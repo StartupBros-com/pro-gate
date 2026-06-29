@@ -23,7 +23,7 @@ pg_have gh && { gh auth status >/dev/null 2>&1 && P "gh authenticated" || X "gh 
 pg_have git && P "git present" || X "git missing"
 pg_have claude && P "claude CLI present" || W "claude CLI missing (needed for the daemon's fixer)"
 pg_have jq && P "jq present" || W "jq missing (usage guardrail degraded)"
-pg_have flock && P "flock present (concurrency serialized)" || W "flock missing — concurrent runs NOT serialized"
+pg_have flock && P "concurrency serialized (flock)" || P "concurrency serialized (portable mkdir lock; flock absent — normal on macOS)"
 
 # fixer tier available?
 if [ -f "$HOME/.claude/skills/ce-work-beta/SKILL.md" ] || ls "$HOME/.claude/plugins"/**/ce-work-beta* >/dev/null 2>&1; then

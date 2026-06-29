@@ -156,13 +156,10 @@ ENGINE_ARGS=(-e browser)
 # so concurrent callers QUEUE on this lock and run one-at-a-time. Auto-releases at script exit.
 LOCKFILE="${PRO_GATE_LOCKFILE:-$PRO_GATE_HOME/oracle.lock}"
 LOCK_WAIT="${PRO_GATE_LOCK_WAIT:-2400}"
-exec 9>"$LOCKFILE" 2>/dev/null || true
-if pg_have flock; then
-  echo "[oracle-review] acquiring review lock (serialized; waits up to ${LOCK_WAIT}s if busy)..." >&2
-  if ! flock -w "$LOCK_WAIT" 9; then
-    echo "ERROR: timed out after ${LOCK_WAIT}s waiting for the review lock — another review is running." >&2
-    exit 7
-  fi
+echo "[oracle-review] acquiring review lock (serialized; waits up to ${LOCK_WAIT}s if busy)..." >&2
+if ! pg_lock "$LOCKFILE" "$LOCK_WAIT"; then
+  echo "ERROR: timed out after ${LOCK_WAIT}s waiting for the review lock — another review is running." >&2
+  exit 7
 fi
 
 echo "[oracle-review] launching GPT-5.5 Pro Extended review (timeout $TIMEOUT)..." >&2

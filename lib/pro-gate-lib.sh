@@ -43,3 +43,24 @@ pg_augment_path() {
 pg_load_env() {
   set -a; [ -f "$PRO_GATE_HOME/.env" ] && . "$PRO_GATE_HOME/.env"; set +a
 }
+
+# Cross-process lock — waits up to $2 seconds; returns 0 acquired / 1 timeout. Uses flock when
+# present (Linux); else an atomic mkdir spinlock (macOS has no flock). Held until the shell exits.
+pg_lock() {
+  local lockfile="$1" wait_s="${2:-2400}"
+  if pg_have flock; then
+    exec 9>"$lockfile" 2>/dev/null || return 0
+    flock -w "$wait_s" 9; return $?
+  fi
+  local lockdir="${lockfile}.d" start opid
+  start=$(date +%s)
+  while ! mkdir "$lockdir" 2>/dev/null; do
+    opid=$(cat "$lockdir/pid" 2>/dev/null || true)
+    if [ -n "$opid" ] && ! kill -0 "$opid" 2>/dev/null; then rm -rf "$lockdir" 2>/dev/null; continue; fi
+    [ $(( $(date +%s) - start )) -ge "$wait_s" ] && return 1
+    sleep 2
+  done
+  echo "$$" > "$lockdir/pid" 2>/dev/null || true
+  trap 'rm -rf "'"$lockdir"'" 2>/dev/null' EXIT
+  return 0
+}
