@@ -1,20 +1,25 @@
 #!/usr/bin/env bash
-# oracle-review.sh — run a GPT-5.5 Pro Extended FINAL-TIER review of a PR (or diff)
-# via the durable oracle-chrome.service browser session. Single source of truth for
-# "how we call oracle for a review" — the /pro-gate skill and the daemon both call this.
+# oracle-review.sh — run a GPT-5.5 Pro Extended FINAL-TIER review of a PR (or diff) via oracle.
+# Single source of truth for "how we call oracle for a review" — the /pro-gate skill and the
+# daemon both call this. Cross-platform: macOS drives signed-in Chrome natively; WSL/Linux
+# attaches to the durable Xvfb Chrome over CDP.
 #
 # Usage:
 #   oracle-review.sh --pr <url|number> [--repo <dir>] [--input both|bundle|connector]
 #                    [--out <file>] [--timeout <dur>] [--extra-files <glob>]
 #   oracle-review.sh --diff <patchfile> --repo <dir> [--out <file>] ...
-#
-# Output: writes the Pro Extended findings to --out (default: stdout + a temp file path
-# echoed on the last line as  RESULT_FILE=<path>).
 set -uo pipefail
 
-export PATH=/home/will/.local/bin:/home/will/.local/share/mise/installs/node/24.13.1/bin:/usr/local/bin:/usr/bin:/bin
-set -a; [ -f /home/will/.pro-review-daemon/.env ] && source /home/will/.pro-review-daemon/.env; set +a
-export DISPLAY="${ORACLE_DISPLAY:-:99}"
+# --- locate + source the shared lib (works from repo and from deployed location) ---
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+for c in "$SELF/lib.sh" "$SELF/../lib/pro-gate-lib.sh" "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/lib.sh"; do
+  [ -f "$c" ] && { . "$c"; break; }
+done
+type pg_os >/dev/null 2>&1 || { echo "ERROR: pro-gate lib not found (lib.sh)" >&2; exit 10; }
+
+pg_augment_path
+pg_load_env
+OS="$(pg_os)"; MODE="$(pg_browser_mode)"
 
 PR=""; REPO=""; DIFF_FILE=""; INPUT="both"; OUT=""; TIMEOUT="30m"; EXTRA_GLOB=""
 while [ $# -gt 0 ]; do
@@ -32,13 +37,22 @@ done
 
 PORT="${ORACLE_BROWSER_PORT:-9222}"
 MODEL="${ORACLE_MODEL:-gpt-5.5-pro}"
-WORK="$(mktemp -d /tmp/pro-review.XXXXXX)"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/pro-review.XXXXXX")"
 [ -n "$OUT" ] || OUT="$WORK/findings.md"
+pg_have oracle || { echo "ERROR: oracle not installed (pnpm add -g @steipete/oracle)" >&2; exit 3; }
 
-# --- preflight: browser session must be up + signed in ---
-if ! curl -sf "localhost:${PORT}/json/version" >/dev/null 2>&1; then
-  echo "ERROR: oracle-chrome.service CDP not reachable on ${PORT}. Start it: sudo systemctl start oracle-chrome" >&2
-  exit 3
+# --- preflight: browser reachable / signed in (per platform) ---
+if [ "$MODE" = "remote-chrome" ]; then
+  export DISPLAY="${ORACLE_DISPLAY:-:99}"
+  if ! curl -sf "localhost:${PORT}/json/version" >/dev/null 2>&1; then
+    echo "ERROR: oracle browser session (CDP) not reachable on ${PORT}." >&2
+    [ "$(pg_service_mgr)" = systemd ] && echo "  start it: sudo systemctl start oracle-chrome" >&2
+    exit 3
+  fi
+else
+  # native (macOS): oracle drives your signed-in Chrome. Nothing to pre-start; oracle errors
+  # clearly if you're not signed into ChatGPT.
+  :
 fi
 
 # --- resolve repo + PR, assemble the diff (ground truth) ---
@@ -46,10 +60,11 @@ PR_URL=""; PR_NUM=""
 if [ -n "$PR" ]; then
   if [[ "$PR" =~ ^https?:// ]]; then
     PR_URL="$PR"; PR_NUM="${PR##*/}"
-    # derive repo dir from URL if not given: github.com/<owner>/<name>/pull/<n>
     if [ -z "$REPO" ]; then
       NAME="$(printf '%s' "$PR_URL" | sed -E 's#https?://github.com/[^/]+/([^/]+)/pull/.*#\1#')"
-      [ -d "$HOME/SITES/$NAME" ] && REPO="$HOME/SITES/$NAME"
+      for base in "${PRO_GATE_REPOS_DIR:-$HOME/SITES}" "$HOME/src" "$HOME/code" "$HOME/dev"; do
+        [ -d "$base/$NAME/.git" ] && { REPO="$base/$NAME"; break; }
+      done
     fi
   else
     PR_NUM="$PR"
@@ -65,15 +80,14 @@ if [ -z "$DIFF_FILE" ]; then
     echo "ERROR: gh pr diff $PR_NUM failed in $REPO: $(cat "$WORK/diff.err")" >&2; exit 5; }
 fi
 DIFF_LINES=$(wc -l < "$DIFF_FILE" 2>/dev/null || echo 0)
-echo "[oracle-review] repo=$REPO pr=#${PR_NUM} url=${PR_URL:-n/a} diff_lines=$DIFF_LINES input=$INPUT" >&2
+echo "[oracle-review] os=$OS mode=$MODE repo=$REPO pr=#${PR_NUM} url=${PR_URL:-n/a} diff_lines=$DIFF_LINES input=$INPUT" >&2
 
 # --- build the review prompt (the product) ---
 PROMPT_FILE="$WORK/prompt.md"
 {
-  # Belt-and-suspenders connector nudge: the literal @GitHub tag (ChatGPT recognizes it even
-  # though oracle's paste doesn't render it as a real mention pill) PLUS an explicit instruction
-  # to use the connector for anything GitHub-related. (ORACLE_CHATGPT_URL can also pin a
-  # connector-bound Project.)
+  # Lead with the @GitHub connector tag + an explicit directive (belt-and-suspenders: oracle
+  # pastes the prompt in one shot, so @GitHub is a recognized hint, not a bound mention pill;
+  # ORACLE_CHATGPT_URL can pin a connector-bound Project for true binding).
   if [ "$INPUT" = "connector" ] || [ "$INPUT" = "both" ]; then
     [ -n "$PR_URL" ] && cat <<EOF
 @GitHub — use the GitHub connector for anything GitHub-related in this review. Fetch this pull request and read its full diff plus the surrounding code, callers, tests, and history directly from GitHub via the connector (do not answer from memory): $PR_URL
@@ -125,34 +139,34 @@ if [ "$INPUT" = "bundle" ] || [ "$INPUT" = "both" ]; then
     while IFS= read -r f; do [ -f "$f" ] && FILES+=("$f"); done < <(compgen -G "$EXTRA_GLOB" 2>/dev/null || true)
   fi
 fi
-
-# --- run oracle against the durable session ---
-echo "[oracle-review] launching GPT-5.5 Pro Extended review (timeout $TIMEOUT)..." >&2
 FILE_ARGS=(); for f in "${FILES[@]:-}"; do [ -n "$f" ] && FILE_ARGS+=(--file "$f"); done
+
 # Route through a connector-bound ChatGPT Project when configured (pre-binds GitHub).
 URL_ARGS=()
 if [ -n "${ORACLE_CHATGPT_URL:-}" ] && [ "${ORACLE_CHATGPT_URL}" != "https://chatgpt.com/" ]; then
   URL_ARGS+=(--chatgpt-url "$ORACLE_CHATGPT_URL")
 fi
 
-# --- Serialize Pro Extended runs against the single shared ChatGPT account ---
-# Oracle has NO cross-process limit in --remote-chrome mode (verified in source: the tab-lease
-# registry only activates with --browser-manual-login). One Pro account cannot take many
-# simultaneous generations, so concurrent callers (e.g. 10 agents) QUEUE on this lock and run
-# one-at-a-time. Lock auto-releases when fd 9 closes at script exit.
-LOCKFILE="${PRO_GATE_LOCKFILE:-/home/will/.pro-review-daemon/oracle.lock}"
+# Platform browser flags: WSL/Linux attaches to the Xvfb Chrome; macOS lets oracle drive Chrome.
+ENGINE_ARGS=(-e browser)
+[ "$MODE" = "remote-chrome" ] && ENGINE_ARGS+=(--remote-chrome "127.0.0.1:${PORT}")
+
+# --- Serialize Pro Extended runs against the single ChatGPT account ---
+# Oracle has NO cross-process limit, and one Pro account can't take many simultaneous generations,
+# so concurrent callers QUEUE on this lock and run one-at-a-time. Auto-releases at script exit.
+LOCKFILE="${PRO_GATE_LOCKFILE:-$PRO_GATE_HOME/oracle.lock}"
 LOCK_WAIT="${PRO_GATE_LOCK_WAIT:-2400}"
 exec 9>"$LOCKFILE" 2>/dev/null || true
-if command -v flock >/dev/null 2>&1; then
+if pg_have flock; then
   echo "[oracle-review] acquiring review lock (serialized; waits up to ${LOCK_WAIT}s if busy)..." >&2
   if ! flock -w "$LOCK_WAIT" 9; then
-    echo "ERROR: timed out after ${LOCK_WAIT}s waiting for the review lock — another Pro Extended review is running. Re-run later." >&2
+    echo "ERROR: timed out after ${LOCK_WAIT}s waiting for the review lock — another review is running." >&2
     exit 7
   fi
-  echo "[oracle-review] lock acquired; running." >&2
 fi
 
-stdbuf -oL -eL oracle -e browser --remote-chrome "127.0.0.1:${PORT}" -m "$MODEL" \
+echo "[oracle-review] launching GPT-5.5 Pro Extended review (timeout $TIMEOUT)..." >&2
+stdbuf -oL -eL oracle "${ENGINE_ARGS[@]}" -m "$MODEL" \
   --browser-model-strategy select \
   --slug "pro gate review pr ${PR_NUM:-diff}" \
   "${URL_ARGS[@]}" "${FILE_ARGS[@]}" \

@@ -3,46 +3,65 @@
 # Watches for open PRs labeled `pro-review`, and for each new head SHA spawns a headless
 # Claude Code run of `/pro-gate` (auto-fix, STOP before merge). Fixes-only: never merges.
 #
-# Trigger:    add the `pro-review` label to a PR (any configured owner/repo).
+# Trigger:    add the `pro-review` label to a PR in a watched owner.
 # Re-review:  push new commits (head SHA changes) -> re-processed automatically.
-# Pause:      touch ~/.pro-review-daemon/PAUSE   (resume: rm it)
+# Pause:      touch $PRO_GATE_HOME/PAUSE   (resume: rm it)
 set -uo pipefail
 
-ENV_FILE=/home/will/.pro-review-daemon/.env
-set -a; [ -f "$ENV_FILE" ] && source "$ENV_FILE"; set +a
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+for c in "$SELF/lib.sh" "$SELF/../lib/pro-gate-lib.sh" "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/lib.sh"; do
+  [ -f "$c" ] && { . "$c"; break; }
+done
+type pg_os >/dev/null 2>&1 || { echo "ERROR: pro-gate lib not found (lib.sh)" >&2; exit 10; }
+pg_augment_path; pg_load_env
+OS="$(pg_os)"; MODE="$(pg_browser_mode)"
 
-ROOT=/home/will/.pro-review-daemon
+ROOT="$PRO_GATE_HOME"
 STATE="$ROOT/processed.tsv"          # repo<TAB>pr<TAB>sha  (idempotency)
 FAILS="$ROOT/failcount.tsv"          # repo<TAB>pr<TAB>sha  (one line per failed attempt)
 LOGDIR="$ROOT/logs"; mkdir -p "$LOGDIR"
 PAUSE="$ROOT/PAUSE"
 touch "$STATE" "$FAILS"
 
-OWNERS="${PRO_REVIEW_OWNERS:-StartupBros-com}"          # space-separated gh owners to watch
-POLL="${PRO_REVIEW_POLL_SECONDS:-180}"                  # idle poll interval
+OWNERS="${PRO_REVIEW_OWNERS:-}"                          # space-separated gh owners to watch (REQUIRED)
+POLL="${PRO_REVIEW_POLL_SECONDS:-180}"
 LABEL="${PRO_REVIEW_LABEL:-pro-review}"
-CLAUDE_MODEL="${PRO_REVIEW_CLAUDE_MODEL:-sonnet}"       # orchestrator model (deep reasoning is in Pro Extended + codex)
-FALLBACK_MODEL="${PRO_REVIEW_FALLBACK_MODEL:-haiku}"    # claude -p resilience on model overload
-MAX_BUDGET="${PRO_REVIEW_MAX_BUDGET_USD:-5}"            # hard $ ceiling per PR (headless claude bills API credits)
-MAX_FAILS="${PRO_REVIEW_MAX_FAILS:-3}"                  # give up on a PR+SHA after this many failed attempts
+CLAUDE_MODEL="${PRO_REVIEW_CLAUDE_MODEL:-sonnet}"
+FALLBACK_MODEL="${PRO_REVIEW_FALLBACK_MODEL:-haiku}"
+MAX_BUDGET="${PRO_REVIEW_MAX_BUDGET_USD:-5}"
+MAX_FAILS="${PRO_REVIEW_MAX_FAILS:-3}"
 CDP_PORT="${ORACLE_BROWSER_PORT:-9222}"
+REPOS_DIR="${PRO_GATE_REPOS_DIR:-$HOME/SITES}"
 
 log(){ printf '%s %s\n' "$(date '+%F %T')" "$*"; }
 
-# --- guardrails -------------------------------------------------------------
-session_up(){ curl -sf "localhost:${CDP_PORT}/json/version" >/dev/null 2>&1; }
+if [ -z "$OWNERS" ]; then
+  log "FATAL: PRO_REVIEW_OWNERS is not set in $ROOT/.env (e.g. PRO_REVIEW_OWNERS=my-org). Idling."
+  while true; do sleep 600; pg_load_env; OWNERS="${PRO_REVIEW_OWNERS:-}"; [ -n "$OWNERS" ] && break; done
+  log "PRO_REVIEW_OWNERS now set to '$OWNERS' — continuing."
+fi
 
+# --- guardrails (universal + best-effort) -----------------------------------
+session_up(){
+  [ "$MODE" = remote-chrome ] || return 0   # native (macOS): oracle drives Chrome; errors per-run if not signed in
+  curl -sf "localhost:${CDP_PORT}/json/version" >/dev/null 2>&1
+}
+
+# Optional: only meaningful for codex users. No-op (returns "not tripped") without ~/.codex.
 doghouse_tripped(){
-  local f=/home/will/.codex/.doghouse
-  [ -f "$f" ] || return 1
+  local f="$HOME/.codex/.doghouse"
+  [ -f "$f" ] && pg_have node || return 1
   node -e 'try{const s=JSON.parse(require("fs").readFileSync(process.argv[1]));process.exit(s.until>Date.now()?0:1)}catch{process.exit(1)}' "$f" 2>/dev/null
 }
 
-usage_saturated(){   # best-effort: account-level signal via the same endpoint the doghouse uses
-  local tok acct js
-  tok=$(jq -r '.tokens.access_token // empty' /home/will/.codex/auth.json 2>/dev/null)
-  acct=$(jq -r '.tokens.account_id // .tokens.chatgpt_account_id // empty' /home/will/.codex/auth.json 2>/dev/null)
-  [ -z "$tok" ] && return 1   # can't determine -> don't block
+# Optional best-effort account-usage check (codex auth). No-op without creds/jq -> never blocks.
+usage_saturated(){
+  pg_have jq || return 1
+  local tok acct js auth="$HOME/.codex/auth.json"
+  [ -f "$auth" ] || return 1
+  tok=$(jq -r '.tokens.access_token // empty' "$auth" 2>/dev/null)
+  acct=$(jq -r '.tokens.account_id // .tokens.chatgpt_account_id // empty' "$auth" 2>/dev/null)
+  [ -z "$tok" ] && return 1
   js=$(curl -s --max-time 10 https://chatgpt.com/backend-api/wham/usage \
         -H "Authorization: Bearer $tok" -H "chatgpt-account-id: $acct" 2>/dev/null)
   [ -z "$js" ] && return 1
@@ -52,23 +71,28 @@ usage_saturated(){   # best-effort: account-level signal via the same endpoint t
 already_done(){ grep -qF "$(printf '%s\t%s\t%s' "$1" "$2" "$3")" "$STATE"; }
 mark_done(){ printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$STATE"; }
 
+# --- find a local checkout of owner/repo ------------------------------------
+find_repo(){
+  local nwo="$1" name="${1##*/}"
+  [ -d "$REPOS_DIR/$name/.git" ] && { echo "$REPOS_DIR/$name"; return; }
+  local d dd r
+  for d in "$REPOS_DIR"/*/.git; do
+    [ -e "$d" ] || continue; dd=${d%/.git}
+    r=$(git -C "$dd" config --get remote.origin.url 2>/dev/null)
+    case "$r" in *"$nwo"*) echo "$dd"; return;; esac
+  done
+}
+
 # --- process one PR ---------------------------------------------------------
 process_pr(){
   local nwo="$1" num="$2" sha="$3" branch="$4" url="$5"
   local slug="${nwo//\//-}-${num}"
-  local repodir="$HOME/SITES/${nwo##*/}"
-  # fall back: try to find a local checkout of this repo by remote
-  if [ ! -d "$repodir/.git" ]; then
-    repodir=$(for d in "$HOME"/SITES/*/.git; do
-                dd=${d%/.git}; r=$(git -C "$dd" config --get remote.origin.url 2>/dev/null)
-                case "$r" in *"$nwo"*) echo "$dd"; break;; esac
-              done)
-  fi
-  if [ -z "$repodir" ] || [ ! -d "$repodir/.git" ]; then
-    log "  ! no local checkout for $nwo — skipping (clone it under ~/SITES to enable)"; return 1
+  local repodir; repodir="$(find_repo "$nwo")"
+  if [ -z "$repodir" ]; then
+    log "  ! no local checkout for $nwo under $REPOS_DIR — skipping (clone it there to enable)"; return 1
   fi
 
-  local wt="/tmp/pro-review-${slug}"
+  local wt="${TMPDIR:-/tmp}/pro-review-${slug}"
   local lg="$LOGDIR/${slug}-$(date +%s).log"
   log "  → reviewing $nwo#$num @ ${sha:0:8} (branch $branch); repo=$repodir log=$lg"
 
@@ -79,9 +103,8 @@ process_pr(){
   fi
   ( cd "$wt" && git switch -C "$branch" "origin/$branch" >>"$lg" 2>&1 || git checkout -B "$branch" >>"$lg" 2>&1 )
 
-  # Headless Claude runs the final-gate pipeline. Explicit, ironclad: never merge.
-  local prompt="Run the /pro-gate skill for PR #${num} (${url}) in this repository, in auto-fix mode.
-Steps: run the GPT-5.5 Pro Extended review via ~/.pro-review-daemon/oracle-review.sh, sanity-check each P0/P1 finding against the actual code, apply the confirmed fixes on this branch (prefer codex via ce-work-beta delegate:codex), run available tests/lint, commit as fix(pro-gate): <summary>, push to origin/${branch}, and post ONE PR comment containing the full Pro Extended review plus what you fixed.
+  # Headless Claude runs the /pro-gate skill (which picks the best available fixer). Ironclad: never merge.
+  local prompt="Run the /pro-gate skill for PR #${num} (${url}) in this repository in auto-fix mode: get the GPT-5.5 Pro Extended review, sanity-check each P0/P1 finding against the actual code, apply the confirmed fixes on this branch, run available tests/lint, commit as 'fix(pro-gate): <summary>', push to origin/${branch}, and post ONE PR comment containing the full Pro Extended review plus what you fixed.
 CRITICAL: do NOT merge the PR, do NOT open new PRs, do NOT change the base branch. Stop after pushing fixes and posting the comment. If no fixes are warranted, just post the review summary comment and stop."
 
   ( cd "$wt" && timeout 5400 claude -p "$prompt" \
@@ -114,10 +137,10 @@ CRITICAL: do NOT merge the PR, do NOT open new PRs, do NOT change the base branc
 }
 
 # --- main loop --------------------------------------------------------------
-log "pro-review-daemon starting (owners='$OWNERS' label='$LABEL' poll=${POLL}s model=$CLAUDE_MODEL)"
+log "pro-review-daemon starting (os=$OS mode=$MODE owners='$OWNERS' label='$LABEL' poll=${POLL}s model=$CLAUDE_MODEL)"
 while true; do
   if [ -f "$PAUSE" ]; then log "PAUSE present — idling"; sleep "$POLL"; continue; fi
-  if ! session_up; then log "oracle-chrome session down — idling (start: sudo systemctl start oracle-chrome)"; sleep "$POLL"; continue; fi
+  if ! session_up; then log "browser session down — idling"; sleep "$POLL"; continue; fi
   if doghouse_tripped; then log "codex doghouse tripped — idling"; sleep "$POLL"; continue; fi
   if usage_saturated; then log "account usage saturated (>=90% / limit) — idling"; sleep "$POLL"; continue; fi
 
@@ -128,14 +151,12 @@ while true; do
     [ -z "$prs" ] && continue
     while IFS=$'\t' read -r nwo num url; do
       [ -z "$nwo" ] && continue
-      # resolve head sha + branch (search payload omits them)
       meta=$(gh pr view "$num" -R "$nwo" --json headRefOid,headRefName 2>/dev/null)
       sha=$(echo "$meta" | jq -r '.headRefOid // empty'); branch=$(echo "$meta" | jq -r '.headRefName // empty')
       [ -z "$sha" ] && continue
       already_done "$nwo" "$num" "$sha" && continue
       found=1
       process_pr "$nwo" "$num" "$sha" "$branch" "$url"
-      # re-check guardrails between PRs
       [ -f "$PAUSE" ] && break
     done < <(echo "$prs" | jq -r '.[] | [.repository.nameWithOwner, (.number|tostring), .url] | @tsv')
   done
