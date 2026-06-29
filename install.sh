@@ -39,7 +39,6 @@ cp "$REPO/lib/pro-gate-lib.sh"   "$DAEMON_DIR/lib.sh"
 cp "$REPO/bin/oracle-review.sh"  "$DAEMON_DIR/oracle-review.sh"
 cp "$REPO/bin/pro-gate-doctor.sh" "$DAEMON_DIR/pro-gate-doctor.sh"
 cp "$REPO"/daemon/{daemon.sh,run-daemon.sh,run-oracle-chrome.sh,login-view.sh} "$DAEMON_DIR/"
-cp "$REPO/oracle/config.json"    "$ORACLE_DIR/config.json"
 chmod +x "$DAEMON_DIR"/*.sh
 [ -f "$DAEMON_DIR/.env" ] || { cp "$REPO/.env.example" "$DAEMON_DIR/.env"; say "wrote $DAEMON_DIR/.env — set PRO_REVIEW_OWNERS"; }
 
