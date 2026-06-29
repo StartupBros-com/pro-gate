@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# pro-gate doctor — verify the setup. Exit 0 if ready to run a review, 1 if something blocks it.
+set -uo pipefail
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+for c in "$SELF/lib.sh" "$SELF/../lib/pro-gate-lib.sh" "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/lib.sh"; do
+  [ -f "$c" ] && { . "$c"; break; }
+done
+type pg_os >/dev/null 2>&1 || { echo "ERROR: lib.sh not found"; exit 1; }
+pg_augment_path; pg_load_env
+OS="$(pg_os)"; MODE="$(pg_browser_mode)"; SVC="$(pg_service_mgr)"
+PORT="${ORACLE_BROWSER_PORT:-9222}"
+
+ok=0; warn=0; bad=0
+P(){ printf '  \033[32m✓\033[0m %s\n' "$*"; ok=$((ok+1)); }
+W(){ printf '  \033[33m!\033[0m %s\n' "$*"; warn=$((warn+1)); }
+X(){ printf '  \033[31m✗\033[0m %s\n' "$*"; bad=$((bad+1)); }
+
+echo "pro-gate doctor — $OS (browser mode: $MODE, service: $SVC)"
+
+# core deps
+pg_have oracle && P "oracle installed ($(oracle --version 2>/dev/null | head -1))" || X "oracle missing — pnpm add -g @steipete/oracle"
+pg_have gh && { gh auth status >/dev/null 2>&1 && P "gh authenticated" || X "gh not authenticated — gh auth login"; } || X "gh (GitHub CLI) missing"
+pg_have git && P "git present" || X "git missing"
+pg_have claude && P "claude CLI present" || W "claude CLI missing (needed for the daemon's fixer)"
+pg_have jq && P "jq present" || W "jq missing (usage guardrail degraded)"
+pg_have flock && P "flock present (concurrency serialized)" || W "flock missing — concurrent runs NOT serialized"
+
+# fixer tier available?
+if [ -f "$HOME/.claude/skills/ce-work-beta/SKILL.md" ] || ls "$HOME/.claude/plugins"/**/ce-work-beta* >/dev/null 2>&1; then
+  P "fixer: Compound Engineering (ce-work-beta) available"
+elif pg_have codex; then P "fixer: codex available"
+else W "fixer: will fall back to plain Claude Code edits (fine; no codex/CE detected)"; fi
+
+# browser reachability
+if [ "$MODE" = remote-chrome ]; then
+  if curl -sf "localhost:${PORT}/json/version" >/dev/null 2>&1; then
+    title=$(curl -s "localhost:${PORT}/json" 2>/dev/null | jq -r '[.[]|select(.type=="page")][0].url // ""' 2>/dev/null)
+    P "browser session up on :${PORT} (${title:-chatgpt})"
+    [ "$SVC" = systemd ] && { systemctl is-active --quiet oracle-chrome.service 2>/dev/null && P "oracle-chrome.service active" || W "oracle-chrome.service not active"; }
+  else
+    X "browser session not reachable on :${PORT} — start it (sudo systemctl start oracle-chrome) and sign in (login-view.sh)"
+  fi
+else
+  W "macOS native mode — cannot pre-check ChatGPT login; ensure Chrome is signed into ChatGPT Pro"
+fi
+
+# config
+[ -n "${PRO_REVIEW_OWNERS:-}" ] && P "PRO_REVIEW_OWNERS='${PRO_REVIEW_OWNERS}'" || W "PRO_REVIEW_OWNERS unset (daemon needs it; interactive /pro-gate does not)"
+
+echo "  ── $ok ok, $warn warnings, $bad blocking ──"
+[ "$bad" -eq 0 ]
