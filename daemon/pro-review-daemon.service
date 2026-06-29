@@ -1,0 +1,20 @@
+[Unit]
+Description=pro-review-daemon — GPT-5.5 Pro Extended final-gate PR reviewer (label: pro-review)
+After=network-online.target oracle-chrome.service
+Wants=network-online.target
+Requires=oracle-chrome.service
+
+[Service]
+Type=simple
+User=will
+Group=will
+WorkingDirectory=/home/will/.pro-review-daemon
+ExecStart=/home/will/.pro-review-daemon/run-daemon.sh
+Restart=always
+RestartSec=10
+KillMode=control-group
+TimeoutStopSec=30
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

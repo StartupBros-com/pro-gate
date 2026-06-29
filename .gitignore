@@ -1,0 +1,13 @@
+# Runtime state — never commit
+.env
+*.lock
+oracle.lock
+processed.tsv
+failcount.tsv
+logs/
+PAUSE
+
+# OS / editor
+.DS_Store
+*.swp
+node_modules/

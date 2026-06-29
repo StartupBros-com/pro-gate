@@ -1,0 +1,19 @@
+[Unit]
+Description=Oracle ChatGPT browser session (Xvfb + Chrome, CDP 127.0.0.1:9222)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=will
+Group=will
+WorkingDirectory=/home/will/.pro-review-daemon
+ExecStart=/home/will/.pro-review-daemon/run-oracle-chrome.sh
+Restart=always
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=20
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
