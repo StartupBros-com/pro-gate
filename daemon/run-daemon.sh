@@ -1,12 +1,7 @@
 #!/usr/bin/env bash
-# systemd wrapper for pro-review-daemon (onwatch pattern: export env, source .env, exec).
-export HOME=/home/will
-export USER=will
-export PATH=/home/will/.local/bin:/home/will/.local/share/mise/shims:/home/will/.local/share/mise/installs/node/24.13.1/bin:/home/will/.local/share/mise/installs/node/24.12.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-
-set -a
-[ -f /home/will/.pro-review-daemon/.env ] && source /home/will/.pro-review-daemon/.env
-set +a
-
-cd /home/will/.pro-review-daemon
-exec /home/will/.pro-review-daemon/daemon.sh
+# Service wrapper for the daemon (systemd/launchd ExecStart). Sets PATH, then execs daemon.sh.
+PRO_GATE_HOME="${PRO_GATE_HOME:-$HOME/.pro-review-daemon}"
+. "$PRO_GATE_HOME/lib.sh" 2>/dev/null || true
+type pg_augment_path >/dev/null 2>&1 && pg_augment_path
+cd "$PRO_GATE_HOME"
+exec "$PRO_GATE_HOME/daemon.sh"

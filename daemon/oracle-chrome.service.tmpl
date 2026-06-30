@@ -1,14 +1,14 @@
 [Unit]
-Description=Oracle ChatGPT browser session (Xvfb + Chrome, CDP 127.0.0.1:9222)
+Description=pro-gate Oracle ChatGPT browser session (Xvfb + Chrome, CDP 127.0.0.1)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=will
-Group=will
-WorkingDirectory=/home/will/.pro-review-daemon
-ExecStart=/home/will/.pro-review-daemon/run-oracle-chrome.sh
+User=@USER@
+Group=@USER@
+WorkingDirectory=@HOME@/.pro-review-daemon
+ExecStart=@HOME@/.pro-review-daemon/run-oracle-chrome.sh
 Restart=always
 RestartSec=5
 KillMode=control-group

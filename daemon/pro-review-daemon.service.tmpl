@@ -6,10 +6,10 @@ Requires=oracle-chrome.service
 
 [Service]
 Type=simple
-User=will
-Group=will
-WorkingDirectory=/home/will/.pro-review-daemon
-ExecStart=/home/will/.pro-review-daemon/run-daemon.sh
+User=@USER@
+Group=@USER@
+WorkingDirectory=@HOME@/.pro-review-daemon
+ExecStart=@HOME@/.pro-review-daemon/run-daemon.sh
 Restart=always
 RestartSec=10
 KillMode=control-group
