@@ -163,13 +163,24 @@ if ! pg_lock "$LOCKFILE" "$LOCK_WAIT"; then
 fi
 
 echo "[oracle-review] launching GPT-5.5 Pro Extended review (timeout $TIMEOUT)..." >&2
-stdbuf -oL -eL oracle "${ENGINE_ARGS[@]}" -m "$MODEL" \
-  --browser-model-strategy select \
-  --slug "pro gate review pr ${PR_NUM:-diff}" \
-  "${URL_ARGS[@]}" "${FILE_ARGS[@]}" \
-  -p "$(cat "$PROMPT_FILE")" \
-  --no-notify --timeout "$TIMEOUT" \
-  --write-output "$OUT" 2>&1 | stdbuf -oL sed 's/^/[oracle] /' >&2
+RUNLOG="$WORK/oracle.log"
+run_oracle() {  # $1 = browser model strategy (select|current|ignore)
+  stdbuf -oL -eL oracle "${ENGINE_ARGS[@]}" -m "$MODEL" \
+    --browser-model-strategy "$1" \
+    --slug "pro gate review pr ${PR_NUM:-diff}" \
+    "${URL_ARGS[@]}" "${FILE_ARGS[@]}" \
+    -p "$(cat "$PROMPT_FILE")" \
+    --no-notify --timeout "$TIMEOUT" \
+    --write-output "$OUT" 2>&1 | tee -a "$RUNLOG" | stdbuf -oL sed 's/^/[oracle] /' >&2
+  return "${PIPESTATUS[0]}"
+}
+run_oracle "${PRO_GATE_MODEL_STRATEGY:-select}" || true
+# UI fallback (notably macOS): if oracle couldn't find the model-picker button and produced no
+# output, retry using the already-selected model. Requires GPT-5.5 Pro Extended set as the default.
+if [ ! -s "$OUT" ] && grep -qiE "model selector|model.?picker" "$RUNLOG" 2>/dev/null; then
+  echo "[oracle-review] model picker not found — retrying with --browser-model-strategy current (ensure GPT-5.5 Pro Extended is your ChatGPT default)..." >&2
+  run_oracle current || true
+fi
 
 if [ -s "$OUT" ]; then
   echo "[oracle-review] findings written." >&2
