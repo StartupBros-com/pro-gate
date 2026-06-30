@@ -186,6 +186,18 @@ pg_filter_diff() {
   ' "$in" > "$out"
 }
 
+# pg_is_review <file>: true only when <file> looks like a REAL review, not a truncated/garbage
+# capture (e.g. a stray "A"). Our prompt mandates a trailing "VERDICT:" line and Pn severity
+# blocks, so require a sane size AND at least one of those markers. Used by the main run path and
+# the salvage path so a corrupted capture is rejected -> salvage -> one retry, instead of being
+# accepted as success.
+pg_is_review() {
+  local f="$1"
+  [ -s "$f" ] || return 1
+  [ "$(wc -c < "$f" 2>/dev/null || echo 0)" -ge 40 ] || return 1
+  grep -qiE 'VERDICT:|\[P[0-3]\]|P[0-3]:[[:space:]]*(none|—|-)' "$f" 2>/dev/null
+}
+
 # pg_reattach_render <slug> <out> [timeout_s]: bounded attempt to SALVAGE a review whose
 # generation may have completed server-side after the live oracle call lost its Chrome
 # connection. Hard-timeout-wrapped so a missing tab can never hang the caller. Accepts the
@@ -201,7 +213,7 @@ pg_reattach_render() {
   else
     oracle session "$slug" --harvest --write-output "$tmp" >/dev/null 2>&1 || true
   fi
-  if [ -s "$tmp" ] && grep -qiE '^VERDICT:' "$tmp" 2>/dev/null; then
+  if pg_is_review "$tmp"; then
     mv "$tmp" "$out"; return 0
   fi
   rm -f "$tmp"; return 1

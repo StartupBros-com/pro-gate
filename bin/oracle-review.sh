@@ -219,14 +219,21 @@ while :; do
   fi
 
   echo "[oracle-review] launching GPT-5.5 Pro Extended review (attempt $((attempt + 1)), timeout $TIMEOUT)..." >&2
-  : > "$RUNLOG"
+  : > "$RUNLOG"; rm -f "$OUT"   # clear any prior attempt's output so stale garbage can't survive
   run_oracle "${PRO_GATE_MODEL_STRATEGY:-select}" || true
   # UI fallback (notably macOS): model picker not found + no output -> retry with the default model.
   if [ ! -s "$OUT" ] && grep -qiE "model selector|model.?picker" "$RUNLOG" 2>/dev/null; then
     echo "[oracle-review] model picker not found — retrying with --browser-model-strategy current (ensure GPT-5.5 Pro Extended is your ChatGPT default)..." >&2
     run_oracle current || true
   fi
-  [ -s "$OUT" ] && { echo "[oracle-review] findings written." >&2; break; }
+  # Accept ONLY a real review, not just any non-empty file — a corrupted capture (e.g. a stray "A")
+  # must NOT pass as success; it falls through to salvage + retry below.
+  if pg_is_review "$OUT"; then
+    echo "[oracle-review] findings written ($(wc -c < "$OUT" 2>/dev/null) bytes)." >&2; break
+  fi
+  if [ -s "$OUT" ]; then
+    echo "[oracle-review] discarding a non-review capture ($(wc -c < "$OUT" 2>/dev/null) bytes, no VERDICT/Pn markers) — will salvage/retry." >&2
+  fi
 
   # No output. The generation may have COMPLETED server-side after a dropped Chrome connection —
   # try a bounded salvage (never hangs) before spending another slot. Capture the slug oracle
@@ -245,11 +252,11 @@ while :; do
   sleep "$BACKOFF"
 done
 
-if [ -s "$OUT" ]; then
+if pg_is_review "$OUT"; then
   cat "$OUT"
   echo "RESULT_FILE=$OUT"
   exit 0
 else
-  echo "ERROR: oracle produced no usable output after salvage + ${attempt} retr$([ "${attempt:-0}" -eq 1 ] && echo y || echo ies) (reattach: oracle session ${SLUG_BASE})." >&2
+  echo "ERROR: oracle produced no usable review after salvage + ${attempt} retr$([ "${attempt:-0}" -eq 1 ] && echo y || echo ies) (reattach: oracle session ${SLUG_BASE})." >&2
   exit 6
 fi
