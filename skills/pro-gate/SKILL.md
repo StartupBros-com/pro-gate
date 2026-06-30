@@ -11,8 +11,10 @@ separate usage pool from the Codex fixer) for what they missed, then applies the
 
 Engine: `oracle-review.sh` (in `$PRO_GATE_HOME`, default `~/.pro-review-daemon`) — the single source
 of truth for the oracle call; cross-platform (macOS drives your signed-in Chrome natively; WSL/Linux
-attaches to the Xvfb Chrome). Verify setup any time with `pro-gate-doctor.sh`. Never re-run a detached
-oracle session — reattach with `oracle session <slug>` (re-running double-spends the Pro Extended quota).
+attaches to the Xvfb Chrome). Verify setup any time with `pro-gate-doctor.sh`. The engine now
+**auto-salvages** a dropped session (a bounded reattach-harvest) and **retries a lost run once**, so
+prefer reading its **exit code** (see §3) over manually re-running — a hand re-run while a session is
+still generating double-spends the Pro Extended quota.
 
 ## 1. Resolve target + mode
 
@@ -37,6 +39,12 @@ oracle session — reattach with `oracle session <slug>` (re-running double-spen
 - **Concurrency is handled for you:** `oracle-review.sh` holds a flock, so many concurrent
   `/pro-gate` calls (e.g. 10 agents at once) QUEUE and run one-at-a-time against the single ChatGPT
   account — safe, never parallel. Each waits up to `PRO_GATE_LOCK_WAIT` (default 40 min).
+- **The engine self-hardens (v0.1.1), so these are backstopped:** right before spending a slot it
+  runs a **health gate** (Chrome reachable + not just-restarted/flapping + RAM headroom) and **defers
+  with exit 8 — spending no slot — if the box is unfit**. A dropped connection is **auto-salvaged**
+  (bounded reattach), a truly-lost run is **retried once** (with a health re-check), and lockfiles /
+  generated files are **stripped from the payload**. Knobs: `PRO_GATE_MIN_UPTIME` (60s),
+  `PRO_GATE_MIN_AVAIL_MB` (1024), `PRO_GATE_MAX_RETRIES` (1), `PRO_GATE_DIFF_FILTER` (1).
 
 ## 3. Run the review
 
@@ -51,6 +59,15 @@ Launch the engine in the background (it blocks ~10-30 min) and poll its `--out` 
 Run with `run_in_background: true` and a long Bash timeout; poll the out file. While waiting, do not
 spawn a second oracle run (one ChatGPT session, serialized). When it returns, the findings are the
 `[Pn] file:line` blocks ending in a `VERDICT:` line.
+
+**Act on the exit code — don't just check the out file:**
+- `0` — findings written to `--out`. Proceed to Synthesize.
+- `8` — **deferred, NO slot spent**: the box was unfit (Chrome down / just-restarted / memory-starved).
+  Not a failure — don't burn a slot retrying blindly. Wait for it to settle and re-run, or run on the
+  **mac-mini** (native Chrome). Tell the user why.
+- `6` — ran but produced nothing even after auto-salvage + the one retry (genuine failure). Report it;
+  a fresh re-run is reasonable (salvage already checked for a completed answer, so it won't double-spend).
+- `7` — lock timeout: another review held the single session the whole `PRO_GATE_LOCK_WAIT`. Retry later.
 
 ## 4. Synthesize
 
