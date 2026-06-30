@@ -65,6 +65,48 @@ pg_lock() {
   return 0
 }
 
+# Counting semaphore — acquire one of $maxn slots ("<base>.slotN"), so up to N reviews share the
+# single ChatGPT account concurrently (the account tolerates several parallel chats; this just
+# bounds it). Returns 0 with a slot HELD until the process exits, 1 on timeout. flock-based on Linux
+# (the winning fd is kept open and auto-released on exit); mkdir-spinlock fallback on macOS scans N
+# slot dirs and self-heals stale ones via the dead-pid check. maxn<=1 is plain mutual exclusion.
+pg_lock_n() {
+  local base="$1" maxn="${2:-1}" wait_s="${3:-2400}" start i fd lockdir opid
+  [ "${maxn:-1}" -ge 1 ] 2>/dev/null || maxn=1
+  start=$(date +%s)
+  if pg_have flock; then
+    while :; do
+      i=1
+      while [ "$i" -le "$maxn" ]; do
+        if exec {fd}>>"${base}.slot${i}" 2>/dev/null && flock -n "$fd"; then
+          return 0   # keep $fd OPEN (do not close) -> slot held until this process exits
+        fi
+        [ -n "${fd:-}" ] && eval "exec ${fd}>&-" 2>/dev/null
+        i=$((i + 1))
+      done
+      [ $(( $(date +%s) - start )) -ge "$wait_s" ] && return 1
+      sleep 3
+    done
+  fi
+  # macOS / no flock: atomic mkdir over N slot dirs (self-heals dirs left by dead pids)
+  while :; do
+    i=1
+    while [ "$i" -le "$maxn" ]; do
+      lockdir="${base}.slot${i}.d"
+      if mkdir "$lockdir" 2>/dev/null; then
+        echo "$$" > "$lockdir/pid" 2>/dev/null || true
+        trap 'rm -rf "'"$lockdir"'" 2>/dev/null' EXIT
+        return 0
+      fi
+      opid=$(cat "$lockdir/pid" 2>/dev/null || true)
+      [ -n "$opid" ] && ! kill -0 "$opid" 2>/dev/null && rm -rf "$lockdir" 2>/dev/null
+      i=$((i + 1))
+    done
+    [ $(( $(date +%s) - start )) -ge "$wait_s" ] && return 1
+    sleep 3
+  done
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Reliability (v0.1.1): don't burn a precious Pro Extended slot into a broken box,
 # salvage a review whose connection dropped, and gate before retrying.

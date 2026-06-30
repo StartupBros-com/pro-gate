@@ -53,6 +53,7 @@ if memreason="$(pg_mem_headroom_ok)"; then P "memory headroom ok for a review"; 
 
 # config
 [ -n "${PRO_REVIEW_OWNERS:-}" ] && P "PRO_REVIEW_OWNERS='${PRO_REVIEW_OWNERS}'" || W "PRO_REVIEW_OWNERS unset (daemon needs it; interactive /pro-gate does not)"
+P "concurrency: up to ${PRO_GATE_MAX_CONCURRENCY:-3} review slot(s) (per-PR serialized; health-governed)"
 
 echo "  ── $ok ok, $warn warnings, $bad blocking ──"
 [ "$bad" -eq 0 ]

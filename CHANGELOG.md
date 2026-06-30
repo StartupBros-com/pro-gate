@@ -3,7 +3,7 @@
 All notable changes to pro-gate are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions are git tags.
 
-## [Unreleased] — v0.1.1 reliability hardening
+## [Unreleased] — v0.1.1 reliability + concurrency
 
 Motivated by a live run where a transient WSL Chrome network-service crash (`net error -2`)
 mid-review tripped `oracle-chrome.service`'s `Restart=always`, killed the review tab, and lost a
@@ -11,6 +11,12 @@ mid-review tripped `oracle-chrome.service`'s `Restart=always`, killed the review
 unattended into the still-thrashing box.
 
 ### Added
+- **Bounded concurrency** (`pg_lock_n`): the binary review lock becomes a counting semaphore, so up to
+  `PRO_GATE_MAX_CONCURRENCY` reviews (default 3) run at once against the single ChatGPT account (which
+  tolerates several parallel chats) instead of strictly one-at-a-time. Excess callers queue. A separate
+  **per-PR guard** keeps one PR from being reviewed twice simultaneously (no double-spend on a diff),
+  and the health gate governs each slot so a loaded box self-throttles below the cap. `=1` restores
+  strict serialization.
 - **Pre-slot health gate** (`pg_health_gate`): before spending a Pro Extended slot (and before each
   retry) the engine checks Chrome CDP reachability, `oracle-chrome` service uptime (not just-restarted
   / flapping), and RAM/swap headroom. An unfit box **defers with exit 8 and spends no slot** instead

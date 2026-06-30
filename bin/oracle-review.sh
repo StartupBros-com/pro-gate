@@ -167,14 +167,26 @@ fi
 ENGINE_ARGS=(-e browser)
 [ "$MODE" = "remote-chrome" ] && ENGINE_ARGS+=(--remote-chrome "127.0.0.1:${PORT}")
 
-# --- Serialize Pro Extended runs against the single ChatGPT account ---
-# Oracle has NO cross-process limit, and one Pro account can't take many simultaneous generations,
-# so concurrent callers QUEUE on this lock and run one-at-a-time. Auto-releases at script exit.
+# --- Bound concurrent Pro Extended runs against the single ChatGPT account ---
+# Up to PRO_GATE_MAX_CONCURRENCY reviews run at once (the account tolerates several parallel chats);
+# excess callers QUEUE on the semaphore. A SEPARATE per-PR guard ensures the SAME pr is never under
+# two simultaneous reviews (that would double-spend a slot on one diff). Both auto-release at exit.
 LOCKFILE="${PRO_GATE_LOCKFILE:-$PRO_GATE_HOME/oracle.lock}"
 LOCK_WAIT="${PRO_GATE_LOCK_WAIT:-2400}"
-echo "[oracle-review] acquiring review lock (serialized; waits up to ${LOCK_WAIT}s if busy)..." >&2
-if ! pg_lock "$LOCKFILE" "$LOCK_WAIT"; then
-  echo "ERROR: timed out after ${LOCK_WAIT}s waiting for the review lock — another review is running." >&2
+MAX_CONC="${PRO_GATE_MAX_CONCURRENCY:-3}"
+
+# Per-PR guard (acquire BEFORE a slot, so same-PR callers serialize without holding a scarce slot).
+if [ -n "${PR_NUM}" ]; then
+  echo "[oracle-review] per-PR guard for pr #${PR_NUM} (serializes same-PR reviews)..." >&2
+  if ! pg_lock "${LOCKFILE}.pr-${PR_NUM}" "$LOCK_WAIT"; then
+    echo "ERROR: timed out after ${LOCK_WAIT}s — pr #${PR_NUM} is already under review elsewhere." >&2
+    exit 7
+  fi
+fi
+
+echo "[oracle-review] acquiring a review slot (up to ${MAX_CONC} concurrent; waits up to ${LOCK_WAIT}s if all busy)..." >&2
+if ! pg_lock_n "$LOCKFILE" "$MAX_CONC" "$LOCK_WAIT"; then
+  echo "ERROR: timed out after ${LOCK_WAIT}s — all ${MAX_CONC} review slots are busy." >&2
   exit 7
 fi
 

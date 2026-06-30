@@ -36,9 +36,12 @@ still generating double-spends the Pro Extended quota.
   you're not logged in. `pro-gate-doctor.sh` checks all of this.
 - **Usage (best-effort):** if codex auth is present, check `chatgpt.com/backend-api/wham/usage`;
   if the primary window is ≥90% or `limit_reached`, warn before burning a slot.
-- **Concurrency is handled for you:** `oracle-review.sh` holds a flock, so many concurrent
-  `/pro-gate` calls (e.g. 10 agents at once) QUEUE and run one-at-a-time against the single ChatGPT
-  account — safe, never parallel. Each waits up to `PRO_GATE_LOCK_WAIT` (default 40 min).
+- **Concurrency is handled for you:** up to `PRO_GATE_MAX_CONCURRENCY` reviews (default **3**) run at
+  once against the single ChatGPT account (it tolerates several parallel chats); extra callers QUEUE on
+  a counting semaphore, each waiting up to `PRO_GATE_LOCK_WAIT` (default 40 min). A separate **per-PR
+  guard** keeps the SAME pr from being reviewed twice at once (no double-spend on one diff), and the
+  health-gate governs every slot — so a loaded box self-throttles below the cap instead of crashing.
+  Set `PRO_GATE_MAX_CONCURRENCY=1` to force strict one-at-a-time.
 - **The engine self-hardens (v0.1.1), so these are backstopped:** right before spending a slot it
   runs a **health gate** (Chrome reachable + not just-restarted/flapping + RAM headroom) and **defers
   with exit 8 — spending no slot — if the box is unfit**. A dropped connection is **auto-salvaged**
