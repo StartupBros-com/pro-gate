@@ -35,6 +35,14 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# --input is the assembly mode (connector/bundle/both), NOT the pro_gate fix-mode. Reject unknown
+# values instead of silently sending a prompt with no diff and no connector directive (which would
+# still burn a 10-30 min Pro slot on an empty/hallucinated review).
+case "$INPUT" in
+  both|bundle|connector) ;;
+  *) echo "ERROR: invalid --input '$INPUT' (expected: both | bundle | connector)" >&2; exit 2;;
+esac
+
 PORT="${ORACLE_BROWSER_PORT:-9222}"
 MODEL="${ORACLE_MODEL:-gpt-5.5-pro}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/pro-review.XXXXXX")"

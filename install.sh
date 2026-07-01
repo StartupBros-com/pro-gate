@@ -22,7 +22,10 @@ say "platform: $OS  (browser mode: $MODE, service: $SVC, daemon: $INSTALL_DAEMON
 # 0. prereqs
 if ! pg_have oracle; then
   say "installing @steipete/oracle"
-  pg_have pnpm && pnpm add -g @steipete/oracle || npm i -g @steipete/oracle
+  # if/elif so a machine with no Node package manager gets a clear message instead of a set -e abort
+  if pg_have pnpm; then pnpm add -g @steipete/oracle
+  elif pg_have npm; then npm i -g @steipete/oracle
+  else echo "  ⚠ no Node package manager (npm/pnpm) found — install Node first (https://nodejs.org or 'brew install node' on macOS), then re-run. Manual: npm i -g @steipete/oracle"; fi
 fi
 for dep in gh git jq flock; do pg_have "$dep" || echo "  ⚠ missing dependency: $dep"; done
 

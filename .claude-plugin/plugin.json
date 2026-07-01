@@ -1,7 +1,7 @@
 {
   "name": "pro-gate",
   "version": "0.1.0",
-  "description": "Get a final, deepest code review from ChatGPT's most powerful model (GPT-5.5 Pro) before you merge. Just run /pro-gate: it reviews your pull request, fixes what it safely can, and comments — never merges. One-time guided setup walks you through it.",
+  "description": "Get the deepest final code review from ChatGPT's most powerful model (GPT-5.5 Pro) before you merge. Just run /pro-gate: it reviews your pull request, fixes what it safely can, and comments — never merges. One-time guided setup. Requires a ChatGPT Pro plan.",
   "author": {
     "name": "StartupBros / House of Vibe",
     "url": "https://houseofvibe.ai"
@@ -14,7 +14,7 @@
     "code-review",
     "pull-request",
     "chatgpt-pro",
-    "gpt-5-pro",
+    "gpt-5.5-pro",
     "final-review",
     "oracle",
     "draft-pr"
