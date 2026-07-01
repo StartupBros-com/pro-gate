@@ -79,6 +79,22 @@ if [ -z "$DIFF_FILE" ]; then
   gh pr diff "$PR_NUM" --patch > "$DIFF_FILE" 2>"$WORK/diff.err" || {
     echo "ERROR: gh pr diff $PR_NUM failed in $REPO: $(cat "$WORK/diff.err")" >&2; exit 5; }
 fi
+
+# --- diff hygiene: drop lockfiles/generated/vendored from the review payload so Pro Extended
+# spends its (finite, disconnect-exposed) thinking window on real code, not lockfile churn. ---
+if [ -s "$DIFF_FILE" ] && [ "${PRO_GATE_DIFF_FILTER:-1}" = 1 ]; then
+  FILTERED="$WORK/pr.filtered.diff"
+  if pg_filter_diff "$DIFF_FILE" "$FILTERED" 2>"$WORK/excluded.raw" && [ -s "$FILTERED" ]; then
+    # a path can appear in several per-commit patches (gh pr diff --patch) — dedupe for the report
+    sort -u "$WORK/excluded.raw" 2>/dev/null > "$WORK/excluded.txt" || cp "$WORK/excluded.raw" "$WORK/excluded.txt"
+    NEX=$(grep -c . "$WORK/excluded.txt" 2>/dev/null || echo 0)
+    if [ "${NEX:-0}" -gt 0 ]; then
+      echo "[oracle-review] diff hygiene: excluded ${NEX} noise file(s) from the payload: $(paste -sd', ' "$WORK/excluded.txt" 2>/dev/null | cut -c1-200)" >&2
+      DIFF_FILE="$FILTERED"
+    fi
+  fi
+fi
+
 DIFF_LINES=$(wc -l < "$DIFF_FILE" 2>/dev/null || echo 0)
 echo "[oracle-review] os=$OS mode=$MODE repo=$REPO pr=#${PR_NUM} url=${PR_URL:-n/a} diff_lines=$DIFF_LINES input=$INPUT" >&2
 
@@ -151,18 +167,29 @@ fi
 ENGINE_ARGS=(-e browser)
 [ "$MODE" = "remote-chrome" ] && ENGINE_ARGS+=(--remote-chrome "127.0.0.1:${PORT}")
 
-# --- Serialize Pro Extended runs against the single ChatGPT account ---
-# Oracle has NO cross-process limit, and one Pro account can't take many simultaneous generations,
-# so concurrent callers QUEUE on this lock and run one-at-a-time. Auto-releases at script exit.
+# --- Bound concurrent Pro Extended runs against the single ChatGPT account ---
+# Up to PRO_GATE_MAX_CONCURRENCY reviews run at once (the account tolerates several parallel chats);
+# excess callers QUEUE on the semaphore. A SEPARATE per-PR guard ensures the SAME pr is never under
+# two simultaneous reviews (that would double-spend a slot on one diff). Both auto-release at exit.
 LOCKFILE="${PRO_GATE_LOCKFILE:-$PRO_GATE_HOME/oracle.lock}"
 LOCK_WAIT="${PRO_GATE_LOCK_WAIT:-2400}"
-echo "[oracle-review] acquiring review lock (serialized; waits up to ${LOCK_WAIT}s if busy)..." >&2
-if ! pg_lock "$LOCKFILE" "$LOCK_WAIT"; then
-  echo "ERROR: timed out after ${LOCK_WAIT}s waiting for the review lock — another review is running." >&2
+MAX_CONC="${PRO_GATE_MAX_CONCURRENCY:-3}"
+
+# Per-PR guard (acquire BEFORE a slot, so same-PR callers serialize without holding a scarce slot).
+if [ -n "${PR_NUM}" ]; then
+  echo "[oracle-review] per-PR guard for pr #${PR_NUM} (serializes same-PR reviews)..." >&2
+  if ! pg_lock "${LOCKFILE}.pr-${PR_NUM}" "$LOCK_WAIT"; then
+    echo "ERROR: timed out after ${LOCK_WAIT}s — pr #${PR_NUM} is already under review elsewhere." >&2
+    exit 7
+  fi
+fi
+
+echo "[oracle-review] acquiring a review slot (up to ${MAX_CONC} concurrent; waits up to ${LOCK_WAIT}s if all busy)..." >&2
+if ! pg_lock_n "$LOCKFILE" "$MAX_CONC" "$LOCK_WAIT"; then
+  echo "ERROR: timed out after ${LOCK_WAIT}s — all ${MAX_CONC} review slots are busy." >&2
   exit 7
 fi
 
-echo "[oracle-review] launching GPT-5.5 Pro Extended review (timeout $TIMEOUT)..." >&2
 RUNLOG="$WORK/oracle.log"
 run_oracle() {  # $1 = browser model strategy (select|current|ignore)
   stdbuf -oL -eL oracle "${ENGINE_ARGS[@]}" -m "$MODEL" \
@@ -174,20 +201,62 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
     --write-output "$OUT" 2>&1 | tee -a "$RUNLOG" | stdbuf -oL sed 's/^/[oracle] /' >&2
   return "${PIPESTATUS[0]}"
 }
-run_oracle "${PRO_GATE_MODEL_STRATEGY:-select}" || true
-# UI fallback (notably macOS): if oracle couldn't find the model-picker button and produced no
-# output, retry using the already-selected model. Requires GPT-5.5 Pro Extended set as the default.
-if [ ! -s "$OUT" ] && grep -qiE "model selector|model.?picker" "$RUNLOG" 2>/dev/null; then
-  echo "[oracle-review] model picker not found — retrying with --browser-model-strategy current (ensure GPT-5.5 Pro Extended is your ChatGPT default)..." >&2
-  run_oracle current || true
-fi
 
-if [ -s "$OUT" ]; then
-  echo "[oracle-review] findings written." >&2
+# --- spend the slot: health-gate -> run -> salvage -> one guarded retry ---
+# A precious Pro Extended slot is spent only when the box is fit; a dropped connection is first
+# SALVAGED (the answer may have finished server-side), and only a truly-lost run is retried once.
+# Exit 8 = deferred (no slot spent); exit 6 = ran but produced nothing after salvage + retry.
+SLUG_BASE="pro-gate-review-pr-${PR_NUM:-diff}"
+REATTACH_TIMEOUT="${PRO_GATE_REATTACH_TIMEOUT:-150}"
+MAX_RETRIES="${PRO_GATE_MAX_RETRIES:-1}"
+BACKOFF="${PRO_GATE_RETRY_BACKOFF:-20}"
+attempt=0
+while :; do
+  if ! GATE_REASON="$(pg_health_gate)"; then
+    echo "ERROR: not spending a Pro Extended slot — ${GATE_REASON}." >&2
+    echo "  Deferred (no slot spent). Retry once the box settles, or run on macOS (native Chrome)." >&2
+    exit 8
+  fi
+
+  echo "[oracle-review] launching GPT-5.5 Pro Extended review (attempt $((attempt + 1)), timeout $TIMEOUT)..." >&2
+  : > "$RUNLOG"; rm -f "$OUT"   # clear any prior attempt's output so stale garbage can't survive
+  run_oracle "${PRO_GATE_MODEL_STRATEGY:-select}" || true
+  # UI fallback (notably macOS): model picker not found + no output -> retry with the default model.
+  if [ ! -s "$OUT" ] && grep -qiE "model selector|model.?picker" "$RUNLOG" 2>/dev/null; then
+    echo "[oracle-review] model picker not found — retrying with --browser-model-strategy current (ensure GPT-5.5 Pro Extended is your ChatGPT default)..." >&2
+    run_oracle current || true
+  fi
+  # Accept ONLY a real review, not just any non-empty file — a corrupted capture (e.g. a stray "A")
+  # must NOT pass as success; it falls through to salvage + retry below.
+  if pg_is_review "$OUT"; then
+    echo "[oracle-review] findings written ($(wc -c < "$OUT" 2>/dev/null) bytes)." >&2; break
+  fi
+  if [ -s "$OUT" ]; then
+    echo "[oracle-review] discarding a non-review capture ($(wc -c < "$OUT" 2>/dev/null) bytes, no VERDICT/Pn markers) — will salvage/retry." >&2
+  fi
+
+  # No output. The generation may have COMPLETED server-side after a dropped Chrome connection —
+  # try a bounded salvage (never hangs) before spending another slot. Capture the slug oracle
+  # actually used (it may differ from SLUG_BASE on a collision, e.g. ...-pr-804-2).
+  SLUG="$(grep -oE 'oracle session [A-Za-z0-9._-]+' "$RUNLOG" 2>/dev/null | tail -1 | awk '{print $NF}')"
+  [ -n "$SLUG" ] || SLUG="$SLUG_BASE"
+  echo "[oracle-review] no output — bounded salvage via reattach (session ${SLUG}, ${REATTACH_TIMEOUT}s)..." >&2
+  if pg_reattach_render "$SLUG" "$OUT" "$REATTACH_TIMEOUT"; then
+    echo "[oracle-review] salvaged a completed review via reattach." >&2
+    break
+  fi
+
+  attempt=$((attempt + 1))
+  [ "$attempt" -gt "$MAX_RETRIES" ] && break
+  echo "[oracle-review] review lost (likely a transient Chrome/connection drop, not a quota issue). Retrying once after ${BACKOFF}s + a health re-check..." >&2
+  sleep "$BACKOFF"
+done
+
+if pg_is_review "$OUT"; then
   cat "$OUT"
   echo "RESULT_FILE=$OUT"
   exit 0
 else
-  echo "ERROR: oracle produced no output (may have detached on timeout — reattach: oracle session pro-gate-review-pr-${PR_NUM:-diff})" >&2
+  echo "ERROR: oracle produced no usable review after salvage + ${attempt} retr$([ "${attempt:-0}" -eq 1 ] && echo y || echo ies) (reattach: oracle session ${SLUG_BASE})." >&2
   exit 6
 fi
