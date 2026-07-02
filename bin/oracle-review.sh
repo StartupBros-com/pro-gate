@@ -101,6 +101,13 @@ DIFF_LINES=$(wc -l < "$DIFF_FILE" 2>/dev/null || echo 0)
 echo "[oracle-review] os=$OS mode=$MODE repo=$REPO pr=#${PR_NUM} url=${PR_URL:-n/a} diff_lines=$DIFF_LINES input=$INPUT" >&2
 
 # --- build the review prompt (the product) ---
+# RUN_MARKER (v0.15, pro-gate PR#5 review P1): a per-attempt correlation id
+# embedded in the prompt, so the CDP probe/salvage match THIS run's
+# conversation tab and never a leftover tab from an earlier review of the
+# same PR (which would suppress the retry and serve a stale review for a
+# new head). The marker lands in the user message, hence in the tab's
+# innerText, without asking the model to echo anything.
+RUN_MARKER="pg-run-${PR_NUM:-diff}-$(date +%s)-$$"
 PROMPT_FILE="$WORK/prompt.md"
 {
   # Lead with the @GitHub connector tag + an explicit directive (belt-and-suspenders: oracle
@@ -147,6 +154,8 @@ where Pn is one of: P0 (critical / blocker / data-loss / security), P1 (major bu
 Group by severity, P0 first. If a severity has no findings, write "Pn: none".
 End with one final line:  VERDICT: SHIP | FIX-FIRST | NEEDS-DISCUSSION  — <=15 word reason.
 EOF
+  echo
+  echo "(run marker: ${RUN_MARKER} — internal correlation id; ignore it and do not mention it)"
 } > "$PROMPT_FILE"
 
 # --- assemble --file attachments (bundle mode) ---
@@ -237,7 +246,7 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
       # double-spend. Kill the blind CLI anyway (frees the browser slot) but
       # flag it so the caller skips reattach+retry and goes straight to the
       # outcome-based CDP salvage with the full remaining budget.
-      if command -v node >/dev/null 2>&1 && node "$SELF/cdp-salvage.mjs" --probe "${PR_URL:-pull/${PR_NUM:-diff}}" 30 >/dev/null 2>>"$RUNLOG"; then
+      if command -v node >/dev/null 2>&1 && node "$SELF/cdp-salvage.mjs" --probe "$RUN_MARKER" 30 >/dev/null 2>>"$RUNLOG"; then
         echo "[oracle-review] watchdog: no-think after $(( now - started ))s BUT a conversation tab matches this PR — submission is LIVE, detection missed. Freeing the slot; CDP salvage will collect the review (retry suppressed: quota already spent)." >&2
         LIVE_CONVERSATION=1
       else
@@ -325,8 +334,8 @@ if ! pg_is_review "$OUT" && command -v node >/dev/null 2>&1; then
   # Live conversation (v0.14 probe hit): the review may still be thinking, so
   # wait with the full hard-cap budget; otherwise a short window suffices.
   SALVAGE_SECS="$STALL_SECS"; [ "$LIVE_CONVERSATION" = 1 ] && SALVAGE_SECS="$HARD_SECS"
-  echo "[oracle-review] last-resort CDP tab salvage (marker ${PR_URL:-pull/$PR_NUM}, up to ${SALVAGE_SECS}s)..." >&2
-  if node "$SELF/cdp-salvage.mjs" "${PR_URL:-pull/$PR_NUM}" "$SALVAGE_SECS" > "$OUT.cdp" 2>>"$RUNLOG" && pg_is_review "$OUT.cdp"; then
+  echo "[oracle-review] last-resort CDP tab salvage (marker ${RUN_MARKER}, up to ${SALVAGE_SECS}s)..." >&2
+  if node "$SELF/cdp-salvage.mjs" "$RUN_MARKER" "$SALVAGE_SECS" > "$OUT.cdp" 2>>"$RUNLOG" && pg_is_review "$OUT.cdp"; then
     mv "$OUT.cdp" "$OUT"
     echo "[oracle-review] CDP salvage recovered a completed review." >&2
   else

@@ -205,16 +205,18 @@ pg_filter_diff() {
   ' "$in" > "$out"
 }
 
-# pg_is_review <file>: true only when <file> looks like a REAL review, not a truncated/garbage
-# capture (e.g. a stray "A"). Our prompt mandates a trailing "VERDICT:" line and Pn severity
-# blocks, so require a sane size AND at least one of those markers. Used by the main run path and
-# the salvage path so a corrupted capture is rejected -> salvage -> one retry, instead of being
-# accepted as success.
+# pg_is_review <file>: true only when <file> looks like a COMPLETE review, not a truncated or
+# garbage capture. Our prompt mandates Pn severity blocks AND one final "VERDICT:" line, so
+# require BOTH (v0.15, pro-gate PR#5 review P1: the old OR-grep accepted a capture truncated
+# after its first finding, which then skipped salvage/retry and shipped an incomplete review).
+# The VERDICT must sit on one of the last 3 non-empty lines: that rejects mid-file truncation
+# while tolerating up to two trailing footer lines from the capture (e.g. "Sources").
 pg_is_review() {
   local f="$1"
   [ -s "$f" ] || return 1
   [ "$(wc -c < "$f" 2>/dev/null || echo 0)" -ge 40 ] || return 1
-  grep -qiE 'VERDICT:|\[P[0-3]\]|P[0-3]:[[:space:]]*(none|—|-)' "$f" 2>/dev/null
+  grep -qiE '\[P[0-3]\]|P[0-3]:[[:space:]]*(none|—|-)' "$f" 2>/dev/null || return 1
+  grep -vE '^[[:space:]]*$' "$f" 2>/dev/null | tail -n 3 | grep -qE '^VERDICT:'
 }
 
 # pg_reattach_render <slug> <out> [timeout_s]: bounded attempt to SALVAGE a review whose

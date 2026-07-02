@@ -32,6 +32,23 @@ if pg_have oracle && pg_have npm; then
     P "oracle up to date ($ORACLE_LOCAL = npm latest)"
   fi
 fi
+# cdp-salvage helper (v0.15): without it the no-think probe cannot distinguish
+# a live run from a dead submission — live runs get killed AND retried
+# (double-spend risk), and the last-resort tab salvage is disabled.
+CDP_HELPER=""
+for c in "$SELF/cdp-salvage.mjs" "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/cdp-salvage.mjs"; do
+  [ -f "$c" ] && { CDP_HELPER="$c"; break; }
+done
+if [ -n "$CDP_HELPER" ]; then
+  NODE_MAJ="$(node -v 2>/dev/null | sed 's/^v\([0-9]*\).*/\1/')"
+  if [ "${NODE_MAJ:-0}" -ge 21 ] 2>/dev/null; then
+    P "cdp-salvage helper present (node v${NODE_MAJ} >= 21)"
+  else
+    W "cdp-salvage present but node ${NODE_MAJ:-missing} < 21 — probe/tab-salvage disabled (needs built-in WebSocket)"
+  fi
+else
+  W "cdp-salvage.mjs missing — no-think probe + tab salvage DISABLED; live runs can be misclassified as dead and retried (double-spend risk)"
+fi
 pg_have gh && { gh auth status >/dev/null 2>&1 && P "gh authenticated" || X "gh not authenticated — gh auth login"; } || X "gh (GitHub CLI) missing"
 pg_have git && P "git present" || X "git missing"
 pg_have claude && P "claude CLI present" || W "claude CLI missing (needed for the daemon's fixer)"
