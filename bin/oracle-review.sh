@@ -182,6 +182,24 @@ if [ ! -s "$OUT" ] && grep -qiE "model selector|model.?picker" "$RUNLOG" 2>/dev/
   run_oracle current || true
 fi
 
+# Last-resort CDP tab salvage: oracle (<=0.15.0) can fail to DETECT thinking
+# after ChatGPT UI drift even though the submission landed, and the review
+# then completes unnoticed in the conversation tab (reattach can bind a stale
+# tab target and harvest nothing). Before declaring failure, read the review
+# straight off the conversation tab's DOM, matched by PR marker so concurrent
+# review slots cannot cross-contaminate. Requires Node >= 21 for the built-in
+# WebSocket client. First seen: pushbot PR #863, 2026-07-02 (live daemon
+# shipped this as v0.13).
+if [ ! -s "$OUT" ] && command -v node >/dev/null 2>&1; then
+  echo "[oracle-review] no output — last-resort CDP tab salvage (marker ${PR_URL:-pull/${PR_NUM:-diff}}, up to ${PRO_GATE_SALVAGE_SECS:-600}s)..." >&2
+  if node "$SELF/cdp-salvage.mjs" "${PR_URL:-pull/${PR_NUM:-diff}}" "${PRO_GATE_SALVAGE_SECS:-600}" > "$OUT.cdp" 2>>"$RUNLOG" && grep -q '^VERDICT:' "$OUT.cdp"; then
+    mv "$OUT.cdp" "$OUT"
+    echo "[oracle-review] CDP salvage recovered a completed review." >&2
+  else
+    rm -f "$OUT.cdp"
+  fi
+fi
+
 if [ -s "$OUT" ]; then
   echo "[oracle-review] findings written." >&2
   cat "$OUT"
