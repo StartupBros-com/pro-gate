@@ -19,6 +19,36 @@ echo "pro-gate doctor — $OS (browser mode: $MODE, service: $SVC)"
 
 # core deps
 pg_have oracle && P "oracle installed ($(oracle --version 2>/dev/null | head -1))" || X "oracle missing — pnpm add -g @steipete/oracle"
+# Version-skew signal (warn-only, offline-tolerant): oracle is deliberately
+# pinned (UI-automation updates are themselves a break risk), but a newer
+# release often means upstream fixed ChatGPT UI drift. Upgrade DELIBERATELY
+# when reviews misbehave, never automatically.
+if pg_have oracle && pg_have npm; then
+  ORACLE_LOCAL="$(oracle --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+  ORACLE_LATEST="$(timeout 10 npm view @steipete/oracle version 2>/dev/null || true)"
+  if [ -n "$ORACLE_LATEST" ] && [ -n "$ORACLE_LOCAL" ] && [ "$ORACLE_LATEST" != "$ORACLE_LOCAL" ]; then
+    W "oracle $ORACLE_LOCAL installed, $ORACLE_LATEST published — upgrade deliberately (pnpm add -g @steipete/oracle) if reviews misbehave"
+  elif [ -n "$ORACLE_LATEST" ]; then
+    P "oracle up to date ($ORACLE_LOCAL = npm latest)"
+  fi
+fi
+# cdp-salvage helper (v0.15): without it the no-think probe cannot distinguish
+# a live run from a dead submission — live runs get killed AND retried
+# (double-spend risk), and the last-resort tab salvage is disabled.
+CDP_HELPER=""
+for c in "$SELF/cdp-salvage.mjs" "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/cdp-salvage.mjs"; do
+  [ -f "$c" ] && { CDP_HELPER="$c"; break; }
+done
+if [ -n "$CDP_HELPER" ]; then
+  NODE_MAJ="$(node -v 2>/dev/null | sed 's/^v\([0-9]*\).*/\1/')"
+  if [ "${NODE_MAJ:-0}" -ge 21 ] 2>/dev/null; then
+    P "cdp-salvage helper present (node v${NODE_MAJ} >= 21)"
+  else
+    W "cdp-salvage present but node ${NODE_MAJ:-missing} < 21 — probe/tab-salvage disabled (needs built-in WebSocket)"
+  fi
+else
+  W "cdp-salvage.mjs missing — no-think probe + tab salvage DISABLED; live runs can be misclassified as dead and retried (double-spend risk)"
+fi
 pg_have gh && { gh auth status >/dev/null 2>&1 && P "gh authenticated" || X "gh not authenticated — gh auth login"; } || X "gh (GitHub CLI) missing"
 pg_have git && P "git present" || X "git missing"
 pg_have claude && P "claude CLI present" || W "claude CLI missing (needed for the daemon's fixer)"
@@ -44,8 +74,16 @@ else
   W "macOS native mode — cannot pre-check ChatGPT login; ensure Chrome is signed into ChatGPT Pro"
 fi
 
+# environment fitness (mirrors the engine's pre-slot health gate, so the doctor predicts a defer)
+if [ "$MODE" = remote-chrome ]; then
+  up="$(pg_service_uptime)"
+  if [ "${up:-999999}" -ge "${PRO_GATE_MIN_UPTIME:-60}" ]; then P "oracle-chrome stable (${up}s uptime)"; else W "oracle-chrome only ${up}s uptime — engine will defer until it stabilizes"; fi
+fi
+if memreason="$(pg_mem_headroom_ok)"; then P "memory headroom ok for a review"; else W "memory pressure: ${memreason} — engine may defer the slot"; fi
+
 # config
 [ -n "${PRO_REVIEW_OWNERS:-}" ] && P "PRO_REVIEW_OWNERS='${PRO_REVIEW_OWNERS}'" || W "PRO_REVIEW_OWNERS unset (daemon needs it; interactive /pro-gate does not)"
+P "concurrency: up to ${PRO_GATE_MAX_CONCURRENCY:-3} review slot(s) (per-PR serialized; health-governed)"
 
 echo "  ── $ok ok, $warn warnings, $bad blocking ──"
 [ "$bad" -eq 0 ]
