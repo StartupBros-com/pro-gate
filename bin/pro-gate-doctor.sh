@@ -57,8 +57,16 @@ else
   W "macOS native mode — cannot pre-check ChatGPT login; ensure Chrome is signed into ChatGPT Pro"
 fi
 
+# environment fitness (mirrors the engine's pre-slot health gate, so the doctor predicts a defer)
+if [ "$MODE" = remote-chrome ]; then
+  up="$(pg_service_uptime)"
+  if [ "${up:-999999}" -ge "${PRO_GATE_MIN_UPTIME:-60}" ]; then P "oracle-chrome stable (${up}s uptime)"; else W "oracle-chrome only ${up}s uptime — engine will defer until it stabilizes"; fi
+fi
+if memreason="$(pg_mem_headroom_ok)"; then P "memory headroom ok for a review"; else W "memory pressure: ${memreason} — engine may defer the slot"; fi
+
 # config
 [ -n "${PRO_REVIEW_OWNERS:-}" ] && P "PRO_REVIEW_OWNERS='${PRO_REVIEW_OWNERS}'" || W "PRO_REVIEW_OWNERS unset (daemon needs it; interactive /pro-gate does not)"
+P "concurrency: up to ${PRO_GATE_MAX_CONCURRENCY:-3} review slot(s) (per-PR serialized; health-governed)"
 
 echo "  ── $ok ok, $warn warnings, $bad blocking ──"
 [ "$bad" -eq 0 ]

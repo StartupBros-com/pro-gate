@@ -32,6 +32,9 @@ MAX_BUDGET="${PRO_REVIEW_MAX_BUDGET_USD:-5}"
 MAX_FAILS="${PRO_REVIEW_MAX_FAILS:-3}"
 CDP_PORT="${ORACLE_BROWSER_PORT:-9222}"
 REPOS_DIR="${PRO_GATE_REPOS_DIR:-$HOME/SITES}"
+ALL_PRS="${PRO_REVIEW_ALL_PRS:-0}"                      # 1 = review ALL open non-draft PRs in OWNERS (not just `pro-review`-labeled)
+SKIP_LABEL="${PRO_REVIEW_SKIP_LABEL:-skip-pro-review}"  # in all-PRs mode, this label opts a PR back OUT
+AUTOCLONE="${PRO_REVIEW_AUTOCLONE:-1}"                  # clone a missing repo under REPOS_DIR instead of skipping it
 
 log(){ printf '%s %s\n' "$(date '+%F %T')" "$*"; }
 
@@ -89,7 +92,13 @@ process_pr(){
   local slug="${nwo//\//-}-${num}"
   local repodir; repodir="$(find_repo "$nwo")"
   if [ -z "$repodir" ]; then
-    log "  ! no local checkout for $nwo under $REPOS_DIR — skipping (clone it there to enable)"; return 1
+    if [ "$AUTOCLONE" = "1" ]; then
+      repodir="$REPOS_DIR/${nwo##*/}"
+      log "  + autoclone $nwo -> $repodir"
+      gh repo clone "$nwo" "$repodir" >>"$LOGDIR/autoclone.log" 2>&1 || { log "  ! clone failed for $nwo (see $LOGDIR/autoclone.log)"; return 1; }
+    else
+      log "  ! no local checkout for $nwo under $REPOS_DIR — skipping (clone it there, or set PRO_REVIEW_AUTOCLONE=1)"; return 1
+    fi
   fi
 
   local wt="${TMPDIR:-/tmp}/pro-review-${slug}"
@@ -105,6 +114,7 @@ process_pr(){
 
   # Headless Claude runs the /pro-gate skill (which picks the best available fixer). Ironclad: never merge.
   local prompt="Run the /pro-gate skill for PR #${num} (${url}) in this repository in auto-fix mode: get the GPT-5.5 Pro Extended review, sanity-check each P0/P1 finding against the actual code, apply the confirmed fixes on this branch, run available tests/lint, commit as 'fix(pro-gate): <summary>', push to origin/${branch}, and post ONE PR comment containing the full Pro Extended review plus what you fixed.
+SYNCHRONOUS EXECUTION (critical): you are running headless — you will NOT receive any asynchronous background-task notification. After you launch the oracle review, you MUST poll its --out file in a loop yourself (e.g. repeatedly: sleep 60; check if the file is non-empty) and KEEP WORKING until it returns. The oracle takes 10-30 minutes; that is expected. Do NOT end your turn, and do NOT say 'I will be notified', while the oracle is still running. Your turn is only complete once the PR comment has actually been posted.
 CRITICAL: do NOT merge the PR, do NOT open new PRs, do NOT change the base branch. Stop after pushing fixes and posting the comment. If no fixes are warranted, just post the review summary comment and stop."
 
   ( cd "$wt" && timeout 5400 claude -p "$prompt" \
@@ -137,7 +147,7 @@ CRITICAL: do NOT merge the PR, do NOT open new PRs, do NOT change the base branc
 }
 
 # --- main loop --------------------------------------------------------------
-log "pro-review-daemon starting (os=$OS mode=$MODE owners='$OWNERS' label='$LABEL' poll=${POLL}s model=$CLAUDE_MODEL)"
+log "pro-review-daemon starting (os=$OS mode=$MODE owners='$OWNERS' poll=${POLL}s model=$CLAUDE_MODEL all_prs=$ALL_PRS autoclone=$AUTOCLONE $( [ "$ALL_PRS" = 1 ] && echo "skip-label='$SKIP_LABEL'" || echo "label='$LABEL'" ))"
 while true; do
   if [ -f "$PAUSE" ]; then log "PAUSE present — idling"; sleep "$POLL"; continue; fi
   if ! session_up; then log "browser session down — idling"; sleep "$POLL"; continue; fi
@@ -146,8 +156,14 @@ while true; do
 
   found=0
   for owner in $OWNERS; do
-    prs=$(gh search prs --owner "$owner" --label "$LABEL" --state open --limit 30 \
-            --json 'repository,number,url' 2>/dev/null)
+    if [ "$ALL_PRS" = "1" ]; then
+      # Review EVERY open non-draft PR in the owner, except ones opted out via $SKIP_LABEL.
+      prs=$(gh search prs "-label:$SKIP_LABEL" --owner "$owner" --state open --draft=false --limit 50 \
+              --json 'repository,number,url' 2>/dev/null)
+    else
+      prs=$(gh search prs --owner "$owner" --label "$LABEL" --state open --limit 30 \
+              --json 'repository,number,url' 2>/dev/null)
+    fi
     [ -z "$prs" ] && continue
     while IFS=$'\t' read -r nwo num url; do
       [ -z "$nwo" ] && continue
@@ -160,6 +176,6 @@ while true; do
       [ -f "$PAUSE" ] && break
     done < <(echo "$prs" | jq -r '.[] | [.repository.nameWithOwner, (.number|tostring), .url] | @tsv')
   done
-  [ "$found" -eq 0 ] && log "no labeled PRs pending"
+  [ "$found" -eq 0 ] && log "no PRs pending"
   sleep "$POLL"
 done

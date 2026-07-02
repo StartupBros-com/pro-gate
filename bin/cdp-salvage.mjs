@@ -10,15 +10,21 @@
 // conversation tab by PR marker, waits for the VERDICT line, and prints the
 // review block. First seen: pushbot PR #863, 2026-07-02.
 //
-// Usage: cdp-salvage.mjs <pr-marker> [timeout-secs] [cdp-port]
+// Usage: cdp-salvage.mjs [--probe] <pr-marker> [timeout-secs] [cdp-port]
 //   pr-marker    substring identifying the right conversation (e.g. the PR
 //                URL or "pull/863"); required because up to 3 review slots
 //                may have concurrent conversation tabs open.
-// Exit: 0 = review printed to stdout; 4 = timeout; 2 = usage/CDP error.
+//   --probe      liveness check only: exit 0 as soon as a conversation tab
+//                matching the marker EXISTS (no VERDICT wait). Used by the
+//                engine's no-think watchdog to distinguish "dead submission,
+//                safe to retry" from "live run, retry would double-spend".
+// Exit: 0 = review printed (probe: tab found); 4 = timeout; 2 = usage/CDP error.
 // Requires Node >= 21 (global WebSocket); the box runs Node 24.
 
-const [marker, timeoutSecs = '600', port = process.env.ORACLE_CDP_PORT ?? '9222'] = process.argv.slice(2);
-if (!marker) { console.error('usage: cdp-salvage.mjs <pr-marker> [timeout-secs] [cdp-port]'); process.exit(2); }
+const argv = process.argv.slice(2);
+const probe = argv[0] === '--probe' && argv.shift();
+const [marker, timeoutSecs = probe ? '30' : '600', port = process.env.ORACLE_CDP_PORT ?? '9222'] = argv;
+if (!marker) { console.error('usage: cdp-salvage.mjs [--probe] <pr-marker> [timeout-secs] [cdp-port]'); process.exit(2); }
 const deadline = Date.now() + Number(timeoutSecs) * 1000;
 const POLL_MS = 20_000;
 
@@ -55,11 +61,12 @@ while (Date.now() < deadline) {
   for (const tab of tabs) {
     const text = await tabText(tab);
     if (!text || !text.includes(marker)) continue;
+    if (probe) { console.error(`live conversation tab: ${tab.url}`); process.exit(0); }
     const review = extractReview(text);
     if (review) { console.log(review); process.exit(0); }
     console.error(`conversation found (${tab.url}) but no VERDICT yet; waiting...`);
   }
-  await new Promise((r) => setTimeout(r, POLL_MS));
+  await new Promise((r) => setTimeout(r, probe ? 5_000 : POLL_MS));
 }
-console.error(`timeout: no completed review matching "${marker}" after ${timeoutSecs}s`);
+console.error(`timeout: no ${probe ? 'conversation tab' : 'completed review'} matching "${marker}" after ${timeoutSecs}s`);
 process.exit(4);
