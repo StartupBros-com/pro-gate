@@ -19,6 +19,19 @@ echo "pro-gate doctor — $OS (browser mode: $MODE, service: $SVC)"
 
 # core deps
 pg_have oracle && P "oracle installed ($(oracle --version 2>/dev/null | head -1))" || X "oracle missing — pnpm add -g @steipete/oracle"
+# Version-skew signal (warn-only, offline-tolerant): oracle is deliberately
+# pinned (UI-automation updates are themselves a break risk), but a newer
+# release often means upstream fixed ChatGPT UI drift. Upgrade DELIBERATELY
+# when reviews misbehave, never automatically.
+if pg_have oracle && pg_have npm; then
+  ORACLE_LOCAL="$(oracle --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+  ORACLE_LATEST="$(timeout 10 npm view @steipete/oracle version 2>/dev/null || true)"
+  if [ -n "$ORACLE_LATEST" ] && [ -n "$ORACLE_LOCAL" ] && [ "$ORACLE_LATEST" != "$ORACLE_LOCAL" ]; then
+    W "oracle $ORACLE_LOCAL installed, $ORACLE_LATEST published — upgrade deliberately (pnpm add -g @steipete/oracle) if reviews misbehave"
+  elif [ -n "$ORACLE_LATEST" ]; then
+    P "oracle up to date ($ORACLE_LOCAL = npm latest)"
+  fi
+fi
 pg_have gh && { gh auth status >/dev/null 2>&1 && P "gh authenticated" || X "gh not authenticated — gh auth login"; } || X "gh (GitHub CLI) missing"
 pg_have git && P "git present" || X "git missing"
 pg_have claude && P "claude CLI present" || W "claude CLI missing (needed for the daemon's fixer)"
