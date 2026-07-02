@@ -11,8 +11,30 @@ separate usage pool from the Codex fixer) for what they missed, then applies the
 
 Engine: `oracle-review.sh` (in `$PRO_GATE_HOME`, default `~/.pro-review-daemon`) — the single source
 of truth for the oracle call; cross-platform (macOS drives your signed-in Chrome natively; WSL/Linux
-attaches to the Xvfb Chrome). Verify setup any time with `pro-gate-doctor.sh`. Never re-run a detached
-oracle session — reattach with `oracle session <slug>` (re-running double-spends the Pro Extended quota).
+attaches to the Xvfb Chrome). Verify setup any time with `pro-gate-doctor.sh`.
+
+**Detached vs dead sessions — different rules:**
+- **Ground truth is the BROWSER, not oracle's log.** oracle can miss the thinking state after
+  ChatGPT UI drift (seen 2026-07-02: it logged `no thinking status detected` for 10 min while the
+  review was mid-thought). Before treating ANY run as dead, check for a live conversation tab:
+  `curl -s localhost:9222/json` — a `chatgpt.com/c/...` page tab whose text matches the PR means
+  the run is LIVE or DONE and quota is SPENT: never re-run.
+- **Detached but thinking** (conversation tab exists / output growing): NEVER re-run. Prefer
+  `node $PRO_GATE_HOME/cdp-salvage.mjs "<pr-url-or-pull/NNN>" <secs>` — it waits for the
+  `VERDICT:` line in the tab and prints the review. (`oracle session <slug> --harvest` can bind a
+  STALE tab target after a watchdog kill and harvest nothing — trust the CDP path.)
+- **Dead submission** (no conversation tab matching the PR + log repeated `no thinking status
+  detected`): no quota consumed — kill the process tree and re-run safely.
+- **Engine ≥v0.14 does all of this itself**: hard-cap/stall/no-think watchdogs, a CDP
+  probe-before-kill at the no-think timeout (live tab → frees the slot, SUPPRESSES the retry,
+  collects via cdp-salvage with the full budget), and cdp-salvage as last resort before failing.
+  Manual salvage is only needed on engines older than v0.13 or when Chrome itself died.
+  Tune with `PRO_GATE_NOTHINK_SECS` / `PRO_GATE_STALL_SECS` (default 600) and
+  `PRO_GATE_TIMEOUT_GRACE` (default +120s on the hard cap).
+
+**Codex on Windows:** run the engine through WSL, not native PowerShell path syntax. Use WSL repo paths
+such as `/home/will/SITES/<repo>` and invoke commands with `wsl -e bash -lc '...'`; the default engine
+home is `/home/will/.pro-review-daemon`.
 
 ## 1. Resolve target + mode
 
@@ -63,8 +85,9 @@ issue · your confidence) plus the verdict.
 
 - **review-only:** post the findings as a PR comment (`gh pr comment <num> --body-file`) and stop.
 - **auto-fix:** route confirmed P0/P1 (and clear P2s) to the **best available fixer**, in order:
-  (1) if the Compound Engineering plugin is installed → `/ce-work-beta delegate:codex` (skip if the
-  codex doghouse `~/.codex/.doghouse` is tripped); (2) else if `codex` is on PATH → `codex exec`;
+  (1) if the Compound Engineering plugin is installed → `/ce-work` (native tiering since CE 3.17.1
+  routes to codex when appropriate; skip if the codex doghouse `~/.codex/.doghouse` is tripped);
+  (2) else if `codex` is on PATH → `codex exec`;
   (3) else → apply the edits yourself directly in this session. Then run available tests/lint, commit
   `fix(pro-gate): <summary>`, push, and post a PR comment with the review + what was fixed. Stop
   before merge — the human merges.
