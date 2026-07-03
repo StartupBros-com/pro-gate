@@ -31,7 +31,10 @@ const POLL_MS = 20_000;
 async function tabText(tab) {
   return await new Promise((resolve) => {
     const ws = new WebSocket(tab.webSocketDebuggerUrl);
-    const bail = setTimeout(() => { try { ws.close(); } catch {} resolve(null); }, 15_000);
+    // 5s bail: a healthy renderer answers in well under a second; suspended
+    // renderers never answer, and orphaned conversation tabs accumulate on
+    // the persistent Chrome, so a long bail makes every poll cycle crawl.
+    const bail = setTimeout(() => { try { ws.close(); } catch {} resolve(null); }, 5_000);
     ws.onerror = () => { clearTimeout(bail); resolve(null); };
     ws.onopen = () => ws.send(JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: { expression: 'document.body.innerText', returnByValue: true } }));
     ws.onmessage = (ev) => {
@@ -39,6 +42,46 @@ async function tabText(tab) {
       if (m.id === 1) { clearTimeout(bail); try { ws.close(); } catch {} resolve(m.result?.result?.value ?? null); }
     };
   });
+}
+
+// v0.17: renderer-dead-tab fallback. Under Xvfb a background conversation
+// tab's renderer can suspend or crash: Runtime.evaluate then returns nothing
+// (and /json/activate does NOT revive it) even though the finished review
+// exists in ChatGPT server state. Re-render the SAME conversation URL in a
+// fresh scratch tab (non-destructive; uses the signed-in profile), read the
+// text there, and close the scratch tab. Conversations whose fresh render
+// loads fully but shows no marker belong to another review and are
+// blacklisted for the rest of this invocation.
+const FRESH_RENDERS_PER_CYCLE = 3;
+const nonMatching = new Set();
+
+async function freshRenderText(url, port) {
+  let target = null;
+  try {
+    let res = await fetch(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(url)}`, { method: 'PUT' });
+    if (!res.ok) res = await fetch(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(url)}`); // pre-v111 Chrome used GET
+    if (!res.ok) return { text: null, loaded: false };
+    target = await res.json();
+    const renderDeadline = Date.now() + 25_000;
+    let text = null;
+    while (Date.now() < renderDeadline) {
+      await new Promise((r) => setTimeout(r, 2_500));
+      const tabs = await (await fetch(`http://127.0.0.1:${port}/json`)).json();
+      const live = tabs.find((t) => t.id === target.id);
+      if (!live) break;
+      text = await tabText(live);
+      // the conversation view is loaded once the page shows real content
+      // beyond the shell (heuristic: some minimum body text)
+      if (text && text.trim().length > 200) return { text, loaded: true };
+    }
+    return { text, loaded: false };
+  } catch {
+    return { text: null, loaded: false };
+  } finally {
+    if (target?.id) {
+      try { await fetch(`http://127.0.0.1:${port}/json/close/${target.id}`); } catch {}
+    }
+  }
 }
 
 function extractReview(text) {
@@ -58,13 +101,34 @@ while (Date.now() < deadline) {
     tabs = (await (await fetch(`http://127.0.0.1:${port}/json`)).json())
       .filter((t) => t.type === 'page' && /chatgpt\.com\/c\//.test(t.url || ''));
   } catch (e) { console.error(`CDP list failed: ${e.message}`); process.exit(2); }
-  for (const tab of tabs) {
-    const text = await tabText(tab);
-    if (!text || !text.includes(marker)) continue;
+  const deadTabs = [];
+  const reads = await Promise.all(tabs.map(async (tab) => ({ tab, text: await tabText(tab) })));
+  for (const { tab, text } of reads) {
+    if (text === null || text.trim() === '') { deadTabs.push(tab); continue; }
+    if (!text.includes(marker)) continue;
     if (probe) { console.error(`live conversation tab: ${tab.url}`); process.exit(0); }
     const review = extractReview(text);
     if (review) { console.log(review); process.exit(0); }
     console.error(`conversation found (${tab.url}) but no VERDICT yet; waiting...`);
+  }
+  // v0.17 fallback: unreadable tabs get their URL re-rendered in a scratch tab
+  let renders = 0;
+  for (const tab of deadTabs) {
+    if (Date.now() >= deadline) break;
+    if (renders >= FRESH_RENDERS_PER_CYCLE) break;
+    if (nonMatching.has(tab.url)) continue;
+    renders += 1;
+    console.error(`tab unreadable (renderer dead?): ${tab.url} — re-rendering in a scratch tab...`);
+    const { text, loaded } = await freshRenderText(tab.url, port);
+    if (!text) continue;
+    if (!text.includes(marker)) {
+      if (loaded) nonMatching.add(tab.url); // fully loaded, different review — skip from now on
+      continue;
+    }
+    if (probe) { console.error(`live conversation (via fresh render): ${tab.url}`); process.exit(0); }
+    const review = extractReview(text);
+    if (review) { console.log(review); process.exit(0); }
+    console.error(`conversation matches (via fresh render, ${tab.url}) but no VERDICT yet; waiting...`);
   }
   await new Promise((r) => setTimeout(r, probe ? 5_000 : POLL_MS));
 }
