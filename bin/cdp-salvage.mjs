@@ -55,28 +55,28 @@ async function tabText(tab) {
 const FRESH_RENDERS_PER_CYCLE = 3;
 const nonMatching = new Set();
 
-async function freshRenderText(url, port) {
+async function freshRenderText(url, port, outerDeadline) {
   let target = null;
   try {
     let res = await fetch(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(url)}`, { method: 'PUT' });
     if (!res.ok) res = await fetch(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(url)}`); // pre-v111 Chrome used GET
-    if (!res.ok) return { text: null, loaded: false };
+    if (!res.ok) return { text: null };
     target = await res.json();
-    const renderDeadline = Date.now() + 25_000;
+    // never grant more than the caller's remaining budget (a 30s probe must
+    // not stall watchdog/retry decisions by overrunning its own window)
+    const renderDeadline = Math.min(Date.now() + 25_000, outerDeadline);
     let text = null;
-    while (Date.now() < renderDeadline) {
+    while (Date.now() + 2_500 < renderDeadline) {
       await new Promise((r) => setTimeout(r, 2_500));
       const tabs = await (await fetch(`http://127.0.0.1:${port}/json`)).json();
       const live = tabs.find((t) => t.id === target.id);
       if (!live) break;
       text = await tabText(live);
-      // the conversation view is loaded once the page shows real content
-      // beyond the shell (heuristic: some minimum body text)
-      if (text && text.trim().length > 200) return { text, loaded: true };
+      if (text && text.trim().length > 200) return { text };
     }
-    return { text, loaded: false };
+    return { text };
   } catch {
-    return { text: null, loaded: false };
+    return { text: null };
   } finally {
     if (target?.id) {
       try { await fetch(`http://127.0.0.1:${port}/json/close/${target.id}`); } catch {}
@@ -119,10 +119,17 @@ while (Date.now() < deadline) {
     if (nonMatching.has(tab.url)) continue;
     renders += 1;
     console.error(`tab unreadable (renderer dead?): ${tab.url} — re-rendering in a scratch tab...`);
-    const { text, loaded } = await freshRenderText(tab.url, port);
+    const { text } = await freshRenderText(tab.url, port, deadline);
     if (!text) continue;
     if (!text.includes(marker)) {
-      if (loaded) nonMatching.add(tab.url); // fully loaded, different review — skip from now on
+      // Blacklist ONLY on positive evidence: the page carries someone
+      // ELSE's run marker, proving it rendered a different review's
+      // conversation. Shell/login/error pages and pre-hydration renders can
+      // exceed any length heuristic without being the conversation at all;
+      // blacklisting those could permanently hide the real review and let
+      // --probe green-light a double-spending retry. Anything without a
+      // foreign marker is treated as not-ready and retried next cycle.
+      if (/pg-run-[A-Za-z0-9.-]+/.test(text)) nonMatching.add(tab.url);
       continue;
     }
     if (probe) { console.error(`live conversation (via fresh render): ${tab.url}`); process.exit(0); }
