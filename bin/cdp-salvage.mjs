@@ -57,7 +57,8 @@ const POLL_MS = 20_000;
 
 const PG_HOME = process.env.PRO_GATE_HOME ?? path.join(os.homedir(), '.pro-review-daemon');
 const BLACKLIST_FILE = path.join(PG_HOME, 'salvage-nonmatching.txt');
-const COOLDOWN_FILE = path.join(PG_HOME, 'throttle.cooldown');
+// honor the same override pg_health_gate reads, or a detected throttle would never defer runs
+const COOLDOWN_FILE = process.env.PRO_GATE_COOLDOWN_FILE ?? path.join(PG_HOME, 'throttle.cooldown');
 // The interstitial's two distinctive sentences. Deliberately NOT a generic
 // /rate.?limit/ — review findings routinely discuss rate limits.
 const THROTTLE_RE = /making requests too quickly|temporarily limited access to your conversations/i;

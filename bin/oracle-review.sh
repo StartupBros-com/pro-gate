@@ -48,10 +48,22 @@ pg_have oracle || { echo "ERROR: oracle not installed (pnpm add -g @steipete/ora
 # watchdog-killed, live-detected, salvaging, retry-wait, throttled, deferred, done, failed.
 # Terminal phases: done (read $OUT), failed, deferred (no slot spent — retry later).
 STATUS_FILE="$OUT.status"
-pg_status() {  # $1 phase, $2 optional detail (keep both free of double quotes)
-  printf '{"phase":"%s","attempt":%d,"detail":"%s","pr":"%s","out":"%s","ts":"%s"}\n' \
-    "$1" "${attempt:-0}" "${2:-}" "${PR_NUM:-diff}" "$OUT" "$(date +%Y-%m-%dT%H:%M:%S%z)" \
-    > "$STATUS_FILE.tmp" 2>/dev/null && mv -f "$STATUS_FILE.tmp" "$STATUS_FILE" 2>/dev/null || true
+pg_status() {  # $1 phase, $2 optional detail — variable fields are JSON-escaped (v0.18.1:
+  # $OUT is caller-supplied; a quote/backslash in it would corrupt the polling contract)
+  local phase="$1" detail="${2:-}" ts
+  ts="$(date +%Y-%m-%dT%H:%M:%S%z)"
+  if pg_have jq; then
+    jq -nc --arg phase "$phase" --argjson attempt "${attempt:-0}" --arg detail "$detail" \
+       --arg pr "${PR_NUM:-diff}" --arg out "$OUT" --arg ts "$ts" \
+       '{phase:$phase,attempt:$attempt,detail:$detail,pr:$pr,out:$out,ts:$ts}' \
+       > "$STATUS_FILE.tmp" 2>/dev/null
+  else
+    printf '{"phase":"%s","attempt":%d,"detail":"%s","pr":"%s","out":"%s","ts":"%s"}\n' \
+      "$phase" "${attempt:-0}" "$(printf '%s' "$detail" | tr -d '"\\' | tr '\n' ' ')" \
+      "${PR_NUM:-diff}" "$(printf '%s' "$OUT" | tr -d '"\\' | tr '\n' ' ')" "$ts" \
+      > "$STATUS_FILE.tmp" 2>/dev/null
+  fi
+  { [ -s "$STATUS_FILE.tmp" ] && mv -f "$STATUS_FILE.tmp" "$STATUS_FILE"; } 2>/dev/null || true
 }
 pg_status preflight
 
@@ -335,6 +347,10 @@ while :; do
       exit 8
     fi
     echo "[oracle-review] not retrying (${GATE_REASON}) — falling through to salvage." >&2
+    # v0.18.1 (pro-gate self-review P1): when the gate failure IS the throttle cooldown,
+    # take the throttle path — otherwise the final salvage would render conversations
+    # against the still-throttled account immediately, bypassing the protective pause.
+    case "$GATE_REASON" in *"throttle cooldown"*) THROTTLED=1 ;; esac
     break
   fi
 
