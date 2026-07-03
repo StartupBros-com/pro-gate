@@ -74,6 +74,31 @@ usage_saturated(){
 already_done(){ grep -qF "$(printf '%s\t%s\t%s' "$1" "$2" "$3")" "$STATE"; }
 mark_done(){ printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$STATE"; }
 
+# Per-cycle memo around usage_saturated, checked lazily just before the FIRST review of a
+# cycle — the old top-of-loop check hit chatgpt.com/backend-api every POLL even when there
+# was nothing to review (~480 needless account hits/day). Returns 0 = saturated.
+SATURATED=""
+usage_gate(){
+  if [ -z "$SATURATED" ]; then
+    if usage_saturated; then SATURATED=1; else SATURATED=0; fi
+  fi
+  [ "$SATURATED" = 1 ]
+}
+
+# Count a failed attempt for repo#pr@sha (ANY failure class: clone, worktree, claude run) and
+# give up permanently after MAX_FAILS — previously only claude-run failures were counted, so a
+# broken clone/worktree retried every cycle forever.
+note_fail(){ # nwo num sha log reason
+  printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$FAILS"
+  local fc; fc=$(grep -cF "$(printf '%s\t%s\t%s' "$1" "$2" "$3")" "$FAILS" 2>/dev/null || echo 1)
+  if [ "${fc:-1}" -ge "$MAX_FAILS" ]; then
+    log "  ✗ $1#$2 failed ${fc}x (${5}) — giving up (marking done; fix manually or re-push to retry). log $4"
+    mark_done "$1" "$2" "$3"
+  else
+    log "  ! $1#$2 failed (${5}, attempt ${fc}/${MAX_FAILS}) — will retry next cycle (log $4)"
+  fi
+}
+
 # --- find a local checkout of owner/repo ------------------------------------
 find_repo(){
   local nwo="$1" name="${1##*/}"
@@ -95,7 +120,7 @@ process_pr(){
     if [ "$AUTOCLONE" = "1" ]; then
       repodir="$REPOS_DIR/${nwo##*/}"
       log "  + autoclone $nwo -> $repodir"
-      gh repo clone "$nwo" "$repodir" >>"$LOGDIR/autoclone.log" 2>&1 || { log "  ! clone failed for $nwo (see $LOGDIR/autoclone.log)"; return 1; }
+      gh repo clone "$nwo" "$repodir" >>"$LOGDIR/autoclone.log" 2>&1 || { note_fail "$nwo" "$num" "$sha" "$LOGDIR/autoclone.log" "clone failed"; return 1; }
     else
       log "  ! no local checkout for $nwo under $REPOS_DIR — skipping (clone it there, or set PRO_REVIEW_AUTOCLONE=1)"; return 1
     fi
@@ -108,13 +133,13 @@ process_pr(){
   ( cd "$repodir" && git fetch --quiet origin "$branch" 2>/dev/null )
   git -C "$repodir" worktree remove --force "$wt" 2>/dev/null || true
   if ! git -C "$repodir" worktree add --force "$wt" "origin/$branch" >>"$lg" 2>&1; then
-    log "  ! worktree add failed for $nwo#$num (see $lg)"; return 1
+    note_fail "$nwo" "$num" "$sha" "$lg" "worktree add failed"; return 1
   fi
   ( cd "$wt" && git switch -C "$branch" "origin/$branch" >>"$lg" 2>&1 || git checkout -B "$branch" >>"$lg" 2>&1 )
 
   # Headless Claude runs the /pro-gate skill (which picks the best available fixer). Ironclad: never merge.
   local prompt="Run the /pro-gate skill for PR #${num} (${url}) in this repository in auto-fix mode: get the GPT-5.5 Pro Extended review, sanity-check each P0/P1 finding against the actual code, apply the confirmed fixes on this branch, run available tests/lint, commit as 'fix(pro-gate): <summary>', push to origin/${branch}, and post ONE PR comment containing the full Pro Extended review plus what you fixed.
-SYNCHRONOUS EXECUTION (critical): you are running headless — you will NOT receive any asynchronous background-task notification. After you launch the oracle review, you MUST poll its --out file in a loop yourself (e.g. repeatedly: sleep 60; check if the file is non-empty) and KEEP WORKING until it returns. The oracle takes 10-30 minutes; that is expected. Do NOT end your turn, and do NOT say 'I will be notified', while the oracle is still running. Your turn is only complete once the PR comment has actually been posted.
+SYNCHRONOUS EXECUTION (critical): you are running headless — you will NOT receive any asynchronous background-task notification. After you launch the oracle review, you MUST poll its status file in a loop yourself: the engine writes single-line JSON to '<out>.status' at every phase change (poll it, e.g. repeatedly: sleep 60; cat the status file). Phase 'done' means read the --out file; 'failed'/'deferred' are terminal — report them, do NOT relaunch. The oracle takes 10-30 minutes; that is expected. Do NOT end your turn, and do NOT say 'I will be notified', while the oracle is still running. Your turn is only complete once the PR comment has actually been posted.
 CRITICAL: do NOT merge the PR, do NOT open new PRs, do NOT change the base branch. Stop after pushing fixes and posting the comment. If no fixes are warranted, just post the review summary comment and stop."
 
   ( cd "$wt" && timeout 5400 claude -p "$prompt" \
@@ -135,14 +160,7 @@ CRITICAL: do NOT merge the PR, do NOT open new PRs, do NOT change the base branc
     [ -n "$newsha" ] && [ "$newsha" != "$sha" ] && mark_done "$nwo" "$num" "$newsha"
     log "  ✓ done $nwo#$num (rc=0; head now ${newsha:0:8})"
   else
-    printf '%s\t%s\t%s\n' "$nwo" "$num" "$sha" >> "$FAILS"
-    local fc; fc=$(grep -cF "$(printf '%s\t%s\t%s' "$nwo" "$num" "$sha")" "$FAILS" 2>/dev/null || echo 1)
-    if [ "${fc:-1}" -ge "$MAX_FAILS" ]; then
-      log "  ✗ $nwo#$num failed ${fc}x at ${sha:0:8} — giving up (marking done; fix manually or re-push to retry). log $lg"
-      mark_done "$nwo" "$num" "$sha"
-    else
-      log "  ! claude run failed for $nwo#$num (rc=$rc, attempt ${fc}/${MAX_FAILS}) — will retry next cycle (log $lg)"
-    fi
+    note_fail "$nwo" "$num" "$sha" "$lg" "claude run rc=$rc"
   fi
 }
 
@@ -152,14 +170,16 @@ while true; do
   if [ -f "$PAUSE" ]; then log "PAUSE present — idling"; sleep "$POLL"; continue; fi
   if ! session_up; then log "browser session down — idling"; sleep "$POLL"; continue; fi
   if doghouse_tripped; then log "codex doghouse tripped — idling"; sleep "$POLL"; continue; fi
-  if usage_saturated; then log "account usage saturated (>=90% / limit) — idling"; sleep "$POLL"; continue; fi
 
-  found=0
+  found=0; SATURATED=""
   for owner in $OWNERS; do
     if [ "$ALL_PRS" = "1" ]; then
       # Review EVERY open non-draft PR in the owner, except ones opted out via $SKIP_LABEL.
-      prs=$(gh search prs "-label:$SKIP_LABEL" --owner "$owner" --state open --draft=false --limit 50 \
-              --json 'repository,number,url' 2>/dev/null)
+      # The exclusion query starts with "-", so it must come AFTER "--" or gh's flag parser
+      # rejects it ("unknown shorthand flag: 'l'") — which 2>/dev/null used to swallow,
+      # silently reviewing nothing in all-PRs mode.
+      prs=$(gh search prs --owner "$owner" --state open --draft=false --limit 50 \
+              --json 'repository,number,url' -- "-label:$SKIP_LABEL" 2>/dev/null)
     else
       prs=$(gh search prs --owner "$owner" --label "$LABEL" --state open --limit 30 \
               --json 'repository,number,url' 2>/dev/null)
@@ -171,10 +191,12 @@ while true; do
       sha=$(echo "$meta" | jq -r '.headRefOid // empty'); branch=$(echo "$meta" | jq -r '.headRefName // empty')
       [ -z "$sha" ] && continue
       already_done "$nwo" "$num" "$sha" && continue
+      if usage_gate; then log "account usage saturated (>=90% / limit) — skipping this cycle"; break; fi
       found=1
       process_pr "$nwo" "$num" "$sha" "$branch" "$url"
       [ -f "$PAUSE" ] && break
     done < <(echo "$prs" | jq -r '.[] | [.repository.nameWithOwner, (.number|tostring), .url] | @tsv')
+    [ "$SATURATED" = 1 ] && break
   done
   [ "$found" -eq 0 ] && log "no PRs pending"
   sleep "$POLL"

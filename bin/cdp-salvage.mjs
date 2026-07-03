@@ -10,16 +10,43 @@
 // conversation tab by PR marker, waits for the VERDICT line, and prints the
 // review block. First seen: pushbot PR #863, 2026-07-02.
 //
+// v0.18: ChatGPT-throttle awareness + polite fresh-render budget.
+//   - Detects ChatGPT's anti-scraping interstitial ("You're making requests
+//     too quickly" / "temporarily limited access to your conversations"),
+//     writes a cooldown file the engine's health gate honors, and exits 5
+//     immediately — continuing to hammer a throttled account only sustains
+//     the throttle (observed 2026-07-03).
+//   - Fresh renders are budgeted PER URL (each one is a full conversation
+//     page load against chatgpt.com — exactly the request pattern the
+//     throttle targets; 42 loads in one salvage on 2026-07-02). URLs that
+//     never match this run get at most MAX_RENDERS_PER_URL loads per
+//     invocation; the one URL that DOES match is re-rendered at most once
+//     per RENDER_INTERVAL_MS while waiting for its VERDICT.
+//   - Foreign-marker URLs are blacklisted PERSISTENTLY (salvage-nonmatching.txt
+//     in $PRO_GATE_HOME) so later invocations never re-render conversations
+//     that are provably another run's.
+//   - A transient CDP /json failure no longer aborts the whole salvage (an
+//     exit 2 mid-probe read as "dead submission" and green-lit a
+//     double-spending retry); it now backs off and retries until the deadline.
+//   - After a successful (non-probe) harvest the matched conversation tab is
+//     closed: watchdog-killed runs never archive their tab, and those
+//     orphaned tabs were the pool every later salvage burned renders on.
+//
 // Usage: cdp-salvage.mjs [--probe] <pr-marker> [timeout-secs] [cdp-port]
 //   pr-marker    substring identifying the right conversation (e.g. the PR
-//                URL or "pull/863"); required because up to 3 review slots
-//                may have concurrent conversation tabs open.
+//                URL or the engine's pg-run marker); required because several
+//                review slots may have concurrent conversation tabs open.
 //   --probe      liveness check only: exit 0 as soon as a conversation tab
 //                matching the marker EXISTS (no VERDICT wait). Used by the
 //                engine's no-think watchdog to distinguish "dead submission,
 //                safe to retry" from "live run, retry would double-spend".
-// Exit: 0 = review printed (probe: tab found); 4 = timeout; 2 = usage/CDP error.
+// Exit: 0 = review printed (probe: tab found); 4 = timeout; 2 = usage error;
+//       5 = ChatGPT throttle detected (cooldown written — do NOT resubmit).
 // Requires Node >= 21 (global WebSocket); the box runs Node 24.
+
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 const argv = process.argv.slice(2);
 const probe = argv[0] === '--probe' && argv.shift();
@@ -27,6 +54,30 @@ const [marker, timeoutSecs = probe ? '30' : '600', port = process.env.ORACLE_CDP
 if (!marker) { console.error('usage: cdp-salvage.mjs [--probe] <pr-marker> [timeout-secs] [cdp-port]'); process.exit(2); }
 const deadline = Date.now() + Number(timeoutSecs) * 1000;
 const POLL_MS = 20_000;
+
+const PG_HOME = process.env.PRO_GATE_HOME ?? path.join(os.homedir(), '.pro-review-daemon');
+const BLACKLIST_FILE = path.join(PG_HOME, 'salvage-nonmatching.txt');
+const COOLDOWN_FILE = path.join(PG_HOME, 'throttle.cooldown');
+// The interstitial's two distinctive sentences. Deliberately NOT a generic
+// /rate.?limit/ — review findings routinely discuss rate limits.
+const THROTTLE_RE = /making requests too quickly|temporarily limited access to your conversations/i;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// A page is the throttle interstitial only if it carries the phrase, no run
+// marker at all (ours or foreign — real conversations can QUOTE the phrase,
+// e.g. a review of this very engine), and is short like an error page.
+function isThrottlePage(text) {
+  return !!text && text.length < 5000 && !/pg-run-[A-Za-z0-9.-]+/.test(text) && THROTTLE_RE.test(text);
+}
+function tripThrottle(where) {
+  try {
+    fs.mkdirSync(PG_HOME, { recursive: true });
+    fs.writeFileSync(COOLDOWN_FILE, `${new Date().toISOString()} ${where}\n`);
+  } catch {}
+  console.error(`ChatGPT throttle interstitial detected (${where}) — cooldown written to ${COOLDOWN_FILE}. Back off; do NOT resubmit.`);
+  process.exit(5);
+}
 
 async function tabText(tab) {
   return await new Promise((resolve) => {
@@ -44,16 +95,42 @@ async function tabText(tab) {
   });
 }
 
+async function closeTab(id) {
+  try { await fetch(`http://127.0.0.1:${port}/json/close/${id}`); } catch {}
+}
+
 // v0.17: renderer-dead-tab fallback. Under Xvfb a background conversation
 // tab's renderer can suspend or crash: Runtime.evaluate then returns nothing
 // (and /json/activate does NOT revive it) even though the finished review
 // exists in ChatGPT server state. Re-render the SAME conversation URL in a
 // fresh scratch tab (non-destructive; uses the signed-in profile), read the
-// text there, and close the scratch tab. Conversations whose fresh render
-// loads fully but shows no marker belong to another review and are
-// blacklisted for the rest of this invocation.
+// text there, and close the scratch tab.
 const FRESH_RENDERS_PER_CYCLE = 3;
+// v0.18: per-URL budgets — each fresh render is a server-side conversation
+// fetch, so unmatched URLs get a hard per-invocation cap and the matched URL
+// is re-rendered at most once per interval while its VERDICT lands.
+const MAX_RENDERS_PER_URL = probe ? 1 : 2;
+const RENDER_INTERVAL_MS = 90_000;
+const renderTried = new Map();   // url -> renders spent this invocation (unmatched URLs only)
+const nextRenderAt = new Map();  // url -> earliest timestamp for the next render
+const ourUrls = new Set();       // URLs proven to carry THIS run's marker (exempt from the cap)
+
+// Persistent blacklist: conversations proven (by a foreign run marker) to
+// belong to another review. That fact never changes, so remember it across
+// invocations instead of re-rendering the same dead tabs every salvage.
 const nonMatching = new Set();
+try {
+  for (const u of fs.readFileSync(BLACKLIST_FILE, 'utf8').split('\n')) if (u.trim()) nonMatching.add(u.trim());
+} catch {}
+function blacklist(url) {
+  if (nonMatching.has(url)) return;
+  nonMatching.add(url);
+  try {
+    fs.mkdirSync(PG_HOME, { recursive: true });
+    // rewrite (bounded) rather than append forever
+    fs.writeFileSync(BLACKLIST_FILE, [...nonMatching].slice(-500).join('\n') + '\n');
+  } catch {}
+}
 
 async function freshRenderText(url, port, outerDeadline) {
   let target = null;
@@ -67,7 +144,7 @@ async function freshRenderText(url, port, outerDeadline) {
     const renderDeadline = Math.min(Date.now() + 25_000, outerDeadline);
     let text = null;
     while (Date.now() + 2_500 < renderDeadline) {
-      await new Promise((r) => setTimeout(r, 2_500));
+      await sleep(2_500);
       const tabs = await (await fetch(`http://127.0.0.1:${port}/json`)).json();
       const live = tabs.find((t) => t.id === target.id);
       if (!live) break;
@@ -95,20 +172,32 @@ function extractReview(text) {
   return lines.slice(start, verdictIdx + 1).join('\n').trim();
 }
 
+let listFailures = 0;
 while (Date.now() < deadline) {
   let tabs = [];
   try {
     tabs = (await (await fetch(`http://127.0.0.1:${port}/json`)).json())
       .filter((t) => t.type === 'page' && /chatgpt\.com\/c\//.test(t.url || ''));
-  } catch (e) { console.error(`CDP list failed: ${e.message}`); process.exit(2); }
+    listFailures = 0;
+  } catch (e) {
+    // v0.18: transient — Chrome restarts and CDP hiccups happen mid-salvage.
+    // Aborting here made the engine's pre-retry probe read "dead submission"
+    // and green-light a double-spending retry. Back off, retry until deadline.
+    listFailures += 1;
+    console.error(`CDP list failed (${listFailures}x): ${e.message} — retrying until deadline`);
+    await sleep(Math.min(5_000 * listFailures, 30_000));
+    continue;
+  }
   const deadTabs = [];
   const reads = await Promise.all(tabs.map(async (tab) => ({ tab, text: await tabText(tab) })));
   for (const { tab, text } of reads) {
     if (text === null || text.trim() === '') { deadTabs.push(tab); continue; }
+    if (isThrottlePage(text)) tripThrottle(`tab ${tab.url}`);
     if (!text.includes(marker)) continue;
+    ourUrls.add(tab.url);
     if (probe) { console.error(`live conversation tab: ${tab.url}`); process.exit(0); }
     const review = extractReview(text);
-    if (review) { console.log(review); process.exit(0); }
+    if (review) { await closeTab(tab.id); console.log(review); process.exit(0); }
     console.error(`conversation found (${tab.url}) but no VERDICT yet; waiting...`);
   }
   // v0.17 fallback: unreadable tabs get their URL re-rendered in a scratch tab
@@ -117,10 +206,18 @@ while (Date.now() < deadline) {
     if (Date.now() >= deadline) break;
     if (renders >= FRESH_RENDERS_PER_CYCLE) break;
     if (nonMatching.has(tab.url)) continue;
+    if (Date.now() < (nextRenderAt.get(tab.url) ?? 0)) continue;
+    if (!ourUrls.has(tab.url)) {
+      const tried = renderTried.get(tab.url) ?? 0;
+      if (tried >= MAX_RENDERS_PER_URL) continue;   // budget spent — re-checked next invocation, not hammered this one
+      renderTried.set(tab.url, tried + 1);
+    }
+    nextRenderAt.set(tab.url, Date.now() + RENDER_INTERVAL_MS);
     renders += 1;
     console.error(`tab unreadable (renderer dead?): ${tab.url} — re-rendering in a scratch tab...`);
     const { text } = await freshRenderText(tab.url, port, deadline);
     if (!text) continue;
+    if (isThrottlePage(text)) tripThrottle(`fresh render ${tab.url}`);
     if (!text.includes(marker)) {
       // Blacklist ONLY on positive evidence: the page carries someone
       // ELSE's run marker, proving it rendered a different review's
@@ -128,16 +225,17 @@ while (Date.now() < deadline) {
       // exceed any length heuristic without being the conversation at all;
       // blacklisting those could permanently hide the real review and let
       // --probe green-light a double-spending retry. Anything without a
-      // foreign marker is treated as not-ready and retried next cycle.
-      if (/pg-run-[A-Za-z0-9.-]+/.test(text)) nonMatching.add(tab.url);
+      // foreign marker is treated as not-ready and retried within budget.
+      if (/pg-run-[A-Za-z0-9.-]+/.test(text)) blacklist(tab.url);
       continue;
     }
+    ourUrls.add(tab.url);
     if (probe) { console.error(`live conversation (via fresh render): ${tab.url}`); process.exit(0); }
     const review = extractReview(text);
-    if (review) { console.log(review); process.exit(0); }
+    if (review) { await closeTab(tab.id); console.log(review); process.exit(0); }
     console.error(`conversation matches (via fresh render, ${tab.url}) but no VERDICT yet; waiting...`);
   }
-  await new Promise((r) => setTimeout(r, probe ? 5_000 : POLL_MS));
+  await sleep(probe ? 5_000 : POLL_MS);
 }
 console.error(`timeout: no ${probe ? 'conversation tab' : 'completed review'} matching "${marker}" after ${timeoutSecs}s`);
 process.exit(4);
