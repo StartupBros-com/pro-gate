@@ -218,9 +218,17 @@ NOTHINK_SECS="${PRO_GATE_NOTHINK_SECS:-600}"
 
 run_oracle() {  # $1 = browser model strategy (select|current|ignore)
   local strategy="$1" job started size last_size last_change now last_line
+  # v0.16 (#873 lesson): a watchdog-killed attempt leaves its session record
+  # status "running", and oracle's duplicate-prompt guard then blocks the
+  # engine's OWN retry of the same prompt/slug. Retries only happen after the
+  # probe judged the submission truly dead (no conversation tab, quota not
+  # spent), so forcing a fresh session on retry is exactly oracle's documented
+  # escape hatch for this state.
+  local force_args=()
+  [ "${attempt:-0}" -gt 0 ] && force_args+=(--force)
   ( stdbuf -oL -eL timeout --signal=TERM --kill-after=30 "$HARD_SECS" \
       oracle "${ENGINE_ARGS[@]}" -m "$MODEL" \
-      --browser-model-strategy "$strategy" \
+      --browser-model-strategy "$strategy" ${force_args[0]:+"${force_args[@]}"} \
       --slug "pro gate review pr ${PR_NUM:-diff}" \
       "${URL_ARGS[@]}" "${FILE_ARGS[@]}" \
       -p "$(cat "$PROMPT_FILE")" \
