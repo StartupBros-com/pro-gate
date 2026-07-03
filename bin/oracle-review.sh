@@ -218,9 +218,17 @@ NOTHINK_SECS="${PRO_GATE_NOTHINK_SECS:-600}"
 
 run_oracle() {  # $1 = browser model strategy (select|current|ignore)
   local strategy="$1" job started size last_size last_change now last_line
+  # v0.16 (#873 lesson): a watchdog-killed attempt leaves its session record
+  # status "running", and oracle's duplicate-prompt guard then blocks the
+  # engine's OWN retry of the same prompt/slug. Retries only happen after the
+  # probe judged the submission truly dead (no conversation tab, quota not
+  # spent), so forcing a fresh session on retry is exactly oracle's documented
+  # escape hatch for this state.
+  local force_args=()
+  [ "${attempt:-0}" -gt 0 ] && force_args+=(--force)
   ( stdbuf -oL -eL timeout --signal=TERM --kill-after=30 "$HARD_SECS" \
       oracle "${ENGINE_ARGS[@]}" -m "$MODEL" \
-      --browser-model-strategy "$strategy" \
+      --browser-model-strategy "$strategy" ${force_args[0]:+"${force_args[@]}"} \
       --slug "pro gate review pr ${PR_NUM:-diff}" \
       "${URL_ARGS[@]}" "${FILE_ARGS[@]}" \
       -p "$(cat "$PROMPT_FILE")" \
@@ -319,7 +327,21 @@ while :; do
 
   attempt=$((attempt + 1))
   [ "$attempt" -gt "$MAX_RETRIES" ] && break
-  echo "[oracle-review] review lost (likely a transient Chrome/connection drop, not a quota issue). Retrying once after ${BACKOFF}s + a health re-check..." >&2
+  # v0.16.1 (self-review P1): the retry passes --force, which bypasses
+  # oracle's duplicate-prompt guard — previously the LAST defense against
+  # resubmitting a live-but-silent run. The no-think path probes before its
+  # kill, but stall and hard-cap kills reach here unprobed. Probe RIGHT
+  # BEFORE every retry: a conversation tab matching this run's marker means
+  # the quota is spent, so suppress the retry and let the CDP salvage below
+  # collect the review instead. (If Chrome itself is unreachable the probe
+  # errors and the retry proceeds — a server-side-completed run cannot be
+  # salvaged through a dead browser anyway.)
+  if command -v node >/dev/null 2>&1 && node "$SELF/cdp-salvage.mjs" --probe "$RUN_MARKER" 30 >/dev/null 2>>"$RUNLOG"; then
+    echo "[oracle-review] pre-retry probe found a live conversation for this run — retry suppressed (quota already spent); CDP salvage will collect it." >&2
+    LIVE_CONVERSATION=1
+    break
+  fi
+  echo "[oracle-review] pre-retry probe found no conversation for this run — dead submission confirmed. Retrying once after ${BACKOFF}s + a health re-check..." >&2
   sleep "$BACKOFF"
 done
 
