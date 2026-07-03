@@ -172,11 +172,24 @@ pg_mem_headroom_ok() {
 # pg_health_gate: call right before spending a Pro Extended slot (and before each retry).
 # Returns 0 when the box is fit to spend a slot; 1 + a one-line reason on stdout otherwise.
 # Only blocks on signals that actually cause wasted slots (unreachable/just-restarted Chrome,
-# genuine memory starvation) — not on transient noise.
+# genuine memory starvation, an account-level ChatGPT throttle) — not on transient noise.
 pg_health_gate() {
-  local mode port min_uptime up reason
+  local mode port min_uptime up reason cdf cds mt age
   mode="$(pg_browser_mode)"; port="${ORACLE_BROWSER_PORT:-9222}"
   min_uptime="${PRO_GATE_MIN_UPTIME:-60}"
+  # v0.18: ChatGPT throttle cooldown — written by cdp-salvage when it sees the
+  # "requests too quickly / temporarily limited" interstitial. Submitting (or even
+  # salvage-rendering) during the cooldown deepens the throttle, so defer instead.
+  # Age-based: the file expires by mtime, no cleanup needed. GNU stat || BSD stat.
+  cdf="${PRO_GATE_COOLDOWN_FILE:-$PRO_GATE_HOME/throttle.cooldown}"
+  cds="${PRO_GATE_THROTTLE_COOLDOWN:-900}"
+  if [ -f "$cdf" ]; then
+    mt="$(stat -c %Y "$cdf" 2>/dev/null || stat -f %m "$cdf" 2>/dev/null || echo 0)"
+    age=$(( $(date +%s) - mt ))
+    if [ "$age" -ge 0 ] && [ "$age" -lt "$cds" ]; then
+      echo "ChatGPT throttle cooldown active ($(( cds - age ))s left; rm $cdf to override)"; return 1
+    fi
+  fi
   if [ "$mode" = remote-chrome ]; then
     curl -sf "localhost:${port}/json/version" >/dev/null 2>&1 \
       || { echo "Chrome CDP unreachable on :${port}"; return 1; }

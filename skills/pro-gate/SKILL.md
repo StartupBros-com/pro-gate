@@ -31,6 +31,9 @@ attaches to the Xvfb Chrome). Verify setup any time with `pro-gate-doctor.sh`.
   Manual salvage is only needed on engines older than v0.13 or when Chrome itself died.
   Tune with `PRO_GATE_NOTHINK_SECS` / `PRO_GATE_STALL_SECS` (default 600) and
   `PRO_GATE_TIMEOUT_GRACE` (default +120s on the hard cap).
+- **Engine ≥v0.18 is also throttle-aware**: salvage page-loads are budgeted per URL,
+  foreign conversations are blacklisted persistently, the throttle interstitial trips a global
+  cooldown instead of a retry, and every phase lands in `<out>.status` for polling.
 
 **Codex on Windows:** run the engine through WSL, not native PowerShell path syntax. Use WSL repo paths
 such as `/home/will/SITES/<repo>` and invoke commands with `wsl -e bash -lc '...'`; the default engine
@@ -56,13 +59,19 @@ home is `/home/will/.pro-review-daemon`.
   you're not logged in. `pro-gate-doctor.sh` checks all of this.
 - **Usage (best-effort):** if codex auth is present, check `chatgpt.com/backend-api/wham/usage`;
   if the primary window is ≥90% or `limit_reached`, warn before burning a slot.
-- **Concurrency is handled for you:** `oracle-review.sh` holds a flock, so many concurrent
-  `/pro-gate` calls (e.g. 10 agents at once) QUEUE and run one-at-a-time against the single ChatGPT
-  account — safe, never parallel. Each waits up to `PRO_GATE_LOCK_WAIT` (default 40 min).
+- **Concurrency is handled for you:** `oracle-review.sh` holds a counting semaphore —
+  **serialized by default** (`PRO_GATE_MAX_CONCURRENCY=1`; raise it only if your account
+  demonstrably tolerates parallel Pro chats). Concurrent `/pro-gate` calls (e.g. 10 agents at
+  once) QUEUE, each waiting up to `PRO_GATE_LOCK_WAIT` (default 40 min). A separate per-PR
+  guard stops the same PR being reviewed twice at once.
+- **ChatGPT throttle cooldown (engine ≥v0.18):** if ChatGPT serves its "requests too quickly /
+  temporarily limited" interstitial, the engine writes `$PRO_GATE_HOME/throttle.cooldown` and every
+  new run DEFERS (exit 8, no quota spent) until it expires (`PRO_GATE_THROTTLE_COOLDOWN`, default
+  900s). Never delete the cooldown file to force a run — hammering extends the throttle.
 
 ## 3. Run the review
 
-Launch the engine in the background (it blocks ~10-30 min) and poll its `--out` file:
+Launch the engine in the background (it blocks ~10-30 min) and poll its **status file**:
 
 ```bash
 "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}"/oracle-review.sh \
@@ -70,9 +79,17 @@ Launch the engine in the background (it blocks ~10-30 min) and poll its `--out` 
   --out "${TMPDIR:-/tmp}/pro-gate-<num>.md" --timeout 30m
 ```
 
-Run with `run_in_background: true` and a long Bash timeout; poll the out file. While waiting, do not
-spawn a second oracle run (one ChatGPT session, serialized). When it returns, the findings are the
-`[Pn] file:line` blocks ending in a `VERDICT:` line.
+Run with `run_in_background: true` and a long Bash timeout. The engine writes single-line JSON to
+`<out>.status` at every phase change (`preflight → waiting-slot → launching → … → done|failed|deferred`) —
+poll THAT, not engine logs. Phase `done` ⇒ read `--out` (the `[Pn] file:line` blocks ending in a
+`VERDICT:` line). `failed`/`deferred` are terminal for this invocation — do NOT relaunch on
+`throttled`/`salvaging` phases; the engine is still working. While waiting, never spawn a second
+oracle run for the same PR.
+
+Engine exit codes: `0` review ready · `2` bad usage · `3` oracle/browser missing · `4` repo not
+found · `5` diff fetch failed · `6` ran but no usable review (quota may be spent — check the PR
+conversation in ChatGPT before re-running) · `7` lock timeout · `8` deferred, NO quota spent
+(box unfit or throttle cooldown — safe to retry later).
 
 ## 4. Synthesize
 

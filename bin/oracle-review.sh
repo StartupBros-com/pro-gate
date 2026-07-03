@@ -41,12 +41,39 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/pro-review.XXXXXX")"
 [ -n "$OUT" ] || OUT="$WORK/findings.md"
 pg_have oracle || { echo "ERROR: oracle not installed (pnpm add -g @steipete/oracle)" >&2; exit 3; }
 
+# --- machine-readable run status (v0.18) ---
+# Callers (the /pro-gate skill, the daemon's headless agent) poll "$OUT.status" — a
+# single-line JSON updated ATOMICALLY at every phase change — instead of scraping the
+# engine's stderr. Phases: preflight, waiting-pr-lock, waiting-slot, launching,
+# watchdog-killed, live-detected, salvaging, retry-wait, throttled, deferred, done, failed.
+# Terminal phases: done (read $OUT), failed, deferred (no slot spent — retry later).
+STATUS_FILE="$OUT.status"
+pg_status() {  # $1 phase, $2 optional detail — variable fields are JSON-escaped (v0.18.1:
+  # $OUT is caller-supplied; a quote/backslash in it would corrupt the polling contract)
+  local phase="$1" detail="${2:-}" ts
+  ts="$(date +%Y-%m-%dT%H:%M:%S%z)"
+  if pg_have jq; then
+    jq -nc --arg phase "$phase" --argjson attempt "${attempt:-0}" --arg detail "$detail" \
+       --arg pr "${PR_NUM:-diff}" --arg out "$OUT" --arg ts "$ts" \
+       '{phase:$phase,attempt:$attempt,detail:$detail,pr:$pr,out:$out,ts:$ts}' \
+       > "$STATUS_FILE.tmp" 2>/dev/null
+  else
+    printf '{"phase":"%s","attempt":%d,"detail":"%s","pr":"%s","out":"%s","ts":"%s"}\n' \
+      "$phase" "${attempt:-0}" "$(printf '%s' "$detail" | tr -d '"\\' | tr '\n' ' ')" \
+      "${PR_NUM:-diff}" "$(printf '%s' "$OUT" | tr -d '"\\' | tr '\n' ' ')" "$ts" \
+      > "$STATUS_FILE.tmp" 2>/dev/null
+  fi
+  { [ -s "$STATUS_FILE.tmp" ] && mv -f "$STATUS_FILE.tmp" "$STATUS_FILE"; } 2>/dev/null || true
+}
+pg_status preflight
+
 # --- preflight: browser reachable / signed in (per platform) ---
 if [ "$MODE" = "remote-chrome" ]; then
   export DISPLAY="${ORACLE_DISPLAY:-:99}"
   if ! curl -sf "localhost:${PORT}/json/version" >/dev/null 2>&1; then
     echo "ERROR: oracle browser session (CDP) not reachable on ${PORT}." >&2
     [ "$(pg_service_mgr)" = systemd ] && echo "  start it: sudo systemctl start oracle-chrome" >&2
+    pg_status failed "browser CDP unreachable"
     exit 3
   fi
 else
@@ -71,13 +98,13 @@ if [ -n "$PR" ]; then
   fi
 fi
 [ -n "$REPO" ] || REPO="$(pwd)"
-cd "$REPO" || { echo "ERROR: repo dir not found: $REPO" >&2; exit 4; }
+cd "$REPO" || { echo "ERROR: repo dir not found: $REPO" >&2; pg_status failed "repo dir not found"; exit 4; }
 [ -n "$PR_URL" ] || PR_URL="$(gh pr view "$PR_NUM" --json url -q .url 2>/dev/null || echo "")"
 
 if [ -z "$DIFF_FILE" ]; then
   DIFF_FILE="$WORK/pr.diff"
   gh pr diff "$PR_NUM" --patch > "$DIFF_FILE" 2>"$WORK/diff.err" || {
-    echo "ERROR: gh pr diff $PR_NUM failed in $REPO: $(cat "$WORK/diff.err")" >&2; exit 5; }
+    echo "ERROR: gh pr diff $PR_NUM failed in $REPO: $(cat "$WORK/diff.err")" >&2; pg_status failed "gh pr diff failed"; exit 5; }
 fi
 
 # --- diff hygiene: drop lockfiles/generated/vendored from the review payload so Pro Extended
@@ -179,25 +206,36 @@ ENGINE_ARGS=(-e browser)
 [ "$MODE" = "remote-chrome" ] && ENGINE_ARGS+=(--remote-chrome "127.0.0.1:${PORT}")
 
 # --- Bound concurrent Pro Extended runs against the single ChatGPT account ---
-# Up to PRO_GATE_MAX_CONCURRENCY reviews run at once (the account tolerates several parallel chats);
-# excess callers QUEUE on the semaphore. A SEPARATE per-PR guard ensures the SAME pr is never under
-# two simultaneous reviews (that would double-spend a slot on one diff). Both auto-release at exit.
+# DEFAULT IS SERIALIZED (1). The 2026-07-03 throttle incident showed one account under
+# 3 parallel runs (plus their salvage page-loads) trips ChatGPT's anti-scraping limiter
+# ("temporarily limited access to your conversations"). Raise PRO_GATE_MAX_CONCURRENCY
+# only if your account demonstrably tolerates it; excess callers QUEUE on the semaphore.
+# A SEPARATE per-PR guard ensures the SAME pr is never under two simultaneous reviews
+# (that would double-spend a slot on one diff). Both auto-release at exit.
 LOCKFILE="${PRO_GATE_LOCKFILE:-$PRO_GATE_HOME/oracle.lock}"
 LOCK_WAIT="${PRO_GATE_LOCK_WAIT:-2400}"
-MAX_CONC="${PRO_GATE_MAX_CONCURRENCY:-3}"
+MAX_CONC="${PRO_GATE_MAX_CONCURRENCY:-1}"
+
+# Housekeeping: per-PR lock files are 0-byte and used to accumulate forever. Sweep ones
+# untouched for >24h — any legitimate holder finishes within the ~35 min hard cap.
+find "$(dirname "$LOCKFILE")" -maxdepth 1 -name "$(basename "$LOCKFILE").pr-*" -mmin +1440 -delete 2>/dev/null || true
 
 # Per-PR guard (acquire BEFORE a slot, so same-PR callers serialize without holding a scarce slot).
 if [ -n "${PR_NUM}" ]; then
   echo "[oracle-review] per-PR guard for pr #${PR_NUM} (serializes same-PR reviews)..." >&2
+  pg_status waiting-pr-lock
   if ! pg_lock "${LOCKFILE}.pr-${PR_NUM}" "$LOCK_WAIT"; then
     echo "ERROR: timed out after ${LOCK_WAIT}s — pr #${PR_NUM} is already under review elsewhere." >&2
+    pg_status failed "per-PR lock timeout"
     exit 7
   fi
 fi
 
 echo "[oracle-review] acquiring a review slot (up to ${MAX_CONC} concurrent; waits up to ${LOCK_WAIT}s if all busy)..." >&2
+pg_status waiting-slot
 if ! pg_lock_n "$LOCKFILE" "$MAX_CONC" "$LOCK_WAIT"; then
   echo "ERROR: timed out after ${LOCK_WAIT}s — all ${MAX_CONC} review slots are busy." >&2
+  pg_status failed "slot timeout"
   exit 7
 fi
 
@@ -217,7 +255,7 @@ STALL_SECS="${PRO_GATE_STALL_SECS:-600}"
 NOTHINK_SECS="${PRO_GATE_NOTHINK_SECS:-600}"
 
 run_oracle() {  # $1 = browser model strategy (select|current|ignore)
-  local strategy="$1" job started size last_size last_change now last_line
+  local strategy="$1" job started size last_size last_change now last_line prc
   # v0.16 (#873 lesson): a watchdog-killed attempt leaves its session record
   # status "running", and oracle's duplicate-prompt guard then blocks the
   # engine's OWN retry of the same prompt/slug. Retries only happen after the
@@ -245,6 +283,7 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
     last_line="$(tail -n 1 "$RUNLOG" 2>/dev/null || true)"
     if [ $(( now - last_change )) -ge "$STALL_SECS" ]; then
       echo "[oracle-review] watchdog: oracle silent for ${STALL_SECS}s with no findings — killing this attempt (salvage/retry follows)." >&2
+      pg_status watchdog-killed "stall ${STALL_SECS}s"
     elif [ $(( now - started )) -ge "$NOTHINK_SECS" ] && printf '%s' "$last_line" | grep -q "no thinking status detected"; then
       # v0.14: oracle's thinking detection can lag reality (ChatGPT UI drift,
       # first seen PR pushbot#863 2026-07-02: killed a run that was 11m into a
@@ -254,11 +293,24 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
       # double-spend. Kill the blind CLI anyway (frees the browser slot) but
       # flag it so the caller skips reattach+retry and goes straight to the
       # outcome-based CDP salvage with the full remaining budget.
-      if command -v node >/dev/null 2>&1 && node "$SELF/cdp-salvage.mjs" --probe "$RUN_MARKER" 30 >/dev/null 2>>"$RUNLOG"; then
+      # v0.18: probe exit 5 = ChatGPT throttle interstitial. The submission's
+      # fate is UNKNOWN (it may have landed before the throttle), so treat it
+      # like live: never resubmit, and let the post-cooldown salvage decide.
+      prc=2
+      if command -v node >/dev/null 2>&1; then
+        node "$SELF/cdp-salvage.mjs" --probe "$RUN_MARKER" 30 >/dev/null 2>>"$RUNLOG"; prc=$?
+      fi
+      if [ "$prc" -eq 0 ]; then
         echo "[oracle-review] watchdog: no-think after $(( now - started ))s BUT a conversation tab matches this PR — submission is LIVE, detection missed. Freeing the slot; CDP salvage will collect the review (retry suppressed: quota already spent)." >&2
         LIVE_CONVERSATION=1
+        pg_status live-detected "no-think probe found the conversation"
+      elif [ "$prc" -eq 5 ]; then
+        echo "[oracle-review] watchdog: ChatGPT is rate-limiting this account — killing this attempt; retry suppressed, cooldown started (salvage after the pause)." >&2
+        THROTTLED=1
+        pg_status throttled "interstitial during no-think probe"
       else
         echo "[oracle-review] watchdog: ChatGPT never started thinking after $(( now - started ))s — dead submission; killing this attempt (salvage/retry follows)." >&2
+        pg_status watchdog-killed "no-think ${NOTHINK_SECS}s"
       fi
     else
       continue
@@ -281,15 +333,29 @@ REATTACH_TIMEOUT="${PRO_GATE_REATTACH_TIMEOUT:-150}"
 MAX_RETRIES="${PRO_GATE_MAX_RETRIES:-1}"
 BACKOFF="${PRO_GATE_RETRY_BACKOFF:-20}"
 LIVE_CONVERSATION=0
+THROTTLED=0
 attempt=0
 while :; do
   if ! GATE_REASON="$(pg_health_gate)"; then
-    echo "ERROR: not spending a Pro Extended slot — ${GATE_REASON}." >&2
-    echo "  Deferred (no slot spent). Retry once the box settles, or run on macOS (native Chrome)." >&2
-    exit 8
+    # v0.18: exit 8 ("deferred, NO slot spent") is only true before the first attempt.
+    # On a retry iteration a slot HAS been spent — abandoning to exit 8 here would skip
+    # the salvage of a possibly-completed review. Stop retrying and salvage instead.
+    if [ "$attempt" -eq 0 ]; then
+      echo "ERROR: not spending a Pro Extended slot — ${GATE_REASON}." >&2
+      echo "  Deferred (no slot spent). Retry once the box settles, or run on macOS (native Chrome)." >&2
+      pg_status deferred "$GATE_REASON"
+      exit 8
+    fi
+    echo "[oracle-review] not retrying (${GATE_REASON}) — falling through to salvage." >&2
+    # v0.18.1 (pro-gate self-review P1): when the gate failure IS the throttle cooldown,
+    # take the throttle path — otherwise the final salvage would render conversations
+    # against the still-throttled account immediately, bypassing the protective pause.
+    case "$GATE_REASON" in *"throttle cooldown"*) THROTTLED=1 ;; esac
+    break
   fi
 
   echo "[oracle-review] launching GPT-5.5 Pro Extended review (attempt $((attempt + 1)), oracle timeout $TIMEOUT, hard cap ${HARD_SECS}s, stall/no-think watchdog ${STALL_SECS}s/${NOTHINK_SECS}s)..." >&2
+  pg_status launching "strategy ${PRO_GATE_MODEL_STRATEGY:-select}"
   : > "$RUNLOG"; rm -f "$OUT"   # clear any prior attempt's output so stale garbage can't survive
   run_oracle "${PRO_GATE_MODEL_STRATEGY:-select}" || true
   # UI fallback (notably macOS): model picker not found + no output -> retry with the default model.
@@ -310,7 +376,9 @@ while :; do
   # useless here (it binds the pre-kill tab target, which goes stale) and a
   # resubmit would double-spend — skip both and let the outcome-based CDP
   # salvage below collect the review when it finishes.
-  if [ "$LIVE_CONVERSATION" = 1 ]; then
+  # v0.18: same for a throttle kill — the submission's fate is unknown, and
+  # both reattach and a resubmit would hit the throttled account again.
+  if [ "$LIVE_CONVERSATION" = 1 ] || [ "$THROTTLED" = 1 ]; then
     break
   fi
 
@@ -320,6 +388,7 @@ while :; do
   SLUG="$(grep -oE 'oracle session [A-Za-z0-9._-]+' "$RUNLOG" 2>/dev/null | tail -1 | awk '{print $NF}')"
   [ -n "$SLUG" ] || SLUG="$SLUG_BASE"
   echo "[oracle-review] no output — bounded salvage via reattach (session ${SLUG}, ${REATTACH_TIMEOUT}s)..." >&2
+  pg_status salvaging "reattach ${SLUG}"
   if pg_reattach_render "$SLUG" "$OUT" "$REATTACH_TIMEOUT"; then
     echo "[oracle-review] salvaged a completed review via reattach." >&2
     break
@@ -336,12 +405,23 @@ while :; do
   # collect the review instead. (If Chrome itself is unreachable the probe
   # errors and the retry proceeds — a server-side-completed run cannot be
   # salvaged through a dead browser anyway.)
-  if command -v node >/dev/null 2>&1 && node "$SELF/cdp-salvage.mjs" --probe "$RUN_MARKER" 30 >/dev/null 2>>"$RUNLOG"; then
+  PRC=2
+  if command -v node >/dev/null 2>&1; then
+    node "$SELF/cdp-salvage.mjs" --probe "$RUN_MARKER" 30 >/dev/null 2>>"$RUNLOG"; PRC=$?
+  fi
+  if [ "$PRC" -eq 0 ]; then
     echo "[oracle-review] pre-retry probe found a live conversation for this run — retry suppressed (quota already spent); CDP salvage will collect it." >&2
     LIVE_CONVERSATION=1
+    pg_status live-detected "pre-retry probe found the conversation"
+    break
+  elif [ "$PRC" -eq 5 ]; then
+    echo "[oracle-review] pre-retry probe hit the ChatGPT throttle — retry suppressed; cooldown started (salvage after the pause)." >&2
+    THROTTLED=1
+    pg_status throttled "interstitial during pre-retry probe"
     break
   fi
   echo "[oracle-review] pre-retry probe found no conversation for this run — dead submission confirmed. Retrying once after ${BACKOFF}s + a health re-check..." >&2
+  pg_status retry-wait "backoff ${BACKOFF}s"
   sleep "$BACKOFF"
 done
 
@@ -356,7 +436,18 @@ if ! pg_is_review "$OUT" && command -v node >/dev/null 2>&1; then
   # Live conversation (v0.14 probe hit): the review may still be thinking, so
   # wait with the full hard-cap budget; otherwise a short window suffices.
   SALVAGE_SECS="$STALL_SECS"; [ "$LIVE_CONVERSATION" = 1 ] && SALVAGE_SECS="$HARD_SECS"
+  # v0.18: after a throttle hit, pause before the single polite salvage pass —
+  # rendering the conversation immediately just re-triggers the limiter. The
+  # salvage itself exits 5 fast if the account is still throttled.
+  if [ "$THROTTLED" = 1 ]; then
+    THROTTLE_PAUSE="${PRO_GATE_THROTTLE_PAUSE:-300}"
+    echo "[oracle-review] throttled — pausing ${THROTTLE_PAUSE}s before one polite salvage attempt..." >&2
+    pg_status throttled "pausing ${THROTTLE_PAUSE}s before salvage"
+    sleep "$THROTTLE_PAUSE"
+    SALVAGE_SECS="$HARD_SECS"
+  fi
   echo "[oracle-review] last-resort CDP tab salvage (marker ${RUN_MARKER}, up to ${SALVAGE_SECS}s)..." >&2
+  pg_status salvaging "cdp up to ${SALVAGE_SECS}s"
   if node "$SELF/cdp-salvage.mjs" "$RUN_MARKER" "$SALVAGE_SECS" > "$OUT.cdp" 2>>"$RUNLOG" && pg_is_review "$OUT.cdp"; then
     mv "$OUT.cdp" "$OUT"
     echo "[oracle-review] CDP salvage recovered a completed review." >&2
@@ -366,11 +457,13 @@ if ! pg_is_review "$OUT" && command -v node >/dev/null 2>&1; then
 fi
 
 if pg_is_review "$OUT"; then
+  pg_status done
   cat "$OUT"
   echo "RESULT_FILE=$OUT"
   exit 0
 else
   RETRIES=$(( attempt > 0 ? attempt - 1 : 0 ))
   echo "ERROR: oracle produced no usable review after salvage + ${RETRIES} retr$([ "${RETRIES}" -eq 1 ] && echo y || echo ies) (reattach: oracle session ${SLUG_BASE})." >&2
+  pg_status failed "no usable review after salvage"
   exit 6
 fi
