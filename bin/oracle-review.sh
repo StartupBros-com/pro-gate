@@ -4,6 +4,11 @@
 # daemon both call this. Cross-platform: macOS drives signed-in Chrome natively; WSL/Linux
 # attaches to the durable Xvfb Chrome over CDP.
 #
+# CALLERS — keep in sync IN THE SAME PR whenever the caller contract changes (status file,
+# exit codes, recovery semantics); they have drifted before (v0.18 missed the agent):
+#   skills/pro-gate/SKILL.md      (authoritative caller guide)
+#   agents/oracle-reviewer.md     (thin relay agent for other pipelines)
+#
 # Usage:
 #   oracle-review.sh --pr <url|number> [--repo <dir>] [--input both|bundle|connector]
 #                    [--out <file>] [--timeout <dur>] [--extra-files <glob>]
