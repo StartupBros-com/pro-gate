@@ -11,7 +11,9 @@ separate usage pool from the Codex fixer) for what they missed, then applies the
 
 Engine: `oracle-review.sh` (in `$PRO_GATE_HOME`, default `~/.pro-review-daemon`) — the single source
 of truth for the oracle call; cross-platform (macOS drives your signed-in Chrome natively; WSL/Linux
-attaches to the Xvfb Chrome). Verify setup any time with `pro-gate-doctor.sh`.
+attaches to the Xvfb Chrome). Verify setup any time with `pro-gate-doctor.sh`. (The `oracle-reviewer`
+agent is a thin relay over the same engine for other pipelines — when the caller contract here
+changes, update `agents/oracle-reviewer.md` in the same PR.)
 
 **Detached vs dead sessions — different rules:**
 - **Ground truth is the BROWSER, not oracle's log.** oracle can miss the thinking state after
