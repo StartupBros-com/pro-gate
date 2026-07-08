@@ -66,6 +66,12 @@ home is `/home/will/.pro-review-daemon`.
   demonstrably tolerates parallel Pro chats). Concurrent `/pro-gate` calls (e.g. 10 agents at
   once) QUEUE, each waiting up to `PRO_GATE_LOCK_WAIT` (default 40 min). A separate per-PR
   guard stops the same PR being reviewed twice at once.
+- **Concurrency is ADAPTIVE (engine ≥v0.19):** `PRO_GATE_MAX_CONCURRENCY` is a ceiling, not the
+  live value — the ramp governor starts low, earns +1 level per `PRO_GATE_RAMP_STREAK` (default 5)
+  clean runs, and drops to 1 instantly on any throttle. Check the live level + run history any
+  time with `pro-gate-stats.sh` (`--tail 10` for recent runs); every run lands in
+  `$PRO_GATE_HOME/ledger.jsonl`. Note oracle itself caps browser tabs (3 in ≤0.15.x) — ceilings
+  above that just queue inside oracle.
 - **ChatGPT throttle cooldown (engine ≥v0.18):** if ChatGPT serves its "requests too quickly /
   temporarily limited" interstitial, the engine writes `$PRO_GATE_HOME/throttle.cooldown` and every
   new run DEFERS (exit 8, no quota spent) until it expires (`PRO_GATE_THROTTLE_COOLDOWN`, default

@@ -72,11 +72,45 @@ pg_status() {  # $1 phase, $2 optional detail — variable fields are JSON-escap
 }
 pg_status preflight
 
+# --- v0.19: run bookkeeping for the ledger + adaptive ramp ---
+RUN_START="$(date +%s)"
+SALVAGED=0
+EFF_CONC=0
+pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor, exit
+  local rc="$1" outcome dur line
+  dur=$(( $(date +%s) - RUN_START ))
+  case "$rc" in
+    0) outcome=clean ;;
+    6) outcome=failed ;;
+    7) outcome=lock-timeout ;;
+    8) outcome=deferred ;;
+    *) outcome=other ;;
+  esac
+  [ "${THROTTLED:-0}" = 1 ] && outcome=throttle
+  case "$outcome" in clean|throttle|failed) pg_ramp_update "$outcome" "${MAX_CONC:-1}" ;; esac
+  if pg_have jq; then
+    line="$(jq -nc --arg ts "$(date +%Y-%m-%dT%H:%M:%S%z)" --arg pr "${PR_NUM:-diff}" \
+      --arg repo "${REPO:-}" --argjson exit "$rc" --arg outcome "$outcome" \
+      --argjson secs "$dur" --argjson attempts "${attempt:-0}" \
+      --argjson conc "${EFF_CONC:-0}" --argjson ceiling "${MAX_CONC:-1}" \
+      --argjson live "${LIVE_CONVERSATION:-0}" --argjson salvaged "${SALVAGED:-0}" \
+      --argjson diff_lines "${DIFF_LINES:-0}" --arg out "$OUT" \
+      '{ts:$ts,pr:$pr,repo:$repo,exit:$exit,outcome:$outcome,secs:$secs,attempts:$attempts,conc:$conc,ceiling:$ceiling,live:$live,salvaged:$salvaged,diff_lines:$diff_lines,out:$out}' 2>/dev/null)"
+  else
+    line="$(printf '{"ts":"%s","pr":"%s","exit":%d,"outcome":"%s","secs":%d,"attempts":%d,"conc":%d,"ceiling":%d,"live":%d,"salvaged":%d}' \
+      "$(date +%Y-%m-%dT%H:%M:%S%z)" "${PR_NUM:-diff}" "$rc" "$outcome" "$dur" "${attempt:-0}" \
+      "${EFF_CONC:-0}" "${MAX_CONC:-1}" "${LIVE_CONVERSATION:-0}" "${SALVAGED:-0}")"
+  fi
+  pg_ledger_append "$line"
+  exit "$rc"
+}
+
 # --- preflight: browser reachable / signed in (per platform) ---
 if [ "$MODE" = "remote-chrome" ]; then
   export DISPLAY="${ORACLE_DISPLAY:-:99}"
-  if ! curl -sf "localhost:${PORT}/json/version" >/dev/null 2>&1; then
-    echo "ERROR: oracle browser session (CDP) not reachable on ${PORT}." >&2
+  # v0.19: one self-heal attempt (non-interactive service start) before giving up.
+  if ! pg_cdp_heal; then
+    echo "ERROR: oracle browser session (CDP) not reachable on ${PORT} (self-heal attempted)." >&2
     [ "$(pg_service_mgr)" = systemd ] && echo "  start it: sudo systemctl start oracle-chrome" >&2
     pg_status failed "browser CDP unreachable"
     exit 3
@@ -213,13 +247,17 @@ ENGINE_ARGS=(-e browser)
 # --- Bound concurrent Pro Extended runs against the single ChatGPT account ---
 # DEFAULT IS SERIALIZED (1). The 2026-07-03 throttle incident showed one account under
 # 3 parallel runs (plus their salvage page-loads) trips ChatGPT's anti-scraping limiter
-# ("temporarily limited access to your conversations"). Raise PRO_GATE_MAX_CONCURRENCY
-# only if your account demonstrably tolerates it; excess callers QUEUE on the semaphore.
-# A SEPARATE per-PR guard ensures the SAME pr is never under two simultaneous reviews
-# (that would double-spend a slot on one diff). Both auto-release at exit.
+# ("temporarily limited access to your conversations"). PRO_GATE_MAX_CONCURRENCY is the
+# CEILING; v0.19's ramp governor (pg_ramp_level) decides the EFFECTIVE slots — earned up
+# one level per PRO_GATE_RAMP_STREAK clean runs, dropped to 1 on any throttle. Excess
+# callers QUEUE on the semaphore. A SEPARATE per-PR guard ensures the SAME pr is never
+# under two simultaneous reviews (that would double-spend a slot on one diff). NOTE:
+# oracle itself caps concurrent browser tabs (3 in <=0.15.x) — a ceiling above oracle's
+# cap just queues inside oracle.
 LOCKFILE="${PRO_GATE_LOCKFILE:-$PRO_GATE_HOME/oracle.lock}"
 LOCK_WAIT="${PRO_GATE_LOCK_WAIT:-2400}"
 MAX_CONC="${PRO_GATE_MAX_CONCURRENCY:-1}"
+EFF_CONC="$(pg_ramp_level "$MAX_CONC")"
 
 # Housekeeping: per-PR lock files are 0-byte and used to accumulate forever. Sweep ones
 # untouched for >24h — any legitimate holder finishes within the ~35 min hard cap.
@@ -232,16 +270,26 @@ if [ -n "${PR_NUM}" ]; then
   if ! pg_lock "${LOCKFILE}.pr-${PR_NUM}" "$LOCK_WAIT"; then
     echo "ERROR: timed out after ${LOCK_WAIT}s — pr #${PR_NUM} is already under review elsewhere." >&2
     pg_status failed "per-PR lock timeout"
-    exit 7
+    pg_finish 7
   fi
 fi
 
-echo "[oracle-review] acquiring a review slot (up to ${MAX_CONC} concurrent; waits up to ${LOCK_WAIT}s if all busy)..." >&2
-pg_status waiting-slot
-if ! pg_lock_n "$LOCKFILE" "$MAX_CONC" "$LOCK_WAIT"; then
-  echo "ERROR: timed out after ${LOCK_WAIT}s — all ${MAX_CONC} review slots are busy." >&2
+echo "[oracle-review] acquiring a review slot (effective ${EFF_CONC} of ceiling ${MAX_CONC}; waits up to ${LOCK_WAIT}s if all busy)..." >&2
+pg_status waiting-slot "effective ${EFF_CONC} / ceiling ${MAX_CONC}"
+# v0.19.1 (pro-gate self-review P1): re-read the ramp level every wait slice — a run that
+# queued at level 3 must NOT acquire slot 3 after a concurrent throttle dropped the level
+# to 1 mid-wait. Short pg_lock_n slices keep the wait responsive to governor changes.
+SLOT_DEADLINE=$(( $(date +%s) + LOCK_WAIT ))
+SLOT_OK=0
+while :; do
+  EFF_CONC="$(pg_ramp_level "$MAX_CONC")"
+  if pg_lock_n "$LOCKFILE" "$EFF_CONC" 15; then SLOT_OK=1; break; fi
+  if [ "$(date +%s)" -ge "$SLOT_DEADLINE" ]; then break; fi
+done
+if [ "$SLOT_OK" != 1 ]; then
+  echo "ERROR: timed out after ${LOCK_WAIT}s — all ${EFF_CONC} review slots are busy." >&2
   pg_status failed "slot timeout"
-  exit 7
+  pg_finish 7
 fi
 
 RUNLOG="$WORK/oracle.log"
@@ -349,7 +397,7 @@ while :; do
       echo "ERROR: not spending a Pro Extended slot — ${GATE_REASON}." >&2
       echo "  Deferred (no slot spent). Retry once the box settles, or run on macOS (native Chrome)." >&2
       pg_status deferred "$GATE_REASON"
-      exit 8
+      pg_finish 8
     fi
     echo "[oracle-review] not retrying (${GATE_REASON}) — falling through to salvage." >&2
     # v0.18.1 (pro-gate self-review P1): when the gate failure IS the throttle cooldown,
@@ -396,6 +444,7 @@ while :; do
   pg_status salvaging "reattach ${SLUG}"
   if pg_reattach_render "$SLUG" "$OUT" "$REATTACH_TIMEOUT"; then
     echo "[oracle-review] salvaged a completed review via reattach." >&2
+    SALVAGED=1
     break
   fi
 
@@ -456,6 +505,7 @@ if ! pg_is_review "$OUT" && command -v node >/dev/null 2>&1; then
   if node "$SELF/cdp-salvage.mjs" "$RUN_MARKER" "$SALVAGE_SECS" > "$OUT.cdp" 2>>"$RUNLOG" && pg_is_review "$OUT.cdp"; then
     mv "$OUT.cdp" "$OUT"
     echo "[oracle-review] CDP salvage recovered a completed review." >&2
+    SALVAGED=1
   else
     rm -f "$OUT.cdp"
   fi
@@ -465,10 +515,10 @@ if pg_is_review "$OUT"; then
   pg_status done
   cat "$OUT"
   echo "RESULT_FILE=$OUT"
-  exit 0
+  pg_finish 0
 else
   RETRIES=$(( attempt > 0 ? attempt - 1 : 0 ))
   echo "ERROR: oracle produced no usable review after salvage + ${RETRIES} retr$([ "${RETRIES}" -eq 1 ] && echo y || echo ies) (reattach: oracle session ${SLUG_BASE})." >&2
   pg_status failed "no usable review after salvage"
-  exit 6
+  pg_finish 6
 fi

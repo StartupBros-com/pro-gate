@@ -40,12 +40,11 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
 
 ## Procedure
 
-1. **Preflight (cheap, non-fatal).** Confirm the browser session is reachable:
-   ```bash
-   curl -sf localhost:9222/json/version >/dev/null
-   ```
-   If this fails, the session is down — return the "Oracle unavailable" envelope noting that
-   (`sudo systemctl start oracle-chrome` to recover) and stop. Do not try to launch Chrome.
+1. **No separate preflight (engine ≥ v0.19).** Do NOT probe CDP yourself and bail — the
+   engine self-heals a down Chrome (one non-interactive `systemctl start oracle-chrome`
+   attempt) and defers cleanly (exit 8) when the box is genuinely unfit. A caller-side
+   `curl` check would skip that recovery path and report "unavailable" for outages the
+   engine would have healed. Just run the engine and interpret its exit code.
 
 2. **Run the review.** From the repo, launch the engine with an explicit `--out` and a long
    Bash timeout (≥ 2100000 ms — it blocks 10-30 min):
@@ -61,8 +60,9 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
 
 3. **Interpret the exit code**, then return the matching envelope:
    - `0` — review ready: relay `$OUT` verbatim (success envelope).
-   - `3` (oracle/browser missing) or `7` (all review slots busy after the 40-min queue wait)
-     — unavailable envelope with the one-line reason; safe to retry later.
+   - `3` (oracle missing, or browser unreachable after the engine's self-heal attempt) or
+     `7` (all review slots busy after the 40-min queue wait) — unavailable envelope with
+     the one-line reason; safe to retry later.
    - `8` — deferred, **no quota spent** (box unfit or ChatGPT throttle cooldown): unavailable
      envelope; note it is safe to retry after the cooldown. Never delete the cooldown file.
    - `6` — ran but produced no usable review: quota MAY be spent — report it in the
