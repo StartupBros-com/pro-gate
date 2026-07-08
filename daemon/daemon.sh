@@ -47,7 +47,7 @@ fi
 # --- guardrails (universal + best-effort) -----------------------------------
 session_up(){
   [ "$MODE" = remote-chrome ] || return 0   # native (macOS): oracle drives Chrome; errors per-run if not signed in
-  curl -sf "localhost:${CDP_PORT}/json/version" >/dev/null 2>&1
+  pg_cdp_heal   # v0.19: reachable-or-one-self-heal-attempt (lib; PRO_GATE_SELF_HEAL=0 disables)
 }
 
 # Optional: only meaningful for codex users. No-op (returns "not tripped") without ~/.codex.

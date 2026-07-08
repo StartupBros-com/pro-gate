@@ -191,14 +191,104 @@ pg_health_gate() {
     fi
   fi
   if [ "$mode" = remote-chrome ]; then
-    curl -sf "localhost:${port}/json/version" >/dev/null 2>&1 \
-      || { echo "Chrome CDP unreachable on :${port}"; return 1; }
+    pg_cdp_heal || { echo "Chrome CDP unreachable on :${port} (self-heal failed or disabled)"; return 1; }
     up="$(pg_service_uptime)"
     if [ "${up:-999999}" -lt "$min_uptime" ]; then
       echo "oracle-chrome only ${up}s up (<${min_uptime}s) — just restarted/flapping"; return 1
     fi
   fi
   if ! reason="$(pg_mem_headroom_ok)"; then echo "$reason"; return 1; fi
+  return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.19: self-healing + run ledger + adaptive concurrency ("ramp")
+# ─────────────────────────────────────────────────────────────────────────────
+
+# pg_cdp_heal: return 0 when Chrome CDP is reachable, attempting ONE non-interactive
+# service start first if it is not (passwordless sudo only — silently a no-op without it,
+# and never on macOS/native where oracle drives the user's own Chrome). A healed Chrome
+# still trips the min-uptime gate above by design: don't submit into a cold browser; the
+# caller (daemon next cycle, or the engine's defer/retry) comes back a minute later.
+# Disable with PRO_GATE_SELF_HEAL=0.
+pg_cdp_heal() {
+  local port="${ORACLE_BROWSER_PORT:-9222}"
+  curl -sf "localhost:${port}/json/version" >/dev/null 2>&1 && return 0
+  [ "${PRO_GATE_SELF_HEAL:-1}" = 1 ] || return 1
+  [ "$(pg_service_mgr)" = systemd ] || return 1
+  echo "[pro-gate] Chrome CDP down on :${port} — self-heal: sudo -n systemctl start oracle-chrome" >&2
+  sudo -n systemctl start oracle-chrome.service >/dev/null 2>&1 || true
+  sleep "${PRO_GATE_SELF_HEAL_WAIT:-10}"
+  curl -sf "localhost:${port}/json/version" >/dev/null 2>&1
+}
+
+# pg_ledger_append <json-line>: flock-guarded append to the run ledger
+# ($PRO_GATE_HOME/ledger.jsonl) — one line per finished/deferred run. Best-effort:
+# observability must never fail a review.
+pg_ledger_append() {
+  local ledger="${PRO_GATE_LEDGER:-$PRO_GATE_HOME/ledger.jsonl}" line="$1" lfd
+  [ -n "$line" ] || return 0
+  if pg_have flock; then
+    if { exec {lfd}>>"$ledger"; } 2>/dev/null; then
+      flock -w 5 "$lfd" 2>/dev/null || true
+      { printf '%s\n' "$line" >&"$lfd"; } 2>/dev/null || true
+      eval "exec ${lfd}>&-" 2>/dev/null
+      return 0
+    fi
+  fi
+  printf '%s\n' "$line" >> "$ledger" 2>/dev/null || true
+}
+
+# Adaptive concurrency governor: effective review slots EARN their way up to the ceiling
+# (PRO_GATE_MAX_CONCURRENCY) and drop instantly on trouble, so raising the ceiling is safe
+# to try without babysitting. State: $PRO_GATE_HOME/ramp.state = "level<TAB>streak<TAB>ts".
+# Rules (pg_ramp_update, serialized under flock):
+#   clean run (exit 0, no throttle) -> streak+1; level+1 when streak >= PRO_GATE_RAMP_STREAK
+#                                      (default 5), streak resets
+#   throttle observed               -> level=1, streak=0 (the engine cooldown also defers)
+#   failed run (exit 6)             -> streak=0, level held
+#   deferred / lock-timeout (7, 8)  -> no change (nothing was spent, nothing learned)
+# PRO_GATE_RAMP=0 pins effective = ceiling (pre-v0.19 behavior).
+pg_ramp_level() {  # $1 = ceiling; echoes the effective concurrency
+  local ceiling="${1:-1}" state level
+  [ "${PRO_GATE_RAMP:-1}" = 1 ] || { echo "$ceiling"; return 0; }
+  state="${PRO_GATE_RAMP_STATE:-$PRO_GATE_HOME/ramp.state}"
+  level="$(awk -F'\t' 'NR==1{print $1}' "$state" 2>/dev/null)"
+  case "$level" in ''|*[!0-9]*) level=1 ;; esac
+  [ "$level" -lt 1 ] && level=1
+  [ "$level" -gt "$ceiling" ] && level="$ceiling"
+  echo "$level"
+}
+
+pg_ramp_update() {  # $1 = clean|throttle|failed, $2 = ceiling
+  [ "${PRO_GATE_RAMP:-1}" = 1 ] || return 0
+  local outcome="$1" ceiling="${2:-1}" state need level streak rfd
+  state="${PRO_GATE_RAMP_STATE:-$PRO_GATE_HOME/ramp.state}"
+  need="${PRO_GATE_RAMP_STREAK:-5}"
+  if pg_have flock; then
+    { exec {rfd}>>"$state.lock"; } 2>/dev/null && flock -w 10 "$rfd" 2>/dev/null || true
+  fi
+  level="$(awk -F'\t' 'NR==1{print $1}' "$state" 2>/dev/null)"
+  streak="$(awk -F'\t' 'NR==1{print $2}' "$state" 2>/dev/null)"
+  case "$level" in ''|*[!0-9]*) level=1 ;; esac
+  case "$streak" in ''|*[!0-9]*) streak=0 ;; esac
+  case "$outcome" in
+    clean)
+      streak=$(( streak + 1 ))
+      if [ "$streak" -ge "$need" ] && [ "$level" -lt "$ceiling" ]; then
+        level=$(( level + 1 )); streak=0
+        echo "[pro-gate ramp] ${need} clean runs at level $(( level - 1 )) — raising concurrency to ${level} (ceiling ${ceiling})" >&2
+      fi
+      ;;
+    throttle)
+      level=1; streak=0
+      echo "[pro-gate ramp] throttle observed — concurrency dropped to 1 (re-earns via clean streaks)" >&2
+      ;;
+    failed) streak=0 ;;
+    *) : ;;
+  esac
+  { printf '%s\t%s\t%s\n' "$level" "$streak" "$(date +%Y-%m-%dT%H:%M:%S%z)" > "$state.tmp" && mv -f "$state.tmp" "$state"; } 2>/dev/null || true
+  [ -n "${rfd:-}" ] && eval "exec ${rfd}>&-" 2>/dev/null
   return 0
 }
 
