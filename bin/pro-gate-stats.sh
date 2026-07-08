@@ -30,6 +30,24 @@ done
 
 command -v jq >/dev/null 2>&1 || { echo "pro-gate-stats: jq required" >&2; exit 3; }
 
+# --json is the automation mode: ONE JSON document on stdout, no banner (v0.19.1,
+# pro-gate self-review P2 — the header lines broke `pro-gate-stats.sh --json | jq`).
+if [ "$AS_JSON" = 1 ]; then
+  RL="$(awk -F'\t' 'NR==1{print $1}' "$STATE" 2>/dev/null)"; case "$RL" in ''|*[!0-9]*) RL=1;; esac
+  RS="$(awk -F'\t' 'NR==1{print $2}' "$STATE" 2>/dev/null)"; case "$RS" in ''|*[!0-9]*) RS=0;; esac
+  FILTER='.'; [ -n "$SINCE" ] && FILTER="select(.ts >= \"$SINCE\")"
+  if [ -s "$LEDGER" ]; then
+    jq -s --argjson level "$RL" --argjson streak "$RS" \
+      --argjson ceiling "${PRO_GATE_MAX_CONCURRENCY:-1}" \
+      "{ramp: {level: \$level, streak: \$streak, ceiling: \$ceiling}, runs: [.[] | $FILTER]}" "$LEDGER"
+  else
+    jq -nc --argjson level "$RL" --argjson streak "$RS" \
+      --argjson ceiling "${PRO_GATE_MAX_CONCURRENCY:-1}" \
+      '{ramp: {level: $level, streak: $streak, ceiling: $ceiling}, runs: []}'
+  fi
+  exit 0
+fi
+
 echo "== pro-gate observability =="
 if [ -f "$STATE" ]; then
   awk -F'\t' 'NR==1{printf "  ramp:    level %s, streak %s (since %s)\n", $1, $2, $3}' "$STATE"
@@ -45,11 +63,6 @@ fi
 
 FILTER='.'
 [ -n "$SINCE" ] && FILTER="select(.ts >= \"$SINCE\")"
-
-if [ "$AS_JSON" = 1 ]; then
-  jq -c "$FILTER" "$LEDGER"
-  exit 0
-fi
 
 jq -s "[.[] | $FILTER] | {
   runs: length,

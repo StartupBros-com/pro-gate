@@ -262,11 +262,30 @@ pg_ramp_level() {  # $1 = ceiling; echoes the effective concurrency
 
 pg_ramp_update() {  # $1 = clean|throttle|failed, $2 = ceiling
   [ "${PRO_GATE_RAMP:-1}" = 1 ] || return 0
-  local outcome="$1" ceiling="${2:-1}" state need level streak rfd
+  local outcome="$1" ceiling="${2:-1}" state need level streak rfd lockdir="" waited
   state="${PRO_GATE_RAMP_STATE:-$PRO_GATE_HOME/ramp.state}"
   need="${PRO_GATE_RAMP_STREAK:-5}"
+  # Serialize the read-modify-write (v0.19.1, pro-gate self-review P1): flock where
+  # available, else a mkdir spinlock (macOS). If NO lock can be obtained, skip the update
+  # rather than racing — a lost 'clean' credit is harmless, and a lost 'throttle' drop is
+  # still covered by the independent cooldown file, which blocks all new spends regardless
+  # of the ramp level.
   if pg_have flock; then
-    { exec {rfd}>>"$state.lock"; } 2>/dev/null && flock -w 10 "$rfd" 2>/dev/null || true
+    if ! { { exec {rfd}>>"$state.lock"; } 2>/dev/null && flock -w 10 "$rfd" 2>/dev/null; }; then
+      echo "[pro-gate ramp] could not lock ramp state — skipping this update" >&2
+      [ -n "${rfd:-}" ] && eval "exec ${rfd}>&-" 2>/dev/null
+      return 0
+    fi
+  else
+    lockdir="$state.lock.d"; waited=0
+    while ! mkdir "$lockdir" 2>/dev/null; do
+      waited=$(( waited + 1 ))
+      if [ "$waited" -ge 10 ]; then
+        echo "[pro-gate ramp] could not lock ramp state — skipping this update" >&2
+        return 0
+      fi
+      sleep 1
+    done
   fi
   level="$(awk -F'\t' 'NR==1{print $1}' "$state" 2>/dev/null)"
   streak="$(awk -F'\t' 'NR==1{print $2}' "$state" 2>/dev/null)"
@@ -289,6 +308,7 @@ pg_ramp_update() {  # $1 = clean|throttle|failed, $2 = ceiling
   esac
   { printf '%s\t%s\t%s\n' "$level" "$streak" "$(date +%Y-%m-%dT%H:%M:%S%z)" > "$state.tmp" && mv -f "$state.tmp" "$state"; } 2>/dev/null || true
   [ -n "${rfd:-}" ] && eval "exec ${rfd}>&-" 2>/dev/null
+  [ -n "$lockdir" ] && rmdir "$lockdir" 2>/dev/null
   return 0
 }
 

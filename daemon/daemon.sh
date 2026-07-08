@@ -47,7 +47,11 @@ fi
 # --- guardrails (universal + best-effort) -----------------------------------
 session_up(){
   [ "$MODE" = remote-chrome ] || return 0   # native (macOS): oracle drives Chrome; errors per-run if not signed in
-  pg_cdp_heal   # v0.19: reachable-or-one-self-heal-attempt (lib; PRO_GATE_SELF_HEAL=0 disables)
+  pg_cdp_heal || return 1   # v0.19: reachable-or-one-self-heal-attempt (PRO_GATE_SELF_HEAL=0 disables)
+  # v0.19.1 (pro-gate self-review P1): a just-healed Chrome must AGE past the engine's
+  # min-uptime gate before the daemon dispatches — otherwise process_pr launches into a
+  # guaranteed engine defer and can burn a MAX_FAILS strike on a healthy PR.
+  [ "$(pg_service_uptime)" -ge "${PRO_GATE_MIN_UPTIME:-60}" ]
 }
 
 # Optional: only meaningful for codex users. No-op (returns "not tripped") without ~/.codex.

@@ -276,7 +276,17 @@ fi
 
 echo "[oracle-review] acquiring a review slot (effective ${EFF_CONC} of ceiling ${MAX_CONC}; waits up to ${LOCK_WAIT}s if all busy)..." >&2
 pg_status waiting-slot "effective ${EFF_CONC} / ceiling ${MAX_CONC}"
-if ! pg_lock_n "$LOCKFILE" "$EFF_CONC" "$LOCK_WAIT"; then
+# v0.19.1 (pro-gate self-review P1): re-read the ramp level every wait slice — a run that
+# queued at level 3 must NOT acquire slot 3 after a concurrent throttle dropped the level
+# to 1 mid-wait. Short pg_lock_n slices keep the wait responsive to governor changes.
+SLOT_DEADLINE=$(( $(date +%s) + LOCK_WAIT ))
+SLOT_OK=0
+while :; do
+  EFF_CONC="$(pg_ramp_level "$MAX_CONC")"
+  if pg_lock_n "$LOCKFILE" "$EFF_CONC" 15; then SLOT_OK=1; break; fi
+  if [ "$(date +%s)" -ge "$SLOT_DEADLINE" ]; then break; fi
+done
+if [ "$SLOT_OK" != 1 ]; then
   echo "ERROR: timed out after ${LOCK_WAIT}s — all ${EFF_CONC} review slots are busy." >&2
   pg_status failed "slot timeout"
   pg_finish 7
