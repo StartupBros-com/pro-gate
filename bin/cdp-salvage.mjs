@@ -182,13 +182,17 @@ async function freshRenderText(url, port, outerDeadline) {
   }
 }
 
+// VERDICT / Pn matchers tolerate GPT-5.6 formatting drift: leading bold/bullet/quote markers and
+// whitespace, and markers/space between the label and its colon (e.g. `**VERDICT:**`, `- P0 :`).
+const VERDICT_RE = /^\s*[*_>#-]*\s*VERDICT[*_\s]*:/i;
+const PBLOCK_START_RE = /^\s*[*_>#-]*\s*(P0\s*[:\-]|P0\b|\[P[0-3]\])/i;
 function extractReview(text) {
   const lines = text.split('\n');
   let verdictIdx = -1;
-  for (let i = lines.length - 1; i >= 0; i--) if (/^VERDICT:/.test(lines[i])) { verdictIdx = i; break; }
+  for (let i = lines.length - 1; i >= 0; i--) if (VERDICT_RE.test(lines[i])) { verdictIdx = i; break; }
   if (verdictIdx < 0) return null;
   let start = -1;
-  for (let i = verdictIdx; i >= 0; i--) if (/^(P0\s*[:\-]|P0$|\[P[0-3]\])/.test(lines[i].trim())) start = i;
+  for (let i = verdictIdx; i >= 0; i--) if (PBLOCK_START_RE.test(lines[i].trim())) start = i;
   if (start < 0) start = Math.max(0, verdictIdx - 120);
   return lines.slice(start, verdictIdx + 1).join('\n').trim();
 }
