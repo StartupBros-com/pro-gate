@@ -189,17 +189,17 @@ pg_health_gate() {
   local mode port min_uptime up reason cdf cds mt age
   mode="$(pg_browser_mode)"; port="${ORACLE_BROWSER_PORT:-9222}"
   min_uptime="${PRO_GATE_MIN_UPTIME:-60}"
-  # v0.18: ChatGPT throttle cooldown — written by cdp-salvage when it sees the
-  # "requests too quickly / temporarily limited" interstitial. Submitting (or even
-  # salvage-rendering) during the cooldown deepens the throttle, so defer instead.
-  # Age-based: the file expires by mtime, no cleanup needed. GNU stat || BSD stat.
+  # v0.18: account back-off cooldown, written by cdp-salvage on the "requests too quickly /
+  # temporarily limited" throttle interstitial, and by oracle-review.sh on a Cloudflare anti-bot
+  # challenge. Submitting (or even salvage-rendering) during the cooldown deepens the block, so
+  # defer instead. Age-based: the file expires by mtime, no cleanup needed. GNU stat || BSD stat.
   cdf="${PRO_GATE_COOLDOWN_FILE:-$PRO_GATE_HOME/throttle.cooldown}"
   cds="${PRO_GATE_THROTTLE_COOLDOWN:-900}"
   if [ -f "$cdf" ]; then
     mt="$(stat -c %Y "$cdf" 2>/dev/null || stat -f %m "$cdf" 2>/dev/null || echo 0)"
     age=$(( $(date +%s) - mt ))
     if [ "$age" -ge 0 ] && [ "$age" -lt "$cds" ]; then
-      echo "ChatGPT throttle cooldown active ($(( cds - age ))s left; rm $cdf to override)"; return 1
+      echo "ChatGPT account back-off cooldown active ($(( cds - age ))s left; throttle/cloudflare; rm $cdf to override)"; return 1
     fi
   fi
   if [ "$mode" = remote-chrome ]; then
