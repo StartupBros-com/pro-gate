@@ -39,9 +39,21 @@ pg_augment_path() {
   export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$HOME/.local/share/pnpm:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
 }
 
-# Source the user's config if present.
+# Source the user's config if present. The .env provides DEFAULTS: any variable ALREADY set in
+# the environment (e.g. an inline one-shot override like `PRO_GATE_MAX_CONCURRENCY=1 oracle-review.sh`)
+# must WIN over the file. Plain `set -a; . .env` inverts that (the file clobbers the caller), so
+# a documented inline override was silently ignored. Snapshot the pre-existing exported env,
+# source .env for anything unset, then re-apply the snapshot so caller/inline values override the
+# file. Sourcing is left intact, so comments and quoting in .env keep working.
 pg_load_env() {
-  set -a; [ -f "$PRO_GATE_HOME/.env" ] && . "$PRO_GATE_HOME/.env"; set +a
+  [ -f "$PRO_GATE_HOME/.env" ] || return 0
+  local __pg_env_snapshot
+  # `export -p` emits `declare -x NAME=VALUE`; rewrite to `declare -gx` so the re-apply below
+  # sets GLOBALS (a bare `declare` inside a function scopes to the function and would not
+  # propagate the caller's values back out).
+  __pg_env_snapshot="$(export -p | sed 's/^declare -x /declare -gx /; s/^export /declare -gx /')"
+  set -a; . "$PRO_GATE_HOME/.env"; set +a
+  eval "$__pg_env_snapshot" 2>/dev/null || true
 }
 
 # pg_dur_secs <dur>: "90", "90s", "30m", "2h" -> seconds (bare number = seconds).

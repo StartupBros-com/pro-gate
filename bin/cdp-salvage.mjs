@@ -50,8 +50,9 @@ import path from 'node:path';
 
 const argv = process.argv.slice(2);
 const probe = argv[0] === '--probe' && argv.shift();
+const close = argv[0] === '--close' && argv.shift();
 const [marker, timeoutSecs = probe ? '30' : '600', port = process.env.ORACLE_CDP_PORT ?? '9222'] = argv;
-if (!marker) { console.error('usage: cdp-salvage.mjs [--probe] <pr-marker> [timeout-secs] [cdp-port]'); process.exit(2); }
+if (!marker) { console.error('usage: cdp-salvage.mjs [--probe|--close] <pr-marker> [timeout-secs] [cdp-port]'); process.exit(2); }
 const deadline = Date.now() + Number(timeoutSecs) * 1000;
 const POLL_MS = 20_000;
 
@@ -98,6 +99,25 @@ async function tabText(tab) {
 
 async function closeTab(id) {
   try { await fetch(`http://127.0.0.1:${port}/json/close/${id}`); } catch {}
+}
+
+// --close: post-review cleanup. Because we run oracle with --browser-archive=never (so the
+// probe/salvage can always find the conversation by marker), the wrapper must close the tab
+// itself once the review is confirmed, or /c/ tabs would accumulate. Close every conversation
+// tab carrying THIS run's marker. Best-effort, bounded, non-fatal (never fail a finished run).
+if (close) {
+  let tabs = [];
+  try {
+    tabs = (await (await fetch(`http://127.0.0.1:${port}/json`)).json())
+      .filter((t) => t.type === 'page' && /chatgpt\.com\/c\//.test(t.url || ''));
+  } catch { process.exit(0); }
+  let closed = 0;
+  for (const tab of tabs) {
+    const text = await tabText(tab);
+    if (text && text.includes(marker)) { await closeTab(tab.id); closed += 1; }
+  }
+  console.error(`cdp-salvage --close: closed ${closed} conversation tab(s) matching "${marker}"`);
+  process.exit(0);
 }
 
 // v0.17: renderer-dead-tab fallback. Under Xvfb a background conversation

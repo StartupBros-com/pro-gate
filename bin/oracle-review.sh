@@ -102,6 +102,18 @@ pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor,
       "${EFF_CONC:-0}" "${MAX_CONC:-1}" "${LIVE_CONVERSATION:-0}" "${SALVAGED:-0}")"
   fi
   pg_ledger_append "$line"
+  # Close this run's conversation tab. We run oracle with --browser-archive=never (so probe and
+  # salvage can always find the conversation by marker), which means WE own cleanup, otherwise
+  # /c/ tabs accumulate and add load to the account. Best-effort, bounded, non-fatal; matched by
+  # RUN_MARKER so we never touch another run's tab. remote-chrome only (native drives the user's
+  # own Chrome, where closing tabs is not ours to do). PRO_GATE_KEEP_TABS=1 opts out (debugging).
+  # Skip cleanup for lock-timeout (7) and deferred (8): no slot was spent, so no conversation
+  # tab exists, and a CDP scan there would just waste time.
+  if [ "$rc" != 7 ] && [ "$rc" != 8 ] \
+     && [ "$MODE" = remote-chrome ] && [ "${PRO_GATE_KEEP_TABS:-0}" != 1 ] \
+     && [ -n "${RUN_MARKER:-}" ] && command -v node >/dev/null 2>&1; then
+    timeout 30 node "$SELF/cdp-salvage.mjs" --close "$RUN_MARKER" >/dev/null 2>&1 || true
+  fi
   exit "$rc"
 }
 
@@ -243,6 +255,13 @@ fi
 # Platform browser flags: WSL/Linux attaches to the Xvfb Chrome; macOS lets oracle drive Chrome.
 ENGINE_ARGS=(-e browser)
 [ "$MODE" = "remote-chrome" ] && ENGINE_ARGS+=(--remote-chrome "127.0.0.1:${PORT}")
+# Keep oracle from auto-archiving the conversation. Its default (auto) archives a "successful"
+# one-shot and navigates the tab off the conversation, which strips the RUN_MARKER from the
+# open tabs and blinds BOTH the pre-retry liveness probe (-> false "dead submission" -> a
+# double-spending retry) and the last-resort CDP salvage. We own the conversation lifecycle:
+# leave the tab intact so probe/salvage can always find it, and close it ourselves once the
+# review is confirmed (pg_close_run_tab in pg_finish). Override with PRO_GATE_BROWSER_ARCHIVE.
+ENGINE_ARGS+=(--browser-archive "${PRO_GATE_BROWSER_ARCHIVE:-never}")
 
 # --- Bound concurrent Pro Extended runs against the single ChatGPT account ---
 # DEFAULT IS SERIALIZED (1). The 2026-07-03 throttle incident showed one account under
@@ -474,7 +493,23 @@ while :; do
     pg_status throttled "interstitial during pre-retry probe"
     break
   fi
-  echo "[oracle-review] pre-retry probe found no conversation for this run — dead submission confirmed. Retrying once after ${BACKOFF}s + a health re-check..." >&2
+  # FAIL CLOSED (self-review P1): a probe that neither found the conversation (0) nor throttle
+  # (5) is INCONCLUSIVE, not proof of a dead submission: a transient CDP/render hiccup returns
+  # the same non-0/5 code, and retrying a submission that actually LANDED double-spends the Pro
+  # slot. Only a run that died BEFORE it submitted is safe to retry. Oracle logs "Acquired
+  # ChatGPT browser slot" / "Session: ..." once the prompt is in flight; if that evidence is
+  # present the quota is spent, so suppress the retry and let the full-budget CDP salvage below
+  # collect it (now reliable: we run --browser-archive=never, so the tab is still findable).
+  # RUNLOG holds oracle's RAW output (the "[oracle] " prefix is added only to the live display),
+  # so match oracle's own strings. Bias toward "landed" (suppress the retry): a double-spend is
+  # worse than a missed retry, which the caller re-runs.
+  if grep -qE 'Launching browser mode|Acquired ChatGPT browser slot|Reattach: oracle session ' "$RUNLOG" 2>/dev/null; then
+    echo "[oracle-review] pre-retry probe inconclusive, but oracle had already submitted (browser slot/session in the log); treating as spent, retry suppressed, falling through to CDP salvage." >&2
+    LIVE_CONVERSATION=1
+    pg_status live-detected "submission landed (log evidence); retry suppressed"
+    break
+  fi
+  echo "[oracle-review] pre-retry probe found no conversation AND no evidence oracle ever submitted (genuine dead submission). Retrying once after ${BACKOFF}s + a health re-check..." >&2
   pg_status retry-wait "backoff ${BACKOFF}s"
   sleep "$BACKOFF"
 done
