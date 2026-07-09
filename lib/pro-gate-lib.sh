@@ -344,14 +344,17 @@ pg_filter_diff() {
 # garbage capture. Our prompt mandates Pn severity blocks AND one final "VERDICT:" line, so
 # require BOTH (v0.15, pro-gate PR#5 review P1: the old OR-grep accepted a capture truncated
 # after its first finding, which then skipped salvage/retry and shipped an incomplete review).
-# The VERDICT must sit on one of the last 3 non-empty lines: that rejects mid-file truncation
-# while tolerating up to two trailing footer lines from the capture (e.g. "Sources").
+# The VERDICT must sit near the end (last few non-empty lines): that rejects mid-file truncation
+# while tolerating trailing footer lines from the capture (e.g. a "Sources" block). The VERDICT
+# match tolerates GPT-5.6 formatting drift: leading bold/bullet/quote markers and whitespace, and
+# markers/space between VERDICT and its colon (e.g. `**VERDICT:**`, `- VERDICT :`).
 pg_is_review() {
   local f="$1"
   [ -s "$f" ] || return 1
   [ "$(wc -c < "$f" 2>/dev/null || echo 0)" -ge 40 ] || return 1
-  grep -qiE '\[P[0-3]\]|P[0-3]:[[:space:]]*(none|—|-)' "$f" 2>/dev/null || return 1
-  grep -vE '^[[:space:]]*$' "$f" 2>/dev/null | tail -n 3 | grep -qE '^VERDICT:'
+  grep -qiE '\[P[0-3]\]|P[0-3][*_ ]*:[[:space:]]*(none|—|-)' "$f" 2>/dev/null || return 1
+  grep -vE '^[[:space:]]*$' "$f" 2>/dev/null | tail -n 6 \
+    | grep -qiE '^[[:space:]]*[*_>#-]*[[:space:]]*VERDICT[*_[:space:]]*:'
 }
 
 # pg_reattach_render <slug> <out> [timeout_s]: bounded attempt to SALVAGE a review whose
