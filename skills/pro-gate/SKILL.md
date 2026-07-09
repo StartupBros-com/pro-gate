@@ -25,8 +25,14 @@ changes, update `agents/oracle-reviewer.md` in the same PR.)
   `node $PRO_GATE_HOME/cdp-salvage.mjs "<pr-url-or-pull/NNN>" <secs>` — it waits for the
   `VERDICT:` line in the tab and prints the review. (`oracle session <slug> --harvest` can bind a
   STALE tab target after a watchdog kill and harvest nothing — trust the CDP path.)
-- **Dead submission** (no conversation tab matching the PR + log repeated `no thinking status
-  detected`): no quota consumed — kill the process tree and re-run safely.
+- **Dead submission** (no conversation tab matching the PR AND the run log shows oracle never got
+  as far as `Launching browser mode` / `Acquired ChatGPT browser slot`): no quota consumed, so
+  kill the process tree and re-run safely. If the log DOES show a browser slot/session, the prompt
+  landed and quota is SPENT even without a visible tab (transient CDP/render hiccup): do NOT
+  re-run, salvage instead. The engine now fails closed here on its own. Note: the engine runs
+  oracle with `--browser-archive=never`, so a landed conversation's `/c/` tab stays findable by
+  marker (and the engine closes it on finish); a missing tab is therefore a stronger "never
+  landed" signal.
 - **Engine ≥v0.14 does all of this itself**: hard-cap/stall/no-think watchdogs, a CDP
   probe-before-kill at the no-think timeout (live tab → frees the slot, SUPPRESSES the retry,
   collects via cdp-salvage with the full budget), and cdp-salvage as last resort before failing.
