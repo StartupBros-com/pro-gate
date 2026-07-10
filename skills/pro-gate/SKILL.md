@@ -127,7 +127,10 @@ MARKER="$(jq -r .marker "$STATUS" 2>/dev/null || sed -nE 's/.*"marker":"([^"]+)"
 
 Harvest exits: `0` review ready · `9` still generating (wait, harvest again) · `8` deferred
 (cooldown: retry after) · `6` conversation gone (review lost; only NOW is a fresh run
-justified). Repeat harvests are free: no Pro quota is spent.
+justified) · `7` another collector already holds this marker (wait for it; do not race it).
+Repeat harvests are free: no Pro quota is spent. The engine serializes each marker and only
+releases a missing-conversation reservation after several consecutive confirmed misses, so a
+single slow or hydrating CDP read cannot green-light a fresh spend.
 
 **Exit 11 (`oversized`): scope the gate.** Huge diffs (default guard: >6000 lines,
 `PRO_GATE_MAX_DIFF_LINES`) do not converge in any review budget; blind reruns just burn

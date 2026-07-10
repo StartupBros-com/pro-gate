@@ -170,6 +170,11 @@ fi
 if [ -n "$HARVEST_MARKER" ]; then
   HARVEST=1
   RUN_MARKER="$HARVEST_MARKER"
+  if ! pg_reservation_marker_ok "$RUN_MARKER"; then
+    echo "ERROR: invalid --harvest marker (expected pg-run-... safe filename syntax)." >&2
+    pg_status failed "invalid harvest marker"
+    pg_finish 2
+  fi
   if [ "$MODE" != remote-chrome ]; then
     echo "ERROR: --harvest requires remote-chrome/CDP mode; native browser mode exposes no marker-addressable CDP tab." >&2
     pg_status failed "harvest unsupported in native browser mode"
@@ -178,6 +183,16 @@ if [ -n "$HARVEST_MARKER" ]; then
   # ledger/status pr field from the marker's "pg-run-<pr>-<epoch>-<pid>" shape (best-effort)
   PR_NUM="$(printf '%s' "$HARVEST_MARKER" | sed -nE 's/^pg-run-([A-Za-z0-9]+)-[0-9]+.*$/\1/p')"
   command -v node >/dev/null 2>&1 || { echo "ERROR: --harvest needs node for CDP salvage" >&2; pg_status failed "node missing"; pg_finish 3; }
+  # Serialize the entire marker harvest. Without this, two collectors can share $OUT.cdp,
+  # both read the same completed tab, and one closes it underneath the other (exit 6 + false
+  # reservation removal). Linux uses flock; macOS/no-flock uses the existing pg_lock mkdir path.
+  HARVEST_LOCK="${PRO_GATE_HARVEST_LOCK_DIR:-$PRO_GATE_HOME/harvest-locks}/${RUN_MARKER}"
+  mkdir -p "$(dirname "$HARVEST_LOCK")" 2>/dev/null || { pg_status failed "harvest lock dir unavailable"; pg_finish 3; }
+  if ! pg_lock "$HARVEST_LOCK" "${PRO_GATE_HARVEST_LOCK_WAIT:-5}"; then
+    echo "ERROR: another harvest is already collecting marker ${RUN_MARKER}; not racing it." >&2
+    pg_status failed "harvest already running"
+    pg_finish 7
+  fi
   # A harvest spends NO Pro slot and only reads over CDP, so the box-fitness parts of
   # pg_health_gate (memory, service uptime) don't apply: memory pressure is likeliest exactly
   # when a long review forced the harvest. Only the account cooldown defers it: salvage renders
