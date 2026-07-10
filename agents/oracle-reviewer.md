@@ -54,9 +54,10 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
      --input <both|bundle|connector> --out "$OUT" --timeout 30m
    ```
    The engine writes single-line JSON to `$OUT.status` at every phase change
-   (`preflight → waiting-slot → launching → … → done|failed|deferred`). If your Bash call is
-   interrupted or times out, do NOT relaunch — read `$OUT.status` first; phases `throttled`
-   and `salvaging` mean the engine is still working and quota may already be spent.
+   (`preflight → waiting-slot → launching → … → done|failed|deferred|in-progress|oversized`).
+   If your Bash call is interrupted or times out, do NOT relaunch: read `$OUT.status` first;
+   phases `throttled` and `salvaging` mean the engine is still working and quota may already
+   be spent. The JSON carries `marker`: the run's conversation id, needed for `--harvest`.
 
 3. **Interpret the exit code**, then return the matching envelope:
    - `0` — review ready: relay `$OUT` verbatim (success envelope).
@@ -67,6 +68,18 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
      envelope; note it is safe to retry after the cooldown. Never delete the cooldown file.
    - `6` — ran but produced no usable review: quota MAY be spent — report it in the
      unavailable envelope and do NOT re-run; the human should check the ChatGPT conversation.
+   - `9`: in-progress (engine >=v0.20): quota IS spent, the model was still generating when
+     the engine's budget ran out, and the conversation tab was left open. NEVER relaunch.
+     Wait ~10 min, then collect with NO new spend. Read the `marker` field from `$OUT.status`
+     (`jq -r .marker`, or the no-jq fallback
+     `sed -nE 's/.*"marker":"([^"]+)".*/\1/p'`), then run:
+     `~/.pro-review-daemon/oracle-review.sh --harvest "$MARKER" --out "$OUT" --timeout 20m`
+     (exit 0 = relay `$OUT`; exit 9 again = still generating, wait and repeat if your budget
+     allows, else return the unavailable envelope quoting the harvest command for the caller).
+   - `11`: oversized diff (engine >=v0.20), **no quota spent**: the payload exceeds
+     `PRO_GATE_MAX_DIFF_LINES` (default 6000) and will not converge. Unavailable envelope;
+     tell the caller to scope the gate (`--diff <delta.patch>` of the un-gated commits):
+     do NOT blind-retry.
    - `2`/`4`/`5` — caller error (usage/repo/diff): unavailable envelope with the reason.
 
 ## Output envelope

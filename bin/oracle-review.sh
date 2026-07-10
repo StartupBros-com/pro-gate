@@ -13,6 +13,9 @@
 #   oracle-review.sh --pr <url|number> [--repo <dir>] [--input both|bundle|connector]
 #                    [--out <file>] [--timeout <dur>] [--extra-files <glob>]
 #   oracle-review.sh --diff <patchfile> --repo <dir> [--out <file>] ...
+#   oracle-review.sh --harvest <run-marker> --out <file> [--timeout <dur>]
+#       Collect a review whose run ended in-progress (exit 9): the Pro slot was spent but the
+#       model was still generating when the salvage budget ran out. No new slot is spent.
 set -uo pipefail
 
 # --- locate + source the shared lib (works from repo and from deployed location) ---
@@ -26,7 +29,7 @@ pg_augment_path
 pg_load_env
 OS="$(pg_os)"; MODE="$(pg_browser_mode)"
 
-PR=""; REPO=""; DIFF_FILE=""; INPUT="both"; OUT=""; TIMEOUT="30m"; EXTRA_GLOB=""
+PR=""; REPO=""; DIFF_FILE=""; INPUT="both"; OUT=""; TIMEOUT="30m"; EXTRA_GLOB=""; HARVEST_MARKER=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --pr) PR="$2"; shift 2;;
@@ -36,6 +39,7 @@ while [ $# -gt 0 ]; do
     --out) OUT="$2"; shift 2;;
     --timeout) TIMEOUT="$2"; shift 2;;
     --extra-files) EXTRA_GLOB="$2"; shift 2;;
+    --harvest) HARVEST_MARKER="$2"; shift 2;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
@@ -44,14 +48,21 @@ PORT="${ORACLE_BROWSER_PORT:-9222}"
 MODEL="${ORACLE_MODEL:-gpt-5.5-pro}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/pro-review.XXXXXX")"
 [ -n "$OUT" ] || OUT="$WORK/findings.md"
-pg_have oracle || { echo "ERROR: oracle not installed (pnpm add -g @steipete/oracle)" >&2; exit 3; }
+# Fresh runs need oracle; --harvest only needs node+CDP and checks that prerequisite inside
+# its branch below (moving this gate matters when oracle is temporarily unavailable but a spent
+# review is waiting in an open conversation).
 
 # --- machine-readable run status (v0.18) ---
 # Callers (the /pro-gate skill, the daemon's headless agent) poll "$OUT.status" — a
 # single-line JSON updated ATOMICALLY at every phase change — instead of scraping the
 # engine's stderr. Phases: preflight, waiting-pr-lock, waiting-slot, launching,
-# watchdog-killed, live-detected, salvaging, retry-wait, throttled, cloudflare, deferred, done, failed.
-# Terminal phases: done (read $OUT), failed, deferred (no slot spent — retry later).
+# watchdog-killed, live-detected, salvaging, retry-wait, throttled, cloudflare, oversized,
+# deferred, done, failed, in-progress.
+# Terminal phases: done (read $OUT), failed, deferred (no slot spent: retry later),
+# oversized (no slot spent: scope the diff), in-progress (slot SPENT, model still
+# generating: collect later with --harvest <marker>, NEVER relaunch).
+# v0.20: the JSON carries `marker`, the run's conversation correlation id, so callers can
+# harvest an in-progress review without grepping engine logs.
 STATUS_FILE="$OUT.status"
 pg_status() {  # $1 phase, $2 optional detail — variable fields are JSON-escaped (v0.18.1:
   # $OUT is caller-supplied; a quote/backslash in it would corrupt the polling contract)
@@ -59,13 +70,14 @@ pg_status() {  # $1 phase, $2 optional detail — variable fields are JSON-escap
   ts="$(date +%Y-%m-%dT%H:%M:%S%z)"
   if pg_have jq; then
     jq -nc --arg phase "$phase" --argjson attempt "${attempt:-0}" --arg detail "$detail" \
-       --arg pr "${PR_NUM:-diff}" --arg out "$OUT" --arg ts "$ts" \
-       '{phase:$phase,attempt:$attempt,detail:$detail,pr:$pr,out:$out,ts:$ts}' \
+       --arg pr "${PR_NUM:-diff}" --arg out "$OUT" --arg ts "$ts" --arg marker "${RUN_MARKER:-}" \
+       '{phase:$phase,attempt:$attempt,detail:$detail,pr:$pr,out:$out,ts:$ts,marker:$marker}' \
        > "$STATUS_FILE.tmp" 2>/dev/null
   else
-    printf '{"phase":"%s","attempt":%d,"detail":"%s","pr":"%s","out":"%s","ts":"%s"}\n' \
+    printf '{"phase":"%s","attempt":%d,"detail":"%s","pr":"%s","out":"%s","ts":"%s","marker":"%s"}\n' \
       "$phase" "${attempt:-0}" "$(printf '%s' "$detail" | tr -d '"\\' | tr '\n' ' ')" \
       "${PR_NUM:-diff}" "$(printf '%s' "$OUT" | tr -d '"\\' | tr '\n' ' ')" "$ts" \
+      "$(printf '%s' "${RUN_MARKER:-}" | tr -d '"\\' | tr '\n' ' ')" \
       > "$STATUS_FILE.tmp" 2>/dev/null
   fi
   { [ -s "$STATUS_FILE.tmp" ] && mv -f "$STATUS_FILE.tmp" "$STATUS_FILE"; } 2>/dev/null || true
@@ -84,16 +96,23 @@ pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor,
     6) outcome=failed ;;
     7) outcome=lock-timeout ;;
     8) outcome=deferred ;;
+    9) outcome=in-progress ;;
+    11) outcome=oversized ;;
     *) outcome=other ;;
   esac
   [ "${THROTTLED:-0}" = 1 ] && outcome=throttle
   [ "${CLOUDFLARE:-0}" = 1 ] && outcome=cloudflare
   # cloudflare is an account-level block just like a throttle: drop concurrency (feed the ramp
   # the throttle signal) while recording the distinct outcome in the ledger.
-  case "$outcome" in
-    clean|throttle|failed) pg_ramp_update "$outcome" "${MAX_CONC:-1}" ;;
-    cloudflare)            pg_ramp_update throttle "${MAX_CONC:-1}" ;;
-  esac
+  # in-progress and oversized teach the ramp nothing (the account behaved fine); harvest runs
+  # (HARVEST=1) never feed it either: a harvest is not a fresh Pro spend, so a clean harvest
+  # must not inflate the clean streak that earns concurrency.
+  if [ "${HARVEST:-0}" != 1 ]; then
+    case "$outcome" in
+      clean|throttle|failed) pg_ramp_update "$outcome" "${MAX_CONC:-1}" ;;
+      cloudflare)            pg_ramp_update throttle "${MAX_CONC:-1}" ;;
+    esac
+  fi
   if pg_have jq; then
     line="$(jq -nc --arg ts "$(date +%Y-%m-%dT%H:%M:%S%z)" --arg pr "${PR_NUM:-diff}" \
       --arg repo "${REPO:-}" --argjson exit "$rc" --arg outcome "$outcome" \
@@ -113,12 +132,15 @@ pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor,
   # /c/ tabs accumulate and add load to the account. Best-effort, bounded, non-fatal; matched by
   # RUN_MARKER so we never touch another run's tab. remote-chrome only (native drives the user's
   # own Chrome, where closing tabs is not ours to do). PRO_GATE_KEEP_TABS=1 opts out (debugging).
-  # Skip cleanup for lock-timeout (7) and deferred (8): no slot was spent, so no conversation
-  # tab exists, and a CDP scan there would just waste time.
-  if [ "$rc" != 7 ] && [ "$rc" != 8 ] \
+  # Skip cleanup for lock-timeout (7), deferred (8), and oversized (11): no slot was spent, so
+  # no conversation tab exists, and a CDP scan there would just waste time. Skip it for
+  # in-progress (9) because the model is STILL GENERATING in that tab: closing it destroys a
+  # spent Pro slot's answer (a 65-minute Pro review was lost exactly this way on 2026-07-09);
+  # the tab stays open for --harvest, which closes it once the review is finally captured.
+  if [ "$rc" != 7 ] && [ "$rc" != 8 ] && [ "$rc" != 9 ] && [ "$rc" != 11 ] \
      && [ "$MODE" = remote-chrome ] && [ "${PRO_GATE_KEEP_TABS:-0}" != 1 ] \
      && [ -n "${RUN_MARKER:-}" ] && command -v node >/dev/null 2>&1; then
-    timeout 30 node "$SELF/cdp-salvage.mjs" --close "$RUN_MARKER" >/dev/null 2>&1 || true
+    timeout 30 node "$SELF/cdp-salvage.mjs" --close "$RUN_MARKER" 25 "$PORT" >/dev/null 2>&1 || true
   fi
   exit "$rc"
 }
@@ -138,6 +160,66 @@ else
   # clearly if you're not signed into ChatGPT.
   :
 fi
+
+# --- v0.20: harvest mode: collect an in-progress run's review, spending NO new slot ---
+# A run that exits 9 (in-progress) spent its Pro slot but hit the salvage budget while the
+# model was still generating; its conversation tab was deliberately left open. This mode
+# re-runs ONLY the marker-matched CDP collection. Exit: 0 done, 9 still generating (run it
+# again later), 8 deferred (cooldown/box unfit: the account must not be rendered against),
+# 6 conversation gone (review lost; only now is a re-run justified).
+if [ -n "$HARVEST_MARKER" ]; then
+  HARVEST=1
+  RUN_MARKER="$HARVEST_MARKER"
+  if [ "$MODE" != remote-chrome ]; then
+    echo "ERROR: --harvest requires remote-chrome/CDP mode; native browser mode exposes no marker-addressable CDP tab." >&2
+    pg_status failed "harvest unsupported in native browser mode"
+    pg_finish 3
+  fi
+  # ledger/status pr field from the marker's "pg-run-<pr>-<epoch>-<pid>" shape (best-effort)
+  PR_NUM="$(printf '%s' "$HARVEST_MARKER" | sed -nE 's/^pg-run-([A-Za-z0-9]+)-[0-9]+.*$/\1/p')"
+  command -v node >/dev/null 2>&1 || { echo "ERROR: --harvest needs node for CDP salvage" >&2; pg_status failed "node missing"; pg_finish 3; }
+  # A harvest spends NO Pro slot and only reads over CDP, so the box-fitness parts of
+  # pg_health_gate (memory, service uptime) don't apply: memory pressure is likeliest exactly
+  # when a long review forced the harvest. Only the account cooldown defers it: salvage renders
+  # against a throttled/challenged account deepen the block.
+  if GATE_REASON="$(pg_cooldown_active)"; then
+    echo "[oracle-review] harvest deferred: ${GATE_REASON}." >&2
+    pg_status deferred "$GATE_REASON"
+    pg_finish 8
+  fi
+  HARVEST_SECS="$(pg_dur_secs "$TIMEOUT")"
+  echo "[oracle-review] harvesting in-progress review (marker ${RUN_MARKER}, up to ${HARVEST_SECS}s, no new slot spent)..." >&2
+  pg_status salvaging "harvest up to ${HARVEST_SECS}s"
+  HARVEST_RC=0
+  node "$SELF/cdp-salvage.mjs" "$RUN_MARKER" "$HARVEST_SECS" "$PORT" > "$OUT.cdp" || HARVEST_RC=$?
+  if [ "$HARVEST_RC" -eq 0 ] && pg_is_review "$OUT.cdp"; then
+    mv "$OUT.cdp" "$OUT"
+    pg_reservation_remove "$RUN_MARKER" || true
+    SALVAGED=1
+    echo "[oracle-review] harvest recovered the completed review ($(wc -c < "$OUT" 2>/dev/null) bytes)." >&2
+    pg_status done
+    cat "$OUT"
+    echo "RESULT_FILE=$OUT"
+    pg_finish 0
+  fi
+  rm -f "$OUT.cdp"
+  case "$HARVEST_RC" in
+    3) pg_reservation_write "$RUN_MARKER" "${PR_NUM:-diff}" "$OUT" || true
+       echo "[oracle-review] still generating: tab left open; run --harvest again later." >&2
+       pg_status in-progress "still generating; retry --harvest later"
+       pg_finish 9 ;;
+    5) echo "[oracle-review] ChatGPT throttle hit during harvest: cooldown written; retry --harvest after it expires." >&2
+       THROTTLED=1
+       pg_status deferred "throttle during harvest; retry after cooldown"
+       pg_finish 8 ;;
+    *) pg_reservation_remove "$RUN_MARKER" || true
+       echo "ERROR: no conversation matches marker ${RUN_MARKER} (tab closed/archived or review lost)." >&2
+       pg_status failed "harvest found no matching conversation"
+       pg_finish 6 ;;
+  esac
+fi
+
+pg_have oracle || { echo "ERROR: oracle not installed (pnpm add -g @steipete/oracle)" >&2; pg_status failed "oracle missing"; pg_finish 3; }
 
 # --- resolve repo + PR, assemble the diff (ground truth) ---
 PR_URL=""; PR_NUM=""
@@ -183,6 +265,26 @@ fi
 
 DIFF_LINES=$(wc -l < "$DIFF_FILE" 2>/dev/null || echo 0)
 echo "[oracle-review] os=$OS mode=$MODE repo=$REPO pr=#${PR_NUM} url=${PR_URL:-n/a} diff_lines=$DIFF_LINES input=$INPUT" >&2
+
+# --- v0.20: diff-size guard: refuse to burn a Pro Extended slot on a payload that will not
+# converge. Ledger data: 984-1402-line diffs complete in 12-21 min; a ~10k-line diff (6.5k
+# insertions, 40 files) reasoned 65 minutes without emitting a verdict (2026-07-09, exactly the
+# review window the timeout+salvage budgets cannot cover). Oversized diffs exit 11 BEFORE any
+# lock or slot is taken, with the delta-scoping recipe on stderr. PRO_GATE_MAX_DIFF_LINES
+# raises the cap, PRO_GATE_DIFF_GUARD=0 downgrades the hard stop to a warning.
+DIFF_WARN_LINES="${PRO_GATE_DIFF_WARN_LINES:-2500}"
+DIFF_MAX_LINES="${PRO_GATE_MAX_DIFF_LINES:-6000}"
+if [ "${DIFF_LINES:-0}" -gt "$DIFF_MAX_LINES" ] 2>/dev/null && [ "${PRO_GATE_DIFF_GUARD:-1}" = 1 ]; then
+  echo "ERROR: diff is ${DIFF_LINES} lines (> PRO_GATE_MAX_DIFF_LINES=${DIFF_MAX_LINES}): Pro Extended does not converge on payloads this size within any review budget; not spending a slot." >&2
+  echo "  Scope the gate to what actually needs the final tier, then re-run with the patch:" >&2
+  echo "    git -C <repo> diff <last-gated-sha>..<head> -- ':!*.lock' > delta.patch" >&2
+  echo "    oracle-review.sh --diff delta.patch --repo <repo> --extra-files '<context globs>' --out <out>" >&2
+  echo "  (Or split the PR; or raise PRO_GATE_MAX_DIFF_LINES / set PRO_GATE_DIFF_GUARD=0 to override.)" >&2
+  pg_status oversized "diff ${DIFF_LINES} lines > max ${DIFF_MAX_LINES}; scope with --diff"
+  pg_finish 11
+elif [ "${DIFF_LINES:-0}" -gt "$DIFF_WARN_LINES" ] 2>/dev/null; then
+  echo "[oracle-review] WARNING: diff is ${DIFF_LINES} lines (> ${DIFF_WARN_LINES}); large diffs risk exceeding the Pro Extended review window: consider scoping with --diff to the unreviewed delta." >&2
+fi
 
 # --- build the review prompt (the product) ---
 # RUN_MARKER (v0.15, pro-gate PR#5 review P1): a per-attempt correlation id
@@ -288,6 +390,24 @@ EFF_CONC="$(pg_ramp_level "$MAX_CONC")"
 # untouched for >24h — any legitimate holder finishes within the ~35 min hard cap.
 find "$(dirname "$LOCKFILE")" -maxdepth 1 -name "$(basename "$LOCKFILE").pr-*" -mmin +1440 -delete 2>/dev/null || true
 
+# Reconcile durable reservations from earlier exit-9 runs before dispatch. A same-PR
+# reservation redirects this invocation to HARVEST instead of spending a second slot. This is
+# enforced in the engine (not merely caller docs), so a killed headless caller cannot double-
+# spend on its next daemon cycle. Native mode has no marker-addressable CDP, so no reservations
+# are created there.
+if [ "$MODE" = remote-chrome ]; then
+  pg_reservation_reconcile "$SELF/cdp-salvage.mjs" "$PORT"
+  if [ -n "${PR_NUM}" ]; then
+    RESERVED_MARKER="$(pg_reservation_find_pr "$PR_NUM" 2>/dev/null || true)"
+    if [ -n "$RESERVED_MARKER" ]; then
+      echo "[oracle-review] pr #${PR_NUM} already has an in-progress Pro conversation (${RESERVED_MARKER}): harvesting it instead of submitting again." >&2
+      pg_status in-progress "existing reservation ${RESERVED_MARKER}; harvest required"
+      echo "  ${PRO_GATE_HOME:-\$HOME/.pro-review-daemon}/oracle-review.sh --harvest '${RESERVED_MARKER}' --out '${OUT}' --timeout 20m" >&2
+      pg_finish 9
+    fi
+  fi
+fi
+
 # Per-PR guard (acquire BEFORE a slot, so same-PR callers serialize without holding a scarce slot).
 if [ -n "${PR_NUM}" ]; then
   echo "[oracle-review] per-PR guard for pr #${PR_NUM} (serializes same-PR reviews)..." >&2
@@ -296,6 +416,15 @@ if [ -n "${PR_NUM}" ]; then
     echo "ERROR: timed out after ${LOCK_WAIT}s — pr #${PR_NUM} is already under review elsewhere." >&2
     pg_status failed "per-PR lock timeout"
     pg_finish 7
+  fi
+  # The previous same-PR process may have exited 9 while we waited and written a reservation
+  # just before releasing this flock. Re-check now that we own the per-PR lock; otherwise this
+  # waiter would immediately submit a duplicate review.
+  RESERVED_MARKER="$(pg_reservation_find_pr "$PR_NUM" 2>/dev/null || true)"
+  if [ -n "$RESERVED_MARKER" ]; then
+    echo "[oracle-review] pr #${PR_NUM} became in-progress while waiting (${RESERVED_MARKER}): harvest required, not resubmitting." >&2
+    pg_status in-progress "existing reservation ${RESERVED_MARKER}; harvest required"
+    pg_finish 9
   fi
 fi
 
@@ -308,8 +437,23 @@ SLOT_DEADLINE=$(( $(date +%s) + LOCK_WAIT ))
 SLOT_OK=0
 while :; do
   EFF_CONC="$(pg_ramp_level "$MAX_CONC")"
-  if pg_lock_n "$LOCKFILE" "$EFF_CONC" 15; then SLOT_OK=1; break; fi
+  # Durable reservations count as occupied Pro capacity even though their wrapper process has
+  # exited. Reduce process-owned semaphore capacity accordingly; if reservations consume the
+  # full effective level, wait without calling pg_lock_n (which clamps maxn<=0 back to 1).
+  if ! pg_reservation_guard_acquire; then sleep 3; continue; fi
+  RESERVED_COUNT="$(pg_reservation_count)"
+  AVAILABLE_CONC=$(( EFF_CONC - RESERVED_COUNT ))
+  # Nonblocking while holding the short handoff guard: waiting here would prevent an active
+  # run from writing its reservation before releasing its process slot (writer waits 10s; the
+  # old slot scan waited 15s). One immediate scan gives an atomic count+acquire decision; the
+  # outer loop releases the guard and retries.
+  if [ "$AVAILABLE_CONC" -gt 0 ] && pg_lock_n "$LOCKFILE" "$AVAILABLE_CONC" 0; then
+    # Keep the acquired process slot, release only the short reservation handoff guard.
+    pg_reservation_guard_release; SLOT_OK=1; break
+  fi
+  pg_reservation_guard_release
   if [ "$(date +%s)" -ge "$SLOT_DEADLINE" ]; then break; fi
+  sleep 3
 done
 if [ "$SLOT_OK" != 1 ]; then
   echo "ERROR: timed out after ${LOCK_WAIT}s — all ${EFF_CONC} review slots are busy." >&2
@@ -343,7 +487,7 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
   local force_args=()
   [ "${attempt:-0}" -gt 0 ] && force_args+=(--force)
   ( stdbuf -oL -eL timeout --signal=TERM --kill-after=30 "$HARD_SECS" \
-      oracle "${ENGINE_ARGS[@]}" -m "$MODEL" \
+      "${PRO_GATE_ORACLE_BIN:-oracle}" "${ENGINE_ARGS[@]}" -m "$MODEL" \
       --browser-model-strategy "$strategy" ${force_args[0]:+"${force_args[@]}"} \
       --slug "pro gate review pr ${PR_NUM:-diff}" \
       "${URL_ARGS[@]}" "${FILE_ARGS[@]}" \
@@ -376,7 +520,7 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
       # like live: never resubmit, and let the post-cooldown salvage decide.
       prc=2
       if command -v node >/dev/null 2>&1; then
-        node "$SELF/cdp-salvage.mjs" --probe "$RUN_MARKER" 30 >/dev/null 2>>"$RUNLOG"; prc=$?
+        node "$SELF/cdp-salvage.mjs" --probe "$RUN_MARKER" 30 "$PORT" >/dev/null 2>>"$RUNLOG"; prc=$?
       fi
       if [ "$prc" -eq 0 ]; then
         echo "[oracle-review] watchdog: no-think after $(( now - started ))s BUT a conversation tab matches this PR — submission is LIVE, detection missed. Freeing the slot; CDP salvage will collect the review (retry suppressed: quota already spent)." >&2
@@ -507,7 +651,7 @@ while :; do
   # salvaged through a dead browser anyway.)
   PRC=2
   if command -v node >/dev/null 2>&1; then
-    node "$SELF/cdp-salvage.mjs" --probe "$RUN_MARKER" 30 >/dev/null 2>>"$RUNLOG"; PRC=$?
+    node "$SELF/cdp-salvage.mjs" --probe "$RUN_MARKER" 30 "$PORT" >/dev/null 2>>"$RUNLOG"; PRC=$?
   fi
   if [ "$PRC" -eq 0 ]; then
     echo "[oracle-review] pre-retry probe found a live conversation for this run — retry suppressed (quota already spent); CDP salvage will collect it." >&2
@@ -566,7 +710,9 @@ if ! pg_is_review "$OUT" && [ "${CLOUDFLARE:-0}" != 1 ] && command -v node >/dev
   fi
   echo "[oracle-review] last-resort CDP tab salvage (marker ${RUN_MARKER}, up to ${SALVAGE_SECS}s)..." >&2
   pg_status salvaging "cdp up to ${SALVAGE_SECS}s"
-  if node "$SELF/cdp-salvage.mjs" "$RUN_MARKER" "$SALVAGE_SECS" > "$OUT.cdp" 2>>"$RUNLOG" && pg_is_review "$OUT.cdp"; then
+  SALVAGE_RC=0
+  node "$SELF/cdp-salvage.mjs" "$RUN_MARKER" "$SALVAGE_SECS" "$PORT" > "$OUT.cdp" 2>>"$RUNLOG" || SALVAGE_RC=$?
+  if [ "$SALVAGE_RC" -eq 0 ] && pg_is_review "$OUT.cdp"; then
     mv "$OUT.cdp" "$OUT"
     echo "[oracle-review] CDP salvage recovered a completed review." >&2
     SALVAGED=1
@@ -580,6 +726,28 @@ if pg_is_review "$OUT"; then
   cat "$OUT"
   echo "RESULT_FILE=$OUT"
   pg_finish 0
+elif [ "${SALVAGE_RC:-0}" -eq 3 ]; then
+  # The salvage budget ran out while the conversation was STILL GENERATING: the Pro slot is
+  # spent and the answer may land any minute. Persist a durable reservation BEFORE this process
+  # releases its flock slot, leave the tab open (pg_finish skips close for exit 9), and hand the
+  # caller a no-respend collection path. Fresh runs reconcile/respect the reservation, so actual
+  # account concurrency and same-PR serialization remain correct after this wrapper exits.
+  if ! pg_reservation_write "$RUN_MARKER" "${PR_NUM:-diff}" "$OUT"; then
+    # Fail closed: without the durable reservation, exit 9 would under-count a live Pro tab and
+    # let the next invocation double-spend. Keep the process/locks alive rather than release
+    # unreserved capacity; this should only happen on a broken/unwritable PRO_GATE_HOME.
+    echo "ERROR: review still generating, but could not persist its capacity reservation; keeping the engine alive to preserve the slot." >&2
+    pg_status salvaging "still generating; reservation write failed; slot held"
+    while node "$SELF/cdp-salvage.mjs" --probe "$RUN_MARKER" 30 "$PORT" >/dev/null 2>&1; do sleep 60; done
+    echo "ERROR: live conversation disappeared before it could be reserved; review lost." >&2
+    pg_status failed "reservation write failed; conversation gone"
+    pg_finish 6
+  fi
+  echo "ERROR: review still generating after the salvage budget: conversation tab LEFT OPEN and account capacity RESERVED." >&2
+  echo "  Collect it later WITHOUT spending another Pro slot:" >&2
+  echo "    ${PRO_GATE_HOME:-\$HOME/.pro-review-daemon}/oracle-review.sh --harvest '${RUN_MARKER}' --out '${OUT}' --timeout 20m" >&2
+  pg_status in-progress "slot spent, model still generating; harvest with --harvest"
+  pg_finish 9
 else
   RETRIES=$(( attempt > 0 ? attempt - 1 : 0 ))
   echo "ERROR: oracle produced no usable review after salvage + ${RETRIES} retr$([ "${RETRIES}" -eq 1 ] && echo y || echo ies) (reattach: oracle session ${SLUG_BASE})." >&2

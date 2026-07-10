@@ -42,6 +42,10 @@ changes, update `agents/oracle-reviewer.md` in the same PR.)
 - **Engine ≥v0.18 is also throttle-aware**: salvage page-loads are budgeted per URL,
   foreign conversations are blacklisted persistently, the throttle interstitial trips a global
   cooldown instead of a retry, and every phase lands in `<out>.status` for polling.
+- **Engine >=v0.20 never destroys a still-generating review**: when the salvage budget ends
+  while the model is still reasoning, the run exits 9 (`in-progress`), leaves the conversation
+  tab open, and `--harvest <marker>` collects the finished review later with NO new spend. An
+  oversized diff is refused up front (exit 11) instead of burning a slot it cannot convert.
 
 **Codex on Windows:** run the engine through WSL, not native PowerShell path syntax. Use WSL repo paths
 such as `/home/will/SITES/<repo>` and invoke commands with `wsl -e bash -lc '...'`; the default engine
@@ -94,16 +98,47 @@ Launch the engine in the background (it blocks ~10-30 min) and poll its **status
 ```
 
 Run with `run_in_background: true` and a long Bash timeout. The engine writes single-line JSON to
-`<out>.status` at every phase change (`preflight → waiting-slot → launching → … → done|failed|deferred`) —
+`<out>.status` at every phase change (`preflight → waiting-slot → launching → … → done|failed|deferred|in-progress|oversized`):
 poll THAT, not engine logs. Phase `done` ⇒ read `--out` (the `[Pn] file:line` blocks ending in a
-`VERDICT:` line). `failed`/`deferred` are terminal for this invocation — do NOT relaunch on
-`throttled`/`salvaging` phases; the engine is still working. While waiting, never spawn a second
-oracle run for the same PR.
+`VERDICT:` line). `failed`/`deferred`/`in-progress`/`oversized` are terminal for this invocation:
+do NOT relaunch on `throttled`/`salvaging` phases; the engine is still working. While waiting,
+never spawn a second oracle run for the same PR. The status JSON carries `marker` (the run's
+conversation correlation id): you need it for `--harvest`.
 
 Engine exit codes: `0` review ready · `2` bad usage · `3` oracle/browser missing · `4` repo not
 found · `5` diff fetch failed · `6` ran but no usable review (quota may be spent — check the PR
 conversation in ChatGPT before re-running) · `7` lock timeout · `8` deferred, NO quota spent
-(box unfit or throttle cooldown — safe to retry later).
+(box unfit or throttle cooldown: safe to retry later) · `9` in-progress: the slot IS spent but
+the model was still generating when the salvage budget ran out; the conversation tab is left
+open: NEVER relaunch, harvest instead (below) · `11` oversized diff, NO quota spent: scope
+the payload (below) instead of re-running.
+
+**Exit 9 (`in-progress`): harvest, don't respend.** GPT-5.5 Pro can reason for 45-90+ minutes
+on a heavy payload (observed 65 min on 2026-07-09): longer than the engine can hold a review
+slot. The engine frees the slot, leaves the run's conversation tab open, and puts the marker in
+the status JSON. Wait ~10 min, then collect with:
+
+```bash
+STATUS=<out>.status
+MARKER="$(jq -r .marker "$STATUS" 2>/dev/null || sed -nE 's/.*"marker":"([^"]+)".*/\1/p' "$STATUS")"
+"${PRO_GATE_HOME:-$HOME/.pro-review-daemon}"/oracle-review.sh \
+  --harvest "$MARKER" --out <out> --timeout 20m
+```
+
+Harvest exits: `0` review ready · `9` still generating (wait, harvest again) · `8` deferred
+(cooldown: retry after) · `6` conversation gone (review lost; only NOW is a fresh run
+justified). Repeat harvests are free: no Pro quota is spent.
+
+**Exit 11 (`oversized`): scope the gate.** Huge diffs (default guard: >6000 lines,
+`PRO_GATE_MAX_DIFF_LINES`) do not converge in any review budget; blind reruns just burn
+20-60 min Pro sessions. Scope the final gate to the delta that has NOT already cleared earlier
+tiers, with full-file context for the trust boundary:
+
+```bash
+git -C <repo> diff <last-gated-sha>..<head> > delta.patch
+"${PRO_GATE_HOME:-$HOME/.pro-review-daemon}"/oracle-review.sh \
+  --diff delta.patch --repo <repo> --extra-files 'lib/critical-*.sh' --out <out>
+```
 
 ## 4. Synthesize
 

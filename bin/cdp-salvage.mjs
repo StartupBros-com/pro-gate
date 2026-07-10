@@ -40,7 +40,10 @@
 //                matching the marker EXISTS (no VERDICT wait). Used by the
 //                engine's no-think watchdog to distinguish "dead submission,
 //                safe to retry" from "live run, retry would double-spend".
-// Exit: 0 = review printed (probe: tab found); 4 = timeout; 2 = usage error;
+// Exit: 0 = review printed (probe: tab found); 4 = timeout, nothing matched; 2 = usage error;
+//       3 = timeout but a conversation matching the marker IS live with no VERDICT yet (the
+//           model is still generating; the tab is left open so a later --harvest can collect
+//           the finished review without respending the Pro slot);
 //       5 = ChatGPT throttle detected (cooldown written — do NOT resubmit).
 // Requires Node >= 21 (global WebSocket); the box runs Node 24.
 
@@ -198,6 +201,7 @@ function extractReview(text) {
 }
 
 let listFailures = 0;
+let stillGeneratingUrl = null;   // marker-matched conversation seen this invocation, no VERDICT yet
 while (Date.now() < deadline) {
   let tabs = [];
   try {
@@ -213,6 +217,10 @@ while (Date.now() < deadline) {
     await sleep(Math.min(5_000 * listFailures, 30_000));
     continue;
   }
+  // Exit 3 means the matching conversation exists NOW, not merely that we saw it sometime
+  // earlier in this invocation. Clear the latest-scan signal before each successful tab list;
+  // if the tab closes/navigates/disappears, the deadline correctly exits 4 (lost) instead.
+  stillGeneratingUrl = null;
   const deadTabs = [];
   const reads = await Promise.all(tabs.map(async (tab) => ({ tab, text: await tabText(tab) })));
   for (const { tab, text } of reads) {
@@ -223,6 +231,7 @@ while (Date.now() < deadline) {
     if (probe) { console.error(`live conversation tab: ${tab.url}`); process.exit(0); }
     const review = extractReview(text);
     if (review) { await closeTab(tab.id); console.log(review); process.exit(0); }
+    stillGeneratingUrl = tab.url;
     console.error(`conversation found (${tab.url}) but no VERDICT yet; waiting...`);
   }
   // v0.17 fallback: unreadable tabs get their URL re-rendered in a scratch tab
@@ -258,9 +267,33 @@ while (Date.now() < deadline) {
     if (probe) { console.error(`live conversation (via fresh render): ${tab.url}`); process.exit(0); }
     const review = extractReview(text);
     if (review) { await closeTab(tab.id); console.log(review); process.exit(0); }
+    stillGeneratingUrl = tab.url;
     console.error(`conversation matches (via fresh render, ${tab.url}) but no VERDICT yet; waiting...`);
   }
-  await sleep(probe ? 5_000 : POLL_MS);
+  // Honor short caller budgets precisely (important for probes and tests); never sleep 20s
+  // past a 3s deadline.
+  await sleep(Math.min(probe ? 5_000 : POLL_MS, Math.max(0, deadline - Date.now())));
+}
+if (!probe && stillGeneratingUrl) {
+  // Revalidate at the deadline: exit 3 means the marker-matched conversation exists NOW, not
+  // merely that it was observed sometime earlier in the invocation.
+  try {
+    const tabs = (await (await fetch(`http://127.0.0.1:${port}/json`)).json())
+      .filter((t) => t.type === 'page' && /chatgpt\.com\/c\//.test(t.url || ''));
+    const reads = await Promise.all(tabs.map(async (tab) => ({ tab, text: await tabText(tab) })));
+    const live = reads.find(({ text }) => text && text.includes(marker));
+    stillGeneratingUrl = live?.tab?.url ?? null;
+  } catch {
+    // CDP outage is inconclusive: retain the last positive signal, fail-closed against respending.
+  }
+}
+if (!probe && stillGeneratingUrl) {
+  // Budget exhausted while the model is still generating. The Pro slot is SPENT and the answer
+  // may land any minute: exiting 4 here historically made the engine declare failure and CLOSE
+  // the tab, destroying the review (65-minute Pro run lost on 2026-07-09). Distinct code + open
+  // tab lets the caller harvest later instead of respending.
+  console.error(`still-generating: ${stillGeneratingUrl} matches "${marker}" but has no VERDICT after ${timeoutSecs}s: tab left open; harvest later (oracle-review.sh --harvest '${marker}')`);
+  process.exit(3);
 }
 console.error(`timeout: no ${probe ? 'conversation tab' : 'completed review'} matching "${marker}" after ${timeoutSecs}s`);
 process.exit(4);

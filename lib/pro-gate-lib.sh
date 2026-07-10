@@ -181,27 +181,34 @@ pg_mem_headroom_ok() {
   return 0
 }
 
+# pg_cooldown_active: 0 + a one-line reason on stdout while the account back-off cooldown is
+# live (v0.18: written by cdp-salvage on the "requests too quickly / temporarily limited"
+# throttle interstitial, and by oracle-review.sh on a Cloudflare anti-bot challenge).
+# Submitting (or even salvage-rendering) during the cooldown deepens the block. Age-based: the
+# file expires by mtime, no cleanup needed. GNU stat || BSD stat. Checked alone by --harvest
+# (which spends nothing, so box-fitness gates don't apply) and inside pg_health_gate.
+pg_cooldown_active() {
+  local cdf cds mt age
+  cdf="${PRO_GATE_COOLDOWN_FILE:-$PRO_GATE_HOME/throttle.cooldown}"
+  cds="${PRO_GATE_THROTTLE_COOLDOWN:-900}"
+  [ -f "$cdf" ] || return 1
+  mt="$(stat -c %Y "$cdf" 2>/dev/null || stat -f %m "$cdf" 2>/dev/null || echo 0)"
+  age=$(( $(date +%s) - mt ))
+  if [ "$age" -ge 0 ] && [ "$age" -lt "$cds" ]; then
+    echo "ChatGPT account back-off cooldown active ($(( cds - age ))s left; throttle/cloudflare; rm $cdf to override)"; return 0
+  fi
+  return 1
+}
+
 # pg_health_gate: call right before spending a Pro Extended slot (and before each retry).
 # Returns 0 when the box is fit to spend a slot; 1 + a one-line reason on stdout otherwise.
 # Only blocks on signals that actually cause wasted slots (unreachable/just-restarted Chrome,
 # genuine memory starvation, an account-level ChatGPT throttle) — not on transient noise.
 pg_health_gate() {
-  local mode port min_uptime up reason cdf cds mt age
+  local mode port min_uptime up reason
   mode="$(pg_browser_mode)"; port="${ORACLE_BROWSER_PORT:-9222}"
   min_uptime="${PRO_GATE_MIN_UPTIME:-60}"
-  # v0.18: account back-off cooldown, written by cdp-salvage on the "requests too quickly /
-  # temporarily limited" throttle interstitial, and by oracle-review.sh on a Cloudflare anti-bot
-  # challenge. Submitting (or even salvage-rendering) during the cooldown deepens the block, so
-  # defer instead. Age-based: the file expires by mtime, no cleanup needed. GNU stat || BSD stat.
-  cdf="${PRO_GATE_COOLDOWN_FILE:-$PRO_GATE_HOME/throttle.cooldown}"
-  cds="${PRO_GATE_THROTTLE_COOLDOWN:-900}"
-  if [ -f "$cdf" ]; then
-    mt="$(stat -c %Y "$cdf" 2>/dev/null || stat -f %m "$cdf" 2>/dev/null || echo 0)"
-    age=$(( $(date +%s) - mt ))
-    if [ "$age" -ge 0 ] && [ "$age" -lt "$cds" ]; then
-      echo "ChatGPT account back-off cooldown active ($(( cds - age ))s left; throttle/cloudflare; rm $cdf to override)"; return 1
-    fi
-  fi
+  if reason="$(pg_cooldown_active)"; then echo "$reason"; return 1; fi
   if [ "$mode" = remote-chrome ]; then
     pg_cdp_heal || { echo "Chrome CDP unreachable on :${port} (self-heal failed or disabled)"; return 1; }
     up="$(pg_service_uptime)"
@@ -232,6 +239,103 @@ pg_cdp_heal() {
   sudo -n systemctl start oracle-chrome.service >/dev/null 2>&1 || true
   sleep "${PRO_GATE_SELF_HEAL_WAIT:-10}"
   curl -sf "localhost:${port}/json/version" >/dev/null 2>&1
+}
+
+# v0.20: durable reservations for reviews whose wrapper budget ended while ChatGPT is still
+# generating. Process-owned flock slots disappear when exit 9 releases the engine; without a
+# durable reservation, a second run immediately under-counts real live Pro tabs and can double-
+# spend the same PR. One file per marker survives the process:
+#   $PRO_GATE_HOME/in-progress/<marker> = "pr<TAB>out<TAB>created_epoch"
+# Fresh runs reconcile files via a marker probe (live -> keep; missing/throttle/inconclusive ->
+# keep until TTL, fail-closed) and subtract the count from the effective semaphore capacity.
+# Harvest success/lost removes the file. Writes/removes serialize under one flock/mkdir lock.
+pg_reservation_dir() { echo "${PRO_GATE_RESERVATION_DIR:-$PRO_GATE_HOME/in-progress}"; }
+pg_reservation_lock() { echo "${PRO_GATE_RESERVATION_LOCK:-$PRO_GATE_HOME/in-progress.lock}"; }
+
+# Shared guard for reservation writes/removes AND the fresh-run count+slot-acquire decision.
+# This makes the handoff atomic: an exit-9 run writes its durable reservation while it still
+# owns the process slot; no waiter can observe "slot released, reservation not counted" (or
+# compute capacity before the write and acquire the just-released slot on stale information).
+pg_reservation_guard_acquire() {
+  local lock; lock="$(pg_reservation_lock)"
+  if pg_have flock; then
+    { exec {PG_RESERVATION_GUARD_FD}>>"$lock"; } 2>/dev/null \
+      && flock -w 10 "$PG_RESERVATION_GUARD_FD" 2>/dev/null
+    return $?
+  fi
+  PG_RESERVATION_GUARD_DIR="${lock}.d"
+  local waited=0
+  while ! mkdir "$PG_RESERVATION_GUARD_DIR" 2>/dev/null; do
+    waited=$(( waited + 1 )); [ "$waited" -ge 10 ] && return 1; sleep 1
+  done
+}
+pg_reservation_guard_release() {
+  if [ -n "${PG_RESERVATION_GUARD_FD:-}" ]; then
+    eval "exec ${PG_RESERVATION_GUARD_FD}>&-" 2>/dev/null
+    PG_RESERVATION_GUARD_FD=""
+  fi
+  if [ -n "${PG_RESERVATION_GUARD_DIR:-}" ]; then
+    rmdir "$PG_RESERVATION_GUARD_DIR" 2>/dev/null; PG_RESERVATION_GUARD_DIR=""
+  fi
+}
+
+pg_reservation_write() { # marker pr out
+  local marker="$1" pr="${2:-diff}" out="${3:-}" dir rc
+  [ -n "$marker" ] || return 1
+  dir="$(pg_reservation_dir)"; mkdir -p "$dir" 2>/dev/null || return 1
+  pg_reservation_guard_acquire || return 1
+  printf '%s\t%s\t%s\n' "$pr" "$out" "$(date +%s)" > "$dir/$marker.tmp" 2>/dev/null \
+    && mv -f "$dir/$marker.tmp" "$dir/$marker"
+  rc=$?; pg_reservation_guard_release; return "$rc"
+}
+
+pg_reservation_remove() { # marker
+  local marker="$1" dir
+  [ -n "$marker" ] || return 0
+  dir="$(pg_reservation_dir)"; pg_reservation_guard_acquire || return 1
+  rm -f "$dir/$marker" 2>/dev/null
+  pg_reservation_guard_release
+}
+
+pg_reservation_find_pr() { # pr -> marker (oldest, best-effort; files are reconciled first)
+  local pr="$1" dir f found_pr
+  dir="$(pg_reservation_dir)"; [ -d "$dir" ] || return 1
+  for f in "$dir"/*; do
+    [ -f "$f" ] || continue
+    IFS=$'\t' read -r found_pr _ < "$f" 2>/dev/null || continue
+    [ "$found_pr" = "$pr" ] && { basename "$f"; return 0; }
+  done
+  return 1
+}
+
+pg_reservation_count() {
+  local dir f n=0; dir="$(pg_reservation_dir)"; [ -d "$dir" ] || { echo 0; return; }
+  for f in "$dir"/*; do [ -f "$f" ] && n=$((n + 1)); done
+  echo "$n"
+}
+
+# pg_reservation_reconcile <salvage-script> <port>: drop reservations whose tab is positively
+# gone (probe exit 4) or older than TTL; keep live (0), throttled (5), and inconclusive errors
+# fail-closed. TTL is a last-resort leak bound for a dead browser/profile reset.
+pg_reservation_reconcile() {
+  local salvage="$1" port="$2" dir ttl now f marker created age rc
+  dir="$(pg_reservation_dir)"; [ -d "$dir" ] || return 0
+  ttl="${PRO_GATE_RESERVATION_TTL:-21600}"; now="$(date +%s)"
+  for f in "$dir"/*; do
+    [ -f "$f" ] || continue; marker="$(basename "$f")"
+    IFS=$'\t' read -r _ _ created < "$f" 2>/dev/null || created=0
+    case "$created" in ''|*[!0-9]*) created=0;; esac
+    age=$(( now - created ))
+    if [ "$created" -gt 0 ] && [ "$age" -ge "$ttl" ]; then
+      echo "[pro-gate] releasing expired in-progress reservation $marker (${age}s >= ${ttl}s TTL)" >&2
+      pg_reservation_remove "$marker"; continue
+    fi
+    rc=2; node "$salvage" --probe "$marker" 10 "$port" >/dev/null 2>&1; rc=$?
+    if [ "$rc" -eq 4 ]; then
+      echo "[pro-gate] releasing stale in-progress reservation $marker (conversation gone)" >&2
+      pg_reservation_remove "$marker"
+    fi
+  done
 }
 
 # pg_ledger_append <json-line>: flock-guarded append to the run ledger
