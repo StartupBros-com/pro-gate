@@ -101,15 +101,21 @@ pg_lock() {
 # (the winning fd is kept open and auto-released on exit); mkdir-spinlock fallback on macOS scans N
 # slot dirs and self-heals stale ones via the dead-pid check. maxn<=1 is plain mutual exclusion.
 pg_lock_n() {
-  local base="$1" maxn="${2:-1}" wait_s="${3:-2400}" start i fd lockdir opid
+  local base="$1" maxn="${2:-1}" wait_s="${3:-2400}" exclude="${4:-}" start i fd lockdir opid
   [ "${maxn:-1}" -ge 1 ] 2>/dev/null || maxn=1
+  # v0.20.3: report WHICH slot was won (durable reservations must remember their slot so fresh
+  # runs exclude it instead of shrinking the scan range, which overbooked real capacity), and
+  # optionally skip reserved slot numbers ($4, space-separated).
+  PG_SLOT_ACQUIRED=""
   start=$(date +%s)
   if pg_have flock; then
     while :; do
       i=1
       while [ "$i" -le "$maxn" ]; do
+        case " $exclude " in *" $i "*) i=$((i + 1)); continue;; esac
         # Braces scope 2>/dev/null to the exec (same stderr-nuking bug class as pg_lock).
         if { exec {fd}>>"${base}.slot${i}"; } 2>/dev/null && flock -n "$fd"; then
+          PG_SLOT_ACQUIRED="$i"
           return 0   # keep $fd OPEN (do not close) -> slot held until this process exits
         fi
         [ -n "${fd:-}" ] && eval "exec ${fd}>&-" 2>/dev/null
@@ -123,10 +129,12 @@ pg_lock_n() {
   while :; do
     i=1
     while [ "$i" -le "$maxn" ]; do
+      case " $exclude " in *" $i "*) i=$((i + 1)); continue;; esac
       lockdir="${base}.slot${i}.d"
       if mkdir "$lockdir" 2>/dev/null; then
         echo "$$" > "$lockdir/pid" 2>/dev/null || true
         trap 'rm -rf "'"$lockdir"'" 2>/dev/null' EXIT
+        PG_SLOT_ACQUIRED="$i"
         return 0
       fi
       opid=$(cat "$lockdir/pid" 2>/dev/null || true)
@@ -288,34 +296,68 @@ pg_reservation_guard_release() {
   fi
 }
 
-pg_reservation_write() { # marker pr out
-  local marker="$1" pr="${2:-diff}" out="${3:-}" dir rc created
+pg_reservation_write() { # marker [pr] [out] [slot] -- empty pr/slot preserve the existing record's
+  local marker="$1" pr="${2:-}" out="${3:-}" slot="${4:-}" dir rc created prev_pr="" prev_slot=""
   pg_reservation_marker_ok "$marker" || return 1
   dir="$(pg_reservation_dir)"; mkdir -p "$dir" 2>/dev/null || return 1
   pg_reservation_guard_acquire || return 1
-  # Preserve the original creation time and reset reconciliation misses: repeated exit-9
-  # harvests must not extend the TTL forever, while a positive live observation clears misses.
-  IFS=$'\t' read -r _ _ created _ < "$dir/$marker" 2>/dev/null || created=""
+  # Preserve the original creation time (repeated exit-9 harvests must not extend the TTL
+  # forever), the pr key, and the recorded slot (a harvest rewrite has neither of its own);
+  # reset the reconciliation miss streak, since this write IS a positive live observation.
+  created=""
+  [ -f "$dir/$marker" ] && { IFS=$'\t' read -r prev_pr _ created _ prev_slot < "$dir/$marker"; } 2>/dev/null
   case "$created" in ''|*[!0-9]*) created="$(date +%s)";; esac
-  printf '%s\t%s\t%s\t0\n' "$pr" "$out" "$created" > "$dir/$marker.tmp" 2>/dev/null \
+  [ -n "$pr" ] || pr="${prev_pr:-diff}"
+  case "$slot" in ''|*[!0-9]*) slot="$prev_slot";; esac
+  case "$slot" in *[!0-9]*) slot="";; esac
+  printf '%s\t%s\t%s\t0\t%s\n' "$pr" "$out" "$created" "$slot" > "$dir/$marker.tmp" 2>/dev/null \
     && mv -f "$dir/$marker.tmp" "$dir/$marker"
   rc=$?; pg_reservation_guard_release; return "$rc"
 }
 
 pg_reservation_remove() { # marker
   local marker="$1" dir
-  [ -n "$marker" ] || return 0
+  pg_reservation_marker_ok "$marker" || return 0
   dir="$(pg_reservation_dir)"; pg_reservation_guard_acquire || return 1
   rm -f "$dir/$marker" 2>/dev/null
   pg_reservation_guard_release
 }
 
-pg_reservation_find_pr() { # pr -> marker (oldest, best-effort; files are reconciled first)
+# pg_reservation_note_miss <marker>: one confirmed-absent observation. Echoes "released" when
+# the miss limit is reached (reservation removed) or "retained miss/limit" otherwise. Shared by
+# reconciliation and the harvest not-found path so both apply the same fail-closed policy.
+pg_reservation_note_miss() {
+  local marker="$1" dir f pr out created misses slot miss_limit
+  miss_limit="${PRO_GATE_RESERVATION_MISSES:-3}"
+  case "$miss_limit" in ''|*[!0-9]*) miss_limit=3;; esac
+  [ "$miss_limit" -ge 2 ] 2>/dev/null || miss_limit=2
+  pg_reservation_marker_ok "$marker" || { echo released; return 0; }
+  dir="$(pg_reservation_dir)"; f="$dir/$marker"
+  pg_reservation_guard_acquire || { echo "retained 0/$miss_limit"; return 0; }
+  if [ ! -f "$f" ]; then pg_reservation_guard_release; echo released; return 0; fi
+  { IFS=$'\t' read -r pr out created misses slot < "$f"; } 2>/dev/null
+  case "$misses" in ''|*[!0-9]*) misses=0;; esac
+  misses=$(( misses + 1 ))
+  if [ "$misses" -ge "$miss_limit" ]; then
+    rm -f "$f" 2>/dev/null
+    pg_reservation_guard_release
+    echo released
+  else
+    printf '%s\t%s\t%s\t%s\t%s\n' "${pr:-diff}" "${out:-}" "${created:-0}" "$misses" "${slot:-}" > "$f.tmp" 2>/dev/null \
+      && mv -f "$f.tmp" "$f"
+    pg_reservation_guard_release
+    echo "retained $misses/$miss_limit"
+  fi
+}
+
+pg_reservation_find_pr() { # pr-key -> marker (oldest, best-effort; files are reconciled first)
   local pr="$1" dir f found_pr
+  [ -n "$pr" ] || return 1
   dir="$(pg_reservation_dir)"; [ -d "$dir" ] || return 1
   for f in "$dir"/*; do
     [ -f "$f" ] || continue
-    IFS=$'\t' read -r found_pr _ < "$f" 2>/dev/null || continue
+    pg_reservation_marker_ok "$(basename "$f")" || continue
+    { IFS=$'\t' read -r found_pr _ < "$f"; } 2>/dev/null || continue
     [ "$found_pr" = "$pr" ] && { basename "$f"; return 0; }
   done
   return 1
@@ -325,6 +367,32 @@ pg_reservation_count() {
   local dir f n=0; dir="$(pg_reservation_dir)"; [ -d "$dir" ] || { echo 0; return; }
   for f in "$dir"/*; do [ -f "$f" ] && n=$((n + 1)); done
   echo "$n"
+}
+
+# pg_reservation_slot_plan <effective-concurrency>: compute the slot-acquisition plan under the
+# reservation guard. Echoes "R|excluded slots": scan slots 1..R skipping the excluded ones.
+# Slot-tagged reservations exclude their exact slot (the tab still occupies that account
+# capacity); reservations without a slot (legacy) and tagged slots outside the current range
+# shrink the range instead. Processed descending so range shrink cascades correctly.
+pg_reservation_slot_plan() {
+  local eff="${1:-1}" dir f slot slots="" excl="" r legacy=0 s
+  dir="$(pg_reservation_dir)"
+  r="$eff"
+  if [ -d "$dir" ]; then
+    for f in "$dir"/*; do
+      [ -f "$f" ] || continue
+      slot="$(awk -F'\t' 'NR==1{print $5}' "$f" 2>/dev/null)"
+      case "$slot" in
+        ''|*[!0-9]*) legacy=$(( legacy + 1 ));;
+        *) slots="$slots $slot";;
+      esac
+    done
+  fi
+  r=$(( r - legacy ))
+  for s in $(printf '%s\n' $slots | sort -rn); do
+    if [ "$s" -le "$r" ] 2>/dev/null; then excl="$excl $s"; else r=$(( r - 1 )); fi
+  done
+  printf '%s|%s\n' "$r" "${excl# }"
 }
 
 # pg_reservation_reconcile <salvage-script> <port>: drop reservations older than TTL or only
@@ -341,7 +409,7 @@ pg_reservation_reconcile() {
   for f in "$dir"/*; do
     [ -f "$f" ] || continue; marker="$(basename "$f")"
     pg_reservation_marker_ok "$marker" || continue
-    IFS=$'\t' read -r pr out created misses < "$f" 2>/dev/null || created=0
+    { IFS=$'\t' read -r pr out created misses slot < "$f"; } 2>/dev/null || created=0
     case "$created" in ''|*[!0-9]*) created=0;; esac
     case "$misses" in ''|*[!0-9]*) misses=0;; esac
     age=$(( now - created ))
@@ -363,24 +431,13 @@ pg_reservation_reconcile() {
           # The harvest may have removed the file during the probe; rewriting would resurrect a
           # released reservation and block capacity until TTL, so re-check under the guard.
           if [ -f "$f" ]; then
-            printf '%s\t%s\t%s\t0\n' "$pr" "$out" "$created" > "$f.tmp" 2>/dev/null && mv -f "$f.tmp" "$f"
+            printf '%s\t%s\t%s\t0\t%s\n' "$pr" "$out" "$created" "${slot:-}" > "$f.tmp" 2>/dev/null && mv -f "$f.tmp" "$f"
           fi
           pg_reservation_guard_release
         }
         ;;
       4)
-        misses=$(( misses + 1 ))
-        if [ "$misses" -ge "$miss_limit" ]; then
-          echo "[pro-gate] releasing stale in-progress reservation $marker after ${misses} confirmed misses" >&2
-          pg_reservation_remove "$marker"
-        else
-          pg_reservation_guard_acquire || continue
-          if [ -f "$f" ]; then
-            printf '%s\t%s\t%s\t%s\n' "$pr" "$out" "$created" "$misses" > "$f.tmp" 2>/dev/null && mv -f "$f.tmp" "$f"
-            echo "[pro-gate] reservation $marker absent ${misses}/${miss_limit}; retained fail-closed" >&2
-          fi
-          pg_reservation_guard_release
-        fi
+        echo "[pro-gate] reservation $marker probe miss -> $(pg_reservation_note_miss "$marker")" >&2
         ;;
       *) : ;; # throttle/CDP error/inconclusive: retain without incrementing misses
     esac
@@ -401,7 +458,7 @@ pg_ledger_append() {
       return 0
     fi
   fi
-  printf '%s\n' "$line" >> "$ledger" 2>/dev/null || true
+  { printf '%s\n' "$line" >> "$ledger"; } 2>/dev/null || true
 }
 
 # Adaptive concurrency governor: effective review slots EARN their way up to the ceiling
