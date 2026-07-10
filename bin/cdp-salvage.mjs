@@ -54,8 +54,9 @@ import path from 'node:path';
 const argv = process.argv.slice(2);
 const probe = argv[0] === '--probe' && argv.shift();
 const close = argv[0] === '--close' && argv.shift();
+const sweepRoot = argv[0] === '--sweep-root' && argv.shift();
 const [marker, timeoutSecs = probe ? '30' : '600', port = process.env.ORACLE_CDP_PORT ?? '9222'] = argv;
-if (!marker) { console.error('usage: cdp-salvage.mjs [--probe|--close] <pr-marker> [timeout-secs] [cdp-port]'); process.exit(2); }
+if (!marker) { console.error('usage: cdp-salvage.mjs [--probe|--close|--sweep-root] <pr-marker|-> [timeout-secs] [cdp-port]'); process.exit(2); }
 const deadline = Date.now() + Number(timeoutSecs) * 1000;
 const POLL_MS = 20_000;
 
@@ -102,6 +103,28 @@ async function tabText(tab) {
 
 async function closeTab(id) {
   try { await fetch(`http://127.0.0.1:${port}/json/close/${id}`); } catch {}
+}
+
+// --sweep-root: close idle chatgpt.com ROOT tabs (no /c/ path). A run killed before it submits
+// leaves its tab parked at the root, where the marker-based --close can never match it; a week
+// of watchdog/hard-cap kills accumulated 23 such renderers (real memory pressure: the health
+// gate defers reviews below 1GB free). Callers must only invoke this when no oracle CLI is
+// young enough to still be pre-navigation (the engine gates on process age). Never closes
+// conversation (/c/) tabs, and always leaves at least one tab so Chrome itself stays alive.
+if (sweepRoot) {
+  let tabs = [];
+  try {
+    tabs = (await (await fetch(`http://127.0.0.1:${port}/json`)).json()).filter((t) => t.type === 'page');
+  } catch { process.exit(0); }
+  const isRoot = (t) => /^https:\/\/chatgpt\.com\/?(\?.*)?$/.test(t.url || '');
+  const roots = tabs.filter(isRoot);
+  const keepers = tabs.length - roots.length;
+  // Keep one tab alive when root tabs are all Chrome has left.
+  const closable = keepers >= 1 ? roots : roots.slice(1);
+  let closed = 0;
+  for (const tab of closable) { await closeTab(tab.id); closed += 1; }
+  console.error(`cdp-salvage --sweep-root: closed ${closed} idle root tab(s); ${tabs.length - closed} tab(s) remain`);
+  process.exit(0);
 }
 
 // --close: post-review cleanup. Because we run oracle with --browser-archive=never (so the

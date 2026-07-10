@@ -66,6 +66,11 @@ if [ "$MODE" = remote-chrome ]; then
   if curl -sf "localhost:${PORT}/json/version" >/dev/null 2>&1; then
     title=$(curl -s "localhost:${PORT}/json" 2>/dev/null | jq -r '[.[]|select(.type=="page")][0].url // ""' 2>/dev/null)
     P "browser session up on :${PORT} (${title:-chatgpt})"
+    TABS=$(curl -s "localhost:${PORT}/json" 2>/dev/null | jq -r '[.[]|select(.type=="page")]|length' 2>/dev/null)
+    case "$TABS" in ''|*[!0-9]*) : ;; *)
+      if [ "$TABS" -le 10 ]; then P "browser tabs: ${TABS} open"
+      else W "browser tabs: ${TABS} open (leaked root tabs eat memory headroom; the engine sweeps them pre-run, or: node \$PRO_GATE_HOME/cdp-salvage.mjs --sweep-root - 25 ${PORT})"; fi ;;
+    esac
     [ "$SVC" = systemd ] && { systemctl is-active --quiet oracle-chrome.service 2>/dev/null && P "oracle-chrome.service active" || W "oracle-chrome.service not active"; }
   else
     X "browser session not reachable on :${PORT} — start it (sudo systemctl start oracle-chrome) and sign in (login-view.sh)"

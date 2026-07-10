@@ -440,6 +440,20 @@ EFF_CONC="$(pg_ramp_level "$MAX_CONC")"
 # file's inode alive, so deleting an unheld file is always safe).
 find "$(dirname "$LOCKFILE")" -maxdepth 1 -name "$(basename "$LOCKFILE").pr-*" -mmin +1440 -delete 2>/dev/null || true
 find "${PRO_GATE_HARVEST_LOCK_DIR:-$PRO_GATE_HOME/harvest-locks}" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
+# Sweep idle chatgpt.com ROOT tabs (leaked by killed pre-submission runs; the marker-based
+# close can't see them, and each is a renderer eating the review box's memory headroom).
+# Only when NO oracle CLI is <120s old: a younger one may still be pre-navigation on a root
+# tab. Age check engine-side (CDP can't see processes). PRO_GATE_TAB_SWEEP=0 disables.
+if [ "$MODE" = remote-chrome ] && [ "${PRO_GATE_TAB_SWEEP:-1}" = 1 ] && command -v node >/dev/null 2>&1; then
+  YOUNGEST_ORACLE=999999
+  while read -r ORACLE_AGE; do
+    case "$ORACLE_AGE" in ''|*[!0-9]*) continue;; esac
+    [ "$ORACLE_AGE" -lt "$YOUNGEST_ORACLE" ] && YOUNGEST_ORACLE="$ORACLE_AGE"
+  done < <(pgrep -f 'bin/oracle-cli\.js' 2>/dev/null | xargs -r -I{} ps -o etimes= -p {} 2>/dev/null | tr -d ' ')
+  if [ "$YOUNGEST_ORACLE" -ge 120 ]; then
+    timeout 30 node "$SELF/cdp-salvage.mjs" --sweep-root - 25 "$PORT" 2>&1 | sed 's/^/[oracle-review] /' >&2 || true
+  fi
+fi
 
 # Reconcile durable reservations from earlier exit-9 runs before dispatch. A same-PR
 # reservation redirects this invocation to HARVEST instead of spending a second slot. This is
