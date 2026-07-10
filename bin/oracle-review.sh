@@ -50,7 +50,7 @@ pg_have oracle || { echo "ERROR: oracle not installed (pnpm add -g @steipete/ora
 # Callers (the /pro-gate skill, the daemon's headless agent) poll "$OUT.status" — a
 # single-line JSON updated ATOMICALLY at every phase change — instead of scraping the
 # engine's stderr. Phases: preflight, waiting-pr-lock, waiting-slot, launching,
-# watchdog-killed, live-detected, salvaging, retry-wait, throttled, deferred, done, failed.
+# watchdog-killed, live-detected, salvaging, retry-wait, throttled, cloudflare, deferred, done, failed.
 # Terminal phases: done (read $OUT), failed, deferred (no slot spent — retry later).
 STATUS_FILE="$OUT.status"
 pg_status() {  # $1 phase, $2 optional detail — variable fields are JSON-escaped (v0.18.1:
@@ -87,7 +87,13 @@ pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor,
     *) outcome=other ;;
   esac
   [ "${THROTTLED:-0}" = 1 ] && outcome=throttle
-  case "$outcome" in clean|throttle|failed) pg_ramp_update "$outcome" "${MAX_CONC:-1}" ;; esac
+  [ "${CLOUDFLARE:-0}" = 1 ] && outcome=cloudflare
+  # cloudflare is an account-level block just like a throttle: drop concurrency (feed the ramp
+  # the throttle signal) while recording the distinct outcome in the ledger.
+  case "$outcome" in
+    clean|throttle|failed) pg_ramp_update "$outcome" "${MAX_CONC:-1}" ;;
+    cloudflare)            pg_ramp_update throttle "${MAX_CONC:-1}" ;;
+  esac
   if pg_have jq; then
     line="$(jq -nc --arg ts "$(date +%Y-%m-%dT%H:%M:%S%z)" --arg pr "${PR_NUM:-diff}" \
       --arg repo "${REPO:-}" --argjson exit "$rc" --arg outcome "$outcome" \
@@ -406,6 +412,7 @@ MAX_RETRIES="${PRO_GATE_MAX_RETRIES:-1}"
 BACKOFF="${PRO_GATE_RETRY_BACKOFF:-20}"
 LIVE_CONVERSATION=0
 THROTTLED=0
+CLOUDFLARE=0
 attempt=0
 while :; do
   if ! GATE_REASON="$(pg_health_gate)"; then
@@ -442,6 +449,26 @@ while :; do
   fi
   if [ -s "$OUT" ]; then
     echo "[oracle-review] discarding a non-review capture ($(wc -c < "$OUT" 2>/dev/null) bytes, no VERDICT/Pn markers) — will salvage/retry." >&2
+  fi
+
+  # Cloudflare / ChatGPT anti-bot challenge: oracle detects the "Just a moment" interstitial and
+  # logs "Cloudflare anti-bot page detected" / throws stage=cloudflare-challenge. The submission
+  # did NOT land, so a retry only hammers the challenge and deepens the block (the headless,
+  # concurrency-driven trigger that a warm interactive session never hits). Treat it like the
+  # throttle: back off. Write the account cooldown the health gate already honors, drop the ramp
+  # to 1 (concurrency is the real trigger), suppress the retry, and skip salvage (nothing landed).
+  # Match oracle's own Cloudflare emissions ("Cloudflare anti-bot page detected" logger line and
+  # the "Cloudflare challenge detected ..." thrown-error message / cloudflare-challenge stage).
+  # Guarded by `! pg_is_review`, so a successful review that merely discusses Cloudflare (its text
+  # also lands in the log) can never be misread as a block.
+  if ! pg_is_review "$OUT" \
+     && grep -qiE 'Cloudflare (anti-bot page|challenge) detected|cloudflare-challenge' "$RUNLOG" 2>/dev/null; then
+    echo "[oracle-review] ChatGPT/Cloudflare anti-bot challenge detected; backing off (account cooldown + concurrency drop), NOT retrying (a resubmit only deepens the block)." >&2
+    CLOUDFLARE=1
+    pg_status cloudflare "anti-bot challenge; cooldown started"
+    cdf="${PRO_GATE_COOLDOWN_FILE:-$PRO_GATE_HOME/throttle.cooldown}"
+    { printf '%s cloudflare-challenge (pr %s)\n' "$(date +%Y-%m-%dT%H:%M:%S%z)" "${PR_NUM:-diff}" > "$cdf"; } 2>/dev/null || true
+    break
   fi
 
   # v0.14: a live conversation means the quota is already spent. Reattach is
@@ -521,7 +548,9 @@ done
 # another tab. Before declaring failure, read the review straight off the
 # conversation tab's DOM, matched by PR marker so concurrent review slots
 # cannot cross-contaminate. First seen: pushbot PR #863, 2026-07-02.
-if ! pg_is_review "$OUT" && command -v node >/dev/null 2>&1; then
+# Skip salvage entirely on a Cloudflare challenge: the submission never landed (nothing to
+# collect), and rendering conversation pages against a challenged account only deepens the block.
+if ! pg_is_review "$OUT" && [ "${CLOUDFLARE:-0}" != 1 ] && command -v node >/dev/null 2>&1; then
   # Live conversation (v0.14 probe hit): the review may still be thinking, so
   # wait with the full hard-cap budget; otherwise a short window suffices.
   SALVAGE_SECS="$STALL_SECS"; [ "$LIVE_CONVERSATION" = 1 ] && SALVAGE_SECS="$HARD_SECS"
