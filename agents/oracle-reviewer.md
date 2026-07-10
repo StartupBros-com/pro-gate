@@ -74,8 +74,10 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
      (`jq -r .marker`, or the no-jq fallback
      `sed -nE 's/.*"marker":"([^"]+)".*/\1/p'`), then run:
      `~/.pro-review-daemon/oracle-review.sh --harvest "$MARKER" --out "$OUT" --timeout 20m`
-     (exit 0 = relay `$OUT`; exit 9 again = still generating, wait and repeat if your budget
-     allows, else return the unavailable envelope quoting the harvest command for the caller).
+     (exit 0 = relay `$OUT`; exit 9 again = reservation retained (still generating, or a
+     below-threshold miss), wait and repeat if your budget allows, else return the unavailable
+     envelope quoting the harvest command; exit 3 = browser/CDP trouble with the reservation
+     kept, safe to retry; exit 6 = confirmed gone after repeated misses).
    - `11`: oversized diff (engine >=v0.20), **no quota spent**: the payload exceeds
      `PRO_GATE_MAX_DIFF_LINES` (default 6000) and will not converge. Unavailable envelope;
      tell the caller to scope the gate (`--diff <delta.patch>` of the un-gated commits):

@@ -180,8 +180,10 @@ if [ -n "$HARVEST_MARKER" ]; then
     pg_status failed "harvest unsupported in native browser mode"
     pg_finish 3
   fi
-  # ledger/status pr field from the marker's "pg-run-<pr>-<epoch>-<pid>" shape (best-effort)
-  PR_NUM="$(printf '%s' "$HARVEST_MARKER" | sed -nE 's/^pg-run-([A-Za-z0-9]+)-[0-9]+.*$/\1/p')"
+  # ledger/status pr field from the marker's "pg-run-<key>-<epoch>-<pid>" shape (best-effort;
+  # the key may itself contain dashes, so strip the two trailing numeric segments instead)
+  PR_NUM="${HARVEST_MARKER#pg-run-}"
+  PR_NUM="${PR_NUM%-*-*}"
   command -v node >/dev/null 2>&1 || { echo "ERROR: --harvest needs node for CDP salvage" >&2; pg_status failed "node missing"; pg_finish 3; }
   # Serialize the entire marker harvest. Without this, two collectors can share $OUT.cdp,
   # both read the same completed tab, and one closes it underneath the other (exit 6 + false
@@ -206,9 +208,10 @@ if [ -n "$HARVEST_MARKER" ]; then
   echo "[oracle-review] harvesting in-progress review (marker ${RUN_MARKER}, up to ${HARVEST_SECS}s, no new slot spent)..." >&2
   pg_status salvaging "harvest up to ${HARVEST_SECS}s"
   HARVEST_RC=0
-  node "$SELF/cdp-salvage.mjs" "$RUN_MARKER" "$HARVEST_SECS" "$PORT" > "$OUT.cdp" || HARVEST_RC=$?
-  if [ "$HARVEST_RC" -eq 0 ] && pg_is_review "$OUT.cdp"; then
-    mv "$OUT.cdp" "$OUT"
+  HARVEST_TMP="$OUT.cdp.$$"
+  node "$SELF/cdp-salvage.mjs" "$RUN_MARKER" "$HARVEST_SECS" "$PORT" > "$HARVEST_TMP" || HARVEST_RC=$?
+  if [ "$HARVEST_RC" -eq 0 ] && pg_is_review "$HARVEST_TMP"; then
+    mv "$HARVEST_TMP" "$OUT"
     pg_reservation_remove "$RUN_MARKER" || true
     SALVAGED=1
     echo "[oracle-review] harvest recovered the completed review ($(wc -c < "$OUT" 2>/dev/null) bytes)." >&2
@@ -217,9 +220,9 @@ if [ -n "$HARVEST_MARKER" ]; then
     echo "RESULT_FILE=$OUT"
     pg_finish 0
   fi
-  rm -f "$OUT.cdp"
+  rm -f "$HARVEST_TMP"
   case "$HARVEST_RC" in
-    3) pg_reservation_write "$RUN_MARKER" "${PR_NUM:-diff}" "$OUT" || true
+    3) pg_reservation_write "$RUN_MARKER" "" "$OUT" || true
        echo "[oracle-review] still generating: tab left open; run --harvest again later." >&2
        pg_status in-progress "still generating; retry --harvest later"
        pg_finish 9 ;;
@@ -227,10 +230,24 @@ if [ -n "$HARVEST_MARKER" ]; then
        THROTTLED=1
        pg_status deferred "throttle during harvest; retry after cooldown"
        pg_finish 8 ;;
-    *) pg_reservation_remove "$RUN_MARKER" || true
-       echo "ERROR: no conversation matches marker ${RUN_MARKER} (tab closed/archived or review lost)." >&2
-       pg_status failed "harvest found no matching conversation"
-       pg_finish 6 ;;
+    4) # Confirmed absent THIS probe, which is not yet proof of loss (suspended renderer,
+       # hydration): apply the shared consecutive-miss policy instead of destroying the
+       # reservation on one observation (dogfood review P1).
+       MISS_VERDICT="$(pg_reservation_note_miss "$RUN_MARKER")"
+       if [ "$MISS_VERDICT" = released ]; then
+         echo "ERROR: no conversation matches marker ${RUN_MARKER} after repeated confirmed misses (review lost or already collected)." >&2
+         pg_status failed "harvest found no matching conversation (miss limit reached)"
+         pg_finish 6
+       fi
+       echo "[oracle-review] conversation not found this pass (${MISS_VERDICT}); reservation kept fail-closed. Retry --harvest later." >&2
+       pg_status in-progress "harvest miss (${MISS_VERDICT}); retry --harvest later"
+       pg_finish 9 ;;
+    *) # Runtime trouble (node crash, CDP outage, usage error) or a capture that failed
+       # validation: NOT evidence the conversation is gone. Keep the reservation and the tab;
+       # exit 3 = engine/browser trouble, safe to retry.
+       echo "ERROR: harvest failed (salvage rc=${HARVEST_RC}); reservation and tab kept. Retry --harvest once the browser/CDP is healthy." >&2
+       pg_status failed "harvest runtime error rc=${HARVEST_RC}; reservation kept"
+       pg_finish 3 ;;
   esac
 fi
 
@@ -254,6 +271,22 @@ fi
 [ -n "$REPO" ] || REPO="$(pwd)"
 cd "$REPO" || { echo "ERROR: repo dir not found: $REPO" >&2; pg_status failed "repo dir not found"; exit 4; }
 [ -n "$PR_URL" ] || PR_URL="$(gh pr view "$PR_NUM" --json url -q .url 2>/dev/null || echo "")"
+
+# PR_KEY: repo-scoped identity for locks, reservations, and markers. PR numbers repeat across
+# repositories; keying on the bare number let an in-progress repo-A#77 redirect a repo-B#77 gate
+# to repo A's conversation (dogfood review P1, 2026-07-10). Derived from the PR URL when known,
+# else from the git remote, else the checkout name; sanitized to the marker-safe charset.
+PR_KEY=""
+if [ -n "$PR_NUM" ]; then
+  REPO_SLUG=""
+  if [ -n "$PR_URL" ]; then
+    REPO_SLUG="$(printf '%s' "$PR_URL" | sed -nE 's#https?://[^/]+/([^/]+)/([^/]+)/pull/.*#\1-\2#p')"
+  fi
+  [ -n "$REPO_SLUG" ] || REPO_SLUG="$(git -C "$REPO" remote get-url origin 2>/dev/null \
+    | sed -nE 's#.*[:/]([^/]+)/([^/]+?)(\.git)?$#\1-\2#p')"
+  [ -n "$REPO_SLUG" ] || REPO_SLUG="$(basename "$REPO")"
+  PR_KEY="$(printf '%s-%s' "$REPO_SLUG" "$PR_NUM" | tr -c 'A-Za-z0-9.\n-' '-')"
+fi
 
 if [ -z "$DIFF_FILE" ]; then
   DIFF_FILE="$WORK/pr.diff"
@@ -308,7 +341,7 @@ fi
 # same PR (which would suppress the retry and serve a stale review for a
 # new head). The marker lands in the user message, hence in the tab's
 # innerText, without asking the model to echo anything.
-RUN_MARKER="pg-run-${PR_NUM:-diff}-$(date +%s)-$$"
+RUN_MARKER="pg-run-${PR_KEY:-diff}-$(date +%s)-$$"
 PROMPT_FILE="$WORK/prompt.md"
 {
   # Lead with the @GitHub connector tag + an explicit directive (belt-and-suspenders: oracle
@@ -412,9 +445,13 @@ find "$(dirname "$LOCKFILE")" -maxdepth 1 -name "$(basename "$LOCKFILE").pr-*" -
 # are created there.
 if [ "$MODE" = remote-chrome ]; then
   pg_reservation_reconcile "$SELF/cdp-salvage.mjs" "$PORT"
-  if [ -n "${PR_NUM}" ]; then
-    RESERVED_MARKER="$(pg_reservation_find_pr "$PR_NUM" 2>/dev/null || true)"
+  if [ -n "${PR_KEY}" ]; then
+    RESERVED_MARKER="$(pg_reservation_find_pr "$PR_KEY" 2>/dev/null || true)"
     if [ -n "$RESERVED_MARKER" ]; then
+      # Publish the RESERVED conversation's marker, not this invocation's fresh one: callers
+      # harvest whatever the status JSON names (dogfood review P1: the fresh marker names a
+      # conversation that does not exist).
+      RUN_MARKER="$RESERVED_MARKER"
       echo "[oracle-review] pr #${PR_NUM} already has an in-progress Pro conversation (${RESERVED_MARKER}): harvesting it instead of submitting again." >&2
       pg_status in-progress "existing reservation ${RESERVED_MARKER}; harvest required"
       echo "  ${PRO_GATE_HOME:-\$HOME/.pro-review-daemon}/oracle-review.sh --harvest '${RESERVED_MARKER}' --out '${OUT}' --timeout 20m" >&2
@@ -423,11 +460,12 @@ if [ "$MODE" = remote-chrome ]; then
   fi
 fi
 
-# Per-PR guard (acquire BEFORE a slot, so same-PR callers serialize without holding a scarce slot).
-if [ -n "${PR_NUM}" ]; then
-  echo "[oracle-review] per-PR guard for pr #${PR_NUM} (serializes same-PR reviews)..." >&2
+# Per-PR guard (acquire BEFORE a slot, so same-PR callers serialize without holding a scarce
+# slot). Keyed by repo-scoped PR_KEY: bare numbers collide across repositories.
+if [ -n "${PR_KEY}" ]; then
+  echo "[oracle-review] per-PR guard for pr #${PR_NUM} (${PR_KEY}; serializes same-PR reviews)..." >&2
   pg_status waiting-pr-lock
-  if ! pg_lock "${LOCKFILE}.pr-${PR_NUM}" "$LOCK_WAIT"; then
+  if ! pg_lock "${LOCKFILE}.pr-${PR_KEY}" "$LOCK_WAIT"; then
     echo "ERROR: timed out after ${LOCK_WAIT}s — pr #${PR_NUM} is already under review elsewhere." >&2
     pg_status failed "per-PR lock timeout"
     pg_finish 7
@@ -435,8 +473,9 @@ if [ -n "${PR_NUM}" ]; then
   # The previous same-PR process may have exited 9 while we waited and written a reservation
   # just before releasing this flock. Re-check now that we own the per-PR lock; otherwise this
   # waiter would immediately submit a duplicate review.
-  RESERVED_MARKER="$(pg_reservation_find_pr "$PR_NUM" 2>/dev/null || true)"
+  RESERVED_MARKER="$(pg_reservation_find_pr "$PR_KEY" 2>/dev/null || true)"
   if [ -n "$RESERVED_MARKER" ]; then
+    RUN_MARKER="$RESERVED_MARKER"
     echo "[oracle-review] pr #${PR_NUM} became in-progress while waiting (${RESERVED_MARKER}): harvest required, not resubmitting." >&2
     pg_status in-progress "existing reservation ${RESERVED_MARKER}; harvest required"
     pg_finish 9
@@ -450,20 +489,24 @@ pg_status waiting-slot "effective ${EFF_CONC} / ceiling ${MAX_CONC}"
 # to 1 mid-wait. Short pg_lock_n slices keep the wait responsive to governor changes.
 SLOT_DEADLINE=$(( $(date +%s) + LOCK_WAIT ))
 SLOT_OK=0
+SLOT_HELD=""
 while :; do
   EFF_CONC="$(pg_ramp_level "$MAX_CONC")"
-  # Durable reservations count as occupied Pro capacity even though their wrapper process has
-  # exited. Reduce process-owned semaphore capacity accordingly; if reservations consume the
-  # full effective level, wait without calling pg_lock_n (which clamps maxn<=0 back to 1).
+  # Durable reservations occupy real account capacity even though their wrapper process has
+  # exited. Slot-tagged reservations EXCLUDE their exact slot from acquisition (shrinking the
+  # scan range instead overbooked capacity when a lower-numbered slot freed: dogfood review
+  # P1); legacy/out-of-range reservations shrink the range.
   if ! pg_reservation_guard_acquire; then sleep 3; continue; fi
-  RESERVED_COUNT="$(pg_reservation_count)"
-  AVAILABLE_CONC=$(( EFF_CONC - RESERVED_COUNT ))
+  SLOT_PLAN="$(pg_reservation_slot_plan "$EFF_CONC")"
+  SCAN_MAX="${SLOT_PLAN%%|*}"
+  SCAN_EXCLUDE="${SLOT_PLAN#*|}"
   # Nonblocking while holding the short handoff guard: waiting here would prevent an active
-  # run from writing its reservation before releasing its process slot (writer waits 10s; the
-  # old slot scan waited 15s). One immediate scan gives an atomic count+acquire decision; the
-  # outer loop releases the guard and retries.
-  if [ "$AVAILABLE_CONC" -gt 0 ] && pg_lock_n "$LOCKFILE" "$AVAILABLE_CONC" 0; then
+  # run from writing its reservation before releasing its process slot (writer waits 10s).
+  # One immediate scan gives an atomic plan+acquire decision; the outer loop releases the
+  # guard and retries.
+  if [ "${SCAN_MAX:-0}" -gt 0 ] 2>/dev/null && pg_lock_n "$LOCKFILE" "$SCAN_MAX" 0 "$SCAN_EXCLUDE"; then
     # Keep the acquired process slot, release only the short reservation handoff guard.
+    SLOT_HELD="$PG_SLOT_ACQUIRED"
     pg_reservation_guard_release; SLOT_OK=1; break
   fi
   pg_reservation_guard_release
@@ -726,13 +769,14 @@ if ! pg_is_review "$OUT" && [ "${CLOUDFLARE:-0}" != 1 ] && command -v node >/dev
   echo "[oracle-review] last-resort CDP tab salvage (marker ${RUN_MARKER}, up to ${SALVAGE_SECS}s)..." >&2
   pg_status salvaging "cdp up to ${SALVAGE_SECS}s"
   SALVAGE_RC=0
-  node "$SELF/cdp-salvage.mjs" "$RUN_MARKER" "$SALVAGE_SECS" "$PORT" > "$OUT.cdp" 2>>"$RUNLOG" || SALVAGE_RC=$?
-  if [ "$SALVAGE_RC" -eq 0 ] && pg_is_review "$OUT.cdp"; then
-    mv "$OUT.cdp" "$OUT"
+  SALVAGE_TMP="$OUT.cdp.$$"
+  node "$SELF/cdp-salvage.mjs" "$RUN_MARKER" "$SALVAGE_SECS" "$PORT" > "$SALVAGE_TMP" 2>>"$RUNLOG" || SALVAGE_RC=$?
+  if [ "$SALVAGE_RC" -eq 0 ] && pg_is_review "$SALVAGE_TMP"; then
+    mv "$SALVAGE_TMP" "$OUT"
     echo "[oracle-review] CDP salvage recovered a completed review." >&2
     SALVAGED=1
   else
-    rm -f "$OUT.cdp"
+    rm -f "$SALVAGE_TMP"
   fi
 fi
 
@@ -747,7 +791,7 @@ elif [ "${SALVAGE_RC:-0}" -eq 3 ]; then
   # releases its flock slot, leave the tab open (pg_finish skips close for exit 9), and hand the
   # caller a no-respend collection path. Fresh runs reconcile/respect the reservation, so actual
   # account concurrency and same-PR serialization remain correct after this wrapper exits.
-  if ! pg_reservation_write "$RUN_MARKER" "${PR_NUM:-diff}" "$OUT"; then
+  if ! pg_reservation_write "$RUN_MARKER" "${PR_KEY:-diff}" "$OUT" "${SLOT_HELD:-}"; then
     # Fail closed: without the durable reservation, exit 9 would under-count a live Pro tab and
     # let the next invocation double-spend. Keep the process/locks alive rather than release
     # unreserved capacity; this should only happen on a broken/unwritable PRO_GATE_HOME.

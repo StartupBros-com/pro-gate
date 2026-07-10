@@ -51,11 +51,27 @@ check 'status carries the marker' "$(grep -qF "\"marker\":\"$MARKER\"" "$TDIR/o-
 check 'in-progress writes durable reservation' "$([ -f "$TDIR/home/in-progress/$MARKER" ]; echo $?)" "reservation missing"
 
 # A fresh same-PR invocation must NOT launch a second oracle request while the reserved tab is
-# active. It redirects to harvest (exit 9) before acquiring/spending a slot.
+# active. It redirects to harvest (exit 9) before acquiring/spending a slot. The reservation is
+# keyed by repo-scoped PR_KEY (repo slug + number), so seed it exactly as a fresh run computes
+# it for this checkout (no git remote here, so the slug falls back to the repo basename).
 printf 'diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -0,0 +1 @@\n+small\n' > "$TDIR/small.diff"
+PR_KEY_77="$(printf '%s-77' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
+printf '%s\t%s\t%s\t0\t\n' "$PR_KEY_77" "$TDIR/o-h1.md" "$(date +%s)" > "$TDIR/home/in-progress/$MARKER"
 run_engine --pr 77 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$TDIR/o-redirect.md" --timeout 5m
 check 'same-PR reservation blocks fresh spend' "$([ "$RC" -eq 9 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
 check 'same-PR redirect exposes original marker' "$(grep -qF "$MARKER" "$TDIR/stderr"; echo $?)" "$(cat "$TDIR/stderr")"
+check 'redirect status publishes RESERVED marker' "$(grep -qF "\"marker\":\"$MARKER\"" "$TDIR/o-redirect.md.status"; echo $?)" "$(cat "$TDIR/o-redirect.md.status" 2>/dev/null)"
+
+# Cross-repo isolation: the same PR NUMBER in a different checkout must not be redirected to
+# this repository's reserved conversation (dogfood review P1: bare numbers collide).
+mkdir -p "$TDIR/other-repo"
+printf 'diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -0,0 +1 @@\n+small\n' > "$TDIR/other-repo/small.diff"
+PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_LOCK_WAIT=4 PRO_GATE_ORACLE_BIN=/nonexistent-oracle NODE_OPTIONS= \
+  bash "$ENGINE" --pr 77 --repo "$TDIR/other-repo" --diff "$TDIR/other-repo/small.diff" \
+  --out "$TDIR/o-crossrepo.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'different repo same number is NOT redirected' "$([ "$RC" -ne 9 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
 
 # A single confirmed-absent reconciliation probe must retain the reservation. Three consecutive
 # misses release it. A positive live probe resets the streak to zero.
@@ -109,6 +125,63 @@ run_engine --harvest "$MARKER" --out "$TDIR/o-h4.md" --timeout 5s
 check 'harvest cooldown exits 8' "$([ "$RC" -eq 8 ]; echo $?)" "rc=$RC"
 check 'harvest cooldown phase deferred' "$([ "$(phase_of "$TDIR/o-h4.md.status")" = deferred ]; echo $?)" "$(cat "$TDIR/o-h4.md.status" 2>/dev/null)"
 rm -f "$TDIR/home/throttle.cooldown"
+
+echo '# slot plan: reservations exclude their slot instead of shrinking the range'
+mkdir -p "$TDIR/home2/in-progress"
+plan(){ PRO_GATE_HOME="$TDIR/home2" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_slot_plan $1"; }
+printf 'k1\to1\t100\t0\t1\n' > "$TDIR/home2/in-progress/pg-run-a-1-1"
+check 'tagged slot 1 at eff 2 excludes slot 1' "$([ "$(plan 2)" = '2|1' ]; echo $?)" "plan=$(plan 2)"
+printf 'k2\to2\t100\t0\t\n' > "$TDIR/home2/in-progress/pg-run-b-2-2"
+check 'legacy reservation shrinks the range' "$([ "$(plan 2)" = '1|1' ]; echo $?)" "plan=$(plan 2)"
+rm -f "$TDIR/home2/in-progress/pg-run-a-1-1"
+printf 'k3\to3\t100\t0\t5\n' > "$TDIR/home2/in-progress/pg-run-c-3-3"
+check 'out-of-range tagged slot shrinks the range' "$([ "$(plan 2)" = '0|' ]; echo $?)" "plan=$(plan 2)"
+rm -rf "$TDIR/home2"
+
+echo '# slot exclusion prevents overbooking through a freed lower slot'
+mkdir -p "$TDIR/home3/in-progress" "$TDIR/bin"
+cat > "$TDIR/bin/oracle-ok" <<'FAKE_OK'
+#!/usr/bin/env bash
+out=""
+while [ $# -gt 0 ]; do case "$1" in --write-output) out="$2"; shift 2;; *) shift;; esac; done
+printf '[P1] a.sh:1 - finding\n  Why: test\nP2: none\nP3: none\nVERDICT: SHIP - fixture.\n' > "$out"
+FAKE_OK
+chmod +x "$TDIR/bin/oracle-ok"
+printf 'kA\toA\t%s\t0\t1\n' "$(date +%s)" > "$TDIR/home3/in-progress/pg-run-slotted-1700000003-44"
+exec {S2FD}>>"$TDIR/home3/oracle.lock.slot2"; flock -n "$S2FD"
+printf 'still thinking foreign\n' > "$TDIR/tab.txt"
+PRO_GATE_HOME="$TDIR/home3" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_MAX_CONCURRENCY=2 PRO_GATE_RAMP=0 PRO_GATE_LOCK_WAIT=4 PRO_GATE_RECONCILE_INTERVAL=3600 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-ok" NODE_OPTIONS= \
+  bash "$ENGINE" --diff "$TDIR/small.diff" --repo "$TDIR" --out "$TDIR/o-slots.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'reserved slot 1 not reacquired while slot 2 held' "$([ "$RC" -eq 7 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
+eval "exec ${S2FD}>&-"
+PRO_GATE_HOME="$TDIR/home3" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_MAX_CONCURRENCY=2 PRO_GATE_RAMP=0 PRO_GATE_LOCK_WAIT=10 PRO_GATE_RECONCILE_INTERVAL=3600 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-ok" NODE_OPTIONS= \
+  bash "$ENGINE" --diff "$TDIR/small.diff" --repo "$TDIR" --out "$TDIR/o-slots2.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'non-reserved slot still acquirable' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+check 'slotted reservation untouched by foreign run' "$([ -f "$TDIR/home3/in-progress/pg-run-slotted-1700000003-44" ]; echo $?)" 'reservation lost'
+rm -rf "$TDIR/home3"
+
+echo '# harvest miss policy: absent passes retain, limit releases'
+MARKER3="pg-run-miss-1700000002-33"
+printf 'kM\t%s\t%s\t0\t\n' "$TDIR/o-miss.md" "$(date +%s)" > "$TDIR/home/in-progress/$MARKER3"
+printf 'foreign only\n' > "$TDIR/tab.txt"
+PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RESERVATION_MISSES=2 bash "$ENGINE" --harvest "$MARKER3" --out "$TDIR/o-miss.md" --timeout 4s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'first harvest miss retains reservation (exit 9)' "$([ "$RC" -eq 9 ] && [ -f "$TDIR/home/in-progress/$MARKER3" ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
+PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RESERVATION_MISSES=2 bash "$ENGINE" --harvest "$MARKER3" --out "$TDIR/o-miss.md" --timeout 4s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'miss limit releases reservation (exit 6)' "$([ "$RC" -eq 6 ] && [ ! -f "$TDIR/home/in-progress/$MARKER3" ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
 
 echo '# primary run: hard cap -> live probe -> final salvage -> exit 9'
 # Fake oracle emits the submission evidence, updates the mock tab to carry the engine-generated
