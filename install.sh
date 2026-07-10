@@ -16,6 +16,16 @@ case "$OS" in macos) INSTALL_DAEMON="${INSTALL_DAEMON:-0}";; *) INSTALL_DAEMON="
 
 say(){ printf '\033[36m▸ %s\033[0m\n' "$*"; }
 render(){ sed -e "s#@HOME@#${HOME}#g" -e "s#@USER@#$(id -un)#g" "$1"; }
+# put <src> <dst>: ATOMIC deploy of one runtime file. cp truncates the destination inode in
+# place, which corrupts any bash engine mid-read of that script (bash reads scripts
+# incrementally); deploys therefore used to require a fully quiet account. Writing a temp file
+# and rename(2)-ing it in gives running readers their old inode untouched while new invocations
+# see the new file, so installs are safe during live reviews.
+put(){
+  local src="$1" dst="$2" tmp
+  tmp="$dst.deploy.$$"
+  cp "$src" "$tmp" && chmod 0755 "$tmp" && mv -f "$tmp" "$dst"
+}
 
 say "platform: $OS  (browser mode: $MODE, service: $SVC, daemon: $INSTALL_DAEMON)"
 
@@ -29,19 +39,20 @@ for dep in gh git jq flock; do pg_have "$dep" || echo "  ⚠ missing dependency:
 # 1. skill + agent
 say "deploying skill + agent → $CLAUDE_DIR"
 mkdir -p "$CLAUDE_DIR/skills/pro-gate" "$CLAUDE_DIR/agents"
-cp "$REPO/skills/pro-gate/SKILL.md" "$CLAUDE_DIR/skills/pro-gate/SKILL.md"
-cp "$REPO/agents/oracle-reviewer.md" "$CLAUDE_DIR/agents/oracle-reviewer.md"
+put "$REPO/skills/pro-gate/SKILL.md" "$CLAUDE_DIR/skills/pro-gate/SKILL.md"
+put "$REPO/agents/oracle-reviewer.md" "$CLAUDE_DIR/agents/oracle-reviewer.md"
 
 # 2. lib + engine + daemon + oracle config
 say "deploying engine + daemon + lib → $DAEMON_DIR"
 mkdir -p "$DAEMON_DIR/logs" "$ORACLE_DIR"
-cp "$REPO/lib/pro-gate-lib.sh"   "$DAEMON_DIR/lib.sh"
-cp "$REPO/bin/oracle-review.sh"  "$DAEMON_DIR/oracle-review.sh"
-cp "$REPO/bin/pro-gate-doctor.sh" "$DAEMON_DIR/pro-gate-doctor.sh"
-cp "$REPO/bin/pro-gate-stats.sh"  "$DAEMON_DIR/pro-gate-stats.sh"
-cp "$REPO/bin/cdp-salvage.mjs"   "$DAEMON_DIR/cdp-salvage.mjs"
-cp "$REPO"/daemon/{daemon.sh,run-daemon.sh,run-oracle-chrome.sh,login-view.sh} "$DAEMON_DIR/"
-chmod +x "$DAEMON_DIR"/*.sh "$DAEMON_DIR/cdp-salvage.mjs"
+put "$REPO/lib/pro-gate-lib.sh"   "$DAEMON_DIR/lib.sh"
+put "$REPO/bin/oracle-review.sh"  "$DAEMON_DIR/oracle-review.sh"
+put "$REPO/bin/pro-gate-doctor.sh" "$DAEMON_DIR/pro-gate-doctor.sh"
+put "$REPO/bin/pro-gate-stats.sh"  "$DAEMON_DIR/pro-gate-stats.sh"
+put "$REPO/bin/cdp-salvage.mjs"   "$DAEMON_DIR/cdp-salvage.mjs"
+for f in daemon.sh run-daemon.sh run-oracle-chrome.sh login-view.sh; do
+  put "$REPO/daemon/$f" "$DAEMON_DIR/$f"
+done
 [ -f "$DAEMON_DIR/.env" ] || { cp "$REPO/.env.example" "$DAEMON_DIR/.env"; say "wrote $DAEMON_DIR/.env — set PRO_REVIEW_OWNERS"; }
 
 # 3. browser session + service (per platform)
