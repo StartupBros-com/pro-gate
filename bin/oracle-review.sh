@@ -435,8 +435,11 @@ MAX_CONC="${PRO_GATE_MAX_CONCURRENCY:-1}"
 EFF_CONC="$(pg_ramp_level "$MAX_CONC")"
 
 # Housekeeping: per-PR lock files are 0-byte and used to accumulate forever. Sweep ones
-# untouched for >24h — any legitimate holder finishes within the ~35 min hard cap.
+# untouched for >24h — any legitimate holder finishes within the ~35 min hard cap. Same for
+# per-marker harvest locks (v0.20.2 dogfood left one stale for 10h; flock holders keep the
+# file's inode alive, so deleting an unheld file is always safe).
 find "$(dirname "$LOCKFILE")" -maxdepth 1 -name "$(basename "$LOCKFILE").pr-*" -mmin +1440 -delete 2>/dev/null || true
+find "${PRO_GATE_HARVEST_LOCK_DIR:-$PRO_GATE_HOME/harvest-locks}" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
 
 # Reconcile durable reservations from earlier exit-9 runs before dispatch. A same-PR
 # reservation redirects this invocation to HARVEST instead of spending a second slot. This is
