@@ -245,12 +245,21 @@ pg_cdp_heal() {
 # generating. Process-owned flock slots disappear when exit 9 releases the engine; without a
 # durable reservation, a second run immediately under-counts real live Pro tabs and can double-
 # spend the same PR. One file per marker survives the process:
-#   $PRO_GATE_HOME/in-progress/<marker> = "pr<TAB>out<TAB>created_epoch"
-# Fresh runs reconcile files via a marker probe (live -> keep; missing/throttle/inconclusive ->
-# keep until TTL, fail-closed) and subtract the count from the effective semaphore capacity.
+#   $PRO_GATE_HOME/in-progress/<marker> = "pr<TAB>out<TAB>created_epoch<TAB>miss_streak"
+# Fresh runs reconcile files via marker probes and subtract the count from effective semaphore
+# capacity. Live resets the miss streak; throttle/inconclusive stays fail-closed; only several
+# consecutive confirmed absences release the reservation before TTL.
 # Harvest success/lost removes the file. Writes/removes serialize under one flock/mkdir lock.
 pg_reservation_dir() { echo "${PRO_GATE_RESERVATION_DIR:-$PRO_GATE_HOME/in-progress}"; }
 pg_reservation_lock() { echo "${PRO_GATE_RESERVATION_LOCK:-$PRO_GATE_HOME/in-progress.lock}"; }
+# Markers become filenames under PRO_GATE_HOME and lock paths; every character must be from the
+# safe class (in particular no "/" anywhere), not just the first one after the prefix.
+pg_reservation_marker_ok() {
+  case "${1:-}" in
+    pg-run-?*) case "$1" in *[!A-Za-z0-9.-]*) return 1;; *) return 0;; esac;;
+    *) return 1;;
+  esac
+}
 
 # Shared guard for reservation writes/removes AND the fresh-run count+slot-acquire decision.
 # This makes the handoff atomic: an exit-9 run writes its durable reservation while it still
@@ -280,11 +289,15 @@ pg_reservation_guard_release() {
 }
 
 pg_reservation_write() { # marker pr out
-  local marker="$1" pr="${2:-diff}" out="${3:-}" dir rc
-  [ -n "$marker" ] || return 1
+  local marker="$1" pr="${2:-diff}" out="${3:-}" dir rc created
+  pg_reservation_marker_ok "$marker" || return 1
   dir="$(pg_reservation_dir)"; mkdir -p "$dir" 2>/dev/null || return 1
   pg_reservation_guard_acquire || return 1
-  printf '%s\t%s\t%s\n' "$pr" "$out" "$(date +%s)" > "$dir/$marker.tmp" 2>/dev/null \
+  # Preserve the original creation time and reset reconciliation misses: repeated exit-9
+  # harvests must not extend the TTL forever, while a positive live observation clears misses.
+  IFS=$'\t' read -r _ _ created _ < "$dir/$marker" 2>/dev/null || created=""
+  case "$created" in ''|*[!0-9]*) created="$(date +%s)";; esac
+  printf '%s\t%s\t%s\t0\n' "$pr" "$out" "$created" > "$dir/$marker.tmp" 2>/dev/null \
     && mv -f "$dir/$marker.tmp" "$dir/$marker"
   rc=$?; pg_reservation_guard_release; return "$rc"
 }
@@ -314,27 +327,63 @@ pg_reservation_count() {
   echo "$n"
 }
 
-# pg_reservation_reconcile <salvage-script> <port>: drop reservations whose tab is positively
-# gone (probe exit 4) or older than TTL; keep live (0), throttled (5), and inconclusive errors
-# fail-closed. TTL is a last-resort leak bound for a dead browser/profile reset.
+# pg_reservation_reconcile <salvage-script> <port>: drop reservations older than TTL or only
+# after N consecutive confirmed-absent probes. A single 10s miss is NOT proof of loss: suspended
+# renderers, hydration delays, and temporary marker-read failures caused false releases in review.
+# Live (0) resets misses; throttle (5) and other errors keep state fail-closed.
 pg_reservation_reconcile() {
-  local salvage="$1" port="$2" dir ttl now f marker created age rc
+  local salvage="$1" port="$2" dir ttl miss_limit interval now f marker pr out created misses age mt rc
   dir="$(pg_reservation_dir)"; [ -d "$dir" ] || return 0
-  ttl="${PRO_GATE_RESERVATION_TTL:-21600}"; now="$(date +%s)"
+  ttl="${PRO_GATE_RESERVATION_TTL:-21600}"; miss_limit="${PRO_GATE_RESERVATION_MISSES:-3}"
+  interval="${PRO_GATE_RECONCILE_INTERVAL:-60}"; now="$(date +%s)"
+  case "$miss_limit" in ''|*[!0-9]*) miss_limit=3;; esac
+  [ "$miss_limit" -ge 2 ] 2>/dev/null || miss_limit=2
   for f in "$dir"/*; do
     [ -f "$f" ] || continue; marker="$(basename "$f")"
-    IFS=$'\t' read -r _ _ created < "$f" 2>/dev/null || created=0
+    pg_reservation_marker_ok "$marker" || continue
+    IFS=$'\t' read -r pr out created misses < "$f" 2>/dev/null || created=0
     case "$created" in ''|*[!0-9]*) created=0;; esac
+    case "$misses" in ''|*[!0-9]*) misses=0;; esac
     age=$(( now - created ))
     if [ "$created" -gt 0 ] && [ "$age" -ge "$ttl" ]; then
       echo "[pro-gate] releasing expired in-progress reservation $marker (${age}s >= ${ttl}s TTL)" >&2
       pg_reservation_remove "$marker"; continue
     fi
+    # Rate-limit probes per marker by file mtime: N concurrent fresh runs must not turn one
+    # real absence window into N miss increments, and back-to-back reconciles should not spam
+    # conversation probes. Writes/updates touch mtime, so consecutive misses are spaced by at
+    # least this interval of wall time.
+    mt="$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)"
+    [ "$(( now - mt ))" -lt "$interval" ] 2>/dev/null && continue
     rc=2; node "$salvage" --probe "$marker" 10 "$port" >/dev/null 2>&1; rc=$?
-    if [ "$rc" -eq 4 ]; then
-      echo "[pro-gate] releasing stale in-progress reservation $marker (conversation gone)" >&2
-      pg_reservation_remove "$marker"
-    fi
+    case "$rc" in
+      0)
+        [ "$misses" -eq 0 ] || {
+          pg_reservation_guard_acquire || continue
+          # The harvest may have removed the file during the probe; rewriting would resurrect a
+          # released reservation and block capacity until TTL, so re-check under the guard.
+          if [ -f "$f" ]; then
+            printf '%s\t%s\t%s\t0\n' "$pr" "$out" "$created" > "$f.tmp" 2>/dev/null && mv -f "$f.tmp" "$f"
+          fi
+          pg_reservation_guard_release
+        }
+        ;;
+      4)
+        misses=$(( misses + 1 ))
+        if [ "$misses" -ge "$miss_limit" ]; then
+          echo "[pro-gate] releasing stale in-progress reservation $marker after ${misses} confirmed misses" >&2
+          pg_reservation_remove "$marker"
+        else
+          pg_reservation_guard_acquire || continue
+          if [ -f "$f" ]; then
+            printf '%s\t%s\t%s\t%s\n' "$pr" "$out" "$created" "$misses" > "$f.tmp" 2>/dev/null && mv -f "$f.tmp" "$f"
+            echo "[pro-gate] reservation $marker absent ${misses}/${miss_limit}; retained fail-closed" >&2
+          fi
+          pg_reservation_guard_release
+        fi
+        ;;
+      *) : ;; # throttle/CDP error/inconclusive: retain without incrementing misses
+    esac
   done
 }
 
