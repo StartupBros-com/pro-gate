@@ -28,18 +28,20 @@ function wsTextFrame(payload) {
 
 // One mock CDP browser: /json lists a single conversation tab whose DOM text is `tabText`;
 // the tab's debugger WebSocket answers every message with that text. /json/close records.
-function mockCdp(initialText) {
+// extraTabs (id/url objects) are appended verbatim for tab-hygiene tests.
+function mockCdp(initialText, extraTabs = []) {
   let tabText = initialText;
   const closed = [];
   const server = createServer((req, res) => {
     if (req.url === '/json') {
       const port = server.address().port;
       res.setHeader('content-type', 'application/json');
-      if (tabText === '__NO_TABS__') { res.end('[]'); return; }
+      const extras = extraTabs.filter((t) => !closed.includes(t.id));
+      if (tabText === '__NO_TABS__') { res.end(JSON.stringify(extras)); return; }
       res.end(JSON.stringify([{
         id: 'tab1', type: 'page', url: 'https://chatgpt.com/c/mock-conversation',
         webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/tab1`,
-      }]));
+      }, ...extras]));
       return;
     }
     if (req.url?.startsWith('/json/close/')) { closed.push(req.url.split('/').pop()); res.end('ok'); return; }
@@ -139,6 +141,31 @@ const MARKER = 'pg-run-test-1234567890-42';
   const status = await new Promise((resolve) => child.on('close', resolve));
   fs.rmSync(home, { recursive: true, force: true });
   check('latest scan clears stale still-generating signal', status === 4, `status=${status} stderr=${stderr.slice(0, 200)}`);
+  cdp.stop();
+}
+
+{ // --sweep-root closes idle root tabs, keeps /c/ tabs, never empties Chrome
+  const roots = [
+    { id: 'root1', type: 'page', url: 'https://chatgpt.com/' },
+    { id: 'root2', type: 'page', url: 'https://chatgpt.com/?model=gpt-5-5-pro' },
+    { id: 'blank1', type: 'page', url: 'about:blank' },
+  ];
+  const cdp = await mockCdp(`run marker: ${MARKER}\nstill thinking`, roots);
+  const r = await runSalvage(['--sweep-root', '-', '10'], cdp.port);
+  check('sweep-root exits 0', r.status === 0, `status=${r.status} stderr=${r.stderr?.slice(0, 200)}`);
+  check('sweep-root closes only root tabs', cdp.closed.includes('root1') && cdp.closed.includes('root2'), `closed=${cdp.closed}`);
+  check('sweep-root keeps conversation and blank tabs', !cdp.closed.includes('tab1') && !cdp.closed.includes('blank1'), `closed=${cdp.closed}`);
+  cdp.stop();
+}
+
+{ // --sweep-root leaves one tab alive when roots are all Chrome has
+  const roots = [
+    { id: 'rootA', type: 'page', url: 'https://chatgpt.com/' },
+    { id: 'rootB', type: 'page', url: 'https://chatgpt.com/' },
+  ];
+  const cdp = await mockCdp('__NO_TABS__', roots);
+  const r = await runSalvage(['--sweep-root', '-', '10'], cdp.port);
+  check('sweep-root keeps a survivor tab', r.status === 0 && cdp.closed.length === 1, `status=${r.status} closed=${cdp.closed}`);
   cdp.stop();
 }
 
