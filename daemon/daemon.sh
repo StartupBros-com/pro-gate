@@ -16,6 +16,15 @@ type pg_os >/dev/null 2>&1 || { echo "ERROR: pro-gate lib not found (lib.sh)" >&
 pg_augment_path; pg_load_env
 OS="$(pg_os)"; MODE="$(pg_browser_mode)"
 
+# --- self-reload signal: `install.sh` writes a single atomic deploy stamp
+# ($PRO_GATE_HOME/.deploy-stamp) as the LAST step of a deploy, after every runtime file is in
+# place. The daemon records the stamp at startup and re-execs itself when it changes (see
+# maybe_self_reload). Recording it at process start is what makes the reload fire at most once per
+# deploy. Disable the whole behavior with PRO_GATE_DAEMON_SELF_RELOAD=0.
+DAEMON_SELF_RELOAD="${PRO_GATE_DAEMON_SELF_RELOAD:-1}"
+DAEMON_STAMP_FILE="${PRO_GATE_HOME}/.deploy-stamp"
+DAEMON_START_STAMP="$(cat "$DAEMON_STAMP_FILE" 2>/dev/null || true)"
+
 ROOT="$PRO_GATE_HOME"
 STATE="$ROOT/processed.tsv"          # repo<TAB>pr<TAB>sha  (idempotency)
 FAILS="$ROOT/failcount.tsv"          # repo<TAB>pr<TAB>sha  (one line per failed attempt)
@@ -38,9 +47,26 @@ AUTOCLONE="${PRO_REVIEW_AUTOCLONE:-1}"                  # clone a missing repo u
 
 log(){ printf '%s %s\n' "$(date '+%F %T')" "$*"; }
 
+# maybe_self_reload: call ONLY at an idle point (no review child running). If `install.sh` has
+# landed a new deploy since startup, re-exec the daemon in place to pick it up. The stamp flips
+# once per deploy and only after all runtime files are consistent (install.sh writes it last, via
+# atomic rename), so there is no mid-deploy mixed-file window and no reload-loop (the re-exec'd
+# process re-reads the now-current stamp as its baseline). `exec` preserves the PID and cgroup, so
+# systemd sees no restart and KillMode=control-group never fires -> an in-flight review is never
+# killed. Prefers run-daemon.sh (the systemd ExecStart, which re-augments PATH); daemon.sh
+# re-sources lib.sh + env on its own, so either entrypoint fully reloads the code.
+maybe_self_reload(){
+  [ "$DAEMON_SELF_RELOAD" = 1 ] || return 0
+  local cur; cur="$(cat "$DAEMON_STAMP_FILE" 2>/dev/null || true)"
+  [ "$cur" = "$DAEMON_START_STAMP" ] && return 0
+  log "detected a new daemon deploy (stamp changed); reloading in place via exec (idle: no review running)"
+  if [ -f "$SELF/run-daemon.sh" ]; then exec "$SELF/run-daemon.sh"; else exec "$SELF/daemon.sh"; fi
+}
+
 if [ -z "$OWNERS" ]; then
   log "FATAL: PRO_REVIEW_OWNERS is not set in $ROOT/.env (e.g. PRO_REVIEW_OWNERS=my-org). Idling."
-  while true; do sleep 600; pg_load_env; OWNERS="${PRO_REVIEW_OWNERS:-}"; [ -n "$OWNERS" ] && break; done
+  # Still pick up a redeploy while parked here (this branch is idle -- no reviews run without OWNERS).
+  while true; do maybe_self_reload; sleep 600; pg_load_env; OWNERS="${PRO_REVIEW_OWNERS:-}"; [ -n "$OWNERS" ] && break; done
   log "PRO_REVIEW_OWNERS now set to '$OWNERS' — continuing."
 fi
 
@@ -171,6 +197,10 @@ CRITICAL: do NOT merge the PR, do NOT open new PRs, do NOT change the base branc
 # --- main loop --------------------------------------------------------------
 log "pro-review-daemon starting (os=$OS mode=$MODE owners='$OWNERS' poll=${POLL}s model=$CLAUDE_MODEL all_prs=$ALL_PRS autoclone=$AUTOCLONE $( [ "$ALL_PRS" = 1 ] && echo "skip-label='$SKIP_LABEL'" || echo "label='$LABEL'" ))"
 while true; do
+  # Idle point: the review loop is fully synchronous, so no review child is running here. Adopt a
+  # new deploy in place if one landed since startup (no systemctl restart -> the control-group kill
+  # never fires -> an in-flight review is never interrupted).
+  maybe_self_reload
   if [ -f "$PAUSE" ]; then log "PAUSE present — idling"; sleep "$POLL"; continue; fi
   if ! session_up; then log "browser session down — idling"; sleep "$POLL"; continue; fi
   if doghouse_tripped; then log "codex doghouse tripped — idling"; sleep "$POLL"; continue; fi
