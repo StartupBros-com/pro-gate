@@ -88,7 +88,7 @@ cat <<EOF
 ✓ pro-gate installed ($OS).
   1) set PRO_REVIEW_OWNERS in $DAEMON_DIR/.env
   2) sign in to ChatGPT Pro:
-       macOS:     open Chrome → chatgpt.com (ensure GPT-5.5 Pro + the GitHub connector are on)
+       macOS:     open Chrome → chatgpt.com (ensure your Pro model + the GitHub connector are on)
        WSL/Linux: $DAEMON_DIR/login-view.sh  → open http://localhost:6080/vnc.html
   3) verify:  $DAEMON_DIR/pro-gate-doctor.sh
   Use:  /pro-gate <pr>            (interactive)

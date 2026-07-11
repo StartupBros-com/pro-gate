@@ -1,13 +1,14 @@
 ---
 name: pro-gate
-description: Run a final-tier GPT-5.5 Pro Extended review of a pull request (the deepest, last gate after other review tiers), then route the findings to the best available fixer. Use when the user says "pro-gate", "pro review", "final review with Pro Extended", "oracle review this PR", or wants the heavyweight ChatGPT Pro Extended pass before merge. Drives a logged-in ChatGPT Pro browser session via oracle (oracle-review.sh).
+description: Run a final-tier ChatGPT Pro review of a pull request (the deepest, last gate after other review tiers), then route the findings to the best available fixer. Use when the user says "pro-gate", "pro review", "final review with the Pro model", "oracle review this PR", or wants the heavyweight ChatGPT Pro pass before merge. Drives a logged-in ChatGPT Pro browser session via oracle (oracle-review.sh).
 ---
 
-# pro-gate — GPT-5.5 Pro Extended final review gate
+# pro-gate: final-tier ChatGPT Pro review gate
 
 The last and deepest review tier. After your earlier tiers (e.g. `/ce-code-review`, a cloud review)
-and their fixes have run, this gate sends the change to **GPT-5.5 Pro Extended** (web-UI-only,
-separate usage pool from the Codex fixer) for what they missed, then applies the fixes.
+and their fixes have run, this gate sends the change to **the ChatGPT Pro reasoning model**
+(web-UI-only, separate usage pool from the Codex fixer) for what they missed, then applies the fixes.
+The exact model follows whatever Pro model the account has selected; the run reports the one it used.
 
 Engine: `oracle-review.sh` (in `$PRO_GATE_HOME`, default `~/.pro-review-daemon`) — the single source
 of truth for the oracle call; cross-platform (macOS drives your signed-in Chrome natively; WSL/Linux
@@ -63,7 +64,7 @@ home is `/home/will/.pro-review-daemon`.
   `auto-fix` and leave the PR for the human.
 - **Input:** `pro_gate_input` (`both` default | `bundle` | `connector`).
 
-## 2. Guardrails (before spending a ~10-30 min Pro Extended slot)
+## 2. Guardrails (before spending a ~10-30 min Pro review slot)
 
 - **Session up (WSL/Linux):** `curl -sf localhost:9222/json/version` — if down, start it
   (`sudo systemctl start oracle-chrome`) and sign in via `login-view.sh` if the profile reset.
@@ -113,7 +114,7 @@ the model was still generating when the salvage budget ran out; the conversation
 open: NEVER relaunch, harvest instead (below) · `11` oversized diff, NO quota spent: scope
 the payload (below) instead of re-running.
 
-**Exit 9 (`in-progress`): harvest, don't respend.** GPT-5.5 Pro can reason for 45-90+ minutes
+**Exit 9 (`in-progress`): harvest, don't respend.** The Pro model can reason for 45-90+ minutes
 on a heavy payload (observed 65 min on 2026-07-09): longer than the engine can hold a review
 slot. The engine frees the slot, leaves the run's conversation tab open, and puts the marker in
 the status JSON. Wait ~10 min, then collect with:
@@ -146,14 +147,17 @@ git -C <repo> diff <last-gated-sha>..<head> > delta.patch
 
 ## 4. Synthesize
 
-Parse the findings into P0/P1/P2/P3. Treat Pro Extended as high-trust but not infallible: for any
+Parse the findings into P0/P1/P2/P3. Treat the Pro review as high-trust but not infallible: for any
 P0/P1, sanity-check it against the actual code before acting (it occasionally misreads context).
 Drop or down-rank anything clearly wrong; keep the rest. Present a short table (severity · file:line ·
 issue · your confidence) plus the verdict.
 
 ## 5. Act (per mode)
 
-- **review-only:** post the findings as a PR comment (`gh pr comment <num> --body-file`) and stop.
+- **review-only:** post the findings as a PR comment (`gh pr comment <num> --body-file`), headed
+  with the run's resolved model (the status file's `model` field, `jq -r .model <out>.status`;
+  role-based text when unreadable, never a hardcoded version) and the `model_warn` note when it is
+  non-empty, then stop.
 - **auto-fix:** route confirmed P0/P1 (and clear P2s) to the **best available fixer**, in order:
   (1) if the Compound Engineering plugin is installed → `/ce-work` (native tiering since CE 3.17.1
   routes to codex when appropriate; skip if the codex doghouse `~/.codex/.doghouse` is tripped);
@@ -171,4 +175,7 @@ If fixes were applied and `pro_gate_max_rounds > 1`, run one more pass on the up
 the P0/P1 issues are resolved. Reuse the same ChatGPT conversation via `oracle ... --followup <slug>`
 when possible to keep context (and cost) down.
 
-Always leave an audit trail: the full Pro Extended review + the fix summary as a PR comment.
+Always leave an audit trail: the full Pro review + the fix summary as a PR comment. Head the
+comment with the model the run resolved (the status file's `model` field, `jq -r .model <out>.status`;
+role-based text when unreadable, never a hardcoded version), and include the status `model_warn`
+downgrade note when it is non-empty.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# pro-review-daemon — set-and-forget GPT-5.5 Pro Extended final-gate reviewer.
+# pro-review-daemon: set-and-forget final-tier Pro review gate (the account's selected Pro model).
 # Watches for open PRs labeled `pro-review`, and for each new head SHA spawns a headless
 # Claude Code run of `/pro-gate` (auto-fix, STOP before merge). Fixes-only: never merges.
 #
@@ -142,7 +142,7 @@ process_pr(){
   ( cd "$wt" && git switch -C "$branch" "origin/$branch" >>"$lg" 2>&1 || git checkout -B "$branch" >>"$lg" 2>&1 )
 
   # Headless Claude runs the /pro-gate skill (which picks the best available fixer). Ironclad: never merge.
-  local prompt="Run the /pro-gate skill for PR #${num} (${url}) in this repository in auto-fix mode: get the GPT-5.5 Pro Extended review, sanity-check each P0/P1 finding against the actual code, apply the confirmed fixes on this branch, run available tests/lint, commit as 'fix(pro-gate): <summary>', push to origin/${branch}, and post ONE PR comment containing the full Pro Extended review plus what you fixed.
+  local prompt="Run the /pro-gate skill for PR #${num} (${url}) in this repository in auto-fix mode: get the final-tier Pro review, sanity-check each P0/P1 finding against the actual code, apply the confirmed fixes on this branch, run available tests/lint, commit as 'fix(pro-gate): <summary>', push to origin/${branch}, and post ONE PR comment containing the full Pro review plus what you fixed. In the PR comment name the model from the run's status 'model' field (jq -r .model on the engine's <out>.status; role-based text when unreadable), never a hardcoded version, and if the status 'model_warn' field is non-empty include it as an advisory model-downgrade note.
 SYNCHRONOUS EXECUTION (critical): you are running headless: you will NOT receive any asynchronous background-task notification. After you launch the oracle review, you MUST poll its status file in a loop yourself: the engine writes single-line JSON to '<out>.status' at every phase change (poll it, e.g. repeatedly: sleep 60; cat the status file). Phase 'done' means read the --out file; 'failed'/'deferred'/'oversized' are terminal: report them, do NOT relaunch. Phase 'in-progress' means the model is STILL generating after the engine's budget: do NOT relaunch; wait 10 minutes, read the marker field from the status JSON, then run the deployed engine again as: \"\${PRO_GATE_HOME:-\$HOME/.pro-review-daemon}/oracle-review.sh\" --harvest '<marker>' --out '<out>' --timeout 20m (repeat while it exits 9; it spends no new quota). The oracle takes 10-30 minutes; that is expected. Do NOT end your turn, and do NOT say 'I will be notified', while the oracle is still running. Your turn is only complete once the PR comment has actually been posted.
 CRITICAL: do NOT merge the PR, do NOT open new PRs, do NOT change the base branch. Stop after pushing fixes and posting the comment. If no fixes are warranted, just post the review summary comment and stop."
 

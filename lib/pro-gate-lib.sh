@@ -147,7 +147,7 @@ pg_lock_n() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Reliability (v0.1.1): don't burn a precious Pro Extended slot into a broken box,
+# Reliability (v0.1.1): don't burn a precious Pro review slot into a broken box,
 # salvage a review whose connection dropped, and gate before retrying.
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -208,7 +208,7 @@ pg_cooldown_active() {
   return 1
 }
 
-# pg_health_gate: call right before spending a Pro Extended slot (and before each retry).
+# pg_health_gate: call right before spending a Pro review slot (and before each retry).
 # Returns 0 when the box is fit to spend a slot; 1 + a one-line reason on stdout otherwise.
 # Only blocks on signals that actually cause wasted slots (unreachable/just-restarted Chrome,
 # genuine memory starvation, an account-level ChatGPT throttle) — not on transient noise.
@@ -296,23 +296,82 @@ pg_reservation_guard_release() {
   fi
 }
 
-pg_reservation_write() { # marker [pr] [out] [slot] -- empty pr/slot preserve the existing record's
-  local marker="$1" pr="${2:-}" out="${3:-}" slot="${4:-}" dir rc created prev_pr="" prev_slot=""
+pg_reservation_write() { # marker [pr] [out] [slot] [model] -- empty pr/slot/model preserve the record's
+  local marker="$1" pr="${2:-}" out="${3:-}" slot="${4:-}" model="${5:-}" dir rc created prev_pr="" prev_slot="" prev_model=""
   pg_reservation_marker_ok "$marker" || return 1
   dir="$(pg_reservation_dir)"; mkdir -p "$dir" 2>/dev/null || return 1
   pg_reservation_guard_acquire || return 1
   # Preserve the original creation time (repeated exit-9 harvests must not extend the TTL
-  # forever), the pr key, and the recorded slot (a harvest rewrite has neither of its own);
-  # reset the reconciliation miss streak, since this write IS a positive live observation.
+  # forever), the pr key, the recorded slot, and the captured model (a harvest rewrite has none
+  # of its own); reset the reconciliation miss streak, since this write IS a positive live
+  # observation. The trailing `model` field (v0.21) records the model oracle resolved for the run
+  # so the later --harvest process can name it without re-deriving; legacy 5-field records read it
+  # back as empty.
   created=""
-  [ -f "$dir/$marker" ] && { IFS=$'\t' read -r prev_pr _ created _ prev_slot < "$dir/$marker"; } 2>/dev/null
+  [ -f "$dir/$marker" ] && { IFS=$'\t' read -r prev_pr _ created _ prev_slot prev_model < "$dir/$marker"; } 2>/dev/null
   case "$created" in ''|*[!0-9]*) created="$(date +%s)";; esac
   [ -n "$pr" ] || pr="${prev_pr:-diff}"
   case "$slot" in ''|*[!0-9]*) slot="$prev_slot";; esac
   case "$slot" in *[!0-9]*) slot="";; esac
-  printf '%s\t%s\t%s\t0\t%s\n' "$pr" "$out" "$created" "$slot" > "$dir/$marker.tmp" 2>/dev/null \
+  [ -n "$model" ] || model="$prev_model"
+  model="$(printf '%s' "$model" | tr -d '\t\n')"   # keep the record single-line + 6-field
+  printf '%s\t%s\t%s\t0\t%s\t%s\n' "$pr" "$out" "$created" "$slot" "$model" > "$dir/$marker.tmp" 2>/dev/null \
     && mv -f "$dir/$marker.tmp" "$dir/$marker"
   rc=$?; pg_reservation_guard_release; return "$rc"
+}
+
+# pg_reservation_read_model <marker>: echo the model field (6th) recorded for an in-progress
+# reservation, or nothing (legacy 5-field records, or none recorded). The --harvest path reads
+# the model straight back from here rather than re-deriving it (KTD3: harvest has no $RUNLOG).
+pg_reservation_read_model() {
+  local marker="$1" dir f
+  pg_reservation_marker_ok "$marker" || return 1
+  dir="$(pg_reservation_dir)"; f="$dir/$marker"
+  [ -f "$f" ] || return 1
+  # awk -F'\t' (NOT `read`): tab is an IFS-whitespace char, so `IFS=$'\t' read` collapses
+  # consecutive tabs and an empty middle field (empty slot + present model) would shift the model
+  # out of reach. awk keeps empty fields, and prints "" for a legacy 5-field record.
+  awk -F'\t' 'NR==1{print $6}' "$f" 2>/dev/null
+}
+
+# pg_model_label <captured-model>: render the model for any human/machine surface. Echoes the
+# captured model when it is present and not oracle's "(unavailable)" sentinel; otherwise a
+# role-based, version-free fallback so no surface ever hardcodes a model version (R5). Override
+# the fallback wording with PRO_GATE_MODEL_ROLE_LABEL.
+pg_model_label() {
+  local m="${1:-}"
+  case "$m" in
+    ''|'(unavailable)') printf '%s\n' "${PRO_GATE_MODEL_ROLE_LABEL:-the frontier OpenAI Pro reasoning model (web-UI-only, via the oracle bridge)}" ;;
+    *) printf '%s\n' "$m" ;;
+  esac
+}
+
+# pg_derive_model_warn <resolved-model> <selection-status>: compute the advisory downgrade
+# warning (R6), or echo nothing. Advisory only; the caller logs it and stores it in the status
+# file, and it never changes the exit code.
+#   - a captured model matching the weak-model denylist (cheap markers) -> weak-model warning
+#   - a captured non-weak model -> no warning
+#   - NO captured model but oracle reported status=already-selected -> BENIGN, no warning: under
+#     the default `current` strategy oracle 0.15.2 reports resolved=(unavailable) whenever the
+#     account's model was already selected (the steady state), so this is a healthy run whose
+#     exact label just was not re-read; warning here would cry wolf on nearly every default run
+#     (found by dogfooding PR #20). pg_model_label still renders role-based text.
+#   - NO captured model and NO benign status (the run was killed before oracle emitted the
+#     evidence line, e.g. an exit-9/harvest, or a genuine read failure) -> cannot-confirm warning.
+# The denylist (not a Pro-tier allowlist) is deliberate: an allowlist would false-warn on a
+# legitimate future top model whose name lacks "Pro" (e.g. a hypothetical "Sol Ultra").
+pg_derive_model_warn() {
+  local m="${1:-}" st="${2:-}" weak
+  weak="${PRO_GATE_MODEL_WEAK_PATTERN:-mini|nano|instant}"
+  if [ -n "$m" ]; then
+    printf '%s' "$m" | grep -qiE "$weak" 2>/dev/null \
+      && printf "resolved model '%s' matches the weak-model denylist; not the top Pro tier\n" "$m"
+    return 0
+  fi
+  case "$st" in
+    already-selected) : ;;  # benign steady state under `current`: no warning
+    *) printf '%s\n' "could not confirm the resolved model (the run ended before oracle reported it, or none was captured); showing role-based text" ;;
+  esac
 }
 
 pg_reservation_remove() { # marker
@@ -327,7 +386,7 @@ pg_reservation_remove() { # marker
 # the miss limit is reached (reservation removed) or "retained miss/limit" otherwise. Shared by
 # reconciliation and the harvest not-found path so both apply the same fail-closed policy.
 pg_reservation_note_miss() {
-  local marker="$1" dir f pr out created misses slot miss_limit
+  local marker="$1" dir f pr out created misses slot model miss_limit
   miss_limit="${PRO_GATE_RESERVATION_MISSES:-3}"
   case "$miss_limit" in ''|*[!0-9]*) miss_limit=3;; esac
   [ "$miss_limit" -ge 2 ] 2>/dev/null || miss_limit=2
@@ -335,7 +394,7 @@ pg_reservation_note_miss() {
   dir="$(pg_reservation_dir)"; f="$dir/$marker"
   pg_reservation_guard_acquire || { echo "retained 0/$miss_limit"; return 0; }
   if [ ! -f "$f" ]; then pg_reservation_guard_release; echo released; return 0; fi
-  { IFS=$'\t' read -r pr out created misses slot < "$f"; } 2>/dev/null
+  { IFS=$'\t' read -r pr out created misses slot model < "$f"; } 2>/dev/null
   case "$misses" in ''|*[!0-9]*) misses=0;; esac
   misses=$(( misses + 1 ))
   if [ "$misses" -ge "$miss_limit" ]; then
@@ -343,7 +402,7 @@ pg_reservation_note_miss() {
     pg_reservation_guard_release
     echo released
   else
-    printf '%s\t%s\t%s\t%s\t%s\n' "${pr:-diff}" "${out:-}" "${created:-0}" "$misses" "${slot:-}" > "$f.tmp" 2>/dev/null \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "${pr:-diff}" "${out:-}" "${created:-0}" "$misses" "${slot:-}" "${model:-}" > "$f.tmp" 2>/dev/null \
       && mv -f "$f.tmp" "$f"
     pg_reservation_guard_release
     echo "retained $misses/$miss_limit"
@@ -400,7 +459,7 @@ pg_reservation_slot_plan() {
 # renderers, hydration delays, and temporary marker-read failures caused false releases in review.
 # Live (0) resets misses; throttle (5) and other errors keep state fail-closed.
 pg_reservation_reconcile() {
-  local salvage="$1" port="$2" dir ttl miss_limit interval now f marker pr out created misses age mt rc
+  local salvage="$1" port="$2" dir ttl miss_limit interval now f marker pr out created misses slot model age mt rc
   dir="$(pg_reservation_dir)"; [ -d "$dir" ] || return 0
   ttl="${PRO_GATE_RESERVATION_TTL:-21600}"; miss_limit="${PRO_GATE_RESERVATION_MISSES:-3}"
   interval="${PRO_GATE_RECONCILE_INTERVAL:-60}"; now="$(date +%s)"
@@ -409,7 +468,7 @@ pg_reservation_reconcile() {
   for f in "$dir"/*; do
     [ -f "$f" ] || continue; marker="$(basename "$f")"
     pg_reservation_marker_ok "$marker" || continue
-    { IFS=$'\t' read -r pr out created misses slot < "$f"; } 2>/dev/null || created=0
+    { IFS=$'\t' read -r pr out created misses slot model < "$f"; } 2>/dev/null || created=0
     case "$created" in ''|*[!0-9]*) created=0;; esac
     case "$misses" in ''|*[!0-9]*) misses=0;; esac
     age=$(( now - created ))
@@ -431,7 +490,7 @@ pg_reservation_reconcile() {
           # The harvest may have removed the file during the probe; rewriting would resurrect a
           # released reservation and block capacity until TTL, so re-check under the guard.
           if [ -f "$f" ]; then
-            printf '%s\t%s\t%s\t0\t%s\n' "$pr" "$out" "$created" "${slot:-}" > "$f.tmp" 2>/dev/null && mv -f "$f.tmp" "$f"
+            printf '%s\t%s\t%s\t0\t%s\t%s\n' "$pr" "$out" "$created" "${slot:-}" "${model:-}" > "$f.tmp" 2>/dev/null && mv -f "$f.tmp" "$f"
           fi
           pg_reservation_guard_release
         }
@@ -535,7 +594,7 @@ pg_ramp_update() {  # $1 = clean|throttle|failed, $2 = ceiling
 }
 
 # pg_filter_diff <in> <out>: strip diff sections for noise paths (lockfiles, generated,
-# vendored, minified, snapshots) so Pro Extended spends its thinking budget on real code and
+# vendored, minified, snapshots) so the Pro model spends its thinking budget on real code and
 # its review window stays short. Writes the filtered unified diff to <out>; prints each
 # excluded path to STDERR (the caller surfaces them — no silent truncation). Override the
 # match with PRO_GATE_DIFF_EXCLUDE.
