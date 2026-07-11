@@ -324,12 +324,14 @@ pg_reservation_write() { # marker [pr] [out] [slot] [model] -- empty pr/slot/mod
 # reservation, or nothing (legacy 5-field records, or none recorded). The --harvest path reads
 # the model straight back from here rather than re-deriving it (KTD3: harvest has no $RUNLOG).
 pg_reservation_read_model() {
-  local marker="$1" dir f model
+  local marker="$1" dir f
   pg_reservation_marker_ok "$marker" || return 1
   dir="$(pg_reservation_dir)"; f="$dir/$marker"
   [ -f "$f" ] || return 1
-  { IFS=$'\t' read -r _ _ _ _ _ model < "$f"; } 2>/dev/null || return 1
-  printf '%s\n' "$model"
+  # awk -F'\t' (NOT `read`): tab is an IFS-whitespace char, so `IFS=$'\t' read` collapses
+  # consecutive tabs and an empty middle field (empty slot + present model) would shift the model
+  # out of reach. awk keeps empty fields, and prints "" for a legacy 5-field record.
+  awk -F'\t' 'NR==1{print $6}' "$f" 2>/dev/null
 }
 
 # pg_model_label <captured-model>: render the model for any human/machine surface. Echoes the
@@ -341,6 +343,34 @@ pg_model_label() {
   case "$m" in
     ''|'(unavailable)') printf '%s\n' "${PRO_GATE_MODEL_ROLE_LABEL:-the frontier OpenAI Pro reasoning model (web-UI-only, via the oracle bridge)}" ;;
     *) printf '%s\n' "$m" ;;
+  esac
+}
+
+# pg_derive_model_warn <resolved-model> <selection-status>: compute the advisory downgrade
+# warning (R6), or echo nothing. Advisory only; the caller logs it and stores it in the status
+# file, and it never changes the exit code.
+#   - a captured model matching the weak-model denylist (cheap markers) -> weak-model warning
+#   - a captured non-weak model -> no warning
+#   - NO captured model but oracle reported status=already-selected -> BENIGN, no warning: under
+#     the default `current` strategy oracle 0.15.2 reports resolved=(unavailable) whenever the
+#     account's model was already selected (the steady state), so this is a healthy run whose
+#     exact label just was not re-read; warning here would cry wolf on nearly every default run
+#     (found by dogfooding PR #20). pg_model_label still renders role-based text.
+#   - NO captured model and NO benign status (the run was killed before oracle emitted the
+#     evidence line, e.g. an exit-9/harvest, or a genuine read failure) -> cannot-confirm warning.
+# The denylist (not a Pro-tier allowlist) is deliberate: an allowlist would false-warn on a
+# legitimate future top model whose name lacks "Pro" (e.g. a hypothetical "Sol Ultra").
+pg_derive_model_warn() {
+  local m="${1:-}" st="${2:-}" weak
+  weak="${PRO_GATE_MODEL_WEAK_PATTERN:-mini|nano|instant}"
+  if [ -n "$m" ]; then
+    printf '%s' "$m" | grep -qiE "$weak" 2>/dev/null \
+      && printf "resolved model '%s' matches the weak-model denylist; not the top Pro tier\n" "$m"
+    return 0
+  fi
+  case "$st" in
+    already-selected) : ;;  # benign steady state under `current`: no warning
+    *) printf '%s\n' "could not confirm the resolved model (the run ended before oracle reported it, or none was captured); showing role-based text" ;;
   esac
 }
 

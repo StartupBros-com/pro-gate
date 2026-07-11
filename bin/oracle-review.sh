@@ -95,13 +95,15 @@ pg_status preflight
 RUN_START="$(date +%s)"
 SALVAGED=0
 EFF_CONC=0
-# v0.21: the model oracle actually resolved for THIS run. Captured from oracle's early
-# "Model selection evidence:" line on fresh paths, or read back from the reservation record on
-# --harvest; empty until known and whenever the resolved label is "(unavailable)". Every model
-# surface renders it through pg_model_label so an unknown model degrades to role-based text
-# rather than a hardcoded version.
+# v0.21: the model oracle actually resolved for THIS run, plus the selection status. Captured
+# (best-effort) from oracle's "Model selection evidence:" line on fresh paths, or read back from
+# the reservation record on --harvest; empty until known and whenever the resolved label is
+# "(unavailable)". Oracle 0.15.2 emits that line only at completion, so exit-9/harvest runs
+# usually leave this empty (dogfood PR #20); every model surface renders it through
+# pg_model_label so an unknown model degrades to role-based text, never a hardcoded version.
 RESOLVED_MODEL=""
-MODEL_WARN=""   # U5: advisory downgrade marker (weak/unreadable model); never blocks the run
+MODEL_STATUS=""   # oracle's status= field (e.g. already-selected); gates the R6 warning
+MODEL_WARN=""     # U5: advisory downgrade marker (weak/unconfirmable model); never blocks the run
 pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor, exit
   local rc="$1" outcome dur line model_label
   dur=$(( $(date +%s) - RUN_START ))
@@ -193,8 +195,13 @@ if [ -n "$HARVEST_MARKER" ]; then
   fi
   # KTD3: name the model the original in-progress run persisted into the reservation record. The
   # harvest runs in a separate process with no $RUNLOG to grep, so it reads the model straight
-  # back; a legacy record with no model field leaves RESOLVED_MODEL empty -> role-based fallback.
+  # back; a legacy/empty record leaves RESOLVED_MODEL empty -> role-based fallback. Derive the R6
+  # warning HERE too (dogfood PR #20 P2): the harvest branch pg_finishes before the fresh-path
+  # warning block, so without this a harvested weak/unconfirmable model would lose its marker. No
+  # selection status is available in this process, so an empty model here warns "cannot confirm".
   RESOLVED_MODEL="$(pg_reservation_read_model "$RUN_MARKER" 2>/dev/null || true)"
+  MODEL_WARN="$(pg_derive_model_warn "$RESOLVED_MODEL" "")"
+  [ -n "$MODEL_WARN" ] && echo "[oracle-review] WARNING: ${MODEL_WARN}." >&2
   if [ "$MODE" != remote-chrome ]; then
     echo "ERROR: --harvest requires remote-chrome/CDP mode; native browser mode exposes no marker-addressable CDP tab." >&2
     pg_status failed "harvest unsupported in native browser mode"
@@ -781,34 +788,35 @@ while :; do
   sleep "$BACKOFF"
 done
 
-# v0.21 (R4/R5): capture the model oracle resolved for THIS run from its early "Model selection
-# evidence: ...; resolved=<label>; ..." line in $RUNLOG. The line is emitted at model selection
-# (before reasoning), so it is present on both the fresh-success and the in-progress/exit-9 path.
-# resolved=(unavailable) degrades to empty -> role-based fallback. Mirrors the $RUNLOG session-slug
-# recovery grep above; feeds pg_model_label for every surface and the exit-9 reservation persist.
+# v0.21 (R4/R5): capture the model oracle resolved for THIS run from its "Model selection
+# evidence: ...; resolved=<label>; status=<st>; ..." line in $RUNLOG, plus the selection status.
+# BEST-EFFORT by design: dogfooding PR #20 showed oracle 0.15.2 emits this line at COMPLETION
+# (right after it releases the browser slot), NOT early at model selection. So on the fresh
+# in-progress/exit-9 path the watchdog kills oracle before the line is emitted and capture yields
+# nothing (empty -> role-based fallback, and the reservation persists no model). On the fresh
+# SUCCESS path the line is present; under `current` a model that was already selected reports
+# resolved=(unavailable); status=already-selected (still healthy). resolved=(unavailable) or
+# absence degrades to empty. Mirrors the $RUNLOG session-slug recovery grep above.
 if [ -f "$RUNLOG" ]; then
   EVIDENCE_LINE="$(grep -a 'Model selection evidence:' "$RUNLOG" 2>/dev/null | tail -1)"
   if [ -n "$EVIDENCE_LINE" ] && [ "${EVIDENCE_LINE#*resolved=}" != "$EVIDENCE_LINE" ]; then
     RM="${EVIDENCE_LINE#*resolved=}"; RM="${RM%%;*}"; RM="${RM%.}"
     RM="$(printf '%s' "$RM" | tr -d '\t\n' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
     case "$RM" in ''|'(unavailable)') RESOLVED_MODEL="" ;; *) RESOLVED_MODEL="$RM" ;; esac
+    if [ "${EVIDENCE_LINE#*status=}" != "$EVIDENCE_LINE" ]; then
+      ST="${EVIDENCE_LINE#*status=}"; ST="${ST%%;*}"; ST="${ST%.}"
+      MODEL_STATUS="$(printf '%s' "$ST" | tr -d '\t\n' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    fi
   fi
 fi
 
-# v0.21 (R6): soft, advisory downgrade warning. Fires when the resolved model is unreadable
-# (empty/(unavailable)) or matches a configurable weak-model denylist of cheap markers. It is a
-# WARN log line plus a marker in the status file that the human-facing composer includes; it NEVER
-# changes the exit code or blocks the run. A denylist (not a Pro-tier allowlist) is deliberate: the
-# failure mode is a cheap model with a recognizable marker, and an allowlist would false-warn on a
-# legitimate future top model whose name lacks "Pro" (e.g. a hypothetical "Sol Ultra").
-WEAK_PATTERN="${PRO_GATE_MODEL_WEAK_PATTERN:-mini|nano|instant}"
-if [ -z "$RESOLVED_MODEL" ]; then
-  MODEL_WARN="resolved model unreadable; cannot confirm the account is on its top Pro model"
-  echo "[oracle-review] WARNING: ${MODEL_WARN}." >&2
-elif printf '%s' "$RESOLVED_MODEL" | grep -qiE "$WEAK_PATTERN" 2>/dev/null; then
-  MODEL_WARN="resolved model '${RESOLVED_MODEL}' matches the weak-model denylist; not the top Pro tier"
-  echo "[oracle-review] WARNING: ${MODEL_WARN}." >&2
-fi
+# v0.21 (R6): soft, advisory downgrade warning (see pg_derive_model_warn). Fires on a weak-model
+# denylist match or a genuinely unconfirmable model (killed before oracle reported, or none
+# captured); it stays SILENT on the benign `current`+already-selected steady state so it does not
+# cry wolf on healthy default runs. A WARN log line plus a status-file marker the composer shows;
+# it NEVER changes the exit code.
+MODEL_WARN="$(pg_derive_model_warn "$RESOLVED_MODEL" "$MODEL_STATUS")"
+[ -n "$MODEL_WARN" ] && echo "[oracle-review] WARNING: ${MODEL_WARN}." >&2
 
 # v0.13: last-resort CDP tab salvage. oracle (<=0.15.0) can fail to DETECT
 # thinking after ChatGPT UI drift even though the submission landed: the
