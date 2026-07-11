@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# oracle-review.sh — run a GPT-5.5 Pro Extended FINAL-TIER review of a PR (or diff) via oracle.
+# oracle-review.sh: run a FINAL-TIER Pro review of a PR (or diff) via oracle.
 # Single source of truth for "how we call oracle for a review" — the /pro-gate skill and the
 # daemon both call this. Cross-platform: macOS drives signed-in Chrome natively; WSL/Linux
 # attaches to the durable Xvfb Chrome over CDP.
@@ -66,18 +66,25 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/pro-review.XXXXXX")"
 STATUS_FILE="$OUT.status"
 pg_status() {  # $1 phase, $2 optional detail — variable fields are JSON-escaped (v0.18.1:
   # $OUT is caller-supplied; a quote/backslash in it would corrupt the polling contract)
-  local phase="$1" detail="${2:-}" ts
+  local phase="$1" detail="${2:-}" ts model_label
   ts="$(date +%Y-%m-%dT%H:%M:%S%z)"
+  # v0.21: `model` is the run's resolved model rendered through pg_model_label (captured label or
+  # role-based fallback, never a hardcoded version); `model_warn` carries the advisory downgrade
+  # marker (empty unless the model looked weak/unreadable). Human surfaces read both from here.
+  model_label="$(pg_model_label "${RESOLVED_MODEL:-}")"
   if pg_have jq; then
     jq -nc --arg phase "$phase" --argjson attempt "${attempt:-0}" --arg detail "$detail" \
        --arg pr "${PR_NUM:-diff}" --arg out "$OUT" --arg ts "$ts" --arg marker "${RUN_MARKER:-}" \
-       '{phase:$phase,attempt:$attempt,detail:$detail,pr:$pr,out:$out,ts:$ts,marker:$marker}' \
+       --arg model "$model_label" --arg model_warn "${MODEL_WARN:-}" \
+       '{phase:$phase,attempt:$attempt,detail:$detail,pr:$pr,out:$out,ts:$ts,marker:$marker,model:$model,model_warn:$model_warn}' \
        > "$STATUS_FILE.tmp" 2>/dev/null
   else
-    printf '{"phase":"%s","attempt":%d,"detail":"%s","pr":"%s","out":"%s","ts":"%s","marker":"%s"}\n' \
+    printf '{"phase":"%s","attempt":%d,"detail":"%s","pr":"%s","out":"%s","ts":"%s","marker":"%s","model":"%s","model_warn":"%s"}\n' \
       "$phase" "${attempt:-0}" "$(printf '%s' "$detail" | tr -d '"\\' | tr '\n' ' ')" \
       "${PR_NUM:-diff}" "$(printf '%s' "$OUT" | tr -d '"\\' | tr '\n' ' ')" "$ts" \
       "$(printf '%s' "${RUN_MARKER:-}" | tr -d '"\\' | tr '\n' ' ')" \
+      "$(printf '%s' "$model_label" | tr -d '"\\' | tr '\n' ' ')" \
+      "$(printf '%s' "${MODEL_WARN:-}" | tr -d '"\\' | tr '\n' ' ')" \
       > "$STATUS_FILE.tmp" 2>/dev/null
   fi
   { [ -s "$STATUS_FILE.tmp" ] && mv -f "$STATUS_FILE.tmp" "$STATUS_FILE"; } 2>/dev/null || true
@@ -88,9 +95,17 @@ pg_status preflight
 RUN_START="$(date +%s)"
 SALVAGED=0
 EFF_CONC=0
+# v0.21: the model oracle actually resolved for THIS run. Captured from oracle's early
+# "Model selection evidence:" line on fresh paths, or read back from the reservation record on
+# --harvest; empty until known and whenever the resolved label is "(unavailable)". Every model
+# surface renders it through pg_model_label so an unknown model degrades to role-based text
+# rather than a hardcoded version.
+RESOLVED_MODEL=""
+MODEL_WARN=""   # U5: advisory downgrade marker (weak/unreadable model); never blocks the run
 pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor, exit
-  local rc="$1" outcome dur line
+  local rc="$1" outcome dur line model_label
   dur=$(( $(date +%s) - RUN_START ))
+  model_label="$(pg_model_label "${RESOLVED_MODEL:-}")"   # resolved model or role-based fallback
   case "$rc" in
     0) outcome=clean ;;
     6) outcome=failed ;;
@@ -119,12 +134,13 @@ pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor,
       --argjson secs "$dur" --argjson attempts "${attempt:-0}" \
       --argjson conc "${EFF_CONC:-0}" --argjson ceiling "${MAX_CONC:-1}" \
       --argjson live "${LIVE_CONVERSATION:-0}" --argjson salvaged "${SALVAGED:-0}" \
-      --argjson diff_lines "${DIFF_LINES:-0}" --arg out "$OUT" \
-      '{ts:$ts,pr:$pr,repo:$repo,exit:$exit,outcome:$outcome,secs:$secs,attempts:$attempts,conc:$conc,ceiling:$ceiling,live:$live,salvaged:$salvaged,diff_lines:$diff_lines,out:$out}' 2>/dev/null)"
+      --argjson diff_lines "${DIFF_LINES:-0}" --arg out "$OUT" --arg model "$model_label" \
+      '{ts:$ts,pr:$pr,repo:$repo,exit:$exit,outcome:$outcome,secs:$secs,attempts:$attempts,conc:$conc,ceiling:$ceiling,live:$live,salvaged:$salvaged,diff_lines:$diff_lines,out:$out,model:$model}' 2>/dev/null)"
   else
-    line="$(printf '{"ts":"%s","pr":"%s","exit":%d,"outcome":"%s","secs":%d,"attempts":%d,"conc":%d,"ceiling":%d,"live":%d,"salvaged":%d}' \
+    line="$(printf '{"ts":"%s","pr":"%s","exit":%d,"outcome":"%s","secs":%d,"attempts":%d,"conc":%d,"ceiling":%d,"live":%d,"salvaged":%d,"model":"%s"}' \
       "$(date +%Y-%m-%dT%H:%M:%S%z)" "${PR_NUM:-diff}" "$rc" "$outcome" "$dur" "${attempt:-0}" \
-      "${EFF_CONC:-0}" "${MAX_CONC:-1}" "${LIVE_CONVERSATION:-0}" "${SALVAGED:-0}")"
+      "${EFF_CONC:-0}" "${MAX_CONC:-1}" "${LIVE_CONVERSATION:-0}" "${SALVAGED:-0}" \
+      "$(printf '%s' "$model_label" | tr -d '"\\' | tr '\n' ' ')")"
   fi
   pg_ledger_append "$line"
   # Close this run's conversation tab. We run oracle with --browser-archive=never (so probe and
@@ -175,6 +191,10 @@ if [ -n "$HARVEST_MARKER" ]; then
     pg_status failed "invalid harvest marker"
     pg_finish 2
   fi
+  # KTD3: name the model the original in-progress run persisted into the reservation record. The
+  # harvest runs in a separate process with no $RUNLOG to grep, so it reads the model straight
+  # back; a legacy record with no model field leaves RESOLVED_MODEL empty -> role-based fallback.
+  RESOLVED_MODEL="$(pg_reservation_read_model "$RUN_MARKER" 2>/dev/null || true)"
   if [ "$MODE" != remote-chrome ]; then
     echo "ERROR: --harvest requires remote-chrome/CDP mode; native browser mode exposes no marker-addressable CDP tab." >&2
     pg_status failed "harvest unsupported in native browser mode"
@@ -294,7 +314,7 @@ if [ -z "$DIFF_FILE" ]; then
     echo "ERROR: gh pr diff $PR_NUM failed in $REPO: $(cat "$WORK/diff.err")" >&2; pg_status failed "gh pr diff failed"; exit 5; }
 fi
 
-# --- diff hygiene: drop lockfiles/generated/vendored from the review payload so Pro Extended
+# --- diff hygiene: drop lockfiles/generated/vendored from the review payload so the Pro model
 # spends its (finite, disconnect-exposed) thinking window on real code, not lockfile churn. ---
 if [ -s "$DIFF_FILE" ] && [ "${PRO_GATE_DIFF_FILTER:-1}" = 1 ]; then
   FILTERED="$WORK/pr.filtered.diff"
@@ -314,7 +334,7 @@ fi
 DIFF_LINES=$(wc -l < "$DIFF_FILE" 2>/dev/null || echo 0)
 echo "[oracle-review] os=$OS mode=$MODE repo=$REPO pr=#${PR_NUM} url=${PR_URL:-n/a} diff_lines=$DIFF_LINES input=$INPUT" >&2
 
-# --- v0.20: diff-size guard: refuse to burn a Pro Extended slot on a payload that will not
+# --- v0.20: diff-size guard: refuse to burn a Pro review slot on a payload that will not
 # converge. Ledger data: 984-1402-line diffs complete in 12-21 min; a ~10k-line diff (6.5k
 # insertions, 40 files) reasoned 65 minutes without emitting a verdict (2026-07-09, exactly the
 # review window the timeout+salvage budgets cannot cover). Oversized diffs exit 11 BEFORE any
@@ -323,7 +343,7 @@ echo "[oracle-review] os=$OS mode=$MODE repo=$REPO pr=#${PR_NUM} url=${PR_URL:-n
 DIFF_WARN_LINES="${PRO_GATE_DIFF_WARN_LINES:-2500}"
 DIFF_MAX_LINES="${PRO_GATE_MAX_DIFF_LINES:-6000}"
 if [ "${DIFF_LINES:-0}" -gt "$DIFF_MAX_LINES" ] 2>/dev/null && [ "${PRO_GATE_DIFF_GUARD:-1}" = 1 ]; then
-  echo "ERROR: diff is ${DIFF_LINES} lines (> PRO_GATE_MAX_DIFF_LINES=${DIFF_MAX_LINES}): Pro Extended does not converge on payloads this size within any review budget; not spending a slot." >&2
+  echo "ERROR: diff is ${DIFF_LINES} lines (> PRO_GATE_MAX_DIFF_LINES=${DIFF_MAX_LINES}): the Pro model does not converge on payloads this size within any review budget; not spending a slot." >&2
   echo "  Scope the gate to what actually needs the final tier, then re-run with the patch:" >&2
   echo "    git -C <repo> diff <last-gated-sha>..<head> -- ':!*.lock' > delta.patch" >&2
   echo "    oracle-review.sh --diff delta.patch --repo <repo> --extra-files '<context globs>' --out <out>" >&2
@@ -331,7 +351,7 @@ if [ "${DIFF_LINES:-0}" -gt "$DIFF_MAX_LINES" ] 2>/dev/null && [ "${PRO_GATE_DIF
   pg_status oversized "diff ${DIFF_LINES} lines > max ${DIFF_MAX_LINES}; scope with --diff"
   pg_finish 11
 elif [ "${DIFF_LINES:-0}" -gt "$DIFF_WARN_LINES" ] 2>/dev/null; then
-  echo "[oracle-review] WARNING: diff is ${DIFF_LINES} lines (> ${DIFF_WARN_LINES}); large diffs risk exceeding the Pro Extended review window: consider scoping with --diff to the unreviewed delta." >&2
+  echo "[oracle-review] WARNING: diff is ${DIFF_LINES} lines (> ${DIFF_WARN_LINES}); large diffs risk exceeding the Pro review window: consider scoping with --diff to the unreviewed delta." >&2
 fi
 
 # --- build the review prompt (the product) ---
@@ -354,7 +374,7 @@ PROMPT_FILE="$WORK/prompt.md"
 EOF
   fi
   cat <<EOF
-You are the FINAL, highest-tier code reviewer (GPT-5.5 Pro Extended) for a pull request that has ALREADY been through automated review tiers (Claude correctness/security/maintainability personas and a cloud bug+security scan) and their fixes have been applied. The cheap, obvious issues are already gone.
+You are the FINAL, highest-tier code reviewer for a pull request that has ALREADY been through automated review tiers (Claude correctness/security/maintainability personas and a cloud bug+security scan) and their fixes have been applied. The cheap, obvious issues are already gone.
 
 Your job is to find what those tiers MISSED — go deep:
 - logic errors and incorrect assumptions; intent-vs-implementation mismatches
@@ -419,7 +439,7 @@ ENGINE_ARGS=(-e browser)
 # review is confirmed (pg_close_run_tab in pg_finish). Override with PRO_GATE_BROWSER_ARCHIVE.
 ENGINE_ARGS+=(--browser-archive "${PRO_GATE_BROWSER_ARCHIVE:-never}")
 
-# --- Bound concurrent Pro Extended runs against the single ChatGPT account ---
+# --- Bound concurrent Pro review runs against the single ChatGPT account ---
 # DEFAULT IS SERIALIZED (1). The 2026-07-03 throttle incident showed one account under
 # 3 parallel runs (plus their salvage page-loads) trips ChatGPT's anti-scraping limiter
 # ("temporarily limited access to your conversations"). PRO_GATE_MAX_CONCURRENCY is the
@@ -545,7 +565,7 @@ RUNLOG="$WORK/oracle.log"
 #   stall      — no oracle log output for PRO_GATE_STALL_SECS (default 600) and no findings
 #   no-think   — still "no thinking status detected" after PRO_GATE_NOTHINK_SECS (default 600)
 # A watchdog kill returns 124; the caller's salvage + guarded-retry path takes over. Dead
-# submissions never consumed the Pro Extended thinking window, so the retry is not a
+# submissions never consumed the Pro thinking window, so the retry is not a
 # double-spend.
 HARD_SECS=$(( $(pg_dur_secs "$TIMEOUT") + ${PRO_GATE_TIMEOUT_GRACE:-120} ))
 STALL_SECS="${PRO_GATE_STALL_SECS:-600}"
@@ -584,7 +604,7 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
     elif [ $(( now - started )) -ge "$NOTHINK_SECS" ] && printf '%s' "$last_line" | grep -q "no thinking status detected"; then
       # v0.14: oracle's thinking detection can lag reality (ChatGPT UI drift,
       # first seen PR pushbot#863 2026-07-02: killed a run that was 11m into a
-      # live Pro Extended thought). Before declaring the submission dead, ask
+      # live Pro thought). Before declaring the submission dead, ask
       # Chrome whether a conversation tab matching this PR exists. If it does,
       # the run is LIVE: quota is already spent and a resubmit would
       # double-spend. Kill the blind CLI anyway (frees the browser slot) but
@@ -622,7 +642,7 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
 }
 
 # --- spend the slot: health-gate -> run -> salvage -> one guarded retry ---
-# A precious Pro Extended slot is spent only when the box is fit; a dropped connection is first
+# A precious Pro review slot is spent only when the box is fit; a dropped connection is first
 # SALVAGED (the answer may have finished server-side), and only a truly-lost run is retried once.
 # Exit 8 = deferred (no slot spent); exit 6 = ran but produced nothing after salvage + retry.
 SLUG_BASE="pro-gate-review-pr-${PR_NUM:-diff}"
@@ -639,7 +659,7 @@ while :; do
     # On a retry iteration a slot HAS been spent — abandoning to exit 8 here would skip
     # the salvage of a possibly-completed review. Stop retrying and salvage instead.
     if [ "$attempt" -eq 0 ]; then
-      echo "ERROR: not spending a Pro Extended slot — ${GATE_REASON}." >&2
+      echo "ERROR: not spending a Pro review slot (${GATE_REASON})." >&2
       echo "  Deferred (no slot spent). Retry once the box settles, or run on macOS (native Chrome)." >&2
       pg_status deferred "$GATE_REASON"
       pg_finish 8
@@ -652,13 +672,14 @@ while :; do
     break
   fi
 
-  echo "[oracle-review] launching GPT-5.5 Pro Extended review (attempt $((attempt + 1)), oracle timeout $TIMEOUT, hard cap ${HARD_SECS}s, stall/no-think watchdog ${STALL_SECS}s/${NOTHINK_SECS}s)..." >&2
-  pg_status launching "strategy ${PRO_GATE_MODEL_STRATEGY:-select}"
+  echo "[oracle-review] launching the final-tier Pro review (attempt $((attempt + 1)), oracle timeout $TIMEOUT, hard cap ${HARD_SECS}s, stall/no-think watchdog ${STALL_SECS}s/${NOTHINK_SECS}s)..." >&2
+  pg_status launching "strategy ${PRO_GATE_MODEL_STRATEGY:-current}"
   : > "$RUNLOG"; rm -f "$OUT"   # clear any prior attempt's output so stale garbage can't survive
-  run_oracle "${PRO_GATE_MODEL_STRATEGY:-select}" || true
-  # UI fallback (notably macOS): model picker not found + no output -> retry with the default model.
+  run_oracle "${PRO_GATE_MODEL_STRATEGY:-current}" || true
+  # UI fallback (notably macOS): model picker not found + no output -> retry pinned to the account's
+  # already-selected model. Redundant on the default path (current is now primary), kept for select.
   if [ ! -s "$OUT" ] && grep -qiE "model selector|model.?picker" "$RUNLOG" 2>/dev/null; then
-    echo "[oracle-review] model picker not found — retrying with --browser-model-strategy current (ensure GPT-5.5 Pro Extended is your ChatGPT default)..." >&2
+    echo "[oracle-review] model picker not found; retrying with --browser-model-strategy current (reviews whichever Pro model your ChatGPT account already has selected)..." >&2
     run_oracle current || true
   fi
   # Accept ONLY a real review, not just any non-empty file — a corrupted capture (e.g. a stray "A")
@@ -760,6 +781,35 @@ while :; do
   sleep "$BACKOFF"
 done
 
+# v0.21 (R4/R5): capture the model oracle resolved for THIS run from its early "Model selection
+# evidence: ...; resolved=<label>; ..." line in $RUNLOG. The line is emitted at model selection
+# (before reasoning), so it is present on both the fresh-success and the in-progress/exit-9 path.
+# resolved=(unavailable) degrades to empty -> role-based fallback. Mirrors the $RUNLOG session-slug
+# recovery grep above; feeds pg_model_label for every surface and the exit-9 reservation persist.
+if [ -f "$RUNLOG" ]; then
+  EVIDENCE_LINE="$(grep -a 'Model selection evidence:' "$RUNLOG" 2>/dev/null | tail -1)"
+  if [ -n "$EVIDENCE_LINE" ] && [ "${EVIDENCE_LINE#*resolved=}" != "$EVIDENCE_LINE" ]; then
+    RM="${EVIDENCE_LINE#*resolved=}"; RM="${RM%%;*}"; RM="${RM%.}"
+    RM="$(printf '%s' "$RM" | tr -d '\t\n' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    case "$RM" in ''|'(unavailable)') RESOLVED_MODEL="" ;; *) RESOLVED_MODEL="$RM" ;; esac
+  fi
+fi
+
+# v0.21 (R6): soft, advisory downgrade warning. Fires when the resolved model is unreadable
+# (empty/(unavailable)) or matches a configurable weak-model denylist of cheap markers. It is a
+# WARN log line plus a marker in the status file that the human-facing composer includes; it NEVER
+# changes the exit code or blocks the run. A denylist (not a Pro-tier allowlist) is deliberate: the
+# failure mode is a cheap model with a recognizable marker, and an allowlist would false-warn on a
+# legitimate future top model whose name lacks "Pro" (e.g. a hypothetical "Sol Ultra").
+WEAK_PATTERN="${PRO_GATE_MODEL_WEAK_PATTERN:-mini|nano|instant}"
+if [ -z "$RESOLVED_MODEL" ]; then
+  MODEL_WARN="resolved model unreadable; cannot confirm the account is on its top Pro model"
+  echo "[oracle-review] WARNING: ${MODEL_WARN}." >&2
+elif printf '%s' "$RESOLVED_MODEL" | grep -qiE "$WEAK_PATTERN" 2>/dev/null; then
+  MODEL_WARN="resolved model '${RESOLVED_MODEL}' matches the weak-model denylist; not the top Pro tier"
+  echo "[oracle-review] WARNING: ${MODEL_WARN}." >&2
+fi
+
 # v0.13: last-resort CDP tab salvage. oracle (<=0.15.0) can fail to DETECT
 # thinking after ChatGPT UI drift even though the submission landed: the
 # no-think watchdog then kills a LIVE run, and reattach harvests a stale tab
@@ -808,7 +858,7 @@ elif [ "${SALVAGE_RC:-0}" -eq 3 ]; then
   # releases its flock slot, leave the tab open (pg_finish skips close for exit 9), and hand the
   # caller a no-respend collection path. Fresh runs reconcile/respect the reservation, so actual
   # account concurrency and same-PR serialization remain correct after this wrapper exits.
-  if ! pg_reservation_write "$RUN_MARKER" "${PR_KEY:-diff}" "$OUT" "${SLOT_HELD:-}"; then
+  if ! pg_reservation_write "$RUN_MARKER" "${PR_KEY:-diff}" "$OUT" "${SLOT_HELD:-}" "$RESOLVED_MODEL"; then
     # Fail closed: without the durable reservation, exit 9 would under-count a live Pro tab and
     # let the next invocation double-spend. Keep the process/locks alive rather than release
     # unreserved capacity; this should only happen on a broken/unwritable PRO_GATE_HOME.

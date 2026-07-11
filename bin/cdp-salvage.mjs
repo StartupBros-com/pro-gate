@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Last-resort review salvage: read the finished GPT-5.5 Pro Extended review
+// Last-resort review salvage: read the finished Pro review
 // straight off the ChatGPT conversation tab's DOM via CDP.
 //
 // Why this exists: oracle (<=0.15.0) can fail to DETECT the thinking state

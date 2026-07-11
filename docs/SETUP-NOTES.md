@@ -1,19 +1,19 @@
 ---
 name: oracle-pro-extended-setup
-description: "Working setup for driving GPT-5.5 Pro Extended headlessly via steipete/oracle on WSL — the durable browser session, the exact flags, and the gotchas"
+description: "Working setup for driving the ChatGPT Pro reasoning model headlessly via steipete/oracle on WSL: the durable browser session, the exact flags, and the gotchas"
 metadata: 
   node_type: memory
   type: project
   originSessionId: d4eee309-7475-4a68-b52d-723f0ba767f0
 ---
 
-Will automates ChatGPT **Pro Extended** PR reviews via `@steipete/oracle` (CLI+MCP that drives a logged-in Chrome ChatGPT session — Pro/Pro-Extended is web-UI-only, no API). Built 2026-06-29 as the "pro-gate" final-tier reviewer after CE + Cloud review. Plan: `~/.claude/plans/swirling-jumping-tarjan.md`. See [[codex-delegation-setup]] (the codex fixer leg).
+Will automates ChatGPT **Pro** PR reviews via `@steipete/oracle` (CLI+MCP that drives a logged-in Chrome ChatGPT session; the Pro reasoning tier is web-UI-only, no API). Built 2026-06-29 as the "pro-gate" final-tier reviewer after CE + Cloud review. Plan: `~/.claude/plans/swirling-jumping-tarjan.md`. See [[codex-delegation-setup]] (the codex fixer leg).
 
 **PROVEN working path (WSL2, NAT networking):** own the Chrome, oracle attaches via `--remote-chrome`.
 - Install: `pnpm add -g @steipete/oracle` (v0.15.0; bins `oracle`, `oracle-mcp` in ~/.local/bin).
 - **Durable browser session = systemd system unit `oracle-chrome.service`** (enabled+active, survives reboot) → `~/.pro-review-daemon/run-oracle-chrome.sh`: starts `Xvfb :99` then headful `google-chrome` with **required WSL flags `--no-sandbox --disable-gpu --disable-dev-shm-usage`**, `--remote-allow-origins='*'`, CDP on `127.0.0.1:9222`, against persistent profile `~/.oracle/browser-profile` (stays signed in). Config in `~/.pro-review-daemon/.env`.
 - **One-time login:** `~/.pro-review-daemon/login-view.sh` brings up x11vnc(:99)+noVNC on `localhost:6080` (WSL forwards localhost to Windows → open `http://localhost:6080/vnc.html` in Windows browser, sign in once). Login persists in the profile across reboots.
-- **Invoke a review:** `oracle -e browser --remote-chrome 127.0.0.1:9222 -m gpt-5.5-pro -p "..." --write-output <file>`. Confirmed: `requested=Pro; resolved=Pro Extended; verified=yes` — `-m gpt-5.5-pro` lands on **Pro Extended thinking**. ~18s for a trivial prompt; real reviews ~10min (oracle `--timeout auto`=60m for Pro; long runs detach → reattach with `oracle session <slug>`, never re-run).
+- **Invoke a review:** `oracle -e browser --remote-chrome 127.0.0.1:9222 -m gpt-5.5-pro -p "..." --write-output <file>`. Confirmed evidence (captured from the run, preserved verbatim as the original proof): `requested=Pro; resolved=Pro Extended; verified=yes`, i.e. `-m gpt-5.5-pro` lands on the Pro thinking tier. ~18s for a trivial prompt; real reviews ~10min (oracle `--timeout auto`=60m for Pro; long runs detach → reattach with `oracle session <slug>`, never re-run).
 
 **GOTCHAS (cost hours):**
 - `oracle`'s OWN Chrome launch (incl. `oracle serve --manual-login`) is **broken under WSL** — it does NOT pass the sandbox flags, so its internal launch dies `ECONNREFUSED`. Fix: we launch Chrome ourselves with the flags and use `--remote-chrome`.
@@ -35,4 +35,4 @@ Will automates ChatGPT **Pro Extended** PR reviews via `@steipete/oracle` (CLI+M
 - **Prompt false-positive control:** mandatory `<file>:<line>` citation per finding + explicit "Do NOT flag" list (style/CI-enforced/generated/pre-existing/speculative). Per Cloudflare/Anthropic review-at-scale patterns.
 - **Daemon cost+resilience:** headless `claude -p` bills API credits (post-2026-06-15) → added `--max-budget-usd` (default $5/PR), `--fallback-model haiku`, and a per-PR failure cap (`MAX_FAILS`=3, then give up to avoid poison-PR retry loops).
 - Prior art: Doodlestein `planning-workflow` skill = the human-driven version of this cross-model review ritual; pro-gate is the agent-native automation. This pattern is new as of 2026-06-29.
-- Optional future (researched, NOT yet done): structured JSON output from Pro Extended for deterministic dedup; a global PreToolUse hook to block `git push` until tests pass; OTEL telemetry per daemon run; auto-tripping circuit breaker on N consecutive failures.
+- Optional future (researched, NOT yet done): structured JSON output from the Pro model for deterministic dedup; a global PreToolUse hook to block `git push` until tests pass; OTEL telemetry per daemon run; auto-tripping circuit breaker on N consecutive failures.

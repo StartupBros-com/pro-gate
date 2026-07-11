@@ -33,7 +33,7 @@ cat <<EOF
        (click Connect — no password; WSL forwards localhost to Windows)
   ►  You'll see Chrome on chatgpt.com. Sign in to your ChatGPT Pro account.
   ►  While there, confirm:
-        • GPT-5.5 Pro is selectable (your Pro plan)
+        • your Pro model is selectable (your Pro plan)
         • Settings → Apps → GitHub connector is enabled for your repos
   ►  The login persists in ${ORACLE_BROWSER_PROFILE_DIR:-\$HOME/.oracle/browser-profile}
      and survives reboots (oracle-chrome.service).
