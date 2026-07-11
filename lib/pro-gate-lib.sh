@@ -69,6 +69,22 @@ pg_dur_secs() {
   esac
 }
 
+# pg_file_sig <file...>: a stable content signature over the given files, used to detect that
+# on-disk code was redeployed (the daemon's self-reload). cksum is POSIX and always present; the
+# per-file content checksum plus its path is folded into one final checksum, so a change in ANY
+# file's content, or a file appearing/disappearing, changes the signature. Order-stable. Echoes a
+# single token, or nothing if cksum is unavailable (callers treat empty as "cannot determine" and
+# do not act, so a missing tool degrades to "never reload" rather than "reload constantly").
+pg_file_sig() {
+  pg_have cksum || return 0
+  local f line acc=""
+  for f in "$@"; do
+    if [ -f "$f" ]; then line="$(cksum < "$f" 2>/dev/null)"; else line="absent"; fi
+    acc="${acc}${f}=${line}|"
+  done
+  printf '%s' "$acc" | cksum 2>/dev/null | awk '{print $1"-"$2}'
+}
+
 # Cross-process lock — waits up to $2 seconds; returns 0 acquired / 1 timeout. Uses flock when
 # present (Linux); else an atomic mkdir spinlock (macOS has no flock). Held until the shell exits.
 pg_lock() {

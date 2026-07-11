@@ -55,6 +55,14 @@ for f in daemon.sh run-daemon.sh run-oracle-chrome.sh login-view.sh; do
 done
 [ -f "$DAEMON_DIR/.env" ] || { cp "$REPO/.env.example" "$DAEMON_DIR/.env"; say "wrote $DAEMON_DIR/.env — set PRO_REVIEW_OWNERS"; }
 
+# Self-reload signal: stamp the deploy AFTER every runtime file above has landed. A running daemon
+# re-execs itself once to adopt the new code (maybe_self_reload in daemon.sh) instead of needing a
+# control-group-killing `systemctl restart`. One atomic rename, so the daemon never sees a
+# half-deployed file set; the content is a signature of the daemon's own code, so a no-op reinstall
+# (identical code) leaves the stamp unchanged and triggers no reload. Best-effort (never fails install).
+{ pg_file_sig "$DAEMON_DIR/daemon.sh" "$DAEMON_DIR/lib.sh" "$DAEMON_DIR/run-daemon.sh" \
+    > "$DAEMON_DIR/.deploy-stamp.tmp" && mv -f "$DAEMON_DIR/.deploy-stamp.tmp" "$DAEMON_DIR/.deploy-stamp"; } 2>/dev/null || true
+
 # 3. browser session + service (per platform)
 case "$OS" in
   macos)
