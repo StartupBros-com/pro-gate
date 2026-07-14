@@ -12,7 +12,7 @@ jobs:
   check:
     name: trusted check
     if: github.event_name == 'push' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)
-    runs-on: [self-hosted, ci]
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - name: Check out repository
@@ -31,6 +31,7 @@ jobs:
           node --test tests/cdp-salvage.test.mjs
           bash tests/distribution.test.sh
           bash tests/release-train.test.sh
+          bash tests/release-assets.test.sh
 
   public-pr-check:
     name: public PR data check

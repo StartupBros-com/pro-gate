@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   release:
-    runs-on: [self-hosted, ci]
+    runs-on: ubuntu-24.04
     steps:
       - name: Check out tagged source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -44,19 +44,14 @@ jobs:
           node --test tests/cdp-salvage.test.mjs
           bash tests/distribution.test.sh
           bash tests/release-train.test.sh
+          bash tests/release-assets.test.sh
       - name: Package exact runtime release
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: scripts/package-runtime.sh
       - name: Verify published checksum
         run: sha256sum -c "dist/pro-gate-runtime-$(tr -d '[:space:]' < VERSION).tar.gz.sha256"
-      - name: Upload exact release assets
+      - name: Upload, verify, and publish exact release assets
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          version="$(tr -d '[:space:]' < VERSION)"
-          gh release view "v$version" >/dev/null 2>&1 || gh release create "v$version" --title "v$version" --generate-notes
-          gh release upload "v$version" \
-            "dist/pro-gate-runtime-$version.tar.gz" \
-            "dist/pro-gate-runtime-$version.tar.gz.sha256" \
-            --clobber
+        run: ./scripts/publish-runtime-release.sh

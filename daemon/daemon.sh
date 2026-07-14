@@ -30,7 +30,6 @@ privileged_runtime_ready() {
     return 1
   }
 }
-privileged_runtime_ready || exit 12
 
 # --- self-reload signal: `install.sh` writes a single atomic deploy stamp
 # ($PRO_GATE_HOME/.deploy-stamp) as the LAST step of a deploy, after every runtime file is in
@@ -62,6 +61,18 @@ SKIP_LABEL="${PRO_REVIEW_SKIP_LABEL:-skip-pro-review}"  # in all-PRs mode, this 
 AUTOCLONE="${PRO_REVIEW_AUTOCLONE:-1}"                  # clone a missing repo under REPOS_DIR instead of skipping it
 
 log(){ printf '%s %s\n' "$(date '+%F %T')" "$*"; }
+
+RUNTIME_DEFERRED=0
+runtime_gate(){
+  if privileged_runtime_ready; then
+    if [ "$RUNTIME_DEFERRED" = 1 ]; then log "privileged runtime ready; resuming PR processing"; fi
+    RUNTIME_DEFERRED=0
+    return 0
+  fi
+  [ "$RUNTIME_DEFERRED" = 1 ] || log "privileged runtime unavailable; globally deferring PR processing"
+  RUNTIME_DEFERRED=1
+  return 1
+}
 
 # maybe_self_reload: call ONLY at an idle point (no review child running). If `install.sh` has
 # landed a new deploy since startup, re-exec the daemon in place to pick it up. The stamp flips
@@ -188,10 +199,13 @@ process_pr(){
 SYNCHRONOUS EXECUTION (critical): you are running headless: you will NOT receive any asynchronous background-task notification. After you launch the oracle review, you MUST poll its status file in a loop yourself: the engine writes single-line JSON to '<out>.status' at every phase change (poll it, e.g. repeatedly: sleep 60; cat the status file). Phase 'done' means read the --out file; 'failed'/'deferred'/'oversized' are terminal: report them, do NOT relaunch. Phase 'in-progress' means the model is STILL generating after the engine's budget: do NOT relaunch; wait 10 minutes, read the marker field from the status JSON, then run the deployed engine again as: \"\${PRO_GATE_HOME:-\$HOME/.pro-review-daemon}/oracle-review.sh\" --harvest '<marker>' --out '<out>' --timeout 20m (repeat while it exits 9; it spends no new quota). The oracle takes 10-30 minutes; that is expected. Do NOT end your turn, and do NOT say 'I will be notified', while the oracle is still running. Your turn is only complete once the PR comment has actually been posted.
 CRITICAL: do NOT merge the PR, do NOT open new PRs, do NOT change the base branch. Stop after pushing fixes and posting the comment. If no fixes are warranted, just post the review summary comment and stop."
 
-  if ! privileged_runtime_ready; then
+  # Recheck at the privileged execution boundary. A runtime deploy or consent
+  # change can happen after the cycle-level gate. This is machine-wide state,
+  # so defer globally without charging this PR's retry budget.
+  if ! runtime_gate; then
     git -C "$repodir" worktree remove --force "$wt" 2>/dev/null || true
-    note_fail "$nwo" "$num" "$sha" "$lg" "runtime version or consent guard failed"
-    return 1
+    log "  ! $nwo#$num deferred because the privileged runtime is unavailable"
+    return 2
   fi
 
   ( cd "$wt" && timeout 5400 claude -p "$prompt" \
@@ -224,6 +238,7 @@ while true; do
   # never fires -> an in-flight review is never interrupted).
   maybe_self_reload
   if [ -f "$PAUSE" ]; then log "PAUSE present — idling"; sleep "$POLL"; continue; fi
+  if ! runtime_gate; then sleep "$POLL"; continue; fi
   if ! session_up; then log "browser session down — idling"; sleep "$POLL"; continue; fi
   if doghouse_tripped; then log "codex doghouse tripped — idling"; sleep "$POLL"; continue; fi
 

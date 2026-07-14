@@ -14,7 +14,7 @@ concurrency:
 jobs:
   promote:
     if: github.event.release.draft == false
-    runs-on: [self-hosted, ci]
+    runs-on: ubuntu-24.04
     steps:
       - name: Check out release commit
         uses: actions/checkout@ac593985615ec2ede58e132d2e21d2b1cbd6127c
@@ -38,13 +38,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          latest_id="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
-            --jq '[.[] | select(.draft == false and .prerelease == false)] | sort_by(.created_at) | reverse | first | .id')"
+          latest_id="$(./scripts/latest-stable-release.sh "$GITHUB_REPOSITORY")"
           test -n "$latest_id"
           echo "id=$latest_id" >> "$GITHUB_OUTPUT"
 
       - name: Download runtime release assets
-        if: github.event.action == 'published' && github.event.release.prerelease == false
+        if: github.event.release.prerelease == false
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
@@ -53,13 +52,20 @@ jobs:
           gh release download "$RELEASE_TAG" --dir release-assets --pattern 'pro-gate-runtime-*'
 
       - name: Check out marketplace
-        if: github.event.action == 'published' && github.event.release.prerelease == false
+        if: github.event.release.prerelease == false
         uses: actions/checkout@ac593985615ec2ede58e132d2e21d2b1cbd6127c
         with:
           repository: StartupBros-com/hov-marketplace
           token: ${{ secrets.HOV_MARKETPLACE_PAT }}
           path: hov-marketplace
           fetch-depth: 0
+
+      - name: Configure marketplace git identity
+        if: github.event.release.prerelease == false
+        working-directory: hov-marketplace
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
 
       - name: Promote release and announce
         env:

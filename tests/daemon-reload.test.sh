@@ -40,9 +40,9 @@ check 'sig changes when a file disappears' "$([ "$S3" != "$S4" ]; echo $?)" "s3=
 
 echo '# install.sh writes an atomic deploy stamp (= sig of the deployed daemon code) as its last deploy step'
 SBI="$TDIR/inst"; mkdir -p "$SBI/shim" "$SBI/claude" "$SBI/home" "$SBI/oracle"
-printf '#!/bin/sh\nexit 0\n' > "$SBI/shim/sudo"; chmod +x "$SBI/shim/sudo"   # neutralize systemd steps
+printf '#!/bin/sh\n[ "$1" = tee ] && cat >/dev/null\nexit 0\n' > "$SBI/shim/sudo"; chmod +x "$SBI/shim/sudo"   # neutralize systemd steps
 INSTALL_DAEMON=0 CLAUDE_DIR="$SBI/claude" PRO_GATE_HOME="$SBI/home" ORACLE_DIR="$SBI/oracle" \
-  PATH="$SBI/shim:$PATH" bash "$HERE/../install.sh" > "$SBI/install.log" 2>&1 || true
+  PATH="$SBI/shim:$PATH" bash "$HERE/../install.sh" --local-source > "$SBI/install.log" 2>&1 || true
 check 'install wrote .deploy-stamp' "$([ -s "$SBI/home/.deploy-stamp" ]; echo $?)" "$(ls -1 "$SBI/home" 2>/dev/null | tr '\n' ' ')"
 EXP="$(bash -c ". '$LIB'; pg_file_sig '$SBI/home/daemon.sh' '$SBI/home/lib.sh' '$SBI/home/run-daemon.sh'")"
 GOT="$(cat "$SBI/home/.deploy-stamp" 2>/dev/null || true)"

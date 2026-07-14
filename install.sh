@@ -10,6 +10,7 @@ REPO_NAME="pro-gate"
 PRO_GATE_HOME="${PRO_GATE_HOME:-$HOME/.pro-review-daemon}"
 ORACLE_DIR="${ORACLE_DIR:-$HOME/.oracle}"
 INSTALL_DAEMON="${INSTALL_DAEMON:-0}"
+LOCAL_SOURCE=0
 REQUESTED_VERSION=""
 ARCHIVE=""
 CHECKSUM_FILE=""
@@ -33,6 +34,7 @@ Options:
   --version VERSION          Install this exact release
   --archive FILE             Install a local release archive
   --checksum FILE            Verify --archive against this checksum file
+  --local-source             Install from the on-disk source tree containing this installer
   --daemon                   Install and enable the automatic review daemon
   --accept-dangerous-mode    Record versioned operator consent for the daemon
   --help                     Show this help
@@ -45,6 +47,7 @@ while [ $# -gt 0 ]; do
     --version) REQUESTED_VERSION="${2:-}"; shift 2;;
     --archive) ARCHIVE="${2:-}"; shift 2;;
     --checksum) CHECKSUM_FILE="${2:-}"; shift 2;;
+    --local-source) LOCAL_SOURCE=1; shift;;
     --daemon) INSTALL_DAEMON=1; shift;;
     --accept-dangerous-mode) ACCEPT_CONSENT=1; shift;;
     --help|-h) usage; exit 0;;
@@ -74,9 +77,21 @@ sha256() {
   fi
 }
 
-SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
-if [ -z "$ARCHIVE" ] && [ -f "$SCRIPT_ROOT/VERSION" ] && [ -f "$SCRIPT_ROOT/lib/pro-gate-lib.sh" ]; then
-  SOURCE_ROOT="$SCRIPT_ROOT"
+if [ "$LOCAL_SOURCE" = 1 ]; then
+  [ -z "$ARCHIVE" ] || { echo "--local-source cannot be combined with --archive" >&2; exit 2; }
+  INSTALLER_SOURCE="${BASH_SOURCE[0]:-}"
+  [ -n "$INSTALLER_SOURCE" ] && [ -f "$INSTALLER_SOURCE" ] && [ ! -d "$INSTALLER_SOURCE" ] || {
+    echo "--local-source requires install.sh to be a real regular on-disk file" >&2
+    exit 2
+  }
+  INSTALLER_SOURCE="$(cd "$(dirname "$INSTALLER_SOURCE")" && pwd -P)/$(basename "$INSTALLER_SOURCE")"
+  SOURCE_ROOT="$(dirname "$INSTALLER_SOURCE")"
+  [ "$INSTALLER_SOURCE" = "$SOURCE_ROOT/install.sh" ] \
+    && [ -f "$SOURCE_ROOT/VERSION" ] \
+    && [ -f "$SOURCE_ROOT/lib/pro-gate-lib.sh" ] || {
+      echo "--local-source installer must be install.sh inside a complete source tree" >&2
+      exit 2
+    }
   LOCAL_VERSION="$(tr -d '[:space:]' < "$SOURCE_ROOT/VERSION")"
   [ -n "$REQUESTED_VERSION" ] || REQUESTED_VERSION="$LOCAL_VERSION"
   [ "$REQUESTED_VERSION" = "$LOCAL_VERSION" ] || { echo "requested $REQUESTED_VERSION but source is $LOCAL_VERSION" >&2; exit 1; }
@@ -153,23 +168,33 @@ printf '%s\n' "$REQUESTED_VERSION" > "$PRO_GATE_HOME/EXPECTED_VERSION.deploy.$$"
 mv -f "$PRO_GATE_HOME/EXPECTED_VERSION.deploy.$$" "$PRO_GATE_HOME/EXPECTED_VERSION"
 { pg_file_sig "$PRO_GATE_HOME/daemon.sh" "$PRO_GATE_HOME/lib.sh" "$PRO_GATE_HOME/run-daemon.sh" > "$PRO_GATE_HOME/.deploy-stamp.tmp" && mv -f "$PRO_GATE_HOME/.deploy-stamp.tmp" "$PRO_GATE_HOME/.deploy-stamp"; } 2>/dev/null || true
 render(){ sed -e "s#@HOME@#${HOME}#g" -e "s#@USER@#$(id -un)#g" "$1"; }
-if [ "$INSTALL_DAEMON" = 1 ]; then
-  case "$OS" in
-    macos)
-      PL="$HOME/Library/LaunchAgents/com.pro-gate.review-daemon.plist"
+case "$OS" in
+  macos)
+    PL="$HOME/Library/LaunchAgents/com.pro-gate.review-daemon.plist"
+    if [ "$INSTALL_DAEMON" = 1 ]; then
+      mkdir -p "$(dirname "$PL")"
       render "$SOURCE_ROOT/daemon/com.pro-gate.review-daemon.plist.tmpl" > "$PL"
       launchctl unload "$PL" 2>/dev/null || true
       launchctl load "$PL"
-      ;;
-    wsl|linux)
-      if [ "$SVC" = systemd ]; then
-        render "$SOURCE_ROOT/daemon/oracle-chrome.service.tmpl" | sudo tee /etc/systemd/system/oracle-chrome.service >/dev/null
+    else
+      launchctl unload "$PL" 2>/dev/null || true
+    fi
+    ;;
+  wsl|linux)
+    if [ "$SVC" = systemd ]; then
+      render "$SOURCE_ROOT/daemon/oracle-chrome.service.tmpl" | sudo tee /etc/systemd/system/oracle-chrome.service >/dev/null
+      if [ "$INSTALL_DAEMON" = 1 ]; then
         render "$SOURCE_ROOT/daemon/pro-review-daemon.service.tmpl" | sudo tee /etc/systemd/system/pro-review-daemon.service >/dev/null
-        sudo systemctl daemon-reload
-        sudo systemctl enable --now oracle-chrome.service pro-review-daemon.service
       fi
-      ;;
-  esac
-fi
+      sudo systemctl daemon-reload
+      sudo systemctl enable --now oracle-chrome.service
+      if [ "$INSTALL_DAEMON" = 1 ]; then
+        sudo systemctl enable --now pro-review-daemon.service
+      else
+        sudo systemctl disable --now pro-review-daemon.service 2>/dev/null || true
+      fi
+    fi
+    ;;
+esac
 DEPLOYING=0
 printf 'pro-gate runtime %s installed in %s (daemon: %s)\n' "$REQUESTED_VERSION" "$PRO_GATE_HOME" "$INSTALL_DAEMON"

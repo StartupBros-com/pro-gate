@@ -31,6 +31,47 @@ check "runtime install does not duplicate skill" test ! -e "$CLAUDE1/skills/pro-
 check "runtime install does not duplicate agent" test ! -e "$CLAUDE1/agents/oracle-reviewer.md"
 check "daemon defaults off" grep -q 'daemon: 0' "$TDIR/default.log"
 
+HOSTILE="$TDIR/hostile-cwd"; mkdir -p "$HOSTILE/lib"
+printf 'hostile\n' > "$HOSTILE/VERSION"
+printf 'exit 99\n' > "$HOSTILE/lib/pro-gate-lib.sh"
+if (cd "$HOSTILE" && PRO_GATE_HOME="$TDIR/piped-runtime" bash -s -- --version "$VERSION" < "$ROOT/install.sh") >"$TDIR/piped.log" 2>&1; then
+  echo "FAIL - piped installer does not infer hostile cwd source"; FAILS=$((FAILS + 1))
+else echo "ok - piped installer does not infer hostile cwd source"; fi
+check "piped installer did not execute hostile source" test ! -e "$TDIR/piped-runtime/VERSION"
+
+HOME_LOCAL="$TDIR/local-home"; RUNTIME_LOCAL="$TDIR/local-runtime"; mkdir -p "$HOME_LOCAL"
+HOME="$HOME_LOCAL" PRO_GATE_HOME="$RUNTIME_LOCAL" PRO_GATE_BROWSER_MODE=native \
+  bash "$ROOT/install.sh" --local-source --version "$VERSION" >"$TDIR/local.log" 2>&1
+check "explicit local source installs source tree" test "$(cat "$RUNTIME_LOCAL/VERSION")" = "$VERSION"
+if bash -s -- --local-source --version "$VERSION" < "$ROOT/install.sh" >"$TDIR/piped-local.log" 2>&1; then
+  echo "FAIL - piped local source is rejected"; FAILS=$((FAILS + 1))
+else echo "ok - piped local source is rejected"; fi
+check "piped local source names real file requirement" grep -q 'real regular on-disk file' "$TDIR/piped-local.log"
+
+SVC_BIN="$TDIR/service-bin"; SVC_LOG="$TDIR/service.log"; mkdir -p "$SVC_BIN"
+printf '#!/usr/bin/env bash\nprintf "sudo %%s\\n" "$*" >> "$SVC_LOG"\nif [ "$1" = tee ]; then cat >/dev/null; fi\n' > "$SVC_BIN/sudo"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$SVC_BIN/systemctl"
+chmod +x "$SVC_BIN/sudo" "$SVC_BIN/systemctl"
+HOME="$TDIR/service-home" PRO_GATE_HOME="$TDIR/service-runtime" SVC_LOG="$SVC_LOG" PATH="$SVC_BIN:$PATH" \
+  bash "$ROOT/install.sh" --local-source --version "$VERSION" >"$TDIR/service-install.log" 2>&1
+check "normal systemd install enables Chrome" grep -q 'systemctl enable --now oracle-chrome.service' "$SVC_LOG"
+check "normal systemd install disables daemon" grep -q 'systemctl disable --now pro-review-daemon.service' "$SVC_LOG"
+: > "$SVC_LOG"
+HOME="$TDIR/service-home" PRO_GATE_HOME="$TDIR/service-runtime" PRO_GATE_CONSENT_HOME="$TDIR/service-consent" \
+  SVC_LOG="$SVC_LOG" PATH="$SVC_BIN:$PATH" bash "$ROOT/install.sh" --local-source --version "$VERSION" \
+  --daemon --accept-dangerous-mode >"$TDIR/service-daemon.log" 2>&1
+check "daemon install independently enables Chrome" grep -q 'systemctl enable --now oracle-chrome.service' "$SVC_LOG"
+check "daemon install enables daemon service" grep -q 'systemctl enable --now pro-review-daemon.service' "$SVC_LOG"
+
+MAC_BIN="$TDIR/mac-bin"; MAC_LOG="$TDIR/mac.log"; mkdir -p "$MAC_BIN"
+printf '#!/usr/bin/env bash\nprintf "Darwin\\n"\n' > "$MAC_BIN/uname"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$MAC_LOG"\n' > "$MAC_BIN/launchctl"
+chmod +x "$MAC_BIN/uname" "$MAC_BIN/launchctl"
+HOME="$TDIR/mac-home" PRO_GATE_HOME="$TDIR/mac-runtime" MAC_LOG="$MAC_LOG" PATH="$MAC_BIN:$PATH" \
+  bash "$ROOT/install.sh" --local-source --version "$VERSION" >"$TDIR/mac-install.log" 2>&1
+check "macOS normal install unloads daemon" grep -q '^unload ' "$MAC_LOG"
+check "macOS has no separate Chrome service" sh -c "! grep -q oracle-chrome '$MAC_LOG'"
+
 printf 'sentinel\n' > "$RUNTIME1/oracle-review.sh"
 cp "$ARCHIVE" "$TDIR/tampered.tar.gz"; printf 'tampered\n' >> "$TDIR/tampered.tar.gz"
 if HOME="$HOME1" PRO_GATE_HOME="$RUNTIME1" bash "$ROOT/install.sh" --version "$VERSION" \
@@ -54,21 +95,38 @@ PRO_GATE_HOME="$RUNTIME3" PRO_GATE_EXPECTED_VERSION="$VERSION" PRO_GATE_CONSENT_
   PRO_GATE_BROWSER_MODE=native bash "$ROOT/bin/pro-gate-doctor.sh" >"$TDIR/doctor-consent.log" 2>&1 || true
 check "doctor reports matching exact release" grep -q "runtime version $VERSION matches plugin" "$TDIR/doctor-consent.log"
 check "doctor reports accepted disclosure" grep -q 'dangerous automatic-fixer disclosure accepted (consent v1)' "$TDIR/doctor-consent.log"
+printf '#!/usr/bin/env bash\nprintf "oracle-custom 7.8.9\\n"\n' > "$TDIR/oracle-custom"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$TIMEOUT_LOG"\nshift\n"$@"\n' > "$TDIR/timeout-custom"
+chmod +x "$TDIR/oracle-custom" "$TDIR/timeout-custom"
+TIMEOUT_LOG="$TDIR/timeout.log" PRO_GATE_ORACLE_BIN="$TDIR/oracle-custom" PRO_GATE_TIMEOUT_BIN="$TDIR/timeout-custom" \
+  PRO_GATE_HOME="$RUNTIME3" PRO_GATE_EXPECTED_VERSION="$VERSION" PRO_GATE_CONSENT_HOME="$CONSENT3" \
+  PRO_GATE_BROWSER_MODE=native bash "$ROOT/bin/pro-gate-doctor.sh" >"$TDIR/doctor-custom.log" 2>&1 || true
+check "doctor uses configured oracle for version" grep -q 'oracle installed (oracle-custom 7.8.9)' "$TDIR/doctor-custom.log"
+check "doctor uses configured timeout" grep -q "$TDIR/oracle-custom --version" "$TDIR/timeout.log"
+PRO_GATE_ORACLE_BIN="$TDIR/missing-oracle" PRO_GATE_TIMEOUT_BIN="$TDIR/missing-timeout" \
+  PRO_GATE_HOME="$RUNTIME3" PRO_GATE_BROWSER_MODE=native bash "$ROOT/bin/pro-gate-doctor.sh" >"$TDIR/doctor-missing-bin.log" 2>&1 || true
+check "doctor reports configured oracle missing" grep -q "configured oracle command missing: $TDIR/missing-oracle" "$TDIR/doctor-missing-bin.log"
+check "doctor reports configured timeout missing" grep -q "configured timeout command missing: $TDIR/missing-timeout" "$TDIR/doctor-missing-bin.log"
 HOME="$HOME3" PRO_GATE_HOME="$RUNTIME3" PRO_GATE_CONSENT_HOME="$CONSENT3" PRO_GATE_BROWSER_MODE=native \
   bash "$ROOT/daemon/daemon.sh" >"$TDIR/daemon-ok.log" 2>&1 & DPID=$!
 sleep 0.3
 check "valid consent passes daemon guard" kill -0 "$DPID"
 kill "$DPID" 2>/dev/null || true
-if HOME="$HOME3" PRO_GATE_HOME="$RUNTIME3" PRO_GATE_CONSENT_HOME="$CONSENT3" PRO_GATE_CONSENT_VERSION=2 \
-  PRO_GATE_BROWSER_MODE=native bash "$ROOT/daemon/daemon.sh" >"$TDIR/stale.log" 2>&1; then
-  echo "FAIL - stale consent blocks daemon"; FAILS=$((FAILS + 1))
-else echo "ok - stale consent blocks daemon"; fi
+HOME="$HOME3" PRO_GATE_HOME="$RUNTIME3" PRO_GATE_CONSENT_HOME="$CONSENT3" PRO_GATE_CONSENT_VERSION=2 \
+  PRO_REVIEW_OWNERS=fake PRO_REVIEW_POLL_SECONDS=1 PRO_GATE_BROWSER_MODE=native \
+  bash "$ROOT/daemon/daemon.sh" >"$TDIR/stale.log" 2>&1 & DPID=$!
+sleep 0.3
+check "stale consent globally defers without exiting" kill -0 "$DPID"
+check "stale consent does not charge per-PR failure" test ! -s "$RUNTIME3/failcount.tsv"
+kill "$DPID" 2>/dev/null || true
 printf '0.0.0\n' > "$RUNTIME3/EXPECTED_VERSION"
-if HOME="$HOME3" PRO_GATE_HOME="$RUNTIME3" PRO_GATE_CONSENT_HOME="$CONSENT3" PRO_GATE_BROWSER_MODE=native \
-  bash "$ROOT/daemon/daemon.sh" >"$TDIR/mismatch.log" 2>&1; then
-  echo "FAIL - runtime mismatch blocks daemon"; FAILS=$((FAILS + 1))
-else echo "ok - runtime mismatch blocks daemon"; fi
+HOME="$HOME3" PRO_GATE_HOME="$RUNTIME3" PRO_GATE_CONSENT_HOME="$CONSENT3" PRO_REVIEW_OWNERS=fake \
+  PRO_REVIEW_POLL_SECONDS=1 PRO_GATE_BROWSER_MODE=native bash "$ROOT/daemon/daemon.sh" >"$TDIR/mismatch.log" 2>&1 & DPID=$!
+sleep 0.3
+check "runtime mismatch globally defers without exiting" kill -0 "$DPID"
+kill "$DPID" 2>/dev/null || true
 check "mismatch route names exact release" grep -q 'exact plugin release' "$TDIR/mismatch.log"
+check "runtime mismatch is global deferred state" grep -q 'globally deferring PR processing' "$TDIR/mismatch.log"
 
 MISSING="$TDIR/missing-runtime"; mkdir -p "$MISSING"
 if PRO_GATE_HOME="$MISSING" PRO_GATE_EXPECTED_VERSION="$VERSION" bash "$ROOT/bin/pro-gate-doctor.sh" >"$TDIR/missing.log" 2>&1; then

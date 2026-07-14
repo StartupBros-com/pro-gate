@@ -71,6 +71,17 @@ current_release_id() {
   jq -er --arg name "$REPOSITORY" '.plugins[] | select(.name == $name) | (.metadata.releaseId // 0)' "$MARKETPLACE_MANIFEST"
 }
 
+marketplace_matches_release() {
+  jq -e \
+    --arg name "$REPOSITORY" \
+    --arg sha "$SOURCE_SHA" \
+    --arg version "$RELEASE_VERSION" \
+    --argjson release_id "$RELEASE_ID" \
+    --arg release_tag "$RELEASE_TAG" \
+    'any(.plugins[]; .name == $name and .source.sha == $sha and .metadata.version == $version and .metadata.releaseId == $release_id and .metadata.releaseTag == $release_tag)' \
+    "$MARKETPLACE_MANIFEST" >/dev/null
+}
+
 apply_marketplace_entry() {
   local output
   output="$(mktemp)"
@@ -95,12 +106,16 @@ validate_marketplace() {
   "$MARKETPLACE_VALIDATOR" "${MARKETPLACE_VALIDATION_MODE:-syntax}"
 }
 
-promote() {
+prepare_marketplace() {
   require MARKETPLACE_DIR
   MARKETPLACE_BRANCH="${MARKETPLACE_BRANCH:-main}"
   MARKETPLACE_MANIFEST="${MARKETPLACE_MANIFEST:-.claude-plugin/marketplace.json}"
   MARKETPLACE_VALIDATOR="${MARKETPLACE_VALIDATOR:-./scripts/validate-marketplace.sh}"
   cd "$MARKETPLACE_DIR"
+}
+
+promote() {
+  prepare_marketplace
 
   local attempt current
   for attempt in 1 2 3; do
@@ -116,20 +131,13 @@ promote() {
       return 2
     fi
     if (( RELEASE_ID == current )); then
-      if git diff --quiet "origin/$MARKETPLACE_BRANCH" -- "$MARKETPLACE_MANIFEST"; then
-        printf 'release %s is already promoted\n' "$RELEASE_ID"
-        return 0
-      fi
-      validate_marketplace
-      if git push origin "HEAD:$MARKETPLACE_BRANCH"; then
-        return 0
-      fi
-      printf 'promotion push attempt %s of 3 lost a race; retrying\n' "$attempt" >&2
-      continue
+      marketplace_matches_release || fail "marketplace release $RELEASE_ID has immutable metadata drift"
+      printf 'release %s is already promoted\n' "$RELEASE_ID"
+      return 0
     fi
 
     apply_marketplace_entry
-    validate_marketplace
+    validate_marketplace || return $?
     git add "$MARKETPLACE_MANIFEST"
     git commit -m "chore: promote $REPOSITORY $RELEASE_TAG"
     if git push origin "HEAD:$MARKETPLACE_BRANCH"; then
@@ -154,11 +162,7 @@ main() {
     printf 'prerelease or draft release ignored\n'
     return
   fi
-  if [[ "$EVENT_ACTION" == edited ]]; then
-    announce
-    return
-  fi
-  [[ "$EVENT_ACTION" == published ]] || fail "unsupported release action: $EVENT_ACTION"
+  [[ "$EVENT_ACTION" == published || "$EVENT_ACTION" == edited ]] || fail "unsupported release action: $EVENT_ACTION"
 
   require LATEST_STABLE_ID
   is_uint "$LATEST_STABLE_ID" || fail "LATEST_STABLE_ID must be an unsigned integer"
@@ -168,6 +172,22 @@ main() {
   fi
 
   RELEASE_VERSION="$(verify_release)"
+  if [[ "$EVENT_ACTION" == edited ]]; then
+    prepare_marketplace
+    git fetch origin "$MARKETPLACE_BRANCH" || fail 'could not fetch marketplace branch'
+    git rebase "origin/$MARKETPLACE_BRANCH" || fail 'could not synchronize marketplace for edited release'
+    local current
+    current="$(current_release_id)"
+    is_uint "$current" || fail "marketplace release marker is not numeric"
+    if (( RELEASE_ID == current )); then
+      marketplace_matches_release || fail "marketplace release $RELEASE_ID does not match the edited release tuple"
+      announce
+      return
+    fi
+    (( RELEASE_ID > current )) || fail "edited release $RELEASE_ID is older than marketplace marker $current"
+    cd "$SOURCE_ROOT"
+  fi
+
   if promote; then
     announce
   else

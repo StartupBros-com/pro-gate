@@ -59,16 +59,37 @@ assert_eq "$(wc -l < "$TMP/curl.log")" 1 'promotion announces once'
 env "${common[@]}" "$ROOT/scripts/release-train.sh" >/dev/null
 assert_eq "$(wc -l < "$TMP/curl.log")" 2 'rerun calls idempotent announce operation'
 
+printf '#!/usr/bin/env bash\nexit 23\n' > "$TMP/fail-validator"
+chmod +x "$TMP/fail-validator"
+git clone -q "$TMP/marketplace.git" "$TMP/invalid-marketplace"
+git -C "$TMP/invalid-marketplace" config user.email test@example.com
+git -C "$TMP/invalid-marketplace" config user.name Test
+if env "${common[@]}" RELEASE_ID=202 LATEST_STABLE_ID=202 \
+  MARKETPLACE_DIR="$TMP/invalid-marketplace" MARKETPLACE_VALIDATOR="$TMP/fail-validator" \
+  "$ROOT/scripts/release-train.sh" >/dev/null 2>&1; then
+  fail 'malformed marketplace validation failure was swallowed'
+else
+  pass 'malformed marketplace validation failure propagates'
+fi
+
+remote_check="$TMP/remote-check"
+git clone -q "$TMP/marketplace.git" "$remote_check"
+assert_eq "$(jq -r '.plugins[] | select(.name=="pro-gate") | .metadata.releaseId' "$remote_check/.claude-plugin/marketplace.json")" 201 'failed validation prevents marketplace push'
+
 env "${common[@]}" RELEASE_ID=200 LATEST_STABLE_ID=200 "$ROOT/scripts/release-train.sh" >/dev/null
 assert_eq "$(wc -l < "$TMP/curl.log")" 2 'older release no-op does not announce'
 
 env "${common[@]}" RELEASE_ID=202 LATEST_STABLE_ID=202 RELEASE_PRERELEASE=true "$ROOT/scripts/release-train.sh" >/dev/null
 assert_eq "$(wc -l < "$TMP/curl.log")" 2 'prerelease is ignored'
 
-env "${common[@]}" EVENT_ACTION=edited MARKETPLACE_DIR= "$ROOT/scripts/release-train.sh" >/dev/null
-assert_eq "$(wc -l < "$TMP/curl.log")" 3 'edited release announces without promotion'
+env "${common[@]}" EVENT_ACTION=edited "$ROOT/scripts/release-train.sh" >/dev/null
+assert_eq "$(wc -l < "$TMP/curl.log")" 3 'edited release announces when marketplace exactly matches'
 
-env "${common[@]}" EVENT_ACTION=edited RELEASE_PRERELEASE=true MARKETPLACE_DIR= "$ROOT/scripts/release-train.sh" >/dev/null
-assert_eq "$(wc -l < "$TMP/curl.log")" 3 'edited prerelease remains production no-op'
+env "${common[@]}" EVENT_ACTION=edited RELEASE_ID=202 LATEST_STABLE_ID=202 "$ROOT/scripts/release-train.sh" >/dev/null
+assert_eq "$(wc -l < "$TMP/curl.log")" 4 'newly stable edited release promotes and announces once'
+assert_eq "$(jq -r '.plugins[] | select(.name=="pro-gate") | .metadata.releaseId' "$TMP/marketplace/.claude-plugin/marketplace.json")" 202 'newly stable edited release advances marketplace'
+
+env "${common[@]}" EVENT_ACTION=edited RELEASE_PRERELEASE=true "$ROOT/scripts/release-train.sh" >/dev/null
+assert_eq "$(wc -l < "$TMP/curl.log")" 4 'edited prerelease remains production no-op'
 
 echo 'ALL PASS'
