@@ -21,6 +21,15 @@ jobs:
         with:
           ref: ${{ github.event.release.tag_name }}
           fetch-depth: 0
+          persist-credentials: false
+      - name: Require release commit on protected default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          git fetch origin "$DEFAULT_BRANCH"
+          release_sha="$(git rev-list -n 1 "$RELEASE_TAG")"
+          git merge-base --is-ancestor "$release_sha" "origin/$DEFAULT_BRANCH"
       - name: Provision pinned CI tools
         run: ./scripts/provision-ci-tools.sh
 

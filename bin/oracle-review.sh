@@ -278,8 +278,6 @@ if [ -n "$HARVEST_MARKER" ]; then
   esac
 fi
 
-pg_have oracle || { echo "ERROR: oracle not installed (pnpm add -g @steipete/oracle)" >&2; pg_status failed "oracle missing"; pg_finish 3; }
-
 # --- resolve repo + PR, assemble the diff (ground truth) ---
 PR_URL=""; PR_NUM=""
 if [ -n "$PR" ]; then
@@ -359,6 +357,13 @@ if [ "${DIFF_LINES:-0}" -gt "$DIFF_MAX_LINES" ] 2>/dev/null && [ "${PRO_GATE_DIF
   pg_finish 11
 elif [ "${DIFF_LINES:-0}" -gt "$DIFF_WARN_LINES" ] 2>/dev/null; then
   echo "[oracle-review] WARNING: diff is ${DIFF_LINES} lines (> ${DIFF_WARN_LINES}); large diffs risk exceeding the Pro review window: consider scoping with --diff to the unreviewed delta." >&2
+fi
+
+ORACLE_BIN="${PRO_GATE_ORACLE_BIN:-oracle}"
+if [[ "$ORACLE_BIN" == */* ]]; then
+  [ -x "$ORACLE_BIN" ] || { echo "ERROR: configured oracle executable not found: $ORACLE_BIN" >&2; pg_status failed "oracle missing"; pg_finish 3; }
+else
+  pg_have "$ORACLE_BIN" || { echo "ERROR: oracle not installed (pnpm add -g @steipete/oracle)" >&2; pg_status failed "oracle missing"; pg_finish 3; }
 fi
 
 # --- build the review prompt (the product) ---
@@ -589,7 +594,7 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
   local force_args=()
   [ "${attempt:-0}" -gt 0 ] && force_args+=(--force)
   ( stdbuf -oL -eL timeout --signal=TERM --kill-after=30 "$HARD_SECS" \
-      "${PRO_GATE_ORACLE_BIN:-oracle}" "${ENGINE_ARGS[@]}" -m "$MODEL" \
+      "$ORACLE_BIN" "${ENGINE_ARGS[@]}" -m "$MODEL" \
       --browser-model-strategy "$strategy" ${force_args[0]:+"${force_args[@]}"} \
       --slug "pro gate review pr ${PR_NUM:-diff}" \
       "${URL_ARGS[@]}" "${FILE_ARGS[@]}" \

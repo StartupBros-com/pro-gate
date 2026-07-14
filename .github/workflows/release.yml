@@ -16,6 +16,15 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
+          persist-credentials: false
+      - name: Require release commit on protected default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          git fetch origin "$DEFAULT_BRANCH"
+          release_sha="$(git rev-list -n 1 "$RELEASE_TAG")"
+          git merge-base --is-ancestor "$release_sha" "origin/$DEFAULT_BRANCH"
       - name: Provision pinned CI tools
         run: ./scripts/provision-ci-tools.sh
       - name: Require the tag to identify this full commit
