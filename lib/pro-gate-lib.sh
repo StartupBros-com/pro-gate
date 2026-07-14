@@ -33,6 +33,32 @@ pg_service_mgr() {
 
 pg_have() { command -v "$1" >/dev/null 2>&1; }
 
+pg_runtime_version() {
+  tr -d '[:space:]' < "$PRO_GATE_HOME/VERSION" 2>/dev/null || true
+}
+
+pg_expected_version() {
+  if [ -n "${PRO_GATE_EXPECTED_VERSION:-}" ]; then
+    printf '%s\n' "$PRO_GATE_EXPECTED_VERSION"
+  elif [ -f "$PRO_GATE_HOME/EXPECTED_VERSION" ]; then
+    tr -d '[:space:]' < "$PRO_GATE_HOME/EXPECTED_VERSION"
+  fi
+}
+
+pg_version_matches() {
+  local installed expected
+  installed="$(pg_runtime_version)"; expected="$(pg_expected_version)"
+  [ -n "$installed" ] && { [ -z "$expected" ] || [ "$installed" = "$expected" ]; }
+}
+
+pg_consent_version() { printf '%s\n' "${PRO_GATE_CONSENT_VERSION:-1}"; }
+pg_consent_file() { printf '%s/dangerous-mode-consent\n' "${PRO_GATE_CONSENT_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/pro-gate}"; }
+pg_dangerous_consent_ok() {
+  local recorded
+  recorded="$(tr -d '[:space:]' < "$(pg_consent_file)" 2>/dev/null || true)"
+  [ "$recorded" = "$(pg_consent_version)" ]
+}
+
 # Prepend likely locations of node/oracle/gh/jq so scripts work under a minimal
 # systemd/launchd PATH without hardcoding any version.
 pg_augment_path() {

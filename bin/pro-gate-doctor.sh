@@ -17,6 +17,21 @@ X(){ printf '  \033[31m✗\033[0m %s\n' "$*"; bad=$((bad+1)); }
 
 echo "pro-gate doctor — $OS (browser mode: $MODE, service: $SVC)"
 
+INSTALLED_VERSION="$(pg_runtime_version)"
+EXPECTED_VERSION="$(pg_expected_version)"
+if [ -z "$INSTALLED_VERSION" ]; then
+  X "runtime version record missing; install the exact plugin release with install.sh --version <plugin-version>"
+elif [ -n "$EXPECTED_VERSION" ] && [ "$INSTALLED_VERSION" != "$EXPECTED_VERSION" ]; then
+  X "runtime $INSTALLED_VERSION does not match plugin $EXPECTED_VERSION; exact-release setup required"
+else
+  P "runtime version ${INSTALLED_VERSION}${EXPECTED_VERSION:+ matches plugin}"
+fi
+if pg_dangerous_consent_ok; then
+  P "dangerous automatic-fixer disclosure accepted (consent v$(pg_consent_version))"
+else
+  W "daemon/dangerous mode disabled until operator consent v$(pg_consent_version) is recorded"
+fi
+
 # core deps
 pg_have oracle && P "oracle installed ($(oracle --version 2>/dev/null | head -1))" || X "oracle missing — pnpm add -g @steipete/oracle"
 # Version-skew signal (warn-only, offline-tolerant): oracle is deliberately

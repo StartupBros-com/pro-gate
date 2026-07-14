@@ -16,6 +16,22 @@ type pg_os >/dev/null 2>&1 || { echo "ERROR: pro-gate lib not found (lib.sh)" >&
 pg_augment_path; pg_load_env
 OS="$(pg_os)"; MODE="$(pg_browser_mode)"
 
+privileged_runtime_ready() {
+  local installed expected
+  installed="$(pg_runtime_version)"
+  expected="$(pg_expected_version)"
+  [ -n "$installed" ] || { echo "FATAL: runtime VERSION is missing; install the exact plugin release" >&2; return 1; }
+  [ -z "$expected" ] || [ "$installed" = "$expected" ] || {
+    echo "FATAL: runtime $installed does not match plugin $expected; install the exact plugin release" >&2
+    return 1
+  }
+  pg_dangerous_consent_ok || {
+    echo "FATAL: operator consent v$(pg_consent_version) is required before automatic fixer execution with --dangerously-skip-permissions" >&2
+    return 1
+  }
+}
+privileged_runtime_ready || exit 12
+
 # --- self-reload signal: `install.sh` writes a single atomic deploy stamp
 # ($PRO_GATE_HOME/.deploy-stamp) as the LAST step of a deploy, after every runtime file is in
 # place. The daemon records the stamp at startup and re-execs itself when it changes (see
@@ -171,6 +187,12 @@ process_pr(){
   local prompt="Run the /pro-gate skill for PR #${num} (${url}) in this repository in auto-fix mode: get the final-tier Pro review, sanity-check each P0/P1 finding against the actual code, apply the confirmed fixes on this branch, run available tests/lint, commit as 'fix(pro-gate): <summary>', push to origin/${branch}, and post ONE PR comment containing the full Pro review plus what you fixed. In the PR comment name the model from the run's status 'model' field (jq -r .model on the engine's <out>.status; role-based text when unreadable), never a hardcoded version, and if the status 'model_warn' field is non-empty include it as an advisory model-downgrade note.
 SYNCHRONOUS EXECUTION (critical): you are running headless: you will NOT receive any asynchronous background-task notification. After you launch the oracle review, you MUST poll its status file in a loop yourself: the engine writes single-line JSON to '<out>.status' at every phase change (poll it, e.g. repeatedly: sleep 60; cat the status file). Phase 'done' means read the --out file; 'failed'/'deferred'/'oversized' are terminal: report them, do NOT relaunch. Phase 'in-progress' means the model is STILL generating after the engine's budget: do NOT relaunch; wait 10 minutes, read the marker field from the status JSON, then run the deployed engine again as: \"\${PRO_GATE_HOME:-\$HOME/.pro-review-daemon}/oracle-review.sh\" --harvest '<marker>' --out '<out>' --timeout 20m (repeat while it exits 9; it spends no new quota). The oracle takes 10-30 minutes; that is expected. Do NOT end your turn, and do NOT say 'I will be notified', while the oracle is still running. Your turn is only complete once the PR comment has actually been posted.
 CRITICAL: do NOT merge the PR, do NOT open new PRs, do NOT change the base branch. Stop after pushing fixes and posting the comment. If no fixes are warranted, just post the review summary comment and stop."
+
+  if ! privileged_runtime_ready; then
+    git -C "$repodir" worktree remove --force "$wt" 2>/dev/null || true
+    note_fail "$nwo" "$num" "$sha" "$lg" "runtime version or consent guard failed"
+    return 1
+  fi
 
   ( cd "$wt" && timeout 5400 claude -p "$prompt" \
         --model "$CLAUDE_MODEL" \

@@ -16,6 +16,31 @@ attaches to the Xvfb Chrome). Verify setup any time with `pro-gate-doctor.sh`. (
 agent is a thin relay over the same engine for other pipelines — when the caller contract here
 changes, update `agents/oracle-reviewer.md` in the same PR.)
 
+## Runtime precheck
+
+Before every review, resolve this plugin's promoted version from
+`${CLAUDE_PLUGIN_ROOT}/.claude-plugin/plugin.json`, then run the doctor with that expectation:
+
+```bash
+PLUGIN_VERSION="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' \
+  "${CLAUDE_PLUGIN_ROOT}/.claude-plugin/plugin.json")"
+PRO_GATE_EXPECTED_VERSION="$PLUGIN_VERSION" \
+  "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/pro-gate-doctor.sh"
+```
+
+If the runtime or its `VERSION` record is missing, or the installed version differs, stop before
+running the engine. Route the operator to the exact matching release, never `latest`:
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/StartupBros-com/pro-gate/v${PLUGIN_VERSION}/install.sh?$(date +%s)" \
+  | bash -s -- --version "$PLUGIN_VERSION"
+```
+
+The plugin is the only owner of this skill and `agents/oracle-reviewer.md`; `install.sh` installs
+runtime files only. Do not copy either artifact into a global Claude skills or agents directory.
+Daemon and dangerous automatic-fixer execution remain disabled unless the operator separately accepts
+the versioned disclosure during installation.
+
 **Detached vs dead sessions — different rules:**
 - **Ground truth is the BROWSER, not oracle's log.** oracle can miss the thinking state after
   ChatGPT UI drift (seen 2026-07-02: it logged `no thinking status detected` for 10 min while the
@@ -49,8 +74,8 @@ changes, update `agents/oracle-reviewer.md` in the same PR.)
   oversized diff is refused up front (exit 11) instead of burning a slot it cannot convert.
 
 **Codex on Windows:** run the engine through WSL, not native PowerShell path syntax. Use WSL repo paths
-such as `/home/will/SITES/<repo>` and invoke commands with `wsl -e bash -lc '...'`; the default engine
-home is `/home/will/.pro-review-daemon`.
+such as `/home/<username>/SITES/<repo>` and invoke commands with `wsl -e bash -lc '...'`; the default
+engine home is `$HOME/.pro-review-daemon`.
 
 ## 1. Resolve target + mode
 

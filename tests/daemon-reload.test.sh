@@ -48,13 +48,19 @@ EXP="$(bash -c ". '$LIB'; pg_file_sig '$SBI/home/daemon.sh' '$SBI/home/lib.sh' '
 GOT="$(cat "$SBI/home/.deploy-stamp" 2>/dev/null || true)"
 check 'stamp == sig of deployed daemon code' "$([ -n "$GOT" ] && [ "$GOT" = "$EXP" ]; echo $?)" "got=$GOT exp=$EXP"
 check 'no leftover .deploy-stamp.tmp (atomic rename)' "$([ ! -e "$SBI/home/.deploy-stamp.tmp" ]; echo $?)" 'tmp left behind'
+check 'installer does not copy plugin-owned skill' "$([ ! -e "$SBI/claude/skills/pro-gate/SKILL.md" ]; echo $?)" 'duplicate skill installed'
+check 'installer does not copy plugin-owned agent' "$([ ! -e "$SBI/claude/agents/oracle-reviewer.md" ]; echo $?)" 'duplicate agent installed'
 
 echo '# integration: daemon re-execs itself in place when the deploy stamp changes'
 cp "$HERE/../daemon/daemon.sh"      "$TDIR/daemon.sh"
 cp "$HERE/../lib/pro-gate-lib.sh"   "$TDIR/lib.sh"
 cp "$HERE/../daemon/run-daemon.sh"  "$TDIR/run-daemon.sh"
 chmod +x "$TDIR/daemon.sh" "$TDIR/run-daemon.sh"
-mkdir -p "$TDIR/.local/bin" "$TDIR/logs"
+mkdir -p "$TDIR/.local/bin" "$TDIR/logs" "$TDIR/.config/pro-gate"
+RUNTIME_VERSION="$(tr -d '[:space:]' < "$HERE/../VERSION")"
+printf '%s\n' "$RUNTIME_VERSION" > "$TDIR/VERSION"
+printf '%s\n' "$RUNTIME_VERSION" > "$TDIR/EXPECTED_VERSION"
+printf '1\n' > "$TDIR/.config/pro-gate/dangerous-mode-consent"
 # Stub gh so the daemon finds no PRs and just idles through its poll loop (wins in PATH because
 # pg_augment_path prepends $HOME/.local/bin first, and HOME is pinned to $TDIR below).
 printf '#!/bin/sh\nexit 0\n' > "$TDIR/.local/bin/gh"; chmod +x "$TDIR/.local/bin/gh"

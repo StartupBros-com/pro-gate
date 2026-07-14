@@ -43,25 +43,39 @@ Two surfaces, one engine:
 
 ## Quickstart
 
+Install the `pro-gate` marketplace plugin first. The plugin is the sole owner of the skill and
+agent. Then install the runtime from the same exact promoted release:
+
 ```bash
-git clone https://github.com/StartupBros-com/pro-gate && cd pro-gate
-./install.sh                 # skill + engine (+ daemon on Linux; INSTALL_DAEMON=1 to add it on macOS)
-~/.pro-review-daemon/pro-gate-doctor.sh   # verify setup
+VERSION=<plugin-version>
+curl -fsSL "https://raw.githubusercontent.com/StartupBros-com/pro-gate/v${VERSION}/install.sh?$(date +%s)" \
+  | bash -s -- --version "$VERSION"
+PRO_GATE_EXPECTED_VERSION="$VERSION" ~/.pro-review-daemon/pro-gate-doctor.sh
 ```
 
-### macOS (oracle native — simplest)
-Oracle reuses your **signed-in Chrome** (Keychain cookie sync) — no Xvfb, no background service for
+The runtime installer never copies skill or agent files. It verifies the exact release archive and
+checksum, records the installed version, and leaves the daemon off on every platform.
+
+### macOS (oracle native, simplest)
+Oracle reuses your **signed-in Chrome** (Keychain cookie sync), with no Xvfb or background service for
 interactive use.
-1. `./install.sh`
-2. Open Chrome → sign into `chatgpt.com` (ensure your **Pro model** is selectable and **Settings → Apps →
+1. Install the plugin and exact matching runtime as above.
+2. Open Chrome and sign into `chatgpt.com` (ensure your **Pro model** is selectable and **Settings → Apps →
    GitHub** connector is enabled).
-3. `pro-gate-doctor.sh` → then `/pro-gate <pr>`.
-4. (optional) `INSTALL_DAEMON=1 ./install.sh` to add the launchd watcher.
+3. Run the doctor, then `/pro-gate <pr>`.
 
 ### WSL2 / Linux (headless Chrome under Xvfb)
-1. `./install.sh` (installs `oracle-chrome.service` + the daemon via systemd).
-2. `~/.pro-review-daemon/login-view.sh` → open `http://localhost:6080/vnc.html`, sign into ChatGPT Pro.
-3. `pro-gate-doctor.sh` → then `/pro-gate <pr>`.
+1. Install the plugin and exact matching runtime as above.
+2. To opt into the daemon, review the disclosure and rerun the exact installer with
+   `--daemon --accept-dangerous-mode`.
+3. `~/.pro-review-daemon/login-view.sh` → open `http://localhost:6080/vnc.html`, sign into ChatGPT Pro.
+4. Run the doctor, then `/pro-gate <pr>`.
+
+Daemon activation and dangerous automatic-fixer mode require versioned operator consent stored under
+`${XDG_CONFIG_HOME:-$HOME/.config}/pro-gate`, outside every target repository. The disclosure covers
+automatic fixer execution with `--dangerously-skip-permissions`. A consent-version change requires
+fresh acceptance. Remove legacy global copies under `~/.claude/skills/pro-gate` and
+`~/.claude/agents/oracle-reviewer.md` so marketplace discovery exposes exactly one copy.
 
 Set **`PRO_REVIEW_OWNERS`** in `~/.pro-review-daemon/.env` before using the daemon. See
 `docs/SETUP-NOTES.md` for mechanics + gotchas.
