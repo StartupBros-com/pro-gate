@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: check
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, ci]
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - name: Validate data and shell files
+        run: |
+          find . -path './.git' -prune -o -name '*.json' -print -exec jq empty {} \;
+          find . -path './.git' -prune -o \( -name '*.yaml' -o -name '*.yml' \) -print -exec yq eval '.' {} \; >/dev/null
+          find . -path './.git' -prune -o -name '*.sh' -print0 | xargs -0 shellcheck --severity=error
+      - name: Run tests
+        run: |
+          bash tests/engine.test.sh
+          bash tests/daemon-reload.test.sh
+          node --test tests/cdp-salvage.test.mjs
+          bash tests/distribution.test.sh
+          bash tests/release-train.test.sh
+
+  fork-check:
+    name: check
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Check out untrusted pull request
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - name: Parse plugin manifest without repository code
+        run: jq empty .claude-plugin/plugin.json
