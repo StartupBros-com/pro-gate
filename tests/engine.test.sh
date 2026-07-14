@@ -17,12 +17,6 @@ phase_of() { jq -r .phase "$1" 2>/dev/null || sed -nE 's/.*"phase":"([^"]+)".*/\
 TDIR="$(mktemp -d "${TMPDIR:-/tmp}/pg-engine-test.XXXXXX")"
 trap 'kill "${MOCK_PID:-0}" 2>/dev/null; rm -rf "$TDIR"' EXIT
 mkdir -p "$TDIR/home" "$TDIR/bin"
-cat > "$TDIR/bin/oracle-preflight" <<'FAKE_PREFLIGHT'
-#!/usr/bin/env bash
-printf 'unexpected generic oracle invocation\n' >&2
-exit 99
-FAKE_PREFLIGHT
-chmod +x "$TDIR/bin/oracle-preflight"
 
 start_mock() { # $1 = tab text file; sets MOCK_PID + PORT
   [ -n "${MOCK_PID:-}" ] && kill "$MOCK_PID" 2>/dev/null
@@ -35,7 +29,7 @@ start_mock() { # $1 = tab text file; sets MOCK_PID + PORT
 MARKER="pg-run-77-1700000000-11"
 run_engine() { # args... ; captures RC
   PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
-    PRO_GATE_SELF_HEAL=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" \
+    PRO_GATE_SELF_HEAL=0 \
     bash "$ENGINE" "$@" >"$TDIR/stdout" 2>"$TDIR/stderr"
   RC=$?
 }

@@ -11,7 +11,7 @@ permissions:
 jobs:
   check:
     name: trusted check
-    if: github.event_name == 'push' || (github.event.repository.private && github.event.pull_request.head.repo.full_name == github.repository)
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, ci]
     timeout-minutes: 20
     steps:
@@ -34,7 +34,7 @@ jobs:
 
   public-pr-check:
     name: public PR data check
-    if: github.event_name == 'pull_request' && (!github.event.repository.private || github.event.pull_request.head.repo.full_name != github.repository)
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
     permissions:
       contents: read
