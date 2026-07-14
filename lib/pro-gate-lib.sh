@@ -675,13 +675,18 @@ pg_is_review() {
 # is rejected so the caller falls through to a clean retry. Returns 0 on a usable salvage.
 pg_reattach_render() {
   local slug="$1" out="$2" t="${3:-150}" tmp="${2}.salvage"
-  pg_have oracle || return 1
+  local oracle_bin="${PRO_GATE_ORACLE_BIN:-oracle}" timeout_bin="${PRO_GATE_TIMEOUT_BIN:-timeout}"
+  if [[ "$oracle_bin" == */* ]]; then
+    [ -x "$oracle_bin" ] || return 1
+  else
+    pg_have "$oracle_bin" || return 1
+  fi
   [ -n "$slug" ] || return 1
   rm -f "$tmp"
-  if pg_have timeout; then
-    timeout "${t}s" oracle session "$slug" --harvest --write-output "$tmp" >/dev/null 2>&1 || true
+  if { [[ "$timeout_bin" == */* ]] && [ -x "$timeout_bin" ]; } || pg_have "$timeout_bin"; then
+    "$timeout_bin" "${t}s" "$oracle_bin" session "$slug" --harvest --write-output "$tmp" >/dev/null 2>&1 || true
   else
-    oracle session "$slug" --harvest --write-output "$tmp" >/dev/null 2>&1 || true
+    "$oracle_bin" session "$slug" --harvest --write-output "$tmp" >/dev/null 2>&1 || true
   fi
   if pg_is_review "$tmp"; then
     mv "$tmp" "$out"; return 0

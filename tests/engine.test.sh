@@ -205,6 +205,7 @@ echo '# primary run: hard cap -> live probe -> final salvage -> exit 9'
 mkdir -p "$TDIR/bin"
 cat > "$TDIR/bin/oracle" <<'FAKE_ORACLE'
 #!/usr/bin/env bash
+[ "${1:-}" = session ] && exit 1
 prompt=""; out=""
 while [ $# -gt 0 ]; do
   case "$1" in -p) prompt="$2"; shift 2;; --write-output) out="$2"; shift 2;; *) shift;; esac
@@ -215,8 +216,7 @@ printf 'run marker: %s\nReasoning continuously; no verdict yet.\n' "$marker" > "
 echo 'Launching browser mode'
 echo 'Acquired ChatGPT browser slot'
 echo 'Session: fake-primary-run'
-trap 'exit 124' TERM
-while :; do sleep 1; done
+exec sleep 30
 FAKE_ORACLE
 chmod +x "$TDIR/bin/oracle"
 printf 'waiting for fake submission\n' > "$TDIR/tab.txt"
@@ -385,6 +385,7 @@ echo '# U2/P1: realistic exit-9: oracle emits evidence ONLY at completion, so a 
 # and the run warns "cannot confirm" (this is what the earlier persist test's pre-sleep evidence masks).
 cat > "$TDIR/bin/oracle-lateev" <<'FAKE_LATE'
 #!/usr/bin/env bash
+[ "${1:-}" = session ] && exit 1
 prompt=""; out=""
 while [ $# -gt 0 ]; do case "$1" in -p) prompt="$2"; shift 2;; --write-output) out="$2"; shift 2;; *) shift;; esac; done
 marker="$(printf '%s' "$prompt" | sed -nE 's/.*run marker: (pg-run-[A-Za-z0-9.-]+).*/\1/p' | tail -1)"
@@ -392,8 +393,7 @@ printf 'run marker: %s\nReasoning continuously; no verdict yet.\n' "$marker" > "
 echo 'Launching browser mode'
 echo 'Acquired ChatGPT browser slot'
 echo 'Session: fake-lateev'
-trap 'exit 124' TERM
-while :; do sleep 1; done
+exec sleep 30
 # evidence only at completion (the watchdog kills the process long before this line):
 printf 'Model selection evidence: requested=Pro; resolved=GPT-5.6 Pro; status=already-selected; strategy=current; verified=no.\n'
 FAKE_LATE
