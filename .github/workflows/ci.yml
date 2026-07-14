@@ -17,6 +17,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - name: Provision pinned CI tools
+        run: ./scripts/provision-ci-tools.sh
       - name: Validate data and shell files
         run: |
           find . -path './.git' -prune -o -name '*.json' -print -exec jq empty {} \;

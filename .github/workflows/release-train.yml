@@ -21,6 +21,8 @@ jobs:
         with:
           ref: ${{ github.event.release.tag_name }}
           fetch-depth: 0
+      - name: Provision pinned CI tools
+        run: ./scripts/provision-ci-tools.sh
 
       - name: Resolve latest stable release
         id: stable

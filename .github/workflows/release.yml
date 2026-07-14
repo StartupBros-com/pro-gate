@@ -16,6 +16,8 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
+      - name: Provision pinned CI tools
+        run: ./scripts/provision-ci-tools.sh
       - name: Require the tag to identify this full commit
         env:
           RELEASE_TAG: ${{ github.ref_name }}
