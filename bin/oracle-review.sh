@@ -360,6 +360,12 @@ elif [ "${DIFF_LINES:-0}" -gt "$DIFF_WARN_LINES" ] 2>/dev/null; then
 fi
 
 ORACLE_BIN="${PRO_GATE_ORACLE_BIN:-oracle}"
+TIMEOUT_BIN="${PRO_GATE_TIMEOUT_BIN:-timeout}"
+if [[ "$TIMEOUT_BIN" == */* ]]; then
+  [ -x "$TIMEOUT_BIN" ] || { echo "ERROR: configured timeout executable not found: $TIMEOUT_BIN" >&2; pg_status failed "timeout missing"; pg_finish 3; }
+else
+  pg_have "$TIMEOUT_BIN" || { echo "ERROR: coreutils timeout not installed" >&2; pg_status failed "timeout missing"; pg_finish 3; }
+fi
 if [[ "$ORACLE_BIN" == */* ]]; then
   [ -x "$ORACLE_BIN" ] || { echo "ERROR: configured oracle executable not found: $ORACLE_BIN" >&2; pg_status failed "oracle missing"; pg_finish 3; }
 else
@@ -593,7 +599,7 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
   # escape hatch for this state.
   local force_args=()
   [ "${attempt:-0}" -gt 0 ] && force_args+=(--force)
-  ( stdbuf -oL -eL timeout --signal=TERM --kill-after=30 "$HARD_SECS" \
+  ( stdbuf -oL -eL "$TIMEOUT_BIN" --signal=TERM --kill-after=30 "$HARD_SECS" \
       "$ORACLE_BIN" "${ENGINE_ARGS[@]}" -m "$MODEL" \
       --browser-model-strategy "$strategy" ${force_args[0]:+"${force_args[@]}"} \
       --slug "pro gate review pr ${PR_NUM:-diff}" \
