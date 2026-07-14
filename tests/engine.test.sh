@@ -215,7 +215,8 @@ printf 'run marker: %s\nReasoning continuously; no verdict yet.\n' "$marker" > "
 echo 'Launching browser mode'
 echo 'Acquired ChatGPT browser slot'
 echo 'Session: fake-primary-run'
-sleep 30
+trap 'exit 124' TERM
+while :; do sleep 1; done
 FAKE_ORACLE
 chmod +x "$TDIR/bin/oracle"
 printf 'waiting for fake submission\n' > "$TDIR/tab.txt"
@@ -391,7 +392,8 @@ printf 'run marker: %s\nReasoning continuously; no verdict yet.\n' "$marker" > "
 echo 'Launching browser mode'
 echo 'Acquired ChatGPT browser slot'
 echo 'Session: fake-lateev'
-sleep 30
+trap 'exit 124' TERM
+while :; do sleep 1; done
 # evidence only at completion (the watchdog kills the process long before this line):
 printf 'Model selection evidence: requested=Pro; resolved=GPT-5.6 Pro; status=already-selected; strategy=current; verified=no.\n'
 FAKE_LATE
