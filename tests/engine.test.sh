@@ -17,6 +17,14 @@ phase_of() { jq -r .phase "$1" 2>/dev/null || sed -nE 's/.*"phase":"([^"]+)".*/\
 TDIR="$(mktemp -d "${TMPDIR:-/tmp}/pg-engine-test.XXXXXX")"
 trap 'kill "${MOCK_PID:-0}" 2>/dev/null; rm -rf "$TDIR"' EXIT
 mkdir -p "$TDIR/home" "$TDIR/bin"
+
+# Self-hosted runners may export operator overrides. The fixture supplies every setting it needs,
+# so inherited runtime configuration must not redirect state, browser probes, or timing behavior.
+while IFS='=' read -r name _; do
+  case "$name" in PRO_GATE_*|ORACLE_*) unset "$name" ;; esac
+done < <(env)
+export PRO_GATE_MIN_AVAIL_MB=0 PRO_GATE_MAX_SWAP_PCT=101
+
 cat > "$TDIR/bin/oracle-preflight" <<'FAKE_PREFLIGHT'
 #!/usr/bin/env bash
 printf 'unexpected generic oracle invocation\n' >&2
