@@ -9,6 +9,18 @@ type pg_os >/dev/null 2>&1 || { echo "ERROR: lib.sh not found"; exit 1; }
 pg_augment_path; pg_load_env
 OS="$(pg_os)"; MODE="$(pg_browser_mode)"; SVC="$(pg_service_mgr)"
 PORT="${ORACLE_BROWSER_PORT:-9222}"
+ORACLE_BIN="${PRO_GATE_ORACLE_BIN:-oracle}"
+TIMEOUT_BIN="${PRO_GATE_TIMEOUT_BIN:-timeout}"
+
+have_bin() {
+  case "$1" in
+    */*) [ -x "$1" ] ;;
+    *) pg_have "$1" ;;
+  esac
+}
+run_bounded() {
+  if have_bin "$TIMEOUT_BIN"; then "$TIMEOUT_BIN" "$@"; else return 127; fi
+}
 
 ok=0; warn=0; bad=0
 P(){ printf '  \033[32m✓\033[0m %s\n' "$*"; ok=$((ok+1)); }
@@ -17,15 +29,38 @@ X(){ printf '  \033[31m✗\033[0m %s\n' "$*"; bad=$((bad+1)); }
 
 echo "pro-gate doctor — $OS (browser mode: $MODE, service: $SVC)"
 
+INSTALLED_VERSION="$(pg_runtime_version)"
+EXPECTED_VERSION="$(pg_expected_version)"
+if [ -z "$INSTALLED_VERSION" ]; then
+  X "runtime version record missing; install the exact plugin release with install.sh --version <plugin-version>"
+elif [ -n "$EXPECTED_VERSION" ] && [ "$INSTALLED_VERSION" != "$EXPECTED_VERSION" ]; then
+  X "runtime $INSTALLED_VERSION does not match plugin $EXPECTED_VERSION; exact-release setup required"
+else
+  P "runtime version ${INSTALLED_VERSION}${EXPECTED_VERSION:+ matches plugin}"
+fi
+if pg_dangerous_consent_ok; then
+  P "dangerous automatic-fixer disclosure accepted (consent v$(pg_consent_version))"
+else
+  W "daemon/dangerous mode disabled until operator consent v$(pg_consent_version) is recorded"
+fi
+
 # core deps
-pg_have oracle && P "oracle installed ($(oracle --version 2>/dev/null | head -1))" || X "oracle missing — pnpm add -g @steipete/oracle"
+if ! have_bin "$TIMEOUT_BIN"; then
+  X "configured timeout command missing: $TIMEOUT_BIN"
+fi
+if have_bin "$ORACLE_BIN"; then
+  ORACLE_VERSION="$(run_bounded 5 "$ORACLE_BIN" --version 2>/dev/null | head -1 || true)"
+  P "oracle installed${ORACLE_VERSION:+ ($ORACLE_VERSION)}"
+else
+  X "configured oracle command missing: $ORACLE_BIN"
+fi
 # Version-skew signal (warn-only, offline-tolerant): oracle is deliberately
 # pinned (UI-automation updates are themselves a break risk), but a newer
 # release often means upstream fixed ChatGPT UI drift. Upgrade DELIBERATELY
 # when reviews misbehave, never automatically.
-if pg_have oracle && pg_have npm; then
-  ORACLE_LOCAL="$(oracle --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
-  ORACLE_LATEST="$(timeout 10 npm view @steipete/oracle version 2>/dev/null || true)"
+if have_bin "$ORACLE_BIN" && have_bin "$TIMEOUT_BIN" && pg_have npm; then
+  ORACLE_LOCAL="$(run_bounded 5 "$ORACLE_BIN" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+  ORACLE_LATEST="$(run_bounded 10 npm view @steipete/oracle version 2>/dev/null || true)"
   if [ -n "$ORACLE_LATEST" ] && [ -n "$ORACLE_LOCAL" ] && [ "$ORACLE_LATEST" != "$ORACLE_LOCAL" ]; then
     W "oracle $ORACLE_LOCAL installed, $ORACLE_LATEST published — upgrade deliberately (pnpm add -g @steipete/oracle) if reviews misbehave"
   elif [ -n "$ORACLE_LATEST" ]; then

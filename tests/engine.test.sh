@@ -16,7 +16,21 @@ phase_of() { jq -r .phase "$1" 2>/dev/null || sed -nE 's/.*"phase":"([^"]+)".*/\
 
 TDIR="$(mktemp -d "${TMPDIR:-/tmp}/pg-engine-test.XXXXXX")"
 trap 'kill "${MOCK_PID:-0}" 2>/dev/null; rm -rf "$TDIR"' EXIT
-mkdir -p "$TDIR/home"
+mkdir -p "$TDIR/home" "$TDIR/bin" "$TDIR/user/.local/bin"
+
+# Self-hosted runners may export operator overrides. The fixture supplies every setting it needs,
+# so inherited runtime configuration must not redirect state, browser probes, or timing behavior.
+while IFS='=' read -r name _; do
+  case "$name" in PRO_GATE_*|ORACLE_*) unset "$name" ;; esac
+done < <(env)
+export PRO_GATE_MIN_AVAIL_MB=0 PRO_GATE_MAX_SWAP_PCT=101 PRO_GATE_TIMEOUT_BIN=/usr/bin/timeout
+
+cat > "$TDIR/bin/oracle-preflight" <<'FAKE_PREFLIGHT'
+#!/usr/bin/env bash
+printf 'unexpected generic oracle invocation\n' >&2
+exit 99
+FAKE_PREFLIGHT
+chmod +x "$TDIR/bin/oracle-preflight"
 
 start_mock() { # $1 = tab text file; sets MOCK_PID + PORT
   [ -n "${MOCK_PID:-}" ] && kill "$MOCK_PID" 2>/dev/null
@@ -29,7 +43,8 @@ start_mock() { # $1 = tab text file; sets MOCK_PID + PORT
 MARKER="pg-run-77-1700000000-11"
 run_engine() { # args... ; captures RC
   PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
-    PRO_GATE_SELF_HEAL=0 bash "$ENGINE" "$@" >"$TDIR/stdout" 2>"$TDIR/stderr"
+    PRO_GATE_SELF_HEAL=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" \
+    bash "$ENGINE" "$@" >"$TDIR/stdout" 2>"$TDIR/stderr"
   RC=$?
 }
 
@@ -43,6 +58,9 @@ check 'oversized status phase' "$([ "$(phase_of "$TDIR/o-big.md.status")" = over
 check 'oversized spends nothing' "$([ ! -s "$TDIR/o-big.md" ]; echo $?)" 'out file exists'
 
 echo '# harvest: still generating'
+run_engine --harvest '' --out "$TDIR/o-empty.md" --timeout 5s
+check 'empty harvest marker exits 2' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC $(cat "$TDIR/stderr")"
+check 'empty harvest marker cannot start a fresh review' "$([ ! -e "$TDIR/o-empty.md.status" ]; echo $?)" 'status file created'
 run_engine --harvest "$MARKER" --out "$TDIR/o-h1.md" --timeout 5s
 check 'harvest in-progress exits 9' "$([ "$RC" -eq 9 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
 check 'harvest in-progress phase' "$([ "$(phase_of "$TDIR/o-h1.md.status")" = in-progress ]; echo $?)" "$(cat "$TDIR/o-h1.md.status" 2>/dev/null)"
@@ -190,6 +208,7 @@ echo '# primary run: hard cap -> live probe -> final salvage -> exit 9'
 mkdir -p "$TDIR/bin"
 cat > "$TDIR/bin/oracle" <<'FAKE_ORACLE'
 #!/usr/bin/env bash
+[ "${1:-}" = session ] && exit 1
 prompt=""; out=""
 while [ $# -gt 0 ]; do
   case "$1" in -p) prompt="$2"; shift 2;; --write-output) out="$2"; shift 2;; *) shift;; esac
@@ -200,7 +219,7 @@ printf 'run marker: %s\nReasoning continuously; no verdict yet.\n' "$marker" > "
 echo 'Launching browser mode'
 echo 'Acquired ChatGPT browser slot'
 echo 'Session: fake-primary-run'
-sleep 30
+exec sleep 30
 FAKE_ORACLE
 chmod +x "$TDIR/bin/oracle"
 printf 'waiting for fake submission\n' > "$TDIR/tab.txt"
@@ -369,6 +388,7 @@ echo '# U2/P1: realistic exit-9: oracle emits evidence ONLY at completion, so a 
 # and the run warns "cannot confirm" (this is what the earlier persist test's pre-sleep evidence masks).
 cat > "$TDIR/bin/oracle-lateev" <<'FAKE_LATE'
 #!/usr/bin/env bash
+[ "${1:-}" = session ] && exit 1
 prompt=""; out=""
 while [ $# -gt 0 ]; do case "$1" in -p) prompt="$2"; shift 2;; --write-output) out="$2"; shift 2;; *) shift;; esac; done
 marker="$(printf '%s' "$prompt" | sed -nE 's/.*run marker: (pg-run-[A-Za-z0-9.-]+).*/\1/p' | tail -1)"
@@ -376,7 +396,7 @@ printf 'run marker: %s\nReasoning continuously; no verdict yet.\n' "$marker" > "
 echo 'Launching browser mode'
 echo 'Acquired ChatGPT browser slot'
 echo 'Session: fake-lateev'
-sleep 30
+exec sleep 30
 # evidence only at completion (the watchdog kills the process long before this line):
 printf 'Model selection evidence: requested=Pro; resolved=GPT-5.6 Pro; status=already-selected; strategy=current; verified=no.\n'
 FAKE_LATE

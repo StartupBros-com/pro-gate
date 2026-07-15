@@ -1,0 +1,57 @@
+name: Release runtime
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require release commit on protected default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          git fetch origin "$DEFAULT_BRANCH"
+          release_sha="$(git rev-list -n 1 "$RELEASE_TAG")"
+          git merge-base --is-ancestor "$release_sha" "origin/$DEFAULT_BRANCH"
+      - name: Provision pinned CI tools
+        run: ./scripts/provision-ci-tools.sh
+      - name: Require the tag to identify this full commit
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          test "$(git rev-list -n 1 "$RELEASE_TAG")" = "$RELEASE_SHA"
+          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+      - name: Validate shell syntax
+        run: |
+          while IFS= read -r file; do bash -n "$file"; done < <(find . -type f -name '*.sh' -print)
+      - name: Run tests
+        run: |
+          bash tests/engine.test.sh
+          bash tests/daemon-reload.test.sh
+          node --test tests/cdp-salvage.test.mjs
+          bash tests/distribution.test.sh
+          bash tests/release-train.test.sh
+          bash tests/release-assets.test.sh
+      - name: Package exact runtime release
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: scripts/package-runtime.sh
+      - name: Verify published checksum
+        run: sha256sum -c "dist/pro-gate-runtime-$(tr -d '[:space:]' < VERSION).tar.gz.sha256"
+      - name: Upload, verify, and publish exact release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/publish-runtime-release.sh

@@ -1,0 +1,91 @@
+name: Release train
+
+on:
+  release:
+    types: [published, edited]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-train-pro-gate
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    if: github.event.release.draft == false
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out release commit
+        uses: actions/checkout@ac593985615ec2ede58e132d2e21d2b1cbd6127c
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require release commit on protected default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          git fetch origin "$DEFAULT_BRANCH"
+          release_sha="$(git rev-list -n 1 "$RELEASE_TAG")"
+          git merge-base --is-ancestor "$release_sha" "origin/$DEFAULT_BRANCH"
+      - name: Provision pinned CI tools
+        run: ./scripts/provision-ci-tools.sh
+
+      - name: Resolve latest stable release
+        id: stable
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          latest_id="$(./scripts/latest-stable-release.sh "$GITHUB_REPOSITORY")"
+          test -n "$latest_id"
+          echo "id=$latest_id" >> "$GITHUB_OUTPUT"
+
+      - name: Download runtime release assets
+        if: github.event.release.prerelease == false
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          mkdir -p release-assets
+          gh release download "$RELEASE_TAG" --dir release-assets --pattern 'pro-gate-runtime-*'
+
+      - name: Check out marketplace
+        if: github.event.release.prerelease == false
+        uses: actions/checkout@ac593985615ec2ede58e132d2e21d2b1cbd6127c
+        with:
+          repository: StartupBros-com/hov-marketplace
+          token: ${{ secrets.HOV_MARKETPLACE_PAT }}
+          path: hov-marketplace
+          fetch-depth: 0
+
+      - name: Configure marketplace git identity
+        if: github.event.release.prerelease == false
+        working-directory: hov-marketplace
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: Promote release and announce
+        env:
+          EVENT_ACTION: ${{ github.event.action }}
+          REPOSITORY: pro-gate
+          RELEASE_ID: ${{ github.event.release.id }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_NAME: ${{ github.event.release.name || github.event.release.tag_name }}
+          RELEASE_URL: ${{ github.event.release.html_url }}
+          RELEASE_NOTES: ${{ github.event.release.body }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+          RELEASE_DRAFT: ${{ github.event.release.draft }}
+          LATEST_STABLE_ID: ${{ steps.stable.outputs.id }}
+          SOURCE_ROOT: ${{ github.workspace }}
+          ASSET_DIR: ${{ github.workspace }}/release-assets
+          MARKETPLACE_DIR: ${{ github.workspace }}/hov-marketplace
+          MARKETPLACE_VALIDATION_MODE: ${{ vars.HOV_MARKETPLACE_VALIDATION_MODE || 'syntax' }}
+          ANNOUNCE_URL: ${{ vars.TOOL_RELEASE_ANNOUNCE_URL }}
+          ANNOUNCE_SECRET: ${{ secrets.TOOL_RELEASE_ANNOUNCE_SECRET }}
+        run: |
+          source_sha="$(git rev-list -n 1 "$RELEASE_TAG")"
+          export SOURCE_SHA="$source_sha"
+          ./scripts/release-train.sh

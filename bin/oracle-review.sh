@@ -29,7 +29,7 @@ pg_augment_path
 pg_load_env
 OS="$(pg_os)"; MODE="$(pg_browser_mode)"
 
-PR=""; REPO=""; DIFF_FILE=""; INPUT="both"; OUT=""; TIMEOUT="30m"; EXTRA_GLOB=""; HARVEST_MARKER=""
+PR=""; REPO=""; DIFF_FILE=""; INPUT="both"; OUT=""; TIMEOUT="30m"; EXTRA_GLOB=""; HARVEST_MARKER=""; HARVEST_REQUESTED=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --pr) PR="$2"; shift 2;;
@@ -39,10 +39,14 @@ while [ $# -gt 0 ]; do
     --out) OUT="$2"; shift 2;;
     --timeout) TIMEOUT="$2"; shift 2;;
     --extra-files) EXTRA_GLOB="$2"; shift 2;;
-    --harvest) HARVEST_MARKER="$2"; shift 2;;
+    --harvest) HARVEST_REQUESTED=1; HARVEST_MARKER="${2:-}"; shift 2;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
+if [ "$HARVEST_REQUESTED" = 1 ] && [ -z "$HARVEST_MARKER" ]; then
+  echo "ERROR: --harvest requires a non-empty run marker" >&2
+  exit 2
+fi
 
 PORT="${ORACLE_BROWSER_PORT:-9222}"
 MODEL="${ORACLE_MODEL:-gpt-5.5-pro}"
@@ -278,8 +282,6 @@ if [ -n "$HARVEST_MARKER" ]; then
   esac
 fi
 
-pg_have oracle || { echo "ERROR: oracle not installed (pnpm add -g @steipete/oracle)" >&2; pg_status failed "oracle missing"; pg_finish 3; }
-
 # --- resolve repo + PR, assemble the diff (ground truth) ---
 PR_URL=""; PR_NUM=""
 if [ -n "$PR" ]; then
@@ -359,6 +361,19 @@ if [ "${DIFF_LINES:-0}" -gt "$DIFF_MAX_LINES" ] 2>/dev/null && [ "${PRO_GATE_DIF
   pg_finish 11
 elif [ "${DIFF_LINES:-0}" -gt "$DIFF_WARN_LINES" ] 2>/dev/null; then
   echo "[oracle-review] WARNING: diff is ${DIFF_LINES} lines (> ${DIFF_WARN_LINES}); large diffs risk exceeding the Pro review window: consider scoping with --diff to the unreviewed delta." >&2
+fi
+
+ORACLE_BIN="${PRO_GATE_ORACLE_BIN:-oracle}"
+TIMEOUT_BIN="${PRO_GATE_TIMEOUT_BIN:-timeout}"
+if [[ "$TIMEOUT_BIN" == */* ]]; then
+  [ -x "$TIMEOUT_BIN" ] || { echo "ERROR: configured timeout executable not found: $TIMEOUT_BIN" >&2; pg_status failed "timeout missing"; pg_finish 3; }
+else
+  pg_have "$TIMEOUT_BIN" || { echo "ERROR: coreutils timeout not installed" >&2; pg_status failed "timeout missing"; pg_finish 3; }
+fi
+if [[ "$ORACLE_BIN" == */* ]]; then
+  [ -x "$ORACLE_BIN" ] || { echo "ERROR: configured oracle executable not found: $ORACLE_BIN" >&2; pg_status failed "oracle missing"; pg_finish 3; }
+else
+  pg_have "$ORACLE_BIN" || { echo "ERROR: oracle not installed (pnpm add -g @steipete/oracle)" >&2; pg_status failed "oracle missing"; pg_finish 3; }
 fi
 
 # --- build the review prompt (the product) ---
@@ -588,8 +603,8 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
   # escape hatch for this state.
   local force_args=()
   [ "${attempt:-0}" -gt 0 ] && force_args+=(--force)
-  ( stdbuf -oL -eL timeout --signal=TERM --kill-after=30 "$HARD_SECS" \
-      "${PRO_GATE_ORACLE_BIN:-oracle}" "${ENGINE_ARGS[@]}" -m "$MODEL" \
+  ( stdbuf -oL -eL "$TIMEOUT_BIN" --signal=TERM --kill-after=30 "$HARD_SECS" \
+      "$ORACLE_BIN" "${ENGINE_ARGS[@]}" -m "$MODEL" \
       --browser-model-strategy "$strategy" ${force_args[0]:+"${force_args[@]}"} \
       --slug "pro gate review pr ${PR_NUM:-diff}" \
       "${URL_ARGS[@]}" "${FILE_ARGS[@]}" \

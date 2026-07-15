@@ -25,6 +25,12 @@ pg_browser_mode() {
 
 # service manager for the daemon: launchd (macOS) | systemd (linux/wsl with systemctl) | none
 pg_service_mgr() {
+  if [ -n "${PRO_GATE_SERVICE_MANAGER:-}" ]; then
+    case "$PRO_GATE_SERVICE_MANAGER" in
+      launchd|systemd|none) echo "$PRO_GATE_SERVICE_MANAGER"; return ;;
+      *) echo "invalid PRO_GATE_SERVICE_MANAGER: $PRO_GATE_SERVICE_MANAGER" >&2; return 1 ;;
+    esac
+  fi
   case "$(pg_os)" in
     macos) echo launchd ;;
     *)     command -v systemctl >/dev/null 2>&1 && echo systemd || echo none ;;
@@ -32,6 +38,32 @@ pg_service_mgr() {
 }
 
 pg_have() { command -v "$1" >/dev/null 2>&1; }
+
+pg_runtime_version() {
+  tr -d '[:space:]' < "$PRO_GATE_HOME/VERSION" 2>/dev/null || true
+}
+
+pg_expected_version() {
+  if [ -n "${PRO_GATE_EXPECTED_VERSION:-}" ]; then
+    printf '%s\n' "$PRO_GATE_EXPECTED_VERSION"
+  elif [ -f "$PRO_GATE_HOME/EXPECTED_VERSION" ]; then
+    tr -d '[:space:]' < "$PRO_GATE_HOME/EXPECTED_VERSION"
+  fi
+}
+
+pg_version_matches() {
+  local installed expected
+  installed="$(pg_runtime_version)"; expected="$(pg_expected_version)"
+  [ -n "$installed" ] && { [ -z "$expected" ] || [ "$installed" = "$expected" ]; }
+}
+
+pg_consent_version() { printf '%s\n' "${PRO_GATE_CONSENT_VERSION:-1}"; }
+pg_consent_file() { printf '%s/dangerous-mode-consent\n' "${PRO_GATE_CONSENT_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/pro-gate}"; }
+pg_dangerous_consent_ok() {
+  local recorded
+  recorded="$(tr -d '[:space:]' < "$(pg_consent_file)" 2>/dev/null || true)"
+  [ "$recorded" = "$(pg_consent_version)" ]
+}
 
 # Prepend likely locations of node/oracle/gh/jq so scripts work under a minimal
 # systemd/launchd PATH without hardcoding any version.
@@ -649,13 +681,18 @@ pg_is_review() {
 # is rejected so the caller falls through to a clean retry. Returns 0 on a usable salvage.
 pg_reattach_render() {
   local slug="$1" out="$2" t="${3:-150}" tmp="${2}.salvage"
-  pg_have oracle || return 1
+  local oracle_bin="${PRO_GATE_ORACLE_BIN:-oracle}" timeout_bin="${PRO_GATE_TIMEOUT_BIN:-timeout}"
+  if [[ "$oracle_bin" == */* ]]; then
+    [ -x "$oracle_bin" ] || return 1
+  else
+    pg_have "$oracle_bin" || return 1
+  fi
   [ -n "$slug" ] || return 1
   rm -f "$tmp"
-  if pg_have timeout; then
-    timeout "${t}s" oracle session "$slug" --harvest --write-output "$tmp" >/dev/null 2>&1 || true
+  if { [[ "$timeout_bin" == */* ]] && [ -x "$timeout_bin" ]; } || pg_have "$timeout_bin"; then
+    "$timeout_bin" "${t}s" "$oracle_bin" session "$slug" --harvest --write-output "$tmp" >/dev/null 2>&1 || true
   else
-    oracle session "$slug" --harvest --write-output "$tmp" >/dev/null 2>&1 || true
+    "$oracle_bin" session "$slug" --harvest --write-output "$tmp" >/dev/null 2>&1 || true
   fi
   if pg_is_review "$tmp"; then
     mv "$tmp" "$out"; return 0
