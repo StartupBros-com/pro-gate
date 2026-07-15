@@ -28,6 +28,7 @@ jobs:
         run: |
           bash tests/engine.test.sh
           bash tests/daemon-reload.test.sh
+          bash tests/browser-launch.test.sh
           node --test tests/cdp-salvage.test.mjs
           bash tests/distribution.test.sh
           bash tests/release-train.test.sh
