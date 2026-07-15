@@ -56,7 +56,7 @@ jobs:
         uses: actions/checkout@ac593985615ec2ede58e132d2e21d2b1cbd6127c
         with:
           repository: StartupBros-com/hov-marketplace
-          token: ${{ secrets.HOV_MARKETPLACE_PAT }}
+          ssh-key: ${{ secrets.HOV_MARKETPLACE_DEPLOY_KEY }}
           path: hov-marketplace
           fetch-depth: 0
 
