@@ -29,7 +29,7 @@ pg_augment_path
 pg_load_env
 OS="$(pg_os)"; MODE="$(pg_browser_mode)"
 
-PR=""; REPO=""; DIFF_FILE=""; INPUT="both"; OUT=""; TIMEOUT="30m"; EXTRA_GLOB=""; HARVEST_MARKER=""
+PR=""; REPO=""; DIFF_FILE=""; INPUT="both"; OUT=""; TIMEOUT="30m"; EXTRA_GLOB=""; HARVEST_MARKER=""; HARVEST_REQUESTED=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --pr) PR="$2"; shift 2;;
@@ -39,10 +39,14 @@ while [ $# -gt 0 ]; do
     --out) OUT="$2"; shift 2;;
     --timeout) TIMEOUT="$2"; shift 2;;
     --extra-files) EXTRA_GLOB="$2"; shift 2;;
-    --harvest) HARVEST_MARKER="$2"; shift 2;;
+    --harvest) HARVEST_REQUESTED=1; HARVEST_MARKER="${2:-}"; shift 2;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
+if [ "$HARVEST_REQUESTED" = 1 ] && [ -z "$HARVEST_MARKER" ]; then
+  echo "ERROR: --harvest requires a non-empty run marker" >&2
+  exit 2
+fi
 
 PORT="${ORACLE_BROWSER_PORT:-9222}"
 MODEL="${ORACLE_MODEL:-gpt-5.5-pro}"

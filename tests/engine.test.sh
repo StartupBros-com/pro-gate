@@ -58,6 +58,9 @@ check 'oversized status phase' "$([ "$(phase_of "$TDIR/o-big.md.status")" = over
 check 'oversized spends nothing' "$([ ! -s "$TDIR/o-big.md" ]; echo $?)" 'out file exists'
 
 echo '# harvest: still generating'
+run_engine --harvest '' --out "$TDIR/o-empty.md" --timeout 5s
+check 'empty harvest marker exits 2' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC $(cat "$TDIR/stderr")"
+check 'empty harvest marker cannot start a fresh review' "$([ ! -e "$TDIR/o-empty.md.status" ]; echo $?)" 'status file created'
 run_engine --harvest "$MARKER" --out "$TDIR/o-h1.md" --timeout 5s
 check 'harvest in-progress exits 9' "$([ "$RC" -eq 9 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
 check 'harvest in-progress phase' "$([ "$(phase_of "$TDIR/o-h1.md.status")" = in-progress ]; echo $?)" "$(cat "$TDIR/o-h1.md.status" 2>/dev/null)"

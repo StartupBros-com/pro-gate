@@ -88,10 +88,16 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
      unavailable envelope and do NOT re-run; the human should check the ChatGPT conversation.
    - `9`: in-progress (engine >=v0.20): quota IS spent, the model was still generating when
      the engine's budget ran out, and the conversation tab was left open. NEVER relaunch.
-     Wait ~10 min, then collect with NO new spend. Read the `marker` field from `$OUT.status`
-     (`jq -r .marker`, or the no-jq fallback
-     `sed -nE 's/.*"marker":"([^"]+)".*/\1/p'`), then run:
-     `"${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --harvest "$MARKER" --out "$OUT" --timeout 20m`
+     Wait ~10 min, then collect with NO new spend. Reconstruct and validate all state in the
+     same shell as the harvest command:
+     ```bash
+     OUT="${TMPDIR:-/tmp}/oracle-reviewer-pr-<num>.md"
+     MARKER="$(jq -r '.marker // empty' "$OUT.status" 2>/dev/null \
+       || sed -nE 's/.*"marker":"([^"]+)".*/\1/p' "$OUT.status")"
+     case "$MARKER" in pg-run-[A-Za-z0-9.-]*) ;; *) echo "ERROR: no valid harvest marker" >&2; exit 1;; esac
+     "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" \
+       --harvest "$MARKER" --out "$OUT" --timeout 20m
+     ```
      (exit 0 = relay `$OUT`; exit 9 again = reservation retained (still generating, or a
      below-threshold miss), wait and repeat if your budget allows, else return the unavailable
      envelope quoting the harvest command; exit 3 = browser/CDP trouble with the reservation

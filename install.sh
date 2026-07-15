@@ -23,6 +23,7 @@ LOCK_ACQUIRED=0
 LOCK_OWNER_FILE=""
 REAPER_LOCKDIR=""
 REAPER_LOCK_ACQUIRED=0
+SELF_START=""
 PROXY_ARGS=()
 [ -n "${HTTPS_PROXY:-}" ] && PROXY_ARGS=(--proxy "$HTTPS_PROXY")
 [ -z "${HTTPS_PROXY:-}" ] && [ -n "${HTTP_PROXY:-}" ] && PROXY_ARGS=(--proxy "$HTTP_PROXY")
@@ -67,7 +68,8 @@ cleanup() {
     done
   fi
   [ "$LOCK_ACQUIRED" = 1 ] && rm -rf "$LOCKDIR"
-  if [ "$REAPER_LOCK_ACQUIRED" = 1 ]; then
+  if [ "$REAPER_LOCK_ACQUIRED" = 1 ] && [ "$(cat "$REAPER_LOCKDIR/owner" 2>/dev/null || true)" = "$$ $SELF_START" ]; then
+    rm -f "$REAPER_LOCKDIR/owner"
     rmdir "$REAPER_LOCKDIR" 2>/dev/null || true
   fi
   [ -n "$TMP" ] && rm -rf "$TMP"
@@ -82,6 +84,43 @@ sha256() {
   elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1
   else echo "SHA256 tool required" >&2; return 1
   fi
+}
+
+process_start() {
+  local pid="$1"
+  ps -o lstart= -p "$pid" 2>/dev/null | tr -s '[:space:]' ' ' | sed 's/^ //;s/ $//' || true
+}
+
+lock_is_reclaimable() {
+  local lock_dir="$1" owner pid recorded_start live_start modified now grace
+  owner="$(cat "$lock_dir/owner" 2>/dev/null || true)"
+  pid="${owner%% *}"
+  recorded_start="${owner#* }"
+  case "$pid" in
+    ''|*[!0-9]*) ;;
+    *)
+      if [ -n "$recorded_start" ] && [ "$recorded_start" != "$owner" ]; then
+        if ! kill -0 "$pid" 2>/dev/null; then return 0; fi
+        live_start="$(process_start "$pid")"
+        [ -n "$live_start" ] && [ "$live_start" = "$recorded_start" ] && return 1
+        return 0
+      fi
+      ;;
+  esac
+
+  modified="$(stat -c %Y "$lock_dir" 2>/dev/null || stat -f %m "$lock_dir" 2>/dev/null || true)"
+  case "$modified" in ''|*[!0-9]*) return 1;; esac
+  now="$(date +%s)"
+  grace="${PRO_GATE_PORTABLE_LOCK_GRACE_SECONDS:-60}"
+  case "$grace" in ''|*[!0-9]*) grace=60;; esac
+  [ "$((now - modified))" -ge "$grace" ]
+}
+
+write_lock_owner() {
+  local owner_file="$1"
+  [ -n "$SELF_START" ] || SELF_START="$(process_start "$$")"
+  [ -n "$SELF_START" ] || { echo "could not record portable lock owner" >&2; return 1; }
+  printf '%s %s\n' "$$" "$SELF_START" > "$owner_file"
 }
 
 if [ "$LOCAL_SOURCE" = 1 ]; then
@@ -139,42 +178,53 @@ else
   if ! mkdir "$LOCKDIR" 2>/dev/null; then
     REAPER_LOCKDIR="$PRO_GATE_HOME/.install.lock.reaper"
     if ! mkdir "$REAPER_LOCKDIR" 2>/dev/null; then
-      echo "another pro-gate install is in progress" >&2
-      exit 1
+      if ! lock_is_reclaimable "$REAPER_LOCKDIR"; then
+        echo "another pro-gate install is in progress" >&2
+        exit 1
+      fi
+      STALE_REAPER="$PRO_GATE_HOME/.install.lock.reaper.stale.$$"
+      if ! mv "$REAPER_LOCKDIR" "$STALE_REAPER" 2>/dev/null; then
+        echo "another pro-gate install is in progress" >&2
+        exit 1
+      fi
+      if ! lock_is_reclaimable "$STALE_REAPER" || ! mkdir "$REAPER_LOCKDIR" 2>/dev/null; then
+        if [ ! -e "$REAPER_LOCKDIR" ]; then
+          mv "$STALE_REAPER" "$REAPER_LOCKDIR" 2>/dev/null || true
+        fi
+        echo "another pro-gate install is in progress" >&2
+        exit 1
+      fi
+      rm -rf "$STALE_REAPER"
     fi
     REAPER_LOCK_ACQUIRED=1
+    write_lock_owner "$REAPER_LOCKDIR/owner"
+    [ "$(cat "$REAPER_LOCKDIR/owner" 2>/dev/null || true)" = "$$ $SELF_START" ] || {
+      echo "another pro-gate install is in progress" >&2
+      exit 1
+    }
 
-    LOCK_OWNER="$(cat "$LOCK_OWNER_FILE" 2>/dev/null || true)"
-    LOCK_PID="${LOCK_OWNER%% *}"
-    LOCK_START="${LOCK_OWNER#* }"
-    LIVE_START=""
-    case "$LOCK_PID" in
-      ''|*[!0-9]*) ;;
-      *)
-        if kill -0 "$LOCK_PID" 2>/dev/null; then
-          LIVE_START="$(ps -o lstart= -p "$LOCK_PID" 2>/dev/null | tr -s '[:space:]' ' ' | sed 's/^ //;s/ $//' || true)"
-        fi
-        ;;
-    esac
-    if [ -z "$LOCK_START" ] || [ "$LOCK_START" = "$LOCK_OWNER" ] || [ "$LIVE_START" = "$LOCK_START" ]; then
+    if ! lock_is_reclaimable "$LOCKDIR"; then
       echo "another pro-gate install is in progress" >&2
       exit 1
     fi
 
     STALE_LOCK="$PRO_GATE_HOME/.install.lock.stale.$$"
-    if ! mv "$LOCKDIR" "$STALE_LOCK" 2>/dev/null || ! mkdir "$LOCKDIR" 2>/dev/null; then
-      [ -d "$STALE_LOCK" ] && mv "$STALE_LOCK" "$LOCKDIR" 2>/dev/null || true
+    if ! mv "$LOCKDIR" "$STALE_LOCK" 2>/dev/null || ! lock_is_reclaimable "$STALE_LOCK" || ! mkdir "$LOCKDIR" 2>/dev/null; then
+      if [ ! -e "$LOCKDIR" ] && [ -d "$STALE_LOCK" ]; then
+        mv "$STALE_LOCK" "$LOCKDIR" 2>/dev/null || true
+      fi
       echo "another pro-gate install is in progress" >&2
       exit 1
     fi
     rm -rf "$STALE_LOCK"
+  fi
+  LOCK_ACQUIRED=1
+  write_lock_owner "$LOCK_OWNER_FILE"
+  if [ "$REAPER_LOCK_ACQUIRED" = 1 ]; then
+    rm -f "$REAPER_LOCKDIR/owner"
     rmdir "$REAPER_LOCKDIR"
     REAPER_LOCK_ACQUIRED=0
   fi
-  LOCK_ACQUIRED=1
-  LOCK_START="$(ps -o lstart= -p "$$" | tr -s '[:space:]' ' ' | sed 's/^ //;s/ $//')"
-  [ -n "$LOCK_START" ] || { echo "could not record portable lock owner" >&2; exit 1; }
-  printf '%s %s\n' "$$" "$LOCK_START" > "$LOCK_OWNER_FILE"
 fi
 
 . "$SOURCE_ROOT/lib/pro-gate-lib.sh"

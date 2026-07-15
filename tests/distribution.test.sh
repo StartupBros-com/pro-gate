@@ -86,6 +86,38 @@ check "exactly one stale-lock reclaimer installs" test "$RACE_WINNER_STATUS" -eq
 check "stale-lock race leaves no portable lock" test ! -e "$RACE_RUNTIME/.install.lock.d"
 check "stale-lock race leaves no reaper lock" test ! -e "$RACE_RUNTIME/.install.lock.reaper"
 
+KILL_RUNTIME="$TDIR/killed-reaper-runtime"; KILL_BIN="$TDIR/killed-reaper-bin"
+mkdir -p "$KILL_RUNTIME/.install.lock.d" "$KILL_BIN"
+printf '999999 Mon Jan 1 00:00:00 2001\n' > "$KILL_RUNTIME/.install.lock.d/owner"
+cat > "$KILL_BIN/mv" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "$KILL_LOCKDIR" ]; then
+  parent="$PPID"
+  : > "$KILL_READY"
+  while kill -0 "$parent" 2>/dev/null; do sleep 0.1; done
+  exit 137
+fi
+exec "$REAL_MV" "$@"
+EOF
+chmod +x "$KILL_BIN/mv"
+KILL_LOCKDIR="$KILL_RUNTIME/.install.lock.d" KILL_READY="$TDIR/killed-reaper.ready" REAL_MV="$REAL_MV" \
+  HOME="$LOCK_HOME" PRO_GATE_HOME="$KILL_RUNTIME" PRO_GATE_BROWSER_MODE=native PRO_GATE_FORCE_PORTABLE_LOCK=1 PATH="$KILL_BIN:$PATH" \
+  bash "$ROOT/install.sh" --local-source --version "$VERSION" >"$TDIR/killed-reaper.log" 2>&1 & KILL_PID=$!
+for _ in $(seq 1 500); do [ -e "$TDIR/killed-reaper.ready" ] && break; sleep 0.01; done
+check "reclaimer reaches crash window" test -e "$TDIR/killed-reaper.ready"
+kill -KILL "$KILL_PID"
+wait "$KILL_PID" 2>/dev/null || true
+HOME="$LOCK_HOME" PRO_GATE_HOME="$KILL_RUNTIME" PRO_GATE_BROWSER_MODE=native PRO_GATE_FORCE_PORTABLE_LOCK=1 \
+  bash "$ROOT/install.sh" --local-source --version "$VERSION" >"$TDIR/killed-reaper-recovery.log" 2>&1
+check "dead reaper owner is recovered" test "$(cat "$KILL_RUNTIME/VERSION")" = "$VERSION"
+check "dead reaper recovery leaves no locks" sh -c "! find '$KILL_RUNTIME' -maxdepth 1 -name '.install.lock.*' -type d | grep -q ."
+
+OWNERLESS_RUNTIME="$TDIR/ownerless-reaper-runtime"; mkdir -p "$OWNERLESS_RUNTIME/.install.lock.d" "$OWNERLESS_RUNTIME/.install.lock.reaper"
+printf '999999 Mon Jan 1 00:00:00 2001\n' > "$OWNERLESS_RUNTIME/.install.lock.d/owner"
+HOME="$LOCK_HOME" PRO_GATE_HOME="$OWNERLESS_RUNTIME" PRO_GATE_BROWSER_MODE=native PRO_GATE_FORCE_PORTABLE_LOCK=1 \
+  PRO_GATE_PORTABLE_LOCK_GRACE_SECONDS=0 bash "$ROOT/install.sh" --local-source --version "$VERSION" >"$TDIR/ownerless-reaper.log" 2>&1
+check "aged ownerless reaper is recovered" test "$(cat "$OWNERLESS_RUNTIME/VERSION")" = "$VERSION"
+
 check "reviewer agent enforces exact runtime" grep -q 'PRO_GATE_EXPECTED_VERSION=' "$ROOT/agents/oracle-reviewer.md"
 check "reviewer agent rejects invalid plugin versions" grep -q 'could not resolve a valid plugin version' "$ROOT/agents/oracle-reviewer.md"
 check "reviewer commands resolve runtime independently" test "$(grep -c '\${PRO_GATE_HOME:-\$HOME/.pro-review-daemon}/oracle-review.sh' "$ROOT/agents/oracle-reviewer.md")" -ge 2
@@ -96,8 +128,16 @@ REVIEW_RUNTIME="$TDIR/reviewer-runtime"; mkdir -p "$REVIEW_RUNTIME"
 printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$REVIEW_LOG"\n' > "$REVIEW_RUNTIME/oracle-review.sh"
 chmod +x "$REVIEW_RUNTIME/oracle-review.sh"
 PRO_GATE_HOME="$REVIEW_RUNTIME" REVIEW_LOG="$TDIR/reviewer.log" bash -c '"${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --pr 22'
-PRO_GATE_HOME="$REVIEW_RUNTIME" REVIEW_LOG="$TDIR/reviewer.log" bash -c '"${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --harvest marker'
+REVIEW_OUT="$TDIR/oracle-reviewer-pr-22.md"
+printf '{"marker":"pg-run-22-1700000000-1"}\n' > "$REVIEW_OUT.status"
+PRO_GATE_HOME="$REVIEW_RUNTIME" REVIEW_LOG="$TDIR/reviewer.log" OUT="$REVIEW_OUT" bash -c '
+  OUT="${OUT}"
+  MARKER="$(jq -r '\''.marker // empty'\'' "$OUT.status" 2>/dev/null || sed -nE '\''s/.*"marker":"([^"]+)".*/\1/p'\'' "$OUT.status")"
+  case "$MARKER" in pg-run-[A-Za-z0-9.-]*) ;; *) exit 1;; esac
+  "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --harvest "$MARKER" --out "$OUT" --timeout 20m
+'
 check "separate reviewer shells use configured runtime" test "$(wc -l < "$TDIR/reviewer.log")" -eq 2
+check "harvest shell reconstructs marker and output" grep -q -- '--harvest pg-run-22-1700000000-1.*--out .*oracle-reviewer-pr-22.md' "$TDIR/reviewer.log"
 
 HOSTILE="$TDIR/hostile-cwd"; mkdir -p "$HOSTILE/lib"
 printf 'hostile\n' > "$HOSTILE/VERSION"
