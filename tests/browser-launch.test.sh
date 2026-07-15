@@ -14,7 +14,7 @@ make_fixture() {
   mkdir -p "$dir/bin" "$dir/home/.oracle/browser-profile" "$dir/runtime"
   printf 'pg_augment_path() { :; }\n' > "$dir/runtime/lib.sh"
   printf '#!/usr/bin/env bash\nexit "${CURL_STATUS:-1}"\n' > "$dir/bin/curl"
-  printf '#!/usr/bin/env bash\n[ -n "${SS_READY_FILE:-}" ] && : > "$SS_READY_FILE"\n[ -n "${SS_SLEEP:-}" ] && sleep "$SS_SLEEP"\n[ -n "${SS_LISTENER:-}" ] && printf "LISTEN 0 128 127.0.0.1:9222 0.0.0.0:*\\n"\n' > "$dir/bin/ss"
+  printf '#!/usr/bin/env bash\n[ -n "${SS_READY_FILE:-}" ] && : > "$SS_READY_FILE"\n[ -n "${SS_SLEEP:-}" ] && sleep "$SS_SLEEP"\n[ -n "${SS_LISTENER:-}" ] && printf "LISTEN 0 128 127.0.0.1:9222 0.0.0.0:*\\n"\nexit 0\n' > "$dir/bin/ss"
   printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$$" > "$XVFB_PID_FILE"\ntrap "exit 0" TERM INT\nwhile :; do sleep 1; done\n' > "$dir/bin/Xvfb"
   printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" > "$CHROME_ARGS_FILE"\n[ -n "${CHROME_SLEEP:-}" ] && sleep "$CHROME_SLEEP"\nexit 0\n' > "$dir/bin/google-chrome"
   chmod +x "$dir/bin/"*
@@ -41,6 +41,19 @@ else
   check 'non-CDP listener is rejected' grep -q 'browser port 9222 is already owned' "$NON_HTTP/occupied.log"
 fi
 check 'non-CDP listener never starts Xvfb' test ! -e "$NON_HTTP/xvfb.pid"
+
+SS_FAIL="$TDIR/ss-fail"
+make_fixture "$SS_FAIL"
+printf '#!/usr/bin/env bash\nexit 17\n' > "$SS_FAIL/bin/ss"
+chmod +x "$SS_FAIL/bin/ss"
+if HOME="$SS_FAIL/home" PRO_GATE_HOME="$SS_FAIL/runtime" ORACLE_DISPLAY="$TEST_DISPLAY" PATH="$SS_FAIL/bin:/usr/bin:/bin" \
+  CURL_STATUS=1 XVFB_PID_FILE="$SS_FAIL/xvfb.pid" CHROME_ARGS_FILE="$SS_FAIL/chrome.args" \
+  bash "$ROOT/daemon/run-oracle-chrome.sh" >"$SS_FAIL/fail.log" 2>&1; then
+  fail 'socket inspection failure blocks startup'
+else
+  check 'socket inspection failure blocks startup' grep -q 'could not inspect browser port' "$SS_FAIL/fail.log"
+fi
+check 'socket inspection failure never starts Xvfb' test ! -e "$SS_FAIL/xvfb.pid"
 
 SIGNAL="$TDIR/signal"
 make_fixture "$SIGNAL"

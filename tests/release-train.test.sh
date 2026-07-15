@@ -59,6 +59,27 @@ assert_eq "$(wc -l < "$TMP/curl.log")" 1 'promotion announces once'
 env "${common[@]}" "$ROOT/scripts/release-train.sh" >/dev/null
 assert_eq "$(wc -l < "$TMP/curl.log")" 2 'rerun calls idempotent announce operation'
 
+git clone -q --bare "$TMP/marketplace.git" "$TMP/retry-marketplace.git"
+git clone -q "$TMP/retry-marketplace.git" "$TMP/retry-marketplace"
+git -C "$TMP/retry-marketplace" config user.email test@example.com
+git -C "$TMP/retry-marketplace" config user.name Test
+cat > "$TMP/retry-marketplace.git/hooks/pre-receive" <<EOF
+#!/usr/bin/env bash
+cat >/dev/null
+if [ ! -e "$TMP/retry-push-rejected" ]; then
+  : > "$TMP/retry-push-rejected"
+  exit 1
+fi
+EOF
+chmod +x "$TMP/retry-marketplace.git/hooks/pre-receive"
+: > "$TMP/retry-curl.log"
+CURL_LOG="$TMP/retry-curl.log" env "${common[@]}" RELEASE_ID=202 LATEST_STABLE_ID=202 \
+  MARKETPLACE_DIR="$TMP/retry-marketplace" "$ROOT/scripts/release-train.sh" >/dev/null
+retry_remote="$TMP/retry-remote-check"
+git clone -q "$TMP/retry-marketplace.git" "$retry_remote"
+assert_eq "$(jq -r '.plugins[] | select(.name=="pro-gate") | .metadata.releaseId' "$retry_remote/.claude-plugin/marketplace.json")" 202 'rejected push retries from remote tip'
+assert_eq "$(wc -l < "$TMP/retry-curl.log")" 1 'retry announces only after remote promotion'
+
 printf '#!/usr/bin/env bash\nexit 23\n' > "$TMP/fail-validator"
 chmod +x "$TMP/fail-validator"
 git clone -q "$TMP/marketplace.git" "$TMP/invalid-marketplace"

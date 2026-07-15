@@ -120,10 +120,7 @@ promote() {
   local attempt current
   for attempt in 1 2 3; do
     git fetch origin "$MARKETPLACE_BRANCH" || fail 'could not fetch marketplace branch'
-    if ! git rebase "origin/$MARKETPLACE_BRANCH"; then
-      git rebase --abort || fail 'could not abort conflicted marketplace rebase'
-      git switch --detach "origin/$MARKETPLACE_BRANCH" || fail 'could not restore fresh marketplace tip'
-    fi
+    git switch --detach "origin/$MARKETPLACE_BRANCH" || fail 'could not restore fresh marketplace tip'
     current="$(current_release_id)"
     is_uint "$current" || fail "marketplace release marker is not numeric"
     if (( RELEASE_ID < current )); then

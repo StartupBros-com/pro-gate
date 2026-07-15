@@ -44,8 +44,12 @@ trap cleanup EXIT
 trap 'on_signal 130' INT
 trap 'on_signal 143' TERM
 
-"$SS" -H -ltn "sport = :${PORT}" | grep -q . \
-  && { echo "ERROR: browser port ${PORT} is already owned by another listener" >&2; exit 1; }
+if ! LISTENERS="$("$SS" -H -ltn "sport = :${PORT}")"; then
+  echo "ERROR: could not inspect browser port ${PORT}" >&2
+  exit 1
+fi
+[ -z "$LISTENERS" ] \
+  || { echo "ERROR: browser port ${PORT} is already owned by another listener" >&2; exit 1; }
 
 LOCK="$PROFILE/SingletonLock"
 if [ -L "$LOCK" ]; then

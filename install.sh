@@ -19,6 +19,7 @@ CONSENT_VERSION="${PRO_GATE_CONSENT_VERSION:-1}"
 CONSENT_HOME="${PRO_GATE_CONSENT_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/pro-gate}"
 CONSENT_FILE="$CONSENT_HOME/dangerous-mode-consent"
 LOCKDIR=""
+LOCK_ACQUIRED=0
 PROXY_ARGS=()
 [ -n "${HTTPS_PROXY:-}" ] && PROXY_ARGS=(--proxy "$HTTPS_PROXY")
 [ -z "${HTTPS_PROXY:-}" ] && [ -n "${HTTP_PROXY:-}" ] && PROXY_ARGS=(--proxy "$HTTP_PROXY")
@@ -62,7 +63,7 @@ cleanup() {
       if [ -e "$BACKUP/$f" ]; then mv -f "$BACKUP/$f" "$PRO_GATE_HOME/$f"; else rm -f "$PRO_GATE_HOME/$f"; fi
     done
   fi
-  [ -n "$LOCKDIR" ] && rm -rf "$LOCKDIR"
+  [ "$LOCK_ACQUIRED" = 1 ] && rm -rf "$LOCKDIR"
   [ -n "$TMP" ] && rm -rf "$TMP"
   trap - EXIT
   exit "$rc"
@@ -123,12 +124,13 @@ fi
 # Do not create or alter the install destination until the complete release has
 # passed checksum, extraction-path, and version validation above.
 mkdir -p "$PRO_GATE_HOME"
-if command -v flock >/dev/null 2>&1; then
+if [ "${PRO_GATE_FORCE_PORTABLE_LOCK:-0}" != 1 ] && command -v flock >/dev/null 2>&1; then
   exec 9>>"$PRO_GATE_HOME/.install.lock"
   flock -w 60 9 || { echo "another pro-gate install is in progress" >&2; exit 1; }
 else
   LOCKDIR="$PRO_GATE_HOME/.install.lock.d"
   mkdir "$LOCKDIR" 2>/dev/null || { echo "another pro-gate install is in progress" >&2; exit 1; }
+  LOCK_ACQUIRED=1
 fi
 
 . "$SOURCE_ROOT/lib/pro-gate-lib.sh"

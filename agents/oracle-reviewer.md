@@ -42,13 +42,24 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
 
 ## Procedure
 
-1. **No separate preflight (engine ≥ v0.19).** Do NOT probe CDP yourself and bail — the
-   engine self-heals a down Chrome (one non-interactive `systemctl start oracle-chrome`
+1. **Enforce the exact plugin runtime.** Resolve this plugin's promoted version and run the
+   installed doctor with that expectation before invoking the engine:
+   ```bash
+   PLUGIN_VERSION="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' \
+     "${CLAUDE_PLUGIN_ROOT}/.claude-plugin/plugin.json")"
+   PRO_GATE_EXPECTED_VERSION="$PLUGIN_VERSION" \
+     "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/pro-gate-doctor.sh"
+   ```
+   If the runtime is absent or mismatched, return the unavailable envelope and route the
+   operator to the exact `v${PLUGIN_VERSION}` installer. Never run a stale runtime.
+
+2. **No separate browser preflight (engine ≥ v0.19).** Do NOT probe CDP yourself and bail:
+   the engine self-heals a down Chrome (one non-interactive `systemctl start oracle-chrome`
    attempt) and defers cleanly (exit 8) when the box is genuinely unfit. A caller-side
    `curl` check would skip that recovery path and report "unavailable" for outages the
    engine would have healed. Just run the engine and interpret its exit code.
 
-2. **Run the review.** From the repo, launch the engine with an explicit `--out` and a long
+3. **Run the review.** From the repo, launch the engine with an explicit `--out` and a long
    Bash timeout (≥ 2100000 ms — it blocks 10-30 min):
    ```bash
    OUT="${TMPDIR:-/tmp}/oracle-reviewer-pr-<num>.md"

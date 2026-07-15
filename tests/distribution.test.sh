@@ -32,6 +32,16 @@ check "runtime install does not duplicate skill" test ! -e "$CLAUDE1/skills/pro-
 check "runtime install does not duplicate agent" test ! -e "$CLAUDE1/agents/oracle-reviewer.md"
 check "daemon defaults off" grep -q 'daemon: 0' "$TDIR/default.log"
 
+LOCK_HOME="$TDIR/lock-home"; LOCK_RUNTIME="$TDIR/lock-runtime"
+mkdir -p "$LOCK_HOME" "$LOCK_RUNTIME/.install.lock.d"
+if HOME="$LOCK_HOME" PRO_GATE_HOME="$LOCK_RUNTIME" PRO_GATE_BROWSER_MODE=native PRO_GATE_FORCE_PORTABLE_LOCK=1 \
+  bash "$ROOT/install.sh" --local-source --version "$VERSION" >"$TDIR/lock-loser.log" 2>&1; then
+  echo "FAIL - concurrent installer loses the portable lock"; FAILS=$((FAILS + 1))
+else echo "ok - concurrent installer loses the portable lock"; fi
+check "losing installer preserves winning lock" test -d "$LOCK_RUNTIME/.install.lock.d"
+
+check "reviewer agent enforces exact runtime" grep -q 'PRO_GATE_EXPECTED_VERSION=' "$ROOT/agents/oracle-reviewer.md"
+
 HOSTILE="$TDIR/hostile-cwd"; mkdir -p "$HOSTILE/lib"
 printf 'hostile\n' > "$HOSTILE/VERSION"
 printf 'exit 99\n' > "$HOSTILE/lib/pro-gate-lib.sh"
