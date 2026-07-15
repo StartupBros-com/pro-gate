@@ -64,6 +64,7 @@ HOME="$OK/home" PRO_GATE_HOME="$OK/runtime" ORACLE_DISPLAY="$TEST_DISPLAY" PATH=
   CURL_STATUS=1 XVFB_PID_FILE="$OK/xvfb.pid" CHROME_ARGS_FILE="$OK/chrome.args" \
   bash "$ROOT/daemon/run-oracle-chrome.sh" >"$OK/ok.log" 2>&1
 check 'Chrome receives software rasterizer guard' grep -q -- '--disable-software-rasterizer' "$OK/chrome.args"
+check 'Chrome remains alive after Oracle closes the last target' grep -q -- '--keep-alive-for-test' "$OK/chrome.args"
 XVFB_PID="$(cat "$OK/xvfb.pid")"
 if kill -0 "$XVFB_PID" 2>/dev/null; then
   fail 'wrapper cleans up Xvfb after Chrome exits'

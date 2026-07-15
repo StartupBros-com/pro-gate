@@ -66,7 +66,7 @@ export DISPLAY="$DISPLAY_NUM"
 # --disable-gpu is set. This browser needs ordinary page rendering and CDP, not WebGL.
 "$CHROME" \
   --no-sandbox --disable-gpu --disable-software-rasterizer --disable-dev-shm-usage \
-  --no-first-run --no-default-browser-check \
+  --keep-alive-for-test --no-first-run --no-default-browser-check \
   --disable-features=Translate,AutomationControlled \
   --remote-allow-origins='*' \
   --remote-debugging-address=127.0.0.1 \
