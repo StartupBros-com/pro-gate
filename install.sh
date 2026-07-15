@@ -20,6 +20,7 @@ CONSENT_HOME="${PRO_GATE_CONSENT_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/pro-gat
 CONSENT_FILE="$CONSENT_HOME/dangerous-mode-consent"
 LOCKDIR=""
 LOCK_ACQUIRED=0
+LOCK_OWNER_FILE=""
 PROXY_ARGS=()
 [ -n "${HTTPS_PROXY:-}" ] && PROXY_ARGS=(--proxy "$HTTPS_PROXY")
 [ -z "${HTTPS_PROXY:-}" ] && [ -n "${HTTP_PROXY:-}" ] && PROXY_ARGS=(--proxy "$HTTP_PROXY")
@@ -129,8 +130,38 @@ if [ "${PRO_GATE_FORCE_PORTABLE_LOCK:-0}" != 1 ] && command -v flock >/dev/null 
   flock -w 60 9 || { echo "another pro-gate install is in progress" >&2; exit 1; }
 else
   LOCKDIR="$PRO_GATE_HOME/.install.lock.d"
-  mkdir "$LOCKDIR" 2>/dev/null || { echo "another pro-gate install is in progress" >&2; exit 1; }
+  LOCK_OWNER_FILE="$LOCKDIR/owner"
+  if ! mkdir "$LOCKDIR" 2>/dev/null; then
+    LOCK_OWNER="$(cat "$LOCK_OWNER_FILE" 2>/dev/null || true)"
+    LOCK_PID="${LOCK_OWNER%% *}"
+    LOCK_START="${LOCK_OWNER#* }"
+    LIVE_START=""
+    case "$LOCK_PID" in
+      ''|*[!0-9]*) ;;
+      *)
+        if kill -0 "$LOCK_PID" 2>/dev/null; then
+          LIVE_START="$(ps -o lstart= -p "$LOCK_PID" 2>/dev/null | tr -s '[:space:]' ' ' | sed 's/^ //;s/ $//' || true)"
+        fi
+        ;;
+    esac
+    if [ -n "$LOCK_START" ] && [ "$LOCK_START" != "$LOCK_OWNER" ] && [ "$LIVE_START" != "$LOCK_START" ]; then
+      STALE_LOCK="$PRO_GATE_HOME/.install.lock.stale.$$"
+      if mv "$LOCKDIR" "$STALE_LOCK" 2>/dev/null && mkdir "$LOCKDIR" 2>/dev/null; then
+        rm -rf "$STALE_LOCK"
+      else
+        [ -d "$STALE_LOCK" ] && mv "$STALE_LOCK" "$LOCKDIR" 2>/dev/null || true
+        echo "another pro-gate install is in progress" >&2
+        exit 1
+      fi
+    else
+      echo "another pro-gate install is in progress" >&2
+      exit 1
+    fi
+  fi
   LOCK_ACQUIRED=1
+  LOCK_START="$(ps -o lstart= -p "$$" | tr -s '[:space:]' ' ' | sed 's/^ //;s/ $//')"
+  [ -n "$LOCK_START" ] || { echo "could not record portable lock owner" >&2; exit 1; }
+  printf '%s %s\n' "$$" "$LOCK_START" > "$LOCK_OWNER_FILE"
 fi
 
 . "$SOURCE_ROOT/lib/pro-gate-lib.sh"

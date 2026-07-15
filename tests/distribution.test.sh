@@ -40,7 +40,26 @@ if HOME="$LOCK_HOME" PRO_GATE_HOME="$LOCK_RUNTIME" PRO_GATE_BROWSER_MODE=native 
 else echo "ok - concurrent installer loses the portable lock"; fi
 check "losing installer preserves winning lock" test -d "$LOCK_RUNTIME/.install.lock.d"
 
+LIVE_LOCK_RUNTIME="$TDIR/live-lock-runtime"; mkdir -p "$LIVE_LOCK_RUNTIME/.install.lock.d"
+LIVE_START="$(ps -o lstart= -p "$$" | tr -s '[:space:]' ' ' | sed 's/^ //;s/ $//')"
+printf '%s %s\n' "$$" "$LIVE_START" > "$LIVE_LOCK_RUNTIME/.install.lock.d/owner"
+if HOME="$LOCK_HOME" PRO_GATE_HOME="$LIVE_LOCK_RUNTIME" PRO_GATE_BROWSER_MODE=native PRO_GATE_FORCE_PORTABLE_LOCK=1 \
+  bash "$ROOT/install.sh" --local-source --version "$VERSION" >"$TDIR/live-lock.log" 2>&1; then
+  echo "FAIL - live portable lock blocks concurrent installer"; FAILS=$((FAILS + 1))
+else echo "ok - live portable lock blocks concurrent installer"; fi
+check "loser preserves live lock owner" grep -q "^$$ " "$LIVE_LOCK_RUNTIME/.install.lock.d/owner"
+
+STALE_LOCK_RUNTIME="$TDIR/stale-lock-runtime"; mkdir -p "$STALE_LOCK_RUNTIME/.install.lock.d"
+printf '999999 Mon Jan 1 00:00:00 2001\n' > "$STALE_LOCK_RUNTIME/.install.lock.d/owner"
+HOME="$LOCK_HOME" PRO_GATE_HOME="$STALE_LOCK_RUNTIME" PRO_GATE_BROWSER_MODE=native PRO_GATE_FORCE_PORTABLE_LOCK=1 \
+  bash "$ROOT/install.sh" --local-source --version "$VERSION" >"$TDIR/stale-lock.log" 2>&1
+check "stale portable lock is reclaimed" test "$(cat "$STALE_LOCK_RUNTIME/VERSION")" = "$VERSION"
+check "successful install releases reclaimed lock" test ! -e "$STALE_LOCK_RUNTIME/.install.lock.d"
+
 check "reviewer agent enforces exact runtime" grep -q 'PRO_GATE_EXPECTED_VERSION=' "$ROOT/agents/oracle-reviewer.md"
+check "reviewer agent rejects invalid plugin versions" grep -q 'could not resolve a valid plugin version' "$ROOT/agents/oracle-reviewer.md"
+check "reviewer agent uses one runtime for review and harvest" test "$(grep -c '\$RUNTIME_HOME/oracle-review.sh' "$ROOT/agents/oracle-reviewer.md")" -ge 2
+check "reviewer agent has no hardcoded engine home" sh -c "! grep -q '~/.pro-review-daemon/oracle-review.sh' '$ROOT/agents/oracle-reviewer.md'"
 
 HOSTILE="$TDIR/hostile-cwd"; mkdir -p "$HOSTILE/lib"
 printf 'hostile\n' > "$HOSTILE/VERSION"

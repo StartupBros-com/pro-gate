@@ -45,10 +45,12 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
 1. **Enforce the exact plugin runtime.** Resolve this plugin's promoted version and run the
    installed doctor with that expectation before invoking the engine:
    ```bash
-   PLUGIN_VERSION="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' \
-     "${CLAUDE_PLUGIN_ROOT}/.claude-plugin/plugin.json")"
-   PRO_GATE_EXPECTED_VERSION="$PLUGIN_VERSION" \
-     "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/pro-gate-doctor.sh"
+   RUNTIME_HOME="${PRO_GATE_HOME:-$HOME/.pro-review-daemon}"
+   PLUGIN_VERSION="$(python3 -c 'import json,re,sys; version=json.load(open(sys.argv[1]))["version"]; sys.exit(0) if isinstance(version,str) and re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+",version) and print(version) is None else sys.exit(1)' \
+     "${CLAUDE_PLUGIN_ROOT}/.claude-plugin/plugin.json")" \
+     && [ -n "$PLUGIN_VERSION" ] \
+     || { echo "ERROR: could not resolve a valid plugin version" >&2; exit 1; }
+   PRO_GATE_EXPECTED_VERSION="$PLUGIN_VERSION" "$RUNTIME_HOME/pro-gate-doctor.sh"
    ```
    If the runtime is absent or mismatched, return the unavailable envelope and route the
    operator to the exact `v${PLUGIN_VERSION}` installer. Never run a stale runtime.
@@ -63,7 +65,7 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
    Bash timeout (≥ 2100000 ms — it blocks 10-30 min):
    ```bash
    OUT="${TMPDIR:-/tmp}/oracle-reviewer-pr-<num>.md"
-   ~/.pro-review-daemon/oracle-review.sh --pr <num|url> --repo <REPO> \
+   "$RUNTIME_HOME/oracle-review.sh" --pr <num|url> --repo <REPO> \
      --input <both|bundle|connector> --out "$OUT" --timeout 30m
    ```
    The engine writes single-line JSON to `$OUT.status` at every phase change
@@ -89,7 +91,7 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
      Wait ~10 min, then collect with NO new spend. Read the `marker` field from `$OUT.status`
      (`jq -r .marker`, or the no-jq fallback
      `sed -nE 's/.*"marker":"([^"]+)".*/\1/p'`), then run:
-     `~/.pro-review-daemon/oracle-review.sh --harvest "$MARKER" --out "$OUT" --timeout 20m`
+     `"$RUNTIME_HOME/oracle-review.sh" --harvest "$MARKER" --out "$OUT" --timeout 20m`
      (exit 0 = relay `$OUT`; exit 9 again = reservation retained (still generating, or a
      below-threshold miss), wait and repeat if your budget allows, else return the unavailable
      envelope quoting the harvest command; exit 3 = browser/CDP trouble with the reservation
