@@ -56,10 +56,48 @@ HOME="$LOCK_HOME" PRO_GATE_HOME="$STALE_LOCK_RUNTIME" PRO_GATE_BROWSER_MODE=nati
 check "stale portable lock is reclaimed" test "$(cat "$STALE_LOCK_RUNTIME/VERSION")" = "$VERSION"
 check "successful install releases reclaimed lock" test ! -e "$STALE_LOCK_RUNTIME/.install.lock.d"
 
+RACE_RUNTIME="$TDIR/race-lock-runtime"; RACE_BIN="$TDIR/race-bin"
+mkdir -p "$RACE_RUNTIME/.install.lock.d" "$RACE_BIN"
+printf '999999 Mon Jan 1 00:00:00 2001\n' > "$RACE_RUNTIME/.install.lock.d/owner"
+REAL_MV="$(command -v mv)"
+cat > "$RACE_BIN/mv" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "$RACE_LOCKDIR" ] && [ ! -e "$RACE_RELEASE" ]; then
+  : > "$RACE_READY"
+  while [ ! -e "$RACE_RELEASE" ]; do sleep 0.01; done
+fi
+exec "$REAL_MV" "$@"
+EOF
+chmod +x "$RACE_BIN/mv"
+RACE_LOCKDIR="$RACE_RUNTIME/.install.lock.d" RACE_READY="$TDIR/race.ready" RACE_RELEASE="$TDIR/race.release" REAL_MV="$REAL_MV" \
+  HOME="$LOCK_HOME" PRO_GATE_HOME="$RACE_RUNTIME" PRO_GATE_BROWSER_MODE=native PRO_GATE_FORCE_PORTABLE_LOCK=1 PATH="$RACE_BIN:$PATH" \
+  bash "$ROOT/install.sh" --local-source --version "$VERSION" >"$TDIR/race-winner.log" 2>&1 & RACE_WINNER_PID=$!
+for _ in $(seq 1 500); do [ -e "$TDIR/race.ready" ] && break; sleep 0.01; done
+check "first stale-lock reclaimer reaches serialized section" test -e "$TDIR/race.ready"
+if RACE_LOCKDIR="$RACE_RUNTIME/.install.lock.d" RACE_READY="$TDIR/race-loser.ready" RACE_RELEASE="$TDIR/race.release" REAL_MV="$REAL_MV" \
+  HOME="$LOCK_HOME" PRO_GATE_HOME="$RACE_RUNTIME" PRO_GATE_BROWSER_MODE=native PRO_GATE_FORCE_PORTABLE_LOCK=1 PATH="$RACE_BIN:$PATH" \
+  bash "$ROOT/install.sh" --local-source --version "$VERSION" >"$TDIR/race-loser.log" 2>&1; then
+  echo "FAIL - concurrent stale-lock reclaimer is rejected"; FAILS=$((FAILS + 1))
+else echo "ok - concurrent stale-lock reclaimer is rejected"; fi
+: > "$TDIR/race.release"
+RACE_WINNER_STATUS=0
+wait "$RACE_WINNER_PID" || RACE_WINNER_STATUS=$?
+check "exactly one stale-lock reclaimer installs" test "$RACE_WINNER_STATUS" -eq 0
+check "stale-lock race leaves no portable lock" test ! -e "$RACE_RUNTIME/.install.lock.d"
+check "stale-lock race leaves no reaper lock" test ! -e "$RACE_RUNTIME/.install.lock.reaper"
+
 check "reviewer agent enforces exact runtime" grep -q 'PRO_GATE_EXPECTED_VERSION=' "$ROOT/agents/oracle-reviewer.md"
 check "reviewer agent rejects invalid plugin versions" grep -q 'could not resolve a valid plugin version' "$ROOT/agents/oracle-reviewer.md"
-check "reviewer agent uses one runtime for review and harvest" test "$(grep -c '\$RUNTIME_HOME/oracle-review.sh' "$ROOT/agents/oracle-reviewer.md")" -ge 2
+check "reviewer commands resolve runtime independently" test "$(grep -c '\${PRO_GATE_HOME:-\$HOME/.pro-review-daemon}/oracle-review.sh' "$ROOT/agents/oracle-reviewer.md")" -ge 2
+check "reviewer agent has no cross-shell runtime dependency" sh -c "! grep -q '\$RUNTIME_HOME/oracle-review.sh' '$ROOT/agents/oracle-reviewer.md'"
 check "reviewer agent has no hardcoded engine home" sh -c "! grep -q '~/.pro-review-daemon/oracle-review.sh' '$ROOT/agents/oracle-reviewer.md'"
+
+REVIEW_RUNTIME="$TDIR/reviewer-runtime"; mkdir -p "$REVIEW_RUNTIME"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$REVIEW_LOG"\n' > "$REVIEW_RUNTIME/oracle-review.sh"
+chmod +x "$REVIEW_RUNTIME/oracle-review.sh"
+PRO_GATE_HOME="$REVIEW_RUNTIME" REVIEW_LOG="$TDIR/reviewer.log" bash -c '"${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --pr 22'
+PRO_GATE_HOME="$REVIEW_RUNTIME" REVIEW_LOG="$TDIR/reviewer.log" bash -c '"${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --harvest marker'
+check "separate reviewer shells use configured runtime" test "$(wc -l < "$TDIR/reviewer.log")" -eq 2
 
 HOSTILE="$TDIR/hostile-cwd"; mkdir -p "$HOSTILE/lib"
 printf 'hostile\n' > "$HOSTILE/VERSION"

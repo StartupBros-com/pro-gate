@@ -21,6 +21,8 @@ CONSENT_FILE="$CONSENT_HOME/dangerous-mode-consent"
 LOCKDIR=""
 LOCK_ACQUIRED=0
 LOCK_OWNER_FILE=""
+REAPER_LOCKDIR=""
+REAPER_LOCK_ACQUIRED=0
 PROXY_ARGS=()
 [ -n "${HTTPS_PROXY:-}" ] && PROXY_ARGS=(--proxy "$HTTPS_PROXY")
 [ -z "${HTTPS_PROXY:-}" ] && [ -n "${HTTP_PROXY:-}" ] && PROXY_ARGS=(--proxy "$HTTP_PROXY")
@@ -65,6 +67,9 @@ cleanup() {
     done
   fi
   [ "$LOCK_ACQUIRED" = 1 ] && rm -rf "$LOCKDIR"
+  if [ "$REAPER_LOCK_ACQUIRED" = 1 ]; then
+    rmdir "$REAPER_LOCKDIR" 2>/dev/null || true
+  fi
   [ -n "$TMP" ] && rm -rf "$TMP"
   trap - EXIT
   exit "$rc"
@@ -132,6 +137,13 @@ else
   LOCKDIR="$PRO_GATE_HOME/.install.lock.d"
   LOCK_OWNER_FILE="$LOCKDIR/owner"
   if ! mkdir "$LOCKDIR" 2>/dev/null; then
+    REAPER_LOCKDIR="$PRO_GATE_HOME/.install.lock.reaper"
+    if ! mkdir "$REAPER_LOCKDIR" 2>/dev/null; then
+      echo "another pro-gate install is in progress" >&2
+      exit 1
+    fi
+    REAPER_LOCK_ACQUIRED=1
+
     LOCK_OWNER="$(cat "$LOCK_OWNER_FILE" 2>/dev/null || true)"
     LOCK_PID="${LOCK_OWNER%% *}"
     LOCK_START="${LOCK_OWNER#* }"
@@ -144,19 +156,20 @@ else
         fi
         ;;
     esac
-    if [ -n "$LOCK_START" ] && [ "$LOCK_START" != "$LOCK_OWNER" ] && [ "$LIVE_START" != "$LOCK_START" ]; then
-      STALE_LOCK="$PRO_GATE_HOME/.install.lock.stale.$$"
-      if mv "$LOCKDIR" "$STALE_LOCK" 2>/dev/null && mkdir "$LOCKDIR" 2>/dev/null; then
-        rm -rf "$STALE_LOCK"
-      else
-        [ -d "$STALE_LOCK" ] && mv "$STALE_LOCK" "$LOCKDIR" 2>/dev/null || true
-        echo "another pro-gate install is in progress" >&2
-        exit 1
-      fi
-    else
+    if [ -z "$LOCK_START" ] || [ "$LOCK_START" = "$LOCK_OWNER" ] || [ "$LIVE_START" = "$LOCK_START" ]; then
       echo "another pro-gate install is in progress" >&2
       exit 1
     fi
+
+    STALE_LOCK="$PRO_GATE_HOME/.install.lock.stale.$$"
+    if ! mv "$LOCKDIR" "$STALE_LOCK" 2>/dev/null || ! mkdir "$LOCKDIR" 2>/dev/null; then
+      [ -d "$STALE_LOCK" ] && mv "$STALE_LOCK" "$LOCKDIR" 2>/dev/null || true
+      echo "another pro-gate install is in progress" >&2
+      exit 1
+    fi
+    rm -rf "$STALE_LOCK"
+    rmdir "$REAPER_LOCKDIR"
+    REAPER_LOCK_ACQUIRED=0
   fi
   LOCK_ACQUIRED=1
   LOCK_START="$(ps -o lstart= -p "$$" | tr -s '[:space:]' ' ' | sed 's/^ //;s/ $//')"

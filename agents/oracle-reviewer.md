@@ -65,7 +65,7 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
    Bash timeout (≥ 2100000 ms — it blocks 10-30 min):
    ```bash
    OUT="${TMPDIR:-/tmp}/oracle-reviewer-pr-<num>.md"
-   "$RUNTIME_HOME/oracle-review.sh" --pr <num|url> --repo <REPO> \
+   "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --pr <num|url> --repo <REPO> \
      --input <both|bundle|connector> --out "$OUT" --timeout 30m
    ```
    The engine writes single-line JSON to `$OUT.status` at every phase change
@@ -91,7 +91,7 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
      Wait ~10 min, then collect with NO new spend. Read the `marker` field from `$OUT.status`
      (`jq -r .marker`, or the no-jq fallback
      `sed -nE 's/.*"marker":"([^"]+)".*/\1/p'`), then run:
-     `"$RUNTIME_HOME/oracle-review.sh" --harvest "$MARKER" --out "$OUT" --timeout 20m`
+     `"${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --harvest "$MARKER" --out "$OUT" --timeout 20m`
      (exit 0 = relay `$OUT`; exit 9 again = reservation retained (still generating, or a
      below-threshold miss), wait and repeat if your budget allows, else return the unavailable
      envelope quoting the harvest command; exit 3 = browser/CDP trouble with the reservation
