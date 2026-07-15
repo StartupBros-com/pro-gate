@@ -25,6 +25,12 @@ pg_browser_mode() {
 
 # service manager for the daemon: launchd (macOS) | systemd (linux/wsl with systemctl) | none
 pg_service_mgr() {
+  if [ -n "${PRO_GATE_SERVICE_MANAGER:-}" ]; then
+    case "$PRO_GATE_SERVICE_MANAGER" in
+      launchd|systemd|none) echo "$PRO_GATE_SERVICE_MANAGER"; return ;;
+      *) echo "invalid PRO_GATE_SERVICE_MANAGER: $PRO_GATE_SERVICE_MANAGER" >&2; return 1 ;;
+    esac
+  fi
   case "$(pg_os)" in
     macos) echo launchd ;;
     *)     command -v systemctl >/dev/null 2>&1 && echo systemd || echo none ;;

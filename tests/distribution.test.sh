@@ -6,6 +6,7 @@ check() { local name="$1"; shift; if "$@"; then echo "ok - $name"; else echo "FA
 TDIR="$(mktemp -d "${TMPDIR:-/tmp}/pro-gate-distribution.XXXXXX")"
 trap 'rm -rf "$TDIR"' EXIT
 VERSION="$(tr -d '[:space:]' < "$ROOT/VERSION")"
+export PRO_GATE_SERVICE_MANAGER=none
 
 check "plugin owns one skill" test "$(find "$ROOT/skills" -name SKILL.md -type f | wc -l)" -eq 1
 check "plugin owns one agent" test "$(find "$ROOT/agents" -name oracle-reviewer.md -type f | wc -l)" -eq 1
@@ -52,13 +53,15 @@ SVC_BIN="$TDIR/service-bin"; SVC_LOG="$TDIR/service.log"; mkdir -p "$SVC_BIN"
 printf '#!/usr/bin/env bash\nprintf "sudo %%s\\n" "$*" >> "$SVC_LOG"\nif [ "$1" = tee ]; then cat >/dev/null; fi\n' > "$SVC_BIN/sudo"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$SVC_BIN/systemctl"
 chmod +x "$SVC_BIN/sudo" "$SVC_BIN/systemctl"
-HOME="$TDIR/service-home" PRO_GATE_HOME="$TDIR/service-runtime" SVC_LOG="$SVC_LOG" PATH="$SVC_BIN:$PATH" \
+HOME="$TDIR/service-home" PRO_GATE_HOME="$TDIR/service-runtime" PRO_GATE_SERVICE_MANAGER=systemd \
+  SVC_LOG="$SVC_LOG" PATH="$SVC_BIN:$PATH" \
   bash "$ROOT/install.sh" --local-source --version "$VERSION" >"$TDIR/service-install.log" 2>&1
 check "normal systemd install enables Chrome" grep -q 'systemctl enable --now oracle-chrome.service' "$SVC_LOG"
 check "normal systemd install disables daemon" grep -q 'systemctl disable --now pro-review-daemon.service' "$SVC_LOG"
 : > "$SVC_LOG"
 HOME="$TDIR/service-home" PRO_GATE_HOME="$TDIR/service-runtime" PRO_GATE_CONSENT_HOME="$TDIR/service-consent" \
-  SVC_LOG="$SVC_LOG" PATH="$SVC_BIN:$PATH" bash "$ROOT/install.sh" --local-source --version "$VERSION" \
+  PRO_GATE_SERVICE_MANAGER=systemd SVC_LOG="$SVC_LOG" PATH="$SVC_BIN:$PATH" \
+  bash "$ROOT/install.sh" --local-source --version "$VERSION" \
   --daemon --accept-dangerous-mode >"$TDIR/service-daemon.log" 2>&1
 check "daemon install independently enables Chrome" grep -q 'systemctl enable --now oracle-chrome.service' "$SVC_LOG"
 check "daemon install enables daemon service" grep -q 'systemctl enable --now pro-review-daemon.service' "$SVC_LOG"
@@ -67,7 +70,8 @@ MAC_BIN="$TDIR/mac-bin"; MAC_LOG="$TDIR/mac.log"; mkdir -p "$MAC_BIN"
 printf '#!/usr/bin/env bash\nprintf "Darwin\\n"\n' > "$MAC_BIN/uname"
 printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$MAC_LOG"\n' > "$MAC_BIN/launchctl"
 chmod +x "$MAC_BIN/uname" "$MAC_BIN/launchctl"
-HOME="$TDIR/mac-home" PRO_GATE_HOME="$TDIR/mac-runtime" MAC_LOG="$MAC_LOG" PATH="$MAC_BIN:$PATH" \
+HOME="$TDIR/mac-home" PRO_GATE_HOME="$TDIR/mac-runtime" PRO_GATE_SERVICE_MANAGER=launchd \
+  MAC_LOG="$MAC_LOG" PATH="$MAC_BIN:$PATH" \
   bash "$ROOT/install.sh" --local-source --version "$VERSION" >"$TDIR/mac-install.log" 2>&1
 check "macOS normal install unloads daemon" grep -q '^unload ' "$MAC_LOG"
 check "macOS has no separate Chrome service" sh -c "! grep -q oracle-chrome '$MAC_LOG'"
