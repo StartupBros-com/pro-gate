@@ -113,6 +113,10 @@ gh pr edit <n> --add-label pro-review   # set-and-forget: daemon reviews → fix
   style/CI-enforced/generated/pre-existing/speculative noise.
 - **Cost:** the daemon's headless `claude -p` runs carry `--max-budget-usd` + a fallback model; a
   per-PR failure cap prevents poison-PR retry loops.
+- **Convergence:** review→fix→re-review loops are bounded by default. The skill runs at most one
+  confirming re-review per gate (`pro_gate_max_rounds: 2`), and the engine refuses to spend more
+  than `PRO_GATE_MAX_ROUNDS_PER_PR` (default 4) Pro slots on one PR per rolling 24h (exit 12,
+  no spend). Unresolved findings escalate to the human instead of looping for 8+ hours.
 - **Merge authority:** the daemon **never merges** — it stops after pushing fixes and commenting.
 
 ## Roadmap

@@ -61,10 +61,12 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/pro-review.XXXXXX")"
 # single-line JSON updated ATOMICALLY at every phase change — instead of scraping the
 # engine's stderr. Phases: preflight, waiting-pr-lock, waiting-slot, launching,
 # watchdog-killed, live-detected, salvaging, retry-wait, throttled, cloudflare, oversized,
-# deferred, done, failed, in-progress.
+# round-capped, deferred, done, failed, in-progress.
 # Terminal phases: done (read $OUT), failed, deferred (no slot spent: retry later),
-# oversized (no slot spent: scope the diff), in-progress (slot SPENT, model still
-# generating: collect later with --harvest <marker>, NEVER relaunch).
+# oversized (no slot spent: scope the diff), round-capped (no slot spent: this PR/branch
+# already used its review round budget for the window; escalate to a human, do not re-run),
+# in-progress (slot SPENT, model still generating: collect later with --harvest <marker>,
+# NEVER relaunch).
 # v0.20: the JSON carries `marker`, the run's conversation correlation id, so callers can
 # harvest an in-progress review without grepping engine logs.
 STATUS_FILE="$OUT.status"
@@ -119,6 +121,7 @@ pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor,
     8) outcome=deferred ;;
     9) outcome=in-progress ;;
     11) outcome=oversized ;;
+    12) outcome=round-capped ;;
     *) outcome=other ;;
   esac
   [ "${THROTTLED:-0}" = 1 ] && outcome=throttle
@@ -154,12 +157,12 @@ pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor,
   # /c/ tabs accumulate and add load to the account. Best-effort, bounded, non-fatal; matched by
   # RUN_MARKER so we never touch another run's tab. remote-chrome only (native drives the user's
   # own Chrome, where closing tabs is not ours to do). PRO_GATE_KEEP_TABS=1 opts out (debugging).
-  # Skip cleanup for lock-timeout (7), deferred (8), and oversized (11): no slot was spent, so
-  # no conversation tab exists, and a CDP scan there would just waste time. Skip it for
-  # in-progress (9) because the model is STILL GENERATING in that tab: closing it destroys a
-  # spent Pro slot's answer (a 65-minute Pro review was lost exactly this way on 2026-07-09);
-  # the tab stays open for --harvest, which closes it once the review is finally captured.
-  if [ "$rc" != 7 ] && [ "$rc" != 8 ] && [ "$rc" != 9 ] && [ "$rc" != 11 ] \
+  # Skip cleanup for lock-timeout (7), deferred (8), oversized (11), and round-capped (12): no
+  # slot was spent, so no conversation tab exists, and a CDP scan there would just waste time.
+  # Skip it for in-progress (9) because the model is STILL GENERATING in that tab: closing it
+  # destroys a spent Pro slot's answer (a 65-minute Pro review was lost exactly this way on
+  # 2026-07-09); the tab stays open for --harvest, which closes it once finally captured.
+  if [ "$rc" != 7 ] && [ "$rc" != 8 ] && [ "$rc" != 9 ] && [ "$rc" != 11 ] && [ "$rc" != 12 ] \
      && [ "$MODE" = remote-chrome ] && [ "${PRO_GATE_KEEP_TABS:-0}" != 1 ] \
      && [ -n "${RUN_MARKER:-}" ] && command -v node >/dev/null 2>&1; then
     timeout 30 node "$SELF/cdp-salvage.mjs" --close "$RUN_MARKER" 25 "$PORT" >/dev/null 2>&1 || true
@@ -305,16 +308,31 @@ cd "$REPO" || { echo "ERROR: repo dir not found: $REPO" >&2; pg_status failed "r
 # repositories; keying on the bare number let an in-progress repo-A#77 redirect a repo-B#77 gate
 # to repo A's conversation (dogfood review P1, 2026-07-10). Derived from the PR URL when known,
 # else from the git remote, else the checkout name; sanitized to the marker-safe charset.
+REPO_SLUG=""
+if [ -n "$PR_URL" ]; then
+  REPO_SLUG="$(printf '%s' "$PR_URL" | sed -nE 's#https?://[^/]+/([^/]+)/([^/]+)/pull/.*#\1-\2#p')"
+fi
+[ -n "$REPO_SLUG" ] || REPO_SLUG="$(git -C "$REPO" remote get-url origin 2>/dev/null \
+  | sed -nE 's#.*[:/]([^/]+)/([^/]+?)(\.git)?$#\1-\2#p')"
+[ -n "$REPO_SLUG" ] || REPO_SLUG="$(basename "$REPO")"
 PR_KEY=""
-if [ -n "$PR_NUM" ]; then
-  REPO_SLUG=""
-  if [ -n "$PR_URL" ]; then
-    REPO_SLUG="$(printf '%s' "$PR_URL" | sed -nE 's#https?://[^/]+/([^/]+)/([^/]+)/pull/.*#\1-\2#p')"
+[ -n "$PR_NUM" ] && PR_KEY="$(printf '%s-%s' "$REPO_SLUG" "$PR_NUM" | tr -c 'A-Za-z0-9.\n-' '-')"
+
+# ROUND_KEY (v0.22): identity for the review round budget. PR runs use PR_KEY. --diff runs loop
+# just as hard (ledger: 11 diff re-gates of one worktree in a day) but have no PR number, so
+# they key on repo+branch: the unit a review->fix->re-review loop actually iterates on.
+if [ -n "$PR_KEY" ]; then
+  ROUND_KEY="$PR_KEY"
+else
+  ROUND_BRANCH="$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  # A detached checkout reports the literal ref name "HEAD" (typical for CI checkouts of a
+  # bare SHA): one shared per-repo bucket would cross-cap unrelated diffs, so key those
+  # per-commit instead. That under-caps a detached loop that rewrites its SHA every round,
+  # but false-capping strangers is the worse failure for a default-on guard.
+  if [ -z "$ROUND_BRANCH" ] || [ "$ROUND_BRANCH" = HEAD ]; then
+    ROUND_BRANCH="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo detached)"
   fi
-  [ -n "$REPO_SLUG" ] || REPO_SLUG="$(git -C "$REPO" remote get-url origin 2>/dev/null \
-    | sed -nE 's#.*[:/]([^/]+)/([^/]+?)(\.git)?$#\1-\2#p')"
-  [ -n "$REPO_SLUG" ] || REPO_SLUG="$(basename "$REPO")"
-  PR_KEY="$(printf '%s-%s' "$REPO_SLUG" "$PR_NUM" | tr -c 'A-Za-z0-9.\n-' '-')"
+  ROUND_KEY="$(printf '%s-%s-diff' "$REPO_SLUG" "$ROUND_BRANCH" | tr -c 'A-Za-z0-9.\n-' '-')"
 fi
 
 if [ -z "$DIFF_FILE" ]; then
@@ -482,6 +500,13 @@ EFF_CONC="$(pg_ramp_level "$MAX_CONC")"
 # file's inode alive, so deleting an unheld file is always safe).
 find "$(dirname "$LOCKFILE")" -maxdepth 1 -name "$(basename "$LOCKFILE").pr-*" -mmin +1440 -delete 2>/dev/null || true
 find "${PRO_GATE_HARVEST_LOCK_DIR:-$PRO_GATE_HOME/harvest-locks}" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
+# Round-budget state (v0.22): entries self-prune on write, but a key never gated again keeps
+# its file (and its 0-byte .lock) forever. Sweep files untouched for longer than the rounds
+# window (every entry inside is expired), floored at 24h so a short window never deletes a
+# lock a live process might hold (same safety argument as the sweeps above).
+ROUND_SWEEP_MIN=$(( $(pg_round_window_secs) / 60 ))
+[ "$ROUND_SWEEP_MIN" -lt 1440 ] && ROUND_SWEEP_MIN=1440
+find "$(pg_rounds_dir)" -maxdepth 1 -type f -mmin "+${ROUND_SWEEP_MIN}" -delete 2>/dev/null || true
 # Sweep idle chatgpt.com ROOT tabs (leaked by killed pre-submission runs; the marker-based
 # close can't see them, and each is a renderer eating the review box's memory headroom).
 # Only when NO oracle CLI is <120s old: a younger one may still be pre-navigation on a root
@@ -519,19 +544,42 @@ if [ "$MODE" = remote-chrome ]; then
   fi
 fi
 
-# Per-PR guard (acquire BEFORE a slot, so same-PR callers serialize without holding a scarce
-# slot). Keyed by repo-scoped PR_KEY: bare numbers collide across repositories.
+# v0.22: review round budget. Refuse to spend ANOTHER Pro slot on a PR/branch that already
+# used its rounds inside the rolling window (default 4 per 24h): unbounded review->fix->
+# re-review loops burned 10-16 slots on single PRs (8h+ gates, queue starvation). Checked
+# AFTER the reservation redirect above: an in-progress conversation harvests for FREE and must
+# never be blocked by the budget. Exit 12, NO quota spent; escalate remaining findings to a
+# human instead of re-running.
+round_capped() {  # $1 = reason
+  echo "ERROR: ${1}; not spending another Pro review slot on this change." >&2
+  echo "  A gate that keeps cycling review->fix->re-review is not converging: escalate the remaining findings to a human instead." >&2
+  echo "  Deliberate override for ONE run: PRO_GATE_FORCE_ROUND=1. Tunables: PRO_GATE_MAX_ROUNDS_PER_PR, PRO_GATE_ROUNDS_WINDOW; PRO_GATE_ROUND_GUARD=0 disables." >&2
+  pg_status round-capped "$1"
+  pg_finish 12
+}
+if ! ROUND_REASON="$(pg_round_guard "$ROUND_KEY")"; then
+  round_capped "$ROUND_REASON"
+fi
+
+# Per-change guard (acquire BEFORE a slot, so same-change callers serialize without holding a
+# scarce slot). Keyed by ROUND_KEY: the repo-scoped PR_KEY for PR runs (bare numbers collide
+# across repositories; the lock filename is unchanged for them), repo+branch for --diff runs.
+# v0.22: --diff runs serialize here too. Without this, concurrent same-branch diff gates raced
+# the round-budget check-then-record window and overshot the cap (review P0: 5 concurrent
+# diff runs all passed a cap of 1), and two parallel reviews of one branch are the same
+# double-spend the per-PR lock exists to stop.
+echo "[oracle-review] per-change guard for ${PR_NUM:+pr #}${PR_NUM:-this diff} (${ROUND_KEY}; serializes same-change reviews)..." >&2
+pg_status waiting-pr-lock
+if ! pg_lock "${LOCKFILE}.pr-${ROUND_KEY}" "$LOCK_WAIT"; then
+  echo "ERROR: timed out after ${LOCK_WAIT}s — ${ROUND_KEY} is already under review elsewhere." >&2
+  pg_status failed "per-change lock timeout"
+  pg_finish 7
+fi
 if [ -n "${PR_KEY}" ]; then
-  echo "[oracle-review] per-PR guard for pr #${PR_NUM} (${PR_KEY}; serializes same-PR reviews)..." >&2
-  pg_status waiting-pr-lock
-  if ! pg_lock "${LOCKFILE}.pr-${PR_KEY}" "$LOCK_WAIT"; then
-    echo "ERROR: timed out after ${LOCK_WAIT}s — pr #${PR_NUM} is already under review elsewhere." >&2
-    pg_status failed "per-PR lock timeout"
-    pg_finish 7
-  fi
   # The previous same-PR process may have exited 9 while we waited and written a reservation
   # just before releasing this flock. Re-check now that we own the per-PR lock; otherwise this
-  # waiter would immediately submit a duplicate review.
+  # waiter would immediately submit a duplicate review. (PR runs only: reservations are keyed
+  # by PR identity.)
   RESERVED_MARKER="$(pg_reservation_find_pr "$PR_KEY" 2>/dev/null || true)"
   if [ -n "$RESERVED_MARKER" ]; then
     RUN_MARKER="$RESERVED_MARKER"
@@ -539,6 +587,12 @@ if [ -n "${PR_KEY}" ]; then
     pg_status in-progress "existing reservation ${RESERVED_MARKER}; harvest required"
     pg_finish 9
   fi
+fi
+# Round-budget re-check for ALL runs, now that we own the per-change lock: the same-change
+# run(s) this waiter queued behind may have consumed the last round during the (up to 40 min)
+# wait. Check-then-record is race-free from here on because the lock is held until exit.
+if ! ROUND_REASON="$(pg_round_guard "$ROUND_KEY")"; then
+  round_capped "$ROUND_REASON (spent while this run waited on the per-change lock)"
 fi
 
 echo "[oracle-review] acquiring a review slot (effective ${EFF_CONC} of ceiling ${MAX_CONC}; waits up to ${LOCK_WAIT}s if all busy)..." >&2
@@ -693,6 +747,10 @@ while :; do
     case "$GATE_REASON" in *"throttle cooldown"*) THROTTLED=1 ;; esac
     break
   fi
+
+  # v0.22: this invocation is now committed to spending a slot: record its round (once; the
+  # guarded retry below is the same round, and pre-launch exits above never record).
+  [ "$attempt" -eq 0 ] && pg_round_record "$ROUND_KEY"
 
   echo "[oracle-review] launching the final-tier Pro review (attempt $((attempt + 1)), oracle timeout $TIMEOUT, hard cap ${HARD_SECS}s, stall/no-think watchdog ${STALL_SECS}s/${NOTHINK_SECS}s)..." >&2
   pg_status launching "strategy ${PRO_GATE_MODEL_STRATEGY:-current}"

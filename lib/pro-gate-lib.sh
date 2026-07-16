@@ -641,6 +641,121 @@ pg_ramp_update() {  # $1 = clean|throttle|failed, $2 = ceiling
   return 0
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.22: per-PR review round budget. Ledger evidence (2026-07-08..16): unbounded
+# review->fix->re-review loops spent 10-16 Pro slots on a SINGLE PR in one day (each slot
+# 10-60+ min, serialized against one account), 8h+ of wall clock per PR plus queue starvation
+# for every other PR. Each slot-spending engine invocation records one "round" against a
+# repo-scoped key (PR_KEY for PR runs; repo+branch for --diff runs); a fresh run whose key has
+# already used PRO_GATE_MAX_ROUNDS_PER_PR rounds (default 4) inside the rolling
+# PRO_GATE_ROUNDS_WINDOW (default 24h) is refused BEFORE any lock or slot is taken (exit 12,
+# NO quota spent). Harvests and no-spend exits (7 lock timeout, 8 deferred, 11 oversized,
+# 12 round-capped) never record a round. PRO_GATE_ROUND_GUARD=0 disables the budget;
+# PRO_GATE_FORCE_ROUND=1 lets ONE deliberate invocation past the cap (its round still records,
+# so the next unforced run stays capped). State: $PRO_GATE_HOME/rounds/<key>, one
+# epoch-seconds line per slot-spending run, pruned to the window on every record.
+# ─────────────────────────────────────────────────────────────────────────────
+pg_rounds_dir() { echo "${PRO_GATE_ROUNDS_DIR:-$PRO_GATE_HOME/rounds}"; }
+
+pg_round_window_secs() {
+  # pg_dur_secs falls back to 1800s on garbage, the right direction for timeouts ("a typo can
+  # never mean no timeout") but the WRONG one here: "1d" or "24hr" would silently shrink the
+  # 24h window to 30 min and un-cap the loop. Validate first and fail LARGE (24h) instead.
+  local w="${PRO_GATE_ROUNDS_WINDOW:-24h}" n
+  n="${w%[smhSMH]}"
+  case "$n" in ''|*[!0-9]*)
+    echo "[pro-gate rounds] unparseable PRO_GATE_ROUNDS_WINDOW='${w}' (use 90 / 45m / 24h); defaulting to 24h" >&2
+    echo 86400; return;;
+  esac
+  pg_dur_secs "$w"
+}
+
+# Keys become filenames under PRO_GATE_HOME: enforce the same safe charset as reservation
+# markers (every character, no "/" anywhere).
+pg_round_key_ok() {
+  case "${1:-}" in '') return 1;; *[!A-Za-z0-9.-]*) return 1;; *) return 0;; esac
+}
+
+pg_round_count() {  # $1 = key; echoes the rounds recorded inside the rolling window
+  local key="$1" f now win t n=0
+  pg_round_key_ok "$key" || { echo 0; return; }
+  f="$(pg_rounds_dir)/$key"
+  [ -f "$f" ] || { echo 0; return; }
+  win="$(pg_round_window_secs)"; now="$(date +%s)"
+  while IFS= read -r t; do
+    case "$t" in ''|*[!0-9]*) continue;; esac
+    [ $(( now - t )) -lt "$win" ] && n=$(( n + 1 ))
+  done < "$f"
+  echo "$n"
+}
+
+pg_round_record() {  # $1 = key; prune entries older than the window, append now. Best-effort
+  # bookkeeping (same posture as pg_ledger_append): it must never fail a review, but every
+  # fail-open path WARNS on stderr, because a silently unrecordable round means the budget
+  # under-counts and the guard quietly stops guarding. Same-key engine runs are already
+  # serialized by the per-change lock; this file lock just keeps the rewrite atomic against
+  # out-of-band readers/writers.
+  local key="$1" dir f now win t rfd lockdir="" waited=0
+  pg_round_key_ok "$key" || return 0
+  dir="$(pg_rounds_dir)"
+  mkdir -p "$dir" 2>/dev/null || {
+    echo "[pro-gate rounds] cannot create ${dir}; round NOT recorded (budget will under-count)" >&2
+    return 0
+  }
+  f="$dir/$key"; win="$(pg_round_window_secs)"; now="$(date +%s)"
+  if pg_have flock; then
+    if ! { { exec {rfd}>>"$f.lock"; } 2>/dev/null && flock -w 10 "$rfd" 2>/dev/null; }; then
+      echo "[pro-gate rounds] could not lock ${f}; round NOT recorded (budget will under-count)" >&2
+      [ -n "${rfd:-}" ] && eval "exec ${rfd}>&-" 2>/dev/null
+      return 0
+    fi
+  else
+    lockdir="$f.lock.d"
+    while ! mkdir "$lockdir" 2>/dev/null; do
+      waited=$(( waited + 1 ))
+      if [ "$waited" -ge 10 ]; then
+        echo "[pro-gate rounds] could not lock ${f}; round NOT recorded (budget will under-count)" >&2
+        return 0
+      fi
+      sleep 1
+    done
+  fi
+  {
+    if [ -f "$f" ]; then
+      while IFS= read -r t; do
+        case "$t" in ''|*[!0-9]*) continue;; esac
+        [ $(( now - t )) -lt "$win" ] && printf '%s\n' "$t"
+      done < "$f"
+    fi
+    printf '%s\n' "$now"
+  } > "$f.tmp" 2>/dev/null && mv -f "$f.tmp" "$f" \
+    || echo "[pro-gate rounds] could not write ${f}; round NOT recorded (budget will under-count)" >&2
+  [ -n "${rfd:-}" ] && eval "exec ${rfd}>&-" 2>/dev/null
+  [ -n "$lockdir" ] && rmdir "$lockdir" 2>/dev/null
+  return 0
+}
+
+pg_round_guard() {  # $1 = key. 0 = proceed; 1 + a one-line reason on stdout = budget spent.
+  local key="$1" cap used
+  [ "${PRO_GATE_ROUND_GUARD:-1}" = 1 ] || return 0
+  [ "${PRO_GATE_FORCE_ROUND:-0}" = 1 ] && return 0   # deliberate one-invocation override
+  pg_round_key_ok "$key" || return 0
+  cap="${PRO_GATE_MAX_ROUNDS_PER_PR:-4}"
+  case "$cap" in ''|*[!0-9]*) cap=4;; esac
+  # cap 0 takes its natural reading: ZERO fresh runs allowed (an operator lockdown of a
+  # runaway change). "Unlimited" is PRO_GATE_ROUND_GUARD=0, never a magic cap value.
+  if [ "$cap" -eq 0 ]; then
+    echo "review round budget for ${key} is 0: fresh Pro runs are disabled (PRO_GATE_MAX_ROUNDS_PER_PR=0)"
+    return 1
+  fi
+  used="$(pg_round_count "$key")"
+  if [ "$used" -ge "$cap" ]; then
+    echo "review round budget exhausted for ${key}: ${used}/${cap} slot-spending runs in the last ${PRO_GATE_ROUNDS_WINDOW:-24h}"
+    return 1
+  fi
+  return 0
+}
+
 # pg_filter_diff <in> <out>: strip diff sections for noise paths (lockfiles, generated,
 # vendored, minified, snapshots) so the Pro model spends its thinking budget on real code and
 # its review window stays short. Writes the filtered unified diff to <out>; prints each

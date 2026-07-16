@@ -69,7 +69,7 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
      --input <both|bundle|connector> --out "$OUT" --timeout 30m
    ```
    The engine writes single-line JSON to `$OUT.status` at every phase change
-   (`preflight → waiting-slot → launching → … → done|failed|deferred|in-progress|oversized`).
+   (`preflight → waiting-slot → launching → … → done|failed|deferred|in-progress|oversized|round-capped`).
    If your Bash call is interrupted or times out, do NOT relaunch: read `$OUT.status` first;
    phases `throttled` and `salvaging` mean the engine is still working and quota may already
    be spent. The JSON carries `marker`: the run's conversation id, needed for `--harvest`.
@@ -106,6 +106,12 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
      `PRO_GATE_MAX_DIFF_LINES` (default 6000) and will not converge. Unavailable envelope;
      tell the caller to scope the gate (`--diff <delta.patch>` of the un-gated commits):
      do NOT blind-retry.
+   - `12`: review round budget exhausted (engine >=v0.22), **no quota spent**: this PR (or
+     repo+branch for `--diff`) already spent `PRO_GATE_MAX_ROUNDS_PER_PR` (default 4) review
+     slots inside the rolling window (default 24h): the review→fix→re-review loop is not
+     converging. Unavailable envelope; tell the caller to escalate the remaining findings to
+     a human instead of re-running (a deliberate operator override is
+     `PRO_GATE_FORCE_ROUND=1` for one run). Do NOT retry.
    - `2`/`4`/`5` — caller error (usage/repo/diff): unavailable envelope with the reason.
 
 ## Output envelope

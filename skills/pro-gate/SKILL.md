@@ -88,6 +88,8 @@ engine home is `$HOME/.pro-review-daemon`.
   `auto-fix+merge` requires the guarded-merge rules; if they aren't satisfied, fall back to
   `auto-fix` and leave the PR for the human.
 - **Input:** `pro_gate_input` (`both` default | `bundle` | `connector`).
+- **Rounds:** `pro_gate_max_rounds` (default `2`): total engine runs this gate may spend,
+  initial review + at most one confirming re-review (section 6).
 
 ## 2. Guardrails (before spending a ~10-30 min Pro review slot)
 
@@ -112,6 +114,12 @@ engine home is `$HOME/.pro-review-daemon`.
   temporarily limited" interstitial, the engine writes `$PRO_GATE_HOME/throttle.cooldown` and every
   new run DEFERS (exit 8, no quota spent) until it expires (`PRO_GATE_THROTTLE_COOLDOWN`, default
   900s). Never delete the cooldown file to force a run — hammering extends the throttle.
+- **Review round budget (engine ≥v0.22):** unbounded review→fix→re-review loops have burned
+  10-16 Pro slots on a single PR in one day (8h+ of wall clock; every other queued PR starves).
+  The engine refuses a fresh run for a PR (repo+branch for `--diff`) that already spent
+  `PRO_GATE_MAX_ROUNDS_PER_PR` (default 4) slots inside the rolling `PRO_GATE_ROUNDS_WINDOW`
+  (default 24h): exit 12, NO quota spent. Harvests never count against it. This is the backstop,
+  not the plan: design the gate around section 6's bounded re-review policy so you never hit it.
 
 ## 3. Run the review
 
@@ -124,12 +132,12 @@ Launch the engine in the background (it blocks ~10-30 min) and poll its **status
 ```
 
 Run with `run_in_background: true` and a long Bash timeout. The engine writes single-line JSON to
-`<out>.status` at every phase change (`preflight → waiting-slot → launching → … → done|failed|deferred|in-progress|oversized`):
+`<out>.status` at every phase change (`preflight → waiting-slot → launching → … → done|failed|deferred|in-progress|oversized|round-capped`):
 poll THAT, not engine logs. Phase `done` ⇒ read `--out` (the `[Pn] file:line` blocks ending in a
-`VERDICT:` line). `failed`/`deferred`/`in-progress`/`oversized` are terminal for this invocation:
-do NOT relaunch on `throttled`/`salvaging` phases; the engine is still working. While waiting,
-never spawn a second oracle run for the same PR. The status JSON carries `marker` (the run's
-conversation correlation id): you need it for `--harvest`.
+`VERDICT:` line). `failed`/`deferred`/`in-progress`/`oversized`/`round-capped` are terminal for
+this invocation: do NOT relaunch on `throttled`/`salvaging` phases; the engine is still working.
+While waiting, never spawn a second oracle run for the same PR. The status JSON carries `marker`
+(the run's conversation correlation id): you need it for `--harvest`.
 
 Engine exit codes: `0` review ready · `2` bad usage · `3` oracle/browser missing · `4` repo not
 found · `5` diff fetch failed · `6` ran but no usable review (quota may be spent — check the PR
@@ -137,7 +145,10 @@ conversation in ChatGPT before re-running) · `7` lock timeout · `8` deferred, 
 (box unfit or throttle cooldown: safe to retry later) · `9` in-progress: the slot IS spent but
 the model was still generating when the salvage budget ran out; the conversation tab is left
 open: NEVER relaunch, harvest instead (below) · `11` oversized diff, NO quota spent: scope
-the payload (below) instead of re-running.
+the payload (below) instead of re-running · `12` round budget exhausted, NO quota spent: this
+PR/branch already used its review rounds for the window (section 6): do NOT re-run; post the
+still-unresolved findings for the human, or set `PRO_GATE_FORCE_ROUND=1` for one deliberate
+extra run.
 
 **Exit 9 (`in-progress`): harvest, don't respend.** The Pro model can reason for 45-90+ minutes
 on a heavy payload (observed 65 min on 2026-07-09): longer than the engine can hold a review
@@ -194,11 +205,29 @@ issue · your confidence) plus the verdict.
   green, no unresolved P0/P1, and the diff doesn't touch high-risk domains
   (auth/payments/migrations/secrets) — otherwise escalate to the human.
 
-## 6. Re-review (optional)
+## 6. Re-review (bounded by default)
 
-If fixes were applied and `pro_gate_max_rounds > 1`, run one more pass on the updated diff to confirm
-the P0/P1 issues are resolved. Reuse the same ChatGPT conversation via `oracle ... --followup <slug>`
-when possible to keep context (and cost) down.
+A Pro review of fresh code almost never comes back empty: every fix push is new code plus
+reviewer nondeterminism, so "loop until clean" does NOT converge (observed: 10-16 rounds and
+8h+ on one PR). The default is ONE confirming re-review, then stop:
+
+- `pro_gate_max_rounds` (`<repo>/.compound-engineering/config.local.yaml`, default **2**) is the
+  total engine runs this gate may make: the initial review plus at most one confirming pass.
+  Raise it only deliberately; the engine independently budgets ALL callers per PR
+  (`PRO_GATE_MAX_ROUNDS_PER_PR`, exit 12, section 2).
+- Re-review ONLY when confirmed P0/P1 fixes were applied this gate. P2/P3-only fixes: commit,
+  post the comment, stop. A `NEEDS-DISCUSSION` verdict is a human decision, not a fix loop.
+- Keep the confirming pass cheap and scoped: reuse the same ChatGPT conversation via
+  `oracle ... --followup <slug>` when possible, and judge it ONLY on whether the previous
+  round's P0/P1s are resolved.
+- In the confirming pass: fix and post any NEW P0/P1 it surfaces, but do not start a third
+  round for them; post new P2/P3 as notes. If a finding you already fixed comes back, stop and
+  escalate: the fixer and reviewer disagree, and another loop will not settle it.
+- Stop immediately when any of: verdict `SHIP`; no new P0/P1; `pro_gate_max_rounds` reached;
+  engine exit 12.
+- Stopping with unresolved P0/P1 is the DESIGNED outcome, not a failure: list them in the PR
+  comment under **Unresolved (needs human decision)** so the human sees exactly what the gate
+  could not settle, then end the gate.
 
 Always leave an audit trail: the full Pro review + the fix summary as a PR comment. Head the
 comment with the model the run resolved (the status file's `model` field, `jq -r .model <out>.status`;
