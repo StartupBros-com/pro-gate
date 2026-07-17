@@ -521,8 +521,10 @@ check 'cap 0 blocks a fresh change (exit 12)' "$([ "$RC" -eq 12 ]; echo $?)" "rc
 check 'cap 0 status phase round-capped' "$([ "$(phase_of "$RHOME/o-r0.md.status")" = round-capped ]; echo $?)" "$(cat "$RHOME/o-r0.md.status" 2>/dev/null)"
 
 # --diff runs serialize on the per-change lock (review P0: without it, concurrent same-branch
-# diff gates race the budget's check-then-record window and overshoot the cap).
-DKEY="$(printf '%s-detached-diff' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
+# diff gates race the budget's check-then-record window and overshoot the cap). The key
+# carries a cksum of the raw repo:branch identity (sanitization is lossy).
+DCK="$(printf '%s:%s' "$(basename "$TDIR")" detached | cksum | awk '{print $1}')"
+DKEY="$(printf '%s-detached-%s-diff' "$(basename "$TDIR")" "$DCK" | tr -c 'A-Za-z0-9.\n-' '-')"
 exec {DLFD}>>"$RHOME/oracle.lock.pr-${DKEY}"; flock -n "$DLFD"
 printf 'foreign idle tab\n' > "$TDIR/tab.txt"
 env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
@@ -551,7 +553,23 @@ env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO
   >"$TDIR/stdout" 2>"$TDIR/stderr"
 RC=$?
 check 'detached-HEAD --diff run proceeds' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
-check 'detached-HEAD key is per-commit (short SHA, not HEAD)' "$([ -f "$RHOME/rounds/detached-repo-${GSHA}-diff" ]; echo $?)" "rounds dir: $(ls "$RHOME/rounds" 2>/dev/null)"
+GCK="$(printf '%s:%s' detached-repo "$GSHA" | cksum | awk '{print $1}')"
+check 'detached-HEAD key is per-commit (short SHA + cksum, not HEAD)' "$([ -f "$RHOME/rounds/detached-repo-${GSHA}-${GCK}-diff" ]; echo $?)" "rounds dir: $(ls "$RHOME/rounds" 2>/dev/null)"
+
+# A same-change reservation redirects --diff runs to harvest too (dogfood gate P1: reservation
+# identity is ROUND_KEY for all runs, no longer the shared literal "diff" for diff mode).
+RMK="pg-run-${DKEY}-1700000040-77"
+printf '%s\t%s\t%s\t0\t\n' "$DKEY" "$RHOME/o-rres.md" "$(date +%s)" > "$RHOME/in-progress/$RMK"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-ok" NODE_OPTIONS= \
+  bash "$ENGINE" --diff "$TDIR/small.diff" --repo "$TDIR" --out "$RHOME/o-rres.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'same-branch --diff reservation redirects to harvest (exit 9)' "$([ "$RC" -eq 9 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+check '--diff redirect publishes the RESERVED marker' "$(grep -qF "\"marker\":\"$RMK\"" "$RHOME/o-rres.md.status"; echo $?)" "$(cat "$RHOME/o-rres.md.status" 2>/dev/null)"
+rm -f "$RHOME/in-progress/$RMK"
 
 # A window typo must fail LARGE (24h), never shrink to pg_dur_secs's 30-min fallback.
 WIN_TYPO="$(PRO_GATE_ROUNDS_WINDOW=1d bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_window_secs" 2>/dev/null)"

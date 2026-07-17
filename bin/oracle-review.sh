@@ -248,9 +248,9 @@ if [ -n "$HARVEST_MARKER" ]; then
     mv "$HARVEST_TMP" "$OUT"
     pg_reservation_remove "$RUN_MARKER" || true
     # v0.22: a harvest completes the round the exit-9 run already recorded, so refresh the
-    # round budget's last-severity sidecar too. The marker embeds the PR key for PR runs
-    # ("pg-run-<key>-<epoch>-<pid>"); legacy/diff markers resolve to keys with no recorded
-    # rounds and are skipped inside the helper (best-effort, advisory only).
+    # round budget's last-severity sidecar too. The marker embeds ROUND_KEY
+    # ("pg-run-<key>-<epoch>-<pid>") for PR and --diff runs alike; legacy markers resolve to
+    # keys with no recorded rounds and are skipped inside the helper (best-effort, advisory).
     HARVEST_KEY="${RUN_MARKER#pg-run-}"; HARVEST_KEY="${HARVEST_KEY%-*-*}"
     pg_round_note_severity "$HARVEST_KEY" "$OUT"
     SALVAGED=1
@@ -338,7 +338,11 @@ else
   if [ -z "$ROUND_BRANCH" ] || [ "$ROUND_BRANCH" = HEAD ]; then
     ROUND_BRANCH="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo detached)"
   fi
-  ROUND_KEY="$(printf '%s-%s-diff' "$REPO_SLUG" "$ROUND_BRANCH" | tr -c 'A-Za-z0-9.\n-' '-')"
+  # Disambiguate with a checksum of the RAW identity: sanitization is lossy ("feature/foo"
+  # and "feature-foo" both sanitize to "feature-foo"), and colliding keys would share one
+  # branch's budget and lock across unrelated branches (dogfood gate P1).
+  ROUND_SUM="$(printf '%s:%s' "$REPO_SLUG" "$ROUND_BRANCH" | cksum 2>/dev/null | awk '{print $1}')"
+  ROUND_KEY="$(printf '%s-%s%s-diff' "$REPO_SLUG" "$ROUND_BRANCH" "${ROUND_SUM:+-$ROUND_SUM}" | tr -c 'A-Za-z0-9.\n-' '-')"
 fi
 
 if [ -z "$DIFF_FILE" ]; then
@@ -407,7 +411,10 @@ fi
 # same PR (which would suppress the retry and serve a stale review for a
 # new head). The marker lands in the user message, hence in the tab's
 # innerText, without asking the model to echo anything.
-RUN_MARKER="pg-run-${PR_KEY:-diff}-$(date +%s)-$$"
+# v0.22 (dogfood gate P1): embed ROUND_KEY, not PR_KEY. It is identical for PR runs, but it
+# gives --diff runs a real per-change identity instead of the shared literal "diff", so their
+# exit-9 reservations can redirect same-branch re-runs to harvest like PR runs always could.
+RUN_MARKER="pg-run-${ROUND_KEY:-diff}-$(date +%s)-$$"
 PROMPT_FILE="$WORK/prompt.md"
 {
   # Lead with the @GitHub connector tag + an explicit directive (belt-and-suspenders: oracle
@@ -528,25 +535,25 @@ if [ "$MODE" = remote-chrome ] && [ "${PRO_GATE_TAB_SWEEP:-1}" = 1 ] && command 
   fi
 fi
 
-# Reconcile durable reservations from earlier exit-9 runs before dispatch. A same-PR
+# Reconcile durable reservations from earlier exit-9 runs before dispatch. A same-change
 # reservation redirects this invocation to HARVEST instead of spending a second slot. This is
 # enforced in the engine (not merely caller docs), so a killed headless caller cannot double-
-# spend on its next daemon cycle. Native mode has no marker-addressable CDP, so no reservations
-# are created there.
+# spend on its next daemon cycle. v0.22 (dogfood gate P1): keyed by ROUND_KEY so --diff runs
+# redirect too; before, their reservations carried the shared literal "diff" and a same-branch
+# re-run could submit a duplicate while the first review was still generating. Native mode has
+# no marker-addressable CDP, so no reservations are created there.
 if [ "$MODE" = remote-chrome ]; then
   pg_reservation_reconcile "$SELF/cdp-salvage.mjs" "$PORT"
-  if [ -n "${PR_KEY}" ]; then
-    RESERVED_MARKER="$(pg_reservation_find_pr "$PR_KEY" 2>/dev/null || true)"
-    if [ -n "$RESERVED_MARKER" ]; then
-      # Publish the RESERVED conversation's marker, not this invocation's fresh one: callers
-      # harvest whatever the status JSON names (dogfood review P1: the fresh marker names a
-      # conversation that does not exist).
-      RUN_MARKER="$RESERVED_MARKER"
-      echo "[oracle-review] pr #${PR_NUM} already has an in-progress Pro conversation (${RESERVED_MARKER}): harvesting it instead of submitting again." >&2
-      pg_status in-progress "existing reservation ${RESERVED_MARKER}; harvest required"
-      echo "  ${PRO_GATE_HOME:-\$HOME/.pro-review-daemon}/oracle-review.sh --harvest '${RESERVED_MARKER}' --out '${OUT}' --timeout 20m" >&2
-      pg_finish 9
-    fi
+  RESERVED_MARKER="$(pg_reservation_find_pr "$ROUND_KEY" 2>/dev/null || true)"
+  if [ -n "$RESERVED_MARKER" ]; then
+    # Publish the RESERVED conversation's marker, not this invocation's fresh one: callers
+    # harvest whatever the status JSON names (dogfood review P1: the fresh marker names a
+    # conversation that does not exist).
+    RUN_MARKER="$RESERVED_MARKER"
+    echo "[oracle-review] ${ROUND_KEY} already has an in-progress Pro conversation (${RESERVED_MARKER}): harvesting it instead of submitting again." >&2
+    pg_status in-progress "existing reservation ${RESERVED_MARKER}; harvest required"
+    echo "  ${PRO_GATE_HOME:-\$HOME/.pro-review-daemon}/oracle-review.sh --harvest '${RESERVED_MARKER}' --out '${OUT}' --timeout 20m" >&2
+    pg_finish 9
   fi
 fi
 
@@ -561,14 +568,32 @@ round_capped() {  # $1 = reason
   # reviewer's own claims, exactly the signal observed to oscillate across rounds), but a cap
   # hit while the change's LAST completed review reported P0s is the one case a human may
   # want to grant PRO_GATE_FORCE_ROUND=1, so say it loudly instead of burying it.
-  local sev="" last_p0="" last_p1="" note=""
+  local sev="" last_p0="" last_p1="" note="" pfd inflight=0
   if sev="$(pg_round_last_severity "$ROUND_KEY")"; then
     last_p0="${sev%% *}"; last_p1="${sev##* }"
     note="; last completed review: ${last_p0} P0 / ${last_p1} P1 unconfirmed by a re-review"
   fi
+  # Non-blocking probe: a same-change run holding the per-change lock right now means the
+  # sidecar note above describes the round BEFORE the one in flight; its completion may
+  # change the picture, so tell the human to re-read before granting a forced round (the
+  # refusal itself stays correct either way: a recorded spend never un-spends). Skipped when
+  # THIS process owns the lock (post-lock re-check site): flock on a second fd would report
+  # our own lock as a foreign in-flight run.
+  if [ "${CHANGE_LOCK_HELD:-0}" = 1 ]; then
+    inflight=0
+  elif pg_have flock; then
+    if { exec {pfd}>>"${LOCKFILE}.pr-${ROUND_KEY}"; } 2>/dev/null; then
+      flock -n "$pfd" 2>/dev/null || inflight=1
+      eval "exec ${pfd}>&-" 2>/dev/null
+    fi
+  elif [ -d "${LOCKFILE}.pr-${ROUND_KEY}.d" ]; then
+    inflight=1
+  fi
+  [ "$inflight" = 1 ] && [ -n "$note" ] && note="${note} (a same-change review is in flight NOW: re-check this note after it completes)"
   echo "ERROR: ${1}; not spending another Pro review slot on this change." >&2
   if [ "${last_p0:-0}" -gt 0 ] 2>/dev/null; then
     echo "  ATTENTION: OPEN P0. The most recent completed review reported ${last_p0} P0 finding(s) that no re-review has confirmed fixed. If the fixes have landed, this is the case PRO_GATE_FORCE_ROUND=1 exists for: surface it to a human now." >&2
+    [ "$inflight" = 1 ] && echo "  (A same-change review is in flight right now; wait for it before deciding, its result may already settle these.)" >&2
   fi
   echo "  A gate that keeps cycling review->fix->re-review is not converging: escalate the remaining findings to a human instead." >&2
   echo "  Deliberate override for ONE run: PRO_GATE_FORCE_ROUND=1. Tunables: PRO_GATE_MAX_ROUNDS_PER_PR, PRO_GATE_ROUNDS_WINDOW; PRO_GATE_ROUND_GUARD=0 disables." >&2
@@ -593,18 +618,16 @@ if ! pg_lock "${LOCKFILE}.pr-${ROUND_KEY}" "$LOCK_WAIT"; then
   pg_status failed "per-change lock timeout"
   pg_finish 7
 fi
-if [ -n "${PR_KEY}" ]; then
-  # The previous same-PR process may have exited 9 while we waited and written a reservation
-  # just before releasing this flock. Re-check now that we own the per-PR lock; otherwise this
-  # waiter would immediately submit a duplicate review. (PR runs only: reservations are keyed
-  # by PR identity.)
-  RESERVED_MARKER="$(pg_reservation_find_pr "$PR_KEY" 2>/dev/null || true)"
-  if [ -n "$RESERVED_MARKER" ]; then
-    RUN_MARKER="$RESERVED_MARKER"
-    echo "[oracle-review] pr #${PR_NUM} became in-progress while waiting (${RESERVED_MARKER}): harvest required, not resubmitting." >&2
-    pg_status in-progress "existing reservation ${RESERVED_MARKER}; harvest required"
-    pg_finish 9
-  fi
+CHANGE_LOCK_HELD=1   # round_capped's in-flight probe must not mistake our own lock for a peer
+# The previous same-change process may have exited 9 while we waited and written a reservation
+# just before releasing this flock. Re-check now that we own the per-change lock; otherwise
+# this waiter would immediately submit a duplicate review.
+RESERVED_MARKER="$(pg_reservation_find_pr "$ROUND_KEY" 2>/dev/null || true)"
+if [ -n "$RESERVED_MARKER" ]; then
+  RUN_MARKER="$RESERVED_MARKER"
+  echo "[oracle-review] ${ROUND_KEY} became in-progress while waiting (${RESERVED_MARKER}): harvest required, not resubmitting." >&2
+  pg_status in-progress "existing reservation ${RESERVED_MARKER}; harvest required"
+  pg_finish 9
 fi
 # Round-budget re-check for ALL runs, now that we own the per-change lock: the same-change
 # run(s) this waiter queued behind may have consumed the last round during the (up to 40 min)
@@ -960,7 +983,7 @@ elif [ "${SALVAGE_RC:-0}" -eq 3 ]; then
   # releases its flock slot, leave the tab open (pg_finish skips close for exit 9), and hand the
   # caller a no-respend collection path. Fresh runs reconcile/respect the reservation, so actual
   # account concurrency and same-PR serialization remain correct after this wrapper exits.
-  if ! pg_reservation_write "$RUN_MARKER" "${PR_KEY:-diff}" "$OUT" "${SLOT_HELD:-}" "$RESOLVED_MODEL"; then
+  if ! pg_reservation_write "$RUN_MARKER" "${ROUND_KEY:-diff}" "$OUT" "${SLOT_HELD:-}" "$RESOLVED_MODEL"; then
     # Fail closed: without the durable reservation, exit 9 would under-count a live Pro tab and
     # let the next invocation double-spend. Keep the process/locks alive rather than release
     # unreserved capacity; this should only happen on a broken/unwritable PRO_GATE_HOME.

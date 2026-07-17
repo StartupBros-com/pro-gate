@@ -102,8 +102,9 @@ engine home is `$HOME/.pro-review-daemon`.
 - **Concurrency is handled for you:** `oracle-review.sh` holds a counting semaphore —
   **serialized by default** (`PRO_GATE_MAX_CONCURRENCY=1`; raise it only if your account
   demonstrably tolerates parallel Pro chats). Concurrent `/pro-gate` calls (e.g. 10 agents at
-  once) QUEUE, each waiting up to `PRO_GATE_LOCK_WAIT` (default 40 min). A separate per-PR
-  guard stops the same PR being reviewed twice at once.
+  once) QUEUE, each waiting up to `PRO_GATE_LOCK_WAIT` (default 40 min). A separate per-change
+  guard (engine ≥v0.22: keyed by PR, or repo+branch for `--diff`) stops the same change being
+  reviewed twice at once.
 - **Concurrency is ADAPTIVE (engine ≥v0.19):** `PRO_GATE_MAX_CONCURRENCY` is a ceiling, not the
   live value — the ramp governor starts low, earns +1 level per `PRO_GATE_RAMP_STREAK` (default 5)
   clean runs, and drops to 1 instantly on any throttle. Check the live level + run history any
@@ -220,9 +221,12 @@ reviewer nondeterminism, so "loop until clean" does NOT converge (observed: 10-1
   (`PRO_GATE_MAX_ROUNDS_PER_PR`, exit 12, section 2).
 - Re-review ONLY when confirmed P0/P1 fixes were applied this gate. P2/P3-only fixes: commit,
   post the comment, stop. A `NEEDS-DISCUSSION` verdict is a human decision, not a fix loop.
-- Keep the confirming pass cheap and scoped: reuse the same ChatGPT conversation via
-  `oracle ... --followup <slug>` when possible, and judge it ONLY on whether the previous
-  round's P0/P1s are resolved.
+- The confirming pass MUST go through the engine (`oracle-review.sh`) like any other run,
+  never through a direct `oracle --followup` call: the engine is the single source of truth
+  for budget accounting, and a direct oracle call spends a Pro response the round budget
+  never sees. Keep the pass cheap by scoping it (`--diff` of the fix delta), and judge it
+  ONLY on whether the previous round's P0/P1s are resolved. Both passes consume budget:
+  the default gate spends 2 of the engine's 4 daily rounds.
 - In the confirming pass: fix and post any NEW P0/P1 it surfaces, but do not start a third
   round for them; post new P2/P3 as notes. If a finding you already fixed comes back, stop and
   escalate: the fixer and reviewer disagree, and another loop will not settle it.
