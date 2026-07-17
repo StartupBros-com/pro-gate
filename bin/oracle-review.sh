@@ -532,8 +532,10 @@ ENGINE_ARGS+=(--browser-archive "${PRO_GATE_BROWSER_ARCHIVE:-never}")
 # one level per PRO_GATE_RAMP_STREAK clean runs, dropped to 1 on any throttle. Excess
 # callers QUEUE on the semaphore. A SEPARATE per-PR guard ensures the SAME pr is never
 # under two simultaneous reviews (that would double-spend a slot on one diff). NOTE:
-# oracle itself caps concurrent browser tabs (3 in <=0.15.x) — a ceiling above oracle's
-# cap just queues inside oracle.
+# oracle itself caps concurrent browser tabs (default 3; since 0.16.0 configurable via the
+# ORACLE_BROWSER_MAX_CONCURRENT_TABS env). A ceiling above oracle's cap just queues inside
+# oracle unless that env raises the cap to match (the ChatGPT account throttle, not oracle's
+# tab cap, is the real limiter, so raising it only helps a genuinely tolerant account).
 LOCKFILE="${PRO_GATE_LOCKFILE:-$PRO_GATE_HOME/oracle.lock}"
 LOCK_WAIT="${PRO_GATE_LOCK_WAIT:-2400}"
 MAX_CONC="${PRO_GATE_MAX_CONCURRENCY:-1}"
@@ -968,8 +970,8 @@ fi
 MODEL_WARN="$(pg_derive_model_warn "$RESOLVED_MODEL" "$MODEL_STATUS")"
 [ -n "$MODEL_WARN" ] && echo "[oracle-review] WARNING: ${MODEL_WARN}." >&2
 
-# v0.13: last-resort CDP tab salvage. oracle (<=0.15.0) can fail to DETECT
-# thinking after ChatGPT UI drift even though the submission landed: the
+# v0.13: last-resort CDP tab salvage. oracle (historically <=0.15.x; hardened upstream in
+# 0.16.0) could fail to DETECT thinking after ChatGPT UI drift even though the submission landed: the
 # no-think watchdog then kills a LIVE run, and reattach harvests a stale tab
 # target ("Assistant turns: 0") while the real conversation finishes in
 # another tab. Before declaring failure, read the review straight off the

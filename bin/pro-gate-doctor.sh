@@ -54,17 +54,32 @@ if have_bin "$ORACLE_BIN"; then
 else
   X "configured oracle command missing: $ORACLE_BIN"
 fi
-# Version-skew signal (warn-only, offline-tolerant): oracle is deliberately
-# pinned (UI-automation updates are themselves a break risk), but a newer
-# release often means upstream fixed ChatGPT UI drift. Upgrade DELIBERATELY
-# when reviews misbehave, never automatically.
-if have_bin "$ORACLE_BIN" && have_bin "$TIMEOUT_BIN" && pg_have npm; then
+# oracle is NOT pinned: install.sh runs `pnpm add -g @steipete/oracle` (unpinned), so it
+# floats to npm latest at install time and is then never auto-upgraded. Two warn-only,
+# offline-tolerant signals below: a version FLOOR (releases below it are known-broken for
+# pro-gate) and a skew nudge (a newer release than installed often fixes ChatGPT UI drift).
+ORACLE_MIN="${PRO_GATE_ORACLE_MIN_VERSION:-0.16.0}"
+if have_bin "$ORACLE_BIN" && have_bin "$TIMEOUT_BIN"; then
   ORACLE_LOCAL="$(run_bounded 5 "$ORACLE_BIN" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
-  ORACLE_LATEST="$(run_bounded 10 npm view @steipete/oracle version 2>/dev/null || true)"
-  if [ -n "$ORACLE_LATEST" ] && [ -n "$ORACLE_LOCAL" ] && [ "$ORACLE_LATEST" != "$ORACLE_LOCAL" ]; then
-    W "oracle $ORACLE_LOCAL installed, $ORACLE_LATEST published — upgrade deliberately (pnpm add -g @steipete/oracle) if reviews misbehave"
-  elif [ -n "$ORACLE_LATEST" ]; then
-    P "oracle up to date ($ORACLE_LOCAL = npm latest)"
+  # Version floor (no network needed): below 0.16.0 oracle can capture a settled preamble as
+  # the final answer and flag healthy ChatGPT pages as Cloudflare challenges; pro-gate's round
+  # budget and Cloudflare backoff then amplify those into spurious exit-12 blocks and account
+  # cooldowns. 0.16.0 also lands the GPT-5.6/Work-tab picker handling. Tune with
+  # PRO_GATE_ORACLE_MIN_VERSION.
+  if [ -n "$ORACLE_LOCAL" ] && pg_semver3_ok "$ORACLE_LOCAL" \
+     && [ "$ORACLE_LOCAL" != "$ORACLE_MIN" ] \
+     && [ "$(printf '%s\n%s\n' "$ORACLE_MIN" "$ORACLE_LOCAL" | sort -V | head -1)" = "$ORACLE_LOCAL" ]; then
+    W "oracle $ORACLE_LOCAL is below the $ORACLE_MIN floor: 0.16.0 fixes preamble-capture double-spends, false Cloudflare detection, and the GPT-5.6/Work-tab picker. Upgrade: pnpm add -g @steipete/oracle"
+  fi
+  # Skew nudge (needs npm): a newer published release than installed often means upstream
+  # fixed ChatGPT UI drift. Upgrade DELIBERATELY when reviews misbehave, never automatically.
+  if pg_have npm; then
+    ORACLE_LATEST="$(run_bounded 10 npm view @steipete/oracle version 2>/dev/null || true)"
+    if [ -n "$ORACLE_LATEST" ] && [ -n "$ORACLE_LOCAL" ] && [ "$ORACLE_LATEST" != "$ORACLE_LOCAL" ]; then
+      W "oracle $ORACLE_LOCAL installed, $ORACLE_LATEST published — upgrade deliberately (pnpm add -g @steipete/oracle) if reviews misbehave"
+    elif [ -n "$ORACLE_LATEST" ]; then
+      P "oracle up to date ($ORACLE_LOCAL = npm latest)"
+    fi
   fi
 fi
 # cdp-salvage helper (v0.15): without it the no-think probe cannot distinguish
