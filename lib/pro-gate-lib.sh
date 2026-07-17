@@ -87,14 +87,14 @@ pg_max_semver() {  # stdin: candidate versions; echoes the highest strict-semver
 #   2            -> manifest exists but is UNUSABLE (unparseable, or no jq/python3):
 #                   callers that would change code unattended must fail closed on this
 # Source of truth is installed_plugins.json, pinned to ONE plugin identity
-# (PRO_GATE_PLUGIN_KEY, default pro-gate@hov-marketplace: an entry from another marketplace
+# (PRO_GATE_PLUGIN_KEY, default pro-gate@hov, the marketplace's DECLARED name, not its repo name: an entry from another marketplace
 # or a project-local scope must not move a machine-wide runtime; dogfood gate P1), preferring
 # user-scope entries. A readable manifest is authoritative INCLUDING its silence; the
 # cache-layout glob (real <marketplace>/<name>/<version>/ shape) is only for older Claude
 # Code versions that have no manifest at all, because cache directories retain stale
 # higher-versioned copies that would invert a deliberate rollback.
 pg_active_plugin_version() {
-  local dir="${PRO_GATE_PLUGIN_SEARCH_DIR:-$HOME/.claude/plugins}" key="${PRO_GATE_PLUGIN_KEY:-pro-gate@hov-marketplace}"
+  local dir="${PRO_GATE_PLUGIN_SEARCH_DIR:-$HOME/.claude/plugins}" key="${PRO_GATE_PLUGIN_KEY:-pro-gate@hov}"
   local manifest out="" name f
   manifest="$dir/installed_plugins.json"
   if [ -f "$manifest" ]; then
