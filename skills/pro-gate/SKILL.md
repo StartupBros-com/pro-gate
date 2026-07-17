@@ -148,7 +148,10 @@ open: NEVER relaunch, harvest instead (below) · `11` oversized diff, NO quota s
 the payload (below) instead of re-running · `12` round budget exhausted, NO quota spent: this
 PR/branch already used its review rounds for the window (section 6): do NOT re-run; post the
 still-unresolved findings for the human, or set `PRO_GATE_FORCE_ROUND=1` for one deliberate
-extra run.
+extra run. The exit-12 status `detail` also reports the change's last completed review as
+"N P0 / M P1 unconfirmed by a re-review" when known: if it names an OPEN P0, put that at the
+top of your escalation comment and explicitly ask the human whether to grant
+`PRO_GATE_FORCE_ROUND=1`.
 
 **Exit 9 (`in-progress`): harvest, don't respend.** The Pro model can reason for 45-90+ minutes
 on a heavy payload (observed 65 min on 2026-07-09): longer than the engine can hold a review
@@ -227,7 +230,9 @@ reviewer nondeterminism, so "loop until clean" does NOT converge (observed: 10-1
   engine exit 12.
 - Stopping with unresolved P0/P1 is the DESIGNED outcome, not a failure: list them in the PR
   comment under **Unresolved (needs human decision)** so the human sees exactly what the gate
-  could not settle, then end the gate.
+  could not settle, then end the gate. If the stop was engine exit 12 and its status detail
+  reports an unconfirmed OPEN P0, lead the comment with that line and ask the human whether
+  to grant `PRO_GATE_FORCE_ROUND=1`, that flag exists for exactly this case.
 
 Always leave an audit trail: the full Pro review + the fix summary as a PR comment. Head the
 comment with the model the run resolved (the status file's `model` field, `jq -r .model <out>.status`;

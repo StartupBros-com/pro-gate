@@ -735,6 +735,38 @@ pg_round_record() {  # $1 = key; prune entries older than the window, append now
   return 0
 }
 
+# pg_round_note_severity <key> <review-file>: record the P0/P1 counts of a change's most
+# recent COMPLETED review in a sidecar ($rounds/<key>.last). Read back at round-cap time so a
+# capped gate can say "you are stopping WITH an open P0" (the one case a human may want
+# PRO_GATE_FORCE_ROUND=1 for). Best-effort and advisory: only keys that have recorded rounds
+# get a sidecar (this also skips legacy "diff" markers on the harvest path), and a stale
+# sidecar can only mis-describe the ADVISORY note, never the budget itself.
+pg_round_note_severity() {
+  local key="$1" out="$2" dir p0 p1
+  pg_round_key_ok "$key" || return 0
+  dir="$(pg_rounds_dir)"
+  [ -f "$dir/$key" ] || return 0
+  [ -s "$out" ] || return 0
+  # grep -c prints 0 AND exits 1 on no match: capture, then default only when empty.
+  p0="$(grep -ci '\[P0\]' "$out" 2>/dev/null)"; [ -n "$p0" ] || p0=0
+  p1="$(grep -ci '\[P1\]' "$out" 2>/dev/null)"; [ -n "$p1" ] || p1=0
+  { printf '%s\t%s\t%s\n' "$(date +%s)" "$p0" "$p1" > "$dir/$key.last.tmp" \
+      && mv -f "$dir/$key.last.tmp" "$dir/$key.last"; } 2>/dev/null || true
+  return 0
+}
+
+# pg_round_last_severity <key>: echo "p0 p1" from the sidecar, or fail when none/unparseable.
+pg_round_last_severity() {
+  local key="$1" f e p0 p1
+  pg_round_key_ok "$key" || return 1
+  f="$(pg_rounds_dir)/$key.last"
+  [ -f "$f" ] || return 1
+  { IFS=$'\t' read -r e p0 p1 < "$f"; } 2>/dev/null
+  case "$p0" in ''|*[!0-9]*) return 1;; esac
+  case "$p1" in ''|*[!0-9]*) p1=0;; esac
+  echo "$p0 $p1"
+}
+
 pg_round_guard() {  # $1 = key. 0 = proceed; 1 + a one-line reason on stdout = budget spent.
   local key="$1" cap used
   [ "${PRO_GATE_ROUND_GUARD:-1}" = 1 ] || return 0

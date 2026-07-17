@@ -111,7 +111,10 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
      slots inside the rolling window (default 24h): the review→fix→re-review loop is not
      converging. Unavailable envelope; tell the caller to escalate the remaining findings to
      a human instead of re-running (a deliberate operator override is
-     `PRO_GATE_FORCE_ROUND=1` for one run). Do NOT retry.
+     `PRO_GATE_FORCE_ROUND=1` for one run). Do NOT retry. Quote the status `detail` field in
+     your envelope: it reports the change's last completed review ("N P0 / M P1 unconfirmed
+     by a re-review") when known, and an unconfirmed OPEN P0 is exactly what the human needs
+     to see to decide on `PRO_GATE_FORCE_ROUND=1`.
    - `2`/`4`/`5` — caller error (usage/repo/diff): unavailable envelope with the reason.
 
 ## Output envelope

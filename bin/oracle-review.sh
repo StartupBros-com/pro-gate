@@ -247,6 +247,12 @@ if [ -n "$HARVEST_MARKER" ]; then
   if [ "$HARVEST_RC" -eq 0 ] && pg_is_review "$HARVEST_TMP"; then
     mv "$HARVEST_TMP" "$OUT"
     pg_reservation_remove "$RUN_MARKER" || true
+    # v0.22: a harvest completes the round the exit-9 run already recorded, so refresh the
+    # round budget's last-severity sidecar too. The marker embeds the PR key for PR runs
+    # ("pg-run-<key>-<epoch>-<pid>"); legacy/diff markers resolve to keys with no recorded
+    # rounds and are skipped inside the helper (best-effort, advisory only).
+    HARVEST_KEY="${RUN_MARKER#pg-run-}"; HARVEST_KEY="${HARVEST_KEY%-*-*}"
+    pg_round_note_severity "$HARVEST_KEY" "$OUT"
     SALVAGED=1
     echo "[oracle-review] harvest recovered the completed review ($(wc -c < "$OUT" 2>/dev/null) bytes)." >&2
     pg_status done
@@ -551,10 +557,22 @@ fi
 # never be blocked by the budget. Exit 12, NO quota spent; escalate remaining findings to a
 # human instead of re-running.
 round_capped() {  # $1 = reason
+  # Severity-aware stop note: the budget still refuses the run (severity labels are the
+  # reviewer's own claims, exactly the signal observed to oscillate across rounds), but a cap
+  # hit while the change's LAST completed review reported P0s is the one case a human may
+  # want to grant PRO_GATE_FORCE_ROUND=1, so say it loudly instead of burying it.
+  local sev="" last_p0="" last_p1="" note=""
+  if sev="$(pg_round_last_severity "$ROUND_KEY")"; then
+    last_p0="${sev%% *}"; last_p1="${sev##* }"
+    note="; last completed review: ${last_p0} P0 / ${last_p1} P1 unconfirmed by a re-review"
+  fi
   echo "ERROR: ${1}; not spending another Pro review slot on this change." >&2
+  if [ "${last_p0:-0}" -gt 0 ] 2>/dev/null; then
+    echo "  ATTENTION: OPEN P0. The most recent completed review reported ${last_p0} P0 finding(s) that no re-review has confirmed fixed. If the fixes have landed, this is the case PRO_GATE_FORCE_ROUND=1 exists for: surface it to a human now." >&2
+  fi
   echo "  A gate that keeps cycling review->fix->re-review is not converging: escalate the remaining findings to a human instead." >&2
   echo "  Deliberate override for ONE run: PRO_GATE_FORCE_ROUND=1. Tunables: PRO_GATE_MAX_ROUNDS_PER_PR, PRO_GATE_ROUNDS_WINDOW; PRO_GATE_ROUND_GUARD=0 disables." >&2
-  pg_status round-capped "$1"
+  pg_status round-capped "${1}${note}"
   pg_finish 12
 }
 if ! ROUND_REASON="$(pg_round_guard "$ROUND_KEY")"; then
@@ -929,6 +947,9 @@ if ! pg_is_review "$OUT" && [ "${CLOUDFLARE:-0}" != 1 ] && command -v node >/dev
 fi
 
 if pg_is_review "$OUT"; then
+  # v0.22: remember this review's P0/P1 counts so a later round-capped refusal can flag an
+  # unconfirmed open P0 to the human (advisory sidecar; see pg_round_note_severity).
+  pg_round_note_severity "$ROUND_KEY" "$OUT"
   pg_status done
   cat "$OUT"
   echo "RESULT_FILE=$OUT"
