@@ -88,6 +88,8 @@ engine home is `$HOME/.pro-review-daemon`.
   `auto-fix+merge` requires the guarded-merge rules; if they aren't satisfied, fall back to
   `auto-fix` and leave the PR for the human.
 - **Input:** `pro_gate_input` (`both` default | `bundle` | `connector`).
+- **Rounds:** `pro_gate_max_rounds` (default `2`): total engine runs this gate may spend,
+  initial review + at most one confirming re-review (section 6).
 
 ## 2. Guardrails (before spending a ~10-30 min Pro review slot)
 
@@ -100,8 +102,9 @@ engine home is `$HOME/.pro-review-daemon`.
 - **Concurrency is handled for you:** `oracle-review.sh` holds a counting semaphore —
   **serialized by default** (`PRO_GATE_MAX_CONCURRENCY=1`; raise it only if your account
   demonstrably tolerates parallel Pro chats). Concurrent `/pro-gate` calls (e.g. 10 agents at
-  once) QUEUE, each waiting up to `PRO_GATE_LOCK_WAIT` (default 40 min). A separate per-PR
-  guard stops the same PR being reviewed twice at once.
+  once) QUEUE, each waiting up to `PRO_GATE_LOCK_WAIT` (default 40 min). A separate per-change
+  guard (engine ≥v0.22: keyed by PR, or repo+branch for `--diff`) stops the same change being
+  reviewed twice at once.
 - **Concurrency is ADAPTIVE (engine ≥v0.19):** `PRO_GATE_MAX_CONCURRENCY` is a ceiling, not the
   live value — the ramp governor starts low, earns +1 level per `PRO_GATE_RAMP_STREAK` (default 5)
   clean runs, and drops to 1 instantly on any throttle. Check the live level + run history any
@@ -112,6 +115,12 @@ engine home is `$HOME/.pro-review-daemon`.
   temporarily limited" interstitial, the engine writes `$PRO_GATE_HOME/throttle.cooldown` and every
   new run DEFERS (exit 8, no quota spent) until it expires (`PRO_GATE_THROTTLE_COOLDOWN`, default
   900s). Never delete the cooldown file to force a run — hammering extends the throttle.
+- **Review round budget (engine ≥v0.22):** unbounded review→fix→re-review loops have burned
+  10-16 Pro slots on a single PR in one day (8h+ of wall clock; every other queued PR starves).
+  The engine refuses a fresh run for a PR (repo+branch for `--diff`) that already spent
+  `PRO_GATE_MAX_ROUNDS_PER_PR` (default 4) slots inside the rolling `PRO_GATE_ROUNDS_WINDOW`
+  (default 24h): exit 12, NO quota spent. Harvests never count against it. This is the backstop,
+  not the plan: design the gate around section 6's bounded re-review policy so you never hit it.
 
 ## 3. Run the review
 
@@ -124,12 +133,12 @@ Launch the engine in the background (it blocks ~10-30 min) and poll its **status
 ```
 
 Run with `run_in_background: true` and a long Bash timeout. The engine writes single-line JSON to
-`<out>.status` at every phase change (`preflight → waiting-slot → launching → … → done|failed|deferred|in-progress|oversized`):
+`<out>.status` at every phase change (`preflight → waiting-slot → launching → … → done|failed|deferred|in-progress|oversized|round-capped`):
 poll THAT, not engine logs. Phase `done` ⇒ read `--out` (the `[Pn] file:line` blocks ending in a
-`VERDICT:` line). `failed`/`deferred`/`in-progress`/`oversized` are terminal for this invocation:
-do NOT relaunch on `throttled`/`salvaging` phases; the engine is still working. While waiting,
-never spawn a second oracle run for the same PR. The status JSON carries `marker` (the run's
-conversation correlation id): you need it for `--harvest`.
+`VERDICT:` line). `failed`/`deferred`/`in-progress`/`oversized`/`round-capped` are terminal for
+this invocation: do NOT relaunch on `throttled`/`salvaging` phases; the engine is still working.
+While waiting, never spawn a second oracle run for the same PR. The status JSON carries `marker`
+(the run's conversation correlation id): you need it for `--harvest`.
 
 Engine exit codes: `0` review ready · `2` bad usage · `3` oracle/browser missing · `4` repo not
 found · `5` diff fetch failed · `6` ran but no usable review (quota may be spent — check the PR
@@ -137,7 +146,13 @@ conversation in ChatGPT before re-running) · `7` lock timeout · `8` deferred, 
 (box unfit or throttle cooldown: safe to retry later) · `9` in-progress: the slot IS spent but
 the model was still generating when the salvage budget ran out; the conversation tab is left
 open: NEVER relaunch, harvest instead (below) · `11` oversized diff, NO quota spent: scope
-the payload (below) instead of re-running.
+the payload (below) instead of re-running · `12` round budget exhausted, NO quota spent: this
+PR/branch already used its review rounds for the window (section 6): do NOT re-run; post the
+still-unresolved findings for the human, or set `PRO_GATE_FORCE_ROUND=1` for one deliberate
+extra run. The exit-12 status `detail` also reports the change's last completed review as
+"N P0 / M P1 unconfirmed by a re-review" when known: if it names an OPEN P0, put that at the
+top of your escalation comment and explicitly ask the human whether to grant
+`PRO_GATE_FORCE_ROUND=1`.
 
 **Exit 9 (`in-progress`): harvest, don't respend.** The Pro model can reason for 45-90+ minutes
 on a heavy payload (observed 65 min on 2026-07-09): longer than the engine can hold a review
@@ -167,8 +182,11 @@ tiers, with full-file context for the trust boundary:
 ```bash
 git -C <repo> diff <last-gated-sha>..<head> > delta.patch
 "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}"/oracle-review.sh \
-  --diff delta.patch --repo <repo> --extra-files 'lib/critical-*.sh' --out <out>
+  --pr <num|url> --diff delta.patch --repo <repo> --extra-files 'lib/critical-*.sh' --out <out>
 ```
+
+Keep `--pr` when the delta belongs to a PR (engine ≥v0.22.1): it keeps the change identity,
+budget, lock, and reservations on the PR key instead of forking a second repo+branch identity.
 
 ## 4. Synthesize
 
@@ -194,11 +212,46 @@ issue · your confidence) plus the verdict.
   green, no unresolved P0/P1, and the diff doesn't touch high-risk domains
   (auth/payments/migrations/secrets) — otherwise escalate to the human.
 
-## 6. Re-review (optional)
+## 6. Re-review (bounded by default)
 
-If fixes were applied and `pro_gate_max_rounds > 1`, run one more pass on the updated diff to confirm
-the P0/P1 issues are resolved. Reuse the same ChatGPT conversation via `oracle ... --followup <slug>`
-when possible to keep context (and cost) down.
+A Pro review of fresh code almost never comes back empty: every fix push is new code plus
+reviewer nondeterminism, so "loop until clean" does NOT converge (observed: 10-16 rounds and
+8h+ on one PR). The default is ONE confirming re-review, then stop:
+
+- `pro_gate_max_rounds` (`<repo>/.compound-engineering/config.local.yaml`, default **2**) is the
+  total engine runs this gate may make: the initial review plus at most one confirming pass.
+  Raise it only deliberately; the engine independently budgets ALL callers per PR
+  (`PRO_GATE_MAX_ROUNDS_PER_PR`, exit 12, section 2).
+- Re-review ONLY when confirmed P0/P1 fixes were applied this gate. P2/P3-only fixes: commit,
+  post the comment, stop. A `NEEDS-DISCUSSION` verdict is a human decision, not a fix loop.
+- The confirming pass MUST go through the engine (`oracle-review.sh`) like any other run,
+  never through a direct `oracle --followup` call: the engine is the single source of truth
+  for budget accounting, and a direct oracle call spends a Pro response the round budget
+  never sees. Both passes consume budget: the default gate spends 2 of the engine's 4 daily
+  rounds. Run it as:
+
+  ```bash
+  git -C <repo> diff <round1-head>..<fixed-head> > fix-delta.patch
+  "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}"/oracle-review.sh \
+    --pr <num|url> --repo <repo> --diff fix-delta.patch \
+    --confirm <round1-review.md> --out <out2> --timeout 30m
+  ```
+
+  KEEP `--pr` alongside `--diff`: without it the pass forks into a separate repo+branch
+  identity with its own budget, lock, and reservations (engine ≥v0.22.1). `--confirm`
+  attaches the prior review and instructs the model to verify EVERY prior P0/P1 as
+  RESOLVED or STILL-PRESENT before reporting new findings, so an empty-looking response
+  cannot be mistaken for confirmation.
+- In the confirming pass: fix and post any NEW P0/P1 it surfaces, but do not start a third
+  round for them; post new P2/P3 as notes. If a finding you already fixed comes back, stop and
+  escalate: the fixer and reviewer disagree, and another loop will not settle it.
+- Stop immediately when any of: verdict `SHIP`; no new P0/P1; `pro_gate_max_rounds` reached;
+  engine exit 12.
+- Stopping with unresolved P0/P1 is the DESIGNED outcome, not a failure: list them in the PR
+  comment under **Unresolved (needs human decision)** so the human sees exactly what the gate
+  could not settle, then end the gate. If the stop was engine exit 12 and its status detail
+  reports an unconfirmed OPEN P0, lead the comment with that line and ask the human whether
+  to grant `PRO_GATE_FORCE_ROUND=1`, that flag exists for exactly this case.
 
 Always leave an audit trail: the full Pro review + the fix summary as a PR comment. Head the
 comment with the model the run resolved (the status file's `model` field, `jq -r .model <out>.status`;

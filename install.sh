@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Exact-release runtime installer. The Claude plugin owns the skill and agent.
 # Remote use:
-#   curl -fsSL "https://raw.githubusercontent.com/StartupBros-com/pro-gate/v0.21.0/install.sh?$(date +%s)" | bash -s -- --version 0.21.0
+#   curl -fsSL "https://raw.githubusercontent.com/StartupBros-com/pro-gate/v0.22.0/install.sh?$(date +%s)" | bash -s -- --version 0.22.0
 set -euo pipefail
 umask 022
 

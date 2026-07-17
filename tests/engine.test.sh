@@ -440,4 +440,205 @@ check 'weak persisted model harvest exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$
 check 'weak persisted model harvest names it' "$([ "$(model_of "$TDIR/o-weakres.md.status")" = 'GPT-4o mini' ]; echo $?)" "model=$(model_of "$TDIR/o-weakres.md.status")"
 check 'weak persisted model harvest WARNS (weak denylist)' "$(printf '%s' "$(warn_of "$TDIR/o-weakres.md.status")" | grep -q denylist; echo $?)" "warn=$(warn_of "$TDIR/o-weakres.md.status")"
 
+echo '# v0.22: per-PR review round budget (exit 12, no spend)'
+RHOME="$TDIR/home-rounds"
+rm -rf "$RHOME"; mkdir -p "$RHOME/in-progress"
+RKEY_88="$(printf '%s-88' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
+roundrun() { # $1 = pr, $2 = out, rest = extra VAR=val env overrides
+  local pr="$1" out="$2"; shift 2
+  printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+  env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+    PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
+    PRO_GATE_MAX_ROUNDS_PER_PR=2 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-ok" NODE_OPTIONS= "$@" \
+    bash "$ENGINE" --pr "$pr" --repo "$TDIR" --diff "$TDIR/small.diff" --out "$out" --timeout 5s \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+  RC=$?
+}
+rounds_of() { wc -l < "$RHOME/rounds/$RKEY_88" 2>/dev/null || echo 0; }
+
+roundrun 88 "$RHOME/o-r1.md"
+check 'round 1 proceeds (exit 0)' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+check 'round 1 recorded' "$([ "$(rounds_of)" -eq 1 ]; echo $?)" "rounds=$(rounds_of)"
+check 'completed review writes severity sidecar (0 P0 / 1 P1)' \
+  "$([ "$(awk -F'\t' 'NR==1{print $2" "$3}' "$RHOME/rounds/$RKEY_88.last" 2>/dev/null)" = '0 1' ]; echo $?)" \
+  "sidecar: $(cat "$RHOME/rounds/$RKEY_88.last" 2>/dev/null)"
+roundrun 88 "$RHOME/o-r2.md"
+check 'round 2 proceeds (exit 0)' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+check 'round 2 recorded' "$([ "$(rounds_of)" -eq 2 ]; echo $?)" "rounds=$(rounds_of)"
+roundrun 88 "$RHOME/o-r3.md"
+check 'round 3 refused with exit 12' "$([ "$RC" -eq 12 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+check 'round-capped status phase' "$([ "$(phase_of "$RHOME/o-r3.md.status")" = round-capped ]; echo $?)" "$(cat "$RHOME/o-r3.md.status" 2>/dev/null)"
+check 'capped run spends nothing (no review written)' "$([ ! -s "$RHOME/o-r3.md" ]; echo $?)" 'out file has content'
+check 'capped run records no extra round' "$([ "$(rounds_of)" -eq 2 ]; echo $?)" "rounds=$(rounds_of)"
+check 'capped run lands in ledger as round-capped' "$(grep -q '"outcome":"round-capped"' "$RHOME/ledger.jsonl"; echo $?)" "$(tail -2 "$RHOME/ledger.jsonl" 2>/dev/null)"
+check 'capped run names the override on stderr' "$(grep -q 'PRO_GATE_FORCE_ROUND=1' "$TDIR/stderr"; echo $?)" "$(tail -3 "$TDIR/stderr")"
+check 'capped status detail reports last review severity' "$(grep -q '0 P0 / 1 P1 unconfirmed by a re-review' "$RHOME/o-r3.md.status"; echo $?)" "$(cat "$RHOME/o-r3.md.status" 2>/dev/null)"
+check 'no open P0 -> no ATTENTION line' "$(! grep -q 'OPEN P0' "$TDIR/stderr"; echo $?)" "$(grep 'OPEN P0' "$TDIR/stderr")"
+
+# A cap hit while the change's last completed review reported P0s flags it loudly: the one
+# case the human may want to grant PRO_GATE_FORCE_ROUND=1 for.
+printf '1700000000\t2\t1\n' > "$RHOME/rounds/$RKEY_88.last"
+roundrun 88 "$RHOME/o-r3b.md"
+check 'capped with open P0 still exits 12' "$([ "$RC" -eq 12 ]; echo $?)" "rc=$RC $(tail -4 "$TDIR/stderr")"
+check 'open P0 raises the ATTENTION line' "$(grep -q 'ATTENTION: OPEN P0' "$TDIR/stderr"; echo $?)" "$(tail -5 "$TDIR/stderr")"
+check 'open P0 counts land in status detail' "$(grep -q '2 P0 / 1 P1 unconfirmed by a re-review' "$RHOME/o-r3b.md.status"; echo $?)" "$(cat "$RHOME/o-r3b.md.status" 2>/dev/null)"
+
+# A different PR in the same repo has its own budget.
+roundrun 99 "$RHOME/o-r99.md"
+check 'different PR is not capped by PR 88' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+
+# One deliberate override runs past the cap and STILL records its round.
+roundrun 88 "$RHOME/o-r4.md" PRO_GATE_FORCE_ROUND=1
+check 'FORCE_ROUND runs past the cap' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+check 'forced run is still recorded' "$([ "$(rounds_of)" -eq 3 ]; echo $?)" "rounds=$(rounds_of)"
+
+# Entries older than the rolling window neither count nor survive the next record's prune.
+printf '100\n200\n300\n' > "$RHOME/rounds/$RKEY_88"
+roundrun 88 "$RHOME/o-r5.md"
+check 'stale rounds outside the window do not cap' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+check 'record prunes stale entries' "$([ "$(rounds_of)" -eq 1 ]; echo $?)" "rounds file: $(cat "$RHOME/rounds/$RKEY_88" 2>/dev/null)"
+
+# ROUND_GUARD=0 disables the budget entirely.
+printf '%s\n%s\n%s\n%s\n' "$(date +%s)" "$(date +%s)" "$(date +%s)" "$(date +%s)" > "$RHOME/rounds/$RKEY_88"
+roundrun 88 "$RHOME/o-r6.md" PRO_GATE_ROUND_GUARD=0
+check 'ROUND_GUARD=0 disables the budget' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+
+# --diff runs (no PR number) budget on repo+branch: they loop just as hard in practice.
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
+  PRO_GATE_MAX_ROUNDS_PER_PR=2 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-ok" NODE_OPTIONS= \
+  bash "$ENGINE" --diff "$TDIR/small.diff" --repo "$TDIR" --out "$RHOME/o-rdiff.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'pure --diff run proceeds under budget' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+DIFF_ROUND_FILE="$(find "$RHOME/rounds" -name '*-diff' -type f 2>/dev/null | head -1)"
+check 'pure --diff run records under a repo+branch diff key' "$([ -n "$DIFF_ROUND_FILE" ]; echo $?)" "rounds dir: $(ls "$RHOME/rounds" 2>/dev/null)"
+
+# Cap 0 is a lockdown: ZERO fresh runs allowed, even on a change with no history.
+roundrun 101 "$RHOME/o-r0.md" PRO_GATE_MAX_ROUNDS_PER_PR=0
+check 'cap 0 blocks a fresh change (exit 12)' "$([ "$RC" -eq 12 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+check 'cap 0 status phase round-capped' "$([ "$(phase_of "$RHOME/o-r0.md.status")" = round-capped ]; echo $?)" "$(cat "$RHOME/o-r0.md.status" 2>/dev/null)"
+
+# --diff runs serialize on the per-change lock (review P0: without it, concurrent same-branch
+# diff gates race the budget's check-then-record window and overshoot the cap). The key
+# carries a cksum of the raw UNSANITIZED identity: remote URL (or checkout path) + branch.
+DCK="$(printf '%s:%s' "$TDIR" detached | cksum | awk '{print $1}')"
+DKEY="$(printf '%s-detached-%s-diff' "$(basename "$TDIR")" "$DCK" | tr -c 'A-Za-z0-9.\n-' '-')"
+exec {DLFD}>>"$RHOME/oracle.lock.pr-${DKEY}"; flock -n "$DLFD"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 PRO_GATE_LOCK_WAIT=3 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-ok" NODE_OPTIONS= \
+  bash "$ENGINE" --diff "$TDIR/small.diff" --repo "$TDIR" --out "$RHOME/o-dlock.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'concurrent same-branch --diff run waits on the per-change lock (exit 7)' "$([ "$RC" -eq 7 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+eval "exec ${DLFD}>&-"
+
+# Detached-HEAD checkouts key per-commit (literal branch name "HEAD" would cross-cap
+# unrelated diffs through one shared per-repo bucket).
+GD="$TDIR/detached-repo"
+mkdir -p "$GD"; git -C "$GD" init -q 2>/dev/null
+printf 'x\n' > "$GD/f"; git -C "$GD" add f
+git -C "$GD" -c user.email=t@t -c user.name=t commit -qm init 2>/dev/null
+git -C "$GD" checkout -q --detach 2>/dev/null
+GSHA="$(git -C "$GD" rev-parse --short HEAD)"
+printf 'diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-x\n+y\n' > "$GD/d.diff"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-ok" NODE_OPTIONS= \
+  bash "$ENGINE" --diff "$GD/d.diff" --repo "$GD" --out "$RHOME/o-det.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'detached-HEAD --diff run proceeds' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+GCK="$(printf '%s:%s' "$GD" "$GSHA" | cksum | awk '{print $1}')"
+check 'detached-HEAD key is per-commit (short SHA + cksum, not HEAD)' "$([ -f "$RHOME/rounds/detached-repo-${GSHA}-${GCK}-diff" ]; echo $?)" "rounds dir: $(ls "$RHOME/rounds" 2>/dev/null)"
+
+# A same-change reservation redirects --diff runs to harvest too (dogfood gate P1: reservation
+# identity is ROUND_KEY for all runs, no longer the shared literal "diff" for diff mode).
+RMK="pg-run-${DKEY}-1700000040-77"
+printf '%s\t%s\t%s\t0\t\n' "$DKEY" "$RHOME/o-rres.md" "$(date +%s)" > "$RHOME/in-progress/$RMK"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-ok" NODE_OPTIONS= \
+  bash "$ENGINE" --diff "$TDIR/small.diff" --repo "$TDIR" --out "$RHOME/o-rres.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'same-branch --diff reservation redirects to harvest (exit 9)' "$([ "$RC" -eq 9 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+check '--diff redirect publishes the RESERVED marker' "$(grep -qF "\"marker\":\"$RMK\"" "$RHOME/o-rres.md.status"; echo $?)" "$(cat "$RHOME/o-rres.md.status" 2>/dev/null)"
+rm -f "$RHOME/in-progress/$RMK"
+
+# A window typo must fail LARGE (24h), never shrink to pg_dur_secs's 30-min fallback.
+WIN_TYPO="$(PRO_GATE_ROUNDS_WINDOW=1d bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_window_secs" 2>/dev/null)"
+check 'window typo (1d) falls back to 24h, not 30 min' "$([ "$WIN_TYPO" = 86400 ]; echo $?)" "win=$WIN_TYPO"
+
+# Housekeeping sweeps round files (and their .lock artifacts) untouched longer than the window.
+touch -d '3 days ago' "$RHOME/rounds/stale-key-1" "$RHOME/rounds/stale-key-1.lock" 2>/dev/null \
+  || { touch "$RHOME/rounds/stale-key-1" "$RHOME/rounds/stale-key-1.lock"; touch -t 202001010000 "$RHOME/rounds/stale-key-1" "$RHOME/rounds/stale-key-1.lock"; }
+roundrun 88 "$RHOME/o-r7.md" PRO_GATE_ROUND_GUARD=0
+check 'stale round state is swept by housekeeping' "$([ ! -f "$RHOME/rounds/stale-key-1" ] && [ ! -f "$RHOME/rounds/stale-key-1.lock" ]; echo $?)" "rounds dir: $(ls "$RHOME/rounds" 2>/dev/null)"
+
+# Harvests spend no slot and must never consume a round.
+NROUND_FILES="$(ls "$RHOME/rounds" 2>/dev/null | wc -l)"
+MKR="pg-run-roundharvest-1700000030-22"
+printf 'kR\t%s\t%s\t0\t\n' "$RHOME/o-rh.md" "$(date +%s)" > "$RHOME/in-progress/$MKR"
+{ printf 'run marker: %s\n' "$MKR"
+  printf '[P1] src/x.sh:10 - real bug\n  Why: demonstrated\nP2: none\nP3: none\nVERDICT: SHIP - clean.\n'
+} > "$TDIR/tab.txt"
+env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 NODE_OPTIONS= \
+  bash "$ENGINE" --harvest "$MKR" --out "$RHOME/o-rh.md" --timeout 30s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'harvest in round-test home exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+check 'harvest consumes no round' "$([ "$(ls "$RHOME/rounds" 2>/dev/null | wc -l)" -eq "$NROUND_FILES" ]; echo $?)" "rounds dir: $(ls "$RHOME/rounds" 2>/dev/null)"
+
+echo '# v0.22.1: --confirm mode (budget-accounted confirming pass)'
+printf 'P0: none\n[P1] x.sh:1 - prior finding\nP2: none\nP3: none\nVERDICT: FIX-FIRST - prior.\n' > "$TDIR/prior-review-src.md"
+: > "$TDIR/argv-confirm.txt"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-evidence" PG_TEST_ARGV_FILE="$TDIR/argv-confirm.txt" \
+  PG_TEST_EVIDENCE= NODE_OPTIONS= \
+  bash "$ENGINE" --pr 102 --repo "$TDIR" --diff "$TDIR/small.diff" \
+  --confirm "$TDIR/prior-review-src.md" --out "$RHOME/o-confirm.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'confirm pass runs and exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+check 'confirm prompt carries the confirming instructions' "$(grep -q 'THIS IS A CONFIRMING PASS' "$TDIR/argv-confirm.txt"; echo $?)" "$(head -c 200 "$TDIR/argv-confirm.txt")"
+check 'confirm attaches prior-review.md' "$(grep -q 'prior-review.md' "$TDIR/argv-confirm.txt"; echo $?)" 'no prior-review.md in oracle argv'
+check 'confirm pass consumes a round (budget-accounted)' "$([ -f "$RHOME/rounds/$(printf '%s-102' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')" ]; echo $?)" "rounds dir: $(ls "$RHOME/rounds" 2>/dev/null)"
+run_engine --confirm /nonexistent-prior.md --pr 102 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$RHOME/o-cbad.md" --timeout 5s
+check 'missing --confirm file is a usage error (exit 2)' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC"
+
+echo '# v0.22.1: Cloudflare (provably-unsubmitted) refunds its round'
+cat > "$TDIR/bin/oracle-cf" <<'FAKE_CF'
+#!/usr/bin/env bash
+echo 'Cloudflare anti-bot page detected'
+exit 1
+FAKE_CF
+chmod +x "$TDIR/bin/oracle-cf"
+RKEY_103="$(printf '%s-103' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-cf" NODE_OPTIONS= \
+  bash "$ENGINE" --pr 103 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$RHOME/o-cf.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'cloudflare run fails without a usable review' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+check 'cloudflare writes the account cooldown' "$([ -f "$RHOME/throttle.cooldown" ]; echo $?)" 'no cooldown file'
+check 'cloudflare refunds the round (no spend, no budget charge)' "$([ ! -f "$RHOME/rounds/$RKEY_103" ]; echo $?)" "rounds file: $(cat "$RHOME/rounds/$RKEY_103" 2>/dev/null)"
+rm -f "$RHOME/throttle.cooldown"
+
+echo '# v0.22.1: pg_round_unrecord drops only the newest entry'
+printf '100\n200\n300\n' > "$RHOME/rounds/unrec-key-1"
+PRO_GATE_HOME="$RHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_unrecord unrec-key-1"
+check 'unrecord drops one entry' "$([ "$(wc -l < "$RHOME/rounds/unrec-key-1")" -eq 2 ]; echo $?)" "$(cat "$RHOME/rounds/unrec-key-1" 2>/dev/null)"
+printf '100\n' > "$RHOME/rounds/unrec-key-1"
+PRO_GATE_HOME="$RHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_unrecord unrec-key-1"
+check 'unrecord removes an emptied file' "$([ ! -f "$RHOME/rounds/unrec-key-1" ]; echo $?)" 'file survived'
+
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }
