@@ -12,7 +12,15 @@
 # Usage:
 #   oracle-review.sh --pr <url|number> [--repo <dir>] [--input both|bundle|connector]
 #                    [--out <file>] [--timeout <dur>] [--extra-files <glob>]
+#                    [--confirm <prior-review-file>]
 #   oracle-review.sh --diff <patchfile> --repo <dir> [--out <file>] ...
+#       Pass --pr TOGETHER with --diff when the diff belongs to a PR: the change identity
+#       (round budget, per-change lock, reservations) stays the PR's instead of forking into
+#       a separate repo+branch identity.
+#   oracle-review.sh --confirm <prior-review-file> ...
+#       Confirming pass (v0.22): attaches the prior review and instructs the model to verify
+#       EVERY prior P0/P1 as RESOLVED or STILL-PRESENT before reporting new findings. A
+#       budget-accounted engine run like any other.
 #   oracle-review.sh --harvest <run-marker> --out <file> [--timeout <dur>]
 #       Collect a review whose run ended in-progress (exit 9): the Pro slot was spent but the
 #       model was still generating when the salvage budget ran out. No new slot is spent.
@@ -29,7 +37,7 @@ pg_augment_path
 pg_load_env
 OS="$(pg_os)"; MODE="$(pg_browser_mode)"
 
-PR=""; REPO=""; DIFF_FILE=""; INPUT="both"; OUT=""; TIMEOUT="30m"; EXTRA_GLOB=""; HARVEST_MARKER=""; HARVEST_REQUESTED=0
+PR=""; REPO=""; DIFF_FILE=""; INPUT="both"; OUT=""; TIMEOUT="30m"; EXTRA_GLOB=""; HARVEST_MARKER=""; HARVEST_REQUESTED=0; CONFIRM_FILE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --pr) PR="$2"; shift 2;;
@@ -39,12 +47,17 @@ while [ $# -gt 0 ]; do
     --out) OUT="$2"; shift 2;;
     --timeout) TIMEOUT="$2"; shift 2;;
     --extra-files) EXTRA_GLOB="$2"; shift 2;;
+    --confirm) CONFIRM_FILE="$2"; shift 2;;
     --harvest) HARVEST_REQUESTED=1; HARVEST_MARKER="${2:-}"; shift 2;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
 if [ "$HARVEST_REQUESTED" = 1 ] && [ -z "$HARVEST_MARKER" ]; then
   echo "ERROR: --harvest requires a non-empty run marker" >&2
+  exit 2
+fi
+if [ -n "$CONFIRM_FILE" ] && [ ! -s "$CONFIRM_FILE" ]; then
+  echo "ERROR: --confirm file not found or empty: $CONFIRM_FILE" >&2
   exit 2
 fi
 
@@ -340,9 +353,15 @@ else
   fi
   # Disambiguate with a checksum of the RAW identity: sanitization is lossy ("feature/foo"
   # and "feature-foo" both sanitize to "feature-foo"), and colliding keys would share one
-  # branch's budget and lock across unrelated branches (dogfood gate P1).
-  ROUND_SUM="$(printf '%s:%s' "$REPO_SLUG" "$ROUND_BRANCH" | cksum 2>/dev/null | awk '{print $1}')"
-  ROUND_KEY="$(printf '%s-%s%s-diff' "$REPO_SLUG" "$ROUND_BRANCH" "${ROUND_SUM:+-$ROUND_SUM}" | tr -c 'A-Za-z0-9.\n-' '-')"
+  # branch's budget and lock across unrelated branches (dogfood gate P1). The checksum input
+  # must be UNSANITIZED end to end: the remote URL (or absolute checkout path) plus the raw
+  # branch, never REPO_SLUG, whose owner/repo separator is itself already flattened
+  # (a-b/c and a/b-c share a slug; dogfood gate round-2 P1). The human-readable prefix is
+  # bounded so a deeply nested ref can never push the key past NAME_MAX, where state writes
+  # fail and pg_lock silently proceeds unlocked.
+  ROUND_RAW="$(git -C "$REPO" remote get-url origin 2>/dev/null || printf '%s' "$REPO"):${ROUND_BRANCH}"
+  ROUND_SUM="$(printf '%s' "$ROUND_RAW" | cksum 2>/dev/null | awk '{print $1}')"
+  ROUND_KEY="$(printf '%.120s%s-diff' "${REPO_SLUG}-${ROUND_BRANCH}" "${ROUND_SUM:+-$ROUND_SUM}" | tr -c 'A-Za-z0-9.\n-' '-')"
 fi
 
 if [ -z "$DIFF_FILE" ]; then
@@ -448,6 +467,12 @@ EOF
 The AUTHORITATIVE change is the attached unified diff "pr.diff" (ground truth — review EVERY changed hunk). Do not assume; if the diff contradicts what the connector shows, trust the diff for what changed.
 EOF
   fi
+  if [ -n "$CONFIRM_FILE" ]; then
+    cat <<'EOF'
+
+THIS IS A CONFIRMING PASS: this change was already reviewed once and fixes were applied. The previous review is attached as "prior-review.md". BEFORE anything else, verify EVERY P0 and P1 finding in that prior review against the CURRENT code and list each one as either RESOLVED (with the file:line of the fix) or STILL-PRESENT (report it again as a finding). Only then report genuinely NEW findings per the standard format. Do not re-litigate a prior finding whose fix is present but shaped differently than you would have chosen.
+EOF
+  fi
   cat <<'EOF'
 
 OUTPUT FORMAT — output ONLY findings, nothing else, each exactly:
@@ -472,6 +497,13 @@ if [ "$INPUT" = "bundle" ] || [ "$INPUT" = "both" ]; then
   if [ -n "$EXTRA_GLOB" ]; then
     while IFS= read -r f; do [ -f "$f" ] && FILES+=("$f"); done < <(compgen -G "$EXTRA_GLOB" 2>/dev/null || true)
   fi
+fi
+# --confirm attaches the prior review REGARDLESS of input mode: the confirming instructions
+# in the prompt reference it by the stable name "prior-review.md".
+if [ -n "$CONFIRM_FILE" ]; then
+  cp "$CONFIRM_FILE" "$WORK/prior-review.md" 2>/dev/null \
+    && FILES+=("$WORK/prior-review.md") \
+    || { echo "ERROR: could not stage --confirm file: $CONFIRM_FILE" >&2; pg_status failed "confirm file unreadable"; pg_finish 2; }
 fi
 FILE_ARGS=(); for f in "${FILES[@]:-}"; do [ -n "$f" ] && FILE_ARGS+=(--file "$f"); done
 
@@ -826,6 +858,10 @@ while :; do
      && grep -qiE 'Cloudflare (anti-bot page|challenge) detected|cloudflare-challenge' "$RUNLOG" 2>/dev/null; then
     echo "[oracle-review] ChatGPT/Cloudflare anti-bot challenge detected; backing off (account cooldown + concurrency drop), NOT retrying (a resubmit only deepens the block)." >&2
     CLOUDFLARE=1
+    # The challenge PROVES no prompt reached the model: refund this invocation's round so a
+    # few challenge hits inside the window cannot exit-12-block a change that spent nothing
+    # (dogfood gate round-2 P1). Unknown-fate paths (throttle, watchdogs) never refund.
+    pg_round_unrecord "$ROUND_KEY"
     pg_status cloudflare "anti-bot challenge; cooldown started"
     cdf="${PRO_GATE_COOLDOWN_FILE:-$PRO_GATE_HOME/throttle.cooldown}"
     { printf '%s cloudflare-challenge (pr %s)\n' "$(date +%Y-%m-%dT%H:%M:%S%z)" "${PR_NUM:-diff}" > "$cdf"; } 2>/dev/null || true

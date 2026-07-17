@@ -104,8 +104,8 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
      kept, safe to retry; exit 6 = confirmed gone after repeated misses).
    - `11`: oversized diff (engine >=v0.20), **no quota spent**: the payload exceeds
      `PRO_GATE_MAX_DIFF_LINES` (default 6000) and will not converge. Unavailable envelope;
-     tell the caller to scope the gate (`--diff <delta.patch>` of the un-gated commits):
-     do NOT blind-retry.
+     tell the caller to scope the gate (`--diff <delta.patch>` of the un-gated commits,
+     KEEPING `--pr` so the change identity stays the PR's): do NOT blind-retry.
    - `12`: review round budget exhausted (engine >=v0.22), **no quota spent**: this PR (or
      repo+branch for `--diff`) already spent `PRO_GATE_MAX_ROUNDS_PER_PR` (default 4) review
      slots inside the rolling window (default 24h): the review→fix→re-review loop is not

@@ -522,8 +522,8 @@ check 'cap 0 status phase round-capped' "$([ "$(phase_of "$RHOME/o-r0.md.status"
 
 # --diff runs serialize on the per-change lock (review P0: without it, concurrent same-branch
 # diff gates race the budget's check-then-record window and overshoot the cap). The key
-# carries a cksum of the raw repo:branch identity (sanitization is lossy).
-DCK="$(printf '%s:%s' "$(basename "$TDIR")" detached | cksum | awk '{print $1}')"
+# carries a cksum of the raw UNSANITIZED identity: remote URL (or checkout path) + branch.
+DCK="$(printf '%s:%s' "$TDIR" detached | cksum | awk '{print $1}')"
 DKEY="$(printf '%s-detached-%s-diff' "$(basename "$TDIR")" "$DCK" | tr -c 'A-Za-z0-9.\n-' '-')"
 exec {DLFD}>>"$RHOME/oracle.lock.pr-${DKEY}"; flock -n "$DLFD"
 printf 'foreign idle tab\n' > "$TDIR/tab.txt"
@@ -553,7 +553,7 @@ env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO
   >"$TDIR/stdout" 2>"$TDIR/stderr"
 RC=$?
 check 'detached-HEAD --diff run proceeds' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
-GCK="$(printf '%s:%s' detached-repo "$GSHA" | cksum | awk '{print $1}')"
+GCK="$(printf '%s:%s' "$GD" "$GSHA" | cksum | awk '{print $1}')"
 check 'detached-HEAD key is per-commit (short SHA + cksum, not HEAD)' "$([ -f "$RHOME/rounds/detached-repo-${GSHA}-${GCK}-diff" ]; echo $?)" "rounds dir: $(ls "$RHOME/rounds" 2>/dev/null)"
 
 # A same-change reservation redirects --diff runs to harvest too (dogfood gate P1: reservation
@@ -593,5 +593,52 @@ env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO
 RC=$?
 check 'harvest in round-test home exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
 check 'harvest consumes no round' "$([ "$(ls "$RHOME/rounds" 2>/dev/null | wc -l)" -eq "$NROUND_FILES" ]; echo $?)" "rounds dir: $(ls "$RHOME/rounds" 2>/dev/null)"
+
+echo '# v0.22.1: --confirm mode (budget-accounted confirming pass)'
+printf 'P0: none\n[P1] x.sh:1 - prior finding\nP2: none\nP3: none\nVERDICT: FIX-FIRST - prior.\n' > "$TDIR/prior-review-src.md"
+: > "$TDIR/argv-confirm.txt"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-evidence" PG_TEST_ARGV_FILE="$TDIR/argv-confirm.txt" \
+  PG_TEST_EVIDENCE= NODE_OPTIONS= \
+  bash "$ENGINE" --pr 102 --repo "$TDIR" --diff "$TDIR/small.diff" \
+  --confirm "$TDIR/prior-review-src.md" --out "$RHOME/o-confirm.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'confirm pass runs and exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+check 'confirm prompt carries the confirming instructions' "$(grep -q 'THIS IS A CONFIRMING PASS' "$TDIR/argv-confirm.txt"; echo $?)" "$(head -c 200 "$TDIR/argv-confirm.txt")"
+check 'confirm attaches prior-review.md' "$(grep -q 'prior-review.md' "$TDIR/argv-confirm.txt"; echo $?)" 'no prior-review.md in oracle argv'
+check 'confirm pass consumes a round (budget-accounted)' "$([ -f "$RHOME/rounds/$(printf '%s-102' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')" ]; echo $?)" "rounds dir: $(ls "$RHOME/rounds" 2>/dev/null)"
+run_engine --confirm /nonexistent-prior.md --pr 102 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$RHOME/o-cbad.md" --timeout 5s
+check 'missing --confirm file is a usage error (exit 2)' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC"
+
+echo '# v0.22.1: Cloudflare (provably-unsubmitted) refunds its round'
+cat > "$TDIR/bin/oracle-cf" <<'FAKE_CF'
+#!/usr/bin/env bash
+echo 'Cloudflare anti-bot page detected'
+exit 1
+FAKE_CF
+chmod +x "$TDIR/bin/oracle-cf"
+RKEY_103="$(printf '%s-103' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-cf" NODE_OPTIONS= \
+  bash "$ENGINE" --pr 103 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$RHOME/o-cf.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'cloudflare run fails without a usable review' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+check 'cloudflare writes the account cooldown' "$([ -f "$RHOME/throttle.cooldown" ]; echo $?)" 'no cooldown file'
+check 'cloudflare refunds the round (no spend, no budget charge)' "$([ ! -f "$RHOME/rounds/$RKEY_103" ]; echo $?)" "rounds file: $(cat "$RHOME/rounds/$RKEY_103" 2>/dev/null)"
+rm -f "$RHOME/throttle.cooldown"
+
+echo '# v0.22.1: pg_round_unrecord drops only the newest entry'
+printf '100\n200\n300\n' > "$RHOME/rounds/unrec-key-1"
+PRO_GATE_HOME="$RHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_unrecord unrec-key-1"
+check 'unrecord drops one entry' "$([ "$(wc -l < "$RHOME/rounds/unrec-key-1")" -eq 2 ]; echo $?)" "$(cat "$RHOME/rounds/unrec-key-1" 2>/dev/null)"
+printf '100\n' > "$RHOME/rounds/unrec-key-1"
+PRO_GATE_HOME="$RHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_unrecord unrec-key-1"
+check 'unrecord removes an emptied file' "$([ ! -f "$RHOME/rounds/unrec-key-1" ]; echo $?)" 'file survived'
 
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }

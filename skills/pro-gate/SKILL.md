@@ -182,8 +182,11 @@ tiers, with full-file context for the trust boundary:
 ```bash
 git -C <repo> diff <last-gated-sha>..<head> > delta.patch
 "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}"/oracle-review.sh \
-  --diff delta.patch --repo <repo> --extra-files 'lib/critical-*.sh' --out <out>
+  --pr <num|url> --diff delta.patch --repo <repo> --extra-files 'lib/critical-*.sh' --out <out>
 ```
+
+Keep `--pr` when the delta belongs to a PR (engine ≥v0.22.1): it keeps the change identity,
+budget, lock, and reservations on the PR key instead of forking a second repo+branch identity.
 
 ## 4. Synthesize
 
@@ -224,9 +227,21 @@ reviewer nondeterminism, so "loop until clean" does NOT converge (observed: 10-1
 - The confirming pass MUST go through the engine (`oracle-review.sh`) like any other run,
   never through a direct `oracle --followup` call: the engine is the single source of truth
   for budget accounting, and a direct oracle call spends a Pro response the round budget
-  never sees. Keep the pass cheap by scoping it (`--diff` of the fix delta), and judge it
-  ONLY on whether the previous round's P0/P1s are resolved. Both passes consume budget:
-  the default gate spends 2 of the engine's 4 daily rounds.
+  never sees. Both passes consume budget: the default gate spends 2 of the engine's 4 daily
+  rounds. Run it as:
+
+  ```bash
+  git -C <repo> diff <round1-head>..<fixed-head> > fix-delta.patch
+  "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}"/oracle-review.sh \
+    --pr <num|url> --repo <repo> --diff fix-delta.patch \
+    --confirm <round1-review.md> --out <out2> --timeout 30m
+  ```
+
+  KEEP `--pr` alongside `--diff`: without it the pass forks into a separate repo+branch
+  identity with its own budget, lock, and reservations (engine ≥v0.22.1). `--confirm`
+  attaches the prior review and instructs the model to verify EVERY prior P0/P1 as
+  RESOLVED or STILL-PRESENT before reporting new findings, so an empty-looking response
+  cannot be mistaken for confirmation.
 - In the confirming pass: fix and post any NEW P0/P1 it surfaces, but do not start a third
   round for them; post new P2/P3 as notes. If a finding you already fixed comes back, stop and
   escalate: the fixer and reviewer disagree, and another loop will not settle it.

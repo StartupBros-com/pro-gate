@@ -735,6 +735,40 @@ pg_round_record() {  # $1 = key; prune entries older than the window, append now
   return 0
 }
 
+# pg_round_unrecord <key>: refund ONE round (drop the newest entry). Called ONLY on outcomes
+# that PROVE the submission never landed (the Cloudflare challenge path: oracle detects the
+# interstitial before any prompt reaches the model). Without the refund, a few challenge
+# responses inside the window would exit-12-block a change for a day despite zero Pro spend
+# (dogfood gate round-2 P1). Outcomes with an UNKNOWN fate (throttle, watchdog kills, failed
+# salvage) must NOT refund: over-counting wastes one retry, under-counting resurrects the
+# unbounded loop.
+pg_round_unrecord() {
+  local key="$1" f rfd lockdir="" waited=0 n
+  pg_round_key_ok "$key" || return 0
+  f="$(pg_rounds_dir)/$key"
+  [ -f "$f" ] || return 0
+  if pg_have flock; then
+    if ! { { exec {rfd}>>"$f.lock"; } 2>/dev/null && flock -w 10 "$rfd" 2>/dev/null; }; then
+      [ -n "${rfd:-}" ] && eval "exec ${rfd}>&-" 2>/dev/null
+      return 0
+    fi
+  else
+    lockdir="$f.lock.d"
+    while ! mkdir "$lockdir" 2>/dev/null; do
+      waited=$(( waited + 1 )); [ "$waited" -ge 10 ] && return 0; sleep 1
+    done
+  fi
+  n="$(grep -c . "$f" 2>/dev/null)"; [ -n "$n" ] || n=0
+  if [ "$n" -le 1 ] 2>/dev/null; then
+    rm -f "$f" 2>/dev/null
+  else
+    head -n $(( n - 1 )) "$f" > "$f.tmp" 2>/dev/null && mv -f "$f.tmp" "$f"
+  fi
+  [ -n "${rfd:-}" ] && eval "exec ${rfd}>&-" 2>/dev/null
+  [ -n "$lockdir" ] && rmdir "$lockdir" 2>/dev/null
+  return 0
+}
+
 # pg_round_note_severity <key> <review-file>: record the P0/P1 counts of a change's most
 # recent COMPLETED review in a sidecar ($rounds/<key>.last). Read back at round-cap time so a
 # capped gate can say "you are stopping WITH an open P0" (the one case a human may want
