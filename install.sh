@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Exact-release runtime installer. The Claude plugin owns the skill and agent.
 # Remote use:
-#   curl -fsSL "https://raw.githubusercontent.com/StartupBros-com/pro-gate/v0.22.0/install.sh?$(date +%s)" | bash -s -- --version 0.22.0
+#   curl -fsSL "https://raw.githubusercontent.com/StartupBros-com/pro-gate/v0.23.0/install.sh?$(date +%s)" | bash -s -- --version 0.23.0
 set -euo pipefail
 umask 022
 
@@ -10,6 +10,10 @@ REPO_NAME="pro-gate"
 PRO_GATE_HOME="${PRO_GATE_HOME:-$HOME/.pro-review-daemon}"
 ORACLE_DIR="${ORACLE_DIR:-$HOME/.oracle}"
 INSTALL_DAEMON="${INSTALL_DAEMON:-0}"
+INSTALL_AUTO_UPDATE="${INSTALL_AUTO_UPDATE:-}"   # 1 enable timer, 0 disable, empty leave alone
+INSTALL_SKIP_SERVICES="${INSTALL_SKIP_SERVICES:-0}" # 1 = deploy files only, never touch services:
+                                                    # no sudo/launchctl, enablement untouched (the
+                                                    # auto-updater's unattended mode)
 LOCAL_SOURCE=0
 REQUESTED_VERSION=""
 ARCHIVE=""
@@ -42,9 +46,18 @@ Options:
   --local-source             Install from the on-disk source tree containing this installer
   --daemon                   Install and enable the automatic review daemon
   --accept-dangerous-mode    Record versioned operator consent for the daemon
+  --auto-update              Enable the hourly runtime auto-update timer (systemd only): the
+                             runtime follows the installed marketplace plugin version via
+                             this same exact-version, checksum-verified installer
+  --no-auto-update           Disable the auto-update timer
+  --skip-services            Deploy runtime files only; never touch systemd/launchd units or
+                             their enablement (no sudo needed; used by unattended auto-update)
   --help                     Show this help
 
 INSTALL_DAEMON=1 is equivalent to --daemon. The daemon is off by default.
+INSTALL_AUTO_UPDATE=1/0 mirrors --auto-update/--no-auto-update. Unlike the daemon, a plain
+install leaves the auto-update timer in its current state: the updater invokes this installer,
+and an updater that disabled itself on every run would be self-defeating.
 EOF
 }
 while [ $# -gt 0 ]; do
@@ -54,6 +67,9 @@ while [ $# -gt 0 ]; do
     --checksum) CHECKSUM_FILE="${2:-}"; shift 2;;
     --local-source) LOCAL_SOURCE=1; shift;;
     --daemon) INSTALL_DAEMON=1; shift;;
+    --auto-update) INSTALL_AUTO_UPDATE=1; shift;;
+    --no-auto-update) INSTALL_AUTO_UPDATE=0; shift;;
+    --skip-services) INSTALL_SKIP_SERVICES=1; shift;;
     --accept-dangerous-mode) ACCEPT_CONSENT=1; shift;;
     --help|-h) usage; exit 0;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2;;
@@ -63,7 +79,7 @@ done
 cleanup() {
   local rc=$?
   if [ "$rc" -ne 0 ] && [ "$DEPLOYING" = 1 ] && [ -n "$BACKUP" ]; then
-    for f in lib.sh oracle-review.sh pro-gate-doctor.sh pro-gate-stats.sh cdp-salvage.mjs daemon.sh run-daemon.sh run-oracle-chrome.sh login-view.sh VERSION EXPECTED_VERSION .deploy-stamp; do
+    for f in lib.sh oracle-review.sh pro-gate-doctor.sh pro-gate-stats.sh pro-gate-autoupdate.sh cdp-salvage.mjs daemon.sh run-daemon.sh run-oracle-chrome.sh login-view.sh VERSION EXPECTED_VERSION .deploy-stamp; do
       if [ -e "$BACKUP/$f" ]; then mv -f "$BACKUP/$f" "$PRO_GATE_HOME/$f"; else rm -f "$PRO_GATE_HOME/$f"; fi
     done
   fi
@@ -246,7 +262,7 @@ fi
 
 mkdir -p "$PRO_GATE_HOME/logs" "$ORACLE_DIR"
 BACKUP="$TMP/backup"; mkdir -p "$BACKUP"
-for f in lib.sh oracle-review.sh pro-gate-doctor.sh pro-gate-stats.sh cdp-salvage.mjs daemon.sh run-daemon.sh run-oracle-chrome.sh login-view.sh VERSION EXPECTED_VERSION .deploy-stamp; do
+for f in lib.sh oracle-review.sh pro-gate-doctor.sh pro-gate-stats.sh pro-gate-autoupdate.sh cdp-salvage.mjs daemon.sh run-daemon.sh run-oracle-chrome.sh login-view.sh VERSION EXPECTED_VERSION .deploy-stamp; do
   [ -e "$PRO_GATE_HOME/$f" ] && cp -p "$PRO_GATE_HOME/$f" "$BACKUP/$f"
 done
 DEPLOYING=1
@@ -255,6 +271,7 @@ put "$SOURCE_ROOT/lib/pro-gate-lib.sh" "$PRO_GATE_HOME/lib.sh"
 put "$SOURCE_ROOT/bin/oracle-review.sh" "$PRO_GATE_HOME/oracle-review.sh"
 put "$SOURCE_ROOT/bin/pro-gate-doctor.sh" "$PRO_GATE_HOME/pro-gate-doctor.sh"
 put "$SOURCE_ROOT/bin/pro-gate-stats.sh" "$PRO_GATE_HOME/pro-gate-stats.sh"
+put "$SOURCE_ROOT/bin/pro-gate-autoupdate.sh" "$PRO_GATE_HOME/pro-gate-autoupdate.sh"
 put "$SOURCE_ROOT/bin/cdp-salvage.mjs" "$PRO_GATE_HOME/cdp-salvage.mjs"
 for f in daemon.sh run-daemon.sh run-oracle-chrome.sh login-view.sh; do put "$SOURCE_ROOT/daemon/$f" "$PRO_GATE_HOME/$f"; done
 [ -f "$PRO_GATE_HOME/.env" ] || cp "$SOURCE_ROOT/.env.example" "$PRO_GATE_HOME/.env"
@@ -263,7 +280,15 @@ mv -f "$PRO_GATE_HOME/VERSION.deploy.$$" "$PRO_GATE_HOME/VERSION"
 printf '%s\n' "$REQUESTED_VERSION" > "$PRO_GATE_HOME/EXPECTED_VERSION.deploy.$$"
 mv -f "$PRO_GATE_HOME/EXPECTED_VERSION.deploy.$$" "$PRO_GATE_HOME/EXPECTED_VERSION"
 { pg_file_sig "$PRO_GATE_HOME/daemon.sh" "$PRO_GATE_HOME/lib.sh" "$PRO_GATE_HOME/run-daemon.sh" > "$PRO_GATE_HOME/.deploy-stamp.tmp" && mv -f "$PRO_GATE_HOME/.deploy-stamp.tmp" "$PRO_GATE_HOME/.deploy-stamp"; } 2>/dev/null || true
-render(){ sed -e "s#@HOME@#${HOME}#g" -e "s#@USER@#$(id -un)#g" "$1"; }
+# @PRO_GATE_HOME@ renders the ACTUAL install home (dogfood gate round-2 P1: hardcoding the
+# default in the auto-update unit pointed a custom-PRO_GATE_HOME box at a nonexistent
+# updater, or worse, at a different runtime).
+render(){ sed -e "s#@PRO_GATE_HOME@#${PRO_GATE_HOME}#g" -e "s#@HOME@#${HOME}#g" -e "s#@USER@#$(id -un)#g" "$1"; }
+# Service reconciliation needs sudo (systemd) or launchctl and is skipped entirely under
+# --skip-services: the unattended auto-updater deploys files only, so it needs no TTY, no
+# NOPASSWD sudo, and cannot flip daemon/timer enablement (adversarial review P0/P1). The
+# already-running daemon adopts the new files via its own idle self-reload.
+if [ "$INSTALL_SKIP_SERVICES" != 1 ]; then
 case "$OS" in
   macos)
     PL="$HOME/Library/LaunchAgents/com.pro-gate.review-daemon.plist"
@@ -289,8 +314,22 @@ case "$OS" in
       else
         sudo systemctl disable --now pro-review-daemon.service 2>/dev/null || true
       fi
+      # Auto-update timer: reconciled ONLY on explicit request; a plain install (including
+      # the updater's own invocations) must not flip it.
+      if [ "$INSTALL_AUTO_UPDATE" = 1 ]; then
+        render "$SOURCE_ROOT/daemon/pro-gate-autoupdate.service.tmpl" | sudo tee /etc/systemd/system/pro-gate-autoupdate.service >/dev/null
+        render "$SOURCE_ROOT/daemon/pro-gate-autoupdate.timer.tmpl" | sudo tee /etc/systemd/system/pro-gate-autoupdate.timer >/dev/null
+        sudo systemctl daemon-reload
+        sudo systemctl enable --now pro-gate-autoupdate.timer
+      elif [ "$INSTALL_AUTO_UPDATE" = "0" ]; then
+        sudo systemctl disable --now pro-gate-autoupdate.timer 2>/dev/null || true
+      fi
     fi
     ;;
 esac
+fi
 DEPLOYING=0
-printf 'pro-gate runtime %s installed in %s (daemon: %s)\n' "$REQUESTED_VERSION" "$PRO_GATE_HOME" "$INSTALL_DAEMON"
+if [ "$INSTALL_AUTO_UPDATE" = 1 ] && { [ "$SVC" != systemd ] || { [ "$OS" != wsl ] && [ "$OS" != linux ]; }; }; then
+  echo "note: --auto-update is systemd-only for now; schedule $PRO_GATE_HOME/pro-gate-autoupdate.sh yourself (cron/launchd) on this platform" >&2
+fi
+printf 'pro-gate runtime %s installed in %s (daemon: %s, auto-update: %s)\n' "$REQUESTED_VERSION" "$PRO_GATE_HOME" "$INSTALL_DAEMON" "${INSTALL_AUTO_UPDATE:-unchanged}"

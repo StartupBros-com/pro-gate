@@ -17,7 +17,7 @@ pg_augment_path; pg_load_env
 OS="$(pg_os)"; MODE="$(pg_browser_mode)"
 
 privileged_runtime_ready() {
-  local installed expected
+  local installed expected plugin_v
   installed="$(pg_runtime_version)"
   expected="$(pg_expected_version)"
   [ -n "$installed" ] || { echo "FATAL: runtime VERSION is missing; install the exact plugin release" >&2; return 1; }
@@ -25,6 +25,16 @@ privileged_runtime_ready() {
     echo "FATAL: runtime $installed does not match plugin $expected; install the exact plugin release" >&2
     return 1
   }
+  # v0.23 (dogfood gate P1): also defer while the runtime differs from the ACTIVE marketplace
+  # plugin. During the window between a marketplace plugin update and the runtime catching up
+  # (auto-update timer or manual install), a dispatched headless child would load the NEW
+  # skill, hit its version precheck, refuse the review, and exit 0, which marks the head SHA
+  # done and silently drops that PR's review. Deferring here is global and never charges any
+  # PR's retry budget. Unknown states (no manifest entry, unreadable manifest) do not block.
+  if plugin_v="$(pg_active_plugin_version 2>/dev/null)" && [ -n "$plugin_v" ] && [ "$plugin_v" != "$installed" ]; then
+    echo "FATAL: runtime $installed differs from the active plugin $plugin_v; waiting for the runtime to catch up (auto-update timer, or install.sh --version $plugin_v)" >&2
+    return 1
+  fi
   pg_dangerous_consent_ok || {
     echo "FATAL: operator consent v$(pg_consent_version) is required before automatic fixer execution with --dangerously-skip-permissions" >&2
     return 1

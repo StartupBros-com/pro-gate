@@ -125,5 +125,16 @@ if memreason="$(pg_mem_headroom_ok)"; then P "memory headroom ok for a review"; 
 [ -n "${PRO_REVIEW_OWNERS:-}" ] && P "PRO_REVIEW_OWNERS='${PRO_REVIEW_OWNERS}'" || W "PRO_REVIEW_OWNERS unset (daemon needs it; interactive /pro-gate does not)"
 P "concurrency: up to ${PRO_GATE_MAX_CONCURRENCY:-3} review slot(s) (per-PR serialized; health-governed)"
 
+# Auto-update health (v0.23): three consecutive failed unattended updates escalate here
+# instead of retrying silently forever into an unread log.
+AUS="$PRO_GATE_HOME/autoupdate.state"
+if [ -f "$AUS" ]; then
+  AUS_STREAK="$(awk -F'\t' 'NR==1{print $1}' "$AUS" 2>/dev/null)"
+  case "$AUS_STREAK" in ''|*[!0-9]*) AUS_STREAK=0;; esac
+  if [ "$AUS_STREAK" -ge 3 ]; then
+    W "runtime auto-update has failed $AUS_STREAK times in a row (see $PRO_GATE_HOME/logs/autoupdate.log; disable with install.sh --no-auto-update)"
+  fi
+fi
+
 echo "  ── $ok ok, $warn warnings, $bad blocking ──"
 [ "$bad" -eq 0 ]

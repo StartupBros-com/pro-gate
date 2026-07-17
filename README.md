@@ -56,6 +56,41 @@ PRO_GATE_EXPECTED_VERSION="$VERSION" ~/.pro-review-daemon/pro-gate-doctor.sh
 The runtime installer never copies skill or agent files. It verifies the exact release archive and
 checksum, records the installed version, and leaves the daemon off on every platform.
 
+### Staying current (opt-in auto-update)
+
+The plugin updates itself through the marketplace; the privileged runtime deliberately does not.
+By default a version skew fail-closes (the skill and daemon refuse to run and print the exact
+installer command). To automate that last step on a box you control:
+
+```bash
+VERSION=<plugin-version>
+curl -fsSL "https://raw.githubusercontent.com/StartupBros-com/pro-gate/v${VERSION}/install.sh?$(date +%s)" \
+  | bash -s -- --version "$VERSION" --auto-update
+# NOTE: every non---skip-services install reconciles daemon enablement; if the daemon is
+# enabled on this box, include --daemon too or it will be disabled.
+```
+
+This enables an hourly systemd timer that reads the ACTIVE plugin version from Claude Code's
+`installed_plugins.json` and, on skew, downloads that exact release's checksum-verified archive
+and runs the verified archive's own installer with `--skip-services` (no sudo, no service
+changes: daemon and timer enablement are untouched by construction; the daemon adopts new code
+at its next idle self-reload). The runtime follows the marketplace promotion, never `latest`,
+so it cannot race ahead of what the release train validated. An enabled daemon with stale
+dangerous-mode consent blocks the auto-update loudly instead of proceeding. Three consecutive
+failures are flagged by `pro-gate-doctor.sh`. Disable any time with `--no-auto-update`. Audit
+trail: `~/.pro-review-daemon/logs/autoupdate.log`.
+
+Rollbacks below v0.23 are a deliberate manual act: the updater refuses them (their installers
+predate `--skip-services`), and you must run `install.sh --no-auto-update` FIRST, since a
+pre-v0.23 runtime cannot run this updater and the leftover timer would fail hourly.
+
+### Release flow (maintainers)
+
+Merging a PR that bumps `VERSION` + `plugin.json` ships it: `auto-release.yml` pushes the tag,
+`release.yml` re-tests and publishes checksummed assets, and the release train promotes the
+marketplace manifest. Requires a fine-grained `RELEASE_PAT` repo secret (contents: read/write);
+without it the workflows fall back to the manual tag-push flow.
+
 ### macOS (oracle native, simplest)
 Oracle reuses your **signed-in Chrome** (Keychain cookie sync), with no Xvfb or background service for
 interactive use.

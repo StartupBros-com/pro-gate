@@ -65,6 +65,74 @@ pg_dangerous_consent_ok() {
   [ "$recorded" = "$(pg_consent_version)" ]
 }
 
+# ── active marketplace plugin discovery (v0.23) ──────────────────────────────
+# Shared by pro-gate-autoupdate.sh (what version should the runtime follow) and daemon.sh
+# (defer dispatch while the runtime lags the plugin a headless /pro-gate child would load).
+pg_semver3_ok() { printf '%s' "${1:-}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; }
+
+pg_max_semver() {  # stdin: candidate versions; echoes the highest strict-semver one
+  local v best=""
+  while IFS= read -r v; do
+    pg_semver3_ok "$v" || continue
+    if [ -z "$best" ] || [ "$(printf '%s\n%s\n' "$best" "$v" | sort -V | tail -1)" = "$v" ]; then
+      best="$v"
+    fi
+  done
+  [ -n "$best" ] && printf '%s\n' "$best"
+}
+
+# pg_active_plugin_version: the version of the ACTIVE installed pro-gate plugin.
+#   0 + version  -> found
+#   1            -> no active install of the expected plugin identity
+#   2            -> manifest exists but is UNUSABLE (unparseable, or no jq/python3):
+#                   callers that would change code unattended must fail closed on this
+# Source of truth is installed_plugins.json, pinned to ONE plugin identity
+# (PRO_GATE_PLUGIN_KEY, default pro-gate@hov-marketplace: an entry from another marketplace
+# or a project-local scope must not move a machine-wide runtime; dogfood gate P1), preferring
+# user-scope entries. A readable manifest is authoritative INCLUDING its silence; the
+# cache-layout glob (real <marketplace>/<name>/<version>/ shape) is only for older Claude
+# Code versions that have no manifest at all, because cache directories retain stale
+# higher-versioned copies that would invert a deliberate rollback.
+pg_active_plugin_version() {
+  local dir="${PRO_GATE_PLUGIN_SEARCH_DIR:-$HOME/.claude/plugins}" key="${PRO_GATE_PLUGIN_KEY:-pro-gate@hov-marketplace}"
+  local manifest out="" name f
+  manifest="$dir/installed_plugins.json"
+  if [ -f "$manifest" ]; then
+    # USER scope only (dogfood gate round-2 P1): a project-scoped install applies to one
+    # repository's sessions, and letting it move the MACHINE-WIDE runtime would gate every
+    # other repository on it. No user-scope entry means "not globally installed": rc 1.
+    if pg_have jq; then
+      jq -e . "$manifest" >/dev/null 2>&1 || return 2
+      out="$(jq -r --arg k "$key" '.plugins[$k][]? | select((.scope // "user") == "user") | .version // empty' "$manifest" 2>/dev/null | pg_max_semver || true)"
+    elif pg_have python3; then
+      out="$(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+entries = d.get("plugins", {}).get(sys.argv[2], []) or []
+print("\n".join(e.get("version", "") for e in entries if e.get("scope", "user") == "user"))' "$manifest" "$key" 2>/dev/null)" || return 2
+      out="$(printf '%s\n' "$out" | pg_max_semver || true)"
+    else
+      return 2
+    fi
+    [ -n "$out" ] || return 1
+    printf '%s\n' "$out"
+    return 0
+  fi
+  name="${key%@*}"
+  out="$(
+    while IFS= read -r f; do
+      if pg_have jq; then
+        jq -er .version "$f" 2>/dev/null || true
+      else
+        sed -nE 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$f" | head -1
+      fi
+    done < <(find "$dir" -path "*/$name/*/.claude-plugin/plugin.json" -type f 2>/dev/null) \
+    | pg_max_semver || true
+  )"
+  [ -n "$out" ] || return 1
+  printf '%s\n' "$out"
+}
+
 # Prepend likely locations of node/oracle/gh/jq so scripts work under a minimal
 # systemd/launchd PATH without hardcoding any version.
 pg_augment_path() {

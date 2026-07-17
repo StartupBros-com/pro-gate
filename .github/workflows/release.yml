@@ -41,6 +41,7 @@ jobs:
         run: |
           bash tests/engine.test.sh
           bash tests/daemon-reload.test.sh
+          bash tests/autoupdate.test.sh
           node --test tests/cdp-salvage.test.mjs
           bash tests/distribution.test.sh
           bash tests/release-train.test.sh
@@ -53,7 +54,18 @@ jobs:
         run: |
           version="$(tr -d '[:space:]' < VERSION)"
           (cd dist && sha256sum -c "pro-gate-runtime-${version}.tar.gz.sha256")
-      - name: Upload, verify, and publish exact release assets
+      - name: Warn when publishing without RELEASE_PAT
         env:
-          GH_TOKEN: ${{ github.token }}
+          RELEASE_PAT: ${{ secrets.RELEASE_PAT }}
+        run: |
+          if [ -z "$RELEASE_PAT" ]; then
+            echo "::warning::Publishing with GITHUB_TOKEN: GitHub suppresses workflow events from it, so the release train will NOT fire and the marketplace will NOT be promoted. Configure the RELEASE_PAT secret, or manually edit the release after this run to trigger the train."
+          fi
+      - name: Upload, verify, and publish exact release assets
+        # Publish with RELEASE_PAT when configured: a release published by GITHUB_TOKEN does
+        # not emit workflow-triggering events (GitHub's recursion rule), which is why the
+        # release train previously needed a human to edit the release before it would fire.
+        # Falls back to GITHUB_TOKEN (manual-nudge flow) when the secret is absent.
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PAT || github.token }}
         run: ./scripts/publish-runtime-release.sh

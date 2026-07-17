@@ -1,0 +1,10 @@
+[Unit]
+Description=Hourly pro-gate runtime auto-update (follows the installed marketplace plugin version)
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=900
+Persistent=true
+
+[Install]
+WantedBy=timers.target
