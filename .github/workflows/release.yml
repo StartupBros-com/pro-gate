@@ -50,7 +50,9 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: scripts/package-runtime.sh
       - name: Verify published checksum
-        run: sha256sum -c "dist/pro-gate-runtime-$(tr -d '[:space:]' < VERSION).tar.gz.sha256"
+        run: |
+          version="$(tr -d '[:space:]' < VERSION)"
+          (cd dist && sha256sum -c "pro-gate-runtime-${version}.tar.gz.sha256")
       - name: Upload, verify, and publish exact release assets
         env:
           GH_TOKEN: ${{ github.token }}
