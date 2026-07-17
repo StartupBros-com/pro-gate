@@ -16,7 +16,9 @@ is_uint() {
 }
 
 notes_summary() {
-  printf '%s' "${RELEASE_NOTES:-}" | tr '\r\n' '  ' | cut -c1-600
+  # First paragraph only: the announcement summary should be the release's
+  # lead description, not flattened install blocks or changelog fragments.
+  printf '%s' "${RELEASE_NOTES:-}" | tr -d '\r' | awk 'BEGIN{RS=""} NR==1' | tr '\n' ' ' | cut -c1-600
 }
 
 announce() {
