@@ -1,0 +1,12 @@
+[Unit]
+Description=pro-gate auto-update: make the installed runtime follow the marketplace plugin version
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=@USER@
+Group=@USER@
+WorkingDirectory=@HOME@/.pro-review-daemon
+ExecStart=@HOME@/.pro-review-daemon/pro-gate-autoupdate.sh
+TimeoutStartSec=600
