@@ -42,7 +42,7 @@ write_manifest() { # $1 = active pro-gate version ('' = no pro-gate entry)
     cat > "$TDIR/plugins/installed_plugins.json" <<EOF
 {"version": 2, "plugins": {
   "other-plugin@some-marketplace": [{"scope": "user", "installPath": "$TDIR/plugins/cache/some-marketplace/other-plugin/9.9.9", "version": "9.9.9"}],
-  "pro-gate@hov-marketplace": [{"scope": "user", "installPath": "$TDIR/plugins/cache/hov-marketplace/pro-gate/$1", "version": "$1"}]
+  "pro-gate@hov": [{"scope": "user", "installPath": "$TDIR/plugins/cache/hov/pro-gate/$1", "version": "$1"}]
 }}
 EOF
   else
@@ -50,8 +50,8 @@ EOF
   fi
 }
 seed_cache() { # $1 = version: a cache directory in the real <marketplace>/pro-gate/<version>/ shape
-  mkdir -p "$TDIR/plugins/cache/hov-marketplace/pro-gate/$1/.claude-plugin"
-  printf '{"name":"pro-gate","version":"%s"}\n' "$1" > "$TDIR/plugins/cache/hov-marketplace/pro-gate/$1/.claude-plugin/plugin.json"
+  mkdir -p "$TDIR/plugins/cache/hov/pro-gate/$1/.claude-plugin"
+  printf '{"name":"pro-gate","version":"%s"}\n' "$1" > "$TDIR/plugins/cache/hov/pro-gate/$1/.claude-plugin/plugin.json"
 }
 
 run_updater() { # extra env pairs as args; RC captured
@@ -88,7 +88,7 @@ echo '# fallback without a manifest: real cache layout is matched'
 rm -f "$TDIR/plugins/installed_plugins.json"
 run_updater
 check 'cache-layout fallback finds versions (<mkt>/pro-gate/<ver>/)' "$([ "$(cat "$TDIR/install.log")" = '0.31.0 1' ]; echo $?)" "log=$(cat "$TDIR/install.log")"
-rm -rf "$TDIR/plugins/cache/hov-marketplace/pro-gate/0.31.0"
+rm -rf "$TDIR/plugins/cache/hov/pro-gate/0.31.0"
 write_manifest 0.23.0
 
 echo '# fail closed: enabled daemon without recorded consent refuses the update'
@@ -142,7 +142,7 @@ echo '# identity pinning: other marketplaces and project scopes never move the r
 cat > "$TDIR/plugins/installed_plugins.json" <<'EOF'
 {"version": 2, "plugins": {
   "pro-gate@other-marketplace": [{"scope": "user", "version": "0.30.0"}],
-  "pro-gate@hov-marketplace": [
+  "pro-gate@hov": [
     {"scope": "project", "projectPath": "/x", "version": "0.29.0"},
     {"scope": "user", "version": "0.23.0"}
   ]
@@ -155,7 +155,7 @@ check 'pinned key + user scope wins (0.23.0, not 0.30.0 or 0.29.0)' "$([ "$(cat 
 echo '# a project-only install is NOT globally installed: never moves the machine-wide runtime'
 cat > "$TDIR/plugins/installed_plugins.json" <<'EOF'
 {"version": 2, "plugins": {
-  "pro-gate@hov-marketplace": [{"scope": "project", "projectPath": "/x", "version": "0.29.0"}]
+  "pro-gate@hov": [{"scope": "project", "projectPath": "/x", "version": "0.29.0"}]
 }}
 EOF
 run_updater

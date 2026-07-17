@@ -1,6 +1,6 @@
 {
   "name": "pro-gate",
-  "version": "0.23.0",
+  "version": "0.23.1",
   "description": "Run the final, deepest pull request review through the account's selected Pro reasoning model, then route confirmed findings to the best available fixer.",
   "author": {
     "name": "StartupBros / House of Vibe",

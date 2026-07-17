@@ -144,7 +144,7 @@ pgau_main() {
 
   plugin_v="$(pg_active_plugin_version)"
   case $? in
-    1) pgau_log "no active ${PRO_GATE_PLUGIN_KEY:-pro-gate@hov-marketplace} plugin found via ${PRO_GATE_PLUGIN_SEARCH_DIR:-$HOME/.claude/plugins}; nothing to follow"
+    1) pgau_log "no active ${PRO_GATE_PLUGIN_KEY:-pro-gate@hov} plugin found via ${PRO_GATE_PLUGIN_SEARCH_DIR:-$HOME/.claude/plugins}; nothing to follow"
        return 0 ;;
     2) pgau_log "REFUSING: installed_plugins.json exists but is unusable (unparseable, or no jq/python3); an unattended update never guesses from cache directories"
        pgau_note_result 4
