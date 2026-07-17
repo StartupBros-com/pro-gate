@@ -142,7 +142,10 @@ check "harvest shell reconstructs marker and output" grep -q -- '--harvest pg-ru
 HOSTILE="$TDIR/hostile-cwd"; mkdir -p "$HOSTILE/lib"
 printf 'hostile\n' > "$HOSTILE/VERSION"
 printf 'exit 99\n' > "$HOSTILE/lib/pro-gate-lib.sh"
-if (cd "$HOSTILE" && PRO_GATE_HOME="$TDIR/piped-runtime" bash -s -- --version "$VERSION" < "$ROOT/install.sh") >"$TDIR/piped.log" 2>&1; then
+# A permanently unpublished version keeps this hermetic: the piped installer
+# must resolve only the published runtime release, so once "$VERSION" is
+# actually released the download would succeed and invert the assertion.
+if (cd "$HOSTILE" && PRO_GATE_HOME="$TDIR/piped-runtime" bash -s -- --version 0.0.0 < "$ROOT/install.sh") >"$TDIR/piped.log" 2>&1; then
   echo "FAIL - piped installer does not infer hostile cwd source"; FAILS=$((FAILS + 1))
 else echo "ok - piped installer does not infer hostile cwd source"; fi
 check "piped installer did not execute hostile source" test ! -e "$TDIR/piped-runtime/VERSION"
