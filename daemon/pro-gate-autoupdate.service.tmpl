@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=oneshot
 User=@USER@
 Group=@USER@
-WorkingDirectory=@HOME@/.pro-review-daemon
-ExecStart=@HOME@/.pro-review-daemon/pro-gate-autoupdate.sh
+WorkingDirectory=@PRO_GATE_HOME@
+Environment=PRO_GATE_HOME=@PRO_GATE_HOME@
+ExecStart=@PRO_GATE_HOME@/pro-gate-autoupdate.sh
 TimeoutStartSec=600

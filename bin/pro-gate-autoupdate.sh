@@ -108,7 +108,7 @@ pgau_run_installer() {  # $1 = target version
   ) || rc=$?
   rm -rf "$stage"
   if [ "$rc" -eq 8 ]; then
-    pgau_log "REFUSING: target v$v installer predates unattended updates (no --skip-services support); roll back manually: install.sh --version $v (add --daemon if the daemon should stay enabled)"
+    pgau_log "REFUSING: target v$v installer predates unattended updates (no --skip-services support). Roll back manually, and DISABLE THIS TIMER FIRST (a pre-v0.23 runtime cannot run this updater and would fail hourly): install.sh --no-auto-update, then install.sh --version $v (add --daemon if the daemon should stay enabled)"
   fi
   return "$rc"
 }

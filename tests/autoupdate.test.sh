@@ -152,6 +152,22 @@ printf '0.22.0\n' > "$TDIR/home/VERSION"
 run_updater
 check 'pinned key + user scope wins (0.23.0, not 0.30.0 or 0.29.0)' "$([ "$(cat "$TDIR/install.log")" = '0.23.0 1' ]; echo $?)" "log=$(cat "$TDIR/install.log")"
 
+echo '# a project-only install is NOT globally installed: never moves the machine-wide runtime'
+cat > "$TDIR/plugins/installed_plugins.json" <<'EOF'
+{"version": 2, "plugins": {
+  "pro-gate@hov-marketplace": [{"scope": "project", "projectPath": "/x", "version": "0.29.0"}]
+}}
+EOF
+run_updater
+check 'project-only entry -> nothing to follow (exit 0, no installer)' "$([ "$RC" -eq 0 ] && [ ! -s "$TDIR/install.log" ]; echo $?)" "rc=$RC log=$(cat "$TDIR/install.log")"
+
+echo '# service template renders the actual PRO_GATE_HOME (custom-home installs)'
+RENDERED="$(sed -e "s#@PRO_GATE_HOME@#/custom/rt-home#g" -e "s#@HOME@#/h#g" -e "s#@USER@#u#g" "$HERE/../daemon/pro-gate-autoupdate.service.tmpl")"
+check 'unit ExecStart/Environment use the rendered runtime home' \
+  "$(printf '%s' "$RENDERED" | grep -q 'ExecStart=/custom/rt-home/pro-gate-autoupdate.sh' \
+     && printf '%s' "$RENDERED" | grep -q 'Environment=PRO_GATE_HOME=/custom/rt-home' \
+     && ! printf '%s' "$RENDERED" | grep -q '@'; echo $?)" "$RENDERED"
+
 echo '# fail closed: a corrupt manifest never falls back to the cache glob'
 printf '{not json' > "$TDIR/plugins/installed_plugins.json"
 run_updater

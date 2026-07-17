@@ -80,6 +80,10 @@ dangerous-mode consent blocks the auto-update loudly instead of proceeding. Thre
 failures are flagged by `pro-gate-doctor.sh`. Disable any time with `--no-auto-update`. Audit
 trail: `~/.pro-review-daemon/logs/autoupdate.log`.
 
+Rollbacks below v0.23 are a deliberate manual act: the updater refuses them (their installers
+predate `--skip-services`), and you must run `install.sh --no-auto-update` FIRST, since a
+pre-v0.23 runtime cannot run this updater and the leftover timer would fail hourly.
+
 ### Release flow (maintainers)
 
 Merging a PR that bumps `VERSION` + `plugin.json` ships it: `auto-release.yml` pushes the tag,

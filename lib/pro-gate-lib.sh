@@ -98,18 +98,18 @@ pg_active_plugin_version() {
   local manifest out="" name f
   manifest="$dir/installed_plugins.json"
   if [ -f "$manifest" ]; then
+    # USER scope only (dogfood gate round-2 P1): a project-scoped install applies to one
+    # repository's sessions, and letting it move the MACHINE-WIDE runtime would gate every
+    # other repository on it. No user-scope entry means "not globally installed": rc 1.
     if pg_have jq; then
       jq -e . "$manifest" >/dev/null 2>&1 || return 2
       out="$(jq -r --arg k "$key" '.plugins[$k][]? | select((.scope // "user") == "user") | .version // empty' "$manifest" 2>/dev/null | pg_max_semver || true)"
-      [ -n "$out" ] || out="$(jq -r --arg k "$key" '.plugins[$k][]?.version // empty' "$manifest" 2>/dev/null | pg_max_semver || true)"
     elif pg_have python3; then
       out="$(python3 -c '
 import json, sys
 d = json.load(open(sys.argv[1]))
 entries = d.get("plugins", {}).get(sys.argv[2], []) or []
-user = [e.get("version", "") for e in entries if e.get("scope", "user") == "user"]
-versions = user or [e.get("version", "") for e in entries]
-print("\n".join(v for v in versions if v))' "$manifest" "$key" 2>/dev/null)" || return 2
+print("\n".join(e.get("version", "") for e in entries if e.get("scope", "user") == "user"))' "$manifest" "$key" 2>/dev/null)" || return 2
       out="$(printf '%s\n' "$out" | pg_max_semver || true)"
     else
       return 2

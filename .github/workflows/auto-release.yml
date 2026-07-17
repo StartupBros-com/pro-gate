@@ -55,9 +55,10 @@ jobs:
             # tag creation, and later pushes would otherwise skip silently forever. Nothing
             # self-retries past tag creation by design (re-dispatching privileged stages
             # automatically is how release loops happen); reconcile by hand instead.
-            if gh release view "v$version" --json assets --jq '[.assets[].name] | join(",")' 2>/dev/null \
+            if gh release view "v$version" --json isDraft,isPrerelease,assets \
+                 --jq 'select(.isDraft == false and .isPrerelease == false) | [.assets[].name] | join(",")' 2>/dev/null \
                  | grep -q "pro-gate-runtime-$version.tar.gz.sha256"; then
-              echo "tag v$version already exists with complete release assets; nothing to release" >&2
+              echo "tag v$version already exists with a published release and complete assets; nothing to release" >&2
             else
               echo "::warning::Tag v$version exists but its release/assets are missing or incomplete. The chain does NOT self-retry past tag creation: rerun the 'Release runtime' workflow for v$version (or delete the tag+release to let auto-release retry), then check the release train run."
             fi

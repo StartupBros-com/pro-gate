@@ -280,7 +280,10 @@ mv -f "$PRO_GATE_HOME/VERSION.deploy.$$" "$PRO_GATE_HOME/VERSION"
 printf '%s\n' "$REQUESTED_VERSION" > "$PRO_GATE_HOME/EXPECTED_VERSION.deploy.$$"
 mv -f "$PRO_GATE_HOME/EXPECTED_VERSION.deploy.$$" "$PRO_GATE_HOME/EXPECTED_VERSION"
 { pg_file_sig "$PRO_GATE_HOME/daemon.sh" "$PRO_GATE_HOME/lib.sh" "$PRO_GATE_HOME/run-daemon.sh" > "$PRO_GATE_HOME/.deploy-stamp.tmp" && mv -f "$PRO_GATE_HOME/.deploy-stamp.tmp" "$PRO_GATE_HOME/.deploy-stamp"; } 2>/dev/null || true
-render(){ sed -e "s#@HOME@#${HOME}#g" -e "s#@USER@#$(id -un)#g" "$1"; }
+# @PRO_GATE_HOME@ renders the ACTUAL install home (dogfood gate round-2 P1: hardcoding the
+# default in the auto-update unit pointed a custom-PRO_GATE_HOME box at a nonexistent
+# updater, or worse, at a different runtime).
+render(){ sed -e "s#@PRO_GATE_HOME@#${PRO_GATE_HOME}#g" -e "s#@HOME@#${HOME}#g" -e "s#@USER@#$(id -un)#g" "$1"; }
 # Service reconciliation needs sudo (systemd) or launchctl and is skipped entirely under
 # --skip-services: the unattended auto-updater deploys files only, so it needs no TTY, no
 # NOPASSWD sudo, and cannot flip daemon/timer enablement (adversarial review P0/P1). The
