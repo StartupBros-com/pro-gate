@@ -48,51 +48,12 @@ pgau_log() {
   { mkdir -p "$PRO_GATE_HOME/logs" && printf '%s\n' "$line" >> "$PRO_GATE_HOME/logs/autoupdate.log"; } 2>/dev/null || true
 }
 
-pgau_semver_ok() { printf '%s' "${1:-}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; }
+pgau_semver_ok() { pg_semver3_ok "$1"; }
 
-pgau_max_semver() {  # stdin: candidate versions, one per line; echoes the highest valid one
-  local v best=""
-  while IFS= read -r v; do
-    pgau_semver_ok "$v" || continue
-    if [ -z "$best" ] || [ "$(printf '%s\n%s\n' "$best" "$v" | sort -V | tail -1)" = "$v" ]; then
-      best="$v"
-    fi
-  done
-  [ -n "$best" ] && printf '%s\n' "$best"
-}
-
-# The ACTIVE pro-gate plugin version. Source of truth is installed_plugins.json: entries are
-# keyed "<plugin>@<marketplace>" and carry the active version; the cache directories are NOT
-# authoritative (Claude Code leaves stale higher-versioned copies behind, which would invert
-# a deliberate marketplace rollback, and a bare path glob could be satisfied by an unrelated
-# file drop; both were adversarial-review findings). The cache-layout glob remains only as a
-# no-jq/no-manifest fallback, matched against the real <marketplace>/pro-gate/<version>/
-# shape. Several active entries (scopes/marketplaces) resolve to the highest version.
-pgau_plugin_version() {
-  local dir="${PRO_GATE_PLUGIN_SEARCH_DIR:-$HOME/.claude/plugins}" manifest f v best=""
-  manifest="$dir/installed_plugins.json"
-  if [ -s "$manifest" ] && pg_have jq && jq -e . "$manifest" >/dev/null 2>&1; then
-    # A readable manifest is AUTHORITATIVE, including its silence: no pro-gate entry means
-    # the plugin is not installed (perhaps uninstalled), and falling through to the cache
-    # glob would follow a leftover copy of something the operator removed.
-    best="$(jq -r '.plugins | to_entries[] | select(.key | startswith("pro-gate@")) | .value[]?.version // empty' "$manifest" 2>/dev/null | pgau_max_semver || true)"
-    [ -n "$best" ] || return 1
-    printf '%s\n' "$best"
-    return 0
-  fi
-  best="$(
-    while IFS= read -r f; do
-      if pg_have jq; then
-        jq -er .version "$f" 2>/dev/null || true
-      else
-        sed -nE 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$f" | head -1
-      fi
-    done < <(find "$dir" -path '*/pro-gate/*/.claude-plugin/plugin.json' -type f 2>/dev/null) \
-    | pgau_max_semver || true
-  )"
-  [ -n "$best" ] || return 1
-  printf '%s\n' "$best"
-}
+# The ACTIVE pro-gate plugin version, via the shared lib helper (installed_plugins.json,
+# pinned identity, user scope preferred; see pg_active_plugin_version). Distinguishes
+# "no plugin" (rc 1: nothing to follow, benign) from "manifest unusable" (rc 2: an
+# unattended code change must fail closed, not guess from cache directories).
 
 # Is the privileged daemon currently enabled on this box? Used ONLY for the consent gate:
 # the update itself never touches service enablement (INSTALL_SKIP_SERVICES=1).
@@ -135,12 +96,26 @@ pgau_run_installer() {  # $1 = target version
       --pattern "pro-gate-runtime-$v.tar.gz" --pattern "pro-gate-runtime-$v.tar.gz.sha256"
     pgau_sha256_check "pro-gate-runtime-$v.tar.gz.sha256"
     tar -xzf "pro-gate-runtime-$v.tar.gz" "pro-gate-runtime-$v/install.sh"
+    # A target installer that predates INSTALL_SKIP_SERVICES (< v0.23) would run the full
+    # sudo/service reconciliation from this TTY-less unit: fail (hang) or, worse, DISABLE an
+    # enabled daemon because INSTALL_DAEMON defaults to 0 (dogfood gate P1). Refuse those
+    # targets: rollbacks below v0.23 are a deliberate manual act.
+    if ! pgau_installer_supports_unattended "pro-gate-runtime-$v/install.sh"; then
+      exit 8
+    fi
     INSTALL_SKIP_SERVICES=1 bash "pro-gate-runtime-$v/install.sh" --version "$v" \
       --archive "pro-gate-runtime-$v.tar.gz" --checksum "pro-gate-runtime-$v.tar.gz.sha256"
   ) || rc=$?
   rm -rf "$stage"
+  if [ "$rc" -eq 8 ]; then
+    pgau_log "REFUSING: target v$v installer predates unattended updates (no --skip-services support); roll back manually: install.sh --version $v (add --daemon if the daemon should stay enabled)"
+  fi
   return "$rc"
 }
+
+# Does this installer understand --skip-services? (v0.23+.) Greps the flag's variable name:
+# executing an unknown installer to ask it would defeat the point.
+pgau_installer_supports_unattended() { grep -q 'INSTALL_SKIP_SERVICES' "$1" 2>/dev/null; }
 
 pgau_fail_streak() { awk -F'\t' 'NR==1{print $1}' "$PGAU_STATE" 2>/dev/null || true; }
 
@@ -167,10 +142,14 @@ pgau_main() {
     fi
   fi
 
-  if ! plugin_v="$(pgau_plugin_version)"; then
-    pgau_log "no active pro-gate plugin found via ${PRO_GATE_PLUGIN_SEARCH_DIR:-$HOME/.claude/plugins}/installed_plugins.json; nothing to follow"
-    return 0
-  fi
+  plugin_v="$(pg_active_plugin_version)"
+  case $? in
+    1) pgau_log "no active ${PRO_GATE_PLUGIN_KEY:-pro-gate@hov-marketplace} plugin found via ${PRO_GATE_PLUGIN_SEARCH_DIR:-$HOME/.claude/plugins}; nothing to follow"
+       return 0 ;;
+    2) pgau_log "REFUSING: installed_plugins.json exists but is unusable (unparseable, or no jq/python3); an unattended update never guesses from cache directories"
+       pgau_note_result 4
+       return 4 ;;
+  esac
   if ! pgau_semver_ok "$plugin_v"; then
     pgau_log "REFUSING: plugin version '$plugin_v' is not strict semver"
     return 4

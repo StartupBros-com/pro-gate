@@ -35,6 +35,8 @@ jobs:
 
       - name: Decide whether a release is due
         id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           version="$(tr -d '[:space:]' < VERSION)"
@@ -49,7 +51,16 @@ jobs:
             echo "due=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
           if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null 2>&1; then
-            echo "tag v$version already exists; nothing to release" >&2
+            # A tag is NOT proof the chain finished: packaging/publish/train can fail after
+            # tag creation, and later pushes would otherwise skip silently forever. Nothing
+            # self-retries past tag creation by design (re-dispatching privileged stages
+            # automatically is how release loops happen); reconcile by hand instead.
+            if gh release view "v$version" --json assets --jq '[.assets[].name] | join(",")' 2>/dev/null \
+                 | grep -q "pro-gate-runtime-$version.tar.gz.sha256"; then
+              echo "tag v$version already exists with complete release assets; nothing to release" >&2
+            else
+              echo "::warning::Tag v$version exists but its release/assets are missing or incomplete. The chain does NOT self-retry past tag creation: rerun the 'Release runtime' workflow for v$version (or delete the tag+release to let auto-release retry), then check the release train run."
+            fi
             echo "due=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
           echo "due=true" >> "$GITHUB_OUTPUT"

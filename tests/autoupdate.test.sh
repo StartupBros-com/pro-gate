@@ -137,7 +137,34 @@ echo '# no plugin installed: nothing to follow'
 write_manifest ''
 run_updater
 check 'no pro-gate entry -> no-op exit 0' "$([ "$RC" -eq 0 ] && [ ! -s "$TDIR/install.log" ]; echo $?)" "rc=$RC"
+
+echo '# identity pinning: other marketplaces and project scopes never move the runtime'
+cat > "$TDIR/plugins/installed_plugins.json" <<'EOF'
+{"version": 2, "plugins": {
+  "pro-gate@other-marketplace": [{"scope": "user", "version": "0.30.0"}],
+  "pro-gate@hov-marketplace": [
+    {"scope": "project", "projectPath": "/x", "version": "0.29.0"},
+    {"scope": "user", "version": "0.23.0"}
+  ]
+}}
+EOF
+printf '0.22.0\n' > "$TDIR/home/VERSION"
+run_updater
+check 'pinned key + user scope wins (0.23.0, not 0.30.0 or 0.29.0)' "$([ "$(cat "$TDIR/install.log")" = '0.23.0 1' ]; echo $?)" "log=$(cat "$TDIR/install.log")"
+
+echo '# fail closed: a corrupt manifest never falls back to the cache glob'
+printf '{not json' > "$TDIR/plugins/installed_plugins.json"
+run_updater
+check 'corrupt manifest refuses (exit 4)' "$([ "$RC" -eq 4 ]; echo $?)" "rc=$RC $(cat "$TDIR/stderr")"
+check 'corrupt manifest runs NO installer' "$([ ! -s "$TDIR/install.log" ]; echo $?)" "log=$(cat "$TDIR/install.log")"
 write_manifest 0.23.0
+
+echo '# legacy target installers (pre --skip-services) are refused, current ones accepted'
+printf '#!/usr/bin/env bash\nINSTALL_DAEMON="${INSTALL_DAEMON:-0}"\n' > "$TDIR/legacy-install.sh"
+LEGACY_RC="$(PRO_GATE_HOME="$TDIR/home" PRO_GATE_AUTOUPDATE_LIB=1 bash -c ". '$SCRIPT'; pgau_installer_supports_unattended '$TDIR/legacy-install.sh'"; echo $?)"
+check 'probe rejects a pre-v0.23 installer' "$([ "$LEGACY_RC" -ne 0 ]; echo $?)" "rc=$LEGACY_RC"
+CURRENT_RC="$(PRO_GATE_HOME="$TDIR/home" PRO_GATE_AUTOUPDATE_LIB=1 bash -c ". '$SCRIPT'; pgau_installer_supports_unattended '$HERE/../install.sh'"; echo $?)"
+check 'probe accepts the current installer' "$([ "$CURRENT_RC" -eq 0 ]; echo $?)" "rc=$CURRENT_RC"
 
 echo '# concurrency: a held lock skips the run'
 if command -v flock >/dev/null 2>&1; then
