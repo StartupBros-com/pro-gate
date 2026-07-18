@@ -2,13 +2,15 @@
 // Last-resort review salvage: read the finished Pro review
 // straight off the ChatGPT conversation tab's DOM via CDP.
 //
-// Why this exists: oracle (<=0.15.0) can fail to DETECT the thinking state
+// Why this exists: oracle (historically <=0.15.x) could fail to DETECT the thinking state
 // after a ChatGPT UI change even though the submission landed. The engine's
 // no-think watchdog then kills a LIVE run, and `oracle session --harvest`
 // reattaches to a stale tab target ("Assistant turns: 0") while the real
 // conversation keeps generating in another tab. This helper finds the
 // conversation tab by PR marker, waits for the VERDICT line, and prints the
-// review block. First seen: pushbot PR #863, 2026-07-02.
+// review block. First seen: pushbot PR #863, 2026-07-02. 0.16.0 hardened detection
+// upstream (positive terminal evidence + tightened Cloudflare / Work-tab handling), so
+// this salvage is now defense-in-depth rather than the sole safety net.
 //
 // v0.18: ChatGPT-throttle awareness + polite fresh-render budget.
 //   - Detects ChatGPT's anti-scraping interstitial ("You're making requests

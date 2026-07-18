@@ -70,11 +70,25 @@ pg_dangerous_consent_ok() {
 # (defer dispatch while the runtime lags the plugin a headless /pro-gate child would load).
 pg_semver3_ok() { printf '%s' "${1:-}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; }
 
+# pg_semver_lt <a> <b>: 0 when a < b, 1 when a >= b (both strict X.Y.Z), 2 when either is not
+# strict semver. Portable component-wise numeric compare via parameter expansion only: `sort -V`
+# is a GNU extension that BSD sort (the default on macOS, a supported platform) rejects, so a
+# sort-based compare errors and silently mis-orders there (dogfood Pro review, PR #32 P2).
+pg_semver_lt() {
+  pg_semver3_ok "${1:-}" && pg_semver3_ok "${2:-}" || return 2
+  local a="$1" b="$2" a1 a2 a3 b1 b2 b3
+  a1="${a%%.*}"; a="${a#*.}"; a2="${a%%.*}"; a3="${a#*.}"
+  b1="${b%%.*}"; b="${b#*.}"; b2="${b%%.*}"; b3="${b#*.}"
+  if [ "$a1" -ne "$b1" ]; then [ "$a1" -lt "$b1" ]; return; fi
+  if [ "$a2" -ne "$b2" ]; then [ "$a2" -lt "$b2" ]; return; fi
+  [ "$a3" -lt "$b3" ]
+}
+
 pg_max_semver() {  # stdin: candidate versions; echoes the highest strict-semver one
   local v best=""
   while IFS= read -r v; do
     pg_semver3_ok "$v" || continue
-    if [ -z "$best" ] || [ "$(printf '%s\n%s\n' "$best" "$v" | sort -V | tail -1)" = "$v" ]; then
+    if [ -z "$best" ] || pg_semver_lt "$best" "$v"; then
       best="$v"
     fi
   done
