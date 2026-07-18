@@ -831,10 +831,17 @@ while :; do
   pg_status launching "strategy ${PRO_GATE_MODEL_STRATEGY:-current}"
   : > "$RUNLOG"; rm -f "$OUT"   # clear any prior attempt's output so stale garbage can't survive
   run_oracle "${PRO_GATE_MODEL_STRATEGY:-current}" || true
-  # UI fallback (notably macOS): model picker not found + no output -> retry pinned to the account's
-  # already-selected model. Redundant on the default path (current is now primary), kept for select.
-  if [ ! -s "$OUT" ] && grep -qiE "model selector|model.?picker" "$RUNLOG" 2>/dev/null; then
-    echo "[oracle-review] model picker not found; retrying with --browser-model-strategy current (reviews whichever Pro model your ChatGPT account already has selected)..." >&2
+  # UI fallback: the requested model was not selectable in the picker (select strategy) -> retry
+  # pinned to the account's already-selected model. oracle's wording varies ("model selector",
+  # "model picker", "model switcher", "Unable to find model option matching ..."), so match them
+  # all: without the switcher/option forms a `select` mismatch failed the WHOLE run instead of
+  # falling back (dogfood 2026-07-17, PR #32: `select` + gpt-5.6 emitted "Unable to find model
+  # option matching 'GPT-5.6 Sol' in the model switcher" and released the slot without submitting,
+  # then the engine burned ~32 min on a pointless salvage). Skip when the primary run was already
+  # `current` (a second current pass changes nothing).
+  if [ ! -s "$OUT" ] && [ "${PRO_GATE_MODEL_STRATEGY:-current}" != current ] \
+     && grep -qiE "model selector|model.?picker|model switcher|unable to find model option" "$RUNLOG" 2>/dev/null; then
+    echo "[oracle-review] requested model not selectable in the picker; retrying with --browser-model-strategy current (reviews whichever model your ChatGPT account already has selected)..." >&2
     run_oracle current || true
   fi
   # Accept ONLY a real review, not just any non-empty file — a corrupted capture (e.g. a stray "A")
