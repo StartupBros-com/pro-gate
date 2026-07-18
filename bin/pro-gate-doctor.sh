@@ -66,9 +66,9 @@ if have_bin "$ORACLE_BIN" && have_bin "$TIMEOUT_BIN"; then
   # budget and Cloudflare backoff then amplify those into spurious exit-12 blocks and account
   # cooldowns. 0.16.0 also lands the GPT-5.6/Work-tab picker handling. Tune with
   # PRO_GATE_ORACLE_MIN_VERSION.
-  if [ -n "$ORACLE_LOCAL" ] && pg_semver3_ok "$ORACLE_LOCAL" \
-     && [ "$ORACLE_LOCAL" != "$ORACLE_MIN" ] \
-     && [ "$(printf '%s\n%s\n' "$ORACLE_MIN" "$ORACLE_LOCAL" | sort -V | head -1)" = "$ORACLE_LOCAL" ]; then
+  # pg_semver_lt is portable (no `sort -V`, which BSD/macOS sort rejects) and returns non-zero
+  # for a non-semver ORACLE_LOCAL or ORACLE_MIN, so a bad value degrades to "no warning".
+  if [ -n "$ORACLE_LOCAL" ] && pg_semver_lt "$ORACLE_LOCAL" "$ORACLE_MIN"; then
     W "oracle $ORACLE_LOCAL is below the $ORACLE_MIN floor: 0.16.0 fixes preamble-capture double-spends, false Cloudflare detection, and the GPT-5.6/Work-tab picker. Upgrade: pnpm add -g @steipete/oracle"
   fi
   # Skew nudge (needs npm): a newer published release than installed often means upstream
