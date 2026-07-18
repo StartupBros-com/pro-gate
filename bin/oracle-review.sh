@@ -62,7 +62,7 @@ if [ -n "$CONFIRM_FILE" ] && [ ! -s "$CONFIRM_FILE" ]; then
 fi
 
 PORT="${ORACLE_BROWSER_PORT:-9222}"
-MODEL="${ORACLE_MODEL:-gpt-5.5-pro}"
+MODEL="${ORACLE_MODEL:-gpt-5.6}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/pro-review.XXXXXX")"
 [ -n "$OUT" ] || OUT="$WORK/findings.md"
 # Fresh runs need oracle; --harvest only needs node+CDP and checks that prerequisite inside
