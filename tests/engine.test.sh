@@ -716,5 +716,21 @@ bash -c ". '$LIB'; pg_service_uptime(){ echo 999999; }; pg_browser_mode(){ echo 
 check 'browser-restart detector silent (stable uptime)' "$([ "$RC" -ne 0 ]; echo $?)" "rc=$RC (fired on stable uptime)"
 bash -c ". '$LIB'; pg_service_uptime(){ echo 5; }; pg_browser_mode(){ echo native; }; pg_browser_restarted_midrun \$(( \$(date +%s) - 100 ))" >/dev/null 2>&1; RC=$?
 check 'browser-restart detector native-safe' "$([ "$RC" -ne 0 ]; echo $?)" "rc=$RC (fired in native mode)"
+# gate #34 P2: a DOWN service (uptime 0) must NOT be misreported as a mid-run restart
+bash -c ". '$LIB'; pg_service_uptime(){ echo 0; }; pg_browser_mode(){ echo remote-chrome; }; pg_browser_restarted_midrun \$(( \$(date +%s) - 100 ))" >/dev/null 2>&1; RC=$?
+check 'browser-restart detector silent when service down (uptime 0)' "$([ "$RC" -ne 0 ]; echo $?)" "rc=$RC (down misread as OOM restart)"
+
+echo '# issue #35: OOM self-heal — conversation-URL capture + reopen guard'
+# cdp-salvage records the matched conversation URL to the sidecar (the seed for post-restart recovery)
+printf 'run marker: %s\nreview body\n[P1] a: b\nVERDICT: SHIP\n' "$MARKER" > "$TDIR/cap-tab.txt"
+start_mock "$TDIR/cap-tab.txt"
+CONVURL="$TDIR/cap.url"; rm -f "$CONVURL"
+PRO_GATE_CONVURL_OUT="$CONVURL" node "$HERE/../bin/cdp-salvage.mjs" "$MARKER" 10 "$PORT" >/dev/null 2>&1
+check 'cdp-salvage records conversation URL sidecar' "$([ "$(cat "$CONVURL" 2>/dev/null)" = 'https://chatgpt.com/c/mock-conversation' ]; echo $?)" "got: $(cat "$CONVURL" 2>/dev/null)"
+# pg_reopen_conversation refuses non-/c/ and empty URLs before any network call (deterministic)
+bash -c ". '$LIB'; pg_reopen_conversation 'https://evil.example/c/x' 9222" >/dev/null 2>&1; RC=$?
+check 'reopen refuses non-chatgpt URL' "$([ "$RC" -ne 0 ]; echo $?)" "rc=$RC"
+bash -c ". '$LIB'; pg_reopen_conversation '' 9222" >/dev/null 2>&1; RC=$?
+check 'reopen refuses empty URL' "$([ "$RC" -ne 0 ]; echo $?)" "rc=$RC"
 
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }

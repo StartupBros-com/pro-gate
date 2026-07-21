@@ -360,8 +360,22 @@ pg_browser_restarted_midrun() {
   dur=$(( $(date +%s) - run_start ))
   up="$(pg_service_uptime)"
   case "$up" in ''|*[!0-9]*) return 1 ;; esac
-  [ "$up" -lt "$dur" ] || return 1
+  # up==0 means the service is DOWN right now (pg_service_uptime's inactive sentinel), which is a
+  # different failure than a mid-run restart — don't misreport a down/looping service as OOM.
+  { [ "$up" -gt 0 ] && [ "$up" -lt "$dur" ]; } || return 1
   echo "$up"
+}
+
+# pg_reopen_conversation <url> [port]: reopen a ChatGPT conversation tab in the (possibly just
+# restarted) remote Chrome via the CDP HTTP API, so a subsequent marker salvage can read it. Only
+# accepts our own /c/ conversation URLs (issue #35 self-heal). Returns non-zero if it can't open
+# the tab. Settle pause is PRO_GATE_REOPEN_SETTLE (default 8s) so the SPA has time to render.
+pg_reopen_conversation() {
+  local url="$1" port="${2:-9222}"
+  case "$url" in https://chatgpt.com/c/*) ;; *) return 1 ;; esac
+  pg_have curl || return 1
+  curl -s --max-time 10 -X PUT "http://127.0.0.1:${port}/json/new?${url}" >/dev/null 2>&1 || return 1
+  sleep "${PRO_GATE_REOPEN_SETTLE:-8}"
 }
 
 # pg_cooldown_active: 0 + a one-line reason on stdout while the account back-off cooldown is

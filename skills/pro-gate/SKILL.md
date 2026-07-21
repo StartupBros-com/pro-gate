@@ -100,9 +100,10 @@ engine home is `$HOME/.pro-review-daemon`.
 - **Low-memory machines (the review runs a real browser):** the Pro review drives a headless
   Chrome that needs memory headroom. On a small or busy machine the engine either DEFERS up front
   (exit 8, no quota spent) with a plain-language "low on memory" message, or — if memory runs out
-  mid-review — Chrome restarts and the run ends exit 6 with a "review browser restarted mid-review,
-  likely out of memory" note (the review may still exist in ChatGPT; free memory and retry, don't
-  blindly re-run). It also prints a heads-up NOTE before a run when memory is tight but not
+  mid-review — Chrome restarts and the engine first tries to **self-heal** (issue #35: reopen the
+  captured conversation and salvage it, no new spend); only if that fails does it end exit 6 with a
+  "review browser restarted mid-review, likely out of memory" note (the review may still exist in
+  ChatGPT; free memory and retry, don't blindly re-run). It also prints a heads-up NOTE before a run when memory is tight but not
   blocking. Thresholds: `PRO_GATE_MIN_AVAIL_MB` (default 1024), `PRO_GATE_MAX_SWAP_PCT` (default
   97, the hard defer), `PRO_GATE_SWAP_WARN_PCT` (default 80, the soft heads-up). For users: close
   other apps / browser tabs / AI tools to free memory. `pro-gate-doctor.sh` reports the live state.

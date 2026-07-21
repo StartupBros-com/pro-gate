@@ -72,6 +72,15 @@ const THROTTLE_RE = /making requests too quickly|temporarily limited access to y
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// v0.24 (issue #35): persist the matched conversation URL to a sidecar so the engine can reopen
+// and salvage it after a mid-run browser restart (which loses the CDP tab) with no new Pro spend.
+// Only our own /c/ conversation URLs; best-effort (a write failure never breaks salvage).
+const CONVURL_OUT = process.env.PRO_GATE_CONVURL_OUT ?? '';
+const recordConvUrl = (url) => {
+  if (!CONVURL_OUT || !/^https:\/\/chatgpt\.com\/c\//.test(url || '')) return;
+  try { fs.writeFileSync(CONVURL_OUT, url + '\n'); } catch {}
+};
+
 // A page is the throttle interstitial only if it carries the phrase, no run
 // marker at all (ours or foreign — real conversations can QUOTE the phrase,
 // e.g. a review of this very engine), and is short like an error page.
@@ -252,7 +261,7 @@ while (Date.now() < deadline) {
     if (text === null || text.trim() === '') { deadTabs.push(tab); continue; }
     if (isThrottlePage(text)) tripThrottle(`tab ${tab.url}`);
     if (!text.includes(marker)) continue;
-    ourUrls.add(tab.url);
+    ourUrls.add(tab.url); recordConvUrl(tab.url);
     if (probe) { console.error(`live conversation tab: ${tab.url}`); process.exit(0); }
     const review = extractReview(text);
     if (review) { await closeTab(tab.id); console.log(review); process.exit(0); }
@@ -288,7 +297,7 @@ while (Date.now() < deadline) {
       if (/pg-run-[A-Za-z0-9.-]+/.test(text)) blacklist(tab.url);
       continue;
     }
-    ourUrls.add(tab.url);
+    ourUrls.add(tab.url); recordConvUrl(tab.url);
     if (probe) { console.error(`live conversation (via fresh render): ${tab.url}`); process.exit(0); }
     const review = extractReview(text);
     if (review) { await closeTab(tab.id); console.log(review); process.exit(0); }
