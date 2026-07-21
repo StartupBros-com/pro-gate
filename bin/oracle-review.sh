@@ -404,22 +404,39 @@ echo "[oracle-review] os=$OS mode=$MODE repo=$REPO pr=#${PR_NUM} url=${PR_URL:-n
 DIFF_WARN_LINES="${PRO_GATE_DIFF_WARN_LINES:-2500}"
 DIFF_COOK_LINES="${PRO_GATE_MAX_DIFF_LINES:-6000}"
 DIFF_HARD_MAX="${PRO_GATE_DIFF_HARD_MAX:-25000}"
+# A nonnumeric override must not silently disable the size checks: with stderr suppressed, a bad
+# value used to propagate through the reconciliation below and let ANY diff through. Validate every
+# operand as a nonnegative integer, restoring each invalid threshold to its own documented default.
+case "$DIFF_WARN_LINES" in ''|*[!0-9]*) DIFF_WARN_LINES=2500 ;; esac
+case "$DIFF_COOK_LINES" in ''|*[!0-9]*) DIFF_COOK_LINES=6000 ;; esac
+case "$DIFF_HARD_MAX"   in ''|*[!0-9]*) DIFF_HARD_MAX=25000 ;; esac
+case "$DIFF_LINES"      in ''|*[!0-9]*) DIFF_LINES=0 ;; esac
 # The hard ceiling can never sit below the cook threshold: raising PRO_GATE_MAX_DIFF_LINES past
 # the ceiling floats the ceiling up with it (so that knob still means "refuse above N" when set
 # high), and setting PRO_GATE_DIFF_HARD_MAX <= the cook threshold collapses the cook band, which
 # restores the pre-v0.24 hard-refuse-at-N behavior for anyone who wants it.
-[ "${DIFF_HARD_MAX:-0}" -ge "${DIFF_COOK_LINES:-0}" ] 2>/dev/null || DIFF_HARD_MAX="$DIFF_COOK_LINES"
-if [ "${DIFF_LINES:-0}" -gt "$DIFF_HARD_MAX" ] 2>/dev/null && [ "${PRO_GATE_DIFF_GUARD:-1}" = 1 ]; then
-  echo "ERROR: diff is ${DIFF_LINES} lines (> PRO_GATE_DIFF_HARD_MAX=${DIFF_HARD_MAX}): beyond the size the Pro model can review even via the harvest path; not spending a slot." >&2
+[ "$DIFF_HARD_MAX" -ge "$DIFF_COOK_LINES" ] || DIFF_HARD_MAX="$DIFF_COOK_LINES"
+# Cooking a large diff only pays off where the harvest path can collect a run that outlasts the
+# slot window. Native browser mode (macOS) has NO marker-addressable harvest and creates no
+# reservation, so a cooked large diff there spends a slot it can never collect (exit 6, quota
+# wasted). Keep the hard refusal at the cook threshold when harvest is unavailable: no cook band on
+# native. (An explicit PRO_GATE_DIFF_GUARD=0 still overrides everything, native included.)
+[ "$MODE" = remote-chrome ] || DIFF_HARD_MAX="$DIFF_COOK_LINES"
+if [ "$DIFF_LINES" -gt "$DIFF_HARD_MAX" ] && [ "${PRO_GATE_DIFF_GUARD:-1}" = 1 ]; then
+  if [ "$MODE" = remote-chrome ]; then
+    echo "ERROR: diff is ${DIFF_LINES} lines (> PRO_GATE_DIFF_HARD_MAX=${DIFF_HARD_MAX}): beyond the size the Pro model can review even via the harvest path; not spending a slot." >&2
+  else
+    echo "ERROR: diff is ${DIFF_LINES} lines (> ${DIFF_HARD_MAX}): native browser mode has no harvest path, so a diff over the cook threshold cannot be collected if it outruns the review window; not spending a slot." >&2
+  fi
   echo "  Scope the gate to what actually needs the final tier, then re-run with the patch:" >&2
   echo "    git -C <repo> diff <last-gated-sha>..<head> -- ':!*.lock' > delta.patch" >&2
   echo "    oracle-review.sh --diff delta.patch --repo <repo> --extra-files '<context globs>' --out <out>" >&2
   echo "  (Or split the PR; or raise PRO_GATE_DIFF_HARD_MAX / set PRO_GATE_DIFF_GUARD=0 to override.)" >&2
   pg_status oversized "diff ${DIFF_LINES} lines > hard max ${DIFF_HARD_MAX}; scope with --diff"
   pg_finish 11
-elif [ "${DIFF_LINES:-0}" -gt "$DIFF_COOK_LINES" ] 2>/dev/null; then
+elif [ "$DIFF_LINES" -gt "$DIFF_COOK_LINES" ]; then
   echo "[oracle-review] NOTE: diff is ${DIFF_LINES} lines (> PRO_GATE_MAX_DIFF_LINES=${DIFF_COOK_LINES}): a payload this size usually reasons past the slot window. Proceeding — the deep review is the point; expect exit 9 (in-progress) and collect it with --harvest (no new slot spent). To narrow instead, scope with --diff to the unreviewed delta." >&2
-elif [ "${DIFF_LINES:-0}" -gt "$DIFF_WARN_LINES" ] 2>/dev/null; then
+elif [ "$DIFF_LINES" -gt "$DIFF_WARN_LINES" ]; then
   echo "[oracle-review] WARNING: diff is ${DIFF_LINES} lines (> ${DIFF_WARN_LINES}); large diffs risk exceeding the Pro review window: consider scoping with --diff to the unreviewed delta." >&2
 fi
 

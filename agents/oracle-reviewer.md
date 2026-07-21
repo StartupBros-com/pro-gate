@@ -61,8 +61,13 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
    `curl` check would skip that recovery path and report "unavailable" for outages the
    engine would have healed. Just run the engine and interpret its exit code.
 
-3. **Run the review.** From the repo, launch the engine with an explicit `--out` and a long
-   Bash timeout (≥ 2100000 ms — it blocks 10-30 min):
+3. **Run the review.** From the repo, prefer launching the engine in the BACKGROUND and polling
+   `$OUT.status`, exactly as the main skill does. A foreground Bash timeout that fires mid-run can
+   kill the engine before it persists a cooked run's harvestable exit-9 reservation, and a later
+   invocation would then double-spend. If you must run it foreground, budget a timeout covering the
+   FULL worst case — the lock-wait queue (up to `PRO_GATE_LOCK_WAIT`, default 40 min) PLUS both the
+   primary and salvage windows (a large cooked diff can reason ~65 min) — never the bare 10-30 min
+   happy path:
    ```bash
    OUT="${TMPDIR:-/tmp}/oracle-reviewer-pr-<num>.md"
    "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --pr <num|url> --repo <REPO> \
@@ -71,8 +76,10 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
    The engine writes single-line JSON to `$OUT.status` at every phase change
    (`preflight → waiting-slot → launching → … → done|failed|deferred|in-progress|oversized|round-capped`).
    If your Bash call is interrupted or times out, do NOT relaunch: read `$OUT.status` first;
-   phases `throttled` and `salvaging` mean the engine is still working and quota may already
-   be spent. The JSON carries `marker`: the run's conversation id, needed for `--harvest`.
+   phases `throttled` and `salvaging` mean the engine is still working and quota may already be
+   spent. A run killed mid-`salvaging` may not have written its exit-9 reservation yet, so a bare
+   re-run could double-spend: harvest by the status `marker` (see exit 9 below), or confirm no open
+   conversation tab matches the PR, before ever launching again.
 
 3. **Interpret the exit code**, then return the matching envelope:
    - `0`: review ready. Read the resolved model from `$OUT.status` (`jq -r .model`, the model

@@ -58,6 +58,27 @@ check 'past-hard-ceiling diff exits 11' "$([ "$RC" -eq 11 ]; echo $?)" "rc=$RC $
 check 'past-hard-ceiling status phase oversized' "$([ "$(phase_of "$TDIR/o-big.md.status")" = oversized ]; echo $?)" "$(cat "$TDIR/o-big.md.status" 2>/dev/null)"
 check 'past-hard-ceiling spends nothing' "$([ ! -s "$TDIR/o-big.md" ]; echo $?)" 'out file exists'
 
+# Pro-gate #33 [P1]: native browser mode has no marker-addressable harvest, so a diff over the cook
+# threshold must be REFUSED (not cooked into an uncollectable exit-6 spend). No cook band on native.
+seq 1 9000 | sed 's/^/+/' > "$TDIR/native-big.diff"
+PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PRO_GATE_BROWSER_MODE=native \
+  bash "$ENGINE" --diff "$TDIR/native-big.diff" --repo "$TDIR" --out "$TDIR/o-native.md" --timeout 5m \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'native mode refuses over-cook diff (exit 11, no cook band)' "$([ "$RC" -eq 11 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
+check 'native-mode refusal phase oversized' "$([ "$(phase_of "$TDIR/o-native.md.status")" = oversized ]; echo $?)" "$(cat "$TDIR/o-native.md.status" 2>/dev/null)"
+
+# Pro-gate #33 [P2]: a nonnumeric PRO_GATE_MAX_DIFF_LINES must NOT silently disable the hard ceiling
+# (it used to propagate the bad value into DIFF_HARD_MAX and let any size through). huge.diff is 26k
+# lines (> default 25k ceiling): the ceiling must still fire despite the garbage cook threshold.
+PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PRO_GATE_MAX_DIFF_LINES=oops \
+  bash "$ENGINE" --diff "$TDIR/huge.diff" --repo "$TDIR" --out "$TDIR/o-nan.md" --timeout 5m \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'nonnumeric cook threshold still enforces hard ceiling (exit 11)' "$([ "$RC" -eq 11 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
+
 echo '# harvest: still generating'
 run_engine --harvest '' --out "$TDIR/o-empty.md" --timeout 5s
 check 'empty harvest marker exits 2' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC $(cat "$TDIR/stderr")"
