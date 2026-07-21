@@ -61,8 +61,13 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
    `curl` check would skip that recovery path and report "unavailable" for outages the
    engine would have healed. Just run the engine and interpret its exit code.
 
-3. **Run the review.** From the repo, launch the engine with an explicit `--out` and a long
-   Bash timeout (≥ 2100000 ms — it blocks 10-30 min):
+3. **Run the review.** From the repo, prefer launching the engine in the BACKGROUND and polling
+   `$OUT.status`, exactly as the main skill does. A foreground Bash timeout that fires mid-run can
+   kill the engine before it persists a cooked run's harvestable exit-9 reservation, and a later
+   invocation would then double-spend. If you must run it foreground, budget a timeout covering the
+   FULL worst case — the lock-wait queue (up to `PRO_GATE_LOCK_WAIT`, default 40 min) PLUS both the
+   primary and salvage windows (a large cooked diff can reason ~65 min) — never the bare 10-30 min
+   happy path:
    ```bash
    OUT="${TMPDIR:-/tmp}/oracle-reviewer-pr-<num>.md"
    "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --pr <num|url> --repo <REPO> \
@@ -71,8 +76,10 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
    The engine writes single-line JSON to `$OUT.status` at every phase change
    (`preflight → waiting-slot → launching → … → done|failed|deferred|in-progress|oversized|round-capped`).
    If your Bash call is interrupted or times out, do NOT relaunch: read `$OUT.status` first;
-   phases `throttled` and `salvaging` mean the engine is still working and quota may already
-   be spent. The JSON carries `marker`: the run's conversation id, needed for `--harvest`.
+   phases `throttled` and `salvaging` mean the engine is still working and quota may already be
+   spent. A run killed mid-`salvaging` may not have written its exit-9 reservation yet, so a bare
+   re-run could double-spend: harvest by the status `marker` (see exit 9 below), or confirm no open
+   conversation tab matches the PR, before ever launching again.
 
 3. **Interpret the exit code**, then return the matching envelope:
    - `0`: review ready. Read the resolved model from `$OUT.status` (`jq -r .model`, the model
@@ -82,10 +89,14 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
    - `3` (oracle missing, or browser unreachable after the engine's self-heal attempt) or
      `7` (all review slots busy after the 40-min queue wait) — unavailable envelope with
      the one-line reason; safe to retry later.
-   - `8` — deferred, **no quota spent** (box unfit or ChatGPT throttle cooldown): unavailable
-     envelope; note it is safe to retry after the cooldown. Never delete the cooldown file.
-   - `6` — ran but produced no usable review: quota MAY be spent — report it in the
-     unavailable envelope and do NOT re-run; the human should check the ChatGPT conversation.
+   - `8` — deferred, **no quota spent** (box unfit, low memory, or ChatGPT throttle cooldown):
+     unavailable envelope; note it is safe to retry after freeing memory / the cooldown. The
+     status `detail` states the reason (a low-memory defer is worded for the user). Never delete
+     the cooldown file.
+   - `6` — ran but produced no usable review: quota MAY be spent — report it in the unavailable
+     envelope and do NOT re-run; the human should check the ChatGPT conversation. On a low-memory
+     box this is often a mid-run browser restart (the status `detail` says so); the review may
+     still exist, so advise freeing memory and retrying rather than an immediate re-run.
    - `9`: in-progress (engine >=v0.20): quota IS spent, the model was still generating when
      the engine's budget ran out, and the conversation tab was left open. NEVER relaunch.
      Wait ~10 min, then collect with NO new spend. Reconstruct and validate all state in the
@@ -102,10 +113,13 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
      below-threshold miss), wait and repeat if your budget allows, else return the unavailable
      envelope quoting the harvest command; exit 3 = browser/CDP trouble with the reservation
      kept, safe to retry; exit 6 = confirmed gone after repeated misses).
-   - `11`: oversized diff (engine >=v0.20), **no quota spent**: the payload exceeds
-     `PRO_GATE_MAX_DIFF_LINES` (default 6000) and will not converge. Unavailable envelope;
-     tell the caller to scope the gate (`--diff <delta.patch>` of the un-gated commits,
-     KEEPING `--pr` so the change identity stays the PR's): do NOT blind-retry.
+   - `11`: oversized diff (engine >=v0.24), **no quota spent**: the payload exceeds the hard
+     ceiling `PRO_GATE_DIFF_HARD_MAX` (default 25000), beyond what the model can review even via
+     the harvest path (usually a generated blob the filter missed). Unavailable envelope; tell the
+     caller to scope the gate (`--diff <delta.patch>` of the un-gated commits, KEEPING `--pr` so
+     the change identity stays the PR's): do NOT blind-retry. NOTE: a *merely* large diff (over
+     `PRO_GATE_MAX_DIFF_LINES`, default 6000, but under the ceiling) no longer exits 11 — it
+     proceeds and is expected to exit 9 (`in-progress`); harvest it, don't scope it.
    - `12`: review round budget exhausted (engine >=v0.22), **no quota spent**: this PR (or
      repo+branch for `--diff`) already spent `PRO_GATE_MAX_ROUNDS_PER_PR` (default 4) review
      slots inside the rolling window (default 24h): the review→fix→re-review loop is not

@@ -48,14 +48,36 @@ run_engine() { # args... ; captures RC
   RC=$?
 }
 
-echo '# oversized diff guard'
+echo '# hard-ceiling refusal (exit 11): only diffs past PRO_GATE_DIFF_HARD_MAX are refused'
 printf 'still thinking, run marker: %s\n' "$MARKER" > "$TDIR/tab.txt"
 start_mock "$TDIR/tab.txt"
-seq 1 6500 | sed 's/^/+/' > "$TDIR/huge.diff"
+# > default hard ceiling (25000): still refused up front, no slot spent.
+seq 1 26000 | sed 's/^/+/' > "$TDIR/huge.diff"
 run_engine --diff "$TDIR/huge.diff" --repo "$TDIR" --out "$TDIR/o-big.md" --timeout 5m
-check 'oversized diff exits 11' "$([ "$RC" -eq 11 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
-check 'oversized status phase' "$([ "$(phase_of "$TDIR/o-big.md.status")" = oversized ]; echo $?)" "$(cat "$TDIR/o-big.md.status" 2>/dev/null)"
-check 'oversized spends nothing' "$([ ! -s "$TDIR/o-big.md" ]; echo $?)" 'out file exists'
+check 'past-hard-ceiling diff exits 11' "$([ "$RC" -eq 11 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
+check 'past-hard-ceiling status phase oversized' "$([ "$(phase_of "$TDIR/o-big.md.status")" = oversized ]; echo $?)" "$(cat "$TDIR/o-big.md.status" 2>/dev/null)"
+check 'past-hard-ceiling spends nothing' "$([ ! -s "$TDIR/o-big.md" ]; echo $?)" 'out file exists'
+
+# Pro-gate #33 [P1]: native browser mode has no marker-addressable harvest, so a diff over the cook
+# threshold must be REFUSED (not cooked into an uncollectable exit-6 spend). No cook band on native.
+seq 1 9000 | sed 's/^/+/' > "$TDIR/native-big.diff"
+PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PRO_GATE_BROWSER_MODE=native \
+  bash "$ENGINE" --diff "$TDIR/native-big.diff" --repo "$TDIR" --out "$TDIR/o-native.md" --timeout 5m \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'native mode refuses over-cook diff (exit 11, no cook band)' "$([ "$RC" -eq 11 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
+check 'native-mode refusal phase oversized' "$([ "$(phase_of "$TDIR/o-native.md.status")" = oversized ]; echo $?)" "$(cat "$TDIR/o-native.md.status" 2>/dev/null)"
+
+# Pro-gate #33 [P2]: a nonnumeric PRO_GATE_MAX_DIFF_LINES must NOT silently disable the hard ceiling
+# (it used to propagate the bad value into DIFF_HARD_MAX and let any size through). huge.diff is 26k
+# lines (> default 25k ceiling): the ceiling must still fire despite the garbage cook threshold.
+PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PRO_GATE_MAX_DIFF_LINES=oops \
+  bash "$ENGINE" --diff "$TDIR/huge.diff" --repo "$TDIR" --out "$TDIR/o-nan.md" --timeout 5m \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'nonnumeric cook threshold still enforces hard ceiling (exit 11)' "$([ "$RC" -eq 11 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
 
 echo '# harvest: still generating'
 run_engine --harvest '' --out "$TDIR/o-empty.md" --timeout 5s
@@ -241,6 +263,26 @@ check 'primary run keeps its tab' "$(! grep -q 'closed tab1' "$TDIR/mock.log"; e
 
 # Clean the primary reservation/tab fixture before the ledger assertion.
 rm -f "$TDIR/home/in-progress/$PRIMARY_MARKER"
+
+echo '# v0.24: a large diff (> cook threshold, < hard ceiling) COOKS to in-progress, not refused'
+# The whole point of the deep gate is to spend the compute: a 9000-line diff (over the 6000 cook
+# threshold, under the 25000 hard ceiling) must reach the fresh-run path and land in-progress
+# (exit 9, harvestable), NEVER exit 11.
+seq 1 9000 | sed 's/^/+/' > "$TDIR/cook.diff"
+printf 'waiting for fake submission\n' > "$TDIR/tab.txt"
+rm -rf "$TDIR/home/in-progress"; : > "$TDIR/mock.log"
+start_mock "$TDIR/tab.txt"
+PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_MAX_RETRIES=0 \
+  PRO_GATE_TIMEOUT_GRACE=0 PRO_GATE_STALL_SECS=5 PRO_GATE_NOTHINK_SECS=5 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle" PG_TEST_TAB_FILE="$TDIR/tab.txt" PATH="$PRIMARY_PATH" NODE_OPTIONS= \
+  bash "$ENGINE" --pr 91 --repo "$TDIR" --diff "$TDIR/cook.diff" \
+    --out "$TDIR/o-cook.md" --timeout 2s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'large diff cooks to in-progress (exit 9, not 11)' "$([ "$RC" -eq 9 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+check 'large diff lands in-progress phase, never oversized' "$([ "$(phase_of "$TDIR/o-cook.md.status")" = in-progress ]; echo $?)" "$(cat "$TDIR/o-cook.md.status" 2>/dev/null)"
+COOK_MARKER="$(jq -r .marker "$TDIR/o-cook.md.status" 2>/dev/null)"
+rm -f "$TDIR/home/in-progress/$COOK_MARKER"
 
 echo '# ledger outcomes'
 check 'ledger has oversized + in-progress rows' \
@@ -693,5 +735,31 @@ check 'unrecord drops one entry' "$([ "$(wc -l < "$RHOME/rounds/unrec-key-1")" -
 printf '100\n' > "$RHOME/rounds/unrec-key-1"
 PRO_GATE_HOME="$RHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_unrecord unrec-key-1"
 check 'unrecord removes an emptied file' "$([ ! -f "$RHOME/rounds/unrec-key-1" ]; echo $?)" 'file survived'
+
+echo '# memory-pressure messaging helpers (low-memory robustness)'
+LIB="$HERE/../lib/pro-gate-lib.sh"
+# pg_mem_status: human snapshot naming free RAM (where free(1) exists, i.e. Linux CI)
+MSTAT="$(bash -c ". '$LIB'; pg_mem_status")"
+check 'pg_mem_status reports free RAM' "$(printf '%s' "$MSTAT" | grep -q 'free RAM'; echo $?)" "got: $MSTAT"
+# pg_mem_pressure_note: silent (rc 1) above threshold
+bash -c ". '$LIB'; PRO_GATE_SWAP_WARN_PCT=101 pg_mem_pressure_note" >/dev/null 2>&1; RC=$?
+check 'mem pressure note silent above threshold' "$([ "$RC" -ne 0 ]; echo $?)" "rc=$RC (fired at 101%)"
+# ...and fires (rc 0 + text) below threshold when the host actually has swap
+if [ "$(free -m | awk '/^Swap:/{print $2}')" -gt 0 ] 2>/dev/null; then
+  NOTE_LO="$(bash -c ". '$LIB'; PRO_GATE_SWAP_WARN_PCT=0 pg_mem_pressure_note")"
+  check 'mem pressure note fires below threshold (swap present)' "$([ -n "$NOTE_LO" ]; echo $?)" "got: $NOTE_LO"
+else
+  echo 'ok - mem pressure note fire-case skipped (no swap on this host)'
+fi
+# pg_browser_restarted_midrun: fires when service uptime < run duration (stubbed), silent otherwise
+R_FIRED="$(bash -c ". '$LIB'; pg_service_uptime(){ echo 5; }; pg_browser_mode(){ echo remote-chrome; }; pg_browser_restarted_midrun \$(( \$(date +%s) - 100 ))")"
+check 'browser-restart detector fires (uptime<run)' "$([ "$R_FIRED" = 5 ]; echo $?)" "got: $R_FIRED"
+bash -c ". '$LIB'; pg_service_uptime(){ echo 999999; }; pg_browser_mode(){ echo remote-chrome; }; pg_browser_restarted_midrun \$(( \$(date +%s) - 100 ))" >/dev/null 2>&1; RC=$?
+check 'browser-restart detector silent (stable uptime)' "$([ "$RC" -ne 0 ]; echo $?)" "rc=$RC (fired on stable uptime)"
+bash -c ". '$LIB'; pg_service_uptime(){ echo 5; }; pg_browser_mode(){ echo native; }; pg_browser_restarted_midrun \$(( \$(date +%s) - 100 ))" >/dev/null 2>&1; RC=$?
+check 'browser-restart detector native-safe' "$([ "$RC" -ne 0 ]; echo $?)" "rc=$RC (fired in native mode)"
+# gate #34 P2: a DOWN service (uptime 0) must NOT be misreported as a mid-run restart
+bash -c ". '$LIB'; pg_service_uptime(){ echo 0; }; pg_browser_mode(){ echo remote-chrome; }; pg_browser_restarted_midrun \$(( \$(date +%s) - 100 ))" >/dev/null 2>&1; RC=$?
+check 'browser-restart detector silent when service down (uptime 0)' "$([ "$RC" -ne 0 ]; echo $?)" "rc=$RC (down misread as OOM restart)"
 
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }

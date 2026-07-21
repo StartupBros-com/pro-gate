@@ -134,7 +134,10 @@ if [ "$MODE" = remote-chrome ]; then
   up="$(pg_service_uptime)"
   if [ "${up:-999999}" -ge "${PRO_GATE_MIN_UPTIME:-60}" ]; then P "oracle-chrome stable (${up}s uptime)"; else W "oracle-chrome only ${up}s uptime — engine will defer until it stabilizes"; fi
 fi
-if memreason="$(pg_mem_headroom_ok)"; then P "memory headroom ok for a review"; else W "memory pressure: ${memreason} — engine may defer the slot"; fi
+if memreason="$(pg_mem_headroom_ok)"; then
+  if memnote="$(pg_mem_pressure_note)"; then W "memory tight: ${memnote} — the engine still runs, but a long review may be unstable; free memory (close apps/tabs) for best results";
+  else P "memory headroom ok for a review ($(pg_mem_status))"; fi
+else W "memory pressure: ${memreason} — the engine will DEFER the slot (no quota spent); free memory and retry"; fi
 
 # config
 [ -n "${PRO_REVIEW_OWNERS:-}" ] && P "PRO_REVIEW_OWNERS='${PRO_REVIEW_OWNERS}'" || W "PRO_REVIEW_OWNERS unset (daemon needs it; interactive /pro-gate does not)"
