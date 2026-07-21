@@ -76,7 +76,8 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/pro-review.XXXXXX")"
 # watchdog-killed, live-detected, salvaging, retry-wait, throttled, cloudflare, oversized,
 # round-capped, deferred, done, failed, in-progress.
 # Terminal phases: done (read $OUT), failed, deferred (no slot spent: retry later),
-# oversized (no slot spent: scope the diff), round-capped (no slot spent: this PR/branch
+# oversized (no slot spent: past the hard ceiling PRO_GATE_DIFF_HARD_MAX; scope the diff — a
+# merely large diff instead proceeds and lands in-progress), round-capped (no slot spent: this PR/branch
 # already used its review round budget for the window; escalate to a human, do not re-run),
 # in-progress (slot SPENT, model still generating: collect later with --harvest <marker>,
 # NEVER relaunch).
@@ -390,22 +391,34 @@ fi
 DIFF_LINES=$(wc -l < "$DIFF_FILE" 2>/dev/null || echo 0)
 echo "[oracle-review] os=$OS mode=$MODE repo=$REPO pr=#${PR_NUM} url=${PR_URL:-n/a} diff_lines=$DIFF_LINES input=$INPUT" >&2
 
-# --- v0.20: diff-size guard: refuse to burn a Pro review slot on a payload that will not
-# converge. Ledger data: 984-1402-line diffs complete in 12-21 min; a ~10k-line diff (6.5k
-# insertions, 40 files) reasoned 65 minutes without emitting a verdict (2026-07-09, exactly the
-# review window the timeout+salvage budgets cannot cover). Oversized diffs exit 11 BEFORE any
-# lock or slot is taken, with the delta-scoping recipe on stderr. PRO_GATE_MAX_DIFF_LINES
-# raises the cap, PRO_GATE_DIFF_GUARD=0 downgrades the hard stop to a warning.
+# --- v0.20/v0.24: diff-size handling. The deep think IS the product of this gate, and the engine
+# already has a harvest path (exit 9 -> --harvest) that collects a review outlasting the slot
+# window for FREE. So a large diff no longer refuses: past PRO_GATE_MAX_DIFF_LINES (the "cook"
+# threshold, default 6000) the run proceeds and is EXPECTED to exit 9 (in-progress), then be
+# harvested. Only past the hard ceiling PRO_GATE_DIFF_HARD_MAX (default 25000) does the engine
+# still refuse up front (exit 11, BEFORE any lock/slot, no spend): a payload that large risks
+# context overflow and is almost always a generated blob the diff filter missed. PRO_GATE_DIFF_GUARD=0
+# disables even the hard ceiling (cook any size). Ledger origin: 984-1402-line diffs complete in
+# 12-21 min; a ~10k-line diff reasoned 65 min (2026-07-09) then had to be harvested — which is
+# exactly the path this now takes by default instead of refusing.
 DIFF_WARN_LINES="${PRO_GATE_DIFF_WARN_LINES:-2500}"
-DIFF_MAX_LINES="${PRO_GATE_MAX_DIFF_LINES:-6000}"
-if [ "${DIFF_LINES:-0}" -gt "$DIFF_MAX_LINES" ] 2>/dev/null && [ "${PRO_GATE_DIFF_GUARD:-1}" = 1 ]; then
-  echo "ERROR: diff is ${DIFF_LINES} lines (> PRO_GATE_MAX_DIFF_LINES=${DIFF_MAX_LINES}): the Pro model does not converge on payloads this size within any review budget; not spending a slot." >&2
+DIFF_COOK_LINES="${PRO_GATE_MAX_DIFF_LINES:-6000}"
+DIFF_HARD_MAX="${PRO_GATE_DIFF_HARD_MAX:-25000}"
+# The hard ceiling can never sit below the cook threshold: raising PRO_GATE_MAX_DIFF_LINES past
+# the ceiling floats the ceiling up with it (so that knob still means "refuse above N" when set
+# high), and setting PRO_GATE_DIFF_HARD_MAX <= the cook threshold collapses the cook band, which
+# restores the pre-v0.24 hard-refuse-at-N behavior for anyone who wants it.
+[ "${DIFF_HARD_MAX:-0}" -ge "${DIFF_COOK_LINES:-0}" ] 2>/dev/null || DIFF_HARD_MAX="$DIFF_COOK_LINES"
+if [ "${DIFF_LINES:-0}" -gt "$DIFF_HARD_MAX" ] 2>/dev/null && [ "${PRO_GATE_DIFF_GUARD:-1}" = 1 ]; then
+  echo "ERROR: diff is ${DIFF_LINES} lines (> PRO_GATE_DIFF_HARD_MAX=${DIFF_HARD_MAX}): beyond the size the Pro model can review even via the harvest path; not spending a slot." >&2
   echo "  Scope the gate to what actually needs the final tier, then re-run with the patch:" >&2
   echo "    git -C <repo> diff <last-gated-sha>..<head> -- ':!*.lock' > delta.patch" >&2
   echo "    oracle-review.sh --diff delta.patch --repo <repo> --extra-files '<context globs>' --out <out>" >&2
-  echo "  (Or split the PR; or raise PRO_GATE_MAX_DIFF_LINES / set PRO_GATE_DIFF_GUARD=0 to override.)" >&2
-  pg_status oversized "diff ${DIFF_LINES} lines > max ${DIFF_MAX_LINES}; scope with --diff"
+  echo "  (Or split the PR; or raise PRO_GATE_DIFF_HARD_MAX / set PRO_GATE_DIFF_GUARD=0 to override.)" >&2
+  pg_status oversized "diff ${DIFF_LINES} lines > hard max ${DIFF_HARD_MAX}; scope with --diff"
   pg_finish 11
+elif [ "${DIFF_LINES:-0}" -gt "$DIFF_COOK_LINES" ] 2>/dev/null; then
+  echo "[oracle-review] NOTE: diff is ${DIFF_LINES} lines (> PRO_GATE_MAX_DIFF_LINES=${DIFF_COOK_LINES}): a payload this size usually reasons past the slot window. Proceeding — the deep review is the point; expect exit 9 (in-progress) and collect it with --harvest (no new slot spent). To narrow instead, scope with --diff to the unreviewed delta." >&2
 elif [ "${DIFF_LINES:-0}" -gt "$DIFF_WARN_LINES" ] 2>/dev/null; then
   echo "[oracle-review] WARNING: diff is ${DIFF_LINES} lines (> ${DIFF_WARN_LINES}); large diffs risk exceeding the Pro review window: consider scoping with --diff to the unreviewed delta." >&2
 fi

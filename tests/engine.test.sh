@@ -48,14 +48,15 @@ run_engine() { # args... ; captures RC
   RC=$?
 }
 
-echo '# oversized diff guard'
+echo '# hard-ceiling refusal (exit 11): only diffs past PRO_GATE_DIFF_HARD_MAX are refused'
 printf 'still thinking, run marker: %s\n' "$MARKER" > "$TDIR/tab.txt"
 start_mock "$TDIR/tab.txt"
-seq 1 6500 | sed 's/^/+/' > "$TDIR/huge.diff"
+# > default hard ceiling (25000): still refused up front, no slot spent.
+seq 1 26000 | sed 's/^/+/' > "$TDIR/huge.diff"
 run_engine --diff "$TDIR/huge.diff" --repo "$TDIR" --out "$TDIR/o-big.md" --timeout 5m
-check 'oversized diff exits 11' "$([ "$RC" -eq 11 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
-check 'oversized status phase' "$([ "$(phase_of "$TDIR/o-big.md.status")" = oversized ]; echo $?)" "$(cat "$TDIR/o-big.md.status" 2>/dev/null)"
-check 'oversized spends nothing' "$([ ! -s "$TDIR/o-big.md" ]; echo $?)" 'out file exists'
+check 'past-hard-ceiling diff exits 11' "$([ "$RC" -eq 11 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
+check 'past-hard-ceiling status phase oversized' "$([ "$(phase_of "$TDIR/o-big.md.status")" = oversized ]; echo $?)" "$(cat "$TDIR/o-big.md.status" 2>/dev/null)"
+check 'past-hard-ceiling spends nothing' "$([ ! -s "$TDIR/o-big.md" ]; echo $?)" 'out file exists'
 
 echo '# harvest: still generating'
 run_engine --harvest '' --out "$TDIR/o-empty.md" --timeout 5s
@@ -241,6 +242,26 @@ check 'primary run keeps its tab' "$(! grep -q 'closed tab1' "$TDIR/mock.log"; e
 
 # Clean the primary reservation/tab fixture before the ledger assertion.
 rm -f "$TDIR/home/in-progress/$PRIMARY_MARKER"
+
+echo '# v0.24: a large diff (> cook threshold, < hard ceiling) COOKS to in-progress, not refused'
+# The whole point of the deep gate is to spend the compute: a 9000-line diff (over the 6000 cook
+# threshold, under the 25000 hard ceiling) must reach the fresh-run path and land in-progress
+# (exit 9, harvestable), NEVER exit 11.
+seq 1 9000 | sed 's/^/+/' > "$TDIR/cook.diff"
+printf 'waiting for fake submission\n' > "$TDIR/tab.txt"
+rm -rf "$TDIR/home/in-progress"; : > "$TDIR/mock.log"
+start_mock "$TDIR/tab.txt"
+PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_MAX_RETRIES=0 \
+  PRO_GATE_TIMEOUT_GRACE=0 PRO_GATE_STALL_SECS=5 PRO_GATE_NOTHINK_SECS=5 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle" PG_TEST_TAB_FILE="$TDIR/tab.txt" PATH="$PRIMARY_PATH" NODE_OPTIONS= \
+  bash "$ENGINE" --pr 91 --repo "$TDIR" --diff "$TDIR/cook.diff" \
+    --out "$TDIR/o-cook.md" --timeout 2s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'large diff cooks to in-progress (exit 9, not 11)' "$([ "$RC" -eq 9 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+check 'large diff lands in-progress phase, never oversized' "$([ "$(phase_of "$TDIR/o-cook.md.status")" = in-progress ]; echo $?)" "$(cat "$TDIR/o-cook.md.status" 2>/dev/null)"
+COOK_MARKER="$(jq -r .marker "$TDIR/o-cook.md.status" 2>/dev/null)"
+rm -f "$TDIR/home/in-progress/$COOK_MARKER"
 
 echo '# ledger outcomes'
 check 'ledger has oversized + in-progress rows' \

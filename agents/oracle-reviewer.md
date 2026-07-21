@@ -102,10 +102,13 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
      below-threshold miss), wait and repeat if your budget allows, else return the unavailable
      envelope quoting the harvest command; exit 3 = browser/CDP trouble with the reservation
      kept, safe to retry; exit 6 = confirmed gone after repeated misses).
-   - `11`: oversized diff (engine >=v0.20), **no quota spent**: the payload exceeds
-     `PRO_GATE_MAX_DIFF_LINES` (default 6000) and will not converge. Unavailable envelope;
-     tell the caller to scope the gate (`--diff <delta.patch>` of the un-gated commits,
-     KEEPING `--pr` so the change identity stays the PR's): do NOT blind-retry.
+   - `11`: oversized diff (engine >=v0.24), **no quota spent**: the payload exceeds the hard
+     ceiling `PRO_GATE_DIFF_HARD_MAX` (default 25000), beyond what the model can review even via
+     the harvest path (usually a generated blob the filter missed). Unavailable envelope; tell the
+     caller to scope the gate (`--diff <delta.patch>` of the un-gated commits, KEEPING `--pr` so
+     the change identity stays the PR's): do NOT blind-retry. NOTE: a *merely* large diff (over
+     `PRO_GATE_MAX_DIFF_LINES`, default 6000, but under the ceiling) no longer exits 11 — it
+     proceeds and is expected to exit 9 (`in-progress`); harvest it, don't scope it.
    - `12`: review round budget exhausted (engine >=v0.22), **no quota spent**: this PR (or
      repo+branch for `--diff`) already spent `PRO_GATE_MAX_ROUNDS_PER_PR` (default 4) review
      slots inside the rolling window (default 24h): the review→fix→re-review loop is not

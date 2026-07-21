@@ -70,8 +70,10 @@ the versioned disclosure during installation.
   cooldown instead of a retry, and every phase lands in `<out>.status` for polling.
 - **Engine >=v0.20 never destroys a still-generating review**: when the salvage budget ends
   while the model is still reasoning, the run exits 9 (`in-progress`), leaves the conversation
-  tab open, and `--harvest <marker>` collects the finished review later with NO new spend. An
-  oversized diff is refused up front (exit 11) instead of burning a slot it cannot convert.
+  tab open, and `--harvest <marker>` collects the finished review later with NO new spend. A
+  large diff (over `PRO_GATE_MAX_DIFF_LINES`, default 6000) rides that same path: it proceeds and
+  is expected to land `in-progress`, to be harvested. Only a diff past the hard ceiling
+  (`PRO_GATE_DIFF_HARD_MAX`, default 25000) is refused up front (exit 11), no slot spent.
 
 **Codex on Windows:** run the engine through WSL, not native PowerShell path syntax. Use WSL repo paths
 such as `/home/<username>/SITES/<repo>` and invoke commands with `wsl -e bash -lc '...'`; the default
@@ -145,8 +147,9 @@ found · `5` diff fetch failed · `6` ran but no usable review (quota may be spe
 conversation in ChatGPT before re-running) · `7` lock timeout · `8` deferred, NO quota spent
 (box unfit or throttle cooldown: safe to retry later) · `9` in-progress: the slot IS spent but
 the model was still generating when the salvage budget ran out; the conversation tab is left
-open: NEVER relaunch, harvest instead (below) · `11` oversized diff, NO quota spent: scope
-the payload (below) instead of re-running · `12` round budget exhausted, NO quota spent: this
+open: NEVER relaunch, harvest instead (below) · `11` oversized diff (past the hard ceiling
+`PRO_GATE_DIFF_HARD_MAX`), NO quota spent: scope the payload (below); a merely large diff instead
+proceeds and lands `in-progress` for harvest · `12` round budget exhausted, NO quota spent: this
 PR/branch already used its review rounds for the window (section 6): do NOT re-run; post the
 still-unresolved findings for the human, or set `PRO_GATE_FORCE_ROUND=1` for one deliberate
 extra run. The exit-12 status `detail` also reports the change's last completed review as
@@ -174,10 +177,18 @@ race it) · `3` runtime/CDP trouble; reservation and tab kept (retry once the br
 healthy). Repeat harvests are free: no Pro quota is spent. Reservations are keyed by
 repo-scoped PR identity, so identical PR numbers in different repositories never cross.
 
-**Exit 11 (`oversized`): scope the gate.** Huge diffs (default guard: >6000 lines,
-`PRO_GATE_MAX_DIFF_LINES`) do not converge in any review budget; blind reruns just burn
-20-60 min Pro sessions. Scope the final gate to the delta that has NOT already cleared earlier
-tiers, with full-file context for the trust boundary:
+**Large diffs (v0.24): cook, don't refuse.** The deep think IS the point of this gate, and the
+engine already harvests a review that outlasts the slot window for free. So past the *cook*
+threshold (`PRO_GATE_MAX_DIFF_LINES`, default 6000) the run **proceeds**: expect it to exit 9
+(`in-progress`) and collect the verdict with `--harvest` (no new slot spent). A big diff is the
+harvest path, not a wall. Only past the *hard ceiling* (`PRO_GATE_DIFF_HARD_MAX`, default 25000)
+does the engine still refuse up front (exit 11, no spend): a payload that large risks context
+overflow and is almost always a generated blob the filter missed.
+
+**Exit 11 (`oversized`): scope the gate.** When you do hit the hard ceiling (or you deliberately
+want to narrow a sprawling, unfocused diff rather than cook the whole thing), scope the final gate
+to the delta that has NOT already cleared earlier tiers, with full-file context for the trust
+boundary:
 
 ```bash
 git -C <repo> diff <last-gated-sha>..<head> > delta.patch
