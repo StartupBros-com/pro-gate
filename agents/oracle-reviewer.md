@@ -89,10 +89,14 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
    - `3` (oracle missing, or browser unreachable after the engine's self-heal attempt) or
      `7` (all review slots busy after the 40-min queue wait) — unavailable envelope with
      the one-line reason; safe to retry later.
-   - `8` — deferred, **no quota spent** (box unfit or ChatGPT throttle cooldown): unavailable
-     envelope; note it is safe to retry after the cooldown. Never delete the cooldown file.
-   - `6` — ran but produced no usable review: quota MAY be spent — report it in the
-     unavailable envelope and do NOT re-run; the human should check the ChatGPT conversation.
+   - `8` — deferred, **no quota spent** (box unfit, low memory, or ChatGPT throttle cooldown):
+     unavailable envelope; note it is safe to retry after freeing memory / the cooldown. The
+     status `detail` states the reason (a low-memory defer is worded for the user). Never delete
+     the cooldown file.
+   - `6` — ran but produced no usable review: quota MAY be spent — report it in the unavailable
+     envelope and do NOT re-run; the human should check the ChatGPT conversation. On a low-memory
+     box this is often a mid-run browser restart (the status `detail` says so); the review may
+     still exist, so advise freeing memory and retrying rather than an immediate re-run.
    - `9`: in-progress (engine >=v0.20): quota IS spent, the model was still generating when
      the engine's budget ran out, and the conversation tab was left open. NEVER relaunch.
      Wait ~10 min, then collect with NO new spend. Reconstruct and validate all state in the

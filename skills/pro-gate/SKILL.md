@@ -99,6 +99,15 @@ engine home is `$HOME/.pro-review-daemon`.
   (`sudo systemctl start oracle-chrome`) and sign in via `login-view.sh` if the profile reset.
   On **macOS** there's no pre-check — oracle drives your signed-in Chrome and errors clearly if
   you're not logged in. `pro-gate-doctor.sh` checks all of this.
+- **Low-memory machines (the review runs a real browser):** the Pro review drives a headless
+  Chrome that needs memory headroom. On a small or busy machine the engine either DEFERS up front
+  (exit 8, no quota spent) with a plain-language "low on memory" message, or — if memory runs out
+  mid-review — Chrome restarts and the run ends exit 6 with a "review browser restarted mid-review,
+  likely out of memory" note (the review may still exist in ChatGPT; free memory and retry, don't
+  blindly re-run). It also prints a heads-up NOTE before a run when memory is tight but not
+  blocking. Thresholds: `PRO_GATE_MIN_AVAIL_MB` (default 1024), `PRO_GATE_MAX_SWAP_PCT` (default
+  97, the hard defer), `PRO_GATE_SWAP_WARN_PCT` (default 80, the soft heads-up). For users: close
+  other apps / browser tabs / AI tools to free memory. `pro-gate-doctor.sh` reports the live state.
 - **Usage (best-effort):** if codex auth is present, check `chatgpt.com/backend-api/wham/usage`;
   if the primary window is ≥90% or `limit_reached`, warn before burning a slot.
 - **Concurrency is handled for you:** `oracle-review.sh` holds a counting semaphore —
@@ -144,8 +153,10 @@ While waiting, never spawn a second oracle run for the same PR. The status JSON 
 
 Engine exit codes: `0` review ready · `2` bad usage · `3` oracle/browser missing · `4` repo not
 found · `5` diff fetch failed · `6` ran but no usable review (quota may be spent — check the PR
-conversation in ChatGPT before re-running) · `7` lock timeout · `8` deferred, NO quota spent
-(box unfit or throttle cooldown: safe to retry later) · `9` in-progress: the slot IS spent but
+conversation in ChatGPT before re-running; on a low-memory box this often means the review browser
+restarted mid-run — the status `detail` says so, the review may still exist, free memory and retry
+rather than blindly re-run) · `7` lock timeout · `8` deferred, NO quota spent
+(box unfit, low memory, or throttle cooldown: safe to retry later) · `9` in-progress: the slot IS spent but
 the model was still generating when the salvage budget ran out; the conversation tab is left
 open: NEVER relaunch, harvest instead (below) · `11` oversized diff (past the hard ceiling
 `PRO_GATE_DIFF_HARD_MAX`), NO quota spent: scope the payload (below); a merely large diff instead

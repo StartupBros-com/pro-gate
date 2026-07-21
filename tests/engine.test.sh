@@ -736,4 +736,30 @@ printf '100\n' > "$RHOME/rounds/unrec-key-1"
 PRO_GATE_HOME="$RHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_unrecord unrec-key-1"
 check 'unrecord removes an emptied file' "$([ ! -f "$RHOME/rounds/unrec-key-1" ]; echo $?)" 'file survived'
 
+echo '# memory-pressure messaging helpers (low-memory robustness)'
+LIB="$HERE/../lib/pro-gate-lib.sh"
+# pg_mem_status: human snapshot naming free RAM (where free(1) exists, i.e. Linux CI)
+MSTAT="$(bash -c ". '$LIB'; pg_mem_status")"
+check 'pg_mem_status reports free RAM' "$(printf '%s' "$MSTAT" | grep -q 'free RAM'; echo $?)" "got: $MSTAT"
+# pg_mem_pressure_note: silent (rc 1) above threshold
+bash -c ". '$LIB'; PRO_GATE_SWAP_WARN_PCT=101 pg_mem_pressure_note" >/dev/null 2>&1; RC=$?
+check 'mem pressure note silent above threshold' "$([ "$RC" -ne 0 ]; echo $?)" "rc=$RC (fired at 101%)"
+# ...and fires (rc 0 + text) below threshold when the host actually has swap
+if [ "$(free -m | awk '/^Swap:/{print $2}')" -gt 0 ] 2>/dev/null; then
+  NOTE_LO="$(bash -c ". '$LIB'; PRO_GATE_SWAP_WARN_PCT=0 pg_mem_pressure_note")"
+  check 'mem pressure note fires below threshold (swap present)' "$([ -n "$NOTE_LO" ]; echo $?)" "got: $NOTE_LO"
+else
+  echo 'ok - mem pressure note fire-case skipped (no swap on this host)'
+fi
+# pg_browser_restarted_midrun: fires when service uptime < run duration (stubbed), silent otherwise
+R_FIRED="$(bash -c ". '$LIB'; pg_service_uptime(){ echo 5; }; pg_browser_mode(){ echo remote-chrome; }; pg_browser_restarted_midrun \$(( \$(date +%s) - 100 ))")"
+check 'browser-restart detector fires (uptime<run)' "$([ "$R_FIRED" = 5 ]; echo $?)" "got: $R_FIRED"
+bash -c ". '$LIB'; pg_service_uptime(){ echo 999999; }; pg_browser_mode(){ echo remote-chrome; }; pg_browser_restarted_midrun \$(( \$(date +%s) - 100 ))" >/dev/null 2>&1; RC=$?
+check 'browser-restart detector silent (stable uptime)' "$([ "$RC" -ne 0 ]; echo $?)" "rc=$RC (fired on stable uptime)"
+bash -c ". '$LIB'; pg_service_uptime(){ echo 5; }; pg_browser_mode(){ echo native; }; pg_browser_restarted_midrun \$(( \$(date +%s) - 100 ))" >/dev/null 2>&1; RC=$?
+check 'browser-restart detector native-safe' "$([ "$RC" -ne 0 ]; echo $?)" "rc=$RC (fired in native mode)"
+# gate #34 P2: a DOWN service (uptime 0) must NOT be misreported as a mid-run restart
+bash -c ". '$LIB'; pg_service_uptime(){ echo 0; }; pg_browser_mode(){ echo remote-chrome; }; pg_browser_restarted_midrun \$(( \$(date +%s) - 100 ))" >/dev/null 2>&1; RC=$?
+check 'browser-restart detector silent when service down (uptime 0)' "$([ "$RC" -ne 0 ]; echo $?)" "rc=$RC (down misread as OOM restart)"
+
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }

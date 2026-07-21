@@ -841,7 +841,12 @@ while :; do
     # the salvage of a possibly-completed review. Stop retrying and salvage instead.
     if [ "$attempt" -eq 0 ]; then
       echo "ERROR: not spending a Pro review slot (${GATE_REASON})." >&2
-      echo "  Deferred (no slot spent). Retry once the box settles, or run on macOS (native Chrome)." >&2
+      case "$GATE_REASON" in
+        *memory*|*thrashing*|*swap*)
+          echo "  Your machine is low on memory, so the Pro review browser can't run reliably right now. Nothing was spent. Close some apps / browser tabs / other AI tools to free memory, then retry." >&2 ;;
+        *)
+          echo "  Deferred (no slot spent). Retry once the box settles, or run on macOS (native Chrome)." >&2 ;;
+      esac
       pg_status deferred "$GATE_REASON"
       pg_finish 8
     fi
@@ -856,6 +861,13 @@ while :; do
   # v0.22: this invocation is now committed to spending a slot: record its round (once; the
   # guarded retry below is the same round, and pre-launch exits above never record).
   [ "$attempt" -eq 0 ] && pg_round_record "$ROUND_KEY"
+
+  # A non-blocking heads-up when memory is tight but not blocking (the gate is deliberately
+  # conservative, so a swap-heavy box with moderate free RAM still runs). Warns low-memory users
+  # BEFORE a long review that a mid-run browser restart is the likely failure mode. Advisory only.
+  if [ "$attempt" -eq 0 ] && MEM_NOTE="$(pg_mem_pressure_note)"; then
+    echo "[oracle-review] NOTE: ${MEM_NOTE}. Proceeding; if the review fails, this is the likely reason — free memory and retry." >&2
+  fi
 
   echo "[oracle-review] launching the final-tier Pro review (attempt $((attempt + 1)), oracle timeout $TIMEOUT, hard cap ${HARD_SECS}s, stall/no-think watchdog ${STALL_SECS}s/${NOTHINK_SECS}s)..." >&2
   pg_status launching "strategy ${PRO_GATE_MODEL_STRATEGY:-current}"
@@ -1077,6 +1089,17 @@ elif [ "${SALVAGE_RC:-0}" -eq 3 ]; then
 else
   RETRIES=$(( attempt > 0 ? attempt - 1 : 0 ))
   echo "ERROR: oracle produced no usable review after salvage + ${RETRIES} retr$([ "${RETRIES}" -eq 1 ] && echo y || echo ies) (reattach: oracle session ${SLUG_BASE})." >&2
-  pg_status failed "no usable review after salvage"
+  # Attribute the failure when the review browser restarted mid-run — almost always memory pressure
+  # on a small box (Chrome's subprocesses get reclaimed, oracle-chrome restarts, the CDP tab is
+  # lost). Say so plainly so a non-technical user knows what happened, that quota was likely already
+  # spent, and that the review may still exist server-side (no need to immediately re-run).
+  FAIL_DETAIL="no usable review after salvage"
+  if _svc_up="$(pg_browser_restarted_midrun "$RUN_START")"; then
+    _mem="$(pg_mem_status)"; [ -n "$_mem" ] || _mem="memory usage unknown"
+    echo "  LIKELY CAUSE: the review browser (Chrome) restarted ${_svc_up}s ago — mid-review — almost always because the machine ran low on memory (${_mem})." >&2
+    echo "  The slot was likely already spent and the review may still exist in ChatGPT, so do NOT immediately re-run. Free memory (close other apps / browser tabs) and try again." >&2
+    FAIL_DETAIL="review browser restarted mid-run (chrome up ${_svc_up}s); likely out of memory"
+  fi
+  pg_status failed "$FAIL_DETAIL"
   pg_finish 6
 fi
