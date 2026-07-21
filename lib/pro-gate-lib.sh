@@ -348,22 +348,31 @@ pg_mem_pressure_note() {
   echo "memory is tight (${avail:-?}MB free RAM, swap ${pct}% used); a long Pro review may destabilize the browser on a low-memory machine"
 }
 
-# pg_browser_restarted_midrun <run_start_epoch>: 0 (+ the service uptime on stdout) when the
-# remote-chrome service (re)started AFTER this run began — i.e. it restarted mid-review, which
-# loses the CDP tab and is almost always memory pressure on a small box. Returns 1 otherwise, and
-# for native mode (no managed service). Diagnosis only: the run has already failed by the time this
-# is consulted.
-pg_browser_restarted_midrun() {
-  local run_start="$1" up dur
+pg_service_active_epoch() {
+  # oracle-chrome's current ActiveEnterTimestamp as epoch seconds — the "activation generation"
+  # for precise restart detection. Returns 1 (no output) when not systemd / native / inactive.
+  [ "$(pg_service_mgr)" = systemd ] || return 1
+  systemctl is-active --quiet oracle-chrome.service 2>/dev/null || return 1
+  local t; t=$(systemctl show oracle-chrome.service -p ActiveEnterTimestamp --value 2>/dev/null)
+  [ -n "$t" ] || return 1
+  date -d "$t" +%s 2>/dev/null || return 1
+}
+
+# pg_browser_restarted_since <baseline_epoch>: 0 (+ seconds since the new activation, on stdout)
+# when the remote-chrome service's activation is now NEWER than the baseline captured at review
+# LAUNCH — i.e. Chrome restarted during the review window (an attempt OR the salvage), which loses
+# the CDP tab and is almost always memory pressure on a small box. Precise by design: the baseline
+# is taken at launch, so a restart during the pre-launch queue is NOT counted (gate #34/#36 P2),
+# and a merely-down service (no current activation) is not misread as a restart. Returns 1
+# otherwise, for native mode, and with no/invalid baseline.
+pg_browser_restarted_since() {
+  local base="$1" now
   [ "$(pg_browser_mode)" = remote-chrome ] || return 1
-  case "$run_start" in ''|*[!0-9]*) return 1 ;; esac
-  dur=$(( $(date +%s) - run_start ))
-  up="$(pg_service_uptime)"
-  case "$up" in ''|*[!0-9]*) return 1 ;; esac
-  # up==0 means the service is DOWN right now (pg_service_uptime's inactive sentinel), which is a
-  # different failure than a mid-run restart — don't misreport a down/looping service as OOM.
-  { [ "$up" -gt 0 ] && [ "$up" -lt "$dur" ]; } || return 1
-  echo "$up"
+  case "$base" in ''|*[!0-9]*) return 1 ;; esac
+  now="$(pg_service_active_epoch)" || return 1
+  case "$now" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$now" -gt "$base" ] || return 1
+  echo $(( $(date +%s) - now ))
 }
 
 # pg_reopen_conversation <url> [port]: reopen a ChatGPT conversation tab in the (possibly just

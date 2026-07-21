@@ -709,16 +709,21 @@ if [ "$(free -m | awk '/^Swap:/{print $2}')" -gt 0 ] 2>/dev/null; then
 else
   echo 'ok - mem pressure note fire-case skipped (no swap on this host)'
 fi
-# pg_browser_restarted_midrun: fires when service uptime < run duration (stubbed), silent otherwise
-R_FIRED="$(bash -c ". '$LIB'; pg_service_uptime(){ echo 5; }; pg_browser_mode(){ echo remote-chrome; }; pg_browser_restarted_midrun \$(( \$(date +%s) - 100 ))")"
-check 'browser-restart detector fires (uptime<run)' "$([ "$R_FIRED" = 5 ]; echo $?)" "got: $R_FIRED"
-bash -c ". '$LIB'; pg_service_uptime(){ echo 999999; }; pg_browser_mode(){ echo remote-chrome; }; pg_browser_restarted_midrun \$(( \$(date +%s) - 100 ))" >/dev/null 2>&1; RC=$?
-check 'browser-restart detector silent (stable uptime)' "$([ "$RC" -ne 0 ]; echo $?)" "rc=$RC (fired on stable uptime)"
-bash -c ". '$LIB'; pg_service_uptime(){ echo 5; }; pg_browser_mode(){ echo native; }; pg_browser_restarted_midrun \$(( \$(date +%s) - 100 ))" >/dev/null 2>&1; RC=$?
-check 'browser-restart detector native-safe' "$([ "$RC" -ne 0 ]; echo $?)" "rc=$RC (fired in native mode)"
-# gate #34 P2: a DOWN service (uptime 0) must NOT be misreported as a mid-run restart
-bash -c ". '$LIB'; pg_service_uptime(){ echo 0; }; pg_browser_mode(){ echo remote-chrome; }; pg_browser_restarted_midrun \$(( \$(date +%s) - 100 ))" >/dev/null 2>&1; RC=$?
-check 'browser-restart detector silent when service down (uptime 0)' "$([ "$RC" -ne 0 ]; echo $?)" "rc=$RC (down misread as OOM restart)"
+# pg_browser_restarted_since (gate #36 P2): fires when activation is NEWER than the launch baseline
+R_FIRED="$(bash -c ". '$LIB'; pg_service_active_epoch(){ echo \$(( \$(date +%s) - 8 )); }; pg_browser_mode(){ echo remote-chrome; }; pg_browser_restarted_since \$(( \$(date +%s) - 200 ))")"
+check 'restart-since fires when activation newer than baseline' "$([ -n "$R_FIRED" ]; echo $?)" "got: $R_FIRED"
+# silent when activation unchanged (== baseline): no restart during the review window
+bash -c ". '$LIB'; A=\$(( \$(date +%s) - 200 )); pg_service_active_epoch(){ echo \$A; }; pg_browser_mode(){ echo remote-chrome; }; pg_browser_restarted_since \$A" >/dev/null 2>&1; RC=$?
+check 'restart-since silent when activation == baseline' "$([ "$RC" -ne 0 ]; echo $?)" "rc=$RC (fired on stable activation)"
+# silent when the service is DOWN now (active_epoch returns non-zero) — not a false OOM
+bash -c ". '$LIB'; pg_service_active_epoch(){ return 1; }; pg_browser_mode(){ echo remote-chrome; }; pg_browser_restarted_since 1000" >/dev/null 2>&1; RC=$?
+check 'restart-since silent when service down (no false OOM)' "$([ "$RC" -ne 0 ]; echo $?)" "rc=$RC (down misread)"
+# silent with no launch baseline (pre-launch queue restart cannot be misblamed)
+bash -c ". '$LIB'; pg_service_active_epoch(){ echo 999; }; pg_browser_mode(){ echo remote-chrome; }; pg_browser_restarted_since ''" >/dev/null 2>&1; RC=$?
+check 'restart-since silent without baseline' "$([ "$RC" -ne 0 ]; echo $?)" "rc=$RC (no baseline)"
+# native-safe
+bash -c ". '$LIB'; pg_service_active_epoch(){ echo 999999999; }; pg_browser_mode(){ echo native; }; pg_browser_restarted_since 1000" >/dev/null 2>&1; RC=$?
+check 'restart-since native-safe' "$([ "$RC" -ne 0 ]; echo $?)" "rc=$RC (fired in native mode)"
 
 echo '# issue #35: OOM self-heal — conversation-URL capture + reopen guard'
 # cdp-salvage records the matched conversation URL to the sidecar (the seed for post-restart recovery)

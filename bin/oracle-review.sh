@@ -66,8 +66,11 @@ MODEL="${ORACLE_MODEL:-gpt-5.6}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/pro-review.XXXXXX")"
 [ -n "$OUT" ] || OUT="$WORK/findings.md"
 # issue #35 self-heal: cdp-salvage records the live conversation URL here so a mid-run browser
-# restart (usually OOM) can be recovered by reopening + salvaging it, with no new Pro spend.
-export PRO_GATE_CONVURL_OUT="$OUT.convurl"; : > "$PRO_GATE_CONVURL_OUT" 2>/dev/null || true
+# restart (usually OOM) can be recovered by reopening + salvaging it, with no new Pro spend. Only a
+# FRESH run truncates it; a --harvest run PRESERVES a prior run's captured URL so it can reopen a
+# conversation whose tab was lost to a restart before the harvest (gate #36 P1).
+export PRO_GATE_CONVURL_OUT="$OUT.convurl"
+if [ "${HARVEST_REQUESTED:-0}" != 1 ]; then : > "$PRO_GATE_CONVURL_OUT" 2>/dev/null || true; fi
 # Fresh runs need oracle; --harvest only needs node+CDP and checks that prerequisite inside
 # its branch below (moving this gate matters when oracle is temporarily unavailable but a spent
 # review is waiting in an open conversation).
@@ -253,6 +256,18 @@ if [ -n "$HARVEST_MARKER" ]; then
     echo "[oracle-review] harvest deferred: ${GATE_REASON}." >&2
     pg_status deferred "$GATE_REASON"
     pg_finish 8
+  fi
+  # gate #36 P1: if this reserved conversation's tab is no longer open (e.g. Chrome restarted since
+  # the exit-9 run) but a prior run captured its URL (preserved: --harvest does not truncate the
+  # sidecar), reopen it first so the harvest salvage below reads it through the normal path.
+  # Memory-gated; no new spend; only reopens when the tab is actually gone (avoids duplicate tabs).
+  if [ "${PRO_GATE_SELF_HEAL_OOM:-1}" = 1 ]; then
+    _hv_url="$(head -n1 "$PRO_GATE_CONVURL_OUT" 2>/dev/null || true)"
+    if [ -n "$_hv_url" ] && ! node "$SELF/cdp-salvage.mjs" --probe "$RUN_MARKER" 5 "$PORT" >/dev/null 2>&1 \
+       && pg_mem_headroom_ok >/dev/null 2>&1; then
+      echo "[oracle-review] SELF-HEAL: reserved conversation tab not open; reopening it before harvest (no new spend)..." >&2
+      pg_reopen_conversation "$_hv_url" "$PORT" || true
+    fi
   fi
   HARVEST_SECS="$(pg_dur_secs "$TIMEOUT")"
   echo "[oracle-review] harvesting in-progress review (marker ${RUN_MARKER}, up to ${HARVEST_SECS}s, no new slot spent)..." >&2
@@ -842,10 +857,19 @@ while :; do
     echo "[oracle-review] NOTE: ${MEM_NOTE}. Proceeding; if the review fails, this is the likely reason — free memory and retry." >&2
   fi
 
-  # issue #34 gate P2: measure the mid-run-restart window from the actual review LAUNCH, not from
-  # process start (RUN_START), which includes the pre-launch queue (up to PRO_GATE_LOCK_WAIT) during
-  # which an unrelated Chrome restart would otherwise be misblamed as this review's OOM.
-  [ "$attempt" -eq 0 ] && REVIEW_LAUNCH_START="$(date +%s)"
+  # gate #34/#36 P2: capture the browser service's activation GENERATION at the first launch as the
+  # restart-detection baseline — this excludes the pre-launch queue, so a Chrome restart before the
+  # review launched is not misblamed as this run's OOM. gate #36 P1: also start a lightweight
+  # background probe that records the conversation's /c/ URL as soon as it appears — BEFORE any
+  # mid-run restart can lose the tab — so the self-heal has a URL to reopen even when the crash
+  # happens during ordinary generation (when no other CDP scan would have run yet).
+  if [ "$attempt" -eq 0 ]; then
+    REVIEW_ACT_BASELINE="$(pg_service_active_epoch || echo '')"
+    if [ "$MODE" = remote-chrome ] && [ "${PRO_GATE_SELF_HEAL_OOM:-1}" = 1 ] && command -v node >/dev/null 2>&1; then
+      ( node "$SELF/cdp-salvage.mjs" --probe "$RUN_MARKER" "${PRO_GATE_URLCAP_SECS:-$HARD_SECS}" "$PORT" >/dev/null 2>&1 ) &
+      URLCAP_PID=$!
+    fi
+  fi
 
   echo "[oracle-review] launching the final-tier Pro review (attempt $((attempt + 1)), oracle timeout $TIMEOUT, hard cap ${HARD_SECS}s, stall/no-think watchdog ${STALL_SECS}s/${NOTHINK_SECS}s)..." >&2
   # issue #34 gate P2: fold the memory heads-up into the status detail so background status-polling
@@ -1001,6 +1025,10 @@ fi
 MODEL_WARN="$(pg_derive_model_warn "$RESOLVED_MODEL" "$MODEL_STATUS")"
 [ -n "$MODEL_WARN" ] && echo "[oracle-review] WARNING: ${MODEL_WARN}." >&2
 
+# gate #36 P1: stop the early URL-capture probe. It self-exits once it records the conversation URL
+# (or times out); by here the URL is captured, or the last-resort salvage below will record it.
+[ -n "${URLCAP_PID:-}" ] && kill "$URLCAP_PID" 2>/dev/null; URLCAP_PID=""
+
 # v0.13: last-resort CDP tab salvage. oracle (historically <=0.15.x; hardened upstream in
 # 0.16.0) could fail to DETECT thinking after ChatGPT UI drift even though the submission landed: the
 # no-think watchdog then kills a LIVE run, and reattach harvests a stale tab
@@ -1038,6 +1066,37 @@ if ! pg_is_review "$OUT" && [ "${CLOUDFLARE:-0}" != 1 ] && command -v node >/dev
   fi
 fi
 
+# gate #36 P1/P2 self-heal (issue #35): if the last-resort salvage did NOT recover a review AND the
+# browser restarted mid-review (usually OOM) AND we captured the conversation URL before the tab was
+# lost, reopen it in the restarted browser and salvage ONCE — memory-gated, no new Pro spend, never
+# re-submits. The result feeds the SAME decision below: a recovered review flows through the shared
+# success path (finalization intact); a still-generating reopened conversation sets SALVAGE_RC=3 and
+# is RESERVED as in-progress (NEVER destroyed); anything else falls through to the failure path.
+if ! pg_is_review "$OUT" && [ "${CLOUDFLARE:-0}" != 1 ] && [ "${PRO_GATE_SELF_HEAL_OOM:-1}" = 1 ] \
+   && command -v node >/dev/null 2>&1; then
+  _heal_up="$(pg_browser_restarted_since "${REVIEW_ACT_BASELINE:-}")" || _heal_up=""
+  _heal_url="$(head -n1 "$PRO_GATE_CONVURL_OUT" 2>/dev/null || true)"
+  if [ -n "$_heal_up" ] && [ -n "$_heal_url" ] && pg_mem_headroom_ok >/dev/null 2>&1; then
+    echo "[oracle-review] SELF-HEAL: the review browser restarted ${_heal_up}s ago (mid-review, likely OOM); reopening the conversation and salvaging it (no new quota)..." >&2
+    pg_status salvaging "self-heal: reopening conversation after mid-run restart"
+    HEAL_TMP="$OUT.heal.$$"
+    if pg_reopen_conversation "$_heal_url" "$PORT"; then
+      SALVAGE_RC=0
+      node "$SELF/cdp-salvage.mjs" "$RUN_MARKER" "${PRO_GATE_RECOVER_SECS:-180}" "$PORT" > "$HEAL_TMP" 2>>"$RUNLOG" || SALVAGE_RC=$?
+      if [ "$SALVAGE_RC" -eq 0 ] && pg_is_review "$HEAL_TMP"; then
+        mv "$HEAL_TMP" "$OUT"; SALVAGED=1
+        echo "[oracle-review] SELF-HEAL recovered the review after the mid-run restart (no new spend)." >&2
+      else
+        rm -f "$HEAL_TMP"
+        echo "[oracle-review] SELF-HEAL: reopened conversation not yet complete (salvage rc=${SALVAGE_RC}); the in-progress/failure handling below applies." >&2
+      fi
+    else
+      rm -f "$HEAL_TMP"
+      echo "[oracle-review] SELF-HEAL: could not reopen the conversation tab; falling through." >&2
+    fi
+  fi
+fi
+
 if pg_is_review "$OUT"; then
   # v0.22: remember this review's P0/P1 counts so a later round-capped refusal can flag an
   # unconfirmed open P0 to the human (advisory sidecar; see pg_round_note_severity).
@@ -1071,31 +1130,16 @@ elif [ "${SALVAGE_RC:-0}" -eq 3 ]; then
 else
   RETRIES=$(( attempt > 0 ? attempt - 1 : 0 ))
   echo "ERROR: oracle produced no usable review after salvage + ${RETRIES} retr$([ "${RETRIES}" -eq 1 ] && echo y || echo ies) (reattach: oracle session ${SLUG_BASE})." >&2
-  # Attribute the failure when the review browser restarted mid-run — almost always memory pressure
-  # on a small box (Chrome's subprocesses get reclaimed, oracle-chrome restarts, the CDP tab is
-  # lost). Say so plainly so a non-technical user knows what happened, that quota was likely already
-  # spent, and that the review may still exist server-side (no need to immediately re-run).
+  # Attribute the failure when the review browser restarted mid-review — almost always memory
+  # pressure on a small box (Chrome's subprocesses get reclaimed, oracle-chrome restarts, the CDP
+  # tab is lost). The self-heal above already TRIED to reopen + recover; reaching here means it
+  # could not (no URL captured before the tab was lost, memory still starved, or the conversation is
+  # truly gone). Say so plainly so a non-technical user knows what happened and that the review may
+  # still exist server-side.
   FAIL_DETAIL="no usable review after salvage"
-  if _svc_up="$(pg_browser_restarted_midrun "${REVIEW_LAUNCH_START:-$RUN_START}")"; then
+  if _svc_up="$(pg_browser_restarted_since "${REVIEW_ACT_BASELINE:-}")"; then
     _mem="$(pg_mem_status)"; [ -n "$_mem" ] || _mem="memory usage unknown"
     echo "  LIKELY CAUSE: the review browser (Chrome) restarted ${_svc_up}s ago — mid-review — almost always because the machine ran low on memory (${_mem})." >&2
-    # issue #35 self-heal: the completed review usually still exists server-side. If cdp-salvage
-    # captured its conversation URL before the restart and the box now has memory headroom, reopen
-    # it in the restarted browser and salvage ONCE — recovering the review with NO new Pro spend.
-    # PRO_GATE_SELF_HEAL_OOM=0 opts out. Never re-submits, so it cannot double-spend.
-    _conv_url="$(head -n1 "$PRO_GATE_CONVURL_OUT" 2>/dev/null)"
-    if [ -n "$_conv_url" ] && [ "${PRO_GATE_SELF_HEAL_OOM:-1}" = 1 ] && pg_mem_headroom_ok >/dev/null 2>&1; then
-      echo "  SELF-HEAL: reopening the review conversation and salvaging it (no new quota)..." >&2
-      pg_status salvaging "self-heal: reopening conversation after mid-run restart"
-      if pg_reopen_conversation "$_conv_url" "$PORT" \
-         && node "$SELF/cdp-salvage.mjs" "$RUN_MARKER" "${PRO_GATE_RECOVER_SECS:-180}" "$PORT" > "$OUT" 2>>"$RUNLOG" \
-         && pg_is_review "$OUT"; then
-        echo "[oracle-review] SELF-HEAL succeeded: recovered the review after the mid-run browser restart (no new spend)." >&2
-        pg_status done "recovered via self-heal after mid-run restart"
-        pg_finish 0
-      fi
-      echo "  SELF-HEAL could not recover a complete review; leaving it for a manual harvest/retry." >&2
-    fi
     echo "  The slot was likely already spent and the review may still exist in ChatGPT, so do NOT immediately re-run. Free memory (close other apps / browser tabs) and try again." >&2
     FAIL_DETAIL="review browser restarted mid-run (chrome up ${_svc_up}s); likely out of memory"
   fi
