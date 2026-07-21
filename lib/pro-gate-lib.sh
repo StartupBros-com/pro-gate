@@ -360,7 +360,9 @@ pg_browser_restarted_midrun() {
   dur=$(( $(date +%s) - run_start ))
   up="$(pg_service_uptime)"
   case "$up" in ''|*[!0-9]*) return 1 ;; esac
-  [ "$up" -lt "$dur" ] || return 1
+  # up==0 means the service is DOWN right now (pg_service_uptime's inactive sentinel), a different
+  # failure than a mid-run restart — don't misreport a down/looping service as an OOM restart.
+  { [ "$up" -gt 0 ] && [ "$up" -lt "$dur" ]; } || return 1
   echo "$up"
 }
 
