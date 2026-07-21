@@ -319,6 +319,51 @@ pg_mem_headroom_ok() {
   return 0
 }
 
+# pg_mem_status: one-line human memory snapshot for user-facing messages (e.g. "1234MB free RAM,
+# swap 94% used"). Empty when free(1) is unavailable (e.g. macOS). Never blocks anything.
+pg_mem_status() {
+  pg_have free || return 0
+  local avail swap_total swap_used tail=""
+  avail=$(free -m | awk '/^Mem:/{print $7}')
+  swap_total=$(free -m | awk '/^Swap:/{print $2}')
+  swap_used=$(free -m | awk '/^Swap:/{print $3}')
+  [ "${swap_total:-0}" -gt 0 ] && tail=", swap $(( swap_used * 100 / swap_total ))% used"
+  echo "${avail:-?}MB free RAM${tail}"
+}
+
+# pg_mem_pressure_note: 0 + a one-line advisory on stdout when the box is under memory pressure but
+# NOT starved enough for pg_mem_headroom_ok to block — a heavy browser review may still destabilize
+# on a small machine. Returns 1 (no output) with ample headroom, no swap, or no measurement.
+# Soft threshold: PRO_GATE_SWAP_WARN_PCT (default 80). Advisory only; never blocks a run.
+pg_mem_pressure_note() {
+  pg_have free || return 1
+  local avail swap_total swap_used warn pct
+  warn="${PRO_GATE_SWAP_WARN_PCT:-80}"
+  avail=$(free -m | awk '/^Mem:/{print $7}')
+  swap_total=$(free -m | awk '/^Swap:/{print $2}')
+  swap_used=$(free -m | awk '/^Swap:/{print $3}')
+  [ "${swap_total:-0}" -gt 0 ] || return 1
+  pct=$(( swap_used * 100 / swap_total ))
+  [ "$pct" -ge "$warn" ] || return 1
+  echo "memory is tight (${avail:-?}MB free RAM, swap ${pct}% used); a long Pro review may destabilize the browser on a low-memory machine"
+}
+
+# pg_browser_restarted_midrun <run_start_epoch>: 0 (+ the service uptime on stdout) when the
+# remote-chrome service (re)started AFTER this run began — i.e. it restarted mid-review, which
+# loses the CDP tab and is almost always memory pressure on a small box. Returns 1 otherwise, and
+# for native mode (no managed service). Diagnosis only: the run has already failed by the time this
+# is consulted.
+pg_browser_restarted_midrun() {
+  local run_start="$1" up dur
+  [ "$(pg_browser_mode)" = remote-chrome ] || return 1
+  case "$run_start" in ''|*[!0-9]*) return 1 ;; esac
+  dur=$(( $(date +%s) - run_start ))
+  up="$(pg_service_uptime)"
+  case "$up" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$up" -lt "$dur" ] || return 1
+  echo "$up"
+}
+
 # pg_cooldown_active: 0 + a one-line reason on stdout while the account back-off cooldown is
 # live (v0.18: written by cdp-salvage on the "requests too quickly / temporarily limited"
 # throttle interstitial, and by oracle-review.sh on a Cloudflare anti-bot challenge).
