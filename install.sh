@@ -300,6 +300,17 @@ case "$OS" in
     else
       launchctl unload "$PL" 2>/dev/null || true
     fi
+    # Auto-update LaunchAgent (launchd equivalent of the systemd timer): reconciled ONLY on
+    # explicit request, like the systemd branch below; a plain install must not flip it.
+    AUPL="$HOME/Library/LaunchAgents/com.pro-gate.autoupdate.plist"
+    if [ "$INSTALL_AUTO_UPDATE" = 1 ]; then
+      mkdir -p "$(dirname "$AUPL")" "$PRO_GATE_HOME/logs"
+      render "$SOURCE_ROOT/daemon/com.pro-gate.autoupdate.plist.tmpl" > "$AUPL"
+      launchctl unload "$AUPL" 2>/dev/null || true
+      launchctl load "$AUPL"
+    elif [ "$INSTALL_AUTO_UPDATE" = "0" ]; then
+      launchctl unload "$AUPL" 2>/dev/null || true
+    fi
     ;;
   wsl|linux)
     if [ "$SVC" = systemd ]; then
@@ -329,7 +340,10 @@ case "$OS" in
 esac
 fi
 DEPLOYING=0
-if [ "$INSTALL_AUTO_UPDATE" = 1 ] && { [ "$SVC" != systemd ] || { [ "$OS" != wsl ] && [ "$OS" != linux ]; }; }; then
-  echo "note: --auto-update is systemd-only for now; schedule $PRO_GATE_HOME/pro-gate-autoupdate.sh yourself (cron/launchd) on this platform" >&2
+# --auto-update is wired for systemd (Linux/WSL) and launchd (macOS). Any other platform must
+# schedule pro-gate-autoupdate.sh itself.
+if [ "$INSTALL_AUTO_UPDATE" = 1 ] && [ "$OS" != macos ] \
+   && ! { { [ "$OS" = wsl ] || [ "$OS" = linux ]; } && [ "$SVC" = systemd ]; }; then
+  echo "note: --auto-update needs systemd (Linux/WSL) or launchd (macOS); schedule $PRO_GATE_HOME/pro-gate-autoupdate.sh yourself (cron) on this platform" >&2
 fi
 printf 'pro-gate runtime %s installed in %s (daemon: %s, auto-update: %s)\n' "$REQUESTED_VERSION" "$PRO_GATE_HOME" "$INSTALL_DAEMON" "${INSTALL_AUTO_UPDATE:-unchanged}"

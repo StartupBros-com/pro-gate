@@ -34,7 +34,16 @@ EXPECTED_VERSION="$(pg_expected_version)"
 if [ -z "$INSTALLED_VERSION" ]; then
   X "runtime version record missing; install the exact plugin release with install.sh --version <plugin-version>"
 elif [ -n "$EXPECTED_VERSION" ] && [ "$INSTALLED_VERSION" != "$EXPECTED_VERSION" ]; then
-  X "runtime $INSTALLED_VERSION does not match plugin $EXPECTED_VERSION; exact-release setup required"
+  # Direction-aware (issue #37): the routed installer always targets the PLUGIN version, so when the
+  # runtime is AHEAD, blindly running it DOWNGRADES the runtime. Say which side is ahead and warn on
+  # the downgrade case, using the same pg_semver_lt the timer path already relies on.
+  if pg_semver_lt "$INSTALLED_VERSION" "$EXPECTED_VERSION"; then
+    X "runtime $INSTALLED_VERSION is BEHIND plugin $EXPECTED_VERSION — upgrade it: install.sh --version $EXPECTED_VERSION"
+  elif pg_semver_lt "$EXPECTED_VERSION" "$INSTALLED_VERSION"; then
+    X "runtime $INSTALLED_VERSION is AHEAD of plugin $EXPECTED_VERSION (local auto-update, a dogfood build, or a stale/rolled-back active plugin). Running 'install.sh --version $EXPECTED_VERSION' would DOWNGRADE the runtime — update the active plugin to $INSTALLED_VERSION instead, unless the downgrade is intended."
+  else
+    X "runtime $INSTALLED_VERSION does not match plugin $EXPECTED_VERSION (non-semver); exact-release setup required"
+  fi
 else
   P "runtime version ${INSTALLED_VERSION}${EXPECTED_VERSION:+ matches plugin}"
 fi

@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- macOS launchd agent: hourly pro-gate runtime auto-update — makes the installed runtime follow
+     the marketplace plugin version. The launchd equivalent of pro-gate-autoupdate.timer/.service.
+     Rendered + installed by `install.sh --auto-update` into ~/Library/LaunchAgents/ (opt-in; a
+     plain install never touches it). RunAtLoad is false so loading it never fires an immediate
+     update; it runs on the interval only. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.pro-gate.autoupdate</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@PRO_GATE_HOME@/pro-gate-autoupdate.sh</string>
+  </array>
+  <key>StartInterval</key><integer>3600</integer>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>@PRO_GATE_HOME@/logs/autoupdate.out.log</string>
+  <key>StandardErrorPath</key><string>@PRO_GATE_HOME@/logs/autoupdate.err.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>@HOME@</string>
+    <key>PRO_GATE_HOME</key><string>@PRO_GATE_HOME@</string>
+    <key>PATH</key><string>@HOME@/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+</dict>
+</plist>
