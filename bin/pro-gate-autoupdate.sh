@@ -166,7 +166,9 @@ pgau_main() {
     return 3
   fi
 
-  if [ -n "$runtime_v" ] && [ "$(printf '%s\n%s\n' "$runtime_v" "$plugin_v" | sort -V | tail -1)" = "$runtime_v" ]; then
+  # Portable downgrade detection (gate #38 P2): pg_semver_lt instead of GNU-only `sort -V`, so the
+  # DOWNGRADE audit line isn't silently suppressed by a sort error on a stock (BSD-sort) macOS.
+  if [ -n "$runtime_v" ] && pg_semver_lt "$plugin_v" "$runtime_v"; then
     pgau_log "DOWNGRADE: following the plugin DOWN from ${runtime_v} to ${plugin_v} (marketplace rollback)"
   fi
 

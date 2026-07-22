@@ -209,6 +209,14 @@ PRO_GATE_HOME="$RUNTIME3" PRO_GATE_EXPECTED_VERSION="$VERSION" PRO_GATE_CONSENT_
   PRO_GATE_BROWSER_MODE=native bash "$ROOT/bin/pro-gate-doctor.sh" >"$TDIR/doctor-consent.log" 2>&1 || true
 check "doctor reports matching exact release" grep -q "runtime version $VERSION matches plugin" "$TDIR/doctor-consent.log"
 check "doctor reports accepted disclosure" grep -q 'dangerous automatic-fixer disclosure accepted (consent v1)' "$TDIR/doctor-consent.log"
+# issue #37: the version-mismatch message is DIRECTION-AWARE (runtime VERSION is $VERSION)
+PRO_GATE_HOME="$RUNTIME3" PRO_GATE_EXPECTED_VERSION="99.99.99" PRO_GATE_CONSENT_HOME="$CONSENT3" \
+  PRO_GATE_BROWSER_MODE=native bash "$ROOT/bin/pro-gate-doctor.sh" >"$TDIR/doctor-behind.log" 2>&1 || true
+check "doctor names a BEHIND runtime (upgrade path)" grep -q "is BEHIND plugin 99.99.99" "$TDIR/doctor-behind.log"
+PRO_GATE_HOME="$RUNTIME3" PRO_GATE_EXPECTED_VERSION="0.0.1" PRO_GATE_CONSENT_HOME="$CONSENT3" \
+  PRO_GATE_BROWSER_MODE=native bash "$ROOT/bin/pro-gate-doctor.sh" >"$TDIR/doctor-ahead.log" 2>&1 || true
+check "doctor flags an AHEAD runtime as a DOWNGRADE" grep -q "AHEAD of plugin 0.0.1" "$TDIR/doctor-ahead.log"
+check "doctor AHEAD message warns DOWNGRADE" grep -q "DOWNGRADE the runtime" "$TDIR/doctor-ahead.log"
 printf '#!/usr/bin/env bash\nprintf "oracle-custom 7.8.9\\n"\n' > "$TDIR/oracle-custom"
 printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$TIMEOUT_LOG"\nshift\n"$@"\n' > "$TDIR/timeout-custom"
 chmod +x "$TDIR/oracle-custom" "$TDIR/timeout-custom"

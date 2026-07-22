@@ -51,12 +51,6 @@ pg_expected_version() {
   fi
 }
 
-pg_version_matches() {
-  local installed expected
-  installed="$(pg_runtime_version)"; expected="$(pg_expected_version)"
-  [ -n "$installed" ] && { [ -z "$expected" ] || [ "$installed" = "$expected" ]; }
-}
-
 pg_consent_version() { printf '%s\n' "${PRO_GATE_CONSENT_VERSION:-1}"; }
 pg_consent_file() { printf '%s/dangerous-mode-consent\n' "${PRO_GATE_CONSENT_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/pro-gate}"; }
 pg_dangerous_consent_ok() {
