@@ -41,6 +41,10 @@ elif [ -n "$EXPECTED_VERSION" ] && [ "$INSTALLED_VERSION" != "$EXPECTED_VERSION"
     X "runtime $INSTALLED_VERSION is BEHIND plugin $EXPECTED_VERSION — upgrade it: install.sh --version $EXPECTED_VERSION"
   elif pg_semver_lt "$EXPECTED_VERSION" "$INSTALLED_VERSION"; then
     X "runtime $INSTALLED_VERSION is AHEAD of plugin $EXPECTED_VERSION (local auto-update, a dogfood build, or a stale/rolled-back active plugin). Running 'install.sh --version $EXPECTED_VERSION' would DOWNGRADE the runtime — update the active plugin to $INSTALLED_VERSION instead, unless the downgrade is intended."
+    # issue #40: the commonest cause is Claude Code bug #52218 — /plugin update caches the new
+    # version but never rewrites installed_plugins.json, so the active plugin stays stale and
+    # re-running /plugin update no-ops. Point the user at the reliable fix.
+    X "  if you already ran '/plugin update pro-gate' and it did not take, that is Claude Code bug #52218 (caches but does not activate); reinstall it: '/plugin uninstall pro-gate && /plugin install pro-gate@hov' then '/reload-plugins'."
   else
     X "runtime $INSTALLED_VERSION does not match plugin $EXPECTED_VERSION (non-semver); exact-release setup required"
   fi

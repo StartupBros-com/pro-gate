@@ -38,7 +38,10 @@ curl -fsSL "https://raw.githubusercontent.com/StartupBros-com/pro-gate/v${PLUGIN
 
 The doctor states which side is ahead. **If it reports the runtime is AHEAD of the plugin, that
 command DOWNGRADES the runtime** (it always targets the plugin's version) — in that case update the
-active plugin to the runtime's version instead, and only run the downgrade if you truly mean it.
+active plugin to the runtime's version instead, and only run the downgrade if you truly mean it. If
+`/plugin update pro-gate` won't take (it caches the new version but the active one stays stale),
+that's Claude Code bug #52218: reinstall the plugin (`/plugin uninstall pro-gate && /plugin install
+pro-gate@hov`) then `/reload-plugins`.
 
 The plugin is the only owner of this skill and `agents/oracle-reviewer.md`; `install.sh` installs
 runtime files only. Do not copy either artifact into a global Claude skills or agents directory.

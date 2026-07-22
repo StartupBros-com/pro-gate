@@ -217,6 +217,7 @@ PRO_GATE_HOME="$RUNTIME3" PRO_GATE_EXPECTED_VERSION="0.0.1" PRO_GATE_CONSENT_HOM
   PRO_GATE_BROWSER_MODE=native bash "$ROOT/bin/pro-gate-doctor.sh" >"$TDIR/doctor-ahead.log" 2>&1 || true
 check "doctor flags an AHEAD runtime as a DOWNGRADE" grep -q "AHEAD of plugin 0.0.1" "$TDIR/doctor-ahead.log"
 check "doctor AHEAD message warns DOWNGRADE" grep -q "DOWNGRADE the runtime" "$TDIR/doctor-ahead.log"
+check "doctor AHEAD message hints the Claude Code plugin-update bug (#40)" grep -q "52218" "$TDIR/doctor-ahead.log"
 printf '#!/usr/bin/env bash\nprintf "oracle-custom 7.8.9\\n"\n' > "$TDIR/oracle-custom"
 printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$TIMEOUT_LOG"\nshift\n"$@"\n' > "$TDIR/timeout-custom"
 chmod +x "$TDIR/oracle-custom" "$TDIR/timeout-custom"

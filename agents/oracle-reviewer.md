@@ -55,7 +55,8 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
    If the runtime is absent or mismatched, return the unavailable envelope and route the
    operator to the exact `v${PLUGIN_VERSION}` installer. Never run a stale runtime. The doctor says
    which side is ahead: if the runtime is AHEAD of the plugin, that installer DOWNGRADES it — tell
-   the operator to update the active plugin instead unless the downgrade is intended.
+   the operator to update the active plugin instead unless the downgrade is intended (and if
+   `/plugin update` won't take, that's Claude Code bug #52218 — reinstall the plugin).
 
 2. **No separate browser preflight (engine ≥ v0.19).** Do NOT probe CDP yourself and bail:
    the engine self-heals a down Chrome (one non-interactive `systemctl start oracle-chrome`
