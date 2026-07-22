@@ -305,11 +305,29 @@ case "$OS" in
     AUPL="$HOME/Library/LaunchAgents/com.pro-gate.autoupdate.plist"
     if [ "$INSTALL_AUTO_UPDATE" = 1 ]; then
       mkdir -p "$(dirname "$AUPL")" "$PRO_GATE_HOME/logs"
-      render "$SOURCE_ROOT/daemon/com.pro-gate.autoupdate.plist.tmpl" > "$AUPL"
-      launchctl unload "$AUPL" 2>/dev/null || true
-      launchctl load "$AUPL"
+      # Render + lint to a temp file, then swap in atomically (gate #38 P2): a failed render/lint
+      # must never corrupt or replace a working plist, and a failed launchctl load restores and
+      # reloads the previous agent instead of leaving it disabled.
+      if render "$SOURCE_ROOT/daemon/com.pro-gate.autoupdate.plist.tmpl" > "$AUPL.tmp" \
+         && plutil -lint "$AUPL.tmp" >/dev/null 2>&1; then
+        [ -f "$AUPL" ] && cp -f "$AUPL" "$AUPL.bak"
+        launchctl unload "$AUPL" 2>/dev/null || true
+        mv -f "$AUPL.tmp" "$AUPL"
+        if launchctl load "$AUPL"; then
+          rm -f "$AUPL.bak"
+        else
+          echo "warning: launchctl load failed for com.pro-gate.autoupdate; restoring the previous agent" >&2
+          if [ -f "$AUPL.bak" ]; then mv -f "$AUPL.bak" "$AUPL"; launchctl load "$AUPL" 2>/dev/null || true; else rm -f "$AUPL"; fi
+        fi
+      else
+        echo "warning: could not render/validate com.pro-gate.autoupdate.plist; leaving any existing agent untouched" >&2
+        rm -f "$AUPL.tmp"
+      fi
     elif [ "$INSTALL_AUTO_UPDATE" = "0" ]; then
+      # Durable opt-out (gate #38 P1): an unloaded-but-present plist reloads at next login, so
+      # remove the file too — not just launchctl unload.
       launchctl unload "$AUPL" 2>/dev/null || true
+      rm -f "$AUPL"
     fi
     ;;
   wsl|linux)

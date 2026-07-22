@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- macOS launchd agent: hourly pro-gate runtime auto-update — makes the installed runtime follow
-     the marketplace plugin version. The launchd equivalent of pro-gate-autoupdate.timer/.service.
-     Rendered + installed by `install.sh --auto-update` into ~/Library/LaunchAgents/ (opt-in; a
-     plain install never touches it). RunAtLoad is false so loading it never fires an immediate
-     update; it runs on the interval only. -->
+<!-- macOS launchd agent: hourly pro-gate runtime auto-update. Makes the installed runtime follow
+     the marketplace plugin version; the launchd equivalent of the pro-gate-autoupdate systemd timer.
+     Installed by install.sh (auto-update flag) into ~/Library/LaunchAgents/ (opt-in; a plain install
+     never touches it). RunAtLoad is false so loading it never fires an immediate update; it runs on
+     the interval only. (XML comments cannot contain a double hyphen, so flags are named in prose.) -->
 <plist version="1.0">
 <dict>
   <key>Label</key><string>com.pro-gate.autoupdate</string>

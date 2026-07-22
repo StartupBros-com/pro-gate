@@ -217,6 +217,11 @@ PRO_GATE_HOME="$RUNTIME3" PRO_GATE_EXPECTED_VERSION="0.0.1" PRO_GATE_CONSENT_HOM
   PRO_GATE_BROWSER_MODE=native bash "$ROOT/bin/pro-gate-doctor.sh" >"$TDIR/doctor-ahead.log" 2>&1 || true
 check "doctor flags an AHEAD runtime as a DOWNGRADE" grep -q "AHEAD of plugin 0.0.1" "$TDIR/doctor-ahead.log"
 check "doctor AHEAD message warns DOWNGRADE" grep -q "DOWNGRADE the runtime" "$TDIR/doctor-ahead.log"
+# gate #38: the macOS auto-update LaunchAgent template renders to a valid plist (launchctl lifecycle
+# itself is validated on real macOS out-of-band; this catches template regressions in Linux CI)
+sed -e "s#@PRO_GATE_HOME@#/tmp/pgx#g" -e "s#@HOME@#/tmp/pgh#g" "$ROOT/daemon/com.pro-gate.autoupdate.plist.tmpl" > "$TDIR/au.plist"
+check "autoupdate LaunchAgent template is valid plist" python3 -c "import plistlib; plistlib.load(open('$TDIR/au.plist','rb'))"
+check "autoupdate plist runs on an interval (not RunAtLoad)" grep -q "StartInterval" "$TDIR/au.plist"
 printf '#!/usr/bin/env bash\nprintf "oracle-custom 7.8.9\\n"\n' > "$TDIR/oracle-custom"
 printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$TIMEOUT_LOG"\nshift\n"$@"\n' > "$TDIR/timeout-custom"
 chmod +x "$TDIR/oracle-custom" "$TDIR/timeout-custom"
