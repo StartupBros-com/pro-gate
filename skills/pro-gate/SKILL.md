@@ -107,8 +107,9 @@ engine home is `$HOME/.pro-review-daemon`.
   Chrome that needs memory headroom. On a small or busy machine the engine either DEFERS up front
   (exit 8, no quota spent) with a plain-language "low on memory" message, or — if memory runs out
   mid-review — Chrome restarts and the run ends exit 6 with a "review browser restarted mid-review,
-  likely out of memory" note (the review may still exist in ChatGPT; free memory and retry, don't
-  blindly re-run). It also prints a heads-up NOTE before a run when memory is tight but not
+  likely out of memory" note. Since v0.25 that restart is usually survivable: the engine remembers
+  the conversation URL and re-renders it, so `--harvest` still collects the review even though the
+  tab died with Chrome. It also prints a heads-up NOTE before a run when memory is tight but not
   blocking. Thresholds: `PRO_GATE_MIN_AVAIL_MB` (default 1024), `PRO_GATE_MAX_SWAP_PCT` (default
   97, the hard defer), `PRO_GATE_SWAP_WARN_PCT` (default 80, the soft heads-up). For users: close
   other apps / browser tabs / AI tools to free memory. `pro-gate-doctor.sh` reports the live state.
@@ -184,13 +185,23 @@ MARKER="$(jq -r .marker "$STATUS" 2>/dev/null || sed -nE 's/.*"marker":"([^"]+)"
   --harvest "$MARKER" --out <out> --timeout 20m
 ```
 
-Harvest exits: `0` review ready · `9` reservation retained, try again later (still generating,
-or absent this pass but under the consecutive-miss threshold) · `8` deferred (cooldown: retry
-after) · `6` conversation confirmed gone after repeated misses (review lost; only NOW is a
-fresh run justified) · `7` another collector already holds this marker (wait for it; do not
-race it) · `3` runtime/CDP trouble; reservation and tab kept (retry once the browser is
-healthy). Repeat harvests are free: no Pro quota is spent. Reservations are keyed by
-repo-scoped PR identity, so identical PR numbers in different repositories never cross.
+Harvest exits: `0` review ready · `9` reservation retained, try again later (still generating;
+absent this pass but under the consecutive-miss threshold; or the browser was unreachable for
+the whole pass, which counts as NO miss) · `8` deferred (cooldown: retry after) · `6`
+conversation gone after repeated misses (only NOW is a fresh run justified) · `7` another
+collector already holds this marker (wait for it; do not race it) · `3` runtime/CDP trouble;
+reservation and tab kept (retry once the browser is healthy). Repeat harvests are free: no Pro
+quota is spent. Reservations are keyed by repo-scoped PR identity, so identical PR numbers in
+different repositories never cross.
+
+**A lost TAB is not a lost review (v0.25).** ChatGPT keeps conversations server-side, so the
+engine remembers each run's conversation URL the first time it proves which one is that run's,
+and re-renders that URL when no open tab carries the marker. A Chrome restart — routine when the
+box is short on memory — therefore no longer destroys a finished review. Before v0.25 it did:
+"conversation gone" really meant "no open Chrome tab has it", and 46 of 200 logged runs were
+declared lost while their reviews sat complete in ChatGPT. If you still get exit 6, open the
+conversation in a browser before spending another Pro slot — and if the review IS there, that is
+a bug worth reporting, not an expected outcome.
 
 **Large diffs (v0.24): cook, don't refuse.** The deep think IS the point of this gate, and the
 engine already harvests a review that outlasts the slot window for free. So past the *cook*

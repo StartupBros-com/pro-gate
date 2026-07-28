@@ -176,7 +176,10 @@ pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor,
   # Skip it for in-progress (9) because the model is STILL GENERATING in that tab: closing it
   # destroys a spent Pro slot's answer (a 65-minute Pro review was lost exactly this way on
   # 2026-07-09); the tab stays open for --harvest, which closes it once finally captured.
-  if [ "$rc" != 7 ] && [ "$rc" != 8 ] && [ "$rc" != 9 ] && [ "$rc" != 11 ] && [ "$rc" != 12 ] \
+  # Skip it for engine/browser trouble (3) too (v0.25): that path tells the caller "reservation
+  # and tab kept, retry once CDP is healthy", so closing the tab here would contradict the
+  # promise and throw away the conversation the retry is supposed to collect.
+  if [ "$rc" != 3 ] && [ "$rc" != 7 ] && [ "$rc" != 8 ] && [ "$rc" != 9 ] && [ "$rc" != 11 ] && [ "$rc" != 12 ] \
      && [ "$MODE" = remote-chrome ] && [ "${PRO_GATE_KEEP_TABS:-0}" != 1 ] \
      && [ -n "${RUN_MARKER:-}" ] && command -v node >/dev/null 2>&1; then
     timeout 30 node "$SELF/cdp-salvage.mjs" --close "$RUN_MARKER" 25 "$PORT" >/dev/null 2>&1 || true
@@ -203,9 +206,14 @@ fi
 # --- v0.20: harvest mode: collect an in-progress run's review, spending NO new slot ---
 # A run that exits 9 (in-progress) spent its Pro slot but hit the salvage budget while the
 # model was still generating; its conversation tab was deliberately left open. This mode
-# re-runs ONLY the marker-matched CDP collection. Exit: 0 done, 9 still generating (run it
-# again later), 8 deferred (cooldown/box unfit: the account must not be rendered against),
-# 6 conversation gone (review lost; only now is a re-run justified).
+# re-runs ONLY the marker-matched CDP collection. Exit: 0 done, 9 still generating / retry later
+# (also: the browser never answered, which is NOT counted as a miss), 8 deferred (cooldown/box
+# unfit: the account must not be rendered against), 6 conversation gone (review lost; only now is
+# a re-run justified).
+# v0.25: the collection is no longer limited to OPEN TABS. cdp-salvage remembers the run's
+# conversation URL once it proves which conversation is ours, and re-renders that URL when no tab
+# carries the marker — so a Chrome restart (the common ending on a memory-pressured box) stops
+# turning a finished, server-side review into "conversation gone".
 if [ -n "$HARVEST_MARKER" ]; then
   HARVEST=1
   RUN_MARKER="$HARVEST_MARKER"
@@ -284,6 +292,26 @@ if [ -n "$HARVEST_MARKER" ]; then
        THROTTLED=1
        pg_status deferred "throttle during harvest; retry after cooldown"
        pg_finish 8 ;;
+    7) # v0.25: INCONCLUSIVE — either the salvage never got one successful CDP tab list (browser
+       # down or restarting, the very condition that loses tabs in the first place), or the
+       # remembered conversation would not render decisively. Absence of evidence, so it must NOT
+       # advance the miss counter toward "conversation gone": keep the reservation untouched and
+       # let the caller retry. The reservation TTL bounds how long an undecidable marker can hold
+       # capacity.
+       if [ -f "$(pg_reservation_dir)/$RUN_MARKER" ]; then
+         echo "[oracle-review] harvest inconclusive (browser unreachable, or the conversation would not render decisively). Reservation kept, NO miss counted. Retry --harvest once the browser is healthy." >&2
+         pg_status in-progress "harvest inconclusive; retry later"
+         pg_finish 9
+       fi
+       # No reservation is held (already collected, or released/expired while the URL memo was
+       # deliberately kept for later human recovery). Do NOT promise an in-progress review that
+       # will never complete — but do NOT claim the conversation is gone either: rc=7 is still
+       # absence of evidence, and exit 6 both invites a fresh Pro spend and permits tab cleanup
+       # (gate P1). Exit 3 says exactly what is true: engine/browser trouble, nothing destroyed,
+       # retry when healthy. pg_finish skips tab cleanup on 3.
+       echo "ERROR: harvest inconclusive for ${RUN_MARKER} and no reservation is held (already collected, or released earlier). Nothing was destroyed; retry once the browser is healthy, or open the conversation in ChatGPT." >&2
+       pg_status failed "harvest inconclusive; no reservation held; retry when healthy"
+       pg_finish 3 ;;
     4) # Confirmed absent THIS probe, which is not yet proof of loss (suspended renderer,
        # hydration): apply the shared consecutive-miss policy instead of destroying the
        # reservation on one observation (dogfood review P1).
@@ -1045,6 +1073,7 @@ if ! pg_is_review "$OUT" && [ "${CLOUDFLARE:-0}" != 1 ] && command -v node >/dev
   echo "[oracle-review] last-resort CDP tab salvage (marker ${RUN_MARKER}, up to ${SALVAGE_SECS}s)..." >&2
   pg_status salvaging "cdp up to ${SALVAGE_SECS}s"
   SALVAGE_RC=0
+  SALVAGE_RAN=1
   SALVAGE_TMP="$OUT.cdp.$$"
   node "$SELF/cdp-salvage.mjs" "$RUN_MARKER" "$SALVAGE_SECS" "$PORT" > "$SALVAGE_TMP" 2>>"$RUNLOG" || SALVAGE_RC=$?
   if [ "$SALVAGE_RC" -eq 0 ] && pg_is_review "$SALVAGE_TMP"; then
@@ -1054,6 +1083,26 @@ if ! pg_is_review "$OUT" && [ "${CLOUDFLARE:-0}" != 1 ] && command -v node >/dev
   else
     rm -f "$SALVAGE_TMP"
   fi
+  # v0.25 (gate P1 x3): rc 4 is the ONLY salvage result that is evidence the review is absent —
+  # "scanned the browser successfully and nothing carried this marker". Everything else is either
+  # positive evidence the conversation exists or no evidence at all, so the default is to PRESERVE:
+  #   3 still generating                        — the classic reserve-and-harvest case
+  #   7 inconclusive                            — CDP down, or the remembered conversation
+  #                                               would not render decisively
+  #   5 ChatGPT throttle                        — literally means "do NOT resubmit"; the
+  #                                               submission's fate is unknown
+  #   0 but pg_is_review rejected the capture   — the conversation demonstrably EXISTS (the
+  #                                               salvage read a VERDICT off it); only our
+  #                                               stricter shape check failed, e.g. mid-render
+  #   anything unexpected (helper crash, bug)   — proves nothing about the conversation
+  # Preserving means persisting the reservation and exiting 9 (which also skips tab cleanup)
+  # instead of falling through to exit 6, which both closes the conversation and leaves no
+  # reservation to stop the next invocation spending a second Pro slot on a review that exists.
+  case "$SALVAGE_RC" in
+    4) : ;;
+    0) [ "${SALVAGED:-0}" = 1 ] || SALVAGE_PRESERVE=1 ;;
+    *) SALVAGE_PRESERVE=1 ;;
+  esac
 fi
 
 if pg_is_review "$OUT"; then
@@ -1064,8 +1113,9 @@ if pg_is_review "$OUT"; then
   cat "$OUT"
   echo "RESULT_FILE=$OUT"
   pg_finish 0
-elif [ "${SALVAGE_RC:-0}" -eq 3 ]; then
-  # The salvage budget ran out while the conversation was STILL GENERATING: the Pro slot is
+elif [ "${SALVAGE_RAN:-0}" = 1 ] && [ "${SALVAGE_PRESERVE:-0}" = 1 ]; then
+  # The salvage budget ran out while the conversation was STILL GENERATING (or the outcome was
+  # inconclusive / the capture failed validation — see the case above): the Pro slot is
   # spent and the answer may land any minute. Persist a durable reservation BEFORE this process
   # releases its flock slot, leave the tab open (pg_finish skips close for exit 9), and hand the
   # caller a no-respend collection path. Fresh runs reconcile/respect the reservation, so actual
@@ -1081,7 +1131,11 @@ elif [ "${SALVAGE_RC:-0}" -eq 3 ]; then
     pg_status failed "reservation write failed; conversation gone"
     pg_finish 6
   fi
-  echo "ERROR: review still generating after the salvage budget: conversation tab LEFT OPEN and account capacity RESERVED." >&2
+  case "${SALVAGE_RC:-0}" in
+    3) echo "ERROR: review still generating after the salvage budget: conversation LEFT OPEN and account capacity RESERVED." >&2 ;;
+    7) echo "ERROR: the salvage could not determine this review's fate (browser unreachable, or the conversation would not render decisively). Treating it as LIVE and RESERVED rather than lost — the slot is spent and the review may well exist." >&2 ;;
+    *) echo "ERROR: the salvage read this run's conversation but the capture failed validation (truncated or malformed). Conversation KEPT and account capacity RESERVED — re-collect rather than re-spend." >&2 ;;
+  esac
   echo "  Collect it later WITHOUT spending another Pro slot:" >&2
   echo "    ${PRO_GATE_HOME:-\$HOME/.pro-review-daemon}/oracle-review.sh --harvest '${RUN_MARKER}' --out '${OUT}' --timeout 20m" >&2
   pg_status in-progress "slot spent, model still generating; harvest with --harvest"
