@@ -259,6 +259,27 @@ const MARKER = 'pg-run-test-1234567890-42';
   cdp.stop();
 }
 
+{ // gate round-2 P1: one EARLY successful listing must not mask a later CDP outage. Scan once
+  // (before the conversation appears), then lose Chrome for the rest of the window — that ends
+  // inconclusive (7), not a confirmed absence (4).
+  const cdp = await mockCdp('some other conversation, no marker here');
+  setTimeout(() => cdp.stop(), 3_000);   // Chrome dies after the first successful scan
+  const r = await runSalvage([MARKER, '30'], cdp.port);
+  check('a later CDP outage is not masked by an early successful scan', r.status === 7, `status=${r.status} stderr=${r.stderr?.slice(-300)}`);
+}
+
+{ // gate round-2 P1: the remembered conversation's tab is LISTED but its renderer is dead, and
+  // re-rendering it proves it carries another run's marker. blacklist() no-ops on a remembered
+  // URL, and the seeded branch is skipped while the tab is listed — so staleness has to be
+  // recorded here or the reservation sits "inconclusive" forever instead of releasing.
+  const cdp = await mockCdp('', [], {   // '' => renderer returns nothing => dead tab
+    renderText: () => 'run marker: pg-run-someone-else-2222222222-3\nanother review entirely',
+  });
+  const r = await runSalvage([MARKER, '30'], cdp.port, seedMemo(MARKER, 'https://chatgpt.com/c/mock-conversation'));
+  check('a dead remembered tab proven foreign still exits 4', r.status === 4, `status=${r.status} stderr=${r.stderr?.slice(-300)}`);
+  cdp.stop();
+}
+
 { // browser down for the whole window -> inconclusive (7), never "gone" (4): the engine's
   // miss counter must not advance on absence of evidence.
   const dead = await mockCdp('__NO_TABS__');

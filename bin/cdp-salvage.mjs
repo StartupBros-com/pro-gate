@@ -350,7 +350,11 @@ async function onOurConversation(url, text) {
 }
 
 let listFailures = 0;
-let everListed = false;          // did ONE CDP tab list ever succeed? (exit 4 vs exit 7)
+let lastListOk = false;          // did the MOST RECENT CDP tab list succeed? (exit 4 vs exit 7)
+                                 // Latching this on the first success would let one early
+                                 // listing mask a Chrome death for the rest of the window:
+                                 // scan once before the conversation appears, lose the browser,
+                                 // and the deadline would claim a confirmed absence (gate P1).
 let stillGeneratingUrl = null;   // marker-matched conversation seen this invocation, no VERDICT yet
 let lastMatchWasSeeded = false;  // that sighting came from the remembered URL, which has no tab
 while (Date.now() < deadline) {
@@ -359,12 +363,13 @@ while (Date.now() < deadline) {
     tabs = (await (await fetch(`http://127.0.0.1:${port}/json`)).json())
       .filter((t) => t.type === 'page' && /chatgpt\.com\/c\//.test(t.url || ''));
     listFailures = 0;
-    everListed = true;
+    lastListOk = true;
   } catch (e) {
     // v0.18: transient — Chrome restarts and CDP hiccups happen mid-salvage.
     // Aborting here made the engine's pre-retry probe read "dead submission"
     // and green-light a double-spending retry. Back off, retry until deadline.
     listFailures += 1;
+    lastListOk = false;
     console.error(`CDP list failed (${listFailures}x): ${e.message} — retrying until deadline`);
     await sleep(Math.min(5_000 * listFailures, 30_000));
     continue;
@@ -417,11 +422,22 @@ while (Date.now() < deadline) {
       // blacklisting those could permanently hide the real review and let
       // --probe green-light a double-spending retry. Anything without a
       // foreign marker is treated as not-ready and retried within budget.
-      if (FOREIGN_MARKER_RE.test(text)) blacklist(tab.url);
+      if (FOREIGN_MARKER_RE.test(text)) {
+        // If this IS the remembered conversation, the memo is provably stale. blacklist() alone
+        // cannot record that: a remembered URL sits in ourUrls, so blacklist() deliberately
+        // no-ops on it. And because the dead tab is still LISTED, the remembered-URL branch
+        // below never runs for it — so without this the reservation would sit at "inconclusive"
+        // forever instead of ever advancing toward release (gate P1).
+        if (tab.url === knownUrl) memoStale = true;
+        blacklist(tab.url);
+      }
       continue;
     }
     stillGeneratingUrl = await onOurConversation(tab.url, text);
     lastMatchWasSeeded = false;
+    // A fresh render is a real page load against ChatGPT, so a match here is SERVER-SIDE
+    // evidence just like the remembered-URL branch: keep it if this tab later disappears.
+    seededLiveUrl = tab.url;
     console.error(`conversation matches (via fresh render, ${tab.url}) but no VERDICT yet; waiting...`);
   }
 
@@ -493,12 +509,12 @@ if (!probe && liveUrl) {
     + `${stillGeneratingUrl ? ': tab left open' : ' (proven server-side; no tab needed)'}; harvest later (oracle-review.sh --harvest '${marker}')`);
   process.exit(3);
 }
-if (!everListed) {
+if (!lastListOk) {
   // Never got a single successful tab list: the browser is down or restarting. That is absence
   // of EVIDENCE, not evidence of absence, and the engine's miss counter (3 strikes -> "review
   // lost, re-run justified") must not advance on it. Distinct code, so callers keep the
   // reservation and retry instead.
-  console.error(`inconclusive: CDP never listed tabs (${listFailures} failed attempt(s)) in ${timeoutSecs}s — browser down or restarting; NOT evidence the conversation is gone`);
+  console.error(`inconclusive: the last CDP tab list failed (${listFailures} consecutive) within ${timeoutSecs}s — browser down or restarting; NOT evidence the conversation is gone`);
   process.exit(7);
 }
 if (knownUrl && !memoStale) {

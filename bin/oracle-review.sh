@@ -303,11 +303,15 @@ if [ -n "$HARVEST_MARKER" ]; then
          pg_status in-progress "harvest inconclusive; retry later"
          pg_finish 9
        fi
-       # Nothing is reserved: this marker was already collected or released, so there is no
-       # in-flight review to promise. Terminal, rather than an in-progress that never completes.
-       echo "ERROR: harvest inconclusive and no reservation is held for ${RUN_MARKER} (already collected, or released earlier)." >&2
-       pg_status failed "harvest inconclusive; no reservation held"
-       pg_finish 6 ;;
+       # No reservation is held (already collected, or released/expired while the URL memo was
+       # deliberately kept for later human recovery). Do NOT promise an in-progress review that
+       # will never complete — but do NOT claim the conversation is gone either: rc=7 is still
+       # absence of evidence, and exit 6 both invites a fresh Pro spend and permits tab cleanup
+       # (gate P1). Exit 3 says exactly what is true: engine/browser trouble, nothing destroyed,
+       # retry when healthy. pg_finish skips tab cleanup on 3.
+       echo "ERROR: harvest inconclusive for ${RUN_MARKER} and no reservation is held (already collected, or released earlier). Nothing was destroyed; retry once the browser is healthy, or open the conversation in ChatGPT." >&2
+       pg_status failed "harvest inconclusive; no reservation held; retry when healthy"
+       pg_finish 3 ;;
     4) # Confirmed absent THIS probe, which is not yet proof of loss (suspended renderer,
        # hydration): apply the shared consecutive-miss policy instead of destroying the
        # reservation on one observation (dogfood review P1).
@@ -1079,19 +1083,25 @@ if ! pg_is_review "$OUT" && [ "${CLOUDFLARE:-0}" != 1 ] && command -v node >/dev
   else
     rm -f "$SALVAGE_TMP"
   fi
-  # v0.25 (gate P1 x2): which salvage outcomes are NOT proof the review is lost?
+  # v0.25 (gate P1 x3): rc 4 is the ONLY salvage result that is evidence the review is absent —
+  # "scanned the browser successfully and nothing carried this marker". Everything else is either
+  # positive evidence the conversation exists or no evidence at all, so the default is to PRESERVE:
   #   3 still generating                        — the classic reserve-and-harvest case
   #   7 inconclusive                            — CDP down, or the remembered conversation
   #                                               would not render decisively
+  #   5 ChatGPT throttle                        — literally means "do NOT resubmit"; the
+  #                                               submission's fate is unknown
   #   0 but pg_is_review rejected the capture   — the conversation demonstrably EXISTS (the
   #                                               salvage read a VERDICT off it); only our
   #                                               stricter shape check failed, e.g. mid-render
-  # All three must persist the reservation and exit 9 (which also skips tab cleanup) instead of
-  # falling through to exit 6, which both closes the conversation and leaves no reservation to
-  # stop the next invocation spending a second Pro slot on a review that already exists.
+  #   anything unexpected (helper crash, bug)   — proves nothing about the conversation
+  # Preserving means persisting the reservation and exiting 9 (which also skips tab cleanup)
+  # instead of falling through to exit 6, which both closes the conversation and leaves no
+  # reservation to stop the next invocation spending a second Pro slot on a review that exists.
   case "$SALVAGE_RC" in
-    3|7) SALVAGE_PRESERVE=1 ;;
+    4) : ;;
     0) [ "${SALVAGED:-0}" = 1 ] || SALVAGE_PRESERVE=1 ;;
+    *) SALVAGE_PRESERVE=1 ;;
   esac
 fi
 
