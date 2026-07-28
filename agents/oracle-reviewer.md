@@ -111,10 +111,14 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
      "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" \
        --harvest "$MARKER" --out "$OUT" --timeout 20m
      ```
-     (exit 0 = relay `$OUT`; exit 9 again = reservation retained (still generating, or a
-     below-threshold miss), wait and repeat if your budget allows, else return the unavailable
-     envelope quoting the harvest command; exit 3 = browser/CDP trouble with the reservation
-     kept, safe to retry; exit 6 = confirmed gone after repeated misses).
+     (exit 0 = relay `$OUT`; exit 9 again = reservation retained (still generating, a
+     below-threshold miss, or the browser was unreachable for the whole pass — which counts as
+     no miss), wait and repeat if your budget allows, else return the unavailable envelope
+     quoting the harvest command; exit 3 = browser/CDP trouble with the reservation kept, safe
+     to retry; exit 6 = gone after repeated misses). Engine >=v0.25 remembers the run's
+     conversation URL and re-renders it when no tab carries the marker, so a browser restart no
+     longer loses a finished review; if exit 6 arrives and the conversation IS in ChatGPT, say
+     so in your envelope — that is a bug, not the expected path.
    - `11`: oversized diff (engine >=v0.24), **no quota spent**: the payload exceeds the hard
      ceiling `PRO_GATE_DIFF_HARD_MAX` (default 25000), beyond what the model can review even via
      the harvest path (usually a generated blob the filter missed). Unavailable envelope; tell the

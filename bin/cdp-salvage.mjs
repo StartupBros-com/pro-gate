@@ -34,6 +34,18 @@
 //     closed: watchdog-killed runs never archive their tab, and those
 //     orphaned tabs were the pool every later salvage burned renders on.
 //
+// v0.25: conversation-URL memory, so a review is never "lost" just because its TAB is.
+//   The salvage used to define "the conversation exists" as "an open Chrome tab carries the
+//   marker". ChatGPT conversations live SERVER-SIDE, so those are different facts: a Chrome
+//   restart (routine on a memory-pressured box), a discarded renderer, or a stray close turned
+//   a finished, fully recoverable review into "confirmed gone" — while the human who opened
+//   chatgpt.com saw it sitting there complete. 46 of 200 logged runs died this way.
+//   Now: the FIRST time a tab is proven to carry this run's marker, its conversation URL is
+//   remembered under $PRO_GATE_HOME/conversation-urls/<marker>. Later invocations (salvage,
+//   harvest AND --probe, so reservation reconciliation inherits it too) re-render that URL in a
+//   scratch tab when no open tab matches. A remembered URL is authoritative for its marker: it
+//   is exempt from the foreign-marker blacklist and from the per-URL render cap.
+//
 // Usage: cdp-salvage.mjs [--probe] <pr-marker> [timeout-secs] [cdp-port]
 //   pr-marker    substring identifying the right conversation (e.g. the PR
 //                URL or the engine's pg-run marker); required because several
@@ -42,11 +54,16 @@
 //                matching the marker EXISTS (no VERDICT wait). Used by the
 //                engine's no-think watchdog to distinguish "dead submission,
 //                safe to retry" from "live run, retry would double-spend".
-// Exit: 0 = review printed (probe: tab found); 4 = timeout, nothing matched; 2 = usage error;
+// Exit: 0 = review printed (probe: tab found); 4 = scanned successfully, nothing matched;
+//       2 = usage error;
 //       3 = timeout but a conversation matching the marker IS live with no VERDICT yet (the
 //           model is still generating; the tab is left open so a later --harvest can collect
 //           the finished review without respending the Pro slot);
-//       5 = ChatGPT throttle detected (cooldown written — do NOT resubmit).
+//       5 = ChatGPT throttle detected (cooldown written — do NOT resubmit);
+//       7 = INCONCLUSIVE: not one successful CDP tab list all invocation (browser down/
+//           restarting). Distinct from 4 because 4 is evidence of absence and feeds the
+//           engine's consecutive-miss counter toward "conversation gone"; 7 is absence of
+//           evidence and must never be counted as a miss.
 // Requires Node >= 21 (global WebSocket); the box runs Node 24.
 
 import fs from 'node:fs';
@@ -66,9 +83,48 @@ const PG_HOME = process.env.PRO_GATE_HOME ?? path.join(os.homedir(), '.pro-revie
 const BLACKLIST_FILE = path.join(PG_HOME, 'salvage-nonmatching.txt');
 // honor the same override pg_health_gate reads, or a detected throttle would never defer runs
 const COOLDOWN_FILE = process.env.PRO_GATE_COOLDOWN_FILE ?? path.join(PG_HOME, 'throttle.cooldown');
+
+// --- conversation-URL memory (v0.25) -------------------------------------------------
+// One file per run marker holding the conversation URL we PROVED carries it. This is the
+// engine's only handle on a conversation whose tab is gone, so it is written on every positive
+// match (probe included) and read before we ever conclude "not found".
+const URL_MEMO_DIR = path.join(PG_HOME, 'conversation-urls');
+const MEMO_KEEP = 200;                  // newest N memos retained; older ones are pruned on write
+const MARKER_SAFE_RE = /^pg-run-[A-Za-z0-9.-]+$/;
+const memoPath = (m) => (MARKER_SAFE_RE.test(m) ? path.join(URL_MEMO_DIR, m) : null);
+
+function recallUrl(m) {
+  const f = memoPath(m);
+  if (!f) return null;
+  try {
+    const url = fs.readFileSync(f, 'utf8').trim();
+    return /^https:\/\/chatgpt\.com\/c\//.test(url) ? url : null;
+  } catch { return null; }
+}
+
+function rememberUrl(m, url) {
+  const f = memoPath(m);
+  if (!f || !/^https:\/\/chatgpt\.com\/c\//.test(url || '')) return;
+  if (recallUrl(m) === url) return;     // already known: no churn, no prune
+  try {
+    fs.mkdirSync(URL_MEMO_DIR, { recursive: true });
+    fs.writeFileSync(f, `${url}\n`);
+    const entries = fs.readdirSync(URL_MEMO_DIR);
+    if (entries.length > MEMO_KEEP) {
+      entries
+        .map((n) => { try { return { n, t: fs.statSync(path.join(URL_MEMO_DIR, n)).mtimeMs }; } catch { return { n, t: 0 }; } })
+        .sort((a, b) => b.t - a.t)
+        .slice(MEMO_KEEP)
+        .forEach(({ n }) => { try { fs.unlinkSync(path.join(URL_MEMO_DIR, n)); } catch {} });
+    }
+  } catch {}
+}
 // The interstitial's two distinctive sentences. Deliberately NOT a generic
 // /rate.?limit/ — review findings routinely discuss rate limits.
 const THROTTLE_RE = /making requests too quickly|temporarily limited access to your conversations/i;
+// Any pro-gate run marker. On a page that does NOT carry our own marker, a hit here is positive
+// evidence the page rendered a DIFFERENT run's conversation (vs. merely not having loaded yet).
+const FOREIGN_MARKER_RE = /pg-run-[A-Za-z0-9.-]+/;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -164,20 +220,46 @@ const renderTried = new Map();   // url -> renders spent this invocation (unmatc
 const nextRenderAt = new Map();  // url -> earliest timestamp for the next render
 const ourUrls = new Set();       // URLs proven to carry THIS run's marker (exempt from the cap)
 
-// Persistent blacklist: conversations proven (by a foreign run marker) to
-// belong to another review. That fact never changes, so remember it across
-// invocations instead of re-rendering the same dead tabs every salvage.
-const nonMatching = new Set();
+// The remembered conversation for THIS marker (see the header note). Proven ours by an earlier
+// invocation, so it joins ourUrls: exempt from the per-URL render cap and from the blacklist.
+// Bounded like every other render source — each one is a real chatgpt.com page load, and
+// hammering the account is what tripped the 2026-07-03 anti-scraping limiter.
+const KNOWN_URL = recallUrl(marker);
+const MAX_SEEDED_RENDERS = probe ? 1 : 8;
+let seededRenders = 0;
+if (KNOWN_URL) ourUrls.add(KNOWN_URL);
+
+// Persistent blacklist: conversations proven (by a foreign run marker) to belong to another
+// review. SCOPED TO THE MARKER that proved it (v0.25). It used to hold bare URLs and was
+// therefore GLOBAL — but "this URL is some other run's conversation" is true only relative to
+// the run that observed it. Run A rendering run B's conversation permanently blacklisted B's
+// own URL, hiding B's finished review from B itself. Observed on a live box: a completed
+// review sat on the blacklist while its own run reported "conversation gone".
+// Lines are "<marker>\t<url>". Legacy bare-URL lines are ignored and dropped on the next
+// rewrite: they cannot be attributed to a marker, and honoring them would preserve exactly the
+// poisoning this fixes.
+const nonMatching = new Set();     // URLs proven foreign TO THIS MARKER
+const blacklistLines = [];         // retained lines (other markers' entries survive a rewrite)
 try {
-  for (const u of fs.readFileSync(BLACKLIST_FILE, 'utf8').split('\n')) if (u.trim()) nonMatching.add(u.trim());
+  for (const raw of fs.readFileSync(BLACKLIST_FILE, 'utf8').split('\n')) {
+    const line = raw.trim();
+    if (!line) continue;
+    const sep = line.indexOf('\t');
+    if (sep < 0) continue;         // legacy global entry: ignore (and do not carry it forward)
+    blacklistLines.push(line);
+    if (line.slice(0, sep) === marker) nonMatching.add(line.slice(sep + 1));
+  }
 } catch {}
 function blacklist(url) {
-  if (nonMatching.has(url)) return;
+  // Never blacklist a URL already proven ours (notably the remembered conversation): that is
+  // the one entry that could make a real review permanently unreachable.
+  if (ourUrls.has(url) || nonMatching.has(url)) return;
   nonMatching.add(url);
+  blacklistLines.push(`${marker}\t${url}`);
   try {
     fs.mkdirSync(PG_HOME, { recursive: true });
     // rewrite (bounded) rather than append forever
-    fs.writeFileSync(BLACKLIST_FILE, [...nonMatching].slice(-500).join('\n') + '\n');
+    fs.writeFileSync(BLACKLIST_FILE, blacklistLines.slice(-500).join('\n') + '\n');
   } catch {}
 }
 
@@ -197,8 +279,23 @@ async function freshRenderText(url, port, outerDeadline) {
       const tabs = await (await fetch(`http://127.0.0.1:${port}/json`)).json();
       const live = tabs.find((t) => t.id === target.id);
       if (!live) break;
-      text = await tabText(live);
-      if (text && text.trim().length > 200) return { text };
+      const sample = await tabText(live);
+      if (!sample) continue;
+      text = sample;
+      // Return only on DECISIVE evidence, never on "looks long enough".
+      //
+      // The old gate returned as soon as innerText passed 200 chars, but innerText covers the
+      // whole body — chatgpt.com's shell plus the conversation-history SIDEBAR is ~1.2k chars
+      // before the conversation itself has hydrated. Measured on a real box: t=2.5s -> 1172
+      // chars, no marker, no VERDICT; t=5.0s -> 5766 chars with both. So the very first sample
+      // reliably passed the gate carrying none of the content we came for, the URL failed the
+      // marker test, and one of just TWO per-URL attempts was burnt on a page that was merely
+      // still loading. Three such invocations in a row is exactly the "conversation gone" storm.
+      if (sample.includes(marker)) return { text };          // ours — done
+      if (FOREIGN_MARKER_RE.test(sample)) return { text };   // provably another run's — done
+      if (isThrottlePage(sample)) return { text };           // interstitial — done
+      // Anything else (shell, pre-hydration, login wall) is NOT an answer: keep sampling and
+      // return the last text at the render deadline.
     }
     return { text };
   } catch {
@@ -225,14 +322,30 @@ function extractReview(text) {
   return lines.slice(start, verdictIdx + 1).join('\n').trim();
 }
 
+// One place where a marker-matched page turns into an outcome, so the live-tab scan, the
+// dead-tab re-render and the remembered-URL recovery all behave identically — including
+// remembering the URL, which is what lets a LATER invocation find this conversation after its
+// tab is gone. Deliberately does NOT close the tab: see the close note at the bottom.
+async function onOurConversation(url, text) {
+  ourUrls.add(url);
+  rememberUrl(marker, url);
+  if (probe) { console.error(`live conversation: ${url}`); process.exit(0); }
+  const review = extractReview(text);
+  if (review) { console.log(review); process.exit(0); }
+  return url;                    // ours, but still generating
+}
+
 let listFailures = 0;
+let everListed = false;          // did ONE CDP tab list ever succeed? (exit 4 vs exit 7)
 let stillGeneratingUrl = null;   // marker-matched conversation seen this invocation, no VERDICT yet
+let lastMatchWasSeeded = false;  // that sighting came from the remembered URL, which has no tab
 while (Date.now() < deadline) {
   let tabs = [];
   try {
     tabs = (await (await fetch(`http://127.0.0.1:${port}/json`)).json())
       .filter((t) => t.type === 'page' && /chatgpt\.com\/c\//.test(t.url || ''));
     listFailures = 0;
+    everListed = true;
   } catch (e) {
     // v0.18: transient — Chrome restarts and CDP hiccups happen mid-salvage.
     // Aborting here made the engine's pre-retry probe read "dead submission"
@@ -246,17 +359,15 @@ while (Date.now() < deadline) {
   // earlier in this invocation. Clear the latest-scan signal before each successful tab list;
   // if the tab closes/navigates/disappears, the deadline correctly exits 4 (lost) instead.
   stillGeneratingUrl = null;
+  lastMatchWasSeeded = false;
   const deadTabs = [];
   const reads = await Promise.all(tabs.map(async (tab) => ({ tab, text: await tabText(tab) })));
   for (const { tab, text } of reads) {
     if (text === null || text.trim() === '') { deadTabs.push(tab); continue; }
     if (isThrottlePage(text)) tripThrottle(`tab ${tab.url}`);
     if (!text.includes(marker)) continue;
-    ourUrls.add(tab.url);
-    if (probe) { console.error(`live conversation tab: ${tab.url}`); process.exit(0); }
-    const review = extractReview(text);
-    if (review) { await closeTab(tab.id); console.log(review); process.exit(0); }
-    stillGeneratingUrl = tab.url;
+    stillGeneratingUrl = await onOurConversation(tab.url, text);
+    lastMatchWasSeeded = false;
     console.error(`conversation found (${tab.url}) but no VERDICT yet; waiting...`);
   }
   // v0.17 fallback: unreadable tabs get their URL re-rendered in a scratch tab
@@ -285,23 +396,53 @@ while (Date.now() < deadline) {
       // blacklisting those could permanently hide the real review and let
       // --probe green-light a double-spending retry. Anything without a
       // foreign marker is treated as not-ready and retried within budget.
-      if (/pg-run-[A-Za-z0-9.-]+/.test(text)) blacklist(tab.url);
+      if (FOREIGN_MARKER_RE.test(text)) blacklist(tab.url);
       continue;
     }
-    ourUrls.add(tab.url);
-    if (probe) { console.error(`live conversation (via fresh render): ${tab.url}`); process.exit(0); }
-    const review = extractReview(text);
-    if (review) { await closeTab(tab.id); console.log(review); process.exit(0); }
-    stillGeneratingUrl = tab.url;
+    stillGeneratingUrl = await onOurConversation(tab.url, text);
+    lastMatchWasSeeded = false;
     console.error(`conversation matches (via fresh render, ${tab.url}) but no VERDICT yet; waiting...`);
+  }
+
+  // v0.25: remembered-conversation recovery. Everything above can only see conversations that
+  // are OPEN TABS. ChatGPT keeps conversations server-side, so a Chrome restart (routine when
+  // the box is short on memory), a discarded renderer or a stray close leaves a finished review
+  // perfectly intact and completely invisible here — which the engine then reports as
+  // "conversation confirmed gone", telling a human a fresh Pro run is justified. If an earlier
+  // invocation proved which conversation is ours, re-render THAT URL: it is a plain navigation
+  // to server-side state and works with no tab at all.
+  if (KNOWN_URL && !stillGeneratingUrl && !tabs.some((t) => t.url === KNOWN_URL)
+      && Date.now() < deadline
+      && seededRenders < MAX_SEEDED_RENDERS
+      && Date.now() >= (nextRenderAt.get(KNOWN_URL) ?? 0)) {
+    nextRenderAt.set(KNOWN_URL, Date.now() + RENDER_INTERVAL_MS);
+    seededRenders += 1;
+    console.error(`no open tab carries "${marker}" — re-rendering the remembered conversation ${KNOWN_URL} (${seededRenders}/${MAX_SEEDED_RENDERS})...`);
+    const { text } = await freshRenderText(KNOWN_URL, port, deadline);
+    if (text) {
+      if (isThrottlePage(text)) tripThrottle(`remembered render ${KNOWN_URL}`);
+      if (text.includes(marker)) {
+        stillGeneratingUrl = await onOurConversation(KNOWN_URL, text);
+        lastMatchWasSeeded = true;
+        console.error(`remembered conversation recovered (${KNOWN_URL}) but no VERDICT yet; waiting...`);
+      } else {
+        // Not proof of loss: the render may simply not have hydrated. Never blacklist it
+        // (blacklist() also refuses, since a remembered URL is in ourUrls) and never let this
+        // stand in for a scan result — the miss policy is driven by the tab scan above.
+        console.error(`remembered conversation ${KNOWN_URL} did not render our marker this pass; will retry`);
+      }
+    }
   }
   // Honor short caller budgets precisely (important for probes and tests); never sleep 20s
   // past a 3s deadline.
   await sleep(Math.min(probe ? 5_000 : POLL_MS, Math.max(0, deadline - Date.now())));
 }
-if (!probe && stillGeneratingUrl) {
+if (!probe && stillGeneratingUrl && !lastMatchWasSeeded) {
   // Revalidate at the deadline: exit 3 means the marker-matched conversation exists NOW, not
   // merely that it was observed sometime earlier in the invocation.
+  // Skipped when the last positive observation came from re-rendering the remembered URL: that
+  // conversation has no tab BY DEFINITION, so a tab scan would "disprove" a sighting we just
+  // made against server-side state and downgrade a live run to a miss.
   try {
     const tabs = (await (await fetch(`http://127.0.0.1:${port}/json`)).json())
       .filter((t) => t.type === 'page' && /chatgpt\.com\/c\//.test(t.url || ''));
@@ -320,5 +461,14 @@ if (!probe && stillGeneratingUrl) {
   console.error(`still-generating: ${stillGeneratingUrl} matches "${marker}" but has no VERDICT after ${timeoutSecs}s: tab left open; harvest later (oracle-review.sh --harvest '${marker}')`);
   process.exit(3);
 }
-console.error(`timeout: no ${probe ? 'conversation tab' : 'completed review'} matching "${marker}" after ${timeoutSecs}s`);
+if (!everListed) {
+  // Never got a single successful tab list: the browser is down or restarting. That is absence
+  // of EVIDENCE, not evidence of absence, and the engine's miss counter (3 strikes -> "review
+  // lost, re-run justified") must not advance on it. Distinct code, so callers keep the
+  // reservation and retry instead.
+  console.error(`inconclusive: CDP never listed tabs (${listFailures} failed attempt(s)) in ${timeoutSecs}s — browser down or restarting; NOT evidence the conversation is gone`);
+  process.exit(7);
+}
+console.error(`timeout: no ${probe ? 'conversation tab' : 'completed review'} matching "${marker}" after ${timeoutSecs}s`
+  + (KNOWN_URL ? ` (remembered conversation ${KNOWN_URL} re-rendered ${seededRenders}x without matching)` : ''));
 process.exit(4);

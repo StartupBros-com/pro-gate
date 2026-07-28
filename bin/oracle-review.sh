@@ -176,7 +176,10 @@ pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor,
   # Skip it for in-progress (9) because the model is STILL GENERATING in that tab: closing it
   # destroys a spent Pro slot's answer (a 65-minute Pro review was lost exactly this way on
   # 2026-07-09); the tab stays open for --harvest, which closes it once finally captured.
-  if [ "$rc" != 7 ] && [ "$rc" != 8 ] && [ "$rc" != 9 ] && [ "$rc" != 11 ] && [ "$rc" != 12 ] \
+  # Skip it for engine/browser trouble (3) too (v0.25): that path tells the caller "reservation
+  # and tab kept, retry once CDP is healthy", so closing the tab here would contradict the
+  # promise and throw away the conversation the retry is supposed to collect.
+  if [ "$rc" != 3 ] && [ "$rc" != 7 ] && [ "$rc" != 8 ] && [ "$rc" != 9 ] && [ "$rc" != 11 ] && [ "$rc" != 12 ] \
      && [ "$MODE" = remote-chrome ] && [ "${PRO_GATE_KEEP_TABS:-0}" != 1 ] \
      && [ -n "${RUN_MARKER:-}" ] && command -v node >/dev/null 2>&1; then
     timeout 30 node "$SELF/cdp-salvage.mjs" --close "$RUN_MARKER" 25 "$PORT" >/dev/null 2>&1 || true
@@ -203,9 +206,14 @@ fi
 # --- v0.20: harvest mode: collect an in-progress run's review, spending NO new slot ---
 # A run that exits 9 (in-progress) spent its Pro slot but hit the salvage budget while the
 # model was still generating; its conversation tab was deliberately left open. This mode
-# re-runs ONLY the marker-matched CDP collection. Exit: 0 done, 9 still generating (run it
-# again later), 8 deferred (cooldown/box unfit: the account must not be rendered against),
-# 6 conversation gone (review lost; only now is a re-run justified).
+# re-runs ONLY the marker-matched CDP collection. Exit: 0 done, 9 still generating / retry later
+# (also: the browser never answered, which is NOT counted as a miss), 8 deferred (cooldown/box
+# unfit: the account must not be rendered against), 6 conversation gone (review lost; only now is
+# a re-run justified).
+# v0.25: the collection is no longer limited to OPEN TABS. cdp-salvage remembers the run's
+# conversation URL once it proves which conversation is ours, and re-renders that URL when no tab
+# carries the marker — so a Chrome restart (the common ending on a memory-pressured box) stops
+# turning a finished, server-side review into "conversation gone".
 if [ -n "$HARVEST_MARKER" ]; then
   HARVEST=1
   RUN_MARKER="$HARVEST_MARKER"
@@ -284,6 +292,13 @@ if [ -n "$HARVEST_MARKER" ]; then
        THROTTLED=1
        pg_status deferred "throttle during harvest; retry after cooldown"
        pg_finish 8 ;;
+    7) # v0.25: INCONCLUSIVE — the salvage never got one successful CDP tab list (browser down
+       # or restarting, the very condition that loses tabs in the first place). Absence of
+       # evidence, so it must NOT advance the miss counter toward "conversation gone": keep the
+       # reservation untouched and let the caller retry.
+       echo "[oracle-review] harvest inconclusive: the review browser never answered (down or restarting). Reservation kept, NO miss counted. Retry --harvest once Chrome is healthy." >&2
+       pg_status in-progress "harvest inconclusive (browser unreachable); retry later"
+       pg_finish 9 ;;
     4) # Confirmed absent THIS probe, which is not yet proof of loss (suspended renderer,
        # hydration): apply the shared consecutive-miss policy instead of destroying the
        # reservation on one observation (dogfood review P1).
