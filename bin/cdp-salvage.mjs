@@ -60,10 +60,13 @@
 //           model is still generating; the tab is left open so a later --harvest can collect
 //           the finished review without respending the Pro slot);
 //       5 = ChatGPT throttle detected (cooldown written — do NOT resubmit);
-//       7 = INCONCLUSIVE: not one successful CDP tab list all invocation (browser down/
-//           restarting). Distinct from 4 because 4 is evidence of absence and feeds the
-//           engine's consecutive-miss counter toward "conversation gone"; 7 is absence of
-//           evidence and must never be counted as a miss.
+//       7 = INCONCLUSIVE: either not one successful CDP tab list all invocation (browser down/
+//           restarting), or this run's remembered conversation could not be resolved either way
+//           (it never rendered decisively). Distinct from 4 because 4 is evidence of absence and
+//           feeds the engine's consecutive-miss counter toward "conversation gone"; 7 is absence
+//           of evidence and must never be counted as a miss. A successful TAB listing says
+//           nothing about SERVER-SIDE state, so it alone cannot promote 7 to 4 — only decisive
+//           evidence that the remembered conversation is another run's does that.
 // Requires Node >= 21 (global WebSocket); the box runs Node 24.
 
 import fs from 'node:fs';
@@ -224,10 +227,20 @@ const ourUrls = new Set();       // URLs proven to carry THIS run's marker (exem
 // invocation, so it joins ourUrls: exempt from the per-URL render cap and from the blacklist.
 // Bounded like every other render source — each one is a real chatgpt.com page load, and
 // hammering the account is what tripped the 2026-07-03 anti-scraping limiter.
-const KNOWN_URL = recallUrl(marker);
+// MUTABLE: a conversation proven ours THIS invocation must be usable immediately. The tab we
+// just matched is exactly the one that dies mid-salvage when the box runs out of memory — the
+// failure this file exists for — so a snapshot read once at startup would leave the recovery
+// branch blind for the whole run and only help the NEXT invocation (gate P1).
+let knownUrl = recallUrl(marker);
 const MAX_SEEDED_RENDERS = probe ? 1 : 8;
 let seededRenders = 0;
-if (KNOWN_URL) ourUrls.add(KNOWN_URL);
+// Liveness proven against SERVER-SIDE state, tracked separately from the open-tab scan below.
+// It is evidence about ChatGPT, not about this Chrome's tab list, so a later empty scan must
+// not erase it (gate P1): otherwise a harvest can prove the conversation live over and over,
+// exhaust its render budget, and still report "gone".
+let seededLiveUrl = null;
+let memoStale = false;       // the remembered URL decisively carries ANOTHER run's conversation
+if (knownUrl) ourUrls.add(knownUrl);
 
 // Persistent blacklist: conversations proven (by a foreign run marker) to belong to another
 // review. SCOPED TO THE MARKER that proved it (v0.25). It used to hold bare URLs and was
@@ -329,6 +342,7 @@ function extractReview(text) {
 async function onOurConversation(url, text) {
   ourUrls.add(url);
   rememberUrl(marker, url);
+  knownUrl = url;                // usable by the recovery branch from the very next cycle
   if (probe) { console.error(`live conversation: ${url}`); process.exit(0); }
   const review = extractReview(text);
   if (review) { console.log(review); process.exit(0); }
@@ -365,7 +379,14 @@ while (Date.now() < deadline) {
   for (const { tab, text } of reads) {
     if (text === null || text.trim() === '') { deadTabs.push(tab); continue; }
     if (isThrottlePage(text)) tripThrottle(`tab ${tab.url}`);
-    if (!text.includes(marker)) continue;
+    if (!text.includes(marker)) {
+      // The remembered URL is open and rendered ANOTHER run's conversation: the memo is stale
+      // (recycled URL, or it was never ours). This is the second way to prove staleness — the
+      // first is a seeded render below — and without it an open-but-foreign remembered URL is
+      // never re-rendered (it is already a tab), so nothing could ever decide it.
+      if (tab.url === knownUrl && FOREIGN_MARKER_RE.test(text)) memoStale = true;
+      continue;
+    }
     stillGeneratingUrl = await onOurConversation(tab.url, text);
     lastMatchWasSeeded = false;
     console.error(`conversation found (${tab.url}) but no VERDICT yet; waiting...`);
@@ -411,25 +432,32 @@ while (Date.now() < deadline) {
   // "conversation confirmed gone", telling a human a fresh Pro run is justified. If an earlier
   // invocation proved which conversation is ours, re-render THAT URL: it is a plain navigation
   // to server-side state and works with no tab at all.
-  if (KNOWN_URL && !stillGeneratingUrl && !tabs.some((t) => t.url === KNOWN_URL)
+  if (knownUrl && !stillGeneratingUrl && !tabs.some((t) => t.url === knownUrl)
       && Date.now() < deadline
       && seededRenders < MAX_SEEDED_RENDERS
-      && Date.now() >= (nextRenderAt.get(KNOWN_URL) ?? 0)) {
-    nextRenderAt.set(KNOWN_URL, Date.now() + RENDER_INTERVAL_MS);
+      && Date.now() >= (nextRenderAt.get(knownUrl) ?? 0)) {
+    const seedUrl = knownUrl;
+    nextRenderAt.set(seedUrl, Date.now() + RENDER_INTERVAL_MS);
     seededRenders += 1;
-    console.error(`no open tab carries "${marker}" — re-rendering the remembered conversation ${KNOWN_URL} (${seededRenders}/${MAX_SEEDED_RENDERS})...`);
-    const { text } = await freshRenderText(KNOWN_URL, port, deadline);
+    console.error(`no open tab carries "${marker}" — re-rendering the remembered conversation ${seedUrl} (${seededRenders}/${MAX_SEEDED_RENDERS})...`);
+    const { text } = await freshRenderText(seedUrl, port, deadline);
     if (text) {
-      if (isThrottlePage(text)) tripThrottle(`remembered render ${KNOWN_URL}`);
+      if (isThrottlePage(text)) tripThrottle(`remembered render ${seedUrl}`);
       if (text.includes(marker)) {
-        stillGeneratingUrl = await onOurConversation(KNOWN_URL, text);
+        stillGeneratingUrl = await onOurConversation(seedUrl, text);
         lastMatchWasSeeded = true;
-        console.error(`remembered conversation recovered (${KNOWN_URL}) but no VERDICT yet; waiting...`);
+        seededLiveUrl = seedUrl;   // survives later empty scans: this is server-side evidence
+        console.error(`remembered conversation recovered (${seedUrl}) but no VERDICT yet; waiting...`);
+      } else if (FOREIGN_MARKER_RE.test(text)) {
+        // Decisive the other way: the memo points at ANOTHER run's conversation (stale or
+        // corrupt). Only this justifies treating the remembered handle as worthless.
+        memoStale = true;
+        console.error(`remembered conversation ${seedUrl} carries a DIFFERENT run's marker — stale memo, ignoring it`);
       } else {
-        // Not proof of loss: the render may simply not have hydrated. Never blacklist it
-        // (blacklist() also refuses, since a remembered URL is in ourUrls) and never let this
-        // stand in for a scan result — the miss policy is driven by the tab scan above.
-        console.error(`remembered conversation ${KNOWN_URL} did not render our marker this pass; will retry`);
+        // Not proof of loss: shell, login wall or incomplete hydration. Never blacklist it
+        // (blacklist() also refuses, since a remembered URL is in ourUrls), and never let it
+        // masquerade as a confirmed absence at the deadline.
+        console.error(`remembered conversation ${seedUrl} did not render our marker this pass; will retry`);
       }
     }
   }
@@ -453,12 +481,16 @@ if (!probe && stillGeneratingUrl && !lastMatchWasSeeded) {
     // CDP outage is inconclusive: retain the last positive signal, fail-closed against respending.
   }
 }
-if (!probe && stillGeneratingUrl) {
+// A conversation proven to exist SERVER-SIDE is still generating even with no tab anywhere.
+// stillGeneratingUrl is a per-scan signal and is cleared every cycle; seededLiveUrl is not.
+const liveUrl = stillGeneratingUrl || seededLiveUrl;
+if (!probe && liveUrl) {
   // Budget exhausted while the model is still generating. The Pro slot is SPENT and the answer
   // may land any minute: exiting 4 here historically made the engine declare failure and CLOSE
   // the tab, destroying the review (65-minute Pro run lost on 2026-07-09). Distinct code + open
   // tab lets the caller harvest later instead of respending.
-  console.error(`still-generating: ${stillGeneratingUrl} matches "${marker}" but has no VERDICT after ${timeoutSecs}s: tab left open; harvest later (oracle-review.sh --harvest '${marker}')`);
+  console.error(`still-generating: ${liveUrl} matches "${marker}" but has no VERDICT after ${timeoutSecs}s`
+    + `${stillGeneratingUrl ? ': tab left open' : ' (proven server-side; no tab needed)'}; harvest later (oracle-review.sh --harvest '${marker}')`);
   process.exit(3);
 }
 if (!everListed) {
@@ -469,6 +501,15 @@ if (!everListed) {
   console.error(`inconclusive: CDP never listed tabs (${listFailures} failed attempt(s)) in ${timeoutSecs}s — browser down or restarting; NOT evidence the conversation is gone`);
   process.exit(7);
 }
+if (knownUrl && !memoStale) {
+  // We hold a URL proven to be this run's conversation and could not decisively rule it out —
+  // the renders were inconclusive (shell / login wall / never got a turn within budget). A
+  // successful TAB listing is not evidence about SERVER-SIDE state, so it must not be laundered
+  // into a confirmed absence: three of those releases a live reservation and permits a
+  // double-spending resubmit (gate P1). Stay inconclusive; the reservation TTL bounds it.
+  console.error(`inconclusive: remembered conversation ${knownUrl} re-rendered ${seededRenders}x without a decisive result in ${timeoutSecs}s — NOT evidence it is gone`);
+  process.exit(7);
+}
 console.error(`timeout: no ${probe ? 'conversation tab' : 'completed review'} matching "${marker}" after ${timeoutSecs}s`
-  + (KNOWN_URL ? ` (remembered conversation ${KNOWN_URL} re-rendered ${seededRenders}x without matching)` : ''));
+  + (memoStale ? ' (the remembered conversation belongs to another run; memo was stale)' : ''));
 process.exit(4);

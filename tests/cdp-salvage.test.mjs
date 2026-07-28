@@ -215,6 +215,50 @@ const MARKER = 'pg-run-test-1234567890-42';
   cdp.stop();
 }
 
+{ // gate P1: a URL learned THIS invocation must be usable immediately. The tab matches, then
+  // dies (Chrome restart mid-salvage — the exact failure this file exists for). Recovery must
+  // engage on the URL just learned, not wait for the next invocation.
+  const cdp = await mockCdp(`run marker: ${MARKER}\nthinking...`, [], {
+    renderText: () => `run marker: ${MARKER}\n[P1] z.ts:1: bug\n  Why: real\nVERDICT: SHIP: ok.`,
+  });
+  // kill the tab shortly after the first scan has matched it
+  setTimeout(() => cdp.setText('__NO_TABS__'), 1_500);
+  const r = await runSalvage([MARKER, '40'], cdp.port);   // NO seeded memo: it must be learned
+  check('a URL learned this invocation is used for recovery', r.status === 0, `status=${r.status} stderr=${r.stderr?.slice(0, 300)}`);
+  check('the learned URL is the one re-rendered',
+    cdp.created.some((t) => t.url === 'https://chatgpt.com/c/mock-conversation'), `created=${JSON.stringify(cdp.created)}`);
+  cdp.stop();
+}
+
+{ // gate P1: proven SERVER-SIDE liveness must outlive a later empty tab scan. The remembered
+  // render proves the conversation is alive but unfinished; subsequent scans see no tabs. That
+  // must end as still-generating (3), not a confirmed miss (4) that pushes toward "gone".
+  const cdp = await mockCdp('__NO_TABS__', [], { renderText: () => `run marker: ${MARKER}\nstill reasoning...` });
+  const r = await runSalvage([MARKER, '30'], cdp.port, seedMemo(MARKER, 'https://chatgpt.com/c/remembered'));
+  check('server-side liveness survives later empty scans (exit 3)', r.status === 3, `status=${r.status} stderr=${r.stderr?.slice(0, 300)}`);
+  check('still-generating says it was proven server-side',
+    /proven server-side/.test(r.stderr ?? ''), `stderr=${r.stderr?.slice(-300)}`);
+  cdp.stop();
+}
+
+{ // gate P1: an INCONCLUSIVE remembered render (shell that never hydrates) must not be laundered
+  // into a confirmed absence by a successful tab listing.
+  const shell = `Skip to content\nChat history\nNew chat\n${'Another conversation\n'.repeat(30)}`;
+  const cdp = await mockCdp('__NO_TABS__', [], { renderText: () => shell });
+  const r = await runSalvage([MARKER, '30'], cdp.port, seedMemo(MARKER, 'https://chatgpt.com/c/remembered'));
+  check('an undecided remembered conversation exits 7, not 4', r.status === 7, `status=${r.status} stderr=${r.stderr?.slice(0, 300)}`);
+  cdp.stop();
+}
+
+{ // ...but a memo that decisively points at ANOTHER run's conversation IS a real negative.
+  const cdp = await mockCdp('__NO_TABS__', [], {
+    renderText: () => 'run marker: pg-run-someone-else-1111111111-9\na different review entirely',
+  });
+  const r = await runSalvage([MARKER, '30'], cdp.port, seedMemo(MARKER, 'https://chatgpt.com/c/remembered'));
+  check('a stale memo pointing at another run still exits 4', r.status === 4, `status=${r.status} stderr=${r.stderr?.slice(0, 300)}`);
+  cdp.stop();
+}
+
 { // browser down for the whole window -> inconclusive (7), never "gone" (4): the engine's
   // miss counter must not advance on absence of evidence.
   const dead = await mockCdp('__NO_TABS__');
@@ -241,7 +285,12 @@ const MARKER = 'pg-run-test-1234567890-42';
   cdp.stop();
 }
 
-{ // latest-scan semantics: marker seen first, then healthy /json reports no tabs -> exit 4
+{ // latest-scan semantics: the marker is seen, then a healthy /json reports no tabs.
+  // The run must NOT claim "still generating" (3) off that stale sighting — that check still
+  // holds. But it must not claim "gone" (4) either: v0.25 learned this conversation's URL from
+  // the sighting, and a vanished TAB is not evidence about ChatGPT's server-side state. With no
+  // budget left to re-render it decisively, the honest answer is inconclusive (7), which keeps
+  // the reservation and counts no miss. Pre-v0.25 this asserted 4.
   const cdp = await mockCdp(`run marker: ${MARKER}\nstill thinking`);
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-disappear-'));
   const child = spawn(process.execPath, [SALVAGE, MARKER, '3', String(cdp.port)], {
@@ -249,11 +298,12 @@ const MARKER = 'pg-run-test-1234567890-42';
   });
   let stderr = '';
   child.stderr.on('data', (d) => { stderr += d; });
-  // First scan observes the marker; then a healthy target list proves it disappeared.
+  // First scan observes the marker; then a healthy target list proves the TAB disappeared.
   setTimeout(() => cdp.setText('__NO_TABS__'), 500);
   const status = await new Promise((resolve) => child.on('close', resolve));
   fs.rmSync(home, { recursive: true, force: true });
-  check('latest scan clears stale still-generating signal', status === 4, `status=${status} stderr=${stderr.slice(0, 200)}`);
+  check('a vanished tab is never reported as still-generating', status !== 3, `status=${status} stderr=${stderr.slice(0, 200)}`);
+  check('a vanished tab is inconclusive, not "gone"', status === 7, `status=${status} stderr=${stderr.slice(0, 200)}`);
   cdp.stop();
 }
 
