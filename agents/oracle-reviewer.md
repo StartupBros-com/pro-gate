@@ -33,9 +33,13 @@ this file hardcodes.
   throttle cooldown). Do NOT relaunch a run that was interrupted, do NOT manually reattach
   (`oracle session … --harvest` can bind a stale tab target), and never start a second run for
   the same PR while yours is in flight — read the status file instead. If you have LOST the
-  status file or marker entirely, re-running the engine's own fresh-run command for the same
-  PR is the sanctioned recovery (engine ≥v0.22): it self-redirects to harvest and prints the
-  harvest command instead of spending a second slot. "Never relaunch" means never bypass the
+  status file or marker entirely, inspect
+  `"${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/in-progress/"` first: when a reservation for
+  the change EXISTS (remote-chrome mode only), re-running the engine's own fresh-run command
+  is the sanctioned recovery (engine ≥v0.22) — it self-redirects to harvest and prints the
+  harvest command instead of spending a second slot. With no reservation (completed, failed,
+  or native-mode runs), a fresh run is a real spend — check the ledger for a completed
+  run's `out` file before ever launching one. "Never relaunch" means never bypass the
   engine, not never call it.
 
 ## Inputs you receive

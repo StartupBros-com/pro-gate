@@ -46,19 +46,23 @@ Daemon and dangerous automatic-fixer execution remain disabled unless the operat
 the versioned disclosure during installation.
 
 **Detached vs dead sessions — different rules:**
-- **Lost track of a run entirely (compaction, a new session, a dead tab)? Start with the
-  engine, not forensics.** Re-running the identical fresh-run command for the same PR (or the
-  same `--diff` change) is SAFE on engine ≥v0.22: before spending anything, the engine
-  reconciles durable reservations, and when the change already has an in-progress Pro
-  conversation it redirects itself to harvest — printing the exact
-  `--harvest '<marker>' --out … --timeout 20m` command and exiting 9 with NO new spend. Every
-  "never relaunch" rule in this file means "never bypass the engine" (raw `oracle` calls,
-  deleting cooldown/lock/reservation files) — the engine's own fresh-run entry point is the
-  sanctioned recovery for lost context. To inspect state without running anything:
-  `ls $PRO_GATE_HOME/in-progress/` (filenames ARE harvest markers; each file's first
-  tab-separated field is the change key), `pro-gate-stats.sh --tail 10` for recent outcomes,
-  and the ledger (`$PRO_GATE_HOME/ledger.jsonl`, `out` field) for a completed run's output
-  path. Declare a review lost only when the HARVEST path itself says so (its exit 6 after
+- **Lost track of a run entirely (compaction, a new session, a dead tab)? Inspect state
+  first, then let the engine route you.** All of this works with zero prior context; use the
+  defaulted home everywhere, `PG_HOME="${PRO_GATE_HOME:-$HOME/.pro-review-daemon}"`:
+  `ls "$PG_HOME/in-progress/"` (filenames ARE harvest markers; each file's first
+  tab-separated field is the change key — a matching entry means your review is still
+  collectable for free), `"$PG_HOME/pro-gate-stats.sh" --tail 10` for recent outcomes, and
+  the ledger (`"$PG_HOME/ledger.jsonl"`, `out` field) for a COMPLETED run's findings path —
+  if the review already finished, read that file; run nothing. When a matching reservation
+  EXISTS (WSL/Linux remote-chrome only — native/macOS never creates reservations),
+  re-running the identical fresh-run command is safe on engine ≥v0.22: it reconciles
+  reservations before spending anything and redirects itself to harvest, printing the exact
+  `--harvest '<marker>' --out … --timeout 20m` command and exiting 9 with NO new spend. With
+  NO reservation, a fresh run is a real spend (the round budget counts it): launch one only
+  deliberately, never as a probe. Every "never relaunch" rule in this file means "never
+  bypass the engine" (raw `oracle` calls, deleting cooldown/lock/reservation files) — but
+  the engine's redirect protects in-progress runs only, not completed or native-mode ones.
+  Declare a review lost only when the HARVEST path itself says so (its exit 6 after
   repeated confirmed misses) — never because you lost the marker or the `--out` path.
 - **Ground truth is the BROWSER, not oracle's log.** oracle can miss the thinking state after
   ChatGPT UI drift (seen 2026-07-02: it logged `no thinking status detected` for 10 min while the
@@ -108,18 +112,19 @@ engine home is `$HOME/.pro-review-daemon`.
   `auto-fix+merge` requires the guarded-merge rules; if they aren't satisfied, fall back to
   `auto-fix` and leave the PR for the human.
 - **Input:** `pro_gate_input` (`both` default | `bundle` | `connector`).
-- **Rounds:** `pro_gate_rounds_policy` (`converge` default | `bounded`) with an optional
-  `pro_gate_max_rounds` ceiling — how many engine runs this gate may spend (section 6).
-  `converge` continues while rounds are strictly narrowing the findings, inside the engine's
-  own per-change budget; `bounded` is the classic fixed ceiling (`pro_gate_max_rounds`,
-  default `2`: initial review + one confirming pass).
+- **Rounds:** `pro_gate_rounds_policy` (`converge` default | `bounded`) — how many engine
+  runs this gate may spend (section 6). `converge` continues while rounds are strictly
+  narrowing the findings, inside the engine's own per-change budget; `bounded` is the classic
+  fixed ceiling. An explicitly set `pro_gate_max_rounds` is a hard ceiling under EITHER
+  policy — a legacy config that sets only `pro_gate_max_rounds: 2` keeps its two-run cap
+  under `converge` too. Only `bounded` supplies a default (2) when the key is absent.
 
   ```yaml
   # <repo>/.compound-engineering/config.local.yaml — every key optional
   pro_gate_mode: auto-fix          # review-only | auto-fix (default) | auto-fix+merge
   pro_gate_input: both             # both (default) | bundle | connector
   pro_gate_rounds_policy: converge # converge (default) | bounded
-  pro_gate_max_rounds: 2           # hard ceiling on engine runs; bounded mode defaults to 2
+  pro_gate_max_rounds: 2           # hard ceiling under BOTH policies when set; bounded defaults to 2
   ```
 
   A missing file, missing key, or unparseable value means the documented default — never infer
@@ -294,22 +299,25 @@ converging — multi-round gates whose later rounds resolved every prior finding
 fully-clean PRs that a hard 2-round stop would have left open. The default policy is
 **converge**: continue exactly as long as each round demonstrably narrows the problem.
 
-After the initial review and its fixes, run a confirming pass. CONTINUE to a further round
-only while ALL of these hold:
+Run a confirming pass — and continue to any round after it — ONLY while ALL of these hold
+(they gate the FIRST confirming pass exactly like every later one):
 
-- confirmed P0/P1 fixes were applied this round (P2/P3-only fixes: commit, post, stop);
-- every prior P0/P1 came back RESOLVED or operator-settled — none returned;
-- the new-P0/P1 count is strictly below the previous round's (shrinking, not churning);
-- the engine still grants rounds (no exit 12), and in `bounded` mode `pro_gate_max_rounds`
-  is not yet reached.
+- the previous verdict was non-terminal (not `SHIP`, not `NEEDS-DISCUSSION`) and confirmed
+  P0/P1 fixes were applied in response to it (P2/P3-only fixes: commit, post, stop);
+- no prior P0/P1 has come back after being fixed — every one RESOLVED or operator-settled;
+- the new-P0/P1 count is strictly below the previous round's (shrinking, not churning; the
+  first confirming pass has nothing to compare and passes this check trivially);
+- the engine still grants rounds (no exit 12), and any explicitly configured
+  `pro_gate_max_rounds` is not yet reached (it caps BOTH policies when set; `bounded`
+  defaults it to 2).
 
 Stop immediately when any of: verdict `SHIP`; a confirming pass reports no new P0/P1; a
 finding you already fixed comes back (oscillation — the fixer and reviewer disagree and
 another loop will not settle it: escalate, and the fix STAYS on the branch while the human
 decides); the new-finding count did not shrink; verdict `NEEDS-DISCUSSION` (a human decision,
-not a fix loop); engine exit 12; `pro_gate_max_rounds` in `bounded` mode. On the last allowed
-round, still fix any new P0/P1 it surfaced — they ship as "fixed, unconfirmed by a
-re-review" — and post new P2/P3 as notes.
+not a fix loop); engine exit 12; an explicitly configured `pro_gate_max_rounds` (or bounded
+mode's default 2) is reached. On the last allowed round, still fix any new P0/P1 it
+surfaced — they ship as "fixed, unconfirmed by a re-review" — and post new P2/P3 as notes.
 
 Mechanics:
 
@@ -355,13 +363,19 @@ human rule unless they already have. The same applies one level up: an orchestra
 pro-gate step reports "stopped with unresolved findings" has received a normal terminal state
 awaiting human sign-off, NOT a failure that licenses reverting commits or closing the PR.
 
-**The final commit must be gated — or disclosed.** Before merging, or before declaring the
-gate complete, compare the PR's head SHA to the head the last engine run actually reviewed.
-Commits pushed after the final gated round (last-round fixes, CI touch-ups, conflict
-resolutions) have never been Pro-reviewed: either gate that delta (`--diff` of
-`<last-gated-head>..HEAD`, keeping `--pr`, budget permitting) or say so explicitly in the PR
-comment under **Landed after the last gated round**. Note each round's reviewed head SHA in
-the audit-trail comment as you go, so this check costs one `git rev-parse` at the end.
+**The final commit must be gated — or disclosed to the human.** Before merging, or before
+declaring the gate complete, compare the PR's current REMOTE head against the head the last
+engine run actually reviewed. Use the remote, not local git: record
+`gh pr view <num> --json headRefOid -q .headRefOid` at the moment you launch each round, and
+compare against a FRESH `headRefOid` at the end — the remote can move while a round waits on
+locks or cooks, and a local `git rev-parse` cannot see that. Commits pushed after the final
+gated round (last-round fixes, CI touch-ups, conflict resolutions) have never been
+Pro-reviewed: either gate that delta (`--diff` of `<last-gated-head>..HEAD`, keeping `--pr`,
+budget permitting) or say so explicitly in the PR comment under **Landed after the last
+gated round**. Disclosure is a HUMAN-handoff path only: in `auto-fix+merge` mode an un-gated
+head BLOCKS the automatic merge — gate the delta or escalate; never auto-merge a head the
+model has not reviewed. Note each round's reviewed `headRefOid` in the audit-trail comment
+as you go, so the final check is one `gh pr view` call.
 
 Always leave an audit trail: the full Pro review + the fix summary as a PR comment. Head the
 comment with the model the run resolved (the status file's `model` field, `jq -r .model <out>.status`;
