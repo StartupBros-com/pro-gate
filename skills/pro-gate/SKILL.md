@@ -212,8 +212,9 @@ restarted mid-run — the status `detail` says so, the review may still exist, f
 rather than blindly re-run) · `7` lock timeout · `8` deferred, NO quota spent
 (box unfit, low memory, or throttle cooldown: safe to retry later) · `9` in-progress: the slot IS spent but
 the model was still generating when the salvage budget ran out; the conversation tab is left
-open: never submit a NEW review for it — harvest instead (below; a same-PR fresh-run
-invocation is safe, the engine self-redirects to this harvest) · `11` oversized diff (past the hard ceiling
+open: never submit a NEW review for it — harvest by marker instead (below; the engine's
+same-change redirect exists as a backstop, but reconciliation can expire a stale
+reservation first, so harvest directly, do not relaunch to "get redirected") · `11` oversized diff (past the hard ceiling
 `PRO_GATE_DIFF_HARD_MAX`), NO quota spent: scope the payload (below); a merely large diff instead
 proceeds and lands `in-progress` for harvest · `12` round budget exhausted, NO quota spent: this
 PR/branch already used its review rounds for the window (section 6): do NOT re-run; post the
@@ -238,7 +239,10 @@ MARKER="$(jq -r .marker "$STATUS" 2>/dev/null || sed -nE 's/.*"marker":"([^"]+)"
 Harvest exits: `0` review ready · `9` reservation retained, try again later (still generating;
 absent this pass but under the consecutive-miss threshold; or the browser was unreachable for
 the whole pass, which counts as NO miss) · `8` deferred (cooldown: retry after) · `6`
-conversation gone after repeated misses (only NOW is a fresh run justified) · `7` another
+conversation gone after repeated misses — but exit 6 also fires when the reservation is
+ALREADY ABSENT, which includes "another pass already collected this review": before treating
+6 as a loss, check the ledger for a clean row for this change and read the `--out` file, and
+open the conversation in a browser; only a persisted miss-limit loss justifies a fresh run · `7` another
 collector already holds this marker (wait for it; do not race it) · `3` runtime/CDP trouble;
 reservation and tab kept (retry once the browser is healthy). Repeat harvests are free: no Pro
 quota is spent. Reservations are keyed by repo-scoped PR identity, so identical PR numbers in
