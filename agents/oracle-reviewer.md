@@ -35,12 +35,14 @@ this file hardcodes.
   the same PR while yours is in flight — read the status file instead. If you have LOST the
   status file or marker entirely, inspect
   `"${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/in-progress/"` first: when a reservation for
-  the change EXISTS (remote-chrome mode only), re-running the engine's own fresh-run command
-  is the sanctioned recovery (engine ≥v0.22) — it self-redirects to harvest and prints the
-  harvest command instead of spending a second slot. With no reservation (completed, failed,
-  or native-mode runs), a fresh run is a real spend — check the ledger for a completed
-  run's `out` file before ever launching one. "Never relaunch" means never bypass the
-  engine, not never call it.
+  the change EXISTS (remote-chrome mode only), harvest it DIRECTLY — the filename is the
+  marker (`--harvest '<filename>'`, free, repeatable). Do not lean on the engine's fresh-run
+  redirect for recovery: reconciliation can expire a stale reservation before the lookup and
+  the run then spends a fresh slot — the redirect (engine ≥v0.22) is the backstop that makes
+  an accidental duplicate launch safe, not the recovery path. With no reservation
+  (completed, failed, or native-mode runs), a fresh run is a real spend — check the ledger
+  for a completed run's `out` file before ever launching one. "Never relaunch" means never
+  bypass the engine, not never call it.
 
 ## Inputs you receive
 

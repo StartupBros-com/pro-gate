@@ -54,14 +54,19 @@ the versioned disclosure during installation.
   collectable for free), `"$PG_HOME/pro-gate-stats.sh" --tail 10` for recent outcomes, and
   the ledger (`"$PG_HOME/ledger.jsonl"`, `out` field) for a COMPLETED run's findings path —
   if the review already finished, read that file; run nothing. When a matching reservation
-  EXISTS (WSL/Linux remote-chrome only — native/macOS never creates reservations),
-  re-running the identical fresh-run command is safe on engine ≥v0.22: it reconciles
-  reservations before spending anything and redirects itself to harvest, printing the exact
-  `--harvest '<marker>' --out … --timeout 20m` command and exiting 9 with NO new spend. With
-  NO reservation, a fresh run is a real spend (the round budget counts it): launch one only
-  deliberately, never as a probe. Every "never relaunch" rule in this file means "never
-  bypass the engine" (raw `oracle` calls, deleting cooldown/lock/reservation files) — but
-  the engine's redirect protects in-progress runs only, not completed or native-mode ones.
+  EXISTS (WSL/Linux remote-chrome only — native/macOS never creates reservations), harvest
+  it DIRECTLY — the filename IS the marker:
+  `"$PG_HOME/oracle-review.sh" --harvest '<filename>' --out <out> --timeout 20m`; repeat
+  harvests are free. Do NOT lean on the fresh-run redirect (engine ≥v0.22: a same-change
+  fresh run reconciles reservations and re-routes itself to harvest, exit 9, no new spend)
+  as the primary recovery: reconciliation can expire a stale reservation (6h TTL or the
+  consecutive-miss limit) between your `ls` and the engine's lookup, and the redirected run
+  then spends a fresh slot — the redirect is the engine-enforced backstop that makes an
+  ACCIDENTAL duplicate launch safe, not a recovery to aim for. With NO reservation, a fresh
+  run is a real spend (the round budget counts it): launch one only deliberately, never as
+  a probe. Every "never relaunch" rule in this file means "never bypass the engine" (raw
+  `oracle` calls, deleting cooldown/lock/reservation files) — but the engine's redirect
+  protects in-progress runs only, not completed or native-mode ones.
   Declare a review lost only when the HARVEST path itself says so (its exit 6 after
   repeated confirmed misses) — never because you lost the marker or the `--out` path.
 - **Ground truth is the BROWSER, not oracle's log.** oracle can miss the thinking state after
@@ -184,10 +189,15 @@ Launch the engine in the background (it blocks ~10-30 min) and poll its **status
 Run with `run_in_background: true`, and mind the clocks: real wall time is 10-47+ min (ledger
 p90 ≈ 47 min), longer than many tools' own command caps (Claude Code's Bash tool kills at
 30 min), so poll in short cycles — re-issue a fresh poll command every minute or two rather
-than one long sleep — and never wrap the LAUNCH itself in a caller-side timeout shorter than
-`--timeout` plus the lock wait. If your wrapper gets killed anyway, the engine keeps running
-and the slot may already be spent: read the status file next, never relaunch on reflex. The
-wait is free time — do useful parallel work and check back. The engine writes single-line JSON to
+than one long sleep. Launch DETACHED with no caller-side timeout at all: a wrapper that kills
+the process tree can end the engine after the slot is spent but before the exit-9
+reservation lands, the worst possible state. If foreground is unavoidable, budget the FULL
+worst case — two lock waits (per-change guard + account slot, each up to
+`PRO_GATE_LOCK_WAIT`, default 40 min) plus `--timeout`, its grace, the retry, and the
+reattach/throttle/salvage windows — never the bare happy path. If your wrapper is killed
+anyway, do not assume the engine either survived or died: read the status file, then check
+for the engine process and a reservation, before anything else — never relaunch on reflex.
+The wait is free time — do useful parallel work and check back. The engine writes single-line JSON to
 `<out>.status` at every phase change (`preflight → waiting-slot → launching → … → done|failed|deferred|in-progress|oversized|round-capped`):
 poll THAT, not engine logs. Phase `done` ⇒ read `--out` (the `[Pn] file:line` blocks ending in a
 `VERDICT:` line). `failed`/`deferred`/`in-progress`/`oversized`/`round-capped` are terminal for
@@ -365,10 +375,15 @@ awaiting human sign-off, NOT a failure that licenses reverting commits or closin
 
 **The final commit must be gated — or disclosed to the human.** Before merging, or before
 declaring the gate complete, compare the PR's current REMOTE head against the head the last
-engine run actually reviewed. Use the remote, not local git: record
-`gh pr view <num> --json headRefOid -q .headRefOid` at the moment you launch each round, and
-compare against a FRESH `headRefOid` at the end — the remote can move while a round waits on
-locks or cooks, and a local `git rev-parse` cannot see that. Commits pushed after the final
+engine run actually reviewed. Use the remote, not local git: at the moment you launch each
+round, record `gh pr view <num> --json headRefOid -q .headRefOid` AND the local head your
+payload was built from. For a `--diff` confirming pass the two must be EQUAL at launch — if
+the remote has already moved past the head your fix-delta ends at, something landed that
+your patch does not cover: re-scope the delta before spending the round; a recorded OID is
+only meaningful when it equals the reviewed payload's endpoint. At the end compare against a
+FRESH `headRefOid` — the remote can move while a round waits on locks or cooks, and a local
+`git rev-parse` cannot see that. (Engine-side persistence of the reviewed head plus a
+payload hash is follow-up engine work; until then this caller-side binding is the rule.) Commits pushed after the final
 gated round (last-round fixes, CI touch-ups, conflict resolutions) have never been
 Pro-reviewed: either gate that delta (`--diff` of `<last-gated-head>..HEAD`, keeping `--pr`,
 budget permitting) or say so explicitly in the PR comment under **Landed after the last
