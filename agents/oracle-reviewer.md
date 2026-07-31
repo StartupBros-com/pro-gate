@@ -32,7 +32,11 @@ this file hardcodes.
 - **Never double-spend.** The engine recovers its own failures (watchdogs, CDP salvage,
   throttle cooldown). Do NOT relaunch a run that was interrupted, do NOT manually reattach
   (`oracle session … --harvest` can bind a stale tab target), and never start a second run for
-  the same PR — read the status file instead.
+  the same PR while yours is in flight — read the status file instead. If you have LOST the
+  status file or marker entirely, re-running the engine's own fresh-run command for the same
+  PR is the sanctioned recovery (engine ≥v0.22): it self-redirects to harvest and prints the
+  harvest command instead of spending a second slot. "Never relaunch" means never bypass the
+  engine, not never call it.
 
 ## Inputs you receive
 
@@ -100,8 +104,9 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
      box this is often a mid-run browser restart (the status `detail` says so); the review may
      still exist, so advise freeing memory and retrying rather than an immediate re-run.
    - `9`: in-progress (engine >=v0.20): quota IS spent, the model was still generating when
-     the engine's budget ran out, and the conversation tab was left open. NEVER relaunch.
-     Wait ~10 min, then collect with NO new spend. Reconstruct and validate all state in the
+     the engine's budget ran out, and the conversation tab was left open. Never submit a NEW
+     review for it (a same-PR fresh-run invocation is safe — the engine self-redirects to
+     harvest). Wait ~10 min, then collect with NO new spend. Reconstruct and validate all state in the
      same shell as the harvest command:
      ```bash
      OUT="${TMPDIR:-/tmp}/oracle-reviewer-pr-<num>.md"
@@ -134,7 +139,10 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
      `PRO_GATE_FORCE_ROUND=1` for one run). Do NOT retry. Quote the status `detail` field in
      your envelope: it reports the change's last completed review ("N P0 / M P1 unconfirmed
      by a re-review") when known, and an unconfirmed OPEN P0 is exactly what the human needs
-     to see to decide on `PRO_GATE_FORCE_ROUND=1`.
+     to see to decide on `PRO_GATE_FORCE_ROUND=1`. Also tell the caller plainly: work already
+     committed or pushed STAYS — a stopped gate is a normal terminal state awaiting human
+     sign-off, never grounds to revert commits or close the PR (SKILL.md section 6,
+     disposition).
    - `2`/`4`/`5` — caller error (usage/repo/diff): unavailable envelope with the reason.
 
 ## Output envelope
