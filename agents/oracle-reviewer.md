@@ -32,7 +32,17 @@ this file hardcodes.
 - **Never double-spend.** The engine recovers its own failures (watchdogs, CDP salvage,
   throttle cooldown). Do NOT relaunch a run that was interrupted, do NOT manually reattach
   (`oracle session … --harvest` can bind a stale tab target), and never start a second run for
-  the same PR — read the status file instead.
+  the same PR while yours is in flight — read the status file instead. If you have LOST the
+  status file or marker entirely, inspect
+  `"${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/in-progress/"` first: when a reservation for
+  the change EXISTS (remote-chrome mode only), harvest it DIRECTLY — the filename is the
+  marker (`--harvest '<filename>'`, free, repeatable). Do not lean on the engine's fresh-run
+  redirect for recovery: reconciliation can expire a stale reservation before the lookup and
+  the run then spends a fresh slot — the redirect (engine ≥v0.22) is the backstop that makes
+  an accidental duplicate launch safe, not the recovery path. With no reservation
+  (completed, failed, or native-mode runs), a fresh run is a real spend — check the ledger
+  for a completed run's `out` file before ever launching one. "Never relaunch" means never
+  bypass the engine, not never call it.
 
 ## Inputs you receive
 
@@ -63,13 +73,16 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
    `curl` check would skip that recovery path and report "unavailable" for outages the
    engine would have healed. Just run the engine and interpret its exit code.
 
-3. **Run the review.** From the repo, prefer launching the engine in the BACKGROUND and polling
-   `$OUT.status`, exactly as the main skill does. A foreground Bash timeout that fires mid-run can
-   kill the engine before it persists a cooked run's harvestable exit-9 reservation, and a later
-   invocation would then double-spend. If you must run it foreground, budget a timeout covering the
-   FULL worst case — the lock-wait queue (up to `PRO_GATE_LOCK_WAIT`, default 40 min) PLUS both the
-   primary and salvage windows (a large cooked diff can reason ~65 min) — never the bare 10-30 min
-   happy path:
+3. **Run the review.** From the repo, launch the engine DETACHED (background, no caller-side
+   timeout) and poll `$OUT.status`, exactly as the main skill does. A wrapper timeout that fires
+   mid-run can kill the engine after the slot is spent but before it persists a cooked run's
+   harvestable exit-9 reservation — the worst possible state — and a later invocation would then
+   double-spend. If foreground is truly unavoidable, budget the FULL worst case — TWO lock waits
+   (the per-change guard and the account slot, each up to `PRO_GATE_LOCK_WAIT`, default 40 min)
+   PLUS `--timeout` and its grace, the retry, and the reattach/throttle/salvage windows (a large
+   cooked diff can reason ~65 min) — never the bare 10-30 min happy path. If your wrapper is
+   killed anyway, verify the engine process, the status file, and any reservation before ever
+   launching again:
    ```bash
    OUT="${TMPDIR:-/tmp}/oracle-reviewer-pr-<num>.md"
    "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --pr <num|url> --repo <REPO> \
@@ -100,8 +113,10 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
      box this is often a mid-run browser restart (the status `detail` says so); the review may
      still exist, so advise freeing memory and retrying rather than an immediate re-run.
    - `9`: in-progress (engine >=v0.20): quota IS spent, the model was still generating when
-     the engine's budget ran out, and the conversation tab was left open. NEVER relaunch.
-     Wait ~10 min, then collect with NO new spend. Reconstruct and validate all state in the
+     the engine's budget ran out, and the conversation tab was left open. Never submit a NEW
+     review for it — harvest by marker directly (the same-change redirect is only a backstop:
+     reconciliation can expire a stale reservation first). Wait ~10 min, then collect with NO
+     new spend. Reconstruct and validate all state in the
      same shell as the harvest command:
      ```bash
      OUT="${TMPDIR:-/tmp}/oracle-reviewer-pr-<num>.md"
@@ -115,7 +130,9 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
      below-threshold miss, or the browser was unreachable for the whole pass — which counts as
      no miss), wait and repeat if your budget allows, else return the unavailable envelope
      quoting the harvest command; exit 3 = browser/CDP trouble with the reservation kept, safe
-     to retry; exit 6 = gone after repeated misses). Engine >=v0.25 remembers the run's
+     to retry; exit 6 = gone after repeated misses — but 6 also fires when the reservation is
+     already ABSENT, which includes "already collected": check the ledger and `$OUT` for a
+     completed review before reporting it lost). Engine >=v0.25 remembers the run's
      conversation URL and re-renders it when no tab carries the marker, so a browser restart no
      longer loses a finished review; if exit 6 arrives and the conversation IS in ChatGPT, say
      so in your envelope — that is a bug, not the expected path.
@@ -134,7 +151,10 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
      `PRO_GATE_FORCE_ROUND=1` for one run). Do NOT retry. Quote the status `detail` field in
      your envelope: it reports the change's last completed review ("N P0 / M P1 unconfirmed
      by a re-review") when known, and an unconfirmed OPEN P0 is exactly what the human needs
-     to see to decide on `PRO_GATE_FORCE_ROUND=1`.
+     to see to decide on `PRO_GATE_FORCE_ROUND=1`. Also tell the caller plainly: work already
+     committed or pushed STAYS — a stopped gate is a normal terminal state awaiting human
+     sign-off, never grounds to revert commits or close the PR (SKILL.md section 6,
+     disposition).
    - `2`/`4`/`5` — caller error (usage/repo/diff): unavailable envelope with the reason.
 
 ## Output envelope
