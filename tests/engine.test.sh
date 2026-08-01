@@ -785,6 +785,18 @@ PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status "$SMARKER" --json >"$TDIR/st2.jso
 check '--status by marker finds the reservation' "$([ "$(jq -r '.reservations | length' "$TDIR/st2.json")" = 1 ]; echo $?)" "$(cat "$TDIR/st2.json")"
 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 999 >"$TDIR/st3.out" 2>/dev/null; RC=$?
 check '--status unknown pr exits 0 with a spend warning' "$([ "$RC" -eq 0 ] && grep -q 'SPEND a slot' "$TDIR/st3.out"; echo $?)" "rc=$RC $(tail -1 "$TDIR/st3.out")"
+# In-flight: a held per-change lock (live run, no reservation/ledger yet) must be reported —
+# NOT "no state found", which would invite the duplicate launch --status exists to prevent.
+rm -f "$SHOME/in-progress/$SMARKER"
+( exec 9>>"$SHOME/oracle.lock.pr-acme-widgets-42"; flock 9; sleep 4 ) &
+LOCK_BG=$!; sleep 0.5
+PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 >"$TDIR/st4.out" 2>/dev/null; RC=$?
+check '--status flags a live same-change run' "$([ "$RC" -eq 0 ] && grep -q 'RUNNING' "$TDIR/st4.out"; echo $?)" "rc=$RC $(cat "$TDIR/st4.out")"
+check '--status live-run hint says do not launch' "$(grep -qi 'do NOT launch' "$TDIR/st4.out"; echo $?)" "$(tail -1 "$TDIR/st4.out")"
+wait "$LOCK_BG" 2>/dev/null
+PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 >"$TDIR/st5.out" 2>/dev/null
+check '--status released lock no longer flagged live' "$(grep -q 'RUNNING' "$TDIR/st5.out"; [ $? -ne 0 ]; echo $?)" "$(cat "$TDIR/st5.out")"
+printf '42\t/tmp/pg-st-42.md\t%s\t0\t1\tGPT-X\n' "$(date +%s)" > "$SHOME/in-progress/$SMARKER"
 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status not.a.query >/dev/null 2>&1; RC=$?
 check '--status rejects a malformed query (exit 2)' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC"
 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --json >/dev/null 2>&1; RC=$?

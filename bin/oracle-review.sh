@@ -95,6 +95,24 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
   ST_CAP="${PRO_GATE_MAX_ROUNDS_PER_PR:-4}"; case "$ST_CAP" in ''|*[!0-9]*) ST_CAP=4;; esac
   ST_WIN="$(pg_round_window_secs)"
   ST_NOW="$(date +%s)"
+  ST_LOCKFILE="${PRO_GATE_LOCKFILE:-$PRO_GATE_HOME/oracle.lock}"
+  ST_INFLIGHT_KEY=""; ST_SPENT_KEY=""; ST_SPENT_N=0
+
+  # Non-blocking in-flight probe (same technique as round_capped's): a held per-change lock
+  # means a same-change review is RUNNING right now — the one state with no reservation and no
+  # ledger row yet, where "no state found" would wrongly invite a duplicate launch. Read-only:
+  # probe only locks that already exist (opening would otherwise create the file).
+  st_inflight() {  # $1 = round key -> rc 0 when a same-change run holds the lock now
+    local lf="${ST_LOCKFILE}.pr-$1" pfd
+    [ -d "${lf}.d" ] && return 0
+    [ -e "$lf" ] || return 1
+    pg_have flock || return 1
+    if { exec {pfd}>>"$lf"; } 2>/dev/null; then
+      if flock -n "$pfd" 2>/dev/null; then eval "exec ${pfd}>&-" 2>/dev/null; return 1; fi
+      eval "exec ${pfd}>&-" 2>/dev/null; return 0
+    fi
+    return 1
+  }
 
   # Normalize the query: marker, PR URL (repo-scoped slug + number), bare number, or all.
   Q_NUM=""; Q_SLUG=""; Q_MARKER=""
@@ -174,13 +192,15 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
       spent="$(pg_round_count "$k")"
       [ "$spent" -gt 0 ] 2>/dev/null || [ -n "$Q_NUM$Q_MARKER" ] || continue   # 'all' skips idle keys
       rem=$(( ST_CAP - spent )); [ "$rem" -lt 0 ] && rem=0
+      if [ "$spent" -gt 0 ] 2>/dev/null; then ST_SPENT_KEY="$k"; ST_SPENT_N="$spent"; fi
+      k_live=0; st_inflight "$k" && { k_live=1; ST_INFLIGHT_KEY="$k"; }
       if pg_have jq; then
         jq -nc --arg key "$k" --argjson spent "$spent" --argjson cap "$ST_CAP" \
-          --argjson remaining "$rem" --argjson window_secs "$ST_WIN" \
-          '{key:$key,spent:$spent,cap:$cap,remaining:$remaining,window_secs:$window_secs}' \
+          --argjson remaining "$rem" --argjson window_secs "$ST_WIN" --argjson in_flight "$k_live" \
+          '{key:$key,spent:$spent,cap:$cap,remaining:$remaining,window_secs:$window_secs,in_flight:($in_flight == 1)}' \
           >> "$ST_TMP/rounds.jsonl" 2>/dev/null
       else
-        printf '%s\t%s\t%s\t%s\n' "$k" "$spent" "$ST_CAP" "$rem" >> "$ST_TMP/rounds.tsv"
+        printf '%s\t%s\t%s\t%s\t%s\n' "$k" "$spent" "$ST_CAP" "$rem" "$k_live" >> "$ST_TMP/rounds.tsv"
       fi
     done
   fi
@@ -197,7 +217,12 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
       | awk '{a[NR]=$0} END{for(i=NR;i>=1;i--) print a[i]}' >> "$ST_TMP/ledger.jsonl" || true
   fi
 
-  # Hint fallback when nothing is in-progress: newest matching ledger row decides.
+  # Hint priority after reservations: a run holding the per-change lock RIGHT NOW (no
+  # reservation, no ledger row yet — the exact window where "no state" would invite a
+  # duplicate launch), then the newest matching ledger row.
+  if [ -z "$ST_HINT" ] && [ -n "$ST_INFLIGHT_KEY" ]; then
+    ST_HINT="a same-change review is RUNNING right now (per-change lock held for ${ST_INFLIGHT_KEY}): do NOT launch another — wait, then run --status again"
+  fi
   if [ -z "$ST_HINT" ] && [ -s "$ST_TMP/ledger.jsonl" ] && pg_have jq; then
     ST_LAST_OUTCOME="$(head -n1 "$ST_TMP/ledger.jsonl" | jq -r '.outcome // ""')"
     ST_LAST_OUT="$(head -n1 "$ST_TMP/ledger.jsonl" | jq -r '.out // ""')"
@@ -215,6 +240,9 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
       *)
         ST_HINT="last run ended '$ST_LAST_OUTCOME' with no reservation held — a fresh run will SPEND a slot (round budget permitting)";;
     esac
+  fi
+  if [ -z "$ST_HINT" ] && [ "$ST_SPENT_N" -gt 0 ] 2>/dev/null; then
+    ST_HINT="${ST_SPENT_N} round(s) already spent in the window for ${ST_SPENT_KEY} but no reservation, ledger row, or live lock — a run may have just started or died early; a fresh run will SPEND a slot"
   fi
   [ -n "$ST_HINT" ] || ST_HINT="no engine state found for this query — a fresh run will SPEND a slot"
 
@@ -241,9 +269,9 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
   if [ -s "$ST_TMP/rounds.jsonl" ] || [ -s "$ST_TMP/rounds.tsv" ]; then
     echo "round budget (rolling window $(( ST_WIN / 3600 ))h, cap $ST_CAP):"
     if pg_have jq && [ -s "$ST_TMP/rounds.jsonl" ]; then
-      jq -r '"  " + .key + ": \(.spent) spent, \(.remaining) remaining"' "$ST_TMP/rounds.jsonl"
+      jq -r '"  " + .key + ": \(.spent) spent, \(.remaining) remaining" + (if .in_flight then "  [REVIEW RUNNING NOW]" else "" end)' "$ST_TMP/rounds.jsonl"
     else
-      awk -F'\t' '{printf "  %s: %s spent, %s remaining (cap %s)\n", $1, $2, $4, $3}' "$ST_TMP/rounds.tsv" 2>/dev/null
+      awk -F'\t' '{printf "  %s: %s spent, %s remaining (cap %s)%s\n", $1, $2, $4, $3, ($5 == 1 ? "  [REVIEW RUNNING NOW]" : "")}' "$ST_TMP/rounds.tsv" 2>/dev/null
     fi
   else
     echo "round budget: nothing spent in the current window for this query"
