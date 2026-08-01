@@ -816,6 +816,28 @@ printf '{"ts":"2026-01-03T00:00:00+0000","pr":"42","repo":"/tmp/other","exit":0,
 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status "https://github.com/acme/widgets/pull/42" --json >"$TDIR/st8.json" 2>/dev/null
 check 'URL --status excludes foreign-repo rows' "$(jq -e '[.recent_runs[].out] | inside(["/tmp/pg-st-42.md"])' "$TDIR/st8.json" >/dev/null 2>&1; echo $?)" "$(jq -c .recent_runs "$TDIR/st8.json")"
 check 'URL --status still finds its own repo' "$([ "$(jq -r '.recent_runs | length' "$TDIR/st8.json")" = 1 ]; echo $?)" "$(jq -c .recent_runs "$TDIR/st8.json")"
+# Round keys are not prefix-free (gate #53 r2 P1): a row whose key merely EXTENDS the queried
+# slug-num (acme-widgets-42-tools-7) must not match a URL query for acme/widgets#42.
+printf '{"ts":"2026-01-04T00:00:00+0000","pr":"7","repo":"/tmp/tools","exit":0,"outcome":"clean","secs":40,"attempts":0,"conc":1,"ceiling":1,"live":0,"salvaged":0,"diff_lines":3,"out":"/tmp/PREFIX-COLLIDE.md","model":"m","marker":"pg-run-acme-widgets-42-tools-7-1700000010-99","round_key":"acme-widgets-42-tools-7"}\n' >> "$SHOME/ledger.jsonl"
+PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status "https://github.com/acme/widgets/pull/42" --json >"$TDIR/st9.json" 2>/dev/null
+check 'URL --status rejects prefix-colliding keys' "$(jq -e '[.recent_runs[].out] | inside(["/tmp/pg-st-42.md"])' "$TDIR/st9.json" >/dev/null 2>&1; echo $?)" "$(jq -c .recent_runs "$TDIR/st9.json")"
+# First-ever run waiting for the account slot (gate #53 r2 P1): per-change lock held, but no
+# rounds/ or active/ file yet — --status must still see it, not report "no state".
+( exec 9>>"$SHOME/oracle.lock.pr-fresh-repo-90"; flock 9; sleep 4 ) &
+LOCK_BG2=$!; sleep 0.5
+PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 90 >"$TDIR/st10.out" 2>/dev/null; RC=$?
+check '--status sees a first-run lock with no rounds file' "$([ "$RC" -eq 0 ] && grep -q 'RUNNING' "$TDIR/st10.out"; echo $?)" "rc=$RC $(cat "$TDIR/st10.out")"
+wait "$LOCK_BG2" 2>/dev/null; rm -f "$SHOME/oracle.lock.pr-fresh-repo-90"
+# Native-mode dead wrapper (gate #53 r2 P1): no harvest loop — manual recovery guidance.
+# (No reservation in this fixture: native runs never create one, and a present reservation
+# would legitimately outrank the active record in the hint cascade.)
+rm -f "$SHOME/in-progress/$SMARKER"
+mkdir -p "$SHOME/active"
+printf '%s\t/tmp/pg-native-42.md\t99999999\t%s\tnative\n' "$SMARKER" "$(date +%s)" > "$SHOME/active/acme-widgets-42"
+PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 >"$TDIR/st11.out" 2>/dev/null
+check 'native dead wrapper avoids the harvest loop' "$(grep -q 'no harvest path' "$TDIR/st11.out" && ! grep -q -- "--harvest '$SMARKER'" "$TDIR/st11.out"; echo $?)" "$(tail -2 "$TDIR/st11.out")"
+rm -rf "$SHOME/active"
+printf '42\t/tmp/pg-st-42.md\t%s\t0\t1\tGPT-X\n' "$(date +%s)" > "$SHOME/in-progress/$SMARKER"
 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status not.a.query >/dev/null 2>&1; RC=$?
 check '--status rejects a malformed query (exit 2)' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC"
 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --json >/dev/null 2>&1; RC=$?
