@@ -32,11 +32,14 @@ while [ $# -gt 0 ]; do
 done
 case "$PR_FILTER" in *[!0-9]*) echo "pro-gate-stats: --pr takes a bare PR number" >&2; exit 2;; esac
 
-# One filter expression shared by every view below; conditions AND together.
+# One filter expression shared by every view below; conditions AND together. The --pr match
+# covers both row shapes: fresh runs ledger .pr as the bare number, while harvest rows carry
+# the stripped repo-scoped key (e.g. "owner-repo-42") in .pr (and, ≥v0.27, .round_key) — a
+# bare-number filter must not silently drop a PR's harvested completion (gate #53 P2).
 pg_stats_filter() {
   local cond=""
   [ -n "$SINCE" ] && cond=".ts >= \"$SINCE\""
-  [ -n "$PR_FILTER" ] && cond="${cond:+$cond and }.pr == \"$PR_FILTER\""
+  [ -n "$PR_FILTER" ] && cond="${cond:+$cond and }((.pr == \"$PR_FILTER\") or ((.round_key // .pr) | endswith(\"-$PR_FILTER\")))"
   if [ -n "$cond" ]; then printf 'select(%s)' "$cond"; else printf '.'; fi
 }
 

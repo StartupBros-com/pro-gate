@@ -96,7 +96,7 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
   ST_WIN="$(pg_round_window_secs)"
   ST_NOW="$(date +%s)"
   ST_LOCKFILE="${PRO_GATE_LOCKFILE:-$PRO_GATE_HOME/oracle.lock}"
-  ST_INFLIGHT_KEY=""; ST_SPENT_KEY=""; ST_SPENT_N=0
+  ST_INFLIGHT_KEY=""; ST_SPENT_KEY=""; ST_SPENT_N=0; ST_ACTIVE_HINT=""
 
   # Non-blocking in-flight probe (same technique as round_capped's): a held per-change lock
   # means a same-change review is RUNNING right now — the one state with no reservation and no
@@ -194,10 +194,24 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
       rem=$(( ST_CAP - spent )); [ "$rem" -lt 0 ] && rem=0
       if [ "$spent" -gt 0 ] 2>/dev/null; then ST_SPENT_KEY="$k"; ST_SPENT_N="$spent"; fi
       k_live=0; st_inflight "$k" && { k_live=1; ST_INFLIGHT_KEY="$k"; }
+      # Active-run index: sees a live run before any reservation/ledger row exists, AND the
+      # wrapper-died-mid-generation case (which releases the flock, so st_inflight misses it).
+      a_marker=""; a_out=""; a_pid=""; a_epoch=""; a_alive=""
+      if [ -f "$PRO_GATE_HOME/active/$k" ]; then
+        IFS=$'\t' read -r a_marker a_out a_pid a_epoch < "$PRO_GATE_HOME/active/$k" 2>/dev/null || true
+        case "$a_pid" in ''|*[!0-9]*) a_alive=0;; *) if kill -0 "$a_pid" 2>/dev/null; then a_alive=1; else a_alive=0; fi;; esac
+        if [ "$a_alive" = 1 ]; then
+          k_live=1; ST_INFLIGHT_KEY="$k"
+          [ -n "$ST_ACTIVE_HINT" ] || ST_ACTIVE_HINT="a same-change review is RUNNING right now (pid ${a_pid}): poll ${a_out}.status — do NOT launch another"
+        elif [ -n "$a_marker" ]; then
+          [ -n "$ST_ACTIVE_HINT" ] || ST_ACTIVE_HINT="the last run's wrapper DIED but the browser may still be generating — recover by marker, never a fresh run: $ST_ENGINE --harvest '$a_marker' --out '${a_out:-${TMPDIR:-/tmp}/pro-gate-recovered.md}' --timeout 20m"
+        fi
+      fi
       if pg_have jq; then
         jq -nc --arg key "$k" --argjson spent "$spent" --argjson cap "$ST_CAP" \
           --argjson remaining "$rem" --argjson window_secs "$ST_WIN" --argjson in_flight "$k_live" \
-          '{key:$key,spent:$spent,cap:$cap,remaining:$remaining,window_secs:$window_secs,in_flight:($in_flight == 1)}' \
+          --arg amarker "$a_marker" --arg aout "$a_out" --arg aalive "$a_alive" \
+          '{key:$key,spent:$spent,cap:$cap,remaining:$remaining,window_secs:$window_secs,in_flight:($in_flight == 1),active:(if $amarker == "" and $aout == "" then null else {marker:$amarker,out:$aout,wrapper_alive:($aalive == "1")} end)}' \
           >> "$ST_TMP/rounds.jsonl" 2>/dev/null
       else
         printf '%s\t%s\t%s\t%s\t%s\n' "$k" "$spent" "$ST_CAP" "$rem" "$k_live" >> "$ST_TMP/rounds.tsv"
@@ -206,20 +220,31 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
   fi
 
   # 3) Ledger: recent finished runs for the query (newest first). Rows from engines <v0.27
-  # carry no marker/round_key fields; treat them as empty rather than skipping the row.
+  # carry no marker/round_key fields; treat them as empty rather than skipping the row. A URL
+  # query pins the repo slug: PR numbers repeat across repositories, and a newer FOREIGN row
+  # must never drive next_step or point at another repo's output (gate #53 P1) — legacy rows
+  # with no scoping identity are excluded under a slugged query rather than guessed at. The
+  # bare-number query also matches round_key suffixes, which is what harvest rows record.
   if [ -s "$ST_LEDGER" ] && pg_have jq; then
-    tail -n 400 "$ST_LEDGER" | jq -c --arg num "$Q_NUM" --arg marker "$Q_MARKER" '
+    tail -n 400 "$ST_LEDGER" | jq -c --arg num "$Q_NUM" --arg slug "$Q_SLUG" --arg marker "$Q_MARKER" '
       select(
-        (($marker != "") and ((.marker // "") == $marker)) or
-        (($marker == "") and ($num != "") and ((.pr == $num) or (((.marker // "") | contains("-\($num)-"))))) or
-        (($marker == "") and ($num == ""))
+        if $marker != "" then (.marker // "") == $marker
+        elif $num == "" then true
+        elif $slug != "" then
+          ((.round_key // "") == ($slug + "-" + $num)) or
+          ((.marker // "") | startswith("pg-run-" + $slug + "-" + $num + "-"))
+        else
+          (.pr == $num) or ((.marker // "") | contains("-" + $num + "-")) or
+          ((.round_key // "") | endswith("-" + $num))
+        end
       )' 2>/dev/null | tail -n 8 \
       | awk '{a[NR]=$0} END{for(i=NR;i>=1;i--) print a[i]}' >> "$ST_TMP/ledger.jsonl" || true
   fi
 
-  # Hint priority after reservations: a run holding the per-change lock RIGHT NOW (no
-  # reservation, no ledger row yet — the exact window where "no state" would invite a
-  # duplicate launch), then the newest matching ledger row.
+  # Hint priority after reservations: the active-run index (live run OR dead wrapper with the
+  # browser possibly still generating), then a held per-change lock, then the newest matching
+  # ledger row — never "no state" while any of those say otherwise.
+  [ -n "$ST_HINT" ] || ST_HINT="$ST_ACTIVE_HINT"
   if [ -z "$ST_HINT" ] && [ -n "$ST_INFLIGHT_KEY" ]; then
     ST_HINT="a same-change review is RUNNING right now (per-change lock held for ${ST_INFLIGHT_KEY}): do NOT launch another — wait, then run --status again"
   fi
@@ -241,8 +266,13 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
         ST_HINT="last run ended '$ST_LAST_OUTCOME' with no reservation held — a fresh run will SPEND a slot (round budget permitting)";;
     esac
   fi
+  # Fail CLOSED when the ledger exists but cannot be read: without jq a clean row (review
+  # already on disk) is invisible here, and a fresh-run recommendation would be a blind spend.
+  if [ -z "$ST_HINT" ] && [ -s "$ST_LEDGER" ] && ! pg_have jq; then
+    ST_HINT="a ledger exists but jq is unavailable to read it — inspect $ST_LEDGER for this change BEFORE spending anything"
+  fi
   if [ -z "$ST_HINT" ] && [ "$ST_SPENT_N" -gt 0 ] 2>/dev/null; then
-    ST_HINT="${ST_SPENT_N} round(s) already spent in the window for ${ST_SPENT_KEY} but no reservation, ledger row, or live lock — a run may have just started or died early; a fresh run will SPEND a slot"
+    ST_HINT="${ST_SPENT_N} round(s) already spent in the window for ${ST_SPENT_KEY} but no reservation, active record, ledger row, or live lock — a run may have just started or died early; a fresh run will SPEND a slot"
   fi
   [ -n "$ST_HINT" ] || ST_HINT="no engine state found for this query — a fresh run will SPEND a slot"
 
@@ -351,6 +381,32 @@ EFF_CONC=0
 RESOLVED_MODEL=""
 MODEL_STATUS=""   # oracle's status= field (e.g. already-selected); gates the R6 warning
 MODEL_WARN=""     # U5: advisory downgrade marker (weak/unconfirmable model); never blocks the run
+# v0.27: active-run index — $PRO_GATE_HOME/active/<ROUND_KEY> (marker\tout\tpid\tstarted_epoch),
+# written the moment a fresh run commits to spending a slot, cleared by pg_finish. Covers the
+# window where a run is live — or its wrapper DIED while the browser kept generating — but
+# neither a reservation nor a ledger row exists yet: --status reads this instead of concluding
+# "no state" and inviting a duplicate spend (gate #53 P1; a dead wrapper also releases the
+# per-change flock, so the lock probe alone cannot see that case).
+pg_active_dir() { echo "$PRO_GATE_HOME/active"; }
+pg_active_write() {
+  [ -n "${ROUND_KEY:-}" ] || return 0
+  mkdir -p "$(pg_active_dir)" 2>/dev/null || return 0
+  printf '%s\t%s\t%s\t%s\n' "${RUN_MARKER:-}" "$OUT" "$$" "$(date +%s)" \
+    > "$(pg_active_dir)/$ROUND_KEY" 2>/dev/null || true
+}
+pg_active_clear() {  # $1 = exit code
+  local f m o p e
+  f="$(pg_active_dir)/${ROUND_KEY:-}"
+  { [ -n "${ROUND_KEY:-}" ] && [ -f "$f" ]; } || return 0
+  if [ "${HARVEST:-0}" = 1 ]; then
+    # A harvest may conclude a DEAD wrapper's run (collected: 0, or confirmed lost: 6) — then
+    # its record is stale and goes. A LIVE wrapper still owns its record and clears it itself.
+    case "$1" in 0|6) ;; *) return 0;; esac
+    IFS=$'\t' read -r m o p e < "$f" 2>/dev/null || true
+    case "$p" in ''|*[!0-9]*) ;; *) kill -0 "$p" 2>/dev/null && return 0;; esac
+  fi
+  rm -f "$f" 2>/dev/null || true
+}
 pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor, exit
   local rc="$1" outcome dur line model_label
   dur=$(( $(date +%s) - RUN_START ))
@@ -401,6 +457,7 @@ pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor,
       "$(printf '%s' "${ROUND_KEY:-}" | tr -d '"\\' | tr '\n' ' ')")"
   fi
   pg_ledger_append "$line"
+  pg_active_clear "$rc"
   # Close this run's conversation tab. We run oracle with --browser-archive=never (so probe and
   # salvage can always find the conversation by marker), which means WE own cleanup, otherwise
   # /c/ tabs accumulate and add load to the account. Best-effort, bounded, non-fatal; matched by
@@ -843,6 +900,7 @@ EFF_CONC="$(pg_ramp_level "$MAX_CONC")"
 # file's inode alive, so deleting an unheld file is always safe).
 find "$(dirname "$LOCKFILE")" -maxdepth 1 -name "$(basename "$LOCKFILE").pr-*" -mmin +1440 -delete 2>/dev/null || true
 find "${PRO_GATE_HARVEST_LOCK_DIR:-$PRO_GATE_HOME/harvest-locks}" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
+find "$(pg_active_dir)" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
 # Round-budget state (v0.22): entries self-prune on write, but a key never gated again keeps
 # its file (and its 0-byte .lock) forever. Sweep files untouched for longer than the rounds
 # window (every entry inside is expired), floored at 24h so a short window never deletes a
@@ -1126,7 +1184,9 @@ while :; do
 
   # v0.22: this invocation is now committed to spending a slot: record its round (once; the
   # guarded retry below is the same round, and pre-launch exits above never record).
-  [ "$attempt" -eq 0 ] && pg_round_record "$ROUND_KEY"
+  # v0.27: and publish the active-run record at the same moment, so --status can see a live
+  # (or wrapper-dead-but-generating) run before any reservation or ledger row exists.
+  [ "$attempt" -eq 0 ] && { pg_round_record "$ROUND_KEY"; pg_active_write; }
 
   # A non-blocking heads-up when memory is tight but not blocking (the gate is deliberately
   # conservative, so a swap-heavy box with moderate free RAM still runs). Warns low-memory users

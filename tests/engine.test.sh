@@ -796,7 +796,26 @@ check '--status live-run hint says do not launch' "$(grep -qi 'do NOT launch' "$
 wait "$LOCK_BG" 2>/dev/null
 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 >"$TDIR/st5.out" 2>/dev/null
 check '--status released lock no longer flagged live' "$(grep -q 'RUNNING' "$TDIR/st5.out"; [ $? -ne 0 ]; echo $?)" "$(cat "$TDIR/st5.out")"
+# Active-run index (gate #53 P1): a live-pid record flags RUNNING with no lock, reservation,
+# or ledger row; a dead-pid record (wrapper died, browser may still generate) leads to
+# harvest-by-marker — never a fresh-run recommendation.
+mkdir -p "$SHOME/active"
+sleep 30 & LIVE_PID=$!
+printf '%s\t/tmp/pg-live-42.md\t%s\t%s\n' "$SMARKER" "$LIVE_PID" "$(date +%s)" > "$SHOME/active/acme-widgets-42"
+PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 >"$TDIR/st6.out" 2>/dev/null
+check '--status active live pid flags RUNNING' "$(grep -q 'RUNNING' "$TDIR/st6.out"; echo $?)" "$(cat "$TDIR/st6.out")"
+kill "$LIVE_PID" 2>/dev/null; wait "$LIVE_PID" 2>/dev/null
+printf '%s\t/tmp/pg-dead-42.md\t99999999\t%s\n' "$SMARKER" "$(date +%s)" > "$SHOME/active/acme-widgets-42"
+PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 >"$TDIR/st7.out" 2>/dev/null
+check '--status dead wrapper leads to harvest, not fresh run' "$(grep -q 'wrapper DIED' "$TDIR/st7.out" && grep -q -- "--harvest '$SMARKER'" "$TDIR/st7.out"; echo $?)" "$(tail -2 "$TDIR/st7.out")"
+rm -rf "$SHOME/active"
 printf '42\t/tmp/pg-st-42.md\t%s\t0\t1\tGPT-X\n' "$(date +%s)" > "$SHOME/in-progress/$SMARKER"
+# URL queries repo-scope the ledger (gate #53 P1): a foreign repo's identical PR number must
+# not drive next_step or appear in recent runs.
+printf '{"ts":"2026-01-03T00:00:00+0000","pr":"42","repo":"/tmp/other","exit":0,"outcome":"clean","secs":50,"attempts":0,"conc":1,"ceiling":1,"live":0,"salvaged":0,"diff_lines":5,"out":"/tmp/FOREIGN-42.md","model":"m","marker":"pg-run-other-repo-42-1700000009-88","round_key":"other-repo-42"}\n' >> "$SHOME/ledger.jsonl"
+PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status "https://github.com/acme/widgets/pull/42" --json >"$TDIR/st8.json" 2>/dev/null
+check 'URL --status excludes foreign-repo rows' "$(jq -e '[.recent_runs[].out] | inside(["/tmp/pg-st-42.md"])' "$TDIR/st8.json" >/dev/null 2>&1; echo $?)" "$(jq -c .recent_runs "$TDIR/st8.json")"
+check 'URL --status still finds its own repo' "$([ "$(jq -r '.recent_runs | length' "$TDIR/st8.json")" = 1 ]; echo $?)" "$(jq -c .recent_runs "$TDIR/st8.json")"
 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status not.a.query >/dev/null 2>&1; RC=$?
 check '--status rejects a malformed query (exit 2)' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC"
 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --json >/dev/null 2>&1; RC=$?
@@ -827,6 +846,10 @@ SP_RUNS="$(PRO_GATE_HOME="$SHOME" bash "$STATS" --pr 7 --json 2>/dev/null | jq -
 check 'stats --pr --json filters runs' "$([ "$SP_RUNS" = 1 ]; echo $?)" "runs=$SP_RUNS"
 SP_TAIL="$(PRO_GATE_HOME="$SHOME" bash "$STATS" --pr 8 --tail 5 2>/dev/null | grep -c $'\t8\t')"
 check 'stats --pr filters --tail' "$([ "$SP_TAIL" = 1 ]; echo $?)" "tail matches=$SP_TAIL"
+# Harvest rows ledger the stripped repo-scoped key as .pr (gate #53 P2): --pr N must match them.
+printf '{"ts":"2026-01-03T00:00:00+0000","pr":"acme-widgets-7","outcome":"clean","secs":30,"conc":0,"salvaged":1,"round_key":"acme-widgets-7"}\n' >> "$SHOME/ledger.jsonl"
+SP_HARV="$(PRO_GATE_HOME="$SHOME" bash "$STATS" --pr 7 --json 2>/dev/null | jq -r '.runs | length')"
+check 'stats --pr matches harvest rows by round key' "$([ "$SP_HARV" = 2 ]; echo $?)" "runs=$SP_HARV"
 PRO_GATE_HOME="$SHOME" bash "$STATS" --pr not-a-number >/dev/null 2>&1; RC=$?
 check 'stats --pr rejects non-numeric (exit 2)' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC"
 
