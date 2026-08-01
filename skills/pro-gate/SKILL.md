@@ -48,7 +48,11 @@ the versioned disclosure during installation.
 **Detached vs dead sessions — different rules:**
 - **Lost track of a run entirely (compaction, a new session, a dead tab)? Inspect state
   first, then let the engine route you.** All of this works with zero prior context; use the
-  defaulted home everywhere, `PG_HOME="${PRO_GATE_HOME:-$HOME/.pro-review-daemon}"`:
+  defaulted home everywhere, `PG_HOME="${PRO_GATE_HOME:-$HOME/.pro-review-daemon}"`. Engine
+  ≥v0.27 does the whole join in one read-only command — reservations, rounds remaining,
+  recent ledger rows, and the exact next command:
+  `"$PG_HOME/oracle-review.sh" --status <pr-number|pr-url|marker>` (`--json` for machine
+  use; no locks, no browser, no spend). The underlying pieces, when you need them raw:
   `ls "$PG_HOME/in-progress/"` (filenames ARE harvest markers; each file's first
   tab-separated field is the change key — a matching entry means your review is still
   collectable for free), `"$PG_HOME/pro-gate-stats.sh" --tail 10` for recent outcomes, and
