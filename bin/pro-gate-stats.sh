@@ -6,7 +6,9 @@
 # diff_lines, out) and the ramp governor keeps its level in $PRO_GATE_HOME/ramp.state.
 # This tool answers "is raising concurrency causing trouble?" at a glance.
 #
-# Usage: pro-gate-stats.sh [--tail N] [--since ISO-DATE] [--json]
+# Usage: pro-gate-stats.sh [--tail N] [--since ISO-DATE] [--pr N] [--json]
+#   --pr N filters every view (summary, --json runs, --tail) to one PR number's rows
+#   (v0.27; pairs with oracle-review.sh --status for run rediscovery).
 set -uo pipefail
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,15 +20,25 @@ pg_load_env
 
 LEDGER="${PRO_GATE_LEDGER:-$PRO_GATE_HOME/ledger.jsonl}"
 STATE="${PRO_GATE_RAMP_STATE:-$PRO_GATE_HOME/ramp.state}"
-TAIL=0; SINCE=""; AS_JSON=0
+TAIL=0; SINCE=""; AS_JSON=0; PR_FILTER=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --tail) TAIL="$2"; shift 2;;
     --since) SINCE="$2"; shift 2;;
+    --pr) PR_FILTER="$2"; shift 2;;
     --json) AS_JSON=1; shift;;
-    *) echo "usage: pro-gate-stats.sh [--tail N] [--since ISO-DATE] [--json]" >&2; exit 2;;
+    *) echo "usage: pro-gate-stats.sh [--tail N] [--since ISO-DATE] [--pr N] [--json]" >&2; exit 2;;
   esac
 done
+case "$PR_FILTER" in *[!0-9]*) echo "pro-gate-stats: --pr takes a bare PR number" >&2; exit 2;; esac
+
+# One filter expression shared by every view below; conditions AND together.
+pg_stats_filter() {
+  local cond=""
+  [ -n "$SINCE" ] && cond=".ts >= \"$SINCE\""
+  [ -n "$PR_FILTER" ] && cond="${cond:+$cond and }.pr == \"$PR_FILTER\""
+  if [ -n "$cond" ]; then printf 'select(%s)' "$cond"; else printf '.'; fi
+}
 
 command -v jq >/dev/null 2>&1 || { echo "pro-gate-stats: jq required" >&2; exit 3; }
 
@@ -35,7 +47,7 @@ command -v jq >/dev/null 2>&1 || { echo "pro-gate-stats: jq required" >&2; exit 
 if [ "$AS_JSON" = 1 ]; then
   RL="$(awk -F'\t' 'NR==1{print $1}' "$STATE" 2>/dev/null)"; case "$RL" in ''|*[!0-9]*) RL=1;; esac
   RS="$(awk -F'\t' 'NR==1{print $2}' "$STATE" 2>/dev/null)"; case "$RS" in ''|*[!0-9]*) RS=0;; esac
-  FILTER='.'; [ -n "$SINCE" ] && FILTER="select(.ts >= \"$SINCE\")"
+  FILTER="$(pg_stats_filter)"
   if [ -s "$LEDGER" ]; then
     jq -s --argjson level "$RL" --argjson streak "$RS" \
       --argjson ceiling "${PRO_GATE_MAX_CONCURRENCY:-1}" \
@@ -61,8 +73,7 @@ if [ ! -s "$LEDGER" ]; then
   exit 0
 fi
 
-FILTER='.'
-[ -n "$SINCE" ] && FILTER="select(.ts >= \"$SINCE\")"
+FILTER="$(pg_stats_filter)"
 
 jq -s "[.[] | $FILTER] | {
   runs: length,
@@ -79,5 +90,7 @@ jq -s "[.[] | $FILTER] | {
 
 if [ "${TAIL:-0}" -gt 0 ] 2>/dev/null; then
   echo "-- last $TAIL runs --"
-  tail -n "$TAIL" "$LEDGER" | jq -r '[.ts, .pr, .outcome, "\(.secs)s", "conc=\(.conc)", (if .salvaged == 1 then "salvaged" else "" end)] | @tsv'
+  # Filter-aware (v0.27): with --pr/--since set, tail the MATCHING rows, not the raw file.
+  jq -c "$FILTER" "$LEDGER" | tail -n "$TAIL" \
+    | jq -r '[.ts, .pr, .outcome, "\(.secs)s", "conc=\(.conc)", (if .salvaged == 1 then "salvaged" else "" end)] | @tsv'
 fi

@@ -24,6 +24,12 @@
 #   oracle-review.sh --harvest <run-marker> --out <file> [--timeout <dur>]
 #       Collect a review whose run ended in-progress (exit 9): the Pro slot was spent but the
 #       model was still generating when the salvage budget ran out. No new slot is spent.
+#   oracle-review.sh --status [<pr-number|pr-url|pg-run-marker>] [--json]
+#       Read-only run rediscovery (v0.27): join reservations, round budget, remembered
+#       conversation URLs, and the ledger, and print each matching run's state plus the exact
+#       next command. For callers that lost their context (compaction, new session): answers
+#       "what runs exist for this change, what do I harvest, how many rounds remain" from
+#       nothing but a PR number. No locks, no browser, no writes; omit the query for all state.
 set -uo pipefail
 
 # --- locate + source the shared lib (works from repo and from deployed location) ---
@@ -38,6 +44,7 @@ pg_load_env
 OS="$(pg_os)"; MODE="$(pg_browser_mode)"
 
 PR=""; REPO=""; DIFF_FILE=""; INPUT="both"; OUT=""; TIMEOUT="30m"; EXTRA_GLOB=""; HARVEST_MARKER=""; HARVEST_REQUESTED=0; CONFIRM_FILE=""
+STATUS_REQUESTED=0; STATUS_QUERY=""; AS_JSON=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --pr) PR="$2"; shift 2;;
@@ -49,9 +56,17 @@ while [ $# -gt 0 ]; do
     --extra-files) EXTRA_GLOB="$2"; shift 2;;
     --confirm) CONFIRM_FILE="$2"; shift 2;;
     --harvest) HARVEST_REQUESTED=1; HARVEST_MARKER="${2:-}"; shift 2;;
+    # --status takes an OPTIONAL query (a following --flag or nothing means "all state").
+    --status) STATUS_REQUESTED=1
+      case "${2:-}" in ''|--*) shift 1;; *) STATUS_QUERY="$2"; shift 2;; esac;;
+    --json) AS_JSON=1; shift;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
+if [ "$AS_JSON" = 1 ] && [ "$STATUS_REQUESTED" != 1 ]; then
+  echo "ERROR: --json is only meaningful with --status" >&2
+  exit 2
+fi
 if [ "$HARVEST_REQUESTED" = 1 ] && [ -z "$HARVEST_MARKER" ]; then
   echo "ERROR: --harvest requires a non-empty run marker" >&2
   exit 2
@@ -59,6 +74,190 @@ fi
 if [ -n "$CONFIRM_FILE" ] && [ ! -s "$CONFIRM_FILE" ]; then
   echo "ERROR: --confirm file not found or empty: $CONFIRM_FILE" >&2
   exit 2
+fi
+
+# --- v0.27: --status — read-only run rediscovery (issue #47) ---
+# Joins the state the engine already keeps (in-progress/ reservations, rounds/<key> budget,
+# conversation-urls/ memos, ledger.jsonl) so a caller with NOTHING but a PR number can answer:
+# what runs exist for this change, what state are they in, where is the output, what marker do
+# I harvest, and how many budget rounds remain. Pure inspection — no locks, no status file, no
+# browser, no writes — safe any time, including while a run is live. Exit 0 even when nothing
+# is found (absence is an answer); 2 on usage errors.
+if [ "$STATUS_REQUESTED" = 1 ]; then
+  if [ "$AS_JSON" = 1 ] && ! pg_have jq; then
+    echo "ERROR: --status --json requires jq" >&2; exit 2
+  fi
+  ST_RES_DIR="$(pg_reservation_dir)"
+  ST_ROUNDS_DIR="$(pg_rounds_dir)"
+  ST_LEDGER="${PRO_GATE_LEDGER:-$PRO_GATE_HOME/ledger.jsonl}"
+  ST_URLS_DIR="$PRO_GATE_HOME/conversation-urls"
+  ST_ENGINE="$PRO_GATE_HOME/oracle-review.sh"
+  ST_CAP="${PRO_GATE_MAX_ROUNDS_PER_PR:-4}"; case "$ST_CAP" in ''|*[!0-9]*) ST_CAP=4;; esac
+  ST_WIN="$(pg_round_window_secs)"
+  ST_NOW="$(date +%s)"
+
+  # Normalize the query: marker, PR URL (repo-scoped slug + number), bare number, or all.
+  Q_NUM=""; Q_SLUG=""; Q_MARKER=""
+  case "$STATUS_QUERY" in
+    '') ;;
+    pg-run-*)
+      pg_reservation_marker_ok "$STATUS_QUERY" \
+        || { echo "ERROR: invalid marker syntax: $STATUS_QUERY" >&2; exit 2; }
+      Q_MARKER="$STATUS_QUERY";;
+    http*://*/pull/*)
+      Q_NUM="${STATUS_QUERY##*/}"; Q_NUM="${Q_NUM%%[!0-9]*}"
+      Q_SLUG="$(printf '%s' "$STATUS_QUERY" \
+        | sed -nE 's#https?://[^/]+/([^/]+)/([^/]+)/pull/.*#\1-\2#p' | tr -c 'A-Za-z0-9.\n-' '-')"
+      [ -n "$Q_NUM" ] || { echo "ERROR: could not parse a PR number from: $STATUS_QUERY" >&2; exit 2; };;
+    *[!0-9]*)
+      echo "ERROR: --status takes a PR number, a PR URL, or a pg-run-... marker (omit for all)" >&2
+      exit 2;;
+    *) Q_NUM="$STATUS_QUERY";;
+  esac
+
+  # A reservation/ledger row matches on: exact marker; recorded pr == number; or the
+  # repo-scoped key embedded in the marker (…<slug>-<num>-<epoch>-<pid>). A bare number shows
+  # every repo's match (keys are repo-scoped precisely so numbers can collide — display the
+  # marker so the caller can tell them apart); a URL query pins the slug too.
+  st_match() {  # $1 marker, $2 recorded pr field ('' when unknown)
+    [ -n "$Q_MARKER" ] && { [ "$1" = "$Q_MARKER" ]; return; }
+    [ -n "$Q_NUM" ] || return 0
+    [ "${2:-}" = "$Q_NUM" ] && { [ -z "$Q_SLUG" ] && return 0; case "$1" in *"${Q_SLUG}-${Q_NUM}-"*|'') return 0;; *) return 1;; esac; }
+    case "$1" in
+      *"-${Q_NUM}-"*) [ -z "$Q_SLUG" ] && return 0; case "$1" in *"${Q_SLUG}-${Q_NUM}-"*) return 0;; *) return 1;; esac;;
+      *) return 1;;
+    esac
+  }
+
+  ST_TMP="$(mktemp -d "${TMPDIR:-/tmp}/pg-status.XXXXXX")"
+  trap 'rm -rf "$ST_TMP"' EXIT
+  : > "$ST_TMP/res.jsonl"; : > "$ST_TMP/rounds.jsonl"; : > "$ST_TMP/ledger.jsonl"
+  ST_HINT=""
+
+  # 1) Reservations: in-progress runs whose review is collectable for FREE.
+  if [ -d "$ST_RES_DIR" ]; then
+    for f in "$ST_RES_DIR"/pg-run-*; do
+      [ -f "$f" ] || continue
+      m="$(basename "$f")"
+      r_pr=""; r_out=""; r_created=""; r_miss=""; r_slot=""; r_model=""
+      IFS=$'\t' read -r r_pr r_out r_created r_miss r_slot r_model < "$f" 2>/dev/null || true
+      st_match "$m" "$r_pr" || continue
+      case "$r_created" in ''|*[!0-9]*) r_age="";; *) r_age=$(( ST_NOW - r_created ));; esac
+      r_url=""; [ -f "$ST_URLS_DIR/$m" ] && r_url="$(head -c 300 "$ST_URLS_DIR/$m" 2>/dev/null | tr -d '\n')"
+      [ -n "$r_out" ] || r_out="${TMPDIR:-/tmp}/pro-gate-${r_pr:-review}.md"
+      r_cmd="$ST_ENGINE --harvest '$m' --out '$r_out' --timeout 20m"
+      [ -n "$ST_HINT" ] || ST_HINT="in-progress reservation found — collect it for FREE: $r_cmd"
+      if pg_have jq; then
+        jq -nc --arg marker "$m" --arg pr "${r_pr:-}" --arg out "$r_out" \
+          --arg age "${r_age:-}" --arg miss "${r_miss:-}" --arg model "${r_model:-}" \
+          --arg url "$r_url" --arg harvest_cmd "$r_cmd" \
+          '{marker:$marker,pr:$pr,out:$out,age_secs:(($age|tonumber?)//null),miss_streak:(($miss|tonumber?)//null),model:$model,conversation_url:$url,harvest_cmd:$harvest_cmd}' \
+          >> "$ST_TMP/res.jsonl" 2>/dev/null
+      else
+        printf '%s\t%s\t%s\t%s\t%s\n' "$m" "${r_pr:-?}" "${r_age:-?}" "${r_miss:-?}" "$r_cmd" >> "$ST_TMP/res.tsv"
+      fi
+    done
+  fi
+
+  # 2) Round budget: spent vs remaining per key inside the rolling window.
+  if [ -d "$ST_ROUNDS_DIR" ]; then
+    for f in "$ST_ROUNDS_DIR"/*; do
+      [ -f "$f" ] || continue
+      case "$f" in *.last) continue;; esac
+      k="$(basename "$f")"
+      if [ -n "$Q_MARKER" ]; then
+        km="${Q_MARKER#pg-run-}"; km="${km%-*-*}"   # same best-effort strip the harvest path uses
+        [ "$k" = "$km" ] || continue
+      elif [ -n "$Q_NUM" ]; then
+        case "$k" in "${Q_SLUG:+${Q_SLUG}-}${Q_NUM}"|*"-${Q_NUM}") [ -z "$Q_SLUG" ] || [ "$k" = "${Q_SLUG}-${Q_NUM}" ] || continue;; *) continue;; esac
+      fi
+      spent="$(pg_round_count "$k")"
+      [ "$spent" -gt 0 ] 2>/dev/null || [ -n "$Q_NUM$Q_MARKER" ] || continue   # 'all' skips idle keys
+      rem=$(( ST_CAP - spent )); [ "$rem" -lt 0 ] && rem=0
+      if pg_have jq; then
+        jq -nc --arg key "$k" --argjson spent "$spent" --argjson cap "$ST_CAP" \
+          --argjson remaining "$rem" --argjson window_secs "$ST_WIN" \
+          '{key:$key,spent:$spent,cap:$cap,remaining:$remaining,window_secs:$window_secs}' \
+          >> "$ST_TMP/rounds.jsonl" 2>/dev/null
+      else
+        printf '%s\t%s\t%s\t%s\n' "$k" "$spent" "$ST_CAP" "$rem" >> "$ST_TMP/rounds.tsv"
+      fi
+    done
+  fi
+
+  # 3) Ledger: recent finished runs for the query (newest first). Rows from engines <v0.27
+  # carry no marker/round_key fields; treat them as empty rather than skipping the row.
+  if [ -s "$ST_LEDGER" ] && pg_have jq; then
+    tail -n 400 "$ST_LEDGER" | jq -c --arg num "$Q_NUM" --arg marker "$Q_MARKER" '
+      select(
+        (($marker != "") and ((.marker // "") == $marker)) or
+        (($marker == "") and ($num != "") and ((.pr == $num) or (((.marker // "") | contains("-\($num)-"))))) or
+        (($marker == "") and ($num == ""))
+      )' 2>/dev/null | tail -n 8 \
+      | awk '{a[NR]=$0} END{for(i=NR;i>=1;i--) print a[i]}' >> "$ST_TMP/ledger.jsonl" || true
+  fi
+
+  # Hint fallback when nothing is in-progress: newest matching ledger row decides.
+  if [ -z "$ST_HINT" ] && [ -s "$ST_TMP/ledger.jsonl" ] && pg_have jq; then
+    ST_LAST_OUTCOME="$(head -n1 "$ST_TMP/ledger.jsonl" | jq -r '.outcome // ""')"
+    ST_LAST_OUT="$(head -n1 "$ST_TMP/ledger.jsonl" | jq -r '.out // ""')"
+    ST_LAST_MARKER="$(head -n1 "$ST_TMP/ledger.jsonl" | jq -r '.marker // ""')"
+    case "$ST_LAST_OUTCOME" in
+      in-progress)
+        if [ -n "$ST_LAST_MARKER" ]; then
+          ST_HINT="last run is in-progress — harvest it for FREE: $ST_ENGINE --harvest '$ST_LAST_MARKER' --out '$ST_LAST_OUT' --timeout 20m"
+        else
+          ST_HINT="last run is in-progress but predates v0.27 (no marker in ledger): read the run's <out>.status for .marker, or re-run the identical --pr command and let the engine redirect"
+        fi;;
+      clean)
+        ST_HINT="last run completed clean — the review is already on disk: $ST_LAST_OUT (spend nothing)";;
+      '') ;;
+      *)
+        ST_HINT="last run ended '$ST_LAST_OUTCOME' with no reservation held — a fresh run will SPEND a slot (round budget permitting)";;
+    esac
+  fi
+  [ -n "$ST_HINT" ] || ST_HINT="no engine state found for this query — a fresh run will SPEND a slot"
+
+  if [ "$AS_JSON" = 1 ]; then
+    jq -n --arg query "${STATUS_QUERY:-all}" --arg home "$PRO_GATE_HOME" --arg hint "$ST_HINT" \
+      --slurpfile res <(cat "$ST_TMP/res.jsonl" 2>/dev/null; echo null) \
+      --slurpfile rounds <(cat "$ST_TMP/rounds.jsonl" 2>/dev/null; echo null) \
+      --slurpfile ledger <(cat "$ST_TMP/ledger.jsonl" 2>/dev/null; echo null) \
+      '{query:$query,home:$home,reservations:($res[:-1]),rounds:($rounds[:-1]),recent_runs:($ledger[:-1]),next_step:$hint}'
+    exit 0
+  fi
+
+  echo "[pro-gate status] query: ${STATUS_QUERY:-all}   home: $PRO_GATE_HOME"
+  if [ -s "$ST_TMP/res.jsonl" ] || [ -s "$ST_TMP/res.tsv" ]; then
+    echo "in-progress reservations (harvest these for FREE — never re-run):"
+    if pg_have jq && [ -s "$ST_TMP/res.jsonl" ]; then
+      jq -r '"  " + .marker + "  pr=" + .pr + (if .age_secs then "  age=\(.age_secs / 60 | floor)m" else "" end) + (if .conversation_url != "" then "  url=remembered" else "" end) + "\n    harvest: " + .harvest_cmd' "$ST_TMP/res.jsonl"
+    else
+      awk -F'\t' '{printf "  %s  pr=%s  age=%ss  miss=%s\n    harvest: %s\n", $1, $2, $3, $4, $5}' "$ST_TMP/res.tsv" 2>/dev/null
+    fi
+  else
+    echo "in-progress reservations: none"
+  fi
+  if [ -s "$ST_TMP/rounds.jsonl" ] || [ -s "$ST_TMP/rounds.tsv" ]; then
+    echo "round budget (rolling window $(( ST_WIN / 3600 ))h, cap $ST_CAP):"
+    if pg_have jq && [ -s "$ST_TMP/rounds.jsonl" ]; then
+      jq -r '"  " + .key + ": \(.spent) spent, \(.remaining) remaining"' "$ST_TMP/rounds.jsonl"
+    else
+      awk -F'\t' '{printf "  %s: %s spent, %s remaining (cap %s)\n", $1, $2, $4, $3}' "$ST_TMP/rounds.tsv" 2>/dev/null
+    fi
+  else
+    echo "round budget: nothing spent in the current window for this query"
+  fi
+  if [ -s "$ST_TMP/ledger.jsonl" ]; then
+    echo "recent runs (newest first):"
+    jq -r '"  " + .ts + "  exit=\(.exit) " + .outcome + "  \(.secs)s  out=" + .out' "$ST_TMP/ledger.jsonl"
+  elif ! pg_have jq; then
+    echo "recent runs: (jq not installed — read $ST_LEDGER directly)"
+  else
+    echo "recent runs: none matching"
+  fi
+  echo "next step: $ST_HINT"
+  exit 0
 fi
 
 PORT="${ORACLE_BROWSER_PORT:-9222}"
@@ -130,6 +329,8 @@ pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor,
   model_label="$(pg_model_label "${RESOLVED_MODEL:-}")"   # resolved model or role-based fallback
   case "$rc" in
     0) outcome=clean ;;
+    4) outcome=bad-repo ;;
+    5) outcome=diff-fetch-failed ;;
     6) outcome=failed ;;
     7) outcome=lock-timeout ;;
     8) outcome=deferred ;;
@@ -151,6 +352,9 @@ pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor,
       cloudflare)            pg_ramp_update throttle "${MAX_CONC:-1}" ;;
     esac
   fi
+  # v0.27: `marker` and `round_key` land in every ledger line so --status (and any caller with
+  # only the ledger) can reconstruct a harvest command without the original status file. Rows
+  # from failures before identity derivation (exit 4/5) carry them empty — present, not absent.
   if pg_have jq; then
     line="$(jq -nc --arg ts "$(date +%Y-%m-%dT%H:%M:%S%z)" --arg pr "${PR_NUM:-diff}" \
       --arg repo "${REPO:-}" --argjson exit "$rc" --arg outcome "$outcome" \
@@ -158,12 +362,15 @@ pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor,
       --argjson conc "${EFF_CONC:-0}" --argjson ceiling "${MAX_CONC:-1}" \
       --argjson live "${LIVE_CONVERSATION:-0}" --argjson salvaged "${SALVAGED:-0}" \
       --argjson diff_lines "${DIFF_LINES:-0}" --arg out "$OUT" --arg model "$model_label" \
-      '{ts:$ts,pr:$pr,repo:$repo,exit:$exit,outcome:$outcome,secs:$secs,attempts:$attempts,conc:$conc,ceiling:$ceiling,live:$live,salvaged:$salvaged,diff_lines:$diff_lines,out:$out,model:$model}' 2>/dev/null)"
+      --arg marker "${RUN_MARKER:-}" --arg round_key "${ROUND_KEY:-}" \
+      '{ts:$ts,pr:$pr,repo:$repo,exit:$exit,outcome:$outcome,secs:$secs,attempts:$attempts,conc:$conc,ceiling:$ceiling,live:$live,salvaged:$salvaged,diff_lines:$diff_lines,out:$out,model:$model,marker:$marker,round_key:$round_key}' 2>/dev/null)"
   else
-    line="$(printf '{"ts":"%s","pr":"%s","exit":%d,"outcome":"%s","secs":%d,"attempts":%d,"conc":%d,"ceiling":%d,"live":%d,"salvaged":%d,"model":"%s"}' \
+    line="$(printf '{"ts":"%s","pr":"%s","exit":%d,"outcome":"%s","secs":%d,"attempts":%d,"conc":%d,"ceiling":%d,"live":%d,"salvaged":%d,"model":"%s","marker":"%s","round_key":"%s"}' \
       "$(date +%Y-%m-%dT%H:%M:%S%z)" "${PR_NUM:-diff}" "$rc" "$outcome" "$dur" "${attempt:-0}" \
       "${EFF_CONC:-0}" "${MAX_CONC:-1}" "${LIVE_CONVERSATION:-0}" "${SALVAGED:-0}" \
-      "$(printf '%s' "$model_label" | tr -d '"\\' | tr '\n' ' ')")"
+      "$(printf '%s' "$model_label" | tr -d '"\\' | tr '\n' ' ')" \
+      "$(printf '%s' "${RUN_MARKER:-}" | tr -d '"\\' | tr '\n' ' ')" \
+      "$(printf '%s' "${ROUND_KEY:-}" | tr -d '"\\' | tr '\n' ' ')")"
   fi
   pg_ledger_append "$line"
   # Close this run's conversation tab. We run oracle with --browser-archive=never (so probe and
@@ -240,6 +447,9 @@ if [ -n "$HARVEST_MARKER" ]; then
   # the key may itself contain dashes, so strip the two trailing numeric segments instead)
   PR_NUM="${HARVEST_MARKER#pg-run-}"
   PR_NUM="${PR_NUM%-*-*}"
+  # v0.27: record the stripped key as round_key in this harvest's ledger line too (best-effort,
+  # same heuristic as HARVEST_KEY below) so --status can join harvest rows to their change.
+  ROUND_KEY="$PR_NUM"
   command -v node >/dev/null 2>&1 || { echo "ERROR: --harvest needs node for CDP salvage" >&2; pg_status failed "node missing"; pg_finish 3; }
   # Serialize the entire marker harvest. Without this, two collectors can share $OUT.cdp,
   # both read the same completed tab, and one closes it underneath the other (exit 6 + false
@@ -349,7 +559,7 @@ if [ -n "$PR" ]; then
   fi
 fi
 [ -n "$REPO" ] || REPO="$(pwd)"
-cd "$REPO" || { echo "ERROR: repo dir not found: $REPO" >&2; pg_status failed "repo dir not found"; exit 4; }
+cd "$REPO" || { echo "ERROR: repo dir not found: $REPO" >&2; pg_status failed "repo dir not found"; pg_finish 4; }
 [ -n "$PR_URL" ] || PR_URL="$(gh pr view "$PR_NUM" --json url -q .url 2>/dev/null || echo "")"
 
 # PR_KEY: repo-scoped identity for locks, reservations, and markers. PR numbers repeat across
@@ -396,7 +606,7 @@ fi
 if [ -z "$DIFF_FILE" ]; then
   DIFF_FILE="$WORK/pr.diff"
   gh pr diff "$PR_NUM" --patch > "$DIFF_FILE" 2>"$WORK/diff.err" || {
-    echo "ERROR: gh pr diff $PR_NUM failed in $REPO: $(cat "$WORK/diff.err")" >&2; pg_status failed "gh pr diff failed"; exit 5; }
+    echo "ERROR: gh pr diff $PR_NUM failed in $REPO: $(cat "$WORK/diff.err")" >&2; pg_status failed "gh pr diff failed"; pg_finish 5; }
 fi
 
 # --- diff hygiene: drop lockfiles/generated/vendored from the review payload so the Pro model

@@ -33,8 +33,11 @@ this file hardcodes.
   throttle cooldown). Do NOT relaunch a run that was interrupted, do NOT manually reattach
   (`oracle session … --harvest` can bind a stale tab target), and never start a second run for
   the same PR while yours is in flight — read the status file instead. If you have LOST the
-  status file or marker entirely, inspect
-  `"${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/in-progress/"` first: when a reservation for
+  status file or marker entirely, run
+  `"${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --status <pr>` (engine
+  ≥v0.27: read-only join of reservations, round budget, and ledger; prints the exact next
+  command) or inspect
+  `"${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/in-progress/"` directly: when a reservation for
   the change EXISTS (remote-chrome mode only), harvest it DIRECTLY — the filename is the
   marker (`--harvest '<filename>'`, free, repeatable). Do not lean on the engine's fresh-run
   redirect for recovery: reconciliation can expire a stale reservation before the lookup and
