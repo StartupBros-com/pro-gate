@@ -852,14 +852,39 @@ LLINE="$(tail -n 1 "$TDIR/home/ledger.jsonl" 2>/dev/null)"
 check 'exit 4 writes a ledger line (outcome bad-repo)' "$([ "$(printf '%s' "$LLINE" | jq -r .outcome 2>/dev/null)" = bad-repo ]; echo $?)" "$LLINE"
 check 'ledger lines carry marker+round_key fields' "$(printf '%s' "$LLINE" | jq -e 'has("marker") and has("round_key")' >/dev/null 2>&1; echo $?)" "$LLINE"
 if command -v gh >/dev/null 2>&1; then
+  # Seed a dead predecessor's active record for the same change: a non-owning invocation that
+  # exits BEFORE pg_active_write (diff-fetch failure here) must NOT erase it (gate #53 r3 P1).
+  RKEY_66="$(git -C "$TDIR" rev-parse --git-dir >/dev/null 2>&1; printf '%s-66' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
+  mkdir -p "$TDIR/home/active"
+  printf 'pg-run-%s-1700000020-11\t/tmp/pg-pred-66.md\t99999999\t%s\tremote-chrome\n' "$RKEY_66" "$(date +%s)" > "$TDIR/home/active/$RKEY_66"
   run_engine --pr 66 --repo "$TDIR" --out "$TDIR/o-nodiff.md" --timeout 5s
   check 'diff fetch failure exits 5' "$([ "$RC" -eq 5 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
   LLINE="$(tail -n 1 "$TDIR/home/ledger.jsonl" 2>/dev/null)"
   check 'exit 5 ledger outcome diff-fetch-failed' "$([ "$(printf '%s' "$LLINE" | jq -r .outcome 2>/dev/null)" = diff-fetch-failed ]; echo $?)" "$LLINE"
   check 'exit 5 ledger carries a round_key' "$([ -n "$(printf '%s' "$LLINE" | jq -r '.round_key // ""' 2>/dev/null)" ]; echo $?)" "$LLINE"
+  check 'non-owning exit preserves predecessor active record' "$([ -f "$TDIR/home/active/$RKEY_66" ]; echo $?)" 'record erased by a run that never wrote it'
+  rm -rf "$TDIR/home/active"
 else
   echo 'ok - exit-5 ledger case skipped (gh not installed)'
 fi
+# Reservation matching is key-exact (gate #53 r3 P1): a prefix-colliding foreign reservation
+# (acme-widgets-42-tools-7 vs acme/widgets#42) must not surface for the URL query — reservations
+# outrank every other status source, so a substring leak would emit a foreign harvest command.
+FMARKER="pg-run-acme-widgets-42-tools-7-1700000021-33"
+printf '7\t/tmp/FOREIGN-RES.md\t%s\t0\t1\tGPT-X\n' "$(date +%s)" > "$SHOME/in-progress/$FMARKER"
+PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status "https://github.com/acme/widgets/pull/42" --json >"$TDIR/st12.json" 2>/dev/null
+check 'URL --status rejects prefix-colliding reservation' "$(jq -e '[.reservations[].marker] | inside(["'"$SMARKER"'"])' "$TDIR/st12.json" >/dev/null 2>&1; echo $?)" "$(jq -c .reservations "$TDIR/st12.json")"
+PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 7 --json >"$TDIR/st13.json" 2>/dev/null
+check 'bare-number --status still finds the -7 key' "$(jq -e '[.reservations[].marker] | index("'"$FMARKER"'") != null' "$TDIR/st13.json" >/dev/null 2>&1; echo $?)" "$(jq -c .reservations "$TDIR/st13.json")"
+rm -f "$SHOME/in-progress/$FMARKER"
+# Stale mkdir-fallback lock dirs (gate #53 r3 P1): a .d dir with a dead owner pid is NOT live.
+mkdir -p "$SHOME/oracle.lock.pr-acme-widgets-42.d"; echo 99999999 > "$SHOME/oracle.lock.pr-acme-widgets-42.d/pid"
+PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 >"$TDIR/st14.out" 2>/dev/null
+check 'stale .d lock (dead owner) not reported RUNNING' "$(grep -q 'RUNNING' "$TDIR/st14.out"; [ $? -ne 0 ]; echo $?)" "$(grep -i running "$TDIR/st14.out")"
+echo "$$" > "$SHOME/oracle.lock.pr-acme-widgets-42.d/pid"
+PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 >"$TDIR/st15.out" 2>/dev/null
+check 'live .d lock (live owner) reported RUNNING' "$(grep -q 'RUNNING' "$TDIR/st15.out"; echo $?)" "$(cat "$TDIR/st15.out")"
+rm -rf "$SHOME/oracle.lock.pr-acme-widgets-42.d"
 
 echo '# v0.27: pro-gate-stats.sh --pr filters every view'
 STATS="$HERE/../bin/pro-gate-stats.sh"

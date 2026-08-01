@@ -103,8 +103,15 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
   # ledger row yet, where "no state found" would wrongly invite a duplicate launch. Read-only:
   # probe only locks that already exist (opening would otherwise create the file).
   st_inflight() {  # $1 = round key -> rc 0 when a same-change run holds the lock now
-    local lf="${ST_LOCKFILE}.pr-$1" pfd
-    [ -d "${lf}.d" ] && return 0
+    local lf="${ST_LOCKFILE}.pr-$1" pfd opid
+    if [ -d "${lf}.d" ]; then
+      # mkdir-fallback lock (no flock, e.g. stock macOS): live only when the recorded owner
+      # is a running pid. A dead/absent owner is a stale dir from SIGKILL/reboot — pg_lock
+      # self-heals it at the next acquisition; report it NOT live, mutate nothing
+      # (gate #53 r3 P1: existence alone reported stale locks as RUNNING forever).
+      opid="$(cat "${lf}.d/pid" 2>/dev/null || true)"
+      case "$opid" in ''|*[!0-9]*) return 1;; *) kill -0 "$opid" 2>/dev/null; return $?;; esac
+    fi
     [ -e "$lf" ] || return 1
     pg_have flock || return 1
     if { exec {pfd}>>"$lf"; } 2>/dev/null; then
@@ -133,18 +140,24 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
     *) Q_NUM="$STATUS_QUERY";;
   esac
 
-  # A reservation/ledger row matches on: exact marker; recorded pr == number; or the
-  # repo-scoped key embedded in the marker (…<slug>-<num>-<epoch>-<pid>). A bare number shows
-  # every repo's match (keys are repo-scoped precisely so numbers can collide — display the
-  # marker so the caller can tell them apart); a URL query pins the slug too.
+  # A reservation matches on: exact marker; or the COMPLETE key embedded in the marker
+  # (strip the pg-run- prefix and the trailing -epoch-pid). Round keys are not prefix-free
+  # (acme-widgets-42-tools-7 contains acme-widgets-42-), so slugged queries compare the whole
+  # key for equality and bare-number queries require the key's FINAL segment — substring
+  # matches leak foreign changes, and reservations outrank every other status source
+  # (gate #53 r3 P1). A bare number still shows every repo's match by design (keys are
+  # repo-scoped precisely so numbers can collide; the marker display disambiguates).
   st_match() {  # $1 marker, $2 recorded pr field ('' when unknown)
-    [ -n "$Q_MARKER" ] && { [ "$1" = "$Q_MARKER" ]; return; }
+    local m="$1" pr="${2:-}" km
+    [ -n "$Q_MARKER" ] && { [ "$m" = "$Q_MARKER" ]; return; }
     [ -n "$Q_NUM" ] || return 0
-    [ "${2:-}" = "$Q_NUM" ] && { [ -z "$Q_SLUG" ] && return 0; case "$1" in *"${Q_SLUG}-${Q_NUM}-"*|'') return 0;; *) return 1;; esac; }
-    case "$1" in
-      *"-${Q_NUM}-"*) [ -z "$Q_SLUG" ] && return 0; case "$1" in *"${Q_SLUG}-${Q_NUM}-"*) return 0;; *) return 1;; esac;;
-      *) return 1;;
-    esac
+    km="${m#pg-run-}"; km="${km%-*-*}"
+    if [ -n "$Q_SLUG" ]; then
+      [ "$km" = "${Q_SLUG}-${Q_NUM}" ]; return
+    fi
+    [ "$pr" = "$Q_NUM" ] && return 0
+    case "$km" in *"-${Q_NUM}") return 0;; esac
+    return 1
   }
 
   ST_TMP="$(mktemp -d "${TMPDIR:-/tmp}/pg-status.XXXXXX")"
@@ -413,24 +426,37 @@ MODEL_WARN=""     # U5: advisory downgrade marker (weak/unconfirmable model); ne
 # "no state" and inviting a duplicate spend (gate #53 P1; a dead wrapper also releases the
 # per-change flock, so the lock probe alone cannot see that case).
 pg_active_dir() { echo "$PRO_GATE_HOME/active"; }
+PG_ACTIVE_WRITTEN=0
 pg_active_write() {
   [ -n "${ROUND_KEY:-}" ] || return 0
   mkdir -p "$(pg_active_dir)" 2>/dev/null || return 0
   # 5th field: browser mode — recovery differs (native has no marker-addressable harvest, so a
   # dead native wrapper must NOT be routed into a --harvest loop that always exits 3).
   printf '%s\t%s\t%s\t%s\t%s\n' "${RUN_MARKER:-}" "$OUT" "$$" "$(date +%s)" "$MODE" \
-    > "$(pg_active_dir)/$ROUND_KEY" 2>/dev/null || true
+    > "$(pg_active_dir)/$ROUND_KEY" 2>/dev/null && PG_ACTIVE_WRITTEN=1
+  return 0
 }
 pg_active_clear() {  # $1 = exit code
-  local f m o p e
+  local f m o p e md
   f="$(pg_active_dir)/${ROUND_KEY:-}"
   { [ -n "${ROUND_KEY:-}" ] && [ -f "$f" ]; } || return 0
   if [ "${HARVEST:-0}" = 1 ]; then
     # A harvest may conclude a DEAD wrapper's run (collected: 0, or confirmed lost: 6) — then
-    # its record is stale and goes. A LIVE wrapper still owns its record and clears it itself.
+    # its record is stale and goes. But only the record whose MARKER this harvest actually
+    # collected/declared lost (legacy empty markers accepted), and only when its wrapper is
+    # dead: a live wrapper still owns its record and clears it itself.
     case "$1" in 0|6) ;; *) return 0;; esac
-    IFS=$'\t' read -r m o p e < "$f" 2>/dev/null || true
+    IFS=$'\t' read -r m o p e md < "$f" 2>/dev/null || true
+    [ -z "$m" ] || [ "$m" = "${RUN_MARKER:-}" ] || return 0
     case "$p" in ''|*[!0-9]*) ;; *) kill -0 "$p" 2>/dev/null && return 0;; esac
+  else
+    # Fresh path: clear ONLY a record THIS process wrote (gate #53 r3 P1). Exits that occur
+    # before pg_active_write — diff-fetch failure, round-cap refusal, health deferral — must
+    # never erase a dead predecessor's record: it may be the only marker/output pointer that
+    # run left, and deleting it lets a later --status authorize a duplicate spend.
+    [ "${PG_ACTIVE_WRITTEN:-0}" = 1 ] || return 0
+    IFS=$'\t' read -r m o p e md < "$f" 2>/dev/null || true
+    [ "$p" = "$$" ] || return 0
   fi
   rm -f "$f" 2>/dev/null || true
 }
