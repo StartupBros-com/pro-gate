@@ -448,13 +448,16 @@ if [ "$STATUS_REQUESTED" != 1 ]; then
              exit 2
            fi ;;
       esac
-      rm -f "$PG_OUT_GUARD_DIR/pid" 2>/dev/null
-      rmdir "$PG_OUT_GUARD_DIR" 2>/dev/null
-      if mkdir "$PG_OUT_GUARD_DIR" 2>/dev/null; then
-        echo "$$" > "$PG_OUT_GUARD_DIR/pid" 2>/dev/null || true
-        # Two processes can race the stale-owner cleanup and both reach here (gate #54 r13):
-        # re-read the pid and claim ownership only when it is OURS.
-        [ "$(cat "$PG_OUT_GUARD_DIR/pid" 2>/dev/null)" = "$$" ] && PG_OUT_GUARD_OK=1
+      # Atomic TAKEOVER of the stale dir (gate #54 r14): rename it aside first — exactly one
+      # racer's mv succeeds; the loser's retake mkdir then fails against the winner's fresh
+      # dir and it refuses below. Immediate rm+mkdir let both racers "win".
+      if mv "$PG_OUT_GUARD_DIR" "$PG_OUT_GUARD_DIR.reap.$$" 2>/dev/null; then
+        rm -f "$PG_OUT_GUARD_DIR.reap.$$/pid" 2>/dev/null
+        rmdir "$PG_OUT_GUARD_DIR.reap.$$" 2>/dev/null
+        if mkdir "$PG_OUT_GUARD_DIR" 2>/dev/null; then
+          echo "$$" > "$PG_OUT_GUARD_DIR/pid" 2>/dev/null || true
+          [ "$(cat "$PG_OUT_GUARD_DIR/pid" 2>/dev/null)" = "$$" ] && PG_OUT_GUARD_OK=1
+        fi
       fi
     fi
     if [ "$PG_OUT_GUARD_OK" != 1 ]; then
@@ -495,15 +498,17 @@ pg_status() {  # $1 phase, $2 optional detail — variable fields are JSON-escap
     jq -nc --arg phase "$phase" --argjson attempt "${attempt:-0}" --arg detail "$detail" \
        --arg pr "${PR_NUM:-diff}" --arg out "$OUT" --arg ts "$ts" --arg marker "${RUN_MARKER:-}" \
        --arg model "$model_label" --arg model_warn "${MODEL_WARN:-}" \
-       '{phase:$phase,attempt:$attempt,detail:$detail,pr:$pr,out:$out,ts:$ts,marker:$marker,model:$model,model_warn:$model_warn}' \
+       --arg result "${RESULT_PATH:-}" \
+       '{phase:$phase,attempt:$attempt,detail:$detail,pr:$pr,out:$out,ts:$ts,marker:$marker,model:$model,model_warn:$model_warn,result:$result}' \
        > "$STATUS_FILE.tmp" 2>/dev/null
   else
-    printf '{"phase":"%s","attempt":%d,"detail":"%s","pr":"%s","out":"%s","ts":"%s","marker":"%s","model":"%s","model_warn":"%s"}\n' \
+    printf '{"phase":"%s","attempt":%d,"detail":"%s","pr":"%s","out":"%s","ts":"%s","marker":"%s","model":"%s","model_warn":"%s","result":"%s"}\n' \
       "$phase" "${attempt:-0}" "$(printf '%s' "$detail" | tr -d '"\\' | tr '\n' ' ')" \
       "${PR_NUM:-diff}" "$(printf '%s' "$OUT" | tr -d '"\\' | tr '\n' ' ')" "$ts" \
       "$(printf '%s' "${RUN_MARKER:-}" | tr -d '"\\' | tr '\n' ' ')" \
       "$(printf '%s' "$model_label" | tr -d '"\\' | tr '\n' ' ')" \
       "$(printf '%s' "${MODEL_WARN:-}" | tr -d '"\\' | tr '\n' ' ')" \
+      "$(printf '%s' "${RESULT_PATH:-}" | tr -d '"\\' | tr '\n' ' ')" \
       > "$STATUS_FILE.tmp" 2>/dev/null
   fi
   { [ -s "$STATUS_FILE.tmp" ] && mv -f "$STATUS_FILE.tmp" "$STATUS_FILE"; } 2>/dev/null || true
@@ -582,6 +587,7 @@ pg_persist_result() {  # $1 = verified snapshot — persist the CANONICAL, marke
   local src="$1"
   if pg_completed_write "$RUN_MARKER" "$src" 2>/dev/null && [ -s "$(pg_completed_dir)/$RUN_MARKER" ]; then
     RESULT_PATH="$(pg_completed_dir)/$RUN_MARKER"
+    pg_reservation_remove "$RUN_MARKER" 2>/dev/null || true
     return 0
   fi
   if { mkdir -p "$PRO_GATE_HOME/pending" \
@@ -605,6 +611,7 @@ pg_publish_fail() {  # $1 = snapshot — shared failure path: durability decides
   # and when NOTHING could be persisted the snapshot itself is retained (gate #54 r9).
   local src="$1"
   if pg_completed_write "$RUN_MARKER" "$src"; then
+    pg_reservation_remove "$RUN_MARKER" 2>/dev/null || true
     echo "ERROR: review captured but could not be written to --out ($OUT). It is durable at $(pg_completed_dir)/$RUN_MARKER — copy it from there or re-run --harvest '$RUN_MARKER'; do NOT respend." >&2
     pg_status failed "already collected; --out unwritable; artifact at $(pg_completed_dir)/$RUN_MARKER"
   else
@@ -756,9 +763,10 @@ if [ -n "$HARVEST_MARKER" ] && pg_reservation_marker_ok "$HARVEST_MARKER" \
       pg_status failed "already collected; could not publish to --out (artifact at $FASTPATH_ART)"
       pg_finish 6
     fi
-    pg_status done "already collected; returned from $FASTPATH_ART"
+    RESULT_PATH="$FASTPATH_ART"
+    echo "RESULT_FILE=$RESULT_PATH"
+    pg_status done "already collected; result: $RESULT_PATH"
     cat "$FASTPATH_SNAP"
-    echo "RESULT_FILE=$FASTPATH_ART"
     pg_finish 0
   fi
   rm -f "$FASTPATH_SNAP" 2>/dev/null
@@ -871,10 +879,18 @@ if [ -n "$HARVEST_MARKER" ]; then
       # arrives with the echo, or the reservation ages out for manual recovery. Deliberately
       # independent of manifest/sidecar persistence (r4 P1): missing metadata fails CLOSED.
       mv "$HARVEST_TMP" "$OUT.unbound.$$" 2>/dev/null || rm -f "$HARVEST_TMP"
-      # The exit-9 contract PROMISES a live reservation; a harvest can reach here for a
-      # marker whose reservation already released — re-persist so the redirect/budget
-      # machinery actually protects the retry (gate #54 r13).
-      pg_reservation_write "$RUN_MARKER" "" "$OUT" 2>/dev/null || true
+      # The exit-9 contract PROMISES a live reservation keyed to the real change; a harvest
+      # can reach here for a marker whose reservation already released. An EMPTY key would
+      # default to the literal "diff" and be undiscoverable (gate #54 r14): derive the key
+      # from the marker, and fail CLOSED (state preserved, exit 3) when even the reservation
+      # cannot be persisted — exit 9 must never claim protection it does not have.
+      RES_KEY="${RUN_MARKER#pg-run-}"; RES_KEY="${RES_KEY%-*-*}"
+      if ! pg_reservation_write "$RUN_MARKER" "$RES_KEY" "$OUT" 2>/dev/null; then
+        PG_PRESERVE_STATE=1
+        echo "ERROR: unbindable capture preserved, but its reservation could not be persisted ($PRO_GATE_HOME unwritable?). Tab and state KEPT; retry --harvest once the home is writable." >&2
+        pg_status failed "unbindable capture; reservation write failed; state preserved"
+        pg_finish 3
+      fi
       echo "ERROR: harvested a complete review that cannot be bound to this run (no run-marker echo — possibly an older answer while the current one is still generating). Reservation and candidate kept. Retry --harvest; inspect $OUT.unbound.$$; PRO_GATE_REQUIRE_NONCE=0 accepts best-effort captures." >&2
       pg_status in-progress "harvested review unbindable (no nonce echo); reservation kept, retry"
       pg_finish 9
@@ -883,7 +899,13 @@ if [ -n "$HARVEST_MARKER" ]; then
       # capture IS foreign here — blacklist its exact source and rescan.
       mv "$HARVEST_TMP" "$OUT.foreign.$$" 2>/dev/null || rm -f "$HARVEST_TMP"
       pg_provenance_reject "$RUN_MARKER" "${HARVEST_URL:-}"
-      pg_reservation_write "$RUN_MARKER" "" "$OUT" 2>/dev/null || true
+      RES_KEY="${RUN_MARKER#pg-run-}"; RES_KEY="${RES_KEY%-*-*}"
+      if ! pg_reservation_write "$RUN_MARKER" "$RES_KEY" "$OUT" 2>/dev/null; then
+        PG_PRESERVE_STATE=1
+        echo "ERROR: foreign capture set aside, but the reservation could not be persisted ($PRO_GATE_HOME unwritable?). Tab and state KEPT; retry --harvest once the home is writable." >&2
+        pg_status failed "foreign capture set aside; reservation write failed; state preserved"
+        pg_finish 3
+      fi
       echo "ERROR: harvested a complete review that cites NONE of this change's files — foreign conversation suspected. Reservation kept, its memoized candidate invalidated; retry --harvest. The rejected capture is at $OUT.foreign.$$ for inspection." >&2
       pg_status in-progress "harvested review failed provenance (cites no change files); reservation kept"
       pg_finish 9
@@ -897,14 +919,10 @@ if [ -n "$HARVEST_MARKER" ]; then
     # promises a readable --out, so a failed publish routes to manual recovery instead.
     PG_FINAL_SRC="$HARVEST_TMP"
     pg_publish_out "$PG_FINAL_SRC" || pg_publish_fail "$PG_FINAL_SRC"
-    # Artifact installation BEFORE reservation removal (gate #54 r6 P2): if the durable
-    # store is unwritable, the reservation stays so the review remains re-collectable —
-    # recovery state must never be discarded on the promise of an artifact that failed.
-    if pg_completed_write "$RUN_MARKER" "$PG_FINAL_SRC"; then
-      pg_reservation_remove "$RUN_MARKER" || true
-    else
-      echo "[oracle-review] WARNING: could not persist the completed artifact ($(pg_completed_dir)); reservation KEPT so the review stays re-collectable." >&2
-    fi
+    # Durability ladder (gate #54 r6/r14): pg_persist_result retires the reservation on the
+    # durable rungs; only the volatile last-resort rung keeps it (the review then remains
+    # re-collectable).
+    pg_persist_result "$PG_FINAL_SRC"
     # v0.22: a harvest completes the round the exit-9 run already recorded, so refresh the
     # round budget's last-severity sidecar too. The marker embeds ROUND_KEY
     # ("pg-run-<key>-<epoch>-<pid>") for PR and --diff runs alike; legacy markers resolve to
@@ -914,9 +932,9 @@ if [ -n "$HARVEST_MARKER" ]; then
     SALVAGED=1
     echo "[oracle-review] harvest recovered the completed review ($(wc -c < "$PG_FINAL_SRC" 2>/dev/null) bytes)." >&2
     pg_persist_result "$PG_FINAL_SRC"
+    echo "RESULT_FILE=$RESULT_PATH"
     pg_status done "result: $RESULT_PATH"
     cat "$PG_FINAL_SRC"
-    echo "RESULT_FILE=$RESULT_PATH"
     pg_finish 0
   fi
   rm -f "$HARVEST_TMP"
@@ -1001,9 +1019,9 @@ if [ -n "$HARVEST_MARKER" ]; then
            # once $OUT verifiably holds the snapshot.
            pg_publish_out "$PG_FINAL_SRC" || pg_publish_fail "$PG_FINAL_SRC"
            pg_persist_result "$PG_FINAL_SRC"
+           echo "RESULT_FILE=$RESULT_PATH"
            pg_status done "already collected; result: $RESULT_PATH"
            cat "$PG_FINAL_SRC"
-           echo "RESULT_FILE=$RESULT_PATH"
            pg_finish 0
          fi
          if [ -n "$PRIOR_OUT" ]; then
@@ -1934,9 +1952,9 @@ if [ -n "$FINAL_SNAP" ]; then
   # Canonical result BEFORE terminal done (gate #54 r11): pollers act on done immediately, so
   # the durable artifact must already exist and be named in the status record they read.
   pg_persist_result "$PG_FINAL_SRC"
+  echo "RESULT_FILE=$RESULT_PATH"
   pg_status done "result: $RESULT_PATH"
   cat "$PG_FINAL_SRC"
-  echo "RESULT_FILE=$RESULT_PATH"
   pg_finish 0
 elif [ "${SALVAGE_RAN:-0}" = 1 ] && [ "${SALVAGE_PRESERVE:-0}" = 1 ]; then
   # The salvage budget ran out while the conversation was STILL GENERATING (or the outcome was

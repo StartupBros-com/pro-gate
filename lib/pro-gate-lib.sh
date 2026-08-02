@@ -923,9 +923,9 @@ pg_round_note_severity() {
   # first token after the delimiter that follows the [Pn] citation — headline shape
   # "[P1] path:line — RESOLVED — …". A finding whose DESCRIPTION merely contains the word
   # ("the RESOLVED state can be forged") or an identifier (RESOLVED_MODEL) stays counted.
-  p0="$(grep -i '\[P0\]' "$out" 2>/dev/null \
+  p0="$(grep -iE '^[[:space:]]*\[P0\]' "$out" 2>/dev/null \
     | grep -Evc '^[[:space:]]*\[[Pp]0\][[:space:]]+[^[:space:]]+[[:space:]]+(—|--|-)[[:space:]]+RESOLVED([^_[:alnum:]]|$)')"; [ -n "$p0" ] || p0=0
-  p1="$(grep -i '\[P1\]' "$out" 2>/dev/null \
+  p1="$(grep -iE '^[[:space:]]*\[P1\]' "$out" 2>/dev/null \
     | grep -Evc '^[[:space:]]*\[[Pp]1\][[:space:]]+[^[:space:]]+[[:space:]]+(—|--|-)[[:space:]]+RESOLVED([^_[:alnum:]]|$)')"; [ -n "$p1" ] || p1=0
   { printf '%s\t%s\t%s\n' "$(date +%s)" "$p0" "$p1" > "$dir/$key.last.tmp" \
       && mv -f "$dir/$key.last.tmp" "$dir/$key.last"; } 2>/dev/null || true
@@ -1127,15 +1127,22 @@ pg_completed_write() {  # <marker> <file>: write-once; an existing artifact is n
   pg_reservation_marker_ok "$marker" || return 1
   [ -s "$f" ] || return 1
   dir="$(pg_completed_dir)"
-  if [ ! -f "$dir/$marker" ]; then
-    mkdir -p "$dir" 2>/dev/null || return 1
-    cp "$f" "$dir/$marker.tmp.$$" 2>/dev/null && mv -f "$dir/$marker.tmp.$$" "$dir/$marker" 2>/dev/null
-    rc=$?
-    # A failed cp/mv must not leave a pg-run-*-globbable temp behind — status discovery would
-    # read it as a completed review (gate #54 r11 P2).
-    rm -f "$dir/$marker.tmp.$$" 2>/dev/null
-    [ "$rc" = 0 ] || return 1
+  mkdir -p "$dir" 2>/dev/null || return 1
+  # Atomic NO-CLOBBER install (gate #54 r14): link(2) fails when the artifact exists, so
+  # concurrent writers cannot replace each other. On EEXIST the existing artifact must be
+  # byte-identical to what we hold — write-once means one review per marker, and accepting
+  # different bytes would let callers drop recovery state while RESULT_FILE names the wrong
+  # review. Fail closed otherwise.
+  if cp "$f" "$dir/$marker.tmp.$$" 2>/dev/null && ln "$dir/$marker.tmp.$$" "$dir/$marker" 2>/dev/null; then
+    rc=0
+  elif [ -f "$dir/$marker" ] && cmp -s "$f" "$dir/$marker" 2>/dev/null; then
+    rc=0
+  else
+    rc=1
   fi
+  # Never leave a pg-run-*-globbable temp behind (r11 P2).
+  rm -f "$dir/$marker.tmp.$$" 2>/dev/null
+  [ "$rc" = 0 ] || return 1
   # An installed artifact supersedes any pending-recovery copy for the marker (r11 P2).
   rm -f "$PRO_GATE_HOME/pending/$marker" 2>/dev/null
   return 0

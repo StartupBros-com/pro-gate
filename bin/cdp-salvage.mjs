@@ -276,8 +276,23 @@ function blacklist(url) {
   blacklistLines.push(`${marker}\t${url}`);
   try {
     fs.mkdirSync(PG_HOME, { recursive: true });
-    // rewrite (bounded) rather than append forever
-    fs.writeFileSync(BLACKLIST_FILE, blacklistLines.slice(-500).join('\n') + '\n');
+    // APPEND-ONLY (gate #54 r14): the shell rejection path appends concurrently, and a
+    // whole-file rewrite from a stale in-memory snapshot could erase its freshly rejected
+    // entry — letting the rejected open tab replay. Compaction is opportunistic, under a
+    // lock both writers respect, and skipped on contention.
+    fs.appendFileSync(BLACKLIST_FILE, `${marker}\t${url}\n`);
+    if (blacklistLines.length > 800) {
+      const lockDir = `${BLACKLIST_FILE}.lock.d`;
+      try {
+        fs.mkdirSync(lockDir);
+        try {
+          const fresh = fs.readFileSync(BLACKLIST_FILE, 'utf8').split('\n').filter((l) => l.includes('\t'));
+          const tmp = `${BLACKLIST_FILE}.tmp.${process.pid}`;
+          fs.writeFileSync(tmp, fresh.slice(-500).join('\n') + '\n');
+          fs.renameSync(tmp, BLACKLIST_FILE);
+        } finally { try { fs.rmdirSync(lockDir); } catch {} }
+      } catch {}
+    }
   } catch {}
 }
 
