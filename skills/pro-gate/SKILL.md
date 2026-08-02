@@ -203,8 +203,11 @@ anyway, do not assume the engine either survived or died: read the status file, 
 for the engine process and a reservation, before anything else — never relaunch on reflex.
 The wait is free time — do useful parallel work and check back. The engine writes single-line JSON to
 `<out>.status` at every phase change (`preflight → waiting-slot → launching → … → done|failed|deferred|in-progress|oversized|round-capped`):
-poll THAT, not engine logs. Phase `done` ⇒ read `--out` (the `[Pn] file:line` blocks ending in a
-`VERDICT:` line). `failed`/`deferred`/`in-progress`/`oversized`/`round-capped` are terminal for
+poll THAT, not engine logs. Phase `done` ⇒ read the file named by the engine's final
+`RESULT_FILE=` stdout line — engine ≥v0.28 points it at the write-once, marker-addressed
+completed artifact (`$PG_HOME/completed/<marker>`), which a concurrent run sharing your
+`--out` path can never overwrite; `--out` holds the same bytes as a best-effort alias. The
+review is the `[Pn] file:line` blocks ending in a `VERDICT:` line. `failed`/`deferred`/`in-progress`/`oversized`/`round-capped` are terminal for
 this invocation: do NOT relaunch on `throttled`/`salvaging` phases; the engine is still working.
 While waiting, never spawn a second oracle run for the same PR. The status JSON carries `marker`
 (the run's conversation correlation id): you need it for `--harvest`.

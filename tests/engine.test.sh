@@ -1064,6 +1064,26 @@ check 'nonce stripped from the returned review' "$(grep -q 'run marker' "$TDIR/o
 check 'VERDICT line survives the strip' "$(grep -q 'VERDICT: FIX-FIRST' "$TDIR/o-nonce.md"; echo $?)" "$(tail -1 "$TDIR/o-nonce.md" 2>/dev/null)"
 check 'clean collection writes the completed artifact' "$([ -s "$TDIR/home/completed/$M8" ]; echo $?)" "$(ls "$TDIR/home/completed" 2>/dev/null)"
 check 'clean ledger row records the digest' "$([ -n "$(tail -1 "$TDIR/home/ledger.jsonl" | jq -r '.sha256 // ""')" ]; echo $?)" "$(tail -1 "$TDIR/home/ledger.jsonl")"
+check 'RESULT_FILE names the canonical artifact' "$(grep -q "RESULT_FILE=$TDIR/home/completed/$M8" "$TDIR/stdout"; echo $?)" "$(grep RESULT_FILE "$TDIR/stdout")"
+# Garbage PRO_GATE_REQUIRE_NONCE values fail CLOSED (gate #54 r10): 'true' is not legacy mode.
+M13="pg-run-noncegarbage-6-1700000060-15"
+printf '6\t%s\t%s\t0\t1\tGPT-X\n' "$TDIR/o-garbage.md" "$(date +%s)" > "$TDIR/home/in-progress/$M13"
+printf 'src/real.sh\n' > "$TDIR/home/manifests/$M13"
+cat > "$TDIR/tab.txt" <<TAB
+conversation for run marker: $M13
+P0: none
+
+[P1] src/real.sh:2 — matching citation but no echo
+
+VERDICT: SHIP — no echo though
+TAB
+start_mock "$TDIR/tab.txt"
+env PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_REQUIRE_NONCE=true NODE_OPTIONS= \
+  bash "$ENGINE" --harvest "$M13" --out "$TDIR/o-garbage.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'non-boolean REQUIRE_NONCE enforces (fails closed, exit 9)' "$([ "$RC" -eq 9 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
+rm -f "$TDIR/home/in-progress/$M13" "$TDIR/home/manifests/$M13"
 
 echo '# v0.28: artifact-first recovery — no ledger row needed'
 M9="pg-run-artifact-4-1700000035-99"

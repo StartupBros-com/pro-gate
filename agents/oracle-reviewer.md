@@ -102,8 +102,10 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
 3. **Interpret the exit code**, then return the matching envelope:
    - `0`: review ready. Read the resolved model from `$OUT.status` (`jq -r .model`, the model
      oracle actually used this run, or role-based text when unreadable) and the advisory
-     `model_warn` field (`jq -r .model_warn`, empty when none), then relay `$OUT` verbatim
-     (success envelope). Never name a model version by hand; use the status `model` field.
+     `model_warn` field (`jq -r .model_warn`, empty when none), then relay the file named by
+     the engine's final `RESULT_FILE=` line verbatim (engine >=v0.28: the marker-addressed
+     completed artifact, immune to concurrent --out reuse; `$OUT` is a best-effort alias).
+     Never name a model version by hand; use the status `model` field.
    - `3` (oracle missing, or browser unreachable after the engine's self-heal attempt) or
      `7` (all review slots busy after the 40-min queue wait) — unavailable envelope with
      the one-line reason; safe to retry later.
