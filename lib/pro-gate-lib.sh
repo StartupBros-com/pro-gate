@@ -1027,15 +1027,17 @@ pg_review_matches_change() {
   [ -n "$cited" ] || return 0
   [ "$(printf '%s\n' "$cited" | grep -c .)" -ge 2 ] 2>/dev/null || return 0
   # Overlap = exact path equality, or one path being a component-anchored SUFFIX of the other
-  # (a review may cite repo-relative paths while the diff carries a prefix, or vice versa).
-  # Bare basename equality is NOT overlap: monorepos repeat index.ts/route.ts/schema.ts
-  # everywhere, and basename matching let entirely foreign reviews pass (gate #54 r2 P1).
+  # (a review may cite repo-relative paths while the diff carries a prefix, or vice versa) —
+  # but ONLY when the shorter side itself carries >=2 components (contains a slash). A bare
+  # single-component citation matching via the suffix rule IS basename matching by another
+  # door (index.ts vs lib/index.ts — gate #54 r6): bare names require exact equality.
   while IFS= read -r c; do
     [ -n "$c" ] || continue
     while IFS= read -r p; do
       [ -n "$p" ] || continue
-      case "$p" in "$c"|*/"$c") return 0;; esac
-      case "$c" in */"$p") return 0;; esac
+      case "$p" in "$c") return 0;; esac
+      case "$c" in */*) case "$p" in */"$c") return 0;; esac;; esac
+      case "$p" in */*) case "$c" in */"$p") return 0;; esac;; esac
     done < "$pathsf"
   done <<PG_EOF
 $cited
@@ -1054,14 +1056,26 @@ pg_provenance_reject() {  # <marker> [matched-url]
   # Prefer the EXPLICIT matched URL the CDP child reported for this very capture: reading the
   # shared memo afterwards races concurrent probes/retries, which can re-learn the GENUINE
   # conversation in the interim — condemning it while the foreign source stays eligible
-  # (gate #54 r5). The memo is removed only when it still names the URL being rejected.
-  local m="$1" url="${2:-}" memo cur
+  # (gate #54 r5). Memo removal is CLAIM-then-verify (gate #54 r6): the memo is atomically
+  # renamed aside first, its content checked against the rejected URL, and restored when it
+  # names a DIFFERENT (newer, possibly genuine) conversation — a read-append-remove sequence
+  # left a window where a concurrently refreshed genuine memo was deleted by a stale compare.
+  local m="$1" url="${2:-}" memo claim snap
   memo="$PRO_GATE_HOME/conversation-urls/$m"
-  cur="$(head -c 300 "$memo" 2>/dev/null | tr -d '\n')"
-  [ -n "$url" ] || url="$cur"
+  claim="$memo.rej.$$"
+  if mv "$memo" "$claim" 2>/dev/null; then
+    snap="$(head -c 300 "$claim" 2>/dev/null | tr -d '\n')"
+    [ -n "$url" ] || url="$snap"
+    if [ "$snap" = "$url" ] || [ -z "$snap" ]; then
+      rm -f "$claim" 2>/dev/null
+    elif [ ! -f "$memo" ]; then
+      mv "$claim" "$memo" 2>/dev/null || rm -f "$claim" 2>/dev/null
+    else
+      rm -f "$claim" 2>/dev/null   # an even newer memo exists; keep that one
+    fi
+  fi
   [ -n "$url" ] || return 0
   { printf '%s\t%s\n' "$m" "$url" >> "$PRO_GATE_HOME/salvage-nonmatching.txt"; } 2>/dev/null || true
-  [ "$cur" = "$url" ] && rm -f "$memo" 2>/dev/null
   return 0
 }
 

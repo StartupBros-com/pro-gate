@@ -492,14 +492,21 @@ pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor,
   # v0.28 (#56): a clean run's review becomes the write-once completed artifact, and its
   # digest lands in the ledger row — later already-collected recovery verifies content
   # identity instead of trusting a mutable, reusable output path.
-  OUT_SHA="${PG_OUT_SHA_OVERRIDE:-}"
-  if [ "$rc" = 0 ] && [ -n "${RUN_MARKER:-}" ] && [ -s "$OUT" ]; then
-    pg_completed_write "$RUN_MARKER" "$OUT" || true
-    # A caller may share one --out across markers; a precomputed digest (fast path) always
-    # describes the bytes THIS invocation verified and returned, not whatever occupies $OUT
-    # by ledger time (gate #54 r5 P1).
-    [ -n "$OUT_SHA" ] || OUT_SHA="$(pg_sha256 "$OUT")"
+  # The private verified snapshot (when a path staged one) is the authoritative source for
+  # the durable artifact AND the ledgered digest (gate #54 r5/r6): a caller may share one
+  # --out across markers, and $OUT's content by ledger time need not be the bytes THIS
+  # invocation verified and returned.
+  local fsrc
+  fsrc="${PG_FINAL_SRC:-$OUT}"
+  [ -s "$fsrc" ] || fsrc="$OUT"
+  OUT_SHA=""
+  if [ "$rc" = 0 ] && [ -n "${RUN_MARKER:-}" ] && [ -s "$fsrc" ]; then
+    if ! pg_completed_write "$RUN_MARKER" "$fsrc"; then
+      echo "[oracle-review] WARNING: completed artifact could not be persisted for ${RUN_MARKER} ($(pg_completed_dir) unwritable?); already-collected recovery will rely on the ledgered digest only." >&2
+    fi
+    OUT_SHA="$(pg_sha256 "$fsrc")"
   fi
+  [ -n "${PG_FINAL_SRC:-}" ] && [ "$PG_FINAL_SRC" != "$OUT" ] && rm -f "$PG_FINAL_SRC" 2>/dev/null
   # v0.27: `marker` and `round_key` land in every ledger line so --status (and any caller with
   # only the ledger) can reconstruct a harvest command without the original status file. Rows
   # from failures before identity derivation (exit 4/5) carry them empty — present, not absent.
@@ -565,12 +572,12 @@ if [ -n "$HARVEST_MARKER" ] && pg_reservation_marker_ok "$HARVEST_MARKER" \
   FASTPATH_ART="$(pg_completed_dir)/$RUN_MARKER"
   FASTPATH_SNAP="$OUT.fastpath.$$"
   if cp "$FASTPATH_ART" "$FASTPATH_SNAP" 2>/dev/null && pg_is_review "$FASTPATH_SNAP"; then
-    PG_OUT_SHA_OVERRIDE="$(pg_sha256 "$FASTPATH_SNAP")"
+    PG_FINAL_SRC="$FASTPATH_SNAP"
     SALVAGED=1
     echo "[oracle-review] review already collected (completed artifact); returning it — no browser touched, nothing spent." >&2
     pg_status done "already collected; returned from $FASTPATH_ART"
     cat "$FASTPATH_SNAP"
-    mv -f "$FASTPATH_SNAP" "$OUT" 2>/dev/null || true
+    cp "$FASTPATH_SNAP" "$OUT" 2>/dev/null || true
     echo "RESULT_FILE=$OUT"
     pg_finish 0
   fi
@@ -673,44 +680,55 @@ if [ -n "$HARVEST_MARKER" ]; then
     # reservation, counts no miss, and invalidates the memoized candidate (blacklist + memo
     # removal) so the NEXT pass rescans instead of replaying the same foreign conversation.
     HARVEST_MANIFEST="$(pg_manifest_dir)/${RUN_MARKER}"
-    HARVEST_NONCE_FLAG="$(pg_manifest_dir)/${RUN_MARKER}.nonce"
     if pg_capture_nonce_ok "$HARVEST_TMP" "$RUN_MARKER"; then
       :  # positively bound to this run
+    elif [ "${PRO_GATE_REQUIRE_NONCE:-1}" = 1 ]; then
+      # NONCE OR NOTHING (gate #54 r3-r6): under REQUIRE_NONCE a nonce-less capture is never
+      # accepted AND never used to blacklist — a "foreign-looking" capture may be an OLDER
+      # verdict scraped from the very conversation still generating THIS run's answer (the
+      # marker sits in the submitted prompt below it), so condemning its URL would skip the
+      # eventual nonce-bearing result (r6 P1). Preserve everything and retry: the real answer
+      # arrives with the echo, or the reservation ages out for manual recovery. Deliberately
+      # independent of manifest/sidecar persistence (r4 P1): missing metadata fails CLOSED.
+      mv "$HARVEST_TMP" "$OUT.unbound.$$" 2>/dev/null || rm -f "$HARVEST_TMP"
+      echo "ERROR: harvested a complete review that cannot be bound to this run (no run-marker echo — possibly an older answer while the current one is still generating). Reservation and candidate kept. Retry --harvest; inspect $OUT.unbound.$$; PRO_GATE_REQUIRE_NONCE=0 accepts best-effort captures." >&2
+      pg_status in-progress "harvested review unbindable (no nonce echo); reservation kept, retry"
+      pg_finish 9
     elif [ -s "$HARVEST_MANIFEST" ] && ! pg_review_matches_change "$HARVEST_TMP" "$HARVEST_MANIFEST"; then
+      # Legacy mode (REQUIRE_NONCE=0): path overlap is authoritative, so a zero-overlap
+      # capture IS foreign here — blacklist its exact source and rescan.
       mv "$HARVEST_TMP" "$OUT.foreign.$$" 2>/dev/null || rm -f "$HARVEST_TMP"
       pg_provenance_reject "$RUN_MARKER" "${HARVEST_URL:-}"
-      echo "ERROR: harvested a complete review with no run-marker echo that cites NONE of this change's files — foreign conversation suspected. Reservation kept, its memoized candidate invalidated; retry --harvest (the real review may still be generating). The rejected capture is at $OUT.foreign.$$ for inspection." >&2
-      pg_status in-progress "harvested review failed provenance (no nonce, cites no change files); reservation kept"
+      echo "ERROR: harvested a complete review that cites NONE of this change's files — foreign conversation suspected. Reservation kept, its memoized candidate invalidated; retry --harvest. The rejected capture is at $OUT.foreign.$$ for inspection." >&2
+      pg_status in-progress "harvested review failed provenance (cites no change files); reservation kept"
       pg_finish 9
-    elif [ "${PRO_GATE_REQUIRE_NONCE:-1}" = 1 ]; then
-      # NONCE OR NOTHING (gate #54 r3/r4/r5): under REQUIRE_NONCE, path overlap can only
-      # REJECT (foreign branch above), never ACCEPT — an OLDER answer for this very PR in the
-      # same marker-matched conversation cites overlapping files by nature, so overlap proves
-      # nothing about WHICH round answered (r5 P1). Deliberately independent of the .nonce
-      # sidecar's existence too: killed wrappers, failed sidecar writes, and pre-v0.28
-      # reservations must not fail OPEN (r4 P1); legacy reservations age out within the 6h
-      # TTL. Preserve for retry or manual confirmation; PRO_GATE_REQUIRE_NONCE=0 restores
-      # best-effort path-overlap acceptance.
-      mv "$HARVEST_TMP" "$OUT.unbound.$$" 2>/dev/null || rm -f "$HARVEST_TMP"
-      echo "ERROR: harvested a complete review that cannot be bound to this run (no run-marker echo; too few citations for the path check). Reservation kept. Inspect $OUT.unbound.$$ and confirm manually, retry --harvest, or set PRO_GATE_REQUIRE_NONCE=0 to accept best-effort captures." >&2
-      pg_status in-progress "harvested review unbindable (no nonce, insufficient citations); reservation kept"
-      pg_finish 9
-    elif [ -f "$HARVEST_NONCE_FLAG" ]; then
+    else
       echo "[oracle-review] NOTE: PRO_GATE_REQUIRE_NONCE=0 — accepted a nonce-less capture on best-effort path overlap." >&2
     fi
-    mv "$HARVEST_TMP" "$OUT"
-    pg_strip_nonce "$OUT" "$RUN_MARKER"
-    pg_reservation_remove "$RUN_MARKER" || true
+    pg_strip_nonce "$HARVEST_TMP" "$RUN_MARKER"
+    # Private verified snapshot is the authoritative return (gate #54 r6): $OUT is
+    # publication only — a concurrent marker sharing the caller's --out cannot change what
+    # THIS invocation returns, persists, or ledgers.
+    PG_FINAL_SRC="$HARVEST_TMP"
+    cp "$HARVEST_TMP" "$OUT" 2>/dev/null || true
+    # Artifact installation BEFORE reservation removal (gate #54 r6 P2): if the durable
+    # store is unwritable, the reservation stays so the review remains re-collectable —
+    # recovery state must never be discarded on the promise of an artifact that failed.
+    if pg_completed_write "$RUN_MARKER" "$PG_FINAL_SRC"; then
+      pg_reservation_remove "$RUN_MARKER" || true
+    else
+      echo "[oracle-review] WARNING: could not persist the completed artifact ($(pg_completed_dir)); reservation KEPT so the review stays re-collectable." >&2
+    fi
     # v0.22: a harvest completes the round the exit-9 run already recorded, so refresh the
     # round budget's last-severity sidecar too. The marker embeds ROUND_KEY
     # ("pg-run-<key>-<epoch>-<pid>") for PR and --diff runs alike; legacy markers resolve to
     # keys with no recorded rounds and are skipped inside the helper (best-effort, advisory).
     HARVEST_KEY="${RUN_MARKER#pg-run-}"; HARVEST_KEY="${HARVEST_KEY%-*-*}"
-    pg_round_note_severity "$HARVEST_KEY" "$OUT"
+    pg_round_note_severity "$HARVEST_KEY" "$PG_FINAL_SRC"
     SALVAGED=1
-    echo "[oracle-review] harvest recovered the completed review ($(wc -c < "$OUT" 2>/dev/null) bytes)." >&2
+    echo "[oracle-review] harvest recovered the completed review ($(wc -c < "$PG_FINAL_SRC" 2>/dev/null) bytes)." >&2
     pg_status done
-    cat "$OUT"
+    cat "$PG_FINAL_SRC"
     echo "RESULT_FILE=$OUT"
     pg_finish 0
   fi
@@ -776,18 +794,20 @@ if [ -n "$HARVEST_MARKER" ]; then
            if [ -n "$PRIOR_OUT" ] && [ -n "$PRIOR_SHA" ] && [ -s "$PRIOR_OUT" ]; then
              SNAP="$OUT.already.$$"
              if cp "$PRIOR_OUT" "$SNAP" 2>/dev/null && pg_is_review "$SNAP" 2>/dev/null \
-                && [ "$(pg_sha256 "$SNAP")" = "$PRIOR_SHA" ] \
-                && mv -f "$SNAP" "$OUT" 2>/dev/null; then
+                && [ "$(pg_sha256 "$SNAP")" = "$PRIOR_SHA" ]; then
                COLLECT_OK=1; COLLECT_SRC="$PRIOR_OUT"
+               PG_FINAL_SRC="$SNAP"
+               cp "$SNAP" "$OUT" 2>/dev/null || true
+             else
+               rm -f "$SNAP" 2>/dev/null
              fi
-             rm -f "$SNAP" 2>/dev/null
            fi
          fi
          if [ "$COLLECT_OK" = 1 ]; then
            SALVAGED=1
            echo "[oracle-review] this review was ALREADY collected (${COLLECT_SRC}); returning it idempotently — nothing spent, nothing lost." >&2
            pg_status done "already collected; returned from ${COLLECT_SRC}"
-           cat "$OUT"
+           cat "${PG_FINAL_SRC:-$OUT}"
            echo "RESULT_FILE=$OUT"
            pg_finish 0
          fi
@@ -1645,7 +1665,11 @@ if { [ "${SALVAGED:-0}" = 1 ] || [ "${REATTACHED:-0}" = 1 ]; } \
   # blacklisting that would make the real review unrecoverable after a Chrome restart.
   # Discriminated by CAPTURE_SOURCE, not SALVAGED — reattach sets SALVAGED too (gate #54 r3).
   # The CDP child names its capture's exact source URL in the run log (gate #54 r5).
-  if [ "${CAPTURE_SOURCE:-}" = cdp ]; then
+  # Blacklisting only in LEGACY mode (gate #54 r6): under REQUIRE_NONCE a mismatched capture
+  # may be an older verdict from the conversation still generating THIS answer — condemned,
+  # its eventual nonce-bearing result would be skipped. (This branch is unreachable under
+  # REQUIRE_NONCE anyway: the nonce-or-nothing branch below captures everything nonce-less.)
+  if [ "${CAPTURE_SOURCE:-}" = cdp ] && [ "${PRO_GATE_REQUIRE_NONCE:-1}" = 0 ]; then
     pg_provenance_reject "$RUN_MARKER" "$(sed -n 's/^matched-url //p' "$RUNLOG" 2>/dev/null | tail -1)"
   fi
   SALVAGE_RAN=1; SALVAGE_PRESERVE=1   # route to the reserve-and-harvest branch below
@@ -1671,11 +1695,15 @@ if pg_is_review "$OUT"; then
   # v0.28 (#55): strip the echoed run-marker nonce before the review leaves the engine —
   # binding is an internal mechanism, not part of the caller-facing output.
   pg_strip_nonce "$OUT" "$RUN_MARKER"
+  # Stage the private verified snapshot (gate #54 r6): what this invocation returns,
+  # persists, and ledgers is what it just validated — not whatever a concurrent marker
+  # sharing the caller's --out may put there later.
+  if cp "$OUT" "$OUT.final.$$" 2>/dev/null; then PG_FINAL_SRC="$OUT.final.$$"; fi
   # v0.22: remember this review's P0/P1 counts so a later round-capped refusal can flag an
   # unconfirmed open P0 to the human (advisory sidecar; see pg_round_note_severity).
-  pg_round_note_severity "$ROUND_KEY" "$OUT"
+  pg_round_note_severity "$ROUND_KEY" "${PG_FINAL_SRC:-$OUT}"
   pg_status done
-  cat "$OUT"
+  cat "${PG_FINAL_SRC:-$OUT}"
   echo "RESULT_FILE=$OUT"
   pg_finish 0
 elif [ "${SALVAGE_RAN:-0}" = 1 ] && [ "${SALVAGE_PRESERVE:-0}" = 1 ]; then

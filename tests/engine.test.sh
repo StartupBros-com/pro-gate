@@ -1001,14 +1001,24 @@ VERDICT: FIX-FIRST — foreign
 TAB
 start_mock "$TDIR/tab.txt"
 run_engine --harvest "$M3" --out "$TDIR/o-prov.md" --timeout 5s
-check 'foreign harvest capture exits 9 (preserved)' "$([ "$RC" -eq 9 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
-check 'foreign harvest keeps the reservation' "$([ -f "$TDIR/home/in-progress/$M3" ]; echo $?)" 'reservation destroyed'
-check 'foreign capture set aside for inspection' "$(ls "$TDIR/o-prov.md.foreign."* >/dev/null 2>&1; echo $?)" 'no .foreign file'
-check 'foreign capture not returned as the review' "$([ ! -s "$TDIR/o-prov.md" ]; echo $?)" 'out file written'
-# Rejection invalidates the memoized candidate: memo gone, URL on the per-marker blacklist —
-# without this the next harvest replays the same foreign conversation forever (gate #54 P1).
-check 'rejection removes the URL memo' "$([ ! -f "$TDIR/home/conversation-urls/$M3" ]; echo $?)" "$(cat "$TDIR/home/conversation-urls/$M3" 2>/dev/null)"
-check 'rejection blacklists the EXACT matched URL' "$(grep -q "^$M3	https://chatgpt.com/c/mock-conversation" "$TDIR/home/salvage-nonmatching.txt" 2>/dev/null; echo $?)" "$(cat "$TDIR/home/salvage-nonmatching.txt" 2>/dev/null)"
+check 'nonce-less capture preserved as unbound (exit 9)' "$([ "$RC" -eq 9 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
+check 'unbound harvest keeps the reservation' "$([ -f "$TDIR/home/in-progress/$M3" ]; echo $?)" 'reservation destroyed'
+check 'unbound capture set aside for inspection' "$(ls "$TDIR/o-prov.md.unbound."* >/dev/null 2>&1; echo $?)" 'no .unbound file'
+check 'unbound capture not returned as the review' "$([ ! -s "$TDIR/o-prov.md" ]; echo $?)" 'out file written'
+# Under REQUIRE_NONCE the candidate is NOT condemned (gate #54 r6): a mismatched capture may
+# be an OLDER verdict from the conversation still generating this run's answer — the memo
+# stays so the eventual nonce-bearing result remains reachable, and nothing is blacklisted.
+check 'nonce mode keeps the URL memo (older-verdict theory)' "$([ -f "$TDIR/home/conversation-urls/$M3" ]; echo $?)" "$(ls "$TDIR/home/conversation-urls" 2>/dev/null)"
+check 'nonce mode blacklists nothing' "$(grep -q "^$M3	" "$TDIR/home/salvage-nonmatching.txt" 2>/dev/null; [ $? -ne 0 ]; echo $?)" "$(cat "$TDIR/home/salvage-nonmatching.txt" 2>/dev/null)"
+# LEGACY mode (REQUIRE_NONCE=0): path overlap is authoritative — a zero-overlap capture IS
+# foreign, blacklisted by its EXACT matched URL, memo removed via claim-and-verify.
+env PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_REQUIRE_NONCE=0 NODE_OPTIONS= \
+  bash "$ENGINE" --harvest "$M3" --out "$TDIR/o-prov.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'legacy foreign harvest exits 9 with .foreign set-aside' "$([ "$RC" -eq 9 ] && ls "$TDIR/o-prov.md.foreign."* >/dev/null 2>&1; echo $?)" "rc=$RC"
+check 'legacy rejection removes the URL memo' "$([ ! -f "$TDIR/home/conversation-urls/$M3" ]; echo $?)" "$(cat "$TDIR/home/conversation-urls/$M3" 2>/dev/null)"
+check 'legacy rejection blacklists the EXACT matched URL' "$(grep -q "^$M3	https://chatgpt.com/c/mock-conversation" "$TDIR/home/salvage-nonmatching.txt" 2>/dev/null; echo $?)" "$(cat "$TDIR/home/salvage-nonmatching.txt" 2>/dev/null)"
 # A manifest in its own directory must NOT read as a reservation (gate #54 P1): exactly one
 # reservation is visible for this change.
 PRO_GATE_HOME="$TDIR/home" bash "$ENGINE" --status "$M3" --json >"$TDIR/st-m3.json" 2>/dev/null
