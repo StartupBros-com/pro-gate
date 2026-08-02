@@ -616,14 +616,17 @@ if [ -n "$HARVEST_MARKER" ]; then
   HARVEST_TMP="$OUT.cdp.$$"
   node "$SELF/cdp-salvage.mjs" "$RUN_MARKER" "$HARVEST_SECS" "$PORT" > "$HARVEST_TMP" || HARVEST_RC=$?
   if [ "$HARVEST_RC" -eq 0 ] && pg_is_review "$HARVEST_TMP"; then
-    # v0.28 (#48): provenance before acceptance. The reservation's .paths sidecar carries the
-    # change's file manifest (written when the exit-9 run reserved); a complete review citing
-    # NONE of those files is a foreign conversation's answer, not ours. Legacy reservations
-    # have no sidecar and skip the check (pg_review_matches_change accepts on a missing
-    # manifest). Rejection preserves everything: reservation kept, no miss counted, exit 9.
-    if ! pg_review_matches_change "$HARVEST_TMP" "$(pg_reservation_dir)/${RUN_MARKER}.paths"; then
+    # v0.28 (#48): provenance before acceptance. The run's manifest (written when the exit-9
+    # run reserved) carries the change's file list; a complete review citing NONE of those
+    # files is a foreign conversation's answer, not ours. Legacy reservations have no manifest
+    # and skip the check (pg_review_matches_change accepts on a missing manifest). Rejection
+    # preserves the reservation and counts no miss — and invalidates the memoized candidate
+    # (blacklist + memo removal) so the NEXT pass rescans instead of replaying the same
+    # foreign conversation forever.
+    if ! pg_review_matches_change "$HARVEST_TMP" "$(pg_manifest_dir)/${RUN_MARKER}"; then
       mv "$HARVEST_TMP" "$OUT.foreign.$$" 2>/dev/null || rm -f "$HARVEST_TMP"
-      echo "ERROR: harvested a complete review that cites NONE of this change's files — foreign conversation suspected. Reservation kept; retry --harvest (the real review may still be generating). The rejected capture is at $OUT.foreign.$$ for inspection." >&2
+      pg_provenance_reject "$RUN_MARKER"
+      echo "ERROR: harvested a complete review that cites NONE of this change's files — foreign conversation suspected. Reservation kept, its memoized candidate invalidated; retry --harvest (the real review may still be generating). The rejected capture is at $OUT.foreign.$$ for inspection." >&2
       pg_status in-progress "harvested review failed provenance (cites no change files); reservation kept"
       pg_finish 9
     fi
@@ -681,12 +684,21 @@ if [ -n "$HARVEST_MARKER" ]; then
          # miss-limit loss, and a reservation ALREADY ABSENT because another pass collected
          # this review (its collection removed the reservation and ledgered a clean row).
          # Declaring the second one lost invited a duplicate Pro spend; return the collected
-         # review idempotently instead, spending nothing.
+         # review idempotently instead, spending nothing. The LEDGERED SOURCE is the only
+         # acceptable proof: validate it, copy through a temp file, and atomically replace a
+         # CLEARED $OUT — pre-existing $OUT content (a stale review from an earlier reuse of
+         # the path) must never pass as evidence of collection (gate #54 P1).
          PRIOR_OUT="$(pg_ledger_lookup_clean "$RUN_MARKER")"
-         if [ -n "$PRIOR_OUT" ] && [ "$PRIOR_OUT" != "$OUT" ] && pg_is_review "$PRIOR_OUT" 2>/dev/null; then
-           cp "$PRIOR_OUT" "$OUT" 2>/dev/null || true
+         COLLECT_OK=0
+         if [ -n "$PRIOR_OUT" ] && [ -s "$PRIOR_OUT" ] && pg_is_review "$PRIOR_OUT" 2>/dev/null; then
+           if [ "$PRIOR_OUT" = "$OUT" ]; then
+             COLLECT_OK=1
+           elif rm -f "$OUT" 2>/dev/null && cp "$PRIOR_OUT" "$OUT.already.$$" 2>/dev/null \
+                && mv -f "$OUT.already.$$" "$OUT" 2>/dev/null; then
+             COLLECT_OK=1
+           fi
          fi
-         if [ -n "$PRIOR_OUT" ] && pg_is_review "$OUT" 2>/dev/null; then
+         if [ "$COLLECT_OK" = 1 ]; then
            SALVAGED=1
            echo "[oracle-review] this review was ALREADY collected (ledger: $PRIOR_OUT); returning it idempotently — nothing spent, nothing lost." >&2
            pg_status done "already collected; returned from $PRIOR_OUT"
@@ -992,6 +1004,7 @@ EFF_CONC="$(pg_ramp_level "$MAX_CONC")"
 find "$(dirname "$LOCKFILE")" -maxdepth 1 -name "$(basename "$LOCKFILE").pr-*" -mmin +1440 -delete 2>/dev/null || true
 find "${PRO_GATE_HARVEST_LOCK_DIR:-$PRO_GATE_HOME/harvest-locks}" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
 find "$(pg_active_dir)" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
+find "$(pg_manifest_dir)" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
 # Round-budget state (v0.22): entries self-prune on write, but a key never gated again keeps
 # its file (and its 0-byte .lock) forever. Sweep files untouched for longer than the rounds
 # window (every entry inside is expired), floored at 24h so a short window never deletes a
@@ -1297,7 +1310,9 @@ while :; do
   # remote-chrome only. PRO_GATE_EARLY_PROBE_SECS sets the delay, 0 disables.
   EARLY_PROBE_DELAY="${PRO_GATE_EARLY_PROBE_SECS:-75}"
   case "$EARLY_PROBE_DELAY" in ''|*[!0-9]*) EARLY_PROBE_DELAY=75;; esac
-  if [ "$attempt" -eq 0 ] && [ "$MODE" = remote-chrome ] && [ "$EARLY_PROBE_DELAY" -gt 0 ] \
+  # Armed on EVERY attempt (gate #54 P1): a dead first attempt commonly outlives the probe
+  # window, and a successful retry would otherwise generate with no early pointer at all.
+  if [ "$MODE" = remote-chrome ] && [ "$EARLY_PROBE_DELAY" -gt 0 ] \
      && command -v node >/dev/null 2>&1; then
     # Close inherited descriptors FIRST: the subshell inherits every open fd, including the
     # per-change flock and the account-slot fd — without this, the sleeping probe holds the
@@ -1526,8 +1541,9 @@ fi
 # clean runs into phantom exit-9s.
 if { [ "${SALVAGED:-0}" = 1 ] || [ "${REATTACHED:-0}" = 1 ]; } \
    && pg_is_review "$OUT" && ! pg_review_matches_change "$OUT" "$WORK/diff.paths"; then
-  echo "[oracle-review] captured a complete review but it cites NONE of this change's files — foreign conversation suspected; NOT accepting it as ours. Preserving the run for --harvest; the rejected capture is at $OUT.foreign.$$." >&2
+  echo "[oracle-review] captured a complete review but it cites NONE of this change's files — foreign conversation suspected; NOT accepting it as ours. Its memoized candidate is invalidated; preserving the run for --harvest. The rejected capture is at $OUT.foreign.$$." >&2
   mv "$OUT" "$OUT.foreign.$$" 2>/dev/null || rm -f "$OUT"
+  pg_provenance_reject "$RUN_MARKER"
   SALVAGE_RAN=1; SALVAGE_PRESERVE=1   # route to the reserve-and-harvest branch below
 fi
 if pg_is_review "$OUT"; then
@@ -1545,12 +1561,13 @@ elif [ "${SALVAGE_RAN:-0}" = 1 ] && [ "${SALVAGE_PRESERVE:-0}" = 1 ]; then
   # releases its flock slot, leave the tab open (pg_finish skips close for exit 9), and hand the
   # caller a no-respend collection path. Fresh runs reconcile/respect the reservation, so actual
   # account concurrency and same-PR serialization remain correct after this wrapper exits.
-  # v0.28 (#48): persist the change's file manifest beside the reservation so a later
-  # --harvest (a separate process with no diff) can provenance-check its capture. Written
-  # before the reservation itself so a reader never sees a reservation without its sidecar.
+  # v0.28 (#48): persist the change's file manifest (its OWN directory — never inside
+  # in-progress/, whose enumerators would misread it as a reservation) so a later --harvest
+  # (a separate process with no diff) can provenance-check its capture. Written before the
+  # reservation itself so a reader never sees a reservation without its manifest.
   if [ -s "$WORK/diff.paths" ]; then
-    mkdir -p "$(pg_reservation_dir)" 2>/dev/null || true
-    cp "$WORK/diff.paths" "$(pg_reservation_dir)/${RUN_MARKER}.paths" 2>/dev/null || true
+    mkdir -p "$(pg_manifest_dir)" 2>/dev/null || true
+    cp "$WORK/diff.paths" "$(pg_manifest_dir)/${RUN_MARKER}" 2>/dev/null || true
   fi
   if ! pg_reservation_write "$RUN_MARKER" "${ROUND_KEY:-diff}" "$OUT" "${SLOT_HELD:-}" "$RESOLVED_MODEL"; then
     # Fail closed: without the durable reservation, exit 9 would under-count a live Pro tab and

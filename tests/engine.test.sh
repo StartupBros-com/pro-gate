@@ -964,7 +964,8 @@ check 'provenance accepts a single ambiguous citation' "$([ "$RC" -eq 0 ]; echo 
 echo '# v0.28: harvest provenance — foreign capture preserved, never returned as ours'
 M3="pg-run-provtest-9-1700000030-44"
 printf '9\t%s\t%s\t0\t1\tGPT-X\n' "$TDIR/o-prov.md" "$(date +%s)" > "$TDIR/home/in-progress/$M3"
-printf 'src/real.sh\n' > "$TDIR/home/in-progress/$M3.paths"
+mkdir -p "$TDIR/home/manifests"
+printf 'src/real.sh\n' > "$TDIR/home/manifests/$M3"
 cat > "$TDIR/tab.txt" <<TAB
 conversation for run marker: $M3
 P0: none
@@ -980,11 +981,22 @@ check 'foreign harvest capture exits 9 (preserved)' "$([ "$RC" -eq 9 ]; echo $?)
 check 'foreign harvest keeps the reservation' "$([ -f "$TDIR/home/in-progress/$M3" ]; echo $?)" 'reservation destroyed'
 check 'foreign capture set aside for inspection' "$(ls "$TDIR/o-prov.md.foreign."* >/dev/null 2>&1; echo $?)" 'no .foreign file'
 check 'foreign capture not returned as the review' "$([ ! -s "$TDIR/o-prov.md" ]; echo $?)" 'out file written'
-# Positive control: a manifest that matches the citation accepts the same capture.
-printf 'apps/blog-writer/collect.ts\n' > "$TDIR/home/in-progress/$M3.paths"
+# Rejection invalidates the memoized candidate: memo gone, URL on the per-marker blacklist —
+# without this the next harvest replays the same foreign conversation forever (gate #54 P1).
+check 'rejection removes the URL memo' "$([ ! -f "$TDIR/home/conversation-urls/$M3" ]; echo $?)" "$(cat "$TDIR/home/conversation-urls/$M3" 2>/dev/null)"
+check 'rejection blacklists the URL for this marker' "$(grep -q "^$M3	" "$TDIR/home/salvage-nonmatching.txt" 2>/dev/null; echo $?)" "$(cat "$TDIR/home/salvage-nonmatching.txt" 2>/dev/null)"
+# A manifest in its own directory must NOT read as a reservation (gate #54 P1): exactly one
+# reservation is visible for this change.
+PRO_GATE_HOME="$TDIR/home" bash "$ENGINE" --status "$M3" --json >"$TDIR/st-m3.json" 2>/dev/null
+check 'manifest not counted as a reservation' "$([ "$(jq -r '.reservations | length' "$TDIR/st-m3.json")" = 1 ]; echo $?)" "$(jq -c .reservations "$TDIR/st-m3.json")"
+# Positive control: a manifest that matches the citation accepts the same capture. (The
+# blacklist from the rejection above is cleared: this fixture reuses the same mock URL, which
+# a real recovered-from-foreign flow would reach via a different conversation.)
+rm -f "$TDIR/home/salvage-nonmatching.txt"
+printf 'apps/blog-writer/collect.ts\n' > "$TDIR/home/manifests/$M3"
 run_engine --harvest "$M3" --out "$TDIR/o-prov.md" --timeout 5s
 check 'matching harvest capture exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
-check 'matching harvest removes reservation + sidecar' "$([ ! -f "$TDIR/home/in-progress/$M3" ] && [ ! -f "$TDIR/home/in-progress/$M3.paths" ]; echo $?)" "$(ls "$TDIR/home/in-progress" 2>/dev/null)"
+check 'matching harvest removes reservation + manifest' "$([ ! -f "$TDIR/home/in-progress/$M3" ] && [ ! -f "$TDIR/home/manifests/$M3" ]; echo $?)" "$(ls "$TDIR/home/in-progress" "$TDIR/home/manifests" 2>/dev/null)"
 
 echo '# v0.28: already-collected harvest returns the ledgered review idempotently'
 M4="pg-run-collected-5-1700000031-55"
@@ -1000,12 +1012,19 @@ printf 'idle tab with no markers at all\n' > "$TDIR/tab.txt"
 run_engine --harvest "$M4" --out "$TDIR/o-already.md" --timeout 5s
 check 'already-collected harvest exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
 check 'already-collected returns the prior review' "$(cmp -s "$TDIR/o-already.md" "$TDIR/prior-collected.md"; echo $?)" "$(head -2 "$TDIR/o-already.md" 2>/dev/null)"
+# Pre-existing $OUT content must never pass as proof of collection (gate #54 P1): with the
+# ledgered source gone, a stale review already sitting at --out stays rejected (exit 6).
+M6="pg-run-staleout-8-1700000033-77"
+printf '{"ts":"2026-01-06T00:00:00+0000","pr":"8","repo":"/tmp/x","exit":0,"outcome":"clean","secs":10,"attempts":0,"conc":0,"ceiling":1,"live":1,"salvaged":1,"diff_lines":4,"out":"%s","model":"m","marker":"%s","round_key":"staleout-8"}\n' "$TDIR/deleted-prior.md" "$M6" >> "$TDIR/home/ledger.jsonl"
+cp "$TDIR/prior-collected.md" "$TDIR/o-stale.md"
+run_engine --harvest "$M6" --out "$TDIR/o-stale.md" --timeout 5s
+check 'stale OUT content never passes as collected (exit 6)' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
 # Without a ledgered copy the same state is still a loss (exit 6), as before.
 M5="pg-run-lostcase-6-1700000032-66"
 run_engine --harvest "$M5" --out "$TDIR/o-lost.md" --timeout 5s
 check 'absent reservation without ledger row still exits 6' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
 
-echo '# v0.28: early URL capture + reservation .paths sidecar on a fresh run'
+echo '# v0.28: early URL capture + change manifest on a fresh run'
 cat > "$TDIR/bin/oracle-early" <<EARLY
 #!/usr/bin/env bash
 M="\$(printf '%s\n' "\$@" | grep -oE 'pg-run-[A-Za-z0-9.-]+' | head -1)"
@@ -1026,7 +1045,7 @@ env PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0
 RC=$?
 check 'early-capture run preserves as in-progress (exit 9)' "$([ "$RC" -eq 9 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
 check 'conversation URL memo written DURING generation' "$(ls "$TDIR/home/conversation-urls/" 2>/dev/null | grep -q 'pg-run-'; echo $?)" "$(ls "$TDIR/home/conversation-urls/" 2>/dev/null)"
-EARLY_MARKER="$(ls "$TDIR/home/in-progress/" 2>/dev/null | grep -m1 -E 'pg-run-.*-120-' | grep -v '\.paths$')"
-check 'reservation .paths sidecar written' "$([ -n "$EARLY_MARKER" ] && [ -s "$TDIR/home/in-progress/$EARLY_MARKER.paths" ]; echo $?)" "in-progress: $(ls "$TDIR/home/in-progress" 2>/dev/null)"
+EARLY_MARKER="$(ls "$TDIR/home/in-progress/" 2>/dev/null | grep -m1 -E 'pg-run-.*-120-')"
+check 'change manifest written beside the reservation' "$([ -n "$EARLY_MARKER" ] && [ -s "$TDIR/home/manifests/$EARLY_MARKER" ]; echo $?)" "manifests: $(ls "$TDIR/home/manifests" 2>/dev/null)"
 
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }

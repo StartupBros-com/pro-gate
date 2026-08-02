@@ -430,6 +430,12 @@ pg_cdp_heal() {
 # consecutive confirmed absences release the reservation before TTL.
 # Harvest success/lost removes the file. Writes/removes serialize under one flock/mkdir lock.
 pg_reservation_dir() { echo "${PRO_GATE_RESERVATION_DIR:-$PRO_GATE_HOME/in-progress}"; }
+# v0.28: change-manifest sidecars (the diff's file list, for provenance checks) live in their
+# OWN directory — NOT inside in-progress/. Every reservation enumerator globs that directory
+# and the marker validator accepts dots, so a "<marker>.paths" file there read as a legacy
+# reservation: slot planning counted it, and reconciliation probed it and rewrote it as a miss
+# record, destroying the manifest (gate #54 P1).
+pg_manifest_dir() { echo "${PRO_GATE_MANIFEST_DIR:-$PRO_GATE_HOME/manifests}"; }
 pg_reservation_lock() { echo "${PRO_GATE_RESERVATION_LOCK:-$PRO_GATE_HOME/in-progress.lock}"; }
 # Markers become filenames under PRO_GATE_HOME and lock paths; every character must be from the
 # safe class (in particular no "/" anywhere), not just the first one after the prefix.
@@ -549,9 +555,9 @@ pg_reservation_remove() { # marker
   local marker="$1" dir
   pg_reservation_marker_ok "$marker" || return 0
   dir="$(pg_reservation_dir)"; pg_reservation_guard_acquire || return 1
-  # v0.28: the .paths sidecar (the change's file manifest for provenance checks) lives and
-  # dies with its reservation.
-  rm -f "$dir/$marker" "$dir/$marker.paths" 2>/dev/null
+  # v0.28: the manifest sidecar (the change's file list for provenance checks) lives and dies
+  # with its reservation.
+  rm -f "$dir/$marker" "$(pg_manifest_dir)/$marker" 2>/dev/null
   pg_reservation_guard_release
 }
 
@@ -571,7 +577,7 @@ pg_reservation_note_miss() {
   case "$misses" in ''|*[!0-9]*) misses=0;; esac
   misses=$(( misses + 1 ))
   if [ "$misses" -ge "$miss_limit" ]; then
-    rm -f "$f" "$f.paths" 2>/dev/null
+    rm -f "$f" "$(pg_manifest_dir)/$marker" 2>/dev/null
     pg_reservation_guard_release
     echo released
   else
@@ -1027,6 +1033,22 @@ pg_review_matches_change() {
 $cited
 PG_EOF
   return 1
+}
+
+# pg_provenance_reject <marker>: invalidate a marker's memoized conversation candidate after
+# its capture failed the provenance check. Without this, cdp-salvage's URL memo (written the
+# moment the capture matched) makes the next harvest PREFER the same foreign conversation and
+# starve the real one indefinitely (gate #54 P1). The URL goes on the per-marker blacklist —
+# deliberately bypassing cdp-salvage's own "never blacklist ourUrls" guard: marker match said
+# "ours", but the CONTENT proved the answer is not this change's review, which is the stronger
+# signal — and the memo is removed so the next pass rescans all candidates.
+pg_provenance_reject() {
+  local m="$1" memo url
+  memo="$PRO_GATE_HOME/conversation-urls/$m"
+  url="$(head -c 300 "$memo" 2>/dev/null | tr -d '\n')"
+  [ -n "$url" ] || return 0
+  { printf '%s\t%s\n' "$m" "$url" >> "$PRO_GATE_HOME/salvage-nonmatching.txt"; } 2>/dev/null || true
+  rm -f "$memo" 2>/dev/null || true
 }
 
 # pg_ledger_lookup_clean <marker>: echo the newest CLEAN ledger row's `out` path for a marker,
