@@ -207,8 +207,8 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
     # legitimate marker like ...foo.tmp.api-... (gate #54 r12 P2).
     OG_TAIL="${m##*.tmp.}"
     if [ "$OG_TAIL" != "$m" ]; then case "$OG_TAIL" in ''|*[!0-9]*) ;; *) continue;; esac; fi
-    pg_is_review "$f" || continue
     st_match "$m" "" || continue
+    pg_is_review "$f" || continue
     a_kind=completed; case "$f" in */pending/*) a_kind=pending;; esac
     a_epoch="${m%-*}"; a_epoch="${a_epoch##*-}"; case "$a_epoch" in ''|*[!0-9]*) a_epoch=0;; esac
     if [ "$a_epoch" -ge "$ST_ART_EPOCH" ]; then
@@ -452,7 +452,9 @@ if [ "$STATUS_REQUESTED" != 1 ]; then
       rmdir "$PG_OUT_GUARD_DIR" 2>/dev/null
       if mkdir "$PG_OUT_GUARD_DIR" 2>/dev/null; then
         echo "$$" > "$PG_OUT_GUARD_DIR/pid" 2>/dev/null || true
-        PG_OUT_GUARD_OK=1
+        # Two processes can race the stale-owner cleanup and both reach here (gate #54 r13):
+        # re-read the pid and claim ownership only when it is OURS.
+        [ "$(cat "$PG_OUT_GUARD_DIR/pid" 2>/dev/null)" = "$$" ] && PG_OUT_GUARD_OK=1
       fi
     fi
     if [ "$PG_OUT_GUARD_OK" != 1 ]; then
@@ -612,6 +614,7 @@ pg_publish_fail() {  # $1 = snapshot — shared failure path: durability decides
     if { mkdir -p "$PRO_GATE_HOME/pending" \
          && cp "$src" "$PRO_GATE_HOME/pending/$RUN_MARKER.tmp.$$" \
          && mv -f "$PRO_GATE_HOME/pending/$RUN_MARKER.tmp.$$" "$PRO_GATE_HOME/pending/$RUN_MARKER"; } 2>/dev/null; then
+      pg_reservation_remove "$RUN_MARKER" 2>/dev/null || true
       echo "ERROR: review captured but --out ($OUT) and the artifact store are unwritable. The review is durable at $PRO_GATE_HOME/pending/$RUN_MARKER — copy it from there; do NOT respend." >&2
       pg_status failed "captured; --out unwritable; review durable at pending/$RUN_MARKER"
     else
@@ -868,6 +871,10 @@ if [ -n "$HARVEST_MARKER" ]; then
       # arrives with the echo, or the reservation ages out for manual recovery. Deliberately
       # independent of manifest/sidecar persistence (r4 P1): missing metadata fails CLOSED.
       mv "$HARVEST_TMP" "$OUT.unbound.$$" 2>/dev/null || rm -f "$HARVEST_TMP"
+      # The exit-9 contract PROMISES a live reservation; a harvest can reach here for a
+      # marker whose reservation already released — re-persist so the redirect/budget
+      # machinery actually protects the retry (gate #54 r13).
+      pg_reservation_write "$RUN_MARKER" "" "$OUT" 2>/dev/null || true
       echo "ERROR: harvested a complete review that cannot be bound to this run (no run-marker echo — possibly an older answer while the current one is still generating). Reservation and candidate kept. Retry --harvest; inspect $OUT.unbound.$$; PRO_GATE_REQUIRE_NONCE=0 accepts best-effort captures." >&2
       pg_status in-progress "harvested review unbindable (no nonce echo); reservation kept, retry"
       pg_finish 9
@@ -876,6 +883,7 @@ if [ -n "$HARVEST_MARKER" ]; then
       # capture IS foreign here — blacklist its exact source and rescan.
       mv "$HARVEST_TMP" "$OUT.foreign.$$" 2>/dev/null || rm -f "$HARVEST_TMP"
       pg_provenance_reject "$RUN_MARKER" "${HARVEST_URL:-}"
+      pg_reservation_write "$RUN_MARKER" "" "$OUT" 2>/dev/null || true
       echo "ERROR: harvested a complete review that cites NONE of this change's files — foreign conversation suspected. Reservation kept, its memoized candidate invalidated; retry --harvest. The rejected capture is at $OUT.foreign.$$ for inspection." >&2
       pg_status in-progress "harvested review failed provenance (cites no change files); reservation kept"
       pg_finish 9
