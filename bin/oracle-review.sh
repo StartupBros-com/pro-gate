@@ -197,9 +197,13 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
   # at a stale review.
   : > "$ST_TMP/artifacts.jsonl"
   ST_ARTIFACT_HINT=""; ST_ART_EPOCH=0
-  for f in "$(pg_completed_dir)"/pg-run-* "$PRO_GATE_HOME/pending"/pg-run-*; do
+  # pending scanned FIRST so a completed artifact wins equal-epoch ties (>= keeps the last
+  # seen); temp suffixes and non-review content never drive a hint (gate #54 r11 P2).
+  for f in "$PRO_GATE_HOME/pending"/pg-run-* "$(pg_completed_dir)"/pg-run-*; do
     [ -f "$f" ] || continue
     m="$(basename "$f")"
+    case "$m" in *.tmp.*) continue;; esac
+    pg_is_review "$f" || continue
     st_match "$m" "" || continue
     a_kind=completed; case "$f" in */pending/*) a_kind=pending;; esac
     a_epoch="${m%-*}"; a_epoch="${a_epoch##*-}"; case "$a_epoch" in ''|*[!0-9]*) a_epoch=0;; esac
@@ -410,6 +414,18 @@ if [ -d "$OUT" ]; then
   echo "ERROR: --out must be a file path, not an existing directory: $OUT" >&2
   exit 2
 fi
+# One live run per --out (gate #54 r11): the status sidecar is keyed by $OUT, so two
+# concurrent runs sharing it would overwrite each other's phase/marker and cross-feed their
+# pollers even with distinct result artifacts. Held for the process lifetime; best-effort
+# where flock or the directory is unavailable.
+if [ "$STATUS_REQUESTED" != 1 ] && pg_have flock; then
+  if { exec {PG_OUT_GUARD_FD}>>"$OUT.lock"; } 2>/dev/null; then
+    if ! flock -n "$PG_OUT_GUARD_FD" 2>/dev/null; then
+      echo "ERROR: another live run is already using --out $OUT (its status sidecar would be overwritten). Use a distinct --out per run." >&2
+      exit 2
+    fi
+  fi
+fi
 # Fresh runs need oracle; --harvest only needs node+CDP and checks that prerequisite inside
 # its branch below (moving this gate matters when oracle is temporarily unavailable but a spent
 # review is waiting in an open conversation).
@@ -519,15 +535,29 @@ pg_publish_out() {  # $1 = verified snapshot → atomically publish to $OUT; rc 
   rm -f "$OUT.pub.$$" 2>/dev/null
   return "$rc"
 }
-pg_result_file() {  # $1 = verified snapshot — name the CANONICAL result: the marker-addressed
-  # write-once artifact when persistable (gate #54 r10: two runs sharing one --out can both
-  # publish "successfully" with the later rename winning; the artifact cannot be cross-fed).
-  # The caller-supplied $OUT remains a best-effort alias holding the same bytes.
-  if pg_completed_write "$RUN_MARKER" "$1" 2>/dev/null && [ -s "$(pg_completed_dir)/$RUN_MARKER" ]; then
-    echo "RESULT_FILE=$(pg_completed_dir)/$RUN_MARKER"
-  else
-    echo "RESULT_FILE=$OUT"
+pg_persist_result() {  # $1 = verified snapshot — persist the CANONICAL, marker-addressed
+  # result and set RESULT_PATH (gate #54 r10/r11). Ladder: completed artifact → pending BYTES
+  # (a pointer to a /tmp snapshot dies with reboots and tmp sweeps; the review itself must be
+  # durable) → the kept private snapshot (PG_KEEP_FINAL). Shared $OUT is NEVER canonical:
+  # two runs sharing it can both "win" a rename, and cross-feeding callers is worse than a
+  # non-preferred path.
+  local src="$1"
+  if pg_completed_write "$RUN_MARKER" "$src" 2>/dev/null && [ -s "$(pg_completed_dir)/$RUN_MARKER" ]; then
+    RESULT_PATH="$(pg_completed_dir)/$RUN_MARKER"
+    return 0
   fi
+  if { mkdir -p "$PRO_GATE_HOME/pending" \
+       && cp "$src" "$PRO_GATE_HOME/pending/$RUN_MARKER.tmp.$$" \
+       && mv -f "$PRO_GATE_HOME/pending/$RUN_MARKER.tmp.$$" "$PRO_GATE_HOME/pending/$RUN_MARKER"; } 2>/dev/null; then
+    RESULT_PATH="$PRO_GATE_HOME/pending/$RUN_MARKER"
+    echo "[oracle-review] WARNING: completed-artifact store unwritable; the review is durable at $RESULT_PATH instead." >&2
+    return 0
+  fi
+  rm -f "$PRO_GATE_HOME/pending/$RUN_MARKER.tmp.$$" 2>/dev/null
+  PG_KEEP_FINAL=1
+  RESULT_PATH="$src"
+  echo "[oracle-review] WARNING: no durable store writable; the review is KEPT at $RESULT_PATH (survives only until temp cleanup) — copy it out now." >&2
+  return 0
 }
 pg_publish_fail() {  # $1 = snapshot — shared failure path: durability decides the message,
   # and when NOTHING could be persisted the snapshot itself is retained (gate #54 r9).
@@ -536,16 +566,17 @@ pg_publish_fail() {  # $1 = snapshot — shared failure path: durability decides
     echo "ERROR: review captured but could not be written to --out ($OUT). It is durable at $(pg_completed_dir)/$RUN_MARKER — copy it from there or re-run --harvest '$RUN_MARKER'; do NOT respend." >&2
     pg_status failed "already collected; --out unwritable; artifact at $(pg_completed_dir)/$RUN_MARKER"
   else
-    PG_KEEP_FINAL=1
-    # Durable, MARKER-ADDRESSED pointer to the kept snapshot (gate #54 r10): a random $WORK
-    # path on stderr is not rediscoverable, and the colocated $OUT.status often cannot be
-    # written in exactly this scenario. If even the pending record cannot be written, keep
-    # the run's active record and tab so --status still shows a live trail.
+    # Durable MARKER-ADDRESSED copy of the review BYTES (gate #54 r10/r11): a pointer to a
+    # /tmp snapshot dies with reboots and temp sweeps. If no durable location exists at all,
+    # keep the run's active record and tab so --status still shows a live trail.
     if { mkdir -p "$PRO_GATE_HOME/pending" \
-         && printf '%s\t%s\n' "$src" "$(pg_sha256 "$src")" > "$PRO_GATE_HOME/pending/$RUN_MARKER"; } 2>/dev/null; then
-      echo "ERROR: review captured but neither --out ($OUT) nor the artifact store is writable. The verified snapshot is KEPT at $src (recorded in pending/$RUN_MARKER) — copy it manually; do NOT respend." >&2
-      pg_status failed "captured; --out and artifact store unwritable; snapshot kept at $src (pending/$RUN_MARKER)"
+         && cp "$src" "$PRO_GATE_HOME/pending/$RUN_MARKER.tmp.$$" \
+         && mv -f "$PRO_GATE_HOME/pending/$RUN_MARKER.tmp.$$" "$PRO_GATE_HOME/pending/$RUN_MARKER"; } 2>/dev/null; then
+      echo "ERROR: review captured but --out ($OUT) and the artifact store are unwritable. The review is durable at $PRO_GATE_HOME/pending/$RUN_MARKER — copy it from there; do NOT respend." >&2
+      pg_status failed "captured; --out unwritable; review durable at pending/$RUN_MARKER"
     else
+      rm -f "$PRO_GATE_HOME/pending/$RUN_MARKER.tmp.$$" 2>/dev/null
+      PG_KEEP_FINAL=1
       PG_PRESERVE_STATE=1
       echo "ERROR: review captured but nothing under $PRO_GATE_HOME is writable either. The verified snapshot is KEPT at $src; the run's tab and active record are PRESERVED — recover manually; do NOT respend." >&2
       pg_status failed "captured; no durable location writable; snapshot kept at $src; state preserved"
@@ -831,9 +862,10 @@ if [ -n "$HARVEST_MARKER" ]; then
     pg_round_note_severity "$HARVEST_KEY" "$PG_FINAL_SRC"
     SALVAGED=1
     echo "[oracle-review] harvest recovered the completed review ($(wc -c < "$PG_FINAL_SRC" 2>/dev/null) bytes)." >&2
-    pg_status done
+    pg_persist_result "$PG_FINAL_SRC"
+    pg_status done "result: $RESULT_PATH"
     cat "$PG_FINAL_SRC"
-    pg_result_file "$PG_FINAL_SRC"
+    echo "RESULT_FILE=$RESULT_PATH"
     pg_finish 0
   fi
   rm -f "$HARVEST_TMP"
@@ -917,9 +949,10 @@ if [ -n "$HARVEST_MARKER" ]; then
            # Same checked publication as every other success (gate #54 r9): done is set only
            # once $OUT verifiably holds the snapshot.
            pg_publish_out "$PG_FINAL_SRC" || pg_publish_fail "$PG_FINAL_SRC"
-           pg_status done "already collected; returned from ${COLLECT_SRC}"
+           pg_persist_result "$PG_FINAL_SRC"
+           pg_status done "already collected; result: $RESULT_PATH"
            cat "$PG_FINAL_SRC"
-           pg_result_file "$PG_FINAL_SRC"
+           echo "RESULT_FILE=$RESULT_PATH"
            pg_finish 0
          fi
          if [ -n "$PRIOR_OUT" ]; then
@@ -1783,6 +1816,12 @@ fi
 FINAL_SNAP=""
 if pg_is_review "$CAPTURE_OUT" && cp "$CAPTURE_OUT" "$WORK/final.snap" 2>/dev/null && pg_is_review "$WORK/final.snap"; then
   FINAL_SNAP="$WORK/final.snap"
+elif pg_is_review "$CAPTURE_OUT"; then
+  # A VALID capture that could not be snapshotted (disk full, WORK trouble) must not fall
+  # through to the state-clearing generic exit 6 with its bytes forgotten (gate #54 r11):
+  # preserve the run — the capture stays at $CAPTURE_OUT and the tab/reservation survive.
+  echo "[oracle-review] valid capture at $CAPTURE_OUT could not be snapshotted; preserving the run for --harvest." >&2
+  SALVAGE_RAN=1; SALVAGE_PRESERVE=1
 fi
 # FAIL CLOSED for unbindable browser-matched captures (gate #54 r3): every v0.28 prompt
 # promises the nonce echo; a capture without it whose path check cannot bind either (no
@@ -1841,9 +1880,12 @@ if [ -n "$FINAL_SNAP" ]; then
   # Verified publication (gate #54 r8/r9): "done" PROMISES a readable --out; a failed publish
   # must not report clean, and the durability of what WAS captured decides the message.
   pg_publish_out "$PG_FINAL_SRC" || pg_publish_fail "$PG_FINAL_SRC"
-  pg_status done
+  # Canonical result BEFORE terminal done (gate #54 r11): pollers act on done immediately, so
+  # the durable artifact must already exist and be named in the status record they read.
+  pg_persist_result "$PG_FINAL_SRC"
+  pg_status done "result: $RESULT_PATH"
   cat "$PG_FINAL_SRC"
-  pg_result_file "$PG_FINAL_SRC"
+  echo "RESULT_FILE=$RESULT_PATH"
   pg_finish 0
 elif [ "${SALVAGE_RAN:-0}" = 1 ] && [ "${SALVAGE_PRESERVE:-0}" = 1 ]; then
   # The salvage budget ran out while the conversation was STILL GENERATING (or the outcome was

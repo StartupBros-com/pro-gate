@@ -1123,13 +1123,22 @@ pg_sha256() {  # <file>: echo the hex digest, or nothing when no tool is availab
   fi
 }
 pg_completed_write() {  # <marker> <file>: write-once; an existing artifact is never replaced
-  local marker="$1" f="$2" dir
+  local marker="$1" f="$2" dir rc
   pg_reservation_marker_ok "$marker" || return 1
   [ -s "$f" ] || return 1
   dir="$(pg_completed_dir)"
-  [ -f "$dir/$marker" ] && return 0
-  mkdir -p "$dir" 2>/dev/null || return 1
-  cp "$f" "$dir/$marker.tmp.$$" 2>/dev/null && mv -f "$dir/$marker.tmp.$$" "$dir/$marker" 2>/dev/null
+  if [ ! -f "$dir/$marker" ]; then
+    mkdir -p "$dir" 2>/dev/null || return 1
+    cp "$f" "$dir/$marker.tmp.$$" 2>/dev/null && mv -f "$dir/$marker.tmp.$$" "$dir/$marker" 2>/dev/null
+    rc=$?
+    # A failed cp/mv must not leave a pg-run-*-globbable temp behind — status discovery would
+    # read it as a completed review (gate #54 r11 P2).
+    rm -f "$dir/$marker.tmp.$$" 2>/dev/null
+    [ "$rc" = 0 ] || return 1
+  fi
+  # An installed artifact supersedes any pending-recovery copy for the marker (r11 P2).
+  rm -f "$PRO_GATE_HOME/pending/$marker" 2>/dev/null
+  return 0
 }
 pg_completed_lookup() {  # <marker> <out>: place the artifact at <out>; rc 0 on success
   local marker="$1" out="$2" src rc
