@@ -1268,6 +1268,15 @@ env PRO_GATE_HOME="$TDIR/home-title" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UP
   >"$TDIR/stdout" 2>"$TDIR/stderr"
 RC=$?
 check 'title-line run exits 0 (nonce echoed back from the dumped prompt)' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
-check 'prompt first line names the run for the auto-titler' "$(head -1 "$TDIR/prompt-dump.txt" 2>/dev/null | grep -q '^pro-gate review: PR #132 \['; echo $?)" "first line: $(head -1 "$TDIR/prompt-dump.txt" 2>/dev/null)"
+check 'prompt first line names the run + round' "$(head -1 "$TDIR/prompt-dump.txt" 2>/dev/null | grep -q '^pro-gate review: PR #132 r1 \['; echo $?)" "first line: $(head -1 "$TDIR/prompt-dump.txt" 2>/dev/null)"
+# A second round of the SAME PR carries a distinct discriminator (gate #57 P1).
+env PRO_GATE_HOME="$TDIR/home-title" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_MAX_RETRIES=0 PG_TEST_PROMPT_DUMP="$TDIR/prompt-dump2.txt" \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-dump" NODE_OPTIONS= \
+  bash "$ENGINE" --pr 132 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$TDIR/o-title2.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'second same-PR round exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
+check 'second round titles r2' "$(head -1 "$TDIR/prompt-dump2.txt" 2>/dev/null | grep -q '^pro-gate review: PR #132 r2 \['; echo $?)" "first line: $(head -1 "$TDIR/prompt-dump2.txt" 2>/dev/null)"
 
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }

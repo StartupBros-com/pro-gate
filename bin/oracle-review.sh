@@ -1221,10 +1221,16 @@ PROMPT_FILE="$WORK/prompt.md"
   # sidebar during manual recovery (observed in >=3 sessions) and among concurrent review
   # tabs; the engine's own machinery is unaffected (it matches by marker, never by title).
   # Zero new API surface — this is prompt wording only.
+  # r<N> distinguishes review ROUNDS of one change (gate #57 P1): PR number and slug repeat
+  # across re-reviews, and a human recovering manually must not open an older round's
+  # verdict. N = rounds already spent in the rolling window + 1 — approximate under races,
+  # but same-change runs serialize on the per-change lock in practice, and the window reset
+  # is disambiguated by the sidebar's own dates.
+  TITLE_ROUND="r$(( $(pg_round_count "${ROUND_KEY:-diff}" 2>/dev/null || echo 0) + 1 ))"
   if [ -n "$PR_NUM" ]; then
-    printf 'pro-gate review: PR #%s [%s]\n\n' "$PR_NUM" "$REPO_SLUG"
+    printf 'pro-gate review: PR #%s %s [%s]\n\n' "$PR_NUM" "$TITLE_ROUND" "$REPO_SLUG"
   else
-    printf 'pro-gate review: %s\n\n' "${ROUND_KEY:-diff}"
+    printf 'pro-gate review: %s %s\n\n' "${ROUND_KEY:-diff}" "$TITLE_ROUND"
   fi
   # Lead with the @GitHub connector tag + an explicit directive (belt-and-suspenders: oracle
   # pastes the prompt in one shot, so @GitHub is a recognized hint, not a bound mention pill;
