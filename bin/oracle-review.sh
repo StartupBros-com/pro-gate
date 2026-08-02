@@ -190,6 +190,25 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
     done
   fi
 
+  # 1b) Completed artifacts: collected reviews that need no browser and no spend. A failed
+  # publication can leave one behind with only a generic 'failed' ledger row (gate #54 r9) —
+  # the correct next step is returning the artifact, never a fresh spend.
+  : > "$ST_TMP/artifacts.jsonl"
+  if [ -d "$(pg_completed_dir)" ]; then
+    for f in "$(pg_completed_dir)"/pg-run-*; do
+      [ -f "$f" ] || continue
+      m="$(basename "$f")"
+      st_match "$m" "" || continue
+      [ -n "$ST_HINT" ] || ST_HINT="a collected review already EXISTS for this change: $f — return it with $ST_ENGINE --harvest '$m' --out <file> (no browser, nothing spent)"
+      if pg_have jq; then
+        jq -nc --arg marker "$m" --arg artifact "$f" '{marker:$marker,artifact:$artifact}' \
+          >> "$ST_TMP/artifacts.jsonl" 2>/dev/null
+      else
+        printf '%s\t%s\n' "$m" "$f" >> "$ST_TMP/artifacts.tsv"
+      fi
+    done
+  fi
+
   # 2) Round budget + live-run probes, per change key. The key set is the UNION of rounds/*,
   # active/*, held per-change lock files, and the query-derived key — not rounds/* alone: a
   # first-ever run holds the per-change lock (and, once committed, an active record) while it
@@ -319,7 +338,8 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
       --slurpfile res <(cat "$ST_TMP/res.jsonl" 2>/dev/null; echo null) \
       --slurpfile rounds <(cat "$ST_TMP/rounds.jsonl" 2>/dev/null; echo null) \
       --slurpfile ledger <(cat "$ST_TMP/ledger.jsonl" 2>/dev/null; echo null) \
-      '{query:$query,home:$home,reservations:($res[:-1]),rounds:($rounds[:-1]),recent_runs:($ledger[:-1]),next_step:$hint}'
+      --slurpfile artifacts <(cat "$ST_TMP/artifacts.jsonl" 2>/dev/null; echo null) \
+      '{query:$query,home:$home,reservations:($res[:-1]),completed_artifacts:($artifacts[:-1]),rounds:($rounds[:-1]),recent_runs:($ledger[:-1]),next_step:$hint}'
     exit 0
   fi
 
@@ -333,6 +353,14 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
     fi
   else
     echo "in-progress reservations: none"
+  fi
+  if [ -s "$ST_TMP/artifacts.jsonl" ] || [ -s "$ST_TMP/artifacts.tsv" ]; then
+    echo "collected artifacts (return with --harvest, no browser, no spend):"
+    if pg_have jq && [ -s "$ST_TMP/artifacts.jsonl" ]; then
+      jq -r '"  " + .marker + "  -> " + .artifact' "$ST_TMP/artifacts.jsonl"
+    else
+      awk -F'\t' '{printf "  %s  -> %s\n", $1, $2}' "$ST_TMP/artifacts.tsv" 2>/dev/null
+    fi
   fi
   if [ -s "$ST_TMP/rounds.jsonl" ] || [ -s "$ST_TMP/rounds.tsv" ]; then
     echo "round budget (rolling window $(( ST_WIN / 3600 ))h, cap $ST_CAP):"
@@ -360,6 +388,13 @@ PORT="${ORACLE_BROWSER_PORT:-9222}"
 MODEL="${ORACLE_MODEL:-gpt-5.6}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/pro-review.XXXXXX")"
 [ -n "$OUT" ] || OUT="$WORK/findings.md"
+if [ -d "$OUT" ]; then
+  # mv into an existing directory "succeeds" by moving the file INSIDE it, so a directory
+  # here would let publication report done while $OUT is still not the promised file
+  # (gate #54 r9 P2). Reject up front.
+  echo "ERROR: --out must be a file path, not an existing directory: $OUT" >&2
+  exit 2
+fi
 # Fresh runs need oracle; --harvest only needs node+CDP and checks that prerequisite inside
 # its branch below (moving this gate matters when oracle is temporarily unavailable but a spent
 # review is waiting in an open conversation).
@@ -460,6 +495,28 @@ pg_active_clear() {  # $1 = exit code
   fi
   rm -f "$f" 2>/dev/null || true
 }
+pg_publish_out() {  # $1 = verified snapshot → atomically publish to $OUT; rc 0 only when
+  # $OUT is a readable regular file afterwards (an existing directory or a failed rename is
+  # a publication FAILURE, never silently "done" — gate #54 r9).
+  local src="$1" rc=1
+  if cp "$src" "$OUT.pub.$$" 2>/dev/null && mv -f "$OUT.pub.$$" "$OUT" 2>/dev/null \
+     && [ -f "$OUT" ] && [ ! -d "$OUT" ]; then rc=0; fi
+  rm -f "$OUT.pub.$$" 2>/dev/null
+  return "$rc"
+}
+pg_publish_fail() {  # $1 = snapshot — shared failure path: durability decides the message,
+  # and when NOTHING could be persisted the snapshot itself is retained (gate #54 r9).
+  local src="$1"
+  if pg_completed_write "$RUN_MARKER" "$src"; then
+    echo "ERROR: review captured but could not be written to --out ($OUT). It is durable at $(pg_completed_dir)/$RUN_MARKER — copy it from there or re-run --harvest '$RUN_MARKER'; do NOT respend." >&2
+    pg_status failed "already collected; --out unwritable; artifact at $(pg_completed_dir)/$RUN_MARKER"
+  else
+    PG_KEEP_FINAL=1
+    echo "ERROR: review captured but neither --out ($OUT) nor the artifact store ($(pg_completed_dir)) is writable. The verified snapshot is KEPT at $src — copy it manually; do NOT respend." >&2
+    pg_status failed "captured; --out and artifact store unwritable; snapshot kept at $src"
+  fi
+  pg_finish 6
+}
 pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor, exit
   local rc="$1" outcome dur line model_label
   dur=$(( $(date +%s) - RUN_START ))
@@ -506,7 +563,8 @@ pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor,
     fi
     OUT_SHA="$(pg_sha256 "$fsrc")"
   fi
-  [ -n "${PG_FINAL_SRC:-}" ] && [ "$PG_FINAL_SRC" != "$OUT" ] && rm -f "$PG_FINAL_SRC" 2>/dev/null
+  [ -n "${PG_FINAL_SRC:-}" ] && [ "$PG_FINAL_SRC" != "$OUT" ] && [ "${PG_KEEP_FINAL:-0}" != 1 ] \
+    && rm -f "$PG_FINAL_SRC" 2>/dev/null
   # v0.27: `marker` and `round_key` land in every ledger line so --status (and any caller with
   # only the ledger) can reconstruct a harvest command without the original status file. Rows
   # from failures before identity derivation (exit 4/5) carry them empty — present, not absent.
@@ -570,7 +628,7 @@ if [ -n "$HARVEST_MARKER" ] && pg_reservation_marker_ok "$HARVEST_MARKER" \
   ROUND_KEY="$PR_NUM"
   RESOLVED_MODEL="$(pg_reservation_read_model "$RUN_MARKER" 2>/dev/null || true)"
   FASTPATH_ART="$(pg_completed_dir)/$RUN_MARKER"
-  FASTPATH_SNAP="$OUT.fastpath.$$"
+  FASTPATH_SNAP="$WORK/fastpath.snap"
   if cp "$FASTPATH_ART" "$FASTPATH_SNAP" 2>/dev/null && pg_is_review "$FASTPATH_SNAP"; then
     PG_FINAL_SRC="$FASTPATH_SNAP"
     SALVAGED=1
@@ -579,8 +637,7 @@ if [ -n "$HARVEST_MARKER" ] && pg_reservation_marker_ok "$HARVEST_MARKER" \
     # (and keep redirecting this change to harvest) for the whole 6h TTL.
     pg_reservation_remove "$RUN_MARKER" || true
     echo "[oracle-review] review already collected (completed artifact); returning it — no browser touched, nothing spent." >&2
-    if ! { cp "$FASTPATH_SNAP" "$OUT.pub.$$" 2>/dev/null && mv -f "$OUT.pub.$$" "$OUT" 2>/dev/null; }; then
-      rm -f "$OUT.pub.$$" 2>/dev/null
+    if ! pg_publish_out "$FASTPATH_SNAP"; then
       echo "ERROR: collected review could not be written to --out ($OUT). It remains durable at $FASTPATH_ART — copy it from there; do NOT respend." >&2
       pg_status failed "already collected; could not publish to --out (artifact at $FASTPATH_ART)"
       pg_finish 6
@@ -674,7 +731,7 @@ if [ -n "$HARVEST_MARKER" ]; then
   echo "[oracle-review] harvesting in-progress review (marker ${RUN_MARKER}, up to ${HARVEST_SECS}s, no new slot spent)..." >&2
   pg_status salvaging "harvest up to ${HARVEST_SECS}s"
   HARVEST_RC=0
-  HARVEST_TMP="$OUT.cdp.$$"
+  HARVEST_TMP="$WORK/harvest.capture"
   node "$SELF/cdp-salvage.mjs" "$RUN_MARKER" "$HARVEST_SECS" "$PORT" > "$HARVEST_TMP" 2> "$HARVEST_TMP.err" || HARVEST_RC=$?
   [ -s "$HARVEST_TMP.err" ] && sed 's/^/[cdp-salvage] /' "$HARVEST_TMP.err" >&2
   # v0.28 (gate #54 r5): the CDP child names its capture's exact source URL.
@@ -720,13 +777,7 @@ if [ -n "$HARVEST_MARKER" ]; then
     # THIS invocation returns, persists, or ledgers. Publication is VERIFIED (r8): "done"
     # promises a readable --out, so a failed publish routes to manual recovery instead.
     PG_FINAL_SRC="$HARVEST_TMP"
-    if ! { cp "$PG_FINAL_SRC" "$OUT.pub.$$" 2>/dev/null && mv -f "$OUT.pub.$$" "$OUT" 2>/dev/null; }; then
-      rm -f "$OUT.pub.$$" 2>/dev/null
-      pg_completed_write "$RUN_MARKER" "$PG_FINAL_SRC" || true
-      echo "ERROR: review harvested but could not be written to --out ($OUT). It is durable at $(pg_completed_dir)/$RUN_MARKER — copy it from there; do NOT respend." >&2
-      pg_status failed "harvested but --out unwritable; artifact at $(pg_completed_dir)/$RUN_MARKER"
-      pg_finish 6
-    fi
+    pg_publish_out "$PG_FINAL_SRC" || pg_publish_fail "$PG_FINAL_SRC"
     # Artifact installation BEFORE reservation removal (gate #54 r6 P2): if the durable
     # store is unwritable, the reservation stays so the review remains re-collectable —
     # recovery state must never be discarded on the promise of an artifact that failed.
@@ -793,13 +844,12 @@ if [ -n "$HARVEST_MARKER" ]; then
          # a collection (gate #54 r1+r2 P1), and pre-existing $OUT content never counts.
          PRIOR_OUT=""; PRIOR_SHA=""; COLLECT_OK=0; COLLECT_SRC=""
          if [ -s "$(pg_completed_dir)/$RUN_MARKER" ] \
-            && cp "$(pg_completed_dir)/$RUN_MARKER" "$OUT.already.$$" 2>/dev/null \
-            && pg_is_review "$OUT.already.$$"; then
+            && cp "$(pg_completed_dir)/$RUN_MARKER" "$WORK/already.snap" 2>/dev/null \
+            && pg_is_review "$WORK/already.snap"; then
            # Snapshot-first here too (gate #54 r8): this branch is reachable when a second
            # collector passes the initial fast path before the first publishes the artifact.
            COLLECT_OK=1; COLLECT_SRC="$(pg_completed_dir)/$RUN_MARKER"
-           PG_FINAL_SRC="$OUT.already.$$"
-           cp "$PG_FINAL_SRC" "$OUT" 2>/dev/null || true
+           PG_FINAL_SRC="$WORK/already.snap"
          else
            LEDGER_HIT="$(pg_ledger_lookup_clean "$RUN_MARKER")"
            PRIOR_OUT="${LEDGER_HIT%%$'\t'*}"
@@ -814,12 +864,11 @@ if [ -n "$HARVEST_MARKER" ]; then
            # between the two. Only bytes whose digest matched are ever installed or returned;
            # the same-path case snapshots too, so the returned bytes ARE the verified ones.
            if [ -n "$PRIOR_OUT" ] && [ -n "$PRIOR_SHA" ] && [ -s "$PRIOR_OUT" ]; then
-             SNAP="$OUT.already.$$"
+             SNAP="$WORK/ledger.snap"
              if cp "$PRIOR_OUT" "$SNAP" 2>/dev/null && pg_is_review "$SNAP" 2>/dev/null \
                 && [ "$(pg_sha256 "$SNAP")" = "$PRIOR_SHA" ]; then
                COLLECT_OK=1; COLLECT_SRC="$PRIOR_OUT"
                PG_FINAL_SRC="$SNAP"
-               cp "$SNAP" "$OUT" 2>/dev/null || true
              else
                rm -f "$SNAP" 2>/dev/null
              fi
@@ -828,8 +877,11 @@ if [ -n "$HARVEST_MARKER" ]; then
          if [ "$COLLECT_OK" = 1 ]; then
            SALVAGED=1
            echo "[oracle-review] this review was ALREADY collected (${COLLECT_SRC}); returning it idempotently — nothing spent, nothing lost." >&2
+           # Same checked publication as every other success (gate #54 r9): done is set only
+           # once $OUT verifiably holds the snapshot.
+           pg_publish_out "$PG_FINAL_SRC" || pg_publish_fail "$PG_FINAL_SRC"
            pg_status done "already collected; returned from ${COLLECT_SRC}"
-           cat "${PG_FINAL_SRC:-$OUT}"
+           cat "$PG_FINAL_SRC"
            echo "RESULT_FILE=$OUT"
            pg_finish 0
          fi
@@ -1686,8 +1738,8 @@ fi
 # oracle captures keep the inherent instant between oracle's write and this copy — a caller
 # sharing one --out across concurrent DIRECT runs is outside the engine's control.)
 FINAL_SNAP=""
-if pg_is_review "$CAPTURE_OUT" && cp "$CAPTURE_OUT" "$OUT.final.$$" 2>/dev/null && pg_is_review "$OUT.final.$$"; then
-  FINAL_SNAP="$OUT.final.$$"
+if pg_is_review "$CAPTURE_OUT" && cp "$CAPTURE_OUT" "$WORK/final.snap" 2>/dev/null && pg_is_review "$WORK/final.snap"; then
+  FINAL_SNAP="$WORK/final.snap"
 fi
 # FAIL CLOSED for unbindable browser-matched captures (gate #54 r3): every v0.28 prompt
 # promises the nonce echo; a capture without it whose path check cannot bind either (no
@@ -1743,15 +1795,9 @@ if [ -n "$FINAL_SNAP" ]; then
   # v0.22: remember this review's P0/P1 counts so a later round-capped refusal can flag an
   # unconfirmed open P0 to the human (advisory sidecar; see pg_round_note_severity).
   pg_round_note_severity "$ROUND_KEY" "$PG_FINAL_SRC"
-  # Verified publication (gate #54 r8): "done" PROMISES a readable --out; a failed publish
-  # must not report clean. The review stays durable in the completed artifact either way.
-  if ! { cp "$PG_FINAL_SRC" "$OUT.pub.$$" 2>/dev/null && mv -f "$OUT.pub.$$" "$OUT" 2>/dev/null; }; then
-    rm -f "$OUT.pub.$$" 2>/dev/null
-    pg_completed_write "$RUN_MARKER" "$PG_FINAL_SRC" || true
-    echo "ERROR: review captured but could not be written to --out ($OUT). It is durable at $(pg_completed_dir)/$RUN_MARKER — copy it from there; do NOT respend." >&2
-    pg_status failed "captured but --out unwritable; artifact at $(pg_completed_dir)/$RUN_MARKER"
-    pg_finish 6
-  fi
+  # Verified publication (gate #54 r8/r9): "done" PROMISES a readable --out; a failed publish
+  # must not report clean, and the durability of what WAS captured decides the message.
+  pg_publish_out "$PG_FINAL_SRC" || pg_publish_fail "$PG_FINAL_SRC"
   pg_status done
   cat "$PG_FINAL_SRC"
   echo "RESULT_FILE=$OUT"

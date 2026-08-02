@@ -1123,6 +1123,16 @@ env PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0
 RC=$?
 check 'PRO_GATE_REQUIRE_NONCE=0 restores best-effort acceptance' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
 
+echo '# v0.28 r9: publication is verified; artifacts are rediscoverable'
+run_engine --pr 55 --repo "$TDIR" --out "$TDIR" --timeout 5s
+check 'directory --out rejected up front (exit 2)' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
+mkdir -p "$TDIR/ro"; chmod 555 "$TDIR/ro"
+run_engine --harvest "$M9" --out "$TDIR/ro/o.md" --timeout 5s
+chmod 755 "$TDIR/ro"
+check 'unpublishable artifact reports exit 6 with the durable path' "$([ "$RC" -eq 6 ] && grep -q 'durable at' "$TDIR/stderr"; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
+PRO_GATE_HOME="$TDIR/home" bash "$ENGINE" --status "$M9" >"$TDIR/st-art.out" 2>/dev/null
+check '--status surfaces the completed artifact' "$(grep -q 'collected artifacts' "$TDIR/st-art.out" && grep -q "$M9" "$TDIR/st-art.out"; echo $?)" "$(cat "$TDIR/st-art.out")"
+
 echo '# v0.28: digest mismatch rejects an overwritten ledgered source'
 M10="pg-run-digest-2-1700000036-11"
 cp "$TDIR/prior-collected.md" "$TDIR/overwritten-prior.md"
