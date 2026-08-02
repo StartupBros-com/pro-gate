@@ -16,9 +16,49 @@ is_uint() {
 }
 
 notes_summary() {
-  # First paragraph only: the announcement summary should be the release's
-  # lead description, not flattened install blocks or changelog fragments.
-  printf '%s' "${RELEASE_NOTES:-}" | tr -d '\r' | awk 'BEGIN{RS=""} NR==1' | tr '\n' ' ' | cut -c1-600
+  # Card-ready release bullets for the announcement endpoint's "What's new" section.
+  # Preference order:
+  #   1. An author-written "## Highlights" section in the release body (manual control for
+  #      releases that deserve hand-picked copy);
+  #   2. GitHub's auto-generated "What's Changed" PR-title bullets, cleaned: conventional-
+  #      commit prefixes, "by @user in <url>" tails, and "(vX.Y.Z)" suffixes stripped;
+  #   3. Fallback: the body's first paragraph, flattened (the pre-2026-08 behavior), so a
+  #      hand-written prose body still announces something.
+  # Up to 3 bullets, one per line, each <=180 chars; total stays under the endpoint's
+  # 600-char schema cap.
+  local notes bullets
+  notes="$(printf '%s' "${RELEASE_NOTES:-}" | tr -d '\r')"
+  [[ -n "$notes" ]] || return 0
+  # Bullets come only from sections that ARE changelogs (gate #58 P2): the Highlights
+  # section, the "What's Changed" section (auto-notes append e.g. "New Contributors"
+  # bullets after it), or — for headingless bodies — a leading list block only, so a prose
+  # release with install bullets further down still falls back to its first paragraph.
+  bullets="$(printf '%s\n' "$notes" | sed -n '/^##[[:space:]]*Highlights/,/^## /p' | grep -E '^[*•-][[:space:]]' || true)"
+  if [[ -z "$bullets" ]]; then
+    if printf '%s\n' "$notes" | grep -qE '^##[[:space:]]*What.?.?s Changed'; then
+      bullets="$(printf '%s\n' "$notes" | sed -n '/^##[[:space:]]*What.\{0,2\}s Changed/,/^## /p' | grep -E '^\*[[:space:]]' || true)"
+    elif [[ "$(printf '%s\n' "$notes" | grep -vE '^[[:space:]]*$' | head -n 1)" == \** ]]; then
+      bullets="$(printf '%s\n' "$notes" | awk '/^[[:space:]]*$/{exit} /^\*[[:space:]]/{print}')"
+    fi
+  fi
+  if [[ -n "$bullets" ]]; then
+    # Character-safe slicing (gate #58 P2): cut -c is BYTES under GNU coreutils, which can
+    # split a multibyte character mid-sequence and ship invalid UTF-8. This path runs only
+    # on the Actions runner, where python3 is guaranteed.
+    printf '%s\n' "$bullets" \
+      | sed -E 's/^[*•-][[:space:]]+//; s/[[:space:]]+by @[A-Za-z0-9_[:punct:]]+ in http[^[:space:]]*[[:space:]]*$//; s/^(feat|fix|perf|chore|docs|refactor|test|ci|build)(\([^)]*\))?!?:[[:space:]]*//; s/[[:space:]]*\(v[0-9]+\.[0-9]+\.[0-9]+\)[[:space:]]*$//' \
+      | python3 -c 'import sys
+out = []
+for line in sys.stdin.read().splitlines():
+    line = line.strip()
+    if line:
+        out.append(line[:180])
+    if len(out) == 3:
+        break
+print("\n".join(out)[:600])'
+    return 0
+  fi
+  printf '%s' "$notes" | awk 'BEGIN{RS=""} NR==1' | tr '\n' ' ' | cut -c1-600
 }
 
 announce() {
