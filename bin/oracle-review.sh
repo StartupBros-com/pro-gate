@@ -1215,6 +1215,17 @@ RUN_MARKER="pg-run-${ROUND_KEY:-diff}-$(date +%s)-$$"
 CAPTURE_OUT="$WORK/capture.md"
 PROMPT_FILE="$WORK/prompt.md"
 {
+  # v0.29 (#49 phase 1): the LITERAL FIRST LINE names the run so ChatGPT's auto-titler
+  # (gen_title summarizes the conversation) is strongly biased toward a legible sidebar
+  # title like "pro-gate review: PR #1263 [StartupBros-com-pushbot]". Humans hunt the
+  # sidebar during manual recovery (observed in >=3 sessions) and among concurrent review
+  # tabs; the engine's own machinery is unaffected (it matches by marker, never by title).
+  # Zero new API surface — this is prompt wording only.
+  if [ -n "$PR_NUM" ]; then
+    printf 'pro-gate review: PR #%s [%s]\n\n' "$PR_NUM" "$REPO_SLUG"
+  else
+    printf 'pro-gate review: %s\n\n' "${ROUND_KEY:-diff}"
+  fi
   # Lead with the @GitHub connector tag + an explicit directive (belt-and-suspenders: oracle
   # pastes the prompt in one shot, so @GitHub is a recognized hint, not a bound mention pill;
   # ORACLE_CHATGPT_URL can pin a connector-bound Project for true binding).
