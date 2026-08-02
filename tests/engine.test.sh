@@ -1002,6 +1002,12 @@ check 'rejection blacklists the URL for this marker' "$(grep -q "^$M3	" "$TDIR/h
 # reservation is visible for this change.
 PRO_GATE_HOME="$TDIR/home" bash "$ENGINE" --status "$M3" --json >"$TDIR/st-m3.json" 2>/dev/null
 check 'manifest not counted as a reservation' "$([ "$(jq -r '.reservations | length' "$TDIR/st-m3.json")" = 1 ]; echo $?)" "$(jq -c .reservations "$TDIR/st-m3.json")"
+# The gate-prescribed replay test (gate #54 r2 P1): a SECOND harvest WITHOUT clearing the
+# blacklist must skip the rejected OPEN tab (live-tab scans now consult the per-marker
+# blacklist) instead of replaying the same foreign review.
+run_engine --harvest "$M3" --out "$TDIR/o-prov.md" --timeout 5s
+check 'replay harvest does not return the foreign review' "$([ "$RC" -ne 0 ] && [ ! -s "$TDIR/o-prov.md" ]; echo $?)" "rc=$RC $(head -2 "$TDIR/o-prov.md" 2>/dev/null)"
+check 'replay harvest preserves the reservation (exit 9)' "$([ "$RC" -eq 9 ] && [ -f "$TDIR/home/in-progress/$M3" ]; echo $?)" "rc=$RC"
 # Positive control: a manifest that matches the citation accepts the same capture. (The
 # blacklist from the rejection above is cleared: this fixture reuses the same mock URL, which
 # a real recovered-from-foreign flow would reach via a different conversation.)
@@ -1010,6 +1016,43 @@ printf 'apps/blog-writer/collect.ts\n' > "$TDIR/home/manifests/$M3"
 run_engine --harvest "$M3" --out "$TDIR/o-prov.md" --timeout 5s
 check 'matching harvest capture exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
 check 'matching harvest removes reservation + manifest' "$([ ! -f "$TDIR/home/in-progress/$M3" ] && [ ! -f "$TDIR/home/manifests/$M3" ]; echo $?)" "$(ls "$TDIR/home/in-progress" "$TDIR/home/manifests" 2>/dev/null)"
+
+echo '# v0.28: positive run-binding — a nonce-bearing capture is accepted and stripped'
+M8="pg-run-noncetest-3-1700000034-88"
+printf '3\t%s\t%s\t0\t1\tGPT-X\n' "$TDIR/o-nonce.md" "$(date +%s)" > "$TDIR/home/in-progress/$M8"
+printf 'src/real.sh\n' > "$TDIR/home/manifests/$M8"
+cat > "$TDIR/tab.txt" <<TAB
+conversation for run marker: $M8
+P0: none
+
+[P1] apps/blog-writer/collect.ts:12 — cites nothing from the diff
+[P1] apps/blog-writer/schema.ts:44 — second non-diff citation
+
+VERDICT: FIX-FIRST — but positively bound (run marker: $M8)
+TAB
+start_mock "$TDIR/tab.txt"
+run_engine --harvest "$M8" --out "$TDIR/o-nonce.md" --timeout 5s
+check 'nonce-bearing capture accepted despite path mismatch' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
+check 'nonce stripped from the returned review' "$(grep -q 'run marker' "$TDIR/o-nonce.md"; [ $? -ne 0 ]; echo $?)" "$(tail -1 "$TDIR/o-nonce.md" 2>/dev/null)"
+check 'VERDICT line survives the strip' "$(grep -q 'VERDICT: FIX-FIRST' "$TDIR/o-nonce.md"; echo $?)" "$(tail -1 "$TDIR/o-nonce.md" 2>/dev/null)"
+check 'clean collection writes the completed artifact' "$([ -s "$TDIR/home/completed/$M8" ]; echo $?)" "$(ls "$TDIR/home/completed" 2>/dev/null)"
+check 'clean ledger row records the digest' "$([ -n "$(tail -1 "$TDIR/home/ledger.jsonl" | jq -r '.sha256 // ""')" ]; echo $?)" "$(tail -1 "$TDIR/home/ledger.jsonl")"
+
+echo '# v0.28: artifact-first recovery — no ledger row needed'
+M9="pg-run-artifact-4-1700000035-99"
+mkdir -p "$TDIR/home/completed"
+cp "$TDIR/prov-ours.md" "$TDIR/home/completed/$M9"
+printf 'idle tab with no markers at all\n' > "$TDIR/tab.txt"
+run_engine --harvest "$M9" --out "$TDIR/o-artifact.md" --timeout 5s
+check 'artifact-first recovery exits 0 without a ledger row' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
+check 'artifact content returned verbatim' "$(cmp -s "$TDIR/o-artifact.md" "$TDIR/prov-ours.md"; echo $?)" "$(head -2 "$TDIR/o-artifact.md" 2>/dev/null)"
+
+echo '# v0.28: digest mismatch rejects an overwritten ledgered source'
+M10="pg-run-digest-2-1700000036-11"
+cp "$TDIR/prior-collected.md" "$TDIR/overwritten-prior.md"
+printf '{"ts":"2026-01-07T00:00:00+0000","pr":"2","repo":"/tmp/x","exit":0,"outcome":"clean","secs":10,"attempts":0,"conc":0,"ceiling":1,"live":1,"salvaged":1,"diff_lines":4,"out":"%s","model":"m","marker":"%s","round_key":"digest-2","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}\n' "$TDIR/overwritten-prior.md" "$M10" >> "$TDIR/home/ledger.jsonl"
+run_engine --harvest "$M10" --out "$TDIR/o-digest.md" --timeout 5s
+check 'overwritten ledgered source rejected by digest (exit 6)' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
 
 echo '# v0.28: already-collected harvest returns the ledgered review idempotently'
 M4="pg-run-collected-5-1700000031-55"
@@ -1060,5 +1103,32 @@ check 'early-capture run preserves as in-progress (exit 9)' "$([ "$RC" -eq 9 ]; 
 check 'conversation URL memo written DURING generation' "$(ls "$TDIR/home/conversation-urls/" 2>/dev/null | grep -q 'pg-run-'; echo $?)" "$(ls "$TDIR/home/conversation-urls/" 2>/dev/null)"
 EARLY_MARKER="$(ls "$TDIR/home/in-progress/" 2>/dev/null | grep -m1 -E 'pg-run-.*-120-')"
 check 'change manifest written beside the reservation' "$([ -n "$EARLY_MARKER" ] && [ -s "$TDIR/home/manifests/$EARLY_MARKER" ]; echo $?)" "manifests: $(ls "$TDIR/home/manifests" 2>/dev/null)"
+check 'nonce expectation flag recorded' "$([ -n "$EARLY_MARKER" ] && [ -f "$TDIR/home/manifests/$EARLY_MARKER.nonce" ]; echo $?)" "manifests: $(ls "$TDIR/home/manifests" 2>/dev/null)"
+
+echo '# v0.28: direct capture with an echoed nonce is stripped before output'
+cat > "$TDIR/bin/oracle-nonce" <<'NONCE'
+#!/usr/bin/env bash
+out=""; m=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --write-output) out="$2"; shift 2;;
+    *) m2="$(printf '%s\n' "$1" | grep -oE 'pg-run-[A-Za-z0-9.-]+' | head -1)"; [ -n "$m2" ] && m="$m2"; shift;;
+  esac
+done
+printf '[P1] a.sh:1 - finding\n  Why: test\nP2: none\nP3: none\nVERDICT: SHIP - fixture. (run marker: %s)\n' "$m" > "$out"
+NONCE
+chmod +x "$TDIR/bin/oracle-nonce"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+# Own home: $TDIR/home carries the early-capture test's live exit-9 reservation, whose
+# recorded slot would (correctly) exclude this fresh run and park it in the account-slot
+# queue for the whole lock wait.
+mkdir -p "$TDIR/home-nonce"
+env PRO_GATE_HOME="$TDIR/home-nonce" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_MAX_RETRIES=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-nonce" NODE_OPTIONS= \
+  bash "$ENGINE" --pr 131 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$TDIR/o-directnonce.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'direct nonce capture exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
+check 'direct capture nonce stripped' "$(grep -q 'run marker' "$TDIR/o-directnonce.md"; [ $? -ne 0 ]; echo $?)" "$(tail -1 "$TDIR/o-directnonce.md" 2>/dev/null)"
 
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }

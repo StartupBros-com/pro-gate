@@ -489,6 +489,14 @@ pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor,
       cloudflare)            pg_ramp_update throttle "${MAX_CONC:-1}" ;;
     esac
   fi
+  # v0.28 (#56): a clean run's review becomes the write-once completed artifact, and its
+  # digest lands in the ledger row — later already-collected recovery verifies content
+  # identity instead of trusting a mutable, reusable output path.
+  OUT_SHA=""
+  if [ "$rc" = 0 ] && [ -n "${RUN_MARKER:-}" ] && [ -s "$OUT" ]; then
+    pg_completed_write "$RUN_MARKER" "$OUT" || true
+    OUT_SHA="$(pg_sha256 "$OUT")"
+  fi
   # v0.27: `marker` and `round_key` land in every ledger line so --status (and any caller with
   # only the ledger) can reconstruct a harvest command without the original status file. Rows
   # from failures before identity derivation (exit 4/5) carry them empty — present, not absent.
@@ -499,16 +507,17 @@ pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor,
       --argjson conc "${EFF_CONC:-0}" --argjson ceiling "${MAX_CONC:-1}" \
       --argjson live "${LIVE_CONVERSATION:-0}" --argjson salvaged "${SALVAGED:-0}" \
       --argjson diff_lines "${DIFF_LINES:-0}" --arg out "$OUT" --arg model "$model_label" \
-      --arg marker "${RUN_MARKER:-}" --arg round_key "${ROUND_KEY:-}" \
-      '{ts:$ts,pr:$pr,repo:$repo,exit:$exit,outcome:$outcome,secs:$secs,attempts:$attempts,conc:$conc,ceiling:$ceiling,live:$live,salvaged:$salvaged,diff_lines:$diff_lines,out:$out,model:$model,marker:$marker,round_key:$round_key}' 2>/dev/null)"
+      --arg marker "${RUN_MARKER:-}" --arg round_key "${ROUND_KEY:-}" --arg sha256 "$OUT_SHA" \
+      '{ts:$ts,pr:$pr,repo:$repo,exit:$exit,outcome:$outcome,secs:$secs,attempts:$attempts,conc:$conc,ceiling:$ceiling,live:$live,salvaged:$salvaged,diff_lines:$diff_lines,out:$out,model:$model,marker:$marker,round_key:$round_key,sha256:$sha256}' 2>/dev/null)"
   else
-    line="$(printf '{"ts":"%s","pr":"%s","exit":%d,"outcome":"%s","secs":%d,"attempts":%d,"conc":%d,"ceiling":%d,"live":%d,"salvaged":%d,"out":"%s","model":"%s","marker":"%s","round_key":"%s"}' \
+    line="$(printf '{"ts":"%s","pr":"%s","exit":%d,"outcome":"%s","secs":%d,"attempts":%d,"conc":%d,"ceiling":%d,"live":%d,"salvaged":%d,"out":"%s","model":"%s","marker":"%s","round_key":"%s","sha256":"%s"}' \
       "$(date +%Y-%m-%dT%H:%M:%S%z)" "${PR_NUM:-diff}" "$rc" "$outcome" "$dur" "${attempt:-0}" \
       "${EFF_CONC:-0}" "${MAX_CONC:-1}" "${LIVE_CONVERSATION:-0}" "${SALVAGED:-0}" \
       "$(printf '%s' "$OUT" | tr -d '"\\' | tr '\n' ' ')" \
       "$(printf '%s' "$model_label" | tr -d '"\\' | tr '\n' ' ')" \
       "$(printf '%s' "${RUN_MARKER:-}" | tr -d '"\\' | tr '\n' ' ')" \
-      "$(printf '%s' "${ROUND_KEY:-}" | tr -d '"\\' | tr '\n' ' ')")"
+      "$(printf '%s' "${ROUND_KEY:-}" | tr -d '"\\' | tr '\n' ' ')" \
+      "$OUT_SHA")"
   fi
   pg_ledger_append "$line"
   pg_active_clear "$rc"
@@ -616,21 +625,26 @@ if [ -n "$HARVEST_MARKER" ]; then
   HARVEST_TMP="$OUT.cdp.$$"
   node "$SELF/cdp-salvage.mjs" "$RUN_MARKER" "$HARVEST_SECS" "$PORT" > "$HARVEST_TMP" || HARVEST_RC=$?
   if [ "$HARVEST_RC" -eq 0 ] && pg_is_review "$HARVEST_TMP"; then
-    # v0.28 (#48): provenance before acceptance. The run's manifest (written when the exit-9
-    # run reserved) carries the change's file list; a complete review citing NONE of those
-    # files is a foreign conversation's answer, not ours. Legacy reservations have no manifest
-    # and skip the check (pg_review_matches_change accepts on a missing manifest). Rejection
-    # preserves the reservation and counts no miss — and invalidates the memoized candidate
-    # (blacklist + memo removal) so the NEXT pass rescans instead of replaying the same
-    # foreign conversation forever.
-    if ! pg_review_matches_change "$HARVEST_TMP" "$(pg_manifest_dir)/${RUN_MARKER}"; then
+    # v0.28 (#48/#55): provenance before acceptance, positive binding first. A capture whose
+    # VERDICT line echoes this run's nonce was provably written for this prompt — that
+    # overrides path heuristics entirely. Absent a nonce (model non-compliance, or a pre-v0.28
+    # conversation), fall back to the manifest overlap check; a complete review citing NONE of
+    # the change's files is a foreign conversation's answer. Rejection preserves the
+    # reservation, counts no miss, and invalidates the memoized candidate (blacklist + memo
+    # removal) so the NEXT pass rescans instead of replaying the same foreign conversation.
+    if pg_capture_nonce_ok "$HARVEST_TMP" "$RUN_MARKER"; then
+      :  # positively bound to this run
+    elif ! pg_review_matches_change "$HARVEST_TMP" "$(pg_manifest_dir)/${RUN_MARKER}"; then
       mv "$HARVEST_TMP" "$OUT.foreign.$$" 2>/dev/null || rm -f "$HARVEST_TMP"
       pg_provenance_reject "$RUN_MARKER"
-      echo "ERROR: harvested a complete review that cites NONE of this change's files — foreign conversation suspected. Reservation kept, its memoized candidate invalidated; retry --harvest (the real review may still be generating). The rejected capture is at $OUT.foreign.$$ for inspection." >&2
-      pg_status in-progress "harvested review failed provenance (cites no change files); reservation kept"
+      echo "ERROR: harvested a complete review with no run-marker echo that cites NONE of this change's files — foreign conversation suspected. Reservation kept, its memoized candidate invalidated; retry --harvest (the real review may still be generating). The rejected capture is at $OUT.foreign.$$ for inspection." >&2
+      pg_status in-progress "harvested review failed provenance (no nonce, cites no change files); reservation kept"
       pg_finish 9
+    elif [ -f "$(pg_manifest_dir)/${RUN_MARKER}.nonce" ]; then
+      echo "[oracle-review] NOTE: this run's prompt requested a run-marker echo but the capture carries none; accepted on path overlap instead." >&2
     fi
     mv "$HARVEST_TMP" "$OUT"
+    pg_strip_nonce "$OUT" "$RUN_MARKER"
     pg_reservation_remove "$RUN_MARKER" || true
     # v0.22: a harvest completes the round the exit-9 run already recorded, so refresh the
     # round budget's last-severity sidecar too. The marker embeds ROUND_KEY
@@ -680,35 +694,45 @@ if [ -n "$HARVEST_MARKER" ]; then
        # reservation on one observation (dogfood review P1).
        MISS_VERDICT="$(pg_reservation_note_miss "$RUN_MARKER")"
        if [ "$MISS_VERDICT" = released ]; then
-         # v0.28 (#52 item 2): "released" conflates two very different states — a genuine
+         # v0.28 (#52 item 2, #56): "released" conflates two very different states — a genuine
          # miss-limit loss, and a reservation ALREADY ABSENT because another pass collected
-         # this review (its collection removed the reservation and ledgered a clean row).
-         # Declaring the second one lost invited a duplicate Pro spend; return the collected
-         # review idempotently instead, spending nothing. The LEDGERED SOURCE is the only
-         # acceptable proof: validate it, copy through a temp file, and atomically replace a
-         # CLEARED $OUT — pre-existing $OUT content (a stale review from an earlier reuse of
-         # the path) must never pass as evidence of collection (gate #54 P1).
-         PRIOR_OUT="$(pg_ledger_lookup_clean "$RUN_MARKER")"
-         COLLECT_OK=0
-         if [ -n "$PRIOR_OUT" ] && [ -s "$PRIOR_OUT" ] && pg_is_review "$PRIOR_OUT" 2>/dev/null; then
-           if [ "$PRIOR_OUT" = "$OUT" ]; then
-             COLLECT_OK=1
-           elif rm -f "$OUT" 2>/dev/null && cp "$PRIOR_OUT" "$OUT.already.$$" 2>/dev/null \
-                && mv -f "$OUT.already.$$" "$OUT" 2>/dev/null; then
-             COLLECT_OK=1
+         # this review. Declaring the second one lost invited a duplicate Pro spend; return
+         # the collected review idempotently instead, spending nothing. The write-once
+         # completed artifact (marker-addressed, written at collection) is the primary proof;
+         # the ledgered path is the fallback for pre-artifact collections, DIGEST-VERIFIED
+         # when the row carries one — a reused/overwritten output path must never impersonate
+         # a collection (gate #54 r1+r2 P1), and pre-existing $OUT content never counts.
+         PRIOR_OUT=""; PRIOR_SHA=""; COLLECT_OK=0; COLLECT_SRC=""
+         if pg_completed_lookup "$RUN_MARKER" "$OUT"; then
+           COLLECT_OK=1; COLLECT_SRC="$(pg_completed_dir)/$RUN_MARKER"
+         else
+           LEDGER_HIT="$(pg_ledger_lookup_clean "$RUN_MARKER")"
+           PRIOR_OUT="${LEDGER_HIT%%$'\t'*}"
+           PRIOR_SHA="${LEDGER_HIT#*$'\t'}"; [ "$PRIOR_SHA" = "$LEDGER_HIT" ] && PRIOR_SHA=""
+           if [ -n "$PRIOR_OUT" ] && [ -s "$PRIOR_OUT" ] && pg_is_review "$PRIOR_OUT" 2>/dev/null; then
+             CUR_SHA=""
+             [ -n "$PRIOR_SHA" ] && CUR_SHA="$(pg_sha256 "$PRIOR_OUT")"
+             if [ -n "$PRIOR_SHA" ] && [ -n "$CUR_SHA" ] && [ "$PRIOR_SHA" != "$CUR_SHA" ]; then
+               :  # ledgered digest mismatch: the path was reused/overwritten since collection
+             elif [ "$PRIOR_OUT" = "$OUT" ]; then
+               COLLECT_OK=1; COLLECT_SRC="$PRIOR_OUT"
+             elif rm -f "$OUT" 2>/dev/null && cp "$PRIOR_OUT" "$OUT.already.$$" 2>/dev/null \
+                  && mv -f "$OUT.already.$$" "$OUT" 2>/dev/null; then
+               COLLECT_OK=1; COLLECT_SRC="$PRIOR_OUT"
+             fi
            fi
          fi
          if [ "$COLLECT_OK" = 1 ]; then
            SALVAGED=1
-           echo "[oracle-review] this review was ALREADY collected (ledger: $PRIOR_OUT); returning it idempotently — nothing spent, nothing lost." >&2
-           pg_status done "already collected; returned from $PRIOR_OUT"
+           echo "[oracle-review] this review was ALREADY collected (${COLLECT_SRC}); returning it idempotently — nothing spent, nothing lost." >&2
+           pg_status done "already collected; returned from ${COLLECT_SRC}"
            cat "$OUT"
            echo "RESULT_FILE=$OUT"
            pg_finish 0
          fi
          if [ -n "$PRIOR_OUT" ]; then
-           echo "ERROR: this review was already collected (ledger row exists) but its output file is gone or unreadable ($PRIOR_OUT). Not a loss — find the review in the PR comment/audit trail or the ChatGPT conversation; do NOT spend a fresh slot for it." >&2
-           pg_status failed "already collected; prior output missing ($PRIOR_OUT)"
+           echo "ERROR: this review was already collected (ledger row exists) but its output is gone, unreadable, or no longer matches the ledgered digest ($PRIOR_OUT). Not a loss — find the review in the PR comment/audit trail or the ChatGPT conversation; do NOT spend a fresh slot for it." >&2
+           pg_status failed "already collected; prior output missing or altered ($PRIOR_OUT)"
            pg_finish 6
          fi
          echo "ERROR: no conversation matches marker ${RUN_MARKER} after repeated confirmed misses, and no collected copy is ledgered (review lost, or collected by an engine <v0.27 that ledgered no marker)." >&2
@@ -943,7 +967,12 @@ Group by severity, P0 first. If a severity has no findings, write "Pn: none".
 End with one final line:  VERDICT: SHIP | FIX-FIRST | NEEDS-DISCUSSION  — <=15 word reason.
 EOF
   echo
-  echo "(run marker: ${RUN_MARKER} — internal correlation id; ignore it and do not mention it)"
+  # v0.28 (#55): positive run-binding. The marker was previously "ignore and do not mention";
+  # now the model must ECHO it on the VERDICT line, proving the answer was written for THIS
+  # prompt (a foreign or stale conversation's review cannot carry it). It sits ON the VERDICT
+  # line because the collector's extraction ends at that line; the engine strips it before
+  # returning output. Non-compliance degrades gracefully to the path-overlap check.
+  echo "(run marker: ${RUN_MARKER} — internal correlation id. Do not discuss it, but append it verbatim to the end of your final VERDICT line, i.e.: VERDICT: <your verdict> (run marker: ${RUN_MARKER}))"
 } > "$PROMPT_FILE"
 
 # --- assemble --file attachments (bundle mode) ---
@@ -1540,7 +1569,9 @@ fi
 # file outside the diff (the fixture suite does exactly that) — rejecting those would turn
 # clean runs into phantom exit-9s.
 if { [ "${SALVAGED:-0}" = 1 ] || [ "${REATTACHED:-0}" = 1 ]; } \
-   && pg_is_review "$OUT" && ! pg_review_matches_change "$OUT" "$WORK/diff.paths"; then
+   && pg_is_review "$OUT" \
+   && ! pg_capture_nonce_ok "$OUT" "$RUN_MARKER" \
+   && ! pg_review_matches_change "$OUT" "$WORK/diff.paths"; then
   echo "[oracle-review] captured a complete review but it cites NONE of this change's files — foreign conversation suspected; NOT accepting it as ours. Preserving the run for --harvest. The rejected capture is at $OUT.foreign.$$." >&2
   mv "$OUT" "$OUT.foreign.$$" 2>/dev/null || rm -f "$OUT"
   # Invalidate the memoized candidate ONLY for CDP captures: the memo names the conversation
@@ -1553,6 +1584,9 @@ if { [ "${SALVAGED:-0}" = 1 ] || [ "${REATTACHED:-0}" = 1 ]; } \
   SALVAGE_RAN=1; SALVAGE_PRESERVE=1   # route to the reserve-and-harvest branch below
 fi
 if pg_is_review "$OUT"; then
+  # v0.28 (#55): strip the echoed run-marker nonce before the review leaves the engine —
+  # binding is an internal mechanism, not part of the caller-facing output.
+  pg_strip_nonce "$OUT" "$RUN_MARKER"
   # v0.22: remember this review's P0/P1 counts so a later round-capped refusal can flag an
   # unconfirmed open P0 to the human (advisory sidecar; see pg_round_note_severity).
   pg_round_note_severity "$ROUND_KEY" "$OUT"
@@ -1571,16 +1605,18 @@ elif [ "${SALVAGE_RAN:-0}" = 1 ] && [ "${SALVAGE_PRESERVE:-0}" = 1 ]; then
   # in-progress/, whose enumerators would misread it as a reservation) so a later --harvest
   # (a separate process with no diff) can provenance-check its capture. Written before the
   # reservation itself so a reader never sees a reservation without its manifest.
+  mkdir -p "$(pg_manifest_dir)" 2>/dev/null || true
   if [ -s "$WORK/diff.paths" ]; then
-    mkdir -p "$(pg_manifest_dir)" 2>/dev/null || true
     if ! cp "$WORK/diff.paths" "$(pg_manifest_dir)/${RUN_MARKER}" 2>/dev/null; then
-      # Loud, not silent (gate #54 r2 P1): without the manifest a later harvest accepts any
-      # structurally-valid capture as legacy — the operator should know provenance is off for
-      # this run. Full fail-closed semantics (harvest refusing without provenance) is part of
-      # the immutable completed-artifact design tracked in the follow-up issue.
-      echo "[oracle-review] WARNING: could not persist the change manifest to $(pg_manifest_dir); a later --harvest of this run will accept its capture WITHOUT provenance checking." >&2
+      # Loud, not silent (gate #54 r2 P1): without the manifest a later harvest falls back
+      # to nonce-only provenance — the operator should know the path check is off for this
+      # run. Full fail-closed semantics is part of #56's completed-artifact design.
+      echo "[oracle-review] WARNING: could not persist the change manifest to $(pg_manifest_dir); a later --harvest of this run can bind only via the run-marker echo." >&2
     fi
   fi
+  # v0.28 (#55): this run's prompt asked for the nonce echo — record that expectation so a
+  # harvest can NOTE when a capture arrives without one (accepted via path overlap instead).
+  : > "$(pg_manifest_dir)/${RUN_MARKER}.nonce" 2>/dev/null || true
   if ! pg_reservation_write "$RUN_MARKER" "${ROUND_KEY:-diff}" "$OUT" "${SLOT_HELD:-}" "$RESOLVED_MODEL"; then
     # Fail closed: without the durable reservation, exit 9 would under-count a live Pro tab and
     # let the next invocation double-spend. Keep the process/locks alive rather than release

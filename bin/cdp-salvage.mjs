@@ -384,6 +384,11 @@ while (Date.now() < deadline) {
   for (const { tab, text } of reads) {
     if (text === null || text.trim() === '') { deadTabs.push(tab); continue; }
     if (isThrottlePage(text)) tripThrottle(`tab ${tab.url}`);
+    // v0.28 (gate #54 r2): honor the per-marker blacklist for OPEN tabs too, not only
+    // re-renders. The engine appends here when a capture from this URL failed the provenance
+    // check — even a marker-bearing tab must be skipped then, or every later harvest replays
+    // the same rejected conversation and starves the real one.
+    if (nonMatching.has(tab.url)) continue;
     if (!text.includes(marker)) {
       // The remembered URL is open and rendered ANOTHER run's conversation: the memo is stale
       // (recycled URL, or it was never ours). This is the second way to prove staleness — the

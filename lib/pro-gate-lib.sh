@@ -557,7 +557,7 @@ pg_reservation_remove() { # marker
   dir="$(pg_reservation_dir)"; pg_reservation_guard_acquire || return 1
   # v0.28: the manifest sidecar (the change's file list for provenance checks) lives and dies
   # with its reservation.
-  rm -f "$dir/$marker" "$(pg_manifest_dir)/$marker" 2>/dev/null
+  rm -f "$dir/$marker" "$(pg_manifest_dir)/$marker" "$(pg_manifest_dir)/$marker.nonce" 2>/dev/null
   pg_reservation_guard_release
 }
 
@@ -577,7 +577,7 @@ pg_reservation_note_miss() {
   case "$misses" in ''|*[!0-9]*) misses=0;; esac
   misses=$(( misses + 1 ))
   if [ "$misses" -ge "$miss_limit" ]; then
-    rm -f "$f" "$(pg_manifest_dir)/$marker" 2>/dev/null
+    rm -f "$f" "$(pg_manifest_dir)/$marker" "$(pg_manifest_dir)/$marker.nonce" 2>/dev/null
     pg_reservation_guard_release
     echo released
   else
@@ -1053,18 +1053,79 @@ pg_provenance_reject() {
   rm -f "$memo" 2>/dev/null || true
 }
 
-# pg_ledger_lookup_clean <marker>: echo the newest CLEAN ledger row's `out` path for a marker,
-# or nothing. Lets a harvest whose reservation is already absent return an ALREADY-COLLECTED
-# review idempotently instead of declaring it lost (#52 item 2). Markers land in the ledger
-# from v0.27 on; legacy rows simply never match (callers fall back to the old behavior).
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.28 (#55): positive run-binding. The review prompt instructs the model to append
+# "(run marker: <marker>)" to its VERDICT line; a browser-matched capture carrying that token
+# was provably written for THIS prompt — content heuristics can't be fooled into accepting a
+# foreign or stale conversation's answer. The engine strips the token before returning output.
+# ─────────────────────────────────────────────────────────────────────────────
+# pg_capture_nonce_ok <file> <marker>: rc 0 when the capture's tail carries this run's token.
+pg_capture_nonce_ok() {
+  local f="$1" marker="$2"
+  [ -s "$f" ] || return 1
+  tail -n 6 "$f" 2>/dev/null | grep -qF "(run marker: $marker)"
+}
+# pg_strip_nonce <file> <marker>: remove the echoed token (harmless when absent).
+pg_strip_nonce() {
+  local f="$1" marker="$2" tmp="$1.nonce.$$"
+  [ -s "$f" ] || return 0
+  # Fixed-string removal via awk (the marker is regex-safe by charset, but the parentheses
+  # around it are not; index/substr avoids regex entirely).
+  awk -v tok="(run marker: $marker)" '{
+    i = index($0, tok)
+    if (i > 0) { $0 = substr($0, 1, i - 1) substr($0, i + length(tok)) ; sub(/[ \t]+$/, "") }
+    print
+  }' "$f" > "$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null
+  rm -f "$tmp" 2>/dev/null
+  return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.28 (#56): immutable completed-artifact store — $PRO_GATE_HOME/completed/<marker>,
+# written ONCE at collection time. Recovery paths previously trusted mutable, path-addressed
+# files (a reused/overwritten --out could impersonate a collection); the artifact store is
+# marker-addressed, write-once, and digest-recorded in the ledger row. Deliberately NOT under
+# the 24h sweeps: these are the durable record (bounded by review volume, a few KB each).
+# ─────────────────────────────────────────────────────────────────────────────
+pg_completed_dir() { echo "${PRO_GATE_COMPLETED_DIR:-$PRO_GATE_HOME/completed}"; }
+pg_sha256() {  # <file>: echo the hex digest, or nothing when no tool is available
+  if pg_have sha256sum; then sha256sum "$1" 2>/dev/null | awk '{print $1}'
+  elif pg_have shasum; then shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
+  elif pg_have openssl; then openssl dgst -sha256 "$1" 2>/dev/null | awk '{print $NF}'
+  fi
+}
+pg_completed_write() {  # <marker> <file>: write-once; an existing artifact is never replaced
+  local marker="$1" f="$2" dir
+  pg_reservation_marker_ok "$marker" || return 1
+  [ -s "$f" ] || return 1
+  dir="$(pg_completed_dir)"
+  [ -f "$dir/$marker" ] && return 0
+  mkdir -p "$dir" 2>/dev/null || return 1
+  cp "$f" "$dir/$marker.tmp.$$" 2>/dev/null && mv -f "$dir/$marker.tmp.$$" "$dir/$marker" 2>/dev/null
+}
+pg_completed_lookup() {  # <marker> <out>: place the artifact at <out>; rc 0 on success
+  local marker="$1" out="$2" src
+  pg_reservation_marker_ok "$marker" || return 1
+  src="$(pg_completed_dir)/$marker"
+  { [ -s "$src" ] && pg_is_review "$src"; } || return 1
+  [ "$src" = "$out" ] && return 0
+  rm -f "$out" 2>/dev/null
+  cp "$src" "$out.already.$$" 2>/dev/null && mv -f "$out.already.$$" "$out" 2>/dev/null
+}
+
+# pg_ledger_lookup_clean <marker>: echo "out<TAB>sha256" from the newest CLEAN ledger row for
+# a marker, or nothing. Fallback for pre-artifact collections (#52 item 2): lets a harvest
+# whose reservation is already absent return an ALREADY-COLLECTED review instead of declaring
+# it lost. Scans the WHOLE ledger (append-only, ~KBs per hundred runs) — a fixed tail window
+# forgot completions older than N newer rows (gate #54 r2 P2). Markers land in the ledger
+# from v0.27 on; legacy rows never match (callers fall back to the old behavior).
 pg_ledger_lookup_clean() {
   local marker="$1" ledger="${PRO_GATE_LEDGER:-$PRO_GATE_HOME/ledger.jsonl}"
   pg_reservation_marker_ok "$marker" || return 1
   [ -s "$ledger" ] || return 1
   pg_have jq || return 1
-  tail -n 400 "$ledger" \
-    | jq -r --arg m "$marker" 'select((.marker // "") == $m and .outcome == "clean") | .out' 2>/dev/null \
-    | tail -n 1
+  jq -r --arg m "$marker" 'select((.marker // "") == $m and .outcome == "clean") | [.out, (.sha256 // "")] | @tsv' \
+    "$ledger" 2>/dev/null | tail -n 1
 }
 
 # pg_reattach_render <slug> <out> [timeout_s]: bounded attempt to SALVAGE a review whose
