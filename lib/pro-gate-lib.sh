@@ -430,6 +430,12 @@ pg_cdp_heal() {
 # consecutive confirmed absences release the reservation before TTL.
 # Harvest success/lost removes the file. Writes/removes serialize under one flock/mkdir lock.
 pg_reservation_dir() { echo "${PRO_GATE_RESERVATION_DIR:-$PRO_GATE_HOME/in-progress}"; }
+# v0.28: change-manifest sidecars (the diff's file list, for provenance checks) live in their
+# OWN directory — NOT inside in-progress/. Every reservation enumerator globs that directory
+# and the marker validator accepts dots, so a "<marker>.paths" file there read as a legacy
+# reservation: slot planning counted it, and reconciliation probed it and rewrote it as a miss
+# record, destroying the manifest (gate #54 P1).
+pg_manifest_dir() { echo "${PRO_GATE_MANIFEST_DIR:-$PRO_GATE_HOME/manifests}"; }
 pg_reservation_lock() { echo "${PRO_GATE_RESERVATION_LOCK:-$PRO_GATE_HOME/in-progress.lock}"; }
 # Markers become filenames under PRO_GATE_HOME and lock paths; every character must be from the
 # safe class (in particular no "/" anywhere), not just the first one after the prefix.
@@ -549,7 +555,9 @@ pg_reservation_remove() { # marker
   local marker="$1" dir
   pg_reservation_marker_ok "$marker" || return 0
   dir="$(pg_reservation_dir)"; pg_reservation_guard_acquire || return 1
-  rm -f "$dir/$marker" 2>/dev/null
+  # v0.28: the manifest sidecar (the change's file list for provenance checks) lives and dies
+  # with its reservation.
+  rm -f "$dir/$marker" "$(pg_manifest_dir)/$marker" "$(pg_manifest_dir)/$marker.nonce" 2>/dev/null
   pg_reservation_guard_release
 }
 
@@ -569,7 +577,7 @@ pg_reservation_note_miss() {
   case "$misses" in ''|*[!0-9]*) misses=0;; esac
   misses=$(( misses + 1 ))
   if [ "$misses" -ge "$miss_limit" ]; then
-    rm -f "$f" 2>/dev/null
+    rm -f "$f" "$(pg_manifest_dir)/$marker" "$(pg_manifest_dir)/$marker.nonce" 2>/dev/null
     pg_reservation_guard_release
     echo released
   else
@@ -904,9 +912,21 @@ pg_round_note_severity() {
   dir="$(pg_rounds_dir)"
   [ -f "$dir/$key" ] || return 0
   [ -s "$out" ] || return 0
-  # grep -c prints 0 AND exits 1 on no match: capture, then default only when empty.
-  p0="$(grep -ci '\[P0\]' "$out" 2>/dev/null)"; [ -n "$p0" ] || p0=0
-  p1="$(grep -ci '\[P1\]' "$out" 2>/dev/null)"; [ -n "$p1" ] || p1=0
+  # v0.28 (#52 item 3): count only OPEN findings. Confirming reviews are REQUIRED to carry
+  # every prior P0/P1 forward as a "[Pn] … RESOLVED …" verification block; grep-counting every
+  # severity tag reported resolved P0s as "OPEN P0" at round-cap time and prompted false
+  # force-round escalations. The RESOLVED filter is case-SENSITIVE on purpose: reviews upcase
+  # the verification token, while prose like "unresolved"/"Unresolved" must not exclude a line.
+  # STILL-PRESENT and new-finding lines carry no RESOLVED token and stay counted.
+  # (grep -c prints 0 AND exits 1 on no match: capture, then default only when empty.)
+  # Anchored to the STATUS POSITION (gate #54 r3+r4 P2): exclude only when RESOLVED is the
+  # first token after the delimiter that follows the [Pn] citation — headline shape
+  # "[P1] path:line — RESOLVED — …". A finding whose DESCRIPTION merely contains the word
+  # ("the RESOLVED state can be forged") or an identifier (RESOLVED_MODEL) stays counted.
+  p0="$(grep -iE '^[[:space:]]*\[P0\]' "$out" 2>/dev/null \
+    | grep -Evc '^[[:space:]]*\[[Pp]0\][[:space:]]+[^[:space:]]+[[:space:]]+(—|--|-)[[:space:]]+RESOLVED([^_[:alnum:]]|$)')"; [ -n "$p0" ] || p0=0
+  p1="$(grep -iE '^[[:space:]]*\[P1\]' "$out" 2>/dev/null \
+    | grep -Evc '^[[:space:]]*\[[Pp]1\][[:space:]]+[^[:space:]]+[[:space:]]+(—|--|-)[[:space:]]+RESOLVED([^_[:alnum:]]|$)')"; [ -n "$p1" ] || p1=0
   { printf '%s\t%s\t%s\n' "$(date +%s)" "$p0" "$p1" > "$dir/$key.last.tmp" \
       && mv -f "$dir/$key.last.tmp" "$dir/$key.last"; } 2>/dev/null || true
   return 0
@@ -976,6 +996,184 @@ pg_is_review() {
   grep -qiE '\[P[0-3]\]|P[0-3][*_ ]*:[[:space:]]*(none|—|-)' "$f" 2>/dev/null || return 1
   grep -vE '^[[:space:]]*$' "$f" 2>/dev/null | tail -n 6 \
     | grep -qiE '^[[:space:]]*[*_>#-]*[[:space:]]*VERDICT[*_[:space:]]*:'
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.28 (#48): review provenance. A structurally-complete review can still be the WRONG
+# conversation's answer — a failed send once salvaged a different PR's finished review with no
+# indication it was foreign (pushbot #1245), sending its caller off to fix phantom findings.
+# The check is deliberately lenient to make false rejections vanishingly rare: it fires only
+# when the review cites at least one file AND none of those citations overlap the change's
+# path manifest, matching exact paths or component-anchored suffixes (never basenames).
+# ─────────────────────────────────────────────────────────────────────────────
+# pg_diff_paths <unified-diff>: the change's file manifest, one path per line.
+pg_diff_paths() {
+  sed -nE 's#^\+\+\+ b/(.+)#\1#p; s#^--- a/(.+)#\1#p' "$1" 2>/dev/null \
+    | grep -v '^/dev/null$' | sort -u
+}
+# pg_review_cited_paths <review>: paths cited in [Pn] headline lines ("[P1] path:line — ...").
+pg_review_cited_paths() {
+  sed -nE 's/^[[:space:]]*\[P[0-3]\][[:space:]]+([^[:space:]:]+):[0-9].*/\1/p' "$1" 2>/dev/null | sort -u
+}
+# pg_review_matches_change <review> <paths-file>: rc 0 = accept (no manifest, fewer than two
+# distinct citations, or any overlap); rc 1 = REJECT (≥2 cited paths, manifest exists, zero
+# overlap → foreign). The two-citation floor keeps single-finding reviews that legitimately
+# cite one caller/context file outside the diff from being misread as foreign — the observed
+# foreign captures are whole other PRs' reviews, which cite several of their own files.
+pg_review_matches_change() {
+  local review="$1" pathsf="$2" cited c p
+  [ -s "$pathsf" ] || return 0
+  cited="$(pg_review_cited_paths "$review")"
+  [ -n "$cited" ] || return 0
+  [ "$(printf '%s\n' "$cited" | grep -c .)" -ge 2 ] 2>/dev/null || return 0
+  # Overlap = exact path equality, or one path being a component-anchored SUFFIX of the other
+  # (a review may cite repo-relative paths while the diff carries a prefix, or vice versa) —
+  # but ONLY when the shorter side itself carries >=2 components (contains a slash). A bare
+  # single-component citation matching via the suffix rule IS basename matching by another
+  # door (index.ts vs lib/index.ts — gate #54 r6): bare names require exact equality.
+  while IFS= read -r c; do
+    [ -n "$c" ] || continue
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      case "$p" in "$c") return 0;; esac
+      case "$c" in */*) case "$p" in */"$c") return 0;; esac;; esac
+      case "$p" in */*) case "$c" in */"$p") return 0;; esac;; esac
+    done < "$pathsf"
+  done <<PG_EOF
+$cited
+PG_EOF
+  return 1
+}
+
+# pg_provenance_reject <marker>: invalidate a marker's memoized conversation candidate after
+# its capture failed the provenance check. Without this, cdp-salvage's URL memo (written the
+# moment the capture matched) makes the next harvest PREFER the same foreign conversation and
+# starve the real one indefinitely (gate #54 P1). The URL goes on the per-marker blacklist —
+# deliberately bypassing cdp-salvage's own "never blacklist ourUrls" guard: marker match said
+# "ours", but the CONTENT proved the answer is not this change's review, which is the stronger
+# signal — and the memo is removed so the next pass rescans all candidates.
+pg_provenance_reject() {  # <marker> [matched-url]
+  # Prefer the EXPLICIT matched URL the CDP child reported for this very capture: reading the
+  # shared memo afterwards races concurrent probes/retries, which can re-learn the GENUINE
+  # conversation in the interim — condemning it while the foreign source stays eligible
+  # (gate #54 r5). Memo removal is CLAIM-then-verify (gate #54 r6): the memo is atomically
+  # renamed aside first, its content checked against the rejected URL, and restored when it
+  # names a DIFFERENT (newer, possibly genuine) conversation — a read-append-remove sequence
+  # left a window where a concurrently refreshed genuine memo was deleted by a stale compare.
+  local m="$1" url="${2:-}" memo claim snap
+  memo="$PRO_GATE_HOME/conversation-urls/$m"
+  claim="$memo.rej.$$"
+  if mv "$memo" "$claim" 2>/dev/null; then
+    snap="$(head -c 300 "$claim" 2>/dev/null | tr -d '\n')"
+    [ -n "$url" ] || url="$snap"
+    if [ "$snap" = "$url" ] || [ -z "$snap" ]; then
+      rm -f "$claim" 2>/dev/null
+    else
+      # Restore via hard link — link(2) FAILS atomically when the memo already exists, so a
+      # genuine URL the Node writer republished between our claim and this restore is never
+      # overwritten (gate #54 r8: an existence check followed by mv raced exactly there).
+      ln "$claim" "$memo" 2>/dev/null || true
+      rm -f "$claim" 2>/dev/null
+    fi
+  fi
+  [ -n "$url" ] || return 0
+  { printf '%s\t%s\n' "$m" "$url" >> "$PRO_GATE_HOME/salvage-nonmatching.txt"; } 2>/dev/null || true
+  return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.28 (#55): positive run-binding. The review prompt instructs the model to append
+# "(run marker: <marker>)" to its VERDICT line; a browser-matched capture carrying that token
+# was provably written for THIS prompt — content heuristics can't be fooled into accepting a
+# foreign or stale conversation's answer. The engine strips the token before returning output.
+# ─────────────────────────────────────────────────────────────────────────────
+# pg_capture_nonce_ok <file> <marker>: rc 0 when the capture's tail carries this run's token.
+pg_capture_nonce_ok() {
+  local f="$1" marker="$2"
+  [ -s "$f" ] || return 1
+  tail -n 6 "$f" 2>/dev/null | grep -qF "(run marker: $marker)"
+}
+# pg_strip_nonce <file> <marker>: remove the echoed token (harmless when absent).
+pg_strip_nonce() {
+  local f="$1" marker="$2" tmp="$1.nonce.$$"
+  [ -s "$f" ] || return 0
+  # Fixed-string removal via awk (the marker is regex-safe by charset, but the parentheses
+  # around it are not; index/substr avoids regex entirely).
+  awk -v tok="(run marker: $marker)" '{
+    i = index($0, tok)
+    if (i > 0) { $0 = substr($0, 1, i - 1) substr($0, i + length(tok)) ; sub(/[ \t]+$/, "") }
+    print
+  }' "$f" > "$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null
+  rm -f "$tmp" 2>/dev/null
+  return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.28 (#56): immutable completed-artifact store — $PRO_GATE_HOME/completed/<marker>,
+# written ONCE at collection time. Recovery paths previously trusted mutable, path-addressed
+# files (a reused/overwritten --out could impersonate a collection); the artifact store is
+# marker-addressed, write-once, and digest-recorded in the ledger row. Deliberately NOT under
+# the 24h sweeps: these are the durable record (bounded by review volume, a few KB each).
+# ─────────────────────────────────────────────────────────────────────────────
+pg_completed_dir() { echo "${PRO_GATE_COMPLETED_DIR:-$PRO_GATE_HOME/completed}"; }
+pg_sha256() {  # <file>: echo the hex digest, or nothing when no tool is available
+  if pg_have sha256sum; then sha256sum "$1" 2>/dev/null | awk '{print $1}'
+  elif pg_have shasum; then shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
+  elif pg_have openssl; then openssl dgst -sha256 "$1" 2>/dev/null | awk '{print $NF}'
+  fi
+}
+pg_completed_write() {  # <marker> <file>: write-once; an existing artifact is never replaced
+  local marker="$1" f="$2" dir rc
+  pg_reservation_marker_ok "$marker" || return 1
+  [ -s "$f" ] || return 1
+  dir="$(pg_completed_dir)"
+  mkdir -p "$dir" 2>/dev/null || return 1
+  # Atomic NO-CLOBBER install (gate #54 r14): link(2) fails when the artifact exists, so
+  # concurrent writers cannot replace each other. On EEXIST the existing artifact must be
+  # byte-identical to what we hold — write-once means one review per marker, and accepting
+  # different bytes would let callers drop recovery state while RESULT_FILE names the wrong
+  # review. Fail closed otherwise.
+  if cp "$f" "$dir/$marker.tmp.$$" 2>/dev/null && ln "$dir/$marker.tmp.$$" "$dir/$marker" 2>/dev/null; then
+    rc=0
+  elif [ -f "$dir/$marker" ] && cmp -s "$f" "$dir/$marker" 2>/dev/null; then
+    rc=0
+  else
+    rc=1
+  fi
+  # Never leave a pg-run-*-globbable temp behind (r11 P2).
+  rm -f "$dir/$marker.tmp.$$" 2>/dev/null
+  [ "$rc" = 0 ] || return 1
+  # An installed artifact supersedes any pending-recovery copy for the marker (r11 P2).
+  rm -f "$PRO_GATE_HOME/pending/$marker" 2>/dev/null
+  return 0
+}
+pg_completed_lookup() {  # <marker> <out>: place the artifact at <out>; rc 0 on success
+  local marker="$1" out="$2" src rc
+  pg_reservation_marker_ok "$marker" || return 1
+  src="$(pg_completed_dir)/$marker"
+  { [ -s "$src" ] && pg_is_review "$src"; } || return 1
+  [ "$src" = "$out" ] && return 0
+  # Copy-then-rename only — never pre-delete the destination (gate #54 r4 P2): a copy/rename
+  # failure must leave any existing valid output intact, not destroy it and then fail.
+  cp "$src" "$out.already.$$" 2>/dev/null && mv -f "$out.already.$$" "$out" 2>/dev/null
+  rc=$?
+  rm -f "$out.already.$$" 2>/dev/null
+  return "$rc"
+}
+
+# pg_ledger_lookup_clean <marker>: echo "out<TAB>sha256" from the newest CLEAN ledger row for
+# a marker, or nothing. Fallback for pre-artifact collections (#52 item 2): lets a harvest
+# whose reservation is already absent return an ALREADY-COLLECTED review instead of declaring
+# it lost. Scans the WHOLE ledger (append-only, ~KBs per hundred runs) — a fixed tail window
+# forgot completions older than N newer rows (gate #54 r2 P2). Markers land in the ledger
+# from v0.27 on; legacy rows never match (callers fall back to the old behavior).
+pg_ledger_lookup_clean() {
+  local marker="$1" ledger="${PRO_GATE_LEDGER:-$PRO_GATE_HOME/ledger.jsonl}"
+  pg_reservation_marker_ok "$marker" || return 1
+  [ -s "$ledger" ] || return 1
+  pg_have jq || return 1
+  jq -r --arg m "$marker" 'select((.marker // "") == $m and .outcome == "clean") | [.out, (.sha256 // "")] | @tsv' \
+    "$ledger" 2>/dev/null | tail -n 1
 }
 
 # pg_reattach_render <slug> <out> [timeout_s]: bounded attempt to SALVAGE a review whose

@@ -102,8 +102,10 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
 3. **Interpret the exit code**, then return the matching envelope:
    - `0`: review ready. Read the resolved model from `$OUT.status` (`jq -r .model`, the model
      oracle actually used this run, or role-based text when unreadable) and the advisory
-     `model_warn` field (`jq -r .model_warn`, empty when none), then relay `$OUT` verbatim
-     (success envelope). Never name a model version by hand; use the status `model` field.
+     `model_warn` field (`jq -r .model_warn`, empty when none), then relay the file named by
+     the engine's final `RESULT_FILE=` line verbatim (engine >=v0.28: the marker-addressed
+     completed artifact, immune to concurrent --out reuse; `$OUT` is a best-effort alias).
+     Never name a model version by hand; use the status `model` field.
    - `3` (oracle missing, or browser unreachable after the engine's self-heal attempt) or
      `7` (all review slots busy after the 40-min queue wait) — unavailable envelope with
      the one-line reason; safe to retry later.
@@ -131,11 +133,20 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
      ```
      (exit 0 = relay `$OUT`; exit 9 again = reservation retained (still generating, a
      below-threshold miss, or the browser was unreachable for the whole pass — which counts as
-     no miss), wait and repeat if your budget allows, else return the unavailable envelope
-     quoting the harvest command; exit 3 = browser/CDP trouble with the reservation kept, safe
-     to retry; exit 6 = gone after repeated misses — but 6 also fires when the reservation is
-     already ABSENT, which includes "already collected": check the ledger and `$OUT` for a
-     completed review before reporting it lost). Engine >=v0.25 remembers the run's
+     no miss; or — engine >=v0.28 — the capture could not be bound to this run: by default a
+     capture without the run-marker echo is set aside as `$OUT.unbound.*` (possibly an older
+     answer while the current one still generates — retry); legacy mode
+     (PRO_GATE_REQUIRE_NONCE=0) sets zero-overlap captures aside as `$OUT.foreign.*`),
+     wait and repeat if your budget allows, else return the
+     unavailable envelope quoting the harvest command; exit 3 = browser/CDP trouble with the
+     reservation kept, safe to retry; exit 6 has TWO flavors — read the status `detail`
+     before ever interpreting it: a detail containing "already collected" means the review
+     EXISTS but could not be returned automatically (unverifiable pre-v0.28 row, missing or
+     altered prior output) — recover it manually from the named path / PR audit trail /
+     ChatGPT, and NEVER resubmit for it; only a miss-limit detail is a possible real loss,
+     and even then have the human check the ChatGPT conversation before any fresh spend.
+     Engine >=v0.28 returns verifiable already-collected reviews idempotently (exit 0,
+     artifact- or digest-backed). Engine >=v0.25 remembers the run's
      conversation URL and re-renders it when no tab carries the marker, so a browser restart no
      longer loses a finished review; if exit 6 arrives and the conversation IS in ChatGPT, say
      so in your envelope — that is a bug, not the expected path.

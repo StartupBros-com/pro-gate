@@ -190,6 +190,43 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
     done
   fi
 
+  # 1b) Completed artifacts + pending-recovery records: collected reviews that need no
+  # browser and no spend. Collected WITHOUT setting the hint here (gate #54 r10): live-run
+  # signals must outrank an artifact, and among artifacts the NEWEST round wins (markers
+  # embed their creation epoch) — the oldest marker sorting first must not steer automation
+  # at a stale review.
+  : > "$ST_TMP/artifacts.jsonl"
+  ST_ARTIFACT_HINT=""; ST_ART_EPOCH=0
+  # pending scanned FIRST so a completed artifact wins equal-epoch ties (>= keeps the last
+  # seen); temp suffixes and non-review content never drive a hint (gate #54 r11 P2).
+  for f in "$PRO_GATE_HOME/pending"/pg-run-* "$(pg_completed_dir)"/pg-run-*; do
+    [ -f "$f" ] || continue
+    m="$(basename "$f")"
+    # Skip only OUR generated temp names — "<marker>.tmp.<pid>" (all-numeric tail after the
+    # LAST .tmp.). Marker syntax permits dots, so a blanket *.tmp.* filter would hide a
+    # legitimate marker like ...foo.tmp.api-... (gate #54 r12 P2).
+    OG_TAIL="${m##*.tmp.}"
+    if [ "$OG_TAIL" != "$m" ]; then case "$OG_TAIL" in ''|*[!0-9]*) ;; *) continue;; esac; fi
+    st_match "$m" "" || continue
+    pg_is_review "$f" || continue
+    a_kind=completed; case "$f" in */pending/*) a_kind=pending;; esac
+    a_epoch="${m%-*}"; a_epoch="${a_epoch##*-}"; case "$a_epoch" in ''|*[!0-9]*) a_epoch=0;; esac
+    if [ "$a_epoch" -ge "$ST_ART_EPOCH" ]; then
+      ST_ART_EPOCH="$a_epoch"
+      if [ "$a_kind" = completed ]; then
+        ST_ARTIFACT_HINT="a collected review already EXISTS for this change (newest: $f) — return it with $ST_ENGINE --harvest '$m' --out <file> (no browser, nothing spent)"
+      else
+        ST_ARTIFACT_HINT="a captured review awaits MANUAL recovery: the record $f names its snapshot path and digest — copy it out by hand; do NOT respend"
+      fi
+    fi
+    if pg_have jq; then
+      jq -nc --arg marker "$m" --arg artifact "$f" --arg kind "$a_kind" \
+        '{marker:$marker,artifact:$artifact,kind:$kind}' >> "$ST_TMP/artifacts.jsonl" 2>/dev/null
+    else
+      printf '%s\t%s\t%s\n' "$m" "$f" "$a_kind" >> "$ST_TMP/artifacts.tsv"
+    fi
+  done
+
   # 2) Round budget + live-run probes, per change key. The key set is the UNION of rounds/*,
   # active/*, held per-change lock files, and the query-derived key — not rounds/* alone: a
   # first-ever run holds the per-change lock (and, once committed, an active record) while it
@@ -286,6 +323,8 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
   if [ -z "$ST_HINT" ] && [ -n "$ST_INFLIGHT_KEY" ]; then
     ST_HINT="a same-change review is RUNNING right now (per-change lock held for ${ST_INFLIGHT_KEY}): do NOT launch another — wait, then run --status again"
   fi
+  # Artifacts rank BELOW live-run signals but above ledger history (gate #54 r10).
+  [ -n "$ST_HINT" ] || ST_HINT="$ST_ARTIFACT_HINT"
   if [ -z "$ST_HINT" ] && [ -s "$ST_TMP/ledger.jsonl" ] && pg_have jq; then
     ST_LAST_OUTCOME="$(head -n1 "$ST_TMP/ledger.jsonl" | jq -r '.outcome // ""')"
     ST_LAST_OUT="$(head -n1 "$ST_TMP/ledger.jsonl" | jq -r '.out // ""')"
@@ -319,7 +358,8 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
       --slurpfile res <(cat "$ST_TMP/res.jsonl" 2>/dev/null; echo null) \
       --slurpfile rounds <(cat "$ST_TMP/rounds.jsonl" 2>/dev/null; echo null) \
       --slurpfile ledger <(cat "$ST_TMP/ledger.jsonl" 2>/dev/null; echo null) \
-      '{query:$query,home:$home,reservations:($res[:-1]),rounds:($rounds[:-1]),recent_runs:($ledger[:-1]),next_step:$hint}'
+      --slurpfile artifacts <(cat "$ST_TMP/artifacts.jsonl" 2>/dev/null; echo null) \
+      '{query:$query,home:$home,reservations:($res[:-1]),completed_artifacts:($artifacts[:-1]),rounds:($rounds[:-1]),recent_runs:($ledger[:-1]),next_step:$hint}'
     exit 0
   fi
 
@@ -333,6 +373,14 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
     fi
   else
     echo "in-progress reservations: none"
+  fi
+  if [ -s "$ST_TMP/artifacts.jsonl" ] || [ -s "$ST_TMP/artifacts.tsv" ]; then
+    echo "collected artifacts (return with --harvest, no browser, no spend):"
+    if pg_have jq && [ -s "$ST_TMP/artifacts.jsonl" ]; then
+      jq -r '"  " + .marker + "  -> " + .artifact' "$ST_TMP/artifacts.jsonl"
+    else
+      awk -F'\t' '{printf "  %s  -> %s\n", $1, $2}' "$ST_TMP/artifacts.tsv" 2>/dev/null
+    fi
   fi
   if [ -s "$ST_TMP/rounds.jsonl" ] || [ -s "$ST_TMP/rounds.tsv" ]; then
     echo "round budget (rolling window $(( ST_WIN / 3600 ))h, cap $ST_CAP):"
@@ -357,9 +405,68 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
 fi
 
 PORT="${ORACLE_BROWSER_PORT:-9222}"
+# v0.28 (gate #54 r10): normalize the binding policy ONCE, fail-closed — "true"/"2"/typos
+# satisfied neither the =1 nor the =0 branch and bypassed both enforcement modes.
+case "${PRO_GATE_REQUIRE_NONCE:-1}" in 0) REQUIRE_NONCE=0;; *) REQUIRE_NONCE=1;; esac
 MODEL="${ORACLE_MODEL:-gpt-5.6}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/pro-review.XXXXXX")"
 [ -n "$OUT" ] || OUT="$WORK/findings.md"
+if [ -d "$OUT" ]; then
+  # mv into an existing directory "succeeds" by moving the file INSIDE it, so a directory
+  # here would let publication report done while $OUT is still not the promised file
+  # (gate #54 r9 P2). Reject up front.
+  echo "ERROR: --out must be a file path, not an existing directory: $OUT" >&2
+  exit 2
+fi
+# One live run per --out (gate #54 r11): the status sidecar is keyed by $OUT, so two
+# concurrent runs sharing it would overwrite each other's phase/marker and cross-feed their
+# pollers even with distinct result artifacts. Held for the process lifetime; best-effort
+# where flock or the directory is unavailable.
+if [ "$STATUS_REQUESTED" != 1 ]; then
+  PG_OUT_GUARD_OK=0
+  if pg_have flock; then
+    if { exec {PG_OUT_GUARD_FD}>>"$OUT.lock"; } 2>/dev/null; then
+      if flock -n "$PG_OUT_GUARD_FD" 2>/dev/null; then PG_OUT_GUARD_OK=1; else
+        echo "ERROR: another live run is already using --out $OUT (its status sidecar would be overwritten). Use a distinct --out per run." >&2
+        exit 2
+      fi
+    fi
+  fi
+  if [ "$PG_OUT_GUARD_OK" != 1 ]; then
+    # mkdir/PID fallback (gate #54 r12): stock macOS has no flock, and skipping the guard
+    # there reopens the sidecar cross-feed. Dead owners self-heal; a live owner refuses.
+    PG_OUT_GUARD_DIR="$OUT.lock.d"
+    if mkdir "$PG_OUT_GUARD_DIR" 2>/dev/null; then
+      echo "$$" > "$PG_OUT_GUARD_DIR/pid" 2>/dev/null || true
+      PG_OUT_GUARD_OK=1
+    else
+      OG_PID="$(cat "$PG_OUT_GUARD_DIR/pid" 2>/dev/null || true)"
+      case "$OG_PID" in
+        ''|*[!0-9]*) ;;
+        *) if kill -0 "$OG_PID" 2>/dev/null; then
+             echo "ERROR: another live run (pid $OG_PID) is already using --out $OUT. Use a distinct --out per run." >&2
+             exit 2
+           fi ;;
+      esac
+      # Atomic TAKEOVER of the stale dir (gate #54 r14): rename it aside first — exactly one
+      # racer's mv succeeds; the loser's retake mkdir then fails against the winner's fresh
+      # dir and it refuses below. Immediate rm+mkdir let both racers "win".
+      if mv "$PG_OUT_GUARD_DIR" "$PG_OUT_GUARD_DIR.reap.$$" 2>/dev/null; then
+        rm -f "$PG_OUT_GUARD_DIR.reap.$$/pid" 2>/dev/null
+        rmdir "$PG_OUT_GUARD_DIR.reap.$$" 2>/dev/null
+        if mkdir "$PG_OUT_GUARD_DIR" 2>/dev/null; then
+          echo "$$" > "$PG_OUT_GUARD_DIR/pid" 2>/dev/null || true
+          [ "$(cat "$PG_OUT_GUARD_DIR/pid" 2>/dev/null)" = "$$" ] && PG_OUT_GUARD_OK=1
+        fi
+      fi
+    fi
+    if [ "$PG_OUT_GUARD_OK" != 1 ]; then
+      # Fail CLOSED: with no ownership established, two runs could share one sidecar.
+      echo "ERROR: cannot establish ownership of --out $OUT (directory unwritable?). Choose an --out in a writable directory." >&2
+      exit 2
+    fi
+  fi
+fi
 # Fresh runs need oracle; --harvest only needs node+CDP and checks that prerequisite inside
 # its branch below (moving this gate matters when oracle is temporarily unavailable but a spent
 # review is waiting in an open conversation).
@@ -391,15 +498,17 @@ pg_status() {  # $1 phase, $2 optional detail — variable fields are JSON-escap
     jq -nc --arg phase "$phase" --argjson attempt "${attempt:-0}" --arg detail "$detail" \
        --arg pr "${PR_NUM:-diff}" --arg out "$OUT" --arg ts "$ts" --arg marker "${RUN_MARKER:-}" \
        --arg model "$model_label" --arg model_warn "${MODEL_WARN:-}" \
-       '{phase:$phase,attempt:$attempt,detail:$detail,pr:$pr,out:$out,ts:$ts,marker:$marker,model:$model,model_warn:$model_warn}' \
+       --arg result "${RESULT_PATH:-}" \
+       '{phase:$phase,attempt:$attempt,detail:$detail,pr:$pr,out:$out,ts:$ts,marker:$marker,model:$model,model_warn:$model_warn,result:$result}' \
        > "$STATUS_FILE.tmp" 2>/dev/null
   else
-    printf '{"phase":"%s","attempt":%d,"detail":"%s","pr":"%s","out":"%s","ts":"%s","marker":"%s","model":"%s","model_warn":"%s"}\n' \
+    printf '{"phase":"%s","attempt":%d,"detail":"%s","pr":"%s","out":"%s","ts":"%s","marker":"%s","model":"%s","model_warn":"%s","result":"%s"}\n' \
       "$phase" "${attempt:-0}" "$(printf '%s' "$detail" | tr -d '"\\' | tr '\n' ' ')" \
       "${PR_NUM:-diff}" "$(printf '%s' "$OUT" | tr -d '"\\' | tr '\n' ' ')" "$ts" \
       "$(printf '%s' "${RUN_MARKER:-}" | tr -d '"\\' | tr '\n' ' ')" \
       "$(printf '%s' "$model_label" | tr -d '"\\' | tr '\n' ' ')" \
       "$(printf '%s' "${MODEL_WARN:-}" | tr -d '"\\' | tr '\n' ' ')" \
+      "$(printf '%s' "${RESULT_PATH:-}" | tr -d '"\\' | tr '\n' ' ')" \
       > "$STATUS_FILE.tmp" 2>/dev/null
   fi
   { [ -s "$STATUS_FILE.tmp" ] && mv -f "$STATUS_FILE.tmp" "$STATUS_FILE"; } 2>/dev/null || true
@@ -460,6 +569,71 @@ pg_active_clear() {  # $1 = exit code
   fi
   rm -f "$f" 2>/dev/null || true
 }
+pg_publish_out() {  # $1 = verified snapshot → atomically publish to $OUT; rc 0 only when
+  # $OUT is a readable regular file afterwards (an existing directory or a failed rename is
+  # a publication FAILURE, never silently "done" — gate #54 r9).
+  local src="$1" rc=1
+  if cp "$src" "$OUT.pub.$$" 2>/dev/null && mv -f "$OUT.pub.$$" "$OUT" 2>/dev/null \
+     && [ -f "$OUT" ] && [ ! -d "$OUT" ]; then rc=0; fi
+  rm -f "$OUT.pub.$$" 2>/dev/null
+  return "$rc"
+}
+pg_persist_result() {  # $1 = verified snapshot — persist the CANONICAL, marker-addressed
+  # result and set RESULT_PATH (gate #54 r10/r11). Ladder: completed artifact → pending BYTES
+  # (a pointer to a /tmp snapshot dies with reboots and tmp sweeps; the review itself must be
+  # durable) → the kept private snapshot (PG_KEEP_FINAL). Shared $OUT is NEVER canonical:
+  # two runs sharing it can both "win" a rename, and cross-feeding callers is worse than a
+  # non-preferred path.
+  local src="$1"
+  if pg_completed_write "$RUN_MARKER" "$src" 2>/dev/null && [ -s "$(pg_completed_dir)/$RUN_MARKER" ]; then
+    RESULT_PATH="$(pg_completed_dir)/$RUN_MARKER"
+    pg_reservation_remove "$RUN_MARKER" 2>/dev/null || true
+    return 0
+  fi
+  if { mkdir -p "$PRO_GATE_HOME/pending" \
+       && cp "$src" "$PRO_GATE_HOME/pending/$RUN_MARKER.tmp.$$" \
+       && mv -f "$PRO_GATE_HOME/pending/$RUN_MARKER.tmp.$$" "$PRO_GATE_HOME/pending/$RUN_MARKER"; } 2>/dev/null; then
+    RESULT_PATH="$PRO_GATE_HOME/pending/$RUN_MARKER"
+    # A durably persisted review retires its reservation (gate #54 r12): the harvest path
+    # deliberately kept it when the completed store was unwritable, but with the bytes safe
+    # under pending/ a live reservation would only hold capacity and outrank the result.
+    pg_reservation_remove "$RUN_MARKER" 2>/dev/null || true
+    echo "[oracle-review] WARNING: completed-artifact store unwritable; the review is durable at $RESULT_PATH instead." >&2
+    return 0
+  fi
+  rm -f "$PRO_GATE_HOME/pending/$RUN_MARKER.tmp.$$" 2>/dev/null
+  PG_KEEP_FINAL=1
+  RESULT_PATH="$src"
+  echo "[oracle-review] WARNING: no durable store writable; the review is KEPT at $RESULT_PATH (survives only until temp cleanup) — copy it out now." >&2
+  return 0
+}
+pg_publish_fail() {  # $1 = snapshot — shared failure path: durability decides the message,
+  # and when NOTHING could be persisted the snapshot itself is retained (gate #54 r9).
+  local src="$1"
+  if pg_completed_write "$RUN_MARKER" "$src"; then
+    pg_reservation_remove "$RUN_MARKER" 2>/dev/null || true
+    echo "ERROR: review captured but could not be written to --out ($OUT). It is durable at $(pg_completed_dir)/$RUN_MARKER — copy it from there or re-run --harvest '$RUN_MARKER'; do NOT respend." >&2
+    pg_status failed "already collected; --out unwritable; artifact at $(pg_completed_dir)/$RUN_MARKER"
+  else
+    # Durable MARKER-ADDRESSED copy of the review BYTES (gate #54 r10/r11): a pointer to a
+    # /tmp snapshot dies with reboots and temp sweeps. If no durable location exists at all,
+    # keep the run's active record and tab so --status still shows a live trail.
+    if { mkdir -p "$PRO_GATE_HOME/pending" \
+         && cp "$src" "$PRO_GATE_HOME/pending/$RUN_MARKER.tmp.$$" \
+         && mv -f "$PRO_GATE_HOME/pending/$RUN_MARKER.tmp.$$" "$PRO_GATE_HOME/pending/$RUN_MARKER"; } 2>/dev/null; then
+      pg_reservation_remove "$RUN_MARKER" 2>/dev/null || true
+      echo "ERROR: review captured but --out ($OUT) and the artifact store are unwritable. The review is durable at $PRO_GATE_HOME/pending/$RUN_MARKER — copy it from there; do NOT respend." >&2
+      pg_status failed "captured; --out unwritable; review durable at pending/$RUN_MARKER"
+    else
+      rm -f "$PRO_GATE_HOME/pending/$RUN_MARKER.tmp.$$" 2>/dev/null
+      PG_KEEP_FINAL=1
+      PG_PRESERVE_STATE=1
+      echo "ERROR: review captured but nothing under $PRO_GATE_HOME is writable either. The verified snapshot is KEPT at $src; the run's tab and active record are PRESERVED — recover manually; do NOT respend." >&2
+      pg_status failed "captured; no durable location writable; snapshot kept at $src; state preserved"
+    fi
+  fi
+  pg_finish 6
+}
 pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor, exit
   local rc="$1" outcome dur line model_label
   dur=$(( $(date +%s) - RUN_START ))
@@ -489,6 +663,28 @@ pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor,
       cloudflare)            pg_ramp_update throttle "${MAX_CONC:-1}" ;;
     esac
   fi
+  # v0.28 (#56): a clean run's review becomes the write-once completed artifact, and its
+  # digest lands in the ledger row — later already-collected recovery verifies content
+  # identity instead of trusting a mutable, reusable output path.
+  # The private verified snapshot (when a path staged one) is the authoritative source for
+  # the durable artifact AND the ledgered digest (gate #54 r5/r6): a caller may share one
+  # --out across markers, and $OUT's content by ledger time need not be the bytes THIS
+  # invocation verified and returned.
+  local fsrc
+  fsrc="${PG_FINAL_SRC:-$OUT}"
+  [ -s "$fsrc" ] || fsrc="$OUT"
+  OUT_SHA=""
+  if [ "$rc" = 0 ] && [ -n "${RUN_MARKER:-}" ] && [ -s "$fsrc" ]; then
+    # Persist EXACTLY ONCE (gate #54 r12): when pg_persist_result already ran, a retry here
+    # could succeed against the completed store and delete the pending file that terminal
+    # status and stdout ALREADY named as canonical — a dangling RESULT_FILE.
+    if [ -z "${RESULT_PATH:-}" ] && ! pg_completed_write "$RUN_MARKER" "$fsrc"; then
+      echo "[oracle-review] WARNING: completed artifact could not be persisted for ${RUN_MARKER} ($(pg_completed_dir) unwritable?); already-collected recovery will rely on the ledgered digest only." >&2
+    fi
+    OUT_SHA="$(pg_sha256 "$fsrc")"
+  fi
+  [ -n "${PG_FINAL_SRC:-}" ] && [ "$PG_FINAL_SRC" != "$OUT" ] && [ "${PG_KEEP_FINAL:-0}" != 1 ] \
+    && rm -f "$PG_FINAL_SRC" 2>/dev/null
   # v0.27: `marker` and `round_key` land in every ledger line so --status (and any caller with
   # only the ledger) can reconstruct a harvest command without the original status file. Rows
   # from failures before identity derivation (exit 4/5) carry them empty — present, not absent.
@@ -499,19 +695,20 @@ pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor,
       --argjson conc "${EFF_CONC:-0}" --argjson ceiling "${MAX_CONC:-1}" \
       --argjson live "${LIVE_CONVERSATION:-0}" --argjson salvaged "${SALVAGED:-0}" \
       --argjson diff_lines "${DIFF_LINES:-0}" --arg out "$OUT" --arg model "$model_label" \
-      --arg marker "${RUN_MARKER:-}" --arg round_key "${ROUND_KEY:-}" \
-      '{ts:$ts,pr:$pr,repo:$repo,exit:$exit,outcome:$outcome,secs:$secs,attempts:$attempts,conc:$conc,ceiling:$ceiling,live:$live,salvaged:$salvaged,diff_lines:$diff_lines,out:$out,model:$model,marker:$marker,round_key:$round_key}' 2>/dev/null)"
+      --arg marker "${RUN_MARKER:-}" --arg round_key "${ROUND_KEY:-}" --arg sha256 "$OUT_SHA" \
+      '{ts:$ts,pr:$pr,repo:$repo,exit:$exit,outcome:$outcome,secs:$secs,attempts:$attempts,conc:$conc,ceiling:$ceiling,live:$live,salvaged:$salvaged,diff_lines:$diff_lines,out:$out,model:$model,marker:$marker,round_key:$round_key,sha256:$sha256}' 2>/dev/null)"
   else
-    line="$(printf '{"ts":"%s","pr":"%s","exit":%d,"outcome":"%s","secs":%d,"attempts":%d,"conc":%d,"ceiling":%d,"live":%d,"salvaged":%d,"out":"%s","model":"%s","marker":"%s","round_key":"%s"}' \
+    line="$(printf '{"ts":"%s","pr":"%s","exit":%d,"outcome":"%s","secs":%d,"attempts":%d,"conc":%d,"ceiling":%d,"live":%d,"salvaged":%d,"out":"%s","model":"%s","marker":"%s","round_key":"%s","sha256":"%s"}' \
       "$(date +%Y-%m-%dT%H:%M:%S%z)" "${PR_NUM:-diff}" "$rc" "$outcome" "$dur" "${attempt:-0}" \
       "${EFF_CONC:-0}" "${MAX_CONC:-1}" "${LIVE_CONVERSATION:-0}" "${SALVAGED:-0}" \
       "$(printf '%s' "$OUT" | tr -d '"\\' | tr '\n' ' ')" \
       "$(printf '%s' "$model_label" | tr -d '"\\' | tr '\n' ' ')" \
       "$(printf '%s' "${RUN_MARKER:-}" | tr -d '"\\' | tr '\n' ' ')" \
-      "$(printf '%s' "${ROUND_KEY:-}" | tr -d '"\\' | tr '\n' ' ')")"
+      "$(printf '%s' "${ROUND_KEY:-}" | tr -d '"\\' | tr '\n' ' ')" \
+      "$OUT_SHA")"
   fi
   pg_ledger_append "$line"
-  pg_active_clear "$rc"
+  [ "${PG_PRESERVE_STATE:-0}" = 1 ] || pg_active_clear "$rc"
   # Close this run's conversation tab. We run oracle with --browser-archive=never (so probe and
   # salvage can always find the conversation by marker), which means WE own cleanup, otherwise
   # /c/ tabs accumulate and add load to the account. Best-effort, bounded, non-fatal; matched by
@@ -525,7 +722,8 @@ pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor,
   # Skip it for engine/browser trouble (3) too (v0.25): that path tells the caller "reservation
   # and tab kept, retry once CDP is healthy", so closing the tab here would contradict the
   # promise and throw away the conversation the retry is supposed to collect.
-  if [ "$rc" != 3 ] && [ "$rc" != 7 ] && [ "$rc" != 8 ] && [ "$rc" != 9 ] && [ "$rc" != 11 ] && [ "$rc" != 12 ] \
+  if [ "${PG_PRESERVE_STATE:-0}" != 1 ] \
+     && [ "$rc" != 3 ] && [ "$rc" != 7 ] && [ "$rc" != 8 ] && [ "$rc" != 9 ] && [ "$rc" != 11 ] && [ "$rc" != 12 ] \
      && [ "$MODE" = remote-chrome ] && [ "${PRO_GATE_KEEP_TABS:-0}" != 1 ] \
      && [ -n "${RUN_MARKER:-}" ] && command -v node >/dev/null 2>&1; then
     timeout 30 node "$SELF/cdp-salvage.mjs" --close "$RUN_MARKER" 25 "$PORT" >/dev/null 2>&1 || true
@@ -534,6 +732,46 @@ pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor,
 }
 
 # --- preflight: browser reachable / signed in (per platform) ---
+# v0.28 (#56, gate #54 r4 P2): the completed artifact needs NO browser at all — return it
+# before even the global CDP preflight, so a collected review stays retrievable while Chrome
+# is down (the exact condition the artifact exists for). No lock needed: the artifact is
+# write-once and installed atomically, so a concurrent reader can never observe a torn copy.
+if [ -n "$HARVEST_MARKER" ] && pg_reservation_marker_ok "$HARVEST_MARKER" \
+   && [ -s "$(pg_completed_dir)/$HARVEST_MARKER" ] && pg_is_review "$(pg_completed_dir)/$HARVEST_MARKER"; then
+  # Full run identity BEFORE any status/ledger write (gate #54 r5 P2): without it this row
+  # landed as pr=diff with no round_key, invisible to --status/stats and unable to retire a
+  # dead active record. The RETURNED bytes come from a process-private snapshot of the
+  # write-once artifact (r5 P1): two markers sharing one caller --out can race the final
+  # rename, but each invocation still outputs and ledgers exactly the bytes it verified.
+  HARVEST=1
+  RUN_MARKER="$HARVEST_MARKER"
+  PR_NUM="${HARVEST_MARKER#pg-run-}"; PR_NUM="${PR_NUM%-*-*}"
+  ROUND_KEY="$PR_NUM"
+  RESOLVED_MODEL="$(pg_reservation_read_model "$RUN_MARKER" 2>/dev/null || true)"
+  FASTPATH_ART="$(pg_completed_dir)/$RUN_MARKER"
+  FASTPATH_SNAP="$WORK/fastpath.snap"
+  if cp "$FASTPATH_ART" "$FASTPATH_SNAP" 2>/dev/null && pg_is_review "$FASTPATH_SNAP"; then
+    PG_FINAL_SRC="$FASTPATH_SNAP"
+    SALVAGED=1
+    # Retire any leftover reservation/manifest for this marker (gate #54 r7): a crash between
+    # a prior run's artifact write and its reservation removal must not hold account capacity
+    # (and keep redirecting this change to harvest) for the whole 6h TTL.
+    pg_reservation_remove "$RUN_MARKER" || true
+    echo "[oracle-review] review already collected (completed artifact); returning it — no browser touched, nothing spent." >&2
+    if ! pg_publish_out "$FASTPATH_SNAP"; then
+      echo "ERROR: collected review could not be written to --out ($OUT). It remains durable at $FASTPATH_ART — copy it from there; do NOT respend." >&2
+      pg_status failed "already collected; could not publish to --out (artifact at $FASTPATH_ART)"
+      pg_finish 6
+    fi
+    RESULT_PATH="$FASTPATH_ART"
+    echo "RESULT_FILE=$RESULT_PATH"
+    pg_status done "already collected; result: $RESULT_PATH"
+    cat "$FASTPATH_SNAP"
+    pg_finish 0
+  fi
+  rm -f "$FASTPATH_SNAP" 2>/dev/null
+fi
+
 if [ "$MODE" = "remote-chrome" ]; then
   export DISPLAY="${ORACLE_DISPLAY:-:99}"
   # v0.19: one self-heal attempt (non-interactive service start) before giving up.
@@ -600,6 +838,8 @@ if [ -n "$HARVEST_MARKER" ]; then
     pg_status failed "harvest already running"
     pg_finish 7
   fi
+  # (Completed-artifact returns happen BEFORE the global preflight — see the fast path above
+  # the MODE check; by this point the artifact is known absent.)
   # A harvest spends NO Pro slot and only reads over CDP, so the box-fitness parts of
   # pg_health_gate (memory, service uptime) don't apply: memory pressure is likeliest exactly
   # when a long review forced the harvest. Only the account cooldown defers it: salvage renders
@@ -613,22 +853,88 @@ if [ -n "$HARVEST_MARKER" ]; then
   echo "[oracle-review] harvesting in-progress review (marker ${RUN_MARKER}, up to ${HARVEST_SECS}s, no new slot spent)..." >&2
   pg_status salvaging "harvest up to ${HARVEST_SECS}s"
   HARVEST_RC=0
-  HARVEST_TMP="$OUT.cdp.$$"
-  node "$SELF/cdp-salvage.mjs" "$RUN_MARKER" "$HARVEST_SECS" "$PORT" > "$HARVEST_TMP" || HARVEST_RC=$?
+  HARVEST_TMP="$WORK/harvest.capture"
+  node "$SELF/cdp-salvage.mjs" "$RUN_MARKER" "$HARVEST_SECS" "$PORT" > "$HARVEST_TMP" 2> "$HARVEST_TMP.err" || HARVEST_RC=$?
+  [ -s "$HARVEST_TMP.err" ] && sed 's/^/[cdp-salvage] /' "$HARVEST_TMP.err" >&2
+  # v0.28 (gate #54 r5): the CDP child names its capture's exact source URL.
+  HARVEST_URL="$(sed -n 's/^matched-url //p' "$HARVEST_TMP.err" 2>/dev/null | tail -1)"
+  rm -f "$HARVEST_TMP.err"
   if [ "$HARVEST_RC" -eq 0 ] && pg_is_review "$HARVEST_TMP"; then
-    mv "$HARVEST_TMP" "$OUT"
-    pg_reservation_remove "$RUN_MARKER" || true
+    # v0.28 (#48/#55): provenance before acceptance, positive binding first. A capture whose
+    # VERDICT line echoes this run's nonce was provably written for this prompt — that
+    # overrides path heuristics entirely. Absent a nonce (model non-compliance, or a pre-v0.28
+    # conversation), fall back to the manifest overlap check; a complete review citing NONE of
+    # the change's files is a foreign conversation's answer. Rejection preserves the
+    # reservation, counts no miss, and invalidates the memoized candidate (blacklist + memo
+    # removal) so the NEXT pass rescans instead of replaying the same foreign conversation.
+    HARVEST_MANIFEST="$(pg_manifest_dir)/${RUN_MARKER}"
+    if pg_capture_nonce_ok "$HARVEST_TMP" "$RUN_MARKER"; then
+      :  # positively bound to this run
+    elif [ "$REQUIRE_NONCE" = 1 ]; then
+      # NONCE OR NOTHING (gate #54 r3-r6): under REQUIRE_NONCE a nonce-less capture is never
+      # accepted AND never used to blacklist — a "foreign-looking" capture may be an OLDER
+      # verdict scraped from the very conversation still generating THIS run's answer (the
+      # marker sits in the submitted prompt below it), so condemning its URL would skip the
+      # eventual nonce-bearing result (r6 P1). Preserve everything and retry: the real answer
+      # arrives with the echo, or the reservation ages out for manual recovery. Deliberately
+      # independent of manifest/sidecar persistence (r4 P1): missing metadata fails CLOSED.
+      mv "$HARVEST_TMP" "$OUT.unbound.$$" 2>/dev/null || rm -f "$HARVEST_TMP"
+      # The exit-9 contract PROMISES a live reservation keyed to the real change; a harvest
+      # can reach here for a marker whose reservation already released. An EMPTY key would
+      # default to the literal "diff" and be undiscoverable (gate #54 r14): derive the key
+      # from the marker, and fail CLOSED (state preserved, exit 3) when even the reservation
+      # cannot be persisted — exit 9 must never claim protection it does not have.
+      RES_KEY="${RUN_MARKER#pg-run-}"; RES_KEY="${RES_KEY%-*-*}"
+      if ! pg_reservation_write "$RUN_MARKER" "$RES_KEY" "$OUT" 2>/dev/null; then
+        PG_PRESERVE_STATE=1
+        echo "ERROR: unbindable capture preserved, but its reservation could not be persisted ($PRO_GATE_HOME unwritable?). Tab and state KEPT; retry --harvest once the home is writable." >&2
+        pg_status failed "unbindable capture; reservation write failed; state preserved"
+        pg_finish 3
+      fi
+      echo "ERROR: harvested a complete review that cannot be bound to this run (no run-marker echo — possibly an older answer while the current one is still generating). Reservation and candidate kept. Retry --harvest; inspect $OUT.unbound.$$; PRO_GATE_REQUIRE_NONCE=0 accepts best-effort captures." >&2
+      pg_status in-progress "harvested review unbindable (no nonce echo); reservation kept, retry"
+      pg_finish 9
+    elif [ -s "$HARVEST_MANIFEST" ] && ! pg_review_matches_change "$HARVEST_TMP" "$HARVEST_MANIFEST"; then
+      # Legacy mode (REQUIRE_NONCE=0): path overlap is authoritative, so a zero-overlap
+      # capture IS foreign here — blacklist its exact source and rescan.
+      mv "$HARVEST_TMP" "$OUT.foreign.$$" 2>/dev/null || rm -f "$HARVEST_TMP"
+      pg_provenance_reject "$RUN_MARKER" "${HARVEST_URL:-}"
+      RES_KEY="${RUN_MARKER#pg-run-}"; RES_KEY="${RES_KEY%-*-*}"
+      if ! pg_reservation_write "$RUN_MARKER" "$RES_KEY" "$OUT" 2>/dev/null; then
+        PG_PRESERVE_STATE=1
+        echo "ERROR: foreign capture set aside, but the reservation could not be persisted ($PRO_GATE_HOME unwritable?). Tab and state KEPT; retry --harvest once the home is writable." >&2
+        pg_status failed "foreign capture set aside; reservation write failed; state preserved"
+        pg_finish 3
+      fi
+      echo "ERROR: harvested a complete review that cites NONE of this change's files — foreign conversation suspected. Reservation kept, its memoized candidate invalidated; retry --harvest. The rejected capture is at $OUT.foreign.$$ for inspection." >&2
+      pg_status in-progress "harvested review failed provenance (cites no change files); reservation kept"
+      pg_finish 9
+    else
+      echo "[oracle-review] NOTE: PRO_GATE_REQUIRE_NONCE=0 — accepted a nonce-less capture on best-effort path overlap." >&2
+    fi
+    pg_strip_nonce "$HARVEST_TMP" "$RUN_MARKER"
+    # Private verified snapshot is the authoritative return (gate #54 r6): $OUT is
+    # publication only — a concurrent marker sharing the caller's --out cannot change what
+    # THIS invocation returns, persists, or ledgers. Publication is VERIFIED (r8): "done"
+    # promises a readable --out, so a failed publish routes to manual recovery instead.
+    PG_FINAL_SRC="$HARVEST_TMP"
+    pg_publish_out "$PG_FINAL_SRC" || pg_publish_fail "$PG_FINAL_SRC"
+    # Durability ladder (gate #54 r6/r14): pg_persist_result retires the reservation on the
+    # durable rungs; only the volatile last-resort rung keeps it (the review then remains
+    # re-collectable).
+    pg_persist_result "$PG_FINAL_SRC"
     # v0.22: a harvest completes the round the exit-9 run already recorded, so refresh the
     # round budget's last-severity sidecar too. The marker embeds ROUND_KEY
     # ("pg-run-<key>-<epoch>-<pid>") for PR and --diff runs alike; legacy markers resolve to
     # keys with no recorded rounds and are skipped inside the helper (best-effort, advisory).
     HARVEST_KEY="${RUN_MARKER#pg-run-}"; HARVEST_KEY="${HARVEST_KEY%-*-*}"
-    pg_round_note_severity "$HARVEST_KEY" "$OUT"
+    pg_round_note_severity "$HARVEST_KEY" "$PG_FINAL_SRC"
     SALVAGED=1
-    echo "[oracle-review] harvest recovered the completed review ($(wc -c < "$OUT" 2>/dev/null) bytes)." >&2
-    pg_status done
-    cat "$OUT"
-    echo "RESULT_FILE=$OUT"
+    echo "[oracle-review] harvest recovered the completed review ($(wc -c < "$PG_FINAL_SRC" 2>/dev/null) bytes)." >&2
+    pg_persist_result "$PG_FINAL_SRC"
+    echo "RESULT_FILE=$RESULT_PATH"
+    pg_status done "result: $RESULT_PATH"
+    cat "$PG_FINAL_SRC"
     pg_finish 0
   fi
   rm -f "$HARVEST_TMP"
@@ -666,7 +972,64 @@ if [ -n "$HARVEST_MARKER" ]; then
        # reservation on one observation (dogfood review P1).
        MISS_VERDICT="$(pg_reservation_note_miss "$RUN_MARKER")"
        if [ "$MISS_VERDICT" = released ]; then
-         echo "ERROR: no conversation matches marker ${RUN_MARKER} after repeated confirmed misses (review lost or already collected)." >&2
+         # v0.28 (#52 item 2, #56): "released" conflates two very different states — a genuine
+         # miss-limit loss, and a reservation ALREADY ABSENT because another pass collected
+         # this review. Declaring the second one lost invited a duplicate Pro spend; return
+         # the collected review idempotently instead, spending nothing. The write-once
+         # completed artifact (marker-addressed, written at collection) is the primary proof;
+         # the ledgered path is the fallback for pre-artifact collections, DIGEST-VERIFIED
+         # when the row carries one — a reused/overwritten output path must never impersonate
+         # a collection (gate #54 r1+r2 P1), and pre-existing $OUT content never counts.
+         PRIOR_OUT=""; PRIOR_SHA=""; COLLECT_OK=0; COLLECT_SRC=""
+         if [ -s "$(pg_completed_dir)/$RUN_MARKER" ] \
+            && cp "$(pg_completed_dir)/$RUN_MARKER" "$WORK/already.snap" 2>/dev/null \
+            && pg_is_review "$WORK/already.snap"; then
+           # Snapshot-first here too (gate #54 r8): this branch is reachable when a second
+           # collector passes the initial fast path before the first publishes the artifact.
+           COLLECT_OK=1; COLLECT_SRC="$(pg_completed_dir)/$RUN_MARKER"
+           PG_FINAL_SRC="$WORK/already.snap"
+         else
+           LEDGER_HIT="$(pg_ledger_lookup_clean "$RUN_MARKER")"
+           PRIOR_OUT="${LEDGER_HIT%%$'\t'*}"
+           PRIOR_SHA="${LEDGER_HIT#*$'\t'}"; [ "$PRIOR_SHA" = "$LEDGER_HIT" ] && PRIOR_SHA=""
+           # Auto-recover from the ledger ONLY under a verified digest (gate #54 r3): a
+           # pre-v0.28 row without one, or a box with no hash tool, cannot prove the mutable
+           # path still holds the collected review — report its location for MANUAL recovery
+           # instead of copying whatever occupies it. All v0.28+ collections have the
+           # completed artifact anyway (checked above), so this fallback only ages out.
+           # Snapshot FIRST, then verify the snapshot (gate #54 r4 P1): hashing the mutable
+           # source and copying it later is a race — another run can overwrite a reused path
+           # between the two. Only bytes whose digest matched are ever installed or returned;
+           # the same-path case snapshots too, so the returned bytes ARE the verified ones.
+           if [ -n "$PRIOR_OUT" ] && [ -n "$PRIOR_SHA" ] && [ -s "$PRIOR_OUT" ]; then
+             SNAP="$WORK/ledger.snap"
+             if cp "$PRIOR_OUT" "$SNAP" 2>/dev/null && pg_is_review "$SNAP" 2>/dev/null \
+                && [ "$(pg_sha256 "$SNAP")" = "$PRIOR_SHA" ]; then
+               COLLECT_OK=1; COLLECT_SRC="$PRIOR_OUT"
+               PG_FINAL_SRC="$SNAP"
+             else
+               rm -f "$SNAP" 2>/dev/null
+             fi
+           fi
+         fi
+         if [ "$COLLECT_OK" = 1 ]; then
+           SALVAGED=1
+           echo "[oracle-review] this review was ALREADY collected (${COLLECT_SRC}); returning it idempotently — nothing spent, nothing lost." >&2
+           # Same checked publication as every other success (gate #54 r9): done is set only
+           # once $OUT verifiably holds the snapshot.
+           pg_publish_out "$PG_FINAL_SRC" || pg_publish_fail "$PG_FINAL_SRC"
+           pg_persist_result "$PG_FINAL_SRC"
+           echo "RESULT_FILE=$RESULT_PATH"
+           pg_status done "already collected; result: $RESULT_PATH"
+           cat "$PG_FINAL_SRC"
+           pg_finish 0
+         fi
+         if [ -n "$PRIOR_OUT" ]; then
+           echo "ERROR: this review was already collected (ledger row exists) but cannot be returned automatically: the prior output ($PRIOR_OUT) is gone, unreadable, digest-mismatched, or carries no verifiable digest (pre-v0.28 row). Not a loss — recover it MANUALLY from that path, the PR comment/audit trail, or the ChatGPT conversation; do NOT spend a fresh slot for it." >&2
+           pg_status failed "already collected; prior output unavailable or unverifiable ($PRIOR_OUT) — manual recovery, do NOT respend"
+           pg_finish 6
+         fi
+         echo "ERROR: no conversation matches marker ${RUN_MARKER} after repeated confirmed misses, and no collected copy is ledgered (review lost, or collected by an engine <v0.27 that ledgered no marker)." >&2
          pg_status failed "harvest found no matching conversation (miss limit reached)"
          pg_finish 6
        fi
@@ -766,6 +1129,10 @@ if [ -s "$DIFF_FILE" ] && [ "${PRO_GATE_DIFF_FILTER:-1}" = 1 ]; then
 fi
 
 DIFF_LINES=$(wc -l < "$DIFF_FILE" 2>/dev/null || echo 0)
+# v0.28 (#48): the change's file manifest, used to provenance-check any salvaged/reattached
+# capture before accepting it as this change's review (and persisted beside an exit-9
+# reservation so a later --harvest can run the same check).
+pg_diff_paths "$DIFF_FILE" > "$WORK/diff.paths" 2>/dev/null || true
 echo "[oracle-review] os=$OS mode=$MODE repo=$REPO pr=#${PR_NUM} url=${PR_URL:-n/a} diff_lines=$DIFF_LINES input=$INPUT" >&2
 
 # --- v0.20/v0.24: diff-size handling. The deep think IS the product of this gate, and the engine
@@ -841,6 +1208,11 @@ fi
 # gives --diff runs a real per-change identity instead of the shared literal "diff", so their
 # exit-9 reservations can redirect same-branch re-runs to harvest like PR runs always could.
 RUN_MARKER="pg-run-${ROUND_KEY:-diff}-$(date +%s)-$$"
+# v0.28 (gate #54 r8): oracle/reattach/salvage capture into a PROCESS-PRIVATE file from the
+# outset; the caller's $OUT is publication-only, written once after acceptance. Two runs whose
+# callers share one --out (same bare PR number in different repos, retries, orchestrator
+# reuse) can no longer swap each other's bytes into the validation window.
+CAPTURE_OUT="$WORK/capture.md"
 PROMPT_FILE="$WORK/prompt.md"
 {
   # Lead with the @GitHub connector tag + an explicit directive (belt-and-suspenders: oracle
@@ -894,7 +1266,12 @@ Group by severity, P0 first. If a severity has no findings, write "Pn: none".
 End with one final line:  VERDICT: SHIP | FIX-FIRST | NEEDS-DISCUSSION  — <=15 word reason.
 EOF
   echo
-  echo "(run marker: ${RUN_MARKER} — internal correlation id; ignore it and do not mention it)"
+  # v0.28 (#55): positive run-binding. The marker was previously "ignore and do not mention";
+  # now the model must ECHO it on the VERDICT line, proving the answer was written for THIS
+  # prompt (a foreign or stale conversation's review cannot carry it). It sits ON the VERDICT
+  # line because the collector's extraction ends at that line; the engine strips it before
+  # returning output. Non-compliance degrades gracefully to the path-overlap check.
+  echo "(run marker: ${RUN_MARKER} — internal correlation id. Do not discuss it, but append it verbatim to the end of your final VERDICT line, i.e.: VERDICT: <your verdict> (run marker: ${RUN_MARKER}))"
 } > "$PROMPT_FILE"
 
 # --- assemble --file attachments (bundle mode) ---
@@ -955,6 +1332,7 @@ EFF_CONC="$(pg_ramp_level "$MAX_CONC")"
 find "$(dirname "$LOCKFILE")" -maxdepth 1 -name "$(basename "$LOCKFILE").pr-*" -mmin +1440 -delete 2>/dev/null || true
 find "${PRO_GATE_HARVEST_LOCK_DIR:-$PRO_GATE_HOME/harvest-locks}" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
 find "$(pg_active_dir)" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
+find "$(pg_manifest_dir)" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
 # Round-budget state (v0.22): entries self-prune on write, but a key never gated again keeps
 # its file (and its 0-byte .lock) forever. Sweep files untouched for longer than the rounds
 # window (every entry inside is expired), floored at 24h so a short window never deletes a
@@ -1147,12 +1525,12 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
       "${URL_ARGS[@]}" "${FILE_ARGS[@]}" \
       -p "$(cat "$PROMPT_FILE")" \
       --no-notify --timeout "$TIMEOUT" \
-      --write-output "$OUT" 2>&1 | tee -a "$RUNLOG" | stdbuf -oL sed 's/^/[oracle] /' >&2 ) &
+      --write-output "$CAPTURE_OUT" 2>&1 | tee -a "$RUNLOG" | stdbuf -oL sed 's/^/[oracle] /' >&2 ) &
   job=$!
   started=$SECONDS; last_size=-1; last_change=$SECONDS
   while kill -0 "$job" 2>/dev/null; do
     sleep 10
-    [ -s "$OUT" ] && continue   # findings are landing — let the run finish undisturbed
+    [ -s "$CAPTURE_OUT" ] && continue   # findings are landing — let the run finish undisturbed
     size=$(wc -c < "$RUNLOG" 2>/dev/null) || size=0
     if [ "$size" != "$last_size" ]; then last_size="$size"; last_change=$SECONDS; fi
     now=$SECONDS
@@ -1251,7 +1629,28 @@ while :; do
 
   echo "[oracle-review] launching the final-tier Pro review (attempt $((attempt + 1)), oracle timeout $TIMEOUT, hard cap ${HARD_SECS}s, stall/no-think watchdog ${STALL_SECS}s/${NOTHINK_SECS}s)..." >&2
   pg_status launching "strategy ${PRO_GATE_MODEL_STRATEGY:-current}"
-  : > "$RUNLOG"; rm -f "$OUT"   # clear any prior attempt's output so stale garbage can't survive
+  # v0.28 (#48, #45 residual): capture the conversation URL EARLY. One bounded background
+  # probe shortly after submission writes the conversation-urls memo the moment the
+  # marker-bearing tab is identifiable — before v0.28 the memo was learned only at the first
+  # successful salvage/probe, so a whole-Chrome death mid-generation could still lose the only
+  # pointer to a review that exists server-side. Open-tab scan only in the common case (the
+  # run's own tab is open, so no page loads and no throttle exposure); non-fatal; bounded;
+  # remote-chrome only. PRO_GATE_EARLY_PROBE_SECS sets the delay, 0 disables.
+  EARLY_PROBE_DELAY="${PRO_GATE_EARLY_PROBE_SECS:-75}"
+  case "$EARLY_PROBE_DELAY" in ''|*[!0-9]*) EARLY_PROBE_DELAY=75;; esac
+  # Armed on EVERY attempt (gate #54 P1): a dead first attempt commonly outlives the probe
+  # window, and a successful retry would otherwise generate with no early pointer at all.
+  if [ "$MODE" = remote-chrome ] && [ "$EARLY_PROBE_DELAY" -gt 0 ] \
+     && command -v node >/dev/null 2>&1; then
+    # Close inherited descriptors FIRST: the subshell inherits every open fd, including the
+    # per-change flock and the account-slot fd — without this, the sleeping probe holds the
+    # lock AND a Pro slot for up to ~165s after the engine exits, blocking the next same-change
+    # run (found the hard way: the whole test suite serialized behind it).
+    ( i=3; while [ "$i" -le 40 ]; do eval "exec $i>&-" 2>/dev/null; i=$((i + 1)); done
+      sleep "$EARLY_PROBE_DELAY"
+      timeout 90 node "$SELF/cdp-salvage.mjs" --probe "$RUN_MARKER" 60 "$PORT" ) >/dev/null 2>&1 &
+  fi
+  : > "$RUNLOG"; rm -f "$CAPTURE_OUT"   # clear any prior attempt's capture so stale garbage can't survive
   run_oracle "${PRO_GATE_MODEL_STRATEGY:-current}" || true
   # UI fallback: the requested model was not selectable in the picker (select strategy) -> retry
   # pinned to the account's already-selected model. oracle's wording varies ("model selector",
@@ -1261,18 +1660,18 @@ while :; do
   # option matching 'GPT-5.6 Sol' in the model switcher" and released the slot without submitting,
   # then the engine burned ~32 min on a pointless salvage). Skip when the primary run was already
   # `current` (a second current pass changes nothing).
-  if [ ! -s "$OUT" ] && [ "${PRO_GATE_MODEL_STRATEGY:-current}" != current ] \
+  if [ ! -s "$CAPTURE_OUT" ] && [ "${PRO_GATE_MODEL_STRATEGY:-current}" != current ] \
      && grep -qiE "model selector|model.?picker|model switcher|unable to find model option" "$RUNLOG" 2>/dev/null; then
     echo "[oracle-review] requested model not selectable in the picker; retrying with --browser-model-strategy current (reviews whichever model your ChatGPT account already has selected)..." >&2
     run_oracle current || true
   fi
   # Accept ONLY a real review, not just any non-empty file — a corrupted capture (e.g. a stray "A")
   # must NOT pass as success; it falls through to salvage + retry below.
-  if pg_is_review "$OUT"; then
-    echo "[oracle-review] findings written ($(wc -c < "$OUT" 2>/dev/null) bytes)." >&2; break
+  if pg_is_review "$CAPTURE_OUT"; then
+    echo "[oracle-review] findings written ($(wc -c < "$CAPTURE_OUT" 2>/dev/null) bytes)." >&2; break
   fi
-  if [ -s "$OUT" ]; then
-    echo "[oracle-review] discarding a non-review capture ($(wc -c < "$OUT" 2>/dev/null) bytes, no VERDICT/Pn markers) — will salvage/retry." >&2
+  if [ -s "$CAPTURE_OUT" ]; then
+    echo "[oracle-review] discarding a non-review capture ($(wc -c < "$CAPTURE_OUT" 2>/dev/null) bytes, no VERDICT/Pn markers) — will salvage/retry." >&2
   fi
 
   # Cloudflare / ChatGPT anti-bot challenge: oracle detects the "Just a moment" interstitial and
@@ -1285,7 +1684,7 @@ while :; do
   # the "Cloudflare challenge detected ..." thrown-error message / cloudflare-challenge stage).
   # Guarded by `! pg_is_review`, so a successful review that merely discusses Cloudflare (its text
   # also lands in the log) can never be misread as a block.
-  if ! pg_is_review "$OUT" \
+  if ! pg_is_review "$CAPTURE_OUT" \
      && grep -qiE 'Cloudflare (anti-bot page|challenge) detected|cloudflare-challenge' "$RUNLOG" 2>/dev/null; then
     echo "[oracle-review] ChatGPT/Cloudflare anti-bot challenge detected; backing off (account cooldown + concurrency drop), NOT retrying (a resubmit only deepens the block)." >&2
     CLOUDFLARE=1
@@ -1316,7 +1715,10 @@ while :; do
   [ -n "$SLUG" ] || SLUG="$SLUG_BASE"
   echo "[oracle-review] no output — bounded salvage via reattach (session ${SLUG}, ${REATTACH_TIMEOUT}s)..." >&2
   pg_status salvaging "reattach ${SLUG}"
-  if pg_reattach_render "$SLUG" "$OUT" "$REATTACH_TIMEOUT"; then
+  if pg_reattach_render "$SLUG" "$CAPTURE_OUT" "$REATTACH_TIMEOUT"; then
+    REATTACHED=1   # v0.28: browser-matched capture — subject to the provenance choke below
+    CAPTURE_SOURCE=reattach   # gate #54 r3: reattach ALSO sets SALVAGED, so the memo-
+                              # invalidation guard must discriminate by source, not SALVAGED
     echo "[oracle-review] salvaged a completed review via reattach." >&2
     SALVAGED=1
     break
@@ -1408,7 +1810,7 @@ MODEL_WARN="$(pg_derive_model_warn "$RESOLVED_MODEL" "$MODEL_STATUS")"
 # cannot cross-contaminate. First seen: pushbot PR #863, 2026-07-02.
 # Skip salvage entirely on a Cloudflare challenge: the submission never landed (nothing to
 # collect), and rendering conversation pages against a challenged account only deepens the block.
-if ! pg_is_review "$OUT" && [ "${CLOUDFLARE:-0}" != 1 ] && command -v node >/dev/null 2>&1; then
+if ! pg_is_review "$CAPTURE_OUT" && [ "${CLOUDFLARE:-0}" != 1 ] && command -v node >/dev/null 2>&1; then
   # Live conversation (v0.14 probe hit): the review may still be thinking, so
   # wait with the full hard-cap budget; otherwise a short window suffices.
   SALVAGE_SECS="$STALL_SECS"; [ "$LIVE_CONVERSATION" = 1 ] && SALVAGE_SECS="$HARD_SECS"
@@ -1426,12 +1828,19 @@ if ! pg_is_review "$OUT" && [ "${CLOUDFLARE:-0}" != 1 ] && command -v node >/dev
   pg_status salvaging "cdp up to ${SALVAGE_SECS}s"
   SALVAGE_RC=0
   SALVAGE_RAN=1
-  SALVAGE_TMP="$OUT.cdp.$$"
+  SALVAGE_TMP="$WORK/salvage.capture"
   node "$SELF/cdp-salvage.mjs" "$RUN_MARKER" "$SALVAGE_SECS" "$PORT" > "$SALVAGE_TMP" 2>>"$RUNLOG" || SALVAGE_RC=$?
-  if [ "$SALVAGE_RC" -eq 0 ] && pg_is_review "$SALVAGE_TMP"; then
-    mv "$SALVAGE_TMP" "$OUT"
+  if [ "$SALVAGE_RC" -eq 0 ] && pg_is_review "$SALVAGE_TMP" \
+     && mv "$SALVAGE_TMP" "$CAPTURE_OUT" 2>/dev/null; then
+    # Checked install (gate #54 r10): SALVAGED is claimed only once the capture actually
+    # reached CAPTURE_OUT; an install failure preserves instead of falling through to a
+    # state-clearing exit 6 with the captured bytes lost.
     echo "[oracle-review] CDP salvage recovered a completed review." >&2
     SALVAGED=1
+    CAPTURE_SOURCE=cdp   # this capture's source URL IS the marker's memo — invalidatable
+  elif [ "$SALVAGE_RC" -eq 0 ] && [ -s "$SALVAGE_TMP" ] && pg_is_review "$SALVAGE_TMP"; then
+    SALVAGE_PRESERVE=1
+    echo "[oracle-review] salvage captured a review but could not install it; preserving the run." >&2
   else
     rm -f "$SALVAGE_TMP"
   fi
@@ -1457,13 +1866,95 @@ if ! pg_is_review "$OUT" && [ "${CLOUDFLARE:-0}" != 1 ] && command -v node >/dev
   esac
 fi
 
-if pg_is_review "$OUT"; then
+# v0.28 (#48): provenance choke point for BROWSER-MATCHED captures — session reattach and CDP
+# salvage. Those find "our" conversation by marker/URL heuristics and can bind the wrong one
+# (seen live: a failed send salvaged a different PR's finished review, pushbot #1245). A
+# structurally-complete capture citing none of this change's files is such a foreign answer:
+# never return it as ours; route to the preserve path — the real review may still be
+# generating, and preserving (reservation + exit 9) costs nothing while a foreign acceptance
+# poisons the gate. Direct oracle output is EXEMPT: the process that submitted the prompt
+# writes its own conversation's answer, and a legitimate review may cite a caller/context
+# file outside the diff (the fixture suite does exactly that) — rejecting those would turn
+# clean runs into phantom exit-9s.
+# Snapshot-FIRST acceptance (gate #54 r7): every structural, nonce, and provenance check below
+# runs on a process-private copy taken NOW. Shared $OUT can be swapped by a concurrent marker
+# between a check and its use; under REQUIRE_NONCE, the snapshot's own nonce check is what
+# binds the accepted bytes to this run, so a swapped-in foreign review can never pass. (Direct
+# oracle captures keep the inherent instant between oracle's write and this copy — a caller
+# sharing one --out across concurrent DIRECT runs is outside the engine's control.)
+FINAL_SNAP=""
+if pg_is_review "$CAPTURE_OUT" && cp "$CAPTURE_OUT" "$WORK/final.snap" 2>/dev/null && pg_is_review "$WORK/final.snap"; then
+  FINAL_SNAP="$WORK/final.snap"
+elif pg_is_review "$CAPTURE_OUT"; then
+  # A VALID capture that could not be snapshotted (disk full, WORK trouble) must not fall
+  # through to the state-clearing generic exit 6 with its bytes forgotten (gate #54 r11):
+  # preserve the run — the capture stays at $CAPTURE_OUT and the tab/reservation survive.
+  echo "[oracle-review] valid capture at $CAPTURE_OUT could not be snapshotted; preserving the run for --harvest." >&2
+  SALVAGE_RAN=1; SALVAGE_PRESERVE=1
+fi
+# FAIL CLOSED for unbindable browser-matched captures (gate #54 r3): every v0.28 prompt
+# promises the nonce echo; a capture without it whose path check cannot bind either (no
+# manifest, or fewer than two citations — a foreign SHIP/single-file review looks identical)
+# is preserved for --harvest/manual confirmation, never auto-accepted.
+# PRO_GATE_REQUIRE_NONCE=0 restores best-effort acceptance.
+if [ -n "$FINAL_SNAP" ] \
+   && { [ "${SALVAGED:-0}" = 1 ] || [ "${REATTACHED:-0}" = 1 ]; } \
+   && [ "$REQUIRE_NONCE" = 1 ] \
+   && ! pg_capture_nonce_ok "$FINAL_SNAP" "$RUN_MARKER"; then
+  # NONCE OR NOTHING for every browser-matched capture (gate #54 r4/r5 P1): reattach is
+  # slug-scoped and CDP is page-wide marker-scoped — in both, a STALE answer for this very
+  # PR naturally cites overlapping files, so path overlap can only reject (branch above),
+  # never accept. PRO_GATE_REQUIRE_NONCE=0 restores best-effort acceptance.
+  echo "[oracle-review] captured a complete review that cannot be bound to this run (no run-marker echo); NOT accepting it. Preserving for --harvest; inspect $OUT.unbound.$$ (PRO_GATE_REQUIRE_NONCE=0 accepts best-effort)." >&2
+  mv "$FINAL_SNAP" "$OUT.unbound.$$" 2>/dev/null || rm -f "$FINAL_SNAP"
+  FINAL_SNAP=""
+  rm -f "$CAPTURE_OUT" 2>/dev/null
+  SALVAGE_RAN=1; SALVAGE_PRESERVE=1
+fi
+if [ -n "$FINAL_SNAP" ] \
+   && { [ "${SALVAGED:-0}" = 1 ] || [ "${REATTACHED:-0}" = 1 ]; } \
+   && [ "$REQUIRE_NONCE" = 0 ] \
+   && ! pg_capture_nonce_ok "$FINAL_SNAP" "$RUN_MARKER" \
+   && ! pg_review_matches_change "$FINAL_SNAP" "$WORK/diff.paths"; then
+  echo "[oracle-review] captured a complete review but it cites NONE of this change's files — foreign conversation suspected; NOT accepting it as ours. Preserving the run for --harvest. The rejected capture is at $OUT.foreign.$$." >&2
+  mv "$FINAL_SNAP" "$OUT.foreign.$$" 2>/dev/null || rm -f "$FINAL_SNAP"
+  FINAL_SNAP=""
+  rm -f "$CAPTURE_OUT" 2>/dev/null
+  # Invalidate the memoized candidate ONLY for CDP captures: the memo names the conversation
+  # the salvage just read, so it identifies the rejected text's source. A REATTACH capture
+  # carries no URL identity — its rejected text may be a stale oracle session while the memo
+  # (possibly written by the early probe) points at the GENUINE current conversation;
+  # blacklisting that would make the real review unrecoverable after a Chrome restart.
+  # Discriminated by CAPTURE_SOURCE, not SALVAGED — reattach sets SALVAGED too (gate #54 r3).
+  # The CDP child names its capture's exact source URL in the run log (gate #54 r5).
+  # Blacklisting only in LEGACY mode (gate #54 r6): under REQUIRE_NONCE a mismatched capture
+  # may be an older verdict from the conversation still generating THIS answer — condemned,
+  # its eventual nonce-bearing result would be skipped. (This branch is unreachable under
+  # REQUIRE_NONCE anyway: the nonce-or-nothing branch below captures everything nonce-less.)
+  if [ "${CAPTURE_SOURCE:-}" = cdp ] && [ "$REQUIRE_NONCE" = 0 ]; then
+    pg_provenance_reject "$RUN_MARKER" "$(sed -n 's/^matched-url //p' "$RUNLOG" 2>/dev/null | tail -1)"
+  fi
+  SALVAGE_RAN=1; SALVAGE_PRESERVE=1   # route to the reserve-and-harvest branch below
+fi
+if [ -n "$FINAL_SNAP" ]; then
+  # v0.28 (#55): strip the echoed run-marker nonce before the review leaves the engine —
+  # binding is an internal mechanism, not part of the caller-facing output. Everything from
+  # here on — severity note, stdout, artifact, digest — sources the verified snapshot;
+  # $OUT is publication only (gate #54 r6/r7).
+  pg_strip_nonce "$FINAL_SNAP" "$RUN_MARKER"
+  PG_FINAL_SRC="$FINAL_SNAP"
   # v0.22: remember this review's P0/P1 counts so a later round-capped refusal can flag an
   # unconfirmed open P0 to the human (advisory sidecar; see pg_round_note_severity).
-  pg_round_note_severity "$ROUND_KEY" "$OUT"
-  pg_status done
-  cat "$OUT"
-  echo "RESULT_FILE=$OUT"
+  pg_round_note_severity "$ROUND_KEY" "$PG_FINAL_SRC"
+  # Verified publication (gate #54 r8/r9): "done" PROMISES a readable --out; a failed publish
+  # must not report clean, and the durability of what WAS captured decides the message.
+  pg_publish_out "$PG_FINAL_SRC" || pg_publish_fail "$PG_FINAL_SRC"
+  # Canonical result BEFORE terminal done (gate #54 r11): pollers act on done immediately, so
+  # the durable artifact must already exist and be named in the status record they read.
+  pg_persist_result "$PG_FINAL_SRC"
+  echo "RESULT_FILE=$RESULT_PATH"
+  pg_status done "result: $RESULT_PATH"
+  cat "$PG_FINAL_SRC"
   pg_finish 0
 elif [ "${SALVAGE_RAN:-0}" = 1 ] && [ "${SALVAGE_PRESERVE:-0}" = 1 ]; then
   # The salvage budget ran out while the conversation was STILL GENERATING (or the outcome was
@@ -1472,6 +1963,22 @@ elif [ "${SALVAGE_RAN:-0}" = 1 ] && [ "${SALVAGE_PRESERVE:-0}" = 1 ]; then
   # releases its flock slot, leave the tab open (pg_finish skips close for exit 9), and hand the
   # caller a no-respend collection path. Fresh runs reconcile/respect the reservation, so actual
   # account concurrency and same-PR serialization remain correct after this wrapper exits.
+  # v0.28 (#48): persist the change's file manifest (its OWN directory — never inside
+  # in-progress/, whose enumerators would misread it as a reservation) so a later --harvest
+  # (a separate process with no diff) can provenance-check its capture. Written before the
+  # reservation itself so a reader never sees a reservation without its manifest.
+  mkdir -p "$(pg_manifest_dir)" 2>/dev/null || true
+  if [ -s "$WORK/diff.paths" ]; then
+    if ! cp "$WORK/diff.paths" "$(pg_manifest_dir)/${RUN_MARKER}" 2>/dev/null; then
+      # Loud, not silent (gate #54 r2 P1): without the manifest a later harvest falls back
+      # to nonce-only provenance — the operator should know the path check is off for this
+      # run. Full fail-closed semantics is part of #56's completed-artifact design.
+      echo "[oracle-review] WARNING: could not persist the change manifest to $(pg_manifest_dir); a later --harvest of this run can bind only via the run-marker echo." >&2
+    fi
+  fi
+  # v0.28 (#55): this run's prompt asked for the nonce echo — record that expectation so a
+  # harvest can NOTE when a capture arrives without one (accepted via path overlap instead).
+  : > "$(pg_manifest_dir)/${RUN_MARKER}.nonce" 2>/dev/null || true
   if ! pg_reservation_write "$RUN_MARKER" "${ROUND_KEY:-diff}" "$OUT" "${SLOT_HELD:-}" "$RESOLVED_MODEL"; then
     # Fail closed: without the durable reservation, exit 9 would under-count a live Pro tab and
     # let the next invocation double-spend. Keep the process/locks alive rather than release

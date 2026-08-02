@@ -111,7 +111,12 @@ function rememberUrl(m, url) {
   if (recallUrl(m) === url) return;     // already known: no churn, no prune
   try {
     fs.mkdirSync(URL_MEMO_DIR, { recursive: true });
-    fs.writeFileSync(f, `${url}\n`);
+    // Atomic publish (gate #54 r7): an in-place writeFileSync truncates first, so the shell's
+    // claim-and-verify rejection could grab (and unlink) an empty mid-write memo, losing the
+    // refreshed genuine URL. Rename swaps complete content or nothing.
+    const tmp = `${f}.tmp.${process.pid}`;
+    fs.writeFileSync(tmp, `${url}\n`);
+    fs.renameSync(tmp, f);
     const entries = fs.readdirSync(URL_MEMO_DIR);
     if (entries.length > MEMO_KEEP) {
       entries
@@ -271,8 +276,23 @@ function blacklist(url) {
   blacklistLines.push(`${marker}\t${url}`);
   try {
     fs.mkdirSync(PG_HOME, { recursive: true });
-    // rewrite (bounded) rather than append forever
-    fs.writeFileSync(BLACKLIST_FILE, blacklistLines.slice(-500).join('\n') + '\n');
+    // APPEND-ONLY (gate #54 r14): the shell rejection path appends concurrently, and a
+    // whole-file rewrite from a stale in-memory snapshot could erase its freshly rejected
+    // entry — letting the rejected open tab replay. Compaction is opportunistic, under a
+    // lock both writers respect, and skipped on contention.
+    fs.appendFileSync(BLACKLIST_FILE, `${marker}\t${url}\n`);
+    if (blacklistLines.length > 800) {
+      const lockDir = `${BLACKLIST_FILE}.lock.d`;
+      try {
+        fs.mkdirSync(lockDir);
+        try {
+          const fresh = fs.readFileSync(BLACKLIST_FILE, 'utf8').split('\n').filter((l) => l.includes('\t'));
+          const tmp = `${BLACKLIST_FILE}.tmp.${process.pid}`;
+          fs.writeFileSync(tmp, fresh.slice(-500).join('\n') + '\n');
+          fs.renameSync(tmp, BLACKLIST_FILE);
+        } finally { try { fs.rmdirSync(lockDir); } catch {} }
+      } catch {}
+    }
   } catch {}
 }
 
@@ -345,7 +365,14 @@ async function onOurConversation(url, text) {
   knownUrl = url;                // usable by the recovery branch from the very next cycle
   if (probe) { console.error(`live conversation: ${url}`); process.exit(0); }
   const review = extractReview(text);
-  if (review) { console.log(review); process.exit(0); }
+  if (review) {
+    // v0.28 (gate #54 r5): name the EXACT source of this capture so the engine can
+    // blacklist precisely on a provenance rejection — reading the shared memo afterwards
+    // races concurrent probes and can condemn the genuine conversation instead.
+    console.error(`matched-url ${url}`);
+    console.log(review);
+    process.exit(0);
+  }
   return url;                    // ours, but still generating
 }
 
@@ -384,6 +411,11 @@ while (Date.now() < deadline) {
   for (const { tab, text } of reads) {
     if (text === null || text.trim() === '') { deadTabs.push(tab); continue; }
     if (isThrottlePage(text)) tripThrottle(`tab ${tab.url}`);
+    // v0.28 (gate #54 r2): honor the per-marker blacklist for OPEN tabs too, not only
+    // re-renders. The engine appends here when a capture from this URL failed the provenance
+    // check — even a marker-bearing tab must be skipped then, or every later harvest replays
+    // the same rejected conversation and starves the real one.
+    if (nonMatching.has(tab.url)) continue;
     if (!text.includes(marker)) {
       // The remembered URL is open and rendered ANOTHER run's conversation: the memo is stale
       // (recycled URL, or it was never ours). This is the second way to prove staleness — the

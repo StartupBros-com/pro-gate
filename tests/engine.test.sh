@@ -24,6 +24,9 @@ while IFS='=' read -r name _; do
   case "$name" in PRO_GATE_*|ORACLE_*) unset "$name" ;; esac
 done < <(env)
 export PRO_GATE_MIN_AVAIL_MB=0 PRO_GATE_MAX_SWAP_PCT=101 PRO_GATE_TIMEOUT_BIN=/usr/bin/timeout
+# v0.28: the early URL-capture probe is off by default in tests (its sleep would slow every
+# fresh-run case); the dedicated early-capture test re-enables it explicitly.
+export PRO_GATE_EARLY_PROBE_SECS=0
 
 cat > "$TDIR/bin/oracle-preflight" <<'FAKE_PREFLIGHT'
 #!/usr/bin/env bash
@@ -144,7 +147,7 @@ eval "exec ${HLFD}>&-"
 
 echo '# harvest: review completed'
 { printf 'run marker: %s\n' "$MARKER"
-  printf '[P1] src/x.sh:10 - real bug\n  Why: demonstrated\nP2: none\nP3: none\nVERDICT: SHIP - clean enough.\n'
+  printf '[P1] src/x.sh:10 - real bug\n  Why: demonstrated\nP2: none\nP3: none\nVERDICT: SHIP - clean enough. (run marker: %s)\n' "$MARKER"
 } > "$TDIR/tab.txt"
 run_engine --harvest "$MARKER" --out "$TDIR/o-h2.md" --timeout 30s
 check 'harvest done exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
@@ -153,17 +156,29 @@ check 'harvest writes the review' "$(grep -q 'VERDICT: SHIP' "$TDIR/o-h2.md"; ec
 check 'harvest closes the tab' "$(grep -q 'closed tab1' "$TDIR/mock.log"; echo $?)" "$(cat "$TDIR/mock.log")"
 check 'successful harvest releases reservation' "$([ ! -f "$TDIR/home/in-progress/$MARKER" ]; echo $?)" "reservation leaked"
 
-echo '# harvest: conversation gone'
+echo '# harvest: already collected (v0.28) vs genuinely gone'
 printf 'run marker: pg-run-999-1700000001-99\nforeign conversation\n' > "$TDIR/tab.txt"
+# This marker WAS collected above (o-h2.md, ledgered clean): v0.28 returns it idempotently
+# instead of the old exit-6 "lost" — the exact double-spend trap #52 item 2 closed.
 run_engine --harvest "$MARKER" --out "$TDIR/o-h3.md" --timeout 5s
+check 'already-collected re-harvest exits 0 (was exit 6 pre-v0.28)' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
+check 'already-collected re-harvest returns the same review' "$(cmp -s "$TDIR/o-h3.md" "$TDIR/o-h2.md"; echo $?)" "$(head -c 120 "$TDIR/o-h3.md" 2>/dev/null)"
+# A marker never collected anywhere is still a genuine loss: exit 6, phase failed.
+MGONE="pg-run-77-1700000099-12"
+run_engine --harvest "$MGONE" --out "$TDIR/o-h3b.md" --timeout 5s
 check 'harvest lost exits 6' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC"
-check 'harvest lost phase failed' "$([ "$(phase_of "$TDIR/o-h3.md.status")" = failed ]; echo $?)" "$(cat "$TDIR/o-h3.md.status" 2>/dev/null)"
+check 'harvest lost phase failed' "$([ "$(phase_of "$TDIR/o-h3b.md.status")" = failed ]; echo $?)" "$(cat "$TDIR/o-h3b.md.status" 2>/dev/null)"
 
-echo '# harvest: deferred under cooldown'
+echo '# harvest: deferred under cooldown (v0.28: only when no completed artifact short-circuits)'
+# $MARKER was collected above, so its artifact now (correctly) returns BEFORE the cooldown
+# gate; the deferral applies to a marker with nothing collected yet.
+MCOOL="pg-run-77-1700000098-13"
 touch "$TDIR/home/throttle.cooldown"
-run_engine --harvest "$MARKER" --out "$TDIR/o-h4.md" --timeout 5s
+run_engine --harvest "$MCOOL" --out "$TDIR/o-h4.md" --timeout 5s
 check 'harvest cooldown exits 8' "$([ "$RC" -eq 8 ]; echo $?)" "rc=$RC"
 check 'harvest cooldown phase deferred' "$([ "$(phase_of "$TDIR/o-h4.md.status")" = deferred ]; echo $?)" "$(cat "$TDIR/o-h4.md.status" 2>/dev/null)"
+run_engine --harvest "$MARKER" --out "$TDIR/o-h4b.md" --timeout 5s
+check 'collected artifact returns even under cooldown' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
 rm -f "$TDIR/home/throttle.cooldown"
 
 echo '# slot plan: reservations exclude their slot instead of shrinking the range'
@@ -467,7 +482,9 @@ PERSIST_MARKER="$(jq -r .marker "$TDIR/o-persist.md.status" 2>/dev/null)"
 check 'in-progress run exits 9' "$([ "$RC" -eq 9 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
 check 'reservation persists the resolved model (field 6)' "$(awk -F'\t' 'NR==1{exit !($6=="GPT-5.6 Pro")}' "$TDIR/home-persist/in-progress/$PERSIST_MARKER" 2>/dev/null; echo $?)" "rec=$(cat "$TDIR/home-persist/in-progress/$PERSIST_MARKER" 2>/dev/null)"
 { printf 'run marker: %s\n' "$PERSIST_MARKER"
-  printf '[P1] src/x.sh:10 - real bug\n  Why: demonstrated\nP2: none\nP3: none\nVERDICT: SHIP - clean.\n'
+  # v0.28 fixtures echo the nonce: this run's prompt promised it (.nonce flag written), and a
+  # sub-2-citation capture without it now correctly fails closed.
+  printf '[P1] src/x.sh:10 - real bug\n  Why: demonstrated\nP2: none\nP3: none\nVERDICT: SHIP - clean. (run marker: %s)\n' "$PERSIST_MARKER"
 } > "$TDIR/tab.txt"
 PRO_GATE_HOME="$TDIR/home-persist" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
   NODE_OPTIONS= bash "$ENGINE" --harvest "$PERSIST_MARKER" --out "$TDIR/o-harv.md" --timeout 30s \
@@ -516,7 +533,7 @@ echo '# U2/U5/P2: harvest derives the downgrade warning too (harvest branch no l
 MKL="pg-run-legacy-1700000009-77"
 printf 'kL\t%s\t%s\t0\t\n' "$TDIR/o-legacy.md" "$(date +%s)" > "$TDIR/home/in-progress/$MKL"
 { printf 'run marker: %s\n' "$MKL"
-  printf '[P1] src/x.sh:10 - real bug\n  Why: demonstrated\nP2: none\nP3: none\nVERDICT: SHIP - clean.\n'
+  printf '[P1] src/x.sh:10 - real bug\n  Why: demonstrated\nP2: none\nP3: none\nVERDICT: SHIP - clean. (run marker: %s)\n' "$MKL"
 } > "$TDIR/tab.txt"
 run_engine --harvest "$MKL" --out "$TDIR/o-legacy.md" --timeout 30s
 LEG_MODEL="$(model_of "$TDIR/o-legacy.md.status")"
@@ -528,7 +545,7 @@ check 'legacy-record harvest WARNS (cannot confirm; P2 fix)' "$([ -n "$(warn_of 
 MKW="pg-run-weakres-1700000012-55"
 printf 'kW\t%s\t%s\t0\t1\tGPT-4o mini\n' "$TDIR/o-weakres.md" "$(date +%s)" > "$TDIR/home/in-progress/$MKW"
 { printf 'run marker: %s\n' "$MKW"
-  printf '[P1] src/x.sh:10 - real bug\n  Why: demonstrated\nP2: none\nP3: none\nVERDICT: SHIP - clean.\n'
+  printf '[P1] src/x.sh:10 - real bug\n  Why: demonstrated\nP2: none\nP3: none\nVERDICT: SHIP - clean. (run marker: %s)\n' "$MKW"
 } > "$TDIR/tab.txt"
 run_engine --harvest "$MKW" --out "$TDIR/o-weakres.md" --timeout 30s
 check 'weak persisted model harvest exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
@@ -681,7 +698,7 @@ NROUND_FILES="$(ls "$RHOME/rounds" 2>/dev/null | wc -l)"
 MKR="pg-run-roundharvest-1700000030-22"
 printf 'kR\t%s\t%s\t0\t\n' "$RHOME/o-rh.md" "$(date +%s)" > "$RHOME/in-progress/$MKR"
 { printf 'run marker: %s\n' "$MKR"
-  printf '[P1] src/x.sh:10 - real bug\n  Why: demonstrated\nP2: none\nP3: none\nVERDICT: SHIP - clean.\n'
+  printf '[P1] src/x.sh:10 - real bug\n  Why: demonstrated\nP2: none\nP3: none\nVERDICT: SHIP - clean. (run marker: %s)\n' "$MKR"
 } > "$TDIR/tab.txt"
 env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 NODE_OPTIONS= \
   bash "$ENGINE" --harvest "$MKR" --out "$RHOME/o-rh.md" --timeout 30s >"$TDIR/stdout" 2>"$TDIR/stderr"
@@ -899,5 +916,334 @@ SP_HARV="$(PRO_GATE_HOME="$SHOME" bash "$STATS" --pr 7 --json 2>/dev/null | jq -
 check 'stats --pr matches harvest rows by round key' "$([ "$SP_HARV" = 2 ]; echo $?)" "runs=$SP_HARV"
 PRO_GATE_HOME="$SHOME" bash "$STATS" --pr not-a-number >/dev/null 2>&1; RC=$?
 check 'stats --pr rejects non-numeric (exit 2)' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC"
+
+echo '# v0.28: severity sidecar counts only OPEN findings (RESOLVED verification blocks excluded)'
+mkdir -p "$SHOME/rounds"
+printf '1000\n' > "$SHOME/rounds/sev-key-1"
+cat > "$TDIR/sevreview.md" <<'SEV'
+P0: none of the priors remain
+
+[P0] a.sh:1 — RESOLVED — fixed earlier
+[P0] b.sh:2 — a new unresolved problem
+[P0] f.sh:6 — the RESOLVED_MODEL capture is clobbered mid-run
+[P0] g.sh:7 — the RESOLVED state can be forged by any writer
+[P1] c.sh:3 — RESOLVED — fixed
+[P1] d.sh:4 — STILL-PRESENT — not fixed
+[P1] e.sh:5 — another new finding
+
+VERDICT: FIX-FIRST — x
+SEV
+PRO_GATE_HOME="$SHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_note_severity sev-key-1 '$TDIR/sevreview.md'"
+SEV_LINE="$(cat "$SHOME/rounds/sev-key-1.last" 2>/dev/null)"
+# 3 open P0 (RESOLVED_MODEL identifier and a description WORD are not status tokens —
+# gate #54 r3+r4 P2), 2 open P1.
+check 'severity sidecar excludes only status-position RESOLVED' "$([ "$(printf '%s' "$SEV_LINE" | cut -f2)" = 3 ] && [ "$(printf '%s' "$SEV_LINE" | cut -f3)" = 2 ]; echo $?)" "sidecar: $SEV_LINE"
+
+echo '# v0.28: provenance helpers (lib)'
+printf 'src/real.sh\nlib/other.sh\n' > "$TDIR/manifest.txt"
+cat > "$TDIR/prov-foreign.md" <<'PF'
+P0: none
+
+[P1] apps/blog-writer/collect.ts:12 — foreign finding
+[P1] apps/blog-writer/schema.ts:44 — second foreign finding
+
+VERDICT: FIX-FIRST — foreign
+PF
+cat > "$TDIR/prov-single.md" <<'PS'
+P0: none
+
+[P1] callers/context-only.ts:5 — single citation outside the diff
+
+VERDICT: FIX-FIRST — ambiguous
+PS
+cat > "$TDIR/prov-ours.md" <<'PO'
+P0: none
+
+[P1] src/real.sh:7 — real finding
+
+VERDICT: FIX-FIRST — ours
+PO
+bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_review_matches_change '$TDIR/prov-foreign.md' '$TDIR/manifest.txt'"; RC=$?
+check 'provenance rejects zero-overlap citations' "$([ "$RC" -ne 0 ]; echo $?)" "rc=$RC"
+bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_review_matches_change '$TDIR/prov-ours.md' '$TDIR/manifest.txt'"; RC=$?
+check 'provenance accepts a cited change file' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC"
+bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_review_matches_change '$TDIR/prov-ours.md' /nonexistent-manifest"; RC=$?
+check 'provenance accepts when no manifest exists (legacy)' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC"
+bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_review_matches_change '$TDIR/prov-single.md' '$TDIR/manifest.txt'"; RC=$?
+check 'provenance accepts a single ambiguous citation' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC"
+# Basename equality is NOT overlap (gate #54 r2 P1): monorepo twins like index.ts must not
+# let a foreign review pass.
+cat > "$TDIR/prov-basename.md" <<'PB'
+P0: none
+
+[P1] apps/foo/index.ts:3 — foreign finding
+[P1] apps/foo/route.ts:9 — second foreign finding
+
+VERDICT: FIX-FIRST — foreign
+PB
+printf 'lib/index.ts\npackages/api/route.ts\n' > "$TDIR/manifest-twins.txt"
+bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_review_matches_change '$TDIR/prov-basename.md' '$TDIR/manifest-twins.txt'"; RC=$?
+check 'provenance rejects basename-only twins' "$([ "$RC" -ne 0 ]; echo $?)" "rc=$RC"
+
+echo '# v0.28: harvest provenance — foreign capture preserved, never returned as ours'
+M3="pg-run-provtest-9-1700000030-44"
+printf '9\t%s\t%s\t0\t1\tGPT-X\n' "$TDIR/o-prov.md" "$(date +%s)" > "$TDIR/home/in-progress/$M3"
+mkdir -p "$TDIR/home/manifests"
+printf 'src/real.sh\n' > "$TDIR/home/manifests/$M3"
+cat > "$TDIR/tab.txt" <<TAB
+conversation for run marker: $M3
+P0: none
+
+[P1] apps/blog-writer/collect.ts:12 — foreign finding
+[P1] apps/blog-writer/schema.ts:44 — second foreign finding
+
+VERDICT: FIX-FIRST — foreign
+TAB
+start_mock "$TDIR/tab.txt"
+run_engine --harvest "$M3" --out "$TDIR/o-prov.md" --timeout 5s
+check 'nonce-less capture preserved as unbound (exit 9)' "$([ "$RC" -eq 9 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
+check 'unbound harvest keeps the reservation' "$([ -f "$TDIR/home/in-progress/$M3" ]; echo $?)" 'reservation destroyed'
+check 'unbound capture set aside for inspection' "$(ls "$TDIR/o-prov.md.unbound."* >/dev/null 2>&1; echo $?)" 'no .unbound file'
+check 'unbound capture not returned as the review' "$([ ! -s "$TDIR/o-prov.md" ]; echo $?)" 'out file written'
+# Under REQUIRE_NONCE the candidate is NOT condemned (gate #54 r6): a mismatched capture may
+# be an OLDER verdict from the conversation still generating this run's answer — the memo
+# stays so the eventual nonce-bearing result remains reachable, and nothing is blacklisted.
+check 'nonce mode keeps the URL memo (older-verdict theory)' "$([ -f "$TDIR/home/conversation-urls/$M3" ]; echo $?)" "$(ls "$TDIR/home/conversation-urls" 2>/dev/null)"
+check 'nonce mode blacklists nothing' "$(grep -q "^$M3	" "$TDIR/home/salvage-nonmatching.txt" 2>/dev/null; [ $? -ne 0 ]; echo $?)" "$(cat "$TDIR/home/salvage-nonmatching.txt" 2>/dev/null)"
+# LEGACY mode (REQUIRE_NONCE=0): path overlap is authoritative — a zero-overlap capture IS
+# foreign, blacklisted by its EXACT matched URL, memo removed via claim-and-verify.
+env PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_REQUIRE_NONCE=0 NODE_OPTIONS= \
+  bash "$ENGINE" --harvest "$M3" --out "$TDIR/o-prov.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'legacy foreign harvest exits 9 with .foreign set-aside' "$([ "$RC" -eq 9 ] && ls "$TDIR/o-prov.md.foreign."* >/dev/null 2>&1; echo $?)" "rc=$RC"
+check 'legacy rejection removes the URL memo' "$([ ! -f "$TDIR/home/conversation-urls/$M3" ]; echo $?)" "$(cat "$TDIR/home/conversation-urls/$M3" 2>/dev/null)"
+check 'legacy rejection blacklists the EXACT matched URL' "$(grep -q "^$M3	https://chatgpt.com/c/mock-conversation" "$TDIR/home/salvage-nonmatching.txt" 2>/dev/null; echo $?)" "$(cat "$TDIR/home/salvage-nonmatching.txt" 2>/dev/null)"
+# A manifest in its own directory must NOT read as a reservation (gate #54 P1): exactly one
+# reservation is visible for this change.
+PRO_GATE_HOME="$TDIR/home" bash "$ENGINE" --status "$M3" --json >"$TDIR/st-m3.json" 2>/dev/null
+check 'manifest not counted as a reservation' "$([ "$(jq -r '.reservations | length' "$TDIR/st-m3.json")" = 1 ]; echo $?)" "$(jq -c .reservations "$TDIR/st-m3.json")"
+# The gate-prescribed replay test (gate #54 r2 P1): a SECOND harvest WITHOUT clearing the
+# blacklist must skip the rejected OPEN tab (live-tab scans now consult the per-marker
+# blacklist) instead of replaying the same foreign review.
+run_engine --harvest "$M3" --out "$TDIR/o-prov.md" --timeout 5s
+check 'replay harvest does not return the foreign review' "$([ "$RC" -ne 0 ] && [ ! -s "$TDIR/o-prov.md" ]; echo $?)" "rc=$RC $(head -2 "$TDIR/o-prov.md" 2>/dev/null)"
+check 'replay harvest preserves the reservation (exit 9)' "$([ "$RC" -eq 9 ] && [ -f "$TDIR/home/in-progress/$M3" ]; echo $?)" "rc=$RC"
+# Nonce-or-nothing (gate r5): path overlap alone no longer ACCEPTS under the default; the
+# best-effort path acceptance survives only behind PRO_GATE_REQUIRE_NONCE=0. (The blacklist
+# from the rejection above is cleared: this fixture reuses the same mock URL, which a real
+# recovered-from-foreign flow would reach via a different conversation.)
+rm -f "$TDIR/home/salvage-nonmatching.txt"
+printf 'apps/blog-writer/collect.ts\n' > "$TDIR/home/manifests/$M3"
+run_engine --harvest "$M3" --out "$TDIR/o-prov.md" --timeout 5s
+check 'path overlap alone no longer accepts (nonce-or-nothing)' "$([ "$RC" -eq 9 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
+env PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_REQUIRE_NONCE=0 NODE_OPTIONS= \
+  bash "$ENGINE" --harvest "$M3" --out "$TDIR/o-prov.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'REQUIRE_NONCE=0 accepts on matching path overlap' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
+check 'matching harvest removes reservation + manifest' "$([ ! -f "$TDIR/home/in-progress/$M3" ] && [ ! -f "$TDIR/home/manifests/$M3" ]; echo $?)" "$(ls "$TDIR/home/in-progress" "$TDIR/home/manifests" 2>/dev/null)"
+
+echo '# v0.28: positive run-binding — a nonce-bearing capture is accepted and stripped'
+M8="pg-run-noncetest-3-1700000034-88"
+printf '3\t%s\t%s\t0\t1\tGPT-X\n' "$TDIR/o-nonce.md" "$(date +%s)" > "$TDIR/home/in-progress/$M8"
+printf 'src/real.sh\n' > "$TDIR/home/manifests/$M8"
+cat > "$TDIR/tab.txt" <<TAB
+conversation for run marker: $M8
+P0: none
+
+[P1] apps/blog-writer/collect.ts:12 — cites nothing from the diff
+[P1] apps/blog-writer/schema.ts:44 — second non-diff citation
+
+VERDICT: FIX-FIRST — but positively bound (run marker: $M8)
+TAB
+start_mock "$TDIR/tab.txt"
+run_engine --harvest "$M8" --out "$TDIR/o-nonce.md" --timeout 5s
+check 'nonce-bearing capture accepted despite path mismatch' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
+check 'nonce stripped from the returned review' "$(grep -q 'run marker' "$TDIR/o-nonce.md"; [ $? -ne 0 ]; echo $?)" "$(tail -1 "$TDIR/o-nonce.md" 2>/dev/null)"
+check 'VERDICT line survives the strip' "$(grep -q 'VERDICT: FIX-FIRST' "$TDIR/o-nonce.md"; echo $?)" "$(tail -1 "$TDIR/o-nonce.md" 2>/dev/null)"
+check 'clean collection writes the completed artifact' "$([ -s "$TDIR/home/completed/$M8" ]; echo $?)" "$(ls "$TDIR/home/completed" 2>/dev/null)"
+check 'clean ledger row records the digest' "$([ -n "$(tail -1 "$TDIR/home/ledger.jsonl" | jq -r '.sha256 // ""')" ]; echo $?)" "$(tail -1 "$TDIR/home/ledger.jsonl")"
+check 'RESULT_FILE names the canonical artifact' "$(grep -q "RESULT_FILE=$TDIR/home/completed/$M8" "$TDIR/stdout"; echo $?)" "$(grep RESULT_FILE "$TDIR/stdout")"
+# Garbage PRO_GATE_REQUIRE_NONCE values fail CLOSED (gate #54 r10): 'true' is not legacy mode.
+M13="pg-run-noncegarbage-6-1700000060-15"
+printf '6\t%s\t%s\t0\t1\tGPT-X\n' "$TDIR/o-garbage.md" "$(date +%s)" > "$TDIR/home/in-progress/$M13"
+printf 'src/real.sh\n' > "$TDIR/home/manifests/$M13"
+cat > "$TDIR/tab.txt" <<TAB
+conversation for run marker: $M13
+P0: none
+
+[P1] src/real.sh:2 — matching citation but no echo
+
+VERDICT: SHIP — no echo though
+TAB
+start_mock "$TDIR/tab.txt"
+env PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_REQUIRE_NONCE=true NODE_OPTIONS= \
+  bash "$ENGINE" --harvest "$M13" --out "$TDIR/o-garbage.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'non-boolean REQUIRE_NONCE enforces (fails closed, exit 9)' "$([ "$RC" -eq 9 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
+rm -f "$TDIR/home/in-progress/$M13" "$TDIR/home/manifests/$M13"
+
+echo '# v0.28: artifact-first recovery — no ledger row needed'
+M9="pg-run-artifact-4-1700000035-99"
+mkdir -p "$TDIR/home/completed"
+cp "$TDIR/prov-ours.md" "$TDIR/home/completed/$M9"
+printf 'idle tab with no markers at all\n' > "$TDIR/tab.txt"
+# Artifact recovery needs no browser and must precede the cooldown gate (gate #54 r3 P2):
+# retrievable even while the account is cooling.
+printf '%s test-cooldown\n' "$(date +%Y-%m-%dT%H:%M:%S%z)" > "$TDIR/home/throttle.cooldown"
+run_engine --harvest "$M9" --out "$TDIR/o-artifact.md" --timeout 5s
+rm -f "$TDIR/home/throttle.cooldown"
+check 'artifact-first recovery exits 0 (even under cooldown, no ledger row)' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
+check 'artifact content returned verbatim' "$(cmp -s "$TDIR/o-artifact.md" "$TDIR/prov-ours.md"; echo $?)" "$(head -2 "$TDIR/o-artifact.md" 2>/dev/null)"
+# ...and with the browser fully DOWN (gate #54 r4 P2): the fast path precedes the CDP
+# preflight, so a dead port must not turn an on-disk artifact into exit 3.
+env PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT=1 PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 NODE_OPTIONS= \
+  bash "$ENGINE" --harvest "$M9" --out "$TDIR/o-artifact2.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'artifact returns with the browser down' "$([ "$RC" -eq 0 ] && cmp -s "$TDIR/o-artifact2.md" "$TDIR/prov-ours.md"; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
+# The fast path carries full run identity (gate r5 P2): its ledger row is rediscoverable.
+FLINE="$(tail -1 "$TDIR/home/ledger.jsonl")"
+check 'fast-path ledger row carries pr + round_key' "$([ "$(printf '%s' "$FLINE" | jq -r .pr)" = "artifact-4" ] && [ "$(printf '%s' "$FLINE" | jq -r .round_key)" = "artifact-4" ]; echo $?)" "$FLINE"
+check 'fast-path ledger row records the artifact digest' "$([ "$(printf '%s' "$FLINE" | jq -r '.sha256 // ""')" = "$(sha256sum "$TDIR/home/completed/$M9" | awk '{print $1}')" ]; echo $?)" "$FLINE"
+
+echo '# v0.28: provenance rejection blacklists precisely (compare-and-delete memo)'
+mkdir -p "$SHOME/conversation-urls"
+MPR="pg-run-rejtest-1-1700000050-10"
+printf 'https://chatgpt.com/c/genuine-conv\n' > "$SHOME/conversation-urls/$MPR"
+PRO_GATE_HOME="$SHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_provenance_reject '$MPR' 'https://chatgpt.com/c/foreign-conv'"
+check 'explicit-URL rejection blacklists the foreign URL' "$(grep -q "^$MPR	https://chatgpt.com/c/foreign-conv" "$SHOME/salvage-nonmatching.txt" 2>/dev/null; echo $?)" "$(cat "$SHOME/salvage-nonmatching.txt" 2>/dev/null)"
+check 'memo naming a DIFFERENT (genuine) URL survives' "$([ -f "$SHOME/conversation-urls/$MPR" ]; echo $?)" 'memo deleted despite mismatch'
+PRO_GATE_HOME="$SHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_provenance_reject '$MPR' 'https://chatgpt.com/c/genuine-conv'"
+check 'memo naming the rejected URL is removed' "$([ ! -f "$SHOME/conversation-urls/$MPR" ]; echo $?)" 'memo survived its own rejection'
+
+
+echo '# v0.28: unbindable captures fail closed when the nonce was promised'
+M11="pg-run-unbound-1-1700000041-33"
+printf '1\t%s\t%s\t0\t1\tGPT-X\n' "$TDIR/o-unbound.md" "$(date +%s)" > "$TDIR/home/in-progress/$M11"
+printf 'src/real.sh\n' > "$TDIR/home/manifests/$M11"
+# Deliberately NO .nonce flag: fail-closed must not depend on the sidecar's existence
+# (gate #54 r4 P1 — killed wrappers / failed writes / pre-v0.28 must not fail open).
+cat > "$TDIR/tab.txt" <<TAB
+conversation for run marker: $M11
+P0: none
+
+[P1] callers/context-only.ts:5 — single citation, no echo
+
+VERDICT: FIX-FIRST — ambiguous
+TAB
+start_mock "$TDIR/tab.txt"
+run_engine --harvest "$M11" --out "$TDIR/o-unbound.md" --timeout 5s
+check 'promised-nonce absent + 1 citation fails closed (exit 9)' "$([ "$RC" -eq 9 ] && grep -q 'unbind\|cannot be bound' "$TDIR/stderr"; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
+check 'unbindable capture set aside, reservation kept' "$(ls "$TDIR/o-unbound.md.unbound."* >/dev/null 2>&1 && [ -f "$TDIR/home/in-progress/$M11" ]; echo $?)" "$(ls "$TDIR" 2>/dev/null | grep unbound)"
+env PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_REQUIRE_NONCE=0 NODE_OPTIONS= \
+  bash "$ENGINE" --harvest "$M11" --out "$TDIR/o-unbound.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'PRO_GATE_REQUIRE_NONCE=0 restores best-effort acceptance' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
+
+echo '# v0.28 r9: publication is verified; artifacts are rediscoverable'
+run_engine --pr 55 --repo "$TDIR" --out "$TDIR" --timeout 5s
+check 'directory --out rejected up front (exit 2)' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
+mkdir -p "$TDIR/ro"; chmod 555 "$TDIR/ro"
+run_engine --harvest "$M9" --out "$TDIR/ro/o.md" --timeout 5s
+chmod 755 "$TDIR/ro"
+# r12: the --out ownership guard fails CLOSED on an unwritable directory (exit 2, before any
+# spend or state change) — earlier and more honest than discovering it at publication time.
+check 'unwritable --out dir refused up front (exit 2, ownership guard)' "$([ "$RC" -eq 2 ] && grep -q 'ownership' "$TDIR/stderr"; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
+PRO_GATE_HOME="$TDIR/home" bash "$ENGINE" --status "$M9" >"$TDIR/st-art.out" 2>/dev/null
+check '--status surfaces the completed artifact' "$(grep -q 'collected artifacts' "$TDIR/st-art.out" && grep -q "$M9" "$TDIR/st-art.out"; echo $?)" "$(cat "$TDIR/st-art.out")"
+
+echo '# v0.28: digest mismatch rejects an overwritten ledgered source'
+M10="pg-run-digest-2-1700000036-11"
+cp "$TDIR/prior-collected.md" "$TDIR/overwritten-prior.md"
+printf '{"ts":"2026-01-07T00:00:00+0000","pr":"2","repo":"/tmp/x","exit":0,"outcome":"clean","secs":10,"attempts":0,"conc":0,"ceiling":1,"live":1,"salvaged":1,"diff_lines":4,"out":"%s","model":"m","marker":"%s","round_key":"digest-2","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}\n' "$TDIR/overwritten-prior.md" "$M10" >> "$TDIR/home/ledger.jsonl"
+run_engine --harvest "$M10" --out "$TDIR/o-digest.md" --timeout 5s
+check 'overwritten ledgered source rejected by digest (exit 6)' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
+
+echo '# v0.28: already-collected harvest returns the ledgered review idempotently'
+M4="pg-run-collected-5-1700000031-55"
+cat > "$TDIR/prior-collected.md" <<'PC'
+P0: none
+
+[P1] x.sh:1 — finding
+
+VERDICT: SHIP — fine
+PC
+M4SHA="$(sha256sum "$TDIR/prior-collected.md" | awk '{print $1}')"
+printf '{"ts":"2026-01-05T00:00:00+0000","pr":"5","repo":"/tmp/x","exit":0,"outcome":"clean","secs":10,"attempts":0,"conc":0,"ceiling":1,"live":1,"salvaged":1,"diff_lines":4,"out":"%s","model":"m","marker":"%s","round_key":"collected-5","sha256":"%s"}\n' "$TDIR/prior-collected.md" "$M4" "$M4SHA" >> "$TDIR/home/ledger.jsonl"
+printf 'idle tab with no markers at all\n' > "$TDIR/tab.txt"
+run_engine --harvest "$M4" --out "$TDIR/o-already.md" --timeout 5s
+check 'digest-verified already-collected harvest exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
+check 'already-collected returns the prior review' "$(cmp -s "$TDIR/o-already.md" "$TDIR/prior-collected.md"; echo $?)" "$(head -2 "$TDIR/o-already.md" 2>/dev/null)"
+# A pre-v0.28 row WITHOUT a digest cannot prove the mutable path still holds the collected
+# review (gate #54 r3): report for manual recovery (exit 6, never respend), never copy it.
+M4L="pg-run-legacyrow-5-1700000040-22"
+printf '{"ts":"2026-01-05T01:00:00+0000","pr":"5","repo":"/tmp/x","exit":0,"outcome":"clean","secs":10,"attempts":0,"conc":0,"ceiling":1,"live":1,"salvaged":1,"diff_lines":4,"out":"%s","model":"m","marker":"%s","round_key":"legacyrow-5"}\n' "$TDIR/prior-collected.md" "$M4L" >> "$TDIR/home/ledger.jsonl"
+run_engine --harvest "$M4L" --out "$TDIR/o-legacy.md" --timeout 5s
+check 'digest-less legacy row routes to manual recovery (exit 6)' "$([ "$RC" -eq 6 ] && grep -q 'MANUAL' "$TDIR/stderr"; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
+# Pre-existing $OUT content must never pass as proof of collection (gate #54 P1): with the
+# ledgered source gone, a stale review already sitting at --out stays rejected (exit 6).
+M6="pg-run-staleout-8-1700000033-77"
+printf '{"ts":"2026-01-06T00:00:00+0000","pr":"8","repo":"/tmp/x","exit":0,"outcome":"clean","secs":10,"attempts":0,"conc":0,"ceiling":1,"live":1,"salvaged":1,"diff_lines":4,"out":"%s","model":"m","marker":"%s","round_key":"staleout-8"}\n' "$TDIR/deleted-prior.md" "$M6" >> "$TDIR/home/ledger.jsonl"
+cp "$TDIR/prior-collected.md" "$TDIR/o-stale.md"
+run_engine --harvest "$M6" --out "$TDIR/o-stale.md" --timeout 5s
+check 'stale OUT content never passes as collected (exit 6)' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
+# Without a ledgered copy the same state is still a loss (exit 6), as before.
+M5="pg-run-lostcase-6-1700000032-66"
+run_engine --harvest "$M5" --out "$TDIR/o-lost.md" --timeout 5s
+check 'absent reservation without ledger row still exits 6' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
+
+echo '# v0.28: early URL capture + change manifest on a fresh run'
+cat > "$TDIR/bin/oracle-early" <<EARLY
+#!/usr/bin/env bash
+M="\$(printf '%s\n' "\$@" | grep -oE 'pg-run-[A-Za-z0-9.-]+' | head -1)"
+printf 'still thinking, run marker: %s\n' "\$M" > "$TDIR/tab.txt"
+sleep 6
+exit 1
+EARLY
+chmod +x "$TDIR/bin/oracle-early"
+printf 'no marker yet\n' > "$TDIR/tab.txt"
+start_mock "$TDIR/tab.txt"
+rm -rf "$TDIR/home/conversation-urls"; mkdir -p "$TDIR/home/in-progress"
+env PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_MAX_RETRIES=0 PRO_GATE_EARLY_PROBE_SECS=1 \
+  PRO_GATE_STALL_SECS=5 PRO_GATE_NOTHINK_SECS=30 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-early" NODE_OPTIONS= \
+  bash "$ENGINE" --pr 120 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$TDIR/o-early.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'early-capture run preserves as in-progress (exit 9)' "$([ "$RC" -eq 9 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+check 'conversation URL memo written DURING generation' "$(ls "$TDIR/home/conversation-urls/" 2>/dev/null | grep -q 'pg-run-'; echo $?)" "$(ls "$TDIR/home/conversation-urls/" 2>/dev/null)"
+EARLY_MARKER="$(ls "$TDIR/home/in-progress/" 2>/dev/null | grep -m1 -E 'pg-run-.*-120-')"
+check 'change manifest written beside the reservation' "$([ -n "$EARLY_MARKER" ] && [ -s "$TDIR/home/manifests/$EARLY_MARKER" ]; echo $?)" "manifests: $(ls "$TDIR/home/manifests" 2>/dev/null)"
+check 'nonce expectation flag recorded' "$([ -n "$EARLY_MARKER" ] && [ -f "$TDIR/home/manifests/$EARLY_MARKER.nonce" ]; echo $?)" "manifests: $(ls "$TDIR/home/manifests" 2>/dev/null)"
+
+echo '# v0.28: direct capture with an echoed nonce is stripped before output'
+cat > "$TDIR/bin/oracle-nonce" <<'NONCE'
+#!/usr/bin/env bash
+out=""; m=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --write-output) out="$2"; shift 2;;
+    *) m2="$(printf '%s\n' "$1" | grep -oE 'pg-run-[A-Za-z0-9.-]+' | head -1)"; [ -n "$m2" ] && m="$m2"; shift;;
+  esac
+done
+printf '[P1] a.sh:1 - finding\n  Why: test\nP2: none\nP3: none\nVERDICT: SHIP - fixture. (run marker: %s)\n' "$m" > "$out"
+NONCE
+chmod +x "$TDIR/bin/oracle-nonce"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+# Own home: $TDIR/home carries the early-capture test's live exit-9 reservation, whose
+# recorded slot would (correctly) exclude this fresh run and park it in the account-slot
+# queue for the whole lock wait.
+mkdir -p "$TDIR/home-nonce"
+env PRO_GATE_HOME="$TDIR/home-nonce" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_MAX_RETRIES=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-nonce" NODE_OPTIONS= \
+  bash "$ENGINE" --pr 131 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$TDIR/o-directnonce.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'direct nonce capture exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
+check 'direct capture nonce stripped' "$(grep -q 'run marker' "$TDIR/o-directnonce.md"; [ $? -ne 0 ]; echo $?)" "$(tail -1 "$TDIR/o-directnonce.md" 2>/dev/null)"
 
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }
