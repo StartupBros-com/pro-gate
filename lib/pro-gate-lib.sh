@@ -998,7 +998,7 @@ pg_is_review() {
 # indication it was foreign (pushbot #1245), sending its caller off to fix phantom findings.
 # The check is deliberately lenient to make false rejections vanishingly rare: it fires only
 # when the review cites at least one file AND none of those citations overlap the change's
-# path manifest, matching full paths in either suffix direction and bare basenames.
+# path manifest, matching exact paths or component-anchored suffixes (never basenames).
 # ─────────────────────────────────────────────────────────────────────────────
 # pg_diff_paths <unified-diff>: the change's file manifest, one path per line.
 pg_diff_paths() {
@@ -1015,19 +1015,21 @@ pg_review_cited_paths() {
 # cite one caller/context file outside the diff from being misread as foreign — the observed
 # foreign captures are whole other PRs' reviews, which cite several of their own files.
 pg_review_matches_change() {
-  local review="$1" pathsf="$2" cited c p base
+  local review="$1" pathsf="$2" cited c p
   [ -s "$pathsf" ] || return 0
   cited="$(pg_review_cited_paths "$review")"
   [ -n "$cited" ] || return 0
   [ "$(printf '%s\n' "$cited" | grep -c .)" -ge 2 ] 2>/dev/null || return 0
+  # Overlap = exact path equality, or one path being a component-anchored SUFFIX of the other
+  # (a review may cite repo-relative paths while the diff carries a prefix, or vice versa).
+  # Bare basename equality is NOT overlap: monorepos repeat index.ts/route.ts/schema.ts
+  # everywhere, and basename matching let entirely foreign reviews pass (gate #54 r2 P1).
   while IFS= read -r c; do
     [ -n "$c" ] || continue
-    base="${c##*/}"
     while IFS= read -r p; do
       [ -n "$p" ] || continue
       case "$p" in "$c"|*/"$c") return 0;; esac
-      case "$c" in "$p"|*/"$p") return 0;; esac
-      [ "${p##*/}" = "$base" ] && return 0
+      case "$c" in */"$p") return 0;; esac
     done < "$pathsf"
   done <<PG_EOF
 $cited

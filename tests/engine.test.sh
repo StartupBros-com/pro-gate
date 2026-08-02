@@ -960,6 +960,19 @@ bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_review_matches_change '$TDIR/prov-
 check 'provenance accepts when no manifest exists (legacy)' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC"
 bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_review_matches_change '$TDIR/prov-single.md' '$TDIR/manifest.txt'"; RC=$?
 check 'provenance accepts a single ambiguous citation' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC"
+# Basename equality is NOT overlap (gate #54 r2 P1): monorepo twins like index.ts must not
+# let a foreign review pass.
+cat > "$TDIR/prov-basename.md" <<'PB'
+P0: none
+
+[P1] apps/foo/index.ts:3 — foreign finding
+[P1] apps/foo/route.ts:9 — second foreign finding
+
+VERDICT: FIX-FIRST — foreign
+PB
+printf 'lib/index.ts\npackages/api/route.ts\n' > "$TDIR/manifest-twins.txt"
+bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_review_matches_change '$TDIR/prov-basename.md' '$TDIR/manifest-twins.txt'"; RC=$?
+check 'provenance rejects basename-only twins' "$([ "$RC" -ne 0 ]; echo $?)" "rc=$RC"
 
 echo '# v0.28: harvest provenance — foreign capture preserved, never returned as ours'
 M3="pg-run-provtest-9-1700000030-44"

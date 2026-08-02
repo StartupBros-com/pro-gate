@@ -1541,9 +1541,15 @@ fi
 # clean runs into phantom exit-9s.
 if { [ "${SALVAGED:-0}" = 1 ] || [ "${REATTACHED:-0}" = 1 ]; } \
    && pg_is_review "$OUT" && ! pg_review_matches_change "$OUT" "$WORK/diff.paths"; then
-  echo "[oracle-review] captured a complete review but it cites NONE of this change's files — foreign conversation suspected; NOT accepting it as ours. Its memoized candidate is invalidated; preserving the run for --harvest. The rejected capture is at $OUT.foreign.$$." >&2
+  echo "[oracle-review] captured a complete review but it cites NONE of this change's files — foreign conversation suspected; NOT accepting it as ours. Preserving the run for --harvest. The rejected capture is at $OUT.foreign.$$." >&2
   mv "$OUT" "$OUT.foreign.$$" 2>/dev/null || rm -f "$OUT"
-  pg_provenance_reject "$RUN_MARKER"
+  # Invalidate the memoized candidate ONLY for CDP captures: the memo names the conversation
+  # the salvage just read, so it identifies the rejected text's source. A REATTACH capture
+  # carries no URL identity — its rejected text may be a stale oracle session while the memo
+  # (possibly written by the early probe) points at the GENUINE current conversation;
+  # blacklisting that would make the real review unrecoverable after a Chrome restart
+  # (gate #54 r2 P1).
+  [ "${SALVAGED:-0}" = 1 ] && pg_provenance_reject "$RUN_MARKER"
   SALVAGE_RAN=1; SALVAGE_PRESERVE=1   # route to the reserve-and-harvest branch below
 fi
 if pg_is_review "$OUT"; then
@@ -1567,7 +1573,13 @@ elif [ "${SALVAGE_RAN:-0}" = 1 ] && [ "${SALVAGE_PRESERVE:-0}" = 1 ]; then
   # reservation itself so a reader never sees a reservation without its manifest.
   if [ -s "$WORK/diff.paths" ]; then
     mkdir -p "$(pg_manifest_dir)" 2>/dev/null || true
-    cp "$WORK/diff.paths" "$(pg_manifest_dir)/${RUN_MARKER}" 2>/dev/null || true
+    if ! cp "$WORK/diff.paths" "$(pg_manifest_dir)/${RUN_MARKER}" 2>/dev/null; then
+      # Loud, not silent (gate #54 r2 P1): without the manifest a later harvest accepts any
+      # structurally-valid capture as legacy — the operator should know provenance is off for
+      # this run. Full fail-closed semantics (harvest refusing without provenance) is part of
+      # the immutable completed-artifact design tracked in the follow-up issue.
+      echo "[oracle-review] WARNING: could not persist the change manifest to $(pg_manifest_dir); a later --harvest of this run will accept its capture WITHOUT provenance checking." >&2
+    fi
   fi
   if ! pg_reservation_write "$RUN_MARKER" "${ROUND_KEY:-diff}" "$OUT" "${SLOT_HELD:-}" "$RESOLVED_MODEL"; then
     # Fail closed: without the durable reservation, exit 9 would under-count a live Pro tab and
