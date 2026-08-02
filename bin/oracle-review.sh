@@ -202,7 +202,11 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
   for f in "$PRO_GATE_HOME/pending"/pg-run-* "$(pg_completed_dir)"/pg-run-*; do
     [ -f "$f" ] || continue
     m="$(basename "$f")"
-    case "$m" in *.tmp.*) continue;; esac
+    # Skip only OUR generated temp names — "<marker>.tmp.<pid>" (all-numeric tail after the
+    # LAST .tmp.). Marker syntax permits dots, so a blanket *.tmp.* filter would hide a
+    # legitimate marker like ...foo.tmp.api-... (gate #54 r12 P2).
+    OG_TAIL="${m##*.tmp.}"
+    if [ "$OG_TAIL" != "$m" ]; then case "$OG_TAIL" in ''|*[!0-9]*) ;; *) continue;; esac; fi
     pg_is_review "$f" || continue
     st_match "$m" "" || continue
     a_kind=completed; case "$f" in */pending/*) a_kind=pending;; esac
@@ -418,10 +422,42 @@ fi
 # concurrent runs sharing it would overwrite each other's phase/marker and cross-feed their
 # pollers even with distinct result artifacts. Held for the process lifetime; best-effort
 # where flock or the directory is unavailable.
-if [ "$STATUS_REQUESTED" != 1 ] && pg_have flock; then
-  if { exec {PG_OUT_GUARD_FD}>>"$OUT.lock"; } 2>/dev/null; then
-    if ! flock -n "$PG_OUT_GUARD_FD" 2>/dev/null; then
-      echo "ERROR: another live run is already using --out $OUT (its status sidecar would be overwritten). Use a distinct --out per run." >&2
+if [ "$STATUS_REQUESTED" != 1 ]; then
+  PG_OUT_GUARD_OK=0
+  if pg_have flock; then
+    if { exec {PG_OUT_GUARD_FD}>>"$OUT.lock"; } 2>/dev/null; then
+      if flock -n "$PG_OUT_GUARD_FD" 2>/dev/null; then PG_OUT_GUARD_OK=1; else
+        echo "ERROR: another live run is already using --out $OUT (its status sidecar would be overwritten). Use a distinct --out per run." >&2
+        exit 2
+      fi
+    fi
+  fi
+  if [ "$PG_OUT_GUARD_OK" != 1 ]; then
+    # mkdir/PID fallback (gate #54 r12): stock macOS has no flock, and skipping the guard
+    # there reopens the sidecar cross-feed. Dead owners self-heal; a live owner refuses.
+    PG_OUT_GUARD_DIR="$OUT.lock.d"
+    if mkdir "$PG_OUT_GUARD_DIR" 2>/dev/null; then
+      echo "$$" > "$PG_OUT_GUARD_DIR/pid" 2>/dev/null || true
+      PG_OUT_GUARD_OK=1
+    else
+      OG_PID="$(cat "$PG_OUT_GUARD_DIR/pid" 2>/dev/null || true)"
+      case "$OG_PID" in
+        ''|*[!0-9]*) ;;
+        *) if kill -0 "$OG_PID" 2>/dev/null; then
+             echo "ERROR: another live run (pid $OG_PID) is already using --out $OUT. Use a distinct --out per run." >&2
+             exit 2
+           fi ;;
+      esac
+      rm -f "$PG_OUT_GUARD_DIR/pid" 2>/dev/null
+      rmdir "$PG_OUT_GUARD_DIR" 2>/dev/null
+      if mkdir "$PG_OUT_GUARD_DIR" 2>/dev/null; then
+        echo "$$" > "$PG_OUT_GUARD_DIR/pid" 2>/dev/null || true
+        PG_OUT_GUARD_OK=1
+      fi
+    fi
+    if [ "$PG_OUT_GUARD_OK" != 1 ]; then
+      # Fail CLOSED: with no ownership established, two runs could share one sidecar.
+      echo "ERROR: cannot establish ownership of --out $OUT (directory unwritable?). Choose an --out in a writable directory." >&2
       exit 2
     fi
   fi
@@ -550,6 +586,10 @@ pg_persist_result() {  # $1 = verified snapshot — persist the CANONICAL, marke
        && cp "$src" "$PRO_GATE_HOME/pending/$RUN_MARKER.tmp.$$" \
        && mv -f "$PRO_GATE_HOME/pending/$RUN_MARKER.tmp.$$" "$PRO_GATE_HOME/pending/$RUN_MARKER"; } 2>/dev/null; then
     RESULT_PATH="$PRO_GATE_HOME/pending/$RUN_MARKER"
+    # A durably persisted review retires its reservation (gate #54 r12): the harvest path
+    # deliberately kept it when the completed store was unwritable, but with the bytes safe
+    # under pending/ a live reservation would only hold capacity and outrank the result.
+    pg_reservation_remove "$RUN_MARKER" 2>/dev/null || true
     echo "[oracle-review] WARNING: completed-artifact store unwritable; the review is durable at $RESULT_PATH instead." >&2
     return 0
   fi
@@ -625,7 +665,10 @@ pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor,
   [ -s "$fsrc" ] || fsrc="$OUT"
   OUT_SHA=""
   if [ "$rc" = 0 ] && [ -n "${RUN_MARKER:-}" ] && [ -s "$fsrc" ]; then
-    if ! pg_completed_write "$RUN_MARKER" "$fsrc"; then
+    # Persist EXACTLY ONCE (gate #54 r12): when pg_persist_result already ran, a retry here
+    # could succeed against the completed store and delete the pending file that terminal
+    # status and stdout ALREADY named as canonical — a dangling RESULT_FILE.
+    if [ -z "${RESULT_PATH:-}" ] && ! pg_completed_write "$RUN_MARKER" "$fsrc"; then
       echo "[oracle-review] WARNING: completed artifact could not be persisted for ${RUN_MARKER} ($(pg_completed_dir) unwritable?); already-collected recovery will rely on the ledgered digest only." >&2
     fi
     OUT_SHA="$(pg_sha256 "$fsrc")"

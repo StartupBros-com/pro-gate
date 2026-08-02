@@ -1149,7 +1149,9 @@ check 'directory --out rejected up front (exit 2)' "$([ "$RC" -eq 2 ]; echo $?)"
 mkdir -p "$TDIR/ro"; chmod 555 "$TDIR/ro"
 run_engine --harvest "$M9" --out "$TDIR/ro/o.md" --timeout 5s
 chmod 755 "$TDIR/ro"
-check 'unpublishable artifact reports exit 6 with the durable path' "$([ "$RC" -eq 6 ] && grep -q 'durable at' "$TDIR/stderr"; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
+# r12: the --out ownership guard fails CLOSED on an unwritable directory (exit 2, before any
+# spend or state change) — earlier and more honest than discovering it at publication time.
+check 'unwritable --out dir refused up front (exit 2, ownership guard)' "$([ "$RC" -eq 2 ] && grep -q 'ownership' "$TDIR/stderr"; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
 PRO_GATE_HOME="$TDIR/home" bash "$ENGINE" --status "$M9" >"$TDIR/st-art.out" 2>/dev/null
 check '--status surfaces the completed artifact' "$(grep -q 'collected artifacts' "$TDIR/st-art.out" && grep -q "$M9" "$TDIR/st-art.out"; echo $?)" "$(cat "$TDIR/st-art.out")"
 
