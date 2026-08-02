@@ -579,9 +579,14 @@ if [ -n "$HARVEST_MARKER" ] && pg_reservation_marker_ok "$HARVEST_MARKER" \
     # (and keep redirecting this change to harvest) for the whole 6h TTL.
     pg_reservation_remove "$RUN_MARKER" || true
     echo "[oracle-review] review already collected (completed artifact); returning it — no browser touched, nothing spent." >&2
+    if ! { cp "$FASTPATH_SNAP" "$OUT.pub.$$" 2>/dev/null && mv -f "$OUT.pub.$$" "$OUT" 2>/dev/null; }; then
+      rm -f "$OUT.pub.$$" 2>/dev/null
+      echo "ERROR: collected review could not be written to --out ($OUT). It remains durable at $FASTPATH_ART — copy it from there; do NOT respend." >&2
+      pg_status failed "already collected; could not publish to --out (artifact at $FASTPATH_ART)"
+      pg_finish 6
+    fi
     pg_status done "already collected; returned from $FASTPATH_ART"
     cat "$FASTPATH_SNAP"
-    cp "$FASTPATH_SNAP" "$OUT" 2>/dev/null || true
     echo "RESULT_FILE=$OUT"
     pg_finish 0
   fi
@@ -712,9 +717,16 @@ if [ -n "$HARVEST_MARKER" ]; then
     pg_strip_nonce "$HARVEST_TMP" "$RUN_MARKER"
     # Private verified snapshot is the authoritative return (gate #54 r6): $OUT is
     # publication only — a concurrent marker sharing the caller's --out cannot change what
-    # THIS invocation returns, persists, or ledgers.
+    # THIS invocation returns, persists, or ledgers. Publication is VERIFIED (r8): "done"
+    # promises a readable --out, so a failed publish routes to manual recovery instead.
     PG_FINAL_SRC="$HARVEST_TMP"
-    cp "$HARVEST_TMP" "$OUT" 2>/dev/null || true
+    if ! { cp "$PG_FINAL_SRC" "$OUT.pub.$$" 2>/dev/null && mv -f "$OUT.pub.$$" "$OUT" 2>/dev/null; }; then
+      rm -f "$OUT.pub.$$" 2>/dev/null
+      pg_completed_write "$RUN_MARKER" "$PG_FINAL_SRC" || true
+      echo "ERROR: review harvested but could not be written to --out ($OUT). It is durable at $(pg_completed_dir)/$RUN_MARKER — copy it from there; do NOT respend." >&2
+      pg_status failed "harvested but --out unwritable; artifact at $(pg_completed_dir)/$RUN_MARKER"
+      pg_finish 6
+    fi
     # Artifact installation BEFORE reservation removal (gate #54 r6 P2): if the durable
     # store is unwritable, the reservation stays so the review remains re-collectable —
     # recovery state must never be discarded on the promise of an artifact that failed.
@@ -780,8 +792,14 @@ if [ -n "$HARVEST_MARKER" ]; then
          # when the row carries one — a reused/overwritten output path must never impersonate
          # a collection (gate #54 r1+r2 P1), and pre-existing $OUT content never counts.
          PRIOR_OUT=""; PRIOR_SHA=""; COLLECT_OK=0; COLLECT_SRC=""
-         if pg_completed_lookup "$RUN_MARKER" "$OUT"; then
+         if [ -s "$(pg_completed_dir)/$RUN_MARKER" ] \
+            && cp "$(pg_completed_dir)/$RUN_MARKER" "$OUT.already.$$" 2>/dev/null \
+            && pg_is_review "$OUT.already.$$"; then
+           # Snapshot-first here too (gate #54 r8): this branch is reachable when a second
+           # collector passes the initial fast path before the first publishes the artifact.
            COLLECT_OK=1; COLLECT_SRC="$(pg_completed_dir)/$RUN_MARKER"
+           PG_FINAL_SRC="$OUT.already.$$"
+           cp "$PG_FINAL_SRC" "$OUT" 2>/dev/null || true
          else
            LEDGER_HIT="$(pg_ledger_lookup_clean "$RUN_MARKER")"
            PRIOR_OUT="${LEDGER_HIT%%$'\t'*}"
@@ -999,6 +1017,11 @@ fi
 # gives --diff runs a real per-change identity instead of the shared literal "diff", so their
 # exit-9 reservations can redirect same-branch re-runs to harvest like PR runs always could.
 RUN_MARKER="pg-run-${ROUND_KEY:-diff}-$(date +%s)-$$"
+# v0.28 (gate #54 r8): oracle/reattach/salvage capture into a PROCESS-PRIVATE file from the
+# outset; the caller's $OUT is publication-only, written once after acceptance. Two runs whose
+# callers share one --out (same bare PR number in different repos, retries, orchestrator
+# reuse) can no longer swap each other's bytes into the validation window.
+CAPTURE_OUT="$WORK/capture.md"
 PROMPT_FILE="$WORK/prompt.md"
 {
   # Lead with the @GitHub connector tag + an explicit directive (belt-and-suspenders: oracle
@@ -1311,12 +1334,12 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
       "${URL_ARGS[@]}" "${FILE_ARGS[@]}" \
       -p "$(cat "$PROMPT_FILE")" \
       --no-notify --timeout "$TIMEOUT" \
-      --write-output "$OUT" 2>&1 | tee -a "$RUNLOG" | stdbuf -oL sed 's/^/[oracle] /' >&2 ) &
+      --write-output "$CAPTURE_OUT" 2>&1 | tee -a "$RUNLOG" | stdbuf -oL sed 's/^/[oracle] /' >&2 ) &
   job=$!
   started=$SECONDS; last_size=-1; last_change=$SECONDS
   while kill -0 "$job" 2>/dev/null; do
     sleep 10
-    [ -s "$OUT" ] && continue   # findings are landing — let the run finish undisturbed
+    [ -s "$CAPTURE_OUT" ] && continue   # findings are landing — let the run finish undisturbed
     size=$(wc -c < "$RUNLOG" 2>/dev/null) || size=0
     if [ "$size" != "$last_size" ]; then last_size="$size"; last_change=$SECONDS; fi
     now=$SECONDS
@@ -1436,7 +1459,7 @@ while :; do
       sleep "$EARLY_PROBE_DELAY"
       timeout 90 node "$SELF/cdp-salvage.mjs" --probe "$RUN_MARKER" 60 "$PORT" ) >/dev/null 2>&1 &
   fi
-  : > "$RUNLOG"; rm -f "$OUT"   # clear any prior attempt's output so stale garbage can't survive
+  : > "$RUNLOG"; rm -f "$CAPTURE_OUT"   # clear any prior attempt's capture so stale garbage can't survive
   run_oracle "${PRO_GATE_MODEL_STRATEGY:-current}" || true
   # UI fallback: the requested model was not selectable in the picker (select strategy) -> retry
   # pinned to the account's already-selected model. oracle's wording varies ("model selector",
@@ -1446,18 +1469,18 @@ while :; do
   # option matching 'GPT-5.6 Sol' in the model switcher" and released the slot without submitting,
   # then the engine burned ~32 min on a pointless salvage). Skip when the primary run was already
   # `current` (a second current pass changes nothing).
-  if [ ! -s "$OUT" ] && [ "${PRO_GATE_MODEL_STRATEGY:-current}" != current ] \
+  if [ ! -s "$CAPTURE_OUT" ] && [ "${PRO_GATE_MODEL_STRATEGY:-current}" != current ] \
      && grep -qiE "model selector|model.?picker|model switcher|unable to find model option" "$RUNLOG" 2>/dev/null; then
     echo "[oracle-review] requested model not selectable in the picker; retrying with --browser-model-strategy current (reviews whichever model your ChatGPT account already has selected)..." >&2
     run_oracle current || true
   fi
   # Accept ONLY a real review, not just any non-empty file — a corrupted capture (e.g. a stray "A")
   # must NOT pass as success; it falls through to salvage + retry below.
-  if pg_is_review "$OUT"; then
-    echo "[oracle-review] findings written ($(wc -c < "$OUT" 2>/dev/null) bytes)." >&2; break
+  if pg_is_review "$CAPTURE_OUT"; then
+    echo "[oracle-review] findings written ($(wc -c < "$CAPTURE_OUT" 2>/dev/null) bytes)." >&2; break
   fi
-  if [ -s "$OUT" ]; then
-    echo "[oracle-review] discarding a non-review capture ($(wc -c < "$OUT" 2>/dev/null) bytes, no VERDICT/Pn markers) — will salvage/retry." >&2
+  if [ -s "$CAPTURE_OUT" ]; then
+    echo "[oracle-review] discarding a non-review capture ($(wc -c < "$CAPTURE_OUT" 2>/dev/null) bytes, no VERDICT/Pn markers) — will salvage/retry." >&2
   fi
 
   # Cloudflare / ChatGPT anti-bot challenge: oracle detects the "Just a moment" interstitial and
@@ -1470,7 +1493,7 @@ while :; do
   # the "Cloudflare challenge detected ..." thrown-error message / cloudflare-challenge stage).
   # Guarded by `! pg_is_review`, so a successful review that merely discusses Cloudflare (its text
   # also lands in the log) can never be misread as a block.
-  if ! pg_is_review "$OUT" \
+  if ! pg_is_review "$CAPTURE_OUT" \
      && grep -qiE 'Cloudflare (anti-bot page|challenge) detected|cloudflare-challenge' "$RUNLOG" 2>/dev/null; then
     echo "[oracle-review] ChatGPT/Cloudflare anti-bot challenge detected; backing off (account cooldown + concurrency drop), NOT retrying (a resubmit only deepens the block)." >&2
     CLOUDFLARE=1
@@ -1501,7 +1524,7 @@ while :; do
   [ -n "$SLUG" ] || SLUG="$SLUG_BASE"
   echo "[oracle-review] no output — bounded salvage via reattach (session ${SLUG}, ${REATTACH_TIMEOUT}s)..." >&2
   pg_status salvaging "reattach ${SLUG}"
-  if pg_reattach_render "$SLUG" "$OUT" "$REATTACH_TIMEOUT"; then
+  if pg_reattach_render "$SLUG" "$CAPTURE_OUT" "$REATTACH_TIMEOUT"; then
     REATTACHED=1   # v0.28: browser-matched capture — subject to the provenance choke below
     CAPTURE_SOURCE=reattach   # gate #54 r3: reattach ALSO sets SALVAGED, so the memo-
                               # invalidation guard must discriminate by source, not SALVAGED
@@ -1596,7 +1619,7 @@ MODEL_WARN="$(pg_derive_model_warn "$RESOLVED_MODEL" "$MODEL_STATUS")"
 # cannot cross-contaminate. First seen: pushbot PR #863, 2026-07-02.
 # Skip salvage entirely on a Cloudflare challenge: the submission never landed (nothing to
 # collect), and rendering conversation pages against a challenged account only deepens the block.
-if ! pg_is_review "$OUT" && [ "${CLOUDFLARE:-0}" != 1 ] && command -v node >/dev/null 2>&1; then
+if ! pg_is_review "$CAPTURE_OUT" && [ "${CLOUDFLARE:-0}" != 1 ] && command -v node >/dev/null 2>&1; then
   # Live conversation (v0.14 probe hit): the review may still be thinking, so
   # wait with the full hard-cap budget; otherwise a short window suffices.
   SALVAGE_SECS="$STALL_SECS"; [ "$LIVE_CONVERSATION" = 1 ] && SALVAGE_SECS="$HARD_SECS"
@@ -1617,7 +1640,7 @@ if ! pg_is_review "$OUT" && [ "${CLOUDFLARE:-0}" != 1 ] && command -v node >/dev
   SALVAGE_TMP="$OUT.cdp.$$"
   node "$SELF/cdp-salvage.mjs" "$RUN_MARKER" "$SALVAGE_SECS" "$PORT" > "$SALVAGE_TMP" 2>>"$RUNLOG" || SALVAGE_RC=$?
   if [ "$SALVAGE_RC" -eq 0 ] && pg_is_review "$SALVAGE_TMP"; then
-    mv "$SALVAGE_TMP" "$OUT"
+    mv "$SALVAGE_TMP" "$CAPTURE_OUT"
     echo "[oracle-review] CDP salvage recovered a completed review." >&2
     SALVAGED=1
     CAPTURE_SOURCE=cdp   # this capture's source URL IS the marker's memo — invalidatable
@@ -1663,32 +1686,8 @@ fi
 # oracle captures keep the inherent instant between oracle's write and this copy — a caller
 # sharing one --out across concurrent DIRECT runs is outside the engine's control.)
 FINAL_SNAP=""
-if pg_is_review "$OUT" && cp "$OUT" "$OUT.final.$$" 2>/dev/null && pg_is_review "$OUT.final.$$"; then
+if pg_is_review "$CAPTURE_OUT" && cp "$CAPTURE_OUT" "$OUT.final.$$" 2>/dev/null && pg_is_review "$OUT.final.$$"; then
   FINAL_SNAP="$OUT.final.$$"
-fi
-if [ -n "$FINAL_SNAP" ] \
-   && { [ "${SALVAGED:-0}" = 1 ] || [ "${REATTACHED:-0}" = 1 ]; } \
-   && ! pg_capture_nonce_ok "$FINAL_SNAP" "$RUN_MARKER" \
-   && ! pg_review_matches_change "$FINAL_SNAP" "$WORK/diff.paths"; then
-  echo "[oracle-review] captured a complete review but it cites NONE of this change's files — foreign conversation suspected; NOT accepting it as ours. Preserving the run for --harvest. The rejected capture is at $OUT.foreign.$$." >&2
-  mv "$FINAL_SNAP" "$OUT.foreign.$$" 2>/dev/null || rm -f "$FINAL_SNAP"
-  FINAL_SNAP=""
-  rm -f "$OUT" 2>/dev/null
-  # Invalidate the memoized candidate ONLY for CDP captures: the memo names the conversation
-  # the salvage just read, so it identifies the rejected text's source. A REATTACH capture
-  # carries no URL identity — its rejected text may be a stale oracle session while the memo
-  # (possibly written by the early probe) points at the GENUINE current conversation;
-  # blacklisting that would make the real review unrecoverable after a Chrome restart.
-  # Discriminated by CAPTURE_SOURCE, not SALVAGED — reattach sets SALVAGED too (gate #54 r3).
-  # The CDP child names its capture's exact source URL in the run log (gate #54 r5).
-  # Blacklisting only in LEGACY mode (gate #54 r6): under REQUIRE_NONCE a mismatched capture
-  # may be an older verdict from the conversation still generating THIS answer — condemned,
-  # its eventual nonce-bearing result would be skipped. (This branch is unreachable under
-  # REQUIRE_NONCE anyway: the nonce-or-nothing branch below captures everything nonce-less.)
-  if [ "${CAPTURE_SOURCE:-}" = cdp ] && [ "${PRO_GATE_REQUIRE_NONCE:-1}" = 0 ]; then
-    pg_provenance_reject "$RUN_MARKER" "$(sed -n 's/^matched-url //p' "$RUNLOG" 2>/dev/null | tail -1)"
-  fi
-  SALVAGE_RAN=1; SALVAGE_PRESERVE=1   # route to the reserve-and-harvest branch below
 fi
 # FAIL CLOSED for unbindable browser-matched captures (gate #54 r3): every v0.28 prompt
 # promises the nonce echo; a capture without it whose path check cannot bind either (no
@@ -1706,8 +1705,33 @@ if [ -n "$FINAL_SNAP" ] \
   echo "[oracle-review] captured a complete review that cannot be bound to this run (no run-marker echo); NOT accepting it. Preserving for --harvest; inspect $OUT.unbound.$$ (PRO_GATE_REQUIRE_NONCE=0 accepts best-effort)." >&2
   mv "$FINAL_SNAP" "$OUT.unbound.$$" 2>/dev/null || rm -f "$FINAL_SNAP"
   FINAL_SNAP=""
-  rm -f "$OUT" 2>/dev/null
+  rm -f "$CAPTURE_OUT" 2>/dev/null
   SALVAGE_RAN=1; SALVAGE_PRESERVE=1
+fi
+if [ -n "$FINAL_SNAP" ] \
+   && { [ "${SALVAGED:-0}" = 1 ] || [ "${REATTACHED:-0}" = 1 ]; } \
+   && [ "${PRO_GATE_REQUIRE_NONCE:-1}" = 0 ] \
+   && ! pg_capture_nonce_ok "$FINAL_SNAP" "$RUN_MARKER" \
+   && ! pg_review_matches_change "$FINAL_SNAP" "$WORK/diff.paths"; then
+  echo "[oracle-review] captured a complete review but it cites NONE of this change's files — foreign conversation suspected; NOT accepting it as ours. Preserving the run for --harvest. The rejected capture is at $OUT.foreign.$$." >&2
+  mv "$FINAL_SNAP" "$OUT.foreign.$$" 2>/dev/null || rm -f "$FINAL_SNAP"
+  FINAL_SNAP=""
+  rm -f "$CAPTURE_OUT" 2>/dev/null
+  # Invalidate the memoized candidate ONLY for CDP captures: the memo names the conversation
+  # the salvage just read, so it identifies the rejected text's source. A REATTACH capture
+  # carries no URL identity — its rejected text may be a stale oracle session while the memo
+  # (possibly written by the early probe) points at the GENUINE current conversation;
+  # blacklisting that would make the real review unrecoverable after a Chrome restart.
+  # Discriminated by CAPTURE_SOURCE, not SALVAGED — reattach sets SALVAGED too (gate #54 r3).
+  # The CDP child names its capture's exact source URL in the run log (gate #54 r5).
+  # Blacklisting only in LEGACY mode (gate #54 r6): under REQUIRE_NONCE a mismatched capture
+  # may be an older verdict from the conversation still generating THIS answer — condemned,
+  # its eventual nonce-bearing result would be skipped. (This branch is unreachable under
+  # REQUIRE_NONCE anyway: the nonce-or-nothing branch below captures everything nonce-less.)
+  if [ "${CAPTURE_SOURCE:-}" = cdp ] && [ "${PRO_GATE_REQUIRE_NONCE:-1}" = 0 ]; then
+    pg_provenance_reject "$RUN_MARKER" "$(sed -n 's/^matched-url //p' "$RUNLOG" 2>/dev/null | tail -1)"
+  fi
+  SALVAGE_RAN=1; SALVAGE_PRESERVE=1   # route to the reserve-and-harvest branch below
 fi
 if [ -n "$FINAL_SNAP" ]; then
   # v0.28 (#55): strip the echoed run-marker nonce before the review leaves the engine —
@@ -1719,9 +1743,17 @@ if [ -n "$FINAL_SNAP" ]; then
   # v0.22: remember this review's P0/P1 counts so a later round-capped refusal can flag an
   # unconfirmed open P0 to the human (advisory sidecar; see pg_round_note_severity).
   pg_round_note_severity "$ROUND_KEY" "$PG_FINAL_SRC"
+  # Verified publication (gate #54 r8): "done" PROMISES a readable --out; a failed publish
+  # must not report clean. The review stays durable in the completed artifact either way.
+  if ! { cp "$PG_FINAL_SRC" "$OUT.pub.$$" 2>/dev/null && mv -f "$OUT.pub.$$" "$OUT" 2>/dev/null; }; then
+    rm -f "$OUT.pub.$$" 2>/dev/null
+    pg_completed_write "$RUN_MARKER" "$PG_FINAL_SRC" || true
+    echo "ERROR: review captured but could not be written to --out ($OUT). It is durable at $(pg_completed_dir)/$RUN_MARKER — copy it from there; do NOT respend." >&2
+    pg_status failed "captured but --out unwritable; artifact at $(pg_completed_dir)/$RUN_MARKER"
+    pg_finish 6
+  fi
   pg_status done
   cat "$PG_FINAL_SRC"
-  cp "$PG_FINAL_SRC" "$OUT" 2>/dev/null || true
   echo "RESULT_FILE=$OUT"
   pg_finish 0
 elif [ "${SALVAGE_RAN:-0}" = 1 ] && [ "${SALVAGE_PRESERVE:-0}" = 1 ]; then

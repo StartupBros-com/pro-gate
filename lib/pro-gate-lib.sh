@@ -1068,10 +1068,12 @@ pg_provenance_reject() {  # <marker> [matched-url]
     [ -n "$url" ] || url="$snap"
     if [ "$snap" = "$url" ] || [ -z "$snap" ]; then
       rm -f "$claim" 2>/dev/null
-    elif [ ! -f "$memo" ]; then
-      mv "$claim" "$memo" 2>/dev/null || rm -f "$claim" 2>/dev/null
     else
-      rm -f "$claim" 2>/dev/null   # an even newer memo exists; keep that one
+      # Restore via hard link — link(2) FAILS atomically when the memo already exists, so a
+      # genuine URL the Node writer republished between our claim and this restore is never
+      # overwritten (gate #54 r8: an existence check followed by mv raced exactly there).
+      ln "$claim" "$memo" 2>/dev/null || true
+      rm -f "$claim" 2>/dev/null
     fi
   fi
   [ -n "$url" ] || return 0
