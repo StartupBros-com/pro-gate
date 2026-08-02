@@ -919,11 +919,14 @@ pg_round_note_severity() {
   # the verification token, while prose like "unresolved"/"Unresolved" must not exclude a line.
   # STILL-PRESENT and new-finding lines carry no RESOLVED token and stay counted.
   # (grep -c prints 0 AND exits 1 on no match: capture, then default only when empty.)
-  # Structural, not substring (gate #54 r3 P2): exclude only a RESOLVED status TOKEN
-  # (whitespace-preceded, not part of an identifier), so a genuine finding about e.g. a
-  # RESOLVED_MODEL variable stays counted as open.
-  p0="$(grep -i '\[P0\]' "$out" 2>/dev/null | grep -Evc '[[:space:]]RESOLVED([^_[:alnum:]]|$)')"; [ -n "$p0" ] || p0=0
-  p1="$(grep -i '\[P1\]' "$out" 2>/dev/null | grep -Evc '[[:space:]]RESOLVED([^_[:alnum:]]|$)')"; [ -n "$p1" ] || p1=0
+  # Anchored to the STATUS POSITION (gate #54 r3+r4 P2): exclude only when RESOLVED is the
+  # first token after the delimiter that follows the [Pn] citation — headline shape
+  # "[P1] path:line — RESOLVED — …". A finding whose DESCRIPTION merely contains the word
+  # ("the RESOLVED state can be forged") or an identifier (RESOLVED_MODEL) stays counted.
+  p0="$(grep -i '\[P0\]' "$out" 2>/dev/null \
+    | grep -Evc '^[[:space:]]*\[[Pp]0\][[:space:]]+[^[:space:]]+[[:space:]]+(—|--|-)[[:space:]]+RESOLVED([^_[:alnum:]]|$)')"; [ -n "$p0" ] || p0=0
+  p1="$(grep -i '\[P1\]' "$out" 2>/dev/null \
+    | grep -Evc '^[[:space:]]*\[[Pp]1\][[:space:]]+[^[:space:]]+[[:space:]]+(—|--|-)[[:space:]]+RESOLVED([^_[:alnum:]]|$)')"; [ -n "$p1" ] || p1=0
   { printf '%s\t%s\t%s\n' "$(date +%s)" "$p0" "$p1" > "$dir/$key.last.tmp" \
       && mv -f "$dir/$key.last.tmp" "$dir/$key.last"; } 2>/dev/null || true
   return 0
@@ -1113,13 +1116,17 @@ pg_completed_write() {  # <marker> <file>: write-once; an existing artifact is n
   cp "$f" "$dir/$marker.tmp.$$" 2>/dev/null && mv -f "$dir/$marker.tmp.$$" "$dir/$marker" 2>/dev/null
 }
 pg_completed_lookup() {  # <marker> <out>: place the artifact at <out>; rc 0 on success
-  local marker="$1" out="$2" src
+  local marker="$1" out="$2" src rc
   pg_reservation_marker_ok "$marker" || return 1
   src="$(pg_completed_dir)/$marker"
   { [ -s "$src" ] && pg_is_review "$src"; } || return 1
   [ "$src" = "$out" ] && return 0
-  rm -f "$out" 2>/dev/null
+  # Copy-then-rename only — never pre-delete the destination (gate #54 r4 P2): a copy/rename
+  # failure must leave any existing valid output intact, not destroy it and then fail.
   cp "$src" "$out.already.$$" 2>/dev/null && mv -f "$out.already.$$" "$out" 2>/dev/null
+  rc=$?
+  rm -f "$out.already.$$" 2>/dev/null
+  return "$rc"
 }
 
 # pg_ledger_lookup_clean <marker>: echo "out<TAB>sha256" from the newest CLEAN ledger row for

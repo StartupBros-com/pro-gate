@@ -147,7 +147,7 @@ eval "exec ${HLFD}>&-"
 
 echo '# harvest: review completed'
 { printf 'run marker: %s\n' "$MARKER"
-  printf '[P1] src/x.sh:10 - real bug\n  Why: demonstrated\nP2: none\nP3: none\nVERDICT: SHIP - clean enough.\n'
+  printf '[P1] src/x.sh:10 - real bug\n  Why: demonstrated\nP2: none\nP3: none\nVERDICT: SHIP - clean enough. (run marker: %s)\n' "$MARKER"
 } > "$TDIR/tab.txt"
 run_engine --harvest "$MARKER" --out "$TDIR/o-h2.md" --timeout 30s
 check 'harvest done exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
@@ -533,7 +533,7 @@ echo '# U2/U5/P2: harvest derives the downgrade warning too (harvest branch no l
 MKL="pg-run-legacy-1700000009-77"
 printf 'kL\t%s\t%s\t0\t\n' "$TDIR/o-legacy.md" "$(date +%s)" > "$TDIR/home/in-progress/$MKL"
 { printf 'run marker: %s\n' "$MKL"
-  printf '[P1] src/x.sh:10 - real bug\n  Why: demonstrated\nP2: none\nP3: none\nVERDICT: SHIP - clean.\n'
+  printf '[P1] src/x.sh:10 - real bug\n  Why: demonstrated\nP2: none\nP3: none\nVERDICT: SHIP - clean. (run marker: %s)\n' "$MKL"
 } > "$TDIR/tab.txt"
 run_engine --harvest "$MKL" --out "$TDIR/o-legacy.md" --timeout 30s
 LEG_MODEL="$(model_of "$TDIR/o-legacy.md.status")"
@@ -545,7 +545,7 @@ check 'legacy-record harvest WARNS (cannot confirm; P2 fix)' "$([ -n "$(warn_of 
 MKW="pg-run-weakres-1700000012-55"
 printf 'kW\t%s\t%s\t0\t1\tGPT-4o mini\n' "$TDIR/o-weakres.md" "$(date +%s)" > "$TDIR/home/in-progress/$MKW"
 { printf 'run marker: %s\n' "$MKW"
-  printf '[P1] src/x.sh:10 - real bug\n  Why: demonstrated\nP2: none\nP3: none\nVERDICT: SHIP - clean.\n'
+  printf '[P1] src/x.sh:10 - real bug\n  Why: demonstrated\nP2: none\nP3: none\nVERDICT: SHIP - clean. (run marker: %s)\n' "$MKW"
 } > "$TDIR/tab.txt"
 run_engine --harvest "$MKW" --out "$TDIR/o-weakres.md" --timeout 30s
 check 'weak persisted model harvest exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
@@ -698,7 +698,7 @@ NROUND_FILES="$(ls "$RHOME/rounds" 2>/dev/null | wc -l)"
 MKR="pg-run-roundharvest-1700000030-22"
 printf 'kR\t%s\t%s\t0\t\n' "$RHOME/o-rh.md" "$(date +%s)" > "$RHOME/in-progress/$MKR"
 { printf 'run marker: %s\n' "$MKR"
-  printf '[P1] src/x.sh:10 - real bug\n  Why: demonstrated\nP2: none\nP3: none\nVERDICT: SHIP - clean.\n'
+  printf '[P1] src/x.sh:10 - real bug\n  Why: demonstrated\nP2: none\nP3: none\nVERDICT: SHIP - clean. (run marker: %s)\n' "$MKR"
 } > "$TDIR/tab.txt"
 env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 NODE_OPTIONS= \
   bash "$ENGINE" --harvest "$MKR" --out "$RHOME/o-rh.md" --timeout 30s >"$TDIR/stdout" 2>"$TDIR/stderr"
@@ -926,6 +926,7 @@ P0: none of the priors remain
 [P0] a.sh:1 — RESOLVED — fixed earlier
 [P0] b.sh:2 — a new unresolved problem
 [P0] f.sh:6 — the RESOLVED_MODEL capture is clobbered mid-run
+[P0] g.sh:7 — the RESOLVED state can be forged by any writer
 [P1] c.sh:3 — RESOLVED — fixed
 [P1] d.sh:4 — STILL-PRESENT — not fixed
 [P1] e.sh:5 — another new finding
@@ -934,8 +935,9 @@ VERDICT: FIX-FIRST — x
 SEV
 PRO_GATE_HOME="$SHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_note_severity sev-key-1 '$TDIR/sevreview.md'"
 SEV_LINE="$(cat "$SHOME/rounds/sev-key-1.last" 2>/dev/null)"
-# 2 open P0 (the RESOLVED_MODEL identifier is NOT a status token — gate #54 r3 P2), 2 open P1.
-check 'severity sidecar excludes only RESOLVED status tokens' "$([ "$(printf '%s' "$SEV_LINE" | cut -f2)" = 2 ] && [ "$(printf '%s' "$SEV_LINE" | cut -f3)" = 2 ]; echo $?)" "sidecar: $SEV_LINE"
+# 3 open P0 (RESOLVED_MODEL identifier and a description WORD are not status tokens —
+# gate #54 r3+r4 P2), 2 open P1.
+check 'severity sidecar excludes only status-position RESOLVED' "$([ "$(printf '%s' "$SEV_LINE" | cut -f2)" = 3 ] && [ "$(printf '%s' "$SEV_LINE" | cut -f3)" = 2 ]; echo $?)" "sidecar: $SEV_LINE"
 
 echo '# v0.28: provenance helpers (lib)'
 printf 'src/real.sh\nlib/other.sh\n' > "$TDIR/manifest.txt"
@@ -1059,12 +1061,19 @@ run_engine --harvest "$M9" --out "$TDIR/o-artifact.md" --timeout 5s
 rm -f "$TDIR/home/throttle.cooldown"
 check 'artifact-first recovery exits 0 (even under cooldown, no ledger row)' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
 check 'artifact content returned verbatim' "$(cmp -s "$TDIR/o-artifact.md" "$TDIR/prov-ours.md"; echo $?)" "$(head -2 "$TDIR/o-artifact.md" 2>/dev/null)"
+# ...and with the browser fully DOWN (gate #54 r4 P2): the fast path precedes the CDP
+# preflight, so a dead port must not turn an on-disk artifact into exit 3.
+env PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT=1 PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 NODE_OPTIONS= \
+  bash "$ENGINE" --harvest "$M9" --out "$TDIR/o-artifact2.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'artifact returns with the browser down' "$([ "$RC" -eq 0 ] && cmp -s "$TDIR/o-artifact2.md" "$TDIR/prov-ours.md"; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
 
 echo '# v0.28: unbindable captures fail closed when the nonce was promised'
 M11="pg-run-unbound-1-1700000041-33"
 printf '1\t%s\t%s\t0\t1\tGPT-X\n' "$TDIR/o-unbound.md" "$(date +%s)" > "$TDIR/home/in-progress/$M11"
 printf 'src/real.sh\n' > "$TDIR/home/manifests/$M11"
-: > "$TDIR/home/manifests/$M11.nonce"
+# Deliberately NO .nonce flag: fail-closed must not depend on the sidecar's existence
+# (gate #54 r4 P1 — killed wrappers / failed writes / pre-v0.28 must not fail open).
 cat > "$TDIR/tab.txt" <<TAB
 conversation for run marker: $M11
 P0: none
