@@ -264,7 +264,13 @@ reservation and tab kept (retry once the browser is healthy). Repeat harvests ar
 quota is spent. Reservations are keyed by repo-scoped PR identity, so identical PR numbers in
 different repositories never cross.
 
-**A lost TAB is not a lost review (v0.25; hardened v0.28).** ChatGPT keeps conversations
+**A lost TAB is not a lost review (v0.25; hardened v0.28).** Engine ≥v0.29 also biases the
+ChatGPT sidebar title: each conversation's prompt leads with
+`pro-gate review: PR #<n> r<k> [<repo>]` (bare `--diff` runs:
+`pro-gate review: <round-key> r<k>`), so a human hunting the sidebar (manual recovery,
+concurrent tabs) can identify the run AND the round at a glance — the r<k> label is what
+separates the current verdict from an older round's.
+ ChatGPT keeps conversations
 server-side, so the engine remembers each run's conversation URL the first time it proves
 which one is that run's, and re-renders that URL when no open tab carries the marker. A
 Chrome restart — routine when the box is short on memory — therefore no longer destroys a

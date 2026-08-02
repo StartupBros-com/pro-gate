@@ -1215,6 +1215,8 @@ RUN_MARKER="pg-run-${ROUND_KEY:-diff}-$(date +%s)-$$"
 CAPTURE_OUT="$WORK/capture.md"
 PROMPT_FILE="$WORK/prompt.md"
 {
+  # (The run-naming title line is PREPENDED after the per-change lock is held — see below.
+  # Computing r<N> here raced: a queued same-change run would prebuild a duplicate label.)
   # Lead with the @GitHub connector tag + an explicit directive (belt-and-suspenders: oracle
   # pastes the prompt in one shot, so @GitHub is a recognized hint, not a bound mention pill;
   # ORACLE_CHATGPT_URL can pin a connector-bound Project for true binding).
@@ -1339,7 +1341,7 @@ find "$(pg_manifest_dir)" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null ||
 # lock a live process might hold (same safety argument as the sweeps above).
 ROUND_SWEEP_MIN=$(( $(pg_round_window_secs) / 60 ))
 [ "$ROUND_SWEEP_MIN" -lt 1440 ] && ROUND_SWEEP_MIN=1440
-find "$(pg_rounds_dir)" -maxdepth 1 -type f -mmin "+${ROUND_SWEEP_MIN}" -delete 2>/dev/null || true
+find "$(pg_rounds_dir)" -maxdepth 1 -type f ! -name '*.seq' -mmin "+${ROUND_SWEEP_MIN}" -delete 2>/dev/null || true
 # Sweep idle chatgpt.com ROOT tabs (leaked by killed pre-submission runs; the marker-based
 # close can't see them, and each is a renderer eating the review box's memory headroom).
 # Only when NO oracle CLI is <120s old: a younger one may still be pre-navigation on a root
@@ -1455,6 +1457,29 @@ fi
 if ! ROUND_REASON="$(pg_round_guard "$ROUND_KEY")"; then
   round_capped "$ROUND_REASON (spent while this run waited on the per-change lock)"
 fi
+
+# v0.29 (#49 phase 1, gate #57 r2): the LITERAL FIRST LINE of the prompt names the run so
+# ChatGPT's auto-titler is biased toward a legible sidebar title, r<N> distinguishing review
+# ROUNDS of one change. Computed HERE — under the per-change lock, after the round-guard
+# recheck — because rounds record only under this lock: the count is stable for our change,
+# so a queued same-change run can no longer prebuild a duplicate label. The ordinal comes
+# from a monotonic, never-window-pruned sequence (gate #57 r3: window counts repeat labels
+# across expiry). The engine's own machinery is unaffected (marker matching, never title).
+if TITLE_SEQ="$(pg_title_seq_next "$ROUND_KEY")"; then
+  TITLE_ROUND="r$TITLE_SEQ"
+else
+  # Unique fallback when the sequence store is unwritable (gate #57 r4 P2): the marker's
+  # pid tail cannot collide with ordinal labels, so duplicates are impossible either way.
+  TITLE_ROUND="r?${RUN_MARKER##*-}"
+  echo "[oracle-review] NOTE: title sequence store unwritable; using unique fallback label $TITLE_ROUND." >&2
+fi
+if [ -n "$PR_NUM" ]; then
+  TITLE_LINE="$(printf 'pro-gate review: PR #%s %s [%s]' "$PR_NUM" "$TITLE_ROUND" "$REPO_SLUG")"
+else
+  TITLE_LINE="$(printf 'pro-gate review: %s %s' "${ROUND_KEY:-diff}" "$TITLE_ROUND")"
+fi
+{ printf '%s\n\n' "$TITLE_LINE"; cat "$PROMPT_FILE"; } > "$PROMPT_FILE.titled" 2>/dev/null \
+  && mv -f "$PROMPT_FILE.titled" "$PROMPT_FILE" 2>/dev/null || rm -f "$PROMPT_FILE.titled"
 
 echo "[oracle-review] acquiring a review slot (effective ${EFF_CONC} of ceiling ${MAX_CONC}; waits up to ${LOCK_WAIT}s if all busy)..." >&2
 pg_status waiting-slot "effective ${EFF_CONC} / ceiling ${MAX_CONC}"

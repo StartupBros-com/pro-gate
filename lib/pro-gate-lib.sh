@@ -807,6 +807,26 @@ pg_round_key_ok() {
   case "${1:-}" in '') return 1;; *[!A-Za-z0-9.-]*) return 1;; *) return 0;; esac
 }
 
+# pg_title_seq_next <key>: monotonic per-change ordinal for the sidebar title label — NEVER
+# window-pruned. Lives in its OWN directory (gate #57 r4): rounds/ is swept whole by engines
+# <v0.29, so a supported >24h rollback would delete a rounds/-resident sequence and restart
+# labels at r1. Single writer (called only under the per-change lock); gaps are fine. Returns
+# NONZERO when the ordinal could not be persisted (r4 P2) — the caller must then use a unique
+# fallback label rather than risk duplicate ordinals from a broken store.
+pg_title_seq_dir() { echo "${PRO_GATE_TITLE_SEQ_DIR:-$PRO_GATE_HOME/title-seq}"; }
+pg_title_seq_next() {
+  local f n
+  pg_round_key_ok "$1" || return 1
+  f="$(pg_title_seq_dir)/$1"
+  mkdir -p "$(pg_title_seq_dir)" 2>/dev/null || return 1
+  # One-time migration from the short-lived rounds/<key>.seq location (v0.29 pre-release).
+  [ -f "$f" ] || { [ -f "$(pg_rounds_dir)/$1.seq" ] && mv "$(pg_rounds_dir)/$1.seq" "$f" 2>/dev/null; } || true
+  n="$(cat "$f" 2>/dev/null)"; case "$n" in ''|*[!0-9]*) n=0;; esac
+  n=$((n + 1))
+  { printf '%s' "$n" > "$f.tmp" && mv -f "$f.tmp" "$f"; } 2>/dev/null || { rm -f "$f.tmp" 2>/dev/null; return 1; }
+  echo "$n"
+}
+
 pg_round_count() {  # $1 = key; echoes the rounds recorded inside the rolling window
   local key="$1" f now win t n=0
   pg_round_key_ok "$key" || { echo 0; return; }

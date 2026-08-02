@@ -1246,4 +1246,49 @@ RC=$?
 check 'direct nonce capture exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
 check 'direct capture nonce stripped' "$(grep -q 'run marker' "$TDIR/o-directnonce.md"; [ $? -ne 0 ]; echo $?)" "$(tail -1 "$TDIR/o-directnonce.md" 2>/dev/null)"
 
+echo '# v0.29: the prompt leads with the run-naming title line (#49 phase 1)'
+cat > "$TDIR/bin/oracle-dump" <<'DUMP'
+#!/usr/bin/env bash
+out=""
+while [ $# -gt 0 ]; do case "$1" in
+  -p) printf '%s' "$2" > "${PG_TEST_PROMPT_DUMP:-/dev/null}"; shift 2;;
+  --write-output) out="$2"; shift 2;;
+  *) shift;;
+esac; done
+printf '[P1] a.sh:1 - f\n  Why: t\nP2: none\nP3: none\nVERDICT: SHIP - ok. (run marker: %s)\n' \
+  "$(grep -oE 'pg-run-[A-Za-z0-9.-]+' "${PG_TEST_PROMPT_DUMP:-/dev/null}" | head -1)" > "$out"
+DUMP
+chmod +x "$TDIR/bin/oracle-dump"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+mkdir -p "$TDIR/home-title"
+env PRO_GATE_HOME="$TDIR/home-title" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_MAX_RETRIES=0 PG_TEST_PROMPT_DUMP="$TDIR/prompt-dump.txt" \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-dump" NODE_OPTIONS= \
+  bash "$ENGINE" --pr 132 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$TDIR/o-title.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'title-line run exits 0 (nonce echoed back from the dumped prompt)' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
+check 'prompt first line names the run + round' "$(head -1 "$TDIR/prompt-dump.txt" 2>/dev/null | grep -q '^pro-gate review: PR #132 r1 \['; echo $?)" "first line: $(head -1 "$TDIR/prompt-dump.txt" 2>/dev/null)"
+# A second round of the SAME PR carries a distinct discriminator (gate #57 P1).
+env PRO_GATE_HOME="$TDIR/home-title" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_MAX_RETRIES=0 PG_TEST_PROMPT_DUMP="$TDIR/prompt-dump2.txt" \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-dump" NODE_OPTIONS= \
+  bash "$ENGINE" --pr 132 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$TDIR/o-title2.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'second same-PR round exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
+check 'second round titles r2' "$(head -1 "$TDIR/prompt-dump2.txt" 2>/dev/null | grep -q '^pro-gate review: PR #132 r2 \['; echo $?)" "first line: $(head -1 "$TDIR/prompt-dump2.txt" 2>/dev/null)"
+# The ordinal is monotonic and window-INDEPENDENT (gate #57 r3): a seeded sequence advances
+# even when every in-window round timestamp has expired.
+TKEY="$(ls "$TDIR/home-title/rounds" 2>/dev/null | grep -vE '\.(seq|last)$|\.tmp' | head -1)"
+mkdir -p "$TDIR/home-title/title-seq"
+printf '7' > "$TDIR/home-title/title-seq/$TKEY"
+printf '100\n' > "$TDIR/home-title/rounds/$TKEY"
+env PRO_GATE_HOME="$TDIR/home-title" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_MAX_RETRIES=0 PG_TEST_PROMPT_DUMP="$TDIR/prompt-dump3.txt" \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-dump" NODE_OPTIONS= \
+  bash "$ENGINE" --pr 132 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$TDIR/o-title3.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+check 'ordinal advances past expired windows (r8)' "$(head -1 "$TDIR/prompt-dump3.txt" 2>/dev/null | grep -q ' r8 \['; echo $?)" "first line: $(head -1 "$TDIR/prompt-dump3.txt" 2>/dev/null)"
+
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }
