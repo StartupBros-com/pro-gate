@@ -16,9 +16,28 @@ is_uint() {
 }
 
 notes_summary() {
-  # First paragraph only: the announcement summary should be the release's
-  # lead description, not flattened install blocks or changelog fragments.
-  printf '%s' "${RELEASE_NOTES:-}" | tr -d '\r' | awk 'BEGIN{RS=""} NR==1' | tr '\n' ' ' | cut -c1-600
+  # Card-ready release bullets for the announcement endpoint's "What's new" section.
+  # Preference order:
+  #   1. An author-written "## Highlights" section in the release body (manual control for
+  #      releases that deserve hand-picked copy);
+  #   2. GitHub's auto-generated "What's Changed" PR-title bullets, cleaned: conventional-
+  #      commit prefixes, "by @user in <url>" tails, and "(vX.Y.Z)" suffixes stripped;
+  #   3. Fallback: the body's first paragraph, flattened (the pre-2026-08 behavior), so a
+  #      hand-written prose body still announces something.
+  # Up to 3 bullets, one per line, each <=180 chars; total stays under the endpoint's
+  # 600-char schema cap.
+  local notes bullets
+  notes="$(printf '%s' "${RELEASE_NOTES:-}" | tr -d '\r')"
+  [[ -n "$notes" ]] || return 0
+  bullets="$(printf '%s\n' "$notes" | sed -n '/^##[[:space:]]*Highlights/,/^## /p' | grep -E '^[*•-][[:space:]]' || true)"
+  [[ -n "$bullets" ]] || bullets="$(printf '%s\n' "$notes" | grep -E '^\*[[:space:]]' || true)"
+  if [[ -n "$bullets" ]]; then
+    printf '%s\n' "$bullets" \
+      | sed -E 's/^[*•-][[:space:]]+//; s/[[:space:]]+by @[A-Za-z0-9_[:punct:]]+ in http[^[:space:]]*[[:space:]]*$//; s/^(feat|fix|perf|chore|docs|refactor|test|ci|build)(\([^)]*\))?!?:[[:space:]]*//; s/[[:space:]]*\(v[0-9]+\.[0-9]+\.[0-9]+\)[[:space:]]*$//' \
+      | grep -v '^[[:space:]]*$' | head -n 3 | cut -c1-180
+    return 0
+  fi
+  printf '%s' "$notes" | awk 'BEGIN{RS=""} NR==1' | tr '\n' ' ' | cut -c1-600
 }
 
 announce() {

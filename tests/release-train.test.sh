@@ -113,4 +113,16 @@ assert_eq "$(jq -r '.plugins[] | select(.name=="pro-gate") | .metadata.releaseId
 env "${common[@]}" EVENT_ACTION=edited RELEASE_PRERELEASE=true "$ROOT/scripts/release-train.sh" >/dev/null
 assert_eq "$(wc -l < "$TMP/curl.log")" 4 'edited prerelease remains production no-op'
 
+# --- notes_summary: card-ready bullets for the What's-new announcement section ---
+ns() { RELEASE_NOTES="$1" bash -c "source <(sed -n '/^notes_summary()/,/^}/p' '$ROOT/scripts/release-train.sh'); notes_summary"; }
+AUTO=$'## What\'s Changed\n* feat(pro-gate): capture provenance (v0.28.0) by @StartupBros in https://github.com/x/y/pull/54\n* fix(pro-gate): idempotent harvests by @StartupBros in https://github.com/x/y/pull/55\n\n**Full Changelog**: https://github.com/x/y/compare/a...b'
+assert_eq "$(ns "$AUTO")" $'capture provenance\nidempotent harvests' 'auto-notes bullets are cleaned (prefix, author, link, version stripped)'
+HL=$'## Highlights\n* Hand-picked line one\n* Hand-picked line two\n\n## What\'s Changed\n* feat: noise by @u in https://x'
+assert_eq "$(ns "$HL")" $'Hand-picked line one\nHand-picked line two' 'an author-written Highlights section wins over auto-notes'
+PROSE=$'A prose lead paragraph.\nStill the lead.\n\nSecond paragraph never announced.'
+assert_eq "$(ns "$PROSE")" 'A prose lead paragraph. Still the lead. ' 'prose bodies fall back to the flattened first paragraph'
+MANY=$'* one\n* two\n* three\n* four'
+assert_eq "$(ns "$MANY")" $'one\ntwo\nthree' 'bullets cap at three'
+assert_eq "$(ns '')" '' 'empty notes stay empty'
+
 echo 'ALL PASS'
