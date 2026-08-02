@@ -919,8 +919,11 @@ pg_round_note_severity() {
   # the verification token, while prose like "unresolved"/"Unresolved" must not exclude a line.
   # STILL-PRESENT and new-finding lines carry no RESOLVED token and stay counted.
   # (grep -c prints 0 AND exits 1 on no match: capture, then default only when empty.)
-  p0="$(grep -i '\[P0\]' "$out" 2>/dev/null | grep -cv 'RESOLVED')"; [ -n "$p0" ] || p0=0
-  p1="$(grep -i '\[P1\]' "$out" 2>/dev/null | grep -cv 'RESOLVED')"; [ -n "$p1" ] || p1=0
+  # Structural, not substring (gate #54 r3 P2): exclude only a RESOLVED status TOKEN
+  # (whitespace-preceded, not part of an identifier), so a genuine finding about e.g. a
+  # RESOLVED_MODEL variable stays counted as open.
+  p0="$(grep -i '\[P0\]' "$out" 2>/dev/null | grep -Evc '[[:space:]]RESOLVED([^_[:alnum:]]|$)')"; [ -n "$p0" ] || p0=0
+  p1="$(grep -i '\[P1\]' "$out" 2>/dev/null | grep -Evc '[[:space:]]RESOLVED([^_[:alnum:]]|$)')"; [ -n "$p1" ] || p1=0
   { printf '%s\t%s\t%s\n' "$(date +%s)" "$p0" "$p1" > "$dir/$key.last.tmp" \
       && mv -f "$dir/$key.last.tmp" "$dir/$key.last"; } 2>/dev/null || true
   return 0
@@ -1008,6 +1011,12 @@ pg_diff_paths() {
 # pg_review_cited_paths <review>: paths cited in [Pn] headline lines ("[P1] path:line — ...").
 pg_review_cited_paths() {
   sed -nE 's/^[[:space:]]*\[P[0-3]\][[:space:]]+([^[:space:]:]+):[0-9].*/\1/p' "$1" 2>/dev/null | sort -u
+}
+# pg_review_citation_count <review>: number of distinct [Pn]-headline cited paths.
+pg_review_citation_count() {
+  local n
+  n="$(pg_review_cited_paths "$1" | grep -c .)"
+  printf '%s' "${n:-0}"
 }
 # pg_review_matches_change <review> <paths-file>: rc 0 = accept (no manifest, fewer than two
 # distinct citations, or any overlap); rc 1 = REJECT (≥2 cited paths, manifest exists, zero

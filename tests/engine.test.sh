@@ -169,11 +169,16 @@ run_engine --harvest "$MGONE" --out "$TDIR/o-h3b.md" --timeout 5s
 check 'harvest lost exits 6' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC"
 check 'harvest lost phase failed' "$([ "$(phase_of "$TDIR/o-h3b.md.status")" = failed ]; echo $?)" "$(cat "$TDIR/o-h3b.md.status" 2>/dev/null)"
 
-echo '# harvest: deferred under cooldown'
+echo '# harvest: deferred under cooldown (v0.28: only when no completed artifact short-circuits)'
+# $MARKER was collected above, so its artifact now (correctly) returns BEFORE the cooldown
+# gate; the deferral applies to a marker with nothing collected yet.
+MCOOL="pg-run-77-1700000098-13"
 touch "$TDIR/home/throttle.cooldown"
-run_engine --harvest "$MARKER" --out "$TDIR/o-h4.md" --timeout 5s
+run_engine --harvest "$MCOOL" --out "$TDIR/o-h4.md" --timeout 5s
 check 'harvest cooldown exits 8' "$([ "$RC" -eq 8 ]; echo $?)" "rc=$RC"
 check 'harvest cooldown phase deferred' "$([ "$(phase_of "$TDIR/o-h4.md.status")" = deferred ]; echo $?)" "$(cat "$TDIR/o-h4.md.status" 2>/dev/null)"
+run_engine --harvest "$MARKER" --out "$TDIR/o-h4b.md" --timeout 5s
+check 'collected artifact returns even under cooldown' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
 rm -f "$TDIR/home/throttle.cooldown"
 
 echo '# slot plan: reservations exclude their slot instead of shrinking the range'
@@ -477,7 +482,9 @@ PERSIST_MARKER="$(jq -r .marker "$TDIR/o-persist.md.status" 2>/dev/null)"
 check 'in-progress run exits 9' "$([ "$RC" -eq 9 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
 check 'reservation persists the resolved model (field 6)' "$(awk -F'\t' 'NR==1{exit !($6=="GPT-5.6 Pro")}' "$TDIR/home-persist/in-progress/$PERSIST_MARKER" 2>/dev/null; echo $?)" "rec=$(cat "$TDIR/home-persist/in-progress/$PERSIST_MARKER" 2>/dev/null)"
 { printf 'run marker: %s\n' "$PERSIST_MARKER"
-  printf '[P1] src/x.sh:10 - real bug\n  Why: demonstrated\nP2: none\nP3: none\nVERDICT: SHIP - clean.\n'
+  # v0.28 fixtures echo the nonce: this run's prompt promised it (.nonce flag written), and a
+  # sub-2-citation capture without it now correctly fails closed.
+  printf '[P1] src/x.sh:10 - real bug\n  Why: demonstrated\nP2: none\nP3: none\nVERDICT: SHIP - clean. (run marker: %s)\n' "$PERSIST_MARKER"
 } > "$TDIR/tab.txt"
 PRO_GATE_HOME="$TDIR/home-persist" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
   NODE_OPTIONS= bash "$ENGINE" --harvest "$PERSIST_MARKER" --out "$TDIR/o-harv.md" --timeout 30s \
@@ -918,6 +925,7 @@ P0: none of the priors remain
 
 [P0] a.sh:1 — RESOLVED — fixed earlier
 [P0] b.sh:2 — a new unresolved problem
+[P0] f.sh:6 — the RESOLVED_MODEL capture is clobbered mid-run
 [P1] c.sh:3 — RESOLVED — fixed
 [P1] d.sh:4 — STILL-PRESENT — not fixed
 [P1] e.sh:5 — another new finding
@@ -926,7 +934,8 @@ VERDICT: FIX-FIRST — x
 SEV
 PRO_GATE_HOME="$SHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_note_severity sev-key-1 '$TDIR/sevreview.md'"
 SEV_LINE="$(cat "$SHOME/rounds/sev-key-1.last" 2>/dev/null)"
-check 'severity sidecar excludes RESOLVED lines' "$([ "$(printf '%s' "$SEV_LINE" | cut -f2)" = 1 ] && [ "$(printf '%s' "$SEV_LINE" | cut -f3)" = 2 ]; echo $?)" "sidecar: $SEV_LINE"
+# 2 open P0 (the RESOLVED_MODEL identifier is NOT a status token — gate #54 r3 P2), 2 open P1.
+check 'severity sidecar excludes only RESOLVED status tokens' "$([ "$(printf '%s' "$SEV_LINE" | cut -f2)" = 2 ] && [ "$(printf '%s' "$SEV_LINE" | cut -f3)" = 2 ]; echo $?)" "sidecar: $SEV_LINE"
 
 echo '# v0.28: provenance helpers (lib)'
 printf 'src/real.sh\nlib/other.sh\n' > "$TDIR/manifest.txt"
@@ -1043,9 +1052,36 @@ M9="pg-run-artifact-4-1700000035-99"
 mkdir -p "$TDIR/home/completed"
 cp "$TDIR/prov-ours.md" "$TDIR/home/completed/$M9"
 printf 'idle tab with no markers at all\n' > "$TDIR/tab.txt"
+# Artifact recovery needs no browser and must precede the cooldown gate (gate #54 r3 P2):
+# retrievable even while the account is cooling.
+printf '%s test-cooldown\n' "$(date +%Y-%m-%dT%H:%M:%S%z)" > "$TDIR/home/throttle.cooldown"
 run_engine --harvest "$M9" --out "$TDIR/o-artifact.md" --timeout 5s
-check 'artifact-first recovery exits 0 without a ledger row' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
+rm -f "$TDIR/home/throttle.cooldown"
+check 'artifact-first recovery exits 0 (even under cooldown, no ledger row)' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
 check 'artifact content returned verbatim' "$(cmp -s "$TDIR/o-artifact.md" "$TDIR/prov-ours.md"; echo $?)" "$(head -2 "$TDIR/o-artifact.md" 2>/dev/null)"
+
+echo '# v0.28: unbindable captures fail closed when the nonce was promised'
+M11="pg-run-unbound-1-1700000041-33"
+printf '1\t%s\t%s\t0\t1\tGPT-X\n' "$TDIR/o-unbound.md" "$(date +%s)" > "$TDIR/home/in-progress/$M11"
+printf 'src/real.sh\n' > "$TDIR/home/manifests/$M11"
+: > "$TDIR/home/manifests/$M11.nonce"
+cat > "$TDIR/tab.txt" <<TAB
+conversation for run marker: $M11
+P0: none
+
+[P1] callers/context-only.ts:5 — single citation, no echo
+
+VERDICT: FIX-FIRST — ambiguous
+TAB
+start_mock "$TDIR/tab.txt"
+run_engine --harvest "$M11" --out "$TDIR/o-unbound.md" --timeout 5s
+check 'promised-nonce absent + 1 citation fails closed (exit 9)' "$([ "$RC" -eq 9 ] && grep -q 'unbind\|cannot be bound' "$TDIR/stderr"; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
+check 'unbindable capture set aside, reservation kept' "$(ls "$TDIR/o-unbound.md.unbound."* >/dev/null 2>&1 && [ -f "$TDIR/home/in-progress/$M11" ]; echo $?)" "$(ls "$TDIR" 2>/dev/null | grep unbound)"
+env PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_REQUIRE_NONCE=0 NODE_OPTIONS= \
+  bash "$ENGINE" --harvest "$M11" --out "$TDIR/o-unbound.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'PRO_GATE_REQUIRE_NONCE=0 restores best-effort acceptance' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
 
 echo '# v0.28: digest mismatch rejects an overwritten ledgered source'
 M10="pg-run-digest-2-1700000036-11"
@@ -1063,11 +1099,18 @@ P0: none
 
 VERDICT: SHIP — fine
 PC
-printf '{"ts":"2026-01-05T00:00:00+0000","pr":"5","repo":"/tmp/x","exit":0,"outcome":"clean","secs":10,"attempts":0,"conc":0,"ceiling":1,"live":1,"salvaged":1,"diff_lines":4,"out":"%s","model":"m","marker":"%s","round_key":"collected-5"}\n' "$TDIR/prior-collected.md" "$M4" >> "$TDIR/home/ledger.jsonl"
+M4SHA="$(sha256sum "$TDIR/prior-collected.md" | awk '{print $1}')"
+printf '{"ts":"2026-01-05T00:00:00+0000","pr":"5","repo":"/tmp/x","exit":0,"outcome":"clean","secs":10,"attempts":0,"conc":0,"ceiling":1,"live":1,"salvaged":1,"diff_lines":4,"out":"%s","model":"m","marker":"%s","round_key":"collected-5","sha256":"%s"}\n' "$TDIR/prior-collected.md" "$M4" "$M4SHA" >> "$TDIR/home/ledger.jsonl"
 printf 'idle tab with no markers at all\n' > "$TDIR/tab.txt"
 run_engine --harvest "$M4" --out "$TDIR/o-already.md" --timeout 5s
-check 'already-collected harvest exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
+check 'digest-verified already-collected harvest exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
 check 'already-collected returns the prior review' "$(cmp -s "$TDIR/o-already.md" "$TDIR/prior-collected.md"; echo $?)" "$(head -2 "$TDIR/o-already.md" 2>/dev/null)"
+# A pre-v0.28 row WITHOUT a digest cannot prove the mutable path still holds the collected
+# review (gate #54 r3): report for manual recovery (exit 6, never respend), never copy it.
+M4L="pg-run-legacyrow-5-1700000040-22"
+printf '{"ts":"2026-01-05T01:00:00+0000","pr":"5","repo":"/tmp/x","exit":0,"outcome":"clean","secs":10,"attempts":0,"conc":0,"ceiling":1,"live":1,"salvaged":1,"diff_lines":4,"out":"%s","model":"m","marker":"%s","round_key":"legacyrow-5"}\n' "$TDIR/prior-collected.md" "$M4L" >> "$TDIR/home/ledger.jsonl"
+run_engine --harvest "$M4L" --out "$TDIR/o-legacy.md" --timeout 5s
+check 'digest-less legacy row routes to manual recovery (exit 6)' "$([ "$RC" -eq 6 ] && grep -q 'MANUAL' "$TDIR/stderr"; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
 # Pre-existing $OUT content must never pass as proof of collection (gate #54 P1): with the
 # ledgered source gone, a stale review already sitting at --out stays rejected (exit 6).
 M6="pg-run-staleout-8-1700000033-77"

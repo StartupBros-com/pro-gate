@@ -135,11 +135,14 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
      as `$OUT.foreign.*`: a complete review citing none of this change's files is a foreign
      conversation's answer), wait and repeat if your budget allows, else return the
      unavailable envelope quoting the harvest command; exit 3 = browser/CDP trouble with the
-     reservation kept, safe to retry; exit 6 = gone after repeated misses (engine >=v0.28
-     self-resolves the "reservation already absent because already collected" case by
-     returning the ledgered review idempotently with exit 0, so a remaining 6 is a real
-     miss-limit loss — still have the human check the ChatGPT conversation before any fresh
-     spend). Engine >=v0.25 remembers the run's
+     reservation kept, safe to retry; exit 6 has TWO flavors — read the status `detail`
+     before ever interpreting it: a detail containing "already collected" means the review
+     EXISTS but could not be returned automatically (unverifiable pre-v0.28 row, missing or
+     altered prior output) — recover it manually from the named path / PR audit trail /
+     ChatGPT, and NEVER resubmit for it; only a miss-limit detail is a possible real loss,
+     and even then have the human check the ChatGPT conversation before any fresh spend.
+     Engine >=v0.28 returns verifiable already-collected reviews idempotently (exit 0,
+     artifact- or digest-backed). Engine >=v0.25 remembers the run's
      conversation URL and re-renders it when no tab carries the marker, so a browser restart no
      longer loses a finished review; if exit 6 arrives and the conversation IS in ChatGPT, say
      so in your envelope — that is a bug, not the expected path.
