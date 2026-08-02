@@ -807,6 +807,22 @@ pg_round_key_ok() {
   case "${1:-}" in '') return 1;; *[!A-Za-z0-9.-]*) return 1;; *) return 0;; esac
 }
 
+# pg_title_seq_next <key>: monotonic per-change ordinal for the sidebar title label — NEVER
+# window-pruned (gate #57 r3: a rolling-window count repeats labels across expiry, recreating
+# the stale-round ambiguity). Single writer: called only under the per-change lock. Gaps are
+# fine (a deferred run burns a number); uniqueness per key is the requirement. The rounds
+# sweep excludes *.seq so long-idle changes keep their numbering.
+pg_title_seq_next() {
+  local f n
+  pg_round_key_ok "$1" || { echo 1; return; }
+  f="$(pg_rounds_dir)/$1.seq"
+  mkdir -p "$(pg_rounds_dir)" 2>/dev/null || true   # title time precedes pg_round_record's mkdir
+  n="$(cat "$f" 2>/dev/null)"; case "$n" in ''|*[!0-9]*) n=0;; esac
+  n=$((n + 1))
+  { printf '%s' "$n" > "$f.tmp" && mv -f "$f.tmp" "$f"; } 2>/dev/null || true
+  echo "$n"
+}
+
 pg_round_count() {  # $1 = key; echoes the rounds recorded inside the rolling window
   local key="$1" f now win t n=0
   pg_round_key_ok "$key" || { echo 0; return; }

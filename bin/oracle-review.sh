@@ -1341,7 +1341,7 @@ find "$(pg_manifest_dir)" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null ||
 # lock a live process might hold (same safety argument as the sweeps above).
 ROUND_SWEEP_MIN=$(( $(pg_round_window_secs) / 60 ))
 [ "$ROUND_SWEEP_MIN" -lt 1440 ] && ROUND_SWEEP_MIN=1440
-find "$(pg_rounds_dir)" -maxdepth 1 -type f -mmin "+${ROUND_SWEEP_MIN}" -delete 2>/dev/null || true
+find "$(pg_rounds_dir)" -maxdepth 1 -type f ! -name '*.seq' -mmin "+${ROUND_SWEEP_MIN}" -delete 2>/dev/null || true
 # Sweep idle chatgpt.com ROOT tabs (leaked by killed pre-submission runs; the marker-based
 # close can't see them, and each is a renderer eating the review box's memory headroom).
 # Only when NO oracle CLI is <120s old: a younger one may still be pre-navigation on a root
@@ -1462,9 +1462,10 @@ fi
 # ChatGPT's auto-titler is biased toward a legible sidebar title, r<N> distinguishing review
 # ROUNDS of one change. Computed HERE — under the per-change lock, after the round-guard
 # recheck — because rounds record only under this lock: the count is stable for our change,
-# so a queued same-change run can no longer prebuild a duplicate label. The engine's own
-# machinery is unaffected (it matches by marker, never by title).
-TITLE_ROUND="r$(( $(pg_round_count "$ROUND_KEY" 2>/dev/null || echo 0) + 1 ))"
+# so a queued same-change run can no longer prebuild a duplicate label. The ordinal comes
+# from a monotonic, never-window-pruned sequence (gate #57 r3: window counts repeat labels
+# across expiry). The engine's own machinery is unaffected (marker matching, never title).
+TITLE_ROUND="r$(pg_title_seq_next "$ROUND_KEY")"
 if [ -n "$PR_NUM" ]; then
   TITLE_LINE="$(printf 'pro-gate review: PR #%s %s [%s]' "$PR_NUM" "$TITLE_ROUND" "$REPO_SLUG")"
 else
