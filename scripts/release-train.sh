@@ -29,12 +29,33 @@ notes_summary() {
   local notes bullets
   notes="$(printf '%s' "${RELEASE_NOTES:-}" | tr -d '\r')"
   [[ -n "$notes" ]] || return 0
+  # Bullets come only from sections that ARE changelogs (gate #58 P2): the Highlights
+  # section, the "What's Changed" section (auto-notes append e.g. "New Contributors"
+  # bullets after it), or — for headingless bodies — a leading list block only, so a prose
+  # release with install bullets further down still falls back to its first paragraph.
   bullets="$(printf '%s\n' "$notes" | sed -n '/^##[[:space:]]*Highlights/,/^## /p' | grep -E '^[*•-][[:space:]]' || true)"
-  [[ -n "$bullets" ]] || bullets="$(printf '%s\n' "$notes" | grep -E '^\*[[:space:]]' || true)"
+  if [[ -z "$bullets" ]]; then
+    if printf '%s\n' "$notes" | grep -qE '^##[[:space:]]*What.?.?s Changed'; then
+      bullets="$(printf '%s\n' "$notes" | sed -n '/^##[[:space:]]*What.\{0,2\}s Changed/,/^## /p' | grep -E '^\*[[:space:]]' || true)"
+    elif [[ "$(printf '%s\n' "$notes" | grep -vE '^[[:space:]]*$' | head -n 1)" == \** ]]; then
+      bullets="$(printf '%s\n' "$notes" | awk '/^[[:space:]]*$/{exit} /^\*[[:space:]]/{print}')"
+    fi
+  fi
   if [[ -n "$bullets" ]]; then
+    # Character-safe slicing (gate #58 P2): cut -c is BYTES under GNU coreutils, which can
+    # split a multibyte character mid-sequence and ship invalid UTF-8. This path runs only
+    # on the Actions runner, where python3 is guaranteed.
     printf '%s\n' "$bullets" \
       | sed -E 's/^[*•-][[:space:]]+//; s/[[:space:]]+by @[A-Za-z0-9_[:punct:]]+ in http[^[:space:]]*[[:space:]]*$//; s/^(feat|fix|perf|chore|docs|refactor|test|ci|build)(\([^)]*\))?!?:[[:space:]]*//; s/[[:space:]]*\(v[0-9]+\.[0-9]+\.[0-9]+\)[[:space:]]*$//' \
-      | grep -v '^[[:space:]]*$' | head -n 3 | cut -c1-180
+      | python3 -c 'import sys
+out = []
+for line in sys.stdin.read().splitlines():
+    line = line.strip()
+    if line:
+        out.append(line[:180])
+    if len(out) == 3:
+        break
+print("\n".join(out)[:600])'
     return 0
   fi
   printf '%s' "$notes" | awk 'BEGIN{RS=""} NR==1' | tr '\n' ' ' | cut -c1-600

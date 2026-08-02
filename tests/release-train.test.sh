@@ -124,5 +124,13 @@ assert_eq "$(ns "$PROSE")" 'A prose lead paragraph. Still the lead. ' 'prose bod
 MANY=$'* one\n* two\n* three\n* four'
 assert_eq "$(ns "$MANY")" $'one\ntwo\nthree' 'bullets cap at three'
 assert_eq "$(ns '')" '' 'empty notes stay empty'
+CONTRIB="$(printf '%s\n' "## What's Changed" '* feat: real change by @u in https://x/pull/1' '' '## New Contributors' '* @newbie made their first contribution in https://x/pull/1')"
+assert_eq "$(ns "$CONTRIB")" 'real change' 'contributor-section bullets never become highlights'
+PROSEB="$(printf '%s\n' 'A prose lead.' '' 'Install steps:' '* run the installer' '* sign in')"
+assert_eq "$(ns "$PROSEB")" 'A prose lead. ' 'later install bullets do not hijack a prose body'
+CJK="$(printf '* %s' "$(python3 -c "print('测' * 200)")")"
+CJK_OUT="$(ns "$CJK")"
+assert_eq "$(printf '%s' "$CJK_OUT" | python3 -c 'import sys; print(len(sys.stdin.read()))')" '180' 'multibyte bullets slice at 180 CHARACTERS'
+printf '%s' "$CJK_OUT" | python3 -c 'import sys; sys.stdin.buffer.read().decode("utf-8")' && pass 'sliced multibyte output is valid UTF-8'
 
 echo 'ALL PASS'
