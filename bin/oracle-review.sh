@@ -1215,23 +1215,8 @@ RUN_MARKER="pg-run-${ROUND_KEY:-diff}-$(date +%s)-$$"
 CAPTURE_OUT="$WORK/capture.md"
 PROMPT_FILE="$WORK/prompt.md"
 {
-  # v0.29 (#49 phase 1): the LITERAL FIRST LINE names the run so ChatGPT's auto-titler
-  # (gen_title summarizes the conversation) is strongly biased toward a legible sidebar
-  # title like "pro-gate review: PR #1263 [StartupBros-com-pushbot]". Humans hunt the
-  # sidebar during manual recovery (observed in >=3 sessions) and among concurrent review
-  # tabs; the engine's own machinery is unaffected (it matches by marker, never by title).
-  # Zero new API surface — this is prompt wording only.
-  # r<N> distinguishes review ROUNDS of one change (gate #57 P1): PR number and slug repeat
-  # across re-reviews, and a human recovering manually must not open an older round's
-  # verdict. N = rounds already spent in the rolling window + 1 — approximate under races,
-  # but same-change runs serialize on the per-change lock in practice, and the window reset
-  # is disambiguated by the sidebar's own dates.
-  TITLE_ROUND="r$(( $(pg_round_count "${ROUND_KEY:-diff}" 2>/dev/null || echo 0) + 1 ))"
-  if [ -n "$PR_NUM" ]; then
-    printf 'pro-gate review: PR #%s %s [%s]\n\n' "$PR_NUM" "$TITLE_ROUND" "$REPO_SLUG"
-  else
-    printf 'pro-gate review: %s %s\n\n' "${ROUND_KEY:-diff}" "$TITLE_ROUND"
-  fi
+  # (The run-naming title line is PREPENDED after the per-change lock is held — see below.
+  # Computing r<N> here raced: a queued same-change run would prebuild a duplicate label.)
   # Lead with the @GitHub connector tag + an explicit directive (belt-and-suspenders: oracle
   # pastes the prompt in one shot, so @GitHub is a recognized hint, not a bound mention pill;
   # ORACLE_CHATGPT_URL can pin a connector-bound Project for true binding).
@@ -1472,6 +1457,21 @@ fi
 if ! ROUND_REASON="$(pg_round_guard "$ROUND_KEY")"; then
   round_capped "$ROUND_REASON (spent while this run waited on the per-change lock)"
 fi
+
+# v0.29 (#49 phase 1, gate #57 r2): the LITERAL FIRST LINE of the prompt names the run so
+# ChatGPT's auto-titler is biased toward a legible sidebar title, r<N> distinguishing review
+# ROUNDS of one change. Computed HERE — under the per-change lock, after the round-guard
+# recheck — because rounds record only under this lock: the count is stable for our change,
+# so a queued same-change run can no longer prebuild a duplicate label. The engine's own
+# machinery is unaffected (it matches by marker, never by title).
+TITLE_ROUND="r$(( $(pg_round_count "$ROUND_KEY" 2>/dev/null || echo 0) + 1 ))"
+if [ -n "$PR_NUM" ]; then
+  TITLE_LINE="$(printf 'pro-gate review: PR #%s %s [%s]' "$PR_NUM" "$TITLE_ROUND" "$REPO_SLUG")"
+else
+  TITLE_LINE="$(printf 'pro-gate review: %s %s' "${ROUND_KEY:-diff}" "$TITLE_ROUND")"
+fi
+{ printf '%s\n\n' "$TITLE_LINE"; cat "$PROMPT_FILE"; } > "$PROMPT_FILE.titled" 2>/dev/null \
+  && mv -f "$PROMPT_FILE.titled" "$PROMPT_FILE" 2>/dev/null || rm -f "$PROMPT_FILE.titled"
 
 echo "[oracle-review] acquiring a review slot (effective ${EFF_CONC} of ceiling ${MAX_CONC}; waits up to ${LOCK_WAIT}s if all busy)..." >&2
 pg_status waiting-slot "effective ${EFF_CONC} / ceiling ${MAX_CONC}"
