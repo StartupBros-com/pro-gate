@@ -1281,7 +1281,8 @@ check 'second round titles r2' "$(head -1 "$TDIR/prompt-dump2.txt" 2>/dev/null |
 # The ordinal is monotonic and window-INDEPENDENT (gate #57 r3): a seeded sequence advances
 # even when every in-window round timestamp has expired.
 TKEY="$(ls "$TDIR/home-title/rounds" 2>/dev/null | grep -vE '\.(seq|last)$|\.tmp' | head -1)"
-printf '7' > "$TDIR/home-title/rounds/$TKEY.seq"
+mkdir -p "$TDIR/home-title/title-seq"
+printf '7' > "$TDIR/home-title/title-seq/$TKEY"
 printf '100\n' > "$TDIR/home-title/rounds/$TKEY"
 env PRO_GATE_HOME="$TDIR/home-title" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
   PRO_GATE_RAMP=0 PRO_GATE_MAX_RETRIES=0 PG_TEST_PROMPT_DUMP="$TDIR/prompt-dump3.txt" \

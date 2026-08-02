@@ -1465,7 +1465,14 @@ fi
 # so a queued same-change run can no longer prebuild a duplicate label. The ordinal comes
 # from a monotonic, never-window-pruned sequence (gate #57 r3: window counts repeat labels
 # across expiry). The engine's own machinery is unaffected (marker matching, never title).
-TITLE_ROUND="r$(pg_title_seq_next "$ROUND_KEY")"
+if TITLE_SEQ="$(pg_title_seq_next "$ROUND_KEY")"; then
+  TITLE_ROUND="r$TITLE_SEQ"
+else
+  # Unique fallback when the sequence store is unwritable (gate #57 r4 P2): the marker's
+  # pid tail cannot collide with ordinal labels, so duplicates are impossible either way.
+  TITLE_ROUND="r?${RUN_MARKER##*-}"
+  echo "[oracle-review] NOTE: title sequence store unwritable; using unique fallback label $TITLE_ROUND." >&2
+fi
 if [ -n "$PR_NUM" ]; then
   TITLE_LINE="$(printf 'pro-gate review: PR #%s %s [%s]' "$PR_NUM" "$TITLE_ROUND" "$REPO_SLUG")"
 else
