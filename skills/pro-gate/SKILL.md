@@ -241,21 +241,29 @@ MARKER="$(jq -r .marker "$STATUS" 2>/dev/null || sed -nE 's/.*"marker":"([^"]+)"
 ```
 
 Harvest exits: `0` review ready · `9` reservation retained, try again later (still generating;
-absent this pass but under the consecutive-miss threshold; or the browser was unreachable for
-the whole pass, which counts as NO miss) · `8` deferred (cooldown: retry after) · `6`
-conversation gone after repeated misses — but exit 6 also fires when the reservation is
-ALREADY ABSENT, which includes "another pass already collected this review": before treating
-6 as a loss, check the ledger for a clean row for this change and read the `--out` file, and
-open the conversation in a browser; only a persisted miss-limit loss justifies a fresh run · `7` another
+absent this pass but under the consecutive-miss threshold; the browser was unreachable for
+the whole pass, which counts as NO miss; or — engine ≥v0.28 — the capture failed the
+provenance check: a complete review citing NONE of this change's files is a foreign
+conversation's answer, so it is set aside as `<out>.foreign.*` and the reservation kept) ·
+`8` deferred (cooldown: retry after) · `6`
+conversation gone after repeated misses — and on engine ≥v0.28 the "reservation already
+absent" case self-resolves: the engine checks the ledger for this marker's clean row and
+returns an ALREADY-COLLECTED review idempotently (exit 0, nothing spent) instead of
+declaring it lost; a remaining exit 6 means a real miss-limit loss (or a pre-v0.27
+collection the ledger cannot identify) — still open the conversation in a browser before
+ever spending a fresh slot · `7` another
 collector already holds this marker (wait for it; do not race it) · `3` runtime/CDP trouble;
 reservation and tab kept (retry once the browser is healthy). Repeat harvests are free: no Pro
 quota is spent. Reservations are keyed by repo-scoped PR identity, so identical PR numbers in
 different repositories never cross.
 
-**A lost TAB is not a lost review (v0.25).** ChatGPT keeps conversations server-side, so the
-engine remembers each run's conversation URL the first time it proves which one is that run's,
-and re-renders that URL when no open tab carries the marker. A Chrome restart — routine when the
-box is short on memory — therefore no longer destroys a finished review. Before v0.25 it did:
+**A lost TAB is not a lost review (v0.25; hardened v0.28).** ChatGPT keeps conversations
+server-side, so the engine remembers each run's conversation URL the first time it proves
+which one is that run's, and re-renders that URL when no open tab carries the marker. A
+Chrome restart — routine when the box is short on memory — therefore no longer destroys a
+finished review. Engine ≥v0.28 learns the URL EARLY (a bounded background probe shortly
+after submission) so even a whole-Chrome death mid-generation, before any salvage ever ran,
+leaves the pointer behind (`PRO_GATE_EARLY_PROBE_SECS`, default 75; 0 disables). Before v0.25 it did:
 "conversation gone" really meant "no open Chrome tab has it", and 46 of 200 logged runs were
 declared lost while their reviews sat complete in ChatGPT. If you still get exit 6, open the
 conversation in a browser before spending another Pro slot — and if the review IS there, that is

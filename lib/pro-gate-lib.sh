@@ -549,7 +549,9 @@ pg_reservation_remove() { # marker
   local marker="$1" dir
   pg_reservation_marker_ok "$marker" || return 0
   dir="$(pg_reservation_dir)"; pg_reservation_guard_acquire || return 1
-  rm -f "$dir/$marker" 2>/dev/null
+  # v0.28: the .paths sidecar (the change's file manifest for provenance checks) lives and
+  # dies with its reservation.
+  rm -f "$dir/$marker" "$dir/$marker.paths" 2>/dev/null
   pg_reservation_guard_release
 }
 
@@ -569,7 +571,7 @@ pg_reservation_note_miss() {
   case "$misses" in ''|*[!0-9]*) misses=0;; esac
   misses=$(( misses + 1 ))
   if [ "$misses" -ge "$miss_limit" ]; then
-    rm -f "$f" 2>/dev/null
+    rm -f "$f" "$f.paths" 2>/dev/null
     pg_reservation_guard_release
     echo released
   else
@@ -904,9 +906,15 @@ pg_round_note_severity() {
   dir="$(pg_rounds_dir)"
   [ -f "$dir/$key" ] || return 0
   [ -s "$out" ] || return 0
-  # grep -c prints 0 AND exits 1 on no match: capture, then default only when empty.
-  p0="$(grep -ci '\[P0\]' "$out" 2>/dev/null)"; [ -n "$p0" ] || p0=0
-  p1="$(grep -ci '\[P1\]' "$out" 2>/dev/null)"; [ -n "$p1" ] || p1=0
+  # v0.28 (#52 item 3): count only OPEN findings. Confirming reviews are REQUIRED to carry
+  # every prior P0/P1 forward as a "[Pn] … RESOLVED …" verification block; grep-counting every
+  # severity tag reported resolved P0s as "OPEN P0" at round-cap time and prompted false
+  # force-round escalations. The RESOLVED filter is case-SENSITIVE on purpose: reviews upcase
+  # the verification token, while prose like "unresolved"/"Unresolved" must not exclude a line.
+  # STILL-PRESENT and new-finding lines carry no RESOLVED token and stay counted.
+  # (grep -c prints 0 AND exits 1 on no match: capture, then default only when empty.)
+  p0="$(grep -i '\[P0\]' "$out" 2>/dev/null | grep -cv 'RESOLVED')"; [ -n "$p0" ] || p0=0
+  p1="$(grep -i '\[P1\]' "$out" 2>/dev/null | grep -cv 'RESOLVED')"; [ -n "$p1" ] || p1=0
   { printf '%s\t%s\t%s\n' "$(date +%s)" "$p0" "$p1" > "$dir/$key.last.tmp" \
       && mv -f "$dir/$key.last.tmp" "$dir/$key.last"; } 2>/dev/null || true
   return 0
@@ -976,6 +984,63 @@ pg_is_review() {
   grep -qiE '\[P[0-3]\]|P[0-3][*_ ]*:[[:space:]]*(none|—|-)' "$f" 2>/dev/null || return 1
   grep -vE '^[[:space:]]*$' "$f" 2>/dev/null | tail -n 6 \
     | grep -qiE '^[[:space:]]*[*_>#-]*[[:space:]]*VERDICT[*_[:space:]]*:'
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.28 (#48): review provenance. A structurally-complete review can still be the WRONG
+# conversation's answer — a failed send once salvaged a different PR's finished review with no
+# indication it was foreign (pushbot #1245), sending its caller off to fix phantom findings.
+# The check is deliberately lenient to make false rejections vanishingly rare: it fires only
+# when the review cites at least one file AND none of those citations overlap the change's
+# path manifest, matching full paths in either suffix direction and bare basenames.
+# ─────────────────────────────────────────────────────────────────────────────
+# pg_diff_paths <unified-diff>: the change's file manifest, one path per line.
+pg_diff_paths() {
+  sed -nE 's#^\+\+\+ b/(.+)#\1#p; s#^--- a/(.+)#\1#p' "$1" 2>/dev/null \
+    | grep -v '^/dev/null$' | sort -u
+}
+# pg_review_cited_paths <review>: paths cited in [Pn] headline lines ("[P1] path:line — ...").
+pg_review_cited_paths() {
+  sed -nE 's/^[[:space:]]*\[P[0-3]\][[:space:]]+([^[:space:]:]+):[0-9].*/\1/p' "$1" 2>/dev/null | sort -u
+}
+# pg_review_matches_change <review> <paths-file>: rc 0 = accept (no manifest, fewer than two
+# distinct citations, or any overlap); rc 1 = REJECT (≥2 cited paths, manifest exists, zero
+# overlap → foreign). The two-citation floor keeps single-finding reviews that legitimately
+# cite one caller/context file outside the diff from being misread as foreign — the observed
+# foreign captures are whole other PRs' reviews, which cite several of their own files.
+pg_review_matches_change() {
+  local review="$1" pathsf="$2" cited c p base
+  [ -s "$pathsf" ] || return 0
+  cited="$(pg_review_cited_paths "$review")"
+  [ -n "$cited" ] || return 0
+  [ "$(printf '%s\n' "$cited" | grep -c .)" -ge 2 ] 2>/dev/null || return 0
+  while IFS= read -r c; do
+    [ -n "$c" ] || continue
+    base="${c##*/}"
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      case "$p" in "$c"|*/"$c") return 0;; esac
+      case "$c" in "$p"|*/"$p") return 0;; esac
+      [ "${p##*/}" = "$base" ] && return 0
+    done < "$pathsf"
+  done <<PG_EOF
+$cited
+PG_EOF
+  return 1
+}
+
+# pg_ledger_lookup_clean <marker>: echo the newest CLEAN ledger row's `out` path for a marker,
+# or nothing. Lets a harvest whose reservation is already absent return an ALREADY-COLLECTED
+# review idempotently instead of declaring it lost (#52 item 2). Markers land in the ledger
+# from v0.27 on; legacy rows simply never match (callers fall back to the old behavior).
+pg_ledger_lookup_clean() {
+  local marker="$1" ledger="${PRO_GATE_LEDGER:-$PRO_GATE_HOME/ledger.jsonl}"
+  pg_reservation_marker_ok "$marker" || return 1
+  [ -s "$ledger" ] || return 1
+  pg_have jq || return 1
+  tail -n 400 "$ledger" \
+    | jq -r --arg m "$marker" 'select((.marker // "") == $m and .outcome == "clean") | .out' 2>/dev/null \
+    | tail -n 1
 }
 
 # pg_reattach_render <slug> <out> [timeout_s]: bounded attempt to SALVAGE a review whose
