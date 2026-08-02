@@ -111,7 +111,12 @@ function rememberUrl(m, url) {
   if (recallUrl(m) === url) return;     // already known: no churn, no prune
   try {
     fs.mkdirSync(URL_MEMO_DIR, { recursive: true });
-    fs.writeFileSync(f, `${url}\n`);
+    // Atomic publish (gate #54 r7): an in-place writeFileSync truncates first, so the shell's
+    // claim-and-verify rejection could grab (and unlink) an empty mid-write memo, losing the
+    // refreshed genuine URL. Rename swaps complete content or nothing.
+    const tmp = `${f}.tmp.${process.pid}`;
+    fs.writeFileSync(tmp, `${url}\n`);
+    fs.renameSync(tmp, f);
     const entries = fs.readdirSync(URL_MEMO_DIR);
     if (entries.length > MEMO_KEEP) {
       entries

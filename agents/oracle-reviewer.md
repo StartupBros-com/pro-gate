@@ -131,9 +131,11 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
      ```
      (exit 0 = relay `$OUT`; exit 9 again = reservation retained (still generating, a
      below-threshold miss, or the browser was unreachable for the whole pass — which counts as
-     no miss; or — engine >=v0.28 — the capture failed the provenance check and was set aside
-     as `$OUT.foreign.*`: a complete review citing none of this change's files is a foreign
-     conversation's answer), wait and repeat if your budget allows, else return the
+     no miss; or — engine >=v0.28 — the capture could not be bound to this run: by default a
+     capture without the run-marker echo is set aside as `$OUT.unbound.*` (possibly an older
+     answer while the current one still generates — retry); legacy mode
+     (PRO_GATE_REQUIRE_NONCE=0) sets zero-overlap captures aside as `$OUT.foreign.*`),
+     wait and repeat if your budget allows, else return the
      unavailable envelope quoting the harvest command; exit 3 = browser/CDP trouble with the
      reservation kept, safe to retry; exit 6 has TWO flavors — read the status `detail`
      before ever interpreting it: a detail containing "already collected" means the review

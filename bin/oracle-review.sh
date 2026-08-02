@@ -574,6 +574,10 @@ if [ -n "$HARVEST_MARKER" ] && pg_reservation_marker_ok "$HARVEST_MARKER" \
   if cp "$FASTPATH_ART" "$FASTPATH_SNAP" 2>/dev/null && pg_is_review "$FASTPATH_SNAP"; then
     PG_FINAL_SRC="$FASTPATH_SNAP"
     SALVAGED=1
+    # Retire any leftover reservation/manifest for this marker (gate #54 r7): a crash between
+    # a prior run's artifact write and its reservation removal must not hold account capacity
+    # (and keep redirecting this change to harvest) for the whole 6h TTL.
+    pg_reservation_remove "$RUN_MARKER" || true
     echo "[oracle-review] review already collected (completed artifact); returning it — no browser touched, nothing spent." >&2
     pg_status done "already collected; returned from $FASTPATH_ART"
     cat "$FASTPATH_SNAP"
@@ -1652,12 +1656,24 @@ fi
 # writes its own conversation's answer, and a legitimate review may cite a caller/context
 # file outside the diff (the fixture suite does exactly that) — rejecting those would turn
 # clean runs into phantom exit-9s.
-if { [ "${SALVAGED:-0}" = 1 ] || [ "${REATTACHED:-0}" = 1 ]; } \
-   && pg_is_review "$OUT" \
-   && ! pg_capture_nonce_ok "$OUT" "$RUN_MARKER" \
-   && ! pg_review_matches_change "$OUT" "$WORK/diff.paths"; then
+# Snapshot-FIRST acceptance (gate #54 r7): every structural, nonce, and provenance check below
+# runs on a process-private copy taken NOW. Shared $OUT can be swapped by a concurrent marker
+# between a check and its use; under REQUIRE_NONCE, the snapshot's own nonce check is what
+# binds the accepted bytes to this run, so a swapped-in foreign review can never pass. (Direct
+# oracle captures keep the inherent instant between oracle's write and this copy — a caller
+# sharing one --out across concurrent DIRECT runs is outside the engine's control.)
+FINAL_SNAP=""
+if pg_is_review "$OUT" && cp "$OUT" "$OUT.final.$$" 2>/dev/null && pg_is_review "$OUT.final.$$"; then
+  FINAL_SNAP="$OUT.final.$$"
+fi
+if [ -n "$FINAL_SNAP" ] \
+   && { [ "${SALVAGED:-0}" = 1 ] || [ "${REATTACHED:-0}" = 1 ]; } \
+   && ! pg_capture_nonce_ok "$FINAL_SNAP" "$RUN_MARKER" \
+   && ! pg_review_matches_change "$FINAL_SNAP" "$WORK/diff.paths"; then
   echo "[oracle-review] captured a complete review but it cites NONE of this change's files — foreign conversation suspected; NOT accepting it as ours. Preserving the run for --harvest. The rejected capture is at $OUT.foreign.$$." >&2
-  mv "$OUT" "$OUT.foreign.$$" 2>/dev/null || rm -f "$OUT"
+  mv "$FINAL_SNAP" "$OUT.foreign.$$" 2>/dev/null || rm -f "$FINAL_SNAP"
+  FINAL_SNAP=""
+  rm -f "$OUT" 2>/dev/null
   # Invalidate the memoized candidate ONLY for CDP captures: the memo names the conversation
   # the salvage just read, so it identifies the rejected text's source. A REATTACH capture
   # carries no URL identity — its rejected text may be a stale oracle session while the memo
@@ -1679,31 +1695,33 @@ fi
 # manifest, or fewer than two citations — a foreign SHIP/single-file review looks identical)
 # is preserved for --harvest/manual confirmation, never auto-accepted.
 # PRO_GATE_REQUIRE_NONCE=0 restores best-effort acceptance.
-if { [ "${SALVAGED:-0}" = 1 ] || [ "${REATTACHED:-0}" = 1 ]; } \
-   && pg_is_review "$OUT" \
+if [ -n "$FINAL_SNAP" ] \
+   && { [ "${SALVAGED:-0}" = 1 ] || [ "${REATTACHED:-0}" = 1 ]; } \
    && [ "${PRO_GATE_REQUIRE_NONCE:-1}" = 1 ] \
-   && ! pg_capture_nonce_ok "$OUT" "$RUN_MARKER"; then
+   && ! pg_capture_nonce_ok "$FINAL_SNAP" "$RUN_MARKER"; then
   # NONCE OR NOTHING for every browser-matched capture (gate #54 r4/r5 P1): reattach is
   # slug-scoped and CDP is page-wide marker-scoped — in both, a STALE answer for this very
   # PR naturally cites overlapping files, so path overlap can only reject (branch above),
   # never accept. PRO_GATE_REQUIRE_NONCE=0 restores best-effort acceptance.
-  echo "[oracle-review] captured a complete review that cannot be bound to this run (no run-marker echo; too few citations for the path check); NOT accepting it. Preserving for --harvest; inspect $OUT.unbound.$$ (PRO_GATE_REQUIRE_NONCE=0 accepts best-effort)." >&2
-  mv "$OUT" "$OUT.unbound.$$" 2>/dev/null || rm -f "$OUT"
+  echo "[oracle-review] captured a complete review that cannot be bound to this run (no run-marker echo); NOT accepting it. Preserving for --harvest; inspect $OUT.unbound.$$ (PRO_GATE_REQUIRE_NONCE=0 accepts best-effort)." >&2
+  mv "$FINAL_SNAP" "$OUT.unbound.$$" 2>/dev/null || rm -f "$FINAL_SNAP"
+  FINAL_SNAP=""
+  rm -f "$OUT" 2>/dev/null
   SALVAGE_RAN=1; SALVAGE_PRESERVE=1
 fi
-if pg_is_review "$OUT"; then
+if [ -n "$FINAL_SNAP" ]; then
   # v0.28 (#55): strip the echoed run-marker nonce before the review leaves the engine —
-  # binding is an internal mechanism, not part of the caller-facing output.
-  pg_strip_nonce "$OUT" "$RUN_MARKER"
-  # Stage the private verified snapshot (gate #54 r6): what this invocation returns,
-  # persists, and ledgers is what it just validated — not whatever a concurrent marker
-  # sharing the caller's --out may put there later.
-  if cp "$OUT" "$OUT.final.$$" 2>/dev/null; then PG_FINAL_SRC="$OUT.final.$$"; fi
+  # binding is an internal mechanism, not part of the caller-facing output. Everything from
+  # here on — severity note, stdout, artifact, digest — sources the verified snapshot;
+  # $OUT is publication only (gate #54 r6/r7).
+  pg_strip_nonce "$FINAL_SNAP" "$RUN_MARKER"
+  PG_FINAL_SRC="$FINAL_SNAP"
   # v0.22: remember this review's P0/P1 counts so a later round-capped refusal can flag an
   # unconfirmed open P0 to the human (advisory sidecar; see pg_round_note_severity).
-  pg_round_note_severity "$ROUND_KEY" "${PG_FINAL_SRC:-$OUT}"
+  pg_round_note_severity "$ROUND_KEY" "$PG_FINAL_SRC"
   pg_status done
-  cat "${PG_FINAL_SRC:-$OUT}"
+  cat "$PG_FINAL_SRC"
+  cp "$PG_FINAL_SRC" "$OUT" 2>/dev/null || true
   echo "RESULT_FILE=$OUT"
   pg_finish 0
 elif [ "${SALVAGE_RAN:-0}" = 1 ] && [ "${SALVAGE_PRESERVE:-0}" = 1 ]; then

@@ -242,9 +242,12 @@ MARKER="$(jq -r .marker "$STATUS" 2>/dev/null || sed -nE 's/.*"marker":"([^"]+)"
 
 Harvest exits: `0` review ready · `9` reservation retained, try again later (still generating;
 absent this pass but under the consecutive-miss threshold; the browser was unreachable for
-the whole pass, which counts as NO miss; or — engine ≥v0.28 — the capture failed the
-provenance check: a complete review citing NONE of this change's files is a foreign
-conversation's answer, so it is set aside as `<out>.foreign.*` and the reservation kept) ·
+the whole pass, which counts as NO miss; or — engine ≥v0.28 — the capture could not be
+BOUND to this run: by default (`PRO_GATE_REQUIRE_NONCE=1`) a capture without the run-marker
+echo is set aside as `<out>.unbound.*` with the reservation kept (it may be an older answer
+while the current one still generates — retry the harvest); in legacy mode
+(`PRO_GATE_REQUIRE_NONCE=0`) a zero-overlap capture is set aside as `<out>.foreign.*` and
+its source blacklisted) ·
 `8` deferred (cooldown: retry after) · `6`
 TWO flavors — read the status `detail` before interpreting: "already collected" means the
 review EXISTS but could not be returned automatically (unverifiable pre-v0.28 row, missing
