@@ -1008,7 +1008,7 @@ check 'foreign capture not returned as the review' "$([ ! -s "$TDIR/o-prov.md" ]
 # Rejection invalidates the memoized candidate: memo gone, URL on the per-marker blacklist —
 # without this the next harvest replays the same foreign conversation forever (gate #54 P1).
 check 'rejection removes the URL memo' "$([ ! -f "$TDIR/home/conversation-urls/$M3" ]; echo $?)" "$(cat "$TDIR/home/conversation-urls/$M3" 2>/dev/null)"
-check 'rejection blacklists the URL for this marker' "$(grep -q "^$M3	" "$TDIR/home/salvage-nonmatching.txt" 2>/dev/null; echo $?)" "$(cat "$TDIR/home/salvage-nonmatching.txt" 2>/dev/null)"
+check 'rejection blacklists the EXACT matched URL' "$(grep -q "^$M3	https://chatgpt.com/c/mock-conversation" "$TDIR/home/salvage-nonmatching.txt" 2>/dev/null; echo $?)" "$(cat "$TDIR/home/salvage-nonmatching.txt" 2>/dev/null)"
 # A manifest in its own directory must NOT read as a reservation (gate #54 P1): exactly one
 # reservation is visible for this change.
 PRO_GATE_HOME="$TDIR/home" bash "$ENGINE" --status "$M3" --json >"$TDIR/st-m3.json" 2>/dev/null
@@ -1019,13 +1019,19 @@ check 'manifest not counted as a reservation' "$([ "$(jq -r '.reservations | len
 run_engine --harvest "$M3" --out "$TDIR/o-prov.md" --timeout 5s
 check 'replay harvest does not return the foreign review' "$([ "$RC" -ne 0 ] && [ ! -s "$TDIR/o-prov.md" ]; echo $?)" "rc=$RC $(head -2 "$TDIR/o-prov.md" 2>/dev/null)"
 check 'replay harvest preserves the reservation (exit 9)' "$([ "$RC" -eq 9 ] && [ -f "$TDIR/home/in-progress/$M3" ]; echo $?)" "rc=$RC"
-# Positive control: a manifest that matches the citation accepts the same capture. (The
-# blacklist from the rejection above is cleared: this fixture reuses the same mock URL, which
-# a real recovered-from-foreign flow would reach via a different conversation.)
+# Nonce-or-nothing (gate r5): path overlap alone no longer ACCEPTS under the default; the
+# best-effort path acceptance survives only behind PRO_GATE_REQUIRE_NONCE=0. (The blacklist
+# from the rejection above is cleared: this fixture reuses the same mock URL, which a real
+# recovered-from-foreign flow would reach via a different conversation.)
 rm -f "$TDIR/home/salvage-nonmatching.txt"
 printf 'apps/blog-writer/collect.ts\n' > "$TDIR/home/manifests/$M3"
 run_engine --harvest "$M3" --out "$TDIR/o-prov.md" --timeout 5s
-check 'matching harvest capture exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
+check 'path overlap alone no longer accepts (nonce-or-nothing)' "$([ "$RC" -eq 9 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
+env PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_REQUIRE_NONCE=0 NODE_OPTIONS= \
+  bash "$ENGINE" --harvest "$M3" --out "$TDIR/o-prov.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'REQUIRE_NONCE=0 accepts on matching path overlap' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
 check 'matching harvest removes reservation + manifest' "$([ ! -f "$TDIR/home/in-progress/$M3" ] && [ ! -f "$TDIR/home/manifests/$M3" ]; echo $?)" "$(ls "$TDIR/home/in-progress" "$TDIR/home/manifests" 2>/dev/null)"
 
 echo '# v0.28: positive run-binding — a nonce-bearing capture is accepted and stripped'
@@ -1067,6 +1073,21 @@ env PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT=1 PRO_GATE_MIN_UPTIME=0 PRO_G
   bash "$ENGINE" --harvest "$M9" --out "$TDIR/o-artifact2.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
 RC=$?
 check 'artifact returns with the browser down' "$([ "$RC" -eq 0 ] && cmp -s "$TDIR/o-artifact2.md" "$TDIR/prov-ours.md"; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
+# The fast path carries full run identity (gate r5 P2): its ledger row is rediscoverable.
+FLINE="$(tail -1 "$TDIR/home/ledger.jsonl")"
+check 'fast-path ledger row carries pr + round_key' "$([ "$(printf '%s' "$FLINE" | jq -r .pr)" = "artifact-4" ] && [ "$(printf '%s' "$FLINE" | jq -r .round_key)" = "artifact-4" ]; echo $?)" "$FLINE"
+check 'fast-path ledger row records the artifact digest' "$([ "$(printf '%s' "$FLINE" | jq -r '.sha256 // ""')" = "$(sha256sum "$TDIR/home/completed/$M9" | awk '{print $1}')" ]; echo $?)" "$FLINE"
+
+echo '# v0.28: provenance rejection blacklists precisely (compare-and-delete memo)'
+mkdir -p "$SHOME/conversation-urls"
+MPR="pg-run-rejtest-1-1700000050-10"
+printf 'https://chatgpt.com/c/genuine-conv\n' > "$SHOME/conversation-urls/$MPR"
+PRO_GATE_HOME="$SHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_provenance_reject '$MPR' 'https://chatgpt.com/c/foreign-conv'"
+check 'explicit-URL rejection blacklists the foreign URL' "$(grep -q "^$MPR	https://chatgpt.com/c/foreign-conv" "$SHOME/salvage-nonmatching.txt" 2>/dev/null; echo $?)" "$(cat "$SHOME/salvage-nonmatching.txt" 2>/dev/null)"
+check 'memo naming a DIFFERENT (genuine) URL survives' "$([ -f "$SHOME/conversation-urls/$MPR" ]; echo $?)" 'memo deleted despite mismatch'
+PRO_GATE_HOME="$SHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_provenance_reject '$MPR' 'https://chatgpt.com/c/genuine-conv'"
+check 'memo naming the rejected URL is removed' "$([ ! -f "$SHOME/conversation-urls/$MPR" ]; echo $?)" 'memo survived its own rejection'
+
 
 echo '# v0.28: unbindable captures fail closed when the nonce was promised'
 M11="pg-run-unbound-1-1700000041-33"

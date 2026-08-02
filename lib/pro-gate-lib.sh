@@ -1015,12 +1015,6 @@ pg_diff_paths() {
 pg_review_cited_paths() {
   sed -nE 's/^[[:space:]]*\[P[0-3]\][[:space:]]+([^[:space:]:]+):[0-9].*/\1/p' "$1" 2>/dev/null | sort -u
 }
-# pg_review_citation_count <review>: number of distinct [Pn]-headline cited paths.
-pg_review_citation_count() {
-  local n
-  n="$(pg_review_cited_paths "$1" | grep -c .)"
-  printf '%s' "${n:-0}"
-}
 # pg_review_matches_change <review> <paths-file>: rc 0 = accept (no manifest, fewer than two
 # distinct citations, or any overlap); rc 1 = REJECT (≥2 cited paths, manifest exists, zero
 # overlap → foreign). The two-citation floor keeps single-finding reviews that legitimately
@@ -1056,13 +1050,19 @@ PG_EOF
 # deliberately bypassing cdp-salvage's own "never blacklist ourUrls" guard: marker match said
 # "ours", but the CONTENT proved the answer is not this change's review, which is the stronger
 # signal — and the memo is removed so the next pass rescans all candidates.
-pg_provenance_reject() {
-  local m="$1" memo url
+pg_provenance_reject() {  # <marker> [matched-url]
+  # Prefer the EXPLICIT matched URL the CDP child reported for this very capture: reading the
+  # shared memo afterwards races concurrent probes/retries, which can re-learn the GENUINE
+  # conversation in the interim — condemning it while the foreign source stays eligible
+  # (gate #54 r5). The memo is removed only when it still names the URL being rejected.
+  local m="$1" url="${2:-}" memo cur
   memo="$PRO_GATE_HOME/conversation-urls/$m"
-  url="$(head -c 300 "$memo" 2>/dev/null | tr -d '\n')"
+  cur="$(head -c 300 "$memo" 2>/dev/null | tr -d '\n')"
+  [ -n "$url" ] || url="$cur"
   [ -n "$url" ] || return 0
   { printf '%s\t%s\n' "$m" "$url" >> "$PRO_GATE_HOME/salvage-nonmatching.txt"; } 2>/dev/null || true
-  rm -f "$memo" 2>/dev/null || true
+  [ "$cur" = "$url" ] && rm -f "$memo" 2>/dev/null
+  return 0
 }
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -492,10 +492,13 @@ pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor,
   # v0.28 (#56): a clean run's review becomes the write-once completed artifact, and its
   # digest lands in the ledger row — later already-collected recovery verifies content
   # identity instead of trusting a mutable, reusable output path.
-  OUT_SHA=""
+  OUT_SHA="${PG_OUT_SHA_OVERRIDE:-}"
   if [ "$rc" = 0 ] && [ -n "${RUN_MARKER:-}" ] && [ -s "$OUT" ]; then
     pg_completed_write "$RUN_MARKER" "$OUT" || true
-    OUT_SHA="$(pg_sha256 "$OUT")"
+    # A caller may share one --out across markers; a precomputed digest (fast path) always
+    # describes the bytes THIS invocation verified and returned, not whatever occupies $OUT
+    # by ledger time (gate #54 r5 P1).
+    [ -n "$OUT_SHA" ] || OUT_SHA="$(pg_sha256 "$OUT")"
   fi
   # v0.27: `marker` and `round_key` land in every ledger line so --status (and any caller with
   # only the ledger) can reconstruct a harvest command without the original status file. Rows
@@ -548,15 +551,30 @@ pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor,
 # is down (the exact condition the artifact exists for). No lock needed: the artifact is
 # write-once and installed atomically, so a concurrent reader can never observe a torn copy.
 if [ -n "$HARVEST_MARKER" ] && pg_reservation_marker_ok "$HARVEST_MARKER" \
-   && pg_completed_lookup "$HARVEST_MARKER" "$OUT"; then
+   && [ -s "$(pg_completed_dir)/$HARVEST_MARKER" ] && pg_is_review "$(pg_completed_dir)/$HARVEST_MARKER"; then
+  # Full run identity BEFORE any status/ledger write (gate #54 r5 P2): without it this row
+  # landed as pr=diff with no round_key, invisible to --status/stats and unable to retire a
+  # dead active record. The RETURNED bytes come from a process-private snapshot of the
+  # write-once artifact (r5 P1): two markers sharing one caller --out can race the final
+  # rename, but each invocation still outputs and ledgers exactly the bytes it verified.
   HARVEST=1
   RUN_MARKER="$HARVEST_MARKER"
-  SALVAGED=1
-  echo "[oracle-review] review already collected (completed artifact); returning it — no browser touched, nothing spent." >&2
-  pg_status done "already collected; returned from $(pg_completed_dir)/$RUN_MARKER"
-  cat "$OUT"
-  echo "RESULT_FILE=$OUT"
-  pg_finish 0
+  PR_NUM="${HARVEST_MARKER#pg-run-}"; PR_NUM="${PR_NUM%-*-*}"
+  ROUND_KEY="$PR_NUM"
+  RESOLVED_MODEL="$(pg_reservation_read_model "$RUN_MARKER" 2>/dev/null || true)"
+  FASTPATH_ART="$(pg_completed_dir)/$RUN_MARKER"
+  FASTPATH_SNAP="$OUT.fastpath.$$"
+  if cp "$FASTPATH_ART" "$FASTPATH_SNAP" 2>/dev/null && pg_is_review "$FASTPATH_SNAP"; then
+    PG_OUT_SHA_OVERRIDE="$(pg_sha256 "$FASTPATH_SNAP")"
+    SALVAGED=1
+    echo "[oracle-review] review already collected (completed artifact); returning it — no browser touched, nothing spent." >&2
+    pg_status done "already collected; returned from $FASTPATH_ART"
+    cat "$FASTPATH_SNAP"
+    mv -f "$FASTPATH_SNAP" "$OUT" 2>/dev/null || true
+    echo "RESULT_FILE=$OUT"
+    pg_finish 0
+  fi
+  rm -f "$FASTPATH_SNAP" 2>/dev/null
 fi
 
 if [ "$MODE" = "remote-chrome" ]; then
@@ -641,7 +659,11 @@ if [ -n "$HARVEST_MARKER" ]; then
   pg_status salvaging "harvest up to ${HARVEST_SECS}s"
   HARVEST_RC=0
   HARVEST_TMP="$OUT.cdp.$$"
-  node "$SELF/cdp-salvage.mjs" "$RUN_MARKER" "$HARVEST_SECS" "$PORT" > "$HARVEST_TMP" || HARVEST_RC=$?
+  node "$SELF/cdp-salvage.mjs" "$RUN_MARKER" "$HARVEST_SECS" "$PORT" > "$HARVEST_TMP" 2> "$HARVEST_TMP.err" || HARVEST_RC=$?
+  [ -s "$HARVEST_TMP.err" ] && sed 's/^/[cdp-salvage] /' "$HARVEST_TMP.err" >&2
+  # v0.28 (gate #54 r5): the CDP child names its capture's exact source URL.
+  HARVEST_URL="$(sed -n 's/^matched-url //p' "$HARVEST_TMP.err" 2>/dev/null | tail -1)"
+  rm -f "$HARVEST_TMP.err"
   if [ "$HARVEST_RC" -eq 0 ] && pg_is_review "$HARVEST_TMP"; then
     # v0.28 (#48/#55): provenance before acceptance, positive binding first. A capture whose
     # VERDICT line echoes this run's nonce was provably written for this prompt — that
@@ -656,25 +678,25 @@ if [ -n "$HARVEST_MARKER" ]; then
       :  # positively bound to this run
     elif [ -s "$HARVEST_MANIFEST" ] && ! pg_review_matches_change "$HARVEST_TMP" "$HARVEST_MANIFEST"; then
       mv "$HARVEST_TMP" "$OUT.foreign.$$" 2>/dev/null || rm -f "$HARVEST_TMP"
-      pg_provenance_reject "$RUN_MARKER"
+      pg_provenance_reject "$RUN_MARKER" "${HARVEST_URL:-}"
       echo "ERROR: harvested a complete review with no run-marker echo that cites NONE of this change's files — foreign conversation suspected. Reservation kept, its memoized candidate invalidated; retry --harvest (the real review may still be generating). The rejected capture is at $OUT.foreign.$$ for inspection." >&2
       pg_status in-progress "harvested review failed provenance (no nonce, cites no change files); reservation kept"
       pg_finish 9
-    elif [ "${PRO_GATE_REQUIRE_NONCE:-1}" = 1 ] \
-         && { [ ! -s "$HARVEST_MANIFEST" ] || [ "$(pg_review_citation_count "$HARVEST_TMP")" -lt 2 ]; }; then
-      # FAIL CLOSED (gate #54 r3/r4): the capture has no nonce echo and the path check cannot
-      # bind it either (no manifest, or too few citations — a foreign SHIP/single-file review
-      # is indistinguishable here). Deliberately NOT conditional on the .nonce sidecar's
-      # existence: pre-v0.28 reservations, wrappers killed before persistence, and failed
-      # sidecar writes must not silently fail OPEN (r4 P1) — every v0.28 prompt promises the
-      # echo, and genuinely-legacy reservations age out within the 6h TTL. Preserve for retry
-      # or manual confirmation; PRO_GATE_REQUIRE_NONCE=0 restores best-effort acceptance.
+    elif [ "${PRO_GATE_REQUIRE_NONCE:-1}" = 1 ]; then
+      # NONCE OR NOTHING (gate #54 r3/r4/r5): under REQUIRE_NONCE, path overlap can only
+      # REJECT (foreign branch above), never ACCEPT — an OLDER answer for this very PR in the
+      # same marker-matched conversation cites overlapping files by nature, so overlap proves
+      # nothing about WHICH round answered (r5 P1). Deliberately independent of the .nonce
+      # sidecar's existence too: killed wrappers, failed sidecar writes, and pre-v0.28
+      # reservations must not fail OPEN (r4 P1); legacy reservations age out within the 6h
+      # TTL. Preserve for retry or manual confirmation; PRO_GATE_REQUIRE_NONCE=0 restores
+      # best-effort path-overlap acceptance.
       mv "$HARVEST_TMP" "$OUT.unbound.$$" 2>/dev/null || rm -f "$HARVEST_TMP"
       echo "ERROR: harvested a complete review that cannot be bound to this run (no run-marker echo; too few citations for the path check). Reservation kept. Inspect $OUT.unbound.$$ and confirm manually, retry --harvest, or set PRO_GATE_REQUIRE_NONCE=0 to accept best-effort captures." >&2
       pg_status in-progress "harvested review unbindable (no nonce, insufficient citations); reservation kept"
       pg_finish 9
     elif [ -f "$HARVEST_NONCE_FLAG" ]; then
-      echo "[oracle-review] NOTE: this run's prompt requested a run-marker echo but the capture carries none; accepted on path overlap instead." >&2
+      echo "[oracle-review] NOTE: PRO_GATE_REQUIRE_NONCE=0 — accepted a nonce-less capture on best-effort path overlap." >&2
     fi
     mv "$HARVEST_TMP" "$OUT"
     pg_strip_nonce "$OUT" "$RUN_MARKER"
@@ -1622,7 +1644,10 @@ if { [ "${SALVAGED:-0}" = 1 ] || [ "${REATTACHED:-0}" = 1 ]; } \
   # (possibly written by the early probe) points at the GENUINE current conversation;
   # blacklisting that would make the real review unrecoverable after a Chrome restart.
   # Discriminated by CAPTURE_SOURCE, not SALVAGED — reattach sets SALVAGED too (gate #54 r3).
-  [ "${CAPTURE_SOURCE:-}" = cdp ] && pg_provenance_reject "$RUN_MARKER"
+  # The CDP child names its capture's exact source URL in the run log (gate #54 r5).
+  if [ "${CAPTURE_SOURCE:-}" = cdp ]; then
+    pg_provenance_reject "$RUN_MARKER" "$(sed -n 's/^matched-url //p' "$RUNLOG" 2>/dev/null | tail -1)"
+  fi
   SALVAGE_RAN=1; SALVAGE_PRESERVE=1   # route to the reserve-and-harvest branch below
 fi
 # FAIL CLOSED for unbindable browser-matched captures (gate #54 r3): every v0.28 prompt
@@ -1633,12 +1658,11 @@ fi
 if { [ "${SALVAGED:-0}" = 1 ] || [ "${REATTACHED:-0}" = 1 ]; } \
    && pg_is_review "$OUT" \
    && [ "${PRO_GATE_REQUIRE_NONCE:-1}" = 1 ] \
-   && ! pg_capture_nonce_ok "$OUT" "$RUN_MARKER" \
-   && { [ "${CAPTURE_SOURCE:-}" = reattach ] \
-        || [ ! -s "$WORK/diff.paths" ] || [ "$(pg_review_citation_count "$OUT")" -lt 2 ]; }; then
-  # REATTACH captures require the nonce REGARDLESS of citation count (gate #54 r4 P1):
-  # reattach is slug-scoped and a stale prior session of the SAME PR naturally cites
-  # overlapping files — path overlap proves nothing about which round answered.
+   && ! pg_capture_nonce_ok "$OUT" "$RUN_MARKER"; then
+  # NONCE OR NOTHING for every browser-matched capture (gate #54 r4/r5 P1): reattach is
+  # slug-scoped and CDP is page-wide marker-scoped — in both, a STALE answer for this very
+  # PR naturally cites overlapping files, so path overlap can only reject (branch above),
+  # never accept. PRO_GATE_REQUIRE_NONCE=0 restores best-effort acceptance.
   echo "[oracle-review] captured a complete review that cannot be bound to this run (no run-marker echo; too few citations for the path check); NOT accepting it. Preserving for --harvest; inspect $OUT.unbound.$$ (PRO_GATE_REQUIRE_NONCE=0 accepts best-effort)." >&2
   mv "$OUT" "$OUT.unbound.$$" 2>/dev/null || rm -f "$OUT"
   SALVAGE_RAN=1; SALVAGE_PRESERVE=1

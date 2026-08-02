@@ -345,7 +345,14 @@ async function onOurConversation(url, text) {
   knownUrl = url;                // usable by the recovery branch from the very next cycle
   if (probe) { console.error(`live conversation: ${url}`); process.exit(0); }
   const review = extractReview(text);
-  if (review) { console.log(review); process.exit(0); }
+  if (review) {
+    // v0.28 (gate #54 r5): name the EXACT source of this capture so the engine can
+    // blacklist precisely on a provenance rejection — reading the shared memo afterwards
+    // races concurrent probes and can condemn the genuine conversation instead.
+    console.error(`matched-url ${url}`);
+    console.log(review);
+    process.exit(0);
+  }
   return url;                    // ours, but still generating
 }
 
