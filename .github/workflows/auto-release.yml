@@ -64,12 +64,27 @@ jobs:
             fi
             # #31 item 3: READ-ONLY marketplace-tuple verification (no redispatch — automatic
             # re-runs of privileged stages are how release loops happen). A published release
-            # whose marketplace entry never advanced is the one silent gap the asset check
-            # above cannot see; warn loudly and name the manual step.
-            mkt_version="$(curl -fsSL "https://raw.githubusercontent.com/StartupBros-com/hov-marketplace/main/.claude-plugin/marketplace.json" 2>/dev/null \
-              | jq -r '.plugins[] | select(.name == "pro-gate") | .metadata.version // empty' 2>/dev/null || true)"
-            if [ -n "$mkt_version" ] && [ "$mkt_version" != "$version" ]; then
-              echo "::warning::Marketplace still promotes pro-gate $mkt_version while the latest published release is $version. If the release train run for v$version is green this is propagation lag; otherwise re-run that release train (it is idempotent past promotion)."
+            # whose marketplace entry never advanced (or advanced with the wrong immutable
+            # tuple) is the one silent gap the asset check above cannot see. Verify the FULL
+            # tuple the release train promotes — sha, version, releaseId, releaseTag — and
+            # warn on fetch failure instead of swallowing it (gate #61 r1 P2).
+            if ! mkt_json="$(curl -fsS "https://raw.githubusercontent.com/StartupBros-com/hov-marketplace/main/.claude-plugin/marketplace.json")"; then
+              echo "::warning::Could not fetch the marketplace manifest to verify pro-gate v$version's promotion; check https://github.com/StartupBros-com/hov-marketplace manually."
+            elif ! mkt_entry="$(printf '%s' "$mkt_json" | jq -ce '[.plugins[] | select(.name == "pro-gate")] | first // empty')" || [ -z "$mkt_entry" ]; then
+              echo "::warning::Marketplace manifest has no readable pro-gate entry; cannot verify v$version's promotion."
+            else
+              rel_sha="$(git rev-list -n 1 "v$version" 2>/dev/null || true)"
+              rel_id="$(gh release view "v$version" --json databaseId --jq .databaseId 2>/dev/null || true)"
+              mkt_mismatch="$(printf '%s' "$mkt_entry" | jq -r \
+                --arg v "$version" --arg sha "$rel_sha" --arg id "$rel_id" --arg tag "v$version" '
+                [ (if (.metadata.version // "") != $v then "version=\(.metadata.version // "?") (want \($v))" else empty end),
+                  (if $sha != "" and (.source.sha // "") != $sha then "sha=\((.source.sha // "?")[0:8]) (want \($sha[0:8]))" else empty end),
+                  (if $id != "" and ((.metadata.releaseId // 0) | tostring) != $id then "releaseId=\(.metadata.releaseId // "?") (want \($id))" else empty end),
+                  (if (.metadata.releaseTag // "") != $tag then "releaseTag=\(.metadata.releaseTag // "?") (want \($tag))" else empty end)
+                ] | join(", ")')"
+              if [ -n "$mkt_mismatch" ]; then
+                echo "::warning::Marketplace tuple for pro-gate does not match published release v$version: $mkt_mismatch. If the release train run for v$version is green this is propagation lag; otherwise re-run that release train (it is idempotent past promotion)."
+              fi
             fi
             echo "due=false" >> "$GITHUB_OUTPUT"; exit 0
           fi

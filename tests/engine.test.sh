@@ -1385,4 +1385,43 @@ check 'harvest run persisted a per-run log' \
   "$([ -s "$TDIR/home-scratch/logs/$MHID.log" ]; echo $?)" \
   "logs: $(ls "$TDIR/home-scratch/logs" 2>/dev/null | tr '\n' ' ')"
 
+echo '# v0.30 gate r1: --status recoverable field is freshness-checked, and the daemon guard consumes it end-to-end'
+GHOME="$TDIR/home-guard"; mkdir -p "$GHOME/in-progress"
+cp "$HERE/../bin/oracle-review.sh" "$GHOME/oracle-review.sh"
+cp "$HERE/../lib/pro-gate-lib.sh" "$GHOME/lib.sh"
+chmod +x "$GHOME/oracle-review.sh"
+MRES="pg-run-acme-widgets-555-1700000000-77"
+printf '555\t/tmp/o555.md\t%s\t0\t1\tgpt\n' "$(date +%s)" > "$GHOME/in-progress/$MRES"
+env PRO_GATE_HOME="$GHOME" bash "$ENGINE" --status 555 --json >"$TDIR/grec.json" 2>"$TDIR/stderr"
+check 'unexpired reservation: recoverable=true' \
+  "$(jq -e '.recoverable == true' "$TDIR/grec.json" >/dev/null 2>&1; echo $?)" "$(jq -c '{recoverable,recoverable_reason}' "$TDIR/grec.json" 2>/dev/null)"
+# Same reservation, created 30000s ago (past the 21600s TTL): NOT recoverable.
+printf '555\t/tmp/o555.md\t%s\t0\t1\tgpt\n' "$(( $(date +%s) - 30000 ))" > "$GHOME/in-progress/$MRES"
+env PRO_GATE_HOME="$GHOME" bash "$ENGINE" --status 555 --json >"$TDIR/grec2.json" 2>"$TDIR/stderr"
+check 'expired reservation: recoverable=false' \
+  "$(jq -e '.recoverable == false' "$TDIR/grec2.json" >/dev/null 2>&1; echo $?)" "$(jq -c '{recoverable,recoverable_reason}' "$TDIR/grec2.json" 2>/dev/null)"
+# The daemon's guard, through the EXACT subprocess call it ships with (a broken --status
+# argument order shipped once because nothing exercised this path).
+printf '555\t/tmp/o555.md\t%s\t0\t1\tgpt\n' "$(date +%s)" > "$GHOME/in-progress/$MRES"
+( export PRO_GATE_HOME="$GHOME" PRO_GATE_DAEMON_LIB_ONLY=1
+  . "$HERE/../daemon/daemon.sh"
+  engine_state_recoverable "https://github.com/acme/widgets/pull/555" )
+check 'daemon guard sees the unexpired reservation (rc 0)' "$([ $? -eq 0 ]; echo $?)" ""
+rm -f "$GHOME/in-progress/$MRES"
+( export PRO_GATE_HOME="$GHOME" PRO_GATE_DAEMON_LIB_ONLY=1
+  . "$HERE/../daemon/daemon.sh"
+  engine_state_recoverable "https://github.com/acme/widgets/pull/555" )
+check 'daemon guard: no state means NOT recoverable (rc 1)' "$([ $? -ne 0 ]; echo $?)" ""
+
+echo '# v0.30 gate r1: pre-marker failures persist a provisional run log'
+PLHOME="$TDIR/home-prelog"; mkdir -p "$PLHOME"
+env PRO_GATE_HOME="$PLHOME" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" \
+  bash "$ENGINE" --pr 5 --repo "$TDIR/does-not-exist" --out "$TDIR/o-prelog.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'bad-repo run still exits 4' "$([ "$RC" -eq 4 ]; echo $?)" "rc=$RC"
+PLOG="$(find "$PLHOME/logs" -name 'pg-run-unidentified-*.log' -size +0c 2>/dev/null | head -1)"
+check 'provisional run log persisted for the pre-marker failure' "$([ -n "$PLOG" ]; echo $?)" "logs: $(ls "$PLHOME/logs" 2>/dev/null | tr '\n' ' ')"
+
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }

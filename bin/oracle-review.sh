@@ -164,6 +164,17 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
   trap 'rm -rf "$ST_TMP"' EXIT
   : > "$ST_TMP/res.jsonl"; : > "$ST_TMP/rounds.jsonl"; : > "$ST_TMP/ledger.jsonl"
   ST_HINT=""
+  # v0.30 (#52 item 1): machine-consumable recoverability. recoverable=true means "a paid
+  # review is live or still collectable WITHOUT a new spend — do not treat this change's
+  # failure as terminal". Computed ONLY from freshness-checked state (unexpired reservation,
+  # live per-change lock/pid, fresh dead-wrapper on a harvest-capable mode), never from hint
+  # prose, so automation (the daemon's fail-budget guard) cannot rot when wording changes.
+  # Static-but-collectable states (failed run with a URL memo, in-progress ledger history)
+  # deliberately do NOT set it: retrying those is charged work, bounded by the caller's own
+  # fail budget, not an open-ended deferral.
+  ST_RECOVERABLE=0; ST_RECOVER_REASON=""
+  ST_RES_TTL="${PRO_GATE_RESERVATION_TTL:-21600}"
+  case "$ST_RES_TTL" in ''|*[!0-9]*) ST_RES_TTL=21600;; esac
 
   # 1) Reservations: in-progress runs whose review is collectable for FREE.
   if [ -d "$ST_RES_DIR" ]; then
@@ -174,6 +185,13 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
       IFS=$'\t' read -r r_pr r_out r_created r_miss r_slot r_model < "$f" 2>/dev/null || true
       st_match "$m" "$r_pr" || continue
       case "$r_created" in ''|*[!0-9]*) r_age="";; *) r_age=$(( ST_NOW - r_created ));; esac
+      # Only an UNEXPIRED reservation marks the change recoverable: an expired one will be
+      # reaped at the next fresh-run reconciliation, and treating it as live would let a
+      # repeatedly-failing caller defer forever (gate #61 r1 P1).
+      if [ -z "$r_age" ] || [ "$r_age" -lt "$ST_RES_TTL" ] 2>/dev/null; then
+        ST_RECOVERABLE=1
+        [ -n "$ST_RECOVER_REASON" ] || ST_RECOVER_REASON="unexpired in-progress reservation ($m)"
+      fi
       r_url=""; [ -f "$ST_URLS_DIR/$m" ] && r_url="$(head -c 300 "$ST_URLS_DIR/$m" 2>/dev/null | tr -d '\n')"
       [ -n "$r_out" ] || r_out="${TMPDIR:-/tmp}/pro-gate-${r_pr:-review}.md"
       r_cmd="$ST_ENGINE --harvest '$m' --out '$r_out' --timeout 20m"
@@ -257,7 +275,12 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
       case "$k" in "${Q_SLUG:+${Q_SLUG}-}${Q_NUM}"|*"-${Q_NUM}") [ -z "$Q_SLUG" ] || [ "$k" = "${Q_SLUG}-${Q_NUM}" ] || continue;; *) continue;; esac
     fi
     spent="$(pg_round_count "$k")"
-    k_live=0; st_inflight "$k" && { k_live=1; ST_INFLIGHT_KEY="$k"; }
+    k_live=0
+    if st_inflight "$k"; then
+      k_live=1; ST_INFLIGHT_KEY="$k"
+      ST_RECOVERABLE=1
+      [ -n "$ST_RECOVER_REASON" ] || ST_RECOVER_REASON="a same-change run holds the per-change lock ($k)"
+    fi
     # Active-run index: sees a live run before any reservation/ledger row exists, AND the
     # wrapper-died-mid-generation case (which releases the flock, so st_inflight misses it).
     a_marker=""; a_out=""; a_pid=""; a_epoch=""; a_mode=""; a_alive=""
@@ -266,12 +289,23 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
       case "$a_pid" in ''|*[!0-9]*) a_alive=0;; *) if kill -0 "$a_pid" 2>/dev/null; then a_alive=1; else a_alive=0; fi;; esac
       if [ "$a_alive" = 1 ]; then
         k_live=1; ST_INFLIGHT_KEY="$k"
+        ST_RECOVERABLE=1
+        [ -n "$ST_RECOVER_REASON" ] || ST_RECOVER_REASON="a same-change run is live (pid ${a_pid})"
         [ -n "$ST_ACTIVE_HINT" ] || ST_ACTIVE_HINT="a same-change review is RUNNING right now (pid ${a_pid}): poll ${a_out}.status — do NOT launch another"
       elif [ "$a_mode" = native ]; then
         # Native has no marker-addressable harvest (--harvest exits 3 there): pointing at it
         # would be an unusable loop that never clears (gate #53 r2 P1). Manual recovery only.
         [ -n "$ST_ACTIVE_HINT" ] || ST_ACTIVE_HINT="the last run's wrapper DIED (native mode: no harvest path) — check ${a_out} and ${a_out}.status, and look for the conversation in the ChatGPT UI; once resolved, rm '$PRO_GATE_HOME/active/$k' to retire this notice (it also expires with the 24h sweep)"
       elif [ -n "$a_marker" ]; then
+        # Recoverable only while FRESH: past the reservation TTL the browser is not still
+        # generating; the stale record is debris awaiting the 24h sweep (gate #61 r1 P1).
+        case "$a_epoch" in
+          ''|*[!0-9]*) : ;;
+          *) if [ $(( ST_NOW - a_epoch )) -lt "$ST_RES_TTL" ]; then
+               ST_RECOVERABLE=1
+               [ -n "$ST_RECOVER_REASON" ] || ST_RECOVER_REASON="dead wrapper, browser may still be generating ($a_marker)"
+             fi ;;
+        esac
         [ -n "$ST_ACTIVE_HINT" ] || ST_ACTIVE_HINT="the last run's wrapper DIED but the browser may still be generating — recover by marker, never a fresh run: $ST_ENGINE --harvest '$a_marker' --out '${a_out:-${TMPDIR:-/tmp}/pro-gate-recovered.md}' --timeout 20m"
       fi
     fi
@@ -364,15 +398,19 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
 
   if [ "$AS_JSON" = 1 ]; then
     jq -n --arg query "${STATUS_QUERY:-all}" --arg home "$PRO_GATE_HOME" --arg hint "$ST_HINT" \
+      --arg rec "$ST_RECOVERABLE" --arg rec_reason "$ST_RECOVER_REASON" \
       --slurpfile res <(cat "$ST_TMP/res.jsonl" 2>/dev/null; echo null) \
       --slurpfile rounds <(cat "$ST_TMP/rounds.jsonl" 2>/dev/null; echo null) \
       --slurpfile ledger <(cat "$ST_TMP/ledger.jsonl" 2>/dev/null; echo null) \
       --slurpfile artifacts <(cat "$ST_TMP/artifacts.jsonl" 2>/dev/null; echo null) \
-      '{query:$query,home:$home,reservations:($res[:-1]),completed_artifacts:($artifacts[:-1]),rounds:($rounds[:-1]),recent_runs:($ledger[:-1]),next_step:$hint}'
+      '{query:$query,home:$home,recoverable:($rec == "1"),recoverable_reason:$rec_reason,reservations:($res[:-1]),completed_artifacts:($artifacts[:-1]),rounds:($rounds[:-1]),recent_runs:($ledger[:-1]),next_step:$hint}'
     exit 0
   fi
 
   echo "[pro-gate status] query: ${STATUS_QUERY:-all}   home: $PRO_GATE_HOME"
+  if [ "$ST_RECOVERABLE" = 1 ]; then
+    echo "recoverable: YES — ${ST_RECOVER_REASON} (do not treat this change's failure as terminal; no new spend needed)"
+  fi
   if [ -s "$ST_TMP/res.jsonl" ] || [ -s "$ST_TMP/res.tsv" ]; then
     echo "in-progress reservations (harvest these for FREE — never re-run):"
     if pg_have jq && [ -s "$ST_TMP/res.jsonl" ]; then
@@ -433,9 +471,12 @@ pg_scratch_cleanup() {
     wait "$PG_RUNLOG_TEE_PID" 2>/dev/null || true
     PG_RUNLOG_TEE_PID=""
   fi
-  if [ "${PRO_GATE_RUN_LOGS:-1}" = 1 ] && [ -n "${RUN_MARKER:-}" ] && [ -s "$WORK/run.log" ]; then
+  # Pre-marker failures (browser preflight, bad repo, diff fetch, oversized) are exactly the
+  # outage diagnostics worth keeping (gate #61 r1 P2): persist under a provisional identity
+  # when the run died before earning a marker.
+  if [ "${PRO_GATE_RUN_LOGS:-1}" = 1 ] && [ -s "$WORK/run.log" ]; then
     mkdir -p "$PRO_GATE_HOME/logs" 2>/dev/null \
-      && cp -f "$WORK/run.log" "$PRO_GATE_HOME/logs/${RUN_MARKER}.log" 2>/dev/null || true
+      && cp -f "$WORK/run.log" "$PRO_GATE_HOME/logs/${RUN_MARKER:-$PG_RUNLOG_ID}.log" 2>/dev/null || true
   fi
   [ "${PG_KEEP_FINAL:-0}" = 1 ] && return 0
   [ "${PG_PRESERVE_STATE:-0}" = 1 ] && return 0
@@ -453,6 +494,9 @@ trap pg_scratch_cleanup EXIT
 # tee whose output goes to the SAVED original stderr (fd 3); the EXIT trap restores fd 2,
 # drains the tee, and persists the log to logs/<marker>.log. PRO_GATE_RUN_LOGS=0 disables.
 if [ "${PRO_GATE_RUN_LOGS:-1}" = 1 ]; then
+  # Provisional log identity for runs that die before a marker exists; matches the
+  # pg-run-*.log sweep pattern so it ages out like every other run log.
+  PG_RUNLOG_ID="pg-run-unidentified-$(date +%s)-$$"
   exec 3>&2 2> >(tee -a "$WORK/run.log" >&3)
   PG_RUNLOG_TEE_PID=$!
 fi

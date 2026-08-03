@@ -16,6 +16,28 @@ type pg_os >/dev/null 2>&1 || { echo "ERROR: pro-gate lib not found (lib.sh)" >&
 pg_augment_path; pg_load_env
 OS="$(pg_os)"; MODE="$(pg_browser_mode)"
 
+# #52 item 1: read-only probe of the ENGINE's state for a PR before treating an agent
+# failure as a review failure. The engine computes `recoverable` itself from freshness-checked
+# state (unexpired reservation, live per-change lock/pid, fresh dead-wrapper on a
+# harvest-capable mode) — the daemon consumes the structured field, never hint prose, so a
+# wording change cannot rot this guard, and expired/stale state cannot defer forever
+# (gate #61 r1 P1 x2). Fail-open to note_fail when --status is unavailable.
+engine_state_recoverable(){ # $1 = PR url
+  local eng js
+  eng="${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh"
+  [ -x "$eng" ] && command -v jq >/dev/null 2>&1 || return 1
+  js="$("$eng" --status "$1" --json 2>/dev/null)" || return 1
+  [ -n "$js" ] || return 1
+  printf '%s' "$js" | jq -e '.recoverable == true' >/dev/null 2>&1
+}
+
+# Test seam: `PRO_GATE_DAEMON_LIB_ONLY=1 . daemon.sh` loads the functions above and stops —
+# no config validation, no watch loop (tests exercise engine_state_recoverable's EXACT
+# engine subprocess call; a broken argument order shipped once because nothing did).
+if [ "${PRO_GATE_DAEMON_LIB_ONLY:-0}" = 1 ]; then
+  return 0 2>/dev/null || exit 0
+fi
+
 privileged_runtime_ready() {
   local installed expected plugin_v
   installed="$(pg_runtime_version)"
@@ -150,26 +172,6 @@ usage_gate(){
     if usage_saturated; then SATURATED=1; else SATURATED=0; fi
   fi
   [ "$SATURATED" = 1 ]
-}
-
-# #52 item 1: read-only probe of the ENGINE's state for a PR before treating an agent
-# failure as a review failure. Recoverable states — an in-progress reservation (harvest is
-# free), a run holding the per-change lock right now, or a dead wrapper whose browser may
-# still be generating — mean the paid review is (or may become) collectable without a new
-# spend; charging the fail budget for those can permanently strand it behind MAX_FAILS.
-# Every recognized state is transient by construction (reservation TTL, 24h active-index
-# sweep, lock lifetime, in-progress ledger hint superseded by the harvest's own newer row),
-# so deferral cannot loop forever. Fail-open to note_fail when --status is unavailable.
-engine_state_recoverable(){ # $1 = PR url
-  local eng js
-  eng="${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh"
-  [ -x "$eng" ] && command -v jq >/dev/null 2>&1 || return 1
-  js="$("$eng" --status --json "$1" 2>/dev/null)" || return 1
-  [ -n "$js" ] || return 1
-  printf '%s' "$js" | jq -e '
-    (((.reservations // []) | length) > 0)
-    or ((.next_step // "") | test("RUNNING right now|wrapper DIED|harvest it for FREE"))
-  ' >/dev/null 2>&1
 }
 
 # Count a failed attempt for repo#pr@sha (ANY failure class: clone, worktree, claude run) and
