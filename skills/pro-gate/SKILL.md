@@ -215,8 +215,10 @@ While waiting, never spawn a second oracle run for the same PR. The status JSON 
 Engine exit codes: `0` review ready · `2` bad usage · `3` oracle/browser missing · `4` repo not
 found · `5` diff fetch failed · `6` ran but no usable review (quota may be spent — check the PR
 conversation in ChatGPT before re-running; on a low-memory box this often means the review browser
-restarted mid-run — the status `detail` says so, the review may still exist, free memory and retry
-rather than blindly re-run) · `7` lock timeout · `8` deferred, NO quota spent
+restarted mid-run — the status `detail` says so, the review may still exist. When that `detail`
+says the conversation URL was remembered, the run also printed an exact FREE `--harvest` command
+(and `--status <pr>` reprints it): run that first — it collects the completed review with no new
+spend. Only when no URL was remembered: free memory and retry rather than blindly re-run) · `7` lock timeout · `8` deferred, NO quota spent
 (box unfit, low memory, or throttle cooldown: safe to retry later) · `9` in-progress: the slot IS spent but
 the model was still generating when the salvage budget ran out; the conversation tab is left
 open: never submit a NEW review for it — harvest by marker instead (below; the engine's

@@ -424,7 +424,7 @@ pg_cdp_heal() {
 # generating. Process-owned flock slots disappear when exit 9 releases the engine; without a
 # durable reservation, a second run immediately under-counts real live Pro tabs and can double-
 # spend the same PR. One file per marker survives the process:
-#   $PRO_GATE_HOME/in-progress/<marker> = "pr<TAB>out<TAB>created_epoch<TAB>miss_streak"
+#   $PRO_GATE_HOME/in-progress/<marker> = "pr<TAB>out<TAB>created_epoch<TAB>miss_streak<TAB>slot<TAB>model"
 # Fresh runs reconcile files via marker probes and subtract the count from effective semaphore
 # capacity. Live resets the miss streak; throttle/inconclusive stays fail-closed; only several
 # consecutive confirmed absences release the reservation before TTL.

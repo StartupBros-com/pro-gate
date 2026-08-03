@@ -152,9 +152,32 @@ usage_gate(){
   [ "$SATURATED" = 1 ]
 }
 
+# #52 item 1: read-only probe of the ENGINE's state for a PR before treating an agent
+# failure as a review failure. Recoverable states — an in-progress reservation (harvest is
+# free), a run holding the per-change lock right now, or a dead wrapper whose browser may
+# still be generating — mean the paid review is (or may become) collectable without a new
+# spend; charging the fail budget for those can permanently strand it behind MAX_FAILS.
+# Every recognized state is transient by construction (reservation TTL, 24h active-index
+# sweep, lock lifetime, in-progress ledger hint superseded by the harvest's own newer row),
+# so deferral cannot loop forever. Fail-open to note_fail when --status is unavailable.
+engine_state_recoverable(){ # $1 = PR url
+  local eng js
+  eng="${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh"
+  [ -x "$eng" ] && command -v jq >/dev/null 2>&1 || return 1
+  js="$("$eng" --status --json "$1" 2>/dev/null)" || return 1
+  [ -n "$js" ] || return 1
+  printf '%s' "$js" | jq -e '
+    (((.reservations // []) | length) > 0)
+    or ((.next_step // "") | test("RUNNING right now|wrapper DIED|harvest it for FREE"))
+  ' >/dev/null 2>&1
+}
+
 # Count a failed attempt for repo#pr@sha (ANY failure class: clone, worktree, claude run) and
 # give up permanently after MAX_FAILS — previously only claude-run failures were counted, so a
 # broken clone/worktree retried every cycle forever.
+# #50 item 6: $FAILS (failcount.tsv) tracks DAEMON-WRAPPER orchestration failures only
+# (clone/worktree/agent rc!=0). Engine-level outcomes live in the engine's own ledger.jsonl;
+# the two records are deliberately separate and are not expected to reconcile.
 note_fail(){ # nwo num sha log reason
   printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$FAILS"
   local fc; fc=$(grep -cF "$(printf '%s\t%s\t%s' "$1" "$2" "$3")" "$FAILS" 2>/dev/null || echo 1)
@@ -218,7 +241,12 @@ CRITICAL: do NOT merge the PR, do NOT open new PRs, do NOT change the base branc
     return 2
   fi
 
-  ( cd "$wt" && timeout 5400 claude -p "$prompt" \
+  # #52 item 1: 5400s was ~78% SHORTER than the engine's worst-case single-invocation
+  # envelope (2x lock waits + primary + retries + salvage ≈ 160 min), so the daemon could
+  # kill a run after the Pro slot was spent but before recoverable state persisted. The
+  # bound now covers the envelope; the recoverable-state guard below makes an overrun
+  # non-catastrophic either way.
+  ( cd "$wt" && timeout "${PRO_REVIEW_AGENT_TIMEOUT:-10800}" claude -p "$prompt" \
         --model "$CLAUDE_MODEL" \
         --fallback-model "$FALLBACK_MODEL" \
         --max-budget-usd "$MAX_BUDGET" \
@@ -236,6 +264,17 @@ CRITICAL: do NOT merge the PR, do NOT open new PRs, do NOT change the base branc
     [ -n "$newsha" ] && [ "$newsha" != "$sha" ] && mark_done "$nwo" "$num" "$newsha"
     log "  ✓ done $nwo#$num (rc=0; head now ${newsha:0:8})"
   else
+    # #52 item 1: a timeout/failure of the AGENT is not a failure of the REVIEW. When the
+    # engine holds recoverable state for this PR (live run, in-progress reservation, dead
+    # wrapper with the browser possibly still generating), charging the retry budget can
+    # strand a paid, collectable review behind MAX_FAILS. Ask the engine read-only and defer
+    # instead: the next cycle's fresh dispatch lands in the engine's own same-change redirect
+    # / idempotent-harvest paths without a second spend, and every deferring state is
+    # naturally bounded (reservation TTL, active-index sweep, lock lifetime).
+    if engine_state_recoverable "$url"; then
+      log "  ! $nwo#$num agent rc=$rc but the engine holds recoverable review state — deferring, fail budget untouched"
+      return 2
+    fi
     note_fail "$nwo" "$num" "$sha" "$lg" "claude run rc=$rc"
   fi
 }

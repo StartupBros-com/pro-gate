@@ -62,6 +62,15 @@ jobs:
             else
               echo "::warning::Tag v$version exists but its release/assets are missing or incomplete. The chain does NOT self-retry past tag creation: rerun the 'Release runtime' workflow for v$version (or delete the tag+release to let auto-release retry), then check the release train run."
             fi
+            # #31 item 3: READ-ONLY marketplace-tuple verification (no redispatch — automatic
+            # re-runs of privileged stages are how release loops happen). A published release
+            # whose marketplace entry never advanced is the one silent gap the asset check
+            # above cannot see; warn loudly and name the manual step.
+            mkt_version="$(curl -fsSL "https://raw.githubusercontent.com/StartupBros-com/hov-marketplace/main/.claude-plugin/marketplace.json" 2>/dev/null \
+              | jq -r '.plugins[] | select(.name == "pro-gate") | .metadata.version // empty' 2>/dev/null || true)"
+            if [ -n "$mkt_version" ] && [ "$mkt_version" != "$version" ]; then
+              echo "::warning::Marketplace still promotes pro-gate $mkt_version while the latest published release is $version. If the release train run for v$version is green this is propagation lag; otherwise re-run that release train (it is idempotent past promotion)."
+            fi
             echo "due=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
           echo "due=true" >> "$GITHUB_OUTPUT"
