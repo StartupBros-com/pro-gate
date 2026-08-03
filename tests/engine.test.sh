@@ -1424,4 +1424,50 @@ check 'bad-repo run still exits 4' "$([ "$RC" -eq 4 ]; echo $?)" "rc=$RC"
 PLOG="$(find "$PLHOME/logs" -name 'pg-run-unidentified-*.log' -size +0c 2>/dev/null | head -1)"
 check 'provisional run log persisted for the pre-marker failure' "$([ -n "$PLOG" ]; echo $?)" "logs: $(ls "$PLHOME/logs" 2>/dev/null | tr '\n' ' ')"
 
+echo '# v0.30 gate r2: EXIT handlers chain instead of clobbering (no-flock lock cleanup vs scratch cleanup)'
+( cd "$TDIR" && bash -c '
+  . "'"$HERE"'/../lib/pro-gate-lib.sh"
+  pg_on_exit "touch \"'"$TDIR"'/exit-a\""
+  pg_on_exit "touch \"'"$TDIR"'/exit-b\""
+  exit 0' )
+check 'both chained EXIT handlers ran' \
+  "$([ -f "$TDIR/exit-a" ] && [ -f "$TDIR/exit-b" ]; echo $?)" "$(ls "$TDIR"/exit-* 2>/dev/null | tr '\n' ' ')"
+
+echo '# v0.30 gate r2: pid reuse cannot resurrect a dead run (token-verified liveness)'
+TOKHOME="$TDIR/home-token"; mkdir -p "$TOKHOME/active"
+NOWEP="$(date +%s)"
+# A recycled pid: pid 1 is alive but its token cannot match the recorded garbage token.
+printf 'pg-run-acme-widgets-888-1700000000-1\t/tmp/o888.md\t1\t%s\tremote-chrome\tBOGUS-TOKEN\n' "$NOWEP" \
+  > "$TOKHOME/active/acme-widgets-888"
+env PRO_GATE_HOME="$TOKHOME" bash "$ENGINE" --status 888 --json >"$TDIR/tok1.json" 2>"$TDIR/stderr"
+check 'token mismatch: pid-1 record is NOT a live run' \
+  "$(jq -e '(.next_step // "") | test("RUNNING right now") | not' "$TDIR/tok1.json" >/dev/null 2>&1; echo $?)" \
+  "next_step: $(jq -r .next_step "$TDIR/tok1.json" 2>/dev/null)"
+# Our own live pid with its real token: genuinely live, recoverable.
+MYTOK="$(bash -c '. "'"$HERE"'/../lib/pro-gate-lib.sh"; pg_pid_token '"$$"'')"
+printf 'pg-run-acme-widgets-888-1700000000-1\t/tmp/o888.md\t%s\t%s\tremote-chrome\t%s\n' "$$" "$NOWEP" "$MYTOK" \
+  > "$TOKHOME/active/acme-widgets-888"
+env PRO_GATE_HOME="$TOKHOME" bash "$ENGINE" --status 888 --json >"$TDIR/tok2.json" 2>"$TDIR/stderr"
+check 'matching token: live run is recoverable' \
+  "$(jq -e '.recoverable == true' "$TDIR/tok2.json" >/dev/null 2>&1; echo $?)" \
+  "$(jq -c '{recoverable,recoverable_reason}' "$TDIR/tok2.json" 2>/dev/null)"
+# Stale token-less record (legacy 5-field) whose epoch is PAST the TTL: not recoverable even
+# when the recorded pid is alive (pid 1 again — reuse with no token to disprove it).
+printf 'pg-run-acme-widgets-888-1700000000-1\t/tmp/o888.md\t1\t%s\tremote-chrome\n' "$(( NOWEP - 30000 ))" \
+  > "$TOKHOME/active/acme-widgets-888"
+env PRO_GATE_HOME="$TOKHOME" bash "$ENGINE" --status 888 --json >"$TDIR/tok3.json" 2>"$TDIR/stderr"
+check 'legacy stale record past TTL: not recoverable' \
+  "$(jq -e '.recoverable == false' "$TDIR/tok3.json" >/dev/null 2>&1; echo $?)" \
+  "$(jq -c '{recoverable,recoverable_reason}' "$TDIR/tok3.json" 2>/dev/null)"
+
+echo '# v0.30 gate r2: a harvest never clobbers the original run log'
+LOGN1="$(find "$TDIR/home-scratch/logs" -name "$MHID*" 2>/dev/null | wc -l | tr -d ' ')"
+env PRO_GATE_HOME="$TDIR/home-scratch" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" \
+  bash "$ENGINE" --harvest "$MHID" --out "$TDIR/o-hid2.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+LOGN2="$(find "$TDIR/home-scratch/logs" -name "$MHID*" 2>/dev/null | wc -l | tr -d ' ')"
+check 'second invocation adds a log instead of overwriting' \
+  "$([ "$LOGN2" -gt "$LOGN1" ]; echo $?)" "before=$LOGN1 after=$LOGN2"
+
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }

@@ -103,14 +103,20 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
   # ledger row yet, where "no state found" would wrongly invite a duplicate launch. Read-only:
   # probe only locks that already exist (opening would otherwise create the file).
   st_inflight() {  # $1 = round key -> rc 0 when a same-change run holds the lock now
-    local lf="${ST_LOCKFILE}.pr-$1" pfd opid
+    local lf="${ST_LOCKFILE}.pr-$1" pfd opid otok
     if [ -d "${lf}.d" ]; then
       # mkdir-fallback lock (no flock, e.g. stock macOS): live only when the recorded owner
       # is a running pid. A dead/absent owner is a stale dir from SIGKILL/reboot — pg_lock
       # self-heals it at the next acquisition; report it NOT live, mutate nothing
       # (gate #53 r3 P1: existence alone reported stale locks as RUNNING forever).
       opid="$(cat "${lf}.d/pid" 2>/dev/null || true)"
-      case "$opid" in ''|*[!0-9]*) return 1;; *) kill -0 "$opid" 2>/dev/null; return $?;; esac
+      case "$opid" in ''|*[!0-9]*) return 1;; esac
+      kill -0 "$opid" 2>/dev/null || return 1
+      # Token-verify when the lock recorded one: a recycled pid must not report a long-dead
+      # holder as RUNNING (gate #61 r2 P1). Token-less locks (legacy) keep the pid-only check.
+      otok="$(cat "${lf}.d/token" 2>/dev/null || true)"
+      [ -z "$otok" ] || [ "$(pg_pid_token "$opid" 2>/dev/null || true)" = "$otok" ] || return 1
+      return 0
     fi
     [ -e "$lf" ] || return 1
     pg_have flock || return 1
@@ -283,14 +289,26 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
     fi
     # Active-run index: sees a live run before any reservation/ledger row exists, AND the
     # wrapper-died-mid-generation case (which releases the flock, so st_inflight misses it).
-    a_marker=""; a_out=""; a_pid=""; a_epoch=""; a_mode=""; a_alive=""
+    a_marker=""; a_out=""; a_pid=""; a_epoch=""; a_mode=""; a_token=""; a_alive=""; a_fresh=0
     if [ -f "$PRO_GATE_HOME/active/$k" ]; then
-      IFS=$'\t' read -r a_marker a_out a_pid a_epoch a_mode < "$PRO_GATE_HOME/active/$k" 2>/dev/null || true
+      IFS=$'\t' read -r a_marker a_out a_pid a_epoch a_mode a_token < "$PRO_GATE_HOME/active/$k" 2>/dev/null || true
+      # Liveness = pid alive AND, when the record carries a process-identity token, the token
+      # still matches — a recycled pid must not resurrect a dead run (gate #61 r2 P1). Legacy
+      # token-less records keep the pid-only check but never extend past the freshness bound.
       case "$a_pid" in ''|*[!0-9]*) a_alive=0;; *) if kill -0 "$a_pid" 2>/dev/null; then a_alive=1; else a_alive=0; fi;; esac
+      if [ "$a_alive" = 1 ] && [ -n "$a_token" ]; then
+        [ "$(pg_pid_token "$a_pid" 2>/dev/null || true)" = "$a_token" ] || a_alive=0
+      fi
+      case "$a_epoch" in
+        ''|*[!0-9]*) : ;;
+        *) [ $(( ST_NOW - a_epoch )) -lt "$ST_RES_TTL" ] && [ "$a_epoch" -le "$ST_NOW" ] && a_fresh=1 ;;
+      esac
       if [ "$a_alive" = 1 ]; then
         k_live=1; ST_INFLIGHT_KEY="$k"
-        ST_RECOVERABLE=1
-        [ -n "$ST_RECOVER_REASON" ] || ST_RECOVER_REASON="a same-change run is live (pid ${a_pid})"
+        if [ "$a_fresh" = 1 ] || [ -n "$a_token" ]; then
+          ST_RECOVERABLE=1
+          [ -n "$ST_RECOVER_REASON" ] || ST_RECOVER_REASON="a same-change run is live (pid ${a_pid})"
+        fi
         [ -n "$ST_ACTIVE_HINT" ] || ST_ACTIVE_HINT="a same-change review is RUNNING right now (pid ${a_pid}): poll ${a_out}.status — do NOT launch another"
       elif [ "$a_mode" = native ]; then
         # Native has no marker-addressable harvest (--harvest exits 3 there): pointing at it
@@ -299,13 +317,10 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
       elif [ -n "$a_marker" ]; then
         # Recoverable only while FRESH: past the reservation TTL the browser is not still
         # generating; the stale record is debris awaiting the 24h sweep (gate #61 r1 P1).
-        case "$a_epoch" in
-          ''|*[!0-9]*) : ;;
-          *) if [ $(( ST_NOW - a_epoch )) -lt "$ST_RES_TTL" ]; then
-               ST_RECOVERABLE=1
-               [ -n "$ST_RECOVER_REASON" ] || ST_RECOVER_REASON="dead wrapper, browser may still be generating ($a_marker)"
-             fi ;;
-        esac
+        if [ "$a_fresh" = 1 ]; then
+          ST_RECOVERABLE=1
+          [ -n "$ST_RECOVER_REASON" ] || ST_RECOVER_REASON="dead wrapper, browser may still be generating ($a_marker)"
+        fi
         [ -n "$ST_ACTIVE_HINT" ] || ST_ACTIVE_HINT="the last run's wrapper DIED but the browser may still be generating — recover by marker, never a fresh run: $ST_ENGINE --harvest '$a_marker' --out '${a_out:-${TMPDIR:-/tmp}/pro-gate-recovered.md}' --timeout 20m"
       fi
     fi
@@ -473,10 +488,14 @@ pg_scratch_cleanup() {
   fi
   # Pre-marker failures (browser preflight, bad repo, diff fetch, oversized) are exactly the
   # outage diagnostics worth keeping (gate #61 r1 P2): persist under a provisional identity
-  # when the run died before earning a marker.
+  # when the run died before earning a marker. Never clobber (gate #61 r2 P2): harvests reuse
+  # the fresh run's marker, and each invocation's diagnostics must survive independently —
+  # later invocations land as <marker>.<epoch>.<pid>.log (still swept by the pg-run-* glob).
   if [ "${PRO_GATE_RUN_LOGS:-1}" = 1 ] && [ -s "$WORK/run.log" ]; then
+    _logdst="$PRO_GATE_HOME/logs/${RUN_MARKER:-$PG_RUNLOG_ID}.log"
+    [ -e "$_logdst" ] && _logdst="$PRO_GATE_HOME/logs/${RUN_MARKER:-$PG_RUNLOG_ID}.$(date +%s).$$.log"
     mkdir -p "$PRO_GATE_HOME/logs" 2>/dev/null \
-      && cp -f "$WORK/run.log" "$PRO_GATE_HOME/logs/${RUN_MARKER:-$PG_RUNLOG_ID}.log" 2>/dev/null || true
+      && cp "$WORK/run.log" "$_logdst" 2>/dev/null || true
   fi
   [ "${PG_KEEP_FINAL:-0}" = 1 ] && return 0
   [ "${PG_PRESERVE_STATE:-0}" = 1 ] && return 0
@@ -489,7 +508,7 @@ pg_scratch_cleanup() {
   esac
   return 0
 }
-trap pg_scratch_cleanup EXIT
+pg_on_exit pg_scratch_cleanup
 # #50 item 8: per-run diagnostics are durable again. Mirror stderr into $WORK/run.log via a
 # tee whose output goes to the SAVED original stderr (fd 3); the EXIT trap restores fd 2,
 # drains the tee, and persists the log to logs/<marker>.log. PRO_GATE_RUN_LOGS=0 disables.
@@ -630,7 +649,9 @@ pg_active_write() {
   mkdir -p "$(pg_active_dir)" 2>/dev/null || return 0
   # 5th field: browser mode — recovery differs (native has no marker-addressable harvest, so a
   # dead native wrapper must NOT be routed into a --harvest loop that always exits 3).
-  printf '%s\t%s\t%s\t%s\t%s\n' "${RUN_MARKER:-}" "$OUT" "$$" "$(date +%s)" "$MODE" \
+  # 6th field: process-identity token — pid reuse must not resurrect a dead run (gate #61 r2).
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "${RUN_MARKER:-}" "$OUT" "$$" "$(date +%s)" "$MODE" \
+    "$(pg_pid_token "$$" 2>/dev/null || true)" \
     > "$(pg_active_dir)/$ROUND_KEY" 2>/dev/null && PG_ACTIVE_WRITTEN=1
   return 0
 }
