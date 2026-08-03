@@ -1415,7 +1415,10 @@ check 'daemon guard: no state means NOT recoverable (rc 1)' "$([ $? -ne 0 ]; ech
 
 echo '# v0.30 gate r1: pre-marker failures persist a provisional run log'
 PLHOME="$TDIR/home-prelog"; mkdir -p "$PLHOME"
-env PRO_GATE_HOME="$PLHOME" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+# ORACLE_BROWSER_PORT must point at the mock: without it the engine probes the default CDP
+# port, which exists on a dev box with a live Chrome (reaching the repo check, exit 4) but
+# not on CI (exit 3 at browser preflight) — the exact leak that failed the v0.30.0 release.
+env PRO_GATE_HOME="$PLHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
   PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" \
   bash "$ENGINE" --pr 5 --repo "$TDIR/does-not-exist" --out "$TDIR/o-prelog.md" --timeout 5s \
   >"$TDIR/stdout" 2>"$TDIR/stderr"
