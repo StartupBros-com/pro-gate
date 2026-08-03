@@ -195,6 +195,34 @@ pg_file_sig() {
 
 # Cross-process lock — waits up to $2 seconds; returns 0 acquired / 1 timeout. Uses flock when
 # present (Linux); else an atomic mkdir spinlock (macOS has no flock). Held until the shell exits.
+# Chained EXIT handlers (gate #61 r2 P1): bash `trap ... EXIT` REPLACES the previous handler,
+# so the no-flock lock-cleanup traps used to silently disable the engine's scratch-cleanup
+# trap on macOS (leaking WORK and dropping run logs). Every EXIT registration in engine+lib
+# goes through here; handlers run in registration order, each isolated by `;` so one failing
+# handler cannot skip the rest.
+pg_on_exit() {
+  PG_EXIT_HANDLERS="${PG_EXIT_HANDLERS:-}${PG_EXIT_HANDLERS:+; }$1"
+  # shellcheck disable=SC2064
+  trap 'eval "${PG_EXIT_HANDLERS:-:}"' EXIT
+}
+
+# Process-identity token: pid start time, so a RECYCLED pid can never impersonate a live run
+# (gate #61 r2 P1: kill -0 alone made a stale active record/lock "live" forever once an
+# unrelated long-lived process inherited the pid). Empty output = no such process.
+pg_pid_token() {
+  local p="${1:-}" st=""
+  [ -n "$p" ] || return 1
+  if [ -r "/proc/$p/stat" ]; then
+    # Field 22 counted AFTER the comm field, which may itself contain spaces/parens:
+    # strip through the last ')' first, then starttime is field 20 of the remainder.
+    st="$(sed 's/^.*) //' "/proc/$p/stat" 2>/dev/null | awk '{print $20}')"
+  else
+    st="$(ps -o lstart= -p "$p" 2>/dev/null | tr -s ' ' | sed 's/^ *//;s/ *$//' | tr ' ' '_')"
+  fi
+  [ -n "$st" ] || return 1
+  printf '%s' "$st"
+}
+
 pg_lock() {
   local lockfile="$1" wait_s="${2:-2400}"
   if pg_have flock; then
@@ -215,7 +243,8 @@ pg_lock() {
     sleep 2
   done
   echo "$$" > "$lockdir/pid" 2>/dev/null || true
-  trap 'rm -rf "'"$lockdir"'" 2>/dev/null' EXIT
+  pg_pid_token "$$" > "$lockdir/token" 2>/dev/null || true
+  pg_on_exit 'rm -rf "'"$lockdir"'" 2>/dev/null'
   return 0
 }
 
@@ -257,7 +286,8 @@ pg_lock_n() {
       lockdir="${base}.slot${i}.d"
       if mkdir "$lockdir" 2>/dev/null; then
         echo "$$" > "$lockdir/pid" 2>/dev/null || true
-        trap 'rm -rf "'"$lockdir"'" 2>/dev/null' EXIT
+        pg_pid_token "$$" > "$lockdir/token" 2>/dev/null || true
+        pg_on_exit 'rm -rf "'"$lockdir"'" 2>/dev/null'
         PG_SLOT_ACQUIRED="$i"
         return 0
       fi
@@ -424,7 +454,7 @@ pg_cdp_heal() {
 # generating. Process-owned flock slots disappear when exit 9 releases the engine; without a
 # durable reservation, a second run immediately under-counts real live Pro tabs and can double-
 # spend the same PR. One file per marker survives the process:
-#   $PRO_GATE_HOME/in-progress/<marker> = "pr<TAB>out<TAB>created_epoch<TAB>miss_streak"
+#   $PRO_GATE_HOME/in-progress/<marker> = "pr<TAB>out<TAB>created_epoch<TAB>miss_streak<TAB>slot<TAB>model"
 # Fresh runs reconcile files via marker probes and subtract the count from effective semaphore
 # capacity. Live resets the miss streak; throttle/inconclusive stays fail-closed; only several
 # consecutive confirmed absences release the reservation before TTL.

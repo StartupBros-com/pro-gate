@@ -1105,7 +1105,8 @@ RC=$?
 check 'artifact returns with the browser down' "$([ "$RC" -eq 0 ] && cmp -s "$TDIR/o-artifact2.md" "$TDIR/prov-ours.md"; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
 # The fast path carries full run identity (gate r5 P2): its ledger row is rediscoverable.
 FLINE="$(tail -1 "$TDIR/home/ledger.jsonl")"
-check 'fast-path ledger row carries pr + round_key' "$([ "$(printf '%s' "$FLINE" | jq -r .pr)" = "artifact-4" ] && [ "$(printf '%s' "$FLINE" | jq -r .round_key)" = "artifact-4" ]; echo $?)" "$FLINE"
+# v0.30 (#50 item 3): pr is the key's trailing NUMBER; round_key keeps the scoped key.
+check 'fast-path ledger row carries pr + round_key' "$([ "$(printf '%s' "$FLINE" | jq -r .pr)" = "4" ] && [ "$(printf '%s' "$FLINE" | jq -r .round_key)" = "artifact-4" ]; echo $?)" "$FLINE"
 check 'fast-path ledger row records the artifact digest' "$([ "$(printf '%s' "$FLINE" | jq -r '.sha256 // ""')" = "$(sha256sum "$TDIR/home/completed/$M9" | awk '{print $1}')" ]; echo $?)" "$FLINE"
 
 echo '# v0.28: provenance rejection blacklists precisely (compare-and-delete memo)'
@@ -1290,5 +1291,183 @@ env PRO_GATE_HOME="$TDIR/home-title" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UP
   bash "$ENGINE" --pr 132 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$TDIR/o-title3.md" --timeout 5s \
   >"$TDIR/stdout" 2>"$TDIR/stderr"
 check 'ordinal advances past expired windows (r8)' "$(head -1 "$TDIR/prompt-dump3.txt" 2>/dev/null | grep -q ' r8 \['; echo $?)" "first line: $(head -1 "$TDIR/prompt-dump3.txt" 2>/dev/null)"
+
+echo '# v0.30 (#50 item 1): scratch dirs are cleaned on exit; a default --out inside WORK survives'
+SCRATCH_TMP="$TDIR/scratch-tmp"; mkdir -p "$SCRATCH_TMP"
+printf 'run marker: none\n' > "$TDIR/tab.txt"
+start_mock "$TDIR/tab.txt"
+# exit-11 path (oversized): WORK is created, run terminates via pg_finish — dir must be gone.
+env TMPDIR="$SCRATCH_TMP" PRO_GATE_HOME="$TDIR/home-scratch" ORACLE_BROWSER_PORT="$PORT" \
+  PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" \
+  bash "$ENGINE" --diff "$TDIR/huge.diff" --repo "$TDIR" --out "$TDIR/o-scratch.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'scratch test still refuses oversized (rc=11)' "$([ "$RC" -eq 11 ]; echo $?)" "rc=$RC"
+LEFT="$(find "$SCRATCH_TMP" -maxdepth 1 -type d -name 'pro-review.*' | wc -l | tr -d ' ')"
+check 'external --out: WORK removed on exit' "$([ "$LEFT" = 0 ]; echo $?)" "leftover=$LEFT"
+# Default --out (no --out flag) lands INSIDE WORK: siblings sweep, findings + status survive.
+env TMPDIR="$SCRATCH_TMP" PRO_GATE_HOME="$TDIR/home-scratch" ORACLE_BROWSER_PORT="$PORT" \
+  PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" \
+  bash "$ENGINE" --diff "$TDIR/huge.diff" --repo "$TDIR" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+DWORK="$(find "$SCRATCH_TMP" -maxdepth 1 -type d -name 'pro-review.*' | head -1)"
+check 'default --out: WORK dir kept for the caller' "$([ -n "$DWORK" ]; echo $?)" "no surviving WORK"
+if [ -n "$DWORK" ]; then
+  SIBLINGS="$(find "$DWORK" -mindepth 1 ! -name 'findings.md' ! -name 'findings.md.status' | wc -l | tr -d ' ')"
+  check 'default --out: status sidecar survives, siblings swept' \
+    "$([ -f "$DWORK/findings.md.status" ] && [ "$SIBLINGS" = 0 ]; echo $?)" \
+    "siblings=$SIBLINGS status=$(ls "$DWORK" 2>/dev/null | tr '\n' ' ')"
+  rm -rf "$DWORK"
+fi
+
+echo '# v0.30 (#50 item 3): harvest ledger rows carry pr=NUMBER and round_key=full key'
+MHID="pg-run-acme-widgets-424-1700000000-55"
+env PRO_GATE_HOME="$TDIR/home-scratch" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" \
+  bash "$ENGINE" --harvest "$MHID" --out "$TDIR/o-hid.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+HROW="$(grep "$MHID" "$TDIR/home-scratch/ledger.jsonl" 2>/dev/null | tail -1)"
+check 'harvest row pr field is the trailing number' \
+  "$(printf '%s' "$HROW" | jq -e '.pr == "424"' >/dev/null 2>&1; echo $?)" "row: $HROW"
+check 'harvest row round_key keeps the scoped key' \
+  "$(printf '%s' "$HROW" | jq -e '.round_key == "acme-widgets-424"' >/dev/null 2>&1; echo $?)" "row: $HROW"
+
+echo '# v0.30 (#50 item 4): conversation-urls memos older than 14d are swept, fresh ones stay'
+SWHOME="$TDIR/home-sweep"; mkdir -p "$SWHOME/conversation-urls"
+printf 'https://chatgpt.com/c/old' > "$SWHOME/conversation-urls/pg-run-old-1600000000-1"
+printf 'https://chatgpt.com/c/new' > "$SWHOME/conversation-urls/pg-run-new-1700000000-1"
+touch -d '20 days ago' "$SWHOME/conversation-urls/pg-run-old-1600000000-1" 2>/dev/null \
+  || touch -t "$(date -v-20d +%Y%m%d%H%M 2>/dev/null || echo 202601010000)" "$SWHOME/conversation-urls/pg-run-old-1600000000-1"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+start_mock "$TDIR/tab.txt"
+env PRO_GATE_HOME="$SWHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_MAX_RETRIES=0 PG_TEST_PROMPT_DUMP="$TDIR/prompt-sweep.txt" \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-dump" NODE_OPTIONS= \
+  bash "$ENGINE" --pr 909 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$TDIR/o-sweep.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+check 'old memo swept' "$([ ! -f "$SWHOME/conversation-urls/pg-run-old-1600000000-1" ]; echo $?)" "still present"
+check 'fresh memo kept' "$([ -f "$SWHOME/conversation-urls/pg-run-new-1700000000-1" ]; echo $?)" "missing"
+
+echo '# v0.30 (#50 item 5): native-mode hard-max clamp is announced, not silent'
+# The NOTE fires before the oversized refusal, so the fast exit-11 path exercises it.
+env PRO_GATE_HOME="$TDIR/home-native" PRO_GATE_BROWSER_MODE=native PRO_GATE_DIFF_HARD_MAX=30000 \
+  PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" \
+  bash "$ENGINE" --diff "$TDIR/huge.diff" --repo "$TDIR" --out "$TDIR/o-clamp.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+check 'clamp NOTE printed when operator value is cut' \
+  "$(grep -q 'capped to the cook threshold' "$TDIR/stderr"; echo $?)" "$(grep NOTE "$TDIR/stderr" | head -1)"
+env PRO_GATE_HOME="$TDIR/home-native" PRO_GATE_BROWSER_MODE=native \
+  PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" \
+  bash "$ENGINE" --diff "$TDIR/huge.diff" --repo "$TDIR" --out "$TDIR/o-clamp2.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+check 'no NOTE when nothing was configured' \
+  "$(grep -q 'capped to the cook threshold' "$TDIR/stderr"; [ $? -ne 0 ]; echo $?)" "$(grep NOTE "$TDIR/stderr" | head -1)"
+
+echo '# v0.30 (#35): --status surfaces a FREE harvest for a failed run with a remembered URL'
+STHOME="$TDIR/home-stfail"; mkdir -p "$STHOME/conversation-urls"
+MFAIL="pg-run-acme-widgets-777-1700000000-88"
+printf 'https://chatgpt.com/c/abc123' > "$STHOME/conversation-urls/$MFAIL"
+printf '%s\n' \
+  "{\"ts\":\"2026-08-03T00:00:00+0000\",\"pr\":\"777\",\"repo\":\"\",\"exit\":6,\"outcome\":\"failed\",\"secs\":100,\"attempts\":1,\"conc\":1,\"ceiling\":1,\"live\":0,\"salvaged\":0,\"diff_lines\":10,\"out\":\"/tmp/o777.md\",\"model\":\"m\",\"marker\":\"$MFAIL\",\"round_key\":\"acme-widgets-777\",\"sha256\":\"\"}" \
+  > "$STHOME/ledger.jsonl"
+env PRO_GATE_HOME="$STHOME" bash "$ENGINE" --status 777 --json >"$TDIR/st.json" 2>"$TDIR/stderr"
+check 'failed+memo status recommends FREE harvest' \
+  "$(jq -e '.next_step | test("FAILED but its conversation URL is remembered") and test("--harvest")' "$TDIR/st.json" >/dev/null 2>&1; echo $?)" \
+  "next_step: $(jq -r .next_step "$TDIR/st.json" 2>/dev/null)"
+rm -f "$STHOME/conversation-urls/$MFAIL"
+env PRO_GATE_HOME="$STHOME" bash "$ENGINE" --status 777 --json >"$TDIR/st2.json" 2>"$TDIR/stderr"
+check 'failed without memo keeps the spend warning' \
+  "$(jq -e '.next_step | test("fresh run will SPEND")' "$TDIR/st2.json" >/dev/null 2>&1; echo $?)" \
+  "next_step: $(jq -r .next_step "$TDIR/st2.json" 2>/dev/null)"
+
+echo '# v0.30 (#50 item 8): run diagnostics persist to logs/<marker>.log'
+check 'harvest run persisted a per-run log' \
+  "$([ -s "$TDIR/home-scratch/logs/$MHID.log" ]; echo $?)" \
+  "logs: $(ls "$TDIR/home-scratch/logs" 2>/dev/null | tr '\n' ' ')"
+
+echo '# v0.30 gate r1: --status recoverable field is freshness-checked, and the daemon guard consumes it end-to-end'
+GHOME="$TDIR/home-guard"; mkdir -p "$GHOME/in-progress"
+cp "$HERE/../bin/oracle-review.sh" "$GHOME/oracle-review.sh"
+cp "$HERE/../lib/pro-gate-lib.sh" "$GHOME/lib.sh"
+chmod +x "$GHOME/oracle-review.sh"
+MRES="pg-run-acme-widgets-555-1700000000-77"
+printf '555\t/tmp/o555.md\t%s\t0\t1\tgpt\n' "$(date +%s)" > "$GHOME/in-progress/$MRES"
+env PRO_GATE_HOME="$GHOME" bash "$ENGINE" --status 555 --json >"$TDIR/grec.json" 2>"$TDIR/stderr"
+check 'unexpired reservation: recoverable=true' \
+  "$(jq -e '.recoverable == true' "$TDIR/grec.json" >/dev/null 2>&1; echo $?)" "$(jq -c '{recoverable,recoverable_reason}' "$TDIR/grec.json" 2>/dev/null)"
+# Same reservation, created 30000s ago (past the 21600s TTL): NOT recoverable.
+printf '555\t/tmp/o555.md\t%s\t0\t1\tgpt\n' "$(( $(date +%s) - 30000 ))" > "$GHOME/in-progress/$MRES"
+env PRO_GATE_HOME="$GHOME" bash "$ENGINE" --status 555 --json >"$TDIR/grec2.json" 2>"$TDIR/stderr"
+check 'expired reservation: recoverable=false' \
+  "$(jq -e '.recoverable == false' "$TDIR/grec2.json" >/dev/null 2>&1; echo $?)" "$(jq -c '{recoverable,recoverable_reason}' "$TDIR/grec2.json" 2>/dev/null)"
+# The daemon's guard, through the EXACT subprocess call it ships with (a broken --status
+# argument order shipped once because nothing exercised this path).
+printf '555\t/tmp/o555.md\t%s\t0\t1\tgpt\n' "$(date +%s)" > "$GHOME/in-progress/$MRES"
+( export PRO_GATE_HOME="$GHOME" PRO_GATE_DAEMON_LIB_ONLY=1
+  . "$HERE/../daemon/daemon.sh"
+  engine_state_recoverable "https://github.com/acme/widgets/pull/555" )
+check 'daemon guard sees the unexpired reservation (rc 0)' "$([ $? -eq 0 ]; echo $?)" ""
+rm -f "$GHOME/in-progress/$MRES"
+( export PRO_GATE_HOME="$GHOME" PRO_GATE_DAEMON_LIB_ONLY=1
+  . "$HERE/../daemon/daemon.sh"
+  engine_state_recoverable "https://github.com/acme/widgets/pull/555" )
+check 'daemon guard: no state means NOT recoverable (rc 1)' "$([ $? -ne 0 ]; echo $?)" ""
+
+echo '# v0.30 gate r1: pre-marker failures persist a provisional run log'
+PLHOME="$TDIR/home-prelog"; mkdir -p "$PLHOME"
+env PRO_GATE_HOME="$PLHOME" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" \
+  bash "$ENGINE" --pr 5 --repo "$TDIR/does-not-exist" --out "$TDIR/o-prelog.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'bad-repo run still exits 4' "$([ "$RC" -eq 4 ]; echo $?)" "rc=$RC"
+PLOG="$(find "$PLHOME/logs" -name 'pg-run-unidentified-*.log' -size +0c 2>/dev/null | head -1)"
+check 'provisional run log persisted for the pre-marker failure' "$([ -n "$PLOG" ]; echo $?)" "logs: $(ls "$PLHOME/logs" 2>/dev/null | tr '\n' ' ')"
+
+echo '# v0.30 gate r2: EXIT handlers chain instead of clobbering (no-flock lock cleanup vs scratch cleanup)'
+( cd "$TDIR" && bash -c '
+  . "'"$HERE"'/../lib/pro-gate-lib.sh"
+  pg_on_exit "touch \"'"$TDIR"'/exit-a\""
+  pg_on_exit "touch \"'"$TDIR"'/exit-b\""
+  exit 0' )
+check 'both chained EXIT handlers ran' \
+  "$([ -f "$TDIR/exit-a" ] && [ -f "$TDIR/exit-b" ]; echo $?)" "$(ls "$TDIR"/exit-* 2>/dev/null | tr '\n' ' ')"
+
+echo '# v0.30 gate r2: pid reuse cannot resurrect a dead run (token-verified liveness)'
+TOKHOME="$TDIR/home-token"; mkdir -p "$TOKHOME/active"
+NOWEP="$(date +%s)"
+# A recycled pid: pid 1 is alive but its token cannot match the recorded garbage token.
+printf 'pg-run-acme-widgets-888-1700000000-1\t/tmp/o888.md\t1\t%s\tremote-chrome\tBOGUS-TOKEN\n' "$NOWEP" \
+  > "$TOKHOME/active/acme-widgets-888"
+env PRO_GATE_HOME="$TOKHOME" bash "$ENGINE" --status 888 --json >"$TDIR/tok1.json" 2>"$TDIR/stderr"
+check 'token mismatch: pid-1 record is NOT a live run' \
+  "$(jq -e '(.next_step // "") | test("RUNNING right now") | not' "$TDIR/tok1.json" >/dev/null 2>&1; echo $?)" \
+  "next_step: $(jq -r .next_step "$TDIR/tok1.json" 2>/dev/null)"
+# Our own live pid with its real token: genuinely live, recoverable.
+MYTOK="$(bash -c '. "'"$HERE"'/../lib/pro-gate-lib.sh"; pg_pid_token '"$$"'')"
+printf 'pg-run-acme-widgets-888-1700000000-1\t/tmp/o888.md\t%s\t%s\tremote-chrome\t%s\n' "$$" "$NOWEP" "$MYTOK" \
+  > "$TOKHOME/active/acme-widgets-888"
+env PRO_GATE_HOME="$TOKHOME" bash "$ENGINE" --status 888 --json >"$TDIR/tok2.json" 2>"$TDIR/stderr"
+check 'matching token: live run is recoverable' \
+  "$(jq -e '.recoverable == true' "$TDIR/tok2.json" >/dev/null 2>&1; echo $?)" \
+  "$(jq -c '{recoverable,recoverable_reason}' "$TDIR/tok2.json" 2>/dev/null)"
+# Stale token-less record (legacy 5-field) whose epoch is PAST the TTL: not recoverable even
+# when the recorded pid is alive (pid 1 again — reuse with no token to disprove it).
+printf 'pg-run-acme-widgets-888-1700000000-1\t/tmp/o888.md\t1\t%s\tremote-chrome\n' "$(( NOWEP - 30000 ))" \
+  > "$TOKHOME/active/acme-widgets-888"
+env PRO_GATE_HOME="$TOKHOME" bash "$ENGINE" --status 888 --json >"$TDIR/tok3.json" 2>"$TDIR/stderr"
+check 'legacy stale record past TTL: not recoverable' \
+  "$(jq -e '.recoverable == false' "$TDIR/tok3.json" >/dev/null 2>&1; echo $?)" \
+  "$(jq -c '{recoverable,recoverable_reason}' "$TDIR/tok3.json" 2>/dev/null)"
+
+echo '# v0.30 gate r2: a harvest never clobbers the original run log'
+LOGN1="$(find "$TDIR/home-scratch/logs" -name "$MHID*" 2>/dev/null | wc -l | tr -d ' ')"
+env PRO_GATE_HOME="$TDIR/home-scratch" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" \
+  bash "$ENGINE" --harvest "$MHID" --out "$TDIR/o-hid2.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+LOGN2="$(find "$TDIR/home-scratch/logs" -name "$MHID*" 2>/dev/null | wc -l | tr -d ' ')"
+check 'second invocation adds a log instead of overwriting' \
+  "$([ "$LOGN2" -gt "$LOGN1" ]; echo $?)" "before=$LOGN1 after=$LOGN2"
 
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }

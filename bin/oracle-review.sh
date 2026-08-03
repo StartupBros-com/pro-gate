@@ -103,14 +103,20 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
   # ledger row yet, where "no state found" would wrongly invite a duplicate launch. Read-only:
   # probe only locks that already exist (opening would otherwise create the file).
   st_inflight() {  # $1 = round key -> rc 0 when a same-change run holds the lock now
-    local lf="${ST_LOCKFILE}.pr-$1" pfd opid
+    local lf="${ST_LOCKFILE}.pr-$1" pfd opid otok
     if [ -d "${lf}.d" ]; then
       # mkdir-fallback lock (no flock, e.g. stock macOS): live only when the recorded owner
       # is a running pid. A dead/absent owner is a stale dir from SIGKILL/reboot — pg_lock
       # self-heals it at the next acquisition; report it NOT live, mutate nothing
       # (gate #53 r3 P1: existence alone reported stale locks as RUNNING forever).
       opid="$(cat "${lf}.d/pid" 2>/dev/null || true)"
-      case "$opid" in ''|*[!0-9]*) return 1;; *) kill -0 "$opid" 2>/dev/null; return $?;; esac
+      case "$opid" in ''|*[!0-9]*) return 1;; esac
+      kill -0 "$opid" 2>/dev/null || return 1
+      # Token-verify when the lock recorded one: a recycled pid must not report a long-dead
+      # holder as RUNNING (gate #61 r2 P1). Token-less locks (legacy) keep the pid-only check.
+      otok="$(cat "${lf}.d/token" 2>/dev/null || true)"
+      [ -z "$otok" ] || [ "$(pg_pid_token "$opid" 2>/dev/null || true)" = "$otok" ] || return 1
+      return 0
     fi
     [ -e "$lf" ] || return 1
     pg_have flock || return 1
@@ -164,6 +170,17 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
   trap 'rm -rf "$ST_TMP"' EXIT
   : > "$ST_TMP/res.jsonl"; : > "$ST_TMP/rounds.jsonl"; : > "$ST_TMP/ledger.jsonl"
   ST_HINT=""
+  # v0.30 (#52 item 1): machine-consumable recoverability. recoverable=true means "a paid
+  # review is live or still collectable WITHOUT a new spend — do not treat this change's
+  # failure as terminal". Computed ONLY from freshness-checked state (unexpired reservation,
+  # live per-change lock/pid, fresh dead-wrapper on a harvest-capable mode), never from hint
+  # prose, so automation (the daemon's fail-budget guard) cannot rot when wording changes.
+  # Static-but-collectable states (failed run with a URL memo, in-progress ledger history)
+  # deliberately do NOT set it: retrying those is charged work, bounded by the caller's own
+  # fail budget, not an open-ended deferral.
+  ST_RECOVERABLE=0; ST_RECOVER_REASON=""
+  ST_RES_TTL="${PRO_GATE_RESERVATION_TTL:-21600}"
+  case "$ST_RES_TTL" in ''|*[!0-9]*) ST_RES_TTL=21600;; esac
 
   # 1) Reservations: in-progress runs whose review is collectable for FREE.
   if [ -d "$ST_RES_DIR" ]; then
@@ -174,6 +191,13 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
       IFS=$'\t' read -r r_pr r_out r_created r_miss r_slot r_model < "$f" 2>/dev/null || true
       st_match "$m" "$r_pr" || continue
       case "$r_created" in ''|*[!0-9]*) r_age="";; *) r_age=$(( ST_NOW - r_created ));; esac
+      # Only an UNEXPIRED reservation marks the change recoverable: an expired one will be
+      # reaped at the next fresh-run reconciliation, and treating it as live would let a
+      # repeatedly-failing caller defer forever (gate #61 r1 P1).
+      if [ -z "$r_age" ] || [ "$r_age" -lt "$ST_RES_TTL" ] 2>/dev/null; then
+        ST_RECOVERABLE=1
+        [ -n "$ST_RECOVER_REASON" ] || ST_RECOVER_REASON="unexpired in-progress reservation ($m)"
+      fi
       r_url=""; [ -f "$ST_URLS_DIR/$m" ] && r_url="$(head -c 300 "$ST_URLS_DIR/$m" 2>/dev/null | tr -d '\n')"
       [ -n "$r_out" ] || r_out="${TMPDIR:-/tmp}/pro-gate-${r_pr:-review}.md"
       r_cmd="$ST_ENGINE --harvest '$m' --out '$r_out' --timeout 20m"
@@ -257,21 +281,46 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
       case "$k" in "${Q_SLUG:+${Q_SLUG}-}${Q_NUM}"|*"-${Q_NUM}") [ -z "$Q_SLUG" ] || [ "$k" = "${Q_SLUG}-${Q_NUM}" ] || continue;; *) continue;; esac
     fi
     spent="$(pg_round_count "$k")"
-    k_live=0; st_inflight "$k" && { k_live=1; ST_INFLIGHT_KEY="$k"; }
+    k_live=0
+    if st_inflight "$k"; then
+      k_live=1; ST_INFLIGHT_KEY="$k"
+      ST_RECOVERABLE=1
+      [ -n "$ST_RECOVER_REASON" ] || ST_RECOVER_REASON="a same-change run holds the per-change lock ($k)"
+    fi
     # Active-run index: sees a live run before any reservation/ledger row exists, AND the
     # wrapper-died-mid-generation case (which releases the flock, so st_inflight misses it).
-    a_marker=""; a_out=""; a_pid=""; a_epoch=""; a_mode=""; a_alive=""
+    a_marker=""; a_out=""; a_pid=""; a_epoch=""; a_mode=""; a_token=""; a_alive=""; a_fresh=0
     if [ -f "$PRO_GATE_HOME/active/$k" ]; then
-      IFS=$'\t' read -r a_marker a_out a_pid a_epoch a_mode < "$PRO_GATE_HOME/active/$k" 2>/dev/null || true
+      IFS=$'\t' read -r a_marker a_out a_pid a_epoch a_mode a_token < "$PRO_GATE_HOME/active/$k" 2>/dev/null || true
+      # Liveness = pid alive AND, when the record carries a process-identity token, the token
+      # still matches — a recycled pid must not resurrect a dead run (gate #61 r2 P1). Legacy
+      # token-less records keep the pid-only check but never extend past the freshness bound.
       case "$a_pid" in ''|*[!0-9]*) a_alive=0;; *) if kill -0 "$a_pid" 2>/dev/null; then a_alive=1; else a_alive=0; fi;; esac
+      if [ "$a_alive" = 1 ] && [ -n "$a_token" ]; then
+        [ "$(pg_pid_token "$a_pid" 2>/dev/null || true)" = "$a_token" ] || a_alive=0
+      fi
+      case "$a_epoch" in
+        ''|*[!0-9]*) : ;;
+        *) [ $(( ST_NOW - a_epoch )) -lt "$ST_RES_TTL" ] && [ "$a_epoch" -le "$ST_NOW" ] && a_fresh=1 ;;
+      esac
       if [ "$a_alive" = 1 ]; then
         k_live=1; ST_INFLIGHT_KEY="$k"
+        if [ "$a_fresh" = 1 ] || [ -n "$a_token" ]; then
+          ST_RECOVERABLE=1
+          [ -n "$ST_RECOVER_REASON" ] || ST_RECOVER_REASON="a same-change run is live (pid ${a_pid})"
+        fi
         [ -n "$ST_ACTIVE_HINT" ] || ST_ACTIVE_HINT="a same-change review is RUNNING right now (pid ${a_pid}): poll ${a_out}.status — do NOT launch another"
       elif [ "$a_mode" = native ]; then
         # Native has no marker-addressable harvest (--harvest exits 3 there): pointing at it
         # would be an unusable loop that never clears (gate #53 r2 P1). Manual recovery only.
         [ -n "$ST_ACTIVE_HINT" ] || ST_ACTIVE_HINT="the last run's wrapper DIED (native mode: no harvest path) — check ${a_out} and ${a_out}.status, and look for the conversation in the ChatGPT UI; once resolved, rm '$PRO_GATE_HOME/active/$k' to retire this notice (it also expires with the 24h sweep)"
       elif [ -n "$a_marker" ]; then
+        # Recoverable only while FRESH: past the reservation TTL the browser is not still
+        # generating; the stale record is debris awaiting the 24h sweep (gate #61 r1 P1).
+        if [ "$a_fresh" = 1 ]; then
+          ST_RECOVERABLE=1
+          [ -n "$ST_RECOVER_REASON" ] || ST_RECOVER_REASON="dead wrapper, browser may still be generating ($a_marker)"
+        fi
         [ -n "$ST_ACTIVE_HINT" ] || ST_ACTIVE_HINT="the last run's wrapper DIED but the browser may still be generating — recover by marker, never a fresh run: $ST_ENGINE --harvest '$a_marker' --out '${a_out:-${TMPDIR:-/tmp}/pro-gate-recovered.md}' --timeout 20m"
       fi
     fi
@@ -338,6 +387,15 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
         fi;;
       clean)
         ST_HINT="last run completed clean — the review is already on disk: $ST_LAST_OUT (spend nothing)";;
+      failed)
+        # #35: a failed run whose conversation URL was memoized may be complete server-side
+        # (Chrome died before collection). Offer the FREE harvest before any fresh spend.
+        if [ -n "$ST_LAST_MARKER" ] && [ -f "$ST_URLS_DIR/$ST_LAST_MARKER" ]; then
+          ST_FAILED_URL="$(head -c 300 "$ST_URLS_DIR/$ST_LAST_MARKER" 2>/dev/null | tr -d '\n')"
+          ST_HINT="last run FAILED but its conversation URL is remembered (${ST_FAILED_URL:-unknown}) — the review may exist server-side; try a FREE harvest before spending: $ST_ENGINE --harvest '$ST_LAST_MARKER' --out '$ST_LAST_OUT' --timeout 20m"
+        else
+          ST_HINT="last run ended 'failed' with no reservation held — a fresh run will SPEND a slot (round budget permitting)"
+        fi;;
       '') ;;
       *)
         ST_HINT="last run ended '$ST_LAST_OUTCOME' with no reservation held — a fresh run will SPEND a slot (round budget permitting)";;
@@ -355,15 +413,19 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
 
   if [ "$AS_JSON" = 1 ]; then
     jq -n --arg query "${STATUS_QUERY:-all}" --arg home "$PRO_GATE_HOME" --arg hint "$ST_HINT" \
+      --arg rec "$ST_RECOVERABLE" --arg rec_reason "$ST_RECOVER_REASON" \
       --slurpfile res <(cat "$ST_TMP/res.jsonl" 2>/dev/null; echo null) \
       --slurpfile rounds <(cat "$ST_TMP/rounds.jsonl" 2>/dev/null; echo null) \
       --slurpfile ledger <(cat "$ST_TMP/ledger.jsonl" 2>/dev/null; echo null) \
       --slurpfile artifacts <(cat "$ST_TMP/artifacts.jsonl" 2>/dev/null; echo null) \
-      '{query:$query,home:$home,reservations:($res[:-1]),completed_artifacts:($artifacts[:-1]),rounds:($rounds[:-1]),recent_runs:($ledger[:-1]),next_step:$hint}'
+      '{query:$query,home:$home,recoverable:($rec == "1"),recoverable_reason:$rec_reason,reservations:($res[:-1]),completed_artifacts:($artifacts[:-1]),rounds:($rounds[:-1]),recent_runs:($ledger[:-1]),next_step:$hint}'
     exit 0
   fi
 
   echo "[pro-gate status] query: ${STATUS_QUERY:-all}   home: $PRO_GATE_HOME"
+  if [ "$ST_RECOVERABLE" = 1 ]; then
+    echo "recoverable: YES — ${ST_RECOVER_REASON} (do not treat this change's failure as terminal; no new spend needed)"
+  fi
   if [ -s "$ST_TMP/res.jsonl" ] || [ -s "$ST_TMP/res.tsv" ]; then
     echo "in-progress reservations (harvest these for FREE — never re-run):"
     if pg_have jq && [ -s "$ST_TMP/res.jsonl" ]; then
@@ -411,6 +473,52 @@ case "${PRO_GATE_REQUIRE_NONCE:-1}" in 0) REQUIRE_NONCE=0;; *) REQUIRE_NONCE=1;;
 MODEL="${ORACLE_MODEL:-gpt-5.6}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/pro-review.XXXXXX")"
 [ -n "$OUT" ] || OUT="$WORK/findings.md"
+# #50: scratch dirs used to leak on every exit path (5,900+ observed on one box). The trap
+# persists this run's diagnostics log, then removes WORK — EXCEPT when a failure path
+# deliberately retained recovery bytes in it (PG_KEEP_FINAL/PG_PRESERVE_STATE: the retained
+# snapshot is the ONLY copy of a paid review), and never touching $OUT/$OUT.status when the
+# default --out placed them inside WORK (callers read them after exit).
+pg_scratch_cleanup() {
+  # Drain the run-log tee FIRST: restore the original stderr (closing the tee's pipe) and
+  # reap it, so run.log holds every line and nothing later is lost or misordered.
+  if [ -n "${PG_RUNLOG_TEE_PID:-}" ]; then
+    exec 2>&3 3>&- 2>/dev/null || true
+    wait "$PG_RUNLOG_TEE_PID" 2>/dev/null || true
+    PG_RUNLOG_TEE_PID=""
+  fi
+  # Pre-marker failures (browser preflight, bad repo, diff fetch, oversized) are exactly the
+  # outage diagnostics worth keeping (gate #61 r1 P2): persist under a provisional identity
+  # when the run died before earning a marker. Never clobber (gate #61 r2 P2): harvests reuse
+  # the fresh run's marker, and each invocation's diagnostics must survive independently —
+  # later invocations land as <marker>.<epoch>.<pid>.log (still swept by the pg-run-* glob).
+  if [ "${PRO_GATE_RUN_LOGS:-1}" = 1 ] && [ -s "$WORK/run.log" ]; then
+    _logdst="$PRO_GATE_HOME/logs/${RUN_MARKER:-$PG_RUNLOG_ID}.log"
+    [ -e "$_logdst" ] && _logdst="$PRO_GATE_HOME/logs/${RUN_MARKER:-$PG_RUNLOG_ID}.$(date +%s).$$.log"
+    mkdir -p "$PRO_GATE_HOME/logs" 2>/dev/null \
+      && cp "$WORK/run.log" "$_logdst" 2>/dev/null || true
+  fi
+  [ "${PG_KEEP_FINAL:-0}" = 1 ] && return 0
+  [ "${PG_PRESERVE_STATE:-0}" = 1 ] && return 0
+  case "$OUT" in
+    "$WORK"/*)
+      find "$WORK" -mindepth 1 -maxdepth 1 \
+        ! -name "$(basename "$OUT")" ! -name "$(basename "$OUT").status" \
+        -exec rm -rf {} + 2>/dev/null || true ;;
+    *) rm -rf "$WORK" 2>/dev/null || true ;;
+  esac
+  return 0
+}
+pg_on_exit pg_scratch_cleanup
+# #50 item 8: per-run diagnostics are durable again. Mirror stderr into $WORK/run.log via a
+# tee whose output goes to the SAVED original stderr (fd 3); the EXIT trap restores fd 2,
+# drains the tee, and persists the log to logs/<marker>.log. PRO_GATE_RUN_LOGS=0 disables.
+if [ "${PRO_GATE_RUN_LOGS:-1}" = 1 ]; then
+  # Provisional log identity for runs that die before a marker exists; matches the
+  # pg-run-*.log sweep pattern so it ages out like every other run log.
+  PG_RUNLOG_ID="pg-run-unidentified-$(date +%s)-$$"
+  exec 3>&2 2> >(tee -a "$WORK/run.log" >&3)
+  PG_RUNLOG_TEE_PID=$!
+fi
 if [ -d "$OUT" ]; then
   # mv into an existing directory "succeeds" by moving the file INSIDE it, so a directory
   # here would let publication report done while $OUT is still not the promised file
@@ -541,7 +649,9 @@ pg_active_write() {
   mkdir -p "$(pg_active_dir)" 2>/dev/null || return 0
   # 5th field: browser mode — recovery differs (native has no marker-addressable harvest, so a
   # dead native wrapper must NOT be routed into a --harvest loop that always exits 3).
-  printf '%s\t%s\t%s\t%s\t%s\n' "${RUN_MARKER:-}" "$OUT" "$$" "$(date +%s)" "$MODE" \
+  # 6th field: process-identity token — pid reuse must not resurrect a dead run (gate #61 r2).
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "${RUN_MARKER:-}" "$OUT" "$$" "$(date +%s)" "$MODE" \
+    "$(pg_pid_token "$$" 2>/dev/null || true)" \
     > "$(pg_active_dir)/$ROUND_KEY" 2>/dev/null && PG_ACTIVE_WRITTEN=1
   return 0
 }
@@ -745,8 +855,12 @@ if [ -n "$HARVEST_MARKER" ] && pg_reservation_marker_ok "$HARVEST_MARKER" \
   # rename, but each invocation still outputs and ledgers exactly the bytes it verified.
   HARVEST=1
   RUN_MARKER="$HARVEST_MARKER"
-  PR_NUM="${HARVEST_MARKER#pg-run-}"; PR_NUM="${PR_NUM%-*-*}"
-  ROUND_KEY="$PR_NUM"
+  ROUND_KEY="${HARVEST_MARKER#pg-run-}"; ROUND_KEY="${ROUND_KEY%-*-*}"
+  # #50 item 3: the ledger/status pr field is the trailing PR NUMBER; round_key carries the
+  # full repo-scoped key. Jamming the whole key into pr produced malformed identity rows
+  # (pr:"org-repo-953", repo:"") that polluted every per-PR ledger join.
+  PR_NUM="${ROUND_KEY##*-}"
+  case "$PR_NUM" in ''|*[!0-9]*) PR_NUM="$ROUND_KEY";; esac
   RESOLVED_MODEL="$(pg_reservation_read_model "$RUN_MARKER" 2>/dev/null || true)"
   FASTPATH_ART="$(pg_completed_dir)/$RUN_MARKER"
   FASTPATH_SNAP="$WORK/fastpath.snap"
@@ -820,13 +934,15 @@ if [ -n "$HARVEST_MARKER" ]; then
     pg_status failed "harvest unsupported in native browser mode"
     pg_finish 3
   fi
-  # ledger/status pr field from the marker's "pg-run-<key>-<epoch>-<pid>" shape (best-effort;
-  # the key may itself contain dashes, so strip the two trailing numeric segments instead)
-  PR_NUM="${HARVEST_MARKER#pg-run-}"
-  PR_NUM="${PR_NUM%-*-*}"
-  # v0.27: record the stripped key as round_key in this harvest's ledger line too (best-effort,
-  # same heuristic as HARVEST_KEY below) so --status can join harvest rows to their change.
-  ROUND_KEY="$PR_NUM"
+  # ledger/status identity from the marker's "pg-run-<key>-<epoch>-<pid>" shape (best-effort;
+  # the key may itself contain dashes, so strip the two trailing numeric segments instead).
+  # v0.27: the stripped key lands as round_key so --status can join harvest rows to their
+  # change. #50 item 3: pr is the key's trailing PR NUMBER, never the whole key — the old
+  # behavior wrote malformed rows (pr:"org-repo-953", repo:"") that broke per-PR joins.
+  ROUND_KEY="${HARVEST_MARKER#pg-run-}"
+  ROUND_KEY="${ROUND_KEY%-*-*}"
+  PR_NUM="${ROUND_KEY##*-}"
+  case "$PR_NUM" in ''|*[!0-9]*) PR_NUM="$ROUND_KEY";; esac
   command -v node >/dev/null 2>&1 || { echo "ERROR: --harvest needs node for CDP salvage" >&2; pg_status failed "node missing"; pg_finish 3; }
   # Serialize the entire marker harvest. Without this, two collectors can share $OUT.cdp,
   # both read the same completed tab, and one closes it underneath the other (exit 6 + false
@@ -1165,6 +1281,12 @@ case "$DIFF_LINES"      in ''|*[!0-9]*) DIFF_LINES=0 ;; esac
 # reservation, so a cooked large diff there spends a slot it can never collect (exit 6, quota
 # wasted). Keep the hard refusal at the cook threshold when harvest is unavailable: no cook band on
 # native. (An explicit PRO_GATE_DIFF_GUARD=0 still overrides everything, native included.)
+# #50 item 5: the coercion below used to be silent — an operator-raised hard max was ignored
+# with no signal. Say so once, before clamping, only when a configured value is actually cut.
+if [ "$MODE" != remote-chrome ] && [ -n "${PRO_GATE_DIFF_HARD_MAX:-}" ] \
+   && [ "$DIFF_HARD_MAX" -gt "$DIFF_COOK_LINES" ]; then
+  echo "NOTE: native browser mode has no harvest path, so the configured hard max (${DIFF_HARD_MAX} lines) is capped to the cook threshold (${DIFF_COOK_LINES}) on this platform." >&2
+fi
 [ "$MODE" = remote-chrome ] || DIFF_HARD_MAX="$DIFF_COOK_LINES"
 if [ "$DIFF_LINES" -gt "$DIFF_HARD_MAX" ] && [ "${PRO_GATE_DIFF_GUARD:-1}" = 1 ]; then
   if [ "$MODE" = remote-chrome ]; then
@@ -1335,6 +1457,18 @@ find "$(dirname "$LOCKFILE")" -maxdepth 1 -name "$(basename "$LOCKFILE").pr-*" -
 find "${PRO_GATE_HARVEST_LOCK_DIR:-$PRO_GATE_HOME/harvest-locks}" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
 find "$(pg_active_dir)" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
 find "$(pg_manifest_dir)" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
+# #50 item 4: conversation-urls memos get the same time-based hygiene as every other state
+# dir. 14 days dwarfs every recovery window (reservation TTL 6h; pending/ holds real bytes)
+# while still covering late manual recovery of a weeks-old run.
+find "$PRO_GATE_HOME/conversation-urls" -maxdepth 1 -type f -mmin +20160 -delete 2>/dev/null || true
+# #50 item 8: per-run diagnostic logs are swept on the same 14-day horizon (autoupdate.log
+# and other non-run logs never match the pg-run-* pattern).
+find "$PRO_GATE_HOME/logs" -maxdepth 1 -type f -name 'pg-run-*.log' -mmin +20160 -delete 2>/dev/null || true
+# #50 item 1 (backfill): scratch dirs leaked by pre-trap engines and kill -9 runs. Only our
+# own naming patterns, only dirs old enough (7d) that every recovery pointer into them has
+# long expired (reservation TTL 6h; PG_KEEP_FINAL messages say "copy it out now").
+find "${TMPDIR:-/tmp}" -maxdepth 1 -type d \( -name 'pro-review.*' -o -name 'pg-status.*' \) \
+  -mmin +10080 -exec rm -rf {} + 2>/dev/null || true
 # Round-budget state (v0.22): entries self-prune on write, but a key never gated again keeps
 # its file (and its 0-byte .lock) forever. Sweep files untouched for longer than the rounds
 # window (every entry inside is expired), floored at 24h so a short window never deletes a
@@ -2035,8 +2169,21 @@ else
   if _svc_up="$(pg_browser_restarted_midrun "$RUN_START")"; then
     _mem="$(pg_mem_status)"; [ -n "$_mem" ] || _mem="memory usage unknown"
     echo "  LIKELY CAUSE: the review browser (Chrome) restarted ${_svc_up}s ago — mid-review — almost always because the machine ran low on memory (${_mem})." >&2
-    echo "  The slot was likely already spent and the review may still exist in ChatGPT, so do NOT immediately re-run. Free memory (close other apps / browser tabs) and try again." >&2
-    FAIL_DETAIL="review browser restarted mid-run (chrome up ${_svc_up}s); likely out of memory"
+    # #35: when the early probe already memoized this run's conversation URL, the recovery is
+    # a copy-paste no-spend command, not "free memory and hope". Say exactly that.
+    _memo=""
+    [ -n "${RUN_MARKER:-}" ] && [ -f "$PRO_GATE_HOME/conversation-urls/$RUN_MARKER" ] \
+      && _memo="$(head -c 300 "$PRO_GATE_HOME/conversation-urls/$RUN_MARKER" 2>/dev/null | tr -d '\n')"
+    if [ -n "$_memo" ]; then
+      echo "  The conversation URL was captured before the crash: $_memo" >&2
+      echo "  The review may be complete server-side. Recover it WITHOUT spending another Pro slot:" >&2
+      echo "    ${PRO_GATE_HOME:-\$HOME/.pro-review-daemon}/oracle-review.sh --harvest '${RUN_MARKER}' --out '${OUT}' --timeout 20m" >&2
+      echo "  Or inspect all state for this change first: ${PRO_GATE_HOME:-\$HOME/.pro-review-daemon}/oracle-review.sh --status '${PR_URL:-${PR_NUM:-}}'" >&2
+      FAIL_DETAIL="review browser restarted mid-run (chrome up ${_svc_up}s); conversation URL remembered — recover FREE with --harvest '${RUN_MARKER}'"
+    else
+      echo "  The slot was likely already spent and the review may still exist in ChatGPT, so do NOT immediately re-run. Free memory (close other apps / browser tabs) and try again." >&2
+      FAIL_DETAIL="review browser restarted mid-run (chrome up ${_svc_up}s); likely out of memory"
+    fi
   fi
   pg_status failed "$FAIL_DETAIL"
   pg_finish 6
