@@ -19,7 +19,7 @@ Conventions in this file:
 
 | Version | Date | Artifact | Theme |
 |---|---|---|---|
-| [v0.30.1](https://github.com/StartupBros-com/pro-gate/releases/tag/v0.30.1) | 2026-08-03 | Release | Hygiene close-out: consent stderr leak, run-log sweep allowlist, blacklist/log bounds, `.env` perms, salvage-window knob |
+| [v0.30.1](https://github.com/StartupBros-com/pro-gate/releases/tag/v0.30.1) | 2026-08-03 | Release | Hygiene close-out: consent stderr leak, run-log sweep allowlist, autoupdate.log bound, `.env` perms, salvage-window knob |
 | [v0.30.0](https://github.com/StartupBros-com/pro-gate/releases/tag/v0.30.0) | 2026-08-03 | Release | Residuals close-out: daemon recoverable-state guard, scratch hygiene, memoized-URL recovery (plus the #58–#60 docs wave) |
 | [v0.29.0](https://github.com/StartupBros-com/pro-gate/releases/tag/v0.29.0) | 2026-08-02 | Release | ChatGPT sidebar titling: run-naming prompt line |
 | [v0.28.0](https://github.com/StartupBros-com/pro-gate/releases/tag/v0.28.0) | 2026-08-02 | Release | Capture provenance: nonce run-binding, early URL capture, immutable artifacts |
@@ -232,16 +232,18 @@ when the consent file is absent (redirect-order bug — `2>/dev/null` cannot cat
 `<` open listed before it); the run-log sweep matches an allowlist of run-log shapes
 (`pg-run-*` plus the pre-v0.27 epoch-suffixed names) so pre-v0.27 logs finally retire while
 `autoupdate.log` and the launchd daemon's open `daemon.{out,err}.log` are structurally
-unmatched; the salvage blacklist is bounded by the new `pg_trim_file` helper — flock-shared
-with the bash appender and skipped while CDP salvage children run, so no concurrent append
-can vanish into the compaction window; `autoupdate.log` is trimmed by its writer; `.env` is
-installed owner-only and the doctor warns when it is group/other-readable. The non-live
-salvage window became its own knob (`PRO_GATE_SALVAGE_SECS`, default: follows
-`PRO_GATE_STALL_SECS` as before) so the stall watchdog can be tuned without silently
-halving recovery windows. `title-seq/` counters are deliberately NOT swept — the gate's
-own review of this change pointed back to their documented monotonic-ordinal invariant
-(gate #57 r4): pruning one would re-title a post-idle round r1 while the old r1
-conversation still exists server-side. Comments calling CDP salvage "defense-in-depth"
+unmatched; `autoupdate.log` is bounded by the new `pg_trim_file` helper, inside the
+updater's singleton lock; `.env` is installed owner-only (a failed `chmod 600` now aborts
+the install before the version stamps land) and the doctor warns when it is
+group/other-readable. The non-live salvage window became its own knob
+(`PRO_GATE_SALVAGE_SECS`, default: follows `PRO_GATE_STALL_SECS` as before) so the stall
+watchdog can be tuned without silently halving recovery windows. Two candidate cleanups
+were deliberately REJECTED by the gate's own two-round review of this change:
+`title-seq/` counters stay unswept (documented monotonic-ordinal invariant, gate #57 r4 —
+pruning one would re-title a post-idle round r1 beside the old r1 conversation), and the
+multi-writer salvage blacklist stays append-only (a read→rename compaction can drop a
+concurrent bash/Node append without one cross-platform lock shared by every writer;
+~16KB/week does not earn that machinery). Comments calling CDP salvage "defense-in-depth"
 were updated to match observed reality (100% of clean runs 2026-07-22 → 08-03 landed via
 salvage/harvest; oracle 0.17.0 restored primary capture for runs that finish inside the
 stall fuse).

@@ -1474,16 +1474,13 @@ find "$PRO_GATE_HOME/logs" -maxdepth 1 -type f \
 # monotonic and never window-pruned (gate #57 r4) — a pruned counter would re-title a
 # post-idle round r1 while the old r1 conversation still exists server-side, recreating the
 # stale-verdict ambiguity the ordinal exists to prevent. 1-byte files; unbounded is fine.
-# The foreign-conversation blacklist is append-only from two writers (engines'
-# pg_provenance_reject and the CDP salvage child). Trim flock-guarded against the bash
-# appender, and only while no salvage child runs — the Node appender takes no lock, and a
-# line lost to the read→rename window could replay a provenance-rejected conversation in
-# legacy nonce mode (#63 gate P1). PRO_GATE_TRIM_SALVAGE_CHECK=0 skips the process check
-# (tests; single-tenant ops).
-if [ "${PRO_GATE_TRIM_SALVAGE_CHECK:-1}" = 0 ] \
-   || ! { command -v pgrep >/dev/null 2>&1 && pgrep -f 'cdp-salvage\.mjs' >/dev/null 2>&1; }; then
-  pg_trim_file "$PRO_GATE_HOME/salvage-nonmatching.txt" 1000 500 "$PRO_GATE_HOME/salvage-nonmatching.txt.lock"
-fi
+# The foreign-conversation blacklist (salvage-nonmatching.txt) is deliberately NOT
+# compacted here: it has concurrent writers in two languages (engines' pg_provenance_reject
+# and the Node salvage children), and any read→rename compaction can silently drop an
+# append unless every writer shares one cross-platform lock — flock is absent on stock
+# macOS and a pgrep guard is only a point-in-time check (#63 gate r1+r2). A dropped line
+# can replay a provenance-rejected conversation in legacy nonce mode, so correctness beats
+# tidiness: the file stays append-only (~16KB/week observed; revisit only if that changes).
 # #50 item 1 (backfill): scratch dirs leaked by pre-trap engines and kill -9 runs. Only our
 # own naming patterns, only dirs old enough (7d) that every recovery pointer into them has
 # long expired (reservation TTL 6h; PG_KEEP_FINAL messages say "copy it out now").

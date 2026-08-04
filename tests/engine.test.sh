@@ -703,27 +703,16 @@ printf '7' > "$RHOME/title-seq/idle-key"
 touch -d '20 days ago' "$RHOME/logs/legacy-owner-repo-4-1782771272.log" "$RHOME/logs/autoupdate.log" "$RHOME/logs/daemon.err.log" "$RHOME/title-seq/idle-key" 2>/dev/null \
   || touch -t 202001010000 "$RHOME/logs/legacy-owner-repo-4-1782771272.log" "$RHOME/logs/autoupdate.log" "$RHOME/logs/daemon.err.log" "$RHOME/title-seq/idle-key"
 seq 1 1200 > "$RHOME/salvage-nonmatching.txt"
-roundrun 89 "$RHOME/o-hyg.md" PRO_GATE_TRIM_SALVAGE_CHECK=0
+roundrun 89 "$RHOME/o-hyg.md"
 check 'hygiene run exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
 check 'legacy epoch-named run log is swept' "$([ ! -f "$RHOME/logs/legacy-owner-repo-4-1782771272.log" ]; echo $?)" "logs: $(ls "$RHOME/logs" 2>/dev/null)"
 check 'autoupdate.log survives the log sweep' "$([ -f "$RHOME/logs/autoupdate.log" ]; echo $?)" 'autoupdate.log deleted'
 check 'launchd daemon log survives the log sweep (gate P1)' "$([ -f "$RHOME/logs/daemon.err.log" ]; echo $?)" 'daemon.err.log deleted'
 check 'fresh pg-run log survives the sweep' "$([ -f "$RHOME/logs/pg-run-fresh.log" ]; echo $?)" 'fresh log deleted'
 check 'idle title-seq counter is NEVER swept (gate P2: monotonic ordinal)' "$([ -f "$RHOME/title-seq/idle-key" ] && [ "$(cat "$RHOME/title-seq/idle-key")" = '7' ]; echo $?)" "title-seq: $(ls "$RHOME/title-seq" 2>/dev/null)"
-check 'salvage blacklist trimmed to 500 newest lines' "$([ "$(wc -l < "$RHOME/salvage-nonmatching.txt")" -eq 500 ] && [ "$(tail -1 "$RHOME/salvage-nonmatching.txt")" = '1200' ]; echo $?)" "lines=$(wc -l < "$RHOME/salvage-nonmatching.txt" 2>/dev/null) tail=$(tail -1 "$RHOME/salvage-nonmatching.txt" 2>/dev/null)"
-# The trim and the bash appender share a flock: an append issued while the trim holds the
-# lock must land in the post-trim file, not vanish into the read->rename window.
-if command -v flock >/dev/null 2>&1; then
-  ( flock -x 9; sleep 2 ) 9>>"$RHOME/salvage-nonmatching.txt.lock" &
-  TRIMHOLD=$!
-  sleep 0.3
-  APPEND_T0=$SECONDS
-  PRO_GATE_HOME="$RHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; PRO_GATE_HOME='$RHOME' pg_provenance_reject 'pg-run-locktest-1700000000-1' 'https://chatgpt.com/c/locktest'"
-  APPEND_SECS=$(( SECONDS - APPEND_T0 ))
-  wait "$TRIMHOLD" 2>/dev/null
-  check 'blacklist append waits for the trim lock' "$([ "$APPEND_SECS" -ge 1 ]; echo $?)" "append returned in ${APPEND_SECS}s (expected to block ~2s)"
-  check 'locked append still lands' "$(grep -q 'locktest' "$RHOME/salvage-nonmatching.txt"; echo $?)" "$(tail -2 "$RHOME/salvage-nonmatching.txt")"
-fi
+# gate r2 P1: the multi-writer blacklist is append-only BY DESIGN — housekeeping must not
+# compact it (a read->rename trim can drop a concurrent append; see the engine comment).
+check 'salvage blacklist is NEVER compacted by housekeeping' "$([ "$(wc -l < "$RHOME/salvage-nonmatching.txt")" -eq 1200 ]; echo $?)" "lines=$(wc -l < "$RHOME/salvage-nonmatching.txt" 2>/dev/null)"
 
 # Harvests spend no slot and must never consume a round.
 NROUND_FILES="$(ls "$RHOME/rounds" 2>/dev/null | wc -l)"

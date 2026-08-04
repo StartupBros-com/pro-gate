@@ -109,6 +109,14 @@ run_updater FAKE_DAEMON_ENABLED="$TDIR/daemon-enabled" PRO_GATE_CONSENT_HOME="$T
 check 'consented daemon box updates (services skipped)' "$([ "$(cat "$TDIR/install.log")" = '0.23.0 1' ]; echo $?)" "log=$(cat "$TDIR/install.log")"
 rm -f "$TDIR/daemon-enabled"
 
+echo '# v0.30.1 (gate r2 P2): autoupdate.log is bounded inside pgau_main, never at source time'
+mkdir -p "$TDIR/home/logs"; seq 1 1200 > "$TDIR/home/logs/autoupdate.log"
+PRO_GATE_HOME="$TDIR/home" PRO_GATE_AUTOUPDATE_LIB=1 bash -c ". '$SCRIPT'" >/dev/null 2>&1
+check 'library-only source does not touch the log' "$([ "$(wc -l < "$TDIR/home/logs/autoupdate.log")" -eq 1200 ]; echo $?)" "lines=$(wc -l < "$TDIR/home/logs/autoupdate.log")"
+run_updater PRO_GATE_CONSENT_HOME="$TDIR/consent"
+AULINES="$(wc -l < "$TDIR/home/logs/autoupdate.log")"
+check 'a locked run trims the log to ~400 lines' "$([ "$AULINES" -ge 400 ] && [ "$AULINES" -le 410 ]; echo $?)" "lines=$AULINES"
+
 echo '# fail closed: non-semver plugin versions are never followed'
 write_manifest '0.23.0-$(rm -rf /)'
 printf '0.22.0\n' > "$TDIR/home/VERSION"

@@ -1131,37 +1131,21 @@ pg_provenance_reject() {  # <marker> [matched-url]
     fi
   fi
   [ -n "$url" ] || return 0
-  # Append under the blacklist's flock when available (#63 gate P1): pg_trim_file's
-  # read→rename compaction holds the same lock, so a concurrent engine's append can never
-  # land inside the window and vanish — in legacy nonce mode a lost blacklist line can
-  # replay a provenance-rejected conversation. No-flock platforms fall back to a bare
-  # append; there the call site's salvage-process check is the only guard.
-  if pg_have flock; then
-    { flock -x 9 2>/dev/null || true
-      printf '%s\t%s\n' "$m" "$url" >> "$PRO_GATE_HOME/salvage-nonmatching.txt"
-    } 9>>"$PRO_GATE_HOME/salvage-nonmatching.txt.lock" 2>/dev/null || true
-  else
-    { printf '%s\t%s\n' "$m" "$url" >> "$PRO_GATE_HOME/salvage-nonmatching.txt"; } 2>/dev/null || true
-  fi
+  { printf '%s\t%s\n' "$m" "$url" >> "$PRO_GATE_HOME/salvage-nonmatching.txt"; } 2>/dev/null || true
   return 0
 }
 
-# pg_trim_file <file> <max-lines> <keep-lines> [lockfile]: bound an append-only file by
-# keeping only the newest <keep-lines> once it exceeds <max-lines>. The rewrite lands via mv
-# (atomic), so readers never see a partial file. A line APPENDED between the tail and the mv
-# would be lost, so when the file has concurrent writers pass [lockfile] and take the SAME
-# flock in every appender (see pg_provenance_reject); writers that cannot share the lock
-# (e.g. Node) must be excluded at the call site instead. Lockless callers (single-writer
-# logs like autoupdate.log) lose at most one re-loggable line.
+# pg_trim_file <file> <max-lines> <keep-lines>: bound an append-only file by keeping only
+# the newest <keep-lines> once it exceeds <max-lines>. The rewrite lands via mv (atomic), so
+# readers never see a partial file — but a line APPENDED between the tail and the mv is
+# LOST, so this is for SINGLE-WRITER files whose writer calls it while holding that file's
+# own serialization (e.g. autoupdate.log under the updater's singleton lock). Multi-writer
+# files (the salvage blacklist: bash engines + Node salvage children) are deliberately NOT
+# compacted — a correct compaction there needs one cross-platform lock shared by every
+# appender in both languages (#63 gate r2), machinery a ~16KB/week diagnostic doesn't earn.
 pg_trim_file() {
-  local f="$1" max="$2" keep="$3" lock="${4:-}" n tmp
+  local f="$1" max="$2" keep="$3" n tmp
   [ -f "$f" ] || return 0
-  if [ -n "$lock" ] && pg_have flock; then
-    { flock -x 9 2>/dev/null || true
-      pg_trim_file "$f" "$max" "$keep"
-    } 9>>"$lock" 2>/dev/null || true
-    return 0
-  fi
   n="$(wc -l < "$f" 2>/dev/null)" || return 0
   [ "$n" -gt "$max" ] 2>/dev/null || return 0
   tmp="$(mktemp "${f}.trim.XXXXXX" 2>/dev/null)" || return 0
