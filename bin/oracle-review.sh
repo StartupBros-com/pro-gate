@@ -1461,19 +1461,29 @@ find "$(pg_manifest_dir)" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null ||
 # dir. 14 days dwarfs every recovery window (reservation TTL 6h; pending/ holds real bytes)
 # while still covering late manual recovery of a weeks-old run.
 find "$PRO_GATE_HOME/conversation-urls" -maxdepth 1 -type f -mmin +20160 -delete 2>/dev/null || true
-# #50 item 8: per-run diagnostic logs are swept on the same 14-day horizon. Matching every
-# *.log except autoupdate.log (the one intentional non-run log; its writer bounds it) also
-# retires run logs named before the v0.27 pg-run- marker convention, which the old
-# pg-run-*-only glob left behind forever.
-find "$PRO_GATE_HOME/logs" -maxdepth 1 -type f -name '*.log' ! -name 'autoupdate.log' -mmin +20160 -delete 2>/dev/null || true
-# title-seq counters (v0.29) are 1-byte per-round-key files with no other pruning; same
-# 14-day horizon. Worst case a swept key's sidebar titling restarts at r1 — cosmetic; the
-# title is a human aid, not an identity key.
-find "$(pg_title_seq_dir)" -maxdepth 1 -type f -mmin +20160 -delete 2>/dev/null || true
-# The foreign-conversation blacklist is append-only from two writers (this engine and the
-# CDP salvage child); markers stop being queried once their run resolves, so keeping the
-# newest 500 lines once it passes 1000 loses nothing a live salvage still needs.
-pg_trim_file "$PRO_GATE_HOME/salvage-nonmatching.txt" 1000 500
+# #50 item 8: per-run diagnostic logs are swept on the same 14-day horizon. An ALLOWLIST of
+# run-log shapes, not a *.log denylist (#63 gate P1: a *.log-minus-autoupdate.log sweep would
+# unlink logs/daemon.{out,err}.log, which the macOS launchd plist keeps OPEN for the live
+# daemon — the path dies while the invisible inode eats disk until restart). Matched shapes:
+# pg-run-* (v0.27+, incl. harvest sub-logs) and the pre-v0.27 '<owner>-<repo>-<pr>-<epoch>'
+# names, whose 10-digit epoch suffix no service log can carry.
+find "$PRO_GATE_HOME/logs" -maxdepth 1 -type f \
+  \( -name 'pg-run-*.log' -o -name '*-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].log' \) \
+  -mmin +20160 -delete 2>/dev/null || true
+# title-seq counters are deliberately NOT swept: pg_title_seq_next documents them as
+# monotonic and never window-pruned (gate #57 r4) — a pruned counter would re-title a
+# post-idle round r1 while the old r1 conversation still exists server-side, recreating the
+# stale-verdict ambiguity the ordinal exists to prevent. 1-byte files; unbounded is fine.
+# The foreign-conversation blacklist is append-only from two writers (engines'
+# pg_provenance_reject and the CDP salvage child). Trim flock-guarded against the bash
+# appender, and only while no salvage child runs — the Node appender takes no lock, and a
+# line lost to the read→rename window could replay a provenance-rejected conversation in
+# legacy nonce mode (#63 gate P1). PRO_GATE_TRIM_SALVAGE_CHECK=0 skips the process check
+# (tests; single-tenant ops).
+if [ "${PRO_GATE_TRIM_SALVAGE_CHECK:-1}" = 0 ] \
+   || ! { command -v pgrep >/dev/null 2>&1 && pgrep -f 'cdp-salvage\.mjs' >/dev/null 2>&1; }; then
+  pg_trim_file "$PRO_GATE_HOME/salvage-nonmatching.txt" 1000 500 "$PRO_GATE_HOME/salvage-nonmatching.txt.lock"
+fi
 # #50 item 1 (backfill): scratch dirs leaked by pre-trap engines and kill -9 runs. Only our
 # own naming patterns, only dirs old enough (7d) that every recovery pointer into them has
 # long expired (reservation TTL 6h; PG_KEEP_FINAL messages say "copy it out now").
