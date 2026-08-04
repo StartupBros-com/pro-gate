@@ -176,12 +176,21 @@ engine home is `$HOME/.pro-review-daemon`.
   temporarily limited" interstitial, the engine writes `$PRO_GATE_HOME/throttle.cooldown` and every
   new run DEFERS (exit 8, no quota spent) until it expires (`PRO_GATE_THROTTLE_COOLDOWN`, default
   900s). Never delete the cooldown file to force a run — hammering extends the throttle.
-- **Review round budget (engine ≥v0.22):** unbounded review→fix→re-review loops have burned
-  10-16 Pro slots on a single PR in one day (8h+ of wall clock; every other queued PR starves).
-  The engine refuses a fresh run for a PR (repo+branch for `--diff`) that already spent
-  `PRO_GATE_MAX_ROUNDS_PER_PR` (default 4) slots inside the rolling `PRO_GATE_ROUNDS_WINDOW`
-  (default 24h): exit 12, NO quota spent. Harvests never count against it. This is the backstop,
-  not the plan: design the gate around section 6's convergence policy so you never hit it.
+- **Review round budget (engine ≥v0.22; trajectory-aware governor ≥v0.31):** unbounded
+  review→fix→re-review loops have burned 10-16 Pro slots on a single PR in one day (8h+ of
+  wall clock; every other queued PR starves). The engine budgets fresh runs per change
+  (repo-scoped PR key; repo+branch for `--diff`) inside the rolling `PRO_GATE_ROUNDS_WINDOW`
+  (default 24h): exit 12, NO quota spent, when exhausted. Since v0.31 the budget GOVERNS by
+  trajectory instead of a flat count: base grant `PRO_GATE_ROUNDS_BASE` (default 3), +1
+  earned for every completed re-review whose open P0+P1 count strictly shrank, hard ceiling
+  `PRO_GATE_ROUNDS_CEILING` (default 8) that no streak can out-earn — and two consecutive
+  NON-shrinking re-reviews stop the loop EARLY (churn brake), before the base is spent. A
+  converging gate therefore finishes without human overrides, and a churning one is cut
+  sooner than the old flat 4. Setting `PRO_GATE_MAX_ROUNDS_PER_PR` explicitly pins the
+  legacy flat cap (trajectory ignored). Harvests never count; a submission the engine can
+  PROVE never landed (send/upload failure: browser scanned clean, no URL ever memoized)
+  refunds its round automatically. This is the backstop, not the plan: design the gate
+  around section 6's convergence policy so you rarely hit it.
 
 ## 3. Run the review
 
@@ -228,12 +237,15 @@ open: never submit a NEW review for it — harvest by marker instead (below; the
 same-change redirect exists as a backstop, but reconciliation can expire a stale
 reservation first, so harvest directly, do not relaunch to "get redirected") · `11` oversized diff (past the hard ceiling
 `PRO_GATE_DIFF_HARD_MAX`), NO quota spent: scope the payload (below); a merely large diff instead
-proceeds and lands `in-progress` for harvest · `12` round budget exhausted, NO quota spent: this
-PR/branch already used its review rounds for the window (section 6): do NOT re-run; post the
-still-unresolved findings for the human, or set `PRO_GATE_FORCE_ROUND=1` for one deliberate
-extra run. Committed fixes STAY on the branch (section 6, disposition). The exit-12 status `detail` also reports the change's last completed review as
-"N P0 / M P1 unconfirmed by a re-review" when known: if it names an OPEN P0, put that at the
-top of your escalation comment and explicitly ask the human whether to grant
+proceeds and lands `in-progress` for harvest · `12` round budget exhausted, NO quota spent: the
+governor refused this PR/branch — either its earned grant is spent or its trajectory stopped
+shrinking (churn brake; section 6): do NOT re-run; post the still-unresolved findings for the
+human, or set `PRO_GATE_FORCE_ROUND=1` for one deliberate extra run. Committed fixes STAY on
+the branch (section 6, disposition). The exit-12 status `detail` reports the change's last
+completed review ("N P0 / M P1 unconfirmed by a re-review") AND the per-round trajectory
+("open P0/P1 by round: 5→7→8") when known: quote the trajectory in your escalation comment —
+a human deciding on FORCE_ROUND needs "churning" vs "converging" more than any single count —
+and if it names an OPEN P0, put that at the top and explicitly ask whether to grant
 `PRO_GATE_FORCE_ROUND=1`.
 
 **Exit 9 (`in-progress`): harvest, don't respend.** The Pro model can reason for 45-90+ minutes
@@ -356,21 +368,34 @@ Run a confirming pass — and continue to any round after it — ONLY while ALL 
   defaults it to 2).
 
 Stop immediately when any of: verdict `SHIP`; a confirming pass reports no new P0/P1; a
-finding you already fixed comes back (oscillation — the fixer and reviewer disagree and
-another loop will not settle it: escalate, and the fix STAYS on the branch while the human
-decides); the new-finding count did not shrink; verdict `NEEDS-DISCUSSION` (a human decision,
-not a fix loop); engine exit 12; an explicitly configured `pro_gate_max_rounds` (or bounded
-mode's default 2) is reached. On the last allowed round, still fix any new P0/P1 it
-surfaced — they ship as "fixed, unconfirmed by a re-review" — and post new P2/P3 as notes.
+finding you already fixed comes back as a DISPUTED fix (true oscillation — see below); the
+new-finding count did not shrink; verdict `NEEDS-DISCUSSION` (a human decision, not a fix
+loop); engine exit 12; an explicitly configured `pro_gate_max_rounds` (or bounded mode's
+default 2) is reached. On the last allowed round, still fix any new P0/P1 it surfaced —
+they ship as "fixed, unconfirmed by a re-review" — and post new P2/P3 as notes.
+
+**A returning finding is not always oscillation — read the reviewer's reason before
+stopping.** Two distinct cases (both observed in the field, pro-gate#63 rounds 2-3 is the
+case study):
+- **Disputed fix** — the reviewer rejects your APPROACH ("narrowed guards are not the CAS
+  fix this needs"): another loop will not settle a disagreement between fixer and reviewer.
+  STOP and escalate; the fix stays on the branch while the human decides.
+- **Acknowledged-incomplete fix** — the reviewer accepts the approach and names a CONCRETE
+  residual ("the flock branch is right, but stock macOS has no flock"): that is convergence
+  work, not oscillation. Fix the named residual and let the next confirming pass verify it,
+  budget permitting — conceding the point (removing the contested mechanism) counts as a
+  fix here and typically settles the finding for good.
 
 Mechanics:
 
 - Every pass MUST go through the engine (`oracle-review.sh`) like any other run, never
   through a direct `oracle --followup` call: the engine is the single source of truth for
   budget accounting, and a direct oracle call spends a Pro response the round budget never
-  sees. The engine independently budgets ALL callers per change
-  (`PRO_GATE_MAX_ROUNDS_PER_PR`, default 4 per rolling 24h, exit 12, section 2): the
-  converge policy runs INSIDE that ceiling, it does not lift it.
+  sees. The engine independently budgets ALL callers per change (the v0.31 trajectory
+  governor: base 3, +1 per shrinking re-review, ceiling 8, churn brake — or the legacy flat
+  cap when `PRO_GATE_MAX_ROUNDS_PER_PR` is explicitly set; exit 12, section 2): the
+  converge policy runs INSIDE that grant, it does not lift it. The two layers agree by
+  design — a gate following this section's stop rules earns exactly the rounds it needs.
 - Run each confirming pass as:
 
   ```bash

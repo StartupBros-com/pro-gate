@@ -574,6 +574,18 @@ check 'round 1 recorded' "$([ "$(rounds_of)" -eq 1 ]; echo $?)" "rounds=$(rounds
 check 'completed review writes severity sidecar (0 P0 / 1 P1)' \
   "$([ "$(awk -F'\t' 'NR==1{print $2" "$3}' "$RHOME/rounds/$RKEY_88.last" 2>/dev/null)" = '0 1' ]; echo $?)" \
   "sidecar: $(cat "$RHOME/rounds/$RKEY_88.last" 2>/dev/null)"
+# v0.31 (#65): the same completion appends a trajectory-history row the governor scores.
+check 'completed review appends hist row (verdict + open counts)' \
+  "$([ "$(awk -F'\t' 'NR==1{print $2" "$3" "$4" "$5" "$6}' "$RHOME/rounds/$RKEY_88.hist" 2>/dev/null)" = 'SHIP 0 1 0 0' ]; echo $?)" \
+  "hist: $(cat "$RHOME/rounds/$RKEY_88.hist" 2>/dev/null)"
+# The history parser shares pg_is_review's hardened terminal matcher (bold/bullet formatting).
+printf '[P1] a.sh:1 - finding\n  Why: test\nP2: none\nP3: none\n**VERDICT:** FIX-FIRST - formatted.\n' > "$RHOME/formatted-review.md"
+PRO_GATE_HOME="$RHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_note_severity '$RKEY_88' '$RHOME/formatted-review.md'"
+check 'formatted verdict records FIX-FIRST (shared hardened parser)' \
+  "$([ "$(awk -F'\t' 'END{print $2}' "$RHOME/rounds/$RKEY_88.hist")" = FIX-FIRST ]; echo $?)" \
+  "hist: $(tail -1 "$RHOME/rounds/$RKEY_88.hist")"
+# Remove the synthetic parser-only row so the live round sequence below stays 1:1.
+head -n 1 "$RHOME/rounds/$RKEY_88.hist" > "$RHOME/rounds/$RKEY_88.hist.tmp" && mv "$RHOME/rounds/$RKEY_88.hist.tmp" "$RHOME/rounds/$RKEY_88.hist"
 roundrun 88 "$RHOME/o-r2.md"
 check 'round 2 proceeds (exit 0)' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
 check 'round 2 recorded' "$([ "$(rounds_of)" -eq 2 ]; echo $?)" "rounds=$(rounds_of)"
@@ -714,6 +726,101 @@ check 'idle title-seq counter is NEVER swept (gate P2: monotonic ordinal)' "$([ 
 # compact it (a read->rename trim can drop a concurrent append; see the engine comment).
 check 'salvage blacklist is NEVER compacted by housekeeping' "$([ "$(wc -l < "$RHOME/salvage-nonmatching.txt")" -eq 1200 ]; echo $?)" "lines=$(wc -l < "$RHOME/salvage-nonmatching.txt" 2>/dev/null)"
 
+echo '# v0.31 (#65): trajectory-aware round governor'
+GHOME="$TDIR/home-governor"; mkdir -p "$GHOME/rounds"
+GEPOCH="$(date +%s)"
+gseed() { # $1=key $2=spends; rows all in-window
+  : > "$GHOME/rounds/$1"
+  local i=0; while [ "$i" -lt "$2" ]; do printf '%s\n' "$GEPOCH" >> "$GHOME/rounds/$1"; i=$(( i + 1 )); done
+}
+ghist() { # $1=key, rest = open-P1 counts per completed round (P0 held at 0)
+  local key="$1" n; shift
+  : > "$GHOME/rounds/$key.hist"
+  for n in "$@"; do printf '%s\tFIX-FIRST\t0\t%s\t0\t0\n' "$GEPOCH" "$n" >> "$GHOME/rounds/$key.hist"; done
+}
+gguard() { # $1=key, rest = env overrides; stdout = reason, rc = guard rc
+  local key="$1"; shift
+  env PRO_GATE_HOME="$GHOME" "$@" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_guard '$key'"
+}
+# No history: the base grant (3) is the whole budget.
+gseed nohist 3
+GOUT="$(gguard nohist)"; GRC=$?
+check 'governor: base grant refuses round 4 without earned rounds' "$([ "$GRC" -eq 1 ]; echo $?)" "rc=$GRC out=$GOUT"
+check 'governor: exhaustion reason names base + earned + ceiling' "$(printf '%s' "$GOUT" | grep -q 'base 3 + 0 earned'; echo $?)" "$GOUT"
+gseed nohist 2
+gguard nohist >/dev/null; GRC=$?
+check 'governor: round 3 of base 3 proceeds' "$([ "$GRC" -eq 0 ]; echo $?)" "rc=$GRC"
+# Shrinking trajectory earns extra rounds: open 5 -> 3 -> 1 = +2 earned (grant 5).
+gseed shrink 4; ghist shrink 5 3 1
+gguard shrink >/dev/null; GRC=$?
+check 'governor: shrinking trajectory earns round 5' "$([ "$GRC" -eq 0 ]; echo $?)" "rc=$GRC $(gguard shrink)"
+gseed shrink 5
+GOUT="$(gguard shrink)"; GRC=$?
+check 'governor: earned grant still exhausts (5/5)' "$([ "$GRC" -eq 1 ] && printf '%s' "$GOUT" | grep -q '5/5 rounds'; echo $?)" "rc=$GRC out=$GOUT"
+# Churn brake: two consecutive non-shrinking re-reviews stop the loop EARLY (before base).
+gseed churn 3; ghist churn 5 7 8
+GOUT="$(gguard churn)"; GRC=$?
+check 'governor: churn brake refuses (not converging)' "$([ "$GRC" -eq 1 ] && printf '%s' "$GOUT" | grep -q 'churning, not converging'; echo $?)" "rc=$GRC out=$GOUT"
+check 'governor: churn reason carries the trajectory arrow' "$(printf '%s' "$GOUT" | grep -q '5→7→8'; echo $?)" "$GOUT"
+# A recovery round (shrink after churn) resets the streak: 5 -> 7 -> 8 -> 2 is earning again.
+ghist churn 5 7 8 2
+gguard churn >/dev/null; GRC=$?
+check 'governor: a shrinking round releases the brake' "$([ "$GRC" -eq 0 ]; echo $?)" "rc=$GRC $(gguard churn)"
+# Ceiling is immovable: 10 shrinking rounds cannot out-earn it.
+gseed marathon 8; ghist marathon 20 18 16 14 12 10 8 6 4 2 1
+GOUT="$(gguard marathon)"; GRC=$?
+check 'governor: ceiling 8 caps any earned run' "$([ "$GRC" -eq 1 ] && printf '%s' "$GOUT" | grep -q 'ceiling 8'; echo $?)" "rc=$GRC out=$GOUT"
+# Explicitly-set flat cap pins legacy behavior: churn trajectory is ignored.
+gseed flatkey 3; ghist flatkey 5 7 8
+gguard flatkey PRO_GATE_MAX_ROUNDS_PER_PR=4 >/dev/null; GRC=$?
+check 'flat mode: explicit cap ignores the trajectory' "$([ "$GRC" -eq 0 ]; echo $?)" "rc=$GRC"
+GOUT="$(gguard flatkey PRO_GATE_MAX_ROUNDS_PER_PR=3)"; GRC=$?
+check 'flat mode: explicit cap still enforces its number' "$([ "$GRC" -eq 1 ] && printf '%s' "$GOUT" | grep -q '3/3 slot-spending'; echo $?)" "rc=$GRC out=$GOUT"
+# Base 0 keeps the lockdown reading in governor mode.
+GOUT="$(gguard nohist PRO_GATE_ROUNDS_BASE=0)"; GRC=$?
+check 'governor: base 0 is a lockdown' "$([ "$GRC" -eq 1 ] && printf '%s' "$GOUT" | grep -q 'PRO_GATE_ROUNDS_BASE=0'; echo $?)" "rc=$GRC out=$GOUT"
+# pg_round_grant mirrors the guard for --status: churn collapses remaining to 0.
+gseed churn2 3; ghist churn2 5 7 8
+GOUT="$(env PRO_GATE_HOME="$GHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_grant churn2")"
+check 'grant: churn brake collapses the grant to spent' "$([ "$GOUT" = 3 ]; echo $?)" "grant=$GOUT"
+
+echo '# v0.31 (#65): governor integration — engine exit 12 carries the trajectory'
+RKEY_90="$(printf '%s-90' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
+mkdir -p "$RHOME/rounds"
+: > "$RHOME/rounds/$RKEY_90"; for _ in 1 2 3; do printf '%s\n' "$(date +%s)" >> "$RHOME/rounds/$RKEY_90"; done
+printf '%s\tFIX-FIRST\t0\t5\t0\t0\n%s\tFIX-FIRST\t0\t7\t0\t0\n%s\tFIX-FIRST\t0\t8\t0\t0\n' \
+  "$(date +%s)" "$(date +%s)" "$(date +%s)" > "$RHOME/rounds/$RKEY_90.hist"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-ok" NODE_OPTIONS= \
+  bash "$ENGINE" --pr 90 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$RHOME/o-gov.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'governor engine run: churn exits 12' "$([ "$RC" -eq 12 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+check 'governor engine run: phase round-capped' "$([ "$(phase_of "$RHOME/o-gov.md.status")" = round-capped ]; echo $?)" "$(cat "$RHOME/o-gov.md.status" 2>/dev/null)"
+check 'governor engine run: status detail carries the trajectory arrow' "$(grep -q '5→7→8' "$RHOME/o-gov.md.status"; echo $?)" "$(cat "$RHOME/o-gov.md.status" 2>/dev/null)"
+
+echo '# v0.31 (#65): a provably-never-landed submission refunds its round'
+cat > "$TDIR/bin/oracle-dead" <<'FAKE_DEAD'
+#!/usr/bin/env bash
+exit 1
+FAKE_DEAD
+chmod +x "$TDIR/bin/oracle-dead"
+RKEY_91="$(printf '%s-91' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 PRO_GATE_STALL_SECS=30 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-dead" NODE_OPTIONS= \
+  bash "$ENGINE" --pr 91 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$RHOME/o-refund.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'never-landed run fails (exit 6)' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+check 'never-landed run announces the refund' "$(grep -q 'refunding this round' "$TDIR/stderr"; echo $?)" "$(tail -5 "$TDIR/stderr")"
+check 'never-landed round is refunded (no in-window spend remains)' \
+  "$([ ! -s "$RHOME/rounds/$RKEY_91" ]; echo $?)" "rounds: $(cat "$RHOME/rounds/$RKEY_91" 2>/dev/null)"
+check 'refund is named in the status detail' "$(grep -q 'round refunded' "$RHOME/o-refund.md.status"; echo $?)" "$(cat "$RHOME/o-refund.md.status" 2>/dev/null)"
+
 # Harvests spend no slot and must never consume a round.
 NROUND_FILES="$(ls "$RHOME/rounds" 2>/dev/null | wc -l)"
 MKR="pg-run-roundharvest-1700000030-22"
@@ -811,13 +918,14 @@ PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 >"$TDIR/st.out" 2>"$TDIR/st.er
 check '--status exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(cat "$TDIR/st.err")"
 check '--status names the reservation marker' "$(grep -q "$SMARKER" "$TDIR/st.out"; echo $?)" "$(cat "$TDIR/st.out")"
 check '--status leads to a free harvest' "$(grep -q "FREE" "$TDIR/st.out" && grep -q -- "--harvest '$SMARKER'" "$TDIR/st.out"; echo $?)" "$(grep -i harvest "$TDIR/st.out")"
-check '--status reports rounds spent/remaining' "$(grep -q '2 spent, 2 remaining' "$TDIR/st.out"; echo $?)" "$(grep spent "$TDIR/st.out")"
+# v0.31: governor default — base grant 3 with no trajectory history, so 2 spent leaves 1.
+check '--status reports rounds spent/remaining' "$(grep -q '2 spent, 1 remaining' "$TDIR/st.out"; echo $?)" "$(grep spent "$TDIR/st.out")"
 check '--status writes nothing' "$([ ! -f "$SHOME/ledger.jsonl.tmp" ] && [ "$(wc -l < "$SHOME/ledger.jsonl")" -eq 1 ]; echo $?)" 'state mutated'
 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 --json >"$TDIR/st.json" 2>/dev/null; RC=$?
 check '--status --json exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC"
 check '--status --json reservation marker' "$([ "$(jq -r '.reservations[0].marker' "$TDIR/st.json")" = "$SMARKER" ]; echo $?)" "$(cat "$TDIR/st.json")"
 check '--status --json remembered url' "$([ "$(jq -r '.reservations[0].conversation_url' "$TDIR/st.json")" = "https://chatgpt.com/c/abc123" ]; echo $?)" "$(jq -c .reservations "$TDIR/st.json")"
-check '--status --json rounds remaining' "$([ "$(jq -r '.rounds[0].remaining' "$TDIR/st.json")" = 2 ]; echo $?)" "$(jq -c .rounds "$TDIR/st.json")"
+check '--status --json rounds remaining' "$([ "$(jq -r '.rounds[0].remaining' "$TDIR/st.json")" = 1 ] && [ "$(jq -r '.rounds[0].cap' "$TDIR/st.json")" = 3 ]; echo $?)" "$(jq -c .rounds "$TDIR/st.json")"
 check '--status --json recent runs' "$([ "$(jq -r '.recent_runs | length' "$TDIR/st.json")" = 1 ]; echo $?)" "$(jq -c .recent_runs "$TDIR/st.json")"
 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status "$SMARKER" --json >"$TDIR/st2.json" 2>/dev/null
 check '--status by marker finds the reservation' "$([ "$(jq -r '.reservations | length' "$TDIR/st2.json")" = 1 ]; echo $?)" "$(cat "$TDIR/st2.json")"

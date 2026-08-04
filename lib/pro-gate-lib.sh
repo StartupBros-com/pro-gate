@@ -812,13 +812,28 @@ pg_ramp_update() {  # $1 = clean|throttle|failed, $2 = ceiling
 # 10-60+ min, serialized against one account), 8h+ of wall clock per PR plus queue starvation
 # for every other PR. Each slot-spending engine invocation records one "round" against a
 # repo-scoped key (PR_KEY for PR runs; repo+branch for --diff runs); a fresh run whose key has
-# already used PRO_GATE_MAX_ROUNDS_PER_PR rounds (default 4) inside the rolling
-# PRO_GATE_ROUNDS_WINDOW (default 24h) is refused BEFORE any lock or slot is taken (exit 12,
-# NO quota spent). Harvests and no-spend exits (7 lock timeout, 8 deferred, 11 oversized,
-# 12 round-capped) never record a round. PRO_GATE_ROUND_GUARD=0 disables the budget;
-# PRO_GATE_FORCE_ROUND=1 lets ONE deliberate invocation past the cap (its round still records,
-# so the next unforced run stays capped). State: $PRO_GATE_HOME/rounds/<key>, one
-# epoch-seconds line per slot-spending run, pruned to the window on every record.
+# exhausted its budget inside the rolling PRO_GATE_ROUNDS_WINDOW (default 24h) is refused
+# BEFORE any lock or slot is taken (exit 12, NO quota spent). Harvests and no-spend exits
+# (7 lock timeout, 8 deferred, 11 oversized, 12 round-capped) never record a round.
+#
+# v0.31 (#65): the budget is a trajectory-aware GOVERNOR, same shape as the concurrency ramp
+# (pg_ramp_*): adaptive within a hard ceiling, earned by demonstrated progress, collapsed on
+# churn. Fleet evidence (254 gated changes, 737 spends, 28 audit trails): a flat cap of 4 was
+# wrong in BOTH directions — converging gates (open P0/P1 shrinking every round, e.g.
+# 6→5→3→2→0-SHIP at round 5) needed per-run human forcing past it, while whack-a-mole gates
+# (5→7→8→10) burned all four slots on churn. Governor: base grant PRO_GATE_ROUNDS_BASE
+# (default 3); each completed re-review whose OPEN P0+P1 count (RESOLVED-filtered, from the
+# rounds/<key>.hist trajectory) is strictly below its predecessor's earns +1, clamped to the
+# immovable ceiling PRO_GATE_ROUNDS_CEILING (default 8); two consecutive non-shrinking
+# re-reviews collapse the grant (early exit 12 — churn stops BEFORE the base is spent, not
+# after). An explicitly SET PRO_GATE_MAX_ROUNDS_PER_PR pins the legacy flat cap instead
+# (trajectory ignored; =0 stays the operator lockdown). PRO_GATE_ROUND_GUARD=0 disables the
+# budget; PRO_GATE_FORCE_ROUND=1 lets ONE deliberate invocation past it (its round still
+# records, so the next unforced run stays governed). State: $PRO_GATE_HOME/rounds/<key>
+# (one epoch-seconds line per slot-spending run) + rounds/<key>.hist (one line per COMPLETED
+# review: epoch, verdict, open P0, open P1, resolved, still-present), both pruned to the
+# window. The caller-side converge policy (SKILL.md §6) remains the stricter first line;
+# this governor is the engine-enforced backstop that catches EVERY caller.
 # ─────────────────────────────────────────────────────────────────────────────
 pg_rounds_dir() { echo "${PRO_GATE_ROUNDS_DIR:-$PRO_GATE_HOME/rounds}"; }
 
@@ -955,13 +970,16 @@ pg_round_unrecord() {
 }
 
 # pg_round_note_severity <key> <review-file>: record the P0/P1 counts of a change's most
-# recent COMPLETED review in a sidecar ($rounds/<key>.last). Read back at round-cap time so a
-# capped gate can say "you are stopping WITH an open P0" (the one case a human may want
-# PRO_GATE_FORCE_ROUND=1 for). Best-effort and advisory: only keys that have recorded rounds
-# get a sidecar (this also skips legacy "diff" markers on the harvest path), and a stale
-# sidecar can only mis-describe the ADVISORY note, never the budget itself.
+# recent COMPLETED review in a sidecar ($rounds/<key>.last), and append the full per-round
+# line (epoch, verdict word, open P0, open P1, resolved, still-present) to the trajectory
+# history ($rounds/<key>.hist) the v0.31 round governor scores. .last is read back at
+# round-cap time so a capped gate can say "you are stopping WITH an open P0" (the one case a
+# human may want PRO_GATE_FORCE_ROUND=1 for). Best-effort: only keys that have recorded
+# rounds get sidecars (this also skips legacy "diff" markers on the harvest path). A lost
+# hist line (concurrent harvest completions race the rewrite) only UNDER-counts earned
+# rounds — the governor degrades toward the base grant, never past the ceiling.
 pg_round_note_severity() {
-  local key="$1" out="$2" dir p0 p1
+  local key="$1" out="$2" dir p0 p1 verdict res sp now win t rest
   pg_round_key_ok "$key" || return 0
   dir="$(pg_rounds_dir)"
   [ -f "$dir/$key" ] || return 0
@@ -983,6 +1001,24 @@ pg_round_note_severity() {
     | grep -Evc '^[[:space:]]*\[[Pp]1\][[:space:]]+[^[:space:]]+[[:space:]]+(—|--|-)[[:space:]]+RESOLVED([^_[:alnum:]]|$)')"; [ -n "$p1" ] || p1=0
   { printf '%s\t%s\t%s\n' "$(date +%s)" "$p0" "$p1" > "$dir/$key.last.tmp" \
       && mv -f "$dir/$key.last.tmp" "$dir/$key.last"; } 2>/dev/null || true
+  # v0.31 trajectory history for the round governor. Verdict word from the review's own
+  # terminal line; RESOLVED/STILL-PRESENT tallies use the same status-position anchor as the
+  # open-count filter above (P0+P1 lines only — the governor scores blocking severities).
+  verdict="$(pg_extract_verdict "$out")"; [ -n "$verdict" ] || verdict=UNKNOWN
+  res="$(grep -icE '^[[:space:]]*\[P[01]\][[:space:]]+[^[:space:]]+[[:space:]]+(—|--|-)[[:space:]]+RESOLVED([^_[:alnum:]]|$)' "$out" 2>/dev/null)"; [ -n "$res" ] || res=0
+  sp="$(grep -icE '^[[:space:]]*\[P[01]\][[:space:]]+[^[:space:]]+[[:space:]]+(—|--|-)[[:space:]]+STILL-PRESENT([^_[:alnum:]]|$)' "$out" 2>/dev/null)"; [ -n "$sp" ] || sp=0
+  now="$(date +%s)"; win="$(pg_round_window_secs)"
+  {
+    if [ -f "$dir/$key.hist" ]; then
+      while IFS= read -r t; do
+        rest="${t%%$'\t'*}"
+        case "$rest" in ''|*[!0-9]*) continue;; esac
+        [ $(( now - rest )) -lt "$win" ] && printf '%s\n' "$t"
+      done < "$dir/$key.hist"
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$now" "$verdict" "$p0" "$p1" "$res" "$sp"
+  } > "$dir/$key.hist.tmp" 2>/dev/null && mv -f "$dir/$key.hist.tmp" "$dir/$key.hist" 2>/dev/null \
+    || rm -f "$dir/$key.hist.tmp" 2>/dev/null
   return 0
 }
 
@@ -998,22 +1034,88 @@ pg_round_last_severity() {
   echo "$p0 $p1"
 }
 
+# pg_round_score <key>: score the in-window trajectory and resolve the governor's tunables in
+# ONE place so --status and enforcement cannot drift. Sets process globals PG_ROUND_EARNED,
+# PG_ROUND_STREAK, PG_ROUND_ARROW, PG_ROUND_BASE, PG_ROUND_CEILING, PG_ROUND_GRANT. Missing
+# history scores 0/0/"". In flat mode, GRANT is the explicit legacy cap and the trajectory
+# remains available for human-facing notes even though it does not affect enforcement.
+pg_round_score() {
+  local key="$1" f now win e verdict p0 p1 res sp open prev="" used
+  PG_ROUND_EARNED=0; PG_ROUND_STREAK=0; PG_ROUND_ARROW=""
+  PG_ROUND_BASE="${PRO_GATE_ROUNDS_BASE:-3}"; case "$PG_ROUND_BASE" in ''|*[!0-9]*) PG_ROUND_BASE=3;; esac
+  PG_ROUND_CEILING="${PRO_GATE_ROUNDS_CEILING:-8}"; case "$PG_ROUND_CEILING" in ''|*[!0-9]*) PG_ROUND_CEILING=8;; esac
+  [ "$PG_ROUND_CEILING" -lt "$PG_ROUND_BASE" ] && PG_ROUND_CEILING="$PG_ROUND_BASE"
+  if pg_round_key_ok "$key"; then
+    f="$(pg_rounds_dir)/$key.hist"
+    if [ -f "$f" ]; then
+      now="$(date +%s)"; win="$(pg_round_window_secs)"
+      while IFS=$'\t' read -r e verdict p0 p1 res sp; do
+        case "$e" in ''|*[!0-9]*) continue;; esac
+        [ $(( now - e )) -lt "$win" ] || continue
+        case "$p0" in ''|*[!0-9]*) p0=0;; esac
+        case "$p1" in ''|*[!0-9]*) p1=0;; esac
+        open=$(( p0 + p1 ))
+        if [ -n "$prev" ]; then
+          if [ "$open" -lt "$prev" ]; then PG_ROUND_EARNED=$(( PG_ROUND_EARNED + 1 )); PG_ROUND_STREAK=0
+          else PG_ROUND_STREAK=$(( PG_ROUND_STREAK + 1 )); fi
+        fi
+        PG_ROUND_ARROW="${PG_ROUND_ARROW:+${PG_ROUND_ARROW}→}${open}"
+        prev="$open"
+      done < "$f"
+    fi
+  fi
+  if [ -n "${PRO_GATE_MAX_ROUNDS_PER_PR:-}" ]; then
+    case "$PRO_GATE_MAX_ROUNDS_PER_PR" in *[!0-9]*|'') PG_ROUND_GRANT=4;; *) PG_ROUND_GRANT="$PRO_GATE_MAX_ROUNDS_PER_PR";; esac
+    return 0
+  fi
+  PG_ROUND_GRANT=$(( PG_ROUND_BASE + PG_ROUND_EARNED ))
+  [ "$PG_ROUND_GRANT" -gt "$PG_ROUND_CEILING" ] && PG_ROUND_GRANT="$PG_ROUND_CEILING"
+  if [ "$PG_ROUND_STREAK" -ge 2 ]; then
+    used="$(pg_round_count "$key")"
+    [ "$used" -lt "$PG_ROUND_GRANT" ] && PG_ROUND_GRANT="$used"
+  fi
+}
+
+# Compatibility/read-only accessors. pg_round_trajectory stays useful to shell callers and
+# tests; pg_round_grant is the status helper. Both delegate to the single scorer above.
+pg_round_trajectory() { pg_round_score "$1"; printf '%s\t%s\t%s\n' "$PG_ROUND_EARNED" "$PG_ROUND_STREAK" "$PG_ROUND_ARROW"; }
+pg_round_grant() { pg_round_score "$1"; echo "$PG_ROUND_GRANT"; }
+
 pg_round_guard() {  # $1 = key. 0 = proceed; 1 + a one-line reason on stdout = budget spent.
-  local key="$1" cap used
+  local key="$1" used
   [ "${PRO_GATE_ROUND_GUARD:-1}" = 1 ] || return 0
   [ "${PRO_GATE_FORCE_ROUND:-0}" = 1 ] && return 0   # deliberate one-invocation override
   pg_round_key_ok "$key" || return 0
-  cap="${PRO_GATE_MAX_ROUNDS_PER_PR:-4}"
-  case "$cap" in ''|*[!0-9]*) cap=4;; esac
-  # cap 0 takes its natural reading: ZERO fresh runs allowed (an operator lockdown of a
-  # runaway change). "Unlimited" is PRO_GATE_ROUND_GUARD=0, never a magic cap value.
-  if [ "$cap" -eq 0 ]; then
-    echo "review round budget for ${key} is 0: fresh Pro runs are disabled (PRO_GATE_MAX_ROUNDS_PER_PR=0)"
+  pg_round_score "$key"
+  # Legacy flat mode: an EXPLICITLY set PRO_GATE_MAX_ROUNDS_PER_PR pins the v0.22 behavior
+  # (trajectory ignored). Unset = the v0.31 governor below.
+  if [ -n "${PRO_GATE_MAX_ROUNDS_PER_PR:-}" ]; then
+    # cap 0 takes its natural reading: ZERO fresh runs allowed (an operator lockdown of a
+    # runaway change). "Unlimited" is PRO_GATE_ROUND_GUARD=0, never a magic cap value.
+    if [ "$PG_ROUND_GRANT" -eq 0 ]; then
+      echo "review round budget for ${key} is 0: fresh Pro runs are disabled (PRO_GATE_MAX_ROUNDS_PER_PR=0)"
+      return 1
+    fi
+    used="$(pg_round_count "$key")"
+    if [ "$used" -ge "$PG_ROUND_GRANT" ]; then
+      echo "review round budget exhausted for ${key}: ${used}/${PG_ROUND_GRANT} slot-spending runs in the last ${PRO_GATE_ROUNDS_WINDOW:-24h}${PG_ROUND_ARROW:+; open P0/P1 by round: ${PG_ROUND_ARROW}}"
+      return 1
+    fi
+    return 0
+  fi
+  # Governor mode (#65): base grant, +1 earned per strictly-shrinking re-review, immovable
+  # ceiling, early stop on churn. base 0 keeps the lockdown reading.
+  if [ "$PG_ROUND_BASE" -eq 0 ]; then
+    echo "review round budget for ${key} is 0: fresh Pro runs are disabled (PRO_GATE_ROUNDS_BASE=0)"
     return 1
   fi
   used="$(pg_round_count "$key")"
-  if [ "$used" -ge "$cap" ]; then
-    echo "review round budget exhausted for ${key}: ${used}/${cap} slot-spending runs in the last ${PRO_GATE_ROUNDS_WINDOW:-24h}"
+  if [ "$PG_ROUND_STREAK" -ge 2 ]; then
+    echo "review rounds stopped early for ${key}: the open-P0/P1 trajectory (${PG_ROUND_ARROW:-none}) has not shrunk for ${PG_ROUND_STREAK} consecutive re-reviews — this loop is churning, not converging (${used} slot-spending runs in the last ${PRO_GATE_ROUNDS_WINDOW:-24h})"
+    return 1
+  fi
+  if [ "$used" -ge "$PG_ROUND_GRANT" ]; then
+    echo "review round budget exhausted for ${key}: ${used}/${PG_ROUND_GRANT} rounds (base ${PG_ROUND_BASE} + ${PG_ROUND_EARNED} earned by a shrinking open-P0/P1 trajectory${PG_ROUND_ARROW:+ ${PG_ROUND_ARROW}}, ceiling ${PG_ROUND_CEILING}) in the last ${PRO_GATE_ROUNDS_WINDOW:-24h}"
     return 1
   fi
   return 0
@@ -1035,21 +1137,28 @@ pg_filter_diff() {
   ' "$in" > "$out"
 }
 
+# pg_extract_verdict <file>: echo SHIP/FIX-FIRST/NEEDS-DISCUSSION from the terminal verdict
+# line. Shared with pg_is_review and trajectory history so formatting drift cannot make a
+# structurally-accepted review record UNKNOWN. The matcher tolerates leading bold/bullet/quote
+# markers and whitespace, and markers/space before the colon (`**VERDICT:**`, `- VERDICT :`).
+pg_extract_verdict() {
+  grep -vE '^[[:space:]]*$' "$1" 2>/dev/null | tail -n 6 \
+    | grep -iE '^[[:space:]]*[*_>#-]*[[:space:]]*VERDICT[*_[:space:]]*:' \
+    | grep -oiE 'SHIP|FIX-FIRST|NEEDS-DISCUSSION' | head -1 | tr '[:lower:]' '[:upper:]'
+}
+
 # pg_is_review <file>: true only when <file> looks like a COMPLETE review, not a truncated or
-# garbage capture. Our prompt mandates Pn severity blocks AND one final "VERDICT:" line, so
-# require BOTH (v0.15, pro-gate PR#5 review P1: the old OR-grep accepted a capture truncated
-# after its first finding, which then skipped salvage/retry and shipped an incomplete review).
-# The VERDICT must sit near the end (last few non-empty lines): that rejects mid-file truncation
-# while tolerating trailing footer lines from the capture (e.g. a "Sources" block). The VERDICT
-# match tolerates GPT-5.6 formatting drift: leading bold/bullet/quote markers and whitespace, and
-# markers/space between VERDICT and its colon (e.g. `**VERDICT:**`, `- VERDICT :`).
+# garbage capture. Our prompt mandates Pn severity blocks AND one final verdict line, so require
+# BOTH (v0.15, pro-gate PR#5 review P1: the old OR-grep accepted a capture truncated after its
+# first finding, which then skipped salvage/retry and shipped an incomplete review). The verdict
+# must sit near the end (last few non-empty lines): that rejects mid-file truncation while
+# tolerating trailing footer lines from the capture (e.g. a "Sources" block).
 pg_is_review() {
   local f="$1"
   [ -s "$f" ] || return 1
   [ "$(wc -c < "$f" 2>/dev/null || echo 0)" -ge 40 ] || return 1
   grep -qiE '\[P[0-3]\]|P[0-3][*_ ]*:[[:space:]]*(none|—|-)' "$f" 2>/dev/null || return 1
-  grep -vE '^[[:space:]]*$' "$f" 2>/dev/null | tail -n 6 \
-    | grep -qiE '^[[:space:]]*[*_>#-]*[[:space:]]*VERDICT[*_[:space:]]*:'
+  [ -n "$(pg_extract_verdict "$f")" ]
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
