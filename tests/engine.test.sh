@@ -1072,6 +1072,28 @@ env PRO_GATE_HOME="$THOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO
   bash "$ENGINE" --harvest "$SMARK" --out "$THOME/o3.md" --timeout 15s >"$TDIR/stdout" 2>"$TDIR/stderr" || true
 check 'harvest never reaps its OWN target reservation mid-collection' \
   "$([ -f "$THOME/in-progress/$SMARK" ]; echo $?)" "$(ls "$THOME/in-progress" 2>/dev/null)"
+# #68 gate r2 P1: the claim is the harvest LOCK, so ANY reconciler (a concurrent harvest, or
+# fresh dispatch) skips an actively-collected marker — not just the collecting process.
+CLAIMED="pg-run-claimkey-1700000006-92"
+mkdir -p "$THOME/harvest-locks"
+printf 'claimkey\t%s/o4.md\t%s\t0\t\t\t\n' "$THOME" "$(( $(date +%s) - 30000 ))" > "$THOME/in-progress/$CLAIMED"
+if command -v flock >/dev/null 2>&1; then
+  ( exec 9>>"$THOME/harvest-locks/$CLAIMED"; flock 9; sleep 6 ) &
+  CLAIM_PID=$!
+  sleep 0.5
+  CLAIMED_RC="$(PRO_GATE_HOME="$THOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_harvest_claimed '$CLAIMED' && echo held || echo free")"
+  check 'pg_harvest_claimed sees a held harvest lock' "$([ "$CLAIMED_RC" = held ]; echo $?)" "got=$CLAIMED_RC"
+  PRO_GATE_HOME="$THOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; PG_RES_TTL_ONLY=1 pg_reservation_reconcile '' 9222" >/dev/null 2>&1
+  check 'a foreign reconciler skips an actively-harvested marker' \
+    "$([ -f "$THOME/in-progress/$CLAIMED" ]; echo $?)" "$(ls "$THOME/in-progress" 2>/dev/null)"
+  wait "$CLAIM_PID" 2>/dev/null
+  # Once the claim is released, the same past-TTL reservation IS reaped.
+  CLAIMED_RC="$(PRO_GATE_HOME="$THOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_harvest_claimed '$CLAIMED' && echo held || echo free")"
+  check 'a released lock reads as unclaimed' "$([ "$CLAIMED_RC" = free ]; echo $?)" "got=$CLAIMED_RC"
+  PRO_GATE_HOME="$THOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; PG_RES_TTL_ONLY=1 pg_reservation_reconcile '' 9222" >/dev/null 2>&1
+  check 'an unclaimed past-TTL reservation is still reaped' \
+    "$([ ! -f "$THOME/in-progress/$CLAIMED" ]; echo $?)" "$(ls "$THOME/in-progress" 2>/dev/null)"
+fi
 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 --json >"$TDIR/st.json" 2>/dev/null; RC=$?
 check '--status --json exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC"
 check '--status --json reservation marker' "$([ "$(jq -r '.reservations[0].marker' "$TDIR/st.json")" = "$SMARKER" ]; echo $?)" "$(cat "$TDIR/st.json")"

@@ -979,13 +979,6 @@ if [ -n "$HARVEST_MARKER" ]; then
   # its review that way). TTL-only here: no probe, no miss increment, so a harvest of a
   # genuinely-live conversation is untouched, and the caller's own capture below is the real
   # evidence. PRO_GATE_HARVEST_TTL_SWEEP=0 opts out.
-  # The TARGET marker is excluded: this process is about to collect it, and reaping it here
-  # would both admit a duplicate same-change submission and let a still-generating result
-  # recreate the record with a fresh timestamp under a fallback key (#68 gate P1). Its own
-  # expiry is decided AFTER the capture, by the miss/TTL paths that see the evidence.
-  if [ "${PRO_GATE_HARVEST_TTL_SWEEP:-1}" = 1 ]; then
-    PG_RES_TTL_ONLY=1 PG_RES_SKIP_MARKER="$RUN_MARKER" pg_reservation_reconcile "" "$PORT" || true
-  fi
   # ledger/status identity from the marker's "pg-run-<key>-<epoch>-<pid>" shape (best-effort;
   # the key may itself contain dashes, so strip the two trailing numeric segments instead).
   # v0.27: the stripped key lands as round_key so --status can join harvest rows to their
@@ -1005,6 +998,17 @@ if [ -n "$HARVEST_MARKER" ]; then
     echo "ERROR: another harvest is already collecting marker ${RUN_MARKER}; not racing it." >&2
     pg_status failed "harvest already running"
     pg_finish 7
+  fi
+  # #67: TTL must be reachable from the harvest path. pg_reservation_reconcile used to run ONLY
+  # in fresh dispatch, so the documented free-recovery flow ("just --harvest") could never
+  # retire a reservation — and a fresh run is redirected to that reservation before it can
+  # submit, so both exits were closed and a stranded change stayed stranded (pushbot#1334 lost
+  # its review that way). Runs AFTER the harvest lock (#68 gate r2 P1): the lock file IS this
+  # marker's active-collection claim, and every reconciler skips actively-claimed markers, so
+  # no concurrent sweep can reap a reservation mid-collection either. TTL-only: no probe, no
+  # miss increment. PRO_GATE_HARVEST_TTL_SWEEP=0 opts out.
+  if [ "${PRO_GATE_HARVEST_TTL_SWEEP:-1}" = 1 ]; then
+    PG_RES_TTL_ONLY=1 pg_reservation_reconcile "" "$PORT" || true
   fi
   # (Completed-artifact returns happen BEFORE the global preflight — see the fast path above
   # the MODE check; by this point the artifact is known absent.)

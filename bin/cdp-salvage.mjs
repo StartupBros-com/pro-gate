@@ -138,6 +138,15 @@ function noteCrossBind(m, url, foreign) {
   } catch {}
 }
 
+// #68 gate r2 P2: a conviction is about ONE candidate URL, not the run. Another tab — or a
+// URL discovered later in the same scan — can still be the genuine conversation, and leaving
+// a marker-wide "terminally cross-bound" flag would have --status tell the operator to delete
+// a reservation still protecting a live review. Proving ownership supersedes every prior
+// conviction for this marker.
+function clearCrossBind(m) {
+  try { fs.unlinkSync(path.join(PG_HOME, 'crossbound', m)); } catch {}
+}
+
 function rememberUrl(m, url) {
   const f = memoPath(m);
   if (!f || !/^https:\/\/chatgpt\.com\/c\//.test(url || '')) return;
@@ -398,9 +407,17 @@ function extractReview(text) {
 function foreignAnswerMarker(text) {
   const review = extractReview(text);
   if (!review) return null;                       // no completed answer here: decides nothing
-  const tail = review.split('\n').slice(-6).join('\n');
-  if (tail.includes(`(run marker: ${marker})`)) return null;   // ours, positively
-  const m = tail.match(/\(run marker:\s*(pg-run-[A-Za-z0-9.-]+)\s*\)/);
+  // ONLY the terminal VERDICT line carries ownership (#68 gate r2 P1). Scanning the last six
+  // lines convicts a genuine nonce-less answer whose FINDINGS merely mention another marker —
+  // routine in this repo, whose reviews quote incident markers verbatim. A verdict line with
+  // no marker at all is ambiguous, not foreign: return null and let the engine's nonce check
+  // file it as retryable.
+  const lines = review.split('\n');
+  let verdictLine = '';
+  for (let i = lines.length - 1; i >= 0; i--) if (VERDICT_RE.test(lines[i])) { verdictLine = lines[i]; break; }
+  if (!verdictLine) return null;
+  if (verdictLine.includes(`(run marker: ${marker})`)) return null;   // ours, positively
+  const m = verdictLine.match(/\(run marker:\s*(pg-run-[A-Za-z0-9.-]+)\s*\)/);
   if (!m || m[1] === marker) return null;
   // POSITION MATTERS (#68 gate P1). A reused conversation can hold an OLDER nonce-bearing
   // verdict ABOVE our freshly-submitted prompt while our answer is still generating.
@@ -421,6 +438,9 @@ function foreignAnswerMarker(text) {
 // tab is gone. Deliberately does NOT close the tab: see the close note at the bottom.
 async function onOurConversation(url, text) {
   ourUrls.add(url);
+  // Positive ownership supersedes any earlier per-candidate conviction for this marker
+  // (#68 gate r2 P2): the run is demonstrably NOT terminally cross-bound.
+  clearCrossBind(marker);
   rememberUrl(marker, url);
   knownUrl = url;                // usable by the recovery branch from the very next cycle
   if (probe) { console.error(`live conversation: ${url}`); process.exit(0); }

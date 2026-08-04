@@ -690,6 +690,33 @@ pg_reservation_slot_plan() {
   printf '%s|%s\n' "$r" "${excl# }"
 }
 
+# pg_harvest_claimed <marker>: 0 when some process is COLLECTING this marker right now, i.e.
+# holds its harvest lock (#68 gate r2 P1). Every reconciler consults this before reaping, so a
+# reservation cannot be removed out from under an in-flight collection by ANY process — the
+# collector's own sweep, a concurrent harvest, or a fresh dispatch. Non-blocking probe: we test
+# whether the lock is takeable and immediately release, never queueing behind the holder.
+# A stale lock FILE with no holder reads as unclaimed (flock is inode-scoped, not path-scoped),
+# which is what the housekeeping sweep of harvest-locks/ already relies on.
+pg_harvest_claimed() {
+  local marker="$1" f pfd rc=1
+  pg_reservation_marker_ok "$marker" || return 1
+  f="${PRO_GATE_HARVEST_LOCK_DIR:-$PRO_GATE_HOME/harvest-locks}/$marker"
+  if pg_have flock; then
+    [ -f "$f" ] || return 1
+    if { exec {pfd}>>"$f"; } 2>/dev/null; then
+      flock -n "$pfd" 2>/dev/null || rc=0     # could NOT take it => someone holds it
+      eval "exec ${pfd}>&-" 2>/dev/null
+    fi
+    return "$rc"
+  fi
+  # mkdir-lock platforms (stock macOS): the directory exists only while held, and pg_lock
+  # reaps it when its recorded pid is gone.
+  [ -d "$f.d" ] || return 1
+  local opid; opid="$(cat "$f.d/pid" 2>/dev/null || true)"
+  [ -n "$opid" ] && ! kill -0 "$opid" 2>/dev/null && return 1
+  return 0
+}
+
 # pg_reservation_reconcile <salvage-script> <port>: drop reservations older than TTL or only
 # after N consecutive confirmed-absent probes. A single 10s miss is NOT proof of loss: suspended
 # renderers, hydration delays, and temporary marker-read failures caused false releases in review.
@@ -704,11 +731,14 @@ pg_reservation_reconcile() {
   for f in "$dir"/*; do
     [ -f "$f" ] || continue; marker="$(basename "$f")"
     pg_reservation_marker_ok "$marker" || continue
-    # Never reap the marker the CALLER is currently collecting (#68 gate P1): removing it
+    # Never reap a marker that is being COLLECTED RIGHT NOW (#68 gate P1, r2 P1). Removing it
     # mid-harvest lets a concurrent same-change run submit a duplicate, and a still-generating
     # result would then recreate the record from scratch — fresh `created` (defeating TTL
-    # self-clear) under a fallback "diff" key (defeating same-change redirection).
-    [ -n "${PG_RES_SKIP_MARKER:-}" ] && [ "$marker" = "$PG_RES_SKIP_MARKER" ] && continue
+    # self-clear) under a fallback "diff" key (defeating same-change redirection). The harvest
+    # LOCK FILE is that claim, so this holds for EVERY reconciler (fresh dispatch and other
+    # harvests), not just the collecting process: a per-invocation skip variable would only
+    # have protected the one sweep that already knew.
+    if pg_harvest_claimed "$marker"; then continue; fi
     # awk per field, NOT `read`: tab is IFS-whitespace, so consecutive tabs from an empty
     # slot/model collapse and shift every later field (the trap pg_reservation_read_model
     # documents). That would silently drop the v0.31 spend epoch on the rewrite below.

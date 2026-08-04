@@ -365,6 +365,45 @@ const FOREIGN_ANSWER = (m) => [
   cdp.stop();
 }
 
+{ // #68 gate r2 P1: ownership comes from the VERDICT LINE ONLY. A genuine nonce-less answer
+  // whose FINDINGS quote another run's marker (routine in this repo — reviews cite incident
+  // markers verbatim) must NOT be convicted as cross-bound.
+  const quotesAMarker = [
+    `run marker: ${MARKER}`,
+    '',
+    '[P1] bin/x.mjs:10 — the pushbot#1334 incident (pg-run-StartupBros-com-pushbot-1334-1785810900-1553112) shows this',
+    'P2: none',
+    'P3: none',
+    'VERDICT: FIX-FIRST — a real review that merely quotes a marker.',
+  ].join('\n');
+  const cdp = await mockCdp(quotesAMarker);
+  const r = await runSalvage([MARKER, '15'], cdp.port);
+  check('a finding QUOTING a foreign marker is not a cross-bind', (r.crossbound ?? 0) === 0,
+    `crossbound=${r.crossbound} stderr=${r.stderr?.slice(-400)}`);
+  check('the quoting review is returned, not convicted', r.status === 0,
+    `status=${r.status} stderr=${r.stderr?.slice(-400)}`);
+  cdp.stop();
+}
+
+{ // #68 gate r2 P2: a conviction is per-CANDIDATE. If another tab turns out to be genuinely
+  // ours, the marker must not stay flagged terminally cross-bound.
+  const foreignTab = { id: 'foreign1', url: 'https://chatgpt.com/c/foreign-one' };
+  const ours = [
+    `run marker: ${MARKER}`,
+    '[P1] lib/y.sh:2 — ours',
+    'P2: none',
+    'P3: none',
+    `VERDICT: SHIP — ours. (run marker: ${MARKER})`,
+  ].join('\n');
+  // The listed conversation tab is ours; an additional tab holds another run's answer.
+  const cdp = await mockCdp(ours, [foreignTab]);
+  const r = await runSalvage([MARKER, '15'], cdp.port);
+  check('proving ownership clears any per-candidate conviction', (r.crossbound ?? 0) === 0,
+    `crossbound=${r.crossbound} stderr=${r.stderr?.slice(-400)}`);
+  check('our review is still returned alongside a foreign tab', r.status === 0, `status=${r.status}`);
+  cdp.stop();
+}
+
 { // gate round-2 P1: one EARLY successful listing must not mask a later CDP outage. Scan once
   // (before the conversation appears), then lose Chrome for the rest of the window — that ends
   // inconclusive (7), not a confirmed absence (4).

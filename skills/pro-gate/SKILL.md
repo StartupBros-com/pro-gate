@@ -269,18 +269,27 @@ while the current one still generates — retry the harvest); in legacy mode
 (`PRO_GATE_REQUIRE_NONCE=0`) a zero-overlap capture is set aside as `<out>.foreign.*` and
 its source blacklisted) ·
 
-> **Repeated `<out>.unbound.*` files mean STUCK, not "try again" (engine ≥v0.31.1).** A
-> conversation whose COMPLETED answer echoes a *different* run's marker is that run's
-> conversation — even though your marker also appears on the page, because the marker rides
-> the submitted prompt. Engine ≥v0.31.1 detects this, discards the cross-bound URL memo, and
-> lets the harvest path apply the reservation TTL, so the change frees itself. On older
-> engines the memo stayed poisoned and every fresh run was redirected to the dead
-> reservation forever (pushbot#1334 lost a review this way). `--status` now reports
-> `state: complete-but-unbindable` with a count. **Never "fix" this with
-> `PRO_GATE_REQUIRE_NONCE=0`** — in both observed incidents the rejected capture really was
-> another PR's review, and accepting it would have sent the gate to fix phantom findings in
-> the wrong repository. Inspect the set-aside file; if it cites another change's files, wait
-> for the TTL or remove the reservation, then re-run. ·
+> **`<out>.unbound.*` files: check WHICH state before acting (engine ≥v0.31.1).**
+> `--status` reports one of three `reservations[].state` values, and they call for different
+> responses:
+>
+> - `generating-or-recoverable` — normal. Harvest again when ready.
+> - `unbindable-ambiguous` — a completed capture carried no run-marker echo. This is
+>   **retryable**: it is often an *older* answer sitting above your prompt in a reused
+>   conversation while yours still generates. Retry the free harvest; do not delete anything.
+> - `cross-bound` — the engine positively proved the remembered conversation's completed
+>   answer belongs to a *different* run (recorded in `$PRO_GATE_HOME/crossbound/<marker>`).
+>   Retrying cannot bind it. Engine ≥v0.31.1 discards the bad memo and expires the
+>   reservation at its TTL, so the change frees itself; to unblock immediately, remove
+>   `$PRO_GATE_HOME/in-progress/<marker>`.
+>
+> Your marker appearing on a page is NOT proof the page is yours — it rides the submitted
+> prompt, so a mis-navigated render can show your prompt above someone else's answer. On
+> engines before v0.31.1 that mis-binding poisoned the URL memo permanently and every fresh
+> run was redirected to the dead reservation (pushbot#1334 lost a review this way).
+> **Never "fix" any of these with `PRO_GATE_REQUIRE_NONCE=0`** — in both observed incidents
+> the rejected capture really was another PR's review, and accepting it would have sent the
+> gate to fix phantom findings in the wrong repository. ·
 `8` deferred (cooldown: retry after) · `6`
 TWO flavors — read the status `detail` before interpreting: "already collected" means the
 review EXISTS but could not be returned automatically (unverifiable pre-v0.28 row, missing
