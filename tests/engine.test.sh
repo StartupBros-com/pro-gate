@@ -693,6 +693,24 @@ touch -d '3 days ago' "$RHOME/rounds/stale-key-1" "$RHOME/rounds/stale-key-1.loc
 roundrun 88 "$RHOME/o-r7.md" PRO_GATE_ROUND_GUARD=0
 check 'stale round state is swept by housekeeping' "$([ ! -f "$RHOME/rounds/stale-key-1" ] && [ ! -f "$RHOME/rounds/stale-key-1.lock" ]; echo $?)" "rounds dir: $(ls "$RHOME/rounds" 2>/dev/null)"
 
+echo '# v0.30.1 hygiene close-out: legacy-named logs, title-seq counters, salvage blacklist'
+mkdir -p "$RHOME/logs" "$RHOME/title-seq"
+touch "$RHOME/logs/pg-run-fresh.log" "$RHOME/title-seq/fresh-key"
+printf 'x\n' > "$RHOME/logs/legacy-owner-repo-4-1782771272.log"
+printf 'x\n' > "$RHOME/logs/autoupdate.log"
+printf '7' > "$RHOME/title-seq/stale-key"
+touch -d '20 days ago' "$RHOME/logs/legacy-owner-repo-4-1782771272.log" "$RHOME/logs/autoupdate.log" "$RHOME/title-seq/stale-key" 2>/dev/null \
+  || touch -t 202001010000 "$RHOME/logs/legacy-owner-repo-4-1782771272.log" "$RHOME/logs/autoupdate.log" "$RHOME/title-seq/stale-key"
+seq 1 1200 > "$RHOME/salvage-nonmatching.txt"
+roundrun 89 "$RHOME/o-hyg.md"
+check 'hygiene run exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+check 'legacy-named run log is swept' "$([ ! -f "$RHOME/logs/legacy-owner-repo-4-1782771272.log" ]; echo $?)" "logs: $(ls "$RHOME/logs" 2>/dev/null)"
+check 'autoupdate.log survives the log sweep' "$([ -f "$RHOME/logs/autoupdate.log" ]; echo $?)" 'autoupdate.log deleted'
+check 'fresh pg-run log survives the sweep' "$([ -f "$RHOME/logs/pg-run-fresh.log" ]; echo $?)" 'fresh log deleted'
+check 'stale title-seq counter is swept' "$([ ! -f "$RHOME/title-seq/stale-key" ]; echo $?)" "title-seq: $(ls "$RHOME/title-seq" 2>/dev/null)"
+check 'fresh title-seq counter survives' "$([ -f "$RHOME/title-seq/fresh-key" ]; echo $?)" 'fresh counter deleted'
+check 'salvage blacklist trimmed to 500 newest lines' "$([ "$(wc -l < "$RHOME/salvage-nonmatching.txt")" -eq 500 ] && [ "$(tail -1 "$RHOME/salvage-nonmatching.txt")" = '1200' ]; echo $?)" "lines=$(wc -l < "$RHOME/salvage-nonmatching.txt" 2>/dev/null) tail=$(tail -1 "$RHOME/salvage-nonmatching.txt" 2>/dev/null)"
+
 # Harvests spend no slot and must never consume a round.
 NROUND_FILES="$(ls "$RHOME/rounds" 2>/dev/null | wc -l)"
 MKR="pg-run-roundharvest-1700000030-22"

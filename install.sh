@@ -275,6 +275,9 @@ put "$SOURCE_ROOT/bin/pro-gate-autoupdate.sh" "$PRO_GATE_HOME/pro-gate-autoupdat
 put "$SOURCE_ROOT/bin/cdp-salvage.mjs" "$PRO_GATE_HOME/cdp-salvage.mjs"
 for f in daemon.sh run-daemon.sh run-oracle-chrome.sh login-view.sh; do put "$SOURCE_ROOT/daemon/$f" "$PRO_GATE_HOME/$f"; done
 [ -f "$PRO_GATE_HOME/.env" ] || cp "$SOURCE_ROOT/.env.example" "$PRO_GATE_HOME/.env"
+# .env can hold keys (PRO_GATE_PLUGIN_KEY etc.): owner-only, regardless of the box's umask
+# or the perms a pre-existing copy already carries.
+chmod 600 "$PRO_GATE_HOME/.env" 2>/dev/null || true
 printf '%s\n' "$REQUESTED_VERSION" > "$PRO_GATE_HOME/VERSION.deploy.$$"
 mv -f "$PRO_GATE_HOME/VERSION.deploy.$$" "$PRO_GATE_HOME/VERSION"
 printf '%s\n' "$REQUESTED_VERSION" > "$PRO_GATE_HOME/EXPECTED_VERSION.deploy.$$"

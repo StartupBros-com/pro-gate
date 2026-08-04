@@ -19,7 +19,8 @@ Conventions in this file:
 
 | Version | Date | Artifact | Theme |
 |---|---|---|---|
-| Unreleased | 2026-08-03 | main | Announcement card bullets, README revamp, this changelog |
+| [v0.30.1](https://github.com/StartupBros-com/pro-gate/releases/tag/v0.30.1) | 2026-08-03 | Release | Hygiene close-out: consent stderr leak, log/blacklist bounds, title-seq TTL, `.env` perms, salvage-window knob |
+| [v0.30.0](https://github.com/StartupBros-com/pro-gate/releases/tag/v0.30.0) | 2026-08-03 | Release | Residuals close-out: daemon recoverable-state guard, scratch hygiene, memoized-URL recovery (plus the #58–#60 docs wave) |
 | [v0.29.0](https://github.com/StartupBros-com/pro-gate/releases/tag/v0.29.0) | 2026-08-02 | Release | ChatGPT sidebar titling: run-naming prompt line |
 | [v0.28.0](https://github.com/StartupBros-com/pro-gate/releases/tag/v0.28.0) | 2026-08-02 | Release | Capture provenance: nonce run-binding, early URL capture, immutable artifacts |
 | [v0.27.0](https://github.com/StartupBros-com/pro-gate/releases/tag/v0.27.0) | 2026-08-01 | Release | `--status` run rediscovery, ledger identity fields |
@@ -203,16 +204,41 @@ Delivered capability, by release:
   [#57](https://github.com/StartupBros-com/pro-gate/pull/57),
   [b2eb3c4](https://github.com/StartupBros-com/pro-gate/commit/b2eb3c4)).
 
-### 9. Announcements and documentation (2026-08-02 → 08-03, unreleased)
+### 9. Announcements, documentation, and residuals close-out (2026-08-02 → 08-03, v0.30.0)
 
 Release announcement cards stopped being identical: the release train now derives
 card-ready "What's new" bullets from each release body (an author-written `## Highlights`
 section wins), and the README was rebuilt value-first with the full engine command and
-exit-code reference.
+exit-code reference. v0.30.0 then closed the standing residuals: the daemon consults
+`--status --json` and skips fail-counting engine states that are recoverable, run scratch
+dirs are cleaned on exit (with a backfill sweep for pre-trap leaks), and an exit-6 run
+that remembered its conversation URL prints the exact free `--harvest` command. The first
+v0.30.0 tag failed CI on a test-environment flake (a test reaching the real default CDP
+port, absent on CI); [#62](https://github.com/StartupBros-com/pro-gate/pull/62) pinned the
+mock port and the release chain went green.
 
 Representative commits:
 [8077d12](https://github.com/StartupBros-com/pro-gate/commit/8077d12) (card bullets, [#58](https://github.com/StartupBros-com/pro-gate/pull/58)),
-[5d3e47e](https://github.com/StartupBros-com/pro-gate/commit/5d3e47e) (README revamp, [#59](https://github.com/StartupBros-com/pro-gate/pull/59)).
+[5d3e47e](https://github.com/StartupBros-com/pro-gate/commit/5d3e47e) (README revamp, [#59](https://github.com/StartupBros-com/pro-gate/pull/59)),
+[9020281](https://github.com/StartupBros-com/pro-gate/commit/9020281) (residuals close-out, [#61](https://github.com/StartupBros-com/pro-gate/pull/61)),
+[cf59d37](https://github.com/StartupBros-com/pro-gate/commit/cf59d37) (release-test fix, [#62](https://github.com/StartupBros-com/pro-gate/pull/62)).
+
+### 10. Hygiene close-out and salvage-window decoupling (2026-08-03, v0.30.1)
+
+A post-v0.30.0 field audit (22 production runs in the first day: zero regressions, both
+exit-9 runs harvested clean) surfaced a handful of small residuals this release closes:
+`pg_dangerous_consent_ok` no longer leaks a raw bash "No such file or directory" to stderr
+when the consent file is absent (redirect-order bug — `2>/dev/null` cannot catch a failed
+`<` open listed before it); the housekeeping sweep also retires pre-v0.27-named run logs
+and idle `title-seq/` counters (14-day horizon) and bounds the salvage blacklist via the
+new `pg_trim_file` helper; `autoupdate.log` is trimmed by its writer; `.env` is installed
+owner-only and the doctor warns when it is group/other-readable. The non-live salvage
+window became its own knob (`PRO_GATE_SALVAGE_SECS`, default: follows
+`PRO_GATE_STALL_SECS` as before) so the stall watchdog can be tuned down without silently
+halving recovery windows — a per-run timing analysis showed healthy oracle output arrives
+every 30s, making 600s of true silence pure dead time on hung runs. Comments calling CDP
+salvage "defense-in-depth" were updated to match observed reality (100% of clean runs
+2026-07-22 → 08-03 landed via salvage/harvest).
 
 ## Notes for agents
 

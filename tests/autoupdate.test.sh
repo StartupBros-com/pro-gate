@@ -98,6 +98,10 @@ run_updater FAKE_DAEMON_ENABLED="$TDIR/daemon-enabled" PRO_GATE_CONSENT_HOME="$T
 check 'missing consent refuses (exit 3)' "$([ "$RC" -eq 3 ]; echo $?)" "rc=$RC"
 check 'missing consent runs NO installer' "$([ ! -s "$TDIR/install.log" ]; echo $?)" "log=$(cat "$TDIR/install.log")"
 check 'refusal names the disclosure' "$(grep -q 'accept the disclosure' "$TDIR/stderr"; echo $?)" "$(cat "$TDIR/stderr")"
+# v0.30.1: the consent check must stay SILENT when the file is absent — the old redirect
+# order leaked a raw bash "No such file or directory" into every doctor/daemon run.
+CONSENT_ERR="$(PRO_GATE_CONSENT_HOME="$TDIR/no-consent" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_dangerous_consent_ok" 2>&1 1>/dev/null)"
+check 'missing consent file leaks no stderr' "$([ -z "$CONSENT_ERR" ]; echo $?)" "stderr: $CONSENT_ERR"
 
 echo '# consent recorded: enabled daemon does not block, services still skipped'
 mkdir -p "$TDIR/consent"; printf '1\n' > "$TDIR/consent/dangerous-mode-consent"

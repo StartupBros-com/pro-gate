@@ -1461,9 +1461,19 @@ find "$(pg_manifest_dir)" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null ||
 # dir. 14 days dwarfs every recovery window (reservation TTL 6h; pending/ holds real bytes)
 # while still covering late manual recovery of a weeks-old run.
 find "$PRO_GATE_HOME/conversation-urls" -maxdepth 1 -type f -mmin +20160 -delete 2>/dev/null || true
-# #50 item 8: per-run diagnostic logs are swept on the same 14-day horizon (autoupdate.log
-# and other non-run logs never match the pg-run-* pattern).
-find "$PRO_GATE_HOME/logs" -maxdepth 1 -type f -name 'pg-run-*.log' -mmin +20160 -delete 2>/dev/null || true
+# #50 item 8: per-run diagnostic logs are swept on the same 14-day horizon. Matching every
+# *.log except autoupdate.log (the one intentional non-run log; its writer bounds it) also
+# retires run logs named before the v0.27 pg-run- marker convention, which the old
+# pg-run-*-only glob left behind forever.
+find "$PRO_GATE_HOME/logs" -maxdepth 1 -type f -name '*.log' ! -name 'autoupdate.log' -mmin +20160 -delete 2>/dev/null || true
+# title-seq counters (v0.29) are 1-byte per-round-key files with no other pruning; same
+# 14-day horizon. Worst case a swept key's sidebar titling restarts at r1 — cosmetic; the
+# title is a human aid, not an identity key.
+find "$(pg_title_seq_dir)" -maxdepth 1 -type f -mmin +20160 -delete 2>/dev/null || true
+# The foreign-conversation blacklist is append-only from two writers (this engine and the
+# CDP salvage child); markers stop being queried once their run resolves, so keeping the
+# newest 500 lines once it passes 1000 loses nothing a live salvage still needs.
+pg_trim_file "$PRO_GATE_HOME/salvage-nonmatching.txt" 1000 500
 # #50 item 1 (backfill): scratch dirs leaked by pre-trap engines and kill -9 runs. Only our
 # own naming patterns, only dirs old enough (7d) that every recovery pointer into them has
 # long expired (reservation TTL 6h; PG_KEEP_FINAL messages say "copy it out now").
@@ -1961,18 +1971,25 @@ MODEL_WARN="$(pg_derive_model_warn "$RESOLVED_MODEL" "$MODEL_STATUS")"
 [ -n "$MODEL_WARN" ] && echo "[oracle-review] WARNING: ${MODEL_WARN}." >&2
 
 # v0.13: last-resort CDP tab salvage. oracle (historically <=0.15.x; hardened upstream in
-# 0.16.0) could fail to DETECT thinking after ChatGPT UI drift even though the submission landed: the
+# 0.16.0; the 2026-07 GPT-5.6 UI re-broke it) can fail to DETECT thinking after ChatGPT UI
+# drift even though the submission landed: the
 # no-think watchdog then kills a LIVE run, and reattach harvests a stale tab
 # target ("Assistant turns: 0") while the real conversation finishes in
 # another tab. Before declaring failure, read the review straight off the
 # conversation tab's DOM, matched by PR marker so concurrent review slots
-# cannot cross-contaminate. First seen: pushbot PR #863, 2026-07-02.
+# cannot cross-contaminate. First seen: pushbot PR #863, 2026-07-02. This is a first-class
+# capture path, not a rare fallback: whenever oracle's detection lags the live UI it collects
+# essentially every review (100% of clean runs 2026-07-22 → 08-03 landed via salvage/harvest).
 # Skip salvage entirely on a Cloudflare challenge: the submission never landed (nothing to
 # collect), and rendering conversation pages against a challenged account only deepens the block.
 if ! pg_is_review "$CAPTURE_OUT" && [ "${CLOUDFLARE:-0}" != 1 ] && command -v node >/dev/null 2>&1; then
   # Live conversation (v0.14 probe hit): the review may still be thinking, so
   # wait with the full hard-cap budget; otherwise a short window suffices.
-  SALVAGE_SECS="$STALL_SECS"; [ "$LIVE_CONVERSATION" = 1 ] && SALVAGE_SECS="$HARD_SECS"
+  # v0.30.1: the non-live window is its own knob. It used to ride PRO_GATE_STALL_SECS, so
+  # tuning the stall watchdog DOWN (justified: healthy oracle prints every 30s, and the
+  # 2026-08-03 timing analysis showed true silence only on hung runs) silently halved the
+  # recovery window for stall/disconnect kills too. Default preserves the historical tie.
+  SALVAGE_SECS="${PRO_GATE_SALVAGE_SECS:-$STALL_SECS}"; [ "$LIVE_CONVERSATION" = 1 ] && SALVAGE_SECS="$HARD_SECS"
   # v0.18: after a throttle hit, pause before the single polite salvage pass —
   # rendering the conversation immediately just re-triggers the limiter. The
   # salvage itself exits 5 fast if the account is still throttled.

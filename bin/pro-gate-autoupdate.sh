@@ -47,6 +47,9 @@ pgau_log() {
   printf '%s\n' "$line" >&2
   { mkdir -p "$PRO_GATE_HOME/logs" && printf '%s\n' "$line" >> "$PRO_GATE_HOME/logs/autoupdate.log"; } 2>/dev/null || true
 }
+# Bound the append-only log (hourly cadence grew it without limit; 393 lines by 2026-08-03):
+# once per invocation, keep the newest 400 lines when it passes 1000 (~2 weeks of polls).
+pg_trim_file "$PRO_GATE_HOME/logs/autoupdate.log" 1000 400
 
 pgau_semver_ok() { pg_semver3_ok "$1"; }
 
