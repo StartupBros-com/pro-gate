@@ -291,15 +291,28 @@ memo stayed poisoned permanently, while the harvest path had no way to expire a 
 reservation before they can submit — both exits closed).
 
 Fix: ownership now requires the *answer* to be ours. A page whose completed verdict echoes a
-different run's marker is that run's conversation regardless of prompt text; such a page is
-never memoized, is blacklisted, and evicts a matching memo (compare-and-delete, so a
-concurrently re-learned genuine URL survives). `--harvest` applies the reservation TTL in a
-probe-free sweep, so a stranded change frees itself. `--status` distinguishes
-`complete-but-unbindable` (with a count of set-aside captures) from "still generating", and
-the skill doc states plainly that `PRO_GATE_REQUIRE_NONCE=0` is the wrong response. Also
-fixed in passing: `pg_reservation_reconcile`'s rewrite emitted six fields and would have
-dropped v0.31's spend epoch, and its `read`-based parse mis-shifted fields on an empty
-slot/model — both moved to per-field `awk`.
+different run's marker is that run's conversation regardless of prompt text — but only when
+that verdict sits AFTER our prompt, since a reused conversation legitimately holds an older
+round's verdict above it and convicting on scrollback would blacklist the live conversation.
+Such a page is never memoized, is blacklisted, and evicts a matching memo through
+claim-and-verify (rename aside, inspect, restore via `link()`), the same protocol
+`pg_provenance_reject` uses — a plain compare-then-delete races a concurrently republished
+genuine memo. `--harvest` applies the reservation TTL in a probe-free sweep that skips the
+marker being collected (reaping it mid-harvest would admit a duplicate submission and let a
+still-generating result recreate the record under a fallback key).
+
+`--status` now names three states, not two: `cross-bound` (positively convicted, terminally
+stuck, recorded by cdp-salvage in `crossbound/<marker>`), `unbindable-ambiguous` (a
+nonce-less capture that may be an older answer while ours generates — retryable), and
+ordinary generating/recoverable. Collapsing the middle case into "stuck" would tell an
+operator to delete a live reservation. The skill doc states plainly that
+`PRO_GATE_REQUIRE_NONCE=0` is the wrong response.
+
+Reservation-record integrity fixed throughout: `pg_reservation_reconcile` AND
+`pg_reservation_note_miss` both rewrote six fields, so a single confirmed miss silently
+erased v0.31's spend epoch and pushed later harvests onto the marker-time fallback; both
+also used `read`, which collapses consecutive tabs and mis-shifts fields when slot/model are
+empty. Every reservation mutation now round-trips all seven fields via per-field `awk`.
 
 ## Notes for agents
 

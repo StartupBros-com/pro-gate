@@ -107,13 +107,35 @@ function recallUrl(m) {
   } catch { return null; }
 }
 
-// #67: drop a memo proven to point at another run's conversation. Compare-and-delete (same
-// discipline as the shell's pg_provenance_reject): only unlink when the file still names the
-// URL we convicted, so a concurrently re-learned genuine URL is never destroyed.
+// #67: drop a memo proven to point at another run's conversation. CLAIM-and-verify, not
+// compare-then-delete (#68 gate P1): read-then-unlink leaves a window in which a concurrent
+// probe republishes the GENUINE url and this process deletes it, destroying the only
+// server-side recovery handle. Rename the memo aside first (atomic), inspect the bytes we
+// actually hold, and restore via link() — which fails atomically if a new memo already
+// exists — when they name a different conversation. Mirrors the shell's pg_provenance_reject.
 function forgetUrl(m, url) {
   const f = memoPath(m);
   if (!f) return;
-  try { if (recallUrl(m) === url) fs.unlinkSync(f); } catch {}
+  const claim = `${f}.rej.${process.pid}`;
+  try { fs.renameSync(f, claim); } catch { return; }   // nothing to claim: someone else won
+  let held = '';
+  try { held = fs.readFileSync(claim, 'utf8').trim(); } catch {}
+  if (held && held !== url) {
+    try { fs.linkSync(claim, f); } catch {}            // a genuine memo republished: put it back
+  }
+  try { fs.unlinkSync(claim); } catch {}
+}
+
+// #68 gate P2: record that THIS marker was positively convicted of a cross-bind (its page held
+// another run's completed answer BELOW our prompt). Only that state is terminally stuck; an
+// ordinary nonce-less .unbound capture may still be an older answer while ours generates, and
+// is genuinely retryable. The engine's --status reads this sidecar to tell them apart.
+function noteCrossBind(m, url, foreign) {
+  try {
+    const dir = path.join(PG_HOME, 'crossbound');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.appendFileSync(path.join(dir, m), `${new Date().toISOString()}\t${url}\t${foreign}\n`);
+  } catch {}
 }
 
 function rememberUrl(m, url) {
@@ -379,7 +401,18 @@ function foreignAnswerMarker(text) {
   const tail = review.split('\n').slice(-6).join('\n');
   if (tail.includes(`(run marker: ${marker})`)) return null;   // ours, positively
   const m = tail.match(/\(run marker:\s*(pg-run-[A-Za-z0-9.-]+)\s*\)/);
-  return m && m[1] !== marker ? m[1] : null;
+  if (!m || m[1] === marker) return null;
+  // POSITION MATTERS (#68 gate P1). A reused conversation can hold an OLDER nonce-bearing
+  // verdict ABOVE our freshly-submitted prompt while our answer is still generating.
+  // extractReview() takes the LAST verdict in the page, which in that layout is the old one —
+  // convicting on it would blacklist and forget the genuine LIVE conversation and let a probe
+  // count misses toward a duplicate spend. Only convict when the foreign verdict comes AFTER
+  // the last occurrence of our marker, i.e. it is the answer to our prompt rather than
+  // scrollback above it.
+  const lastMarkerAt = text.lastIndexOf(marker);
+  const foreignAt = text.lastIndexOf(m[0]);
+  if (lastMarkerAt >= 0 && foreignAt >= 0 && foreignAt < lastMarkerAt) return null;
+  return m[1];
 }
 
 // One place where a marker-matched page turns into an outcome, so the live-tab scan, the
@@ -458,6 +491,7 @@ while (Date.now() < deadline) {
     if (fa) {
       if (tab.url === knownUrl) { memoStale = true; ourUrls.delete(tab.url); forgetUrl(marker, tab.url); knownUrl = null; }
       blacklist(tab.url);
+      noteCrossBind(marker, tab.url, fa);
       console.error(`tab ${tab.url} carries our marker but ANOTHER run's completed answer (${fa}) — not ours; ignoring it`);
       continue;
     }
@@ -508,6 +542,7 @@ while (Date.now() < deadline) {
     if (faRender) {
       if (tab.url === knownUrl) { memoStale = true; ourUrls.delete(tab.url); forgetUrl(marker, tab.url); knownUrl = null; }
       blacklist(tab.url);
+      noteCrossBind(marker, tab.url, faRender);
       console.error(`re-rendered ${tab.url} carries our marker but ANOTHER run's completed answer (${faRender}) — not ours; ignoring it`);
       continue;
     }
@@ -549,6 +584,7 @@ while (Date.now() < deadline) {
         forgetUrl(marker, seedUrl);   // the memo is provably wrong: do not re-read it next pass
         blacklist(seedUrl);
         knownUrl = null;
+        noteCrossBind(marker, seedUrl, faSeed);
         console.error(`remembered conversation ${seedUrl} carries ANOTHER run's completed answer (${faSeed}) — cross-bound memo, discarding it`);
       } else if (text.includes(marker)) {
         stillGeneratingUrl = await onOurConversation(seedUrl, text);

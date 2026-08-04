@@ -612,7 +612,7 @@ pg_reservation_remove() { # marker
 # the miss limit is reached (reservation removed) or "retained miss/limit" otherwise. Shared by
 # reconciliation and the harvest not-found path so both apply the same fail-closed policy.
 pg_reservation_note_miss() {
-  local marker="$1" dir f pr out created misses slot model miss_limit
+  local marker="$1" dir f pr out created misses slot model spend miss_limit
   miss_limit="${PRO_GATE_RESERVATION_MISSES:-3}"
   case "$miss_limit" in ''|*[!0-9]*) miss_limit=3;; esac
   [ "$miss_limit" -ge 2 ] 2>/dev/null || miss_limit=2
@@ -620,7 +620,17 @@ pg_reservation_note_miss() {
   dir="$(pg_reservation_dir)"; f="$dir/$marker"
   pg_reservation_guard_acquire || { echo "retained 0/$miss_limit"; return 0; }
   if [ ! -f "$f" ]; then pg_reservation_guard_release; echo released; return 0; fi
-  { IFS=$'\t' read -r pr out created misses slot model < "$f"; } 2>/dev/null
+  # Per-field awk, and ALL SEVEN fields (#68 gate P1): `read` collapses consecutive tabs, and
+  # a 6-field rewrite silently erased the v0.31 spend epoch on the first confirmed miss —
+  # which then forced a later harvest onto the marker-time fallback and corrupted round
+  # ordering. Every reservation mutation must round-trip the whole record.
+  pr="$(awk -F'\t' 'NR==1{print $1}' "$f" 2>/dev/null)"
+  out="$(awk -F'\t' 'NR==1{print $2}' "$f" 2>/dev/null)"
+  created="$(awk -F'\t' 'NR==1{print $3}' "$f" 2>/dev/null)"
+  misses="$(awk -F'\t' 'NR==1{print $4}' "$f" 2>/dev/null)"
+  slot="$(awk -F'\t' 'NR==1{print $5}' "$f" 2>/dev/null)"
+  model="$(awk -F'\t' 'NR==1{print $6}' "$f" 2>/dev/null)"
+  spend="$(awk -F'\t' 'NR==1{print $7}' "$f" 2>/dev/null)"
   case "$misses" in ''|*[!0-9]*) misses=0;; esac
   misses=$(( misses + 1 ))
   if [ "$misses" -ge "$miss_limit" ]; then
@@ -628,7 +638,7 @@ pg_reservation_note_miss() {
     pg_reservation_guard_release
     echo released
   else
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "${pr:-diff}" "${out:-}" "${created:-0}" "$misses" "${slot:-}" "${model:-}" > "$f.tmp" 2>/dev/null \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${pr:-diff}" "${out:-}" "${created:-0}" "$misses" "${slot:-}" "${model:-}" "${spend:-}" > "$f.tmp" 2>/dev/null \
       && mv -f "$f.tmp" "$f"
     pg_reservation_guard_release
     echo "retained $misses/$miss_limit"
@@ -694,6 +704,11 @@ pg_reservation_reconcile() {
   for f in "$dir"/*; do
     [ -f "$f" ] || continue; marker="$(basename "$f")"
     pg_reservation_marker_ok "$marker" || continue
+    # Never reap the marker the CALLER is currently collecting (#68 gate P1): removing it
+    # mid-harvest lets a concurrent same-change run submit a duplicate, and a still-generating
+    # result would then recreate the record from scratch — fresh `created` (defeating TTL
+    # self-clear) under a fallback "diff" key (defeating same-change redirection).
+    [ -n "${PG_RES_SKIP_MARKER:-}" ] && [ "$marker" = "$PG_RES_SKIP_MARKER" ] && continue
     # awk per field, NOT `read`: tab is IFS-whitespace, so consecutive tabs from an empty
     # slot/model collapse and shift every later field (the trap pg_reservation_read_model
     # documents). That would silently drop the v0.31 spend epoch on the rewrite below.

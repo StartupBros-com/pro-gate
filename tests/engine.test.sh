@@ -998,37 +998,80 @@ check '--status leads to a free harvest' "$(grep -q "FREE" "$TDIR/st.out" && gre
 # v0.31: governor default — base grant 3 with no trajectory history, so 2 spent leaves 1.
 check '--status reports rounds spent/remaining' "$(grep -q '2 spent, 1 remaining' "$TDIR/st.out"; echo $?)" "$(grep spent "$TDIR/st.out")"
 check '--status writes nothing' "$([ ! -f "$SHOME/ledger.jsonl.tmp" ] && [ "$(wc -l < "$SHOME/ledger.jsonl")" -eq 1 ]; echo $?)" 'state mutated'
-# #67: a reservation with set-aside unbindable captures is STUCK — retrying --harvest cannot
-# help, so --status must say so instead of advertising a cheerful free harvest.
+# #67/#68 P2: THREE states. Bare .unbound captures are AMBIGUOUS and retryable (strict nonce
+# mode makes one when an older answer is visible while ours generates); only a positively
+# convicted cross-bind is terminally stuck. Reporting the first as STUCK would tell an operator
+# to delete a live reservation.
 : > /tmp/pg-st-42.md.unbound.111; : > /tmp/pg-st-42.md.unbound.222
+PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 >"$TDIR/st-amb.out" 2>/dev/null
+check '--status calls bare unbound captures AMBIGUOUS, not stuck' \
+  "$(grep -q 'ambiguous, still retryable' "$TDIR/st-amb.out" && ! grep -q 'STUCK' "$TDIR/st-amb.out"; echo $?)" "$(cat "$TDIR/st-amb.out")"
+if command -v jq >/dev/null 2>&1; then
+  PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 --json >"$TDIR/st-amb.json" 2>/dev/null
+  check '--status --json: unbindable-ambiguous with a count' \
+    "$([ "$(jq -r '.reservations[0].state' "$TDIR/st-amb.json")" = 'unbindable-ambiguous' ] && [ "$(jq -r '.reservations[0].unbound_captures' "$TDIR/st-amb.json")" = 2 ]; echo $?)" \
+    "$(jq -c '.reservations[0]' "$TDIR/st-amb.json" 2>/dev/null)"
+fi
+# Now convict it: cdp-salvage recorded a cross-bind for this marker.
+mkdir -p "$SHOME/crossbound"; printf '2026-01-01T00:00:00Z\thttps://chatgpt.com/c/x\tpg-run-other-9-1-1\n' > "$SHOME/crossbound/$SMARKER"
 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 >"$TDIR/st-stuck.out" 2>/dev/null
-check '--status flags a stuck (complete-but-unbindable) reservation' "$(grep -q 'STUCK' "$TDIR/st-stuck.out"; echo $?)" "$(cat "$TDIR/st-stuck.out")"
-check '--status counts the unbound captures' "$(grep -q '2 complete-but-unbindable' "$TDIR/st-stuck.out"; echo $?)" "$(grep -i stuck "$TDIR/st-stuck.out")"
-if pg_have_jq=$(command -v jq >/dev/null 2>&1 && echo 1 || echo 0); [ "$pg_have_jq" = 1 ]; then
+check '--status flags a convicted cross-bind as STUCK' "$(grep -q 'STUCK' "$TDIR/st-stuck.out"; echo $?)" "$(cat "$TDIR/st-stuck.out")"
+check '--status warns against REQUIRE_NONCE=0 on a cross-bind' "$(grep -q 'Do NOT set PRO_GATE_REQUIRE_NONCE=0' "$TDIR/st-stuck.out"; echo $?)" "$(grep -i 'nonce' "$TDIR/st-stuck.out")"
+if command -v jq >/dev/null 2>&1; then
   PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 --json >"$TDIR/st-stuck.json" 2>/dev/null
-  check '--status --json reports the unbindable state' \
-    "$([ "$(jq -r '.reservations[0].state' "$TDIR/st-stuck.json")" = 'complete-but-unbindable' ] && [ "$(jq -r '.reservations[0].unbound_captures' "$TDIR/st-stuck.json")" = 2 ]; echo $?)" \
+  check '--status --json: cross-bound state' \
+    "$([ "$(jq -r '.reservations[0].state' "$TDIR/st-stuck.json")" = 'cross-bound' ]; echo $?)" \
     "$(jq -c '.reservations[0]' "$TDIR/st-stuck.json" 2>/dev/null)"
 fi
-rm -f /tmp/pg-st-42.md.unbound.111 /tmp/pg-st-42.md.unbound.222
+rm -rf "$SHOME/crossbound"; rm -f /tmp/pg-st-42.md.unbound.111 /tmp/pg-st-42.md.unbound.222
+
+# #68 gate P1: a confirmed miss must NOT erase the v0.31 spend epoch (field 7).
+MHOME="$TDIR/home-missfields"; mkdir -p "$MHOME/in-progress"
+MMARK="pg-run-mk-1700000009-7"
+printf 'mk\t/tmp/o.md\t1700000000\t0\t\tGPT-X\t1700005555\n' > "$MHOME/in-progress/$MMARK"
+PRO_GATE_HOME="$MHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_note_miss '$MMARK' >/dev/null"
+check 'note_miss preserves the spend epoch (field 7)' \
+  "$([ "$(PRO_GATE_HOME="$MHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_read_spend '$MMARK'")" = 1700005555 ]; echo $?)" \
+  "record: $(tr '\t' '|' < "$MHOME/in-progress/$MMARK")"
+check 'note_miss preserves the model too' \
+  "$([ "$(PRO_GATE_HOME="$MHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_read_model '$MMARK'")" = GPT-X ]; echo $?)" \
+  "record: $(tr '\t' '|' < "$MHOME/in-progress/$MMARK")"
+check 'note_miss still incremented the streak' \
+  "$([ "$(awk -F'\t' 'NR==1{print $4}' "$MHOME/in-progress/$MMARK")" = 1 ]; echo $?)" \
+  "record: $(tr '\t' '|' < "$MHOME/in-progress/$MMARK")"
 
 # #67: --harvest must apply reservation TTL, so a stranded change is not blocked forever (the
 # fresh-run path is redirected to the reservation before it can submit, so if the harvest path
 # cannot expire it either, both exits are closed — pushbot#1334 lost its review that way).
 THOME="$TDIR/home-harvestttl"; mkdir -p "$THOME/in-progress"
+# A past-TTL reservation for a DIFFERENT marker is swept while harvesting this one — that is
+# the point of the sweep: a change stranded by an unbindable reservation frees itself instead
+# of blocking every fresh run forever. (The target marker itself is deliberately exempt; see
+# the skip-marker assertion below.)
 TMARK="pg-run-ttlkey-1700000002-88"
+OTHER_STALE="pg-run-otherkey-1700000005-91"
 printf 'ttlkey\t%s/o.md\t%s\t0\t\t\t\n' "$THOME" "$(( $(date +%s) - 30000 ))" > "$THOME/in-progress/$TMARK"
+printf 'otherkey\t%s/oX.md\t%s\t0\t\t\t\n' "$THOME" "$(( $(date +%s) - 30000 ))" > "$THOME/in-progress/$OTHER_STALE"
 printf 'no tabs\n' > "$TDIR/tab.txt"; start_mock "$TDIR/tab.txt"
 env PRO_GATE_HOME="$THOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 NODE_OPTIONS= \
   bash "$ENGINE" --harvest "$TMARK" --out "$THOME/o.md" --timeout 15s >"$TDIR/stdout" 2>"$TDIR/stderr" || true
-check 'harvest expires a past-TTL reservation (frees the change)' \
-  "$([ ! -f "$THOME/in-progress/$TMARK" ]; echo $?)" "$(ls "$THOME/in-progress" 2>/dev/null)"
+check 'harvest expires OTHER past-TTL reservations (frees stranded changes)' \
+  "$([ ! -f "$THOME/in-progress/$OTHER_STALE" ]; echo $?)" "$(ls "$THOME/in-progress" 2>/dev/null)"
 # An UNEXPIRED reservation must survive the same sweep untouched.
 UMARK="pg-run-ttlkey-1700000003-89"
 printf 'ttlkey\t%s/o2.md\t%s\t0\t\t\t\n' "$THOME" "$(date +%s)" > "$THOME/in-progress/$UMARK"
 env PRO_GATE_HOME="$THOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 NODE_OPTIONS= \
   bash "$ENGINE" --harvest "$UMARK" --out "$THOME/o2.md" --timeout 15s >"$TDIR/stdout" 2>"$TDIR/stderr" || true
 check 'harvest keeps a fresh reservation' "$([ -f "$THOME/in-progress/$UMARK" ]; echo $?)" "$(ls "$THOME/in-progress" 2>/dev/null)"
+# #68 gate P1: the sweep must NEVER reap the marker being harvested, even when it is past TTL —
+# removing it mid-collection admits a duplicate same-change submission, and a still-generating
+# result would recreate the record with a fresh timestamp under a fallback key.
+SMARK="pg-run-ttlkey-1700000004-90"
+printf 'ttlkey\t%s/o3.md\t%s\t0\t\t\t\n' "$THOME" "$(( $(date +%s) - 30000 ))" > "$THOME/in-progress/$SMARK"
+env PRO_GATE_HOME="$THOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 NODE_OPTIONS= \
+  bash "$ENGINE" --harvest "$SMARK" --out "$THOME/o3.md" --timeout 15s >"$TDIR/stdout" 2>"$TDIR/stderr" || true
+check 'harvest never reaps its OWN target reservation mid-collection' \
+  "$([ -f "$THOME/in-progress/$SMARK" ]; echo $?)" "$(ls "$THOME/in-progress" 2>/dev/null)"
 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 --json >"$TDIR/st.json" 2>/dev/null; RC=$?
 check '--status --json exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC"
 check '--status --json reservation marker' "$([ "$(jq -r '.reservations[0].marker' "$TDIR/st.json")" = "$SMARKER" ]; echo $?)" "$(cat "$TDIR/st.json")"

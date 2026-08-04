@@ -122,8 +122,15 @@ function runSalvage(args, port, seed) {
       })();
       const memoUrl = memos.length ? read(path.join('conversation-urls', memos[0])) : null;
       const blacklist = read('salvage-nonmatching.txt');
+      // #68: convictions recorded for --status to read back (one line per cross-bind hit).
+      const crossbound = (() => {
+        try {
+          return fs.readdirSync(path.join(home, 'crossbound'))
+            .reduce((n, f) => n + (read(path.join('crossbound', f)) ?? '').split('\n').filter(Boolean).length, 0);
+        } catch { return 0; }
+      })();
       fs.rmSync(home, { recursive: true, force: true });
-      resolve({ status, stdout, stderr, memoUrl: memoUrl?.trim() ?? null, memos, blacklist });
+      resolve({ status, stdout, stderr, memoUrl: memoUrl?.trim() ?? null, memos, blacklist, crossbound });
     });
   });
 }
@@ -318,6 +325,43 @@ const FOREIGN_ANSWER = (m) => [
   const cdp = await mockCdp(`run marker: ${MARKER}\nthinking hard, no verdict yet`);
   const r = await runSalvage([MARKER, '12'], cdp.port);
   check('still-generating stays exit 3 under the new check', r.status === 3, `status=${r.status} stderr=${r.stderr?.slice(-300)}`);
+  cdp.stop();
+}
+
+{ // #68 gate P1 (POSITION): a REUSED conversation can hold an older nonce-bearing verdict
+  // ABOVE our freshly-submitted prompt while our answer is still generating. extractReview()
+  // takes the LAST verdict, which here is the OLD one — convicting on it would blacklist and
+  // forget the genuine LIVE conversation. Order decides: foreign verdict BEFORE our marker.
+  const scrollback = [
+    '[P1] old/thing.ts:1 — a previous round in this same chat',
+    'P2: none',
+    'P3: none',
+    'VERDICT: FIX-FIRST — earlier round. (run marker: pg-run-old-round-1111111111-1)',
+    '',
+    `run marker: ${MARKER}`,                 // OUR prompt comes AFTER the old verdict
+    'thinking about the new diff...',
+  ].join('\n');
+  const cdp = await mockCdp(scrollback);
+  const r = await runSalvage([MARKER, '12'], cdp.port);
+  // cdp-salvage owns TAB OWNERSHIP, the engine owns nonce validation: the old verdict is
+  // returned (exit 0) and the ENGINE's nonce check then sets it aside as unbound-AMBIGUOUS,
+  // the retryable state. What must NOT happen here is a conviction — blacklisting/forgetting
+  // the live conversation — or a crossbound sidecar, which would mark it terminally stuck.
+  check('an OLDER verdict above our prompt is returned for engine adjudication', r.status === 0,
+    `status=${r.status} stderr=${r.stderr?.slice(-400)}`);
+  check('the live conversation is not convicted', !/ANOTHER run's completed answer/.test(r.stderr ?? ''),
+    `stderr=${r.stderr?.slice(-400)}`);
+  check('no crossbound sidecar is written for scrollback', (r.crossbound ?? 0) === 0,
+    `crossbound=${r.crossbound}`);
+  cdp.stop();
+}
+
+{ // A convicted cross-bind records a sidecar so --status can distinguish terminally-stuck
+  // from merely-ambiguous (#68 gate P2).
+  const cdp = await mockCdp('__NO_TABS__', [], { renderText: () => FOREIGN_ANSWER(MARKER) });
+  const r = await runSalvage([MARKER, '30'], cdp.port, seedMemo(MARKER, 'https://chatgpt.com/c/crossbound2'));
+  check('a conviction is recorded in crossbound/<marker>', (r.crossbound ?? 0) > 0,
+    `crossbound=${r.crossbound} stderr=${r.stderr?.slice(-300)}`);
   cdp.stop();
 }
 
