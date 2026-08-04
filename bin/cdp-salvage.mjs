@@ -107,6 +107,15 @@ function recallUrl(m) {
   } catch { return null; }
 }
 
+// #67: drop a memo proven to point at another run's conversation. Compare-and-delete (same
+// discipline as the shell's pg_provenance_reject): only unlink when the file still names the
+// URL we convicted, so a concurrently re-learned genuine URL is never destroyed.
+function forgetUrl(m, url) {
+  const f = memoPath(m);
+  if (!f) return;
+  try { if (recallUrl(m) === url) fs.unlinkSync(f); } catch {}
+}
+
 function rememberUrl(m, url) {
   const f = memoPath(m);
   if (!f || !/^https:\/\/chatgpt\.com\/c\//.test(url || '')) return;
@@ -357,6 +366,22 @@ function extractReview(text) {
   return lines.slice(start, verdictIdx + 1).join('\n').trim();
 }
 
+// #67: a page carrying a COMPLETED answer whose verdict echoes a DIFFERENT run's marker is
+// that run's conversation, full stop — even though our own marker also appears on the page,
+// because the marker rides the submitted PROMPT and a mis-navigated render can show ours
+// above someone else's answer. Two live incidents (pro-gate#66 <- pushbot#1336,
+// pushbot#1334 <- pushbot#1323) memoized exactly such a page as "ours" and, because a
+// remembered URL is exempt from blacklisting, poisoned that marker's memo permanently.
+// Returns the foreign marker when the ANSWER is provably another run's, else null.
+function foreignAnswerMarker(text) {
+  const review = extractReview(text);
+  if (!review) return null;                       // no completed answer here: decides nothing
+  const tail = review.split('\n').slice(-6).join('\n');
+  if (tail.includes(`(run marker: ${marker})`)) return null;   // ours, positively
+  const m = tail.match(/\(run marker:\s*(pg-run-[A-Za-z0-9.-]+)\s*\)/);
+  return m && m[1] !== marker ? m[1] : null;
+}
+
 // One place where a marker-matched page turns into an outcome, so the live-tab scan, the
 // dead-tab re-render and the remembered-URL recovery all behave identically — including
 // remembering the URL, which is what lets a LATER invocation find this conversation after its
@@ -426,6 +451,16 @@ while (Date.now() < deadline) {
       if (tab.url === knownUrl && FOREIGN_MARKER_RE.test(text)) memoStale = true;
       continue;
     }
+    // #67: our marker is present, but if the page's completed ANSWER belongs to another run,
+    // the page is theirs — never memoize it as ours (that is the cross-bind that stranded
+    // pro-gate#66 and pushbot#1334). Blacklist it so later passes stop re-reading it.
+    const fa = foreignAnswerMarker(text);
+    if (fa) {
+      if (tab.url === knownUrl) { memoStale = true; ourUrls.delete(tab.url); forgetUrl(marker, tab.url); knownUrl = null; }
+      blacklist(tab.url);
+      console.error(`tab ${tab.url} carries our marker but ANOTHER run's completed answer (${fa}) — not ours; ignoring it`);
+      continue;
+    }
     stillGeneratingUrl = await onOurConversation(tab.url, text);
     lastMatchWasSeeded = false;
     console.error(`conversation found (${tab.url}) but no VERDICT yet; waiting...`);
@@ -467,6 +502,15 @@ while (Date.now() < deadline) {
       }
       continue;
     }
+    // #67: same ownership test as the live-tab scan — our marker on the page is not proof the
+    // ANSWER is ours.
+    const faRender = foreignAnswerMarker(text);
+    if (faRender) {
+      if (tab.url === knownUrl) { memoStale = true; ourUrls.delete(tab.url); forgetUrl(marker, tab.url); knownUrl = null; }
+      blacklist(tab.url);
+      console.error(`re-rendered ${tab.url} carries our marker but ANOTHER run's completed answer (${faRender}) — not ours; ignoring it`);
+      continue;
+    }
     stillGeneratingUrl = await onOurConversation(tab.url, text);
     lastMatchWasSeeded = false;
     // A fresh render is a real page load against ChatGPT, so a match here is SERVER-SIDE
@@ -493,7 +537,20 @@ while (Date.now() < deadline) {
     const { text } = await freshRenderText(seedUrl, port, deadline);
     if (text) {
       if (isThrottlePage(text)) tripThrottle(`remembered render ${seedUrl}`);
-      if (text.includes(marker)) {
+      const faSeed = text.includes(marker) ? foreignAnswerMarker(text) : null;
+      if (faSeed) {
+        // #67: the memo itself is cross-bound — it points at a conversation whose completed
+        // answer belongs to another run, while carrying our marker in its prompt text. This is
+        // exactly what stranded pro-gate#66 and pushbot#1334: without this branch the memo is
+        // re-rendered, re-matched and re-memoized forever, and every harvest re-rejects the
+        // same foreign answer while the reservation never retires.
+        memoStale = true;
+        ourUrls.delete(seedUrl);      // release the blacklist exemption a remembered URL holds
+        forgetUrl(marker, seedUrl);   // the memo is provably wrong: do not re-read it next pass
+        blacklist(seedUrl);
+        knownUrl = null;
+        console.error(`remembered conversation ${seedUrl} carries ANOTHER run's completed answer (${faSeed}) — cross-bound memo, discarding it`);
+      } else if (text.includes(marker)) {
         stillGeneratingUrl = await onOurConversation(seedUrl, text);
         lastMatchWasSeeded = true;
         seededLiveUrl = seedUrl;   // survives later empty scans: this is server-side evidence

@@ -259,6 +259,68 @@ const MARKER = 'pg-run-test-1234567890-42';
   cdp.stop();
 }
 
+// ── #67: cross-bound memo. A page can carry OUR marker (it rides the submitted prompt) while
+// the completed ANSWER belongs to another run. Two live incidents memoized exactly such a page
+// as "ours"; since a remembered URL is exempt from blacklisting, the memo stayed poisoned and
+// every later harvest re-rejected the same foreign answer while the reservation never retired.
+const FOREIGN_ANSWER = (m) => [
+  `pro-gate review: PR #999 r1 [other-repo]`,
+  `run marker: ${m}`,                       // OUR marker, in the prompt echoed on the page
+  '',
+  '[P1] apps/other/thing.ts:12 — something in ANOTHER change',
+  'P2: none',
+  'P3: none',
+  'VERDICT: FIX-FIRST — not ours. (run marker: pg-run-other-repo-42-1111111111-9)',
+].join('\n');
+
+{ // The cross-bind itself: a remembered URL whose completed answer is another run's must be
+  // discarded, not re-memoized — and must NOT be returned as our review.
+  const cdp = await mockCdp('__NO_TABS__', [], { renderText: () => FOREIGN_ANSWER(MARKER) });
+  const r = await runSalvage([MARKER, '30'], cdp.port, seedMemo(MARKER, 'https://chatgpt.com/c/crossbound'));
+  check('cross-bound memo is not accepted as our review', r.status !== 0, `status=${r.status}`);
+  check('cross-bound memo exits 4 (decisive), not 7/3', r.status === 4, `status=${r.status} stderr=${r.stderr?.slice(-300)}`);
+  check('cross-bound memo is reported as another run\'s answer',
+    /ANOTHER run's completed answer/.test(r.stderr ?? ''), `stderr=${r.stderr?.slice(-400)}`);
+  check('the poisoned memo file is deleted', (r.memos ?? []).length === 0, `memos=${JSON.stringify(r.memos)}`);
+  check('no foreign review text is emitted on stdout',
+    !/VERDICT/.test(r.stdout ?? ''), `stdout=${r.stdout?.slice(0, 200)}`);
+  cdp.stop();
+}
+
+{ // Same page shape, but arriving as an OPEN TAB rather than a memo: also refused.
+  const cdp = await mockCdp(FOREIGN_ANSWER(MARKER));
+  const r = await runSalvage([MARKER, '20'], cdp.port);
+  check('an open tab with our marker but another run\'s answer is refused', r.status !== 0, `status=${r.status}`);
+  check('open-tab cross-bind never emits the foreign review',
+    !/VERDICT/.test(r.stdout ?? ''), `stdout=${r.stdout?.slice(0, 200)}`);
+  cdp.stop();
+}
+
+{ // NON-NEGOTIABLE: the fix must not make us laxer. A page carrying our marker AND our own
+  // nonce echo is still accepted exactly as before.
+  const ours = [
+    `run marker: ${MARKER}`,
+    '',
+    '[P1] lib/thing.sh:3 — a real finding',
+    'P2: none',
+    'P3: none',
+    `VERDICT: FIX-FIRST — ours. (run marker: ${MARKER})`,
+  ].join('\n');
+  const cdp = await mockCdp(ours);
+  const r = await runSalvage([MARKER, '20'], cdp.port);
+  check('our own nonce-bearing review is still returned (exit 0)', r.status === 0, `status=${r.status} stderr=${r.stderr?.slice(-300)}`);
+  check('our review reaches stdout', /VERDICT: FIX-FIRST/.test(r.stdout ?? ''), `stdout=${r.stdout?.slice(0, 200)}`);
+  cdp.stop();
+}
+
+{ // A still-generating conversation (our marker, NO completed verdict yet) must remain
+  // "live", not be mistaken for a cross-bind: the foreign check only fires on a COMPLETE answer.
+  const cdp = await mockCdp(`run marker: ${MARKER}\nthinking hard, no verdict yet`);
+  const r = await runSalvage([MARKER, '12'], cdp.port);
+  check('still-generating stays exit 3 under the new check', r.status === 3, `status=${r.status} stderr=${r.stderr?.slice(-300)}`);
+  cdp.stop();
+}
+
 { // gate round-2 P1: one EARLY successful listing must not mask a later CDP outage. Scan once
   // (before the conversation appears), then lose Chrome for the rest of the window — that ends
   // inconclusive (7), not a confirmed absence (4).

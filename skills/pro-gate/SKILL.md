@@ -268,6 +268,19 @@ echo is set aside as `<out>.unbound.*` with the reservation kept (it may be an o
 while the current one still generates — retry the harvest); in legacy mode
 (`PRO_GATE_REQUIRE_NONCE=0`) a zero-overlap capture is set aside as `<out>.foreign.*` and
 its source blacklisted) ·
+
+> **Repeated `<out>.unbound.*` files mean STUCK, not "try again" (engine ≥v0.31.1).** A
+> conversation whose COMPLETED answer echoes a *different* run's marker is that run's
+> conversation — even though your marker also appears on the page, because the marker rides
+> the submitted prompt. Engine ≥v0.31.1 detects this, discards the cross-bound URL memo, and
+> lets the harvest path apply the reservation TTL, so the change frees itself. On older
+> engines the memo stayed poisoned and every fresh run was redirected to the dead
+> reservation forever (pushbot#1334 lost a review this way). `--status` now reports
+> `state: complete-but-unbindable` with a count. **Never "fix" this with
+> `PRO_GATE_REQUIRE_NONCE=0`** — in both observed incidents the rejected capture really was
+> another PR's review, and accepting it would have sent the gate to fix phantom findings in
+> the wrong repository. Inspect the set-aside file; if it cites another change's files, wait
+> for the TTL or remove the reservation, then re-run. ·
 `8` deferred (cooldown: retry after) · `6`
 TWO flavors — read the status `detail` before interpreting: "already collected" means the
 review EXISTS but could not be returned automatically (unverifiable pre-v0.28 row, missing

@@ -998,6 +998,37 @@ check '--status leads to a free harvest' "$(grep -q "FREE" "$TDIR/st.out" && gre
 # v0.31: governor default — base grant 3 with no trajectory history, so 2 spent leaves 1.
 check '--status reports rounds spent/remaining' "$(grep -q '2 spent, 1 remaining' "$TDIR/st.out"; echo $?)" "$(grep spent "$TDIR/st.out")"
 check '--status writes nothing' "$([ ! -f "$SHOME/ledger.jsonl.tmp" ] && [ "$(wc -l < "$SHOME/ledger.jsonl")" -eq 1 ]; echo $?)" 'state mutated'
+# #67: a reservation with set-aside unbindable captures is STUCK — retrying --harvest cannot
+# help, so --status must say so instead of advertising a cheerful free harvest.
+: > /tmp/pg-st-42.md.unbound.111; : > /tmp/pg-st-42.md.unbound.222
+PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 >"$TDIR/st-stuck.out" 2>/dev/null
+check '--status flags a stuck (complete-but-unbindable) reservation' "$(grep -q 'STUCK' "$TDIR/st-stuck.out"; echo $?)" "$(cat "$TDIR/st-stuck.out")"
+check '--status counts the unbound captures' "$(grep -q '2 complete-but-unbindable' "$TDIR/st-stuck.out"; echo $?)" "$(grep -i stuck "$TDIR/st-stuck.out")"
+if pg_have_jq=$(command -v jq >/dev/null 2>&1 && echo 1 || echo 0); [ "$pg_have_jq" = 1 ]; then
+  PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 --json >"$TDIR/st-stuck.json" 2>/dev/null
+  check '--status --json reports the unbindable state' \
+    "$([ "$(jq -r '.reservations[0].state' "$TDIR/st-stuck.json")" = 'complete-but-unbindable' ] && [ "$(jq -r '.reservations[0].unbound_captures' "$TDIR/st-stuck.json")" = 2 ]; echo $?)" \
+    "$(jq -c '.reservations[0]' "$TDIR/st-stuck.json" 2>/dev/null)"
+fi
+rm -f /tmp/pg-st-42.md.unbound.111 /tmp/pg-st-42.md.unbound.222
+
+# #67: --harvest must apply reservation TTL, so a stranded change is not blocked forever (the
+# fresh-run path is redirected to the reservation before it can submit, so if the harvest path
+# cannot expire it either, both exits are closed — pushbot#1334 lost its review that way).
+THOME="$TDIR/home-harvestttl"; mkdir -p "$THOME/in-progress"
+TMARK="pg-run-ttlkey-1700000002-88"
+printf 'ttlkey\t%s/o.md\t%s\t0\t\t\t\n' "$THOME" "$(( $(date +%s) - 30000 ))" > "$THOME/in-progress/$TMARK"
+printf 'no tabs\n' > "$TDIR/tab.txt"; start_mock "$TDIR/tab.txt"
+env PRO_GATE_HOME="$THOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 NODE_OPTIONS= \
+  bash "$ENGINE" --harvest "$TMARK" --out "$THOME/o.md" --timeout 15s >"$TDIR/stdout" 2>"$TDIR/stderr" || true
+check 'harvest expires a past-TTL reservation (frees the change)' \
+  "$([ ! -f "$THOME/in-progress/$TMARK" ]; echo $?)" "$(ls "$THOME/in-progress" 2>/dev/null)"
+# An UNEXPIRED reservation must survive the same sweep untouched.
+UMARK="pg-run-ttlkey-1700000003-89"
+printf 'ttlkey\t%s/o2.md\t%s\t0\t\t\t\n' "$THOME" "$(date +%s)" > "$THOME/in-progress/$UMARK"
+env PRO_GATE_HOME="$THOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 NODE_OPTIONS= \
+  bash "$ENGINE" --harvest "$UMARK" --out "$THOME/o2.md" --timeout 15s >"$TDIR/stdout" 2>"$TDIR/stderr" || true
+check 'harvest keeps a fresh reservation' "$([ -f "$THOME/in-progress/$UMARK" ]; echo $?)" "$(ls "$THOME/in-progress" 2>/dev/null)"
 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 --json >"$TDIR/st.json" 2>/dev/null; RC=$?
 check '--status --json exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC"
 check '--status --json reservation marker' "$([ "$(jq -r '.reservations[0].marker' "$TDIR/st.json")" = "$SMARKER" ]; echo $?)" "$(cat "$TDIR/st.json")"

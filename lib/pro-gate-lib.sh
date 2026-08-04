@@ -685,7 +685,7 @@ pg_reservation_slot_plan() {
 # renderers, hydration delays, and temporary marker-read failures caused false releases in review.
 # Live (0) resets misses; throttle (5) and other errors keep state fail-closed.
 pg_reservation_reconcile() {
-  local salvage="$1" port="$2" dir ttl miss_limit interval now f marker pr out created misses slot model age mt rc
+  local salvage="$1" port="$2" dir ttl miss_limit interval now f marker pr out created misses slot model spend age mt rc
   dir="$(pg_reservation_dir)"; [ -d "$dir" ] || return 0
   ttl="${PRO_GATE_RESERVATION_TTL:-21600}"; miss_limit="${PRO_GATE_RESERVATION_MISSES:-3}"
   interval="${PRO_GATE_RECONCILE_INTERVAL:-60}"; now="$(date +%s)"
@@ -694,7 +694,16 @@ pg_reservation_reconcile() {
   for f in "$dir"/*; do
     [ -f "$f" ] || continue; marker="$(basename "$f")"
     pg_reservation_marker_ok "$marker" || continue
-    { IFS=$'\t' read -r pr out created misses slot model < "$f"; } 2>/dev/null || created=0
+    # awk per field, NOT `read`: tab is IFS-whitespace, so consecutive tabs from an empty
+    # slot/model collapse and shift every later field (the trap pg_reservation_read_model
+    # documents). That would silently drop the v0.31 spend epoch on the rewrite below.
+    pr="$(awk -F'\t' 'NR==1{print $1}' "$f" 2>/dev/null)"
+    out="$(awk -F'\t' 'NR==1{print $2}' "$f" 2>/dev/null)"
+    created="$(awk -F'\t' 'NR==1{print $3}' "$f" 2>/dev/null)"
+    misses="$(awk -F'\t' 'NR==1{print $4}' "$f" 2>/dev/null)"
+    slot="$(awk -F'\t' 'NR==1{print $5}' "$f" 2>/dev/null)"
+    model="$(awk -F'\t' 'NR==1{print $6}' "$f" 2>/dev/null)"
+    spend="$(awk -F'\t' 'NR==1{print $7}' "$f" 2>/dev/null)"
     case "$created" in ''|*[!0-9]*) created=0;; esac
     case "$misses" in ''|*[!0-9]*) misses=0;; esac
     age=$(( now - created ))
@@ -702,6 +711,10 @@ pg_reservation_reconcile() {
       echo "[pro-gate] releasing expired in-progress reservation $marker (${age}s >= ${ttl}s TTL)" >&2
       pg_reservation_remove "$marker"; continue
     fi
+    # TTL-only mode (#67): the harvest path sweeps expiry without probing. A probe there would
+    # cost a page render per harvest and could only duplicate the evidence the caller's own
+    # capture is about to produce; misses stay the fresh-dispatch path's business.
+    [ "${PG_RES_TTL_ONLY:-0}" = 1 ] && continue
     # Rate-limit probes per marker by file mtime: N concurrent fresh runs must not turn one
     # real absence window into N miss increments, and back-to-back reconciles should not spam
     # conversation probes. Writes/updates touch mtime, so consecutive misses are spaced by at
@@ -716,7 +729,7 @@ pg_reservation_reconcile() {
           # The harvest may have removed the file during the probe; rewriting would resurrect a
           # released reservation and block capacity until TTL, so re-check under the guard.
           if [ -f "$f" ]; then
-            printf '%s\t%s\t%s\t0\t%s\t%s\n' "$pr" "$out" "$created" "${slot:-}" "${model:-}" > "$f.tmp" 2>/dev/null && mv -f "$f.tmp" "$f"
+            printf '%s\t%s\t%s\t0\t%s\t%s\t%s\n' "$pr" "$out" "$created" "${slot:-}" "${model:-}" "${spend:-}" > "$f.tmp" 2>/dev/null && mv -f "$f.tmp" "$f"
           fi
           pg_reservation_guard_release
         }
