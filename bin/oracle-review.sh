@@ -984,13 +984,11 @@ if [ -n "$HARVEST_MARKER" ]; then
     pg_finish 8
   fi
   HARVEST_SECS="$(pg_dur_secs "$TIMEOUT")"
-  # The reservation's creation epoch IS this review's spend epoch. Capture it BEFORE the
-  # collection (which retires the reservation) so the trajectory row is stamped with when the
-  # round was spent, not when it was collected (#66 gate P1).
-  HARVEST_SPEND_EPOCH=""
-  [ -f "$(pg_reservation_dir)/$RUN_MARKER" ] \
-    && { IFS=$'\t' read -r _ _ HARVEST_SPEND_EPOCH _ < "$(pg_reservation_dir)/$RUN_MARKER"; } 2>/dev/null
-  case "$HARVEST_SPEND_EPOCH" in *[!0-9]*) HARVEST_SPEND_EPOCH="";; esac
+  # Stamp the trajectory row with when the ROUND WAS CHARGED, which is the epoch inside the
+  # marker (#66 gate r2 P1). The reservation's `created` field is NOT that moment: it is only
+  # written when the run gives up its slot at exit 9 — measured 35 min after the charge on the
+  # run that exposed this — which would park the row beyond its own spend in the scored window.
+  HARVEST_SPEND_EPOCH="$(pg_marker_epoch "$RUN_MARKER" 2>/dev/null || true)"
   echo "[oracle-review] harvesting in-progress review (marker ${RUN_MARKER}, up to ${HARVEST_SECS}s, no new slot spent)..." >&2
   pg_status salvaging "harvest up to ${HARVEST_SECS}s"
   HARVEST_RC=0
@@ -2158,7 +2156,10 @@ if [ -n "$FINAL_SNAP" ]; then
   PG_FINAL_SRC="$FINAL_SNAP"
   # v0.22: remember this review's P0/P1 counts so a later round-capped refusal can flag an
   # unconfirmed open P0 to the human (advisory sidecar; see pg_round_note_severity).
-  pg_round_note_severity "$ROUND_KEY" "$PG_FINAL_SRC"
+  # Same spend-identity rule as the harvest path: a fresh completion is stamped with the epoch
+  # its round was CHARGED at (inside the marker), not the minutes-to-an-hour-later moment the
+  # review finished — otherwise a long run's row outlives its own spend in the scored window.
+  pg_round_note_severity "$ROUND_KEY" "$PG_FINAL_SRC" "$(pg_marker_epoch "$RUN_MARKER" 2>/dev/null || true)"
   # Verified publication (gate #54 r8/r9): "done" PROMISES a readable --out; a failed publish
   # must not report clean, and the durability of what WAS captured decides the message.
   pg_publish_out "$PG_FINAL_SRC" || pg_publish_fail "$PG_FINAL_SRC"

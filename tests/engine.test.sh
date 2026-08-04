@@ -848,6 +848,14 @@ check 'landed-but-lost run does NOT announce a refund' "$(grep -qv 'refunding th
 check 'landed-but-lost round STAYS charged' \
   "$([ -s "$RHOME/rounds/$RKEY_92" ]; echo $?)" "rounds: $(cat "$RHOME/rounds/$RKEY_92" 2>/dev/null)"
 
+# #66 gate r2 P1: the spend epoch comes from the MARKER (when pg_round_record charged the
+# round), never the reservation's `created` field — that is written at exit-9 time, measured
+# 35 min later on the live run that exposed this.
+MEPOCH="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_marker_epoch 'pg-run-acme-widgets-42-1700000123-99'")"
+check 'pg_marker_epoch extracts the launch epoch' "$([ "$MEPOCH" = 1700000123 ]; echo $?)" "got=$MEPOCH"
+MEPOCH="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_marker_epoch 'legacy-marker' 2>/dev/null" || true)"
+check 'pg_marker_epoch rejects a legacy marker' "$([ -z "$MEPOCH" ]; echo $?)" "got=$MEPOCH"
+
 # #66 gate P1: a harvested review is stamped with its SPEND epoch, not the collection time —
 # otherwise an hours-later harvest outlives its own spend in the scored window.
 HHOME="$TDIR/home-histstamp"; mkdir -p "$HHOME/rounds"

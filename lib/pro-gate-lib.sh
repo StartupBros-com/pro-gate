@@ -1009,11 +1009,12 @@ pg_round_note_severity() {
   sp="$(grep -icE '^[[:space:]]*\[P[01]\][[:space:]]+[^[:space:]]+[[:space:]]+(—|--|-)[[:space:]]+STILL-PRESENT([^_[:alnum:]]|$)' "$out" 2>/dev/null)"; [ -n "$sp" ] || sp=0
   now="$(date +%s)"; win="$(pg_round_window_secs)"
   # A hist row is stamped with the epoch of the SPEND it describes, not the moment it was
-  # collected (#66 gate P1): an exit-9 review harvested hours later would otherwise stay in
-  # the scored trajectory after its spend aged out of pg_round_count's window — earning
-  # rounds, faking a churn brake, or landing out of order after newer rounds. Callers on the
-  # harvest path pass the reservation's recorded spend epoch; a fresh completion is its own
-  # spend, so "now" is correct there. Rows are pruned on the same window as the spends.
+  # collected (#66 gate P1/r2 P1): a review collected long after its charge — an exit-9
+  # harvest, or just a slow fresh run — would otherwise stay in the scored trajectory after
+  # its spend aged out of pg_round_count's window, earning rounds, faking a churn brake, or
+  # landing out of order after newer rounds. Both engine paths pass the marker's launch epoch
+  # (pg_marker_epoch), which is when pg_round_record charged the round. Rows are pruned on the
+  # same window as the spends, so history and budget expire together.
   # The re-sort is STABLE (-s): rounds inside one second are common in tests and fast gates,
   # and an unstable sort would silently reorder the trajectory it exists to keep honest.
   stamp="$spend_epoch"; case "$stamp" in ''|*[!0-9]*) stamp="$now";; esac
@@ -1032,6 +1033,21 @@ pg_round_note_severity() {
     && mv -f "$dir/$key.hist.tmp" "$dir/$key.hist" 2>/dev/null \
     || rm -f "$dir/$key.hist.tmp" 2>/dev/null
   return 0
+}
+
+# pg_marker_epoch <marker>: the launch epoch embedded in "pg-run-<key>-<epoch>-<pid>". This is
+# the round's spend identity (#66 gate r2 P1): pg_round_record charges the round moments after
+# the marker is minted, whereas a reservation's `created` field is only written at exit-9 time —
+# 35 minutes later on the run that exposed this — so stamping history from the reservation left
+# a harvested row scored long after its own spend expired. Empty on a legacy/unparseable marker,
+# and callers then fall back to "now".
+pg_marker_epoch() {
+  local m="${1:-}" rest e
+  case "$m" in pg-run-*) rest="${m#pg-run-}";; *) return 1;; esac
+  rest="${rest%-*}"          # strip -<pid>
+  e="${rest##*-}"            # take <epoch>
+  case "$e" in ''|*[!0-9]*) return 1;; esac
+  printf '%s\n' "$e"
 }
 
 # pg_round_last_severity <key>: echo "p0 p1" from the sidecar, or fail when none/unparseable.
