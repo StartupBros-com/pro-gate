@@ -92,7 +92,13 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
   ST_LEDGER="${PRO_GATE_LEDGER:-$PRO_GATE_HOME/ledger.jsonl}"
   ST_URLS_DIR="$PRO_GATE_HOME/conversation-urls"
   ST_ENGINE="$PRO_GATE_HOME/oracle-review.sh"
-  ST_CAP="${PRO_GATE_MAX_ROUNDS_PER_PR:-4}"; case "$ST_CAP" in ''|*[!0-9]*) ST_CAP=4;; esac
+  # v0.31: the cap is per-key (governor grant varies with each key's trajectory). ST_CAP_DESC
+  # is the human-readable header; per-key grants come from pg_round_grant in the loop below.
+  if [ -n "${PRO_GATE_MAX_ROUNDS_PER_PR:-}" ]; then
+    ST_CAP_DESC="flat cap ${PRO_GATE_MAX_ROUNDS_PER_PR}"
+  else
+    ST_CAP_DESC="adaptive (base ${PRO_GATE_ROUNDS_BASE:-3}, +1 per shrinking re-review, ceiling ${PRO_GATE_ROUNDS_CEILING:-8})"
+  fi
   ST_WIN="$(pg_round_window_secs)"
   ST_NOW="$(date +%s)"
   ST_LOCKFILE="${PRO_GATE_LOCKFILE:-$PRO_GATE_HOME/oracle.lock}"
@@ -328,16 +334,25 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
     if [ -z "$Q_NUM$Q_MARKER" ] && ! [ "$spent" -gt 0 ] 2>/dev/null && [ "$k_live" != 1 ] && [ -z "$a_marker$a_out" ]; then
       continue
     fi
-    rem=$(( ST_CAP - spent )); [ "$rem" -lt 0 ] && rem=0
+    # Score IN THIS SHELL (#66 gate P2): a command substitution would return only the number
+    # and drop the trajectory globals, leaving --status unable to distinguish ordinary
+    # exhaustion from a churn brake — the very signal this release exists to surface.
+    pg_round_score "$k"
+    k_cap="$PG_ROUND_GRANT"; k_arrow="$PG_ROUND_ARROW"; k_earned="$PG_ROUND_EARNED"
+    k_streak="$PG_ROUND_STREAK"; k_braked=0
+    [ "$PG_ROUND_STREAK" -ge 2 ] && [ -z "${PRO_GATE_MAX_ROUNDS_PER_PR:-}" ] && k_braked=1
+    rem=$(( k_cap - spent )); [ "$rem" -lt 0 ] && rem=0
     if [ "$spent" -gt 0 ] 2>/dev/null; then ST_SPENT_KEY="$k"; ST_SPENT_N="$spent"; fi
     if pg_have jq; then
-      jq -nc --arg key "$k" --argjson spent "$spent" --argjson cap "$ST_CAP" \
+      jq -nc --arg key "$k" --argjson spent "$spent" --argjson cap "$k_cap" \
         --argjson remaining "$rem" --argjson window_secs "$ST_WIN" --argjson in_flight "$k_live" \
         --arg amarker "$a_marker" --arg aout "$a_out" --arg aalive "$a_alive" --arg amode "$a_mode" \
-        '{key:$key,spent:$spent,cap:$cap,remaining:$remaining,window_secs:$window_secs,in_flight:($in_flight == 1),active:(if $amarker == "" and $aout == "" then null else {marker:$amarker,out:$aout,wrapper_alive:($aalive == "1"),mode:$amode} end)}' \
+        --arg arrow "$k_arrow" --argjson earned "$k_earned" --argjson streak "$k_streak" \
+        --argjson braked "$k_braked" \
+        '{key:$key,spent:$spent,cap:$cap,remaining:$remaining,window_secs:$window_secs,in_flight:($in_flight == 1),trajectory:(if $arrow == "" then null else $arrow end),earned:$earned,streak:$streak,churn_braked:($braked == 1),active:(if $amarker == "" and $aout == "" then null else {marker:$amarker,out:$aout,wrapper_alive:($aalive == "1"),mode:$amode} end)}' \
         >> "$ST_TMP/rounds.jsonl" 2>/dev/null
     else
-      printf '%s\t%s\t%s\t%s\t%s\n' "$k" "$spent" "$ST_CAP" "$rem" "$k_live" >> "$ST_TMP/rounds.tsv"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$k" "$spent" "$k_cap" "$rem" "$k_live" "$k_arrow" "$k_braked" >> "$ST_TMP/rounds.tsv"
     fi
   done
 
@@ -445,11 +460,14 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
     fi
   fi
   if [ -s "$ST_TMP/rounds.jsonl" ] || [ -s "$ST_TMP/rounds.tsv" ]; then
-    echo "round budget (rolling window $(( ST_WIN / 3600 ))h, cap $ST_CAP):"
+    echo "round budget (rolling window $(( ST_WIN / 3600 ))h, ${ST_CAP_DESC}):"
     if pg_have jq && [ -s "$ST_TMP/rounds.jsonl" ]; then
-      jq -r '"  " + .key + ": \(.spent) spent, \(.remaining) remaining" + (if .in_flight then "  [REVIEW RUNNING NOW]" else "" end)' "$ST_TMP/rounds.jsonl"
+      jq -r '"  " + .key + ": \(.spent) spent, \(.remaining) remaining"
+             + (if .trajectory then "  (open P0/P1 by round: " + .trajectory + ")" else "" end)
+             + (if .churn_braked then "  [CHURN BRAKE: not converging — escalate instead of re-running]" else "" end)
+             + (if .in_flight then "  [REVIEW RUNNING NOW]" else "" end)' "$ST_TMP/rounds.jsonl"
     else
-      awk -F'\t' '{printf "  %s: %s spent, %s remaining (cap %s)%s\n", $1, $2, $4, $3, ($5 == 1 ? "  [REVIEW RUNNING NOW]" : "")}' "$ST_TMP/rounds.tsv" 2>/dev/null
+      awk -F'\t' '{printf "  %s: %s spent, %s remaining (cap %s)%s%s%s\n", $1, $2, $4, $3, ($6 == "" ? "" : "  (open P0/P1 by round: " $6 ")"), ($7 == 1 ? "  [CHURN BRAKE: not converging]" : ""), ($5 == 1 ? "  [REVIEW RUNNING NOW]" : "")}' "$ST_TMP/rounds.tsv" 2>/dev/null
     fi
   else
     echo "round budget: nothing spent in the current window for this query"
@@ -966,6 +984,15 @@ if [ -n "$HARVEST_MARKER" ]; then
     pg_finish 8
   fi
   HARVEST_SECS="$(pg_dur_secs "$TIMEOUT")"
+  # Stamp the trajectory row with when the ROUND WAS CHARGED. Authoritative source is the
+  # reservation's spend field, written from pg_round_record's own epoch (#66 gate r3 P1); the
+  # marker's launch epoch is only a fallback for legacy reservations, since a queued run mints
+  # its marker up to two lock waits before the charge. NOT the reservation's `created` field:
+  # that is stamped at exit-9 time, 35 min after the charge on the run that exposed this.
+  HARVEST_SPEND_EPOCH="$(pg_reservation_read_spend "$RUN_MARKER" 2>/dev/null || true)"
+  case "$HARVEST_SPEND_EPOCH" in ''|*[!0-9]*)
+    HARVEST_SPEND_EPOCH="$(pg_marker_epoch "$RUN_MARKER" 2>/dev/null || true)";;
+  esac
   echo "[oracle-review] harvesting in-progress review (marker ${RUN_MARKER}, up to ${HARVEST_SECS}s, no new slot spent)..." >&2
   pg_status salvaging "harvest up to ${HARVEST_SECS}s"
   HARVEST_RC=0
@@ -1044,7 +1071,7 @@ if [ -n "$HARVEST_MARKER" ]; then
     # ("pg-run-<key>-<epoch>-<pid>") for PR and --diff runs alike; legacy markers resolve to
     # keys with no recorded rounds and are skipped inside the helper (best-effort, advisory).
     HARVEST_KEY="${RUN_MARKER#pg-run-}"; HARVEST_KEY="${HARVEST_KEY%-*-*}"
-    pg_round_note_severity "$HARVEST_KEY" "$PG_FINAL_SRC"
+    pg_round_note_severity "$HARVEST_KEY" "$PG_FINAL_SRC" "$HARVEST_SPEND_EPOCH"
     SALVAGED=1
     echo "[oracle-review] harvest recovered the completed review ($(wc -c < "$PG_FINAL_SRC" 2>/dev/null) bytes)." >&2
     pg_persist_result "$PG_FINAL_SRC"
@@ -1530,10 +1557,13 @@ if [ "$MODE" = remote-chrome ]; then
   fi
 fi
 
-# v0.22: review round budget. Refuse to spend ANOTHER Pro slot on a PR/branch that already
-# used its rounds inside the rolling window (default 4 per 24h): unbounded review->fix->
-# re-review loops burned 10-16 slots on single PRs (8h+ gates, queue starvation). Checked
-# AFTER the reservation redirect above: an in-progress conversation harvests for FREE and must
+# v0.22/v0.31: review round budget. Refuse to spend ANOTHER Pro slot on a PR/branch whose
+# budget is exhausted inside the rolling window: unbounded review->fix->re-review loops
+# burned 10-16 slots on single PRs (8h+ gates, queue starvation). Since v0.31 the budget is
+# a trajectory-aware governor (base 3, +1 earned per strictly-shrinking re-review, ceiling 8,
+# early stop after 2 consecutive non-shrinking re-reviews; an explicitly set
+# PRO_GATE_MAX_ROUNDS_PER_PR pins the legacy flat cap — see pg_round_guard). Checked AFTER
+# the reservation redirect above: an in-progress conversation harvests for FREE and must
 # never be blocked by the budget. Exit 12, NO quota spent; escalate remaining findings to a
 # human instead of re-running.
 round_capped() {  # $1 = reason
@@ -1546,6 +1576,8 @@ round_capped() {  # $1 = reason
     last_p0="${sev%% *}"; last_p1="${sev##* }"
     note="; last completed review: ${last_p0} P0 / ${last_p1} P1 unconfirmed by a re-review"
   fi
+  # pg_round_guard's refusal already carries the scored trajectory. Do not re-read .hist here:
+  # the reason becomes the status detail below, and a second parse can only duplicate I/O.
   # Non-blocking probe: a same-change run holding the per-change lock right now means the
   # sidecar note above describes the round BEFORE the one in flight; its completion may
   # change the picture, so tell the human to re-read before granting a forced round (the
@@ -1569,7 +1601,7 @@ round_capped() {  # $1 = reason
     [ "$inflight" = 1 ] && echo "  (A same-change review is in flight right now; wait for it before deciding, its result may already settle these.)" >&2
   fi
   echo "  A gate that keeps cycling review->fix->re-review is not converging: escalate the remaining findings to a human instead." >&2
-  echo "  Deliberate override for ONE run: PRO_GATE_FORCE_ROUND=1. Tunables: PRO_GATE_MAX_ROUNDS_PER_PR, PRO_GATE_ROUNDS_WINDOW; PRO_GATE_ROUND_GUARD=0 disables." >&2
+  echo "  Deliberate override for ONE run: PRO_GATE_FORCE_ROUND=1. Tunables: PRO_GATE_ROUNDS_BASE/PRO_GATE_ROUNDS_CEILING (governor), PRO_GATE_MAX_ROUNDS_PER_PR (pins the legacy flat cap), PRO_GATE_ROUNDS_WINDOW; PRO_GATE_ROUND_GUARD=0 disables." >&2
   pg_status round-capped "${1}${note}"
   pg_finish 12
 }
@@ -1794,7 +1826,10 @@ while :; do
   # guarded retry below is the same round, and pre-launch exits above never record).
   # v0.27: and publish the active-run record at the same moment, so --status can see a live
   # (or wrapper-dead-but-generating) run before any reservation or ledger row exists.
-  [ "$attempt" -eq 0 ] && { pg_round_record "$ROUND_KEY"; pg_active_write; }
+  # PG_ROUND_SPEND_EPOCH (set by pg_round_record) is this run's charge time — the stamp every
+  # trajectory row for this round must carry (#66 gate r3 P1). Keep it for the completion path
+  # and for the reservation an exit-9 hands to a later harvest process.
+  [ "$attempt" -eq 0 ] && { pg_round_record "$ROUND_KEY"; RUN_SPEND_EPOCH="$PG_ROUND_SPEND_EPOCH"; pg_active_write; }
 
   # A non-blocking heads-up when memory is tight but not blocking (the gate is deliberately
   # conservative, so a swap-heavy box with moderate free RAM still runs). Warns low-memory users
@@ -2128,7 +2163,10 @@ if [ -n "$FINAL_SNAP" ]; then
   PG_FINAL_SRC="$FINAL_SNAP"
   # v0.22: remember this review's P0/P1 counts so a later round-capped refusal can flag an
   # unconfirmed open P0 to the human (advisory sidecar; see pg_round_note_severity).
-  pg_round_note_severity "$ROUND_KEY" "$PG_FINAL_SRC"
+  # Same spend-identity rule as the harvest path: stamp with the epoch pg_round_record CHARGED
+  # this round at, not the minutes-to-an-hour-later moment the review finished, and not the
+  # marker's pre-queue launch time — otherwise the row outlives (or predates) its own spend.
+  pg_round_note_severity "$ROUND_KEY" "$PG_FINAL_SRC" "${RUN_SPEND_EPOCH:-}"
   # Verified publication (gate #54 r8/r9): "done" PROMISES a readable --out; a failed publish
   # must not report clean, and the durability of what WAS captured decides the message.
   pg_publish_out "$PG_FINAL_SRC" || pg_publish_fail "$PG_FINAL_SRC"
@@ -2162,7 +2200,7 @@ elif [ "${SALVAGE_RAN:-0}" = 1 ] && [ "${SALVAGE_PRESERVE:-0}" = 1 ]; then
   # v0.28 (#55): this run's prompt asked for the nonce echo — record that expectation so a
   # harvest can NOTE when a capture arrives without one (accepted via path overlap instead).
   : > "$(pg_manifest_dir)/${RUN_MARKER}.nonce" 2>/dev/null || true
-  if ! pg_reservation_write "$RUN_MARKER" "${ROUND_KEY:-diff}" "$OUT" "${SLOT_HELD:-}" "$RESOLVED_MODEL"; then
+  if ! pg_reservation_write "$RUN_MARKER" "${ROUND_KEY:-diff}" "$OUT" "${SLOT_HELD:-}" "$RESOLVED_MODEL" "${RUN_SPEND_EPOCH:-}"; then
     # Fail closed: without the durable reservation, exit 9 would under-count a live Pro tab and
     # let the next invocation double-spend. Keep the process/locks alive rather than release
     # unreserved capacity; this should only happen on a broken/unwritable PRO_GATE_HOME.
@@ -2185,12 +2223,37 @@ elif [ "${SALVAGE_RAN:-0}" = 1 ] && [ "${SALVAGE_PRESERVE:-0}" = 1 ]; then
 else
   RETRIES=$(( attempt > 0 ? attempt - 1 : 0 ))
   echo "ERROR: oracle produced no usable review after salvage + ${RETRIES} retr$([ "${RETRIES}" -eq 1 ] && echo y || echo ies) (reattach: oracle session ${SLUG_BASE})." >&2
+  FAIL_DETAIL="no usable review after salvage"
+  # v0.31 (#65): refund the round when the submission PROVABLY never landed — the same bar as
+  # the Cloudflare refund, met by positive evidence only: salvage scanned the browser clean
+  # (rc 4 is the one result meaning "nothing carries this marker"; the marker rides the
+  # PROMPT, so even an answerless landed submission matches), the live probe never fired, no
+  # conversation URL was ever memoized (the early probe runs ~75s after submission), the
+  # account was not mid-throttle (fate unknown), and Chrome did not restart mid-run (a dead
+  # tab is absence of evidence, not evidence of absence). Fleet evidence: upload-timeout
+  # failures ate 2 of pro-gate#61's 4 window rounds while spending zero Pro quota.
+  # The run log must ALSO carry no submission evidence (#66 gate P1): the pre-retry
+  # classifier at the retry site only runs when a retry is attempted, so with retries
+  # disabled — or after the last one — a run that logged "Acquired ChatGPT browser slot"
+  # then lost its tab before the URL memo could be captured would otherwise be refunded
+  # despite the prompt existing server-side. Same strings, same fail-closed bias.
+  _svc_up=""; _svc_restarted=0
+  if _svc_up="$(pg_browser_restarted_midrun "$RUN_START")"; then _svc_restarted=1; fi
+  if [ "${SALVAGE_RAN:-0}" = 1 ] && [ "${SALVAGE_RC:-0}" -eq 4 ] \
+     && [ "${LIVE_CONVERSATION:-0}" != 1 ] && [ "${THROTTLED:-0}" != 1 ] \
+     && [ ! -f "$PRO_GATE_HOME/conversation-urls/${RUN_MARKER}" ] \
+     && [ "$_svc_restarted" = 0 ] \
+     && ! grep -qE 'Launching browser mode|Acquired ChatGPT browser slot|Reattach: oracle session ' "$RUNLOG" 2>/dev/null; then
+    echo "[oracle-review] no conversation ever carried this run's marker (browser scanned clean, no URL memoized, browser stable): the submission never landed — refunding this round; zero Pro quota was spent." >&2
+    pg_round_unrecord "$ROUND_KEY"
+    FAIL_DETAIL="submission never landed (send/upload failure before the prompt reached ChatGPT); round refunded, safe to retry"
+  fi
   # Attribute the failure when the review browser restarted mid-run — almost always memory pressure
   # on a small box (Chrome's subprocesses get reclaimed, oracle-chrome restarts, the CDP tab is
   # lost). Say so plainly so a non-technical user knows what happened, that quota was likely already
   # spent, and that the review may still exist server-side (no need to immediately re-run).
-  FAIL_DETAIL="no usable review after salvage"
-  if _svc_up="$(pg_browser_restarted_midrun "$RUN_START")"; then
+  # (FAIL_DETAIL was seeded above; the refund path may already carry its own detail.)
+  if [ "$_svc_restarted" = 1 ]; then
     _mem="$(pg_mem_status)"; [ -n "$_mem" ] || _mem="memory usage unknown"
     echo "  LIKELY CAUSE: the review browser (Chrome) restarted ${_svc_up}s ago — mid-review — almost always because the machine ran low on memory (${_mem})." >&2
     # #35: when the early probe already memoized this run's conversation URL, the recovery is

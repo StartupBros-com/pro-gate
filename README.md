@@ -41,7 +41,7 @@ to the best available fixer, and posts the review on the PR. It stops before mer
 | Spend protection | Deferrals, oversized refusals, and round caps exit without spending a Pro slot; an interrupted run leaves a harvestable reservation instead of a wasted slot |
 | Crash recovery | `--status` rediscovers any run from a bare PR number; `--harvest` collects a review the model was still writing when your session died |
 | Verified provenance | Every run embeds a nonce the model echoes back on its verdict line; a capture that doesn't match the run is rejected, never silently accepted |
-| Bounded loops | The review, fix, re-review loop continues only while findings strictly shrink; the engine refuses more than 4 slot-spending rounds per change per rolling 24 h |
+| Bounded loops | The review, fix, re-review loop continues only while findings strictly shrink; the engine's trajectory governor grants 3 rounds per change per rolling 24 h, earns +1 per shrinking re-review up to a hard ceiling of 8, and cuts a non-converging loop early |
 
 ### Quick example
 
@@ -236,7 +236,9 @@ All tunables live in [`.env.example`](.env.example) with inline docs; the engine
 |---|---|---|
 | `PRO_REVIEW_OWNERS` | *(required for daemon)* | GitHub owners the daemon may watch |
 | `PRO_REVIEW_MAX_BUDGET_USD` | `5` | Hard $ ceiling per PR for headless fixer runs |
-| `PRO_GATE_MAX_ROUNDS_PER_PR` | `4` | Slot-spending reviews per change per rolling window |
+| `PRO_GATE_ROUNDS_BASE` | `3` | Governor base grant of slot-spending reviews per change per window |
+| `PRO_GATE_ROUNDS_CEILING` | `8` | Hard ceiling a shrinking-findings trajectory can earn up to (+1 per shrinking re-review) |
+| `PRO_GATE_MAX_ROUNDS_PER_PR` | *(unset)* | Set to pin the legacy flat cap instead of the governor |
 | `PRO_GATE_ROUNDS_WINDOW` | `24h` | The rolling window for that budget |
 | `PRO_GATE_MAX_DIFF_LINES` | `6000` | Above this a run proceeds but usually lands in-progress → harvest |
 | `PRO_GATE_DIFF_HARD_MAX` | `25000` | Above this the engine refuses (exit 11, no spend) |
@@ -273,7 +275,8 @@ All tunables live in [`.env.example`](.env.example) with inline docs; the engine
   skill's default `converge` policy continues only while each round strictly narrows the
   findings (all prior P0/P1 resolved, fewer new ones) and stops on oscillation;
   `pro_gate_rounds_policy: bounded` restores a fixed ceiling. The engine independently
-  enforces the per-change round budget (exit 12, no spend).
+  enforces the per-change round budget (exit 12, no spend) — since v0.31 a trajectory-aware
+  governor that earns rounds while open findings shrink and brakes early on churn.
 - **Merge authority**: the daemon never merges; it stops after pushing fixes and commenting.
 
 ## Troubleshooting

@@ -19,6 +19,7 @@ Conventions in this file:
 
 | Version | Date | Artifact | Theme |
 |---|---|---|---|
+| [v0.31.0](https://github.com/StartupBros-com/pro-gate/releases/tag/v0.31.0) | 2026-08-04 | Release | Trajectory-aware round governor: earned rounds, churn brake, never-landed refunds |
 | [v0.30.1](https://github.com/StartupBros-com/pro-gate/releases/tag/v0.30.1) | 2026-08-03 | Release | Hygiene close-out: consent stderr leak, run-log sweep allowlist, autoupdate.log bound, `.env` perms, salvage-window knob |
 | [v0.30.0](https://github.com/StartupBros-com/pro-gate/releases/tag/v0.30.0) | 2026-08-03 | Release | Residuals close-out: daemon recoverable-state guard, scratch hygiene, memoized-URL recovery (plus the #58–#60 docs wave) |
 | [v0.29.0](https://github.com/StartupBros-com/pro-gate/releases/tag/v0.29.0) | 2026-08-02 | Release | ChatGPT sidebar titling: run-naming prompt line |
@@ -248,6 +249,30 @@ concurrent bash/Node append without one cross-platform lock shared by every writ
 were updated to match observed reality (100% of clean runs 2026-07-22 → 08-03 landed via
 salvage/harvest; oracle 0.17.0 restored primary capture for runs that finish inside the
 stall fuse).
+
+### 11. Trajectory-aware round governor (2026-08-04, v0.31.0)
+
+The flat 4-per-24h round cap became a governor ([#65](https://github.com/StartupBros-com/pro-gate/issues/65)),
+grounded in a fleet-wide mining pass (254 gated changes, 737 spends, 43 reconstructed
+verdict sequences, 28 deep-read audit trails): the flat cap fired only twice ever, yet was
+too tight for converging gates (pushbot#987 shrank open P1s 6→5→3→2→0-SHIP at round 5;
+arena-strategy#322 reached SHIP at round 14 — both needed per-run human forcing) and too
+loose for churning ones (open counts GREW 5→7→8→10 while four slots burned). The engine now
+scores each completed review into `rounds/<key>.hist` (verdict word, open P0/P1
+RESOLVED-filtered, resolved/still-present tallies) and grants rounds by trajectory: base
+`PRO_GATE_ROUNDS_BASE` (3), +1 earned per strictly-shrinking re-review, immovable ceiling
+`PRO_GATE_ROUNDS_CEILING` (8), with an early stop after two consecutive non-shrinking
+re-reviews — the same adaptive-within-a-ceiling shape as the v0.19 concurrency ramp. An
+explicitly set `PRO_GATE_MAX_ROUNDS_PER_PR` pins the legacy flat cap. Exit-12 refusals now
+carry the whole trajectory ("open P0/P1 by round: 5→7→8") so a human deciding on
+`PRO_GATE_FORCE_ROUND` sees churning-vs-converging at a glance, `--status` reports each
+key's live grant, and a submission the engine can PROVE never landed (send/upload failure:
+browser scanned clean, no URL ever memoized, no throttle, no Chrome restart) refunds its
+round the way the Cloudflare path always has — upload timeouts had eaten 2 of
+pro-gate#61's 4 window rounds while spending zero Pro quota. The skill's §6 stop rules
+gained the matching refinement: a returning finding whose fix the reviewer ACCEPTS but
+calls incomplete is convergence work, not oscillation — only a disputed fix approach
+escalates.
 
 ## Notes for agents
 
