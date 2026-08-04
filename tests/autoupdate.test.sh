@@ -116,6 +116,19 @@ check 'library-only source does not touch the log' "$([ "$(wc -l < "$TDIR/home/l
 run_updater PRO_GATE_CONSENT_HOME="$TDIR/consent"
 AULINES="$(wc -l < "$TDIR/home/logs/autoupdate.log")"
 check 'a locked run trims the log to ~400 lines' "$([ "$AULINES" -ge 400 ] && [ "$AULINES" -le 410 ]; echo $?)" "lines=$AULINES"
+# gate r3 P2: a lock LOSER holds no serialization, so it must not touch the log at all —
+# its skip notice goes to stderr only, and no trim runs.
+if command -v flock >/dev/null 2>&1; then
+  seq 1 50 > "$TDIR/home/logs/autoupdate.log"
+  ( flock -x 9; sleep 2 ) 9>>"$TDIR/home/autoupdate.lock" &
+  AUHOLD=$!
+  sleep 0.3
+  run_updater PRO_GATE_CONSENT_HOME="$TDIR/consent"
+  check 'lock loser exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC"
+  check 'lock loser announces the skip on stderr' "$(grep -q 'another auto-update run is active' "$TDIR/stderr"; echo $?)" "$(cat "$TDIR/stderr")"
+  check 'lock loser never appends to or trims the log' "$([ "$(wc -l < "$TDIR/home/logs/autoupdate.log")" -eq 50 ]; echo $?)" "lines=$(wc -l < "$TDIR/home/logs/autoupdate.log")"
+  wait "$AUHOLD" 2>/dev/null
+fi
 
 echo '# fail closed: non-semver plugin versions are never followed'
 write_manifest '0.23.0-$(rm -rf /)'

@@ -232,8 +232,9 @@ when the consent file is absent (redirect-order bug — `2>/dev/null` cannot cat
 `<` open listed before it); the run-log sweep matches an allowlist of run-log shapes
 (`pg-run-*` plus the pre-v0.27 epoch-suffixed names) so pre-v0.27 logs finally retire while
 `autoupdate.log` and the launchd daemon's open `daemon.{out,err}.log` are structurally
-unmatched; `autoupdate.log` is bounded by the new `pg_trim_file` helper, inside the
-updater's singleton lock; `.env` is installed owner-only (a failed `chmod 600` now aborts
+unmatched; `autoupdate.log` is bounded by the new `pg_trim_file` helper, only while the updater's
+singleton lock is actually held (lock losers announce the skip on stderr without touching
+the log; no-flock platforms never trim); `.env` is installed owner-only (a failed `chmod 600` now aborts
 the install before the version stamps land) and the doctor warns when it is
 group/other-readable. The non-live salvage window became its own knob
 (`PRO_GATE_SALVAGE_SECS`, default: follows `PRO_GATE_STALL_SECS` as before) so the stall
