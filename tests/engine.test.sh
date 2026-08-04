@@ -693,6 +693,27 @@ touch -d '3 days ago' "$RHOME/rounds/stale-key-1" "$RHOME/rounds/stale-key-1.loc
 roundrun 88 "$RHOME/o-r7.md" PRO_GATE_ROUND_GUARD=0
 check 'stale round state is swept by housekeeping' "$([ ! -f "$RHOME/rounds/stale-key-1" ] && [ ! -f "$RHOME/rounds/stale-key-1.lock" ]; echo $?)" "rounds dir: $(ls "$RHOME/rounds" 2>/dev/null)"
 
+echo '# v0.30.1 hygiene close-out: legacy-named logs, daemon/service logs, title-seq, blacklist'
+mkdir -p "$RHOME/logs" "$RHOME/title-seq"
+touch "$RHOME/logs/pg-run-fresh.log"
+printf 'x\n' > "$RHOME/logs/legacy-owner-repo-4-1782771272.log"
+printf 'x\n' > "$RHOME/logs/autoupdate.log"
+printf 'x\n' > "$RHOME/logs/daemon.err.log"
+printf '7' > "$RHOME/title-seq/idle-key"
+touch -d '20 days ago' "$RHOME/logs/legacy-owner-repo-4-1782771272.log" "$RHOME/logs/autoupdate.log" "$RHOME/logs/daemon.err.log" "$RHOME/title-seq/idle-key" 2>/dev/null \
+  || touch -t 202001010000 "$RHOME/logs/legacy-owner-repo-4-1782771272.log" "$RHOME/logs/autoupdate.log" "$RHOME/logs/daemon.err.log" "$RHOME/title-seq/idle-key"
+seq 1 1200 > "$RHOME/salvage-nonmatching.txt"
+roundrun 89 "$RHOME/o-hyg.md"
+check 'hygiene run exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+check 'legacy epoch-named run log is swept' "$([ ! -f "$RHOME/logs/legacy-owner-repo-4-1782771272.log" ]; echo $?)" "logs: $(ls "$RHOME/logs" 2>/dev/null)"
+check 'autoupdate.log survives the log sweep' "$([ -f "$RHOME/logs/autoupdate.log" ]; echo $?)" 'autoupdate.log deleted'
+check 'launchd daemon log survives the log sweep (gate P1)' "$([ -f "$RHOME/logs/daemon.err.log" ]; echo $?)" 'daemon.err.log deleted'
+check 'fresh pg-run log survives the sweep' "$([ -f "$RHOME/logs/pg-run-fresh.log" ]; echo $?)" 'fresh log deleted'
+check 'idle title-seq counter is NEVER swept (gate P2: monotonic ordinal)' "$([ -f "$RHOME/title-seq/idle-key" ] && [ "$(cat "$RHOME/title-seq/idle-key")" = '7' ]; echo $?)" "title-seq: $(ls "$RHOME/title-seq" 2>/dev/null)"
+# gate r2 P1: the multi-writer blacklist is append-only BY DESIGN — housekeeping must not
+# compact it (a read->rename trim can drop a concurrent append; see the engine comment).
+check 'salvage blacklist is NEVER compacted by housekeeping' "$([ "$(wc -l < "$RHOME/salvage-nonmatching.txt")" -eq 1200 ]; echo $?)" "lines=$(wc -l < "$RHOME/salvage-nonmatching.txt" 2>/dev/null)"
+
 # Harvests spend no slot and must never consume a round.
 NROUND_FILES="$(ls "$RHOME/rounds" 2>/dev/null | wc -l)"
 MKR="pg-run-roundharvest-1700000030-22"

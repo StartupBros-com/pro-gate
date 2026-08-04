@@ -55,7 +55,11 @@ pg_consent_version() { printf '%s\n' "${PRO_GATE_CONSENT_VERSION:-1}"; }
 pg_consent_file() { printf '%s/dangerous-mode-consent\n' "${PRO_GATE_CONSENT_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/pro-gate}"; }
 pg_dangerous_consent_ok() {
   local recorded
-  recorded="$(tr -d '[:space:]' < "$(pg_consent_file)" 2>/dev/null || true)"
+  # The braces matter: on a bare `< file 2>/dev/null` bash reports a failed open to the OLD
+  # stderr (redirections apply left to right, so 2> is not yet in effect when `<` fails),
+  # leaking a raw "No such file or directory" into every doctor/daemon run on a consent-less
+  # box. The group redirect catches the open failure too.
+  recorded="$( { tr -d '[:space:]' < "$(pg_consent_file)"; } 2>/dev/null || true)"
   [ "$recorded" = "$(pg_consent_version)" ]
 }
 
@@ -1128,6 +1132,24 @@ pg_provenance_reject() {  # <marker> [matched-url]
   fi
   [ -n "$url" ] || return 0
   { printf '%s\t%s\n' "$m" "$url" >> "$PRO_GATE_HOME/salvage-nonmatching.txt"; } 2>/dev/null || true
+  return 0
+}
+
+# pg_trim_file <file> <max-lines> <keep-lines>: bound an append-only file by keeping only
+# the newest <keep-lines> once it exceeds <max-lines>. The rewrite lands via mv (atomic), so
+# readers never see a partial file — but a line APPENDED between the tail and the mv is
+# LOST, so this is for SINGLE-WRITER files whose writer calls it while holding that file's
+# own serialization (e.g. autoupdate.log under the updater's singleton lock). Multi-writer
+# files (the salvage blacklist: bash engines + Node salvage children) are deliberately NOT
+# compacted — a correct compaction there needs one cross-platform lock shared by every
+# appender in both languages (#63 gate r2), machinery a ~16KB/week diagnostic doesn't earn.
+pg_trim_file() {
+  local f="$1" max="$2" keep="$3" n tmp
+  [ -f "$f" ] || return 0
+  n="$(wc -l < "$f" 2>/dev/null)" || return 0
+  [ "$n" -gt "$max" ] 2>/dev/null || return 0
+  tmp="$(mktemp "${f}.trim.XXXXXX" 2>/dev/null)" || return 0
+  if tail -n "$keep" "$f" > "$tmp" 2>/dev/null; then mv -f "$tmp" "$f" 2>/dev/null || rm -f "$tmp"; else rm -f "$tmp"; fi
   return 0
 }
 

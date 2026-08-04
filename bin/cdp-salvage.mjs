@@ -9,8 +9,10 @@
 // conversation keeps generating in another tab. This helper finds the
 // conversation tab by PR marker, waits for the VERDICT line, and prints the
 // review block. First seen: pushbot PR #863, 2026-07-02. 0.16.0 hardened detection
-// upstream (positive terminal evidence + tightened Cloudflare / Work-tab handling), so
-// this salvage is now defense-in-depth rather than the sole safety net.
+// upstream (positive terminal evidence + tightened Cloudflare / Work-tab handling), but the
+// 2026-07 GPT-5.6 UI re-broke it: 100% of clean runs 2026-07-22 → 08-03 landed via this
+// path or --harvest. Treat it as the first-class capture path whenever oracle's own
+// detection lags the live UI — defense-in-depth is the aspiration, not the observed role.
 //
 // v0.18: ChatGPT-throttle awareness + polite fresh-render budget.
 //   - Detects ChatGPT's anti-scraping interstitial ("You're making requests

@@ -151,6 +151,14 @@ else W "memory pressure: ${memreason} — the engine will DEFER the slot (no quo
 # config
 [ -n "${PRO_REVIEW_OWNERS:-}" ] && P "PRO_REVIEW_OWNERS='${PRO_REVIEW_OWNERS}'" || W "PRO_REVIEW_OWNERS unset (daemon needs it; interactive /pro-gate does not)"
 P "concurrency: up to ${PRO_GATE_MAX_CONCURRENCY:-3} review slot(s) (per-PR serialized; health-governed)"
+# .env can hold keys; warn when group/other can read it (installer sets 600 since v0.30.1).
+if [ -f "$PRO_GATE_HOME/.env" ]; then
+  ENV_MODE="$(stat -c '%a' "$PRO_GATE_HOME/.env" 2>/dev/null || stat -f '%Lp' "$PRO_GATE_HOME/.env" 2>/dev/null || true)"
+  case "$ENV_MODE" in
+    ''|*00) : ;;
+    *) W ".env is mode $ENV_MODE (group/other-readable) and may hold keys — chmod 600 '$PRO_GATE_HOME/.env'" ;;
+  esac
+fi
 
 # Auto-update health (v0.23): three consecutive failed unattended updates escalate here
 # instead of retrying silently forever into an unread log.

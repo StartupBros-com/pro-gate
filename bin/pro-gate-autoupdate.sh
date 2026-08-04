@@ -133,14 +133,24 @@ pgau_note_result() {  # $1 = rc; tracks the consecutive-failure streak and escal
 }
 
 pgau_main() {
-  local lock="$PRO_GATE_HOME/autoupdate.lock" lfd plugin_v runtime_v rc
+  local lock="$PRO_GATE_HOME/autoupdate.lock" lfd plugin_v runtime_v rc locked=0
   mkdir -p "$PRO_GATE_HOME" 2>/dev/null || true
   if pg_have flock; then
     if ! { { exec {lfd}>>"$lock"; } 2>/dev/null && flock -n "$lfd" 2>/dev/null; }; then
-      pgau_log "another auto-update run is active; skipping"
+      # stderr ONLY (#63 gate r3 P2): this loser does NOT hold the lock, and an unlocked
+      # append can vanish into the winner's concurrent tail→mv trim of the same log.
+      printf '%s\n' "$(date '+%F %T') another auto-update run is active; skipping" >&2
       return 0
     fi
+    locked=1
   fi
+
+  # Bound the append-only log (hourly cadence grew it without limit; 393 lines by
+  # 2026-08-03): keep the newest 400 lines when it passes 1000 (~2 weeks of polls).
+  # Trim ONLY while actually serialized: after the singleton lock, never at source time
+  # (#63 gate r2 P2), and never on no-flock platforms where nothing holds appenders off
+  # the tail→mv window (#63 gate r3 P2) — there the log simply stays unbounded.
+  [ "$locked" = 1 ] && pg_trim_file "$PRO_GATE_HOME/logs/autoupdate.log" 1000 400
 
   plugin_v="$(pg_active_plugin_version)"
   case $? in

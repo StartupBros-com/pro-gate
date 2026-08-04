@@ -98,12 +98,37 @@ run_updater FAKE_DAEMON_ENABLED="$TDIR/daemon-enabled" PRO_GATE_CONSENT_HOME="$T
 check 'missing consent refuses (exit 3)' "$([ "$RC" -eq 3 ]; echo $?)" "rc=$RC"
 check 'missing consent runs NO installer' "$([ ! -s "$TDIR/install.log" ]; echo $?)" "log=$(cat "$TDIR/install.log")"
 check 'refusal names the disclosure' "$(grep -q 'accept the disclosure' "$TDIR/stderr"; echo $?)" "$(cat "$TDIR/stderr")"
+# v0.30.1: the consent check must stay SILENT when the file is absent — the old redirect
+# order leaked a raw bash "No such file or directory" into every doctor/daemon run.
+CONSENT_ERR="$(PRO_GATE_CONSENT_HOME="$TDIR/no-consent" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_dangerous_consent_ok" 2>&1 1>/dev/null)"
+check 'missing consent file leaks no stderr' "$([ -z "$CONSENT_ERR" ]; echo $?)" "stderr: $CONSENT_ERR"
 
 echo '# consent recorded: enabled daemon does not block, services still skipped'
 mkdir -p "$TDIR/consent"; printf '1\n' > "$TDIR/consent/dangerous-mode-consent"
 run_updater FAKE_DAEMON_ENABLED="$TDIR/daemon-enabled" PRO_GATE_CONSENT_HOME="$TDIR/consent"
 check 'consented daemon box updates (services skipped)' "$([ "$(cat "$TDIR/install.log")" = '0.23.0 1' ]; echo $?)" "log=$(cat "$TDIR/install.log")"
 rm -f "$TDIR/daemon-enabled"
+
+echo '# v0.30.1 (gate r2 P2): autoupdate.log is bounded inside pgau_main, never at source time'
+mkdir -p "$TDIR/home/logs"; seq 1 1200 > "$TDIR/home/logs/autoupdate.log"
+PRO_GATE_HOME="$TDIR/home" PRO_GATE_AUTOUPDATE_LIB=1 bash -c ". '$SCRIPT'" >/dev/null 2>&1
+check 'library-only source does not touch the log' "$([ "$(wc -l < "$TDIR/home/logs/autoupdate.log")" -eq 1200 ]; echo $?)" "lines=$(wc -l < "$TDIR/home/logs/autoupdate.log")"
+run_updater PRO_GATE_CONSENT_HOME="$TDIR/consent"
+AULINES="$(wc -l < "$TDIR/home/logs/autoupdate.log")"
+check 'a locked run trims the log to ~400 lines' "$([ "$AULINES" -ge 400 ] && [ "$AULINES" -le 410 ]; echo $?)" "lines=$AULINES"
+# gate r3 P2: a lock LOSER holds no serialization, so it must not touch the log at all —
+# its skip notice goes to stderr only, and no trim runs.
+if command -v flock >/dev/null 2>&1; then
+  seq 1 50 > "$TDIR/home/logs/autoupdate.log"
+  ( flock -x 9; sleep 2 ) 9>>"$TDIR/home/autoupdate.lock" &
+  AUHOLD=$!
+  sleep 0.3
+  run_updater PRO_GATE_CONSENT_HOME="$TDIR/consent"
+  check 'lock loser exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC"
+  check 'lock loser announces the skip on stderr' "$(grep -q 'another auto-update run is active' "$TDIR/stderr"; echo $?)" "$(cat "$TDIR/stderr")"
+  check 'lock loser never appends to or trims the log' "$([ "$(wc -l < "$TDIR/home/logs/autoupdate.log")" -eq 50 ]; echo $?)" "lines=$(wc -l < "$TDIR/home/logs/autoupdate.log")"
+  wait "$AUHOLD" 2>/dev/null
+fi
 
 echo '# fail closed: non-semver plugin versions are never followed'
 write_manifest '0.23.0-$(rm -rf /)'

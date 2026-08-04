@@ -95,7 +95,10 @@ the versioned disclosure during installation.
   collects via cdp-salvage with the full budget), and cdp-salvage as last resort before failing.
   Manual salvage is only needed on engines older than v0.13 or when Chrome itself died.
   Tune with `PRO_GATE_NOTHINK_SECS` / `PRO_GATE_STALL_SECS` (default 600) and
-  `PRO_GATE_TIMEOUT_GRACE` (default +120s on the hard cap).
+  `PRO_GATE_TIMEOUT_GRACE` (default +120s on the hard cap). Engine ≥v0.30.1: the non-live
+  salvage window is its own knob, `PRO_GATE_SALVAGE_SECS` (default: follows
+  `PRO_GATE_STALL_SECS`) — set it when tuning the stall watchdog down, so a shorter stall
+  fuse does not also shrink post-kill recovery.
 - **Engine ≥v0.18 is also throttle-aware**: salvage page-loads are budgeted per URL,
   foreign conversations are blacklisted persistently, the throttle interstitial trips a global
   cooldown instead of a retry, and every phase lands in `<out>.status` for polling.
