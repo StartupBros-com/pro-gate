@@ -979,7 +979,7 @@ pg_round_unrecord() {
 # hist line (concurrent harvest completions race the rewrite) only UNDER-counts earned
 # rounds — the governor degrades toward the base grant, never past the ceiling.
 pg_round_note_severity() {
-  local key="$1" out="$2" dir p0 p1 verdict res sp now win t rest
+  local key="$1" out="$2" spend_epoch="${3:-}" dir p0 p1 verdict res sp now win t rest stamp
   pg_round_key_ok "$key" || return 0
   dir="$(pg_rounds_dir)"
   [ -f "$dir/$key" ] || return 0
@@ -1008,6 +1008,16 @@ pg_round_note_severity() {
   res="$(grep -icE '^[[:space:]]*\[P[01]\][[:space:]]+[^[:space:]]+[[:space:]]+(—|--|-)[[:space:]]+RESOLVED([^_[:alnum:]]|$)' "$out" 2>/dev/null)"; [ -n "$res" ] || res=0
   sp="$(grep -icE '^[[:space:]]*\[P[01]\][[:space:]]+[^[:space:]]+[[:space:]]+(—|--|-)[[:space:]]+STILL-PRESENT([^_[:alnum:]]|$)' "$out" 2>/dev/null)"; [ -n "$sp" ] || sp=0
   now="$(date +%s)"; win="$(pg_round_window_secs)"
+  # A hist row is stamped with the epoch of the SPEND it describes, not the moment it was
+  # collected (#66 gate P1): an exit-9 review harvested hours later would otherwise stay in
+  # the scored trajectory after its spend aged out of pg_round_count's window — earning
+  # rounds, faking a churn brake, or landing out of order after newer rounds. Callers on the
+  # harvest path pass the reservation's recorded spend epoch; a fresh completion is its own
+  # spend, so "now" is correct there. Rows are pruned on the same window as the spends.
+  # The re-sort is STABLE (-s): rounds inside one second are common in tests and fast gates,
+  # and an unstable sort would silently reorder the trajectory it exists to keep honest.
+  stamp="$spend_epoch"; case "$stamp" in ''|*[!0-9]*) stamp="$now";; esac
+  [ "$stamp" -gt "$now" ] 2>/dev/null && stamp="$now"
   {
     if [ -f "$dir/$key.hist" ]; then
       while IFS= read -r t; do
@@ -1016,8 +1026,10 @@ pg_round_note_severity() {
         [ $(( now - rest )) -lt "$win" ] && printf '%s\n' "$t"
       done < "$dir/$key.hist"
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$now" "$verdict" "$p0" "$p1" "$res" "$sp"
-  } > "$dir/$key.hist.tmp" 2>/dev/null && mv -f "$dir/$key.hist.tmp" "$dir/$key.hist" 2>/dev/null \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$stamp" "$verdict" "$p0" "$p1" "$res" "$sp"
+  } > "$dir/$key.hist.tmp" 2>/dev/null \
+    && sort -s -n -k1,1 -o "$dir/$key.hist.tmp" "$dir/$key.hist.tmp" 2>/dev/null \
+    && mv -f "$dir/$key.hist.tmp" "$dir/$key.hist" 2>/dev/null \
     || rm -f "$dir/$key.hist.tmp" 2>/dev/null
   return 0
 }
@@ -1044,7 +1056,13 @@ pg_round_score() {
   PG_ROUND_EARNED=0; PG_ROUND_STREAK=0; PG_ROUND_ARROW=""
   PG_ROUND_BASE="${PRO_GATE_ROUNDS_BASE:-3}"; case "$PG_ROUND_BASE" in ''|*[!0-9]*) PG_ROUND_BASE=3;; esac
   PG_ROUND_CEILING="${PRO_GATE_ROUNDS_CEILING:-8}"; case "$PG_ROUND_CEILING" in ''|*[!0-9]*) PG_ROUND_CEILING=8;; esac
-  [ "$PG_ROUND_CEILING" -lt "$PG_ROUND_BASE" ] && PG_ROUND_CEILING="$PG_ROUND_BASE"
+  # The ceiling is the IMMOVABLE backstop: an inconsistent config clamps the BASE DOWN to it,
+  # never the ceiling up (#66 gate P1 — raising it let BASE=10/CEILING=8 grant 10 rounds and
+  # defeat the one limit that exists to contain optimistic callers and config mistakes).
+  if [ "$PG_ROUND_BASE" -gt "$PG_ROUND_CEILING" ]; then
+    echo "[pro-gate rounds] PRO_GATE_ROUNDS_BASE=${PG_ROUND_BASE} exceeds PRO_GATE_ROUNDS_CEILING=${PG_ROUND_CEILING}; clamping the base to the ceiling (the ceiling never moves)" >&2
+    PG_ROUND_BASE="$PG_ROUND_CEILING"
+  fi
   if pg_round_key_ok "$key"; then
     f="$(pg_rounds_dir)/$key.hist"
     if [ -f "$f" ]; then

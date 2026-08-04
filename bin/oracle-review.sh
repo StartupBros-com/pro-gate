@@ -334,17 +334,25 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
     if [ -z "$Q_NUM$Q_MARKER" ] && ! [ "$spent" -gt 0 ] 2>/dev/null && [ "$k_live" != 1 ] && [ -z "$a_marker$a_out" ]; then
       continue
     fi
-    k_cap="$(pg_round_grant "$k")"
+    # Score IN THIS SHELL (#66 gate P2): a command substitution would return only the number
+    # and drop the trajectory globals, leaving --status unable to distinguish ordinary
+    # exhaustion from a churn brake — the very signal this release exists to surface.
+    pg_round_score "$k"
+    k_cap="$PG_ROUND_GRANT"; k_arrow="$PG_ROUND_ARROW"; k_earned="$PG_ROUND_EARNED"
+    k_streak="$PG_ROUND_STREAK"; k_braked=0
+    [ "$PG_ROUND_STREAK" -ge 2 ] && [ -z "${PRO_GATE_MAX_ROUNDS_PER_PR:-}" ] && k_braked=1
     rem=$(( k_cap - spent )); [ "$rem" -lt 0 ] && rem=0
     if [ "$spent" -gt 0 ] 2>/dev/null; then ST_SPENT_KEY="$k"; ST_SPENT_N="$spent"; fi
     if pg_have jq; then
       jq -nc --arg key "$k" --argjson spent "$spent" --argjson cap "$k_cap" \
         --argjson remaining "$rem" --argjson window_secs "$ST_WIN" --argjson in_flight "$k_live" \
         --arg amarker "$a_marker" --arg aout "$a_out" --arg aalive "$a_alive" --arg amode "$a_mode" \
-        '{key:$key,spent:$spent,cap:$cap,remaining:$remaining,window_secs:$window_secs,in_flight:($in_flight == 1),active:(if $amarker == "" and $aout == "" then null else {marker:$amarker,out:$aout,wrapper_alive:($aalive == "1"),mode:$amode} end)}' \
+        --arg arrow "$k_arrow" --argjson earned "$k_earned" --argjson streak "$k_streak" \
+        --argjson braked "$k_braked" \
+        '{key:$key,spent:$spent,cap:$cap,remaining:$remaining,window_secs:$window_secs,in_flight:($in_flight == 1),trajectory:(if $arrow == "" then null else $arrow end),earned:$earned,streak:$streak,churn_braked:($braked == 1),active:(if $amarker == "" and $aout == "" then null else {marker:$amarker,out:$aout,wrapper_alive:($aalive == "1"),mode:$amode} end)}' \
         >> "$ST_TMP/rounds.jsonl" 2>/dev/null
     else
-      printf '%s\t%s\t%s\t%s\t%s\n' "$k" "$spent" "$k_cap" "$rem" "$k_live" >> "$ST_TMP/rounds.tsv"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$k" "$spent" "$k_cap" "$rem" "$k_live" "$k_arrow" "$k_braked" >> "$ST_TMP/rounds.tsv"
     fi
   done
 
@@ -454,9 +462,12 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
   if [ -s "$ST_TMP/rounds.jsonl" ] || [ -s "$ST_TMP/rounds.tsv" ]; then
     echo "round budget (rolling window $(( ST_WIN / 3600 ))h, ${ST_CAP_DESC}):"
     if pg_have jq && [ -s "$ST_TMP/rounds.jsonl" ]; then
-      jq -r '"  " + .key + ": \(.spent) spent, \(.remaining) remaining" + (if .in_flight then "  [REVIEW RUNNING NOW]" else "" end)' "$ST_TMP/rounds.jsonl"
+      jq -r '"  " + .key + ": \(.spent) spent, \(.remaining) remaining"
+             + (if .trajectory then "  (open P0/P1 by round: " + .trajectory + ")" else "" end)
+             + (if .churn_braked then "  [CHURN BRAKE: not converging — escalate instead of re-running]" else "" end)
+             + (if .in_flight then "  [REVIEW RUNNING NOW]" else "" end)' "$ST_TMP/rounds.jsonl"
     else
-      awk -F'\t' '{printf "  %s: %s spent, %s remaining (cap %s)%s\n", $1, $2, $4, $3, ($5 == 1 ? "  [REVIEW RUNNING NOW]" : "")}' "$ST_TMP/rounds.tsv" 2>/dev/null
+      awk -F'\t' '{printf "  %s: %s spent, %s remaining (cap %s)%s%s%s\n", $1, $2, $4, $3, ($6 == "" ? "" : "  (open P0/P1 by round: " $6 ")"), ($7 == 1 ? "  [CHURN BRAKE: not converging]" : ""), ($5 == 1 ? "  [REVIEW RUNNING NOW]" : "")}' "$ST_TMP/rounds.tsv" 2>/dev/null
     fi
   else
     echo "round budget: nothing spent in the current window for this query"
@@ -973,6 +984,13 @@ if [ -n "$HARVEST_MARKER" ]; then
     pg_finish 8
   fi
   HARVEST_SECS="$(pg_dur_secs "$TIMEOUT")"
+  # The reservation's creation epoch IS this review's spend epoch. Capture it BEFORE the
+  # collection (which retires the reservation) so the trajectory row is stamped with when the
+  # round was spent, not when it was collected (#66 gate P1).
+  HARVEST_SPEND_EPOCH=""
+  [ -f "$(pg_reservation_dir)/$RUN_MARKER" ] \
+    && { IFS=$'\t' read -r _ _ HARVEST_SPEND_EPOCH _ < "$(pg_reservation_dir)/$RUN_MARKER"; } 2>/dev/null
+  case "$HARVEST_SPEND_EPOCH" in *[!0-9]*) HARVEST_SPEND_EPOCH="";; esac
   echo "[oracle-review] harvesting in-progress review (marker ${RUN_MARKER}, up to ${HARVEST_SECS}s, no new slot spent)..." >&2
   pg_status salvaging "harvest up to ${HARVEST_SECS}s"
   HARVEST_RC=0
@@ -1051,7 +1069,7 @@ if [ -n "$HARVEST_MARKER" ]; then
     # ("pg-run-<key>-<epoch>-<pid>") for PR and --diff runs alike; legacy markers resolve to
     # keys with no recorded rounds and are skipped inside the helper (best-effort, advisory).
     HARVEST_KEY="${RUN_MARKER#pg-run-}"; HARVEST_KEY="${HARVEST_KEY%-*-*}"
-    pg_round_note_severity "$HARVEST_KEY" "$PG_FINAL_SRC"
+    pg_round_note_severity "$HARVEST_KEY" "$PG_FINAL_SRC" "$HARVEST_SPEND_EPOCH"
     SALVAGED=1
     echo "[oracle-review] harvest recovered the completed review ($(wc -c < "$PG_FINAL_SRC" 2>/dev/null) bytes)." >&2
     pg_persist_result "$PG_FINAL_SRC"
@@ -2206,12 +2224,18 @@ else
   # account was not mid-throttle (fate unknown), and Chrome did not restart mid-run (a dead
   # tab is absence of evidence, not evidence of absence). Fleet evidence: upload-timeout
   # failures ate 2 of pro-gate#61's 4 window rounds while spending zero Pro quota.
+  # The run log must ALSO carry no submission evidence (#66 gate P1): the pre-retry
+  # classifier at the retry site only runs when a retry is attempted, so with retries
+  # disabled — or after the last one — a run that logged "Acquired ChatGPT browser slot"
+  # then lost its tab before the URL memo could be captured would otherwise be refunded
+  # despite the prompt existing server-side. Same strings, same fail-closed bias.
   _svc_up=""; _svc_restarted=0
   if _svc_up="$(pg_browser_restarted_midrun "$RUN_START")"; then _svc_restarted=1; fi
   if [ "${SALVAGE_RAN:-0}" = 1 ] && [ "${SALVAGE_RC:-0}" -eq 4 ] \
      && [ "${LIVE_CONVERSATION:-0}" != 1 ] && [ "${THROTTLED:-0}" != 1 ] \
      && [ ! -f "$PRO_GATE_HOME/conversation-urls/${RUN_MARKER}" ] \
-     && [ "$_svc_restarted" = 0 ]; then
+     && [ "$_svc_restarted" = 0 ] \
+     && ! grep -qE 'Launching browser mode|Acquired ChatGPT browser slot|Reattach: oracle session ' "$RUNLOG" 2>/dev/null; then
     echo "[oracle-review] no conversation ever carried this run's marker (browser scanned clean, no URL memoized, browser stable): the submission never landed — refunding this round; zero Pro quota was spent." >&2
     pg_round_unrecord "$ROUND_KEY"
     FAIL_DETAIL="submission never landed (send/upload failure before the prompt reached ChatGPT); round refunded, safe to retry"

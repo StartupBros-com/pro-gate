@@ -779,6 +779,12 @@ check 'flat mode: explicit cap still enforces its number' "$([ "$GRC" -eq 1 ] &&
 # Base 0 keeps the lockdown reading in governor mode.
 GOUT="$(gguard nohist PRO_GATE_ROUNDS_BASE=0)"; GRC=$?
 check 'governor: base 0 is a lockdown' "$([ "$GRC" -eq 1 ] && printf '%s' "$GOUT" | grep -q 'PRO_GATE_ROUNDS_BASE=0'; echo $?)" "rc=$GRC out=$GOUT"
+# #66 gate P1: a base above the ceiling clamps the BASE DOWN — the ceiling never moves.
+gseed clampkey 8
+GOUT="$(gguard clampkey PRO_GATE_ROUNDS_BASE=10 PRO_GATE_ROUNDS_CEILING=8 2>/dev/null)"; GRC=$?
+check 'governor: base above ceiling cannot raise the ceiling' "$([ "$GRC" -eq 1 ] && printf '%s' "$GOUT" | grep -q '8/8 rounds'; echo $?)" "rc=$GRC out=$GOUT"
+GERR="$(gguard clampkey PRO_GATE_ROUNDS_BASE=10 PRO_GATE_ROUNDS_CEILING=8 2>&1 >/dev/null)"
+check 'governor: base clamp warns loudly' "$(printf '%s' "$GERR" | grep -q 'clamping the base to the ceiling'; echo $?)" "$GERR"
 # pg_round_grant mirrors the guard for --status: churn collapses remaining to 0.
 gseed churn2 3; ghist churn2 5 7 8
 GOUT="$(env PRO_GATE_HOME="$GHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_grant churn2")"
@@ -820,6 +826,53 @@ check 'never-landed run announces the refund' "$(grep -q 'refunding this round' 
 check 'never-landed round is refunded (no in-window spend remains)' \
   "$([ ! -s "$RHOME/rounds/$RKEY_91" ]; echo $?)" "rounds: $(cat "$RHOME/rounds/$RKEY_91" 2>/dev/null)"
 check 'refund is named in the status detail' "$(grep -q 'round refunded' "$RHOME/o-refund.md.status"; echo $?)" "$(cat "$RHOME/o-refund.md.status" 2>/dev/null)"
+
+# #66 gate P1: a run whose LOG shows the prompt reached ChatGPT must NOT be refunded, even
+# when the tab is gone and salvage scans clean (the quota was spent server-side).
+cat > "$TDIR/bin/oracle-landed" <<'FAKE_LANDED'
+#!/usr/bin/env bash
+echo "Acquired ChatGPT browser slot" >&2
+exit 1
+FAKE_LANDED
+chmod +x "$TDIR/bin/oracle-landed"
+RKEY_92="$(printf '%s-92' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 PRO_GATE_STALL_SECS=30 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-landed" NODE_OPTIONS= \
+  bash "$ENGINE" --pr 92 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$RHOME/o-landed.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'landed-but-lost run fails (exit 6)' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+check 'landed-but-lost run does NOT announce a refund' "$(grep -qv 'refunding this round' "$TDIR/stderr" && ! grep -q 'refunding this round' "$TDIR/stderr"; echo $?)" "$(tail -5 "$TDIR/stderr")"
+check 'landed-but-lost round STAYS charged' \
+  "$([ -s "$RHOME/rounds/$RKEY_92" ]; echo $?)" "rounds: $(cat "$RHOME/rounds/$RKEY_92" 2>/dev/null)"
+
+# #66 gate P1: a harvested review is stamped with its SPEND epoch, not the collection time —
+# otherwise an hours-later harvest outlives its own spend in the scored window.
+HHOME="$TDIR/home-histstamp"; mkdir -p "$HHOME/rounds"
+HKEY=histstamp
+OLD_EPOCH=$(( $(date +%s) - 7200 ))
+printf '%s\n' "$OLD_EPOCH" > "$HHOME/rounds/$HKEY"
+printf '[P1] a.sh:1 - finding\n  Why: test\nP2: none\nP3: none\nVERDICT: SHIP - fixture.\n' > "$HHOME/review.md"
+PRO_GATE_HOME="$HHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_note_severity '$HKEY' '$HHOME/review.md' '$OLD_EPOCH'"
+check 'harvested hist row carries the SPEND epoch' \
+  "$([ "$(awk -F'\t' 'NR==1{print $1}' "$HHOME/rounds/$HKEY.hist")" = "$OLD_EPOCH" ]; echo $?)" \
+  "hist: $(cat "$HHOME/rounds/$HKEY.hist")"
+# Rows sharing one second must keep WRITE order (the re-sort is stable): an unstable sort
+# would reorder the very trajectory the governor scores.
+SHOME2="$TDIR/home-histstable"; mkdir -p "$SHOME2/rounds"; date +%s > "$SHOME2/rounds/k"
+printf '[P1] a.sh:1 - f\n  Why: t\nP2: none\nP3: none\nVERDICT: SHIP - x.\n' > "$SHOME2/a.md"
+printf '[P1] a.sh:1 - f\n  Why: t\nP2: none\nP3: none\n**VERDICT:** FIX-FIRST - y.\n' > "$SHOME2/b.md"
+PRO_GATE_HOME="$SHOME2" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_note_severity k '$SHOME2/a.md'; pg_round_note_severity k '$SHOME2/b.md'"
+check 'same-second hist rows keep write order (stable sort)' \
+  "$([ "$(awk -F'\t' 'NR==1{print $2}' "$SHOME2/rounds/k.hist")" = SHIP ]; echo $?)" \
+  "hist: $(cat "$SHOME2/rounds/k.hist")"
+# A future/garbage epoch degrades to now rather than parking a row beyond the window.
+PRO_GATE_HOME="$HHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_note_severity '$HKEY' '$HHOME/review.md' '99999999999'"
+check 'implausible spend epoch falls back to now' \
+  "$([ "$(awk -F'\t' 'END{print ($1 <= '"$(date +%s)"') ? "ok" : "bad"}' "$HHOME/rounds/$HKEY.hist")" = ok ]; echo $?)" \
+  "hist: $(cat "$HHOME/rounds/$HKEY.hist")"
 
 # Harvests spend no slot and must never consume a round.
 NROUND_FILES="$(ls "$RHOME/rounds" 2>/dev/null | wc -l)"
@@ -926,6 +979,15 @@ check '--status --json exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC"
 check '--status --json reservation marker' "$([ "$(jq -r '.reservations[0].marker' "$TDIR/st.json")" = "$SMARKER" ]; echo $?)" "$(cat "$TDIR/st.json")"
 check '--status --json remembered url' "$([ "$(jq -r '.reservations[0].conversation_url' "$TDIR/st.json")" = "https://chatgpt.com/c/abc123" ]; echo $?)" "$(jq -c .reservations "$TDIR/st.json")"
 check '--status --json rounds remaining' "$([ "$(jq -r '.rounds[0].remaining' "$TDIR/st.json")" = 1 ] && [ "$(jq -r '.rounds[0].cap' "$TDIR/st.json")" = 3 ]; echo $?)" "$(jq -c .rounds "$TDIR/st.json")"
+# #66 gate P2: --status must expose the scored trajectory, not just the numbers.
+printf '%s\tFIX-FIRST\t0\t5\t0\t0\n%s\tFIX-FIRST\t0\t7\t0\t0\n%s\tFIX-FIRST\t0\t8\t0\t0\n' \
+  "$(date +%s)" "$(date +%s)" "$(date +%s)" > "$SHOME/rounds/acme-widgets-42.hist"
+PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 --json >"$TDIR/st2.json" 2>/dev/null
+check '--status --json exposes the trajectory' "$([ "$(jq -r '.rounds[0].trajectory' "$TDIR/st2.json")" = '5→7→8' ]; echo $?)" "$(jq -c .rounds "$TDIR/st2.json")"
+check '--status --json flags the churn brake' "$([ "$(jq -r '.rounds[0].churn_braked' "$TDIR/st2.json")" = true ]; echo $?)" "$(jq -c .rounds "$TDIR/st2.json")"
+PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 >"$TDIR/st2.out" 2>/dev/null
+check '--status text names the churn brake' "$(grep -q 'CHURN BRAKE' "$TDIR/st2.out"; echo $?)" "$(grep -i 'spent' "$TDIR/st2.out")"
+rm -f "$SHOME/rounds/acme-widgets-42.hist"
 check '--status --json recent runs' "$([ "$(jq -r '.recent_runs | length' "$TDIR/st.json")" = 1 ]; echo $?)" "$(jq -c .recent_runs "$TDIR/st.json")"
 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status "$SMARKER" --json >"$TDIR/st2.json" 2>/dev/null
 check '--status by marker finds the reservation' "$([ "$(jq -r '.reservations | length' "$TDIR/st2.json")" = 1 ]; echo $?)" "$(cat "$TDIR/st2.json")"
