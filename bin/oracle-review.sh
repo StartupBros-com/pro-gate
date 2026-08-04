@@ -984,11 +984,15 @@ if [ -n "$HARVEST_MARKER" ]; then
     pg_finish 8
   fi
   HARVEST_SECS="$(pg_dur_secs "$TIMEOUT")"
-  # Stamp the trajectory row with when the ROUND WAS CHARGED, which is the epoch inside the
-  # marker (#66 gate r2 P1). The reservation's `created` field is NOT that moment: it is only
-  # written when the run gives up its slot at exit 9 — measured 35 min after the charge on the
-  # run that exposed this — which would park the row beyond its own spend in the scored window.
-  HARVEST_SPEND_EPOCH="$(pg_marker_epoch "$RUN_MARKER" 2>/dev/null || true)"
+  # Stamp the trajectory row with when the ROUND WAS CHARGED. Authoritative source is the
+  # reservation's spend field, written from pg_round_record's own epoch (#66 gate r3 P1); the
+  # marker's launch epoch is only a fallback for legacy reservations, since a queued run mints
+  # its marker up to two lock waits before the charge. NOT the reservation's `created` field:
+  # that is stamped at exit-9 time, 35 min after the charge on the run that exposed this.
+  HARVEST_SPEND_EPOCH="$(pg_reservation_read_spend "$RUN_MARKER" 2>/dev/null || true)"
+  case "$HARVEST_SPEND_EPOCH" in ''|*[!0-9]*)
+    HARVEST_SPEND_EPOCH="$(pg_marker_epoch "$RUN_MARKER" 2>/dev/null || true)";;
+  esac
   echo "[oracle-review] harvesting in-progress review (marker ${RUN_MARKER}, up to ${HARVEST_SECS}s, no new slot spent)..." >&2
   pg_status salvaging "harvest up to ${HARVEST_SECS}s"
   HARVEST_RC=0
@@ -1822,7 +1826,10 @@ while :; do
   # guarded retry below is the same round, and pre-launch exits above never record).
   # v0.27: and publish the active-run record at the same moment, so --status can see a live
   # (or wrapper-dead-but-generating) run before any reservation or ledger row exists.
-  [ "$attempt" -eq 0 ] && { pg_round_record "$ROUND_KEY"; pg_active_write; }
+  # PG_ROUND_SPEND_EPOCH (set by pg_round_record) is this run's charge time — the stamp every
+  # trajectory row for this round must carry (#66 gate r3 P1). Keep it for the completion path
+  # and for the reservation an exit-9 hands to a later harvest process.
+  [ "$attempt" -eq 0 ] && { pg_round_record "$ROUND_KEY"; RUN_SPEND_EPOCH="$PG_ROUND_SPEND_EPOCH"; pg_active_write; }
 
   # A non-blocking heads-up when memory is tight but not blocking (the gate is deliberately
   # conservative, so a swap-heavy box with moderate free RAM still runs). Warns low-memory users
@@ -2156,10 +2163,10 @@ if [ -n "$FINAL_SNAP" ]; then
   PG_FINAL_SRC="$FINAL_SNAP"
   # v0.22: remember this review's P0/P1 counts so a later round-capped refusal can flag an
   # unconfirmed open P0 to the human (advisory sidecar; see pg_round_note_severity).
-  # Same spend-identity rule as the harvest path: a fresh completion is stamped with the epoch
-  # its round was CHARGED at (inside the marker), not the minutes-to-an-hour-later moment the
-  # review finished — otherwise a long run's row outlives its own spend in the scored window.
-  pg_round_note_severity "$ROUND_KEY" "$PG_FINAL_SRC" "$(pg_marker_epoch "$RUN_MARKER" 2>/dev/null || true)"
+  # Same spend-identity rule as the harvest path: stamp with the epoch pg_round_record CHARGED
+  # this round at, not the minutes-to-an-hour-later moment the review finished, and not the
+  # marker's pre-queue launch time — otherwise the row outlives (or predates) its own spend.
+  pg_round_note_severity "$ROUND_KEY" "$PG_FINAL_SRC" "${RUN_SPEND_EPOCH:-}"
   # Verified publication (gate #54 r8/r9): "done" PROMISES a readable --out; a failed publish
   # must not report clean, and the durability of what WAS captured decides the message.
   pg_publish_out "$PG_FINAL_SRC" || pg_publish_fail "$PG_FINAL_SRC"
@@ -2193,7 +2200,7 @@ elif [ "${SALVAGE_RAN:-0}" = 1 ] && [ "${SALVAGE_PRESERVE:-0}" = 1 ]; then
   # v0.28 (#55): this run's prompt asked for the nonce echo — record that expectation so a
   # harvest can NOTE when a capture arrives without one (accepted via path overlap instead).
   : > "$(pg_manifest_dir)/${RUN_MARKER}.nonce" 2>/dev/null || true
-  if ! pg_reservation_write "$RUN_MARKER" "${ROUND_KEY:-diff}" "$OUT" "${SLOT_HELD:-}" "$RESOLVED_MODEL"; then
+  if ! pg_reservation_write "$RUN_MARKER" "${ROUND_KEY:-diff}" "$OUT" "${SLOT_HELD:-}" "$RESOLVED_MODEL" "${RUN_SPEND_EPOCH:-}"; then
     # Fail closed: without the durable reservation, exit 9 would under-count a live Pro tab and
     # let the next invocation double-spend. Keep the process/locks alive rather than release
     # unreserved capacity; this should only happen on a broken/unwritable PRO_GATE_HOME.

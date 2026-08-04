@@ -507,8 +507,8 @@ pg_reservation_guard_release() {
   fi
 }
 
-pg_reservation_write() { # marker [pr] [out] [slot] [model] -- empty pr/slot/model preserve the record's
-  local marker="$1" pr="${2:-}" out="${3:-}" slot="${4:-}" model="${5:-}" dir rc created prev_pr="" prev_slot="" prev_model=""
+pg_reservation_write() { # marker [pr] [out] [slot] [model] [spend_epoch] -- empty fields preserve the record's
+  local marker="$1" pr="${2:-}" out="${3:-}" slot="${4:-}" model="${5:-}" spend="${6:-}" dir rc created prev_pr="" prev_slot="" prev_model="" prev_spend=""
   pg_reservation_marker_ok "$marker" || return 1
   dir="$(pg_reservation_dir)"; mkdir -p "$dir" 2>/dev/null || return 1
   pg_reservation_guard_acquire || return 1
@@ -519,14 +519,27 @@ pg_reservation_write() { # marker [pr] [out] [slot] [model] -- empty pr/slot/mod
   # so the later --harvest process can name it without re-deriving; legacy 5-field records read it
   # back as empty.
   created=""
-  [ -f "$dir/$marker" ] && { IFS=$'\t' read -r prev_pr _ created _ prev_slot prev_model < "$dir/$marker"; } 2>/dev/null
+  # awk (NOT `read`): tab is IFS-whitespace, so consecutive tabs from an empty slot/model
+  # collapse and shift later fields — the same trap pg_reservation_read_model documents.
+  if [ -f "$dir/$marker" ]; then
+    prev_pr="$(awk -F'\t' 'NR==1{print $1}' "$dir/$marker" 2>/dev/null)"
+    created="$(awk -F'\t' 'NR==1{print $3}' "$dir/$marker" 2>/dev/null)"
+    prev_slot="$(awk -F'\t' 'NR==1{print $5}' "$dir/$marker" 2>/dev/null)"
+    prev_model="$(awk -F'\t' 'NR==1{print $6}' "$dir/$marker" 2>/dev/null)"
+    prev_spend="$(awk -F'\t' 'NR==1{print $7}' "$dir/$marker" 2>/dev/null)"
+  fi
   case "$created" in ''|*[!0-9]*) created="$(date +%s)";; esac
   [ -n "$pr" ] || pr="${prev_pr:-diff}"
   case "$slot" in ''|*[!0-9]*) slot="$prev_slot";; esac
   case "$slot" in *[!0-9]*) slot="";; esac
   [ -n "$model" ] || model="$prev_model"
-  model="$(printf '%s' "$model" | tr -d '\t\n')"   # keep the record single-line + 6-field
-  printf '%s\t%s\t%s\t0\t%s\t%s\n' "$pr" "$out" "$created" "$slot" "$model" > "$dir/$marker.tmp" 2>/dev/null \
+  model="$(printf '%s' "$model" | tr -d '\t\n')"   # keep the record single-line + 7-field
+  # v0.31 (#66 gate r3): field 7 is the epoch pg_round_record CHARGED this run's round at, so a
+  # later harvest process stamps trajectory history with the charge time rather than the
+  # marker's pre-queue launch time. Empty on legacy records; readers fall back accordingly.
+  [ -n "$spend" ] || spend="$prev_spend"
+  case "$spend" in *[!0-9]*) spend="";; esac
+  printf '%s\t%s\t%s\t0\t%s\t%s\t%s\n' "$pr" "$out" "$created" "$slot" "$model" "$spend" > "$dir/$marker.tmp" 2>/dev/null \
     && mv -f "$dir/$marker.tmp" "$dir/$marker"
   rc=$?; pg_reservation_guard_release; return "$rc"
 }
@@ -889,13 +902,20 @@ pg_round_count() {  # $1 = key; echoes the rounds recorded inside the rolling wi
   echo "$n"
 }
 
-pg_round_record() {  # $1 = key; prune entries older than the window, append now. Best-effort
+pg_round_record() {  # $1 = key; prune entries older than the window, append now. Sets
+  # PG_ROUND_SPEND_EPOCH to the epoch actually appended — the round's charge time, which is
+  # what trajectory history must be stamped with (#66 gate r3 P1). The marker's epoch is NOT
+  # that moment: it is minted before the per-change lock AND the account-slot wait (each up to
+  # PRO_GATE_LOCK_WAIT, 2400s by default), so a queued run's history row could expire ~80 min
+  # before its own spend, or order concurrent runs by process start rather than charge order.
+  # Best-effort
   # bookkeeping (same posture as pg_ledger_append): it must never fail a review, but every
   # fail-open path WARNS on stderr, because a silently unrecordable round means the budget
   # under-counts and the guard quietly stops guarding. Same-key engine runs are already
   # serialized by the per-change lock; this file lock just keeps the rewrite atomic against
   # out-of-band readers/writers.
   local key="$1" dir f now win t rfd lockdir="" waited=0
+  PG_ROUND_SPEND_EPOCH=""
   pg_round_key_ok "$key" || return 0
   dir="$(pg_rounds_dir)"
   mkdir -p "$dir" 2>/dev/null || {
@@ -928,7 +948,7 @@ pg_round_record() {  # $1 = key; prune entries older than the window, append now
       done < "$f"
     fi
     printf '%s\n' "$now"
-  } > "$f.tmp" 2>/dev/null && mv -f "$f.tmp" "$f" \
+  } > "$f.tmp" 2>/dev/null && mv -f "$f.tmp" "$f" && PG_ROUND_SPEND_EPOCH="$now" \
     || echo "[pro-gate rounds] could not write ${f}; round NOT recorded (budget will under-count)" >&2
   [ -n "${rfd:-}" ] && eval "exec ${rfd}>&-" 2>/dev/null
   [ -n "$lockdir" ] && rmdir "$lockdir" 2>/dev/null
@@ -1035,12 +1055,23 @@ pg_round_note_severity() {
   return 0
 }
 
+# pg_reservation_read_spend <marker>: echo the charged-round epoch (field 7), or nothing on a
+# legacy record. This is the AUTHORITATIVE spend time for trajectory stamping on the harvest
+# path; pg_marker_epoch is only the last-resort fallback below.
+pg_reservation_read_spend() {
+  local marker="$1" f
+  pg_reservation_marker_ok "$marker" || return 1
+  f="$(pg_reservation_dir)/$marker"
+  [ -f "$f" ] || return 1
+  awk -F'\t' 'NR==1{print $7}' "$f" 2>/dev/null
+}
+
 # pg_marker_epoch <marker>: the launch epoch embedded in "pg-run-<key>-<epoch>-<pid>". This is
-# the round's spend identity (#66 gate r2 P1): pg_round_record charges the round moments after
-# the marker is minted, whereas a reservation's `created` field is only written at exit-9 time —
-# 35 minutes later on the run that exposed this — so stamping history from the reservation left
-# a harvested row scored long after its own spend expired. Empty on a legacy/unparseable marker,
-# and callers then fall back to "now".
+# a FALLBACK only (#66 gate r3 P1): the marker is minted before the per-change lock and the
+# account-slot wait, so on a queued run it can precede the actual charge by up to two
+# PRO_GATE_LOCK_WAIT periods. Prefer pg_round_record's PG_ROUND_SPEND_EPOCH (fresh completions)
+# or pg_reservation_read_spend (harvests); use this only when neither is recorded, and never
+# for a value that must line up exactly with the budget window.
 pg_marker_epoch() {
   local m="${1:-}" rest e
   case "$m" in pg-run-*) rest="${m#pg-run-}";; *) return 1;; esac

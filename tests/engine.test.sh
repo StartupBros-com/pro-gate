@@ -848,11 +848,27 @@ check 'landed-but-lost run does NOT announce a refund' "$(grep -qv 'refunding th
 check 'landed-but-lost round STAYS charged' \
   "$([ -s "$RHOME/rounds/$RKEY_92" ]; echo $?)" "rounds: $(cat "$RHOME/rounds/$RKEY_92" 2>/dev/null)"
 
-# #66 gate r2 P1: the spend epoch comes from the MARKER (when pg_round_record charged the
-# round), never the reservation's `created` field — that is written at exit-9 time, measured
-# 35 min later on the live run that exposed this.
+# #66 gate r2/r3 P1: the spend epoch is the one pg_round_record CHARGED at — not the
+# reservation's `created` field (written at exit-9 time, 35 min later on the live run that
+# exposed this) and not the marker's launch time (minted before two lock waits of up to
+# PRO_GATE_LOCK_WAIT each, so a queued run could be charged ~80 min after its marker).
+EHOME="$TDIR/home-spendepoch"; mkdir -p "$EHOME/rounds"
+SPEND_OUT="$(PRO_GATE_HOME="$EHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_record spendkey; printf '%s|%s' \"\$PG_ROUND_SPEND_EPOCH\" \"\$(cat '$EHOME/rounds/spendkey')\"")"
+check 'pg_round_record exports the epoch it charged' \
+  "$([ -n "${SPEND_OUT%%|*}" ] && [ "${SPEND_OUT%%|*}" = "${SPEND_OUT##*|}" ]; echo $?)" "got=$SPEND_OUT"
+# The reservation carries that epoch (field 7) into a later harvest process.
+RHOME_S="$TDIR/home-resspend"; mkdir -p "$RHOME_S/in-progress"
+PRO_GATE_HOME="$RHOME_S" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_write 'pg-run-k-1700000000-1' 'k' '/tmp/o.md' '' 'GPT-X' '1700009999'"
+RSPEND="$(PRO_GATE_HOME="$RHOME_S" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_read_spend 'pg-run-k-1700000000-1'")"
+check 'reservation persists the charged-round epoch' "$([ "$RSPEND" = 1700009999 ]; echo $?)" "got=$RSPEND"
+# A rewrite with no explicit spend (the harvest-path rewrite) must PRESERVE it.
+PRO_GATE_HOME="$RHOME_S" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_write 'pg-run-k-1700000000-1' 'k' '/tmp/o.md'"
+RSPEND="$(PRO_GATE_HOME="$RHOME_S" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_read_spend 'pg-run-k-1700000000-1'")"
+check 'reservation rewrite preserves the spend epoch' "$([ "$RSPEND" = 1700009999 ]; echo $?)" "got=$RSPEND"
+RMODEL="$(PRO_GATE_HOME="$RHOME_S" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_read_model 'pg-run-k-1700000000-1'")"
+check 'reservation rewrite still preserves the model (7-field record)' "$([ "$RMODEL" = GPT-X ]; echo $?)" "got=$RMODEL"
 MEPOCH="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_marker_epoch 'pg-run-acme-widgets-42-1700000123-99'")"
-check 'pg_marker_epoch extracts the launch epoch' "$([ "$MEPOCH" = 1700000123 ]; echo $?)" "got=$MEPOCH"
+check 'pg_marker_epoch (fallback) extracts the launch epoch' "$([ "$MEPOCH" = 1700000123 ]; echo $?)" "got=$MEPOCH"
 MEPOCH="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_marker_epoch 'legacy-marker' 2>/dev/null" || true)"
 check 'pg_marker_epoch rejects a legacy marker' "$([ -z "$MEPOCH" ]; echo $?)" "got=$MEPOCH"
 
