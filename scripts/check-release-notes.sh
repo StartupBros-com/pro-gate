@@ -36,11 +36,26 @@ if [ -n "$highlights" ]; then
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     n=$((n + 1))
-    text="$(printf '%s' "$line" | sed -E 's/^[*•-][[:space:]]+//')"
-    case "$text" in
-      # An un-edited PR title or commit subject: the exact shapes the fallback produced.
-      feat:*|fix:*|perf:*|chore:*|docs:*|refactor:*|test:*|ci:*|build:*) problem "bullet $n is a raw commit subject: ${text:0:60}" ;;
-      feat\(*|fix\(*|perf\(*|chore\(*|docs\(*|refactor\(*|test\(*|ci\(*|build\(*) problem "bullet $n is a raw commit subject: ${text:0:60}" ;;
+    # TWO views of each bullet (#69 gate P2):
+    #   raw  — the marker stripped only, so a conventional-commit prefix is still visible and
+    #          can be reported as "this is a commit subject, not customer copy";
+    #   text — normalized exactly as notes_summary will normalize it, so every OTHER rule
+    #          inspects the bytes customers actually receive. Checking only the raw line let
+    #          "feat!: memo-crossbind" pass and still ship as bare "memo-crossbind"; checking
+    #          only the normalized text would hide raw subjects entirely.
+    # Keep this transform identical to notes_summary's sed in scripts/release-train.sh.
+    raw="$(printf '%s' "$line" | sed -E 's/^[*•-][[:space:]]+//')"
+    text="$(printf '%s' "$raw" | sed -E '
+      s/[[:space:]]+by @[A-Za-z0-9_[:punct:]]+ in http[^[:space:]]*[[:space:]]*$//
+      s/^(feat|fix|perf|chore|docs|refactor|test|ci|build)(\([^)]*\))?!?:[[:space:]]*//
+      s/[[:space:]]*\(v[0-9]+\.[0-9]+\.[0-9]+\)[[:space:]]*$//
+      s/[[:space:]]+$//
+    ')"
+    # Prefix check on the RAW line (the normalized text has it stripped already).
+    case "$raw" in
+      feat:*|fix:*|perf:*|chore:*|docs:*|refactor:*|test:*|ci:*|build:*) problem "bullet $n is a raw commit subject: ${raw:0:60}" ;;
+      feat!:*|fix!:*|perf!:*|chore!:*|docs!:*|refactor!:*|test!:*|ci!:*|build!:*) problem "bullet $n is a raw commit subject: ${raw:0:60}" ;;
+      feat\(*|fix\(*|perf\(*|chore\(*|docs\(*|refactor\(*|test\(*|ci\(*|build\(*) problem "bullet $n is a raw commit subject: ${raw:0:60}" ;;
     esac
     printf '%s' "$text" | grep -qE ' by @[A-Za-z0-9_-]+ in http' \
       && problem "bullet $n still carries a 'by @user in <url>' tail: ${text:0:60}"

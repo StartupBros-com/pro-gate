@@ -158,4 +158,39 @@ chk $'## Highlights\n\n- Faster now.' && fail 'stub bullet must be rejected' || 
 assert_eq "$(ns "$GOOD")" $'Reviews that keep making progress now earn extra rounds automatically, instead of stopping at a flat limit.\nReviews going in circles stop early rather than burning your remaining quota.' \
   'notes that pass the gate produce exactly those announcement bullets'
 
+# #69 gate P2: the checker must validate the NORMALIZED bytes the announcer sends. A
+# breaking-change prefix (feat!:) passed the raw-line check, then notes_summary stripped it and
+# shipped the bare branch name — the exact failure this gate exists to prevent.
+chk $'## Highlights\n\n- feat!: memo-crossbind' && fail 'feat!: prefix must be rejected' || pass 'a scope-less breaking-change prefix is rejected after normalization'
+chk $'## Highlights\n\n- fix(pro-gate)!: governor-rounds' && fail 'scoped feat!: must be rejected' || pass 'a scoped breaking-change prefix is rejected after normalization'
+chk $'## Highlights\n\n- governor-rounds   ' && fail 'trailing-space branch name must be rejected' || pass 'a trailing-whitespace branch name is rejected'
+# The normalization must MATCH notes_summary exactly, or the gate inspects different bytes
+# than customers receive. Anything the checker accepts must survive the announcer unchanged.
+assert_eq "$(ns $'## Highlights\n- Reviews that keep making progress now earn extra rounds automatically, instead of a flat limit.')" \
+  'Reviews that keep making progress now earn extra rounds automatically, instead of a flat limit.' \
+  'checker-normalized text and announcer output agree'
+
+# #69 gate P1: the release is CREATED with real copy when an archived notes file exists, so
+# bad copy is not the default. Guard the wiring rather than re-running gh.
+grep -q 'notes-file' "$ROOT/scripts/publish-runtime-release.sh" \
+  && pass 'publish-runtime-release prefers a hand-written notes file' \
+  || fail 'publish-runtime-release still only auto-generates notes'
+grep -q 'docs/release-notes/v\$version.md' "$ROOT/scripts/publish-runtime-release.sh" \
+  && pass 'the notes file is resolved per version' \
+  || fail 'no per-version notes file lookup'
+
+# #69 gate P0: nothing executed from the CHECKED-OUT TAG may run before the ancestry check
+# that proves the tag descends from protected main — that job later holds the marketplace
+# deploy key and the announcement secret.
+WF="$ROOT/.github/workflows/release-train.yml"
+ANCESTRY_LINE="$(grep -n 'merge-base --is-ancestor' "$WF" | cut -d: -f1)"
+CHECKER_LINE="$(grep -n 'check-release-notes.sh' "$WF" | head -1 | cut -d: -f1)"
+PROVISION_LINE="$(grep -n 'provision-ci-tools.sh' "$WF" | head -1 | cut -d: -f1)"
+[ -n "$ANCESTRY_LINE" ] && [ -n "$CHECKER_LINE" ] && [ "$CHECKER_LINE" -gt "$ANCESTRY_LINE" ] \
+  && pass 'the notes checker runs AFTER the protected-branch ancestry check' \
+  || fail "tag-sourced checker runs before ancestry proof (checker=$CHECKER_LINE ancestry=$ANCESTRY_LINE)"
+[ -n "$PROVISION_LINE" ] && [ "$PROVISION_LINE" -gt "$ANCESTRY_LINE" ] \
+  && pass 'tool provisioning also runs after the ancestry check' \
+  || fail 'provisioning runs before ancestry proof'
+
 echo 'ALL PASS'

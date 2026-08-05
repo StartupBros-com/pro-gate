@@ -10,9 +10,17 @@ which is derived from a `## Highlights` section in the GitHub release body.
 v0.31.0 and v0.31.1 shipped cards whose What's New read `governor-rounds` and
 `memo-crossbind`. CI now blocks that.
 
-Because the members-site handler stores each release's Discord message id, editing a release
-body **updates the existing card in place** rather than posting a second one — so fixing
-copy after the fact is safe.
+**Get it right at publish time.** `scripts/publish-runtime-release.sh` uses
+`docs/release-notes/v<version>.md` as the release body when that file exists and passes the
+check, falling back to GitHub auto-notes (branch names) otherwise. So the reliable workflow
+is: write the notes file in the version-bump PR, and the published release carries real copy
+from the start.
+
+Editing a body afterwards is only a partial fix. The release train re-runs on `edited` and
+the members-site handler updates the existing Discord card in place (no double-post) — **but
+only for the LATEST stable release**. `release-train.sh` no-ops when the edited release is
+not the latest, so once a newer version ships, an older release's card can no longer be
+corrected through this path.
 
 ## The rule
 
