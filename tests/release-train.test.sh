@@ -193,4 +193,34 @@ PROVISION_LINE="$(grep -n 'provision-ci-tools.sh' "$WF" | head -1 | cut -d: -f1)
   && pass 'tool provisioning also runs after the ancestry check' \
   || fail 'provisioning runs before ancestry proof'
 
+# #69 gate r2 P2: `printf | grep -q` SIGPIPEs the producer; under pipefail the pipeline reports
+# 141 and a VALID body was read as "no Highlights". Measured 20/20 failures on a long body,
+# which would have published auto-generated branch names for a good release.
+BIG="$(printf '## Highlights\n\n- %s\n\n## Details\n\n%s' \
+  'Reviews now earn extra rounds when they are converging, instead of stopping at a flat limit.' \
+  "$(for _ in $(seq 1 4000); do echo 'filler line for a long details section'; done)")"
+chk "$BIG" && pass 'a long Details section does not break Highlights detection (no SIGPIPE)' \
+  || fail 'large body still trips the SIGPIPE/pipefail path'
+grep -q 'printf .%s. "\$notes" | grep -q' "$CHK" && fail 'a SIGPIPE-prone pipeline remains' \
+  || pass 'no printf|grep -q pipelines remain in the checker'
+
+# #69 gate r2 P2: conventional-commit types are open-ended; a fixed allowlist let revert:/deps:
+# through verbatim.
+chk $'## Highlights\n\n- revert: memo-crossbind changes' && fail 'revert: must be rejected' || pass 'revert: is rejected by generic subject detection'
+chk $'## Highlights\n\n- deps: bump the oracle bridge to 0.17.0' && fail 'deps: must be rejected' || pass 'deps: is rejected by generic subject detection'
+chk $'## Highlights\n\n- chore(release): cut v0.32.0' && fail 'arbitrary scoped type must be rejected' || pass 'an arbitrary scoped commit type is rejected'
+chk $'## Highlights\n\n- Reviews stop early when they stop converging: no more burning quota on repeats.' \
+  && pass 'prose containing a colon is NOT mistaken for a commit subject' || fail 'false positive on prose with a colon'
+
+# #69 gate r2 P2: a wrapped bullet reaches customers as its first clause only.
+chk "$(printf '## Highlights\n\n- Reviews now earn extra rounds automatically,\n  which keeps a converging PR from being cut off.')" \
+  && fail 'wrapped bullet must be rejected' || pass 'a wrapped Highlights bullet is rejected'
+
+# #69 gate r2 P1: a version bump without customer copy must fail on the PR, where it is cheap
+# to fix — the release train is warn-only by design.
+grep -q 'Require customer-ready notes for a version bump' "$ROOT/.github/workflows/ci.yml" \
+  && pass 'PR CI requires notes for a version bump' || fail 'no PR-level version-bump notes gate'
+grep -q 'docs/release-notes/v\$version.md' "$ROOT/.github/workflows/ci.yml" \
+  && pass 'the version-bump gate resolves the per-version notes file' || fail 'version-bump gate does not resolve the notes file'
+
 echo 'ALL PASS'

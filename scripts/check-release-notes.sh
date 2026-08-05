@@ -25,11 +25,34 @@ problem() { printf '  ✗ %s\n' "$*" >&2; fails=$((fails + 1)); }
 # the bytes customers actually receive rather than a lookalike.
 highlights="$(printf '%s\n' "$notes" | sed -n '/^##[[:space:]]*Highlights/,/^## /p' | grep -E '^[*•-][[:space:]]' || true)"
 
-if ! printf '%s\n' "$notes" | grep -qE '^##[[:space:]]*Highlights'; then
+# NEVER `printf ... | grep -q` here (#69 gate r2 P2). `grep -q` exits the moment it matches,
+# so printf takes SIGPIPE and, under `set -o pipefail`, the pipeline reports 141 — the
+# "Highlights missing" branch then fires on notes that DO have the section. Verified: a body
+# with a long Details section failed 20/20 runs, which would have published auto-generated
+# branch-name copy for a perfectly good release. Match against the variable instead, which
+# consumes nothing and cannot break.
+case "$notes" in
+  '##'*Highlights*|*$'\n##'*Highlights*) has_highlights=1 ;;
+  *) has_highlights=0 ;;
+esac
+if [ "$has_highlights" = 0 ]; then
   problem "no '## Highlights' section — customers would receive auto-generated PR titles instead of release notes"
 elif [ -z "$highlights" ]; then
   problem "'## Highlights' section has no bullets"
 fi
+
+# Wrapped bullets are a silent truncation (#69 gate r2 P2): notes_summary keeps only physical
+# lines starting with a marker, so a bullet continued on an indented next line reaches
+# customers as its first clause alone — grammatical, plausible, and missing the point. Reject
+# rather than join, because joining would change what the ANNOUNCER sends and the two must
+# agree. Authors write one bullet per line.
+while IFS= read -r hl; do
+  case "$hl" in
+    '  '*|$'\t'*) problem "a Highlights bullet is wrapped onto a continuation line; the announcement keeps only the first line — put each bullet on ONE line: ${hl#"${hl%%[![:space:]]*}"}" ;;
+  esac
+done <<EOF
+$(printf '%s\n' "$notes" | sed -n '/^##[[:space:]]*Highlights/,/^## /p' | grep -vE '^[[:space:]]*$' | grep -vE '^##')
+EOF
 
 if [ -n "$highlights" ]; then
   n=0
@@ -51,19 +74,28 @@ if [ -n "$highlights" ]; then
       s/[[:space:]]*\(v[0-9]+\.[0-9]+\.[0-9]+\)[[:space:]]*$//
       s/[[:space:]]+$//
     ')"
-    # Prefix check on the RAW line (the normalized text has it stripped already).
-    case "$raw" in
-      feat:*|fix:*|perf:*|chore:*|docs:*|refactor:*|test:*|ci:*|build:*) problem "bullet $n is a raw commit subject: ${raw:0:60}" ;;
-      feat!:*|fix!:*|perf!:*|chore!:*|docs!:*|refactor!:*|test!:*|ci!:*|build!:*) problem "bullet $n is a raw commit subject: ${raw:0:60}" ;;
-      feat\(*|fix\(*|perf\(*|chore\(*|docs\(*|refactor\(*|test\(*|ci\(*|build\(*) problem "bullet $n is a raw commit subject: ${raw:0:60}" ;;
-    esac
-    printf '%s' "$text" | grep -qE ' by @[A-Za-z0-9_-]+ in http' \
-      && problem "bullet $n still carries a 'by @user in <url>' tail: ${text:0:60}"
-    printf '%s' "$text" | grep -qE '(^|[[:space:]])#[0-9]+([[:space:]]|$|\))' \
-      && problem "bullet $n references an issue/PR number — link it under Details instead: ${text:0:60}"
+    # Prefix check on the RAW line (normalization already stripped the known types).
+    # GENERIC, not an allowlist (#69 gate r2 P2): Conventional Commit types are open-ended, so
+    # `revert:`, `deps:` or any project-specific type sailed through a fixed nine-type list and
+    # reached customers verbatim. Match the SHAPE instead — a lowercase token, optional
+    # (scope), optional !, then ": " — which is what a commit subject looks like and what
+    # customer prose never does.
+    # All matches use grep <<< (here-string): the producer is bash itself, so an early -q exit
+    # cannot SIGPIPE a printf and poison $? under pipefail (same class of bug as the Highlights
+    # detection above).
+    if grep -qE '^[a-z][a-z0-9_-]*(\([^)]*\))?!?:[[:space:]]' <<<"$raw"; then
+      problem "bullet $n is a raw commit subject: ${raw:0:60}"
+    fi
+    if grep -qE ' by @[A-Za-z0-9_-]+ in http' <<<"$text"; then
+      problem "bullet $n still carries a 'by @user in <url>' tail: ${text:0:60}"
+    fi
+    if grep -qE '(^|[[:space:]])#[0-9]+([[:space:]]|$|\))' <<<"$text"; then
+      problem "bullet $n references an issue/PR number — link it under Details instead: ${text:0:60}"
+    fi
     # A bare branch-name bullet: no spaces, dash/slash separated. "governor-rounds" exactly.
-    printf '%s' "$text" | grep -qE '^[A-Za-z0-9]+([-/][A-Za-z0-9]+)+$' \
-      && problem "bullet $n looks like a branch name, not a sentence: ${text:0:60}"
+    if grep -qE '^[A-Za-z0-9]+([-/][A-Za-z0-9]+)+$' <<<"$text"; then
+      problem "bullet $n looks like a branch name, not a sentence: ${text:0:60}"
+    fi
     [ "${#text}" -gt 180 ] && problem "bullet $n is ${#text} chars; the feed truncates at 180"
     [ "${#text}" -lt 15 ] && problem "bullet $n is too short to say anything useful: ${text:0:60}"
   done <<EOF

@@ -24,6 +24,25 @@ jobs:
           find . -path './.git' -prune -o -name '*.json' -print -exec jq empty {} \;
           find . -path './.git' -prune -o \( -name '*.yaml' -o -name '*.yml' \) -print -exec yq eval '.' {} \; >/dev/null
           find . -path './.git' -prune -o -name '*.sh' -print0 | xargs -0 shellcheck --severity=error
+      # A version bump IS a release: require its customer copy here, where a human can still
+      # fix it (#69 gate r2 P1). Blocking belongs on the PR, never on the release train — that
+      # job also promotes the runtime, so failing there over prose would leave a tagged release
+      # customers cannot install. Without this gate the auto-notes fallback in
+      # publish-runtime-release.sh silently ships branch names, which is how v0.31.0 and
+      # v0.31.1 announced "governor-rounds" and "memo-crossbind".
+      - name: Require customer-ready notes for a version bump
+        run: |
+          version="$(tr -d '[:space:]' < VERSION)"
+          notes="docs/release-notes/v$version.md"
+          if git rev-parse "v$version" >/dev/null 2>&1; then
+            echo "v$version already tagged; not a new release in this PR."
+            exit 0
+          fi
+          if [ ! -s "$notes" ]; then
+            echo "::error title=Missing release notes::VERSION is $version but $notes does not exist. Write it (see docs/RELEASE-NOTES-TEMPLATE.md) — without it the release publishes auto-generated PR titles to customers."
+            exit 1
+          fi
+          ./scripts/check-release-notes.sh "$notes"
       - name: Run tests
         run: |
           bash tests/engine.test.sh
