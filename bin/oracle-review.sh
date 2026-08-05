@@ -1072,6 +1072,16 @@ if [ -n "$HARVEST_MARKER" ]; then
         pg_status failed "unbindable capture; reservation write failed; state preserved"
         pg_finish 3
       fi
+      # #68 gate r3 P1: an unbindable capture does NOT prove the review is live, so this is a
+      # legitimate moment to apply the target's own TTL — and the only one, since reconcilers
+      # skip markers under active collection. Without it the harvest target could never expire
+      # and #67's "a stranded change frees itself" property died for the very marker it was
+      # written for. Done while we still hold the harvest lock, so no peer races the decision.
+      if [ "${PRO_GATE_HARVEST_TTL_SWEEP:-1}" = 1 ] && [ -n "$(pg_reservation_expire_if_stale "$RUN_MARKER")" ]; then
+        echo "ERROR: this reservation is past its ${PRO_GATE_RESERVATION_TTL:-21600}s TTL and its conversation still cannot be bound to this run — releasing it so the change is no longer blocked. The set-aside capture is at $OUT.unbound.$$; a fresh review may now be run." >&2
+        pg_status failed "unbindable past TTL; reservation released (change unblocked)"
+        pg_finish 6
+      fi
       echo "ERROR: harvested a complete review that cannot be bound to this run (no run-marker echo — possibly an older answer while the current one is still generating). Reservation and candidate kept. Retry --harvest; inspect $OUT.unbound.$$; PRO_GATE_REQUIRE_NONCE=0 accepts best-effort captures." >&2
       pg_status in-progress "harvested review unbindable (no nonce echo); reservation kept, retry"
       pg_finish 9

@@ -57,7 +57,15 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
     if (req.url === '/json') {
       const port = server.address().port;
       res.setHeader('content-type', 'application/json');
-      const extras = extraTabs.filter((t) => !closed.includes(t.id));
+      // Extras are listed verbatim EXCEPT that a caller-supplied tab with no debugger URL
+      // gets one, so opts.tabText can give listed tabs distinct bodies. Without this an extra
+      // tab is unreadable and silently becomes a "dead tab" — which is what tab-hygiene tests
+      // (sweep-root, foreign-tab-left-open) rely on, so only fill it in when tabText is used.
+      const extras = extraTabs.filter((t) => !closed.includes(t.id)).map((t) => (
+        opts.tabText && !t.webSocketDebuggerUrl
+          ? { type: 'page', ...t, webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/${t.id}` }
+          : t
+      ));
       const scratch = created.filter((t) => !closed.includes(t.id)).map((t) => ({
         id: t.id, type: 'page', url: t.url,
         webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/${t.id}`,
@@ -78,9 +86,14 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
       + `Sec-WebSocket-Accept: ${accept}\r\n\r\n`);
     const id = (req.url ?? '').split('/').pop();
     const scratch = created.find((t) => t.id === id);
+    const extra = extraTabs.find((t) => t.id === id);
     // Any client frame (the Runtime.evaluate call) gets the canned innerText back.
     socket.on('data', () => {
       let value = tabText;
+      // opts.tabText lets a test give LISTED tabs distinct bodies (tab id or url -> text);
+      // without it every listed tab serves the same text, which cannot express "one tab is
+      // ours and another is foreign" — the shape #68's ordering regression needs.
+      if (extra && opts.tabText) value = opts.tabText(extra.url, extra.id) ?? value;
       if (scratch && opts.renderText) {
         const n = (pollsByTab.get(id) ?? 0) + 1;
         pollsByTab.set(id, n);
@@ -402,6 +415,33 @@ const FOREIGN_ANSWER = (m) => [
     `crossbound=${r.crossbound} stderr=${r.stderr?.slice(-400)}`);
   check('our review is still returned alongside a foreign tab', r.status === 0, `status=${r.status}`);
   cdp.stop();
+}
+
+{ // #68 gate r3 P2: terminal cross-bound state must be ORDER-INDEPENDENT. Give each tab a
+  // DIFFERENT body — one cross-bound, one genuinely ours — and assert the verdict is the same
+  // whichever the scan happens to classify first. Writing mid-scan made this depend on /json
+  // order, so a live review could be labelled STUCK purely by tab ordering.
+  const oursBody = [
+    `run marker: ${MARKER}`,
+    '[P1] lib/z.sh:1 — ours',
+    'P2: none',
+    'P3: none',
+    `VERDICT: SHIP — ours. (run marker: ${MARKER})`,
+  ].join('\n');
+  for (const foreignFirst of [true, false]) {
+    // tab1 (listed first) carries one body; the extra tab carries the other. Swapping which
+    // is which flips scan order without changing anything else.
+    const first = foreignFirst ? FOREIGN_ANSWER(MARKER) : oursBody;
+    const second = foreignFirst ? oursBody : FOREIGN_ANSWER(MARKER);
+    const cdp = await mockCdp(first, [{ id: 't-second', url: 'https://chatgpt.com/c/tab-second' }],
+      { tabText: () => second });
+    const r = await runSalvage([MARKER, '15'], cdp.port);
+    check(`cross-bound state is order-independent (foreignFirst=${foreignFirst}): not stuck`,
+      (r.crossbound ?? 0) === 0, `crossbound=${r.crossbound} status=${r.status} stderr=${r.stderr?.slice(-300)}`);
+    check(`our review is found regardless of order (foreignFirst=${foreignFirst})`,
+      r.status === 0, `status=${r.status} stderr=${r.stderr?.slice(-300)}`);
+    cdp.stop();
+  }
 }
 
 { // gate round-2 P1: one EARLY successful listing must not mask a later CDP outage. Scan once

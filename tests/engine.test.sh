@@ -1094,6 +1094,19 @@ if command -v flock >/dev/null 2>&1; then
   check 'an unclaimed past-TTL reservation is still reaped' \
     "$([ ! -f "$THOME/in-progress/$CLAIMED" ]; echo $?)" "$(ls "$THOME/in-progress" 2>/dev/null)"
 fi
+# #68 gate r3 P1: the TARGET's own expiry. Reconcilers skip claimed markers, so the collector
+# must decide its own target's fate post-capture — otherwise the one marker #67 exists for can
+# never self-clear, and repeatedly following --status's advice loops forever.
+EXPIRED_SELF="pg-run-selfkey-1700000007-93"
+printf 'selfkey\t%s/o5.md\t%s\t0\t\t\t\n' "$THOME" "$(( $(date +%s) - 30000 ))" > "$THOME/in-progress/$EXPIRED_SELF"
+check 'expire_if_stale releases a past-TTL reservation' \
+  "$([ "$(PRO_GATE_HOME="$THOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_expire_if_stale '$EXPIRED_SELF'")" = expired ]; echo $?)" \
+  "$(ls "$THOME/in-progress" 2>/dev/null)"
+FRESH_SELF="pg-run-selfkey-1700000008-94"
+printf 'selfkey\t%s/o6.md\t%s\t0\t\t\t\n' "$THOME" "$(date +%s)" > "$THOME/in-progress/$FRESH_SELF"
+check 'expire_if_stale keeps an unexpired reservation' \
+  "$([ -z "$(PRO_GATE_HOME="$THOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_expire_if_stale '$FRESH_SELF'")" ] && [ -f "$THOME/in-progress/$FRESH_SELF" ]; echo $?)" \
+  "$(ls "$THOME/in-progress" 2>/dev/null)"
 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 --json >"$TDIR/st.json" 2>/dev/null; RC=$?
 check '--status --json exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC"
 check '--status --json reservation marker' "$([ "$(jq -r '.reservations[0].marker' "$TDIR/st.json")" = "$SMARKER" ]; echo $?)" "$(cat "$TDIR/st.json")"

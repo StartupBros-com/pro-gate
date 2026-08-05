@@ -690,6 +690,26 @@ pg_reservation_slot_plan() {
   printf '%s|%s\n' "$r" "${excl# }"
 }
 
+# pg_reservation_expire_if_stale <marker>: release THIS marker's reservation when it is past
+# TTL. The collector calls it AFTER its capture, while still holding the marker's harvest lock
+# (#68 gate r3 P1) — reconcilers skip claimed markers, so without this the harvest target could
+# never expire and #67's self-clearing property was defeated for the one marker that needed it.
+# Caller MUST only invoke this on outcomes that did NOT positively prove the review is live.
+# Echoes "expired" when released, nothing otherwise.
+pg_reservation_expire_if_stale() {
+  local marker="$1" f created ttl now
+  pg_reservation_marker_ok "$marker" || return 0
+  f="$(pg_reservation_dir)/$marker"
+  [ -f "$f" ] || return 0
+  created="$(awk -F'\t' 'NR==1{print $3}' "$f" 2>/dev/null)"
+  case "$created" in ''|*[!0-9]*) return 0;; esac
+  ttl="${PRO_GATE_RESERVATION_TTL:-21600}"; case "$ttl" in ''|*[!0-9]*) ttl=21600;; esac
+  now="$(date +%s)"
+  [ $(( now - created )) -ge "$ttl" ] || return 0
+  pg_reservation_remove "$marker"
+  echo expired
+}
+
 # pg_harvest_claimed <marker>: 0 when some process is COLLECTING this marker right now, i.e.
 # holds its harvest lock (#68 gate r2 P1). Every reconciler consults this before reaping, so a
 # reservation cannot be removed out from under an in-flight collection by ANY process — the
@@ -709,11 +729,20 @@ pg_harvest_claimed() {
     fi
     return "$rc"
   fi
-  # mkdir-lock platforms (stock macOS): the directory exists only while held, and pg_lock
-  # reaps it when its recorded pid is gone.
+  # mkdir-lock platforms (stock macOS): the directory exists only while held. Owner metadata
+  # must PROVE a live holder (#68 gate r3 P2) — a crash between mkdir and the pid write, or a
+  # recycled pid, would otherwise mark the reservation claimed forever and freeze reconciliation
+  # (pg_lock cannot reap an empty-pid directory either). Require a live pid AND, when the lock
+  # recorded a process-identity token, a matching one.
   [ -d "$f.d" ] || return 1
-  local opid; opid="$(cat "$f.d/pid" 2>/dev/null || true)"
-  [ -n "$opid" ] && ! kill -0 "$opid" 2>/dev/null && return 1
+  local opid otok
+  opid="$(cat "$f.d/pid" 2>/dev/null || true)"
+  case "$opid" in ''|*[!0-9]*) return 1;; esac        # torn/missing owner record: not a claim
+  kill -0 "$opid" 2>/dev/null || return 1             # dead holder: stale directory
+  otok="$(cat "$f.d/token" 2>/dev/null || true)"
+  if [ -n "$otok" ] && [ "$otok" != "$(pg_pid_token "$opid" 2>/dev/null)" ]; then
+    return 1                                          # pid reused by an unrelated process
+  fi
   return 0
 }
 
