@@ -133,4 +133,94 @@ CJK_OUT="$(ns "$CJK")"
 assert_eq "$(printf '%s' "$CJK_OUT" | python3 -c 'import sys; print(len(sys.stdin.read()))')" '180' 'multibyte bullets slice at 180 CHARACTERS'
 printf '%s' "$CJK_OUT" | python3 -c 'import sys; sys.stdin.buffer.read().decode("utf-8")' && pass 'sliced multibyte output is valid UTF-8'
 
+# ── customer-readiness gate (scripts/check-release-notes.sh) ─────────────────────────────
+# Both customer feeds derive from the release body, so a missing/lazy Highlights section
+# ships developer shorthand to House of Vibe customers. v0.31.0 and v0.31.1 announced
+# "governor-rounds" and "memo-crossbind" exactly this way; these cases lock that out.
+CHK="$ROOT/scripts/check-release-notes.sh"
+chk() { printf '%s' "$1" | bash "$CHK" - >/dev/null 2>&1; }
+
+# The REAL v0.31.0 body that shipped: the regression this gate exists for.
+SHIPPED=$'## What\'s Changed\n* governor-rounds by @StartupBros in https://github.com/StartupBros-com/pro-gate/pull/66\n\n**Full Changelog**: https://x/y'
+chk "$SHIPPED" && fail 'the shipped v0.31.0 body must be rejected' || pass 'the auto-generated body that shipped is rejected'
+
+GOOD=$'## Highlights\n\n- Reviews that keep making progress now earn extra rounds automatically, instead of stopping at a flat limit.\n- Reviews going in circles stop early rather than burning your remaining quota.\n\n## Upgrade\n\nNothing to do.'
+chk "$GOOD" && pass 'well-written customer notes pass' || fail 'good notes were rejected'
+
+chk $'## Highlights\n\n## Upgrade\n\nNothing.' && fail 'empty Highlights must be rejected' || pass 'an empty Highlights section is rejected'
+chk $'## Highlights\n\n- feat(pro-gate): trajectory-aware round governor with churn brake' && fail 'raw commit subject must be rejected' || pass 'a raw conventional-commit subject is rejected'
+chk $'## Highlights\n\n- memo-crossbind' && fail 'branch name must be rejected' || pass 'a bare branch-name bullet is rejected'
+chk $'## Highlights\n\n- Fixed the stuck-review problem reported in #67 by users last week.' && fail 'issue ref must be rejected' || pass 'an issue/PR reference in Highlights is rejected'
+chk "$(printf '## Highlights\n\n- %s' "$(python3 -c "print('x' * 200)")")" && fail 'over-long bullet must be rejected' || pass 'a bullet past the 180-char feed limit is rejected'
+chk $'## Highlights\n\n- Faster now.' && fail 'stub bullet must be rejected' || pass 'a too-short stub bullet is rejected'
+
+# The gate must agree with the announcer: what passes the check is what customers receive.
+assert_eq "$(ns "$GOOD")" $'Reviews that keep making progress now earn extra rounds automatically, instead of stopping at a flat limit.\nReviews going in circles stop early rather than burning your remaining quota.' \
+  'notes that pass the gate produce exactly those announcement bullets'
+
+# #69 gate P2: the checker must validate the NORMALIZED bytes the announcer sends. A
+# breaking-change prefix (feat!:) passed the raw-line check, then notes_summary stripped it and
+# shipped the bare branch name — the exact failure this gate exists to prevent.
+chk $'## Highlights\n\n- feat!: memo-crossbind' && fail 'feat!: prefix must be rejected' || pass 'a scope-less breaking-change prefix is rejected after normalization'
+chk $'## Highlights\n\n- fix(pro-gate)!: governor-rounds' && fail 'scoped feat!: must be rejected' || pass 'a scoped breaking-change prefix is rejected after normalization'
+chk $'## Highlights\n\n- governor-rounds   ' && fail 'trailing-space branch name must be rejected' || pass 'a trailing-whitespace branch name is rejected'
+# The normalization must MATCH notes_summary exactly, or the gate inspects different bytes
+# than customers receive. Anything the checker accepts must survive the announcer unchanged.
+assert_eq "$(ns $'## Highlights\n- Reviews that keep making progress now earn extra rounds automatically, instead of a flat limit.')" \
+  'Reviews that keep making progress now earn extra rounds automatically, instead of a flat limit.' \
+  'checker-normalized text and announcer output agree'
+
+# #69 gate P1: the release is CREATED with real copy when an archived notes file exists, so
+# bad copy is not the default. Guard the wiring rather than re-running gh.
+grep -q 'notes-file' "$ROOT/scripts/publish-runtime-release.sh" \
+  && pass 'publish-runtime-release prefers a hand-written notes file' \
+  || fail 'publish-runtime-release still only auto-generates notes'
+grep -q 'docs/release-notes/v\$version.md' "$ROOT/scripts/publish-runtime-release.sh" \
+  && pass 'the notes file is resolved per version' \
+  || fail 'no per-version notes file lookup'
+
+# #69 gate P0: nothing executed from the CHECKED-OUT TAG may run before the ancestry check
+# that proves the tag descends from protected main — that job later holds the marketplace
+# deploy key and the announcement secret.
+WF="$ROOT/.github/workflows/release-train.yml"
+ANCESTRY_LINE="$(grep -n 'merge-base --is-ancestor' "$WF" | cut -d: -f1)"
+CHECKER_LINE="$(grep -n 'check-release-notes.sh' "$WF" | head -1 | cut -d: -f1)"
+PROVISION_LINE="$(grep -n 'provision-ci-tools.sh' "$WF" | head -1 | cut -d: -f1)"
+[ -n "$ANCESTRY_LINE" ] && [ -n "$CHECKER_LINE" ] && [ "$CHECKER_LINE" -gt "$ANCESTRY_LINE" ] \
+  && pass 'the notes checker runs AFTER the protected-branch ancestry check' \
+  || fail "tag-sourced checker runs before ancestry proof (checker=$CHECKER_LINE ancestry=$ANCESTRY_LINE)"
+[ -n "$PROVISION_LINE" ] && [ "$PROVISION_LINE" -gt "$ANCESTRY_LINE" ] \
+  && pass 'tool provisioning also runs after the ancestry check' \
+  || fail 'provisioning runs before ancestry proof'
+
+# #69 gate r2 P2: `printf | grep -q` SIGPIPEs the producer; under pipefail the pipeline reports
+# 141 and a VALID body was read as "no Highlights". Measured 20/20 failures on a long body,
+# which would have published auto-generated branch names for a good release.
+BIG="$(printf '## Highlights\n\n- %s\n\n## Details\n\n%s' \
+  'Reviews now earn extra rounds when they are converging, instead of stopping at a flat limit.' \
+  "$(for _ in $(seq 1 4000); do echo 'filler line for a long details section'; done)")"
+chk "$BIG" && pass 'a long Details section does not break Highlights detection (no SIGPIPE)' \
+  || fail 'large body still trips the SIGPIPE/pipefail path'
+grep -q 'printf .%s. "\$notes" | grep -q' "$CHK" && fail 'a SIGPIPE-prone pipeline remains' \
+  || pass 'no printf|grep -q pipelines remain in the checker'
+
+# #69 gate r2 P2: conventional-commit types are open-ended; a fixed allowlist let revert:/deps:
+# through verbatim.
+chk $'## Highlights\n\n- revert: memo-crossbind changes' && fail 'revert: must be rejected' || pass 'revert: is rejected by generic subject detection'
+chk $'## Highlights\n\n- deps: bump the oracle bridge to 0.17.0' && fail 'deps: must be rejected' || pass 'deps: is rejected by generic subject detection'
+chk $'## Highlights\n\n- chore(release): cut v0.32.0' && fail 'arbitrary scoped type must be rejected' || pass 'an arbitrary scoped commit type is rejected'
+chk $'## Highlights\n\n- Reviews stop early when they stop converging: no more burning quota on repeats.' \
+  && pass 'prose containing a colon is NOT mistaken for a commit subject' || fail 'false positive on prose with a colon'
+
+# #69 gate r2 P2: a wrapped bullet reaches customers as its first clause only.
+chk "$(printf '## Highlights\n\n- Reviews now earn extra rounds automatically,\n  which keeps a converging PR from being cut off.')" \
+  && fail 'wrapped bullet must be rejected' || pass 'a wrapped Highlights bullet is rejected'
+
+# #69 gate r2 P1: a version bump without customer copy must fail on the PR, where it is cheap
+# to fix — the release train is warn-only by design.
+grep -q 'Require customer-ready notes for a version bump' "$ROOT/.github/workflows/ci.yml" \
+  && pass 'PR CI requires notes for a version bump' || fail 'no PR-level version-bump notes gate'
+grep -q 'docs/release-notes/v\$version.md' "$ROOT/.github/workflows/ci.yml" \
+  && pass 'the version-bump gate resolves the per-version notes file' || fail 'version-bump gate does not resolve the notes file'
+
 echo 'ALL PASS'

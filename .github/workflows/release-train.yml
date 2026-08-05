@@ -30,6 +30,21 @@ jobs:
           git fetch origin "$DEFAULT_BRANCH"
           release_sha="$(git rev-list -n 1 "$RELEASE_TAG")"
           git merge-base --is-ancestor "$release_sha" "origin/$DEFAULT_BRANCH"
+      # AFTER the ancestry check, never before (#69 gate P0): this executes a script from the
+      # CHECKED-OUT TAG, so running it earlier would let anyone able to push a tag execute
+      # arbitrary code in a job that later handles the marketplace deploy key and the
+      # announcement secret — persisting BASH_ENV/PATH to survive into those steps. Every
+      # tag-sourced executable must sit below the proof that the tag descends from protected
+      # main. Warn-only: promote/announce also publish the runtime, so failing on imperfect
+      # PROSE would leave a tagged release customers cannot install. Blocking enforcement
+      # lives in PR CI, where a human can still fix it cheaply.
+      - name: Check release notes are customer-ready
+        env:
+          RELEASE_NOTES: ${{ github.event.release.body }}
+        run: |
+          if ! printf '%s' "$RELEASE_NOTES" | ./scripts/check-release-notes.sh -; then
+            echo "::warning title=Release notes are not customer-ready::The announcement will fall back to auto-generated PR titles. Edit the release body (see docs/RELEASE-NOTES-TEMPLATE.md)."
+          fi
       - name: Provision pinned CI tools
         run: ./scripts/provision-ci-tools.sh
 
