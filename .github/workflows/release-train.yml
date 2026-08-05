@@ -22,12 +22,19 @@ jobs:
           ref: ${{ github.event.release.tag_name }}
           fetch-depth: 0
           persist-credentials: false
-      # Gate the COPY before anything is promoted or announced: both customer feeds derive
+      # Surface copy problems LOUDLY but never block distribution: both customer feeds derive
       # from this body, and a missing Highlights section silently falls back to PR titles.
+      # Deliberately non-fatal (`|| true` + a job annotation): promote/announce publish the
+      # runtime and update the marketplace, so failing here on imperfect PROSE would leave a
+      # tagged release that customers cannot install. Bad copy degrades the announcement; it
+      # must never degrade shipping. The blocking enforcement lives in CI on the PR instead.
       - name: Check release notes are customer-ready
         env:
           RELEASE_NOTES: ${{ github.event.release.body }}
-        run: printf '%s' "$RELEASE_NOTES" | ./scripts/check-release-notes.sh -
+        run: |
+          if ! printf '%s' "$RELEASE_NOTES" | ./scripts/check-release-notes.sh -; then
+            echo "::warning title=Release notes are not customer-ready::The announcement will fall back to auto-generated PR titles. Edit the release body (see docs/RELEASE-NOTES-TEMPLATE.md); editing re-runs this train and updates the card in place."
+          fi
       - name: Require release commit on protected default branch
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}

@@ -65,10 +65,20 @@ Rules of thumb:
 
 ## Checks
 
-`scripts/check-release-notes.sh` runs in CI on every release and fails when the body has no
-`## Highlights` section, when Highlights is empty, or when a bullet looks like an
-un-edited PR title (a conventional-commit prefix, a bare branch name, a `#123` reference, or
-a `by @user in <url>` tail). Run it locally on a draft:
+`scripts/check-release-notes.sh` flags a body with no `## Highlights` section, an empty one,
+or bullets that look like un-edited PR titles (a conventional-commit prefix, a bare branch
+name, a `#123` reference, or a `by @user in <url>` tail).
+
+It runs in two places, deliberately with different severity:
+
+- **On the release train: warn only.** The same job promotes the runtime to
+  `hov-marketplace`, so a hard failure over prose would leave a tagged release customers
+  cannot install. Bad copy degrades the announcement, never shipping. The warning appears as
+  a job annotation, and editing the release body re-runs the train and updates the existing
+  Discord card in place.
+- **On the PR / locally: fail.** That is where a human can still fix it cheaply.
+
+Run it on a draft before publishing:
 
 ```bash
 scripts/check-release-notes.sh path/to/notes.md
