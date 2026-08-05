@@ -1,10 +1,18 @@
 # Release notes: how to write them
 
-Every pro-gate release is announced to House of Vibe customers — on the members site and in
-the Discord tool-drops channel. Both feeds pull from a `## Highlights` section in the GitHub
-release body. **If you don't write one, customers get GitHub's auto-generated PR titles**,
-which is how v0.31.0 and v0.31.1 shipped announcements reading `governor-rounds` and
+Every pro-gate release is announced to House of Vibe customers. The release train POSTs to
+the members site (`/api/internal/ops/tool-releases`), which renders the branded tool-drop
+card and posts it to the Discord tool-drops channel — **pro-gate itself sends no Discord
+message; do not add one.** The card's "What's new" section is the `notesSummary` field,
+which is derived from a `## Highlights` section in the GitHub release body.
+
+**If you don't write one, customers get GitHub's auto-generated PR titles.** That is how
+v0.31.0 and v0.31.1 shipped cards whose What's New read `governor-rounds` and
 `memo-crossbind`. CI now blocks that.
+
+Because the members-site handler stores each release's Discord message id, editing a release
+body **updates the existing card in place** rather than posting a second one — so fixing
+copy after the fact is safe.
 
 ## The rule
 

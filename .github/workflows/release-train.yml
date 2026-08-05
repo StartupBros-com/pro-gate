@@ -91,8 +91,6 @@ jobs:
           MARKETPLACE_VALIDATION_MODE: ${{ vars.HOV_MARKETPLACE_VALIDATION_MODE || 'syntax' }}
           ANNOUNCE_URL: ${{ vars.TOOL_RELEASE_ANNOUNCE_URL }}
           ANNOUNCE_SECRET: ${{ secrets.TOOL_RELEASE_ANNOUNCE_SECRET }}
-          # Optional: unset skips the Discord post entirely (forks, older configs).
-          DISCORD_WEBHOOK_URL: ${{ secrets.TOOL_DROPS_DISCORD_WEBHOOK_URL }}
         run: |
           source_sha="$(git rev-list -n 1 "$RELEASE_TAG")"
           export SOURCE_SHA="$source_sha"
