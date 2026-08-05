@@ -268,6 +268,28 @@ echo is set aside as `<out>.unbound.*` with the reservation kept (it may be an o
 while the current one still generates — retry the harvest); in legacy mode
 (`PRO_GATE_REQUIRE_NONCE=0`) a zero-overlap capture is set aside as `<out>.foreign.*` and
 its source blacklisted) ·
+
+> **`<out>.unbound.*` files: check WHICH state before acting (engine ≥v0.31.1).**
+> `--status` reports one of three `reservations[].state` values, and they call for different
+> responses:
+>
+> - `generating-or-recoverable` — normal. Harvest again when ready.
+> - `unbindable-ambiguous` — a completed capture carried no run-marker echo. This is
+>   **retryable**: it is often an *older* answer sitting above your prompt in a reused
+>   conversation while yours still generates. Retry the free harvest; do not delete anything.
+> - `cross-bound` — the engine positively proved the remembered conversation's completed
+>   answer belongs to a *different* run (recorded in `$PRO_GATE_HOME/crossbound/<marker>`).
+>   Retrying cannot bind it. Engine ≥v0.31.1 discards the bad memo and expires the
+>   reservation at its TTL, so the change frees itself; to unblock immediately, remove
+>   `$PRO_GATE_HOME/in-progress/<marker>`.
+>
+> Your marker appearing on a page is NOT proof the page is yours — it rides the submitted
+> prompt, so a mis-navigated render can show your prompt above someone else's answer. On
+> engines before v0.31.1 that mis-binding poisoned the URL memo permanently and every fresh
+> run was redirected to the dead reservation (pushbot#1334 lost a review this way).
+> **Never "fix" any of these with `PRO_GATE_REQUIRE_NONCE=0`** — in both observed incidents
+> the rejected capture really was another PR's review, and accepting it would have sent the
+> gate to fix phantom findings in the wrong repository. ·
 `8` deferred (cooldown: retry after) · `6`
 TWO flavors — read the status `detail` before interpreting: "already collected" means the
 review EXISTS but could not be returned automatically (unverifiable pre-v0.28 row, missing

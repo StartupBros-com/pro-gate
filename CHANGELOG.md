@@ -19,6 +19,7 @@ Conventions in this file:
 
 | Version | Date | Artifact | Theme |
 |---|---|---|---|
+| [v0.31.1](https://github.com/StartupBros-com/pro-gate/releases/tag/v0.31.1) | 2026-08-04 | Release | Cross-bound conversation memos: answer-ownership check, memo eviction, harvest-path TTL |
 | [v0.31.0](https://github.com/StartupBros-com/pro-gate/releases/tag/v0.31.0) | 2026-08-04 | Release | Trajectory-aware round governor: earned rounds, churn brake, never-landed refunds |
 | [v0.30.1](https://github.com/StartupBros-com/pro-gate/releases/tag/v0.30.1) | 2026-08-03 | Release | Hygiene close-out: consent stderr leak, run-log sweep allowlist, autoupdate.log bound, `.env` perms, salvage-window knob |
 | [v0.30.0](https://github.com/StartupBros-com/pro-gate/releases/tag/v0.30.0) | 2026-08-03 | Release | Residuals close-out: daemon recoverable-state guard, scratch hygiene, memoized-URL recovery (plus the #58–#60 docs wave) |
@@ -273,6 +274,45 @@ pro-gate#61's 4 window rounds while spending zero Pro quota. The skill's §6 sto
 gained the matching refinement: a returning finding whose fix the reviewer ACCEPTS but
 calls incomplete is convergence work, not oscillation — only a disputed fix approach
 escalates.
+
+### 12. Cross-bound conversation memos (2026-08-04, v0.31.1)
+
+Two production incidents stranded a change's remaining rounds and lost one review
+([#67](https://github.com/StartupBros-com/pro-gate/issues/67)): pushbot#1334 (slot spent,
+four unbindable harvests, then exit 6 — the only unresolved exit-9 marker in ~800 ledger
+rows) and pro-gate#66 (escaped by hand). The nonce guard was **working correctly** in both
+— the captures it rejected were genuinely another PR's review, citing another repo's files.
+The defect was upstream of it: `cdp-salvage` decided "this conversation is ours" from a bare
+full-page substring match on the run marker, and the marker rides the submitted *prompt*, so
+a mis-navigated render could show our prompt above someone else's finished answer. That page
+was then memoized as ours — and because a remembered URL is exempt from blacklisting, the
+memo stayed poisoned permanently, while the harvest path had no way to expire a reservation
+(`pg_reservation_reconcile` ran only in fresh dispatch, and fresh runs are redirected to the
+reservation before they can submit — both exits closed).
+
+Fix: ownership now requires the *answer* to be ours. A page whose completed verdict echoes a
+different run's marker is that run's conversation regardless of prompt text — but only when
+that verdict sits AFTER our prompt, since a reused conversation legitimately holds an older
+round's verdict above it and convicting on scrollback would blacklist the live conversation.
+Such a page is never memoized, is blacklisted, and evicts a matching memo through
+claim-and-verify (rename aside, inspect, restore via `link()`), the same protocol
+`pg_provenance_reject` uses — a plain compare-then-delete races a concurrently republished
+genuine memo. `--harvest` applies the reservation TTL in a probe-free sweep that skips the
+marker being collected (reaping it mid-harvest would admit a duplicate submission and let a
+still-generating result recreate the record under a fallback key).
+
+`--status` now names three states, not two: `cross-bound` (positively convicted, terminally
+stuck, recorded by cdp-salvage in `crossbound/<marker>`), `unbindable-ambiguous` (a
+nonce-less capture that may be an older answer while ours generates — retryable), and
+ordinary generating/recoverable. Collapsing the middle case into "stuck" would tell an
+operator to delete a live reservation. The skill doc states plainly that
+`PRO_GATE_REQUIRE_NONCE=0` is the wrong response.
+
+Reservation-record integrity fixed throughout: `pg_reservation_reconcile` AND
+`pg_reservation_note_miss` both rewrote six fields, so a single confirmed miss silently
+erased v0.31's spend epoch and pushed later harvests onto the marker-time fallback; both
+also used `read`, which collapses consecutive tabs and mis-shifts fields when slot/model are
+empty. Every reservation mutation now round-trips all seven fields via per-field `awk`.
 
 ## Notes for agents
 

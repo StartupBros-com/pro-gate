@@ -57,7 +57,15 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
     if (req.url === '/json') {
       const port = server.address().port;
       res.setHeader('content-type', 'application/json');
-      const extras = extraTabs.filter((t) => !closed.includes(t.id));
+      // Extras are listed verbatim EXCEPT that a caller-supplied tab with no debugger URL
+      // gets one, so opts.tabText can give listed tabs distinct bodies. Without this an extra
+      // tab is unreadable and silently becomes a "dead tab" — which is what tab-hygiene tests
+      // (sweep-root, foreign-tab-left-open) rely on, so only fill it in when tabText is used.
+      const extras = extraTabs.filter((t) => !closed.includes(t.id)).map((t) => (
+        opts.tabText && !t.webSocketDebuggerUrl
+          ? { type: 'page', ...t, webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/${t.id}` }
+          : t
+      ));
       const scratch = created.filter((t) => !closed.includes(t.id)).map((t) => ({
         id: t.id, type: 'page', url: t.url,
         webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/${t.id}`,
@@ -78,9 +86,14 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
       + `Sec-WebSocket-Accept: ${accept}\r\n\r\n`);
     const id = (req.url ?? '').split('/').pop();
     const scratch = created.find((t) => t.id === id);
+    const extra = extraTabs.find((t) => t.id === id);
     // Any client frame (the Runtime.evaluate call) gets the canned innerText back.
     socket.on('data', () => {
       let value = tabText;
+      // opts.tabText lets a test give LISTED tabs distinct bodies (tab id or url -> text);
+      // without it every listed tab serves the same text, which cannot express "one tab is
+      // ours and another is foreign" — the shape #68's ordering regression needs.
+      if (extra && opts.tabText) value = opts.tabText(extra.url, extra.id) ?? value;
       if (scratch && opts.renderText) {
         const n = (pollsByTab.get(id) ?? 0) + 1;
         pollsByTab.set(id, n);
@@ -122,8 +135,15 @@ function runSalvage(args, port, seed) {
       })();
       const memoUrl = memos.length ? read(path.join('conversation-urls', memos[0])) : null;
       const blacklist = read('salvage-nonmatching.txt');
+      // #68: convictions recorded for --status to read back (one line per cross-bind hit).
+      const crossbound = (() => {
+        try {
+          return fs.readdirSync(path.join(home, 'crossbound'))
+            .reduce((n, f) => n + (read(path.join('crossbound', f)) ?? '').split('\n').filter(Boolean).length, 0);
+        } catch { return 0; }
+      })();
       fs.rmSync(home, { recursive: true, force: true });
-      resolve({ status, stdout, stderr, memoUrl: memoUrl?.trim() ?? null, memos, blacklist });
+      resolve({ status, stdout, stderr, memoUrl: memoUrl?.trim() ?? null, memos, blacklist, crossbound });
     });
   });
 }
@@ -257,6 +277,171 @@ const MARKER = 'pg-run-test-1234567890-42';
   const r = await runSalvage([MARKER, '30'], cdp.port, seedMemo(MARKER, 'https://chatgpt.com/c/remembered'));
   check('a stale memo pointing at another run still exits 4', r.status === 4, `status=${r.status} stderr=${r.stderr?.slice(0, 300)}`);
   cdp.stop();
+}
+
+// ── #67: cross-bound memo. A page can carry OUR marker (it rides the submitted prompt) while
+// the completed ANSWER belongs to another run. Two live incidents memoized exactly such a page
+// as "ours"; since a remembered URL is exempt from blacklisting, the memo stayed poisoned and
+// every later harvest re-rejected the same foreign answer while the reservation never retired.
+const FOREIGN_ANSWER = (m) => [
+  `pro-gate review: PR #999 r1 [other-repo]`,
+  `run marker: ${m}`,                       // OUR marker, in the prompt echoed on the page
+  '',
+  '[P1] apps/other/thing.ts:12 — something in ANOTHER change',
+  'P2: none',
+  'P3: none',
+  'VERDICT: FIX-FIRST — not ours. (run marker: pg-run-other-repo-42-1111111111-9)',
+].join('\n');
+
+{ // The cross-bind itself: a remembered URL whose completed answer is another run's must be
+  // discarded, not re-memoized — and must NOT be returned as our review.
+  const cdp = await mockCdp('__NO_TABS__', [], { renderText: () => FOREIGN_ANSWER(MARKER) });
+  const r = await runSalvage([MARKER, '30'], cdp.port, seedMemo(MARKER, 'https://chatgpt.com/c/crossbound'));
+  check('cross-bound memo is not accepted as our review', r.status !== 0, `status=${r.status}`);
+  check('cross-bound memo exits 4 (decisive), not 7/3', r.status === 4, `status=${r.status} stderr=${r.stderr?.slice(-300)}`);
+  check('cross-bound memo is reported as another run\'s answer',
+    /ANOTHER run's completed answer/.test(r.stderr ?? ''), `stderr=${r.stderr?.slice(-400)}`);
+  check('the poisoned memo file is deleted', (r.memos ?? []).length === 0, `memos=${JSON.stringify(r.memos)}`);
+  check('no foreign review text is emitted on stdout',
+    !/VERDICT/.test(r.stdout ?? ''), `stdout=${r.stdout?.slice(0, 200)}`);
+  cdp.stop();
+}
+
+{ // Same page shape, but arriving as an OPEN TAB rather than a memo: also refused.
+  const cdp = await mockCdp(FOREIGN_ANSWER(MARKER));
+  const r = await runSalvage([MARKER, '20'], cdp.port);
+  check('an open tab with our marker but another run\'s answer is refused', r.status !== 0, `status=${r.status}`);
+  check('open-tab cross-bind never emits the foreign review',
+    !/VERDICT/.test(r.stdout ?? ''), `stdout=${r.stdout?.slice(0, 200)}`);
+  cdp.stop();
+}
+
+{ // NON-NEGOTIABLE: the fix must not make us laxer. A page carrying our marker AND our own
+  // nonce echo is still accepted exactly as before.
+  const ours = [
+    `run marker: ${MARKER}`,
+    '',
+    '[P1] lib/thing.sh:3 — a real finding',
+    'P2: none',
+    'P3: none',
+    `VERDICT: FIX-FIRST — ours. (run marker: ${MARKER})`,
+  ].join('\n');
+  const cdp = await mockCdp(ours);
+  const r = await runSalvage([MARKER, '20'], cdp.port);
+  check('our own nonce-bearing review is still returned (exit 0)', r.status === 0, `status=${r.status} stderr=${r.stderr?.slice(-300)}`);
+  check('our review reaches stdout', /VERDICT: FIX-FIRST/.test(r.stdout ?? ''), `stdout=${r.stdout?.slice(0, 200)}`);
+  cdp.stop();
+}
+
+{ // A still-generating conversation (our marker, NO completed verdict yet) must remain
+  // "live", not be mistaken for a cross-bind: the foreign check only fires on a COMPLETE answer.
+  const cdp = await mockCdp(`run marker: ${MARKER}\nthinking hard, no verdict yet`);
+  const r = await runSalvage([MARKER, '12'], cdp.port);
+  check('still-generating stays exit 3 under the new check', r.status === 3, `status=${r.status} stderr=${r.stderr?.slice(-300)}`);
+  cdp.stop();
+}
+
+{ // #68 gate P1 (POSITION): a REUSED conversation can hold an older nonce-bearing verdict
+  // ABOVE our freshly-submitted prompt while our answer is still generating. extractReview()
+  // takes the LAST verdict, which here is the OLD one — convicting on it would blacklist and
+  // forget the genuine LIVE conversation. Order decides: foreign verdict BEFORE our marker.
+  const scrollback = [
+    '[P1] old/thing.ts:1 — a previous round in this same chat',
+    'P2: none',
+    'P3: none',
+    'VERDICT: FIX-FIRST — earlier round. (run marker: pg-run-old-round-1111111111-1)',
+    '',
+    `run marker: ${MARKER}`,                 // OUR prompt comes AFTER the old verdict
+    'thinking about the new diff...',
+  ].join('\n');
+  const cdp = await mockCdp(scrollback);
+  const r = await runSalvage([MARKER, '12'], cdp.port);
+  // cdp-salvage owns TAB OWNERSHIP, the engine owns nonce validation: the old verdict is
+  // returned (exit 0) and the ENGINE's nonce check then sets it aside as unbound-AMBIGUOUS,
+  // the retryable state. What must NOT happen here is a conviction — blacklisting/forgetting
+  // the live conversation — or a crossbound sidecar, which would mark it terminally stuck.
+  check('an OLDER verdict above our prompt is returned for engine adjudication', r.status === 0,
+    `status=${r.status} stderr=${r.stderr?.slice(-400)}`);
+  check('the live conversation is not convicted', !/ANOTHER run's completed answer/.test(r.stderr ?? ''),
+    `stderr=${r.stderr?.slice(-400)}`);
+  check('no crossbound sidecar is written for scrollback', (r.crossbound ?? 0) === 0,
+    `crossbound=${r.crossbound}`);
+  cdp.stop();
+}
+
+{ // A convicted cross-bind records a sidecar so --status can distinguish terminally-stuck
+  // from merely-ambiguous (#68 gate P2).
+  const cdp = await mockCdp('__NO_TABS__', [], { renderText: () => FOREIGN_ANSWER(MARKER) });
+  const r = await runSalvage([MARKER, '30'], cdp.port, seedMemo(MARKER, 'https://chatgpt.com/c/crossbound2'));
+  check('a conviction is recorded in crossbound/<marker>', (r.crossbound ?? 0) > 0,
+    `crossbound=${r.crossbound} stderr=${r.stderr?.slice(-300)}`);
+  cdp.stop();
+}
+
+{ // #68 gate r2 P1: ownership comes from the VERDICT LINE ONLY. A genuine nonce-less answer
+  // whose FINDINGS quote another run's marker (routine in this repo — reviews cite incident
+  // markers verbatim) must NOT be convicted as cross-bound.
+  const quotesAMarker = [
+    `run marker: ${MARKER}`,
+    '',
+    '[P1] bin/x.mjs:10 — the pushbot#1334 incident (pg-run-StartupBros-com-pushbot-1334-1785810900-1553112) shows this',
+    'P2: none',
+    'P3: none',
+    'VERDICT: FIX-FIRST — a real review that merely quotes a marker.',
+  ].join('\n');
+  const cdp = await mockCdp(quotesAMarker);
+  const r = await runSalvage([MARKER, '15'], cdp.port);
+  check('a finding QUOTING a foreign marker is not a cross-bind', (r.crossbound ?? 0) === 0,
+    `crossbound=${r.crossbound} stderr=${r.stderr?.slice(-400)}`);
+  check('the quoting review is returned, not convicted', r.status === 0,
+    `status=${r.status} stderr=${r.stderr?.slice(-400)}`);
+  cdp.stop();
+}
+
+{ // #68 gate r2 P2: a conviction is per-CANDIDATE. If another tab turns out to be genuinely
+  // ours, the marker must not stay flagged terminally cross-bound.
+  const foreignTab = { id: 'foreign1', url: 'https://chatgpt.com/c/foreign-one' };
+  const ours = [
+    `run marker: ${MARKER}`,
+    '[P1] lib/y.sh:2 — ours',
+    'P2: none',
+    'P3: none',
+    `VERDICT: SHIP — ours. (run marker: ${MARKER})`,
+  ].join('\n');
+  // The listed conversation tab is ours; an additional tab holds another run's answer.
+  const cdp = await mockCdp(ours, [foreignTab]);
+  const r = await runSalvage([MARKER, '15'], cdp.port);
+  check('proving ownership clears any per-candidate conviction', (r.crossbound ?? 0) === 0,
+    `crossbound=${r.crossbound} stderr=${r.stderr?.slice(-400)}`);
+  check('our review is still returned alongside a foreign tab', r.status === 0, `status=${r.status}`);
+  cdp.stop();
+}
+
+{ // #68 gate r3 P2: terminal cross-bound state must be ORDER-INDEPENDENT. Give each tab a
+  // DIFFERENT body — one cross-bound, one genuinely ours — and assert the verdict is the same
+  // whichever the scan happens to classify first. Writing mid-scan made this depend on /json
+  // order, so a live review could be labelled STUCK purely by tab ordering.
+  const oursBody = [
+    `run marker: ${MARKER}`,
+    '[P1] lib/z.sh:1 — ours',
+    'P2: none',
+    'P3: none',
+    `VERDICT: SHIP — ours. (run marker: ${MARKER})`,
+  ].join('\n');
+  for (const foreignFirst of [true, false]) {
+    // tab1 (listed first) carries one body; the extra tab carries the other. Swapping which
+    // is which flips scan order without changing anything else.
+    const first = foreignFirst ? FOREIGN_ANSWER(MARKER) : oursBody;
+    const second = foreignFirst ? oursBody : FOREIGN_ANSWER(MARKER);
+    const cdp = await mockCdp(first, [{ id: 't-second', url: 'https://chatgpt.com/c/tab-second' }],
+      { tabText: () => second });
+    const r = await runSalvage([MARKER, '15'], cdp.port);
+    check(`cross-bound state is order-independent (foreignFirst=${foreignFirst}): not stuck`,
+      (r.crossbound ?? 0) === 0, `crossbound=${r.crossbound} status=${r.status} stderr=${r.stderr?.slice(-300)}`);
+    check(`our review is found regardless of order (foreignFirst=${foreignFirst})`,
+      r.status === 0, `status=${r.status} stderr=${r.stderr?.slice(-300)}`);
+    cdp.stop();
+  }
 }
 
 { // gate round-2 P1: one EARLY successful listing must not mask a later CDP outage. Scan once

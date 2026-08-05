@@ -612,7 +612,7 @@ pg_reservation_remove() { # marker
 # the miss limit is reached (reservation removed) or "retained miss/limit" otherwise. Shared by
 # reconciliation and the harvest not-found path so both apply the same fail-closed policy.
 pg_reservation_note_miss() {
-  local marker="$1" dir f pr out created misses slot model miss_limit
+  local marker="$1" dir f pr out created misses slot model spend miss_limit
   miss_limit="${PRO_GATE_RESERVATION_MISSES:-3}"
   case "$miss_limit" in ''|*[!0-9]*) miss_limit=3;; esac
   [ "$miss_limit" -ge 2 ] 2>/dev/null || miss_limit=2
@@ -620,7 +620,17 @@ pg_reservation_note_miss() {
   dir="$(pg_reservation_dir)"; f="$dir/$marker"
   pg_reservation_guard_acquire || { echo "retained 0/$miss_limit"; return 0; }
   if [ ! -f "$f" ]; then pg_reservation_guard_release; echo released; return 0; fi
-  { IFS=$'\t' read -r pr out created misses slot model < "$f"; } 2>/dev/null
+  # Per-field awk, and ALL SEVEN fields (#68 gate P1): `read` collapses consecutive tabs, and
+  # a 6-field rewrite silently erased the v0.31 spend epoch on the first confirmed miss —
+  # which then forced a later harvest onto the marker-time fallback and corrupted round
+  # ordering. Every reservation mutation must round-trip the whole record.
+  pr="$(awk -F'\t' 'NR==1{print $1}' "$f" 2>/dev/null)"
+  out="$(awk -F'\t' 'NR==1{print $2}' "$f" 2>/dev/null)"
+  created="$(awk -F'\t' 'NR==1{print $3}' "$f" 2>/dev/null)"
+  misses="$(awk -F'\t' 'NR==1{print $4}' "$f" 2>/dev/null)"
+  slot="$(awk -F'\t' 'NR==1{print $5}' "$f" 2>/dev/null)"
+  model="$(awk -F'\t' 'NR==1{print $6}' "$f" 2>/dev/null)"
+  spend="$(awk -F'\t' 'NR==1{print $7}' "$f" 2>/dev/null)"
   case "$misses" in ''|*[!0-9]*) misses=0;; esac
   misses=$(( misses + 1 ))
   if [ "$misses" -ge "$miss_limit" ]; then
@@ -628,7 +638,7 @@ pg_reservation_note_miss() {
     pg_reservation_guard_release
     echo released
   else
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "${pr:-diff}" "${out:-}" "${created:-0}" "$misses" "${slot:-}" "${model:-}" > "$f.tmp" 2>/dev/null \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${pr:-diff}" "${out:-}" "${created:-0}" "$misses" "${slot:-}" "${model:-}" "${spend:-}" > "$f.tmp" 2>/dev/null \
       && mv -f "$f.tmp" "$f"
     pg_reservation_guard_release
     echo "retained $misses/$miss_limit"
@@ -680,12 +690,68 @@ pg_reservation_slot_plan() {
   printf '%s|%s\n' "$r" "${excl# }"
 }
 
+# pg_reservation_expire_if_stale <marker>: release THIS marker's reservation when it is past
+# TTL. The collector calls it AFTER its capture, while still holding the marker's harvest lock
+# (#68 gate r3 P1) — reconcilers skip claimed markers, so without this the harvest target could
+# never expire and #67's self-clearing property was defeated for the one marker that needed it.
+# Caller MUST only invoke this on outcomes that did NOT positively prove the review is live.
+# Echoes "expired" when released, nothing otherwise.
+pg_reservation_expire_if_stale() {
+  local marker="$1" f created ttl now
+  pg_reservation_marker_ok "$marker" || return 0
+  f="$(pg_reservation_dir)/$marker"
+  [ -f "$f" ] || return 0
+  created="$(awk -F'\t' 'NR==1{print $3}' "$f" 2>/dev/null)"
+  case "$created" in ''|*[!0-9]*) return 0;; esac
+  ttl="${PRO_GATE_RESERVATION_TTL:-21600}"; case "$ttl" in ''|*[!0-9]*) ttl=21600;; esac
+  now="$(date +%s)"
+  [ $(( now - created )) -ge "$ttl" ] || return 0
+  pg_reservation_remove "$marker"
+  echo expired
+}
+
+# pg_harvest_claimed <marker>: 0 when some process is COLLECTING this marker right now, i.e.
+# holds its harvest lock (#68 gate r2 P1). Every reconciler consults this before reaping, so a
+# reservation cannot be removed out from under an in-flight collection by ANY process — the
+# collector's own sweep, a concurrent harvest, or a fresh dispatch. Non-blocking probe: we test
+# whether the lock is takeable and immediately release, never queueing behind the holder.
+# A stale lock FILE with no holder reads as unclaimed (flock is inode-scoped, not path-scoped),
+# which is what the housekeeping sweep of harvest-locks/ already relies on.
+pg_harvest_claimed() {
+  local marker="$1" f pfd rc=1
+  pg_reservation_marker_ok "$marker" || return 1
+  f="${PRO_GATE_HARVEST_LOCK_DIR:-$PRO_GATE_HOME/harvest-locks}/$marker"
+  if pg_have flock; then
+    [ -f "$f" ] || return 1
+    if { exec {pfd}>>"$f"; } 2>/dev/null; then
+      flock -n "$pfd" 2>/dev/null || rc=0     # could NOT take it => someone holds it
+      eval "exec ${pfd}>&-" 2>/dev/null
+    fi
+    return "$rc"
+  fi
+  # mkdir-lock platforms (stock macOS): the directory exists only while held. Owner metadata
+  # must PROVE a live holder (#68 gate r3 P2) — a crash between mkdir and the pid write, or a
+  # recycled pid, would otherwise mark the reservation claimed forever and freeze reconciliation
+  # (pg_lock cannot reap an empty-pid directory either). Require a live pid AND, when the lock
+  # recorded a process-identity token, a matching one.
+  [ -d "$f.d" ] || return 1
+  local opid otok
+  opid="$(cat "$f.d/pid" 2>/dev/null || true)"
+  case "$opid" in ''|*[!0-9]*) return 1;; esac        # torn/missing owner record: not a claim
+  kill -0 "$opid" 2>/dev/null || return 1             # dead holder: stale directory
+  otok="$(cat "$f.d/token" 2>/dev/null || true)"
+  if [ -n "$otok" ] && [ "$otok" != "$(pg_pid_token "$opid" 2>/dev/null)" ]; then
+    return 1                                          # pid reused by an unrelated process
+  fi
+  return 0
+}
+
 # pg_reservation_reconcile <salvage-script> <port>: drop reservations older than TTL or only
 # after N consecutive confirmed-absent probes. A single 10s miss is NOT proof of loss: suspended
 # renderers, hydration delays, and temporary marker-read failures caused false releases in review.
 # Live (0) resets misses; throttle (5) and other errors keep state fail-closed.
 pg_reservation_reconcile() {
-  local salvage="$1" port="$2" dir ttl miss_limit interval now f marker pr out created misses slot model age mt rc
+  local salvage="$1" port="$2" dir ttl miss_limit interval now f marker pr out created misses slot model spend age mt rc
   dir="$(pg_reservation_dir)"; [ -d "$dir" ] || return 0
   ttl="${PRO_GATE_RESERVATION_TTL:-21600}"; miss_limit="${PRO_GATE_RESERVATION_MISSES:-3}"
   interval="${PRO_GATE_RECONCILE_INTERVAL:-60}"; now="$(date +%s)"
@@ -694,7 +760,24 @@ pg_reservation_reconcile() {
   for f in "$dir"/*; do
     [ -f "$f" ] || continue; marker="$(basename "$f")"
     pg_reservation_marker_ok "$marker" || continue
-    { IFS=$'\t' read -r pr out created misses slot model < "$f"; } 2>/dev/null || created=0
+    # Never reap a marker that is being COLLECTED RIGHT NOW (#68 gate P1, r2 P1). Removing it
+    # mid-harvest lets a concurrent same-change run submit a duplicate, and a still-generating
+    # result would then recreate the record from scratch — fresh `created` (defeating TTL
+    # self-clear) under a fallback "diff" key (defeating same-change redirection). The harvest
+    # LOCK FILE is that claim, so this holds for EVERY reconciler (fresh dispatch and other
+    # harvests), not just the collecting process: a per-invocation skip variable would only
+    # have protected the one sweep that already knew.
+    if pg_harvest_claimed "$marker"; then continue; fi
+    # awk per field, NOT `read`: tab is IFS-whitespace, so consecutive tabs from an empty
+    # slot/model collapse and shift every later field (the trap pg_reservation_read_model
+    # documents). That would silently drop the v0.31 spend epoch on the rewrite below.
+    pr="$(awk -F'\t' 'NR==1{print $1}' "$f" 2>/dev/null)"
+    out="$(awk -F'\t' 'NR==1{print $2}' "$f" 2>/dev/null)"
+    created="$(awk -F'\t' 'NR==1{print $3}' "$f" 2>/dev/null)"
+    misses="$(awk -F'\t' 'NR==1{print $4}' "$f" 2>/dev/null)"
+    slot="$(awk -F'\t' 'NR==1{print $5}' "$f" 2>/dev/null)"
+    model="$(awk -F'\t' 'NR==1{print $6}' "$f" 2>/dev/null)"
+    spend="$(awk -F'\t' 'NR==1{print $7}' "$f" 2>/dev/null)"
     case "$created" in ''|*[!0-9]*) created=0;; esac
     case "$misses" in ''|*[!0-9]*) misses=0;; esac
     age=$(( now - created ))
@@ -702,6 +785,10 @@ pg_reservation_reconcile() {
       echo "[pro-gate] releasing expired in-progress reservation $marker (${age}s >= ${ttl}s TTL)" >&2
       pg_reservation_remove "$marker"; continue
     fi
+    # TTL-only mode (#67): the harvest path sweeps expiry without probing. A probe there would
+    # cost a page render per harvest and could only duplicate the evidence the caller's own
+    # capture is about to produce; misses stay the fresh-dispatch path's business.
+    [ "${PG_RES_TTL_ONLY:-0}" = 1 ] && continue
     # Rate-limit probes per marker by file mtime: N concurrent fresh runs must not turn one
     # real absence window into N miss increments, and back-to-back reconciles should not spam
     # conversation probes. Writes/updates touch mtime, so consecutive misses are spaced by at
@@ -716,7 +803,7 @@ pg_reservation_reconcile() {
           # The harvest may have removed the file during the probe; rewriting would resurrect a
           # released reservation and block capacity until TTL, so re-check under the guard.
           if [ -f "$f" ]; then
-            printf '%s\t%s\t%s\t0\t%s\t%s\n' "$pr" "$out" "$created" "${slot:-}" "${model:-}" > "$f.tmp" 2>/dev/null && mv -f "$f.tmp" "$f"
+            printf '%s\t%s\t%s\t0\t%s\t%s\t%s\n' "$pr" "$out" "$created" "${slot:-}" "${model:-}" "${spend:-}" > "$f.tmp" 2>/dev/null && mv -f "$f.tmp" "$f"
           fi
           pg_reservation_guard_release
         }

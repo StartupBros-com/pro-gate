@@ -107,6 +107,62 @@ function recallUrl(m) {
   } catch { return null; }
 }
 
+// #67: drop a memo proven to point at another run's conversation. CLAIM-and-verify, not
+// compare-then-delete (#68 gate P1): read-then-unlink leaves a window in which a concurrent
+// probe republishes the GENUINE url and this process deletes it, destroying the only
+// server-side recovery handle. Rename the memo aside first (atomic), inspect the bytes we
+// actually hold, and restore via link() — which fails atomically if a new memo already
+// exists — when they name a different conversation. Mirrors the shell's pg_provenance_reject.
+// Returns the SURVIVING memo url when a concurrent writer had already republished a different
+// (potentially genuine) conversation, else null. The caller must keep using that url rather
+// than declaring absence (#68 gate r3 P1): restoring the file but then clearing knownUrl left
+// this invocation blind to a recovery handle that exists on disk, and its exit 4 could supply
+// the final miss that retires the reservation.
+function forgetUrl(m, url) {
+  const f = memoPath(m);
+  if (!f) return null;
+  const claim = `${f}.rej.${process.pid}`;
+  try { fs.renameSync(f, claim); } catch { return null; }   // nothing to claim: someone else won
+  let held = '';
+  try { held = fs.readFileSync(claim, 'utf8').trim(); } catch {}
+  let survivor = null;
+  if (held && held !== url) {
+    try { fs.linkSync(claim, f); survivor = held; } catch {}  // genuine memo republished: put it back
+  }
+  try { fs.unlinkSync(claim); } catch {}
+  return survivor;
+}
+
+// #68 gate P2: record that THIS marker was positively convicted of a cross-bind (its page held
+// another run's completed answer BELOW our prompt). Only that state is terminally stuck; an
+// ordinary nonce-less .unbound capture may still be an older answer while ours generates, and
+// is genuinely retryable. The engine's --status reads this sidecar to tell them apart.
+// Record a per-candidate conviction. Persisted only by flushCrossBind() at exit.
+function noteCrossBind(_m, url, foreign) { crossBindHits.set(url, foreign); }
+
+// Persist terminal cross-bound state ONLY when the completed scan found no candidate we could
+// prove is ours. Order-independent by construction: every candidate has been classified by the
+// time this runs.
+function flushCrossBind(m) {
+  const dir = path.join(PG_HOME, 'crossbound');
+  const f = path.join(dir, m);
+  if (ownershipProven || crossBindHits.size === 0) {
+    try { fs.unlinkSync(f); } catch {}
+    return;
+  }
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const ts = new Date().toISOString();
+    const body = [...crossBindHits].map(([u, fm]) => `${ts}\t${u}\t${fm}\n`).join('');
+    fs.writeFileSync(f, body);
+  } catch {}
+}
+
+
+// One hook rather than seven call sites: every exit path (0/3/4/5/7, probe, close, sweep)
+// persists the scan's verdict exactly once, so no future exit can forget to.
+process.on('exit', () => { if (!probe) flushCrossBind(marker); });
+
 function rememberUrl(m, url) {
   const f = memoPath(m);
   if (!f || !/^https:\/\/chatgpt\.com\/c\//.test(url || '')) return;
@@ -247,6 +303,12 @@ let seededRenders = 0;
 // exhaust its render budget, and still report "gone".
 let seededLiveUrl = null;
 let memoStale = false;       // the remembered URL decisively carries ANOTHER run's conversation
+// #68 gate r3 P2: cross-bind convictions are ACCUMULATED per candidate URL and only persisted
+// at exit, when the whole scan is known. Writing mid-scan made the terminal "cross-bound"
+// state depend on /json tab ORDER — a foreign tab seen after a genuine one would re-flag a
+// live review as stuck and have --status advise deleting its reservation.
+const crossBindHits = new Map();   // url -> foreign marker
+let ownershipProven = false;       // any candidate positively proved ours this invocation
 if (knownUrl) ourUrls.add(knownUrl);
 
 // Persistent blacklist: conversations proven (by a foreign run marker) to belong to another
@@ -357,12 +419,51 @@ function extractReview(text) {
   return lines.slice(start, verdictIdx + 1).join('\n').trim();
 }
 
+// #67: a page carrying a COMPLETED answer whose verdict echoes a DIFFERENT run's marker is
+// that run's conversation, full stop — even though our own marker also appears on the page,
+// because the marker rides the submitted PROMPT and a mis-navigated render can show ours
+// above someone else's answer. Two live incidents (pro-gate#66 <- pushbot#1336,
+// pushbot#1334 <- pushbot#1323) memoized exactly such a page as "ours" and, because a
+// remembered URL is exempt from blacklisting, poisoned that marker's memo permanently.
+// Returns the foreign marker when the ANSWER is provably another run's, else null.
+function foreignAnswerMarker(text) {
+  const review = extractReview(text);
+  if (!review) return null;                       // no completed answer here: decides nothing
+  // ONLY the terminal VERDICT line carries ownership (#68 gate r2 P1). Scanning the last six
+  // lines convicts a genuine nonce-less answer whose FINDINGS merely mention another marker —
+  // routine in this repo, whose reviews quote incident markers verbatim. A verdict line with
+  // no marker at all is ambiguous, not foreign: return null and let the engine's nonce check
+  // file it as retryable.
+  const lines = review.split('\n');
+  let verdictLine = '';
+  for (let i = lines.length - 1; i >= 0; i--) if (VERDICT_RE.test(lines[i])) { verdictLine = lines[i]; break; }
+  if (!verdictLine) return null;
+  if (verdictLine.includes(`(run marker: ${marker})`)) return null;   // ours, positively
+  const m = verdictLine.match(/\(run marker:\s*(pg-run-[A-Za-z0-9.-]+)\s*\)/);
+  if (!m || m[1] === marker) return null;
+  // POSITION MATTERS (#68 gate P1). A reused conversation can hold an OLDER nonce-bearing
+  // verdict ABOVE our freshly-submitted prompt while our answer is still generating.
+  // extractReview() takes the LAST verdict in the page, which in that layout is the old one —
+  // convicting on it would blacklist and forget the genuine LIVE conversation and let a probe
+  // count misses toward a duplicate spend. Only convict when the foreign verdict comes AFTER
+  // the last occurrence of our marker, i.e. it is the answer to our prompt rather than
+  // scrollback above it.
+  const lastMarkerAt = text.lastIndexOf(marker);
+  const foreignAt = text.lastIndexOf(m[0]);
+  if (lastMarkerAt >= 0 && foreignAt >= 0 && foreignAt < lastMarkerAt) return null;
+  return m[1];
+}
+
 // One place where a marker-matched page turns into an outcome, so the live-tab scan, the
 // dead-tab re-render and the remembered-URL recovery all behave identically — including
 // remembering the URL, which is what lets a LATER invocation find this conversation after its
 // tab is gone. Deliberately does NOT close the tab: see the close note at the bottom.
 async function onOurConversation(url, text) {
   ourUrls.add(url);
+  // Positive ownership: the run is demonstrably NOT terminally cross-bound, whatever other
+  // candidates this scan rejected (#68 gate r2/r3 P2). Decided at exit, so tab order is
+  // irrelevant.
+  ownershipProven = true;
   rememberUrl(marker, url);
   knownUrl = url;                // usable by the recovery branch from the very next cycle
   if (probe) { console.error(`live conversation: ${url}`); process.exit(0); }
@@ -426,6 +527,17 @@ while (Date.now() < deadline) {
       if (tab.url === knownUrl && FOREIGN_MARKER_RE.test(text)) memoStale = true;
       continue;
     }
+    // #67: our marker is present, but if the page's completed ANSWER belongs to another run,
+    // the page is theirs — never memoize it as ours (that is the cross-bind that stranded
+    // pro-gate#66 and pushbot#1334). Blacklist it so later passes stop re-reading it.
+    const fa = foreignAnswerMarker(text);
+    if (fa) {
+      if (tab.url === knownUrl) { ourUrls.delete(tab.url); const surv = forgetUrl(marker, tab.url); knownUrl = surv; memoStale = !surv; }
+      blacklist(tab.url);
+      noteCrossBind(marker, tab.url, fa);
+      console.error(`tab ${tab.url} carries our marker but ANOTHER run's completed answer (${fa}) — not ours; ignoring it`);
+      continue;
+    }
     stillGeneratingUrl = await onOurConversation(tab.url, text);
     lastMatchWasSeeded = false;
     console.error(`conversation found (${tab.url}) but no VERDICT yet; waiting...`);
@@ -467,6 +579,16 @@ while (Date.now() < deadline) {
       }
       continue;
     }
+    // #67: same ownership test as the live-tab scan — our marker on the page is not proof the
+    // ANSWER is ours.
+    const faRender = foreignAnswerMarker(text);
+    if (faRender) {
+      if (tab.url === knownUrl) { ourUrls.delete(tab.url); const surv = forgetUrl(marker, tab.url); knownUrl = surv; memoStale = !surv; }
+      blacklist(tab.url);
+      noteCrossBind(marker, tab.url, faRender);
+      console.error(`re-rendered ${tab.url} carries our marker but ANOTHER run's completed answer (${faRender}) — not ours; ignoring it`);
+      continue;
+    }
     stillGeneratingUrl = await onOurConversation(tab.url, text);
     lastMatchWasSeeded = false;
     // A fresh render is a real page load against ChatGPT, so a match here is SERVER-SIDE
@@ -493,7 +615,24 @@ while (Date.now() < deadline) {
     const { text } = await freshRenderText(seedUrl, port, deadline);
     if (text) {
       if (isThrottlePage(text)) tripThrottle(`remembered render ${seedUrl}`);
-      if (text.includes(marker)) {
+      const faSeed = text.includes(marker) ? foreignAnswerMarker(text) : null;
+      if (faSeed) {
+        // #67: the memo itself is cross-bound — it points at a conversation whose completed
+        // answer belongs to another run, while carrying our marker in its prompt text. This is
+        // exactly what stranded pro-gate#66 and pushbot#1334: without this branch the memo is
+        // re-rendered, re-matched and re-memoized forever, and every harvest re-rejects the
+        // same foreign answer while the reservation never retires.
+        ourUrls.delete(seedUrl);      // release the blacklist exemption a remembered URL holds
+        // Evict, but KEEP a concurrently republished different memo as the live handle: it may
+        // be the genuine conversation, and blinding ourselves to it can turn this pass into the
+        // miss that retires a valid reservation (#68 gate r3 P1).
+        const survivor = forgetUrl(marker, seedUrl);
+        blacklist(seedUrl);
+        knownUrl = survivor;
+        memoStale = !survivor;
+        noteCrossBind(marker, seedUrl, faSeed);
+        console.error(`remembered conversation ${seedUrl} carries ANOTHER run's completed answer (${faSeed}) — cross-bound memo, discarding it`);
+      } else if (text.includes(marker)) {
         stillGeneratingUrl = await onOurConversation(seedUrl, text);
         lastMatchWasSeeded = true;
         seededLiveUrl = seedUrl;   // survives later empty scans: this is server-side evidence

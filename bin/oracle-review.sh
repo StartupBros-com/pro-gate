@@ -207,15 +207,33 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
       r_url=""; [ -f "$ST_URLS_DIR/$m" ] && r_url="$(head -c 300 "$ST_URLS_DIR/$m" 2>/dev/null | tr -d '\n')"
       [ -n "$r_out" ] || r_out="${TMPDIR:-/tmp}/pro-gate-${r_pr:-review}.md"
       r_cmd="$ST_ENGINE --harvest '$m' --out '$r_out' --timeout 20m"
-      [ -n "$ST_HINT" ] || ST_HINT="in-progress reservation found — collect it for FREE: $r_cmd"
+      # #67/#68: distinguish three states, not two. A set-aside <out>.unbound.* capture alone
+      # is AMBIGUOUS — strict nonce mode deliberately produces one when an older completed
+      # answer is visible while OUR answer may still be generating, and that case IS
+      # retryable. Only a positively convicted cross-bind (cdp-salvage saw another run's
+      # completed answer BELOW our prompt and recorded it in crossbound/<marker>) is
+      # terminally stuck. Reporting every .unbound as STUCK would tell the operator to remove
+      # a possibly-live reservation (#68 gate P2).
+      r_unbound=0
+      for _ub in "$r_out".unbound.*; do [ -e "$_ub" ] && r_unbound=$(( r_unbound + 1 )); done
+      r_crossbound=0
+      [ -s "$PRO_GATE_HOME/crossbound/$m" ] && r_crossbound="$(grep -c . "$PRO_GATE_HOME/crossbound/$m" 2>/dev/null || echo 1)"
+      if [ "$r_crossbound" -gt 0 ] 2>/dev/null; then
+        ST_HINT="STUCK (cross-bound): the conversation remembered for $m carries ANOTHER run's completed answer — see $PRO_GATE_HOME/crossbound/$m. Retrying --harvest cannot bind it. Engine >=v0.31.1 discards the bad memo and expires the reservation at the ${ST_RES_TTL}s TTL; to free the change now, remove $(pg_reservation_dir)/$m. Do NOT set PRO_GATE_REQUIRE_NONCE=0 — that would accept the other run's review."
+      elif [ "$r_unbound" -gt 0 ]; then
+        ST_HINT="AMBIGUOUS: ${r_unbound} harvested capture(s) for $m completed but carried no run-marker echo (see ${r_out}.unbound.*). This is retryable — it may be an older answer while yours still generates. Retry the FREE harvest: $r_cmd"
+      else
+        [ -n "$ST_HINT" ] || ST_HINT="in-progress reservation found — collect it for FREE: $r_cmd"
+      fi
       if pg_have jq; then
         jq -nc --arg marker "$m" --arg pr "${r_pr:-}" --arg out "$r_out" \
           --arg age "${r_age:-}" --arg miss "${r_miss:-}" --arg model "${r_model:-}" \
-          --arg url "$r_url" --arg harvest_cmd "$r_cmd" \
-          '{marker:$marker,pr:$pr,out:$out,age_secs:(($age|tonumber?)//null),miss_streak:(($miss|tonumber?)//null),model:$model,conversation_url:$url,harvest_cmd:$harvest_cmd}' \
+          --arg url "$r_url" --arg harvest_cmd "$r_cmd" --argjson unbound "$r_unbound" \
+          --argjson crossbound "$r_crossbound" \
+          '{marker:$marker,pr:$pr,out:$out,age_secs:(($age|tonumber?)//null),miss_streak:(($miss|tonumber?)//null),model:$model,conversation_url:$url,harvest_cmd:$harvest_cmd,unbound_captures:$unbound,crossbound_hits:$crossbound,state:(if $crossbound > 0 then "cross-bound" elif $unbound > 0 then "unbindable-ambiguous" else "generating-or-recoverable" end)}' \
           >> "$ST_TMP/res.jsonl" 2>/dev/null
       else
-        printf '%s\t%s\t%s\t%s\t%s\n' "$m" "${r_pr:-?}" "${r_age:-?}" "${r_miss:-?}" "$r_cmd" >> "$ST_TMP/res.tsv"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$m" "${r_pr:-?}" "${r_age:-?}" "${r_miss:-?}" "$r_unbound" "$r_crossbound" "$r_cmd" >> "$ST_TMP/res.tsv"
       fi
     done
   fi
@@ -444,9 +462,11 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
   if [ -s "$ST_TMP/res.jsonl" ] || [ -s "$ST_TMP/res.tsv" ]; then
     echo "in-progress reservations (harvest these for FREE — never re-run):"
     if pg_have jq && [ -s "$ST_TMP/res.jsonl" ]; then
-      jq -r '"  " + .marker + "  pr=" + .pr + (if .age_secs then "  age=\(.age_secs / 60 | floor)m" else "" end) + (if .conversation_url != "" then "  url=remembered" else "" end) + "\n    harvest: " + .harvest_cmd' "$ST_TMP/res.jsonl"
+      jq -r '"  " + .marker + "  pr=" + .pr + (if .age_secs then "  age=\(.age_secs / 60 | floor)m" else "" end) + (if .conversation_url != "" then "  url=remembered" else "" end)
+             + (if .crossbound_hits > 0 then "  [STUCK: cross-bound to another run - retrying cannot bind it]" else (if .unbound_captures > 0 then "  [\(.unbound_captures) unbindable capture(s) - ambiguous, still retryable]" else "" end) end)
+             + "\n    harvest: " + .harvest_cmd' "$ST_TMP/res.jsonl"
     else
-      awk -F'\t' '{printf "  %s  pr=%s  age=%ss  miss=%s\n    harvest: %s\n", $1, $2, $3, $4, $5}' "$ST_TMP/res.tsv" 2>/dev/null
+      awk -F'\t' '{printf "  %s  pr=%s  age=%ss  miss=%s%s\n    harvest: %s\n", $1, $2, $3, $4, ($6 > 0 ? "  [STUCK: cross-bound to another run]" : ($5 > 0 ? "  [" $5 " unbindable capture(s) — ambiguous, retryable]" : "")), $7}' "$ST_TMP/res.tsv" 2>/dev/null
     fi
   else
     echo "in-progress reservations: none"
@@ -952,6 +972,13 @@ if [ -n "$HARVEST_MARKER" ]; then
     pg_status failed "harvest unsupported in native browser mode"
     pg_finish 3
   fi
+  # #67: TTL must be reachable from the harvest path. pg_reservation_reconcile used to run ONLY
+  # in fresh dispatch, so the documented free-recovery flow ("just --harvest") could never
+  # retire a reservation — and a fresh run is redirected to that reservation before it can
+  # submit, so both exits were closed and a stranded change stayed stranded (pushbot#1334 lost
+  # its review that way). TTL-only here: no probe, no miss increment, so a harvest of a
+  # genuinely-live conversation is untouched, and the caller's own capture below is the real
+  # evidence. PRO_GATE_HARVEST_TTL_SWEEP=0 opts out.
   # ledger/status identity from the marker's "pg-run-<key>-<epoch>-<pid>" shape (best-effort;
   # the key may itself contain dashes, so strip the two trailing numeric segments instead).
   # v0.27: the stripped key lands as round_key so --status can join harvest rows to their
@@ -971,6 +998,17 @@ if [ -n "$HARVEST_MARKER" ]; then
     echo "ERROR: another harvest is already collecting marker ${RUN_MARKER}; not racing it." >&2
     pg_status failed "harvest already running"
     pg_finish 7
+  fi
+  # #67: TTL must be reachable from the harvest path. pg_reservation_reconcile used to run ONLY
+  # in fresh dispatch, so the documented free-recovery flow ("just --harvest") could never
+  # retire a reservation — and a fresh run is redirected to that reservation before it can
+  # submit, so both exits were closed and a stranded change stayed stranded (pushbot#1334 lost
+  # its review that way). Runs AFTER the harvest lock (#68 gate r2 P1): the lock file IS this
+  # marker's active-collection claim, and every reconciler skips actively-claimed markers, so
+  # no concurrent sweep can reap a reservation mid-collection either. TTL-only: no probe, no
+  # miss increment. PRO_GATE_HARVEST_TTL_SWEEP=0 opts out.
+  if [ "${PRO_GATE_HARVEST_TTL_SWEEP:-1}" = 1 ]; then
+    PG_RES_TTL_ONLY=1 pg_reservation_reconcile "" "$PORT" || true
   fi
   # (Completed-artifact returns happen BEFORE the global preflight — see the fast path above
   # the MODE check; by this point the artifact is known absent.)
@@ -1033,6 +1071,16 @@ if [ -n "$HARVEST_MARKER" ]; then
         echo "ERROR: unbindable capture preserved, but its reservation could not be persisted ($PRO_GATE_HOME unwritable?). Tab and state KEPT; retry --harvest once the home is writable." >&2
         pg_status failed "unbindable capture; reservation write failed; state preserved"
         pg_finish 3
+      fi
+      # #68 gate r3 P1: an unbindable capture does NOT prove the review is live, so this is a
+      # legitimate moment to apply the target's own TTL — and the only one, since reconcilers
+      # skip markers under active collection. Without it the harvest target could never expire
+      # and #67's "a stranded change frees itself" property died for the very marker it was
+      # written for. Done while we still hold the harvest lock, so no peer races the decision.
+      if [ "${PRO_GATE_HARVEST_TTL_SWEEP:-1}" = 1 ] && [ -n "$(pg_reservation_expire_if_stale "$RUN_MARKER")" ]; then
+        echo "ERROR: this reservation is past its ${PRO_GATE_RESERVATION_TTL:-21600}s TTL and its conversation still cannot be bound to this run — releasing it so the change is no longer blocked. The set-aside capture is at $OUT.unbound.$$; a fresh review may now be run." >&2
+        pg_status failed "unbindable past TTL; reservation released (change unblocked)"
+        pg_finish 6
       fi
       echo "ERROR: harvested a complete review that cannot be bound to this run (no run-marker echo — possibly an older answer while the current one is still generating). Reservation and candidate kept. Retry --harvest; inspect $OUT.unbound.$$; PRO_GATE_REQUIRE_NONCE=0 accepts best-effort captures." >&2
       pg_status in-progress "harvested review unbindable (no nonce echo); reservation kept, retry"
