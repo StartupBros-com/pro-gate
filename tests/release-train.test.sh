@@ -133,4 +133,29 @@ CJK_OUT="$(ns "$CJK")"
 assert_eq "$(printf '%s' "$CJK_OUT" | python3 -c 'import sys; print(len(sys.stdin.read()))')" '180' 'multibyte bullets slice at 180 CHARACTERS'
 printf '%s' "$CJK_OUT" | python3 -c 'import sys; sys.stdin.buffer.read().decode("utf-8")' && pass 'sliced multibyte output is valid UTF-8'
 
+# ── customer-readiness gate (scripts/check-release-notes.sh) ─────────────────────────────
+# Both customer feeds derive from the release body, so a missing/lazy Highlights section
+# ships developer shorthand to House of Vibe customers. v0.31.0 and v0.31.1 announced
+# "governor-rounds" and "memo-crossbind" exactly this way; these cases lock that out.
+CHK="$ROOT/scripts/check-release-notes.sh"
+chk() { printf '%s' "$1" | bash "$CHK" - >/dev/null 2>&1; }
+
+# The REAL v0.31.0 body that shipped: the regression this gate exists for.
+SHIPPED=$'## What\'s Changed\n* governor-rounds by @StartupBros in https://github.com/StartupBros-com/pro-gate/pull/66\n\n**Full Changelog**: https://x/y'
+chk "$SHIPPED" && fail 'the shipped v0.31.0 body must be rejected' || pass 'the auto-generated body that shipped is rejected'
+
+GOOD=$'## Highlights\n\n- Reviews that keep making progress now earn extra rounds automatically, instead of stopping at a flat limit.\n- Reviews going in circles stop early rather than burning your remaining quota.\n\n## Upgrade\n\nNothing to do.'
+chk "$GOOD" && pass 'well-written customer notes pass' || fail 'good notes were rejected'
+
+chk $'## Highlights\n\n## Upgrade\n\nNothing.' && fail 'empty Highlights must be rejected' || pass 'an empty Highlights section is rejected'
+chk $'## Highlights\n\n- feat(pro-gate): trajectory-aware round governor with churn brake' && fail 'raw commit subject must be rejected' || pass 'a raw conventional-commit subject is rejected'
+chk $'## Highlights\n\n- memo-crossbind' && fail 'branch name must be rejected' || pass 'a bare branch-name bullet is rejected'
+chk $'## Highlights\n\n- Fixed the stuck-review problem reported in #67 by users last week.' && fail 'issue ref must be rejected' || pass 'an issue/PR reference in Highlights is rejected'
+chk "$(printf '## Highlights\n\n- %s' "$(python3 -c "print('x' * 200)")")" && fail 'over-long bullet must be rejected' || pass 'a bullet past the 180-char feed limit is rejected'
+chk $'## Highlights\n\n- Faster now.' && fail 'stub bullet must be rejected' || pass 'a too-short stub bullet is rejected'
+
+# The gate must agree with the announcer: what passes the check is what customers receive.
+assert_eq "$(ns "$GOOD")" $'Reviews that keep making progress now earn extra rounds automatically, instead of stopping at a flat limit.\nReviews going in circles stop early rather than burning your remaining quota.' \
+  'notes that pass the gate produce exactly those announcement bullets'
+
 echo 'ALL PASS'

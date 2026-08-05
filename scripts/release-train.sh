@@ -82,6 +82,32 @@ announce() {
     "$ANNOUNCE_URL"
 }
 
+# Post the same release to the House of Vibe Discord tool-drops channel. Optional by design:
+# DISCORD_WEBHOOK_URL unset simply skips it, so forks and older repo configs keep working.
+# Deliberately NOT `|| true` on the send itself (the fleet-alerting convention): a configured
+# webhook that fails is a real delivery failure and must surface, not vanish. It runs AFTER
+# the members-site announce so the site of record is never blocked by a chat outage.
+announce_discord() {
+  [[ -n "${DISCORD_WEBHOOK_URL:-}" ]] || return 0
+  local summary body payload
+  summary="$(notes_summary)"
+  # Bullets for humans reading a chat feed; the release URL carries the full detail.
+  if [[ -n "$summary" ]]; then
+    body="$(printf '%s\n' "$summary" | sed -E 's/^/• /')"
+  else
+    body='See the release notes for details.'
+  fi
+  payload="$(jq -cn \
+    --arg name "${RELEASE_NAME:-$RELEASE_TAG}" \
+    --arg tag "$RELEASE_TAG" \
+    --arg url "$RELEASE_URL" \
+    --arg body "$body" \
+    '{username: "House of Vibe", embeds: [{title: ("pro-gate " + $tag), url: $url, description: $body, color: 5814783, footer: {text: "House of Vibe · tool drop"}}]}')"
+  curl --fail-with-body --silent --show-error \
+    -X POST -H 'content-type: application/json' \
+    --data "$payload" "$DISCORD_WEBHOOK_URL" >/dev/null
+}
+
 verify_release() {
   require SOURCE_ROOT
   require SOURCE_SHA
@@ -221,6 +247,7 @@ main() {
     if (( RELEASE_ID == current )); then
       marketplace_matches_release || fail "marketplace release $RELEASE_ID does not match the edited release tuple"
       announce
+      announce_discord
       return
     fi
     (( RELEASE_ID > current )) || fail "edited release $RELEASE_ID is older than marketplace marker $current"
@@ -229,6 +256,7 @@ main() {
 
   if promote; then
     announce
+    announce_discord
   else
     local status=$?
     [[ "$status" == 2 ]] || return "$status"

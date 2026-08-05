@@ -22,6 +22,12 @@ jobs:
           ref: ${{ github.event.release.tag_name }}
           fetch-depth: 0
           persist-credentials: false
+      # Gate the COPY before anything is promoted or announced: both customer feeds derive
+      # from this body, and a missing Highlights section silently falls back to PR titles.
+      - name: Check release notes are customer-ready
+        env:
+          RELEASE_NOTES: ${{ github.event.release.body }}
+        run: printf '%s' "$RELEASE_NOTES" | ./scripts/check-release-notes.sh -
       - name: Require release commit on protected default branch
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
@@ -85,6 +91,8 @@ jobs:
           MARKETPLACE_VALIDATION_MODE: ${{ vars.HOV_MARKETPLACE_VALIDATION_MODE || 'syntax' }}
           ANNOUNCE_URL: ${{ vars.TOOL_RELEASE_ANNOUNCE_URL }}
           ANNOUNCE_SECRET: ${{ secrets.TOOL_RELEASE_ANNOUNCE_SECRET }}
+          # Optional: unset skips the Discord post entirely (forks, older configs).
+          DISCORD_WEBHOOK_URL: ${{ secrets.TOOL_DROPS_DISCORD_WEBHOOK_URL }}
         run: |
           source_sha="$(git rev-list -n 1 "$RELEASE_TAG")"
           export SOURCE_SHA="$source_sha"
