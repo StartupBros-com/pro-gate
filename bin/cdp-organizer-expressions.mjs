@@ -12,9 +12,11 @@ function targetContext(marker, conversationUrl) {
   if (!CONVERSATION_URL_RE.test(conversationUrl ?? '')) {
     throw new TypeError('an exact ChatGPT conversation URL is required');
   }
+  const conversationPath = new URL(conversationUrl).pathname;
   return String.raw`
     const expectedMarker = ${JSON.stringify(marker)};
     const expectedUrl = ${JSON.stringify(conversationUrl)};
+    const expectedConversationPath = ${JSON.stringify(conversationPath)};
     const isRunMarkerChar = (char) => /[A-Za-z0-9.-]/.test(char ?? '');
     const lastExactMarkerAt = (text, wanted) => {
       let found = -1;
@@ -42,10 +44,11 @@ function targetContext(marker, conversationUrl) {
           break;
         }
       }
-      const foreign = verdictLine.match(/\(run marker:\s*(pg-run-[A-Za-z0-9.-]+)\s*\)/i);
-      if (foreign && foreign[1] !== expectedMarker) {
-        const foreignAt = text.lastIndexOf(foreign[0]);
-        if (foreignAt > ownMarkerAt) return 'target-cross-bound';
+      const verdictAt = verdictLine ? text.lastIndexOf(verdictLine) : -1;
+      if (verdictAt > ownMarkerAt) {
+        const answerMarker = verdictLine.match(/\(run marker:\s*(pg-run-[A-Za-z0-9.-]+)\s*\)/i)?.[1] ?? null;
+        if (!answerMarker) return 'target-answer-marker-missing';
+        if (answerMarker !== expectedMarker) return 'target-cross-bound';
       }
       return null;
     };
@@ -109,7 +112,41 @@ const interactionHelpers = String.raw`
       code: 'Escape',
       bubbles: true,
     }));
-    const findConversationMenuButton = () => {
+    const findSidebarConversationLink = () => Array.from(document.querySelectorAll('a[href]'))
+      .find((element) => {
+        const href = element.getAttribute('href') ?? '';
+        if (!href.startsWith('/c/') && !href.startsWith('https://chatgpt.com/c/')) return false;
+        try {
+          return new URL(href, location.href).pathname === expectedConversationPath;
+        } catch {
+          return false;
+        }
+      }) ?? null;
+    const findSidebarMenuButton = () => {
+      const link = findSidebarConversationLink();
+      const row = link?.closest('li') ?? link?.parentElement;
+      if (!row) return null;
+      return Array.from(row.querySelectorAll('button,[role="button"]'))
+        .find((element) => {
+          if (!(element instanceof HTMLElement) || !isVisible(element)) return false;
+          const label = labelFor(element);
+          return label.includes('open conversation options') ||
+            /^history-item-.*-options$/.test(element.getAttribute('data-testid') ?? '');
+        }) ?? null;
+    };
+    const findOpenSidebarButton = () => Array.from(document.querySelectorAll('button,[role="button"]'))
+      .find((element) => element instanceof HTMLElement && isVisible(element) &&
+        labelFor(element).includes('open sidebar')) ?? null;
+    const ensureSidebarMenuButton = async () => {
+      let menuButton = findSidebarMenuButton();
+      if (menuButton) return menuButton;
+      const openSidebar = findOpenSidebarButton();
+      if (!openSidebar || guardedPress(openSidebar)) return null;
+      await sleep(350);
+      menuButton = findSidebarMenuButton();
+      return menuButton;
+    };
+    const findHeaderMenuButton = () => {
       const buttons = Array.from(document.querySelectorAll('button,[role="button"]'))
         .filter((element) => element instanceof HTMLElement && isVisible(element));
       const headerCandidates = buttons
@@ -125,13 +162,12 @@ const interactionHelpers = String.raw`
         .sort((a, b) => b.rect.right - a.rect.right);
       return headerCandidates[0]?.element ?? null;
     };
+    const findConversationMenuButton = ({ allowHeader = true } = {}) =>
+      findSidebarMenuButton() ?? (allowHeader ? findHeaderMenuButton() : null);
     const visibleMenuRoots = () => Array.from(document.querySelectorAll(
       '[role="menu"],[data-radix-menu-content],[data-testid*="menu" i]',
-    )).filter((element) => {
-      if (!(element instanceof HTMLElement) || !isVisible(element)) return false;
-      const rect = element.getBoundingClientRect();
-      return rect.top < 300 && rect.right > window.innerWidth - 600;
-    });
+    )).filter((element) =>
+      element instanceof HTMLElement && isVisible(element));
     const visibleMenuCandidates = () => visibleMenuRoots().flatMap((root) => Array.from(
       root.querySelectorAll('[role="menuitem"],[role="option"],button,div[tabindex],a'),
     )).filter((element) => element instanceof HTMLElement && isVisible(element));
@@ -150,20 +186,34 @@ export function buildRenameConversationExpression(title, { marker, conversationU
     if (!label || label.includes('delete')) return false;
     return label === 'rename' || label.includes('rename conversation') || label === 'zmień nazwę';
   }) ?? null;
-  const findRenameInput = () => visibleDialogs().flatMap((dialog) => Array.from(
-    dialog.querySelectorAll('input'),
-  )).find((element) => element instanceof HTMLInputElement && isVisible(element)) ?? null;
+  const findRenameInput = () => Array.from(document.querySelectorAll(
+    'input[name="title-editor"],input[aria-label="Chat title"],input[aria-label="Tytuł czatu"]',
+  )).find((element) => element instanceof HTMLInputElement && isVisible(element)) ??
+    visibleDialogs().flatMap((dialog) => Array.from(dialog.querySelectorAll('input')))
+      .find((element) => element instanceof HTMLInputElement && isVisible(element)) ?? null;
   const findSaveButton = () => visibleDialogs().flatMap((dialog) => Array.from(
     dialog.querySelectorAll('button,[role="button"]'),
   )).filter((element) => element instanceof HTMLElement && isVisible(element)).find((element) => {
     const label = labelFor(element);
     return label === 'save' || label === 'rename' || label === 'zapisz';
   }) ?? null;
+  const commitInlineRename = (input) => {
+    input.focus();
+    input.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true,
+    }));
+    input.dispatchEvent(new KeyboardEvent('keyup', {
+      key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true,
+    }));
+  };
   const openEditor = async () => {
     const targetError = validateTarget();
     if (targetError) return { error: targetError };
-    const menuButton = findConversationMenuButton();
+    const menuButton = await ensureSidebarMenuButton();
     if (!menuButton) return { error: 'conversation-menu-not-found' };
+    const sidebarTitle = String(findSidebarConversationLink()?.textContent ?? '')
+      .replace(/\s+/g, ' ').trim();
+    if (sidebarTitle === expected) return { already: true };
     const menuError = guardedPress(menuButton);
     if (menuError) return { error: menuError };
     await sleep(350);
@@ -187,6 +237,7 @@ export function buildRenameConversationExpression(title, { marker, conversationU
   };
   return (async () => {
     const editor = await openEditor();
+    if (editor.already) return { status: 'already' };
     if (!editor.input) return { status: 'skipped', reason: editor.error };
     if (editor.input.value === expected) {
       dismiss();
@@ -206,17 +257,28 @@ export function buildRenameConversationExpression(title, { marker, conversationU
     editor.input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: expected }));
     editor.input.dispatchEvent(new Event('change', { bubbles: true }));
     const save = findSaveButton();
-    if (!save) {
+    if (save) {
+      const saveError = guardedPress(save);
+      if (saveError) {
+        dismiss();
+        return { status: 'skipped', reason: saveError };
+      }
+    } else if (editor.input.name === 'title-editor' ||
+               normalize(editor.input.getAttribute('aria-label')).includes('chat title') ||
+               normalize(editor.input.getAttribute('aria-label')).includes('tytuł czatu')) {
+      const commitError = validateTarget();
+      if (commitError) {
+        dismiss();
+        return { status: 'skipped', reason: commitError };
+      }
+      commitInlineRename(editor.input);
+    } else {
       dismiss();
       return { status: 'skipped', reason: 'rename-save-not-found' };
     }
-    const saveError = guardedPress(save);
-    if (saveError) {
-      dismiss();
-      return { status: 'skipped', reason: saveError };
-    }
     await sleep(500);
     const verification = await openEditor();
+    if (verification.already) return { status: 'renamed' };
     if (!verification.input) return { status: 'skipped', reason: 'rename-not-verifiable' };
     const exact = verification.input.value === expected;
     dismiss();

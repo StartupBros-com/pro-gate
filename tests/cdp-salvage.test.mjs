@@ -667,6 +667,46 @@ const FOREIGN_ANSWER = (m) => [
 }
 
 {
+  const title = 'pro-gate review: PR #71 r2b [pro-gate]';
+  const nonceLessAnswer = [
+    `run marker: ${MARKER}`,
+    '[P1] bin/x.mjs:1 — completed but unbound',
+    'P2: none',
+    'P3: none',
+    'VERDICT: FIX-FIRST — marker echo omitted.',
+  ].join('\n');
+  const cdp = await mockCdp(nonceLessAnswer);
+  const r = await runSalvage(
+    ['--organize', '--finalize', '--archive', MARKER, '5'],
+    cdp.port,
+    seedOrganizer(MARKER, title),
+  );
+  check('nonce-less completed answers never grant organizer mutation authority',
+    /reason=answer-marker-missing/.test(r.stdout), `stdout=${r.stdout}`);
+  check('ambiguous completed ownership leaves title archive and tabs untouched',
+    cdp.ui.events.length === 0 && !cdp.ui.archived && cdp.closed.length === 0,
+    `ui=${JSON.stringify(cdp.ui)} closed=${cdp.closed}`);
+  cdp.stop();
+}
+
+{
+  const title = 'pro-gate review: PR #71 r2c [pro-gate]';
+  const oldScrollback = [
+    '[P1] old/x.mjs:1 — old answer',
+    'P2: none',
+    'P3: none',
+    'VERDICT: FIX-FIRST — old marker omitted.',
+    `run marker: ${MARKER}`,
+    'new answer still generating',
+  ].join('\n');
+  const cdp = await mockCdp(oldScrollback);
+  const r = await runSalvage(['--organize', MARKER, '5'], cdp.port, seedOrganizer(MARKER, title));
+  check('an old nonce-less verdict above the newest prompt does not block safe rename',
+    /rename=renamed archive=disabled close=skipped reason=ok/.test(r.stdout), `stdout=${r.stdout}`);
+  cdp.stop();
+}
+
+{
   const title = 'pro-gate review: PR #71 r3 [pro-gate]';
   const ours = { id: 'ours2', url: 'https://chatgpt.com/c/ours-two' };
   const cdp = await mockCdp(FOREIGN_ANSWER(MARKER), [ours], {
@@ -720,8 +760,34 @@ const FOREIGN_ANSWER = (m) => [
     seedOrganizer(MARKER, title, remembered),
   );
   check('organizer recovers a tabless owned conversation from its memo', /source=memo rename=renamed/.test(r.stdout), `stdout=${r.stdout}`);
-  check('memo recovery retains the scratch through rename then closes it',
-    cdp.created.length === 1 && cdp.closed.includes(cdp.created[0].id),
+  check('rename-only memo recovery keeps its owned scratch renderer open',
+    cdp.created.length === 1 && !cdp.closed.includes(cdp.created[0].id),
+    `created=${JSON.stringify(cdp.created)} closed=${cdp.closed}`);
+  cdp.stop();
+}
+
+{
+  const title = 'pro-gate review: PR #71 r6b [pro-gate]';
+  const remembered = 'https://chatgpt.com/c/tabless-finalized';
+  const body = [
+    `run marker: ${MARKER}`,
+    'P0: none',
+    'P1: none',
+    'P2: none',
+    'P3: none',
+    `VERDICT: SHIP — owned. (run marker: ${MARKER})`,
+  ].join('\n');
+  const cdp = await mockCdp('__NO_TABS__', [], { renderText: () => body });
+  const r = await runSalvage(
+    ['--organize', '--finalize', '--archive', MARKER, '5'],
+    cdp.port,
+    seedOrganizer(MARKER, title, remembered),
+  );
+  check('authorized memo finalization archives and closes its owned scratch',
+    /source=memo rename=renamed archive=archived close=closed reason=ok/.test(r.stdout),
+    `stdout=${r.stdout}`);
+  check('authorized finalization closes the accepted memo scratch exactly once',
+    cdp.created.length === 1 && cdp.closed.filter((id) => id === cdp.created[0].id).length === 1,
     `created=${JSON.stringify(cdp.created)} closed=${cdp.closed}`);
   cdp.stop();
 }
@@ -759,6 +825,63 @@ const FOREIGN_ANSWER = (m) => [
   check('finalizer closes only its selected owned tab',
     cdp.closed.length === 1 && cdp.closed[0] === 'tab1',
     `closed=${cdp.closed}`);
+  cdp.stop();
+}
+
+{
+  const title = 'pro-gate review: PR #71 r8b [pro-gate]';
+  const duplicate = { id: 'same-url-duplicate', url: 'https://chatgpt.com/c/mock-conversation' };
+  const body = [
+    `run marker: ${MARKER}`,
+    'P0: none',
+    'P1: none',
+    'P2: none',
+    'P3: none',
+    `VERDICT: SHIP — owned. (run marker: ${MARKER})`,
+  ].join('\n');
+  const cdp = await mockCdp(body, [duplicate], { tabText: () => body });
+  const r = await runSalvage(
+    ['--organize', '--finalize', '--archive', MARKER, '5'],
+    cdp.port,
+    seedOrganizer(MARKER, title),
+  );
+  check('same-URL owned duplicate tabs finalize successfully',
+    /archive=archived close=closed reason=ok/.test(r.stdout), `stdout=${r.stdout}`);
+  check('finalizer revalidates and closes every owned tab at the selected exact URL',
+    cdp.closed.length === 2 && cdp.closed.includes('tab1') && cdp.closed.includes('same-url-duplicate'),
+    `closed=${cdp.closed}`);
+  cdp.stop();
+}
+
+{
+  const title = 'pro-gate review: PR #71 r8c [pro-gate]';
+  const duplicate = { id: 'same-url-drifted', url: 'https://chatgpt.com/c/mock-conversation' };
+  const owned = [
+    `run marker: ${MARKER}`,
+    'P0: none',
+    'P1: none',
+    'P2: none',
+    'P3: none',
+    `VERDICT: SHIP — owned. (run marker: ${MARKER})`,
+  ].join('\n');
+  const foreign = 'run marker: pg-run-other-1234567890-9\nforeign conversation';
+  let duplicateReads = 0;
+  const cdp = await mockCdp(owned, [duplicate], {
+    tabText: (_url, id) => {
+      if (id !== duplicate.id) return owned;
+      duplicateReads += 1;
+      return duplicateReads === 1 ? owned : foreign;
+    },
+  });
+  const r = await runSalvage(
+    ['--organize', '--finalize', '--archive', MARKER, '5'],
+    cdp.port,
+    seedOrganizer(MARKER, title),
+  );
+  check('same-URL duplicate ownership drift blocks local cleanup',
+    /close=failed reason=ownership-drift/.test(r.stdout), `stdout=${r.stdout}`);
+  check('duplicate ownership drift leaves every same-URL tab open',
+    cdp.closed.length === 0, `closed=${cdp.closed}`);
   cdp.stop();
 }
 
@@ -857,6 +980,23 @@ const FOREIGN_ANSWER = (m) => [
     !/backend-api|XMLHttpRequest|\bfetch\s*\(/i.test(`${renameExpression}\n${archiveExpression}`));
   check('rename expression uses native input state and exact verification',
     /HTMLInputElement\.prototype/.test(renameExpression) && /status: 'already'/.test(renameExpression));
+  check('organizer scopes the rendered sidebar menu to the exact conversation URL',
+    /expectedConversationPath/.test(renameExpression) &&
+      /findSidebarConversationLink/.test(renameExpression) &&
+      /new URL\(href, location\.href\)\.pathname === expectedConversationPath/.test(renameExpression) &&
+      /ensureSidebarMenuButton/.test(renameExpression) &&
+      /findOpenSidebarButton/.test(renameExpression));
+  check('inline ChatGPT title editors commit through the rendered keyboard path',
+    /input\[name="title-editor"\]/.test(renameExpression) &&
+      /commitInlineRename/.test(renameExpression) &&
+      /key: 'Enter'/.test(renameExpression));
+  check('exact sidebar title short-circuits a second editor open',
+    /sidebarTitle === expected/.test(renameExpression) &&
+      /editor\.already/.test(renameExpression) &&
+      /verification\.already/.test(renameExpression));
+  check('browser-side ownership rejects a terminal verdict without an exact marker echo',
+    /target-answer-marker-missing/.test(renameExpression) &&
+      /verdictAt > ownMarkerAt/.test(renameExpression));
   check('archive expression excludes destructive and reverse actions',
     /label\.includes\('delete'\)/.test(archiveExpression) &&
       /label\.includes\('unarchive'\)/.test(archiveExpression) &&

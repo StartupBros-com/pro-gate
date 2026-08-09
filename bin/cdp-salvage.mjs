@@ -558,8 +558,34 @@ function lastExactMarkerAt(text, wanted) {
 }
 const hasExactMarker = (text, wanted) => !!text && lastExactMarkerAt(text, wanted) >= 0;
 
+function terminalVerdict(text) {
+  const lines = text.split('\n');
+  let at = 0;
+  let terminal = null;
+  for (const line of lines) {
+    if (VERDICT_RE.test(line)) terminal = { line, at };
+    at += line.length + 1;
+  }
+  return terminal;
+}
+
+// Mutation authority is intentionally stricter than salvage extraction. The engine may capture a
+// nonce-less completed answer and adjudicate it as retryable, but the organizer must not mutate that
+// page: once a verdict follows this run's prompt, only an exact marker echo proves it is our answer.
+function organizerOwnership(text) {
+  if (!hasExactMarker(text, marker)) return { owned: false, reason: 'marker-missing' };
+  const verdict = terminalVerdict(text);
+  if (!verdict) return { owned: true, reason: 'live' };
+  const answerMarker = verdict.line.match(/\(run marker:\s*(pg-run-[A-Za-z0-9.-]+)\s*\)/i)?.[1] ?? null;
+  if (answerMarker === marker) return { owned: true, reason: 'completed' };
+  if (verdict.at < lastExactMarkerAt(text, marker)) return { owned: true, reason: 'old-verdict' };
+  return answerMarker
+    ? { owned: false, reason: 'cross-bound', foreignMarker: answerMarker }
+    : { owned: false, reason: 'answer-marker-missing' };
+}
+
 function ownedOrganizerText(text) {
-  return hasExactMarker(text, marker) && !foreignAnswerMarker(text);
+  return organizerOwnership(text).owned;
 }
 
 async function openOrganizerScratch(url) {
@@ -584,9 +610,10 @@ async function openOrganizerScratch(url) {
       if (!text) continue;
       if (isThrottlePage(text)) return { target: live, reason: 'throttle' };
       if (hasExactMarker(text, marker)) {
-        return foreignAnswerMarker(text)
-          ? { target: live, reason: 'cross-bound' }
-          : { target: live, text, reason: 'ok' };
+        const ownership = organizerOwnership(text);
+        return ownership.owned
+          ? { target: live, text, reason: 'ok' }
+          : { target: live, reason: ownership.reason };
       }
       if (FOREIGN_MARKER_RE.test(text)) return { target: live, reason: 'stale-memo' };
       if (/\b(log in|sign up)\b/i.test(text) && text.length < 10_000) sawLogin = true;
@@ -623,6 +650,40 @@ async function validateOrganizerTarget(target, expectedUrl) {
   return { ok: true, reason: 'ok', tab: live, text };
 }
 
+async function closeOwnedOrganizerTabs(expectedUrl, authorizedTargetId, allowTargetUrlDrift) {
+  let tabs;
+  try {
+    tabs = await (await fetch(`http://127.0.0.1:${port}/json`)).json();
+  } catch {
+    return { status: 'failed', reason: 'cdp-list-failed' };
+  }
+  if (!Array.isArray(tabs)) return { status: 'failed', reason: 'cdp-list-failed' };
+  const selected = tabs.find((tab) => tab.id === authorizedTargetId) ?? null;
+  if (!selected) return { status: 'failed', reason: 'target-disappeared' };
+  const sameUrl = tabs.filter((tab) => tab.type === 'page' && tab.url === expectedUrl);
+  const toClose = [];
+  for (const tab of sameUrl) {
+    if (allowTargetUrlDrift && tab.id === authorizedTargetId) {
+      toClose.push(tab);
+      continue;
+    }
+    const text = await tabText(tab);
+    if (!ownedOrganizerText(text)) return { status: 'failed', reason: 'ownership-drift' };
+    toClose.push(tab);
+  }
+  if (selected.url !== expectedUrl) {
+    if (!allowTargetUrlDrift) return { status: 'failed', reason: 'target-url-drift' };
+    toClose.push(selected);
+  }
+  const unique = [...new Map(toClose.map((tab) => [tab.id, tab])).values()];
+  if (!unique.length) return { status: 'failed', reason: 'target-disappeared' };
+  let closed = 0;
+  for (const tab of unique) if (await closeTab(tab.id)) closed += 1;
+  return closed === unique.length
+    ? { status: 'closed', reason: 'ok' }
+    : { status: 'failed', reason: 'close-failed' };
+}
+
 async function organizeConversation() {
   const result = {
     source: 'none',
@@ -652,9 +713,10 @@ async function organizeConversation() {
       continue;
     }
     if (!hasExactMarker(text, marker)) continue;
-    if (foreignAnswerMarker(text)) {
+    const ownership = organizerOwnership(text);
+    if (!ownership.owned) {
       conflictedUrls.add(tab.url);
-      rejectionReason = 'cross-bound';
+      rejectionReason = ownership.reason;
       continue;
     }
     if (nonMatching.has(tab.url)) {
@@ -668,7 +730,6 @@ async function organizeConversation() {
 
   let target = null;
   let source = 'none';
-  let scratch = null;
   const candidateUrls = [...candidatesByUrl.keys()];
   if (candidateUrls.length > 0) {
     const selectedUrl = rememberedUrl && candidatesByUrl.has(rememberedUrl)
@@ -679,7 +740,7 @@ async function organizeConversation() {
     source = 'open';
   } else if (rememberedUrl) {
     if (nonMatching.has(rememberedUrl)) return { ...result, reason: 'provenance-rejected' };
-    scratch = await openOrganizerScratch(rememberedUrl);
+    const scratch = await openOrganizerScratch(rememberedUrl);
     if (!scratch.text || !scratch.target) {
       if (scratch.target?.id) await closeTab(scratch.target.id);
       return { ...result, reason: scratch.reason };
@@ -693,67 +754,65 @@ async function organizeConversation() {
   result.source = source;
   const targetUrl = target.url;
   rememberUrl(marker, targetUrl);
-  try {
-    const before = await validateOrganizerTarget(target, targetUrl);
-    if (!before.ok) return { ...result, reason: before.reason };
-    target = before.tab;
+  const before = await validateOrganizerTarget(target, targetUrl);
+  if (!before.ok) return { ...result, reason: before.reason };
+  target = before.tab;
 
-    if (rename) {
-      if (!title) {
-        result.renameStatus = 'skipped';
-        result.reason = 'title-memo-missing';
-      } else {
-        const renameOutcome = organizerUiStatus(
-          await evaluateTab(target, buildRenameConversationExpression(title, {
-            marker,
-            conversationUrl: targetUrl,
-          }), true),
-          'rename',
-        );
-        result.renameStatus = renameOutcome.status;
-        if (renameOutcome.reason !== 'ok') result.reason = renameOutcome.reason;
-      }
-    }
-
-    const afterRename = await validateOrganizerTarget(target, targetUrl);
-    if (!afterRename.ok) {
-      if (result.reason === 'ok') result.reason = afterRename.reason;
-      result.archiveStatus = archive ? 'skipped' : 'disabled';
-      return result;
-    }
-    target = afterRename.tab;
-
-    let closeAuthorized = false;
-    if (archive) {
-      const archiveOutcome = organizerUiStatus(
-        await evaluateTab(target, buildArchiveConversationExpression({
+  if (rename) {
+    if (!title) {
+      result.renameStatus = 'skipped';
+      result.reason = 'title-memo-missing';
+    } else {
+      const renameOutcome = organizerUiStatus(
+        await evaluateTab(target, buildRenameConversationExpression(title, {
           marker,
           conversationUrl: targetUrl,
         }), true),
-        'archive',
+        'rename',
       );
-      result.archiveStatus = archiveOutcome.status;
-      if (archiveOutcome.reason !== 'ok' && result.reason === 'ok') result.reason = archiveOutcome.reason;
-      closeAuthorized = ['archived', 'already'].includes(archiveOutcome.status);
-    }
-
-    if (finalize && !closeAuthorized) {
-      const beforeClose = await validateOrganizerTarget(target, targetUrl);
-      closeAuthorized = beforeClose.ok;
-      if (beforeClose.ok) target = beforeClose.tab;
-      else if (result.reason === 'ok') result.reason = beforeClose.reason;
-    }
-    if (finalize && closeAuthorized) {
-      result.closeStatus = await closeTab(target.id) ? 'closed' : 'failed';
-      if (result.closeStatus === 'failed' && result.reason === 'ok') result.reason = 'close-failed';
-    }
-    return result;
-  } finally {
-    if (source === 'memo' && target?.id && result.closeStatus !== 'closed') {
-      const closed = await closeTab(target.id);
-      if (closed) result.closeStatus = 'closed';
+      result.renameStatus = renameOutcome.status;
+      if (renameOutcome.reason !== 'ok') result.reason = renameOutcome.reason;
     }
   }
+
+  const afterRename = await validateOrganizerTarget(target, targetUrl);
+  if (!afterRename.ok) {
+    if (result.reason === 'ok') result.reason = afterRename.reason;
+    result.archiveStatus = archive ? 'skipped' : 'disabled';
+    return result;
+  }
+  target = afterRename.tab;
+
+  let closeAuthorized = false;
+  if (archive) {
+    const archiveOutcome = organizerUiStatus(
+      await evaluateTab(target, buildArchiveConversationExpression({
+        marker,
+        conversationUrl: targetUrl,
+      }), true),
+      'archive',
+    );
+    result.archiveStatus = archiveOutcome.status;
+    if (archiveOutcome.reason !== 'ok' && result.reason === 'ok') result.reason = archiveOutcome.reason;
+    closeAuthorized = ['archived', 'already'].includes(archiveOutcome.status);
+  }
+
+  if (finalize && !closeAuthorized) {
+    const beforeClose = await validateOrganizerTarget(target, targetUrl);
+    closeAuthorized = beforeClose.ok;
+    if (beforeClose.ok) target = beforeClose.tab;
+    else if (result.reason === 'ok') result.reason = beforeClose.reason;
+  }
+  if (finalize && closeAuthorized) {
+    const closeOutcome = await closeOwnedOrganizerTabs(
+      targetUrl,
+      target.id,
+      ['archived', 'already'].includes(result.archiveStatus),
+    );
+    result.closeStatus = closeOutcome.status;
+    if (closeOutcome.reason !== 'ok' && result.reason === 'ok') result.reason = closeOutcome.reason;
+  }
+  return result;
 }
 
 if (organize) {
