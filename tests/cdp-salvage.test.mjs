@@ -18,6 +18,11 @@ import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
 
+import {
+  buildArchiveConversationExpression,
+  buildRenameConversationExpression,
+} from '../bin/cdp-organizer-expressions.mjs';
+
 const SALVAGE = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'cdp-salvage.mjs');
 const WS_MAGIC = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
@@ -28,6 +33,47 @@ function wsTextFrame(payload) {
   const head = Buffer.alloc(4);
   head[0] = 0x81; head[1] = 126; head.writeUInt16BE(data.length, 2);
   return Buffer.concat([head, data]);
+}
+
+// Chrome's WebSocket client masks frames and may send more than one request per connection.
+// Decode the actual request so the mock can echo its CDP id and model organizer state instead
+// of accidentally passing only clients that hard-code id=1.
+function wsClientTextDecoder(onText) {
+  let buffered = Buffer.alloc(0);
+  return (chunk) => {
+    buffered = Buffer.concat([buffered, chunk]);
+    for (;;) {
+      if (buffered.length < 2) return;
+      const opcode = buffered[0] & 0x0f;
+      const masked = (buffered[1] & 0x80) !== 0;
+      let length = buffered[1] & 0x7f;
+      let offset = 2;
+      if (length === 126) {
+        if (buffered.length < 4) return;
+        length = buffered.readUInt16BE(2);
+        offset = 4;
+      } else if (length === 127) {
+        if (buffered.length < 10) return;
+        length = Number(buffered.readBigUInt64BE(2));
+        offset = 10;
+      }
+      const maskBytes = masked ? 4 : 0;
+      if (buffered.length < offset + maskBytes + length) return;
+      const mask = masked ? buffered.subarray(offset, offset + 4) : null;
+      offset += maskBytes;
+      const payload = Buffer.from(buffered.subarray(offset, offset + length));
+      buffered = buffered.subarray(offset + length);
+      if (mask) for (let i = 0; i < payload.length; i += 1) payload[i] ^= mask[i % 4];
+      if (opcode === 1) onText(payload.toString('utf8'));
+      if (opcode === 8) return;
+    }
+  };
+}
+
+function expectedTitleFromExpression(expression) {
+  const match = expression.match(/^\s*const expected = (.+);$/m);
+  if (!match) return null;
+  try { return JSON.parse(match[1]); } catch { return null; }
 }
 
 // One mock CDP browser: /json lists a single conversation tab whose DOM text is `tabText`;
@@ -41,6 +87,10 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
   const closed = [];
   const created = [];              // scratch tabs opened via /json/new
   const pollsByTab = new Map();    // scratch tab id -> how many times its DOM has been read
+  const requests = [];
+  const ui = opts.ui ?? { title: null, archived: false, events: [] };
+  ui.events ??= [];
+  let primaryPolls = 0;
   const server = createServer((req, res) => {
     if (req.url === '/json/version') { res.end(JSON.stringify({ Browser: 'MockChrome/1.0' })); return; }
     if (req.url?.startsWith('/json/new')) {
@@ -70,7 +120,10 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
         id: t.id, type: 'page', url: t.url,
         webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/${t.id}`,
       }));
-      if (tabText === '__NO_TABS__') { res.end(JSON.stringify([...extras, ...scratch])); return; }
+      if (tabText === '__NO_TABS__' || closed.includes('tab1')) {
+        res.end(JSON.stringify([...extras, ...scratch]));
+        return;
+      }
       res.end(JSON.stringify([{
         id: 'tab1', type: 'page', url: 'https://chatgpt.com/c/mock-conversation',
         webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/tab1`,
@@ -87,9 +140,15 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
     const id = (req.url ?? '').split('/').pop();
     const scratch = created.find((t) => t.id === id);
     const extra = extraTabs.find((t) => t.id === id);
-    // Any client frame (the Runtime.evaluate call) gets the canned innerText back.
-    socket.on('data', () => {
+    socket.on('data', wsClientTextDecoder((payload) => {
+      let request;
+      try { request = JSON.parse(payload); } catch { return; }
+      requests.push(request);
       let value = tabText;
+      if (id === 'tab1' && opts.primaryText) {
+        primaryPolls += 1;
+        value = opts.primaryText(tabText, primaryPolls) ?? value;
+      }
       // opts.tabText lets a test give LISTED tabs distinct bodies (tab id or url -> text);
       // without it every listed tab serves the same text, which cannot express "one tab is
       // ours and another is foreign" — the shape #68's ordering regression needs.
@@ -99,12 +158,42 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
         pollsByTab.set(id, n);
         value = opts.renderText(scratch.url, n);
       }
-      socket.write(wsTextFrame(JSON.stringify({ id: 1, result: { result: { value } } })));
-    });
+      const expression = request.params?.expression ?? '';
+      if (expression.includes('pro-gate-organizer:rename')) {
+        const expected = expectedTitleFromExpression(expression);
+        if (ui.renameResult) value = ui.renameResult;
+        else if (ui.title === expected) value = { status: 'already' };
+        else {
+          ui.title = expected;
+          ui.events.push({ action: 'rename', id });
+          value = { status: 'renamed' };
+        }
+      } else if (expression.includes('pro-gate-organizer:archive')) {
+        if (ui.archiveResult) value = ui.archiveResult;
+        else if (ui.archived) value = { status: 'already' };
+        else {
+          ui.archived = true;
+          ui.events.push({ action: 'archive', id });
+          value = { status: 'archived' };
+        }
+      }
+      socket.write(wsTextFrame(JSON.stringify({ id: request.id, result: { result: { value } } })));
+    }));
     socket.on('error', () => {});
   });
   return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({
-    port: server.address().port, closed, created, setText: (value) => { tabText = value; },
+    port: server.address().port,
+    closed,
+    created,
+    requests,
+    ui,
+    setText: (value) => {
+      if (value !== tabText) {
+        const closedAt = closed.indexOf('tab1');
+        if (closedAt >= 0) closed.splice(closedAt, 1);
+      }
+      tabText = value;
+    },
     stop: (cb) => server.close(cb),
   })));
 }
@@ -153,6 +242,14 @@ function seedMemo(marker, url) {
   return (home) => {
     fs.mkdirSync(path.join(home, 'conversation-urls'), { recursive: true });
     fs.writeFileSync(path.join(home, 'conversation-urls', marker), `${url}\n`);
+  };
+}
+
+function seedOrganizer(marker, title, url = null) {
+  return (home) => {
+    fs.mkdirSync(path.join(home, 'conversation-titles'), { recursive: true });
+    fs.writeFileSync(path.join(home, 'conversation-titles', marker), `${title}\n`);
+    if (url) seedMemo(marker, url)(home);
   };
 }
 
@@ -536,6 +633,238 @@ const FOREIGN_ANSWER = (m) => [
   const r = await runSalvage(['--sweep-root', '-', '10'], cdp.port);
   check('sweep-root keeps a survivor tab', r.status === 0 && cdp.closed.length === 1, `status=${r.status} closed=${cdp.closed}`);
   cdp.stop();
+}
+
+// ── v0.32: marker-owned conversation organization. These checks exercise the real CLI/CDP
+// request path while the mock models only the UI's state transitions. A static innerText reply
+// is no longer enough: request ids, rename state, archive state, and action ordering all matter.
+{
+  const title = 'pro-gate review: PR #71 r1 [pro-gate]';
+  const cdp = await mockCdp(`run marker: ${MARKER}\nstill generating`);
+  const r = await runSalvage(['--organize', MARKER, '5'], cdp.port, seedOrganizer(MARKER, title));
+  check('organizer rename exits 0', r.status === 0, `status=${r.status} stderr=${r.stderr}`);
+  check('organizer applies the exact title', cdp.ui.title === title, `title=${cdp.ui.title}`);
+  check('rename-only organizer leaves the owned tab open', cdp.closed.length === 0, `closed=${cdp.closed}`);
+  check('rename-only organizer never archives', !cdp.ui.archived, `ui=${JSON.stringify(cdp.ui)}`);
+  check('organizer emits one bounded structured result',
+    r.stdout.trim().split('\n').length === 1 &&
+      /^organizer source=open rename=renamed archive=disabled close=skipped reason=ok$/.test(r.stdout.trim()),
+    `stdout=${r.stdout}`);
+  check('CDP mock decoded and echoed nonconstant request ids',
+    new Set(cdp.requests.map((request) => request.id)).size > 1,
+    `ids=${cdp.requests.map((request) => request.id).join(',')}`);
+  cdp.stop();
+}
+
+{
+  const title = 'pro-gate review: PR #71 r2 [pro-gate]';
+  const ui = { title, archived: false, events: [] };
+  const cdp = await mockCdp(`run marker: ${MARKER}\ncomplete`, [], { ui });
+  const r = await runSalvage(['--organize', MARKER, '5'], cdp.port, seedOrganizer(MARKER, title));
+  check('an exact existing title is reported already', /rename=already/.test(r.stdout), `stdout=${r.stdout}`);
+  check('an exact existing title causes no title mutation', ui.events.length === 0, `events=${JSON.stringify(ui.events)}`);
+  cdp.stop();
+}
+
+{
+  const title = 'pro-gate review: PR #71 r3 [pro-gate]';
+  const ours = { id: 'ours2', url: 'https://chatgpt.com/c/ours-two' };
+  const cdp = await mockCdp(FOREIGN_ANSWER(MARKER), [ours], {
+    tabText: () => `run marker: ${MARKER}\nour model is still generating`,
+  });
+  const r = await runSalvage(['--organize', MARKER, '5'], cdp.port, seedOrganizer(MARKER, title));
+  check('organizer selects a genuine owned tab beside a cross-bound tab', /rename=renamed/.test(r.stdout), `stdout=${r.stdout}`);
+  check('organizer action targets only the genuine tab',
+    cdp.ui.events.length === 1 && cdp.ui.events[0].id === 'ours2',
+    `events=${JSON.stringify(cdp.ui.events)}`);
+  check('organizer leaves the cross-bound tab open', !cdp.closed.includes('tab1'), `closed=${cdp.closed}`);
+  cdp.stop();
+}
+
+{
+  const title = 'pro-gate review: PR #71 r4 [pro-gate]';
+  const second = { id: 'oursB', url: 'https://chatgpt.com/c/ours-b' };
+  const body = `run marker: ${MARKER}\nowned conversation`;
+  const cdp = await mockCdp(body, [second], { tabText: () => body });
+  const r = await runSalvage(['--organize', MARKER, '5'], cdp.port, seedOrganizer(MARKER, title));
+  check('two distinct owned URLs fail closed as ambiguous', /reason=ambiguous-owned-targets/.test(r.stdout), `stdout=${r.stdout}`);
+  check('ambiguity performs no UI action', cdp.ui.events.length === 0, `events=${JSON.stringify(cdp.ui.events)}`);
+  cdp.stop();
+}
+
+{
+  const title = 'pro-gate review: PR #71 r5 [pro-gate]';
+  const remembered = 'https://chatgpt.com/c/remembered-owned';
+  const second = { id: 'remembered-tab', url: remembered };
+  const body = `run marker: ${MARKER}\nowned conversation`;
+  const cdp = await mockCdp(body, [second], { tabText: () => body });
+  const r = await runSalvage(
+    ['--organize', MARKER, '5'],
+    cdp.port,
+    seedOrganizer(MARKER, title, remembered),
+  );
+  check('remembered URL resolves multiple owned targets', /rename=renamed/.test(r.stdout), `stdout=${r.stdout}`);
+  check('remembered URL is preferred exactly', cdp.ui.events[0]?.id === 'remembered-tab', `events=${JSON.stringify(cdp.ui.events)}`);
+  cdp.stop();
+}
+
+{
+  const title = 'pro-gate review: PR #71 r6 [pro-gate]';
+  const remembered = 'https://chatgpt.com/c/tabless-owned';
+  const cdp = await mockCdp('__NO_TABS__', [], {
+    renderText: () => `run marker: ${MARKER}\nserver-side conversation`,
+  });
+  const r = await runSalvage(
+    ['--organize', MARKER, '5'],
+    cdp.port,
+    seedOrganizer(MARKER, title, remembered),
+  );
+  check('organizer recovers a tabless owned conversation from its memo', /source=memo rename=renamed/.test(r.stdout), `stdout=${r.stdout}`);
+  check('memo recovery retains the scratch through rename then closes it',
+    cdp.created.length === 1 && cdp.closed.includes(cdp.created[0].id),
+    `created=${JSON.stringify(cdp.created)} closed=${cdp.closed}`);
+  cdp.stop();
+}
+
+{
+  const title = 'pro-gate review: PR #71 r7 [pro-gate]';
+  const remembered = 'https://chatgpt.com/c/stale-owned';
+  const cdp = await mockCdp('__NO_TABS__', [], {
+    renderText: () => 'run marker: pg-run-different-1234567890-2\nforeign conversation',
+  });
+  const r = await runSalvage(
+    ['--organize', MARKER, '5'],
+    cdp.port,
+    seedOrganizer(MARKER, title, remembered),
+  );
+  check('stale memo is rejected without mutation', /reason=stale-memo/.test(r.stdout) && cdp.ui.events.length === 0, `stdout=${r.stdout}`);
+  check('stale memo scratch is closed', cdp.created.length === 1 && cdp.closed.includes(cdp.created[0].id), `closed=${cdp.closed}`);
+  cdp.stop();
+}
+
+{
+  const title = 'pro-gate review: PR #71 r8 [pro-gate]';
+  const cdp = await mockCdp(`run marker: ${MARKER}\ndurable completed review`);
+  const r = await runSalvage(
+    ['--organize', '--finalize', '--archive', MARKER, '5'],
+    cdp.port,
+    seedOrganizer(MARKER, title),
+  );
+  check('finalizer renames then archives then closes',
+    /rename=renamed archive=archived close=closed reason=ok/.test(r.stdout),
+    `stdout=${r.stdout}`);
+  check('finalizer records ordered UI actions',
+    cdp.ui.events.map((event) => event.action).join(',') === 'rename,archive',
+    `events=${JSON.stringify(cdp.ui.events)}`);
+  check('finalizer closes only its selected owned tab',
+    cdp.closed.length === 1 && cdp.closed[0] === 'tab1',
+    `closed=${cdp.closed}`);
+  cdp.stop();
+}
+
+{
+  const title = 'pro-gate review: PR #71 r9 [pro-gate]';
+  const ui = { title: null, archived: true, events: [] };
+  const unrelated = { id: 'root-unrelated', type: 'page', url: 'https://chatgpt.com/' };
+  const cdp = await mockCdp(`run marker: ${MARKER}\ndurable completed review`, [unrelated], { ui });
+  const r = await runSalvage(
+    ['--organize', '--finalize', '--archive', MARKER, '5'],
+    cdp.port,
+    seedOrganizer(MARKER, title),
+  );
+  check('already-archived state is idempotent', /archive=already close=closed/.test(r.stdout), `stdout=${r.stdout}`);
+  check('finalization never closes an unrelated tab', !cdp.closed.includes('root-unrelated'), `closed=${cdp.closed}`);
+  cdp.stop();
+}
+
+{
+  const title = 'pro-gate review: PR #71 r10 [pro-gate]';
+  const ui = {
+    title: null,
+    archived: false,
+    events: [],
+    archiveResult: { status: 'skipped', reason: 'archive-menu-item-not-found' },
+  };
+  const cdp = await mockCdp(`run marker: ${MARKER}\ndurable completed review`, [], { ui });
+  const r = await runSalvage(
+    ['--organize', '--finalize', '--archive', MARKER, '5'],
+    cdp.port,
+    seedOrganizer(MARKER, title),
+  );
+  check('archive selector drift is reported once and remains nonfatal',
+    /archive=skipped close=closed reason=archive-archive-menu-item-not-found/.test(r.stdout),
+    `stdout=${r.stdout}`);
+  cdp.stop();
+}
+
+{
+  const title = 'pro-gate review: PR #71 r11 [pro-gate]';
+  const foreign = 'run marker: pg-run-different-1234567890-4\nforeign conversation';
+  const cdp = await mockCdp(`run marker: ${MARKER}\nowned conversation`, [], {
+    primaryText: (initial, n) => (n >= 4 ? foreign : initial),
+  });
+  const r = await runSalvage(
+    ['--organize', '--finalize', '--archive', MARKER, '5'],
+    cdp.port,
+    seedOrganizer(MARKER, title),
+  );
+  check('ownership drift after rename blocks archive and close',
+    /archive=skipped close=skipped reason=ownership-drift/.test(r.stdout),
+    `stdout=${r.stdout}`);
+  check('ownership drift leaves the target recoverable', cdp.closed.length === 0 && !cdp.ui.archived, `closed=${cdp.closed}`);
+  cdp.stop();
+}
+
+{
+  const title = 'pro-gate review: PR #71 r12 [pro-gate]';
+  const cdp = await mockCdp(`run marker: ${MARKER}\ndurable completed review`);
+  const r = await runSalvage(
+    ['--organize', '--finalize', '--archive', '--no-rename', MARKER, '5'],
+    cdp.port,
+    seedOrganizer(MARKER, title),
+  );
+  check('rename suppression does not suppress archive or local cleanup',
+    /rename=disabled archive=archived close=closed reason=ok/.test(r.stdout),
+    `stdout=${r.stdout}`);
+  check('rename suppression performs only the archive UI action',
+    cdp.ui.events.map((event) => event.action).join(',') === 'archive',
+    `events=${JSON.stringify(cdp.ui.events)}`);
+  cdp.stop();
+}
+
+{
+  const cdp = await mockCdp('__NO_TABS__');
+  const r = await runSalvage(['--organize', MARKER, '5'], cdp.port, seedOrganizer(MARKER, 'unused'));
+  check('an operational organizer failure still exits 0', r.status === 0, `status=${r.status}`);
+  check('an operational organizer failure emits exactly one structured line',
+    r.stdout.trim().split('\n').length === 1 && /reason=owned-target-not-found$/.test(r.stdout.trim()),
+    `stdout=${r.stdout} stderr=${r.stderr}`);
+  cdp.stop();
+}
+
+{
+  const dangerousTitle = 'pro-gate review: PR #71 r13 [repo "quoted" \\ literal]';
+  const target = {
+    marker: MARKER,
+    conversationUrl: 'https://chatgpt.com/c/mock-conversation',
+  };
+  const renameExpression = buildRenameConversationExpression(dangerousTitle, target);
+  const archiveExpression = buildArchiveConversationExpression(target);
+  check('rename expression serializes the exact title as data',
+    expectedTitleFromExpression(renameExpression) === dangerousTitle,
+    `expression=${renameExpression.slice(0, 160)}`);
+  check('organizer expressions contain no ChatGPT backend API path',
+    !/backend-api|XMLHttpRequest|\bfetch\s*\(/i.test(`${renameExpression}\n${archiveExpression}`));
+  check('rename expression uses native input state and exact verification',
+    /HTMLInputElement\.prototype/.test(renameExpression) && /status: 'already'/.test(renameExpression));
+  check('archive expression excludes destructive and reverse actions',
+    /label\.includes\('delete'\)/.test(archiveExpression) &&
+      /label\.includes\('unarchive'\)/.test(archiveExpression) &&
+      /label\.includes\('restore'\)/.test(archiveExpression));
+  check('archive expression verifies confirmation rather than trusting a click',
+    /verifyArchivedStateFromMenu/.test(archiveExpression) && /hasArchiveToast/.test(archiveExpression));
+  check('UI mutation ownership accepts the same formatted VERDICT labels as salvage',
+    /\[\*_>#-\]/.test(renameExpression) && /VERDICT\[\*_\\s\]/.test(renameExpression));
 }
 
 process.exit(failures === 0 ? 0 : 1);

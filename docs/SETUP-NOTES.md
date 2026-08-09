@@ -23,6 +23,17 @@ Will automates ChatGPT **Pro** PR reviews via `@steipete/oracle` (CLI+MCP that d
 - Self-inflicted trap when scripting: `pkill -f "oracle serve"` / `pkill -f "websockify.*6080"` match the **running script's own bash cmdline** → kills the parent shell (exit 144). Use `pkill -x <procname>` (exact name) or kill by PID.
 - `~/.oracle/config.json` (JSON5) sets browser defaults (engine, model, manualLoginProfileDir, keepBrowser); CLI flags override. `oracle serve` bypasses it.
 - **Model-label capture is BEST-EFFORT (oracle 0.15.2, dogfood PR #20).** Oracle prints its `Model selection evidence: ...; resolved=<label>; status=<st>; ...` line only at COMPLETION (right after it releases the browser slot), not early at selection. Consequences the engine handles by design: (1) an exit-9/harvest run is killed before the line is emitted, so `RESOLVED_MODEL` is empty and every surface shows role-based text, never a wrong version; (2) under the default `current` strategy a model that was already selected reports `resolved=(unavailable); status=already-selected` (healthy, just not re-read), which the R6 warning treats as benign and stays silent on. The advisory warning fires only on a weak-model denylist match or a genuinely unconfirmable model.
+- **Conversation lifecycle belongs to pro-gate in remote-CDP mode.** Keep
+  `PRO_GATE_BROWSER_ARCHIVE=never` so Oracle cannot archive before marker ownership, capture,
+  and durability have been established. pro-gate uses the rendered ChatGPT menu/input controls
+  (never a backend API) to apply the exact marker-addressed title, then archives and closes only
+  after exit 0 has readable exact bytes under `completed/<marker>` or `pending/<marker>`.
+  Exit 3/6/9, volatile-only results, cross-bound answers, stale memos, and ambiguous targets stay
+  unarchived and open for recovery. `PRO_GATE_CHAT_ARCHIVE=0` leaves the server chat in history
+  but still permits normal successful local close; `PRO_GATE_KEEP_TABS=1` suppresses both archive
+  and close while still permitting exact rename. `PRO_GATE_BROWSER_ARCHIVE=auto|always` remains
+  available as an unchanged Oracle pass-through, but opts back into the unsafe pre-validation
+  lifecycle this wrapper normally prevents.
 
 **BUILT + VALIDATED (2026-06-29):**
 - **Engine** `~/.pro-review-daemon/oracle-review.sh` — assembles `gh pr diff` + `--file` + the PR URL, prompt **leads with `@GitHub` to bind the connector** (Will confirmed pasting `@GitHub` tags it; oracle's CDP insertText carries it — connector fetches correctly, verified twice). `ORACLE_CHATGPT_URL` (→ `--chatgpt-url`) optionally routes through a connector-bound ChatGPT Project. Outputs P0–P3 findings + VERDICT.

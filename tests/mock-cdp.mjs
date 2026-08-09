@@ -4,13 +4,14 @@
 // the tab's debugger WebSocket, /json/new (scratch tabs, so the salvage's remembered-URL
 // recovery can reach a decisive answer the way a real browser does), and /json/close.
 // Prints the chosen port on stdout.
-// Usage: node tests/mock-cdp.mjs <tab-text-file>
+// Usage: node tests/mock-cdp.mjs <tab-text-file> [organizer-state-file]
 import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 
 const textFile = process.argv[2];
 if (!textFile) { console.error('usage: mock-cdp.mjs <tab-text-file>'); process.exit(2); }
+const stateFile = process.argv[3] || null;
 const WS_MAGIC = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
 function wsTextFrame(payload) {
@@ -21,8 +22,62 @@ function wsTextFrame(payload) {
   return Buffer.concat([head, data]);
 }
 
+function wsClientTextDecoder(onText) {
+  let buffered = Buffer.alloc(0);
+  return (chunk) => {
+    buffered = Buffer.concat([buffered, chunk]);
+    for (;;) {
+      if (buffered.length < 2) return;
+      const opcode = buffered[0] & 0x0f;
+      const masked = (buffered[1] & 0x80) !== 0;
+      let length = buffered[1] & 0x7f;
+      let offset = 2;
+      if (length === 126) {
+        if (buffered.length < 4) return;
+        length = buffered.readUInt16BE(2);
+        offset = 4;
+      } else if (length === 127) {
+        if (buffered.length < 10) return;
+        length = Number(buffered.readBigUInt64BE(2));
+        offset = 10;
+      }
+      const maskBytes = masked ? 4 : 0;
+      if (buffered.length < offset + maskBytes + length) return;
+      const mask = masked ? buffered.subarray(offset, offset + 4) : null;
+      offset += maskBytes;
+      const payload = Buffer.from(buffered.subarray(offset, offset + length));
+      buffered = buffered.subarray(offset + length);
+      if (mask) for (let i = 0; i < payload.length; i += 1) payload[i] ^= mask[i % 4];
+      if (opcode === 1) onText(payload.toString('utf8'));
+      if (opcode === 8) return;
+    }
+  };
+}
+
+let memoryState = { title: null, archived: false, events: [] };
+function readState() {
+  if (!stateFile) return memoryState;
+  try { return JSON.parse(fs.readFileSync(stateFile, 'utf8')); } catch { return { title: null, archived: false, events: [] }; }
+}
+
+function writeState(state) {
+  if (!stateFile) {
+    memoryState = state;
+    return;
+  }
+  try { fs.writeFileSync(stateFile, `${JSON.stringify(state)}\n`); } catch {}
+}
+
+function expectedTitleFromExpression(expression) {
+  const match = expression.match(/^\s*const expected = (.+);$/m);
+  if (!match) return null;
+  try { return JSON.parse(match[1]); } catch { return null; }
+}
+
 const scratch = new Map();   // id -> url, for tabs opened via /json/new
 let scratchSeq = 0;
+let primaryClosed = false;
+let primaryClosedText = null;
 
 const server = createServer((req, res) => {
   if (req.url === '/json/version') { res.end(JSON.stringify({ Browser: 'MockChrome/1.0' })); return; }
@@ -34,6 +89,7 @@ const server = createServer((req, res) => {
     const url = decodeURIComponent(req.url.slice(req.url.indexOf('?') + 1));
     const id = `scratch${++scratchSeq}`;
     scratch.set(id, url);
+    console.error(`opened ${id} ${url}`);
     res.setHeader('content-type', 'application/json');
     res.end(JSON.stringify({
       id, type: 'page', url, webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/${id}`,
@@ -43,11 +99,15 @@ const server = createServer((req, res) => {
   if (req.url === '/json') {
     const port = server.address().port;
     const current = fs.readFileSync(textFile, 'utf8');
+    if (primaryClosed && current !== primaryClosedText) {
+      primaryClosed = false;
+      primaryClosedText = null;
+    }
     res.setHeader('content-type', 'application/json');
     const extras = [...scratch].map(([id, url]) => ({
       id, type: 'page', url, webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/${id}`,
     }));
-    if (current === '__NO_TABS__') { res.end(JSON.stringify(extras)); return; }
+    if (current === '__NO_TABS__' || primaryClosed) { res.end(JSON.stringify(extras)); return; }
     res.end(JSON.stringify([{
       id: 'tab1', type: 'page', url: 'https://chatgpt.com/c/mock-conversation',
       webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/tab1`,
@@ -56,7 +116,12 @@ const server = createServer((req, res) => {
   }
   if (req.url?.startsWith('/json/close/')) {
     const id = req.url.split('/').pop();
-    scratch.delete(id);
+    if (id === 'tab1') {
+      primaryClosed = true;
+      try { primaryClosedText = fs.readFileSync(textFile, 'utf8'); } catch { primaryClosedText = null; }
+    } else {
+      scratch.delete(id);
+    }
     console.error(`closed ${id}`); res.end('ok'); return;
   }
   res.statusCode = 404; res.end();
@@ -65,10 +130,38 @@ server.on('upgrade', (req, socket) => {
   const accept = createHash('sha1').update(req.headers['sec-websocket-key'] + WS_MAGIC).digest('base64');
   socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n'
     + `Sec-WebSocket-Accept: ${accept}\r\n\r\n`);
-  socket.on('data', () => {
+  socket.on('data', wsClientTextDecoder((payload) => {
+    let request;
+    try { request = JSON.parse(payload); } catch { return; }
     const text = fs.readFileSync(textFile, 'utf8');
-    socket.write(wsTextFrame(JSON.stringify({ id: 1, result: { result: { value: text } } })));
-  });
+    const expression = request.params?.expression ?? '';
+    let value = text;
+    if (expression.includes('pro-gate-organizer:rename')) {
+      const state = readState();
+      const expected = expectedTitleFromExpression(expression);
+      if (state.renameResult) value = state.renameResult;
+      else if (state.title === expected) value = { status: 'already' };
+      else {
+        state.title = expected;
+        state.events = [...(state.events ?? []), { action: 'rename', tab: (req.url ?? '').split('/').pop() }];
+        writeState(state);
+        console.error('renamed conversation');
+        value = { status: 'renamed' };
+      }
+    } else if (expression.includes('pro-gate-organizer:archive')) {
+      const state = readState();
+      if (state.archiveResult) value = state.archiveResult;
+      else if (state.archived) value = { status: 'already' };
+      else {
+        state.archived = true;
+        state.events = [...(state.events ?? []), { action: 'archive', tab: (req.url ?? '').split('/').pop() }];
+        writeState(state);
+        console.error('archived conversation');
+        value = { status: 'archived' };
+      }
+    }
+    socket.write(wsTextFrame(JSON.stringify({ id: request.id, result: { result: { value } } })));
+  }));
   socket.on('error', () => {});
 });
 server.listen(0, '127.0.0.1', () => process.stdout.write(`${server.address().port}\n`));

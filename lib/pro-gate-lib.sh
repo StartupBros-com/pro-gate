@@ -976,6 +976,25 @@ pg_title_seq_next() {
   echo "$n"
 }
 
+# v0.32: marker-addressed canonical conversation title. The engine publishes this before the
+# browser run starts; later harvest/fast-path processes can therefore organize the same server-
+# side conversation without reconstructing PR or round state. Atomic replacement prevents the
+# CDP organizer from reading a partial title while a fresh run is publishing it.
+pg_conversation_title_dir() { echo "$PRO_GATE_HOME/conversation-titles"; }
+pg_conversation_title_write() {  # <marker> <one-line-title>
+  local marker="$1" title="$2" dir f tmp
+  pg_reservation_marker_ok "$marker" || return 1
+  [ -n "$title" ] && [ "${#title}" -le 200 ] || return 1
+  case "$title" in *$'\n'*|*$'\r'*) return 1;; esac
+  dir="$(pg_conversation_title_dir)"; f="$dir/$marker"; tmp="$f.tmp.$$"
+  mkdir -p "$dir" 2>/dev/null || return 1
+  if printf '%s\n' "$title" > "$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$tmp" 2>/dev/null
+  return 1
+}
+
 pg_round_count() {  # $1 = key; echoes the rounds recorded inside the rolling window
   local key="$1" f now win t n=0
   pg_round_key_ok "$key" || { echo 0; return; }

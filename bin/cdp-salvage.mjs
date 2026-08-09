@@ -75,12 +75,45 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import {
+  buildArchiveConversationExpression,
+  buildRenameConversationExpression,
+} from './cdp-organizer-expressions.mjs';
+
+const usage = () => {
+  console.error('usage: cdp-salvage.mjs [--probe|--close|--sweep-root|--organize [--finalize] [--archive] [--no-rename]] <pr-marker|-> [timeout-secs] [cdp-port]');
+  process.exit(2);
+};
 const argv = process.argv.slice(2);
-const probe = argv[0] === '--probe' && argv.shift();
-const close = argv[0] === '--close' && argv.shift();
-const sweepRoot = argv[0] === '--sweep-root' && argv.shift();
-const [marker, timeoutSecs = probe ? '30' : '600', port = process.env.ORACLE_CDP_PORT ?? '9222'] = argv;
-if (!marker) { console.error('usage: cdp-salvage.mjs [--probe|--close|--sweep-root] <pr-marker|-> [timeout-secs] [cdp-port]'); process.exit(2); }
+let mode = 'salvage';
+let finalize = false;
+let archive = false;
+let rename = true;
+for (;;) {
+  const arg = argv[0];
+  if (!arg?.startsWith('--')) break;
+  argv.shift();
+  if (['--probe', '--close', '--sweep-root', '--organize'].includes(arg)) {
+    if (mode !== 'salvage') usage();
+    mode = arg.slice(2);
+  } else if (arg === '--finalize') {
+    finalize = true;
+  } else if (arg === '--archive') {
+    archive = true;
+  } else if (arg === '--no-rename') {
+    rename = false;
+  } else {
+    usage();
+  }
+}
+if (mode !== 'organize' && (finalize || archive || !rename)) usage();
+if (archive && !finalize) usage();
+const probe = mode === 'probe';
+const close = mode === 'close';
+const sweepRoot = mode === 'sweep-root';
+const organize = mode === 'organize';
+const [marker, timeoutSecs = probe || organize ? '30' : '600', port = process.env.ORACLE_CDP_PORT ?? '9222'] = argv;
+if (!marker || argv.length > 3 || !/^\d+$/.test(String(timeoutSecs)) || Number(timeoutSecs) <= 0 || !/^\d+$/.test(String(port))) usage();
 const deadline = Date.now() + Number(timeoutSecs) * 1000;
 const POLL_MS = 20_000;
 
@@ -94,9 +127,11 @@ const COOLDOWN_FILE = process.env.PRO_GATE_COOLDOWN_FILE ?? path.join(PG_HOME, '
 // engine's only handle on a conversation whose tab is gone, so it is written on every positive
 // match (probe included) and read before we ever conclude "not found".
 const URL_MEMO_DIR = path.join(PG_HOME, 'conversation-urls');
+const TITLE_MEMO_DIR = path.join(PG_HOME, 'conversation-titles');
 const MEMO_KEEP = 200;                  // newest N memos retained; older ones are pruned on write
 const MARKER_SAFE_RE = /^pg-run-[A-Za-z0-9.-]+$/;
 const memoPath = (m) => (MARKER_SAFE_RE.test(m) ? path.join(URL_MEMO_DIR, m) : null);
+const titleMemoPath = (m) => (MARKER_SAFE_RE.test(m) ? path.join(TITLE_MEMO_DIR, m) : null);
 
 function recallUrl(m) {
   const f = memoPath(m);
@@ -104,6 +139,15 @@ function recallUrl(m) {
   try {
     const url = fs.readFileSync(f, 'utf8').trim();
     return /^https:\/\/chatgpt\.com\/c\//.test(url) ? url : null;
+  } catch { return null; }
+}
+
+function recallTitle(m) {
+  const f = titleMemoPath(m);
+  if (!f) return null;
+  try {
+    const title = fs.readFileSync(f, 'utf8').replace(/\n$/, '');
+    return title && title.length <= 200 && !/[\r\n\0]/.test(title) ? title : null;
   } catch { return null; }
 }
 
@@ -159,9 +203,10 @@ function flushCrossBind(m) {
 }
 
 
-// One hook rather than seven call sites: every exit path (0/3/4/5/7, probe, close, sweep)
+// One hook rather than seven call sites: every salvage exit path (0/3/4/5/7)
 // persists the scan's verdict exactly once, so no future exit can forget to.
-process.on('exit', () => { if (!probe) flushCrossBind(marker); });
+// Organizer/cleanup modes are deliberately read-only with respect to cross-bound recovery state.
+process.on('exit', () => { if (mode === 'salvage') flushCrossBind(marker); });
 
 function rememberUrl(m, url) {
   const f = memoPath(m);
@@ -209,24 +254,59 @@ function tripThrottle(where) {
   process.exit(5);
 }
 
-async function tabText(tab) {
+let evaluateRequestId = 0;
+async function evaluateTab(tab, expression, awaitPromise = false) {
   return await new Promise((resolve) => {
-    const ws = new WebSocket(tab.webSocketDebuggerUrl);
+    const requestId = ++evaluateRequestId;
+    let ws;
+    try {
+      ws = new WebSocket(tab?.webSocketDebuggerUrl);
+    } catch {
+      resolve({ ok: false, reason: 'invalid-websocket-url' });
+      return;
+    }
     // 5s bail: a healthy renderer answers in well under a second; suspended
     // renderers never answer, and orphaned conversation tabs accumulate on
     // the persistent Chrome, so a long bail makes every poll cycle crawl.
-    const bail = setTimeout(() => { try { ws.close(); } catch {} resolve(null); }, 5_000);
-    ws.onerror = () => { clearTimeout(bail); resolve(null); };
-    ws.onopen = () => ws.send(JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: { expression: 'document.body.innerText', returnByValue: true } }));
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(bail);
+      try { ws.close(); } catch {}
+      resolve(value);
+    };
+    const bail = setTimeout(() => finish({ ok: false, reason: 'evaluate-timeout' }), 5_000);
+    ws.onerror = () => finish({ ok: false, reason: 'websocket-error' });
+    ws.onopen = () => {
+      try {
+        ws.send(JSON.stringify({
+          id: requestId,
+          method: 'Runtime.evaluate',
+          params: { expression, returnByValue: true, awaitPromise },
+        }));
+      } catch {
+        finish({ ok: false, reason: 'websocket-send-failed' });
+      }
+    };
     ws.onmessage = (ev) => {
-      const m = JSON.parse(ev.data);
-      if (m.id === 1) { clearTimeout(bail); try { ws.close(); } catch {} resolve(m.result?.result?.value ?? null); }
+      try {
+        const m = JSON.parse(ev.data);
+        if (m.id !== requestId) return;
+        if (m.error || m.result?.exceptionDetails) finish({ ok: false, reason: 'evaluate-failed' });
+        else finish({ ok: true, value: m.result?.result?.value });
+      } catch { finish({ ok: false, reason: 'invalid-cdp-response' }); }
     };
   });
 }
 
+async function tabText(tab) {
+  const result = await evaluateTab(tab, 'document.body.innerText');
+  return result.ok ? result.value ?? null : null;
+}
+
 async function closeTab(id) {
-  try { await fetch(`http://127.0.0.1:${port}/json/close/${id}`); } catch {}
+  try { return (await fetch(`http://127.0.0.1:${port}/json/close/${id}`)).ok; } catch { return false; }
 }
 
 // --sweep-root: close idle chatgpt.com ROOT tabs (no /c/ path). A run killed before it submits
@@ -448,10 +528,249 @@ function foreignAnswerMarker(text) {
   // count misses toward a duplicate spend. Only convict when the foreign verdict comes AFTER
   // the last occurrence of our marker, i.e. it is the answer to our prompt rather than
   // scrollback above it.
-  const lastMarkerAt = text.lastIndexOf(marker);
+  const lastMarkerAt = lastExactMarkerAt(text, marker);
   const foreignAt = text.lastIndexOf(m[0]);
   if (lastMarkerAt >= 0 && foreignAt >= 0 && foreignAt < lastMarkerAt) return null;
   return m[1];
+}
+
+const organizerToken = (value, fallback = 'unknown') => {
+  const token = String(value ?? fallback).toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '');
+  return (token || fallback).slice(0, 64);
+};
+function emitOrganizerResult({ source = 'none', renameStatus = 'skipped', archiveStatus = 'disabled', closeStatus = 'skipped', reason = 'ok' }) {
+  process.stdout.write(`organizer source=${organizerToken(source)} rename=${organizerToken(renameStatus)} archive=${organizerToken(archiveStatus)} close=${organizerToken(closeStatus)} reason=${organizerToken(reason)}\n`);
+}
+
+const isRunMarkerChar = (char) => /[A-Za-z0-9.-]/.test(char ?? '');
+function lastExactMarkerAt(text, wanted) {
+  let found = -1;
+  let from = 0;
+  while (from <= text.length - wanted.length) {
+    const at = text.indexOf(wanted, from);
+    if (at < 0) break;
+    const before = at > 0 ? text[at - 1] : '';
+    const after = text[at + wanted.length] ?? '';
+    if (!isRunMarkerChar(before) && !isRunMarkerChar(after)) found = at;
+    from = at + 1;
+  }
+  return found;
+}
+const hasExactMarker = (text, wanted) => !!text && lastExactMarkerAt(text, wanted) >= 0;
+
+function ownedOrganizerText(text) {
+  return hasExactMarker(text, marker) && !foreignAnswerMarker(text);
+}
+
+async function openOrganizerScratch(url) {
+  let target = null;
+  try {
+    let response = await fetch(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(url)}`, { method: 'PUT' });
+    if (!response.ok) response = await fetch(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(url)}`);
+    if (!response.ok) return { target: null, reason: 'memo-open-failed' };
+    target = await response.json();
+    const renderDeadline = Math.min(deadline, Date.now() + 25_000);
+    let sawLogin = false;
+    while (Date.now() < renderDeadline) {
+      await sleep(Math.min(250, Math.max(0, renderDeadline - Date.now())));
+      let live = target;
+      try {
+        const tabs = await (await fetch(`http://127.0.0.1:${port}/json`)).json();
+        live = tabs.find((tab) => tab.id === target.id) ?? null;
+      } catch { return { target, reason: 'cdp-list-failed' }; }
+      if (!live) return { target, reason: 'memo-tab-disappeared' };
+      if (live.url !== url) return { target: live, reason: 'memo-url-drift' };
+      const text = await tabText(live);
+      if (!text) continue;
+      if (isThrottlePage(text)) return { target: live, reason: 'throttle' };
+      if (hasExactMarker(text, marker)) {
+        return foreignAnswerMarker(text)
+          ? { target: live, reason: 'cross-bound' }
+          : { target: live, text, reason: 'ok' };
+      }
+      if (FOREIGN_MARKER_RE.test(text)) return { target: live, reason: 'stale-memo' };
+      if (/\b(log in|sign up)\b/i.test(text) && text.length < 10_000) sawLogin = true;
+    }
+    return { target, reason: sawLogin ? 'login-wall' : 'memo-not-hydrated' };
+  } catch {
+    return { target, reason: 'memo-open-failed' };
+  }
+}
+
+function organizerUiStatus(result, action) {
+  if (!result.ok || !result.value || typeof result.value !== 'object') {
+    return { status: 'failed', reason: `${action}-evaluate-failed` };
+  }
+  const status = result.value.status;
+  if (action === 'rename' && ['renamed', 'already'].includes(status)) return { status, reason: 'ok' };
+  if (action === 'archive' && ['archived', 'already'].includes(status)) return { status, reason: 'ok' };
+  if (status === 'skipped') return { status, reason: `${action}-${organizerToken(result.value.reason, 'skipped')}` };
+  return { status: 'failed', reason: `${action}-ui-failed` };
+}
+
+async function validateOrganizerTarget(target, expectedUrl) {
+  let tabs;
+  try {
+    tabs = await (await fetch(`http://127.0.0.1:${port}/json`)).json();
+  } catch {
+    return { ok: false, reason: 'cdp-list-failed', tab: null };
+  }
+  const live = Array.isArray(tabs) ? tabs.find((tab) => tab.id === target?.id) : null;
+  if (!live) return { ok: false, reason: 'target-disappeared', tab: null };
+  if (live.url !== expectedUrl) return { ok: false, reason: 'target-url-drift', tab: live };
+  const text = await tabText(live);
+  if (!ownedOrganizerText(text)) return { ok: false, reason: 'ownership-drift', tab: live };
+  return { ok: true, reason: 'ok', tab: live, text };
+}
+
+async function organizeConversation() {
+  const result = {
+    source: 'none',
+    renameStatus: rename ? 'skipped' : 'disabled',
+    archiveStatus: archive ? 'skipped' : 'disabled',
+    closeStatus: 'skipped',
+    reason: 'ok',
+  };
+  if (!MARKER_SAFE_RE.test(marker)) return { ...result, reason: 'invalid-marker' };
+
+  const rememberedUrl = recallUrl(marker);
+  const title = recallTitle(marker);
+  let tabs;
+  try {
+    tabs = (await (await fetch(`http://127.0.0.1:${port}/json`)).json())
+      .filter((tab) => tab.type === 'page' && /^https:\/\/chatgpt\.com\/c\//.test(tab.url || ''));
+  } catch { return { ...result, reason: 'cdp-list-failed' }; }
+
+  const reads = await Promise.all(tabs.map(async (tab) => ({ tab, text: await tabText(tab) })));
+  const candidatesByUrl = new Map();
+  const conflictedUrls = new Set();
+  let rejectionReason = 'owned-target-not-found';
+  for (const { tab, text } of reads) {
+    if (!text) continue;
+    if (isThrottlePage(text)) {
+      rejectionReason = 'throttle';
+      continue;
+    }
+    if (!hasExactMarker(text, marker)) continue;
+    if (foreignAnswerMarker(text)) {
+      conflictedUrls.add(tab.url);
+      rejectionReason = 'cross-bound';
+      continue;
+    }
+    if (nonMatching.has(tab.url)) {
+      rejectionReason = 'provenance-rejected';
+      continue;
+    }
+    if (!candidatesByUrl.has(tab.url)) candidatesByUrl.set(tab.url, []);
+    candidatesByUrl.get(tab.url).push({ tab, text });
+  }
+  for (const url of conflictedUrls) candidatesByUrl.delete(url);
+
+  let target = null;
+  let source = 'none';
+  let scratch = null;
+  const candidateUrls = [...candidatesByUrl.keys()];
+  if (candidateUrls.length > 0) {
+    const selectedUrl = rememberedUrl && candidatesByUrl.has(rememberedUrl)
+      ? rememberedUrl
+      : candidateUrls.length === 1 ? candidateUrls[0] : null;
+    if (!selectedUrl) return { ...result, reason: 'ambiguous-owned-targets' };
+    target = candidatesByUrl.get(selectedUrl)[0].tab;
+    source = 'open';
+  } else if (rememberedUrl) {
+    if (nonMatching.has(rememberedUrl)) return { ...result, reason: 'provenance-rejected' };
+    scratch = await openOrganizerScratch(rememberedUrl);
+    if (!scratch.text || !scratch.target) {
+      if (scratch.target?.id) await closeTab(scratch.target.id);
+      return { ...result, reason: scratch.reason };
+    }
+    target = scratch.target;
+    source = 'memo';
+  } else {
+    return { ...result, reason: rejectionReason };
+  }
+
+  result.source = source;
+  const targetUrl = target.url;
+  rememberUrl(marker, targetUrl);
+  try {
+    const before = await validateOrganizerTarget(target, targetUrl);
+    if (!before.ok) return { ...result, reason: before.reason };
+    target = before.tab;
+
+    if (rename) {
+      if (!title) {
+        result.renameStatus = 'skipped';
+        result.reason = 'title-memo-missing';
+      } else {
+        const renameOutcome = organizerUiStatus(
+          await evaluateTab(target, buildRenameConversationExpression(title, {
+            marker,
+            conversationUrl: targetUrl,
+          }), true),
+          'rename',
+        );
+        result.renameStatus = renameOutcome.status;
+        if (renameOutcome.reason !== 'ok') result.reason = renameOutcome.reason;
+      }
+    }
+
+    const afterRename = await validateOrganizerTarget(target, targetUrl);
+    if (!afterRename.ok) {
+      if (result.reason === 'ok') result.reason = afterRename.reason;
+      result.archiveStatus = archive ? 'skipped' : 'disabled';
+      return result;
+    }
+    target = afterRename.tab;
+
+    let closeAuthorized = false;
+    if (archive) {
+      const archiveOutcome = organizerUiStatus(
+        await evaluateTab(target, buildArchiveConversationExpression({
+          marker,
+          conversationUrl: targetUrl,
+        }), true),
+        'archive',
+      );
+      result.archiveStatus = archiveOutcome.status;
+      if (archiveOutcome.reason !== 'ok' && result.reason === 'ok') result.reason = archiveOutcome.reason;
+      closeAuthorized = ['archived', 'already'].includes(archiveOutcome.status);
+    }
+
+    if (finalize && !closeAuthorized) {
+      const beforeClose = await validateOrganizerTarget(target, targetUrl);
+      closeAuthorized = beforeClose.ok;
+      if (beforeClose.ok) target = beforeClose.tab;
+      else if (result.reason === 'ok') result.reason = beforeClose.reason;
+    }
+    if (finalize && closeAuthorized) {
+      result.closeStatus = await closeTab(target.id) ? 'closed' : 'failed';
+      if (result.closeStatus === 'failed' && result.reason === 'ok') result.reason = 'close-failed';
+    }
+    return result;
+  } finally {
+    if (source === 'memo' && target?.id && result.closeStatus !== 'closed') {
+      const closed = await closeTab(target.id);
+      if (closed) result.closeStatus = 'closed';
+    }
+  }
+}
+
+if (organize) {
+  let result;
+  try {
+    result = await organizeConversation();
+  } catch {
+    result = {
+      source: 'none',
+      renameStatus: rename ? 'failed' : 'disabled',
+      archiveStatus: archive ? 'failed' : 'disabled',
+      closeStatus: 'skipped',
+      reason: 'organizer-exception',
+    };
+  }
+  emitOrganizerResult(result);
+  process.exit(0);
 }
 
 // One place where a marker-matched page turns into an outcome, so the live-tab scan, the

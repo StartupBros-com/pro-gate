@@ -35,9 +35,9 @@ exit 99
 FAKE_PREFLIGHT
 chmod +x "$TDIR/bin/oracle-preflight"
 
-start_mock() { # $1 = tab text file; sets MOCK_PID + PORT
+start_mock() { # $1 = tab text file; optional $2 = organizer state file; sets MOCK_PID + PORT
   [ -n "${MOCK_PID:-}" ] && kill "$MOCK_PID" 2>/dev/null
-  node "$HERE/mock-cdp.mjs" "$1" > "$TDIR/port" 2>"$TDIR/mock.log" &
+  node "$HERE/mock-cdp.mjs" "$1" "${2:-}" > "$TDIR/port" 2>"$TDIR/mock.log" &
   MOCK_PID=$!
   for _ in $(seq 1 50); do [ -s "$TDIR/port" ] && break; sleep 0.1; done
   PORT="$(tr -d '[:space:]' < "$TDIR/port")"; : > "$TDIR/port"
@@ -53,7 +53,12 @@ run_engine() { # args... ; captures RC
 
 echo '# hard-ceiling refusal (exit 11): only diffs past PRO_GATE_DIFF_HARD_MAX are refused'
 printf 'still thinking, run marker: %s\n' "$MARKER" > "$TDIR/tab.txt"
-start_mock "$TDIR/tab.txt"
+ORGANIZER_STATE="$TDIR/organizer-state.json"
+ORGANIZER_TITLE='pro-gate review: PR #77 r1 [engine-fixture]'
+printf '{"title":null,"archived":false,"events":[]}\n' > "$ORGANIZER_STATE"
+mkdir -p "$TDIR/home/conversation-titles"
+printf '%s\n' "$ORGANIZER_TITLE" > "$TDIR/home/conversation-titles/$MARKER"
+start_mock "$TDIR/tab.txt" "$ORGANIZER_STATE"
 # > default hard ceiling (25000): still refused up front, no slot spent.
 seq 1 26000 | sed 's/^/+/' > "$TDIR/huge.diff"
 run_engine --diff "$TDIR/huge.diff" --repo "$TDIR" --out "$TDIR/o-big.md" --timeout 5m
@@ -90,6 +95,9 @@ run_engine --harvest "$MARKER" --out "$TDIR/o-h1.md" --timeout 5s
 check 'harvest in-progress exits 9' "$([ "$RC" -eq 9 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
 check 'harvest in-progress phase' "$([ "$(phase_of "$TDIR/o-h1.md.status")" = in-progress ]; echo $?)" "$(cat "$TDIR/o-h1.md.status" 2>/dev/null)"
 check 'harvest keeps the tab' "$(! grep -q 'closed tab1' "$TDIR/mock.log"; echo $?)" "$(cat "$TDIR/mock.log")"
+check 'exit-9 organizer exact-renames the owned conversation' "$([ "$(jq -r .title "$ORGANIZER_STATE")" = "$ORGANIZER_TITLE" ]; echo $?)" "$(cat "$ORGANIZER_STATE")"
+check 'exit-9 organizer never archives' "$([ "$(jq -r .archived "$ORGANIZER_STATE")" = false ]; echo $?)" "$(cat "$ORGANIZER_STATE")"
+check 'exit-9 organizer performs rename only' "$([ "$(jq -r '[.events[].action] | join(",")' "$ORGANIZER_STATE")" = rename ]; echo $?)" "$(cat "$ORGANIZER_STATE")"
 check 'status carries the marker' "$(grep -qF "\"marker\":\"$MARKER\"" "$TDIR/o-h1.md.status"; echo $?)" "$(cat "$TDIR/o-h1.md.status" 2>/dev/null)"
 check 'in-progress writes durable reservation' "$([ -f "$TDIR/home/in-progress/$MARKER" ]; echo $?)" "reservation missing"
 
@@ -154,6 +162,9 @@ check 'harvest done exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$T
 check 'harvest done phase' "$([ "$(phase_of "$TDIR/o-h2.md.status")" = done ]; echo $?)" "$(cat "$TDIR/o-h2.md.status" 2>/dev/null)"
 check 'harvest writes the review' "$(grep -q 'VERDICT: SHIP' "$TDIR/o-h2.md"; echo $?)" "$(head -c 200 "$TDIR/o-h2.md" 2>/dev/null)"
 check 'harvest closes the tab' "$(grep -q 'closed tab1' "$TDIR/mock.log"; echo $?)" "$(cat "$TDIR/mock.log")"
+check 'durable harvest archives the server conversation' "$([ "$(jq -r .archived "$ORGANIZER_STATE")" = true ]; echo $?)" "$(cat "$ORGANIZER_STATE")"
+check 'durable harvest organizes rename before archive' "$([ "$(jq -r '[.events[].action] | join(",")' "$ORGANIZER_STATE")" = 'rename,archive' ]; echo $?)" "$(cat "$ORGANIZER_STATE")"
+check 'durable harvest has marker-addressed completed bytes before cleanup' "$([ -s "$TDIR/home/completed/$MARKER" ] && cmp -s "$TDIR/home/completed/$MARKER" "$TDIR/o-h2.md"; echo $?)" "completed=$(ls "$TDIR/home/completed" 2>/dev/null)"
 check 'successful harvest releases reservation' "$([ ! -f "$TDIR/home/in-progress/$MARKER" ]; echo $?)" "reservation leaked"
 
 echo '# harvest: already collected (v0.28) vs genuinely gone'
@@ -330,11 +341,12 @@ printf '[P1] a.sh:1 - finding\n  Why: test\nP2: none\nP3: none\nVERDICT: SHIP - 
 FAKE_EV
 chmod +x "$TDIR/bin/oracle-evidence"
 
-freshrun() { # $1=home $2=argv-file $3=evidence $4=out [extra STRATEGY via $5]
+freshrun() { # $1=home $2=argv-file $3=evidence $4=out [strategy] [legacy browser archive]
   rm -rf "$1"; mkdir -p "$1/in-progress"; : > "$2"; printf 'foreign idle tab\n' > "$TDIR/tab.txt"
   PRO_GATE_HOME="$1" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
     PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
-    PRO_GATE_MODEL_STRATEGY="${5:-current}" PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-evidence" \
+    PRO_GATE_MODEL_STRATEGY="${5:-current}" PRO_GATE_BROWSER_ARCHIVE="${6:-never}" \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-evidence" \
     PG_TEST_ARGV_FILE="$2" PG_TEST_EVIDENCE="$3" NODE_OPTIONS= \
     bash "$ENGINE" --diff "$TDIR/small.diff" --repo "$TDIR" --out "$4" --timeout 5s \
     >"$TDIR/stdout" 2>"$TDIR/stderr"
@@ -348,6 +360,8 @@ check 'default run requests strategy current' "$(grep -q -- '--browser-model-str
 freshrun "$TDIR/home-u1b" "$TDIR/argv-sel.txt" "$EV_PRO" "$TDIR/o-u1b.md" select
 check 'PRO_GATE_MODEL_STRATEGY=select passes select' "$(grep -q -- '--browser-model-strategy select' "$TDIR/argv-sel.txt"; echo $?)" "argv=$(head -1 "$TDIR/argv-sel.txt")"
 check 'select still passes -m requested hint' "$(grep -q -- '-m gpt-5.6' "$TDIR/argv-sel.txt"; echo $?)" "argv=$(head -1 "$TDIR/argv-sel.txt")"
+freshrun "$TDIR/home-u1c" "$TDIR/argv-archive.txt" "$EV_PRO" "$TDIR/o-u1c.md" current always
+check 'explicit PRO_GATE_BROWSER_ARCHIVE passes through unchanged' "$(grep -q -- '--browser-archive always' "$TDIR/argv-archive.txt"; echo $?)" "argv=$(head -1 "$TDIR/argv-archive.txt")"
 
 # Fallback: a `select` run whose requested model is not selectable (oracle emits "... in the model
 # switcher") must auto-fall-back to `current` and still produce a review, not fail the whole run
@@ -1432,6 +1446,88 @@ FLINE="$(tail -1 "$TDIR/home/ledger.jsonl")"
 # v0.30 (#50 item 3): pr is the key's trailing NUMBER; round_key keeps the scoped key.
 check 'fast-path ledger row carries pr + round_key' "$([ "$(printf '%s' "$FLINE" | jq -r .pr)" = "4" ] && [ "$(printf '%s' "$FLINE" | jq -r .round_key)" = "artifact-4" ]; echo $?)" "$FLINE"
 check 'fast-path ledger row records the artifact digest' "$([ "$(printf '%s' "$FLINE" | jq -r '.sha256 // ""')" = "$(sha256sum "$TDIR/home/completed/$M9" | awk '{print $1}')" ]; echo $?)" "$FLINE"
+check 'organizer CDP failure preserves artifact-first exit 0 + output' "$([ "$RC" -eq 0 ] && cmp -s "$TDIR/o-artifact2.md" "$TDIR/prov-ours.md" && grep -q 'reason=cdp-list-failed' "$TDIR/stderr"; echo $?)" "rc=$RC stderr=$(tail -2 "$TDIR/stderr")"
+
+run_artifact_organizer_case() { # <case-id> <marker> [NAME=VALUE ...]
+  local case_id="$1" marker="$2"; shift 2
+  CASE_HOME="$TDIR/home-$case_id"
+  CASE_STATE="$TDIR/state-$case_id.json"
+  CASE_OUT="$TDIR/out-$case_id.md"
+  CASE_TITLE="pro-gate review: PR #${marker##*-} r1 [$case_id]"
+  mkdir -p "$CASE_HOME/completed" "$CASE_HOME/conversation-titles"
+  cp "$TDIR/prov-ours.md" "$CASE_HOME/completed/$marker"
+  printf '%s\n' "$CASE_TITLE" > "$CASE_HOME/conversation-titles/$marker"
+  printf '{"title":null,"archived":false,"events":[]}\n' > "$CASE_STATE"
+  printf 'run marker: %s\nowned artifact conversation\n' "$marker" > "$TDIR/tab.txt"
+  start_mock "$TDIR/tab.txt" "$CASE_STATE"
+  env PRO_GATE_HOME="$CASE_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+    PRO_GATE_SELF_HEAL=0 NODE_OPTIONS= "$@" bash "$ENGINE" --harvest "$marker" \
+    --out "$CASE_OUT" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+  CASE_RC=$?
+}
+
+echo '# v0.32: successful organizer controls preserve independent semantics'
+MCFG1='pg-run-config-201-1700000201-21'
+run_artifact_organizer_case archive-off "$MCFG1" PRO_GATE_CHAT_ARCHIVE=0
+check 'CHAT_ARCHIVE=0 keeps exit 0 and exact rename' "$([ "$CASE_RC" -eq 0 ] && [ "$(jq -r .title "$CASE_STATE")" = "$CASE_TITLE" ] && [ "$(jq -r .archived "$CASE_STATE")" = false ]; echo $?)" "rc=$CASE_RC state=$(cat "$CASE_STATE")"
+check 'CHAT_ARCHIVE=0 still closes the verified local tab' "$(grep -q 'closed tab1' "$TDIR/mock.log"; echo $?)" "$(cat "$TDIR/mock.log")"
+
+MCFG2='pg-run-config-202-1700000202-22'
+run_artifact_organizer_case rename-off "$MCFG2" PRO_GATE_CHAT_RENAME=0
+check 'CHAT_RENAME=0 still archives durable success' "$([ "$CASE_RC" -eq 0 ] && [ "$(jq -r .title "$CASE_STATE")" = null ] && [ "$(jq -r .archived "$CASE_STATE")" = true ]; echo $?)" "rc=$CASE_RC state=$(cat "$CASE_STATE")"
+check 'CHAT_RENAME=0 performs archive only, then closes' "$([ "$(jq -r '[.events[].action] | join(",")' "$CASE_STATE")" = archive ] && grep -q 'closed tab1' "$TDIR/mock.log"; echo $?)" "state=$(cat "$CASE_STATE") log=$(cat "$TDIR/mock.log")"
+
+MCFG3='pg-run-config-203-1700000203-23'
+run_artifact_organizer_case keep-tabs "$MCFG3" PRO_GATE_KEEP_TABS=1
+check 'KEEP_TABS=1 permits exact rename but suppresses archive' "$([ "$CASE_RC" -eq 0 ] && [ "$(jq -r .title "$CASE_STATE")" = "$CASE_TITLE" ] && [ "$(jq -r .archived "$CASE_STATE")" = false ]; echo $?)" "rc=$CASE_RC state=$(cat "$CASE_STATE")"
+check 'KEEP_TABS=1 leaves the local tab open' "$(! grep -q 'closed tab1' "$TDIR/mock.log"; echo $?)" "$(cat "$TDIR/mock.log")"
+
+MCFG4='pg-run-config-204-1700000204-24'
+run_artifact_organizer_case invalid-bools "$MCFG4" PRO_GATE_CHAT_RENAME=yes PRO_GATE_CHAT_ARCHIVE=yes
+check 'invalid mutation booleans warn and disable both UI mutations' "$([ "$CASE_RC" -eq 0 ] && [ "$(jq -r '.events | length' "$CASE_STATE")" = 0 ] && grep -q 'invalid PRO_GATE_CHAT_RENAME' "$TDIR/stderr" && grep -q 'invalid PRO_GATE_CHAT_ARCHIVE' "$TDIR/stderr"; echo $?)" "rc=$CASE_RC state=$(cat "$CASE_STATE") stderr=$(grep 'invalid PRO_GATE_CHAT' "$TDIR/stderr")"
+check 'invalid mutation booleans still permit verified local cleanup' "$(grep -q 'closed tab1' "$TDIR/mock.log"; echo $?)" "$(cat "$TDIR/mock.log")"
+
+MCFG5='pg-run-config-205-1700000205-25'
+run_artifact_organizer_case native "$MCFG5" PRO_GATE_BROWSER_MODE=native
+check 'native artifact recovery performs no CDP organization' "$([ "$CASE_RC" -eq 0 ] && [ "$(jq -r '.events | length' "$CASE_STATE")" = 0 ] && ! grep -q 'closed tab1' "$TDIR/mock.log"; echo $?)" "rc=$CASE_RC state=$(cat "$CASE_STATE") log=$(cat "$TDIR/mock.log")"
+
+echo '# v0.32: pending durability archives; volatile-only success stays recoverable'
+run_harvest_durability_case() { # <case-id> <marker> <block-pending:0|1>
+  local case_id="$1" marker="$2" block_pending="$3"
+  CASE_HOME="$TDIR/home-$case_id"
+  CASE_STATE="$TDIR/state-$case_id.json"
+  CASE_OUT="$TDIR/out-$case_id.md"
+  CASE_TITLE="pro-gate review: PR #206 r1 [$case_id]"
+  mkdir -p "$CASE_HOME/in-progress" "$CASE_HOME/manifests" "$CASE_HOME/conversation-titles"
+  printf 'config-206\t%s\t%s\t0\t1\tGPT-X\n' "$CASE_OUT" "$(date +%s)" > "$CASE_HOME/in-progress/$marker"
+  printf 'src/real.sh\n' > "$CASE_HOME/manifests/$marker"
+  printf '%s\n' "$CASE_TITLE" > "$CASE_HOME/conversation-titles/$marker"
+  [ "$block_pending" = 1 ] && printf 'not-a-directory\n' > "$CASE_HOME/pending"
+  printf '{"title":null,"archived":false,"events":[]}\n' > "$CASE_STATE"
+  {
+    printf 'run marker: %s\n' "$marker"
+    printf '[P1] src/real.sh:1 - finding\n  Why: test\nP2: none\nP3: none\nVERDICT: SHIP - fixture. (run marker: %s)\n' "$marker"
+  } > "$TDIR/tab.txt"
+  start_mock "$TDIR/tab.txt" "$CASE_STATE"
+  env PRO_GATE_HOME="$CASE_HOME" PRO_GATE_COMPLETED_DIR="$TDIR/completed-block-$case_id" \
+    ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 NODE_OPTIONS= \
+    bash "$ENGINE" --harvest "$marker" --out "$CASE_OUT" --timeout 5s \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+  CASE_RC=$?
+}
+
+printf 'not-a-directory\n' > "$TDIR/completed-block-pending"
+MPEND='pg-run-config-206-1700000206-26'
+run_harvest_durability_case pending "$MPEND" 0
+check 'pending fallback is a durable exit-0 result' "$([ "$CASE_RC" -eq 0 ] && [ -s "$CASE_HOME/pending/$MPEND" ] && grep -q "RESULT_FILE=$CASE_HOME/pending/$MPEND" "$TDIR/stdout"; echo $?)" "rc=$CASE_RC stdout=$(grep RESULT_FILE "$TDIR/stdout")"
+check 'pending fallback still archives and closes' "$([ "$(jq -r .archived "$CASE_STATE")" = true ] && grep -q 'closed tab1' "$TDIR/mock.log"; echo $?)" "state=$(cat "$CASE_STATE") log=$(cat "$TDIR/mock.log")"
+
+printf 'not-a-directory\n' > "$TDIR/completed-block-volatile"
+MVOL='pg-run-config-207-1700000207-27'
+run_harvest_durability_case volatile "$MVOL" 1
+check 'volatile-only persistence still returns exit 0 with explicit warning' "$([ "$CASE_RC" -eq 0 ] && grep -q 'no durable store writable' "$TDIR/stderr"; echo $?)" "rc=$CASE_RC stderr=$(grep 'no durable store' "$TDIR/stderr")"
+check 'volatile-only success exact-renames but never archives' "$([ "$(jq -r .title "$CASE_STATE")" = "$CASE_TITLE" ] && [ "$(jq -r .archived "$CASE_STATE")" = false ]; echo $?)" "state=$(cat "$CASE_STATE")"
+check 'volatile-only success leaves the local tab open and reservation held' "$(! grep -q 'closed tab1' "$TDIR/mock.log" && [ -f "$CASE_HOME/in-progress/$MVOL" ]; echo $?)" "log=$(cat "$TDIR/mock.log") reservation=$(ls "$CASE_HOME/in-progress" 2>/dev/null)"
 
 echo '# v0.28: provenance rejection blacklists precisely (compare-and-delete memo)'
 mkdir -p "$SHOME/conversation-urls"
@@ -1530,7 +1626,9 @@ exit 1
 EARLY
 chmod +x "$TDIR/bin/oracle-early"
 printf 'no marker yet\n' > "$TDIR/tab.txt"
-start_mock "$TDIR/tab.txt"
+EARLY_STATE="$TDIR/early-organizer-state.json"
+printf '{"title":null,"archived":false,"events":[]}\n' > "$EARLY_STATE"
+start_mock "$TDIR/tab.txt" "$EARLY_STATE"
 rm -rf "$TDIR/home/conversation-urls"; mkdir -p "$TDIR/home/in-progress"
 env PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
   PRO_GATE_RAMP=0 PRO_GATE_MAX_RETRIES=0 PRO_GATE_EARLY_PROBE_SECS=1 \
@@ -1542,8 +1640,55 @@ RC=$?
 check 'early-capture run preserves as in-progress (exit 9)' "$([ "$RC" -eq 9 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
 check 'conversation URL memo written DURING generation' "$(ls "$TDIR/home/conversation-urls/" 2>/dev/null | grep -q 'pg-run-'; echo $?)" "$(ls "$TDIR/home/conversation-urls/" 2>/dev/null)"
 EARLY_MARKER="$(ls "$TDIR/home/in-progress/" 2>/dev/null | grep -m1 -E 'pg-run-.*-120-')"
+check 'early organizer applies the marker memo title exactly' "$([ -n "$EARLY_MARKER" ] && [ "$(jq -r .title "$EARLY_STATE")" = "$(cat "$TDIR/home/conversation-titles/$EARLY_MARKER" 2>/dev/null)" ]; echo $?)" "state=$(cat "$EARLY_STATE") memo=$(cat "$TDIR/home/conversation-titles/$EARLY_MARKER" 2>/dev/null)"
+check 'early organizer leaves in-progress conversation unarchived' "$([ "$(jq -r .archived "$EARLY_STATE")" = false ] && ! grep -q 'closed tab1' "$TDIR/mock.log"; echo $?)" "state=$(cat "$EARLY_STATE") log=$(cat "$TDIR/mock.log")"
+check 'early organizer diagnostic is persisted in the run log' "$(grep -Rqs '^\[oracle-review\] organizer source=' "$TDIR/home/logs"; echo $?)" "$(find "$TDIR/home/logs" -maxdepth 1 -type f -print 2>/dev/null)"
 check 'change manifest written beside the reservation' "$([ -n "$EARLY_MARKER" ] && [ -s "$TDIR/home/manifests/$EARLY_MARKER" ]; echo $?)" "manifests: $(ls "$TDIR/home/manifests" 2>/dev/null)"
 check 'nonce expectation flag recorded' "$([ -n "$EARLY_MARKER" ] && [ -f "$TDIR/home/manifests/$EARLY_MARKER.nonce" ]; echo $?)" "manifests: $(ls "$TDIR/home/manifests" 2>/dev/null)"
+
+echo '# v0.32: a failed owned run stays named, unarchived, and locally untouched'
+cat > "$TDIR/bin/oracle-early-failed" <<'EARLY_FAIL'
+#!/usr/bin/env bash
+[ "${1:-}" = session ] && exit 1
+marker=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p) marker="$(printf '%s' "$2" | grep -oE 'pg-run-[A-Za-z0-9.-]+' | head -1)"; shift 2;;
+    *) shift;;
+  esac
+done
+printf 'still thinking, run marker: %s\n' "$marker" > "${PG_TEST_TAB_FILE:?}"
+printf 'Acquired ChatGPT browser slot\n' >&2
+# Wait until the early organizer has positively owned and named the chat, then model a browser-
+# local loss that final salvage can prove absent. Removing the remembered URL is intentional:
+# without that decisive loss signal the engine correctly preserves as in-progress (exit 9).
+for _ in $(seq 1 60); do
+  grep -q '"title":"pro-gate review:' "${PG_TEST_STATE_FILE:?}" 2>/dev/null && break
+  sleep 0.1
+done
+rm -f "${PRO_GATE_HOME:?}/conversation-urls/$marker"
+printf '__NO_TABS__' > "$PG_TEST_TAB_FILE"
+exit 1
+EARLY_FAIL
+chmod +x "$TDIR/bin/oracle-early-failed"
+FAIL_HOME="$TDIR/home-organizer-failed"
+FAIL_STATE="$TDIR/state-organizer-failed.json"
+mkdir -p "$FAIL_HOME"
+printf '{"title":null,"archived":false,"events":[]}\n' > "$FAIL_STATE"
+printf 'no marker yet\n' > "$TDIR/tab.txt"
+start_mock "$TDIR/tab.txt" "$FAIL_STATE"
+env PRO_GATE_HOME="$FAIL_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_MAX_RETRIES=0 \
+  PRO_GATE_EARLY_PROBE_SECS=1 PRO_GATE_REATTACH_TIMEOUT=1 PRO_GATE_SALVAGE_SECS=2 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-early-failed" PG_TEST_TAB_FILE="$TDIR/tab.txt" \
+  PG_TEST_STATE_FILE="$FAIL_STATE" NODE_OPTIONS= \
+  bash "$ENGINE" --pr 121 --repo "$TDIR" --diff "$TDIR/small.diff" \
+  --out "$TDIR/o-organizer-failed.md" --timeout 8s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+FAIL_MARKER="$(jq -r .marker "$TDIR/o-organizer-failed.md.status" 2>/dev/null)"
+check 'owned failed run exits 6 after decisive loss' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC stderr=$(tail -3 "$TDIR/stderr")"
+check 'owned failed run keeps its exact early title' "$([ -n "$FAIL_MARKER" ] && [ "$(jq -r .title "$FAIL_STATE")" = "$(cat "$FAIL_HOME/conversation-titles/$FAIL_MARKER" 2>/dev/null)" ]; echo $?)" "state=$(cat "$FAIL_STATE") marker=$FAIL_MARKER"
+check 'owned failed run is never archived or locally closed' "$([ "$(jq -r .archived "$FAIL_STATE")" = false ] && [ "$(jq -r '[.events[].action] | join(",")' "$FAIL_STATE")" = rename ] && ! grep -q 'closed tab1' "$TDIR/mock.log"; echo $?)" "state=$(cat "$FAIL_STATE") log=$(cat "$TDIR/mock.log")"
 
 echo '# v0.28: direct capture with an echoed nonce is stripped before output'
 cat > "$TDIR/bin/oracle-nonce" <<'NONCE'
@@ -1571,6 +1716,40 @@ RC=$?
 check 'direct nonce capture exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
 check 'direct capture nonce stripped' "$(grep -q 'run marker' "$TDIR/o-directnonce.md"; [ $? -ne 0 ]; echo $?)" "$(tail -1 "$TDIR/o-directnonce.md" 2>/dev/null)"
 
+echo '# v0.32: a delayed early organizer cannot wake after terminal archive/close'
+cat > "$TDIR/bin/oracle-organizer-race" <<'RACE'
+#!/usr/bin/env bash
+out=""; marker=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p) marker="$(printf '%s' "$2" | grep -oE 'pg-run-[A-Za-z0-9.-]+' | head -1)"; shift 2;;
+    --write-output) out="$2"; shift 2;;
+    *) shift;;
+  esac
+done
+printf 'still thinking, run marker: %s\n' "$marker" > "${PG_TEST_TAB_FILE:?}"
+printf '[P1] a.sh:1 - finding\n  Why: test\nP2: none\nP3: none\nVERDICT: SHIP - fixture. (run marker: %s)\n' "$marker" > "$out"
+RACE
+chmod +x "$TDIR/bin/oracle-organizer-race"
+RACE_HOME="$TDIR/home-organizer-race"
+RACE_STATE="$TDIR/state-organizer-race.json"
+mkdir -p "$RACE_HOME"
+printf '{"title":null,"archived":false,"events":[]}\n' > "$RACE_STATE"
+printf 'no marker yet\n' > "$TDIR/tab.txt"
+start_mock "$TDIR/tab.txt" "$RACE_STATE"
+RACE_START="$(date +%s)"
+env PRO_GATE_HOME="$RACE_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_MAX_RETRIES=0 \
+  PRO_GATE_EARLY_PROBE_SECS=15 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-organizer-race" \
+  PG_TEST_TAB_FILE="$TDIR/tab.txt" NODE_OPTIONS= \
+  bash "$ENGINE" --pr 132 --repo "$TDIR" --diff "$TDIR/small.diff" \
+  --out "$TDIR/o-organizer-race.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+RACE_ELAPSED=$(( $(date +%s) - RACE_START ))
+check 'terminal success beats the delayed organizer timer' "$([ "$RC" -eq 0 ] && [ "$RACE_ELAPSED" -lt 15 ] && grep -q 'closed tab1' "$TDIR/mock.log"; echo $?)" "rc=$RC elapsed=$RACE_ELAPSED log=$(cat "$TDIR/mock.log")"
+sleep 6
+check 'revoked early organizer performs no post-finalization render or mutation' "$([ "$(jq -r '[.events[].action] | join(",")' "$RACE_STATE")" = 'rename,archive' ] && ! grep -q '^opened scratch' "$TDIR/mock.log"; echo $?)" "state=$(cat "$RACE_STATE") log=$(cat "$TDIR/mock.log")"
+
 echo '# v0.29: the prompt leads with the run-naming title line (#49 phase 1)'
 cat > "$TDIR/bin/oracle-dump" <<'DUMP'
 #!/usr/bin/env bash
@@ -1594,6 +1773,9 @@ env PRO_GATE_HOME="$TDIR/home-title" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UP
 RC=$?
 check 'title-line run exits 0 (nonce echoed back from the dumped prompt)' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
 check 'prompt first line names the run + round' "$(head -1 "$TDIR/prompt-dump.txt" 2>/dev/null | grep -q '^pro-gate review: PR #132 r1 \['; echo $?)" "first line: $(head -1 "$TDIR/prompt-dump.txt" 2>/dev/null)"
+TITLE_MARKER="$(jq -r .marker "$TDIR/o-title.md.status" 2>/dev/null)"
+check 'marker-scoped title memo equals the prompt title exactly' "$([ -n "$TITLE_MARKER" ] && [ "$(cat "$TDIR/home-title/conversation-titles/$TITLE_MARKER" 2>/dev/null)" = "$(head -1 "$TDIR/prompt-dump.txt" 2>/dev/null)" ]; echo $?)" "marker=$TITLE_MARKER memo=$(cat "$TDIR/home-title/conversation-titles/$TITLE_MARKER" 2>/dev/null)"
+check 'title memo publication leaves no partial temp file' "$(! find "$TDIR/home-title/conversation-titles" -maxdepth 1 -name '*.tmp.*' -print -quit | grep -q .; echo $?)" "$(find "$TDIR/home-title/conversation-titles" -maxdepth 1 -type f 2>/dev/null)"
 # A second round of the SAME PR carries a distinct discriminator (gate #57 P1).
 env PRO_GATE_HOME="$TDIR/home-title" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
   PRO_GATE_RAMP=0 PRO_GATE_MAX_RETRIES=0 PG_TEST_PROMPT_DUMP="$TDIR/prompt-dump2.txt" \

@@ -79,7 +79,7 @@ done
 cleanup() {
   local rc=$?
   if [ "$rc" -ne 0 ] && [ "$DEPLOYING" = 1 ] && [ -n "$BACKUP" ]; then
-    for f in lib.sh oracle-review.sh pro-gate-doctor.sh pro-gate-stats.sh pro-gate-autoupdate.sh cdp-salvage.mjs daemon.sh run-daemon.sh run-oracle-chrome.sh login-view.sh VERSION EXPECTED_VERSION .deploy-stamp; do
+    for f in lib.sh oracle-review.sh pro-gate-doctor.sh pro-gate-stats.sh pro-gate-autoupdate.sh cdp-salvage.mjs cdp-organizer-expressions.mjs daemon.sh run-daemon.sh run-oracle-chrome.sh login-view.sh VERSION EXPECTED_VERSION .deploy-stamp; do
       if [ -e "$BACKUP/$f" ]; then mv -f "$BACKUP/$f" "$PRO_GATE_HOME/$f"; else rm -f "$PRO_GATE_HOME/$f"; fi
     done
   fi
@@ -262,7 +262,7 @@ fi
 
 mkdir -p "$PRO_GATE_HOME/logs" "$ORACLE_DIR"
 BACKUP="$TMP/backup"; mkdir -p "$BACKUP"
-for f in lib.sh oracle-review.sh pro-gate-doctor.sh pro-gate-stats.sh pro-gate-autoupdate.sh cdp-salvage.mjs daemon.sh run-daemon.sh run-oracle-chrome.sh login-view.sh VERSION EXPECTED_VERSION .deploy-stamp; do
+for f in lib.sh oracle-review.sh pro-gate-doctor.sh pro-gate-stats.sh pro-gate-autoupdate.sh cdp-salvage.mjs cdp-organizer-expressions.mjs daemon.sh run-daemon.sh run-oracle-chrome.sh login-view.sh VERSION EXPECTED_VERSION .deploy-stamp; do
   [ -e "$PRO_GATE_HOME/$f" ] && cp -p "$PRO_GATE_HOME/$f" "$BACKUP/$f"
 done
 DEPLOYING=1
@@ -273,6 +273,7 @@ put "$SOURCE_ROOT/bin/pro-gate-doctor.sh" "$PRO_GATE_HOME/pro-gate-doctor.sh"
 put "$SOURCE_ROOT/bin/pro-gate-stats.sh" "$PRO_GATE_HOME/pro-gate-stats.sh"
 put "$SOURCE_ROOT/bin/pro-gate-autoupdate.sh" "$PRO_GATE_HOME/pro-gate-autoupdate.sh"
 put "$SOURCE_ROOT/bin/cdp-salvage.mjs" "$PRO_GATE_HOME/cdp-salvage.mjs"
+put "$SOURCE_ROOT/bin/cdp-organizer-expressions.mjs" "$PRO_GATE_HOME/cdp-organizer-expressions.mjs"
 for f in daemon.sh run-daemon.sh run-oracle-chrome.sh login-view.sh; do put "$SOURCE_ROOT/daemon/$f" "$PRO_GATE_HOME/$f"; done
 [ -f "$PRO_GATE_HOME/.env" ] || cp "$SOURCE_ROOT/.env.example" "$PRO_GATE_HOME/.env"
 # .env can hold keys (PRO_GATE_PLUGIN_KEY etc.): owner-only, regardless of the box's umask

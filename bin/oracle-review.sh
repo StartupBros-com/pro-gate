@@ -508,6 +508,23 @@ PORT="${ORACLE_BROWSER_PORT:-9222}"
 # v0.28 (gate #54 r10): normalize the binding policy ONCE, fail-closed — "true"/"2"/typos
 # satisfied neither the =1 nor the =0 branch and bypassed both enforcement modes.
 case "${PRO_GATE_REQUIRE_NONCE:-1}" in 0) REQUIRE_NONCE=0;; *) REQUIRE_NONCE=1;; esac
+# v0.32: these controls gate independent UI mutations. Invalid booleans fail safe for only the
+# corresponding mutation; legacy PRO_GATE_KEEP_TABS and PRO_GATE_BROWSER_ARCHIVE retain their
+# exact historical interpretation below.
+CHAT_RENAME_DEFAULT=0
+[ "$MODE" = remote-chrome ] && CHAT_RENAME_DEFAULT=1
+case "${PRO_GATE_CHAT_RENAME:-$CHAT_RENAME_DEFAULT}" in
+  0) CHAT_RENAME=0;;
+  1) CHAT_RENAME=1;;
+  *) CHAT_RENAME=0
+     echo "[oracle-review] WARNING: invalid PRO_GATE_CHAT_RENAME='${PRO_GATE_CHAT_RENAME}'; conversation rename disabled for safety (use 0 or 1)." >&2 ;;
+esac
+case "${PRO_GATE_CHAT_ARCHIVE:-1}" in
+  0) CHAT_ARCHIVE=0;;
+  1) CHAT_ARCHIVE=1;;
+  *) CHAT_ARCHIVE=0
+     echo "[oracle-review] WARNING: invalid PRO_GATE_CHAT_ARCHIVE='${PRO_GATE_CHAT_ARCHIVE}'; conversation archive disabled for safety (use 0 or 1)." >&2 ;;
+esac
 MODEL="${ORACLE_MODEL:-gpt-5.6}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/pro-review.XXXXXX")"
 [ -n "$OUT" ] || OUT="$WORK/findings.md"
@@ -517,6 +534,9 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/pro-review.XXXXXX")"
 # snapshot is the ONLY copy of a paid review), and never touching $OUT/$OUT.status when the
 # default --out placed them inside WORK (callers read them after exit).
 pg_scratch_cleanup() {
+  # Revoke every delayed organizer before preserving or removing WORK. A volatile-only result
+  # deliberately keeps WORK, so directory cleanup alone cannot be the revocation mechanism.
+  rm -f "$WORK"/early-organizer.*.lease 2>/dev/null || true
   # Drain the run-log tee FIRST: restore the original stderr (closing the tee's pipe) and
   # reap it, so run.log holds every line and nothing later is lost or misordered.
   if [ -n "${PG_RUNLOG_TEE_PID:-}" ]; then
@@ -665,6 +685,7 @@ pg_status preflight
 RUN_START="$(date +%s)"
 SALVAGED=0
 EFF_CONC=0
+PG_RESULT_DURABLE=0
 # v0.21: the model oracle actually resolved for THIS run, plus the selection status. Captured
 # (best-effort) from oracle's "Model selection evidence:" line on fresh paths, or read back from
 # the reservation record on --harvest; empty until known and whenever the resolved label is
@@ -733,15 +754,24 @@ pg_persist_result() {  # $1 = verified snapshot — persist the CANONICAL, marke
   # two runs sharing it can both "win" a rename, and cross-feeding callers is worse than a
   # non-preferred path.
   local src="$1"
-  if pg_completed_write "$RUN_MARKER" "$src" 2>/dev/null && [ -s "$(pg_completed_dir)/$RUN_MARKER" ]; then
+  PG_RESULT_DURABLE=0
+  if pg_completed_write "$RUN_MARKER" "$src" 2>/dev/null \
+     && [ -f "$(pg_completed_dir)/$RUN_MARKER" ] && [ -r "$(pg_completed_dir)/$RUN_MARKER" ] \
+     && [ -s "$(pg_completed_dir)/$RUN_MARKER" ] && cmp -s "$src" "$(pg_completed_dir)/$RUN_MARKER"; then
     RESULT_PATH="$(pg_completed_dir)/$RUN_MARKER"
+    PG_RESULT_DURABLE=1
     pg_reservation_remove "$RUN_MARKER" 2>/dev/null || true
     return 0
   fi
   if { mkdir -p "$PRO_GATE_HOME/pending" \
        && cp "$src" "$PRO_GATE_HOME/pending/$RUN_MARKER.tmp.$$" \
-       && mv -f "$PRO_GATE_HOME/pending/$RUN_MARKER.tmp.$$" "$PRO_GATE_HOME/pending/$RUN_MARKER"; } 2>/dev/null; then
+       && mv -f "$PRO_GATE_HOME/pending/$RUN_MARKER.tmp.$$" "$PRO_GATE_HOME/pending/$RUN_MARKER" \
+       && [ -f "$PRO_GATE_HOME/pending/$RUN_MARKER" ] \
+       && [ -r "$PRO_GATE_HOME/pending/$RUN_MARKER" ] \
+       && [ -s "$PRO_GATE_HOME/pending/$RUN_MARKER" ] \
+       && cmp -s "$src" "$PRO_GATE_HOME/pending/$RUN_MARKER"; } 2>/dev/null; then
     RESULT_PATH="$PRO_GATE_HOME/pending/$RUN_MARKER"
+    PG_RESULT_DURABLE=1
     # A durably persisted review retires its reservation (gate #54 r12): the harvest path
     # deliberately kept it when the completed store was unwritable, but with the bytes safe
     # under pending/ a live reservation would only hold capacity and outrank the result.
@@ -758,7 +788,10 @@ pg_persist_result() {  # $1 = verified snapshot — persist the CANONICAL, marke
 pg_publish_fail() {  # $1 = snapshot — shared failure path: durability decides the message,
   # and when NOTHING could be persisted the snapshot itself is retained (gate #54 r9).
   local src="$1"
-  if pg_completed_write "$RUN_MARKER" "$src"; then
+  if pg_completed_write "$RUN_MARKER" "$src" \
+     && [ -f "$(pg_completed_dir)/$RUN_MARKER" ] && [ -r "$(pg_completed_dir)/$RUN_MARKER" ] \
+     && [ -s "$(pg_completed_dir)/$RUN_MARKER" ] && cmp -s "$src" "$(pg_completed_dir)/$RUN_MARKER"; then
+    PG_RESULT_DURABLE=1
     pg_reservation_remove "$RUN_MARKER" 2>/dev/null || true
     echo "ERROR: review captured but could not be written to --out ($OUT). It is durable at $(pg_completed_dir)/$RUN_MARKER — copy it from there or re-run --harvest '$RUN_MARKER'; do NOT respend." >&2
     pg_status failed "already collected; --out unwritable; artifact at $(pg_completed_dir)/$RUN_MARKER"
@@ -768,7 +801,12 @@ pg_publish_fail() {  # $1 = snapshot — shared failure path: durability decides
     # keep the run's active record and tab so --status still shows a live trail.
     if { mkdir -p "$PRO_GATE_HOME/pending" \
          && cp "$src" "$PRO_GATE_HOME/pending/$RUN_MARKER.tmp.$$" \
-         && mv -f "$PRO_GATE_HOME/pending/$RUN_MARKER.tmp.$$" "$PRO_GATE_HOME/pending/$RUN_MARKER"; } 2>/dev/null; then
+         && mv -f "$PRO_GATE_HOME/pending/$RUN_MARKER.tmp.$$" "$PRO_GATE_HOME/pending/$RUN_MARKER" \
+         && [ -f "$PRO_GATE_HOME/pending/$RUN_MARKER" ] \
+         && [ -r "$PRO_GATE_HOME/pending/$RUN_MARKER" ] \
+         && [ -s "$PRO_GATE_HOME/pending/$RUN_MARKER" ] \
+         && cmp -s "$src" "$PRO_GATE_HOME/pending/$RUN_MARKER"; } 2>/dev/null; then
+      PG_RESULT_DURABLE=1
       pg_reservation_remove "$RUN_MARKER" 2>/dev/null || true
       echo "ERROR: review captured but --out ($OUT) and the artifact store are unwritable. The review is durable at $PRO_GATE_HOME/pending/$RUN_MARKER — copy it from there; do NOT respend." >&2
       pg_status failed "captured; --out unwritable; review durable at pending/$RUN_MARKER"
@@ -782,8 +820,118 @@ pg_publish_fail() {  # $1 = snapshot — shared failure path: durability decides
   fi
   pg_finish 6
 }
+
+# v0.32: serialize every organizer for one marker. The delayed early rename and terminal
+# archive/close must never overlap: on a short run the latter can finish before the former wakes,
+# and an unsynchronized helper would then reopen the remembered URL after successful cleanup.
+# Linux uses a dedicated dynamic flock fd (never the engine's lock fds); stock macOS uses an
+# owner-verified mkdir lock. Globals are process-local inside the early organizer's subshell.
+pg_organizer_lock_acquire() {  # <marker> [wait-seconds]
+  local marker="$1" wait_s="${2:-95}" lock start owner owner_token self self_token probe_pid
+  PG_ORGANIZER_LOCK_FD=""; PG_ORGANIZER_LOCK_DIR=""
+  lock="${PRO_GATE_ORGANIZER_LOCK_DIR:-$PRO_GATE_HOME/organizer-locks}/$marker"
+  mkdir -p "$(dirname "$lock")" 2>/dev/null || return 1
+  if command -v flock >/dev/null 2>&1; then
+    if { exec {PG_ORGANIZER_LOCK_FD}>>"$lock"; } 2>/dev/null \
+       && flock -w "$wait_s" "$PG_ORGANIZER_LOCK_FD" 2>/dev/null; then
+      return 0
+    fi
+    [ -n "${PG_ORGANIZER_LOCK_FD:-}" ] && eval "exec ${PG_ORGANIZER_LOCK_FD}>&-" 2>/dev/null
+    PG_ORGANIZER_LOCK_FD=""
+    return 1
+  fi
+  PG_ORGANIZER_LOCK_DIR="${lock}.d"; start="$(date +%s)"
+  # BASHPID is absent in macOS's Bash 3.2, and $$ stays the parent engine's pid inside a
+  # background subshell. The PPID of a short child is the actual current shell process; unlike
+  # a $$-named temp file, this cannot collide between sibling helpers.
+  self="${BASHPID:-}"
+  if [ -z "$self" ]; then
+    sleep 5 & probe_pid=$!
+    self="$(ps -o ppid= -p "$probe_pid" 2>/dev/null | tr -d ' ')"
+    kill "$probe_pid" 2>/dev/null || true
+    wait "$probe_pid" 2>/dev/null || true
+  fi
+  case "$self" in ''|*[!0-9]*) self="$$";; esac
+  while ! mkdir "$PG_ORGANIZER_LOCK_DIR" 2>/dev/null; do
+    owner="$(cat "$PG_ORGANIZER_LOCK_DIR/pid" 2>/dev/null || true)"
+    owner_token="$(cat "$PG_ORGANIZER_LOCK_DIR/token" 2>/dev/null || true)"
+    if case "$owner" in ''|*[!0-9]*) true;; *) ! kill -0 "$owner" 2>/dev/null;; esac \
+       || { [ -n "$owner_token" ] && [ "$owner_token" != "$(pg_pid_token "$owner" 2>/dev/null)" ]; }; then
+      # The winner writes owner metadata immediately AFTER mkdir. Recheck once before treating
+      # missing/torn metadata as stale, or a contender can delete a newly acquired live lock.
+      sleep 1
+      owner="$(cat "$PG_ORGANIZER_LOCK_DIR/pid" 2>/dev/null || true)"
+      owner_token="$(cat "$PG_ORGANIZER_LOCK_DIR/token" 2>/dev/null || true)"
+      if case "$owner" in ''|*[!0-9]*) true;; *) ! kill -0 "$owner" 2>/dev/null;; esac \
+         || { [ -n "$owner_token" ] && [ "$owner_token" != "$(pg_pid_token "$owner" 2>/dev/null)" ]; }; then
+        rm -rf "$PG_ORGANIZER_LOCK_DIR" 2>/dev/null
+        continue
+      fi
+    fi
+    [ $(( $(date +%s) - start )) -ge "$wait_s" ] && { PG_ORGANIZER_LOCK_DIR=""; return 1; }
+    sleep 1
+  done
+  printf '%s\n' "$self" > "$PG_ORGANIZER_LOCK_DIR/pid" 2>/dev/null || true
+  self_token="$(pg_pid_token "$self" 2>/dev/null || true)"
+  [ -n "$self_token" ] && printf '%s\n' "$self_token" > "$PG_ORGANIZER_LOCK_DIR/token" 2>/dev/null || true
+  return 0
+}
+
+pg_organizer_lock_release() {
+  [ -n "${PG_ORGANIZER_LOCK_FD:-}" ] && eval "exec ${PG_ORGANIZER_LOCK_FD}>&-" 2>/dev/null
+  [ -n "${PG_ORGANIZER_LOCK_DIR:-}" ] && rm -rf "$PG_ORGANIZER_LOCK_DIR" 2>/dev/null
+  PG_ORGANIZER_LOCK_FD=""; PG_ORGANIZER_LOCK_DIR=""
+}
+
+pg_organize_chat() {  # rename|finalize [early-lease] [diagnostic-log] [helper-seconds] [scan-seconds]
+  local action="$1" lease="${2:-}" diagnostic_log="${3:-}" helper_s="${4:-35}" scan_s="${5:-25}"
+  local marker="${RUN_MARKER:-}" timeout_bin line
+  local -a organizer_args=(--organize)
+  [ "$MODE" = remote-chrome ] || return 0
+  pg_reservation_marker_ok "$marker" || return 0
+  command -v node >/dev/null 2>&1 || return 0
+  timeout_bin="${PRO_GATE_TIMEOUT_BIN:-timeout}"
+  if [[ "$timeout_bin" == */* ]]; then
+    [ -x "$timeout_bin" ] || return 0
+  else
+    command -v "$timeout_bin" >/dev/null 2>&1 || return 0
+  fi
+  # Most revoked helpers are still asleep and can exit before creating even a lock file. The
+  # second lease check below remains authoritative for the race where finalization revokes while
+  # this helper is queued behind an active organizer.
+  [ -n "$lease" ] && [ ! -f "$lease" ] && return 0
+  if ! pg_organizer_lock_acquire "$marker" 95; then
+    line='organizer source=none rename=failed archive=disabled close=skipped reason=organizer-lock-timeout'
+  elif [ -n "$lease" ] && [ ! -f "$lease" ]; then
+    # Terminal finalization (or a newer retry) revoked this delayed helper before it acquired
+    # mutation authority. Do not scan tabs or open the remembered URL after that boundary.
+    pg_organizer_lock_release
+    return 0
+  else
+    [ "${CHAT_RENAME:-0}" = 1 ] || organizer_args+=(--no-rename)
+    if [ "$action" = finalize ]; then
+      organizer_args+=(--finalize)
+      [ "${CHAT_ARCHIVE:-0}" = 1 ] && organizer_args+=(--archive)
+    fi
+    line="$("$timeout_bin" "$helper_s" node "$SELF/cdp-salvage.mjs" "${organizer_args[@]}" \
+      "$marker" "$scan_s" "$PORT" 2>/dev/null | sed -n '/^organizer /p' | tail -n 1)"
+    pg_organizer_lock_release
+    [ -n "$line" ] || line='organizer source=none rename=failed archive=disabled close=skipped reason=helper-failed'
+  fi
+  if [ -n "$diagnostic_log" ]; then
+    printf '[oracle-review] %s\n' "$line" >> "$diagnostic_log" 2>/dev/null || true
+  else
+    echo "[oracle-review] $line" >&2
+  fi
+  return 0
+}
+
 pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor, exit
   local rc="$1" outcome dur line model_label
+  # This terminal boundary revokes every sleeping early organizer. A helper that already passed
+  # its lease check still holds the marker lock, so pg_organize_chat below waits for it and then
+  # performs finalization without overlapping browser mutations.
+  rm -f "$WORK"/early-organizer.*.lease 2>/dev/null || true
   dur=$(( $(date +%s) - RUN_START ))
   model_label="$(pg_model_label "${RESOLVED_MODEL:-}")"   # resolved model or role-based fallback
   case "$rc" in
@@ -826,8 +974,15 @@ pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor,
     # Persist EXACTLY ONCE (gate #54 r12): when pg_persist_result already ran, a retry here
     # could succeed against the completed store and delete the pending file that terminal
     # status and stdout ALREADY named as canonical — a dangling RESULT_FILE.
-    if [ -z "${RESULT_PATH:-}" ] && ! pg_completed_write "$RUN_MARKER" "$fsrc"; then
-      echo "[oracle-review] WARNING: completed artifact could not be persisted for ${RUN_MARKER} ($(pg_completed_dir) unwritable?); already-collected recovery will rely on the ledgered digest only." >&2
+    if [ -z "${RESULT_PATH:-}" ]; then
+      if pg_completed_write "$RUN_MARKER" "$fsrc" \
+         && [ -f "$(pg_completed_dir)/$RUN_MARKER" ] && [ -r "$(pg_completed_dir)/$RUN_MARKER" ] \
+         && [ -s "$(pg_completed_dir)/$RUN_MARKER" ] && cmp -s "$fsrc" "$(pg_completed_dir)/$RUN_MARKER"; then
+        RESULT_PATH="$(pg_completed_dir)/$RUN_MARKER"
+        PG_RESULT_DURABLE=1
+      else
+        echo "[oracle-review] WARNING: completed artifact could not be persisted for ${RUN_MARKER} ($(pg_completed_dir) unwritable?); already-collected recovery will rely on the ledgered digest only." >&2
+      fi
     fi
     OUT_SHA="$(pg_sha256 "$fsrc")"
   fi
@@ -857,24 +1012,30 @@ pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor,
   fi
   pg_ledger_append "$line"
   [ "${PG_PRESERVE_STATE:-0}" = 1 ] || pg_active_clear "$rc"
-  # Close this run's conversation tab. We run oracle with --browser-archive=never (so probe and
-  # salvage can always find the conversation by marker), which means WE own cleanup, otherwise
-  # /c/ tabs accumulate and add load to the account. Best-effort, bounded, non-fatal; matched by
-  # RUN_MARKER so we never touch another run's tab. remote-chrome only (native drives the user's
-  # own Chrome, where closing tabs is not ours to do). PRO_GATE_KEEP_TABS=1 opts out (debugging).
-  # Skip cleanup for lock-timeout (7), deferred (8), oversized (11), and round-capped (12): no
-  # slot was spent, so no conversation tab exists, and a CDP scan there would just waste time.
-  # Skip it for in-progress (9) because the model is STILL GENERATING in that tab: closing it
-  # destroys a spent Pro slot's answer (a 65-minute Pro review was lost exactly this way on
-  # 2026-07-09); the tab stays open for --harvest, which closes it once finally captured.
-  # Skip it for engine/browser trouble (3) too (v0.25): that path tells the caller "reservation
-  # and tab kept, retry once CDP is healthy", so closing the tab here would contradict the
-  # promise and throw away the conversation the retry is supposed to collect.
-  if [ "${PG_PRESERVE_STATE:-0}" != 1 ] \
-     && [ "$rc" != 3 ] && [ "$rc" != 7 ] && [ "$rc" != 8 ] && [ "$rc" != 9 ] && [ "$rc" != 11 ] && [ "$rc" != 12 ] \
-     && [ "$MODE" = remote-chrome ] && [ "${PRO_GATE_KEEP_TABS:-0}" != 1 ] \
-     && [ -n "${RUN_MARKER:-}" ] && command -v node >/dev/null 2>&1; then
-    timeout 30 node "$SELF/cdp-salvage.mjs" --close "$RUN_MARKER" 25 "$PORT" >/dev/null 2>&1 || true
+  # v0.32: mutation is a positive state machine, never the former "close unless excluded"
+  # heuristic. Naming is safe on spent failure/in-progress outcomes, but server archive and
+  # local close require a marker-addressed durable success. The organizer independently proves
+  # marker ownership immediately before each UI action. Any helper timeout/drift is diagnostic
+  # only: result bytes, status, ledger, reservation handling, and this exit code are settled.
+  local title_memo=""
+  if pg_reservation_marker_ok "${RUN_MARKER:-}"; then
+    title_memo="$(pg_conversation_title_dir)/${RUN_MARKER}"
+  fi
+  if [ "$MODE" = remote-chrome ]; then
+    case "$rc" in
+      0)
+        if [ "${PG_RESULT_DURABLE:-0}" = 1 ] && [ "${PG_PRESERVE_STATE:-0}" != 1 ]; then
+          if [ "${PRO_GATE_KEEP_TABS:-0}" = 1 ]; then
+            [ "${CHAT_RENAME:-0}" = 1 ] && [ -s "$title_memo" ] && pg_organize_chat rename
+          else
+            pg_organize_chat finalize
+          fi
+        elif [ "${CHAT_RENAME:-0}" = 1 ] && [ -s "$title_memo" ]; then
+          pg_organize_chat rename
+        fi ;;
+      3|6|9)
+        [ "${CHAT_RENAME:-0}" = 1 ] && [ -s "$title_memo" ] && pg_organize_chat rename ;;
+    esac
   fi
   exit "$rc"
 }
@@ -904,12 +1065,13 @@ if [ -n "$HARVEST_MARKER" ] && pg_reservation_marker_ok "$HARVEST_MARKER" \
   FASTPATH_SNAP="$WORK/fastpath.snap"
   if cp "$FASTPATH_ART" "$FASTPATH_SNAP" 2>/dev/null && pg_is_review "$FASTPATH_SNAP"; then
     PG_FINAL_SRC="$FASTPATH_SNAP"
+    PG_RESULT_DURABLE=1
     SALVAGED=1
     # Retire any leftover reservation/manifest for this marker (gate #54 r7): a crash between
     # a prior run's artifact write and its reservation removal must not hold account capacity
     # (and keep redirecting this change to harvest) for the whole 6h TTL.
     pg_reservation_remove "$RUN_MARKER" || true
-    echo "[oracle-review] review already collected (completed artifact); returning it — no browser touched, nothing spent." >&2
+    echo "[oracle-review] review already collected (completed artifact); result retrieval needed no browser and spent nothing; best-effort organization may follow." >&2
     if ! pg_publish_out "$FASTPATH_SNAP"; then
       echo "ERROR: collected review could not be written to --out ($OUT). It remains durable at $FASTPATH_ART — copy it from there; do NOT respend." >&2
       pg_status failed "already collected; could not publish to --out (artifact at $FASTPATH_ART)"
@@ -1122,7 +1284,6 @@ if [ -n "$HARVEST_MARKER" ]; then
     pg_round_note_severity "$HARVEST_KEY" "$PG_FINAL_SRC" "$HARVEST_SPEND_EPOCH"
     SALVAGED=1
     echo "[oracle-review] harvest recovered the completed review ($(wc -c < "$PG_FINAL_SRC" 2>/dev/null) bytes)." >&2
-    pg_persist_result "$PG_FINAL_SRC"
     echo "RESULT_FILE=$RESULT_PATH"
     pg_status done "result: $RESULT_PATH"
     cat "$PG_FINAL_SRC"
@@ -1411,6 +1572,7 @@ RUN_MARKER="pg-run-${ROUND_KEY:-diff}-$(date +%s)-$$"
 # reuse) can no longer swap each other's bytes into the validation window.
 CAPTURE_OUT="$WORK/capture.md"
 PROMPT_FILE="$WORK/prompt.md"
+RUNLOG="$WORK/oracle.log"
 {
   # (The run-naming title line is PREPENDED after the per-change lock is held — see below.
   # Computing r<N> here raced: a queued same-change run would prebuild a duplicate label.)
@@ -1530,12 +1692,20 @@ EFF_CONC="$(pg_ramp_level "$MAX_CONC")"
 # file's inode alive, so deleting an unheld file is always safe).
 find "$(dirname "$LOCKFILE")" -maxdepth 1 -name "$(basename "$LOCKFILE").pr-*" -mmin +1440 -delete 2>/dev/null || true
 find "${PRO_GATE_HARVEST_LOCK_DIR:-$PRO_GATE_HOME/harvest-locks}" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
+# Organizer locks are marker-unique and held for at most 95s. A one-day threshold cannot touch a
+# live holder, but bounds both flock files and crash-left mkdir fallbacks that would otherwise grow
+# forever because no future run normally reuses the same marker.
+find "${PRO_GATE_ORGANIZER_LOCK_DIR:-$PRO_GATE_HOME/organizer-locks}" -mindepth 1 -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
+find "${PRO_GATE_ORGANIZER_LOCK_DIR:-$PRO_GATE_HOME/organizer-locks}" -mindepth 1 -maxdepth 1 -type d -mmin +1440 -exec rm -rf {} + 2>/dev/null || true
 find "$(pg_active_dir)" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
 find "$(pg_manifest_dir)" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
 # #50 item 4: conversation-urls memos get the same time-based hygiene as every other state
 # dir. 14 days dwarfs every recovery window (reservation TTL 6h; pending/ holds real bytes)
 # while still covering late manual recovery of a weeks-old run.
 find "$PRO_GATE_HOME/conversation-urls" -maxdepth 1 -type f -mmin +20160 -delete 2>/dev/null || true
+# Canonical title memos serve the same late-harvest lifecycle as URL memos. Sequence counters
+# remain exempt below because they prevent server-side title reuse across idle windows.
+find "$(pg_conversation_title_dir)" -maxdepth 1 -type f -mmin +20160 -delete 2>/dev/null || true
 # #50 item 8: per-run diagnostic logs are swept on the same 14-day horizon. An ALLOWLIST of
 # run-log shapes, not a *.log denylist (#63 gate P1: a *.log-minus-autoupdate.log sweep would
 # unlink logs/daemon.{out,err}.log, which the macOS launchd plist keeps OPEN for the live
@@ -1709,8 +1879,17 @@ if [ -n "$PR_NUM" ]; then
 else
   TITLE_LINE="$(printf 'pro-gate review: %s %s' "${ROUND_KEY:-diff}" "$TITLE_ROUND")"
 fi
-{ printf '%s\n\n' "$TITLE_LINE"; cat "$PROMPT_FILE"; } > "$PROMPT_FILE.titled" 2>/dev/null \
-  && mv -f "$PROMPT_FILE.titled" "$PROMPT_FILE" 2>/dev/null || rm -f "$PROMPT_FILE.titled"
+# Normalize once so the prompt and marker-addressed memo carry byte-identical display text.
+# Generated titles are already one line; the collapse is defense-in-depth for unusual repo data.
+TITLE_LINE="$(printf '%s' "$TITLE_LINE" | tr '\r\n\t' '   ' | awk '{$1=$1; print}' | cut -c 1-180)"
+if ! { { printf '%s\n\n' "$TITLE_LINE"; cat "$PROMPT_FILE"; } > "$PROMPT_FILE.titled" 2>/dev/null \
+       && mv -f "$PROMPT_FILE.titled" "$PROMPT_FILE" 2>/dev/null; }; then
+  rm -f "$PROMPT_FILE.titled" 2>/dev/null
+  echo "[oracle-review] WARNING: could not prepend the canonical conversation title to the prompt." >&2
+fi
+if ! pg_conversation_title_write "$RUN_MARKER" "$TITLE_LINE"; then
+  echo "[oracle-review] WARNING: could not publish the canonical conversation-title memo; browser rename will be skipped safely." >&2
+fi
 
 echo "[oracle-review] acquiring a review slot (effective ${EFF_CONC} of ceiling ${MAX_CONC}; waits up to ${LOCK_WAIT}s if all busy)..." >&2
 pg_status waiting-slot "effective ${EFF_CONC} / ceiling ${MAX_CONC}"
@@ -1748,8 +1927,6 @@ if [ "$SLOT_OK" != 1 ]; then
   pg_status failed "slot timeout"
   pg_finish 7
 fi
-
-RUNLOG="$WORK/oracle.log"
 
 # The oracle CLI's own --timeout has been observed NOT to fire while it waits on a ChatGPT
 # tab that never starts thinking (a "dead submission" squatted a browser slot for 3.5h on
@@ -1888,13 +2065,12 @@ while :; do
 
   echo "[oracle-review] launching the final-tier Pro review (attempt $((attempt + 1)), oracle timeout $TIMEOUT, hard cap ${HARD_SECS}s, stall/no-think watchdog ${STALL_SECS}s/${NOTHINK_SECS}s)..." >&2
   pg_status launching "strategy ${PRO_GATE_MODEL_STRATEGY:-current}"
-  # v0.28 (#48, #45 residual): capture the conversation URL EARLY. One bounded background
-  # probe shortly after submission writes the conversation-urls memo the moment the
-  # marker-bearing tab is identifiable — before v0.28 the memo was learned only at the first
-  # successful salvage/probe, so a whole-Chrome death mid-generation could still lose the only
-  # pointer to a review that exists server-side. Open-tab scan only in the common case (the
-  # run's own tab is open, so no page loads and no throttle exposure); non-fatal; bounded;
-  # remote-chrome only. PRO_GATE_EARLY_PROBE_SECS sets the delay, 0 disables.
+  : > "$RUNLOG"; rm -f "$CAPTURE_OUT"   # clear prior-attempt diagnostics/capture before arming background work
+  # v0.32: capture the URL AND apply the exact canonical title early. One bounded background
+  # organizer shortly after submission proves marker ownership, remembers the conversation URL,
+  # and renames through ChatGPT's rendered UI. It never archives or closes a live/in-progress
+  # conversation. Open-tab scan only in the common case; non-fatal; bounded; remote-chrome only.
+  # PRO_GATE_EARLY_PROBE_SECS retains its existing delay/disable contract.
   EARLY_PROBE_DELAY="${PRO_GATE_EARLY_PROBE_SECS:-75}"
   case "$EARLY_PROBE_DELAY" in ''|*[!0-9]*) EARLY_PROBE_DELAY=75;; esac
   # Armed on EVERY attempt (gate #54 P1): a dead first attempt commonly outlives the probe
@@ -1905,11 +2081,16 @@ while :; do
     # per-change flock and the account-slot fd — without this, the sleeping probe holds the
     # lock AND a Pro slot for up to ~165s after the engine exits, blocking the next same-change
     # run (found the hard way: the whole test suite serialized behind it).
+    # A retry supersedes the previous attempt's sleeping helper. Its subshell may remain asleep,
+    # but the revoked lease prevents any later CDP scan, scratch render, or UI mutation.
+    rm -f "$WORK"/early-organizer.*.lease 2>/dev/null || true
+    EARLY_ORGANIZER_LEASE="$WORK/early-organizer.${attempt}.$$.lease"
+    : > "$EARLY_ORGANIZER_LEASE"
     ( i=3; while [ "$i" -le 40 ]; do eval "exec $i>&-" 2>/dev/null; i=$((i + 1)); done
       sleep "$EARLY_PROBE_DELAY"
-      timeout 90 node "$SELF/cdp-salvage.mjs" --probe "$RUN_MARKER" 60 "$PORT" ) >/dev/null 2>&1 &
+      pg_organize_chat rename "$EARLY_ORGANIZER_LEASE" "$WORK/run.log" 90 60
+    ) >/dev/null 2>&1 &
   fi
-  : > "$RUNLOG"; rm -f "$CAPTURE_OUT"   # clear any prior attempt's capture so stale garbage can't survive
   run_oracle "${PRO_GATE_MODEL_STRATEGY:-current}" || true
   # UI fallback: the requested model was not selectable in the picker (select strategy) -> retry
   # pinned to the account's already-selected model. oracle's wording varies ("model selector",

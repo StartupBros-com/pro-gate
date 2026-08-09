@@ -1,7 +1,7 @@
 # Changelog
 
 Orientation layer for pro-gate's full history: what changed, when, why, and where to look
-first. Scope window: 2026-06-29 → 2026-08-03 (complete history). Reconstructed 2026-08-03
+first. Scope window: 2026-06-29 → 2026-08-08 (complete history). Reconstructed 2026-08-03
 from the full git log (66 non-merge commits), all 11 tags and GitHub Releases, the
 VERSION-bump record, and the issue tracker. Release notes on individual GitHub Releases remain per-release; this file is the
 durable cross-version record.
@@ -19,6 +19,7 @@ Conventions in this file:
 
 | Version | Date | Artifact | Theme |
 |---|---|---|---|
+| v0.32.0 | 2026-08-08 | Pending release | Exact marker-owned conversation titles and durable-success archive lifecycle |
 | [v0.31.1](https://github.com/StartupBros-com/pro-gate/releases/tag/v0.31.1) | 2026-08-04 | Release | Cross-bound conversation memos: answer-ownership check, memo eviction, harvest-path TTL |
 | [v0.31.0](https://github.com/StartupBros-com/pro-gate/releases/tag/v0.31.0) | 2026-08-04 | Release | Trajectory-aware round governor: earned rounds, churn brake, never-landed refunds |
 | [v0.30.1](https://github.com/StartupBros-com/pro-gate/releases/tag/v0.30.1) | 2026-08-03 | Release | Hygiene close-out: consent stderr leak, run-log sweep allowlist, autoupdate.log bound, `.env` perms, salvage-window knob |
@@ -313,6 +314,30 @@ Reservation-record integrity fixed throughout: `pg_reservation_reconcile` AND
 erased v0.31's spend epoch and pushed later harvests onto the marker-time fallback; both
 also used `read`, which collapses consecutive tabs and mis-shifts fields when slot/model are
 empty. Every reservation mutation now round-trips all seven fields via per-field `awk`.
+
+### 13. Exact conversation lifecycle (2026-08-08, v0.32.0)
+
+The prompt-title hint introduced in v0.29 made ChatGPT titles more legible, but it could not
+make them exact and it left completed server-side conversations accumulating indefinitely.
+Issue [#71](https://github.com/StartupBros-com/pro-gate/issues/71) closes both gaps without
+weakening the recovery invariants built in v0.25–v0.31.
+
+Fresh runs now publish one atomic, marker-addressed canonical-title memo before launching
+Oracle. A bounded remote-CDP organizer proves answer ownership with the same cross-bound
+rules as salvage, coalesces duplicate tabs by conversation URL, and uses only ChatGPT's
+rendered menu/input controls to apply and verify the exact PR/round title. A remembered URL
+can be opened in a retained scratch tab when the original renderer is gone; foreign, stale,
+throttled, login-wall, ambiguous, and provenance-rejected candidates are never mutated.
+
+Conversation cleanup is now a positive durable-success transition. Only exit 0 with readable,
+exact bytes under `completed/<marker>` or `pending/<marker>` may archive through ChatGPT's UI
+and close the validated local tab. Exit 3, 6, and 9 may be named for recovery, but are never
+archived or closed; UI drift and helper timeouts cannot alter output bytes, status, ledger,
+reservation state, or the engine exit code. `PRO_GATE_CHAT_RENAME` and
+`PRO_GATE_CHAT_ARCHIVE` independently control the new mutations. The exact legacy escape
+hatches remain: `PRO_GATE_KEEP_TABS=1` still suppresses both server archive and local close
+while allowing rename, and `PRO_GATE_BROWSER_ARCHIVE` is still passed through to Oracle
+unchanged (with `never` remaining the safe default).
 
 ## Notes for agents
 
