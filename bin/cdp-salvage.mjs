@@ -257,12 +257,15 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function isThrottlePage(text) {
   return !!text && text.length < 5000 && !/pg-run-[A-Za-z0-9.-]+/.test(text) && THROTTLE_RE.test(text);
 }
-function tripThrottle(where) {
+function recordThrottle(where) {
   try {
     fs.mkdirSync(PG_HOME, { recursive: true });
     fs.writeFileSync(COOLDOWN_FILE, `${new Date().toISOString()} ${where}\n`);
   } catch {}
   console.error(`ChatGPT throttle interstitial detected (${where}) — cooldown written to ${COOLDOWN_FILE}. Back off; do NOT resubmit.`);
+}
+function tripThrottle(where) {
+  recordThrottle(where);
   process.exit(5);
 }
 
@@ -334,22 +337,24 @@ async function evaluateMutation(tab, buildExpression) {
     MUTATION_EVALUATE_MS,
   );
   if (result.ok) return result;
-  // Closing the DevTools socket does not cancel Runtime.evaluate. Positively revoke this token in
-  // the renderer before the shell may release the marker lock; each visible action rechecks it.
-  const cancelled = await evaluateTab(
+  // Closing the DevTools socket does not cancel Runtime.evaluate. Revoke this token in the renderer
+  // so work that already armed its lease stops immediately. Cancellation acknowledgement alone is
+  // not enough to release serialization: the original expression may still be queued and can arm
+  // after cancellation observes no token, so every timed-out mutation stays locked through the
+  // absolute pre-issued expiry.
+  await evaluateTab(
     tab,
-    buildCancelOrganizerMutationExpression(marker, mutation.mutationToken),
+    buildCancelOrganizerMutationExpression(
+      marker,
+      mutation.mutationToken,
+      mutation.mutationExpiresAt,
+    ),
     false,
     5_000,
   );
-  if (cancelled.ok && cancelled.value === true) return result;
-
-  // A lost CDP acknowledgement cannot prove the renderer stopped running the expression. Hold the
-  // organizer lock until the absolute lease embedded in that expression has expired; a delayed
-  // expression can then neither resume a visible action nor create a fresh lease after we return.
   const leaseRemainingMs = mutation.mutationExpiresAt - Date.now();
   if (leaseRemainingMs > 0) await sleep(leaseRemainingMs + 25);
-  return { ok: false, reason: 'mutation-cancel-unconfirmed' };
+  return result;
 }
 
 async function tabText(tab) {
@@ -813,10 +818,7 @@ async function organizeConversation() {
 
   const reads = await Promise.all(tabs.map(async (tab) => ({ tab, text: await tabText(tab) })));
   if (reads.some(({ text }) => isThrottlePage(text))) {
-    try {
-      fs.mkdirSync(PG_HOME, { recursive: true });
-      fs.writeFileSync(COOLDOWN_FILE, `${new Date().toISOString()} organizer\n`);
-    } catch {}
+    recordThrottle('organizer scan');
     return { ...result, reason: 'throttle' };
   }
 
@@ -866,6 +868,7 @@ async function organizeConversation() {
     if (nonMatching.has(recoveryUrl)) return { ...result, reason: 'provenance-rejected' };
     const scratch = await openOrganizerScratch(recoveryUrl);
     if (!scratch.text || !scratch.target) {
+      if (scratch.reason === 'throttle') recordThrottle('organizer scratch');
       if (scratch.target?.id) await closeTab(scratch.target.id);
       return { ...result, reason: scratch.reason };
     }

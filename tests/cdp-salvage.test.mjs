@@ -98,6 +98,7 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
   ui.events ??= [];
   const mutationTokens = new Map();
   const mutationExpiries = new Map();
+  const revokedMutationTokens = new Set();
   let primaryPolls = 0;
   const server = createServer((req, res) => {
     if (req.url === '/json/version') { res.end(JSON.stringify({ Browser: 'MockChrome/1.0' })); return; }
@@ -168,12 +169,17 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
       }
       const expression = request.params?.expression ?? '';
       let delayMs = 0;
+      let armMutation = null;
       let applyMutation = null;
       if (expression.includes('pro-gate-organizer:rename')) {
         const expected = expectedTitleFromExpression(expression);
         const token = mutationTokenFromExpression(expression);
-        mutationTokens.set(id, token);
-        mutationExpiries.set(id, mutationExpiresAtFromExpression(expression));
+        const expiresAt = mutationExpiresAtFromExpression(expression);
+        armMutation = () => {
+          if (revokedMutationTokens.has(`${id}:${token}`)) return;
+          mutationTokens.set(id, token);
+          mutationExpiries.set(id, expiresAt);
+        };
         if (ui.renameResult) value = ui.renameResult;
         else if (ui.title === expected) value = { status: 'already' };
         else {
@@ -190,8 +196,12 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
         delayMs = Number(ui.renameDelayMs ?? 0);
       } else if (expression.includes('pro-gate-organizer:archive')) {
         const token = mutationTokenFromExpression(expression);
-        mutationTokens.set(id, token);
-        mutationExpiries.set(id, mutationExpiresAtFromExpression(expression));
+        const expiresAt = mutationExpiresAtFromExpression(expression);
+        armMutation = () => {
+          if (revokedMutationTokens.has(`${id}:${token}`)) return;
+          mutationTokens.set(id, token);
+          mutationExpiries.set(id, expiresAt);
+        };
         if (ui.archiveResult) value = ui.archiveResult;
         else if (ui.archived) value = { status: 'already' };
         else {
@@ -207,22 +217,24 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
         }
         delayMs = Number(ui.archiveDelayMs ?? 0);
       } else if (expression.includes('pro-gate-organizer:cancel')) {
-        const tokenMatch = expression.match(/\.token === ("(?:[^"\\]|\\.)*")/);
-        let token = null;
-        try { token = tokenMatch ? JSON.parse(tokenMatch[1]) : null; } catch {}
-        if (!ui.cancelUnconfirmed && mutationTokens.get(id) === token) {
-          mutationTokens.delete(id);
+        const token = expressionJsonValue(expression, 'token') ??
+          expressionJsonValue(expression, 'mutationToken');
+        if (!ui.cancelUnconfirmed && token) {
+          revokedMutationTokens.add(`${id}:${token}`);
+          if (mutationTokens.get(id) === token) mutationTokens.delete(id);
         }
-        value = mutationTokens.get(id) !== token;
-        if (ui.cancelUnconfirmed) value = false;
+        value = ui.cancelUnconfirmed ? false : true;
       }
+      const armLate = ui.armMutationAfterDelay && armMutation;
       const response = () => {
+        if (armLate) armMutation();
         applyMutation?.();
         socket.write(wsTextFrame(JSON.stringify({
           id: request.id,
           result: { result: { value } },
         })));
       };
+      if (armMutation && !armLate) armMutation();
       if (delayMs > 0) setTimeout(response, delayMs);
       else response();
     }));
@@ -272,6 +284,7 @@ function runSalvage(args, port, seed, extraEnv = {}) {
       })();
       const memoUrl = memos.length ? read(path.join('conversation-urls', memos[0])) : null;
       const blacklist = read('salvage-nonmatching.txt');
+      const cooldown = read('throttle.cooldown');
       // #68: convictions recorded for --status to read back (one line per cross-bind hit).
       const crossbound = (() => {
         try {
@@ -280,7 +293,7 @@ function runSalvage(args, port, seed, extraEnv = {}) {
         } catch { return 0; }
       })();
       fs.rmSync(home, { recursive: true, force: true });
-      resolve({ status, stdout, stderr, memoUrl: memoUrl?.trim() ?? null, memos, blacklist, crossbound });
+      resolve({ status, stdout, stderr, memoUrl: memoUrl?.trim() ?? null, memos, blacklist, cooldown, crossbound });
     });
   });
 }
@@ -1129,21 +1142,78 @@ const FOREIGN_ANSWER = (m) => [
 }
 
 {
+  const title = 'pro-gate review: PR #71 r17b [pro-gate]';
+  const remembered = 'https://chatgpt.com/c/throttled-scratch';
+  const throttle = "You're making requests too quickly. Temporarily limited access to your conversations.";
+  const cdp = await mockCdp('__NO_TABS__', [], { renderText: () => throttle });
+  const r = await runSalvage(
+    ['--organize', MARKER, '5'],
+    cdp.port,
+    seedOrganizer(MARKER, title, remembered),
+  );
+  check('scratch-render throttle evidence stops organization',
+    /reason=throttle/.test(r.stdout) && cdp.ui.events.length === 0,
+    `stdout=${r.stdout} events=${JSON.stringify(cdp.ui.events)}`);
+  check('scratch-render throttle evidence writes the account cooldown before returning',
+    /organizer scratch/.test(r.cooldown ?? ''), `cooldown=${r.cooldown}`);
+  check('throttled organizer scratch is closed',
+    cdp.created.length === 1 && cdp.closed.includes(cdp.created[0].id),
+    `created=${JSON.stringify(cdp.created)} closed=${cdp.closed}`);
+  cdp.stop();
+}
+
+{
   const title = 'pro-gate review: PR #71 r18 [pro-gate]';
   const ui = { title: null, archived: false, events: [], renameDelayMs: 300 };
   const cdp = await mockCdp(`run marker: ${MARKER}\nstill generating`, [], { ui });
+  const startedAt = Date.now();
   const r = await runSalvage(
     ['--organize', MARKER, '5'],
     cdp.port,
     seedOrganizer(MARKER, title),
-    { PRO_GATE_TEST_MUTATION_EVALUATE_MS: '100' },
+    {
+      PRO_GATE_TEST_MUTATION_EVALUATE_MS: '100',
+      PRO_GATE_TEST_MUTATION_LEASE_MS: '250',
+    },
   );
-  await new Promise((resolve) => setTimeout(resolve, 350));
-  check('timed-out UI mutation reports failure only after positive cancellation',
+  const elapsedMs = Date.now() - startedAt;
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  check('timed-out UI mutation reports failure after revocation and absolute lease expiry',
+    elapsedMs >= 225 &&
     /rename=failed.*reason=rename-evaluate-failed/.test(r.stdout) &&
       cdp.requests.some((request) => request.params?.expression?.includes('pro-gate-organizer:cancel')),
     `stdout=${r.stdout} requests=${cdp.requests.length}`);
   check('positively cancelled renderer work cannot mutate after its CDP timeout',
+    ui.events.length === 0 && ui.title === null, `ui=${JSON.stringify(ui)}`);
+  cdp.stop();
+}
+
+{
+  const title = 'pro-gate review: PR #71 r18b [pro-gate]';
+  const ui = {
+    title: null,
+    archived: false,
+    events: [],
+    renameDelayMs: 300,
+    armMutationAfterDelay: true,
+  };
+  const cdp = await mockCdp(`run marker: ${MARKER}\nstill generating`, [], { ui });
+  const startedAt = Date.now();
+  const r = await runSalvage(
+    ['--organize', MARKER, '5'],
+    cdp.port,
+    seedOrganizer(MARKER, title),
+    {
+      PRO_GATE_TEST_MUTATION_EVALUATE_MS: '100',
+      PRO_GATE_TEST_MUTATION_LEASE_MS: '250',
+    },
+  );
+  const elapsedMs = Date.now() - startedAt;
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  check('cancellation-before-arm holds serialization through the absolute lease expiry',
+    elapsedMs >= 225 && /reason=rename-evaluate-failed/.test(r.stdout),
+    `elapsedMs=${elapsedMs} stdout=${r.stdout}`);
+  check('a queued expression cannot arm and mutate after its token was revoked',
     ui.events.length === 0 && ui.title === null, `ui=${JSON.stringify(ui)}`);
   cdp.stop();
 }
@@ -1198,16 +1268,25 @@ const FOREIGN_ANSWER = (m) => [
   };
   const renameExpression = buildRenameConversationExpression(dangerousTitle, target);
   const archiveExpression = buildArchiveConversationExpression(target);
-  const cancelExpression = buildCancelOrganizerMutationExpression(MARKER, target.mutationToken);
+  const cancelExpression = buildCancelOrganizerMutationExpression(
+    MARKER,
+    target.mutationToken,
+    target.mutationExpiresAt,
+  );
   check('rename expression serializes the exact title as data',
     expectedTitleFromExpression(renameExpression) === dangerousTitle,
     `expression=${renameExpression.slice(0, 160)}`);
   check('organizer expressions contain no ChatGPT backend API path',
     !/backend-api|XMLHttpRequest|\bfetch\s*\(/i.test(`${renameExpression}\n${archiveExpression}\n${cancelExpression}`));
-  check('UI mutations carry an expiring browser lease and a positive cancellation expression',
+  check('UI mutations carry an expiring browser lease and a revocation tombstone',
     /mutationLeaseActive/.test(renameExpression) &&
       /guardedDispatch/.test(renameExpression) &&
-      /pro-gate-organizer:cancel/.test(cancelExpression));
+      /pro-gate-organizer:cancel/.test(cancelExpression) &&
+      /revocations\[mutationToken\] = mutationExpiresAt/.test(cancelExpression) &&
+      /current\.revoked = true/.test(cancelExpression) &&
+      /revocationRegistry\[mutationToken\]/.test(renameExpression) &&
+      /mutationRevokedBeforeStart/.test(renameExpression) &&
+      /priorMutationLease/.test(renameExpression));
   check('mutation lease expires before the CDP mutation deadline', ORGANIZER_MUTATION_LEASE_MS < 15_000);
   check('rename expression uses native input state and exact verification',
     /HTMLInputElement\.prototype/.test(renameExpression) && /status: 'already'/.test(renameExpression));

@@ -8,6 +8,7 @@ const MARKER_SAFE_RE = /^pg-run-[A-Za-z0-9.-]+$/;
 const CONVERSATION_URL_RE = /^https:\/\/chatgpt\.com\/c\//;
 const MUTATION_TOKEN_RE = /^[A-Za-z0-9.-]+$/;
 const LEASE_REGISTRY = '__proGateOrganizerLeases';
+const REVOCATION_REGISTRY = '__proGateOrganizerRevocations';
 
 export const ORGANIZER_MUTATION_LEASE_MS = 10_000;
 
@@ -38,19 +39,36 @@ function targetContext(marker, conversationUrl, {
     const mutationToken = ${JSON.stringify(mutationToken)};
     const mutationExpiresAt = ${mutationExpiresAt};
     const leaseRegistryName = ${JSON.stringify(LEASE_REGISTRY)};
+    const revocationRegistryName = ${JSON.stringify(REVOCATION_REGISTRY)};
     const leaseRegistry = globalThis[leaseRegistryName] ??= Object.create(null);
-    leaseRegistry[expectedMarker] = {
-      token: mutationToken,
-      expiresAt: mutationExpiresAt,
-    };
+    const revocationRegistry = globalThis[revocationRegistryName] ??= Object.create(null);
+    const priorMutationLease = leaseRegistry[expectedMarker];
+    const revokedUntil = Number(revocationRegistry[mutationToken] ?? 0);
+    const mutationRevokedBeforeStart = Date.now() < revokedUntil;
+    if (revokedUntil > 0 && !mutationRevokedBeforeStart) {
+      delete revocationRegistry[mutationToken];
+    }
+    const mutationMayArm = Date.now() < mutationExpiresAt &&
+      !mutationRevokedBeforeStart &&
+      !(priorMutationLease?.token !== mutationToken &&
+        priorMutationLease?.revoked !== true && Date.now() < priorMutationLease?.expiresAt);
+    if (mutationMayArm) {
+      leaseRegistry[expectedMarker] = {
+        token: mutationToken,
+        expiresAt: mutationExpiresAt,
+        revoked: false,
+      };
+    }
     const mutationLeaseActive = () => {
       const lease = globalThis[leaseRegistryName]?.[expectedMarker];
-      return lease?.token === mutationToken && Date.now() < lease.expiresAt;
+      return lease?.token === mutationToken && lease.revoked !== true &&
+        Date.now() < lease.expiresAt;
     };
     const releaseMutationLease = () => {
       if (globalThis[leaseRegistryName]?.[expectedMarker]?.token === mutationToken) {
         delete globalThis[leaseRegistryName][expectedMarker];
       }
+      delete globalThis[revocationRegistryName]?.[mutationToken];
     };
     const isRunMarkerChar = (char) => /[A-Za-z0-9.-]/.test(char ?? '');
     const lastExactMarkerAt = (text, wanted) => {
@@ -132,12 +150,15 @@ function targetContext(marker, conversationUrl, {
   `;
 }
 
-export function buildCancelOrganizerMutationExpression(marker, mutationToken) {
+export function buildCancelOrganizerMutationExpression(marker, mutationToken, mutationExpiresAt) {
   if (!MARKER_SAFE_RE.test(marker ?? '')) throw new TypeError('a safe run marker is required');
   if (!MUTATION_TOKEN_RE.test(mutationToken ?? '')) {
     throw new TypeError('a safe mutation token is required');
   }
-  return `/* pro-gate-organizer:cancel */\n(() => {\n  const registry = globalThis[${JSON.stringify(LEASE_REGISTRY)}];\n  if (registry?.[${JSON.stringify(marker)}]?.token === ${JSON.stringify(mutationToken)}) {\n    delete registry[${JSON.stringify(marker)}];\n  }\n  return registry?.[${JSON.stringify(marker)}]?.token !== ${JSON.stringify(mutationToken)};\n})()`;
+  if (!Number.isSafeInteger(mutationExpiresAt) || mutationExpiresAt <= 0) {
+    throw new TypeError('a mutation expiry is required');
+  }
+  return `/* pro-gate-organizer:cancel */\n(() => {\n  const mutationToken = ${JSON.stringify(mutationToken)};\n  const mutationExpiresAt = ${mutationExpiresAt};\n  const registry = globalThis[${JSON.stringify(LEASE_REGISTRY)}] ??= Object.create(null);\n  const revocations = globalThis[${JSON.stringify(REVOCATION_REGISTRY)}] ??= Object.create(null);\n  revocations[mutationToken] = mutationExpiresAt;\n  const current = registry[${JSON.stringify(marker)}];\n  if (current?.token === mutationToken) current.revoked = true;\n  return current?.token !== mutationToken || current.revoked === true;\n})()`;
 }
 
 const interactionHelpers = String.raw`

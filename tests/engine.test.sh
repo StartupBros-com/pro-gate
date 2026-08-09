@@ -1488,6 +1488,51 @@ rm -f "$TDIR/home/throttle.cooldown"
 check 'artifact-first recovery exits 0 (even under cooldown, no ledger row)' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
 check 'artifact content returned verbatim' "$(cmp -s "$TDIR/o-artifact.md" "$TDIR/prov-ours.md"; echo $?)" "$(head -2 "$TDIR/o-artifact.md" 2>/dev/null)"
 check 'artifact retrieval under active cooldown never invokes organizer mode' "$(! grep -q -- '--organize' "$TDIR/node-args-artifact-cooldown.log"; echo $?)" "$(cat "$TDIR/node-args-artifact-cooldown.log")"
+
+# A peer can write the shared account cooldown while this process is queued behind the marker's
+# organizer lock. The cooldown check must happen again AFTER lock acquisition; otherwise this
+# process launches stale browser traffic as soon as the peer releases serialization.
+if command -v flock >/dev/null 2>&1; then
+  mkdir -p "$TDIR/home/organizer-locks"
+  : > "$TDIR/node-args-artifact-peer-cooldown.log"
+  (
+    exec 8>>"$TDIR/home/organizer-locks/$M9"
+    flock 8
+    : > "$TDIR/peer-organizer-locked"
+    # Wait until the engine has opened its own descriptor for this flock file. That proves it
+    # reached pg_organizer_lock_acquire and is queued behind fd 8 before the peer writes cooldown.
+    for _ in $(seq 1 100); do
+      waiters=0
+      for fd in /proc/[0-9]*/fd/*; do
+        [ "$(readlink "$fd" 2>/dev/null || true)" = "$TDIR/home/organizer-locks/$M9" ] \
+          && waiters=$((waiters + 1))
+      done
+      [ "$waiters" -ge 2 ] && break
+      sleep 0.05
+    done
+    printf '%s peer-cooldown\n' "$(date +%Y-%m-%dT%H:%M:%S%z)" > "$TDIR/home/throttle.cooldown"
+    sleep 1
+  ) &
+  PEER_LOCK_PID=$!
+  for _ in $(seq 1 50); do [ -f "$TDIR/peer-organizer-locked" ] && break; sleep 0.1; done
+  PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+    PRO_GATE_SELF_HEAL=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" \
+    PRO_GATE_TIMEOUT_BIN="$TIMEOUT_LOG_BIN" \
+    PG_TEST_NODE_ARGS="$TDIR/node-args-artifact-peer-cooldown.log" \
+    bash "$ENGINE" --harvest "$M9" --out "$TDIR/o-artifact-peer-cooldown.md" --timeout 5s \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+  RC=$?
+  wait "$PEER_LOCK_PID"
+  rm -f "$TDIR/home/throttle.cooldown"
+  check 'artifact recovery still exits 0 when a peer starts cooldown during lock wait' \
+    "$([ "$RC" -eq 0 ] && cmp -s "$TDIR/o-artifact-peer-cooldown.md" "$TDIR/prov-ours.md"; echo $?)" \
+    "rc=$RC $(tail -2 "$TDIR/stderr")"
+  check 'post-lock cooldown recheck suppresses stale organizer traffic' \
+    "$(! grep -q -- '--organize' "$TDIR/node-args-artifact-peer-cooldown.log"; echo $?)" \
+    "$(cat "$TDIR/node-args-artifact-peer-cooldown.log")"
+else
+  echo 'ok - post-lock cooldown recheck fixture skipped without flock'
+fi
 # ...and with the browser fully DOWN (gate #54 r4 P2): the fast path precedes the CDP
 # preflight, so a dead port must not turn an on-disk artifact into exit 3.
 env PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT=1 PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 NODE_OPTIONS= \

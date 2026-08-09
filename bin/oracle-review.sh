@@ -890,21 +890,7 @@ pg_organize_chat() {  # rename|finalize [early-lease] [diagnostic-log] [helper-s
   local -a organizer_args=(--organize)
   [ "$MODE" = remote-chrome ] || return 0
   pg_reservation_marker_ok "$marker" || return 0
-  command -v node >/dev/null 2>&1 || return 0
-  # Browser organization is traffic against the same account surface as salvage. Never make it
-  # the first request after throttle/Cloudflare evidence, and honor a cooldown written by a peer.
-  if [ "${THROTTLED:-0}" = 1 ] || [ "${CLOUDFLARE:-0}" = 1 ]; then
-    return 0
-  fi
-  if cooldown_reason="$(pg_cooldown_active)"; then
-    return 0
-  fi
   timeout_bin="${PRO_GATE_TIMEOUT_BIN:-timeout}"
-  if [[ "$timeout_bin" == */* ]]; then
-    [ -x "$timeout_bin" ] || return 0
-  else
-    command -v "$timeout_bin" >/dev/null 2>&1 || return 0
-  fi
   # Most revoked helpers are still asleep and can exit before creating even a lock file. The
   # second lease check below remains authoritative for the race where finalization revokes while
   # this helper is queued behind an active organizer.
@@ -913,7 +899,24 @@ pg_organize_chat() {  # rename|finalize [early-lease] [diagnostic-log] [helper-s
     line='organizer source=none rename=failed archive=disabled close=skipped reason=organizer-lock-timeout'
   elif [ -n "$lease" ] && [ ! -f "$lease" ]; then
     # Terminal finalization (or a newer retry) revoked this delayed helper before it acquired
-    # mutation authority. Do not scan tabs or open the remembered URL after that boundary.
+    # mutation authority. Acquiring the lock first joins any already-running helper before this
+    # process returns, so cooldown evidence cannot abandon browser work outside serialization.
+    pg_organizer_lock_release
+    return 0
+  elif [ "${THROTTLED:-0}" = 1 ] || [ "${CLOUDFLARE:-0}" = 1 ] \
+       || cooldown_reason="$(pg_cooldown_active)"; then
+    # Browser organization is traffic against the same account surface as salvage. Check every
+    # process-local and shared signal under the marker lock: a peer may write the cooldown while
+    # this helper waits, and terminal cleanup must still join an early helper before returning.
+    pg_organizer_lock_release
+    return 0
+  elif ! command -v node >/dev/null 2>&1; then
+    pg_organizer_lock_release
+    return 0
+  elif [[ "$timeout_bin" == */* ]] && [ ! -x "$timeout_bin" ]; then
+    pg_organizer_lock_release
+    return 0
+  elif [[ "$timeout_bin" != */* ]] && ! command -v "$timeout_bin" >/dev/null 2>&1; then
     pg_organizer_lock_release
     return 0
   else
