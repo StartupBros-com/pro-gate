@@ -6,17 +6,52 @@
 
 const MARKER_SAFE_RE = /^pg-run-[A-Za-z0-9.-]+$/;
 const CONVERSATION_URL_RE = /^https:\/\/chatgpt\.com\/c\//;
+const MUTATION_TOKEN_RE = /^[A-Za-z0-9.-]+$/;
+const LEASE_REGISTRY = '__proGateOrganizerLeases';
 
-function targetContext(marker, conversationUrl) {
+export const ORGANIZER_MUTATION_LEASE_MS = 10_000;
+
+function targetContext(marker, conversationUrl, {
+  mutationToken,
+  mutationExpiresAt,
+  expectedReview = null,
+} = {}) {
   if (!MARKER_SAFE_RE.test(marker ?? '')) throw new TypeError('a safe run marker is required');
   if (!CONVERSATION_URL_RE.test(conversationUrl ?? '')) {
     throw new TypeError('an exact ChatGPT conversation URL is required');
+  }
+  if (!MUTATION_TOKEN_RE.test(mutationToken ?? '')) {
+    throw new TypeError('a safe mutation token is required');
+  }
+  if (!Number.isSafeInteger(mutationExpiresAt) || mutationExpiresAt <= 0) {
+    throw new TypeError('a mutation expiry is required');
+  }
+  if (expectedReview !== null && typeof expectedReview !== 'string') {
+    throw new TypeError('expected review bytes must be a string');
   }
   const conversationPath = new URL(conversationUrl).pathname;
   return String.raw`
     const expectedMarker = ${JSON.stringify(marker)};
     const expectedUrl = ${JSON.stringify(conversationUrl)};
     const expectedConversationPath = ${JSON.stringify(conversationPath)};
+    const expectedFinalReview = ${JSON.stringify(expectedReview)};
+    const mutationToken = ${JSON.stringify(mutationToken)};
+    const mutationExpiresAt = ${mutationExpiresAt};
+    const leaseRegistryName = ${JSON.stringify(LEASE_REGISTRY)};
+    const leaseRegistry = globalThis[leaseRegistryName] ??= Object.create(null);
+    leaseRegistry[expectedMarker] = {
+      token: mutationToken,
+      expiresAt: mutationExpiresAt,
+    };
+    const mutationLeaseActive = () => {
+      const lease = globalThis[leaseRegistryName]?.[expectedMarker];
+      return lease?.token === mutationToken && Date.now() < lease.expiresAt;
+    };
+    const releaseMutationLease = () => {
+      if (globalThis[leaseRegistryName]?.[expectedMarker]?.token === mutationToken) {
+        delete globalThis[leaseRegistryName][expectedMarker];
+      }
+    };
     const isRunMarkerChar = (char) => /[A-Za-z0-9.-]/.test(char ?? '');
     const lastExactMarkerAt = (text, wanted) => {
       let found = -1;
@@ -31,11 +66,36 @@ function targetContext(marker, conversationUrl) {
       }
       return found;
     };
+    const normalizeReviewBytes = (value) => String(value ?? '')
+      .replace(/\r\n?/g, '\n').replace(/\n$/, '');
+    const stripMarkerEcho = (value) => String(value ?? '').split('\n').map((line) => {
+      const token = '(run marker: ' + expectedMarker + ')';
+      const at = line.indexOf(token);
+      if (at < 0) return line;
+      return (line.slice(0, at) + line.slice(at + token.length)).replace(/[ \t]+$/, '');
+    }).join('\n');
+    const extractFinalReview = (text) => {
+      const lines = text.split('\n');
+      let verdictIdx = -1;
+      for (let i = lines.length - 1; i >= 0; i -= 1) {
+        if (/^\s*[*_>#-]*\s*VERDICT[*_\s]*:/i.test(lines[i])) {
+          verdictIdx = i;
+          break;
+        }
+      }
+      if (verdictIdx < 0) return null;
+      let start = -1;
+      for (let i = verdictIdx; i >= 0; i -= 1) {
+        if (/^\s*[*_>#-]*\s*(P0\s*[:\-]|P0\b|\[P[0-3]\])/i.test(lines[i].trim())) start = i;
+      }
+      if (start < 0) start = Math.max(0, verdictIdx - 120);
+      return lines.slice(start, verdictIdx + 1).join('\n').trim();
+    };
     const validateTarget = () => {
+      if (!mutationLeaseActive()) return 'mutation-lease-expired';
       if (typeof location !== 'object' || location.href !== expectedUrl) return 'target-url-drift';
       const text = String(document.body?.innerText ?? '');
-      const ownMarkerAt = lastExactMarkerAt(text, expectedMarker);
-      if (ownMarkerAt < 0) return 'target-marker-missing';
+      if (lastExactMarkerAt(text, expectedMarker) < 0) return 'target-marker-missing';
       const lines = text.split('\n');
       let verdictLine = '';
       for (let i = lines.length - 1; i >= 0; i -= 1) {
@@ -45,14 +105,39 @@ function targetContext(marker, conversationUrl) {
         }
       }
       const verdictAt = verdictLine ? text.lastIndexOf(verdictLine) : -1;
-      if (verdictAt > ownMarkerAt) {
+      const ownMarkerAt = lastExactMarkerAt(text, expectedMarker);
+      const promptMarkerAt = verdictAt >= 0
+        ? lastExactMarkerAt(text.slice(0, verdictAt), expectedMarker)
+        : -1;
+      if (expectedFinalReview === null && verdictAt > ownMarkerAt) {
         const answerMarker = verdictLine.match(/\(run marker:\s*(pg-run-[A-Za-z0-9.-]+)\s*\)/i)?.[1] ?? null;
         if (!answerMarker) return 'target-answer-marker-missing';
         if (answerMarker !== expectedMarker) return 'target-cross-bound';
       }
+      if (expectedFinalReview !== null) {
+        if (verdictAt < 0 || promptMarkerAt < 0) return 'target-answer-incomplete';
+        if (lastExactMarkerAt(text.slice(verdictAt + verdictLine.length), expectedMarker) >= 0) {
+          return 'target-answer-incomplete';
+        }
+        const answerMarker = verdictLine.match(/\(run marker:\s*(pg-run-[A-Za-z0-9.-]+)\s*\)/i)?.[1] ?? null;
+        if (!answerMarker) return 'target-answer-marker-missing';
+        if (answerMarker !== expectedMarker) return 'target-cross-bound';
+        const renderedReview = extractFinalReview(text);
+        if (!renderedReview || normalizeReviewBytes(stripMarkerEcho(renderedReview)) !== expectedFinalReview) {
+          return 'target-result-mismatch';
+        }
+      }
       return null;
     };
   `;
+}
+
+export function buildCancelOrganizerMutationExpression(marker, mutationToken) {
+  if (!MARKER_SAFE_RE.test(marker ?? '')) throw new TypeError('a safe run marker is required');
+  if (!MUTATION_TOKEN_RE.test(mutationToken ?? '')) {
+    throw new TypeError('a safe mutation token is required');
+  }
+  return `/* pro-gate-organizer:cancel */\n(() => {\n  const registry = globalThis[${JSON.stringify(LEASE_REGISTRY)}];\n  if (registry?.[${JSON.stringify(marker)}]?.token === ${JSON.stringify(mutationToken)}) {\n    delete registry[${JSON.stringify(marker)}];\n  }\n  return registry?.[${JSON.stringify(marker)}]?.token !== ${JSON.stringify(mutationToken)};\n})()`;
 }
 
 const interactionHelpers = String.raw`
@@ -69,7 +154,13 @@ const interactionHelpers = String.raw`
       element?.getAttribute?.('title'),
       element?.textContent,
     ].filter(Boolean).join(' '));
-    const press = (element) => {
+    const guardedDispatch = (element, event) => {
+      const reason = validateTarget();
+      if (reason) return reason;
+      element.dispatchEvent(event);
+      return null;
+    };
+    const guardedPress = (element) => {
       const rect = element.getBoundingClientRect();
       const eventInit = {
         bubbles: true,
@@ -79,8 +170,9 @@ const interactionHelpers = String.raw`
         clientY: rect.top + rect.height / 2,
         button: 0,
       };
+      const events = [];
       if (typeof PointerEvent === 'function') {
-        element.dispatchEvent(new PointerEvent('pointerdown', {
+        events.push(new PointerEvent('pointerdown', {
           ...eventInit,
           buttons: 1,
           pointerId: 1,
@@ -88,9 +180,9 @@ const interactionHelpers = String.raw`
           isPrimary: true,
         }));
       }
-      element.dispatchEvent(new MouseEvent('mousedown', { ...eventInit, buttons: 1 }));
+      events.push(new MouseEvent('mousedown', { ...eventInit, buttons: 1 }));
       if (typeof PointerEvent === 'function') {
-        element.dispatchEvent(new PointerEvent('pointerup', {
+        events.push(new PointerEvent('pointerup', {
           ...eventInit,
           buttons: 0,
           pointerId: 1,
@@ -98,16 +190,15 @@ const interactionHelpers = String.raw`
           isPrimary: true,
         }));
       }
-      element.dispatchEvent(new MouseEvent('mouseup', { ...eventInit, buttons: 0 }));
-      element.dispatchEvent(new MouseEvent('click', { ...eventInit, buttons: 0 }));
-    };
-    const guardedPress = (element) => {
-      const reason = validateTarget();
-      if (reason) return reason;
-      press(element);
+      events.push(new MouseEvent('mouseup', { ...eventInit, buttons: 0 }));
+      events.push(new MouseEvent('click', { ...eventInit, buttons: 0 }));
+      for (const event of events) {
+        const reason = guardedDispatch(element, event);
+        if (reason) return reason;
+      }
       return null;
     };
-    const dismiss = () => document.dispatchEvent(new KeyboardEvent('keydown', {
+    const dismiss = () => guardedDispatch(document, new KeyboardEvent('keydown', {
       key: 'Escape',
       code: 'Escape',
       bubbles: true,
@@ -175,11 +266,21 @@ const interactionHelpers = String.raw`
       .filter((element) => element instanceof HTMLElement && isVisible(element));
 `;
 
-export function buildRenameConversationExpression(title, { marker, conversationUrl } = {}) {
+export function buildRenameConversationExpression(title, {
+  marker,
+  conversationUrl,
+  mutationToken,
+  mutationExpiresAt,
+  expectedReview = null,
+} = {}) {
   return `/* pro-gate-organizer:rename */
 (() => {
   const expected = ${JSON.stringify(title)};
-  ${targetContext(marker, conversationUrl)}
+  ${targetContext(marker, conversationUrl, {
+    mutationToken,
+    mutationExpiresAt,
+    expectedReview,
+  })}
   ${interactionHelpers}
   const findRenameMenuItem = () => visibleMenuCandidates().find((element) => {
     const label = labelFor(element);
@@ -198,11 +299,14 @@ export function buildRenameConversationExpression(title, { marker, conversationU
     return label === 'save' || label === 'rename' || label === 'zapisz';
   }) ?? null;
   const commitInlineRename = (input) => {
+    const focusError = validateTarget();
+    if (focusError) return focusError;
     input.focus();
-    input.dispatchEvent(new KeyboardEvent('keydown', {
+    const downError = guardedDispatch(input, new KeyboardEvent('keydown', {
       key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true,
     }));
-    input.dispatchEvent(new KeyboardEvent('keyup', {
+    if (downError) return downError;
+    return guardedDispatch(input, new KeyboardEvent('keyup', {
       key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true,
     }));
   };
@@ -237,8 +341,14 @@ export function buildRenameConversationExpression(title, { marker, conversationU
   };
   return (async () => {
     const editor = await openEditor();
-    if (editor.already) return { status: 'already' };
-    if (!editor.input) return { status: 'skipped', reason: editor.error };
+    if (editor.already) {
+      releaseMutationLease();
+      return { status: 'already' };
+    }
+    if (!editor.input) {
+      releaseMutationLease();
+      return { status: 'skipped', reason: editor.error };
+    }
     if (editor.input.value === expected) {
       dismiss();
       return { status: 'already' };
@@ -254,8 +364,18 @@ export function buildRenameConversationExpression(title, { marker, conversationU
       return { status: 'skipped', reason: editError };
     }
     setter.call(editor.input, expected);
-    editor.input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: expected }));
-    editor.input.dispatchEvent(new Event('change', { bubbles: true }));
+    const inputError = guardedDispatch(editor.input, new InputEvent('input', {
+      bubbles: true, inputType: 'insertText', data: expected,
+    }));
+    if (inputError) {
+      dismiss();
+      return { status: 'skipped', reason: inputError };
+    }
+    const changeError = guardedDispatch(editor.input, new Event('change', { bubbles: true }));
+    if (changeError) {
+      dismiss();
+      return { status: 'skipped', reason: changeError };
+    }
     const save = findSaveButton();
     if (save) {
       const saveError = guardedPress(save);
@@ -271,7 +391,11 @@ export function buildRenameConversationExpression(title, { marker, conversationU
         dismiss();
         return { status: 'skipped', reason: commitError };
       }
-      commitInlineRename(editor.input);
+      const commitDispatchError = commitInlineRename(editor.input);
+      if (commitDispatchError) {
+        dismiss();
+        return { status: 'skipped', reason: commitDispatchError };
+      }
     } else {
       dismiss();
       return { status: 'skipped', reason: 'rename-save-not-found' };
@@ -288,14 +412,24 @@ export function buildRenameConversationExpression(title, { marker, conversationU
   })().catch((error) => ({
     status: 'failed',
     error: error instanceof Error ? error.message : String(error),
-  }));
+  })).finally(releaseMutationLease);
 })()`;
 }
 
-export function buildArchiveConversationExpression({ marker, conversationUrl } = {}) {
+export function buildArchiveConversationExpression({
+  marker,
+  conversationUrl,
+  mutationToken,
+  mutationExpiresAt,
+  expectedReview = null,
+} = {}) {
   return `/* pro-gate-organizer:archive */
 (() => {
-  ${targetContext(marker, conversationUrl)}
+  ${targetContext(marker, conversationUrl, {
+    mutationToken,
+    mutationExpiresAt,
+    expectedReview,
+  })}
   ${interactionHelpers}
   const hasUnarchiveMenuItem = () => visibleMenuCandidates().some((element) => {
     const label = labelFor(element);
@@ -372,6 +506,6 @@ export function buildArchiveConversationExpression({ marker, conversationUrl } =
   })().catch((error) => ({
     status: 'failed',
     error: error instanceof Error ? error.message : String(error),
-  }));
+  })).finally(releaseMutationLease);
 })()`;
 }

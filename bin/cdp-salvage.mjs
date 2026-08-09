@@ -77,11 +77,13 @@ import path from 'node:path';
 
 import {
   buildArchiveConversationExpression,
+  buildCancelOrganizerMutationExpression,
   buildRenameConversationExpression,
+  ORGANIZER_MUTATION_LEASE_MS,
 } from './cdp-organizer-expressions.mjs';
 
 const usage = () => {
-  console.error('usage: cdp-salvage.mjs [--probe|--close|--sweep-root|--organize [--finalize] [--archive] [--no-rename]] <pr-marker|-> [timeout-secs] [cdp-port]');
+  console.error('usage: cdp-salvage.mjs [--probe|--close|--sweep-root|--organize [--finalize --result-file <path>] [--accepted-url <url>] [--archive] [--no-rename]] <pr-marker|-> [timeout-secs] [cdp-port]');
   process.exit(2);
 };
 const argv = process.argv.slice(2);
@@ -89,6 +91,8 @@ let mode = 'salvage';
 let finalize = false;
 let archive = false;
 let rename = true;
+let resultFile = null;
+let acceptedUrl = null;
 for (;;) {
   const arg = argv[0];
   if (!arg?.startsWith('--')) break;
@@ -98,6 +102,10 @@ for (;;) {
     mode = arg.slice(2);
   } else if (arg === '--finalize') {
     finalize = true;
+  } else if (arg === '--result-file') {
+    resultFile = argv.shift() ?? null;
+  } else if (arg === '--accepted-url') {
+    acceptedUrl = argv.shift() ?? null;
   } else if (arg === '--archive') {
     archive = true;
   } else if (arg === '--no-rename') {
@@ -106,8 +114,10 @@ for (;;) {
     usage();
   }
 }
-if (mode !== 'organize' && (finalize || archive || !rename)) usage();
+if (mode !== 'organize' && (finalize || archive || !rename || resultFile || acceptedUrl)) usage();
 if (archive && !finalize) usage();
+if (finalize !== !!resultFile || (acceptedUrl && !finalize)) usage();
+if (acceptedUrl && !/^https:\/\/chatgpt\.com\/c\//.test(acceptedUrl)) usage();
 const probe = mode === 'probe';
 const close = mode === 'close';
 const sweepRoot = mode === 'sweep-root';
@@ -128,6 +138,8 @@ const COOLDOWN_FILE = process.env.PRO_GATE_COOLDOWN_FILE ?? path.join(PG_HOME, '
 // match (probe included) and read before we ever conclude "not found".
 const URL_MEMO_DIR = path.join(PG_HOME, 'conversation-urls');
 const TITLE_MEMO_DIR = path.join(PG_HOME, 'conversation-titles');
+const COMPLETED_DIR = process.env.PRO_GATE_COMPLETED_DIR ?? path.join(PG_HOME, 'completed');
+const PENDING_DIR = path.join(PG_HOME, 'pending');
 const MEMO_KEEP = 200;                  // newest N memos retained; older ones are pruned on write
 const MARKER_SAFE_RE = /^pg-run-[A-Za-z0-9.-]+$/;
 const memoPath = (m) => (MARKER_SAFE_RE.test(m) ? path.join(URL_MEMO_DIR, m) : null);
@@ -255,7 +267,7 @@ function tripThrottle(where) {
 }
 
 let evaluateRequestId = 0;
-async function evaluateTab(tab, expression, awaitPromise = false) {
+async function evaluateTab(tab, expression, awaitPromise = false, timeoutMs = 5_000) {
   return await new Promise((resolve) => {
     const requestId = ++evaluateRequestId;
     let ws;
@@ -265,9 +277,8 @@ async function evaluateTab(tab, expression, awaitPromise = false) {
       resolve({ ok: false, reason: 'invalid-websocket-url' });
       return;
     }
-    // 5s bail: a healthy renderer answers in well under a second; suspended
-    // renderers never answer, and orphaned conversation tabs accumulate on
-    // the persistent Chrome, so a long bail makes every poll cycle crawl.
+    // Read-only probes retain the short bail because suspended renderers accumulate. UI actions
+    // pass a longer operation-specific timeout and carry an in-page lease that expires first.
     let settled = false;
     const finish = (value) => {
       if (settled) return;
@@ -276,7 +287,7 @@ async function evaluateTab(tab, expression, awaitPromise = false) {
       try { ws.close(); } catch {}
       resolve(value);
     };
-    const bail = setTimeout(() => finish({ ok: false, reason: 'evaluate-timeout' }), 5_000);
+    const bail = setTimeout(() => finish({ ok: false, reason: 'evaluate-timeout' }), timeoutMs);
     ws.onerror = () => finish({ ok: false, reason: 'websocket-error' });
     ws.onopen = () => {
       try {
@@ -298,6 +309,47 @@ async function evaluateTab(tab, expression, awaitPromise = false) {
       } catch { finish({ ok: false, reason: 'invalid-cdp-response' }); }
     };
   });
+}
+
+const testMutationEvaluateMs = Number(process.env.PRO_GATE_TEST_MUTATION_EVALUATE_MS ?? 0);
+const MUTATION_EVALUATE_MS = Number.isFinite(testMutationEvaluateMs) && testMutationEvaluateMs >= 50
+  ? testMutationEvaluateMs
+  : 15_000;
+const testMutationLeaseMs = Number(process.env.PRO_GATE_TEST_MUTATION_LEASE_MS ?? 0);
+const MUTATION_LEASE_MS = Number.isFinite(testMutationLeaseMs) && testMutationLeaseMs >= 50
+  ? testMutationLeaseMs
+  : ORGANIZER_MUTATION_LEASE_MS;
+let mutationSequence = 0;
+const nextMutation = () => ({
+  mutationToken: `${process.pid}.${++mutationSequence}`,
+  mutationExpiresAt: Date.now() + MUTATION_LEASE_MS,
+});
+
+async function evaluateMutation(tab, buildExpression) {
+  const mutation = nextMutation();
+  const result = await evaluateTab(
+    tab,
+    buildExpression(mutation),
+    true,
+    MUTATION_EVALUATE_MS,
+  );
+  if (result.ok) return result;
+  // Closing the DevTools socket does not cancel Runtime.evaluate. Positively revoke this token in
+  // the renderer before the shell may release the marker lock; each visible action rechecks it.
+  const cancelled = await evaluateTab(
+    tab,
+    buildCancelOrganizerMutationExpression(marker, mutation.mutationToken),
+    false,
+    5_000,
+  );
+  if (cancelled.ok && cancelled.value === true) return result;
+
+  // A lost CDP acknowledgement cannot prove the renderer stopped running the expression. Hold the
+  // organizer lock until the absolute lease embedded in that expression has expired; a delayed
+  // expression can then neither resume a visible action nor create a fresh lease after we return.
+  const leaseRemainingMs = mutation.mutationExpiresAt - Date.now();
+  if (leaseRemainingMs > 0) await sleep(leaseRemainingMs + 25);
+  return { ok: false, reason: 'mutation-cancel-unconfirmed' };
 }
 
 async function tabText(tab) {
@@ -584,8 +636,42 @@ function organizerOwnership(text) {
     : { owned: false, reason: 'answer-marker-missing' };
 }
 
-function ownedOrganizerText(text) {
-  return organizerOwnership(text).owned;
+function normalizeReviewBytes(value) {
+  return String(value ?? '').replace(/\r\n?/g, '\n').replace(/\n$/, '');
+}
+
+function stripMarkerEcho(value) {
+  const token = `(run marker: ${marker})`;
+  return String(value ?? '').split('\n').map((line) => {
+    const at = line.indexOf(token);
+    if (at < 0) return line;
+    return `${line.slice(0, at)}${line.slice(at + token.length)}`.replace(/[ \t]+$/, '');
+  }).join('\n');
+}
+
+let acceptedReview = null;
+function finalizerOwnership(text) {
+  if (acceptedReview === null) return { owned: false, reason: 'result-file-missing' };
+  const verdict = terminalVerdict(text);
+  if (!verdict) return { owned: false, reason: 'answer-incomplete' };
+  const promptMarkerAt = lastExactMarkerAt(text.slice(0, verdict.at), marker);
+  if (promptMarkerAt < 0 || lastExactMarkerAt(text.slice(verdict.at + verdict.line.length), marker) >= 0) {
+    return { owned: false, reason: 'answer-incomplete' };
+  }
+  const answerMarker = verdict.line.match(/\(run marker:\s*(pg-run-[A-Za-z0-9.-]+)\s*\)/i)?.[1] ?? null;
+  if (!answerMarker) return { owned: false, reason: 'answer-marker-missing' };
+  if (answerMarker !== marker) {
+    return { owned: false, reason: 'cross-bound', foreignMarker: answerMarker };
+  }
+  const review = extractReview(text);
+  if (!review || normalizeReviewBytes(stripMarkerEcho(review)) !== acceptedReview) {
+    return { owned: false, reason: 'result-mismatch' };
+  }
+  return { owned: true, reason: 'completed' };
+}
+
+function mutationOwnership(text) {
+  return finalize ? finalizerOwnership(text) : organizerOwnership(text);
 }
 
 async function openOrganizerScratch(url) {
@@ -610,7 +696,7 @@ async function openOrganizerScratch(url) {
       if (!text) continue;
       if (isThrottlePage(text)) return { target: live, reason: 'throttle' };
       if (hasExactMarker(text, marker)) {
-        const ownership = organizerOwnership(text);
+        const ownership = mutationOwnership(text);
         return ownership.owned
           ? { target: live, text, reason: 'ok' }
           : { target: live, reason: ownership.reason };
@@ -646,7 +732,8 @@ async function validateOrganizerTarget(target, expectedUrl) {
   if (!live) return { ok: false, reason: 'target-disappeared', tab: null };
   if (live.url !== expectedUrl) return { ok: false, reason: 'target-url-drift', tab: live };
   const text = await tabText(live);
-  if (!ownedOrganizerText(text)) return { ok: false, reason: 'ownership-drift', tab: live };
+  const ownership = mutationOwnership(text);
+  if (!ownership.owned) return { ok: false, reason: ownership.reason, tab: live };
   return { ok: true, reason: 'ok', tab: live, text };
 }
 
@@ -668,7 +755,8 @@ async function closeOwnedOrganizerTabs(expectedUrl, authorizedTargetId, allowTar
       continue;
     }
     const text = await tabText(tab);
-    if (!ownedOrganizerText(text)) return { status: 'failed', reason: 'ownership-drift' };
+    const ownership = mutationOwnership(text);
+    if (!ownership.owned) return { status: 'failed', reason: ownership.reason };
     toClose.push(tab);
   }
   if (selected.url !== expectedUrl) {
@@ -693,6 +781,27 @@ async function organizeConversation() {
     reason: 'ok',
   };
   if (!MARKER_SAFE_RE.test(marker)) return { ...result, reason: 'invalid-marker' };
+  if (finalize) {
+    const allowedResultFiles = [
+      path.resolve(COMPLETED_DIR, marker),
+      path.resolve(PENDING_DIR, marker),
+    ];
+    if (!allowedResultFiles.includes(path.resolve(resultFile))) {
+      return { ...result, reason: 'result-file-invalid' };
+    }
+    let resultFd = null;
+    try {
+      resultFd = fs.openSync(resultFile, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      const stat = fs.fstatSync(resultFd);
+      const bytes = fs.readFileSync(resultFd, 'utf8');
+      if (!stat.isFile() || !bytes) return { ...result, reason: 'result-file-invalid' };
+      acceptedReview = normalizeReviewBytes(bytes);
+    } catch {
+      return { ...result, reason: 'result-file-invalid' };
+    } finally {
+      if (resultFd !== null) try { fs.closeSync(resultFd); } catch {}
+    }
+  }
 
   const rememberedUrl = recallUrl(marker);
   const title = recallTitle(marker);
@@ -703,17 +812,20 @@ async function organizeConversation() {
   } catch { return { ...result, reason: 'cdp-list-failed' }; }
 
   const reads = await Promise.all(tabs.map(async (tab) => ({ tab, text: await tabText(tab) })));
+  if (reads.some(({ text }) => isThrottlePage(text))) {
+    try {
+      fs.mkdirSync(PG_HOME, { recursive: true });
+      fs.writeFileSync(COOLDOWN_FILE, `${new Date().toISOString()} organizer\n`);
+    } catch {}
+    return { ...result, reason: 'throttle' };
+  }
+
   const candidatesByUrl = new Map();
   const conflictedUrls = new Set();
   let rejectionReason = 'owned-target-not-found';
   for (const { tab, text } of reads) {
-    if (!text) continue;
-    if (isThrottlePage(text)) {
-      rejectionReason = 'throttle';
-      continue;
-    }
-    if (!hasExactMarker(text, marker)) continue;
-    const ownership = organizerOwnership(text);
+    if (!text || !hasExactMarker(text, marker)) continue;
+    const ownership = mutationOwnership(text);
     if (!ownership.owned) {
       conflictedUrls.add(tab.url);
       rejectionReason = ownership.reason;
@@ -731,24 +843,34 @@ async function organizeConversation() {
   let target = null;
   let source = 'none';
   const candidateUrls = [...candidatesByUrl.keys()];
-  if (candidateUrls.length > 0) {
-    const selectedUrl = rememberedUrl && candidatesByUrl.has(rememberedUrl)
-      ? rememberedUrl
-      : candidateUrls.length === 1 ? candidateUrls[0] : null;
+  let selectedUrl = null;
+  if (acceptedUrl) {
+    if (conflictedUrls.has(acceptedUrl)) return { ...result, reason: rejectionReason };
+    if (candidatesByUrl.has(acceptedUrl)) selectedUrl = acceptedUrl;
+  } else if (candidateUrls.length > 0) {
+    if (finalize) {
+      selectedUrl = candidateUrls.length === 1 ? candidateUrls[0] : null;
+    } else {
+      selectedUrl = rememberedUrl && candidatesByUrl.has(rememberedUrl)
+        ? rememberedUrl
+        : candidateUrls.length === 1 ? candidateUrls[0] : null;
+    }
     if (!selectedUrl) return { ...result, reason: 'ambiguous-owned-targets' };
+  }
+  if (selectedUrl) {
     target = candidatesByUrl.get(selectedUrl)[0].tab;
     source = 'open';
-  } else if (rememberedUrl) {
-    if (nonMatching.has(rememberedUrl)) return { ...result, reason: 'provenance-rejected' };
-    const scratch = await openOrganizerScratch(rememberedUrl);
+  } else {
+    const recoveryUrl = acceptedUrl ?? (candidateUrls.length === 0 ? rememberedUrl : null);
+    if (!recoveryUrl) return { ...result, reason: rejectionReason };
+    if (nonMatching.has(recoveryUrl)) return { ...result, reason: 'provenance-rejected' };
+    const scratch = await openOrganizerScratch(recoveryUrl);
     if (!scratch.text || !scratch.target) {
       if (scratch.target?.id) await closeTab(scratch.target.id);
       return { ...result, reason: scratch.reason };
     }
     target = scratch.target;
     source = 'memo';
-  } else {
-    return { ...result, reason: rejectionReason };
   }
 
   result.source = source;
@@ -757,6 +879,7 @@ async function organizeConversation() {
   const before = await validateOrganizerTarget(target, targetUrl);
   if (!before.ok) return { ...result, reason: before.reason };
   target = before.tab;
+  const expressionBinding = finalize ? acceptedReview : null;
 
   if (rename) {
     if (!title) {
@@ -764,10 +887,12 @@ async function organizeConversation() {
       result.reason = 'title-memo-missing';
     } else {
       const renameOutcome = organizerUiStatus(
-        await evaluateTab(target, buildRenameConversationExpression(title, {
+        await evaluateMutation(target, (mutation) => buildRenameConversationExpression(title, {
           marker,
           conversationUrl: targetUrl,
-        }), true),
+          expectedReview: expressionBinding,
+          ...mutation,
+        })),
         'rename',
       );
       result.renameStatus = renameOutcome.status;
@@ -786,10 +911,12 @@ async function organizeConversation() {
   let closeAuthorized = false;
   if (archive) {
     const archiveOutcome = organizerUiStatus(
-      await evaluateTab(target, buildArchiveConversationExpression({
+      await evaluateMutation(target, (mutation) => buildArchiveConversationExpression({
         marker,
         conversationUrl: targetUrl,
-      }), true),
+        expectedReview: expressionBinding,
+        ...mutation,
+      })),
       'archive',
     );
     result.archiveStatus = archiveOutcome.status;

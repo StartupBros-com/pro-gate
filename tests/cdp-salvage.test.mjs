@@ -20,7 +20,9 @@ import fs from 'node:fs';
 
 import {
   buildArchiveConversationExpression,
+  buildCancelOrganizerMutationExpression,
   buildRenameConversationExpression,
+  ORGANIZER_MUTATION_LEASE_MS,
 } from '../bin/cdp-organizer-expressions.mjs';
 
 const SALVAGE = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'cdp-salvage.mjs');
@@ -70,11 +72,15 @@ function wsClientTextDecoder(onText) {
   };
 }
 
-function expectedTitleFromExpression(expression) {
-  const match = expression.match(/^\s*const expected = (.+);$/m);
+function expressionJsonValue(expression, name) {
+  const match = expression.match(new RegExp(`^\\s*const ${name} = (.+);$`, 'm'));
   if (!match) return null;
   try { return JSON.parse(match[1]); } catch { return null; }
 }
+
+const expectedTitleFromExpression = (expression) => expressionJsonValue(expression, 'expected');
+const mutationTokenFromExpression = (expression) => expressionJsonValue(expression, 'mutationToken');
+const mutationExpiresAtFromExpression = (expression) => expressionJsonValue(expression, 'mutationExpiresAt');
 
 // One mock CDP browser: /json lists a single conversation tab whose DOM text is `tabText`;
 // the tab's debugger WebSocket answers every message with that text. /json/close records.
@@ -90,6 +96,8 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
   const requests = [];
   const ui = opts.ui ?? { title: null, archived: false, events: [] };
   ui.events ??= [];
+  const mutationTokens = new Map();
+  const mutationExpiries = new Map();
   let primaryPolls = 0;
   const server = createServer((req, res) => {
     if (req.url === '/json/version') { res.end(JSON.stringify({ Browser: 'MockChrome/1.0' })); return; }
@@ -159,25 +167,64 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
         value = opts.renderText(scratch.url, n);
       }
       const expression = request.params?.expression ?? '';
+      let delayMs = 0;
+      let applyMutation = null;
       if (expression.includes('pro-gate-organizer:rename')) {
         const expected = expectedTitleFromExpression(expression);
+        const token = mutationTokenFromExpression(expression);
+        mutationTokens.set(id, token);
+        mutationExpiries.set(id, mutationExpiresAtFromExpression(expression));
         if (ui.renameResult) value = ui.renameResult;
         else if (ui.title === expected) value = { status: 'already' };
         else {
-          ui.title = expected;
-          ui.events.push({ action: 'rename', id });
           value = { status: 'renamed' };
+          applyMutation = () => {
+            if (
+              mutationTokens.get(id) !== token ||
+              Date.now() >= mutationExpiries.get(id)
+            ) return;
+            ui.title = expected;
+            ui.events.push({ action: 'rename', id });
+          };
         }
+        delayMs = Number(ui.renameDelayMs ?? 0);
       } else if (expression.includes('pro-gate-organizer:archive')) {
+        const token = mutationTokenFromExpression(expression);
+        mutationTokens.set(id, token);
+        mutationExpiries.set(id, mutationExpiresAtFromExpression(expression));
         if (ui.archiveResult) value = ui.archiveResult;
         else if (ui.archived) value = { status: 'already' };
         else {
-          ui.archived = true;
-          ui.events.push({ action: 'archive', id });
           value = { status: 'archived' };
+          applyMutation = () => {
+            if (
+              mutationTokens.get(id) !== token ||
+              Date.now() >= mutationExpiries.get(id)
+            ) return;
+            ui.archived = true;
+            ui.events.push({ action: 'archive', id });
+          };
         }
+        delayMs = Number(ui.archiveDelayMs ?? 0);
+      } else if (expression.includes('pro-gate-organizer:cancel')) {
+        const tokenMatch = expression.match(/\.token === ("(?:[^"\\]|\\.)*")/);
+        let token = null;
+        try { token = tokenMatch ? JSON.parse(tokenMatch[1]) : null; } catch {}
+        if (!ui.cancelUnconfirmed && mutationTokens.get(id) === token) {
+          mutationTokens.delete(id);
+        }
+        value = mutationTokens.get(id) !== token;
+        if (ui.cancelUnconfirmed) value = false;
       }
-      socket.write(wsTextFrame(JSON.stringify({ id: request.id, result: { result: { value } } })));
+      const response = () => {
+        applyMutation?.();
+        socket.write(wsTextFrame(JSON.stringify({
+          id: request.id,
+          result: { result: { value } },
+        })));
+      };
+      if (delayMs > 0) setTimeout(response, delayMs);
+      else response();
     }));
     socket.on('error', () => {});
   });
@@ -203,14 +250,15 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
 // seed: optional (home) => void, to pre-populate PRO_GATE_HOME (remembered conversation URL,
 // blacklist) before the run. The resolved result carries `home` contents read back before the
 // directory is removed, so a test can assert what the salvage persisted.
-function runSalvage(args, port, seed) {
+function runSalvage(args, port, seed, extraEnv = {}) {
   // Isolated PRO_GATE_HOME so blacklist/cooldown/URL-memo state never leaks between tests or
   // into a real deployment's home.
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
   if (seed) seed(home);
   return new Promise((resolve) => {
-    const child = spawn(process.execPath, [SALVAGE, ...args, String(port)], {
-      env: { ...process.env, PRO_GATE_HOME: home },
+    const expandedArgs = args.map((arg) => arg.replace(/^PG_HOME\//, `${home}/`));
+    const child = spawn(process.execPath, [SALVAGE, ...expandedArgs, String(port)], {
+      env: { ...process.env, PRO_GATE_HOME: home, ...extraEnv },
     });
     let stdout = '', stderr = '';
     child.stdout.on('data', (d) => { stdout += d; });
@@ -245,13 +293,48 @@ function seedMemo(marker, url) {
   };
 }
 
-function seedOrganizer(marker, title, url = null) {
+function seedOrganizer(marker, title, url = null, review = null) {
   return (home) => {
     fs.mkdirSync(path.join(home, 'conversation-titles'), { recursive: true });
     fs.writeFileSync(path.join(home, 'conversation-titles', marker), `${title}\n`);
     if (url) seedMemo(marker, url)(home);
+    if (review !== null) {
+      fs.mkdirSync(path.join(home, 'completed'), { recursive: true });
+      fs.writeFileSync(path.join(home, 'completed', marker), `${review}\n`);
+    }
   };
 }
+
+const completedReview = (marker, summary = 'owned') => [
+  'P0: none',
+  'P1: none',
+  'P2: none',
+  'P3: none',
+  `VERDICT: SHIP — ${summary}. (run marker: ${marker})`,
+].join('\n');
+const durableReview = (review, marker) => {
+  const lines = review.split('\n');
+  let verdict = -1;
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    if (/^\s*[*_>#-]*\s*VERDICT[*_\s]*:/i.test(lines[i])) { verdict = i; break; }
+  }
+  let start = -1;
+  for (let i = verdict; i >= 0; i -= 1) {
+    if (/^\s*[*_>#-]*\s*(P0\s*[:\-]|P0\b|\[P[0-3]\])/i.test(lines[i].trim())) start = i;
+  }
+  if (start < 0) start = Math.max(0, verdict - 120);
+  return lines.slice(start, verdict + 1).join('\n')
+    .replace(`(run marker: ${marker})`, '')
+    .replace(/[ \t]+$/gm, '')
+    .trim();
+};
+const finalizerArgs = (marker, { archive = true, rename = true, acceptedUrl = null } = {}) => {
+  const args = ['--organize', '--finalize', '--result-file', `PG_HOME/completed/${marker}`];
+  if (acceptedUrl) args.push('--accepted-url', acceptedUrl);
+  if (archive) args.push('--archive');
+  if (!rename) args.push('--no-rename');
+  return [...args, marker, '5'];
+};
 
 let failures = 0;
 function check(name, cond, detail) {
@@ -677,9 +760,9 @@ const FOREIGN_ANSWER = (m) => [
   ].join('\n');
   const cdp = await mockCdp(nonceLessAnswer);
   const r = await runSalvage(
-    ['--organize', '--finalize', '--archive', MARKER, '5'],
+    finalizerArgs(MARKER),
     cdp.port,
-    seedOrganizer(MARKER, title),
+    seedOrganizer(MARKER, title, null, durableReview(nonceLessAnswer, MARKER)),
   );
   check('nonce-less completed answers never grant organizer mutation authority',
     /reason=answer-marker-missing/.test(r.stdout), `stdout=${r.stdout}`);
@@ -779,9 +862,9 @@ const FOREIGN_ANSWER = (m) => [
   ].join('\n');
   const cdp = await mockCdp('__NO_TABS__', [], { renderText: () => body });
   const r = await runSalvage(
-    ['--organize', '--finalize', '--archive', MARKER, '5'],
+    finalizerArgs(MARKER),
     cdp.port,
-    seedOrganizer(MARKER, title, remembered),
+    seedOrganizer(MARKER, title, remembered, durableReview(body, MARKER)),
   );
   check('authorized memo finalization archives and closes its owned scratch',
     /source=memo rename=renamed archive=archived close=closed reason=ok/.test(r.stdout),
@@ -810,11 +893,12 @@ const FOREIGN_ANSWER = (m) => [
 
 {
   const title = 'pro-gate review: PR #71 r8 [pro-gate]';
-  const cdp = await mockCdp(`run marker: ${MARKER}\ndurable completed review`);
+  const body = completedReview(MARKER);
+  const cdp = await mockCdp(`run marker: ${MARKER}\n${body}`);
   const r = await runSalvage(
-    ['--organize', '--finalize', '--archive', MARKER, '5'],
+    finalizerArgs(MARKER),
     cdp.port,
-    seedOrganizer(MARKER, title),
+    seedOrganizer(MARKER, title, null, durableReview(body, MARKER)),
   );
   check('finalizer renames then archives then closes',
     /rename=renamed archive=archived close=closed reason=ok/.test(r.stdout),
@@ -841,9 +925,9 @@ const FOREIGN_ANSWER = (m) => [
   ].join('\n');
   const cdp = await mockCdp(body, [duplicate], { tabText: () => body });
   const r = await runSalvage(
-    ['--organize', '--finalize', '--archive', MARKER, '5'],
+    finalizerArgs(MARKER),
     cdp.port,
-    seedOrganizer(MARKER, title),
+    seedOrganizer(MARKER, title, null, durableReview(body, MARKER)),
   );
   check('same-URL owned duplicate tabs finalize successfully',
     /archive=archived close=closed reason=ok/.test(r.stdout), `stdout=${r.stdout}`);
@@ -874,12 +958,12 @@ const FOREIGN_ANSWER = (m) => [
     },
   });
   const r = await runSalvage(
-    ['--organize', '--finalize', '--archive', MARKER, '5'],
+    finalizerArgs(MARKER),
     cdp.port,
-    seedOrganizer(MARKER, title),
+    seedOrganizer(MARKER, title, null, durableReview(owned, MARKER)),
   );
   check('same-URL duplicate ownership drift blocks local cleanup',
-    /close=failed reason=ownership-drift/.test(r.stdout), `stdout=${r.stdout}`);
+    /close=failed reason=answer-incomplete/.test(r.stdout), `stdout=${r.stdout}`);
   check('duplicate ownership drift leaves every same-URL tab open',
     cdp.closed.length === 0, `closed=${cdp.closed}`);
   cdp.stop();
@@ -887,13 +971,14 @@ const FOREIGN_ANSWER = (m) => [
 
 {
   const title = 'pro-gate review: PR #71 r9 [pro-gate]';
+  const body = completedReview(MARKER);
   const ui = { title: null, archived: true, events: [] };
   const unrelated = { id: 'root-unrelated', type: 'page', url: 'https://chatgpt.com/' };
-  const cdp = await mockCdp(`run marker: ${MARKER}\ndurable completed review`, [unrelated], { ui });
+  const cdp = await mockCdp(`run marker: ${MARKER}\n${body}`, [unrelated], { ui });
   const r = await runSalvage(
-    ['--organize', '--finalize', '--archive', MARKER, '5'],
+    finalizerArgs(MARKER),
     cdp.port,
-    seedOrganizer(MARKER, title),
+    seedOrganizer(MARKER, title, null, durableReview(body, MARKER)),
   );
   check('already-archived state is idempotent', /archive=already close=closed/.test(r.stdout), `stdout=${r.stdout}`);
   check('finalization never closes an unrelated tab', !cdp.closed.includes('root-unrelated'), `closed=${cdp.closed}`);
@@ -902,17 +987,18 @@ const FOREIGN_ANSWER = (m) => [
 
 {
   const title = 'pro-gate review: PR #71 r10 [pro-gate]';
+  const body = completedReview(MARKER);
   const ui = {
     title: null,
     archived: false,
     events: [],
     archiveResult: { status: 'skipped', reason: 'archive-menu-item-not-found' },
   };
-  const cdp = await mockCdp(`run marker: ${MARKER}\ndurable completed review`, [], { ui });
+  const cdp = await mockCdp(`run marker: ${MARKER}\n${body}`, [], { ui });
   const r = await runSalvage(
-    ['--organize', '--finalize', '--archive', MARKER, '5'],
+    finalizerArgs(MARKER),
     cdp.port,
-    seedOrganizer(MARKER, title),
+    seedOrganizer(MARKER, title, null, durableReview(body, MARKER)),
   );
   check('archive selector drift is reported once and remains nonfatal',
     /archive=skipped close=closed reason=archive-archive-menu-item-not-found/.test(r.stdout),
@@ -922,17 +1008,18 @@ const FOREIGN_ANSWER = (m) => [
 
 {
   const title = 'pro-gate review: PR #71 r11 [pro-gate]';
+  const body = `run marker: ${MARKER}\n${completedReview(MARKER)}`;
   const foreign = 'run marker: pg-run-different-1234567890-4\nforeign conversation';
-  const cdp = await mockCdp(`run marker: ${MARKER}\nowned conversation`, [], {
+  const cdp = await mockCdp(body, [], {
     primaryText: (initial, n) => (n >= 4 ? foreign : initial),
   });
   const r = await runSalvage(
-    ['--organize', '--finalize', '--archive', MARKER, '5'],
+    finalizerArgs(MARKER),
     cdp.port,
-    seedOrganizer(MARKER, title),
+    seedOrganizer(MARKER, title, null, durableReview(completedReview(MARKER), MARKER)),
   );
   check('ownership drift after rename blocks archive and close',
-    /archive=skipped close=skipped reason=ownership-drift/.test(r.stdout),
+    /archive=skipped close=skipped reason=answer-incomplete/.test(r.stdout),
     `stdout=${r.stdout}`);
   check('ownership drift leaves the target recoverable', cdp.closed.length === 0 && !cdp.ui.archived, `closed=${cdp.closed}`);
   cdp.stop();
@@ -940,11 +1027,12 @@ const FOREIGN_ANSWER = (m) => [
 
 {
   const title = 'pro-gate review: PR #71 r12 [pro-gate]';
-  const cdp = await mockCdp(`run marker: ${MARKER}\ndurable completed review`);
+  const body = completedReview(MARKER);
+  const cdp = await mockCdp(`run marker: ${MARKER}\n${body}`);
   const r = await runSalvage(
-    ['--organize', '--finalize', '--archive', '--no-rename', MARKER, '5'],
+    finalizerArgs(MARKER, { rename: false }),
     cdp.port,
-    seedOrganizer(MARKER, title),
+    seedOrganizer(MARKER, title, null, durableReview(body, MARKER)),
   );
   check('rename suppression does not suppress archive or local cleanup',
     /rename=disabled archive=archived close=closed reason=ok/.test(r.stdout),
@@ -952,6 +1040,141 @@ const FOREIGN_ANSWER = (m) => [
   check('rename suppression performs only the archive UI action',
     cdp.ui.events.map((event) => event.action).join(',') === 'archive',
     `events=${JSON.stringify(cdp.ui.events)}`);
+  cdp.stop();
+}
+
+{
+  const title = 'pro-gate review: PR #71 r13 [pro-gate]';
+  const body = `run marker: ${MARKER}\nstill generating`;
+  const cdp = await mockCdp(body);
+  const r = await runSalvage(
+    finalizerArgs(MARKER),
+    cdp.port,
+    seedOrganizer(MARKER, title, null, durableReview(completedReview(MARKER), MARKER)),
+  );
+  check('finalization rejects a live same-marker page that rename would accept',
+    /reason=answer-incomplete/.test(r.stdout), `stdout=${r.stdout}`);
+  check('live finalization rejection performs no mutation or close',
+    cdp.ui.events.length === 0 && cdp.closed.length === 0, `events=${JSON.stringify(cdp.ui.events)} closed=${cdp.closed}`);
+  cdp.stop();
+}
+
+{
+  const title = 'pro-gate review: PR #71 r14 [pro-gate]';
+  const rendered = completedReview(MARKER, 'rendered bytes');
+  const durable = durableReview(completedReview(MARKER, 'different durable bytes'), MARKER);
+  const cdp = await mockCdp(`run marker: ${MARKER}\n${rendered}`);
+  const r = await runSalvage(
+    finalizerArgs(MARKER),
+    cdp.port,
+    seedOrganizer(MARKER, title, null, durable),
+  );
+  check('durable byte mismatch blocks finalization', /reason=result-mismatch/.test(r.stdout), `stdout=${r.stdout}`);
+  check('byte mismatch leaves title archive and tab untouched',
+    cdp.ui.events.length === 0 && !cdp.ui.archived && cdp.closed.length === 0,
+    `events=${JSON.stringify(cdp.ui.events)} closed=${cdp.closed}`);
+  cdp.stop();
+}
+
+{
+  const title = 'pro-gate review: PR #71 r15 [pro-gate]';
+  const accepted = 'https://chatgpt.com/c/accepted-result';
+  const live = `run marker: ${MARKER}\nstill generating`;
+  const completed = `run marker: ${MARKER}\n${completedReview(MARKER)}`;
+  const cdp = await mockCdp(live, [], { renderText: (url) => url === accepted ? completed : '' });
+  const r = await runSalvage(
+    finalizerArgs(MARKER, { acceptedUrl: accepted }),
+    cdp.port,
+    seedOrganizer(MARKER, title, null, durableReview(completedReview(MARKER), MARKER)),
+  );
+  check('accepted capture URL outranks a different live same-marker conversation',
+    /source=memo rename=renamed archive=archived close=closed reason=ok/.test(r.stdout), `stdout=${r.stdout}`);
+  check('accepted URL finalization leaves the unrelated live URL open',
+    !cdp.closed.includes('tab1') && cdp.created[0]?.url === accepted, `created=${JSON.stringify(cdp.created)} closed=${cdp.closed}`);
+  cdp.stop();
+}
+
+{
+  const title = 'pro-gate review: PR #71 r16 [pro-gate]';
+  const remembered = 'https://chatgpt.com/c/wrong-remembered-result';
+  const first = `run marker: ${MARKER}\n${completedReview(MARKER)}`;
+  const second = { id: 'second-result', url: 'https://chatgpt.com/c/second-result' };
+  const cdp = await mockCdp(first, [second], { tabText: () => first });
+  const r = await runSalvage(
+    finalizerArgs(MARKER),
+    cdp.port,
+    seedOrganizer(MARKER, title, remembered, durableReview(completedReview(MARKER), MARKER)),
+  );
+  check('remembered URL cannot resolve multiple byte-matching finalizer URLs',
+    /reason=ambiguous-owned-targets/.test(r.stdout), `stdout=${r.stdout}`);
+  check('ambiguous finalizer performs no mutation', cdp.ui.events.length === 0, `events=${JSON.stringify(cdp.ui.events)}`);
+  cdp.stop();
+}
+
+{
+  const title = 'pro-gate review: PR #71 r17 [pro-gate]';
+  const remembered = 'https://chatgpt.com/c/should-not-open-under-throttle';
+  const throttle = "You're making requests too quickly. Temporarily limited access to your conversations.";
+  const cdp = await mockCdp(throttle);
+  const r = await runSalvage(
+    ['--organize', MARKER, '5'],
+    cdp.port,
+    seedOrganizer(MARKER, title, remembered),
+  );
+  check('organizer stops immediately when any scanned page is a throttle interstitial',
+    /reason=throttle/.test(r.stdout), `stdout=${r.stdout}`);
+  check('throttle evidence prevents remembered-URL scratch traffic',
+    cdp.created.length === 0 && cdp.ui.events.length === 0, `created=${JSON.stringify(cdp.created)}`);
+  cdp.stop();
+}
+
+{
+  const title = 'pro-gate review: PR #71 r18 [pro-gate]';
+  const ui = { title: null, archived: false, events: [], renameDelayMs: 300 };
+  const cdp = await mockCdp(`run marker: ${MARKER}\nstill generating`, [], { ui });
+  const r = await runSalvage(
+    ['--organize', MARKER, '5'],
+    cdp.port,
+    seedOrganizer(MARKER, title),
+    { PRO_GATE_TEST_MUTATION_EVALUATE_MS: '100' },
+  );
+  await new Promise((resolve) => setTimeout(resolve, 350));
+  check('timed-out UI mutation reports failure only after positive cancellation',
+    /rename=failed.*reason=rename-evaluate-failed/.test(r.stdout) &&
+      cdp.requests.some((request) => request.params?.expression?.includes('pro-gate-organizer:cancel')),
+    `stdout=${r.stdout} requests=${cdp.requests.length}`);
+  check('positively cancelled renderer work cannot mutate after its CDP timeout',
+    ui.events.length === 0 && ui.title === null, `ui=${JSON.stringify(ui)}`);
+  cdp.stop();
+}
+
+{
+  const title = 'pro-gate review: PR #71 r19 [pro-gate]';
+  const ui = {
+    title: null,
+    archived: false,
+    events: [],
+    renameDelayMs: 300,
+    cancelUnconfirmed: true,
+  };
+  const cdp = await mockCdp(`run marker: ${MARKER}\nstill generating`, [], { ui });
+  const startedAt = Date.now();
+  const r = await runSalvage(
+    ['--organize', MARKER, '5'],
+    cdp.port,
+    seedOrganizer(MARKER, title),
+    {
+      PRO_GATE_TEST_MUTATION_EVALUATE_MS: '100',
+      PRO_GATE_TEST_MUTATION_LEASE_MS: '250',
+    },
+  );
+  const elapsedMs = Date.now() - startedAt;
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  check('unconfirmed cancellation holds the organizer through absolute lease expiry',
+    elapsedMs >= 225 && /reason=rename-evaluate-failed/.test(r.stdout),
+    `elapsedMs=${elapsedMs} stdout=${r.stdout}`);
+  check('expired renderer work cannot mutate after cancellation acknowledgement is lost',
+    ui.events.length === 0 && ui.title === null, `ui=${JSON.stringify(ui)}`);
   cdp.stop();
 }
 
@@ -970,14 +1193,22 @@ const FOREIGN_ANSWER = (m) => [
   const target = {
     marker: MARKER,
     conversationUrl: 'https://chatgpt.com/c/mock-conversation',
+    mutationToken: 'test-token.1',
+    mutationExpiresAt: Date.now() + ORGANIZER_MUTATION_LEASE_MS,
   };
   const renameExpression = buildRenameConversationExpression(dangerousTitle, target);
   const archiveExpression = buildArchiveConversationExpression(target);
+  const cancelExpression = buildCancelOrganizerMutationExpression(MARKER, target.mutationToken);
   check('rename expression serializes the exact title as data',
     expectedTitleFromExpression(renameExpression) === dangerousTitle,
     `expression=${renameExpression.slice(0, 160)}`);
   check('organizer expressions contain no ChatGPT backend API path',
-    !/backend-api|XMLHttpRequest|\bfetch\s*\(/i.test(`${renameExpression}\n${archiveExpression}`));
+    !/backend-api|XMLHttpRequest|\bfetch\s*\(/i.test(`${renameExpression}\n${archiveExpression}\n${cancelExpression}`));
+  check('UI mutations carry an expiring browser lease and a positive cancellation expression',
+    /mutationLeaseActive/.test(renameExpression) &&
+      /guardedDispatch/.test(renameExpression) &&
+      /pro-gate-organizer:cancel/.test(cancelExpression));
+  check('mutation lease expires before the CDP mutation deadline', ORGANIZER_MUTATION_LEASE_MS < 15_000);
   check('rename expression uses native input state and exact verification',
     /HTMLInputElement\.prototype/.test(renameExpression) && /status: 'already'/.test(renameExpression));
   check('organizer scopes the rendered sidebar menu to the exact conversation URL',
@@ -996,7 +1227,7 @@ const FOREIGN_ANSWER = (m) => [
       /verification\.already/.test(renameExpression));
   check('browser-side ownership rejects a terminal verdict without an exact marker echo',
     /target-answer-marker-missing/.test(renameExpression) &&
-      /verdictAt > ownMarkerAt/.test(renameExpression));
+      /expectedFinalReview === null[\s\S]*verdictAt > ownMarkerAt/.test(renameExpression));
   check('archive expression excludes destructive and reverse actions',
     /label\.includes\('delete'\)/.test(archiveExpression) &&
       /label\.includes\('unarchive'\)/.test(archiveExpression) &&

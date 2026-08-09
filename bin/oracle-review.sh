@@ -686,6 +686,7 @@ RUN_START="$(date +%s)"
 SALVAGED=0
 EFF_CONC=0
 PG_RESULT_DURABLE=0
+PG_ACCEPTED_URL=""
 # v0.21: the model oracle actually resolved for THIS run, plus the selection status. Captured
 # (best-effort) from oracle's "Model selection evidence:" line on fresh paths, or read back from
 # the reservation record on --harvest; empty until known and whenever the resolved label is
@@ -885,11 +886,19 @@ pg_organizer_lock_release() {
 
 pg_organize_chat() {  # rename|finalize [early-lease] [diagnostic-log] [helper-seconds] [scan-seconds]
   local action="$1" lease="${2:-}" diagnostic_log="${3:-}" helper_s="${4:-35}" scan_s="${5:-25}"
-  local marker="${RUN_MARKER:-}" timeout_bin line
+  local marker="${RUN_MARKER:-}" timeout_bin line cooldown_reason
   local -a organizer_args=(--organize)
   [ "$MODE" = remote-chrome ] || return 0
   pg_reservation_marker_ok "$marker" || return 0
   command -v node >/dev/null 2>&1 || return 0
+  # Browser organization is traffic against the same account surface as salvage. Never make it
+  # the first request after throttle/Cloudflare evidence, and honor a cooldown written by a peer.
+  if [ "${THROTTLED:-0}" = 1 ] || [ "${CLOUDFLARE:-0}" = 1 ]; then
+    return 0
+  fi
+  if cooldown_reason="$(pg_cooldown_active)"; then
+    return 0
+  fi
   timeout_bin="${PRO_GATE_TIMEOUT_BIN:-timeout}"
   if [[ "$timeout_bin" == */* ]]; then
     [ -x "$timeout_bin" ] || return 0
@@ -909,10 +918,22 @@ pg_organize_chat() {  # rename|finalize [early-lease] [diagnostic-log] [helper-s
     return 0
   else
     [ "${CHAT_RENAME:-0}" = 1 ] || organizer_args+=(--no-rename)
+    # The scan/render window may be followed by a 15s mutation evaluation and a 5s positive-
+    # cancellation attempt. Keep the shell helper beyond that lifecycle so timeout can never
+    # release the marker lock while the renderer's absolute 10s mutation lease is still live.
+    local helper_min_s=$(( scan_s + 25 ))
     if [ "$action" = finalize ]; then
-      organizer_args+=(--finalize)
+      [ "${PG_RESULT_DURABLE:-0}" = 1 ] && [ -s "${RESULT_PATH:-}" ] || {
+        pg_organizer_lock_release
+        return 0
+      }
+      organizer_args+=(--finalize --result-file "$RESULT_PATH")
+      [ -n "${PG_ACCEPTED_URL:-}" ] && organizer_args+=(--accepted-url "$PG_ACCEPTED_URL")
       [ "${CHAT_ARCHIVE:-0}" = 1 ] && organizer_args+=(--archive)
+      # Finalization may perform both rename and archive, so reserve two mutation windows.
+      helper_min_s=$(( scan_s + 50 ))
     fi
+    [ "$helper_s" -ge "$helper_min_s" ] 2>/dev/null || helper_s="$helper_min_s"
     line="$("$timeout_bin" "$helper_s" node "$SELF/cdp-salvage.mjs" "${organizer_args[@]}" \
       "$marker" "$scan_s" "$PORT" 2>/dev/null | sed -n '/^organizer /p' | tail -n 1)"
     pg_organizer_lock_release
@@ -1265,6 +1286,9 @@ if [ -n "$HARVEST_MARKER" ]; then
     else
       echo "[oracle-review] NOTE: PRO_GATE_REQUIRE_NONCE=0 — accepted a nonce-less capture on best-effort path overlap." >&2
     fi
+    # Only now—after structural, nonce, and provenance acceptance—may the exact CDP source URL
+    # narrow finalization. A merely observed candidate never gains mutation authority.
+    PG_ACCEPTED_URL="${HARVEST_URL:-}"
     pg_strip_nonce "$HARVEST_TMP" "$RUN_MARKER"
     # Private verified snapshot is the authoritative return (gate #54 r6): $OUT is
     # publication only — a concurrent marker sharing the caller's --out cannot change what
@@ -1665,8 +1689,8 @@ ENGINE_ARGS=(-e browser)
 # one-shot and navigates the tab off the conversation, which strips the RUN_MARKER from the
 # open tabs and blinds BOTH the pre-retry liveness probe (-> false "dead submission" -> a
 # double-spending retry) and the last-resort CDP salvage. We own the conversation lifecycle:
-# leave the tab intact so probe/salvage can always find it, and close it ourselves once the
-# review is confirmed (pg_close_run_tab in pg_finish). Override with PRO_GATE_BROWSER_ARCHIVE.
+# leave the tab intact so probe/salvage can always find it, then let the marker-owned organizer
+# archive/close only after durable validation in pg_finish. Override with PRO_GATE_BROWSER_ARCHIVE.
 ENGINE_ARGS+=(--browser-archive "${PRO_GATE_BROWSER_ARCHIVE:-never}")
 
 # --- Bound concurrent Pro review runs against the single ChatGPT account ---
@@ -2384,6 +2408,12 @@ if [ -n "$FINAL_SNAP" ] \
   SALVAGE_RAN=1; SALVAGE_PRESERVE=1   # route to the reserve-and-harvest branch below
 fi
 if [ -n "$FINAL_SNAP" ]; then
+  # CDP names the exact rendered conversation in RUNLOG. Promote it only after every acceptance
+  # check above passed; direct and reattach captures deliberately leave this empty and bind by
+  # durable byte identity instead.
+  if [ "${CAPTURE_SOURCE:-}" = cdp ]; then
+    PG_ACCEPTED_URL="$(sed -n 's/^matched-url //p' "$RUNLOG" 2>/dev/null | tail -1)"
+  fi
   # v0.28 (#55): strip the echoed run-marker nonce before the review leaves the engine —
   # binding is an internal mechanism, not part of the caller-facing output. Everything from
   # here on — severity note, stdout, artifact, digest — sources the verified snapshot;

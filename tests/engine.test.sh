@@ -51,6 +51,20 @@ run_engine() { # args... ; captures RC
   RC=$?
 }
 
+# Opt-in timeout shim for lifecycle assertions. Set PRO_GATE_TIMEOUT_BIN to this wrapper and
+# PG_TEST_NODE_ARGS to a log file; it records only organizer subprocesses, then preserves timeout.
+REAL_TIMEOUT=/usr/bin/timeout
+TIMEOUT_LOG_BIN="$TDIR/timeout-log"
+cat > "$TIMEOUT_LOG_BIN" <<TIMEOUT_LOG
+#!/usr/bin/env bash
+: >> "\${PG_TEST_NODE_ARGS:?}"
+case " \$* " in
+  *' --organize '*) printf '%s\n' "\$*" >> "\$PG_TEST_NODE_ARGS" ;;
+esac
+exec "$REAL_TIMEOUT" "\$@"
+TIMEOUT_LOG
+chmod +x "$TIMEOUT_LOG_BIN"
+
 echo '# hard-ceiling refusal (exit 11): only diffs past PRO_GATE_DIFF_HARD_MAX are refused'
 printf 'still thinking, run marker: %s\n' "$MARKER" > "$TDIR/tab.txt"
 ORGANIZER_STATE="$TDIR/organizer-state.json"
@@ -953,16 +967,47 @@ FAKE_CF
 chmod +x "$TDIR/bin/oracle-cf"
 RKEY_103="$(printf '%s-103' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
 printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+: > "$TDIR/mock.log"
 env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
   PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
   PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-cf" NODE_OPTIONS= \
+  PRO_GATE_TIMEOUT_BIN="$TIMEOUT_LOG_BIN" PG_TEST_NODE_ARGS="$TDIR/node-args-cloudflare.log" \
   bash "$ENGINE" --pr 103 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$RHOME/o-cf.md" --timeout 5s \
   >"$TDIR/stdout" 2>"$TDIR/stderr"
 RC=$?
 check 'cloudflare run fails without a usable review' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
 check 'cloudflare writes the account cooldown' "$([ -f "$RHOME/throttle.cooldown" ]; echo $?)" 'no cooldown file'
 check 'cloudflare refunds the round (no spend, no budget charge)' "$([ ! -f "$RHOME/rounds/$RKEY_103" ]; echo $?)" "rounds file: $(cat "$RHOME/rounds/$RKEY_103" 2>/dev/null)"
+check 'cloudflare failure never invokes organizer mode' "$(! grep -q -- '--organize' "$TDIR/node-args-cloudflare.log"; echo $?)" "$(cat "$TDIR/node-args-cloudflare.log" 2>/dev/null)"
 rm -f "$RHOME/throttle.cooldown"
+
+echo '# v0.32: throttle evidence suppresses exit-9 organization'
+cat > "$TDIR/bin/oracle-throttle" <<'FAKE_THROTTLE'
+#!/usr/bin/env bash
+[ "${1:-}" = session ] && exit 1
+echo 'Launching browser mode'
+echo 'Acquired ChatGPT browser slot'
+exit 1
+FAKE_THROTTLE
+chmod +x "$TDIR/bin/oracle-throttle"
+THOME="$TDIR/home-throttle-organizer"
+TSTATE="$TDIR/state-throttle-organizer.json"
+mkdir -p "$THOME"
+printf '{"title":null,"archived":false,"events":[]}\n' > "$TSTATE"
+printf "You're making requests too quickly. Temporarily limited access to your conversations.\n" > "$TDIR/tab.txt"
+start_mock "$TDIR/tab.txt" "$TSTATE"
+: > "$TDIR/node-args-throttle.log"
+env PRO_GATE_HOME="$THOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_MAX_RETRIES=0 \
+  PRO_GATE_REATTACH_TIMEOUT=1 PRO_GATE_SALVAGE_SECS=2 PRO_GATE_THROTTLE_PAUSE=0 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-throttle" NODE_OPTIONS= \
+  PRO_GATE_TIMEOUT_BIN="$TIMEOUT_LOG_BIN" PG_TEST_NODE_ARGS="$TDIR/node-args-throttle.log" \
+  bash "$ENGINE" --pr 104 --repo "$TDIR" --diff "$TDIR/small.diff" \
+  --out "$THOME/o-throttle.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'throttle salvage preserves the spent run as exit 9' "$([ "$RC" -eq 9 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+check 'throttle evidence writes the account cooldown' "$([ -f "$THOME/throttle.cooldown" ]; echo $?)" 'no cooldown file'
+check 'exit-9 under active throttle never invokes organizer mode' "$(! grep -q -- '--organize' "$TDIR/node-args-throttle.log"; echo $?)" "$(cat "$TDIR/node-args-throttle.log")"
 
 echo '# v0.22.1: pg_round_unrecord drops only the newest entry'
 printf '100\n200\n300\n' > "$RHOME/rounds/unrec-key-1"
@@ -1431,10 +1476,18 @@ printf 'idle tab with no markers at all\n' > "$TDIR/tab.txt"
 # Artifact recovery needs no browser and must precede the cooldown gate (gate #54 r3 P2):
 # retrievable even while the account is cooling.
 printf '%s test-cooldown\n' "$(date +%Y-%m-%dT%H:%M:%S%z)" > "$TDIR/home/throttle.cooldown"
-run_engine --harvest "$M9" --out "$TDIR/o-artifact.md" --timeout 5s
+: > "$TDIR/mock.log"
+: > "$TDIR/node-args-artifact-cooldown.log"
+PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" \
+  PRO_GATE_TIMEOUT_BIN="$TIMEOUT_LOG_BIN" PG_TEST_NODE_ARGS="$TDIR/node-args-artifact-cooldown.log" \
+  bash "$ENGINE" --harvest "$M9" --out "$TDIR/o-artifact.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
 rm -f "$TDIR/home/throttle.cooldown"
 check 'artifact-first recovery exits 0 (even under cooldown, no ledger row)' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
 check 'artifact content returned verbatim' "$(cmp -s "$TDIR/o-artifact.md" "$TDIR/prov-ours.md"; echo $?)" "$(head -2 "$TDIR/o-artifact.md" 2>/dev/null)"
+check 'artifact retrieval under active cooldown never invokes organizer mode' "$(! grep -q -- '--organize' "$TDIR/node-args-artifact-cooldown.log"; echo $?)" "$(cat "$TDIR/node-args-artifact-cooldown.log")"
 # ...and with the browser fully DOWN (gate #54 r4 P2): the fast path precedes the CDP
 # preflight, so a dead port must not turn an on-disk artifact into exit 3.
 env PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT=1 PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 NODE_OPTIONS= \
@@ -1458,10 +1511,19 @@ run_artifact_organizer_case() { # <case-id> <marker> [NAME=VALUE ...]
   cp "$TDIR/prov-ours.md" "$CASE_HOME/completed/$marker"
   printf '%s\n' "$CASE_TITLE" > "$CASE_HOME/conversation-titles/$marker"
   printf '{"title":null,"archived":false,"events":[]}\n' > "$CASE_STATE"
-  printf 'run marker: %s\nowned artifact conversation\n' "$marker" > "$TDIR/tab.txt"
+  {
+    printf 'run marker: %s\n' "$marker"
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        VERDICT:*) printf '%s (run marker: %s)\n' "$line" "$marker" ;;
+        *) printf '%s\n' "$line" ;;
+      esac
+    done < "$CASE_HOME/completed/$marker"
+  } > "$TDIR/tab.txt"
   start_mock "$TDIR/tab.txt" "$CASE_STATE"
   env PRO_GATE_HOME="$CASE_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
-    PRO_GATE_SELF_HEAL=0 NODE_OPTIONS= "$@" bash "$ENGINE" --harvest "$marker" \
+    PRO_GATE_SELF_HEAL=0 NODE_OPTIONS= PRO_GATE_TIMEOUT_BIN="$TIMEOUT_LOG_BIN" \
+    PG_TEST_NODE_ARGS="$TDIR/node-args-$case_id.log" "$@" bash "$ENGINE" --harvest "$marker" \
     --out "$CASE_OUT" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
   CASE_RC=$?
 }
@@ -1471,6 +1533,8 @@ MCFG1='pg-run-config-201-1700000201-21'
 run_artifact_organizer_case archive-off "$MCFG1" PRO_GATE_CHAT_ARCHIVE=0
 check 'CHAT_ARCHIVE=0 keeps exit 0 and exact rename' "$([ "$CASE_RC" -eq 0 ] && [ "$(jq -r .title "$CASE_STATE")" = "$CASE_TITLE" ] && [ "$(jq -r .archived "$CASE_STATE")" = false ]; echo $?)" "rc=$CASE_RC state=$(cat "$CASE_STATE")"
 check 'CHAT_ARCHIVE=0 still closes the verified local tab' "$(grep -q 'closed tab1' "$TDIR/mock.log"; echo $?)" "$(cat "$TDIR/mock.log")"
+check 'artifact finalization has no accepted URL without a validated CDP capture source' "$(! grep -q -- '--accepted-url' "$TDIR/node-args-archive-off.log"; echo $?)" "$(cat "$TDIR/node-args-archive-off.log" 2>/dev/null)"
+check 'finalizer timeout keeps the organizer lock beyond both mutation windows' "$(awk '$1 + 0 >= 75 && /--finalize/ { found=1 } END { exit !found }' "$TDIR/node-args-archive-off.log"; echo $?)" "$(cat "$TDIR/node-args-archive-off.log" 2>/dev/null)"
 
 MCFG2='pg-run-config-202-1700000202-22'
 run_artifact_organizer_case rename-off "$MCFG2" PRO_GATE_CHAT_RENAME=0
@@ -1481,6 +1545,7 @@ MCFG3='pg-run-config-203-1700000203-23'
 run_artifact_organizer_case keep-tabs "$MCFG3" PRO_GATE_KEEP_TABS=1
 check 'KEEP_TABS=1 permits exact rename but suppresses archive' "$([ "$CASE_RC" -eq 0 ] && [ "$(jq -r .title "$CASE_STATE")" = "$CASE_TITLE" ] && [ "$(jq -r .archived "$CASE_STATE")" = false ]; echo $?)" "rc=$CASE_RC state=$(cat "$CASE_STATE")"
 check 'KEEP_TABS=1 leaves the local tab open' "$(! grep -q 'closed tab1' "$TDIR/mock.log"; echo $?)" "$(cat "$TDIR/mock.log")"
+check 'rename-only timeout keeps the organizer lock beyond its mutation lease' "$(awk '$1 + 0 >= 50 && /--organize/ && !/--finalize/ { found=1 } END { exit !found }' "$TDIR/node-args-keep-tabs.log"; echo $?)" "$(cat "$TDIR/node-args-keep-tabs.log" 2>/dev/null)"
 
 MCFG4='pg-run-config-204-1700000204-24'
 run_artifact_organizer_case invalid-bools "$MCFG4" PRO_GATE_CHAT_RENAME=yes PRO_GATE_CHAT_ARCHIVE=yes
@@ -1511,6 +1576,7 @@ run_harvest_durability_case() { # <case-id> <marker> <block-pending:0|1>
   start_mock "$TDIR/tab.txt" "$CASE_STATE"
   env PRO_GATE_HOME="$CASE_HOME" PRO_GATE_COMPLETED_DIR="$TDIR/completed-block-$case_id" \
     ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 NODE_OPTIONS= \
+    PRO_GATE_TIMEOUT_BIN="$TIMEOUT_LOG_BIN" PG_TEST_NODE_ARGS="$TDIR/node-args-$case_id.log" \
     bash "$ENGINE" --harvest "$marker" --out "$CASE_OUT" --timeout 5s \
     >"$TDIR/stdout" 2>"$TDIR/stderr"
   CASE_RC=$?
@@ -1521,6 +1587,7 @@ MPEND='pg-run-config-206-1700000206-26'
 run_harvest_durability_case pending "$MPEND" 0
 check 'pending fallback is a durable exit-0 result' "$([ "$CASE_RC" -eq 0 ] && [ -s "$CASE_HOME/pending/$MPEND" ] && grep -q "RESULT_FILE=$CASE_HOME/pending/$MPEND" "$TDIR/stdout"; echo $?)" "rc=$CASE_RC stdout=$(grep RESULT_FILE "$TDIR/stdout")"
 check 'pending fallback still archives and closes' "$([ "$(jq -r .archived "$CASE_STATE")" = true ] && grep -q 'closed tab1' "$TDIR/mock.log"; echo $?)" "state=$(cat "$CASE_STATE") log=$(cat "$TDIR/mock.log")"
+check 'validated harvest forwards its exact CDP capture URL to finalization' "$(grep -q -- '--accepted-url https://chatgpt.com/c/mock-conversation' "$TDIR/node-args-pending.log"; echo $?)" "$(cat "$TDIR/node-args-pending.log" 2>/dev/null)"
 
 printf 'not-a-directory\n' > "$TDIR/completed-block-volatile"
 MVOL='pg-run-config-207-1700000207-27'
@@ -1708,13 +1775,16 @@ printf 'foreign idle tab\n' > "$TDIR/tab.txt"
 # recorded slot would (correctly) exclude this fresh run and park it in the account-slot
 # queue for the whole lock wait.
 mkdir -p "$TDIR/home-nonce"
+: > "$TDIR/node-args-directnonce.log"
 env PRO_GATE_HOME="$TDIR/home-nonce" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
   PRO_GATE_RAMP=0 PRO_GATE_MAX_RETRIES=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-nonce" NODE_OPTIONS= \
+  PRO_GATE_TIMEOUT_BIN="$TIMEOUT_LOG_BIN" PG_TEST_NODE_ARGS="$TDIR/node-args-directnonce.log" \
   bash "$ENGINE" --pr 131 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$TDIR/o-directnonce.md" --timeout 5s \
   >"$TDIR/stdout" 2>"$TDIR/stderr"
 RC=$?
 check 'direct nonce capture exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
 check 'direct capture nonce stripped' "$(grep -q 'run marker' "$TDIR/o-directnonce.md"; [ $? -ne 0 ]; echo $?)" "$(tail -1 "$TDIR/o-directnonce.md" 2>/dev/null)"
+check 'direct capture finalization never invents accepted URL authority' "$(! grep -q -- '--accepted-url' "$TDIR/node-args-directnonce.log"; echo $?)" "$(cat "$TDIR/node-args-directnonce.log")"
 
 echo '# v0.32: a delayed early organizer cannot wake after terminal archive/close'
 cat > "$TDIR/bin/oracle-organizer-race" <<'RACE'
@@ -1727,8 +1797,8 @@ while [ $# -gt 0 ]; do
     *) shift;;
   esac
 done
-printf 'still thinking, run marker: %s\n' "$marker" > "${PG_TEST_TAB_FILE:?}"
 printf '[P1] a.sh:1 - finding\n  Why: test\nP2: none\nP3: none\nVERDICT: SHIP - fixture. (run marker: %s)\n' "$marker" > "$out"
+{ printf 'run marker: %s\n' "$marker"; cat "$out"; } > "${PG_TEST_TAB_FILE:?}"
 RACE
 chmod +x "$TDIR/bin/oracle-organizer-race"
 RACE_HOME="$TDIR/home-organizer-race"
