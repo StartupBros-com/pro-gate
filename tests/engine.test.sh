@@ -1865,6 +1865,233 @@ check 'terminal success beats the delayed organizer timer' "$([ "$RC" -eq 0 ] &&
 sleep 6
 check 'revoked early organizer performs no post-finalization render or mutation' "$([ "$(jq -r '[.events[].action] | join(",")' "$RACE_STATE")" = 'rename,archive' ] && ! grep -q '^opened scratch' "$TDIR/mock.log"; echo $?)" "state=$(cat "$RACE_STATE") log=$(cat "$TDIR/mock.log")"
 
+# A helper that already passed lease validation owns the marker lock until its browser work ends.
+# Terminal paths that elect no mutation must still join it: otherwise the helper survives the
+# parent and can render through a cooldown written after the parent already ledgered its outcome.
+cat > "$TDIR/bin/oracle-organizer-join" <<'JOIN'
+#!/usr/bin/env bash
+out=""; marker=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p) marker="$(printf '%s' "$2" | grep -oE 'pg-run-[A-Za-z0-9.-]+' | head -1)"; shift 2;;
+    --write-output) out="$2"; shift 2;;
+    *) shift;;
+  esac
+done
+mkdir -p "${PRO_GATE_HOME:?}/organizer-locks"
+if command -v flock >/dev/null 2>&1; then
+  (
+    exec 8>>"$PRO_GATE_HOME/organizer-locks/$marker"
+    flock 8
+    : > "${PG_TEST_JOIN_LOCKED:?}"
+    sleep 3
+    : > "${PG_TEST_JOIN_RELEASED:?}"
+  ) </dev/null >/dev/null 2>&1 &
+else
+  (
+    mkdir "$PRO_GATE_HOME/organizer-locks/$marker.d"
+    : > "${PG_TEST_JOIN_LOCKED:?}"
+    sleep 3
+    rmdir "$PRO_GATE_HOME/organizer-locks/$marker.d"
+    : > "${PG_TEST_JOIN_RELEASED:?}"
+  ) </dev/null >/dev/null 2>&1 &
+fi
+for _ in $(seq 1 50); do [ -f "${PG_TEST_JOIN_LOCKED:?}" ] && break; sleep 0.1; done
+printf '[P1] a.sh:1 - finding\n  Why: test\nP2: none\nP3: none\nVERDICT: SHIP - fixture. (run marker: %s)\n' "$marker" > "$out"
+JOIN
+chmod +x "$TDIR/bin/oracle-organizer-join"
+
+run_join_only_case() { # <id> [NAME=VALUE ...]
+  local id="$1"; shift
+  JOIN_HOME="$TDIR/home-join-$id"
+  JOIN_OUT="$TDIR/o-join-$id.md"
+  JOIN_LOCKED="$TDIR/join-$id.locked"
+  JOIN_RELEASED="$TDIR/join-$id.released"
+  mkdir -p "$JOIN_HOME"
+  printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+  start_mock "$TDIR/tab.txt"
+  env PRO_GATE_HOME="$JOIN_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+    PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_MAX_RETRIES=0 PRO_GATE_KEEP_TABS=1 \
+    PRO_GATE_EARLY_PROBE_SECS=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-organizer-join" \
+    PG_TEST_JOIN_LOCKED="$JOIN_LOCKED" PG_TEST_JOIN_RELEASED="$JOIN_RELEASED" \
+    NODE_OPTIONS= "$@" bash "$ENGINE" --pr 133 --repo "$TDIR" \
+      --diff "$TDIR/small.diff" --out "$JOIN_OUT" --timeout 5s \
+      >"$TDIR/stdout" 2>"$TDIR/stderr"
+  JOIN_RC=$?
+}
+
+echo '# v0.32 gate: every terminal path joins an already-running early organizer'
+run_join_only_case rename-off PRO_GATE_CHAT_RENAME=0
+check 'rename-disabled KEEP_TABS success waits for the marker organizer' \
+  "$([ "$JOIN_RC" -eq 0 ] && [ -f "$JOIN_RELEASED" ]; echo $?)" \
+  "rc=$JOIN_RC released=$(test -f "$JOIN_RELEASED"; echo $?) stderr=$(tail -2 "$TDIR/stderr")"
+
+mkdir -p "$TDIR/home-join-title-missing"
+printf 'blocks-title-directory\n' > "$TDIR/home-join-title-missing/conversation-titles"
+run_join_only_case title-missing
+check 'missing title memo still waits for the marker organizer' \
+  "$([ "$JOIN_RC" -eq 0 ] && [ -f "$JOIN_RELEASED" ]; echo $?)" \
+  "rc=$JOIN_RC released=$(test -f "$JOIN_RELEASED"; echo $?) stderr=$(tail -2 "$TDIR/stderr")"
+
+# A successful model capture can encounter a throttle only during terminal organization. The child
+# writes shared cooldown state; the parent must join it before one ramp update and one ledger append.
+echo '# v0.32 gate: organizer throttle precedes ramp and ledger settlement'
+THROTTLE_HOME="$TDIR/home-organizer-throttle"
+mkdir -p "$THROTTLE_HOME"
+printf '2\t4\tseed\n' > "$THROTTLE_HOME/ramp.state"
+printf "%s\n" "You're making requests too quickly. Temporarily limited access to your conversations." > "$TDIR/tab.txt"
+start_mock "$TDIR/tab.txt"
+env PRO_GATE_HOME="$THROTTLE_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=1 PRO_GATE_RAMP_STREAK=5 PRO_GATE_MAX_CONCURRENCY=3 \
+  PRO_GATE_MAX_RETRIES=0 PRO_GATE_EARLY_PROBE_SECS=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-nonce" \
+  NODE_OPTIONS= bash "$ENGINE" --pr 134 --repo "$TDIR" --diff "$TDIR/small.diff" \
+    --out "$TDIR/o-organizer-throttle.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+THROTTLE_ROW="$(tail -1 "$THROTTLE_HOME/ledger.jsonl" 2>/dev/null)"
+check 'organizer-detected throttle preserves collected exit 0' \
+  "$([ "$RC" -eq 0 ] && [ -f "$THROTTLE_HOME/throttle.cooldown" ]; echo $?)" \
+  "rc=$RC cooldown=$(cat "$THROTTLE_HOME/throttle.cooldown" 2>/dev/null)"
+check 'organizer throttle is ledgered instead of clean' \
+  "$([ "$(printf '%s' "$THROTTLE_ROW" | jq -r .outcome 2>/dev/null)" = throttle ]; echo $?)" \
+  "$THROTTLE_ROW"
+check 'organizer throttle applies exactly one ramp reset' \
+  "$([ "$(grep -c '^\[pro-gate ramp\]' "$TDIR/stderr")" -eq 1 ] \
+      && grep -q 'throttle observed' "$TDIR/stderr" \
+      && awk -F'\t' 'NR==1{exit !($1==1 && $2==0)}' "$THROTTLE_HOME/ramp.state"; echo $?)" \
+  "state=$(cat "$THROTTLE_HOME/ramp.state" 2>/dev/null) ramp-log=$(grep '^\[pro-gate ramp\]' "$TDIR/stderr")"
+
+# A cooldown that predates artifact-only recovery suppresses browser traffic, but it is not evidence
+# that this invocation hit a throttle. Preserve the existing clean ledger semantics.
+ARTIFACT_COOLDOWN_ROW="$(grep -F '"out":"'$TDIR'/o-artifact.md"' "$TDIR/home/ledger.jsonl" | tail -1)"
+check 'pre-existing cooldown does not relabel artifact recovery as throttle' \
+  "$([ "$(printf '%s' "$ARTIFACT_COOLDOWN_ROW" | jq -r .outcome 2>/dev/null)" = clean ]; echo $?)" \
+  "$ARTIFACT_COOLDOWN_ROW"
+
+# Stock macOS lacks flock. Model a winner paused after mkdir but before metadata publication; a
+# contender must treat that empty directory as busy rather than deleting a live lock after one second.
+echo '# v0.32 gate: no-flock organizer lock never steals a publication-in-progress'
+NOFLOCK_HOME="$TDIR/home-organizer-noflock"
+NOFLOCK_MARKER='pg-run-config-208-1700000208-28'
+NOFLOCK_DIR="$NOFLOCK_HOME/organizer-locks/$NOFLOCK_MARKER.d"
+mkdir -p "$NOFLOCK_HOME/completed" "$NOFLOCK_HOME/conversation-titles" "$NOFLOCK_DIR"
+cp "$TDIR/prov-ours.md" "$NOFLOCK_HOME/completed/$NOFLOCK_MARKER"
+printf 'pro-gate review: PR #208 r1 [noflock]\n' > "$NOFLOCK_HOME/conversation-titles/$NOFLOCK_MARKER"
+inode_of() { stat -c %i "$1" 2>/dev/null || stat -f %i "$1" 2>/dev/null; }
+NOFLOCK_INODE="$(inode_of "$NOFLOCK_DIR")"
+(
+  sleep 2
+  [ -d "$NOFLOCK_DIR" ] && [ "$(inode_of "$NOFLOCK_DIR")" = "$NOFLOCK_INODE" ] \
+    || { : > "$TDIR/noflock-stolen"; exit 0; }
+  owner="${BASHPID:-$$}"
+  token="$(bash -c '. "'$HERE'/../lib/pro-gate-lib.sh"; pg_pid_token '"$owner" 2>/dev/null || true)"
+  printf '%s\n' "$owner" > "$NOFLOCK_DIR/pid"
+  printf '%s\n' "$token" > "$NOFLOCK_DIR/token"
+  : > "$TDIR/noflock-published"
+  sleep 2
+  rm -rf "$NOFLOCK_DIR"
+) &
+NOFLOCK_OWNER_PID=$!
+printf 'idle tab with no markers\n' > "$TDIR/tab.txt"
+start_mock "$TDIR/tab.txt"
+env PRO_GATE_HOME="$NOFLOCK_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_TEST_ORGANIZER_NO_FLOCK=1 \
+  PRO_GATE_TEST_ORGANIZER_LOCK_WAIT=8 PRO_GATE_TIMEOUT_BIN="$TIMEOUT_LOG_BIN" \
+  PG_TEST_NODE_ARGS="$TDIR/node-args-noflock.log" NODE_OPTIONS= \
+  bash "$ENGINE" --harvest "$NOFLOCK_MARKER" --out "$TDIR/o-noflock.md" --timeout 5s \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+wait "$NOFLOCK_OWNER_PID"
+check 'no-flock contender preserves the live unpublished lock' \
+  "$([ "$RC" -eq 0 ] && [ -f "$TDIR/noflock-published" ] && [ ! -f "$TDIR/noflock-stolen" ]; echo $?)" \
+  "rc=$RC published=$(test -f "$TDIR/noflock-published"; echo $?) stolen=$(test -f "$TDIR/noflock-stolen"; echo $?) stderr=$(tail -2 "$TDIR/stderr")"
+check 'no-flock lock metadata and directory are retired after the join' \
+  "$([ ! -e "$NOFLOCK_DIR" ]; echo $?)" "lock remains: $(find "$NOFLOCK_HOME/organizer-locks" -maxdepth 2 -print 2>/dev/null)"
+
+# An empty crash-left directory has no trustworthy owner record. It stays busy for this bounded
+# call rather than being deleted from under a winner that may still be publishing metadata.
+BUSY_HOME="$TDIR/home-organizer-busy"
+BUSY_MARKER='pg-run-config-209-1700000209-29'
+mkdir -p "$BUSY_HOME/completed" "$BUSY_HOME/organizer-locks/$BUSY_MARKER.d"
+cp "$TDIR/prov-ours.md" "$BUSY_HOME/completed/$BUSY_MARKER"
+env PRO_GATE_HOME="$BUSY_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_KEEP_TABS=1 PRO_GATE_CHAT_RENAME=0 \
+  PRO_GATE_TEST_ORGANIZER_NO_FLOCK=1 PRO_GATE_TEST_ORGANIZER_LOCK_WAIT=1 NODE_OPTIONS= \
+  bash "$ENGINE" --harvest "$BUSY_MARKER" --out "$TDIR/o-noflock-busy.md" --timeout 5s \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'no-flock missing metadata stays busy instead of being stolen' \
+  "$([ "$RC" -eq 0 ] && [ -d "$BUSY_HOME/organizer-locks/$BUSY_MARKER.d" ] \
+      && grep -q 'organizer-lock-timeout' "$TDIR/stderr"; echo $?)" \
+  "rc=$RC stderr=$(cat "$TDIR/stderr")"
+
+# Selectively fail the ownership-record install after mkdir. Acquisition must fail and remove its
+# partial directory; browser work must never start under unpublished ownership.
+PUB_HOME="$TDIR/home-organizer-publish-fail"
+PUB_MARKER='pg-run-config-210-1700000210-30'
+PUB_OS_HOME="$TDIR/os-home-organizer-publish-fail"
+PUB_INTERCEPT="$TDIR/organizer-publish-intercepted"
+mkdir -p "$PUB_HOME/completed" "$PUB_OS_HOME/.local/bin"
+cp "$TDIR/prov-ours.md" "$PUB_HOME/completed/$PUB_MARKER"
+cat > "$PUB_OS_HOME/.local/bin/mv" <<'PUB_MV'
+#!/usr/bin/env bash
+last=""
+for arg in "$@"; do last="$arg"; done
+case "$last" in
+  */organizer-locks/*.d/pid)
+    : > "${PG_TEST_PUB_INTERCEPT:?}"
+    exit 1
+    ;;
+esac
+exec /bin/mv "$@"
+PUB_MV
+chmod +x "$PUB_OS_HOME/.local/bin/mv"
+env HOME="$PUB_OS_HOME" PG_TEST_PUB_INTERCEPT="$PUB_INTERCEPT" \
+  PRO_GATE_HOME="$PUB_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_KEEP_TABS=1 PRO_GATE_CHAT_RENAME=0 \
+  PRO_GATE_TEST_ORGANIZER_NO_FLOCK=1 PRO_GATE_TEST_ORGANIZER_LOCK_WAIT=1 NODE_OPTIONS= \
+  bash "$ENGINE" --harvest "$PUB_MARKER" --out "$TDIR/o-noflock-publish.md" --timeout 5s \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'no-flock acquisition fails when ownership publication fails' \
+  "$([ "$RC" -eq 0 ] && [ -f "$PUB_INTERCEPT" ] \
+      && [ ! -e "$PUB_HOME/organizer-locks/$PUB_MARKER.d" ] \
+      && grep -q 'organizer-lock-timeout' "$TDIR/stderr"; echo $?)" \
+  "rc=$RC intercepted=$(test -f "$PUB_INTERCEPT"; echo $?) stderr=$(cat "$TDIR/stderr") locks=$(find "$PUB_HOME/organizer-locks" -maxdepth 2 -print 2>/dev/null)"
+
+# Replace ownership while the organizer helper runs. Release must compare both fields and preserve
+# the replacement directory instead of deleting a lock it no longer owns.
+RELEASE_HOME="$TDIR/home-organizer-release"
+RELEASE_MARKER='pg-run-config-211-1700000211-31'
+RELEASE_TIMEOUT="$TDIR/timeout-organizer-release"
+mkdir -p "$RELEASE_HOME/completed" "$RELEASE_HOME/conversation-titles"
+cp "$TDIR/prov-ours.md" "$RELEASE_HOME/completed/$RELEASE_MARKER"
+printf 'pro-gate review: PR #211 r1 [release]\n' > "$RELEASE_HOME/conversation-titles/$RELEASE_MARKER"
+cat > "$RELEASE_TIMEOUT" <<'RELEASE_TIMEOUT_SH'
+#!/usr/bin/env bash
+case " $* " in
+  *' --organize '*)
+    for dir in "${PRO_GATE_HOME:?}"/organizer-locks/*.d; do
+      [ -d "$dir" ] || continue
+      printf 'replacement-owner\n' > "$dir/pid"
+    done ;;
+esac
+exec /usr/bin/timeout "$@"
+RELEASE_TIMEOUT_SH
+chmod +x "$RELEASE_TIMEOUT"
+printf 'idle tab with no markers\n' > "$TDIR/tab.txt"
+start_mock "$TDIR/tab.txt"
+env PRO_GATE_HOME="$RELEASE_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_TEST_ORGANIZER_NO_FLOCK=1 \
+  PRO_GATE_TIMEOUT_BIN="$RELEASE_TIMEOUT" NODE_OPTIONS= \
+  bash "$ENGINE" --harvest "$RELEASE_MARKER" --out "$TDIR/o-noflock-release.md" --timeout 5s \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+REPLACEMENT_DIR="$RELEASE_HOME/organizer-locks/$RELEASE_MARKER.d"
+check 'no-flock release cannot remove replacement ownership' \
+  "$([ "$RC" -eq 0 ] && [ -d "$REPLACEMENT_DIR" ] \
+      && grep -q '^replacement-owner$' "$REPLACEMENT_DIR/pid"; echo $?)" \
+  "rc=$RC stderr=$(tail -2 "$TDIR/stderr") locks=$(find "$RELEASE_HOME/organizer-locks" -maxdepth 2 -print 2>/dev/null)"
+
 echo '# v0.29: the prompt leads with the run-naming title line (#49 phase 1)'
 cat > "$TDIR/bin/oracle-dump" <<'DUMP'
 #!/usr/bin/env bash

@@ -828,11 +828,13 @@ pg_publish_fail() {  # $1 = snapshot — shared failure path: durability decides
 # Linux uses a dedicated dynamic flock fd (never the engine's lock fds); stock macOS uses an
 # owner-verified mkdir lock. Globals are process-local inside the early organizer's subshell.
 pg_organizer_lock_acquire() {  # <marker> [wait-seconds]
-  local marker="$1" wait_s="${2:-95}" lock start owner owner_token self self_token probe_pid
+  local marker="$1" wait_s="${2:-95}" lock start self self_token probe_pid
+  case "$wait_s" in ''|*[!0-9]*) wait_s=95;; esac
   PG_ORGANIZER_LOCK_FD=""; PG_ORGANIZER_LOCK_DIR=""
+  PG_ORGANIZER_LOCK_OWNER=""; PG_ORGANIZER_LOCK_TOKEN=""
   lock="${PRO_GATE_ORGANIZER_LOCK_DIR:-$PRO_GATE_HOME/organizer-locks}/$marker"
   mkdir -p "$(dirname "$lock")" 2>/dev/null || return 1
-  if command -v flock >/dev/null 2>&1; then
+  if [ "${PRO_GATE_TEST_ORGANIZER_NO_FLOCK:-0}" != 1 ] && command -v flock >/dev/null 2>&1; then
     if { exec {PG_ORGANIZER_LOCK_FD}>>"$lock"; } 2>/dev/null \
        && flock -w "$wait_s" "$PG_ORGANIZER_LOCK_FD" 2>/dev/null; then
       return 0
@@ -853,35 +855,58 @@ pg_organizer_lock_acquire() {  # <marker> [wait-seconds]
     wait "$probe_pid" 2>/dev/null || true
   fi
   case "$self" in ''|*[!0-9]*) self="$$";; esac
+  self_token="$(pg_pid_token "$self" 2>/dev/null || true)"
+  [ -n "$self_token" ] || { PG_ORGANIZER_LOCK_DIR=""; return 1; }
+  # Existing directories are always BUSY, including missing/torn/dead owner metadata. Reaping a
+  # path after reading its metadata cannot be made conditional with portable Bash: a live winner
+  # can replace the directory before rm/rename and be deleted instead. The startup sweep removes
+  # crash-left organizer locks only after one day; this bounded acquisition therefore fails closed.
   while ! mkdir "$PG_ORGANIZER_LOCK_DIR" 2>/dev/null; do
-    owner="$(cat "$PG_ORGANIZER_LOCK_DIR/pid" 2>/dev/null || true)"
-    owner_token="$(cat "$PG_ORGANIZER_LOCK_DIR/token" 2>/dev/null || true)"
-    if case "$owner" in ''|*[!0-9]*) true;; *) ! kill -0 "$owner" 2>/dev/null;; esac \
-       || { [ -n "$owner_token" ] && [ "$owner_token" != "$(pg_pid_token "$owner" 2>/dev/null)" ]; }; then
-      # The winner writes owner metadata immediately AFTER mkdir. Recheck once before treating
-      # missing/torn metadata as stale, or a contender can delete a newly acquired live lock.
-      sleep 1
-      owner="$(cat "$PG_ORGANIZER_LOCK_DIR/pid" 2>/dev/null || true)"
-      owner_token="$(cat "$PG_ORGANIZER_LOCK_DIR/token" 2>/dev/null || true)"
-      if case "$owner" in ''|*[!0-9]*) true;; *) ! kill -0 "$owner" 2>/dev/null;; esac \
-         || { [ -n "$owner_token" ] && [ "$owner_token" != "$(pg_pid_token "$owner" 2>/dev/null)" ]; }; then
-        rm -rf "$PG_ORGANIZER_LOCK_DIR" 2>/dev/null
-        continue
-      fi
-    fi
-    [ $(( $(date +%s) - start )) -ge "$wait_s" ] && { PG_ORGANIZER_LOCK_DIR=""; return 1; }
+    [ $(( $(date +%s) - start )) -ge "$wait_s" ] \
+      && { PG_ORGANIZER_LOCK_DIR=""; return 1; }
     sleep 1
   done
-  printf '%s\n' "$self" > "$PG_ORGANIZER_LOCK_DIR/pid" 2>/dev/null || true
-  self_token="$(pg_pid_token "$self" 2>/dev/null || true)"
-  [ -n "$self_token" ] && printf '%s\n' "$self_token" > "$PG_ORGANIZER_LOCK_DIR/token" 2>/dev/null || true
+  # Ownership publication is part of acquisition, not best-effort diagnostics. A process may run
+  # browser work only after both fields are atomically installed and read back from its directory.
+  if ! printf '%s\n' "$self" > "$PG_ORGANIZER_LOCK_DIR/pid.tmp.$self" 2>/dev/null \
+     || ! mv -f "$PG_ORGANIZER_LOCK_DIR/pid.tmp.$self" "$PG_ORGANIZER_LOCK_DIR/pid" 2>/dev/null \
+     || ! printf '%s\n' "$self_token" > "$PG_ORGANIZER_LOCK_DIR/token.tmp.$self" 2>/dev/null \
+     || ! mv -f "$PG_ORGANIZER_LOCK_DIR/token.tmp.$self" "$PG_ORGANIZER_LOCK_DIR/token" 2>/dev/null \
+     || [ "$(cat "$PG_ORGANIZER_LOCK_DIR/pid" 2>/dev/null || true)" != "$self" ] \
+     || [ "$(cat "$PG_ORGANIZER_LOCK_DIR/token" 2>/dev/null || true)" != "$self_token" ]; then
+    rm -rf "$PG_ORGANIZER_LOCK_DIR" 2>/dev/null
+    PG_ORGANIZER_LOCK_DIR=""
+    return 1
+  fi
+  PG_ORGANIZER_LOCK_OWNER="$self"
+  PG_ORGANIZER_LOCK_TOKEN="$self_token"
   return 0
 }
 
 pg_organizer_lock_release() {
+  local owner owner_token
   [ -n "${PG_ORGANIZER_LOCK_FD:-}" ] && eval "exec ${PG_ORGANIZER_LOCK_FD}>&-" 2>/dev/null
-  [ -n "${PG_ORGANIZER_LOCK_DIR:-}" ] && rm -rf "$PG_ORGANIZER_LOCK_DIR" 2>/dev/null
+  if [ -n "${PG_ORGANIZER_LOCK_DIR:-}" ]; then
+    owner="$(cat "$PG_ORGANIZER_LOCK_DIR/pid" 2>/dev/null || true)"
+    owner_token="$(cat "$PG_ORGANIZER_LOCK_DIR/token" 2>/dev/null || true)"
+    [ "$owner" = "${PG_ORGANIZER_LOCK_OWNER:-}" ] \
+      && [ "$owner_token" = "${PG_ORGANIZER_LOCK_TOKEN:-}" ] \
+      && rm -rf "$PG_ORGANIZER_LOCK_DIR" 2>/dev/null
+  fi
   PG_ORGANIZER_LOCK_FD=""; PG_ORGANIZER_LOCK_DIR=""
+  PG_ORGANIZER_LOCK_OWNER=""; PG_ORGANIZER_LOCK_TOKEN=""
+}
+
+pg_organizer_join() {  # wait for and retire any early organizer without browser traffic
+  local marker="${RUN_MARKER:-}"
+  [ "$MODE" = remote-chrome ] || return 0
+  pg_reservation_marker_ok "$marker" || return 0
+  if pg_organizer_lock_acquire "$marker" "${PRO_GATE_TEST_ORGANIZER_LOCK_WAIT:-95}"; then
+    pg_organizer_lock_release
+    return 0
+  fi
+  echo "[oracle-review] organizer source=none rename=failed archive=disabled close=skipped reason=organizer-lock-timeout" >&2
+  return 1
 }
 
 pg_organize_chat() {  # rename|finalize [early-lease] [diagnostic-log] [helper-seconds] [scan-seconds]
@@ -939,6 +964,14 @@ pg_organize_chat() {  # rename|finalize [early-lease] [diagnostic-log] [helper-s
     [ "$helper_s" -ge "$helper_min_s" ] 2>/dev/null || helper_s="$helper_min_s"
     line="$("$timeout_bin" "$helper_s" node "$SELF/cdp-salvage.mjs" "${organizer_args[@]}" \
       "$marker" "$scan_s" "$PORT" 2>/dev/null | sed -n '/^organizer /p' | tail -n 1)"
+    # The helper may be the early organizer's subshell, so its THROTTLED assignment cannot reach
+    # the parent. Publish a run-private sentinel before releasing serialization; pg_finish joins
+    # this lock and consumes it before the one ramp update and ledger append.
+    if case "$line" in *' reason=throttle') true;; *) false;; esac \
+       || pg_cooldown_active >/dev/null 2>&1; then
+      THROTTLED=1
+      : > "$WORK/organizer-throttle" 2>/dev/null || true
+    fi
     pg_organizer_lock_release
     [ -n "$line" ] || line='organizer source=none rename=failed archive=disabled close=skipped reason=helper-failed'
   fi
@@ -950,14 +983,73 @@ pg_organize_chat() {  # rename|finalize [early-lease] [diagnostic-log] [helper-s
   return 0
 }
 
-pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor, exit
-  local rc="$1" outcome dur line model_label
-  # This terminal boundary revokes every sleeping early organizer. A helper that already passed
-  # its lease check still holds the marker lock, so pg_organize_chat below waits for it and then
-  # performs finalization without overlapping browser mutations.
+pg_finish() {  # $1 exit code — settle organization, ramp, and ledger exactly once, then exit
+  local rc="$1" outcome dur line model_label fsrc title_memo=""
+  # Revoke every sleeping early organizer before anything at the terminal boundary can settle.
+  # Every path below then acquires the marker lock — either to mutate or only to join — so no
+  # helper can keep scanning/rendering after the parent records its final account state.
   rm -f "$WORK"/early-organizer.*.lease 2>/dev/null || true
   dur=$(( $(date +%s) - RUN_START ))
   model_label="$(pg_model_label "${RESOLVED_MODEL:-}")"   # resolved model or role-based fallback
+
+  # v0.28 (#56): a clean run's review becomes the write-once completed artifact before any
+  # archive/close is eligible. The private verified snapshot is authoritative for both durable
+  # bytes and the ledger digest; a shared --out can be reused by unrelated markers.
+  fsrc="${PG_FINAL_SRC:-$OUT}"
+  [ -s "$fsrc" ] || fsrc="$OUT"
+  OUT_SHA=""
+  if [ "$rc" = 0 ] && [ -n "${RUN_MARKER:-}" ] && [ -s "$fsrc" ]; then
+    # Persist EXACTLY ONCE (gate #54 r12): when pg_persist_result already ran, a retry here
+    # could replace a pending result already named by status/stdout with a different path.
+    if [ -z "${RESULT_PATH:-}" ]; then
+      if pg_completed_write "$RUN_MARKER" "$fsrc" \
+         && [ -f "$(pg_completed_dir)/$RUN_MARKER" ] && [ -r "$(pg_completed_dir)/$RUN_MARKER" ] \
+         && [ -s "$(pg_completed_dir)/$RUN_MARKER" ] && cmp -s "$fsrc" "$(pg_completed_dir)/$RUN_MARKER"; then
+        RESULT_PATH="$(pg_completed_dir)/$RUN_MARKER"
+        PG_RESULT_DURABLE=1
+      else
+        echo "[oracle-review] WARNING: completed artifact could not be persisted for ${RUN_MARKER} ($(pg_completed_dir) unwritable?); already-collected recovery will rely on the ledgered digest only." >&2
+      fi
+    fi
+    OUT_SHA="$(pg_sha256 "$fsrc")"
+  fi
+
+  # v0.32: mutation is a positive state machine, never the former "close unless excluded"
+  # heuristic. A mutation-capable call also joins the early helper under the same marker lock;
+  # every non-mutating terminal path performs an explicit join-only acquisition.
+  if pg_reservation_marker_ok "${RUN_MARKER:-}"; then
+    title_memo="$(pg_conversation_title_dir)/${RUN_MARKER}"
+  fi
+  case "$rc" in
+    0)
+      if [ "${PG_RESULT_DURABLE:-0}" = 1 ] && [ "${PG_PRESERVE_STATE:-0}" != 1 ]; then
+        if [ "${PRO_GATE_KEEP_TABS:-0}" = 1 ]; then
+          if [ "${CHAT_RENAME:-0}" = 1 ] && [ -s "$title_memo" ]; then
+            pg_organize_chat rename
+          else
+            pg_organizer_join || true
+          fi
+        else
+          pg_organize_chat finalize
+        fi
+      elif [ "${CHAT_RENAME:-0}" = 1 ] && [ -s "$title_memo" ]; then
+        pg_organize_chat rename
+      else
+        pg_organizer_join || true
+      fi ;;
+    3|6|9)
+      if [ "${CHAT_RENAME:-0}" = 1 ] && [ -s "$title_memo" ]; then
+        pg_organize_chat rename
+      else
+        pg_organizer_join || true
+      fi ;;
+    *) pg_organizer_join || true ;;
+  esac
+
+  # Organizer scans and scratch renders can discover an account throttle in a child process.
+  # The marker join makes its run-private sentinel authoritative before classification; do not
+  # infer this run's outcome from a cooldown that may have predated artifact-only recovery.
+  [ -f "$WORK/organizer-throttle" ] && THROTTLED=1
   case "$rc" in
     0) outcome=clean ;;
     4) outcome=bad-repo ;;
@@ -972,49 +1064,19 @@ pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor,
   esac
   [ "${THROTTLED:-0}" = 1 ] && outcome=throttle
   [ "${CLOUDFLARE:-0}" = 1 ] && outcome=cloudflare
-  # cloudflare is an account-level block just like a throttle: drop concurrency (feed the ramp
-  # the throttle signal) while recording the distinct outcome in the ledger.
-  # in-progress and oversized teach the ramp nothing (the account behaved fine); harvest runs
-  # (HARVEST=1) never feed it either: a harvest is not a fresh Pro spend, so a clean harvest
-  # must not inflate the clean streak that earns concurrency.
+  # Harvests spend no Pro slot and never teach the ramp. Fresh clean/throttle/failure outcomes do;
+  # Cloudflare records its distinct ledger outcome while feeding the same account-level backoff.
   if [ "${HARVEST:-0}" != 1 ]; then
     case "$outcome" in
       clean|throttle|failed) pg_ramp_update "$outcome" "${MAX_CONC:-1}" ;;
       cloudflare)            pg_ramp_update throttle "${MAX_CONC:-1}" ;;
     esac
   fi
-  # v0.28 (#56): a clean run's review becomes the write-once completed artifact, and its
-  # digest lands in the ledger row — later already-collected recovery verifies content
-  # identity instead of trusting a mutable, reusable output path.
-  # The private verified snapshot (when a path staged one) is the authoritative source for
-  # the durable artifact AND the ledgered digest (gate #54 r5/r6): a caller may share one
-  # --out across markers, and $OUT's content by ledger time need not be the bytes THIS
-  # invocation verified and returned.
-  local fsrc
-  fsrc="${PG_FINAL_SRC:-$OUT}"
-  [ -s "$fsrc" ] || fsrc="$OUT"
-  OUT_SHA=""
-  if [ "$rc" = 0 ] && [ -n "${RUN_MARKER:-}" ] && [ -s "$fsrc" ]; then
-    # Persist EXACTLY ONCE (gate #54 r12): when pg_persist_result already ran, a retry here
-    # could succeed against the completed store and delete the pending file that terminal
-    # status and stdout ALREADY named as canonical — a dangling RESULT_FILE.
-    if [ -z "${RESULT_PATH:-}" ]; then
-      if pg_completed_write "$RUN_MARKER" "$fsrc" \
-         && [ -f "$(pg_completed_dir)/$RUN_MARKER" ] && [ -r "$(pg_completed_dir)/$RUN_MARKER" ] \
-         && [ -s "$(pg_completed_dir)/$RUN_MARKER" ] && cmp -s "$fsrc" "$(pg_completed_dir)/$RUN_MARKER"; then
-        RESULT_PATH="$(pg_completed_dir)/$RUN_MARKER"
-        PG_RESULT_DURABLE=1
-      else
-        echo "[oracle-review] WARNING: completed artifact could not be persisted for ${RUN_MARKER} ($(pg_completed_dir) unwritable?); already-collected recovery will rely on the ledgered digest only." >&2
-      fi
-    fi
-    OUT_SHA="$(pg_sha256 "$fsrc")"
-  fi
+
   [ -n "${PG_FINAL_SRC:-}" ] && [ "$PG_FINAL_SRC" != "$OUT" ] && [ "${PG_KEEP_FINAL:-0}" != 1 ] \
     && rm -f "$PG_FINAL_SRC" 2>/dev/null
-  # v0.27: `marker` and `round_key` land in every ledger line so --status (and any caller with
-  # only the ledger) can reconstruct a harvest command without the original status file. Rows
-  # from failures before identity derivation (exit 4/5) carry them empty — present, not absent.
+  # v0.27: marker and round_key make every row independently recoverable. Failures before
+  # identity derivation carry empty values — present, not absent.
   if pg_have jq; then
     line="$(jq -nc --arg ts "$(date +%Y-%m-%dT%H:%M:%S%z)" --arg pr "${PR_NUM:-diff}" \
       --arg repo "${REPO:-}" --argjson exit "$rc" --arg outcome "$outcome" \
@@ -1036,31 +1098,6 @@ pg_finish() {  # $1 exit code — write the ledger line, feed the ramp governor,
   fi
   pg_ledger_append "$line"
   [ "${PG_PRESERVE_STATE:-0}" = 1 ] || pg_active_clear "$rc"
-  # v0.32: mutation is a positive state machine, never the former "close unless excluded"
-  # heuristic. Naming is safe on spent failure/in-progress outcomes, but server archive and
-  # local close require a marker-addressed durable success. The organizer independently proves
-  # marker ownership immediately before each UI action. Any helper timeout/drift is diagnostic
-  # only: result bytes, status, ledger, reservation handling, and this exit code are settled.
-  local title_memo=""
-  if pg_reservation_marker_ok "${RUN_MARKER:-}"; then
-    title_memo="$(pg_conversation_title_dir)/${RUN_MARKER}"
-  fi
-  if [ "$MODE" = remote-chrome ]; then
-    case "$rc" in
-      0)
-        if [ "${PG_RESULT_DURABLE:-0}" = 1 ] && [ "${PG_PRESERVE_STATE:-0}" != 1 ]; then
-          if [ "${PRO_GATE_KEEP_TABS:-0}" = 1 ]; then
-            [ "${CHAT_RENAME:-0}" = 1 ] && [ -s "$title_memo" ] && pg_organize_chat rename
-          else
-            pg_organize_chat finalize
-          fi
-        elif [ "${CHAT_RENAME:-0}" = 1 ] && [ -s "$title_memo" ]; then
-          pg_organize_chat rename
-        fi ;;
-      3|6|9)
-        [ "${CHAT_RENAME:-0}" = 1 ] && [ -s "$title_memo" ] && pg_organize_chat rename ;;
-    esac
-  fi
   exit "$rc"
 }
 
