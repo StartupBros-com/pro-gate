@@ -901,9 +901,21 @@ ln -s "$LOG_TRANSCRIPT" "$LOG_PROOF_DIR/symlink.log"
 verified_log_rc "$LOG_PROOF_DIR/symlink.log" "$LOG_PROOF"; LOG_RC=$?
 check 'symlinked transcript fails closed' "$([ "$LOG_RC" -ne 0 ]; echo $?)" "rc=$LOG_RC"
 
-# Reproduce the reviewed failure path end-to-end: Oracle emits browser lifecycle, but tee forwards
-# it only to the operator and returns failure without writing either log. Old negative-grep logic
-# retried/refunded this shape; missing completion proof must now keep it charged and single-shot.
+# Gate #72 r8 P1 end-to-end. These two runs are IDENTICAL except for the tee binary, which is the
+# only way to attribute the outcome to log capture alone: a pre-browser oracle failure that would
+# otherwise refund and retry must become charged and single-shot when its capture fails.
+# The tee is injected via PRO_GATE_TEE_BIN, NOT PATH — pg_augment_path re-prepends /usr/bin before
+# the pipeline runs, so a PATH-injected fake tee never wins and the assertions below would pass
+# with the fix reverted (exactly how the first version of this regression fooled a green CI).
+cat > "$TDIR/bin/oracle-quiet-fail" <<'FAKE_QUIET_FAIL'
+#!/usr/bin/env bash
+[ "${1:-}" = session ] && exit 1
+count=0
+[ -s "${PG_TEST_ATTEMPTS_FILE:?}" ] && count="$(cat "$PG_TEST_ATTEMPTS_FILE")"
+printf '%s\n' "$((count + 1))" > "$PG_TEST_ATTEMPTS_FILE"
+exit 1
+FAKE_QUIET_FAIL
+chmod +x "$TDIR/bin/oracle-quiet-fail"
 mkdir -p "$TDIR/tee-fail-bin"
 cat > "$TDIR/tee-fail-bin/tee" <<'FAKE_TEE_FAIL'
 #!/usr/bin/env bash
@@ -911,16 +923,28 @@ cat
 exit 1
 FAKE_TEE_FAIL
 chmod +x "$TDIR/tee-fail-bin/tee"
-cat > "$TDIR/bin/oracle-log-loss" <<'FAKE_LOG_LOSS'
-#!/usr/bin/env bash
-[ "${1:-}" = session ] && exit 1
-count=0
-[ -s "${PG_TEST_ATTEMPTS_FILE:?}" ] && count="$(cat "$PG_TEST_ATTEMPTS_FILE")"
-printf '%s\n' "$((count + 1))" > "$PG_TEST_ATTEMPTS_FILE"
-printf 'Launching browser mode\nAcquired ChatGPT browser slot\n'
-exit 1
-FAKE_LOG_LOSS
-chmod +x "$TDIR/bin/oracle-log-loss"
+# CONTROL: real tee. Capture is complete, no lifecycle was ever printed -> provably unsubmitted,
+# so the engine both RETRIES and refunds. Without this run, "charged" below proves nothing.
+CTL_HOME="$TDIR/home-tee-ok"; CTL_ATTEMPTS="$TDIR/tee-ok-attempts"
+mkdir -p "$CTL_HOME"; : > "$CTL_ATTEMPTS"
+RKEY_920="$(printf '%s-920' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+env PRO_GATE_HOME="$CTL_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
+  PRO_GATE_MAX_RETRIES=1 PRO_GATE_RETRY_BACKOFF=0 PRO_GATE_REATTACH_TIMEOUT=1 \
+  PRO_GATE_SALVAGE_SECS=2 PRO_GATE_RUN_LOGS=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-quiet-fail" \
+  PG_TEST_ATTEMPTS_FILE="$CTL_ATTEMPTS" NODE_OPTIONS= \
+  bash "$ENGINE" --pr 920 --repo "$TDIR" --diff "$TDIR/small.diff" \
+  --out "$CTL_HOME/o-tee-ok.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'intact log capture still refunds the pre-browser failure' \
+  "$(grep -q 'refunding this round' "$TDIR/stderr"; echo $?)" "rc=$RC $(tail -6 "$TDIR/stderr")"
+check 'intact log capture leaves no in-window spend' \
+  "$([ ! -s "$CTL_HOME/rounds/$RKEY_920" ]; echo $?)" "rounds=$(cat "$CTL_HOME/rounds/$RKEY_920" 2>/dev/null)"
+check 'intact log capture permits the guarded retry' \
+  "$([ "$(cat "$CTL_ATTEMPTS")" = 2 ]; echo $?)" "attempts=$(cat "$CTL_ATTEMPTS")"
+# TEST: same oracle, failing tee. The proof is never published, so the identical evidence must now
+# fail closed — one invocation, charged, no refund.
 LOSS_HOME="$TDIR/home-log-loss"; LOSS_ATTEMPTS="$TDIR/log-loss-attempts"
 mkdir -p "$LOSS_HOME"; : > "$LOSS_ATTEMPTS"
 RKEY_921="$(printf '%s-921' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
@@ -928,8 +952,9 @@ printf 'foreign idle tab\n' > "$TDIR/tab.txt"
 env PRO_GATE_HOME="$LOSS_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
   PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
   PRO_GATE_MAX_RETRIES=1 PRO_GATE_RETRY_BACKOFF=0 PRO_GATE_REATTACH_TIMEOUT=1 \
-  PRO_GATE_SALVAGE_SECS=2 PRO_GATE_RUN_LOGS=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-log-loss" \
-  PG_TEST_ATTEMPTS_FILE="$LOSS_ATTEMPTS" PATH="$TDIR/tee-fail-bin:$PATH" NODE_OPTIONS= \
+  PRO_GATE_SALVAGE_SECS=2 PRO_GATE_RUN_LOGS=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-quiet-fail" \
+  PRO_GATE_TEE_BIN="$TDIR/tee-fail-bin/tee" \
+  PG_TEST_ATTEMPTS_FILE="$LOSS_ATTEMPTS" NODE_OPTIONS= \
   bash "$ENGINE" --pr 921 --repo "$TDIR" --diff "$TDIR/small.diff" \
   --out "$LOSS_HOME/o-log-loss.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
 RC=$?
@@ -943,6 +968,37 @@ check 'failed Oracle log capture stays charged' \
 check 'failed Oracle log capture never announces a refund' \
   "$(! grep -q 'refunding this round' "$TDIR/stderr" && ! grep -q 'round refunded' "$LOSS_HOME/o-log-loss.md.status"; echo $?)" \
   "stderr=$(tail -6 "$TDIR/stderr") status=$(cat "$LOSS_HOME/o-log-loss.md.status")"
+
+# Gate #72 r9: the watchdog kills the run_oracle SUBSHELL, which therefore never reaches its own
+# proof publication. The parent must publish after reaping, or every watchdog-killed stall would
+# silently lose the pre-browser refund it had before v0.32 — the exact scenario the stall
+# watchdog exists to catch.
+cat > "$TDIR/bin/oracle-stall" <<'FAKE_STALL'
+#!/usr/bin/env bash
+[ "${1:-}" = session ] && exit 1
+count=0
+[ -s "${PG_TEST_ATTEMPTS_FILE:?}" ] && count="$(cat "$PG_TEST_ATTEMPTS_FILE")"
+printf '%s\n' "$((count + 1))" > "$PG_TEST_ATTEMPTS_FILE"
+sleep 120
+FAKE_STALL
+chmod +x "$TDIR/bin/oracle-stall"
+STALL_HOME="$TDIR/home-stall"; STALL_ATTEMPTS="$TDIR/stall-attempts"
+mkdir -p "$STALL_HOME"; : > "$STALL_ATTEMPTS"
+RKEY_922="$(printf '%s-922' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+env PRO_GATE_HOME="$STALL_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
+  PRO_GATE_MAX_RETRIES=0 PRO_GATE_STALL_SECS=1 PRO_GATE_REATTACH_TIMEOUT=1 \
+  PRO_GATE_SALVAGE_SECS=2 PRO_GATE_RUN_LOGS=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-stall" \
+  PG_TEST_ATTEMPTS_FILE="$STALL_ATTEMPTS" NODE_OPTIONS= \
+  bash "$ENGINE" --pr 922 --repo "$TDIR" --diff "$TDIR/small.diff" \
+  --out "$STALL_HOME/o-stall.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'watchdog-killed pre-browser stall exits 6' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -5 "$TDIR/stderr")"
+check 'watchdog-killed stall still refunds its round' \
+  "$(grep -q 'refunding this round' "$TDIR/stderr"; echo $?)" "$(tail -8 "$TDIR/stderr")"
+check 'watchdog-killed stall leaves no in-window spend' \
+  "$([ ! -s "$STALL_HOME/rounds/$RKEY_922" ]; echo $?)" "rounds=$(cat "$STALL_HOME/rounds/$RKEY_922" 2>/dev/null)"
 
 # v0.32: Oracle 0.17+ stores prompt-commit state only after dispatching Send/Enter. Even a complete
 # all-negative DOM probe cannot prove ChatGPT rejected that request, so browser-lifecycle evidence

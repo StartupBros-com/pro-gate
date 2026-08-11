@@ -1474,6 +1474,20 @@ pg_sha256() {  # <file>: echo the hex digest, or nothing when no tool is availab
   elif pg_have openssl; then openssl dgst -sha256 "$1" 2>/dev/null | awk '{print $NF}'
   fi
 }
+# pg_publish_log_proof <transcript> <digest-proof>: publish the digest that makes <transcript>
+# trustworthy evidence. Call this ONLY once no writer remains (the tee drained to EOF, or the
+# pipeline was killed AND reaped) — the proof asserts the transcript is final, so publishing it
+# over a live stream would let a half-written log pass as complete. Atomic: a partial temp file
+# is removed rather than left where pg_verified_log_lacks would read it.
+pg_publish_log_proof() {
+  local transcript="$1" proof="$2" sha
+  [ -f "$transcript" ] && [ ! -L "$transcript" ] || return 1
+  sha="$(pg_sha256 "$transcript")"
+  [ -n "$sha" ] || return 1
+  printf '%s\n' "$sha" > "$proof.tmp" 2>/dev/null \
+    && mv -f "$proof.tmp" "$proof" 2>/dev/null \
+    || { rm -f "$proof.tmp" 2>/dev/null; return 1; }
+}
 # pg_verified_log_lacks <transcript> <digest-proof> <extended-regex>: true only when the
 # immutable transcript still matches the digest published after its tee drained successfully
 # AND grep completed with the exact no-match status. Missing/truncated/unreadable logs fail closed.

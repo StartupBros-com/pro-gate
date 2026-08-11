@@ -1616,6 +1616,10 @@ fi
 
 ORACLE_BIN="${PRO_GATE_ORACLE_BIN:-oracle}"
 TIMEOUT_BIN="${PRO_GATE_TIMEOUT_BIN:-timeout}"
+# Internal seam (like the two above): the run-log tee whose clean drain authorizes a transcript
+# proof. Overridable so a regression can inject a FAILING tee — PATH injection cannot reach it,
+# because pg_augment_path re-prepends the system paths before this pipeline ever runs.
+TEE_BIN="${PRO_GATE_TEE_BIN:-tee}"
 if [[ "$TIMEOUT_BIN" == */* ]]; then
   [ -x "$TIMEOUT_BIN" ] || { echo "ERROR: configured timeout executable not found: $TIMEOUT_BIN" >&2; pg_status failed "timeout missing"; pg_finish 3; }
 else
@@ -2035,15 +2039,13 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
       "${URL_ARGS[@]}" "${FILE_ARGS[@]}" \
       -p "$(cat "$PROMPT_FILE")" \
       --no-notify --timeout "$TIMEOUT" \
-      --write-output "$CAPTURE_OUT" 2>&1 | tee -a "$RUNLOG" "$transcript" | stdbuf -oL sed 's/^/[oracle] /' >&2
+      --write-output "$CAPTURE_OUT" 2>&1 | "$TEE_BIN" -a "$RUNLOG" "$transcript" | stdbuf -oL sed 's/^/[oracle] /' >&2
     _pipeline_status=("${PIPESTATUS[@]}")
+    # Publish the proof ONLY when tee drained to EOF successfully. That success is precisely what
+    # separates "Oracle printed no browser lifecycle" from "the log was never written", and only
+    # the former may authorize a duplicate retry or a round refund.
     if [ "${_pipeline_status[1]:-1}" -eq 0 ]; then
-      _transcript_sha="$(pg_sha256 "$transcript")"
-      if [ -n "$_transcript_sha" ]; then
-        printf '%s\n' "$_transcript_sha" > "$proof.tmp" 2>/dev/null \
-          && mv -f "$proof.tmp" "$proof" 2>/dev/null \
-          || rm -f "$proof.tmp"
-      fi
+      pg_publish_log_proof "$transcript" "$proof" || true
     fi
     [ "${_pipeline_status[1]:-1}" -eq 0 ] && [ "${_pipeline_status[2]:-1}" -eq 0 ] \
       || exit 1
@@ -2096,6 +2098,21 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
     sleep 5
     pkill -KILL -P "$job" 2>/dev/null; kill -KILL "$job" 2>/dev/null
     wait "$job" 2>/dev/null
+    # The kill above targets the subshell itself, so it never reaches its own proof publication.
+    # Publish from here instead, or EVERY watchdog-killed attempt would forfeit the pre-browser
+    # retry/refund it earned before v0.32 (an unintended over-charge on the exact stall this
+    # watchdog exists for). Sound because the transcript is final and complete at this point: the
+    # pipeline is reaped (no writer remains), the stall branch only fires after STALL_SECS with
+    # ZERO log growth, and the no-think branch only fires minutes after any lifecycle line would
+    # have been written and flushed — so a lifecycle line cannot be hiding in a lost tail. When
+    # the no-think probe DID find a live conversation, LIVE_CONVERSATION/THROTTLED already fail
+    # the predicate on their own evidence, independent of this transcript.
+    # The guard covers tee's one asymmetric failure mode: it keeps writing its other operand after
+    # one fails, so a transcript that is EMPTY while the shared log holds bytes is a failed capture
+    # wearing the shape of a quiet run. Refuse to certify that; an over-charge is the safe error.
+    if [ -s "$transcript" ] || [ ! -s "$RUNLOG" ]; then
+      pg_publish_log_proof "$transcript" "$proof" || true
+    fi
     return 124
   done
   wait "$job"
