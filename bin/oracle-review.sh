@@ -2089,6 +2089,27 @@ BACKOFF="${PRO_GATE_RETRY_BACKOFF:-20}"
 LIVE_CONVERSATION=0
 THROTTLED=0
 CLOUDFLARE=0
+
+# pg_attempt_provably_unsubmitted <oracle-slug> <marker-scan-rc>: the ONE shared bar for a
+# no-spend retry/refund. A clean marker scan, no remembered URL, no throttle/live evidence, and a
+# stable browser remain mandatory. Legacy failures that never reached Oracle's browser lifecycle
+# still qualify. If lifecycle lines exist, only Oracle's exact structured prompt-commit proof may
+# override them; missing/old/malformed metadata stays charged and retry-suppressed.
+pg_attempt_provably_unsubmitted() {
+  local slug="${1:-}" scan_rc="${2:-}"
+  [ "$scan_rc" = 4 ] || return 1
+  [ "${LIVE_CONVERSATION:-0}" != 1 ] || return 1
+  [ "${THROTTLED:-0}" != 1 ] || return 1
+  [ ! -f "$PRO_GATE_HOME/conversation-urls/${RUN_MARKER}" ] || return 1
+  ! pg_browser_restarted_midrun "$RUN_START" >/dev/null || return 1
+
+  if ! grep -qE 'Launching browser mode|Acquired ChatGPT browser slot|Reattach: oracle session ' \
+      "$RUNLOG" 2>/dev/null; then
+    return 0
+  fi
+  pg_oracle_prompt_provably_unsubmitted "$slug" "$RUN_MARKER"
+}
+
 attempt=0
 while :; do
   if ! GATE_REASON="$(pg_health_gate)"; then
@@ -2257,23 +2278,17 @@ while :; do
     pg_status throttled "interstitial during pre-retry probe"
     break
   fi
-  # FAIL CLOSED (self-review P1): a probe that neither found the conversation (0) nor throttle
-  # (5) is INCONCLUSIVE, not proof of a dead submission: a transient CDP/render hiccup returns
-  # the same non-0/5 code, and retrying a submission that actually LANDED double-spends the Pro
-  # slot. Only a run that died BEFORE it submitted is safe to retry. Oracle logs "Acquired
-  # ChatGPT browser slot" / "Session: ..." once the prompt is in flight; if that evidence is
-  # present the quota is spent, so suppress the retry and let the full-budget CDP salvage below
-  # collect it (now reliable: we run --browser-archive=never, so the tab is still findable).
-  # RUNLOG holds oracle's RAW output (the "[oracle] " prefix is added only to the live display),
-  # so match oracle's own strings. Bias toward "landed" (suppress the retry): a double-spend is
-  # worse than a missed retry, which the caller re-runs.
-  if grep -qE 'Launching browser mode|Acquired ChatGPT browser slot|Reattach: oracle session ' "$RUNLOG" 2>/dev/null; then
-    echo "[oracle-review] pre-retry probe inconclusive, but oracle had already submitted (browser slot/session in the log); treating as spent, retry suppressed, falling through to CDP salvage." >&2
+  # FAIL CLOSED: a non-0/5 probe is inconclusive unless the complete shared no-spend predicate
+  # succeeds. Generic browser lifecycle lines alone remain spent evidence; Oracle emits them before
+  # prompt commit, so its exact all-negative commitProbe may now override them. Every other shape
+  # suppresses the retry because a duplicate Pro submission is worse than a missed retry.
+  if ! pg_attempt_provably_unsubmitted "$SLUG" "$PRC"; then
+    echo "[oracle-review] pre-retry probe could not prove the prompt stayed unsubmitted; treating as spent, retry suppressed, falling through to CDP salvage." >&2
     LIVE_CONVERSATION=1
-    pg_status live-detected "submission landed (log evidence); retry suppressed"
+    pg_status live-detected "submission fate ambiguous; retry suppressed"
     break
   fi
-  echo "[oracle-review] pre-retry probe found no conversation AND no evidence oracle ever submitted (genuine dead submission). Retrying once after ${BACKOFF}s + a health re-check..." >&2
+  echo "[oracle-review] pre-retry evidence proves no prompt turn landed (clean marker scan + stable browser + Oracle commit state). Retrying once after ${BACKOFF}s + a health re-check..." >&2
   pg_status retry-wait "backoff ${BACKOFF}s"
   sleep "$BACKOFF"
 done
@@ -2526,27 +2541,15 @@ else
   RETRIES=$(( attempt > 0 ? attempt - 1 : 0 ))
   echo "ERROR: oracle produced no usable review after salvage + ${RETRIES} retr$([ "${RETRIES}" -eq 1 ] && echo y || echo ies) (reattach: oracle session ${SLUG_BASE})." >&2
   FAIL_DETAIL="no usable review after salvage"
-  # v0.31 (#65): refund the round when the submission PROVABLY never landed — the same bar as
-  # the Cloudflare refund, met by positive evidence only: salvage scanned the browser clean
-  # (rc 4 is the one result meaning "nothing carries this marker"; the marker rides the
-  # PROMPT, so even an answerless landed submission matches), the live probe never fired, no
-  # conversation URL was ever memoized (the early probe runs ~75s after submission), the
-  # account was not mid-throttle (fate unknown), and Chrome did not restart mid-run (a dead
-  # tab is absence of evidence, not evidence of absence). Fleet evidence: upload-timeout
-  # failures ate 2 of pro-gate#61's 4 window rounds while spending zero Pro quota.
-  # The run log must ALSO carry no submission evidence (#66 gate P1): the pre-retry
-  # classifier at the retry site only runs when a retry is attempted, so with retries
-  # disabled — or after the last one — a run that logged "Acquired ChatGPT browser slot"
-  # then lost its tab before the URL memo could be captured would otherwise be refunded
-  # despite the prompt existing server-side. Same strings, same fail-closed bias.
+  # v0.31 (#65): refund only through the same positive no-spend predicate used before a retry.
+  # It requires a clean marker scan, no URL/live/throttle evidence, a stable browser, and either no
+  # Oracle browser lifecycle at all or the exact complete all-negative prompt-commit proof. This
+  # keeps disabled/exhausted-retry accounting identical to the guarded retry decision.
   _svc_up=""; _svc_restarted=0
   if _svc_up="$(pg_browser_restarted_midrun "$RUN_START")"; then _svc_restarted=1; fi
-  if [ "${SALVAGE_RAN:-0}" = 1 ] && [ "${SALVAGE_RC:-0}" -eq 4 ] \
-     && [ "${LIVE_CONVERSATION:-0}" != 1 ] && [ "${THROTTLED:-0}" != 1 ] \
-     && [ ! -f "$PRO_GATE_HOME/conversation-urls/${RUN_MARKER}" ] \
-     && [ "$_svc_restarted" = 0 ] \
-     && ! grep -qE 'Launching browser mode|Acquired ChatGPT browser slot|Reattach: oracle session ' "$RUNLOG" 2>/dev/null; then
-    echo "[oracle-review] no conversation ever carried this run's marker (browser scanned clean, no URL memoized, browser stable): the submission never landed — refunding this round; zero Pro quota was spent." >&2
+  if [ "${SALVAGE_RAN:-0}" = 1 ] \
+     && pg_attempt_provably_unsubmitted "${SLUG:-$SLUG_BASE}" "${SALVAGE_RC:-0}"; then
+    echo "[oracle-review] no conversation ever carried this run's marker (browser scanned clean, no URL memoized, browser stable, prompt state unsubmitted): refunding this round; zero Pro quota was spent." >&2
     pg_round_unrecord "$ROUND_KEY"
     FAIL_DETAIL="submission never landed (send/upload failure before the prompt reached ChatGPT); round refunded, safe to retry"
   fi
