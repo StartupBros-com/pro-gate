@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Fail a release whose notes would announce developer shorthand to customers.
 #
-# Both customer feeds (members site + Discord tool drops) read a "## Highlights" section from
-# the release body and fall back to GitHub's auto-generated PR titles when it is absent — which
-# is exactly how v0.31.0 and v0.31.1 announced "governor-rounds" and "memo-crossbind". This
-# check makes that failure loud at release time instead of silent in front of customers.
+# The canonical marketplace announcer reads a "## Highlights" section from the release body
+# and falls back to GitHub's auto-generated PR titles when it is absent — which is exactly how
+# v0.31.0 and v0.31.1 announced "governor-rounds" and "memo-crossbind". This check makes that
+# failure loud at release time instead of silent in front of customers.
 #
 # Usage: check-release-notes.sh <notes-file>     (or pipe the body on stdin with "-")
 # Conventions in docs/RELEASE-NOTES-TEMPLATE.md.
@@ -21,8 +21,8 @@ notes="$(printf '%s' "$notes" | tr -d '\r')"
 fails=0
 problem() { printf '  ✗ %s\n' "$*" >&2; fails=$((fails + 1)); }
 
-# Same extraction the announcer uses (scripts/release-train.sh notes_summary), so this checks
-# the bytes customers actually receive rather than a lookalike.
+# Mirror the canonical marketplace announcer's Highlights extraction so this checks the text
+# customers receive rather than a lookalike.
 highlights="$(printf '%s\n' "$notes" | sed -n '/^##[[:space:]]*Highlights/,/^## /p' | grep -E '^[*•-][[:space:]]' || true)"
 
 # NEVER `printf ... | grep -q` here (#69 gate r2 P2). `grep -q` exits the moment it matches,
@@ -41,11 +41,11 @@ elif [ -z "$highlights" ]; then
   problem "'## Highlights' section has no bullets"
 fi
 
-# Wrapped bullets are a silent truncation (#69 gate r2 P2): notes_summary keeps only physical
-# lines starting with a marker, so a bullet continued on an indented next line reaches
+# Wrapped bullets are a silent truncation (#69 gate r2 P2): the canonical announcer keeps only
+# physical lines starting with a marker, so a bullet continued on an indented next line reaches
 # customers as its first clause alone — grammatical, plausible, and missing the point. Reject
-# rather than join, because joining would change what the ANNOUNCER sends and the two must
-# agree. Authors write one bullet per line.
+# rather than join, because joining would change what the announcer sends. Authors write one
+# bullet per line.
 while IFS= read -r hl; do
   case "$hl" in
     '  '*|$'\t'*) problem "a Highlights bullet is wrapped onto a continuation line; the announcement keeps only the first line — put each bullet on ONE line: ${hl#"${hl%%[![:space:]]*}"}" ;;
@@ -62,11 +62,11 @@ if [ -n "$highlights" ]; then
     # TWO views of each bullet (#69 gate P2):
     #   raw  — the marker stripped only, so a conventional-commit prefix is still visible and
     #          can be reported as "this is a commit subject, not customer copy";
-    #   text — normalized exactly as notes_summary will normalize it, so every OTHER rule
+    #   text — normalized as the canonical marketplace summary will normalize it, so every OTHER rule
     #          inspects the bytes customers actually receive. Checking only the raw line let
     #          "feat!: memo-crossbind" pass and still ship as bare "memo-crossbind"; checking
     #          only the normalized text would hide raw subjects entirely.
-    # Keep this transform identical to notes_summary's sed in scripts/release-train.sh.
+    # Keep this transform aligned with hov-marketplace's canonical summary normalization.
     raw="$(printf '%s' "$line" | sed -E 's/^[*•-][[:space:]]+//')"
     text="$(printf '%s' "$raw" | sed -E '
       s/[[:space:]]+by @[A-Za-z0-9_[:punct:]]+ in http[^[:space:]]*[[:space:]]*$//
