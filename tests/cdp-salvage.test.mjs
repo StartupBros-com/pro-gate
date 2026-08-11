@@ -538,4 +538,27 @@ const FOREIGN_ANSWER = (m) => [
   cdp.stop();
 }
 
+{ // #76: the exit hook must actually RUN on the early-exit paths, not just leave a 0 status.
+  // It was registered above the `const`/`let` state it reads, so --sweep-root and --close died
+  // in the temporal dead zone ("Cannot access 'ownershipProven' before initialization") AFTER
+  // process.exit had already fixed the status. Both --sweep-root tests above stayed green
+  // through it, because the crash only reaches stderr. So assert the flush's EFFECT: a stale
+  // conviction from an earlier run must be cleared, which only happens if flushCrossBind ran.
+  const stale = '2026-01-01T00:00:00.000Z\thttps://chatgpt.com/c/other\tpg-run-someone-else\n';
+  const seedStale = (home) => {
+    fs.mkdirSync(path.join(home, 'crossbound'), { recursive: true });
+    fs.writeFileSync(path.join(home, 'crossbound', MARKER), stale);
+  };
+  for (const mode of ['--sweep-root', '--close']) {
+    const cdp = await mockCdp(`run marker: ${MARKER}\nstill thinking`,
+      [{ id: 'root1', type: 'page', url: 'https://chatgpt.com/' }]);
+    const r = await runSalvage([mode, MARKER, '10'], cdp.port, seedStale);
+    check(`${mode} exits without a temporal-dead-zone crash`,
+      !/ReferenceError/.test(r.stderr ?? ''), `stderr=${r.stderr?.slice(0, 300)}`);
+    check(`${mode} still runs the exit flush and clears a stale conviction`,
+      r.crossbound === 0, `crossbound=${r.crossbound} stderr=${r.stderr?.slice(0, 300)}`);
+    cdp.stop();
+  }
+}
+
 process.exit(failures === 0 ? 0 : 1);
