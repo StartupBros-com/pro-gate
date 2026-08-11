@@ -207,6 +207,20 @@ chk $'## Highlights\n\n- feat(pro-gate): trajectory-aware round governor with ch
 chk $'## Highlights\n\n- memo-crossbind' && fail 'branch name must be rejected' || pass 'a bare branch-name bullet is rejected'
 chk $'## Highlights\n\n- Fixed the stuck-review problem reported in #67 by users last week.' && fail 'issue ref must be rejected' || pass 'an issue/PR reference in Highlights is rejected'
 chk "$(printf '## Highlights\n\n- %s' "$(python3 -c "print('x' * 200)")")" && fail 'over-long bullet must be rejected' || pass 'a bullet past the 180-char feed limit is rejected'
+
+# Feed parity for astral characters (#75 gate P2). The announcer truncates with
+# utf16_prefix(line, 180), where an emoji costs 2 units; bash ${#text} counted it as 1, so a
+# bullet could pass here and lose its tail in the published card. The pair is the proof: OVER
+# and EDGE differ only in emoji count, so EDGE passing rules out rejection for any other reason.
+ASTRAL_OVER="$(python3 -c "print('x' * 100 + '\U0001F600' * 45)")"   # 145 code points, 190 units
+ASTRAL_EDGE="$(python3 -c "print('x' * 100 + '\U0001F600' * 40)")"   # 140 code points, 180 units
+chk "$(printf '## Highlights\n\n- %s' "$ASTRAL_OVER")" && fail 'astral bullet past the UTF-16 feed limit must be rejected' || pass 'a bullet under 180 code points but past 180 UTF-16 units is rejected'
+chk "$(printf '## Highlights\n\n- %s' "$ASTRAL_EDGE")" && pass 'a bullet at exactly 180 UTF-16 units still passes' || fail 'the 180-unit boundary bullet was wrongly rejected'
+ASTRAL_OUT="$(printf '## Highlights\n\n- %s' "$ASTRAL_OVER" | bash "$CHK" - 2>&1 || true)"
+case "$ASTRAL_OUT" in
+  *'190 UTF-16 units'*) pass 'the astral rejection names the feed-counted width, not the code-point count' ;;
+  *) fail "astral bullet was not rejected by the UTF-16 width rule: $ASTRAL_OUT" ;;
+esac
 chk $'## Highlights\n\n- Faster now.' && fail 'stub bullet must be rejected' || pass 'a too-short stub bullet is rejected'
 chk $'## Highlights\n\n- feat!: memo-crossbind' && fail 'feat!: prefix must be rejected' || pass 'a scope-less breaking-change prefix is rejected after normalization'
 chk $'## Highlights\n\n- fix(pro-gate)!: governor-rounds' && fail 'scoped feat!: must be rejected' || pass 'a scoped breaking-change prefix is rejected after normalization'

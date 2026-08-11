@@ -96,7 +96,14 @@ if [ -n "$highlights" ]; then
     if grep -qE '^[A-Za-z0-9]+([-/][A-Za-z0-9]+)+$' <<<"$text"; then
       problem "bullet $n looks like a branch name, not a sentence: ${text:0:60}"
     fi
-    [ "${#text}" -gt 180 ] && problem "bullet $n is ${#text} chars; the feed truncates at 180"
+    # Count what the FEED counts (#75 gate P2). The canonical announcer truncates each bullet
+    # with utf16_prefix(line, 180) — astral characters (emoji) cost 2 units — while bash
+    # ${#text} counts code points. A bullet of 145 characters including 45 emoji is 190 units:
+    # it passed here and still reached customers with its tail silently removed. python3 is
+    # already required by the release path, and is what the announcer itself uses.
+    units="$(printf '%s' "$text" | python3 -c 'import sys
+print(sum(2 if ord(c) > 0xFFFF else 1 for c in sys.stdin.read()))')"
+    [ "$units" -gt 180 ] && problem "bullet $n is $units UTF-16 units; the feed truncates at 180"
     [ "${#text}" -lt 15 ] && problem "bullet $n is too short to say anything useful: ${text:0:60}"
   done <<EOF
 $highlights
