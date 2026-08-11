@@ -31,7 +31,10 @@ assert_eq "$(grep -c '^release upload ' "$TMP/gh.log")" 2 'rerun refreshes exact
 
 grep -q 'runs-on: ubuntu-24.04' "$ROOT/.github/workflows/ci.yml" || fail 'CI uses GitHub-hosted runner'; pass 'CI uses GitHub-hosted runner'
 grep -q 'runs-on: \[self-hosted' "$ROOT/.github/workflows/ci.yml" && fail 'PR CI retains persistent runner'; pass 'PR CI never executes persistent runner'
-grep -q 'github-actions\[bot\]' "$ROOT/.github/workflows/release-train.yml" || fail 'marketplace identity is configured'; pass 'marketplace identity is configured'
+# The bot git identity existed only to author marketplace promotion commits.
+# That push is retired, so the identity must be gone too — its presence would
+# mean a write path came back.
+! grep -q 'github-actions\[bot\]' "$ROOT/.github/workflows/release-train.yml" || fail 'marketplace commit identity must stay retired'; pass 'no marketplace commit identity remains'
 grep -q 'publish-runtime-release.sh' "$ROOT/.github/workflows/release.yml" || fail 'release workflow uses extracted helper'; pass 'release workflow uses extracted helper'
 
 echo 'ALL PASS'
