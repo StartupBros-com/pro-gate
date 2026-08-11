@@ -223,4 +223,20 @@ grep -q 'Require customer-ready notes for a version bump' "$ROOT/.github/workflo
 grep -q 'docs/release-notes/v\$version.md' "$ROOT/.github/workflows/ci.yml" \
   && pass 'the version-bump gate resolves the per-version notes file' || fail 'version-bump gate does not resolve the notes file'
 
+
+
+# The legacy script still owns marketplace promotion, but production runs set
+# PROMOTE_ONLY so the dependent OIDC reusable workflow is the ONE announcer.
+before_promote_only="$(wc -l < "$TMP/curl.log")"
+promote_only_out="$(PROMOTE_ONLY=true bash -c "source <(sed -n '/^announce()/,/^}/p' '$ROOT/scripts/release-train.sh'); announce")"
+assert_eq "$promote_only_out" 'announcement delegated to the canonical OIDC job' 'promotion-only mode delegates announcement'
+assert_eq "$(wc -l < "$TMP/curl.log")" "$before_promote_only" 'promotion-only mode never calls the secret-authenticated endpoint'
+
+WF="$ROOT/.github/workflows/release-train.yml"
+grep -q 'PROMOTE_ONLY: true' "$WF" || fail 'release workflow does not suppress the legacy announcer'; pass 'release workflow suppresses legacy announcer'
+grep -q 'Announce via canonical OIDC train' "$WF" || fail 'canonical OIDC announce job missing'; pass 'canonical OIDC announce job present'
+grep -q 'id-token: write' "$WF" || fail 'OIDC announce job lacks id-token permission'; pass 'OIDC permission present'
+grep -q 'hov-tool-drop-announce.yml@c981b872ebf650805200ad72c8b7142232f8b3f6' "$WF" || fail 'canonical announce workflow is not SHA-pinned'; pass 'canonical announce workflow SHA-pinned'
+! grep -q 'TOOL_RELEASE_ANNOUNCE_SECRET' "$WF" || fail 'static announce secret remains in the production workflow'; pass 'static announce secret removed from production workflow'
+
 echo 'ALL PASS'

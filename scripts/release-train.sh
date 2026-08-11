@@ -62,6 +62,10 @@ print("\n".join(out)[:600])'
 }
 
 announce() {
+  if [[ "${PROMOTE_ONLY:-false}" == true ]]; then
+    printf 'announcement delegated to the canonical OIDC job\n'
+    return
+  fi
   require ANNOUNCE_URL
   require ANNOUNCE_SECRET
   local payload
