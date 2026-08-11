@@ -5,22 +5,85 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+HARDENED_SHA='08f7d22f3a5b59b1658ab2e96a20d0d3c352869c'
+RETIRED_SHA='c981b872ebf650805200ad72c8b7142232f8b3f6'
+ANNOUNCE_WORKFLOW='StartupBros-com/hov-marketplace/.github/workflows/hov-tool-drop-announce.yml'
+HARDENED_USES="$ANNOUNCE_WORKFLOW@$HARDENED_SHA"
+ANNOUNCE_IF="github.event.release.draft == false && github.event.release.prerelease == false && needs.promote.result == 'success'"
+
 pass() { printf 'ok - %s\n' "$1"; }
 fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
 assert_eq() { [[ "$1" == "$2" ]] || fail "$3: expected $2, got $1"; pass "$3"; }
+
+validate_release_policy() {
+  local workflow="$1" script="$2" json
+  if grep -Eq 'TOOL_RELEASE_ANNOUNCE_(SECRET|URL)|ANNOUNCE_(SECRET|URL)|x-tool-release-announce-secret|/api/internal/ops/tool-releases|(^|[[:space:]])curl([[:space:]]|$)' "$workflow" "$script"; then
+    printf 'direct Tool Drop delivery surface is forbidden\n' >&2
+    return 1
+  fi
+  if ! json="$(yq -o=json '.' "$workflow" 2>/dev/null)"; then
+    printf 'release workflow must parse as YAML\n' >&2
+    return 1
+  fi
+  jq -e '.on.release.types == ["published", "edited"]' <<<"$json" >/dev/null || {
+    printf 'release events must be exactly published and edited\n' >&2
+    return 1
+  }
+  jq -e '.permissions == {"contents": "read"}' <<<"$json" >/dev/null || {
+    printf 'workflow permissions must be exactly contents read\n' >&2
+    return 1
+  }
+  jq -e --arg key '${{ secrets.HOV_MARKETPLACE_DEPLOY_KEY }}' \
+    'any(.jobs.promote.steps[]?; .with."ssh-key" == $key)' <<<"$json" >/dev/null || {
+    printf 'promotion must retain the marketplace deploy key\n' >&2
+    return 1
+  }
+  jq -e --arg uses "$HARDENED_USES" '.jobs.announce.uses == $uses' <<<"$json" >/dev/null || {
+    printf 'announce job must use the hardened immutable workflow\n' >&2
+    return 1
+  }
+  jq -e '.jobs.announce.needs == "promote"' <<<"$json" >/dev/null || {
+    printf 'announce job must depend on promotion\n' >&2
+    return 1
+  }
+  jq -e --arg condition "$ANNOUNCE_IF" '.jobs.announce.if == $condition' <<<"$json" >/dev/null || {
+    printf 'announce job must retain the stable release gate\n' >&2
+    return 1
+  }
+  jq -e '.jobs.announce.permissions == {"contents": "read", "id-token": "write"}' <<<"$json" >/dev/null || {
+    printf 'announce permissions must be exactly contents read and id-token write\n' >&2
+    return 1
+  }
+  jq -e '(.jobs.announce | keys | sort) == ["if", "name", "needs", "permissions", "uses"]' <<<"$json" >/dev/null || {
+    printf 'announce job may not add inputs, secrets, or unrelated behavior\n' >&2
+    return 1
+  }
+}
+
+assert_policy_failure() {
+  local label="$1" diagnostic="$2" workflow="$3" script="$4" output status
+  if output="$(validate_release_policy "$workflow" "$script" 2>&1)"; then
+    status=0
+  else
+    status=$?
+  fi
+  if [[ "$status" -eq 1 && "$output" == *"$diagnostic"* ]]; then
+    pass "$label"
+  else
+    fail "$label: expected exit 1 with [$diagnostic], got exit $status and [$output]"
+  fi
+}
 
 mkdir -p "$TMP/bin" "$TMP/source/.claude-plugin"
 printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$CURL_LOG"\n' > "$TMP/bin/curl"
 chmod +x "$TMP/bin/curl"
 printf '{"name":"pro-gate","version":"0.1.0"}\n' > "$TMP/source/.claude-plugin/plugin.json"
+printf '0.1.0\n' > "$TMP/source/VERSION"
 git -C "$TMP/source" init -q
 git -C "$TMP/source" config user.email test@example.com
 git -C "$TMP/source" config user.name Test
 git -C "$TMP/source" add .
 git -C "$TMP/source" commit -qm source
-printf '0.1.0\n' > "$TMP/source/VERSION"
-git -C "$TMP/source" add VERSION
-git -C "$TMP/source" commit -qm version
 git -C "$TMP/source" tag v0.1.0
 SOURCE_SHA="$(git -C "$TMP/source" rev-parse HEAD)"
 mkdir -p "$TMP/assets"
@@ -43,21 +106,20 @@ git -C "$TMP/marketplace" config user.email test@example.com
 git -C "$TMP/marketplace" config user.name Test
 
 export PATH="$TMP/bin:$PATH" CURL_LOG="$TMP/curl.log"
+: > "$CURL_LOG"
 common=(
   EVENT_ACTION=published REPOSITORY=pro-gate RELEASE_ID=201 RELEASE_TAG=v0.1.0
-  RELEASE_NAME='Pro Gate 0.1.0' RELEASE_URL='https://github.com/StartupBros-com/pro-gate/releases/tag/v0.1.0'
-  RELEASE_PRERELEASE=false RELEASE_DRAFT=false LATEST_STABLE_ID=201 SOURCE_ROOT="$TMP/source" ASSET_DIR="$TMP/assets"
-  SOURCE_SHA="$SOURCE_SHA" MARKETPLACE_DIR="$TMP/marketplace" ANNOUNCE_URL=https://example.test/tool-releases
-  ANNOUNCE_SECRET=test-secret
+  RELEASE_PRERELEASE=false RELEASE_DRAFT=false LATEST_STABLE_ID=201 SOURCE_ROOT="$TMP/source"
+  ASSET_DIR="$TMP/assets" SOURCE_SHA="$SOURCE_SHA" MARKETPLACE_DIR="$TMP/marketplace"
 )
 env "${common[@]}" "$ROOT/scripts/release-train.sh" >/dev/null
 fresh="$TMP/fresh"
 git clone -q "$TMP/marketplace.git" "$fresh"
 assert_eq "$(jq -r '.plugins[] | select(.name=="pro-gate") | .metadata.releaseId' "$fresh/.claude-plugin/marketplace.json")" 201 'stable latest release promotes'
-assert_eq "$(wc -l < "$TMP/curl.log")" 1 'promotion announces once'
+assert_eq "$(wc -l < "$CURL_LOG")" 0 'promotion never calls a direct announcement endpoint'
 
 env "${common[@]}" "$ROOT/scripts/release-train.sh" >/dev/null
-assert_eq "$(wc -l < "$TMP/curl.log")" 2 'rerun calls idempotent announce operation'
+assert_eq "$(wc -l < "$CURL_LOG")" 0 'rerun remains promotion-only'
 
 git clone -q --bare "$TMP/marketplace.git" "$TMP/retry-marketplace.git"
 git clone -q "$TMP/retry-marketplace.git" "$TMP/retry-marketplace"
@@ -78,7 +140,7 @@ CURL_LOG="$TMP/retry-curl.log" env "${common[@]}" RELEASE_ID=202 LATEST_STABLE_I
 retry_remote="$TMP/retry-remote-check"
 git clone -q "$TMP/retry-marketplace.git" "$retry_remote"
 assert_eq "$(jq -r '.plugins[] | select(.name=="pro-gate") | .metadata.releaseId' "$retry_remote/.claude-plugin/marketplace.json")" 202 'rejected push retries from remote tip'
-assert_eq "$(wc -l < "$TMP/retry-curl.log")" 1 'retry announces only after remote promotion'
+assert_eq "$(wc -l < "$TMP/retry-curl.log")" 0 'promotion retry never delivers directly'
 
 printf '#!/usr/bin/env bash\nexit 23\n' > "$TMP/fail-validator"
 chmod +x "$TMP/fail-validator"
@@ -98,49 +160,42 @@ git clone -q "$TMP/marketplace.git" "$remote_check"
 assert_eq "$(jq -r '.plugins[] | select(.name=="pro-gate") | .metadata.releaseId' "$remote_check/.claude-plugin/marketplace.json")" 201 'failed validation prevents marketplace push'
 
 env "${common[@]}" RELEASE_ID=200 LATEST_STABLE_ID=200 "$ROOT/scripts/release-train.sh" >/dev/null
-assert_eq "$(wc -l < "$TMP/curl.log")" 2 'older release no-op does not announce'
+assert_eq "$(wc -l < "$CURL_LOG")" 0 'older release no-op never delivers directly'
 
 env "${common[@]}" RELEASE_ID=202 LATEST_STABLE_ID=202 RELEASE_PRERELEASE=true "$ROOT/scripts/release-train.sh" >/dev/null
-assert_eq "$(wc -l < "$TMP/curl.log")" 2 'prerelease is ignored'
+assert_eq "$(wc -l < "$CURL_LOG")" 0 'prerelease remains promotion and delivery no-op'
 
 env "${common[@]}" EVENT_ACTION=edited "$ROOT/scripts/release-train.sh" >/dev/null
-assert_eq "$(wc -l < "$TMP/curl.log")" 3 'edited release announces when marketplace exactly matches'
+assert_eq "$(wc -l < "$CURL_LOG")" 0 'edited matching release remains promotion-only'
+
+corrupt="$TMP/corrupt"
+git clone -q "$TMP/marketplace.git" "$corrupt"
+git -C "$corrupt" config user.email test@example.com
+git -C "$corrupt" config user.name Test
+jq '(.plugins[] | select(.name == "pro-gate") | .source.sha) = "2222222222222222222222222222222222222222"' \
+  "$corrupt/.claude-plugin/marketplace.json" > "$corrupt/marketplace.tmp"
+mv "$corrupt/marketplace.tmp" "$corrupt/.claude-plugin/marketplace.json"
+git -C "$corrupt" add .claude-plugin/marketplace.json
+git -C "$corrupt" commit -qm 'corrupt immutable promotion tuple'
+git -C "$corrupt" push -q origin HEAD:main
+if env "${common[@]}" EVENT_ACTION=edited "$ROOT/scripts/release-train.sh" >/dev/null 2>&1; then
+  fail 'edited release repairs immutable drift under the same release ID'
+fi
+assert_eq "$(wc -l < "$CURL_LOG")" 0 'same-ID drift fails closed without direct delivery'
 
 env "${common[@]}" EVENT_ACTION=edited RELEASE_ID=202 LATEST_STABLE_ID=202 "$ROOT/scripts/release-train.sh" >/dev/null
-assert_eq "$(wc -l < "$TMP/curl.log")" 4 'newly stable edited release promotes and announces once'
+assert_eq "$(wc -l < "$CURL_LOG")" 0 'newly stable edited release promotes without direct delivery'
 assert_eq "$(jq -r '.plugins[] | select(.name=="pro-gate") | .metadata.releaseId' "$TMP/marketplace/.claude-plugin/marketplace.json")" 202 'newly stable edited release advances marketplace'
 
 env "${common[@]}" EVENT_ACTION=edited RELEASE_PRERELEASE=true "$ROOT/scripts/release-train.sh" >/dev/null
-assert_eq "$(wc -l < "$TMP/curl.log")" 4 'edited prerelease remains production no-op'
+assert_eq "$(wc -l < "$CURL_LOG")" 0 'edited prerelease remains production no-op'
 
-# --- notes_summary: card-ready bullets for the What's-new announcement section ---
-ns() { RELEASE_NOTES="$1" bash -c "source <(sed -n '/^notes_summary()/,/^}/p' '$ROOT/scripts/release-train.sh'); notes_summary"; }
-AUTO=$'## What\'s Changed\n* feat(pro-gate): capture provenance (v0.28.0) by @StartupBros in https://github.com/x/y/pull/54\n* fix(pro-gate): idempotent harvests by @StartupBros in https://github.com/x/y/pull/55\n\n**Full Changelog**: https://github.com/x/y/compare/a...b'
-assert_eq "$(ns "$AUTO")" $'capture provenance\nidempotent harvests' 'auto-notes bullets are cleaned (prefix, author, link, version stripped)'
-HL=$'## Highlights\n* Hand-picked line one\n* Hand-picked line two\n\n## What\'s Changed\n* feat: noise by @u in https://x'
-assert_eq "$(ns "$HL")" $'Hand-picked line one\nHand-picked line two' 'an author-written Highlights section wins over auto-notes'
-PROSE=$'A prose lead paragraph.\nStill the lead.\n\nSecond paragraph never announced.'
-assert_eq "$(ns "$PROSE")" 'A prose lead paragraph. Still the lead. ' 'prose bodies fall back to the flattened first paragraph'
-MANY=$'* one\n* two\n* three\n* four'
-assert_eq "$(ns "$MANY")" $'one\ntwo\nthree' 'bullets cap at three'
-assert_eq "$(ns '')" '' 'empty notes stay empty'
-CONTRIB="$(printf '%s\n' "## What's Changed" '* feat: real change by @u in https://x/pull/1' '' '## New Contributors' '* @newbie made their first contribution in https://x/pull/1')"
-assert_eq "$(ns "$CONTRIB")" 'real change' 'contributor-section bullets never become highlights'
-PROSEB="$(printf '%s\n' 'A prose lead.' '' 'Install steps:' '* run the installer' '* sign in')"
-assert_eq "$(ns "$PROSEB")" 'A prose lead. ' 'later install bullets do not hijack a prose body'
-CJK="$(printf '* %s' "$(python3 -c "print('测' * 200)")")"
-CJK_OUT="$(ns "$CJK")"
-assert_eq "$(printf '%s' "$CJK_OUT" | python3 -c 'import sys; print(len(sys.stdin.read()))')" '180' 'multibyte bullets slice at 180 CHARACTERS'
-printf '%s' "$CJK_OUT" | python3 -c 'import sys; sys.stdin.buffer.read().decode("utf-8")' && pass 'sliced multibyte output is valid UTF-8'
-
-# ── customer-readiness gate (scripts/check-release-notes.sh) ─────────────────────────────
-# Both customer feeds derive from the release body, so a missing/lazy Highlights section
-# ships developer shorthand to House of Vibe customers. v0.31.0 and v0.31.1 announced
-# "governor-rounds" and "memo-crossbind" exactly this way; these cases lock that out.
+# Both customer feeds derive from the release body. The canonical marketplace announcer owns
+# summary generation; this repository owns the earlier authoring gate that prevents developer
+# shorthand from reaching that renderer.
 CHK="$ROOT/scripts/check-release-notes.sh"
 chk() { printf '%s' "$1" | bash "$CHK" - >/dev/null 2>&1; }
 
-# The REAL v0.31.0 body that shipped: the regression this gate exists for.
 SHIPPED=$'## What\'s Changed\n* governor-rounds by @StartupBros in https://github.com/StartupBros-com/pro-gate/pull/66\n\n**Full Changelog**: https://x/y'
 chk "$SHIPPED" && fail 'the shipped v0.31.0 body must be rejected' || pass 'the auto-generated body that shipped is rejected'
 
@@ -152,26 +207,25 @@ chk $'## Highlights\n\n- feat(pro-gate): trajectory-aware round governor with ch
 chk $'## Highlights\n\n- memo-crossbind' && fail 'branch name must be rejected' || pass 'a bare branch-name bullet is rejected'
 chk $'## Highlights\n\n- Fixed the stuck-review problem reported in #67 by users last week.' && fail 'issue ref must be rejected' || pass 'an issue/PR reference in Highlights is rejected'
 chk "$(printf '## Highlights\n\n- %s' "$(python3 -c "print('x' * 200)")")" && fail 'over-long bullet must be rejected' || pass 'a bullet past the 180-char feed limit is rejected'
+
+# Feed parity for astral characters (#75 gate P2). The announcer truncates with
+# utf16_prefix(line, 180), where an emoji costs 2 units; bash ${#text} counted it as 1, so a
+# bullet could pass here and lose its tail in the published card. The pair is the proof: OVER
+# and EDGE differ only in emoji count, so EDGE passing rules out rejection for any other reason.
+ASTRAL_OVER="$(python3 -c "print('x' * 100 + '\U0001F600' * 45)")"   # 145 code points, 190 units
+ASTRAL_EDGE="$(python3 -c "print('x' * 100 + '\U0001F600' * 40)")"   # 140 code points, 180 units
+chk "$(printf '## Highlights\n\n- %s' "$ASTRAL_OVER")" && fail 'astral bullet past the UTF-16 feed limit must be rejected' || pass 'a bullet under 180 code points but past 180 UTF-16 units is rejected'
+chk "$(printf '## Highlights\n\n- %s' "$ASTRAL_EDGE")" && pass 'a bullet at exactly 180 UTF-16 units still passes' || fail 'the 180-unit boundary bullet was wrongly rejected'
+ASTRAL_OUT="$(printf '## Highlights\n\n- %s' "$ASTRAL_OVER" | bash "$CHK" - 2>&1 || true)"
+case "$ASTRAL_OUT" in
+  *'190 UTF-16 units'*) pass 'the astral rejection names the feed-counted width, not the code-point count' ;;
+  *) fail "astral bullet was not rejected by the UTF-16 width rule: $ASTRAL_OUT" ;;
+esac
 chk $'## Highlights\n\n- Faster now.' && fail 'stub bullet must be rejected' || pass 'a too-short stub bullet is rejected'
-
-# The gate must agree with the announcer: what passes the check is what customers receive.
-assert_eq "$(ns "$GOOD")" $'Reviews that keep making progress now earn extra rounds automatically, instead of stopping at a flat limit.\nReviews going in circles stop early rather than burning your remaining quota.' \
-  'notes that pass the gate produce exactly those announcement bullets'
-
-# #69 gate P2: the checker must validate the NORMALIZED bytes the announcer sends. A
-# breaking-change prefix (feat!:) passed the raw-line check, then notes_summary stripped it and
-# shipped the bare branch name — the exact failure this gate exists to prevent.
 chk $'## Highlights\n\n- feat!: memo-crossbind' && fail 'feat!: prefix must be rejected' || pass 'a scope-less breaking-change prefix is rejected after normalization'
 chk $'## Highlights\n\n- fix(pro-gate)!: governor-rounds' && fail 'scoped feat!: must be rejected' || pass 'a scoped breaking-change prefix is rejected after normalization'
 chk $'## Highlights\n\n- governor-rounds   ' && fail 'trailing-space branch name must be rejected' || pass 'a trailing-whitespace branch name is rejected'
-# The normalization must MATCH notes_summary exactly, or the gate inspects different bytes
-# than customers receive. Anything the checker accepts must survive the announcer unchanged.
-assert_eq "$(ns $'## Highlights\n- Reviews that keep making progress now earn extra rounds automatically, instead of a flat limit.')" \
-  'Reviews that keep making progress now earn extra rounds automatically, instead of a flat limit.' \
-  'checker-normalized text and announcer output agree'
 
-# #69 gate P1: the release is CREATED with real copy when an archived notes file exists, so
-# bad copy is not the default. Guard the wiring rather than re-running gh.
 grep -q 'notes-file' "$ROOT/scripts/publish-runtime-release.sh" \
   && pass 'publish-runtime-release prefers a hand-written notes file' \
   || fail 'publish-runtime-release still only auto-generates notes'
@@ -179,9 +233,6 @@ grep -q 'docs/release-notes/v\$version.md' "$ROOT/scripts/publish-runtime-releas
   && pass 'the notes file is resolved per version' \
   || fail 'no per-version notes file lookup'
 
-# #69 gate P0: nothing executed from the CHECKED-OUT TAG may run before the ancestry check
-# that proves the tag descends from protected main — that job later holds the marketplace
-# deploy key and the announcement secret.
 WF="$ROOT/.github/workflows/release-train.yml"
 ANCESTRY_LINE="$(grep -n 'merge-base --is-ancestor' "$WF" | cut -d: -f1)"
 CHECKER_LINE="$(grep -n 'check-release-notes.sh' "$WF" | head -1 | cut -d: -f1)"
@@ -193,9 +244,6 @@ PROVISION_LINE="$(grep -n 'provision-ci-tools.sh' "$WF" | head -1 | cut -d: -f1)
   && pass 'tool provisioning also runs after the ancestry check' \
   || fail 'provisioning runs before ancestry proof'
 
-# #69 gate r2 P2: `printf | grep -q` SIGPIPEs the producer; under pipefail the pipeline reports
-# 141 and a VALID body was read as "no Highlights". Measured 20/20 failures on a long body,
-# which would have published auto-generated branch names for a good release.
 BIG="$(printf '## Highlights\n\n- %s\n\n## Details\n\n%s' \
   'Reviews now earn extra rounds when they are converging, instead of stopping at a flat limit.' \
   "$(for _ in $(seq 1 4000); do echo 'filler line for a long details section'; done)")"
@@ -204,39 +252,71 @@ chk "$BIG" && pass 'a long Details section does not break Highlights detection (
 grep -q 'printf .%s. "\$notes" | grep -q' "$CHK" && fail 'a SIGPIPE-prone pipeline remains' \
   || pass 'no printf|grep -q pipelines remain in the checker'
 
-# #69 gate r2 P2: conventional-commit types are open-ended; a fixed allowlist let revert:/deps:
-# through verbatim.
 chk $'## Highlights\n\n- revert: memo-crossbind changes' && fail 'revert: must be rejected' || pass 'revert: is rejected by generic subject detection'
 chk $'## Highlights\n\n- deps: bump the oracle bridge to 0.17.0' && fail 'deps: must be rejected' || pass 'deps: is rejected by generic subject detection'
 chk $'## Highlights\n\n- chore(release): cut v0.32.0' && fail 'arbitrary scoped type must be rejected' || pass 'an arbitrary scoped commit type is rejected'
 chk $'## Highlights\n\n- Reviews stop early when they stop converging: no more burning quota on repeats.' \
   && pass 'prose containing a colon is NOT mistaken for a commit subject' || fail 'false positive on prose with a colon'
 
-# #69 gate r2 P2: a wrapped bullet reaches customers as its first clause only.
 chk "$(printf '## Highlights\n\n- Reviews now earn extra rounds automatically,\n  which keeps a converging PR from being cut off.')" \
   && fail 'wrapped bullet must be rejected' || pass 'a wrapped Highlights bullet is rejected'
 
-# #69 gate r2 P1: a version bump without customer copy must fail on the PR, where it is cheap
-# to fix — the release train is warn-only by design.
 grep -q 'Require customer-ready notes for a version bump' "$ROOT/.github/workflows/ci.yml" \
   && pass 'PR CI requires notes for a version bump' || fail 'no PR-level version-bump notes gate'
 grep -q 'docs/release-notes/v\$version.md' "$ROOT/.github/workflows/ci.yml" \
   && pass 'the version-bump gate resolves the per-version notes file' || fail 'version-bump gate does not resolve the notes file'
 
+SCRIPT="$ROOT/scripts/release-train.sh"
+validate_release_policy "$WF" "$SCRIPT"
+pass 'checked-in release train uses the hardened OIDC policy'
 
+mkdir -p "$TMP/policy"
+if ! python3 - "$WF" "$SCRIPT" "$TMP/policy" "$HARDENED_USES" "$RETIRED_SHA" <<'PY'
+import sys
+from pathlib import Path
 
-# The legacy script still owns marketplace promotion, but production runs set
-# PROMOTE_ONLY so the dependent OIDC reusable workflow is the ONE announcer.
-before_promote_only="$(wc -l < "$TMP/curl.log")"
-promote_only_out="$(PROMOTE_ONLY=true bash -c "source <(sed -n '/^announce()/,/^}/p' '$ROOT/scripts/release-train.sh'); announce")"
-assert_eq "$promote_only_out" 'announcement delegated to the canonical OIDC job' 'promotion-only mode delegates announcement'
-assert_eq "$(wc -l < "$TMP/curl.log")" "$before_promote_only" 'promotion-only mode never calls the secret-authenticated endpoint'
+workflow_path, script_path, output_dir, hardened_uses, retired_sha = sys.argv[1:]
+workflow = Path(workflow_path).read_text()
+script = Path(script_path).read_text()
+out = Path(output_dir)
+uses_line = f"    uses: {hardened_uses}"
+assert workflow.count(uses_line) == 1
 
-WF="$ROOT/.github/workflows/release-train.yml"
-grep -q 'PROMOTE_ONLY: true' "$WF" || fail 'release workflow does not suppress the legacy announcer'; pass 'release workflow suppresses legacy announcer'
-grep -q 'Announce via canonical OIDC train' "$WF" || fail 'canonical OIDC announce job missing'; pass 'canonical OIDC announce job present'
-grep -q 'id-token: write' "$WF" || fail 'OIDC announce job lacks id-token permission'; pass 'OIDC permission present'
-grep -q 'hov-tool-drop-announce.yml@c981b872ebf650805200ad72c8b7142232f8b3f6' "$WF" || fail 'canonical announce workflow is not SHA-pinned'; pass 'canonical announce workflow SHA-pinned'
-! grep -q 'TOOL_RELEASE_ANNOUNCE_SECRET' "$WF" || fail 'static announce secret remains in the production workflow'; pass 'static announce secret removed from production workflow'
+retired = workflow.replace(uses_line, uses_line.replace(hardened_uses.rsplit("@", 1)[1], retired_sha), 1)
+assert retired != workflow and retired_sha in retired
+(out / "retired.yml").write_text(retired)
+
+decoy = workflow.replace(
+    uses_line,
+    f"    uses: attacker/hov-marketplace/.github/workflows/hov-tool-drop-announce.yml@{hardened_uses.rsplit('@', 1)[1]}\n"
+    f"\n  decoy:\n    uses: {hardened_uses}",
+    1,
+)
+assert decoy != workflow and decoy.count(hardened_uses) == 1 and "\n  decoy:\n" in decoy
+(out / "decoy.yml").write_text(decoy)
+
+shadowed = workflow.replace("      id-token: write", "      id-token: read", 1)
+assert shadowed != workflow
+(out / "shadowed.yml").write_text(shadowed)
+
+direct_script = script + "\nANNOUNCE_URL=https://attacker.example\nANNOUNCE_SECRET=forbidden-test-fixture\ncurl \"$ANNOUNCE_URL\"\n"
+assert direct_script != script and "ANNOUNCE_URL" in direct_script and "ANNOUNCE_SECRET" in direct_script and "curl \"$ANNOUNCE_URL\"" in direct_script
+(out / "direct-script.sh").write_text(direct_script)
+PY
+then
+  fail 'policy fixture generation failed'
+fi
+for fixture in retired.yml decoy.yml shadowed.yml direct-script.sh; do
+  [[ -s "$TMP/policy/$fixture" ]] || fail "missing generated fixture: $fixture"
+done
+
+assert_policy_failure 'retired workflow pin is rejected' \
+  'announce job must use the hardened immutable workflow' "$TMP/policy/retired.yml" "$SCRIPT"
+assert_policy_failure 'blessed-SHA decoy cannot hide an attacker announce target' \
+  'announce job must use the hardened immutable workflow' "$TMP/policy/decoy.yml" "$SCRIPT"
+assert_policy_failure 'job-level permission shadowing is rejected' \
+  'announce permissions must be exactly contents read and id-token write' "$TMP/policy/shadowed.yml" "$SCRIPT"
+assert_policy_failure 'direct secret or URL delivery cannot return in the release script' \
+  'direct Tool Drop delivery surface is forbidden' "$WF" "$TMP/policy/direct-script.sh"
 
 echo 'ALL PASS'
