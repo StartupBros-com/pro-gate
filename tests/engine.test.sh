@@ -876,31 +876,35 @@ check 'landed-but-lost run does NOT announce a refund' "$(grep -qv 'refunding th
 check 'landed-but-lost round STAYS charged' \
   "$([ -s "$RHOME/rounds/$RKEY_92" ]; echo $?)" "rounds: $(cat "$RHOME/rounds/$RKEY_92" 2>/dev/null)"
 
-# v0.32: Oracle 0.17+ stores the exact prompt-commit probe in session meta.json. Lifecycle lines
-# precede commit verification, so a COMPLETE all-negative probe plus a clean marker scan may safely
-# override them. The fake writes one metadata record per invocation and fails before generation.
+# v0.32: Oracle 0.17+ stores prompt-commit state only after dispatching Send/Enter. Even a complete
+# all-negative DOM probe cannot prove ChatGPT rejected that request, so browser-lifecycle evidence
+# must suppress retries and retain the round regardless of metadata completeness or landing URL.
 cat > "$TDIR/bin/oracle-commit-timeout" <<'FAKE_COMMIT_TIMEOUT'
 #!/usr/bin/env bash
 [ "${1:-}" = session ] && exit 1
-prompt=""
+prompt=""; chatgpt_url=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -p) prompt="$2"; shift 2 ;;
+    --chatgpt-url) chatgpt_url="$2"; shift 2 ;;
     *) shift ;;
   esac
 done
+[ -z "${PG_TEST_CHATGPT_URL_FILE:-}" ] || printf '%s\n' "$chatgpt_url" > "$PG_TEST_CHATGPT_URL_FILE"
+tab_url="${PG_TEST_TAB_URL:-https://chatgpt.com/}"
 count=0
 [ -s "${PG_TEST_ATTEMPTS_FILE:?}" ] && count="$(cat "$PG_TEST_ATTEMPTS_FILE")"
 count=$((count + 1)); printf '%s\n' "$count" > "$PG_TEST_ATTEMPTS_FILE"
 slug="fake-prompt-commit-$count"
 mkdir -p "${ORACLE_HOME_DIR:?}/sessions/$slug"
-jq -n --arg id "$slug" --arg prompt "$prompt" --argjson promptLength "${#prompt}" '
+jq -n --arg id "$slug" --arg prompt "$prompt" --arg tabUrl "$tab_url" \
+  --argjson promptLength "${#prompt}" '
   {
     id: $id,
     status: "error",
     mode: "browser",
     options: {prompt: $prompt},
-    browser: {runtime: {promptSubmitted: true, tabUrl: "https://chatgpt.com/"}},
+    browser: {runtime: {promptSubmitted: true, tabUrl: $tabUrl}},
     error: {
       category: "browser-automation",
       details: {
@@ -940,63 +944,36 @@ FAKE_COMMIT_TIMEOUT
 chmod +x "$TDIR/bin/oracle-commit-timeout"
 
 PROOF_HOME="$TDIR/home-prompt-proof"; PROOF_ORACLE="$TDIR/oracle-prompt-proof"
-PROOF_ATTEMPTS="$TDIR/prompt-proof-attempts"; mkdir -p "$PROOF_HOME" "$PROOF_ORACLE"; : > "$PROOF_ATTEMPTS"
+PROOF_ATTEMPTS="$TDIR/prompt-proof-attempts"; PROOF_URL="$TDIR/prompt-proof-url"
+mkdir -p "$PROOF_HOME" "$PROOF_ORACLE"; : > "$PROOF_ATTEMPTS"
 RKEY_93="$(printf '%s-93' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
+PROJECT_URL="https://chatgpt.com/g/g-test/project/project-test"
 printf 'foreign idle tab\n' > "$TDIR/tab.txt"
 env PRO_GATE_HOME="$PROOF_HOME" ORACLE_HOME_DIR="$PROOF_ORACLE" ORACLE_BROWSER_PORT="$PORT" \
-  PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
-  PRO_GATE_MAX_RETRIES=1 PRO_GATE_RETRY_BACKOFF=0 PRO_GATE_REATTACH_TIMEOUT=1 PRO_GATE_SALVAGE_SECS=2 \
+  ORACLE_CHATGPT_URL="$PROJECT_URL" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 \
+  PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=1 PRO_GATE_RETRY_BACKOFF=0 \
+  PRO_GATE_REATTACH_TIMEOUT=1 PRO_GATE_SALVAGE_SECS=2 \
   PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-commit-timeout" PG_TEST_ATTEMPTS_FILE="$PROOF_ATTEMPTS" \
+  PG_TEST_CHATGPT_URL_FILE="$PROOF_URL" PG_TEST_TAB_URL="$PROJECT_URL" \
   NODE_OPTIONS= bash "$ENGINE" --pr 93 --repo "$TDIR" --diff "$TDIR/small.diff" \
   --out "$PROOF_HOME/o-proof.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
 RC=$?
-PROOF_MARKER="$(jq -r .marker "$PROOF_HOME/o-proof.md.status" 2>/dev/null)"
-check 'proven-unsubmitted run still fails after its bounded retry' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -4 "$TDIR/stderr")"
-check 'complete commit proof overrides generic lifecycle evidence for retry' \
-  "$(grep -q 'evidence proves no prompt turn landed' "$TDIR/stderr"; echo $?)" "$(tail -8 "$TDIR/stderr")"
-check 'proven-unsubmitted retry occurs exactly once' \
-  "$([ "$(cat "$PROOF_ATTEMPTS")" = 2 ]; echo $?)" "attempts=$(cat "$PROOF_ATTEMPTS")"
-check 'last proven-unsubmitted attempt refunds the shared round' \
-  "$([ ! -s "$PROOF_HOME/rounds/$RKEY_93" ]; echo $?)" "rounds=$(cat "$PROOF_HOME/rounds/$RKEY_93" 2>/dev/null)"
-check 'structured refund is named in terminal status' \
-  "$(grep -q 'round refunded' "$PROOF_HOME/o-proof.md.status"; echo $?)" "$(cat "$PROOF_HOME/o-proof.md.status")"
+check 'post-click timeout fails without a duplicate retry' \
+  "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -4 "$TDIR/stderr")"
+check 'Project URL is forwarded unchanged to Oracle' \
+  "$([ "$(cat "$PROOF_URL" 2>/dev/null)" = "$PROJECT_URL" ]; echo $?)" "url=$(cat "$PROOF_URL" 2>/dev/null)"
+check 'complete post-click metadata remains ambiguous and suppresses retry' \
+  "$(grep -q 'browser lifecycle makes its fate ambiguous/spent' "$TDIR/stderr"; echo $?)" "$(tail -8 "$TDIR/stderr")"
+check 'post-click timeout invokes Oracle exactly once' \
+  "$([ "$(cat "$PROOF_ATTEMPTS")" = 1 ]; echo $?)" "attempts=$(cat "$PROOF_ATTEMPTS")"
+check 'post-click timeout stays charged' \
+  "$([ -s "$PROOF_HOME/rounds/$RKEY_93" ]; echo $?)" "rounds=$(cat "$PROOF_HOME/rounds/$RKEY_93" 2>/dev/null)"
+check 'post-click timeout never announces a refund' \
+  "$(! grep -q 'refunding this round' "$TDIR/stderr" && ! grep -q 'round refunded' "$PROOF_HOME/o-proof.md.status"; echo $?)" \
+  "stderr=$(tail -6 "$TDIR/stderr") status=$(cat "$PROOF_HOME/o-proof.md.status")"
 
-# Unit-level mutations pin every field in the strict proof. Each mutation starts from a known-good
-# second-attempt record, so one contradictory or missing value must be enough to fail closed.
-PROOF_SLUG="fake-prompt-commit-2"
-PROOF_META="$PROOF_ORACLE/sessions/$PROOF_SLUG/meta.json"
-PROOF_BASE="$TDIR/prompt-proof-base.json"; cp "$PROOF_META" "$PROOF_BASE"
-proof_metadata_rc() {
-  ORACLE_HOME_DIR="$PROOF_ORACLE" PRO_GATE_HOME="$PROOF_HOME" bash -c \
-    ". '$HERE/../lib/pro-gate-lib.sh'; pg_oracle_prompt_provably_unsubmitted '$PROOF_SLUG' '$PROOF_MARKER'"
-}
-proof_rejects() { # $1 label, $2 jq mutation
-  local label="$1" filter="$2" rc
-  jq "$filter" "$PROOF_BASE" > "$PROOF_META"
-  proof_metadata_rc; rc=$?
-  check "$label" "$([ "$rc" -ne 0 ]; echo $?)" "mutation=$filter unexpectedly accepted"
-}
-cp "$PROOF_BASE" "$PROOF_META"; proof_metadata_rc; PROOF_RC=$?
-check 'exact complete Oracle commit metadata is accepted' "$([ "$PROOF_RC" -eq 0 ]; echo $?)" "rc=$PROOF_RC"
-proof_rejects 'missing probe field remains ambiguous' 'del(.error.details.commitProbe.prefixMatched)'
-proof_rejects 'existing conversation turn remains charged' '.error.details.commitProbe.turnsCount = 1'
-proof_rejects 'full prompt match remains charged' '.error.details.commitProbe.userMatched = true'
-proof_rejects 'prompt prefix match remains charged' '.error.details.commitProbe.prefixMatched = true'
-proof_rejects 'last-turn match remains charged' '.error.details.commitProbe.lastMatched = true'
-proof_rejects 'new turn evidence remains charged' '.error.details.commitProbe.hasNewTurn = true'
-proof_rejects 'stop-button evidence remains charged' '.error.details.commitProbe.stopVisible = true'
-proof_rejects 'assistant evidence remains charged' '.error.details.commitProbe.assistantVisible = true'
-proof_rejects 'uncleared composer remains ambiguous' '.error.details.commitProbe.composerCleared = false'
-proof_rejects 'conversation route evidence remains charged' '.error.details.commitProbe.inConversation = true'
-proof_rejects 'conversation URL evidence remains charged' '.browser.runtime.tabUrl = "https://chatgpt.com/c/owned"'
-proof_rejects 'residual editor content remains ambiguous' '.error.details.commitProbe.editorLength = 1'
-proof_rejects 'last-turn content remains charged' '.error.details.commitProbe.lastTurnLength = 1'
-proof_rejects 'unknown Oracle error code remains charged' '.error.details.code = "unknown-timeout"'
-proof_rejects 'foreign run marker metadata remains charged' '.options.prompt = "run marker: pg-run-foreign-1700000000-1 — wrong"'
-cp "$PROOF_BASE" "$PROOF_META"
-
-# Integration-level partial metadata must suppress the retry AND retain the round despite the same
-# lifecycle prose and a clean browser scan.
+# Partial metadata has the same fail-closed result: once browser lifecycle exists, metadata shape
+# has no authority to enable a duplicate retry or refund.
 PARTIAL_HOME="$TDIR/home-prompt-partial"; PARTIAL_ORACLE="$TDIR/oracle-prompt-partial"
 PARTIAL_ATTEMPTS="$TDIR/prompt-partial-attempts"; mkdir -p "$PARTIAL_HOME" "$PARTIAL_ORACLE"; : > "$PARTIAL_ATTEMPTS"
 RKEY_94="$(printf '%s-94' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"

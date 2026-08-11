@@ -187,10 +187,11 @@ engine home is `$HOME/.pro-review-daemon`.
   NON-shrinking re-reviews stop the loop EARLY (churn brake), before the base is spent. A
   converging gate therefore finishes without human overrides, and a churning one is cut
   sooner than the old flat 4. Setting `PRO_GATE_MAX_ROUNDS_PER_PR` explicitly pins the
-  legacy flat cap (trajectory ignored). Harvests never count; a submission the engine can
-  PROVE never landed (send/upload failure: browser scanned clean, no URL ever memoized)
-  refunds its round automatically. This is the backstop, not the plan: design the gate
-  around section 6's convergence policy so you rarely hit it.
+  legacy flat cap (trajectory ignored). Harvests never count; a failure proven before Oracle's
+  browser lifecycle (browser scanned clean, no URL memoized, no throttle/restart) refunds its
+  round automatically. A post-click DOM timeout stays charged because delivery is ambiguous.
+  This is the backstop, not the plan: design the gate around section 6's convergence policy so
+  you rarely hit it.
 
 ## 3. Run the review
 
