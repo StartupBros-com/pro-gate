@@ -189,6 +189,19 @@ function forgetUrl(m, url) {
   return survivor;
 }
 
+// #68 gate r3 P2: cross-bind convictions are ACCUMULATED per candidate URL and only persisted
+// at exit, when the whole scan is known. Writing mid-scan made the terminal "cross-bound"
+// state depend on /json tab ORDER — a foreign tab seen after a genuine one would re-flag a
+// live review as stuck and have --status advise deleting its reservation.
+//
+// #76: these live HERE, above the exit hook below, not with the scan state further down.
+// The hook reads them, and `const`/`let` are in the temporal dead zone until their
+// declaration is evaluated — so declaring them after the hook made every exit that happens
+// before that point (--sweep-root, --close, an unreachable CDP port) throw
+// "Cannot access 'ownershipProven' before initialization" instead of flushing.
+const crossBindHits = new Map();   // url -> foreign marker
+let ownershipProven = false;       // any candidate positively proved ours this invocation
+
 // #68 gate P2: record that THIS marker was positively convicted of a cross-bind (its page held
 // another run's completed answer BELOW our prompt). Only that state is terminally stuck; an
 // ordinary nonce-less .unbound capture may still be an older answer while ours generates, and
@@ -218,7 +231,11 @@ function flushCrossBind(m) {
 // One hook rather than seven call sites: every salvage exit path (0/3/4/5/7)
 // persists the scan's verdict exactly once, so no future exit can forget to.
 // Organizer/cleanup modes are deliberately read-only with respect to cross-bound recovery state.
-process.on('exit', () => { if (mode === 'salvage') flushCrossBind(marker); });
+// #76 keeps close/sweep-root flushing (they clear a stale conviction, and their test asserts it);
+// v0.32 excludes only --organize. It exits before the scan that can call noteCrossBind, so it
+// never has hits and never proves ownership — flushing there would just DELETE a genuine
+// conviction an earlier salvage recorded. probe stays excluded exactly as before.
+process.on('exit', () => { if (!probe && !organize) flushCrossBind(marker); });
 
 function rememberUrl(m, url) {
   const f = memoPath(m);
@@ -440,12 +457,8 @@ let seededRenders = 0;
 // exhaust its render budget, and still report "gone".
 let seededLiveUrl = null;
 let memoStale = false;       // the remembered URL decisively carries ANOTHER run's conversation
-// #68 gate r3 P2: cross-bind convictions are ACCUMULATED per candidate URL and only persisted
-// at exit, when the whole scan is known. Writing mid-scan made the terminal "cross-bound"
-// state depend on /json tab ORDER — a foreign tab seen after a genuine one would re-flag a
-// live review as stuck and have --status advise deleting its reservation.
-const crossBindHits = new Map();   // url -> foreign marker
-let ownershipProven = false;       // any candidate positively proved ours this invocation
+// crossBindHits / ownershipProven are declared next to flushCrossBind() above, because the
+// exit hook registered there reads them (#76).
 if (knownUrl) ourUrls.add(knownUrl);
 
 // Persistent blacklist: conversations proven (by a foreign run marker) to belong to another

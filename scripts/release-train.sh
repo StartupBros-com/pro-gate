@@ -15,73 +15,6 @@ is_uint() {
   [[ "$1" =~ ^(0|[1-9][0-9]*)$ ]]
 }
 
-notes_summary() {
-  # Card-ready release bullets for the announcement endpoint's "What's new" section.
-  # Preference order:
-  #   1. An author-written "## Highlights" section in the release body (manual control for
-  #      releases that deserve hand-picked copy);
-  #   2. GitHub's auto-generated "What's Changed" PR-title bullets, cleaned: conventional-
-  #      commit prefixes, "by @user in <url>" tails, and "(vX.Y.Z)" suffixes stripped;
-  #   3. Fallback: the body's first paragraph, flattened (the pre-2026-08 behavior), so a
-  #      hand-written prose body still announces something.
-  # Up to 3 bullets, one per line, each <=180 chars; total stays under the endpoint's
-  # 600-char schema cap.
-  local notes bullets
-  notes="$(printf '%s' "${RELEASE_NOTES:-}" | tr -d '\r')"
-  [[ -n "$notes" ]] || return 0
-  # Bullets come only from sections that ARE changelogs (gate #58 P2): the Highlights
-  # section, the "What's Changed" section (auto-notes append e.g. "New Contributors"
-  # bullets after it), or — for headingless bodies — a leading list block only, so a prose
-  # release with install bullets further down still falls back to its first paragraph.
-  bullets="$(printf '%s\n' "$notes" | sed -n '/^##[[:space:]]*Highlights/,/^## /p' | grep -E '^[*•-][[:space:]]' || true)"
-  if [[ -z "$bullets" ]]; then
-    if printf '%s\n' "$notes" | grep -qE '^##[[:space:]]*What.?.?s Changed'; then
-      bullets="$(printf '%s\n' "$notes" | sed -n '/^##[[:space:]]*What.\{0,2\}s Changed/,/^## /p' | grep -E '^\*[[:space:]]' || true)"
-    elif [[ "$(printf '%s\n' "$notes" | grep -vE '^[[:space:]]*$' | head -n 1)" == \** ]]; then
-      bullets="$(printf '%s\n' "$notes" | awk '/^[[:space:]]*$/{exit} /^\*[[:space:]]/{print}')"
-    fi
-  fi
-  if [[ -n "$bullets" ]]; then
-    # Character-safe slicing (gate #58 P2): cut -c is BYTES under GNU coreutils, which can
-    # split a multibyte character mid-sequence and ship invalid UTF-8. This path runs only
-    # on the Actions runner, where python3 is guaranteed.
-    printf '%s\n' "$bullets" \
-      | sed -E 's/^[*•-][[:space:]]+//; s/[[:space:]]+by @[A-Za-z0-9_[:punct:]]+ in http[^[:space:]]*[[:space:]]*$//; s/^(feat|fix|perf|chore|docs|refactor|test|ci|build)(\([^)]*\))?!?:[[:space:]]*//; s/[[:space:]]*\(v[0-9]+\.[0-9]+\.[0-9]+\)[[:space:]]*$//' \
-      | python3 -c 'import sys
-out = []
-for line in sys.stdin.read().splitlines():
-    line = line.strip()
-    if line:
-        out.append(line[:180])
-    if len(out) == 3:
-        break
-print("\n".join(out)[:600])'
-    return 0
-  fi
-  printf '%s' "$notes" | awk 'BEGIN{RS=""} NR==1' | tr '\n' ' ' | cut -c1-600
-}
-
-announce() {
-  require ANNOUNCE_URL
-  require ANNOUNCE_SECRET
-  local payload
-  payload="$(jq -cn \
-    --arg operation announce \
-    --arg repository "$REPOSITORY" \
-    --arg releaseId "$RELEASE_ID" \
-    --arg tag "$RELEASE_TAG" \
-    --arg releaseName "$RELEASE_NAME" \
-    --arg releaseUrl "$RELEASE_URL" \
-    --arg notesSummary "$(notes_summary)" \
-    '{operation: $operation, repository: $repository, releaseId: $releaseId, tag: $tag, releaseName: $releaseName, releaseUrl: $releaseUrl} + (if $notesSummary == "" then {} else {notesSummary: $notesSummary} end)')"
-  curl --fail-with-body --silent --show-error \
-    -X POST \
-    -H 'content-type: application/json' \
-    -H "x-tool-release-announce-secret: $ANNOUNCE_SECRET" \
-    --data "$payload" \
-    "$ANNOUNCE_URL"
-}
-
 verify_release() {
   require SOURCE_ROOT
   require SOURCE_SHA
@@ -192,8 +125,6 @@ main() {
   require REPOSITORY
   require RELEASE_ID
   require RELEASE_TAG
-  require RELEASE_NAME
-  require RELEASE_URL
   is_uint "$RELEASE_ID" || fail "RELEASE_ID must be an unsigned integer"
   [[ "$REPOSITORY" == pro-gate ]] || fail "this release train only promotes pro-gate"
 
@@ -220,17 +151,18 @@ main() {
     is_uint "$current" || fail "marketplace release marker is not numeric"
     if (( RELEASE_ID == current )); then
       marketplace_matches_release || fail "marketplace release $RELEASE_ID does not match the edited release tuple"
-      announce
+      printf 'release %s is already promoted\n' "$RELEASE_ID"
       return
     fi
     (( RELEASE_ID > current )) || fail "edited release $RELEASE_ID is older than marketplace marker $current"
     cd "$SOURCE_ROOT"
   fi
 
+  local status
   if promote; then
-    announce
+    return
   else
-    local status=$?
+    status=$?
     [[ "$status" == 2 ]] || return "$status"
   fi
 }
