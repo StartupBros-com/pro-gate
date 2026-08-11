@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  promote:
+  verify:
     if: github.event.release.draft == false
     runs-on: ubuntu-24.04
     steps:
@@ -66,23 +66,7 @@ jobs:
           mkdir -p release-assets
           gh release download "$RELEASE_TAG" --dir release-assets --pattern 'pro-gate-runtime-*'
 
-      - name: Check out marketplace
-        if: github.event.release.prerelease == false
-        uses: actions/checkout@ac593985615ec2ede58e132d2e21d2b1cbd6127c
-        with:
-          repository: StartupBros-com/hov-marketplace
-          ssh-key: ${{ secrets.HOV_MARKETPLACE_DEPLOY_KEY }}
-          path: hov-marketplace
-          fetch-depth: 0
-
-      - name: Configure marketplace git identity
-        if: github.event.release.prerelease == false
-        working-directory: hov-marketplace
-        run: |
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-
-      - name: Promote release
+      - name: Verify release and report repin
         env:
           EVENT_ACTION: ${{ github.event.action }}
           REPOSITORY: pro-gate
@@ -93,8 +77,6 @@ jobs:
           LATEST_STABLE_ID: ${{ steps.stable.outputs.id }}
           SOURCE_ROOT: ${{ github.workspace }}
           ASSET_DIR: ${{ github.workspace }}/release-assets
-          MARKETPLACE_DIR: ${{ github.workspace }}/hov-marketplace
-          MARKETPLACE_VALIDATION_MODE: ${{ vars.HOV_MARKETPLACE_VALIDATION_MODE || 'syntax' }}
         run: |
           source_sha="$(git rev-list -n 1 "$RELEASE_TAG")"
           export SOURCE_SHA="$source_sha"
@@ -102,8 +84,8 @@ jobs:
 
   announce:
     name: Announce via canonical OIDC train
-    needs: promote
-    if: github.event.release.draft == false && github.event.release.prerelease == false && needs.promote.result == 'success'
+    needs: verify
+    if: github.event.release.draft == false && github.event.release.prerelease == false && needs.verify.result == 'success'
     permissions:
       contents: read
       id-token: write
