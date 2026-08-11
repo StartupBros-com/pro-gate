@@ -1645,6 +1645,11 @@ RUN_MARKER="pg-run-${ROUND_KEY:-diff}-$(date +%s)-$$"
 CAPTURE_OUT="$WORK/capture.md"
 PROMPT_FILE="$WORK/prompt.md"
 RUNLOG="$WORK/oracle.log"
+# Each run_oracle invocation publishes a private transcript + digest only after its tee drains
+# successfully. The shared RUNLOG remains the live diagnostic stream, while these immutable
+# captures let retry/refund accounting distinguish a trustworthy no-match from missing output.
+ORACLE_LOG_TRANSCRIPTS=()
+ORACLE_LOG_PROOFS=()
 {
   # (The run-naming title line is PREPENDED after the per-change lock is held — see below.
   # Computing r<N> here raced: a queued same-change run would prebuild a duplicate label.)
@@ -2010,6 +2015,11 @@ NOTHINK_SECS="${PRO_GATE_NOTHINK_SECS:-600}"
 
 run_oracle() {  # $1 = browser model strategy (select|current|ignore)
   local strategy="$1" job started size last_size last_change now last_line prc
+  local transcript="$WORK/oracle.${#ORACLE_LOG_TRANSCRIPTS[@]}.log"
+  local proof="$WORK/oracle.${#ORACLE_LOG_TRANSCRIPTS[@]}.sha256"
+  ORACLE_LOG_TRANSCRIPTS+=("$transcript")
+  ORACLE_LOG_PROOFS+=("$proof")
+  rm -f "$transcript" "$proof"
   # v0.16 (#873 lesson): a watchdog-killed attempt leaves its session record
   # status "running", and oracle's duplicate-prompt guard then blocks the
   # engine's OWN retry of the same prompt/slug. Retries only happen after the
@@ -2025,7 +2035,20 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
       "${URL_ARGS[@]}" "${FILE_ARGS[@]}" \
       -p "$(cat "$PROMPT_FILE")" \
       --no-notify --timeout "$TIMEOUT" \
-      --write-output "$CAPTURE_OUT" 2>&1 | tee -a "$RUNLOG" | stdbuf -oL sed 's/^/[oracle] /' >&2 ) &
+      --write-output "$CAPTURE_OUT" 2>&1 | tee -a "$RUNLOG" "$transcript" | stdbuf -oL sed 's/^/[oracle] /' >&2
+    _pipeline_status=("${PIPESTATUS[@]}")
+    if [ "${_pipeline_status[1]:-1}" -eq 0 ]; then
+      _transcript_sha="$(pg_sha256 "$transcript")"
+      if [ -n "$_transcript_sha" ]; then
+        printf '%s\n' "$_transcript_sha" > "$proof.tmp" 2>/dev/null \
+          && mv -f "$proof.tmp" "$proof" 2>/dev/null \
+          || rm -f "$proof.tmp"
+      fi
+    fi
+    [ "${_pipeline_status[1]:-1}" -eq 0 ] && [ "${_pipeline_status[2]:-1}" -eq 0 ] \
+      || exit 1
+    exit "${_pipeline_status[0]:-1}"
+  ) &
   job=$!
   started=$SECONDS; last_size=-1; last_change=$SECONDS
   while kill -0 "$job" 2>/dev/null; do
@@ -2092,17 +2115,23 @@ CLOUDFLARE=0
 
 # pg_attempt_provably_unsubmitted <marker-scan-rc>: the ONE shared bar for a no-spend
 # retry/refund. A clean marker scan, no remembered URL, no throttle/live evidence, and a stable
-# browser remain mandatory. Oracle browser-lifecycle evidence makes submission fate ambiguous and
-# therefore spent; its DOM-only commit state cannot safely override that fail-closed decision.
+# browser remain mandatory. Every Oracle invocation must also have a complete, digest-verified
+# transcript whose grep completed with no lifecycle match. Missing/truncated/unreadable capture is
+# ambiguous and therefore spent; DOM-only commit state cannot override that fail-closed decision.
 pg_attempt_provably_unsubmitted() {
-  local scan_rc="${1:-}"
+  local scan_rc="${1:-}" i
+  local lifecycle='Launching browser mode|Acquired ChatGPT browser slot|Reattach: oracle session '
   [ "$scan_rc" = 4 ] || return 1
   [ "${LIVE_CONVERSATION:-0}" != 1 ] || return 1
   [ "${THROTTLED:-0}" != 1 ] || return 1
   [ ! -f "$PRO_GATE_HOME/conversation-urls/${RUN_MARKER}" ] || return 1
   ! pg_browser_restarted_midrun "$RUN_START" >/dev/null || return 1
-  ! grep -qE 'Launching browser mode|Acquired ChatGPT browser slot|Reattach: oracle session ' \
-      "$RUNLOG" 2>/dev/null
+  [ "${#ORACLE_LOG_TRANSCRIPTS[@]}" -gt 0 ] || return 1
+  for i in "${!ORACLE_LOG_TRANSCRIPTS[@]}"; do
+    pg_verified_log_lacks "${ORACLE_LOG_TRANSCRIPTS[$i]}" "${ORACLE_LOG_PROOFS[$i]}" \
+      "$lifecycle" || return 1
+  done
+  return 0
 }
 
 attempt=0
@@ -2274,10 +2303,10 @@ while :; do
     break
   fi
   # FAIL CLOSED: a non-0/5 probe is inconclusive unless the shared no-spend predicate succeeds.
-  # Oracle browser-lifecycle lines mean a send may have reached ChatGPT even when neither Oracle nor
-  # the marker scan can render it, so they suppress a duplicate retry regardless of commit metadata.
+  # Oracle browser-lifecycle lines OR an incomplete/unverifiable lifecycle transcript mean a send
+  # may have reached ChatGPT, so they suppress a duplicate retry regardless of commit metadata.
   if ! pg_attempt_provably_unsubmitted "$PRC"; then
-    echo "[oracle-review] pre-retry probe could not prove the prompt stayed unsubmitted; Oracle browser lifecycle makes its fate ambiguous/spent, so retry is suppressed and CDP salvage gets the final chance." >&2
+    echo "[oracle-review] pre-retry probe could not prove the prompt stayed unsubmitted; Oracle browser lifecycle evidence or incomplete log capture makes its fate ambiguous/spent, so retry is suppressed and CDP salvage gets the final chance." >&2
     LIVE_CONVERSATION=1
     pg_status live-detected "submission fate ambiguous/spent; retry suppressed"
     break
@@ -2536,8 +2565,9 @@ else
   echo "ERROR: oracle produced no usable review after salvage + ${RETRIES} retr$([ "${RETRIES}" -eq 1 ] && echo y || echo ies) (reattach: oracle session ${SLUG_BASE})." >&2
   FAIL_DETAIL="no usable review after salvage"
   # v0.31 (#65): refund only through the same positive no-spend predicate used before a retry.
-  # It requires a clean marker scan, no URL/live/throttle evidence, a stable browser, and no Oracle
-  # browser lifecycle. Post-click DOM timeouts stay charged because their delivery fate is ambiguous.
+  # It requires a clean marker scan, no URL/live/throttle evidence, a stable browser, and complete,
+  # digest-verified Oracle transcripts with no browser lifecycle. Missing capture and post-click DOM
+  # timeouts stay charged because their delivery fate is ambiguous.
   _svc_up=""; _svc_restarted=0
   if _svc_up="$(pg_browser_restarted_midrun "$RUN_START")"; then _svc_restarted=1; fi
   if [ "${SALVAGE_RAN:-0}" = 1 ] \

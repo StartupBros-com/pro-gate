@@ -268,11 +268,11 @@ re-reviews — the same adaptive-within-a-ceiling shape as the v0.19 concurrency
 explicitly set `PRO_GATE_MAX_ROUNDS_PER_PR` pins the legacy flat cap. Exit-12 refusals now
 carry the whole trajectory ("open P0/P1 by round: 5→7→8") so a human deciding on
 `PRO_GATE_FORCE_ROUND` sees churning-vs-converging at a glance, `--status` reports each
-key's live grant, and a failure proven before Oracle's browser lifecycle (browser scanned
-clean, no URL ever memoized, no throttle, no Chrome restart) refunds its round the way the
-Cloudflare path always has — pre-browser failures had eaten 2 of pro-gate#61's 4 window
-rounds while spending zero Pro quota. Post-click DOM timeouts stay charged because delivery
-is ambiguous. The skill's §6 stop rules
+key's live grant, and a failure proven before Oracle's browser lifecycle (complete,
+digest-verified Oracle transcript; browser scanned clean; no URL memo, throttle, or Chrome
+restart) refunds its round the way the Cloudflare path always has — pre-browser failures had
+eaten 2 of pro-gate#61's 4 window rounds while spending zero Pro quota. Incomplete logging
+and post-click DOM timeouts stay charged because delivery is ambiguous. The skill's §6 stop rules
 gained the matching refinement: a returning finding whose fix the reviewer ACCEPTS but
 calls incomplete is convergence work, not oscillation — only a disputed fix approach
 escalates.

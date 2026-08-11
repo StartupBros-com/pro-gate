@@ -1474,6 +1474,22 @@ pg_sha256() {  # <file>: echo the hex digest, or nothing when no tool is availab
   elif pg_have openssl; then openssl dgst -sha256 "$1" 2>/dev/null | awk '{print $NF}'
   fi
 }
+# pg_verified_log_lacks <transcript> <digest-proof> <extended-regex>: true only when the
+# immutable transcript still matches the digest published after its tee drained successfully
+# AND grep completed with the exact no-match status. Missing/truncated/unreadable logs fail closed.
+pg_verified_log_lacks() {
+  local transcript="$1" proof="$2" pattern="$3" expected actual grep_rc
+  [ -f "$transcript" ] && [ ! -L "$transcript" ] || return 1
+  [ -f "$proof" ] && [ ! -L "$proof" ] || return 1
+  IFS= read -r expected < "$proof" || return 1
+  case "$expected" in ''|*[!0-9a-fA-F]*) return 1 ;; esac
+  [ "${#expected}" -eq 64 ] || return 1
+  actual="$(pg_sha256 "$transcript")"
+  [ -n "$actual" ] && [ "$actual" = "$expected" ] || return 1
+  grep -qE "$pattern" "$transcript" 2>/dev/null
+  grep_rc=$?
+  [ "$grep_rc" -eq 1 ]
+}
 pg_completed_write() {  # <marker> <file>: write-once; an existing artifact is never replaced
   local marker="$1" f="$2" dir rc
   pg_reservation_marker_ok "$marker" || return 1

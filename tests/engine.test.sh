@@ -876,6 +876,74 @@ check 'landed-but-lost run does NOT announce a refund' "$(grep -qv 'refunding th
 check 'landed-but-lost round STAYS charged' \
   "$([ -s "$RHOME/rounds/$RKEY_92" ]; echo $?)" "rounds: $(cat "$RHOME/rounds/$RKEY_92" 2>/dev/null)"
 
+# Gate #72 r8 P1: lifecycle ABSENCE is proof only in a complete, immutable transcript whose tee
+# drained successfully. Pin the helper's fail-closed contract before exercising the full pipeline.
+LOG_PROOF_DIR="$TDIR/log-proof"; mkdir -p "$LOG_PROOF_DIR"
+LOG_TRANSCRIPT="$LOG_PROOF_DIR/oracle.log"; LOG_PROOF="$LOG_PROOF_DIR/oracle.sha256"
+printf 'pre-browser failure\n' > "$LOG_TRANSCRIPT"
+printf '%s\n' "$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_sha256 '$LOG_TRANSCRIPT'")" > "$LOG_PROOF"
+verified_log_rc() {
+  bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_verified_log_lacks \"\$1\" \"\$2\" \"\$3\"" \
+    _ "$1" "$2" 'Launching browser mode|Acquired ChatGPT browser slot'
+}
+verified_log_rc "$LOG_TRANSCRIPT" "$LOG_PROOF"; LOG_RC=$?
+check 'verified lifecycle-free transcript is accepted' "$([ "$LOG_RC" -eq 0 ]; echo $?)" "rc=$LOG_RC"
+rm -f "$LOG_PROOF"; verified_log_rc "$LOG_TRANSCRIPT" "$LOG_PROOF"; LOG_RC=$?
+check 'missing transcript proof fails closed' "$([ "$LOG_RC" -ne 0 ]; echo $?)" "rc=$LOG_RC"
+printf '%s\n' "$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_sha256 '$LOG_TRANSCRIPT'")" > "$LOG_PROOF"
+printf 'late truncation\n' >> "$LOG_TRANSCRIPT"; verified_log_rc "$LOG_TRANSCRIPT" "$LOG_PROOF"; LOG_RC=$?
+check 'transcript changed after proof fails closed' "$([ "$LOG_RC" -ne 0 ]; echo $?)" "rc=$LOG_RC"
+printf 'Launching browser mode\n' > "$LOG_TRANSCRIPT"
+printf '%s\n' "$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_sha256 '$LOG_TRANSCRIPT'")" > "$LOG_PROOF"
+verified_log_rc "$LOG_TRANSCRIPT" "$LOG_PROOF"; LOG_RC=$?
+check 'verified lifecycle evidence remains charged' "$([ "$LOG_RC" -ne 0 ]; echo $?)" "rc=$LOG_RC"
+ln -s "$LOG_TRANSCRIPT" "$LOG_PROOF_DIR/symlink.log"
+verified_log_rc "$LOG_PROOF_DIR/symlink.log" "$LOG_PROOF"; LOG_RC=$?
+check 'symlinked transcript fails closed' "$([ "$LOG_RC" -ne 0 ]; echo $?)" "rc=$LOG_RC"
+
+# Reproduce the reviewed failure path end-to-end: Oracle emits browser lifecycle, but tee forwards
+# it only to the operator and returns failure without writing either log. Old negative-grep logic
+# retried/refunded this shape; missing completion proof must now keep it charged and single-shot.
+mkdir -p "$TDIR/tee-fail-bin"
+cat > "$TDIR/tee-fail-bin/tee" <<'FAKE_TEE_FAIL'
+#!/usr/bin/env bash
+cat
+exit 1
+FAKE_TEE_FAIL
+chmod +x "$TDIR/tee-fail-bin/tee"
+cat > "$TDIR/bin/oracle-log-loss" <<'FAKE_LOG_LOSS'
+#!/usr/bin/env bash
+[ "${1:-}" = session ] && exit 1
+count=0
+[ -s "${PG_TEST_ATTEMPTS_FILE:?}" ] && count="$(cat "$PG_TEST_ATTEMPTS_FILE")"
+printf '%s\n' "$((count + 1))" > "$PG_TEST_ATTEMPTS_FILE"
+printf 'Launching browser mode\nAcquired ChatGPT browser slot\n'
+exit 1
+FAKE_LOG_LOSS
+chmod +x "$TDIR/bin/oracle-log-loss"
+LOSS_HOME="$TDIR/home-log-loss"; LOSS_ATTEMPTS="$TDIR/log-loss-attempts"
+mkdir -p "$LOSS_HOME"; : > "$LOSS_ATTEMPTS"
+RKEY_921="$(printf '%s-921' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+env PRO_GATE_HOME="$LOSS_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
+  PRO_GATE_MAX_RETRIES=1 PRO_GATE_RETRY_BACKOFF=0 PRO_GATE_REATTACH_TIMEOUT=1 \
+  PRO_GATE_SALVAGE_SECS=2 PRO_GATE_RUN_LOGS=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-log-loss" \
+  PG_TEST_ATTEMPTS_FILE="$LOSS_ATTEMPTS" PATH="$TDIR/tee-fail-bin:$PATH" NODE_OPTIONS= \
+  bash "$ENGINE" --pr 921 --repo "$TDIR" --diff "$TDIR/small.diff" \
+  --out "$LOSS_HOME/o-log-loss.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'failed Oracle log capture exits 6' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -5 "$TDIR/stderr")"
+check 'failed Oracle log capture suppresses retry' \
+  "$(grep -q 'incomplete log capture makes its fate ambiguous/spent' "$TDIR/stderr"; echo $?)" "$(tail -8 "$TDIR/stderr")"
+check 'failed Oracle log capture invokes Oracle exactly once' \
+  "$([ "$(cat "$LOSS_ATTEMPTS")" = 1 ]; echo $?)" "attempts=$(cat "$LOSS_ATTEMPTS")"
+check 'failed Oracle log capture stays charged' \
+  "$([ -s "$LOSS_HOME/rounds/$RKEY_921" ]; echo $?)" "rounds=$(cat "$LOSS_HOME/rounds/$RKEY_921" 2>/dev/null)"
+check 'failed Oracle log capture never announces a refund' \
+  "$(! grep -q 'refunding this round' "$TDIR/stderr" && ! grep -q 'round refunded' "$LOSS_HOME/o-log-loss.md.status"; echo $?)" \
+  "stderr=$(tail -6 "$TDIR/stderr") status=$(cat "$LOSS_HOME/o-log-loss.md.status")"
+
 # v0.32: Oracle 0.17+ stores prompt-commit state only after dispatching Send/Enter. Even a complete
 # all-negative DOM probe cannot prove ChatGPT rejected that request, so browser-lifecycle evidence
 # must suppress retries and retain the round regardless of metadata completeness or landing URL.
@@ -963,7 +1031,8 @@ check 'post-click timeout fails without a duplicate retry' \
 check 'Project URL is forwarded unchanged to Oracle' \
   "$([ "$(cat "$PROOF_URL" 2>/dev/null)" = "$PROJECT_URL" ]; echo $?)" "url=$(cat "$PROOF_URL" 2>/dev/null)"
 check 'complete post-click metadata remains ambiguous and suppresses retry' \
-  "$(grep -q 'browser lifecycle makes its fate ambiguous/spent' "$TDIR/stderr"; echo $?)" "$(tail -8 "$TDIR/stderr")"
+  "$(grep -q 'lifecycle evidence or incomplete log capture makes its fate ambiguous/spent' "$TDIR/stderr"; echo $?)" \
+  "$(tail -8 "$TDIR/stderr")"
 check 'post-click timeout invokes Oracle exactly once' \
   "$([ "$(cat "$PROOF_ATTEMPTS")" = 1 ]; echo $?)" "attempts=$(cat "$PROOF_ATTEMPTS")"
 check 'post-click timeout stays charged' \
