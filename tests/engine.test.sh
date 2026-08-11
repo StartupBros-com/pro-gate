@@ -2007,6 +2007,46 @@ check 'no-flock contender preserves the live unpublished lock' \
 check 'no-flock lock metadata and directory are retired after the join' \
   "$([ ! -e "$NOFLOCK_DIR" ]; echo $?)" "lock remains: $(find "$NOFLOCK_HOME/organizer-locks" -maxdepth 2 -print 2>/dev/null)"
 
+# Housekeeping must run on artifact-only harvests, not only fresh reviews. A day-old crash-left
+# directory should be removed before the no-flock join, while a fresh sibling remains untouched.
+echo '# v0.32 gate: harvest-only recovery sweeps stale organizer locks'
+STALE_HOME="$TDIR/home-organizer-stale"
+STALE_LOCK_ROOT="$TDIR/custom-organizer-locks"
+STALE_MARKER='pg-run-config-2081-1700000281-281'
+STALE_DIR="$STALE_LOCK_ROOT/$STALE_MARKER.d"
+FRESH_DIR="$STALE_LOCK_ROOT/pg-run-config-fresh-1700000282-282.d"
+mkdir -p "$STALE_HOME/completed" "$STALE_DIR" "$FRESH_DIR"
+cp "$TDIR/prov-ours.md" "$STALE_HOME/completed/$STALE_MARKER"
+touch -d '3 days ago' "$STALE_DIR" 2>/dev/null || touch -t 202001010000 "$STALE_DIR"
+env PRO_GATE_HOME="$STALE_HOME" PRO_GATE_ORGANIZER_LOCK_DIR="$STALE_LOCK_ROOT" \
+  ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_KEEP_TABS=1 PRO_GATE_CHAT_RENAME=0 \
+  PRO_GATE_TEST_ORGANIZER_NO_FLOCK=1 PRO_GATE_TEST_ORGANIZER_LOCK_WAIT=1 NODE_OPTIONS= \
+  bash "$ENGINE" --harvest "$STALE_MARKER" --out "$TDIR/o-noflock-stale.md" --timeout 5s \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'artifact-only harvest removes its stale no-flock lock before joining' \
+  "$([ "$RC" -eq 0 ] && [ ! -e "$STALE_DIR" ] \
+      && ! grep -q 'organizer-lock-timeout' "$TDIR/stderr"; echo $?)" \
+  "rc=$RC stderr=$(cat "$TDIR/stderr") locks=$(find "$STALE_LOCK_ROOT" -maxdepth 2 -print 2>/dev/null)"
+check 'organizer housekeeping honors the custom directory and preserves fresh locks' \
+  "$([ -d "$FRESH_DIR" ]; echo $?)" \
+  "locks=$(find "$STALE_LOCK_ROOT" -maxdepth 2 -print 2>/dev/null)"
+check 'stale-lock recovery returns the exact durable artifact' \
+  "$(cmp -s "$TDIR/o-noflock-stale.md" "$STALE_HOME/completed/$STALE_MARKER"; echo $?)" \
+  "stdout=$(grep RESULT_FILE "$TDIR/stdout" 2>/dev/null)"
+
+# --status is inspection-only even when it sees organizer housekeeping candidates.
+STATUS_STALE_DIR="$STALE_LOCK_ROOT/pg-run-status-stale-1700000283-283.d"
+mkdir -p "$STATUS_STALE_DIR"
+touch -d '3 days ago' "$STATUS_STALE_DIR" 2>/dev/null || touch -t 202001010000 "$STATUS_STALE_DIR"
+env PRO_GATE_HOME="$STALE_HOME" PRO_GATE_ORGANIZER_LOCK_DIR="$STALE_LOCK_ROOT" \
+  bash "$ENGINE" --status >"$TDIR/status-organizer-lock.out" 2>"$TDIR/status-organizer-lock.err"
+RC=$?
+check '--status does not sweep stale organizer locks' \
+  "$([ "$RC" -eq 0 ] && [ -d "$STATUS_STALE_DIR" ]; echo $?)" \
+  "rc=$RC stderr=$(cat "$TDIR/status-organizer-lock.err")"
+
 # An empty crash-left directory has no trustworthy owner record. It stays busy for this bounded
 # call rather than being deleted from under a winner that may still be publishing metadata.
 BUSY_HOME="$TDIR/home-organizer-busy"

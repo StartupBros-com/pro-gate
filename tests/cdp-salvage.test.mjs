@@ -926,6 +926,71 @@ const FOREIGN_ANSWER = (m) => [
 }
 
 {
+  const title = 'pro-gate review: PR #71 r8a [pro-gate]';
+  const newerMarker = 'pg-run-test-1234567891-43';
+  const accepted = completedReview(MARKER);
+  const reusedConversation = [
+    `run marker: ${MARKER}`,
+    accepted,
+    '',
+    `pro-gate review: PR #71 r9 [pro-gate]`,
+    `(run marker: ${newerMarker})`,
+    'newer review still generating',
+  ].join('\n');
+  const cdp = await mockCdp(reusedConversation);
+  const r = await runSalvage(
+    finalizerArgs(MARKER),
+    cdp.port,
+    seedOrganizer(MARKER, title, null, durableReview(accepted, MARKER)),
+  );
+  check('a newer exact run marker after the accepted verdict blocks finalization',
+    /reason=newer-run-marker/.test(r.stdout), `stdout=${r.stdout}`);
+  check('newer in-progress work prevents every older-run mutation and local close',
+    cdp.ui.events.length === 0 && !cdp.ui.archived && cdp.closed.length === 0,
+    `events=${JSON.stringify(cdp.ui.events)} closed=${cdp.closed}`);
+  cdp.stop();
+}
+
+{
+  const title = 'pro-gate review: PR #71 r8aa [pro-gate]';
+  const markerLookalike = 'xpg-run-test-1234567891-43';
+  const accepted = completedReview(MARKER);
+  const cdp = await mockCdp(`run marker: ${MARKER}\n${accepted}\nquoted ${markerLookalike}`);
+  const r = await runSalvage(
+    finalizerArgs(MARKER),
+    cdp.port,
+    seedOrganizer(MARKER, title, null, durableReview(accepted, MARKER)),
+  );
+  check('an embedded marker-like substring does not create a false freshness conflict',
+    /archive=archived close=closed reason=ok/.test(r.stdout), `stdout=${r.stdout}`);
+  cdp.stop();
+}
+
+{
+  const title = 'pro-gate review: PR #71 r8ab [pro-gate]';
+  const newerMarker = 'pg-run-test-1234567892-44';
+  const accepted = completedReview(MARKER);
+  const owned = `run marker: ${MARKER}\n${accepted}`;
+  const advanced = `${owned}\nrun marker: ${newerMarker}\nnewer review still generating`;
+  const cdp = await mockCdp(owned, [], {
+    primaryText: (initial, n) => (n >= 4 ? advanced : initial),
+  });
+  const r = await runSalvage(
+    finalizerArgs(MARKER),
+    cdp.port,
+    seedOrganizer(MARKER, title, null, durableReview(accepted, MARKER)),
+  );
+  check('a newer marker appearing after rename blocks archive and close',
+    /rename=renamed archive=skipped close=skipped reason=newer-run-marker/.test(r.stdout),
+    `stdout=${r.stdout}`);
+  check('freshness drift preserves the newer run after the already-dispatched rename',
+    cdp.ui.events.map((event) => event.action).join(',') === 'rename' &&
+      !cdp.ui.archived && cdp.closed.length === 0,
+    `events=${JSON.stringify(cdp.ui.events)} closed=${cdp.closed}`);
+  cdp.stop();
+}
+
+{
   const title = 'pro-gate review: PR #71 r8b [pro-gate]';
   const duplicate = { id: 'same-url-duplicate', url: 'https://chatgpt.com/c/mock-conversation' };
   const body = [
@@ -1307,6 +1372,10 @@ const FOREIGN_ANSWER = (m) => [
   check('browser-side ownership rejects a terminal verdict without an exact marker echo',
     /target-answer-marker-missing/.test(renameExpression) &&
       /expectedFinalReview === null[\s\S]*verdictAt > ownMarkerAt/.test(renameExpression));
+  check('browser-side finalization rejects any newer exact run marker',
+    /lastExactRunMarkerAt/.test(renameExpression) &&
+      /matchAll\(\/pg-run-\[A-Za-z0-9.-\]\+\/g\)/.test(renameExpression) &&
+      /target-newer-run-marker/.test(renameExpression));
   check('archive expression excludes destructive and reverse actions',
     /label\.includes\('delete'\)/.test(archiveExpression) &&
       /label\.includes\('unarchive'\)/.test(archiveExpression) &&

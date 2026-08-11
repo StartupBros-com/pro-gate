@@ -84,6 +84,16 @@ function targetContext(marker, conversationUrl, {
       }
       return found;
     };
+    const lastExactRunMarkerAt = (text) => {
+      let found = -1;
+      for (const match of text.matchAll(/pg-run-[A-Za-z0-9.-]+/g)) {
+        const at = match.index;
+        const before = at > 0 ? text[at - 1] : '';
+        const after = text[at + match[0].length] ?? '';
+        if (!isRunMarkerChar(before) && !isRunMarkerChar(after)) found = at;
+      }
+      return found;
+    };
     const normalizeReviewBytes = (value) => String(value ?? '')
       .replace(/\r\n?/g, '\n').replace(/\n$/, '');
     const stripMarkerEcho = (value) => String(value ?? '').split('\n').map((line) => {
@@ -134,8 +144,8 @@ function targetContext(marker, conversationUrl, {
       }
       if (expectedFinalReview !== null) {
         if (verdictAt < 0 || promptMarkerAt < 0) return 'target-answer-incomplete';
-        if (lastExactMarkerAt(text.slice(verdictAt + verdictLine.length), expectedMarker) >= 0) {
-          return 'target-answer-incomplete';
+        if (lastExactRunMarkerAt(text.slice(verdictAt + verdictLine.length)) >= 0) {
+          return 'target-newer-run-marker';
         }
         const answerMarker = verdictLine.match(/\(run marker:\s*(pg-run-[A-Za-z0-9.-]+)\s*\)/i)?.[1] ?? null;
         if (!answerMarker) return 'target-answer-marker-missing';

@@ -504,6 +504,14 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
   exit 0
 fi
 
+# Organizer locks are marker-unique and held for at most 95s. Sweep crash-left flock files and
+# mkdir fallbacks at the first write-capable boundary so artifact recovery and every --harvest path
+# self-heal too. --status exits above and remains strictly read-only; fresh locks survive one day.
+find "${PRO_GATE_ORGANIZER_LOCK_DIR:-$PRO_GATE_HOME/organizer-locks}" \
+  -mindepth 1 -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
+find "${PRO_GATE_ORGANIZER_LOCK_DIR:-$PRO_GATE_HOME/organizer-locks}" \
+  -mindepth 1 -maxdepth 1 -type d -mmin +1440 -exec rm -rf {} + 2>/dev/null || true
+
 PORT="${ORACLE_BROWSER_PORT:-9222}"
 # v0.28 (gate #54 r10): normalize the binding policy ONCE, fail-closed — "true"/"2"/typos
 # satisfied neither the =1 nor the =0 branch and bypassed both enforcement modes.
@@ -1756,11 +1764,6 @@ EFF_CONC="$(pg_ramp_level "$MAX_CONC")"
 # file's inode alive, so deleting an unheld file is always safe).
 find "$(dirname "$LOCKFILE")" -maxdepth 1 -name "$(basename "$LOCKFILE").pr-*" -mmin +1440 -delete 2>/dev/null || true
 find "${PRO_GATE_HARVEST_LOCK_DIR:-$PRO_GATE_HOME/harvest-locks}" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
-# Organizer locks are marker-unique and held for at most 95s. A one-day threshold cannot touch a
-# live holder, but bounds both flock files and crash-left mkdir fallbacks that would otherwise grow
-# forever because no future run normally reuses the same marker.
-find "${PRO_GATE_ORGANIZER_LOCK_DIR:-$PRO_GATE_HOME/organizer-locks}" -mindepth 1 -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
-find "${PRO_GATE_ORGANIZER_LOCK_DIR:-$PRO_GATE_HOME/organizer-locks}" -mindepth 1 -maxdepth 1 -type d -mmin +1440 -exec rm -rf {} + 2>/dev/null || true
 find "$(pg_active_dir)" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
 find "$(pg_manifest_dir)" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
 # #50 item 4: conversation-urls memos get the same time-based hygiene as every other state

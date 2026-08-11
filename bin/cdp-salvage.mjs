@@ -614,6 +614,16 @@ function lastExactMarkerAt(text, wanted) {
   return found;
 }
 const hasExactMarker = (text, wanted) => !!text && lastExactMarkerAt(text, wanted) >= 0;
+function lastExactRunMarkerAt(text) {
+  let found = -1;
+  for (const match of text.matchAll(/pg-run-[A-Za-z0-9.-]+/g)) {
+    const at = match.index;
+    const before = at > 0 ? text[at - 1] : '';
+    const after = text[at + match[0].length] ?? '';
+    if (!isRunMarkerChar(before) && !isRunMarkerChar(after)) found = at;
+  }
+  return found;
+}
 
 function terminalVerdict(text) {
   const lines = text.split('\n');
@@ -660,8 +670,9 @@ function finalizerOwnership(text) {
   const verdict = terminalVerdict(text);
   if (!verdict) return { owned: false, reason: 'answer-incomplete' };
   const promptMarkerAt = lastExactMarkerAt(text.slice(0, verdict.at), marker);
-  if (promptMarkerAt < 0 || lastExactMarkerAt(text.slice(verdict.at + verdict.line.length), marker) >= 0) {
-    return { owned: false, reason: 'answer-incomplete' };
+  if (promptMarkerAt < 0) return { owned: false, reason: 'answer-incomplete' };
+  if (lastExactRunMarkerAt(text.slice(verdict.at + verdict.line.length)) >= 0) {
+    return { owned: false, reason: 'newer-run-marker' };
   }
   const answerMarker = verdict.line.match(/\(run marker:\s*(pg-run-[A-Za-z0-9.-]+)\s*\)/i)?.[1] ?? null;
   if (!answerMarker) return { owned: false, reason: 'answer-marker-missing' };
