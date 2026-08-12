@@ -1027,6 +1027,40 @@ check 'watchdog-killed stall after lifecycle stays charged' \
 check 'watchdog-killed stall after lifecycle never announces a refund' \
   "$(! grep -q 'refunding this round' "$TDIR/stderr"; echo $?)" "$(tail -6 "$TDIR/stderr")"
 
+# Gate #72 r13 P1: the inner `timeout` can kill Oracle at HARD_SECS while output keeps flowing, so
+# the stall watchdog never fires and the run exits through the NORMAL wait path. tee still returns 0
+# there, so only the producer's own status can reveal that the stream was cut off. Thresholds are
+# set above HARD_SECS deliberately: this must be the timeout's kill, not the watchdog's.
+cat > "$TDIR/bin/oracle-hardcap" <<'FAKE_HARDCAP'
+#!/usr/bin/env bash
+[ "${1:-}" = session ] && exit 1
+count=0
+[ -s "${PG_TEST_ATTEMPTS_FILE:?}" ] && count="$(cat "$PG_TEST_ATTEMPTS_FILE")"
+printf '%s\n' "$((count + 1))" > "$PG_TEST_ATTEMPTS_FILE"
+while :; do printf 'still working\n'; sleep 1; done
+FAKE_HARDCAP
+chmod +x "$TDIR/bin/oracle-hardcap"
+HARDCAP_HOME="$TDIR/home-hardcap"; HARDCAP_ATTEMPTS="$TDIR/hardcap-attempts"
+mkdir -p "$HARDCAP_HOME"; : > "$HARDCAP_ATTEMPTS"
+RKEY_926="$(printf '%s-926' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+env PRO_GATE_HOME="$HARDCAP_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
+  PRO_GATE_MAX_RETRIES=1 PRO_GATE_RETRY_BACKOFF=0 PRO_GATE_STALL_SECS=600 \
+  PRO_GATE_NOTHINK_SECS=600 PRO_GATE_TIMEOUT_GRACE=1 PRO_GATE_REATTACH_TIMEOUT=1 \
+  PRO_GATE_SALVAGE_SECS=2 PRO_GATE_RUN_LOGS=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-hardcap" \
+  PG_TEST_ATTEMPTS_FILE="$HARDCAP_ATTEMPTS" NODE_OPTIONS= \
+  bash "$ENGINE" --pr 926 --repo "$TDIR" --diff "$TDIR/small.diff" \
+  --out "$HARDCAP_HOME/o-hardcap.md" --timeout 2s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'hard-cap timeout kill exits 6' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -4 "$TDIR/stderr")"
+check 'hard-cap timeout kill invokes Oracle exactly once' \
+  "$([ "$(cat "$HARDCAP_ATTEMPTS")" = 1 ]; echo $?)" "attempts=$(cat "$HARDCAP_ATTEMPTS")"
+check 'hard-cap timeout kill stays charged' \
+  "$([ -s "$HARDCAP_HOME/rounds/$RKEY_926" ]; echo $?)" "rounds=$(cat "$HARDCAP_HOME/rounds/$RKEY_926" 2>/dev/null)"
+check 'hard-cap timeout kill never announces a refund' \
+  "$(! grep -q 'refunding this round' "$TDIR/stderr"; echo $?)" "$(tail -5 "$TDIR/stderr")"
+
 # Gate #72 r11 P1: Oracle is a GRANDCHILD of the watchdog's job, so killing the wrappers would
 # reparent it and let it keep driving the browser after this run's slot and locks are released.
 # A TERM-ignoring Oracle is the honest test: only a process-group kill reaches it.

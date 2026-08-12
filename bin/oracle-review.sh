@@ -2058,10 +2058,13 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
       wait "$_producer" ) \
         | "$TEE_BIN" -a "$RUNLOG" "$transcript" | stdbuf -oL sed 's/^/[oracle] /' >&2
     _pipeline_status=("${PIPESTATUS[@]}")
-    # Publish the proof ONLY when tee drained to EOF successfully. That success is precisely what
-    # separates "Oracle printed no browser lifecycle" from "the log was never written" or "the log
-    # was cut off mid-stream", and only the first may authorize a duplicate retry or a round refund.
-    if [ "${_pipeline_status[1]:-1}" -eq 0 ]; then
+    # Publish ONLY when tee drained to EOF AND Oracle exited on its OWN. tee's success proves we
+    # captured the stream; the producer's status proves the stream was finished. A producer that was
+    # timed out or signalled (124, or 128+signal) was interrupted mid-flight, and an interrupted Node
+    # process loses queued stdout — so a lifecycle line it had already written can be missing.
+    # This covers the killer the watchdog never sees: the inner TIMEOUT_BIN reaching HARD_SECS while
+    # output still flows, which exits through the normal wait path (gate #72 r13 P1).
+    if [ "${_pipeline_status[1]:-1}" -eq 0 ] && [ "${_pipeline_status[0]:-1}" -lt 124 ]; then
       pg_publish_log_proof "$transcript" "$proof" || true
     fi
     [ "${_pipeline_status[1]:-1}" -eq 0 ] && [ "${_pipeline_status[2]:-1}" -eq 0 ] \
