@@ -1000,6 +1000,33 @@ check 'watchdog-killed stall still refunds its round' \
 check 'watchdog-killed stall leaves no in-window spend' \
   "$([ ! -s "$STALL_HOME/rounds/$RKEY_922" ]; echo $?)" "rounds=$(cat "$STALL_HOME/rounds/$RKEY_922" 2>/dev/null)"
 
+# The converse, and the one that matters: a stall that ALREADY printed browser lifecycle must stay
+# charged. That line is only in the transcript because tee drained to EOF after the producer died;
+# killing tee with the pipeline would drop it and turn a spent send into a refunded duplicate.
+cat > "$TDIR/bin/oracle-stall-landed" <<'FAKE_STALL_LANDED'
+#!/usr/bin/env bash
+[ "${1:-}" = session ] && exit 1
+printf 'Launching browser mode\nAcquired ChatGPT browser slot\n'
+sleep 120
+FAKE_STALL_LANDED
+chmod +x "$TDIR/bin/oracle-stall-landed"
+SLANDED_HOME="$TDIR/home-stall-landed"; mkdir -p "$SLANDED_HOME"
+RKEY_923="$(printf '%s-923' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+env PRO_GATE_HOME="$SLANDED_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
+  PRO_GATE_MAX_RETRIES=0 PRO_GATE_STALL_SECS=1 PRO_GATE_REATTACH_TIMEOUT=1 \
+  PRO_GATE_SALVAGE_SECS=2 PRO_GATE_RUN_LOGS=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-stall-landed" \
+  NODE_OPTIONS= \
+  bash "$ENGINE" --pr 923 --repo "$TDIR" --diff "$TDIR/small.diff" \
+  --out "$SLANDED_HOME/o-stall-landed.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'watchdog-killed stall after lifecycle exits 6' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -4 "$TDIR/stderr")"
+check 'watchdog-killed stall after lifecycle stays charged' \
+  "$([ -s "$SLANDED_HOME/rounds/$RKEY_923" ]; echo $?)" "rounds=$(cat "$SLANDED_HOME/rounds/$RKEY_923" 2>/dev/null)"
+check 'watchdog-killed stall after lifecycle never announces a refund' \
+  "$(! grep -q 'refunding this round' "$TDIR/stderr"; echo $?)" "$(tail -6 "$TDIR/stderr")"
+
 # v0.32: Oracle 0.17+ stores prompt-commit state only after dispatching Send/Enter. Even a complete
 # all-negative DOM probe cannot prove ChatGPT rejected that request, so browser-lifecycle evidence
 # must suppress retries and retain the round regardless of metadata completeness or landing URL.

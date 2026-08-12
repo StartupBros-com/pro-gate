@@ -2021,9 +2021,10 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
   local strategy="$1" job started size last_size last_change now last_line prc
   local transcript="$WORK/oracle.${#ORACLE_LOG_TRANSCRIPTS[@]}.log"
   local proof="$WORK/oracle.${#ORACLE_LOG_TRANSCRIPTS[@]}.sha256"
+  local producer_file="${transcript%.log}.pid" producer drained
   ORACLE_LOG_TRANSCRIPTS+=("$transcript")
   ORACLE_LOG_PROOFS+=("$proof")
-  rm -f "$transcript" "$proof"
+  rm -f "$transcript" "$proof" "$producer_file"
   # v0.16 (#873 lesson): a watchdog-killed attempt leaves its session record
   # status "running", and oracle's duplicate-prompt guard then blocks the
   # engine's OWN retry of the same prompt/slug. Retries only happen after the
@@ -2032,18 +2033,27 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
   # escape hatch for this state.
   local force_args=()
   [ "${attempt:-0}" -gt 0 ] && force_args+=(--force)
-  ( stdbuf -oL -eL "$TIMEOUT_BIN" --signal=TERM --kill-after=30 "$HARD_SECS" \
-      "$ORACLE_BIN" "${ENGINE_ARGS[@]}" -m "$MODEL" \
-      --browser-model-strategy "$strategy" ${force_args[0]:+"${force_args[@]}"} \
-      --slug "pro gate review pr ${PR_NUM:-diff}" \
-      "${URL_ARGS[@]}" "${FILE_ARGS[@]}" \
-      -p "$(cat "$PROMPT_FILE")" \
-      --no-notify --timeout "$TIMEOUT" \
-      --write-output "$CAPTURE_OUT" 2>&1 | "$TEE_BIN" -a "$RUNLOG" "$transcript" | stdbuf -oL sed 's/^/[oracle] /' >&2
+  # Oracle runs as its OWN reapable job inside the pipeline, and publishes its pid. The watchdog
+  # kills only that producer, so tee always reaches EOF and reports whether it captured everything
+  # (gate #72 r10 P1) — killing tee instead leaves a prefix that is immutable but NOT complete.
+  ( ( stdbuf -oL -eL "$TIMEOUT_BIN" --signal=TERM --kill-after=30 "$HARD_SECS" \
+        "$ORACLE_BIN" "${ENGINE_ARGS[@]}" -m "$MODEL" \
+        --browser-model-strategy "$strategy" ${force_args[0]:+"${force_args[@]}"} \
+        --slug "pro gate review pr ${PR_NUM:-diff}" \
+        "${URL_ARGS[@]}" "${FILE_ARGS[@]}" \
+        -p "$(cat "$PROMPT_FILE")" \
+        --no-notify --timeout "$TIMEOUT" \
+        --write-output "$CAPTURE_OUT" 2>&1 &
+      _producer=$!
+      printf '%s\n' "$_producer" > "$producer_file.tmp" 2>/dev/null \
+        && mv -f "$producer_file.tmp" "$producer_file" 2>/dev/null \
+        || rm -f "$producer_file.tmp" 2>/dev/null
+      wait "$_producer" ) \
+        | "$TEE_BIN" -a "$RUNLOG" "$transcript" | stdbuf -oL sed 's/^/[oracle] /' >&2
     _pipeline_status=("${PIPESTATUS[@]}")
     # Publish the proof ONLY when tee drained to EOF successfully. That success is precisely what
-    # separates "Oracle printed no browser lifecycle" from "the log was never written", and only
-    # the former may authorize a duplicate retry or a round refund.
+    # separates "Oracle printed no browser lifecycle" from "the log was never written" or "the log
+    # was cut off mid-stream", and only the first may authorize a duplicate retry or a round refund.
     if [ "${_pipeline_status[1]:-1}" -eq 0 ]; then
       pg_publish_log_proof "$transcript" "$proof" || true
     fi
@@ -2094,25 +2104,26 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
     else
       continue
     fi
-    pkill -TERM -P "$job" 2>/dev/null; kill -TERM "$job" 2>/dev/null
-    sleep 5
-    pkill -KILL -P "$job" 2>/dev/null; kill -KILL "$job" 2>/dev/null
-    wait "$job" 2>/dev/null
-    # The kill above targets the subshell itself, so it never reaches its own proof publication.
-    # Publish from here instead, or EVERY watchdog-killed attempt would forfeit the pre-browser
-    # retry/refund it earned before v0.32 (an unintended over-charge on the exact stall this
-    # watchdog exists for). Sound because the transcript is final and complete at this point: the
-    # pipeline is reaped (no writer remains), the stall branch only fires after STALL_SECS with
-    # ZERO log growth, and the no-think branch only fires minutes after any lifecycle line would
-    # have been written and flushed — so a lifecycle line cannot be hiding in a lost tail. When
-    # the no-think probe DID find a live conversation, LIVE_CONVERSATION/THROTTLED already fail
-    # the predicate on their own evidence, independent of this transcript.
-    # The guard covers tee's one asymmetric failure mode: it keeps writing its other operand after
-    # one fails, so a transcript that is EMPTY while the shared log holds bytes is a failed capture
-    # wearing the shape of a quiet run. Refuse to certify that; an over-charge is the safe error.
-    if [ -s "$transcript" ] || [ ! -s "$RUNLOG" ]; then
-      pg_publish_log_proof "$transcript" "$proof" || true
+    # Stop ONLY Oracle and let the rest of the pipeline finish on its own: tee then reads EOF,
+    # flushes, and exits 0, which is what lets the subshell publish a proof that means "complete",
+    # not merely "immutable". Killing tee here instead would silently drop anything still buffered
+    # between Oracle and tee — including a browser-lifecycle line printed just before the kill —
+    # and that lost line is the difference between a charged send and a duplicate retry + refund.
+    producer=""
+    [ -r "$producer_file" ] && IFS= read -r producer < "$producer_file" 2>/dev/null
+    if [ -n "$producer" ]; then
+      kill -TERM "$producer" 2>/dev/null
+      drained=0
+      while [ "$drained" -lt 30 ] && kill -0 "$job" 2>/dev/null; do sleep 1; drained=$((drained + 1)); done
     fi
+    # Refused to drain (or the pid was never published): fall back to the blunt kill and publish
+    # NOTHING, so the attempt stays charged rather than resting on a possibly-truncated capture.
+    if kill -0 "$job" 2>/dev/null; then
+      pkill -TERM -P "$job" 2>/dev/null; kill -TERM "$job" 2>/dev/null
+      sleep 5
+      pkill -KILL -P "$job" 2>/dev/null; kill -KILL "$job" 2>/dev/null
+    fi
+    wait "$job" 2>/dev/null
     return 124
   done
   wait "$job"
