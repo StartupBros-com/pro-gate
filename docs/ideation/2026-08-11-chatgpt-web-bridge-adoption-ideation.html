@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ideation: ChatGPT-Web Bridge Adoption vs pro-gate</title>
+<link rel="stylesheet" href="https://fonts.bunny.net/css?family=inter:400,500,600,700|jetbrains-mono:400,500">
+<style>
+  :root{
+    --bg:#fbfbfa; --surface:#ffffff; --ink:#1a1a19; --ink-soft:#5c5c58; --ink-faint:#8a8a84;
+    --line:#e4e3df; --line-soft:#efeeea;
+    --accent:#1f5f4f; --accent-soft:#e8f2ee; --accent-text:#14453a;
+    --warn:#8a5a12; --warn-soft:#fbf1de; --warn-text:#6b4409;
+    --stop:#8f2f2f; --stop-soft:#fbeaea; --stop-text:#6f2020;
+    --info:#2a4d7a; --info-soft:#e9f0f9; --info-text:#1e3a5e;
+    --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+    --sans:"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    --radius:7px;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#16171a; --surface:#1d1f23; --ink:#ececea; --ink-soft:#a8a8a3; --ink-faint:#7d7d78;
+      --line:#2e3136; --line-soft:#26282c;
+      --accent:#6fc0a8; --accent-soft:#1b2f2a; --accent-text:#8fd6c0;
+      --warn:#d8a552; --warn-soft:#312816; --warn-text:#e5be76;
+      --stop:#d98080; --stop-soft:#331e1e; --stop-text:#e79b9b;
+      --info:#84b0e0; --info-soft:#1b2735; --info-text:#a3c6ef;
+    }
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg); color:var(--ink); font-family:var(--sans);
+    font-size:15.5px; line-height:1.62; -webkit-font-smoothing:antialiased;
+    font-feature-settings:"cv05","ss01";
+  }
+  .page{max-width:58rem; margin-inline:auto; padding:3.5rem 1.5rem 5rem}
+  p,li{max-width:70ch}
+  .eyebrow{
+    font-size:.7rem; letter-spacing:.13em; text-transform:uppercase; font-weight:600;
+    color:var(--accent-text); margin:0 0 .5rem;
+  }
+  h1{font-size:2.05rem; line-height:1.2; letter-spacing:-.022em; margin:0 0 .6rem; font-weight:700}
+  h2{
+    font-size:1.32rem; letter-spacing:-.014em; margin:3.2rem 0 1rem; font-weight:650;
+    padding-bottom:.45rem; border-bottom:2px solid var(--line);
+  }
+  h3{font-size:1.06rem; margin:0 0 .3rem; font-weight:650; letter-spacing:-.008em}
+  h4{font-size:.9rem; margin:1.4rem 0 .4rem; font-weight:650; color:var(--ink-soft)}
+  a{color:var(--accent-text); text-underline-offset:2px}
+  code{
+    font-family:var(--mono); font-size:.855em; background:var(--line-soft);
+    padding:.1em .36em; border-radius:4px; word-break:break-word;
+  }
+  .lede{font-size:1.06rem; color:var(--ink-soft); margin:0 0 1.6rem}
+  .meta{
+    display:flex; flex-wrap:wrap; gap:.45rem; margin:0 0 2rem; padding:0; list-style:none;
+  }
+  .meta li{
+    font-size:.78rem; font-family:var(--mono); background:var(--surface);
+    border:1px solid var(--line); border-radius:99px; padding:.24rem .7rem; color:var(--ink-soft);
+  }
+  .meta li b{font-weight:500; color:var(--ink-faint); font-family:var(--sans)}
+  .stats{
+    display:grid; grid-template-columns:repeat(auto-fit,minmax(8.5rem,1fr)); gap:.65rem;
+    margin:0 0 2.4rem;
+  }
+  .stat{
+    background:var(--surface); border:1px solid var(--line); border-radius:var(--radius);
+    padding:.8rem .9rem;
+  }
+  .stat .n{font-size:1.5rem; font-weight:680; letter-spacing:-.02em; display:block; line-height:1.15}
+  .stat .l{font-size:.71rem; text-transform:uppercase; letter-spacing:.08em; color:var(--ink-faint); font-weight:600}
+  .card{
+    background:var(--surface); border:1px solid var(--line); border-radius:var(--radius);
+    padding:1.25rem 1.35rem; margin:0 0 1.1rem;
+  }
+  .idea{scroll-margin-top:1.5rem}
+  .idea-head{display:flex; gap:.7rem; align-items:baseline; flex-wrap:wrap; margin-bottom:.65rem}
+  .idchip{
+    font-family:var(--mono); font-size:.76rem; font-weight:600; background:var(--accent-soft);
+    color:var(--accent-text); border:1px solid var(--accent-soft); border-radius:99px;
+    padding:.16rem .58rem; flex:none;
+  }
+  .chips{display:flex; flex-wrap:wrap; gap:.4rem; margin:.75rem 0 0}
+  .chip{
+    font-size:.735rem; font-family:var(--mono); border-radius:99px; padding:.18rem .6rem;
+    border:1px solid transparent;
+  }
+  .chip.axis{background:var(--info-soft); color:var(--info-text); border-color:var(--info-soft)}
+  .chip.conf{background:var(--accent-soft); color:var(--accent-text); border-color:var(--accent-soft)}
+  .chip.cx{background:var(--warn-soft); color:var(--warn-text); border-color:var(--warn-soft)}
+  dl.fields{margin:.9rem 0 0; display:grid; grid-template-columns:auto 1fr; gap:.42rem .9rem}
+  dl.fields dt{
+    font-size:.7rem; text-transform:uppercase; letter-spacing:.08em; font-weight:700;
+    color:var(--ink-faint); padding-top:.16rem;
+  }
+  dl.fields dd{margin:0; max-width:68ch}
+  ul.jump{
+    list-style:none; padding:.85rem 1rem; margin:0 0 1.6rem; background:var(--surface);
+    border:1px solid var(--line); border-radius:var(--radius); display:grid; gap:.28rem;
+  }
+  ul.jump li{font-size:.87rem; max-width:none}
+  ul.jump a{text-decoration:none; color:var(--ink-soft)}
+  ul.jump a:hover{color:var(--accent-text); text-decoration:underline}
+  ul.jump .n{font-family:var(--mono); color:var(--ink-faint); font-size:.8rem; margin-right:.45rem}
+  table{border-collapse:collapse; width:100%; font-size:.885rem; margin:1rem 0}
+  th,td{text-align:left; padding:.52rem .7rem; border-bottom:1px solid var(--line); vertical-align:top}
+  th{
+    font-size:.71rem; text-transform:uppercase; letter-spacing:.07em; color:var(--ink-faint);
+    font-weight:700; border-bottom:2px solid var(--line);
+  }
+  td:first-child{white-space:nowrap; font-family:var(--mono); font-size:.83rem; color:var(--ink-faint)}
+  .callout{
+    border-radius:var(--radius); padding:.95rem 1.1rem; margin:1.2rem 0; border:1px solid transparent;
+  }
+  .callout .lab{
+    font-size:.69rem; text-transform:uppercase; letter-spacing:.11em; font-weight:700;
+    display:block; margin-bottom:.3rem;
+  }
+  .callout p{margin:.3rem 0 0}
+  .callout.warn{background:var(--warn-soft); border-color:var(--warn-soft)}
+  .callout.warn .lab{color:var(--warn-text)}
+  .callout.warn, .callout.warn p{color:var(--warn-text)}
+  .callout.info{background:var(--info-soft); border-color:var(--info-soft)}
+  .callout.info .lab{color:var(--info-text)}
+  .callout.info, .callout.info p{color:var(--info-text)}
+  .callout.stop{background:var(--stop-soft); border-color:var(--stop-soft)}
+  .callout.stop .lab{color:var(--stop-text)}
+  .callout.stop, .callout.stop p{color:var(--stop-text)}
+  figure{margin:1.3rem 0; padding:0}
+  figure svg{display:block; width:100%; height:auto; max-width:100%}
+  figcaption{font-size:.79rem; color:var(--ink-faint); margin-top:.5rem; max-width:70ch}
+  footer.composition-signal{
+    margin-top:4rem; padding-top:1.1rem; border-top:1px solid var(--line);
+    font-size:.775rem; color:var(--ink-faint); font-family:var(--mono);
+  }
+  @media (max-width:620px){
+    dl.fields{grid-template-columns:1fr; gap:.1rem .5rem}
+    dl.fields dt{margin-top:.6rem}
+    .page{padding:2.2rem 1.1rem 3.5rem}
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+<p class="eyebrow">Ideation · Repo-grounded</p>
+<h1>ChatGPT-Web Bridge Adoption vs pro-gate</h1>
+<p class="lede">Three community projects were proposed as overlapping with pro-gate's oracle bridge. Analysis of their source found that none is adoptable wholesale — but a fourth project, surfaced during research, holds the exact signal pro-gate deferred a year of work on.</p>
+
+<ul class="meta">
+  <li><b>date</b> <time datetime="2026-08-11">2026-08-11</time></li>
+  <li><b>topic</b> chatgpt-web-bridge-adoption</li>
+  <li><b>mode</b> repo-grounded</li>
+  <li><b>focus</b> cherry-pick vs adopt vs side-by-side vs consolidate</li>
+</ul>
+
+<div class="stats">
+  <div class="stat"><span class="n">4</span><span class="l">Projects analysed</span></div>
+  <div class="stat"><span class="n">40</span><span class="l">Raw candidates</span></div>
+  <div class="stat"><span class="n">7</span><span class="l">Survivors</span></div>
+  <div class="stat"><span class="n">33</span><span class="l">Cut</span></div>
+  <div class="stat"><span class="n">5</span><span class="l">Axes covered</span></div>
+</div>
+
+<h2 id="grounding">Grounding Context</h2>
+
+<h4>Codebase Context</h4>
+<p>pro-gate runs a final-tier ChatGPT Pro code review of a GitHub PR. It shells out to the <code>oracle</code> CLI to submit a prompt into a logged-in Chrome session (<code>bin/oracle-review.sh:1777-1785</code>), and when oracle's own capture fails it falls back to its own raw-CDP client <code>bin/cdp-salvage.mjs</code>, which runs <code>Runtime.evaluate</code> on <code>document.body.innerText</code> over the tab's <code>webSocketDebuggerUrl</code>. Both paths therefore read <em>rendered text</em>.</p>
+<p>Its design tenets are review-only authority (the gate never merges or writes code; a separate trusted fixer applies findings), fail-closed and recover-explicit, and — decisively for this analysis — <strong>the browser-driven model gets no filesystem or shell access</strong>. It receives a diff bundle plus a PR URL and returns text findings. The reason for driving a browser at all is that the Pro reasoning tier is web-UI-only, with no API.</p>
+<p>Run state is flat files under <code>$PRO_GATE_HOME</code> keyed by repo-scoped PR identity: <code>in-progress/</code> reservations, <code>rounds/*.hist</code>, <code>conversation-urls/</code> memos, <code>crossbound/</code> mis-bind proofs, write-once <code>completed/</code>, and an append-only <code>ledger.jsonl</code>. The project carries zero npm dependencies today.</p>
+
+<h4>Operational pain the candidates were measured against</h4>
+<p>For the twelve days to 2026-08-03, every clean run completed via salvage or harvest rather than primary capture — oracle's own capture succeeded on 0 of 22 runs on one day. The root cause is that oracle finalizes an assistant turn on the first visual settle, while Pro's UX is multi-phase: a preamble streams, briefly settles, then minutes of thinking follow before the real answer. A short preamble gets finalized as the review. An adversarial review concluded DOM-only proof is asymptotic rather than convergent and prescribed "network lifecycle completion, else fail closed" — and that branch was explicitly paused and never taken.</p>
+<p>Separately, cross-bind incidents occurred twice in production where a harvested capture was genuinely another PR's review, because ownership was decided from a marker that rides the submitted prompt. The recorded lesson was "ownership requires the ANSWER, not the marker."</p>
+
+<h4>Orchestrator-verified probe</h4>
+<p>Installed <code>oracle --version</code> is 0.17.2. Grepping its shipped bundle for <code>event-stream</code> returns zero files, and CDP <code>Network.*</code> appears only in <code>browser/index.js</code>, <code>projectSourcesRunner.js</code> and the Gemini executor — never in the assistant-response capture path. oracle's completion detection is DOM-only in both the local fork and current upstream.</p>
+
+<h4>What the four projects actually are</h4>
+<table>
+  <thead><tr><th>Project</th><th>What it is</th><th>Maturity</th></tr></thead>
+  <tbody>
+    <tr><td>devspace-local-artifacts</td><td>MCP server exposing local filesystem and shell to ChatGPT web over a user-run tunnel, behind one shared static "Owner password". Shell runs as the local user.</td><td>One squashed commit dated 2026-08-08, single author, no releases; a fork of <code>Waishnav/devspace</code>. Real CI, 26 test files.</td></tr>
+    <tr><td>local-mcp</td><td>Rust MCP server: file read/write, dir listing, sandboxed and unsandboxed exec. <strong>stdio JSON-RPC only</strong> — no HTTP or tunnel code at all, and no authentication whatsoever.</td><td>13 days old, 13 commits, single maintainer. No sandbox on Windows. <code>Cargo.toml</code> says Apache-2.0 while <code>LICENSE</code> says MIT.</td></tr>
+    <tr><td>codex-chatgpt-web</td><td>Local server presenting ChatGPT Web/Pro as a backend in Codex's model picker. Completion is DOM-based (<code>copy-turn-action-button</code> visible, stable 2000ms). Stall aborts the whole turn with no partial recovery; <code>rolling-checkpoint</code> is context compaction, not salvage.</td><td>Substantial and well-tested, but a different product shape and thousands of Electron/CDP-entangled lines.</td></tr>
+    <tr><td>rosetta (found in research)</td><td>Explicitly "extends oracle's playbook." Reads the network stream, not the DOM, and verifies completion against the conversation message graph over REST.</td><td>v0.3.2, 14 releases in ~3.5 months, MIT, 1113 lines of tests including a dedicated completion-gate suite. Single maintainer, ~62 downloads/week.</td></tr>
+  </tbody>
+</table>
+
+<div class="callout warn">
+  <span class="lab">Corrected during verification</span>
+  <p>Three claims that appeared in generation did not survive the adversarial pass and are <em>not</em> relied on below. <code>age_secs</code> is not "tracked but unused" — <code>bin/oracle-review.sh:202</code> gates <code>ST_RECOVERABLE</code> on it. <code>VERDICT_RE</code> is <em>already</em> tolerant of <code>**VERDICT:**</code> drift per its own comment, so that regression is fixed. And the widely-repeated claim that local-MCP tool access is structurally unavailable on ChatGPT Pro could not be verified — devspace's own README documents ChatGPT web plus custom MCP connectors working over a tunnel. The recommendation to decline those two projects therefore rests on tenet conflict, which is provable from their own documentation, not on the platform-tier claim.</p>
+</div>
+
+<h2 id="axes">Topic Axes</h2>
+<ol>
+  <li><strong>Capture reliability</strong> — completion detection, preamble-vs-final, stall, salvage/harvest/checkpoint</li>
+  <li><strong>Transport &amp; session</strong> — oracle CLI, raw CDP, network interception, MCP connector, local API shim</li>
+  <li><strong>Payload bounding</strong> — diff size, compaction, chunking, the 6k cook threshold and 25k hard max</li>
+  <li><strong>Trust &amp; blast radius</strong> — tunnels, filesystem/shell exposure, ToS posture, credential surface</li>
+  <li><strong>Scope &amp; product shape</strong> — one-shot review gate vs interactive backend; consolidate vs side-by-side; single-maintainer dependency risk</li>
+</ol>
+
+<h2 id="ideas">Ranked Ideas</h2>
+
+<ul class="jump">
+  <li><a href="#i1"><span class="n">1.</span>Read the conversation graph, not the rendered page</a></li>
+  <li><a href="#i2"><span class="n">2.</span>Vendor two zero-dependency files at a pinned rev</a></li>
+  <li><a href="#i3"><span class="n">3.</span>Adopt the REST leg; decline the live-CoT WebSocket</a></li>
+  <li><a href="#i4"><span class="n">4.</span>Treat the four projects as a supply chain, not a shortlist</a></li>
+  <li><a href="#i5"><span class="n">5.</span>Record the standing decline of local filesystem/shell exposure</a></li>
+  <li><a href="#i6"><span class="n">6.</span>Token-aware payload bounding with periodic recalibration</a></li>
+  <li><a href="#i7"><span class="n">7.</span>A separate consult skill on rosetta's capture layer</a></li>
+</ul>
+
+<article class="card idea" id="i1">
+  <div class="idea-head"><span class="idchip">1</span><h3>Read the conversation graph, not the rendered page</h3></div>
+  <p>Replace "the page looks settled" as pro-gate's completion oracle with a structural contract evaluated against ChatGPT's own conversation message graph, fetched over REST. Rosetta's <code>evaluateProTurnCompletion</code> requires a terminal node with <code>content_type: "text"</code>, <code>recipient: "all"</code>, <code>status: "finished_successfully"</code>, <code>end_turn: true</code> and <code>finish_details.type: "stop"</code> that is a <em>graph descendant</em> of a <code>reasoning_recap</code> node carrying <code>reasoning_status: "reasoning_ended"</code> — rejecting the candidate if any <code>is_reasoning</code> node is a sibling or graph-incomparable branch, and failing closed with an explicit <code>INCOMPLETE Pro turn</code> rather than guessing.</p>
+  <p>The same fetch also carries <code>metadata.turn_exchange_id</code>, which rosetta keys ownership on. That is a graph field, not a substring in rendered text, so it settles cross-bind at the same time and by the same mechanism. Operationally this makes in-run polling the normal completion path and returns harvest to being genuine crash recovery — though harvest must stay, because long runs also stall for reasons unrelated to completion timing.</p>
+  <figure>
+    <svg viewBox="0 0 720 268" role="img" aria-label="Contrast between reading rendered page text and reading the conversation graph">
+      <style>
+        .dt{font:600 11.5px "Inter",sans-serif}
+        .db{font:11px "Inter",sans-serif}
+        .dm{font:10.5px "JetBrains Mono",monospace}
+        .halo{paint-order:stroke fill; stroke:#fbfbfa; stroke-width:2.5px}
+      </style>
+      <rect x="1" y="1" width="349" height="266" rx="8" fill="#fbeaea" stroke="#e2c4c4"/>
+      <rect x="370" y="1" width="349" height="266" rx="8" fill="#e8f2ee" stroke="#bcd9cf"/>
+      <text x="18" y="26" class="dt" fill="#6f2020">TODAY — rendered text is the oracle</text>
+      <text x="387" y="26" class="dt" fill="#14453a">PROPOSED — the graph is the oracle</text>
+
+      <rect x="18" y="42" width="313" height="34" rx="5" fill="#fff" stroke="#e2c4c4"/>
+      <text x="30" y="63" class="dm" fill="#6f2020">document.body.innerText</text>
+      <rect x="18" y="90" width="313" height="30" rx="5" fill="#fff" stroke="#e2c4c4"/>
+      <text x="30" y="109" class="db" fill="#6f2020">"stop button gone + text stable" → done?</text>
+      <path d="M174 76 L174 90" stroke="#8f2f2f" stroke-width="1.4" marker-end="url(#ar)"/>
+
+      <rect x="18" y="140" width="150" height="30" rx="5" fill="#fff" stroke="#e2c4c4"/>
+      <text x="28" y="159" class="db" fill="#6f2020">preamble finalized</text>
+      <rect x="181" y="140" width="150" height="30" rx="5" fill="#fff" stroke="#e2c4c4"/>
+      <text x="191" y="159" class="db" fill="#6f2020">wrong PR's review</text>
+      <path d="M120 120 L80 140" stroke="#8f2f2f" stroke-width="1.4" marker-end="url(#ar)"/>
+      <path d="M228 120 L256 140" stroke="#8f2f2f" stroke-width="1.4" marker-end="url(#ar)"/>
+
+      <rect x="18" y="192" width="313" height="56" rx="5" fill="#f6dede" stroke="#e2c4c4"/>
+      <text x="30" y="212" class="db halo" fill="#6f2020">0 of 22 primary captures on one day;</text>
+      <text x="30" y="229" class="db halo" fill="#6f2020">2 production cross-binds. Both symptoms</text>
+      <text x="30" y="243" class="db halo" fill="#6f2020">of one cause.</text>
+
+      <rect x="387" y="42" width="313" height="34" rx="5" fill="#fff" stroke="#bcd9cf"/>
+      <text x="399" y="63" class="dm" fill="#14453a">/backend-api/conversation/&lt;id&gt;</text>
+      <rect x="387" y="90" width="313" height="30" rx="5" fill="#fff" stroke="#bcd9cf"/>
+      <text x="399" y="109" class="db" fill="#14453a">reasoning_recap → terminal text node</text>
+      <path d="M543 76 L543 90" stroke="#1f5f4f" stroke-width="1.4" marker-end="url(#ag)"/>
+
+      <rect x="387" y="140" width="150" height="30" rx="5" fill="#fff" stroke="#bcd9cf"/>
+      <text x="397" y="159" class="db" fill="#14453a">completion proven</text>
+      <rect x="550" y="140" width="150" height="30" rx="5" fill="#fff" stroke="#bcd9cf"/>
+      <text x="560" y="159" class="db" fill="#14453a">ownership proven</text>
+      <path d="M489 120 L449 140" stroke="#1f5f4f" stroke-width="1.4" marker-end="url(#ag)"/>
+      <path d="M597 120 L625 140" stroke="#1f5f4f" stroke-width="1.4" marker-end="url(#ag)"/>
+
+      <rect x="387" y="192" width="313" height="56" rx="5" fill="#dcece5" stroke="#bcd9cf"/>
+      <text x="399" y="212" class="db halo" fill="#14453a">Ambiguity fails closed as INCOMPLETE,</text>
+      <text x="399" y="229" class="db halo" fill="#14453a">never a guess. turn_exchange_id is a</text>
+      <text x="399" y="243" class="db halo" fill="#14453a">graph field, not a text substring.</text>
+
+      <defs>
+        <marker id="ar" markerWidth="7" markerHeight="7" refX="5.5" refY="3" orient="auto">
+          <path d="M0,0 L6,3 L0,6 z" fill="#8f2f2f"/></marker>
+        <marker id="ag" markerWidth="7" markerHeight="7" refX="5.5" refY="3" orient="auto">
+          <path d="M0,0 L6,3 L0,6 z" fill="#1f5f4f"/></marker>
+      </defs>
+    </svg>
+    <figcaption>Directional contrast. Two failure classes that are separately engineered around today share one cause: the authority for both "is it done" and "is it mine" is text scraped off a rendered page.</figcaption>
+  </figure>
+  <dl class="fields">
+    <dt>Basis</dt><dd><code>direct:</code> <code>pro-final.ts:49-52</code> states plainly that "<code>end_turn</code>, <code>finished_successfully</code>, stream terminators, and <code>create_time</code> ordering are not completion proof. Pro can emit several short progress texts carrying both flags and then resume reasoning" — an independent rediscovery of pro-gate's own preamble bug. Ownership keys on <code>message.metadata?.turn_exchange_id !== turnExchangeId</code>, confirmed verbatim. Against this, the orchestrator probe confirms oracle 0.17.2 ships zero <code>event-stream</code> references.</dd>
+    <dt>Rationale</dt><dd>pro-gate's own postmortem prescribed exactly this signal class and then paused the branch for scope. A tested, MIT-licensed reference implementation removes the reason the branch stayed paused. Because the fix replaces the <em>authority</em> rather than adding another heuristic, the stall watchdog, salvage and nonce guard become backstops instead of the load-bearing path.</dd>
+    <dt>Downsides</dt><dd>It fixes two of the three bug classes it is tempting to bundle — VERDICT extraction still needs a text scan, because <code>VERDICT:</code> is pro-gate's own prompt convention, not a ChatGPT API field. It also binds pro-gate to an undocumented internal response shape that can change without notice, so it needs its own fail-closed path. New glue is required to capture <code>turn_exchange_id</code> at submission time.</dd>
+    <dt>Confidence</dt><dd>90%</dd>
+    <dt>Complexity</dt><dd>Medium</dd>
+  </dl>
+  <div class="chips"><span class="chip axis">Capture reliability</span><span class="chip conf">Confidence 90%</span><span class="chip cx">Complexity Medium</span></div>
+</article>
+
+<article class="card idea" id="i2">
+  <div class="idea-head"><span class="idchip">2</span><h3>Vendor two zero-dependency files at a pinned rev</h3></div>
+  <p>Take rosetta as source, not as a runtime dependency and not as a transport replacement. Copy <code>src/pro-final.ts</code> and <code>src/sse.ts</code> into pro-gate at a pinned upstream revision, with attribution, and leave oracle owning launch, authentication, navigation, model selection and submission. This is the narrowest form of idea 1 that still gets the whole benefit.</p>
+  <table>
+    <thead><tr><th>Option</th><th>Cost</th><th>Verdict</th></tr></thead>
+    <tbody>
+      <tr><td>Replace oracle</td><td><code>client.ts</code> is 2055 lines and entangled with CDP and auth; oracle's submit, navigate and model-pick legs have no near-standalone equivalent</td><td>Refuted — not low blast radius</td></tr>
+      <tr><td>npm dependency</td><td>Would be pro-gate's first-ever npm dependency, on a ~62-download/week single-maintainer package</td><td>Rejected — cost out of proportion</td></tr>
+      <tr><td>Vendor 2 files pinned</td><td>Two files, no build step, attribution and a pinned rev to diff against upstream</td><td><strong>Recommended</strong></td></tr>
+    </tbody>
+  </table>
+  <dl class="fields">
+    <dt>Basis</dt><dd><code>direct:</code> verification opened both files: <code>pro-final.ts</code> has <em>zero</em> import statements and <code>sse.ts</code> has one type-only import; neither touches <code>client.ts</code>. The verifier copied <code>pro-final.ts</code> into this repo and ran it under plain <code>node</code> (24.12) — it executed with no build step and no transpile. License is MIT at <code>package.json:61</code>. <code>external:</code> local-mcp itself sets the precedent, pinning Codex's sandbox crates to a fixed upstream git rev rather than reimplementing them.</dd>
+    <dt>Rationale</dt><dd>pro-gate ships with zero dependencies and a "one engine, thin surfaces" tenet. Vendoring preserves both while capturing the mechanism, and the failure mode if the upstream maintainer stalls is that nothing happens — the vendored copy keeps working. Verification also found the auth question dissolves: pro-gate's existing <code>Runtime.evaluate</code>-against-an-authenticated-tab pattern can issue an in-page <code>fetch()</code> that is automatically credentialed, so rosetta's Node-side header-capture machinery is not needed at all.</dd>
+    <dt>Downsides</dt><dd>Vendored code drifts silently unless someone diffs the pinned rev periodically, and pro-gate inherits maintenance of a wire format it does not control. Attribution and license notice must be handled properly in a distributed tool.</dd>
+    <dt>Confidence</dt><dd>85%</dd>
+    <dt>Complexity</dt><dd>Low</dd>
+  </dl>
+  <div class="chips"><span class="chip axis">Transport &amp; session</span><span class="chip conf">Confidence 85%</span><span class="chip cx">Complexity Low</span></div>
+</article>
+
+<article class="card idea" id="i3">
+  <div class="idea-head"><span class="idchip">3</span><h3>Adopt the REST leg; decline the live-CoT WebSocket</h3></div>
+  <p>Rosetta has two capture legs, and they are separable. The REST poll of <code>/backend-api/conversation/&lt;id&gt;</code> reads the same conversation a signed-in human sees rendered. The second leg opens its own WebSocket to <code>wss://ws.chatgpt.com</code> and reads live chain-of-thought frames the UI never displays. Take the first; do not take the second.</p>
+  <figure>
+    <svg viewBox="0 0 720 210" role="img" aria-label="Rosetta's two capture legs and which one to adopt">
+      <style>
+        .lt{font:600 11.5px "Inter",sans-serif}
+        .lb{font:11px "Inter",sans-serif}
+        .lm{font:10.5px "JetBrains Mono",monospace}
+      </style>
+      <rect x="272" y="14" width="176" height="34" rx="5" fill="#fff" stroke="#c9c8c3"/>
+      <text x="299" y="35" class="lt" fill="#1a1a19">ChatGPT Pro session</text>
+
+      <path d="M320 48 L190 82" stroke="#1f5f4f" stroke-width="1.6" marker-end="url(#a2)"/>
+      <path d="M400 48 L530 82" stroke="#8f2f2f" stroke-width="1.6" marker-end="url(#a3)"/>
+
+      <rect x="26" y="84" width="300" height="104" rx="6" fill="#e8f2ee" stroke="#bcd9cf"/>
+      <text x="42" y="106" class="lt" fill="#14453a">ADOPT · REST completion poll</text>
+      <text x="42" y="127" class="lm" fill="#14453a">/backend-api/conversation/&lt;id&gt;</text>
+      <text x="42" y="147" class="lb" fill="#14453a">Same content the signed-in user sees</text>
+      <text x="42" y="163" class="lb" fill="#14453a">rendered. Carries the completion</text>
+      <text x="42" y="179" class="lb" fill="#14453a">contract and turn_exchange_id.</text>
+
+      <rect x="394" y="84" width="300" height="104" rx="6" fill="#fbeaea" stroke="#e2c4c4"/>
+      <text x="410" y="106" class="lt" fill="#6f2020">DECLINE · live-CoT WebSocket</text>
+      <text x="410" y="127" class="lm" fill="#6f2020">wss://ws.chatgpt.com</text>
+      <text x="410" y="147" class="lb" fill="#6f2020">Reasoning frames the UI never shows.</text>
+      <text x="410" y="163" class="lb" fill="#6f2020">Further from "automating what a human</text>
+      <text x="410" y="179" class="lb" fill="#6f2020">sees" on a scarce account.</text>
+
+      <defs>
+        <marker id="a2" markerWidth="7" markerHeight="7" refX="5.5" refY="3" orient="auto">
+          <path d="M0,0 L6,3 L0,6 z" fill="#1f5f4f"/></marker>
+        <marker id="a3" markerWidth="7" markerHeight="7" refX="5.5" refY="3" orient="auto">
+          <path d="M0,0 L6,3 L0,6 z" fill="#8f2f2f"/></marker>
+      </defs>
+    </svg>
+    <figcaption>Directional only. The reliability benefit lives almost entirely in the left leg, so the two decisions should be made separately rather than adopted as one bundle.</figcaption>
+  </figure>
+  <dl class="fields">
+    <dt>Basis</dt><dd><code>direct:</code> verification confirmed <code>evaluateProTurnCompletion</code> takes only a <code>ConversationMapping</code> — a REST JSON payload — and never references <code>sse.ts</code> or anything WebSocket-related. The two legs are provably separable in code. <code>reasoned:</code> OpenAI's terms bar "any method to extract data from the Services, including web scraping … other than as permitted through the API." Reading content that has no rendered-UI equivalent sits further from the "automating what a human sees" reading than DOM scraping does, on an account pro-gate already treats as a scarce shared resource.</dd>
+    <dt>Rationale</dt><dd>The whole reliability argument for idea 1 rests on the completion contract, and that contract is fed entirely by REST. Adopting the WebSocket leg would add account risk for no capture benefit. Making this an explicit boundary now stops it being quietly crossed later during implementation.</dd>
+    <dt>Downsides</dt><dd>The ToS reading is forum-sourced rather than adjudicated, so the distinction is a judgment call rather than a settled legal line — and pro-gate's existing DOM extraction already sits on the same spectrum. Declining the WebSocket also gives up live progress visibility during long reasoning runs.</dd>
+    <dt>Confidence</dt><dd>90%</dd>
+    <dt>Complexity</dt><dd>Low</dd>
+  </dl>
+  <div class="chips"><span class="chip axis">Trust &amp; blast radius</span><span class="chip conf">Confidence 90%</span><span class="chip cx">Complexity Low</span></div>
+</article>
+
+<article class="card idea" id="i4">
+  <div class="idea-head"><span class="idchip">4</span><h3>Treat the four projects as a supply chain, not a shortlist</h3></div>
+  <p>The question as posed — cherry-pick, adopt, run side-by-side, or consolidate — assumes the projects compete for one slot. They do not. Each owns a different subsystem, and no two solve the same problem, so the right output is four separate verdicts rather than one vote.</p>
+  <figure>
+    <svg viewBox="0 0 720 232" role="img" aria-label="Each project mapped to the subsystem it owns and its verdict">
+      <style>
+        .st{font:600 11.5px "Inter",sans-serif}
+        .sb{font:10.8px "Inter",sans-serif}
+      </style>
+      <text x="20" y="20" class="st" fill="#8a8a84">PROJECT</text>
+      <text x="220" y="20" class="st" fill="#8a8a84">SUBSYSTEM IT OWNS</text>
+      <text x="530" y="20" class="st" fill="#8a8a84">VERDICT</text>
+
+      <rect x="16" y="32" width="688" height="44" rx="5" fill="#e8f2ee" stroke="#bcd9cf"/>
+      <text x="30" y="52" class="st" fill="#14453a">rosetta</text>
+      <text x="30" y="68" class="sb" fill="#14453a">(found in research)</text>
+      <text x="220" y="60" class="sb" fill="#14453a">Completion proof + turn ownership</text>
+      <text x="530" y="60" class="st" fill="#14453a">Vendor 2 files</text>
+
+      <rect x="16" y="82" width="688" height="40" rx="5" fill="#e9f0f9" stroke="#c3d5ea"/>
+      <text x="30" y="107" class="st" fill="#1e3a5e">codex-chatgpt-web</text>
+      <text x="220" y="100" class="sb" fill="#1e3a5e">Interactive backend; token ceilings;</text>
+      <text x="220" y="115" class="sb" fill="#1e3a5e">real-turn smoke test as liveness check</text>
+      <text x="530" y="107" class="st" fill="#1e3a5e">Learn from</text>
+
+      <rect x="16" y="128" width="688" height="44" rx="5" fill="#fbeaea" stroke="#e2c4c4"/>
+      <text x="30" y="148" class="st" fill="#6f2020">devspace-local-artifacts</text>
+      <text x="30" y="164" class="sb" fill="#6f2020">1 commit, 3 days old</text>
+      <text x="220" y="156" class="sb" fill="#6f2020">Local fs/shell exposure over a tunnel</text>
+      <text x="530" y="156" class="st" fill="#6f2020">Decline</text>
+
+      <rect x="16" y="178" width="688" height="44" rx="5" fill="#fbeaea" stroke="#e2c4c4"/>
+      <text x="30" y="198" class="st" fill="#6f2020">local-mcp</text>
+      <text x="30" y="214" class="sb" fill="#6f2020">stdio only, no auth</text>
+      <text x="220" y="206" class="sb" fill="#6f2020">OS-level sandboxing of local exec</text>
+      <text x="530" y="206" class="st" fill="#6f2020">Decline</text>
+    </svg>
+    <figcaption>Directional only. Evaluated as "which one do we adopt," the likely error is picking the most visually impressive option and missing that a two-file extraction is the only one that touches pro-gate's actual chronic pain.</figcaption>
+  </figure>
+  <dl class="fields">
+    <dt>Basis</dt><dd><code>reasoned:</code> cross-referencing each project's own description shows no overlap in the problem solved: rosetta owns capture and completion; devspace owns tool exposure, widgets and working-tree checkpoints; local-mcp owns OS-level sandboxing of local execution; codex-chatgpt-web owns an interactive multi-turn backend with its own token-ceiling and liveness machinery. Only rosetta's subsystem is one pro-gate is currently doing badly.</dd>
+    <dt>Rationale</dt><dd>This reframing is what makes the other six ideas coherent rather than competing. It also explains why "consolidate into a meta-skill" is the wrong shape here: there is no shared surface to consolidate, only one component to import and three verdicts to record.</dd>
+    <dt>Downsides</dt><dd>Four separate verdicts are more work to communicate than one, and the framing risks implying every project must yield something — three of the four yield nothing pro-gate should ship.</dd>
+    <dt>Confidence</dt><dd>85%</dd>
+    <dt>Complexity</dt><dd>Low</dd>
+  </dl>
+  <div class="chips"><span class="chip axis">Scope &amp; product shape</span><span class="chip conf">Confidence 85%</span><span class="chip cx">Complexity Low</span></div>
+</article>
+
+<article class="card idea" id="i5">
+  <div class="idea-head"><span class="idchip">5</span><h3>Record the standing decline of local filesystem/shell exposure</h3></div>
+  <p>Write a decision record, in the same <code>docs/solutions/conventions/</code> shape as the existing ship-the-legible-core convention, stating that exposing local filesystem or shell to the browser-driven model is out of scope for pro-gate — so the next trending repo in this genre does not restart the evaluation from zero. This is the fourth such project in a single research pass.</p>
+  <div class="callout stop">
+    <span class="lab">Ground the decline on the tenet, not the platform claim</span>
+    <p>The tempting justification — that Pro-tier accounts cannot use write-capable MCP at all — is external, unverified, and contradicted by devspace's own README documenting ChatGPT web plus custom connectors working over a tunnel. The durable justification needs no external claim: both projects' own docs confirm arbitrary shell and filesystem access for the driving model, which directly contradicts pro-gate's stated tenet. A decision record that cites the unverified platform claim will rot the moment OpenAI changes tiering.</p>
+  </div>
+  <dl class="fields">
+    <dt>Basis</dt><dd><code>direct:</code> devspace's <code>docs/security.md:86-87</code> states shell commands "can do what your user account can do," and the same docs say the tunnel URL should not be treated as a secret — leaving one shared static password as the only barrier. local-mcp's <code>session_id</code> is validated for character legality rather than secrecy and is designed to be pasted into a chat prompt, and <code>/permissions yolo</code> makes unsandboxed shell silent. Against these, pro-gate's own tenet is that the browser-driven model gets no filesystem or shell access.</dd>
+    <dt>Rationale</dt><dd>pro-gate already has a precedent for recording a considered "no": three automations were each built, gate-reviewed over two to three rounds, then dropped when new real problems kept surfacing. Recording this decline once, with the evidence attached, is far cheaper than re-litigating it per trending repo — and it prevents the review effort being spent on devspace's genuinely well-built parts under a premise that does not apply.</dd>
+    <dt>Downsides</dt><dd>A standing "no" can calcify: if ChatGPT's connector model or pro-gate's own scope changes materially, the record needs revisiting rather than citing. It should name the tenet it depends on so the revisit trigger is obvious.</dd>
+    <dt>Confidence</dt><dd>85%</dd>
+    <dt>Complexity</dt><dd>Low</dd>
+  </dl>
+  <div class="chips"><span class="chip axis">Trust &amp; blast radius</span><span class="chip conf">Confidence 85%</span><span class="chip cx">Complexity Low</span></div>
+</article>
+
+<article class="card idea" id="i6">
+  <div class="idea-head"><span class="idchip">6</span><h3>Token-aware payload bounding with periodic recalibration</h3></div>
+  <p>pro-gate decides whether a diff will fit by counting lines. Replace that with a token estimate measured against an empirically discovered transport ceiling, and re-measure the ceiling periodically rather than hardcoding it — the real wall drifts the same way selectors drift.</p>
+  <dl class="fields">
+    <dt>Basis</dt><dd><code>direct:</code> bounding today is purely <code>DIFF_LINES</code> against three line-count environment variables, and the code's own comment concedes the proxy is weak: "984-1402-line diffs complete in 12-21 min; a ~10k-line diff reasoned 65 min then had to be harvested." <code>external:</code> codex-chatgpt-web binary-searched the actual limit rather than assuming it — <code>CHATGPT_LUNA_BROWSER_INPUT_TOKEN_BUDGET = 28_000</code>, annotated as empirically measured, with the same payload shape accepted at 25,400 and 28,547 estimated tokens but rejected at 32,283, and identified as a browser transport boundary rather than a model context limit. <code>external:</code> the structure matches Path MTU Discovery: probe an undocumented ceiling rather than assume one.</dd>
+    <dt>Rationale</dt><dd>Line count and token count diverge sharply by content — dense minified diffs versus sparse source — so the current threshold both wastes slots cooking payloads that would have fit and lets doomed payloads cook anyway. Since each mistake costs a real Pro slot on a serialized single-account resource, a preflight estimate converts a blind spend into a cheap rejection.</dd>
+    <dt>Downsides</dt><dd>Needs a tokenizer pro-gate does not currently carry, and codex-chatgpt-web's specific 28k figure is for a different tier and will not transfer as a constant. The calibration probe itself costs slots to run. The correlation is unproven for pro-gate's own traffic, so this warrants an instrumented measure-first pass — log token estimate alongside line count for a while — before any threshold changes.</dd>
+    <dt>Confidence</dt><dd>70%</dd>
+    <dt>Complexity</dt><dd>Medium</dd>
+  </dl>
+  <div class="chips"><span class="chip axis">Payload bounding</span><span class="chip conf">Confidence 70%</span><span class="chip cx">Complexity Medium</span></div>
+</article>
+
+<article class="card idea" id="i7">
+  <div class="idea-head"><span class="idchip">7</span><h3>A separate consult skill on rosetta's capture layer</h3></div>
+  <p>If interactive Pro consults are wanted — asking a design question mid-session, sanity-checking an approach — build that as its own small skill on the same vendored capture layer, deliberately outside pro-gate's authority model. Do not add an interactive mode to the review gate.</p>
+  <dl class="fields">
+    <dt>Basis</dt><dd><code>direct:</code> pro-gate's tenet is review-only authority, and its reviewer agent is instructed never to edit files, apply patches, stage or commit. Its entire engineered-around-failure list — stall watchdog, nonce guard, harvest, round governor — assumes a bounded, single-shot, text-only exchange. <code>external:</code> codex-chatgpt-web demonstrates real demand for Pro-as-interactive-backend, which is its whole product.</dd>
+    <dt>Rationale</dt><dd>Folding interactive consulting into the review gate would blur the one boundary that keeps pro-gate's failure modes tractable. A separate skill also lets the vendored capture layer be exercised on a low-stakes surface before it is trusted inside a terminal merge gate.</dd>
+    <dt>Downsides</dt><dd>Speculative — no demand for this has been demonstrated in pro-gate's own usage, and it should be sequenced strictly after ideas 1 through 3 prove the capture layer works. Note that building it on codex-chatgpt-web's turn machinery instead would be a much larger undertaking: that code is Electron- and CDP-entangled across thousands of lines, not portable like rosetta's two files.</dd>
+    <dt>Confidence</dt><dd>60%</dd>
+    <dt>Complexity</dt><dd>Medium</dd>
+  </dl>
+  <div class="chips"><span class="chip axis">Scope &amp; product shape</span><span class="chip conf">Confidence 60%</span><span class="chip cx">Complexity Medium</span></div>
+</article>
+
+<h2 id="rejections">Rejection Summary</h2>
+<table>
+  <thead><tr><th>#</th><th>Idea</th><th>Reason Rejected</th></tr></thead>
+  <tbody>
+    <tr><td>R1</td><td>Retire the oracle CLI, embed rosetta as the transport</td><td>Refuted — <code>client.ts</code> is 2055 lines entangled with CDP and auth; oracle's submit/navigate/model-pick legs have no standalone equivalent. Superseded by idea 2.</td></tr>
+    <tr><td>R2</td><td>Depend on <code>@syntaxsmith/rosetta</code> as an npm package</td><td>Would be pro-gate's first-ever npm dependency, on a ~62-download/week single-maintainer package. Vendoring gets the same benefit at lower risk.</td></tr>
+    <tr><td>R3</td><td>Fresh Temporary Chat per turn to make cross-bind impossible</td><td>Trades away a proven capability — harvest saved 46 of 200 runs before v0.25 — and harvest stays necessary regardless, since long runs also stall via a silent detached worker. Idea 1 gets the cross-bind fix without the trade.</td></tr>
+    <tr><td>R4</td><td>Kill the VERDICT regex, read the field instead</td><td>Overstated — <code>VERDICT_RE</code> already tolerates <code>**VERDICT:**</code> drift per its own comment, and <code>VERDICT:</code> is pro-gate's own prompt convention, not a ChatGPT API field, so no graph field replaces it.</td></tr>
+    <tr><td>R5</td><td>Weight harvest trust by <code>age_secs</code></td><td>Refuted on fact — <code>age_secs</code> is already used: <code>bin/oracle-review.sh:202</code> gates <code>ST_RECOVERABLE</code> on it and <code>:465</code> surfaces it in <code>--status</code>.</td></tr>
+    <tr><td>R6</td><td>Adopt devspace's <code>GIT_INDEX_FILE</code> working-tree checkpoint</td><td>Solves a different problem — snapshotting a live dirty working tree across many tool calls. pro-gate reviews a fixed <code>gh pr diff</code> artifact and needs hash-and-compare, not snapshotting.</td></tr>
+    <tr><td>R7</td><td>Structured throttle classification in the ledger</td><td>Already largely implemented — <code>pg_ramp_update()</code> turns a throttle outcome into concurrency ramp level plus a cooldown file, not a bare exit code.</td></tr>
+    <tr><td>R8</td><td>Audit the CDP port against devspace's tunnel threat model</td><td>Solves a threat pro-gate does not have — the CDP port is loopback-only (<code>127.0.0.1</code>) and never tunneled.</td></tr>
+    <tr><td>R9</td><td>Externalize harvest as a Temporal-style durable workflow</td><td>Scope wildly disproportionate to a zero-dependency bash and node CLI, and contradicts the project's own demonstrated pattern of rejecting this class of complexity.</td></tr>
+    <tr><td>R10</td><td>Add a fast pre-filter tier before the Pro gate</td><td>Already implemented one layer up — pro-gate is documented as the terminal gate that runs after CE personas and cloud review have already run.</td></tr>
+    <tr><td>R11</td><td>Batch several PRs into one weekly bundled submission</td><td>Premise does not match reality — pro-gate is one account, one review at a time, continuously serialized; scarcity is governed by the round governor, not a weekly ration.</td></tr>
+    <tr><td>R12</td><td>Compact the diff before letting it cook</td><td>pro-gate declares the diff authoritative ground truth; compacting it risks hiding code from the reviewer, which conflicts with that design.</td></tr>
+    <tr><td>R13</td><td>Isolate the ChatGPT credential from the review process</td><td>Solves a risk this design does not carry — pro-gate's reviewer has no tool-calling agency, so there are no keys for it to hold.</td></tr>
+    <tr><td>R14</td><td>Publish account-risk base rates from the ledger</td><td>Fails the meeting test — unfalsifiable framing, no connection to pro-gate's actual chronic pain.</td></tr>
+    <tr><td>R15</td><td>Build a shared cross-project ChatGPT capture library</td><td>Repeats a failure pattern the project has already lived through three times; bank it as a spec'd issue instead of building a fourth reinvention solo.</td></tr>
+    <tr><td>R16</td><td>Extract a general "ChatGPT-Pro session broker" meta-skill</td><td>No cited technical basis, and premature abstraction of a single caller unless idea 7 is greenlit first.</td></tr>
+    <tr><td>R17</td><td>Segregate local-tool bridges onto a separate ChatGPT account</td><td>Moot — mitigates the blast radius of a pattern idea 5 declines outright.</td></tr>
+    <tr><td>R18</td><td>Confirmed/probable capture confidence tiers</td><td>A naming and framing device rather than an actionable change; the underlying signal question is settled by idea 1.</td></tr>
+    <tr><td>R19</td><td>Federate review slots across maintainer machines</td><td>No concrete mechanism stated; unassessable as written.</td></tr>
+    <tr><td>R20</td><td>Gate pre-PR using devspace's worktree primitive</td><td>Scope overrun — changes when the gate runs, on the same weak basis as R6.</td></tr>
+    <tr><td>R21</td><td>Treat ToS conservatism as the filter over maintenance health</td><td>False dichotomy — both are legitimate independent risk axes; idea 3 handles the ToS question directly.</td></tr>
+    <tr><td>—</td><td>Duplicates across frames</td><td>Four agents independently proposed the network-completion swap and four proposed declining the MCP-tunnel pattern; merged into ideas 1 and 5 respectively.</td></tr>
+  </tbody>
+</table>
+
+<footer class="composition-signal">Composed 2026-08-11 by ce-ideate from user prompt (three GitHub projects + two X posts), grounded against <code>StartupBros-com/pro-gate</code> @ worktree <code>ideate-chatgpt-web-bridges</code>. 40 raw candidates from 5 ideation frames, filtered through one fresh-context adversarial verifier.</footer>
+
+</div>
+</body>
+</html>
