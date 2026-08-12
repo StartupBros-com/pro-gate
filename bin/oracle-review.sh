@@ -2036,7 +2036,9 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
   # Oracle runs as its OWN reapable job inside the pipeline, and publishes its pid. The watchdog
   # kills only that producer, so tee always reaches EOF and reports whether it captured everything
   # (gate #72 r10 P1) — killing tee instead leaves a prefix that is immutable but NOT complete.
-  ( ( stdbuf -oL -eL "$TIMEOUT_BIN" --signal=TERM --kill-after=30 "$HARD_SECS" \
+  ( ( set -m   # job control: the producer leads its OWN process group, so one signal reaches
+                # `timeout`, Oracle, and the browser client it drives (gate #72 r11 P1).
+      stdbuf -oL -eL "$TIMEOUT_BIN" --signal=TERM --kill-after=30 "$HARD_SECS" \
         "$ORACLE_BIN" "${ENGINE_ARGS[@]}" -m "$MODEL" \
         --browser-model-strategy "$strategy" ${force_args[0]:+"${force_args[@]}"} \
         --slug "pro gate review pr ${PR_NUM:-diff}" \
@@ -2045,6 +2047,11 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
         --no-notify --timeout "$TIMEOUT" \
         --write-output "$CAPTURE_OUT" 2>&1 &
       _producer=$!
+      set +m
+      # If the pid never reaches the sidecar the watchdog cannot target this group, so the blunt
+      # fallback signals THIS shell instead. Take the producer's group down with us rather than
+      # letting the wrappers die and reparent a live Oracle onto init.
+      trap 'pg_signal_producer TERM "$_producer"; sleep 2; pg_signal_producer KILL "$_producer"' TERM HUP INT
       printf '%s\n' "$_producer" > "$producer_file.tmp" 2>/dev/null \
         && mv -f "$producer_file.tmp" "$producer_file" 2>/dev/null \
         || rm -f "$producer_file.tmp" 2>/dev/null
@@ -2112,18 +2119,27 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
     producer=""
     [ -r "$producer_file" ] && IFS= read -r producer < "$producer_file" 2>/dev/null
     if [ -n "$producer" ]; then
-      kill -TERM "$producer" 2>/dev/null
+      pg_signal_producer TERM "$producer"
       drained=0
       while [ "$drained" -lt 30 ] && kill -0 "$job" 2>/dev/null; do sleep 1; drained=$((drained + 1)); done
     fi
-    # Refused to drain (or the pid was never published): fall back to the blunt kill and publish
-    # NOTHING, so the attempt stays charged rather than resting on a possibly-truncated capture.
+    # Refused to drain (or the pid was never published): publish NOTHING, so the attempt stays
+    # charged rather than resting on a possibly-truncated capture. Take Oracle's process group down
+    # FIRST and reap it: the wrappers are only its parents, and killing them alone would reparent a
+    # live Oracle that keeps driving the browser after this run's slot and locks are released
+    # (gate #72 r11 P1). The inner shell's TERM trap covers the case where no pid was published.
     if kill -0 "$job" 2>/dev/null; then
+      pg_signal_producer KILL "$producer"
       pkill -TERM -P "$job" 2>/dev/null; kill -TERM "$job" 2>/dev/null
       sleep 5
+      pg_signal_producer KILL "$producer"
       pkill -KILL -P "$job" 2>/dev/null; kill -KILL "$job" 2>/dev/null
     fi
     wait "$job" 2>/dev/null
+    # Unconditional, even when the pipeline drained cleanly: `timeout` exits on TERM, so a
+    # signal-ignoring Oracle can be left holding the browser while its wrappers die tidily and the
+    # drain looks successful. This attempt is over — nothing from its group may outlive it.
+    pg_signal_producer KILL "$producer"
     return 124
   done
   wait "$job"

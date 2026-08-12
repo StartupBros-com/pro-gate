@@ -1474,6 +1474,20 @@ pg_sha256() {  # <file>: echo the hex digest, or nothing when no tool is availab
   elif pg_have openssl; then openssl dgst -sha256 "$1" 2>/dev/null | awk '{print $NF}'
   fi
 }
+# pg_signal_producer <signal> <pid>: signal Oracle's whole PROCESS GROUP, falling back to the pid
+# plus its direct children when it does not lead one. Oracle sits under `timeout` and itself drives
+# a browser client, so signalling the bare pid can leave grandchildren running after the engine has
+# released the account slot and its locks — an orphan that keeps using the browser we just freed.
+pg_signal_producer() {
+  local sig="$1" pid="$2"
+  [ -n "$pid" ] || return 0
+  case "$pid" in ''|*[!0-9]*) return 0 ;; esac
+  kill -"$sig" -- "-$pid" 2>/dev/null && return 0
+  pkill -"$sig" -P "$pid" 2>/dev/null
+  kill -"$sig" "$pid" 2>/dev/null
+  return 0
+}
+
 # pg_publish_log_proof <transcript> <digest-proof>: publish the digest that makes <transcript>
 # trustworthy evidence. Call this ONLY once no writer remains (the tee drained to EOF, or the
 # pipeline was killed AND reaped) — the proof asserts the transcript is final, so publishing it

@@ -1027,6 +1027,36 @@ check 'watchdog-killed stall after lifecycle stays charged' \
 check 'watchdog-killed stall after lifecycle never announces a refund' \
   "$(! grep -q 'refunding this round' "$TDIR/stderr"; echo $?)" "$(tail -6 "$TDIR/stderr")"
 
+# Gate #72 r11 P1: Oracle is a GRANDCHILD of the watchdog's job, so killing the wrappers would
+# reparent it and let it keep driving the browser after this run's slot and locks are released.
+# A TERM-ignoring Oracle is the honest test: only a process-group kill reaches it.
+cat > "$TDIR/bin/oracle-term-ignoring" <<'FAKE_TERM_IGNORE'
+#!/usr/bin/env bash
+[ "${1:-}" = session ] && exit 1
+trap '' TERM
+printf '%s\n' "$$" > "${PG_TEST_PRODUCER_PID:?}"
+printf 'Launching browser mode\n'
+sleep 300
+FAKE_TERM_IGNORE
+chmod +x "$TDIR/bin/oracle-term-ignoring"
+ORPHAN_HOME="$TDIR/home-orphan"; ORPHAN_PID="$TDIR/orphan-producer.pid"
+mkdir -p "$ORPHAN_HOME"; : > "$ORPHAN_PID"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+env PRO_GATE_HOME="$ORPHAN_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
+  PRO_GATE_MAX_RETRIES=0 PRO_GATE_STALL_SECS=1 PRO_GATE_REATTACH_TIMEOUT=1 \
+  PRO_GATE_SALVAGE_SECS=2 PRO_GATE_RUN_LOGS=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-term-ignoring" \
+  PG_TEST_PRODUCER_PID="$ORPHAN_PID" NODE_OPTIONS= \
+  bash "$ENGINE" --pr 924 --repo "$TDIR" --diff "$TDIR/small.diff" \
+  --out "$ORPHAN_HOME/o-orphan.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+ORPHAN_SEEN="$(cat "$ORPHAN_PID" 2>/dev/null)"
+check 'TERM-ignoring Oracle still terminates the attempt' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+check 'TERM-ignoring Oracle actually started (fixture sanity)' \
+  "$([ -n "$ORPHAN_SEEN" ]; echo $?)" "pid=$ORPHAN_SEEN"
+check 'TERM-ignoring Oracle leaves no surviving descendant' \
+  "$([ -n "$ORPHAN_SEEN" ] && ! kill -0 "$ORPHAN_SEEN" 2>/dev/null; echo $?)" "pid=$ORPHAN_SEEN"
+
 # v0.32: Oracle 0.17+ stores prompt-commit state only after dispatching Send/Enter. Even a complete
 # all-negative DOM probe cannot prove ChatGPT rejected that request, so browser-lifecycle evidence
 # must suppress retries and retain the round regardless of metadata completeness or landing URL.
