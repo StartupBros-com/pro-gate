@@ -71,22 +71,40 @@ OpenAI's documentation is internally contradictory as of 2026-08:
 The latter is treated as operative. **Confidence: probable, not verified.** The live check that
 would have settled it for this account aborted (see below).
 
-### The finding that changes something
+### The model's read scope today (and a retracted claim)
 
-The security skeptic proved pro-gate's own stated tenet does not describe the shipped system.
+**RETRACTION (2026-08-12, verified directly).** An earlier revision of this document asserted that
+pro-gate's README claims "the browser-driven model gets NO filesystem or shell access … it receives
+a diff bundle + PR URL," and that this was contradicted by the shipped code. **That tenet does not
+exist in this repo.** It originated as a research subagent's paraphrase, was carried into a later
+workflow brief as though it were quoted README text, and was then "refuted" by a security reviewer
+who was in fact refuting the paraphrase. Verified by direct read:
 
-> README tenet: "the browser-driven model gets NO filesystem or shell access … it receives a diff
-> bundle + PR URL and returns text findings."
+- `README.md:100` says only: "**Review-only authority.** The gate never merges, and committed work
+  stays on the branch at any stop; unresolved findings escalate to a human instead of triggering a
+  revert." That is a statement about *merge/write* authority, not read scope.
+- A repo-wide grep for `shell access`, `filesystem access`, `only the diff`, `diff bundle` across
+  `README.md`, `docs/`, `skills/`, `agents/` returns **no matches**.
 
-`bin/oracle-review.sh` hardcodes `INPUT="both"` and ships a live `@GitHub` connector directive
-instructing the Pro model to autonomously fetch "surrounding code, callers, tests, and history"
-beyond the diff. The model therefore has first-party read access beyond the diff bundle today.
+**There is no documentation inaccuracy, and no README edit is required.**
 
-**Verdict unchanged, framing overruled.** What was found is a first-party, OpenAI-hosted,
-*read-only* GitHub connector scoped to one PR's repo context — categorically different from a
-self-hosted MCP server exposing shell-as-the-local-user over a tunnel (devspace) or unauthenticated
-fs/exec (local-mcp). Declining new write/shell access stands on three independent grounds: the
-review-only tenet, the Pro-tier gating, and the blast radius of shipping this to other people.
+What *is* true, and worth recording because it is undocumented rather than misdocumented:
+
+- `bin/oracle-review.sh:46` defaults `INPUT="both"`.
+- `bin/oracle-review.sh:1422` sends: "@GitHub — use the GitHub connector for anything GitHub-related
+  in this review. Fetch this pull request and read its full diff plus the surrounding code, callers,
+  tests, and history directly from GitHub via the connector (do not answer from memory)."
+
+So the Pro model does read beyond the submitted diff, via a first-party OpenAI-hosted GitHub
+connector. That is categorically different from a self-hosted MCP server exposing shell-as-the-local
+-user over a tunnel (devspace) or unauthenticated fs/exec (local-mcp). Declining new write/shell
+access stands on three independent grounds: review-only authority, the Pro-tier gating, and the
+blast radius of shipping this to other people.
+
+**Lesson worth keeping:** a paraphrase that enters a multi-agent brief as a quotation will be
+reasoned about as fact by every downstream agent, and adversarial review does not catch it — the
+skeptics correctly refuted the claim they were given. Quote sources verbatim into agent briefs, or
+mark them explicitly as paraphrase.
 
 Also worth recording so it is not re-litigated wrongly: `docs/SETUP-NOTES.md` records the GitHub
 connector "CONFIRMED working" on the Pro tier pro-gate targets. **"Pro cannot use MCP tools" is
@@ -99,10 +117,11 @@ findings as text and a separate trusted local agent applies them. Inbound write 
 capability so much as remove a safety property — and it creates the textbook confused-deputy setup,
 since the model reads repo and web content and would then write files.
 
-**Actions (2):**
-1. Correct the tenet wording in `README.md` so it describes what actually ships.
-2. Audit and document the `@GitHub` connector's real OAuth grant scope — single-repo or org-wide.
-   Currently unaudited anywhere in the repo or docs.
+**Action (1):** audit and document the `@GitHub` connector's real OAuth grant scope — single-repo or
+org-wide. This is genuinely unaudited anywhere in the repo or docs, and it is the actual boundary of
+what the Pro model can read. It stands on its own merits, independent of the retracted claim above.
+
+(The previously listed README edit is withdrawn — see the retraction above.)
 
 ---
 
