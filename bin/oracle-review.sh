@@ -2140,6 +2140,14 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
     # signal-ignoring Oracle can be left holding the browser while its wrappers die tidily and the
     # drain looks successful. This attempt is over — nothing from its group may outlive it.
     pg_signal_producer KILL "$producer"
+    # A KILLED ATTEMPT NEVER CERTIFIES ITS TRANSCRIPT. Killing the producer also closes its pipe, so
+    # tee can reach EOF and the subshell can publish a proof — but we interrupted Oracle, and a Node
+    # process loses queued stdout on SIGKILL, so "tee succeeded" no longer implies "we saw
+    # everything Oracle sent". Rather than infer completeness from kill paths (three gate rounds,
+    # three races: #72 r10/r11/r12), revoke it outright. `wait` above reaped the only publisher, so
+    # nothing can re-create this. Refunds therefore require Oracle to have EXITED on its own —
+    # exactly the send/upload failure the refund was built for. A killed attempt stays charged.
+    rm -f "$proof" "$proof.tmp" 2>/dev/null
     return 124
   done
   wait "$job"

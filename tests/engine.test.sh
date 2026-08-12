@@ -995,10 +995,10 @@ env PRO_GATE_HOME="$STALL_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=
   --out "$STALL_HOME/o-stall.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
 RC=$?
 check 'watchdog-killed pre-browser stall exits 6' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -5 "$TDIR/stderr")"
-check 'watchdog-killed stall still refunds its round' \
-  "$(grep -q 'refunding this round' "$TDIR/stderr"; echo $?)" "$(tail -8 "$TDIR/stderr")"
-check 'watchdog-killed stall leaves no in-window spend' \
-  "$([ ! -s "$STALL_HOME/rounds/$RKEY_922" ]; echo $?)" "rounds=$(cat "$STALL_HOME/rounds/$RKEY_922" 2>/dev/null)"
+check 'watchdog-killed stall stays charged even with a lifecycle-free log' \
+  "$([ -s "$STALL_HOME/rounds/$RKEY_922" ]; echo $?)" "rounds=$(cat "$STALL_HOME/rounds/$RKEY_922" 2>/dev/null)"
+check 'watchdog-killed stall never announces a refund' \
+  "$(! grep -q 'refunding this round' "$TDIR/stderr"; echo $?)" "$(tail -8 "$TDIR/stderr")"
 
 # The converse, and the one that matters: a stall that ALREADY printed browser lifecycle must stay
 # charged. That line is only in the transcript because tee drained to EOF after the producer died;
@@ -1030,23 +1030,30 @@ check 'watchdog-killed stall after lifecycle never announces a refund' \
 # Gate #72 r11 P1: Oracle is a GRANDCHILD of the watchdog's job, so killing the wrappers would
 # reparent it and let it keep driving the browser after this run's slot and locks are released.
 # A TERM-ignoring Oracle is the honest test: only a process-group kill reaches it.
+# NOTE: `trap '' TERM; sleep N` is NOT TERM-proof — the group signal kills the sleep CHILD, the
+# script falls through, and the pipeline drains as if nothing were wrong, so the assertions below
+# would pass without testing anything. Block on a builtin read against a writer-less fifo instead:
+# no child to kill, no CPU burn, and only KILL ends it (verified: `timeout 3` cannot kill it).
 cat > "$TDIR/bin/oracle-term-ignoring" <<'FAKE_TERM_IGNORE'
 #!/usr/bin/env bash
 [ "${1:-}" = session ] && exit 1
 trap '' TERM
 printf '%s\n' "$$" > "${PG_TEST_PRODUCER_PID:?}"
 printf 'Launching browser mode\n'
-sleep 300
+exec 3<> "${PG_TEST_BLOCK_FIFO:?}"
+read -u 3 -r _
 FAKE_TERM_IGNORE
 chmod +x "$TDIR/bin/oracle-term-ignoring"
 ORPHAN_HOME="$TDIR/home-orphan"; ORPHAN_PID="$TDIR/orphan-producer.pid"
-mkdir -p "$ORPHAN_HOME"; : > "$ORPHAN_PID"
+ORPHAN_FIFO="$TDIR/orphan-block.fifo"
+RKEY_924="$(printf '%s-924' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
+mkdir -p "$ORPHAN_HOME"; : > "$ORPHAN_PID"; rm -f "$ORPHAN_FIFO"; mkfifo "$ORPHAN_FIFO"
 printf 'foreign idle tab\n' > "$TDIR/tab.txt"
 env PRO_GATE_HOME="$ORPHAN_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
   PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
   PRO_GATE_MAX_RETRIES=0 PRO_GATE_STALL_SECS=1 PRO_GATE_REATTACH_TIMEOUT=1 \
   PRO_GATE_SALVAGE_SECS=2 PRO_GATE_RUN_LOGS=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-term-ignoring" \
-  PG_TEST_PRODUCER_PID="$ORPHAN_PID" NODE_OPTIONS= \
+  PG_TEST_PRODUCER_PID="$ORPHAN_PID" PG_TEST_BLOCK_FIFO="$ORPHAN_FIFO" NODE_OPTIONS= \
   bash "$ENGINE" --pr 924 --repo "$TDIR" --diff "$TDIR/small.diff" \
   --out "$ORPHAN_HOME/o-orphan.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
 RC=$?
@@ -1056,6 +1063,12 @@ check 'TERM-ignoring Oracle actually started (fixture sanity)' \
   "$([ -n "$ORPHAN_SEEN" ]; echo $?)" "pid=$ORPHAN_SEEN"
 check 'TERM-ignoring Oracle leaves no surviving descendant' \
   "$([ -n "$ORPHAN_SEEN" ] && ! kill -0 "$ORPHAN_SEEN" 2>/dev/null; echo $?)" "pid=$ORPHAN_SEEN"
+# Same run also covers the BLUNT-fallback branch: the producer never drains, so the attempt is
+# force-killed. Its proof is revoked, so it must stay charged no matter how clean the log looks.
+check 'force-killed attempt stays charged' \
+  "$([ -s "$ORPHAN_HOME/rounds/$RKEY_924" ]; echo $?)" "rounds=$(cat "$ORPHAN_HOME/rounds/$RKEY_924" 2>/dev/null)"
+check 'force-killed attempt never announces a refund' \
+  "$(! grep -q 'refunding this round' "$TDIR/stderr"; echo $?)" "$(tail -5 "$TDIR/stderr")"
 
 # v0.32: Oracle 0.17+ stores prompt-commit state only after dispatching Send/Enter. Even a complete
 # all-negative DOM probe cannot prove ChatGPT rejected that request, so browser-lifecycle evidence

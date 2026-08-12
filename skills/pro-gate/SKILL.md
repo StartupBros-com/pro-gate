@@ -188,10 +188,11 @@ engine home is `$HOME/.pro-review-daemon`.
   converging gate therefore finishes without human overrides, and a churning one is cut
   sooner than the old flat 4. Setting `PRO_GATE_MAX_ROUNDS_PER_PR` explicitly pins the
   legacy flat cap (trajectory ignored). Harvests never count; a failure proven before Oracle's
-  browser lifecycle (complete, digest-verified Oracle transcript; browser scanned clean; no URL
-  memo, throttle, or restart) refunds its round automatically. Incomplete logging or post-click
-  uncertainty stays charged. This is the backstop, not the plan: design the gate around section
-  6's convergence policy so you rarely hit it.
+  browser lifecycle (Oracle EXITED on its own leaving a complete, digest-verified transcript;
+  browser scanned clean; no URL memo, throttle, or restart) refunds its round automatically.
+  Incomplete logging, post-click uncertainty, and any watchdog-KILLED attempt stay charged. This is
+  the backstop, not the plan: design the gate around section 6's convergence policy so you rarely
+  hit it.
 
 ## 3. Run the review
 
