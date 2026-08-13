@@ -69,8 +69,8 @@ verified-identical copy, both empirically run (not reasoned about):**
    absent from every field cited in `WIRE-SHAPE.md`, and absent from rosetta's own source and test
    suites entirely — `grep -rl current_node` across rosetta's `src/` and `tests/` returns
    nothing). Two independent, both-complete `recap → final` branches under the same
-   `turn_exchange_id` (a regenerate/retry — pro-gate reuses conversations across review rounds,
-   per its own architecture) cause the veto to reject **both** candidates
+   `turn_exchange_id` (an actual regenerate/retry; ordinary pro-gate review rounds reuse the
+   conversation ID but submit new turns with new exchange IDs) cause the veto to reject **both** candidates
    (`"active or graph-incomparable reasoning remains for final text candidate"`), because neither
    final text is a descendant of the *other* branch's `thoughts`/`code` node. The function cannot
    distinguish "stray abandoned branch" (S4, correctly rejected) from "genuinely complete

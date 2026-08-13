@@ -5,7 +5,9 @@
 
 import { evaluateProTurnCompletion } from "./pro-final.mjs";
 
-function show(name, mapping, turn, note) {
+let failures = 0;
+
+function show(name, mapping, turn, note, expected) {
   const t0 = process.hrtime.bigint();
   const actual = evaluateProTurnCompletion(mapping, turn);
   const t1 = process.hrtime.bigint();
@@ -13,7 +15,16 @@ function show(name, mapping, turn, note) {
   console.log(`note: ${note}`);
   console.log(`nodes: ${Object.keys(mapping).length}, elapsed: ${Number(t1 - t0) / 1e6}ms`);
   console.log(`result: ${JSON.stringify(actual)}`);
+  const matches = expected(actual);
+  if (!matches) {
+    failures += 1;
+    console.error(`ASSERTION FAILED: ${name}`);
+  }
   return actual;
+}
+
+function expectIncomplete(expectedReason) {
+  return (actual) => actual.done === false && (!expectedReason || actual.reason === expectedReason);
 }
 
 // ---------------------------------------------------------------------
@@ -43,6 +54,7 @@ function show(name, mapping, turn, note) {
       "recap will ever land), so the REST-poll caller spins until POLL_IDLE_FLOOR_MS (6 min) and " +
       "throws INCOMPLETE Pro turn on a genuinely-finished answer -- a false negative burning wall-" +
       "clock time (and, on any caller that retries with a fresh turn, a second Pro invocation).",
+    expectIncomplete("trusted reasoning_ended signal not present"),
   );
 }
 
@@ -101,6 +113,7 @@ function show(name, mapping, turn, note) {
       "reasoning node is INVISIBLE to it. Real answer has not landed. EXPECTED (correct): " +
       "done:false. If ACTUAL is done:true, the 'fix' silently reproduces the exact bug it was " +
       "built to close, via any future/renamed resumed-work content_type.",
+    expectIncomplete("active or graph-incomparable reasoning remains for final text candidate"),
   );
   console.log(
     r.done === true
@@ -174,6 +187,7 @@ function show(name, mapping, turn, note) {
       "progress round, which has only reached recap (no final text yet). Expected: done:false " +
       "('no terminal recipient=all text after trusted reasoning_ended'), NOT a match against any " +
       "prior round's final text.",
+    expectIncomplete("no terminal recipient=all text after trusted reasoning_ended"),
   );
 }
 
@@ -235,7 +249,12 @@ for (const [label, mutate] of drifts) {
   }
   console.log(`\n=== A4-drift: ${label} ===`);
   console.log(`result: ${JSON.stringify(result)}`);
-  console.log(threw ? "THROWS (uncaught exception, not a clean fail-closed)" : (result.done === false ? "fails closed (safe)" : "FAILS OPEN (unsafe)"));
+  const safe = !threw && result.done === false;
+  if (!safe) {
+    failures += 1;
+    console.error(`ASSERTION FAILED: A4-drift ${label}`);
+  }
+  console.log(threw ? "THROWS (uncaught exception, not a clean fail-closed)" : (safe ? "fails closed (safe)" : "FAILS OPEN (unsafe)"));
 }
 
 // ---------------------------------------------------------------------
@@ -276,6 +295,7 @@ for (const [label, mutate] of drifts) {
       "its parent chain doesn't lead back to the recap (parent points to a node absent from the " +
       "mapping). Expected: done:false ('no terminal recipient=all text after trusted " +
       "reasoning_ended') -- confirms ancestry, not just turn-id + field match, is load-bearing.",
+    expectIncomplete("no terminal recipient=all text after trusted reasoning_ended"),
   );
 }
 
@@ -353,8 +373,10 @@ for (const [label, mutate] of drifts) {
       "false-negative source distinct from S4: not a stray/never-finished branch, but two FINISHED " +
       "branches, because the contract has no signal for 'which branch is current' (no current_node " +
       "field is read -- confirmed absent from every field this function touches, WIRE-SHAPE.md S1).",
+    expectIncomplete(),
   );
 }
 
 console.log("\n" + "=".repeat(100));
-console.log("Adversarial fixture run complete.");
+console.log(`Adversarial fixture run complete: ${failures === 0 ? "all assertions passed" : `${failures} assertion(s) failed`}.`);
+if (failures > 0) process.exitCode = 1;

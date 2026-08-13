@@ -54,29 +54,36 @@ it — not before, and no amount of additional GitHub research changes that.
 
 ## 2. Recommended move
 
-1. **Build commit (b)** on the existing fork branch `feat/pro-turn-completion-contract`: `Fetch`
-   interception to capture `turn_exchange_id` at submit, then an **in-page**
+1. **Build commit (b)** on the existing fork branch `feat/pro-turn-completion-contract`: passively
+   observe the page's `/backend-api/f/conversation` request with CDP Network events to capture its
+   Pro `stream_handoff` (`conversation_id` + `turn_exchange_id`), then run an **in-page**
    `Runtime.evaluate(fetch('/backend-api/conversation/<id>', {credentials:'include'}))` poll —
    matching the same-file precedent already in `navigation.ts` for `/api/auth/session` /
-   `/backend-api/me`, so the bearer token never leaves the browser (Q3's hard constraint). Wire
-   `evaluateProTurnCompletion` as a **fallback signal alongside** `assistantResponse.ts`'s
-   `classifyTurnTerminal`/`TERMINAL_GATE_CONFIG` (PR #301's DOM gate), not a replacement. Gate
-   behind `ORACLE_STRUCTURAL_COMPLETION=1`, default off.
+   `/backend-api/me`, so the bearer token never leaves the browser (Q3's hard constraint). For a
+   verified Pro/reasoning turn, the structural result is authoritative: wait for `done:true` or
+   an explicit bounded `unavailable`/`inconclusive` state, then fall back to
+   `assistantResponse.ts`'s `classifyTurnTerminal`/`TERMINAL_GATE_CONFIG` (PR #301's DOM gate).
+   This prevents a settled DOM preamble from winning while graph verification is still active.
+   Gate behind `ORACLE_STRUCTURAL_COMPLETION=1`, default off.
 2. **Do the five-minute technical check first, inside step 1, not before it:** while
    signed in, confirm whether `/backend-api/conversation/<id>` requires `Authorization: Bearer`
-   the same way issue #241 established `/backend-api/me` now does. This determines whether the
-   in-page relay needs the token at all or can stay cookie-only; either way it's a fact the wiring
-   code needs, so check it while writing the wiring, not as a separate upstream-facing step.
+   the same way issue #241 established `/backend-api/me` now does. The first implementation keeps
+   the request cookie-only and treats a 401/403 or malformed body as structural `unavailable`/
+   `inconclusive`, preserving the DOM fallback without extracting a bearer token into Node.
 3. **`pnpm build`, point `PRO_GATE_ORACLE_BIN`** at the local fork's `dist/bin/oracle-cli.js`.
    Non-destructive, doesn't touch the pnpm-managed global `@steipete/oracle@0.17.2` install
    pro-gate uses in production.
-4. **Dogfood on pro-gate's own PRs**, flag on, and read `bin/pro-gate-stats.sh`'s
-   `salvage_rate_pct` against the recorded baseline (100% salvage, 12 days to 2026-08-03). Target
-   ≥20 clean runs, matching the baseline's own sample size, before judging. Watch the two
-   secondary signals the proof doc names: a new stall cluster near the 6-minute
-   `POLL_IDLE_FLOOR_MS` region (defect A1, no-recap-ever, unresolved by construction), and a
-   rising same-PR retry rate on second-or-later rounds (defect A6, fail-closed on regenerate,
-   described in §4 below).
+4. **Dogfood on pro-gate's own PRs**, flag on, and compare like-for-like cohorts in
+   `bin/pro-gate-stats.sh`/`ledger.jsonl`: the script's `salvage_rate_pct` is an all-run descriptive
+   rate, while the rollout metric is **clean-only primary-capture rate**
+   (`1 - mean(salvaged)` over rows where `outcome == "clean"`). The 100% salvage figure from the
+   12 days to 2026-08-03 is the recorded clean-run baseline, not a claim about deferred/failed rows.
+   Target ≥20 clean runs, matching that sample size, before judging. Watch the two secondary
+   signals the proof doc names: a new stall cluster near the 6-minute `POLL_IDLE_FLOOR_MS` region
+   (defect A1, no-recap-ever, unresolved by construction), and a rising same-PR retry rate on
+   **actual regenerate/retry branches** where one `turn_exchange_id` is reused (defect A6,
+   fail-closed on regenerate, described in §4 below). Ordinary later pro-gate rounds are new turns
+   with new `turn_exchange_id` values; do not use conversation reuse alone as evidence of A6.
 5. **Go/no-go on the numbers, not on a maintainer's opinion.** If `salvaged` doesn't measurably
    improve, stop — revert the flag, do not send anything upstream, do not proceed to Q4. If it
    does improve, *then* decide whether to go upstream, and if so, send a PR (drafted in §3 below),
@@ -149,13 +156,10 @@ currently renders. `evaluateProTurnCompletion()` in `src/browser/actions/proTurn
 implements exactly that check and fails closed on any ambiguity — a same-turn `is_reasoning` node,
 an unresolvable multi-branch tie — rather than ever returning a preamble.
 
-**This is wired as a fallback signal alongside `classifyTurnTerminal`, not a replacement.** The
-DOM gate stays live for when the REST poll is unreachable (rate-limited, schema drift, or a
-non-Pro model where the mapping shape may differ — this function only activates when
-`client.ts`'s existing `stream_handoff` gate confirms a Pro turn). If you'd rather see a different
-composition (network-signal-primary with DOM as fallback, vs. today's DOM-primary with network as
-corroboration), that's a one-line flip in the poll loop and I'm glad to send it either way — the
-current shape is a starting position, not a claim there's only one right answer.
+**The signals have an explicit authority order.** For an eligible verified Pro/reasoning turn, the structural verifier is authoritative while the matching `stream_handoff` is available: a settled DOM preamble cannot win before graph verification. The
+DOM gate is used only after the structural monitor reports an explicit bounded `unavailable`/`inconclusive` state (or for images, non-Pro turns, and other unsupported paths).
+A structural false negative never triggers a resend; it falls through to today's DOM/recovery
+behavior.
 
 ## Provenance
 
@@ -184,10 +188,11 @@ this PR.
    exists to fix. Fixed by keying the veto on `reasoning_status` alone (a strict superset of what
    the original caught). Regression test included.
 2. **Fail-closed on regenerate** (documented, *not* fixed here, scoped out): the function never
-   reads a `current_node` pointer. A regenerate/retry under the same `turn_exchange_id` — which
-   pro-gate hits routinely, since it reuses conversations across review rounds — produces two
-   independent complete `recap → final` branches, and the leaf-ambiguity check rejects both,
-   because neither is a structural descendant of the other's `thoughts`/`code` node. The function
+   reads a `current_node` pointer. An actual regenerate/retry under the same `turn_exchange_id` can produce two independent
+   complete `recap → final` branches, and the leaf-ambiguity check rejects both, because neither
+   is a structural descendant of the other's `thoughts`/`code` node. Ordinary pro-gate review
+   rounds reuse the conversation ID but submit new turns with new `turn_exchange_id` values; that
+   reuse alone is not evidence of this branch topology. The function
    can't yet tell "stray abandoned branch" from "genuinely complete regenerated answer the UI is
    currently showing." The real fix needs `client.ts`'s response type extended past `{mapping}` to
    carry `current_node` as a tie-breaker — real new surface, tracked as a named follow-up, not a
@@ -207,9 +212,10 @@ today's baseline. This is enforced in the poll loop at `<call site file:line>` a
 
 The in-page poll runs at a fixed interval (`<N>`ms) with backoff on non-2xx, mirroring the
 existing `autoReattachIntervalMs`/`--browser-auto-reattach-interval` pattern already in
-`config.ts`/`browserDefaults.ts` rather than inventing a new cadence primitive. It stops polling
-the instant the DOM gate independently confirms completion, so the two signals race to "done,"
-they don't both run for the full turn.
+`config.ts`/`browserDefaults.ts` rather than inventing a new cadence primitive. For an eligible
+Pro turn, structural observation resolves first: `verified` returns the graph-proven answer;
+`unavailable` (no handoff) or bounded `inconclusive` permits the DOM gate to run. A structural
+`done:false` never independently dispatches or resubmits a turn.
 
 ## What's NOT proven
 
@@ -227,16 +233,29 @@ they don't both run for the full turn.
 
 ## Validation
 
-Dogfooded against pro-gate's own PR reviews with the flag on, `PRO_GATE_ORACLE_BIN` pointed at a
-local build of this branch, against pro-gate's `salvaged`-rate ledger metric (the fraction of
-clean runs that needed post-hoc CDP salvage instead of capturing the answer in-run — the direct
-measurement of the bug both #301 and this PR target).
+Dogfooding is deliberately local and evidence-gated. The exact handoff is
+`PRO_GATE_ORACLE_BIN`, not `ORACLE_BIN`; pro-gate validates a slash-containing override as an
+executable. Oracle's TypeScript build emits `dist/bin/oracle-cli.js` mode `0644`, so do not point the
+override at that file directly and do not chmod the tracked artifact. Create an owner-only executable
+wrapper outside the repo that runs `node /path/to/oracle-worktree/dist/bin/oracle-cli.js`, then use
+that wrapper for both doctor and review.
 
-[INSERT BEFORE SENDING — do not send with this line unfilled: N clean dogfood runs over
-`<date range>`, primary-capture rate `<baseline>%` → `<after>%`, sourced from
-`pro-gate-stats.sh`'s `salvage_rate_pct`, plus the two secondary-metric checks (no new stall
-cluster near the 6-minute idle floor; no rise in same-PR-round retries) from
-`$PRO_GATE_HOME/ledger.jsonl`.]
+Before any live turn, from the oracle worktree, verify Node >=24 and pnpm 11.20.0, run
+`pnpm install --frozen-lockfile`, `pnpm run typecheck`, `pnpm test`, `pnpm build`, and record the
+oracle source SHA plus build identity. Run `pro-gate-doctor.sh` and `oracle-review.sh --status` with
+the identical `PRO_GATE_ORACLE_BIN` and `ORACLE_STRUCTURAL_COMPLETION=1` environment. Preserve both
+`$PRO_GATE_HOME` (ledger, reservations, recovery state) and `~/.oracle/sessions/<id>/` (session metadata,
+transcript, browser artifacts). Use only pro-gate-owned PRs, keep browser archive conservative, and
+inspect status/harvest before any recovery action; never blindly resubmit an uncertain live turn.
+
+For the treatment cohort, record source/build SHA, flag state, override path, PR, date, model evidence,
+outcome, attempts, `salvaged`, duration, and artifact paths per run. The rollout metric is clean-only
+primary-capture rate (`1 - mean(salvaged)` where `outcome == "clean"`); `pro-gate-stats.sh`'s
+`salvage_rate_pct` is an all-run descriptive metric and must not be used as the clean-only denominator.
+Collect at least 20 comparable clean runs. Before sending an upstream PR, fill in the measured
+baseline → treatment primary-capture rate, the all-run salvage summary, and the secondary checks (no
+new cluster near the six-minute idle floor, no retry increase on actual regenerate/retry branches,
+and no non-Pro model entering the structural path). Do not send this section with placeholders.
 
 Happy to share the raw ledger rows or adjust anything about the composition/interval/scope above —
 this is offered as one worked answer to the chronic capture problem, not a take-it-or-leave-it
@@ -319,9 +338,9 @@ whether you'd rather review a diff or take the one-line change directly.
 
 **Body:**
 ```markdown
-`evaluateProTurnCompletion` never reads a `current_node` field. When a conversation has two
-independent, both-complete `recap → terminal-text` branches under the same `turn_exchange_id` —
-which happens on a regenerate/retry, a real and not-uncommon topology — the leaf-ambiguity check:
+`evaluateProTurnCompletion` never reads a `current_node` field. When an actual regenerate/retry
+produces two independent, both-complete `recap → terminal-text` branches under the same
+`turn_exchange_id`, the leaf-ambiguity check:
 
 ```ts
 const leafCandidates = structurallySafe.filter((candidate) =>
