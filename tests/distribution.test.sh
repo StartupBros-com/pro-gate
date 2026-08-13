@@ -21,6 +21,7 @@ LIST="$TDIR/archive.list"; tar -tzf "$ARCHIVE" > "$LIST"
 check "runtime package excludes skill" sh -c "! grep -q '/skills/' '$LIST'"
 check "runtime package excludes agent" sh -c "! grep -q '/agents/' '$LIST'"
 check "runtime package excludes plugin manifest" sh -c "! grep -q '/.claude-plugin/' '$LIST'"
+check "runtime package includes organizer UI expressions" grep -q '/bin/cdp-organizer-expressions.mjs$' "$LIST"
 
 HOME1="$TDIR/default-home"; RUNTIME1="$TDIR/default-runtime"; CLAUDE1="$HOME1/.claude"
 mkdir -p "$HOME1" "$CLAUDE1"
@@ -28,6 +29,7 @@ HOME="$HOME1" CLAUDE_DIR="$CLAUDE1" PRO_GATE_HOME="$RUNTIME1" \
   bash "$ROOT/install.sh" --version "$VERSION" --archive "$ARCHIVE" --checksum "$CHECKSUM" >"$TDIR/default.log" 2>&1
 check "runtime records installed version" test "$(cat "$RUNTIME1/VERSION")" = "$VERSION"
 check "runtime records expected version" test "$(cat "$RUNTIME1/EXPECTED_VERSION")" = "$VERSION"
+check "runtime installs organizer UI expressions" test -s "$RUNTIME1/cdp-organizer-expressions.mjs"
 check "runtime install does not duplicate skill" test ! -e "$CLAUDE1/skills/pro-gate/SKILL.md"
 check "runtime install does not duplicate agent" test ! -e "$CLAUDE1/agents/oracle-reviewer.md"
 check "daemon defaults off" grep -q 'daemon: 0' "$TDIR/default.log"

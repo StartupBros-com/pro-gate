@@ -116,7 +116,9 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
    - `6` — ran but produced no usable review: quota MAY be spent — report it in the unavailable
      envelope and do NOT re-run; the human should check the ChatGPT conversation. On a low-memory
      box this is often a mid-run browser restart (the status `detail` says so); the review may
-     still exist, so advise freeing memory and retrying rather than an immediate re-run.
+     still exist, so advise freeing memory and retrying rather than an immediate re-run. Engine
+     >=v0.32 never archives or closes this failure's marker-owned conversation; it may rename it
+     to the exact PR/round title so recovery is easier.
    - `9`: in-progress (engine >=v0.20): quota IS spent, the model was still generating when
      the engine's budget ran out, and the conversation tab was left open. Never submit a NEW
      review for it — harvest by marker directly (the same-change redirect is only a backstop:
@@ -149,7 +151,9 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
      artifact- or digest-backed). Engine >=v0.25 remembers the run's
      conversation URL and re-renders it when no tab carries the marker, so a browser restart no
      longer loses a finished review; if exit 6 arrives and the conversation IS in ChatGPT, say
-     so in your envelope — that is a bug, not the expected path.
+     so in your envelope — that is a bug, not the expected path. Engine >=v0.32 may exact-rename
+     this in-progress conversation, but never archives or closes it before a durable exit-0
+     harvest succeeds.
    - `11`: oversized diff (engine >=v0.24), **no quota spent**: the payload exceeds the hard
      ceiling `PRO_GATE_DIFF_HARD_MAX` (default 25000), beyond what the model can review even via
      the harvest path (usually a generated blob the filter missed). Unavailable envelope; tell the

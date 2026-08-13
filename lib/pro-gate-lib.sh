@@ -976,6 +976,25 @@ pg_title_seq_next() {
   echo "$n"
 }
 
+# v0.32: marker-addressed canonical conversation title. The engine publishes this before the
+# browser run starts; later harvest/fast-path processes can therefore organize the same server-
+# side conversation without reconstructing PR or round state. Atomic replacement prevents the
+# CDP organizer from reading a partial title while a fresh run is publishing it.
+pg_conversation_title_dir() { echo "$PRO_GATE_HOME/conversation-titles"; }
+pg_conversation_title_write() {  # <marker> <one-line-title>
+  local marker="$1" title="$2" dir f tmp
+  pg_reservation_marker_ok "$marker" || return 1
+  [ -n "$title" ] && [ "${#title}" -le 200 ] || return 1
+  case "$title" in *$'\n'*|*$'\r'*) return 1;; esac
+  dir="$(pg_conversation_title_dir)"; f="$dir/$marker"; tmp="$f.tmp.$$"
+  mkdir -p "$dir" 2>/dev/null || return 1
+  if printf '%s\n' "$title" > "$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$tmp" 2>/dev/null
+  return 1
+}
+
 pg_round_count() {  # $1 = key; echoes the rounds recorded inside the rolling window
   local key="$1" f now win t n=0
   pg_round_key_ok "$key" || { echo 0; return; }
@@ -1454,6 +1473,50 @@ pg_sha256() {  # <file>: echo the hex digest, or nothing when no tool is availab
   elif pg_have shasum; then shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
   elif pg_have openssl; then openssl dgst -sha256 "$1" 2>/dev/null | awk '{print $NF}'
   fi
+}
+# pg_signal_producer <signal> <pid>: signal Oracle's whole PROCESS GROUP, falling back to the pid
+# plus its direct children when it does not lead one. Oracle sits under `timeout` and itself drives
+# a browser client, so signalling the bare pid can leave grandchildren running after the engine has
+# released the account slot and its locks — an orphan that keeps using the browser we just freed.
+pg_signal_producer() {
+  local sig="$1" pid="$2"
+  [ -n "$pid" ] || return 0
+  case "$pid" in ''|*[!0-9]*) return 0 ;; esac
+  kill -"$sig" -- "-$pid" 2>/dev/null && return 0
+  pkill -"$sig" -P "$pid" 2>/dev/null
+  kill -"$sig" "$pid" 2>/dev/null
+  return 0
+}
+
+# pg_publish_log_proof <transcript> <digest-proof>: publish the digest that makes <transcript>
+# trustworthy evidence. Call this ONLY once no writer remains (the tee drained to EOF, or the
+# pipeline was killed AND reaped) — the proof asserts the transcript is final, so publishing it
+# over a live stream would let a half-written log pass as complete. Atomic: a partial temp file
+# is removed rather than left where pg_verified_log_lacks would read it.
+pg_publish_log_proof() {
+  local transcript="$1" proof="$2" sha
+  [ -f "$transcript" ] && [ ! -L "$transcript" ] || return 1
+  sha="$(pg_sha256 "$transcript")"
+  [ -n "$sha" ] || return 1
+  printf '%s\n' "$sha" > "$proof.tmp" 2>/dev/null \
+    && mv -f "$proof.tmp" "$proof" 2>/dev/null \
+    || { rm -f "$proof.tmp" 2>/dev/null; return 1; }
+}
+# pg_verified_log_lacks <transcript> <digest-proof> <extended-regex>: true only when the
+# immutable transcript still matches the digest published after its tee drained successfully
+# AND grep completed with the exact no-match status. Missing/truncated/unreadable logs fail closed.
+pg_verified_log_lacks() {
+  local transcript="$1" proof="$2" pattern="$3" expected actual grep_rc
+  [ -f "$transcript" ] && [ ! -L "$transcript" ] || return 1
+  [ -f "$proof" ] && [ ! -L "$proof" ] || return 1
+  IFS= read -r expected < "$proof" || return 1
+  case "$expected" in ''|*[!0-9a-fA-F]*) return 1 ;; esac
+  [ "${#expected}" -eq 64 ] || return 1
+  actual="$(pg_sha256 "$transcript")"
+  [ -n "$actual" ] && [ "$actual" = "$expected" ] || return 1
+  grep -qE "$pattern" "$transcript" 2>/dev/null
+  grep_rc=$?
+  [ "$grep_rc" -eq 1 ]
 }
 pg_completed_write() {  # <marker> <file>: write-once; an existing artifact is never replaced
   local marker="$1" f="$2" dir rc

@@ -88,8 +88,8 @@ the versioned disclosure during installation.
   landed and quota is SPENT even without a visible tab (transient CDP/render hiccup): do NOT
   re-run, salvage instead. The engine now fails closed here on its own. Note: the engine runs
   oracle with `--browser-archive=never`, so a landed conversation's `/c/` tab stays findable by
-  marker (and the engine closes it on finish); a missing tab is therefore a stronger "never
-  landed" signal.
+  marker until pro-gate validates and durably stores the result; a missing tab is therefore a
+  stronger "never landed" signal.
 - **Engine ≥v0.14 does all of this itself**: hard-cap/stall/no-think watchdogs, a CDP
   probe-before-kill at the no-think timeout (live tab → frees the slot, SUPPRESSES the retry,
   collects via cdp-salvage with the full budget), and cdp-salvage as last resort before failing.
@@ -187,10 +187,12 @@ engine home is `$HOME/.pro-review-daemon`.
   NON-shrinking re-reviews stop the loop EARLY (churn brake), before the base is spent. A
   converging gate therefore finishes without human overrides, and a churning one is cut
   sooner than the old flat 4. Setting `PRO_GATE_MAX_ROUNDS_PER_PR` explicitly pins the
-  legacy flat cap (trajectory ignored). Harvests never count; a submission the engine can
-  PROVE never landed (send/upload failure: browser scanned clean, no URL ever memoized)
-  refunds its round automatically. This is the backstop, not the plan: design the gate
-  around section 6's convergence policy so you rarely hit it.
+  legacy flat cap (trajectory ignored). Harvests never count; a failure proven before Oracle's
+  browser lifecycle (Oracle EXITED on its own leaving a complete, digest-verified transcript;
+  browser scanned clean; no URL memo, throttle, or restart) refunds its round automatically.
+  Incomplete logging, post-click uncertainty, and any watchdog-KILLED attempt stay charged. This is
+  the backstop, not the plan: design the gate around section 6's convergence policy so you rarely
+  hit it.
 
 ## 3. Run the review
 
@@ -303,13 +305,21 @@ reservation and tab kept (retry once the browser is healthy). Repeat harvests ar
 quota is spent. Reservations are keyed by repo-scoped PR identity, so identical PR numbers in
 different repositories never cross.
 
-**A lost TAB is not a lost review (v0.25; hardened v0.28).** Engine ≥v0.29 also biases the
-ChatGPT sidebar title: each conversation's prompt leads with
+**A lost TAB is not a lost review (v0.25; hardened v0.28/v0.32).** Engine ≥v0.29 biases the
+ChatGPT sidebar title by leading each conversation's prompt with
 `pro-gate review: PR #<n> r<k> [<repo>]` (bare `--diff` runs:
 `pro-gate review: <round-key> r<k>`), so a human hunting the sidebar (manual recovery,
 concurrent tabs) can identify the run AND the round at a glance — the r<k> label is what
-separates the current verdict from an older round's.
- ChatGPT keeps conversations
+separates the current verdict from an older round's. Engine ≥v0.32 also publishes that exact
+title under the run marker and, in remote-Chrome mode, applies and verifies it through ChatGPT's
+rendered controls after proving the conversation belongs to the marker. It archives and closes
+only after exit 0 has a readable marker-addressed durable result. Exit 3/6/9, volatile-only
+results, cross-bound/foreign answers, and ambiguous targets remain unarchived and open; exact
+rename may still make a recoverable run easier to find. `PRO_GATE_KEEP_TABS=1` permits rename
+but suppresses both archive and local close. `PRO_GATE_CHAT_ARCHIVE=0` suppresses server archive
+but retains normal successful local close. Never work around this with a ChatGPT backend API.
+
+ChatGPT keeps conversations
 server-side, so the engine remembers each run's conversation URL the first time it proves
 which one is that run's, and re-renders that URL when no open tab carries the marker. A
 Chrome restart — routine when the box is short on memory — therefore no longer destroys a

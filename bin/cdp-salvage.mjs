@@ -75,12 +75,55 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import {
+  buildArchiveConversationExpression,
+  buildCancelOrganizerMutationExpression,
+  buildRenameConversationExpression,
+  ORGANIZER_MUTATION_LEASE_MS,
+} from './cdp-organizer-expressions.mjs';
+
+const usage = () => {
+  console.error('usage: cdp-salvage.mjs [--probe|--close|--sweep-root|--organize [--finalize --result-file <path>] [--accepted-url <url>] [--archive] [--no-rename]] <pr-marker|-> [timeout-secs] [cdp-port]');
+  process.exit(2);
+};
 const argv = process.argv.slice(2);
-const probe = argv[0] === '--probe' && argv.shift();
-const close = argv[0] === '--close' && argv.shift();
-const sweepRoot = argv[0] === '--sweep-root' && argv.shift();
-const [marker, timeoutSecs = probe ? '30' : '600', port = process.env.ORACLE_CDP_PORT ?? '9222'] = argv;
-if (!marker) { console.error('usage: cdp-salvage.mjs [--probe|--close|--sweep-root] <pr-marker|-> [timeout-secs] [cdp-port]'); process.exit(2); }
+let mode = 'salvage';
+let finalize = false;
+let archive = false;
+let rename = true;
+let resultFile = null;
+let acceptedUrl = null;
+for (;;) {
+  const arg = argv[0];
+  if (!arg?.startsWith('--')) break;
+  argv.shift();
+  if (['--probe', '--close', '--sweep-root', '--organize'].includes(arg)) {
+    if (mode !== 'salvage') usage();
+    mode = arg.slice(2);
+  } else if (arg === '--finalize') {
+    finalize = true;
+  } else if (arg === '--result-file') {
+    resultFile = argv.shift() ?? null;
+  } else if (arg === '--accepted-url') {
+    acceptedUrl = argv.shift() ?? null;
+  } else if (arg === '--archive') {
+    archive = true;
+  } else if (arg === '--no-rename') {
+    rename = false;
+  } else {
+    usage();
+  }
+}
+if (mode !== 'organize' && (finalize || archive || !rename || resultFile || acceptedUrl)) usage();
+if (archive && !finalize) usage();
+if (finalize !== !!resultFile || (acceptedUrl && !finalize)) usage();
+if (acceptedUrl && !/^https:\/\/chatgpt\.com\/c\//.test(acceptedUrl)) usage();
+const probe = mode === 'probe';
+const close = mode === 'close';
+const sweepRoot = mode === 'sweep-root';
+const organize = mode === 'organize';
+const [marker, timeoutSecs = probe || organize ? '30' : '600', port = process.env.ORACLE_CDP_PORT ?? '9222'] = argv;
+if (!marker || argv.length > 3 || !/^\d+$/.test(String(timeoutSecs)) || Number(timeoutSecs) <= 0 || !/^\d+$/.test(String(port))) usage();
 const deadline = Date.now() + Number(timeoutSecs) * 1000;
 const POLL_MS = 20_000;
 
@@ -94,9 +137,13 @@ const COOLDOWN_FILE = process.env.PRO_GATE_COOLDOWN_FILE ?? path.join(PG_HOME, '
 // engine's only handle on a conversation whose tab is gone, so it is written on every positive
 // match (probe included) and read before we ever conclude "not found".
 const URL_MEMO_DIR = path.join(PG_HOME, 'conversation-urls');
+const TITLE_MEMO_DIR = path.join(PG_HOME, 'conversation-titles');
+const COMPLETED_DIR = process.env.PRO_GATE_COMPLETED_DIR ?? path.join(PG_HOME, 'completed');
+const PENDING_DIR = path.join(PG_HOME, 'pending');
 const MEMO_KEEP = 200;                  // newest N memos retained; older ones are pruned on write
 const MARKER_SAFE_RE = /^pg-run-[A-Za-z0-9.-]+$/;
 const memoPath = (m) => (MARKER_SAFE_RE.test(m) ? path.join(URL_MEMO_DIR, m) : null);
+const titleMemoPath = (m) => (MARKER_SAFE_RE.test(m) ? path.join(TITLE_MEMO_DIR, m) : null);
 
 function recallUrl(m) {
   const f = memoPath(m);
@@ -104,6 +151,15 @@ function recallUrl(m) {
   try {
     const url = fs.readFileSync(f, 'utf8').trim();
     return /^https:\/\/chatgpt\.com\/c\//.test(url) ? url : null;
+  } catch { return null; }
+}
+
+function recallTitle(m) {
+  const f = titleMemoPath(m);
+  if (!f) return null;
+  try {
+    const title = fs.readFileSync(f, 'utf8').replace(/\n$/, '');
+    return title && title.length <= 200 && !/[\r\n\0]/.test(title) ? title : null;
   } catch { return null; }
 }
 
@@ -172,9 +228,14 @@ function flushCrossBind(m) {
 }
 
 
-// One hook rather than seven call sites: every exit path (0/3/4/5/7, probe, close, sweep)
+// One hook rather than seven call sites: every salvage exit path (0/3/4/5/7)
 // persists the scan's verdict exactly once, so no future exit can forget to.
-process.on('exit', () => { if (!probe) flushCrossBind(marker); });
+// Organizer/cleanup modes are deliberately read-only with respect to cross-bound recovery state.
+// #76 keeps close/sweep-root flushing (they clear a stale conviction, and their test asserts it);
+// v0.32 excludes only --organize. It exits before the scan that can call noteCrossBind, so it
+// never has hits and never proves ownership — flushing there would just DELETE a genuine
+// conviction an earlier salvage recorded. probe stays excluded exactly as before.
+process.on('exit', () => { if (!probe && !organize) flushCrossBind(marker); });
 
 function rememberUrl(m, url) {
   const f = memoPath(m);
@@ -213,33 +274,113 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function isThrottlePage(text) {
   return !!text && text.length < 5000 && !/pg-run-[A-Za-z0-9.-]+/.test(text) && THROTTLE_RE.test(text);
 }
-function tripThrottle(where) {
+function recordThrottle(where) {
   try {
     fs.mkdirSync(PG_HOME, { recursive: true });
     fs.writeFileSync(COOLDOWN_FILE, `${new Date().toISOString()} ${where}\n`);
   } catch {}
   console.error(`ChatGPT throttle interstitial detected (${where}) — cooldown written to ${COOLDOWN_FILE}. Back off; do NOT resubmit.`);
+}
+function tripThrottle(where) {
+  recordThrottle(where);
   process.exit(5);
 }
 
-async function tabText(tab) {
+let evaluateRequestId = 0;
+async function evaluateTab(tab, expression, awaitPromise = false, timeoutMs = 5_000) {
   return await new Promise((resolve) => {
-    const ws = new WebSocket(tab.webSocketDebuggerUrl);
-    // 5s bail: a healthy renderer answers in well under a second; suspended
-    // renderers never answer, and orphaned conversation tabs accumulate on
-    // the persistent Chrome, so a long bail makes every poll cycle crawl.
-    const bail = setTimeout(() => { try { ws.close(); } catch {} resolve(null); }, 5_000);
-    ws.onerror = () => { clearTimeout(bail); resolve(null); };
-    ws.onopen = () => ws.send(JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: { expression: 'document.body.innerText', returnByValue: true } }));
+    const requestId = ++evaluateRequestId;
+    let ws;
+    try {
+      ws = new WebSocket(tab?.webSocketDebuggerUrl);
+    } catch {
+      resolve({ ok: false, reason: 'invalid-websocket-url' });
+      return;
+    }
+    // Read-only probes retain the short bail because suspended renderers accumulate. UI actions
+    // pass a longer operation-specific timeout and carry an in-page lease that expires first.
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(bail);
+      try { ws.close(); } catch {}
+      resolve(value);
+    };
+    const bail = setTimeout(() => finish({ ok: false, reason: 'evaluate-timeout' }), timeoutMs);
+    ws.onerror = () => finish({ ok: false, reason: 'websocket-error' });
+    ws.onopen = () => {
+      try {
+        ws.send(JSON.stringify({
+          id: requestId,
+          method: 'Runtime.evaluate',
+          params: { expression, returnByValue: true, awaitPromise },
+        }));
+      } catch {
+        finish({ ok: false, reason: 'websocket-send-failed' });
+      }
+    };
     ws.onmessage = (ev) => {
-      const m = JSON.parse(ev.data);
-      if (m.id === 1) { clearTimeout(bail); try { ws.close(); } catch {} resolve(m.result?.result?.value ?? null); }
+      try {
+        const m = JSON.parse(ev.data);
+        if (m.id !== requestId) return;
+        if (m.error || m.result?.exceptionDetails) finish({ ok: false, reason: 'evaluate-failed' });
+        else finish({ ok: true, value: m.result?.result?.value });
+      } catch { finish({ ok: false, reason: 'invalid-cdp-response' }); }
     };
   });
 }
 
+const testMutationEvaluateMs = Number(process.env.PRO_GATE_TEST_MUTATION_EVALUATE_MS ?? 0);
+const MUTATION_EVALUATE_MS = Number.isFinite(testMutationEvaluateMs) && testMutationEvaluateMs >= 50
+  ? testMutationEvaluateMs
+  : 15_000;
+const testMutationLeaseMs = Number(process.env.PRO_GATE_TEST_MUTATION_LEASE_MS ?? 0);
+const MUTATION_LEASE_MS = Number.isFinite(testMutationLeaseMs) && testMutationLeaseMs >= 50
+  ? testMutationLeaseMs
+  : ORGANIZER_MUTATION_LEASE_MS;
+let mutationSequence = 0;
+const nextMutation = () => ({
+  mutationToken: `${process.pid}.${++mutationSequence}`,
+  mutationExpiresAt: Date.now() + MUTATION_LEASE_MS,
+});
+
+async function evaluateMutation(tab, buildExpression) {
+  const mutation = nextMutation();
+  const result = await evaluateTab(
+    tab,
+    buildExpression(mutation),
+    true,
+    MUTATION_EVALUATE_MS,
+  );
+  if (result.ok) return result;
+  // Closing the DevTools socket does not cancel Runtime.evaluate. Revoke this token in the renderer
+  // so work that already armed its lease stops immediately. Cancellation acknowledgement alone is
+  // not enough to release serialization: the original expression may still be queued and can arm
+  // after cancellation observes no token, so every timed-out mutation stays locked through the
+  // absolute pre-issued expiry.
+  await evaluateTab(
+    tab,
+    buildCancelOrganizerMutationExpression(
+      marker,
+      mutation.mutationToken,
+      mutation.mutationExpiresAt,
+    ),
+    false,
+    5_000,
+  );
+  const leaseRemainingMs = mutation.mutationExpiresAt - Date.now();
+  if (leaseRemainingMs > 0) await sleep(leaseRemainingMs + 25);
+  return result;
+}
+
+async function tabText(tab) {
+  const result = await evaluateTab(tab, 'document.body.innerText');
+  return result.ok ? result.value ?? null : null;
+}
+
 async function closeTab(id) {
-  try { await fetch(`http://127.0.0.1:${port}/json/close/${id}`); } catch {}
+  try { return (await fetch(`http://127.0.0.1:${port}/json/close/${id}`)).ok; } catch { return false; }
 }
 
 // --sweep-root: close idle chatgpt.com ROOT tabs (no /c/ path). A run killed before it submits
@@ -457,10 +598,392 @@ function foreignAnswerMarker(text) {
   // count misses toward a duplicate spend. Only convict when the foreign verdict comes AFTER
   // the last occurrence of our marker, i.e. it is the answer to our prompt rather than
   // scrollback above it.
-  const lastMarkerAt = text.lastIndexOf(marker);
+  const lastMarkerAt = lastExactMarkerAt(text, marker);
   const foreignAt = text.lastIndexOf(m[0]);
   if (lastMarkerAt >= 0 && foreignAt >= 0 && foreignAt < lastMarkerAt) return null;
   return m[1];
+}
+
+const organizerToken = (value, fallback = 'unknown') => {
+  const token = String(value ?? fallback).toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '');
+  return (token || fallback).slice(0, 64);
+};
+function emitOrganizerResult({ source = 'none', renameStatus = 'skipped', archiveStatus = 'disabled', closeStatus = 'skipped', reason = 'ok' }) {
+  process.stdout.write(`organizer source=${organizerToken(source)} rename=${organizerToken(renameStatus)} archive=${organizerToken(archiveStatus)} close=${organizerToken(closeStatus)} reason=${organizerToken(reason)}\n`);
+}
+
+const isRunMarkerChar = (char) => /[A-Za-z0-9.-]/.test(char ?? '');
+function lastExactMarkerAt(text, wanted) {
+  let found = -1;
+  let from = 0;
+  while (from <= text.length - wanted.length) {
+    const at = text.indexOf(wanted, from);
+    if (at < 0) break;
+    const before = at > 0 ? text[at - 1] : '';
+    const after = text[at + wanted.length] ?? '';
+    if (!isRunMarkerChar(before) && !isRunMarkerChar(after)) found = at;
+    from = at + 1;
+  }
+  return found;
+}
+const hasExactMarker = (text, wanted) => !!text && lastExactMarkerAt(text, wanted) >= 0;
+function lastExactRunMarkerAt(text) {
+  let found = -1;
+  for (const match of text.matchAll(/pg-run-[A-Za-z0-9.-]+/g)) {
+    const at = match.index;
+    const before = at > 0 ? text[at - 1] : '';
+    const after = text[at + match[0].length] ?? '';
+    if (!isRunMarkerChar(before) && !isRunMarkerChar(after)) found = at;
+  }
+  return found;
+}
+
+function terminalVerdict(text) {
+  const lines = text.split('\n');
+  let at = 0;
+  let terminal = null;
+  for (const line of lines) {
+    if (VERDICT_RE.test(line)) terminal = { line, at };
+    at += line.length + 1;
+  }
+  return terminal;
+}
+
+// Mutation authority is intentionally stricter than salvage extraction. The engine may capture a
+// nonce-less completed answer and adjudicate it as retryable, but the organizer must not mutate that
+// page: once a verdict follows this run's prompt, only an exact marker echo proves it is our answer.
+function organizerOwnership(text) {
+  if (!hasExactMarker(text, marker)) return { owned: false, reason: 'marker-missing' };
+  const verdict = terminalVerdict(text);
+  if (!verdict) return { owned: true, reason: 'live' };
+  const answerMarker = verdict.line.match(/\(run marker:\s*(pg-run-[A-Za-z0-9.-]+)\s*\)/i)?.[1] ?? null;
+  if (answerMarker === marker) return { owned: true, reason: 'completed' };
+  if (verdict.at < lastExactMarkerAt(text, marker)) return { owned: true, reason: 'old-verdict' };
+  return answerMarker
+    ? { owned: false, reason: 'cross-bound', foreignMarker: answerMarker }
+    : { owned: false, reason: 'answer-marker-missing' };
+}
+
+function normalizeReviewBytes(value) {
+  return String(value ?? '').replace(/\r\n?/g, '\n').replace(/\n$/, '');
+}
+
+function stripMarkerEcho(value) {
+  const token = `(run marker: ${marker})`;
+  return String(value ?? '').split('\n').map((line) => {
+    const at = line.indexOf(token);
+    if (at < 0) return line;
+    return `${line.slice(0, at)}${line.slice(at + token.length)}`.replace(/[ \t]+$/, '');
+  }).join('\n');
+}
+
+let acceptedReview = null;
+function finalizerOwnership(text) {
+  if (acceptedReview === null) return { owned: false, reason: 'result-file-missing' };
+  const verdict = terminalVerdict(text);
+  if (!verdict) return { owned: false, reason: 'answer-incomplete' };
+  const promptMarkerAt = lastExactMarkerAt(text.slice(0, verdict.at), marker);
+  if (promptMarkerAt < 0) return { owned: false, reason: 'answer-incomplete' };
+  if (lastExactRunMarkerAt(text.slice(verdict.at + verdict.line.length)) >= 0) {
+    return { owned: false, reason: 'newer-run-marker' };
+  }
+  const answerMarker = verdict.line.match(/\(run marker:\s*(pg-run-[A-Za-z0-9.-]+)\s*\)/i)?.[1] ?? null;
+  if (!answerMarker) return { owned: false, reason: 'answer-marker-missing' };
+  if (answerMarker !== marker) {
+    return { owned: false, reason: 'cross-bound', foreignMarker: answerMarker };
+  }
+  const review = extractReview(text);
+  if (!review || normalizeReviewBytes(stripMarkerEcho(review)) !== acceptedReview) {
+    return { owned: false, reason: 'result-mismatch' };
+  }
+  return { owned: true, reason: 'completed' };
+}
+
+function mutationOwnership(text) {
+  return finalize ? finalizerOwnership(text) : organizerOwnership(text);
+}
+
+async function openOrganizerScratch(url) {
+  let target = null;
+  try {
+    let response = await fetch(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(url)}`, { method: 'PUT' });
+    if (!response.ok) response = await fetch(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(url)}`);
+    if (!response.ok) return { target: null, reason: 'memo-open-failed' };
+    target = await response.json();
+    const renderDeadline = Math.min(deadline, Date.now() + 25_000);
+    let sawLogin = false;
+    while (Date.now() < renderDeadline) {
+      await sleep(Math.min(250, Math.max(0, renderDeadline - Date.now())));
+      let live = target;
+      try {
+        const tabs = await (await fetch(`http://127.0.0.1:${port}/json`)).json();
+        live = tabs.find((tab) => tab.id === target.id) ?? null;
+      } catch { return { target, reason: 'cdp-list-failed' }; }
+      if (!live) return { target, reason: 'memo-tab-disappeared' };
+      if (live.url !== url) return { target: live, reason: 'memo-url-drift' };
+      const text = await tabText(live);
+      if (!text) continue;
+      if (isThrottlePage(text)) return { target: live, reason: 'throttle' };
+      if (hasExactMarker(text, marker)) {
+        const ownership = mutationOwnership(text);
+        return ownership.owned
+          ? { target: live, text, reason: 'ok' }
+          : { target: live, reason: ownership.reason };
+      }
+      if (FOREIGN_MARKER_RE.test(text)) return { target: live, reason: 'stale-memo' };
+      if (/\b(log in|sign up)\b/i.test(text) && text.length < 10_000) sawLogin = true;
+    }
+    return { target, reason: sawLogin ? 'login-wall' : 'memo-not-hydrated' };
+  } catch {
+    return { target, reason: 'memo-open-failed' };
+  }
+}
+
+function organizerUiStatus(result, action) {
+  if (!result.ok || !result.value || typeof result.value !== 'object') {
+    return { status: 'failed', reason: `${action}-evaluate-failed` };
+  }
+  const status = result.value.status;
+  if (action === 'rename' && ['renamed', 'already'].includes(status)) return { status, reason: 'ok' };
+  if (action === 'archive' && ['archived', 'already'].includes(status)) return { status, reason: 'ok' };
+  if (status === 'skipped') return { status, reason: `${action}-${organizerToken(result.value.reason, 'skipped')}` };
+  return { status: 'failed', reason: `${action}-ui-failed` };
+}
+
+async function validateOrganizerTarget(target, expectedUrl) {
+  let tabs;
+  try {
+    tabs = await (await fetch(`http://127.0.0.1:${port}/json`)).json();
+  } catch {
+    return { ok: false, reason: 'cdp-list-failed', tab: null };
+  }
+  const live = Array.isArray(tabs) ? tabs.find((tab) => tab.id === target?.id) : null;
+  if (!live) return { ok: false, reason: 'target-disappeared', tab: null };
+  if (live.url !== expectedUrl) return { ok: false, reason: 'target-url-drift', tab: live };
+  const text = await tabText(live);
+  const ownership = mutationOwnership(text);
+  if (!ownership.owned) return { ok: false, reason: ownership.reason, tab: live };
+  return { ok: true, reason: 'ok', tab: live, text };
+}
+
+async function closeOwnedOrganizerTabs(expectedUrl, authorizedTargetId, allowTargetUrlDrift) {
+  let tabs;
+  try {
+    tabs = await (await fetch(`http://127.0.0.1:${port}/json`)).json();
+  } catch {
+    return { status: 'failed', reason: 'cdp-list-failed' };
+  }
+  if (!Array.isArray(tabs)) return { status: 'failed', reason: 'cdp-list-failed' };
+  const selected = tabs.find((tab) => tab.id === authorizedTargetId) ?? null;
+  if (!selected) return { status: 'failed', reason: 'target-disappeared' };
+  const sameUrl = tabs.filter((tab) => tab.type === 'page' && tab.url === expectedUrl);
+  const toClose = [];
+  for (const tab of sameUrl) {
+    if (allowTargetUrlDrift && tab.id === authorizedTargetId) {
+      toClose.push(tab);
+      continue;
+    }
+    const text = await tabText(tab);
+    const ownership = mutationOwnership(text);
+    if (!ownership.owned) return { status: 'failed', reason: ownership.reason };
+    toClose.push(tab);
+  }
+  if (selected.url !== expectedUrl) {
+    if (!allowTargetUrlDrift) return { status: 'failed', reason: 'target-url-drift' };
+    toClose.push(selected);
+  }
+  const unique = [...new Map(toClose.map((tab) => [tab.id, tab])).values()];
+  if (!unique.length) return { status: 'failed', reason: 'target-disappeared' };
+  let closed = 0;
+  for (const tab of unique) if (await closeTab(tab.id)) closed += 1;
+  return closed === unique.length
+    ? { status: 'closed', reason: 'ok' }
+    : { status: 'failed', reason: 'close-failed' };
+}
+
+async function organizeConversation() {
+  const result = {
+    source: 'none',
+    renameStatus: rename ? 'skipped' : 'disabled',
+    archiveStatus: archive ? 'skipped' : 'disabled',
+    closeStatus: 'skipped',
+    reason: 'ok',
+  };
+  if (!MARKER_SAFE_RE.test(marker)) return { ...result, reason: 'invalid-marker' };
+  if (finalize) {
+    const allowedResultFiles = [
+      path.resolve(COMPLETED_DIR, marker),
+      path.resolve(PENDING_DIR, marker),
+    ];
+    if (!allowedResultFiles.includes(path.resolve(resultFile))) {
+      return { ...result, reason: 'result-file-invalid' };
+    }
+    let resultFd = null;
+    try {
+      resultFd = fs.openSync(resultFile, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      const stat = fs.fstatSync(resultFd);
+      const bytes = fs.readFileSync(resultFd, 'utf8');
+      if (!stat.isFile() || !bytes) return { ...result, reason: 'result-file-invalid' };
+      acceptedReview = normalizeReviewBytes(bytes);
+    } catch {
+      return { ...result, reason: 'result-file-invalid' };
+    } finally {
+      if (resultFd !== null) try { fs.closeSync(resultFd); } catch {}
+    }
+  }
+
+  const rememberedUrl = recallUrl(marker);
+  const title = recallTitle(marker);
+  let tabs;
+  try {
+    tabs = (await (await fetch(`http://127.0.0.1:${port}/json`)).json())
+      .filter((tab) => tab.type === 'page' && /^https:\/\/chatgpt\.com\/c\//.test(tab.url || ''));
+  } catch { return { ...result, reason: 'cdp-list-failed' }; }
+
+  const reads = await Promise.all(tabs.map(async (tab) => ({ tab, text: await tabText(tab) })));
+  if (reads.some(({ text }) => isThrottlePage(text))) {
+    recordThrottle('organizer scan');
+    return { ...result, reason: 'throttle' };
+  }
+
+  const candidatesByUrl = new Map();
+  const conflictedUrls = new Set();
+  let rejectionReason = 'owned-target-not-found';
+  for (const { tab, text } of reads) {
+    if (!text || !hasExactMarker(text, marker)) continue;
+    const ownership = mutationOwnership(text);
+    if (!ownership.owned) {
+      conflictedUrls.add(tab.url);
+      rejectionReason = ownership.reason;
+      continue;
+    }
+    if (nonMatching.has(tab.url)) {
+      rejectionReason = 'provenance-rejected';
+      continue;
+    }
+    if (!candidatesByUrl.has(tab.url)) candidatesByUrl.set(tab.url, []);
+    candidatesByUrl.get(tab.url).push({ tab, text });
+  }
+  for (const url of conflictedUrls) candidatesByUrl.delete(url);
+
+  let target = null;
+  let source = 'none';
+  const candidateUrls = [...candidatesByUrl.keys()];
+  let selectedUrl = null;
+  if (acceptedUrl) {
+    if (conflictedUrls.has(acceptedUrl)) return { ...result, reason: rejectionReason };
+    if (candidatesByUrl.has(acceptedUrl)) selectedUrl = acceptedUrl;
+  } else if (candidateUrls.length > 0) {
+    if (finalize) {
+      selectedUrl = candidateUrls.length === 1 ? candidateUrls[0] : null;
+    } else {
+      selectedUrl = rememberedUrl && candidatesByUrl.has(rememberedUrl)
+        ? rememberedUrl
+        : candidateUrls.length === 1 ? candidateUrls[0] : null;
+    }
+    if (!selectedUrl) return { ...result, reason: 'ambiguous-owned-targets' };
+  }
+  if (selectedUrl) {
+    target = candidatesByUrl.get(selectedUrl)[0].tab;
+    source = 'open';
+  } else {
+    const recoveryUrl = acceptedUrl ?? (candidateUrls.length === 0 ? rememberedUrl : null);
+    if (!recoveryUrl) return { ...result, reason: rejectionReason };
+    if (nonMatching.has(recoveryUrl)) return { ...result, reason: 'provenance-rejected' };
+    const scratch = await openOrganizerScratch(recoveryUrl);
+    if (!scratch.text || !scratch.target) {
+      if (scratch.reason === 'throttle') recordThrottle('organizer scratch');
+      if (scratch.target?.id) await closeTab(scratch.target.id);
+      return { ...result, reason: scratch.reason };
+    }
+    target = scratch.target;
+    source = 'memo';
+  }
+
+  result.source = source;
+  const targetUrl = target.url;
+  rememberUrl(marker, targetUrl);
+  const before = await validateOrganizerTarget(target, targetUrl);
+  if (!before.ok) return { ...result, reason: before.reason };
+  target = before.tab;
+  const expressionBinding = finalize ? acceptedReview : null;
+
+  if (rename) {
+    if (!title) {
+      result.renameStatus = 'skipped';
+      result.reason = 'title-memo-missing';
+    } else {
+      const renameOutcome = organizerUiStatus(
+        await evaluateMutation(target, (mutation) => buildRenameConversationExpression(title, {
+          marker,
+          conversationUrl: targetUrl,
+          expectedReview: expressionBinding,
+          ...mutation,
+        })),
+        'rename',
+      );
+      result.renameStatus = renameOutcome.status;
+      if (renameOutcome.reason !== 'ok') result.reason = renameOutcome.reason;
+    }
+  }
+
+  const afterRename = await validateOrganizerTarget(target, targetUrl);
+  if (!afterRename.ok) {
+    if (result.reason === 'ok') result.reason = afterRename.reason;
+    result.archiveStatus = archive ? 'skipped' : 'disabled';
+    return result;
+  }
+  target = afterRename.tab;
+
+  let closeAuthorized = false;
+  if (archive) {
+    const archiveOutcome = organizerUiStatus(
+      await evaluateMutation(target, (mutation) => buildArchiveConversationExpression({
+        marker,
+        conversationUrl: targetUrl,
+        expectedReview: expressionBinding,
+        ...mutation,
+      })),
+      'archive',
+    );
+    result.archiveStatus = archiveOutcome.status;
+    if (archiveOutcome.reason !== 'ok' && result.reason === 'ok') result.reason = archiveOutcome.reason;
+    closeAuthorized = ['archived', 'already'].includes(archiveOutcome.status);
+  }
+
+  if (finalize && !closeAuthorized) {
+    const beforeClose = await validateOrganizerTarget(target, targetUrl);
+    closeAuthorized = beforeClose.ok;
+    if (beforeClose.ok) target = beforeClose.tab;
+    else if (result.reason === 'ok') result.reason = beforeClose.reason;
+  }
+  if (finalize && closeAuthorized) {
+    const closeOutcome = await closeOwnedOrganizerTabs(
+      targetUrl,
+      target.id,
+      ['archived', 'already'].includes(result.archiveStatus),
+    );
+    result.closeStatus = closeOutcome.status;
+    if (closeOutcome.reason !== 'ok' && result.reason === 'ok') result.reason = closeOutcome.reason;
+  }
+  return result;
+}
+
+if (organize) {
+  let result;
+  try {
+    result = await organizeConversation();
+  } catch {
+    result = {
+      source: 'none',
+      renameStatus: rename ? 'failed' : 'disabled',
+      archiveStatus: archive ? 'failed' : 'disabled',
+      closeStatus: 'skipped',
+      reason: 'organizer-exception',
+    };
+  }
+  emitOrganizerResult(result);
+  process.exit(0);
 }
 
 // One place where a marker-matched page turns into an outcome, so the live-tab scan, the

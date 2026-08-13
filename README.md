@@ -74,9 +74,10 @@ gh pr edit 1292 --add-label pro-review
         │  2. usage + session + concurrency guardrails  │
         │  3. Pro review via oracle (nonce-bound run)   │  ← the web-only model
         │  4. capture / salvage / harvest the verdict   │  ← survives crashes + timeouts
-        │  5. parse P0–P3 findings + VERDICT            │
-        │  6. fix confirmed P0/P1 → push                │  ← CE → codex → Claude Code
-        │  7. post the review as a PR comment           │
+        │  5. validate + durably save the verdict        │
+        │  6. name/archive the marker-owned chat         │  ← only after durable success
+        │  7. fix confirmed P0/P1 → push                 │  ← CE → codex → Claude Code
+        │  8. post the review as a PR comment            │
         │     …stop before merge (you merge)            │
         └──────────────────────────────────────────────┘
 ```
@@ -97,6 +98,10 @@ July 2026). The Pro model spends that long reasoning; the engine is built around
 - **Fail closed, recover explicitly.** A plugin/runtime version skew blocks the run.
   Captures must echo the run's nonce. Unverifiable results are surfaced for manual
   recovery, never guessed at.
+- **Clean up only after durable success.** Remote-browser conversations get an exact,
+  marker-owned title. Server archive and local tab close happen only after the validated
+  review is readable from marker-addressed durable storage; failed and in-progress runs stay
+  recoverable.
 - **Review-only authority.** The gate never merges, and committed work stays on the branch
   at any stop; unresolved findings escalate to a human instead of triggering a revert.
 - **One engine, thin surfaces.** The skill, the relay agent, and the daemon all call
@@ -246,13 +251,38 @@ All tunables live in [`.env.example`](.env.example) with inline docs; the engine
 | `PRO_GATE_RESERVATION_TTL` | `21600` | Seconds an in-progress run's capacity stays reserved (6 h) |
 | `PRO_GATE_REQUIRE_NONCE` | `1` | Reject any capture that doesn't echo this run's nonce (`0` restores path-overlap matching) |
 | `PRO_GATE_MODEL_STRATEGY` | `current` | Review with whatever Pro model the account has selected; the run reports the one it used |
+| `PRO_GATE_CHAT_RENAME` | `1` remote / prompt-only native | Apply and verify the exact canonical PR/round title through ChatGPT's rendered UI |
+| `PRO_GATE_CHAT_ARCHIVE` | `1` | Archive through ChatGPT's rendered UI only after marker-addressed durable exit-0 success |
+| `PRO_GATE_KEEP_TABS` | `0` | Exact value `1` permits rename but suppresses both server archive and local tab close |
+| `PRO_GATE_BROWSER_ARCHIVE` | `never` | Passed unchanged to Oracle; `auto`/`always` can archive before pro-gate validates durable recovery state |
+
+### Conversation lifecycle
+
+The remote-browser organizer never calls a ChatGPT backend API. It first proves the open or
+remembered conversation carries this run's marker and not another run's completed answer, then
+uses the visible menu, title input, save, and archive controls. UI drift is best-effort and cannot
+change the review result.
+
+| Remote outcome/configuration | Exact rename | Server archive | Local tab close |
+|---|---:|---:|---:|
+| Exit 0, readable marker-addressed durable result (defaults) | yes | yes | yes |
+| Same, `PRO_GATE_CHAT_ARCHIVE=0` | yes | no | yes |
+| Same, `PRO_GATE_CHAT_RENAME=0` | no | yes | yes |
+| Same, `PRO_GATE_KEEP_TABS=1` | yes | no | no |
+| Exit 3, 6, or 9 with a proven owned conversation | yes | no | no |
+| Volatile-only result or ambiguous/foreign/cross-bound target | at most a proven safe rename | no | no |
+
+Invalid values for the two new boolean controls warn and disable only that mutation. The older
+`PRO_GATE_KEEP_TABS` and `PRO_GATE_BROWSER_ARCHIVE` surfaces keep their exact historical
+semantics. Native mode keeps the prompt's title hint and does not run remote-CDP organization.
 
 ## Repo map
 
 | Path | What it is |
 |---|---|
 | `bin/oracle-review.sh` | **The engine**: assembles context, runs the review, captures/salvages/harvests the verdict |
-| `bin/cdp-salvage.mjs` | CDP salvage: recovers a finished review straight from the browser when oracle's own capture fails |
+| `bin/cdp-salvage.mjs` | Marker-owned CDP salvage and conversation organizer: recover, exact-rename, archive, and local cleanup decisions |
+| `bin/cdp-organizer-expressions.mjs` | Auditable ChatGPT UI expressions for exact rename and archive; no backend API calls |
 | `bin/pro-gate-doctor.sh` | One-command setup verification (deps, versions, browser, consent) |
 | `bin/pro-gate-stats.sh` | Ledger stats: clean rate, exits, per-PR history |
 | `bin/pro-gate-autoupdate.sh` | The opt-in hourly skew-follower |
@@ -292,7 +322,8 @@ downgrade the runtime.
 Not a failure. The slot is spent and the model is still writing; the run printed the exact
 `--harvest` command. Collect with that (or find it later via `--status <pr>`). Never submit
 a new review for the same change while the reservation lives; that would spend a second slot
-on the same question.
+on the same question. Its marker-owned conversation may already have the exact run title, but
+it is deliberately neither archived nor closed.
 
 ### Exit 6 (`no usable review`)
 
@@ -300,7 +331,8 @@ This exit covers two different situations, so read the status `detail` before ac
 means the review exists (find it with `--status`; do not resubmit). A genuine loss is safe
 to retry: re-running the identical `--pr` command is engine-enforced safe (a live
 reservation redirects instead of double-spending). On a low-memory box this exit often means
-the review browser restarted mid-run, so free memory first.
+the review browser restarted mid-run, so free memory first. Failed runs are never archived or
+closed by the organizer; a proven owned conversation can still be renamed so it is easy to find.
 
 ### Exit 3 / CDP unreachable (WSL2/Linux)
 

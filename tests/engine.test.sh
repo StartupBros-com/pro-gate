@@ -35,9 +35,9 @@ exit 99
 FAKE_PREFLIGHT
 chmod +x "$TDIR/bin/oracle-preflight"
 
-start_mock() { # $1 = tab text file; sets MOCK_PID + PORT
+start_mock() { # $1 = tab text file; optional $2 = organizer state file; sets MOCK_PID + PORT
   [ -n "${MOCK_PID:-}" ] && kill "$MOCK_PID" 2>/dev/null
-  node "$HERE/mock-cdp.mjs" "$1" > "$TDIR/port" 2>"$TDIR/mock.log" &
+  node "$HERE/mock-cdp.mjs" "$1" "${2:-}" > "$TDIR/port" 2>"$TDIR/mock.log" &
   MOCK_PID=$!
   for _ in $(seq 1 50); do [ -s "$TDIR/port" ] && break; sleep 0.1; done
   PORT="$(tr -d '[:space:]' < "$TDIR/port")"; : > "$TDIR/port"
@@ -51,9 +51,28 @@ run_engine() { # args... ; captures RC
   RC=$?
 }
 
+# Opt-in timeout shim for lifecycle assertions. Set PRO_GATE_TIMEOUT_BIN to this wrapper and
+# PG_TEST_NODE_ARGS to a log file; it records only organizer subprocesses, then preserves timeout.
+REAL_TIMEOUT=/usr/bin/timeout
+TIMEOUT_LOG_BIN="$TDIR/timeout-log"
+cat > "$TIMEOUT_LOG_BIN" <<TIMEOUT_LOG
+#!/usr/bin/env bash
+: >> "\${PG_TEST_NODE_ARGS:?}"
+case " \$* " in
+  *' --organize '*) printf '%s\n' "\$*" >> "\$PG_TEST_NODE_ARGS" ;;
+esac
+exec "$REAL_TIMEOUT" "\$@"
+TIMEOUT_LOG
+chmod +x "$TIMEOUT_LOG_BIN"
+
 echo '# hard-ceiling refusal (exit 11): only diffs past PRO_GATE_DIFF_HARD_MAX are refused'
 printf 'still thinking, run marker: %s\n' "$MARKER" > "$TDIR/tab.txt"
-start_mock "$TDIR/tab.txt"
+ORGANIZER_STATE="$TDIR/organizer-state.json"
+ORGANIZER_TITLE='pro-gate review: PR #77 r1 [engine-fixture]'
+printf '{"title":null,"archived":false,"events":[]}\n' > "$ORGANIZER_STATE"
+mkdir -p "$TDIR/home/conversation-titles"
+printf '%s\n' "$ORGANIZER_TITLE" > "$TDIR/home/conversation-titles/$MARKER"
+start_mock "$TDIR/tab.txt" "$ORGANIZER_STATE"
 # > default hard ceiling (25000): still refused up front, no slot spent.
 seq 1 26000 | sed 's/^/+/' > "$TDIR/huge.diff"
 run_engine --diff "$TDIR/huge.diff" --repo "$TDIR" --out "$TDIR/o-big.md" --timeout 5m
@@ -90,6 +109,9 @@ run_engine --harvest "$MARKER" --out "$TDIR/o-h1.md" --timeout 5s
 check 'harvest in-progress exits 9' "$([ "$RC" -eq 9 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
 check 'harvest in-progress phase' "$([ "$(phase_of "$TDIR/o-h1.md.status")" = in-progress ]; echo $?)" "$(cat "$TDIR/o-h1.md.status" 2>/dev/null)"
 check 'harvest keeps the tab' "$(! grep -q 'closed tab1' "$TDIR/mock.log"; echo $?)" "$(cat "$TDIR/mock.log")"
+check 'exit-9 organizer exact-renames the owned conversation' "$([ "$(jq -r .title "$ORGANIZER_STATE")" = "$ORGANIZER_TITLE" ]; echo $?)" "$(cat "$ORGANIZER_STATE")"
+check 'exit-9 organizer never archives' "$([ "$(jq -r .archived "$ORGANIZER_STATE")" = false ]; echo $?)" "$(cat "$ORGANIZER_STATE")"
+check 'exit-9 organizer performs rename only' "$([ "$(jq -r '[.events[].action] | join(",")' "$ORGANIZER_STATE")" = rename ]; echo $?)" "$(cat "$ORGANIZER_STATE")"
 check 'status carries the marker' "$(grep -qF "\"marker\":\"$MARKER\"" "$TDIR/o-h1.md.status"; echo $?)" "$(cat "$TDIR/o-h1.md.status" 2>/dev/null)"
 check 'in-progress writes durable reservation' "$([ -f "$TDIR/home/in-progress/$MARKER" ]; echo $?)" "reservation missing"
 
@@ -154,6 +176,9 @@ check 'harvest done exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$T
 check 'harvest done phase' "$([ "$(phase_of "$TDIR/o-h2.md.status")" = done ]; echo $?)" "$(cat "$TDIR/o-h2.md.status" 2>/dev/null)"
 check 'harvest writes the review' "$(grep -q 'VERDICT: SHIP' "$TDIR/o-h2.md"; echo $?)" "$(head -c 200 "$TDIR/o-h2.md" 2>/dev/null)"
 check 'harvest closes the tab' "$(grep -q 'closed tab1' "$TDIR/mock.log"; echo $?)" "$(cat "$TDIR/mock.log")"
+check 'durable harvest archives the server conversation' "$([ "$(jq -r .archived "$ORGANIZER_STATE")" = true ]; echo $?)" "$(cat "$ORGANIZER_STATE")"
+check 'durable harvest organizes rename before archive' "$([ "$(jq -r '[.events[].action] | join(",")' "$ORGANIZER_STATE")" = 'rename,archive' ]; echo $?)" "$(cat "$ORGANIZER_STATE")"
+check 'durable harvest has marker-addressed completed bytes before cleanup' "$([ -s "$TDIR/home/completed/$MARKER" ] && cmp -s "$TDIR/home/completed/$MARKER" "$TDIR/o-h2.md"; echo $?)" "completed=$(ls "$TDIR/home/completed" 2>/dev/null)"
 check 'successful harvest releases reservation' "$([ ! -f "$TDIR/home/in-progress/$MARKER" ]; echo $?)" "reservation leaked"
 
 echo '# harvest: already collected (v0.28) vs genuinely gone'
@@ -330,11 +355,12 @@ printf '[P1] a.sh:1 - finding\n  Why: test\nP2: none\nP3: none\nVERDICT: SHIP - 
 FAKE_EV
 chmod +x "$TDIR/bin/oracle-evidence"
 
-freshrun() { # $1=home $2=argv-file $3=evidence $4=out [extra STRATEGY via $5]
+freshrun() { # $1=home $2=argv-file $3=evidence $4=out [strategy] [legacy browser archive]
   rm -rf "$1"; mkdir -p "$1/in-progress"; : > "$2"; printf 'foreign idle tab\n' > "$TDIR/tab.txt"
   PRO_GATE_HOME="$1" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
     PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
-    PRO_GATE_MODEL_STRATEGY="${5:-current}" PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-evidence" \
+    PRO_GATE_MODEL_STRATEGY="${5:-current}" PRO_GATE_BROWSER_ARCHIVE="${6:-never}" \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-evidence" \
     PG_TEST_ARGV_FILE="$2" PG_TEST_EVIDENCE="$3" NODE_OPTIONS= \
     bash "$ENGINE" --diff "$TDIR/small.diff" --repo "$TDIR" --out "$4" --timeout 5s \
     >"$TDIR/stdout" 2>"$TDIR/stderr"
@@ -348,6 +374,8 @@ check 'default run requests strategy current' "$(grep -q -- '--browser-model-str
 freshrun "$TDIR/home-u1b" "$TDIR/argv-sel.txt" "$EV_PRO" "$TDIR/o-u1b.md" select
 check 'PRO_GATE_MODEL_STRATEGY=select passes select' "$(grep -q -- '--browser-model-strategy select' "$TDIR/argv-sel.txt"; echo $?)" "argv=$(head -1 "$TDIR/argv-sel.txt")"
 check 'select still passes -m requested hint' "$(grep -q -- '-m gpt-5.6' "$TDIR/argv-sel.txt"; echo $?)" "argv=$(head -1 "$TDIR/argv-sel.txt")"
+freshrun "$TDIR/home-u1c" "$TDIR/argv-archive.txt" "$EV_PRO" "$TDIR/o-u1c.md" current always
+check 'explicit PRO_GATE_BROWSER_ARCHIVE passes through unchanged' "$(grep -q -- '--browser-archive always' "$TDIR/argv-archive.txt"; echo $?)" "argv=$(head -1 "$TDIR/argv-archive.txt")"
 
 # Fallback: a `select` run whose requested model is not selectable (oracle emits "... in the model
 # switcher") must auto-fall-back to `current` and still produce a review, not fail the whole run
@@ -848,6 +876,353 @@ check 'landed-but-lost run does NOT announce a refund' "$(grep -qv 'refunding th
 check 'landed-but-lost round STAYS charged' \
   "$([ -s "$RHOME/rounds/$RKEY_92" ]; echo $?)" "rounds: $(cat "$RHOME/rounds/$RKEY_92" 2>/dev/null)"
 
+# Gate #72 r8 P1: lifecycle ABSENCE is proof only in a complete, immutable transcript whose tee
+# drained successfully. Pin the helper's fail-closed contract before exercising the full pipeline.
+LOG_PROOF_DIR="$TDIR/log-proof"; mkdir -p "$LOG_PROOF_DIR"
+LOG_TRANSCRIPT="$LOG_PROOF_DIR/oracle.log"; LOG_PROOF="$LOG_PROOF_DIR/oracle.sha256"
+printf 'pre-browser failure\n' > "$LOG_TRANSCRIPT"
+printf '%s\n' "$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_sha256 '$LOG_TRANSCRIPT'")" > "$LOG_PROOF"
+verified_log_rc() {
+  bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_verified_log_lacks \"\$1\" \"\$2\" \"\$3\"" \
+    _ "$1" "$2" 'Launching browser mode|Acquired ChatGPT browser slot'
+}
+verified_log_rc "$LOG_TRANSCRIPT" "$LOG_PROOF"; LOG_RC=$?
+check 'verified lifecycle-free transcript is accepted' "$([ "$LOG_RC" -eq 0 ]; echo $?)" "rc=$LOG_RC"
+rm -f "$LOG_PROOF"; verified_log_rc "$LOG_TRANSCRIPT" "$LOG_PROOF"; LOG_RC=$?
+check 'missing transcript proof fails closed' "$([ "$LOG_RC" -ne 0 ]; echo $?)" "rc=$LOG_RC"
+printf '%s\n' "$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_sha256 '$LOG_TRANSCRIPT'")" > "$LOG_PROOF"
+printf 'late truncation\n' >> "$LOG_TRANSCRIPT"; verified_log_rc "$LOG_TRANSCRIPT" "$LOG_PROOF"; LOG_RC=$?
+check 'transcript changed after proof fails closed' "$([ "$LOG_RC" -ne 0 ]; echo $?)" "rc=$LOG_RC"
+printf 'Launching browser mode\n' > "$LOG_TRANSCRIPT"
+printf '%s\n' "$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_sha256 '$LOG_TRANSCRIPT'")" > "$LOG_PROOF"
+verified_log_rc "$LOG_TRANSCRIPT" "$LOG_PROOF"; LOG_RC=$?
+check 'verified lifecycle evidence remains charged' "$([ "$LOG_RC" -ne 0 ]; echo $?)" "rc=$LOG_RC"
+ln -s "$LOG_TRANSCRIPT" "$LOG_PROOF_DIR/symlink.log"
+verified_log_rc "$LOG_PROOF_DIR/symlink.log" "$LOG_PROOF"; LOG_RC=$?
+check 'symlinked transcript fails closed' "$([ "$LOG_RC" -ne 0 ]; echo $?)" "rc=$LOG_RC"
+
+# Gate #72 r8 P1 end-to-end. These two runs are IDENTICAL except for the tee binary, which is the
+# only way to attribute the outcome to log capture alone: a pre-browser oracle failure that would
+# otherwise refund and retry must become charged and single-shot when its capture fails.
+# The tee is injected via PRO_GATE_TEE_BIN, NOT PATH — pg_augment_path re-prepends /usr/bin before
+# the pipeline runs, so a PATH-injected fake tee never wins and the assertions below would pass
+# with the fix reverted (exactly how the first version of this regression fooled a green CI).
+cat > "$TDIR/bin/oracle-quiet-fail" <<'FAKE_QUIET_FAIL'
+#!/usr/bin/env bash
+[ "${1:-}" = session ] && exit 1
+count=0
+[ -s "${PG_TEST_ATTEMPTS_FILE:?}" ] && count="$(cat "$PG_TEST_ATTEMPTS_FILE")"
+printf '%s\n' "$((count + 1))" > "$PG_TEST_ATTEMPTS_FILE"
+exit 1
+FAKE_QUIET_FAIL
+chmod +x "$TDIR/bin/oracle-quiet-fail"
+mkdir -p "$TDIR/tee-fail-bin"
+cat > "$TDIR/tee-fail-bin/tee" <<'FAKE_TEE_FAIL'
+#!/usr/bin/env bash
+cat
+exit 1
+FAKE_TEE_FAIL
+chmod +x "$TDIR/tee-fail-bin/tee"
+# CONTROL: real tee. Capture is complete, no lifecycle was ever printed -> provably unsubmitted,
+# so the engine both RETRIES and refunds. Without this run, "charged" below proves nothing.
+CTL_HOME="$TDIR/home-tee-ok"; CTL_ATTEMPTS="$TDIR/tee-ok-attempts"
+mkdir -p "$CTL_HOME"; : > "$CTL_ATTEMPTS"
+RKEY_920="$(printf '%s-920' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+env PRO_GATE_HOME="$CTL_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
+  PRO_GATE_MAX_RETRIES=1 PRO_GATE_RETRY_BACKOFF=0 PRO_GATE_REATTACH_TIMEOUT=1 \
+  PRO_GATE_SALVAGE_SECS=2 PRO_GATE_RUN_LOGS=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-quiet-fail" \
+  PG_TEST_ATTEMPTS_FILE="$CTL_ATTEMPTS" NODE_OPTIONS= \
+  bash "$ENGINE" --pr 920 --repo "$TDIR" --diff "$TDIR/small.diff" \
+  --out "$CTL_HOME/o-tee-ok.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'intact log capture still refunds the pre-browser failure' \
+  "$(grep -q 'refunding this round' "$TDIR/stderr"; echo $?)" "rc=$RC $(tail -6 "$TDIR/stderr")"
+check 'intact log capture leaves no in-window spend' \
+  "$([ ! -s "$CTL_HOME/rounds/$RKEY_920" ]; echo $?)" "rounds=$(cat "$CTL_HOME/rounds/$RKEY_920" 2>/dev/null)"
+check 'intact log capture permits the guarded retry' \
+  "$([ "$(cat "$CTL_ATTEMPTS")" = 2 ]; echo $?)" "attempts=$(cat "$CTL_ATTEMPTS")"
+# TEST: same oracle, failing tee. The proof is never published, so the identical evidence must now
+# fail closed — one invocation, charged, no refund.
+LOSS_HOME="$TDIR/home-log-loss"; LOSS_ATTEMPTS="$TDIR/log-loss-attempts"
+mkdir -p "$LOSS_HOME"; : > "$LOSS_ATTEMPTS"
+RKEY_921="$(printf '%s-921' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+env PRO_GATE_HOME="$LOSS_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
+  PRO_GATE_MAX_RETRIES=1 PRO_GATE_RETRY_BACKOFF=0 PRO_GATE_REATTACH_TIMEOUT=1 \
+  PRO_GATE_SALVAGE_SECS=2 PRO_GATE_RUN_LOGS=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-quiet-fail" \
+  PRO_GATE_TEE_BIN="$TDIR/tee-fail-bin/tee" \
+  PG_TEST_ATTEMPTS_FILE="$LOSS_ATTEMPTS" NODE_OPTIONS= \
+  bash "$ENGINE" --pr 921 --repo "$TDIR" --diff "$TDIR/small.diff" \
+  --out "$LOSS_HOME/o-log-loss.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'failed Oracle log capture exits 6' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -5 "$TDIR/stderr")"
+check 'failed Oracle log capture suppresses retry' \
+  "$(grep -q 'incomplete log capture makes its fate ambiguous/spent' "$TDIR/stderr"; echo $?)" "$(tail -8 "$TDIR/stderr")"
+check 'failed Oracle log capture invokes Oracle exactly once' \
+  "$([ "$(cat "$LOSS_ATTEMPTS")" = 1 ]; echo $?)" "attempts=$(cat "$LOSS_ATTEMPTS")"
+check 'failed Oracle log capture stays charged' \
+  "$([ -s "$LOSS_HOME/rounds/$RKEY_921" ]; echo $?)" "rounds=$(cat "$LOSS_HOME/rounds/$RKEY_921" 2>/dev/null)"
+check 'failed Oracle log capture never announces a refund' \
+  "$(! grep -q 'refunding this round' "$TDIR/stderr" && ! grep -q 'round refunded' "$LOSS_HOME/o-log-loss.md.status"; echo $?)" \
+  "stderr=$(tail -6 "$TDIR/stderr") status=$(cat "$LOSS_HOME/o-log-loss.md.status")"
+
+# Gate #72 r9: the watchdog kills the run_oracle SUBSHELL, which therefore never reaches its own
+# proof publication. The parent must publish after reaping, or every watchdog-killed stall would
+# silently lose the pre-browser refund it had before v0.32 — the exact scenario the stall
+# watchdog exists to catch.
+cat > "$TDIR/bin/oracle-stall" <<'FAKE_STALL'
+#!/usr/bin/env bash
+[ "${1:-}" = session ] && exit 1
+count=0
+[ -s "${PG_TEST_ATTEMPTS_FILE:?}" ] && count="$(cat "$PG_TEST_ATTEMPTS_FILE")"
+printf '%s\n' "$((count + 1))" > "$PG_TEST_ATTEMPTS_FILE"
+sleep 120
+FAKE_STALL
+chmod +x "$TDIR/bin/oracle-stall"
+STALL_HOME="$TDIR/home-stall"; STALL_ATTEMPTS="$TDIR/stall-attempts"
+mkdir -p "$STALL_HOME"; : > "$STALL_ATTEMPTS"
+RKEY_922="$(printf '%s-922' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+env PRO_GATE_HOME="$STALL_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
+  PRO_GATE_MAX_RETRIES=0 PRO_GATE_STALL_SECS=1 PRO_GATE_REATTACH_TIMEOUT=1 \
+  PRO_GATE_SALVAGE_SECS=2 PRO_GATE_RUN_LOGS=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-stall" \
+  PG_TEST_ATTEMPTS_FILE="$STALL_ATTEMPTS" NODE_OPTIONS= \
+  bash "$ENGINE" --pr 922 --repo "$TDIR" --diff "$TDIR/small.diff" \
+  --out "$STALL_HOME/o-stall.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'watchdog-killed pre-browser stall exits 6' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -5 "$TDIR/stderr")"
+check 'watchdog-killed stall stays charged even with a lifecycle-free log' \
+  "$([ -s "$STALL_HOME/rounds/$RKEY_922" ]; echo $?)" "rounds=$(cat "$STALL_HOME/rounds/$RKEY_922" 2>/dev/null)"
+check 'watchdog-killed stall never announces a refund' \
+  "$(! grep -q 'refunding this round' "$TDIR/stderr"; echo $?)" "$(tail -8 "$TDIR/stderr")"
+
+# The converse, and the one that matters: a stall that ALREADY printed browser lifecycle must stay
+# charged. That line is only in the transcript because tee drained to EOF after the producer died;
+# killing tee with the pipeline would drop it and turn a spent send into a refunded duplicate.
+cat > "$TDIR/bin/oracle-stall-landed" <<'FAKE_STALL_LANDED'
+#!/usr/bin/env bash
+[ "${1:-}" = session ] && exit 1
+printf 'Launching browser mode\nAcquired ChatGPT browser slot\n'
+sleep 120
+FAKE_STALL_LANDED
+chmod +x "$TDIR/bin/oracle-stall-landed"
+SLANDED_HOME="$TDIR/home-stall-landed"; mkdir -p "$SLANDED_HOME"
+RKEY_923="$(printf '%s-923' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+env PRO_GATE_HOME="$SLANDED_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
+  PRO_GATE_MAX_RETRIES=0 PRO_GATE_STALL_SECS=1 PRO_GATE_REATTACH_TIMEOUT=1 \
+  PRO_GATE_SALVAGE_SECS=2 PRO_GATE_RUN_LOGS=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-stall-landed" \
+  NODE_OPTIONS= \
+  bash "$ENGINE" --pr 923 --repo "$TDIR" --diff "$TDIR/small.diff" \
+  --out "$SLANDED_HOME/o-stall-landed.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'watchdog-killed stall after lifecycle exits 6' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -4 "$TDIR/stderr")"
+check 'watchdog-killed stall after lifecycle stays charged' \
+  "$([ -s "$SLANDED_HOME/rounds/$RKEY_923" ]; echo $?)" "rounds=$(cat "$SLANDED_HOME/rounds/$RKEY_923" 2>/dev/null)"
+check 'watchdog-killed stall after lifecycle never announces a refund' \
+  "$(! grep -q 'refunding this round' "$TDIR/stderr"; echo $?)" "$(tail -6 "$TDIR/stderr")"
+
+# Gate #72 r13 P1: the inner `timeout` can kill Oracle at HARD_SECS while output keeps flowing, so
+# the stall watchdog never fires and the run exits through the NORMAL wait path. tee still returns 0
+# there, so only the producer's own status can reveal that the stream was cut off. Thresholds are
+# set above HARD_SECS deliberately: this must be the timeout's kill, not the watchdog's.
+cat > "$TDIR/bin/oracle-hardcap" <<'FAKE_HARDCAP'
+#!/usr/bin/env bash
+[ "${1:-}" = session ] && exit 1
+count=0
+[ -s "${PG_TEST_ATTEMPTS_FILE:?}" ] && count="$(cat "$PG_TEST_ATTEMPTS_FILE")"
+printf '%s\n' "$((count + 1))" > "$PG_TEST_ATTEMPTS_FILE"
+while :; do printf 'still working\n'; sleep 1; done
+FAKE_HARDCAP
+chmod +x "$TDIR/bin/oracle-hardcap"
+HARDCAP_HOME="$TDIR/home-hardcap"; HARDCAP_ATTEMPTS="$TDIR/hardcap-attempts"
+mkdir -p "$HARDCAP_HOME"; : > "$HARDCAP_ATTEMPTS"
+RKEY_926="$(printf '%s-926' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+env PRO_GATE_HOME="$HARDCAP_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
+  PRO_GATE_MAX_RETRIES=1 PRO_GATE_RETRY_BACKOFF=0 PRO_GATE_STALL_SECS=600 \
+  PRO_GATE_NOTHINK_SECS=600 PRO_GATE_TIMEOUT_GRACE=1 PRO_GATE_REATTACH_TIMEOUT=1 \
+  PRO_GATE_SALVAGE_SECS=2 PRO_GATE_RUN_LOGS=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-hardcap" \
+  PG_TEST_ATTEMPTS_FILE="$HARDCAP_ATTEMPTS" NODE_OPTIONS= \
+  bash "$ENGINE" --pr 926 --repo "$TDIR" --diff "$TDIR/small.diff" \
+  --out "$HARDCAP_HOME/o-hardcap.md" --timeout 2s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'hard-cap timeout kill exits 6' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -4 "$TDIR/stderr")"
+check 'hard-cap timeout kill invokes Oracle exactly once' \
+  "$([ "$(cat "$HARDCAP_ATTEMPTS")" = 1 ]; echo $?)" "attempts=$(cat "$HARDCAP_ATTEMPTS")"
+check 'hard-cap timeout kill stays charged' \
+  "$([ -s "$HARDCAP_HOME/rounds/$RKEY_926" ]; echo $?)" "rounds=$(cat "$HARDCAP_HOME/rounds/$RKEY_926" 2>/dev/null)"
+check 'hard-cap timeout kill never announces a refund' \
+  "$(! grep -q 'refunding this round' "$TDIR/stderr"; echo $?)" "$(tail -5 "$TDIR/stderr")"
+
+# Gate #72 r11 P1: Oracle is a GRANDCHILD of the watchdog's job, so killing the wrappers would
+# reparent it and let it keep driving the browser after this run's slot and locks are released.
+# A TERM-ignoring Oracle is the honest test: only a process-group kill reaches it.
+# NOTE: `trap '' TERM; sleep N` is NOT TERM-proof — the group signal kills the sleep CHILD, the
+# script falls through, and the pipeline drains as if nothing were wrong, so the assertions below
+# would pass without testing anything. Block on a builtin read against a writer-less fifo instead:
+# no child to kill, no CPU burn, and only KILL ends it (verified: `timeout 3` cannot kill it).
+cat > "$TDIR/bin/oracle-term-ignoring" <<'FAKE_TERM_IGNORE'
+#!/usr/bin/env bash
+[ "${1:-}" = session ] && exit 1
+trap '' TERM
+printf '%s\n' "$$" > "${PG_TEST_PRODUCER_PID:?}"
+printf 'Launching browser mode\n'
+exec 3<> "${PG_TEST_BLOCK_FIFO:?}"
+read -u 3 -r _
+FAKE_TERM_IGNORE
+chmod +x "$TDIR/bin/oracle-term-ignoring"
+ORPHAN_HOME="$TDIR/home-orphan"; ORPHAN_PID="$TDIR/orphan-producer.pid"
+ORPHAN_FIFO="$TDIR/orphan-block.fifo"
+RKEY_924="$(printf '%s-924' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
+mkdir -p "$ORPHAN_HOME"; : > "$ORPHAN_PID"; rm -f "$ORPHAN_FIFO"; mkfifo "$ORPHAN_FIFO"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+env PRO_GATE_HOME="$ORPHAN_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
+  PRO_GATE_MAX_RETRIES=0 PRO_GATE_STALL_SECS=1 PRO_GATE_REATTACH_TIMEOUT=1 \
+  PRO_GATE_SALVAGE_SECS=2 PRO_GATE_RUN_LOGS=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-term-ignoring" \
+  PG_TEST_PRODUCER_PID="$ORPHAN_PID" PG_TEST_BLOCK_FIFO="$ORPHAN_FIFO" NODE_OPTIONS= \
+  bash "$ENGINE" --pr 924 --repo "$TDIR" --diff "$TDIR/small.diff" \
+  --out "$ORPHAN_HOME/o-orphan.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+ORPHAN_SEEN="$(cat "$ORPHAN_PID" 2>/dev/null)"
+check 'TERM-ignoring Oracle still terminates the attempt' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+check 'TERM-ignoring Oracle actually started (fixture sanity)' \
+  "$([ -n "$ORPHAN_SEEN" ]; echo $?)" "pid=$ORPHAN_SEEN"
+check 'TERM-ignoring Oracle leaves no surviving descendant' \
+  "$([ -n "$ORPHAN_SEEN" ] && ! kill -0 "$ORPHAN_SEEN" 2>/dev/null; echo $?)" "pid=$ORPHAN_SEEN"
+# Same run also covers the BLUNT-fallback branch: the producer never drains, so the attempt is
+# force-killed. Its proof is revoked, so it must stay charged no matter how clean the log looks.
+check 'force-killed attempt stays charged' \
+  "$([ -s "$ORPHAN_HOME/rounds/$RKEY_924" ]; echo $?)" "rounds=$(cat "$ORPHAN_HOME/rounds/$RKEY_924" 2>/dev/null)"
+check 'force-killed attempt never announces a refund' \
+  "$(! grep -q 'refunding this round' "$TDIR/stderr"; echo $?)" "$(tail -5 "$TDIR/stderr")"
+
+# v0.32: Oracle 0.17+ stores prompt-commit state only after dispatching Send/Enter. Even a complete
+# all-negative DOM probe cannot prove ChatGPT rejected that request, so browser-lifecycle evidence
+# must suppress retries and retain the round regardless of metadata completeness or landing URL.
+cat > "$TDIR/bin/oracle-commit-timeout" <<'FAKE_COMMIT_TIMEOUT'
+#!/usr/bin/env bash
+[ "${1:-}" = session ] && exit 1
+prompt=""; chatgpt_url=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p) prompt="$2"; shift 2 ;;
+    --chatgpt-url) chatgpt_url="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -z "${PG_TEST_CHATGPT_URL_FILE:-}" ] || printf '%s\n' "$chatgpt_url" > "$PG_TEST_CHATGPT_URL_FILE"
+tab_url="${PG_TEST_TAB_URL:-https://chatgpt.com/}"
+count=0
+[ -s "${PG_TEST_ATTEMPTS_FILE:?}" ] && count="$(cat "$PG_TEST_ATTEMPTS_FILE")"
+count=$((count + 1)); printf '%s\n' "$count" > "$PG_TEST_ATTEMPTS_FILE"
+slug="fake-prompt-commit-$count"
+mkdir -p "${ORACLE_HOME_DIR:?}/sessions/$slug"
+jq -n --arg id "$slug" --arg prompt "$prompt" --arg tabUrl "$tab_url" \
+  --argjson promptLength "${#prompt}" '
+  {
+    id: $id,
+    status: "error",
+    mode: "browser",
+    options: {prompt: $prompt},
+    browser: {runtime: {promptSubmitted: true, tabUrl: $tabUrl}},
+    error: {
+      category: "browser-automation",
+      details: {
+        stage: "submit-prompt",
+        code: "prompt-commit-timeout",
+        promptLength: $promptLength,
+        timeoutMs: 60000,
+        commitProbe: {
+          baseline: 0,
+          turnsCount: 0,
+          userMatched: false,
+          prefixMatched: false,
+          lastMatched: false,
+          hasNewTurn: false,
+          stopVisible: false,
+          assistantVisible: false,
+          composerCleared: true,
+          inConversation: false,
+          editorLength: 0,
+          lastTurnLength: 0
+        }
+      }
+    }
+  }
+' > "$ORACLE_HOME_DIR/sessions/$slug/meta.json"
+if [ "${PG_TEST_COMMIT_MODE:-complete}" = partial ]; then
+  jq 'del(.error.details.commitProbe.prefixMatched)' \
+    "$ORACLE_HOME_DIR/sessions/$slug/meta.json" > "$ORACLE_HOME_DIR/sessions/$slug/meta.tmp"
+  mv "$ORACLE_HOME_DIR/sessions/$slug/meta.tmp" "$ORACLE_HOME_DIR/sessions/$slug/meta.json"
+fi
+printf 'Session: %s\n' "$slug"
+printf 'Reattach: oracle session %s\n' "$slug"
+printf 'Launching browser mode\nAcquired ChatGPT browser slot\n'
+printf 'ERROR: Prompt did not appear in conversation before timeout (send may have failed)\n'
+exit 1
+FAKE_COMMIT_TIMEOUT
+chmod +x "$TDIR/bin/oracle-commit-timeout"
+
+PROOF_HOME="$TDIR/home-prompt-proof"; PROOF_ORACLE="$TDIR/oracle-prompt-proof"
+PROOF_ATTEMPTS="$TDIR/prompt-proof-attempts"; PROOF_URL="$TDIR/prompt-proof-url"
+mkdir -p "$PROOF_HOME" "$PROOF_ORACLE"; : > "$PROOF_ATTEMPTS"
+RKEY_93="$(printf '%s-93' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
+PROJECT_URL="https://chatgpt.com/g/g-test/project/project-test"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+env PRO_GATE_HOME="$PROOF_HOME" ORACLE_HOME_DIR="$PROOF_ORACLE" ORACLE_BROWSER_PORT="$PORT" \
+  ORACLE_CHATGPT_URL="$PROJECT_URL" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 \
+  PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=1 PRO_GATE_RETRY_BACKOFF=0 \
+  PRO_GATE_REATTACH_TIMEOUT=1 PRO_GATE_SALVAGE_SECS=2 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-commit-timeout" PG_TEST_ATTEMPTS_FILE="$PROOF_ATTEMPTS" \
+  PG_TEST_CHATGPT_URL_FILE="$PROOF_URL" PG_TEST_TAB_URL="$PROJECT_URL" \
+  NODE_OPTIONS= bash "$ENGINE" --pr 93 --repo "$TDIR" --diff "$TDIR/small.diff" \
+  --out "$PROOF_HOME/o-proof.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'post-click timeout fails without a duplicate retry' \
+  "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -4 "$TDIR/stderr")"
+check 'Project URL is forwarded unchanged to Oracle' \
+  "$([ "$(cat "$PROOF_URL" 2>/dev/null)" = "$PROJECT_URL" ]; echo $?)" "url=$(cat "$PROOF_URL" 2>/dev/null)"
+check 'complete post-click metadata remains ambiguous and suppresses retry' \
+  "$(grep -q 'lifecycle evidence or incomplete log capture makes its fate ambiguous/spent' "$TDIR/stderr"; echo $?)" \
+  "$(tail -8 "$TDIR/stderr")"
+check 'post-click timeout invokes Oracle exactly once' \
+  "$([ "$(cat "$PROOF_ATTEMPTS")" = 1 ]; echo $?)" "attempts=$(cat "$PROOF_ATTEMPTS")"
+check 'post-click timeout stays charged' \
+  "$([ -s "$PROOF_HOME/rounds/$RKEY_93" ]; echo $?)" "rounds=$(cat "$PROOF_HOME/rounds/$RKEY_93" 2>/dev/null)"
+check 'post-click timeout never announces a refund' \
+  "$(! grep -q 'refunding this round' "$TDIR/stderr" && ! grep -q 'round refunded' "$PROOF_HOME/o-proof.md.status"; echo $?)" \
+  "stderr=$(tail -6 "$TDIR/stderr") status=$(cat "$PROOF_HOME/o-proof.md.status")"
+
+# Partial metadata has the same fail-closed result: once browser lifecycle exists, metadata shape
+# has no authority to enable a duplicate retry or refund.
+PARTIAL_HOME="$TDIR/home-prompt-partial"; PARTIAL_ORACLE="$TDIR/oracle-prompt-partial"
+PARTIAL_ATTEMPTS="$TDIR/prompt-partial-attempts"; mkdir -p "$PARTIAL_HOME" "$PARTIAL_ORACLE"; : > "$PARTIAL_ATTEMPTS"
+RKEY_94="$(printf '%s-94' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+env PRO_GATE_HOME="$PARTIAL_HOME" ORACLE_HOME_DIR="$PARTIAL_ORACLE" ORACLE_BROWSER_PORT="$PORT" \
+  PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
+  PRO_GATE_MAX_RETRIES=1 PRO_GATE_RETRY_BACKOFF=0 PRO_GATE_REATTACH_TIMEOUT=1 PRO_GATE_SALVAGE_SECS=2 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-commit-timeout" PG_TEST_ATTEMPTS_FILE="$PARTIAL_ATTEMPTS" \
+  PG_TEST_COMMIT_MODE=partial NODE_OPTIONS= bash "$ENGINE" --pr 94 --repo "$TDIR" \
+  --diff "$TDIR/small.diff" --out "$PARTIAL_HOME/o-partial.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'partial commit metadata fails without a duplicate retry' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -4 "$TDIR/stderr")"
+check 'partial commit metadata suppresses retry' \
+  "$([ "$(cat "$PARTIAL_ATTEMPTS")" = 1 ]; echo $?)" "attempts=$(cat "$PARTIAL_ATTEMPTS")"
+check 'partial commit metadata remains charged' \
+  "$([ -s "$PARTIAL_HOME/rounds/$RKEY_94" ]; echo $?)" "rounds=$(cat "$PARTIAL_HOME/rounds/$RKEY_94" 2>/dev/null)"
+check 'partial commit metadata never announces a refund' \
+  "$(! grep -q 'refunding this round' "$TDIR/stderr"; echo $?)" "$(tail -6 "$TDIR/stderr")"
+
 # #66 gate r2/r3 P1: the spend epoch is the one pg_round_record CHARGED at — not the
 # reservation's `created` field (written at exit-9 time, 35 min later on the live run that
 # exposed this) and not the marker's launch time (minted before two lock waits of up to
@@ -939,16 +1314,47 @@ FAKE_CF
 chmod +x "$TDIR/bin/oracle-cf"
 RKEY_103="$(printf '%s-103' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
 printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+: > "$TDIR/mock.log"
 env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
   PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
   PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-cf" NODE_OPTIONS= \
+  PRO_GATE_TIMEOUT_BIN="$TIMEOUT_LOG_BIN" PG_TEST_NODE_ARGS="$TDIR/node-args-cloudflare.log" \
   bash "$ENGINE" --pr 103 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$RHOME/o-cf.md" --timeout 5s \
   >"$TDIR/stdout" 2>"$TDIR/stderr"
 RC=$?
 check 'cloudflare run fails without a usable review' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
 check 'cloudflare writes the account cooldown' "$([ -f "$RHOME/throttle.cooldown" ]; echo $?)" 'no cooldown file'
 check 'cloudflare refunds the round (no spend, no budget charge)' "$([ ! -f "$RHOME/rounds/$RKEY_103" ]; echo $?)" "rounds file: $(cat "$RHOME/rounds/$RKEY_103" 2>/dev/null)"
+check 'cloudflare failure never invokes organizer mode' "$(! grep -q -- '--organize' "$TDIR/node-args-cloudflare.log"; echo $?)" "$(cat "$TDIR/node-args-cloudflare.log" 2>/dev/null)"
 rm -f "$RHOME/throttle.cooldown"
+
+echo '# v0.32: throttle evidence suppresses exit-9 organization'
+cat > "$TDIR/bin/oracle-throttle" <<'FAKE_THROTTLE'
+#!/usr/bin/env bash
+[ "${1:-}" = session ] && exit 1
+echo 'Launching browser mode'
+echo 'Acquired ChatGPT browser slot'
+exit 1
+FAKE_THROTTLE
+chmod +x "$TDIR/bin/oracle-throttle"
+THOME="$TDIR/home-throttle-organizer"
+TSTATE="$TDIR/state-throttle-organizer.json"
+mkdir -p "$THOME"
+printf '{"title":null,"archived":false,"events":[]}\n' > "$TSTATE"
+printf "You're making requests too quickly. Temporarily limited access to your conversations.\n" > "$TDIR/tab.txt"
+start_mock "$TDIR/tab.txt" "$TSTATE"
+: > "$TDIR/node-args-throttle.log"
+env PRO_GATE_HOME="$THOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_MAX_RETRIES=0 \
+  PRO_GATE_REATTACH_TIMEOUT=1 PRO_GATE_SALVAGE_SECS=2 PRO_GATE_THROTTLE_PAUSE=0 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-throttle" NODE_OPTIONS= \
+  PRO_GATE_TIMEOUT_BIN="$TIMEOUT_LOG_BIN" PG_TEST_NODE_ARGS="$TDIR/node-args-throttle.log" \
+  bash "$ENGINE" --pr 104 --repo "$TDIR" --diff "$TDIR/small.diff" \
+  --out "$THOME/o-throttle.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'throttle salvage preserves the spent run as exit 9' "$([ "$RC" -eq 9 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+check 'throttle evidence writes the account cooldown' "$([ -f "$THOME/throttle.cooldown" ]; echo $?)" 'no cooldown file'
+check 'exit-9 under active throttle never invokes organizer mode' "$(! grep -q -- '--organize' "$TDIR/node-args-throttle.log"; echo $?)" "$(cat "$TDIR/node-args-throttle.log")"
 
 echo '# v0.22.1: pg_round_unrecord drops only the newest entry'
 printf '100\n200\n300\n' > "$RHOME/rounds/unrec-key-1"
@@ -1417,10 +1823,63 @@ printf 'idle tab with no markers at all\n' > "$TDIR/tab.txt"
 # Artifact recovery needs no browser and must precede the cooldown gate (gate #54 r3 P2):
 # retrievable even while the account is cooling.
 printf '%s test-cooldown\n' "$(date +%Y-%m-%dT%H:%M:%S%z)" > "$TDIR/home/throttle.cooldown"
-run_engine --harvest "$M9" --out "$TDIR/o-artifact.md" --timeout 5s
+: > "$TDIR/mock.log"
+: > "$TDIR/node-args-artifact-cooldown.log"
+PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" \
+  PRO_GATE_TIMEOUT_BIN="$TIMEOUT_LOG_BIN" PG_TEST_NODE_ARGS="$TDIR/node-args-artifact-cooldown.log" \
+  bash "$ENGINE" --harvest "$M9" --out "$TDIR/o-artifact.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
 rm -f "$TDIR/home/throttle.cooldown"
 check 'artifact-first recovery exits 0 (even under cooldown, no ledger row)' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
 check 'artifact content returned verbatim' "$(cmp -s "$TDIR/o-artifact.md" "$TDIR/prov-ours.md"; echo $?)" "$(head -2 "$TDIR/o-artifact.md" 2>/dev/null)"
+check 'artifact retrieval under active cooldown never invokes organizer mode' "$(! grep -q -- '--organize' "$TDIR/node-args-artifact-cooldown.log"; echo $?)" "$(cat "$TDIR/node-args-artifact-cooldown.log")"
+
+# A peer can write the shared account cooldown while this process is queued behind the marker's
+# organizer lock. The cooldown check must happen again AFTER lock acquisition; otherwise this
+# process launches stale browser traffic as soon as the peer releases serialization.
+if command -v flock >/dev/null 2>&1; then
+  mkdir -p "$TDIR/home/organizer-locks"
+  : > "$TDIR/node-args-artifact-peer-cooldown.log"
+  (
+    exec 8>>"$TDIR/home/organizer-locks/$M9"
+    flock 8
+    : > "$TDIR/peer-organizer-locked"
+    # Wait until the engine has opened its own descriptor for this flock file. That proves it
+    # reached pg_organizer_lock_acquire and is queued behind fd 8 before the peer writes cooldown.
+    for _ in $(seq 1 100); do
+      waiters=0
+      for fd in /proc/[0-9]*/fd/*; do
+        [ "$(readlink "$fd" 2>/dev/null || true)" = "$TDIR/home/organizer-locks/$M9" ] \
+          && waiters=$((waiters + 1))
+      done
+      [ "$waiters" -ge 2 ] && break
+      sleep 0.05
+    done
+    printf '%s peer-cooldown\n' "$(date +%Y-%m-%dT%H:%M:%S%z)" > "$TDIR/home/throttle.cooldown"
+    sleep 1
+  ) &
+  PEER_LOCK_PID=$!
+  for _ in $(seq 1 50); do [ -f "$TDIR/peer-organizer-locked" ] && break; sleep 0.1; done
+  PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+    PRO_GATE_SELF_HEAL=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" \
+    PRO_GATE_TIMEOUT_BIN="$TIMEOUT_LOG_BIN" \
+    PG_TEST_NODE_ARGS="$TDIR/node-args-artifact-peer-cooldown.log" \
+    bash "$ENGINE" --harvest "$M9" --out "$TDIR/o-artifact-peer-cooldown.md" --timeout 5s \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+  RC=$?
+  wait "$PEER_LOCK_PID"
+  rm -f "$TDIR/home/throttle.cooldown"
+  check 'artifact recovery still exits 0 when a peer starts cooldown during lock wait' \
+    "$([ "$RC" -eq 0 ] && cmp -s "$TDIR/o-artifact-peer-cooldown.md" "$TDIR/prov-ours.md"; echo $?)" \
+    "rc=$RC $(tail -2 "$TDIR/stderr")"
+  check 'post-lock cooldown recheck suppresses stale organizer traffic' \
+    "$(! grep -q -- '--organize' "$TDIR/node-args-artifact-peer-cooldown.log"; echo $?)" \
+    "$(cat "$TDIR/node-args-artifact-peer-cooldown.log")"
+else
+  echo 'ok - post-lock cooldown recheck fixture skipped without flock'
+fi
 # ...and with the browser fully DOWN (gate #54 r4 P2): the fast path precedes the CDP
 # preflight, so a dead port must not turn an on-disk artifact into exit 3.
 env PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT=1 PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 NODE_OPTIONS= \
@@ -1432,6 +1891,102 @@ FLINE="$(tail -1 "$TDIR/home/ledger.jsonl")"
 # v0.30 (#50 item 3): pr is the key's trailing NUMBER; round_key keeps the scoped key.
 check 'fast-path ledger row carries pr + round_key' "$([ "$(printf '%s' "$FLINE" | jq -r .pr)" = "4" ] && [ "$(printf '%s' "$FLINE" | jq -r .round_key)" = "artifact-4" ]; echo $?)" "$FLINE"
 check 'fast-path ledger row records the artifact digest' "$([ "$(printf '%s' "$FLINE" | jq -r '.sha256 // ""')" = "$(sha256sum "$TDIR/home/completed/$M9" | awk '{print $1}')" ]; echo $?)" "$FLINE"
+check 'organizer CDP failure preserves artifact-first exit 0 + output' "$([ "$RC" -eq 0 ] && cmp -s "$TDIR/o-artifact2.md" "$TDIR/prov-ours.md" && grep -q 'reason=cdp-list-failed' "$TDIR/stderr"; echo $?)" "rc=$RC stderr=$(tail -2 "$TDIR/stderr")"
+
+run_artifact_organizer_case() { # <case-id> <marker> [NAME=VALUE ...]
+  local case_id="$1" marker="$2"; shift 2
+  CASE_HOME="$TDIR/home-$case_id"
+  CASE_STATE="$TDIR/state-$case_id.json"
+  CASE_OUT="$TDIR/out-$case_id.md"
+  CASE_TITLE="pro-gate review: PR #${marker##*-} r1 [$case_id]"
+  mkdir -p "$CASE_HOME/completed" "$CASE_HOME/conversation-titles"
+  cp "$TDIR/prov-ours.md" "$CASE_HOME/completed/$marker"
+  printf '%s\n' "$CASE_TITLE" > "$CASE_HOME/conversation-titles/$marker"
+  printf '{"title":null,"archived":false,"events":[]}\n' > "$CASE_STATE"
+  {
+    printf 'run marker: %s\n' "$marker"
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        VERDICT:*) printf '%s (run marker: %s)\n' "$line" "$marker" ;;
+        *) printf '%s\n' "$line" ;;
+      esac
+    done < "$CASE_HOME/completed/$marker"
+  } > "$TDIR/tab.txt"
+  start_mock "$TDIR/tab.txt" "$CASE_STATE"
+  env PRO_GATE_HOME="$CASE_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+    PRO_GATE_SELF_HEAL=0 NODE_OPTIONS= PRO_GATE_TIMEOUT_BIN="$TIMEOUT_LOG_BIN" \
+    PG_TEST_NODE_ARGS="$TDIR/node-args-$case_id.log" "$@" bash "$ENGINE" --harvest "$marker" \
+    --out "$CASE_OUT" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+  CASE_RC=$?
+}
+
+echo '# v0.32: successful organizer controls preserve independent semantics'
+MCFG1='pg-run-config-201-1700000201-21'
+run_artifact_organizer_case archive-off "$MCFG1" PRO_GATE_CHAT_ARCHIVE=0
+check 'CHAT_ARCHIVE=0 keeps exit 0 and exact rename' "$([ "$CASE_RC" -eq 0 ] && [ "$(jq -r .title "$CASE_STATE")" = "$CASE_TITLE" ] && [ "$(jq -r .archived "$CASE_STATE")" = false ]; echo $?)" "rc=$CASE_RC state=$(cat "$CASE_STATE")"
+check 'CHAT_ARCHIVE=0 still closes the verified local tab' "$(grep -q 'closed tab1' "$TDIR/mock.log"; echo $?)" "$(cat "$TDIR/mock.log")"
+check 'artifact finalization has no accepted URL without a validated CDP capture source' "$(! grep -q -- '--accepted-url' "$TDIR/node-args-archive-off.log"; echo $?)" "$(cat "$TDIR/node-args-archive-off.log" 2>/dev/null)"
+check 'finalizer timeout keeps the organizer lock beyond both mutation windows' "$(awk '$1 + 0 >= 75 && /--finalize/ { found=1 } END { exit !found }' "$TDIR/node-args-archive-off.log"; echo $?)" "$(cat "$TDIR/node-args-archive-off.log" 2>/dev/null)"
+
+MCFG2='pg-run-config-202-1700000202-22'
+run_artifact_organizer_case rename-off "$MCFG2" PRO_GATE_CHAT_RENAME=0
+check 'CHAT_RENAME=0 still archives durable success' "$([ "$CASE_RC" -eq 0 ] && [ "$(jq -r .title "$CASE_STATE")" = null ] && [ "$(jq -r .archived "$CASE_STATE")" = true ]; echo $?)" "rc=$CASE_RC state=$(cat "$CASE_STATE")"
+check 'CHAT_RENAME=0 performs archive only, then closes' "$([ "$(jq -r '[.events[].action] | join(",")' "$CASE_STATE")" = archive ] && grep -q 'closed tab1' "$TDIR/mock.log"; echo $?)" "state=$(cat "$CASE_STATE") log=$(cat "$TDIR/mock.log")"
+
+MCFG3='pg-run-config-203-1700000203-23'
+run_artifact_organizer_case keep-tabs "$MCFG3" PRO_GATE_KEEP_TABS=1
+check 'KEEP_TABS=1 permits exact rename but suppresses archive' "$([ "$CASE_RC" -eq 0 ] && [ "$(jq -r .title "$CASE_STATE")" = "$CASE_TITLE" ] && [ "$(jq -r .archived "$CASE_STATE")" = false ]; echo $?)" "rc=$CASE_RC state=$(cat "$CASE_STATE")"
+check 'KEEP_TABS=1 leaves the local tab open' "$(! grep -q 'closed tab1' "$TDIR/mock.log"; echo $?)" "$(cat "$TDIR/mock.log")"
+check 'rename-only timeout keeps the organizer lock beyond its mutation lease' "$(awk '$1 + 0 >= 50 && /--organize/ && !/--finalize/ { found=1 } END { exit !found }' "$TDIR/node-args-keep-tabs.log"; echo $?)" "$(cat "$TDIR/node-args-keep-tabs.log" 2>/dev/null)"
+
+MCFG4='pg-run-config-204-1700000204-24'
+run_artifact_organizer_case invalid-bools "$MCFG4" PRO_GATE_CHAT_RENAME=yes PRO_GATE_CHAT_ARCHIVE=yes
+check 'invalid mutation booleans warn and disable both UI mutations' "$([ "$CASE_RC" -eq 0 ] && [ "$(jq -r '.events | length' "$CASE_STATE")" = 0 ] && grep -q 'invalid PRO_GATE_CHAT_RENAME' "$TDIR/stderr" && grep -q 'invalid PRO_GATE_CHAT_ARCHIVE' "$TDIR/stderr"; echo $?)" "rc=$CASE_RC state=$(cat "$CASE_STATE") stderr=$(grep 'invalid PRO_GATE_CHAT' "$TDIR/stderr")"
+check 'invalid mutation booleans still permit verified local cleanup' "$(grep -q 'closed tab1' "$TDIR/mock.log"; echo $?)" "$(cat "$TDIR/mock.log")"
+
+MCFG5='pg-run-config-205-1700000205-25'
+run_artifact_organizer_case native "$MCFG5" PRO_GATE_BROWSER_MODE=native
+check 'native artifact recovery performs no CDP organization' "$([ "$CASE_RC" -eq 0 ] && [ "$(jq -r '.events | length' "$CASE_STATE")" = 0 ] && ! grep -q 'closed tab1' "$TDIR/mock.log"; echo $?)" "rc=$CASE_RC state=$(cat "$CASE_STATE") log=$(cat "$TDIR/mock.log")"
+
+echo '# v0.32: pending durability archives; volatile-only success stays recoverable'
+run_harvest_durability_case() { # <case-id> <marker> <block-pending:0|1>
+  local case_id="$1" marker="$2" block_pending="$3"
+  CASE_HOME="$TDIR/home-$case_id"
+  CASE_STATE="$TDIR/state-$case_id.json"
+  CASE_OUT="$TDIR/out-$case_id.md"
+  CASE_TITLE="pro-gate review: PR #206 r1 [$case_id]"
+  mkdir -p "$CASE_HOME/in-progress" "$CASE_HOME/manifests" "$CASE_HOME/conversation-titles"
+  printf 'config-206\t%s\t%s\t0\t1\tGPT-X\n' "$CASE_OUT" "$(date +%s)" > "$CASE_HOME/in-progress/$marker"
+  printf 'src/real.sh\n' > "$CASE_HOME/manifests/$marker"
+  printf '%s\n' "$CASE_TITLE" > "$CASE_HOME/conversation-titles/$marker"
+  [ "$block_pending" = 1 ] && printf 'not-a-directory\n' > "$CASE_HOME/pending"
+  printf '{"title":null,"archived":false,"events":[]}\n' > "$CASE_STATE"
+  {
+    printf 'run marker: %s\n' "$marker"
+    printf '[P1] src/real.sh:1 - finding\n  Why: test\nP2: none\nP3: none\nVERDICT: SHIP - fixture. (run marker: %s)\n' "$marker"
+  } > "$TDIR/tab.txt"
+  start_mock "$TDIR/tab.txt" "$CASE_STATE"
+  env PRO_GATE_HOME="$CASE_HOME" PRO_GATE_COMPLETED_DIR="$TDIR/completed-block-$case_id" \
+    ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 NODE_OPTIONS= \
+    PRO_GATE_TIMEOUT_BIN="$TIMEOUT_LOG_BIN" PG_TEST_NODE_ARGS="$TDIR/node-args-$case_id.log" \
+    bash "$ENGINE" --harvest "$marker" --out "$CASE_OUT" --timeout 5s \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+  CASE_RC=$?
+}
+
+printf 'not-a-directory\n' > "$TDIR/completed-block-pending"
+MPEND='pg-run-config-206-1700000206-26'
+run_harvest_durability_case pending "$MPEND" 0
+check 'pending fallback is a durable exit-0 result' "$([ "$CASE_RC" -eq 0 ] && [ -s "$CASE_HOME/pending/$MPEND" ] && grep -q "RESULT_FILE=$CASE_HOME/pending/$MPEND" "$TDIR/stdout"; echo $?)" "rc=$CASE_RC stdout=$(grep RESULT_FILE "$TDIR/stdout")"
+check 'pending fallback still archives and closes' "$([ "$(jq -r .archived "$CASE_STATE")" = true ] && grep -q 'closed tab1' "$TDIR/mock.log"; echo $?)" "state=$(cat "$CASE_STATE") log=$(cat "$TDIR/mock.log")"
+check 'validated harvest forwards its exact CDP capture URL to finalization' "$(grep -q -- '--accepted-url https://chatgpt.com/c/mock-conversation' "$TDIR/node-args-pending.log"; echo $?)" "$(cat "$TDIR/node-args-pending.log" 2>/dev/null)"
+
+printf 'not-a-directory\n' > "$TDIR/completed-block-volatile"
+MVOL='pg-run-config-207-1700000207-27'
+run_harvest_durability_case volatile "$MVOL" 1
+check 'volatile-only persistence still returns exit 0 with explicit warning' "$([ "$CASE_RC" -eq 0 ] && grep -q 'no durable store writable' "$TDIR/stderr"; echo $?)" "rc=$CASE_RC stderr=$(grep 'no durable store' "$TDIR/stderr")"
+check 'volatile-only success exact-renames but never archives' "$([ "$(jq -r .title "$CASE_STATE")" = "$CASE_TITLE" ] && [ "$(jq -r .archived "$CASE_STATE")" = false ]; echo $?)" "state=$(cat "$CASE_STATE")"
+check 'volatile-only success leaves the local tab open and reservation held' "$(! grep -q 'closed tab1' "$TDIR/mock.log" && [ -f "$CASE_HOME/in-progress/$MVOL" ]; echo $?)" "log=$(cat "$TDIR/mock.log") reservation=$(ls "$CASE_HOME/in-progress" 2>/dev/null)"
 
 echo '# v0.28: provenance rejection blacklists precisely (compare-and-delete memo)'
 mkdir -p "$SHOME/conversation-urls"
@@ -1530,7 +2085,9 @@ exit 1
 EARLY
 chmod +x "$TDIR/bin/oracle-early"
 printf 'no marker yet\n' > "$TDIR/tab.txt"
-start_mock "$TDIR/tab.txt"
+EARLY_STATE="$TDIR/early-organizer-state.json"
+printf '{"title":null,"archived":false,"events":[]}\n' > "$EARLY_STATE"
+start_mock "$TDIR/tab.txt" "$EARLY_STATE"
 rm -rf "$TDIR/home/conversation-urls"; mkdir -p "$TDIR/home/in-progress"
 env PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
   PRO_GATE_RAMP=0 PRO_GATE_MAX_RETRIES=0 PRO_GATE_EARLY_PROBE_SECS=1 \
@@ -1542,8 +2099,55 @@ RC=$?
 check 'early-capture run preserves as in-progress (exit 9)' "$([ "$RC" -eq 9 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
 check 'conversation URL memo written DURING generation' "$(ls "$TDIR/home/conversation-urls/" 2>/dev/null | grep -q 'pg-run-'; echo $?)" "$(ls "$TDIR/home/conversation-urls/" 2>/dev/null)"
 EARLY_MARKER="$(ls "$TDIR/home/in-progress/" 2>/dev/null | grep -m1 -E 'pg-run-.*-120-')"
+check 'early organizer applies the marker memo title exactly' "$([ -n "$EARLY_MARKER" ] && [ "$(jq -r .title "$EARLY_STATE")" = "$(cat "$TDIR/home/conversation-titles/$EARLY_MARKER" 2>/dev/null)" ]; echo $?)" "state=$(cat "$EARLY_STATE") memo=$(cat "$TDIR/home/conversation-titles/$EARLY_MARKER" 2>/dev/null)"
+check 'early organizer leaves in-progress conversation unarchived' "$([ "$(jq -r .archived "$EARLY_STATE")" = false ] && ! grep -q 'closed tab1' "$TDIR/mock.log"; echo $?)" "state=$(cat "$EARLY_STATE") log=$(cat "$TDIR/mock.log")"
+check 'early organizer diagnostic is persisted in the run log' "$(grep -Rqs '^\[oracle-review\] organizer source=' "$TDIR/home/logs"; echo $?)" "$(find "$TDIR/home/logs" -maxdepth 1 -type f -print 2>/dev/null)"
 check 'change manifest written beside the reservation' "$([ -n "$EARLY_MARKER" ] && [ -s "$TDIR/home/manifests/$EARLY_MARKER" ]; echo $?)" "manifests: $(ls "$TDIR/home/manifests" 2>/dev/null)"
 check 'nonce expectation flag recorded' "$([ -n "$EARLY_MARKER" ] && [ -f "$TDIR/home/manifests/$EARLY_MARKER.nonce" ]; echo $?)" "manifests: $(ls "$TDIR/home/manifests" 2>/dev/null)"
+
+echo '# v0.32: a failed owned run stays named, unarchived, and locally untouched'
+cat > "$TDIR/bin/oracle-early-failed" <<'EARLY_FAIL'
+#!/usr/bin/env bash
+[ "${1:-}" = session ] && exit 1
+marker=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p) marker="$(printf '%s' "$2" | grep -oE 'pg-run-[A-Za-z0-9.-]+' | head -1)"; shift 2;;
+    *) shift;;
+  esac
+done
+printf 'still thinking, run marker: %s\n' "$marker" > "${PG_TEST_TAB_FILE:?}"
+printf 'Acquired ChatGPT browser slot\n' >&2
+# Wait until the early organizer has positively owned and named the chat, then model a browser-
+# local loss that final salvage can prove absent. Removing the remembered URL is intentional:
+# without that decisive loss signal the engine correctly preserves as in-progress (exit 9).
+for _ in $(seq 1 60); do
+  grep -q '"title":"pro-gate review:' "${PG_TEST_STATE_FILE:?}" 2>/dev/null && break
+  sleep 0.1
+done
+rm -f "${PRO_GATE_HOME:?}/conversation-urls/$marker"
+printf '__NO_TABS__' > "$PG_TEST_TAB_FILE"
+exit 1
+EARLY_FAIL
+chmod +x "$TDIR/bin/oracle-early-failed"
+FAIL_HOME="$TDIR/home-organizer-failed"
+FAIL_STATE="$TDIR/state-organizer-failed.json"
+mkdir -p "$FAIL_HOME"
+printf '{"title":null,"archived":false,"events":[]}\n' > "$FAIL_STATE"
+printf 'no marker yet\n' > "$TDIR/tab.txt"
+start_mock "$TDIR/tab.txt" "$FAIL_STATE"
+env PRO_GATE_HOME="$FAIL_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_MAX_RETRIES=0 \
+  PRO_GATE_EARLY_PROBE_SECS=1 PRO_GATE_REATTACH_TIMEOUT=1 PRO_GATE_SALVAGE_SECS=2 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-early-failed" PG_TEST_TAB_FILE="$TDIR/tab.txt" \
+  PG_TEST_STATE_FILE="$FAIL_STATE" NODE_OPTIONS= \
+  bash "$ENGINE" --pr 121 --repo "$TDIR" --diff "$TDIR/small.diff" \
+  --out "$TDIR/o-organizer-failed.md" --timeout 8s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+FAIL_MARKER="$(jq -r .marker "$TDIR/o-organizer-failed.md.status" 2>/dev/null)"
+check 'owned failed run exits 6 after decisive loss' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC stderr=$(tail -3 "$TDIR/stderr")"
+check 'owned failed run keeps its exact early title' "$([ -n "$FAIL_MARKER" ] && [ "$(jq -r .title "$FAIL_STATE")" = "$(cat "$FAIL_HOME/conversation-titles/$FAIL_MARKER" 2>/dev/null)" ]; echo $?)" "state=$(cat "$FAIL_STATE") marker=$FAIL_MARKER"
+check 'owned failed run is never archived or locally closed' "$([ "$(jq -r .archived "$FAIL_STATE")" = false ] && [ "$(jq -r '[.events[].action] | join(",")' "$FAIL_STATE")" = rename ] && ! grep -q 'closed tab1' "$TDIR/mock.log"; echo $?)" "state=$(cat "$FAIL_STATE") log=$(cat "$TDIR/mock.log")"
 
 echo '# v0.28: direct capture with an echoed nonce is stripped before output'
 cat > "$TDIR/bin/oracle-nonce" <<'NONCE'
@@ -1563,13 +2167,317 @@ printf 'foreign idle tab\n' > "$TDIR/tab.txt"
 # recorded slot would (correctly) exclude this fresh run and park it in the account-slot
 # queue for the whole lock wait.
 mkdir -p "$TDIR/home-nonce"
+: > "$TDIR/node-args-directnonce.log"
 env PRO_GATE_HOME="$TDIR/home-nonce" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
   PRO_GATE_RAMP=0 PRO_GATE_MAX_RETRIES=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-nonce" NODE_OPTIONS= \
+  PRO_GATE_TIMEOUT_BIN="$TIMEOUT_LOG_BIN" PG_TEST_NODE_ARGS="$TDIR/node-args-directnonce.log" \
   bash "$ENGINE" --pr 131 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$TDIR/o-directnonce.md" --timeout 5s \
   >"$TDIR/stdout" 2>"$TDIR/stderr"
 RC=$?
 check 'direct nonce capture exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
 check 'direct capture nonce stripped' "$(grep -q 'run marker' "$TDIR/o-directnonce.md"; [ $? -ne 0 ]; echo $?)" "$(tail -1 "$TDIR/o-directnonce.md" 2>/dev/null)"
+check 'direct capture finalization never invents accepted URL authority' "$(! grep -q -- '--accepted-url' "$TDIR/node-args-directnonce.log"; echo $?)" "$(cat "$TDIR/node-args-directnonce.log")"
+
+echo '# v0.32: a delayed early organizer cannot wake after terminal archive/close'
+cat > "$TDIR/bin/oracle-organizer-race" <<'RACE'
+#!/usr/bin/env bash
+out=""; marker=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p) marker="$(printf '%s' "$2" | grep -oE 'pg-run-[A-Za-z0-9.-]+' | head -1)"; shift 2;;
+    --write-output) out="$2"; shift 2;;
+    *) shift;;
+  esac
+done
+printf '[P1] a.sh:1 - finding\n  Why: test\nP2: none\nP3: none\nVERDICT: SHIP - fixture. (run marker: %s)\n' "$marker" > "$out"
+{ printf 'run marker: %s\n' "$marker"; cat "$out"; } > "${PG_TEST_TAB_FILE:?}"
+RACE
+chmod +x "$TDIR/bin/oracle-organizer-race"
+RACE_HOME="$TDIR/home-organizer-race"
+RACE_STATE="$TDIR/state-organizer-race.json"
+mkdir -p "$RACE_HOME"
+printf '{"title":null,"archived":false,"events":[]}\n' > "$RACE_STATE"
+printf 'no marker yet\n' > "$TDIR/tab.txt"
+start_mock "$TDIR/tab.txt" "$RACE_STATE"
+RACE_START="$(date +%s)"
+env PRO_GATE_HOME="$RACE_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_MAX_RETRIES=0 \
+  PRO_GATE_EARLY_PROBE_SECS=15 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-organizer-race" \
+  PG_TEST_TAB_FILE="$TDIR/tab.txt" NODE_OPTIONS= \
+  bash "$ENGINE" --pr 132 --repo "$TDIR" --diff "$TDIR/small.diff" \
+  --out "$TDIR/o-organizer-race.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+RACE_ELAPSED=$(( $(date +%s) - RACE_START ))
+check 'terminal success beats the delayed organizer timer' "$([ "$RC" -eq 0 ] && [ "$RACE_ELAPSED" -lt 15 ] && grep -q 'closed tab1' "$TDIR/mock.log"; echo $?)" "rc=$RC elapsed=$RACE_ELAPSED log=$(cat "$TDIR/mock.log")"
+sleep 6
+check 'revoked early organizer performs no post-finalization render or mutation' "$([ "$(jq -r '[.events[].action] | join(",")' "$RACE_STATE")" = 'rename,archive' ] && ! grep -q '^opened scratch' "$TDIR/mock.log"; echo $?)" "state=$(cat "$RACE_STATE") log=$(cat "$TDIR/mock.log")"
+
+# A helper that already passed lease validation owns the marker lock until its browser work ends.
+# Terminal paths that elect no mutation must still join it: otherwise the helper survives the
+# parent and can render through a cooldown written after the parent already ledgered its outcome.
+cat > "$TDIR/bin/oracle-organizer-join" <<'JOIN'
+#!/usr/bin/env bash
+out=""; marker=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p) marker="$(printf '%s' "$2" | grep -oE 'pg-run-[A-Za-z0-9.-]+' | head -1)"; shift 2;;
+    --write-output) out="$2"; shift 2;;
+    *) shift;;
+  esac
+done
+mkdir -p "${PRO_GATE_HOME:?}/organizer-locks"
+if command -v flock >/dev/null 2>&1; then
+  (
+    exec 8>>"$PRO_GATE_HOME/organizer-locks/$marker"
+    flock 8
+    : > "${PG_TEST_JOIN_LOCKED:?}"
+    sleep 3
+    : > "${PG_TEST_JOIN_RELEASED:?}"
+  ) </dev/null >/dev/null 2>&1 &
+else
+  (
+    mkdir "$PRO_GATE_HOME/organizer-locks/$marker.d"
+    : > "${PG_TEST_JOIN_LOCKED:?}"
+    sleep 3
+    rmdir "$PRO_GATE_HOME/organizer-locks/$marker.d"
+    : > "${PG_TEST_JOIN_RELEASED:?}"
+  ) </dev/null >/dev/null 2>&1 &
+fi
+for _ in $(seq 1 50); do [ -f "${PG_TEST_JOIN_LOCKED:?}" ] && break; sleep 0.1; done
+printf '[P1] a.sh:1 - finding\n  Why: test\nP2: none\nP3: none\nVERDICT: SHIP - fixture. (run marker: %s)\n' "$marker" > "$out"
+JOIN
+chmod +x "$TDIR/bin/oracle-organizer-join"
+
+run_join_only_case() { # <id> [NAME=VALUE ...]
+  local id="$1"; shift
+  JOIN_HOME="$TDIR/home-join-$id"
+  JOIN_OUT="$TDIR/o-join-$id.md"
+  JOIN_LOCKED="$TDIR/join-$id.locked"
+  JOIN_RELEASED="$TDIR/join-$id.released"
+  mkdir -p "$JOIN_HOME"
+  printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+  start_mock "$TDIR/tab.txt"
+  env PRO_GATE_HOME="$JOIN_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+    PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_MAX_RETRIES=0 PRO_GATE_KEEP_TABS=1 \
+    PRO_GATE_EARLY_PROBE_SECS=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-organizer-join" \
+    PG_TEST_JOIN_LOCKED="$JOIN_LOCKED" PG_TEST_JOIN_RELEASED="$JOIN_RELEASED" \
+    NODE_OPTIONS= "$@" bash "$ENGINE" --pr 133 --repo "$TDIR" \
+      --diff "$TDIR/small.diff" --out "$JOIN_OUT" --timeout 5s \
+      >"$TDIR/stdout" 2>"$TDIR/stderr"
+  JOIN_RC=$?
+}
+
+echo '# v0.32 gate: every terminal path joins an already-running early organizer'
+run_join_only_case rename-off PRO_GATE_CHAT_RENAME=0
+check 'rename-disabled KEEP_TABS success waits for the marker organizer' \
+  "$([ "$JOIN_RC" -eq 0 ] && [ -f "$JOIN_RELEASED" ]; echo $?)" \
+  "rc=$JOIN_RC released=$(test -f "$JOIN_RELEASED"; echo $?) stderr=$(tail -2 "$TDIR/stderr")"
+
+mkdir -p "$TDIR/home-join-title-missing"
+printf 'blocks-title-directory\n' > "$TDIR/home-join-title-missing/conversation-titles"
+run_join_only_case title-missing
+check 'missing title memo still waits for the marker organizer' \
+  "$([ "$JOIN_RC" -eq 0 ] && [ -f "$JOIN_RELEASED" ]; echo $?)" \
+  "rc=$JOIN_RC released=$(test -f "$JOIN_RELEASED"; echo $?) stderr=$(tail -2 "$TDIR/stderr")"
+
+# A successful model capture can encounter a throttle only during terminal organization. The child
+# writes shared cooldown state; the parent must join it before one ramp update and one ledger append.
+echo '# v0.32 gate: organizer throttle precedes ramp and ledger settlement'
+THROTTLE_HOME="$TDIR/home-organizer-throttle"
+mkdir -p "$THROTTLE_HOME"
+printf '2\t4\tseed\n' > "$THROTTLE_HOME/ramp.state"
+printf "%s\n" "You're making requests too quickly. Temporarily limited access to your conversations." > "$TDIR/tab.txt"
+start_mock "$TDIR/tab.txt"
+env PRO_GATE_HOME="$THROTTLE_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=1 PRO_GATE_RAMP_STREAK=5 PRO_GATE_MAX_CONCURRENCY=3 \
+  PRO_GATE_MAX_RETRIES=0 PRO_GATE_EARLY_PROBE_SECS=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-nonce" \
+  NODE_OPTIONS= bash "$ENGINE" --pr 134 --repo "$TDIR" --diff "$TDIR/small.diff" \
+    --out "$TDIR/o-organizer-throttle.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+THROTTLE_ROW="$(tail -1 "$THROTTLE_HOME/ledger.jsonl" 2>/dev/null)"
+check 'organizer-detected throttle preserves collected exit 0' \
+  "$([ "$RC" -eq 0 ] && [ -f "$THROTTLE_HOME/throttle.cooldown" ]; echo $?)" \
+  "rc=$RC cooldown=$(cat "$THROTTLE_HOME/throttle.cooldown" 2>/dev/null)"
+check 'organizer throttle is ledgered instead of clean' \
+  "$([ "$(printf '%s' "$THROTTLE_ROW" | jq -r .outcome 2>/dev/null)" = throttle ]; echo $?)" \
+  "$THROTTLE_ROW"
+check 'organizer throttle applies exactly one ramp reset' \
+  "$([ "$(grep -c '^\[pro-gate ramp\]' "$TDIR/stderr")" -eq 1 ] \
+      && grep -q 'throttle observed' "$TDIR/stderr" \
+      && awk -F'\t' 'NR==1{exit !($1==1 && $2==0)}' "$THROTTLE_HOME/ramp.state"; echo $?)" \
+  "state=$(cat "$THROTTLE_HOME/ramp.state" 2>/dev/null) ramp-log=$(grep '^\[pro-gate ramp\]' "$TDIR/stderr")"
+
+# A cooldown that predates artifact-only recovery suppresses browser traffic, but it is not evidence
+# that this invocation hit a throttle. Preserve the existing clean ledger semantics.
+ARTIFACT_COOLDOWN_ROW="$(grep -F '"out":"'$TDIR'/o-artifact.md"' "$TDIR/home/ledger.jsonl" | tail -1)"
+check 'pre-existing cooldown does not relabel artifact recovery as throttle' \
+  "$([ "$(printf '%s' "$ARTIFACT_COOLDOWN_ROW" | jq -r .outcome 2>/dev/null)" = clean ]; echo $?)" \
+  "$ARTIFACT_COOLDOWN_ROW"
+
+# Stock macOS lacks flock. Model a winner paused after mkdir but before metadata publication; a
+# contender must treat that empty directory as busy rather than deleting a live lock after one second.
+echo '# v0.32 gate: no-flock organizer lock never steals a publication-in-progress'
+NOFLOCK_HOME="$TDIR/home-organizer-noflock"
+NOFLOCK_MARKER='pg-run-config-208-1700000208-28'
+NOFLOCK_DIR="$NOFLOCK_HOME/organizer-locks/$NOFLOCK_MARKER.d"
+mkdir -p "$NOFLOCK_HOME/completed" "$NOFLOCK_HOME/conversation-titles" "$NOFLOCK_DIR"
+cp "$TDIR/prov-ours.md" "$NOFLOCK_HOME/completed/$NOFLOCK_MARKER"
+printf 'pro-gate review: PR #208 r1 [noflock]\n' > "$NOFLOCK_HOME/conversation-titles/$NOFLOCK_MARKER"
+inode_of() { stat -c %i "$1" 2>/dev/null || stat -f %i "$1" 2>/dev/null; }
+NOFLOCK_INODE="$(inode_of "$NOFLOCK_DIR")"
+(
+  sleep 2
+  [ -d "$NOFLOCK_DIR" ] && [ "$(inode_of "$NOFLOCK_DIR")" = "$NOFLOCK_INODE" ] \
+    || { : > "$TDIR/noflock-stolen"; exit 0; }
+  owner="${BASHPID:-$$}"
+  token="$(bash -c '. "'$HERE'/../lib/pro-gate-lib.sh"; pg_pid_token '"$owner" 2>/dev/null || true)"
+  printf '%s\n' "$owner" > "$NOFLOCK_DIR/pid"
+  printf '%s\n' "$token" > "$NOFLOCK_DIR/token"
+  : > "$TDIR/noflock-published"
+  sleep 2
+  rm -rf "$NOFLOCK_DIR"
+) &
+NOFLOCK_OWNER_PID=$!
+printf 'idle tab with no markers\n' > "$TDIR/tab.txt"
+start_mock "$TDIR/tab.txt"
+env PRO_GATE_HOME="$NOFLOCK_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_TEST_ORGANIZER_NO_FLOCK=1 \
+  PRO_GATE_TEST_ORGANIZER_LOCK_WAIT=8 PRO_GATE_TIMEOUT_BIN="$TIMEOUT_LOG_BIN" \
+  PG_TEST_NODE_ARGS="$TDIR/node-args-noflock.log" NODE_OPTIONS= \
+  bash "$ENGINE" --harvest "$NOFLOCK_MARKER" --out "$TDIR/o-noflock.md" --timeout 5s \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+wait "$NOFLOCK_OWNER_PID"
+check 'no-flock contender preserves the live unpublished lock' \
+  "$([ "$RC" -eq 0 ] && [ -f "$TDIR/noflock-published" ] && [ ! -f "$TDIR/noflock-stolen" ]; echo $?)" \
+  "rc=$RC published=$(test -f "$TDIR/noflock-published"; echo $?) stolen=$(test -f "$TDIR/noflock-stolen"; echo $?) stderr=$(tail -2 "$TDIR/stderr")"
+check 'no-flock lock metadata and directory are retired after the join' \
+  "$([ ! -e "$NOFLOCK_DIR" ]; echo $?)" "lock remains: $(find "$NOFLOCK_HOME/organizer-locks" -maxdepth 2 -print 2>/dev/null)"
+
+# Housekeeping must run on artifact-only harvests, not only fresh reviews. A day-old crash-left
+# directory should be removed before the no-flock join, while a fresh sibling remains untouched.
+echo '# v0.32 gate: harvest-only recovery sweeps stale organizer locks'
+STALE_HOME="$TDIR/home-organizer-stale"
+STALE_LOCK_ROOT="$TDIR/custom-organizer-locks"
+STALE_MARKER='pg-run-config-2081-1700000281-281'
+STALE_DIR="$STALE_LOCK_ROOT/$STALE_MARKER.d"
+FRESH_DIR="$STALE_LOCK_ROOT/pg-run-config-fresh-1700000282-282.d"
+mkdir -p "$STALE_HOME/completed" "$STALE_DIR" "$FRESH_DIR"
+cp "$TDIR/prov-ours.md" "$STALE_HOME/completed/$STALE_MARKER"
+touch -d '3 days ago' "$STALE_DIR" 2>/dev/null || touch -t 202001010000 "$STALE_DIR"
+env PRO_GATE_HOME="$STALE_HOME" PRO_GATE_ORGANIZER_LOCK_DIR="$STALE_LOCK_ROOT" \
+  ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_KEEP_TABS=1 PRO_GATE_CHAT_RENAME=0 \
+  PRO_GATE_TEST_ORGANIZER_NO_FLOCK=1 PRO_GATE_TEST_ORGANIZER_LOCK_WAIT=1 NODE_OPTIONS= \
+  bash "$ENGINE" --harvest "$STALE_MARKER" --out "$TDIR/o-noflock-stale.md" --timeout 5s \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'artifact-only harvest removes its stale no-flock lock before joining' \
+  "$([ "$RC" -eq 0 ] && [ ! -e "$STALE_DIR" ] \
+      && ! grep -q 'organizer-lock-timeout' "$TDIR/stderr"; echo $?)" \
+  "rc=$RC stderr=$(cat "$TDIR/stderr") locks=$(find "$STALE_LOCK_ROOT" -maxdepth 2 -print 2>/dev/null)"
+check 'organizer housekeeping honors the custom directory and preserves fresh locks' \
+  "$([ -d "$FRESH_DIR" ]; echo $?)" \
+  "locks=$(find "$STALE_LOCK_ROOT" -maxdepth 2 -print 2>/dev/null)"
+check 'stale-lock recovery returns the exact durable artifact' \
+  "$(cmp -s "$TDIR/o-noflock-stale.md" "$STALE_HOME/completed/$STALE_MARKER"; echo $?)" \
+  "stdout=$(grep RESULT_FILE "$TDIR/stdout" 2>/dev/null)"
+
+# --status is inspection-only even when it sees organizer housekeeping candidates.
+STATUS_STALE_DIR="$STALE_LOCK_ROOT/pg-run-status-stale-1700000283-283.d"
+mkdir -p "$STATUS_STALE_DIR"
+touch -d '3 days ago' "$STATUS_STALE_DIR" 2>/dev/null || touch -t 202001010000 "$STATUS_STALE_DIR"
+env PRO_GATE_HOME="$STALE_HOME" PRO_GATE_ORGANIZER_LOCK_DIR="$STALE_LOCK_ROOT" \
+  bash "$ENGINE" --status >"$TDIR/status-organizer-lock.out" 2>"$TDIR/status-organizer-lock.err"
+RC=$?
+check '--status does not sweep stale organizer locks' \
+  "$([ "$RC" -eq 0 ] && [ -d "$STATUS_STALE_DIR" ]; echo $?)" \
+  "rc=$RC stderr=$(cat "$TDIR/status-organizer-lock.err")"
+
+# An empty crash-left directory has no trustworthy owner record. It stays busy for this bounded
+# call rather than being deleted from under a winner that may still be publishing metadata.
+BUSY_HOME="$TDIR/home-organizer-busy"
+BUSY_MARKER='pg-run-config-209-1700000209-29'
+mkdir -p "$BUSY_HOME/completed" "$BUSY_HOME/organizer-locks/$BUSY_MARKER.d"
+cp "$TDIR/prov-ours.md" "$BUSY_HOME/completed/$BUSY_MARKER"
+env PRO_GATE_HOME="$BUSY_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_KEEP_TABS=1 PRO_GATE_CHAT_RENAME=0 \
+  PRO_GATE_TEST_ORGANIZER_NO_FLOCK=1 PRO_GATE_TEST_ORGANIZER_LOCK_WAIT=1 NODE_OPTIONS= \
+  bash "$ENGINE" --harvest "$BUSY_MARKER" --out "$TDIR/o-noflock-busy.md" --timeout 5s \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'no-flock missing metadata stays busy instead of being stolen' \
+  "$([ "$RC" -eq 0 ] && [ -d "$BUSY_HOME/organizer-locks/$BUSY_MARKER.d" ] \
+      && grep -q 'organizer-lock-timeout' "$TDIR/stderr"; echo $?)" \
+  "rc=$RC stderr=$(cat "$TDIR/stderr")"
+
+# Selectively fail the ownership-record install after mkdir. Acquisition must fail and remove its
+# partial directory; browser work must never start under unpublished ownership.
+PUB_HOME="$TDIR/home-organizer-publish-fail"
+PUB_MARKER='pg-run-config-210-1700000210-30'
+PUB_OS_HOME="$TDIR/os-home-organizer-publish-fail"
+PUB_INTERCEPT="$TDIR/organizer-publish-intercepted"
+mkdir -p "$PUB_HOME/completed" "$PUB_OS_HOME/.local/bin"
+cp "$TDIR/prov-ours.md" "$PUB_HOME/completed/$PUB_MARKER"
+cat > "$PUB_OS_HOME/.local/bin/mv" <<'PUB_MV'
+#!/usr/bin/env bash
+last=""
+for arg in "$@"; do last="$arg"; done
+case "$last" in
+  */organizer-locks/*.d/pid)
+    : > "${PG_TEST_PUB_INTERCEPT:?}"
+    exit 1
+    ;;
+esac
+exec /bin/mv "$@"
+PUB_MV
+chmod +x "$PUB_OS_HOME/.local/bin/mv"
+env HOME="$PUB_OS_HOME" PG_TEST_PUB_INTERCEPT="$PUB_INTERCEPT" \
+  PRO_GATE_HOME="$PUB_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_KEEP_TABS=1 PRO_GATE_CHAT_RENAME=0 \
+  PRO_GATE_TEST_ORGANIZER_NO_FLOCK=1 PRO_GATE_TEST_ORGANIZER_LOCK_WAIT=1 NODE_OPTIONS= \
+  bash "$ENGINE" --harvest "$PUB_MARKER" --out "$TDIR/o-noflock-publish.md" --timeout 5s \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'no-flock acquisition fails when ownership publication fails' \
+  "$([ "$RC" -eq 0 ] && [ -f "$PUB_INTERCEPT" ] \
+      && [ ! -e "$PUB_HOME/organizer-locks/$PUB_MARKER.d" ] \
+      && grep -q 'organizer-lock-timeout' "$TDIR/stderr"; echo $?)" \
+  "rc=$RC intercepted=$(test -f "$PUB_INTERCEPT"; echo $?) stderr=$(cat "$TDIR/stderr") locks=$(find "$PUB_HOME/organizer-locks" -maxdepth 2 -print 2>/dev/null)"
+
+# Replace ownership while the organizer helper runs. Release must compare both fields and preserve
+# the replacement directory instead of deleting a lock it no longer owns.
+RELEASE_HOME="$TDIR/home-organizer-release"
+RELEASE_MARKER='pg-run-config-211-1700000211-31'
+RELEASE_TIMEOUT="$TDIR/timeout-organizer-release"
+mkdir -p "$RELEASE_HOME/completed" "$RELEASE_HOME/conversation-titles"
+cp "$TDIR/prov-ours.md" "$RELEASE_HOME/completed/$RELEASE_MARKER"
+printf 'pro-gate review: PR #211 r1 [release]\n' > "$RELEASE_HOME/conversation-titles/$RELEASE_MARKER"
+cat > "$RELEASE_TIMEOUT" <<'RELEASE_TIMEOUT_SH'
+#!/usr/bin/env bash
+case " $* " in
+  *' --organize '*)
+    for dir in "${PRO_GATE_HOME:?}"/organizer-locks/*.d; do
+      [ -d "$dir" ] || continue
+      printf 'replacement-owner\n' > "$dir/pid"
+    done ;;
+esac
+exec /usr/bin/timeout "$@"
+RELEASE_TIMEOUT_SH
+chmod +x "$RELEASE_TIMEOUT"
+printf 'idle tab with no markers\n' > "$TDIR/tab.txt"
+start_mock "$TDIR/tab.txt"
+env PRO_GATE_HOME="$RELEASE_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_TEST_ORGANIZER_NO_FLOCK=1 \
+  PRO_GATE_TIMEOUT_BIN="$RELEASE_TIMEOUT" NODE_OPTIONS= \
+  bash "$ENGINE" --harvest "$RELEASE_MARKER" --out "$TDIR/o-noflock-release.md" --timeout 5s \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+REPLACEMENT_DIR="$RELEASE_HOME/organizer-locks/$RELEASE_MARKER.d"
+check 'no-flock release cannot remove replacement ownership' \
+  "$([ "$RC" -eq 0 ] && [ -d "$REPLACEMENT_DIR" ] \
+      && grep -q '^replacement-owner$' "$REPLACEMENT_DIR/pid"; echo $?)" \
+  "rc=$RC stderr=$(tail -2 "$TDIR/stderr") locks=$(find "$RELEASE_HOME/organizer-locks" -maxdepth 2 -print 2>/dev/null)"
 
 echo '# v0.29: the prompt leads with the run-naming title line (#49 phase 1)'
 cat > "$TDIR/bin/oracle-dump" <<'DUMP'
@@ -1594,6 +2502,9 @@ env PRO_GATE_HOME="$TDIR/home-title" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UP
 RC=$?
 check 'title-line run exits 0 (nonce echoed back from the dumped prompt)' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
 check 'prompt first line names the run + round' "$(head -1 "$TDIR/prompt-dump.txt" 2>/dev/null | grep -q '^pro-gate review: PR #132 r1 \['; echo $?)" "first line: $(head -1 "$TDIR/prompt-dump.txt" 2>/dev/null)"
+TITLE_MARKER="$(jq -r .marker "$TDIR/o-title.md.status" 2>/dev/null)"
+check 'marker-scoped title memo equals the prompt title exactly' "$([ -n "$TITLE_MARKER" ] && [ "$(cat "$TDIR/home-title/conversation-titles/$TITLE_MARKER" 2>/dev/null)" = "$(head -1 "$TDIR/prompt-dump.txt" 2>/dev/null)" ]; echo $?)" "marker=$TITLE_MARKER memo=$(cat "$TDIR/home-title/conversation-titles/$TITLE_MARKER" 2>/dev/null)"
+check 'title memo publication leaves no partial temp file' "$(! find "$TDIR/home-title/conversation-titles" -maxdepth 1 -name '*.tmp.*' -print -quit | grep -q .; echo $?)" "$(find "$TDIR/home-title/conversation-titles" -maxdepth 1 -type f 2>/dev/null)"
 # A second round of the SAME PR carries a distinct discriminator (gate #57 P1).
 env PRO_GATE_HOME="$TDIR/home-title" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
   PRO_GATE_RAMP=0 PRO_GATE_MAX_RETRIES=0 PG_TEST_PROMPT_DUMP="$TDIR/prompt-dump2.txt" \
