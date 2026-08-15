@@ -738,6 +738,22 @@ pg_reservation_set_state() {
   rc=$?; pg_reservation_guard_release; return "$rc"
 }
 
+# pg_reservation_holding_count: how many reservations actually OCCUPY account capacity, i.e.
+# everything except the ones proven complete. Distinct from pg_reservation_count, which counts
+# collectable records: once a finished review stops holding its slot, "a reservation exists" and
+# "capacity is reserved" stop being the same question, and a timeout caused by genuinely busy
+# runs must not be blamed on an uncollected review that is holding nothing (#82).
+pg_reservation_holding_count() {
+  local dir f n=0
+  dir="$(pg_reservation_dir)"; [ -d "$dir" ] || { echo 0; return 0; }
+  for f in "$dir"/*; do
+    [ -f "$f" ] || continue
+    [ "$(awk -F'\t' 'NR==1{print $8}' "$f" 2>/dev/null)" = complete ] && continue
+    n=$(( n + 1 ))
+  done
+  echo "$n"
+}
+
 # pg_report_capacity_holders [effective]: explain, on stderr, why no slot is free. The wait loop
 # and the exit-7 path both use it because "all N review slots are busy" is the one thing an
 # operator can already see is false — the locks are free and the browser is idle. What they cannot

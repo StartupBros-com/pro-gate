@@ -248,6 +248,13 @@ check 'complete reservation frees its slot at eff 1' "$([ "$(avail 1)" = '1' ]; 
 # Legacy records predate the state field and must fail CLOSED (occupying), never open.
 printf 'k1\to1\t100\t0\t1\n' > "$TDIR/home2/in-progress/pg-run-a-1-1"
 check 'legacy record without state still holds capacity' "$([ "$(avail 1)" = '0' ]; echo $?)" "available=$(avail 1)"
+# "A reservation exists" and "capacity is reserved" stopped being the same question. A slot
+# timeout caused by genuinely busy runs must not be blamed on a completed record holding nothing.
+holding(){ PRO_GATE_HOME="$TDIR/home2" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_holding_count"; }
+counted(){ PRO_GATE_HOME="$TDIR/home2" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_count"; }
+check 'legacy record counts as holding capacity' "$([ "$(holding)" = '1' ]; echo $?)" "holding=$(holding)"
+printf 'k1\to1\t100\t0\t1\t\t\tcomplete\n' > "$TDIR/home2/in-progress/pg-run-a-1-1"
+check 'complete record is collectable but holds nothing' "$([ "$(counted)" = '1' ] && [ "$(holding)" = '0' ]; echo $?)" "counted=$(counted) holding=$(holding)"
 rm -rf "$TDIR/home2"
 
 echo '# slot exclusion prevents overbooking through a freed lower slot'

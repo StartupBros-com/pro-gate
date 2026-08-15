@@ -2015,7 +2015,7 @@ while :; do
   sleep 3
 done
 if [ "$SLOT_OK" != 1 ]; then
-  if [ "$(pg_reservation_count 2>/dev/null || echo 0)" -gt 0 ] 2>/dev/null; then
+  if [ "$(pg_reservation_holding_count 2>/dev/null || echo 0)" -gt 0 ] 2>/dev/null; then
     echo "ERROR: timed out after ${LOCK_WAIT}s — 0 of ${EFF_CONC} effective slots free; capacity is held by uncollected review(s), not by running ones." >&2
     pg_report_capacity_holders "$EFF_CONC"
   else
