@@ -539,7 +539,11 @@ pg_reservation_write() { # marker [pr] [out] [slot] [model] [spend_epoch] -- emp
   # marker's pre-queue launch time. Empty on legacy records; readers fall back accordingly.
   [ -n "$spend" ] || spend="$prev_spend"
   case "$spend" in *[!0-9]*) spend="";; esac
-  printf '%s\t%s\t%s\t0\t%s\t%s\t%s\n' "$pr" "$out" "$created" "$slot" "$model" "$spend" > "$dir/$marker.tmp" 2>/dev/null \
+  # v0.33 (#82): field 8 is the lifecycle state. THIS write is a positive live observation (a run
+  # reserving, or a harvest that found it still generating), so it re-arms "generating" rather
+  # than inheriting a stale "complete" — capacity must be re-held the moment the turn is live
+  # again. Only pg_reservation_set_state marks completion.
+  printf '%s\t%s\t%s\t0\t%s\t%s\t%s\tgenerating\n' "$pr" "$out" "$created" "$slot" "$model" "$spend" > "$dir/$marker.tmp" 2>/dev/null \
     && mv -f "$dir/$marker.tmp" "$dir/$marker"
   rc=$?; pg_reservation_guard_release; return "$rc"
 }
@@ -670,12 +674,18 @@ pg_reservation_count() {
 # capacity); reservations without a slot (legacy) and tagged slots outside the current range
 # shrink the range instead. Processed descending so range shrink cascades correctly.
 pg_reservation_slot_plan() {
-  local eff="${1:-1}" dir f slot slots="" excl="" r legacy=0 s
+  local eff="${1:-1}" dir f slot state slots="" excl="" r legacy=0 s avail
   dir="$(pg_reservation_dir)"
   r="$eff"
   if [ -d "$dir" ]; then
     for f in "$dir"/*; do
       [ -f "$f" ] || continue
+      # A COMPLETE reservation is a harvest pointer, not account occupancy (#82): its review
+      # stopped generating, so it holds no slot even though it stays collectable until TTL.
+      # Empty/legacy state reads as generating, so pre-state records keep their hold — an
+      # unknown state must never free capacity (overbooking the account is the worse error).
+      state="$(awk -F'\t' 'NR==1{print $8}' "$f" 2>/dev/null)"
+      [ "$state" = complete ] && continue
       slot="$(awk -F'\t' 'NR==1{print $5}' "$f" 2>/dev/null)"
       case "$slot" in
         ''|*[!0-9]*) legacy=$(( legacy + 1 ));;
@@ -687,7 +697,102 @@ pg_reservation_slot_plan() {
   for s in $(printf '%s\n' $slots | sort -rn); do
     if [ "$s" -le "$r" ] 2>/dev/null; then excl="$excl $s"; else r=$(( r - 1 )); fi
   done
-  printf '%s|%s\n' "$r" "${excl# }"
+  # Field 3 is the TRUE availability: the scan bound MINUS its in-range exclusions. Callers must
+  # gate on this and never on the bound — "1|1" is a bound of 1 whose only slot is excluded, i.e.
+  # an EMPTY scannable set. Gating on the bound made runs call pg_lock_n against an impossible
+  # plan every wait slice and report "all N slots busy" while the locks were free (#82).
+  avail="$r"
+  for s in $excl; do [ "$s" -le "$r" ] 2>/dev/null && avail=$(( avail - 1 )); done
+  [ "$avail" -ge 0 ] 2>/dev/null || avail=0
+  printf '%s|%s|%s\n' "$r" "${excl# }" "$avail"
+}
+
+# pg_reservation_set_state <marker> <generating|complete>: flip ONLY the lifecycle field,
+# preserving every other field verbatim. Deliberately not pg_reservation_write: that helper takes
+# `out` as an argument and would blank the harvest pointer when called without it, and it resets
+# the miss counter. Marking completion must change exactly one thing — whether this review still
+# occupies account capacity — and nothing about how it is later collected (#82).
+pg_reservation_set_state() {
+  local marker="$1" state="$2" dir f rc pr out created misses slot model spend
+  case "$state" in generating|complete) ;; *) return 1;; esac
+  pg_reservation_marker_ok "$marker" || return 1
+  dir="$(pg_reservation_dir)"; f="$dir/$marker"
+  [ -f "$f" ] || return 1
+  pg_reservation_guard_acquire || return 1
+  # Re-check under the guard: a concurrent harvest may have released the record while we probed,
+  # and rewriting here would resurrect a collected reservation and re-block capacity until TTL.
+  if [ ! -f "$f" ]; then pg_reservation_guard_release; return 1; fi
+  # awk per field, NOT `read`: tab is IFS-whitespace, so consecutive tabs from an empty
+  # slot/model collapse and shift every later field.
+  pr="$(awk -F'\t' 'NR==1{print $1}' "$f" 2>/dev/null)"
+  out="$(awk -F'\t' 'NR==1{print $2}' "$f" 2>/dev/null)"
+  created="$(awk -F'\t' 'NR==1{print $3}' "$f" 2>/dev/null)"
+  misses="$(awk -F'\t' 'NR==1{print $4}' "$f" 2>/dev/null)"
+  slot="$(awk -F'\t' 'NR==1{print $5}' "$f" 2>/dev/null)"
+  model="$(awk -F'\t' 'NR==1{print $6}' "$f" 2>/dev/null)"
+  spend="$(awk -F'\t' 'NR==1{print $7}' "$f" 2>/dev/null)"
+  case "$misses" in ''|*[!0-9]*) misses=0;; esac
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$pr" "$out" "$created" "$misses" "$slot" "$model" "$spend" "$state" > "$f.tmp" 2>/dev/null \
+    && mv -f "$f.tmp" "$f"
+  rc=$?; pg_reservation_guard_release; return "$rc"
+}
+
+# pg_reservation_holding_count: how many reservations actually OCCUPY account capacity, i.e.
+# everything except the ones proven complete. Distinct from pg_reservation_count, which counts
+# collectable records: once a finished review stops holding its slot, "a reservation exists" and
+# "capacity is reserved" stop being the same question, and a timeout caused by genuinely busy
+# runs must not be blamed on an uncollected review that is holding nothing (#82).
+pg_reservation_holding_count() {
+  local dir f n=0
+  dir="$(pg_reservation_dir)"; [ -d "$dir" ] || { echo 0; return 0; }
+  for f in "$dir"/*; do
+    [ -f "$f" ] || continue
+    [ "$(awk -F'\t' 'NR==1{print $8}' "$f" 2>/dev/null)" = complete ] && continue
+    n=$(( n + 1 ))
+  done
+  echo "$n"
+}
+
+# pg_report_capacity_holders [effective]: explain, on stderr, why no slot is free. The wait loop
+# and the exit-7 path both use it because "all N review slots are busy" is the one thing an
+# operator can already see is false — the locks are free and the browser is idle. What they cannot
+# see is that a FINISHED review still holds its slot until someone collects it (#82). Naming the
+# marker and the exact free-it command turns a 40-minute mystery into one command.
+pg_report_capacity_holders() {
+  local eff="${1:-}" dir f marker state pr held=0
+  dir="$(pg_reservation_dir)"; [ -d "$dir" ] || return 0
+  for f in "$dir"/*; do
+    [ -f "$f" ] || continue
+    held=$(( held + 1 ))
+  done
+  [ "$held" -gt 0 ] || return 0
+  echo "[pro-gate] 0 of ${eff:-?} effective slot(s) free — ${held} held by in-progress reservation(s):" >&2
+  for f in "$dir"/*; do
+    [ -f "$f" ] || continue
+    marker="$(basename "$f")"
+    pr="$(awk -F'\t' 'NR==1{print $1}' "$f" 2>/dev/null)"
+    state="$(pg_reservation_state "$marker" 2>/dev/null || echo generating)"
+    case "$state" in
+      complete) echo "  $marker  [$pr] complete — finished, awaiting collection" >&2 ;;
+      *)        echo "  $marker  [$pr] generating — still using the account" >&2 ;;
+    esac
+  done
+  echo "  collect a finished one for FREE (no new spend, never re-run):" >&2
+  echo "    oracle-review.sh --harvest <marker> --out <path> --timeout 20m" >&2
+}
+
+# pg_reservation_state <marker>: echo the lifecycle state (8th field) of a reservation —
+# "complete" once its review is provably finished, "generating" otherwise. Legacy records
+# (pre-v0.33, fewer than 8 fields) read back empty and are reported as generating, so every
+# caller treats an unknown state as still occupying account capacity.
+pg_reservation_state() {
+  local marker="$1" f state
+  pg_reservation_marker_ok "$marker" || return 1
+  f="$(pg_reservation_dir)/$marker"
+  [ -f "$f" ] || return 1
+  state="$(awk -F'\t' 'NR==1{print $8}' "$f" 2>/dev/null)"
+  case "$state" in complete) echo complete;; *) echo generating;; esac
 }
 
 # pg_reservation_expire_if_stale <marker>: release THIS marker's reservation when it is past
@@ -751,7 +856,7 @@ pg_harvest_claimed() {
 # renderers, hydration delays, and temporary marker-read failures caused false releases in review.
 # Live (0) resets misses; throttle (5) and other errors keep state fail-closed.
 pg_reservation_reconcile() {
-  local salvage="$1" port="$2" dir ttl miss_limit interval now f marker pr out created misses slot model spend age mt rc
+  local salvage="$1" port="$2" dir ttl miss_limit interval now f marker pr out created misses slot model spend age mt rc probe_out
   dir="$(pg_reservation_dir)"; [ -d "$dir" ] || return 0
   ttl="${PRO_GATE_RESERVATION_TTL:-21600}"; miss_limit="${PRO_GATE_RESERVATION_MISSES:-3}"
   interval="${PRO_GATE_RECONCILE_INTERVAL:-60}"; now="$(date +%s)"
@@ -795,18 +900,31 @@ pg_reservation_reconcile() {
     # least this interval of wall time.
     mt="$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)"
     [ "$(( now - mt ))" -lt "$interval" ] 2>/dev/null && continue
-    rc=2; node "$salvage" --probe "$marker" 10 "$port" >/dev/null 2>&1; rc=$?
+    rc=2; probe_out="$(node "$salvage" --probe "$marker" 10 "$port" 2>&1 >/dev/null)"; rc=$?
     case "$rc" in
       0)
-        [ "$misses" -eq 0 ] || {
-          pg_reservation_guard_acquire || continue
-          # The harvest may have removed the file during the probe; rewriting would resurrect a
-          # released reservation and block capacity until TTL, so re-check under the guard.
-          if [ -f "$f" ]; then
-            printf '%s\t%s\t%s\t0\t%s\t%s\t%s\n' "$pr" "$out" "$created" "${slot:-}" "${model:-}" "${spend:-}" > "$f.tmp" 2>/dev/null && mv -f "$f.tmp" "$f"
+        # A found conversation is not automatically an OCCUPIED one. ChatGPT keeps conversations
+        # server-side forever, so a finished review probes as present on every sweep, resets its
+        # miss streak, and used to hold its slot for the full 6h TTL — one uncollected review
+        # could starve the whole machine at effective concurrency 1 (#82). Release the capacity
+        # the moment completion is proven, while KEEPING the record so the review stays
+        # collectable for free. Anything short of proof stays generating.
+        if printf '%s' "$probe_out" | grep -q '^probe-state: complete$'; then
+          if [ "$(pg_reservation_state "$marker" 2>/dev/null)" != complete ] \
+             && pg_reservation_set_state "$marker" complete; then
+            echo "[pro-gate] reservation $marker is complete — releasing its slot; collect it with --harvest (no new spend)" >&2
           fi
-          pg_reservation_guard_release
-        }
+        else
+          [ "$misses" -eq 0 ] || {
+            pg_reservation_guard_acquire || continue
+            # The harvest may have removed the file during the probe; rewriting would resurrect a
+            # released reservation and block capacity until TTL, so re-check under the guard.
+            if [ -f "$f" ]; then
+              printf '%s\t%s\t%s\t0\t%s\t%s\t%s\t%s\n' "$pr" "$out" "$created" "${slot:-}" "${model:-}" "${spend:-}" "generating" > "$f.tmp" 2>/dev/null && mv -f "$f.tmp" "$f"
+            fi
+            pg_reservation_guard_release
+          }
+        fi
         ;;
       4)
         echo "[pro-gate] reservation $marker probe miss -> $(pg_reservation_note_miss "$marker")" >&2

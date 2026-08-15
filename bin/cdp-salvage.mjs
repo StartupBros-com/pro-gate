@@ -56,6 +56,11 @@
 //                matching the marker EXISTS (no VERDICT wait). Used by the
 //                engine's no-think watchdog to distinguish "dead submission,
 //                safe to retry" from "live run, retry would double-spend".
+//                Also prints `probe-state: complete|generating` on stderr so the
+//                reservation reconciler can release the account slot of a review
+//                that has finished but has not been collected yet (#82). This is
+//                an additive LINE, never a new exit code: callers above key on
+//                rc 0 meaning "live", and a new code would fall through them.
 // Exit: 0 = review printed (probe: tab found); 4 = scanned successfully, nothing matched;
 //       2 = usage error;
 //       3 = timeout but a conversation matching the marker IS live with no VERDICT yet (the
@@ -998,7 +1003,18 @@ async function onOurConversation(url, text) {
   ownershipProven = true;
   rememberUrl(marker, url);
   knownUrl = url;                // usable by the recovery branch from the very next cycle
-  if (probe) { console.error(`live conversation: ${url}`); process.exit(0); }
+  if (probe) {
+    console.error(`live conversation: ${url}`);
+    // Additive completeness signal (#82). The reservation reconciler must distinguish a turn that
+    // is STILL GENERATING (occupies account capacity) from one that merely awaits collection
+    // (occupies nothing, so its slot should be released). Deliberately NOT a new exit code: the
+    // no-think and pre-retry watchdogs treat probe rc 0 as "demonstrably live, suppress retry",
+    // and any other code falls through those guards toward a retry against an already-spent slot.
+    // extractReview applies the same terminal + marker-owned VERDICT contract the harvest path
+    // uses, so an unowned, partial, or cross-bound answer reports `generating` (fail closed).
+    console.error(`probe-state: ${extractReview(text) ? 'complete' : 'generating'}`);
+    process.exit(0);
+  }
   const review = extractReview(text);
   if (review) {
     // v0.28 (gate #54 r5): name the EXACT source of this capture so the engine can

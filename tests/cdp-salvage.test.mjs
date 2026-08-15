@@ -681,6 +681,31 @@ const FOREIGN_ANSWER = (m) => [
   const r = await runSalvage(['--probe', MARKER, '10'], cdp.port);
   check('probe exits 0 on match', r.status === 0, `status=${r.status}`);
   check('probe never closes tabs', cdp.closed.length === 0, `closed=${cdp.closed}`);
+  // A conversation still being written occupies the account, so its reservation must keep its
+  // slot. The state rides as a LINE, not an exit code: the no-think and pre-retry watchdogs read
+  // rc 0 as "demonstrably live", and any other code would fall through them toward a retry
+  // against an already-spent slot (#82).
+  check('probe reports generating while no VERDICT has landed',
+    /^probe-state: generating$/m.test(r.stderr || ''), `stderr=${(r.stderr || '').slice(0, 300)}`);
+  cdp.stop();
+}
+
+{ // probe: a FINISHED review still probes as present forever (ChatGPT keeps conversations
+  // server-side), which is exactly why presence alone must not hold account capacity (#82).
+  const cdp = await mockCdp(`run marker: ${MARKER}\nP0: none\n\nVERDICT: SHIP — fine.`);
+  const r = await runSalvage(['--probe', MARKER, '10'], cdp.port);
+  check('probe still exits 0 when the review is complete', r.status === 0, `status=${r.status}`);
+  check('probe reports complete once an owned VERDICT is present',
+    /^probe-state: complete$/m.test(r.stderr || ''), `stderr=${(r.stderr || '').slice(0, 300)}`);
+  cdp.stop();
+}
+
+{ // A VERDICT that does not belong to this run must never release its capacity: the reservation
+  // would be freed while the account is still generating, overbooking the next run.
+  const cdp = await mockCdp('run marker: pg-run-someone-else-1700000009-77\nVERDICT: SHIP — theirs.');
+  const r = await runSalvage(['--probe', MARKER, '10'], cdp.port);
+  check('foreign VERDICT never reports complete for our marker',
+    !/^probe-state: complete$/m.test(r.stderr || ''), `status=${r.status} stderr=${(r.stderr || '').slice(0, 300)}`);
   cdp.stop();
 }
 
