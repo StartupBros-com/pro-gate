@@ -148,6 +148,19 @@ check 'first marker miss records streak one' "$(awk -F'\t' 'NR==1{exit !($4==1)}
 printf 'still thinking, run marker: %s\n' "$MARKER" > "$TDIR/tab.txt"
 PRO_GATE_HOME="$TDIR/home" PRO_GATE_RESERVATION_MISSES=3 PRO_GATE_RECONCILE_INTERVAL=0 bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_reconcile '$HERE/../bin/cdp-salvage.mjs' '$PORT'"
 check 'positive probe resets miss streak' "$(awk -F'\t' 'NR==1{exit !($4==0)}' "$TDIR/home/in-progress/$MARKER"; echo $?)" "$(cat "$TDIR/home/in-progress/$MARKER")"
+check 'still-generating probe keeps the reservation occupying capacity' "$([ "$(PRO_GATE_HOME="$TDIR/home" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_state '$MARKER'")" = generating ]; echo $?)" "$(cat "$TDIR/home/in-progress/$MARKER")"
+
+# ChatGPT keeps conversations server-side forever, so a FINISHED review probes as present on
+# every sweep and used to hold its slot for the whole 6h TTL — at effective concurrency 1 a
+# single uncollected review starved every other run (#82). Completion must release the capacity
+# while KEEPING the record collectable.
+echo '# reservation releases capacity once its review is complete'
+printf 'run marker: %s\nP0: none\n\nVERDICT: SHIP — looks good.\n' "$MARKER" > "$TDIR/tab.txt"
+PRO_GATE_HOME="$TDIR/home" PRO_GATE_RESERVATION_MISSES=3 PRO_GATE_RECONCILE_INTERVAL=0 bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_reconcile '$HERE/../bin/cdp-salvage.mjs' '$PORT'"
+check 'complete probe marks the reservation complete' "$([ "$(PRO_GATE_HOME="$TDIR/home" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_state '$MARKER'")" = complete ]; echo $?)" "$(cat "$TDIR/home/in-progress/$MARKER")"
+check 'completed reservation survives as a harvest pointer' "$([ -f "$TDIR/home/in-progress/$MARKER" ]; echo $?)" 'record removed instead of released'
+check 'completed reservation keeps its out path' "$(awk -F'\t' 'NR==1{exit !($2 != "")}' "$TDIR/home/in-progress/$MARKER"; echo $?)" "$(cat "$TDIR/home/in-progress/$MARKER")"
+check 'completed reservation stops consuming a slot' "$([ "$(PRO_GATE_HOME="$TDIR/home" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_slot_plan 1" | cut -d'|' -f3)" = 1 ]; echo $?)" "plan=$(PRO_GATE_HOME="$TDIR/home" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_slot_plan 1")"
 
 echo '# marker validation'
 run_engine --harvest 'pg-run-../../../etc/passwd' --out "$TDIR/o-trav.md" --timeout 5s
@@ -210,12 +223,31 @@ echo '# slot plan: reservations exclude their slot instead of shrinking the rang
 mkdir -p "$TDIR/home2/in-progress"
 plan(){ PRO_GATE_HOME="$TDIR/home2" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_slot_plan $1"; }
 printf 'k1\to1\t100\t0\t1\n' > "$TDIR/home2/in-progress/pg-run-a-1-1"
-check 'tagged slot 1 at eff 2 excludes slot 1' "$([ "$(plan 2)" = '2|1' ]; echo $?)" "plan=$(plan 2)"
+check 'tagged slot 1 at eff 2 excludes slot 1' "$([ "$(plan 2)" = '2|1|1' ]; echo $?)" "plan=$(plan 2)"
 printf 'k2\to2\t100\t0\t\n' > "$TDIR/home2/in-progress/pg-run-b-2-2"
-check 'legacy reservation shrinks the range' "$([ "$(plan 2)" = '1|1' ]; echo $?)" "plan=$(plan 2)"
+check 'legacy reservation shrinks the range' "$([ "$(plan 2)" = '1|1|0' ]; echo $?)" "plan=$(plan 2)"
 rm -f "$TDIR/home2/in-progress/pg-run-a-1-1"
 printf 'k3\to3\t100\t0\t5\n' > "$TDIR/home2/in-progress/pg-run-c-3-3"
-check 'out-of-range tagged slot shrinks the range' "$([ "$(plan 2)" = '0|' ]; echo $?)" "plan=$(plan 2)"
+check 'out-of-range tagged slot shrinks the range' "$([ "$(plan 2)" = '0||0' ]; echo $?)" "plan=$(plan 2)"
+rm -rf "$TDIR/home2"
+
+# The scan upper bound is NOT the available count: at effective 1 a slot-1 reservation leaves an
+# EMPTY scannable set, yet the legacy two-field encoding reported "1|1". Callers gating on that
+# first field believed they had capacity, called pg_lock_n against an impossible plan every wait
+# slice, and reported "all N review slots are busy" while the locks were provably free
+# (incident #82: five runs starved 40m against an idle account). Field 3 is the true count.
+echo '# slot plan: available count is explicit and state-aware'
+mkdir -p "$TDIR/home2/in-progress"
+avail(){ PRO_GATE_HOME="$TDIR/home2" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_slot_plan $1" | cut -d'|' -f3; }
+printf 'k1\to1\t100\t0\t1\t\t\tgenerating\n' > "$TDIR/home2/in-progress/pg-run-a-1-1"
+check 'generating reservation at eff 1 leaves zero available' "$([ "$(avail 1)" = '0' ]; echo $?)" "available=$(avail 1)"
+check 'generating reservation at eff 2 leaves one available' "$([ "$(avail 2)" = '1' ]; echo $?)" "available=$(avail 2)"
+# A finished review is a harvest pointer, not account occupancy: it must not hold a slot.
+printf 'k1\to1\t100\t0\t1\t\t\tcomplete\n' > "$TDIR/home2/in-progress/pg-run-a-1-1"
+check 'complete reservation frees its slot at eff 1' "$([ "$(avail 1)" = '1' ]; echo $?)" "available=$(avail 1)"
+# Legacy records predate the state field and must fail CLOSED (occupying), never open.
+printf 'k1\to1\t100\t0\t1\n' > "$TDIR/home2/in-progress/pg-run-a-1-1"
+check 'legacy record without state still holds capacity' "$([ "$(avail 1)" = '0' ]; echo $?)" "available=$(avail 1)"
 rm -rf "$TDIR/home2"
 
 echo '# slot exclusion prevents overbooking through a freed lower slot'

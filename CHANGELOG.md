@@ -19,7 +19,8 @@ Conventions in this file:
 
 | Version | Date | Artifact | Theme |
 |---|---|---|---|
-| v0.32.0 | 2026-08-08 | Pending release | Exact marker-owned conversation titles and durable-success archive lifecycle |
+| v0.33.0 | 2026-08-15 | Pending release | Reservation lifecycle: a finished review releases its account slot instead of holding it to TTL |
+| [v0.32.0](https://github.com/StartupBros-com/pro-gate/releases/tag/v0.32.0) | 2026-08-08 | Release | Exact marker-owned conversation titles and durable-success archive lifecycle |
 | [v0.31.1](https://github.com/StartupBros-com/pro-gate/releases/tag/v0.31.1) | 2026-08-04 | Release | Cross-bound conversation memos: answer-ownership check, memo eviction, harvest-path TTL |
 | [v0.31.0](https://github.com/StartupBros-com/pro-gate/releases/tag/v0.31.0) | 2026-08-04 | Release | Trajectory-aware round governor: earned rounds, churn brake, never-landed refunds |
 | [v0.30.1](https://github.com/StartupBros-com/pro-gate/releases/tag/v0.30.1) | 2026-08-03 | Release | Hygiene close-out: consent stderr leak, run-log sweep allowlist, autoupdate.log bound, `.env` perms, salvage-window knob |
@@ -317,6 +318,33 @@ Reservation-record integrity fixed throughout: `pg_reservation_reconcile` AND
 erased v0.31's spend epoch and pushed later harvests onto the marker-time fallback; both
 also used `read`, which collapses consecutive tabs and mis-shifts fields when slot/model are
 empty. Every reservation mutation now round-trips all seven fields via per-field `awk`.
+
+### 14. Reservation capacity lifecycle (2026-08-15, v0.33.0)
+
+Five runs sat in `waiting-slot` for their full 40-minute windows while the ChatGPT account was
+idle and all four slot locks were provably free. Issue
+[#82](https://github.com/StartupBros-com/pro-gate/issues/82) traced it to a single conflation: a
+reservation stood for both "this review still occupies the account" and "this review is still
+collectable", but only the second was ever true for long.
+
+Because ChatGPT retains conversations server-side, a finished review kept probing as present, so
+its miss streak reset on every sweep and its slot stayed held for the full six-hour TTL. With the
+ramp governor at effective concurrency 1 after a throttle, one uncollected review starved the
+whole machine.
+
+Reservations now carry an explicit lifecycle state. `--probe` reports `probe-state:
+complete|generating` as an additive stderr line — deliberately not a new exit code, because the
+no-think and pre-retry watchdogs read rc 0 as "demonstrably live" and any other code would fall
+through them toward a retry against an already-spent slot. Reconciliation releases the slot the
+moment completion is proven under the same marker-owned VERDICT contract salvage uses, while
+keeping the record so the review stays harvestable for free. Unknown, legacy, unowned, and
+ambiguous states all keep holding capacity: overbooking the account is the worse error.
+
+The slot planner now returns a true available count alongside its scan bound, since a bound of 1
+whose only slot is excluded is an empty set — gating on the bound is what made runs call the lock
+scanner against an impossible plan every wait slice. When no slot is free, the wait loop and the
+timeout error now name each holding marker, its state, and the exact free-it command, and
+distinguish capacity held by running reviews from capacity held by uncollected ones.
 
 ### 13. Exact conversation lifecycle (2026-08-08, v0.32.0)
 

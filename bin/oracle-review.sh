@@ -218,6 +218,9 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
       for _ub in "$r_out".unbound.*; do [ -e "$_ub" ] && r_unbound=$(( r_unbound + 1 )); done
       r_crossbound=0
       [ -s "$PRO_GATE_HOME/crossbound/$m" ] && r_crossbound="$(grep -c . "$PRO_GATE_HOME/crossbound/$m" 2>/dev/null || echo 1)"
+      # v0.33 (#82): a reservation proven complete no longer holds a review slot, so say so —
+      # "still generating" and "finished, just uncollected" call for different operator action.
+      r_life="$(pg_reservation_state "$m" 2>/dev/null || echo generating)"
       if [ "$r_crossbound" -gt 0 ] 2>/dev/null; then
         ST_HINT="STUCK (cross-bound): the conversation remembered for $m carries ANOTHER run's completed answer — see $PRO_GATE_HOME/crossbound/$m. Retrying --harvest cannot bind it. Engine >=v0.31.1 discards the bad memo and expires the reservation at the ${ST_RES_TTL}s TTL; to free the change now, remove $(pg_reservation_dir)/$m. Do NOT set PRO_GATE_REQUIRE_NONCE=0 — that would accept the other run's review."
       elif [ "$r_unbound" -gt 0 ]; then
@@ -229,8 +232,8 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
         jq -nc --arg marker "$m" --arg pr "${r_pr:-}" --arg out "$r_out" \
           --arg age "${r_age:-}" --arg miss "${r_miss:-}" --arg model "${r_model:-}" \
           --arg url "$r_url" --arg harvest_cmd "$r_cmd" --argjson unbound "$r_unbound" \
-          --argjson crossbound "$r_crossbound" \
-          '{marker:$marker,pr:$pr,out:$out,age_secs:(($age|tonumber?)//null),miss_streak:(($miss|tonumber?)//null),model:$model,conversation_url:$url,harvest_cmd:$harvest_cmd,unbound_captures:$unbound,crossbound_hits:$crossbound,state:(if $crossbound > 0 then "cross-bound" elif $unbound > 0 then "unbindable-ambiguous" else "generating-or-recoverable" end)}' \
+          --argjson crossbound "$r_crossbound" --arg life "$r_life" \
+          '{marker:$marker,pr:$pr,out:$out,age_secs:(($age|tonumber?)//null),miss_streak:(($miss|tonumber?)//null),model:$model,conversation_url:$url,harvest_cmd:$harvest_cmd,unbound_captures:$unbound,crossbound_hits:$crossbound,holds_capacity:($life != "complete"),state:(if $crossbound > 0 then "cross-bound" elif $unbound > 0 then "unbindable-ambiguous" elif $life == "complete" then "complete-awaiting-harvest" else "generating-or-recoverable" end)}' \
           >> "$ST_TMP/res.jsonl" 2>/dev/null
       else
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$m" "${r_pr:-?}" "${r_age:-?}" "${r_miss:-?}" "$r_unbound" "$r_crossbound" "$r_cmd" >> "$ST_TMP/res.tsv"
@@ -463,6 +466,7 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
     echo "in-progress reservations (harvest these for FREE — never re-run):"
     if pg_have jq && [ -s "$ST_TMP/res.jsonl" ]; then
       jq -r '"  " + .marker + "  pr=" + .pr + (if .age_secs then "  age=\(.age_secs / 60 | floor)m" else "" end) + (if .conversation_url != "" then "  url=remembered" else "" end)
+             + (if .holds_capacity then "  [holding a review slot]" else "  [complete — slot already released, collect when convenient]" end)
              + (if .crossbound_hits > 0 then "  [STUCK: cross-bound to another run - retrying cannot bind it]" else (if .unbound_captures > 0 then "  [\(.unbound_captures) unbindable capture(s) - ambiguous, still retryable]" else "" end) end)
              + "\n    harvest: " + .harvest_cmd' "$ST_TMP/res.jsonl"
     else
@@ -1984,22 +1988,39 @@ while :; do
   if ! pg_reservation_guard_acquire; then sleep 3; continue; fi
   SLOT_PLAN="$(pg_reservation_slot_plan "$EFF_CONC")"
   SCAN_MAX="${SLOT_PLAN%%|*}"
-  SCAN_EXCLUDE="${SLOT_PLAN#*|}"
+  SCAN_EXCLUDE="$(printf '%s' "$SLOT_PLAN" | cut -d'|' -f2)"
+  # Gate on the plan's AVAILABLE count (field 3), never on the scan bound: a bound of 1 whose
+  # only slot is excluded is an EMPTY set, and gating on the bound spent every wait slice
+  # calling pg_lock_n against an impossible plan while reporting "all slots busy" (#82).
+  SCAN_AVAIL="$(printf '%s' "$SLOT_PLAN" | cut -d'|' -f3)"
   # Nonblocking while holding the short handoff guard: waiting here would prevent an active
   # run from writing its reservation before releasing its process slot (writer waits 10s).
   # One immediate scan gives an atomic plan+acquire decision; the outer loop releases the
   # guard and retries.
-  if [ "${SCAN_MAX:-0}" -gt 0 ] 2>/dev/null && pg_lock_n "$LOCKFILE" "$SCAN_MAX" 0 "$SCAN_EXCLUDE"; then
+  if [ "${SCAN_AVAIL:-0}" -gt 0 ] 2>/dev/null && pg_lock_n "$LOCKFILE" "$SCAN_MAX" 0 "$SCAN_EXCLUDE"; then
     # Keep the acquired process slot, release only the short reservation handoff guard.
     SLOT_HELD="$PG_SLOT_ACQUIRED"
     pg_reservation_guard_release; SLOT_OK=1; break
   fi
   pg_reservation_guard_release
+  # Name what actually holds capacity. An operator staring at a free-looking account and an idle
+  # browser cannot tell "another review is generating" from "a finished review was never
+  # collected" — and only the second is theirs to fix, for free (#82).
+  if [ "${SCAN_AVAIL:-0}" -le 0 ] 2>/dev/null \
+     && { [ -z "${SLOT_BLOCK_LOGGED:-}" ] || [ $(( $(date +%s) - ${SLOT_BLOCK_LOGGED:-0} )) -ge 300 ]; }; then
+    SLOT_BLOCK_LOGGED="$(date +%s)"
+    pg_report_capacity_holders "$EFF_CONC"
+  fi
   if [ "$(date +%s)" -ge "$SLOT_DEADLINE" ]; then break; fi
   sleep 3
 done
 if [ "$SLOT_OK" != 1 ]; then
-  echo "ERROR: timed out after ${LOCK_WAIT}s — all ${EFF_CONC} review slots are busy." >&2
+  if [ "$(pg_reservation_count 2>/dev/null || echo 0)" -gt 0 ] 2>/dev/null; then
+    echo "ERROR: timed out after ${LOCK_WAIT}s — 0 of ${EFF_CONC} effective slots free; capacity is held by uncollected review(s), not by running ones." >&2
+    pg_report_capacity_holders "$EFF_CONC"
+  else
+    echo "ERROR: timed out after ${LOCK_WAIT}s — all ${EFF_CONC} review slots are busy with running reviews." >&2
+  fi
   pg_status failed "slot timeout"
   pg_finish 7
 fi
