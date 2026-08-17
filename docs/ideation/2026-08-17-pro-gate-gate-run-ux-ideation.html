@@ -138,7 +138,7 @@
 <nav class="jump">
   <strong style="font-size:13px;">Jump to:</strong>
   <ol>
-    <li><a href="#idea-1">The wait leaves the session: zero-token watcher + wake-on-terminal</a></li>
+    <li><a href="#idea-1">The wait leaves the session: a blocking <code>--wait</code> verb + wake-on-terminal</a></li>
     <li><a href="#idea-2">Status v2: one additive schema change at the status choke point</a></li>
     <li><a href="#idea-3">Nobody remembers to harvest: fleet-wide sweep + loss accounting</a></li>
     <li><a href="#idea-4">Measure the queue and the spend honestly</a></li>
@@ -149,24 +149,24 @@
 </nav>
 
 <article class="idea" id="idea-1">
-<h3>1. The wait leaves the session: zero-token watcher + wake-on-terminal</h3>
+<h3>1. The wait leaves the session: a blocking <code>--wait</code> verb + wake-on-terminal</h3>
 <div class="chips">
   <span class="chip axis">caller-wait-protocol</span>
-  <span class="chip conf-high">Confidence 85%</span>
-  <span class="chip">Complexity Medium</span>
+  <span class="chip conf-high">Confidence 90%</span>
+  <span class="chip">Complexity Low</span>
 </div>
 <dl>
 <dt>Description</dt>
-<dd>Make the documented protocol: launch, record the marker, <em>end the turn</em>. A tiny bash/cron watcher &mdash; no LLM &mdash; polls <code>&lt;out&gt;.status</code> and, only when the phase is terminal, wakes an agent (cross-session <code>SendMessage</code>, background-task notification, or a fresh invocation) with the result injected. Add one escalation rule for the watcher itself: after N consecutive failed status reads, stop re-arming and raise a distinct &ldquo;the poller is broken, not the review&rdquo; alert. Nothing about reading a phase field and sleeping needs a language model; only the terminal transition needs judgment.</dd>
+<dd>Give the engine a blocking verb &mdash; <code>oracle-review.sh --wait &lt;out|marker&gt; [--timeout S]</code> &mdash; a zero-token shell process that sleeps in a loop until <code>&lt;out&gt;.status</code> goes terminal, then prints the final status JSON and exits, with <strong>distinct exit codes for &ldquo;review reached a verdict&rdquo; vs &ldquo;I lost the ability to observe&rdquo;</strong> (the poller-escalation rule, folded in). The documented protocol becomes: launch, record the marker, run <code>--wait</code> with <code>run_in_background</code>, <em>end the turn</em> &mdash; the harness's own background-completion notification is the wake; no per-poll LLM turns exist anywhere. Cross-session and dead-session delivery stays pull-based on the durable pieces that already exist (completed store, PR comment, <code>--status</code>) &mdash; the production lesson from push channels is to keep exactly that safety net. The headless daemon benefits too: it blocks on <code>--wait</code> instead of a <code>sleep 60</code> prompt loop, sidestepping its no-notifications constraint entirely.</dd>
 <dt>Axis</dt><dd>caller-wait-protocol</dd>
 <dt>Basis</dt>
 <dd><code>direct:</code> PR #1628 transcript: 65 poller invocations, 9 &ldquo;Re-arm corrected poller&rdquo; recoveries, 8 poller failures with exit code 3, session ended at ~100% context / ~$443. <code>daemon/daemon.sh:234</code> hand-rolls the same loop inside an LLM prompt (&ldquo;sleep 60; cat the status file&rdquo;). Verified: no notify path exists anywhere in bin/lib/daemon/SKILL.md. <code>external:</code> wake-not-poll production pattern (Aura; AWS <code>waitForCondition</code> suspends at no compute cost); NN/g queue research: past ~20&ndash;30 min, people must walk away and be pushed the result.</dd>
 <dt>Rationale</dt>
-<dd>This is the idea most directly traceable to the incident that triggered the ask. The engine already produces everything a dumb watcher needs (a status file with a terminal phase and a durable marker); burning agent turns and context on intermediate polls is pure waste, and it actively fights harness anti-loop heuristics. The automation lives in caller orchestration, not inside pro-gate's credential/quota surface, so it clears the ship-the-legible-core bar.</dd>
+<dd>This is the idea most directly traceable to the incident: the hand-rolled <code>r3-poller.sh</code> in a job tmp dir was a per-session, per-caller reimplementation of exactly this missing verb, and it crashed 8 times. A blocking CLI verb is the smallest true fix &mdash; a ~60-line legible loop in the engine rather than a notification bus &mdash; and it doesn't deduplicate the poll ceremony across the three prose copies, it <em>deletes</em> it: SKILL.md &sect;3 collapses to &ldquo;run <code>--wait</code> in background.&rdquo; Deleting protocol beats synchronizing it. This is also <strong>stage 1 of a two-stage stack</strong>: idea 5's round-loop supervisor consumes this primitive; built without it, the supervisor would just move poller fragility down one level (an LLM subagent polling for 47 minutes).</dd>
 <dt>Downsides</dt>
-<dd>Needs one new, well-tested watcher script plus a wake mechanism per caller shape (interactive session vs headless daemon &mdash; the daemon has no notification path and keeps polling as its named fallback). Cross-session wake semantics must handle a dead originating session (deliver to the PR comment / a mailbox file instead).</dd>
-<dt>Confidence</dt><dd>85%</dd>
-<dt>Complexity</dt><dd>Medium</dd>
+<dd>The <code>--wait</code> process is tied to the session's shell lifetime &mdash; if the session dies, only the wait dies; the run, status file, and marker survive and recovery is unchanged (a good failure mode, but callers must know re-arming is free). <code>--timeout</code> must exceed the worst-case lock+generation envelope or exit through the distinct lost-observability code, never a false &ldquo;review failed.&rdquo;</dd>
+<dt>Confidence</dt><dd>90%</dd>
+<dt>Complexity</dt><dd>Low</dd>
 </dl>
 <figure>
 <svg viewBox="0 0 820 240" role="img" aria-label="Before/after: session-held polling versus zero-token watcher with wake">
@@ -191,7 +191,7 @@
   <text x="513" y="73" font-size="12.5" text-anchor="middle" fill="#23262d">agent session</text>
   <text x="513" y="89" font-size="11" text-anchor="middle" fill="#6b7280">launch &rarr; end turn</text>
   <rect x="438" y="130" width="150" height="44" rx="8" fill="#ffffff" stroke="#b9bdf0"/>
-  <text x="513" y="149" font-size="12.5" text-anchor="middle" fill="#23262d">watcher (bash/cron)</text>
+  <text x="513" y="149" font-size="12.5" text-anchor="middle" fill="#23262d">--wait (blocking)</text>
   <text x="513" y="165" font-size="11" text-anchor="middle" fill="#6b7280">zero tokens</text>
   <rect x="650" y="130" width="140" height="44" rx="8" fill="#ffffff" stroke="#b9bdf0"/>
   <text x="720" y="149" font-size="12.5" text-anchor="middle" fill="#23262d">&lt;out&gt;.status</text>
@@ -311,20 +311,20 @@
 <h3>5. One supervisor per PR, not one ceremony per round</h3>
 <div class="chips">
   <span class="chip axis">round-verdict-economics</span>
-  <span class="chip conf-med">Confidence 70%</span>
+  <span class="chip conf-med">Confidence 75%</span>
   <span class="chip">Complexity Medium</span>
 </div>
 <dl>
 <dt>Description</dt>
-<dd>Spawn one background subagent at round 1 that owns the entire §6 re-review arc &mdash; wait, collect, score against the governor's trajectory, apply-or-delegate fixes, relaunch &mdash; and reports to the parent exactly once: SHIP, round-capped/escalate, or churn-braked. Pair it with collapsing the triple-maintained wait contract (SKILL.md, <code>agents/oracle-reviewer.md</code>, daemon prompt) into one canonical source with a CI drift check, so the supervisor is the contract's primary consumer instead of three hand-synced prose copies.</dd>
+<dd><strong>Stage 2, built on idea 1's <code>--wait</code> verb.</strong> Spawn one background subagent at round 1 that owns the entire §6 re-review arc and reports to the parent exactly once: SHIP, round-capped/escalate, or churn-braked. With <code>--wait</code> as its wait primitive, the supervisor's context stays small and mostly idle; its irreducible content is only what no primitive can absorb &mdash; round bookkeeping against the governor (headRefOid per round, trajectory reads via <code>--status --json</code>), fix-application policy, and disposition at stop. It is a <em>plugin-side agent, not engine code</em>: the engine stays a legible CLI, the orchestration intelligence lives in the agent file. The residual contract surface (exit codes, phases) that <code>--wait</code> doesn't delete gets a CI drift check across the remaining prose copies.</dd>
 <dt>Axis</dt><dd>round-verdict-economics</dd>
 <dt>Basis</dt>
 <dd><code>direct:</code> §6 repeats the full launch/poll/status ceremony up to 8&times; per PR (SKILL.md:381-430); &ldquo;contract changes &hellip; both files must change in the same PR&rdquo; (<code>agents/oracle-reviewer.md:20</code>); PR #1628 died specifically during a round-3 confirming pass; the governor already exposes machine-checkable termination conditions (base 3 / +1-per-shrink / ceiling 8 / 2-strike brake). Verified.</dd>
 <dt>Rationale</dt>
-<dd>Idea 1 fixes the single wait; this fixes the loop that multiplies it. The context burn in the incident wasn't one wait &mdash; it was the ceremony re-derived every round across 8 hours. A supervisor holding only the loop state (not the parent's whole task context) is the harness-native shape for that, and the canonical-contract half removes the drift tax every future protocol change currently pays three times.</dd>
+<dd>Idea 1 fixes the single wait; this fixes the loop that multiplies it. The context burn in the incident wasn't one wait &mdash; it was the ceremony re-derived every round across 8 hours. A supervisor holding only the loop state (not the parent's whole task context) is the harness-native shape for that. Sequencing is forced: built <em>without</em> stage 1, the supervisor merely relocates poller fragility into a subagent; built on it, each round costs the supervisor one launch, one background <code>--wait</code>, one scoring turn.</dd>
 <dt>Downsides</dt>
-<dd>The supervisor must be crash-tolerant (its own death has to degrade to today's manual protocol, discoverable via <code>--status</code>); fix-application authority inside a subagent needs clear bounds; the headless daemon keeps its own loop (it structurally cannot receive notifications).</dd>
-<dt>Confidence</dt><dd>70%</dd>
+<dd>The supervisor must be crash-tolerant (its own death has to degrade to today's manual protocol, discoverable via <code>--status</code>); fix-application authority inside a subagent needs clear bounds; the daemon path keeps <code>--wait</code>-based blocking rather than subagent supervision.</dd>
+<dt>Confidence</dt><dd>75%</dd>
 <dt>Complexity</dt><dd>Medium</dd>
 </dl>
 </article>
@@ -384,9 +384,9 @@
     <tr><td>22</td><td>Exit 7 becomes a durable queue ticket</td><td>The cited exit-9 precedent binds a live, collectible conversation; before submission there is nothing to ticket. The desirable outcome (never sleep 40 min synchronously) is delivered by idea 1 instead.</td></tr>
     <tr><td>25</td><td>Multiplex several small PRs into one held Pro conversation</td><td>Breaks the per-run marker/nonce ownership model and the per-key round governor; the cross-bind incident history warns that concurrency games in one conversation are exactly where reviews get mis-attributed.</td></tr>
     <tr><td>29</td><td>Self-spawning detached auto-harvester per run</td><td>Repeats the shape of the OOM self-heal that was built and dropped as too fragile for a distributable; the externally-triggered sweep (idea 3) is the legible variant.</td></tr>
-    <tr><td>7 / 26</td><td>Route interactive calls into the daemon / daemon as default entry point</td><td>Assumes daemon liveness on every box (it is disabled here); the watcher (idea 1) delivers the same walk-away shape without a resident service.</td></tr>
+    <tr><td>7 / 26</td><td>Route interactive calls into the daemon / daemon as default entry point</td><td>Assumes daemon liveness on every box (it is disabled here); idea 1's <code>--wait</code> verb delivers the same walk-away shape without a resident service.</td></tr>
     <tr><td>14 / 15 / 16</td><td>Live ETA / ready_by / position in status now</td><td>Every current duration percentile conflates queue-wait with generation, so an ETA would be systematically biased; heartbeat ships now (idea 2), ETA becomes buildable after idea 4's ledger split. &ldquo;Position&rdquo; has no underlying data source today.</td></tr>
-    <tr><td>1 / 3</td><td>One universal harness-native wait primitive for all callers</td><td>The headless daemon structurally cannot receive async notifications, so &ldquo;one primitive&rdquo; oversells; survives as the canonical-contract half of idea 5 plus idea 1's watcher.</td></tr>
+    <tr><td>1 / 3</td><td>One universal harness-native wait primitive for all callers</td><td>Notification-based unification oversells (the headless daemon cannot receive async notifications) &mdash; but a <em>blocking</em> primitive serves every caller shape, which is how this survives inside idea 1's <code>--wait</code> verb plus idea 5's drift check.</td></tr>
     <tr><td>5</td><td>Marker as accession number; polling demoted to opt-in</td><td>Mischaracterized exit-9/harvest as recovery-only (it is the designed default for large diffs since v0.24); the accession-number spirit lives on inside ideas 1 and 3.</td></tr>
     <tr><td>9</td><td>Pro-gate as an async GitHub required check</td><td>Sound, but it is the end-state of ideas 1+5 rather than a separate build; standalone it adds GitHub-integration scope the core win doesn't need. Revisit after the watcher exists.</td></tr>
     <tr><td>41</td><td>Structured findings object the governor reads directly</td><td>Assumes Pro reliably emits machine-parseable findings without degrading review quality &mdash; unproven; better developed as a brainstorm variant of idea 6's category tagging.</td></tr>
