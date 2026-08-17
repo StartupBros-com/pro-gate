@@ -695,6 +695,12 @@ pg_status preflight
 
 # --- v0.19: run bookkeeping for the ledger + adaptive ramp ---
 RUN_START="$(date +%s)"
+# ledger-timing-split (R1/R3): stamped once the run leaves the queue (slot acquired, generation
+# about to start) — never at marker mint or RUN_START — so pg_finish can split queue wait from
+# generation time without a budget or history window ever keying off a pre-lock epoch. Stays
+# empty on any path that never reaches that point (lock-timeout, preflight failure, round-cap,
+# deferred): pg_finish then counts the run's whole life as queue_secs with run_secs 0.
+LAUNCH_EPOCH=""
 SALVAGED=0
 EFF_CONC=0
 PG_RESULT_DURABLE=0
@@ -996,12 +1002,32 @@ pg_organize_chat() {  # rename|finalize [early-lease] [diagnostic-log] [helper-s
 }
 
 pg_finish() {  # $1 exit code — settle organization, ramp, and ledger exactly once, then exit
-  local rc="$1" outcome dur line model_label fsrc title_memo=""
+  local rc="$1" outcome dur now queue_secs run_secs line model_label fsrc title_memo=""
   # Revoke every sleeping early organizer before anything at the terminal boundary can settle.
   # Every path below then acquires the marker lock — either to mutate or only to join — so no
   # helper can keep scanning/rendering after the parent records its final account state.
   rm -f "$WORK"/early-organizer.*.lease 2>/dev/null || true
-  dur=$(( $(date +%s) - RUN_START ))
+  now="$(date +%s)"
+  dur=$(( now - RUN_START ))
+  # ledger-timing-split (R1/R3): split `secs` (unchanged, kept for backward compatibility) into
+  # queue_secs (waiting for a lock/slot) and run_secs (actual generation), by field name, always
+  # summing back to `secs` exactly. A harvest never queues for a slot at all — it reads an
+  # existing/in-progress conversation over CDP — so its queue_secs is always 0 and run_secs is
+  # this invocation's own short wall time (collection, not generation); that semantic is
+  # DOCUMENTED here rather than reconstructed from a generation epoch harvest never has. A fresh
+  # run that reached "launching" (LAUNCH_EPOCH set) splits at that phase transition; one that
+  # never did (lock-timeout, preflight failure, round-cap, deferred) records its whole life as
+  # queue_secs with run_secs 0.
+  if [ "${HARVEST:-0}" = 1 ]; then
+    queue_secs=0
+    run_secs=$dur
+  elif [ -n "$LAUNCH_EPOCH" ]; then
+    queue_secs=$(( LAUNCH_EPOCH - RUN_START ))
+    run_secs=$(( now - LAUNCH_EPOCH ))
+  else
+    queue_secs=$dur
+    run_secs=0
+  fi
   model_label="$(pg_model_label "${RESOLVED_MODEL:-}")"   # resolved model or role-based fallback
 
   # v0.28 (#56): a clean run's review becomes the write-once completed artifact before any
@@ -1092,15 +1118,16 @@ pg_finish() {  # $1 exit code — settle organization, ramp, and ledger exactly 
   if pg_have jq; then
     line="$(jq -nc --arg ts "$(date +%Y-%m-%dT%H:%M:%S%z)" --arg pr "${PR_NUM:-diff}" \
       --arg repo "${REPO:-}" --argjson exit "$rc" --arg outcome "$outcome" \
-      --argjson secs "$dur" --argjson attempts "${attempt:-0}" \
+      --argjson secs "$dur" --argjson queue_secs "$queue_secs" --argjson run_secs "$run_secs" \
+      --argjson attempts "${attempt:-0}" \
       --argjson conc "${EFF_CONC:-0}" --argjson ceiling "${MAX_CONC:-1}" \
       --argjson live "${LIVE_CONVERSATION:-0}" --argjson salvaged "${SALVAGED:-0}" \
       --argjson diff_lines "${DIFF_LINES:-0}" --arg out "$OUT" --arg model "$model_label" \
       --arg marker "${RUN_MARKER:-}" --arg round_key "${ROUND_KEY:-}" --arg sha256 "$OUT_SHA" \
-      '{ts:$ts,pr:$pr,repo:$repo,exit:$exit,outcome:$outcome,secs:$secs,attempts:$attempts,conc:$conc,ceiling:$ceiling,live:$live,salvaged:$salvaged,diff_lines:$diff_lines,out:$out,model:$model,marker:$marker,round_key:$round_key,sha256:$sha256}' 2>/dev/null)"
+      '{ts:$ts,pr:$pr,repo:$repo,exit:$exit,outcome:$outcome,secs:$secs,queue_secs:$queue_secs,run_secs:$run_secs,attempts:$attempts,conc:$conc,ceiling:$ceiling,live:$live,salvaged:$salvaged,diff_lines:$diff_lines,out:$out,model:$model,marker:$marker,round_key:$round_key,sha256:$sha256}' 2>/dev/null)"
   else
-    line="$(printf '{"ts":"%s","pr":"%s","exit":%d,"outcome":"%s","secs":%d,"attempts":%d,"conc":%d,"ceiling":%d,"live":%d,"salvaged":%d,"out":"%s","model":"%s","marker":"%s","round_key":"%s","sha256":"%s"}' \
-      "$(date +%Y-%m-%dT%H:%M:%S%z)" "${PR_NUM:-diff}" "$rc" "$outcome" "$dur" "${attempt:-0}" \
+    line="$(printf '{"ts":"%s","pr":"%s","exit":%d,"outcome":"%s","secs":%d,"queue_secs":%d,"run_secs":%d,"attempts":%d,"conc":%d,"ceiling":%d,"live":%d,"salvaged":%d,"out":"%s","model":"%s","marker":"%s","round_key":"%s","sha256":"%s"}' \
+      "$(date +%Y-%m-%dT%H:%M:%S%z)" "${PR_NUM:-diff}" "$rc" "$outcome" "$dur" "$queue_secs" "$run_secs" "${attempt:-0}" \
       "${EFF_CONC:-0}" "${MAX_CONC:-1}" "${LIVE_CONVERSATION:-0}" "${SALVAGED:-0}" \
       "$(printf '%s' "$OUT" | tr -d '"\\' | tr '\n' ' ')" \
       "$(printf '%s' "$model_label" | tr -d '"\\' | tr '\n' ' ')" \
@@ -2024,6 +2051,9 @@ if [ "$SLOT_OK" != 1 ]; then
   pg_status failed "slot timeout"
   pg_finish 7
 fi
+# ledger-timing-split (R1/R3): the run leaves the queue HERE — a slot is held, not yet
+# generating. One site, hit exactly once per invocation (retries below reuse this same slot).
+LAUNCH_EPOCH="$(date +%s)"
 
 # The oracle CLI's own --timeout has been observed NOT to fire while it waits on a ChatGPT
 # tab that never starts thinking (a "dead submission" squatted a browser slot for 3.5h on

@@ -2,8 +2,10 @@
 # pro-gate-stats.sh — observability over the run ledger + ramp governor (v0.19).
 #
 # The engine appends one JSON line per finished/deferred run to $PRO_GATE_HOME/ledger.jsonl
-# (fields: ts, pr, repo, exit, outcome, secs, attempts, conc, ceiling, live, salvaged,
-# diff_lines, out) and the ramp governor keeps its level in $PRO_GATE_HOME/ramp.state.
+# (fields: ts, pr, repo, exit, outcome, secs, queue_secs, run_secs, attempts, conc, ceiling,
+# live, salvaged, diff_lines, out) and the ramp governor keeps its level in
+# $PRO_GATE_HOME/ramp.state. queue_secs/run_secs (ledger-timing-split) split `secs` into wait
+# vs. generation time; older rows lack them, and every consumer below tolerates that.
 # This tool answers "is raising concurrency causing trouble?" at a glance.
 #
 # Usage: pro-gate-stats.sh [--tail N] [--since ISO-DATE] [--pr N] [--json]
@@ -86,6 +88,10 @@ jq -s "[.[] | $FILTER] | {
   salvage_rate_pct: (if length > 0 then (100 * ([.[] | select(.salvaged == 1)] | length) / length | floor) else null end),
   duration_p50_s: ([.[] | select(.outcome == \"clean\") | .secs] | sort | if length > 0 then .[(length / 2 | floor)] else null end),
   duration_p95_s: ([.[] | select(.outcome == \"clean\") | .secs] | sort | if length > 0 then .[((length * 95 / 100) | floor)] else null end),
+  queue_p50_s: ([.[] | select(.outcome == \"clean\") | (.queue_secs // empty)] | sort | if length > 0 then .[(length / 2 | floor)] else null end),
+  queue_p95_s: ([.[] | select(.outcome == \"clean\") | (.queue_secs // empty)] | sort | if length > 0 then .[((length * 95 / 100) | floor)] else null end),
+  run_p50_s: ([.[] | select(.outcome == \"clean\") | (.run_secs // empty)] | sort | if length > 0 then .[(length / 2 | floor)] else null end),
+  run_p95_s: ([.[] | select(.outcome == \"clean\") | (.run_secs // empty)] | sort | if length > 0 then .[((length * 95 / 100) | floor)] else null end),
   by_concurrency: (group_by(.conc) | map({level: .[0].conc, runs: length,
     clean: ([.[] | select(.outcome == \"clean\")] | length),
     throttle: ([.[] | select(.outcome == \"throttle\")] | length)}))

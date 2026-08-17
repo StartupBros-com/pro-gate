@@ -193,6 +193,13 @@ check 'durable harvest archives the server conversation' "$([ "$(jq -r .archived
 check 'durable harvest organizes rename before archive' "$([ "$(jq -r '[.events[].action] | join(",")' "$ORGANIZER_STATE")" = 'rename,archive' ]; echo $?)" "$(cat "$ORGANIZER_STATE")"
 check 'durable harvest has marker-addressed completed bytes before cleanup' "$([ -s "$TDIR/home/completed/$MARKER" ] && cmp -s "$TDIR/home/completed/$MARKER" "$TDIR/o-h2.md"; echo $?)" "completed=$(ls "$TDIR/home/completed" 2>/dev/null)"
 check 'successful harvest releases reservation' "$([ ! -f "$TDIR/home/in-progress/$MARKER" ]; echo $?)" "reservation leaked"
+# U1 (R1/R3): a harvest never queues for a slot — it reads an existing/in-progress conversation
+# over CDP — so its ledger row must carry queue_secs=0 and run_secs equal to the row's own secs
+# (the harvest's own short wall time), never reconstructed from a generation epoch it has none of.
+H2_ROW="$(grep -F "\"out\":\"$TDIR/o-h2.md\"" "$TDIR/home/ledger.jsonl" | tail -1)"
+check 'harvest ledger row is valid JSON' "$(printf '%s' "$H2_ROW" | jq empty >/dev/null 2>&1; echo $?)" "$H2_ROW"
+check 'harvest ledger row records queue_secs=0' "$([ "$(printf '%s' "$H2_ROW" | jq -r '.queue_secs // "MISSING"')" = 0 ]; echo $?)" "$H2_ROW"
+check 'harvest ledger row records run_secs == secs' "$([ "$(printf '%s' "$H2_ROW" | jq -r '.run_secs // "MISSING"')" = "$(printf '%s' "$H2_ROW" | jq -r .secs)" ]; echo $?)" "$H2_ROW"
 
 echo '# harvest: already collected (v0.28) vs genuinely gone'
 printf 'run marker: pg-run-999-1700000001-99\nforeign conversation\n' > "$TDIR/tab.txt"
@@ -285,6 +292,12 @@ PRO_GATE_HOME="$TDIR/home3" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PR
 RC=$?
 check 'non-reserved slot still acquirable' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
 check 'slotted reservation untouched by foreign run' "$([ -f "$TDIR/home3/in-progress/pg-run-slotted-1700000003-44" ]; echo $?)" 'reservation lost'
+# U1 (R1/R3): a completed fresh run's ledger row carries queue_secs/run_secs BY NAME alongside
+# the unchanged secs field, and the two parts sum back to secs exactly (shared "now" epoch).
+SLOTS2_ROW="$(grep -F "\"out\":\"$TDIR/o-slots2.md\"" "$TDIR/home3/ledger.jsonl" | tail -1)"
+check 'happy-path ledger row is valid JSON' "$(printf '%s' "$SLOTS2_ROW" | jq empty >/dev/null 2>&1; echo $?)" "$SLOTS2_ROW"
+check 'happy-path ledger row carries queue_secs + run_secs' "$(printf '%s' "$SLOTS2_ROW" | jq -e 'has("queue_secs") and has("run_secs") and has("secs")' >/dev/null 2>&1; echo $?)" "$SLOTS2_ROW"
+check 'happy-path queue_secs + run_secs equals secs' "$(printf '%s' "$SLOTS2_ROW" | jq -e '(.queue_secs + .run_secs - .secs) as $d | ($d >= -2 and $d <= 2)' >/dev/null 2>&1; echo $?)" "$SLOTS2_ROW"
 rm -rf "$TDIR/home3"
 
 echo '# harvest miss policy: absent passes retain, limit releases'
@@ -725,6 +738,12 @@ env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO
   >"$TDIR/stdout" 2>"$TDIR/stderr"
 RC=$?
 check 'concurrent same-branch --diff run waits on the per-change lock (exit 7)' "$([ "$RC" -eq 7 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+# U1 (R1/R3): a run that never reaches launch (this lock-timeout never even gets to the slot
+# wait) records its FULL wait as queue_secs with run_secs 0 — LAUNCH_EPOCH is never set.
+DLOCK_ROW="$(grep -F "\"out\":\"$RHOME/o-dlock.md\"" "$RHOME/ledger.jsonl" | tail -1)"
+check 'lock-timeout ledger row records run_secs=0' "$([ "$(printf '%s' "$DLOCK_ROW" | jq -r '.run_secs // "MISSING"')" = 0 ]; echo $?)" "$DLOCK_ROW"
+check 'lock-timeout ledger row records its full wait as queue_secs (>= 2s of the 3s PRO_GATE_LOCK_WAIT)' "$(printf '%s' "$DLOCK_ROW" | jq -e '(.queue_secs // -1) >= 2' >/dev/null 2>&1; echo $?)" "$DLOCK_ROW"
+check 'lock-timeout queue_secs + run_secs equals secs' "$([ "$(printf '%s' "$DLOCK_ROW" | jq -r '(.queue_secs // "MISSING") as $q | (.run_secs // "MISSING") as $r | if ($q == "MISSING" or $r == "MISSING") then "MISSING" else ($q + $r) end')" = "$(printf '%s' "$DLOCK_ROW" | jq -r .secs)" ]; echo $?)" "$DLOCK_ROW"
 eval "exec ${DLFD}>&-"
 
 # Detached-HEAD checkouts key per-commit (literal branch name "HEAD" would cross-cap
@@ -1685,6 +1704,30 @@ SP_HARV="$(PRO_GATE_HOME="$SHOME" bash "$STATS" --pr 7 --json 2>/dev/null | jq -
 check 'stats --pr matches harvest rows by round key' "$([ "$SP_HARV" = 2 ]; echo $?)" "runs=$SP_HARV"
 PRO_GATE_HOME="$SHOME" bash "$STATS" --pr not-a-number >/dev/null 2>&1; RC=$?
 check 'stats --pr rejects non-numeric (exit 2)' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC"
+
+echo '# U1: pro-gate-stats.sh queue/run percentiles on a MIXED ledger (old rows without the new'
+echo '# fields alongside new rows that carry them) — old .secs percentiles unchanged, new'
+echo '# percentiles computed from new-field rows only, no error, existing fields byte-compatible.'
+mkdir -p "$TDIR/home-mixed"
+MIXHOME="$TDIR/home-mixed"
+{
+  printf '{"ts":"2026-01-01T00:00:00+0000","pr":"1","outcome":"clean","secs":10,"conc":1}\n'
+  printf '{"ts":"2026-01-01T00:01:00+0000","pr":"2","outcome":"clean","secs":20,"conc":1}\n'
+  printf '{"ts":"2026-01-01T00:02:00+0000","pr":"3","outcome":"clean","secs":30,"queue_secs":5,"run_secs":25,"conc":1}\n'
+  printf '{"ts":"2026-01-01T00:03:00+0000","pr":"4","outcome":"clean","secs":40,"queue_secs":8,"run_secs":32,"conc":1}\n'
+  printf '{"ts":"2026-01-01T00:04:00+0000","pr":"5","outcome":"clean","secs":50,"queue_secs":10,"run_secs":40,"conc":1}\n'
+} > "$MIXHOME/ledger.jsonl"
+MIX_JSON="$(PRO_GATE_HOME="$MIXHOME" bash "$STATS" 2>/dev/null | awk '/^\{$/{f=1} f')"
+check 'stats on mixed ledger emits valid JSON' "$(printf '%s' "$MIX_JSON" | jq empty >/dev/null 2>&1; echo $?)" "$MIX_JSON"
+check 'stats mixed-ledger runs count is 5' "$([ "$(printf '%s' "$MIX_JSON" | jq -r .runs)" = 5 ]; echo $?)" "$MIX_JSON"
+check 'stats duration_p50_s/p95_s unchanged by rows lacking queue/run fields' \
+  "$([ "$(printf '%s' "$MIX_JSON" | jq -r .duration_p50_s)" = 30 ] && [ "$(printf '%s' "$MIX_JSON" | jq -r .duration_p95_s)" = 50 ]; echo $?)" "$MIX_JSON"
+check 'stats new queue_p50_s/p95_s computed from new-field rows only' \
+  "$([ "$(printf '%s' "$MIX_JSON" | jq -r .queue_p50_s)" = 8 ] && [ "$(printf '%s' "$MIX_JSON" | jq -r .queue_p95_s)" = 10 ]; echo $?)" "$MIX_JSON"
+check 'stats new run_p50_s/p95_s computed from new-field rows only' \
+  "$([ "$(printf '%s' "$MIX_JSON" | jq -r .run_p50_s)" = 32 ] && [ "$(printf '%s' "$MIX_JSON" | jq -r .run_p95_s)" = 40 ]; echo $?)" "$MIX_JSON"
+check 'stats mixed ledger keeps existing fields present (byte-compatible for old consumers)' \
+  "$(printf '%s' "$MIX_JSON" | jq -e 'has("runs") and has("by_outcome") and has("success_rate_pct") and has("throttles") and has("salvage_rate_pct") and has("duration_p50_s") and has("duration_p95_s") and has("by_concurrency")' >/dev/null 2>&1; echo $?)" "$MIX_JSON"
 
 echo '# v0.28: severity sidecar counts only OPEN findings (RESOLVED verification blocks excluded)'
 mkdir -p "$SHOME/rounds"
