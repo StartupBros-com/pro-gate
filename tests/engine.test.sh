@@ -658,6 +658,9 @@ check 'completed review writes severity sidecar (0 P0 / 1 P1)' \
 check 'completed review appends hist row (verdict + open counts)' \
   "$([ "$(awk -F'\t' 'NR==1{print $2" "$3" "$4" "$5" "$6}' "$RHOME/rounds/$RKEY_88.hist" 2>/dev/null)" = 'SHIP 0 1 0 0' ]; echo $?)" \
   "hist: $(cat "$RHOME/rounds/$RKEY_88.hist" 2>/dev/null)"
+check 'completed review hist row has a seventh wall-clock field' \
+  "$(awk -F'\t' 'NR==1{exit !(NF == 7 && $7 >= 0 && $7 < 86400)}' "$RHOME/rounds/$RKEY_88.hist" 2>/dev/null; echo $?)" \
+  "hist: $(cat "$RHOME/rounds/$RKEY_88.hist" 2>/dev/null)"
 # The history parser shares pg_is_review's hardened terminal matcher (bold/bullet formatting).
 printf '[P1] a.sh:1 - finding\n  Why: test\nP2: none\nP3: none\n**VERDICT:** FIX-FIRST - formatted.\n' > "$RHOME/formatted-review.md"
 PRO_GATE_HOME="$RHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_note_severity '$RKEY_88' '$RHOME/formatted-review.md'"
@@ -880,7 +883,7 @@ echo '# v0.31 (#65): governor integration — engine exit 12 carries the traject
 RKEY_90="$(printf '%s-90' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
 mkdir -p "$RHOME/rounds"
 : > "$RHOME/rounds/$RKEY_90"; for _ in 1 2 3; do printf '%s\n' "$(date +%s)" >> "$RHOME/rounds/$RKEY_90"; done
-printf '%s\tFIX-FIRST\t0\t5\t0\t0\n%s\tFIX-FIRST\t0\t7\t0\t0\n%s\tFIX-FIRST\t0\t8\t0\t0\n' \
+printf '%s\tFIX-FIRST\t0\t5\t0\t0\t3600\n%s\tFIX-FIRST\t0\t7\t0\t0\t3600\n%s\tFIX-FIRST\t0\t8\t0\t0\t3600\n' \
   "$(date +%s)" "$(date +%s)" "$(date +%s)" > "$RHOME/rounds/$RKEY_90.hist"
 printf 'foreign idle tab\n' > "$TDIR/tab.txt"
 env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
@@ -892,6 +895,8 @@ RC=$?
 check 'governor engine run: churn exits 12' "$([ "$RC" -eq 12 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
 check 'governor engine run: phase round-capped' "$([ "$(phase_of "$RHOME/o-gov.md.status")" = round-capped ]; echo $?)" "$(cat "$RHOME/o-gov.md.status" 2>/dev/null)"
 check 'governor engine run: status detail carries the trajectory arrow' "$(grep -q '5→7→8' "$RHOME/o-gov.md.status"; echo $?)" "$(cat "$RHOME/o-gov.md.status" 2>/dev/null)"
+check 'governor engine refusal names rounds used and wall clock' \
+  "$(grep -q '3 rounds, ~3.0h wall clock on this change' "$TDIR/stderr"; echo $?)" "$(tail -5 "$TDIR/stderr")"
 
 echo '# v0.31 (#65): a provably-never-landed submission refunds its round'
 cat > "$TDIR/bin/oracle-dead" <<'FAKE_DEAD'
@@ -1305,6 +1310,23 @@ check 'pg_marker_epoch (fallback) extracts the launch epoch' "$([ "$MEPOCH" = 17
 MEPOCH="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_marker_epoch 'legacy-marker' 2>/dev/null" || true)"
 check 'pg_marker_epoch rejects a legacy marker' "$([ -z "$MEPOCH" ]; echo $?)" "got=$MEPOCH"
 
+# ledger-timing-split R3 audit: a round's charge (and hence its budget window) must key off
+# the moment pg_round_record actually runs (post-lock, post-slot — the phase transition), never
+# off a marker's mint time. A marker minted well outside the round window simulates the queued
+# run this whole family of bugs (#66) was about: if pg_round_record ever used the marker's
+# epoch instead of its own call-time "now", this round would already be stale on arrival and
+# pg_round_count would read 0, not 1.
+R3_HOME="$TDIR/home-r3audit"; mkdir -p "$R3_HOME/rounds"
+R3_KEY="r3auditkey"
+R3_OLD_MARKER="pg-run-${R3_KEY}-$(( $(date +%s) - 172800 ))-42"   # minted 48h ago (2x the 24h window)
+R3_STALE_EPOCH="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_marker_epoch '$R3_OLD_MARKER'")"
+check 'R3 audit: the marker mint epoch really is outside the round window' \
+  "$([ $(( $(date +%s) - R3_STALE_EPOCH )) -ge 86400 ]; echo $?)" "marker_epoch=$R3_STALE_EPOCH"
+PRO_GATE_HOME="$R3_HOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_record '$R3_KEY'"
+R3_COUNT="$(PRO_GATE_HOME="$R3_HOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_count '$R3_KEY'")"
+check 'R3 audit: a round charged now counts in-window despite an out-of-window marker mint' \
+  "$([ "$R3_COUNT" -eq 1 ]; echo $?)" "count=$R3_COUNT rounds file=$(cat "$R3_HOME/rounds/$R3_KEY" 2>/dev/null)"
+
 # #66 gate P1: a harvested review is stamped with its SPEND epoch, not the collection time —
 # otherwise an hours-later harvest outlives its own spend in the scored window.
 HHOME="$TDIR/home-histstamp"; mkdir -p "$HHOME/rounds"
@@ -1315,6 +1337,9 @@ printf '[P1] a.sh:1 - finding\n  Why: test\nP2: none\nP3: none\nVERDICT: SHIP - 
 PRO_GATE_HOME="$HHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_note_severity '$HKEY' '$HHOME/review.md' '$OLD_EPOCH'"
 check 'harvested hist row carries the SPEND epoch' \
   "$([ "$(awk -F'\t' 'NR==1{print $1}' "$HHOME/rounds/$HKEY.hist")" = "$OLD_EPOCH" ]; echo $?)" \
+  "hist: $(cat "$HHOME/rounds/$HKEY.hist")"
+check 'harvested hist row carries plausible positive wall-clock seconds' \
+  "$(awk -F'\t' 'NR==1{exit !(NF == 7 && $7 > 0 && $7 < 86400)}' "$HHOME/rounds/$HKEY.hist"; echo $?)" \
   "hist: $(cat "$HHOME/rounds/$HKEY.hist")"
 # Rows sharing one second must keep WRITE order (the re-sort is stable): an unstable sort
 # would reorder the very trajectory the governor scores.
@@ -1453,6 +1478,10 @@ SHOME="$TDIR/sthome"; mkdir -p "$SHOME/in-progress" "$SHOME/rounds" "$SHOME/conv
 SMARKER="pg-run-acme-widgets-42-1700000001-77"
 printf '42\t/tmp/pg-st-42.md\t%s\t0\t1\tGPT-X\n' "$(date +%s)" > "$SHOME/in-progress/$SMARKER"
 printf '%s\n%s\n' "$(( $(date +%s) - 60 ))" "$(( $(date +%s) - 120 ))" > "$SHOME/rounds/acme-widgets-42"
+# Flat (non-shrinking) open counts so this fixture earns no extra round and leaves the
+# base-grant assertion below ('2 spent, 1 remaining') undisturbed — it exists only to give
+# the elapsed-wall-clock assertion two real hist rows (2h total) to sum.
+printf '%s\tFIX-FIRST\t0\t5\t0\t0\t3600\n%s\tFIX-FIRST\t0\t5\t0\t0\t3600\n' "$(date +%s)" "$(date +%s)" > "$SHOME/rounds/acme-widgets-42.hist"
 printf 'https://chatgpt.com/c/abc123\n' > "$SHOME/conversation-urls/$SMARKER"
 printf '{"ts":"2026-01-01T00:00:00+0000","pr":"42","repo":"/tmp/acme","exit":9,"outcome":"in-progress","secs":100,"attempts":0,"conc":1,"ceiling":1,"live":1,"salvaged":0,"diff_lines":10,"out":"/tmp/pg-st-42.md","model":"m","marker":"%s","round_key":"acme-widgets-42"}\n' "$SMARKER" > "$SHOME/ledger.jsonl"
 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 >"$TDIR/st.out" 2>"$TDIR/st.err"; RC=$?
@@ -1461,6 +1490,8 @@ check '--status names the reservation marker' "$(grep -q "$SMARKER" "$TDIR/st.ou
 check '--status leads to a free harvest' "$(grep -q "FREE" "$TDIR/st.out" && grep -q -- "--harvest '$SMARKER'" "$TDIR/st.out"; echo $?)" "$(grep -i harvest "$TDIR/st.out")"
 # v0.31: governor default — base grant 3 with no trajectory history, so 2 spent leaves 1.
 check '--status reports rounds spent/remaining' "$(grep -q '2 spent, 1 remaining' "$TDIR/st.out"; echo $?)" "$(grep spent "$TDIR/st.out")"
+check '--status reports rounds used and total wall clock' \
+  "$(grep -q '2 rounds, ~2.0h wall clock on this change' "$TDIR/st.out"; echo $?)" "$(grep spent "$TDIR/st.out")"
 check '--status writes nothing' "$([ ! -f "$SHOME/ledger.jsonl.tmp" ] && [ "$(wc -l < "$SHOME/ledger.jsonl")" -eq 1 ]; echo $?)" 'state mutated'
 # #67/#68 P2: THREE states. Bare .unbound captures are AMBIGUOUS and retryable (strict nonce
 # mode makes one when an older answer is visible while ours generates); only a positively

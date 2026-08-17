@@ -361,6 +361,11 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
     pg_round_score "$k"
     k_cap="$PG_ROUND_GRANT"; k_arrow="$PG_ROUND_ARROW"; k_earned="$PG_ROUND_EARNED"
     k_streak="$PG_ROUND_STREAK"; k_braked=0
+    # ledger-timing-split R2: total wall clock spent on this change's rounds, alongside spent/cap.
+    # elapsed_h is pre-formatted here (never in jq): jq's number formatting collapses "2.0" to
+    # "2", so the human-readable string is built once, in shell, with the same pg_hours_1dp
+    # round_capped() uses, and carried through as an opaque string field.
+    k_elapsed="$PG_ROUND_ELAPSED_SECS"; k_elapsed_h="$(pg_hours_1dp "$k_elapsed")"
     [ "$PG_ROUND_STREAK" -ge 2 ] && [ -z "${PRO_GATE_MAX_ROUNDS_PER_PR:-}" ] && k_braked=1
     rem=$(( k_cap - spent )); [ "$rem" -lt 0 ] && rem=0
     if [ "$spent" -gt 0 ] 2>/dev/null; then ST_SPENT_KEY="$k"; ST_SPENT_N="$spent"; fi
@@ -369,11 +374,11 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
         --argjson remaining "$rem" --argjson window_secs "$ST_WIN" --argjson in_flight "$k_live" \
         --arg amarker "$a_marker" --arg aout "$a_out" --arg aalive "$a_alive" --arg amode "$a_mode" \
         --arg arrow "$k_arrow" --argjson earned "$k_earned" --argjson streak "$k_streak" \
-        --argjson braked "$k_braked" \
-        '{key:$key,spent:$spent,cap:$cap,remaining:$remaining,window_secs:$window_secs,in_flight:($in_flight == 1),trajectory:(if $arrow == "" then null else $arrow end),earned:$earned,streak:$streak,churn_braked:($braked == 1),active:(if $amarker == "" and $aout == "" then null else {marker:$amarker,out:$aout,wrapper_alive:($aalive == "1"),mode:$amode} end)}' \
+        --argjson braked "$k_braked" --argjson elapsed_secs "$k_elapsed" --arg elapsed_h "$k_elapsed_h" \
+        '{key:$key,spent:$spent,cap:$cap,remaining:$remaining,window_secs:$window_secs,in_flight:($in_flight == 1),trajectory:(if $arrow == "" then null else $arrow end),earned:$earned,streak:$streak,churn_braked:($braked == 1),elapsed_secs:$elapsed_secs,elapsed_h:$elapsed_h,active:(if $amarker == "" and $aout == "" then null else {marker:$amarker,out:$aout,wrapper_alive:($aalive == "1"),mode:$amode} end)}' \
         >> "$ST_TMP/rounds.jsonl" 2>/dev/null
     else
-      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$k" "$spent" "$k_cap" "$rem" "$k_live" "$k_arrow" "$k_braked" >> "$ST_TMP/rounds.tsv"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$k" "$spent" "$k_cap" "$rem" "$k_live" "$k_arrow" "$k_braked" "$k_elapsed" >> "$ST_TMP/rounds.tsv"
     fi
   done
 
@@ -487,11 +492,12 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
     echo "round budget (rolling window $(( ST_WIN / 3600 ))h, ${ST_CAP_DESC}):"
     if pg_have jq && [ -s "$ST_TMP/rounds.jsonl" ]; then
       jq -r '"  " + .key + ": \(.spent) spent, \(.remaining) remaining"
+             + "  (\(.spent) rounds, ~" + .elapsed_h + "h wall clock on this change)"
              + (if .trajectory then "  (open P0/P1 by round: " + .trajectory + ")" else "" end)
              + (if .churn_braked then "  [CHURN BRAKE: not converging — escalate instead of re-running]" else "" end)
              + (if .in_flight then "  [REVIEW RUNNING NOW]" else "" end)' "$ST_TMP/rounds.jsonl"
     else
-      awk -F'\t' '{printf "  %s: %s spent, %s remaining (cap %s)%s%s%s\n", $1, $2, $4, $3, ($6 == "" ? "" : "  (open P0/P1 by round: " $6 ")"), ($7 == 1 ? "  [CHURN BRAKE: not converging]" : ""), ($5 == 1 ? "  [REVIEW RUNNING NOW]" : "")}' "$ST_TMP/rounds.tsv" 2>/dev/null
+      awk -F'\t' '{printf "  %s: %s spent, %s remaining (cap %s)  (%s rounds, ~%.1fh wall clock on this change)%s%s%s\n", $1, $2, $4, $3, $2, ($8+0)/3600, ($6 == "" ? "" : "  (open P0/P1 by round: " $6 ")"), ($7 == 1 ? "  [CHURN BRAKE: not converging]" : ""), ($5 == 1 ? "  [REVIEW RUNNING NOW]" : "")}' "$ST_TMP/rounds.tsv" 2>/dev/null
     fi
   else
     echo "round budget: nothing spent in the current window for this query"
@@ -1896,11 +1902,22 @@ round_capped() {  # $1 = reason
   # reviewer's own claims, exactly the signal observed to oscillate across rounds), but a cap
   # hit while the change's LAST completed review reported P0s is the one case a human may
   # want to grant PRO_GATE_FORCE_ROUND=1, so say it loudly instead of burying it.
-  local sev="" last_p0="" last_p1="" note="" pfd inflight=0
+  local sev="" last_p0="" last_p1="" note="" pfd inflight=0 used elapsed_h totals
   if sev="$(pg_round_last_severity "$ROUND_KEY")"; then
     last_p0="${sev%% *}"; last_p1="${sev##* }"
     note="; last completed review: ${last_p0} P0 / ${last_p1} P1 unconfirmed by a re-review"
   fi
+  # ledger-timing-split R2: state rounds used + total wall clock spent on this change alongside
+  # the severity note above. pg_round_guard's refusal ($1) already carries the scored
+  # trajectory, but it ran as "ROUND_REASON=\"\$(pg_round_guard ...)\"" — a command
+  # substitution — so the PG_ROUND_* globals it set are gone by the time we get here (same
+  # pitfall the --status renderer's "score IN THIS SHELL" comment guards against). Re-score
+  # directly, in-shell, rather than re-deriving totals from $1's text.
+  pg_round_score "$ROUND_KEY"
+  used="$(pg_round_count "$ROUND_KEY")"
+  elapsed_h="$(pg_hours_1dp "$PG_ROUND_ELAPSED_SECS")"
+  totals="${used} rounds, ~${elapsed_h}h wall clock on this change"
+  note="${note}; ${totals}"
   # pg_round_guard's refusal already carries the scored trajectory. Do not re-read .hist here:
   # the reason becomes the status detail below, and a second parse can only duplicate I/O.
   # Non-blocking probe: a same-change run holding the per-change lock right now means the
@@ -1921,6 +1938,7 @@ round_capped() {  # $1 = reason
   fi
   [ "$inflight" = 1 ] && [ -n "$note" ] && note="${note} (a same-change review is in flight NOW: re-check this note after it completes)"
   echo "ERROR: ${1}; not spending another Pro review slot on this change." >&2
+  echo "  ${totals}." >&2
   if [ "${last_p0:-0}" -gt 0 ] 2>/dev/null; then
     echo "  ATTENTION: OPEN P0. The most recent completed review reported ${last_p0} P0 finding(s) that no re-review has confirmed fixed. If the fixes have landed, this is the case PRO_GATE_FORCE_ROUND=1 exists for: surface it to a human now." >&2
     [ "$inflight" = 1 ] && echo "  (A same-change review is in flight right now; wait for it before deciding, its result may already settle these.)" >&2
