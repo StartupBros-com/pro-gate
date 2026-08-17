@@ -56,6 +56,7 @@ Two observability gaps make the wait worse than it needs to be. The status file 
 - R4. `oracle-review.sh --wait <out-path|marker> [--timeout S]` blocks as a plain shell process — no LLM involvement — until the run's status reaches a terminal phase, then prints the final status JSON to stdout and exits. It is a pure watcher: it never drives `--harvest` or any other engine action, and it never touches `pg_finish`'s outcome bookkeeping (per KTD1, KTD6).
 - R5. `--wait` exits with distinct codes for distinct situations: verdict-reached (one code regardless of the underlying engine outcome — the printed status JSON and `next_action` carry the disambiguation), usage error / unknown run (fail-fast, never blocks the full timeout on a run that never existed), timeout expiry (re-arm safe — a chunk boundary, not a failure), and lost observability (stale-beyond-bounds or unreadable state — escalate). Timeout and lost observability are separate codes so an unattended caller can re-arm on one and escalate on the other. New code values collide with nothing the engine currently returns: the documented set 0, 2–9, 11, 12 plus the undocumented bootstrap-fatal 10 (per KD6). Proposed values in KTD3; exact final values are the implementer's within that collision rule.
 - R6. `--wait` accepts a bare marker and resolves it through the same state join `--status` already implements (reservations → active-run index → ledger → completed store, `bin/oracle-review.sh:190-448`, per KTD4), so a session that did not launch the run can wait on it; invoked on an already-terminal run it returns immediately with the verdict-reached exit. A marker with no engine state anywhere fails fast with the usage exit. Repeat waits are free and idempotent.
+- R6a. When `--wait` knows the target marker, it verifies the polled status file's own `marker` field matches before trusting that file's phase or verdict; a mismatch is treated as "no status for this run yet" and falls back to the state join. `--out` paths are reused across rounds of the same PR (`skills/pro-gate/SKILL.md:204` launches every round at one fixed path, and `bin/oracle-review.sh:1009-1010` records that a shared `--out` can be reused by unrelated markers), so without this check a marker-attached wait could report a newer run's verdict as the target's. The bare out-path form has no marker to check and trusts the file as-is.
 - R7. `--timeout` defaults to a value exceeding the worst-case envelope of both lock waits plus a long generation; on expiry `--wait` exits through the timeout code. `--timeout 0` is a probe: classify the run's current state once and exit immediately with the same code taxonomy.
 
 **Status schema additions (ride PR B)**
@@ -138,12 +139,14 @@ This plan owns stage 1 of the gate-run UX program mapped in `docs/ideation/2026-
 ### Dependencies / Assumptions
 
 - Verified against the live repo (fresh-context verifiers, 2026-08-17): no existing `--wait` or notify mechanism; the three protocol copies at `skills/pro-gate/SKILL.md:197-356`, `agents/oracle-reviewer.md:18-21,79-176`, `daemon/daemon.sh:232-235`; atomic status writes at `bin/oracle-review.sh:692` (`pg_status` defined at 652–693; schema: phase, attempt, detail, pr, out, ts, marker, model, model_warn, result); `RUN_START` at 697 preceding both lock waits; jq field-name ledger parsing in `bin/pro-gate-stats.sh:87-88,98`; `.hist` writer at `lib/pro-gate-lib.sh:1274` with sole reader at `:1341`; live exit code 10 at `bin/oracle-review.sh:40`; status writes occur once per phase entry, never per wait-loop iteration; the only in-repo programmatic status consumer is `daemon.sh`'s `engine_state_recoverable()` via `--status --json`.
-- Assumption: the harness's background-completion notification reliably wakes the calling session when a background command exits (observed working throughout this session); the headless daemon does not rely on it (it chunks `--wait --timeout` calls).
+- Assumption: the harness's background-completion notification reliably wakes the calling session when a background command exits. Evidence is one session's observation over short waits — not across a p90-length (47+ min) wait or a context-compaction event, and a notification that silently fails while both the wait and the session live is a distinct failure from F2's caller-death case. U4's verification includes a long-wait notification test; if it does not survive, the interactive protocol gains a coarse self-check fallback ("if no wake after N minutes, run `--status`"). The headless daemon does not depend on this at all (it chunks `--wait --timeout` calls).
+- Risk: terminal status precedes the engine's own bookkeeping. `pg_status done` is written before `pg_finish` (`bin/oracle-review.sh:2592-2595`), whose rc=0 branch calls `pg_organize_chat finalize` (`:1045`) — in `remote-chrome` mode that can block on a 95s organizer-lock wait plus a `scan_s+50` helper timeout (`:935`, `:958-960`) before `pg_ledger_append` and `pg_active_clear` run (`:1111-1112`). A caller that acts the instant `--wait` reports terminal can therefore see the active-run index still reporting the change as live. Native-Chrome mode returns immediately (`:929`) and has no gap.
 - Assumption: the ~30-minute tool-call cap documented in `skills/pro-gate/SKILL.md:207-209` applies to the daemon's headless agent, motivating F4's chunked waits; chunking is safe regardless of the cap's exact value.
 
 ### Outstanding Questions
 
-- **Deferred to implementation:** final exit-code values (KTD3 proposes 0/2/20/21 within R5's collision rule); heartbeat env-var names and the poll interval (KTD2 proposes `PRO_GATE_HEARTBEAT_SECS=30`, staleness 4×, poll every 10s); the exact phase→`wait_class` mapping table beyond R9's anchors; `--timeout` default constant (KTD3 proposes 14400).
+- **Decide during U4:** how to close the terminal-status-precedes-bookkeeping gap named under Dependencies / Assumptions — either move `pg_ledger_append` and `pg_active_clear` ahead of `pg_organize_chat`'s browser work inside `pg_finish` (fixes it for every consumer, but reorders a load-bearing engine function), or have `--wait`'s terminal path re-check the active-run index before printing `next_action` (local to the new verb, leaves other consumers exposed). The plan does not pick; U4 cannot ship without one.
+- **Deferred to implementation:** final exit-code values (KTD3 proposes 0/2/20/21 within R5's collision rule); heartbeat env-var names and the poll interval (KTD2 proposes `PRO_GATE_HEARTBEAT_SECS=30`, staleness 4×, poll every 10s); the loopless-phase slack term — give it the same explicit treatment as the heartbeat multiplier rather than an arbitrary constant (proposal: 1.5× each phase's own budget); the exact phase→`wait_class` mapping table beyond R9's anchors; `--timeout` default constant (KTD3 proposes 14400); whether a harvest invocation should publish its own `--timeout` so an external `--wait` can bound the harvest-collection phase exactly instead of assuming a default.
 - **Resolve Before Planning:** none.
 
 ### Sources / Research
@@ -198,7 +201,7 @@ Phase staleness table (bounds sourced from the engine's own tunables):
 
 | Phase group | Freshness source | Bound |
 |---|---|---|
-| `launching`, `live-detected`, `throttled`→loop states | watchdog-tick heartbeat | 4 × `PRO_GATE_HEARTBEAT_SECS` |
+| `launching`, `live-detected` | watchdog-tick heartbeat | 4 × `PRO_GATE_HEARTBEAT_SECS` |
 | `waiting-slot` | slot-loop heartbeat | 4 × `PRO_GATE_HEARTBEAT_SECS` |
 | `waiting-pr-lock` | phase window | `PRO_GATE_LOCK_WAIT` + slack |
 | `salvaging`, harvest collection | phase window | salvage/harvest budget + slack |
@@ -280,13 +283,13 @@ PR A = U1 + U2 (independent of each other; land together). PR B = U3 → U4 → 
 ### U4. The --wait verb
 
 - **Goal:** `oracle-review.sh --wait <out|marker> [--timeout S]` blocks, classifies, and exits per the KTD3 taxonomy.
-- **Requirements:** R4, R5, R6, R7, R10 (consumer side). Covers AE1, AE2, AE5, AE6, AE7, AE8, AE9.
+- **Requirements:** R4, R5, R6, R6a, R7, R10 (consumer side). Covers AE1, AE2, AE5, AE6, AE7, AE8, AE9.
 - **Dependencies:** U3.
 - **Files:** `bin/oracle-review.sh`, `tests/engine.test.sh`.
 - **Approach:**
   1. Parse arm copying `--status`'s optional-positional shape (`:33-77`); validation in the existing post-parse block: `--wait` is exclusive with run/harvest/status modes.
   2. Extract `--status`'s state join (`:190-448`) into a shared resolver helper; `--wait` uses it for marker→surface resolution and completed-store fast return (KTD4).
-  3. Loop body per the `:2625` template: sleep ~10s; read status; classify per the HTD flowchart (ENOENT → keep polling; legacy no-`terminal` → widest bound + one stderr warning; phase-aware staleness per the HTD table; terminal → print JSON, exit 0; stale → exit 21 with last-known JSON; `--timeout` expiry → exit 20; unknown run → fail-fast exit 2).
+  3. Loop body per the `:2625` template: sleep ~10s; read status; when a target marker is known, check the file's `marker` field first and treat a mismatch as ENOENT (R6a); classify per the HTD flowchart (ENOENT → keep polling; legacy no-`terminal` → widest bound + one stderr warning; phase-aware staleness per the HTD table; terminal → print JSON, exit 0; stale → exit 21 with last-known JSON; `--timeout` expiry → exit 20; unknown run → fail-fast exit 2).
   4. `--timeout 0` probe: one classification pass, exit immediately (terminal → 0; healthy non-terminal → 20; stale → 21).
   5. Direct-exit family: no `pg_finish`, no state mutation of any kind (KTD1).
 - **Patterns to follow:** `--status`'s read-only discipline; shellcheck `--severity=error` clean with zero suppressions (repo has none).
@@ -301,6 +304,9 @@ PR A = U1 + U2 (independent of each other; land together). PR B = U3 → U4 → 
   7. Legacy fixture without `terminal` → wide bound applied, one warning line, no false exit 21 within the window.
   8. Unknown marker (no state anywhere) → exit 2 immediately with a clear message.
   9. Usage: `--wait` combined with `--pr` → exit 2.
+  10. Covers R6a: a status file at the resolved out-path carrying a different `marker` → `--wait` keeps polling via the state join instead of printing that run's terminal JSON.
+  11. Terminal-exit ordering: after `--wait` reports verdict-reached, the engine's active-run index no longer reports the change as live (enforces whichever remedy U4 picks for the gap under Dependencies / Assumptions).
+  12. Notification survival (manual, once): a background `--wait` spanning a p90-length wait and at least one context compaction still wakes the calling session; record the result and, on failure, add the `--status` self-check fallback to R11's protocol.
   10. End-to-end: launch against mock CDP, `--wait` in background, engine completes, `--wait` exits 0 with the final JSON.
 - **Verification:** `bash tests/engine.test.sh` green including the new suite section (opened with the standard env-scrub block); shellcheck clean.
 
@@ -327,7 +333,7 @@ PR A = U1 + U2 (independent of each other; land together). PR B = U3 → U4 → 
 | Engine test suite (incl. new --wait/heartbeat/ledger cases) | `bash tests/engine.test.sh` | U1–U4 |
 | Full test set | the 8 test files invoked by `.github/workflows/ci.yml` | all units |
 | Shell lint (zero suppressions) | `shellcheck --severity=error` on all `*.sh` | U1–U5 |
-| JSON/YAML validity | `jq empty` / `yq eval '.'` per CI | U1, U3, U4 |
+| JSON/YAML validity | `jq empty` / `yq eval '.'` per CI | U1, U3, U4, U5 |
 | Release-notes gate | CI `VERSION`-bump check | each PR |
 | Terminal review gate | `/pro-gate` on each PR; PR B's wait driven by `--wait` itself (dogfood) | each PR |
 
@@ -336,6 +342,7 @@ Sequencing gate: PR A merged and released before PR B opens.
 ## Definition of Done
 
 - Both PRs merged with green CI and a pro-gate review verdict; PR A released before PR B opened.
+- The terminal-status-precedes-bookkeeping gap is closed by one of the two named remedies, with U4 test scenario 11 enforcing it.
 - All U1–U5 verification gates pass; every AE1–AE9 scenario is enforced by a test or (AE3) by the rewritten docs.
 - The SKILL.md §3 poll ceremony and the daemon's `sleep 60` instruction no longer exist; manual recovery remains documented.
 - `pro-gate-stats.sh` runs correctly against a mixed old/new ledger; `pg_round_score` runs correctly against mixed 6/7-field history.
