@@ -297,7 +297,7 @@ check 'slotted reservation untouched by foreign run' "$([ -f "$TDIR/home3/in-pro
 SLOTS2_ROW="$(grep -F "\"out\":\"$TDIR/o-slots2.md\"" "$TDIR/home3/ledger.jsonl" | tail -1)"
 check 'happy-path ledger row is valid JSON' "$(printf '%s' "$SLOTS2_ROW" | jq empty >/dev/null 2>&1; echo $?)" "$SLOTS2_ROW"
 check 'happy-path ledger row carries queue_secs + run_secs' "$(printf '%s' "$SLOTS2_ROW" | jq -e 'has("queue_secs") and has("run_secs") and has("secs")' >/dev/null 2>&1; echo $?)" "$SLOTS2_ROW"
-check 'happy-path queue_secs + run_secs equals secs' "$(printf '%s' "$SLOTS2_ROW" | jq -e '(.queue_secs + .run_secs - .secs) as $d | ($d >= -2 and $d <= 2)' >/dev/null 2>&1; echo $?)" "$SLOTS2_ROW"
+check 'happy-path queue_secs + run_secs equals secs' "$([ "$(printf '%s' "$SLOTS2_ROW" | jq -r '(.queue_secs // "MISSING") as $q | (.run_secs // "MISSING") as $r | if ($q == "MISSING" or $r == "MISSING") then "MISSING" else ($q + $r) end')" = "$(printf '%s' "$SLOTS2_ROW" | jq -r .secs)" ]; echo $?)" "$SLOTS2_ROW"
 rm -rf "$TDIR/home3"
 
 echo '# harvest miss policy: absent passes retain, limit releases'
@@ -831,6 +831,9 @@ gguard() { # $1=key, rest = env overrides; stdout = reason, rc = guard rc
   local key="$1"; shift
   env PRO_GATE_HOME="$GHOME" "$@" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_guard '$key'"
 }
+gscore() { # $1=key -> "earned<TAB>streak<TAB>elapsed_secs<TAB>scored" from pg_round_score
+  env PRO_GATE_HOME="$GHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_score '$1'; printf '%s\t%s\t%s\t%s\n' \"\$PG_ROUND_EARNED\" \"\$PG_ROUND_STREAK\" \"\$PG_ROUND_ELAPSED_SECS\" \"\$PG_ROUND_SCORED\""
+}
 # No history: the base grant (3) is the whole budget.
 gseed nohist 3
 GOUT="$(gguard nohist)"; GRC=$?
@@ -879,6 +882,39 @@ gseed churn2 3; ghist churn2 5 7 8
 GOUT="$(env PRO_GATE_HOME="$GHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_grant churn2")"
 check 'grant: churn brake collapses the grant to spent' "$([ "$GOUT" = 3 ]; echo $?)" "grant=$GOUT"
 
+echo '# ledger-timing-split R4: MIXED 6-field (pre-upgrade) and 7-field (post-upgrade) .hist rows'
+# pg_round_note_severity copies existing .hist lines through VERBATIM and appends only the new
+# row as 7 fields, so every change with pre-existing rounds has a MIXED-width file on first
+# upgrade to the ledger-timing-split fields. That real state was previously untested: every
+# existing fixture in this suite is uniformly 6-field (ghist above) or uniformly 7-field
+# (RKEY_90 below). Same open-count sequence as the 'shrink' fixture (5 -> 3 -> 1) so trajectory
+# scoring is directly comparable; only the row WIDTH differs.
+gseed mixedhist 3
+{
+  printf '%s\tFIX-FIRST\t0\t5\t0\t0\n' "$GEPOCH"          # legacy 6-field row: no field 7 at all
+  printf '%s\tFIX-FIRST\t0\t3\t0\t0\t1800\n' "$GEPOCH"    # 7-field row: dur=1800s
+  printf '%s\tFIX-FIRST\t0\t1\t0\t0\t3600\n' "$GEPOCH"    # 7-field row: dur=3600s
+} > "$GHOME/rounds/mixedhist.hist"
+MIXROW="$(gscore mixedhist)"
+MIX_EARNED="$(printf '%s' "$MIXROW" | cut -f1)"
+MIX_STREAK="$(printf '%s' "$MIXROW" | cut -f2)"
+MIX_ELAPSED="$(printf '%s' "$MIXROW" | cut -f3)"
+MIX_SCORED="$(printf '%s' "$MIXROW" | cut -f4)"
+# (a) trajectory scoring (earned/streak) is unaffected by row width — same 5->3->1 sequence as
+# the 'shrink' fixture earns 2 rounds with a reset (non-churning) streak, exactly as it does
+# when every row is uniformly 7-field.
+check 'mixed-width .hist: trajectory scoring matches the pure 7-field sequence (2 earned, streak 0)' \
+  "$([ "$MIX_EARNED" = 2 ] && [ "$MIX_STREAK" = 0 ]; echo $?)" "earned=$MIX_EARNED streak=$MIX_STREAK"
+# (b) PG_ROUND_ELAPSED_SECS sums only the two 7-field durations (1800+3600=5400); the legacy
+# 6-field row contributes 0 rather than breaking the scan. PG_ROUND_SCORED counts all THREE
+# in-window rows regardless of width — the distinction FIX 1 exists to make visible.
+check 'mixed-width .hist: elapsed sums only the 7-field durations, legacy row as 0' \
+  "$([ "$MIX_ELAPSED" = 5400 ]; echo $?)" "elapsed=$MIX_ELAPSED"
+check 'mixed-width .hist: scored count includes every in-window row (legacy + 7-field)' \
+  "$([ "$MIX_SCORED" = 3 ]; echo $?)" "scored=$MIX_SCORED"
+gguard mixedhist >/dev/null; GRC=$?
+check 'mixed-width .hist: governor still proceeds normally (earned round available)' "$([ "$GRC" -eq 0 ]; echo $?)" "rc=$GRC"
+
 echo '# v0.31 (#65): governor integration — engine exit 12 carries the trajectory'
 RKEY_90="$(printf '%s-90' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
 mkdir -p "$RHOME/rounds"
@@ -896,7 +932,7 @@ check 'governor engine run: churn exits 12' "$([ "$RC" -eq 12 ]; echo $?)" "rc=$
 check 'governor engine run: phase round-capped' "$([ "$(phase_of "$RHOME/o-gov.md.status")" = round-capped ]; echo $?)" "$(cat "$RHOME/o-gov.md.status" 2>/dev/null)"
 check 'governor engine run: status detail carries the trajectory arrow' "$(grep -q '5→7→8' "$RHOME/o-gov.md.status"; echo $?)" "$(cat "$RHOME/o-gov.md.status" 2>/dev/null)"
 check 'governor engine refusal names rounds used and wall clock' \
-  "$(grep -q '3 rounds, ~3.0h wall clock on this change' "$TDIR/stderr"; echo $?)" "$(tail -5 "$TDIR/stderr")"
+  "$(grep -q '3 rounds; ~3.0h recorded across 3 scored round(s)' "$TDIR/stderr"; echo $?)" "$(tail -5 "$TDIR/stderr")"
 
 echo '# v0.31 (#65): a provably-never-landed submission refunds its round'
 cat > "$TDIR/bin/oracle-dead" <<'FAKE_DEAD'
@@ -1491,7 +1527,7 @@ check '--status leads to a free harvest' "$(grep -q "FREE" "$TDIR/st.out" && gre
 # v0.31: governor default — base grant 3 with no trajectory history, so 2 spent leaves 1.
 check '--status reports rounds spent/remaining' "$(grep -q '2 spent, 1 remaining' "$TDIR/st.out"; echo $?)" "$(grep spent "$TDIR/st.out")"
 check '--status reports rounds used and total wall clock' \
-  "$(grep -q '2 rounds, ~2.0h wall clock on this change' "$TDIR/st.out"; echo $?)" "$(grep spent "$TDIR/st.out")"
+  "$(grep -q '2 rounds; ~2.0h recorded across 2 scored round(s)' "$TDIR/st.out"; echo $?)" "$(grep spent "$TDIR/st.out")"
 check '--status writes nothing' "$([ ! -f "$SHOME/ledger.jsonl.tmp" ] && [ "$(wc -l < "$SHOME/ledger.jsonl")" -eq 1 ]; echo $?)" 'state mutated'
 # #67/#68 P2: THREE states. Bare .unbound captures are AMBIGUOUS and retryable (strict nonce
 # mode makes one when an older answer is visible while ours generates); only a positively

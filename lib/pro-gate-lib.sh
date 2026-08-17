@@ -1273,12 +1273,13 @@ pg_round_note_severity() {
   # and an unstable sort would silently reorder the trajectory it exists to keep honest.
   stamp="$spend_epoch"; case "$stamp" in ''|*[!0-9]*) stamp="$now";; esac
   [ "$stamp" -gt "$now" ] 2>/dev/null && stamp="$now"
-  # Field 7 (ledger-timing-split R2): wall-clock seconds from the round's SPEND (the
-  # phase-transition charge stamped above as $stamp) to this row's completion — i.e. how
-  # long the round actually took. Never from marker mint (R3): $stamp is already the spend
-  # epoch, never the pre-lock/pre-queue marker time, so this duration cannot inherit the
-  # ~80-minute queue skew documented at pg_round_record above. Clamped at 0 as a defensive
-  # floor; $stamp is already clamped to never exceed $now so this should never go negative.
+  # Field 7 (ledger-timing-split R2): wall-clock seconds from $stamp (the round's recorded
+  # spend epoch, stamped above) to this row being written — NOT pure generation time. On the
+  # harvest path that span includes however long the finished review sat uncollected before
+  # someone ran --harvest (bounded only by the reservation TTL); when no spend epoch was
+  # available, $stamp fell back to the marker's mint time (pg_marker_epoch), which can precede
+  # the real charge by up to two PRO_GATE_LOCK_WAIT periods. Clamped at 0 as a defensive floor;
+  # $stamp is already clamped to never exceed $now so this should never go negative.
   dur=$(( now - stamp )); [ "$dur" -lt 0 ] 2>/dev/null && dur=0
   {
     if [ -f "$dir/$key.hist" ]; then
@@ -1339,13 +1340,16 @@ pg_round_last_severity() {
 # PG_ROUND_STREAK, PG_ROUND_ARROW, PG_ROUND_BASE, PG_ROUND_CEILING, PG_ROUND_GRANT,
 # PG_ROUND_ELAPSED_SECS (ledger-timing-split R2: sum of field-7 wall-clock durations across the
 # in-window trajectory — a legacy 6-field row has no field 7 and contributes 0, never breaking
-# the scan). Missing history scores 0/0/""/0. In flat mode, GRANT is the explicit legacy cap and
+# the scan), PG_ROUND_SCORED (ledger-timing-split R2: count of in-window .hist rows folded into
+# that sum — legacy and 7-field rows alike — distinct from pg_round_count's "rounds charged",
+# since a charged-but-lost round writes no .hist row at all and so is never scored here).
+# Missing history scores 0/0/""/0/0. In flat mode, GRANT is the explicit legacy cap and
 # the trajectory remains available for human-facing notes even though it does not affect
 # enforcement. Called IN-SHELL (never via command substitution) by every caller that needs these
 # globals afterward — a subshell would compute them and then drop them on exit.
 pg_round_score() {
   local key="$1" f now win e verdict p0 p1 res sp dur open prev="" used
-  PG_ROUND_EARNED=0; PG_ROUND_STREAK=0; PG_ROUND_ARROW=""; PG_ROUND_ELAPSED_SECS=0
+  PG_ROUND_EARNED=0; PG_ROUND_STREAK=0; PG_ROUND_ARROW=""; PG_ROUND_ELAPSED_SECS=0; PG_ROUND_SCORED=0
   PG_ROUND_BASE="${PRO_GATE_ROUNDS_BASE:-3}"; case "$PG_ROUND_BASE" in ''|*[!0-9]*) PG_ROUND_BASE=3;; esac
   PG_ROUND_CEILING="${PRO_GATE_ROUNDS_CEILING:-8}"; case "$PG_ROUND_CEILING" in ''|*[!0-9]*) PG_ROUND_CEILING=8;; esac
   # The ceiling is the IMMOVABLE backstop: an inconsistent config clamps the BASE DOWN to it,
@@ -1366,6 +1370,7 @@ pg_round_score() {
         case "$p1" in ''|*[!0-9]*) p1=0;; esac
         case "$dur" in ''|*[!0-9]*) dur=0;; esac
         PG_ROUND_ELAPSED_SECS=$(( PG_ROUND_ELAPSED_SECS + dur ))
+        PG_ROUND_SCORED=$(( PG_ROUND_SCORED + 1 ))
         open=$(( p0 + p1 ))
         if [ -n "$prev" ]; then
           if [ "$open" -lt "$prev" ]; then PG_ROUND_EARNED=$(( PG_ROUND_EARNED + 1 )); PG_ROUND_STREAK=0

@@ -366,6 +366,10 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
     # "2", so the human-readable string is built once, in shell, with the same pg_hours_1dp
     # round_capped() uses, and carried through as an opaque string field.
     k_elapsed="$PG_ROUND_ELAPSED_SECS"; k_elapsed_h="$(pg_hours_1dp "$k_elapsed")"
+    # ledger-timing-split R2: the population the elapsed hours were summed across — distinct
+    # from $spent (every charge in the window), so the rendered line can name its own scope
+    # rather than implying the hours cover every spent round.
+    k_scored="$PG_ROUND_SCORED"
     [ "$PG_ROUND_STREAK" -ge 2 ] && [ -z "${PRO_GATE_MAX_ROUNDS_PER_PR:-}" ] && k_braked=1
     rem=$(( k_cap - spent )); [ "$rem" -lt 0 ] && rem=0
     if [ "$spent" -gt 0 ] 2>/dev/null; then ST_SPENT_KEY="$k"; ST_SPENT_N="$spent"; fi
@@ -375,10 +379,11 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
         --arg amarker "$a_marker" --arg aout "$a_out" --arg aalive "$a_alive" --arg amode "$a_mode" \
         --arg arrow "$k_arrow" --argjson earned "$k_earned" --argjson streak "$k_streak" \
         --argjson braked "$k_braked" --argjson elapsed_secs "$k_elapsed" --arg elapsed_h "$k_elapsed_h" \
-        '{key:$key,spent:$spent,cap:$cap,remaining:$remaining,window_secs:$window_secs,in_flight:($in_flight == 1),trajectory:(if $arrow == "" then null else $arrow end),earned:$earned,streak:$streak,churn_braked:($braked == 1),elapsed_secs:$elapsed_secs,elapsed_h:$elapsed_h,active:(if $amarker == "" and $aout == "" then null else {marker:$amarker,out:$aout,wrapper_alive:($aalive == "1"),mode:$amode} end)}' \
+        --argjson scored "$k_scored" \
+        '{key:$key,spent:$spent,cap:$cap,remaining:$remaining,window_secs:$window_secs,in_flight:($in_flight == 1),trajectory:(if $arrow == "" then null else $arrow end),earned:$earned,streak:$streak,churn_braked:($braked == 1),elapsed_secs:$elapsed_secs,elapsed_h:$elapsed_h,scored:$scored,active:(if $amarker == "" and $aout == "" then null else {marker:$amarker,out:$aout,wrapper_alive:($aalive == "1"),mode:$amode} end)}' \
         >> "$ST_TMP/rounds.jsonl" 2>/dev/null
     else
-      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$k" "$spent" "$k_cap" "$rem" "$k_live" "$k_arrow" "$k_braked" "$k_elapsed" >> "$ST_TMP/rounds.tsv"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$k" "$spent" "$k_cap" "$rem" "$k_live" "$k_arrow" "$k_braked" "$k_elapsed" "$k_scored" >> "$ST_TMP/rounds.tsv"
     fi
   done
 
@@ -492,12 +497,12 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
     echo "round budget (rolling window $(( ST_WIN / 3600 ))h, ${ST_CAP_DESC}):"
     if pg_have jq && [ -s "$ST_TMP/rounds.jsonl" ]; then
       jq -r '"  " + .key + ": \(.spent) spent, \(.remaining) remaining"
-             + "  (\(.spent) rounds, ~" + .elapsed_h + "h wall clock on this change)"
+             + "  (\(.spent) rounds; ~" + .elapsed_h + "h recorded across \(.scored) scored round(s))"
              + (if .trajectory then "  (open P0/P1 by round: " + .trajectory + ")" else "" end)
              + (if .churn_braked then "  [CHURN BRAKE: not converging — escalate instead of re-running]" else "" end)
              + (if .in_flight then "  [REVIEW RUNNING NOW]" else "" end)' "$ST_TMP/rounds.jsonl"
     else
-      awk -F'\t' '{printf "  %s: %s spent, %s remaining (cap %s)  (%s rounds, ~%.1fh wall clock on this change)%s%s%s\n", $1, $2, $4, $3, $2, ($8+0)/3600, ($6 == "" ? "" : "  (open P0/P1 by round: " $6 ")"), ($7 == 1 ? "  [CHURN BRAKE: not converging]" : ""), ($5 == 1 ? "  [REVIEW RUNNING NOW]" : "")}' "$ST_TMP/rounds.tsv" 2>/dev/null
+      awk -F'\t' '{printf "  %s: %s spent, %s remaining (cap %s)  (%s rounds; ~%.1fh recorded across %s scored round(s))%s%s%s\n", $1, $2, $4, $3, $2, ($8+0)/3600, $9, ($6 == "" ? "" : "  (open P0/P1 by round: " $6 ")"), ($7 == 1 ? "  [CHURN BRAKE: not converging]" : ""), ($5 == 1 ? "  [REVIEW RUNNING NOW]" : "")}' "$ST_TMP/rounds.tsv" 2>/dev/null
     fi
   else
     echo "round budget: nothing spent in the current window for this query"
@@ -704,8 +709,8 @@ RUN_START="$(date +%s)"
 # ledger-timing-split (R1/R3): stamped once the run leaves the queue (slot acquired, generation
 # about to start) — never at marker mint or RUN_START — so pg_finish can split queue wait from
 # generation time without a budget or history window ever keying off a pre-lock epoch. Stays
-# empty on any path that never reaches that point (lock-timeout, preflight failure, round-cap,
-# deferred): pg_finish then counts the run's whole life as queue_secs with run_secs 0.
+# empty on any path that never reaches that point (lock-timeout, preflight failure, round-cap):
+# pg_finish then counts the run's whole life as queue_secs with run_secs 0.
 LAUNCH_EPOCH=""
 SALVAGED=0
 EFF_CONC=0
@@ -1022,14 +1027,18 @@ pg_finish() {  # $1 exit code — settle organization, ramp, and ledger exactly 
   # this invocation's own short wall time (collection, not generation); that semantic is
   # DOCUMENTED here rather than reconstructed from a generation epoch harvest never has. A fresh
   # run that reached "launching" (LAUNCH_EPOCH set) splits at that phase transition; one that
-  # never did (lock-timeout, preflight failure, round-cap, deferred) records its whole life as
+  # never did (lock-timeout, preflight failure, round-cap) records its whole life as
   # queue_secs with run_secs 0.
   if [ "${HARVEST:-0}" = 1 ]; then
     queue_secs=0
     run_secs=$dur
   elif [ -n "$LAUNCH_EPOCH" ]; then
-    queue_secs=$(( LAUNCH_EPOCH - RUN_START ))
-    run_secs=$(( now - LAUNCH_EPOCH ))
+    # RUN_START, LAUNCH_EPOCH, and now are three independent `date +%s` samples minutes apart;
+    # an NTP correction or WSL suspend/resume between them can make either difference negative.
+    # Clamp at 0 (same defensive floor as pg_round_note_severity's $dur) so a backward clock
+    # jump never writes a negative duration into the ledger or the stats percentile sort.
+    queue_secs=$(( LAUNCH_EPOCH - RUN_START )); [ "$queue_secs" -lt 0 ] 2>/dev/null && queue_secs=0
+    run_secs=$(( now - LAUNCH_EPOCH )); [ "$run_secs" -lt 0 ] 2>/dev/null && run_secs=0
   else
     queue_secs=$dur
     run_secs=0
@@ -1916,7 +1925,7 @@ round_capped() {  # $1 = reason
   pg_round_score "$ROUND_KEY"
   used="$(pg_round_count "$ROUND_KEY")"
   elapsed_h="$(pg_hours_1dp "$PG_ROUND_ELAPSED_SECS")"
-  totals="${used} rounds, ~${elapsed_h}h wall clock on this change"
+  totals="${used} rounds; ~${elapsed_h}h recorded across ${PG_ROUND_SCORED} scored round(s)"
   note="${note}; ${totals}"
   # pg_round_guard's refusal already carries the scored trajectory. Do not re-read .hist here:
   # the reason becomes the status detail below, and a second parse can only duplicate I/O.
@@ -1936,7 +1945,10 @@ round_capped() {  # $1 = reason
   elif [ -d "${LOCKFILE}.pr-${ROUND_KEY}.d" ]; then
     inflight=1
   fi
-  [ "$inflight" = 1 ] && [ -n "$note" ] && note="${note} (a same-change review is in flight NOW: re-check this note after it completes)"
+  # Gated on $sev (a SEVERITY claim is being shown), not on $note: since the totals summary
+  # above is now appended unconditionally, $note is never empty and would otherwise always
+  # pass this check regardless of whether a severity claim is present.
+  [ "$inflight" = 1 ] && [ -n "$sev" ] && note="${note} (a same-change review is in flight NOW: re-check this note after it completes)"
   echo "ERROR: ${1}; not spending another Pro review slot on this change." >&2
   echo "  ${totals}." >&2
   if [ "${last_p0:-0}" -gt 0 ] 2>/dev/null; then
