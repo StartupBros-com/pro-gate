@@ -47,7 +47,7 @@ Two observability gaps make the wait worse than it needs to be. The status file 
 
 **Instrumentation prelude (PR A)**
 
-- R1. Ledger rows carry queue time and run time as separate appended fields, stamped at the existing phase transitions (preflight → lock waits → launch → outcome); the existing `secs` field is preserved unchanged for backward compatibility. Appending is verified safe: `bin/pro-gate-stats.sh` parses ledger rows by jq field name (`.secs` at lines 87–88 and 98), so only a rename or split of `secs` itself would break it. Harvest-invocation rows record their own short wall time; their field semantics are documented rather than reconstructed.
+- R1. Ledger rows split their duration into separate appended fields at the slot-acquisition transition, with `secs` preserved unchanged for backward compatibility, and the split must sum back to `secs` exactly. Appending is verified safe: `bin/pro-gate-stats.sh` parses ledger rows by jq field name, so only a rename or split of `secs` itself would break it. Harvest invocations record their own short collection time, and rows name their invocation kind so percentile populations can distinguish a fresh run from a collection. *Shipped in v0.34.0 as `pre_slot_secs` / `post_slot_secs` plus a `kind` field: the terminal review established that the split point marks slot acquisition, not the start of model generation, so the fields are named for the boundary they actually measure. True generation timing needs the phase machinery below.*
 - R2. Round history rows gain wall-clock-per-round as a 7th positional TSV field, and both `--status` and the exit-12 refusal message state rounds used plus elapsed wall clock for the change. The 6-field `.hist` format (`lib/pro-gate-lib.sh:1274`) has one production reader (`pg_round_score`, fixed 6-variable `read` at `:1341`) and ~15 test fixtures; the reader extension and fixture updates land in the same PR as the writer.
 - R3. The new timing fields are stamped at phase-transition time, never at marker mint or `RUN_START`, so queue time is never recorded as run time — and no budget or history window keys off a pre-lock epoch (the ~80-minute skew family documented at `lib/pro-gate-lib.sh:1129-1134` and `tests/engine.test.sh:1265-1268`).
 
@@ -223,20 +223,20 @@ PR A = U1 + U2 (independent of each other; land together). PR B = U3 → U4 → 
 
 ### U1. Ledger queue/run time split
 
-- **Goal:** Every ledger row carries `queue_secs` and `run_secs`; `secs` unchanged; stats gains queue/run percentiles.
+- **Goal:** Every ledger row carries `pre_slot_secs` and `post_slot_secs`; `secs` unchanged; stats gains the matching percentiles. *(Shipped v0.34.0.)*
 - **Requirements:** R1, R3. Covers AE4 (ledger half).
 - **Dependencies:** none.
 - **Files:** `bin/oracle-review.sh`, `bin/pro-gate-stats.sh`, `tests/engine.test.sh`.
 - **Approach:**
   1. Capture a launch epoch when the run leaves the queue: after the slot wait completes (`bin/oracle-review.sh:~2026`) or at `launching` (`:2255`) — one site, before generation.
-  2. In `pg_finish` (`:998-1114`), compute `queue_secs = launch_epoch - RUN_START` and `run_secs = now - launch_epoch`; append both fields by name to the ledger line next to `secs`. Runs that never reach launch (exit 7, preflight failures) record `queue_secs = now - RUN_START`, `run_secs = 0`.
-  3. Harvest invocations: `queue_secs = 0`, `run_secs =` harvest wall time; document the semantic in a comment at the field build.
+  2. In `pg_finish` (`:998-1114`), clamp the total duration once, then compute `pre_slot_secs` clamped into `[0, dur]` and derive `post_slot_secs = dur - pre_slot_secs` so the partition is exact by construction; append both by name next to `secs`. Runs that never reach launch (exit 7, preflight failures) record the whole life as `pre_slot_secs` with `post_slot_secs = 0`.
+  3. Harvest invocations: `pre_slot_secs = 0`, `post_slot_secs =` collection wall time; record `kind` (`fresh`/`harvest`) so percentile populations can exclude collections; document the semantics at the field build.
   4. `bin/pro-gate-stats.sh`: add `queue_p50/p95` and `run_p50/p95` alongside the existing `.secs` percentiles (`:87-88`), by field name, tolerating rows without the new fields (`// empty`).
 - **Patterns to follow:** field-by-name jq access as in `pro-gate-stats.sh:87-88`; `pg_ledger_append`'s flock-guarded append (`lib/pro-gate-lib.sh:~937-963`).
 - **Test scenarios:**
-  1. A completed run's ledger row has `queue_secs + run_secs ≈ secs` (± 2s rounding) and all three fields present.
-  2. An exit-7 (lock-timeout) row records its full wait in `queue_secs` and `run_secs = 0`.
-  3. A harvest row records `queue_secs = 0` and a short `run_secs`.
+  1. A completed run's ledger row has `pre_slot_secs + post_slot_secs` equal to `secs` exactly, with all three fields present.
+  2. An exit-7 (lock-timeout) row records its full wait in `pre_slot_secs` with `post_slot_secs = 0`, and joins the pre-slot percentile population.
+  3. A harvest row records `pre_slot_secs = 0`, a short `post_slot_secs`, and is excluded from both percentile populations.
   4. `pro-gate-stats.sh` on a mixed ledger (old rows without the fields + new rows) computes `.secs` percentiles unchanged and new percentiles from new rows only, without error.
   5. Covers AE4. Existing stats output fields are byte-compatible for old consumers.
 - **Verification:** `bash tests/engine.test.sh` green including new cases; `jq empty` on a generated ledger row; shellcheck clean.
