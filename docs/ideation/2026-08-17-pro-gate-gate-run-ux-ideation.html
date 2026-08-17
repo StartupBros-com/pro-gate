@@ -311,7 +311,7 @@
 <h3>5. One supervisor per PR, not one ceremony per round</h3>
 <div class="chips">
   <span class="chip axis">round-verdict-economics</span>
-  <span class="chip conf-med">Confidence 75%</span>
+  <span class="chip conf-high">Confidence 80%</span>
   <span class="chip">Complexity Medium</span>
 </div>
 <dl>
@@ -322,9 +322,11 @@
 <dd><code>direct:</code> §6 repeats the full launch/poll/status ceremony up to 8&times; per PR (SKILL.md:381-430); &ldquo;contract changes &hellip; both files must change in the same PR&rdquo; (<code>agents/oracle-reviewer.md:20</code>); PR #1628 died specifically during a round-3 confirming pass; the governor already exposes machine-checkable termination conditions (base 3 / +1-per-shrink / ceiling 8 / 2-strike brake). Verified.</dd>
 <dt>Rationale</dt>
 <dd>Idea 1 fixes the single wait; this fixes the loop that multiplies it. The context burn in the incident wasn't one wait &mdash; it was the ceremony re-derived every round across 8 hours. A supervisor holding only the loop state (not the parent's whole task context) is the harness-native shape for that. Sequencing is forced: built <em>without</em> stage 1, the supervisor merely relocates poller fragility into a subagent; built on it, each round costs the supervisor one launch, one background <code>--wait</code>, one scoring turn.</dd>
+<dt>Design note (crash-tolerance)</dt>
+<dd>The supervisor holds <strong>no authoritative state</strong> &mdash; it is a cursor over durable state the engine already owns (trajectory in <code>rounds/&lt;key&gt;.hist</code>, in-flight round in reservations/<code>active/</code>/URL memos, fixes in git, verdicts in the completed store + PR comments). Its only novel data &mdash; headRefOid-per-round and decision narrative &mdash; goes in an <em>append-only journal</em> under <code>$PRO_GATE_HOME/supervisor/</code> that is a re-adoption cache, never a source of truth (the false-loss era's local-proxy-for-durable-state trap is the failure to design against). Identity via the existing <code>pg_pid_token</code>; single-writer via the existing per-change lock family; <code>--status</code> gains a <code>supervisor: alive|dead</code> line. Death mid-round loses nothing: the detached run, reservation, and marker survive, and the degradation path <em>is</em> the documented manual &sect;6 protocol &mdash; the property that clears the ship-the-legible-core bar. Validate by <code>kill -9</code> at each phase and asserting cold re-adoption reconstructs the same round, trajectory, and next decision from engine state alone, journal deleted.</dd>
 <dt>Downsides</dt>
-<dd>The supervisor must be crash-tolerant (its own death has to degrade to today's manual protocol, discoverable via <code>--status</code>); fix-application authority inside a subagent needs clear bounds; the daemon path keeps <code>--wait</code>-based blocking rather than subagent supervision.</dd>
-<dt>Confidence</dt><dd>75%</dd>
+<dd>Fix-application authority inside a subagent needs clear bounds (PR-branch pushes only, never force-push or merge, SKILL disposition policy at stop); the daemon path keeps <code>--wait</code>-based blocking rather than subagent supervision.</dd>
+<dt>Confidence</dt><dd>80%</dd>
 <dt>Complexity</dt><dd>Medium</dd>
 </dl>
 </article>
