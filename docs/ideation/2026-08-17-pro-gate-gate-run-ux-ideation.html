@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ideation: pro-gate gate-run UX &amp; performance</title>
+<style>
+  :root {
+    --bg: #fbfaf8;
+    --ink: #23262d;
+    --muted: #6b7280;
+    --accent: #4f46e5;
+    --accent-text: #3730a3;
+    --accent-soft: #eef0fd;
+    --warn-text: #92400e;
+    --warn-soft: #fdf3e3;
+    --ok-text: #065f46;
+    --ok-soft: #e7f6ef;
+    --card: #ffffff;
+    --line: #e5e3de;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 2.5rem 1.25rem 4rem;
+    background: var(--bg); color: var(--ink);
+    font: 15px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  }
+  .page { max-width: 900px; margin-inline: auto; }
+  p, li, dd { max-width: 72ch; }
+  .eyebrow {
+    font-size: 11px; letter-spacing: .14em; text-transform: uppercase;
+    color: var(--accent-text); font-weight: 700; margin-bottom: .35rem;
+  }
+  h1 { font-size: 1.7rem; line-height: 1.25; margin: 0 0 .5rem; }
+  h2 { font-size: 1.25rem; margin: 2.6rem 0 .8rem; padding-top: 1rem; border-top: 1px solid var(--line); }
+  h3 { font-size: 1.05rem; margin: 1.4rem 0 .4rem; }
+  .meta { color: var(--muted); font-size: 13.5px; }
+  .meta code { font-family: var(--mono); font-size: 12.5px; }
+  .stats { display: flex; flex-wrap: wrap; gap: .5rem; margin: 1.1rem 0 0; padding: 0; list-style: none; }
+  .stats li {
+    background: var(--card); border: 1px solid var(--line); border-radius: 999px;
+    padding: .25rem .8rem; font-size: 12.5px; color: var(--muted);
+  }
+  .stats li strong { color: var(--ink); font-weight: 600; }
+  code { font-family: var(--mono); font-size: .88em; background: #f1efe9; border-radius: 4px; padding: .08em .35em; }
+  article.idea {
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    padding: 1.25rem 1.4rem 1.1rem; margin: 1.1rem 0;
+  }
+  article.idea h3 { margin: 0 0 .55rem; font-size: 1.08rem; }
+  .chips { display: flex; flex-wrap: wrap; gap: .45rem; margin: 0 0 .8rem; }
+  .chip {
+    font-size: 11.5px; font-weight: 600; border-radius: 999px; padding: .16em .7em;
+    background: #f1efe9; color: #57534e;
+  }
+  .chip.axis { background: var(--accent-soft); color: var(--accent-text); }
+  .chip.conf-high { background: var(--ok-soft); color: var(--ok-text); }
+  .chip.conf-med  { background: var(--warn-soft); color: var(--warn-text); }
+  .idea dl { margin: .3rem 0 0; }
+  .idea dt {
+    font-size: 11px; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--muted); font-weight: 700; margin-top: .75rem;
+  }
+  .idea dd { margin: .15rem 0 0; }
+  .jump { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: .8rem 1.2rem; }
+  .jump ol { margin: .3rem 0 .2rem; padding-left: 1.4rem; }
+  .jump a { color: var(--accent-text); text-decoration: none; }
+  .jump a:hover { text-decoration: underline; }
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; margin-top: .6rem; }
+  th, td { border: 1px solid var(--line); padding: .45rem .65rem; text-align: left; vertical-align: top; }
+  th { background: #f4f2ec; font-size: 12px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+  td:first-child { white-space: nowrap; font-weight: 600; }
+  figure { margin: 1.1rem 0 .4rem; }
+  figcaption { font-size: 12.5px; color: var(--muted); margin-top: .35rem; }
+  svg text { font-family: -apple-system, "Segoe UI", sans-serif; }
+  footer.composition-signal {
+    margin-top: 3.5rem; padding-top: 1rem; border-top: 1px solid var(--line);
+    font-size: 12.5px; color: var(--muted);
+  }
+  ul.tight li { margin-bottom: .35rem; }
+</style>
+</head>
+<body>
+<div class="page">
+
+<header>
+  <div class="eyebrow">Ideation</div>
+  <h1>pro-gate gate-run UX &amp; performance</h1>
+  <p class="meta">
+    date: 2026-08-17 &middot; topic: <code>pro-gate-gate-run-ux</code> &middot; mode: repo-grounded<br>
+    focus: gate-run performance and caller UX degradation &mdash; process ceremony, slot-queue waits, poller
+    failures, context/cost burn; grounded in recent usage history and the PR&nbsp;#1628 incident.
+  </p>
+  <ul class="stats">
+    <li><strong>45</strong> raw ideas &rarr; <strong>7</strong> survivors</li>
+    <li><strong>5</strong> axes, all covered</li>
+    <li><strong>579</strong> runs analyzed (14d)</li>
+    <li>exit-7 timeouts <strong>0 &rarr; 31</strong></li>
+    <li>exit-9 share <strong>3.3% &rarr; 19.5%</strong></li>
+    <li>incident cost <strong>~$443 / 100% context</strong></li>
+  </ul>
+</header>
+
+<section id="grounding-context">
+<h2>Grounding Context</h2>
+<h3>Codebase Context</h3>
+<ul class="tight">
+  <li><strong>Caller protocol</strong> (<code>skills/pro-gate/SKILL.md</code>): precheck &rarr; ~7 guardrail steps &rarr; detached launch with no caller timeout &rarr; poll <code>&lt;out&gt;.status</code> every 1&ndash;2 min for up to 47+ min p90 &rarr; branch on 13 exit codes &rarr; on exit&nbsp;9, wait and re-invoke <code>--harvest</code> &rarr; §6 re-review loop with caller-held convergence bookkeeping, repeatable up to 8&times; per PR. No blocking mode, no callback, <strong>no push/notify/wake mechanism anywhere</strong>; the polled status file is the only signal surface. The wait ceremony is maintained in three places (SKILL.md, <code>agents/oracle-reviewer.md</code>, a hand-rolled <code>sleep 60</code> loop in <code>daemon/daemon.sh</code>'s prompt string).</li>
+  <li><strong>Slot lifecycle</strong>: two stacked lock layers (per-change + account slot), each polling 3s up to 40 min. Reservations carry a <code>generating|complete</code> state since v0.33.0 (PRs #82/#83): a finished review no longer occupies capacity, and <code>pg_report_capacity_holders</code> names each holder plus the exact free-it command &mdash; but only on throttled stderr, never in the polled status file.</li>
+  <li><strong>Round governor</strong> (v0.31): base 3 rounds, +1 per strictly-shrinking re-review, immovable ceiling 8, 2-strike churn brake. Trajectory state is computed every round and surfaced only at refusal (exit 12) or via pull-only <code>--status</code>. No cost accounting of any kind exists in the repo.</li>
+  <li><strong>Institutional constraint</strong> (<code>docs/solutions/&hellip;/ship-the-legible-core-let-the-gate-decline-fragile-automation.md</code>): prefer a clear message over a clever mechanism, especially near credentials/quota/environment; fragile automation historically got repeated FIX-FIRST findings from the gate itself and was dropped.</li>
+</ul>
+<h3>Usage Forensics (Aug 3&ndash;17: 579 runs, vs prior 14d: 272)</h3>
+<ul class="tight">
+  <li>Exit-7 lock-timeouts went <strong>0 &rarr; 31</strong>, all Aug 14&ndash;16; callers slept the full configured wait (23&times;2400s, up to 7200s). Seven logs blame capacity held by <em>uncollected finished reviews</em>; v0.33.0 (installed Aug 15) fixed that class mid-window, but timeouts continued into Aug 16.</li>
+  <li>Exit-9 (deferred harvest) grew from <strong>3.3% to 19.5%</strong> of all runs; clean share fell 76.8% &rarr; 64.1%; clean p50/p90 durations rose 14&ndash;19%.</li>
+  <li>Caller-side ceremony, PR #1628 transcript: <strong>65</strong> background-poller invocations, <strong>9</strong> re-arm recoveries, <strong>8</strong> poller failures (exit code 3), 4 &ldquo;queued behind another session's slot&rdquo; messages; session ended at ~100% context / ~$443.</li>
+  <li>Verdicts in window: <strong>32 FIX-FIRST vs 4 SHIP</strong>; exit-12 round-cap hits concentrating (6 of 8 all-time in Aug 4&ndash;16); 9 reservation-TTL expiry orphans, oldest ~13h.</li>
+</ul>
+<h3>External Context</h3>
+<p>Independent sources converge on one architecture for agents waiting on long external jobs: <strong>start/poll split with a durable handle, the wait as a suspended first-class state, and wake-not-poll</strong> &mdash; polling surviving only as a named degraded fallback (AWS Durable Execution, Cloudflare Agents, production postmortems). Supporting numbers: virtual-queue UX research puts 20&ndash;160&nbsp;min waits entirely in &ldquo;walk away and get pushed the result&rdquo; territory; SLURM ships estimated start times and usage-decayed fair-share; the 2026 AI-review market pairs a fast shallow reviewer with a slow deep one rather than gating everything on the expensive model; push channels in production (Kubernetes watch) still keep a poll safety net.</p>
+</section>
+
+<section id="topic-axes">
+<h2>Topic Axes</h2>
+<ul class="tight">
+  <li><strong>slot-capacity-queue</strong> &mdash; account-slot capacity, reservations, locks, contention across sessions</li>
+  <li><strong>caller-wait-protocol</strong> &mdash; what the calling agent does and holds during the 20&ndash;160 min wait</li>
+  <li><strong>queue-observability</strong> &mdash; what callers/operators can see: position, ETA, phase, degradation detection</li>
+  <li><strong>harvest-recovery</strong> &mdash; the exit-9 collect dance, uncollected reviews, recovery paths</li>
+  <li><strong>round-verdict-economics</strong> &mdash; rounds, convergence, FIX-FIRST churn, cost per merged PR</li>
+</ul>
+</section>
+
+<section id="ranked-ideas">
+<h2>Ranked Ideas</h2>
+<nav class="jump">
+  <strong style="font-size:13px;">Jump to:</strong>
+  <ol>
+    <li><a href="#idea-1">The wait leaves the session: a blocking <code>--wait</code> verb + wake-on-terminal</a></li>
+    <li><a href="#idea-2">Status v2: one additive schema change at the status choke point</a></li>
+    <li><a href="#idea-3">Nobody remembers to harvest: fleet-wide sweep + loss accounting</a></li>
+    <li><a href="#idea-4">Measure the queue and the spend honestly</a></li>
+    <li><a href="#idea-5">One supervisor per PR, not one ceremony per round</a></li>
+    <li><a href="#idea-6">Churn Pareto first, fast tier second</a></li>
+    <li><a href="#idea-7">Fair-share slot admission</a></li>
+  </ol>
+</nav>
+
+<article class="idea" id="idea-1">
+<h3>1. The wait leaves the session: a blocking <code>--wait</code> verb + wake-on-terminal</h3>
+<div class="chips">
+  <span class="chip axis">caller-wait-protocol</span>
+  <span class="chip conf-high">Confidence 90%</span>
+  <span class="chip">Complexity Low</span>
+</div>
+<dl>
+<dt>Description</dt>
+<dd>Give the engine a blocking verb &mdash; <code>oracle-review.sh --wait &lt;out|marker&gt; [--timeout S]</code> &mdash; a zero-token shell process that sleeps in a loop until <code>&lt;out&gt;.status</code> goes terminal, then prints the final status JSON and exits, with <strong>distinct exit codes for &ldquo;review reached a verdict&rdquo; vs &ldquo;I lost the ability to observe&rdquo;</strong> (the poller-escalation rule, folded in). The documented protocol becomes: launch, record the marker, run <code>--wait</code> with <code>run_in_background</code>, <em>end the turn</em> &mdash; the harness's own background-completion notification is the wake; no per-poll LLM turns exist anywhere. Cross-session and dead-session delivery stays pull-based on the durable pieces that already exist (completed store, PR comment, <code>--status</code>) &mdash; the production lesson from push channels is to keep exactly that safety net. The headless daemon benefits too: it blocks on <code>--wait</code> instead of a <code>sleep 60</code> prompt loop, sidestepping its no-notifications constraint entirely.</dd>
+<dt>Axis</dt><dd>caller-wait-protocol</dd>
+<dt>Basis</dt>
+<dd><code>direct:</code> PR #1628 transcript: 65 poller invocations, 9 &ldquo;Re-arm corrected poller&rdquo; recoveries, 8 poller failures with exit code 3, session ended at ~100% context / ~$443. <code>daemon/daemon.sh:234</code> hand-rolls the same loop inside an LLM prompt (&ldquo;sleep 60; cat the status file&rdquo;). Verified: no notify path exists anywhere in bin/lib/daemon/SKILL.md. <code>external:</code> wake-not-poll production pattern (Aura; AWS <code>waitForCondition</code> suspends at no compute cost); NN/g queue research: past ~20&ndash;30 min, people must walk away and be pushed the result.</dd>
+<dt>Rationale</dt>
+<dd>This is the idea most directly traceable to the incident: the hand-rolled <code>r3-poller.sh</code> in a job tmp dir was a per-session, per-caller reimplementation of exactly this missing verb, and it crashed 8 times. A blocking CLI verb is the smallest true fix &mdash; a ~60-line legible loop in the engine rather than a notification bus &mdash; and it doesn't deduplicate the poll ceremony across the three prose copies, it <em>deletes</em> it: SKILL.md &sect;3 collapses to &ldquo;run <code>--wait</code> in background.&rdquo; Deleting protocol beats synchronizing it. This is also <strong>stage 1 of a two-stage stack</strong>: idea 5's round-loop supervisor consumes this primitive; built without it, the supervisor would just move poller fragility down one level (an LLM subagent polling for 47 minutes).</dd>
+<dt>Downsides</dt>
+<dd>The <code>--wait</code> process is tied to the session's shell lifetime &mdash; if the session dies, only the wait dies; the run, status file, and marker survive and recovery is unchanged (a good failure mode, but callers must know re-arming is free). <code>--timeout</code> must exceed the worst-case lock+generation envelope or exit through the distinct lost-observability code, never a false &ldquo;review failed.&rdquo;</dd>
+<dt>Confidence</dt><dd>90%</dd>
+<dt>Complexity</dt><dd>Low</dd>
+</dl>
+<figure>
+<svg viewBox="0 0 820 240" role="img" aria-label="Before/after: session-held polling versus zero-token watcher with wake">
+  <!-- BEFORE panel -->
+  <rect x="10" y="14" width="390" height="212" rx="10" fill="#f6f4ef" stroke="#e5e3de"/>
+  <text x="28" y="40" font-size="12" font-weight="700" fill="#92400e" letter-spacing="1">TODAY</text>
+  <rect x="28" y="54" width="150" height="44" rx="8" fill="#ffffff" stroke="#c9c5bc"/>
+  <text x="103" y="73" font-size="12.5" text-anchor="middle" fill="#23262d">agent session</text>
+  <text x="103" y="89" font-size="11" text-anchor="middle" fill="#6b7280">holds the wait</text>
+  <rect x="240" y="54" width="140" height="44" rx="8" fill="#ffffff" stroke="#c9c5bc"/>
+  <text x="310" y="73" font-size="12.5" text-anchor="middle" fill="#23262d">&lt;out&gt;.status</text>
+  <text x="310" y="89" font-size="11" text-anchor="middle" fill="#6b7280">polled file</text>
+  <path d="M178 66 H232" stroke="#92400e" stroke-width="1.6" fill="none" marker-end="url(#arrW)"/>
+  <path d="M232 86 H186" stroke="#92400e" stroke-width="1.6" fill="none" marker-end="url(#arrW)"/>
+  <text x="205" y="120" font-size="11.5" fill="#92400e" text-anchor="middle">poll every 1&ndash;2 min, 65&times; per gate wait</text>
+  <text x="205" y="150" font-size="11.5" fill="#6b7280" text-anchor="middle">8 poller crashes &middot; 9 re-arms</text>
+  <text x="205" y="168" font-size="11.5" fill="#6b7280" text-anchor="middle">100% context &middot; ~$443</text>
+  <!-- AFTER panel -->
+  <rect x="420" y="14" width="390" height="212" rx="10" fill="#eef0fd" stroke="#dcdff8"/>
+  <text x="438" y="40" font-size="12" font-weight="700" fill="#3730a3" letter-spacing="1">PROPOSED</text>
+  <rect x="438" y="54" width="150" height="44" rx="8" fill="#ffffff" stroke="#b9bdf0"/>
+  <text x="513" y="73" font-size="12.5" text-anchor="middle" fill="#23262d">agent session</text>
+  <text x="513" y="89" font-size="11" text-anchor="middle" fill="#6b7280">launch &rarr; end turn</text>
+  <rect x="438" y="130" width="150" height="44" rx="8" fill="#ffffff" stroke="#b9bdf0"/>
+  <text x="513" y="149" font-size="12.5" text-anchor="middle" fill="#23262d">--wait (blocking)</text>
+  <text x="513" y="165" font-size="11" text-anchor="middle" fill="#6b7280">zero tokens</text>
+  <rect x="650" y="130" width="140" height="44" rx="8" fill="#ffffff" stroke="#b9bdf0"/>
+  <text x="720" y="149" font-size="12.5" text-anchor="middle" fill="#23262d">&lt;out&gt;.status</text>
+  <text x="720" y="165" font-size="11" text-anchor="middle" fill="#6b7280">same file</text>
+  <path d="M513 98 V126" stroke="#4f46e5" stroke-width="1.6" fill="none" marker-end="url(#arrA)"/>
+  <path d="M592 152 H646" stroke="#4f46e5" stroke-width="1.6" fill="none" marker-end="url(#arrA)"/>
+  <path d="M513 174 V196" stroke="#4f46e5" stroke-width="1.6" fill="none" marker-end="url(#arrA)"/>
+  <text x="524" y="212" font-size="11.5" fill="#3730a3">wake only at terminal phase (SendMessage / fresh turn)</text>
+  <defs>
+    <marker id="arrW" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" fill="#92400e"/></marker>
+    <marker id="arrA" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" fill="#4f46e5"/></marker>
+  </defs>
+</svg>
+<figcaption>The same status file, watched by a process that costs nothing, waking an agent only for the one transition that needs judgment.</figcaption>
+</figure>
+</article>
+
+<article class="idea" id="idea-2">
+<h3>2. Status v2: one additive schema change at the status choke point</h3>
+<div class="chips">
+  <span class="chip axis">queue-observability</span>
+  <span class="chip conf-high">Confidence 90%</span>
+  <span class="chip">Complexity Medium</span>
+</div>
+<dl>
+<dt>Description</dt>
+<dd>Enrich the JSON that <code>pg_status()</code> already writes on every phase transition with the state the engine already computes and then discards or hides: <code>holders[]</code> (which markers hold capacity, <code>generating</code> vs <code>complete &mdash; awaiting collection</code>, with the free-it command), an elapsed-in-phase heartbeat (fresh <code>ts</code> re-writes so silence stops being the only signal that Pro is thinking), <code>next_action {cmd, terminal, wait_class}</code> replacing the 23-line exit-code prose branch, a stable <code>recover_reason_code</code> enum for the five free-text recovery reasons, a TTL countdown on completed-but-uncollected reservations, and the round governor's <code>rounds_used / rounds_granted / streak</code> so exit&nbsp;12 becomes an anticipated checkpoint instead of a surprise. <strong>Sequencing:</strong> two fields ship <em>inside</em> idea 1's stage-1 PR &mdash; a literal <code>terminal</code> flag + <code>next_action</code> (they are <code>--wait</code>'s loop condition and wake payload) and the heartbeat (it defines the staleness that makes the lost-observability exit reliable). The rest is additive and can trail a release; the rounds preview and reason enum ideally land before or with the stage-2 supervisor, their real consumer.</dd>
+<dt>Axis</dt><dd>queue-observability</dd>
+<dt>Basis</dt>
+<dd><code>direct:</code> <code>pg_report_capacity_holders</code> (<code>lib/pro-gate-lib.sh:757-783</code>) explains a &ldquo;40-minute mystery&rdquo; only on throttled stderr while SKILL.md:219 tells callers &ldquo;poll THAT, not engine logs&rdquo;; the phase enum has no generating state (<code>bin/oracle-review.sh:655-657</code>); the engine already emits <code>recoverable=true/false</code> &ldquo;so automation cannot rot when wording changes&rdquo; (<code>bin/oracle-review.sh:179-183</code>) &mdash; that discipline stops one field short; governor numbers are computed then discarded (<code>lib:1330-1352</code>). All citations verified against the live repo.</dd>
+<dt>Rationale</dt>
+<dd><code>pg_status()</code> is a single verified write choke point that every consumer &mdash; the skill's poller, <code>--status</code>, the daemon, the oracle-reviewer agent, and idea&nbsp;1's watcher &mdash; already reads. One additive schema change ships the entire observability slate at once, and every future consumer inherits it for free. It also finishes the job v0.33.0 started: the diagnosis for &ldquo;why is no slot free&rdquo; finally reaches the channel the documented contract points at.</dd>
+<dt>Downsides</dt>
+<dd>Schema growth needs discipline (additive-only, documented fields) and the heartbeat re-write must respect the existing atomic tmp+rename pattern. The prose paragraph in SKILL.md stays until callers migrate to <code>next_action</code>.</dd>
+<dt>Confidence</dt><dd>90%</dd>
+<dt>Complexity</dt><dd>Medium</dd>
+</dl>
+<figure>
+<svg viewBox="0 0 820 210" role="img" aria-label="New fields flow through one status write point to all consumers">
+  <rect x="20" y="24" width="200" height="160" rx="10" fill="#f6f4ef" stroke="#e5e3de"/>
+  <text x="120" y="46" font-size="12" font-weight="700" fill="#57534e" text-anchor="middle" letter-spacing="1">NEW FIELDS</text>
+  <text x="36" y="70" font-size="11.5" fill="#23262d">holders[] + states</text>
+  <text x="36" y="90" font-size="11.5" fill="#23262d">elapsed-in-phase heartbeat</text>
+  <text x="36" y="110" font-size="11.5" fill="#23262d">next_action {cmd, terminal}</text>
+  <text x="36" y="130" font-size="11.5" fill="#23262d">recover_reason_code enum</text>
+  <text x="36" y="150" font-size="11.5" fill="#23262d">TTL countdown (complete)</text>
+  <text x="36" y="170" font-size="11.5" fill="#23262d">rounds used / granted / streak</text>
+  <rect x="320" y="74" width="180" height="60" rx="10" fill="#eef0fd" stroke="#b9bdf0"/>
+  <text x="410" y="99" font-size="12.5" font-weight="600" text-anchor="middle" fill="#3730a3">pg_status()</text>
+  <text x="410" y="117" font-size="11" text-anchor="middle" fill="#6b7280">one write choke point</text>
+  <path d="M222 104 H316" stroke="#4f46e5" stroke-width="1.6" fill="none" marker-end="url(#arrB)"/>
+  <rect x="620" y="24" width="180" height="34" rx="8" fill="#ffffff" stroke="#c9c5bc"/>
+  <text x="710" y="46" font-size="11.5" text-anchor="middle" fill="#23262d">SKILL.md poller / watcher</text>
+  <rect x="620" y="66" width="180" height="34" rx="8" fill="#ffffff" stroke="#c9c5bc"/>
+  <text x="710" y="88" font-size="11.5" text-anchor="middle" fill="#23262d">--status &amp; --status --json</text>
+  <rect x="620" y="108" width="180" height="34" rx="8" fill="#ffffff" stroke="#c9c5bc"/>
+  <text x="710" y="130" font-size="11.5" text-anchor="middle" fill="#23262d">daemon headless prompt</text>
+  <rect x="620" y="150" width="180" height="34" rx="8" fill="#ffffff" stroke="#c9c5bc"/>
+  <text x="710" y="172" font-size="11.5" text-anchor="middle" fill="#23262d">oracle-reviewer agent</text>
+  <path d="M502 92 C560 80 570 50 616 42" stroke="#4f46e5" stroke-width="1.4" fill="none" marker-end="url(#arrB)"/>
+  <path d="M502 100 H616 " stroke="#4f46e5" stroke-width="1.4" fill="none" marker-end="url(#arrB)"/>
+  <path d="M502 116 C560 128 570 118 616 124" stroke="#4f46e5" stroke-width="1.4" fill="none" marker-end="url(#arrB)"/>
+  <path d="M502 124 C560 150 570 160 616 166" stroke="#4f46e5" stroke-width="1.4" fill="none" marker-end="url(#arrB)"/>
+  <defs>
+    <marker id="arrB" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" fill="#4f46e5"/></marker>
+  </defs>
+</svg>
+<figcaption>Everything the engine already knows, surfaced once, inherited by every consumer.</figcaption>
+</figure>
+</article>
+
+<article class="idea" id="idea-3">
+<h3>3. Nobody remembers to harvest: fleet-wide sweep + loss accounting</h3>
+<div class="chips">
+  <span class="chip axis">harvest-recovery</span>
+  <span class="chip conf-high">Confidence 85%</span>
+  <span class="chip">Complexity Low</span>
+</div>
+<dl>
+<dt>Description</dt>
+<dd>Add a <code>--harvest-all</code> sweep, run externally (cron or operator), that collects every outstanding reservation for the account in one pass &mdash; <code>pg_report_capacity_holders</code> already computes the list, and repeat harvests are documented free and idempotent. Replace SKILL.md's flat &ldquo;wait ~10 min, then collect&rdquo; with a payload-aware estimate (the engine already classifies diff size at submit). And log the expiry of a <code>complete</code> reservation as a distinct &ldquo;spent-and-wasted&rdquo; event &mdash; a paid-for Pro answer nobody redeemed &mdash; instead of the current undifferentiated TTL release.</dd>
+<dt>Axis</dt><dd>harvest-recovery</dd>
+<dt>Basis</dt>
+<dd><code>direct:</code> exit-9 grew 3.3% &rarr; 19.5% of all runs; &ldquo;Repeat harvests are free: no Pro quota is spent&rdquo; (SKILL.md:304-306); &ldquo;Five runs sat in waiting-slot &hellip; while the ChatGPT account was idle&rdquo; (v0.33.0 notes); SKILL.md juxtaposes &ldquo;wait ~10 min&rdquo; with &ldquo;45&ndash;90+ minutes on a heavy payload (observed 65 min)&rdquo; in the same section (253-256); <code>pg_reservation_expire_if_stale</code> (lib:798-816) logs no complete/generating distinction. All verified.</dd>
+<dt>Rationale</dt>
+<dd>One in five runs now ends in &ldquo;remember to come back later.&rdquo; v0.33.0 stopped uncollected reviews from starving <em>other</em> runs; nothing yet collects the review itself when the caller forgets, and a genuinely lost answer is currently invisible. An externally-triggered sweep is the legible version of this automation (the verifier flagged the self-spawning per-run variant as repeating the dropped OOM-self-heal pattern); a free, idempotent operation has no reason to be gated on caller memory.</dd>
+<dt>Downsides</dt>
+<dd>Sweep scheduling is per-box (cron here; launchd on macOS); it must serialize with live runs' locks and respect nonce binding when matching conversations to markers.</dd>
+<dt>Confidence</dt><dd>85%</dd>
+<dt>Complexity</dt><dd>Low</dd>
+</dl>
+</article>
+
+<article class="idea" id="idea-4">
+<h3>4. Measure the queue and the spend honestly</h3>
+<div class="chips">
+  <span class="chip axis">slot-capacity-queue</span>
+  <span class="chip conf-high">Confidence 90%</span>
+  <span class="chip">Complexity Low</span>
+</div>
+<dl>
+<dt>Description</dt>
+<dd>Split the ledger's single <code>secs</code> into <code>queue_secs</code> + <code>run_secs</code>, stamped at phase transitions that already exist (<code>waiting-pr-lock</code> &rarr; <code>waiting-slot</code> &rarr; <code>launching</code>). Close out the charge-epoch skew family (a queued run can be charged ~80 min after its marker is minted &mdash; documented in a test comment). Publish an abandonment rate (how often <code>generating</code> reservations die vs convert). And add wall-clock-per-round to <code>rounds/&lt;key&gt;.hist</code>, <code>--status</code>, and the exit-12 message, so &ldquo;4/4 rounds&rdquo; reads &ldquo;4/4 rounds, ~2.1h wall clock on this change.&rdquo; <strong>Sequencing: build this first</strong> &mdash; it instruments the same phase-transition lines the stage-1 heartbeat touches, and it is the baseline ruler for the whole program: the before/after story for ideas 1, 5, and 7 (&ldquo;poller invocations per wait went 65 &rarr; 1, queue p90 went X &rarr; Y&rdquo;) only exists if the measurement fields land before the behavior changes do.</dd>
+<dt>Axis</dt><dd>slot-capacity-queue (data foundation for queue-observability)</dd>
+<dt>Basis</dt>
+<dd><code>direct:</code> <code>RUN_START</code> is stamped at preflight (verified line 697), before both lock waits at 1918/1975 &mdash; every duration percentile conflates queue-wait with generation; the ~80-min skew is documented at <code>lib:1129-1134</code> and <code>tests/engine.test.sh:1265-1268</code>; a repo-wide grep found zero cost accounting; the operator had to report &ldquo;$442.93&rdquo; themselves. All verified.</dd>
+<dt>Rationale</dt>
+<dd>The system currently optimizes the one dimension it tracks (rounds) while the dimensions that actually hurt &mdash; queue time and session cost &mdash; are invisible to it. This is the cheapest survivor and the enabler for the rest: the verifier's own finding was that any ETA (&ldquo;ready_by&rdquo;) is systematically biased until queue and generation time are separated. Ship the split now and every later observability feature inherits clean data.</dd>
+<dt>Downsides</dt>
+<dd>Ledger schema change needs backward-compatible parsing in <code>pro-gate-stats.sh</code>; historical rows stay conflated (accepted &mdash; the split is forward-looking).</dd>
+<dt>Confidence</dt><dd>90%</dd>
+<dt>Complexity</dt><dd>Low</dd>
+</dl>
+</article>
+
+<article class="idea" id="idea-5">
+<h3>5. One supervisor per PR, not one ceremony per round</h3>
+<div class="chips">
+  <span class="chip axis">round-verdict-economics</span>
+  <span class="chip conf-high">Confidence 80%</span>
+  <span class="chip">Complexity Medium</span>
+</div>
+<dl>
+<dt>Description</dt>
+<dd><strong>Stage 2, built on idea 1's <code>--wait</code> verb.</strong> Spawn one background subagent at round 1 that owns the entire §6 re-review arc and reports to the parent exactly once: SHIP, round-capped/escalate, or churn-braked. With <code>--wait</code> as its wait primitive, the supervisor's context stays small and mostly idle; its irreducible content is only what no primitive can absorb &mdash; round bookkeeping against the governor (headRefOid per round, trajectory reads via <code>--status --json</code>), fix-application policy, and disposition at stop. It is a <em>plugin-side agent, not engine code</em>: the engine stays a legible CLI, the orchestration intelligence lives in the agent file. The residual contract surface (exit codes, phases) that <code>--wait</code> doesn't delete gets a CI drift check across the remaining prose copies.</dd>
+<dt>Axis</dt><dd>round-verdict-economics</dd>
+<dt>Basis</dt>
+<dd><code>direct:</code> §6 repeats the full launch/poll/status ceremony up to 8&times; per PR (SKILL.md:381-430); &ldquo;contract changes &hellip; both files must change in the same PR&rdquo; (<code>agents/oracle-reviewer.md:20</code>); PR #1628 died specifically during a round-3 confirming pass; the governor already exposes machine-checkable termination conditions (base 3 / +1-per-shrink / ceiling 8 / 2-strike brake). Verified.</dd>
+<dt>Rationale</dt>
+<dd>Idea 1 fixes the single wait; this fixes the loop that multiplies it. The context burn in the incident wasn't one wait &mdash; it was the ceremony re-derived every round across 8 hours. A supervisor holding only the loop state (not the parent's whole task context) is the harness-native shape for that. Sequencing is forced: built <em>without</em> stage 1, the supervisor merely relocates poller fragility into a subagent; built on it, each round costs the supervisor one launch, one background <code>--wait</code>, one scoring turn.</dd>
+<dt>Design note (crash-tolerance)</dt>
+<dd>The supervisor holds <strong>no authoritative state</strong> &mdash; it is a cursor over durable state the engine already owns (trajectory in <code>rounds/&lt;key&gt;.hist</code>, in-flight round in reservations/<code>active/</code>/URL memos, fixes in git, verdicts in the completed store + PR comments). Its only novel data &mdash; headRefOid-per-round and decision narrative &mdash; goes in an <em>append-only journal</em> under <code>$PRO_GATE_HOME/supervisor/</code> that is a re-adoption cache, never a source of truth (the false-loss era's local-proxy-for-durable-state trap is the failure to design against). Identity via the existing <code>pg_pid_token</code>; single-writer via the existing per-change lock family; <code>--status</code> gains a <code>supervisor: alive|dead</code> line. Death mid-round loses nothing: the detached run, reservation, and marker survive, and the degradation path <em>is</em> the documented manual &sect;6 protocol &mdash; the property that clears the ship-the-legible-core bar. Validate by <code>kill -9</code> at each phase and asserting cold re-adoption reconstructs the same round, trajectory, and next decision from engine state alone, journal deleted.</dd>
+<dt>Downsides</dt>
+<dd>Fix-application authority inside a subagent needs clear bounds (PR-branch pushes only, never force-push or merge, SKILL disposition policy at stop); the daemon path keeps <code>--wait</code>-based blocking rather than subagent supervision.</dd>
+<dt>Confidence</dt><dd>80%</dd>
+<dt>Complexity</dt><dd>Medium</dd>
+</dl>
+</article>
+
+<article class="idea" id="idea-6">
+<h3>6. Churn Pareto first, fast tier second</h3>
+<div class="chips">
+  <span class="chip axis">round-verdict-economics</span>
+  <span class="chip conf-med">Confidence 65%</span>
+  <span class="chip">Complexity Medium</span>
+</div>
+<dl>
+<dt>Description</dt>
+<dd>Aggregate <code>rounds/*.hist</code> across the fleet (254+ gated changes, 737 spends) into a Pareto of which finding categories most often fail to shrink round-over-round &mdash; a <code>pro-gate-stats.sh</code> extension, pure reporting. Then, only if categories concentrate, stand up a cheap fast-tier pre-filter (lint/tests/Sonnet-level pass) targeted at exactly those categories before any Pro submission &mdash; the 2026 market's fast-shallow + slow-deep pairing, adopted on internal evidence rather than an external benchmark.</dd>
+<dt>Axis</dt><dd>round-verdict-economics</dd>
+<dt>Basis</dt>
+<dd><code>direct:</code> 32 of 36 recorded verdicts in the window were FIX-FIRST; &ldquo;a Pro review of fresh code almost never comes back empty&rdquo; (SKILL.md:383-385); the per-key <code>.hist</code> data (epoch, verdict, open P0/P1, resolved, still-present) exists and is never aggregated (verified: no rollup in stats/doctor). <code>external:</code> fast/deep reviewer pairing across the AI-review market (benchmark unverifiable from here &mdash; hence Pareto-first sequencing).</dd>
+<dt>Rationale</dt>
+<dd>Every FIX-FIRST round costs 20&ndash;160 min of wall clock and a slot someone else is queued behind. If a third of churn concentrates in categories a cheap pass can catch, the fast tier pays for itself immediately &mdash; and if the Pareto shows churn is irreducibly deep-model territory, you've spent one stats script to avoid building the wrong thing. The gate's terminal-rigor identity is untouched; what changes is what reaches it.</dd>
+<dt>Downsides</dt>
+<dd>Requires findings to carry a coarse category (today they're prose); the fast tier adds a moving part to the review path and its false-confidence risk must be framed as &ldquo;pre-filter,&rdquo; never &ldquo;pre-approval.&rdquo;</dd>
+<dt>Confidence</dt><dd>65%</dd>
+<dt>Complexity</dt><dd>Medium</dd>
+</dl>
+</article>
+
+<article class="idea" id="idea-7">
+<h3>7. Fair-share slot admission</h3>
+<div class="chips">
+  <span class="chip axis">slot-capacity-queue</span>
+  <span class="chip conf-med">Confidence 55%</span>
+  <span class="chip">Complexity High</span>
+</div>
+<dl>
+<dt>Description</dt>
+<dd>Replace pure arrival-order admission in the account-slot semaphore with a usage-decayed fair-share weight (SLURM's <code>2^(-usage/share)</code>, ~1-day half-life): a PR burning its 6th round today queues behind a PR requesting its 1st. Deprioritize heavy recent consumers gradually &mdash; never block them.</dd>
+<dt>Axis</dt><dd>slot-capacity-queue</dd>
+<dt>Basis</dt>
+<dd><code>direct:</code> the founding evidence for round budgets was &ldquo;10&ndash;16 Pro slots on a SINGLE PR in one day &hellip; queue starvation for every other PR&rdquo; (<code>lib:1029-1030</code>); verified that <code>pg_lock_n</code> has no priority concept &mdash; a churning PR and a first-time PR are admitted identically. <code>external:</code> SLURM fair-share + backfill.</dd>
+<dt>Rationale</dt>
+<dd>The codebase has twice validated the same governance shape &mdash; adaptive within a ceiling, earned by progress, collapsed on churn (concurrency ramp, round governor) &mdash; and the admission queue is the one scarce-resource site conspicuously missing it. This extends a pattern the team already trusts to the place the &ldquo;queued behind another session's slot&rdquo; complaint actually lives.</dd>
+<dt>Downsides</dt>
+<dd>Highest-risk survivor: priority logic in a multi-process flock/mkdir semaphore is subtle, starvation-freedom must be proven, and the win depends on how often true multi-session contention occurs (survivor 4's honest queue data should quantify that first). Build last, on evidence.</dd>
+<dt>Confidence</dt><dd>55%</dd>
+<dt>Complexity</dt><dd>High</dd>
+</dl>
+</article>
+</section>
+
+<section id="rejection-summary">
+<h2>Rejection Summary</h2>
+<table>
+  <thead><tr><th>#</th><th>Idea</th><th>Reason rejected</th></tr></thead>
+  <tbody>
+    <tr><td>38</td><td>Reuse daemon's <code>--max-budget-usd</code> for a round dollar-budget</td><td>Refuted: that flag caps the headless fixer agent's token spend; ChatGPT Pro time has no per-round dollar meter &mdash; category error. The underlying cost question survives inside idea 4.</td></tr>
+    <tr><td>43</td><td>Soft-infinite rounds with an escalating priority tax</td><td>Refuted: the round ceiling is documented as the deliberately immovable backstop, hardened after a gate P1 (#66) showed raising it defeats the one limit containing optimistic callers; re-litigates a settled decision without new evidence.</td></tr>
+    <tr><td>22</td><td>Exit 7 becomes a durable queue ticket</td><td>The cited exit-9 precedent binds a live, collectible conversation; before submission there is nothing to ticket. The desirable outcome (never sleep 40 min synchronously) is delivered by idea 1 instead.</td></tr>
+    <tr><td>25</td><td>Multiplex several small PRs into one held Pro conversation</td><td>Breaks the per-run marker/nonce ownership model and the per-key round governor; the cross-bind incident history warns that concurrency games in one conversation are exactly where reviews get mis-attributed.</td></tr>
+    <tr><td>29</td><td>Self-spawning detached auto-harvester per run</td><td>Repeats the shape of the OOM self-heal that was built and dropped as too fragile for a distributable; the externally-triggered sweep (idea 3) is the legible variant.</td></tr>
+    <tr><td>7 / 26</td><td>Route interactive calls into the daemon / daemon as default entry point</td><td>Assumes daemon liveness on every box (it is disabled here); idea 1's <code>--wait</code> verb delivers the same walk-away shape without a resident service.</td></tr>
+    <tr><td>14 / 15 / 16</td><td>Live ETA / ready_by / position in status now</td><td>Every current duration percentile conflates queue-wait with generation, so an ETA would be systematically biased; heartbeat ships now (idea 2), ETA becomes buildable after idea 4's ledger split. &ldquo;Position&rdquo; has no underlying data source today.</td></tr>
+    <tr><td>1 / 3</td><td>One universal harness-native wait primitive for all callers</td><td>Notification-based unification oversells (the headless daemon cannot receive async notifications) &mdash; but a <em>blocking</em> primitive serves every caller shape, which is how this survives inside idea 1's <code>--wait</code> verb plus idea 5's drift check.</td></tr>
+    <tr><td>5</td><td>Marker as accession number; polling demoted to opt-in</td><td>Mischaracterized exit-9/harvest as recovery-only (it is the designed default for large diffs since v0.24); the accession-number spirit lives on inside ideas 1 and 3.</td></tr>
+    <tr><td>9</td><td>Pro-gate as an async GitHub required check</td><td>Sound, but it is the end-state of ideas 1+5 rather than a separate build; standalone it adds GitHub-integration scope the core win doesn't need. Revisit after the watcher exists.</td></tr>
+    <tr><td>41</td><td>Structured findings object the governor reads directly</td><td>Assumes Pro reliably emits machine-parseable findings without degrading review quality &mdash; unproven; better developed as a brainstorm variant of idea 6's category tagging.</td></tr>
+    <tr><td>42</td><td>Round governor demotion instead of a cliff</td><td>Leaves churn unbounded; the queue-side version (idea 7) prices heavy use without touching the immovable ceiling.</td></tr>
+    <tr><td>28-solo</td><td>Payload-aware harvest wait as its own item</td><td>Folded into idea 3 &mdash; same surface, one PR.</td></tr>
+    <tr><td>34 / 35</td><td>Proactive round-trajectory preview</td><td>Folded into idea 2's status schema (<code>rounds_used/granted/streak</code>).</td></tr>
+    <tr><td>12 / 24 / 31 / 37</td><td>Duplicate phrasings from parallel frames</td><td>Literal duplicates of ideas 11 / 23 / 30 / 36 respectively; merged at dedupe.</td></tr>
+  </tbody>
+</table>
+</section>
+
+<footer class="composition-signal">Composed 2026-08-17 by ce-ideate from repo grounding (origin/main @ v0.33.0), <code>~/.pro-review-daemon</code> usage forensics (579 runs, Aug 3&ndash;17), five evidence dossiers, and external research. Bases adversarially verified by a fresh-context reviewer against the live repo.</footer>
+
+</div>
+</body>
+</html>
