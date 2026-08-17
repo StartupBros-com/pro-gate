@@ -49,6 +49,11 @@ verify_release() {
 # direct bot push cannot satisfy required status checks anyway (proved when
 # hov-marketplace gained require-ci: pro-gate v0.31.2 had to be promoted by
 # hand as hov-marketplace PR #70).
+#
+# That posture is unchanged by issue #84 below: this job still NEVER writes
+# the marketplace, in any of the three outcomes verify_marketplace_promotion
+# decides between. What changed is that a printed notice is no longer treated
+# as sufficient on its own — see that function for why.
 emit_repin_request() {
   printf '\n=== marketplace repin needed ===\n'
   printf '  plugin      %s\n' "$REPOSITORY"
@@ -70,6 +75,92 @@ emit_repin_request() {
       printf '| releaseTag | `%s` |\n' "$RELEASE_TAG"
     } >> "$GITHUB_STEP_SUMMARY"
   fi
+}
+
+# Where the marketplace card that actually reaches installed clients lives.
+# Overridable only so tests never touch the network; production always reads
+# the one canonical marketplace.
+MARKETPLACE_REPO="${MARKETPLACE_REPO:-StartupBros-com/hov-marketplace}"
+MARKETPLACE_MANIFEST_PATH='.claude-plugin/marketplace.json'
+
+# distribution UNVERIFIED: could not prove either way whether the release was
+# promoted. Printing a warning and then failing (not passing) is the point of
+# this function existing at all (issue #84): a release train that cannot
+# prove distribution must not report success — that is the exact bug this
+# fixes. The wording is kept deliberately distinct from the STALE failure
+# message below it in verify_marketplace_promotion, so a log reader (or a
+# grep) can tell an unrelated outage apart from genuine staleness.
+fail_distribution_unverified() {
+  printf 'warning: could not verify marketplace distribution state: %s\n' "$1" >&2
+  printf 'this is an outage or a read/parse failure, NOT evidence the marketplace card is stale — do not conclude promotion happened OR failed from this alone\n' >&2
+  fail "distribution UNVERIFIED for $RELEASE_TAG: $1 (re-run once the underlying read succeeds; this is a distinct failure mode from a stale card)"
+}
+
+# Read the LIVE marketplace manifest and decide whether this release was
+# actually promoted (issue #84). Before this function existed, main() called
+# emit_repin_request() unconditionally and returned 0 regardless of what the
+# marketplace said — so a stale card printed a notice nobody reads in a job
+# that goes green (v0.32.0, v0.33.0, v0.34.0 all shipped undistributed this
+# way), AND an already-current card printed the exact same notice, because
+# nothing ever read the card to tell the two cases apart (run 31875537361).
+#
+# This function is READ-ONLY, same posture as emit_repin_request above: it
+# never writes hov-marketplace, holds no deploy credential, and the decision
+# below is the only thing that changes which of that function's already-
+# existing output paths fires.
+#
+# Three outcomes:
+#   CURRENT    - card matches this release exactly on all four fields ->
+#                confirm, do NOT print the repin notice, succeed.
+#   STALE      - card names a different release on any field -> print the
+#                existing repin notice (kept verbatim; the recipe references
+#                its exact fields) AND fail. A red release train is the
+#                correct signal that the release is not distributed yet
+#                (issue #84 option 2 — self-repin was rejected: see the
+#                comment above emit_repin_request).
+#   UNVERIFIED - network/API/parse failure -> fail_distribution_unverified
+#                (see above); never silently pass, never conflate with STALE.
+verify_marketplace_promotion() {
+  require REPOSITORY
+  require RELEASE_VERSION
+  require RELEASE_TAG
+  require RELEASE_ID
+  require SOURCE_SHA
+  local manifest card card_version card_tag card_id card_sha
+
+  # One gh api call against the marketplace's live default branch (no ref
+  # pinned, so this always reads whatever a merged repin PR most recently
+  # produced), fetched raw so the response body is the manifest itself.
+  if ! manifest="$(gh api -H 'Accept: application/vnd.github.raw+json' \
+      "repos/$MARKETPLACE_REPO/contents/$MARKETPLACE_MANIFEST_PATH" 2>/dev/null)"; then
+    fail_distribution_unverified "gh api could not fetch repos/$MARKETPLACE_REPO/$MARKETPLACE_MANIFEST_PATH"
+  fi
+
+  if ! card="$(jq -c --arg name "$REPOSITORY" \
+      '[.plugins[]? | select(.name == $name)][0] // empty' <<<"$manifest" 2>/dev/null)"; then
+    fail_distribution_unverified "marketplace manifest did not parse as JSON"
+  fi
+  if [[ -z "$card" || "$card" == "null" ]]; then
+    fail_distribution_unverified "marketplace manifest has no \"$REPOSITORY\" plugin entry"
+  fi
+
+  card_version="$(jq -r '.metadata.version // empty' <<<"$card")"
+  card_tag="$(jq -r '.metadata.releaseTag // empty' <<<"$card")"
+  card_id="$(jq -r '.metadata.releaseId // empty' <<<"$card")"
+  card_sha="$(jq -r '.source.sha // empty' <<<"$card")"
+  if [[ -z "$card_version" || -z "$card_tag" || -z "$card_id" || -z "$card_sha" ]]; then
+    fail_distribution_unverified "\"$REPOSITORY\" card is missing version/releaseTag/releaseId/sha"
+  fi
+
+  if [[ "$card_version" == "$RELEASE_VERSION" && "$card_tag" == "$RELEASE_TAG" \
+        && "$card_id" == "$RELEASE_ID" && "$card_sha" == "$SOURCE_SHA" ]]; then
+    printf 'marketplace card already lists %s (releaseId %s, sha %s): distribution is current\n' \
+      "$RELEASE_TAG" "$RELEASE_ID" "$SOURCE_SHA"
+    return 0
+  fi
+
+  emit_repin_request
+  fail "release $RELEASE_TAG (releaseId $RELEASE_ID) is published but NOT distributed: marketplace card still lists $card_tag (releaseId $card_id, sha $card_sha) - open the repin PR reported above against $MARKETPLACE_REPO, merge it, then re-fire announce"
 }
 
 main() {
@@ -94,7 +185,7 @@ main() {
   fi
 
   RELEASE_VERSION="$(verify_release)"
-  emit_repin_request
+  verify_marketplace_promotion
 }
 
 main "$@"

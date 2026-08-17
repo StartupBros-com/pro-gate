@@ -77,6 +77,11 @@ jobs:
           LATEST_STABLE_ID: ${{ steps.stable.outputs.id }}
           SOURCE_ROOT: ${{ github.workspace }}
           ASSET_DIR: ${{ github.workspace }}/release-assets
+          # Read-only: this token only fetches hov-marketplace's public
+          # marketplace.json to verify distribution (issue #84); it is never
+          # used to write, and hov-marketplace is a public repo so the
+          # default token needs no cross-repo grant to read it.
+          GH_TOKEN: ${{ github.token }}
         run: |
           source_sha="$(git rev-list -n 1 "$RELEASE_TAG")"
           export SOURCE_SHA="$source_sha"

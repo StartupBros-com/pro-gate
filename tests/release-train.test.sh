@@ -101,15 +101,99 @@ common=(
   SOURCE_ROOT="$TMP/source" ASSET_DIR="$TMP/assets" SOURCE_SHA="$SOURCE_SHA"
 )
 
-# The run must hand over every value the repin PR needs. That is the point of
-# retiring the push: the follow-up step becomes mechanical instead of recalled.
-out="$(env "${common[@]}" "$ROOT/scripts/release-train.sh")"
+# Test stub for `gh api` (the only gh subcommand verify_marketplace_promotion
+# uses), same fake-binary-on-PATH pattern as tests/release-assets.test.sh.
+# GH_API_MODE=fail/malformed simulate an unreadable manifest; otherwise it
+# hands back whatever GH_MARKETPLACE_JSON the caller set, letting each
+# scenario below control what the "live" marketplace card says.
+mkdir -p "$TMP/bin"
+cat > "$TMP/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = api ]; then
+  case "${GH_API_MODE:-ok}" in
+    fail) exit 1 ;;
+    malformed) printf 'not-json-at-all' ;;
+    *) printf '%s\n' "$GH_MARKETPLACE_JSON" ;;
+  esac
+  exit 0
+fi
+exit 2
+EOF
+chmod +x "$TMP/bin/gh"
+export PATH="$TMP/bin:$PATH"
+
+# Builds a one-plugin marketplace.json fragment with only the fields
+# verify_marketplace_promotion reads, so each scenario below can hand the
+# stubbed `gh api` call a card with a chosen version/tag/id/sha.
+marketplace_json() {
+  local version="$1" tag="$2" id="$3" sha="$4"
+  printf '{"plugins":[{"name":"%s","source":{"sha":"%s"},"metadata":{"version":"%s","releaseTag":"%s","releaseId":%s}}]}\n' \
+    "$PLUGIN" "$sha" "$version" "$tag" "$id"
+}
+
+# Planted negative 1 (issue #84): the marketplace card LAGS the release (card
+# 0.0.9, release fixture is 0.1.0) -> the train's verify path must NOT
+# conclude success. Before the fix, release-train.sh printed this exact repin
+# block and exited 0 regardless of what the card said — the bug reproduced
+# live for v0.32.0, v0.33.0, and v0.34.0.
+STALE_CARD="$(marketplace_json 0.0.9 v0.0.9 99 0000000000000000000000000000000000000a)"
+if out="$(env "${common[@]}" GH_MARKETPLACE_JSON="$STALE_CARD" "$ROOT/scripts/release-train.sh" 2>&1)"; then
+  fail 'a stale marketplace card must not let the run conclude success'
+fi
+pass 'a stale marketplace card fails the run (planted negative 1)'
+# The run must still hand over every value the repin PR needs. That is the
+# point of retiring the push: the follow-up step becomes mechanical instead
+# of recalled.
 for field in "$PLUGIN" 0.1.0 "$SOURCE_SHA" 201 v0.1.0; do
   [[ "$out" == *"$field"* ]] || fail "repin report omits $field"
 done
 pass 'run reports every value the marketplace repin PR needs'
-[[ "$out" == *repin* ]] || fail 'run does not name the repin step'
+[[ "$out" == *'=== marketplace repin needed ==='* ]] || fail 'run does not print the repin notice'
 pass 'run names the repin step explicitly'
+[[ "$out" == *'NOT distributed'* ]] || fail 'stale failure does not say the release was not distributed'
+pass 'stale failure names the actual consequence: published but not distributed'
+
+# Planted negative 2 (issue #84 secondary finding, reproduced live in run
+# 31875537361): when the card ALREADY matches the release, the repin notice
+# must be ABSENT. Before the fix the notice printed unconditionally
+# regardless of what the card said, even when announce had already succeeded.
+CURRENT_CARD="$(marketplace_json 0.1.0 v0.1.0 201 "$SOURCE_SHA")"
+out="$(env "${common[@]}" GH_MARKETPLACE_JSON="$CURRENT_CARD" "$ROOT/scripts/release-train.sh")"
+[[ "$out" != *'=== marketplace repin needed ==='* ]] || fail 'repin notice fires even though the card already matches (planted negative 2)'
+pass 'repin notice is absent when the marketplace card already matches (planted negative 2)'
+[[ "$out" == *'distribution is current'* ]] || fail 'a current card does not print a confirmation'
+pass 'a current card prints a confirmation instead of a repin notice'
+
+# Unreadable marketplace: gh api itself fails (network/API outage). Must not
+# silently pass (a false "success") and must not be confused with a
+# genuinely stale card in the log — a release train that cannot prove
+# distribution must not report success either way.
+if out="$(env "${common[@]}" GH_API_MODE=fail "$ROOT/scripts/release-train.sh" 2>&1)"; then
+  fail 'an unreadable marketplace manifest must not let the run conclude success'
+fi
+pass 'gh api failure fails the run instead of silently passing'
+[[ "$out" != *'=== marketplace repin needed ==='* ]] || fail 'an unreadable manifest must not fabricate a repin notice'
+pass 'an unreadable manifest does not fabricate a repin notice'
+[[ "$out" == *'UNVERIFIED'* ]] || fail 'gh api failure is not reported as a distinct UNVERIFIED outcome'
+pass 'gh api failure is reported as UNVERIFIED, distinct wording from a stale card'
+
+# Unreadable marketplace: manifest fetched but does not parse as JSON.
+if out="$(env "${common[@]}" GH_API_MODE=malformed "$ROOT/scripts/release-train.sh" 2>&1)"; then
+  fail 'a malformed marketplace manifest must not let the run conclude success'
+fi
+pass 'malformed marketplace manifest fails the run instead of silently passing'
+[[ "$out" != *'=== marketplace repin needed ==='* ]] || fail 'a malformed manifest must not fabricate a repin notice'
+pass 'a malformed manifest does not fabricate a repin notice'
+[[ "$out" == *'UNVERIFIED'* ]] || fail 'malformed manifest is not reported as a distinct UNVERIFIED outcome'
+pass 'malformed manifest is reported as UNVERIFIED, distinct wording from a stale card'
+
+# Everyday runs (prerelease/superseded/tag-mismatch checks below) do not need
+# a specific marketplace card: prerelease and superseded releases return
+# before the marketplace is ever read, and a tag/VERSION mismatch fails
+# inside verify_release, before verify_marketplace_promotion runs. Give them
+# a current card anyway so a future reordering that reaches the marketplace
+# check does not fail these for the wrong reason.
+export GH_MARKETPLACE_JSON="$CURRENT_CARD"
 
 # Nothing in this repo may retain the ability to write the marketplace.
 grep -Fq 'HOV_MARKETPLACE_DEPLOY_KEY' "$ROOT/.github/workflows/release-train.yml" \

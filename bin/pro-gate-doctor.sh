@@ -47,6 +47,34 @@ elif [ -n "$EXPECTED_VERSION" ] && [ "$INSTALLED_VERSION" != "$EXPECTED_VERSION"
 else
   P "runtime version ${INSTALLED_VERSION}${EXPECTED_VERSION:+ matches plugin}"
 fi
+# Distribution-layer skew (issue #84): the block above only compares runtime
+# against plugin — two things that come from the SAME machine's cache and so
+# will always "match" once both have settled, even when both are stale. That
+# is exactly how the dogfood box ran 0.31.2, reported "matches", while the
+# fix under test had already shipped as 0.33.0: the release train had gone
+# green without the marketplace card ever being promoted, and this doctor had
+# no way to see one layer further up the chain. This check adds that layer:
+# is either side of the pair above behind the newest release pro-gate has
+# actually PUBLISHED (independent of whether the marketplace has caught up
+# yet — see release-train.sh's verify_marketplace_promotion for that half).
+#
+# releases/latest over the marketplace card: one direct read of this repo's
+# own release history (a single object, no pagination, no cross-repo hop) vs.
+# fetching hov-marketplace's full multi-plugin manifest just to filter down
+# to one entry — cheaper, and it stays meaningful even while the marketplace
+# card is the very thing lagging.
+#
+# Best-effort like the oracle skew nudge below: gh missing, unauthenticated,
+# or offline all degrade to total silence (no P/W path for "could not
+# check") — this must never block, and the doctor must stay usable offline.
+if pg_have gh; then
+  NEWEST_TAG="$(run_bounded 10 gh api repos/StartupBros-com/pro-gate/releases/latest --jq '.tag_name' 2>/dev/null || true)"
+  NEWEST_VERSION="${NEWEST_TAG#v}"
+  LOCAL_VERSION="${EXPECTED_VERSION:-$INSTALLED_VERSION}"
+  if [ -n "$NEWEST_VERSION" ] && [ -n "$LOCAL_VERSION" ] && pg_semver_lt "$LOCAL_VERSION" "$NEWEST_VERSION"; then
+    W "pro-gate $NEWEST_VERSION has been published (this box is on $LOCAL_VERSION) — once the marketplace card lists it: install.sh --version $NEWEST_VERSION"
+  fi
+fi
 if pg_dangerous_consent_ok; then
   P "dangerous automatic-fixer disclosure accepted (consent v$(pg_consent_version))"
 else
