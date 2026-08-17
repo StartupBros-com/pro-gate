@@ -193,6 +193,13 @@ check 'durable harvest archives the server conversation' "$([ "$(jq -r .archived
 check 'durable harvest organizes rename before archive' "$([ "$(jq -r '[.events[].action] | join(",")' "$ORGANIZER_STATE")" = 'rename,archive' ]; echo $?)" "$(cat "$ORGANIZER_STATE")"
 check 'durable harvest has marker-addressed completed bytes before cleanup' "$([ -s "$TDIR/home/completed/$MARKER" ] && cmp -s "$TDIR/home/completed/$MARKER" "$TDIR/o-h2.md"; echo $?)" "completed=$(ls "$TDIR/home/completed" 2>/dev/null)"
 check 'successful harvest releases reservation' "$([ ! -f "$TDIR/home/in-progress/$MARKER" ]; echo $?)" "reservation leaked"
+# U1 (R1/R3): a harvest never queues for a slot — it reads an existing/in-progress conversation
+# over CDP — so its ledger row must carry pre_slot_secs=0 and post_slot_secs equal to the row's own secs
+# (the harvest's own short wall time), never reconstructed from a generation epoch it has none of.
+H2_ROW="$(grep -F "\"out\":\"$TDIR/o-h2.md\"" "$TDIR/home/ledger.jsonl" | tail -1)"
+check 'harvest ledger row is valid JSON' "$(printf '%s' "$H2_ROW" | jq empty >/dev/null 2>&1; echo $?)" "$H2_ROW"
+check 'harvest ledger row records pre_slot_secs=0' "$([ "$(printf '%s' "$H2_ROW" | jq -r '.pre_slot_secs // "MISSING"')" = 0 ]; echo $?)" "$H2_ROW"
+check 'harvest ledger row records post_slot_secs == secs' "$([ "$(printf '%s' "$H2_ROW" | jq -r '.post_slot_secs // "MISSING"')" = "$(printf '%s' "$H2_ROW" | jq -r .secs)" ]; echo $?)" "$H2_ROW"
 
 echo '# harvest: already collected (v0.28) vs genuinely gone'
 printf 'run marker: pg-run-999-1700000001-99\nforeign conversation\n' > "$TDIR/tab.txt"
@@ -285,6 +292,12 @@ PRO_GATE_HOME="$TDIR/home3" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PR
 RC=$?
 check 'non-reserved slot still acquirable' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
 check 'slotted reservation untouched by foreign run' "$([ -f "$TDIR/home3/in-progress/pg-run-slotted-1700000003-44" ]; echo $?)" 'reservation lost'
+# U1 (R1/R3): a completed fresh run's ledger row carries pre_slot_secs/post_slot_secs BY NAME alongside
+# the unchanged secs field, and the two parts sum back to secs exactly (shared "now" epoch).
+SLOTS2_ROW="$(grep -F "\"out\":\"$TDIR/o-slots2.md\"" "$TDIR/home3/ledger.jsonl" | tail -1)"
+check 'happy-path ledger row is valid JSON' "$(printf '%s' "$SLOTS2_ROW" | jq empty >/dev/null 2>&1; echo $?)" "$SLOTS2_ROW"
+check 'happy-path ledger row carries pre_slot_secs + post_slot_secs' "$(printf '%s' "$SLOTS2_ROW" | jq -e 'has("pre_slot_secs") and has("post_slot_secs") and has("secs")' >/dev/null 2>&1; echo $?)" "$SLOTS2_ROW"
+check 'happy-path pre_slot_secs + post_slot_secs equals secs' "$([ "$(printf '%s' "$SLOTS2_ROW" | jq -r '(.pre_slot_secs // "MISSING") as $q | (.post_slot_secs // "MISSING") as $r | if ($q == "MISSING" or $r == "MISSING") then "MISSING" else ($q + $r) end')" = "$(printf '%s' "$SLOTS2_ROW" | jq -r .secs)" ]; echo $?)" "$SLOTS2_ROW"
 rm -rf "$TDIR/home3"
 
 echo '# harvest miss policy: absent passes retain, limit releases'
@@ -645,6 +658,9 @@ check 'completed review writes severity sidecar (0 P0 / 1 P1)' \
 check 'completed review appends hist row (verdict + open counts)' \
   "$([ "$(awk -F'\t' 'NR==1{print $2" "$3" "$4" "$5" "$6}' "$RHOME/rounds/$RKEY_88.hist" 2>/dev/null)" = 'SHIP 0 1 0 0' ]; echo $?)" \
   "hist: $(cat "$RHOME/rounds/$RKEY_88.hist" 2>/dev/null)"
+check 'completed review hist row has a seventh wall-clock field' \
+  "$(awk -F'\t' 'NR==1{exit !(NF == 7 && $7 >= 0 && $7 < 86400)}' "$RHOME/rounds/$RKEY_88.hist" 2>/dev/null; echo $?)" \
+  "hist: $(cat "$RHOME/rounds/$RKEY_88.hist" 2>/dev/null)"
 # The history parser shares pg_is_review's hardened terminal matcher (bold/bullet formatting).
 printf '[P1] a.sh:1 - finding\n  Why: test\nP2: none\nP3: none\n**VERDICT:** FIX-FIRST - formatted.\n' > "$RHOME/formatted-review.md"
 PRO_GATE_HOME="$RHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_note_severity '$RKEY_88' '$RHOME/formatted-review.md'"
@@ -725,6 +741,12 @@ env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO
   >"$TDIR/stdout" 2>"$TDIR/stderr"
 RC=$?
 check 'concurrent same-branch --diff run waits on the per-change lock (exit 7)' "$([ "$RC" -eq 7 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+# U1 (R1/R3): a run that never reaches launch (this lock-timeout never even gets to the slot
+# wait) records its FULL wait as pre_slot_secs with post_slot_secs 0 — LAUNCH_EPOCH is never set.
+DLOCK_ROW="$(grep -F "\"out\":\"$RHOME/o-dlock.md\"" "$RHOME/ledger.jsonl" | tail -1)"
+check 'lock-timeout ledger row records post_slot_secs=0' "$([ "$(printf '%s' "$DLOCK_ROW" | jq -r '.post_slot_secs // "MISSING"')" = 0 ]; echo $?)" "$DLOCK_ROW"
+check 'lock-timeout ledger row records its full wait as pre_slot_secs (>= 2s of the 3s PRO_GATE_LOCK_WAIT)' "$(printf '%s' "$DLOCK_ROW" | jq -e '(.pre_slot_secs // -1) >= 2' >/dev/null 2>&1; echo $?)" "$DLOCK_ROW"
+check 'lock-timeout pre_slot_secs + post_slot_secs equals secs' "$([ "$(printf '%s' "$DLOCK_ROW" | jq -r '(.pre_slot_secs // "MISSING") as $q | (.post_slot_secs // "MISSING") as $r | if ($q == "MISSING" or $r == "MISSING") then "MISSING" else ($q + $r) end')" = "$(printf '%s' "$DLOCK_ROW" | jq -r .secs)" ]; echo $?)" "$DLOCK_ROW"
 eval "exec ${DLFD}>&-"
 
 # Detached-HEAD checkouts key per-commit (literal branch name "HEAD" would cross-cap
@@ -809,6 +831,9 @@ gguard() { # $1=key, rest = env overrides; stdout = reason, rc = guard rc
   local key="$1"; shift
   env PRO_GATE_HOME="$GHOME" "$@" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_guard '$key'"
 }
+gscore() { # $1=key -> "earned<TAB>streak<TAB>elapsed_secs<TAB>scored" from pg_round_score
+  env PRO_GATE_HOME="$GHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_score '$1'; printf '%s\t%s\t%s\t%s\n' \"\$PG_ROUND_EARNED\" \"\$PG_ROUND_STREAK\" \"\$PG_ROUND_ELAPSED_SECS\" \"\$PG_ROUND_SCORED\""
+}
 # No history: the base grant (3) is the whole budget.
 gseed nohist 3
 GOUT="$(gguard nohist)"; GRC=$?
@@ -857,11 +882,44 @@ gseed churn2 3; ghist churn2 5 7 8
 GOUT="$(env PRO_GATE_HOME="$GHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_grant churn2")"
 check 'grant: churn brake collapses the grant to spent' "$([ "$GOUT" = 3 ]; echo $?)" "grant=$GOUT"
 
+echo '# ledger-timing-split R4: MIXED 6-field (pre-upgrade) and 7-field (post-upgrade) .hist rows'
+# pg_round_note_severity copies existing .hist lines through VERBATIM and appends only the new
+# row as 7 fields, so every change with pre-existing rounds has a MIXED-width file on first
+# upgrade to the ledger-timing-split fields. That real state was previously untested: every
+# existing fixture in this suite is uniformly 6-field (ghist above) or uniformly 7-field
+# (RKEY_90 below). Same open-count sequence as the 'shrink' fixture (5 -> 3 -> 1) so trajectory
+# scoring is directly comparable; only the row WIDTH differs.
+gseed mixedhist 3
+{
+  printf '%s\tFIX-FIRST\t0\t5\t0\t0\n' "$GEPOCH"          # legacy 6-field row: no field 7 at all
+  printf '%s\tFIX-FIRST\t0\t3\t0\t0\t1800\n' "$GEPOCH"    # 7-field row: dur=1800s
+  printf '%s\tFIX-FIRST\t0\t1\t0\t0\t3600\n' "$GEPOCH"    # 7-field row: dur=3600s
+} > "$GHOME/rounds/mixedhist.hist"
+MIXROW="$(gscore mixedhist)"
+MIX_EARNED="$(printf '%s' "$MIXROW" | cut -f1)"
+MIX_STREAK="$(printf '%s' "$MIXROW" | cut -f2)"
+MIX_ELAPSED="$(printf '%s' "$MIXROW" | cut -f3)"
+MIX_SCORED="$(printf '%s' "$MIXROW" | cut -f4)"
+# (a) trajectory scoring (earned/streak) is unaffected by row width — same 5->3->1 sequence as
+# the 'shrink' fixture earns 2 rounds with a reset (non-churning) streak, exactly as it does
+# when every row is uniformly 7-field.
+check 'mixed-width .hist: trajectory scoring matches the pure 7-field sequence (2 earned, streak 0)' \
+  "$([ "$MIX_EARNED" = 2 ] && [ "$MIX_STREAK" = 0 ]; echo $?)" "earned=$MIX_EARNED streak=$MIX_STREAK"
+# (b) PG_ROUND_ELAPSED_SECS sums only the two 7-field durations (1800+3600=5400); the legacy
+# 6-field row contributes 0 rather than breaking the scan. PG_ROUND_SCORED counts all THREE
+# in-window rows regardless of width — the distinction FIX 1 exists to make visible.
+check 'mixed-width .hist: elapsed sums only the 7-field durations, legacy row as 0' \
+  "$([ "$MIX_ELAPSED" = 5400 ]; echo $?)" "elapsed=$MIX_ELAPSED"
+check 'mixed-width .hist: scored count includes every in-window row (legacy + 7-field)' \
+  "$([ "$MIX_SCORED" = 3 ]; echo $?)" "scored=$MIX_SCORED"
+gguard mixedhist >/dev/null; GRC=$?
+check 'mixed-width .hist: governor still proceeds normally (earned round available)' "$([ "$GRC" -eq 0 ]; echo $?)" "rc=$GRC"
+
 echo '# v0.31 (#65): governor integration — engine exit 12 carries the trajectory'
 RKEY_90="$(printf '%s-90' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
 mkdir -p "$RHOME/rounds"
 : > "$RHOME/rounds/$RKEY_90"; for _ in 1 2 3; do printf '%s\n' "$(date +%s)" >> "$RHOME/rounds/$RKEY_90"; done
-printf '%s\tFIX-FIRST\t0\t5\t0\t0\n%s\tFIX-FIRST\t0\t7\t0\t0\n%s\tFIX-FIRST\t0\t8\t0\t0\n' \
+printf '%s\tFIX-FIRST\t0\t5\t0\t0\t3600\n%s\tFIX-FIRST\t0\t7\t0\t0\t3600\n%s\tFIX-FIRST\t0\t8\t0\t0\t3600\n' \
   "$(date +%s)" "$(date +%s)" "$(date +%s)" > "$RHOME/rounds/$RKEY_90.hist"
 printf 'foreign idle tab\n' > "$TDIR/tab.txt"
 env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
@@ -873,6 +931,8 @@ RC=$?
 check 'governor engine run: churn exits 12' "$([ "$RC" -eq 12 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
 check 'governor engine run: phase round-capped' "$([ "$(phase_of "$RHOME/o-gov.md.status")" = round-capped ]; echo $?)" "$(cat "$RHOME/o-gov.md.status" 2>/dev/null)"
 check 'governor engine run: status detail carries the trajectory arrow' "$(grep -q '5→7→8' "$RHOME/o-gov.md.status"; echo $?)" "$(cat "$RHOME/o-gov.md.status" 2>/dev/null)"
+check 'governor engine refusal names rounds used and wall clock' \
+  "$(grep -q '3 rounds; ~3.0h recorded across 3 scored round(s)' "$TDIR/stderr"; echo $?)" "$(tail -5 "$TDIR/stderr")"
 
 echo '# v0.31 (#65): a provably-never-landed submission refunds its round'
 cat > "$TDIR/bin/oracle-dead" <<'FAKE_DEAD'
@@ -1286,6 +1346,23 @@ check 'pg_marker_epoch (fallback) extracts the launch epoch' "$([ "$MEPOCH" = 17
 MEPOCH="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_marker_epoch 'legacy-marker' 2>/dev/null" || true)"
 check 'pg_marker_epoch rejects a legacy marker' "$([ -z "$MEPOCH" ]; echo $?)" "got=$MEPOCH"
 
+# ledger-timing-split R3 audit: a round's charge (and hence its budget window) must key off
+# the moment pg_round_record actually runs (post-lock, post-slot — the phase transition), never
+# off a marker's mint time. A marker minted well outside the round window simulates the queued
+# run this whole family of bugs (#66) was about: if pg_round_record ever used the marker's
+# epoch instead of its own call-time "now", this round would already be stale on arrival and
+# pg_round_count would read 0, not 1.
+R3_HOME="$TDIR/home-r3audit"; mkdir -p "$R3_HOME/rounds"
+R3_KEY="r3auditkey"
+R3_OLD_MARKER="pg-run-${R3_KEY}-$(( $(date +%s) - 172800 ))-42"   # minted 48h ago (2x the 24h window)
+R3_STALE_EPOCH="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_marker_epoch '$R3_OLD_MARKER'")"
+check 'R3 audit: the marker mint epoch really is outside the round window' \
+  "$([ $(( $(date +%s) - R3_STALE_EPOCH )) -ge 86400 ]; echo $?)" "marker_epoch=$R3_STALE_EPOCH"
+PRO_GATE_HOME="$R3_HOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_record '$R3_KEY'"
+R3_COUNT="$(PRO_GATE_HOME="$R3_HOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_count '$R3_KEY'")"
+check 'R3 audit: a round charged now counts in-window despite an out-of-window marker mint' \
+  "$([ "$R3_COUNT" -eq 1 ]; echo $?)" "count=$R3_COUNT rounds file=$(cat "$R3_HOME/rounds/$R3_KEY" 2>/dev/null)"
+
 # #66 gate P1: a harvested review is stamped with its SPEND epoch, not the collection time —
 # otherwise an hours-later harvest outlives its own spend in the scored window.
 HHOME="$TDIR/home-histstamp"; mkdir -p "$HHOME/rounds"
@@ -1296,6 +1373,9 @@ printf '[P1] a.sh:1 - finding\n  Why: test\nP2: none\nP3: none\nVERDICT: SHIP - 
 PRO_GATE_HOME="$HHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_note_severity '$HKEY' '$HHOME/review.md' '$OLD_EPOCH'"
 check 'harvested hist row carries the SPEND epoch' \
   "$([ "$(awk -F'\t' 'NR==1{print $1}' "$HHOME/rounds/$HKEY.hist")" = "$OLD_EPOCH" ]; echo $?)" \
+  "hist: $(cat "$HHOME/rounds/$HKEY.hist")"
+check 'harvested hist row carries plausible positive wall-clock seconds' \
+  "$(awk -F'\t' 'NR==1{exit !(NF == 7 && $7 > 0 && $7 < 86400)}' "$HHOME/rounds/$HKEY.hist"; echo $?)" \
   "hist: $(cat "$HHOME/rounds/$HKEY.hist")"
 # Rows sharing one second must keep WRITE order (the re-sort is stable): an unstable sort
 # would reorder the very trajectory the governor scores.
@@ -1434,6 +1514,10 @@ SHOME="$TDIR/sthome"; mkdir -p "$SHOME/in-progress" "$SHOME/rounds" "$SHOME/conv
 SMARKER="pg-run-acme-widgets-42-1700000001-77"
 printf '42\t/tmp/pg-st-42.md\t%s\t0\t1\tGPT-X\n' "$(date +%s)" > "$SHOME/in-progress/$SMARKER"
 printf '%s\n%s\n' "$(( $(date +%s) - 60 ))" "$(( $(date +%s) - 120 ))" > "$SHOME/rounds/acme-widgets-42"
+# Flat (non-shrinking) open counts so this fixture earns no extra round and leaves the
+# base-grant assertion below ('2 spent, 1 remaining') undisturbed — it exists only to give
+# the elapsed-wall-clock assertion two real hist rows (2h total) to sum.
+printf '%s\tFIX-FIRST\t0\t5\t0\t0\t3600\n%s\tFIX-FIRST\t0\t5\t0\t0\t3600\n' "$(date +%s)" "$(date +%s)" > "$SHOME/rounds/acme-widgets-42.hist"
 printf 'https://chatgpt.com/c/abc123\n' > "$SHOME/conversation-urls/$SMARKER"
 printf '{"ts":"2026-01-01T00:00:00+0000","pr":"42","repo":"/tmp/acme","exit":9,"outcome":"in-progress","secs":100,"attempts":0,"conc":1,"ceiling":1,"live":1,"salvaged":0,"diff_lines":10,"out":"/tmp/pg-st-42.md","model":"m","marker":"%s","round_key":"acme-widgets-42"}\n' "$SMARKER" > "$SHOME/ledger.jsonl"
 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 >"$TDIR/st.out" 2>"$TDIR/st.err"; RC=$?
@@ -1442,6 +1526,8 @@ check '--status names the reservation marker' "$(grep -q "$SMARKER" "$TDIR/st.ou
 check '--status leads to a free harvest' "$(grep -q "FREE" "$TDIR/st.out" && grep -q -- "--harvest '$SMARKER'" "$TDIR/st.out"; echo $?)" "$(grep -i harvest "$TDIR/st.out")"
 # v0.31: governor default — base grant 3 with no trajectory history, so 2 spent leaves 1.
 check '--status reports rounds spent/remaining' "$(grep -q '2 spent, 1 remaining' "$TDIR/st.out"; echo $?)" "$(grep spent "$TDIR/st.out")"
+check '--status reports rounds used and total wall clock' \
+  "$(grep -q '2 rounds; ~2.0h recorded across 2 scored round(s)' "$TDIR/st.out"; echo $?)" "$(grep spent "$TDIR/st.out")"
 check '--status writes nothing' "$([ ! -f "$SHOME/ledger.jsonl.tmp" ] && [ "$(wc -l < "$SHOME/ledger.jsonl")" -eq 1 ]; echo $?)" 'state mutated'
 # #67/#68 P2: THREE states. Bare .unbound captures are AMBIGUOUS and retryable (strict nonce
 # mode makes one when an older answer is visible while ours generates); only a positively
@@ -1685,6 +1771,64 @@ SP_HARV="$(PRO_GATE_HOME="$SHOME" bash "$STATS" --pr 7 --json 2>/dev/null | jq -
 check 'stats --pr matches harvest rows by round key' "$([ "$SP_HARV" = 2 ]; echo $?)" "runs=$SP_HARV"
 PRO_GATE_HOME="$SHOME" bash "$STATS" --pr not-a-number >/dev/null 2>&1; RC=$?
 check 'stats --pr rejects non-numeric (exit 2)' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC"
+
+echo '# U1: pro-gate-stats.sh queue/run percentiles on a MIXED ledger (old rows without the new'
+echo '# fields alongside new rows that carry them) — old .secs percentiles unchanged, new'
+echo '# percentiles computed from new-field rows only, no error, existing fields byte-compatible.'
+mkdir -p "$TDIR/home-mixed"
+MIXHOME="$TDIR/home-mixed"
+{
+  printf '{"ts":"2026-01-01T00:00:00+0000","pr":"1","outcome":"clean","secs":10,"conc":1}\n'
+  printf '{"ts":"2026-01-01T00:01:00+0000","pr":"2","outcome":"clean","secs":20,"conc":1}\n'
+  printf '{"ts":"2026-01-01T00:02:00+0000","pr":"3","outcome":"clean","secs":30,"pre_slot_secs":5,"post_slot_secs":25,"conc":1}\n'
+  printf '{"ts":"2026-01-01T00:03:00+0000","pr":"4","outcome":"clean","secs":40,"pre_slot_secs":8,"post_slot_secs":32,"conc":1}\n'
+  printf '{"ts":"2026-01-01T00:04:00+0000","pr":"5","outcome":"clean","secs":50,"pre_slot_secs":10,"post_slot_secs":40,"conc":1}\n'
+} > "$MIXHOME/ledger.jsonl"
+MIX_JSON="$(PRO_GATE_HOME="$MIXHOME" bash "$STATS" 2>/dev/null | awk '/^\{$/{f=1} f')"
+check 'stats on mixed ledger emits valid JSON' "$(printf '%s' "$MIX_JSON" | jq empty >/dev/null 2>&1; echo $?)" "$MIX_JSON"
+check 'stats mixed-ledger runs count is 5' "$([ "$(printf '%s' "$MIX_JSON" | jq -r .runs)" = 5 ]; echo $?)" "$MIX_JSON"
+check 'stats duration_p50_s/p95_s unchanged by rows lacking queue/run fields' \
+  "$([ "$(printf '%s' "$MIX_JSON" | jq -r .duration_p50_s)" = 30 ] && [ "$(printf '%s' "$MIX_JSON" | jq -r .duration_p95_s)" = 50 ]; echo $?)" "$MIX_JSON"
+check 'stats new pre_slot_p50_s/p95_s computed from new-field rows only' \
+  "$([ "$(printf '%s' "$MIX_JSON" | jq -r .pre_slot_p50_s)" = 8 ] && [ "$(printf '%s' "$MIX_JSON" | jq -r .pre_slot_p95_s)" = 10 ]; echo $?)" "$MIX_JSON"
+check 'stats new post_slot_p50_s/p95_s computed from new-field rows only' \
+  "$([ "$(printf '%s' "$MIX_JSON" | jq -r .post_slot_p50_s)" = 32 ] && [ "$(printf '%s' "$MIX_JSON" | jq -r .post_slot_p95_s)" = 40 ]; echo $?)" "$MIX_JSON"
+check 'stats mixed ledger keeps existing fields present (byte-compatible for old consumers)' \
+  "$(printf '%s' "$MIX_JSON" | jq -e 'has("runs") and has("by_outcome") and has("success_rate_pct") and has("throttles") and has("salvage_rate_pct") and has("duration_p50_s") and has("duration_p95_s") and has("by_concurrency")' >/dev/null 2>&1; echo $?)" "$MIX_JSON"
+
+echo '# ledger-timing-split Fix 3: lock-timeout rows join the pre-slot population; harvest rows'
+echo '# are excluded from both — kind names the invocation explicitly instead of guessing from'
+echo '# outcome.'
+mkdir -p "$TDIR/home-kind"
+KINDHOME="$TDIR/home-kind"
+{
+  printf '{"ts":"2026-01-01T00:00:00+0000","pr":"1","outcome":"clean","secs":30,"pre_slot_secs":5,"post_slot_secs":25,"kind":"fresh","conc":1}\n'
+  printf '{"ts":"2026-01-01T00:01:00+0000","pr":"2","outcome":"clean","secs":40,"pre_slot_secs":8,"post_slot_secs":32,"kind":"fresh","conc":1}\n'
+  # A lock-timeout row never launches (LAUNCH_EPOCH unset): its full wait is pre_slot_secs, with
+  # post_slot_secs 0. It must join the pre-slot population (it genuinely queued, and the longest
+  # waits live here) but not distort post-slot (which stays clean-only, fresh-only).
+  printf '{"ts":"2026-01-01T00:02:00+0000","pr":"3","outcome":"lock-timeout","secs":50,"pre_slot_secs":50,"post_slot_secs":0,"kind":"fresh","conc":1}\n'
+  # A harvest row never queues (pre_slot_secs 0) and its post_slot_secs is collection time, not
+  # generation time. It must be excluded from BOTH percentile populations even though its
+  # outcome is "clean".
+  printf '{"ts":"2026-01-01T00:03:00+0000","pr":"4","outcome":"clean","secs":1,"pre_slot_secs":0,"post_slot_secs":1000,"kind":"harvest","conc":0}\n'
+} > "$KINDHOME/ledger.jsonl"
+KIND_JSON="$(PRO_GATE_HOME="$KINDHOME" bash "$STATS" 2>/dev/null | awk '/^\{$/{f=1} f')"
+check 'stats kind ledger emits valid JSON' "$(printf '%s' "$KIND_JSON" | jq empty >/dev/null 2>&1; echo $?)" "$KIND_JSON"
+# Population sorted by pre_slot_secs: [5, 8, 50] (harvest's 0 excluded) — p50 idx1=8, p95 idx2=50.
+check 'lock-timeout row included in pre_slot percentile population' \
+  "$([ "$(printf '%s' "$KIND_JSON" | jq -r .pre_slot_p50_s)" = 8 ] && [ "$(printf '%s' "$KIND_JSON" | jq -r .pre_slot_p95_s)" = 50 ]; echo $?)" "$KIND_JSON"
+# Post-slot stays clean+fresh only: [25, 32] (lock-timeout's 0 and harvest's 1000 both excluded)
+# — p50 idx1=32, p95 idx1=32.
+check 'harvest row excluded from pre_slot and post_slot percentile populations' \
+  "$([ "$(printf '%s' "$KIND_JSON" | jq -r .post_slot_p50_s)" = 32 ] && [ "$(printf '%s' "$KIND_JSON" | jq -r .post_slot_p95_s)" = 32 ]; echo $?)" "$KIND_JSON"
+# Historical rows with no kind at all must still count as fresh (v0.19-era ledger rows predate
+# the field entirely).
+printf '{"ts":"2026-01-01T00:04:00+0000","pr":"5","outcome":"clean","secs":20,"pre_slot_secs":2,"post_slot_secs":18,"conc":1}\n' >> "$KINDHOME/ledger.jsonl"
+KIND_JSON2="$(PRO_GATE_HOME="$KINDHOME" bash "$STATS" 2>/dev/null | awk '/^\{$/{f=1} f')"
+check 'missing kind field treated as fresh (historical rows still count)' \
+  "$(printf '%s' "$KIND_JSON2" | jq -e '.pre_slot_p50_s != null and .post_slot_p50_s != null' >/dev/null 2>&1; echo $?)" "$KIND_JSON2"
+rm -rf "$KINDHOME"
 
 echo '# v0.28: severity sidecar counts only OPEN findings (RESOLVED verification blocks excluded)'
 mkdir -p "$SHOME/rounds"

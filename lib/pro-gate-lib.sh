@@ -181,6 +181,16 @@ pg_dur_secs() {
   esac
 }
 
+# pg_hours_1dp <secs>: seconds -> one-decimal hour string ("3.5"), for human-facing round-budget
+# totals (ledger-timing-split R2). Bash has no float arithmetic, so this is the one shared spot —
+# every caller that needs "~X.Yh" text uses this rather than re-deriving its own rounding.
+# Garbage/negative input reads as 0.0 (a display helper never errors out a refusal message).
+pg_hours_1dp() {
+  local s="${1:-0}"
+  case "$s" in ''|*[!0-9]*) s=0;; esac
+  awk -v s="$s" 'BEGIN{printf "%.1f", s/3600}'
+}
+
 # pg_file_sig <file...>: a stable content signature over the given files, used to detect that
 # on-disk code was redeployed (the daemon's self-reload). cksum is POSIX and always present; the
 # per-file content checksum plus its path is folded into one final checksum, so a change in ANY
@@ -1215,15 +1225,15 @@ pg_round_unrecord() {
 
 # pg_round_note_severity <key> <review-file>: record the P0/P1 counts of a change's most
 # recent COMPLETED review in a sidecar ($rounds/<key>.last), and append the full per-round
-# line (epoch, verdict word, open P0, open P1, resolved, still-present) to the trajectory
-# history ($rounds/<key>.hist) the v0.31 round governor scores. .last is read back at
-# round-cap time so a capped gate can say "you are stopping WITH an open P0" (the one case a
-# human may want PRO_GATE_FORCE_ROUND=1 for). Best-effort: only keys that have recorded
+# line (epoch, verdict word, open P0, open P1, resolved, still-present, wall-clock secs) to
+# the trajectory history ($rounds/<key>.hist) the v0.31 round governor scores. .last is read
+# back at round-cap time so a capped gate can say "you are stopping WITH an open P0" (the one
+# case a human may want PRO_GATE_FORCE_ROUND=1 for). Best-effort: only keys that have recorded
 # rounds get sidecars (this also skips legacy "diff" markers on the harvest path). A lost
 # hist line (concurrent harvest completions race the rewrite) only UNDER-counts earned
 # rounds — the governor degrades toward the base grant, never past the ceiling.
 pg_round_note_severity() {
-  local key="$1" out="$2" spend_epoch="${3:-}" dir p0 p1 verdict res sp now win t rest stamp
+  local key="$1" out="$2" spend_epoch="${3:-}" dir p0 p1 verdict res sp now win t rest stamp dur
   pg_round_key_ok "$key" || return 0
   dir="$(pg_rounds_dir)"
   [ -f "$dir/$key" ] || return 0
@@ -1263,6 +1273,14 @@ pg_round_note_severity() {
   # and an unstable sort would silently reorder the trajectory it exists to keep honest.
   stamp="$spend_epoch"; case "$stamp" in ''|*[!0-9]*) stamp="$now";; esac
   [ "$stamp" -gt "$now" ] 2>/dev/null && stamp="$now"
+  # Field 7 (ledger-timing-split R2): wall-clock seconds from $stamp (the round's recorded
+  # spend epoch, stamped above) to this row being written — NOT pure generation time. On the
+  # harvest path that span includes however long the finished review sat uncollected before
+  # someone ran --harvest (bounded only by the reservation TTL); when no spend epoch was
+  # available, $stamp fell back to the marker's mint time (pg_marker_epoch), which can precede
+  # the real charge by up to two PRO_GATE_LOCK_WAIT periods. Clamped at 0 as a defensive floor;
+  # $stamp is already clamped to never exceed $now so this should never go negative.
+  dur=$(( now - stamp )); [ "$dur" -lt 0 ] 2>/dev/null && dur=0
   {
     if [ -f "$dir/$key.hist" ]; then
       while IFS= read -r t; do
@@ -1271,7 +1289,7 @@ pg_round_note_severity() {
         [ $(( now - rest )) -lt "$win" ] && printf '%s\n' "$t"
       done < "$dir/$key.hist"
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$stamp" "$verdict" "$p0" "$p1" "$res" "$sp"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$stamp" "$verdict" "$p0" "$p1" "$res" "$sp" "$dur"
   } > "$dir/$key.hist.tmp" 2>/dev/null \
     && sort -s -n -k1,1 -o "$dir/$key.hist.tmp" "$dir/$key.hist.tmp" 2>/dev/null \
     && mv -f "$dir/$key.hist.tmp" "$dir/$key.hist" 2>/dev/null \
@@ -1319,12 +1337,19 @@ pg_round_last_severity() {
 
 # pg_round_score <key>: score the in-window trajectory and resolve the governor's tunables in
 # ONE place so --status and enforcement cannot drift. Sets process globals PG_ROUND_EARNED,
-# PG_ROUND_STREAK, PG_ROUND_ARROW, PG_ROUND_BASE, PG_ROUND_CEILING, PG_ROUND_GRANT. Missing
-# history scores 0/0/"". In flat mode, GRANT is the explicit legacy cap and the trajectory
-# remains available for human-facing notes even though it does not affect enforcement.
+# PG_ROUND_STREAK, PG_ROUND_ARROW, PG_ROUND_BASE, PG_ROUND_CEILING, PG_ROUND_GRANT,
+# PG_ROUND_ELAPSED_SECS (ledger-timing-split R2: sum of field-7 wall-clock durations across the
+# in-window trajectory — a legacy 6-field row has no field 7 and contributes 0, never breaking
+# the scan), PG_ROUND_SCORED (ledger-timing-split R2: count of in-window .hist rows folded into
+# that sum — legacy and 7-field rows alike — distinct from pg_round_count's "rounds charged",
+# since a charged-but-lost round writes no .hist row at all and so is never scored here).
+# Missing history scores 0/0/""/0/0. In flat mode, GRANT is the explicit legacy cap and
+# the trajectory remains available for human-facing notes even though it does not affect
+# enforcement. Called IN-SHELL (never via command substitution) by every caller that needs these
+# globals afterward — a subshell would compute them and then drop them on exit.
 pg_round_score() {
-  local key="$1" f now win e verdict p0 p1 res sp open prev="" used
-  PG_ROUND_EARNED=0; PG_ROUND_STREAK=0; PG_ROUND_ARROW=""
+  local key="$1" f now win e verdict p0 p1 res sp dur open prev="" used
+  PG_ROUND_EARNED=0; PG_ROUND_STREAK=0; PG_ROUND_ARROW=""; PG_ROUND_ELAPSED_SECS=0; PG_ROUND_SCORED=0
   PG_ROUND_BASE="${PRO_GATE_ROUNDS_BASE:-3}"; case "$PG_ROUND_BASE" in ''|*[!0-9]*) PG_ROUND_BASE=3;; esac
   PG_ROUND_CEILING="${PRO_GATE_ROUNDS_CEILING:-8}"; case "$PG_ROUND_CEILING" in ''|*[!0-9]*) PG_ROUND_CEILING=8;; esac
   # The ceiling is the IMMOVABLE backstop: an inconsistent config clamps the BASE DOWN to it,
@@ -1338,11 +1363,14 @@ pg_round_score() {
     f="$(pg_rounds_dir)/$key.hist"
     if [ -f "$f" ]; then
       now="$(date +%s)"; win="$(pg_round_window_secs)"
-      while IFS=$'\t' read -r e verdict p0 p1 res sp; do
+      while IFS=$'\t' read -r e verdict p0 p1 res sp dur; do
         case "$e" in ''|*[!0-9]*) continue;; esac
         [ $(( now - e )) -lt "$win" ] || continue
         case "$p0" in ''|*[!0-9]*) p0=0;; esac
         case "$p1" in ''|*[!0-9]*) p1=0;; esac
+        case "$dur" in ''|*[!0-9]*) dur=0;; esac
+        PG_ROUND_ELAPSED_SECS=$(( PG_ROUND_ELAPSED_SECS + dur ))
+        PG_ROUND_SCORED=$(( PG_ROUND_SCORED + 1 ))
         open=$(( p0 + p1 ))
         if [ -n "$prev" ]; then
           if [ "$open" -lt "$prev" ]; then PG_ROUND_EARNED=$(( PG_ROUND_EARNED + 1 )); PG_ROUND_STREAK=0

@@ -361,6 +361,15 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
     pg_round_score "$k"
     k_cap="$PG_ROUND_GRANT"; k_arrow="$PG_ROUND_ARROW"; k_earned="$PG_ROUND_EARNED"
     k_streak="$PG_ROUND_STREAK"; k_braked=0
+    # ledger-timing-split R2: total wall clock spent on this change's rounds, alongside spent/cap.
+    # elapsed_h is pre-formatted here (never in jq): jq's number formatting collapses "2.0" to
+    # "2", so the human-readable string is built once, in shell, with the same pg_hours_1dp
+    # round_capped() uses, and carried through as an opaque string field.
+    k_elapsed="$PG_ROUND_ELAPSED_SECS"; k_elapsed_h="$(pg_hours_1dp "$k_elapsed")"
+    # ledger-timing-split R2: the population the elapsed hours were summed across — distinct
+    # from $spent (every charge in the window), so the rendered line can name its own scope
+    # rather than implying the hours cover every spent round.
+    k_scored="$PG_ROUND_SCORED"
     [ "$PG_ROUND_STREAK" -ge 2 ] && [ -z "${PRO_GATE_MAX_ROUNDS_PER_PR:-}" ] && k_braked=1
     rem=$(( k_cap - spent )); [ "$rem" -lt 0 ] && rem=0
     if [ "$spent" -gt 0 ] 2>/dev/null; then ST_SPENT_KEY="$k"; ST_SPENT_N="$spent"; fi
@@ -369,11 +378,12 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
         --argjson remaining "$rem" --argjson window_secs "$ST_WIN" --argjson in_flight "$k_live" \
         --arg amarker "$a_marker" --arg aout "$a_out" --arg aalive "$a_alive" --arg amode "$a_mode" \
         --arg arrow "$k_arrow" --argjson earned "$k_earned" --argjson streak "$k_streak" \
-        --argjson braked "$k_braked" \
-        '{key:$key,spent:$spent,cap:$cap,remaining:$remaining,window_secs:$window_secs,in_flight:($in_flight == 1),trajectory:(if $arrow == "" then null else $arrow end),earned:$earned,streak:$streak,churn_braked:($braked == 1),active:(if $amarker == "" and $aout == "" then null else {marker:$amarker,out:$aout,wrapper_alive:($aalive == "1"),mode:$amode} end)}' \
+        --argjson braked "$k_braked" --argjson elapsed_secs "$k_elapsed" --arg elapsed_h "$k_elapsed_h" \
+        --argjson scored "$k_scored" \
+        '{key:$key,spent:$spent,cap:$cap,remaining:$remaining,window_secs:$window_secs,in_flight:($in_flight == 1),trajectory:(if $arrow == "" then null else $arrow end),earned:$earned,streak:$streak,churn_braked:($braked == 1),elapsed_secs:$elapsed_secs,elapsed_h:$elapsed_h,scored:$scored,active:(if $amarker == "" and $aout == "" then null else {marker:$amarker,out:$aout,wrapper_alive:($aalive == "1"),mode:$amode} end)}' \
         >> "$ST_TMP/rounds.jsonl" 2>/dev/null
     else
-      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$k" "$spent" "$k_cap" "$rem" "$k_live" "$k_arrow" "$k_braked" >> "$ST_TMP/rounds.tsv"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$k" "$spent" "$k_cap" "$rem" "$k_live" "$k_arrow" "$k_braked" "$k_elapsed" "$k_scored" >> "$ST_TMP/rounds.tsv"
     fi
   done
 
@@ -487,11 +497,12 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
     echo "round budget (rolling window $(( ST_WIN / 3600 ))h, ${ST_CAP_DESC}):"
     if pg_have jq && [ -s "$ST_TMP/rounds.jsonl" ]; then
       jq -r '"  " + .key + ": \(.spent) spent, \(.remaining) remaining"
+             + "  (\(.spent) rounds; ~" + .elapsed_h + "h recorded across \(.scored) scored round(s))"
              + (if .trajectory then "  (open P0/P1 by round: " + .trajectory + ")" else "" end)
              + (if .churn_braked then "  [CHURN BRAKE: not converging — escalate instead of re-running]" else "" end)
              + (if .in_flight then "  [REVIEW RUNNING NOW]" else "" end)' "$ST_TMP/rounds.jsonl"
     else
-      awk -F'\t' '{printf "  %s: %s spent, %s remaining (cap %s)%s%s%s\n", $1, $2, $4, $3, ($6 == "" ? "" : "  (open P0/P1 by round: " $6 ")"), ($7 == 1 ? "  [CHURN BRAKE: not converging]" : ""), ($5 == 1 ? "  [REVIEW RUNNING NOW]" : "")}' "$ST_TMP/rounds.tsv" 2>/dev/null
+      awk -F'\t' '{printf "  %s: %s spent, %s remaining (cap %s)  (%s rounds; ~%.1fh recorded across %s scored round(s))%s%s%s\n", $1, $2, $4, $3, $2, ($8+0)/3600, $9, ($6 == "" ? "" : "  (open P0/P1 by round: " $6 ")"), ($7 == 1 ? "  [CHURN BRAKE: not converging]" : ""), ($5 == 1 ? "  [REVIEW RUNNING NOW]" : "")}' "$ST_TMP/rounds.tsv" 2>/dev/null
     fi
   else
     echo "round budget: nothing spent in the current window for this query"
@@ -695,6 +706,14 @@ pg_status preflight
 
 # --- v0.19: run bookkeeping for the ledger + adaptive ramp ---
 RUN_START="$(date +%s)"
+# ledger-timing-split (R1/R3): stamped once the run acquires its account slot — never at marker
+# mint or RUN_START — so pg_finish can split pre-slot lifecycle time from post-slot lifecycle
+# time without a budget or history window ever keying off a pre-lock epoch. This marks SLOT
+# ACQUISITION, not the start of model generation (browser preflight, diff retrieval/filtering
+# and prompt preparation all still lie ahead post-slot). Stays empty on any path that never
+# reaches that point (lock-timeout, preflight failure, round-cap): pg_finish then counts the
+# run's whole life as pre_slot_secs with post_slot_secs 0.
+LAUNCH_EPOCH=""
 SALVAGED=0
 EFF_CONC=0
 PG_RESULT_DURABLE=0
@@ -996,12 +1015,48 @@ pg_organize_chat() {  # rename|finalize [early-lease] [diagnostic-log] [helper-s
 }
 
 pg_finish() {  # $1 exit code — settle organization, ramp, and ledger exactly once, then exit
-  local rc="$1" outcome dur line model_label fsrc title_memo=""
+  local rc="$1" outcome dur now pre_slot_secs post_slot_secs kind line model_label fsrc title_memo=""
   # Revoke every sleeping early organizer before anything at the terminal boundary can settle.
   # Every path below then acquires the marker lock — either to mutate or only to join — so no
   # helper can keep scanning/rendering after the parent records its final account state.
   rm -f "$WORK"/early-organizer.*.lease 2>/dev/null || true
-  dur=$(( $(date +%s) - RUN_START ))
+  now="$(date +%s)"
+  dur=$(( now - RUN_START ))
+  # RUN_START and now are two independent `date +%s` samples possibly minutes apart; an NTP
+  # correction or WSL suspend/resume between them can make dur negative. Clamp FIRST, before any
+  # branch below reads it, so a backward clock jump can never write a negative `secs` OR break
+  # the pre/post split that's derived from this same clamped value.
+  [ "$dur" -lt 0 ] 2>/dev/null && dur=0
+  # ledger-timing-split (R1/R3): split `secs` (unchanged, kept for backward compatibility) into
+  # pre_slot_secs (this run's life before it held an account slot) and post_slot_secs (its life
+  # after), by field name. LAUNCH_EPOCH marks SLOT ACQUISITION, not the start of model
+  # generation: RUN_START precedes browser preflight, diff retrieval/filtering and prompt
+  # preparation; the post-slot health gate can still exit 8 without ever invoking the model; and
+  # retry backoff plus salvage land after LAUNCH_EPOCH too. So these fields measure pre-slot vs.
+  # post-slot lifecycle time, NOT queue-wait vs. model-generation time — name and comment say so
+  # plainly to avoid overclaiming. A harvest never queues for a slot at all — it reads an
+  # existing/in-progress conversation over CDP — so its pre_slot_secs is always 0 and
+  # post_slot_secs is this invocation's own short wall time (collection, not generation); that
+  # semantic is DOCUMENTED here rather than reconstructed from a phase epoch harvest never has. A
+  # fresh run that reached "launching" (LAUNCH_EPOCH set) splits at that phase transition; one
+  # that never did (lock-timeout, preflight failure, round-cap) records its whole life as
+  # pre_slot_secs with post_slot_secs 0. The partition is exact BY CONSTRUCTION, not by
+  # independent defensive floors on each side: post_slot_secs is always derived from the
+  # already-clamped dur minus the clamped pre_slot_secs, so pre_slot_secs + post_slot_secs ==
+  # secs holds under every clock condition.
+  kind="fresh"; [ "${HARVEST:-0}" = 1 ] && kind="harvest"
+  if [ "${HARVEST:-0}" = 1 ]; then
+    pre_slot_secs=0
+    post_slot_secs=$dur
+  elif [ -n "$LAUNCH_EPOCH" ]; then
+    pre_slot_secs=$(( LAUNCH_EPOCH - RUN_START ))
+    [ "$pre_slot_secs" -lt 0 ] 2>/dev/null && pre_slot_secs=0
+    [ "$pre_slot_secs" -gt "$dur" ] 2>/dev/null && pre_slot_secs=$dur
+    post_slot_secs=$(( dur - pre_slot_secs ))
+  else
+    pre_slot_secs=$dur
+    post_slot_secs=0
+  fi
   model_label="$(pg_model_label "${RESOLVED_MODEL:-}")"   # resolved model or role-based fallback
 
   # v0.28 (#56): a clean run's review becomes the write-once completed artifact before any
@@ -1092,15 +1147,17 @@ pg_finish() {  # $1 exit code — settle organization, ramp, and ledger exactly 
   if pg_have jq; then
     line="$(jq -nc --arg ts "$(date +%Y-%m-%dT%H:%M:%S%z)" --arg pr "${PR_NUM:-diff}" \
       --arg repo "${REPO:-}" --argjson exit "$rc" --arg outcome "$outcome" \
-      --argjson secs "$dur" --argjson attempts "${attempt:-0}" \
+      --argjson secs "$dur" --argjson pre_slot_secs "$pre_slot_secs" --argjson post_slot_secs "$post_slot_secs" \
+      --arg kind "$kind" \
+      --argjson attempts "${attempt:-0}" \
       --argjson conc "${EFF_CONC:-0}" --argjson ceiling "${MAX_CONC:-1}" \
       --argjson live "${LIVE_CONVERSATION:-0}" --argjson salvaged "${SALVAGED:-0}" \
       --argjson diff_lines "${DIFF_LINES:-0}" --arg out "$OUT" --arg model "$model_label" \
       --arg marker "${RUN_MARKER:-}" --arg round_key "${ROUND_KEY:-}" --arg sha256 "$OUT_SHA" \
-      '{ts:$ts,pr:$pr,repo:$repo,exit:$exit,outcome:$outcome,secs:$secs,attempts:$attempts,conc:$conc,ceiling:$ceiling,live:$live,salvaged:$salvaged,diff_lines:$diff_lines,out:$out,model:$model,marker:$marker,round_key:$round_key,sha256:$sha256}' 2>/dev/null)"
+      '{ts:$ts,pr:$pr,repo:$repo,exit:$exit,outcome:$outcome,secs:$secs,pre_slot_secs:$pre_slot_secs,post_slot_secs:$post_slot_secs,kind:$kind,attempts:$attempts,conc:$conc,ceiling:$ceiling,live:$live,salvaged:$salvaged,diff_lines:$diff_lines,out:$out,model:$model,marker:$marker,round_key:$round_key,sha256:$sha256}' 2>/dev/null)"
   else
-    line="$(printf '{"ts":"%s","pr":"%s","exit":%d,"outcome":"%s","secs":%d,"attempts":%d,"conc":%d,"ceiling":%d,"live":%d,"salvaged":%d,"out":"%s","model":"%s","marker":"%s","round_key":"%s","sha256":"%s"}' \
-      "$(date +%Y-%m-%dT%H:%M:%S%z)" "${PR_NUM:-diff}" "$rc" "$outcome" "$dur" "${attempt:-0}" \
+    line="$(printf '{"ts":"%s","pr":"%s","exit":%d,"outcome":"%s","secs":%d,"pre_slot_secs":%d,"post_slot_secs":%d,"kind":"%s","attempts":%d,"conc":%d,"ceiling":%d,"live":%d,"salvaged":%d,"out":"%s","model":"%s","marker":"%s","round_key":"%s","sha256":"%s"}' \
+      "$(date +%Y-%m-%dT%H:%M:%S%z)" "${PR_NUM:-diff}" "$rc" "$outcome" "$dur" "$pre_slot_secs" "$post_slot_secs" "$kind" "${attempt:-0}" \
       "${EFF_CONC:-0}" "${MAX_CONC:-1}" "${LIVE_CONVERSATION:-0}" "${SALVAGED:-0}" \
       "$(printf '%s' "$OUT" | tr -d '"\\' | tr '\n' ' ')" \
       "$(printf '%s' "$model_label" | tr -d '"\\' | tr '\n' ' ')" \
@@ -1869,11 +1926,22 @@ round_capped() {  # $1 = reason
   # reviewer's own claims, exactly the signal observed to oscillate across rounds), but a cap
   # hit while the change's LAST completed review reported P0s is the one case a human may
   # want to grant PRO_GATE_FORCE_ROUND=1, so say it loudly instead of burying it.
-  local sev="" last_p0="" last_p1="" note="" pfd inflight=0
+  local sev="" last_p0="" last_p1="" note="" pfd inflight=0 used elapsed_h totals
   if sev="$(pg_round_last_severity "$ROUND_KEY")"; then
     last_p0="${sev%% *}"; last_p1="${sev##* }"
     note="; last completed review: ${last_p0} P0 / ${last_p1} P1 unconfirmed by a re-review"
   fi
+  # ledger-timing-split R2: state rounds used + total wall clock spent on this change alongside
+  # the severity note above. pg_round_guard's refusal ($1) already carries the scored
+  # trajectory, but it ran as "ROUND_REASON=\"\$(pg_round_guard ...)\"" — a command
+  # substitution — so the PG_ROUND_* globals it set are gone by the time we get here (same
+  # pitfall the --status renderer's "score IN THIS SHELL" comment guards against). Re-score
+  # directly, in-shell, rather than re-deriving totals from $1's text.
+  pg_round_score "$ROUND_KEY"
+  used="$(pg_round_count "$ROUND_KEY")"
+  elapsed_h="$(pg_hours_1dp "$PG_ROUND_ELAPSED_SECS")"
+  totals="${used} rounds; ~${elapsed_h}h recorded across ${PG_ROUND_SCORED} scored round(s)"
+  note="${note}; ${totals}"
   # pg_round_guard's refusal already carries the scored trajectory. Do not re-read .hist here:
   # the reason becomes the status detail below, and a second parse can only duplicate I/O.
   # Non-blocking probe: a same-change run holding the per-change lock right now means the
@@ -1892,8 +1960,12 @@ round_capped() {  # $1 = reason
   elif [ -d "${LOCKFILE}.pr-${ROUND_KEY}.d" ]; then
     inflight=1
   fi
-  [ "$inflight" = 1 ] && [ -n "$note" ] && note="${note} (a same-change review is in flight NOW: re-check this note after it completes)"
+  # Gated on $sev (a SEVERITY claim is being shown), not on $note: since the totals summary
+  # above is now appended unconditionally, $note is never empty and would otherwise always
+  # pass this check regardless of whether a severity claim is present.
+  [ "$inflight" = 1 ] && [ -n "$sev" ] && note="${note} (a same-change review is in flight NOW: re-check this note after it completes)"
   echo "ERROR: ${1}; not spending another Pro review slot on this change." >&2
+  echo "  ${totals}." >&2
   if [ "${last_p0:-0}" -gt 0 ] 2>/dev/null; then
     echo "  ATTENTION: OPEN P0. The most recent completed review reported ${last_p0} P0 finding(s) that no re-review has confirmed fixed. If the fixes have landed, this is the case PRO_GATE_FORCE_ROUND=1 exists for: surface it to a human now." >&2
     [ "$inflight" = 1 ] && echo "  (A same-change review is in flight right now; wait for it before deciding, its result may already settle these.)" >&2
@@ -2024,6 +2096,9 @@ if [ "$SLOT_OK" != 1 ]; then
   pg_status failed "slot timeout"
   pg_finish 7
 fi
+# ledger-timing-split (R1/R3): the run leaves the queue HERE — a slot is held, not yet
+# generating. One site, hit exactly once per invocation (retries below reuse this same slot).
+LAUNCH_EPOCH="$(date +%s)"
 
 # The oracle CLI's own --timeout has been observed NOT to fire while it waits on a ChatGPT
 # tab that never starts thinking (a "dead submission" squatted a browser slot for 3.5h on

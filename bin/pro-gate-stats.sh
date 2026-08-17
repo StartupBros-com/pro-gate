@@ -2,8 +2,13 @@
 # pro-gate-stats.sh — observability over the run ledger + ramp governor (v0.19).
 #
 # The engine appends one JSON line per finished/deferred run to $PRO_GATE_HOME/ledger.jsonl
-# (fields: ts, pr, repo, exit, outcome, secs, attempts, conc, ceiling, live, salvaged,
-# diff_lines, out) and the ramp governor keeps its level in $PRO_GATE_HOME/ramp.state.
+# (fields: ts, pr, repo, exit, outcome, secs, pre_slot_secs, post_slot_secs, kind, attempts,
+# conc, ceiling, live, salvaged, diff_lines, out) and the ramp governor keeps its level in
+# $PRO_GATE_HOME/ramp.state. pre_slot_secs/post_slot_secs (ledger-timing-split) split `secs`
+# into this run's life before vs. after it held an account slot — NOT queue-wait vs.
+# model-generation time (LAUNCH_EPOCH marks slot acquisition, not generation start); older rows
+# lack them, and every consumer below tolerates that. `kind` names the invocation ("fresh" or
+# "harvest"); rows from before this field existed have no `kind` and are treated as "fresh".
 # This tool answers "is raising concurrency causing trouble?" at a glance.
 #
 # Usage: pro-gate-stats.sh [--tail N] [--since ISO-DATE] [--pr N] [--json]
@@ -86,6 +91,10 @@ jq -s "[.[] | $FILTER] | {
   salvage_rate_pct: (if length > 0 then (100 * ([.[] | select(.salvaged == 1)] | length) / length | floor) else null end),
   duration_p50_s: ([.[] | select(.outcome == \"clean\") | .secs] | sort | if length > 0 then .[(length / 2 | floor)] else null end),
   duration_p95_s: ([.[] | select(.outcome == \"clean\") | .secs] | sort | if length > 0 then .[((length * 95 / 100) | floor)] else null end),
+  pre_slot_p50_s: ([.[] | select((.kind // \"fresh\") == \"fresh\" and (.outcome == \"clean\" or .outcome == \"lock-timeout\")) | (.pre_slot_secs // empty)] | sort | if length > 0 then .[(length / 2 | floor)] else null end),
+  pre_slot_p95_s: ([.[] | select((.kind // \"fresh\") == \"fresh\" and (.outcome == \"clean\" or .outcome == \"lock-timeout\")) | (.pre_slot_secs // empty)] | sort | if length > 0 then .[((length * 95 / 100) | floor)] else null end),
+  post_slot_p50_s: ([.[] | select((.kind // \"fresh\") == \"fresh\" and .outcome == \"clean\") | (.post_slot_secs // empty)] | sort | if length > 0 then .[(length / 2 | floor)] else null end),
+  post_slot_p95_s: ([.[] | select((.kind // \"fresh\") == \"fresh\" and .outcome == \"clean\") | (.post_slot_secs // empty)] | sort | if length > 0 then .[((length * 95 / 100) | floor)] else null end),
   by_concurrency: (group_by(.conc) | map({level: .[0].conc, runs: length,
     clean: ([.[] | select(.outcome == \"clean\")] | length),
     throttle: ([.[] | select(.outcome == \"throttle\")] | length)}))
