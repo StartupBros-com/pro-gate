@@ -706,11 +706,13 @@ pg_status preflight
 
 # --- v0.19: run bookkeeping for the ledger + adaptive ramp ---
 RUN_START="$(date +%s)"
-# ledger-timing-split (R1/R3): stamped once the run leaves the queue (slot acquired, generation
-# about to start) — never at marker mint or RUN_START — so pg_finish can split queue wait from
-# generation time without a budget or history window ever keying off a pre-lock epoch. Stays
-# empty on any path that never reaches that point (lock-timeout, preflight failure, round-cap):
-# pg_finish then counts the run's whole life as queue_secs with run_secs 0.
+# ledger-timing-split (R1/R3): stamped once the run acquires its account slot — never at marker
+# mint or RUN_START — so pg_finish can split pre-slot lifecycle time from post-slot lifecycle
+# time without a budget or history window ever keying off a pre-lock epoch. This marks SLOT
+# ACQUISITION, not the start of model generation (browser preflight, diff retrieval/filtering
+# and prompt preparation all still lie ahead post-slot). Stays empty on any path that never
+# reaches that point (lock-timeout, preflight failure, round-cap): pg_finish then counts the
+# run's whole life as pre_slot_secs with post_slot_secs 0.
 LAUNCH_EPOCH=""
 SALVAGED=0
 EFF_CONC=0
@@ -1013,35 +1015,47 @@ pg_organize_chat() {  # rename|finalize [early-lease] [diagnostic-log] [helper-s
 }
 
 pg_finish() {  # $1 exit code — settle organization, ramp, and ledger exactly once, then exit
-  local rc="$1" outcome dur now queue_secs run_secs line model_label fsrc title_memo=""
+  local rc="$1" outcome dur now pre_slot_secs post_slot_secs kind line model_label fsrc title_memo=""
   # Revoke every sleeping early organizer before anything at the terminal boundary can settle.
   # Every path below then acquires the marker lock — either to mutate or only to join — so no
   # helper can keep scanning/rendering after the parent records its final account state.
   rm -f "$WORK"/early-organizer.*.lease 2>/dev/null || true
   now="$(date +%s)"
   dur=$(( now - RUN_START ))
+  # RUN_START and now are two independent `date +%s` samples possibly minutes apart; an NTP
+  # correction or WSL suspend/resume between them can make dur negative. Clamp FIRST, before any
+  # branch below reads it, so a backward clock jump can never write a negative `secs` OR break
+  # the pre/post split that's derived from this same clamped value.
+  [ "$dur" -lt 0 ] 2>/dev/null && dur=0
   # ledger-timing-split (R1/R3): split `secs` (unchanged, kept for backward compatibility) into
-  # queue_secs (waiting for a lock/slot) and run_secs (actual generation), by field name, always
-  # summing back to `secs` exactly. A harvest never queues for a slot at all — it reads an
-  # existing/in-progress conversation over CDP — so its queue_secs is always 0 and run_secs is
-  # this invocation's own short wall time (collection, not generation); that semantic is
-  # DOCUMENTED here rather than reconstructed from a generation epoch harvest never has. A fresh
-  # run that reached "launching" (LAUNCH_EPOCH set) splits at that phase transition; one that
-  # never did (lock-timeout, preflight failure, round-cap) records its whole life as
-  # queue_secs with run_secs 0.
+  # pre_slot_secs (this run's life before it held an account slot) and post_slot_secs (its life
+  # after), by field name. LAUNCH_EPOCH marks SLOT ACQUISITION, not the start of model
+  # generation: RUN_START precedes browser preflight, diff retrieval/filtering and prompt
+  # preparation; the post-slot health gate can still exit 8 without ever invoking the model; and
+  # retry backoff plus salvage land after LAUNCH_EPOCH too. So these fields measure pre-slot vs.
+  # post-slot lifecycle time, NOT queue-wait vs. model-generation time — name and comment say so
+  # plainly to avoid overclaiming. A harvest never queues for a slot at all — it reads an
+  # existing/in-progress conversation over CDP — so its pre_slot_secs is always 0 and
+  # post_slot_secs is this invocation's own short wall time (collection, not generation); that
+  # semantic is DOCUMENTED here rather than reconstructed from a phase epoch harvest never has. A
+  # fresh run that reached "launching" (LAUNCH_EPOCH set) splits at that phase transition; one
+  # that never did (lock-timeout, preflight failure, round-cap) records its whole life as
+  # pre_slot_secs with post_slot_secs 0. The partition is exact BY CONSTRUCTION, not by
+  # independent defensive floors on each side: post_slot_secs is always derived from the
+  # already-clamped dur minus the clamped pre_slot_secs, so pre_slot_secs + post_slot_secs ==
+  # secs holds under every clock condition.
+  kind="fresh"; [ "${HARVEST:-0}" = 1 ] && kind="harvest"
   if [ "${HARVEST:-0}" = 1 ]; then
-    queue_secs=0
-    run_secs=$dur
+    pre_slot_secs=0
+    post_slot_secs=$dur
   elif [ -n "$LAUNCH_EPOCH" ]; then
-    # RUN_START, LAUNCH_EPOCH, and now are three independent `date +%s` samples minutes apart;
-    # an NTP correction or WSL suspend/resume between them can make either difference negative.
-    # Clamp at 0 (same defensive floor as pg_round_note_severity's $dur) so a backward clock
-    # jump never writes a negative duration into the ledger or the stats percentile sort.
-    queue_secs=$(( LAUNCH_EPOCH - RUN_START )); [ "$queue_secs" -lt 0 ] 2>/dev/null && queue_secs=0
-    run_secs=$(( now - LAUNCH_EPOCH )); [ "$run_secs" -lt 0 ] 2>/dev/null && run_secs=0
+    pre_slot_secs=$(( LAUNCH_EPOCH - RUN_START ))
+    [ "$pre_slot_secs" -lt 0 ] 2>/dev/null && pre_slot_secs=0
+    [ "$pre_slot_secs" -gt "$dur" ] 2>/dev/null && pre_slot_secs=$dur
+    post_slot_secs=$(( dur - pre_slot_secs ))
   else
-    queue_secs=$dur
-    run_secs=0
+    pre_slot_secs=$dur
+    post_slot_secs=0
   fi
   model_label="$(pg_model_label "${RESOLVED_MODEL:-}")"   # resolved model or role-based fallback
 
@@ -1133,16 +1147,17 @@ pg_finish() {  # $1 exit code — settle organization, ramp, and ledger exactly 
   if pg_have jq; then
     line="$(jq -nc --arg ts "$(date +%Y-%m-%dT%H:%M:%S%z)" --arg pr "${PR_NUM:-diff}" \
       --arg repo "${REPO:-}" --argjson exit "$rc" --arg outcome "$outcome" \
-      --argjson secs "$dur" --argjson queue_secs "$queue_secs" --argjson run_secs "$run_secs" \
+      --argjson secs "$dur" --argjson pre_slot_secs "$pre_slot_secs" --argjson post_slot_secs "$post_slot_secs" \
+      --arg kind "$kind" \
       --argjson attempts "${attempt:-0}" \
       --argjson conc "${EFF_CONC:-0}" --argjson ceiling "${MAX_CONC:-1}" \
       --argjson live "${LIVE_CONVERSATION:-0}" --argjson salvaged "${SALVAGED:-0}" \
       --argjson diff_lines "${DIFF_LINES:-0}" --arg out "$OUT" --arg model "$model_label" \
       --arg marker "${RUN_MARKER:-}" --arg round_key "${ROUND_KEY:-}" --arg sha256 "$OUT_SHA" \
-      '{ts:$ts,pr:$pr,repo:$repo,exit:$exit,outcome:$outcome,secs:$secs,queue_secs:$queue_secs,run_secs:$run_secs,attempts:$attempts,conc:$conc,ceiling:$ceiling,live:$live,salvaged:$salvaged,diff_lines:$diff_lines,out:$out,model:$model,marker:$marker,round_key:$round_key,sha256:$sha256}' 2>/dev/null)"
+      '{ts:$ts,pr:$pr,repo:$repo,exit:$exit,outcome:$outcome,secs:$secs,pre_slot_secs:$pre_slot_secs,post_slot_secs:$post_slot_secs,kind:$kind,attempts:$attempts,conc:$conc,ceiling:$ceiling,live:$live,salvaged:$salvaged,diff_lines:$diff_lines,out:$out,model:$model,marker:$marker,round_key:$round_key,sha256:$sha256}' 2>/dev/null)"
   else
-    line="$(printf '{"ts":"%s","pr":"%s","exit":%d,"outcome":"%s","secs":%d,"queue_secs":%d,"run_secs":%d,"attempts":%d,"conc":%d,"ceiling":%d,"live":%d,"salvaged":%d,"out":"%s","model":"%s","marker":"%s","round_key":"%s","sha256":"%s"}' \
-      "$(date +%Y-%m-%dT%H:%M:%S%z)" "${PR_NUM:-diff}" "$rc" "$outcome" "$dur" "$queue_secs" "$run_secs" "${attempt:-0}" \
+    line="$(printf '{"ts":"%s","pr":"%s","exit":%d,"outcome":"%s","secs":%d,"pre_slot_secs":%d,"post_slot_secs":%d,"kind":"%s","attempts":%d,"conc":%d,"ceiling":%d,"live":%d,"salvaged":%d,"out":"%s","model":"%s","marker":"%s","round_key":"%s","sha256":"%s"}' \
+      "$(date +%Y-%m-%dT%H:%M:%S%z)" "${PR_NUM:-diff}" "$rc" "$outcome" "$dur" "$pre_slot_secs" "$post_slot_secs" "$kind" "${attempt:-0}" \
       "${EFF_CONC:-0}" "${MAX_CONC:-1}" "${LIVE_CONVERSATION:-0}" "${SALVAGED:-0}" \
       "$(printf '%s' "$OUT" | tr -d '"\\' | tr '\n' ' ')" \
       "$(printf '%s' "$model_label" | tr -d '"\\' | tr '\n' ' ')" \
