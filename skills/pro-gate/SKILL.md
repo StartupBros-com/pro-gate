@@ -214,11 +214,16 @@ in the background:
 
 ```bash
 sleep 5
-# Record the marker in your own notes/turn text: it is the run's durable handle. --wait "$OUT"
-# is enough right now, but a later session (or one that lost this shell) re-attaches for free
-# with --wait "$MARKER", and --harvest takes the marker too.
+# Record the marker in your own notes/turn text: it is the run's durable handle — a later
+# session (or one that lost this shell) re-attaches for free with the same command, and
+# --harvest takes the marker too. Wait on the MARKER, not the bare --out path: --out is a
+# fixed file reused across every round of the same change, so a wait armed on the bare path
+# can pick up a PRIOR round's stale terminal status if it starts before this round's own
+# status write lands there. (Convenience: `--wait "$OUT"` also works and skips the marker
+# lookup, but only trust it when you're certain no earlier round's terminal status could
+# still be sitting at that path — the marker form is unambiguous.)
 MARKER="$(jq -r '.marker // empty' "$OUT.status" 2>/dev/null)"
-"${PRO_GATE_HOME:-$HOME/.pro-review-daemon}"/oracle-review.sh --wait "$OUT" --timeout 14400
+"${PRO_GATE_HOME:-$HOME/.pro-review-daemon}"/oracle-review.sh --wait "$MARKER" --timeout 14400
 ```
 
 Run `--wait` with `run_in_background: true` and end your turn — the harness wakes you when it
@@ -227,7 +232,7 @@ safe to run again (any session, any time) if you lose track of one. Real wall ti
 (ledger p90 ≈ 47 min); the default `--timeout` (14400s = 4h) comfortably covers the worst-case
 envelope (two lock waits, generation, retries, salvage), so a single `--wait` call normally
 spans the whole run. If you are the headless daemon or another caller whose own tool-call cap is
-shorter than that, chunk it: loop `--wait "$OUT" --timeout <chunk>`, re-arming on the timeout
+shorter than that, chunk it: loop `--wait "$MARKER" --timeout <chunk>`, re-arming on the timeout
 exit and escalating on the lost-observability exit (see the exit-code table below).
 
 `--wait` exits when the run reaches a terminal phase (or the marker resolves to one via

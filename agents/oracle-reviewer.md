@@ -91,16 +91,21 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
      --input <both|bundle|connector> --out "$OUT" --timeout 30m &
    disown
    sleep 5
-   "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --wait "$OUT" --timeout 14400
+   MARKER="$(jq -r '.marker // empty' "$OUT.status" 2>/dev/null)"
+   "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --wait "$MARKER" --timeout 14400
    ```
    Run the `--wait` call with `run_in_background: true`; the harness wakes you when it exits.
    `--wait` is read-only (never launches, harvests, or mutates state) and blocks until the run
    reaches a terminal phase, then prints the final status JSON — safe to re-run any time you lose
-   track of one. If your own tool-call cap is shorter than the run's worst-case envelope, chunk
-   it: loop `--wait "$OUT" --timeout <chunk>`, re-arming on exit 20 (timeout, healthy) and
-   escalating on exit 21 (lost observability) rather than assuming the bare 10-30 min happy path.
-   `next_action` in the printed JSON names exactly what to do next (see step 3's exit-code list
-   below for the full taxonomy).
+   track of one. Wait on the MARKER, not the bare `--out` path: `--out` is a fixed file reused
+   across every round of the same change, so a wait armed on the bare path can pick up a PRIOR
+   round's stale terminal status if it starts before this round's own status write lands there.
+   (`--wait "$OUT"` also works and skips the marker lookup, but only trust it when you're certain
+   no earlier round's terminal status could still be sitting at that path.) If your own tool-call
+   cap is shorter than the run's worst-case envelope, chunk it: loop `--wait "$MARKER" --timeout
+   <chunk>`, re-arming on exit 20 (timeout, healthy) and escalating on exit 21 (lost
+   observability) rather than assuming the bare 10-30 min happy path. `next_action` in the printed
+   JSON names exactly what to do next (see step 3's exit-code list below for the full taxonomy).
 
    **Degradation path**, if `--wait` is unavailable or you lost the marker/status file
    (compaction, new session): the engine still writes single-line JSON to `$OUT.status` at every

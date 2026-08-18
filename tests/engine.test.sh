@@ -3129,8 +3129,16 @@ W2RC=$?
 W2_T1=$(date +%s)
 check 'AE2: completed-store marker returns immediately with exit 0' "$([ "$W2RC" -eq 0 ]; echo $?)" "rc=$W2RC $(cat "$TDIR/w2.err")"
 check 'AE2: returns fast, no poll-interval wait spent' "$([ $(( W2_T1 - W2_T0 )) -le 3 ]; echo $?)" "elapsed=$(( W2_T1 - W2_T0 ))s"
-check 'AE2: synthesized JSON carries the marker and a collect harvest command' \
-  "$(jq -e --arg m "$W2MARKER" '.terminal==true and .marker==$m and .next_action.wait_class=="collect"' "$TDIR/w2.out" >/dev/null 2>&1; echo $?)" "$(cat "$TDIR/w2.out")"
+check 'AE2: synthesized JSON carries the marker and wait_class=verdict (already collected, nothing to harvest)' \
+  "$(jq -e --arg m "$W2MARKER" '.terminal==true and .marker==$m and .next_action.wait_class=="verdict"' "$TDIR/w2.out" >/dev/null 2>&1; echo $?)" "$(cat "$TDIR/w2.out")"
+# regression (gate finding P2, FIX 5): a completed-artifact next_action.cmd used to be a literal
+# "--harvest '...' --out <file>" string — not executable as-is (the "<file>" placeholder is not
+# a real path). result already names the artifact directly, so cmd must now be EMPTY (a caller
+# acting on next_action.cmd verbatim has nothing to run, by design, and reads result instead).
+check 'FIX5: completed-artifact next_action.cmd is directly executable — empty, never a "<...>" placeholder' \
+  "$(jq -e '(.next_action.cmd == "") and ((.next_action.cmd | contains("<")) | not)' "$TDIR/w2.out" >/dev/null 2>&1; echo $?)" "$(cat "$TDIR/w2.out")"
+check 'FIX5: result names the artifact path directly' \
+  "$(jq -e '.result | length > 0' "$TDIR/w2.out" >/dev/null 2>&1; echo $?)" "$(cat "$TDIR/w2.out")"
 
 echo '# scenario 3 (AE9): no status file yet is non-terminal, never a false verdict; proceeds once it appears'
 W3HOME="$TDIR/home-wait3"; mkdir -p "$W3HOME/in-progress"
@@ -3406,5 +3414,140 @@ lh_case "pg-run-lh2-1700002400-2" in-progress 0 collect "in-progress"
 lh_case "pg-run-lh3-1700002400-3" deferred 0 recover "deferred"
 lh_case "pg-run-lh4-1700002400-4" round-capped 0 recover "round-capped"
 lh_case "pg-run-lh5-1700002400-5" bad-repo 0 verdict "other/failed"
+
+####################################################################################################
+# Terminal ChatGPT-Pro gate findings (2026-08-17/18), regression coverage. Six confirmed P1/P2
+# bugs in the --wait implementation above; each check here is written to FAIL against the
+# pre-fix code (verified by running this same file against a read-only git-show extraction of
+# HEAD's bin/oracle-review.sh, i.e. the state before this session's fixes — see the session
+# REPORT for the exact pass/fail counts of that run) and PASS against the fixed working tree.
+####################################################################################################
+echo '# gate P1 regression 1 (wait_resolve_marker / FIX 1): a marker with ONLY an active-index record'
+echo '# (no reservation, no ledger row, no completed artifact yet) must keep polling, never a false exit 2'
+RT1_HOME="$TDIR/home-rt1"; mkdir -p "$RT1_HOME/active"
+RT1_KEY="rt1fix"
+RT1_MARKER="pg-run-${RT1_KEY}-1700003000-31"
+RT1_OUT="$TDIR/rt1.md"
+sleep 30 & RT1_LIVEPID=$!
+printf '%s\t%s\t%s\t%s\n' "$RT1_MARKER" "$RT1_OUT" "$RT1_LIVEPID" "$(date +%s)" > "$RT1_HOME/active/$RT1_KEY"
+PRO_GATE_HOME="$RT1_HOME" PRO_GATE_WAIT_POLL_SECS=1 "$ENGINE" --wait "$RT1_MARKER" --timeout 10 \
+  >"$TDIR/rt1.out" 2>"$TDIR/rt1.err" &
+RT1_WAITPID=$!
+sleep 1.5
+kill -0 "$RT1_WAITPID" 2>/dev/null
+check 'FIX1: active-index-only marker (no reservation/ledger/artifact anywhere) keeps polling, never a false exit 2' \
+  "$?" "wait pid=$RT1_WAITPID (expected still running; pre-fix this exits 2 almost instantly)"
+# Let the run actually reach a verdict: write its terminal status at the active record's own out
+# path, then clear the active record the way pg_finish would.
+printf '{"phase":"done","attempt":1,"detail":"","pr":"","out":"%s","ts":"%s","marker":"%s","model":"gpt-5","model_warn":"","result":"%s","terminal":true,"next_action":{"cmd":"","terminal":true,"wait_class":"verdict"}}\n' \
+  "$RT1_OUT" "$(date +%Y-%m-%dT%H:%M:%S%z)" "$RT1_MARKER" "$RT1_OUT" > "$RT1_OUT.status"
+kill "$RT1_LIVEPID" 2>/dev/null; wait "$RT1_LIVEPID" 2>/dev/null
+rm -f "$RT1_HOME/active/$RT1_KEY"
+wait "$RT1_WAITPID"; RT1RC=$?
+check 'FIX1: once the active-only run reaches a status file and the record clears, --wait exits 0 with the verdict' \
+  "$([ "$RT1RC" -eq 0 ]; echo $?)" "rc=$RT1RC $(cat "$TDIR/rt1.err")"
+check 'FIX1: prints the correct marker' \
+  "$(jq -e --arg m "$RT1_MARKER" '.marker==$m' "$TDIR/rt1.out" >/dev/null 2>&1; echo $?)" "$(cat "$TDIR/rt1.out")"
+echo '# (exit 2 remains correct when NOTHING exists anywhere — already covered by the "unknown marker exits 2" scenario above)'
+
+echo '# gate P1 regression 2 (pg_state_resolve dynamic scoping / FIX 2): a settle-loop target key must'
+echo '# not be clobbered when MULTIPLE active-run keys exist and a non-target key sorts last'
+RT2_HOME="$TDIR/home-rt2"; mkdir -p "$RT2_HOME/active"
+RT2_MARKER="pg-run-aaaclobber-1700003200-33"
+RT2_OUT="$TDIR/rt2.md"
+sleep 30 & RT2_LIVEPID=$!
+# Target key "aaaclobber" sorts FIRST; a decoy key "zzzclobber" sorts LAST in the active/* glob
+# (and therefore last in pg_state_resolve's own $ST_KEYS iteration). Pre-fix, pg_state_resolve's
+# unlocalized `k` loop variable clobbers wait_settle_terminal's caller-side `k` (the parsed
+# target round key, via bash dynamic scoping) to whatever key that loop visited LAST — even
+# though only the TARGET key's own active record is actually live, corrupting the comparison.
+printf '%s\t%s\t%s\t%s\n' "$RT2_MARKER" "$RT2_OUT" "$RT2_LIVEPID" "$(date +%s)" \
+  > "$RT2_HOME/active/aaaclobber"
+printf 'pg-run-zzzclobber-1699999000-9\t%s\t1\t%s\n' "$TDIR/rt2-decoy.md" "$(date +%s)" \
+  > "$RT2_HOME/active/zzzclobber"
+printf '{"phase":"done","attempt":1,"detail":"","pr":"","out":"%s","ts":"%s","marker":"%s","model":"gpt-5","model_warn":"","result":"%s","terminal":true,"next_action":{"cmd":"","terminal":true,"wait_class":"verdict"}}\n' \
+  "$RT2_OUT" "$(date +%Y-%m-%dT%H:%M:%S%z)" "$RT2_MARKER" "$RT2_OUT" > "$RT2_OUT.status"
+PRO_GATE_HOME="$RT2_HOME" PRO_GATE_WAIT_POLL_SECS=1 "$ENGINE" --wait "$RT2_OUT" --timeout 30 \
+  >"$TDIR/rt2.out" 2>"$TDIR/rt2.err" &
+RT2_WAITPID=$!
+sleep 2
+kill -0 "$RT2_WAITPID" 2>/dev/null
+check 'FIX2: settle keeps waiting on the TARGET key with a differently-keyed decoy active record present (no dynamic-scoping clobber)' \
+  "$?" "wait pid=$RT2_WAITPID (expected still running; a clobbered target key exits immediately instead of waiting)"
+kill "$RT2_LIVEPID" 2>/dev/null; wait "$RT2_LIVEPID" 2>/dev/null
+rm -f "$RT2_HOME/active/aaaclobber"
+wait "$RT2_WAITPID"; RT2RC=$?
+check 'FIX2: --wait exits 0 once the target active record actually clears' "$([ "$RT2RC" -eq 0 ]; echo $?)" "rc=$RT2RC $(cat "$TDIR/rt2.err")"
+check 'FIX2: prints the terminal JSON for the correct target marker' \
+  "$(jq -e --arg m "$RT2_MARKER" '.terminal==true and .marker==$m' "$TDIR/rt2.out" >/dev/null 2>&1; echo $?)" "$(cat "$TDIR/rt2.out")"
+
+echo '# gate P1 regression 3 (out-path snapshot+bind / FIX 3a/3b): a bound --out path must not silently'
+echo '# hand back a REPLACEMENT round'"'"'s verdict as if it were the bound round'"'"'s own'
+RT3_HOME="$TDIR/home-rt3"; mkdir -p "$RT3_HOME"
+RT3_OUT="$TDIR/rt3.md"
+RT3_ORIG_MARKER="pg-run-rt3orig-1700003400-34"
+RT3_NEW_MARKER="pg-run-rt3new-1700003401-35"
+# Round ORIG is still generating (non-terminal) when --wait first polls and binds to it.
+printf '{"phase":"waiting-slot","attempt":1,"detail":"","pr":"5","out":"%s","ts":"%s","marker":"%s","model":"","model_warn":"","result":"","terminal":false,"next_action":{"cmd":"","terminal":false,"wait_class":null}}\n' \
+  "$RT3_OUT" "$(date +%Y-%m-%dT%H:%M:%S%z)" "$RT3_ORIG_MARKER" > "$RT3_OUT.status"
+PRO_GATE_HOME="$RT3_HOME" PRO_GATE_WAIT_POLL_SECS=1 "$ENGINE" --wait "$RT3_OUT" --timeout 4 \
+  >"$TDIR/rt3.out" 2>"$TDIR/rt3.err" &
+RT3_WAITPID=$!
+sleep 1.3
+# Round ORIG never reaches terminal — a totally different round (rt3new) replaces it at the
+# SAME shared --out path, landing its OWN terminal verdict there instead.
+printf '{"phase":"done","attempt":1,"detail":"","pr":"5","out":"%s","ts":"%s","marker":"%s","model":"gpt-5","model_warn":"","result":"%s","terminal":true,"next_action":{"cmd":"","terminal":true,"wait_class":"verdict"}}\n' \
+  "$RT3_OUT" "$(date +%Y-%m-%dT%H:%M:%S%z)" "$RT3_NEW_MARKER" "$RT3_OUT" > "$RT3_OUT.status"
+wait "$RT3_WAITPID"; RT3RC=$?
+check 'FIX3: a bound out-path wait never silently reports a REPLACEMENT round'"'"'s verdict (no false exit 0)' \
+  "$([ "$RT3RC" -ne 0 ]; echo $?)" "rc=$RT3RC $(cat "$TDIR/rt3.out")"
+check 'FIX3: falls through to the timeout instead of fabricating a verdict' "$([ "$RT3RC" -eq 20 ]; echo $?)" "rc=$RT3RC $(cat "$TDIR/rt3.err")"
+check 'FIX3: --timeout print still shows the last-known bytes, not silence, after the bind mismatch' \
+  "$([ -s "$TDIR/rt3.out" ]; echo $?)" "stdout was empty at timeout"
+
+echo '# gate P1 regression 4 (wait_json_valid / FIX 4): corrupt/truncated/non-JSON status must exit 21'
+echo '# (lost observability), never mistaken for a healthy pre-v0.35 (KTD5) legacy run'
+RT4_OUT="$TDIR/rt4.md"
+printf '{"phase":"launching","ts":"%s","marker":"pg-run-rt4-1700003500-36"' "$(date +%Y-%m-%dT%H:%M:%S%z)" \
+  > "$RT4_OUT.status"  # truncated mid-write: no closing brace, no "terminal" field
+PRO_GATE_HOME="$WHOME" "$ENGINE" --wait "$RT4_OUT" --timeout 2 >"$TDIR/rt4.out" 2>"$TDIR/rt4.err"
+RT4RC=$?
+check 'FIX4 (jq path): truncated/corrupt status exits 21, not 20 (never a false healthy-legacy classification)' \
+  "$([ "$RT4RC" -eq 21 ]; echo $?)" "rc=$RT4RC $(cat "$TDIR/rt4.err")"
+check 'FIX4 (jq path): still prints whatever bytes are on disk' "$([ -s "$TDIR/rt4.out" ]; echo $?)" "stdout was empty"
+
+build_nojq_path
+RT4B_OUT="$TDIR/rt4b.md"
+printf '{"phase":"launching","ts":"%s","marker":"pg-run-rt4b-1700003501-36"' "$(date +%Y-%m-%dT%H:%M:%S%z)" \
+  > "$RT4B_OUT.status"
+PATH="$NOJQ_DIR" PRO_GATE_HOME="$WHOME" "$ENGINE" --wait "$RT4B_OUT" --timeout 2 >"$TDIR/rt4b.out" 2>"$TDIR/rt4b.err"
+RT4BRC=$?
+check 'FIX4 (no-jq path): truncated/corrupt status exits 21, not 20 (never a false healthy-legacy classification)' \
+  "$([ "$RT4BRC" -eq 21 ]; echo $?)" "rc=$RT4BRC $(cat "$TDIR/rt4b.err")"
+
+echo '# gate P2 regression 5 (completed-artifact handoff / FIX 5): covered above as part of scenario 2 (AE2)'
+echo '# — dual-purposed there since it is the exact same code path (wait_resolve_marker artifact_completed).'
+
+echo '# gate P2 regression 6 (settle cap vs. overall deadline / FIX 6): --timeout 0 must not block for the'
+echo '# settle cap even with a stuck (never-clearing) active-index record for the same key'
+RT6_HOME="$TDIR/home-rt6"; mkdir -p "$RT6_HOME/active"
+RT6_MARKER="pg-run-rt6cap-1700003300-33"
+RT6_OUT="$TDIR/rt6.md"
+sleep 30 & RT6_LIVEPID=$!
+printf '%s\t%s\t%s\t%s\n' "$RT6_MARKER" "$RT6_OUT" "$RT6_LIVEPID" "$(date +%s)" > "$RT6_HOME/active/rt6cap"
+printf '{"phase":"done","attempt":1,"detail":"","pr":"","out":"%s","ts":"%s","marker":"%s","model":"gpt-5","model_warn":"","result":"%s","terminal":true,"next_action":{"cmd":"","terminal":true,"wait_class":"verdict"}}\n' \
+  "$RT6_OUT" "$(date +%Y-%m-%dT%H:%M:%S%z)" "$RT6_MARKER" "$RT6_OUT" > "$RT6_OUT.status"
+RT6_T0=$(date +%s)
+PRO_GATE_HOME="$RT6_HOME" PRO_GATE_WAIT_POLL_SECS=1 PRO_GATE_WAIT_SETTLE_CAP=5 \
+  "$ENGINE" --wait "$RT6_OUT" --timeout 0 >"$TDIR/rt6.out" 2>"$TDIR/rt6.err"
+RT6RC=$?
+RT6_T1=$(date +%s)
+kill "$RT6_LIVEPID" 2>/dev/null; wait "$RT6_LIVEPID" 2>/dev/null
+check 'FIX6: --timeout 0 exits 0 with the terminal verdict even though the active index is stuck live' \
+  "$([ "$RT6RC" -eq 0 ]; echo $?)" "rc=$RT6RC $(cat "$TDIR/rt6.err")"
+check 'FIX6: --timeout 0 returns near-instantly, never blocking for the (5s) settle cap' \
+  "$([ $(( RT6_T1 - RT6_T0 )) -le 2 ]; echo $?)" "elapsed=$(( RT6_T1 - RT6_T0 ))s (settle cap=5s)"
+check 'FIX6: still prints the terminal JSON' \
+  "$(jq -e --arg m "$RT6_MARKER" '.terminal==true and .marker==$m' "$TDIR/rt6.out" >/dev/null 2>&1; echo $?)" "$(cat "$TDIR/rt6.out")"
 
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }
