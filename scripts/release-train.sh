@@ -1,6 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CANONICAL_SOURCE_KIND='url'
+CANONICAL_SOURCE_URL='https://github.com/StartupBros-com/pro-gate.git'
+
+# The verify job maps this step output to the reusable announce job. Write the
+# fail-closed value before even validating inputs so early no-ops and failures
+# can never inherit a stale truthy output from a prior command in the step.
+write_announce_output() {
+  [[ -n "${GITHUB_OUTPUT:-}" ]] || return 0
+  printf 'announce=%s\n' "$1" >> "$GITHUB_OUTPUT"
+}
+
 fail() {
   printf 'error: %s\n' "$*" >&2
   exit 1
@@ -110,9 +122,10 @@ fail_distribution_unverified() {
 # existing output paths fires.
 #
 # Three outcomes:
-#   CURRENT    - card matches this release exactly on all four fields ->
-#                confirm, do NOT print the repin notice, succeed.
-#   STALE      - card names a different release on any field -> print the
+#   CURRENT    - card matches this release exactly on its version, release
+#                identity, commit SHA, and canonical source kind/URL -> confirm,
+#                do NOT print the repin notice, succeed.
+#   STALE      - a complete, typed card names a different tuple field -> print the
 #                existing repin notice (kept verbatim; the recipe references
 #                its exact fields) AND fail. A red release train is the
 #                correct signal that the release is not distributed yet
@@ -126,7 +139,7 @@ verify_marketplace_promotion() {
   require RELEASE_TAG
   require RELEASE_ID
   require SOURCE_SHA
-  local manifest card card_version card_tag card_id card_sha
+  local manifest card_tuple card_version card_tag card_id card_sha card_source_kind card_source_url
 
   # One gh api call against the marketplace's live default branch (no ref
   # pinned, so this always reads whatever a merged repin PR most recently
@@ -136,34 +149,86 @@ verify_marketplace_promotion() {
     fail_distribution_unverified "gh api could not fetch repos/$MARKETPLACE_REPO/$MARKETPLACE_MANIFEST_PATH"
   fi
 
-  if ! card="$(jq -c --arg name "$REPOSITORY" \
-      '[.plugins[]? | select(.name == $name)][0] // empty' <<<"$manifest" 2>/dev/null)"; then
-    fail_distribution_unverified "marketplace manifest did not parse as JSON"
+  # Fail closed on an ambiguous or ill-typed card in ONE jq -e validation pass.
+  # Values are deliberately compared below, rather than folded into this schema
+  # check: a complete, typed card for another release is STALE (and needs a
+  # repin), while duplicate/missing/type-invalid source metadata is UNVERIFIED
+  # (and must not be mistaken for evidence that a human can safely repin).
+  if ! card_tuple="$(jq -er --arg name "$REPOSITORY" '
+      def nonempty_string: type == "string" and length > 0;
+      def positive_uint: type == "number" and . > 0 and floor == .;
+      if type != "object" or (.plugins | type) != "array" then
+        error("marketplace manifest has no plugins array")
+      else
+        [.plugins[] | select(type == "object" and (.name? == $name))] as $cards
+        | if ($cards | length) != 1 then
+            error("expected exactly one matching plugin card")
+          else
+            $cards[0]
+            | if (
+                (.name | nonempty_string)
+                and (.metadata | type) == "object"
+                and (.metadata.version | nonempty_string)
+                and (.metadata.releaseTag | nonempty_string)
+                and (.metadata.releaseId | positive_uint)
+                and (.source | type) == "object"
+                and (.source.sha | nonempty_string)
+                and (.source.source | nonempty_string)
+                and (.source.url | nonempty_string)
+              ) then
+                [
+                  .metadata.version,
+                  .metadata.releaseTag,
+                  .metadata.releaseId,
+                  .source.sha,
+                  .source.source,
+                  .source.url
+                ] | @tsv
+              else
+                error("matching plugin card has an invalid tuple")
+              end
+          end
+      end
+    ' <<<"$manifest" 2>/dev/null)"; then
+    fail_distribution_unverified "marketplace manifest lacks exactly one typed \"$REPOSITORY\" distribution tuple"
   fi
-  if [[ -z "$card" || "$card" == "null" ]]; then
-    fail_distribution_unverified "marketplace manifest has no \"$REPOSITORY\" plugin entry"
-  fi
-
-  card_version="$(jq -r '.metadata.version // empty' <<<"$card")"
-  card_tag="$(jq -r '.metadata.releaseTag // empty' <<<"$card")"
-  card_id="$(jq -r '.metadata.releaseId // empty' <<<"$card")"
-  card_sha="$(jq -r '.source.sha // empty' <<<"$card")"
-  if [[ -z "$card_version" || -z "$card_tag" || -z "$card_id" || -z "$card_sha" ]]; then
-    fail_distribution_unverified "\"$REPOSITORY\" card is missing version/releaseTag/releaseId/sha"
-  fi
+  IFS=$'\t' read -r card_version card_tag card_id card_sha card_source_kind card_source_url <<<"$card_tuple"
 
   if [[ "$card_version" == "$RELEASE_VERSION" && "$card_tag" == "$RELEASE_TAG" \
-        && "$card_id" == "$RELEASE_ID" && "$card_sha" == "$SOURCE_SHA" ]]; then
+        && "$card_id" == "$RELEASE_ID" && "$card_sha" == "$SOURCE_SHA" \
+        && "$card_source_kind" == "$CANONICAL_SOURCE_KIND" \
+        && "$card_source_url" == "$CANONICAL_SOURCE_URL" ]]; then
     printf 'marketplace card already lists %s (releaseId %s, sha %s): distribution is current\n' \
       "$RELEASE_TAG" "$RELEASE_ID" "$SOURCE_SHA"
     return 0
   fi
 
   emit_repin_request
-  fail "release $RELEASE_TAG (releaseId $RELEASE_ID) is published but NOT distributed: marketplace card still lists $card_tag (releaseId $card_id, sha $card_sha) - open the repin PR reported above against $MARKETPLACE_REPO, merge it, then re-fire announce"
+  fail "release $RELEASE_TAG (releaseId $RELEASE_ID) is published but NOT distributed: marketplace card still lists $card_tag (releaseId $card_id, sha $card_sha, source $card_source_kind $card_source_url) - open the repin PR reported above against $MARKETPLACE_REPO, merge it, then re-fire announce"
+}
+
+# Re-resolve only AFTER proving the exact marketplace tuple. The first stable
+# lookup gates work before asset verification; this second lookup closes changes
+# that happen while that work runs. If it moved, the release remains a successful
+# no-op but cannot announce. The only remaining race is a newer stable release
+# published after this final API response; that later release has its own event.
+final_release_is_still_latest() {
+  require RELEASE_REPOSITORY
+  local final_latest_id
+  if ! final_latest_id="$("$SCRIPT_DIR/latest-stable-release.sh" "$RELEASE_REPOSITORY")"; then
+    fail "could not re-resolve latest stable release before announce"
+  fi
+  is_uint "$final_latest_id" || fail "final latest stable release id must be an unsigned integer"
+  if [[ "$final_latest_id" != "$RELEASE_ID" ]]; then
+    printf 'release %s ceased to be latest stable (%s); announce remains disabled\n' \
+      "$RELEASE_ID" "$final_latest_id"
+    return 1
+  fi
+  return 0
 }
 
 main() {
+  write_announce_output false
   require EVENT_ACTION
   require REPOSITORY
   require RELEASE_ID
@@ -186,6 +251,9 @@ main() {
 
   RELEASE_VERSION="$(verify_release)"
   verify_marketplace_promotion
+  if final_release_is_still_latest; then
+    write_announce_output true
+  fi
 }
 
 main "$@"

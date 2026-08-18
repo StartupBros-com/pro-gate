@@ -11,6 +11,7 @@ OS="$(pg_os)"; MODE="$(pg_browser_mode)"; SVC="$(pg_service_mgr)"
 PORT="${ORACLE_BROWSER_PORT:-9222}"
 ORACLE_BIN="${PRO_GATE_ORACLE_BIN:-oracle}"
 TIMEOUT_BIN="${PRO_GATE_TIMEOUT_BIN:-timeout}"
+GH_BIN="${PRO_GATE_GH_BIN:-gh}"
 
 have_bin() {
   case "$1" in
@@ -20,6 +21,14 @@ have_bin() {
 }
 run_bounded() {
   if have_bin "$TIMEOUT_BIN"; then "$TIMEOUT_BIN" "$@"; else return 127; fi
+}
+
+# The release lookup is advisory, but must not leave a TERM-ignoring gh child
+# behind on an offline/broken host. The configured timeout command is the
+# portable `timeout`/`gtimeout` surface used everywhere else; -k supplies the
+# hard-stop phase after the normal five-second deadline.
+run_hard_bounded() {
+  if have_bin "$TIMEOUT_BIN"; then "$TIMEOUT_BIN" -k 1s 5s "$@"; else return 127; fi
 }
 
 ok=0; warn=0; bad=0
@@ -67,8 +76,8 @@ fi
 # Best-effort like the oracle skew nudge below: gh missing, unauthenticated,
 # or offline all degrade to total silence (no P/W path for "could not
 # check") — this must never block, and the doctor must stay usable offline.
-if pg_have gh; then
-  NEWEST_TAG="$(run_bounded 10 gh api repos/StartupBros-com/pro-gate/releases/latest --jq '.tag_name' 2>/dev/null || true)"
+if have_bin "$GH_BIN"; then
+  NEWEST_TAG="$(run_hard_bounded "$GH_BIN" api repos/StartupBros-com/pro-gate/releases/latest --jq '.tag_name' 2>/dev/null || true)"
   NEWEST_VERSION="${NEWEST_TAG#v}"
   LOCAL_VERSION="${EXPECTED_VERSION:-$INSTALLED_VERSION}"
   if [ -n "$NEWEST_VERSION" ] && [ -n "$LOCAL_VERSION" ] && pg_semver_lt "$LOCAL_VERSION" "$NEWEST_VERSION"; then
@@ -136,7 +145,7 @@ if [ -n "$CDP_HELPER" ]; then
 else
   W "cdp-salvage.mjs missing — no-think probe + tab salvage DISABLED; live runs can be misclassified as dead and retried (double-spend risk)"
 fi
-pg_have gh && { gh auth status >/dev/null 2>&1 && P "gh authenticated" || X "gh not authenticated — gh auth login"; } || X "gh (GitHub CLI) missing"
+have_bin "$GH_BIN" && { "$GH_BIN" auth status >/dev/null 2>&1 && P "gh authenticated" || X "gh not authenticated — gh auth login"; } || X "gh (GitHub CLI) missing"
 pg_have git && P "git present" || X "git missing"
 pg_have claude && P "claude CLI present" || W "claude CLI missing (needed for the daemon's fixer)"
 pg_have jq && P "jq present" || W "jq missing (usage guardrail degraded)"
