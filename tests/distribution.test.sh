@@ -231,6 +231,81 @@ PRO_GATE_ORACLE_BIN="$TDIR/missing-oracle" PRO_GATE_TIMEOUT_BIN="$TDIR/missing-t
   PRO_GATE_HOME="$RUNTIME3" PRO_GATE_BROWSER_MODE=native bash "$ROOT/bin/pro-gate-doctor.sh" >"$TDIR/doctor-missing-bin.log" 2>&1 || true
 check "doctor reports configured oracle missing" grep -q "configured oracle command missing: $TDIR/missing-oracle" "$TDIR/doctor-missing-bin.log"
 check "doctor reports configured timeout missing" grep -q "configured timeout command missing: $TDIR/missing-timeout" "$TDIR/doctor-missing-bin.log"
+
+# The distribution lookup is advisory, but it must be exact and bounded: a
+# broken network/CLI can never hold the doctor open or invent a skew warning.
+DOCTOR_GH_HOME="$TDIR/doctor-gh-home"; DOCTOR_GH_BIN="$DOCTOR_GH_HOME/.local/bin/gh"
+NETWORK_TIMEOUT="$TDIR/doctor-network-timeout"; NETWORK_TIMEOUT_LOG="$TDIR/doctor-network-timeout.log"
+mkdir -p "$(dirname "$DOCTOR_GH_BIN")"
+cat > "$DOCTOR_GH_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "$*" >> "$GH_LOG"
+if [[ "${1:-}" == auth && "${2:-}" == status && "$#" -eq 2 ]]; then
+  exit 0
+fi
+if [[ "${1:-}" != api || "${2:-}" != repos/StartupBros-com/pro-gate/releases/latest || "${3:-}" != --jq || "${4:-}" != .tag_name || "$#" -ne 4 ]]; then
+  exit 64
+fi
+case "${GH_MODE:-newer}" in
+  fail) exit 1 ;;
+  malformed) printf 'not-a-semver\n' ;;
+  hung) trap '' TERM; while :; do :; done ;;
+  *) printf '%s\n' "$GH_TAG" ;;
+esac
+EOF
+cat > "$NETWORK_TIMEOUT" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$NETWORK_TIMEOUT_LOG"
+exec /usr/bin/timeout "$@"
+EOF
+chmod +x "$DOCTOR_GH_BIN" "$NETWORK_TIMEOUT"
+run_doctor_release_skew() {
+  local mode="$1" tag="$2" output="$3"
+  GH_MODE="$mode" GH_TAG="$tag" GH_LOG="$TDIR/doctor-gh.log" NETWORK_TIMEOUT_LOG="$NETWORK_TIMEOUT_LOG" \
+    HOME="$DOCTOR_GH_HOME" PRO_GATE_HOME="$RUNTIME3" PRO_GATE_EXPECTED_VERSION="$VERSION" \
+    PRO_GATE_CONSENT_HOME="$CONSENT3" PRO_GATE_BROWSER_MODE=native PRO_GATE_ORACLE_BIN="$TDIR/oracle-custom" \
+    PRO_GATE_GH_BIN="$DOCTOR_GH_BIN" PRO_GATE_TIMEOUT_BIN="$NETWORK_TIMEOUT" \
+    bash "$ROOT/bin/pro-gate-doctor.sh" >"$output" 2>&1 || true
+}
+
+: > "$TDIR/doctor-gh.log"; : > "$NETWORK_TIMEOUT_LOG"
+run_doctor_release_skew newer v99.99.99 "$TDIR/doctor-newer.log"
+check "doctor warns once when published release is newer" test "$(grep -c 'pro-gate 99.99.99 has been published' "$TDIR/doctor-newer.log")" -eq 1
+check "doctor skew lookup uses exact endpoint and jq selector" grep -Fxq 'api repos/StartupBros-com/pro-gate/releases/latest --jq .tag_name' "$TDIR/doctor-gh.log"
+check "doctor uses configured timeout with TERM and KILL deadlines" grep -Fxq -- "-k 1s 5s $DOCTOR_GH_BIN api repos/StartupBros-com/pro-gate/releases/latest --jq .tag_name" "$NETWORK_TIMEOUT_LOG"
+
+: > "$TDIR/doctor-gh.log"
+run_doctor_release_skew equal "v$VERSION" "$TDIR/doctor-equal.log"
+check "doctor stays quiet when local version equals latest release" sh -c "! grep -q 'has been published' '$TDIR/doctor-equal.log'"
+
+: > "$TDIR/doctor-gh.log"
+run_doctor_release_skew ahead v0.0.1 "$TDIR/doctor-ahead-release.log"
+check "doctor stays quiet when local version is ahead of latest release" sh -c "! grep -q 'has been published' '$TDIR/doctor-ahead-release.log'"
+
+: > "$TDIR/doctor-gh.log"
+run_doctor_release_skew malformed ignored "$TDIR/doctor-malformed-release.log"
+check "doctor stays quiet for malformed latest release output" sh -c "! grep -q 'has been published' '$TDIR/doctor-malformed-release.log'"
+
+: > "$TDIR/doctor-gh.log"
+run_doctor_release_skew fail ignored "$TDIR/doctor-api-failure.log"
+check "doctor stays quiet for latest release API failure" sh -c "! grep -q 'has been published' '$TDIR/doctor-api-failure.log'"
+
+MISSING_GH_OUTPUT="$TDIR/doctor-missing-gh.log"
+HOME="$DOCTOR_GH_HOME" PRO_GATE_HOME="$RUNTIME3" PRO_GATE_EXPECTED_VERSION="$VERSION" PRO_GATE_CONSENT_HOME="$CONSENT3" \
+  PRO_GATE_BROWSER_MODE=native PRO_GATE_ORACLE_BIN="$TDIR/oracle-custom" PRO_GATE_GH_BIN="$TDIR/no-such-gh" \
+  PRO_GATE_TIMEOUT_BIN="$NETWORK_TIMEOUT" bash "$ROOT/bin/pro-gate-doctor.sh" >"$MISSING_GH_OUTPUT" 2>&1 || true
+check "doctor reports a configured gh binary missing" grep -q 'gh (GitHub CLI) missing' "$MISSING_GH_OUTPUT"
+check "doctor stays quiet when gh is missing" sh -c "! grep -q 'has been published' '$MISSING_GH_OUTPUT'"
+
+: > "$TDIR/doctor-gh.log"; : > "$NETWORK_TIMEOUT_LOG"
+SECONDS=0
+run_doctor_release_skew hung ignored "$TDIR/doctor-hung-gh.log"
+HUNG_ELAPSED=$SECONDS
+check "TERM-ignoring gh is hard-killed within the bounded window" test "$HUNG_ELAPSED" -lt 8
+check "doctor stays quiet after hard-killing a hung gh" sh -c "! grep -q 'has been published' '$TDIR/doctor-hung-gh.log'"
+check "hung gh received configured hard timeout" grep -Fxq -- "-k 1s 5s $DOCTOR_GH_BIN api repos/StartupBros-com/pro-gate/releases/latest --jq .tag_name" "$NETWORK_TIMEOUT_LOG"
+
 HOME="$HOME3" PRO_GATE_HOME="$RUNTIME3" PRO_GATE_CONSENT_HOME="$CONSENT3" PRO_GATE_BROWSER_MODE=native \
   bash "$ROOT/daemon/daemon.sh" >"$TDIR/daemon-ok.log" 2>&1 & DPID=$!
 sleep 0.3

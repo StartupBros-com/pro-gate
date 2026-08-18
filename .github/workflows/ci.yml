@@ -13,7 +13,10 @@ jobs:
     name: trusted check
     if: github.event_name == 'push' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # The engine suite carries ~18 minutes of real watchdog/stall waits by design and has
+    # grown to 1777-1800s: the 30-minute cap started cancelling green runs whose tests had
+    # already ALL PASSed (run 32087692674). 45 restores headroom without masking a hang.
+    timeout-minutes: 45
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
