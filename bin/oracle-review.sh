@@ -30,6 +30,12 @@
 #       next command. For callers that lost their context (compaction, new session): answers
 #       "what runs exist for this change, what do I harvest, how many rounds remain" from
 #       nothing but a PR number. No locks, no browser, no writes; omit the query for all state.
+#   oracle-review.sh --wait <out-path|pg-run-marker> [--timeout <dur>]
+#       Blocking read-only watcher (v0.35): blocks until the target run reaches a terminal
+#       phase, then prints the final status JSON and exits. Exit 0 verdict-reached (next_action
+#       says what to do next), 2 usage/unknown run, 20 timeout (re-arm safe), 21 lost
+#       observability (escalate). --timeout 0 is a single classify-and-exit probe. Never
+#       launches, harvests, or mutates state — pure watcher, same discipline as --status.
 set -uo pipefail
 
 # --- locate + source the shared lib (works from repo and from deployed location) ---
@@ -43,8 +49,9 @@ pg_augment_path
 pg_load_env
 OS="$(pg_os)"; MODE="$(pg_browser_mode)"
 
-PR=""; REPO=""; DIFF_FILE=""; INPUT="both"; OUT=""; TIMEOUT="30m"; EXTRA_GLOB=""; HARVEST_MARKER=""; HARVEST_REQUESTED=0; CONFIRM_FILE=""
+PR=""; REPO=""; DIFF_FILE=""; INPUT="both"; OUT=""; TIMEOUT="30m"; TIMEOUT_SET=0; EXTRA_GLOB=""; HARVEST_MARKER=""; HARVEST_REQUESTED=0; CONFIRM_FILE=""
 STATUS_REQUESTED=0; STATUS_QUERY=""; AS_JSON=0
+WAIT_REQUESTED=0; WAIT_TARGET=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --pr) PR="$2"; shift 2;;
@@ -52,13 +59,19 @@ while [ $# -gt 0 ]; do
     --diff) DIFF_FILE="$2"; shift 2;;
     --input) INPUT="$2"; shift 2;;
     --out) OUT="$2"; shift 2;;
-    --timeout) TIMEOUT="$2"; shift 2;;
+    --timeout) TIMEOUT="$2"; TIMEOUT_SET=1; shift 2;;
     --extra-files) EXTRA_GLOB="$2"; shift 2;;
     --confirm) CONFIRM_FILE="$2"; shift 2;;
     --harvest) HARVEST_REQUESTED=1; HARVEST_MARKER="${2:-}"; shift 2;;
     # --status takes an OPTIONAL query (a following --flag or nothing means "all state").
     --status) STATUS_REQUESTED=1
       case "${2:-}" in ''|--*) shift 1;; *) STATUS_QUERY="$2"; shift 2;; esac;;
+    # blocking-wait-verb (R4): --wait takes a REQUIRED target (out-path or pg-run-... marker).
+    # Same peek-before-consume shape as --status above (a following --flag or nothing must not
+    # be swallowed as the target); unlike --status's query, an absent target is a usage error,
+    # enforced below in the existing post-parse validation block.
+    --wait) WAIT_REQUESTED=1
+      case "${2:-}" in ''|--*) shift 1;; *) WAIT_TARGET="$2"; shift 2;; esac;;
     --json) AS_JSON=1; shift;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
@@ -75,6 +88,22 @@ if [ -n "$CONFIRM_FILE" ] && [ ! -s "$CONFIRM_FILE" ]; then
   echo "ERROR: --confirm file not found or empty: $CONFIRM_FILE" >&2
   exit 2
 fi
+if [ "$WAIT_REQUESTED" = 1 ]; then
+  if [ -z "$WAIT_TARGET" ]; then
+    echo "ERROR: --wait requires a target (an --out path or a pg-run-... marker)" >&2
+    exit 2
+  fi
+  if [ -n "$PR" ] || [ -n "$DIFF_FILE" ] || [ "$HARVEST_REQUESTED" = 1 ] || [ "$STATUS_REQUESTED" = 1 ]; then
+    echo "ERROR: --wait is exclusive with --pr/--diff/--harvest/--status" >&2
+    exit 2
+  fi
+  # KTD3: --wait's own envelope (worst-case lock wait + a long generation) is far larger than a
+  # fresh run's launch --timeout default (30m), so an UNSPECIFIED --timeout defaults to 14400s
+  # here rather than inheriting "30m". An explicit --timeout (any value, including one that
+  # happens to spell "30m") is never overridden — TIMEOUT_SET is set only by the parser above,
+  # never inferred from the value itself.
+  [ "$TIMEOUT_SET" = 1 ] || TIMEOUT=14400
+fi
 
 # --- v0.27: --status — read-only run rediscovery (issue #47) ---
 # Joins the state the engine already keeps (in-progress/ reservations, rounds/<key> budget,
@@ -83,10 +112,15 @@ fi
 # I harvest, and how many budget rounds remain. Pure inspection — no locks, no status file, no
 # browser, no writes — safe any time, including while a run is live. Exit 0 even when nothing
 # is found (absence is an answer); 2 on usage errors.
-if [ "$STATUS_REQUESTED" = 1 ]; then
-  if [ "$AS_JSON" = 1 ] && ! pg_have jq; then
-    echo "ERROR: --status --json requires jq" >&2; exit 2
-  fi
+# v0.35 (#88, KTD4): the state join below is a shared helper, pg_state_resolve(), called by
+# both --status and the new --wait verb (R6) — never duplicated. It reads $STATUS_QUERY and
+# populates the ST_* globals plus $ST_TMP/*.jsonl exactly as this block always did before the
+# extraction; this is pure code motion, so --status's behavior is unchanged. Idempotent-safe
+# for repeated calls in one process (--wait re-resolves on every ENOENT poll tick): a stale
+# $ST_TMP from a PRIOR call is removed before minting a new one, so the single EXIT trap set
+# below always cleans up only the most recently created temp dir.
+pg_state_resolve() {
+  [ -n "${ST_TMP:-}" ] && rm -rf "$ST_TMP" 2>/dev/null
   ST_RES_DIR="$(pg_reservation_dir)"
   ST_ROUNDS_DIR="$(pg_rounds_dir)"
   ST_LEDGER="${PRO_GATE_LEDGER:-$PRO_GATE_HOME/ledger.jsonl}"
@@ -456,6 +490,13 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
     ST_HINT="${ST_SPENT_N} round(s) already spent in the window for ${ST_SPENT_KEY} but no reservation, active record, ledger row, or live lock — a run may have just started or died early; a fresh run will SPEND a slot"
   fi
   [ -n "$ST_HINT" ] || ST_HINT="no engine state found for this query — a fresh run will SPEND a slot"
+}
+
+if [ "$STATUS_REQUESTED" = 1 ]; then
+  if [ "$AS_JSON" = 1 ] && ! pg_have jq; then
+    echo "ERROR: --status --json requires jq" >&2; exit 2
+  fi
+  pg_state_resolve
 
   if [ "$AS_JSON" = 1 ]; then
     jq -n --arg query "${STATUS_QUERY:-all}" --arg home "$PRO_GATE_HOME" --arg hint "$ST_HINT" \
@@ -517,6 +558,348 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
   fi
   echo "next step: $ST_HINT"
   exit 0
+fi
+
+# --- v0.35 (#88): --wait — pure read-only blocking classifier (R4-R7, R6a, R10 consumer side;
+# KTD1-KTD6). Blocks as a plain shell process (no LLM, no browser action of its own) until the
+# target run's status reaches a terminal phase, then prints the final status JSON to stdout and
+# exits 0. Never calls pg_finish, --harvest, or mutates any engine state (KTD1/KTD6) — same
+# read-only discipline as --status above. Exit codes (KTD3): 0 verdict-reached (next_action
+# disambiguates which situation — see the wait_class table at pg_status above), 2 usage/unknown
+# run (fail-fast, never blocks a full timeout on a run that never existed), 20 timeout (re-arm
+# safe — a chunk boundary, not a failure), 21 lost observability (stale beyond its phase's bound
+# or unreadable — escalate, do not blindly re-arm).
+if [ "$WAIT_REQUESTED" = 1 ]; then
+  case "$WAIT_TARGET" in
+    pg-run-*)
+      pg_reservation_marker_ok "$WAIT_TARGET" \
+        || { echo "ERROR: --wait target looks like a marker but has invalid syntax: $WAIT_TARGET" >&2; exit 2; }
+      WAIT_MARKER="$WAIT_TARGET"; WAIT_OUT=""
+      ;;
+    *)
+      # R6a: the bare out-path form has no marker to verify against, so it trusts whatever
+      # status file lands at this path as-is; pg_state_resolve's query grammar is marker/PR-
+      # number/PR-URL, not an arbitrary path, so no state-join fallback is even possible here.
+      WAIT_MARKER=""; WAIT_OUT="$WAIT_TARGET"
+      ;;
+  esac
+
+  WAIT_TIMEOUT_SECS="$(pg_dur_secs "$TIMEOUT")"
+  WAIT_POLL_SECS="${PRO_GATE_WAIT_POLL_SECS:-10}"
+  case "$WAIT_POLL_SECS" in ''|*[!0-9]*) WAIT_POLL_SECS=10;; esac
+  WAIT_START="$(date +%s)"
+  WAIT_DEADLINE=$(( WAIT_START + WAIT_TIMEOUT_SECS ))
+  WAIT_LEGACY_WARNED=0
+
+  # Phase staleness bounds (R10, KTD2, the plan's Phase Staleness Table). Heartbeated phases:
+  # 4x the heartbeat interval. Loopless phases: 1.5x the phase's own env-tunable budget — the
+  # plan's Outstanding Questions section proposes this multiplier and leaves the exact term to
+  # the implementer, same explicit treatment as the heartbeat multiplier.
+  WAIT_HB_SECS="${PRO_GATE_HEARTBEAT_SECS:-30}"; case "$WAIT_HB_SECS" in ''|*[!0-9]*) WAIT_HB_SECS=30;; esac
+  WAIT_HB_BOUND=$(( WAIT_HB_SECS * 4 ))
+  WAIT_LOCK_W="${PRO_GATE_LOCK_WAIT:-2400}"; case "$WAIT_LOCK_W" in ''|*[!0-9]*) WAIT_LOCK_W=2400;; esac
+  WAIT_LOCK_BOUND=$(( WAIT_LOCK_W * 3 / 2 ))
+  WAIT_STALL_W="${PRO_GATE_STALL_SECS:-600}"; case "$WAIT_STALL_W" in ''|*[!0-9]*) WAIT_STALL_W=600;; esac
+  WAIT_SALVAGE_W="${PRO_GATE_SALVAGE_SECS:-$WAIT_STALL_W}"
+  case "$WAIT_SALVAGE_W" in ''|*[!0-9]*) WAIT_SALVAGE_W="$WAIT_STALL_W";; esac
+  # Deviation (implementer judgment): floor at 1800s so this bound also covers a harvest
+  # invocation's own collection window (HARVEST_SECS derives from --timeout, default 30m =
+  # 1800s) — a salvaging fixture reached via harvest must not be flagged lost just because it
+  # outlives the shorter default stall/salvage tunable.
+  [ "$WAIT_SALVAGE_W" -lt 1800 ] 2>/dev/null && WAIT_SALVAGE_W=1800
+  WAIT_SALVAGE_BOUND=$(( WAIT_SALVAGE_W * 3 / 2 ))
+  WAIT_THROTTLE_W="${PRO_GATE_THROTTLE_PAUSE:-300}"; case "$WAIT_THROTTLE_W" in ''|*[!0-9]*) WAIT_THROTTLE_W=300;; esac
+  WAIT_THROTTLE_BOUND=$(( WAIT_THROTTLE_W * 3 / 2 ))
+  WAIT_RETRY_W="${PRO_GATE_RETRY_BACKOFF:-20}"; case "$WAIT_RETRY_W" in ''|*[!0-9]*) WAIT_RETRY_W=20;; esac
+  WAIT_RETRY_BOUND=$(( WAIT_RETRY_W * 3 / 2 ))
+  # Deviation (implementer judgment): floor the retry-wait bound at 60s. A bare 1.5x of the
+  # 20s default backoff (30s) leaves less margin than one --wait poll interval plus scheduling
+  # jitter, which would false-trigger lost-observability on a perfectly healthy short backoff.
+  [ "$WAIT_RETRY_BOUND" -lt 60 ] 2>/dev/null && WAIT_RETRY_BOUND=60
+  # v0.35 (#88) terminal-settle cap: pg_status writes terminal:true BEFORE pg_finish's own
+  # bookkeeping (organizer dispatch, ledger append, active-index clear) runs, so a --wait
+  # caller that trusts the status file the instant it flips terminal can race ahead of that
+  # bookkeeping. 180s covers pg_organize_chat's organizer-lock wait (<=95s) plus the
+  # state-join helper's own scan_s+50 timeout, with margin. Env-tunable (same pattern as the
+  # phase-staleness bounds above) so tests can shrink it instead of burning 180s per run.
+  WAIT_SETTLE_CAP="${PRO_GATE_WAIT_SETTLE_CAP:-180}"
+  case "$WAIT_SETTLE_CAP" in ''|*[!0-9]*) WAIT_SETTLE_CAP=180;; esac
+  WAIT_WIDEST_BOUND=$WAIT_HB_BOUND
+  [ "$WAIT_LOCK_BOUND" -gt "$WAIT_WIDEST_BOUND" ] && WAIT_WIDEST_BOUND=$WAIT_LOCK_BOUND
+  [ "$WAIT_SALVAGE_BOUND" -gt "$WAIT_WIDEST_BOUND" ] && WAIT_WIDEST_BOUND=$WAIT_SALVAGE_BOUND
+  [ "$WAIT_THROTTLE_BOUND" -gt "$WAIT_WIDEST_BOUND" ] && WAIT_WIDEST_BOUND=$WAIT_THROTTLE_BOUND
+  [ "$WAIT_RETRY_BOUND" -gt "$WAIT_WIDEST_BOUND" ] && WAIT_WIDEST_BOUND=$WAIT_RETRY_BOUND
+
+  wait_phase_bound() {  # $1 phase -> staleness bound in seconds
+    case "$1" in
+      launching|waiting-slot|live-detected) echo "$WAIT_HB_BOUND";;
+      waiting-pr-lock) echo "$WAIT_LOCK_BOUND";;
+      salvaging) echo "$WAIT_SALVAGE_BOUND";;
+      throttled) echo "$WAIT_THROTTLE_BOUND";;
+      retry-wait) echo "$WAIT_RETRY_BOUND";;
+      # preflight/cloudflare/watchdog-killed (momentary, plan-unlisted; each engine call site
+      # is immediately followed by a `break` or pg_finish) and any other/future phase name:
+      # widest bound — same conservative direction as the KTD5 legacy-engine treatment below;
+      # a wide bound only delays, never falsely triggers, a lost-observability verdict.
+      *) echo "$WAIT_WIDEST_BOUND";;
+    esac
+  }
+
+  wait_json_has() {  # $1 file $2 key -> rc 0 iff the key is present (ANY value, incl. false/null
+    # — jq's `//` treats a false value as absent, so this uses has() instead, never `//`).
+    if pg_have jq; then jq -e --arg k "$2" 'has($k)' "$1" >/dev/null 2>&1
+    else grep -q "\"$2\":" "$1" 2>/dev/null; fi
+  }
+  wait_json_str() {  # $1 file $2 key (top-level, non-duplicated) -> string value; '' if absent/null
+    if pg_have jq; then jq -r --arg k "$2" '.[$k] as $v | if ($v|type)=="string" then $v else "" end' "$1" 2>/dev/null
+    else sed -nE "s/.*\"$2\":\"([^\"]*)\".*/\1/p" "$1" | head -1; fi
+  }
+  wait_json_bool_true() {  # $1 file $2 key -> rc 0 iff present AND === true (never infers from
+    # absence). pg_status always mirrors "terminal" into next_action.terminal with the SAME
+    # value, so a plain substring grep on the top-level key name is unambiguous either way.
+    if pg_have jq; then jq -e --arg k "$2" '.[$k] == true' "$1" >/dev/null 2>&1
+    else grep -q "\"$2\":true" "$1" 2>/dev/null; fi
+  }
+
+  wait_ts_epoch() {  # $1 ISO8601 ts (pg_status's %Y-%m-%dT%H:%M:%S%z shape) -> epoch, empty on failure
+    local t="$1" e
+    [ -n "$t" ] || return 1
+    e="$(date -d "$t" +%s 2>/dev/null)" && { printf '%s\n' "$e"; return 0; }
+    # BSD/macOS date has no -d; -j -f with the exact emitted layout is the portable fallback
+    # (no existing cross-platform epoch-parse helper in lib/pro-gate-lib.sh to reuse).
+    e="$(date -j -f '%Y-%m-%dT%H:%M:%S%z' "$t" +%s 2>/dev/null)" && { printf '%s\n' "$e"; return 0; }
+    return 1
+  }
+
+  wait_emit_synth() {  # $1 phase $2 detail $3 marker $4 out $5 result $6 cmd $7 wait_class
+    # Synthesizes a pg_status-shaped terminal JSON from state-join evidence when no status
+    # file exists yet (marker resolves via the completed store / a finished ledger row).
+    local phase="$1" detail="$2" marker="$3" out="$4" result="$5" cmd="$6" wc="$7" ts
+    ts="$(date +%Y-%m-%dT%H:%M:%S%z)"
+    if pg_have jq; then
+      jq -nc --arg phase "$phase" --arg detail "$detail" --arg marker "$marker" --arg out "$out" \
+        --arg result "$result" --arg cmd "$cmd" --arg wc "$wc" --arg ts "$ts" \
+        '{phase:$phase,terminal:true,detail:$detail,ts:$ts,marker:$marker,out:$out,result:$result,next_action:{cmd:$cmd,terminal:true,wait_class:$wc}}'
+    else
+      printf '{"phase":"%s","terminal":true,"detail":"%s","ts":"%s","marker":"%s","out":"%s","result":"%s","next_action":{"cmd":"%s","terminal":true,"wait_class":"%s"}}\n' \
+        "$(printf '%s' "$phase" | tr -d '"\\')" "$(printf '%s' "$detail" | tr -d '"\\' | tr '\n' ' ')" \
+        "$ts" "$(printf '%s' "$marker" | tr -d '"\\')" "$(printf '%s' "$out" | tr -d '"\\')" \
+        "$(printf '%s' "$result" | tr -d '"\\')" "$(printf '%s' "$cmd" | tr -d '"\\')" "$wc"
+    fi
+  }
+
+  # KTD4/R6: marker resolution reuses the shared state-join helper — reservations -> completed
+  # store -> ledger, exactly --status's own priority order. Sets WR_STATE plus whichever of
+  # WR_OUT/WR_CMD/WR_ARTIFACT/WR_LEDGER_OUTCOME that state supplies. Marker mode only.
+  wait_resolve_marker() {
+    WR_STATE=none; WR_OUT=""; WR_CMD=""; WR_ARTIFACT=""; WR_LEDGER_OUTCOME=""
+    STATUS_QUERY="$WAIT_MARKER"
+    pg_state_resolve
+
+    if pg_have jq && [ -s "$ST_TMP/artifacts.jsonl" ]; then
+      local ln
+      ln="$(jq -c --arg m "$WAIT_MARKER" 'select(.marker==$m)' "$ST_TMP/artifacts.jsonl" 2>/dev/null | tail -1)"
+      if [ -n "$ln" ]; then
+        WR_ARTIFACT="$(printf '%s' "$ln" | jq -r '.artifact')"
+        case "$(printf '%s' "$ln" | jq -r '.kind')" in
+          completed) WR_STATE=artifact_completed;;
+          *) WR_STATE=artifact_pending;;
+        esac
+      fi
+    elif [ -s "$ST_TMP/artifacts.tsv" ]; then
+      local ln
+      ln="$(awk -F'\t' -v m="$WAIT_MARKER" '$1==m{l=$0} END{print l}' "$ST_TMP/artifacts.tsv")"
+      if [ -n "$ln" ]; then
+        WR_ARTIFACT="$(printf '%s' "$ln" | cut -f2)"
+        case "$(printf '%s' "$ln" | cut -f3)" in
+          completed) WR_STATE=artifact_completed;;
+          *) WR_STATE=artifact_pending;;
+        esac
+      fi
+    fi
+
+    if [ "$WR_STATE" = none ] && pg_have jq && [ -s "$ST_TMP/res.jsonl" ]; then
+      local ln
+      ln="$(jq -c --arg m "$WAIT_MARKER" 'select(.marker==$m)' "$ST_TMP/res.jsonl" 2>/dev/null | tail -1)"
+      if [ -n "$ln" ]; then
+        WR_OUT="$(printf '%s' "$ln" | jq -r '.out')"
+        WR_CMD="$(printf '%s' "$ln" | jq -r '.harvest_cmd')"
+        case "$(printf '%s' "$ln" | jq -r '.state')" in
+          complete-awaiting-harvest) WR_STATE=res_complete;;
+          cross-bound) WR_STATE=res_crossbound;;
+          unbindable-ambiguous) WR_STATE=res_ambiguous;;
+          *) WR_STATE=res_generating;;
+        esac
+      fi
+    elif [ "$WR_STATE" = none ] && [ -s "$ST_TMP/res.tsv" ]; then
+      local ln
+      ln="$(awk -F'\t' -v m="$WAIT_MARKER" '$1==m{l=$0} END{print l}' "$ST_TMP/res.tsv")"
+      if [ -n "$ln" ]; then
+        WR_CMD="$(printf '%s' "$ln" | cut -f7)"
+        WR_OUT="$(printf '%s' "$WR_CMD" | sed -nE "s/.*--out '([^']*)'.*/\1/p")"
+        # no-jq fallback cannot see the reservation's "complete" life-state (not carried in
+        # the TSV) — deviation, same pre-existing jq-gating pg_state_resolve's own ledger join
+        # already has: falls back to "keep polling" instead of the res_complete fast-exit; the
+        # run's own status file (once WR_OUT is pinned below) still resolves it correctly.
+        if [ "$(printf '%s' "$ln" | cut -f6)" -gt 0 ] 2>/dev/null; then
+          WR_STATE=res_crossbound
+        elif [ "$(printf '%s' "$ln" | cut -f5)" -gt 0 ] 2>/dev/null; then
+          WR_STATE=res_ambiguous
+        else
+          WR_STATE=res_generating
+        fi
+      fi
+    fi
+
+    if [ "$WR_STATE" = none ] && [ -s "$ST_TMP/ledger.jsonl" ] && pg_have jq; then
+      local ln
+      ln="$(jq -c --arg m "$WAIT_MARKER" 'select(.marker==$m)' "$ST_TMP/ledger.jsonl" 2>/dev/null | head -1)"
+      if [ -n "$ln" ]; then
+        WR_OUT="$(printf '%s' "$ln" | jq -r '.out')"
+        WR_LEDGER_OUTCOME="$(printf '%s' "$ln" | jq -r '.outcome')"
+        WR_STATE=ledger_hit
+      fi
+    fi
+  }
+
+  # v0.35 (#88) terminal-settle: pg_status's `terminal:true` write PRECEDES pg_finish's own
+  # bookkeeping (organizer rename/archive dispatch, ledger append, active-index clear) at
+  # every call site — pg_finish runs synchronously after the status file already reports
+  # done. A caller that exits the instant it sees terminal:true can therefore race ahead of
+  # that bookkeeping and, e.g., see the active-run index still list this change as live after
+  # --wait already reported the verdict. This local fix (KTD1: stays read-only, reuses the
+  # existing pg_state_resolve join --status already uses) re-checks the active-run index
+  # before printing+exiting: if the run's round key is still reported live, keep polling
+  # (bounded by WAIT_SETTLE_CAP, default 180s) until it clears or the cap elapses, then print
+  # the terminal JSON and exit 0 regardless — a settle timeout is a bookkeeping delay, never a
+  # reason to turn a real verdict into a failure. RESIDUAL (by design, per the plan's KTD
+  # note): this recheck is local to --wait. Other status-file consumers (e.g. --status) do
+  # not get it and can still observe terminal:true before pg_finish's bookkeeping settles.
+  wait_settle_terminal() {  # $1 = status file already confirmed terminal:true -> prints it, exits 0
+    local sf="$1" sf_marker k cap_deadline
+    sf_marker="$(wait_json_str "$sf" marker)"
+    if [ -n "$sf_marker" ]; then
+      k="${sf_marker#pg-run-}"; k="${k%-*-*}"
+      cap_deadline=$(( $(date +%s) + WAIT_SETTLE_CAP ))
+      while :; do
+        STATUS_QUERY="$sf_marker"
+        pg_state_resolve
+        [ "$ST_INFLIGHT_KEY" = "$k" ] || break
+        if [ "$(date +%s)" -ge "$cap_deadline" ]; then
+          echo "[oracle-review --wait] NOTE: reached a terminal verdict but the active-run index had not settled within ${WAIT_SETTLE_CAP}s — printing it anyway; engine bookkeeping (organizer rename/archive, ledger append) may still be finishing." >&2
+          break
+        fi
+        sleep "$WAIT_POLL_SECS"
+      done
+    fi
+    cat "$sf"
+    exit 0
+  }
+
+  while :; do
+    if [ -n "$WAIT_OUT" ] && [ -s "$WAIT_OUT.status" ]; then
+      WAIT_SF="$WAIT_OUT.status"
+      # R6a: a known target marker must match the polled file's OWN marker before it is
+      # trusted — a shared --out is reused across rounds/markers, so a mismatch means "no
+      # status for this run yet", not this run's verdict; fall back to the state join.
+      WAIT_SF_OK=1
+      if [ -n "$WAIT_MARKER" ]; then
+        WAIT_SF_MARKER="$(wait_json_str "$WAIT_SF" marker)"
+        [ "$WAIT_SF_MARKER" = "$WAIT_MARKER" ] || WAIT_SF_OK=0
+      fi
+      if [ "$WAIT_SF_OK" = 1 ]; then
+        if wait_json_has "$WAIT_SF" terminal; then
+          if wait_json_bool_true "$WAIT_SF" terminal; then
+            wait_settle_terminal "$WAIT_SF"
+          fi
+          WAIT_SF_PHASE="$(wait_json_str "$WAIT_SF" phase)"
+          WAIT_BOUND="$(wait_phase_bound "$WAIT_SF_PHASE")"
+        else
+          # KTD5: a status JSON with no `terminal` field came from a pre-v0.35 engine that
+          # will never heartbeat — apply the widest bound and warn once, instead of false-
+          # alarming on a mixed-version deploy.
+          if [ "$WAIT_LEGACY_WARNED" != 1 ]; then
+            echo "[oracle-review --wait] WARNING: status file has no 'terminal' field (pre-v0.35 engine) — applying the widest phase-window staleness bound instead of phase-aware detection." >&2
+            WAIT_LEGACY_WARNED=1
+          fi
+          WAIT_BOUND="$WAIT_WIDEST_BOUND"
+        fi
+        WAIT_SF_TS="$(wait_json_str "$WAIT_SF" ts)"
+        WAIT_SF_EPOCH="$(wait_ts_epoch "$WAIT_SF_TS")"
+        if [ -n "$WAIT_SF_EPOCH" ]; then
+          WAIT_NOW_E="$(date +%s)"
+          if [ $(( WAIT_NOW_E - WAIT_SF_EPOCH )) -gt "$WAIT_BOUND" ]; then
+            cat "$WAIT_SF"
+            echo "ERROR: --wait: status has not advanced in over ${WAIT_BOUND}s (phase ${WAIT_SF_PHASE:-unknown}) — lost observability, escalate (do not re-arm blindly)." >&2
+            exit 21
+          fi
+        fi
+        # healthy and non-terminal: fall through to the --timeout check below.
+      else
+        # marker mismatch: treat exactly like ENOENT and re-resolve via the state join.
+        WAIT_OUT=""
+      fi
+    fi
+
+    if [ -z "$WAIT_OUT" ] || [ ! -s "${WAIT_OUT:-/nonexistent}.status" ]; then
+      if [ -n "$WAIT_MARKER" ]; then
+        wait_resolve_marker
+        case "$WR_STATE" in
+          artifact_completed)
+            wait_emit_synth done "already collected (completed artifact) — return it with the harvest command" \
+              "$WAIT_MARKER" "" "$WR_ARTIFACT" "$PRO_GATE_HOME/oracle-review.sh --harvest '$WAIT_MARKER' --out <file>" collect
+            exit 0;;
+          artifact_pending)
+            wait_emit_synth failed "a captured review awaits MANUAL recovery ($WR_ARTIFACT) — not auto-collectible" \
+              "$WAIT_MARKER" "" "" "$PRO_GATE_HOME/oracle-review.sh --status '$WAIT_MARKER'" recover
+            exit 0;;
+          res_complete)
+            wait_emit_synth in-progress "reservation complete, awaiting harvest" "$WAIT_MARKER" "$WR_OUT" "" "$WR_CMD" collect
+            exit 0;;
+          res_crossbound)
+            wait_emit_synth failed "reservation cross-bound to another run's conversation — not retryable via harvest" \
+              "$WAIT_MARKER" "$WR_OUT" "" "$PRO_GATE_HOME/oracle-review.sh --status '$WAIT_MARKER'" recover
+            exit 0;;
+          res_generating|res_ambiguous)
+            # known run, file pending (still generating, or an ambiguous-but-retryable
+            # capture): pin the resolved out-path so later ticks poll the file directly
+            # instead of re-running the whole state join every time.
+            [ -n "$WR_OUT" ] && WAIT_OUT="$WR_OUT"
+            ;;
+          ledger_hit)
+            case "$WR_LEDGER_OUTCOME" in
+              clean) wait_emit_synth done "" "$WAIT_MARKER" "$WR_OUT" "$WR_OUT" "" verdict; exit 0;;
+              in-progress)
+                wait_emit_synth in-progress "" "$WAIT_MARKER" "$WR_OUT" "" \
+                  "$PRO_GATE_HOME/oracle-review.sh --harvest '$WAIT_MARKER' --out '$WR_OUT' --timeout 20m" collect
+                exit 0;;
+              deferred|oversized|round-capped)
+                wait_emit_synth "$WR_LEDGER_OUTCOME" "" "$WAIT_MARKER" "$WR_OUT" "" \
+                  "$PRO_GATE_HOME/oracle-review.sh --status '$WAIT_MARKER'" recover
+                exit 0;;
+              *)
+                wait_emit_synth failed "$WR_LEDGER_OUTCOME" "$WAIT_MARKER" "$WR_OUT" "" "" verdict
+                exit 0;;
+            esac;;
+          none)
+            echo "ERROR: --wait: no engine state found anywhere for marker $WAIT_MARKER (no reservation, no completed artifact, no ledger row) — this run does not exist." >&2
+            exit 2;;
+        esac
+      fi
+      # Out-path mode (or marker mode that just pinned/kept polling without a status file
+      # yet): AE9 — a status file that has not been written yet is non-terminal, never an
+      # instant lost-observability verdict. Falls through to the --timeout check below.
+    fi
+
+    WAIT_NOW="$(date +%s)"
+    if [ "$WAIT_NOW" -ge "$WAIT_DEADLINE" ]; then
+      # AE7: print whatever JSON is known even on a --timeout 0 immediate probe.
+      [ -n "$WAIT_OUT" ] && [ -s "$WAIT_OUT.status" ] && cat "$WAIT_OUT.status"
+      echo "ERROR: --wait: timed out after ${WAIT_TIMEOUT_SECS}s — re-arm safe (the run itself is unaffected)." >&2
+      exit 20
+    fi
+    sleep "$WAIT_POLL_SECS"
+  done
 fi
 
 # Organizer locks are marker-unique and held for at most 95s. Sweep crash-left flock files and
@@ -674,30 +1057,58 @@ fi
 # NEVER relaunch).
 # v0.20: the JSON carries `marker`, the run's conversation correlation id, so callers can
 # harvest an in-progress review without grepping engine logs.
+# blocking-wait-verb (R8/R9): the JSON also carries a literal `terminal` boolean and a
+# `next_action {cmd, terminal, wait_class}` handoff so a --wait caller (or any status-file
+# reader) never has to re-derive terminality or the follow-up command from phase-name prose.
+# Terminal set matches the doc block above: done, failed, deferred, oversized, round-capped,
+# in-progress. wait_class anchors (R9): done/failed -> verdict; in-progress -> collect (with
+# the exact harvest command); deferred/oversized/round-capped -> recover (no slot spent, no
+# single re-run command is derivable from status alone, so next_action points at --status for
+# the current picture). Every other phase is non-terminal: terminal=false, wait_class=null,
+# cmd="" (nothing to run yet — keep waiting).
 STATUS_FILE="$OUT.status"
 pg_status() {  # $1 phase, $2 optional detail — variable fields are JSON-escaped (v0.18.1:
   # $OUT is caller-supplied; a quote/backslash in it would corrupt the polling contract)
   local phase="$1" detail="${2:-}" ts model_label
+  local terminal=0 wait_class="" next_cmd="" terminal_lit wait_class_lit
   ts="$(date +%Y-%m-%dT%H:%M:%S%z)"
   # v0.21: `model` is the run's resolved model rendered through pg_model_label (captured label or
   # role-based fallback, never a hardcoded version); `model_warn` carries the advisory downgrade
   # marker (empty unless the model looked weak/unreadable). Human surfaces read both from here.
   model_label="$(pg_model_label "${RESOLVED_MODEL:-}")"
+  case "$phase" in
+    done|failed|deferred|oversized|round-capped|in-progress) terminal=1;;
+  esac
+  case "$phase" in
+    done|failed) wait_class=verdict;;
+    in-progress)
+      wait_class=collect
+      next_cmd="${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh --harvest '${RUN_MARKER:-}' --out '$OUT' --timeout 20m";;
+    deferred|oversized|round-capped)
+      wait_class=recover
+      next_cmd="${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh --status '${RUN_MARKER:-${PR_NUM:-}}'";;
+  esac
   if pg_have jq; then
     jq -nc --arg phase "$phase" --argjson attempt "${attempt:-0}" --arg detail "$detail" \
        --arg pr "${PR_NUM:-diff}" --arg out "$OUT" --arg ts "$ts" --arg marker "${RUN_MARKER:-}" \
        --arg model "$model_label" --arg model_warn "${MODEL_WARN:-}" \
        --arg result "${RESULT_PATH:-}" \
-       '{phase:$phase,attempt:$attempt,detail:$detail,pr:$pr,out:$out,ts:$ts,marker:$marker,model:$model,model_warn:$model_warn,result:$result}' \
+       --argjson terminal "$terminal" --arg wait_class "$wait_class" --arg next_cmd "$next_cmd" \
+       '{phase:$phase,attempt:$attempt,detail:$detail,pr:$pr,out:$out,ts:$ts,marker:$marker,model:$model,model_warn:$model_warn,result:$result,terminal:($terminal==1),next_action:{cmd:$next_cmd,terminal:($terminal==1),wait_class:(if $wait_class=="" then null else $wait_class end)}}' \
        > "$STATUS_FILE.tmp" 2>/dev/null
   else
-    printf '{"phase":"%s","attempt":%d,"detail":"%s","pr":"%s","out":"%s","ts":"%s","marker":"%s","model":"%s","model_warn":"%s","result":"%s"}\n' \
+    terminal_lit="false"; [ "$terminal" = 1 ] && terminal_lit="true"
+    wait_class_lit="null"; [ -n "$wait_class" ] && wait_class_lit="\"$wait_class\""
+    printf '{"phase":"%s","attempt":%d,"detail":"%s","pr":"%s","out":"%s","ts":"%s","marker":"%s","model":"%s","model_warn":"%s","result":"%s","terminal":%s,"next_action":{"cmd":"%s","terminal":%s,"wait_class":%s}}\n' \
       "$phase" "${attempt:-0}" "$(printf '%s' "$detail" | tr -d '"\\' | tr '\n' ' ')" \
       "${PR_NUM:-diff}" "$(printf '%s' "$OUT" | tr -d '"\\' | tr '\n' ' ')" "$ts" \
       "$(printf '%s' "${RUN_MARKER:-}" | tr -d '"\\' | tr '\n' ' ')" \
       "$(printf '%s' "$model_label" | tr -d '"\\' | tr '\n' ' ')" \
       "$(printf '%s' "${MODEL_WARN:-}" | tr -d '"\\' | tr '\n' ' ')" \
       "$(printf '%s' "${RESULT_PATH:-}" | tr -d '"\\' | tr '\n' ' ')" \
+      "$terminal_lit" \
+      "$(printf '%s' "$next_cmd" | tr -d '"\\' | tr '\n' ' ')" \
+      "$terminal_lit" "$wait_class_lit" \
       > "$STATUS_FILE.tmp" 2>/dev/null
   fi
   { [ -s "$STATUS_FILE.tmp" ] && mv -f "$STATUS_FILE.tmp" "$STATUS_FILE"; } 2>/dev/null || true
@@ -2051,6 +2462,11 @@ pg_status waiting-slot "effective ${EFF_CONC} / ceiling ${MAX_CONC}"
 SLOT_DEADLINE=$(( $(date +%s) + LOCK_WAIT ))
 SLOT_OK=0
 SLOT_HELD=""
+# blocking-wait-verb (R10/KTD2): heartbeat the waiting-slot phase so a --wait poller can tell
+# a healthy long wait from a stalled one. Throttled to PRO_GATE_HEARTBEAT_SECS (default 30,
+# inline per repo convention) so the 3s loop below does not hammer the status file.
+PG_HEARTBEAT_SECS="${PRO_GATE_HEARTBEAT_SECS:-30}"
+SLOT_HB_LAST=$(date +%s)
 while :; do
   EFF_CONC="$(pg_ramp_level "$MAX_CONC")"
   # Durable reservations occupy real account capacity even though their wrapper process has
@@ -2083,7 +2499,12 @@ while :; do
     SLOT_BLOCK_LOGGED="$(date +%s)"
     pg_report_capacity_holders "$EFF_CONC"
   fi
-  if [ "$(date +%s)" -ge "$SLOT_DEADLINE" ]; then break; fi
+  SLOT_NOW="$(date +%s)"
+  if [ "$SLOT_NOW" -ge "$SLOT_DEADLINE" ]; then break; fi
+  if [ $(( SLOT_NOW - SLOT_HB_LAST )) -ge "$PG_HEARTBEAT_SECS" ]; then
+    pg_status waiting-slot "effective ${EFF_CONC} / ceiling ${MAX_CONC}"
+    SLOT_HB_LAST="$SLOT_NOW"
+  fi
   sleep 3
 done
 if [ "$SLOT_OK" != 1 ]; then
@@ -2114,7 +2535,7 @@ STALL_SECS="${PRO_GATE_STALL_SECS:-600}"
 NOTHINK_SECS="${PRO_GATE_NOTHINK_SECS:-600}"
 
 run_oracle() {  # $1 = browser model strategy (select|current|ignore)
-  local strategy="$1" job started size last_size last_change now last_line prc
+  local strategy="$1" job started size last_size last_change now last_line prc last_hb
   local transcript="$WORK/oracle.${#ORACLE_LOG_TRANSCRIPTS[@]}.log"
   local proof="$WORK/oracle.${#ORACLE_LOG_TRANSCRIPTS[@]}.sha256"
   local producer_file="${transcript%.log}.pid" producer drained
@@ -2168,13 +2589,22 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
     exit "${_pipeline_status[0]:-1}"
   ) &
   job=$!
-  started=$SECONDS; last_size=-1; last_change=$SECONDS
+  started=$SECONDS; last_size=-1; last_change=$SECONDS; last_hb=$SECONDS
   while kill -0 "$job" 2>/dev/null; do
     sleep 10
     [ -s "$CAPTURE_OUT" ] && continue   # findings are landing — let the run finish undisturbed
     size=$(wc -c < "$RUNLOG" 2>/dev/null) || size=0
     if [ "$size" != "$last_size" ]; then last_size="$size"; last_change=$SECONDS; fi
     now=$SECONDS
+    # blocking-wait-verb (R10/KTD2): heartbeat the frozen-`launching` phase so a --wait poller
+    # can distinguish a healthy generation window from a stalled one. Same throttle as the
+    # slot-wait loop (PG_HEARTBEAT_SECS, set above); a same-iteration transition below (stall,
+    # live-detected, throttled, watchdog-killed) legitimately overwrites this with a fresh
+    # phase — never a regression, just the next real state.
+    if [ $(( now - last_hb )) -ge "$PG_HEARTBEAT_SECS" ]; then
+      pg_status launching "strategy ${strategy}"
+      last_hb=$now
+    fi
     last_line="$(tail -n 1 "$RUNLOG" 2>/dev/null || true)"
     if [ $(( now - last_change )) -ge "$STALL_SECS" ]; then
       echo "[oracle-review] watchdog: oracle silent for ${STALL_SECS}s with no findings — killing this attempt (salvage/retry follows)." >&2

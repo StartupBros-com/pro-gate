@@ -107,4 +107,19 @@ sleep 3
 check 'self-reload=0 does not detect/reload' "$([ "$(grep -c 'detected a new daemon deploy' "$DLOG2")" -eq 0 ]; echo $?)" "reloads=$(grep -c 'detected a new daemon deploy' "$DLOG2")"
 check 'self-reload=0 keeps a single startup line' "$([ "$(grep -c 'pro-review-daemon starting' "$DLOG2")" -eq 1 ]; echo $?)" "starts=$(grep -c 'pro-review-daemon starting' "$DLOG2")"
 
+echo '# v0.35 (#88, R12/F4): headless agent prompt blocks on --wait, not a sleep-60 poll loop'
+DAEMON_SRC="$HERE/../daemon/daemon.sh"
+check 'daemon prompt no longer contains the sleep-60 poll instruction' \
+  "$(! grep -q 'sleep 60;' "$DAEMON_SRC"; echo $?)" \
+  "$(grep -n 'sleep 60;' "$DAEMON_SRC")"
+check 'daemon prompt instructs a chunked --wait loop' \
+  "$(grep -q -- '--wait' "$DAEMON_SRC"; echo $?)" \
+  "no --wait reference found in $DAEMON_SRC"
+check 'daemon prompt re-arms on --wait timeout (exit 20)' \
+  "$(grep -q 'Exit 20' "$DAEMON_SRC"; echo $?)" \
+  "no exit-20 re-arm instruction found"
+check 'daemon prompt escalates on lost observability (exit 21) instead of guessing' \
+  "$(grep -q 'Exit 21' "$DAEMON_SRC"; echo $?)" \
+  "no exit-21 escalation instruction found"
+
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }

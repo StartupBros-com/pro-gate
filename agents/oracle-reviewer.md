@@ -18,7 +18,10 @@ this file hardcodes.
 > **Caller contract (engine ≥ v0.18).** This file and `skills/pro-gate/SKILL.md` are the two
 > callers of `oracle-review.sh`; the SKILL is the authoritative caller guide. When the engine's
 > contract changes (status file, exit codes, recovery), both files must change in the same PR —
-> they have drifted before (v0.18 updated the skill but not this agent).
+> they have drifted before (v0.18 updated the skill but not this agent). Engine ≥v0.35: the
+> documented protocol is launch detached, record the marker, block on `--wait` in the
+> background, act on its printed `next_action` — see step 3 below. `--status`/`--harvest`
+> remain the degradation path when `--wait` is unavailable or the marker/status file was lost.
 
 ## Hard constraints
 
@@ -77,27 +80,36 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
    engine would have healed. Just run the engine and interpret its exit code.
 
 3. **Run the review.** From the repo, launch the engine DETACHED (background, no caller-side
-   timeout) and poll `$OUT.status`, exactly as the main skill does. A wrapper timeout that fires
+   timeout), record its marker, then block on `--wait` (engine ≥v0.35) in the background and end
+   your turn — the same protocol as the main skill's step 3. A wrapper timeout that fires
    mid-run can kill the engine after the slot is spent but before it persists a cooked run's
    harvestable exit-9 reservation — the worst possible state — and a later invocation would then
-   double-spend. If foreground is truly unavoidable, budget the FULL worst case — TWO lock waits
-   (the per-change guard and the account slot, each up to `PRO_GATE_LOCK_WAIT`, default 40 min)
-   PLUS `--timeout` and its grace, the retry, and the reattach/throttle/salvage windows (a large
-   cooked diff can reason ~65 min) — never the bare 10-30 min happy path. If your wrapper is
-   killed anyway, verify the engine process, the status file, and any reservation before ever
-   launching again:
+   double-spend.
    ```bash
    OUT="${TMPDIR:-/tmp}/oracle-reviewer-pr-<num>.md"
    "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --pr <num|url> --repo <REPO> \
-     --input <both|bundle|connector> --out "$OUT" --timeout 30m
+     --input <both|bundle|connector> --out "$OUT" --timeout 30m &
+   disown
+   sleep 5
+   "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --wait "$OUT" --timeout 14400
    ```
-   The engine writes single-line JSON to `$OUT.status` at every phase change
-   (`preflight → waiting-slot → launching → … → done|failed|deferred|in-progress|oversized|round-capped`).
-   If your Bash call is interrupted or times out, do NOT relaunch: read `$OUT.status` first;
-   phases `throttled` and `salvaging` mean the engine is still working and quota may already be
-   spent. A run killed mid-`salvaging` may not have written its exit-9 reservation yet, so a bare
-   re-run could double-spend: harvest by the status `marker` (see exit 9 below), or confirm no open
-   conversation tab matches the PR, before ever launching again.
+   Run the `--wait` call with `run_in_background: true`; the harness wakes you when it exits.
+   `--wait` is read-only (never launches, harvests, or mutates state) and blocks until the run
+   reaches a terminal phase, then prints the final status JSON — safe to re-run any time you lose
+   track of one. If your own tool-call cap is shorter than the run's worst-case envelope, chunk
+   it: loop `--wait "$OUT" --timeout <chunk>`, re-arming on exit 20 (timeout, healthy) and
+   escalating on exit 21 (lost observability) rather than assuming the bare 10-30 min happy path.
+   `next_action` in the printed JSON names exactly what to do next (see step 3's exit-code list
+   below for the full taxonomy).
+
+   **Degradation path**, if `--wait` is unavailable or you lost the marker/status file
+   (compaction, new session): the engine still writes single-line JSON to `$OUT.status` at every
+   phase change (`preflight → waiting-slot → launching → … → done|failed|deferred|in-progress|oversized|round-capped`);
+   poll it by hand, or run `--status <pr>` for the same read-only state join without blocking.
+   Phases `throttled` and `salvaging` mean the engine is still working and quota may already be
+   spent — do NOT relaunch. A run killed mid-`salvaging` may not have written its exit-9
+   reservation yet, so a bare re-run could double-spend: harvest by the status `marker` (see
+   exit 9 below), or confirm no open conversation tab matches the PR, before ever launching again.
 
 3. **Interpret the exit code**, then return the matching envelope:
    - `0`: review ready. Read the resolved model from `$OUT.status` (`jq -r .model`, the model
@@ -174,6 +186,18 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
      sign-off, never grounds to revert commits or close the PR (SKILL.md section 6,
      disposition).
    - `2`/`4`/`5` — caller error (usage/repo/diff): unavailable envelope with the reason.
+   - `10` — bootstrap failure: the shared lib (`lib.sh`/`pro-gate-lib.sh`) could not be found.
+     Not a review outcome — a broken or partial install. Unavailable envelope; route to
+     reinstalling the plugin/runtime rather than retrying the review.
+
+   `--wait`'s own exit codes (engine ≥v0.35) are a separate taxonomy from the run codes above,
+   since `--wait` never runs a review itself — it only watches one: `0` verdict reached (a
+   terminal phase was hit; the printed `next_action` says what to do) · `2` usage error, or no
+   engine state exists anywhere for the given marker (no reservation, no completed artifact, no
+   ledger row) — do not wait for a run that was never launched · `20` timeout — `--timeout`
+   elapsed while the run stayed healthy and non-terminal; re-arm safe, call `--wait` again · `21`
+   lost observability — the status has not advanced within its phase's staleness bound; do NOT
+   re-arm blindly, escalate instead (fall back to `--status`, check engine logs/browser state).
 
 ## Output envelope
 

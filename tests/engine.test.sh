@@ -43,6 +43,27 @@ start_mock() { # $1 = tab text file; optional $2 = organizer state file; sets MO
   PORT="$(tr -d '[:space:]' < "$TDIR/port")"; : > "$TDIR/port"
 }
 
+# v0.35 (#88): a PATH that resolves every already-installed external tool this suite needs
+# EXCEPT jq, built once and reused by every printf-fallback/no-jq scenario. A merely-narrowed
+# PATH (e.g. /usr/bin:/bin) is not enough on hosts where jq is ALSO installed system-wide
+# (not just via a user PATH entry) — this symlinks every executable regular file found under
+# the standard bin directories, skipping jq by name, so `command -v jq` genuinely fails while
+# every other tool oracle-review.sh needs still resolves.
+NOJQ_DIR="$TDIR/nojq-bin"
+build_nojq_path() {
+  [ -d "$NOJQ_DIR" ] && return 0
+  mkdir -p "$NOJQ_DIR"
+  for d in /usr/bin /bin /usr/local/bin /opt/homebrew/bin; do
+    [ -d "$d" ] || continue
+    for f in "$d"/*; do
+      b="$(basename "$f")"
+      [ "$b" = jq ] && continue
+      [ -f "$f" ] && [ -x "$f" ] || continue
+      ln -sf "$f" "$NOJQ_DIR/$b" 2>/dev/null || true
+    done
+  done
+}
+
 MARKER="pg-run-77-1700000000-11"
 run_engine() { # args... ; captures RC
   PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
@@ -2890,5 +2911,500 @@ env PRO_GATE_HOME="$TDIR/home-scratch" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_
 LOGN2="$(find "$TDIR/home-scratch/logs" -name "$MHID*" 2>/dev/null | wc -l | tr -d ' ')"
 check 'second invocation adds a log instead of overwriting' \
   "$([ "$LOGN2" -gt "$LOGN1" ]; echo $?)" "before=$LOGN1 after=$LOGN2"
+
+####################################################################################################
+# v0.35 (#88) U3: pg_status's terminal/next_action/wait_class schema, across all 16 known phases,
+# both the jq branch and the printf-fallback branch (extraction technique: pull the function body
+# out of the engine verbatim and source it alongside the library in an isolated subshell — this
+# exercises the REAL implementation, not a reimplementation of its logic).
+####################################################################################################
+echo '# v0.35 U3: pg_status terminal/next_action/wait_class across all 16 phases'
+while IFS='=' read -r name _; do
+  case "$name" in PRO_GATE_*|ORACLE_*) unset "$name" ;; esac
+done < <(env)
+export PRO_GATE_MIN_AVAIL_MB=0 PRO_GATE_MAX_SWAP_PCT=101 PRO_GATE_TIMEOUT_BIN=/usr/bin/timeout
+export PRO_GATE_EARLY_PROBE_SECS=0
+
+sed -n '/^pg_status() {/,/^}$/p' "$ENGINE" > "$TDIR/pg_status_fn.sh"
+check 'pg_status extraction found the function body' \
+  "$(grep -q 'next_action' "$TDIR/pg_status_fn.sh"; echo $?)" "$(wc -l < "$TDIR/pg_status_fn.sh") lines extracted"
+
+PSHOME="$TDIR/home-pgstatus"; mkdir -p "$PSHOME"
+PS_OUT="$TDIR/ps-out.md"
+PS_MARKER="pg-run-psfix-1700000000-1"
+run_pg_status() { # $1 phase; $2 optional PATH override (for the no-jq branch)
+  rm -f "$PS_OUT.status"
+  PATH="${2:-$PATH}" PRO_GATE_HOME="$PSHOME" bash -c '
+    set -uo pipefail
+    . "'"$HERE"'/../lib/pro-gate-lib.sh"
+    . "'"$TDIR"'/pg_status_fn.sh"
+    OUT="'"$PS_OUT"'"; STATUS_FILE="$OUT.status"
+    PR_NUM=42; RUN_MARKER="'"$PS_MARKER"'"; RESOLVED_MODEL=""; MODEL_WARN=""; RESULT_PATH=""; attempt=1
+    pg_status "'"$1"'"
+  '
+}
+
+PS_PHASES="cloudflare deferred done failed in-progress launching live-detected oversized preflight retry-wait round-capped salvaging throttled waiting-pr-lock waiting-slot watchdog-killed"
+PS_COUNT=0
+for phase in $PS_PHASES; do
+  PS_COUNT=$((PS_COUNT + 1))
+  case "$phase" in
+    done|failed) EXP_TERM=true; EXP_WC=verdict ;;
+    deferred|oversized|round-capped) EXP_TERM=true; EXP_WC=recover ;;
+    in-progress) EXP_TERM=true; EXP_WC=collect ;;
+    *) EXP_TERM=false; EXP_WC=null ;;
+  esac
+
+  run_pg_status "$phase"
+  SF="$PS_OUT.status"
+  check "pg_status($phase) jq: valid JSON" "$(jq empty "$SF" >/dev/null 2>&1; echo $?)" "$(cat "$SF" 2>/dev/null)"
+  check "pg_status($phase) jq: phase echoed" "$([ "$(jq -r .phase "$SF" 2>/dev/null)" = "$phase" ]; echo $?)" "$(cat "$SF" 2>/dev/null)"
+  check "pg_status($phase) jq: terminal=$EXP_TERM (top-level + next_action mirror)" \
+    "$(jq -e --argjson t "$EXP_TERM" '.terminal == $t and .next_action.terminal == $t' "$SF" >/dev/null 2>&1; echo $?)" \
+    "$(jq -c '{terminal,next_action}' "$SF" 2>/dev/null)"
+  if [ "$EXP_WC" = null ]; then
+    check "pg_status($phase) jq: wait_class=null" \
+      "$(jq -e '.next_action.wait_class == null' "$SF" >/dev/null 2>&1; echo $?)" "$(jq -c .next_action "$SF" 2>/dev/null)"
+  else
+    check "pg_status($phase) jq: wait_class=$EXP_WC" \
+      "$(jq -e --arg wc "$EXP_WC" '.next_action.wait_class == $wc' "$SF" >/dev/null 2>&1; echo $?)" "$(jq -c .next_action "$SF" 2>/dev/null)"
+  fi
+done
+check 'pg_status covered all 16 R8/staleness-table phases' "$([ "$PS_COUNT" -eq 16 ]; echo $?)" "covered $PS_COUNT"
+
+# in-progress carries the EXACT harvest command a caller should run next, marker and out included.
+run_pg_status in-progress
+check 'pg_status(in-progress) next_action.cmd is the exact harvest command' \
+  "$(jq -r '.next_action.cmd' "$PS_OUT.status" 2>/dev/null | grep -qF -- "--harvest '$PS_MARKER' --out '$PS_OUT' --timeout 20m"; echo $?)" \
+  "$(jq -r '.next_action.cmd' "$PS_OUT.status" 2>/dev/null)"
+
+echo '# v0.35 U3: pg_status printf-fallback branch (jq removed from PATH) matches the jq branch field-for-field'
+build_nojq_path
+check 'nojq PATH genuinely hides jq' "$(PATH="$NOJQ_DIR" command -v jq >/dev/null 2>&1; [ $? -ne 0 ]; echo $?)" "jq still resolves on \$NOJQ_DIR"
+for phase in $PS_PHASES; do
+  case "$phase" in
+    done|failed) EXP_TERM_LIT=true; EXP_WC_LIT='"verdict"' ;;
+    deferred|oversized|round-capped) EXP_TERM_LIT=true; EXP_WC_LIT='"recover"' ;;
+    in-progress) EXP_TERM_LIT=true; EXP_WC_LIT='"collect"' ;;
+    *) EXP_TERM_LIT=false; EXP_WC_LIT=null ;;
+  esac
+  run_pg_status "$phase" "$NOJQ_DIR"
+  SF="$PS_OUT.status"
+  check "pg_status($phase) printf-fallback: phase echoed" "$(grep -q "\"phase\":\"$phase\"" "$SF"; echo $?)" "$(cat "$SF" 2>/dev/null)"
+  # Two DISTINCT occurrences per the real field order (phase..result,terminal,next_action{cmd,terminal,wait_class}):
+  # the top-level terminal sits between "result" and "next_action"; the mirrored one sits between
+  # next_action's "cmd" and "wait_class". Matching a bare "\"terminal\":$X}" (assuming terminal is
+  # the LAST field before a closing brace) never fires -- wait_class always follows it -- and false-failed
+  # every phase here until fixed.
+  check "pg_status($phase) printf-fallback: terminal=$EXP_TERM_LIT (top-level + next_action mirror)" \
+    "$(grep -qF "\"terminal\":$EXP_TERM_LIT,\"next_action\"" "$SF" && grep -qF "\"terminal\":$EXP_TERM_LIT,\"wait_class\"" "$SF"; echo $?)" "$(cat "$SF" 2>/dev/null)"
+  check "pg_status($phase) printf-fallback: wait_class=$EXP_WC_LIT" \
+    "$(grep -qF "\"wait_class\":$EXP_WC_LIT}" "$SF"; echo $?)" "$(cat "$SF" 2>/dev/null)"
+done
+run_pg_status in-progress "$NOJQ_DIR"
+check 'pg_status(in-progress) printf-fallback: next_action.cmd is the exact harvest command' \
+  "$(grep -qF -- "--harvest '$PS_MARKER' --out '$PS_OUT' --timeout 20m" "$PS_OUT.status"; echo $?)" "$(cat "$PS_OUT.status" 2>/dev/null)"
+
+####################################################################################################
+# v0.35 (#88) U3: heartbeat integration — the slot-wait loop and the watchdog loop must each
+# re-write the status file at most every PRO_GATE_HEARTBEAT_SECS, with a fresh ts and the SAME
+# phase (never a regression), while genuinely blocked.
+####################################################################################################
+echo '# v0.35 U3: slot-wait loop heartbeats while blocked on a busy slot'
+HBHOME="$TDIR/home-hb-slot"; mkdir -p "$HBHOME"
+exec {HBSLOTFD}>>"$HBHOME/oracle.lock.slot1"; flock -n "$HBSLOTFD"
+PRO_GATE_HOME="$HBHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_MAX_CONCURRENCY=1 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
+  PRO_GATE_LOCK_WAIT=9 PRO_GATE_HEARTBEAT_SECS=1 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" NODE_OPTIONS= \
+  bash "$ENGINE" --diff "$TDIR/small.diff" --repo "$TDIR" --out "$TDIR/o-hbslot.md" --timeout 5s \
+  >"$TDIR/hbslot.stdout" 2>"$TDIR/hbslot.stderr" &
+HB_ENGPID=$!
+# Poll for the waiting-slot phase specifically (not merely "a status file exists") -- an early
+# preflight write can otherwise race HB_T0 into the wrong phase and false-fail the no-regression
+# check below.
+for _ in $(seq 1 50); do [ "$(phase_of "$TDIR/o-hbslot.md.status")" = waiting-slot ] && break; sleep 0.2; done
+HB_T0="$(phase_of "$TDIR/o-hbslot.md.status")"
+HB_TS0="$(jq -r .ts "$TDIR/o-hbslot.md.status" 2>/dev/null)"
+sleep 4
+HB_T1="$(phase_of "$TDIR/o-hbslot.md.status")"
+HB_TS1="$(jq -r .ts "$TDIR/o-hbslot.md.status" 2>/dev/null)"
+sleep 3
+HB_T2="$(phase_of "$TDIR/o-hbslot.md.status")"
+HB_TS2="$(jq -r .ts "$TDIR/o-hbslot.md.status" 2>/dev/null)"
+wait "$HB_ENGPID" 2>/dev/null; HB_RC=$?
+eval "exec ${HBSLOTFD}>&-"
+check 'slot-wait heartbeat: phase never regresses off waiting-slot while blocked' \
+  "$([ "$HB_T0" = waiting-slot ] && [ "$HB_T1" = waiting-slot ] && [ "$HB_T2" = waiting-slot ]; echo $?)" \
+  "phases: $HB_T0 / $HB_T1 / $HB_T2"
+check 'slot-wait heartbeat: ts advances tick over tick' \
+  "$([ -n "$HB_TS0" ] && [ -n "$HB_TS1" ] && [ -n "$HB_TS2" ] && [ "$HB_TS1" '>' "$HB_TS0" ] && [ "$HB_TS2" '>' "$HB_TS1" ]; echo $?)" \
+  "ts: $HB_TS0 / $HB_TS1 / $HB_TS2"
+check 'slot-wait heartbeat: run eventually times out on the busy slot' \
+  "$([ "$HB_RC" -eq 7 ]; echo $?)" "rc=$HB_RC $(tail -3 "$TDIR/hbslot.stderr")"
+
+echo '# v0.35 U3: watchdog loop heartbeats while a launch is silently generating, then legitimately transitions to watchdog-killed'
+mkdir -p "$TDIR/bin"
+cat > "$TDIR/bin/oracle-slowsilent" <<'FAKE_SLOWSILENT'
+#!/usr/bin/env bash
+out=""
+while [ $# -gt 0 ]; do case "$1" in --write-output) out="$2"; shift 2;; *) shift;; esac; done
+echo "[oracle] starting up"
+sleep 60
+printf '[P1] a.sh:1 - finding\n  Why: test\nP2: none\nP3: none\nVERDICT: SHIP - fixture.\n' > "$out"
+FAKE_SLOWSILENT
+chmod +x "$TDIR/bin/oracle-slowsilent"
+HBWDHOME="$TDIR/home-hb-wd"; mkdir -p "$HBWDHOME"
+PRO_GATE_HOME="$HBWDHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
+  PRO_GATE_STALL_SECS=15 PRO_GATE_NOTHINK_SECS=999 PRO_GATE_HEARTBEAT_SECS=1 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-slowsilent" NODE_OPTIONS= \
+  bash "$ENGINE" --diff "$TDIR/small.diff" --repo "$TDIR" --out "$TDIR/o-hbwd.md" --timeout 5m \
+  >"$TDIR/hbwd.stdout" 2>"$TDIR/hbwd.stderr" &
+HBWD_ENGPID=$!
+for _ in $(seq 1 100); do [ "$(phase_of "$TDIR/o-hbwd.md.status" 2>/dev/null)" = launching ] && break; sleep 0.3; done
+HBWD_TS0="$(jq -r .ts "$TDIR/o-hbwd.md.status" 2>/dev/null)"
+sleep 11
+HBWD_T1="$(phase_of "$TDIR/o-hbwd.md.status")"
+HBWD_TS1="$(jq -r .ts "$TDIR/o-hbwd.md.status" 2>/dev/null)"
+sleep 10
+HBWD_T2="$(phase_of "$TDIR/o-hbwd.md.status")"
+HBWD_TS2="$(jq -r .ts "$TDIR/o-hbwd.md.status" 2>/dev/null)"
+# Past STALL_SECS=15 from the first size sample: the run must transition to watchdog-killed —
+# a legitimate phase change, not a heartbeat regression.
+for _ in $(seq 1 40); do [ "$(phase_of "$TDIR/o-hbwd.md.status" 2>/dev/null)" = watchdog-killed ] && break; sleep 0.5; done
+HBWD_T3="$(phase_of "$TDIR/o-hbwd.md.status")"
+wait "$HBWD_ENGPID" 2>/dev/null; HBWD_RC=$?
+check 'watchdog heartbeat: phase stays launching across two ticks while silently generating' \
+  "$([ "$HBWD_T1" = launching ] && [ "$HBWD_T2" = launching ]; echo $?)" "phases: $HBWD_T1 / $HBWD_T2"
+check 'watchdog heartbeat: ts advances tick over tick' \
+  "$([ -n "$HBWD_TS0" ] && [ -n "$HBWD_TS1" ] && [ -n "$HBWD_TS2" ] && [ "$HBWD_TS1" '>' "$HBWD_TS0" ] && [ "$HBWD_TS2" '>' "$HBWD_TS1" ]; echo $?)" \
+  "ts: $HBWD_TS0 / $HBWD_TS1 / $HBWD_TS2"
+check 'watchdog heartbeat: eventually transitions to watchdog-killed (legitimate, not a regression)' \
+  "$([ "$HBWD_T3" = watchdog-killed ]; echo $?)" "final phase: $HBWD_T3"
+kill "$HBWD_ENGPID" 2>/dev/null; wait "$HBWD_ENGPID" 2>/dev/null || true
+
+####################################################################################################
+# v0.35 (#88) U4: the --wait verb (R4-R7, R6a, R10 consumer side; AE1, AE2, AE5, AE6, AE7, AE8, AE9;
+# KTD5 legacy detection; terminal-exit ordering). Scenarios 1-9 and 10(R6a) hand-construct raw
+# status-file / reservation / artifact / ledger fixtures matching pg_status's real emitted shape
+# (validated byte-for-byte against the real implementation by U3, above) so each staleness/branch
+# decision can be tested in isolation without a live browser. Scenario 11 and the duplicate-numbered
+# end-to-end scenario drive the REAL engine over mock CDP. Scenario 12 (long-wait notification
+# survival, hours-scale) is MANUAL per the plan and is skipped here — see the note near the bottom.
+####################################################################################################
+echo '# v0.35 U4: --wait verb'
+while IFS='=' read -r name _; do
+  case "$name" in PRO_GATE_*|ORACLE_*) unset "$name" ;; esac
+done < <(env)
+export PRO_GATE_MIN_AVAIL_MB=0 PRO_GATE_MAX_SWAP_PCT=101 PRO_GATE_TIMEOUT_BIN=/usr/bin/timeout
+export PRO_GATE_EARLY_PROBE_SECS=0
+
+WHOME="$TDIR/home-wait"; mkdir -p "$WHOME"
+
+echo '# scenario 1 (AE5): a status file flipping to terminal mid-poll unblocks --wait within one poll interval'
+W1OUT="$TDIR/w1.md"
+NOWTS="$(date +%Y-%m-%dT%H:%M:%S%z)"
+printf '{"phase":"waiting-slot","attempt":1,"detail":"","pr":"5","out":"%s","ts":"%s","marker":"pg-run-w1-1700000100-1","model":"","model_warn":"","result":"","terminal":false,"next_action":{"cmd":"","terminal":false,"wait_class":null}}\n' \
+  "$W1OUT" "$NOWTS" > "$W1OUT.status"
+PRO_GATE_HOME="$WHOME" PRO_GATE_WAIT_POLL_SECS=1 "$ENGINE" --wait "$W1OUT" --timeout 10 >"$TDIR/w1.out" 2>"$TDIR/w1.err" &
+W1PID=$!
+sleep 0.4
+printf '{"phase":"done","attempt":1,"detail":"","pr":"5","out":"%s","ts":"%s","marker":"pg-run-w1-1700000100-1","model":"gpt-5","model_warn":"","result":"%s","terminal":true,"next_action":{"cmd":"","terminal":true,"wait_class":"verdict"}}\n' \
+  "$W1OUT" "$(date +%Y-%m-%dT%H:%M:%S%z)" "$W1OUT" > "$W1OUT.status"
+W1_T0=$(date +%s)
+wait "$W1PID"; W1RC=$?
+W1_T1=$(date +%s)
+check 'AE5: blocked --wait exits 0 once the fixture flips to terminal' "$([ "$W1RC" -eq 0 ]; echo $?)" "rc=$W1RC $(cat "$TDIR/w1.err")"
+check 'AE5: exits within one poll interval of the flip' "$([ $(( W1_T1 - W1_T0 )) -le 3 ]; echo $?)" "elapsed=$(( W1_T1 - W1_T0 ))s"
+check 'AE5: prints the final terminal JSON on stdout' "$(jq -e '.terminal == true and .phase == "done"' "$TDIR/w1.out" >/dev/null 2>&1; echo $?)" "$(cat "$TDIR/w1.out")"
+
+echo '# scenario 2 (AE2): marker resolving straight to the completed store returns immediately'
+W2HOME="$TDIR/home-wait2"; mkdir -p "$W2HOME/completed"
+W2MARKER="pg-run-w2-1700000200-2"
+printf 'run marker: %s\n[P1] a.sh:1 - x\n  Why: y\nP2: none\nP3: none\nVERDICT: SHIP - clean. (run marker: %s)\n' \
+  "$W2MARKER" "$W2MARKER" > "$W2HOME/completed/$W2MARKER"
+W2_T0=$(date +%s)
+PRO_GATE_HOME="$W2HOME" "$ENGINE" --wait "$W2MARKER" --timeout 30 >"$TDIR/w2.out" 2>"$TDIR/w2.err"
+W2RC=$?
+W2_T1=$(date +%s)
+check 'AE2: completed-store marker returns immediately with exit 0' "$([ "$W2RC" -eq 0 ]; echo $?)" "rc=$W2RC $(cat "$TDIR/w2.err")"
+check 'AE2: returns fast, no poll-interval wait spent' "$([ $(( W2_T1 - W2_T0 )) -le 3 ]; echo $?)" "elapsed=$(( W2_T1 - W2_T0 ))s"
+check 'AE2: synthesized JSON carries the marker and a collect harvest command' \
+  "$(jq -e --arg m "$W2MARKER" '.terminal==true and .marker==$m and .next_action.wait_class=="collect"' "$TDIR/w2.out" >/dev/null 2>&1; echo $?)" "$(cat "$TDIR/w2.out")"
+
+echo '# scenario 3 (AE9): no status file yet is non-terminal, never a false verdict; proceeds once it appears'
+W3HOME="$TDIR/home-wait3"; mkdir -p "$W3HOME/in-progress"
+W3MARKER="pg-run-w3-1700000300-3"
+W3OUT="$TDIR/w3.md"
+printf 'w3\t%s\t%s\t0\t1\tgpt-5\n' "$W3OUT" "$(date +%s)" > "$W3HOME/in-progress/$W3MARKER"
+PRO_GATE_HOME="$W3HOME" PRO_GATE_WAIT_POLL_SECS=1 "$ENGINE" --wait "$W3MARKER" --timeout 10 >"$TDIR/w3.out" 2>"$TDIR/w3.err" &
+W3PID=$!
+sleep 1.5
+kill -0 "$W3PID" 2>/dev/null; W3_STILL_RUNNING=$?
+printf '{"phase":"done","attempt":1,"detail":"","pr":"5","out":"%s","ts":"%s","marker":"%s","model":"gpt-5","model_warn":"","result":"%s","terminal":true,"next_action":{"cmd":"","terminal":true,"wait_class":"verdict"}}\n' \
+  "$W3OUT" "$(date +%Y-%m-%dT%H:%M:%S%z)" "$W3MARKER" "$W3OUT" > "$W3OUT.status"
+wait "$W3PID"; W3RC=$?
+check 'AE9: still polling (no false exit) before the status file exists' "$([ "$W3_STILL_RUNNING" -eq 0 ]; echo $?)" "wait exited before the file appeared"
+check 'AE9: proceeds normally once the file appears, exit 0' "$([ "$W3RC" -eq 0 ]; echo $?)" "rc=$W3RC $(cat "$TDIR/w3.err")"
+check 'AE9: final JSON is the newly-appeared terminal status' "$(jq -e --arg m "$W3MARKER" '.terminal==true and .marker==$m' "$TDIR/w3.out" >/dev/null 2>&1; echo $?)" "$(cat "$TDIR/w3.out")"
+
+echo '# scenario 4 (AE6/AE7): --timeout on a healthy non-terminal run exits 20, never a false lost-observability'
+W4OUT="$TDIR/w4.md"
+NOWTS="$(date +%Y-%m-%dT%H:%M:%S%z)"
+printf '{"phase":"waiting-slot","attempt":1,"detail":"","pr":"5","out":"%s","ts":"%s","marker":"pg-run-w4-1700000400-4","model":"","model_warn":"","result":"","terminal":false,"next_action":{"cmd":"","terminal":false,"wait_class":null}}\n' \
+  "$W4OUT" "$NOWTS" > "$W4OUT.status"
+# Deviation: the plan's AE6 example uses --timeout 60; scaled to 3s here (identical exit-20 code
+# path, identical healthy/non-terminal classification) to keep the suite's wall time bounded — the
+# mechanism under test is timeout-vs-staleness classification, not the literal duration.
+W4_T0=$(date +%s)
+PRO_GATE_HOME="$WHOME" PRO_GATE_WAIT_POLL_SECS=1 "$ENGINE" --wait "$W4OUT" --timeout 3 >"$TDIR/w4.out" 2>"$TDIR/w4.err"
+W4RC=$?
+W4_T1=$(date +%s)
+check 'AE6: healthy non-terminal run times out through exit 20 (not 21)' "$([ "$W4RC" -eq 20 ]; echo $?)" "rc=$W4RC $(cat "$TDIR/w4.err")"
+check 'AE6: times out at roughly the requested duration' "$([ $(( W4_T1 - W4_T0 )) -ge 3 ] && [ $(( W4_T1 - W4_T0 )) -le 6 ]; echo $?)" "elapsed=$(( W4_T1 - W4_T0 ))s"
+check 'AE6: the run itself is unaffected (fixture untouched)' "$(grep -q '\"phase\":\"waiting-slot\"' "$W4OUT.status"; echo $?)" "$(cat "$W4OUT.status")"
+
+echo '# scenario 4b (AE7): --timeout 0 is an immediate single classification probe'
+W4B_T0=$(date +%s)
+PRO_GATE_HOME="$WHOME" "$ENGINE" --wait "$W4OUT" --timeout 0 >"$TDIR/w4b.out" 2>"$TDIR/w4b.err"
+W4BRC=$?
+W4B_T1=$(date +%s)
+check 'AE7: --timeout 0 exits through the timeout code immediately' "$([ "$W4BRC" -eq 20 ]; echo $?)" "rc=$W4BRC $(cat "$TDIR/w4b.err")"
+check 'AE7: --timeout 0 returns in well under one poll interval' "$([ $(( W4B_T1 - W4B_T0 )) -le 2 ]; echo $?)" "elapsed=$(( W4B_T1 - W4B_T0 ))s"
+check 'AE7: --timeout 0 still prints the current status JSON' "$(jq -e '.phase == "waiting-slot"' "$TDIR/w4b.out" >/dev/null 2>&1; echo $?)" "$(cat "$TDIR/w4b.out")"
+
+echo '# scenario 5 (AE1): heartbeated-phase staleness — fresh ts keeps waiting, stale ts is lost observability'
+W5OUT="$TDIR/w5.md"
+FRESHTS="$(date +%Y-%m-%dT%H:%M:%S%z)"
+printf '{"phase":"launching","attempt":1,"detail":"","pr":"5","out":"%s","ts":"%s","marker":"pg-run-w5-1700000500-5","model":"","model_warn":"","result":"","terminal":false,"next_action":{"cmd":"","terminal":false,"wait_class":null}}\n' \
+  "$W5OUT" "$FRESHTS" > "$W5OUT.status"
+PRO_GATE_HOME="$WHOME" PRO_GATE_WAIT_POLL_SECS=1 "$ENGINE" --wait "$W5OUT" --timeout 2 >"$TDIR/w5.out" 2>"$TDIR/w5.err"
+W5RC=$?
+check 'AE1: fresh ts in a heartbeated phase keeps waiting (times out, not lost)' "$([ "$W5RC" -eq 20 ]; echo $?)" "rc=$W5RC $(cat "$TDIR/w5.err")"
+
+STALETS="$(date -d '-10 minutes' +%Y-%m-%dT%H:%M:%S%z 2>/dev/null || date -v-10M +%Y-%m-%dT%H:%M:%S%z)"
+printf '{"phase":"launching","attempt":1,"detail":"","pr":"5","out":"%s","ts":"%s","marker":"pg-run-w5b-1700000501-5","model":"","model_warn":"","result":"","terminal":false,"next_action":{"cmd":"","terminal":false,"wait_class":null}}\n' \
+  "$W5OUT" "$STALETS" > "$W5OUT.status"
+PRO_GATE_HOME="$WHOME" "$ENGINE" --wait "$W5OUT" --timeout 30 >"$TDIR/w5b.out" 2>"$TDIR/w5b.err"
+W5BRC=$?
+check 'AE1: stale ts (10min old, default 4x30s=120s bound) in launching exits 21 (lost observability)' "$([ "$W5BRC" -eq 21 ]; echo $?)" "rc=$W5BRC $(cat "$TDIR/w5b.err")"
+check 'AE1: lost-observability still prints the last-known JSON' "$(jq -e '.phase == "launching"' "$TDIR/w5b.out" >/dev/null 2>&1; echo $?)" "$(cat "$TDIR/w5b.out")"
+
+echo '# scenario 6 (AE8): salvaging (loopless phase) — within its 1.5x window bound keeps waiting, beyond it is lost'
+W6OUT="$TDIR/w6.md"
+TS_10MIN="$(date -d '-10 minutes' +%Y-%m-%dT%H:%M:%S%z 2>/dev/null || date -v-10M +%Y-%m-%dT%H:%M:%S%z)"
+printf '{"phase":"salvaging","attempt":1,"detail":"","pr":"5","out":"%s","ts":"%s","marker":"pg-run-w6-1700000600-6","model":"","model_warn":"","result":"","terminal":false,"next_action":{"cmd":"","terminal":false,"wait_class":null}}\n' \
+  "$W6OUT" "$TS_10MIN" > "$W6OUT.status"
+PRO_GATE_HOME="$WHOME" "$ENGINE" --wait "$W6OUT" --timeout 2 >"$TDIR/w6.out" 2>"$TDIR/w6.err"
+W6RC=$?
+check 'AE8: 10-minute-old salvaging ts is within the (>=1800s floor * 1.5) salvage bound — keeps waiting' "$([ "$W6RC" -eq 20 ]; echo $?)" "rc=$W6RC $(cat "$TDIR/w6.err")"
+
+TS_46MIN="$(date -d '-46 minutes' +%Y-%m-%dT%H:%M:%S%z 2>/dev/null || date -v-46M +%Y-%m-%dT%H:%M:%S%z)"
+printf '{"phase":"salvaging","attempt":1,"detail":"","pr":"5","out":"%s","ts":"%s","marker":"pg-run-w6b-1700000601-6","model":"","model_warn":"","result":"","terminal":false,"next_action":{"cmd":"","terminal":false,"wait_class":null}}\n' \
+  "$W6OUT" "$TS_46MIN" > "$W6OUT.status"
+PRO_GATE_HOME="$WHOME" "$ENGINE" --wait "$W6OUT" --timeout 5 >"$TDIR/w6b.out" 2>"$TDIR/w6b.err"
+W6BRC=$?
+check 'AE8: beyond the salvage bound (46min > 2700s) exits 21 (lost observability)' "$([ "$W6BRC" -eq 21 ]; echo $?)" "rc=$W6BRC $(cat "$TDIR/w6b.err")"
+
+echo '# scenario 7 (KTD5): legacy status JSON without a terminal field — widest bound, exactly one warning'
+W7OUT="$TDIR/w7.md"
+NOWTS="$(date +%Y-%m-%dT%H:%M:%S%z)"
+printf '{"phase":"launching","attempt":1,"detail":"","pr":"5","out":"%s","ts":"%s","marker":"pg-run-w7-1700000700-7","model":"","model_warn":"","result":""}\n' \
+  "$W7OUT" "$NOWTS" > "$W7OUT.status"
+PRO_GATE_HOME="$WHOME" PRO_GATE_WAIT_POLL_SECS=1 "$ENGINE" --wait "$W7OUT" --timeout 3 >"$TDIR/w7.out" 2>"$TDIR/w7.err"
+W7RC=$?
+check 'KTD5: legacy fixture (no terminal field) keeps waiting within the widest bound, no false lost-observability' "$([ "$W7RC" -eq 20 ]; echo $?)" "rc=$W7RC $(cat "$TDIR/w7.err")"
+check 'KTD5: legacy fixture triggers exactly one stderr warning across the whole wait' "$([ "$(grep -c "has no 'terminal' field" "$TDIR/w7.err")" -eq 1 ]; echo $?)" "$(cat "$TDIR/w7.err")"
+
+echo '# scenario 8: an unknown marker (no state anywhere) fails fast with exit 2'
+W8_T0=$(date +%s)
+PRO_GATE_HOME="$WHOME" "$ENGINE" --wait pg-run-nonexistent-1700000800-8 --timeout 300 >"$TDIR/w8.out" 2>"$TDIR/w8.err"
+W8RC=$?
+W8_T1=$(date +%s)
+check 'unknown marker exits 2' "$([ "$W8RC" -eq 2 ]; echo $?)" "rc=$W8RC $(cat "$TDIR/w8.err")"
+check 'unknown marker fails fast, never blocks toward --timeout' "$([ $(( W8_T1 - W8_T0 )) -le 3 ]; echo $?)" "elapsed=$(( W8_T1 - W8_T0 ))s"
+check 'unknown marker message names the marker' "$(grep -qF 'pg-run-nonexistent-1700000800-8' "$TDIR/w8.err"; echo $?)" "$(cat "$TDIR/w8.err")"
+
+echo '# scenario 9: --wait combined with another mode flag is a usage error (exit 2)'
+PRO_GATE_HOME="$WHOME" "$ENGINE" --wait pg-run-w9-1700000900-9 --pr 5 >"$TDIR/w9.out" 2>"$TDIR/w9.err"
+W9RC=$?
+check 'usage: --wait + --pr exits 2' "$([ "$W9RC" -eq 2 ]; echo $?)" "rc=$W9RC $(cat "$TDIR/w9.err")"
+check 'usage error names the exclusivity rule' "$(grep -qF 'exclusive with' "$TDIR/w9.err"; echo $?)" "$(cat "$TDIR/w9.err")"
+
+echo '# scenario 10 (R6a): a status file at the resolved out-path carrying a DIFFERENT marker is never trusted'
+W10HOME="$TDIR/home-wait10"; mkdir -p "$W10HOME/in-progress"
+W10MARKER="pg-run-w10-1700001000-10"
+W10OUT="$TDIR/w10.md"
+printf 'w10\t%s\t%s\t0\t1\tgpt-5\n' "$W10OUT" "$(date +%s)" > "$W10HOME/in-progress/$W10MARKER"
+# A stale/reused --out carries ANOTHER run's terminal status at the exact path this marker's own
+# reservation resolves to.
+printf '{"phase":"done","attempt":1,"detail":"","pr":"5","out":"%s","ts":"%s","marker":"pg-run-DIFFERENT-9999999999-1","model":"gpt-5","model_warn":"","result":"%s","terminal":true,"next_action":{"cmd":"","terminal":true,"wait_class":"verdict"}}\n' \
+  "$W10OUT" "$(date +%Y-%m-%dT%H:%M:%S%z)" "$W10OUT" > "$W10OUT.status"
+PRO_GATE_HOME="$W10HOME" PRO_GATE_WAIT_POLL_SECS=1 "$ENGINE" --wait "$W10MARKER" --timeout 3 >"$TDIR/w10.out" 2>"$TDIR/w10.err"
+W10RC=$?
+check 'R6a: a marker-mismatched status file at the resolved out-path is never trusted (no false exit 0)' "$([ "$W10RC" -ne 0 ]; echo $?)" "rc=$W10RC $(cat "$TDIR/w10.out")"
+check 'R6a: falls back to the state join and times out healthy rather than reporting the wrong verdict' "$([ "$W10RC" -eq 20 ]; echo $?)" "rc=$W10RC $(cat "$TDIR/w10.err")"
+
+echo '# scenario 11, part A (terminal-exit ordering): --wait settles the active-run index before exiting'
+# pg_finish keeps its original, v0.32-gated order: the organizer case dispatch (which can
+# discover a same-call throttle) runs BEFORE ledger append and active-index clear. That
+# means pg_status's terminal:true write can be observed by a poller well before pg_finish's
+# bookkeeping (organizer dispatch, ledger append, active-index clear) actually completes.
+# The fix is local to --wait (wait_settle_terminal): it re-checks the active-run index via
+# pg_state_resolve before printing+exiting. This exercises that behavior directly: a
+# terminal status file plus a LIVE active-index record for the same round key must block
+# --wait until the record clears (never a false-early exit), and once it clears, --wait
+# exits 0 promptly with the terminal JSON.
+W11AHOME="$TDIR/home-wait11a"; mkdir -p "$W11AHOME/active"
+W11AMARKER="pg-run-w11settle-1700001150-11"
+W11AOUT="$TDIR/o-w11a.md"
+sleep 30 & W11A_LIVEPID=$!
+# Token-less record (legacy shape, 4 tab-separated fields): pg_state_resolve treats an alive
+# pid with no token as live, same as a genuine in-flight run (see pg_state_resolve's a_token
+# handling). Keyed by "w11settle" — the round key embedded in W11AMARKER (strip "pg-run-"
+# and the trailing "-epoch-pid").
+printf '%s\t%s\t%s\t%s\n' "$W11AMARKER" "$W11AOUT" "$W11A_LIVEPID" "$(date +%s)" \
+  > "$W11AHOME/active/w11settle"
+printf '{"phase":"done","attempt":1,"detail":"","pr":"","out":"%s","ts":"%s","marker":"%s","model":"gpt-5","model_warn":"","result":"%s","terminal":true,"next_action":{"cmd":"","terminal":true,"wait_class":"verdict"}}\n' \
+  "$W11AOUT" "$(date +%Y-%m-%dT%H:%M:%S%z)" "$W11AMARKER" "$W11AOUT" > "$W11AOUT.status"
+PRO_GATE_HOME="$W11AHOME" PRO_GATE_WAIT_POLL_SECS=1 "$ENGINE" --wait "$W11AOUT" --timeout 30 \
+  >"$TDIR/w11a.out" 2>"$TDIR/w11a.err" &
+W11A_WAITPID=$!
+sleep 2
+kill -0 "$W11A_WAITPID" 2>/dev/null
+check 'part A: --wait does not exit while the active index still reports the change live' \
+  "$?" "wait pid=$W11A_WAITPID (expected still running)"
+kill "$W11A_LIVEPID" 2>/dev/null; wait "$W11A_LIVEPID" 2>/dev/null
+rm -f "$W11AHOME/active/w11settle"
+wait "$W11A_WAITPID"; W11ARC=$?
+check 'part A: --wait exits 0 once the active index clears' "$([ "$W11ARC" -eq 0 ]; echo $?)" "rc=$W11ARC $(cat "$TDIR/w11a.err")"
+check 'part A: --wait prints the terminal JSON after settling' \
+  "$(jq -e --arg m "$W11AMARKER" '.terminal==true and .marker==$m' "$TDIR/w11a.out" >/dev/null 2>&1; echo $?)" "$(cat "$TDIR/w11a.out")"
+check 'part A: the active index no longer reports the change live once --wait has exited' \
+  "$([ ! -f "$W11AHOME/active/w11settle" ]; echo $?)" "$(cat "$W11AHOME/active/w11settle" 2>/dev/null)"
+
+echo '# scenario 11, part B (terminal-exit ordering): pg_active_clear genuinely fires on a real harvest completion'
+mkdir -p "$TDIR/home/active"
+W11MARKER="pg-run-w11-1700001100-11"
+W11OUT="$TDIR/o-w11.md"
+( exit 0 ) & W11_DEADPID=$!; wait "$W11_DEADPID" 2>/dev/null
+printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$W11MARKER" "$W11OUT" "$W11_DEADPID" "$(date +%s)" remote-chrome tok \
+  > "$TDIR/home/active/w11"
+{ printf 'run marker: %s\n' "$W11MARKER"
+  printf '[P1] src/z.sh:1 - bug\n  Why: y\nP2: none\nP3: none\nVERDICT: SHIP - clean. (run marker: %s)\n' "$W11MARKER" "$W11MARKER"
+} > "$TDIR/tab-w11.txt"
+start_mock "$TDIR/tab-w11.txt"
+run_engine --harvest "$W11MARKER" --out "$W11OUT" --timeout 30s
+check 'part B: harvest completing over a dead-pid-owned active record still exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
+check 'part B: pg_active_clear removes the dead-owner active record on harvest completion' "$([ ! -f "$TDIR/home/active/w11" ]; echo $?)" "$(cat "$TDIR/home/active/w11" 2>/dev/null)"
+
+echo '# scenario 11, part C (terminal-exit ordering): the settle cap cannot hang forever'
+# If the active-run index never clears (a stuck/orphaned record), wait_settle_terminal must
+# still print the verdict and exit 0 once PRO_GATE_WAIT_SETTLE_CAP elapses, with a one-line
+# stderr note — a settle timeout is a bookkeeping delay, never a reason to fail the verdict.
+W11CHOME="$TDIR/home-wait11c"; mkdir -p "$W11CHOME/active"
+W11CMARKER="pg-run-w11cap-1700001160-11"
+W11COUT="$TDIR/o-w11c.md"
+sleep 30 & W11C_LIVEPID=$!
+printf '%s\t%s\t%s\t%s\n' "$W11CMARKER" "$W11COUT" "$W11C_LIVEPID" "$(date +%s)" \
+  > "$W11CHOME/active/w11cap"
+printf '{"phase":"done","attempt":1,"detail":"","pr":"","out":"%s","ts":"%s","marker":"%s","model":"gpt-5","model_warn":"","result":"%s","terminal":true,"next_action":{"cmd":"","terminal":true,"wait_class":"verdict"}}\n' \
+  "$W11COUT" "$(date +%Y-%m-%dT%H:%M:%S%z)" "$W11CMARKER" "$W11COUT" > "$W11COUT.status"
+W11C_T0=$(date +%s)
+PRO_GATE_HOME="$W11CHOME" PRO_GATE_WAIT_POLL_SECS=1 PRO_GATE_WAIT_SETTLE_CAP=2 \
+  "$ENGINE" --wait "$W11COUT" --timeout 30 >"$TDIR/w11c.out" 2>"$TDIR/w11c.err"
+W11CRC=$?
+W11C_T1=$(date +%s)
+kill "$W11C_LIVEPID" 2>/dev/null; wait "$W11C_LIVEPID" 2>/dev/null
+check 'part C: --wait exits 0 once the settle cap elapses, even with the active record still live' \
+  "$([ "$W11CRC" -eq 0 ]; echo $?)" "rc=$W11CRC $(cat "$TDIR/w11c.err")"
+check 'part C: settling never hangs past the cap (bounded elapsed time)' \
+  "$([ $(( W11C_T1 - W11C_T0 )) -le 8 ]; echo $?)" "elapsed=$(( W11C_T1 - W11C_T0 ))s"
+check 'part C: cap expiry emits the documented one-line stderr note' \
+  "$(grep -q 'had not settled within 2s' "$TDIR/w11c.err"; echo $?)" "$(cat "$TDIR/w11c.err")"
+check 'part C: --wait still prints the terminal JSON on cap expiry' \
+  "$(jq -e --arg m "$W11CMARKER" '.terminal==true and .marker==$m' "$TDIR/w11c.out" >/dev/null 2>&1; echo $?)" "$(cat "$TDIR/w11c.out")"
+
+echo '# scenario 10 (duplicate plan numbering), end-to-end: --wait against a REAL engine run (mock CDP), from launch through verdict'
+E2E_MARKER="pg-run-w12-1700001200-12"
+E2E_OUT="$TDIR/o-w12.md"
+{ printf 'run marker: %s\n' "$E2E_MARKER"
+  printf '[P1] src/y.sh:5 - real bug\n  Why: demonstrated\nP2: none\nP3: none\nVERDICT: SHIP - clean enough. (run marker: %s)\n' "$E2E_MARKER" "$E2E_MARKER"
+} > "$TDIR/tab-w12.txt"
+start_mock "$TDIR/tab-w12.txt"
+PRO_GATE_HOME="$TDIR/home" PRO_GATE_WAIT_POLL_SECS=1 "$ENGINE" --wait "$E2E_OUT" --timeout 30 >"$TDIR/w12-wait.out" 2>"$TDIR/w12-wait.err" &
+E2E_WAITPID=$!
+sleep 1.2
+run_engine --harvest "$E2E_MARKER" --out "$E2E_OUT" --timeout 30s
+check 'end-to-end: the real engine harvest itself still completes normally' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
+wait "$E2E_WAITPID"; E2E_WAITRC=$?
+check 'end-to-end: a concurrently-blocked --wait exits 0 once the real run reaches a verdict' "$([ "$E2E_WAITRC" -eq 0 ]; echo $?)" "rc=$E2E_WAITRC $(cat "$TDIR/w12-wait.err")"
+check "end-to-end: --wait reports exactly the engine's own final status JSON" "$(cmp -s "$TDIR/w12-wait.out" "$E2E_OUT.status"; echo $?)" "wait=$(cat "$TDIR/w12-wait.out" 2>/dev/null) status=$(cat "$E2E_OUT.status" 2>/dev/null)"
+
+echo '# scenario 12 (long-wait notification survival) is MANUAL per the plan — hours-scale, requires an actual'
+echo '# terminal/session restart mid-wait to exercise. Not automatable in this suite; skipped by design.'
+
+echo '# supplementary: wait_resolve_marker reservation-branch coverage not exercised by scenarios 1-11'
+echo '# res_complete -> collect'
+RC_HOME="$TDIR/home-rescomplete"; mkdir -p "$RC_HOME/in-progress"
+RC_MARKER="pg-run-rc-1700002000-20"
+RC_OUT="$TDIR/rc.md"
+printf '5\t%s\t%s\t0\t1\tgpt-5\t\tcomplete\n' "$RC_OUT" "$(date +%s)" > "$RC_HOME/in-progress/$RC_MARKER"
+PRO_GATE_HOME="$RC_HOME" "$ENGINE" --wait "$RC_MARKER" --timeout 5 >"$TDIR/rc.out" 2>"$TDIR/rc.err"
+RCRC=$?
+check 'res_complete: a completed-but-uncollected reservation returns immediately, exit 0' "$([ "$RCRC" -eq 0 ]; echo $?)" "rc=$RCRC $(cat "$TDIR/rc.err")"
+check 'res_complete: synthesized JSON carries the collect harvest command' "$(jq -e '.next_action.wait_class == "collect"' "$TDIR/rc.out" >/dev/null 2>&1; echo $?)" "$(cat "$TDIR/rc.out")"
+
+echo '# res_crossbound -> recover'
+RX_HOME="$TDIR/home-rescross"; mkdir -p "$RX_HOME/in-progress" "$RX_HOME/crossbound"
+RX_MARKER="pg-run-rx-1700002100-21"
+RX_OUT="$TDIR/rx.md"
+printf '5\t%s\t%s\t0\t1\tgpt-5\n' "$RX_OUT" "$(date +%s)" > "$RX_HOME/in-progress/$RX_MARKER"
+printf 'foreign completed answer detected below our prompt\n' > "$RX_HOME/crossbound/$RX_MARKER"
+PRO_GATE_HOME="$RX_HOME" "$ENGINE" --wait "$RX_MARKER" --timeout 5 >"$TDIR/rx.out" 2>"$TDIR/rx.err"
+RXRC=$?
+check 'res_crossbound: a cross-bound reservation returns immediately, exit 0' "$([ "$RXRC" -eq 0 ]; echo $?)" "rc=$RXRC $(cat "$TDIR/rx.err")"
+check 'res_crossbound: wait_class is recover, never collect' "$(jq -e '.next_action.wait_class == "recover"' "$TDIR/rx.out" >/dev/null 2>&1; echo $?)" "$(cat "$TDIR/rx.out")"
+
+echo '# res_ambiguous -> retryable, keeps polling rather than an instant verdict'
+RA_HOME="$TDIR/home-resambig"; mkdir -p "$RA_HOME/in-progress"
+RA_MARKER="pg-run-ra-1700002200-22"
+RA_OUT="$TDIR/ra.md"
+printf '5\t%s\t%s\t0\t1\tgpt-5\n' "$RA_OUT" "$(date +%s)" > "$RA_HOME/in-progress/$RA_MARKER"
+: > "$RA_OUT.unbound.1"
+PRO_GATE_HOME="$RA_HOME" PRO_GATE_WAIT_POLL_SECS=1 "$ENGINE" --wait "$RA_MARKER" --timeout 2 >"$TDIR/ra.out" 2>"$TDIR/ra.err"
+RARC=$?
+check 'res_ambiguous: an unbound-but-retryable capture keeps polling rather than an instant verdict' "$([ "$RARC" -eq 20 ]; echo $?)" "rc=$RARC $(cat "$TDIR/ra.err")"
+
+echo '# artifact_pending -> recover (manual)'
+AP_HOME="$TDIR/home-artpending"; mkdir -p "$AP_HOME/pending"
+AP_MARKER="pg-run-ap-1700002300-23"
+printf 'run marker: %s\n[P1] a.sh:1 - x\n  Why: y\nP2: none\nP3: none\nVERDICT: SHIP - clean. (run marker: %s)\n' \
+  "$AP_MARKER" "$AP_MARKER" > "$AP_HOME/pending/$AP_MARKER"
+PRO_GATE_HOME="$AP_HOME" "$ENGINE" --wait "$AP_MARKER" --timeout 5 >"$TDIR/ap.out" 2>"$TDIR/ap.err"
+APRC=$?
+check 'artifact_pending: a captured-but-uninstalled review returns immediately, exit 0' "$([ "$APRC" -eq 0 ]; echo $?)" "rc=$APRC $(cat "$TDIR/ap.err")"
+check 'artifact_pending: wait_class is recover (manual), not collect' "$(jq -e '.next_action.wait_class == "recover"' "$TDIR/ap.out" >/dev/null 2>&1; echo $?)" "$(cat "$TDIR/ap.out")"
+
+echo '# ledger_hit outcome sub-branches -> outcome-mapped exits'
+LH_HOME="$TDIR/home-ledgerhit"; mkdir -p "$LH_HOME"
+lh_case() { # $1 marker $2 outcome $3 expected_rc $4 expected_wait_class(or empty) $5 label
+  local m="$1" oc="$2" exp_rc="$3" exp_wc="$4" label="$5" out="$TDIR/lh-$1.md"
+  jq -nc --arg ts "$(date +%Y-%m-%dT%H:%M:%S%z)" --arg pr "9" --arg outcome "$oc" \
+    --arg out "$out" --arg marker "$m" \
+    '{ts:$ts,pr:$pr,exit:0,outcome:$outcome,secs:1,pre_slot_secs:0,post_slot_secs:1,kind:"diff",attempts:1,conc:1,ceiling:1,live:0,salvaged:0,out:$out,model:"gpt-5",marker:$marker,round_key:"lh",sha256:""}' \
+    >> "$LH_HOME/ledger.jsonl"
+  PRO_GATE_HOME="$LH_HOME" "$ENGINE" --wait "$m" --timeout 5 >"$TDIR/lh-$m.out" 2>"$TDIR/lh-$m.err"
+  LHRC=$?
+  check "ledger_hit ($label): exit code" "$([ "$LHRC" -eq "$exp_rc" ]; echo $?)" "rc=$LHRC $(cat "$TDIR/lh-$m.err")"
+  if [ -n "$exp_wc" ]; then
+    check "ledger_hit ($label): wait_class" "$(jq -e --arg wc "$exp_wc" '.next_action.wait_class == $wc' "$TDIR/lh-$m.out" >/dev/null 2>&1; echo $?)" "$(cat "$TDIR/lh-$m.out")"
+  fi
+}
+lh_case "pg-run-lh1-1700002400-1" clean 0 verdict "clean"
+lh_case "pg-run-lh2-1700002400-2" in-progress 0 collect "in-progress"
+lh_case "pg-run-lh3-1700002400-3" deferred 0 recover "deferred"
+lh_case "pg-run-lh4-1700002400-4" round-capped 0 recover "round-capped"
+lh_case "pg-run-lh5-1700002400-5" bad-repo 0 verdict "other/failed"
 
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }

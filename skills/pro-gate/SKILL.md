@@ -196,35 +196,74 @@ engine home is `$HOME/.pro-review-daemon`.
 
 ## 3. Run the review
 
-Launch the engine in the background (it blocks ~10-30 min) and poll its **status file**:
+Launch the engine DETACHED, record its marker, then let `--wait` (v0.35) block for you —
+zero tokens spent while it does, one background command instead of a hand-rolled poll loop:
 
 ```bash
+OUT="${TMPDIR:-/tmp}/pro-gate-<num>.md"
 "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}"/oracle-review.sh \
   --pr <num|url> --repo <repo> --input <mode> \
-  --out "${TMPDIR:-/tmp}/pro-gate-<num>.md" --timeout 30m
+  --out "$OUT" --timeout 30m &
+disown
 ```
 
-Run with `run_in_background: true`, and mind the clocks: real wall time is 10-47+ min (ledger
-p90 ≈ 47 min), longer than many tools' own command caps (Claude Code's Bash tool kills at
-30 min), so poll in short cycles — re-issue a fresh poll command every minute or two rather
-than one long sleep. Launch DETACHED with no caller-side timeout at all: a wrapper that kills
-the process tree can end the engine after the slot is spent but before the exit-9
-reservation lands, the worst possible state. If foreground is unavoidable, budget the FULL
-worst case — two lock waits (per-change guard + account slot, each up to
-`PRO_GATE_LOCK_WAIT`, default 40 min) plus `--timeout`, its grace, the retry, and the
-reattach/throttle/salvage windows — never the bare happy path. If your wrapper is killed
-anyway, do not assume the engine either survived or died: read the status file, then check
-for the engine process and a reservation, before anything else — never relaunch on reflex.
-The wait is free time — do useful parallel work and check back. The engine writes single-line JSON to
-`<out>.status` at every phase change (`preflight → waiting-slot → launching → … → done|failed|deferred|in-progress|oversized|round-capped`):
-poll THAT, not engine logs. Phase `done` ⇒ read the file named by the engine's final
-`RESULT_FILE=` stdout line — engine ≥v0.28 points it at the write-once, marker-addressed
-completed artifact (`$PG_HOME/completed/<marker>`), which a concurrent run sharing your
-`--out` path can never overwrite; `--out` holds the same bytes as a best-effort alias. The
-review is the `[Pn] file:line` blocks ending in a `VERDICT:` line. `failed`/`deferred`/`in-progress`/`oversized`/`round-capped` are terminal for
-this invocation: do NOT relaunch on `throttled`/`salvaging` phases; the engine is still working.
-While waiting, never spawn a second oracle run for the same PR. The status JSON carries `marker`
-(the run's conversation correlation id): you need it for `--harvest`.
+Launch with NO caller-side timeout at all: a wrapper that kills the process tree can end the
+engine after the slot is spent but before the exit-9 reservation lands, the worst possible
+state. Give it a moment to write its first status line, then read the marker and start `--wait`
+in the background:
+
+```bash
+sleep 5
+# Record the marker in your own notes/turn text: it is the run's durable handle. --wait "$OUT"
+# is enough right now, but a later session (or one that lost this shell) re-attaches for free
+# with --wait "$MARKER", and --harvest takes the marker too.
+MARKER="$(jq -r '.marker // empty' "$OUT.status" 2>/dev/null)"
+"${PRO_GATE_HOME:-$HOME/.pro-review-daemon}"/oracle-review.sh --wait "$OUT" --timeout 14400
+```
+
+Run `--wait` with `run_in_background: true` and end your turn — the harness wakes you when it
+exits. `--wait` is read-only: it never launches, harvests, or mutates state, so it is always
+safe to run again (any session, any time) if you lose track of one. Real wall time is 10-47+ min
+(ledger p90 ≈ 47 min); the default `--timeout` (14400s = 4h) comfortably covers the worst-case
+envelope (two lock waits, generation, retries, salvage), so a single `--wait` call normally
+spans the whole run. If you are the headless daemon or another caller whose own tool-call cap is
+shorter than that, chunk it: loop `--wait "$OUT" --timeout <chunk>`, re-arming on the timeout
+exit and escalating on the lost-observability exit (see the exit-code table below).
+
+`--wait` exits when the run reaches a terminal phase (or the marker resolves to one via
+reservation/artifact/ledger lookup — it works from a bare marker even before any status file
+exists) and prints that final status JSON to stdout. Read `next_action` in it: `wait_class`
+names what to do — `verdict` (the review is ready; nothing more to run, `cmd` is empty),
+`collect` (exit-9 in-progress; `cmd` is the exact `--harvest` command to run next, no new
+spend), or `recover` (a deferred/oversized/round-capped terminal state; `cmd` is the exact
+`--status` command for the details). Act on `next_action.cmd` verbatim rather than
+re-deriving it — it already carries the marker and is guaranteed to match the run.
+
+The engine writes single-line JSON to `<out>.status` at every phase change
+(`preflight → waiting-slot → launching → … → done|failed|deferred|in-progress|oversized|round-capped`).
+Phase `done` ⇒ read the file named by the engine's final `RESULT_FILE=` stdout line — engine
+≥v0.28 points it at the write-once, marker-addressed completed artifact
+(`$PG_HOME/completed/<marker>`), which a concurrent run sharing your `--out` path can never
+overwrite; `--out` holds the same bytes as a best-effort alias. The review is the
+`[Pn] file:line` blocks ending in a `VERDICT:` line. `failed`/`deferred`/`in-progress`/`oversized`/`round-capped`
+are terminal for this invocation: do NOT relaunch — `--wait` already returned control at exactly
+that point. While waiting, never spawn a second oracle run for the same PR.
+
+**Degradation path.** If `--wait` itself is unavailable (older engine, or you need a one-shot
+snapshot instead of a block) or you lost the marker/status file entirely (compaction, new
+session), fall back to manual polling and rediscovery:
+
+```bash
+"${PRO_GATE_HOME:-$HOME/.pro-review-daemon}"/oracle-review.sh --status <pr|marker>
+```
+
+`--status` is the same read-only join `--wait` uses internally (reservations, round budget,
+remembered conversation URLs, the ledger) but returns immediately instead of blocking — poll it
+by hand every minute or two if you must, mind the same clocks (wall time 10-47+ min, longer than
+many tools' own command caps — Claude Code's Bash tool kills at 30 min). If your wrapper is
+killed mid-run, do not assume the engine either survived or died: read the status file (or run
+`--status`), then check for the engine process and a reservation, before anything else — never
+relaunch on reflex.
 
 Engine exit codes: `0` review ready · `2` bad usage · `3` oracle/browser missing · `4` repo not
 found · `5` diff fetch failed · `6` ran but no usable review (quota may be spent — check the PR
@@ -237,7 +276,9 @@ spend. Only when no URL was remembered: free memory and retry rather than blindl
 the model was still generating when the salvage budget ran out; the conversation tab is left
 open: never submit a NEW review for it — harvest by marker instead (below; the engine's
 same-change redirect exists as a backstop, but reconciliation can expire a stale
-reservation first, so harvest directly, do not relaunch to "get redirected") · `11` oversized diff (past the hard ceiling
+reservation first, so harvest directly, do not relaunch to "get redirected") · `10` bootstrap
+failure: the shared lib (`lib.sh`/`pro-gate-lib.sh`) could not be found — a broken or partial
+install, not a review outcome; reinstall the plugin/runtime rather than retrying · `11` oversized diff (past the hard ceiling
 `PRO_GATE_DIFF_HARD_MAX`), NO quota spent: scope the payload (below); a merely large diff instead
 proceeds and lands `in-progress` for harvest · `12` round budget exhausted, NO quota spent: the
 governor refused this PR/branch — either its earned grant is spent or its trajectory stopped
@@ -250,10 +291,22 @@ a human deciding on FORCE_ROUND needs "churning" vs "converging" more than any s
 and if it names an OPEN P0, put that at the top and explicitly ask whether to grant
 `PRO_GATE_FORCE_ROUND=1`.
 
+`--wait` exit codes (v0.35; distinct from the engine-run codes above, since `--wait` never runs
+a review itself): `0` verdict reached — the run hit a terminal phase; act on the printed
+`next_action` · `2` usage error, or no engine state found anywhere for the given marker (no
+reservation, no completed artifact, no ledger row) — the run does not exist, do not wait for it
+· `20` timeout — `--timeout` elapsed while the run stayed healthy and non-terminal; re-arm safe,
+just call `--wait` again (the run itself is unaffected) · `21` lost observability — the status
+file has not advanced within its phase's staleness bound; do NOT re-arm blindly, escalate
+instead (check `--status`, engine logs, browser state — the run may be fine and merely
+unobserved, or it may be genuinely stuck).
+
 **Exit 9 (`in-progress`): harvest, don't respend.** The Pro model can reason for 45-90+ minutes
 on a heavy payload (observed 65 min on 2026-07-09): longer than the engine can hold a review
 slot. The engine frees the slot, leaves the run's conversation tab open, and puts the marker in
-the status JSON. Wait ~10 min, then collect with:
+the status JSON. If you got here via `--wait` (`next_action.wait_class == "collect"`), skip the
+manual reconstruction below — `next_action.cmd` already IS this exact harvest command. Wait ~10
+min, then collect with:
 
 ```bash
 STATUS=<out>.status
