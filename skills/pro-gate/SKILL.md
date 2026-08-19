@@ -196,44 +196,65 @@ engine home is `$HOME/.pro-review-daemon`.
 
 ## 3. Run the review
 
-Launch the engine DETACHED, record its marker, then let `--wait` (v0.35) block for you —
-zero tokens spent while it does, one background command instead of a hand-rolled poll loop:
+Launch with **no caller-side timeout**: a wrapper that kills the process tree can end the engine
+after the slot is spent but before the exit-9 reservation lands. Bind the marker to the PID of
+this launch before waiting. This handshake deliberately rejects a stale nonempty sidecar instead
+of looping forever; it uses `jq` when available and a `sed` fallback otherwise.
 
 ```bash
 OUT="${TMPDIR:-/tmp}/pro-gate-<num>.md"
+read_marker() {
+  if command -v jq >/dev/null 2>&1; then
+    jq -r '.marker // empty' "$1" 2>/dev/null
+  else
+    sed -nE 's/.*"marker":"([^"]+)".*/\1/p' "$1" 2>/dev/null | head -1
+  fi
+}
+PRIOR_MARKER=""
+if [ -f "$OUT.status" ] && [ ! -L "$OUT.status" ]; then PRIOR_MARKER="$(read_marker "$OUT.status")"; fi
 "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}"/oracle-review.sh \
-  --pr <num|url> --repo <repo> --input <mode> \
-  --out "$OUT" --timeout 30m &
-disown
+  --pr <num|url> --repo <repo> --input <mode> --out "$OUT" --timeout 30m &
+ENGINE_PID=$!
+disown "$ENGINE_PID" 2>/dev/null || true
+MARKER=""
+while :; do
+  # Read before checking liveness so a fast terminal run gets one final sidecar read after exit.
+  if [ -f "$OUT.status" ] && [ ! -L "$OUT.status" ]; then
+    CANDIDATE="$(read_marker "$OUT.status")"
+    CANDIDATE_PID="${CANDIDATE##*-}"
+    case "$CANDIDATE" in
+      pg-run-*)
+        if [ -n "$CANDIDATE" ] && [ "$CANDIDATE_PID" = "$ENGINE_PID" ] \
+           && [ "$CANDIDATE" != "$PRIOR_MARKER" ]; then MARKER="$CANDIDATE"; break; fi ;;
+    esac
+  fi
+  kill -0 "$ENGINE_PID" 2>/dev/null || break
+  sleep 1
+done
+if [ -z "$MARKER" ]; then
+  echo "ERROR: engine exited without publishing its PID-bound marker; final status follows:" >&2
+  if [ -f "$OUT.status" ] && [ ! -L "$OUT.status" ]; then cat "$OUT.status" >&2; fi
+  exit 1
+fi
+# Record MARKER in your notes/turn text: it is the durable reattach and harvest handle.
+while :; do
+  "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}"/oracle-review.sh --wait "$MARKER" --timeout 1800
+  WAIT_RC=$?
+  case "$WAIT_RC" in 0) break;; 20) continue;; *) exit "$WAIT_RC";; esac
+done
 ```
 
-Launch with NO caller-side timeout at all: a wrapper that kills the process tree can end the
-engine after the slot is spent but before the exit-9 reservation lands, the worst possible
-state. Give it a moment to write its first status line, then read the marker and start `--wait`
-in the background:
+Run that whole block with `run_in_background: true`; the harness wakes you only when its chunked
+wait loop reaches a terminal result. Do useful non-conflicting work while it blocks. Headless
+callers that cannot receive a background notification use the same loop synchronously.
 
-```bash
-sleep 5
-# Record the marker in your own notes/turn text: it is the run's durable handle — a later
-# session (or one that lost this shell) re-attaches for free with the same command, and
-# --harvest takes the marker too. Wait on the MARKER, not the bare --out path: --out is a
-# fixed file reused across every round of the same change, so a wait armed on the bare path
-# can pick up a PRIOR round's stale terminal status if it starts before this round's own
-# status write lands there. (Convenience: `--wait "$OUT"` also works and skips the marker
-# lookup, but only trust it when you're certain no earlier round's terminal status could
-# still be sitting at that path — the marker form is unambiguous.)
-MARKER="$(jq -r '.marker // empty' "$OUT.status" 2>/dev/null)"
-"${PRO_GATE_HOME:-$HOME/.pro-review-daemon}"/oracle-review.sh --wait "$MARKER" --timeout 14400
-```
-
-Run `--wait` with `run_in_background: true` and end your turn — the harness wakes you when it
-exits. `--wait` is read-only: it never launches, harvests, or mutates state, so it is always
-safe to run again (any session, any time) if you lose track of one. Real wall time is 10-47+ min
-(ledger p90 ≈ 47 min); the default `--timeout` (14400s = 4h) comfortably covers the worst-case
-envelope (two lock waits, generation, retries, salvage), so a single `--wait` call normally
-spans the whole run. If you are the headless daemon or another caller whose own tool-call cap is
-shorter than that, chunk it: loop `--wait "$MARKER" --timeout <chunk>`, re-arming on the timeout
-exit and escalating on the lost-observability exit (see the exit-code table below).
+`--wait` is read-only: it never launches, harvests, or mutates state, so it is safe to re-run
+against the marker from any session. Use the marker form for every reattach or repeat. A bare
+`--wait "$OUT"` is permitted only when armed before `<out>.status` exists; it now fails closed
+with exit 2 when that sidecar already exists (including a dangling symlink), because it cannot
+distinguish a prior round. Each wait chunk is at most 30 minutes; exit 20 re-arms safely, while
+exit 21 is lost observability and must be escalated rather than retried blindly (see the table
+below).
 
 `--wait` exits when the run reaches a terminal phase (or the marker resolves to one via
 reservation/artifact/ledger lookup — it works from a bare marker even before any status file

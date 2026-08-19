@@ -36,12 +36,10 @@
 #       says what to do next), 2 usage/unknown run, 20 timeout (re-arm safe), 21 lost
 #       observability (escalate). --timeout 0 is a single classify-and-exit probe. Never
 #       launches, harvests, or mutates state — pure watcher, same discipline as --status.
-#       PREFER THE MARKER FORM. --out is a fixed file reused across every round of the same
-#       change; a bare out-path wait started before this round's own status write lands there
-#       can bind to and return an OLDER round's still-terminal status (once bound to a marker
-#       mid-poll it stays bound and detects a later replacement, but the very first read is not
-#       protected). The marker form (`--wait pg-run-...`) is unambiguous: it resolves through
-#       the engine's own state join and cannot return a foreign run's verdict.
+#       USE THE MARKER FORM for every reattach/repeat: it resolves through the engine's state
+#       join and cannot return a foreign run's verdict. A bare out-path is supported only as a
+#       clean-arm watcher started BEFORE <out>.status exists; an existing sidecar is ambiguous
+#       because --out is reused across rounds, so that form fails closed with exit 2.
 set -uo pipefail
 
 # --- locate + source the shared lib (works from repo and from deployed location) ---
@@ -123,8 +121,8 @@ fi
 # populates the ST_* globals plus $ST_TMP/*.jsonl exactly as this block always did before the
 # extraction; this is pure code motion, so --status's behavior is unchanged. Idempotent-safe
 # for repeated calls in one process (--wait re-resolves on every ENOENT poll tick): a stale
-# $ST_TMP from a PRIOR call is removed before minting a new one, so the single EXIT trap set
-# below always cleans up only the most recently created temp dir.
+# $ST_TMP from a PRIOR call is removed before minting a new one. Its cleanup is registered once
+# through pg_on_exit so this helper never clobbers another EXIT handler.
 pg_state_resolve() {
   # Localize every scratch/iteration variable this function uses internally (gate finding
   # P1): bash's dynamic scoping means an unlocalized assignment here overwrites a same-named
@@ -224,7 +222,10 @@ pg_state_resolve() {
   }
 
   ST_TMP="$(mktemp -d "${TMPDIR:-/tmp}/pg-status.XXXXXX")"
-  trap 'rm -rf "$ST_TMP"' EXIT
+  if [ "${ST_TMP_CLEANUP_REGISTERED:-0}" != 1 ]; then
+    pg_on_exit 'rm -rf "${ST_TMP:-}" 2>/dev/null'
+    ST_TMP_CLEANUP_REGISTERED=1
+  fi
   : > "$ST_TMP/res.jsonl"; : > "$ST_TMP/rounds.jsonl"; : > "$ST_TMP/ledger.jsonl"
   ST_HINT=""
   # v0.30 (#52 item 1): machine-consumable recoverability. recoverable=true means "a paid
@@ -594,10 +595,14 @@ if [ "$WAIT_REQUESTED" = 1 ]; then
       WAIT_MARKER="$WAIT_TARGET"; WAIT_OUT=""
       ;;
     *)
-      # R6a: the bare out-path form has no marker to verify against, so it trusts whatever
-      # status file lands at this path as-is; pg_state_resolve's query grammar is marker/PR-
-      # number/PR-URL, not an arbitrary path, so no state-join fallback is even possible here.
+      # A bare out path is exact only when armed before its sidecar exists. Its first later
+      # status generation may already be terminal, which is safe; a pre-existing sidecar could
+      # be a prior round and has no marker supplied by the caller to disambiguate it.
       WAIT_MARKER=""; WAIT_OUT="$WAIT_TARGET"
+      if [ -e "$WAIT_OUT.status" ] || [ -L "$WAIT_OUT.status" ]; then
+        echo "ERROR: --wait: ${WAIT_OUT}.status already exists; a bare --out wait cannot distinguish a prior run. Use --wait with the run marker instead." >&2
+        exit 2
+      fi
       ;;
   esac
 
@@ -688,23 +693,24 @@ if [ "$WAIT_REQUESTED" = 1 ]; then
     return 1
   }
 
-  wait_json_valid() {  # $1 file -> rc 0 iff readable, a JSON object, and carries a nonempty
-    # "phase" plus a "ts" that actually parses (gate finding P1: corrupt/unreadable status was
-    # previously falling into the KTD5 "legacy engine, no terminal field" branch and being
-    # treated as a healthy-but-old run instead of flagged as lost observability). Reserve that
-    # KTD5 branch for VALID JSON that merely lacks "terminal" — this check runs first.
+  wait_json_valid() {  # $1 file -> rc 0 iff readable, a complete JSON object, and carries
+    # nonempty "phase" and "ts" fields. Marker validation happens only AFTER this check. A
+    # clean-armed out-path may legitimately observe the engine's markerless preflight status,
+    # written before RUN_MARKER can be derived; that generation is still exact because the
+    # sidecar did not exist when the watcher armed. Corrupt/unreadable status previously fell
+    # into the KTD5 "legacy engine, no terminal field" branch and was treated as healthy-but-old;
+    # reserve KTD5 for VALID JSON that merely lacks "terminal".
     local v_phase v_ts
     [ -r "$1" ] || return 1
     if pg_have jq; then
       jq -e 'type=="object"' "$1" >/dev/null 2>&1 || return 1
     else
-      # no-jq: cheapest structural sanity check available (wait_json_str/has below already
-      # tolerate anything looser via regex) — reject bytes that don't even look like a single
-      # trimmed JSON object, e.g. truncated mid-write or plainly non-JSON.
-      case "$(tr -d '[:space:]' < "$1" 2>/dev/null)" in
-        \{*\}) ;;
-        *) return 1;;
-      esac
+      # jq is optional, but accepting a merely brace-shaped file would let a truncated sidecar
+      # reach marker comparison. python3 is already a runtime precheck dependency; without
+      # either complete-object parser, fail closed rather than guess from sed fields.
+      command -v python3 >/dev/null 2>&1 || return 1
+      python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); sys.exit(0 if isinstance(value, dict) else 1)' "$1" \
+        >/dev/null 2>&1 || return 1
     fi
     v_phase="$(wait_json_str "$1" phase)"
     [ -n "$v_phase" ] || return 1
@@ -868,108 +874,137 @@ if [ "$WAIT_REQUESTED" = 1 ]; then
     exit 0
   }
 
-  # v0.35 fix (gate finding P1, out-path staleness/replacement): every poll below reads the
-  # status through ONE snapshot copied at the top of that poll, never the live path again
-  # afterward — a replacement round landing at a shared --out path mid-iteration (a new launch
-  # reusing the same --out while this iteration is still validating/settling/printing the
-  # PRIOR round's bytes) can't hand back a torn mix of two rounds' fields. WAIT_SNAP is a
-  # single fixed per-process path, overwritten every poll rather than a fresh tempfile per
-  # poll, so a long wait leaks at most one file total (best-effort rm at every exit below), not
-  # one per poll interval. Bind (out-path mode only, WAIT_MARKER empty): the first nonempty
-  # marker this out-path is ever observed carrying becomes WAIT_BOUND_MARKER and is enforced on
-  # every later poll exactly like a caller-supplied marker would be, so a later replacement
-  # round is DETECTED (falls back to the state join) instead of silently consumed as if it were
-  # the run being waited for. Residual (documented in the --wait usage comment above): this
-  # cannot protect the very first poll — a bare out-path wait started while a PRIOR round's own
-  # terminal status still sits at that path binds to and can return that older verdict on poll
-  # one. The marker form is unambiguous from the first poll; prefer it.
-  WAIT_SNAP="${TMPDIR:-/tmp}/pg-wait-snap.$$"
+  # Every poll validates one immutable, process-private snapshot before extracting its marker.
+  # A bare path is safe only because it was armed while clean above; after that first write, the
+  # bound marker stops a replacement round from being returned as this run. Marker mode is the
+  # supported reattach/repeat form and remains exact independently of sidecar reuse.
+  WAIT_SNAP_DIR="$( (umask 077; mktemp -d "${TMPDIR:-/tmp}/pg-wait.XXXXXX") )" || {
+    echo "ERROR: --wait: could not create a private snapshot directory — lost observability." >&2
+    exit 21
+  }
+  if [ ! -d "$WAIT_SNAP_DIR" ] || [ -L "$WAIT_SNAP_DIR" ] || ! chmod 700 "$WAIT_SNAP_DIR" 2>/dev/null; then
+    rm -rf "$WAIT_SNAP_DIR" 2>/dev/null
+    echo "ERROR: --wait: private snapshot directory is unsafe — lost observability." >&2
+    exit 21
+  fi
+  # Keep the path expansion inside the EXIT handler: interpolating TMPDIR-derived bytes into the
+  # eval-backed handler string would make quotes/metacharacters in a caller-supplied TMPDIR active.
+  pg_on_exit 'rm -rf "${WAIT_SNAP_DIR:-}" 2>/dev/null'
   WAIT_BOUND_MARKER=""
+  WAIT_TRUSTED="$WAIT_SNAP_DIR/trusted.json"
+  WAIT_SNAP_SEQ=0
+
+  wait_snapshot_dir_safe() {
+    [ -d "$WAIT_SNAP_DIR" ] && [ ! -L "$WAIT_SNAP_DIR" ] && [ -w "$WAIT_SNAP_DIR" ]
+  }
+
+  wait_copy_snapshot() {  # $1 = live sidecar; 0 copied, 3 absent, otherwise unsafe/unreadable
+    local source="$1" stage target
+    if ! { [ -e "$source" ] || [ -L "$source" ]; }; then return 3; fi
+    [ ! -L "$source" ] && [ -f "$source" ] && [ -r "$source" ] || return 1
+    wait_snapshot_dir_safe || return 2
+    stage="$(mktemp "$WAIT_SNAP_DIR/.stage.XXXXXX")" || return 2
+    wait_snapshot_dir_safe && [ -f "$stage" ] && [ ! -L "$stage" ] \
+      && chmod 600 "$stage" 2>/dev/null || { rm -f "$stage"; return 2; }
+    cp "$source" "$stage" 2>/dev/null || { rm -f "$stage"; return 1; }
+    wait_snapshot_dir_safe && [ -f "$stage" ] && [ ! -L "$stage" ] \
+      || { rm -f "$stage"; return 2; }
+    WAIT_SNAP_SEQ=$(( WAIT_SNAP_SEQ + 1 ))
+    target="$WAIT_SNAP_DIR/poll.${WAIT_SNAP_SEQ}.json"
+    [ ! -e "$target" ] && [ ! -L "$target" ] || { rm -f "$stage"; return 2; }
+    mv "$stage" "$target" 2>/dev/null && chmod 400 "$target" 2>/dev/null \
+      || { rm -f "$stage" "$target"; return 2; }
+    WAIT_POLL_SNAP="$target"
+    return 0
+  }
+
+  wait_trust_snapshot() {  # only a fully validated, expected-marker snapshot reaches timeout output
+    local source="$1" stage
+    wait_snapshot_dir_safe || return 1
+    stage="$(mktemp "$WAIT_SNAP_DIR/.trusted-stage.XXXXXX")" || return 1
+    wait_snapshot_dir_safe && [ -f "$stage" ] && [ ! -L "$stage" ] \
+      && chmod 600 "$stage" 2>/dev/null || { rm -f "$stage"; return 1; }
+    cp "$source" "$stage" 2>/dev/null || { rm -f "$stage"; return 1; }
+    wait_snapshot_dir_safe && [ -f "$stage" ] && [ ! -L "$stage" ] \
+      || { rm -f "$stage"; return 1; }
+    if [ -e "$WAIT_TRUSTED" ] || [ -L "$WAIT_TRUSTED" ]; then
+      [ -f "$WAIT_TRUSTED" ] && [ ! -L "$WAIT_TRUSTED" ] || { rm -f "$stage"; return 1; }
+    fi
+    mv -f "$stage" "$WAIT_TRUSTED" 2>/dev/null && chmod 400 "$WAIT_TRUSTED" 2>/dev/null \
+      || { rm -f "$stage"; return 1; }
+  }
+
+  wait_lost_observability() {  # $1 snapshot to print when it was copied successfully
+    [ -n "${1:-}" ] && [ -f "$1" ] && [ ! -L "$1" ] && cat "$1"
+    echo "ERROR: --wait: status at ${WAIT_OUT:-the resolved out path}.status is unreadable or not valid JSON — lost observability, escalate (do not re-arm blindly)." >&2
+    exit 21
+  }
+
+  WAIT_POLL_SNAP=""
+  WAIT_RESOLVED_PATH_SEEN=0
   while :; do
-    WAIT_SNAP_FRESH=0
-    if [ -n "$WAIT_OUT" ] && [ -s "$WAIT_OUT.status" ] \
-       && cp "$WAIT_OUT.status" "$WAIT_SNAP" 2>/dev/null && [ -s "$WAIT_SNAP" ]; then
-      WAIT_SNAP_FRESH=1
-      WAIT_SF="$WAIT_SNAP"
-      # R6a (marker mode) / bind (out-path mode): a known target — the caller's own marker, or
-      # the bound marker this out-path already committed to — must match the snapshot's OWN
-      # marker before it's trusted. A shared --out is reused across every round of the same
-      # change, so a mismatch means either "no status for this run yet" (marker mode: fall back
-      # to the state join) or "a REPLACEMENT round landed here" (out-path mode: same fallback,
-      # rather than silently handing back a foreign round's verdict).
-      WAIT_SF_OK=1
-      WAIT_SF_MARKER="$(wait_json_str "$WAIT_SF" marker)"
-      if [ -n "$WAIT_MARKER" ]; then
-        [ "$WAIT_SF_MARKER" = "$WAIT_MARKER" ] || WAIT_SF_OK=0
-      elif [ -n "$WAIT_BOUND_MARKER" ]; then
-        [ "$WAIT_SF_MARKER" = "$WAIT_BOUND_MARKER" ] || WAIT_SF_OK=0
-      elif [ -n "$WAIT_SF_MARKER" ]; then
-        WAIT_BOUND_MARKER="$WAIT_SF_MARKER"
-      fi
-      if [ "$WAIT_SF_OK" = 1 ]; then
-        if ! wait_json_valid "$WAIT_SF"; then
-          # Malformed/unreadable/schema-invalid status (truncated write, corrupt bytes, or
-          # valid-JSON-but-missing-phase-or-ts): print whatever is on disk and escalate. The
-          # KTD5 legacy-engine branch below is reserved for VALID JSON that merely lacks
-          # "terminal" — this check runs first so corruption is never mistaken for a healthy
-          # pre-v0.35 run (gate finding P1). A not-yet-written file (AE9) never reaches here —
-          # the outer [ -s ... ] test above already requires nonempty bytes.
-          cat "$WAIT_SF" 2>/dev/null
-          echo "ERROR: --wait: status at ${WAIT_OUT}.status is unreadable or not valid JSON (missing/empty phase or ts) — lost observability, escalate (do not re-arm blindly)." >&2
-          rm -f "$WAIT_SNAP" 2>/dev/null
-          exit 21
+    WAIT_RESNAPSHOT=0
+    # The prior poll's immutable bytes have been consumed; keep only this poll plus the separate
+    # last-trusted copy so a multi-hour wait cannot accumulate one file per interval.
+    [ -n "$WAIT_POLL_SNAP" ] && rm -f "$WAIT_POLL_SNAP" 2>/dev/null
+    WAIT_POLL_SNAP=""
+    WAIT_SNAPSHOT_RC=3
+    if [ -n "$WAIT_OUT" ]; then
+      wait_copy_snapshot "$WAIT_OUT.status"; WAIT_SNAPSHOT_RC=$?
+    fi
+    case "$WAIT_SNAPSHOT_RC" in
+      0)
+        WAIT_SF="$WAIT_POLL_SNAP"
+        # Complete-object validation is deliberately before ANY marker extraction/comparison:
+        # malformed, empty, truncated, or present-but-unreadable status is observability loss,
+        # never a foreign run and never a healthy no-status poll.
+        if ! wait_json_valid "$WAIT_SF"; then wait_lost_observability "$WAIT_SF"; fi
+        WAIT_SF_MARKER="$(wait_json_str "$WAIT_SF" marker)"
+        WAIT_SF_OK=1
+        if [ -n "$WAIT_MARKER" ]; then
+          [ "$WAIT_SF_MARKER" = "$WAIT_MARKER" ] || WAIT_SF_OK=0
+        elif [ -n "$WAIT_BOUND_MARKER" ]; then
+          [ "$WAIT_SF_MARKER" = "$WAIT_BOUND_MARKER" ] || WAIT_SF_OK=0
+        elif [ -n "$WAIT_SF_MARKER" ]; then
+          WAIT_BOUND_MARKER="$WAIT_SF_MARKER"
         fi
-        if wait_json_has "$WAIT_SF" terminal; then
-          if wait_json_bool_true "$WAIT_SF" terminal; then
-            wait_settle_terminal "$WAIT_SF"
+        if [ "$WAIT_SF_OK" = 1 ]; then
+          wait_trust_snapshot "$WAIT_SF" || wait_lost_observability "$WAIT_SF"
+          if wait_json_has "$WAIT_SF" terminal; then
+            if wait_json_bool_true "$WAIT_SF" terminal; then
+              wait_settle_terminal "$WAIT_SF"
+            fi
+            WAIT_SF_PHASE="$(wait_json_str "$WAIT_SF" phase)"
+            WAIT_BOUND="$(wait_phase_bound "$WAIT_SF_PHASE")"
+          else
+            # KTD5: valid legacy JSON without a terminal field gets the widest bound.
+            if [ "$WAIT_LEGACY_WARNED" != 1 ]; then
+              echo "[oracle-review --wait] WARNING: status file has no 'terminal' field (pre-v0.35 engine) — applying the widest phase-window staleness bound instead of phase-aware detection." >&2
+              WAIT_LEGACY_WARNED=1
+            fi
+            WAIT_BOUND="$WAIT_WIDEST_BOUND"
           fi
-          WAIT_SF_PHASE="$(wait_json_str "$WAIT_SF" phase)"
-          WAIT_BOUND="$(wait_phase_bound "$WAIT_SF_PHASE")"
-        else
-          # KTD5: a status JSON with no `terminal` field came from a pre-v0.35 engine that
-          # will never heartbeat — apply the widest bound and warn once, instead of false-
-          # alarming on a mixed-version deploy.
-          if [ "$WAIT_LEGACY_WARNED" != 1 ]; then
-            echo "[oracle-review --wait] WARNING: status file has no 'terminal' field (pre-v0.35 engine) — applying the widest phase-window staleness bound instead of phase-aware detection." >&2
-            WAIT_LEGACY_WARNED=1
-          fi
-          WAIT_BOUND="$WAIT_WIDEST_BOUND"
-        fi
-        WAIT_SF_TS="$(wait_json_str "$WAIT_SF" ts)"
-        WAIT_SF_EPOCH="$(wait_ts_epoch "$WAIT_SF_TS")"
-        if [ -n "$WAIT_SF_EPOCH" ]; then
-          WAIT_NOW_E="$(date +%s)"
-          if [ $(( WAIT_NOW_E - WAIT_SF_EPOCH )) -gt "$WAIT_BOUND" ]; then
+          WAIT_SF_TS="$(wait_json_str "$WAIT_SF" ts)"
+          WAIT_SF_EPOCH="$(wait_ts_epoch "$WAIT_SF_TS")"
+          if [ -n "$WAIT_SF_EPOCH" ] && [ $(( $(date +%s) - WAIT_SF_EPOCH )) -gt "$WAIT_BOUND" ]; then
             cat "$WAIT_SF"
             echo "ERROR: --wait: status has not advanced in over ${WAIT_BOUND}s (phase ${WAIT_SF_PHASE:-unknown}) — lost observability, escalate (do not re-arm blindly)." >&2
-            rm -f "$WAIT_SNAP" 2>/dev/null
             exit 21
           fi
+        else
+          # Only a VALID object with a different marker is ignored as another run.
+          [ -n "$WAIT_MARKER" ] && WAIT_OUT=""
         fi
-        # healthy and non-terminal: fall through to the --timeout check below.
-      else
-        # marker mismatch (marker mode): treat exactly like ENOENT and re-resolve via the
-        # state join below. Bind mismatch (out-path mode, WAIT_MARKER empty): there is no
-        # marker to re-resolve via — wait_resolve_marker is never called in this mode, so
-        # blanking WAIT_OUT here would permanently stop polling this path (nothing below ever
-        # restores it from WAIT_TARGET), silently turning a detected replacement into a dead
-        # wait that prints nothing at --timeout instead of AE7's "print whatever is known".
-        # Leave WAIT_OUT set so the next iteration re-reads the SAME path fresh; the bind check
-        # above already guarantees a mismatched (replacement) round's content is never trusted
-        # as this round's verdict, poll after poll, until --timeout.
-        [ -n "$WAIT_MARKER" ] && WAIT_OUT=""
-      fi
-    fi
+        ;;
+      1|2) wait_lost_observability ;;
+      3) : ;;
+    esac
 
-    if [ -z "$WAIT_OUT" ] || [ ! -s "${WAIT_OUT:-/nonexistent}.status" ]; then
+    if [ -z "$WAIT_OUT" ] || [ "$WAIT_SNAPSHOT_RC" = 3 ]; then
       if [ -n "$WAIT_MARKER" ]; then
         wait_resolve_marker
         case "$WR_STATE" in
           artifact_completed)
-            # FIX (gate finding P2): the review is ALREADY on disk — a --harvest command with a
-            # literal "<file>" placeholder is not executable as-is. result already names the
-            # artifact path directly; cmd stays empty (wait_class=verdict, not collect) so a
-            # caller acting on next_action.cmd verbatim has nothing to run and reads result.
             wait_emit_synth done "already collected (completed artifact) — read it directly from result" \
               "$WAIT_MARKER" "" "$WR_ARTIFACT" "" verdict
             exit 0;;
@@ -985,11 +1020,16 @@ if [ "$WAIT_REQUESTED" = 1 ]; then
               "$WAIT_MARKER" "$WR_OUT" "" "$PRO_GATE_HOME/oracle-review.sh --status '$WAIT_MARKER'" recover
             exit 0;;
           res_generating|res_ambiguous|active_live)
-            # known run, file pending (still generating, an ambiguous-but-retryable capture,
-            # or — active_live — a freshly launched run seen only via the active-run index,
-            # with no reservation or ledger row yet): pin the resolved out-path so later ticks
-            # poll the file directly instead of re-running the whole state join every time.
-            [ -n "$WR_OUT" ] && WAIT_OUT="$WR_OUT"
+            if [ -n "$WR_OUT" ]; then
+              WAIT_OUT="$WR_OUT"
+              # Marker mode starts with no out path. Once the state join discovers it, take one
+              # immediate second pass so even --timeout 0 classifies the actual sidecar through
+              # the normal immutable/validated snapshot path instead of returning empty output.
+              if [ "$WAIT_RESOLVED_PATH_SEEN" != 1 ]; then
+                WAIT_RESOLVED_PATH_SEEN=1
+                WAIT_RESNAPSHOT=1
+              fi
+            fi
             ;;
           ledger_hit)
             case "$WR_LEDGER_OUTCOME" in
@@ -1002,36 +1042,23 @@ if [ "$WAIT_REQUESTED" = 1 ]; then
                 wait_emit_synth "$WR_LEDGER_OUTCOME" "" "$WAIT_MARKER" "$WR_OUT" "" \
                   "$PRO_GATE_HOME/oracle-review.sh --status '$WAIT_MARKER'" recover
                 exit 0;;
-              *)
-                wait_emit_synth failed "$WR_LEDGER_OUTCOME" "$WAIT_MARKER" "$WR_OUT" "" "" verdict
-                exit 0;;
+              *) wait_emit_synth failed "$WR_LEDGER_OUTCOME" "$WAIT_MARKER" "$WR_OUT" "" "" verdict; exit 0;;
             esac;;
           none)
             echo "ERROR: --wait: no engine state found anywhere for marker $WAIT_MARKER (no reservation, no completed artifact, no ledger row) — this run does not exist." >&2
-            rm -f "$WAIT_SNAP" 2>/dev/null
             exit 2;;
         esac
       fi
-      # Out-path mode (or marker mode that just pinned/kept polling without a status file
-      # yet): AE9 — a status file that has not been written yet is non-terminal, never an
-      # instant lost-observability verdict. Falls through to the --timeout check below.
     fi
+
+    [ "$WAIT_RESNAPSHOT" = 1 ] && continue
 
     WAIT_NOW="$(date +%s)"
     if [ "$WAIT_NOW" -ge "$WAIT_DEADLINE" ]; then
-      # AE7: print whatever JSON is known even on a --timeout 0 immediate probe. Prefer THIS
-      # poll's own snapshot (FIX 3a) when one was taken this iteration (WAIT_SNAP_FRESH); only
-      # fall back to a fresh live read when no snapshot was taken this tick (e.g. the file
-      # didn't exist yet, or a marker-resolve pin just set WAIT_OUT without polling it through
-      # the snapshot path yet) — never re-read the live path once a snapshot for this tick is
-      # already in hand.
-      if [ "$WAIT_SNAP_FRESH" = 1 ] && [ -s "$WAIT_SNAP" ]; then
-        cat "$WAIT_SNAP"
-      elif [ -n "$WAIT_OUT" ] && [ -s "$WAIT_OUT.status" ]; then
-        cat "$WAIT_OUT.status"
-      fi
+      # Timeout must expose only a previously trusted snapshot, never a new mismatched sidecar
+      # and never a fresh reread of the live path.
+      [ -f "$WAIT_TRUSTED" ] && [ ! -L "$WAIT_TRUSTED" ] && cat "$WAIT_TRUSTED"
       echo "ERROR: --wait: timed out after ${WAIT_TIMEOUT_SECS}s — re-arm safe (the run itself is unaffected)." >&2
-      rm -f "$WAIT_SNAP" 2>/dev/null
       exit 20
     fi
     sleep "$WAIT_POLL_SECS"
@@ -2728,19 +2755,16 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
   started=$SECONDS; last_size=-1; last_change=$SECONDS; last_hb=$SECONDS
   while kill -0 "$job" 2>/dev/null; do
     sleep 10
-    [ -s "$CAPTURE_OUT" ] && continue   # findings are landing — let the run finish undisturbed
-    size=$(wc -c < "$RUNLOG" 2>/dev/null) || size=0
-    if [ "$size" != "$last_size" ]; then last_size="$size"; last_change=$SECONDS; fi
     now=$SECONDS
-    # blocking-wait-verb (R10/KTD2): heartbeat the frozen-`launching` phase so a --wait poller
-    # can distinguish a healthy generation window from a stalled one. Same throttle as the
-    # slot-wait loop (PG_HEARTBEAT_SECS, set above); a same-iteration transition below (stall,
-    # live-detected, throttled, watchdog-killed) legitimately overwrites this with a fresh
-    # phase — never a regression, just the next real state.
+    # Heartbeat before the partial-capture fast path: Oracle can write findings while its
+    # producer remains alive for a long time, and that output must not freeze `launching`'s ts.
     if [ $(( now - last_hb )) -ge "$PG_HEARTBEAT_SECS" ]; then
       pg_status launching "strategy ${strategy}"
       last_hb=$now
     fi
+    [ -s "$CAPTURE_OUT" ] && continue   # findings are landing — let the run finish undisturbed
+    size=$(wc -c < "$RUNLOG" 2>/dev/null) || size=0
+    if [ "$size" != "$last_size" ]; then last_size="$size"; last_change=$SECONDS; fi
     last_line="$(tail -n 1 "$RUNLOG" 2>/dev/null || true)"
     if [ $(( now - last_change )) -ge "$STALL_SECS" ]; then
       echo "[oracle-review] watchdog: oracle silent for ${STALL_SECS}s with no findings — killing this attempt (salvage/retry follows)." >&2

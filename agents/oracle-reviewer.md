@@ -79,33 +79,55 @@ The caller passes: the PR number or URL, the repo directory (`REPO:`), and optio
    `curl` check would skip that recovery path and report "unavailable" for outages the
    engine would have healed. Just run the engine and interpret its exit code.
 
-3. **Run the review.** From the repo, launch the engine DETACHED (background, no caller-side
-   timeout), record its marker, then block on `--wait` (engine ≥v0.35) in the background and end
-   your turn — the same protocol as the main skill's step 3. A wrapper timeout that fires
-   mid-run can kill the engine after the slot is spent but before it persists a cooked run's
-   harvestable exit-9 reservation — the worst possible state — and a later invocation would then
-   double-spend.
+3. **Run the review.** From the repo, launch detached with no caller-side timeout, then bind the
+   marker to this launch's PID before any wait. A wrapper timeout can kill the engine after the
+   slot is spent but before an exit-9 reservation persists. The handshake uses `jq` when available
+   and a `sed` fallback; it rejects stale nonempty sidecars instead of spinning forever.
    ```bash
    OUT="${TMPDIR:-/tmp}/oracle-reviewer-pr-<num>.md"
+   read_marker() {
+     if command -v jq >/dev/null 2>&1; then jq -r '.marker // empty' "$1" 2>/dev/null
+     else sed -nE 's/.*"marker":"([^"]+)".*/\1/p' "$1" 2>/dev/null | head -1; fi
+   }
+   PRIOR_MARKER=""
+   if [ -f "$OUT.status" ] && [ ! -L "$OUT.status" ]; then PRIOR_MARKER="$(read_marker "$OUT.status")"; fi
    "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --pr <num|url> --repo <REPO> \
      --input <both|bundle|connector> --out "$OUT" --timeout 30m &
-   disown
-   sleep 5
-   MARKER="$(jq -r '.marker // empty' "$OUT.status" 2>/dev/null)"
-   "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --wait "$MARKER" --timeout 14400
+   ENGINE_PID=$!
+   disown "$ENGINE_PID" 2>/dev/null || true
+   MARKER=""
+   while :; do
+     # Read before checking liveness so a fast terminal run gets one final sidecar read after exit.
+     if [ -f "$OUT.status" ] && [ ! -L "$OUT.status" ]; then
+       CANDIDATE="$(read_marker "$OUT.status")"; CANDIDATE_PID="${CANDIDATE##*-}"
+       case "$CANDIDATE" in pg-run-*)
+         if [ -n "$CANDIDATE" ] && [ "$CANDIDATE_PID" = "$ENGINE_PID" ] \
+            && [ "$CANDIDATE" != "$PRIOR_MARKER" ]; then MARKER="$CANDIDATE"; break; fi ;;
+       esac
+     fi
+     kill -0 "$ENGINE_PID" 2>/dev/null || break
+     sleep 1
+   done
+   if [ -z "$MARKER" ]; then
+     echo "ERROR: engine exited without publishing its PID-bound marker; final status follows:" >&2
+     if [ -f "$OUT.status" ] && [ ! -L "$OUT.status" ]; then cat "$OUT.status" >&2; fi
+     exit 1
+   fi
+   while :; do
+     "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --wait "$MARKER" --timeout 1800
+     WAIT_RC=$?
+     case "$WAIT_RC" in 0) break;; 20) continue;; *) exit "$WAIT_RC";; esac
+   done
    ```
-   Run the `--wait` call with `run_in_background: true`; the harness wakes you when it exits.
-   `--wait` is read-only (never launches, harvests, or mutates state) and blocks until the run
-   reaches a terminal phase, then prints the final status JSON — safe to re-run any time you lose
-   track of one. Wait on the MARKER, not the bare `--out` path: `--out` is a fixed file reused
-   across every round of the same change, so a wait armed on the bare path can pick up a PRIOR
-   round's stale terminal status if it starts before this round's own status write lands there.
-   (`--wait "$OUT"` also works and skips the marker lookup, but only trust it when you're certain
-   no earlier round's terminal status could still be sitting at that path.) If your own tool-call
-   cap is shorter than the run's worst-case envelope, chunk it: loop `--wait "$MARKER" --timeout
-   <chunk>`, re-arming on exit 20 (timeout, healthy) and escalating on exit 21 (lost
-   observability) rather than assuming the bare 10-30 min happy path. `next_action` in the printed
-   JSON names exactly what to do next (see step 3's exit-code list below for the full taxonomy).
+   Run that whole block with `run_in_background: true` and end the turn; the harness wakes you
+   only when the chunked wait loop reaches a terminal result. Do useful non-conflicting work while
+   it blocks.
+
+   `--wait` is read-only and prints final status JSON. Always wait on the PID-bound marker for
+   reattach/repeat. Bare `--wait "$OUT"` is only safe when armed before `<out>.status` exists and
+   now fails closed (exit 2, including a dangling symlink) when it does not. Every wait chunk is
+   ≤30m; only exit 20 is safe to re-arm, while exit 21 must be escalated. `next_action` in the
+   printed JSON names the next operation (see the exit-code list below).
 
    **Degradation path**, if `--wait` is unavailable or you lost the marker/status file
    (compaction, new session): the engine still writes single-line JSON to `$OUT.status` at every

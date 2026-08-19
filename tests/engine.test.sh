@@ -3083,6 +3083,34 @@ check 'watchdog heartbeat: eventually transitions to watchdog-killed (legitimate
   "$([ "$HBWD_T3" = watchdog-killed ]; echo $?)" "final phase: $HBWD_T3"
 kill "$HBWD_ENGPID" 2>/dev/null; wait "$HBWD_ENGPID" 2>/dev/null || true
 
+echo '# v0.35 U3: watchdog heartbeat continues after Oracle has written a partial capture'
+cat > "$TDIR/bin/oracle-partialcapture" <<'FAKE_PARTIALCAPTURE'
+#!/usr/bin/env bash
+out=""
+while [ $# -gt 0 ]; do case "$1" in --write-output) out="$2"; shift 2;; *) shift;; esac; done
+printf '[P1] a.sh:1 - partial finding\n' > "$out"
+sleep 60
+FAKE_PARTIALCAPTURE
+chmod +x "$TDIR/bin/oracle-partialcapture"
+HBPC_HOME="$TDIR/home-hb-partial"; mkdir -p "$HBPC_HOME"
+PRO_GATE_HOME="$HBPC_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
+  PRO_GATE_STALL_SECS=60 PRO_GATE_NOTHINK_SECS=999 PRO_GATE_HEARTBEAT_SECS=1 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-partialcapture" NODE_OPTIONS= \
+  bash "$ENGINE" --diff "$TDIR/small.diff" --repo "$TDIR" --out "$TDIR/o-hbpartial.md" --timeout 5m \
+  >"$TDIR/hbpartial.stdout" 2>"$TDIR/hbpartial.stderr" &
+HBPC_ENGPID=$!
+for _ in $(seq 1 100); do [ "$(phase_of "$TDIR/o-hbpartial.md.status" 2>/dev/null)" = launching ] && break; sleep 0.2; done
+HBPC_TS0="$(jq -r .ts "$TDIR/o-hbpartial.md.status" 2>/dev/null)"
+# run_oracle's watchdog loop ticks every 10s; wait past one full tick after CAPTURE_OUT is nonempty.
+sleep 11
+HBPC_PHASE="$(phase_of "$TDIR/o-hbpartial.md.status")"
+HBPC_TS1="$(jq -r .ts "$TDIR/o-hbpartial.md.status" 2>/dev/null)"
+kill "$HBPC_ENGPID" 2>/dev/null; wait "$HBPC_ENGPID" 2>/dev/null || true
+check 'partial capture: launching heartbeat remains live after CAPTURE_OUT becomes nonempty' \
+  "$([ "$HBPC_PHASE" = launching ] && [ -n "$HBPC_TS0" ] && [ -n "$HBPC_TS1" ] && [ "$HBPC_TS1" '>' "$HBPC_TS0" ]; echo $?)" \
+  "phase=$HBPC_PHASE ts=$HBPC_TS0/$HBPC_TS1"
+
 ####################################################################################################
 # v0.35 (#88) U4: the --wait verb (R4-R7, R6a, R10 consumer side; AE1, AE2, AE5, AE6, AE7, AE8, AE9;
 # KTD5 legacy detection; terminal-exit ordering). Scenarios 1-9 and 10(R6a) hand-construct raw
@@ -3100,23 +3128,73 @@ export PRO_GATE_MIN_AVAIL_MB=0 PRO_GATE_MAX_SWAP_PCT=101 PRO_GATE_TIMEOUT_BIN=/u
 export PRO_GATE_EARLY_PROBE_SECS=0
 
 WHOME="$TDIR/home-wait"; mkdir -p "$WHOME"
+wait_marker_fixture() { # $1 home $2 exact marker $3 out path
+  mkdir -p "$1/in-progress"
+  printf 'wait\t%s\t%s\t0\t1\tgpt-5\n' "$3" "$(date +%s)" > "$1/in-progress/$2"
+}
+wait_snapshot_armed() { # $1 private TMPDIR; the waiter's private dir exists only after bare-target validation
+  local p _
+  for _ in $(seq 1 100); do
+    for p in "$1"/pg-wait.*; do [ -d "$p" ] && return 0; done
+    sleep 0.1
+  done
+  return 1
+}
 
-echo '# scenario 1 (AE5): a status file flipping to terminal mid-poll unblocks --wait within one poll interval'
+echo '# bare --out safety: an existing sidecar is ambiguous, including a dangling symlink'
+W0OUT="$TDIR/w0.md"
+printf '{"phase":"done","terminal":true}\n' > "$W0OUT.status"
+PRO_GATE_HOME="$WHOME" "$ENGINE" --wait "$W0OUT" --timeout 30 >"$TDIR/w0.out" 2>"$TDIR/w0.err"
+W0RC=$?
+check 'bare --out rejects a pre-existing terminal status with exit 2 and no verdict bytes' \
+  "$([ "$W0RC" -eq 2 ] && [ ! -s "$TDIR/w0.out" ]; echo $?)" "rc=$W0RC $(cat "$TDIR/w0.err")"
+W0LINKOUT="$TDIR/w0-link.md"
+ln -s "$TDIR/w0-missing.status" "$W0LINKOUT.status"
+PRO_GATE_HOME="$WHOME" "$ENGINE" --wait "$W0LINKOUT" --timeout 30 >"$TDIR/w0-link.out" 2>"$TDIR/w0-link.err"
+W0LINKRC=$?
+check 'bare --out rejects a dangling pre-existing sidecar with exit 2' \
+  "$([ "$W0LINKRC" -eq 2 ]; echo $?)" "rc=$W0LINKRC $(cat "$TDIR/w0-link.err")"
+
+echo '# scenario 1 (AE5): a clean-armed bare --out wait survives markerless preflight and returns its terminal generation'
 W1OUT="$TDIR/w1.md"
-NOWTS="$(date +%Y-%m-%dT%H:%M:%S%z)"
-printf '{"phase":"waiting-slot","attempt":1,"detail":"","pr":"5","out":"%s","ts":"%s","marker":"pg-run-w1-1700000100-1","model":"","model_warn":"","result":"","terminal":false,"next_action":{"cmd":"","terminal":false,"wait_class":null}}\n' \
-  "$W1OUT" "$NOWTS" > "$W1OUT.status"
-PRO_GATE_HOME="$WHOME" PRO_GATE_WAIT_POLL_SECS=1 "$ENGINE" --wait "$W1OUT" --timeout 10 >"$TDIR/w1.out" 2>"$TDIR/w1.err" &
+W1_TMP="$TDIR/w1-tmp"; mkdir -p "$W1_TMP"
+TMPDIR="$W1_TMP" PRO_GATE_HOME="$WHOME" PRO_GATE_WAIT_POLL_SECS=1 "$ENGINE" --wait "$W1OUT" --timeout 10 >"$TDIR/w1.out" 2>"$TDIR/w1.err" &
 W1PID=$!
-sleep 0.4
+wait_snapshot_armed "$W1_TMP"; W1ARMED=$?
+# The real engine writes preflight before RUN_MARKER can be derived. Clean arming identifies this
+# generation without a marker; requiring one here would make the documented bare-path form fail 21.
+printf '{"phase":"preflight","attempt":0,"detail":"","pr":"5","out":"%s","ts":"%s","marker":"","model":"","model_warn":"","result":"","terminal":false,"next_action":{"cmd":"","terminal":false,"wait_class":null}}\n' \
+  "$W1OUT" "$(date +%Y-%m-%dT%H:%M:%S%z)" > "$W1OUT.status"
+sleep 1.3
+kill -0 "$W1PID" 2>/dev/null; W1_PREFLIGHT_LIVE=$?
 printf '{"phase":"done","attempt":1,"detail":"","pr":"5","out":"%s","ts":"%s","marker":"pg-run-w1-1700000100-1","model":"gpt-5","model_warn":"","result":"%s","terminal":true,"next_action":{"cmd":"","terminal":true,"wait_class":"verdict"}}\n' \
   "$W1OUT" "$(date +%Y-%m-%dT%H:%M:%S%z)" "$W1OUT" > "$W1OUT.status"
 W1_T0=$(date +%s)
 wait "$W1PID"; W1RC=$?
 W1_T1=$(date +%s)
-check 'AE5: blocked --wait exits 0 once the fixture flips to terminal' "$([ "$W1RC" -eq 0 ]; echo $?)" "rc=$W1RC $(cat "$TDIR/w1.err")"
-check 'AE5: exits within one poll interval of the flip' "$([ $(( W1_T1 - W1_T0 )) -le 3 ]; echo $?)" "elapsed=$(( W1_T1 - W1_T0 ))s"
+check 'AE5: clean-armed --wait keeps waiting through the real markerless preflight status' \
+  "$([ "$W1ARMED" -eq 0 ] && [ "$W1_PREFLIGHT_LIVE" -eq 0 ]; echo $?)" "armed=$W1ARMED live=$W1_PREFLIGHT_LIVE $(cat "$TDIR/w1.err")"
+check 'AE5: clean-armed --wait exits 0 when that generation becomes terminal' "$([ "$W1RC" -eq 0 ]; echo $?)" "rc=$W1RC $(cat "$TDIR/w1.err")"
+check 'AE5: exits within one poll interval of the terminal write' "$([ $(( W1_T1 - W1_T0 )) -le 3 ]; echo $?)" "elapsed=$(( W1_T1 - W1_T0 ))s"
 check 'AE5: prints the final terminal JSON on stdout' "$(jq -e '.terminal == true and .phase == "done"' "$TDIR/w1.out" >/dev/null 2>&1; echo $?)" "$(cat "$TDIR/w1.out")"
+
+echo '# wait snapshot safety: the old predictable pg-wait-snap.PID symlink cannot overwrite a victim'
+W1SAFE_TMP="$TDIR/wait-private"
+mkdir -p "$W1SAFE_TMP"
+W1SAFE_OUT="$TDIR/w1-safe.md"
+printf 'preserve me\n' > "$TDIR/wait-victim"
+TMPDIR="$W1SAFE_TMP" PRO_GATE_HOME="$WHOME" PRO_GATE_WAIT_POLL_SECS=1 "$ENGINE" --wait "$W1SAFE_OUT" --timeout 10 \
+  >"$TDIR/w1-safe.out" 2>"$TDIR/w1-safe.err" &
+W1SAFE_PID=$!
+wait_snapshot_armed "$W1SAFE_TMP"; W1SAFE_ARMED=$?
+ln -s "$TDIR/wait-victim" "$W1SAFE_TMP/pg-wait-snap.$W1SAFE_PID"
+printf '{"phase":"done","attempt":1,"detail":"","pr":"5","out":"%s","ts":"%s","marker":"pg-run-w1safe-1700000101-1","model":"gpt-5","model_warn":"","result":"%s","terminal":true,"next_action":{"cmd":"","terminal":true,"wait_class":"verdict"}}\n' \
+  "$W1SAFE_OUT" "$(date +%Y-%m-%dT%H:%M:%S%z)" "$W1SAFE_OUT" > "$W1SAFE_OUT.status"
+wait "$W1SAFE_PID"; W1SAFERC=$?
+check 'snapshot staging never follows the legacy predictable symlink' \
+  "$( [ "$W1SAFE_ARMED" -eq 0 ] && [ "$W1SAFERC" -eq 0 ] && [ "$(cat "$TDIR/wait-victim")" = 'preserve me' ]; echo $?)" "armed=$W1SAFE_ARMED rc=$W1SAFERC victim=$(cat "$TDIR/wait-victim")"
+check 'successful wait removes its private pg-wait snapshot directory' \
+  "$( [ -z "$(find "$W1SAFE_TMP" -maxdepth 1 -name 'pg-wait.*' -print -quit)" ]; echo $?)" "$(find "$W1SAFE_TMP" -maxdepth 1 -print)"
 
 echo '# scenario 2 (AE2): marker resolving straight to the completed store returns immediately'
 W2HOME="$TDIR/home-wait2"; mkdir -p "$W2HOME/completed"
@@ -3158,23 +3236,28 @@ check 'AE9: final JSON is the newly-appeared terminal status' "$(jq -e --arg m "
 
 echo '# scenario 4 (AE6/AE7): --timeout on a healthy non-terminal run exits 20, never a false lost-observability'
 W4OUT="$TDIR/w4.md"
+W4_TMP="$TDIR/w4-tmp"; mkdir -p "$W4_TMP"
+W4MARKER="pg-run-w4-1700000400-4"
 NOWTS="$(date +%Y-%m-%dT%H:%M:%S%z)"
-printf '{"phase":"waiting-slot","attempt":1,"detail":"","pr":"5","out":"%s","ts":"%s","marker":"pg-run-w4-1700000400-4","model":"","model_warn":"","result":"","terminal":false,"next_action":{"cmd":"","terminal":false,"wait_class":null}}\n' \
-  "$W4OUT" "$NOWTS" > "$W4OUT.status"
+printf '{"phase":"waiting-slot","attempt":1,"detail":"","pr":"5","out":"%s","ts":"%s","marker":"%s","model":"","model_warn":"","result":"","terminal":false,"next_action":{"cmd":"","terminal":false,"wait_class":null}}\n' \
+  "$W4OUT" "$NOWTS" "$W4MARKER" > "$W4OUT.status"
+wait_marker_fixture "$WHOME" "$W4MARKER" "$W4OUT"
 # Deviation: the plan's AE6 example uses --timeout 60; scaled to 3s here (identical exit-20 code
 # path, identical healthy/non-terminal classification) to keep the suite's wall time bounded — the
 # mechanism under test is timeout-vs-staleness classification, not the literal duration.
 W4_T0=$(date +%s)
-PRO_GATE_HOME="$WHOME" PRO_GATE_WAIT_POLL_SECS=1 "$ENGINE" --wait "$W4OUT" --timeout 3 >"$TDIR/w4.out" 2>"$TDIR/w4.err"
+TMPDIR="$W4_TMP" PRO_GATE_HOME="$WHOME" PRO_GATE_WAIT_POLL_SECS=1 "$ENGINE" --wait "$W4MARKER" --timeout 3 >"$TDIR/w4.out" 2>"$TDIR/w4.err"
 W4RC=$?
 W4_T1=$(date +%s)
 check 'AE6: healthy non-terminal run times out through exit 20 (not 21)' "$([ "$W4RC" -eq 20 ]; echo $?)" "rc=$W4RC $(cat "$TDIR/w4.err")"
 check 'AE6: times out at roughly the requested duration' "$([ $(( W4_T1 - W4_T0 )) -ge 3 ] && [ $(( W4_T1 - W4_T0 )) -le 6 ]; echo $?)" "elapsed=$(( W4_T1 - W4_T0 ))s"
 check 'AE6: the run itself is unaffected (fixture untouched)' "$(grep -q '\"phase\":\"waiting-slot\"' "$W4OUT.status"; echo $?)" "$(cat "$W4OUT.status")"
+check 'AE6: timeout after marker resolution removes the private snapshot directory' \
+  "$( [ -z "$(find "$W4_TMP" -maxdepth 1 -name 'pg-wait.*' -print -quit)" ]; echo $?)" "$(find "$W4_TMP" -maxdepth 1 -print)"
 
 echo '# scenario 4b (AE7): --timeout 0 is an immediate single classification probe'
 W4B_T0=$(date +%s)
-PRO_GATE_HOME="$WHOME" "$ENGINE" --wait "$W4OUT" --timeout 0 >"$TDIR/w4b.out" 2>"$TDIR/w4b.err"
+PRO_GATE_HOME="$WHOME" "$ENGINE" --wait "$W4MARKER" --timeout 0 >"$TDIR/w4b.out" 2>"$TDIR/w4b.err"
 W4BRC=$?
 W4B_T1=$(date +%s)
 check 'AE7: --timeout 0 exits through the timeout code immediately' "$([ "$W4BRC" -eq 20 ]; echo $?)" "rc=$W4BRC $(cat "$TDIR/w4b.err")"
@@ -3183,43 +3266,53 @@ check 'AE7: --timeout 0 still prints the current status JSON' "$(jq -e '.phase =
 
 echo '# scenario 5 (AE1): heartbeated-phase staleness — fresh ts keeps waiting, stale ts is lost observability'
 W5OUT="$TDIR/w5.md"
+W5MARKER="pg-run-w5-1700000500-5"
 FRESHTS="$(date +%Y-%m-%dT%H:%M:%S%z)"
-printf '{"phase":"launching","attempt":1,"detail":"","pr":"5","out":"%s","ts":"%s","marker":"pg-run-w5-1700000500-5","model":"","model_warn":"","result":"","terminal":false,"next_action":{"cmd":"","terminal":false,"wait_class":null}}\n' \
-  "$W5OUT" "$FRESHTS" > "$W5OUT.status"
-PRO_GATE_HOME="$WHOME" PRO_GATE_WAIT_POLL_SECS=1 "$ENGINE" --wait "$W5OUT" --timeout 2 >"$TDIR/w5.out" 2>"$TDIR/w5.err"
+printf '{"phase":"launching","attempt":1,"detail":"","pr":"5","out":"%s","ts":"%s","marker":"%s","model":"","model_warn":"","result":"","terminal":false,"next_action":{"cmd":"","terminal":false,"wait_class":null}}\n' \
+  "$W5OUT" "$FRESHTS" "$W5MARKER" > "$W5OUT.status"
+wait_marker_fixture "$WHOME" "$W5MARKER" "$W5OUT"
+PRO_GATE_HOME="$WHOME" PRO_GATE_WAIT_POLL_SECS=1 "$ENGINE" --wait "$W5MARKER" --timeout 2 >"$TDIR/w5.out" 2>"$TDIR/w5.err"
 W5RC=$?
 check 'AE1: fresh ts in a heartbeated phase keeps waiting (times out, not lost)' "$([ "$W5RC" -eq 20 ]; echo $?)" "rc=$W5RC $(cat "$TDIR/w5.err")"
 
+W5BMARKER="pg-run-w5b-1700000501-5"
 STALETS="$(date -d '-10 minutes' +%Y-%m-%dT%H:%M:%S%z 2>/dev/null || date -v-10M +%Y-%m-%dT%H:%M:%S%z)"
-printf '{"phase":"launching","attempt":1,"detail":"","pr":"5","out":"%s","ts":"%s","marker":"pg-run-w5b-1700000501-5","model":"","model_warn":"","result":"","terminal":false,"next_action":{"cmd":"","terminal":false,"wait_class":null}}\n' \
-  "$W5OUT" "$STALETS" > "$W5OUT.status"
-PRO_GATE_HOME="$WHOME" "$ENGINE" --wait "$W5OUT" --timeout 30 >"$TDIR/w5b.out" 2>"$TDIR/w5b.err"
+printf '{"phase":"launching","attempt":1,"detail":"","pr":"5","out":"%s","ts":"%s","marker":"%s","model":"","model_warn":"","result":"","terminal":false,"next_action":{"cmd":"","terminal":false,"wait_class":null}}\n' \
+  "$W5OUT" "$STALETS" "$W5BMARKER" > "$W5OUT.status"
+wait_marker_fixture "$WHOME" "$W5BMARKER" "$W5OUT"
+PRO_GATE_HOME="$WHOME" "$ENGINE" --wait "$W5BMARKER" --timeout 30 >"$TDIR/w5b.out" 2>"$TDIR/w5b.err"
 W5BRC=$?
 check 'AE1: stale ts (10min old, default 4x30s=120s bound) in launching exits 21 (lost observability)' "$([ "$W5BRC" -eq 21 ]; echo $?)" "rc=$W5BRC $(cat "$TDIR/w5b.err")"
 check 'AE1: lost-observability still prints the last-known JSON' "$(jq -e '.phase == "launching"' "$TDIR/w5b.out" >/dev/null 2>&1; echo $?)" "$(cat "$TDIR/w5b.out")"
 
 echo '# scenario 6 (AE8): salvaging (loopless phase) — within its 1.5x window bound keeps waiting, beyond it is lost'
 W6OUT="$TDIR/w6.md"
+W6MARKER="pg-run-w6-1700000600-6"
 TS_10MIN="$(date -d '-10 minutes' +%Y-%m-%dT%H:%M:%S%z 2>/dev/null || date -v-10M +%Y-%m-%dT%H:%M:%S%z)"
-printf '{"phase":"salvaging","attempt":1,"detail":"","pr":"5","out":"%s","ts":"%s","marker":"pg-run-w6-1700000600-6","model":"","model_warn":"","result":"","terminal":false,"next_action":{"cmd":"","terminal":false,"wait_class":null}}\n' \
-  "$W6OUT" "$TS_10MIN" > "$W6OUT.status"
-PRO_GATE_HOME="$WHOME" "$ENGINE" --wait "$W6OUT" --timeout 2 >"$TDIR/w6.out" 2>"$TDIR/w6.err"
+printf '{"phase":"salvaging","attempt":1,"detail":"","pr":"5","out":"%s","ts":"%s","marker":"%s","model":"","model_warn":"","result":"","terminal":false,"next_action":{"cmd":"","terminal":false,"wait_class":null}}\n' \
+  "$W6OUT" "$TS_10MIN" "$W6MARKER" > "$W6OUT.status"
+wait_marker_fixture "$WHOME" "$W6MARKER" "$W6OUT"
+PRO_GATE_HOME="$WHOME" "$ENGINE" --wait "$W6MARKER" --timeout 2 >"$TDIR/w6.out" 2>"$TDIR/w6.err"
 W6RC=$?
 check 'AE8: 10-minute-old salvaging ts is within the (>=1800s floor * 1.5) salvage bound — keeps waiting' "$([ "$W6RC" -eq 20 ]; echo $?)" "rc=$W6RC $(cat "$TDIR/w6.err")"
 
+W6BMARKER="pg-run-w6b-1700000601-6"
 TS_46MIN="$(date -d '-46 minutes' +%Y-%m-%dT%H:%M:%S%z 2>/dev/null || date -v-46M +%Y-%m-%dT%H:%M:%S%z)"
-printf '{"phase":"salvaging","attempt":1,"detail":"","pr":"5","out":"%s","ts":"%s","marker":"pg-run-w6b-1700000601-6","model":"","model_warn":"","result":"","terminal":false,"next_action":{"cmd":"","terminal":false,"wait_class":null}}\n' \
-  "$W6OUT" "$TS_46MIN" > "$W6OUT.status"
-PRO_GATE_HOME="$WHOME" "$ENGINE" --wait "$W6OUT" --timeout 5 >"$TDIR/w6b.out" 2>"$TDIR/w6b.err"
+printf '{"phase":"salvaging","attempt":1,"detail":"","pr":"5","out":"%s","ts":"%s","marker":"%s","model":"","model_warn":"","result":"","terminal":false,"next_action":{"cmd":"","terminal":false,"wait_class":null}}\n' \
+  "$W6OUT" "$TS_46MIN" "$W6BMARKER" > "$W6OUT.status"
+wait_marker_fixture "$WHOME" "$W6BMARKER" "$W6OUT"
+PRO_GATE_HOME="$WHOME" "$ENGINE" --wait "$W6BMARKER" --timeout 5 >"$TDIR/w6b.out" 2>"$TDIR/w6b.err"
 W6BRC=$?
 check 'AE8: beyond the salvage bound (46min > 2700s) exits 21 (lost observability)' "$([ "$W6BRC" -eq 21 ]; echo $?)" "rc=$W6BRC $(cat "$TDIR/w6b.err")"
 
 echo '# scenario 7 (KTD5): legacy status JSON without a terminal field — widest bound, exactly one warning'
 W7OUT="$TDIR/w7.md"
+W7MARKER="pg-run-w7-1700000700-7"
 NOWTS="$(date +%Y-%m-%dT%H:%M:%S%z)"
-printf '{"phase":"launching","attempt":1,"detail":"","pr":"5","out":"%s","ts":"%s","marker":"pg-run-w7-1700000700-7","model":"","model_warn":"","result":""}\n' \
-  "$W7OUT" "$NOWTS" > "$W7OUT.status"
-PRO_GATE_HOME="$WHOME" PRO_GATE_WAIT_POLL_SECS=1 "$ENGINE" --wait "$W7OUT" --timeout 3 >"$TDIR/w7.out" 2>"$TDIR/w7.err"
+printf '{"phase":"launching","attempt":1,"detail":"","pr":"5","out":"%s","ts":"%s","marker":"%s","model":"","model_warn":"","result":""}\n' \
+  "$W7OUT" "$NOWTS" "$W7MARKER" > "$W7OUT.status"
+wait_marker_fixture "$WHOME" "$W7MARKER" "$W7OUT"
+PRO_GATE_HOME="$WHOME" PRO_GATE_WAIT_POLL_SECS=1 "$ENGINE" --wait "$W7MARKER" --timeout 3 >"$TDIR/w7.out" 2>"$TDIR/w7.err"
 W7RC=$?
 check 'KTD5: legacy fixture (no terminal field) keeps waiting within the widest bound, no false lost-observability' "$([ "$W7RC" -eq 20 ]; echo $?)" "rc=$W7RC $(cat "$TDIR/w7.err")"
 check 'KTD5: legacy fixture triggers exactly one stderr warning across the whole wait' "$([ "$(grep -c "has no 'terminal' field" "$TDIR/w7.err")" -eq 1 ]; echo $?)" "$(cat "$TDIR/w7.err")"
@@ -3243,15 +3336,18 @@ echo '# scenario 10 (R6a): a status file at the resolved out-path carrying a DIF
 W10HOME="$TDIR/home-wait10"; mkdir -p "$W10HOME/in-progress"
 W10MARKER="pg-run-w10-1700001000-10"
 W10OUT="$TDIR/w10.md"
+W10_TMP="$TDIR/w10-tmp"; mkdir -p "$W10_TMP"
 printf 'w10\t%s\t%s\t0\t1\tgpt-5\n' "$W10OUT" "$(date +%s)" > "$W10HOME/in-progress/$W10MARKER"
 # A stale/reused --out carries ANOTHER run's terminal status at the exact path this marker's own
 # reservation resolves to.
 printf '{"phase":"done","attempt":1,"detail":"","pr":"5","out":"%s","ts":"%s","marker":"pg-run-DIFFERENT-9999999999-1","model":"gpt-5","model_warn":"","result":"%s","terminal":true,"next_action":{"cmd":"","terminal":true,"wait_class":"verdict"}}\n' \
   "$W10OUT" "$(date +%Y-%m-%dT%H:%M:%S%z)" "$W10OUT" > "$W10OUT.status"
-PRO_GATE_HOME="$W10HOME" PRO_GATE_WAIT_POLL_SECS=1 "$ENGINE" --wait "$W10MARKER" --timeout 3 >"$TDIR/w10.out" 2>"$TDIR/w10.err"
+TMPDIR="$W10_TMP" PRO_GATE_HOME="$W10HOME" PRO_GATE_WAIT_POLL_SECS=1 "$ENGINE" --wait "$W10MARKER" --timeout 3 >"$TDIR/w10.out" 2>"$TDIR/w10.err"
 W10RC=$?
 check 'R6a: a marker-mismatched status file at the resolved out-path is never trusted (no false exit 0)' "$([ "$W10RC" -ne 0 ]; echo $?)" "rc=$W10RC $(cat "$TDIR/w10.out")"
 check 'R6a: falls back to the state join and times out healthy rather than reporting the wrong verdict' "$([ "$W10RC" -eq 20 ]; echo $?)" "rc=$W10RC $(cat "$TDIR/w10.err")"
+check 'R6a: resolver after a snapshot preserves the snapshot cleanup EXIT handler' \
+  "$( [ -z "$(find "$W10_TMP" -maxdepth 1 -name 'pg-wait.*' -print -quit)" ]; echo $?)" "$(find "$W10_TMP" -maxdepth 1 -print)"
 
 echo '# scenario 11, part A (terminal-exit ordering): --wait settles the active-run index before exiting'
 # pg_finish keeps its original, v0.32-gated order: the organizer case dispatch (which can
@@ -3275,7 +3371,7 @@ printf '%s\t%s\t%s\t%s\n' "$W11AMARKER" "$W11AOUT" "$W11A_LIVEPID" "$(date +%s)"
   > "$W11AHOME/active/w11settle"
 printf '{"phase":"done","attempt":1,"detail":"","pr":"","out":"%s","ts":"%s","marker":"%s","model":"gpt-5","model_warn":"","result":"%s","terminal":true,"next_action":{"cmd":"","terminal":true,"wait_class":"verdict"}}\n' \
   "$W11AOUT" "$(date +%Y-%m-%dT%H:%M:%S%z)" "$W11AMARKER" "$W11AOUT" > "$W11AOUT.status"
-PRO_GATE_HOME="$W11AHOME" PRO_GATE_WAIT_POLL_SECS=1 "$ENGINE" --wait "$W11AOUT" --timeout 30 \
+PRO_GATE_HOME="$W11AHOME" PRO_GATE_WAIT_POLL_SECS=1 "$ENGINE" --wait "$W11AMARKER" --timeout 30 \
   >"$TDIR/w11a.out" 2>"$TDIR/w11a.err" &
 W11A_WAITPID=$!
 sleep 2
@@ -3320,7 +3416,7 @@ printf '{"phase":"done","attempt":1,"detail":"","pr":"","out":"%s","ts":"%s","ma
   "$W11COUT" "$(date +%Y-%m-%dT%H:%M:%S%z)" "$W11CMARKER" "$W11COUT" > "$W11COUT.status"
 W11C_T0=$(date +%s)
 PRO_GATE_HOME="$W11CHOME" PRO_GATE_WAIT_POLL_SECS=1 PRO_GATE_WAIT_SETTLE_CAP=2 \
-  "$ENGINE" --wait "$W11COUT" --timeout 30 >"$TDIR/w11c.out" 2>"$TDIR/w11c.err"
+  "$ENGINE" --wait "$W11CMARKER" --timeout 30 >"$TDIR/w11c.out" 2>"$TDIR/w11c.err"
 W11CRC=$?
 W11C_T1=$(date +%s)
 kill "$W11C_LIVEPID" 2>/dev/null; wait "$W11C_LIVEPID" 2>/dev/null
@@ -3467,7 +3563,7 @@ printf 'pg-run-zzzclobber-1699999000-9\t%s\t1\t%s\n' "$TDIR/rt2-decoy.md" "$(dat
   > "$RT2_HOME/active/zzzclobber"
 printf '{"phase":"done","attempt":1,"detail":"","pr":"","out":"%s","ts":"%s","marker":"%s","model":"gpt-5","model_warn":"","result":"%s","terminal":true,"next_action":{"cmd":"","terminal":true,"wait_class":"verdict"}}\n' \
   "$RT2_OUT" "$(date +%Y-%m-%dT%H:%M:%S%z)" "$RT2_MARKER" "$RT2_OUT" > "$RT2_OUT.status"
-PRO_GATE_HOME="$RT2_HOME" PRO_GATE_WAIT_POLL_SECS=1 "$ENGINE" --wait "$RT2_OUT" --timeout 30 \
+PRO_GATE_HOME="$RT2_HOME" PRO_GATE_WAIT_POLL_SECS=1 "$ENGINE" --wait "$RT2_MARKER" --timeout 30 \
   >"$TDIR/rt2.out" 2>"$TDIR/rt2.err" &
 RT2_WAITPID=$!
 sleep 2
@@ -3485,45 +3581,64 @@ echo '# gate P1 regression 3 (out-path snapshot+bind / FIX 3a/3b): a bound --out
 echo '# hand back a REPLACEMENT round'"'"'s verdict as if it were the bound round'"'"'s own'
 RT3_HOME="$TDIR/home-rt3"; mkdir -p "$RT3_HOME"
 RT3_OUT="$TDIR/rt3.md"
+RT3_TMP="$TDIR/rt3-tmp"; mkdir -p "$RT3_TMP"
 RT3_ORIG_MARKER="pg-run-rt3orig-1700003400-34"
 RT3_NEW_MARKER="pg-run-rt3new-1700003401-35"
-# Round ORIG is still generating (non-terminal) when --wait first polls and binds to it.
-printf '{"phase":"waiting-slot","attempt":1,"detail":"","pr":"5","out":"%s","ts":"%s","marker":"%s","model":"","model_warn":"","result":"","terminal":false,"next_action":{"cmd":"","terminal":false,"wait_class":null}}\n' \
-  "$RT3_OUT" "$(date +%Y-%m-%dT%H:%M:%S%z)" "$RT3_ORIG_MARKER" > "$RT3_OUT.status"
-PRO_GATE_HOME="$RT3_HOME" PRO_GATE_WAIT_POLL_SECS=1 "$ENGINE" --wait "$RT3_OUT" --timeout 4 \
+# Arm the bare output path while clean, then let it bind to ORIG on its first later poll.
+TMPDIR="$RT3_TMP" PRO_GATE_HOME="$RT3_HOME" PRO_GATE_WAIT_POLL_SECS=1 "$ENGINE" --wait "$RT3_OUT" --timeout 4 \
   >"$TDIR/rt3.out" 2>"$TDIR/rt3.err" &
 RT3_WAITPID=$!
-sleep 1.3
+wait_snapshot_armed "$RT3_TMP"; RT3ARMED=$?
+printf '{"phase":"waiting-slot","attempt":1,"detail":"","pr":"5","out":"%s","ts":"%s","marker":"%s","model":"","model_warn":"","result":"","terminal":false,"next_action":{"cmd":"","terminal":false,"wait_class":null}}\n' \
+  "$RT3_OUT" "$(date +%Y-%m-%dT%H:%M:%S%z)" "$RT3_ORIG_MARKER" > "$RT3_OUT.status"
+# Keep ORIG present for multiple poll intervals so the waiter has definitely bound before replacement.
+sleep 2.2
 # Round ORIG never reaches terminal — a totally different round (rt3new) replaces it at the
 # SAME shared --out path, landing its OWN terminal verdict there instead.
 printf '{"phase":"done","attempt":1,"detail":"","pr":"5","out":"%s","ts":"%s","marker":"%s","model":"gpt-5","model_warn":"","result":"%s","terminal":true,"next_action":{"cmd":"","terminal":true,"wait_class":"verdict"}}\n' \
   "$RT3_OUT" "$(date +%Y-%m-%dT%H:%M:%S%z)" "$RT3_NEW_MARKER" "$RT3_OUT" > "$RT3_OUT.status"
 wait "$RT3_WAITPID"; RT3RC=$?
 check 'FIX3: a bound out-path wait never silently reports a REPLACEMENT round'"'"'s verdict (no false exit 0)' \
-  "$([ "$RT3RC" -ne 0 ]; echo $?)" "rc=$RT3RC $(cat "$TDIR/rt3.out")"
+  "$([ "$RT3ARMED" -eq 0 ] && [ "$RT3RC" -ne 0 ]; echo $?)" "armed=$RT3ARMED rc=$RT3RC $(cat "$TDIR/rt3.out")"
 check 'FIX3: falls through to the timeout instead of fabricating a verdict' "$([ "$RT3RC" -eq 20 ]; echo $?)" "rc=$RT3RC $(cat "$TDIR/rt3.err")"
-check 'FIX3: --timeout print still shows the last-known bytes, not silence, after the bind mismatch' \
-  "$([ -s "$TDIR/rt3.out" ]; echo $?)" "stdout was empty at timeout"
+check 'FIX3: --timeout prints only the last trusted original snapshot, never the replacement marker' \
+  "$(jq -e --arg m "$RT3_ORIG_MARKER" '.marker==$m' "$TDIR/rt3.out" >/dev/null 2>&1; echo $?)" "$(cat "$TDIR/rt3.out")"
 
 echo '# gate P1 regression 4 (wait_json_valid / FIX 4): corrupt/truncated/non-JSON status must exit 21'
 echo '# (lost observability), never mistaken for a healthy pre-v0.35 (KTD5) legacy run'
 RT4_OUT="$TDIR/rt4.md"
-printf '{"phase":"launching","ts":"%s","marker":"pg-run-rt4-1700003500-36"' "$(date +%Y-%m-%dT%H:%M:%S%z)" \
+RT4_MARKER="pg-run-rt4-1700003500-36"
+wait_marker_fixture "$WHOME" "$RT4_MARKER" "$RT4_OUT"
+# A malformed file claims a DIFFERENT marker: complete-object validation must fail before marker
+# comparison can classify it as a foreign run.
+printf '{"phase":"launching","ts":"%s","marker":"pg-run-foreign-1700003500-99"' "$(date +%Y-%m-%dT%H:%M:%S%z)" \
   > "$RT4_OUT.status"  # truncated mid-write: no closing brace, no "terminal" field
-PRO_GATE_HOME="$WHOME" "$ENGINE" --wait "$RT4_OUT" --timeout 2 >"$TDIR/rt4.out" 2>"$TDIR/rt4.err"
+PRO_GATE_HOME="$WHOME" "$ENGINE" --wait "$RT4_MARKER" --timeout 2 >"$TDIR/rt4.out" 2>"$TDIR/rt4.err"
 RT4RC=$?
-check 'FIX4 (jq path): truncated/corrupt status exits 21, not 20 (never a false healthy-legacy classification)' \
+check 'FIX4 (jq marker path): truncated foreign-marker status exits 21 before mismatch handling' \
   "$([ "$RT4RC" -eq 21 ]; echo $?)" "rc=$RT4RC $(cat "$TDIR/rt4.err")"
-check 'FIX4 (jq path): still prints whatever bytes are on disk' "$([ -s "$TDIR/rt4.out" ]; echo $?)" "stdout was empty"
+check 'FIX4 (jq path): still prints the copied malformed bytes' "$([ -s "$TDIR/rt4.out" ]; echo $?)" "stdout was empty"
 
 build_nojq_path
 RT4B_OUT="$TDIR/rt4b.md"
-printf '{"phase":"launching","ts":"%s","marker":"pg-run-rt4b-1700003501-36"' "$(date +%Y-%m-%dT%H:%M:%S%z)" \
+RT4B_MARKER="pg-run-rt4b-1700003501-36"
+wait_marker_fixture "$WHOME" "$RT4B_MARKER" "$RT4B_OUT"
+printf '{"phase":"launching","ts":"%s","marker":"pg-run-foreign-1700003501-99"' "$(date +%Y-%m-%dT%H:%M:%S%z)" \
   > "$RT4B_OUT.status"
-PATH="$NOJQ_DIR" PRO_GATE_HOME="$WHOME" "$ENGINE" --wait "$RT4B_OUT" --timeout 2 >"$TDIR/rt4b.out" 2>"$TDIR/rt4b.err"
+PATH="$NOJQ_DIR" PRO_GATE_HOME="$WHOME" "$ENGINE" --wait "$RT4B_MARKER" --timeout 2 >"$TDIR/rt4b.out" 2>"$TDIR/rt4b.err"
 RT4BRC=$?
-check 'FIX4 (no-jq path): truncated/corrupt status exits 21, not 20 (never a false healthy-legacy classification)' \
+check 'FIX4 (no-jq marker path): truncated foreign-marker status exits 21 before mismatch handling' \
   "$([ "$RT4BRC" -eq 21 ]; echo $?)" "rc=$RT4BRC $(cat "$TDIR/rt4b.err")"
+
+echo '# gate P1 regression 4b (snapshot copy failure): a present unreadable sidecar is lost observability'
+RT4C_OUT="$TDIR/rt4c.md"
+RT4C_MARKER="pg-run-rt4c-1700003502-36"
+wait_marker_fixture "$WHOME" "$RT4C_MARKER" "$RT4C_OUT"
+ln -s "$TDIR/rt4c-missing.status" "$RT4C_OUT.status"
+PRO_GATE_HOME="$WHOME" "$ENGINE" --wait "$RT4C_MARKER" --timeout 2 >"$TDIR/rt4c.out" 2>"$TDIR/rt4c.err"
+RT4CRC=$?
+check 'FIX4: present unreadable sidecar in marker mode exits 21, not timeout or foreign-run handling' \
+  "$([ "$RT4CRC" -eq 21 ]; echo $?)" "rc=$RT4CRC $(cat "$TDIR/rt4c.err")"
 
 echo '# gate P2 regression 5 (completed-artifact handoff / FIX 5): covered above as part of scenario 2 (AE2)'
 echo '# — dual-purposed there since it is the exact same code path (wait_resolve_marker artifact_completed).'
@@ -3539,7 +3654,7 @@ printf '{"phase":"done","attempt":1,"detail":"","pr":"","out":"%s","ts":"%s","ma
   "$RT6_OUT" "$(date +%Y-%m-%dT%H:%M:%S%z)" "$RT6_MARKER" "$RT6_OUT" > "$RT6_OUT.status"
 RT6_T0=$(date +%s)
 PRO_GATE_HOME="$RT6_HOME" PRO_GATE_WAIT_POLL_SECS=1 PRO_GATE_WAIT_SETTLE_CAP=5 \
-  "$ENGINE" --wait "$RT6_OUT" --timeout 0 >"$TDIR/rt6.out" 2>"$TDIR/rt6.err"
+  "$ENGINE" --wait "$RT6_MARKER" --timeout 0 >"$TDIR/rt6.out" 2>"$TDIR/rt6.err"
 RT6RC=$?
 RT6_T1=$(date +%s)
 kill "$RT6_LIVEPID" 2>/dev/null; wait "$RT6_LIVEPID" 2>/dev/null

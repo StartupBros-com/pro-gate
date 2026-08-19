@@ -107,19 +107,54 @@ sleep 3
 check 'self-reload=0 does not detect/reload' "$([ "$(grep -c 'detected a new daemon deploy' "$DLOG2")" -eq 0 ]; echo $?)" "reloads=$(grep -c 'detected a new daemon deploy' "$DLOG2")"
 check 'self-reload=0 keeps a single startup line' "$([ "$(grep -c 'pro-review-daemon starting' "$DLOG2")" -eq 1 ]; echo $?)" "starts=$(grep -c 'pro-review-daemon starting' "$DLOG2")"
 
-echo '# v0.35 (#88, R12/F4): headless agent prompt blocks on --wait, not a sleep-60 poll loop'
+echo '# v0.35 (#88): daemon prompt uses a PID-bound marker handshake before chunked --wait'
 DAEMON_SRC="$HERE/../daemon/daemon.sh"
 check 'daemon prompt no longer contains the sleep-60 poll instruction' \
   "$(! grep -q 'sleep 60;' "$DAEMON_SRC"; echo $?)" \
   "$(grep -n 'sleep 60;' "$DAEMON_SRC")"
-check 'daemon prompt instructs a chunked --wait loop' \
-  "$(grep -q -- '--wait' "$DAEMON_SRC"; echo $?)" \
-  "no --wait reference found in $DAEMON_SRC"
+check 'daemon prompt captures ENGINE_PID before disown' \
+  "$(grep -q 'ENGINE_PID=\\$! BEFORE disown' "$DAEMON_SRC"; echo $?)" \
+  "missing PID-bound launch instruction"
+check 'daemon prompt validates the PID-bound marker and prior sidecar marker' \
+  "$(grep -q 'PRIOR_MARKER' "$DAEMON_SRC" && grep -q 'equals ENGINE_PID' "$DAEMON_SRC"; echo $?)" \
+  "missing prior-marker or PID equality guard"
+check 'daemon prompt reads status before liveness and reports a final regular sidecar' \
+  "$(grep -q 'BEFORE each ENGINE_PID liveness check' "$DAEMON_SRC" && grep -q 'print the final regular sidecar' "$DAEMON_SRC"; echo $?)" \
+  "missing fast-exit final sidecar read"
+check 'daemon prompt provides jq and sed marker extraction paths' \
+  "$(grep -q 'jq when installed, otherwise sed' "$DAEMON_SRC"; echo $?)" \
+  "missing jq/sed fallback instruction"
+check 'daemon prompt waits on MARKER in <=30m chunks' \
+  "$(grep -q -- '--wait \\\"\\$MARKER\\\" --timeout 1800' "$DAEMON_SRC"; echo $?)" \
+  "missing marker wait instruction"
+check 'daemon prompt never instructs unsafe bare-out wait' \
+  "$(! grep -q -- "--wait '<out>'" "$DAEMON_SRC"; echo $?)" \
+  "unsafe bare-out wait remains"
 check 'daemon prompt re-arms on --wait timeout (exit 20)' \
   "$(grep -q 'Exit 20' "$DAEMON_SRC"; echo $?)" \
   "no exit-20 re-arm instruction found"
 check 'daemon prompt escalates on lost observability (exit 21) instead of guessing' \
   "$(grep -q 'Exit 21' "$DAEMON_SRC"; echo $?)" \
   "no exit-21 escalation instruction found"
+
+echo '# v0.35 (#88): skill and reviewer agent mirror the same executable marker handshake'
+for CALLER_SRC in "$HERE/../skills/pro-gate/SKILL.md" "$HERE/../agents/oracle-reviewer.md"; do
+  CALLER_NAME="$(basename "$CALLER_SRC")"
+  check "$CALLER_NAME replaces the fixed sleep with PID-bound launch state" \
+    "$(! grep -q '^ *sleep 5$' "$CALLER_SRC" && grep -q 'ENGINE_PID=\$!' "$CALLER_SRC" && grep -q 'PRIOR_MARKER' "$CALLER_SRC"; echo $?)" \
+    "missing PID/prior-marker handshake or fixed sleep remains"
+  check "$CALLER_NAME supports jq and no-jq marker extraction" \
+    "$(grep -q 'command -v jq' "$CALLER_SRC" && grep -q 'sed -nE' "$CALLER_SRC"; echo $?)" \
+    "missing jq/sed marker reader"
+  check "$CALLER_NAME reads the final sidecar before declaring a fast process dead" \
+    "$(grep -q 'Read before checking liveness' "$CALLER_SRC" && grep -q 'kill -0 \"\$ENGINE_PID\"' "$CALLER_SRC"; echo $?)" \
+    "missing final-read-before-liveness loop"
+  check "$CALLER_NAME chunks an exact marker wait and re-arms only exit 20" \
+    "$(grep -q -- '--wait \"\$MARKER\" --timeout 1800' "$CALLER_SRC" && grep -q '20) continue' "$CALLER_SRC"; echo $?)" \
+    "missing marker wait or exit-20 re-arm"
+  check "$CALLER_NAME runs the blocking loop in the background" \
+    "$(grep -q 'run_in_background: true' "$CALLER_SRC"; echo $?)" \
+    "missing background execution instruction"
+done
 
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }
