@@ -52,10 +52,14 @@ to the best available fixer, and posts the review on the PR. It stops before mer
 # Or drive the engine directly
 ~/.pro-review-daemon/oracle-review.sh --pr 1292 --repo ~/SITES/myrepo --out /tmp/review.md
 
-# Lost your terminal mid-review? Rediscover the run from nothing but the PR number
-~/.pro-review-daemon/oracle-review.sh --status 1292
+# Recover an already-started review without a new slot; accepts a PR, URL, or exact marker
+/pro-gate recover 1292
+~/.pro-review-daemon/oracle-review.sh --recover <PR|URL|marker> --repo ~/SITES/myrepo --out /tmp/review.md
 
-# The model was still thinking when your run timed out (exit 9)? Collect it; no new slot spent
+# Expert diagnostics: rediscover state from nothing but the PR number
+~/.pro-review-daemon/oracle-review.sh --status 1292 --json
+
+# Expert/degradation route: collect an exit-9 run directly; no new slot spent
 ~/.pro-review-daemon/oracle-review.sh --harvest pg-run-myrepo-1292-... --out /tmp/review.md
 
 # Set-and-forget: the daemon reviews every PR you label
@@ -195,6 +199,7 @@ consent-version change requires fresh acceptance. Set **`PRO_REVIEW_OWNERS`** in
 
 ```bash
 /pro-gate <pr-number-or-url>            # interactive, any Claude Code session
+/pro-gate recover <PR|URL|marker>       # recover an existing review; never starts a fresh one
 gh pr edit <n> --add-label pro-review   # daemon: review → fix → comment → stop before merge
 touch ~/.pro-review-daemon/PAUSE        # pause the daemon; logs in ~/.pro-review-daemon/logs/
 ```
@@ -211,10 +216,25 @@ oracle-review.sh --diff <patchfile> --repo <dir> [--pr <n>] ...   # review a loc
                                                                   # too so budget/locks stay the PR's
 oracle-review.sh --confirm <prior-review-file> ...                # confirming pass: verify every prior
                                                                   # P0/P1 RESOLVED or STILL-PRESENT first
-oracle-review.sh --harvest <run-marker> --out <file>              # collect an exit-9 run; no new slot
-oracle-review.sh --status [<pr|url|marker>] [--json]              # read-only run rediscovery: what runs
-                                                                  # exist, what to harvest, rounds left
+oracle-review.sh --recover <PR|URL|marker> [--repo <dir>] [--out <file>] [--timeout <dur>]
+                                                                  # recover an existing run only; no fresh slot
+oracle-review.sh --harvest <run-marker> --out <file>              # expert/degradation collection of an exit-9 run
+oracle-review.sh --status [<pr|url|marker>] [--json]              # expert diagnostics: read-only rediscovery,
+                                                                  # machine-readable with --json
 ```
+
+`recover` accepts exactly one decimal PR number, canonical PR URL, or exact `pg-run-...` marker.
+It selects an exact marker directly; a repository-qualified URL or PR number with canonical
+repository proof selects the unique newest charged run. A bare PR without repository proof,
+multiple repositories, tied candidates, or conflicting ordering returns disambiguation and takes
+no action. Recovery first returns a verified completed artifact and otherwise performs only the
+existing marker harvest; it never dispatches a `--pr` review, creates a new slot, or spends a new
+round. Its plain states are **Review ready**, **Checking for completed review**, **Still working**,
+and **Browser needs attention**. A readable or open tab can be stale, so the engine safely
+revalidates the canonical server conversation without changing the source tab.
+
+Use direct `--status --json` and direct `--harvest` above for expert automation or degradation
+diagnosis; ordinary callers should use `/pro-gate recover` instead.
 
 ### Exit codes
 

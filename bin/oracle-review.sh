@@ -25,12 +25,17 @@
 #       Collect a review whose run ended in-progress (exit 9): the Pro slot was spent but the
 #       model was still generating when the salvage budget ran out. No new slot is spent.
 #   oracle-review.sh --status [<pr-number|pr-url|pg-run-marker>] [--json]
-#   oracle-review.sh --recover <pr-number|pr-url|pg-run-marker> [--repo <dir>] [--out <file>] [--timeout <dur>]
-#       Read-only run rediscovery (v0.27): join reservations, round budget, remembered
+#       Expert/read-only diagnostics (v0.27): join reservations, round budget, remembered
 #       conversation URLs, and the ledger, and print each matching run's state plus the exact
-#       next command. For callers that lost their context (compaction, new session): answers
-#       "what runs exist for this change, what do I harvest, how many rounds remain" from
-#       nothing but a PR number. No locks, no browser, no writes; omit the query for all state.
+#       next command. `--json` is the detailed machine contract; omit the query for all state.
+#   oracle-review.sh --recover <pr-number|pr-url|pg-run-marker> [--repo <dir>] [--out <file>] [--timeout <dur>]
+#       Recover exactly one existing review (v0.35). Accepts a decimal PR number, canonical PR
+#       URL, or exact marker. Exact markers win; repository-qualified queries select the unique
+#       newest charged run, while unproved or ambiguous candidates only disambiguate. It returns
+#       a verified artifact or runs marker-only harvest; it never dispatches --pr, creates a new
+#       slot, or spends a new round. Plain states: Review ready; Checking for completed review;
+#       Still working; Browser needs attention. A readable tab can be stale, so the engine safely
+#       revalidates the canonical server conversation without changing the source tab.
 set -uo pipefail
 
 # --- locate + source the shared lib (works from repo and from deployed location) ---

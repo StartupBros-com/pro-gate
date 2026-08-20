@@ -1,6 +1,6 @@
 ---
 name: pro-gate
-description: Run a final-tier ChatGPT Pro review of a pull request (the deepest, last gate after other review tiers), then route the findings to the best available fixer. Use when the user says "pro-gate", "pro review", "final review with the Pro model", "oracle review this PR", or wants the heavyweight ChatGPT Pro pass before merge. Drives a logged-in ChatGPT Pro browser session via oracle (oracle-review.sh).
+description: Run a final-tier ChatGPT Pro review of a pull request (the deepest, last gate after other review tiers), then route the findings to the best available fixer; or safely recover an already-started review. Use when the user says "pro-gate", "pro review", "final review with the Pro model", "oracle review this PR", "/pro-gate recover", or wants the heavyweight ChatGPT Pro pass before merge. Drives a logged-in ChatGPT Pro browser session via oracle (oracle-review.sh).
 ---
 
 # pro-gate: final-tier ChatGPT Pro review gate
@@ -46,13 +46,28 @@ Daemon and dangerous automatic-fixer execution remain disabled unless the operat
 the versioned disclosure during installation.
 
 **Detached vs dead sessions — different rules:**
-- **Lost track of a run entirely (compaction, a new session, a dead tab)? Inspect state
-  first, then let the engine route you.** All of this works with zero prior context; use the
-  defaulted home everywhere, `PG_HOME="${PRO_GATE_HOME:-$HOME/.pro-review-daemon}"`. Engine
-  ≥v0.27 does the whole join in one read-only command — reservations, rounds remaining,
-  recent ledger rows, and the exact next command:
-  `"$PG_HOME/oracle-review.sh" --status <pr-number|pr-url|marker>` (`--json` for machine
-  use; no locks, no browser, no spend). The underlying pieces, when you need them raw:
+- **Recover an existing review (novice path):** recognize `/pro-gate recover <PR|URL|marker>`
+  **before ordinary review target resolution**. The accepted query is exactly one decimal PR
+  number, canonical PR URL, or exact `pg-run-...` marker. Set
+  `PG_HOME="${PRO_GATE_HOME:-$HOME/.pro-review-daemon}"`, then invoke only:
+  `"$PG_HOME/oracle-review.sh" --recover <PR|URL|marker> [--repo <dir>] [--out <file>] [--timeout <dur>]`.
+  Recovery is artifact-first and may only collect the selected marker; it never launches a fresh review,
+  acquires a new slot, or spends a new round. It never invokes `--pr`. An exact marker wins. A PR URL or
+  a PR number with canonical repository proof selects the unique newest charged run. A bare PR
+  without repository proof, tied/conflicting candidates, or candidates across repositories
+  produces a non-mutating disambiguation response: supply the exact marker. Plain recovery
+  reports exactly one state: **Review ready** (verified artifact), **Checking for completed review**
+  (collection is temporarily unavailable or busy), **Still working** (the existing
+  review is not done), or **Browser needs attention** (the engine cannot safely collect it).
+  Do not manually refresh anything: current engines safely revalidate the canonical server
+  conversation before classifying recovery, without changing the original conversation tab.
+- **Lost track of a run entirely (expert/degradation path): inspect state first, then let the
+  engine route you.** All of this works with zero prior context; use the defaulted home
+  everywhere, `PG_HOME="${PRO_GATE_HOME:-$HOME/.pro-review-daemon}"`. Direct
+  `"$PG_HOME/oracle-review.sh" --status <pr-number|pr-url|marker> --json` is the detailed
+  machine/expert diagnostic surface (omit `--json` for its human route); it joins reservations,
+  rounds remaining, recent ledger rows, and the exact next command with no locks, browser, or
+  spend. The underlying pieces, when you need them raw:
   `ls "$PG_HOME/in-progress/"` (filenames ARE harvest markers; each file's first
   tab-separated field is the change key — a matching entry means your review is still
   collectable for free), `"$PG_HOME/pro-gate-stats.sh" --tail 10` for recent outcomes, and
@@ -73,15 +88,15 @@ the versioned disclosure during installation.
   protects in-progress runs only, not completed or native-mode ones.
   Declare a review lost only when the HARVEST path itself says so (its exit 6 after
   repeated confirmed misses) — never because you lost the marker or the `--out` path.
-- **Ground truth is the BROWSER, not oracle's log.** oracle can miss the thinking state after
-  ChatGPT UI drift (seen 2026-07-02: it logged `no thinking status detected` for 10 min while the
-  review was mid-thought). Before treating ANY run as dead, check for a live conversation tab:
-  `curl -s localhost:9222/json` — a `chatgpt.com/c/...` page tab whose text matches the PR means
-  the run is LIVE or DONE and quota is SPENT: never re-run.
-- **Detached but thinking** (conversation tab exists / output growing): NEVER re-run. Prefer
-  `node $PRO_GATE_HOME/cdp-salvage.mjs "<pr-url-or-pull/NNN>" <secs>` — it waits for the
-  `VERDICT:` line in the tab and prints the review. (`oracle session <slug> --harvest` can bind a
-  STALE tab target after a watchdog kill and harvest nothing — trust the CDP path.)
+- **A readable or open tab is not current server truth.** UI drift can leave its displayed
+  answer stale even when the canonical conversation has completed. Never use tab appearance to
+  authorize a rerun: use `/pro-gate recover <PR|URL|marker>` for the safe canonical
+  revalidation, or the expert `--status --json` / marker `--harvest` routes above. The engine
+  preserves the original tab while it checks current server conversation state.
+- **Detached but thinking:** NEVER re-run. Use the recovery action first; it returns the
+  existing verified artifact or a plain state without launching a review. Do not manually
+  reattach with `oracle session … --harvest`: it can bind a stale tab target after a watchdog
+  kill and collect nothing.
 - **Dead submission** (no conversation tab matching the PR AND the run log shows oracle never got
   as far as `Launching browser mode` / `Acquired ChatGPT browser slot`): no quota consumed, so
   kill the process tree and re-run safely. If the log DOES show a browser slot/session, the prompt
