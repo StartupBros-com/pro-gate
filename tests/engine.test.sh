@@ -35,9 +35,9 @@ exit 99
 FAKE_PREFLIGHT
 chmod +x "$TDIR/bin/oracle-preflight"
 
-start_mock() { # $1 = tab text file; optional $2 = organizer state file; sets MOCK_PID + PORT
+start_mock() { # $1 = source text; optional $2 = organizer/browser state; optional $3 = scratch text; sets MOCK_PID + PORT
   [ -n "${MOCK_PID:-}" ] && kill "$MOCK_PID" 2>/dev/null
-  node "$HERE/mock-cdp.mjs" "$1" "${2:-}" > "$TDIR/port" 2>"$TDIR/mock.log" &
+  node "$HERE/mock-cdp.mjs" "$1" "${2:-}" "${3:-}" > "$TDIR/port" 2>"$TDIR/mock.log" &
   MOCK_PID=$!
   for _ in $(seq 1 50); do [ -s "$TDIR/port" ] && break; sleep 0.1; done
   PORT="$(tr -d '[:space:]' < "$TDIR/port")"; : > "$TDIR/port"
@@ -155,7 +155,7 @@ check 'still-generating probe keeps the reservation occupying capacity' "$([ "$(
 # single uncollected review starved every other run (#82). Completion must release the capacity
 # while KEEPING the record collectable.
 echo '# reservation releases capacity once its review is complete'
-printf 'run marker: %s\nP0: none\n\nVERDICT: SHIP — looks good.\n' "$MARKER" > "$TDIR/tab.txt"
+printf 'run marker: %s\nP0: none\n\nVERDICT: SHIP — looks good. (run marker: %s)\n' "$MARKER" "$MARKER" > "$TDIR/tab.txt"
 PRO_GATE_HOME="$TDIR/home" PRO_GATE_RESERVATION_MISSES=3 PRO_GATE_RECONCILE_INTERVAL=0 bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_reconcile '$HERE/../bin/cdp-salvage.mjs' '$PORT'"
 check 'complete probe marks the reservation complete' "$([ "$(PRO_GATE_HOME="$TDIR/home" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_state '$MARKER'")" = complete ]; echo $?)" "$(cat "$TDIR/home/in-progress/$MARKER")"
 check 'completed reservation survives as a harvest pointer' "$([ -f "$TDIR/home/in-progress/$MARKER" ]; echo $?)" 'record removed instead of released'
@@ -200,6 +200,173 @@ H2_ROW="$(grep -F "\"out\":\"$TDIR/o-h2.md\"" "$TDIR/home/ledger.jsonl" | tail -
 check 'harvest ledger row is valid JSON' "$(printf '%s' "$H2_ROW" | jq empty >/dev/null 2>&1; echo $?)" "$H2_ROW"
 check 'harvest ledger row records pre_slot_secs=0' "$([ "$(printf '%s' "$H2_ROW" | jq -r '.pre_slot_secs // "MISSING"')" = 0 ]; echo $?)" "$H2_ROW"
 check 'harvest ledger row records post_slot_secs == secs' "$([ "$(printf '%s' "$H2_ROW" | jq -r '.post_slot_secs // "MISSING"')" = "$(printf '%s' "$H2_ROW" | jq -r .secs)" ]; echo $?)" "$H2_ROW"
+
+# U2 (R3–R6/R9): the readable source has our marker but a stale DOM. The canonical scratch
+# target supplies the completed, nonce-bound server answer; harvest must take that evidence
+# through the existing shell acceptance/persistence lifecycle without dispatching Oracle.
+echo '# U2: readable stale source harvest lifecycle'
+MSTALE="pg-run-stale-harvest-77-1700000700-701"
+STALE_SOURCE="$TDIR/stale-source.txt"
+STALE_SCRATCH="$TDIR/stale-scratch.txt"
+STALE_EXPECTED="$TDIR/stale-expected.md"
+STALE_STATE="$TDIR/stale-browser-state.json"
+STALE_SENTINEL="$TDIR/stale-oracle-invocations"
+printf 'run marker: %s\nReasoning about the diff in a stale renderer...\n' "$MSTALE" > "$STALE_SOURCE"
+cat > "$STALE_SCRATCH" <<STALE_SCRATCH_TEXT
+run marker: $MSTALE
+[P1] src/stale-source.mjs:10 — recovered from canonical server render
+  Why: the source DOM was stale.
+P2: none
+VERDICT: SHIP — canonical review complete. (run marker: $MSTALE)
+STALE_SCRATCH_TEXT
+cat > "$STALE_EXPECTED" <<'STALE_EXPECTED_TEXT'
+[P1] src/stale-source.mjs:10 — recovered from canonical server render
+  Why: the source DOM was stale.
+P2: none
+VERDICT: SHIP — canonical review complete.
+STALE_EXPECTED_TEXT
+printf '{"title":null,"archived":false,"events":[]}\n' > "$STALE_STATE"
+cat > "$TDIR/bin/oracle-stale-sentinel" <<'STALE_ORACLE'
+#!/usr/bin/env bash
+: >> "${PG_TEST_ORACLE_SENTINEL:?}"
+exit 99
+STALE_ORACLE
+chmod +x "$TDIR/bin/oracle-stale-sentinel"
+printf 'stale-77\t%s\t%s\t0\t1\tGPT-X\t1700000700\tgenerating\n' "$TDIR/o-stale.md" "$(date +%s)" > "$TDIR/home/in-progress/$MSTALE"
+start_mock "$STALE_SOURCE" "$STALE_STATE" "$STALE_SCRATCH"
+PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-stale-sentinel" PG_TEST_ORACLE_SENTINEL="$STALE_SENTINEL" NODE_OPTIONS= \
+  bash "$ENGINE" --harvest "$MSTALE" --out "$TDIR/o-stale.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'readable stale harvest exits 0 from canonical scratch evidence' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+check 'readable stale harvest publishes exact nonce-stripped review' "$(cmp -s "$TDIR/o-stale.md" "$STALE_EXPECTED"; echo $?)" "$(cat "$TDIR/o-stale.md" 2>/dev/null)"
+check 'readable stale harvest persists the exact durable artifact' "$(cmp -s "$TDIR/home/completed/$MSTALE" "$STALE_EXPECTED"; echo $?)" "$(cat "$TDIR/home/completed/$MSTALE" 2>/dev/null)"
+check 'readable stale harvest retires its reservation' "$([ ! -e "$TDIR/home/in-progress/$MSTALE" ]; echo $?)" "$(cat "$TDIR/home/in-progress/$MSTALE" 2>/dev/null)"
+check 'readable stale harvest never dispatches Oracle' "$([ ! -s "$STALE_SENTINEL" ]; echo $?)" "$(cat "$STALE_SENTINEL" 2>/dev/null)"
+check 'readable stale harvest leaves the source target untouched' \
+  "$([ "$(jq -r '[.closed[]? | select(. == "tab1")] | length' "$STALE_STATE")" = 0 ]; echo $?)" "$(cat "$STALE_STATE")"
+check 'readable stale harvest opens and closes exactly one scratch target' \
+  "$([ "$(jq -r '.created | length' "$STALE_STATE")" = 1 ] && [ "$(jq -r '.closed | map(select(. == "scratch1")) | length' "$STALE_STATE")" = 1 ]; echo $?)" "$(cat "$STALE_STATE")"
+# A second harvest must see the immutable completed artifact rather than race the stale source,
+# write another artifact, or ever reach the fresh-dispatch Oracle binary.
+: > "$STALE_SENTINEL"
+PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-stale-sentinel" PG_TEST_ORACLE_SENTINEL="$STALE_SENTINEL" NODE_OPTIONS= \
+  bash "$ENGINE" --harvest "$MSTALE" --out "$TDIR/o-stale-idempotent.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'stale harvest replays the completed artifact idempotently' \
+  "$([ "$RC" -eq 0 ] && cmp -s "$TDIR/o-stale-idempotent.md" "$STALE_EXPECTED"; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
+check 'idempotent stale harvest does not dispatch Oracle' \
+  "$([ ! -s "$STALE_SENTINEL" ]; echo $?)" "state=$(cat "$STALE_STATE") oracle=$(cat "$STALE_SENTINEL" 2>/dev/null)"
+check 'idempotent stale harvest leaves the retired reservation absent' \
+  "$([ ! -e "$TDIR/home/in-progress/$MSTALE" ] && [ "$(find "$TDIR/home/completed" -maxdepth 1 -name "$MSTALE" | wc -l)" = 1 ]; echo $?)" "$(find "$TDIR/home/completed" -maxdepth 1 -name "$MSTALE" -print)"
+
+# Non-terminal stale scratch evidence retains the existing state. These remain direct harvest
+# integrations so the CDP class-to-shell lifecycle boundary, rather than a duplicate shell
+# classifier, owns the behavior.
+run_stale_retention_case() { # <label> <marker> <scratch-file> <expected-rc>
+  local label marker scratch expected_rc source state
+  label="$1"; marker="$2"; scratch="$3"; expected_rc="$4"
+  source="$TDIR/${label}-source.txt"; state="$TDIR/${label}-state.json"
+  printf 'run marker: %s\nstale readable source\n' "$marker" > "$source"
+  printf '{"title":null,"archived":false,"events":[]}\n' > "$state"
+  printf '%s\t%s\t%s\t0\t1\tGPT-X\t1700000701\tgenerating\n' "$label" "$TDIR/o-${label}.md" "$(date +%s)" > "$TDIR/home/in-progress/$marker"
+  : > "$STALE_SENTINEL"
+  start_mock "$source" "$state" "$scratch"
+  PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+    PRO_GATE_RAMP=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-stale-sentinel" PG_TEST_ORACLE_SENTINEL="$STALE_SENTINEL" NODE_OPTIONS= \
+    bash "$ENGINE" --harvest "$marker" --out "$TDIR/o-${label}.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+  RC=$?
+  check "${label} stale scratch retains reservation with its existing exit" \
+    "$([ "$RC" -eq "$expected_rc" ] && [ -f "$TDIR/home/in-progress/$marker" ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
+  check "${label} stale scratch accepts no artifact or Oracle dispatch" \
+    "$([ ! -e "$TDIR/home/completed/$marker" ] && [ ! -s "$STALE_SENTINEL" ]; echo $?)" "artifact=$(ls "$TDIR/home/completed/$marker" 2>/dev/null) oracle=$(cat "$STALE_SENTINEL" 2>/dev/null)"
+  check "${label} stale scratch closes only one scratch target" \
+    "$([ "$(jq -r '.created | length' "$state")" = 1 ] && [ "$(jq -r '.closed | map(select(. == "scratch1")) | length' "$state")" = 1 ] && [ "$(jq -r '.closed | map(select(. == "tab1")) | length' "$state")" = 0 ]; echo $?)" "$(cat "$state")"
+}
+
+MSTALE_INCOMPLETE="pg-run-stale-incomplete-77-1700000701-702"
+STALE_INCOMPLETE="$TDIR/stale-incomplete-scratch.txt"
+printf 'run marker: %s\nStill thinking on the canonical page.\n' "$MSTALE_INCOMPLETE" > "$STALE_INCOMPLETE"
+run_stale_retention_case stale-incomplete "$MSTALE_INCOMPLETE" "$STALE_INCOMPLETE" 9
+
+MSTALE_INCONCLUSIVE="pg-run-stale-inconclusive-77-1700000702-703"
+STALE_INCONCLUSIVE="$TDIR/stale-inconclusive-scratch.txt"
+printf 'Loading ChatGPT…\n' > "$STALE_INCONCLUSIVE"
+run_stale_retention_case stale-inconclusive "$MSTALE_INCONCLUSIVE" "$STALE_INCONCLUSIVE" 9
+
+MSTALE_THROTTLE="pg-run-stale-throttle-77-1700000703-704"
+STALE_THROTTLE="$TDIR/stale-throttle-scratch.txt"
+printf "You're making requests too quickly. Temporarily limited access to your conversations.\n" > "$STALE_THROTTLE"
+run_stale_retention_case stale-throttle "$MSTALE_THROTTLE" "$STALE_THROTTLE" 8
+check 'throttled stale scratch keeps its reservation and writes the existing cooldown' \
+  "$([ -f "$TDIR/home/in-progress/$MSTALE_THROTTLE" ] && [ -f "$TDIR/home/throttle.cooldown" ]; echo $?)" "$(cat "$TDIR/home/throttle.cooldown" 2>/dev/null)"
+rm -f "$TDIR/home/throttle.cooldown"
+
+MSTALE_CROSS="pg-run-stale-cross-77-1700000704-705"
+MSTALE_FOREIGN="pg-run-stale-foreign-77-1700000704-706"
+STALE_CROSS="$TDIR/stale-cross-scratch.txt"
+cat > "$STALE_CROSS" <<STALE_CROSS_TEXT
+run marker: $MSTALE_CROSS
+run marker: $MSTALE_FOREIGN
+[P1] src/foreign.mjs:4 — foreign result
+P2: none
+VERDICT: SHIP — foreign conversation. (run marker: $MSTALE_FOREIGN)
+STALE_CROSS_TEXT
+run_stale_retention_case stale-cross "$MSTALE_CROSS" "$STALE_CROSS" 9
+# These cases intentionally retained their state; clear only their isolated fixture records before
+# asserting the probe's single capacity transition.
+rm -f "$TDIR/home/in-progress/$MSTALE_INCOMPLETE" "$TDIR/home/in-progress/$MSTALE_INCONCLUSIVE" \
+  "$TDIR/home/in-progress/$MSTALE_THROTTLE" "$TDIR/home/in-progress/$MSTALE_CROSS"
+
+# The same revalidated terminal evidence drives probe. Reconciliation changes only the existing
+# state field from generating to complete: it preserves the collectable reservation and frees its
+# capacity slot, without doing a harvest or starting Oracle.
+MSTALE_PROBE="pg-run-stale-probe-77-1700000705-707"
+STALE_PROBE_SOURCE="$TDIR/stale-probe-source.txt"
+STALE_PROBE_SCRATCH="$TDIR/stale-probe-scratch.txt"
+STALE_PROBE_STATE="$TDIR/stale-probe-state.json"
+printf 'run marker: %s\nstale readable source\n' "$MSTALE_PROBE" > "$STALE_PROBE_SOURCE"
+cat > "$STALE_PROBE_SCRATCH" <<STALE_PROBE_TEXT
+run marker: $MSTALE_PROBE
+[P1] src/probe.mjs:1 — completed server review
+P2: none
+VERDICT: SHIP — complete. (run marker: $MSTALE_PROBE)
+STALE_PROBE_TEXT
+printf '{"title":null,"archived":false,"events":[]}\n' > "$STALE_PROBE_STATE"
+printf 'stale-probe-77\t%s\t%s\t0\t1\tGPT-X\t1700000705\tgenerating\n' "$TDIR/o-stale-probe.md" "$(date +%s)" > "$TDIR/home/in-progress/$MSTALE_PROBE"
+start_mock "$STALE_PROBE_SOURCE" "$STALE_PROBE_STATE" "$STALE_PROBE_SCRATCH"
+PRO_GATE_HOME="$TDIR/home" PRO_GATE_RESERVATION_MISSES=3 PRO_GATE_RECONCILE_INTERVAL=0 \
+  bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_reconcile '$HERE/../bin/cdp-salvage.mjs' '$PORT'"
+check 'stale readable probe marks only the existing reservation state complete' \
+  "$([ -f "$TDIR/home/in-progress/$MSTALE_PROBE" ] && [ "$(PRO_GATE_HOME="$TDIR/home" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_state '$MSTALE_PROBE'")" = complete ]; echo $?)" "$(cat "$TDIR/home/in-progress/$MSTALE_PROBE")"
+check 'stale readable probe frees only the completed reservation capacity' \
+  "$([ "$(PRO_GATE_HOME="$TDIR/home" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_slot_plan 1" | cut -d'|' -f3)" = 1 ]; echo $?)" "plan=$(PRO_GATE_HOME="$TDIR/home" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_slot_plan 1")"
+check 'stale readable probe closes scratch without mutating its source target' \
+  "$([ "$(jq -r '.closed | map(select(. == "scratch1")) | length' "$STALE_PROBE_STATE")" = 1 ] && [ "$(jq -r '.closed | map(select(. == "tab1")) | length' "$STALE_PROBE_STATE")" = 0 ]; echo $?)" "$(cat "$STALE_PROBE_STATE")"
+
+# Holding the existing per-marker lock models a concurrent collector. The contender must return
+# the established busy outcome before CDP, artifact mutation, or any fresh Oracle path.
+MSTALE_BUSY="pg-run-stale-busy-77-1700000706-708"
+printf 'stale-busy-77\t%s\t%s\t0\t1\tGPT-X\t1700000706\tgenerating\n' "$TDIR/o-stale-busy.md" "$(date +%s)" > "$TDIR/home/in-progress/$MSTALE_BUSY"
+printf 'run marker: %s\nstale readable source\n' "$MSTALE_BUSY" > "$TDIR/stale-busy-source.txt"
+printf '{"title":null,"archived":false,"events":[]}\n' > "$TDIR/stale-busy-state.json"
+start_mock "$TDIR/stale-busy-source.txt" "$TDIR/stale-busy-state.json" "$STALE_SCRATCH"
+mkdir -p "$TDIR/home/harvest-locks"
+exec {STALE_BUSY_FD}>>"$TDIR/home/harvest-locks/$MSTALE_BUSY"; flock -n "$STALE_BUSY_FD"
+: > "$STALE_SENTINEL"
+PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_HARVEST_LOCK_WAIT=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-stale-sentinel" PG_TEST_ORACLE_SENTINEL="$STALE_SENTINEL" NODE_OPTIONS= \
+  bash "$ENGINE" --harvest "$MSTALE_BUSY" --out "$TDIR/o-stale-busy.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+eval "exec ${STALE_BUSY_FD}>&-"
+check 'concurrent stale harvest returns the established busy outcome' "$([ "$RC" -eq 7 ] && [ -f "$TDIR/home/in-progress/$MSTALE_BUSY" ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
+check 'concurrent stale harvest starts neither scratch nor Oracle' \
+  "$([ "$(jq -r '.created | length' "$TDIR/stale-busy-state.json")" = 0 ] && [ ! -s "$STALE_SENTINEL" ]; echo $?)" "state=$(cat "$TDIR/stale-busy-state.json") oracle=$(cat "$STALE_SENTINEL" 2>/dev/null)"
+# Keep the rest of the legacy engine suite independent from these intentionally retained records.
+rm -f "$TDIR/home/in-progress/$MSTALE_INCOMPLETE" "$TDIR/home/in-progress/$MSTALE_INCONCLUSIVE" \
+  "$TDIR/home/in-progress/$MSTALE_THROTTLE" "$TDIR/home/in-progress/$MSTALE_CROSS" \
+  "$TDIR/home/in-progress/$MSTALE_PROBE" "$TDIR/home/in-progress/$MSTALE_BUSY"
 
 echo '# harvest: already collected (v0.28) vs genuinely gone'
 printf 'run marker: pg-run-999-1700000001-99\nforeign conversation\n' > "$TDIR/tab.txt"
@@ -338,6 +505,7 @@ FAKE_ORACLE
 chmod +x "$TDIR/bin/oracle"
 printf 'waiting for fake submission\n' > "$TDIR/tab.txt"
 rm -rf "$TDIR/home/in-progress"; : > "$TDIR/mock.log"
+start_mock "$TDIR/tab.txt"
 PRIMARY_PATH="$TDIR/bin:$PATH"
 PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
   PRO_GATE_SELF_HEAL=0 PRO_GATE_MAX_DIFF_LINES=6000 PRO_GATE_MAX_RETRIES=0 \

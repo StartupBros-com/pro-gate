@@ -4,7 +4,9 @@
 // the tab's debugger WebSocket, /json/new (scratch tabs, so the salvage's remembered-URL
 // recovery can reach a decisive answer the way a real browser does), and /json/close.
 // Prints the chosen port on stdout.
-// Usage: node tests/mock-cdp.mjs <tab-text-file> [organizer-state-file]
+// Usage: node tests/mock-cdp.mjs <source-text-file> [organizer-state-file] [scratch-text-file]
+// The optional scratch text models a canonical server render that diverges from a stale source.
+// State records created/closed browser targets independently from organizer events.
 import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
@@ -12,6 +14,7 @@ import fs from 'node:fs';
 const textFile = process.argv[2];
 if (!textFile) { console.error('usage: mock-cdp.mjs <tab-text-file>'); process.exit(2); }
 const stateFile = process.argv[3] || null;
+const scratchTextFile = process.argv[4] || null;
 const WS_MAGIC = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
 function wsTextFrame(payload) {
@@ -68,6 +71,17 @@ function writeState(state) {
   try { fs.writeFileSync(stateFile, `${JSON.stringify(state)}\n`); } catch {}
 }
 
+function recordBrowserTarget(field, target) {
+  const state = readState();
+  state[field] = [...(state[field] ?? []), target];
+  writeState(state);
+}
+
+function textForTarget(id) {
+  const file = id.startsWith('scratch') && scratchTextFile ? scratchTextFile : textFile;
+  try { return fs.readFileSync(file, 'utf8'); } catch { return ''; }
+}
+
 function expectedTitleFromExpression(expression) {
   const match = expression.match(/^\s*const expected = (.+);$/m);
   if (!match) return null;
@@ -89,6 +103,7 @@ const server = createServer((req, res) => {
     const url = decodeURIComponent(req.url.slice(req.url.indexOf('?') + 1));
     const id = `scratch${++scratchSeq}`;
     scratch.set(id, url);
+    recordBrowserTarget('created', { id, url });
     console.error(`opened ${id} ${url}`);
     res.setHeader('content-type', 'application/json');
     res.end(JSON.stringify({
@@ -122,6 +137,7 @@ const server = createServer((req, res) => {
     } else {
       scratch.delete(id);
     }
+    recordBrowserTarget('closed', id);
     console.error(`closed ${id}`); res.end('ok'); return;
   }
   res.statusCode = 404; res.end();
@@ -133,7 +149,8 @@ server.on('upgrade', (req, socket) => {
   socket.on('data', wsClientTextDecoder((payload) => {
     let request;
     try { request = JSON.parse(payload); } catch { return; }
-    const text = fs.readFileSync(textFile, 'utf8');
+    const targetId = (req.url ?? '').split('/').pop() ?? '';
+    const text = textForTarget(targetId);
     const expression = request.params?.expression ?? '';
     let value = text;
     if (expression.includes('pro-gate-organizer:rename')) {
