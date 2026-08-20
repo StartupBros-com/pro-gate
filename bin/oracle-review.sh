@@ -2550,6 +2550,7 @@ while :; do
     # few challenge hits inside the window cannot exit-12-block a change that spent nothing
     # (dogfood gate round-2 P1). Unknown-fate paths (throttle, watchdogs) never refund.
     pg_round_unrecord "$ROUND_KEY"
+    pg_run_meta_remove "$RUN_MARKER"
     pg_status cloudflare "anti-bot challenge; cooldown started"
     cdf="${PRO_GATE_COOLDOWN_FILE:-$PRO_GATE_HOME/throttle.cooldown}"
     { printf '%s cloudflare-challenge (pr %s)\n' "$(date +%Y-%m-%dT%H:%M:%S%z)" "${PR_NUM:-diff}" > "$cdf"; } 2>/dev/null || true
@@ -2880,6 +2881,7 @@ else
      && pg_attempt_provably_unsubmitted "${SALVAGE_RC:-0}"; then
     echo "[oracle-review] no conversation carried this run's marker and Oracle never reached its browser lifecycle (browser scanned clean, no URL memoized, browser stable): refunding this round; zero Pro quota was spent." >&2
     pg_round_unrecord "$ROUND_KEY"
+    pg_run_meta_remove "$RUN_MARKER"
     FAIL_DETAIL="submission never landed (send/upload failure before the prompt reached ChatGPT); round refunded, safe to retry"
   fi
   # Attribute the failure when the review browser restarted mid-run — almost always memory pressure

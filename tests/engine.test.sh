@@ -1593,25 +1593,43 @@ run_engine --confirm /nonexistent-prior.md --pr 102 --repo "$TDIR" --diff "$TDIR
 check 'missing --confirm file is a usage error (exit 2)' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC"
 
 echo '# v0.22.1: Cloudflare (provably-unsubmitted) refunds its round'
+CF_REPO="$TDIR/cloudflare-repo"; git init -q "$CF_REPO"
+git -C "$CF_REPO" remote add origin https://github.com/acme/widgets.git
+CF_PRIOR='pg-run-acme-widgets-103-1700008500-1'
+mkdir -p "$RHOME/completed" "$RHOME/run-meta"
+printf '[P1] src/prior.sh:1 - prior charged review\n  Why: recovery must keep it\nP2: none\nP3: none\nVERDICT: SHIP - prior.\n' > "$RHOME/completed/$CF_PRIOR"
+printf 'github.com\tacme\twidgets\tacme-widgets-103\t103\t%s\t1700008500\n' "$RHOME/prior-103.md" > "$RHOME/run-meta/$CF_PRIOR"
 cat > "$TDIR/bin/oracle-cf" <<'FAKE_CF'
 #!/usr/bin/env bash
 echo 'Cloudflare anti-bot page detected'
 exit 1
 FAKE_CF
 chmod +x "$TDIR/bin/oracle-cf"
-RKEY_103="$(printf '%s-103' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
+RKEY_103='acme-widgets-103'
 printf 'foreign idle tab\n' > "$TDIR/tab.txt"
 : > "$TDIR/mock.log"
 env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
   PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
   PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-cf" NODE_OPTIONS= \
   PRO_GATE_TIMEOUT_BIN="$TIMEOUT_LOG_BIN" PG_TEST_NODE_ARGS="$TDIR/node-args-cloudflare.log" \
-  bash "$ENGINE" --pr 103 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$RHOME/o-cf.md" --timeout 5s \
+  bash "$ENGINE" --pr 103 --repo "$CF_REPO" --diff "$TDIR/small.diff" --out "$RHOME/o-cf.md" --timeout 5s \
   >"$TDIR/stdout" 2>"$TDIR/stderr"
 RC=$?
 check 'cloudflare run fails without a usable review' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
 check 'cloudflare writes the account cooldown' "$([ -f "$RHOME/throttle.cooldown" ]; echo $?)" 'no cooldown file'
 check 'cloudflare refunds the round (no spend, no budget charge)' "$([ ! -f "$RHOME/rounds/$RKEY_103" ]; echo $?)" "rounds file: $(cat "$RHOME/rounds/$RKEY_103" 2>/dev/null)"
+CF_META_MATCHES="$(PRO_GATE_HOME="$RHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_run_meta_scan" \
+  | awk -F'\t' '$2 == "github.com" && $3 == "acme" && $4 == "widgets" && $6 == "103" {print $1}')"
+check 'cloudflare refund retires the unsubmitted run metadata' \
+  "$([ "$CF_META_MATCHES" = "$CF_PRIOR" ] && [ -f "$RHOME/run-meta/$CF_PRIOR" ]; echo $?)" \
+  "canonical metadata=$CF_META_MATCHES"
+env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT=65530 PRO_GATE_SELF_HEAL=0 NODE_OPTIONS= \
+  bash "$ENGINE" --recover 'https://github.com/acme/widgets/pull/103' --out "$RHOME/recovered-prior-103.md" \
+  >"$TDIR/stdout" 2>"$TDIR/recover.stderr"
+RC=$?
+check 'recover ignores refunded attempt and returns the prior charged artifact' \
+  "$([ "$RC" -eq 0 ] && cmp -s "$RHOME/completed/$CF_PRIOR" "$TDIR/stdout" && grep -qx 'Review ready' "$TDIR/recover.stderr"; echo $?)" \
+  "rc=$RC stderr=$(cat "$TDIR/recover.stderr")"
 check 'cloudflare failure never invokes organizer mode' "$(! grep -q -- '--organize' "$TDIR/node-args-cloudflare.log"; echo $?)" "$(cat "$TDIR/node-args-cloudflare.log" 2>/dev/null)"
 rm -f "$RHOME/throttle.cooldown"
 

@@ -526,6 +526,7 @@ async function freshRenderText(url, port, outerDeadline, waitForDecisiveEvidence
     // not stall watchdog/retry decisions by overrunning its own window)
     const renderDeadline = Math.min(Date.now() + 25_000, outerDeadline);
     let text = null;
+    let evidence = null;
     while (Date.now() + 2_500 < renderDeadline) {
       await sleep(2_500);
       let tabs;
@@ -551,9 +552,9 @@ async function freshRenderText(url, port, outerDeadline, waitForDecisiveEvidence
         // A readable source can be a stale snapshot, so this one revalidation must not spend its
         // only scratch navigation on the prompt marker ChatGPT hydrates before the answer. Reuse
         // the shared classifier: marker-only text remains owned-incomplete through the deadline.
-        const evidence = classifyEvidence(sample);
+        evidence = classifyEvidence(sample);
         if (['terminal', 'foreign', 'cross-bound', 'throttle'].includes(evidence.kind)) {
-          return { text, reason: `${evidence.kind}-evidence` };
+          return { text, reason: `${evidence.kind}-evidence`, evidence };
         }
       } else {
         if (hasExactMarker(sample, marker)) return { text, reason: 'marker-found' }; // ours — done
@@ -563,7 +564,7 @@ async function freshRenderText(url, port, outerDeadline, waitForDecisiveEvidence
       // Anything else (shell, pre-hydration, login wall, or a marker-only stale-source render)
       // is NOT an answer: keep sampling and return the last text at the render deadline.
     }
-    return { text, reason: text ? 'not-hydrated' : 'read-failed' };
+    return { text, reason: text ? 'not-hydrated' : 'read-failed', evidence };
   } catch {
     return { text: null, reason: 'scratch-cdp-failed' };
   } finally {
@@ -1084,7 +1085,7 @@ async function revalidateReadableStaleSource(url) {
     console.error(`canonical scratch revalidation was inconclusive (${rendered.reason})`);
     return { kind: 'inconclusive', reason: rendered.reason };
   }
-  return classifyEvidence(rendered.text);
+  return rendered.evidence ?? classifyEvidence(rendered.text);
 }
 
 function discardForeignUrl(url) {

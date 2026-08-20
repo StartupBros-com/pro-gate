@@ -536,6 +536,12 @@ pg_run_meta_write() { # marker host owner repo round_key pr out [charged_spend_e
   rm -f "$f.tmp.$$" 2>/dev/null
   return "$rc"
 }
+pg_run_meta_remove() { # marker -- retire an attempt proven never submitted/spent
+  local marker="$1"
+  pg_reservation_marker_ok "$marker" || return 0
+  rm -f "$(pg_run_meta_dir)/$marker" 2>/dev/null || true
+}
+
 pg_run_meta_read() { # marker -> one validated compact record
   local marker="$1" f host owner repo key pr out spend
   pg_reservation_marker_ok "$marker" || return 1
