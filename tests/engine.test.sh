@@ -3059,4 +3059,192 @@ LOGN2="$(find "$TDIR/home-scratch/logs" -name "$MHID*" 2>/dev/null | wc -l | tr 
 check 'second invocation adds a log instead of overwriting' \
   "$([ "$LOGN2" -gt "$LOGN1" ]; echo $?)" "before=$LOGN1 after=$LOGN2"
 
+# U3: --recover is a recovery-only resolver. Its public seam is the engine CLI: no fresh
+# dispatch machinery may run before one marker is selected from durable, marker-addressed state.
+echo '# U3: recovery-only resolver and no-spend control flow'
+REC_HOME="$TDIR/home-recover"
+REC_MARKER='pg-run-acme-widgets-42-1700001000-11'
+REC_ART="$REC_HOME/completed/$REC_MARKER"
+mkdir -p "$REC_HOME/completed" "$REC_HOME/run-meta"
+printf '[P1] src/recover.sh:1 - recovered finding\n  Why: durable fixture\nP2: none\nP3: none\nVERDICT: SHIP - recovered.\n' > "$REC_ART"
+printf 'github.com\tacme\twidgets\tacme-widgets-42\t42\t%s\t1700002000\n' "$TDIR/recover-original.md" > "$REC_HOME/run-meta/$REC_MARKER"
+: > "$TDIR/recover-oracle-sentinel"
+cat > "$TDIR/bin/oracle-recover-sentinel" <<'RECOVER_SENTINEL'
+#!/usr/bin/env bash
+printf 'invoked\n' >> "${PG_TEST_RECOVER_ORACLE_SENTINEL:?}"
+printf 'RECOVER FRESH DISPATCH FORBIDDEN\n' >&2
+exit 99
+RECOVER_SENTINEL
+chmod +x "$TDIR/bin/oracle-recover-sentinel"
+recover_run() { # home, then engine args; CDP deliberately unavailable unless harvest is expected
+  local home="$1"; shift
+  env PRO_GATE_HOME="$home" ORACLE_BROWSER_PORT=65530 PRO_GATE_SELF_HEAL=0 \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-recover-sentinel" \
+    PG_TEST_RECOVER_ORACLE_SENTINEL="$TDIR/recover-oracle-sentinel" NODE_OPTIONS= \
+    bash "$ENGINE" "$@" >"$TDIR/recover.stdout" 2>"$TDIR/recover.stderr"
+  RC=$?
+}
+REC_BEFORE="$(find "$REC_HOME" -mindepth 1 -maxdepth 2 -type f -printf '%P:%s\n' | sort)"
+recover_run "$REC_HOME" --recover "$REC_MARKER" --out "$TDIR/recover-out.md" --timeout 1s
+REC_AFTER="$(find "$REC_HOME" -mindepth 1 -maxdepth 2 -type f -printf '%P:%s\n' | sort)"
+check 'recover exact marker returns durable artifact with CDP and Oracle unavailable' \
+  "$([ "$RC" -eq 0 ] && cmp -s "$REC_ART" "$TDIR/recover.stdout" && cmp -s "$REC_ART" "$TDIR/recover-out.md"; echo $?)" \
+  "rc=$RC stdout=$(cat "$TDIR/recover.stdout") stderr=$(cat "$TDIR/recover.stderr")"
+check 'recover exact artifact prints Review ready only on stderr' \
+  "$(grep -qx 'Review ready' "$TDIR/recover.stderr"; echo $?)" "stderr=$(cat "$TDIR/recover.stderr")"
+check 'recover artifact fast path has no fresh dispatch, status, ledger, round, reservation, or organizer effects' \
+  "$([ ! -s "$TDIR/recover-oracle-sentinel" ] && [ "$REC_BEFORE" = "$REC_AFTER" ] && [ ! -e "$TDIR/recover-out.md.status" ]; echo $?)" \
+  "oracle=$(cat "$TDIR/recover-oracle-sentinel") before=$REC_BEFORE after=$REC_AFTER"
+
+# Repo-qualified URL and a current-repo --repo bare PR both resolve one newest durable candidate.
+REC_NEW='pg-run-acme-widgets-42-1700000001-12'
+printf '[P1] src/new.sh:1 - newer finding\n  Why: newest fixture\nP2: none\nP3: none\nVERDICT: SHIP - newer.\n' > "$REC_HOME/completed/$REC_NEW"
+printf 'github.com\tacme\twidgets\tacme-widgets-42\t42\t%s\t1700003000\n' "$TDIR/recover-new.md" > "$REC_HOME/run-meta/$REC_NEW"
+recover_run "$REC_HOME" --recover 'https://github.com/acme/widgets/pull/42' --out "$TDIR/recover-url.md"
+check 'recover repo-qualified URL selects newest charged run before artifact lookup' \
+  "$([ "$RC" -eq 0 ] && cmp -s "$REC_HOME/completed/$REC_NEW" "$TDIR/recover.stdout"; echo $?)" "rc=$RC stdout=$(cat "$TDIR/recover.stdout")"
+# A repository remote is the only acceptable proof for a bare PR. The temporary fixture remote
+# deliberately uses the exact host/owner/repo identity written above.
+REC_REPO="$TDIR/recover-repo"; git init -q "$REC_REPO"
+git -C "$REC_REPO" remote add origin https://github.com/acme/widgets.git
+recover_run "$REC_HOME" --recover 42 --repo "$REC_REPO" --out "$TDIR/recover-bare.md"
+check 'recover bare PR with current repository proof selects newest charged run' \
+  "$([ "$RC" -eq 0 ] && cmp -s "$REC_HOME/completed/$REC_NEW" "$TDIR/recover.stdout"; echo $?)" "rc=$RC stderr=$(cat "$TDIR/recover.stderr")"
+
+# A queued marker can be older than an earlier marker despite being charged later. Persisted
+# pg_round_record spend wins after reservation retirement; marker epochs are legacy-only fallback.
+REC_ORDER_HOME="$TDIR/home-recover-order"; mkdir -p "$REC_ORDER_HOME/completed" "$REC_ORDER_HOME/run-meta"
+REC_OLD='pg-run-acme-widgets-77-1700009000-1'; REC_LATE='pg-run-acme-widgets-77-1700001000-2'
+printf '[P1] old\n  Why: old\nP2: none\nP3: none\nVERDICT: SHIP - old.\n' > "$REC_ORDER_HOME/completed/$REC_OLD"
+printf '[P1] late\n  Why: late\nP2: none\nP3: none\nVERDICT: SHIP - late.\n' > "$REC_ORDER_HOME/completed/$REC_LATE"
+printf 'github.com\tacme\twidgets\tacme-widgets-77\t77\t/tmp/old.md\t1700009100\n' > "$REC_ORDER_HOME/run-meta/$REC_OLD"
+printf 'github.com\tacme\twidgets\tacme-widgets-77\t77\t/tmp/late.md\t1700010000\n' > "$REC_ORDER_HOME/run-meta/$REC_LATE"
+recover_run "$REC_ORDER_HOME" --recover 'https://github.com/acme/widgets/pull/77'
+check 'recover orders completed runs by durable charged spend, not inverted marker epoch' \
+  "$([ "$RC" -eq 0 ] && cmp -s "$REC_ORDER_HOME/completed/$REC_LATE" "$TDIR/recover.stdout"; echo $?)" "rc=$RC stdout=$(cat "$TDIR/recover.stdout")"
+
+# Lossy legacy slugs and mixed/tied evidence are not identity proof. Refuse with no browser,
+# harvest lock, or state mutation rather than selecting a colliding artifact.
+REC_AMBIG_HOME="$TDIR/home-recover-ambiguous"; mkdir -p "$REC_AMBIG_HOME/completed" "$REC_AMBIG_HOME/run-meta"
+REC_COLLIDE='pg-run-a-b-c-9-1700004000-1'
+printf '[P1] collision\n  Why: never return\nP2: none\nP3: none\nVERDICT: SHIP - collision.\n' > "$REC_AMBIG_HOME/completed/$REC_COLLIDE"
+# No run-meta: this legacy marker could name a-b/c#9 or a/b-c#9.
+recover_run "$REC_AMBIG_HOME" --recover 'https://github.com/a-b/c/pull/9'
+check 'recover refuses lossy legacy slug collision without canonical metadata proof' \
+  "$([ "$RC" -ne 0 ] && grep -qi 'disambigu' "$TDIR/recover.stderr" && [ ! -s "$TDIR/recover-oracle-sentinel" ]; echo $?)" \
+  "rc=$RC stderr=$(cat "$TDIR/recover.stderr")"
+REC_TIE_A='pg-run-acme-widgets-88-1700005000-1'; REC_TIE_B='pg-run-acme-widgets-88-1700005001-2'
+for m in "$REC_TIE_A" "$REC_TIE_B"; do
+  printf '[P1] tie\n  Why: never choose\nP2: none\nP3: none\nVERDICT: SHIP - tie.\n' > "$REC_AMBIG_HOME/completed/$m"
+  printf 'github.com\tacme\twidgets\tacme-widgets-88\t88\t/tmp/tie.md\t1700006000\n' > "$REC_AMBIG_HOME/run-meta/$m"
+done
+recover_run "$REC_AMBIG_HOME" --recover 'https://github.com/acme/widgets/pull/88'
+check 'recover refuses tied durable charged-spend candidates' \
+  "$([ "$RC" -ne 0 ] && grep -qi 'disambigu' "$TDIR/recover.stderr"; echo $?)" "rc=$RC stderr=$(cat "$TDIR/recover.stderr")"
+
+# Artifact absence is the only recovery path allowed to enter existing marker harvest behavior;
+# it keeps the prior exit while mapping its novice state and never invokes Oracle.
+REC_HARV_HOME="$TDIR/home-recover-harvest"; REC_HARV='pg-run-acme-widgets-99-1700007000-1'
+mkdir -p "$REC_HARV_HOME/in-progress" "$REC_HARV_HOME/run-meta"
+printf 'acme-widgets-99\t%s\t%s\t0\t1\t\t1700008000\tgenerating\n' "$TDIR/recover-harvest.md" "$(date +%s)" > "$REC_HARV_HOME/in-progress/$REC_HARV"
+printf 'github.com\tacme\twidgets\tacme-widgets-99\t99\t%s\t1700008000\n' "$TDIR/recover-harvest.md" > "$REC_HARV_HOME/run-meta/$REC_HARV"
+: > "$TDIR/recover-oracle-sentinel"
+recover_run "$REC_HARV_HOME" --recover 'https://github.com/acme/widgets/pull/99' --timeout 1s
+check 'recover artifact absence enters harvest only and retains its operational exit' \
+  "$([ "$RC" -eq 3 ] && grep -qx 'Browser needs attention' "$TDIR/recover.stderr" && [ ! -s "$TDIR/recover-oracle-sentinel" ]; echo $?)" \
+  "rc=$RC stderr=$(cat "$TDIR/recover.stderr") oracle=$(cat "$TDIR/recover-oracle-sentinel")"
+
+# Newer live work outranks an old completed artifact. Metadata and reservation spend must agree;
+# the absent new artifact is harvested instead of silently serving the old bytes.
+REC_LIVE_HOME="$TDIR/home-recover-live"; REC_LIVE_OLD='pg-run-acme-widgets-101-1700008100-1'; REC_LIVE_NEW='pg-run-acme-widgets-101-1700008000-2'
+mkdir -p "$REC_LIVE_HOME/completed" "$REC_LIVE_HOME/in-progress" "$REC_LIVE_HOME/run-meta"
+printf '[P1] old artifact\n  Why: stale\nP2: none\nP3: none\nVERDICT: SHIP - old.\n' > "$REC_LIVE_HOME/completed/$REC_LIVE_OLD"
+printf 'github.com\tacme\twidgets\tacme-widgets-101\t101\t/tmp/old.md\t1700008100\n' > "$REC_LIVE_HOME/run-meta/$REC_LIVE_OLD"
+printf 'github.com\tacme\twidgets\tacme-widgets-101\t101\t/tmp/new.md\t1700008200\n' > "$REC_LIVE_HOME/run-meta/$REC_LIVE_NEW"
+printf 'acme-widgets-101\t/tmp/new.md\t%s\t0\t1\t\t1700008200\tgenerating\n' "$(date +%s)" > "$REC_LIVE_HOME/in-progress/$REC_LIVE_NEW"
+: > "$TDIR/recover-oracle-sentinel"
+recover_run "$REC_LIVE_HOME" --recover 'https://github.com/acme/widgets/pull/101' --timeout 1s
+check 'recover targets newer live run before older completed artifact' \
+  "$([ "$RC" -eq 3 ] && ! cmp -s "$REC_LIVE_HOME/completed/$REC_LIVE_OLD" "$TDIR/recover.stdout" && grep -qx 'Browser needs attention' "$TDIR/recover.stderr"; echo $?)" \
+  "rc=$RC stdout=$(cat "$TDIR/recover.stdout") stderr=$(tail -2 "$TDIR/recover.stderr")"
+
+# The resolver rejects every uncertainty shape before acquiring the harvest lock or touching CDP.
+REC_MIX='pg-run-acme-widgets-102-1700008200-1'
+printf '[P1] mixed\n  Why: refuse\nP2: none\nP3: none\nVERDICT: SHIP - mixed.\n' > "$REC_AMBIG_HOME/completed/$REC_MIX"
+printf 'github.com\tacme\twidgets\tacme-widgets-102\t102\t/tmp/mix.md\t1700008300\n' > "$REC_AMBIG_HOME/run-meta/$REC_MIX"
+printf '[P1] legacy mixed\n  Why: refuse\nP2: none\nP3: none\nVERDICT: SHIP - legacy.\n' > "$REC_AMBIG_HOME/completed/pg-run-acme-widgets-102-1700008201-2"
+recover_run "$REC_AMBIG_HOME" --recover 'https://github.com/acme/widgets/pull/102'
+check 'recover refuses mixed legacy and canonical candidate evidence' \
+  "$([ "$RC" -eq 2 ] && grep -qi 'legacy candidate' "$TDIR/recover.stderr"; echo $?)" "rc=$RC stderr=$(cat "$TDIR/recover.stderr")"
+REC_CONFLICT='pg-run-acme-widgets-103-1700008300-1'
+printf '[P1] conflict\n  Why: refuse\nP2: none\nP3: none\nVERDICT: SHIP - conflict.\n' > "$REC_AMBIG_HOME/completed/$REC_CONFLICT"
+printf 'github.com\tacme\twidgets\tacme-widgets-103\t103\t/tmp/conflict.md\t1700008400\n' > "$REC_AMBIG_HOME/run-meta/$REC_CONFLICT"
+mkdir -p "$REC_AMBIG_HOME/in-progress"
+printf 'acme-widgets-103\t/tmp/conflict.md\t%s\t0\t1\t\t1700008401\tgenerating\n' "$(date +%s)" > "$REC_AMBIG_HOME/in-progress/$REC_CONFLICT"
+recover_run "$REC_AMBIG_HOME" --recover 'https://github.com/acme/widgets/pull/103'
+check 'recover refuses conflicting sidecar and reservation charge evidence' \
+  "$([ "$RC" -eq 2 ] && grep -qi 'charge evidence conflicts' "$TDIR/recover.stderr"; echo $?)" "rc=$RC stderr=$(cat "$TDIR/recover.stderr")"
+: > "$TDIR/recover-oracle-sentinel"
+REC_UNPROVEN_REPO="$TDIR/recover-unproven-repo"; git init -q "$REC_UNPROVEN_REPO"
+recover_run "$REC_AMBIG_HOME" --recover 42 --repo "$REC_UNPROVEN_REPO"
+check 'recover bare PR without current canonical repository proof refuses cross-repo ambiguity' \
+  "$([ "$RC" -eq 2 ] && grep -qi 'canonical repository proof' "$TDIR/recover.stderr" && [ ! -s "$TDIR/recover-oracle-sentinel" ]; echo $?)" \
+  "rc=$RC stderr=$(cat "$TDIR/recover.stderr") oracle=$(cat "$TDIR/recover-oracle-sentinel")"
+
+# A recover caller inherits the existing marker lock and reports the established busy exit/state.
+REC_BUSY_HOME="$TDIR/home-recover-busy"; REC_BUSY='pg-run-acme-widgets-104-1700008400-1'
+mkdir -p "$REC_BUSY_HOME/in-progress" "$REC_BUSY_HOME/run-meta" "$REC_BUSY_HOME/harvest-locks"
+printf 'acme-widgets-104\t/tmp/busy.md\t%s\t0\t1\t\t1700008500\tgenerating\n' "$(date +%s)" > "$REC_BUSY_HOME/in-progress/$REC_BUSY"
+printf 'github.com\tacme\twidgets\tacme-widgets-104\t104\t/tmp/busy.md\t1700008500\n' > "$REC_BUSY_HOME/run-meta/$REC_BUSY"
+printf 'run marker: %s\nstale readable source\n' "$REC_BUSY" > "$TDIR/recover-busy-source.txt"
+printf '{"title":null,"archived":false,"events":[]}\n' > "$TDIR/recover-busy-state.json"
+start_mock "$TDIR/recover-busy-source.txt" "$TDIR/recover-busy-state.json"
+exec {REC_BUSY_FD}>>"$REC_BUSY_HOME/harvest-locks/$REC_BUSY"; flock -n "$REC_BUSY_FD"
+env PRO_GATE_HOME="$REC_BUSY_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_HARVEST_LOCK_WAIT=1 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-recover-sentinel" \
+  PG_TEST_RECOVER_ORACLE_SENTINEL="$TDIR/recover-oracle-sentinel" NODE_OPTIONS= \
+  bash "$ENGINE" --recover 'https://github.com/acme/widgets/pull/104' --timeout 1s \
+  >"$TDIR/recover.stdout" 2>"$TDIR/recover.stderr"
+RC=$?; eval "exec ${REC_BUSY_FD}>&-"
+check 'concurrent recover inherits marker harvest lock and busy state without fresh dispatch' \
+  "$([ "$RC" -eq 7 ] && grep -qx 'Checking for completed review' "$TDIR/recover.stderr" && [ ! -s "$TDIR/recover-oracle-sentinel" ] && [ "$(jq -r '.created | length' "$TDIR/recover-busy-state.json")" = 0 ]; echo $?)" \
+  "rc=$RC stderr=$(tail -3 "$TDIR/recover.stderr") state=$(cat "$TDIR/recover-busy-state.json") oracle=$(cat "$TDIR/recover-oracle-sentinel")"
+
+# Exact-marker recovery remains useful for a legacy run with neither run-meta nor a reservation
+# output pointer. The recovery-owned fallback directory must exist before marker-only harvest starts.
+REC_EXACT_LEGACY_HOME="$TDIR/home-recover-exact-legacy"
+REC_EXACT_LEGACY='pg-run-legacy-exact-105-1700008600-1'
+: > "$TDIR/recover-oracle-sentinel"
+recover_run "$REC_EXACT_LEGACY_HOME" --recover "$REC_EXACT_LEGACY" --timeout 1s
+check 'recover exact legacy marker creates a safe fallback output before harvest' \
+  "$([ "$RC" -eq 3 ] && [ -d "$REC_EXACT_LEGACY_HOME/recovered" ] && grep -qx 'Browser needs attention' "$TDIR/recover.stderr" && [ ! -s "$TDIR/recover-oracle-sentinel" ]; echo $?)" \
+  "rc=$RC stderr=$(cat "$TDIR/recover.stderr") oracle=$(cat "$TDIR/recover-oracle-sentinel")"
+
+# A real fresh run, not a hand-authored fixture, must publish canonical repository identity when
+# its marker is minted and then persist pg_round_record's charged-spend epoch into the same sidecar.
+REC_META_HOME="$TDIR/home-recover-meta"
+REC_META_REPO="$TDIR/recover-meta-repo"; git init -q "$REC_META_REPO"
+git -C "$REC_META_REPO" remote add origin https://github.com/acme/widgets.git
+cat > "$TDIR/bin/oracle-recover-meta" <<'RECOVER_META_ORACLE'
+#!/usr/bin/env bash
+prompt=""; out=""
+while [ $# -gt 0 ]; do
+  case "$1" in -p) prompt="$2"; shift 2;; --write-output) out="$2"; shift 2;; *) shift;; esac
+done
+marker="$(printf '%s' "$prompt" | grep -oE 'pg-run-[A-Za-z0-9.-]+' | tail -1)"
+printf '[P1] src/meta.sh:1 - metadata fixture\n  Why: real fresh run\nP2: none\nP3: none\nVERDICT: SHIP - metadata recorded. (run marker: %s)\n' "$marker" > "$out"
+RECOVER_META_ORACLE
+chmod +x "$TDIR/bin/oracle-recover-meta"
+env PRO_GATE_HOME="$REC_META_HOME" PRO_GATE_BROWSER_MODE=native PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_MAX_RETRIES=0 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-recover-meta" NODE_OPTIONS= \
+  bash "$ENGINE" --pr 105 --repo "$REC_META_REPO" --diff "$TDIR/small.diff" \
+  --out "$TDIR/recover-meta.md" --timeout 5s >"$TDIR/recover.stdout" 2>"$TDIR/recover.stderr"
+RC=$?
+REC_META_MARKER="$(jq -r .marker "$TDIR/recover-meta.md.status" 2>/dev/null)"
+REC_META_RECORD="$(cat "$REC_META_HOME/run-meta/$REC_META_MARKER" 2>/dev/null)"
+check 'fresh run persists canonical repository identity and charged-spend ordering metadata' \
+  "$([ "$RC" -eq 0 ] && [ -n "$REC_META_MARKER" ] && printf '%s\n' "$REC_META_RECORD" | awk -F'\t' 'NF == 7 && $1 == "github.com" && $2 == "acme" && $3 == "widgets" && $5 == "105" && $7 ~ /^[0-9]+$/ {ok=1} END{exit !ok}'; echo $?)" \
+  "rc=$RC marker=$REC_META_MARKER meta=$REC_META_RECORD stderr=$(tail -3 "$TDIR/recover.stderr")"
+
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }

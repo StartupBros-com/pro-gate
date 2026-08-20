@@ -490,6 +490,78 @@ pg_reservation_marker_ok() {
   esac
 }
 
+# Recovery identity must retain the canonical host/owner/repo triple. ROUND_KEY's historic
+# owner-repo slug is deliberately NOT reversible: a-b/c and a/b-c both become a-b-c.
+pg_run_meta_dir() { echo "${PRO_GATE_RUN_META_DIR:-$PRO_GATE_HOME/run-meta}"; }
+pg_canonical_repo_ok() { # host owner repo
+  local host="${1:-}" owner="${2:-}" repo="${3:-}"
+  case "$host" in ''|*[!A-Za-z0-9.-]*) return 1;; esac
+  case "$owner" in ''|*[!A-Za-z0-9._-]*) return 1;; esac
+  case "$repo" in ''|*[!A-Za-z0-9._-]*) return 1;; esac
+  return 0
+}
+pg_repo_identity_from_url() { # GitHub/Git remote URL -> host<TAB>owner<TAB>repo
+  local url="${1:-}" host owner repo
+  if [[ "$url" =~ ^https?://([^/]+)/([^/]+)/([^/]+)(/pull/[0-9]+)?/?$ ]]; then
+    host="${BASH_REMATCH[1]}"; owner="${BASH_REMATCH[2]}"; repo="${BASH_REMATCH[3]}"
+  elif [[ "$url" =~ ^git@([^:]+):([^/]+)/([^/]+)\.git$ ]] || [[ "$url" =~ ^ssh://git@([^/]+)/([^/]+)/([^/]+)\.git$ ]]; then
+    host="${BASH_REMATCH[1]}"; owner="${BASH_REMATCH[2]}"; repo="${BASH_REMATCH[3]}"
+  else
+    return 1
+  fi
+  repo="${repo%.git}"
+  pg_canonical_repo_ok "$host" "$owner" "$repo" || return 1
+  printf '%s\t%s\t%s\n' "$host" "$owner" "$repo"
+}
+# A compact, marker-addressed sidecar survives reservation retirement and completion:
+# host<TAB>owner<TAB>repo<TAB>round_key<TAB>pr<TAB>out<TAB>charged_spend_epoch
+pg_run_meta_write() { # marker host owner repo round_key pr out [charged_spend_epoch]
+  local marker="$1" host="$2" owner="$3" repo="$4" key="$5" pr="$6" out="$7" spend="${8:-}" dir f prev
+  pg_reservation_marker_ok "$marker" || return 1
+  pg_canonical_repo_ok "$host" "$owner" "$repo" || return 1
+  pg_round_key_ok "$key" || return 1
+  case "$pr" in ''|*[!0-9]*) return 1;; esac
+  case "$out" in *$'\t'*|*$'\n'*) return 1;; esac
+  case "$spend" in ''|*[!0-9]*) return 1;; esac
+  dir="$(pg_run_meta_dir)"; mkdir -p "$dir" 2>/dev/null || return 1
+  f="$dir/$marker"
+  # A later lifecycle transition supplies the authoritative charge; no caller may erase it.
+  if [ -f "$f" ] && [ -z "$spend" ]; then
+    prev="$(awk -F'\t' 'NR==1{print $7}' "$f" 2>/dev/null)"
+    case "$prev" in ''|*[!0-9]*) ;; *) spend="$prev";; esac
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$host" "$owner" "$repo" "$key" "$pr" "$out" "$spend" > "$f.tmp.$$" 2>/dev/null \
+    && mv -f "$f.tmp.$$" "$f" 2>/dev/null
+  local rc=$?
+  rm -f "$f.tmp.$$" 2>/dev/null
+  return "$rc"
+}
+pg_run_meta_read() { # marker -> one validated compact record
+  local marker="$1" f host owner repo key pr out spend
+  pg_reservation_marker_ok "$marker" || return 1
+  f="$(pg_run_meta_dir)/$marker"; [ -f "$f" ] && [ ! -L "$f" ] || return 1
+  IFS=$'\t' read -r host owner repo key pr out spend < "$f" 2>/dev/null || return 1
+  pg_canonical_repo_ok "$host" "$owner" "$repo" || return 1
+  pg_round_key_ok "$key" || return 1
+  case "$pr" in ''|*[!0-9]*) return 1;; esac
+  case "$out" in *$'\t'*|*$'\n'*) return 1;; esac
+  case "$spend" in ''|*[!0-9]*) return 1;; esac
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$host" "$owner" "$repo" "$key" "$pr" "$out" "$spend"
+}
+# Shared read-only marker enumerator. Status uses it to discover sidecar-only keys; recovery
+# uses the same records rather than scraping status's human or JSON renderings.
+pg_run_meta_scan() {
+  local dir f marker rec
+  dir="$(pg_run_meta_dir)"; [ -d "$dir" ] || return 0
+  for f in "$dir"/pg-run-*; do
+    [ -f "$f" ] || continue
+    marker="$(basename "$f")"
+    pg_reservation_marker_ok "$marker" || continue
+    rec="$(pg_run_meta_read "$marker" 2>/dev/null)" || continue
+    printf '%s\t%s\n' "$marker" "$rec"
+  done
+}
+
 # Shared guard for reservation writes/removes AND the fresh-run count+slot-acquire decision.
 # This makes the handoff atomic: an exit-9 run writes its durable reservation while it still
 # owns the process slot; no waiter can observe "slot released, reservation not counted" (or

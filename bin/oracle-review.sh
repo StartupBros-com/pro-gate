@@ -25,6 +25,7 @@
 #       Collect a review whose run ended in-progress (exit 9): the Pro slot was spent but the
 #       model was still generating when the salvage budget ran out. No new slot is spent.
 #   oracle-review.sh --status [<pr-number|pr-url|pg-run-marker>] [--json]
+#   oracle-review.sh --recover <pr-number|pr-url|pg-run-marker> [--repo <dir>] [--out <file>] [--timeout <dur>]
 #       Read-only run rediscovery (v0.27): join reservations, round budget, remembered
 #       conversation URLs, and the ledger, and print each matching run's state plus the exact
 #       next command. For callers that lost their context (compaction, new session): answers
@@ -44,7 +45,7 @@ pg_load_env
 OS="$(pg_os)"; MODE="$(pg_browser_mode)"
 
 PR=""; REPO=""; DIFF_FILE=""; INPUT="both"; OUT=""; TIMEOUT="30m"; EXTRA_GLOB=""; HARVEST_MARKER=""; HARVEST_REQUESTED=0; CONFIRM_FILE=""
-STATUS_REQUESTED=0; STATUS_QUERY=""; AS_JSON=0
+STATUS_REQUESTED=0; STATUS_QUERY=""; AS_JSON=0; RECOVER_REQUESTED=0; RECOVER_QUERY=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --pr) PR="$2"; shift 2;;
@@ -56,6 +57,7 @@ while [ $# -gt 0 ]; do
     --extra-files) EXTRA_GLOB="$2"; shift 2;;
     --confirm) CONFIRM_FILE="$2"; shift 2;;
     --harvest) HARVEST_REQUESTED=1; HARVEST_MARKER="${2:-}"; shift 2;;
+    --recover) RECOVER_REQUESTED=1; RECOVER_QUERY="${2:-}"; shift 2;;
     # --status takes an OPTIONAL query (a following --flag or nothing means "all state").
     --status) STATUS_REQUESTED=1
       case "${2:-}" in ''|--*) shift 1;; *) STATUS_QUERY="$2"; shift 2;; esac;;
@@ -74,6 +76,125 @@ fi
 if [ -n "$CONFIRM_FILE" ] && [ ! -s "$CONFIRM_FILE" ]; then
   echo "ERROR: --confirm file not found or empty: $CONFIRM_FILE" >&2
   exit 2
+fi
+
+# --- v0.35: --recover — resolve exactly one already-spent marker, never dispatch ---
+# This deliberately precedes status, organizer housekeeping, WORK creation, browser preflight,
+# output locks, status writes, repository/diff assembly, round accounting, and Oracle validation.
+# It is not a friendlier spelling of a fresh review: after selection it either returns the immutable
+# artifact or delegates ONLY to the pre-existing marker-addressed --harvest path.
+if [ "$RECOVER_REQUESTED" = 1 ]; then
+  if [ -z "$RECOVER_QUERY" ] || [ -n "$PR$DIFF_FILE$EXTRA_GLOB$CONFIRM_FILE$HARVEST_MARKER$STATUS_QUERY" ] \
+     || [ "$HARVEST_REQUESTED" = 1 ] || [ "$STATUS_REQUESTED" = 1 ] || [ "$AS_JSON" = 1 ]; then
+    echo "ERROR: --recover <PR|URL|marker> accepts only --repo, --out, and --timeout modifiers" >&2
+    exit 2
+  fi
+
+  recover_disambiguate() { # reason [markers...]
+    local why="$1"; shift
+    echo "Disambiguation required: $why. Specify an exact pg-run-... marker." >&2
+    [ $# -eq 0 ] || printf 'Candidates: %s\n' "$*" >&2
+    exit 2
+  }
+  recover_marker_key() { local m="$1" k; k="${m#pg-run-}"; printf '%s\n' "${k%-*-*}"; }
+  REC_SELECTED=""; REC_SELECTED_OUT=""; REC_QUERY_NUM=""; REC_HOST=""; REC_OWNER=""; REC_REPO_NAME=""
+  case "$RECOVER_QUERY" in
+    pg-run-*)
+      pg_reservation_marker_ok "$RECOVER_QUERY" || { echo "ERROR: invalid recovery marker syntax" >&2; exit 2; }
+      REC_SELECTED="$RECOVER_QUERY";;
+    http*://*/pull/*)
+      REC_QUERY_NUM="${RECOVER_QUERY##*/}"; REC_QUERY_NUM="${REC_QUERY_NUM%%[!0-9]*}"
+      REC_IDENT="$(pg_repo_identity_from_url "$RECOVER_QUERY" 2>/dev/null || true)"
+      { [ -n "$REC_QUERY_NUM" ] && [ -n "$REC_IDENT" ]; } \
+        || recover_disambiguate "the PR URL is not a canonical host/owner/repo pull URL"
+      IFS=$'\t' read -r REC_HOST REC_OWNER REC_REPO_NAME <<< "$REC_IDENT";;
+    *[!0-9]*) echo "ERROR: --recover takes a PR number, a PR URL, or a pg-run-... marker" >&2; exit 2;;
+    *)
+      REC_QUERY_NUM="$RECOVER_QUERY"
+      # A bare number needs a proved current repository. Never fall back to the checkout basename:
+      # it is neither canonical nor unique and reopens the historical lossy-slug cross-bind.
+      REC_REPO_DIR="${REPO:-$(pwd)}"
+      REC_REMOTE="$(git -C "$REC_REPO_DIR" remote get-url origin 2>/dev/null || true)"
+      REC_IDENT="$(pg_repo_identity_from_url "$REC_REMOTE" 2>/dev/null || true)"
+      [ -n "$REC_IDENT" ] || recover_disambiguate "bare PR #$REC_QUERY_NUM has no canonical repository proof"
+      IFS=$'\t' read -r REC_HOST REC_OWNER REC_REPO_NAME <<< "$REC_IDENT";;
+  esac
+
+  if [ -z "$REC_SELECTED" ]; then
+    REC_SEEN=""; REC_NEW_COUNT=0; REC_LEGACY=""; REC_CONFLICT=""; REC_BEST_EPOCH=""; REC_BEST_MARKER=""; REC_BEST_OUT=""; REC_TIED=0
+    # The run-meta scan is the canonical candidate source. It retains exact identity and the
+    # pg_round_record charge after a completed artifact retires its reservation.
+    while IFS=$'\t' read -r m h o r key pr mout spend; do
+      [ "$pr" = "$REC_QUERY_NUM" ] && [ "$h" = "$REC_HOST" ] && [ "$o" = "$REC_OWNER" ] && [ "$r" = "$REC_REPO_NAME" ] || continue
+      REC_SEEN="$REC_SEEN $m"; REC_NEW_COUNT=$(( REC_NEW_COUNT + 1 ))
+      r_spend="$(pg_reservation_read_spend "$m" 2>/dev/null || true)"
+      case "$r_spend" in ''|*[!0-9]*) ;; *) [ "$r_spend" = "$spend" ] || REC_CONFLICT="$REC_CONFLICT $m";; esac
+      case "$spend" in ''|*[!0-9]*) REC_CONFLICT="$REC_CONFLICT $m"; continue;; esac
+      if [ -z "$REC_BEST_EPOCH" ] || [ "$spend" -gt "$REC_BEST_EPOCH" ]; then
+        REC_BEST_EPOCH="$spend"; REC_BEST_MARKER="$m"; REC_BEST_OUT="$mout"; REC_TIED=0
+      elif [ "$spend" = "$REC_BEST_EPOCH" ]; then
+        REC_TIED=1
+      fi
+    done < <(pg_run_meta_scan)
+
+    # Legacy markers remain visible candidates so an old lossy round key cannot be silently
+    # bypassed. They never provide canonical identity proof; a mixed set therefore disambiguates.
+    for f in "$PRO_GATE_HOME/in-progress"/pg-run-* "$(pg_completed_dir)"/pg-run-* "$PRO_GATE_HOME/pending"/pg-run-*; do
+      [ -f "$f" ] || continue
+      m="$(basename "$f")"; pg_reservation_marker_ok "$m" || continue
+      case " $REC_SEEN " in *" $m "*) continue;; esac
+      key="$(recover_marker_key "$m")"
+      case "$key" in *"-$REC_QUERY_NUM") REC_LEGACY="$REC_LEGACY $m";; esac
+    done
+    [ -z "$REC_LEGACY" ] || recover_disambiguate "legacy candidate(s) lack canonical repository proof" "$REC_LEGACY"
+    [ -z "$REC_CONFLICT" ] || recover_disambiguate "candidate charge evidence conflicts or is incomplete" "$REC_CONFLICT"
+    [ "$REC_NEW_COUNT" -gt 0 ] || recover_disambiguate "no canonically identified run matches this PR"
+    [ "$REC_TIED" = 0 ] || recover_disambiguate "newest charged-spend epoch is tied"
+    REC_SELECTED="$REC_BEST_MARKER"; REC_SELECTED_OUT="$REC_BEST_OUT"
+  fi
+
+  # Artifact-first is intentionally smaller than --harvest's historical fast path: no work dir,
+  # preflight, status/ledger/active records, reservation retirement, organizer, or lock. stdout is
+  # exclusively review bytes; the novice state remains a single plain stderr line.
+  REC_ART="$(pg_completed_dir)/$REC_SELECTED"
+  if [ -s "$REC_ART" ] && pg_is_review "$REC_ART"; then
+    if [ -n "$OUT" ] && ! pg_completed_lookup "$REC_SELECTED" "$OUT"; then
+      echo "Browser needs attention" >&2
+      exit 6
+    fi
+    echo "Review ready" >&2
+    cat "$REC_ART"
+    exit 0
+  fi
+
+  # Exact-marker input does not pass through the candidate scan, so recover its publication path
+  # from marker-addressed metadata or the live reservation before choosing a safe local default.
+  if [ -z "$REC_SELECTED_OUT" ]; then
+    REC_META="$(pg_run_meta_read "$REC_SELECTED" 2>/dev/null || true)"
+    if [ -n "$REC_META" ]; then
+      IFS=$'\t' read -r _rh _ro _rr _rk _rp REC_SELECTED_OUT _rs <<< "$REC_META"
+    elif [ -f "$(pg_reservation_dir)/$REC_SELECTED" ]; then
+      REC_SELECTED_OUT="$(awk -F'\t' 'NR==1{print $2}' "$(pg_reservation_dir)/$REC_SELECTED" 2>/dev/null)"
+    fi
+  fi
+  if [ -z "$OUT" ]; then
+    if [ -n "$REC_SELECTED_OUT" ]; then
+      OUT="$REC_SELECTED_OUT"
+    else
+      mkdir -p "$PRO_GATE_HOME/recovered" 2>/dev/null \
+        || { echo "Browser needs attention" >&2; exit 3; }
+      OUT="$PRO_GATE_HOME/recovered/$REC_SELECTED.md"
+    fi
+  fi
+  bash "$0" --harvest "$REC_SELECTED" --out "$OUT" --timeout "$TIMEOUT"
+  REC_HARVEST_RC=$?
+  case "$REC_HARVEST_RC" in
+    0) echo "Review ready" >&2;;
+    8|7) echo "Checking for completed review" >&2;;
+    9) echo "Still working" >&2;;
+    *) echo "Browser needs attention" >&2;;
+  esac
+  exit "$REC_HARVEST_RC"
 fi
 
 # --- v0.27: --status — read-only run rediscovery (issue #47) ---
@@ -299,6 +420,11 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
     [ -e "$f" ] || continue
     k="${f#"${ST_LOCKFILE}".pr-}"; k="${k%.d}"; st_add_key "$k"
   done
+  # Same marker-addressed durable source used by --recover. This only contributes a key to
+  # status's existing state join; it neither parses rendered status output nor changes its schema.
+  while IFS=$'\t' read -r _sm _sh _so _sr _sk _sp _sout _sspend; do
+    st_add_key "$_sk"
+  done < <(pg_run_meta_scan)
   [ -n "$Q_SLUG" ] && [ -n "$Q_NUM" ] && st_add_key "${Q_SLUG}-${Q_NUM}"
   for k in $ST_KEYS; do
     if [ -n "$Q_MARKER" ]; then
@@ -1562,6 +1688,11 @@ fi
 [ -n "$REPO_SLUG" ] || REPO_SLUG="$(basename "$REPO")"
 PR_KEY=""
 [ -n "$PR_NUM" ] && PR_KEY="$(printf '%s-%s' "$REPO_SLUG" "$PR_NUM" | tr -c 'A-Za-z0-9.\n-' '-')"
+# Keep a non-lossy identity alongside the historical safe filename key. It is intentionally
+# absent when no canonical remote/PR URL can prove it; recovery must then ask for a marker.
+PG_META_IDENT="$(pg_repo_identity_from_url "${PR_URL:-}" 2>/dev/null || pg_repo_identity_from_url "$(git -C "$REPO" remote get-url origin 2>/dev/null || true)" 2>/dev/null || true)"
+PG_META_HOST=""; PG_META_OWNER=""; PG_META_REPO=""
+[ -z "$PG_META_IDENT" ] || IFS=$'\t' read -r PG_META_HOST PG_META_OWNER PG_META_REPO <<< "$PG_META_IDENT"
 
 # ROUND_KEY (v0.22): identity for the review round budget. PR runs use PR_KEY. --diff runs loop
 # just as hard (ledger: 11 diff re-gates of one worktree in a day) but have no PR number, so
@@ -1703,6 +1834,14 @@ fi
 # gives --diff runs a real per-change identity instead of the shared literal "diff", so their
 # exit-9 reservations can redirect same-branch re-runs to harvest like PR runs always could.
 RUN_MARKER="pg-run-${ROUND_KEY:-diff}-$(date +%s)-$$"
+# The marker is minted before queue/slot acquisition. Write identity immediately, then update the
+# same record only when pg_round_record supplies its authoritative charged-spend epoch below.
+# This sidecar is never removed with a reservation or completed artifact.
+if [ -n "$PR_NUM" ] && [ -n "$PG_META_HOST" ] && [ -n "$PG_META_OWNER" ] && [ -n "$PG_META_REPO" ]; then
+  pg_run_meta_write "$RUN_MARKER" "$PG_META_HOST" "$PG_META_OWNER" "$PG_META_REPO" \
+    "$ROUND_KEY" "$PR_NUM" "$OUT" 2>/dev/null \
+    || echo "[oracle-review] WARNING: could not persist recovery identity metadata for $RUN_MARKER" >&2
+fi
 # v0.28 (gate #54 r8): oracle/reattach/salvage capture into a PROCESS-PRIVATE file from the
 # outset; the caller's $OUT is publication-only, written once after acceptance. Two runs whose
 # callers share one --out (same bare PR number in different repos, retries, orchestrator
@@ -2317,7 +2456,18 @@ while :; do
   # PG_ROUND_SPEND_EPOCH (set by pg_round_record) is this run's charge time — the stamp every
   # trajectory row for this round must carry (#66 gate r3 P1). Keep it for the completion path
   # and for the reservation an exit-9 hands to a later harvest process.
-  [ "$attempt" -eq 0 ] && { pg_round_record "$ROUND_KEY"; RUN_SPEND_EPOCH="$PG_ROUND_SPEND_EPOCH"; pg_active_write; }
+  [ "$attempt" -eq 0 ] && {
+    pg_round_record "$ROUND_KEY"; RUN_SPEND_EPOCH="$PG_ROUND_SPEND_EPOCH"
+    # pg_round_record is the sole authority for charged-spend ordering. Preserve that epoch in
+    # run-meta before any later exit-9 reservation can retire, so recovery never reorders queued
+    # rounds by their earlier marker-mint time.
+    if [ -n "${RUN_SPEND_EPOCH:-}" ] && [ -n "${PG_META_HOST:-}${PG_META_OWNER:-}${PG_META_REPO:-}" ]; then
+      pg_run_meta_write "$RUN_MARKER" "$PG_META_HOST" "$PG_META_OWNER" "$PG_META_REPO" \
+        "$ROUND_KEY" "$PR_NUM" "$OUT" "$RUN_SPEND_EPOCH" 2>/dev/null \
+        || echo "[oracle-review] WARNING: could not persist recovery charge metadata for $RUN_MARKER" >&2
+    fi
+    pg_active_write
+  }
 
   # A non-blocking heads-up when memory is tight but not blocking (the gate is deliberately
   # conservative, so a swap-heavy box with moderate free RAM still runs). Warns low-memory users
