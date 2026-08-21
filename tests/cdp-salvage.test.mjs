@@ -105,8 +105,18 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
     if (req.url?.startsWith('/json/new')) {
       const port = server.address().port;
       const url = decodeURIComponent(req.url.slice(req.url.indexOf('?') + 1));
+      // opts.putNewFails models a pre-v111 Chrome, which has no PUT /json/new and answers with a
+      // plain-text (non-JSON) error instead — the exact shape that used to make
+      // fetchJsonBeforeDeadline's unconditional response.json() throw before the caller ever
+      // reached its own response.ok check and tried the documented GET fallback below.
+      if (opts.putNewFails && req.method === 'PUT') {
+        res.statusCode = 404;
+        res.end('Not Found (pre-v111 Chrome has no PUT /json/new)');
+        return;
+      }
       const id = `scratch${created.length + 1}`;
       created.push({ id, url });
+      if (opts.hangScratchOpen) return;
       res.setHeader('content-type', 'application/json');
       res.end(JSON.stringify({
         id, type: 'page', url, webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/${id}`,
@@ -114,6 +124,7 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
       return;
     }
     if (req.url === '/json') {
+      if (opts.hangScratchList && created.some((t) => !closed.includes(t.id))) return;
       const port = server.address().port;
       res.setHeader('content-type', 'application/json');
       // Extras are listed verbatim EXCEPT that a caller-supplied tab with no debugger URL
@@ -125,10 +136,18 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
           ? { type: 'page', ...t, webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/${t.id}` }
           : t
       ));
-      const scratch = created.filter((t) => !closed.includes(t.id)).map((t) => ({
-        id: t.id, type: 'page', url: t.url,
-        webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/${t.id}`,
-      }));
+      if (opts.failScratchList && created.some((t) => !closed.includes(t.id))) {
+        res.statusCode = 503; res.end('scratch list unavailable'); return;
+      }
+      const scratch = created.filter((t) => !closed.includes(t.id)).flatMap((t) => {
+        const override = opts.scratchTarget?.(t, pollsByTab.get(t.id) ?? 0);
+        if (override === null) return [];
+        return [{
+          id: t.id, type: 'page', url: t.url,
+          webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/${t.id}`,
+          ...(override ?? {}),
+        }];
+      });
       if (tabText === '__NO_TABS__' || closed.includes('tab1')) {
         res.end(JSON.stringify([...extras, ...scratch]));
         return;
@@ -139,7 +158,12 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
       }, ...extras, ...scratch]));
       return;
     }
-    if (req.url?.startsWith('/json/close/')) { closed.push(req.url.split('/').pop()); res.end('ok'); return; }
+    if (req.url?.startsWith('/json/close/')) {
+      closed.push(req.url.split('/').pop());
+      if (opts.hangScratchClose && req.url.split('/').pop().startsWith('scratch')) return;
+      res.end('ok');
+      return;
+    }
     res.statusCode = 404; res.end();
   });
   server.on('upgrade', (req, socket) => {
@@ -268,6 +292,7 @@ function runSalvage(args, port, seed, extraEnv = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
   if (seed) seed(home);
   return new Promise((resolve) => {
+    const startedAt = Date.now();
     const expandedArgs = args.map((arg) => arg.replace(/^PG_HOME\//, `${home}/`));
     const child = spawn(process.execPath, [SALVAGE, ...expandedArgs, String(port)], {
       env: { ...process.env, PRO_GATE_HOME: home, ...extraEnv },
@@ -275,7 +300,7 @@ function runSalvage(args, port, seed, extraEnv = {}) {
     let stdout = '', stderr = '';
     child.stdout.on('data', (d) => { stdout += d; });
     child.stderr.on('data', (d) => { stderr += d; });
-    const killer = setTimeout(() => child.kill('SIGKILL'), 90_000);
+    const killer = setTimeout(() => child.kill('SIGKILL'), Number(extraEnv.PRO_GATE_TEST_CHILD_TIMEOUT_MS ?? 90_000));
     child.on('close', (status) => {
       clearTimeout(killer);
       const read = (rel) => { try { return fs.readFileSync(path.join(home, rel), 'utf8'); } catch { return null; } };
@@ -293,7 +318,10 @@ function runSalvage(args, port, seed, extraEnv = {}) {
         } catch { return 0; }
       })();
       fs.rmSync(home, { recursive: true, force: true });
-      resolve({ status, stdout, stderr, memoUrl: memoUrl?.trim() ?? null, memos, blacklist, cooldown, crossbound });
+      resolve({
+        status, stdout, stderr, elapsedMs: Date.now() - startedAt,
+        memoUrl: memoUrl?.trim() ?? null, memos, blacklist, cooldown, crossbound,
+      });
     });
   });
 }
@@ -361,9 +389,452 @@ const MARKER = 'pg-run-test-1234567890-42';
   const cdp = await mockCdp(`run marker: ${MARKER}\nReasoning about the diff...`);
   const r = await runSalvage([MARKER, '3'], cdp.port);
   check('still-generating exits 3', r.status === 3, `status=${r.status} stderr=${r.stderr?.slice(0, 200)}`);
-  check('still-generating leaves the tab open', cdp.closed.length === 0, `closed=${cdp.closed}`);
+  check('still-generating leaves the source tab open after closing its scratch revalidation',
+    !cdp.closed.includes('tab1') && cdp.closed.includes('scratch1'), `closed=${cdp.closed}`);
   check('still-generating names the conversation', /still-generating: .*mock-conversation/.test(r.stderr ?? ''));
   cdp.stop();
+}
+
+{ // U1: production-shaped divergence. The listed source is readable and marker-owned but stale;
+  // the same canonical URL, rendered in a scratch tab, contains the completed server answer.
+  // Recovery must never refresh, close, or otherwise mutate the source target.
+  const canonicalUrl = 'https://chatgpt.com/c/mock-conversation';
+  const staleSource = `run marker: ${MARKER}\nReasoning about the diff...`;
+  const serverReview = [
+    `run marker: ${MARKER}`,
+    '[P1] src/stale-source.mjs:10 — server-complete finding',
+    'P2: none',
+    `VERDICT: FIX-FIRST — recovered from the canonical conversation. (run marker: ${MARKER})`,
+  ].join('\n');
+  const cdp = await mockCdp(staleSource, [], { renderText: (url) => url === canonicalUrl ? serverReview : '' });
+  const r = await runSalvage([MARKER, '3'], cdp.port, seedMemo(MARKER, canonicalUrl));
+  check('readable stale source recovers the canonical scratch review', r.status === 0,
+    `status=${r.status} stderr=${r.stderr?.slice(0, 300)}`);
+  const expectedReview = serverReview.split('\n').slice(1).join('\n');
+  check('readable stale source prints the canonical scratch review bytes', r.stdout.trim() === expectedReview,
+    `stdout=${r.stdout?.slice(0, 300)}`);
+  check('readable stale source opens and closes one canonical scratch target',
+    cdp.created.length === 1 && cdp.created[0]?.url === canonicalUrl && cdp.closed.includes(cdp.created[0].id),
+    `created=${JSON.stringify(cdp.created)} closed=${cdp.closed}`);
+  check('readable stale source stays open and unnavigated',
+    !cdp.closed.includes('tab1') && !cdp.requests.some((request) => request.method === 'Page.navigate'),
+    `closed=${cdp.closed} requests=${JSON.stringify(cdp.requests)}`);
+  cdp.stop();
+}
+
+{ // U1 regression: ChatGPT can hydrate our prompt marker before its completed answer. The readable
+  // source is stale, so its one canonical scratch revalidation must sample past marker-only text.
+  const canonicalUrl = 'https://chatgpt.com/c/mock-conversation';
+  const staleSource = `run marker: ${MARKER}\nReasoning about the diff...`;
+  const markerOnlyScratch = `run marker: ${MARKER}\nAnswer is still hydrating...`;
+  const serverReview = [
+    `run marker: ${MARKER}`,
+    '[P1] src/stale-source.mjs:10 — hydrated server-complete finding',
+    'P2: none',
+    `VERDICT: FIX-FIRST — recovered after marker hydration. (run marker: ${MARKER})`,
+  ].join('\n');
+  const cdp = await mockCdp(staleSource, [], {
+    renderText: (url, n) => url === canonicalUrl && n === 1 ? markerOnlyScratch : serverReview,
+  });
+  const r = await runSalvage([MARKER, '8'], cdp.port, seedMemo(MARKER, canonicalUrl));
+  check('readable stale source waits past a marker-only canonical scratch sample', r.status === 0,
+    `status=${r.status} stderr=${r.stderr?.slice(0, 300)}`);
+  check('marker-hydration revalidation emits the later nonce-bearing verdict',
+    r.stdout.trim() === serverReview.split('\n').slice(1).join('\n'), `stdout=${r.stdout?.slice(0, 300)}`);
+  check('marker-hydration revalidation closes only its scratch target',
+    cdp.created.length === 1 && cdp.closed.includes('scratch1') && !cdp.closed.includes('tab1'),
+    `created=${JSON.stringify(cdp.created)} closed=${cdp.closed}`);
+  cdp.stop();
+}
+
+{ // U1 probe must defer its normal early exit until the same bounded canonical revalidation.
+  const canonicalUrl = 'https://chatgpt.com/c/mock-conversation';
+  const staleSource = `run marker: ${MARKER}\nReasoning about the diff...`;
+  const serverReview = [
+    `run marker: ${MARKER}`,
+    'P1: none',
+    `VERDICT: SHIP — server-complete. (run marker: ${MARKER})`,
+  ].join('\n');
+  const cdp = await mockCdp(staleSource, [], { renderText: (url) => url === canonicalUrl ? serverReview : '' });
+  const r = await runSalvage(['--probe', MARKER, '3'], cdp.port, seedMemo(MARKER, canonicalUrl));
+  check('probe revalidates a readable stale source and remains live (exit 0)', r.status === 0,
+    `status=${r.status} stderr=${r.stderr?.slice(0, 300)}`);
+  check('probe classifies fresh owned terminal evidence as complete', /^probe-state: complete$/m.test(r.stderr || ''),
+    `stderr=${r.stderr?.slice(0, 300)}`);
+  check('probe emits no review body after stale-source revalidation', r.stdout === '', `stdout=${r.stdout}`);
+  check('probe closes only its canonical scratch target',
+    cdp.created.length === 1 && cdp.closed.includes(cdp.created[0].id) && !cdp.closed.includes('tab1'),
+    `created=${JSON.stringify(cdp.created)} closed=${cdp.closed}`);
+  cdp.stop();
+}
+
+{ // U1: an owned incomplete scratch remains live and must not consume a second stale render.
+  const canonicalUrl = 'https://chatgpt.com/c/mock-conversation';
+  const cdp = await mockCdp(`run marker: ${MARKER}\nstale readable source`, [], {
+    renderText: () => `run marker: ${MARKER}\nstill generating on the server`,
+  });
+  const r = await runSalvage([MARKER, '3'], cdp.port, seedMemo(MARKER, canonicalUrl));
+  check('same-marker incomplete scratch remains still-generating', r.status === 3, `status=${r.status} stderr=${r.stderr}`);
+  check('same-marker incomplete scratch is attempted only once', cdp.created.length === 1 && cdp.closed.includes('scratch1'),
+    `created=${JSON.stringify(cdp.created)} closed=${cdp.closed}`);
+  check('incomplete scratch keeps the canonical memo and avoids blacklist/cross-bind mutation',
+    r.memoUrl === canonicalUrl && r.blacklist === null && r.crossbound === 0,
+    `memo=${r.memoUrl} blacklist=${r.blacklist} crossbound=${r.crossbound}`);
+  cdp.stop();
+}
+
+{ // U1: an old foreign-marked verdict before our latest prompt is not this run's completion.
+  const canonicalUrl = 'https://chatgpt.com/c/mock-conversation';
+  const oldBeforePrompt = [
+    'P1: old/source.mjs:1 — old answer',
+    'VERDICT: SHIP — old. (run marker: pg-run-old-round-1111111111-1)',
+    `run marker: ${MARKER}`,
+    'new answer still generating',
+  ].join('\n');
+  const cdp = await mockCdp(`run marker: ${MARKER}\nstale readable source`, [], { renderText: () => oldBeforePrompt });
+  const r = await runSalvage(['--probe', MARKER, '3'], cdp.port, seedMemo(MARKER, canonicalUrl));
+  check('probe keeps an old foreign-marked scratch verdict generating',
+    r.status === 0 && /^probe-state: generating$/m.test(r.stderr || ''), `status=${r.status} stderr=${r.stderr}`);
+  check('old verdict ordering closes only one scratch', cdp.created.length === 1 && !cdp.closed.includes('tab1'),
+    `created=${JSON.stringify(cdp.created)} closed=${cdp.closed}`);
+  cdp.stop();
+
+  const oldOwnedBeforePrompt = [
+    `run marker: ${MARKER}`,
+    'P1: old/source.mjs:1 — old answer from this same run marker',
+    `VERDICT: SHIP — old. (run marker: ${MARKER})`,
+    `run marker: ${MARKER}`,
+    'new answer still generating',
+  ].join('\n');
+  const ownCdp = await mockCdp(`run marker: ${MARKER}\nstale readable source`, [], {
+    renderText: () => oldOwnedBeforePrompt,
+  });
+  const ownResult = await runSalvage(['--probe', MARKER, '3'], ownCdp.port, seedMemo(MARKER, canonicalUrl));
+  check('probe keeps an old same-marker terminal verdict before the latest prompt generating',
+    ownResult.status === 0 && /^probe-state: generating$/m.test(ownResult.stderr || ''),
+    `status=${ownResult.status} stderr=${ownResult.stderr}`);
+  ownCdp.stop();
+}
+
+{ // P1 (gate #91 r2): a retry reuses this run's exact marker, so an OLDER same-marker verdict
+  // that a newer prompt marker has already superseded must not be emitted as harvest's result —
+  // only --probe checked probeComplete; the plain harvest path emitted on kind alone and would
+  // report last round's review as this run's, retiring the reservation while the real answer was
+  // still generating.
+  const canonicalUrl = 'https://chatgpt.com/c/mock-conversation';
+  const staleTerminal = [
+    `run marker: ${MARKER}`,
+    'Reasoning about the old round...',
+    `VERDICT: SHIP — stale round must never be emitted. (run marker: ${MARKER})`,
+    `run marker: ${MARKER}`,
+    'newer round still generating...',
+  ].join('\n');
+  const cdp = await mockCdp(staleTerminal, [], {});
+  const r = await runSalvage([MARKER, '3'], cdp.port);
+  check('a stale same-marker verdict before the latest prompt does not exit 0', r.status !== 0,
+    `status=${r.status} stdout=${r.stdout?.slice(0, 200)} stderr=${r.stderr?.slice(0, 300)}`);
+  check('a stale same-marker verdict is never printed as the harvested review',
+    !/SHIP — stale round/.test(r.stdout ?? ''), `stdout=${r.stdout?.slice(0, 300)}`);
+  check('a stale same-marker verdict keeps the run still-generating (exit 3)', r.status === 3,
+    `status=${r.status} stderr=${r.stderr?.slice(0, 300)}`);
+  cdp.stop();
+
+  // Once the newer prompt's own VERDICT lands after the newest marker, THAT review — and only
+  // that one — is what harvest emits.
+  const newerFinal = [
+    `run marker: ${MARKER}`,
+    'Reasoning about the old round...',
+    `VERDICT: SHIP — stale round must never be emitted. (run marker: ${MARKER})`,
+    `run marker: ${MARKER}`,
+    '[P1] src/new.mjs:5 — newer finding, real',
+    '  Why: real bug',
+    `VERDICT: FIX-FIRST — newer round is final. (run marker: ${MARKER})`,
+  ].join('\n');
+  // Reuse the readable-stale-source -> canonical-scratch-revalidation path (U1): its scratch
+  // samples every 2.5s with no render-interval throttle, unlike the remembered-URL seeded
+  // render (90s), so it can observe the newer verdict landing within a normal test budget.
+  const seededCdp = await mockCdp(staleTerminal, [], {
+    renderText: (_url, n) => (n === 1 ? staleTerminal : newerFinal),
+  });
+  const seededResult = await runSalvage([MARKER, '8'], seededCdp.port, seedMemo(MARKER, canonicalUrl));
+  check('the superseded verdict is skipped and the newer verdict is emitted instead',
+    seededResult.status === 0 && /VERDICT: FIX-FIRST — newer round is final/.test(seededResult.stdout ?? ''),
+    `status=${seededResult.status} stdout=${seededResult.stdout?.slice(0, 300)}`);
+  check('the stale verdict text never reaches stdout',
+    !/SHIP — stale round/.test(seededResult.stdout ?? ''), `stdout=${seededResult.stdout?.slice(0, 300)}`);
+  seededCdp.stop();
+}
+
+{ // U1: scratch transport and hydration failures are inconclusive, never a memo or blacklist mutation.
+  const canonicalUrl = 'https://chatgpt.com/c/mock-conversation';
+  const source = `run marker: ${MARKER}\nstale readable source`;
+  const login = 'Log in\nSign up\nContinue with Google';
+  const cases = [
+    ['canonical URL drift', { scratchTarget: () => ({ url: 'https://chatgpt.com/c/wrong-conversation' }) }],
+    ['scratch target disappearance', { scratchTarget: () => null }],
+    ['scratch CDP listing failure', { failScratchList: true }],
+    ['login wall', { renderText: () => login }],
+    ['pre-hydration shell', { renderText: () => 'Chat history\nNew chat\nSidebar only' }],
+  ];
+  for (const [name, opts] of cases) {
+    const cdp = await mockCdp(source, [], opts);
+    const r = await runSalvage([MARKER, '3'], cdp.port, seedMemo(MARKER, canonicalUrl));
+    check(`${name} is inconclusive while the readable source remains live`, r.status === 3,
+      `status=${r.status} stderr=${r.stderr}`);
+    check(`${name} keeps memo and avoids blacklist/cross-bind mutation`,
+      r.memoUrl === canonicalUrl && r.blacklist === null && r.crossbound === 0,
+      `memo=${r.memoUrl} blacklist=${r.blacklist} crossbound=${r.crossbound}`);
+    check(`${name} closes only the disposable scratch`,
+      cdp.created.length === 1 && cdp.closed.includes('scratch1') && !cdp.closed.includes('tab1'),
+      `created=${JSON.stringify(cdp.created)} closed=${cdp.closed}`);
+    cdp.stop();
+  }
+}
+
+{ // U1: throttle and cross-bound scratch outcomes retain their existing safety consequences.
+  const canonicalUrl = 'https://chatgpt.com/c/mock-conversation';
+  const source = `run marker: ${MARKER}\nstale readable source`;
+  const throttle = "You're making requests too quickly. Temporarily limited access to your conversations.";
+  const throttled = await mockCdp(source, [], { renderText: () => throttle });
+  const throttleResult = await runSalvage([MARKER, '3'], throttled.port, seedMemo(MARKER, canonicalUrl));
+  check('throttled canonical scratch takes the existing throttle exit', throttleResult.status === 5,
+    `status=${throttleResult.status} stderr=${throttleResult.stderr}`);
+  check('throttled canonical scratch writes cooldown and closes only scratch',
+    /canonical scratch/.test(throttleResult.cooldown ?? '') && throttled.closed.includes('scratch1') && !throttled.closed.includes('tab1'),
+    `cooldown=${throttleResult.cooldown} closed=${throttled.closed}`);
+  throttled.stop();
+
+  const foreignAnswer = [
+    `run marker: ${MARKER}`,
+    '[P1] foreign/source.mjs:1 — another run',
+    'VERDICT: FIX-FIRST — not ours. (run marker: pg-run-other-repo-42-1111111111-9)',
+  ].join('\n');
+  const crossBound = await mockCdp(source, [], { renderText: () => foreignAnswer });
+  const crossBoundResult = await runSalvage([MARKER, '3'], crossBound.port, seedMemo(MARKER, canonicalUrl));
+  check('cross-bound canonical scratch is never emitted as our review',
+    crossBoundResult.status !== 0 && !/VERDICT/.test(crossBoundResult.stdout ?? ''),
+    `status=${crossBoundResult.status} stdout=${crossBoundResult.stdout}`);
+  check('cross-bound canonical scratch forgets and blacklists the stale canonical memo',
+    crossBoundResult.memos.length === 0 && /mock-conversation/.test(crossBoundResult.blacklist ?? ''),
+    `memos=${JSON.stringify(crossBoundResult.memos)} blacklist=${crossBoundResult.blacklist}`);
+  check('cross-bound canonical scratch closes only scratch',
+    crossBound.closed.includes('scratch1') && !crossBound.closed.includes('tab1'), `closed=${crossBound.closed}`);
+  crossBound.stop();
+
+  const foreignOnly = await mockCdp(source, [], {
+    renderText: () => 'run marker: pg-run-other-repo-42-1111111111-9\nVERDICT: SHIP — foreign.',
+  });
+  const foreignResult = await runSalvage([MARKER, '3'], foreignOnly.port, seedMemo(MARKER, canonicalUrl));
+  check('foreign canonical scratch is rejected as a decisive stale memo', foreignResult.status === 4,
+    `status=${foreignResult.status} stderr=${foreignResult.stderr}`);
+  check('foreign canonical scratch forgets and blacklists the stale memo',
+    foreignResult.memos.length === 0 && /mock-conversation/.test(foreignResult.blacklist ?? ''),
+    `memos=${JSON.stringify(foreignResult.memos)} blacklist=${foreignResult.blacklist}`);
+  foreignOnly.stop();
+}
+
+{ // P1: the one-shot canonical revalidation must be spent on the REMEMBERED conversation (A),
+  // never on whichever marker-bearing owned-incomplete tab the scan happens to reach first (B).
+  // Before this fix, a retry-created duplicate tab at a different URL (B) — still incomplete,
+  // still carrying our marker — would consume the single scratch navigation every cycle and
+  // permanently suppress the remembered-URL pass, so a completed, PAID review already sitting at
+  // A was reported as still generating forever. Evidence must be attributed to the URL actually
+  // rendered (A), not the tab that merely triggered the pass (B).
+  const knownUrlA = 'https://chatgpt.com/c/known-conversation-a';
+  const duplicateTabB = `run marker: ${MARKER}\nduplicate retry tab, still reasoning...`;
+  const terminalReviewA = [
+    `run marker: ${MARKER}`,
+    '[P1] src/known.mjs:1 — finished on the canonical conversation',
+    'P2: none',
+    `VERDICT: FIX-FIRST — recovered from A, not B. (run marker: ${MARKER})`,
+  ].join('\n');
+  const wrongUrlRendered = 'run marker: pg-run-other-9999999999-9\nWRONG URL WAS RENDERED';
+  const terminalCdp = await mockCdp(duplicateTabB, [], {
+    renderText: (url) => (url === knownUrlA ? terminalReviewA : wrongUrlRendered),
+  });
+  const terminalResult = await runSalvage([MARKER, '3'], terminalCdp.port, seedMemo(MARKER, knownUrlA));
+  check('the one revalidation renders the remembered conversation A, not the duplicate tab B',
+    terminalCdp.created.length === 1 && terminalCdp.created[0]?.url === knownUrlA,
+    `created=${JSON.stringify(terminalCdp.created)}`);
+  check('a terminal render of A is emitted and attributed to A', terminalResult.status === 0 &&
+    /^matched-url https:\/\/chatgpt\.com\/c\/known-conversation-a$/m.test(terminalResult.stderr ?? ''),
+    `status=${terminalResult.status} stderr=${terminalResult.stderr?.slice(0, 300)}`);
+  check('the emitted review body is A\'s, not B\'s',
+    terminalResult.stdout.trim() === terminalReviewA.split('\n').slice(1).join('\n'),
+    `stdout=${terminalResult.stdout?.slice(0, 300)}`);
+  check('the duplicate tab B is never navigated, closed, or promoted in A\'s place',
+    !terminalCdp.closed.includes('tab1') &&
+      !terminalCdp.requests.some((request) => request.method === 'Page.navigate'),
+    `closed=${terminalCdp.closed} requests=${JSON.stringify(terminalCdp.requests)}`);
+  terminalCdp.stop();
+
+  const crossBoundAnswerA = [
+    `run marker: ${MARKER}`,
+    '[P1] foreign/source.mjs:1 — another run',
+    'VERDICT: FIX-FIRST — not ours. (run marker: pg-run-other-repo-42-1111111111-9)',
+  ].join('\n');
+  const crossBoundCdp = await mockCdp(duplicateTabB, [], {
+    renderText: (url) => (url === knownUrlA ? crossBoundAnswerA : duplicateTabB),
+  });
+  const crossBoundResult = await runSalvage([MARKER, '3'], crossBoundCdp.port, seedMemo(MARKER, knownUrlA));
+  check('the one revalidation renders A, not B, for the cross-bound case',
+    crossBoundCdp.created.length === 1 && crossBoundCdp.created[0]?.url === knownUrlA,
+    `created=${JSON.stringify(crossBoundCdp.created)}`);
+  check('a cross-bound render of A is rejected and blacklisted as A',
+    crossBoundResult.memos.length === 0 &&
+      (crossBoundResult.blacklist ?? '').includes(`${MARKER}\t${knownUrlA}`),
+    `memos=${JSON.stringify(crossBoundResult.memos)} blacklist=${crossBoundResult.blacklist}`);
+  check('B is not promoted into A\'s place as the new recovery handle',
+    crossBoundResult.memoUrl !== 'https://chatgpt.com/c/mock-conversation' &&
+      !(crossBoundResult.blacklist ?? '').includes('mock-conversation'),
+    `memoUrl=${crossBoundResult.memoUrl} blacklist=${crossBoundResult.blacklist}`);
+  check('the duplicate tab B stays open and unnavigated, and the still-generating exit reflects it',
+    crossBoundResult.status === 3 && !crossBoundCdp.closed.includes('tab1') &&
+      !crossBoundCdp.requests.some((request) => request.method === 'Page.navigate'),
+    `status=${crossBoundResult.status} closed=${crossBoundCdp.closed} requests=${JSON.stringify(crossBoundCdp.requests)}`);
+  check('the cross-bound rejection of A is recorded for --status', crossBoundResult.crossbound > 0,
+    `crossbound=${crossBoundResult.crossbound}`);
+  crossBoundCdp.stop();
+}
+
+{ // P1 (gate #91 r3): --probe must not report the conversation ABSENT just because the one-shot
+  // revalidation was spent on a DIFFERENT remembered URL (A) that comes back cross-bound or
+  // foreign, while the tab actually scanned (B) is demonstrably ours and still generating. Before
+  // this fix, B's owned-incomplete evidence was only ever emitted to probe from the line AFTER
+  // these rejections' `continue` (never reached), so probe fell through to the deadline with no
+  // positive signal this cycle, exited 4 (absent), and the engine's miss counter could ultimately
+  // release a live review for a double-spending retry.
+  const knownUrlA = 'https://chatgpt.com/c/known-conversation-a';
+  const duplicateTabB = `run marker: ${MARKER}\nduplicate retry tab, still reasoning...`;
+
+  const crossBoundAnswerA = [
+    `run marker: ${MARKER}`,
+    '[P1] foreign/source.mjs:1 — another run',
+    'VERDICT: FIX-FIRST — not ours. (run marker: pg-run-other-repo-42-1111111111-9)',
+  ].join('\n');
+  const crossBoundCdp = await mockCdp(duplicateTabB, [], {
+    renderText: (url) => (url === knownUrlA ? crossBoundAnswerA : duplicateTabB),
+  });
+  const crossBoundResult = await runSalvage(['--probe', MARKER, '3'], crossBoundCdp.port, seedMemo(MARKER, knownUrlA));
+  check('probe reports tab B present and generating despite A\'s cross-bound rejection',
+    crossBoundResult.status === 0 && /^probe-state: generating$/m.test(crossBoundResult.stderr || ''),
+    `status=${crossBoundResult.status} stderr=${crossBoundResult.stderr}`);
+  check('probe emits no review body for the cross-bound-A case', crossBoundResult.stdout === '',
+    `stdout=${crossBoundResult.stdout}`);
+  check('the one revalidation still only ever rendered A', crossBoundCdp.created.length === 1 &&
+    crossBoundCdp.created[0]?.url === knownUrlA, `created=${JSON.stringify(crossBoundCdp.created)}`);
+  crossBoundCdp.stop();
+
+  const foreignOnlyA = 'run marker: pg-run-other-repo-42-1111111111-9\nVERDICT: SHIP — foreign.';
+  const foreignCdp = await mockCdp(duplicateTabB, [], {
+    renderText: (url) => (url === knownUrlA ? foreignOnlyA : duplicateTabB),
+  });
+  const foreignResult = await runSalvage(['--probe', MARKER, '3'], foreignCdp.port, seedMemo(MARKER, knownUrlA));
+  check('probe reports tab B present and generating despite A\'s foreign rejection',
+    foreignResult.status === 0 && /^probe-state: generating$/m.test(foreignResult.stderr || ''),
+    `status=${foreignResult.status} stderr=${foreignResult.stderr}`);
+  foreignCdp.stop();
+}
+
+{ // P1 regression guard: with no remembered conversation, knownUrl is null so revalidateUrl
+  // reduces to tab.url — the readable owned-incomplete tab's own URL is revalidated exactly as
+  // before this fix.
+  const ownUrl = 'https://chatgpt.com/c/mock-conversation';
+  const staleTabOnly = `run marker: ${MARKER}\nno memo yet, still reasoning...`;
+  const cdp = await mockCdp(staleTabOnly, [], {
+    renderText: (url) => (url === ownUrl ? staleTabOnly : 'unexpected'),
+  });
+  const r = await runSalvage([MARKER, '3'], cdp.port);   // NO seeded memo
+  check('with no remembered conversation, revalidation still targets the readable tab\'s own URL',
+    cdp.created.length === 1 && cdp.created[0]?.url === ownUrl && r.status === 3,
+    `created=${JSON.stringify(cdp.created)} status=${r.status}`);
+  cdp.stop();
+}
+
+{ // P1: an unresponsive scratch-open endpoint is absence of fresh evidence, not permission to
+  // overrun the caller deadline or mutate a readable source's prior recovery handle.
+  const priorUrl = 'https://chatgpt.com/c/prior-genuine';
+  const source = `run marker: ${MARKER}\nstale readable source`;
+  for (const [label, args, expectedStatus] of [
+    ['normal', [MARKER, '3'], 3],
+    ['probe', ['--probe', MARKER, '3'], 0],
+  ]) {
+    const cdp = await mockCdp(source, [], { hangScratchOpen: true });
+    const r = await runSalvage(args, cdp.port, seedMemo(MARKER, priorUrl), {
+      PRO_GATE_TEST_CHILD_TIMEOUT_MS: '6000',
+    });
+    // Bound relaxed from 4_500: against a 3s deadline and a 6000ms SIGKILL fallback, 4_500 left
+    // only ~1.5s of slack for spawn + timer jitter, and this is the only upper-bound wall-clock
+    // assertion in a file whose other elapsed assertions are lower-bound only. 5_500 still proves
+    // the process beat the SIGKILL fallback with margin to spare.
+    check(`${label} scratch-open timeout returns before its watchdog fallback`,
+      r.status === expectedStatus && r.elapsedMs < 5_500,
+      `status=${r.status} elapsed=${r.elapsedMs}ms stderr=${r.stderr}`);
+    check(`${label} scratch-open timeout leaves source and recovery state unchanged`,
+      r.memoUrl === priorUrl && r.blacklist === null && r.crossbound === 0 && !cdp.closed.includes('tab1'),
+      `memo=${r.memoUrl} blacklist=${r.blacklist} crossbound=${r.crossbound} closed=${cdp.closed}`);
+    cdp.stop();
+  }
+}
+
+{ // P1: an unresponsive scratch LIST poll (headers never arrive at all) is likewise absence of
+  // fresh evidence, not permission to overrun the caller deadline. Regression lock: before this
+  // test existed, opts.hangScratchList was defined in the mock but no test ever set it, so
+  // reverting the /json list-poll's fetchJsonBeforeDeadline binding back to a bare fetch() would
+  // fail nothing.
+  const priorUrl = 'https://chatgpt.com/c/prior-genuine';
+  const source = `run marker: ${MARKER}\nstale readable source`;
+  for (const [label, args, expectedStatus] of [
+    ['normal', [MARKER, '3'], 3],
+    ['probe', ['--probe', MARKER, '3'], 0],
+  ]) {
+    const cdp = await mockCdp(source, [], { hangScratchList: true });
+    const r = await runSalvage(args, cdp.port, seedMemo(MARKER, priorUrl), {
+      PRO_GATE_TEST_CHILD_TIMEOUT_MS: '6000',
+    });
+    check(`${label} scratch-list timeout returns before its watchdog fallback`,
+      r.status === expectedStatus && r.elapsedMs < 5_500,
+      `status=${r.status} elapsed=${r.elapsedMs}ms stderr=${r.stderr}`);
+    check(`${label} scratch-list timeout leaves source and recovery state unchanged`,
+      r.memoUrl === priorUrl && r.blacklist === null && r.crossbound === 0 && !cdp.closed.includes('tab1'),
+      `memo=${r.memoUrl} blacklist=${r.blacklist} crossbound=${r.crossbound} closed=${cdp.closed}`);
+    cdp.stop();
+  }
+}
+
+{ // P1: an unresponsive scratch CLOSE (the fix-A cleanup attempt in freshRenderText's finally
+  // block) must not be allowed to hang the process either, and — the regression lock for fix A —
+  // the close must actually be ATTEMPTED even though the peer never replies. scratchTarget
+  // returning null makes the scratch target vanish from the /json listing (mirroring a
+  // disappeared tab) so freshRenderText reaches its cleanup finally without ever reading decisive
+  // text, keeping this test's second assertion (unchanged recovery state) meaningful the same way
+  // the scratch-open and scratch-list variants above are.
+  const priorUrl = 'https://chatgpt.com/c/prior-genuine';
+  const source = `run marker: ${MARKER}\nstale readable source`;
+  for (const [label, args, expectedStatus] of [
+    ['normal', [MARKER, '3'], 3],
+    ['probe', ['--probe', MARKER, '3'], 0],
+  ]) {
+    const cdp = await mockCdp(source, [], { hangScratchClose: true, scratchTarget: () => null });
+    // This variant is the slowest of the three by construction: the render loop must burn its
+    // 2.5s sample before the target-disappeared return, and only THEN does the cleanup close
+    // spend its own 2s grace against a peer that never replies (~4.5s before spawn overhead).
+    // So it gets a proportionally later kill fallback and ceiling rather than the 6000/5_500 the
+    // open- and list-timeout variants use, where the abort lands at the 3s caller deadline.
+    const r = await runSalvage(args, cdp.port, seedMemo(MARKER, priorUrl), {
+      PRO_GATE_TEST_CHILD_TIMEOUT_MS: '9000',
+    });
+    check(`${label} scratch-close timeout returns before its watchdog fallback`,
+      r.status === expectedStatus && r.elapsedMs < 7_000,
+      `status=${r.status} elapsed=${r.elapsedMs}ms stderr=${r.stderr}`);
+    check(`${label} scratch-close timeout leaves source and recovery state unchanged`,
+      r.memoUrl === priorUrl && r.blacklist === null && r.crossbound === 0 && !cdp.closed.includes('tab1'),
+      `memo=${r.memoUrl} blacklist=${r.blacklist} crossbound=${r.crossbound} closed=${cdp.closed}`);
+    check(`${label} scratch-close cleanup was attempted despite no reply`,
+      cdp.closed.includes('scratch1'),
+      `closed=${cdp.closed}`);
+    cdp.stop();
+  }
 }
 
 { // completed review: marker + Pn block + VERDICT -> exit 0, review on stdout, tab LEFT OPEN
@@ -390,6 +861,19 @@ const MARKER = 'pg-run-test-1234567890-42';
   check('tabless conversation is recovered from the remembered URL', r.status === 0, `status=${r.status} stderr=${r.stderr?.slice(0, 300)}`);
   check('recovered review is printed', /VERDICT: FIX-FIRST/.test(r.stdout ?? ''), `stdout=${r.stdout?.slice(0, 160)}`);
   check('recovery re-rendered the remembered URL',
+    cdp.created.some((t) => t.url === 'https://chatgpt.com/c/remembered'), `created=${JSON.stringify(cdp.created)}`);
+  cdp.stop();
+}
+
+{ // P2: a Chrome that answers PUT /json/new with a non-JSON error must still fall through to the
+  // documented pre-v111 GET fallback in freshRenderText's path, not read as scratch-open-failed.
+  const review = `run marker: ${MARKER}\n[P0] a.ts:1: boom\n  Why: real\nVERDICT: FIX-FIRST: bad.`;
+  const cdp = await mockCdp('__NO_TABS__', [], { renderText: () => review, putNewFails: true });
+  const r = await runSalvage([MARKER, '30'], cdp.port, seedMemo(MARKER, 'https://chatgpt.com/c/remembered'));
+  check('a non-JSON PUT error still reaches the GET fallback and recovers the review', r.status === 0,
+    `status=${r.status} stderr=${r.stderr?.slice(0, 300)}`);
+  check('the GET-recovered review is printed', /VERDICT: FIX-FIRST/.test(r.stdout ?? ''), `stdout=${r.stdout?.slice(0, 160)}`);
+  check('the scratch tab was actually opened (via GET, after PUT failed)',
     cdp.created.some((t) => t.url === 'https://chatgpt.com/c/remembered'), `created=${JSON.stringify(cdp.created)}`);
   cdp.stop();
 }
@@ -680,7 +1164,7 @@ const FOREIGN_ANSWER = (m) => [
   const cdp = await mockCdp(`run marker: ${MARKER}\nstill thinking`);
   const r = await runSalvage(['--probe', MARKER, '10'], cdp.port);
   check('probe exits 0 on match', r.status === 0, `status=${r.status}`);
-  check('probe never closes tabs', cdp.closed.length === 0, `closed=${cdp.closed}`);
+  check('probe never closes the source tab', !cdp.closed.includes('tab1'), `closed=${cdp.closed}`);
   // A conversation still being written occupies the account, so its reservation must keep its
   // slot. The state rides as a LINE, not an exit code: the no-think and pre-retry watchdogs read
   // rc 0 as "demonstrably live", and any other code would fall through them toward a retry
@@ -692,7 +1176,7 @@ const FOREIGN_ANSWER = (m) => [
 
 { // probe: a FINISHED review still probes as present forever (ChatGPT keeps conversations
   // server-side), which is exactly why presence alone must not hold account capacity (#82).
-  const cdp = await mockCdp(`run marker: ${MARKER}\nP0: none\n\nVERDICT: SHIP — fine.`);
+  const cdp = await mockCdp(`run marker: ${MARKER}\nP0: none\n\nVERDICT: SHIP — fine. (run marker: ${MARKER})`);
   const r = await runSalvage(['--probe', MARKER, '10'], cdp.port);
   check('probe still exits 0 when the review is complete', r.status === 0, `status=${r.status}`);
   check('probe reports complete once an owned VERDICT is present',
@@ -884,6 +1368,28 @@ const FOREIGN_ANSWER = (m) => [
   check('rename-only memo recovery keeps its owned scratch renderer open',
     cdp.created.length === 1 && !cdp.closed.includes(cdp.created[0].id),
     `created=${JSON.stringify(cdp.created)} closed=${cdp.closed}`);
+  cdp.stop();
+}
+
+{ // P2: a Chrome that answers PUT /json/new with a non-JSON error must still fall through to the
+  // documented pre-v111 GET fallback in openOrganizerScratch's path too, not read as
+  // memo-open-failed.
+  const title = 'pro-gate review: PR #71 r6c [pro-gate]';
+  const remembered = 'https://chatgpt.com/c/tabless-owned-put-fails';
+  const cdp = await mockCdp('__NO_TABS__', [], {
+    renderText: () => `run marker: ${MARKER}\nserver-side conversation`,
+    putNewFails: true,
+  });
+  const r = await runSalvage(
+    ['--organize', MARKER, '5'],
+    cdp.port,
+    seedOrganizer(MARKER, title, remembered),
+  );
+  check('a non-JSON PUT error still reaches the GET fallback and opens the memo scratch tab',
+    /source=memo rename=renamed/.test(r.stdout), `stdout=${r.stdout}`);
+  check('the memo scratch tab was actually opened (via GET, after PUT failed)',
+    cdp.created.length === 1 && cdp.created[0]?.url === remembered,
+    `created=${JSON.stringify(cdp.created)}`);
   cdp.stop();
 }
 

@@ -25,11 +25,17 @@
 #       Collect a review whose run ended in-progress (exit 9): the Pro slot was spent but the
 #       model was still generating when the salvage budget ran out. No new slot is spent.
 #   oracle-review.sh --status [<pr-number|pr-url|pg-run-marker>] [--json]
-#       Read-only run rediscovery (v0.27): join reservations, round budget, remembered
+#       Expert/read-only diagnostics (v0.27): join reservations, round budget, remembered
 #       conversation URLs, and the ledger, and print each matching run's state plus the exact
-#       next command. For callers that lost their context (compaction, new session): answers
-#       "what runs exist for this change, what do I harvest, how many rounds remain" from
-#       nothing but a PR number. No locks, no browser, no writes; omit the query for all state.
+#       next command. `--json` is the detailed machine contract; omit the query for all state.
+#   oracle-review.sh --recover <pr-number|pr-url|pg-run-marker> [--repo <dir>] [--out <file>] [--timeout <dur>]
+#       Recover exactly one existing review (v0.35). Accepts a decimal PR number, canonical PR
+#       URL, or exact marker. Exact markers win; repository-qualified queries select the unique
+#       newest charged run, while unproved or ambiguous candidates only disambiguate. It returns
+#       a verified artifact or runs marker-only harvest; it never dispatches --pr, creates a new
+#       slot, or spends a new round. Plain states: Review ready; Checking for completed review;
+#       Still working; Browser needs attention. A readable tab can be stale, so the engine safely
+#       revalidates the canonical server conversation without changing the source tab.
 set -uo pipefail
 
 # --- locate + source the shared lib (works from repo and from deployed location) ---
@@ -43,9 +49,81 @@ pg_augment_path
 pg_load_env
 OS="$(pg_os)"; MODE="$(pg_browser_mode)"
 
+# One live run per --out (gate #54 r11): the status sidecar is keyed by $OUT, so two
+# concurrent runs sharing it would overwrite each other's phase/marker and cross-feed their
+# pollers even with distinct result artifacts. Held for the process lifetime; best-effort
+# where flock or the directory is unavailable. gate #91 round3 P1 (:880): extracted to a
+# function — defined here, ahead of both callers — so --recover's own publications (:191-219)
+# can take the IDENTICAL guard before writing $OUT instead of doing it unguarded. A fast-path
+# recovery used to publish straight to --out with no lock at all, racing a live fresh/harvest
+# run (or a second concurrent recovery) that IS holding this guard: two publishers, two
+# "success" reports, one silently overwritten. Logic, fallbacks, and messages are VERBATIM
+# from the original inline block; only the failure signal changed (return 1, not exit) so
+# each caller can map "cannot acquire" onto its own contract — a fresh/harvest run keeps its
+# long-standing exit 2, --recover maps it onto the trouble state its own contract promises.
+pg_out_guard_acquire() {
+  PG_OUT_GUARD_OK=0
+  if pg_have flock; then
+    if { exec {PG_OUT_GUARD_FD}>>"$OUT.lock"; } 2>/dev/null; then
+      if flock -n "$PG_OUT_GUARD_FD" 2>/dev/null; then PG_OUT_GUARD_OK=1; else
+        echo "ERROR: another live run is already using --out $OUT (its status sidecar would be overwritten). Use a distinct --out per run." >&2
+        return 1
+      fi
+    fi
+  fi
+  if [ "$PG_OUT_GUARD_OK" != 1 ]; then
+    # mkdir/PID fallback (gate #54 r12): stock macOS has no flock, and skipping the guard
+    # there reopens the sidecar cross-feed. Dead owners self-heal; a live owner refuses.
+    PG_OUT_GUARD_DIR="$OUT.lock.d"
+    if mkdir "$PG_OUT_GUARD_DIR" 2>/dev/null; then
+      echo "$$" > "$PG_OUT_GUARD_DIR/pid" 2>/dev/null || true
+      PG_OUT_GUARD_OK=1
+    else
+      OG_PID="$(cat "$PG_OUT_GUARD_DIR/pid" 2>/dev/null || true)"
+      case "$OG_PID" in
+        ''|*[!0-9]*) ;;
+        *) if kill -0 "$OG_PID" 2>/dev/null; then
+             echo "ERROR: another live run (pid $OG_PID) is already using --out $OUT. Use a distinct --out per run." >&2
+             return 1
+           fi ;;
+      esac
+      # Atomic TAKEOVER of the stale dir (gate #54 r14): rename it aside first — exactly one
+      # racer's mv succeeds; the loser's retake mkdir then fails against the winner's fresh
+      # dir and it refuses below. Immediate rm+mkdir let both racers "win".
+      if mv "$PG_OUT_GUARD_DIR" "$PG_OUT_GUARD_DIR.reap.$$" 2>/dev/null; then
+        rm -f "$PG_OUT_GUARD_DIR.reap.$$/pid" 2>/dev/null
+        rmdir "$PG_OUT_GUARD_DIR.reap.$$" 2>/dev/null
+        if mkdir "$PG_OUT_GUARD_DIR" 2>/dev/null; then
+          echo "$$" > "$PG_OUT_GUARD_DIR/pid" 2>/dev/null || true
+          [ "$(cat "$PG_OUT_GUARD_DIR/pid" 2>/dev/null)" = "$$" ] && PG_OUT_GUARD_OK=1
+        fi
+      fi
+    fi
+    if [ "$PG_OUT_GUARD_OK" != 1 ]; then
+      # Fail CLOSED: with no ownership established, two runs could share one sidecar.
+      echo "ERROR: cannot establish ownership of --out $OUT (directory unwritable?). Choose an --out in a writable directory." >&2
+      return 1
+    fi
+  fi
+  return 0
+}
+
 PR=""; REPO=""; DIFF_FILE=""; INPUT="both"; OUT=""; TIMEOUT="30m"; EXTRA_GLOB=""; HARVEST_MARKER=""; HARVEST_REQUESTED=0; CONFIRM_FILE=""
-STATUS_REQUESTED=0; STATUS_QUERY=""; AS_JSON=0
+STATUS_REQUESTED=0; STATUS_QUERY=""; AS_JSON=0; RECOVER_REQUESTED=0; RECOVER_QUERY=""
 while [ $# -gt 0 ]; do
+  # gate #91 P2 (:65): every flag below except --status takes a REQUIRED second argument via raw
+  # "$2"/"${2:-}" + "shift 2". With no errexit, a flag left trailing (no operand) hit one of two
+  # silent failures instead of a usage error: "$2" with no fallback tripped `set -u`'s unbound-
+  # variable abort (--pr and friends), while "${2:-}" (--harvest/--recover, added so a bare flag
+  # could be a deliberate no-op) suppressed that abort but left `shift 2` failing on only one
+  # argument remaining — shift is atomic, so it shifts NOTHING, $1 stays pinned on the flag, and
+  # the loop spins forever. One guard here, before any branch consumes its operand, replaces both
+  # symptoms with a clean usage error. --status is excluded: its second argument is deliberately
+  # optional (its own branch below already handles "missing").
+  case "$1" in
+    --pr|--repo|--diff|--input|--out|--timeout|--extra-files|--confirm|--harvest|--recover)
+      [ $# -ge 2 ] || { echo "ERROR: $1 requires a value" >&2; exit 2; };;
+  esac
   case "$1" in
     --pr) PR="$2"; shift 2;;
     --repo) REPO="$2"; shift 2;;
@@ -56,6 +134,7 @@ while [ $# -gt 0 ]; do
     --extra-files) EXTRA_GLOB="$2"; shift 2;;
     --confirm) CONFIRM_FILE="$2"; shift 2;;
     --harvest) HARVEST_REQUESTED=1; HARVEST_MARKER="${2:-}"; shift 2;;
+    --recover) RECOVER_REQUESTED=1; RECOVER_QUERY="${2:-}"; shift 2;;
     # --status takes an OPTIONAL query (a following --flag or nothing means "all state").
     --status) STATUS_REQUESTED=1
       case "${2:-}" in ''|--*) shift 1;; *) STATUS_QUERY="$2"; shift 2;; esac;;
@@ -74,6 +153,278 @@ fi
 if [ -n "$CONFIRM_FILE" ] && [ ! -s "$CONFIRM_FILE" ]; then
   echo "ERROR: --confirm file not found or empty: $CONFIRM_FILE" >&2
   exit 2
+fi
+
+# --- v0.35: --recover — resolve exactly one already-spent marker, never dispatch ---
+# This deliberately precedes status, organizer housekeeping, WORK creation, browser preflight,
+# output locks, status writes, repository/diff assembly, round accounting, and Oracle validation.
+# It is not a friendlier spelling of a fresh review: after selection it either returns the immutable
+# artifact or delegates ONLY to the pre-existing marker-addressed --harvest path.
+if [ "$RECOVER_REQUESTED" = 1 ]; then
+  if [ -z "$RECOVER_QUERY" ] || [ -n "$PR$DIFF_FILE$EXTRA_GLOB$CONFIRM_FILE$HARVEST_MARKER$STATUS_QUERY" ] \
+     || [ "$HARVEST_REQUESTED" = 1 ] || [ "$STATUS_REQUESTED" = 1 ] || [ "$AS_JSON" = 1 ]; then
+    echo "ERROR: --recover <PR|URL|marker> accepts only --repo, --out, and --timeout modifiers" >&2
+    exit 2
+  fi
+
+  recover_disambiguate() { # reason [markers...]
+    local why="$1"; shift
+    echo "Disambiguation required: $why. Specify an exact pg-run-... marker." >&2
+    [ $# -eq 0 ] || printf 'Candidates: %s\n' "$*" >&2
+    exit 2
+  }
+  recover_marker_key() { local m="$1" k; k="${m#pg-run-}"; printf '%s\n' "${k%-*-*}"; }
+  REC_SELECTED=""; REC_SELECTED_OUT=""; REC_QUERY_NUM=""; REC_HOST=""; REC_OWNER=""; REC_REPO_NAME=""
+  case "$RECOVER_QUERY" in
+    pg-run-*)
+      pg_reservation_marker_ok "$RECOVER_QUERY" || { echo "ERROR: invalid recovery marker syntax" >&2; exit 2; }
+      REC_SELECTED="$RECOVER_QUERY";;
+    http*://*/pull/*)
+      # pg_repo_identity_from_url's own regex already accepts one trailing slash (it is the
+      # canonical spelling GitHub itself sometimes renders), but the number extraction below
+      # takes everything after the FINAL slash — a trailing slash left that empty and forced a
+      # spurious disambiguation even though the URL was otherwise canonical. Normalize once.
+      REC_URL_NORM="${RECOVER_QUERY%/}"
+      REC_QUERY_NUM="${REC_URL_NORM##*/}"; REC_QUERY_NUM="${REC_QUERY_NUM%%[!0-9]*}"
+      REC_IDENT="$(pg_repo_identity_from_url "$REC_URL_NORM" 2>/dev/null || true)"
+      { [ -n "$REC_QUERY_NUM" ] && [ -n "$REC_IDENT" ]; } \
+        || recover_disambiguate "the PR URL is not a canonical host/owner/repo pull URL"
+      IFS=$'\t' read -r REC_HOST REC_OWNER REC_REPO_NAME <<< "$REC_IDENT";;
+    *[!0-9]*) echo "ERROR: --recover takes a PR number, a PR URL, or a pg-run-... marker" >&2; exit 2;;
+    *)
+      REC_QUERY_NUM="$RECOVER_QUERY"
+      # A bare number needs a proved current repository. Never fall back to the checkout basename:
+      # it is neither canonical nor unique and reopens the historical lossy-slug cross-bind.
+      REC_REPO_DIR="${REPO:-$(pwd)}"
+      REC_REMOTE="$(git -C "$REC_REPO_DIR" remote get-url origin 2>/dev/null || true)"
+      REC_IDENT="$(pg_repo_identity_from_url "$REC_REMOTE" 2>/dev/null || true)"
+      [ -n "$REC_IDENT" ] || recover_disambiguate "bare PR #$REC_QUERY_NUM has no canonical repository proof"
+      IFS=$'\t' read -r REC_HOST REC_OWNER REC_REPO_NAME <<< "$REC_IDENT";;
+  esac
+
+  if [ -z "$REC_SELECTED" ]; then
+    REC_SEEN=""; REC_NEW_COUNT=0; REC_LEGACY=""; REC_CONFLICT=""; REC_BEST_EPOCH=""; REC_BEST_MARKER=""; REC_BEST_OUT=""; REC_TIED=0
+    # The run-meta scan is the canonical candidate source. It retains exact identity and the
+    # pg_round_record charge after a completed artifact retires its reservation.
+    while IFS=$'\t' read -r m h o r key pr mout spend; do
+      [ "$pr" = "$REC_QUERY_NUM" ] && [ "$h" = "$REC_HOST" ] && [ "$o" = "$REC_OWNER" ] && [ "$r" = "$REC_REPO_NAME" ] || continue
+      REC_SEEN="$REC_SEEN $m"; REC_NEW_COUNT=$(( REC_NEW_COUNT + 1 ))
+      r_spend="$(pg_reservation_read_spend "$m" 2>/dev/null || true)"
+      case "$r_spend" in ''|*[!0-9]*) ;; *) [ "$r_spend" = "$spend" ] || REC_CONFLICT="$REC_CONFLICT $m";; esac
+      case "$spend" in ''|*[!0-9]*) REC_CONFLICT="$REC_CONFLICT $m"; continue;; esac
+      if [ -z "$REC_BEST_EPOCH" ] || [ "$spend" -gt "$REC_BEST_EPOCH" ]; then
+        REC_BEST_EPOCH="$spend"; REC_BEST_MARKER="$m"; REC_BEST_OUT="$mout"; REC_TIED=0
+      elif [ "$spend" = "$REC_BEST_EPOCH" ]; then
+        REC_TIED=1
+      fi
+    done < <(pg_run_meta_scan)
+
+    # gate #91 round3 P1 (:165): the charge site's run-meta write is best-effort — its failure
+    # only WARNs, because a failed sidecar write must never block a real review from running —
+    # so a NEWER run can be live right now with no run-meta row at all, while an OLDER completed
+    # sidecar for this same change still exists above. Left unchecked, the scan above would
+    # silently return that older, WRONG artifact while the real answer is still generating.
+    # active/<key> is written unconditionally at charge time (pg_active_write, before the
+    # metadata write), so cross-check it here using the IDENTICAL liveness rule --status already
+    # applies to active records (pid alive, then a process-identity token match when the record
+    # carries one) rather than inventing a second rule that could disagree with --status's own
+    # verdict. active/ is keyed by the lossy ROUND_KEY slug (owner-repo-PR#, no host) — a slug
+    # COLLISION here can only ever cause an OVER-refusal (ask for an exact marker instead of
+    # guessing), never a wrong review, which is the correct direction to fail.
+    REC_ROUND_KEY="$(printf '%s-%s-%s' "$REC_OWNER" "$REC_REPO_NAME" "$REC_QUERY_NUM" | tr -c 'A-Za-z0-9.\n-' '-')"
+    REC_ACTIVE_F="$PRO_GATE_HOME/active/$REC_ROUND_KEY"
+    if [ -f "$REC_ACTIVE_F" ]; then
+      IFS=$'\t' read -r REC_A_MARKER REC_A_OUT REC_A_PID REC_A_EPOCH REC_A_MODE REC_A_TOKEN < "$REC_ACTIVE_F" 2>/dev/null || true
+      REC_A_ALIVE=0
+      case "$REC_A_PID" in ''|*[!0-9]*) ;; *) kill -0 "$REC_A_PID" 2>/dev/null && REC_A_ALIVE=1;; esac
+      if [ "$REC_A_ALIVE" = 1 ] && [ -n "$REC_A_TOKEN" ]; then
+        [ "$(pg_pid_token "$REC_A_PID" 2>/dev/null || true)" = "$REC_A_TOKEN" ] || REC_A_ALIVE=0
+      fi
+      if [ "$REC_A_ALIVE" = 1 ] && [ -n "$REC_A_MARKER" ]; then
+        case " $REC_SEEN " in
+          *" $REC_A_MARKER "*) ;;  # already a run-meta candidate — no new information, no refusal
+          *) recover_disambiguate "a newer run for this change is LIVE right now and has not yet recorded its metadata ($REC_A_MARKER)" "$REC_A_MARKER";;
+        esac
+      fi
+    fi
+
+    # Legacy markers remain visible candidates so an old lossy round key cannot be silently
+    # bypassed. They never provide canonical identity proof; a mixed set therefore disambiguates.
+    for f in "$PRO_GATE_HOME/in-progress"/pg-run-* "$(pg_completed_dir)"/pg-run-* "$PRO_GATE_HOME/pending"/pg-run-*; do
+      [ -f "$f" ] || continue
+      m="$(basename "$f")"; pg_reservation_marker_ok "$m" || continue
+      case " $REC_SEEN " in *" $m "*) continue;; esac
+      key="$(recover_marker_key "$m")"
+      case "$key" in *"-$REC_QUERY_NUM") REC_LEGACY="$REC_LEGACY $m";; esac
+    done
+    [ -z "$REC_LEGACY" ] || recover_disambiguate "legacy candidate(s) lack canonical repository proof" "$REC_LEGACY"
+    [ -z "$REC_CONFLICT" ] || recover_disambiguate "candidate charge evidence conflicts or is incomplete" "$REC_CONFLICT"
+    [ "$REC_NEW_COUNT" -gt 0 ] || recover_disambiguate "no canonically identified run matches this PR"
+    [ "$REC_TIED" = 0 ] || recover_disambiguate "newest charged-spend epoch is tied"
+    REC_SELECTED="$REC_BEST_MARKER"; REC_SELECTED_OUT="$REC_BEST_OUT"
+  fi
+
+  # Artifact-first is intentionally smaller than --harvest's historical fast path: no work dir,
+  # preflight, status/ledger/active records, reservation retirement, organizer, or lock. stdout is
+  # exclusively review bytes; the novice state remains a single plain stderr line.
+  #
+  # gate #91 P1 (:169): pg_persist_result's own durability ladder falls through to pending/<marker>
+  # BYTES whenever the completed store is unwritable (and retires the reservation there, same as a
+  # completed write) — pending/ is verified review content, not a lesser record. Checking only
+  # pg_completed_dir() meant a review durable ONLY under pending/ was invisible here: recovery fell
+  # through to a fresh harvest that could report failure after the tab was gone, even though the
+  # only bytes that ever needed collecting were already sitting on disk. Pending is checked as a
+  # fallback (completed still wins when both somehow exist) and is READ-ONLY here — no promotion
+  # into completed/, no removal: --recover stays side-effect free, exactly like the completed path.
+  REC_ART="$(pg_completed_dir)/$REC_SELECTED"
+  REC_PENDING_ART="$PRO_GATE_HOME/pending/$REC_SELECTED"
+  REC_SRC=""
+  if [ -s "$REC_ART" ] && pg_is_review "$REC_ART"; then
+    REC_SRC="$REC_ART"
+  elif [ -s "$REC_PENDING_ART" ] && pg_is_review "$REC_PENDING_ART"; then
+    REC_SRC="$REC_PENDING_ART"
+  fi
+  if [ -n "$REC_SRC" ]; then
+    if [ -n "$OUT" ]; then
+      # pg_completed_lookup only knows the completed store's own path, so the pending source needs
+      # the identical copy-then-rename discipline inline: never pre-delete an existing --out (a
+      # copy/rename failure must leave it intact), and skip the copy entirely when --out already
+      # IS the source (pg_completed_lookup's own no-op case).
+      if [ "$REC_SRC" = "$OUT" ]; then
+        :
+      else
+        # gate #91 round3 P1 (:208): this fast path used to write $OUT with no lock at all —
+        # a second recovery, or a fresh/harvest run, racing it could each replace the same file
+        # and each report success while the other's bytes vanished. Take the SAME process-lifetime
+        # guard the engine's own dispatch takes (pg_out_guard_acquire, defined near the top of the
+        # file) before the first byte moves; a recovery that loses the race reports the trouble
+        # state instead of a "successful" publish nobody can trust.
+        # 2>/dev/null: pg_out_guard_acquire narrates its own "ERROR: another live run..." to
+        # stderr, which is right for the engine's dispatch but breaks --recover's promise of
+        # EXACTLY ONE plain state line. Every other failure site in this branch calls a silent
+        # helper; this one must be silenced explicitly or contention prints two lines.
+        pg_out_guard_acquire 2>/dev/null || { echo "Browser needs attention" >&2; exit 6; }
+        if [ "$REC_SRC" = "$REC_ART" ]; then
+          pg_completed_lookup "$REC_SELECTED" "$OUT" || { echo "Browser needs attention" >&2; exit 6; }
+        else
+          cp "$REC_SRC" "$OUT.already.$$" 2>/dev/null && mv -f "$OUT.already.$$" "$OUT" 2>/dev/null
+          REC_PUB_RC=$?
+          rm -f "$OUT.already.$$" 2>/dev/null
+          [ "$REC_PUB_RC" = 0 ] || { echo "Browser needs attention" >&2; exit 6; }
+        fi
+      fi
+    fi
+    echo "Review ready" >&2
+    cat "$REC_SRC"
+    exit 0
+  fi
+
+  # Exact-marker input does not pass through the candidate scan, so recover its publication path
+  # from marker-addressed metadata or the live reservation before choosing a safe local default.
+  if [ -z "$REC_SELECTED_OUT" ]; then
+    REC_META="$(pg_run_meta_read "$REC_SELECTED" 2>/dev/null || true)"
+    if [ -n "$REC_META" ]; then
+      IFS=$'\t' read -r _rh _ro _rr _rk _rp REC_SELECTED_OUT _rs <<< "$REC_META"
+    elif [ -f "$(pg_reservation_dir)/$REC_SELECTED" ]; then
+      REC_SELECTED_OUT="$(awk -F'\t' 'NR==1{print $2}' "$(pg_reservation_dir)/$REC_SELECTED" 2>/dev/null)"
+    fi
+  fi
+  if [ -z "$OUT" ]; then
+    # gate #91 P1 (:192): a fresh run persists $OUT verbatim (see the charge-time write below), and
+    # a caller's relative --out is resolved against $REPO there, not against wherever --recover
+    # happens to run from (it never `cd`s anywhere). Reusing a recorded relative path here would
+    # therefore publish into whatever sits under THIS invocation's cwd — an unrelated file, not the
+    # run's real output. Only trust a recorded OUT that is unambiguous on its own: absolute, with a
+    # parent directory that still exists and still accepts writes (the default --out lives inside a
+    # per-run mktemp dir, which the engine deletes on exit — a dead parent must fall back exactly
+    # like "no metadata at all" instead of failing later at the publish step).
+    REC_OUT_PARENT=""
+    case "$REC_SELECTED_OUT" in
+      /*) REC_OUT_PARENT="$(dirname "$REC_SELECTED_OUT")";;
+    esac
+    if [ -n "$REC_SELECTED_OUT" ] && [ -n "$REC_OUT_PARENT" ] \
+       && [ -d "$REC_OUT_PARENT" ] && [ -w "$REC_OUT_PARENT" ]; then
+      OUT="$REC_SELECTED_OUT"
+    else
+      mkdir -p "$PRO_GATE_HOME/recovered" 2>/dev/null \
+        || { echo "Browser needs attention" >&2; exit 3; }
+      OUT="$PRO_GATE_HOME/recovered/$REC_SELECTED.md"
+    fi
+  fi
+  # gate #91 P2 (:199): --harvest is an operational tool, not the novice contract this mode
+  # promises — its stdout/stderr carry CDP probe noise, marker echoes, and (on success) a leading
+  # "RESULT_FILE=" line meant for scripted callers. Left to inherit the parent's streams, all of
+  # that leaked in front of (or instead of) the single plain state line documented above. Capture
+  # both streams and reconstruct the clean contract from what the child itself verified and printed
+  # (gate #91 P1 (:271): never from re-reading $OUT — see below) instead of relaying whatever the
+  # child happened to print. The raw streams stay reachable behind PRO_GATE_RECOVER_VERBOSE=1 for
+  # debugging a stuck recovery.
+  if [ "${PRO_GATE_RECOVER_VERBOSE:-0}" = 1 ]; then
+    bash "$0" --harvest "$REC_SELECTED" --out "$OUT" --timeout "$TIMEOUT"
+    REC_HARVEST_RC=$?
+    case "$REC_HARVEST_RC" in
+      0) echo "Review ready" >&2;;
+      8|7) echo "Checking for completed review" >&2;;
+      9) echo "Still working" >&2;;
+      *) echo "Browser needs attention" >&2;;
+    esac
+    exit "$REC_HARVEST_RC"
+  fi
+  REC_HV_OUT="$(mktemp "${TMPDIR:-/tmp}/pg-recover-hv.XXXXXX" 2>/dev/null)" \
+    || { echo "Browser needs attention" >&2; exit 3; }
+  REC_HV_ERR="$(mktemp "${TMPDIR:-/tmp}/pg-recover-hv.XXXXXX" 2>/dev/null)" \
+    || { rm -f "$REC_HV_OUT"; echo "Browser needs attention" >&2; exit 3; }
+  REC_HV_BODY=""
+  bash "$0" --harvest "$REC_SELECTED" --out "$OUT" --timeout "$TIMEOUT" \
+    >"$REC_HV_OUT" 2>"$REC_HV_ERR"
+  REC_HARVEST_RC=$?
+  case "$REC_HARVEST_RC" in
+    0)
+      # gate #91 P1 (:271): the child publishes $OUT under its own process-lifetime output lock
+      # and then EXITS, releasing it. In the window between that exit and this read, another run
+      # reusing the same --out path can replace or truncate the file — trusting $OUT here can
+      # print a DIFFERENT run's review while this still announces "Review ready". The child's
+      # captured stdout (this process's own private temp file) is immune to that race: prefer the
+      # "RESULT_FILE=<path>" locator it prints, naming the write-once, marker-addressed completed
+      # artifact — re-reading that path is safe precisely because nothing can overwrite a
+      # write-once artifact. Validate it before trusting it (a stale or foreign path is not proof
+      # of anything). Fall back to the review bytes the child printed directly (same captured,
+      # race-free stdout, minus the locator line) when no locator is present or it doesn't check
+      # out. gate #91 round3 P1 (:304): there is deliberately NO third rung that re-reads $OUT.
+      # An earlier version fell back to $OUT once the locator AND the captured body both failed
+      # to validate — but by then the child has already released its output guard, and $OUT is
+      # exactly the mutable, unlocked path a concurrent run (or a second recovery) can have
+      # already overwritten with a DIFFERENT, unrelated review. Reading it here would announce
+      # "Review ready" and hand back a foreign review that happens to pass pg_is_review. Failing
+      # closed on the two race-free sources is correct even though it costs recoverability in the
+      # rare case both legitimately fail.
+      REC_BODY=""
+      REC_LOCATOR="$(sed -n 's/^RESULT_FILE=//p' "$REC_HV_OUT" 2>/dev/null | head -1)"
+      if [ -n "$REC_LOCATOR" ] && pg_is_review "$REC_LOCATOR" 2>/dev/null; then
+        REC_BODY="$REC_LOCATOR"
+      else
+        REC_HV_BODY="$(mktemp "${TMPDIR:-/tmp}/pg-recover-hvbody.XXXXXX" 2>/dev/null)"
+        if [ -n "$REC_HV_BODY" ]; then
+          grep -v '^RESULT_FILE=' "$REC_HV_OUT" > "$REC_HV_BODY" 2>/dev/null
+          pg_is_review "$REC_HV_BODY" 2>/dev/null && REC_BODY="$REC_HV_BODY"
+        fi
+      fi
+      # Neither race-free source yielded a valid review: report trouble, not success — a
+      # published file we cannot actually verify and read back race-free is a worse lie than
+      # "Browser needs attention", and $OUT itself is not trustworthy evidence (see above).
+      if [ -z "$REC_BODY" ] || ! cat "$REC_BODY" 2>/dev/null; then
+        rm -f "$REC_HV_OUT" "$REC_HV_ERR" "$REC_HV_BODY" 2>/dev/null
+        echo "Browser needs attention" >&2
+        exit 6
+      fi
+      echo "Review ready" >&2
+      ;;
+    8|7) echo "Checking for completed review" >&2;;
+    9) echo "Still working" >&2;;
+    *) echo "Browser needs attention" >&2;;
+  esac
+  rm -f "$REC_HV_OUT" "$REC_HV_ERR" "$REC_HV_BODY" 2>/dev/null
+  exit "$REC_HARVEST_RC"
 fi
 
 # --- v0.27: --status — read-only run rediscovery (issue #47) ---
@@ -299,6 +650,11 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
     [ -e "$f" ] || continue
     k="${f#"${ST_LOCKFILE}".pr-}"; k="${k%.d}"; st_add_key "$k"
   done
+  # Same marker-addressed durable source used by --recover. This only contributes a key to
+  # status's existing state join; it neither parses rendered status output nor changes its schema.
+  while IFS=$'\t' read -r _sm _sh _so _sr _sk _sp _sout _sspend; do
+    st_add_key "$_sk"
+  done < <(pg_run_meta_scan)
   [ -n "$Q_SLUG" ] && [ -n "$Q_NUM" ] && st_add_key "${Q_SLUG}-${Q_NUM}"
   for k in $ST_KEYS; do
     if [ -n "$Q_MARKER" ]; then
@@ -551,6 +907,22 @@ esac
 MODEL="${ORACLE_MODEL:-gpt-5.6}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/pro-review.XXXXXX")"
 [ -n "$OUT" ] || OUT="$WORK/findings.md"
+# gate #91 P1 (:192): a caller-supplied relative --out is resolved against whatever directory
+# this process happened to start in (below this line and before the later `cd "$REPO"`), which
+# is invisible once the string is written verbatim into run-meta at charge time. --recover runs
+# from an unrelated cwd and never `cd`s anywhere, so replaying a recorded relative path there
+# would publish into a different, unrelated file instead of this run's real output. Resolve to
+# an absolute path HERE, once, before anything else reads or locks $OUT, so every later use
+# (the guard lock, the status sidecar, the charge-time run-meta write) already sees the
+# unambiguous form. Only the parent directory needs to exist — $OUT itself is written later.
+case "$OUT" in
+  /*) ;;
+  *)
+    OUT_PARENT_ABS="$(cd "$(dirname "$OUT")" 2>/dev/null && pwd)" \
+      || { echo "ERROR: --out parent directory not found: $(dirname "$OUT")" >&2; exit 2; }
+    OUT="$OUT_PARENT_ABS/$(basename "$OUT")"
+    ;;
+esac
 # #50: scratch dirs used to leak on every exit path (5,900+ observed on one box). The trap
 # persists this run's diagnostics log, then removes WORK — EXCEPT when a failure path
 # deliberately retained recovery bytes in it (PG_KEEP_FINAL/PG_PRESERVE_STATE: the retained
@@ -610,51 +982,11 @@ fi
 # One live run per --out (gate #54 r11): the status sidecar is keyed by $OUT, so two
 # concurrent runs sharing it would overwrite each other's phase/marker and cross-feed their
 # pollers even with distinct result artifacts. Held for the process lifetime; best-effort
-# where flock or the directory is unavailable.
+# where flock or the directory is unavailable. Logic lives in pg_out_guard_acquire (defined
+# near the top of the file, ahead of --recover) so --recover's own publications take the
+# IDENTICAL guard — see that function's comment for why a second, unguarded publisher is a bug.
 if [ "$STATUS_REQUESTED" != 1 ]; then
-  PG_OUT_GUARD_OK=0
-  if pg_have flock; then
-    if { exec {PG_OUT_GUARD_FD}>>"$OUT.lock"; } 2>/dev/null; then
-      if flock -n "$PG_OUT_GUARD_FD" 2>/dev/null; then PG_OUT_GUARD_OK=1; else
-        echo "ERROR: another live run is already using --out $OUT (its status sidecar would be overwritten). Use a distinct --out per run." >&2
-        exit 2
-      fi
-    fi
-  fi
-  if [ "$PG_OUT_GUARD_OK" != 1 ]; then
-    # mkdir/PID fallback (gate #54 r12): stock macOS has no flock, and skipping the guard
-    # there reopens the sidecar cross-feed. Dead owners self-heal; a live owner refuses.
-    PG_OUT_GUARD_DIR="$OUT.lock.d"
-    if mkdir "$PG_OUT_GUARD_DIR" 2>/dev/null; then
-      echo "$$" > "$PG_OUT_GUARD_DIR/pid" 2>/dev/null || true
-      PG_OUT_GUARD_OK=1
-    else
-      OG_PID="$(cat "$PG_OUT_GUARD_DIR/pid" 2>/dev/null || true)"
-      case "$OG_PID" in
-        ''|*[!0-9]*) ;;
-        *) if kill -0 "$OG_PID" 2>/dev/null; then
-             echo "ERROR: another live run (pid $OG_PID) is already using --out $OUT. Use a distinct --out per run." >&2
-             exit 2
-           fi ;;
-      esac
-      # Atomic TAKEOVER of the stale dir (gate #54 r14): rename it aside first — exactly one
-      # racer's mv succeeds; the loser's retake mkdir then fails against the winner's fresh
-      # dir and it refuses below. Immediate rm+mkdir let both racers "win".
-      if mv "$PG_OUT_GUARD_DIR" "$PG_OUT_GUARD_DIR.reap.$$" 2>/dev/null; then
-        rm -f "$PG_OUT_GUARD_DIR.reap.$$/pid" 2>/dev/null
-        rmdir "$PG_OUT_GUARD_DIR.reap.$$" 2>/dev/null
-        if mkdir "$PG_OUT_GUARD_DIR" 2>/dev/null; then
-          echo "$$" > "$PG_OUT_GUARD_DIR/pid" 2>/dev/null || true
-          [ "$(cat "$PG_OUT_GUARD_DIR/pid" 2>/dev/null)" = "$$" ] && PG_OUT_GUARD_OK=1
-        fi
-      fi
-    fi
-    if [ "$PG_OUT_GUARD_OK" != 1 ]; then
-      # Fail CLOSED: with no ownership established, two runs could share one sidecar.
-      echo "ERROR: cannot establish ownership of --out $OUT (directory unwritable?). Choose an --out in a writable directory." >&2
-      exit 2
-    fi
-  fi
+  pg_out_guard_acquire || exit 2
 fi
 # Fresh runs need oracle; --harvest only needs node+CDP and checks that prerequisite inside
 # its branch below (moving this gate matters when oracle is temporarily unavailable but a spent
@@ -1562,6 +1894,11 @@ fi
 [ -n "$REPO_SLUG" ] || REPO_SLUG="$(basename "$REPO")"
 PR_KEY=""
 [ -n "$PR_NUM" ] && PR_KEY="$(printf '%s-%s' "$REPO_SLUG" "$PR_NUM" | tr -c 'A-Za-z0-9.\n-' '-')"
+# Keep a non-lossy identity alongside the historical safe filename key. It is intentionally
+# absent when no canonical remote/PR URL can prove it; recovery must then ask for a marker.
+PG_META_IDENT="$(pg_repo_identity_from_url "${PR_URL:-}" 2>/dev/null || pg_repo_identity_from_url "$(git -C "$REPO" remote get-url origin 2>/dev/null || true)" 2>/dev/null || true)"
+PG_META_HOST=""; PG_META_OWNER=""; PG_META_REPO=""
+[ -z "$PG_META_IDENT" ] || IFS=$'\t' read -r PG_META_HOST PG_META_OWNER PG_META_REPO <<< "$PG_META_IDENT"
 
 # ROUND_KEY (v0.22): identity for the review round budget. PR runs use PR_KEY. --diff runs loop
 # just as hard (ledger: 11 diff re-gates of one worktree in a day) but have no PR number, so
@@ -1703,6 +2040,13 @@ fi
 # gives --diff runs a real per-change identity instead of the shared literal "diff", so their
 # exit-9 reservations can redirect same-branch re-runs to harvest like PR runs always could.
 RUN_MARKER="pg-run-${ROUND_KEY:-diff}-$(date +%s)-$$"
+# The marker is minted before queue/slot acquisition, but recovery metadata is published only
+# together with the authoritative charge (the adjacent pg_round_record + charged
+# pg_run_meta_write below, near pg_round_record's call site). An attempt that never charges a
+# round (round-capped, per-change-lock-timeout, deferred, oversized, ...) must never mint a
+# run-meta record: an uncharged attempt has nothing to recover, and a stray sidecar for it would
+# poison PR/URL recovery with a candidate that no reservation or ledger row backs. This sidecar
+# is never removed with a reservation or completed artifact.
 # v0.28 (gate #54 r8): oracle/reattach/salvage capture into a PROCESS-PRIVATE file from the
 # outset; the caller's $OUT is publication-only, written once after acceptance. Two runs whose
 # callers share one --out (same bare PR number in different repos, retries, orchestrator
@@ -2317,7 +2661,18 @@ while :; do
   # PG_ROUND_SPEND_EPOCH (set by pg_round_record) is this run's charge time — the stamp every
   # trajectory row for this round must carry (#66 gate r3 P1). Keep it for the completion path
   # and for the reservation an exit-9 hands to a later harvest process.
-  [ "$attempt" -eq 0 ] && { pg_round_record "$ROUND_KEY"; RUN_SPEND_EPOCH="$PG_ROUND_SPEND_EPOCH"; pg_active_write; }
+  [ "$attempt" -eq 0 ] && {
+    pg_round_record "$ROUND_KEY"; RUN_SPEND_EPOCH="$PG_ROUND_SPEND_EPOCH"
+    # pg_round_record is the sole authority for charged-spend ordering. Preserve that epoch in
+    # run-meta before any later exit-9 reservation can retire, so recovery never reorders queued
+    # rounds by their earlier marker-mint time.
+    if [ -n "${RUN_SPEND_EPOCH:-}" ] && [ -n "${PG_META_HOST:-}${PG_META_OWNER:-}${PG_META_REPO:-}" ]; then
+      pg_run_meta_write "$RUN_MARKER" "$PG_META_HOST" "$PG_META_OWNER" "$PG_META_REPO" \
+        "$ROUND_KEY" "$PR_NUM" "$OUT" "$RUN_SPEND_EPOCH" 2>/dev/null \
+        || echo "[oracle-review] WARNING: could not persist recovery charge metadata for $RUN_MARKER" >&2
+    fi
+    pg_active_write
+  }
 
   # A non-blocking heads-up when memory is tight but not blocking (the gate is deliberately
   # conservative, so a swap-heavy box with moderate free RAM still runs). Warns low-memory users
@@ -2395,6 +2750,7 @@ while :; do
     # few challenge hits inside the window cannot exit-12-block a change that spent nothing
     # (dogfood gate round-2 P1). Unknown-fate paths (throttle, watchdogs) never refund.
     pg_round_unrecord "$ROUND_KEY"
+    pg_run_meta_remove "$RUN_MARKER"
     pg_status cloudflare "anti-bot challenge; cooldown started"
     cdf="${PRO_GATE_COOLDOWN_FILE:-$PRO_GATE_HOME/throttle.cooldown}"
     { printf '%s cloudflare-challenge (pr %s)\n' "$(date +%Y-%m-%dT%H:%M:%S%z)" "${PR_NUM:-diff}" > "$cdf"; } 2>/dev/null || true
@@ -2725,6 +3081,7 @@ else
      && pg_attempt_provably_unsubmitted "${SALVAGE_RC:-0}"; then
     echo "[oracle-review] no conversation carried this run's marker and Oracle never reached its browser lifecycle (browser scanned clean, no URL memoized, browser stable): refunding this round; zero Pro quota was spent." >&2
     pg_round_unrecord "$ROUND_KEY"
+    pg_run_meta_remove "$RUN_MARKER"
     FAIL_DETAIL="submission never landed (send/upload failure before the prompt reached ChatGPT); round refunded, safe to retry"
   fi
   # Attribute the failure when the review browser restarted mid-run — almost always memory pressure

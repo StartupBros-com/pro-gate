@@ -515,22 +515,73 @@ function blacklist(url) {
   } catch {}
 }
 
-async function freshRenderText(url, port, outerDeadline) {
+// A fresh render runs inside a watchdog/probe deadline. Native fetch has no deadline of its
+// own, so every scratch CDP request carries the caller's remaining budget for the part that can
+// genuinely hang forever: waiting for headers from a peer that never answers at all (the
+// hangScratchOpen/hangScratchList case). Body consumption is a TWO-STAGE bound instead of
+// sharing that same signal to its end: once headers land, the response — and any CDP target it
+// names — is real, already-created server-side state, so a deadline landing mid-JSON-parse must
+// not lose the only reference to it. Headers-received swaps the caller's (possibly near-zero)
+// remaining budget for a small independent grace window to let `consume` finish.
+const CONSUME_GRACE_MS = 2_000;
+async function fetchBeforeDeadline(url, options, requestDeadline, consume = null) {
+  const remaining = requestDeadline - Date.now();
+  if (remaining <= 0) throw new Error('caller-deadline-expired');
+  const controller = new AbortController();
+  let timeout = setTimeout(() => controller.abort(), remaining);
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    if (!consume) return response;
+    // Headers arrived: replace the caller's-deadline timer with the fixed grace window so a
+    // slow-but-arriving body still completes and callers can capture the target it names.
+    clearTimeout(timeout);
+    timeout = setTimeout(() => controller.abort(), CONSUME_GRACE_MS);
+    return await consume(response);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchJsonBeforeDeadline(url, options, requestDeadline) {
+  return await fetchBeforeDeadline(url, options, requestDeadline, async (response) => (
+    // Parse only a successful body. A pre-v111 Chrome answering PUT /json/new (or any other
+    // non-2xx CDP response) with a plain-text or empty error body used to get parsed
+    // unconditionally here, so response.json() threw before the caller ever got to inspect
+    // response.ok — turning the documented PUT-to-GET fallback into an immediate
+    // scratch-open-failed/memo-open-failed instead. Callers branch on response.ok themselves;
+    // handing them value: null on failure keeps that branch reachable without a parse throw.
+    response.ok ? { response, value: await response.json() } : { response, value: null }
+  ));
+}
+
+async function freshRenderText(url, port, outerDeadline, waitForDecisiveEvidence = false) {
   let target = null;
   try {
-    let res = await fetch(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(url)}`, { method: 'PUT' });
-    if (!res.ok) res = await fetch(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(url)}`); // pre-v111 Chrome used GET
-    if (!res.ok) return { text: null };
-    target = await res.json();
+    const openUrl = `http://127.0.0.1:${port}/json/new?${encodeURIComponent(url)}`;
+    let opened = await fetchJsonBeforeDeadline(openUrl, { method: 'PUT' }, outerDeadline);
+    if (!opened.response.ok) opened = await fetchJsonBeforeDeadline(openUrl, {}, outerDeadline); // pre-v111 Chrome used GET
+    if (!opened.response.ok) return { text: null, reason: 'scratch-open-failed' };
+    target = opened.value;
     // never grant more than the caller's remaining budget (a 30s probe must
     // not stall watchdog/retry decisions by overrunning its own window)
     const renderDeadline = Math.min(Date.now() + 25_000, outerDeadline);
     let text = null;
+    let evidence = null;
     while (Date.now() + 2_500 < renderDeadline) {
       await sleep(2_500);
-      const tabs = await (await fetch(`http://127.0.0.1:${port}/json`)).json();
+      let tabs;
+      try {
+        ({ value: tabs } = await fetchJsonBeforeDeadline(`http://127.0.0.1:${port}/json`, {}, renderDeadline));
+      } catch { return { text: null, reason: 'cdp-list-failed' }; }
+      // A non-2xx /json listing now carries value: null (see fetchJsonBeforeDeadline) instead of
+      // throwing — this is CDP-list failure just like the caught exception above, not a tab that
+      // legitimately vanished, so it must not fall through to tabs.find() on null.
+      if (!tabs) return { text: null, reason: 'cdp-list-failed' };
       const live = tabs.find((t) => t.id === target.id);
-      if (!live) break;
+      if (!live) return { text: null, reason: 'target-disappeared' };
+      // A scratch target may redirect, be reused, or be replaced underneath us. Its DOM is
+      // evidence only for the canonical URL requested above, never merely for a matching target id.
+      if (live.url !== url) return { text: null, reason: 'target-url-drift' };
       const sample = await tabText(live);
       if (!sample) continue;
       text = sample;
@@ -543,18 +594,34 @@ async function freshRenderText(url, port, outerDeadline) {
       // reliably passed the gate carrying none of the content we came for, the URL failed the
       // marker test, and one of just TWO per-URL attempts was burnt on a page that was merely
       // still loading. Three such invocations in a row is exactly the "conversation gone" storm.
-      if (sample.includes(marker)) return { text };          // ours — done
-      if (FOREIGN_MARKER_RE.test(sample)) return { text };   // provably another run's — done
-      if (isThrottlePage(sample)) return { text };           // interstitial — done
-      // Anything else (shell, pre-hydration, login wall) is NOT an answer: keep sampling and
-      // return the last text at the render deadline.
+      if (waitForDecisiveEvidence) {
+        // A readable source can be a stale snapshot, so this one revalidation must not spend its
+        // only scratch navigation on the prompt marker ChatGPT hydrates before the answer. Reuse
+        // the shared classifier: marker-only text remains owned-incomplete through the deadline.
+        evidence = classifyEvidence(sample);
+        if (['terminal', 'foreign', 'cross-bound', 'throttle'].includes(evidence.kind)) {
+          return { text, reason: `${evidence.kind}-evidence`, evidence };
+        }
+      } else {
+        if (hasExactMarker(sample, marker)) return { text, reason: 'marker-found' }; // ours — done
+        if (FOREIGN_MARKER_RE.test(sample)) return { text, reason: 'foreign-marker' }; // provably another run's — done
+        if (isThrottlePage(sample)) return { text, reason: 'throttle' }; // interstitial — done
+      }
+      // Anything else (shell, pre-hydration, login wall, or a marker-only stale-source render)
+      // is NOT an answer: keep sampling and return the last text at the render deadline.
     }
-    return { text };
+    return { text, reason: text ? 'not-hydrated' : 'read-failed', evidence };
   } catch {
-    return { text: null };
+    return { text: null, reason: 'scratch-cdp-failed' };
   } finally {
+    // Cleanup ALWAYS gets attempted when a scratch target was opened, even though the caller's
+    // budget is usually already spent by the time we get here (that is exactly when a stranded
+    // scratch tab does the most damage: it sits open in the user's real Chrome profile, and a
+    // later /json list against it can itself hang forever). So this gets a small FIXED budget of
+    // its own, independent of outerDeadline, rather than inheriting whatever (possibly zero or
+    // negative) time the caller has left. Still best-effort (the try/catch stays).
     if (target?.id) {
-      try { await fetch(`http://127.0.0.1:${port}/json/close/${target.id}`); } catch {}
+      try { await fetchBeforeDeadline(`http://127.0.0.1:${port}/json/close/${target.id}`, {}, Date.now() + 2000); } catch {}
     }
   }
 }
@@ -711,17 +778,25 @@ function mutationOwnership(text) {
 async function openOrganizerScratch(url) {
   let target = null;
   try {
-    let response = await fetch(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(url)}`, { method: 'PUT' });
-    if (!response.ok) response = await fetch(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(url)}`);
-    if (!response.ok) return { target: null, reason: 'memo-open-failed' };
-    target = await response.json();
+    // Bound like freshRenderText's scratch open/list (gate: these were bare fetch() calls, so
+    // --organize/--finalize was bounded only by the shell's outer SIGKILL, which skips JS
+    // cleanup entirely). Open is bound to the module-level deadline (the whole invocation's
+    // budget); the list poll below is bound to renderDeadline, its own tighter sub-budget.
+    const openUrl = `http://127.0.0.1:${port}/json/new?${encodeURIComponent(url)}`;
+    let opened = await fetchJsonBeforeDeadline(openUrl, { method: 'PUT' }, deadline);
+    if (!opened.response.ok) opened = await fetchJsonBeforeDeadline(openUrl, {}, deadline); // pre-v111 Chrome used GET
+    if (!opened.response.ok) return { target: null, reason: 'memo-open-failed' };
+    target = opened.value;
     const renderDeadline = Math.min(deadline, Date.now() + 25_000);
     let sawLogin = false;
     while (Date.now() < renderDeadline) {
       await sleep(Math.min(250, Math.max(0, renderDeadline - Date.now())));
       let live = target;
       try {
-        const tabs = await (await fetch(`http://127.0.0.1:${port}/json`)).json();
+        const { value: tabs } = await fetchJsonBeforeDeadline(`http://127.0.0.1:${port}/json`, {}, renderDeadline);
+        // A non-2xx listing carries value: null rather than throwing (see fetchJsonBeforeDeadline);
+        // treat it the same as the caught exception below instead of dereferencing null.
+        if (!tabs) return { target, reason: 'cdp-list-failed' };
         live = tabs.find((tab) => tab.id === target.id) ?? null;
       } catch { return { target, reason: 'cdp-list-failed' }; }
       if (!live) return { target, reason: 'memo-tab-disappeared' };
@@ -991,11 +1066,55 @@ if (organize) {
   process.exit(0);
 }
 
-// One place where a marker-matched page turns into an outcome, so the live-tab scan, the
-// dead-tab re-render and the remembered-URL recovery all behave identically — including
-// remembering the URL, which is what lets a LATER invocation find this conversation after its
-// tab is gone. Deliberately does NOT close the tab: see the close note at the bottom.
-async function onOurConversation(url, text) {
+// All evidence sources (readable open tabs, dead-tab scratch renders, and remembered-URL
+// scratch renders) enter here before a caller maps the result to an exit code. In particular,
+// probe cannot call a terminal answer "complete" from an old or nonce-less verdict: only a
+// verdict after this run's latest prompt marker that repeats the marker releases capacity.
+function classifyEvidence(text) {
+  if (!text || !text.trim()) return { kind: 'inconclusive', reason: 'empty-text' };
+  if (isThrottlePage(text)) return { kind: 'throttle' };
+  if (!hasExactMarker(text, marker)) {
+    return FOREIGN_MARKER_RE.test(text)
+      ? { kind: 'foreign' }
+      : { kind: 'inconclusive', reason: 'marker-not-hydrated' };
+  }
+  const foreignMarker = foreignAnswerMarker(text);
+  if (foreignMarker) return { kind: 'cross-bound', foreignMarker };
+  const review = extractReview(text);
+  if (!review) return { kind: 'owned-incomplete' };
+  const verdict = terminalVerdict(text);
+  const promptMarkerAt = verdict ? lastExactMarkerAt(text.slice(0, verdict.at), marker) : -1;
+  const answerMarker = verdict?.line.match(/\(run marker:\s*(pg-run-[A-Za-z0-9.-]+)\s*\)/i)?.[1] ?? null;
+  // The marker echoed in the terminal line is not a later prompt. A separate exact marker after
+  // that line is, and proves this otherwise-owned verdict belongs to an older turn in the same chat.
+  const newerPromptMarker = verdict && hasExactMarker(text.slice(verdict.at + verdict.line.length), marker);
+  // A retry reuses this run's exact marker, so a stale SAME-marker verdict (answerMarker ===
+  // marker) passes every other check here (owned, non-foreign, well-formed) AND the shell's
+  // nonce check downstream — it would otherwise satisfy `kind: 'terminal'` while the newer
+  // prompt it precedes is still generating, and the harvest path below emits on `kind` alone
+  // (unlike --probe, which also gates on probeComplete), so that stale verdict would be reported
+  // as THIS run's result and retire the reservation early. Fall back to owned-incomplete so every
+  // caller (readable-tab match, scratch revalidation, remembered-URL render, freshRenderText's
+  // decisive-evidence wait) keeps sampling instead of treating scrollback as a live answer.
+  // Gated on answerMarker === marker: a verdict carrying a DIFFERENT marker ahead of our prompt
+  // (#68 gate P1's reused-conversation scrollback) already fails the shell's nonce check on its
+  // own — that case must stay 'terminal' so the engine can adjudicate it, not be swallowed here.
+  if (newerPromptMarker && answerMarker === marker) return { kind: 'owned-incomplete', reason: 'stale-terminal' };
+  return {
+    kind: 'terminal',
+    review,
+    // newerPromptMarker can still be true here for a foreign answerMarker (scrollback case
+    // above); the `&& !newerPromptMarker` term stays as a guard against that combination
+    // ever being reported probe-complete, even though only --probe reads this field.
+    probeComplete: promptMarkerAt >= 0 && answerMarker === marker && !newerPromptMarker,
+  };
+}
+
+// Positive evidence mutates URL ownership only after the shared classifier has excluded a
+// cross-bound answer. The caller supplies the classification so readable incomplete sources can
+// defer promotion until their canonical scratch revalidation resolves the ambiguity.
+function onOurConversation(url, evidence) {
+  if (!['owned-incomplete', 'terminal'].includes(evidence.kind)) return evidence;
   ourUrls.add(url);
   // Positive ownership: the run is demonstrably NOT terminally cross-bound, whatever other
   // candidates this scan rejected (#68 gate r2/r3 P2). Decided at exit, so tab order is
@@ -1003,28 +1122,73 @@ async function onOurConversation(url, text) {
   ownershipProven = true;
   rememberUrl(marker, url);
   knownUrl = url;                // usable by the recovery branch from the very next cycle
+  return evidence;
+}
+
+// A readable incomplete source has proved only that its prompt is visible: its terminal answer
+// can still be cross-bound. Preserve a pre-existing recovery handle through an inconclusive
+// scratch pass, but retain this source as a future handle when no prior handle exists.
+function rememberInconclusiveReadableSource(url) {
+  if (knownUrl) return;
+  ourUrls.add(url);
+  rememberUrl(marker, url);
+  knownUrl = url;
+}
+
+function emitEvidence(url, evidence) {
   if (probe) {
     console.error(`live conversation: ${url}`);
-    // Additive completeness signal (#82). The reservation reconciler must distinguish a turn that
-    // is STILL GENERATING (occupies account capacity) from one that merely awaits collection
-    // (occupies nothing, so its slot should be released). Deliberately NOT a new exit code: the
-    // no-think and pre-retry watchdogs treat probe rc 0 as "demonstrably live, suppress retry",
-    // and any other code falls through those guards toward a retry against an already-spent slot.
-    // extractReview applies the same terminal + marker-owned VERDICT contract the harvest path
-    // uses, so an unowned, partial, or cross-bound answer reports `generating` (fail closed).
-    console.error(`probe-state: ${extractReview(text) ? 'complete' : 'generating'}`);
+    // rc 0 proves the conversation exists. Completeness is intentionally stricter than harvest
+    // extraction: the terminal verdict must answer the latest exact prompt and echo this marker.
+    console.error(`probe-state: ${evidence.kind === 'terminal' && evidence.probeComplete ? 'complete' : 'generating'}`);
     process.exit(0);
   }
-  const review = extractReview(text);
-  if (review) {
-    // v0.28 (gate #54 r5): name the EXACT source of this capture so the engine can
-    // blacklist precisely on a provenance rejection — reading the shared memo afterwards
-    // races concurrent probes and can condemn the genuine conversation instead.
+  if (evidence.kind === 'terminal') {
+    // v0.28 (gate #54 r5): name the EXACT source of this capture so the engine can blacklist
+    // precisely on a provenance rejection — reading the shared memo afterwards races probes.
     console.error(`matched-url ${url}`);
-    console.log(review);
+    console.log(evidence.review);
     process.exit(0);
   }
-  return url;                    // ours, but still generating
+  return url;
+}
+
+let staleRevalidationAttempted = false;
+async function revalidateReadableStaleSource(url) {
+  if (staleRevalidationAttempted || Date.now() >= deadline || seededRenders >= MAX_SEEDED_RENDERS) return null;
+  staleRevalidationAttempted = true;
+  seededRenders += 1;
+  nextRenderAt.set(url, Date.now() + RENDER_INTERVAL_MS);
+  console.error(`readable conversation ${url} has no terminal verdict — re-rendering its canonical URL once in a scratch tab...`);
+  const rendered = await freshRenderText(url, port, deadline, true);
+  if (!rendered.text) {
+    // URL drift, target loss, login/hydration and CDP failures are absence of fresh evidence.
+    // Do not forget, blacklist, or otherwise mutate the already-proven canonical URL.
+    console.error(`canonical scratch revalidation was inconclusive (${rendered.reason})`);
+    return { kind: 'inconclusive', reason: rendered.reason };
+  }
+  return rendered.evidence ?? classifyEvidence(rendered.text);
+}
+
+function discardForeignUrl(url) {
+  if (url === knownUrl) {
+    ourUrls.delete(url);
+    const survivor = forgetUrl(marker, url);
+    knownUrl = survivor;
+    memoStale = !survivor;
+  }
+  blacklist(url);
+}
+
+function rejectForeign(url, source) {
+  discardForeignUrl(url);
+  console.error(`${source} ${url} carries a DIFFERENT run's marker — not ours; ignoring it`);
+}
+
+function rejectCrossBound(url, foreignMarker, source) {
+  discardForeignUrl(url);
+  noteCrossBind(marker, url, foreignMarker);
+  console.error(`${source} ${url} carries our marker but ANOTHER run's completed answer (${foreignMarker}) — not ours; ignoring it`);
 }
 
 let listFailures = 0;
@@ -1075,19 +1239,78 @@ while (Date.now() < deadline) {
       if (tab.url === knownUrl && FOREIGN_MARKER_RE.test(text)) memoStale = true;
       continue;
     }
-    // #67: our marker is present, but if the page's completed ANSWER belongs to another run,
-    // the page is theirs — never memoize it as ours (that is the cross-bind that stranded
-    // pro-gate#66 and pushbot#1334). Blacklist it so later passes stop re-reading it.
-    const fa = foreignAnswerMarker(text);
-    if (fa) {
-      if (tab.url === knownUrl) { ourUrls.delete(tab.url); const surv = forgetUrl(marker, tab.url); knownUrl = surv; memoStale = !surv; }
-      blacklist(tab.url);
-      noteCrossBind(marker, tab.url, fa);
-      console.error(`tab ${tab.url} carries our marker but ANOTHER run's completed answer (${fa}) — not ours; ignoring it`);
+    const evidence = classifyEvidence(text);
+    if (evidence.kind === 'cross-bound') {
+      rejectCrossBound(tab.url, evidence.foreignMarker, 'tab');
       continue;
     }
-    stillGeneratingUrl = await onOurConversation(tab.url, text);
+    if (evidence.kind === 'terminal') {
+      onOurConversation(tab.url, evidence);
+      emitEvidence(tab.url, evidence);
+    }
+    if (evidence.kind !== 'owned-incomplete') continue;
+    stillGeneratingUrl = tab.url;
     lastMatchWasSeeded = false;
+    // A readable DOM can be stale while its server-side conversation is complete. Do not promote
+    // it over an earlier recovery memo until its one same-profile scratch navigation classifies it.
+    //
+    // The one-shot revalidation is spent on the REMEMBERED conversation (knownUrl) when we have
+    // one, never on whichever owned-incomplete tab this scan happens to reach first. A
+    // retry-created duplicate tab that stays incomplete carries our marker just as legitimately
+    // as the real one, so without this a duplicate could burn the single scratch navigation every
+    // cycle and permanently suppress the remembered-URL pass — reporting a completed, PAID review
+    // sitting at knownUrl as still generating forever. Every downstream consequence (terminal
+    // emit, cross-bound/foreign rejection, blacklist, stillGeneratingUrl) is attributed to the URL
+    // actually rendered, never to the tab that merely triggered the pass — the tab itself is still
+    // never navigated or closed.
+    const revalidateUrl = knownUrl ?? tab.url;
+    if (revalidateUrl !== tab.url) {
+      console.error(`readable tab ${tab.url} is incomplete, but "${marker}" already has a proven `
+        + `conversation (${revalidateUrl}) — spending the one canonical revalidation there instead`);
+    }
+    const fresh = await revalidateReadableStaleSource(revalidateUrl);
+    if (fresh?.kind === 'throttle') tripThrottle(`canonical scratch ${revalidateUrl}`);
+    if (fresh?.kind === 'cross-bound') {
+      rejectCrossBound(revalidateUrl, fresh.foreignMarker, 'canonical scratch');
+      // Only null the signal when the rejected URL IS the tab we were scanning: a rejected
+      // knownUrl says nothing about a genuinely different, still-open, still-incomplete tab.
+      if (revalidateUrl === tab.url) {
+        stillGeneratingUrl = null;
+      } else if (probe) {
+        // The one-shot revalidation was spent on knownUrl, a DIFFERENT conversation from the
+        // tab this iteration is actually scanning. Rejecting knownUrl proves nothing about that
+        // tab — it already produced its own owned-incomplete `evidence` above (gate #91 r3 P1).
+        // Without re-emitting it here, probe has no positive signal left this cycle: it falls
+        // through past every `!probe` block below straight to the deadline's exit 4 (absent),
+        // which increments the reservation's consecutive-miss count and can ultimately RELEASE a
+        // live, still-generating review for double-spending.
+        emitEvidence(tab.url, evidence);
+      }
+      continue;
+    }
+    if (fresh?.kind === 'foreign') {
+      rejectForeign(revalidateUrl, 'canonical scratch');
+      if (revalidateUrl === tab.url) {
+        stillGeneratingUrl = null;
+      } else if (probe) {
+        emitEvidence(tab.url, evidence);
+      }
+      continue;
+    }
+    if (fresh?.kind === 'terminal') {
+      onOurConversation(revalidateUrl, fresh);
+      emitEvidence(revalidateUrl, fresh);
+    }
+    if (fresh?.kind === 'owned-incomplete') {
+      onOurConversation(revalidateUrl, fresh);
+      // Real scratch evidence for the rendered URL supersedes the tentative tab.url guess above.
+      stillGeneratingUrl = revalidateUrl;
+      lastMatchWasSeeded = revalidateUrl !== tab.url;
+    }
+    // Inconclusive scratch evidence preserves an existing recovery handle. With no prior handle,
+    // retain this marker-bearing source without claiming ownershipProven.
+    if (!fresh || fresh.kind === 'inconclusive') rememberInconclusiveReadableSource(revalidateUrl);
+    if (probe) emitEvidence(tab.url, evidence);
     console.error(`conversation found (${tab.url}) but no VERDICT yet; waiting...`);
   }
   // v0.17 fallback: unreadable tabs get their URL re-rendered in a scratch tab
@@ -1127,21 +1350,19 @@ while (Date.now() < deadline) {
       }
       continue;
     }
-    // #67: same ownership test as the live-tab scan — our marker on the page is not proof the
-    // ANSWER is ours.
-    const faRender = foreignAnswerMarker(text);
-    if (faRender) {
-      if (tab.url === knownUrl) { ourUrls.delete(tab.url); const surv = forgetUrl(marker, tab.url); knownUrl = surv; memoStale = !surv; }
-      blacklist(tab.url);
-      noteCrossBind(marker, tab.url, faRender);
-      console.error(`re-rendered ${tab.url} carries our marker but ANOTHER run's completed answer (${faRender}) — not ours; ignoring it`);
+    const evidence = onOurConversation(tab.url, classifyEvidence(text));
+    if (evidence.kind === 'cross-bound') {
+      rejectCrossBound(tab.url, evidence.foreignMarker, 're-rendered');
       continue;
     }
-    stillGeneratingUrl = await onOurConversation(tab.url, text);
+    if (evidence.kind === 'terminal') emitEvidence(tab.url, evidence);
+    if (evidence.kind !== 'owned-incomplete') continue;
+    stillGeneratingUrl = tab.url;
     lastMatchWasSeeded = false;
     // A fresh render is a real page load against ChatGPT, so a match here is SERVER-SIDE
     // evidence just like the remembered-URL branch: keep it if this tab later disappears.
     seededLiveUrl = tab.url;
+    if (probe) emitEvidence(tab.url, evidence);
     console.error(`conversation matches (via fresh render, ${tab.url}) but no VERDICT yet; waiting...`);
   }
 
@@ -1162,30 +1383,23 @@ while (Date.now() < deadline) {
     console.error(`no open tab carries "${marker}" — re-rendering the remembered conversation ${seedUrl} (${seededRenders}/${MAX_SEEDED_RENDERS})...`);
     const { text } = await freshRenderText(seedUrl, port, deadline);
     if (text) {
-      if (isThrottlePage(text)) tripThrottle(`remembered render ${seedUrl}`);
-      const faSeed = text.includes(marker) ? foreignAnswerMarker(text) : null;
-      if (faSeed) {
-        // #67: the memo itself is cross-bound — it points at a conversation whose completed
-        // answer belongs to another run, while carrying our marker in its prompt text. This is
-        // exactly what stranded pro-gate#66 and pushbot#1334: without this branch the memo is
-        // re-rendered, re-matched and re-memoized forever, and every harvest re-rejects the
-        // same foreign answer while the reservation never retires.
-        ourUrls.delete(seedUrl);      // release the blacklist exemption a remembered URL holds
-        // Evict, but KEEP a concurrently republished different memo as the live handle: it may
-        // be the genuine conversation, and blinding ourselves to it can turn this pass into the
-        // miss that retires a valid reservation (#68 gate r3 P1).
-        const survivor = forgetUrl(marker, seedUrl);
-        blacklist(seedUrl);
-        knownUrl = survivor;
-        memoStale = !survivor;
-        noteCrossBind(marker, seedUrl, faSeed);
-        console.error(`remembered conversation ${seedUrl} carries ANOTHER run's completed answer (${faSeed}) — cross-bound memo, discarding it`);
-      } else if (text.includes(marker)) {
-        stillGeneratingUrl = await onOurConversation(seedUrl, text);
-        lastMatchWasSeeded = true;
-        seededLiveUrl = seedUrl;   // survives later empty scans: this is server-side evidence
-        console.error(`remembered conversation recovered (${seedUrl}) but no VERDICT yet; waiting...`);
-      } else if (FOREIGN_MARKER_RE.test(text)) {
+      const evidence = classifyEvidence(text);
+      if (evidence.kind === 'throttle') tripThrottle(`remembered render ${seedUrl}`);
+      if (evidence.kind === 'cross-bound') {
+        // The memo itself is cross-bound. Evict it with claim-and-verify, but preserve a
+        // concurrently republished survivor as the only possible genuine recovery handle.
+        rejectCrossBound(seedUrl, evidence.foreignMarker, 'remembered conversation');
+      } else if (evidence.kind === 'terminal' || evidence.kind === 'owned-incomplete') {
+        const owned = onOurConversation(seedUrl, evidence);
+        if (owned.kind === 'terminal') emitEvidence(seedUrl, owned);
+        if (owned.kind === 'owned-incomplete') {
+          stillGeneratingUrl = seedUrl;
+          lastMatchWasSeeded = true;
+          seededLiveUrl = seedUrl;   // survives later empty scans: this is server-side evidence
+          if (probe) emitEvidence(seedUrl, owned);
+          console.error(`remembered conversation recovered (${seedUrl}) but no VERDICT yet; waiting...`);
+        }
+      } else if (evidence.kind === 'foreign') {
         // Decisive the other way: the memo points at ANOTHER run's conversation (stale or
         // corrupt). Only this justifies treating the remembered handle as worthless.
         memoStale = true;

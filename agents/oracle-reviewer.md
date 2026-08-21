@@ -47,6 +47,34 @@ this file hardcodes.
   for a completed run's `out` file before ever launching one. "Never relaunch" means never
   bypass the engine, not never call it.
 
+## Recovery relay
+
+If the caller asks to recover an already-started review, recognize `recover <PR|URL|marker>`
+before the normal review inputs and procedure. The accepted query is exactly one decimal PR
+number, canonical PR URL, or exact `pg-run-...` marker. Invoke only:
+
+```bash
+"${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --recover <PR|URL|marker> \
+  [--repo <dir>] [--out <file>] [--timeout <dur>]
+```
+
+Do not translate recovery into `--pr`: it never launches a fresh review or acquires a new review
+slot. Recovery selects exactly one already-spent run: an exact marker wins; a repository-qualified URL
+or PR number with canonical repository proof selects the unique newest charged run. Bare PRs
+without repository proof and tied, conflicting, or cross-repository candidates return a
+non-mutating disambiguation response; ask for the exact marker. Recovery is artifact-first and
+otherwise uses only the existing marker harvest path.
+
+Relay one of these plain states exactly: **Review ready**, **Checking for completed review**,
+**Still working**, or **Browser needs attention**. A readable or open tab is not server truth;
+the current engine safely revalidates the canonical conversation without changing the source tab.
+For detailed automation and degradation diagnosis, retain direct
+`oracle-review.sh --status <pr-number|pr-url|marker> --json` and direct marker
+`oracle-review.sh --harvest <run-marker> --out <file>` as expert surfaces. Never instruct
+callers to refresh a browser manually. Preserve the nonce guard: never set
+`PRO_GATE_REQUIRE_NONCE=0`, and never delete a reservation except the already-documented
+positively cross-bound case.
+
 ## Inputs you receive
 
 The caller passes: the PR number or URL, the repo directory (`REPO:`), and optionally an

@@ -126,6 +126,27 @@ check "reviewer commands resolve runtime independently" test "$(grep -c '\${PRO_
 check "reviewer agent has no cross-shell runtime dependency" sh -c "! grep -q '\$RUNTIME_HOME/oracle-review.sh' '$ROOT/agents/oracle-reviewer.md'"
 check "reviewer agent has no hardcoded engine home" sh -c "! grep -q '~/.pro-review-daemon/oracle-review.sh' '$ROOT/agents/oracle-reviewer.md'"
 
+# U4: novice recovery is a thin, no-spend relay over the engine's exclusive --recover mode.
+# Keep the skill and agent in lockstep while preserving the older diagnostic/harvest expert paths.
+RECOVERY_GRAMMAR='recover <PR|URL|marker>'
+RECOVERY_CALL='oracle-review.sh" --recover <PR|URL|marker>'
+for caller in "$ROOT/skills/pro-gate/SKILL.md" "$ROOT/agents/oracle-reviewer.md"; do
+  caller_name="$(basename "$(dirname "$caller")")"
+  check "$caller_name documents recover grammar" grep -Fq "$RECOVERY_GRAMMAR" "$caller"
+  check "$caller_name routes recover through engine recovery mode" grep -Fq "$RECOVERY_CALL" "$caller"
+  check "$caller_name recover route has no fresh --pr dispatch" sh -c "! grep -F -- '--recover <PR|URL|marker> --pr' '$caller' | grep -q ."
+  check "$caller_name guarantees recovery launches no fresh review" grep -Fq 'never launches a fresh review' "$caller"
+  check "$caller_name recovery does not prescribe manual refresh" sh -c "! grep -Eqi 'manual (browser )?(refresh|reload)' '$caller'"
+  check "$caller_name documents four plain recovery states" sh -c "for state in 'Review ready' 'Checking for completed review' 'Still working' 'Browser needs attention'; do grep -Fq \"\$state\" '$caller' || exit 1; done"
+done
+check "skill rejects open-tab ground-truth guidance" sh -c "! grep -Fq 'Ground truth is the BROWSER' '$ROOT/skills/pro-gate/SKILL.md'"
+check "skill preserves expert status JSON diagnostics" grep -Fq 'oracle-review.sh" --status <pr-number|pr-url|marker> --json' "$ROOT/skills/pro-gate/SKILL.md"
+check "skill preserves direct expert harvest" grep -Fq 'oracle-review.sh" --harvest' "$ROOT/skills/pro-gate/SKILL.md"
+check "README documents engine recover command" grep -Fq 'oracle-review.sh --recover <PR|URL|marker>' "$ROOT/README.md"
+check "README preserves expert status JSON command" grep -Fq 'oracle-review.sh --status [<pr|url|marker>] [--json]' "$ROOT/README.md"
+check "README preserves direct expert harvest command" grep -Fq 'oracle-review.sh --harvest <run-marker>' "$ROOT/README.md"
+check "engine usage documents recover as no-fresh-run mode" grep -Fq 'oracle-review.sh --recover <pr-number|pr-url|pg-run-marker>' "$ROOT/bin/oracle-review.sh"
+
 REVIEW_RUNTIME="$TDIR/reviewer-runtime"; mkdir -p "$REVIEW_RUNTIME"
 printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$REVIEW_LOG"\n' > "$REVIEW_RUNTIME/oracle-review.sh"
 chmod +x "$REVIEW_RUNTIME/oracle-review.sh"
