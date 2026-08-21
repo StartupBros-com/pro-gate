@@ -108,8 +108,13 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
       pg_reservation_marker_ok "$RECOVER_QUERY" || { echo "ERROR: invalid recovery marker syntax" >&2; exit 2; }
       REC_SELECTED="$RECOVER_QUERY";;
     http*://*/pull/*)
-      REC_QUERY_NUM="${RECOVER_QUERY##*/}"; REC_QUERY_NUM="${REC_QUERY_NUM%%[!0-9]*}"
-      REC_IDENT="$(pg_repo_identity_from_url "$RECOVER_QUERY" 2>/dev/null || true)"
+      # pg_repo_identity_from_url's own regex already accepts one trailing slash (it is the
+      # canonical spelling GitHub itself sometimes renders), but the number extraction below
+      # takes everything after the FINAL slash — a trailing slash left that empty and forced a
+      # spurious disambiguation even though the URL was otherwise canonical. Normalize once.
+      REC_URL_NORM="${RECOVER_QUERY%/}"
+      REC_QUERY_NUM="${REC_URL_NORM##*/}"; REC_QUERY_NUM="${REC_QUERY_NUM%%[!0-9]*}"
+      REC_IDENT="$(pg_repo_identity_from_url "$REC_URL_NORM" 2>/dev/null || true)"
       { [ -n "$REC_QUERY_NUM" ] && [ -n "$REC_IDENT" ]; } \
         || recover_disambiguate "the PR URL is not a canonical host/owner/repo pull URL"
       IFS=$'\t' read -r REC_HOST REC_OWNER REC_REPO_NAME <<< "$REC_IDENT";;
@@ -1839,14 +1844,13 @@ fi
 # gives --diff runs a real per-change identity instead of the shared literal "diff", so their
 # exit-9 reservations can redirect same-branch re-runs to harvest like PR runs always could.
 RUN_MARKER="pg-run-${ROUND_KEY:-diff}-$(date +%s)-$$"
-# The marker is minted before queue/slot acquisition. Write identity immediately, then update the
-# same record only when pg_round_record supplies its authoritative charged-spend epoch below.
-# This sidecar is never removed with a reservation or completed artifact.
-if [ -n "$PR_NUM" ] && [ -n "$PG_META_HOST" ] && [ -n "$PG_META_OWNER" ] && [ -n "$PG_META_REPO" ]; then
-  pg_run_meta_write "$RUN_MARKER" "$PG_META_HOST" "$PG_META_OWNER" "$PG_META_REPO" \
-    "$ROUND_KEY" "$PR_NUM" "$OUT" 2>/dev/null \
-    || echo "[oracle-review] WARNING: could not persist recovery identity metadata for $RUN_MARKER" >&2
-fi
+# The marker is minted before queue/slot acquisition, but recovery metadata is published only
+# together with the authoritative charge (the adjacent pg_round_record + charged
+# pg_run_meta_write below, near pg_round_record's call site). An attempt that never charges a
+# round (round-capped, per-change-lock-timeout, deferred, oversized, ...) must never mint a
+# run-meta record: an uncharged attempt has nothing to recover, and a stray sidecar for it would
+# poison PR/URL recovery with a candidate that no reservation or ledger row backs. This sidecar
+# is never removed with a reservation or completed artifact.
 # v0.28 (gate #54 r8): oracle/reattach/salvage capture into a PROCESS-PRIVATE file from the
 # outset; the caller's $OUT is publication-only, written once after acceptance. Two runs whose
 # callers share one --out (same bare PR number in different repos, retries, orchestrator

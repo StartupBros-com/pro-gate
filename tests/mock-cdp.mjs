@@ -4,8 +4,9 @@
 // the tab's debugger WebSocket, /json/new (scratch tabs, so the salvage's remembered-URL
 // recovery can reach a decisive answer the way a real browser does), and /json/close.
 // Prints the chosen port on stdout.
-// Usage: node tests/mock-cdp.mjs <source-text-file> [organizer-state-file] [scratch-text-file]
-// The optional scratch text models a canonical server render that diverges from a stale source.
+// Usage: node tests/mock-cdp.mjs <source-text-file> [organizer-state-file] [scratch-text-file] [scratch-canonical-url]
+// Optional scratch content is served only when the requested URL equals the canonical URL,
+// preventing a wrong URL from producing a plausible recovery artifact.
 // State records created/closed browser targets independently from organizer events.
 import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
@@ -15,6 +16,8 @@ const textFile = process.argv[2];
 if (!textFile) { console.error('usage: mock-cdp.mjs <tab-text-file>'); process.exit(2); }
 const stateFile = process.argv[3] || null;
 const scratchTextFile = process.argv[4] || null;
+const PRIMARY_URL = 'https://chatgpt.com/c/mock-conversation';
+const scratchCanonicalUrl = process.argv[5] || PRIMARY_URL;
 const WS_MAGIC = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
 function wsTextFrame(payload) {
@@ -78,8 +81,13 @@ function recordBrowserTarget(field, target) {
 }
 
 function textForTarget(id) {
-  const file = id.startsWith('scratch') && scratchTextFile ? scratchTextFile : textFile;
-  try { return fs.readFileSync(file, 'utf8'); } catch { return ''; }
+  if (id.startsWith('scratch') && scratchTextFile) {
+    // A target id proves only that Chrome opened a tab. The requested canonical URL is what
+    // binds its body to the recovery candidate; mismatch must remain inconclusive/foreign.
+    if (scratch.get(id) !== scratchCanonicalUrl) return 'Mock scratch URL mismatch: no conversation content.';
+    try { return fs.readFileSync(scratchTextFile, 'utf8'); } catch { return ''; }
+  }
+  try { return fs.readFileSync(textFile, 'utf8'); } catch { return ''; }
 }
 
 function expectedTitleFromExpression(expression) {
@@ -124,7 +132,7 @@ const server = createServer((req, res) => {
     }));
     if (current === '__NO_TABS__' || primaryClosed) { res.end(JSON.stringify(extras)); return; }
     res.end(JSON.stringify([{
-      id: 'tab1', type: 'page', url: 'https://chatgpt.com/c/mock-conversation',
+      id: 'tab1', type: 'page', url: PRIMARY_URL,
       webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/tab1`,
     }, ...extras]));
     return;

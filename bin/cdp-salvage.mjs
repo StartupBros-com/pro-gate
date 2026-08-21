@@ -515,13 +515,37 @@ function blacklist(url) {
   } catch {}
 }
 
+// A fresh render runs inside a watchdog/probe deadline. Native fetch has no deadline of its
+// own, so every scratch CDP request carries the caller's remaining budget. Keep body parsing
+// under that same signal too: a peer that sends headers but never completes JSON is also stuck.
+async function fetchBeforeDeadline(url, options, requestDeadline, consume = null) {
+  const remaining = requestDeadline - Date.now();
+  if (remaining <= 0) throw new Error('caller-deadline-expired');
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), remaining);
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    return consume ? await consume(response) : response;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchJsonBeforeDeadline(url, options, requestDeadline) {
+  return await fetchBeforeDeadline(url, options, requestDeadline, async (response) => ({
+    response,
+    value: await response.json(),
+  }));
+}
+
 async function freshRenderText(url, port, outerDeadline, waitForDecisiveEvidence = false) {
   let target = null;
   try {
-    let res = await fetch(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(url)}`, { method: 'PUT' });
-    if (!res.ok) res = await fetch(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(url)}`); // pre-v111 Chrome used GET
-    if (!res.ok) return { text: null, reason: 'scratch-open-failed' };
-    target = await res.json();
+    const openUrl = `http://127.0.0.1:${port}/json/new?${encodeURIComponent(url)}`;
+    let opened = await fetchJsonBeforeDeadline(openUrl, { method: 'PUT' }, outerDeadline);
+    if (!opened.response.ok) opened = await fetchJsonBeforeDeadline(openUrl, {}, outerDeadline); // pre-v111 Chrome used GET
+    if (!opened.response.ok) return { text: null, reason: 'scratch-open-failed' };
+    target = opened.value;
     // never grant more than the caller's remaining budget (a 30s probe must
     // not stall watchdog/retry decisions by overrunning its own window)
     const renderDeadline = Math.min(Date.now() + 25_000, outerDeadline);
@@ -530,7 +554,9 @@ async function freshRenderText(url, port, outerDeadline, waitForDecisiveEvidence
     while (Date.now() + 2_500 < renderDeadline) {
       await sleep(2_500);
       let tabs;
-      try { tabs = await (await fetch(`http://127.0.0.1:${port}/json`)).json(); } catch { return { text: null, reason: 'cdp-list-failed' }; }
+      try {
+        ({ value: tabs } = await fetchJsonBeforeDeadline(`http://127.0.0.1:${port}/json`, {}, renderDeadline));
+      } catch { return { text: null, reason: 'cdp-list-failed' }; }
       const live = tabs.find((t) => t.id === target.id);
       if (!live) return { text: null, reason: 'target-disappeared' };
       // A scratch target may redirect, be reused, or be replaced underneath us. Its DOM is
@@ -568,8 +594,9 @@ async function freshRenderText(url, port, outerDeadline, waitForDecisiveEvidence
   } catch {
     return { text: null, reason: 'scratch-cdp-failed' };
   } finally {
-    if (target?.id) {
-      try { await fetch(`http://127.0.0.1:${port}/json/close/${target.id}`); } catch {}
+    // Cleanup is best-effort, but never gets to outlive the caller's watchdog/probe budget.
+    if (target?.id && Date.now() < outerDeadline) {
+      try { await fetchBeforeDeadline(`http://127.0.0.1:${port}/json/close/${target.id}`, {}, outerDeadline); } catch {}
     }
   }
 }
@@ -1036,12 +1063,9 @@ function classifyEvidence(text) {
 }
 
 // Positive evidence mutates URL ownership only after the shared classifier has excluded a
-// cross-bound answer. It deliberately does not exit; the readable-source path gets exactly one
-// canonical scratch revalidation before the caller decides whether an owned incomplete page is
-// still generating.
-function onOurConversation(url, text) {
-  const evidence = classifyEvidence(text);
-  if (evidence.kind === 'cross-bound') return evidence;
+// cross-bound answer. The caller supplies the classification so readable incomplete sources can
+// defer promotion until their canonical scratch revalidation resolves the ambiguity.
+function onOurConversation(url, evidence) {
   if (!['owned-incomplete', 'terminal'].includes(evidence.kind)) return evidence;
   ourUrls.add(url);
   // Positive ownership: the run is demonstrably NOT terminally cross-bound, whatever other
@@ -1051,6 +1075,16 @@ function onOurConversation(url, text) {
   rememberUrl(marker, url);
   knownUrl = url;                // usable by the recovery branch from the very next cycle
   return evidence;
+}
+
+// A readable incomplete source has proved only that its prompt is visible: its terminal answer
+// can still be cross-bound. Preserve a pre-existing recovery handle through an inconclusive
+// scratch pass, but retain this source as a future handle when no prior handle exists.
+function rememberInconclusiveReadableSource(url) {
+  if (knownUrl) return;
+  ourUrls.add(url);
+  rememberUrl(marker, url);
+  knownUrl = url;
 }
 
 function emitEvidence(url, evidence) {
@@ -1157,17 +1191,20 @@ while (Date.now() < deadline) {
       if (tab.url === knownUrl && FOREIGN_MARKER_RE.test(text)) memoStale = true;
       continue;
     }
-    let evidence = onOurConversation(tab.url, text);
+    const evidence = classifyEvidence(text);
     if (evidence.kind === 'cross-bound') {
       rejectCrossBound(tab.url, evidence.foreignMarker, 'tab');
       continue;
     }
-    if (evidence.kind === 'terminal') emitEvidence(tab.url, evidence);
+    if (evidence.kind === 'terminal') {
+      onOurConversation(tab.url, evidence);
+      emitEvidence(tab.url, evidence);
+    }
     if (evidence.kind !== 'owned-incomplete') continue;
     stillGeneratingUrl = tab.url;
     lastMatchWasSeeded = false;
-    // A readable DOM can be stale while its server-side conversation is complete. The source
-    // remains untouched; one same-profile scratch navigation is the only fresh evidence pass.
+    // A readable DOM can be stale while its server-side conversation is complete. Do not promote
+    // it over an earlier recovery memo until its one same-profile scratch navigation classifies it.
     const fresh = await revalidateReadableStaleSource(tab.url);
     if (fresh?.kind === 'throttle') tripThrottle(`canonical scratch ${tab.url}`);
     if (fresh?.kind === 'cross-bound') {
@@ -1180,9 +1217,14 @@ while (Date.now() < deadline) {
       stillGeneratingUrl = null;
       continue;
     }
-    if (fresh?.kind === 'terminal') emitEvidence(tab.url, fresh);
-    // Inconclusive scratch evidence deliberately leaves the proven source live and makes no
-    // memo/blacklist mutation. Probe still returns rc 0, but only after this bounded pass.
+    if (fresh?.kind === 'terminal') {
+      onOurConversation(tab.url, fresh);
+      emitEvidence(tab.url, fresh);
+    }
+    if (fresh?.kind === 'owned-incomplete') onOurConversation(tab.url, fresh);
+    // Inconclusive scratch evidence preserves an existing recovery handle. With no prior handle,
+    // retain this marker-bearing source without claiming ownershipProven.
+    if (!fresh || fresh.kind === 'inconclusive') rememberInconclusiveReadableSource(tab.url);
     if (probe) emitEvidence(tab.url, evidence);
     console.error(`conversation found (${tab.url}) but no VERDICT yet; waiting...`);
   }
@@ -1223,7 +1265,7 @@ while (Date.now() < deadline) {
       }
       continue;
     }
-    const evidence = onOurConversation(tab.url, text);
+    const evidence = onOurConversation(tab.url, classifyEvidence(text));
     if (evidence.kind === 'cross-bound') {
       rejectCrossBound(tab.url, evidence.foreignMarker, 're-rendered');
       continue;
@@ -1263,7 +1305,7 @@ while (Date.now() < deadline) {
         // concurrently republished survivor as the only possible genuine recovery handle.
         rejectCrossBound(seedUrl, evidence.foreignMarker, 'remembered conversation');
       } else if (evidence.kind === 'terminal' || evidence.kind === 'owned-incomplete') {
-        const owned = onOurConversation(seedUrl, text);
+        const owned = onOurConversation(seedUrl, evidence);
         if (owned.kind === 'terminal') emitEvidence(seedUrl, owned);
         if (owned.kind === 'owned-incomplete') {
           stillGeneratingUrl = seedUrl;

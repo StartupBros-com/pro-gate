@@ -504,7 +504,9 @@ pg_repo_identity_from_url() { # GitHub/Git remote URL -> host<TAB>owner<TAB>repo
   local url="${1:-}" host owner repo
   if [[ "$url" =~ ^https?://([^/]+)/([^/]+)/([^/]+)(/pull/[0-9]+)?/?$ ]]; then
     host="${BASH_REMATCH[1]}"; owner="${BASH_REMATCH[2]}"; repo="${BASH_REMATCH[3]}"
-  elif [[ "$url" =~ ^git@([^:]+):([^/]+)/([^/]+)\.git$ ]] || [[ "$url" =~ ^ssh://git@([^/]+)/([^/]+)/([^/]+)\.git$ ]]; then
+  # .git is common but optional on both SSH forms. The repo capture is greedy, so it swallows a
+  # trailing ".git" when present; the repo="${repo%.git}" strip below normalizes it either way.
+  elif [[ "$url" =~ ^git@([^:]+):([^/]+)/([^/]+)$ ]] || [[ "$url" =~ ^ssh://git@([^/]+)/([^/]+)/([^/]+)$ ]]; then
     host="${BASH_REMATCH[1]}"; owner="${BASH_REMATCH[2]}"; repo="${BASH_REMATCH[3]}"
   else
     return 1
@@ -515,8 +517,12 @@ pg_repo_identity_from_url() { # GitHub/Git remote URL -> host<TAB>owner<TAB>repo
 }
 # A compact, marker-addressed sidecar survives reservation retirement and completion:
 # host<TAB>owner<TAB>repo<TAB>round_key<TAB>pr<TAB>out<TAB>charged_spend_epoch
-pg_run_meta_write() { # marker host owner repo round_key pr out [charged_spend_epoch]
-  local marker="$1" host="$2" owner="$3" repo="$4" key="$5" pr="$6" out="$7" spend="${8:-}" dir f prev
+# charged_spend_epoch is REQUIRED (no caller may write an uncharged/empty-spend record): the
+# only writer is the charged call site adjacent to pg_round_record, so a run-meta record's mere
+# existence proves a round was actually spent. An attempt that never reaches that charge must
+# never mint a sidecar for recovery to find.
+pg_run_meta_write() { # marker host owner repo round_key pr out charged_spend_epoch
+  local marker="$1" host="$2" owner="$3" repo="$4" key="$5" pr="$6" out="$7" spend="${8:-}" dir f
   pg_reservation_marker_ok "$marker" || return 1
   pg_canonical_repo_ok "$host" "$owner" "$repo" || return 1
   pg_round_key_ok "$key" || return 1
@@ -525,15 +531,10 @@ pg_run_meta_write() { # marker host owner repo round_key pr out [charged_spend_e
   case "$spend" in ''|*[!0-9]*) return 1;; esac
   dir="$(pg_run_meta_dir)"; mkdir -p "$dir" 2>/dev/null || return 1
   f="$dir/$marker"
-  # A later lifecycle transition supplies the authoritative charge; no caller may erase it.
-  if [ -f "$f" ] && [ -z "$spend" ]; then
-    prev="$(awk -F'\t' 'NR==1{print $7}' "$f" 2>/dev/null)"
-    case "$prev" in ''|*[!0-9]*) ;; *) spend="$prev";; esac
-  fi
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$host" "$owner" "$repo" "$key" "$pr" "$out" "$spend" > "$f.tmp.$$" 2>/dev/null \
-    && mv -f "$f.tmp.$$" "$f" 2>/dev/null
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$host" "$owner" "$repo" "$key" "$pr" "$out" "$spend" > "$dir/.$marker.tmp.$$" 2>/dev/null \
+    && mv -f "$dir/.$marker.tmp.$$" "$f" 2>/dev/null
   local rc=$?
-  rm -f "$f.tmp.$$" 2>/dev/null
+  rm -f "$dir/.$marker.tmp.$$" 2>/dev/null
   return "$rc"
 }
 pg_run_meta_remove() { # marker -- retire an attempt proven never submitted/spent
@@ -562,6 +563,10 @@ pg_run_meta_scan() {
   for f in "$dir"/pg-run-*; do
     [ -f "$f" ] || continue
     marker="$(basename "$f")"
+    # Belt-and-suspenders: pg_run_meta_write's own publication temp is dot-prefixed (excluded by
+    # the glob above), but skip any leftover/foreign ".tmp." name too rather than trust the glob
+    # alone — a half-published record here would surface a candidate no charge backs.
+    case "$marker" in *.tmp.*) continue;; esac
     pg_reservation_marker_ok "$marker" || continue
     rec="$(pg_run_meta_read "$marker" 2>/dev/null)" || continue
     printf '%s\t%s\n' "$marker" "$rec"

@@ -35,9 +35,9 @@ exit 99
 FAKE_PREFLIGHT
 chmod +x "$TDIR/bin/oracle-preflight"
 
-start_mock() { # $1 = source text; optional $2 = organizer/browser state; optional $3 = scratch text; sets MOCK_PID + PORT
+start_mock() { # $1 = source text; optional $2 = organizer/browser state; optional $3 = scratch text; optional $4 = scratch canonical URL
   [ -n "${MOCK_PID:-}" ] && kill "$MOCK_PID" 2>/dev/null
-  node "$HERE/mock-cdp.mjs" "$1" "${2:-}" "${3:-}" > "$TDIR/port" 2>"$TDIR/mock.log" &
+  node "$HERE/mock-cdp.mjs" "$1" "${2:-}" "${3:-}" "${4:-}" > "$TDIR/port" 2>"$TDIR/mock.log" &
   MOCK_PID=$!
   for _ in $(seq 1 50); do [ -s "$TDIR/port" ] && break; sleep 0.1; done
   PORT="$(tr -d '[:space:]' < "$TDIR/port")"; : > "$TDIR/port"
@@ -247,6 +247,8 @@ check 'readable stale harvest leaves the source target untouched' \
   "$([ "$(jq -r '[.closed[]? | select(. == "tab1")] | length' "$STALE_STATE")" = 0 ]; echo $?)" "$(cat "$STALE_STATE")"
 check 'readable stale harvest opens and closes exactly one scratch target' \
   "$([ "$(jq -r '.created | length' "$STALE_STATE")" = 1 ] && [ "$(jq -r '.closed | map(select(. == "scratch1")) | length' "$STALE_STATE")" = 1 ]; echo $?)" "$(cat "$STALE_STATE")"
+check 'readable stale harvest requests the canonical conversation URL' \
+  "$([ "$(jq -r '.created[0].url' "$STALE_STATE")" = 'https://chatgpt.com/c/mock-conversation' ]; echo $?)" "$(cat "$STALE_STATE")"
 # A second harvest must see the immutable completed artifact rather than race the stale source,
 # write another artifact, or ever reach the fresh-dispatch Oracle binary.
 : > "$STALE_SENTINEL"
@@ -264,15 +266,15 @@ check 'idempotent stale harvest leaves the retired reservation absent' \
 # Non-terminal stale scratch evidence retains the existing state. These remain direct harvest
 # integrations so the CDP class-to-shell lifecycle boundary, rather than a duplicate shell
 # classifier, owns the behavior.
-run_stale_retention_case() { # <label> <marker> <scratch-file> <expected-rc>
-  local label marker scratch expected_rc source state
-  label="$1"; marker="$2"; scratch="$3"; expected_rc="$4"
+run_stale_retention_case() { # <label> <marker> <scratch-file> <expected-rc> [scratch-canonical-url]
+  local label marker scratch expected_rc scratch_canonical_url source state
+  label="$1"; marker="$2"; scratch="$3"; expected_rc="$4"; scratch_canonical_url="${5:-}"
   source="$TDIR/${label}-source.txt"; state="$TDIR/${label}-state.json"
   printf 'run marker: %s\nstale readable source\n' "$marker" > "$source"
   printf '{"title":null,"archived":false,"events":[]}\n' > "$state"
   printf '%s\t%s\t%s\t0\t1\tGPT-X\t1700000701\tgenerating\n' "$label" "$TDIR/o-${label}.md" "$(date +%s)" > "$TDIR/home/in-progress/$marker"
   : > "$STALE_SENTINEL"
-  start_mock "$source" "$state" "$scratch"
+  start_mock "$source" "$state" "$scratch" "$scratch_canonical_url"
   PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
     PRO_GATE_RAMP=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-stale-sentinel" PG_TEST_ORACLE_SENTINEL="$STALE_SENTINEL" NODE_OPTIONS= \
     bash "$ENGINE" --harvest "$marker" --out "$TDIR/o-${label}.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
@@ -294,6 +296,18 @@ MSTALE_INCONCLUSIVE="pg-run-stale-inconclusive-77-1700000702-703"
 STALE_INCONCLUSIVE="$TDIR/stale-inconclusive-scratch.txt"
 printf 'Loading ChatGPT…\n' > "$STALE_INCONCLUSIVE"
 run_stale_retention_case stale-inconclusive "$MSTALE_INCONCLUSIVE" "$STALE_INCONCLUSIVE" 9
+
+# Mock scratch content is URL-bound: a completed artifact attached to a different canonical URL
+# must be inconclusive and never reach the harvest lifecycle.
+MSTALE_WRONG_URL="pg-run-stale-wrong-url-77-1700000702-703"
+STALE_WRONG_URL="$TDIR/stale-wrong-url-scratch.txt"
+cat > "$STALE_WRONG_URL" <<STALE_WRONG_URL_TEXT
+run marker: $MSTALE_WRONG_URL
+[P1] src/wrong-url.mjs:1 — must not be accepted
+P2: none
+VERDICT: SHIP — wrong URL artifact. (run marker: $MSTALE_WRONG_URL)
+STALE_WRONG_URL_TEXT
+run_stale_retention_case stale-wrong-url "$MSTALE_WRONG_URL" "$STALE_WRONG_URL" 9 'https://chatgpt.com/c/not-the-source'
 
 MSTALE_THROTTLE="pg-run-stale-throttle-77-1700000703-704"
 STALE_THROTTLE="$TDIR/stale-throttle-scratch.txt"
@@ -317,7 +331,8 @@ run_stale_retention_case stale-cross "$MSTALE_CROSS" "$STALE_CROSS" 9
 # These cases intentionally retained their state; clear only their isolated fixture records before
 # asserting the probe's single capacity transition.
 rm -f "$TDIR/home/in-progress/$MSTALE_INCOMPLETE" "$TDIR/home/in-progress/$MSTALE_INCONCLUSIVE" \
-  "$TDIR/home/in-progress/$MSTALE_THROTTLE" "$TDIR/home/in-progress/$MSTALE_CROSS"
+  "$TDIR/home/in-progress/$MSTALE_WRONG_URL" "$TDIR/home/in-progress/$MSTALE_THROTTLE" \
+  "$TDIR/home/in-progress/$MSTALE_CROSS"
 
 # The same revalidated terminal evidence drives probe. Reconciliation changes only the existing
 # state field from generating to complete: it preserves the collectable reservation and frees its
@@ -365,7 +380,8 @@ check 'concurrent stale harvest starts neither scratch nor Oracle' \
   "$([ "$(jq -r '.created | length' "$TDIR/stale-busy-state.json")" = 0 ] && [ ! -s "$STALE_SENTINEL" ]; echo $?)" "state=$(cat "$TDIR/stale-busy-state.json") oracle=$(cat "$STALE_SENTINEL" 2>/dev/null)"
 # Keep the rest of the legacy engine suite independent from these intentionally retained records.
 rm -f "$TDIR/home/in-progress/$MSTALE_INCOMPLETE" "$TDIR/home/in-progress/$MSTALE_INCONCLUSIVE" \
-  "$TDIR/home/in-progress/$MSTALE_THROTTLE" "$TDIR/home/in-progress/$MSTALE_CROSS" \
+  "$TDIR/home/in-progress/$MSTALE_WRONG_URL" "$TDIR/home/in-progress/$MSTALE_THROTTLE" \
+  "$TDIR/home/in-progress/$MSTALE_CROSS" \
   "$TDIR/home/in-progress/$MSTALE_PROBE" "$TDIR/home/in-progress/$MSTALE_BUSY"
 
 echo '# harvest: already collected (v0.28) vs genuinely gone'
@@ -3264,5 +3280,139 @@ REC_META_RECORD="$(cat "$REC_META_HOME/run-meta/$REC_META_MARKER" 2>/dev/null)"
 check 'fresh run persists canonical repository identity and charged-spend ordering metadata' \
   "$([ "$RC" -eq 0 ] && [ -n "$REC_META_MARKER" ] && printf '%s\n' "$REC_META_RECORD" | awk -F'\t' 'NF == 7 && $1 == "github.com" && $2 == "acme" && $3 == "widgets" && $5 == "105" && $7 ~ /^[0-9]+$/ {ok=1} END{exit !ok}'; echo $?)" \
   "rc=$RC marker=$REC_META_MARKER meta=$REC_META_RECORD stderr=$(tail -3 "$TDIR/recover.stderr")"
+
+# v0.35.x fix: the early (pre-charge) run-meta write was a no-op WARNING generator — it never
+# supplied charged_spend_epoch, and pg_run_meta_write now REQUIRES it. Recovery metadata is
+# published only together with the authoritative charge, so an uncharged terminal exit (here:
+# round-capped, which mints RUN_MARKER before ever reaching pg_round_record) must mint no
+# run-meta record and print no metadata WARNING, while a prior charged artifact for the same PR
+# stays recoverable exactly as before.
+echo '# fix: uncharged terminal exit no longer mints a false run-meta record'
+UNCH_HOME="$TDIR/home-uncharged"
+UNCH_REPO="$TDIR/uncharged-repo"; git init -q "$UNCH_REPO"
+git -C "$UNCH_REPO" remote add origin https://github.com/acme/uncharged.git
+mkdir -p "$UNCH_HOME/completed" "$UNCH_HOME/run-meta"
+UNCH_PRIOR='pg-run-acme-uncharged-201-1700009000-1'
+printf '[P1] src/prior.sh:1 - prior charged finding\n  Why: durable\nP2: none\nP3: none\nVERDICT: SHIP - prior.\n' > "$UNCH_HOME/completed/$UNCH_PRIOR"
+printf 'github.com\tacme\tuncharged\tacme-uncharged-201\t201\t/tmp/prior.md\t1700009100\n' > "$UNCH_HOME/run-meta/$UNCH_PRIOR"
+UNCH_BEFORE="$(find "$UNCH_HOME/run-meta" -type f | sort)"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+start_mock "$TDIR/tab.txt"
+env PRO_GATE_HOME="$UNCH_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_MAX_ROUNDS_PER_PR=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" NODE_OPTIONS= \
+  bash "$ENGINE" --pr 201 --repo "$UNCH_REPO" --diff "$TDIR/small.diff" --out "$TDIR/o-uncharged.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'uncharged round-capped run exits 12' "$([ "$RC" -eq 12 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+UNCH_MARKER="$(jq -r .marker "$TDIR/o-uncharged.md.status" 2>/dev/null)"
+UNCH_AFTER="$(find "$UNCH_HOME/run-meta" -type f | sort)"
+check 'uncharged terminal exit mints no run-meta record for its own marker' \
+  "$([ -n "$UNCH_MARKER" ] && [ ! -e "$UNCH_HOME/run-meta/$UNCH_MARKER" ] && [ "$UNCH_BEFORE" = "$UNCH_AFTER" ]; echo $?)" \
+  "marker=$UNCH_MARKER before=$UNCH_BEFORE after=$UNCH_AFTER"
+check 'uncharged terminal exit emits no metadata WARNING' \
+  "$(! grep -q 'could not persist recovery' "$TDIR/stderr"; echo $?)" "$(cat "$TDIR/stderr")"
+recover_run "$UNCH_HOME" --recover 'https://github.com/acme/uncharged/pull/201'
+check 'recover after an uncharged attempt still returns the prior charged artifact' \
+  "$([ "$RC" -eq 0 ] && cmp -s "$UNCH_HOME/completed/$UNCH_PRIOR" "$TDIR/recover.stdout"; echo $?)" "rc=$RC stdout=$(cat "$TDIR/recover.stdout")"
+
+# fix: pg_run_meta_write's own publication temp ($f.tmp.$$) used to match the pg-run-* glob AND
+# pg_reservation_marker_ok (dots are a legal marker character), so a concurrent scan mid-publish
+# could surface a half-written record. The temp is now dot-prefixed (excluded by the glob) and
+# the scanner also skips any lingering "*.tmp.*" basename as a second line of defense.
+echo '# fix: publication temps are excluded from the run-meta recovery scan'
+TMPSCAN_HOME="$TDIR/home-tmpscan"; mkdir -p "$TMPSCAN_HOME/run-meta"
+TMPSCAN_GOOD='pg-run-acme-widgets-301-1700009900-1'
+printf 'github.com\tacme\twidgets\tacme-widgets-301\t301\t/tmp/good.md\t1700010000\n' > "$TMPSCAN_HOME/run-meta/$TMPSCAN_GOOD"
+printf 'github.com\tacme\twidgets\tacme-widgets-301\t301\t/tmp/bad.md\t1700010001\n' \
+  > "$TMPSCAN_HOME/run-meta/pg-run-acme-widgets-301-1700009901-2.tmp.99"
+SCAN_OUT="$(PRO_GATE_HOME="$TMPSCAN_HOME" bash -c '. "'"$HERE"'/../lib/pro-gate-lib.sh"; pg_run_meta_scan')"
+check 'run-meta scan excludes a planted publication-temp record' \
+  "$(! printf '%s\n' "$SCAN_OUT" | grep -qF 'tmp.99'; echo $?)" "scan: $SCAN_OUT"
+check 'run-meta scan still returns the committed record beside it' \
+  "$(printf '%s\n' "$SCAN_OUT" | grep -qF "$TMPSCAN_GOOD"; echo $?)" "scan: $SCAN_OUT"
+
+# fix: --recover extracted the PR number from everything after the FINAL slash, so a canonical
+# URL with one trailing slash (a spelling pg_repo_identity_from_url already accepts) yielded an
+# empty number and forced a spurious disambiguation.
+echo '# fix: --recover accepts one trailing slash on a canonical PR URL'
+TRAILSLASH_HOME="$TDIR/home-trailslash"; mkdir -p "$TRAILSLASH_HOME/completed" "$TRAILSLASH_HOME/run-meta"
+TRAILSLASH_MARKER='pg-run-acme-widgets-401-1700010100-1'
+printf '[P1] src/ts.sh:1 - trailing slash fixture\n  Why: durable\nP2: none\nP3: none\nVERDICT: SHIP - ts.\n' \
+  > "$TRAILSLASH_HOME/completed/$TRAILSLASH_MARKER"
+printf 'github.com\tacme\twidgets\tacme-widgets-401\t401\t/tmp/ts.md\t1700010200\n' > "$TRAILSLASH_HOME/run-meta/$TRAILSLASH_MARKER"
+recover_run "$TRAILSLASH_HOME" --recover 'https://github.com/acme/widgets/pull/401/'
+check 'recover of a trailing-slash canonical PR URL returns the prior charged artifact' \
+  "$([ "$RC" -eq 0 ] && cmp -s "$TRAILSLASH_HOME/completed/$TRAILSLASH_MARKER" "$TDIR/recover.stdout"; echo $?)" \
+  "rc=$RC stdout=$(cat "$TDIR/recover.stdout") stderr=$(cat "$TDIR/recover.stderr")"
+
+# fix: pg_repo_identity_from_url required a literal .git suffix on both SSH remote spellings;
+# common remotes omit it, which refused bare-PR recovery despite a unique proven checkout.
+echo '# fix: pg_repo_identity_from_url accepts SSH remotes without a .git suffix'
+check 'git@host:owner/repo (no .git) parses to canonical identity' \
+  "$(bash -c '. "'"$HERE"'/../lib/pro-gate-lib.sh"; [ "$(pg_repo_identity_from_url "git@github.com:acme/widgets")" = "$(printf "github.com\tacme\twidgets")" ]'; echo $?)" \
+  "$(bash -c '. "'"$HERE"'/../lib/pro-gate-lib.sh"; pg_repo_identity_from_url "git@github.com:acme/widgets"')"
+check 'ssh://git@host/owner/repo (no .git) parses to canonical identity' \
+  "$(bash -c '. "'"$HERE"'/../lib/pro-gate-lib.sh"; [ "$(pg_repo_identity_from_url "ssh://git@github.com/acme/widgets")" = "$(printf "github.com\tacme\twidgets")" ]'; echo $?)" \
+  "$(bash -c '. "'"$HERE"'/../lib/pro-gate-lib.sh"; pg_repo_identity_from_url "ssh://git@github.com/acme/widgets"')"
+check 'git@host:owner/repo.git (with .git) still parses (existing strip preserved)' \
+  "$(bash -c '. "'"$HERE"'/../lib/pro-gate-lib.sh"; [ "$(pg_repo_identity_from_url "git@github.com:acme/widgets.git")" = "$(printf "github.com\tacme\twidgets")" ]'; echo $?)" \
+  "$(bash -c '. "'"$HERE"'/../lib/pro-gate-lib.sh"; pg_repo_identity_from_url "git@github.com:acme/widgets.git"')"
+check 'ssh://git@host/owner/repo.git (with .git) still parses' \
+  "$(bash -c '. "'"$HERE"'/../lib/pro-gate-lib.sh"; [ "$(pg_repo_identity_from_url "ssh://git@github.com/acme/widgets.git")" = "$(printf "github.com\tacme\twidgets")" ]'; echo $?)" \
+  "$(bash -c '. "'"$HERE"'/../lib/pro-gate-lib.sh"; pg_repo_identity_from_url "ssh://git@github.com/acme/widgets.git"')"
+check 'a malformed ssh-ish form (no colon, no ssh://) still refuses' \
+  "$(! bash -c '. "'"$HERE"'/../lib/pro-gate-lib.sh"; pg_repo_identity_from_url "git@github.com/acme/widgets"' >/dev/null 2>&1; echo $?)" \
+  "expected nonzero"
+
+# Recovery parser negative table: --recover is exclusive with every dispatch/status flag, and
+# with no query at all. Every case must refuse before any state mutation or fresh dispatch.
+echo '# --recover negative parser table: exclusive with every other mode, and rejects no query'
+NEG_HOME="$TDIR/home-recover-neg"; mkdir -p "$NEG_HOME/run-meta" "$NEG_HOME/completed"
+neg_snapshot() {
+  find "$NEG_HOME" -mindepth 1 -type f -printf '%P:%s\n' 2>/dev/null | sort
+  find "$TDIR" -maxdepth 1 -name 'recover-oracle-sentinel' -printf '%s\n'
+}
+: > "$TDIR/recover-oracle-sentinel"
+NEG_BEFORE="$(neg_snapshot)"
+recover_run "$NEG_HOME" --recover 501 --pr 1
+check 'recover + --pr exits 2' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC stderr=$(cat "$TDIR/recover.stderr")"
+check 'recover + --pr names the misuse on stderr' "$(grep -qi 'recover' "$TDIR/recover.stderr"; echo $?)" "$(cat "$TDIR/recover.stderr")"
+recover_run "$NEG_HOME" --recover 501 --diff "$TDIR/small.diff"
+check 'recover + --diff exits 2' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC stderr=$(cat "$TDIR/recover.stderr")"
+recover_run "$NEG_HOME" --recover 501 --harvest pg-run-x-1-1
+check 'recover + --harvest exits 2' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC stderr=$(cat "$TDIR/recover.stderr")"
+recover_run "$NEG_HOME" --recover 501 --status
+check 'recover + --status exits 2' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC stderr=$(cat "$TDIR/recover.stderr")"
+recover_run "$NEG_HOME" --recover 501 --json
+check 'recover + --json exits 2' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC stderr=$(cat "$TDIR/recover.stderr")"
+recover_run "$NEG_HOME" --recover ''
+check 'recover with no query exits 2' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC stderr=$(cat "$TDIR/recover.stderr")"
+NEG_AFTER="$(neg_snapshot)"
+check 'negative recover table creates no run-meta/recovered/reservation state and never dispatches oracle' \
+  "$([ "$NEG_BEFORE" = "$NEG_AFTER" ]; echo $?)" "before=$NEG_BEFORE after=$NEG_AFTER"
+
+# U3 publication-failure mapping (documented in the --recover artifact-first block): OUT given,
+# pg_completed_lookup fails to copy the durable artifact to --out -> "Browser needs attention" on
+# stderr, exit 6, the durable artifact untouched, no browser/round/reservation side effects, and
+# stdout carries no review claim.
+echo '# U3 publication-failure mapping: --recover --out with an unwritable/nonexistent parent'
+PUBF_HOME="$TDIR/home-recover-pubfail"
+PUBF_MARKER='pg-run-acme-widgets-601-1700010500-1'
+mkdir -p "$PUBF_HOME/completed"
+printf '[P1] src/pub.sh:1 - pub fixture\n  Why: durable\nP2: none\nP3: none\nVERDICT: SHIP - pub.\n' > "$PUBF_HOME/completed/$PUBF_MARKER"
+PUBF_BEFORE="$(cat "$PUBF_HOME/completed/$PUBF_MARKER")"
+: > "$TDIR/recover-oracle-sentinel"
+recover_run "$PUBF_HOME" --recover "$PUBF_MARKER" --out "$TDIR/no-such-parent-dir/out.md" --timeout 1s
+check 'publication failure exits 6 with "Browser needs attention" on stderr' \
+  "$([ "$RC" -eq 6 ] && grep -qx 'Browser needs attention' "$TDIR/recover.stderr"; echo $?)" "rc=$RC stderr=$(cat "$TDIR/recover.stderr")"
+check 'publication failure leaves the durable artifact byte-identical' \
+  "$([ "$(cat "$PUBF_HOME/completed/$PUBF_MARKER")" = "$PUBF_BEFORE" ]; echo $?)" "artifact changed"
+check 'publication failure creates no output file' \
+  "$([ ! -e "$TDIR/no-such-parent-dir/out.md" ]; echo $?)" "out file exists"
+check 'publication failure has no browser/round/reservation side effects' \
+  "$([ ! -d "$PUBF_HOME/in-progress" ] && [ ! -d "$PUBF_HOME/rounds" ] && [ ! -s "$TDIR/recover-oracle-sentinel" ]; echo $?)" \
+  "oracle=$(cat "$TDIR/recover-oracle-sentinel")"
+check 'publication failure stdout carries no review claim' \
+  "$([ ! -s "$TDIR/recover.stdout" ]; echo $?)" "stdout=$(cat "$TDIR/recover.stdout")"
 
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }

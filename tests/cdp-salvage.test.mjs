@@ -107,6 +107,7 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
       const url = decodeURIComponent(req.url.slice(req.url.indexOf('?') + 1));
       const id = `scratch${created.length + 1}`;
       created.push({ id, url });
+      if (opts.hangScratchOpen) return;
       res.setHeader('content-type', 'application/json');
       res.end(JSON.stringify({
         id, type: 'page', url, webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/${id}`,
@@ -114,6 +115,7 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
       return;
     }
     if (req.url === '/json') {
+      if (opts.hangScratchList && created.some((t) => !closed.includes(t.id))) return;
       const port = server.address().port;
       res.setHeader('content-type', 'application/json');
       // Extras are listed verbatim EXCEPT that a caller-supplied tab with no debugger URL
@@ -147,7 +149,12 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
       }, ...extras, ...scratch]));
       return;
     }
-    if (req.url?.startsWith('/json/close/')) { closed.push(req.url.split('/').pop()); res.end('ok'); return; }
+    if (req.url?.startsWith('/json/close/')) {
+      closed.push(req.url.split('/').pop());
+      if (opts.hangScratchClose && req.url.split('/').pop().startsWith('scratch')) return;
+      res.end('ok');
+      return;
+    }
     res.statusCode = 404; res.end();
   });
   server.on('upgrade', (req, socket) => {
@@ -276,6 +283,7 @@ function runSalvage(args, port, seed, extraEnv = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
   if (seed) seed(home);
   return new Promise((resolve) => {
+    const startedAt = Date.now();
     const expandedArgs = args.map((arg) => arg.replace(/^PG_HOME\//, `${home}/`));
     const child = spawn(process.execPath, [SALVAGE, ...expandedArgs, String(port)], {
       env: { ...process.env, PRO_GATE_HOME: home, ...extraEnv },
@@ -283,7 +291,7 @@ function runSalvage(args, port, seed, extraEnv = {}) {
     let stdout = '', stderr = '';
     child.stdout.on('data', (d) => { stdout += d; });
     child.stderr.on('data', (d) => { stderr += d; });
-    const killer = setTimeout(() => child.kill('SIGKILL'), 90_000);
+    const killer = setTimeout(() => child.kill('SIGKILL'), Number(extraEnv.PRO_GATE_TEST_CHILD_TIMEOUT_MS ?? 90_000));
     child.on('close', (status) => {
       clearTimeout(killer);
       const read = (rel) => { try { return fs.readFileSync(path.join(home, rel), 'utf8'); } catch { return null; } };
@@ -301,7 +309,10 @@ function runSalvage(args, port, seed, extraEnv = {}) {
         } catch { return 0; }
       })();
       fs.rmSync(home, { recursive: true, force: true });
-      resolve({ status, stdout, stderr, memoUrl: memoUrl?.trim() ?? null, memos, blacklist, cooldown, crossbound });
+      resolve({
+        status, stdout, stderr, elapsedMs: Date.now() - startedAt,
+        memoUrl: memoUrl?.trim() ?? null, memos, blacklist, cooldown, crossbound,
+      });
     });
   });
 }
@@ -562,6 +573,51 @@ const MARKER = 'pg-run-test-1234567890-42';
     foreignResult.memos.length === 0 && /mock-conversation/.test(foreignResult.blacklist ?? ''),
     `memos=${JSON.stringify(foreignResult.memos)} blacklist=${foreignResult.blacklist}`);
   foreignOnly.stop();
+}
+
+{ // P1: a readable incomplete source must not overwrite a prior genuine memo before its one
+  // canonical scratch revalidation has ruled out a cross-bound answer.
+  const priorUrl = 'https://chatgpt.com/c/prior-genuine';
+  const source = `run marker: ${MARKER}\nstale readable source`;
+  const crossBoundAnswer = [
+    `run marker: ${MARKER}`,
+    '[P1] foreign/source.mjs:1 — another run',
+    'VERDICT: FIX-FIRST — not ours. (run marker: pg-run-other-repo-42-1111111111-9)',
+  ].join('\n');
+  const cdp = await mockCdp(source, [], { renderText: () => crossBoundAnswer });
+  const r = await runSalvage([MARKER, '3'], cdp.port, seedMemo(MARKER, priorUrl));
+  check('cross-bound stale scratch rejects source A without replacing prior memo B',
+    r.status === 7 && r.memoUrl === priorUrl && r.memos.length === 1,
+    `status=${r.status} memo=${r.memoUrl} memos=${JSON.stringify(r.memos)} stderr=${r.stderr}`);
+  check('cross-bound stale scratch records its diagnostic despite readable source A', r.crossbound > 0,
+    `crossbound=${r.crossbound} stderr=${r.stderr}`);
+  check('cross-bound stale scratch rejects A without mutating its source target',
+    /mock-conversation/.test(r.blacklist ?? '') && !cdp.closed.includes('tab1') &&
+      !cdp.requests.some((request) => request.method === 'Page.navigate'),
+    `blacklist=${r.blacklist} closed=${cdp.closed} requests=${JSON.stringify(cdp.requests)}`);
+  cdp.stop();
+}
+
+{ // P1: an unresponsive scratch-open endpoint is absence of fresh evidence, not permission to
+  // overrun the caller deadline or mutate a readable source's prior recovery handle.
+  const priorUrl = 'https://chatgpt.com/c/prior-genuine';
+  const source = `run marker: ${MARKER}\nstale readable source`;
+  for (const [label, args, expectedStatus] of [
+    ['normal', [MARKER, '3'], 3],
+    ['probe', ['--probe', MARKER, '3'], 0],
+  ]) {
+    const cdp = await mockCdp(source, [], { hangScratchOpen: true });
+    const r = await runSalvage(args, cdp.port, seedMemo(MARKER, priorUrl), {
+      PRO_GATE_TEST_CHILD_TIMEOUT_MS: '6000',
+    });
+    check(`${label} scratch-open timeout returns before its watchdog fallback`,
+      r.status === expectedStatus && r.elapsedMs < 4_500,
+      `status=${r.status} elapsed=${r.elapsedMs}ms stderr=${r.stderr}`);
+    check(`${label} scratch-open timeout leaves source and recovery state unchanged`,
+      r.memoUrl === priorUrl && r.blacklist === null && r.crossbound === 0 && !cdp.closed.includes('tab1'),
+      `memo=${r.memoUrl} blacklist=${r.blacklist} crossbound=${r.crossbound} closed=${cdp.closed}`);
+    cdp.stop();
+  }
 }
 
 { // completed review: marker + Pn block + VERDICT -> exit 0, review on stdout, tab LEFT OPEN
