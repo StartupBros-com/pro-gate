@@ -3318,18 +3318,27 @@ check 'recover after an uncharged attempt still returns the prior charged artifa
 # fix: pg_run_meta_write's own publication temp ($f.tmp.$$) used to match the pg-run-* glob AND
 # pg_reservation_marker_ok (dots are a legal marker character), so a concurrent scan mid-publish
 # could surface a half-written record. The temp is now dot-prefixed (excluded by the glob) and
-# the scanner also skips any lingering "*.tmp.*" basename as a second line of defense.
+# the scanner also skips a lingering "<marker>.tmp.<pid>" basename left by a pre-fix version.
 echo '# fix: publication temps are excluded from the run-meta recovery scan'
 TMPSCAN_HOME="$TDIR/home-tmpscan"; mkdir -p "$TMPSCAN_HOME/run-meta"
 TMPSCAN_GOOD='pg-run-acme-widgets-301-1700009900-1'
 printf 'github.com\tacme\twidgets\tacme-widgets-301\t301\t/tmp/good.md\t1700010000\n' > "$TMPSCAN_HOME/run-meta/$TMPSCAN_GOOD"
 printf 'github.com\tacme\twidgets\tacme-widgets-301\t301\t/tmp/bad.md\t1700010001\n' \
   > "$TMPSCAN_HOME/run-meta/pg-run-acme-widgets-301-1700009901-2.tmp.99"
+# A repo or branch may legitimately contain the literal ".tmp." (GitHub allows dots in a repo
+# name), and ROUND_KEY preserves dots, so a bare "*.tmp.*" substring skip would hide this
+# CHARGED record from every future recovery scan forever. A real marker always ends
+# "-<epoch>-<pid>", so anchoring on an all-digit tail after the LAST ".tmp." separates the two.
+TMPSCAN_DOTTED='pg-run-acme-app.tmp.v2-302-1700009902-3'
+printf 'github.com\tacme\tapp.tmp.v2\tacme-app.tmp.v2-302\t302\t/tmp/dotted.md\t1700010002\n' \
+  > "$TMPSCAN_HOME/run-meta/$TMPSCAN_DOTTED"
 SCAN_OUT="$(PRO_GATE_HOME="$TMPSCAN_HOME" bash -c '. "'"$HERE"'/../lib/pro-gate-lib.sh"; pg_run_meta_scan')"
 check 'run-meta scan excludes a planted publication-temp record' \
   "$(! printf '%s\n' "$SCAN_OUT" | grep -qF 'tmp.99'; echo $?)" "scan: $SCAN_OUT"
 check 'run-meta scan still returns the committed record beside it' \
   "$(printf '%s\n' "$SCAN_OUT" | grep -qF "$TMPSCAN_GOOD"; echo $?)" "scan: $SCAN_OUT"
+check 'run-meta scan keeps a charged record whose repo name contains .tmp.' \
+  "$(printf '%s\n' "$SCAN_OUT" | grep -qF "$TMPSCAN_DOTTED"; echo $?)" "scan: $SCAN_OUT"
 
 # fix: --recover extracted the PR number from everything after the FINAL slash, so a canonical
 # URL with one trailing slash (a spelling pg_repo_identity_from_url already accepts) yielded an
