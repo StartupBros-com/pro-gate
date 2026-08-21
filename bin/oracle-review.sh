@@ -166,14 +166,42 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
   # Artifact-first is intentionally smaller than --harvest's historical fast path: no work dir,
   # preflight, status/ledger/active records, reservation retirement, organizer, or lock. stdout is
   # exclusively review bytes; the novice state remains a single plain stderr line.
+  #
+  # gate #91 P1 (:169): pg_persist_result's own durability ladder falls through to pending/<marker>
+  # BYTES whenever the completed store is unwritable (and retires the reservation there, same as a
+  # completed write) — pending/ is verified review content, not a lesser record. Checking only
+  # pg_completed_dir() meant a review durable ONLY under pending/ was invisible here: recovery fell
+  # through to a fresh harvest that could report failure after the tab was gone, even though the
+  # only bytes that ever needed collecting were already sitting on disk. Pending is checked as a
+  # fallback (completed still wins when both somehow exist) and is READ-ONLY here — no promotion
+  # into completed/, no removal: --recover stays side-effect free, exactly like the completed path.
   REC_ART="$(pg_completed_dir)/$REC_SELECTED"
+  REC_PENDING_ART="$PRO_GATE_HOME/pending/$REC_SELECTED"
+  REC_SRC=""
   if [ -s "$REC_ART" ] && pg_is_review "$REC_ART"; then
-    if [ -n "$OUT" ] && ! pg_completed_lookup "$REC_SELECTED" "$OUT"; then
-      echo "Browser needs attention" >&2
-      exit 6
+    REC_SRC="$REC_ART"
+  elif [ -s "$REC_PENDING_ART" ] && pg_is_review "$REC_PENDING_ART"; then
+    REC_SRC="$REC_PENDING_ART"
+  fi
+  if [ -n "$REC_SRC" ]; then
+    if [ -n "$OUT" ]; then
+      # pg_completed_lookup only knows the completed store's own path, so the pending source needs
+      # the identical copy-then-rename discipline inline: never pre-delete an existing --out (a
+      # copy/rename failure must leave it intact), and skip the copy entirely when --out already
+      # IS the source (pg_completed_lookup's own no-op case).
+      if [ "$REC_SRC" = "$OUT" ]; then
+        :
+      elif [ "$REC_SRC" = "$REC_ART" ]; then
+        pg_completed_lookup "$REC_SELECTED" "$OUT" || { echo "Browser needs attention" >&2; exit 6; }
+      else
+        cp "$REC_SRC" "$OUT.already.$$" 2>/dev/null && mv -f "$OUT.already.$$" "$OUT" 2>/dev/null
+        REC_PUB_RC=$?
+        rm -f "$OUT.already.$$" 2>/dev/null
+        [ "$REC_PUB_RC" = 0 ] || { echo "Browser needs attention" >&2; exit 6; }
+      fi
     fi
     echo "Review ready" >&2
-    cat "$REC_ART"
+    cat "$REC_SRC"
     exit 0
   fi
 
@@ -188,7 +216,20 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
     fi
   fi
   if [ -z "$OUT" ]; then
-    if [ -n "$REC_SELECTED_OUT" ]; then
+    # gate #91 P1 (:192): a fresh run persists $OUT verbatim (see the charge-time write below), and
+    # a caller's relative --out is resolved against $REPO there, not against wherever --recover
+    # happens to run from (it never `cd`s anywhere). Reusing a recorded relative path here would
+    # therefore publish into whatever sits under THIS invocation's cwd — an unrelated file, not the
+    # run's real output. Only trust a recorded OUT that is unambiguous on its own: absolute, with a
+    # parent directory that still exists and still accepts writes (the default --out lives inside a
+    # per-run mktemp dir, which the engine deletes on exit — a dead parent must fall back exactly
+    # like "no metadata at all" instead of failing later at the publish step).
+    REC_OUT_PARENT=""
+    case "$REC_SELECTED_OUT" in
+      /*) REC_OUT_PARENT="$(dirname "$REC_SELECTED_OUT")";;
+    esac
+    if [ -n "$REC_SELECTED_OUT" ] && [ -n "$REC_OUT_PARENT" ] \
+       && [ -d "$REC_OUT_PARENT" ] && [ -w "$REC_OUT_PARENT" ]; then
       OUT="$REC_SELECTED_OUT"
     else
       mkdir -p "$PRO_GATE_HOME/recovered" 2>/dev/null \
@@ -196,10 +237,43 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
       OUT="$PRO_GATE_HOME/recovered/$REC_SELECTED.md"
     fi
   fi
-  bash "$0" --harvest "$REC_SELECTED" --out "$OUT" --timeout "$TIMEOUT"
+  # gate #91 P2 (:199): --harvest is an operational tool, not the novice contract this mode
+  # promises — its stdout/stderr carry CDP probe noise, marker echoes, and (on success) a leading
+  # "RESULT_FILE=" line meant for scripted callers. Left to inherit the parent's streams, all of
+  # that leaked in front of (or instead of) the single plain state line documented above. Capture
+  # both streams and reconstruct the clean contract from $OUT (which the child already verified and
+  # published on success) instead of relaying whatever the child happened to print. The raw streams
+  # stay reachable behind PRO_GATE_RECOVER_VERBOSE=1 for debugging a stuck recovery.
+  if [ "${PRO_GATE_RECOVER_VERBOSE:-0}" = 1 ]; then
+    bash "$0" --harvest "$REC_SELECTED" --out "$OUT" --timeout "$TIMEOUT"
+    REC_HARVEST_RC=$?
+    case "$REC_HARVEST_RC" in
+      0) echo "Review ready" >&2;;
+      8|7) echo "Checking for completed review" >&2;;
+      9) echo "Still working" >&2;;
+      *) echo "Browser needs attention" >&2;;
+    esac
+    exit "$REC_HARVEST_RC"
+  fi
+  REC_HV_OUT="$(mktemp "${TMPDIR:-/tmp}/pg-recover-hv.XXXXXX" 2>/dev/null)" \
+    || { echo "Browser needs attention" >&2; exit 3; }
+  REC_HV_ERR="$(mktemp "${TMPDIR:-/tmp}/pg-recover-hv.XXXXXX" 2>/dev/null)" \
+    || { rm -f "$REC_HV_OUT"; echo "Browser needs attention" >&2; exit 3; }
+  bash "$0" --harvest "$REC_SELECTED" --out "$OUT" --timeout "$TIMEOUT" \
+    >"$REC_HV_OUT" 2>"$REC_HV_ERR"
   REC_HARVEST_RC=$?
+  rm -f "$REC_HV_OUT" "$REC_HV_ERR" 2>/dev/null
   case "$REC_HARVEST_RC" in
-    0) echo "Review ready" >&2;;
+    0)
+      # Suppressing the child's stdout means its bytes now reach the caller ONLY through $OUT.
+      # "Review ready" with nothing on stdout would be a worse lie than any leaked diagnostic, so
+      # a published file we cannot actually read back is reported as trouble, not success.
+      if ! cat "$OUT" 2>/dev/null; then
+        echo "Browser needs attention" >&2
+        exit 6
+      fi
+      echo "Review ready" >&2
+      ;;
     8|7) echo "Checking for completed review" >&2;;
     9) echo "Still working" >&2;;
     *) echo "Browser needs attention" >&2;;
@@ -687,6 +761,22 @@ esac
 MODEL="${ORACLE_MODEL:-gpt-5.6}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/pro-review.XXXXXX")"
 [ -n "$OUT" ] || OUT="$WORK/findings.md"
+# gate #91 P1 (:192): a caller-supplied relative --out is resolved against whatever directory
+# this process happened to start in (below this line and before the later `cd "$REPO"`), which
+# is invisible once the string is written verbatim into run-meta at charge time. --recover runs
+# from an unrelated cwd and never `cd`s anywhere, so replaying a recorded relative path there
+# would publish into a different, unrelated file instead of this run's real output. Resolve to
+# an absolute path HERE, once, before anything else reads or locks $OUT, so every later use
+# (the guard lock, the status sidecar, the charge-time run-meta write) already sees the
+# unambiguous form. Only the parent directory needs to exist — $OUT itself is written later.
+case "$OUT" in
+  /*) ;;
+  *)
+    OUT_PARENT_ABS="$(cd "$(dirname "$OUT")" 2>/dev/null && pwd)" \
+      || { echo "ERROR: --out parent directory not found: $(dirname "$OUT")" >&2; exit 2; }
+    OUT="$OUT_PARENT_ABS/$(basename "$OUT")"
+    ;;
+esac
 # #50: scratch dirs used to leak on every exit path (5,900+ observed on one box). The trap
 # persists this run's diagnostics log, then removes WORK — EXCEPT when a failure path
 # deliberately retained recovery bytes in it (PG_KEEP_FINAL/PG_PRESERVE_STATE: the retained

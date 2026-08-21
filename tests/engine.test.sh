@@ -3424,4 +3424,197 @@ check 'publication failure has no browser/round/reservation side effects' \
 check 'publication failure stdout carries no review claim' \
   "$([ ! -s "$TDIR/recover.stdout" ]; echo $?)" "stdout=$(cat "$TDIR/recover.stdout")"
 
+# gate #91 P1 (:169): pg_persist_result's own durability ladder falls through to pending/<marker>
+# BYTES whenever the completed store is unwritable, retiring the reservation there exactly like a
+# completed write — pending/ is verified review content, not a lesser record. A review durable
+# ONLY under pending/ must be just as recoverable as one under completed/, by exact marker AND by
+# PR URL, byte-identical, with no fresh dispatch, and the pending file left untouched (--recover
+# never promotes it into completed/).
+echo '# gate #91 P1 (:169): --recover serves a pending-only durable artifact'
+REC_PEND_HOME="$TDIR/home-recover-pending"
+REC_PEND_MARKER='pg-run-acme-widgets-801-1700011500-1'
+mkdir -p "$REC_PEND_HOME/pending" "$REC_PEND_HOME/run-meta"
+printf '[P1] src/pending.sh:1 - pending fixture\n  Why: durable pending only\nP2: none\nP3: none\nVERDICT: SHIP - pending.\n' \
+  > "$REC_PEND_HOME/pending/$REC_PEND_MARKER"
+printf 'github.com\tacme\twidgets\tacme-widgets-801\t801\t/tmp/pending-orig.md\t1700011600\n' \
+  > "$REC_PEND_HOME/run-meta/$REC_PEND_MARKER"
+REC_PEND_BEFORE="$(cat "$REC_PEND_HOME/pending/$REC_PEND_MARKER")"
+: > "$TDIR/recover-oracle-sentinel"
+recover_run "$REC_PEND_HOME" --recover "$REC_PEND_MARKER" --out "$TDIR/recover-pending-out.md" --timeout 1s
+check 'recover returns a pending-only artifact by exact marker' \
+  "$([ "$RC" -eq 0 ] && cmp -s "$REC_PEND_HOME/pending/$REC_PEND_MARKER" "$TDIR/recover.stdout" \
+     && cmp -s "$REC_PEND_HOME/pending/$REC_PEND_MARKER" "$TDIR/recover-pending-out.md"; echo $?)" \
+  "rc=$RC stdout=$(cat "$TDIR/recover.stdout") stderr=$(cat "$TDIR/recover.stderr")"
+check 'recover pending-only artifact prints Review ready only on stderr' \
+  "$(grep -qx 'Review ready' "$TDIR/recover.stderr"; echo $?)" "stderr=$(cat "$TDIR/recover.stderr")"
+check 'recover pending-only artifact never dispatches oracle' \
+  "$([ ! -s "$TDIR/recover-oracle-sentinel" ]; echo $?)" "oracle=$(cat "$TDIR/recover-oracle-sentinel")"
+check 'recover pending-only artifact leaves the pending file byte-identical and in place' \
+  "$([ "$(cat "$REC_PEND_HOME/pending/$REC_PEND_MARKER")" = "$REC_PEND_BEFORE" ]; echo $?)" "pending artifact changed or removed"
+recover_run "$REC_PEND_HOME" --recover 'https://github.com/acme/widgets/pull/801'
+check 'recover returns a pending-only artifact by PR URL' \
+  "$([ "$RC" -eq 0 ] && cmp -s "$REC_PEND_HOME/pending/$REC_PEND_MARKER" "$TDIR/recover.stdout"; echo $?)" \
+  "rc=$RC stdout=$(cat "$TDIR/recover.stdout")"
+
+# gate #91 P1 (:192): a fresh run persists $OUT verbatim into run-meta, and a caller's relative
+# --out is resolved against wherever the process itself started (before any `cd "$REPO"`).
+# --recover runs from an unrelated cwd and never `cd`s anywhere, so a recorded relative path
+# must never be replayed as a publish target, and a recorded absolute path is only trustworthy
+# when its parent directory still exists and still accepts writes.
+echo '# gate #91 P1 (:192): recorded --out is resolved absolute at charge time and validated at recovery'
+RECABS_HOME="$TDIR/home-recover-absout"
+RECABS_REPO="$TDIR/recover-absout-repo"; git init -q "$RECABS_REPO"
+git -C "$RECABS_REPO" remote add origin https://github.com/acme/absout.git
+( cd "$RECABS_REPO" && env PRO_GATE_HOME="$RECABS_HOME" PRO_GATE_BROWSER_MODE=native PRO_GATE_MIN_UPTIME=0 \
+    PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_MAX_RETRIES=0 \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-recover-meta" NODE_OPTIONS= \
+    bash "$ENGINE" --pr 106 --repo "$RECABS_REPO" --diff "$TDIR/small.diff" \
+    --out 'relative-out.md' --timeout 5s >"$TDIR/recover.stdout" 2>"$TDIR/recover.stderr" )
+RC=$?
+RECABS_MARKER="$(jq -r .marker "$RECABS_REPO/relative-out.md.status" 2>/dev/null)"
+RECABS_EXPECT="$RECABS_REPO/relative-out.md"
+RECABS_RECORDED="$(awk -F'\t' '{print $6}' "$RECABS_HOME/run-meta/$RECABS_MARKER" 2>/dev/null)"
+check 'fresh run with a relative --out records an absolute path in run-meta' \
+  "$([ "$RC" -eq 0 ] && [ -n "$RECABS_MARKER" ] && [ "$RECABS_RECORDED" = "$RECABS_EXPECT" ]; echo $?)" \
+  "rc=$RC marker=$RECABS_MARKER recorded=$RECABS_RECORDED expect=$RECABS_EXPECT"
+
+# A hand-authored legacy/foreign record can still carry a bare relative OUT (or none at all
+# yet, from before this fix). Recovery must never treat it as an escape hatch into whatever
+# directory --recover happens to run from.
+RECFALLBACK_HOME="$TDIR/home-recover-relfallback"
+RECFALLBACK_MARKER='pg-run-acme-widgets-802-1700011700-1'
+mkdir -p "$RECFALLBACK_HOME/run-meta"
+printf 'github.com\tacme\twidgets\tacme-widgets-802\t802\trelative-escape.md\t1700011800\n' \
+  > "$RECFALLBACK_HOME/run-meta/$RECFALLBACK_MARKER"
+: > "$TDIR/recover-oracle-sentinel"
+( cd "$TDIR" && recover_run "$RECFALLBACK_HOME" --recover "$RECFALLBACK_MARKER" --timeout 1s )
+check 'a recorded relative OUT does not publish outside PRO_GATE_HOME' \
+  "$([ ! -e "$TDIR/relative-escape.md" ]; echo $?)" "escaped file: $(find "$TDIR" -maxdepth 1 -name 'relative-escape.md')"
+check 'a recorded relative OUT falls back to the recovered/ directory instead' \
+  "$([ -d "$RECFALLBACK_HOME/recovered" ]; echo $?)" "recovered=$(ls "$RECFALLBACK_HOME/recovered" 2>/dev/null)"
+
+# A recorded absolute OUT whose parent directory has since been cleaned up (the common case:
+# the default --out lived inside a per-run mktemp WORK dir the engine already deleted) must
+# fall back exactly like "no metadata at all", not fail.
+RECDEADPARENT_HOME="$TDIR/home-recover-deadparent"
+RECDEADPARENT_MARKER='pg-run-acme-widgets-803-1700011900-1'
+mkdir -p "$RECDEADPARENT_HOME/run-meta"
+RECDEADPARENT_GONE="$TDIR/gone-parent-$$"; mkdir -p "$RECDEADPARENT_GONE"; rmdir "$RECDEADPARENT_GONE"
+printf 'github.com\tacme\twidgets\tacme-widgets-803\t803\t%s/out.md\t1700012000\n' "$RECDEADPARENT_GONE" \
+  > "$RECDEADPARENT_HOME/run-meta/$RECDEADPARENT_MARKER"
+: > "$TDIR/recover-oracle-sentinel"
+recover_run "$RECDEADPARENT_HOME" --recover "$RECDEADPARENT_MARKER" --timeout 1s
+check 'a recorded absolute OUT with a dead parent falls back to the recovered/ directory instead of failing to establish an output path' \
+  "$([ -d "$RECDEADPARENT_HOME/recovered" ]; echo $?)" \
+  "recovered=$(ls "$RECDEADPARENT_HOME/recovered" 2>/dev/null) stderr=$(cat "$TDIR/recover.stderr")"
+check 'a recorded absolute OUT with a dead parent never creates the dead parent directory' \
+  "$([ ! -d "$RECDEADPARENT_GONE" ]; echo $?)" "revived: $RECDEADPARENT_GONE"
+
+# A recorded absolute OUT whose parent is still writable is still used as-is. No completed/
+# pending artifact here on purpose: the recorded-OUT reuse only matters on the marker-only
+# harvest path (the artifact-first fast path above never reads REC_SELECTED_OUT).
+RECVALID_HOME="$TDIR/home-recover-validout"
+RECVALID_MARKER='pg-run-acme-widgets-804-1700012100-1'
+mkdir -p "$RECVALID_HOME/run-meta"
+printf 'github.com\tacme\twidgets\tacme-widgets-804\t804\t%s\t1700012200\n' "$TDIR/recover-validout-target.md" \
+  > "$RECVALID_HOME/run-meta/$RECVALID_MARKER"
+{ printf 'run marker: %s\n' "$RECVALID_MARKER"
+  printf '[P1] src/valid.sh:1 - valid-out fixture\n  Why: durable\nP2: none\nP3: none\nVERDICT: SHIP - valid. (run marker: %s)\n' \
+    "$RECVALID_MARKER" "$RECVALID_MARKER"
+} > "$TDIR/recover-validout-tab.txt"
+start_mock "$TDIR/recover-validout-tab.txt"
+: > "$TDIR/recover-oracle-sentinel"
+env PRO_GATE_HOME="$RECVALID_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-recover-sentinel" PG_TEST_RECOVER_ORACLE_SENTINEL="$TDIR/recover-oracle-sentinel" NODE_OPTIONS= \
+  bash "$ENGINE" --recover "$RECVALID_MARKER" --timeout 5s \
+  >"$TDIR/recover.stdout" 2>"$TDIR/recover.stderr"
+RC=$?
+check 'a recorded valid absolute OUT is still used to publish the recovered artifact' \
+  "$([ "$RC" -eq 0 ] && [ -s "$TDIR/recover-validout-target.md" ] && cmp -s "$TDIR/recover.stdout" "$TDIR/recover-validout-target.md"; echo $?)" \
+  "rc=$RC stdout=$(cat "$TDIR/recover.stdout") target=$(cat "$TDIR/recover-validout-target.md" 2>/dev/null) stderr=$(cat "$TDIR/recover.stderr")"
+
+# gate #91 P2 (:199): --recover's delegation to --harvest must surface exactly one plain novice
+# state line, not the operational CDP/marker/RESULT_FILE= noise that --harvest itself prints —
+# for the success path and for at least two distinct failure states. PRO_GATE_RECOVER_VERBOSE=1
+# is the explicit opt-in that still surfaces the raw diagnostics for debugging a stuck recovery.
+echo '# gate #91 P2 (:199): recover harvest-delegation exposes one plain state line, not raw --harvest noise'
+RECNOISE_HOME="$TDIR/home-recover-noise"
+RECNOISE_MARKER='pg-run-acme-widgets-701-1700010600-1'
+{ printf 'run marker: %s\n' "$RECNOISE_MARKER"
+  printf '[P1] src/noise.sh:1 - noisy finding\n  Why: leak check\nP2: none\nP3: none\nVERDICT: SHIP - noise. (run marker: %s)\n' \
+    "$RECNOISE_MARKER" "$RECNOISE_MARKER"
+} > "$TDIR/recover-noise-tab.txt"
+start_mock "$TDIR/recover-noise-tab.txt"
+: > "$TDIR/recover-oracle-sentinel"
+env PRO_GATE_HOME="$RECNOISE_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-recover-sentinel" PG_TEST_RECOVER_ORACLE_SENTINEL="$TDIR/recover-oracle-sentinel" NODE_OPTIONS= \
+  bash "$ENGINE" --recover "$RECNOISE_MARKER" --out "$TDIR/recover-noise-out.md" --timeout 30s \
+  >"$TDIR/recover.stdout" 2>"$TDIR/recover.stderr"
+RC=$?
+check 'recover harvest-delegation success exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC stderr=$(cat "$TDIR/recover.stderr")"
+check 'recover harvest-delegation success stdout carries only review bytes' \
+  "$(cmp -s "$TDIR/recover-noise-out.md" "$TDIR/recover.stdout"; echo $?)" "stdout=$(cat "$TDIR/recover.stdout")"
+check 'recover harvest-delegation success stderr is exactly one plain state line' \
+  "$([ "$(wc -l < "$TDIR/recover.stderr" | tr -d ' ')" = 1 ] && grep -qx 'Review ready' "$TDIR/recover.stderr"; echo $?)" \
+  "stderr=$(cat "$TDIR/recover.stderr")"
+
+# Failure state 1: the harvested conversation is still generating (--harvest -> exit 9) ->
+# mapped novice state "Still working", nothing else on either stream.
+RECSTILL_MARKER='pg-run-acme-widgets-702-1700010700-1'
+printf 'still thinking, run marker: %s\n' "$RECSTILL_MARKER" > "$TDIR/recover-still-tab.txt"
+start_mock "$TDIR/recover-still-tab.txt"
+: > "$TDIR/recover-oracle-sentinel"
+env PRO_GATE_HOME="$RECNOISE_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-recover-sentinel" PG_TEST_RECOVER_ORACLE_SENTINEL="$TDIR/recover-oracle-sentinel" NODE_OPTIONS= \
+  bash "$ENGINE" --recover "$RECSTILL_MARKER" --out "$TDIR/recover-still-out.md" --timeout 5s \
+  >"$TDIR/recover.stdout" 2>"$TDIR/recover.stderr"
+RC=$?
+check 'recover harvest-delegation still-generating exits 9' "$([ "$RC" -eq 9 ]; echo $?)" "rc=$RC stderr=$(cat "$TDIR/recover.stderr")"
+check 'recover harvest-delegation still-generating stdout is empty' \
+  "$([ ! -s "$TDIR/recover.stdout" ]; echo $?)" "stdout=$(cat "$TDIR/recover.stdout")"
+check 'recover harvest-delegation still-generating stderr is exactly one plain state line' \
+  "$([ "$(wc -l < "$TDIR/recover.stderr" | tr -d ' ')" = 1 ] && grep -qx 'Still working' "$TDIR/recover.stderr"; echo $?)" \
+  "stderr=$(cat "$TDIR/recover.stderr")"
+
+# Failure state 2: a concurrent harvest already holds this marker's lock (--harvest -> exit 7)
+# -> mapped novice state "Checking for completed review", nothing else on either stream.
+RECBUSY_MARKER='pg-run-acme-widgets-703-1700010800-1'
+mkdir -p "$RECNOISE_HOME/harvest-locks"
+exec {RECBUSY_FD}>>"$RECNOISE_HOME/harvest-locks/$RECBUSY_MARKER"; flock -n "$RECBUSY_FD"
+: > "$TDIR/recover-oracle-sentinel"
+env PRO_GATE_HOME="$RECNOISE_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_HARVEST_LOCK_WAIT=1 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-recover-sentinel" \
+  PG_TEST_RECOVER_ORACLE_SENTINEL="$TDIR/recover-oracle-sentinel" NODE_OPTIONS= \
+  bash "$ENGINE" --recover "$RECBUSY_MARKER" --out "$TDIR/recover-busy-out.md" --timeout 1s \
+  >"$TDIR/recover.stdout" 2>"$TDIR/recover.stderr"
+RC=$?; eval "exec ${RECBUSY_FD}>&-"
+check 'recover harvest-delegation lock contention exits 7' "$([ "$RC" -eq 7 ]; echo $?)" "rc=$RC stderr=$(cat "$TDIR/recover.stderr")"
+check 'recover harvest-delegation lock contention stdout is empty' \
+  "$([ ! -s "$TDIR/recover.stdout" ]; echo $?)" "stdout=$(cat "$TDIR/recover.stdout")"
+check 'recover harvest-delegation lock contention stderr is exactly one plain state line' \
+  "$([ "$(wc -l < "$TDIR/recover.stderr" | tr -d ' ')" = 1 ] && grep -qx 'Checking for completed review' "$TDIR/recover.stderr"; echo $?)" \
+  "stderr=$(cat "$TDIR/recover.stderr")"
+check 'neither failure state dispatched oracle' "$([ ! -s "$TDIR/recover-oracle-sentinel" ]; echo $?)" "oracle=$(cat "$TDIR/recover-oracle-sentinel")"
+
+# The opt-in: PRO_GATE_RECOVER_VERBOSE=1 still surfaces the raw --harvest diagnostics the
+# default path just swallowed, for debugging a stuck recovery. A fresh marker/tab is required:
+# RECNOISE_MARKER's review is already durable from the success case above, so reusing it here
+# would take the artifact-first fast path (no harvest, no noise to gate at all).
+RECVERBOSE_MARKER='pg-run-acme-widgets-704-1700010900-1'
+{ printf 'run marker: %s\n' "$RECVERBOSE_MARKER"
+  printf '[P1] src/verbose.sh:1 - verbose fixture\n  Why: opt-in check\nP2: none\nP3: none\nVERDICT: SHIP - verbose. (run marker: %s)\n' \
+    "$RECVERBOSE_MARKER" "$RECVERBOSE_MARKER"
+} > "$TDIR/recover-verbose-tab.txt"
+start_mock "$TDIR/recover-verbose-tab.txt"
+env PRO_GATE_HOME="$RECNOISE_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-recover-sentinel" PG_TEST_RECOVER_ORACLE_SENTINEL="$TDIR/recover-oracle-sentinel" NODE_OPTIONS= \
+  PRO_GATE_RECOVER_VERBOSE=1 \
+  bash "$ENGINE" --recover "$RECVERBOSE_MARKER" --out "$TDIR/recover-verbose-out.md" --timeout 30s \
+  >"$TDIR/recover.stdout" 2>"$TDIR/recover.stderr"
+RC=$?
+check 'PRO_GATE_RECOVER_VERBOSE=1 surfaces the raw harvest RESULT_FILE= line' \
+  "$(grep -q '^RESULT_FILE=' "$TDIR/recover.stdout"; echo $?)" "stdout=$(cat "$TDIR/recover.stdout")"
+check 'PRO_GATE_RECOVER_VERBOSE=1 surfaces raw cdp-salvage diagnostics on stderr' \
+  "$(grep -q '\[cdp-salvage\]' "$TDIR/recover.stderr"; echo $?)" "stderr=$(cat "$TDIR/recover.stderr")"
+
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }

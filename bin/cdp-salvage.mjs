@@ -543,10 +543,15 @@ async function fetchBeforeDeadline(url, options, requestDeadline, consume = null
 }
 
 async function fetchJsonBeforeDeadline(url, options, requestDeadline) {
-  return await fetchBeforeDeadline(url, options, requestDeadline, async (response) => ({
-    response,
-    value: await response.json(),
-  }));
+  return await fetchBeforeDeadline(url, options, requestDeadline, async (response) => (
+    // Parse only a successful body. A pre-v111 Chrome answering PUT /json/new (or any other
+    // non-2xx CDP response) with a plain-text or empty error body used to get parsed
+    // unconditionally here, so response.json() threw before the caller ever got to inspect
+    // response.ok — turning the documented PUT-to-GET fallback into an immediate
+    // scratch-open-failed/memo-open-failed instead. Callers branch on response.ok themselves;
+    // handing them value: null on failure keeps that branch reachable without a parse throw.
+    response.ok ? { response, value: await response.json() } : { response, value: null }
+  ));
 }
 
 async function freshRenderText(url, port, outerDeadline, waitForDecisiveEvidence = false) {
@@ -568,6 +573,10 @@ async function freshRenderText(url, port, outerDeadline, waitForDecisiveEvidence
       try {
         ({ value: tabs } = await fetchJsonBeforeDeadline(`http://127.0.0.1:${port}/json`, {}, renderDeadline));
       } catch { return { text: null, reason: 'cdp-list-failed' }; }
+      // A non-2xx /json listing now carries value: null (see fetchJsonBeforeDeadline) instead of
+      // throwing — this is CDP-list failure just like the caught exception above, not a tab that
+      // legitimately vanished, so it must not fall through to tabs.find() on null.
+      if (!tabs) return { text: null, reason: 'cdp-list-failed' };
       const live = tabs.find((t) => t.id === target.id);
       if (!live) return { text: null, reason: 'target-disappeared' };
       // A scratch target may redirect, be reused, or be replaced underneath us. Its DOM is
@@ -785,6 +794,9 @@ async function openOrganizerScratch(url) {
       let live = target;
       try {
         const { value: tabs } = await fetchJsonBeforeDeadline(`http://127.0.0.1:${port}/json`, {}, renderDeadline);
+        // A non-2xx listing carries value: null rather than throwing (see fetchJsonBeforeDeadline);
+        // treat it the same as the caught exception below instead of dereferencing null.
+        if (!tabs) return { target, reason: 'cdp-list-failed' };
         live = tabs.find((tab) => tab.id === target.id) ?? null;
       } catch { return { target, reason: 'cdp-list-failed' }; }
       if (!live) return { target, reason: 'memo-tab-disappeared' };
@@ -1226,26 +1238,48 @@ while (Date.now() < deadline) {
     lastMatchWasSeeded = false;
     // A readable DOM can be stale while its server-side conversation is complete. Do not promote
     // it over an earlier recovery memo until its one same-profile scratch navigation classifies it.
-    const fresh = await revalidateReadableStaleSource(tab.url);
-    if (fresh?.kind === 'throttle') tripThrottle(`canonical scratch ${tab.url}`);
+    //
+    // The one-shot revalidation is spent on the REMEMBERED conversation (knownUrl) when we have
+    // one, never on whichever owned-incomplete tab this scan happens to reach first. A
+    // retry-created duplicate tab that stays incomplete carries our marker just as legitimately
+    // as the real one, so without this a duplicate could burn the single scratch navigation every
+    // cycle and permanently suppress the remembered-URL pass — reporting a completed, PAID review
+    // sitting at knownUrl as still generating forever. Every downstream consequence (terminal
+    // emit, cross-bound/foreign rejection, blacklist, stillGeneratingUrl) is attributed to the URL
+    // actually rendered, never to the tab that merely triggered the pass — the tab itself is still
+    // never navigated or closed.
+    const revalidateUrl = knownUrl ?? tab.url;
+    if (revalidateUrl !== tab.url) {
+      console.error(`readable tab ${tab.url} is incomplete, but "${marker}" already has a proven `
+        + `conversation (${revalidateUrl}) — spending the one canonical revalidation there instead`);
+    }
+    const fresh = await revalidateReadableStaleSource(revalidateUrl);
+    if (fresh?.kind === 'throttle') tripThrottle(`canonical scratch ${revalidateUrl}`);
     if (fresh?.kind === 'cross-bound') {
-      rejectCrossBound(tab.url, fresh.foreignMarker, 'canonical scratch');
-      stillGeneratingUrl = null;
+      rejectCrossBound(revalidateUrl, fresh.foreignMarker, 'canonical scratch');
+      // Only null the signal when the rejected URL IS the tab we were scanning: a rejected
+      // knownUrl says nothing about a genuinely different, still-open, still-incomplete tab.
+      if (revalidateUrl === tab.url) stillGeneratingUrl = null;
       continue;
     }
     if (fresh?.kind === 'foreign') {
-      rejectForeign(tab.url, 'canonical scratch');
-      stillGeneratingUrl = null;
+      rejectForeign(revalidateUrl, 'canonical scratch');
+      if (revalidateUrl === tab.url) stillGeneratingUrl = null;
       continue;
     }
     if (fresh?.kind === 'terminal') {
-      onOurConversation(tab.url, fresh);
-      emitEvidence(tab.url, fresh);
+      onOurConversation(revalidateUrl, fresh);
+      emitEvidence(revalidateUrl, fresh);
     }
-    if (fresh?.kind === 'owned-incomplete') onOurConversation(tab.url, fresh);
+    if (fresh?.kind === 'owned-incomplete') {
+      onOurConversation(revalidateUrl, fresh);
+      // Real scratch evidence for the rendered URL supersedes the tentative tab.url guess above.
+      stillGeneratingUrl = revalidateUrl;
+      lastMatchWasSeeded = revalidateUrl !== tab.url;
+    }
     // Inconclusive scratch evidence preserves an existing recovery handle. With no prior handle,
     // retain this marker-bearing source without claiming ownershipProven.
-    if (!fresh || fresh.kind === 'inconclusive') rememberInconclusiveReadableSource(tab.url);
+    if (!fresh || fresh.kind === 'inconclusive') rememberInconclusiveReadableSource(revalidateUrl);
     if (probe) emitEvidence(tab.url, evidence);
     console.error(`conversation found (${tab.url}) but no VERDICT yet; waiting...`);
   }

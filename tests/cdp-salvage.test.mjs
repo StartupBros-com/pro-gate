@@ -105,6 +105,15 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
     if (req.url?.startsWith('/json/new')) {
       const port = server.address().port;
       const url = decodeURIComponent(req.url.slice(req.url.indexOf('?') + 1));
+      // opts.putNewFails models a pre-v111 Chrome, which has no PUT /json/new and answers with a
+      // plain-text (non-JSON) error instead — the exact shape that used to make
+      // fetchJsonBeforeDeadline's unconditional response.json() throw before the caller ever
+      // reached its own response.ok check and tried the documented GET fallback below.
+      if (opts.putNewFails && req.method === 'PUT') {
+        res.statusCode = 404;
+        res.end('Not Found (pre-v111 Chrome has no PUT /json/new)');
+        return;
+      }
       const id = `scratch${created.length + 1}`;
       created.push({ id, url });
       if (opts.hangScratchOpen) return;
@@ -575,26 +584,82 @@ const MARKER = 'pg-run-test-1234567890-42';
   foreignOnly.stop();
 }
 
-{ // P1: a readable incomplete source must not overwrite a prior genuine memo before its one
-  // canonical scratch revalidation has ruled out a cross-bound answer.
-  const priorUrl = 'https://chatgpt.com/c/prior-genuine';
-  const source = `run marker: ${MARKER}\nstale readable source`;
-  const crossBoundAnswer = [
+{ // P1: the one-shot canonical revalidation must be spent on the REMEMBERED conversation (A),
+  // never on whichever marker-bearing owned-incomplete tab the scan happens to reach first (B).
+  // Before this fix, a retry-created duplicate tab at a different URL (B) — still incomplete,
+  // still carrying our marker — would consume the single scratch navigation every cycle and
+  // permanently suppress the remembered-URL pass, so a completed, PAID review already sitting at
+  // A was reported as still generating forever. Evidence must be attributed to the URL actually
+  // rendered (A), not the tab that merely triggered the pass (B).
+  const knownUrlA = 'https://chatgpt.com/c/known-conversation-a';
+  const duplicateTabB = `run marker: ${MARKER}\nduplicate retry tab, still reasoning...`;
+  const terminalReviewA = [
+    `run marker: ${MARKER}`,
+    '[P1] src/known.mjs:1 — finished on the canonical conversation',
+    'P2: none',
+    `VERDICT: FIX-FIRST — recovered from A, not B. (run marker: ${MARKER})`,
+  ].join('\n');
+  const wrongUrlRendered = 'run marker: pg-run-other-9999999999-9\nWRONG URL WAS RENDERED';
+  const terminalCdp = await mockCdp(duplicateTabB, [], {
+    renderText: (url) => (url === knownUrlA ? terminalReviewA : wrongUrlRendered),
+  });
+  const terminalResult = await runSalvage([MARKER, '3'], terminalCdp.port, seedMemo(MARKER, knownUrlA));
+  check('the one revalidation renders the remembered conversation A, not the duplicate tab B',
+    terminalCdp.created.length === 1 && terminalCdp.created[0]?.url === knownUrlA,
+    `created=${JSON.stringify(terminalCdp.created)}`);
+  check('a terminal render of A is emitted and attributed to A', terminalResult.status === 0 &&
+    /^matched-url https:\/\/chatgpt\.com\/c\/known-conversation-a$/m.test(terminalResult.stderr ?? ''),
+    `status=${terminalResult.status} stderr=${terminalResult.stderr?.slice(0, 300)}`);
+  check('the emitted review body is A\'s, not B\'s',
+    terminalResult.stdout.trim() === terminalReviewA.split('\n').slice(1).join('\n'),
+    `stdout=${terminalResult.stdout?.slice(0, 300)}`);
+  check('the duplicate tab B is never navigated, closed, or promoted in A\'s place',
+    !terminalCdp.closed.includes('tab1') &&
+      !terminalCdp.requests.some((request) => request.method === 'Page.navigate'),
+    `closed=${terminalCdp.closed} requests=${JSON.stringify(terminalCdp.requests)}`);
+  terminalCdp.stop();
+
+  const crossBoundAnswerA = [
     `run marker: ${MARKER}`,
     '[P1] foreign/source.mjs:1 — another run',
     'VERDICT: FIX-FIRST — not ours. (run marker: pg-run-other-repo-42-1111111111-9)',
   ].join('\n');
-  const cdp = await mockCdp(source, [], { renderText: () => crossBoundAnswer });
-  const r = await runSalvage([MARKER, '3'], cdp.port, seedMemo(MARKER, priorUrl));
-  check('cross-bound stale scratch rejects source A without replacing prior memo B',
-    r.status === 7 && r.memoUrl === priorUrl && r.memos.length === 1,
-    `status=${r.status} memo=${r.memoUrl} memos=${JSON.stringify(r.memos)} stderr=${r.stderr}`);
-  check('cross-bound stale scratch records its diagnostic despite readable source A', r.crossbound > 0,
-    `crossbound=${r.crossbound} stderr=${r.stderr}`);
-  check('cross-bound stale scratch rejects A without mutating its source target',
-    /mock-conversation/.test(r.blacklist ?? '') && !cdp.closed.includes('tab1') &&
-      !cdp.requests.some((request) => request.method === 'Page.navigate'),
-    `blacklist=${r.blacklist} closed=${cdp.closed} requests=${JSON.stringify(cdp.requests)}`);
+  const crossBoundCdp = await mockCdp(duplicateTabB, [], {
+    renderText: (url) => (url === knownUrlA ? crossBoundAnswerA : duplicateTabB),
+  });
+  const crossBoundResult = await runSalvage([MARKER, '3'], crossBoundCdp.port, seedMemo(MARKER, knownUrlA));
+  check('the one revalidation renders A, not B, for the cross-bound case',
+    crossBoundCdp.created.length === 1 && crossBoundCdp.created[0]?.url === knownUrlA,
+    `created=${JSON.stringify(crossBoundCdp.created)}`);
+  check('a cross-bound render of A is rejected and blacklisted as A',
+    crossBoundResult.memos.length === 0 &&
+      (crossBoundResult.blacklist ?? '').includes(`${MARKER}\t${knownUrlA}`),
+    `memos=${JSON.stringify(crossBoundResult.memos)} blacklist=${crossBoundResult.blacklist}`);
+  check('B is not promoted into A\'s place as the new recovery handle',
+    crossBoundResult.memoUrl !== 'https://chatgpt.com/c/mock-conversation' &&
+      !(crossBoundResult.blacklist ?? '').includes('mock-conversation'),
+    `memoUrl=${crossBoundResult.memoUrl} blacklist=${crossBoundResult.blacklist}`);
+  check('the duplicate tab B stays open and unnavigated, and the still-generating exit reflects it',
+    crossBoundResult.status === 3 && !crossBoundCdp.closed.includes('tab1') &&
+      !crossBoundCdp.requests.some((request) => request.method === 'Page.navigate'),
+    `status=${crossBoundResult.status} closed=${crossBoundCdp.closed} requests=${JSON.stringify(crossBoundCdp.requests)}`);
+  check('the cross-bound rejection of A is recorded for --status', crossBoundResult.crossbound > 0,
+    `crossbound=${crossBoundResult.crossbound}`);
+  crossBoundCdp.stop();
+}
+
+{ // P1 regression guard: with no remembered conversation, knownUrl is null so revalidateUrl
+  // reduces to tab.url — the readable owned-incomplete tab's own URL is revalidated exactly as
+  // before this fix.
+  const ownUrl = 'https://chatgpt.com/c/mock-conversation';
+  const staleTabOnly = `run marker: ${MARKER}\nno memo yet, still reasoning...`;
+  const cdp = await mockCdp(staleTabOnly, [], {
+    renderText: (url) => (url === ownUrl ? staleTabOnly : 'unexpected'),
+  });
+  const r = await runSalvage([MARKER, '3'], cdp.port);   // NO seeded memo
+  check('with no remembered conversation, revalidation still targets the readable tab\'s own URL',
+    cdp.created.length === 1 && cdp.created[0]?.url === ownUrl && r.status === 3,
+    `created=${JSON.stringify(cdp.created)} status=${r.status}`);
   cdp.stop();
 }
 
@@ -708,6 +773,19 @@ const MARKER = 'pg-run-test-1234567890-42';
   check('tabless conversation is recovered from the remembered URL', r.status === 0, `status=${r.status} stderr=${r.stderr?.slice(0, 300)}`);
   check('recovered review is printed', /VERDICT: FIX-FIRST/.test(r.stdout ?? ''), `stdout=${r.stdout?.slice(0, 160)}`);
   check('recovery re-rendered the remembered URL',
+    cdp.created.some((t) => t.url === 'https://chatgpt.com/c/remembered'), `created=${JSON.stringify(cdp.created)}`);
+  cdp.stop();
+}
+
+{ // P2: a Chrome that answers PUT /json/new with a non-JSON error must still fall through to the
+  // documented pre-v111 GET fallback in freshRenderText's path, not read as scratch-open-failed.
+  const review = `run marker: ${MARKER}\n[P0] a.ts:1: boom\n  Why: real\nVERDICT: FIX-FIRST: bad.`;
+  const cdp = await mockCdp('__NO_TABS__', [], { renderText: () => review, putNewFails: true });
+  const r = await runSalvage([MARKER, '30'], cdp.port, seedMemo(MARKER, 'https://chatgpt.com/c/remembered'));
+  check('a non-JSON PUT error still reaches the GET fallback and recovers the review', r.status === 0,
+    `status=${r.status} stderr=${r.stderr?.slice(0, 300)}`);
+  check('the GET-recovered review is printed', /VERDICT: FIX-FIRST/.test(r.stdout ?? ''), `stdout=${r.stdout?.slice(0, 160)}`);
+  check('the scratch tab was actually opened (via GET, after PUT failed)',
     cdp.created.some((t) => t.url === 'https://chatgpt.com/c/remembered'), `created=${JSON.stringify(cdp.created)}`);
   cdp.stop();
 }
@@ -1202,6 +1280,28 @@ const FOREIGN_ANSWER = (m) => [
   check('rename-only memo recovery keeps its owned scratch renderer open',
     cdp.created.length === 1 && !cdp.closed.includes(cdp.created[0].id),
     `created=${JSON.stringify(cdp.created)} closed=${cdp.closed}`);
+  cdp.stop();
+}
+
+{ // P2: a Chrome that answers PUT /json/new with a non-JSON error must still fall through to the
+  // documented pre-v111 GET fallback in openOrganizerScratch's path too, not read as
+  // memo-open-failed.
+  const title = 'pro-gate review: PR #71 r6c [pro-gate]';
+  const remembered = 'https://chatgpt.com/c/tabless-owned-put-fails';
+  const cdp = await mockCdp('__NO_TABS__', [], {
+    renderText: () => `run marker: ${MARKER}\nserver-side conversation`,
+    putNewFails: true,
+  });
+  const r = await runSalvage(
+    ['--organize', MARKER, '5'],
+    cdp.port,
+    seedOrganizer(MARKER, title, remembered),
+  );
+  check('a non-JSON PUT error still reaches the GET fallback and opens the memo scratch tab',
+    /source=memo rename=renamed/.test(r.stdout), `stdout=${r.stdout}`);
+  check('the memo scratch tab was actually opened (via GET, after PUT failed)',
+    cdp.created.length === 1 && cdp.created[0]?.url === remembered,
+    `created=${JSON.stringify(cdp.created)}`);
   cdp.stop();
 }
 
