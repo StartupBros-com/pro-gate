@@ -39,8 +39,19 @@ start_mock() { # $1 = source text; optional $2 = organizer/browser state; option
   [ -n "${MOCK_PID:-}" ] && kill "$MOCK_PID" 2>/dev/null
   node "$HERE/mock-cdp.mjs" "$1" "${2:-}" "${3:-}" "${4:-}" > "$TDIR/port" 2>"$TDIR/mock.log" &
   MOCK_PID=$!
-  for _ in $(seq 1 50); do [ -s "$TDIR/port" ] && break; sleep 0.1; done
+  # A cold CI runner has taken >5s to get node to its first write here, and an empty PORT is
+  # SILENT: every following test then points the engine at the default 9222, gets "CDP not
+  # reachable", and reports a wall of unrelated failures until the next start_mock happens to
+  # succeed (observed: 32 failures from one slow start, run 32450985579). Wait long enough for a
+  # loaded runner, then abort loudly with the mock's own stderr rather than testing nothing.
+  for _ in $(seq 1 300); do [ -s "$TDIR/port" ] && break; sleep 0.1; done
   PORT="$(tr -d '[:space:]' < "$TDIR/port")"; : > "$TDIR/port"
+  if [ -z "$PORT" ]; then
+    echo "FATAL - mock CDP server never reported a port within 30s; aborting rather than testing against :9222" >&2
+    echo "--- mock stderr ---" >&2
+    cat "$TDIR/mock.log" >&2 2>/dev/null
+    exit 1
+  fi
 }
 
 MARKER="pg-run-77-1700000000-11"
@@ -3400,6 +3411,29 @@ NEG_AFTER="$(neg_snapshot)"
 check 'negative recover table creates no run-meta/recovered/reservation state and never dispatches oracle' \
   "$([ "$NEG_BEFORE" = "$NEG_AFTER" ]; echo $?)" "before=$NEG_BEFORE after=$NEG_AFTER"
 
+# gate #91 P2 (:65): every two-argument flag left trailing with no operand must fail fast (exit 2,
+# naming the flag), not silently misbehave. Pre-fix, raw "$2" (--pr and friends) tripped set -u's
+# unbound-variable abort, while "${2:-}" (--harvest/--recover, which allow a deliberate no-op
+# value) let "shift 2" fail on one remaining argument — shift is atomic, so nothing is consumed,
+# $1 stays pinned on the flag, and the parser loop spins FOREVER. Each case runs under `timeout` so
+# a regression hangs this one test instead of the whole CI job.
+echo '# gate #91 P2 (:65): trailing two-arg flag with no operand fails fast, exit 2, not forever'
+ARGP_HOME="$TDIR/home-argparse"; mkdir -p "$ARGP_HOME"
+for f in --pr --repo --diff --input --out --timeout --extra-files --confirm --harvest --recover; do
+  timeout 10 env PRO_GATE_HOME="$ARGP_HOME" bash "$ENGINE" "$f" >"$TDIR/stdout" 2>"$TDIR/stderr"
+  RC=$?
+  check "trailing $f with no operand exits 2 promptly (not 124-timeout, not unbound-variable crash)" \
+    "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC stderr=$(cat "$TDIR/stderr")"
+  check "trailing $f with no operand names the flag on stderr" \
+    "$(grep -qF "ERROR: $f requires a value" "$TDIR/stderr"; echo $?)" "stderr=$(cat "$TDIR/stderr")"
+done
+# --status deliberately takes an OPTIONAL operand (a bare --status means "all state"): it must be
+# excluded from the two-arg guard above and keep working with nothing following it.
+timeout 10 env PRO_GATE_HOME="$ARGP_HOME" bash "$ENGINE" --status >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check '--status with no trailing operand still works (excluded from the two-arg guard)' \
+  "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC stdout=$(cat "$TDIR/stdout") stderr=$(cat "$TDIR/stderr")"
+
 # U3 publication-failure mapping (documented in the --recover artifact-first block): OUT given,
 # pg_completed_lookup fails to copy the durable artifact to --out -> "Browser needs attention" on
 # stderr, exit 6, the durable artifact untouched, no browser/round/reservation side effects, and
@@ -3557,6 +3591,78 @@ check 'recover harvest-delegation success stdout carries only review bytes' \
 check 'recover harvest-delegation success stderr is exactly one plain state line' \
   "$([ "$(wc -l < "$TDIR/recover.stderr" | tr -d ' ')" = 1 ] && grep -qx 'Review ready' "$TDIR/recover.stderr"; echo $?)" \
   "stderr=$(cat "$TDIR/recover.stderr")"
+
+# gate #91 P1 (:271): the harvest child publishes $OUT under its own process-lifetime output
+# lock and then EXITS, releasing it — the window after that exit (including while the parent
+# is still validating/reading) is wide open for another run reusing the same --out path to
+# replace or truncate the file. A racer that continuously stomps --out for the ENTIRE recover
+# invocation necessarily also lands inside that specific gap: if the parent ever re-reads $OUT
+# instead of the child's own captured RESULT_FILE=/stdout bytes, this must observe the racer's
+# garbage on stdout instead of the real review.
+echo '# gate #91 P1 (:271): recover ignores a concurrently mutated --out, using the RESULT_FILE locator/captured body instead'
+RECRACE_HOME="$TDIR/home-recover-race-out"
+RECRACE_MARKER='pg-run-acme-widgets-705-1700011000-1'
+{ printf 'run marker: %s\n' "$RECRACE_MARKER"
+  printf '[P1] src/race.sh:1 - race fixture\n  Why: out-mutation race check\nP2: none\nP3: none\nVERDICT: SHIP - race. (run marker: %s)\n' \
+    "$RECRACE_MARKER" "$RECRACE_MARKER"
+} > "$TDIR/recover-race-tab.txt"
+start_mock "$TDIR/recover-race-tab.txt"
+: > "$TDIR/recover-oracle-sentinel"
+RECRACE_OUT="$TDIR/recover-race-out.md"
+RECRACE_STOP="$TDIR/recover-race.stop"; rm -f "$RECRACE_STOP"
+( while [ ! -e "$RECRACE_STOP" ]; do printf 'GARBAGE-NOT-A-REVIEW\n' > "$RECRACE_OUT" 2>/dev/null; done ) &
+RECRACE_RACER=$!
+env PRO_GATE_HOME="$RECRACE_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-recover-sentinel" PG_TEST_RECOVER_ORACLE_SENTINEL="$TDIR/recover-oracle-sentinel" NODE_OPTIONS= \
+  bash "$ENGINE" --recover "$RECRACE_MARKER" --out "$RECRACE_OUT" --timeout 30s \
+  >"$TDIR/recover.stdout" 2>"$TDIR/recover.stderr"
+RC=$?
+touch "$RECRACE_STOP"; wait "$RECRACE_RACER" 2>/dev/null
+check 'recover under a continuous --out race still exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC stderr=$(cat "$TDIR/recover.stderr")"
+check 'recover under a continuous --out race prints the REAL review, not the racer garbage' \
+  "$(grep -qF 'race fixture' "$TDIR/recover.stdout" && ! grep -qF 'GARBAGE-NOT-A-REVIEW' "$TDIR/recover.stdout"; echo $?)" \
+  "stdout=$(cat "$TDIR/recover.stdout")"
+check 'recover under a continuous --out race still reports the plain success state line' \
+  "$([ "$(wc -l < "$TDIR/recover.stderr" | tr -d ' ')" = 1 ] && grep -qx 'Review ready' "$TDIR/recover.stderr"; echo $?)" \
+  "stderr=$(cat "$TDIR/recover.stderr")"
+
+# gate #91 P1 (:271) fallback leg: when the RESULT_FILE locator itself fails validation (here,
+# forced by racing the completed artifact it names so pg_is_review sees garbage), recovery must
+# fall back to the child's own captured stdout review bytes rather than failing outright or
+# trusting --out. --out is raced TOO (same technique as the block above): with both the locator
+# target and --out garbage for the run's whole duration, only the captured-stdout-body fallback
+# (immune to both, since it was read from the child's own private temp file) can still be
+# correct — a test that raced the artifact alone would pass even pre-fix, because pre-fix code
+# never looks at the artifact at all and would coincidentally read a correct $OUT here.
+echo '# gate #91 P1 (:271): a locator naming a non-review file falls back to the captured review body, still ignoring a raced --out'
+RECRACE2_HOME="$TDIR/home-recover-race-artifact"
+RECRACE2_MARKER='pg-run-acme-widgets-706-1700011100-1'
+{ printf 'run marker: %s\n' "$RECRACE2_MARKER"
+  printf '[P1] src/race2.sh:1 - locator fallback fixture\n  Why: locator-invalid race check\nP2: none\nP3: none\nVERDICT: SHIP - race2. (run marker: %s)\n' \
+    "$RECRACE2_MARKER" "$RECRACE2_MARKER"
+} > "$TDIR/recover-race2-tab.txt"
+start_mock "$TDIR/recover-race2-tab.txt"
+: > "$TDIR/recover-oracle-sentinel"
+RECRACE2_ART="$RECRACE2_HOME/completed/$RECRACE2_MARKER"
+RECRACE2_OUT="$TDIR/recover-race2-out.md"
+RECRACE2_STOP="$TDIR/recover-race2.stop"; rm -f "$RECRACE2_STOP"
+mkdir -p "$RECRACE2_HOME/completed"
+( while [ ! -e "$RECRACE2_STOP" ]; do
+    printf 'GARBAGE-NOT-A-REVIEW\n' > "$RECRACE2_ART" 2>/dev/null
+    printf 'GARBAGE-NOT-A-REVIEW\n' > "$RECRACE2_OUT" 2>/dev/null
+  done ) &
+RECRACE2_RACER=$!
+env PRO_GATE_HOME="$RECRACE2_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-recover-sentinel" PG_TEST_RECOVER_ORACLE_SENTINEL="$TDIR/recover-oracle-sentinel" NODE_OPTIONS= \
+  bash "$ENGINE" --recover "$RECRACE2_MARKER" --out "$RECRACE2_OUT" --timeout 30s \
+  >"$TDIR/recover.stdout" 2>"$TDIR/recover.stderr"
+RC=$?
+touch "$RECRACE2_STOP"; wait "$RECRACE2_RACER" 2>/dev/null
+check 'recover with a racing (locator-invalidating) completed artifact still exits 0 via captured-body fallback' \
+  "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC stderr=$(cat "$TDIR/recover.stderr")"
+check 'recover with a racing completed artifact and racing --out prints the REAL review, not the racer garbage' \
+  "$(grep -qF 'locator fallback fixture' "$TDIR/recover.stdout" && ! grep -qF 'GARBAGE-NOT-A-REVIEW' "$TDIR/recover.stdout"; echo $?)" \
+  "stdout=$(cat "$TDIR/recover.stdout")"
 
 # Failure state 1: the harvested conversation is still generating (--harvest -> exit 9) ->
 # mapped novice state "Still working", nothing else on either stream.

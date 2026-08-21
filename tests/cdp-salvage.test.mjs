@@ -516,6 +516,55 @@ const MARKER = 'pg-run-test-1234567890-42';
   ownCdp.stop();
 }
 
+{ // P1 (gate #91 r2): a retry reuses this run's exact marker, so an OLDER same-marker verdict
+  // that a newer prompt marker has already superseded must not be emitted as harvest's result —
+  // only --probe checked probeComplete; the plain harvest path emitted on kind alone and would
+  // report last round's review as this run's, retiring the reservation while the real answer was
+  // still generating.
+  const canonicalUrl = 'https://chatgpt.com/c/mock-conversation';
+  const staleTerminal = [
+    `run marker: ${MARKER}`,
+    'Reasoning about the old round...',
+    `VERDICT: SHIP — stale round must never be emitted. (run marker: ${MARKER})`,
+    `run marker: ${MARKER}`,
+    'newer round still generating...',
+  ].join('\n');
+  const cdp = await mockCdp(staleTerminal, [], {});
+  const r = await runSalvage([MARKER, '3'], cdp.port);
+  check('a stale same-marker verdict before the latest prompt does not exit 0', r.status !== 0,
+    `status=${r.status} stdout=${r.stdout?.slice(0, 200)} stderr=${r.stderr?.slice(0, 300)}`);
+  check('a stale same-marker verdict is never printed as the harvested review',
+    !/SHIP — stale round/.test(r.stdout ?? ''), `stdout=${r.stdout?.slice(0, 300)}`);
+  check('a stale same-marker verdict keeps the run still-generating (exit 3)', r.status === 3,
+    `status=${r.status} stderr=${r.stderr?.slice(0, 300)}`);
+  cdp.stop();
+
+  // Once the newer prompt's own VERDICT lands after the newest marker, THAT review — and only
+  // that one — is what harvest emits.
+  const newerFinal = [
+    `run marker: ${MARKER}`,
+    'Reasoning about the old round...',
+    `VERDICT: SHIP — stale round must never be emitted. (run marker: ${MARKER})`,
+    `run marker: ${MARKER}`,
+    '[P1] src/new.mjs:5 — newer finding, real',
+    '  Why: real bug',
+    `VERDICT: FIX-FIRST — newer round is final. (run marker: ${MARKER})`,
+  ].join('\n');
+  // Reuse the readable-stale-source -> canonical-scratch-revalidation path (U1): its scratch
+  // samples every 2.5s with no render-interval throttle, unlike the remembered-URL seeded
+  // render (90s), so it can observe the newer verdict landing within a normal test budget.
+  const seededCdp = await mockCdp(staleTerminal, [], {
+    renderText: (_url, n) => (n === 1 ? staleTerminal : newerFinal),
+  });
+  const seededResult = await runSalvage([MARKER, '8'], seededCdp.port, seedMemo(MARKER, canonicalUrl));
+  check('the superseded verdict is skipped and the newer verdict is emitted instead',
+    seededResult.status === 0 && /VERDICT: FIX-FIRST — newer round is final/.test(seededResult.stdout ?? ''),
+    `status=${seededResult.status} stdout=${seededResult.stdout?.slice(0, 300)}`);
+  check('the stale verdict text never reaches stdout',
+    !/SHIP — stale round/.test(seededResult.stdout ?? ''), `stdout=${seededResult.stdout?.slice(0, 300)}`);
+  seededCdp.stop();
+}
+
 { // U1: scratch transport and hydration failures are inconclusive, never a memo or blacklist mutation.
   const canonicalUrl = 'https://chatgpt.com/c/mock-conversation';
   const source = `run marker: ${MARKER}\nstale readable source`;

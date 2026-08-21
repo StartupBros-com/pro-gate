@@ -52,6 +52,19 @@ OS="$(pg_os)"; MODE="$(pg_browser_mode)"
 PR=""; REPO=""; DIFF_FILE=""; INPUT="both"; OUT=""; TIMEOUT="30m"; EXTRA_GLOB=""; HARVEST_MARKER=""; HARVEST_REQUESTED=0; CONFIRM_FILE=""
 STATUS_REQUESTED=0; STATUS_QUERY=""; AS_JSON=0; RECOVER_REQUESTED=0; RECOVER_QUERY=""
 while [ $# -gt 0 ]; do
+  # gate #91 P2 (:65): every flag below except --status takes a REQUIRED second argument via raw
+  # "$2"/"${2:-}" + "shift 2". With no errexit, a flag left trailing (no operand) hit one of two
+  # silent failures instead of a usage error: "$2" with no fallback tripped `set -u`'s unbound-
+  # variable abort (--pr and friends), while "${2:-}" (--harvest/--recover, added so a bare flag
+  # could be a deliberate no-op) suppressed that abort but left `shift 2` failing on only one
+  # argument remaining — shift is atomic, so it shifts NOTHING, $1 stays pinned on the flag, and
+  # the loop spins forever. One guard here, before any branch consumes its operand, replaces both
+  # symptoms with a clean usage error. --status is excluded: its second argument is deliberately
+  # optional (its own branch below already handles "missing").
+  case "$1" in
+    --pr|--repo|--diff|--input|--out|--timeout|--extra-files|--confirm|--harvest|--recover)
+      [ $# -ge 2 ] || { echo "ERROR: $1 requires a value" >&2; exit 2; };;
+  esac
   case "$1" in
     --pr) PR="$2"; shift 2;;
     --repo) REPO="$2"; shift 2;;
@@ -241,9 +254,10 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
   # promises — its stdout/stderr carry CDP probe noise, marker echoes, and (on success) a leading
   # "RESULT_FILE=" line meant for scripted callers. Left to inherit the parent's streams, all of
   # that leaked in front of (or instead of) the single plain state line documented above. Capture
-  # both streams and reconstruct the clean contract from $OUT (which the child already verified and
-  # published on success) instead of relaying whatever the child happened to print. The raw streams
-  # stay reachable behind PRO_GATE_RECOVER_VERBOSE=1 for debugging a stuck recovery.
+  # both streams and reconstruct the clean contract from what the child itself verified and printed
+  # (gate #91 P1 (:271): never from re-reading $OUT — see below) instead of relaying whatever the
+  # child happened to print. The raw streams stay reachable behind PRO_GATE_RECOVER_VERBOSE=1 for
+  # debugging a stuck recovery.
   if [ "${PRO_GATE_RECOVER_VERBOSE:-0}" = 1 ]; then
     bash "$0" --harvest "$REC_SELECTED" --out "$OUT" --timeout "$TIMEOUT"
     REC_HARVEST_RC=$?
@@ -259,16 +273,42 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
     || { echo "Browser needs attention" >&2; exit 3; }
   REC_HV_ERR="$(mktemp "${TMPDIR:-/tmp}/pg-recover-hv.XXXXXX" 2>/dev/null)" \
     || { rm -f "$REC_HV_OUT"; echo "Browser needs attention" >&2; exit 3; }
+  REC_HV_BODY=""
   bash "$0" --harvest "$REC_SELECTED" --out "$OUT" --timeout "$TIMEOUT" \
     >"$REC_HV_OUT" 2>"$REC_HV_ERR"
   REC_HARVEST_RC=$?
-  rm -f "$REC_HV_OUT" "$REC_HV_ERR" 2>/dev/null
   case "$REC_HARVEST_RC" in
     0)
-      # Suppressing the child's stdout means its bytes now reach the caller ONLY through $OUT.
-      # "Review ready" with nothing on stdout would be a worse lie than any leaked diagnostic, so
-      # a published file we cannot actually read back is reported as trouble, not success.
-      if ! cat "$OUT" 2>/dev/null; then
+      # gate #91 P1 (:271): the child publishes $OUT under its own process-lifetime output lock
+      # and then EXITS, releasing it. In the window between that exit and this read, another run
+      # reusing the same --out path can replace or truncate the file — trusting $OUT here can
+      # print a DIFFERENT run's review, or nothing, while this still announces "Review ready".
+      # The child's captured stdout (this process's own private temp file) is immune to that
+      # race: prefer the "RESULT_FILE=<path>" locator it prints, naming the write-once,
+      # marker-addressed completed artifact — re-reading that path is safe precisely because
+      # nothing can overwrite a write-once artifact. Validate it before trusting it (a stale or
+      # foreign path is not proof of anything). Fall back to the review bytes the child printed
+      # directly (same captured, race-free stdout, minus the locator line) when no locator is
+      # present or the locator doesn't check out, and only then to $OUT as a last resort.
+      REC_BODY=""
+      REC_LOCATOR="$(sed -n 's/^RESULT_FILE=//p' "$REC_HV_OUT" 2>/dev/null | head -1)"
+      if [ -n "$REC_LOCATOR" ] && pg_is_review "$REC_LOCATOR" 2>/dev/null; then
+        REC_BODY="$REC_LOCATOR"
+      else
+        REC_HV_BODY="$(mktemp "${TMPDIR:-/tmp}/pg-recover-hvbody.XXXXXX" 2>/dev/null)"
+        if [ -n "$REC_HV_BODY" ]; then
+          grep -v '^RESULT_FILE=' "$REC_HV_OUT" > "$REC_HV_BODY" 2>/dev/null
+          pg_is_review "$REC_HV_BODY" 2>/dev/null && REC_BODY="$REC_HV_BODY"
+        fi
+      fi
+      if [ -z "$REC_BODY" ] && pg_is_review "$OUT" 2>/dev/null; then
+        REC_BODY="$OUT"
+      fi
+      # None of the three sources yielded a valid review: report trouble, not success — a
+      # published file we cannot actually verify and read back is a worse lie than "Browser
+      # needs attention".
+      if [ -z "$REC_BODY" ] || ! cat "$REC_BODY" 2>/dev/null; then
+        rm -f "$REC_HV_OUT" "$REC_HV_ERR" "$REC_HV_BODY" 2>/dev/null
         echo "Browser needs attention" >&2
         exit 6
       fi
@@ -278,6 +318,7 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
     9) echo "Still working" >&2;;
     *) echo "Browser needs attention" >&2;;
   esac
+  rm -f "$REC_HV_OUT" "$REC_HV_ERR" "$REC_HV_BODY" 2>/dev/null
   exit "$REC_HARVEST_RC"
 fi
 

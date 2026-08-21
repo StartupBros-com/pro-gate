@@ -1088,9 +1088,24 @@ function classifyEvidence(text) {
   // The marker echoed in the terminal line is not a later prompt. A separate exact marker after
   // that line is, and proves this otherwise-owned verdict belongs to an older turn in the same chat.
   const newerPromptMarker = verdict && hasExactMarker(text.slice(verdict.at + verdict.line.length), marker);
+  // A retry reuses this run's exact marker, so a stale SAME-marker verdict (answerMarker ===
+  // marker) passes every other check here (owned, non-foreign, well-formed) AND the shell's
+  // nonce check downstream — it would otherwise satisfy `kind: 'terminal'` while the newer
+  // prompt it precedes is still generating, and the harvest path below emits on `kind` alone
+  // (unlike --probe, which also gates on probeComplete), so that stale verdict would be reported
+  // as THIS run's result and retire the reservation early. Fall back to owned-incomplete so every
+  // caller (readable-tab match, scratch revalidation, remembered-URL render, freshRenderText's
+  // decisive-evidence wait) keeps sampling instead of treating scrollback as a live answer.
+  // Gated on answerMarker === marker: a verdict carrying a DIFFERENT marker ahead of our prompt
+  // (#68 gate P1's reused-conversation scrollback) already fails the shell's nonce check on its
+  // own — that case must stay 'terminal' so the engine can adjudicate it, not be swallowed here.
+  if (newerPromptMarker && answerMarker === marker) return { kind: 'owned-incomplete', reason: 'stale-terminal' };
   return {
     kind: 'terminal',
     review,
+    // newerPromptMarker can still be true here for a foreign answerMarker (scrollback case
+    // above); the `&& !newerPromptMarker` term stays as a guard against that combination
+    // ever being reported probe-complete, even though only --probe reads this field.
     probeComplete: promptMarkerAt >= 0 && answerMarker === marker && !newerPromptMarker,
   };
 }
