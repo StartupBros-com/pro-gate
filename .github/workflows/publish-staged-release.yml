@@ -1,0 +1,95 @@
+name: Publish staged release
+
+# Second half of the draft-first release (hov-marketplace
+# docs/plugin-release-recipe.md). release.yml packages, uploads and verifies the
+# assets but leaves the release a DRAFT, because the marketplace card cannot name
+# a release whose id was only just minted. Once the repin PR has merged, this
+# flips the draft to published — and the single publish-event announce then finds
+# the card already current, instead of failing the distribution guard and needing
+# a re-fire.
+#
+# Deliberately workflow_dispatch and not automatic: re-running release.yml would
+# re-run the whole ~30 minute suite to flip one flag, and auto-dispatching a
+# privileged publish from another repository is how release loops start. The
+# guard below re-reads the LIVE card, so a mistimed run cannot publish an
+# undistributed release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish (e.g. v0.35.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-staged-release-pro-gate
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out main
+        uses: actions/checkout@ac593985615ec2ede58e132d2e21d2b1cbd6127c
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require the tag to be on the protected default branch
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          git fetch origin "$DEFAULT_BRANCH" --tags
+          release_sha="$(git rev-list -n 1 "refs/tags/$RELEASE_TAG")"
+          git merge-base --is-ancestor "$release_sha" "origin/$DEFAULT_BRANCH"
+          echo "$RELEASE_TAG -> $release_sha is on $DEFAULT_BRANCH"
+
+      - name: Publish only when the marketplace card names this release
+        env:
+          # Publishing with RELEASE_PAT keeps the release-event identity able to
+          # trigger release-train.yml; a GITHUB_TOKEN publish is suppressed by
+          # GitHub's recursion rule and would leave the announce dead.
+          GH_TOKEN: ${{ secrets.RELEASE_PAT || github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          . scripts/lib/marketplace-card.sh
+
+          state="$(gh release view "$RELEASE_TAG" --json isDraft,isPrerelease \
+            --jq 'if .isDraft then "draft" elif .isPrerelease then "prerelease" else "published" end')"
+          if [ "$state" = published ]; then
+            echo "::notice::$RELEASE_TAG is already published; nothing to do."
+            exit 0
+          fi
+          [ "$state" = draft ] || { echo "error: $RELEASE_TAG is $state, not a draft" >&2; exit 1; }
+
+          version="${RELEASE_TAG#v}"
+          release_id="$(gh release view "$RELEASE_TAG" --json databaseId --jq .databaseId)"
+          source_sha="$(git rev-list -n 1 "refs/tags/$RELEASE_TAG")"
+
+          card_rc=0
+          card_tuple="$(marketplace_card_tuple 'pro-gate')" || card_rc=$?
+          if [ "$card_rc" -ne 0 ]; then
+            echo "error: refusing to publish $RELEASE_TAG: could not read the marketplace card (outage or parse failure, NOT evidence of staleness); re-run once the read succeeds" >&2
+            exit 1
+          fi
+          IFS=$'\t' read -r card_version card_tag card_id card_sha card_kind card_url <<<"$card_tuple"
+
+          if [ "$card_version" != "$version" ] || [ "$card_tag" != "$RELEASE_TAG" ] \
+             || [ "$card_id" != "$release_id" ] || [ "$card_sha" != "$source_sha" ] \
+             || [ "$card_kind" != 'url' ] \
+             || [ "$card_url" != 'https://github.com/StartupBros-com/pro-gate.git' ]; then
+            echo "error: marketplace card does not name $RELEASE_TAG (releaseId $release_id, sha $source_sha)." >&2
+            echo "       card lists $card_tag (releaseId $card_id, sha $card_sha)." >&2
+            echo "       Merge the repin PR against StartupBros-com/hov-marketplace first." >&2
+            exit 1
+          fi
+
+          gh release edit "$RELEASE_TAG" --draft=false --latest
+          echo "published $RELEASE_TAG; the release train announces from here"

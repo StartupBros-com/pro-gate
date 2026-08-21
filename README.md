@@ -413,11 +413,27 @@ salvage, and a durable artifact store.
 
 ## Release flow (maintainers)
 
-Merging a PR that bumps `VERSION` + `plugin.json` ships it: `auto-release.yml` pushes the
-tag, `release.yml` re-tests and publishes checksummed assets, and the release train promotes
-the marketplace manifest and announces the release. Requires a fine-grained `RELEASE_PAT`
-repo secret (contents: read/write); without it the workflows fall back to the manual
-tag-push flow. A `## Highlights` bullet list at the top of a release body becomes the
+Merging a PR that bumps `VERSION` + `plugin.json` ships it, in two halves — the release is
+**staged first and published second**, because the marketplace card has to name a release id
+that only exists once the release does:
+
+1. `auto-release.yml` pushes the tag; `release.yml` re-tests, packages and uploads
+   checksummed assets, then leaves the release a **draft** and prints the repin tuple
+   (plugin, version, sha, releaseId, releaseTag).
+2. Open that repin PR against `StartupBros-com/hov-marketplace` and merge it. The card is
+   updated by a reviewed PR and never by a push from CI — a standing credential able to
+   write the distribution manifest is the one whose compromise reaches every installed
+   client.
+3. Run the **Publish staged release** workflow (or `gh release edit vX.Y.Z --draft=false`).
+   It re-reads the live card and refuses unless the card names exactly this release, so a
+   mistimed run cannot publish something undistributed.
+4. Publishing fires the release train once: it verifies distribution and announces. The
+   train only ever *reads* the marketplace — it holds no deploy credential.
+
+Publishing before step 2 is what made every release fail its own distribution guard and need
+an announce re-fire; that is why step 1 stops at a draft. Requires a fine-grained
+`RELEASE_PAT` repo secret (contents: read/write); without it the workflows fall back to the
+manual tag-push flow. A `## Highlights` bullet list at the top of a release body becomes the
 announcement card's "What's new" section verbatim; otherwise the bullets are derived from
 the auto-generated notes.
 

@@ -5,6 +5,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CANONICAL_SOURCE_KIND='url'
 CANONICAL_SOURCE_URL='https://github.com/StartupBros-com/pro-gate.git'
 
+# Shared with scripts/publish-runtime-release.sh so the publish gate and this
+# post-publish guard can never disagree about what the card says. The failure
+# POLICY stays here (stale -> red); the helper only reads and types the tuple.
+# shellcheck source=scripts/lib/marketplace-card.sh
+. "$SCRIPT_DIR/lib/marketplace-card.sh"
+
 # The verify job maps this step output to the reusable announce job. Write the
 # fail-closed value before even validating inputs so early no-ops and failures
 # can never inherit a stale truthy output from a prior command in the step.
@@ -139,58 +145,17 @@ verify_marketplace_promotion() {
   require RELEASE_TAG
   require RELEASE_ID
   require SOURCE_SHA
-  local manifest card_tuple card_version card_tag card_id card_sha card_source_kind card_source_url
+  local card_tuple card_version card_tag card_id card_sha card_source_kind card_source_url
 
-  # One gh api call against the marketplace's live default branch (no ref
-  # pinned, so this always reads whatever a merged repin PR most recently
-  # produced), fetched raw so the response body is the manifest itself.
-  if ! manifest="$(gh api -H 'Accept: application/vnd.github.raw+json' \
-      "repos/$MARKETPLACE_REPO/contents/$MARKETPLACE_MANIFEST_PATH" 2>/dev/null)"; then
-    fail_distribution_unverified "gh api could not fetch repos/$MARKETPLACE_REPO/$MARKETPLACE_MANIFEST_PATH"
-  fi
-
-  # Fail closed on an ambiguous or ill-typed card in ONE jq -e validation pass.
-  # Values are deliberately compared below, rather than folded into this schema
-  # check: a complete, typed card for another release is STALE (and needs a
-  # repin), while duplicate/missing/type-invalid source metadata is UNVERIFIED
-  # (and must not be mistaken for evidence that a human can safely repin).
-  if ! card_tuple="$(jq -er --arg name "$REPOSITORY" '
-      def nonempty_string: type == "string" and length > 0;
-      def positive_uint: type == "number" and . > 0 and floor == .;
-      if type != "object" or (.plugins | type) != "array" then
-        error("marketplace manifest has no plugins array")
-      else
-        [.plugins[] | select(type == "object" and (.name? == $name))] as $cards
-        | if ($cards | length) != 1 then
-            error("expected exactly one matching plugin card")
-          else
-            $cards[0]
-            | if (
-                (.name | nonempty_string)
-                and (.metadata | type) == "object"
-                and (.metadata.version | nonempty_string)
-                and (.metadata.releaseTag | nonempty_string)
-                and (.metadata.releaseId | positive_uint)
-                and (.source | type) == "object"
-                and (.source.sha | nonempty_string)
-                and (.source.source | nonempty_string)
-                and (.source.url | nonempty_string)
-              ) then
-                [
-                  .metadata.version,
-                  .metadata.releaseTag,
-                  .metadata.releaseId,
-                  .source.sha,
-                  .source.source,
-                  .source.url
-                ] | @tsv
-              else
-                error("matching plugin card has an invalid tuple")
-              end
-          end
-      end
-    ' <<<"$manifest" 2>/dev/null)"; then
-    fail_distribution_unverified "marketplace manifest lacks exactly one typed \"$REPOSITORY\" distribution tuple"
+  # Read + type the live card via the shared helper (one gh api call against the
+  # marketplace's default branch, so this always sees whatever a merged repin PR
+  # most recently produced). The helper fails closed on fetch/parse/type errors
+  # and NEVER decides staleness — that comparison stays below, because STALE and
+  # UNVERIFIED must not be conflated (issue #84).
+  local card_rc=0
+  card_tuple="$(marketplace_card_tuple "$REPOSITORY")" || card_rc=$?
+  if [ "$card_rc" -ne 0 ]; then
+    fail_distribution_unverified "could not read exactly one typed \"$REPOSITORY\" distribution tuple from $MARKETPLACE_REPO/$MARKETPLACE_MANIFEST_PATH"
   fi
   IFS=$'\t' read -r card_version card_tag card_id card_sha card_source_kind card_source_url <<<"$card_tuple"
 
