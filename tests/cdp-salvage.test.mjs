@@ -697,6 +697,45 @@ const MARKER = 'pg-run-test-1234567890-42';
   crossBoundCdp.stop();
 }
 
+{ // P1 (gate #91 r3): --probe must not report the conversation ABSENT just because the one-shot
+  // revalidation was spent on a DIFFERENT remembered URL (A) that comes back cross-bound or
+  // foreign, while the tab actually scanned (B) is demonstrably ours and still generating. Before
+  // this fix, B's owned-incomplete evidence was only ever emitted to probe from the line AFTER
+  // these rejections' `continue` (never reached), so probe fell through to the deadline with no
+  // positive signal this cycle, exited 4 (absent), and the engine's miss counter could ultimately
+  // release a live review for a double-spending retry.
+  const knownUrlA = 'https://chatgpt.com/c/known-conversation-a';
+  const duplicateTabB = `run marker: ${MARKER}\nduplicate retry tab, still reasoning...`;
+
+  const crossBoundAnswerA = [
+    `run marker: ${MARKER}`,
+    '[P1] foreign/source.mjs:1 — another run',
+    'VERDICT: FIX-FIRST — not ours. (run marker: pg-run-other-repo-42-1111111111-9)',
+  ].join('\n');
+  const crossBoundCdp = await mockCdp(duplicateTabB, [], {
+    renderText: (url) => (url === knownUrlA ? crossBoundAnswerA : duplicateTabB),
+  });
+  const crossBoundResult = await runSalvage(['--probe', MARKER, '3'], crossBoundCdp.port, seedMemo(MARKER, knownUrlA));
+  check('probe reports tab B present and generating despite A\'s cross-bound rejection',
+    crossBoundResult.status === 0 && /^probe-state: generating$/m.test(crossBoundResult.stderr || ''),
+    `status=${crossBoundResult.status} stderr=${crossBoundResult.stderr}`);
+  check('probe emits no review body for the cross-bound-A case', crossBoundResult.stdout === '',
+    `stdout=${crossBoundResult.stdout}`);
+  check('the one revalidation still only ever rendered A', crossBoundCdp.created.length === 1 &&
+    crossBoundCdp.created[0]?.url === knownUrlA, `created=${JSON.stringify(crossBoundCdp.created)}`);
+  crossBoundCdp.stop();
+
+  const foreignOnlyA = 'run marker: pg-run-other-repo-42-1111111111-9\nVERDICT: SHIP — foreign.';
+  const foreignCdp = await mockCdp(duplicateTabB, [], {
+    renderText: (url) => (url === knownUrlA ? foreignOnlyA : duplicateTabB),
+  });
+  const foreignResult = await runSalvage(['--probe', MARKER, '3'], foreignCdp.port, seedMemo(MARKER, knownUrlA));
+  check('probe reports tab B present and generating despite A\'s foreign rejection',
+    foreignResult.status === 0 && /^probe-state: generating$/m.test(foreignResult.stderr || ''),
+    `status=${foreignResult.status} stderr=${foreignResult.stderr}`);
+  foreignCdp.stop();
+}
+
 { // P1 regression guard: with no remembered conversation, knownUrl is null so revalidateUrl
   // reduces to tab.url — the readable owned-incomplete tab's own URL is revalidated exactly as
   // before this fix.

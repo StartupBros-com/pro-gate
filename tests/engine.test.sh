@@ -3664,6 +3664,187 @@ check 'recover with a racing completed artifact and racing --out prints the REAL
   "$(grep -qF 'locator fallback fixture' "$TDIR/recover.stdout" && ! grep -qF 'GARBAGE-NOT-A-REVIEW' "$TDIR/recover.stdout"; echo $?)" \
   "stdout=$(cat "$TDIR/recover.stdout")"
 
+# gate #91 round3 P1 (:304): when BOTH race-free sources fail — the RESULT_FILE locator and the
+# captured stdout body — recovery must fail closed rather than fall back to re-reading $OUT. The
+# completed and pending stores are pre-blocked DETERMINISTICALLY (a pre-existing mismatched
+# write-once artifact; pending replaced by a plain file so mkdir -p cannot recreate it as a
+# directory), forcing pg_persist_result to its last-resort rung: RESULT_PATH is the child's own
+# kept $WORK/harvest.capture — the --harvest path's HARVEST_TMP, and (via pg_persist_result's
+# "$src" fallback) the SAME file RESULT_PATH ends up naming (PG_KEEP_FINAL=1).
+#
+# An earlier version of this test raced a background poller against the child instead of the
+# line below: it busy-waited for pg_strip_nonce's token-removal (grep, forking on every
+# iteration) as the "safe to corrupt" signal before hammering $WORK/harvest.capture with
+# garbage. That lost the race every observed run — the production path from strip to the
+# parent's own re-validation is a handful of shell builtins plus one mv/cp, which finishes
+# faster than a loop that forks a grep per poll can even notice the signal, let alone land a
+# write before the parent reads the file. The result was a FALSE negative on this exact
+# regression (rc=0, the real review printed, the check reporting a working race that never
+# actually raced). Corrupt the file as a synchronous SIDE EFFECT of the parent's own next
+# instruction instead of trying to outrun it: `sed -n 's/^RESULT_FILE=//p'` at :398 is the
+# unique, unambiguous call the parent makes to parse the child's locator line, immediately
+# before validating it — nothing else in the codebase runs that exact script. A PATH shim on
+# `sed` overwrites $WORK/harvest.capture the instant that call fires, then execs the real sed
+# so REC_LOCATOR still resolves to the correct (now-corrupted) path. No timing window, no
+# flakiness: the parent's very next read of $REC_LOCATOR is guaranteed post-corruption. The
+# captured body is blocked independently: a second shim rule fails the mktemp call recovery
+# uses to stage the child's own stdout into a private temp file. $OUT carries a DIFFERENT,
+# structurally valid "foreign" review throughout — an old build that fell back to re-reading
+# $OUT here would have announced it as this run's result.
+#
+# A SECOND false-negative sits one layer below the one above: a plain `PATH="$BIN:$PATH"`
+# prefix does not survive pg_augment_path, which every oracle-review.sh invocation (parent AND
+# the --harvest child it spawns) runs before touching mktemp/sed — it unconditionally rebuilds
+# PATH as "$HOME/.local/bin:...mise/pnpm/homebrew...:/usr/local/bin:/usr/bin:/bin:$PATH",
+# putting the real /usr/bin/mktemp and /usr/bin/sed AHEAD of whatever the caller prepended. A
+# shim bin/ directory earlier in $PATH is silently shadowed and never runs (confirmed: `which
+# mktemp` still resolves /usr/bin/mktemp under a prefixed PATH once pg_augment_path has fired) —
+# this test passed even against a build with the $OUT fallback still in place, for the wrong
+# reason (the "corruption" never happened, so both race-free rungs kept validating for real).
+# $HOME/.local/bin is the one directory pg_augment_path itself puts FIRST, so pointing HOME at
+# a private fixture directory containing only the two shims (not a repo/user directory — never
+# touch the real $HOME) wins the lookup deterministically without relying on PATH ordering at
+# all, and leaves every other tool (node, flock, git, ...) resolving from the real system dirs
+# pg_augment_path lists after it.
+echo '# gate #91 round3 P1 (:304): recover with locator AND captured body both invalid fails closed, never reading $OUT'
+RECFINAL_HOME="$TDIR/home-recover-final-fallback"
+RECFINAL_MARKER='pg-run-acme-widgets-708-1700011300-1'
+{ printf 'run marker: %s\n' "$RECFINAL_MARKER"
+  printf '[P1] src/final.sh:1 - third-rung fixture\n  Why: OUT-fallback removal check\nP2: none\nP3: none\nVERDICT: SHIP - final. (run marker: %s)\n' \
+    "$RECFINAL_MARKER" "$RECFINAL_MARKER"
+} > "$TDIR/recover-final-tab.txt"
+mkdir -p "$RECFINAL_HOME/completed"
+printf 'GARBAGE-NOT-A-REVIEW\n' > "$RECFINAL_HOME/completed/$RECFINAL_MARKER"
+: > "$RECFINAL_HOME/pending"
+RECFINAL_OUT="$TDIR/recover-final-out.md"
+printf '[P2] src/foreign.sh:1 - unrelated concurrent review\n  Why: must never be returned by this recovery\nP1: none\nP3: none\nVERDICT: SHIP - foreign.\n' \
+  > "$RECFINAL_OUT"
+RECFINAL_WORK="$TDIR/recfinal-work"
+RECFINAL_SNAP="$RECFINAL_WORK/harvest.capture"
+RECFINAL_FAKEHOME="$TDIR/home-recfinal-fakehome"
+RECFINAL_BIN="$RECFINAL_FAKEHOME/.local/bin"; mkdir -p "$RECFINAL_BIN"
+cat > "$RECFINAL_BIN/mktemp" <<SHIM
+#!/usr/bin/env bash
+for a in "\$@"; do
+  case "\$a" in
+    */pg-recover-hvbody.*) exit 1 ;;
+  esac
+done
+case "\$*" in
+  *pro-review.XXXXXX*)
+    mkdir -p "$RECFINAL_WORK" 2>/dev/null && { printf '%s\n' "$RECFINAL_WORK"; exit 0; }
+    exit 1
+    ;;
+esac
+exec /usr/bin/mktemp "\$@"
+SHIM
+chmod +x "$RECFINAL_BIN/mktemp"
+cat > "$RECFINAL_BIN/sed" <<SHIM
+#!/usr/bin/env bash
+case "\$*" in
+  *'s/^RESULT_FILE=//p'*)
+    printf 'CORRUPTED-BY-TEST-NOT-A-REVIEW\n' > "$RECFINAL_SNAP" 2>/dev/null
+    ;;
+esac
+exec /usr/bin/sed "\$@"
+SHIM
+chmod +x "$RECFINAL_BIN/sed"
+start_mock "$TDIR/recover-final-tab.txt"
+: > "$TDIR/recover-oracle-sentinel"
+env PRO_GATE_HOME="$RECFINAL_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-recover-sentinel" PG_TEST_RECOVER_ORACLE_SENTINEL="$TDIR/recover-oracle-sentinel" NODE_OPTIONS= \
+  HOME="$RECFINAL_FAKEHOME" \
+  bash "$ENGINE" --recover "$RECFINAL_MARKER" --out "$RECFINAL_OUT" --timeout 30s \
+  >"$TDIR/recover.stdout" 2>"$TDIR/recover.stderr"
+RC=$?
+check 'recover with locator AND captured body both invalid reports the trouble state' \
+  "$([ "$RC" -eq 6 ] && grep -qx 'Browser needs attention' "$TDIR/recover.stderr"; echo $?)" \
+  "rc=$RC stderr=$(cat "$TDIR/recover.stderr")"
+check 'recover with locator AND captured body both invalid prints nothing on stdout' \
+  "$([ ! -s "$TDIR/recover.stdout" ]; echo $?)" "stdout=$(cat "$TDIR/recover.stdout")"
+check 'recover with locator AND captured body both invalid never surfaces the foreign $OUT review' \
+  "$(! grep -qF 'unrelated concurrent review' "$TDIR/recover.stdout"; echo $?)" \
+  "stdout=$(cat "$TDIR/recover.stdout")"
+
+# gate #91 round3 P1 (:165): the charge site's run-meta write is best-effort (a failed sidecar
+# write must never block a real review from running), so a NEWER run can be live right now with
+# NO run-meta row at all while an OLDER completed sidecar for the same change still exists. The
+# run-meta scan alone would see only the old row and silently serve it while the real answer is
+# still generating. active/<key> is written unconditionally at charge time, so the resolver
+# cross-checks it using the SAME liveness rule --status already applies to active records (pid
+# alive, then a process-identity token match) rather than a second rule that could disagree.
+REC_ACTIVE_HOME="$TDIR/home-recover-active"
+mkdir -p "$REC_ACTIVE_HOME/completed" "$REC_ACTIVE_HOME/run-meta" "$REC_ACTIVE_HOME/active"
+REC_ACTIVE_OLD='pg-run-acme-widgets-110-1700009000-1'
+printf '[P1] old artifact\n  Why: stale\nP2: none\nP3: none\nVERDICT: SHIP - old.\n' > "$REC_ACTIVE_HOME/completed/$REC_ACTIVE_OLD"
+printf 'github.com\tacme\twidgets\tacme-widgets-110\t110\t/tmp/old-110.md\t1700009100\n' > "$REC_ACTIVE_HOME/run-meta/$REC_ACTIVE_OLD"
+REC_ACTIVE_NEW='pg-run-acme-widgets-110-1700009200-2'
+REC_ACTIVE_TOK="$(bash -c '. "'"$HERE"'/../lib/pro-gate-lib.sh"; pg_pid_token '"$$"'')"
+printf '%s\t/tmp/new-110.md\t%s\t%s\tremote-chrome\t%s\n' \
+  "$REC_ACTIVE_NEW" "$$" "$(date +%s)" "$REC_ACTIVE_TOK" > "$REC_ACTIVE_HOME/active/acme-widgets-110"
+: > "$TDIR/recover-oracle-sentinel"
+recover_run "$REC_ACTIVE_HOME" --recover 'https://github.com/acme/widgets/pull/110'
+check 'recover refuses a stale artifact while a newer metadata-less run is LIVE, naming that marker' \
+  "$([ "$RC" -eq 2 ] && grep -qi 'disambiguation' "$TDIR/recover.stderr" && grep -qF "$REC_ACTIVE_NEW" "$TDIR/recover.stderr" \
+     && [ ! -s "$TDIR/recover.stdout" ] && [ ! -s "$TDIR/recover-oracle-sentinel" ]; echo $?)" \
+  "rc=$RC stderr=$(cat "$TDIR/recover.stderr") oracle=$(cat "$TDIR/recover-oracle-sentinel")"
+
+# A DEAD (pid gone, or a live pid whose process-identity token no longer matches — pid reuse)
+# active record carries no live evidence and must never block recovery of the durable older
+# artifact: the failure direction for a stale active record is "recover normally", not refuse.
+printf '%s\t/tmp/dead-110.md\t99999999\t%s\tremote-chrome\tBOGUS-TOKEN\n' \
+  "$REC_ACTIVE_OLD" "$(date +%s)" > "$REC_ACTIVE_HOME/active/acme-widgets-110"
+recover_run "$REC_ACTIVE_HOME" --recover 'https://github.com/acme/widgets/pull/110'
+check 'recover ignores a dead active record and returns the durable older artifact' \
+  "$([ "$RC" -eq 0 ] && cmp -s "$REC_ACTIVE_HOME/completed/$REC_ACTIVE_OLD" "$TDIR/recover.stdout"; echo $?)" \
+  "rc=$RC stdout=$(cat "$TDIR/recover.stdout") stderr=$(cat "$TDIR/recover.stderr")"
+
+# Exact-marker recovery never enters the candidate scan (it already names one marker), so a LIVE
+# active record for the same round key must not affect it either way — the active/ cross-check
+# lives entirely inside the ambiguous-query branch above.
+printf '%s\t/tmp/new-110.md\t%s\t%s\tremote-chrome\t%s\n' \
+  "$REC_ACTIVE_NEW" "$$" "$(date +%s)" "$REC_ACTIVE_TOK" > "$REC_ACTIVE_HOME/active/acme-widgets-110"
+recover_run "$REC_ACTIVE_HOME" --recover "$REC_ACTIVE_OLD"
+check 'exact-marker recovery is unaffected by a live active record for the same round key' \
+  "$([ "$RC" -eq 0 ] && cmp -s "$REC_ACTIVE_HOME/completed/$REC_ACTIVE_OLD" "$TDIR/recover.stdout"; echo $?)" \
+  "rc=$RC stdout=$(cat "$TDIR/recover.stdout") stderr=$(cat "$TDIR/recover.stderr")"
+
+# gate #91 round3 P1 (:208): the artifact-first fast path used to publish straight to --out with
+# no lock at all — a second recovery, or a fresh/harvest run, racing it could each replace the
+# same file and each report success while the other's bytes vanished silently. It now takes the
+# SAME process-lifetime guard the engine's own dispatch takes (pg_out_guard_acquire) before the
+# first byte moves. Hold that guard here exactly the way a live run would (flock on $OUT.lock)
+# and confirm the racing recovery reports the trouble state and never touches --out, rather than
+# a "successful" publish nobody could trust.
+REC_GUARD_HOME="$TDIR/home-recover-outguard"
+mkdir -p "$REC_GUARD_HOME/completed" "$REC_GUARD_HOME/run-meta"
+REC_GUARD_MARKER='pg-run-acme-widgets-111-1700009400-1'
+printf '[P1] guarded artifact\n  Why: must not publish while guard held\nP2: none\nP3: none\nVERDICT: SHIP - guarded.\n' \
+  > "$REC_GUARD_HOME/completed/$REC_GUARD_MARKER"
+printf 'github.com\tacme\twidgets\tacme-widgets-111\t111\t/tmp/og-111.md\t1700009500\n' \
+  > "$REC_GUARD_HOME/run-meta/$REC_GUARD_MARKER"
+REC_GUARD_OUT="$TDIR/recover-outguard-out.md"
+exec {REC_GUARD_FD}>>"$REC_GUARD_OUT.lock"; flock -n "$REC_GUARD_FD"
+recover_run "$REC_GUARD_HOME" --recover "$REC_GUARD_MARKER" --out "$REC_GUARD_OUT"
+check 'recover cannot publish over an --out whose guard another live run already holds' \
+  "$([ "$RC" -eq 6 ] && grep -qx 'Browser needs attention' "$TDIR/recover.stderr" \
+     && [ ! -s "$TDIR/recover.stdout" ] && [ ! -s "$REC_GUARD_OUT" ]; echo $?)" \
+  "rc=$RC stdout=$(cat "$TDIR/recover.stdout") stderr=$(cat "$TDIR/recover.stderr")"
+# The guard helper narrates its own "ERROR: another live run..." line, which is right for the
+# engine's dispatch but not for --recover, which promises exactly ONE plain state line. A
+# grep-only assertion cannot see that leak, so pin the line count the way the sibling state
+# checks above already do.
+check 'recover guard contention still prints exactly one plain state line' \
+  "$([ "$(wc -l < "$TDIR/recover.stderr")" = 1 ]; echo $?)" \
+  "stderr=$(cat "$TDIR/recover.stderr")"
+eval "exec ${REC_GUARD_FD}>&-"
+# Once the guard is released, the identical call recovers normally — the guard blocks a genuine
+# race, not recovery itself.
+recover_run "$REC_GUARD_HOME" --recover "$REC_GUARD_MARKER" --out "$REC_GUARD_OUT"
+check 'recover publishes normally once the --out guard is released' \
+  "$([ "$RC" -eq 0 ] && cmp -s "$REC_GUARD_HOME/completed/$REC_GUARD_MARKER" "$REC_GUARD_OUT"; echo $?)" \
+  "rc=$RC stdout=$(cat "$TDIR/recover.stdout") stderr=$(cat "$TDIR/recover.stderr")"
+
 # Failure state 1: the harvested conversation is still generating (--harvest -> exit 9) ->
 # mapped novice state "Still working", nothing else on either stream.
 RECSTILL_MARKER='pg-run-acme-widgets-702-1700010700-1'

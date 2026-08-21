@@ -1274,12 +1274,27 @@ while (Date.now() < deadline) {
       rejectCrossBound(revalidateUrl, fresh.foreignMarker, 'canonical scratch');
       // Only null the signal when the rejected URL IS the tab we were scanning: a rejected
       // knownUrl says nothing about a genuinely different, still-open, still-incomplete tab.
-      if (revalidateUrl === tab.url) stillGeneratingUrl = null;
+      if (revalidateUrl === tab.url) {
+        stillGeneratingUrl = null;
+      } else if (probe) {
+        // The one-shot revalidation was spent on knownUrl, a DIFFERENT conversation from the
+        // tab this iteration is actually scanning. Rejecting knownUrl proves nothing about that
+        // tab — it already produced its own owned-incomplete `evidence` above (gate #91 r3 P1).
+        // Without re-emitting it here, probe has no positive signal left this cycle: it falls
+        // through past every `!probe` block below straight to the deadline's exit 4 (absent),
+        // which increments the reservation's consecutive-miss count and can ultimately RELEASE a
+        // live, still-generating review for double-spending.
+        emitEvidence(tab.url, evidence);
+      }
       continue;
     }
     if (fresh?.kind === 'foreign') {
       rejectForeign(revalidateUrl, 'canonical scratch');
-      if (revalidateUrl === tab.url) stillGeneratingUrl = null;
+      if (revalidateUrl === tab.url) {
+        stillGeneratingUrl = null;
+      } else if (probe) {
+        emitEvidence(tab.url, evidence);
+      }
       continue;
     }
     if (fresh?.kind === 'terminal') {
