@@ -558,15 +558,25 @@ pg_run_meta_read() { # marker -> one validated compact record
 # Shared read-only marker enumerator. Status uses it to discover sidecar-only keys; recovery
 # uses the same records rather than scraping status's human or JSON renderings.
 pg_run_meta_scan() {
-  local dir f marker rec
+  local dir f marker rec tail
   dir="$(pg_run_meta_dir)"; [ -d "$dir" ] || return 0
   for f in "$dir"/pg-run-*; do
     [ -f "$f" ] || continue
     marker="$(basename "$f")"
     # Belt-and-suspenders: pg_run_meta_write's own publication temp is dot-prefixed (excluded by
-    # the glob above), but skip any leftover/foreign ".tmp." name too rather than trust the glob
-    # alone — a half-published record here would surface a candidate no charge backs.
-    case "$marker" in *.tmp.*) continue;; esac
+    # the glob above), but LEGACY temps written by pre-fix versions were not — they land as
+    # "<valid-marker>.tmp.<pid>", which DOES match the pg-run-* glob, so skip those leftovers too
+    # rather than trust the glob alone. The check is anchored to the LAST ".tmp." and requires an
+    # all-digit tail (the pid) rather than a bare substring test: a bare `*.tmp.*` match hides any
+    # charged record whose repo/branch legitimately contains the literal ".tmp." (e.g. a repo
+    # named app.tmp.v2) from every future recovery scan forever. A real marker always ends
+    # "-<epoch>-<pid>", which can never take that "digits after the last .tmp." shape.
+    case "$marker" in
+      *.tmp.*)
+        tail="${marker##*.tmp.}"
+        case "$tail" in ''|*[!0-9]*) ;; *) continue;; esac
+        ;;
+    esac
     pg_reservation_marker_ok "$marker" || continue
     rec="$(pg_run_meta_read "$marker" 2>/dev/null)" || continue
     printf '%s\t%s\n' "$marker" "$rec"

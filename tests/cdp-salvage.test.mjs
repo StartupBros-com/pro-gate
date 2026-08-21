@@ -610,12 +610,76 @@ const MARKER = 'pg-run-test-1234567890-42';
     const r = await runSalvage(args, cdp.port, seedMemo(MARKER, priorUrl), {
       PRO_GATE_TEST_CHILD_TIMEOUT_MS: '6000',
     });
+    // Bound relaxed from 4_500: against a 3s deadline and a 6000ms SIGKILL fallback, 4_500 left
+    // only ~1.5s of slack for spawn + timer jitter, and this is the only upper-bound wall-clock
+    // assertion in a file whose other elapsed assertions are lower-bound only. 5_500 still proves
+    // the process beat the SIGKILL fallback with margin to spare.
     check(`${label} scratch-open timeout returns before its watchdog fallback`,
-      r.status === expectedStatus && r.elapsedMs < 4_500,
+      r.status === expectedStatus && r.elapsedMs < 5_500,
       `status=${r.status} elapsed=${r.elapsedMs}ms stderr=${r.stderr}`);
     check(`${label} scratch-open timeout leaves source and recovery state unchanged`,
       r.memoUrl === priorUrl && r.blacklist === null && r.crossbound === 0 && !cdp.closed.includes('tab1'),
       `memo=${r.memoUrl} blacklist=${r.blacklist} crossbound=${r.crossbound} closed=${cdp.closed}`);
+    cdp.stop();
+  }
+}
+
+{ // P1: an unresponsive scratch LIST poll (headers never arrive at all) is likewise absence of
+  // fresh evidence, not permission to overrun the caller deadline. Regression lock: before this
+  // test existed, opts.hangScratchList was defined in the mock but no test ever set it, so
+  // reverting the /json list-poll's fetchJsonBeforeDeadline binding back to a bare fetch() would
+  // fail nothing.
+  const priorUrl = 'https://chatgpt.com/c/prior-genuine';
+  const source = `run marker: ${MARKER}\nstale readable source`;
+  for (const [label, args, expectedStatus] of [
+    ['normal', [MARKER, '3'], 3],
+    ['probe', ['--probe', MARKER, '3'], 0],
+  ]) {
+    const cdp = await mockCdp(source, [], { hangScratchList: true });
+    const r = await runSalvage(args, cdp.port, seedMemo(MARKER, priorUrl), {
+      PRO_GATE_TEST_CHILD_TIMEOUT_MS: '6000',
+    });
+    check(`${label} scratch-list timeout returns before its watchdog fallback`,
+      r.status === expectedStatus && r.elapsedMs < 5_500,
+      `status=${r.status} elapsed=${r.elapsedMs}ms stderr=${r.stderr}`);
+    check(`${label} scratch-list timeout leaves source and recovery state unchanged`,
+      r.memoUrl === priorUrl && r.blacklist === null && r.crossbound === 0 && !cdp.closed.includes('tab1'),
+      `memo=${r.memoUrl} blacklist=${r.blacklist} crossbound=${r.crossbound} closed=${cdp.closed}`);
+    cdp.stop();
+  }
+}
+
+{ // P1: an unresponsive scratch CLOSE (the fix-A cleanup attempt in freshRenderText's finally
+  // block) must not be allowed to hang the process either, and — the regression lock for fix A —
+  // the close must actually be ATTEMPTED even though the peer never replies. scratchTarget
+  // returning null makes the scratch target vanish from the /json listing (mirroring a
+  // disappeared tab) so freshRenderText reaches its cleanup finally without ever reading decisive
+  // text, keeping this test's second assertion (unchanged recovery state) meaningful the same way
+  // the scratch-open and scratch-list variants above are.
+  const priorUrl = 'https://chatgpt.com/c/prior-genuine';
+  const source = `run marker: ${MARKER}\nstale readable source`;
+  for (const [label, args, expectedStatus] of [
+    ['normal', [MARKER, '3'], 3],
+    ['probe', ['--probe', MARKER, '3'], 0],
+  ]) {
+    const cdp = await mockCdp(source, [], { hangScratchClose: true, scratchTarget: () => null });
+    // This variant is the slowest of the three by construction: the render loop must burn its
+    // 2.5s sample before the target-disappeared return, and only THEN does the cleanup close
+    // spend its own 2s grace against a peer that never replies (~4.5s before spawn overhead).
+    // So it gets a proportionally later kill fallback and ceiling rather than the 6000/5_500 the
+    // open- and list-timeout variants use, where the abort lands at the 3s caller deadline.
+    const r = await runSalvage(args, cdp.port, seedMemo(MARKER, priorUrl), {
+      PRO_GATE_TEST_CHILD_TIMEOUT_MS: '9000',
+    });
+    check(`${label} scratch-close timeout returns before its watchdog fallback`,
+      r.status === expectedStatus && r.elapsedMs < 7_000,
+      `status=${r.status} elapsed=${r.elapsedMs}ms stderr=${r.stderr}`);
+    check(`${label} scratch-close timeout leaves source and recovery state unchanged`,
+      r.memoUrl === priorUrl && r.blacklist === null && r.crossbound === 0 && !cdp.closed.includes('tab1'),
+      `memo=${r.memoUrl} blacklist=${r.blacklist} crossbound=${r.crossbound} closed=${cdp.closed}`);
+    check(`${label} scratch-close cleanup was attempted despite no reply`,
+      cdp.closed.includes('scratch1'),
+      `closed=${cdp.closed}`);
     cdp.stop();
   }
 }

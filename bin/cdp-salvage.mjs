@@ -516,16 +516,27 @@ function blacklist(url) {
 }
 
 // A fresh render runs inside a watchdog/probe deadline. Native fetch has no deadline of its
-// own, so every scratch CDP request carries the caller's remaining budget. Keep body parsing
-// under that same signal too: a peer that sends headers but never completes JSON is also stuck.
+// own, so every scratch CDP request carries the caller's remaining budget for the part that can
+// genuinely hang forever: waiting for headers from a peer that never answers at all (the
+// hangScratchOpen/hangScratchList case). Body consumption is a TWO-STAGE bound instead of
+// sharing that same signal to its end: once headers land, the response — and any CDP target it
+// names — is real, already-created server-side state, so a deadline landing mid-JSON-parse must
+// not lose the only reference to it. Headers-received swaps the caller's (possibly near-zero)
+// remaining budget for a small independent grace window to let `consume` finish.
+const CONSUME_GRACE_MS = 2_000;
 async function fetchBeforeDeadline(url, options, requestDeadline, consume = null) {
   const remaining = requestDeadline - Date.now();
   if (remaining <= 0) throw new Error('caller-deadline-expired');
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), remaining);
+  let timeout = setTimeout(() => controller.abort(), remaining);
   try {
     const response = await fetch(url, { ...options, signal: controller.signal });
-    return consume ? await consume(response) : response;
+    if (!consume) return response;
+    // Headers arrived: replace the caller's-deadline timer with the fixed grace window so a
+    // slow-but-arriving body still completes and callers can capture the target it names.
+    clearTimeout(timeout);
+    timeout = setTimeout(() => controller.abort(), CONSUME_GRACE_MS);
+    return await consume(response);
   } finally {
     clearTimeout(timeout);
   }
@@ -594,9 +605,14 @@ async function freshRenderText(url, port, outerDeadline, waitForDecisiveEvidence
   } catch {
     return { text: null, reason: 'scratch-cdp-failed' };
   } finally {
-    // Cleanup is best-effort, but never gets to outlive the caller's watchdog/probe budget.
-    if (target?.id && Date.now() < outerDeadline) {
-      try { await fetchBeforeDeadline(`http://127.0.0.1:${port}/json/close/${target.id}`, {}, outerDeadline); } catch {}
+    // Cleanup ALWAYS gets attempted when a scratch target was opened, even though the caller's
+    // budget is usually already spent by the time we get here (that is exactly when a stranded
+    // scratch tab does the most damage: it sits open in the user's real Chrome profile, and a
+    // later /json list against it can itself hang forever). So this gets a small FIXED budget of
+    // its own, independent of outerDeadline, rather than inheriting whatever (possibly zero or
+    // negative) time the caller has left. Still best-effort (the try/catch stays).
+    if (target?.id) {
+      try { await fetchBeforeDeadline(`http://127.0.0.1:${port}/json/close/${target.id}`, {}, Date.now() + 2000); } catch {}
     }
   }
 }
@@ -753,17 +769,22 @@ function mutationOwnership(text) {
 async function openOrganizerScratch(url) {
   let target = null;
   try {
-    let response = await fetch(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(url)}`, { method: 'PUT' });
-    if (!response.ok) response = await fetch(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(url)}`);
-    if (!response.ok) return { target: null, reason: 'memo-open-failed' };
-    target = await response.json();
+    // Bound like freshRenderText's scratch open/list (gate: these were bare fetch() calls, so
+    // --organize/--finalize was bounded only by the shell's outer SIGKILL, which skips JS
+    // cleanup entirely). Open is bound to the module-level deadline (the whole invocation's
+    // budget); the list poll below is bound to renderDeadline, its own tighter sub-budget.
+    const openUrl = `http://127.0.0.1:${port}/json/new?${encodeURIComponent(url)}`;
+    let opened = await fetchJsonBeforeDeadline(openUrl, { method: 'PUT' }, deadline);
+    if (!opened.response.ok) opened = await fetchJsonBeforeDeadline(openUrl, {}, deadline); // pre-v111 Chrome used GET
+    if (!opened.response.ok) return { target: null, reason: 'memo-open-failed' };
+    target = opened.value;
     const renderDeadline = Math.min(deadline, Date.now() + 25_000);
     let sawLogin = false;
     while (Date.now() < renderDeadline) {
       await sleep(Math.min(250, Math.max(0, renderDeadline - Date.now())));
       let live = target;
       try {
-        const tabs = await (await fetch(`http://127.0.0.1:${port}/json`)).json();
+        const { value: tabs } = await fetchJsonBeforeDeadline(`http://127.0.0.1:${port}/json`, {}, renderDeadline);
         live = tabs.find((tab) => tab.id === target.id) ?? null;
       } catch { return { target, reason: 'cdp-list-failed' }; }
       if (!live) return { target, reason: 'memo-tab-disappeared' };
