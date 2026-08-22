@@ -55,12 +55,28 @@ jobs:
             # tag creation, and later pushes would otherwise skip silently forever. Nothing
             # self-retries past tag creation by design (re-dispatching privileged stages
             # automatically is how release loops happen); reconcile by hand instead.
-            if gh release view "v$version" --json isDraft,isPrerelease,assets \
-                 --jq 'select(.isDraft == false and .isPrerelease == false) | [.assets[].name] | join(",")' 2>/dev/null \
+            # Draft-first: release.yml now leaves the release a DRAFT until the
+            # marketplace card names it, so "draft WITH complete assets" is the
+            # normal awaiting-repin state and must not be reported as breakage.
+            # Only a release that is neither published-and-complete nor
+            # staged-and-complete is actually wrong.
+            rel_state="$(gh release view "v$version" --json isDraft,isPrerelease \
+                 --jq 'if .isDraft then "draft" elif .isPrerelease then "prerelease" else "published" end' 2>/dev/null || echo missing)"
+            if gh release view "v$version" --json assets \
+                 --jq '[.assets[].name] | join(",")' 2>/dev/null \
                  | grep -q "pro-gate-runtime-$version.tar.gz.sha256"; then
-              echo "tag v$version already exists with a published release and complete assets; nothing to release" >&2
+              assets_complete=true
             else
-              echo "::warning::Tag v$version exists but its release/assets are missing or incomplete. The chain does NOT self-retry past tag creation: rerun the 'Release runtime' workflow for v$version (or delete the tag+release to let auto-release retry), then check the release train run."
+              assets_complete=false
+            fi
+            staged=false
+            if [ "$rel_state" = published ] && [ "$assets_complete" = true ]; then
+              echo "tag v$version already exists with a published release and complete assets; nothing to release" >&2
+            elif [ "$rel_state" = draft ] && [ "$assets_complete" = true ]; then
+              staged=true
+              echo "::notice::v$version is staged as a draft with complete assets, awaiting its marketplace repin. Merge the repin PR against StartupBros-com/hov-marketplace, then run the 'Publish staged release' workflow for v$version."
+            else
+              echo "::warning::Tag v$version exists but its release/assets are missing or incomplete (state=$rel_state, assets_complete=$assets_complete). The chain does NOT self-retry past tag creation: rerun the 'Release runtime' workflow for v$version (or delete the tag+release to let auto-release retry), then check the release train run."
             fi
             # #31 item 3: READ-ONLY marketplace-tuple verification (no redispatch — automatic
             # re-runs of privileged stages are how release loops happen). A published release
@@ -68,7 +84,13 @@ jobs:
             # tuple) is the one silent gap the asset check above cannot see. Verify the FULL
             # tuple the release train promotes — sha, version, releaseId, releaseTag — and
             # warn on fetch failure instead of swallowing it (gate #61 r1 P2).
-            if ! mkt_json="$(curl -fsS "https://raw.githubusercontent.com/StartupBros-com/hov-marketplace/main/.claude-plugin/marketplace.json")"; then
+            if [ "$staged" = true ]; then
+              # A staged draft has not been promoted YET, by design — the card
+              # still names the previous release and the repin is the next step,
+              # already reported above. Warning about the mismatch here would fire
+              # on every release and train the reader to ignore this channel.
+              :
+            elif ! mkt_json="$(curl -fsS "https://raw.githubusercontent.com/StartupBros-com/hov-marketplace/main/.claude-plugin/marketplace.json")"; then
               echo "::warning::Could not fetch the marketplace manifest to verify pro-gate v$version's promotion; check https://github.com/StartupBros-com/hov-marketplace manually."
             elif ! mkt_entry="$(printf '%s' "$mkt_json" | jq -ce '[.plugins[] | select(.name == "pro-gate")] | first // empty')" || [ -z "$mkt_entry" ]; then
               echo "::warning::Marketplace manifest has no readable pro-gate entry; cannot verify v$version's promotion."
