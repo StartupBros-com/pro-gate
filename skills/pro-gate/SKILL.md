@@ -173,8 +173,9 @@ engine home is `$HOME/.pro-review-daemon`.
   blocking. Thresholds: `PRO_GATE_MIN_AVAIL_MB` (default 1024), `PRO_GATE_MAX_SWAP_PCT` (default
   97, the hard defer), `PRO_GATE_SWAP_WARN_PCT` (default 80, the soft heads-up). For users: close
   other apps / browser tabs / AI tools to free memory. `pro-gate-doctor.sh` reports the live state.
-- **Usage (best-effort):** if codex auth is present, check `chatgpt.com/backend-api/wham/usage`;
-  if the primary window is ≥90% or `limit_reached`, warn before burning a slot.
+- **Browser review and fixer availability are separate:** the Pro review runs through the signed-in
+  ChatGPT browser session; Codex/CE are optional post-review fixers with a separate usage pool. Never
+  query Codex quota or a local Codex cooldown before admitting a browser review.
 - **Concurrency is handled for you:** `oracle-review.sh` holds a counting semaphore —
   **serialized by default** (`PRO_GATE_MAX_CONCURRENCY=1`; raise it only if your account
   demonstrably tolerates parallel Pro chats). Concurrent `/pro-gate` calls (e.g. 10 agents at
@@ -383,12 +384,14 @@ issue · your confidence) plus the verdict.
   non-empty, then stop.
 - **auto-fix:** route confirmed P0/P1 (and clear P2s) to the **best available fixer**, in order:
   (1) if the Compound Engineering plugin is installed → `/ce-work` (native tiering since CE 3.17.1
-  routes to codex when appropriate; skip if the codex doghouse `~/.codex/.doghouse` is tripped);
-  (2) else if `codex` is on PATH → `codex exec`;
-  (3) else → apply the edits yourself directly in this session. Then run available tests/lint, commit
-  `fix(pro-gate): <summary>`, push, and post a PR comment with the review + what was fixed. Note in
-  that comment which head SHA each engine run reviewed (section 6's final-commit rule needs it). Stop
-  before merge — the human merges.
+  routes to Codex when appropriate);
+  (2) else, if direct `codex` is on PATH and its invocation proceeds → `codex exec`;
+  (3) if those optional fixers are absent or unavailable → apply the edits directly in this session.
+  A Codex quota or transport failure changes only the fixer route: it never invalidates the completed
+  browser review and never warrants spending another Pro slot. Report which engine actually handled
+  the fixes. Then run available tests/lint, commit `fix(pro-gate): <summary>`, push, and post a PR
+  comment with the review + what was fixed. Note in that comment which head SHA each engine run
+  reviewed (section 6's final-commit rule needs it). Stop before merge — the human merges.
 - **auto-fix+merge:** after fixes converge, follow the guarded-merge rules: merge only when CI is
   green, no unresolved P0/P1, and the diff doesn't touch high-risk domains
   (auth/payments/migrations/secrets) — otherwise escalate to the human.
