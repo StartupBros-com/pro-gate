@@ -135,7 +135,7 @@
 <header>
   <div class="eyebrow">Ideation</div>
   <h1>pro-gate simplification</h1>
-  <p class="lede">Replace caller-side interpretation with a few engine-owned facts. Keep the machinery that proves identity, preserves charged work, and bounds spend; delete the questions, polling rituals, and duplicated policy prose built around it.</p>
+  <p class="lede">Replace caller-side interpretation with a few engine-owned, harness-neutral facts. Keep the machinery that proves identity, preserves charged work, and bounds spend; let thin Claude, Codex, and Pi adapters render those facts without recreating policy.</p>
   <p class="meta">Date: <time datetime="2026-08-26">2026-08-26</time> · Topic: <code>pro-gate-simplification</code> · Focus: polish, subtraction, autonomous continuation, finite stopping · Mode: repo-grounded</p>
   <div class="stats" aria-label="Ideation counts">
     <div class="stat"><strong>40</strong><span>raw candidates</span></div>
@@ -152,6 +152,7 @@
     <p>The strongest direct example is the supplied PR&nbsp;#1983 transcript: after a connector could not verify the PR, the agent prepared a smaller exact-head bundle and then blocked on whether to spend a forced round. The question was unnecessary process even if the correct answer was “stop”; the system should have emitted an authoritative disposition rather than converting ambiguity into operator permission.</p>
     <div class="callout"><strong>Evidence limit:</strong> the session-history corpus was degraded. Cass had a malformed canonical database, a stale lexical index, and 108 quarantined conversations. The readable evidence verified one bounded two-run stop and one premature/ambiguous recovery result, but it did not verify an endless same-head loop or a recurring authorization-question pattern. Ideas that required those stronger claims were cut.</div>
     <p><strong>Preserved boundary.</strong> Nonce/provenance, reservation ownership, no-respend recovery, write-once artifacts, charge ordering, and a finite engine-level spend ceiling are safety mechanisms—not ceremony. The simplification target is the duplicated caller policy and protocol around them. External workflow-engine, controller, and SRE prior art reinforces the same shape: immutable input identity, typed outcomes, re-observation before action, and retries that cannot silently promote into semantic spend.</p>
+    <p><strong>Distribution and harness boundary.</strong> <code>hov-marketplace</code> distributes Claude-specific skill and agent prose from a pinned pro-gate commit, while the executable <code>bin/</code>, <code>lib/</code>, and daemon runtime ships separately as a version-matched release archive. Codex is evidenced as a direct shell caller; no Pi entry point or result adapter is documented in either inspected repository. Therefore the durable contract must live in the runtime as versioned shell/JSON outcomes, while Claude, Codex, and Pi remain thin renderers. Blocking observation must also have a snapshot form so no idea depends on one harness’s process lifetime or wake mechanism.</p>
   </div>
   <figure aria-labelledby="fig-before-after-caption">
     <svg viewBox="0 0 900 292" role="img" aria-label="Current distributed interpretation compared with one engine-issued disposition">
@@ -215,9 +216,9 @@
   <h2>Ranked Ideas</h2>
   <nav class="jump" aria-label="Ranked idea links">
     <a href="#idea-1">1. Terminal disposition, not terminal question</a>
-    <a href="#idea-2">2. Zero-spend observer replaces caller polling</a>
+    <a href="#idea-2">2. Snapshot + wait observer replaces caller polling</a>
     <a href="#idea-3">3. Exact-input passport for every verdict</a>
-    <a href="#idea-4">4. Typed outcomes and generated action cards</a>
+    <a href="#idea-4">4. Versioned typed outcomes with harness-local renderers</a>
     <a href="#idea-5">5. One engine-issued round disposition—without a finding ledger</a>
   </nav>
 
@@ -225,7 +226,7 @@
     <div class="idea-head"><h3><span class="rank">1.</span> Terminal disposition, not terminal question</h3></div>
     <div class="chips"><span class="chip axis-chip">Terminal ownership</span><span class="chip conf-chip">Confidence 94%</span><span class="chip cx-chip">Complexity Medium</span></div>
     <dl>
-      <dt>Description</dt><dd>Persist one marker-addressed terminal disposition that binds reviewed input identity, verdict, unresolved findings, spend and round state, branch-preservation rule, next actor, and exactly one permitted next transition. <code>NEEDS-DISCUSSION</code> becomes either a named safe action or a compact, specific human decision—not a generic permission question.</dd>
+      <dt>Description</dt><dd>Persist one marker-addressed terminal disposition in the shared runtime, binding reviewed input identity, verdict, unresolved findings, spend and round state, branch-preservation rule, a harness-neutral next actor, and exactly one permitted next transition. <code>NEEDS-DISCUSSION</code> becomes either a named safe capability or a compact, specific operator decision—not a Claude-specific question or tool call.</dd>
       <dt>Basis</dt><dd><code>direct:</code> current code captures verdicts while the skill separately determines terminal behavior; durable marker, artifact, and status machinery already exists.</dd>
       <dt>Rationale</dt><dd>This directly fixes the supplied failure with the smallest authoritative seam. It lets agents continue whenever policy already authorizes the next move while preserving the branch and stopping spend when judgment is genuinely external.</dd>
       <dt>Downsides</dt><dd>The disposition vocabulary becomes a compatibility contract. The engine must report authority boundaries without accidentally granting merge or fix authority it does not own.</dd>
@@ -233,13 +234,13 @@
   </article>
 
   <article class="idea" id="idea-2">
-    <div class="idea-head"><h3><span class="rank">2.</span> Zero-spend observer replaces caller polling</h3></div>
+    <div class="idea-head"><h3><span class="rank">2.</span> Snapshot + wait observer replaces caller polling</h3></div>
     <div class="chips"><span class="chip axis-chip">Run observation and recovery</span><span class="chip conf-chip">Confidence 92%</span><span class="chip cx-chip">Complexity Medium</span></div>
     <dl>
-      <dt>Description</dt><dd>Add a marker-addressed blocking observer that follows durable state, emits meaningful transitions, and returns a typed terminal observation. It cannot dispatch, reserve, substitute input, or impose a submission timeout; observer death leaves the charged run and recovery artifacts intact.</dd>
-      <dt>Basis</dt><dd><code>direct:</code> the skill, relay, and daemon each narrate their own polling and harvest loop despite atomic state publication and durable no-spend recovery.</dd>
-      <dt>Rationale</dt><dd>Waiting is control-plane labor, not judgment. Moving it into a zero-token process deletes repeated agent turns, hand-written pollers, and elapsed-time interpretation without touching nonce, reservation, or artifact guarantees.</dd>
-      <dt>Downsides</dt><dd>The observer must be proven incapable of dispatch and lifecycle ownership. A stale, unmerged <code>--wait</code> branch exists, but it is historical evidence—not code to revive blindly.</dd>
+      <dt>Description</dt><dd>Add marker-addressed <code>observe --once</code> and <code>observe --wait</code> modes over the same durable state. Snapshot mode returns immediately; wait mode blocks without tokens until a meaningful transition or typed terminal observation. Neither can dispatch, reserve, substitute input, or impose a submission timeout; observer death leaves the charged run and recovery artifacts intact.</dd>
+      <dt>Basis</dt><dd><code>direct:</code> the skill, relay, and daemon each narrate their own polling and harvest loop despite atomic state publication and durable no-spend recovery. Claude also has process-duration constraints that Codex and Pi need not share.</dd>
+      <dt>Rationale</dt><dd>Waiting is control-plane labor, not judgment. A portable runtime primitive lets Claude detach or wake, Codex block or re-query, and Pi use whichever mode its harness supports—without making any notification mechanism part of the contract.</dd>
+      <dt>Downsides</dt><dd>Both modes must be proven incapable of dispatch and lifecycle ownership. Adapters still decide how to schedule or present observation. A stale, unmerged <code>--wait</code> branch is historical evidence—not code to revive blindly.</dd>
     </dl>
   </article>
 
@@ -255,13 +256,13 @@
   </article>
 
   <article class="idea" id="idea-4">
-    <div class="idea-head"><h3><span class="rank">4.</span> Typed outcomes and generated action cards</h3></div>
+    <div class="idea-head"><h3><span class="rank">4.</span> Versioned typed outcomes with harness-local renderers</h3></div>
     <div class="chips"><span class="chip axis-chip">Agent-facing protocol surface</span><span class="chip conf-chip">Confidence 88%</span><span class="chip cx-chip">Complexity Medium</span></div>
     <dl>
-      <dt>Description</dt><dd>Promote engine state to a stable typed outcome containing category, reason, spend or retry class, currentness, actor, exact safe command or capability, and artifact references. Render concise human and agent action cards from it. Keep audience-specific judgment prose hand-written and use targeted contract tests rather than compiling every document.</dd>
-      <dt>Basis</dt><dd><code>direct:</code> current status exposes rich internal classifications as a boolean <code>recoverable</code> plus free-text <code>next_step</code>; skill, relay, and daemon independently translate exits and phases and have already drifted on the default round policy.</dd>
-      <dt>Rationale</dt><dd>One semantic contract lets callers delete parsing and synchronized state-to-action narratives. It also makes failure behavior testable at the contract boundary rather than through prompt archaeology.</dd>
-      <dt>Downsides</dt><dd>Schema evolution becomes public API work. Rare recovery states still need rich diagnostics, so typed outcomes should front the system rather than erase expert inspection.</dd>
+      <dt>Description</dt><dd>Promote engine state to a versioned typed outcome containing <code>protocol_version</code>, category, reason, spend or retry class, currentness, actor, exact safe command or capability, and artifact references. Claude, Codex, and Pi adapters render their own concise action guidance from that schema; audience-specific judgment prose remains hand-written.</dd>
+      <dt>Basis</dt><dd><code>direct:</code> current status exposes rich internal classifications as a boolean <code>recoverable</code> plus free-text <code>next_step</code>; skill, relay, and daemon independently translate exits and phases and have already drifted. The HOV marketplace card is static installation metadata, not a per-run outcome surface.</dd>
+      <dt>Rationale</dt><dd>One runtime contract lets every harness delete parsing and synchronized state-to-action narratives without forcing their interaction models to match. A protocol version also gives direct Codex and Pi callers the compatibility check Claude currently gets from plugin/runtime version matching.</dd>
+      <dt>Downsides</dt><dd>Schema evolution becomes public API work, and each adapter needs its own distribution and conformance fixture. Pi’s current adapter path is undocumented, so compatibility is a required proof rather than an assumption.</dd>
     </dl>
   </article>
 
@@ -269,7 +270,7 @@
     <div class="idea-head"><h3><span class="rank">5.</span> One engine-issued round disposition—without a finding ledger</h3></div>
     <div class="chips"><span class="chip axis-chip">Semantic round progression</span><span class="chip conf-chip">Confidence 74%</span><span class="chip cx-chip">Complexity Medium</span></div>
     <dl>
-      <dt>Description</dt><dd>Have the engine combine verdict class and its existing trajectory and budget facts into one round disposition: terminal ship, terminal discussion, eligible after fixes, stop non-shrinking, or budget denied. Keep nuanced fix and dispute narration in the caller, but forbid callers from treating spare numerical budget as semantic permission after a terminal verdict.</dd>
+      <dt>Description</dt><dd>Have the shared shell engine combine verdict class and its existing trajectory and budget facts into one round disposition: terminal ship, terminal discussion, eligible after fixes, stop non-shrinking, or budget denied. Keep nuanced fix and dispute narration in each harness adapter, but forbid any caller from treating spare numerical budget as semantic permission after a terminal verdict.</dd>
       <dt>Basis</dt><dd><code>direct:</code> the skill and engine currently govern continuation with different signals and neither consumes the other’s authoritative disposition; <code>NEEDS-DISCUSSION</code> is terminal only in caller prose.</dd>
       <dt>Rationale</dt><dd>This removes one layer of stop-policy recomputation without inventing stable identities for free-form findings. It preserves the engine’s finite spend backstop and makes terminal verdict semantics impossible to bypass through a direct caller.</dd>
       <dt>Downsides</dt><dd>A deliberately small policy cannot encode every disputed-versus-acknowledged nuance. The boundary between engine facts and caller judgment must stay explicit.</dd>
@@ -291,23 +292,23 @@
       <text x="290" y="96" text-anchor="middle" class="svg-small">existing safety core</text>
       <path d="M365 85 H400" class="svg-line" marker-end="url(#arrow-two)"></path>
       <rect x="402" y="54" width="150" height="62" rx="8" class="svg-accent"></rect>
-      <text x="477" y="78" text-anchor="middle" class="svg-label">3 · Observer</text>
-      <text x="477" y="96" text-anchor="middle" class="svg-small">wait and recover, no spend</text>
+      <text x="477" y="78" text-anchor="middle" class="svg-label">3 · Observe</text>
+      <text x="477" y="96" text-anchor="middle" class="svg-small">snapshot or wait, no spend</text>
       <path d="M552 85 H587" class="svg-line" marker-end="url(#arrow-two)"></path>
       <rect x="589" y="54" width="150" height="62" rx="8" class="svg-accent"></rect>
       <text x="664" y="78" text-anchor="middle" class="svg-label">4 · Disposition</text>
       <text x="664" y="96" text-anchor="middle" class="svg-small">actor and one next action</text>
       <path d="M739 85 H774" class="svg-line" marker-end="url(#arrow-two)"></path>
       <rect x="776" y="54" width="96" height="62" rx="8" class="svg-step"></rect>
-      <text x="824" y="78" text-anchor="middle" class="svg-label">5 · Card</text>
-      <text x="824" y="96" text-anchor="middle" class="svg-small">typed output</text>
+      <text x="824" y="78" text-anchor="middle" class="svg-label">5 · Adapter</text>
+      <text x="824" y="96" text-anchor="middle" class="svg-small">render outcome</text>
 
       <rect x="215" y="174" width="337" height="64" rx="8" class="svg-warn"></rect>
       <text x="383" y="198" text-anchor="middle" class="svg-label">Round disposition controls re-entry</text>
       <text x="383" y="217" text-anchor="middle" class="svg-small">verdict + existing trajectory · finite ceiling remains</text>
       <path d="M664 116 V206 H552" class="svg-line" marker-end="url(#arrow-two)"></path>
       <path d="M215 206 H150 V116" class="svg-line" marker-end="url(#arrow-two)"></path>
-      <text x="28" y="274" class="svg-small">Normal callers see passport, observer, disposition, and action card—not reservations, sidecars, nonce rules, or harvest branching.</text>
+      <text x="28" y="274" class="svg-small">Runtime exposes passport, observation, and disposition; harness adapters render outcomes without learning safety stores.</text>
     </svg>
     <figcaption id="fig-stack-caption">Illustrative relationship among the five survivors. This is a direction map, not an implementation sequence or architecture specification.</figcaption>
   </figure>
@@ -342,6 +343,9 @@
     <li><a href="https://github.com/StartupBros-com/pro-gate/blob/main/agents/oracle-reviewer.md">Reviewer relay and recovery contract</a></li>
     <li><a href="https://github.com/StartupBros-com/pro-gate/blob/main/lib/pro-gate-lib.sh">Round governor, reservations, status, and identity helpers</a></li>
     <li><a href="https://github.com/StartupBros-com/pro-gate/blob/main/bin/oracle-review.sh">Engine entry points and state transitions</a></li>
+    <li><a href="https://github.com/StartupBros-com/pro-gate/blob/main/scripts/package-runtime.sh">Runtime/plugin distribution boundary</a></li>
+    <li><a href="https://github.com/StartupBros-com/hov-marketplace/blob/main/.claude-plugin/marketplace.json">HOV marketplace pinned plugin source</a></li>
+    <li><a href="https://github.com/StartupBros-com/hov-marketplace/blob/main/scripts/validate-marketplace.sh">Marketplace card and source validation</a></li>
     <li><a href="https://github.com/StartupBros-com/pro-gate/blob/main/docs/ideation/2026-08-17-pro-gate-gate-run-ux-ideation.html">Prior gate-run UX and performance ideation</a></li>
     <li><a href="https://github.com/StartupBros-com/pro-gate/blob/main/docs/solutions/conventions/ship-the-legible-core-let-the-gate-decline-fragile-automation.md">Ship the legible core; decline fragile automation</a></li>
     <li><a href="https://docs.temporal.io/encyclopedia/retry-policies">Temporal retry policies</a></li>
@@ -351,7 +355,7 @@
   </ul>
 </section>
 
-<footer class="composition-signal">Composed 2026-08-26T22:41Z by ce-ideate from the user’s pro-gate simplification prompt, current <code>origin/main</code>, local session-history evidence, and external workflow-engine prior art.</footer>
+<footer class="composition-signal">Composed 2026-08-26T22:41Z and refined 2026-08-26T23:23Z by ce-ideate from the user’s pro-gate simplification prompt, current <code>origin/main</code>, local session-history evidence, HOV marketplace distribution evidence, and external workflow-engine prior art.</footer>
 </main>
 </body>
 </html>
