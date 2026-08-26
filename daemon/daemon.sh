@@ -139,40 +139,8 @@ session_up(){
   [ "$(pg_service_uptime)" -ge "${PRO_GATE_MIN_UPTIME:-60}" ]
 }
 
-# Optional: only meaningful for codex users. No-op (returns "not tripped") without ~/.codex.
-doghouse_tripped(){
-  local f="$HOME/.codex/.doghouse"
-  [ -f "$f" ] && pg_have node || return 1
-  node -e 'try{const s=JSON.parse(require("fs").readFileSync(process.argv[1]));process.exit(s.until>Date.now()?0:1)}catch{process.exit(1)}' "$f" 2>/dev/null
-}
-
-# Optional best-effort account-usage check (codex auth). No-op without creds/jq -> never blocks.
-usage_saturated(){
-  pg_have jq || return 1
-  local tok acct js auth="$HOME/.codex/auth.json"
-  [ -f "$auth" ] || return 1
-  tok=$(jq -r '.tokens.access_token // empty' "$auth" 2>/dev/null)
-  acct=$(jq -r '.tokens.account_id // .tokens.chatgpt_account_id // empty' "$auth" 2>/dev/null)
-  [ -z "$tok" ] && return 1
-  js=$(curl -s --max-time 10 https://chatgpt.com/backend-api/wham/usage \
-        -H "Authorization: Bearer $tok" -H "chatgpt-account-id: $acct" 2>/dev/null)
-  [ -z "$js" ] && return 1
-  echo "$js" | jq -e '(.rate_limit.allowed==false) or (.rate_limit.limit_reached==true) or ((.rate_limit.primary_window.used_percent // 0)>=90)' >/dev/null 2>&1
-}
-
 already_done(){ grep -qF "$(printf '%s\t%s\t%s' "$1" "$2" "$3")" "$STATE"; }
 mark_done(){ printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$STATE"; }
-
-# Per-cycle memo around usage_saturated, checked lazily just before the FIRST review of a
-# cycle — the old top-of-loop check hit chatgpt.com/backend-api every POLL even when there
-# was nothing to review (~480 needless account hits/day). Returns 0 = saturated.
-SATURATED=""
-usage_gate(){
-  if [ -z "$SATURATED" ]; then
-    if usage_saturated; then SATURATED=1; else SATURATED=0; fi
-  fi
-  [ "$SATURATED" = 1 ]
-}
 
 # Count a failed attempt for repo#pr@sha (ANY failure class: clone, worktree, claude run) and
 # give up permanently after MAX_FAILS — previously only claude-run failures were counted, so a
@@ -291,9 +259,8 @@ while true; do
   if [ -f "$PAUSE" ]; then log "PAUSE present — idling"; sleep "$POLL"; continue; fi
   if ! runtime_gate; then sleep "$POLL"; continue; fi
   if ! session_up; then log "browser session down — idling"; sleep "$POLL"; continue; fi
-  if doghouse_tripped; then log "codex doghouse tripped — idling"; sleep "$POLL"; continue; fi
 
-  found=0; SATURATED=""
+  found=0
   for owner in $OWNERS; do
     if [ "$ALL_PRS" = "1" ]; then
       # Review EVERY open non-draft PR in the owner, except ones opted out via $SKIP_LABEL.
@@ -313,12 +280,10 @@ while true; do
       sha=$(echo "$meta" | jq -r '.headRefOid // empty'); branch=$(echo "$meta" | jq -r '.headRefName // empty')
       [ -z "$sha" ] && continue
       already_done "$nwo" "$num" "$sha" && continue
-      if usage_gate; then log "account usage saturated (>=90% / limit) — skipping this cycle"; break; fi
       found=1
       process_pr "$nwo" "$num" "$sha" "$branch" "$url"
       [ -f "$PAUSE" ] && break
     done < <(echo "$prs" | jq -r '.[] | [.repository.nameWithOwner, (.number|tostring), .url] | @tsv')
-    [ "$SATURATED" = 1 ] && break
   done
   [ "$found" -eq 0 ] && log "no PRs pending"
   sleep "$POLL"
