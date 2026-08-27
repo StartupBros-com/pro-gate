@@ -110,6 +110,7 @@ pg_out_guard_acquire() {
 
 PR=""; REPO=""; DIFF_FILE=""; INPUT="both"; OUT=""; TIMEOUT="30m"; EXTRA_GLOB=""; HARVEST_MARKER=""; HARVEST_REQUESTED=0; CONFIRM_FILE=""
 STATUS_REQUESTED=0; STATUS_QUERY=""; AS_JSON=0; RECOVER_REQUESTED=0; RECOVER_QUERY=""
+REVIEW_DECISION_REQUESTED=0; REVIEW_DECISION_EFFECT_FILE=""
 while [ $# -gt 0 ]; do
   # gate #91 P2 (:65): every flag below except --status takes a REQUIRED second argument via raw
   # "$2"/"${2:-}" + "shift 2". With no errexit, a flag left trailing (no operand) hit one of two
@@ -121,7 +122,7 @@ while [ $# -gt 0 ]; do
   # symptoms with a clean usage error. --status is excluded: its second argument is deliberately
   # optional (its own branch below already handles "missing").
   case "$1" in
-    --pr|--repo|--diff|--input|--out|--timeout|--extra-files|--confirm|--harvest|--recover)
+    --pr|--repo|--diff|--input|--out|--timeout|--extra-files|--confirm|--harvest|--recover|--review-decision-effect)
       [ $# -ge 2 ] || { echo "ERROR: $1 requires a value" >&2; exit 2; };;
   esac
   case "$1" in
@@ -135,6 +136,8 @@ while [ $# -gt 0 ]; do
     --confirm) CONFIRM_FILE="$2"; shift 2;;
     --harvest) HARVEST_REQUESTED=1; HARVEST_MARKER="${2:-}"; shift 2;;
     --recover) RECOVER_REQUESTED=1; RECOVER_QUERY="${2:-}"; shift 2;;
+    --review-decision) REVIEW_DECISION_REQUESTED=1; shift;;
+    --review-decision-effect) REVIEW_DECISION_REQUESTED=1; REVIEW_DECISION_EFFECT_FILE="$2"; shift 2;;
     # --status takes an OPTIONAL query (a following --flag or nothing means "all state").
     --status) STATUS_REQUESTED=1
       case "${2:-}" in ''|--*) shift 1;; *) STATUS_QUERY="$2"; shift 2;; esac;;
@@ -142,8 +145,8 @@ while [ $# -gt 0 ]; do
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
-if [ "$AS_JSON" = 1 ] && [ "$STATUS_REQUESTED" != 1 ]; then
-  echo "ERROR: --json is only meaningful with --status" >&2
+if [ "$AS_JSON" = 1 ] && [ "$STATUS_REQUESTED" != 1 ] && [ "$REVIEW_DECISION_REQUESTED" != 1 ]; then
+  echo "ERROR: --json is only meaningful with --status or --review-decision" >&2
   exit 2
 fi
 if [ "$HARVEST_REQUESTED" = 1 ] && [ -z "$HARVEST_MARKER" ]; then
@@ -153,6 +156,152 @@ fi
 if [ -n "$CONFIRM_FILE" ] && [ ! -s "$CONFIRM_FILE" ]; then
   echo "ERROR: --confirm file not found or empty: $CONFIRM_FILE" >&2
   exit 2
+fi
+
+# review-decision/v1 resolution is deliberately an early, read-only path. It must never borrow
+# the regular engine's housekeeping, browser preflight, locks, reconciliation, status sidecars,
+# slots, round recording, or binding/publication writes: the answer is advisory until an effect
+# boundary assembles the same facts again. The U1 reducer remains the sole policy authority.
+pg_review_decision_cli() {
+  local repo pr_num remote ident host owner repo_name head base raw_digest round_key
+  local input_proven=false input_binding_valid=false input_identity evidence_identity evidence_state
+  local input_marker="" input_record="" input_digest="" f marker candidate mode active_marker="" active_state=none
+  local reservation_marker="" reservation_state=none governor_granted=false completed='[]' result artifact artifact_digest
+  local facts decision effect_ok=false
+
+  pg_have jq || { echo 'ERROR: review-decision/v1 requires jq' >&2; return 2; }
+  repo="${REPO:-$(pwd)}"
+  [ -d "$repo/.git" ] || { echo 'ERROR: review-decision requires a local git repository' >&2; return 2; }
+  case "$PR" in
+    http*://*/pull/*) pr_num="${PR%/}"; pr_num="${pr_num##*/}" ;;
+    *) pr_num="$PR" ;;
+  esac
+  case "$pr_num" in ''|*[!0-9]*) echo 'ERROR: review-decision requires a numeric or canonical PR target' >&2; return 2;; esac
+  remote="$(git -C "$repo" remote get-url origin 2>/dev/null || true)"
+  ident="$(pg_repo_identity_from_url "$remote" 2>/dev/null || true)"
+  [ -n "$ident" ] || { echo 'ERROR: review-decision requires canonical origin repository proof' >&2; return 2; }
+  IFS=$'\t' read -r host owner repo_name <<< "$ident"
+  head="$(git -C "$repo" rev-parse HEAD 2>/dev/null || true)"
+  case "$head" in *[!0-9a-f]*|'') echo 'ERROR: review-decision cannot prove the current head' >&2; return 2;; esac
+  base="$(git -C "$repo" merge-base HEAD '@{upstream}' 2>/dev/null || git -C "$repo" rev-parse HEAD^ 2>/dev/null || true)"
+  case "$base" in *[!0-9a-f]*|'') base="";; esac
+  if [ -n "$DIFF_FILE" ]; then
+    [ -f "$DIFF_FILE" ] && [ ! -L "$DIFF_FILE" ] || { echo 'ERROR: review-decision diff must be a regular file' >&2; return 2; }
+    raw_digest="$(pg_sha256 "$DIFF_FILE")"
+  else
+    raw_digest=""
+  fi
+  round_key="$(printf '%s-%s-%s' "$owner" "$repo_name" "$pr_num" | tr -c 'A-Za-z0-9.\n-' '-')"
+  input_identity="${host}:${owner}/${repo_name}:${pr_num}:${head}"
+  evidence_identity='evidence:none'; evidence_state=missing
+
+  # Only a validated immutable input binding can make evidence applicable. A caller-supplied
+  # diff is intentionally bare: it can support bounded review/recovery, never full-PR or merge
+  # claims, because it lacks an independently fetched unfiltered endpoint digest.
+  for f in "$(pg_review_input_binding_dir)"/pg-run-*; do
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    marker="${f##*/}"
+    candidate="$(pg_review_input_binding_read "$marker" 2>/dev/null || true)"
+    [ -n "$candidate" ] || continue
+    jq -e --arg h "$host" --arg o "$owner" --arg r "$repo_name" --argjson p "$pr_num" --arg head "$head" \
+      '.repository.host==$h and .repository.owner==$o and .repository.repo==$r and .target.pr==$p and .target.head_oid==$head' \
+      <<<"$candidate" >/dev/null 2>&1 || continue
+    mode="$(jq -r .evidence.mode <<<"$candidate")"
+    case "$mode" in
+      connector)
+        [ "$INPUT" = connector ] || [ "$INPUT" = both ] || continue
+        jq -e --arg target "$host/$owner/$repo_name" --arg head "$head" \
+          '.evidence.proof.repository_target==$target and .evidence.proof.commit_target==$head' \
+          <<<"$candidate" >/dev/null 2>&1 || continue
+        input_proven=true ;;
+      full-pr)
+        # A local --diff is not endpoint proof. Full-PR applicability therefore remains false
+        # until an effect/query owner supplies independently acquired endpoint bytes.
+        continue ;;
+      scoped-delta)
+        # The binding validator establishes shape, but the CLI cannot promote an arbitrary
+        # attachment or confirmation into its recorded lineage without a dedicated lineage proof.
+        continue ;;
+      *) continue ;;
+    esac
+    input_marker="$marker"; input_record="$candidate"
+    input_digest="$(pg_review_sha256_text "$candidate")"
+    input_binding_valid=true; input_identity="$input_digest"
+    evidence_identity="$(jq -r .evidence.identity <<<"$candidate")"; evidence_state=matching
+    break
+  done
+
+  # Active index and reservation authority are read directly without reconciliation. Querying a
+  # stale record is conservative (recover), while reconciliation itself is an effect and forbidden.
+  if [ -f "$PRO_GATE_HOME/active/$round_key" ] && [ ! -L "$PRO_GATE_HOME/active/$round_key" ]; then
+    IFS=$'\t' read -r active_marker _ _ _ _ _ < "$PRO_GATE_HOME/active/$round_key" 2>/dev/null || true
+    if pg_reservation_marker_ok "$active_marker"; then active_state=live; else active_marker=""; fi
+  fi
+  reservation_marker="$(pg_reservation_find_pr "$round_key" 2>/dev/null || true)"
+  if pg_reservation_marker_ok "$reservation_marker"; then reservation_state=live; else reservation_marker=""; fi
+  if pg_round_guard "$round_key" >/dev/null 2>&1; then governor_granted=true; fi
+
+  # A result becomes applicable only through both immutable bindings and exact canonical bytes.
+  # Missing result bindings remain recoverable artifacts, but cannot expose terminal or merge state.
+  if [ -n "$input_marker" ]; then
+    for f in "$(pg_review_result_binding_dir)"/pg-run-*; do
+      [ -f "$f" ] && [ ! -L "$f" ] || continue
+      marker="${f##*/}"
+      result="$(pg_review_result_binding_read "$marker" 2>/dev/null || true)"
+      [ -n "$result" ] || continue
+      jq -e --arg ib "$input_digest" '.input_binding_digest==$ib' <<<"$result" >/dev/null 2>&1 || continue
+      artifact="$(pg_completed_dir)/$marker"
+      artifact_digest="$(pg_sha256 "$artifact")"
+      jq -e --arg digest "$artifact_digest" '.artifact.digest==$digest' <<<"$result" >/dev/null 2>&1 || continue
+      # A SHIP must freshly bind the exact current full-PR relation. Connector and bare-diff
+      # evidence may collect/recover but never become merge eligibility.
+      if [ "$(jq -r .verdict <<<"$result")" = SHIP ]; then
+        [ -n "$base" ] && [ -n "$raw_digest" ] || continue
+        jq -e --arg base "$base" --arg head "$head" --arg digest "$raw_digest" \
+          '.ship_proof.base_oid==$base and .ship_proof.head_oid==$head and .ship_proof.diff_digest==$digest' \
+          <<<"$result" >/dev/null 2>&1 || continue
+      fi
+      completed="$(jq -cS --arg marker "$marker" --arg canonical "$(pg_review_result_binding_digest "$marker")" \
+        --arg artifact "$artifact_digest" --argjson epoch "$(jq -r .accepted_epoch <<<"$result")" \
+        --arg verdict "$(jq -r .verdict <<<"$result")" \
+        '. + [{applicable:true,artifact_digest:$artifact,binding_valid:true,canonical_identity:$canonical,charged_spend_epoch:$epoch,collected:true,legacy:false,marker:$marker,provenance_valid:true,verdict:$verdict}]' <<<"$completed")"
+    done
+  fi
+
+  facts="$(jq -cnS --arg h "$host" --arg o "$owner" --arg r "$repo_name" --arg head "$head" --argjson pr "$pr_num" \
+    --arg identity "$input_identity" --arg evidence "$evidence_identity" --arg state "$evidence_state" \
+    --arg marker "$active_marker" --arg astate "$active_state" --arg reservation "$reservation_marker" --arg rstate "$reservation_state" \
+    --argjson input_proven "$input_proven" --argjson input_binding "$input_binding_valid" --argjson granted "$governor_granted" \
+    --argjson completed "$completed" --arg cd "$(pg_review_decision_contract_digest)" --arg xd "$(pg_review_decision_corpus_digest)" '
+    {active_index:{binding_valid:$input_binding,charged_spend_epoch:0,marker:$marker,state:$astate},completed_results:$completed,
+     contract:{contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,corpus_digest:$xd},
+     evidence:{identity:$evidence,safe_to_prepare:true,state:$state},governor:{granted:$granted},
+     input:{binding_valid:$input_binding,identity:$identity,proven:$input_proven},named_choice:{outcomes:[],selected_id:null,snapshot_digest:""},
+     observation:{kind:"idle"},prior_review:{applicable:false,binding_valid:false,code_identity:"",evidence_identity:"",legacy:false,marker:"",provenance_valid:false,verdict:"NONE"},
+     reservation:{binding_valid:false,legacy:false,marker:$reservation,state:$rstate},target:{head_oid:$head,host:$h,owner:$o,pr:$pr,repo:$r},transport:"review-decision/v1"}')" || return 2
+  decision="$(pg_review_decision_reduce "$facts")" || { echo 'ERROR: review-decision reduction failed' >&2; return 2; }
+
+  # An effect request is an immutable comparison target, never an authorization token. Re-reading
+  # it is bounded and control-safe; a mismatch simply returns this freshly reduced replacement.
+  if [ -n "$REVIEW_DECISION_EFFECT_FILE" ]; then
+    [ -f "$REVIEW_DECISION_EFFECT_FILE" ] && [ ! -L "$REVIEW_DECISION_EFFECT_FILE" ] \
+      && [ "$(wc -c < "$REVIEW_DECISION_EFFECT_FILE" 2>/dev/null | tr -d ' ')" -le 65536 ] \
+      && jq -e --argjson fresh "$decision" '
+        .contract == $fresh.contract and .effect_request.action == .action and
+        .effect_request.snapshot_digest == $fresh.effect_request.snapshot_digest and
+        .effect_request.target == $fresh.effect_request.target' "$REVIEW_DECISION_EFFECT_FILE" >/dev/null 2>&1 \
+      && effect_ok=true
+  fi
+  printf '%s\n' "$decision"
+}
+
+if [ "$REVIEW_DECISION_REQUESTED" = 1 ]; then
+  if [ "$HARVEST_REQUESTED" = 1 ] || [ "$RECOVER_REQUESTED" = 1 ] || [ "$STATUS_REQUESTED" = 1 ] || [ -n "$OUT$EXTRA_GLOB" ]; then
+    echo 'ERROR: review-decision accepts only --pr, --repo, --diff, --input, --confirm, and --review-decision-effect' >&2
+    exit 2
+  fi
+  pg_review_decision_cli
+  exit $?
 fi
 
 # --- v0.35: --recover — resolve exactly one already-spent marker, never dispatch ---
