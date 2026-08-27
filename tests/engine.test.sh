@@ -4306,4 +4306,33 @@ check 'stale run-granted advisory re-reduces a moved head without charge or Orac
   "$([ ! -s "$TDIR/fresh-oracle.calls" ] && [ ! -d "$FRESH_HOME/active" ] && [ ! -d "$FRESH_HOME/run-meta" ]; echo $?)" \
   "rc=$FRESH_RC stdout=$(cat "$TDIR/fresh.stdout") stderr=$(cat "$TDIR/fresh.stderr")"
 
+# U3 extends the reducer table with precedence cases that U1's original epoch-different
+# selection case did not cover. These remain pure snapshots: race/restart fixture setup belongs
+# to U2's guarded-effect tests above.
+echo '# U3: review-decision precedence and recovery-state conformance'
+SAME_EPOCH_ORDER_PATCH='{"completed_results":[{"applicable":true,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binding_valid":true,"canonical_identity":"canonical-a","charged_spend_epoch":1700000900,"collected":false,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000900-1","provenance_valid":true,"verdict":"SHIP"},{"applicable":true,"artifact_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","binding_valid":true,"canonical_identity":"canonical-z","charged_spend_epoch":1700000900,"collected":false,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000900-2","provenance_valid":true,"verdict":"FIX-FIRST"}]}'
+SAME_EPOCH_ORDER_OUT="$(rd_reduce "$(rd_facts "$SAME_EPOCH_ORDER_PATCH")")"
+check 'same charged epoch deterministically selects canonical identity before collection' \
+  "$(jq -e '.action == "collect-existing-result" and .effect_request.applicable_ref == "canonical-z"' <<<"$SAME_EPOCH_ORDER_OUT" >/dev/null 2>&1; echo $?)" "$SAME_EPOCH_ORDER_OUT"
+
+COMPLETED_BEATS_ACTIVE_PATCH='{"active_index":{"binding_valid":true,"charged_spend_epoch":1700000902,"marker":"pg-run-acme-widgets-1983-1700000902-2","state":"charged"},"completed_results":[{"applicable":true,"artifact_digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","binding_valid":true,"canonical_identity":"completed-first","charged_spend_epoch":1700000901,"collected":false,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000901-1","provenance_valid":true,"verdict":"SHIP"}]}'
+COMPLETED_BEATS_ACTIVE_OUT="$(rd_reduce "$(rd_facts "$COMPLETED_BEATS_ACTIVE_PATCH")")"
+check 'uncollected current result wins over newer active work without a fresh review' \
+  "$(jq -e '.action == "collect-existing-result" and .effect_request.applicable_ref == "completed-first"' <<<"$COMPLETED_BEATS_ACTIVE_OUT" >/dev/null 2>&1; echo $?)" "$COMPLETED_BEATS_ACTIVE_OUT"
+
+for reservation_state in live recoverable unknown-fate; do
+  reservation_patch="$(jq -cn --arg state "$reservation_state" '{reservation:{binding_valid:true,legacy:false,marker:"pg-run-acme-widgets-1983-1700000903-3",state:$state}}')"
+  reservation_out="$(rd_reduce "$(rd_facts "$reservation_patch")")"
+  check "reservation state is recovery-only: $reservation_state" \
+    "$(jq -e '.action == "recover-existing-review" and .effect_request.applicable_ref == "pg-run-acme-widgets-1983-1700000903-3"' <<<"$reservation_out" >/dev/null 2>&1; echo $?)" "$reservation_out"
+done
+
+# A stale/expired reservation must not be upgraded to a caller-selected continuation. The CLI's
+# current read-only lookup drops it, therefore an absent binding still fails closed rather than
+# launching or granting merge eligibility.
+EXPIRED_RESERVATION_FACTS="$(rd_facts '{"reservation":{"binding_valid":false,"legacy":false,"marker":"","state":"none"},"input":{"binding_valid":false,"identity":"","proven":false}}')"
+EXPIRED_RESERVATION_OUT="$(rd_reduce "$EXPIRED_RESERVATION_FACTS")"
+check 'expired reservation with no current binding stops rather than creating new spend' \
+  "$(jq -e '.action == "stop-without-new-review" and .reason == "unproven-input"' <<<"$EXPIRED_RESERVATION_OUT" >/dev/null 2>&1; echo $?)" "$EXPIRED_RESERVATION_OUT"
+
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }
