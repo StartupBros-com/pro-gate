@@ -4164,4 +4164,146 @@ check 'result-binding repair is idempotent and does not mutate canonical bytes' 
   "$([ "$REPAIR_REPLAY_RC" -eq 0 ] && [ "$(PRO_GATE_HOME="$DECISION_HOME" pg_review_result_binding_digest "$FULL_MARKER")" = "$REPAIR_BINDING_DIGEST" ] && cmp -s "$DECISION_HOME/completed/$FULL_MARKER" "$DECISION_HOME/completed/$FULL_MARKER"; echo $?)" \
   "rc=$REPAIR_REPLAY_RC binding=$(PRO_GATE_HOME="$DECISION_HOME" pg_review_result_binding_read "$FULL_MARKER" 2>/dev/null)"
 
+# U2 fresh-dispatch effects are re-reduced at every existing handoff boundary. This fixture
+# deliberately uses an already-proven full-PR binding as the advisory input; the effect must
+# create a NEW marker binding only after its final pre-charge reduction succeeds.
+echo '# U2: fresh dispatch charge-to-input-binding guards'
+FRESH_HOME="$TDIR/home-fresh-dispatch"
+FRESH_REPO="$TDIR/fresh-dispatch-repo"
+mkdir -p "$FRESH_REPO"
+git -C "$FRESH_REPO" init -q
+git -C "$FRESH_REPO" config user.email test@example.invalid
+git -C "$FRESH_REPO" config user.name 'Engine Test'
+printf 'base\n' > "$FRESH_REPO/fresh.txt"
+git -C "$FRESH_REPO" add fresh.txt && git -C "$FRESH_REPO" commit -qm fresh-base
+FRESH_BASE="$(git -C "$FRESH_REPO" rev-parse HEAD)"
+printf 'head\n' > "$FRESH_REPO/fresh.txt"
+git -C "$FRESH_REPO" add fresh.txt && git -C "$FRESH_REPO" commit -qm fresh-head
+FRESH_HEAD="$(git -C "$FRESH_REPO" rev-parse HEAD)"
+git -C "$FRESH_REPO" remote add origin https://github.com/acme/fresh.git
+git -C "$FRESH_REPO" diff "$FRESH_BASE" "$FRESH_HEAD" > "$TDIR/fresh-effect.patch"
+FRESH_DIGEST="$(sha256sum "$TDIR/fresh-effect.patch" | awk '{print $1}')"
+FRESH_KEY='acme-fresh.git-77'
+FRESH_TEMPLATE='pg-run-acme-fresh-77-1700014000-1'
+FRESH_BINDING="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg base "$FRESH_BASE" --arg head "$FRESH_HEAD" --arg digest "$FRESH_DIGEST" --arg marker "$FRESH_TEMPLATE" '{charged_spend_epoch:1700014000,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("full-pr:"+$base+":"+$head),mode:"full-pr",proof:{base_oid:$base,endpoint_digest:$digest,head_oid:$head,raw_patch_digest:$digest}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:"github.com",owner:"acme",repo:"fresh"},target:{head_oid:$head,kind:"pull-request",pr:77}}')"
+mkdir -p "$TDIR/fresh-bin"
+cat > "$TDIR/fresh-bin/oracle" <<'FRESH_ORACLE'
+#!/usr/bin/env bash
+printf 'submitted\n' >> "${PG_TEST_FRESH_ORACLE:?}"
+out=""
+while [ $# -gt 0 ]; do
+  case "$1" in --write-output) out="$2"; shift 2;; *) shift;; esac
+done
+printf 'P0: none\nP1: none\nP2: none\nP3: none\nVERDICT: SHIP - fixture.\n' > "$out"
+FRESH_ORACLE
+chmod +x "$TDIR/fresh-bin/oracle"
+fresh_seed_binding() {
+  rm -rf "$FRESH_HOME"
+  PRO_GATE_HOME="$FRESH_HOME" pg_review_input_binding_write "$FRESH_TEMPLATE" "$FRESH_BINDING"
+}
+fresh_query() {
+  env PRO_GATE_HOME="$FRESH_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/fresh-effect.patch" \
+    bash "$ENGINE" --review-decision --repo "$FRESH_REPO" --pr 77 --diff "$TDIR/fresh-effect.patch" --input bundle
+}
+fresh_effect() {
+  env PATH="$TDIR/fresh-bin:$PATH" PRO_GATE_HOME="$FRESH_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/fresh-effect.patch" \
+    ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_ORACLE_BIN="$TDIR/fresh-bin/oracle" \
+    PG_TEST_FRESH_ORACLE="$TDIR/fresh-oracle.calls" PRO_GATE_EARLY_PROBE_SECS=0 \
+    bash "$ENGINE" --review-decision --review-decision-effect "$1" --repo "$FRESH_REPO" --pr 77 --diff "$TDIR/fresh-effect.patch" --input bundle --out "$2" --timeout 5s \
+    >"$TDIR/fresh.stdout" 2>"$TDIR/fresh.stderr"
+  FRESH_RC=$?
+}
+fresh_seed_binding
+FRESH_ADVISORY="$(fresh_query)"
+check 'fresh-dispatch fixture first resolves to advisory run-granted-review' \
+  "$(jq -e '.action == "run-granted-review"' <<<"$FRESH_ADVISORY" >/dev/null 2>&1; echo $?)" "$FRESH_ADVISORY"
+printf '%s\n' "$FRESH_ADVISORY" > "$TDIR/fresh-advisory.json"
+: > "$TDIR/fresh-oracle.calls"
+start_mock "$TDIR/tab.txt" "$ORGANIZER_STATE"
+fresh_effect "$TDIR/fresh-advisory.json" "$TDIR/fresh-success.md"
+FRESH_NEW_MARKER="$(find "$FRESH_HOME/review-input-bindings" -type f -name 'pg-run-*' ! -name "$FRESH_TEMPLATE" -printf '%f\n' | head -1)"
+FRESH_NEW_BINDING="$(PRO_GATE_HOME="$FRESH_HOME" pg_review_input_binding_read "$FRESH_NEW_MARKER" 2>/dev/null || true)"
+check 'matching fresh effect charges only after marker-bound input binding persists before Oracle submission' \
+  "$([ "$FRESH_RC" -eq 0 ] && [ -s "$TDIR/fresh-oracle.calls" ] && jq -e --arg m "$FRESH_NEW_MARKER" '.marker==$m and .charged_spend_epoch > 0' <<<"$FRESH_NEW_BINDING" >/dev/null 2>&1; echo $?)" \
+  "rc=$FRESH_RC marker=$FRESH_NEW_MARKER binding=$FRESH_NEW_BINDING stderr=$(cat "$TDIR/fresh.stderr")"
+check 'successful fresh charge records the exact binding epoch before submission' \
+  "$(jq -e --argjson epoch "$(awk -F'\t' 'NR==1{print $7}' "$FRESH_HOME/run-meta/$FRESH_NEW_MARKER" 2>/dev/null || echo 0)" '.charged_spend_epoch == $epoch' <<<"$FRESH_NEW_BINDING" >/dev/null 2>&1; echo $?)" \
+  "meta=$(cat "$FRESH_HOME/run-meta/$FRESH_NEW_MARKER" 2>/dev/null) binding=$FRESH_NEW_BINDING"
+
+# Each durable predecessor supersedes the saved advisory request before pre-lock dispatch; none
+# may reach the browser. The unknown-fate fixture intentionally has run-meta only.
+for fresh_kind in completed active reserved unknown-fate; do
+  fresh_seed_binding
+  FRESH_ADVISORY="$(fresh_query)"; printf '%s\n' "$FRESH_ADVISORY" > "$TDIR/fresh-advisory.json"
+  : > "$TDIR/fresh-oracle.calls"
+  case "$fresh_kind" in
+    completed)
+      mkdir -p "$FRESH_HOME/completed"
+      printf 'P0: none\nP1: none\nP2: none\nP3: none\nVERDICT: SHIP - existing.\n' > "$FRESH_HOME/completed/$FRESH_TEMPLATE" ;;
+    active)
+      mkdir -p "$FRESH_HOME/active"
+      printf 'pg-run-acme-fresh-77-1700014001-2\t%s\t%s\t%s\tremote-chrome\ttoken\tcharged\t1700014001\n' "$TDIR/x" "$$" "$(date +%s)" > "$FRESH_HOME/active/$FRESH_KEY" ;;
+    reserved)
+      mkdir -p "$FRESH_HOME/in-progress"
+      printf '%s\t%s\t%s\t0\t\n' "$FRESH_KEY" "$TDIR/x" "$(date +%s)" > "$FRESH_HOME/in-progress/pg-run-acme-fresh-77-1700014002-3" ;;
+    unknown-fate)
+      mkdir -p "$FRESH_HOME/run-meta"
+      printf 'github.com\tacme\tfresh\t%s\t77\t%s\t1700014003\n' "$FRESH_KEY" "$TDIR/x" > "$FRESH_HOME/run-meta/pg-run-acme-fresh.git-77-1700014003-4" ;;
+  esac
+  fresh_effect "$TDIR/fresh-advisory.json" "$TDIR/fresh-$fresh_kind.md"
+  check "fresh pre-lock guard supersedes advisory for $fresh_kind without Oracle dispatch" \
+    "$([ ! -s "$TDIR/fresh-oracle.calls" ]; echo $?)" \
+    "rc=$FRESH_RC stdout=$(cat "$TDIR/fresh.stdout") stderr=$(cat "$TDIR/fresh.stderr")"
+done
+
+# Effect-time proof/governor movement returns a replacement before it reaches the engine's
+# charge protocol. These are deliberately changes AFTER the advisory JSON was saved.
+for fresh_change in evidence governor; do
+  fresh_seed_binding
+  FRESH_ADVISORY="$(fresh_query)"; printf '%s\n' "$FRESH_ADVISORY" > "$TDIR/fresh-advisory.json"
+  : > "$TDIR/fresh-oracle.calls"
+  case "$fresh_change" in
+    head)
+      printf 'moved\n' > "$FRESH_REPO/fresh.txt"
+      git -C "$FRESH_REPO" add fresh.txt && git -C "$FRESH_REPO" commit -qm fresh-moved ;;
+    evidence) printf 'changed endpoint\n' >> "$TDIR/fresh-effect.patch" ;;
+    governor)
+      mkdir -p "$FRESH_HOME/rounds"
+      for _ in $(seq 1 3); do date +%s; done > "$FRESH_HOME/rounds/$FRESH_KEY" ;;
+  esac
+  fresh_effect "$TDIR/fresh-advisory.json" "$TDIR/fresh-$fresh_change.md"
+  check "stale run-granted advisory re-reduces after $fresh_change without charge or Oracle" \
+    "$([ ! -s "$TDIR/fresh-oracle.calls" ] && [ ! -d "$FRESH_HOME/active" ] && [ ! -d "$FRESH_HOME/run-meta" ]; echo $?)" \
+    "rc=$FRESH_RC stdout=$(cat "$TDIR/fresh.stdout") stderr=$(cat "$TDIR/fresh.stderr")"
+  [ "$fresh_change" != evidence ] || git -C "$FRESH_REPO" diff "$FRESH_BASE" "$FRESH_HEAD" > "$TDIR/fresh-effect.patch"
+done
+
+# Persistence failures are pre-submission failures: the marker remains active/recoverable, but
+# the fake browser is never called. Each fixture fails a different charge-to-binding step.
+for fresh_failure in round run-meta binding; do
+  fresh_seed_binding
+  FRESH_ADVISORY="$(fresh_query)"; printf '%s\n' "$FRESH_ADVISORY" > "$TDIR/fresh-advisory.json"
+  : > "$TDIR/fresh-oracle.calls"
+  case "$fresh_failure" in
+    round) printf 'not-a-rounds-directory\n' > "$FRESH_HOME/rounds" ;;
+    run-meta) printf 'not-a-meta-directory\n' > "$FRESH_HOME/run-meta" ;;
+    binding) chmod 500 "$FRESH_HOME/review-input-bindings" ;;
+  esac
+  fresh_effect "$TDIR/fresh-advisory.json" "$TDIR/fresh-$fresh_failure.md"
+  check "failed $fresh_failure persistence preserves charged recovery state before Oracle" \
+    "$([ "$FRESH_RC" -ne 0 ] && [ ! -s "$TDIR/fresh-oracle.calls" ]; echo $?)" \
+    "rc=$FRESH_RC active=$(find "$FRESH_HOME/active" -type f -printf '%f=' -exec cat {} \; 2>/dev/null) stderr=$(cat "$TDIR/fresh.stderr")"
+  [ "$fresh_failure" != binding ] || chmod 700 "$FRESH_HOME/review-input-bindings"
+done
+
+fresh_seed_binding
+FRESH_ADVISORY="$(fresh_query)"; printf '%s\n' "$FRESH_ADVISORY" > "$TDIR/fresh-advisory.json"
+printf 'moved\n' > "$FRESH_REPO/fresh.txt"
+git -C "$FRESH_REPO" add fresh.txt && git -C "$FRESH_REPO" commit -qm fresh-moved
+: > "$TDIR/fresh-oracle.calls"
+fresh_effect "$TDIR/fresh-advisory.json" "$TDIR/fresh-head.md"
+check 'stale run-granted advisory re-reduces a moved head without charge or Oracle' \
+  "$([ ! -s "$TDIR/fresh-oracle.calls" ] && [ ! -d "$FRESH_HOME/active" ] && [ ! -d "$FRESH_HOME/run-meta" ]; echo $?)" \
+  "rc=$FRESH_RC stdout=$(cat "$TDIR/fresh.stdout") stderr=$(cat "$TDIR/fresh.stderr")"
+
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }

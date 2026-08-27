@@ -364,18 +364,32 @@ pg_review_decision_cli() {
       if [ "$effect_marker" = "$input_marker" ]; then
         pg_review_decision_repair_result_binding "$effect_marker" "$input_record" || true
       fi
+    elif [ "$effect_ok" = true ] && [ "$(jq -r .action <<<"$decision")" = run-granted-review ]; then
+      # The advisory request matched a freshly reduced grant. It still carries no authority:
+      # the normal engine re-reduces at its pre-lock, under-lock, and pre-charge boundaries.
+      # Retain only the validated immutable input relation to clone onto this attempt's marker.
+      REVIEW_DECISION_EXECUTE=1
+      REVIEW_DECISION_INPUT_TEMPLATE="$input_record"
+      REVIEW_DECISION_INPUT_TEMPLATE_MARKER="$input_marker"
+      REVIEW_DECISION_INPUT_TEMPLATE_DIGEST="$input_digest"
+      return 0
     fi
   fi
   printf '%s\n' "$decision"
 }
 
 if [ "$REVIEW_DECISION_REQUESTED" = 1 ]; then
-  if [ "$HARVEST_REQUESTED" = 1 ] || [ "$RECOVER_REQUESTED" = 1 ] || [ "$STATUS_REQUESTED" = 1 ] || [ -n "$OUT$EXTRA_GLOB" ]; then
-    echo 'ERROR: review-decision accepts only --pr, --repo, --diff, --input, --confirm, and --review-decision-effect' >&2
+  if [ "$HARVEST_REQUESTED" = 1 ] || [ "$RECOVER_REQUESTED" = 1 ] || [ "$STATUS_REQUESTED" = 1 ] || { [ -n "$REVIEW_DECISION_EFFECT_FILE" ] && [ -n "$EXTRA_GLOB" ]; } || { [ -z "$REVIEW_DECISION_EFFECT_FILE" ] && [ -n "$OUT$EXTRA_GLOB" ]; }; then
+    echo 'ERROR: review-decision accepts only --pr, --repo, --diff, --input, --confirm, --out for run effects, and --review-decision-effect' >&2
     exit 2
   fi
+  REVIEW_DECISION_EXECUTE=0
   pg_review_decision_cli
-  exit $?
+  REVIEW_DECISION_RC=$?
+  if [ "$REVIEW_DECISION_RC" -ne 0 ] || [ "$REVIEW_DECISION_EXECUTE" != 1 ]; then exit "$REVIEW_DECISION_RC"; fi
+  # A matching run-granted effect now enters the existing fresh-dispatch path. Plain queries and
+  # every other effect retain their strictly read-only/repair-only behavior above.
+  REVIEW_DECISION_REQUESTED=0
 fi
 
 # --- v0.35: --recover — resolve exactly one already-spent marker, never dispatch ---
@@ -1290,15 +1304,19 @@ MODEL_WARN=""     # U5: advisory downgrade marker (weak/unconfirmable model); ne
 # per-change flock, so the lock probe alone cannot see that case).
 pg_active_dir() { echo "$PRO_GATE_HOME/active"; }
 PG_ACTIVE_WRITTEN=0
-pg_active_write() {
-  [ -n "${ROUND_KEY:-}" ] || return 0
-  mkdir -p "$(pg_active_dir)" 2>/dev/null || return 0
-  # 5th field: browser mode — recovery differs (native has no marker-addressable harvest, so a
-  # dead native wrapper must NOT be routed into a --harvest loop that always exits 3).
-  # 6th field: process-identity token — pid reuse must not resurrect a dead run (gate #61 r2).
-  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "${RUN_MARKER:-}" "$OUT" "$$" "$(date +%s)" "$MODE" \
-    "$(pg_pid_token "$$" 2>/dev/null || true)" \
-    > "$(pg_active_dir)/$ROUND_KEY" 2>/dev/null && PG_ACTIVE_WRITTEN=1
+pg_active_write() { # [state] [charged epoch]
+  local state="${1:-live}" charged_epoch="${2:-0}"
+  [ -n "${ROUND_KEY:-}" ] || return 1
+  case "$state" in pre-charge|round-recorded|charged|run-meta-written|input-bound|submitted|unknown-fate|live) ;; *) return 1;; esac
+  case "$charged_epoch" in ''|*[!0-9]*) return 1;; esac
+  mkdir -p "$(pg_active_dir)" 2>/dev/null || return 1
+  # Fields 1-6 are the stable active-index layout consumed by status/recovery. The optional
+  # state+epoch suffix is additive: U2's charge protocol makes crash phases inspectable without
+  # changing run-meta or reservation layouts.
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${RUN_MARKER:-}" "$OUT" "$$" "$(date +%s)" "$MODE" \
+    "$(pg_pid_token "$$" 2>/dev/null || true)" "$state" "$charged_epoch" \
+    > "$(pg_active_dir)/$ROUND_KEY" 2>/dev/null || return 1
+  PG_ACTIVE_WRITTEN=1
   return 0
 }
 pg_active_clear() {  # $1 = exit code
@@ -1335,6 +1353,118 @@ pg_install_full_pr_input_binding() { # marker; only endpoint-fetched full PRs ga
     --argjson epoch "$RUN_SPEND_EPOCH" \
     '{charged_spend_epoch:$epoch,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("full-pr:"+$base+":"+$head),mode:"full-pr",proof:{base_oid:$base,endpoint_digest:$endpoint,head_oid:$head,raw_patch_digest:$raw}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:$host,owner:$owner,repo:$repo},target:{head_oid:$head,kind:"pull-request",pr:$pr}}')" || return 1
   pg_review_input_binding_write "$marker" "$binding"
+}
+
+# A run-granted effect is advisory until this shared snapshot has been rebuilt at the existing
+# dispatch boundaries. It deliberately uses the U1 reducer and existing active/reservation/round
+# authorities; it neither creates an action token nor a second ledger or lock.
+pg_fresh_dispatch_recheck() { # sets PG_FRESH_DECISION/PG_FRESH_ACTION
+  local template="$REVIEW_DECISION_INPUT_TEMPLATE" marker="" state=none epoch=0 f rec m astate="" completed='[]'
+  local input_ok=false input_digest evidence identity head base endpoint raw mode active_marker="" reservation="" granted=false facts
+  [ -n "$template" ] || return 1
+  input_digest="$(pg_review_sha256_text "$template" 2>/dev/null || true)"
+  mode="$(jq -r '.evidence.mode // ""' <<<"$template" 2>/dev/null || true)"
+  head="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || true)"
+  base="$(git -C "$REPO" merge-base HEAD '@{upstream}' 2>/dev/null || git -C "$REPO" rev-parse HEAD^ 2>/dev/null || true)"
+  raw="$(pg_sha256 "$DIFF_FILE" 2>/dev/null || true)"
+  jq -e --arg h "$PG_META_HOST" --arg o "$PG_META_OWNER" --arg r "$PG_META_REPO" --argjson p "$PR_NUM" --arg head "$head" \
+    '.repository.host==$h and .repository.owner==$o and .repository.repo==$r and .target.pr==$p and .target.head_oid==$head' \
+    <<<"$template" >/dev/null 2>&1 || mode=""
+  case "$mode" in
+    full-pr)
+      endpoint="${PRO_GATE_REVIEW_ENDPOINT_PATCH:-}"
+      [ -f "$endpoint" ] && [ ! -L "$endpoint" ] || endpoint=""
+      endpoint="${endpoint:+$(pg_sha256 "$endpoint" 2>/dev/null || true)}"
+      jq -e --arg base "$base" --arg head "$head" --arg raw "$raw" --arg endpoint "$endpoint" \
+        '.evidence.proof.base_oid==$base and .evidence.proof.head_oid==$head and .evidence.proof.raw_patch_digest==$raw and .evidence.proof.endpoint_digest==$endpoint' \
+        <<<"$template" >/dev/null 2>&1 && input_ok=true ;;
+    connector)
+      jq -e --arg target "$PG_META_HOST/$PG_META_OWNER/$PG_META_REPO" --arg head "$head" \
+        '.evidence.proof.repository_target==$target and .evidence.proof.commit_target==$head' \
+        <<<"$template" >/dev/null 2>&1 && input_ok=true ;;
+    scoped-delta)
+      # The resolver has already checked the bounded manifest/confirmation lineage. Rechecking
+      # its target and exact raw evidence at charge keeps a moved head or payload from spending.
+      jq -e --arg base "$base" --arg head "$head" --arg raw "$raw" \
+        '.evidence.proof.base_oid==$base and .evidence.proof.end_oid==$head and .evidence.proof.raw_digest==$raw and .evidence.proof.reviewed_payload_digest==$raw' \
+        <<<"$template" >/dev/null 2>&1 && input_ok=true ;;
+  esac
+  identity="${input_digest:-input-unproven}"
+  evidence="$(jq -r '.evidence.identity // "evidence:none"' <<<"$template" 2>/dev/null || echo evidence:none)"
+
+  # Completed bytes are a collection authority even before result-binding work (the next slice).
+  # A marker-qualified artifact therefore supersedes a fresh dispatch rather than being ignored.
+  for f in "$(pg_completed_dir)"/pg-run-"$ROUND_KEY"-*; do
+    [ -f "$f" ] && [ ! -L "$f" ] && pg_is_review "$f" || continue
+    m="${f##*/}"
+    completed="$(jq -cS --arg marker "$m" --arg digest "$(pg_sha256 "$f")" \
+      '. + [{applicable:true,artifact_digest:$digest,binding_valid:false,canonical_identity:$marker,charged_spend_epoch:1,collected:false,legacy:true,marker:$marker,provenance_valid:false,verdict:"NONE"}]' <<<"$completed")"
+  done
+  if [ -f "$(pg_active_dir)/$ROUND_KEY" ] && [ ! -L "$(pg_active_dir)/$ROUND_KEY" ]; then
+    IFS=$'\t' read -r marker _ _ _ _ _ astate epoch < "$(pg_active_dir)/$ROUND_KEY" 2>/dev/null || true
+    if pg_reservation_marker_ok "$marker" && [ "$marker" != "${RUN_MARKER:-}" ]; then
+      case "$astate" in pre-charge|round-recorded|charged|run-meta-written|input-bound|submitted|unknown-fate|live) ;; *) astate=unknown-fate;; esac
+      active_marker="$marker"
+    fi
+  fi
+  reservation="$(pg_reservation_find_pr "$ROUND_KEY" 2>/dev/null || true)"
+  if ! pg_reservation_marker_ok "$reservation"; then reservation=""; fi
+  # A run-meta row with no active/reservation is a charged unknown-fate predecessor. The old
+  # sidecar layout remains authoritative and untouched; only its existing epoch is read.
+  if [ -z "$active_marker" ]; then
+    for f in "$(pg_run_meta_dir)"/pg-run-"$ROUND_KEY"-*; do
+      [ -f "$f" ] && [ ! -L "$f" ] || continue
+      m="${f##*/}"; rec="$(pg_run_meta_read "$m" 2>/dev/null || true)"
+      [ -n "$rec" ] || continue
+      active_marker="$m"; astate=unknown-fate; break
+    done
+  fi
+  pg_round_guard "$ROUND_KEY" >/dev/null 2>&1 && granted=true
+  facts="$(jq -cnS --arg h "$PG_META_HOST" --arg o "$PG_META_OWNER" --arg r "$PG_META_REPO" --arg head "$head" --argjson p "$PR_NUM" \
+    --arg identity "$identity" --arg evidence "$evidence" --arg marker "$active_marker" --arg astate "${astate:-none}" --arg reservation "$reservation" \
+    --argjson valid "$input_ok" --argjson granted "$granted" --argjson completed "$completed" --arg cd "$(pg_review_decision_contract_digest)" --arg xd "$(pg_review_decision_corpus_digest)" \
+    '{active_index:{binding_valid:$valid,charged_spend_epoch:0,marker:$marker,state:$astate},completed_results:$completed,contract:{contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,corpus_digest:$xd},evidence:{identity:$evidence,safe_to_prepare:true,state:(if $valid then "matching" else "missing" end)},governor:{granted:$granted},input:{binding_valid:$valid,identity:$identity,proven:$valid},named_choice:{outcomes:[],selected_id:null,snapshot_digest:""},observation:{kind:"idle"},prior_review:{applicable:false,binding_valid:false,code_identity:"",evidence_identity:"",legacy:false,marker:"",provenance_valid:false,verdict:"NONE"},reservation:{binding_valid:false,legacy:false,marker:$reservation,state:(if $reservation=="" then "none" else "live" end)},target:{head_oid:$head,host:$h,owner:$o,pr:$p,repo:$r},transport:"review-decision/v1"}')" || return 1
+  PG_FRESH_DECISION="$(pg_review_decision_reduce "$facts")" || return 1
+  PG_FRESH_ACTION="$(jq -r .action <<<"$PG_FRESH_DECISION")"
+  [ "$PG_FRESH_ACTION" = run-granted-review ]
+}
+pg_fresh_dispatch_require_run() { # boundary label; exits through existing status/finish path
+  local boundary="$1" reason
+  if pg_fresh_dispatch_recheck; then return 0; fi
+  reason="$(jq -r .reason <<<"${PG_FRESH_DECISION:-{}}" 2>/dev/null || echo recheck-failed)"
+  echo "[oracle-review] review-decision fresh dispatch superseded at ${boundary}: ${PG_FRESH_ACTION:-stop-without-new-review}/${reason}; no browser submission." >&2
+  # A replacement is data, not an authorization token. Emit it before the legacy status/exit so
+  # callers can re-enter through the ordinary collect/recover/stop path without inferring action.
+  [ -n "${PG_FRESH_DECISION:-}" ] && printf '%s\n' "$PG_FRESH_DECISION"
+  case "${PG_FRESH_ACTION:-}" in
+    collect-existing-result|recover-existing-review) pg_status in-progress "review-decision superseded at $boundary: $PG_FRESH_ACTION/$reason"; pg_finish 9 ;;
+    *) pg_status failed "review-decision superseded at $boundary: ${PG_FRESH_ACTION:-stop-without-new-review}/$reason"; pg_finish 3 ;;
+  esac
+}
+pg_install_effect_input_binding() { # clone the already-current validated relation to this charged marker
+  local binding
+  [ -n "${RUN_SPEND_EPOCH:-}" ] || return 1
+  binding="$(jq -cS --arg marker "$RUN_MARKER" --argjson epoch "$RUN_SPEND_EPOCH" '.marker=$marker | .charged_spend_epoch=$epoch' <<<"$REVIEW_DECISION_INPUT_TEMPLATE")" || return 1
+  pg_review_input_binding_write "$RUN_MARKER" "$binding"
+}
+pg_fresh_dispatch_refund() { # only the current marker and its exact charged epoch may roll back
+  local f marker _ _ _ _ state epoch latest meta binding
+  f="$(pg_active_dir)/$ROUND_KEY"
+  [ -n "${RUN_SPEND_EPOCH:-}" ] && [ -f "$f" ] || return 1
+  IFS=$'\t' read -r marker _ _ _ _ _ state epoch < "$f" 2>/dev/null || return 1
+  [ "$marker" = "$RUN_MARKER" ] && [ "$epoch" = "$RUN_SPEND_EPOCH" ] || return 1
+  latest=""
+  while IFS= read -r latest; do :; done < "$(pg_rounds_dir)/$ROUND_KEY" 2>/dev/null
+  [ "$latest" = "$RUN_SPEND_EPOCH" ] || return 1
+  meta="$(pg_run_meta_read "$RUN_MARKER" 2>/dev/null || true)"
+  [ -n "$meta" ] && [ "${meta##*$'\t'}" = "$RUN_SPEND_EPOCH" ] || return 1
+  binding="$(pg_review_input_binding_read "$RUN_MARKER" 2>/dev/null || true)"
+  [ -n "$binding" ] && [ "$(jq -r .charged_spend_epoch <<<"$binding")" = "$RUN_SPEND_EPOCH" ] || return 1
+  pg_round_unrecord "$ROUND_KEY"
+  pg_run_meta_remove "$RUN_MARKER"
+  rm -f "$(pg_review_input_binding_dir)/$RUN_MARKER" "$f" 2>/dev/null || true
+  PG_ACTIVE_WRITTEN=0
+  return 0
 }
 
 pg_publish_out() {  # $1 = verified snapshot → atomically publish to $OUT; rc 0 only when
@@ -2513,6 +2643,10 @@ if [ "$MODE" = remote-chrome ]; then
   fi
 fi
 
+# A matching run-granted effect is still advisory at this pre-lock boundary. Rebuild the
+# normalized facts before either the round guard or per-change lock can lead to a browser slot.
+[ "${REVIEW_DECISION_EXECUTE:-0}" != 1 ] || pg_fresh_dispatch_require_run pre-lock
+
 # v0.22/v0.31: review round budget. Refuse to spend ANOTHER Pro slot on a PR/branch whose
 # budget is exhausted inside the rolling window: unbounded review->fix->re-review loops
 # burned 10-16 slots on single PRs (8h+ gates, queue starvation). Since v0.31 the budget is
@@ -2605,6 +2739,10 @@ if [ -n "$RESERVED_MARKER" ]; then
   pg_status in-progress "existing reservation ${RESERVED_MARKER}; harvest required"
   pg_finish 9
 fi
+# A queued effect can be superseded by completed, active, reserved, or unknown-fate work while
+# it waits for this same existing change lock. Re-reduce before continuing to the slot queue.
+[ "${REVIEW_DECISION_EXECUTE:-0}" != 1 ] || pg_fresh_dispatch_require_run under-lock
+
 # Round-budget re-check for ALL runs, now that we own the per-change lock: the same-change
 # run(s) this waiter queued behind may have consumed the last round during the (up to 40 min)
 # wait. Check-then-record is race-free from here on because the lock is held until exit.
@@ -2697,6 +2835,10 @@ if [ "$SLOT_OK" != 1 ]; then
   pg_status failed "slot timeout"
   pg_finish 7
 fi
+# Slot acquisition is not submission authority. A completed/recoverable predecessor, moved
+# target/evidence, or governor change that arrived in the slot wait must win before charging.
+[ "${REVIEW_DECISION_EXECUTE:-0}" != 1 ] || pg_fresh_dispatch_require_run post-slot-pre-charge
+
 # ledger-timing-split (R1/R3): the run leaves the queue HERE — a slot is held, not yet
 # generating. One site, hit exactly once per invocation (retries below reuse this same slot).
 LAUNCH_EPOCH="$(date +%s)"
@@ -2919,24 +3061,67 @@ while :; do
   # trajectory row for this round must carry (#66 gate r3 P1). Keep it for the completion path
   # and for the reservation an exit-9 hands to a later harvest process.
   [ "$attempt" -eq 0 ] && {
-    pg_round_record "$ROUND_KEY"; RUN_SPEND_EPOCH="$PG_ROUND_SPEND_EPOCH"
-    # pg_round_record is the sole authority for charged-spend ordering. Preserve that epoch in
-    # run-meta before any later exit-9 reservation can retire, so recovery never reorders queued
-    # rounds by their earlier marker-mint time.
-    if [ -n "${RUN_SPEND_EPOCH:-}" ] && [ -n "${PG_META_HOST:-}${PG_META_OWNER:-}${PG_META_REPO:-}" ]; then
-      pg_run_meta_write "$RUN_MARKER" "$PG_META_HOST" "$PG_META_OWNER" "$PG_META_REPO" \
-        "$ROUND_KEY" "$PR_NUM" "$OUT" "$RUN_SPEND_EPOCH" 2>/dev/null \
-        || echo "[oracle-review] WARNING: could not persist recovery charge metadata for $RUN_MARKER" >&2
-    fi
-    pg_active_write
-    # Charge ordering is marker-bound: a proven endpoint run is not submitted until its immutable
-    # input relation is installed. A failure leaves the charged active record recoverable rather
-    # than launching an unbound attempt; bare/scoped callers retain existing non-merge behavior.
-    if ! pg_install_full_pr_input_binding "$RUN_MARKER"; then
-      PG_PRESERVE_STATE=1
-      echo "ERROR: charged full-PR input binding could not be installed; preserving active recovery state and not submitting." >&2
-      pg_status failed "charged input binding unavailable; recovery required"
-      pg_finish 3
+    if [ "${REVIEW_DECISION_EXECUTE:-0}" = 1 ]; then
+      # Marker-bound pre-charge state is durable BEFORE the round write. Any persistence failure
+      # below remains recover-only; no browser process can be started without all three records.
+      if ! pg_active_write pre-charge 0; then
+        PG_PRESERVE_STATE=1
+        echo "ERROR: could not publish pre-charge active state; not submitting." >&2
+        pg_status failed "pre-charge active state unavailable; recovery required"
+        pg_finish 3
+      fi
+      pg_round_record "$ROUND_KEY"; RUN_SPEND_EPOCH="$PG_ROUND_SPEND_EPOCH"
+      if [ -z "${RUN_SPEND_EPOCH:-}" ]; then
+        PG_PRESERVE_STATE=1
+        echo "ERROR: round charge could not be persisted; active state preserved and not submitting." >&2
+        pg_status failed "round charge unavailable; recovery required"
+        pg_finish 3
+      fi
+      if ! pg_active_write charged "$RUN_SPEND_EPOCH"; then
+        PG_PRESERVE_STATE=1
+        echo "ERROR: charged active state could not be persisted; not submitting." >&2
+        pg_status failed "charged active state unavailable; recovery required"
+        pg_finish 3
+      fi
+      if ! pg_run_meta_write "$RUN_MARKER" "$PG_META_HOST" "$PG_META_OWNER" "$PG_META_REPO" \
+        "$ROUND_KEY" "$PR_NUM" "$OUT" "$RUN_SPEND_EPOCH"; then
+        PG_PRESERVE_STATE=1
+        echo "ERROR: charged run metadata could not be persisted; active state preserved and not submitting." >&2
+        pg_status failed "charged run metadata unavailable; recovery required"
+        pg_finish 3
+      fi
+      if ! pg_install_effect_input_binding; then
+        PG_PRESERVE_STATE=1
+        echo "ERROR: charged input binding could not be installed; preserving active recovery state and not submitting." >&2
+        pg_status failed "charged input binding unavailable; recovery required"
+        pg_finish 3
+      fi
+      pg_active_write input-bound "$RUN_SPEND_EPOCH" || {
+        PG_PRESERVE_STATE=1
+        echo "ERROR: input-bound active state could not be persisted; not submitting." >&2
+        pg_status failed "input-bound active state unavailable; recovery required"
+        pg_finish 3
+      }
+    else
+      pg_round_record "$ROUND_KEY"; RUN_SPEND_EPOCH="$PG_ROUND_SPEND_EPOCH"
+      # pg_round_record is the sole authority for charged-spend ordering. Preserve that epoch in
+      # run-meta before any later exit-9 reservation can retire, so recovery never reorders queued
+      # rounds by their earlier marker-mint time.
+      if [ -n "${RUN_SPEND_EPOCH:-}" ] && [ -n "${PG_META_HOST:-}${PG_META_OWNER:-}${PG_META_REPO:-}" ]; then
+        pg_run_meta_write "$RUN_MARKER" "$PG_META_HOST" "$PG_META_OWNER" "$PG_META_REPO" \
+          "$ROUND_KEY" "$PR_NUM" "$OUT" "$RUN_SPEND_EPOCH" 2>/dev/null \
+          || echo "[oracle-review] WARNING: could not persist recovery charge metadata for $RUN_MARKER" >&2
+      fi
+      pg_active_write charged "$RUN_SPEND_EPOCH"
+      # Charge ordering is marker-bound: a proven endpoint run is not submitted until its immutable
+      # input relation is installed. A failure leaves the charged active record recoverable rather
+      # than launching an unbound attempt; bare/scoped callers retain existing non-merge behavior.
+      if ! pg_install_full_pr_input_binding "$RUN_MARKER"; then
+        PG_PRESERVE_STATE=1
+        echo "ERROR: charged full-PR input binding could not be installed; preserving active recovery state and not submitting." >&2
+        pg_status failed "charged input binding unavailable; recovery required"
+        pg_finish 3
+      fi
     fi
   }
 
@@ -2949,6 +3134,12 @@ while :; do
 
   echo "[oracle-review] launching the final-tier Pro review (attempt $((attempt + 1)), oracle timeout $TIMEOUT, hard cap ${HARD_SECS}s, stall/no-think watchdog ${STALL_SECS}s/${NOTHINK_SECS}s)..." >&2
   pg_status launching "strategy ${PRO_GATE_MODEL_STRATEGY:-current}"
+  [ "${REVIEW_DECISION_EXECUTE:-0}" != 1 ] || pg_active_write submitted "$RUN_SPEND_EPOCH" || {
+    PG_PRESERVE_STATE=1
+    echo "ERROR: submission handoff state could not be persisted; not submitting." >&2
+    pg_status failed "submission handoff state unavailable; recovery required"
+    pg_finish 3
+  }
   : > "$RUNLOG"; rm -f "$CAPTURE_OUT"   # clear prior-attempt diagnostics/capture before arming background work
   # v0.32: capture the URL AND apply the exact canonical title early. One bounded background
   # organizer shortly after submission proves marker ownership, remembers the conversation URL,
@@ -3015,8 +3206,12 @@ while :; do
     # The challenge PROVES no prompt reached the model: refund this invocation's round so a
     # few challenge hits inside the window cannot exit-12-block a change that spent nothing
     # (dogfood gate round-2 P1). Unknown-fate paths (throttle, watchdogs) never refund.
-    pg_round_unrecord "$ROUND_KEY"
-    pg_run_meta_remove "$RUN_MARKER"
+    if [ "${REVIEW_DECISION_EXECUTE:-0}" = 1 ]; then
+      pg_fresh_dispatch_refund || echo "[oracle-review] charged marker state could not be proven for refund; preserving it for recovery." >&2
+    else
+      pg_round_unrecord "$ROUND_KEY"
+      pg_run_meta_remove "$RUN_MARKER"
+    fi
     pg_status cloudflare "anti-bot challenge; cooldown started"
     cdf="${PRO_GATE_COOLDOWN_FILE:-$PRO_GATE_HOME/throttle.cooldown}"
     { printf '%s cloudflare-challenge (pr %s)\n' "$(date +%Y-%m-%dT%H:%M:%S%z)" "${PR_NUM:-diff}" > "$cdf"; } 2>/dev/null || true
@@ -3346,9 +3541,13 @@ else
   if [ "${SALVAGE_RAN:-0}" = 1 ] \
      && pg_attempt_provably_unsubmitted "${SALVAGE_RC:-0}"; then
     echo "[oracle-review] no conversation carried this run's marker and Oracle never reached its browser lifecycle (browser scanned clean, no URL memoized, browser stable): refunding this round; zero Pro quota was spent." >&2
-    pg_round_unrecord "$ROUND_KEY"
-    pg_run_meta_remove "$RUN_MARKER"
-    FAIL_DETAIL="submission never landed (send/upload failure before the prompt reached ChatGPT); round refunded, safe to retry"
+    if [ "${REVIEW_DECISION_EXECUTE:-0}" = 1 ]; then
+      pg_fresh_dispatch_refund || { echo "[oracle-review] charged marker state could not be proven for refund; preserving it for recovery." >&2; FAIL_DETAIL="submission fate uncertain; charged state preserved for recovery"; }
+    else
+      pg_round_unrecord "$ROUND_KEY"
+      pg_run_meta_remove "$RUN_MARKER"
+    fi
+    [ "${FAIL_DETAIL:-}" = "submission fate uncertain; charged state preserved for recovery" ] || FAIL_DETAIL="submission never landed (send/upload failure before the prompt reached ChatGPT); round refunded, safe to retry"
   fi
   # Attribute the failure when the review browser restarted mid-run — almost always memory pressure
   # on a small box (Chrome's subprocesses get reclaimed, oracle-chrome restarts, the CDP tab is
