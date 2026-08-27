@@ -190,13 +190,101 @@ pg_review_decision_repair_result_binding() { # marker input-binding-json
   pg_review_result_binding_write "$marker" "$result"
 }
 
+# Rebuild a binding's evidence relation from the exact files named by the invocation. This checks
+# proof only: marker and charged epoch remain immutable history, and are separately validated.
+# Scoped review deliberately hashes its raw endpoint and reviewed payload independently.
+pg_review_decision_input_proof_current() { # binding repo pr host owner name head base
+  local binding="$1" repo="$2" pr="$3" host="$4" owner="$5" name="$6" head="$7" base="$8"
+  local mode endpoint reviewed manifest confirmation raw_digest reviewed_digest manifest_digest confirmation_digest lineage
+  pg_review_input_binding_validate "$binding" "$(jq -r '.marker // ""' <<<"$binding" 2>/dev/null)" || return 1
+  jq -e --arg h "$host" --arg o "$owner" --arg r "$name" --argjson p "$pr" --arg head "$head" \
+    '.repository.host==$h and .repository.owner==$o and .repository.repo==$r and .target.pr==$p and .target.head_oid==$head' \
+    <<<"$binding" >/dev/null 2>&1 || return 1
+  mode="$(jq -r .evidence.mode <<<"$binding")"
+  reviewed="${REVIEW_DECISION_REVIEWED_DIFF_FILE:-${DIFF_FILE:-}}"
+  case "$mode" in
+    connector)
+      [ "$INPUT" = connector ] || [ "$INPUT" = both ] || return 1
+      jq -e --arg target "$host/$owner/$name" --arg head "$head" \
+        '.evidence.proof.repository_target==$target and .evidence.proof.commit_target==$head' \
+        <<<"$binding" >/dev/null 2>&1 ;;
+    full-pr)
+      [ "$INPUT" = bundle ] || [ "$INPUT" = both ] || return 1
+      endpoint="${PRO_GATE_REVIEW_ENDPOINT_PATCH:-}"
+      [ -n "$base" ] && [ -f "$endpoint" ] && [ ! -L "$endpoint" ] \
+        && [ -f "$reviewed" ] && [ ! -L "$reviewed" ] || return 1
+      [ "$(wc -c < "$endpoint" 2>/dev/null | tr -d ' ')" -le 26214400 ] \
+        && [ "$(wc -c < "$reviewed" 2>/dev/null | tr -d ' ')" -le 26214400 ] || return 1
+      raw_digest="$(pg_sha256 "$reviewed" 2>/dev/null || true)"
+      endpoint="$(pg_sha256 "$endpoint" 2>/dev/null || true)"
+      jq -e --arg base "$base" --arg head "$head" --arg raw "$raw_digest" --arg endpoint "$endpoint" \
+        '.evidence.proof.base_oid==$base and .evidence.proof.head_oid==$head and .evidence.proof.raw_patch_digest==$raw and .evidence.proof.endpoint_digest==$endpoint' \
+        <<<"$binding" >/dev/null 2>&1 ;;
+    scoped-delta)
+      [ "$INPUT" = bundle ] || [ "$INPUT" = both ] || return 1
+      endpoint="${PRO_GATE_REVIEW_ENDPOINT_PATCH:-}"; manifest="${PRO_GATE_REVIEW_FILTER_MANIFEST:-}"; confirmation="${CONFIRM_FILE:-}"
+      [ -n "$base" ] && [ -f "$endpoint" ] && [ ! -L "$endpoint" ] \
+        && [ -f "$reviewed" ] && [ ! -L "$reviewed" ] && [ -f "$manifest" ] && [ ! -L "$manifest" ] \
+        && [ -f "$confirmation" ] && [ ! -L "$confirmation" ] || return 1
+      [ "$(wc -c < "$endpoint" 2>/dev/null | tr -d ' ')" -le 26214400 ] \
+        && [ "$(wc -c < "$reviewed" 2>/dev/null | tr -d ' ')" -le 26214400 ] \
+        && [ "$(wc -c < "$manifest" 2>/dev/null | tr -d ' ')" -le 65536 ] \
+        && [ "$(wc -c < "$confirmation" 2>/dev/null | tr -d ' ')" -le 262144 ] && pg_is_review "$confirmation" || return 1
+      raw_digest="$(pg_sha256 "$endpoint" 2>/dev/null || true)"
+      reviewed_digest="$(pg_sha256 "$reviewed" 2>/dev/null || true)"
+      manifest_digest="$(pg_sha256 "$manifest" 2>/dev/null || true)"
+      confirmation_digest="$(pg_sha256 "$confirmation" 2>/dev/null || true)"
+      lineage="confirmation:${confirmation_digest}"
+      jq -e --arg base "$base" --arg head "$head" --arg raw "$raw_digest" --arg reviewed "$reviewed_digest" \
+        --arg manifest "$manifest_digest" --arg lineage "$lineage" \
+        '.evidence.proof.base_oid==$base and .evidence.proof.end_oid==$head and .evidence.proof.raw_digest==$raw and .evidence.proof.reviewed_payload_digest==$reviewed and .evidence.proof.filtering_manifest_digest==$manifest and .evidence.proof.lineage_identity==$lineage' \
+        <<<"$binding" >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
+# A query never writes an uncharged record. When the invocation itself proves a current relation,
+# it supplies this deterministic, validated template for the guarded effect to clone after charge.
+pg_review_decision_prospective_input_binding() { # repo pr host owner name head base round-key
+  local repo="$1" pr="$2" host="$3" owner="$4" name="$5" head="$6" base="$7" round_key="$8"
+  local marker="pg-run-prospective-${round_key}" endpoint reviewed manifest confirmation raw_digest reviewed_digest manifest_digest confirmation_digest lineage binding
+  reviewed="${REVIEW_DECISION_REVIEWED_DIFF_FILE:-${DIFF_FILE:-}}"
+  binding=""
+  if { [ "$INPUT" = bundle ] || [ "$INPUT" = both ]; } && [ -n "${PRO_GATE_REVIEW_FILTER_MANIFEST:-}" ] && [ -n "${CONFIRM_FILE:-}" ]; then
+    endpoint="${PRO_GATE_REVIEW_ENDPOINT_PATCH:-}"; manifest="$PRO_GATE_REVIEW_FILTER_MANIFEST"; confirmation="$CONFIRM_FILE"
+    if [ -n "$base" ] && [ -f "$endpoint" ] && [ ! -L "$endpoint" ] && [ -f "$reviewed" ] && [ ! -L "$reviewed" ] \
+       && [ -f "$manifest" ] && [ ! -L "$manifest" ] && [ -f "$confirmation" ] && [ ! -L "$confirmation" ] \
+       && [ "$(wc -c < "$endpoint" 2>/dev/null | tr -d ' ')" -le 26214400 ] \
+       && [ "$(wc -c < "$reviewed" 2>/dev/null | tr -d ' ')" -le 26214400 ] \
+       && [ "$(wc -c < "$manifest" 2>/dev/null | tr -d ' ')" -le 65536 ] \
+       && [ "$(wc -c < "$confirmation" 2>/dev/null | tr -d ' ')" -le 262144 ] && pg_is_review "$confirmation"; then
+      raw_digest="$(pg_sha256 "$endpoint")"; reviewed_digest="$(pg_sha256 "$reviewed")"
+      manifest_digest="$(pg_sha256 "$manifest")"; confirmation_digest="$(pg_sha256 "$confirmation")"; lineage="confirmation:${confirmation_digest}"
+      binding="$(jq -cnS --arg cd "$(pg_review_decision_contract_digest)" --arg marker "$marker" --arg host "$host" --arg owner "$owner" --arg repo "$name" --argjson pr "$pr" --arg base "$base" --arg head "$head" --arg raw "$raw_digest" --arg reviewed "$reviewed_digest" --arg manifest "$manifest_digest" --arg lineage "$lineage" '{charged_spend_epoch:1,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("scoped-delta:"+$base+":"+$head+":"+$reviewed),mode:"scoped-delta",proof:{base_oid:$base,end_oid:$head,filtering_manifest_digest:$manifest,lineage_identity:$lineage,raw_digest:$raw,reviewed_payload_digest:$reviewed,scope_algorithm:"unified-diff-v1"}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:$host,owner:$owner,repo:$repo},target:{head_oid:$head,kind:"pull-request",pr:$pr}}')"
+    fi
+  fi
+  if [ -z "$binding" ] && { [ "$INPUT" = bundle ] || [ "$INPUT" = both ]; }; then
+    endpoint="${PRO_GATE_REVIEW_ENDPOINT_PATCH:-}"
+    if [ -n "$base" ] && [ -f "$endpoint" ] && [ ! -L "$endpoint" ] && [ -f "$reviewed" ] && [ ! -L "$reviewed" ] \
+       && [ "$(wc -c < "$endpoint" 2>/dev/null | tr -d ' ')" -le 26214400 ] && [ "$(wc -c < "$reviewed" 2>/dev/null | tr -d ' ')" -le 26214400 ]; then
+      endpoint="$(pg_sha256 "$endpoint")"; raw_digest="$(pg_sha256 "$reviewed")"
+      binding="$(jq -cnS --arg cd "$(pg_review_decision_contract_digest)" --arg marker "$marker" --arg host "$host" --arg owner "$owner" --arg repo "$name" --argjson pr "$pr" --arg base "$base" --arg head "$head" --arg endpoint "$endpoint" --arg raw "$raw_digest" '{charged_spend_epoch:1,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("full-pr:"+$base+":"+$head),mode:"full-pr",proof:{base_oid:$base,endpoint_digest:$endpoint,head_oid:$head,raw_patch_digest:$raw}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:$host,owner:$owner,repo:$repo},target:{head_oid:$head,kind:"pull-request",pr:$pr}}')"
+    fi
+  fi
+  if [ -z "$binding" ] && { [ "$INPUT" = connector ] || [ "$INPUT" = both ]; }; then
+    binding="$(jq -cnS --arg cd "$(pg_review_decision_contract_digest)" --arg marker "$marker" --arg host "$host" --arg owner "$owner" --arg repo "$name" --argjson pr "$pr" --arg head "$head" '{charged_spend_epoch:1,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("connector:"+$host+"/"+$owner+"/"+$repo+":"+$head),mode:"connector",proof:{commit_target:$head,endpoint_digest:null,raw_diff_digest:null,repository_target:($host+"/"+$owner+"/"+$repo)}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:$host,owner:$owner,repo:$repo},target:{head_oid:$head,kind:"pull-request",pr:$pr}}')"
+  fi
+  [ -n "$binding" ] && pg_review_decision_input_proof_current "$binding" "$repo" "$pr" "$host" "$owner" "$name" "$head" "$base" || return 1
+  printf '%s' "$binding"
+}
+
 pg_review_decision_cli() {
   local repo pr_num remote ident host owner repo_name head base raw_digest round_key
   local input_proven=false input_binding_valid=false input_identity evidence_identity evidence_state
   local input_marker="" input_record="" input_digest="" f marker candidate mode active_marker="" active_state=none
   local endpoint reviewed manifest confirmation endpoint_digest reviewed_digest manifest_digest confirmation_digest lineage
   local reservation_marker="" reservation_state=none governor_granted=false completed='[]' result artifact artifact_digest
-  local facts decision effect_ok=false
+  local facts decision effect_ok=false prospective
 
   pg_have jq || { echo 'ERROR: review-decision/v1 requires jq' >&2; return 2; }
   repo="${REPO:-$(pwd)}"
@@ -220,71 +308,36 @@ pg_review_decision_cli() {
   else
     raw_digest=""
   fi
+  # The effect path must rehash the caller's reviewed bytes even if normal diff hygiene later
+  # chooses a filtered engine payload. It is never interchangeable with the raw endpoint bytes.
+  REVIEW_DECISION_REVIEWED_DIFF_FILE="$DIFF_FILE"
   round_key="$(printf '%s-%s-%s' "$owner" "$repo_name" "$pr_num" | tr -c 'A-Za-z0-9.\n-' '-')"
   input_identity="${host}:${owner}/${repo_name}:${pr_num}:${head}"
   evidence_identity='evidence:none'; evidence_state=missing
 
-  # Only a validated immutable input binding can make evidence applicable. A caller-supplied
-  # diff is intentionally bare: it can support bounded review/recovery, never full-PR or merge
-  # claims, because it lacks an independently fetched unfiltered endpoint digest.
+  # Persisted bindings remain authoritative when their complete proof still matches. A cold
+  # start instead assembles a validated in-memory template; query resolution never writes it.
   for f in "$(pg_review_input_binding_dir)"/pg-run-*; do
     [ -f "$f" ] && [ ! -L "$f" ] || continue
     marker="${f##*/}"
     candidate="$(pg_review_input_binding_read "$marker" 2>/dev/null || true)"
     [ -n "$candidate" ] || continue
-    jq -e --arg h "$host" --arg o "$owner" --arg r "$repo_name" --argjson p "$pr_num" --arg head "$head" \
-      '.repository.host==$h and .repository.owner==$o and .repository.repo==$r and .target.pr==$p and .target.head_oid==$head' \
-      <<<"$candidate" >/dev/null 2>&1 || continue
-    mode="$(jq -r .evidence.mode <<<"$candidate")"
-    case "$mode" in
-      connector)
-        [ "$INPUT" = connector ] || [ "$INPUT" = both ] || continue
-        jq -e --arg target "$host/$owner/$repo_name" --arg head "$head" \
-          '.evidence.proof.repository_target==$target and .evidence.proof.commit_target==$head' \
-          <<<"$candidate" >/dev/null 2>&1 || continue
-        input_proven=true ;;
-      full-pr)
-        # A local --diff remains bare evidence. Full-PR applicability requires the independently
-        # acquired, bounded endpoint patch as well as the separately retained raw patch bytes.
-        endpoint="${PRO_GATE_REVIEW_ENDPOINT_PATCH:-}"
-        [ -n "$endpoint" ] && [ -f "$endpoint" ] && [ ! -L "$endpoint" ] || continue
-        [ "$(wc -c < "$endpoint" 2>/dev/null | tr -d ' ')" -le 26214400 ] || continue
-        endpoint_digest="$(pg_sha256 "$endpoint")"
-        [ -n "$endpoint_digest" ] && [ -n "$raw_digest" ] || continue
-        jq -e --arg base "$base" --arg head "$head" --arg endpoint "$endpoint_digest" --arg raw "$raw_digest" '
-          .evidence.proof.base_oid==$base and .evidence.proof.head_oid==$head and
-          .evidence.proof.endpoint_digest==$endpoint and .evidence.proof.raw_patch_digest==$raw' \
-          <<<"$candidate" >/dev/null 2>&1 || continue
-        input_proven=true ;;
-      scoped-delta)
-        # A scoped payload never implies full PR coverage: retain exact raw/reviewed bytes, a
-        # filtering manifest, and a validated confirmation lineage tied to the bound end OID.
-        reviewed="${DIFF_FILE:-}"; manifest="${PRO_GATE_REVIEW_FILTER_MANIFEST:-}"; confirmation="${CONFIRM_FILE:-}"
-        [ -n "$reviewed" ] && [ -f "$reviewed" ] && [ ! -L "$reviewed" ] || continue
-        [ -n "$manifest" ] && [ -f "$manifest" ] && [ ! -L "$manifest" ] || continue
-        [ -n "$confirmation" ] && [ -f "$confirmation" ] && [ ! -L "$confirmation" ] || continue
-        [ "$(wc -c < "$reviewed" 2>/dev/null | tr -d ' ')" -le 26214400 ] || continue
-        [ "$(wc -c < "$manifest" 2>/dev/null | tr -d ' ')" -le 65536 ] || continue
-        [ "$(wc -c < "$confirmation" 2>/dev/null | tr -d ' ')" -le 262144 ] || continue
-        pg_is_review "$confirmation" || continue
-        reviewed_digest="$(pg_sha256 "$reviewed")"; manifest_digest="$(pg_sha256 "$manifest")"
-        confirmation_digest="$(pg_sha256 "$confirmation")"; lineage="confirmation:${confirmation_digest}"
-        [ -n "$raw_digest" ] && [ -n "$reviewed_digest" ] && [ -n "$manifest_digest" ] && [ -n "$confirmation_digest" ] || continue
-        jq -e --arg base "$base" --arg end "$head" --arg raw "$raw_digest" --arg reviewed "$reviewed_digest" \
-          --arg manifest "$manifest_digest" --arg lineage "$lineage" '
-          .evidence.proof.base_oid==$base and .evidence.proof.end_oid==$end and
-          .evidence.proof.raw_digest==$raw and .evidence.proof.reviewed_payload_digest==$reviewed and
-          .evidence.proof.filtering_manifest_digest==$manifest and .evidence.proof.lineage_identity==$lineage' \
-          <<<"$candidate" >/dev/null 2>&1 || continue
-        input_proven=true ;;
-      *) continue ;;
-    esac
+    pg_review_decision_input_proof_current "$candidate" "$repo" "$pr_num" "$host" "$owner" "$repo_name" "$head" "$base" || continue
     input_marker="$marker"; input_record="$candidate"
     input_digest="$(pg_review_sha256_text "$candidate")"
-    input_binding_valid=true; input_identity="$input_digest"
+    input_binding_valid=true; input_proven=true; input_identity="$input_digest"
     evidence_identity="$(jq -r .evidence.identity <<<"$candidate")"; evidence_state=matching
     break
   done
+  if [ -z "$input_record" ]; then
+    prospective="$(pg_review_decision_prospective_input_binding "$repo" "$pr_num" "$host" "$owner" "$repo_name" "$head" "$base" "$round_key" 2>/dev/null || true)"
+    if [ -n "$prospective" ]; then
+      input_marker="$(jq -r .marker <<<"$prospective")"; input_record="$prospective"
+      input_digest="$(pg_review_sha256_text "$prospective")"
+      input_binding_valid=true; input_proven=true; input_identity="$input_digest"
+      evidence_identity="$(jq -r .evidence.identity <<<"$prospective")"; evidence_state=matching
+    fi
+  fi
 
   # Active index and reservation authority are read directly without reconciliation. Querying a
   # stale record is conservative (recover), while reconciliation itself is an effect and forbidden.
@@ -1360,35 +1413,16 @@ pg_install_full_pr_input_binding() { # marker; only endpoint-fetched full PRs ga
 # authorities; it neither creates an action token nor a second ledger or lock.
 pg_fresh_dispatch_recheck() { # sets PG_FRESH_DECISION/PG_FRESH_ACTION
   local template="$REVIEW_DECISION_INPUT_TEMPLATE" marker="" state=none epoch=0 f rec m astate="" completed='[]'
-  local input_ok=false input_digest evidence identity head base endpoint raw mode active_marker="" reservation="" granted=false facts
+  local input_ok=false input_digest evidence identity head base active_marker="" reservation="" granted=false facts
   [ -n "$template" ] || return 1
   input_digest="$(pg_review_sha256_text "$template" 2>/dev/null || true)"
-  mode="$(jq -r '.evidence.mode // ""' <<<"$template" 2>/dev/null || true)"
   head="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || true)"
   base="$(git -C "$REPO" merge-base HEAD '@{upstream}' 2>/dev/null || git -C "$REPO" rev-parse HEAD^ 2>/dev/null || true)"
-  raw="$(pg_sha256 "$DIFF_FILE" 2>/dev/null || true)"
-  jq -e --arg h "$PG_META_HOST" --arg o "$PG_META_OWNER" --arg r "$PG_META_REPO" --argjson p "$PR_NUM" --arg head "$head" \
-    '.repository.host==$h and .repository.owner==$o and .repository.repo==$r and .target.pr==$p and .target.head_oid==$head' \
-    <<<"$template" >/dev/null 2>&1 || mode=""
-  case "$mode" in
-    full-pr)
-      endpoint="${PRO_GATE_REVIEW_ENDPOINT_PATCH:-}"
-      [ -f "$endpoint" ] && [ ! -L "$endpoint" ] || endpoint=""
-      endpoint="${endpoint:+$(pg_sha256 "$endpoint" 2>/dev/null || true)}"
-      jq -e --arg base "$base" --arg head "$head" --arg raw "$raw" --arg endpoint "$endpoint" \
-        '.evidence.proof.base_oid==$base and .evidence.proof.head_oid==$head and .evidence.proof.raw_patch_digest==$raw and .evidence.proof.endpoint_digest==$endpoint' \
-        <<<"$template" >/dev/null 2>&1 && input_ok=true ;;
-    connector)
-      jq -e --arg target "$PG_META_HOST/$PG_META_OWNER/$PG_META_REPO" --arg head "$head" \
-        '.evidence.proof.repository_target==$target and .evidence.proof.commit_target==$head' \
-        <<<"$template" >/dev/null 2>&1 && input_ok=true ;;
-    scoped-delta)
-      # The resolver has already checked the bounded manifest/confirmation lineage. Rechecking
-      # its target and exact raw evidence at charge keeps a moved head or payload from spending.
-      jq -e --arg base "$base" --arg head "$head" --arg raw "$raw" \
-        '.evidence.proof.base_oid==$base and .evidence.proof.end_oid==$head and .evidence.proof.raw_digest==$raw and .evidence.proof.reviewed_payload_digest==$raw' \
-        <<<"$template" >/dev/null 2>&1 && input_ok=true ;;
-  esac
+  # Reassemble every evidence byte relation at each dispatch boundary. In particular, scoped
+  # raw endpoint, reviewed payload, manifest, and confirmation remain four separate inputs.
+  if pg_review_decision_input_proof_current "$template" "$REPO" "$PR_NUM" "$PG_META_HOST" "$PG_META_OWNER" "$PG_META_REPO" "$head" "$base"; then
+    input_ok=true
+  fi
   identity="${input_digest:-input-unproven}"
   evidence="$(jq -r '.evidence.identity // "evidence:none"' <<<"$template" 2>/dev/null || echo evidence:none)"
 
