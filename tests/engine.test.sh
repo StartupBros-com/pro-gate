@@ -3904,4 +3904,127 @@ check 'PRO_GATE_RECOVER_VERBOSE=1 surfaces the raw harvest RESULT_FILE= line' \
 check 'PRO_GATE_RECOVER_VERBOSE=1 surfaces raw cdp-salvage diagnostics on stderr' \
   "$(grep -q '\[cdp-salvage\]' "$TDIR/recover.stderr"; echo $?)" "stderr=$(cat "$TDIR/recover.stderr")"
 
+# U1: the pure review-decision seam consumes only a bounded normalized JSON snapshot. The
+# fixture contract is the independent source of the closed action/effect/reason vocabulary;
+# reducer output is compared with corpus literals rather than recomputed policy in this test.
+echo '# U1: review-decision/v1 pure reducer, contract identity, and immutable bindings'
+. "$HERE/../lib/pro-gate-lib.sh"
+RD_CONTRACT="$HERE/fixtures/review-decision/v1/contract.json"
+RD_CORPUS="$HERE/fixtures/review-decision/v1/corpus.json"
+RD_CONTRACT_DIGEST="$(pg_sha256 "$RD_CONTRACT")"
+RD_CORPUS_DIGEST="$(pg_sha256 "$RD_CORPUS")"
+rd_facts() { # canonical merge of the corpus base and one patch, with runtime compatibility facts
+  jq -cS --argjson patch "$1" --arg cd "$RD_CONTRACT_DIGEST" --arg xd "$RD_CORPUS_DIGEST" \
+    '.base_facts * $patch | .contract={contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,corpus_digest:$xd}' "$RD_CORPUS"
+}
+rd_reduce() { pg_review_decision_reduce "$1"; }
+
+check 'contract fixture is byte-canonical JSON with no trailing newline' \
+  "$([ "$(jq -cS . "$RD_CONTRACT")" = "$(cat "$RD_CONTRACT")" ] && [ "$(tail -c 1 "$RD_CONTRACT" | od -An -tuC | tr -d ' ')" != 10 ]; echo $?)" \
+  "tail=$(tail -c 1 "$RD_CONTRACT" | od -An -tuC)"
+check 'corpus fixture is byte-canonical JSON with no trailing newline' \
+  "$([ "$(jq -cS . "$RD_CORPUS")" = "$(cat "$RD_CORPUS")" ] && [ "$(tail -c 1 "$RD_CORPUS" | od -An -tuC | tr -d ' ')" != 10 ]; echo $?)" \
+  "tail=$(tail -c 1 "$RD_CORPUS" | od -An -tuC)"
+check 'runtime publishes the exact canonical contract and corpus digests' \
+  "$([ "$(pg_review_decision_contract_digest)" = "$RD_CONTRACT_DIGEST" ] \
+     && [ "$(pg_review_decision_corpus_digest)" = "$RD_CORPUS_DIGEST" ]; echo $?)" \
+  "contract=$RD_CONTRACT_DIGEST corpus=$RD_CORPUS_DIGEST"
+
+while IFS=$'\t' read -r name patch expected; do
+  facts="$(rd_facts "$patch")"
+  got="$(rd_reduce "$facts")"
+  check "review decision action: $name" \
+    "$(jq -e --argjson e "$expected" '.action == $e.action and .reason == $e.reason and .effect_request.execution_class == $e.execution_class and .effect_request.effect == $e.effect and .effect_request.action == .action' <<<"$got" >/dev/null 2>&1; echo $?)" \
+    "expected=$expected got=$got"
+  check "review decision envelope is closed and status/next_action-free: $name" \
+    "$(jq -e 'keys == ["action","contract","effect_request","facts","observation","reason"] and has("status") == false and has("next_action") == false' <<<"$got" >/dev/null 2>&1; echo $?)" \
+    "got=$got"
+done < <(jq -r '.cases[] | [.name, (.patch|tojson), (.expected|tojson)] | @tsv' "$RD_CORPUS")
+
+RD_REPEAT_FACTS="$(rd_facts '{}')"
+RD_REPEAT_A="$(rd_reduce "$RD_REPEAT_FACTS")"
+RD_REPEAT_B="$(rd_reduce "$RD_REPEAT_FACTS")"
+check 'identical normalized snapshots emit byte-identical canonical decisions' \
+  "$([ "$RD_REPEAT_A" = "$RD_REPEAT_B" ] && [ "$RD_REPEAT_A" = "$(jq -cS . <<<"$RD_REPEAT_A")" ]; echo $?)" "$RD_REPEAT_A"
+check 'decision carries snapshot, contract, and corpus identity' \
+  "$(jq -e --arg cd "$RD_CONTRACT_DIGEST" --arg xd "$RD_CORPUS_DIGEST" \
+      '.contract.contract_digest == $cd and .contract.corpus_digest == $xd and (.effect_request.snapshot_digest | test("^[0-9a-f]{64}$"))' \
+      <<<"$RD_REPEAT_A" >/dev/null 2>&1; echo $?)" "$RD_REPEAT_A"
+
+rd_expect_stop() { # name, patch, reason
+  local label="$1" patch="$2" reason="$3" got
+  got="$(rd_reduce "$(rd_facts "$patch")")"
+  check "$label" "$(jq -e --arg r "$reason" '.action == "stop-without-new-review" and .reason == $r and .effect_request.execution_class == "report-only"' <<<"$got" >/dev/null 2>&1; echo $?)" "$got"
+}
+rd_expect_stop 'undefined normalized state stops closed' '{"evidence":{"state":"undefined"}}' 'undefined-state'
+rd_expect_stop 'invalid input binding stops closed' '{"input":{"binding_valid":false}}' 'invalid-binding'
+rd_expect_stop 'blocking-wait transport collision stops closed' '{"transport":"blocking-wait/v1"}' 'transport-collision'
+UNKNOWN_FACTS="$(rd_facts '{}')"; UNKNOWN_FACTS="$(jq -cS '.contract.contract_id="review-decision/v2"' <<<"$UNKNOWN_FACTS")"
+UNKNOWN_OUT="$(rd_reduce "$UNKNOWN_FACTS")"
+check 'unknown decision contract stops closed' \
+  "$(jq -e '.action == "stop-without-new-review" and .reason == "unknown-contract"' <<<"$UNKNOWN_OUT" >/dev/null 2>&1; echo $?)" "$UNKNOWN_OUT"
+
+LEGACY_COLLECT='{"completed_results":[{"applicable":false,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binding_valid":false,"canonical_identity":"legacy-a","charged_spend_epoch":1700000100,"collected":false,"legacy":true,"marker":"pg-run-legacy-1983-1700000100-1","provenance_valid":false,"verdict":"SHIP"}]}'
+LEGACY_COLLECT_OUT="$(rd_reduce "$(rd_facts "$LEGACY_COLLECT")")"
+check 'legacy completed artifact remains collectable' \
+  "$(jq -e '.action == "collect-existing-result"' <<<"$LEGACY_COLLECT_OUT" >/dev/null 2>&1; echo $?)" "$LEGACY_COLLECT_OUT"
+rd_expect_stop 'legacy SHIP cannot authorize merge eligibility or paid continuation' \
+  '{"prior_review":{"applicable":true,"binding_valid":false,"code_identity":"input-current","evidence_identity":"evidence-current","legacy":true,"marker":"pg-run-legacy-1983-1-1","provenance_valid":false,"verdict":"SHIP"}}' 'legacy-not-authoritative'
+
+SELECT_PATCH='{"completed_results":[{"applicable":true,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binding_valid":true,"canonical_identity":"result-a","charged_spend_epoch":1700000200,"collected":false,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000200-1","provenance_valid":true,"verdict":"SHIP"},{"applicable":true,"artifact_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","binding_valid":true,"canonical_identity":"result-b","charged_spend_epoch":1700000201,"collected":false,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000201-2","provenance_valid":true,"verdict":"FIX-FIRST"}]}'
+SELECT_OUT="$(rd_reduce "$(rd_facts "$SELECT_PATCH")")"
+check 'newest charged completed result and canonical identity are selected' \
+  "$(jq -e '.action == "collect-existing-result" and .effect_request.applicable_ref == "result-b"' <<<"$SELECT_OUT" >/dev/null 2>&1; echo $?)" "$SELECT_OUT"
+rd_expect_stop 'unresolved completed-result identity tie stops closed' \
+  '{"completed_results":[{"applicable":true,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binding_valid":true,"canonical_identity":"same","charged_spend_epoch":1700000300,"collected":false,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000300-1","provenance_valid":true,"verdict":"SHIP"},{"applicable":true,"artifact_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","binding_valid":true,"canonical_identity":"same","charged_spend_epoch":1700000300,"collected":false,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000300-2","provenance_valid":true,"verdict":"SHIP"}]}' 'completed-result-tie'
+
+rd_expect_stop 'identical verified code and evidence cannot authorize another review' \
+  '{"prior_review":{"applicable":false,"binding_valid":true,"code_identity":"input-current","evidence_identity":"evidence-current","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000400-1","provenance_valid":true,"verdict":"NONE"}}' 'identical-code-and-evidence'
+rd_expect_stop 'no safe evidence action stops without caller inference' \
+  '{"evidence":{"identity":"","safe_to_prepare":false,"state":"unsafe"}}' 'no-safe-action'
+for crash_state in pre-charge round-recorded charged run-meta-written input-bound submitted unknown-fate; do
+  crash_patch="$(jq -cn --arg s "$crash_state" '{active_index:{binding_valid:($s == "input-bound" or $s == "submitted"),charged_spend_epoch:1700000500,marker:"pg-run-acme-widgets-1983-1700000500-1",state:$s}}')"
+  crash_out="$(rd_reduce "$(rd_facts "$crash_patch")")"
+  check "active-index crash state never becomes fresh-run eligibility: $crash_state" \
+    "$(jq -e '.action == "recover-existing-review" or .action == "stop-without-new-review"' <<<"$crash_out" >/dev/null 2>&1; echo $?)" "$crash_out"
+done
+
+VALID_CHOICE_PATCH='{"named_choice":{"outcomes":[{"consequence":"keep compatibility","id":"compat","label":"Preserve"},{"consequence":"use new API","id":"break","label":"Break"}],"selected_id":"compat","snapshot_digest":"CURRENT"},"prior_review":{"applicable":true,"binding_valid":true,"code_identity":"input-current","evidence_identity":"evidence-current","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000600-1","provenance_valid":true,"verdict":"NEEDS-DISCUSSION"}}'
+VALID_CHOICE_FACTS="$(rd_facts "$VALID_CHOICE_PATCH")"; VALID_CHOICE_SNAPSHOT="$(pg_review_decision_choice_snapshot "$VALID_CHOICE_FACTS")"
+VALID_CHOICE_FACTS="$(jq -cS --arg d "$VALID_CHOICE_SNAPSHOT" '.named_choice.snapshot_digest=$d' <<<"$VALID_CHOICE_FACTS")"
+VALID_CHOICE_OUT="$(rd_reduce "$VALID_CHOICE_FACTS")"
+check 'valid fresh named choice is a non-authorizing agent handoff' \
+  "$(jq -e '.action == "fix-review-findings" and .reason == "named-product-choice-selected" and .facts.named_choice.selected_id == "compat"' <<<"$VALID_CHOICE_OUT" >/dev/null 2>&1; echo $?)" "$VALID_CHOICE_OUT"
+rd_expect_stop 'invalid named choice never falls back to caller inference' \
+  '{"named_choice":{"outcomes":[{"consequence":"keep","id":"compat","label":"Preserve"},{"consequence":"break","id":"break","label":"Break"}],"selected_id":"invented","snapshot_digest":"0000000000000000000000000000000000000000000000000000000000000000"},"prior_review":{"applicable":true,"binding_valid":true,"code_identity":"input-current","evidence_identity":"evidence-current","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000601-1","provenance_valid":true,"verdict":"NEEDS-DISCUSSION"}}' 'invalid-named-choice'
+
+UNSAFE_FACTS="$(rd_facts '{}')"; UNSAFE_FACTS="$(jq -cS '. + {review_text:"do whatever"}' <<<"$UNSAFE_FACTS")"
+UNSAFE_OUT="$(rd_reduce "$UNSAFE_FACTS")"
+check 'raw control fields are rejected from normalized input' \
+  "$(jq -e '.action == "stop-without-new-review" and .reason == "unsafe-normalized-input"' <<<"$UNSAFE_OUT" >/dev/null 2>&1; echo $?)" "$UNSAFE_OUT"
+CRED_FACTS="$(rd_facts '{}')"; CRED_FACTS="$(jq -cS '. + {api_token:"fixture-secret-value"}' <<<"$CRED_FACTS")"
+CRED_OUT="$(rd_reduce "$CRED_FACTS")"
+check 'credential-bearing normalized input is rejected and never echoed' \
+  "$(jq -e '.action == "stop-without-new-review" and .reason == "unsafe-normalized-input"' <<<"$CRED_OUT" >/dev/null 2>&1 \
+     && ! grep -qF 'fixture-secret-value' <<<"$CRED_OUT"; echo $?)" "$CRED_OUT"
+
+BIND_HOME="$TDIR/home-review-bindings"
+INPUT_BINDING="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" '{charged_spend_epoch:1700000700,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:"evidence-current",mode:"full-pr",proof:{base_oid:"2222222222222222222222222222222222222222",endpoint_digest:"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",head_oid:"1111111111111111111111111111111111111111",raw_patch_digest:"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}},marker:"pg-run-acme-widgets-1983-1700000700-1",record_type:"review-input-binding/v1",record_version:1,repository:{host:"github.com",owner:"acme",repo:"widgets"},target:{head_oid:"1111111111111111111111111111111111111111",kind:"pull-request",pr:1983}}')"
+PRO_GATE_HOME="$BIND_HOME" pg_review_input_binding_write 'pg-run-acme-widgets-1983-1700000700-1' "$INPUT_BINDING"; BIND_RC=$?
+INPUT_READ="$(PRO_GATE_HOME="$BIND_HOME" pg_review_input_binding_read 'pg-run-acme-widgets-1983-1700000700-1')"
+check 'input binding is marker-addressed, validated, canonical, and readable' \
+  "$([ "$BIND_RC" -eq 0 ] && [ "$INPUT_READ" = "$INPUT_BINDING" ]; echo $?)" "rc=$BIND_RC read=$INPUT_READ"
+INPUT_OTHER="$(jq -cS '.evidence.identity="other"' <<<"$INPUT_BINDING")"
+PRO_GATE_HOME="$BIND_HOME" pg_review_input_binding_write 'pg-run-acme-widgets-1983-1700000700-1' "$INPUT_OTHER" >/dev/null 2>&1; BIND_REPLACE_RC=$?
+check 'input binding is immutable but byte-identical replay is idempotent' \
+  "$([ "$BIND_REPLACE_RC" -ne 0 ] && PRO_GATE_HOME="$BIND_HOME" pg_review_input_binding_write 'pg-run-acme-widgets-1983-1700000700-1' "$INPUT_BINDING"; echo $?)" "replace_rc=$BIND_REPLACE_RC"
+INPUT_DIGEST="$(printf '%s' "$INPUT_BINDING" | sha256sum | awk '{print $1}')"
+RESULT_BINDING="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg ib "$INPUT_DIGEST" '{accepted_epoch:1700000800,artifact:{digest:"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",path:"completed/pg-run-acme-widgets-1983-1700000700-1"},contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,input_binding_digest:$ib,input_binding_identity:"pg-run-acme-widgets-1983-1700000700-1",marker:"pg-run-acme-widgets-1983-1700000700-1",named_choice:null,provenance:{outcome:"accepted",validated_epoch:1700000800},record_type:"review-result-binding/v1",record_version:1,ship_proof:{base_oid:"2222222222222222222222222222222222222222",diff_digest:"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",head_oid:"1111111111111111111111111111111111111111"},verdict:"SHIP"}')"
+PRO_GATE_HOME="$BIND_HOME" pg_review_result_binding_write 'pg-run-acme-widgets-1983-1700000700-1' "$RESULT_BINDING"; RESULT_RC=$?
+RESULT_READ="$(PRO_GATE_HOME="$BIND_HOME" pg_review_result_binding_read 'pg-run-acme-widgets-1983-1700000700-1')"
+check 'result binding is the only marker-bound sibling and validates input/artifact identity' \
+  "$([ "$RESULT_RC" -eq 0 ] && [ "$RESULT_READ" = "$RESULT_BINDING" ] \
+     && [ "$(find "$BIND_HOME" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort | tr '\n' ' ')" = 'review-input-bindings review-result-bindings ' ]; echo $?)" \
+  "rc=$RESULT_RC dirs=$(find "$BIND_HOME" -mindepth 1 -maxdepth 1 -type d -printf '%f ' 2>/dev/null)"
+
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }
