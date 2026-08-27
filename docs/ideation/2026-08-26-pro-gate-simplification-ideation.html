@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ideation: pro-gate simplification</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f5f1;
+    --card: #ffffff;
+    --ink: #202127;
+    --muted: #666a73;
+    --line: #d9d8d2;
+    --soft: #efeee9;
+    --accent: #4f46e5;
+    --accent-text: #3730a3;
+    --accent-soft: #e8e7ff;
+    --good-text: #166534;
+    --good-soft: #dcfce7;
+    --warn-text: #92400e;
+    --warn-soft: #fef3c7;
+    --bad-text: #991b1b;
+    --bad-soft: #fee2e2;
+    --shadow: 0 10px 28px rgba(32, 33, 39, .07);
+    --radius: 12px;
+    --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17181d;
+      --card: #202127;
+      --ink: #f2f2ef;
+      --muted: #b5b7c0;
+      --line: #3a3c45;
+      --soft: #292b32;
+      --accent: #a5b4fc;
+      --accent-text: #c7d2fe;
+      --accent-soft: #303158;
+      --good-text: #bbf7d0;
+      --good-soft: #173f2a;
+      --warn-text: #fde68a;
+      --warn-soft: #4a3715;
+      --bad-text: #fecaca;
+      --bad-soft: #4d2427;
+      --shadow: none;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 15.5px/1.62 var(--sans);
+  }
+  main { width: min(940px, calc(100% - 32px)); margin: 0 auto; padding: 56px 0 72px; }
+  header { margin-bottom: 34px; }
+  .eyebrow {
+    color: var(--accent-text);
+    font-size: 12px;
+    font-weight: 800;
+    letter-spacing: .13em;
+    text-transform: uppercase;
+  }
+  h1 { margin: .25rem 0 .7rem; font-size: clamp(2rem, 4.2vw, 3.35rem); line-height: 1.05; letter-spacing: -.035em; }
+  h2 { margin: 0 0 1rem; font-size: 1.55rem; line-height: 1.2; letter-spacing: -.015em; }
+  h3 { margin: 0; font-size: 1.18rem; line-height: 1.32; }
+  p, li { max-width: 74ch; }
+  a { color: var(--accent-text); text-underline-offset: 3px; }
+  code { font: .88em var(--mono); background: var(--soft); border-radius: 4px; padding: .08em .35em; }
+  .lede { max-width: 72ch; color: var(--muted); font-size: 1.08rem; }
+  .meta { color: var(--muted); font-size: .91rem; }
+  .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-top: 24px; }
+  .stat { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; box-shadow: var(--shadow); }
+  .stat strong { display: block; font-size: 1.5rem; line-height: 1.1; }
+  .stat span { color: var(--muted); font-size: .78rem; text-transform: uppercase; letter-spacing: .07em; }
+  section { margin-top: 44px; }
+  .panel, article.idea { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); }
+  .panel { padding: 22px 24px; }
+  .callout { background: var(--warn-soft); color: var(--warn-text); padding: 16px 18px; border-radius: 10px; margin: 18px 0; }
+  .callout strong { color: inherit; }
+  .axes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; padding: 0; list-style: none; }
+  .axes li { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  .axes strong { display: block; }
+  .axes span { color: var(--muted); font-size: .92rem; }
+  .jump { display: grid; gap: 8px; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; margin-bottom: 18px; }
+  .jump a { text-decoration: none; }
+  article.idea { padding: 24px; margin: 14px 0; }
+  .idea-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+  .rank { color: var(--accent-text); font: 800 1rem var(--mono); }
+  .chips { display: flex; flex-wrap: wrap; gap: 7px; margin: 12px 0 18px; }
+  .chip { border-radius: 999px; padding: 5px 9px; font-size: .76rem; font-weight: 750; border: 1px solid transparent; }
+  .axis-chip { background: var(--accent-soft); color: var(--accent-text); }
+  .conf-chip { background: var(--good-soft); color: var(--good-text); }
+  .cx-chip { background: var(--soft); color: var(--ink); border-color: var(--line); }
+  dl { display: grid; grid-template-columns: 110px 1fr; gap: 9px 16px; margin: 0; }
+  dt { color: var(--muted); font-size: .77rem; font-weight: 800; letter-spacing: .07em; text-transform: uppercase; }
+  dd { margin: 0; }
+  figure { margin: 24px 0 8px; background: var(--soft); border: 1px solid var(--line); border-radius: 10px; padding: 12px; overflow-x: auto; }
+  svg { display: block; width: 100%; min-width: 680px; height: auto; }
+  figcaption { color: var(--muted); font-size: .85rem; margin: 9px 5px 2px; }
+  .svg-label { font: 700 13px var(--sans); fill: var(--ink); }
+  .svg-small { font: 600 11px var(--sans); fill: var(--muted); }
+  .svg-step { fill: var(--card); stroke: var(--line); stroke-width: 1.5; }
+  .svg-accent { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.5; }
+  .svg-warn { fill: var(--warn-soft); stroke: var(--warn-text); stroke-width: 1.5; }
+  .svg-line { stroke: var(--muted); stroke-width: 1.5; fill: none; }
+  table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--line); font-size: .9rem; }
+  th, td { padding: 11px 12px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); }
+  th { background: var(--soft); color: var(--muted); font-size: .72rem; letter-spacing: .07em; text-transform: uppercase; }
+  tr:last-child td { border-bottom: 0; }
+  .refs { columns: 2; column-gap: 32px; }
+  .refs li { break-inside: avoid; margin-bottom: 8px; }
+  footer { color: var(--muted); font-size: .78rem; border-top: 1px solid var(--line); margin-top: 48px; padding-top: 18px; }
+  @media (max-width: 700px) {
+    main { width: min(100% - 22px, 940px); padding-top: 32px; }
+    .stats, .axes { grid-template-columns: 1fr; }
+    .idea-head { display: block; }
+    dl { grid-template-columns: 1fr; gap: 3px; }
+    dt { margin-top: 9px; }
+    .refs { columns: 1; }
+  }
+  @media print {
+    body { background: #fff; color: #111; }
+    main { width: 100%; padding: 0; }
+    .panel, article.idea, .stat { box-shadow: none; break-inside: avoid; }
+    a { color: inherit; }
+  }
+</style>
+</head>
+<body>
+<main>
+<header>
+  <div class="eyebrow">Ideation</div>
+  <h1>pro-gate simplification</h1>
+  <p class="lede">Replace caller-side interpretation with a few engine-owned, harness-neutral facts. Keep the machinery that proves identity, preserves charged work, and bounds spend; let thin Claude, Codex, and Pi adapters render those facts without recreating policy.</p>
+  <p class="meta">Date: <time datetime="2026-08-26">2026-08-26</time> · Topic: <code>pro-gate-simplification</code> · Focus: polish, subtraction, autonomous continuation, finite stopping · Mode: repo-grounded</p>
+  <div class="stats" aria-label="Ideation counts">
+    <div class="stat"><strong>40</strong><span>raw candidates</span></div>
+    <div class="stat"><strong>17</strong><span>after consolidation</span></div>
+    <div class="stat"><strong>5</strong><span>ranked survivors</span></div>
+    <div class="stat"><strong>5</strong><span>axes covered</span></div>
+  </div>
+</header>
+
+<section id="grounding-context">
+  <h2>Grounding Context</h2>
+  <div class="panel">
+    <p><strong>Codebase Context.</strong> Current truth is <code>origin/main</code> at <code>f2dfe5f</code>. pro-gate has durable safety state in the engine, but terminal interpretation is distributed across <code>SKILL.md</code>, <code>oracle-reviewer.md</code>, the daemon prompt, and shell exit/status surfaces. The skill and engine also make partly independent continuation decisions: caller prose uses verdict and finding semantics; the engine grants a base three rounds, earns more on shrinking open P0/P1 counts, brakes after two non-shrinks, and never exceeds eight.</p>
+    <p>The strongest direct example is the supplied PR&nbsp;#1983 transcript: after a connector could not verify the PR, the agent prepared a smaller exact-head bundle and then blocked on whether to spend a forced round. The question was unnecessary process even if the correct answer was “stop”; the system should have emitted an authoritative disposition rather than converting ambiguity into operator permission.</p>
+    <div class="callout"><strong>Evidence limit:</strong> the session-history corpus was degraded. Cass had a malformed canonical database, a stale lexical index, and 108 quarantined conversations. The readable evidence verified one bounded two-run stop and one premature/ambiguous recovery result, but it did not verify an endless same-head loop or a recurring authorization-question pattern. Ideas that required those stronger claims were cut.</div>
+    <p><strong>Preserved boundary.</strong> Nonce/provenance, reservation ownership, no-respend recovery, write-once artifacts, charge ordering, and a finite engine-level spend ceiling are safety mechanisms—not ceremony. The simplification target is the duplicated caller policy and protocol around them. External workflow-engine, controller, and SRE prior art reinforces the same shape: immutable input identity, typed outcomes, re-observation before action, and retries that cannot silently promote into semantic spend.</p>
+    <p><strong>Distribution and harness boundary.</strong> <code>hov-marketplace</code> distributes Claude-specific skill and agent prose from a pinned pro-gate commit, while the executable <code>bin/</code>, <code>lib/</code>, and daemon runtime ships separately as a version-matched release archive. Codex is evidenced as a direct shell caller; no Pi entry point or result adapter is documented in either inspected repository. Therefore the durable contract must live in the runtime as versioned shell/JSON outcomes, while Claude, Codex, and Pi remain thin renderers. Blocking observation must also have a snapshot form so no idea depends on one harness’s process lifetime or wake mechanism.</p>
+  </div>
+  <figure aria-labelledby="fig-before-after-caption">
+    <svg viewBox="0 0 900 292" role="img" aria-label="Current distributed interpretation compared with one engine-issued disposition">
+      <defs>
+        <marker id="arrow-one" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="currentColor"></path></marker>
+      </defs>
+      <text x="26" y="27" class="svg-label">Current: one verdict, several translators</text>
+      <rect x="28" y="48" width="130" height="52" rx="8" class="svg-step"></rect>
+      <text x="93" y="70" text-anchor="middle" class="svg-label">Review verdict</text>
+      <text x="93" y="87" text-anchor="middle" class="svg-small">+ exit / status</text>
+      <path d="M158 74 H198" class="svg-line" marker-end="url(#arrow-one)"></path>
+      <rect x="200" y="42" width="120" height="42" rx="8" class="svg-step"></rect>
+      <rect x="200" y="94" width="120" height="42" rx="8" class="svg-step"></rect>
+      <rect x="200" y="146" width="120" height="42" rx="8" class="svg-step"></rect>
+      <text x="260" y="68" text-anchor="middle" class="svg-label">Skill prose</text>
+      <text x="260" y="120" text-anchor="middle" class="svg-label">Reviewer relay</text>
+      <text x="260" y="172" text-anchor="middle" class="svg-label">Daemon prompt</text>
+      <path d="M320 63 H356 V194" class="svg-line"></path>
+      <path d="M320 115 H356" class="svg-line"></path>
+      <path d="M320 167 H356" class="svg-line"></path>
+      <rect x="358" y="126" width="112" height="68" rx="8" class="svg-warn"></rect>
+      <text x="414" y="151" text-anchor="middle" class="svg-label">Ask / poll</text>
+      <text x="414" y="169" text-anchor="middle" class="svg-label">recover / retry</text>
+      <text x="414" y="185" text-anchor="middle" class="svg-small">caller decides</text>
+
+      <line x1="495" y1="36" x2="495" y2="250" stroke="var(--line)" stroke-width="1"></line>
+      <text x="525" y="27" class="svg-label">Target: engine facts produce one disposition</text>
+      <rect x="525" y="48" width="142" height="64" rx="8" class="svg-step"></rect>
+      <text x="596" y="72" text-anchor="middle" class="svg-label">Verdict + state</text>
+      <text x="596" y="90" text-anchor="middle" class="svg-small">identity · spend · artifact</text>
+      <path d="M667 80 H704" class="svg-line" marker-end="url(#arrow-one)"></path>
+      <rect x="706" y="45" width="166" height="70" rx="8" class="svg-accent"></rect>
+      <text x="789" y="70" text-anchor="middle" class="svg-label">Terminal disposition</text>
+      <text x="789" y="88" text-anchor="middle" class="svg-small">actor · action · boundary</text>
+      <path d="M789 115 V145" class="svg-line" marker-end="url(#arrow-one)"></path>
+      <rect x="550" y="148" width="138" height="48" rx="8" class="svg-step"></rect>
+      <rect x="706" y="148" width="138" height="48" rx="8" class="svg-step"></rect>
+      <text x="619" y="169" text-anchor="middle" class="svg-label">Safe action</text>
+      <text x="619" y="186" text-anchor="middle" class="svg-small">continue autonomously</text>
+      <text x="775" y="169" text-anchor="middle" class="svg-label">Specific decision</text>
+      <text x="775" y="186" text-anchor="middle" class="svg-small">human only if required</text>
+      <path d="M789 145 H619 V148" class="svg-line"></path>
+      <text x="26" y="267" class="svg-small">Safety stores remain; the translation and permission ritual disappears.</text>
+    </svg>
+    <figcaption id="fig-before-after-caption">Illustrative before/after. The proposal centralizes state-to-action interpretation; it does not make the engine the merge authority.</figcaption>
+  </figure>
+</section>
+
+<section id="topic-axes">
+  <h2>Topic Axes</h2>
+  <ul class="axes">
+    <li><strong>Terminal ownership</strong><span>Who acts after a verdict or anomaly, and when a human decision is genuinely necessary.</span></li>
+    <li><strong>Semantic round progression</strong><span>When another expensive review is earned, forbidden, or terminal.</span></li>
+    <li><strong>Run observation and recovery</strong><span>How callers wait, reattach, and collect charged work without redispatch.</span></li>
+    <li><strong>Identity and spend safety</strong><span>How verdict applicability, provenance, reservations, and no-respend recovery remain exact.</span></li>
+    <li><strong>Agent-facing protocol surface</strong><span>How many commands, exit codes, state translations, and synchronized narratives callers must understand.</span></li>
+  </ul>
+</section>
+
+<section id="ranked-ideas">
+  <h2>Ranked Ideas</h2>
+  <nav class="jump" aria-label="Ranked idea links">
+    <a href="#idea-1">1. Terminal disposition, not terminal question</a>
+    <a href="#idea-2">2. Snapshot + wait observer replaces caller polling</a>
+    <a href="#idea-3">3. Exact-input passport for every verdict</a>
+    <a href="#idea-4">4. Versioned typed outcomes with harness-local renderers</a>
+    <a href="#idea-5">5. One engine-issued round disposition—without a finding ledger</a>
+  </nav>
+
+  <article class="idea" id="idea-1">
+    <div class="idea-head"><h3><span class="rank">1.</span> Terminal disposition, not terminal question</h3></div>
+    <div class="chips"><span class="chip axis-chip">Terminal ownership</span><span class="chip conf-chip">Confidence 94%</span><span class="chip cx-chip">Complexity Medium</span></div>
+    <dl>
+      <dt>Description</dt><dd>Persist one marker-addressed terminal disposition in the shared runtime, binding reviewed input identity, verdict, unresolved findings, spend and round state, branch-preservation rule, a harness-neutral next actor, and exactly one permitted next transition. <code>NEEDS-DISCUSSION</code> becomes either a named safe capability or a compact, specific operator decision—not a Claude-specific question or tool call.</dd>
+      <dt>Basis</dt><dd><code>direct:</code> current code captures verdicts while the skill separately determines terminal behavior; durable marker, artifact, and status machinery already exists.</dd>
+      <dt>Rationale</dt><dd>This directly fixes the supplied failure with the smallest authoritative seam. It lets agents continue whenever policy already authorizes the next move while preserving the branch and stopping spend when judgment is genuinely external.</dd>
+      <dt>Downsides</dt><dd>The disposition vocabulary becomes a compatibility contract. The engine must report authority boundaries without accidentally granting merge or fix authority it does not own.</dd>
+    </dl>
+  </article>
+
+  <article class="idea" id="idea-2">
+    <div class="idea-head"><h3><span class="rank">2.</span> Snapshot + wait observer replaces caller polling</h3></div>
+    <div class="chips"><span class="chip axis-chip">Run observation and recovery</span><span class="chip conf-chip">Confidence 92%</span><span class="chip cx-chip">Complexity Medium</span></div>
+    <dl>
+      <dt>Description</dt><dd>Add marker-addressed <code>observe --once</code> and <code>observe --wait</code> modes over the same durable state. Snapshot mode returns immediately; wait mode blocks without tokens until a meaningful transition or typed terminal observation. Neither can dispatch, reserve, substitute input, or impose a submission timeout; observer death leaves the charged run and recovery artifacts intact.</dd>
+      <dt>Basis</dt><dd><code>direct:</code> the skill, relay, and daemon each narrate their own polling and harvest loop despite atomic state publication and durable no-spend recovery. Claude also has process-duration constraints that Codex and Pi need not share.</dd>
+      <dt>Rationale</dt><dd>Waiting is control-plane labor, not judgment. A portable runtime primitive lets Claude detach or wake, Codex block or re-query, and Pi use whichever mode its harness supports—without making any notification mechanism part of the contract.</dd>
+      <dt>Downsides</dt><dd>Both modes must be proven incapable of dispatch and lifecycle ownership. Adapters still decide how to schedule or present observation. A stale, unmerged <code>--wait</code> branch is historical evidence—not code to revive blindly.</dd>
+    </dl>
+  </article>
+
+  <article class="idea" id="idea-3">
+    <div class="idea-head"><h3><span class="rank">3.</span> Exact-input passport for every verdict</h3></div>
+    <div class="chips"><span class="chip axis-chip">Identity and spend safety</span><span class="chip conf-chip">Confidence 89%</span><span class="chip cx-chip">Complexity Medium</span></div>
+    <dl>
+      <dt>Description</dt><dd>Bind every result, reservation, capture, round record, disposition, and handoff to one immutable review-input identity: canonical repository and PR, exact head when applicable, normalized bundle or diff digest, mode, policy version, spend key, and marker. Old work remains recoverable but is explicitly superseded for changed input.</dd>
+      <dt>Basis</dt><dd><code>direct:</code> runtime markers and nonce prove attempt and prompt provenance, but current runtime identity does not prove exact-head applicability.</dd>
+      <dt>Rationale</dt><dd>Deepening one invariant makes surrounding exact-head narration, hashes pasted into comments, and manual “is this still current?” ceremony deletable. Provenance answers who produced the review; the passport also answers what it still applies to.</dd>
+      <dt>Downsides</dt><dd>Normalization across connector, bundle, and both modes is subtle. Existing artifacts need a compatibility state rather than being declared current or discarded.</dd>
+    </dl>
+  </article>
+
+  <article class="idea" id="idea-4">
+    <div class="idea-head"><h3><span class="rank">4.</span> Versioned typed outcomes with harness-local renderers</h3></div>
+    <div class="chips"><span class="chip axis-chip">Agent-facing protocol surface</span><span class="chip conf-chip">Confidence 88%</span><span class="chip cx-chip">Complexity Medium</span></div>
+    <dl>
+      <dt>Description</dt><dd>Promote engine state to a versioned typed outcome containing <code>protocol_version</code>, category, reason, spend or retry class, currentness, actor, exact safe command or capability, and artifact references. Claude, Codex, and Pi adapters render their own concise action guidance from that schema; audience-specific judgment prose remains hand-written.</dd>
+      <dt>Basis</dt><dd><code>direct:</code> current status exposes rich internal classifications as a boolean <code>recoverable</code> plus free-text <code>next_step</code>; skill, relay, and daemon independently translate exits and phases and have already drifted. The HOV marketplace card is static installation metadata, not a per-run outcome surface.</dd>
+      <dt>Rationale</dt><dd>One runtime contract lets every harness delete parsing and synchronized state-to-action narratives without forcing their interaction models to match. A protocol version also gives direct Codex and Pi callers the compatibility check Claude currently gets from plugin/runtime version matching.</dd>
+      <dt>Downsides</dt><dd>Schema evolution becomes public API work, and each adapter needs its own distribution and conformance fixture. Pi’s current adapter path is undocumented, so compatibility is a required proof rather than an assumption.</dd>
+    </dl>
+  </article>
+
+  <article class="idea" id="idea-5">
+    <div class="idea-head"><h3><span class="rank">5.</span> One engine-issued round disposition—without a finding ledger</h3></div>
+    <div class="chips"><span class="chip axis-chip">Semantic round progression</span><span class="chip conf-chip">Confidence 74%</span><span class="chip cx-chip">Complexity Medium</span></div>
+    <dl>
+      <dt>Description</dt><dd>Have the shared shell engine combine verdict class and its existing trajectory and budget facts into one round disposition: terminal ship, terminal discussion, eligible after fixes, stop non-shrinking, or budget denied. Keep nuanced fix and dispute narration in each harness adapter, but forbid any caller from treating spare numerical budget as semantic permission after a terminal verdict.</dd>
+      <dt>Basis</dt><dd><code>direct:</code> the skill and engine currently govern continuation with different signals and neither consumes the other’s authoritative disposition; <code>NEEDS-DISCUSSION</code> is terminal only in caller prose.</dd>
+      <dt>Rationale</dt><dd>This removes one layer of stop-policy recomputation without inventing stable identities for free-form findings. It preserves the engine’s finite spend backstop and makes terminal verdict semantics impossible to bypass through a direct caller.</dd>
+      <dt>Downsides</dt><dd>A deliberately small policy cannot encode every disputed-versus-acknowledged nuance. The boundary between engine facts and caller judgment must stay explicit.</dd>
+    </dl>
+  </article>
+
+  <figure aria-labelledby="fig-stack-caption">
+    <svg viewBox="0 0 900 300" role="img" aria-label="Five simplification ideas arranged as a layered review control flow">
+      <defs>
+        <marker id="arrow-two" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="currentColor"></path></marker>
+      </defs>
+      <text x="28" y="28" class="svg-label">A smaller normal path; safety mechanisms stay behind it</text>
+      <rect x="28" y="54" width="150" height="62" rx="8" class="svg-accent"></rect>
+      <text x="103" y="78" text-anchor="middle" class="svg-label">1 · Input passport</text>
+      <text x="103" y="96" text-anchor="middle" class="svg-small">what this review applies to</text>
+      <path d="M178 85 H213" class="svg-line" marker-end="url(#arrow-two)"></path>
+      <rect x="215" y="54" width="150" height="62" rx="8" class="svg-step"></rect>
+      <text x="290" y="78" text-anchor="middle" class="svg-label">2 · Review run</text>
+      <text x="290" y="96" text-anchor="middle" class="svg-small">existing safety core</text>
+      <path d="M365 85 H400" class="svg-line" marker-end="url(#arrow-two)"></path>
+      <rect x="402" y="54" width="150" height="62" rx="8" class="svg-accent"></rect>
+      <text x="477" y="78" text-anchor="middle" class="svg-label">3 · Observe</text>
+      <text x="477" y="96" text-anchor="middle" class="svg-small">snapshot or wait, no spend</text>
+      <path d="M552 85 H587" class="svg-line" marker-end="url(#arrow-two)"></path>
+      <rect x="589" y="54" width="150" height="62" rx="8" class="svg-accent"></rect>
+      <text x="664" y="78" text-anchor="middle" class="svg-label">4 · Disposition</text>
+      <text x="664" y="96" text-anchor="middle" class="svg-small">actor and one next action</text>
+      <path d="M739 85 H774" class="svg-line" marker-end="url(#arrow-two)"></path>
+      <rect x="776" y="54" width="96" height="62" rx="8" class="svg-step"></rect>
+      <text x="824" y="78" text-anchor="middle" class="svg-label">5 · Adapter</text>
+      <text x="824" y="96" text-anchor="middle" class="svg-small">render outcome</text>
+
+      <rect x="215" y="174" width="337" height="64" rx="8" class="svg-warn"></rect>
+      <text x="383" y="198" text-anchor="middle" class="svg-label">Round disposition controls re-entry</text>
+      <text x="383" y="217" text-anchor="middle" class="svg-small">verdict + existing trajectory · finite ceiling remains</text>
+      <path d="M664 116 V206 H552" class="svg-line" marker-end="url(#arrow-two)"></path>
+      <path d="M215 206 H150 V116" class="svg-line" marker-end="url(#arrow-two)"></path>
+      <text x="28" y="274" class="svg-small">Runtime exposes passport, observation, and disposition; harness adapters render outcomes without learning safety stores.</text>
+    </svg>
+    <figcaption id="fig-stack-caption">Illustrative relationship among the five survivors. This is a direction map, not an implementation sequence or architecture specification.</figcaption>
+  </figure>
+</section>
+
+<section id="rejection-summary">
+  <h2>Rejection Summary</h2>
+  <table>
+    <thead><tr><th>#</th><th>Idea considered</th><th>Reason rejected or folded</th></tr></thead>
+    <tbody>
+      <tr><td>C01</td><td>Autonomy envelope</td><td>Adds a second authorization protocol and is dominated by the smaller terminal-disposition seam.</td></tr>
+      <tr><td>C03 original</td><td>Per-finding progression ledger</td><td>Free-form finding identity is expensive and unreliable; only the narrowed engine round disposition survives.</td></tr>
+      <tr><td>C04</td><td>One-shot evidence substitution</td><td>Basis refuted: one connector incident does not establish a generally safe charged substitution lane.</td></tr>
+      <tr><td>C06</td><td>Reconcile-and-act normal command</td><td>The completeness claim is under-proven; typed outcomes plus a no-spend observer are smaller seams.</td></tr>
+      <tr><td>C08</td><td>Full protocol manifest/compiler</td><td>Known drift warrants shared semantics and tests, not generation of every skill, daemon, help, and docs surface.</td></tr>
+      <tr><td>C10</td><td>Human decision token</td><td>Adds an authorization lifecycle without evidence that a durable terminal handoff cannot resume work.</td></tr>
+      <tr><td>C11</td><td>Sole lifecycle ledger</td><td>Replatforms deliberately distinct atomic stores and introduces synchronization and replay failure modes.</td></tr>
+      <tr><td>C12</td><td>Retry-budget firewall</td><td>Existing controls already implement the useful distinction; a new taxonomy adds vocabulary more than control.</td></tr>
+      <tr><td>C13</td><td>Hold, don’t halt</td><td>Useful presentation behavior, but it is a field of terminal disposition rather than an independent mechanism.</td></tr>
+      <tr><td>C14</td><td>Authority-bounded continuation state machine</td><td>Combines several unverified mechanisms and is larger than the terminal-disposition seam.</td></tr>
+      <tr><td>C15</td><td>Evidence-transition pipeline</td><td>Inherits the refuted substitution premise and overclaims exhaustive post-review continuation.</td></tr>
+      <tr><td>C16</td><td>Durable review handle</td><td>Coherent but overlaps the observer and typed-outcome survivors; revisit only if those smaller seams prove insufficient.</td></tr>
+      <tr><td>C17</td><td>Generated deletion loop</td><td>Manifest-to-prose compilation recreates process burden; targeted tests and typed outcomes suffice.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="grounding-references">
+  <h2>Grounding References</h2>
+  <ul class="refs">
+    <li><a href="https://github.com/StartupBros-com/pro-gate/blob/main/skills/pro-gate/SKILL.md">Caller policy and convergence protocol</a></li>
+    <li><a href="https://github.com/StartupBros-com/pro-gate/blob/main/agents/oracle-reviewer.md">Reviewer relay and recovery contract</a></li>
+    <li><a href="https://github.com/StartupBros-com/pro-gate/blob/main/lib/pro-gate-lib.sh">Round governor, reservations, status, and identity helpers</a></li>
+    <li><a href="https://github.com/StartupBros-com/pro-gate/blob/main/bin/oracle-review.sh">Engine entry points and state transitions</a></li>
+    <li><a href="https://github.com/StartupBros-com/pro-gate/blob/main/scripts/package-runtime.sh">Runtime/plugin distribution boundary</a></li>
+    <li><a href="https://github.com/StartupBros-com/hov-marketplace/blob/main/.claude-plugin/marketplace.json">HOV marketplace pinned plugin source</a></li>
+    <li><a href="https://github.com/StartupBros-com/hov-marketplace/blob/main/scripts/validate-marketplace.sh">Marketplace card and source validation</a></li>
+    <li><a href="https://github.com/StartupBros-com/pro-gate/blob/main/docs/ideation/2026-08-17-pro-gate-gate-run-ux-ideation.html">Prior gate-run UX and performance ideation</a></li>
+    <li><a href="https://github.com/StartupBros-com/pro-gate/blob/main/docs/solutions/conventions/ship-the-legible-core-let-the-gate-decline-fragile-automation.md">Ship the legible core; decline fragile automation</a></li>
+    <li><a href="https://docs.temporal.io/encyclopedia/retry-policies">Temporal retry policies</a></li>
+    <li><a href="https://docs.aws.amazon.com/step-functions/latest/dg/concepts-error-handling.html">AWS Step Functions error handling</a></li>
+    <li><a href="https://kubernetes.io/docs/concepts/architecture/controller/">Kubernetes controller pattern</a></li>
+    <li><a href="https://sre.google/sre-book/addressing-cascading-failures/">SRE retry-budget and cascading-failure guidance</a></li>
+  </ul>
+</section>
+
+<footer class="composition-signal">Composed 2026-08-26T22:41Z and refined 2026-08-26T23:23Z by ce-ideate from the user’s pro-gate simplification prompt, current <code>origin/main</code>, local session-history evidence, HOV marketplace distribution evidence, and external workflow-engine prior art.</footer>
+</main>
+</body>
+</html>
