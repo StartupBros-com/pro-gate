@@ -108,8 +108,24 @@ July 2026). The Pro model spends that long reasoning; the engine is built around
   recoverable.
 - **Review-only authority.** The gate never merges, and committed work stays on the branch
   at any stop; unresolved findings escalate to a human instead of triggering a revert.
-- **One engine, thin surfaces.** The skill, the relay agent, and the daemon all call
-  `oracle-review.sh`; caller contracts change in the same PR as the engine.
+- **One engine, thin surfaces.** The skill, relay agent, and daemon share the runtime contract;
+  caller contracts change in the same PR as the engine.
+
+## Typed review-decision contract
+
+The interactive skill and Oracle relay dispatch the runtime's closed `review-decision/v1` contract,
+not independently inferred verdicts, phases, exit codes, recoverability, or round state. The
+contract binds normalized facts and results to one of eight actions: collect an existing result,
+recover existing work, run a granted review, fix findings, prepare matching evidence, stop, hand
+off to the existing merge workflow, or ask a named product choice.
+
+Only a named product choice can prompt; its answer is freshness-validated and never independently
+authorizes a runtime effect. Missing, malformed, unknown, stale, or version/corpus-mismatched
+decisions stop and show the exact matching runtime update path rather than starting a fresh review.
+Raw review and repository text are untrusted adapter input and are never used as action policy.
+
+This changes neither review provenance nor merge authority: the runtime remains the Oracle
+transport, the gate stops before merge, and you retain merge authority.
 
 ## Requirements
 
