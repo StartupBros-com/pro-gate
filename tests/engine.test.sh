@@ -4027,4 +4027,57 @@ check 'result binding is the only marker-bound sibling and validates input/artif
      && [ "$(find "$BIND_HOME" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort | tr '\n' ' ')" = 'review-input-bindings review-result-bindings ' ]; echo $?)" \
   "rc=$RESULT_RC dirs=$(find "$BIND_HOME" -mindepth 1 -maxdepth 1 -type d -printf '%f ' 2>/dev/null)"
 
+# U2: the typed resolution surface is advisory and strictly read-only. It must normalize a
+# canonical local PR target and bare supplied diff without starting the existing engine path.
+echo '# U2: review-decision CLI resolution is read-only and proof-bounded'
+DECISION_HOME="$TDIR/home-review-decision"
+DECISION_REPO="$TDIR/review-decision-repo"
+mkdir -p "$DECISION_REPO"
+git -C "$DECISION_REPO" init -q
+git -C "$DECISION_REPO" config user.email test@example.invalid
+git -C "$DECISION_REPO" config user.name 'Engine Test'
+printf 'one\n' > "$DECISION_REPO/file.txt"
+git -C "$DECISION_REPO" add file.txt && git -C "$DECISION_REPO" commit -qm initial
+git -C "$DECISION_REPO" remote add origin https://github.com/acme/widgets.git
+printf '%s\n' 'diff --git a/file.txt b/file.txt' '--- a/file.txt' '+++ b/file.txt' '@@ -1 +1 @@' '-one' '+two' > "$TDIR/review-decision.patch"
+env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 \
+  bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/review-decision.patch" --input bundle \
+  >"$TDIR/review-decision.json" 2>"$TDIR/review-decision.err"
+DECISION_RC=$?
+check 'review-decision resolves a bare diff as an advisory bounded stop' \
+  "$([ "$DECISION_RC" -eq 0 ] && jq -e '.action == "stop-without-new-review" and .reason == "unproven-input" and .effect_request.target.pr == 1983' "$TDIR/review-decision.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$DECISION_RC output=$(cat "$TDIR/review-decision.json") stderr=$(cat "$TDIR/review-decision.err")"
+check 'review-decision query creates no durable state, lock, sidecar, cache, or binding' \
+  "$([ ! -e "$DECISION_HOME" ]; echo $?)" \
+  "state=$(find "$DECISION_HOME" -mindepth 1 -maxdepth 2 -print 2>/dev/null | tr '\n' ' ')"
+
+# A connector binding must carry the immutable canonical repository target and exact current
+# commit. The query may grant a matching review, but an advisory effect re-entry after HEAD moves
+# must return the newly reduced stop rather than use the old request as a capability.
+DECISION_HEAD="$(git -C "$DECISION_REPO" rev-parse HEAD)"
+DECISION_MARKER='pg-run-acme-widgets-1983-1700012000-1'
+DECISION_BINDING="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg head "$DECISION_HEAD" '{charged_spend_epoch:1700012000,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:"connector-current",mode:"connector",proof:{commit_target:$head,endpoint_digest:null,raw_diff_digest:null,repository_target:"github.com/acme/widgets"}},marker:"pg-run-acme-widgets-1983-1700012000-1",record_type:"review-input-binding/v1",record_version:1,repository:{host:"github.com",owner:"acme",repo:"widgets"},target:{head_oid:$head,kind:"pull-request",pr:1983}}')"
+PRO_GATE_HOME="$DECISION_HOME" pg_review_input_binding_write "$DECISION_MARKER" "$DECISION_BINDING"
+env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 \
+  bash "$ENGINE" --review-decision --repo "$DECISION_REPO" --pr 1983 --input connector \
+  >"$TDIR/review-decision-run.json" 2>"$TDIR/review-decision-run.err"
+DECISION_RUN_RC=$?
+check 'review-decision accepts only the immutable connector target at its exact bound head' \
+  "$([ "$DECISION_RUN_RC" -eq 0 ] && jq -e '.action == "run-granted-review" and .facts.input.proven and .facts.input.binding_valid and .facts.evidence.identity == "connector-current"' "$TDIR/review-decision-run.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$DECISION_RUN_RC output=$(cat "$TDIR/review-decision-run.json") stderr=$(cat "$TDIR/review-decision-run.err")"
+printf 'two\n' > "$DECISION_REPO/file.txt"
+git -C "$DECISION_REPO" add file.txt && git -C "$DECISION_REPO" commit -qm moved-head
+DECISION_STATE_BEFORE="$(find "$DECISION_HOME" -mindepth 1 -maxdepth 2 -printf '%P\n' | sort)"
+env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 \
+  bash "$ENGINE" --review-decision --review-decision-effect "$TDIR/review-decision-run.json" --repo "$DECISION_REPO" --pr 1983 --input connector \
+  >"$TDIR/review-decision-replacement.json" 2>"$TDIR/review-decision-replacement.err"
+DECISION_REPLACEMENT_RC=$?
+DECISION_STATE_AFTER="$(find "$DECISION_HOME" -mindepth 1 -maxdepth 2 -printf '%P\n' | sort)"
+check 'stale review-decision effect returns the freshly reduced replacement action' \
+  "$([ "$DECISION_REPLACEMENT_RC" -eq 0 ] && jq -e '.action == "stop-without-new-review" and .reason == "unproven-input"' "$TDIR/review-decision-replacement.json" >/dev/null 2>&1 && ! cmp -s "$TDIR/review-decision-run.json" "$TDIR/review-decision-replacement.json"; echo $?)" \
+  "rc=$DECISION_REPLACEMENT_RC output=$(cat "$TDIR/review-decision-replacement.json") stderr=$(cat "$TDIR/review-decision-replacement.err")"
+check 'effect re-resolution creates no lock, cache, sidecar, or binding mutation' \
+  "$([ "$DECISION_STATE_BEFORE" = "$DECISION_STATE_AFTER" ]; echo $?)" \
+  "before=$DECISION_STATE_BEFORE after=$DECISION_STATE_AFTER"
+
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }
