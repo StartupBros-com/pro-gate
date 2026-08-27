@@ -1978,6 +1978,22 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
       "$(jq -r .reservation.marker <<<"$canonical")"; return
   fi
 
+  # A missing but safely preparable evidence relation must reach the preparer before the absent
+  # input binding can stop it. Unsafe/invalid/undefined evidence is still terminal, while a
+  # matching relation remains unable to authorize a run until its input binding is proven.
+  case "$(jq -r .evidence.state <<<"$canonical")" in
+    missing)
+      if [ "$(jq -r .evidence.safe_to_prepare <<<"$canonical")" = true ]; then
+        pg_review_decision_emit prepare-matching-review-evidence matching-evidence-requires-preparation "$canonical" "$snapshot"
+      else
+        pg_review_decision_emit stop-without-new-review evidence-preparation-unsafe "$canonical" "$snapshot"
+      fi
+      return ;;
+    unsafe|invalid)
+      pg_review_decision_emit stop-without-new-review no-safe-action "$canonical" "$snapshot"; return ;;
+    undefined)
+      pg_review_decision_emit stop-without-new-review undefined-state "$canonical" "$snapshot"; return ;;
+  esac
   if [ "$(jq -r '.input.proven' <<<"$canonical")" != true ]; then
     pg_review_decision_emit stop-without-new-review unproven-input "$canonical" "$snapshot"; return
   fi
@@ -2025,19 +2041,6 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
       <<<"$canonical" >/dev/null 2>&1; then
     pg_review_decision_emit stop-without-new-review identical-code-and-evidence "$canonical" "$snapshot"; return
   fi
-  case "$(jq -r .evidence.state <<<"$canonical")" in
-    missing)
-      if [ "$(jq -r .evidence.safe_to_prepare <<<"$canonical")" = true ]; then
-        pg_review_decision_emit prepare-matching-review-evidence matching-evidence-requires-preparation "$canonical" "$snapshot"
-      else
-        pg_review_decision_emit stop-without-new-review evidence-preparation-unsafe "$canonical" "$snapshot"
-      fi
-      return ;;
-    unsafe|invalid)
-      pg_review_decision_emit stop-without-new-review no-safe-action "$canonical" "$snapshot"; return ;;
-    undefined)
-      pg_review_decision_emit stop-without-new-review undefined-state "$canonical" "$snapshot"; return ;;
-  esac
   if [ "$(jq -r .governor.granted <<<"$canonical")" != true ]; then
     pg_review_decision_emit stop-without-new-review round-governor-denied "$canonical" "$snapshot"; return
   fi
