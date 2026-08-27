@@ -108,7 +108,7 @@ pg_out_guard_acquire() {
   return 0
 }
 
-PR=""; REPO=""; DIFF_FILE=""; INPUT="both"; OUT=""; TIMEOUT="30m"; EXTRA_GLOB=""; HARVEST_MARKER=""; HARVEST_REQUESTED=0; CONFIRM_FILE=""
+PR=""; REPO=""; DIFF_FILE=""; DIFF_IS_CALLER_SUPPLIED=0; INPUT="both"; OUT=""; TIMEOUT="30m"; EXTRA_GLOB=""; HARVEST_MARKER=""; HARVEST_REQUESTED=0; CONFIRM_FILE=""
 STATUS_REQUESTED=0; STATUS_QUERY=""; AS_JSON=0; RECOVER_REQUESTED=0; RECOVER_QUERY=""
 REVIEW_DECISION_REQUESTED=0; REVIEW_DECISION_EFFECT_FILE=""
 while [ $# -gt 0 ]; do
@@ -128,7 +128,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --pr) PR="$2"; shift 2;;
     --repo) REPO="$2"; shift 2;;
-    --diff) DIFF_FILE="$2"; shift 2;;
+    --diff) DIFF_FILE="$2"; DIFF_IS_CALLER_SUPPLIED=1; shift 2;;
     --input) INPUT="$2"; shift 2;;
     --out) OUT="$2"; shift 2;;
     --timeout) TIMEOUT="$2"; shift 2;;
@@ -162,10 +162,39 @@ fi
 # the regular engine's housekeeping, browser preflight, locks, reconciliation, status sidecars,
 # slots, round recording, or binding/publication writes: the answer is advisory until an effect
 # boundary assembles the same facts again. The U1 reducer remains the sole policy authority.
+pg_review_decision_repair_result_binding() { # marker input-binding-json
+  local marker="$1" input="$2" artifact verdict input_digest accepted epoch base head proof result lock
+  pg_reservation_marker_ok "$marker" || return 1
+  artifact="$(pg_completed_dir)/$marker"
+  [ -f "$artifact" ] && [ ! -L "$artifact" ] && pg_is_review "$artifact" || return 1
+  input_digest="$(pg_review_sha256_text "$input")" || return 1
+  verdict="$(pg_extract_verdict "$artifact")"
+  case "$verdict" in SHIP|FIX-FIRST|NEEDS-DISCUSSION) ;; *) return 1;; esac
+  epoch="$(jq -r .charged_spend_epoch <<<"$input")"
+  case "$epoch" in ''|*[!0-9]*) return 1;; esac
+  accepted="$(date +%s)"
+  proof=null
+  if [ "$verdict" = SHIP ]; then
+    [ "$(jq -r .evidence.mode <<<"$input")" = full-pr ] || return 1
+    base="$(jq -r .evidence.proof.base_oid <<<"$input")"; head="$(jq -r .evidence.proof.head_oid <<<"$input")"
+    proof="$(jq -cnS --arg base "$base" --arg head "$head" --arg digest "$(jq -r .evidence.proof.raw_patch_digest <<<"$input")" '{base_oid:$base,diff_digest:$digest,head_oid:$head}')" || return 1
+  fi
+  result="$(jq -cnS --arg cd "$(pg_review_decision_contract_digest)" --arg marker "$marker" --arg digest "$(pg_sha256 "$artifact")" \
+    --arg ib "$input_digest" --arg verdict "$verdict" --argjson accepted "$accepted" --argjson proof "$proof" \
+    '{accepted_epoch:$accepted,artifact:{digest:$digest,path:("completed/"+$marker)},contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,input_binding_digest:$ib,input_binding_identity:$marker,marker:$marker,named_choice:null,provenance:{outcome:"accepted",validated_epoch:$accepted},record_type:"review-result-binding/v1",record_version:1,ship_proof:$proof,verdict:$verdict}')" || return 1
+  lock="${PRO_GATE_REVIEW_DECISION_LOCK_DIR:-$PRO_GATE_HOME/review-decision-locks}/$marker"
+  mkdir -p "$(dirname "$lock")" 2>/dev/null || return 1
+  pg_lock "$lock" "${PRO_GATE_REVIEW_EFFECT_LOCK_WAIT:-5}" || return 1
+  # The no-clobber artifact was already persisted. This only installs its one immutable sibling;
+  # a byte-identical replay succeeds, while a conflicting sibling remains collect-only.
+  pg_review_result_binding_write "$marker" "$result"
+}
+
 pg_review_decision_cli() {
   local repo pr_num remote ident host owner repo_name head base raw_digest round_key
   local input_proven=false input_binding_valid=false input_identity evidence_identity evidence_state
   local input_marker="" input_record="" input_digest="" f marker candidate mode active_marker="" active_state=none
+  local endpoint reviewed manifest confirmation endpoint_digest reviewed_digest manifest_digest confirmation_digest lineage
   local reservation_marker="" reservation_state=none governor_granted=false completed='[]' result artifact artifact_digest
   local facts decision effect_ok=false
 
@@ -215,13 +244,39 @@ pg_review_decision_cli() {
           <<<"$candidate" >/dev/null 2>&1 || continue
         input_proven=true ;;
       full-pr)
-        # A local --diff is not endpoint proof. Full-PR applicability therefore remains false
-        # until an effect/query owner supplies independently acquired endpoint bytes.
-        continue ;;
+        # A local --diff remains bare evidence. Full-PR applicability requires the independently
+        # acquired, bounded endpoint patch as well as the separately retained raw patch bytes.
+        endpoint="${PRO_GATE_REVIEW_ENDPOINT_PATCH:-}"
+        [ -n "$endpoint" ] && [ -f "$endpoint" ] && [ ! -L "$endpoint" ] || continue
+        [ "$(wc -c < "$endpoint" 2>/dev/null | tr -d ' ')" -le 26214400 ] || continue
+        endpoint_digest="$(pg_sha256 "$endpoint")"
+        [ -n "$endpoint_digest" ] && [ -n "$raw_digest" ] || continue
+        jq -e --arg base "$base" --arg head "$head" --arg endpoint "$endpoint_digest" --arg raw "$raw_digest" '
+          .evidence.proof.base_oid==$base and .evidence.proof.head_oid==$head and
+          .evidence.proof.endpoint_digest==$endpoint and .evidence.proof.raw_patch_digest==$raw' \
+          <<<"$candidate" >/dev/null 2>&1 || continue
+        input_proven=true ;;
       scoped-delta)
-        # The binding validator establishes shape, but the CLI cannot promote an arbitrary
-        # attachment or confirmation into its recorded lineage without a dedicated lineage proof.
-        continue ;;
+        # A scoped payload never implies full PR coverage: retain exact raw/reviewed bytes, a
+        # filtering manifest, and a validated confirmation lineage tied to the bound end OID.
+        reviewed="${DIFF_FILE:-}"; manifest="${PRO_GATE_REVIEW_FILTER_MANIFEST:-}"; confirmation="${CONFIRM_FILE:-}"
+        [ -n "$reviewed" ] && [ -f "$reviewed" ] && [ ! -L "$reviewed" ] || continue
+        [ -n "$manifest" ] && [ -f "$manifest" ] && [ ! -L "$manifest" ] || continue
+        [ -n "$confirmation" ] && [ -f "$confirmation" ] && [ ! -L "$confirmation" ] || continue
+        [ "$(wc -c < "$reviewed" 2>/dev/null | tr -d ' ')" -le 26214400 ] || continue
+        [ "$(wc -c < "$manifest" 2>/dev/null | tr -d ' ')" -le 65536 ] || continue
+        [ "$(wc -c < "$confirmation" 2>/dev/null | tr -d ' ')" -le 262144 ] || continue
+        pg_is_review "$confirmation" || continue
+        reviewed_digest="$(pg_sha256 "$reviewed")"; manifest_digest="$(pg_sha256 "$manifest")"
+        confirmation_digest="$(pg_sha256 "$confirmation")"; lineage="confirmation:${confirmation_digest}"
+        [ -n "$raw_digest" ] && [ -n "$reviewed_digest" ] && [ -n "$manifest_digest" ] && [ -n "$confirmation_digest" ] || continue
+        jq -e --arg base "$base" --arg end "$head" --arg raw "$raw_digest" --arg reviewed "$reviewed_digest" \
+          --arg manifest "$manifest_digest" --arg lineage "$lineage" '
+          .evidence.proof.base_oid==$base and .evidence.proof.end_oid==$end and
+          .evidence.proof.raw_digest==$raw and .evidence.proof.reviewed_payload_digest==$reviewed and
+          .evidence.proof.filtering_manifest_digest==$manifest and .evidence.proof.lineage_identity==$lineage' \
+          <<<"$candidate" >/dev/null 2>&1 || continue
+        input_proven=true ;;
       *) continue ;;
     esac
     input_marker="$marker"; input_record="$candidate"
@@ -268,6 +323,16 @@ pg_review_decision_cli() {
     done
   fi
 
+  # Canonical bytes that survived a crash before binding installation are collectable recovery
+  # facts, never terminal facts. A matching collect effect performs the marker-locked repair.
+  if [ -n "$input_marker" ] && [ -f "$(pg_completed_dir)/$input_marker" ] \
+     && [ ! -L "$(pg_completed_dir)/$input_marker" ] && pg_is_review "$(pg_completed_dir)/$input_marker" \
+     && ! pg_review_result_binding_read "$input_marker" >/dev/null 2>&1; then
+    artifact_digest="$(pg_sha256 "$(pg_completed_dir)/$input_marker")"
+    completed="$(jq -cS --arg marker "$input_marker" --arg artifact "$artifact_digest" --argjson epoch "$(jq -r .charged_spend_epoch <<<"$input_record")" \
+      '. + [{applicable:true,artifact_digest:$artifact,binding_valid:false,canonical_identity:$marker,charged_spend_epoch:$epoch,collected:false,legacy:false,marker:$marker,provenance_valid:false,verdict:"NONE"}]' <<<"$completed")"
+  fi
+
   facts="$(jq -cnS --arg h "$host" --arg o "$owner" --arg r "$repo_name" --arg head "$head" --argjson pr "$pr_num" \
     --arg identity "$input_identity" --arg evidence "$evidence_identity" --arg state "$evidence_state" \
     --arg marker "$active_marker" --arg astate "$active_state" --arg reservation "$reservation_marker" --arg rstate "$reservation_state" \
@@ -289,8 +354,17 @@ pg_review_decision_cli() {
       && jq -e --argjson fresh "$decision" '
         .contract == $fresh.contract and .effect_request.action == .action and
         .effect_request.snapshot_digest == $fresh.effect_request.snapshot_digest and
-        .effect_request.target == $fresh.effect_request.target' "$REVIEW_DECISION_EFFECT_FILE" >/dev/null 2>&1 \
+        .effect_request.target == $fresh.effect_request.target and
+        .effect_request.applicable_ref == $fresh.effect_request.applicable_ref' "$REVIEW_DECISION_EFFECT_FILE" >/dev/null 2>&1 \
       && effect_ok=true
+    # Effects acquire their own marker protection only after a byte-for-byte request match and
+    # fresh reduction. A mismatch falls through to the replacement decision with no mutation.
+    if [ "$effect_ok" = true ] && [ "$(jq -r .action <<<"$decision")" = collect-existing-result ]; then
+      effect_marker="$(jq -r '.effect_request.applicable_ref // ""' <<<"$decision")"
+      if [ "$effect_marker" = "$input_marker" ]; then
+        pg_review_decision_repair_result_binding "$effect_marker" "$input_record" || true
+      fi
+    fi
   fi
   printf '%s\n' "$decision"
 }
@@ -1251,6 +1325,18 @@ pg_active_clear() {  # $1 = exit code
   fi
   rm -f "$f" 2>/dev/null || true
 }
+pg_install_full_pr_input_binding() { # marker; only endpoint-fetched full PRs gain automatic applicability
+  local marker="$1" binding
+  [ "${PG_FULL_PR_PROVEN:-0}" = 1 ] || return 0  # caller-supplied/scoped/bare patches remain bounded
+  [ -n "${RUN_SPEND_EPOCH:-}" ] && [ -n "${PG_META_HOST:-}${PG_META_OWNER:-}${PG_META_REPO:-}" ] || return 1
+  binding="$(jq -cnS --arg cd "$(pg_review_decision_contract_digest)" --arg marker "$marker" \
+    --arg host "$PG_META_HOST" --arg owner "$PG_META_OWNER" --arg repo "$PG_META_REPO" --argjson pr "$PR_NUM" \
+    --arg base "$PG_FULL_PR_BASE" --arg head "$PG_FULL_PR_HEAD" --arg endpoint "$PG_FULL_PR_ENDPOINT_DIGEST" --arg raw "$PG_FULL_PR_RAW_DIGEST" \
+    --argjson epoch "$RUN_SPEND_EPOCH" \
+    '{charged_spend_epoch:$epoch,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("full-pr:"+$base+":"+$head),mode:"full-pr",proof:{base_oid:$base,endpoint_digest:$endpoint,head_oid:$head,raw_patch_digest:$raw}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:$host,owner:$owner,repo:$repo},target:{head_oid:$head,kind:"pull-request",pr:$pr}}')" || return 1
+  pg_review_input_binding_write "$marker" "$binding"
+}
+
 pg_publish_out() {  # $1 = verified snapshot → atomically publish to $OUT; rc 0 only when
   # $OUT is a readable regular file afterwards (an existing directory or a failed rename is
   # a publication FAILURE, never silently "done" — gate #54 r9).
@@ -1266,13 +1352,18 @@ pg_persist_result() {  # $1 = verified snapshot — persist the CANONICAL, marke
   # durable) → the kept private snapshot (PG_KEEP_FINAL). Shared $OUT is NEVER canonical:
   # two runs sharing it can both "win" a rename, and cross-feeding callers is worse than a
   # non-preferred path.
-  local src="$1"
+  local src="$1" input_binding
   PG_RESULT_DURABLE=0
   if pg_completed_write "$RUN_MARKER" "$src" 2>/dev/null \
      && [ -f "$(pg_completed_dir)/$RUN_MARKER" ] && [ -r "$(pg_completed_dir)/$RUN_MARKER" ] \
      && [ -s "$(pg_completed_dir)/$RUN_MARKER" ] && cmp -s "$src" "$(pg_completed_dir)/$RUN_MARKER"; then
     RESULT_PATH="$(pg_completed_dir)/$RUN_MARKER"
     PG_RESULT_DURABLE=1
+    # Canonical bytes may exist after a prior crash without their result binding. Repair is
+    # marker-locked and idempotent; failure preserves collectable bytes and never exposes SHIP.
+    if input_binding="$(pg_review_input_binding_read "$RUN_MARKER" 2>/dev/null)"; then
+      pg_review_decision_repair_result_binding "$RUN_MARKER" "$input_binding" || true
+    fi
     pg_reservation_remove "$RUN_MARKER" 2>/dev/null || true
     return 0
   fi
@@ -2082,6 +2173,23 @@ if [ -z "$DIFF_FILE" ]; then
     echo "ERROR: gh pr diff $PR_NUM failed in $REPO: $(cat "$WORK/diff.err")" >&2; pg_status failed "gh pr diff failed"; pg_finish 5; }
 fi
 
+# An engine-fetched endpoint patch is the only normal path that earns full-PR proof. A caller
+# patch may still be reviewed/recovered, but it is deliberately bare until scoped lineage is
+# independently assembled; filtering below never changes these retained raw endpoint bytes.
+PG_FULL_PR_PROVEN=0
+if [ "$DIFF_IS_CALLER_SUPPLIED" = 0 ] && [ -n "$PR_NUM" ] \
+   && [ -n "${PG_META_HOST:-}${PG_META_OWNER:-}${PG_META_REPO:-}" ] \
+   && [[ "$PR_NUM" =~ ^[0-9]+$ ]]; then
+  PG_FULL_PR_HEAD="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || true)"
+  PG_FULL_PR_BASE="$(git -C "$REPO" merge-base HEAD '@{upstream}' 2>/dev/null || git -C "$REPO" rev-parse HEAD^ 2>/dev/null || true)"
+  PG_FULL_PR_ENDPOINT_DIGEST="$(pg_sha256 "$DIFF_FILE")"
+  PG_FULL_PR_RAW_DIGEST="$PG_FULL_PR_ENDPOINT_DIGEST"
+  if [[ "$PG_FULL_PR_HEAD" =~ ^[0-9a-f]{40,64}$ ]] && [[ "$PG_FULL_PR_BASE" =~ ^[0-9a-f]{40,64}$ ]] \
+     && [[ "$PG_FULL_PR_ENDPOINT_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then
+    PG_FULL_PR_PROVEN=1
+  fi
+fi
+
 # --- diff hygiene: drop lockfiles/generated/vendored from the review payload so the Pro model
 # spends its (finite, disconnect-exposed) thinking window on real code, not lockfile churn. ---
 if [ -s "$DIFF_FILE" ] && [ "${PRO_GATE_DIFF_FILTER:-1}" = 1 ]; then
@@ -2821,6 +2929,15 @@ while :; do
         || echo "[oracle-review] WARNING: could not persist recovery charge metadata for $RUN_MARKER" >&2
     fi
     pg_active_write
+    # Charge ordering is marker-bound: a proven endpoint run is not submitted until its immutable
+    # input relation is installed. A failure leaves the charged active record recoverable rather
+    # than launching an unbound attempt; bare/scoped callers retain existing non-merge behavior.
+    if ! pg_install_full_pr_input_binding "$RUN_MARKER"; then
+      PG_PRESERVE_STATE=1
+      echo "ERROR: charged full-PR input binding could not be installed; preserving active recovery state and not submitting." >&2
+      pg_status failed "charged input binding unavailable; recovery required"
+      pg_finish 3
+    fi
   }
 
   # A non-blocking heads-up when memory is tight but not blocking (the gate is deliberately

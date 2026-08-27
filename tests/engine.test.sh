@@ -4080,4 +4080,88 @@ check 'effect re-resolution creates no lock, cache, sidecar, or binding mutation
   "$([ "$DECISION_STATE_BEFORE" = "$DECISION_STATE_AFTER" ]; echo $?)" \
   "before=$DECISION_STATE_BEFORE after=$DECISION_STATE_AFTER"
 
+# U2 proof modes must validate every relation recorded in U1's immutable input binding; a
+# similarly-shaped local patch is never endpoint proof. Scoped evidence additionally needs its
+# independent filtering and confirmation lineage to remain byte-identical at re-resolution.
+printf 'base\n' > "$DECISION_REPO/proof.txt"
+git -C "$DECISION_REPO" add proof.txt && git -C "$DECISION_REPO" commit -qm proof-base
+PROOF_BASE="$(git -C "$DECISION_REPO" rev-parse HEAD)"
+printf 'head\n' > "$DECISION_REPO/proof.txt"
+git -C "$DECISION_REPO" add proof.txt && git -C "$DECISION_REPO" commit -qm proof-head
+PROOF_HEAD="$(git -C "$DECISION_REPO" rev-parse HEAD)"
+git -C "$DECISION_REPO" diff "$PROOF_BASE" "$PROOF_HEAD" > "$TDIR/proof-endpoint.patch"
+cp "$TDIR/proof-endpoint.patch" "$TDIR/proof-raw.patch"
+PROOF_ENDPOINT_DIGEST="$(sha256sum "$TDIR/proof-endpoint.patch" | awk '{print $1}')"
+PROOF_RAW_DIGEST="$(sha256sum "$TDIR/proof-raw.patch" | awk '{print $1}')"
+FULL_MARKER='pg-run-acme-widgets-1983-1700013000-1'
+FULL_BINDING="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg base "$PROOF_BASE" --arg head "$PROOF_HEAD" --arg endpoint "$PROOF_ENDPOINT_DIGEST" --arg raw "$PROOF_RAW_DIGEST" '{charged_spend_epoch:1700013000,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:"full-proof-current",mode:"full-pr",proof:{base_oid:$base,endpoint_digest:$endpoint,head_oid:$head,raw_patch_digest:$raw}},marker:"pg-run-acme-widgets-1983-1700013000-1",record_type:"review-input-binding/v1",record_version:1,repository:{host:"github.com",owner:"acme",repo:"widgets"},target:{head_oid:$head,kind:"pull-request",pr:1983}}')"
+PRO_GATE_HOME="$DECISION_HOME" pg_review_input_binding_write "$FULL_MARKER" "$FULL_BINDING"
+env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+  bash "$ENGINE" --review-decision --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
+  >"$TDIR/full-proof.json" 2>"$TDIR/full-proof.err"
+FULL_PROOF_RC=$?
+check 'full-PR proof requires current base head endpoint and raw patch digests' \
+  "$([ "$FULL_PROOF_RC" -eq 0 ] && jq -e '.action == "run-granted-review" and .facts.input.proven and .facts.evidence.identity == "full-proof-current"' "$TDIR/full-proof.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$FULL_PROOF_RC output=$(cat "$TDIR/full-proof.json") stderr=$(cat "$TDIR/full-proof.err")"
+printf 'altered endpoint bytes\n' >> "$TDIR/proof-endpoint.patch"
+env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+  bash "$ENGINE" --review-decision --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
+  >"$TDIR/full-proof-moved.json" 2>"$TDIR/full-proof-moved.err"
+FULL_MOVED_RC=$?
+check 'changed endpoint bytes at the same current head stop full-PR continuation' \
+  "$([ "$FULL_MOVED_RC" -eq 0 ] && jq -e '.action == "stop-without-new-review" and .reason == "unproven-input"' "$TDIR/full-proof-moved.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$FULL_MOVED_RC output=$(cat "$TDIR/full-proof-moved.json") stderr=$(cat "$TDIR/full-proof-moved.err")"
+
+printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — prior review accepted' > "$TDIR/scoped-confirmation.md"
+printf 'proof.txt\n' > "$TDIR/scoped-manifest"
+SCOPED_MANIFEST_DIGEST="$(sha256sum "$TDIR/scoped-manifest" | awk '{print $1}')"
+SCOPED_CONFIRM_DIGEST="$(sha256sum "$TDIR/scoped-confirmation.md" | awk '{print $1}')"
+SCOPED_MARKER='pg-run-acme-widgets-1983-1700013001-2'
+SCOPED_BINDING="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg base "$PROOF_BASE" --arg head "$PROOF_HEAD" --arg raw "$PROOF_RAW_DIGEST" --arg manifest "$SCOPED_MANIFEST_DIGEST" --arg lineage "confirmation:$SCOPED_CONFIRM_DIGEST" '{charged_spend_epoch:1700013001,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:"scoped-proof-current",mode:"scoped-delta",proof:{base_oid:$base,end_oid:$head,filtering_manifest_digest:$manifest,lineage_identity:$lineage,raw_digest:$raw,reviewed_payload_digest:$raw,scope_algorithm:"unified-diff-v1"}},marker:"pg-run-acme-widgets-1983-1700013001-2",record_type:"review-input-binding/v1",record_version:1,repository:{host:"github.com",owner:"acme",repo:"widgets"},target:{head_oid:$head,kind:"pull-request",pr:1983}}')"
+PRO_GATE_HOME="$DECISION_HOME" pg_review_input_binding_write "$SCOPED_MARKER" "$SCOPED_BINDING"
+env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+  bash "$ENGINE" --review-decision --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
+  >"$TDIR/scoped-proof.json" 2>"$TDIR/scoped-proof.err"
+SCOPED_PROOF_RC=$?
+check 'scoped delta requires base end raw reviewed manifest and confirmed lineage' \
+  "$([ "$SCOPED_PROOF_RC" -eq 0 ] && jq -e '.action == "run-granted-review" and .facts.evidence.identity == "scoped-proof-current"' "$TDIR/scoped-proof.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$SCOPED_PROOF_RC output=$(cat "$TDIR/scoped-proof.json") stderr=$(cat "$TDIR/scoped-proof.err")"
+printf 'different scope\n' > "$TDIR/scoped-manifest"
+env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+  bash "$ENGINE" --review-decision --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
+  >"$TDIR/scoped-proof-stale.json" 2>"$TDIR/scoped-proof-stale.err"
+SCOPED_STALE_RC=$?
+check 'altered scoped filtering manifest stops continuation' \
+  "$([ "$SCOPED_STALE_RC" -eq 0 ] && jq -e '.action == "stop-without-new-review" and .reason == "unproven-input"' "$TDIR/scoped-proof-stale.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$SCOPED_STALE_RC output=$(cat "$TDIR/scoped-proof-stale.json") stderr=$(cat "$TDIR/scoped-proof-stale.err")"
+
+# Canonical bytes without a result binding are recoverable but never a SHIP handoff. A matching
+# collect effect repairs the exact marker binding under its own marker lock; replay is idempotent.
+cp "$TDIR/proof-raw.patch" "$TDIR/proof-endpoint.patch"
+mkdir -p "$DECISION_HOME/completed"
+printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — canonical review accepted with current proof' > "$DECISION_HOME/completed/$FULL_MARKER"
+env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+  bash "$ENGINE" --review-decision --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
+  >"$TDIR/repair-before.json" 2>"$TDIR/repair-before.err"
+REPAIR_BEFORE_RC=$?
+check 'canonical SHIP without result binding is collect-only, never merge eligible' \
+  "$([ "$REPAIR_BEFORE_RC" -eq 0 ] && jq -e '.action != "allow-existing-merge-workflow"' "$TDIR/repair-before.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$REPAIR_BEFORE_RC output=$(cat "$TDIR/repair-before.json") stderr=$(cat "$TDIR/repair-before.err")"
+env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+  bash "$ENGINE" --review-decision --review-decision-effect "$TDIR/repair-before.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
+  >"$TDIR/repair-effect.json" 2>"$TDIR/repair-effect.err"
+REPAIR_EFFECT_RC=$?
+REPAIR_BINDING="$(PRO_GATE_HOME="$DECISION_HOME" pg_review_result_binding_read "$FULL_MARKER" 2>/dev/null || true)"
+check 'matching collect effect repairs one validated marker-bound result binding' \
+  "$([ "$REPAIR_EFFECT_RC" -eq 0 ] && jq -e --arg marker "$FULL_MARKER" '.marker == $marker and .verdict == "SHIP"' <<<"$REPAIR_BINDING" >/dev/null 2>&1; echo $?)" \
+  "rc=$REPAIR_EFFECT_RC binding=$REPAIR_BINDING output=$(cat "$TDIR/repair-effect.json") stderr=$(cat "$TDIR/repair-effect.err")"
+REPAIR_BINDING_DIGEST="$(printf '%s' "$REPAIR_BINDING" | sha256sum | awk '{print $1}')"
+env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+  bash "$ENGINE" --review-decision --review-decision-effect "$TDIR/repair-before.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
+  >"$TDIR/repair-replay.json" 2>"$TDIR/repair-replay.err"
+REPAIR_REPLAY_RC=$?
+check 'result-binding repair is idempotent and does not mutate canonical bytes' \
+  "$([ "$REPAIR_REPLAY_RC" -eq 0 ] && [ "$(PRO_GATE_HOME="$DECISION_HOME" pg_review_result_binding_digest "$FULL_MARKER")" = "$REPAIR_BINDING_DIGEST" ] && cmp -s "$DECISION_HOME/completed/$FULL_MARKER" "$DECISION_HOME/completed/$FULL_MARKER"; echo $?)" \
+  "rc=$REPAIR_REPLAY_RC binding=$(PRO_GATE_HOME="$DECISION_HOME" pg_review_result_binding_read "$FULL_MARKER" 2>/dev/null)"
+
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }
