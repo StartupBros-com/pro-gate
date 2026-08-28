@@ -127,8 +127,22 @@ and direct marker diagnostics remain:
 "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --harvest <run-marker> --out <out> --timeout 20m
 ```
 
-ask-named-product-choice is the only prompt. Its selection is freshness-validated,
-non-authoritatively passed to the coding agent, and re-enters after code or policy change. Malformed or stale selection stops. A selection never authorizes a review or merge by itself.
+ask-named-product-choice is the only prompt. Present only the normalized
+`.facts.named_choice.outcomes`. After the operator selects one ID, return it through the runtime's
+bounded freshness path—never treat the answer itself as authorization:
+
+```bash
+CHOICE_ID="<selected normalized id>"
+CHOICE_SNAPSHOT="$(jq -r .effect_request.snapshot_digest "$DECISION")"
+SELECTION="${DECISION}.selection"
+printf '%s' "$(jq -cnS --arg id "$CHOICE_ID" --arg snapshot "$CHOICE_SNAPSHOT" \
+  '{selected_id:$id,snapshot_digest:$snapshot}')" > "$SELECTION"
+"$PG" "${QUERY_ARGS[@]}" --review-choice-selection "$SELECTION" > "${DECISION}.fresh"
+rm -f "$SELECTION"
+```
+
+Dispatch only the fresh decision. A valid selection is freshness-validated, non-authoritatively
+passed to the coding agent, and re-enters after code or policy change. Malformed or stale selection stops. A selection never authorizes a review or merge by itself.
 
 ## 4. Fixing and handoff
 

@@ -125,6 +125,8 @@ check 'skill invokes the real advisory query and guarded effect surfaces' \
   "$(grep -Fq -- '--review-decision --json' "$SKILL" && grep -Fq -- '--review-decision-effect' "$SKILL"; printf '%s' "$?")"
 check 'relay invokes the real advisory query and guarded effect surfaces' \
   "$(grep -Fq -- '--review-decision --json' "$RELAY" && grep -Fq -- '--review-decision-effect' "$RELAY"; printf '%s' "$?")"
+check 'skill and relay return named choices through the canonical freshness surface' \
+  "$(for consumer in "$SKILL" "$RELAY"; do grep -Fq -- '--review-choice-selection' "$consumer" && grep -Fq 'effect_request.snapshot_digest' "$consumer" && grep -Fq 'jq -cnS' "$consumer" || exit 1; done; printf '%s' "$?")"
 check 'skill retains exact version update, evidence, no-merge, and fixer fallback authority' \
   "$(grep -Fq 'raw.githubusercontent.com/StartupBros-com/pro-gate/v${PLUGIN_VERSION}/install.sh' "$SKILL" && grep -Fq 'prepare-matching-review-evidence' "$SKILL" && grep -Fq 'Stop before merge' "$SKILL" && grep -Fq 'codex exec' "$SKILL" && grep -Fq 'apply the edits directly in this session' "$SKILL"; printf '%s' "$?")"
 check 'Codex metadata uses the supported invoke-only policy and does not redefine review authority' \
