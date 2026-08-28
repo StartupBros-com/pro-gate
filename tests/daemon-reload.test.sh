@@ -160,6 +160,7 @@ mkdir -p "$TDIR/.local/bin" "$TDIR/logs" "$TDIR/.config/pro-gate"
 RUNTIME_VERSION="$(tr -d '[:space:]' < "$HERE/../VERSION")"
 printf '%s\n' "$RUNTIME_VERSION" > "$TDIR/VERSION"
 printf '%s\n' "$RUNTIME_VERSION" > "$TDIR/EXPECTED_VERSION"
+cp "$HERE/../skills/pro-gate/review-decision-v1.json" "$TDIR/review-decision-v1.json"
 printf '1\n' > "$TDIR/.config/pro-gate/dangerous-mode-consent"
 # Stub gh so the daemon finds no PRs and just idles through its poll loop (wins in PATH because
 # pg_augment_path prepends $HOME/.local/bin first, and HOME is pinned to $TDIR below).
@@ -206,5 +207,22 @@ printf 'deploy-v3-%s\n' "$(date +%s)" > "$TDIR/.deploy-stamp.tmp" && mv -f "$TDI
 sleep 3
 check 'self-reload=0 does not detect/reload' "$([ "$(grep -c 'detected a new daemon deploy' "$DLOG2")" -eq 0 ]; echo $?)" "reloads=$(grep -c 'detected a new daemon deploy' "$DLOG2")"
 check 'self-reload=0 keeps a single startup line' "$([ "$(grep -c 'pro-review-daemon starting' "$DLOG2")" -eq 1 ]; echo $?)" "starts=$(grep -c 'pro-review-daemon starting' "$DLOG2")"
+
+# U5: metadata/library skew is a machine-global zero-effect defer. A later complete deploy stamp
+# re-execs only after the compatible record is present, restoring normal runtime readiness.
+echo '# integration: identity mismatch globally defers, compatible reload recovers'
+kill "$DPID" 2>/dev/null; pkill -P "$DPID" 2>/dev/null; DPID=""
+rm -f "$TDIR/review-decision-v1.json" "$TDIR/.deploy-stamp"
+DLOG3="$TDIR/daemon-identity.log"
+HOME="$TDIR" PRO_GATE_HOME="$TDIR" PRO_REVIEW_OWNERS=fakeowner PRO_REVIEW_POLL_SECONDS=1 \
+  PRO_GATE_BROWSER_MODE=native PRO_GATE_DAEMON_SELF_RELOAD=1 PATH="/usr/bin:/bin" \
+  bash "$TDIR/run-daemon.sh" > "$DLOG3" 2>&1 &
+DPID=$!
+for _ in $(seq 1 50); do grep -q 'review-decision identity is missing' "$DLOG3" 2>/dev/null && break; sleep 0.2; done
+check 'missing identity globally defers before browser or worker work' "$(grep -q 'review-decision identity is missing' "$DLOG3" && grep -q 'globally deferring PR processing' "$DLOG3" && ! grep -q 'reviewing ' "$DLOG3"; echo $?)" "$(tail -5 "$DLOG3" 2>/dev/null)"
+cp "$HERE/../skills/pro-gate/review-decision-v1.json" "$TDIR/review-decision-v1.json"
+printf 'identity-converged-%s\n' "$(date +%s)" > "$TDIR/.deploy-stamp.tmp" && mv -f "$TDIR/.deploy-stamp.tmp" "$TDIR/.deploy-stamp"
+for _ in $(seq 1 60); do [ "$(grep -c 'pro-review-daemon starting' "$DLOG3" 2>/dev/null)" -ge 2 ] && break; sleep 0.2; done
+check 'compatible identity deploy reloads and recovers daemon readiness' "$( [ "$(grep -c 'pro-review-daemon starting' "$DLOG3" 2>/dev/null)" -ge 2 ] && [ "$(grep -c 'review-decision identity is missing' "$DLOG3" 2>/dev/null)" -eq 1 ] && grep -q 'no PRs pending' "$DLOG3"; echo $?)" "$(tail -8 "$DLOG3" 2>/dev/null)"
 
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }

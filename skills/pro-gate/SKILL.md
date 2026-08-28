@@ -15,16 +15,28 @@ task. Observation is non-prompting and is not blocking-wait next_action.
 
 ## 1. Require the matching runtime
 
-Resolve the promoted plugin version and verify the matching runtime before dispatch:
+Resolve the promoted plugin version and plugin-side canonical identity through the one shipped
+resolver. Claude Code uses `CLAUDE_PLUGIN_ROOT`. For a repository-mounted Codex skill, set
+`SKILL_ROOT` (or `PRO_GATE_SKILL_ROOT`) to the directory containing this `SKILL.md`; the resolver
+then reads the sibling identity and the repository manifest without a Claude cache path.
 
 ```bash
-PLUGIN_VERSION="$(python3 -c 'import json,re,sys; v=json.load(open(sys.argv[1]))["version"]; print(v) if isinstance(v,str) and re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+",v) else sys.exit(1)' \
-  "${CLAUDE_PLUGIN_ROOT}/.claude-plugin/plugin.json")" || {
-  echo "ERROR: could not resolve a valid plugin version" >&2
-  exit 1
-}
+if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ]; then
+  IDENTITY_RESOLVER="$CLAUDE_PLUGIN_ROOT/skills/pro-gate/scripts/resolve-identity.sh"
+else
+  SKILL_ROOT="${PRO_GATE_SKILL_ROOT:-${SKILL_ROOT:-}}"
+  IDENTITY_RESOLVER="$SKILL_ROOT/scripts/resolve-identity.sh"
+fi
+[ -x "$IDENTITY_RESOLVER" ] || { echo "ERROR: pro-gate identity resolver is unavailable" >&2; exit 1; }
+IFS=$'\t' read -r PLUGIN_VERSION CONTRACT_ID CONTRACT_VERSION CONTRACT_DIGEST CORPUS_DIGEST < <(
+  "$IDENTITY_RESOLVER"
+) || { echo "ERROR: could not resolve a valid plugin version or review-decision identity" >&2; exit 1; }
 PG="${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh"
 PRO_GATE_EXPECTED_VERSION="$PLUGIN_VERSION" \
+PRO_GATE_EXPECTED_CONTRACT_ID="$CONTRACT_ID" \
+PRO_GATE_EXPECTED_CONTRACT_VERSION="$CONTRACT_VERSION" \
+PRO_GATE_EXPECTED_CONTRACT_DIGEST="$CONTRACT_DIGEST" \
+PRO_GATE_EXPECTED_CORPUS_DIGEST="$CORPUS_DIGEST" \
   "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/pro-gate-doctor.sh"
 ```
 
@@ -56,13 +68,14 @@ QUERY_ARGS=(--review-decision --json --pr "$PR" --repo "$REPO" --input "${INPUT:
 # QUERY_ARGS+=(--confirm "$PRIOR_REVIEW")                     # scoped delta only
 
 "$PG" "${QUERY_ARGS[@]}" > "$DECISION"
-jq -e '
-  .contract.contract_id == "review-decision/v1" and
+jq -e --arg id "$CONTRACT_ID" --argjson version "$CONTRACT_VERSION" \
+  --arg digest "$CONTRACT_DIGEST" --arg corpus "$CORPUS_DIGEST" '
+  .contract == {contract_id:$id,contract_version:$version,contract_digest:$digest,corpus_digest:$corpus} and
   (.action | type == "string") and
   .effect_request.action == .action and
   (.effect_request.execution_class |
     IN("runtime-guarded-effect","agent-task","report-only","named-product-choice"))
-' "$DECISION" >/dev/null
+' "$DECISION" >/dev/null || { echo "ERROR: runtime decision identity is incompatible; use the exact version-update path" >&2; exit 1; }
 ```
 
 Contract/corpus identity must match the promoted adapter. Any validation failure stops through the

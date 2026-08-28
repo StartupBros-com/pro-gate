@@ -1810,8 +1810,35 @@ PG_REVIEW_DECISION_CONTRACT_VERSION=1
 PG_REVIEW_DECISION_CONTRACT_DIGEST='7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee'
 PG_REVIEW_DECISION_CORPUS_DIGEST='2a1e347e4c15766ab9c530074ae75aead7397349f5e13328c40183ced8b70b69'
 
+pg_review_decision_contract_id() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_ID"; }
+pg_review_decision_contract_version() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_VERSION"; }
 pg_review_decision_contract_digest() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_DIGEST"; }
 pg_review_decision_corpus_digest() { printf '%s\n' "$PG_REVIEW_DECISION_CORPUS_DIGEST"; }
+
+# Compatibility metadata only: reducers continue to use the compiled constants above.
+pg_review_decision_identity_json() {
+  jq -cnS --arg contract_id "$PG_REVIEW_DECISION_CONTRACT_ID" \
+    --argjson contract_version "$PG_REVIEW_DECISION_CONTRACT_VERSION" \
+    --arg contract_digest "$PG_REVIEW_DECISION_CONTRACT_DIGEST" \
+    --arg corpus_digest "$PG_REVIEW_DECISION_CORPUS_DIGEST" \
+    '{contract_digest:$contract_digest,contract_id:$contract_id,contract_version:$contract_version,corpus_digest:$corpus_digest}'
+}
+
+pg_review_decision_identity_file_valid() { # path; exact compact canonical metadata from these constants
+  local path="$1" canonical expected
+  [ -f "$path" ] && [ ! -L "$path" ] && pg_have jq || return 1
+  canonical="$(LC_ALL=C jq -ceS '
+    if type == "object" and
+       keys == ["contract_digest","contract_id","contract_version","corpus_digest"] and
+       (.contract_id | type == "string" and length > 0) and
+       (.contract_version | type == "number" and floor == . and . > 0) and
+       (.contract_digest | type == "string" and test("^[0-9a-f]{64}$")) and
+       (.corpus_digest | type == "string" and test("^[0-9a-f]{64}$"))
+    then . else error("invalid review-decision identity") end
+  ' "$path" 2>/dev/null)" || return 1
+  expected="$(pg_review_decision_identity_json)" || return 1
+  [ "$canonical" = "$expected" ] && printf '%s' "$expected" | cmp -s - "$path"
+}
 
 # Canonical JSON is intentionally a small, shared primitive: jq -S recursively sorts object
 # keys, -c removes insignificant whitespace, and command substitution removes jq's one LF. Arrays

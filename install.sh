@@ -79,7 +79,7 @@ done
 cleanup() {
   local rc=$?
   if [ "$rc" -ne 0 ] && [ "$DEPLOYING" = 1 ] && [ -n "$BACKUP" ]; then
-    for f in lib.sh oracle-review.sh pro-gate-doctor.sh pro-gate-stats.sh pro-gate-autoupdate.sh cdp-salvage.mjs cdp-organizer-expressions.mjs daemon.sh run-daemon.sh run-oracle-chrome.sh login-view.sh VERSION EXPECTED_VERSION .deploy-stamp; do
+    for f in lib.sh oracle-review.sh pro-gate-doctor.sh pro-gate-stats.sh pro-gate-autoupdate.sh cdp-salvage.mjs cdp-organizer-expressions.mjs daemon.sh run-daemon.sh run-oracle-chrome.sh login-view.sh review-decision-v1.json VERSION EXPECTED_VERSION .deploy-stamp; do
       if [ -e "$BACKUP/$f" ]; then mv -f "$BACKUP/$f" "$PRO_GATE_HOME/$f"; else rm -f "$PRO_GATE_HOME/$f"; fi
     done
   fi
@@ -150,7 +150,8 @@ if [ "$LOCAL_SOURCE" = 1 ]; then
   SOURCE_ROOT="$(dirname "$INSTALLER_SOURCE")"
   [ "$INSTALLER_SOURCE" = "$SOURCE_ROOT/install.sh" ] \
     && [ -f "$SOURCE_ROOT/VERSION" ] \
-    && [ -f "$SOURCE_ROOT/lib/pro-gate-lib.sh" ] || {
+    && [ -f "$SOURCE_ROOT/lib/pro-gate-lib.sh" ] \
+    && [ -f "$SOURCE_ROOT/skills/pro-gate/review-decision-v1.json" ] || {
       echo "--local-source installer must be install.sh inside a complete source tree" >&2
       exit 2
     }
@@ -183,7 +184,39 @@ else
 fi
 
 # Do not create or alter the install destination until the complete release has
-# passed checksum, extraction-path, and version validation above.
+# passed checksum, extraction-path, version, and identity validation. The metadata
+# is an adapter compatibility record; the staged compiled library remains authority.
+. "$SOURCE_ROOT/lib/pro-gate-lib.sh"
+IDENTITY_FILE="$SOURCE_ROOT/review-decision-v1.json"
+# The source tree keeps the one plugin-owned expected copy; the archive exposes its staged runtime
+# copy at the root. Both are checked against the staged library before deployment.
+[ "$LOCAL_SOURCE" = 1 ] && IDENTITY_FILE="$SOURCE_ROOT/skills/pro-gate/review-decision-v1.json"
+[ -f "$IDENTITY_FILE" ] && [ ! -L "$IDENTITY_FILE" ] || {
+  echo "release is missing review-decision identity metadata" >&2
+  exit 1
+}
+IDENTITY_CANONICAL="$(LC_ALL=C jq -ceS '
+  if type == "object" and
+     keys == ["contract_digest","contract_id","contract_version","corpus_digest"] and
+     (.contract_id | type == "string" and length > 0) and
+     (.contract_version | type == "number" and floor == . and . > 0) and
+     (.contract_digest | type == "string" and test("^[0-9a-f]{64}$")) and
+     (.corpus_digest | type == "string" and test("^[0-9a-f]{64}$"))
+  then . else error("invalid review-decision identity") end
+' "$IDENTITY_FILE" 2>/dev/null)" || {
+  echo "release review-decision identity metadata is malformed" >&2
+  exit 1
+}
+IDENTITY_EXPECTED="$(pg_review_decision_identity_json)" || {
+  echo "staged runtime cannot generate review-decision identity metadata" >&2
+  exit 1
+}
+[ "$IDENTITY_CANONICAL" = "$IDENTITY_EXPECTED" ] \
+  && printf '%s' "$IDENTITY_EXPECTED" | cmp -s - "$IDENTITY_FILE" || {
+  echo "release review-decision identity metadata does not match staged library constants" >&2
+  exit 1
+}
+
 mkdir -p "$PRO_GATE_HOME"
 if [ "${PRO_GATE_FORCE_PORTABLE_LOCK:-0}" != 1 ] && command -v flock >/dev/null 2>&1; then
   exec 9>>"$PRO_GATE_HOME/.install.lock"
@@ -262,11 +295,12 @@ fi
 
 mkdir -p "$PRO_GATE_HOME/logs" "$ORACLE_DIR"
 BACKUP="$TMP/backup"; mkdir -p "$BACKUP"
-for f in lib.sh oracle-review.sh pro-gate-doctor.sh pro-gate-stats.sh pro-gate-autoupdate.sh cdp-salvage.mjs cdp-organizer-expressions.mjs daemon.sh run-daemon.sh run-oracle-chrome.sh login-view.sh VERSION EXPECTED_VERSION .deploy-stamp; do
+for f in lib.sh oracle-review.sh pro-gate-doctor.sh pro-gate-stats.sh pro-gate-autoupdate.sh cdp-salvage.mjs cdp-organizer-expressions.mjs daemon.sh run-daemon.sh run-oracle-chrome.sh login-view.sh review-decision-v1.json VERSION EXPECTED_VERSION .deploy-stamp; do
   [ -e "$PRO_GATE_HOME/$f" ] && cp -p "$PRO_GATE_HOME/$f" "$BACKUP/$f"
 done
 DEPLOYING=1
 put() { local src="$1" dst="$2" tmp="$2.deploy.$$"; install -m 0755 "$src" "$tmp"; mv -f "$tmp" "$dst"; }
+put_data() { local src="$1" dst="$2" tmp="$2.deploy.$$"; install -m 0644 "$src" "$tmp"; mv -f "$tmp" "$dst"; }
 put "$SOURCE_ROOT/lib/pro-gate-lib.sh" "$PRO_GATE_HOME/lib.sh"
 put "$SOURCE_ROOT/bin/oracle-review.sh" "$PRO_GATE_HOME/oracle-review.sh"
 put "$SOURCE_ROOT/bin/pro-gate-doctor.sh" "$PRO_GATE_HOME/pro-gate-doctor.sh"
@@ -275,6 +309,9 @@ put "$SOURCE_ROOT/bin/pro-gate-autoupdate.sh" "$PRO_GATE_HOME/pro-gate-autoupdat
 put "$SOURCE_ROOT/bin/cdp-salvage.mjs" "$PRO_GATE_HOME/cdp-salvage.mjs"
 put "$SOURCE_ROOT/bin/cdp-organizer-expressions.mjs" "$PRO_GATE_HOME/cdp-organizer-expressions.mjs"
 for f in daemon.sh run-daemon.sh run-oracle-chrome.sh login-view.sh; do put "$SOURCE_ROOT/daemon/$f" "$PRO_GATE_HOME/$f"; done
+# Deploy verified compatibility metadata before version/stamp publication. A failed write invokes
+# cleanup rollback, so no live runtime observes a new VERSION with an old identity record.
+put_data "$IDENTITY_FILE" "$PRO_GATE_HOME/review-decision-v1.json"
 [ -f "$PRO_GATE_HOME/.env" ] || cp "$SOURCE_ROOT/.env.example" "$PRO_GATE_HOME/.env"
 # .env can hold keys (PRO_GATE_PLUGIN_KEY etc.): owner-only, regardless of the box's umask
 # or the perms a pre-existing copy already carries. A chmod failure is a hard stop BEFORE

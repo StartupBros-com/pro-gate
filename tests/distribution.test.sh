@@ -22,6 +22,8 @@ check "runtime package excludes skill" sh -c "! grep -q '/skills/' '$LIST'"
 check "runtime package excludes agent" sh -c "! grep -q '/agents/' '$LIST'"
 check "runtime package excludes plugin manifest" sh -c "! grep -q '/.claude-plugin/' '$LIST'"
 check "runtime package includes organizer UI expressions" grep -q '/bin/cdp-organizer-expressions.mjs$' "$LIST"
+check "runtime package includes one identity record" sh -c "test \"\$(grep -Fc 'pro-gate-runtime-$VERSION/review-decision-v1.json' '$LIST')\" -eq 1"
+check "runtime identity is byte-identical to plugin identity" sh -c "tar -xOf '$ARCHIVE' 'pro-gate-runtime-$VERSION/review-decision-v1.json' | cmp -s - '$ROOT/skills/pro-gate/review-decision-v1.json'"
 
 HOME1="$TDIR/default-home"; RUNTIME1="$TDIR/default-runtime"; CLAUDE1="$HOME1/.claude"
 mkdir -p "$HOME1" "$CLAUDE1"
@@ -30,6 +32,7 @@ HOME="$HOME1" CLAUDE_DIR="$CLAUDE1" PRO_GATE_HOME="$RUNTIME1" \
 check "runtime records installed version" test "$(cat "$RUNTIME1/VERSION")" = "$VERSION"
 check "runtime records expected version" test "$(cat "$RUNTIME1/EXPECTED_VERSION")" = "$VERSION"
 check "runtime installs organizer UI expressions" test -s "$RUNTIME1/cdp-organizer-expressions.mjs"
+check "runtime installs exact identity metadata beside its library" cmp -s "$RUNTIME1/review-decision-v1.json" "$ROOT/skills/pro-gate/review-decision-v1.json"
 check "runtime daemon omits Codex doghouse admission" sh -c "! grep -qF '.codex/.doghouse' '$RUNTIME1/daemon.sh'"
 check "runtime daemon omits Codex usage endpoint" sh -c "! grep -qF 'backend-api/wham/usage' '$RUNTIME1/daemon.sh'"
 check "runtime daemon omits Codex quota probe" sh -c "! grep -qF 'usage_saturated' '$RUNTIME1/daemon.sh'"
@@ -221,6 +224,62 @@ if HOME="$HOME1" PRO_GATE_HOME="$RUNTIME1" bash "$ROOT/install.sh" --version "$V
 else echo "ok - tampered checksum rejected"; fi
 check "tampered archive leaves install untouched" grep -q '^sentinel$' "$RUNTIME1/oracle-review.sh"
 
+# Every archive-level failure occurs before DEPLOYING, preserving the old runtime byte-for-byte.
+# Build validly checksummed bad candidates so checksum success cannot mask extraction/identity gates.
+printf 'not a gzip archive\n' > "$TDIR/bad-extraction.tar.gz"
+sha256sum "$TDIR/bad-extraction.tar.gz" > "$TDIR/bad-extraction.tar.gz.sha256"
+if HOME="$HOME1" PRO_GATE_HOME="$RUNTIME1" bash "$ROOT/install.sh" --version "$VERSION" \
+  --archive "$TDIR/bad-extraction.tar.gz" --checksum "$TDIR/bad-extraction.tar.gz.sha256" >"$TDIR/bad-extraction.log" 2>&1; then
+  echo "FAIL - extraction failure rejected"; FAILS=$((FAILS + 1))
+else echo "ok - extraction failure rejected"; fi
+check "extraction failure leaves install untouched" grep -q '^sentinel$' "$RUNTIME1/oracle-review.sh"
+
+MIXED_STAGE="$TDIR/mixed-stage"; mkdir -p "$MIXED_STAGE"
+tar -xzf "$ARCHIVE" -C "$MIXED_STAGE"
+jq -cS '.contract_digest="0000000000000000000000000000000000000000000000000000000000000000"' \
+  "$MIXED_STAGE/pro-gate-runtime-$VERSION/review-decision-v1.json" | tr -d '\n' > "$MIXED_STAGE/identity.tmp"
+mv "$MIXED_STAGE/identity.tmp" "$MIXED_STAGE/pro-gate-runtime-$VERSION/review-decision-v1.json"
+tar -C "$MIXED_STAGE" -czf "$TDIR/mixed-identity.tar.gz" "pro-gate-runtime-$VERSION"
+sha256sum "$TDIR/mixed-identity.tar.gz" > "$TDIR/mixed-identity.tar.gz.sha256"
+if HOME="$HOME1" PRO_GATE_HOME="$RUNTIME1" bash "$ROOT/install.sh" --version "$VERSION" \
+  --archive "$TDIR/mixed-identity.tar.gz" --checksum "$TDIR/mixed-identity.tar.gz.sha256" >"$TDIR/mixed-identity.log" 2>&1; then
+  echo "FAIL - mixed archive/library identity rejected"; FAILS=$((FAILS + 1))
+else echo "ok - mixed archive/library identity rejected"; fi
+check "mixed archive/library identity leaves install untouched" grep -q '^sentinel$' "$RUNTIME1/oracle-review.sh"
+
+MALFORMED_STAGE="$TDIR/malformed-stage"; cp -a "$MIXED_STAGE" "$MALFORMED_STAGE"
+printf '{}' > "$MALFORMED_STAGE/pro-gate-runtime-$VERSION/review-decision-v1.json"
+tar -C "$MALFORMED_STAGE" -czf "$TDIR/malformed-identity.tar.gz" "pro-gate-runtime-$VERSION"
+sha256sum "$TDIR/malformed-identity.tar.gz" > "$TDIR/malformed-identity.tar.gz.sha256"
+if HOME="$HOME1" PRO_GATE_HOME="$RUNTIME1" bash "$ROOT/install.sh" --version "$VERSION" \
+  --archive "$TDIR/malformed-identity.tar.gz" --checksum "$TDIR/malformed-identity.tar.gz.sha256" >"$TDIR/malformed-identity.log" 2>&1; then
+  echo "FAIL - malformed identity rejected"; FAILS=$((FAILS + 1))
+else echo "ok - malformed identity rejected"; fi
+check "malformed identity leaves install untouched" grep -q '^sentinel$' "$RUNTIME1/oracle-review.sh"
+
+# A failure after live files and identity metadata start changing must exercise cleanup rollback,
+# not merely the pre-deploy validation path above.
+ROLLBACK_BIN="$TDIR/rollback-bin"; mkdir -p "$ROLLBACK_BIN"
+REAL_CHMOD="$(command -v chmod)"
+cat > "$ROLLBACK_BIN/chmod" <<'ROLLBACK_CHMOD'
+#!/usr/bin/env bash
+if [ "${2:-}" = "${ROLLBACK_FAIL_TARGET:?}" ]; then exit 1; fi
+exec "${REAL_CHMOD:?}" "$@"
+ROLLBACK_CHMOD
+chmod +x "$ROLLBACK_BIN/chmod"
+cp "$RUNTIME1/review-decision-v1.json" "$TDIR/rollback-identity.before"
+cp "$RUNTIME1/VERSION" "$TDIR/rollback-version.before"
+cp "$RUNTIME1/.deploy-stamp" "$TDIR/rollback-stamp.before"
+if HOME="$HOME1" PRO_GATE_HOME="$RUNTIME1" REAL_CHMOD="$REAL_CHMOD" ROLLBACK_FAIL_TARGET="$RUNTIME1/.env" \
+  PATH="$ROLLBACK_BIN:$PATH" bash "$ROOT/install.sh" --version "$VERSION" \
+  --archive "$ARCHIVE" --checksum "$CHECKSUM" >"$TDIR/rollback-live.log" 2>&1; then
+  echo "FAIL - live deploy permission failure triggers rollback"; FAILS=$((FAILS + 1))
+else echo "ok - live deploy permission failure triggers rollback"; fi
+check "live rollback restores prior engine bytes" grep -q '^sentinel$' "$RUNTIME1/oracle-review.sh"
+check "live rollback restores prior identity bytes" cmp -s "$RUNTIME1/review-decision-v1.json" "$TDIR/rollback-identity.before"
+check "live rollback restores prior version bytes" cmp -s "$RUNTIME1/VERSION" "$TDIR/rollback-version.before"
+check "live rollback restores prior deploy stamp" cmp -s "$RUNTIME1/.deploy-stamp" "$TDIR/rollback-stamp.before"
+
 HOME2="$TDIR/consent-home"; RUNTIME2="$TDIR/consent-runtime"; mkdir -p "$HOME2"
 if HOME="$HOME2" PRO_GATE_HOME="$RUNTIME2" PRO_GATE_BROWSER_MODE=native \
   bash "$ROOT/install.sh" --version "$VERSION" --archive "$ARCHIVE" --checksum "$CHECKSUM" --daemon >"$TDIR/no-consent.log" 2>&1; then
@@ -244,6 +303,39 @@ PRO_GATE_HOME="$RUNTIME3" PRO_GATE_EXPECTED_VERSION="0.0.1" PRO_GATE_CONSENT_HOM
   PRO_GATE_BROWSER_MODE=native bash "$ROOT/bin/pro-gate-doctor.sh" >"$TDIR/doctor-ahead.log" 2>&1 || true
 check "doctor flags an AHEAD runtime as a DOWNGRADE" grep -q "AHEAD of plugin 0.0.1" "$TDIR/doctor-ahead.log"
 check "doctor AHEAD message warns DOWNGRADE" grep -q "DOWNGRADE the runtime" "$TDIR/doctor-ahead.log"
+
+# Contract skew is directional and blocks before consumers can resolve or dispatch. Package semver
+# messaging above remains independent; these test the typed adapter/runtime compatibility record.
+read -r CONTRACT_ID CONTRACT_VERSION CONTRACT_DIGEST CORPUS_DIGEST < <(jq -r '[.contract_id, (.contract_version|tostring), .contract_digest, .corpus_digest] | @tsv' "$ROOT/skills/pro-gate/review-decision-v1.json")
+run_contract_doctor() { # expected-id expected-version expected-contract-digest expected-corpus-digest output
+  PRO_GATE_HOME="$RUNTIME3" PRO_GATE_EXPECTED_VERSION="$VERSION" PRO_GATE_CONSENT_HOME="$CONSENT3" \
+    PRO_GATE_BROWSER_MODE=native PRO_GATE_EXPECTED_CONTRACT_ID="$1" PRO_GATE_EXPECTED_CONTRACT_VERSION="$2" \
+    PRO_GATE_EXPECTED_CONTRACT_DIGEST="$3" PRO_GATE_EXPECTED_CORPUS_DIGEST="$4" \
+    bash "$ROOT/bin/pro-gate-doctor.sh" > "$5" 2>&1 || true
+}
+run_contract_doctor "$CONTRACT_ID" "$CONTRACT_VERSION" "$CONTRACT_DIGEST" "$CORPUS_DIGEST" "$TDIR/doctor-contract-ok.log"
+check "doctor accepts matching runtime/plugin contract identity" grep -q 'runtime and adapter review-decision identities match' "$TDIR/doctor-contract-ok.log"
+run_contract_doctor "$CONTRACT_ID" 0 "$CONTRACT_DIGEST" "$CORPUS_DIGEST" "$TDIR/doctor-runtime-newer.log"
+check "doctor blocks runtime-newer contract before dispatch" grep -q 'runtime-newer contract' "$TDIR/doctor-runtime-newer.log"
+run_contract_doctor "$CONTRACT_ID" 2 "$CONTRACT_DIGEST" "$CORPUS_DIGEST" "$TDIR/doctor-adapter-newer.log"
+check "doctor blocks adapter-newer contract before dispatch" grep -q 'adapter-newer contract' "$TDIR/doctor-adapter-newer.log"
+run_contract_doctor review-decision/v999 "$CONTRACT_VERSION" "$CONTRACT_DIGEST" "$CORPUS_DIGEST" "$TDIR/doctor-unknown-contract.log"
+check "doctor blocks unknown contract before dispatch" grep -q 'unknown contract' "$TDIR/doctor-unknown-contract.log"
+run_contract_doctor "$CONTRACT_ID" "$CONTRACT_VERSION" "0000000000000000000000000000000000000000000000000000000000000000" "$CORPUS_DIGEST" "$TDIR/doctor-contract-digest.log"
+check "doctor blocks contract-digest mismatch before dispatch" grep -q 'contract-digest mismatch' "$TDIR/doctor-contract-digest.log"
+run_contract_doctor "$CONTRACT_ID" "$CONTRACT_VERSION" "$CONTRACT_DIGEST" "0000000000000000000000000000000000000000000000000000000000000000" "$TDIR/doctor-corpus.log"
+check "doctor blocks corpus mismatch before dispatch" grep -q 'corpus mismatch' "$TDIR/doctor-corpus.log"
+cp "$RUNTIME3/review-decision-v1.json" "$TDIR/runtime-identity.backup"
+rm "$RUNTIME3/review-decision-v1.json"
+run_contract_doctor "$CONTRACT_ID" "$CONTRACT_VERSION" "$CONTRACT_DIGEST" "$CORPUS_DIGEST" "$TDIR/doctor-missing-identity.log"
+check "doctor blocks missing runtime identity metadata" grep -q 'metadata missing or malformed' "$TDIR/doctor-missing-identity.log"
+cp "$TDIR/runtime-identity.backup" "$RUNTIME3/review-decision-v1.json"
+printf '%s\n' "$(<"$TDIR/runtime-identity.backup")" > "$RUNTIME3/review-decision-v1.json"
+run_contract_doctor "$CONTRACT_ID" "$CONTRACT_VERSION" "$CONTRACT_DIGEST" "$CORPUS_DIGEST" "$TDIR/doctor-malformed-identity.log"
+check "doctor blocks malformed runtime identity metadata" grep -q 'metadata missing or malformed' "$TDIR/doctor-malformed-identity.log"
+cp "$TDIR/runtime-identity.backup" "$RUNTIME3/review-decision-v1.json"
+run_contract_doctor "$CONTRACT_ID" "$CONTRACT_VERSION" "$CONTRACT_DIGEST" "$CORPUS_DIGEST" "$TDIR/doctor-recovered-identity.log"
+check "doctor recovers after a compatible runtime identity converges" grep -q 'runtime and adapter review-decision identities match' "$TDIR/doctor-recovered-identity.log"
 printf '#!/usr/bin/env bash\nprintf "oracle-custom 7.8.9\\n"\n' > "$TDIR/oracle-custom"
 printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$TIMEOUT_LOG"\nshift\n"$@"\n' > "$TDIR/timeout-custom"
 chmod +x "$TDIR/oracle-custom" "$TDIR/timeout-custom"
