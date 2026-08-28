@@ -56,6 +56,74 @@ elif [ -n "$EXPECTED_VERSION" ] && [ "$INSTALLED_VERSION" != "$EXPECTED_VERSION"
 else
   P "runtime version ${INSTALLED_VERSION}${EXPECTED_VERSION:+ matches plugin}"
 fi
+
+# review-decision/v1 compatibility is independent of package semver. The plugin/skill passes its
+# expected record with narrowly scoped values; the runtime record must first be exact canonical
+# metadata and match the loaded runtime library before either side can dispatch a decision.
+identity_read() { # path -> id<TAB>version<TAB>contract-digest<TAB>corpus-digest
+  local path="$1" canonical
+  [ -f "$path" ] && [ ! -L "$path" ] && pg_have jq || return 1
+  canonical="$(LC_ALL=C jq -ceS '
+    if type == "object" and
+       keys == ["contract_digest","contract_id","contract_version","corpus_digest"] and
+       (.contract_id | type == "string" and length > 0) and
+       (.contract_version | type == "number" and floor == . and . > 0) and
+       (.contract_digest | type == "string" and test("^[0-9a-f]{64}$")) and
+       (.corpus_digest | type == "string" and test("^[0-9a-f]{64}$"))
+    then . else error("invalid review-decision identity") end
+  ' "$path" 2>/dev/null)" || return 1
+  printf '%s' "$canonical" | cmp -s - "$path" || return 1
+  jq -r '[.contract_id, (.contract_version|tostring), .contract_digest, .corpus_digest] | @tsv' "$path"
+}
+
+RUNTIME_IDENTITY_FILE="${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/review-decision-v1.json"
+if ! RUNTIME_IDENTITY="$(identity_read "$RUNTIME_IDENTITY_FILE")"; then
+  X "runtime review-decision metadata missing or malformed; install the exact plugin release with install.sh --version ${EXPECTED_VERSION:-<plugin-version>}"
+else
+  IFS=$'\t' read -r RUNTIME_CONTRACT_ID RUNTIME_CONTRACT_VERSION RUNTIME_CONTRACT_DIGEST RUNTIME_CORPUS_DIGEST <<< "$RUNTIME_IDENTITY"
+  if ! type pg_review_decision_contract_id >/dev/null 2>&1 \
+      || [ "$RUNTIME_CONTRACT_ID" != "$(pg_review_decision_contract_id)" ] \
+      || [ "$RUNTIME_CONTRACT_VERSION" != "$(pg_review_decision_contract_version)" ] \
+      || [ "$RUNTIME_CONTRACT_DIGEST" != "$(pg_review_decision_contract_digest)" ] \
+      || [ "$RUNTIME_CORPUS_DIGEST" != "$(pg_review_decision_corpus_digest)" ]; then
+    X "runtime review-decision metadata does not match the installed library; install the exact plugin release with install.sh --version ${EXPECTED_VERSION:-<plugin-version>}"
+  else
+    P "runtime review-decision identity matches installed library"
+  fi
+fi
+
+EXPECTED_CONTRACT_ID="${PRO_GATE_EXPECTED_CONTRACT_ID:-}"
+EXPECTED_CONTRACT_VERSION="${PRO_GATE_EXPECTED_CONTRACT_VERSION:-}"
+EXPECTED_CONTRACT_DIGEST="${PRO_GATE_EXPECTED_CONTRACT_DIGEST:-}"
+EXPECTED_CORPUS_DIGEST="${PRO_GATE_EXPECTED_CORPUS_DIGEST:-}"
+EXPECTED_IDENTITY_COUNT=0
+for value in "$EXPECTED_CONTRACT_ID" "$EXPECTED_CONTRACT_VERSION" "$EXPECTED_CONTRACT_DIGEST" "$EXPECTED_CORPUS_DIGEST"; do
+  [ -n "$value" ] && EXPECTED_IDENTITY_COUNT=$((EXPECTED_IDENTITY_COUNT + 1))
+done
+if [ "$EXPECTED_IDENTITY_COUNT" -ne 0 ] && [ "$EXPECTED_IDENTITY_COUNT" -ne 4 ]; then
+  X "adapter review-decision identity is incomplete; use the exact plugin update path"
+elif [ "$EXPECTED_IDENTITY_COUNT" -eq 4 ]; then
+  if ! [[ "$EXPECTED_CONTRACT_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] \
+      || ! [[ "$EXPECTED_CONTRACT_VERSION" =~ ^[0-9]+$ ]] \
+      || ! [[ "$EXPECTED_CONTRACT_DIGEST" =~ ^[0-9a-f]{64}$ ]] \
+      || ! [[ "$EXPECTED_CORPUS_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then
+    X "adapter review-decision identity is malformed; use the exact plugin update path"
+  elif [ -z "${RUNTIME_IDENTITY:-}" ]; then
+    X "adapter review-decision identity cannot compare to missing runtime metadata; use the exact plugin update path"
+  elif [ "$RUNTIME_CONTRACT_ID" != "$EXPECTED_CONTRACT_ID" ]; then
+    X "unknown contract: runtime $RUNTIME_CONTRACT_ID, adapter $EXPECTED_CONTRACT_ID — update through the exact version path"
+  elif [ "$RUNTIME_CONTRACT_VERSION" -gt "$EXPECTED_CONTRACT_VERSION" ]; then
+    X "runtime-newer contract v$RUNTIME_CONTRACT_VERSION exceeds adapter v$EXPECTED_CONTRACT_VERSION — update the active plugin; do not downgrade the runtime"
+  elif [ "$RUNTIME_CONTRACT_VERSION" -lt "$EXPECTED_CONTRACT_VERSION" ]; then
+    X "adapter-newer contract v$EXPECTED_CONTRACT_VERSION exceeds runtime v$RUNTIME_CONTRACT_VERSION — install the exact plugin release"
+  elif [ "$RUNTIME_CONTRACT_DIGEST" != "$EXPECTED_CONTRACT_DIGEST" ]; then
+    X "contract-digest mismatch for $RUNTIME_CONTRACT_ID v$RUNTIME_CONTRACT_VERSION — update through the exact version path"
+  elif [ "$RUNTIME_CORPUS_DIGEST" != "$EXPECTED_CORPUS_DIGEST" ]; then
+    X "corpus mismatch for $RUNTIME_CONTRACT_ID v$RUNTIME_CONTRACT_VERSION — update through the exact version path"
+  else
+    P "runtime and adapter review-decision identities match"
+  fi
+fi
 # Distribution-layer skew (issue #84): the block above only compares runtime
 # against plugin — two things that come from the SAME machine's cache and so
 # will always "match" once both have settled, even when both are stale. That

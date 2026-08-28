@@ -1,0 +1,6 @@
+interface:
+  display_name: "Pro-gate"
+  short_description: "Invoke the typed final-review gate for a pull request"
+  default_prompt: "Use $pro-gate to dispatch the current review-decision/v1 action for this pull request."
+policy:
+  allow_implicit_invocation: false

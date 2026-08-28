@@ -1796,6 +1796,449 @@ pg_completed_lookup() {  # <marker> <out>: place the artifact at <out>; rc 0 on 
   return "$rc"
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# review-decision/v1: pure continuation policy and immutable marker bindings.
+#
+# The reducer below deliberately receives one already-normalized JSON value. It performs no
+# filesystem reads, writes, locking, allocation, browser work, round work, or publication. The
+# fixture digests are compiled into the runtime so resolving an answer never makes metadata files
+# an ambient policy input. Fixture validation is a packaging/test concern exposed by the digest
+# accessors; callers supply their claimed compatibility identity in the normalized snapshot.
+# ─────────────────────────────────────────────────────────────────────────────
+PG_REVIEW_DECISION_CONTRACT_ID='review-decision/v1'
+PG_REVIEW_DECISION_CONTRACT_VERSION=1
+PG_REVIEW_DECISION_CONTRACT_DIGEST='7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee'
+PG_REVIEW_DECISION_CORPUS_DIGEST='2a1e347e4c15766ab9c530074ae75aead7397349f5e13328c40183ced8b70b69'
+
+pg_review_decision_contract_id() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_ID"; }
+pg_review_decision_contract_version() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_VERSION"; }
+pg_review_decision_contract_digest() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_DIGEST"; }
+pg_review_decision_corpus_digest() { printf '%s\n' "$PG_REVIEW_DECISION_CORPUS_DIGEST"; }
+
+# Compatibility metadata only: reducers continue to use the compiled constants above.
+pg_review_decision_identity_json() {
+  jq -cnS --arg contract_id "$PG_REVIEW_DECISION_CONTRACT_ID" \
+    --argjson contract_version "$PG_REVIEW_DECISION_CONTRACT_VERSION" \
+    --arg contract_digest "$PG_REVIEW_DECISION_CONTRACT_DIGEST" \
+    --arg corpus_digest "$PG_REVIEW_DECISION_CORPUS_DIGEST" \
+    '{contract_digest:$contract_digest,contract_id:$contract_id,contract_version:$contract_version,corpus_digest:$corpus_digest}'
+}
+
+pg_review_decision_identity_file_valid() { # path; exact compact canonical metadata from these constants
+  local path="$1" canonical expected
+  [ -f "$path" ] && [ ! -L "$path" ] && pg_have jq || return 1
+  canonical="$(LC_ALL=C jq -ceS '
+    if type == "object" and
+       keys == ["contract_digest","contract_id","contract_version","corpus_digest"] and
+       (.contract_id | type == "string" and length > 0) and
+       (.contract_version | type == "number" and floor == . and . > 0) and
+       (.contract_digest | type == "string" and test("^[0-9a-f]{64}$")) and
+       (.corpus_digest | type == "string" and test("^[0-9a-f]{64}$"))
+    then . else error("invalid review-decision identity") end
+  ' "$path" 2>/dev/null)" || return 1
+  expected="$(pg_review_decision_identity_json)" || return 1
+  [ "$canonical" = "$expected" ] && printf '%s' "$expected" | cmp -s - "$path"
+}
+
+# Canonical JSON is intentionally a small, shared primitive: jq -S recursively sorts object
+# keys, -c removes insignificant whitespace, and command substitution removes jq's one LF. Arrays
+# retain their source order. The C locale avoids locale-dependent diagnostics/character classes.
+pg_review_json_canonical() { # [json]; with no argument, read stdin
+  local json canonical
+  if [ "$#" -gt 0 ]; then json="$1"; else json="$(cat)"; fi
+  canonical="$(LC_ALL=C printf '%s' "$json" | jq -ceS . 2>/dev/null)" || return 1
+  printf '%s' "$canonical"
+}
+
+pg_review_sha256_text() { # text: digest bytes exactly, without adding a newline
+  local text="${1-}"
+  if pg_have sha256sum; then LC_ALL=C printf '%s' "$text" | sha256sum | awk '{print $1}'
+  elif pg_have shasum; then LC_ALL=C printf '%s' "$text" | shasum -a 256 | awk '{print $1}'
+  elif pg_have openssl; then LC_ALL=C printf '%s' "$text" | openssl dgst -sha256 | awk '{print $NF}'
+  else return 1
+  fi
+}
+
+# A choice is fresh only for the prompt context that named it. The selected value and its proof
+# are excluded from that context; otherwise the proof would be self-referential.
+pg_review_decision_choice_snapshot() { # normalized facts JSON -> sha256
+  local canonical
+  canonical="$(printf '%s' "${1-}" | jq -ceS '.named_choice.selected_id=null | .named_choice.snapshot_digest=""' 2>/dev/null)" || return 1
+  pg_review_sha256_text "$canonical"
+}
+
+# Parse the deliberately tiny NEEDS-DISCUSSION choice grammar from a canonical review artifact.
+# This is a data extractor, not a prose relay: it emits only schema-bounded JSON fields after the
+# complete artifact and terminal verdict are independently validated.
+pg_review_decision_named_choices() { # review artifact -> canonical outcomes JSON
+  local f="$1" line id label consequence choices='[]' count=0 verdict_seen=false choices_started=false
+  [ -f "$f" ] && [ ! -L "$f" ] && pg_is_review "$f" || return 1
+  [ "$(pg_extract_verdict "$f")" = NEEDS-DISCUSSION ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [[ "$line" =~ ^[[:space:]]*[*_\>#-]*[[:space:]]*VERDICT[*_[:space:]]*: ]]; then
+      verdict_seen=true
+      continue
+    fi
+    if [[ "$line" != CHOICE:* ]]; then
+      # Choice lines form one terminal block; prose after that block is not a machine grammar.
+      [ "$choices_started" = false ] || return 1
+      continue
+    fi
+    [ "$verdict_seen" = false ] || return 1
+    choices_started=true
+    [[ "$line" =~ ^CHOICE:[[:space:]]+([A-Za-z0-9._:/+-]+)[[:space:]]\|[[:space:]]([^\|[:cntrl:]]{1,120})[[:space:]]\|[[:space:]]([^\|[:cntrl:]]{1,240})[[:space:]]*$ ]] || return 1
+    id="${BASH_REMATCH[1]}"; label="${BASH_REMATCH[2]}"; consequence="${BASH_REMATCH[3]}"
+    [ "${#id}" -le 256 ] || return 1
+    # The grammar's separators consume one optional display space; trim only separator-adjacent
+    # whitespace so stored values never contain formatting padding.
+    label="${label#"${label%%[![:space:]]*}"}"; label="${label%"${label##*[![:space:]]}"}"
+    consequence="${consequence#"${consequence%%[![:space:]]*}"}"; consequence="${consequence%"${consequence##*[![:space:]]}"}"
+    [ -n "$label" ] && [ -n "$consequence" ] || return 1
+    [ "${#label}" -le 120 ] && [ "${#consequence}" -le 240 ] || return 1
+    jq -e --arg id "$id" --arg label "$label" --arg consequence "$consequence" \
+      'all(.[]; .id != $id)' <<<"$choices" >/dev/null 2>&1 || return 1
+    choices="$(jq -cS --arg id "$id" --arg label "$label" --arg consequence "$consequence" \
+      '. + [{consequence:$consequence,id:$id,label:$label}]' <<<"$choices")" || return 1
+    count=$((count + 1))
+    [ "$count" -le 8 ] || return 1
+  done < "$f"
+  [ "$verdict_seen" = true ] && [ "$count" -ge 2 ] || return 1
+  printf '%s' "$choices"
+}
+
+pg_review_decision_emit() { # action reason facts snapshot-digest applicable-ref
+  local action="$1" reason="$2" facts="$3" snapshot="$4" ref="${5:-}" class out
+  # The ask payload supplies the exact selection context, not the surrounding decision envelope.
+  [ "$action" != ask-named-product-choice ] || snapshot="$(pg_review_decision_choice_snapshot "$facts")" || return 1
+  case "$action" in
+    collect-existing-result|recover-existing-review|run-granted-review) class='runtime-guarded-effect' ;;
+    fix-review-findings|prepare-matching-review-evidence) class='agent-task' ;;
+    stop-without-new-review|allow-existing-merge-workflow) class='report-only' ;;
+    ask-named-product-choice) class='named-product-choice' ;;
+    *) return 1 ;;
+  esac
+  out="$(jq -cnS \
+    --arg action "$action" --arg reason "$reason" --arg class "$class" --arg snapshot "$snapshot" \
+    --arg ref "$ref" --arg cid "$PG_REVIEW_DECISION_CONTRACT_ID" \
+    --argjson cv "$PG_REVIEW_DECISION_CONTRACT_VERSION" \
+    --arg cd "$PG_REVIEW_DECISION_CONTRACT_DIGEST" --arg xd "$PG_REVIEW_DECISION_CORPUS_DIGEST" \
+    --argjson facts "$facts" '
+      {action:$action,
+       contract:{contract_digest:$cd,contract_id:$cid,contract_version:$cv,corpus_digest:$xd},
+       effect_request:{action:$action,applicable_ref:(if $ref=="" then null else $ref end),
+         contract_digest:$cd,effect:$action,execution_class:$class,snapshot_digest:$snapshot,
+         target:($facts.target // null)},
+       facts:$facts,observation:($facts.observation // {kind:"rejected"}),reason:$reason}' 2>/dev/null)" || return 1
+  printf '%s' "$out"
+}
+
+pg_review_decision_reject() { # reason snapshot; never reflect rejected untrusted data
+  pg_review_decision_emit stop-without-new-review "$1" '{}' "$2" ''
+}
+
+pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read stdin
+  local supplied canonical snapshot unsafe valid reason selected selected_ref selected_count
+  local action prior prior_applicable verdict choice_snapshot
+  pg_have jq || return 1
+  if [ "$#" -gt 0 ]; then supplied="$1"; else supplied="$(cat)"; fi
+  canonical="$(pg_review_json_canonical "$supplied")" || return 1
+  snapshot="$(pg_review_sha256_text "$canonical")" || return 1
+
+  # Raw/caller control fields, credentials, control characters, and unbounded structures are not
+  # normalized facts. Reject them before any response can reflect their values.
+  unsafe="$(printf '%s' "$canonical" | jq -r '
+    if (type != "object") then "yes"
+    elif ([.. | objects | keys[] |
+      test("^(raw|.*_text|prose|prompt|caller.*|status|next_action|approval.*|.*ledger.*|.*password.*|.*secret.*|.*credential.*|authorization|api[_-]?key|api[_-]?token|access[_-]?token|private[_-]?key)$";"i")] | any) then "yes"
+    elif ([.. | strings | (length > 1024 or test("[\u0000-\u001f\u007f]"))] | any) then "yes"
+    elif ([.. | arrays | length > 32] | any) then "yes"
+    else "no" end' 2>/dev/null)" || unsafe=yes
+  if [ "$unsafe" != no ]; then
+    pg_review_decision_reject unsafe-normalized-input "$snapshot"; return
+  fi
+
+  # Compatibility and transport are checked before the domain shape so skew and collision have
+  # stable directional reasons, even when a newer producer also carries unfamiliar fields.
+  if ! jq -e --arg id "$PG_REVIEW_DECISION_CONTRACT_ID" --argjson v "$PG_REVIEW_DECISION_CONTRACT_VERSION" \
+      --arg cd "$PG_REVIEW_DECISION_CONTRACT_DIGEST" --arg xd "$PG_REVIEW_DECISION_CORPUS_DIGEST" \
+      '.contract.contract_id==$id and .contract.contract_version==$v and .contract.contract_digest==$cd and .contract.corpus_digest==$xd' \
+      <<<"$canonical" >/dev/null 2>&1; then
+    pg_review_decision_reject unknown-contract "$snapshot"; return
+  fi
+  if [ "$(jq -r '.transport // ""' <<<"$canonical")" != "$PG_REVIEW_DECISION_CONTRACT_ID" ]; then
+    pg_review_decision_reject transport-collision "$snapshot"; return
+  fi
+
+  # Closed normalized-facts grammar. No repository/review prose is admitted, marker references
+  # use the existing filename-safe grammar, and each nested object has an exact key set.
+  valid="$(printf '%s' "$canonical" | jq -r '
+    def keys_are($x): keys == ($x|sort);
+    def marker: type=="string" and (length==0 or test("^pg-run-[A-Za-z0-9.-]+$"));
+    def ident: type=="string" and length<=256 and test("^[A-Za-z0-9._:/+-]*$");
+    def hex: type=="string" and test("^[0-9a-f]{64}$");
+    def oid: type=="string" and test("^[0-9a-f]{40}([0-9a-f]{24})?$");
+    def result:
+      keys_are(["applicable","artifact_digest","binding_valid","canonical_identity","charged_spend_epoch","collected","legacy","marker","provenance_valid","verdict"])
+      and (.applicable|type=="boolean") and (.artifact_digest|hex) and (.binding_valid|type=="boolean")
+      and (.canonical_identity|ident and length>0) and (.charged_spend_epoch|type=="number" and floor==.)
+      and (.collected|type=="boolean") and (.legacy|type=="boolean") and (.marker|marker and length>0)
+      and (.provenance_valid|type=="boolean") and (.verdict|IN("SHIP","FIX-FIRST","NEEDS-DISCUSSION","NONE"));
+    (keys_are(["active_index","completed_results","contract","evidence","governor","input","named_choice","observation","prior_review","reservation","target","transport"]))
+    and (.contract|keys_are(["contract_digest","contract_id","contract_version","corpus_digest"]))
+    and (.active_index|keys_are(["binding_valid","charged_spend_epoch","marker","state"]))
+    and (.active_index.binding_valid|type=="boolean") and (.active_index.charged_spend_epoch|type=="number" and floor==.)
+    and (.active_index.marker|marker)
+    and (.active_index.state|IN("none","live","pre-charge","round-recorded","charged","run-meta-written","input-bound","submitted","unknown-fate"))
+    and (.completed_results|type=="array" and all(.[];result))
+    and (.evidence|keys_are(["identity","safe_to_prepare","state"])) and (.evidence.identity|ident)
+    and (.evidence.safe_to_prepare|type=="boolean") and (.evidence.state|IN("matching","missing","unsafe","invalid","undefined"))
+    and (.governor|keys_are(["granted"])) and (.governor.granted|type=="boolean")
+    and (.input|keys_are(["binding_valid","identity","proven"])) and (.input.binding_valid|type=="boolean")
+    and (.input.identity|ident) and (.input.proven|type=="boolean")
+    and (.named_choice|keys_are(["outcomes","selected_id","snapshot_digest"]))
+    and (.named_choice.outcomes|type=="array" and length<=8 and all(.[];
+      keys_are(["consequence","id","label"]) and (.id|ident and length>0) and
+      (.label|type=="string" and length>0 and length<=120) and (.consequence|type=="string" and length>0 and length<=240)))
+    and (([.named_choice.outcomes[].id]|length)==([.named_choice.outcomes[].id]|unique|length))
+    and (.named_choice.selected_id==null or (.named_choice.selected_id|ident and length>0))
+    and (.named_choice.snapshot_digest|type=="string" and (length==0 or .=="CURRENT" or hex))
+    and (.observation|keys_are(["kind"])) and (.observation.kind|IN("idle","queued","running","waiting","observed"))
+    and (.prior_review|keys_are(["applicable","binding_valid","code_identity","evidence_identity","legacy","marker","provenance_valid","verdict"]))
+    and (.prior_review.applicable|type=="boolean") and (.prior_review.binding_valid|type=="boolean")
+    and (.prior_review.code_identity|ident) and (.prior_review.evidence_identity|ident) and (.prior_review.legacy|type=="boolean")
+    and (.prior_review.marker|marker) and (.prior_review.provenance_valid|type=="boolean")
+    and (.prior_review.verdict|IN("SHIP","FIX-FIRST","NEEDS-DISCUSSION","NONE"))
+    and (.reservation|keys_are(["binding_valid","legacy","marker","state"]))
+    and (.reservation.binding_valid|type=="boolean") and (.reservation.legacy|type=="boolean")
+    and (.reservation.marker|marker) and (.reservation.state|IN("none","live","recoverable","unknown-fate"))
+    and (.target|keys_are(["head_oid","host","owner","pr","repo"])) and (.target.head_oid|oid)
+    and (.target.host|test("^[A-Za-z0-9.-]+$") and length<=253)
+    and (.target.owner|test("^[A-Za-z0-9._-]+$") and length<=100)
+    and (.target.repo|test("^[A-Za-z0-9._-]+$") and length<=100)
+    and (.target.pr|type=="number" and floor==. and .>0)
+    and (.transport=="review-decision/v1")' 2>/dev/null)" || valid=false
+  if [ "$valid" != true ]; then
+    pg_review_decision_reject undefined-state "$snapshot"; return
+  fi
+
+  # Existing completed work wins. Selection is newest charged epoch, then canonical identity;
+  # duplicate rows still tied on both fields are unresolved and stop closed.
+  selected="$(jq -cS '[.completed_results[] | select(.applicable or .legacy)] | sort_by(.charged_spend_epoch,.canonical_identity) | last // empty' <<<"$canonical")"
+  if [ -n "$selected" ]; then
+    selected_count="$(jq -r --argjson s "$selected" '[.completed_results[] | select(.charged_spend_epoch==$s.charged_spend_epoch and .canonical_identity==$s.canonical_identity)] | length' <<<"$canonical")"
+    if [ "$selected_count" -gt 1 ]; then
+      pg_review_decision_emit stop-without-new-review completed-result-tie "$canonical" "$snapshot"; return
+    fi
+    selected_ref="$(jq -r .canonical_identity <<<"$selected")"
+    if [ "$(jq -r .collected <<<"$selected")" = false ]; then
+      pg_review_decision_emit collect-existing-result completed-result-awaits-collection "$canonical" "$snapshot" "$selected_ref"; return
+    fi
+  fi
+
+  # Active and reserved facts are authority even when a crash happened between charge protocol
+  # steps. None of these states can become fresh eligibility by absence of a later sidecar.
+  if [ "$(jq -r .active_index.state <<<"$canonical")" != none ]; then
+    pg_review_decision_emit recover-existing-review active-work-requires-recovery "$canonical" "$snapshot" \
+      "$(jq -r .active_index.marker <<<"$canonical")"; return
+  fi
+  if [ "$(jq -r .reservation.state <<<"$canonical")" != none ]; then
+    pg_review_decision_emit recover-existing-review active-work-requires-recovery "$canonical" "$snapshot" \
+      "$(jq -r .reservation.marker <<<"$canonical")"; return
+  fi
+
+  # A missing but safely preparable evidence relation must reach the preparer before the absent
+  # input binding can stop it. Unsafe/invalid/undefined evidence is still terminal, while a
+  # matching relation remains unable to authorize a run until its input binding is proven.
+  case "$(jq -r .evidence.state <<<"$canonical")" in
+    missing)
+      if [ "$(jq -r .evidence.safe_to_prepare <<<"$canonical")" = true ]; then
+        pg_review_decision_emit prepare-matching-review-evidence matching-evidence-requires-preparation "$canonical" "$snapshot"
+      else
+        pg_review_decision_emit stop-without-new-review evidence-preparation-unsafe "$canonical" "$snapshot"
+      fi
+      return ;;
+    unsafe|invalid)
+      pg_review_decision_emit stop-without-new-review no-safe-action "$canonical" "$snapshot"; return ;;
+    undefined)
+      pg_review_decision_emit stop-without-new-review undefined-state "$canonical" "$snapshot"; return ;;
+  esac
+  if [ "$(jq -r '.input.proven' <<<"$canonical")" != true ]; then
+    pg_review_decision_emit stop-without-new-review unproven-input "$canonical" "$snapshot"; return
+  fi
+  if [ "$(jq -r '.input.binding_valid' <<<"$canonical")" != true ]; then
+    pg_review_decision_emit stop-without-new-review invalid-binding "$canonical" "$snapshot"; return
+  fi
+
+  # A collected exact-evidence result is terminal. A same-code prior with different evidence is
+  # progress context only: it participates in the identical-evidence check below, but its verdict
+  # cannot route this continuation.
+  if [ -n "$selected" ]; then
+    prior="$selected"; prior_applicable=true
+  else
+    prior="$(jq -cS .prior_review <<<"$canonical")"
+    prior_applicable="$(jq -r .applicable <<<"$prior")"
+  fi
+  if [ "$prior_applicable" = true ]; then
+    if [ "$(jq -r '.legacy // false' <<<"$prior")" = true ]; then
+      pg_review_decision_emit stop-without-new-review legacy-not-authoritative "$canonical" "$snapshot"; return
+    fi
+    if [ "$(jq -r '.marker // ""' <<<"$prior")" != "" ] && \
+       { [ "$(jq -r '.binding_valid // false' <<<"$prior")" != true ] || [ "$(jq -r '.provenance_valid // false' <<<"$prior")" != true ]; }; then
+      if [ "$(jq -r '.binding_valid // false' <<<"$prior")" != true ]; then reason=invalid-binding; else reason=invalid-result-provenance; fi
+      pg_review_decision_emit stop-without-new-review "$reason" "$canonical" "$snapshot"; return
+    fi
+
+    verdict="$(jq -r '.verdict // "NONE"' <<<"$prior")"
+    selected_ref="$(jq -r '.canonical_identity // .marker // ""' <<<"$prior")"
+    case "$verdict" in
+      FIX-FIRST)
+        pg_review_decision_emit fix-review-findings review-findings-require-fix "$canonical" "$snapshot" "$selected_ref"; return ;;
+      SHIP)
+        pg_review_decision_emit allow-existing-merge-workflow current-ship-is-merge-eligible "$canonical" "$snapshot" "$selected_ref"; return ;;
+      NEEDS-DISCUSSION)
+        if [ "$(jq -r '.named_choice.outcomes|length' <<<"$canonical")" -lt 2 ]; then
+          pg_review_decision_emit stop-without-new-review invalid-named-choice "$canonical" "$snapshot" "$selected_ref"; return
+        fi
+        if [ "$(jq -r '.named_choice.selected_id // ""' <<<"$canonical")" = "" ]; then
+          pg_review_decision_emit ask-named-product-choice named-product-choice-required "$canonical" "$snapshot" "$selected_ref"; return
+        fi
+        if ! jq -e '.named_choice as $c | any($c.outcomes[]; .id==$c.selected_id)' <<<"$canonical" >/dev/null 2>&1; then
+          pg_review_decision_emit stop-without-new-review invalid-named-choice "$canonical" "$snapshot" "$selected_ref"; return
+        fi
+        choice_snapshot="$(pg_review_decision_choice_snapshot "$canonical")" || return 1
+        if [ "$(jq -r .named_choice.snapshot_digest <<<"$canonical")" != "$choice_snapshot" ]; then
+          pg_review_decision_emit stop-without-new-review stale-named-choice "$canonical" "$snapshot" "$selected_ref"; return
+        fi
+        pg_review_decision_emit fix-review-findings named-product-choice-selected "$canonical" "$snapshot" "$selected_ref"; return ;;
+    esac
+  fi
+
+  if jq -e '.prior_review.binding_valid and .prior_review.provenance_valid and
+      .prior_review.code_identity==.input.identity and .prior_review.evidence_identity==.evidence.identity' \
+      <<<"$canonical" >/dev/null 2>&1; then
+    pg_review_decision_emit stop-without-new-review identical-code-and-evidence "$canonical" "$snapshot"; return
+  fi
+  if [ "$(jq -r .governor.granted <<<"$canonical")" != true ]; then
+    pg_review_decision_emit stop-without-new-review round-governor-denied "$canonical" "$snapshot"; return
+  fi
+  if [ "$(jq -r .evidence.state <<<"$canonical")" = matching ]; then
+    pg_review_decision_emit run-granted-review round-granted-for-changed-input "$canonical" "$snapshot"; return
+  fi
+  pg_review_decision_emit stop-without-new-review no-safe-action "$canonical" "$snapshot"
+}
+
+# Exactly two marker-addressed immutable sibling record stores. Existing run-meta, reservation,
+# active-index, completed-artifact, and round layouts are intentionally untouched.
+pg_review_input_binding_dir() { printf '%s\n' "${PRO_GATE_REVIEW_INPUT_BINDING_DIR:-$PRO_GATE_HOME/review-input-bindings}"; }
+pg_review_result_binding_dir() { printf '%s\n' "${PRO_GATE_REVIEW_RESULT_BINDING_DIR:-$PRO_GATE_HOME/review-result-bindings}"; }
+
+pg_review_input_binding_validate() { # canonical record JSON [expected marker]
+  local json="${1-}" marker="${2:-}" canonical
+  canonical="$(pg_review_json_canonical "$json")" || return 1
+  jq -e --arg marker "$marker" --arg cid "$PG_REVIEW_DECISION_CONTRACT_ID" \
+    --argjson cv "$PG_REVIEW_DECISION_CONTRACT_VERSION" --arg cd "$PG_REVIEW_DECISION_CONTRACT_DIGEST" '
+    def keys_are($x): keys == ($x|sort);
+    def hex: type=="string" and test("^[0-9a-f]{64}$");
+    def oid: type=="string" and test("^[0-9a-f]{40}([0-9a-f]{24})?$");
+    ([.. | strings | (length>1024 or test("[\u0000-\u001f\u007f]"))] | any | not)
+    and keys_are(["charged_spend_epoch","contract_digest","contract_id","contract_version","evidence","marker","record_type","record_version","repository","target"])
+    and .record_type=="review-input-binding/v1" and .record_version==1
+    and .contract_id==$cid and .contract_version==$cv and .contract_digest==$cd
+    and (.marker|test("^pg-run-[A-Za-z0-9.-]+$")) and ($marker=="" or .marker==$marker)
+    and (.charged_spend_epoch|type=="number" and floor==. and .>0)
+    and (.repository|keys_are(["host","owner","repo"]))
+    and (.repository.host|test("^[A-Za-z0-9.-]+$")) and (.repository.owner|test("^[A-Za-z0-9._-]+$")) and (.repository.repo|test("^[A-Za-z0-9._-]+$"))
+    and (.target|keys_are(["head_oid","kind","pr"])) and .target.kind=="pull-request"
+    and (.target.pr|type=="number" and floor==. and .>0) and (.target.head_oid|oid)
+    and (.evidence|keys_are(["identity","mode","proof"])) and (.evidence.identity|type=="string" and test("^[A-Za-z0-9._:/+-]+$") and length<=256)
+    and (.evidence.mode|IN("full-pr","scoped-delta","connector"))
+    and (if .evidence.mode=="full-pr" then
+      (.evidence.proof|keys_are(["base_oid","endpoint_digest","head_oid","raw_patch_digest"]))
+      and (.evidence.proof.base_oid|oid) and (.evidence.proof.head_oid|oid) and .evidence.proof.head_oid==.target.head_oid
+      and (.evidence.proof.endpoint_digest|hex) and (.evidence.proof.raw_patch_digest|hex)
+    elif .evidence.mode=="scoped-delta" then
+      (.evidence.proof|keys_are(["base_oid","end_oid","filtering_manifest_digest","lineage_identity","raw_digest","reviewed_payload_digest","scope_algorithm"]))
+      and (.evidence.proof.base_oid|oid) and (.evidence.proof.end_oid|oid) and .evidence.proof.end_oid==.target.head_oid
+      and (.evidence.proof.filtering_manifest_digest|hex) and (.evidence.proof.raw_digest|hex) and (.evidence.proof.reviewed_payload_digest|hex)
+      and (.evidence.proof.lineage_identity|type=="string" and length>0 and length<=256)
+      and (.evidence.proof.scope_algorithm|type=="string" and length>0 and length<=64)
+    else
+      (.evidence.proof|keys_are(["commit_target","endpoint_digest","raw_diff_digest","repository_target"]))
+      and (.evidence.proof.commit_target|oid) and .evidence.proof.commit_target==.target.head_oid
+      and (.evidence.proof.repository_target|type=="string" and length>0 and length<=256)
+      and ((.evidence.proof.endpoint_digest==null) or (.evidence.proof.endpoint_digest|hex))
+      and ((.evidence.proof.raw_diff_digest==null) or (.evidence.proof.raw_diff_digest|hex))
+    end)' <<<"$canonical" >/dev/null 2>&1
+}
+
+pg_review_result_binding_validate() { # canonical record JSON [expected marker]
+  local json="${1-}" marker="${2:-}" canonical
+  canonical="$(pg_review_json_canonical "$json")" || return 1
+  jq -e --arg marker "$marker" --arg cid "$PG_REVIEW_DECISION_CONTRACT_ID" \
+    --argjson cv "$PG_REVIEW_DECISION_CONTRACT_VERSION" --arg cd "$PG_REVIEW_DECISION_CONTRACT_DIGEST" '
+    def keys_are($x): keys == ($x|sort);
+    def hex: type=="string" and test("^[0-9a-f]{64}$");
+    def oid: type=="string" and test("^[0-9a-f]{40}([0-9a-f]{24})?$");
+    ([.. | strings | (length>1024 or test("[\u0000-\u001f\u007f]"))] | any | not)
+    and keys_are(["accepted_epoch","artifact","contract_digest","contract_id","contract_version","input_binding_digest","input_binding_identity","marker","named_choice","provenance","record_type","record_version","ship_proof","verdict"])
+    and .record_type=="review-result-binding/v1" and .record_version==1
+    and .contract_id==$cid and .contract_version==$cv and .contract_digest==$cd
+    and (.marker|test("^pg-run-[A-Za-z0-9.-]+$")) and ($marker=="" or .marker==$marker)
+    and (.accepted_epoch|type=="number" and floor==. and .>0)
+    and (.input_binding_digest|hex) and .input_binding_identity==.marker
+    and (.artifact|keys_are(["digest","path"])) and (.artifact.digest|hex)
+    and .artifact.path==( "completed/" + .marker )
+    and (.provenance|keys_are(["outcome","validated_epoch"])) and .provenance.outcome=="accepted"
+    and (.provenance.validated_epoch|type=="number" and floor==. and .>0)
+    and (.verdict|IN("SHIP","FIX-FIRST","NEEDS-DISCUSSION"))
+    and (.named_choice==null or ((.named_choice|keys_are(["consequence","id","label"])) and (.named_choice.id|type=="string" and length>0 and length<=256) and (.named_choice.label|type=="string" and length>0 and length<=120) and (.named_choice.consequence|type=="string" and length>0 and length<=240)))
+    and (if .verdict=="SHIP" then
+      (.ship_proof|keys_are(["base_oid","diff_digest","head_oid"])) and (.ship_proof.base_oid|oid) and (.ship_proof.head_oid|oid) and (.ship_proof.diff_digest|hex)
+    else .ship_proof==null end)' <<<"$canonical" >/dev/null 2>&1
+}
+
+pg_review_binding_write_immutable() { # type marker json
+  local type="$1" marker="$2" json="$3" canonical dir f tmp rc
+  pg_reservation_marker_ok "$marker" || return 1
+  canonical="$(pg_review_json_canonical "$json")" || return 1
+  case "$type" in
+    input) pg_review_input_binding_validate "$canonical" "$marker" || return 1; dir="$(pg_review_input_binding_dir)" ;;
+    result) pg_review_result_binding_validate "$canonical" "$marker" || return 1; dir="$(pg_review_result_binding_dir)" ;;
+    *) return 1 ;;
+  esac
+  mkdir -p "$dir" 2>/dev/null || return 1
+  f="$dir/$marker"; tmp="$dir/.$marker.tmp.$$"
+  if LC_ALL=C printf '%s' "$canonical" > "$tmp" 2>/dev/null && ln "$tmp" "$f" 2>/dev/null; then
+    rc=0
+  elif [ -f "$f" ] && [ ! -L "$f" ] && cmp -s "$tmp" "$f" 2>/dev/null; then
+    rc=0
+  else
+    rc=1
+  fi
+  rm -f "$tmp" 2>/dev/null
+  return "$rc"
+}
+
+pg_review_input_binding_write() { pg_review_binding_write_immutable input "$1" "$2"; }
+pg_review_result_binding_write() { pg_review_binding_write_immutable result "$1" "$2"; }
+
+pg_review_binding_read() { # type marker
+  local type="$1" marker="$2" dir f json canonical
+  pg_reservation_marker_ok "$marker" || return 1
+  case "$type" in input) dir="$(pg_review_input_binding_dir)";; result) dir="$(pg_review_result_binding_dir)";; *) return 1;; esac
+  f="$dir/$marker"; [ -f "$f" ] && [ ! -L "$f" ] || return 1
+  json="$(cat "$f" 2>/dev/null)" || return 1
+  canonical="$(pg_review_json_canonical "$json")" || return 1
+  [ "$(wc -c < "$f" 2>/dev/null | tr -d ' ')" = "${#canonical}" ] || return 1
+  case "$type" in input) pg_review_input_binding_validate "$canonical" "$marker";; result) pg_review_result_binding_validate "$canonical" "$marker";; esac || return 1
+  printf '%s' "$canonical"
+}
+
+pg_review_input_binding_read() { pg_review_binding_read input "$1"; }
+pg_review_result_binding_read() { pg_review_binding_read result "$1"; }
+pg_review_input_binding_digest() { local r; r="$(pg_review_input_binding_read "$1")" || return 1; pg_review_sha256_text "$r"; }
+pg_review_result_binding_digest() { local r; r="$(pg_review_result_binding_read "$1")" || return 1; pg_review_sha256_text "$r"; }
+
 # pg_ledger_lookup_clean <marker>: echo "out<TAB>sha256" from the newest CLEAN ledger row for
 # a marker, or nothing. Fallback for pre-artifact collections (#52 item 2): lets a harvest
 # whose reservation is already absent return an ALREADY-COLLECTED review instead of declaring
