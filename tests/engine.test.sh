@@ -3031,19 +3031,6 @@ printf '555\t/tmp/o555.md\t%s\t0\t1\tgpt\n' "$(( $(date +%s) - 30000 ))" > "$GHO
 env PRO_GATE_HOME="$GHOME" bash "$ENGINE" --status 555 --json >"$TDIR/grec2.json" 2>"$TDIR/stderr"
 check 'expired reservation: recoverable=false' \
   "$(jq -e '.recoverable == false' "$TDIR/grec2.json" >/dev/null 2>&1; echo $?)" "$(jq -c '{recoverable,recoverable_reason}' "$TDIR/grec2.json" 2>/dev/null)"
-# The daemon's guard, through the EXACT subprocess call it ships with (a broken --status
-# argument order shipped once because nothing exercised this path).
-printf '555\t/tmp/o555.md\t%s\t0\t1\tgpt\n' "$(date +%s)" > "$GHOME/in-progress/$MRES"
-( export PRO_GATE_HOME="$GHOME" PRO_GATE_DAEMON_LIB_ONLY=1
-  . "$HERE/../daemon/daemon.sh"
-  engine_state_recoverable "https://github.com/acme/widgets/pull/555" )
-check 'daemon guard sees the unexpired reservation (rc 0)' "$([ $? -eq 0 ]; echo $?)" ""
-rm -f "$GHOME/in-progress/$MRES"
-( export PRO_GATE_HOME="$GHOME" PRO_GATE_DAEMON_LIB_ONLY=1
-  . "$HERE/../daemon/daemon.sh"
-  engine_state_recoverable "https://github.com/acme/widgets/pull/555" )
-check 'daemon guard: no state means NOT recoverable (rc 1)' "$([ $? -ne 0 ]; echo $?)" ""
-
 echo '# v0.30 gate r1: pre-marker failures persist a provisional run log'
 PLHOME="$TDIR/home-prelog"; mkdir -p "$PLHOME"
 # ORACLE_BROWSER_PORT must point at the mock: without it the engine probes the default CDP

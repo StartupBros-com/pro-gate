@@ -16,19 +16,6 @@ type pg_os >/dev/null 2>&1 || { echo "ERROR: pro-gate lib not found (lib.sh)" >&
 pg_augment_path; pg_load_env
 OS="$(pg_os)"; MODE="$(pg_browser_mode)"
 
-# review-decision/v1 is the daemon's only continuation-policy input. This legacy diagnostic
-# remains sourceable for the historic engine test, but the daemon no longer calls it: recoverable
-# state is selected by the runtime as recover-existing-review, never translated here into retry
-# or failure-budget policy.
-engine_state_recoverable(){ # $1 = PR url
-  local eng js
-  eng="${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh"
-  [ -x "$eng" ] && command -v jq >/dev/null 2>&1 || return 1
-  js="$("$eng" --status "$1" --json 2>/dev/null)" || return 1
-  [ -n "$js" ] || return 1
-  printf '%s' "$js" | jq -e '.recoverable == true' >/dev/null 2>&1
-}
-
 daemon_note(){
   if declare -F log >/dev/null 2>&1; then log "$*"; else printf '%s\n' "$*"; fi
 }
