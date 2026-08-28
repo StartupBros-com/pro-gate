@@ -228,6 +228,10 @@ privileged_runtime_ready() {
     echo "FATAL: runtime $installed does not match plugin $expected; install the exact plugin release" >&2
     return 1
   }
+  pg_review_decision_identity_file_valid "$PRO_GATE_HOME/review-decision-v1.json" || {
+    echo "FATAL: runtime review-decision identity is missing, malformed, or mismatched with its library; install the exact plugin release" >&2
+    return 1
+  }
   # v0.23 (dogfood gate P1): also defer while the runtime differs from the ACTIVE marketplace
   # plugin. During the window between a marketplace plugin update and the runtime catching up
   # (auto-update timer or manual install), a dispatched headless child would load the NEW

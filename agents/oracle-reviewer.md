@@ -19,14 +19,28 @@ task. Observation is non-prompting and is not blocking-wait next_action.
 
 ## Compatibility
 
-Resolve a semantic `MAJOR.MINOR.PATCH` promoted plugin version and verify the matching runtime before
-an effect. If resolution fails, return `ERROR: could not resolve a valid plugin version` and stop.
+Resolve the promoted plugin version and exact plugin-side identity through the shipped resolver.
+Claude Code uses `CLAUDE_PLUGIN_ROOT`. A repository-mounted Codex skill sets `SKILL_ROOT` (or
+`PRO_GATE_SKILL_ROOT`) to the directory containing its mounted `SKILL.md`; no Claude cache path is
+required. Any missing or malformed resolver output stops through the exact update path.
 
 ```bash
-PLUGIN_VERSION="$(python3 -c 'import json,re,sys; v=json.load(open(sys.argv[1]))["version"]; print(v) if isinstance(v,str) and re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+",v) else sys.exit(1)' \
-  "${CLAUDE_PLUGIN_ROOT}/.claude-plugin/plugin.json")" || exit 1
+if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ]; then
+  IDENTITY_RESOLVER="$CLAUDE_PLUGIN_ROOT/skills/pro-gate/scripts/resolve-identity.sh"
+else
+  SKILL_ROOT="${PRO_GATE_SKILL_ROOT:-${SKILL_ROOT:-}}"
+  IDENTITY_RESOLVER="$SKILL_ROOT/scripts/resolve-identity.sh"
+fi
+[ -x "$IDENTITY_RESOLVER" ] || { echo "ERROR: pro-gate identity resolver is unavailable" >&2; exit 1; }
+IFS=$'\t' read -r PLUGIN_VERSION CONTRACT_ID CONTRACT_VERSION CONTRACT_DIGEST CORPUS_DIGEST < <(
+  "$IDENTITY_RESOLVER"
+) || { echo "ERROR: could not resolve a valid plugin version or review-decision identity" >&2; exit 1; }
 PG="${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh"
 PRO_GATE_EXPECTED_VERSION="$PLUGIN_VERSION" \
+PRO_GATE_EXPECTED_CONTRACT_ID="$CONTRACT_ID" \
+PRO_GATE_EXPECTED_CONTRACT_VERSION="$CONTRACT_VERSION" \
+PRO_GATE_EXPECTED_CONTRACT_DIGEST="$CONTRACT_DIGEST" \
+PRO_GATE_EXPECTED_CORPUS_DIGEST="$CORPUS_DIGEST" \
   "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/pro-gate-doctor.sh"
 ```
 
@@ -53,12 +67,13 @@ QUERY_ARGS=(--review-decision --json --pr "$PR" --repo "$REPO" --input "${INPUT:
 # Full/scoped proof paths use PRO_GATE_REVIEW_ENDPOINT_PATCH and, for scoped input,
 # PRO_GATE_REVIEW_FILTER_MANIFEST.
 "$PG" "${QUERY_ARGS[@]}" > "$DECISION"
-jq -e '
-  .contract.contract_id == "review-decision/v1" and
+jq -e --arg id "$CONTRACT_ID" --argjson version "$CONTRACT_VERSION" \
+  --arg digest "$CONTRACT_DIGEST" --arg corpus "$CORPUS_DIGEST" '
+  .contract == {contract_id:$id,contract_version:$version,contract_digest:$digest,corpus_digest:$corpus} and
   .effect_request.action == .action and
   (.effect_request.execution_class |
     IN("runtime-guarded-effect","agent-task","report-only","named-product-choice"))
-' "$DECISION" >/dev/null
+' "$DECISION" >/dev/null || { echo "ERROR: runtime decision identity is incompatible; use the exact version-update path" >&2; exit 1; }
 ```
 
 Contract and corpus digests must match the promoted adapter. A saved decision is advisory only.

@@ -70,6 +70,21 @@ CORPUS_DIGEST="$(sha256sum "$CORPUS" | cut -d' ' -f1)"
 check 'runtime identity exactly matches the frozen contract and corpus bytes' \
   "$([ "$(pg_review_decision_contract_digest)" = "$CONTRACT_DIGEST" ] && [ "$(pg_review_decision_corpus_digest)" = "$CORPUS_DIGEST" ]; printf '%s' "$?")" \
   "runtime-contract=$(pg_review_decision_contract_digest) fixture-contract=$CONTRACT_DIGEST runtime-corpus=$(pg_review_decision_corpus_digest) fixture-corpus=$CORPUS_DIGEST"
+PLUGIN_IDENTITY="$HERE/../skills/pro-gate/review-decision-v1.json"
+check 'plugin identity is compact canonical metadata byte-identical to compiled library accessors' \
+  "$([ "$(jq -cS . "$PLUGIN_IDENTITY")" = "$(<"$PLUGIN_IDENTITY")" ] && [ "$(tail -c 1 "$PLUGIN_IDENTITY" | od -An -tuC | tr -d ' ')" != 10 ] && [ "$(pg_review_decision_identity_json)" = "$(<"$PLUGIN_IDENTITY")" ]; printf '%s' "$?")" \
+  "identity=$(<"$PLUGIN_IDENTITY")"
+check 'library exposes the canonical contract id and version accessors' \
+  "$([ "$(pg_review_decision_contract_id)" = review-decision/v1 ] && [ "$(pg_review_decision_contract_version)" = 1 ]; printf '%s' "$?")"
+IDENTITY_RESOLVER="$HERE/../skills/pro-gate/scripts/resolve-identity.sh"
+PLUGIN_VERSION="$(jq -r .version "$HERE/../.claude-plugin/plugin.json")"
+EXPECTED_IDENTITY_FIELDS="$(printf '%s\t%s\t%s\t%s\t%s' "$PLUGIN_VERSION" "$(pg_review_decision_contract_id)" "$(pg_review_decision_contract_version)" "$CONTRACT_DIGEST" "$CORPUS_DIGEST")"
+CLAUDE_IDENTITY_FIELDS="$(CLAUDE_PLUGIN_ROOT="$HERE/.." "$IDENTITY_RESOLVER" 2>/dev/null || true)"
+CODEX_IDENTITY_FIELDS="$(env -u CLAUDE_PLUGIN_ROOT SKILL_ROOT="$HERE/../skills/pro-gate" "$IDENTITY_RESOLVER" 2>/dev/null || true)"
+check 'identity resolver supports the Claude plugin-root layout' \
+  "$([ "$CLAUDE_IDENTITY_FIELDS" = "$EXPECTED_IDENTITY_FIELDS" ]; printf '%s' "$?")" "$CLAUDE_IDENTITY_FIELDS"
+check 'identity resolver supports the repository-mounted Codex skill layout' \
+  "$([ "$CODEX_IDENTITY_FIELDS" = "$EXPECTED_IDENTITY_FIELDS" ]; printf '%s' "$?")" "$CODEX_IDENTITY_FIELDS"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
