@@ -122,9 +122,22 @@ read-only diagnostics remain available through:
 "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --harvest <run-marker> --out <out> --timeout 20m
 ```
 
-`ask-named-product-choice is the only prompt.` Validate selection freshness, pass a valid selection
-non-authoritatively to the coding agent, and re-enter after code or policy change. Malformed or stale
-selection stops; it cannot authorize review or merge.
+`ask-named-product-choice is the only prompt.` Present only the normalized outcomes. Return the
+selected ID and the ask decision's exact snapshot through the runtime:
+
+```bash
+CHOICE_ID="<selected normalized id>"
+CHOICE_SNAPSHOT="$(jq -r .effect_request.snapshot_digest "$DECISION")"
+SELECTION="${DECISION}.selection"
+printf '%s' "$(jq -cnS --arg id "$CHOICE_ID" --arg snapshot "$CHOICE_SNAPSHOT" \
+  '{selected_id:$id,snapshot_digest:$snapshot}')" > "$SELECTION"
+"$PG" "${QUERY_ARGS[@]}" --review-choice-selection "$SELECTION" > "${DECISION}.fresh"
+rm -f "$SELECTION"
+```
+
+Dispatch only the fresh decision. A valid selection is freshness-validated and passed
+non-authoritatively to the coding agent, which re-enters after code or policy change. Malformed or
+stale selection stops; it cannot authorize review or merge.
 
 ## Relay boundary
 
