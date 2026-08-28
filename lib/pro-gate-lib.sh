@@ -1840,8 +1840,49 @@ pg_review_decision_choice_snapshot() { # normalized facts JSON -> sha256
   pg_review_sha256_text "$canonical"
 }
 
+# Parse the deliberately tiny NEEDS-DISCUSSION choice grammar from a canonical review artifact.
+# This is a data extractor, not a prose relay: it emits only schema-bounded JSON fields after the
+# complete artifact and terminal verdict are independently validated.
+pg_review_decision_named_choices() { # review artifact -> canonical outcomes JSON
+  local f="$1" line id label consequence choices='[]' count=0 verdict_seen=false choices_started=false
+  [ -f "$f" ] && [ ! -L "$f" ] && pg_is_review "$f" || return 1
+  [ "$(pg_extract_verdict "$f")" = NEEDS-DISCUSSION ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [[ "$line" =~ ^[[:space:]]*[*_\>#-]*[[:space:]]*VERDICT[*_[:space:]]*: ]]; then
+      verdict_seen=true
+      continue
+    fi
+    if [[ "$line" != CHOICE:* ]]; then
+      # Choice lines form one terminal block; prose after that block is not a machine grammar.
+      [ "$choices_started" = false ] || return 1
+      continue
+    fi
+    [ "$verdict_seen" = false ] || return 1
+    choices_started=true
+    [[ "$line" =~ ^CHOICE:[[:space:]]+([A-Za-z0-9._:/+-]+)[[:space:]]\|[[:space:]]([^\|[:cntrl:]]{1,120})[[:space:]]\|[[:space:]]([^\|[:cntrl:]]{1,240})[[:space:]]*$ ]] || return 1
+    id="${BASH_REMATCH[1]}"; label="${BASH_REMATCH[2]}"; consequence="${BASH_REMATCH[3]}"
+    [ "${#id}" -le 256 ] || return 1
+    # The grammar's separators consume one optional display space; trim only separator-adjacent
+    # whitespace so stored values never contain formatting padding.
+    label="${label#"${label%%[![:space:]]*}"}"; label="${label%"${label##*[![:space:]]}"}"
+    consequence="${consequence#"${consequence%%[![:space:]]*}"}"; consequence="${consequence%"${consequence##*[![:space:]]}"}"
+    [ -n "$label" ] && [ -n "$consequence" ] || return 1
+    [ "${#label}" -le 120 ] && [ "${#consequence}" -le 240 ] || return 1
+    jq -e --arg id "$id" --arg label "$label" --arg consequence "$consequence" \
+      'all(.[]; .id != $id)' <<<"$choices" >/dev/null 2>&1 || return 1
+    choices="$(jq -cS --arg id "$id" --arg label "$label" --arg consequence "$consequence" \
+      '. + [{consequence:$consequence,id:$id,label:$label}]' <<<"$choices")" || return 1
+    count=$((count + 1))
+    [ "$count" -le 8 ] || return 1
+  done < "$f"
+  [ "$verdict_seen" = true ] && [ "$count" -ge 2 ] || return 1
+  printf '%s' "$choices"
+}
+
 pg_review_decision_emit() { # action reason facts snapshot-digest applicable-ref
   local action="$1" reason="$2" facts="$3" snapshot="$4" ref="${5:-}" class out
+  # The ask payload supplies the exact selection context, not the surrounding decision envelope.
+  [ "$action" != ask-named-product-choice ] || snapshot="$(pg_review_decision_choice_snapshot "$facts")" || return 1
   case "$action" in
     collect-existing-result|recover-existing-review|run-granted-review) class='runtime-guarded-effect' ;;
     fix-review-findings|prepare-matching-review-evidence) class='agent-task' ;;

@@ -110,7 +110,7 @@ pg_out_guard_acquire() {
 
 PR=""; REPO=""; DIFF_FILE=""; DIFF_IS_CALLER_SUPPLIED=0; INPUT="both"; OUT=""; TIMEOUT="30m"; EXTRA_GLOB=""; HARVEST_MARKER=""; HARVEST_REQUESTED=0; CONFIRM_FILE=""
 STATUS_REQUESTED=0; STATUS_QUERY=""; AS_JSON=0; RECOVER_REQUESTED=0; RECOVER_QUERY=""
-REVIEW_DECISION_REQUESTED=0; REVIEW_DECISION_EFFECT_FILE=""
+REVIEW_DECISION_REQUESTED=0; REVIEW_DECISION_EFFECT_FILE=""; REVIEW_CHOICE_SELECTION_FILE=""
 while [ $# -gt 0 ]; do
   # gate #91 P2 (:65): every flag below except --status takes a REQUIRED second argument via raw
   # "$2"/"${2:-}" + "shift 2". With no errexit, a flag left trailing (no operand) hit one of two
@@ -122,7 +122,7 @@ while [ $# -gt 0 ]; do
   # symptoms with a clean usage error. --status is excluded: its second argument is deliberately
   # optional (its own branch below already handles "missing").
   case "$1" in
-    --pr|--repo|--diff|--input|--out|--timeout|--extra-files|--confirm|--harvest|--recover|--review-decision-effect)
+    --pr|--repo|--diff|--input|--out|--timeout|--extra-files|--confirm|--harvest|--recover|--review-decision-effect|--review-choice-selection)
       [ $# -ge 2 ] || { echo "ERROR: $1 requires a value" >&2; exit 2; };;
   esac
   case "$1" in
@@ -138,6 +138,7 @@ while [ $# -gt 0 ]; do
     --recover) RECOVER_REQUESTED=1; RECOVER_QUERY="${2:-}"; shift 2;;
     --review-decision) REVIEW_DECISION_REQUESTED=1; shift;;
     --review-decision-effect) REVIEW_DECISION_REQUESTED=1; REVIEW_DECISION_EFFECT_FILE="$2"; shift 2;;
+    --review-choice-selection) REVIEW_CHOICE_SELECTION_FILE="$2"; shift 2;;
     # --status takes an OPTIONAL query (a following --flag or nothing means "all state").
     --status) STATUS_REQUESTED=1
       case "${2:-}" in ''|--*) shift 1;; *) STATUS_QUERY="$2"; shift 2;; esac;;
@@ -147,6 +148,10 @@ while [ $# -gt 0 ]; do
 done
 if [ "$AS_JSON" = 1 ] && [ "$STATUS_REQUESTED" != 1 ] && [ "$REVIEW_DECISION_REQUESTED" != 1 ]; then
   echo "ERROR: --json is only meaningful with --status or --review-decision" >&2
+  exit 2
+fi
+if [ -n "$REVIEW_CHOICE_SELECTION_FILE" ] && [ "$REVIEW_DECISION_REQUESTED" != 1 ]; then
+  echo 'ERROR: --review-choice-selection requires --review-decision' >&2
   exit 2
 fi
 if [ "$HARVEST_REQUESTED" = 1 ] && [ -z "$HARVEST_MARKER" ]; then
@@ -175,9 +180,16 @@ pg_review_decision_repair_result_binding() { # marker input-binding-json
   accepted="$(date +%s)"
   proof=null
   if [ "$verdict" = SHIP ]; then
-    [ "$(jq -r .evidence.mode <<<"$input")" = full-pr ] || return 1
-    base="$(jq -r .evidence.proof.base_oid <<<"$input")"; head="$(jq -r .evidence.proof.head_oid <<<"$input")"
-    proof="$(jq -cnS --arg base "$base" --arg head "$head" --arg digest "$(jq -r .evidence.proof.raw_patch_digest <<<"$input")" '{base_oid:$base,diff_digest:$digest,head_oid:$head}')" || return 1
+    case "$(jq -r .evidence.mode <<<"$input")" in
+      full-pr)
+        base="$(jq -r .evidence.proof.base_oid <<<"$input")"; head="$(jq -r .evidence.proof.head_oid <<<"$input")"
+        proof="$(jq -cnS --arg base "$base" --arg head "$head" --arg digest "$(jq -r .evidence.proof.raw_patch_digest <<<"$input")" '{base_oid:$base,diff_digest:$digest,head_oid:$head}')" || return 1 ;;
+      scoped-delta)
+        base="$(jq -r .evidence.proof.base_oid <<<"$input")"; head="$(jq -r .evidence.proof.end_oid <<<"$input")"
+        # Merge eligibility binds the complete raw endpoint, never the filtered review payload.
+        proof="$(jq -cnS --arg base "$base" --arg head "$head" --arg digest "$(jq -r .evidence.proof.raw_digest <<<"$input")" '{base_oid:$base,diff_digest:$digest,head_oid:$head}')" || return 1 ;;
+      *) return 1 ;;
+    esac
   fi
   result="$(jq -cnS --arg cd "$(pg_review_decision_contract_digest)" --arg marker "$marker" --arg digest "$(pg_sha256 "$artifact")" \
     --arg ib "$input_digest" --arg verdict "$verdict" --argjson accepted "$accepted" --argjson proof "$proof" \
@@ -280,13 +292,28 @@ pg_review_decision_prospective_input_binding() { # repo pr host owner name head 
   printf '%s' "$binding"
 }
 
+# Selection is input to an advisory reduction, never a durable authorization record. Canonical
+# bytes make a copied selection deterministic and prevent trailing prose from becoming a channel.
+pg_review_decision_choice_selection_read() { # file -> canonical {selected_id,snapshot_digest}
+  local f="$1" json canonical
+  [ -f "$f" ] && [ ! -L "$f" ] || return 1
+  [ "$(wc -c < "$f" 2>/dev/null | tr -d ' ')" -le 65536 ] || return 1
+  json="$(cat "$f" 2>/dev/null)" || return 1
+  canonical="$(pg_review_json_canonical "$json")" || return 1
+  [ "$(wc -c < "$f" 2>/dev/null | tr -d ' ')" = "${#canonical}" ] || return 1
+  jq -e 'keys == ["selected_id","snapshot_digest"] and
+    (.selected_id|type=="string" and length>0 and length<=256 and test("^[A-Za-z0-9._:/+-]+$")) and
+    (.snapshot_digest|type=="string" and test("^[0-9a-f]{64}$"))' <<<"$canonical" >/dev/null 2>&1 || return 1
+  printf '%s' "$canonical"
+}
+
 pg_review_decision_cli() {
   local repo pr_num remote ident host owner repo_name head base raw_digest round_key code_identity
   local input_proven=false input_binding_valid=false input_identity evidence_identity evidence_state
   local input_marker="" input_record="" input_digest="" f marker candidate candidate_relation desired_relation exact=false active_marker="" active_state=none
-  local endpoint reviewed manifest confirmation endpoint_digest reviewed_digest manifest_digest confirmation_digest lineage
+  local endpoint reviewed manifest confirmation endpoint_digest reviewed_digest manifest_digest confirmation_digest lineage mode ship_digest
   local reservation_marker="" reservation_state=none governor_granted=false completed='[]' prior_candidates='[]' prior_review result artifact artifact_digest canonical
-  local facts decision effect_ok=false prospective exact_inputs='[]'
+  local facts decision effect_ok=false prospective exact_inputs='[]' choice_candidates='[]' choice_outcomes='[]' choice_selected="" choice_snapshot="" selection="" selection_supplied=false current_verdict=NONE current_canonical=""
 
   pg_have jq || { echo 'ERROR: review-decision/v1 requires jq' >&2; return 2; }
   repo="${REPO:-$(pwd)}"
@@ -367,16 +394,34 @@ pg_review_decision_cli() {
     [ -n "$canonical" ] || continue
 
     if [ "$exact" = true ]; then
-      # SHIP remains full-PR only; scoped evidence is not widened into merge authority here.
       if [ "$(jq -r .verdict <<<"$result")" = SHIP ]; then
-        [ "$(jq -r .evidence.mode <<<"$candidate")" = full-pr ] && [ -n "$base" ] && [ -n "$raw_digest" ] || continue
-        jq -e --arg base "$base" --arg head "$head" --arg digest "$raw_digest" \
+        mode="$(jq -r .evidence.mode <<<"$candidate")"
+        case "$mode" in
+          full-pr)
+            [ -n "$base" ] && [ -n "$raw_digest" ] || continue
+            ship_digest="$raw_digest" ;;
+          scoped-delta)
+            # The binding recheck above proved endpoint, reviewed payload, manifest, confirmation,
+            # base, and head. Handoff additionally binds the result to that full raw endpoint.
+            ship_digest="$(jq -r .evidence.proof.raw_digest <<<"$candidate")" ;;
+          connector)
+            # Connector observations never become merge handoff authority.
+            continue ;;
+          *) continue ;;
+        esac
+        jq -e --arg base "$base" --arg head "$head" --arg digest "$ship_digest" \
           '.ship_proof.base_oid==$base and .ship_proof.head_oid==$head and .ship_proof.diff_digest==$digest' \
           <<<"$result" >/dev/null 2>&1 || continue
       fi
       completed="$(jq -cS --arg marker "$marker" --arg canonical "$canonical" --arg artifact "$artifact_digest" \
         --argjson epoch "$(jq -r .charged_spend_epoch <<<"$candidate")" --arg verdict "$(jq -r .verdict <<<"$result")" \
         '. + [{applicable:true,artifact_digest:$artifact,binding_valid:true,canonical_identity:$canonical,charged_spend_epoch:$epoch,collected:true,legacy:false,marker:$marker,provenance_valid:true,verdict:$verdict}]' <<<"$completed")"
+      if [ "$(jq -r .verdict <<<"$result")" = NEEDS-DISCUSSION ]; then
+        choice_outcomes="$(pg_review_decision_named_choices "$artifact" 2>/dev/null || true)"
+        [ -n "$choice_outcomes" ] || choice_outcomes='[]'
+        choice_candidates="$(jq -cS --arg canonical "$canonical" --argjson outcomes "$choice_outcomes" \
+          '. + [{canonical_identity:$canonical,outcomes:$outcomes}]' <<<"$choice_candidates")"
+      fi
     else
       prior_candidates="$(jq -cS --arg marker "$marker" --arg canonical "$canonical" --arg code "$code_identity" \
         --arg evidence "relation:$(pg_review_sha256_text "$candidate_relation")" --argjson epoch "$(jq -r .charged_spend_epoch <<<"$candidate")" \
@@ -392,6 +437,34 @@ pg_review_decision_cli() {
     input_record="$(jq -cS 'sort_by(.binding.charged_spend_epoch,.marker) | last.binding' <<<"$exact_inputs")"
   fi
   [ -z "$input_record" ] || input_digest="$(pg_review_sha256_text "$input_record")"
+  current_canonical="$(jq -r 'sort_by(.charged_spend_epoch,.canonical_identity) | last.canonical_identity // ""' <<<"$completed")"
+  current_verdict="$(jq -r 'sort_by(.charged_spend_epoch,.canonical_identity) | last.verdict // "NONE"' <<<"$completed")"
+  if [ "$current_verdict" = NEEDS-DISCUSSION ]; then
+    choice_outcomes="$(jq -cS --arg canonical "$current_canonical" '[.[] | select(.canonical_identity==$canonical)] | last.outcomes // []' <<<"$choice_candidates")"
+  else
+    choice_outcomes='[]'
+  fi
+  # A supplied selection may only enter facts after the exact current NEEDS-DISCUSSION result
+  # and its immutable artifact have supplied bounded outcomes. Unknown or malformed selections
+  # deliberately empty the outcomes so the reducer emits its existing closed invalid-choice stop.
+  if [ -n "$REVIEW_CHOICE_SELECTION_FILE" ]; then
+    selection_supplied=true
+    selection="$(pg_review_decision_choice_selection_read "$REVIEW_CHOICE_SELECTION_FILE" 2>/dev/null || true)"
+    if [ "$current_verdict" = NEEDS-DISCUSSION ] && [ -n "$selection" ] \
+       && [ "$(jq 'length' <<<"$choice_outcomes")" -ge 2 ] \
+       && jq -e --arg id "$(jq -r .selected_id <<<"$selection")" 'any(.[]; .id==$id)' <<<"$choice_outcomes" >/dev/null 2>&1; then
+      choice_selected="$(jq -r .selected_id <<<"$selection")"
+      choice_snapshot="$(jq -r .snapshot_digest <<<"$selection")"
+    elif [ "$current_verdict" = NEEDS-DISCUSSION ]; then
+      choice_outcomes='[]'
+    fi
+  fi
+  # A selection is meaningful only for the exact current NEEDS-DISCUSSION artifact. If that
+  # artifact ceased to be current (head/evidence moved), keep reduction inside its closed stop
+  # branch rather than letting the unrelated fresh-review grant treat selection as a new spend.
+  if [ "$selection_supplied" = true ] && [ "$current_verdict" != NEEDS-DISCUSSION ]; then
+    evidence_state=invalid
+  fi
   prior_review="$(jq -cS '
     sort_by(.charged_spend_epoch,.canonical_identity) | last //
     {code_identity:"",evidence_identity:"",marker:"",verdict:"NONE"} |
@@ -421,11 +494,11 @@ pg_review_decision_cli() {
     --arg identity "$input_identity" --arg evidence "$evidence_identity" --arg state "$evidence_state" \
     --arg marker "$active_marker" --arg astate "$active_state" --arg reservation "$reservation_marker" --arg rstate "$reservation_state" \
     --argjson input_proven "$input_proven" --argjson input_binding "$input_binding_valid" --argjson granted "$governor_granted" \
-    --argjson completed "$completed" --argjson prior "$prior_review" --arg cd "$(pg_review_decision_contract_digest)" --arg xd "$(pg_review_decision_corpus_digest)" '
+    --argjson completed "$completed" --argjson prior "$prior_review" --argjson choices "$choice_outcomes" --arg choice "$choice_selected" --arg choice_snap "$choice_snapshot" --arg cd "$(pg_review_decision_contract_digest)" --arg xd "$(pg_review_decision_corpus_digest)" '
     {active_index:{binding_valid:$input_binding,charged_spend_epoch:0,marker:$marker,state:$astate},completed_results:$completed,
      contract:{contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,corpus_digest:$xd},
      evidence:{identity:$evidence,safe_to_prepare:true,state:$state},governor:{granted:$granted},
-     input:{binding_valid:$input_binding,identity:$identity,proven:$input_proven},named_choice:{outcomes:[],selected_id:null,snapshot_digest:""},
+     input:{binding_valid:$input_binding,identity:$identity,proven:$input_proven},named_choice:{outcomes:$choices,selected_id:(if $choice=="" then null else $choice end),snapshot_digest:$choice_snap},
      observation:{kind:"idle"},prior_review:$prior,
      reservation:{binding_valid:false,legacy:false,marker:$reservation,state:$rstate},target:{head_oid:$head,host:$h,owner:$o,pr:$pr,repo:$r},transport:"review-decision/v1"}')" || return 2
   decision="$(pg_review_decision_reduce "$facts")" || { echo 'ERROR: review-decision reduction failed' >&2; return 2; }
@@ -2562,6 +2635,7 @@ OUTPUT FORMAT — output ONLY findings, nothing else, each exactly:
 
 where Pn is one of: P0 (critical / blocker / data-loss / security), P1 (major bug), P2 (minor), P3 (nit).
 Group by severity, P0 first. If a severity has no findings, write "Pn: none".
+If and only if your verdict is NEEDS-DISCUSSION, emit 2-8 choice lines immediately before the final VERDICT line, each exactly: CHOICE: <safe-id> | <label> | <consequence>. Use a unique safe-id containing only letters, digits, dot, underscore, colon, slash, plus, or hyphen; label is 1-120 printable characters and consequence is 1-240 printable characters. Do not emit CHOICE lines for SHIP or FIX-FIRST. Do not add fields or extra pipes.
 End with one final line:  VERDICT: SHIP | FIX-FIRST | NEEDS-DISCUSSION  — <=15 word reason.
 EOF
   echo
