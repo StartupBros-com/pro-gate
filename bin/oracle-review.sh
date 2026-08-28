@@ -271,7 +271,9 @@ pg_review_decision_prospective_input_binding() { # repo pr host owner name head 
       binding="$(jq -cnS --arg cd "$(pg_review_decision_contract_digest)" --arg marker "$marker" --arg host "$host" --arg owner "$owner" --arg repo "$name" --argjson pr "$pr" --arg base "$base" --arg head "$head" --arg endpoint "$endpoint" --arg raw "$raw_digest" '{charged_spend_epoch:1,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("full-pr:"+$base+":"+$head),mode:"full-pr",proof:{base_oid:$base,endpoint_digest:$endpoint,head_oid:$head,raw_patch_digest:$raw}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:$host,owner:$owner,repo:$repo},target:{head_oid:$head,kind:"pull-request",pr:$pr}}')"
     fi
   fi
-  if [ -z "$binding" ] && { [ "$INPUT" = connector ] || [ "$INPUT" = both ]; }; then
+  # `both` requires a bundle relation. Connector is a distinct, explicitly requested current
+  # relation, never a fallback when bundle proof is absent.
+  if [ -z "$binding" ] && [ "$INPUT" = connector ]; then
     binding="$(jq -cnS --arg cd "$(pg_review_decision_contract_digest)" --arg marker "$marker" --arg host "$host" --arg owner "$owner" --arg repo "$name" --argjson pr "$pr" --arg head "$head" '{charged_spend_epoch:1,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("connector:"+$host+"/"+$owner+"/"+$repo+":"+$head),mode:"connector",proof:{commit_target:$head,endpoint_digest:null,raw_diff_digest:null,repository_target:($host+"/"+$owner+"/"+$repo)}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:$host,owner:$owner,repo:$repo},target:{head_oid:$head,kind:"pull-request",pr:$pr}}')"
   fi
   [ -n "$binding" ] && pg_review_decision_input_proof_current "$binding" "$repo" "$pr" "$host" "$owner" "$name" "$head" "$base" || return 1
@@ -279,12 +281,12 @@ pg_review_decision_prospective_input_binding() { # repo pr host owner name head 
 }
 
 pg_review_decision_cli() {
-  local repo pr_num remote ident host owner repo_name head base raw_digest round_key
+  local repo pr_num remote ident host owner repo_name head base raw_digest round_key code_identity
   local input_proven=false input_binding_valid=false input_identity evidence_identity evidence_state
-  local input_marker="" input_record="" input_digest="" f marker candidate mode active_marker="" active_state=none
+  local input_marker="" input_record="" input_digest="" f marker candidate candidate_relation desired_relation exact=false active_marker="" active_state=none
   local endpoint reviewed manifest confirmation endpoint_digest reviewed_digest manifest_digest confirmation_digest lineage
-  local reservation_marker="" reservation_state=none governor_granted=false completed='[]' result artifact artifact_digest
-  local facts decision effect_ok=false prospective
+  local reservation_marker="" reservation_state=none governor_granted=false completed='[]' prior_candidates='[]' prior_review result artifact artifact_digest canonical
+  local facts decision effect_ok=false prospective exact_inputs='[]'
 
   pg_have jq || { echo 'ERROR: review-decision/v1 requires jq' >&2; return 2; }
   repo="${REPO:-$(pwd)}"
@@ -312,32 +314,88 @@ pg_review_decision_cli() {
   # chooses a filtered engine payload. It is never interchangeable with the raw endpoint bytes.
   REVIEW_DECISION_REVIEWED_DIFF_FILE="$DIFF_FILE"
   round_key="$(printf '%s-%s-%s' "$owner" "$repo_name" "$pr_num" | tr -c 'A-Za-z0-9.\n-' '-')"
-  input_identity="${host}:${owner}/${repo_name}:${pr_num}:${head}"
+  # Code identity is deliberately independent from the marker, spend epoch, and immutable-binding
+  # digest. It describes only the canonical repository target and current PR head.
+  code_identity="${host}:${owner}/${repo_name}:${pr_num}:${head}"
+  input_identity="$code_identity"
   evidence_identity='evidence:none'; evidence_state=missing
 
-  # Persisted bindings remain authoritative when their complete proof still matches. A cold
-  # start instead assembles a validated in-memory template; query resolution never writes it.
-  for f in "$(pg_review_input_binding_dir)"/pg-run-*; do
-    [ -f "$f" ] && [ ! -L "$f" ] || continue
-    marker="${f##*/}"
+  # Build the invocation's desired relation before looking at history. In `both` mode, this is
+  # bundle-only: a historical connector proof can inform progress but can never become current.
+  prospective="$(pg_review_decision_prospective_input_binding "$repo" "$pr_num" "$host" "$owner" "$repo_name" "$head" "$base" "$round_key" 2>/dev/null || true)"
+  if [ -n "$prospective" ]; then
+    desired_relation="$(jq -cS '{repository,target,evidence}' <<<"$prospective")"
+    input_marker="$(jq -r .marker <<<"$prospective")"; input_record="$prospective"
+    input_digest="$(pg_review_sha256_text "$prospective")"
+    input_binding_valid=true; input_proven=true
+    # The reducer sees the complete relation identity, not the human-facing evidence label: a
+    # scoped manifest or confirmation change is changed evidence even when its label is stable.
+    evidence_identity="relation:$(pg_review_sha256_text "$desired_relation")"; evidence_state=matching
+  else
+    desired_relation=""
+  fi
+
+  # Read every structurally valid, same-code binding in deterministic marker order. An input is
+  # exact-current only if all proof bytes revalidate and its target/evidence relation is exactly
+  # the desired invocation relation; marker and charged epoch are intentionally excluded.
+  while IFS= read -r marker; do
     candidate="$(pg_review_input_binding_read "$marker" 2>/dev/null || true)"
     [ -n "$candidate" ] || continue
-    pg_review_decision_input_proof_current "$candidate" "$repo" "$pr_num" "$host" "$owner" "$repo_name" "$head" "$base" || continue
-    input_marker="$marker"; input_record="$candidate"
-    input_digest="$(pg_review_sha256_text "$candidate")"
-    input_binding_valid=true; input_proven=true; input_identity="$input_digest"
-    evidence_identity="$(jq -r .evidence.identity <<<"$candidate")"; evidence_state=matching
-    break
-  done
-  if [ -z "$input_record" ]; then
-    prospective="$(pg_review_decision_prospective_input_binding "$repo" "$pr_num" "$host" "$owner" "$repo_name" "$head" "$base" "$round_key" 2>/dev/null || true)"
-    if [ -n "$prospective" ]; then
-      input_marker="$(jq -r .marker <<<"$prospective")"; input_record="$prospective"
-      input_digest="$(pg_review_sha256_text "$prospective")"
-      input_binding_valid=true; input_proven=true; input_identity="$input_digest"
-      evidence_identity="$(jq -r .evidence.identity <<<"$prospective")"; evidence_state=matching
+    jq -e --arg h "$host" --arg o "$owner" --arg r "$repo_name" --argjson p "$pr_num" --arg head "$head" \
+      '.repository.host==$h and .repository.owner==$o and .repository.repo==$r and .target.pr==$p and .target.head_oid==$head' \
+      <<<"$candidate" >/dev/null 2>&1 || continue
+    candidate_relation="$(jq -cS '{repository,target,evidence}' <<<"$candidate")"
+    exact=false
+    if [ -n "$desired_relation" ] && [ "$candidate_relation" = "$desired_relation" ] \
+       && pg_review_decision_input_proof_current "$candidate" "$repo" "$pr_num" "$host" "$owner" "$repo_name" "$head" "$base"; then
+      exact=true
+      exact_inputs="$(jq -cS --arg marker "$marker" --argjson binding "$candidate" '. + [{binding:$binding,marker:$marker}]' <<<"$exact_inputs")"
     fi
+
+    # A result is credible only when its own marker-bound input digest and canonical artifact
+    # bytes validate. We inspect every linked sibling rather than inheriting one chosen input.
+    result="$(pg_review_result_binding_read "$marker" 2>/dev/null || true)"
+    [ -n "$result" ] || continue
+    artifact="$(pg_completed_dir)/$marker"
+    [ -f "$artifact" ] && [ ! -L "$artifact" ] && pg_is_review "$artifact" || continue
+    artifact_digest="$(pg_sha256 "$artifact" 2>/dev/null || true)"
+    [ -n "$artifact_digest" ] || continue
+    input_digest="$(pg_review_sha256_text "$candidate")"
+    jq -e --arg ib "$input_digest" --arg digest "$artifact_digest" \
+      '.input_binding_digest==$ib and .artifact.digest==$digest' <<<"$result" >/dev/null 2>&1 || continue
+    canonical="$(pg_review_result_binding_digest "$marker" 2>/dev/null || true)"
+    [ -n "$canonical" ] || continue
+
+    if [ "$exact" = true ]; then
+      # SHIP remains full-PR only; scoped evidence is not widened into merge authority here.
+      if [ "$(jq -r .verdict <<<"$result")" = SHIP ]; then
+        [ "$(jq -r .evidence.mode <<<"$candidate")" = full-pr ] && [ -n "$base" ] && [ -n "$raw_digest" ] || continue
+        jq -e --arg base "$base" --arg head "$head" --arg digest "$raw_digest" \
+          '.ship_proof.base_oid==$base and .ship_proof.head_oid==$head and .ship_proof.diff_digest==$digest' \
+          <<<"$result" >/dev/null 2>&1 || continue
+      fi
+      completed="$(jq -cS --arg marker "$marker" --arg canonical "$canonical" --arg artifact "$artifact_digest" \
+        --argjson epoch "$(jq -r .charged_spend_epoch <<<"$candidate")" --arg verdict "$(jq -r .verdict <<<"$result")" \
+        '. + [{applicable:true,artifact_digest:$artifact,binding_valid:true,canonical_identity:$canonical,charged_spend_epoch:$epoch,collected:true,legacy:false,marker:$marker,provenance_valid:true,verdict:$verdict}]' <<<"$completed")"
+    else
+      prior_candidates="$(jq -cS --arg marker "$marker" --arg canonical "$canonical" --arg code "$code_identity" \
+        --arg evidence "relation:$(pg_review_sha256_text "$candidate_relation")" --argjson epoch "$(jq -r .charged_spend_epoch <<<"$candidate")" \
+        --arg verdict "$(jq -r .verdict <<<"$result")" \
+        '. + [{canonical_identity:$canonical,charged_spend_epoch:$epoch,code_identity:$code,evidence_identity:$evidence,marker:$marker,verdict:$verdict}]' <<<"$prior_candidates")"
+    fi
+  done < <(find "$(pg_review_input_binding_dir)" -mindepth 1 -maxdepth 1 -type f -name 'pg-run-*' -printf '%f\n' 2>/dev/null | LC_ALL=C sort)
+
+  # A persisted exact relation is preferred over its equivalent prospective template. Pick it
+  # deterministically so recover/repair effects never depend on directory enumeration order.
+  if [ "$(jq 'length' <<<"$exact_inputs")" -gt 0 ]; then
+    input_marker="$(jq -r 'sort_by(.binding.charged_spend_epoch,.marker) | last.marker' <<<"$exact_inputs")"
+    input_record="$(jq -cS 'sort_by(.binding.charged_spend_epoch,.marker) | last.binding' <<<"$exact_inputs")"
   fi
+  [ -z "$input_record" ] || input_digest="$(pg_review_sha256_text "$input_record")"
+  prior_review="$(jq -cS '
+    sort_by(.charged_spend_epoch,.canonical_identity) | last //
+    {code_identity:"",evidence_identity:"",marker:"",verdict:"NONE"} |
+    {applicable:false,binding_valid:(.marker != ""),code_identity,evidence_identity,legacy:false,marker,provenance_valid:(.marker != ""),verdict}' <<<"$prior_candidates")"
 
   # Active index and reservation authority are read directly without reconciliation. Querying a
   # stale record is conservative (recover), while reconciliation itself is an effect and forbidden.
@@ -348,33 +406,6 @@ pg_review_decision_cli() {
   reservation_marker="$(pg_reservation_find_pr "$round_key" 2>/dev/null || true)"
   if pg_reservation_marker_ok "$reservation_marker"; then reservation_state=live; else reservation_marker=""; fi
   if pg_round_guard "$round_key" >/dev/null 2>&1; then governor_granted=true; fi
-
-  # A result becomes applicable only through both immutable bindings and exact canonical bytes.
-  # Missing result bindings remain recoverable artifacts, but cannot expose terminal or merge state.
-  if [ -n "$input_marker" ]; then
-    for f in "$(pg_review_result_binding_dir)"/pg-run-*; do
-      [ -f "$f" ] && [ ! -L "$f" ] || continue
-      marker="${f##*/}"
-      result="$(pg_review_result_binding_read "$marker" 2>/dev/null || true)"
-      [ -n "$result" ] || continue
-      jq -e --arg ib "$input_digest" '.input_binding_digest==$ib' <<<"$result" >/dev/null 2>&1 || continue
-      artifact="$(pg_completed_dir)/$marker"
-      artifact_digest="$(pg_sha256 "$artifact")"
-      jq -e --arg digest "$artifact_digest" '.artifact.digest==$digest' <<<"$result" >/dev/null 2>&1 || continue
-      # A SHIP must freshly bind the exact current full-PR relation. Connector and bare-diff
-      # evidence may collect/recover but never become merge eligibility.
-      if [ "$(jq -r .verdict <<<"$result")" = SHIP ]; then
-        [ -n "$base" ] && [ -n "$raw_digest" ] || continue
-        jq -e --arg base "$base" --arg head "$head" --arg digest "$raw_digest" \
-          '.ship_proof.base_oid==$base and .ship_proof.head_oid==$head and .ship_proof.diff_digest==$digest' \
-          <<<"$result" >/dev/null 2>&1 || continue
-      fi
-      completed="$(jq -cS --arg marker "$marker" --arg canonical "$(pg_review_result_binding_digest "$marker")" \
-        --arg artifact "$artifact_digest" --argjson epoch "$(jq -r .accepted_epoch <<<"$result")" \
-        --arg verdict "$(jq -r .verdict <<<"$result")" \
-        '. + [{applicable:true,artifact_digest:$artifact,binding_valid:true,canonical_identity:$canonical,charged_spend_epoch:$epoch,collected:true,legacy:false,marker:$marker,provenance_valid:true,verdict:$verdict}]' <<<"$completed")"
-    done
-  fi
 
   # Canonical bytes that survived a crash before binding installation are collectable recovery
   # facts, never terminal facts. A matching collect effect performs the marker-locked repair.
@@ -390,12 +421,12 @@ pg_review_decision_cli() {
     --arg identity "$input_identity" --arg evidence "$evidence_identity" --arg state "$evidence_state" \
     --arg marker "$active_marker" --arg astate "$active_state" --arg reservation "$reservation_marker" --arg rstate "$reservation_state" \
     --argjson input_proven "$input_proven" --argjson input_binding "$input_binding_valid" --argjson granted "$governor_granted" \
-    --argjson completed "$completed" --arg cd "$(pg_review_decision_contract_digest)" --arg xd "$(pg_review_decision_corpus_digest)" '
+    --argjson completed "$completed" --argjson prior "$prior_review" --arg cd "$(pg_review_decision_contract_digest)" --arg xd "$(pg_review_decision_corpus_digest)" '
     {active_index:{binding_valid:$input_binding,charged_spend_epoch:0,marker:$marker,state:$astate},completed_results:$completed,
      contract:{contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,corpus_digest:$xd},
      evidence:{identity:$evidence,safe_to_prepare:true,state:$state},governor:{granted:$granted},
      input:{binding_valid:$input_binding,identity:$identity,proven:$input_proven},named_choice:{outcomes:[],selected_id:null,snapshot_digest:""},
-     observation:{kind:"idle"},prior_review:{applicable:false,binding_valid:false,code_identity:"",evidence_identity:"",legacy:false,marker:"",provenance_valid:false,verdict:"NONE"},
+     observation:{kind:"idle"},prior_review:$prior,
      reservation:{binding_valid:false,legacy:false,marker:$reservation,state:$rstate},target:{head_oid:$head,host:$h,owner:$o,pr:$pr,repo:$r},transport:"review-decision/v1"}')" || return 2
   decision="$(pg_review_decision_reduce "$facts")" || { echo 'ERROR: review-decision reduction failed' >&2; return 2; }
 
