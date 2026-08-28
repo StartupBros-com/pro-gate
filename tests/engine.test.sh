@@ -4038,6 +4038,31 @@ check 'review-decision query creates no durable state, lock, sidecar, cache, or 
   "$([ ! -e "$DECISION_HOME" ]; echo $?)" \
   "state=$(find "$DECISION_HOME" -mindepth 1 -maxdepth 2 -print 2>/dev/null | tr '\n' ' ')"
 
+# Git's working-tree proof must accept linked worktrees (.git is a file) while refusing a plain
+# directory and a bare repository. These are real CLI calls, not a metadata-shape unit stub.
+DECISION_LINKED="$TDIR/review-decision-linked"
+git -C "$DECISION_REPO" worktree add -q -b review-decision-linked "$DECISION_LINKED"
+env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 \
+  bash "$ENGINE" --review-decision --json --repo "$DECISION_LINKED" --pr 1983 --input connector \
+  >"$TDIR/review-decision-linked.json" 2>"$TDIR/review-decision-linked.err"
+DECISION_LINKED_RC=$?
+check 'review-decision accepts a linked working tree with a .git file' \
+  "$([ "$DECISION_LINKED_RC" -eq 0 ] && [ -f "$DECISION_LINKED/.git" ] && jq -e '.action=="run-granted-review"' "$TDIR/review-decision-linked.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$DECISION_LINKED_RC output=$(cat "$TDIR/review-decision-linked.json") stderr=$(cat "$TDIR/review-decision-linked.err")"
+mkdir -p "$TDIR/review-decision-nonrepo"
+env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 \
+  bash "$ENGINE" --review-decision --repo "$TDIR/review-decision-nonrepo" --pr 1983 --input connector \
+  >"$TDIR/review-decision-nonrepo.out" 2>"$TDIR/review-decision-nonrepo.err"
+DECISION_NONREPO_RC=$?
+git clone -q --bare "$DECISION_REPO" "$TDIR/review-decision-bare.git"
+env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 \
+  bash "$ENGINE" --review-decision --repo "$TDIR/review-decision-bare.git" --pr 1983 --input connector \
+  >"$TDIR/review-decision-bare.out" 2>"$TDIR/review-decision-bare.err"
+DECISION_BARE_RC=$?
+check 'review-decision rejects non-working-tree and bare repository paths' \
+  "$([ "$DECISION_NONREPO_RC" -eq 2 ] && [ "$DECISION_BARE_RC" -eq 2 ] && grep -qF 'local git working tree' "$TDIR/review-decision-nonrepo.err" && grep -qF 'local git working tree' "$TDIR/review-decision-bare.err"; echo $?)" \
+  "nonrepo_rc=$DECISION_NONREPO_RC bare_rc=$DECISION_BARE_RC"
+
 # A canonical connector target plus the exact current head is sufficient cold-start proof. The
 # advisory template is in-memory only; moving HEAD must invalidate the saved effect request.
 DECISION_HEAD="$(git -C "$DECISION_REPO" rev-parse HEAD)"
@@ -4149,12 +4174,17 @@ done
 cp "$TDIR/proof-raw.patch" "$TDIR/proof-endpoint.patch"
 mkdir -p "$DECISION_HOME/completed"
 printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — canonical review accepted with current proof' > "$DECISION_HOME/completed/$FULL_MARKER"
+# A newer equivalent binding with no artifact must not prevent repair of the older artifact selected
+# by its own canonical marker.
+FULL_REPAIR_NEW_MARKER='pg-run-acme-widgets-1983-1700013002-9'
+FULL_REPAIR_NEW_BINDING="$(jq -cS --arg marker "$FULL_REPAIR_NEW_MARKER" '.marker=$marker | .charged_spend_epoch=1700013002' <<<"$FULL_BINDING")"
+PRO_GATE_HOME="$DECISION_HOME" pg_review_input_binding_write "$FULL_REPAIR_NEW_MARKER" "$FULL_REPAIR_NEW_BINDING"
 env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
   bash "$ENGINE" --review-decision --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
   >"$TDIR/repair-before.json" 2>"$TDIR/repair-before.err"
 REPAIR_BEFORE_RC=$?
 check 'canonical SHIP without result binding is collect-only, never merge eligible' \
-  "$([ "$REPAIR_BEFORE_RC" -eq 0 ] && jq -e '.action != "allow-existing-merge-workflow"' "$TDIR/repair-before.json" >/dev/null 2>&1; echo $?)" \
+  "$([ "$REPAIR_BEFORE_RC" -eq 0 ] && jq -e --arg marker "$FULL_MARKER" '.action == "collect-existing-result" and .effect_request.applicable_ref == $marker and .action != "allow-existing-merge-workflow"' "$TDIR/repair-before.json" >/dev/null 2>&1; echo $?)" \
   "rc=$REPAIR_BEFORE_RC output=$(cat "$TDIR/repair-before.json") stderr=$(cat "$TDIR/repair-before.err")"
 env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
   bash "$ENGINE" --review-decision --review-decision-effect "$TDIR/repair-before.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
@@ -4348,6 +4378,7 @@ for fresh_kind in completed active reserved unknown-fate; do
   case "$fresh_kind" in
     completed)
       mkdir -p "$FRESH_HOME/completed"
+      PRO_GATE_HOME="$FRESH_HOME" pg_review_input_binding_write "$FRESH_TEMPLATE" "$FRESH_BINDING"
       printf 'P0: none\nP1: none\nP2: none\nP3: none\nVERDICT: SHIP - existing.\n' > "$FRESH_HOME/completed/$FRESH_TEMPLATE" ;;
     active)
       mkdir -p "$FRESH_HOME/active"
@@ -4364,6 +4395,48 @@ for fresh_kind in completed active reserved unknown-fate; do
     "$([ ! -s "$TDIR/fresh-oracle.calls" ]; echo $?)" \
     "rc=$FRESH_RC stdout=$(cat "$TDIR/fresh.stdout") stderr=$(cat "$TDIR/fresh.stderr")"
 done
+
+# Exact marker-bound pending bytes are durable recovery work after active/reservation state has
+# cleared: dispatch must not spend again. A pending SHIP remains uncollected data, never merge
+# authority. Old-head and changed-evidence completions prove the inverse: they must not suppress
+# the fresh grant merely because their filenames share this PR's round key.
+fresh_reset_state
+FRESH_ADVISORY="$(fresh_query)"; printf '%s\n' "$FRESH_ADVISORY" > "$TDIR/fresh-advisory.json"
+mkdir -p "$FRESH_HOME/pending"
+PRO_GATE_HOME="$FRESH_HOME" pg_review_input_binding_write "$FRESH_TEMPLATE" "$FRESH_BINDING"
+printf 'P0: none\nP1: none\nVERDICT: SHIP - pending only.\n' > "$FRESH_HOME/pending/$FRESH_TEMPLATE"
+: > "$TDIR/fresh-oracle.calls"
+fresh_effect "$TDIR/fresh-advisory.json" "$TDIR/fresh-pending.md"
+check 'exact current pending review suppresses spend and routes only to collection/recovery' \
+  "$([ ! -s "$TDIR/fresh-oracle.calls" ] && jq -e '.action=="collect-existing-result" and .action!="allow-existing-merge-workflow"' "$TDIR/fresh.stdout" >/dev/null 2>&1; echo $?)" \
+  "rc=$FRESH_RC stdout=$(cat "$TDIR/fresh.stdout") stderr=$(cat "$TDIR/fresh.stderr")"
+
+fresh_reset_state
+FRESH_ADVISORY="$(fresh_query)"; printf '%s\n' "$FRESH_ADVISORY" > "$TDIR/fresh-advisory.json"
+FRESH_OLD_MARKER='pg-run-acme-fresh.git-77-1700013999-0'
+FRESH_OLD_BINDING="$(jq -cS --arg marker "$FRESH_OLD_MARKER" --arg head "$FRESH_BASE" '.marker=$marker | .charged_spend_epoch=1700013999 | .target.head_oid=$head | .evidence.identity=("full-pr:" + .evidence.proof.base_oid + ":" + $head) | .evidence.proof.head_oid=$head' <<<"$FRESH_BINDING")"
+mkdir -p "$FRESH_HOME/completed"
+PRO_GATE_HOME="$FRESH_HOME" pg_review_input_binding_write "$FRESH_OLD_MARKER" "$FRESH_OLD_BINDING"
+printf 'P0: none\nP1: none\nVERDICT: SHIP - old head.\n' > "$FRESH_HOME/completed/$FRESH_OLD_MARKER"
+: > "$TDIR/fresh-oracle.calls"
+fresh_effect "$TDIR/fresh-advisory.json" "$TDIR/fresh-old-head.md"
+check 'old-head completed bytes do not suppress the current fresh dispatch' \
+  "$([ -s "$TDIR/fresh-oracle.calls" ]; echo $?)" \
+  "rc=$FRESH_RC stdout=$(cat "$TDIR/fresh.stdout") stderr=$(cat "$TDIR/fresh.stderr")"
+
+fresh_reset_state
+printf 'changed endpoint evidence\n' >> "$TDIR/fresh-endpoint.patch"
+FRESH_ADVISORY="$(fresh_query)"; printf '%s\n' "$FRESH_ADVISORY" > "$TDIR/fresh-advisory.json"
+mkdir -p "$FRESH_HOME/completed"
+PRO_GATE_HOME="$FRESH_HOME" pg_review_input_binding_write "$FRESH_TEMPLATE" "$FRESH_BINDING"
+printf 'P0: none\nP1: none\nVERDICT: SHIP - changed evidence.\n' > "$FRESH_HOME/completed/$FRESH_TEMPLATE"
+: > "$TDIR/fresh-oracle.calls"
+fresh_effect "$TDIR/fresh-advisory.json" "$TDIR/fresh-changed-evidence.md"
+check 'changed-evidence completed bytes do not suppress the current fresh dispatch' \
+  "$([ -s "$TDIR/fresh-oracle.calls" ]; echo $?)" \
+  "rc=$FRESH_RC stdout=$(cat "$TDIR/fresh.stdout") stderr=$(cat "$TDIR/fresh.stderr")"
+git -C "$FRESH_REPO" diff "$FRESH_BASE" "$FRESH_HEAD" > "$TDIR/fresh-effect.patch"
+cp "$TDIR/fresh-effect.patch" "$TDIR/fresh-endpoint.patch"
 
 # Effect-time proof/governor movement returns a replacement before it reaches the engine's
 # charge protocol. These are deliberately changes AFTER the advisory JSON was saved.
@@ -4616,5 +4689,19 @@ CONNECTOR_SHIP_RC=$?
 check 'connector SHIP never becomes merge eligibility' \
   "$([ "$CONNECTOR_SHIP_RC" -eq 0 ] && jq -e '.action!="allow-existing-merge-workflow"' "$TDIR/connector-ship.json" >/dev/null 2>&1; echo $?)" \
   "rc=$CONNECTOR_SHIP_RC output=$(cat "$TDIR/connector-ship.json")"
+
+# pending/ deliberately has no result-binding store. Even exact-current connector bytes therefore
+# remain uncollected recovery data and cannot inherit the completed SHIP handoff route.
+CONNECTOR_PENDING_HOME="$TDIR/home-connector-pending"; CONNECTOR_PENDING_MARKER='pg-run-acme-widgets-1983-1700018002-3'
+CONNECTOR_PENDING_HEAD="$(git -C "$DECISION_REPO" rev-parse HEAD)"
+CONNECTOR_PENDING_INPUT="$(jq -cS --arg marker "$CONNECTOR_PENDING_MARKER" --arg head "$CONNECTOR_PENDING_HEAD" '.marker=$marker | .charged_spend_epoch=1700018002 | .target.head_oid=$head | .evidence.identity=("connector:github.com/acme/widgets:" + $head) | .evidence.proof.commit_target=$head' <<<"$PC_CONNECTOR")"
+mkdir -p "$CONNECTOR_PENDING_HOME/pending"
+PRO_GATE_HOME="$CONNECTOR_PENDING_HOME" pg_review_input_binding_write "$CONNECTOR_PENDING_MARKER" "$CONNECTOR_PENDING_INPUT"
+printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — pending connector observation.' > "$CONNECTOR_PENDING_HOME/pending/$CONNECTOR_PENDING_MARKER"
+env PRO_GATE_HOME="$CONNECTOR_PENDING_HOME" PRO_GATE_RUN_LOGS=0 bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --input connector >"$TDIR/connector-pending.json" 2>"$TDIR/connector-pending.err"
+CONNECTOR_PENDING_RC=$?
+check 'exact pending connector SHIP is collect-only and never merge eligible' \
+  "$([ "$CONNECTOR_PENDING_RC" -eq 0 ] && jq -e '.action=="collect-existing-result" and .action!="allow-existing-merge-workflow"' "$TDIR/connector-pending.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$CONNECTOR_PENDING_RC output=$(cat "$TDIR/connector-pending.json") stderr=$(cat "$TDIR/connector-pending.err")"
 
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }

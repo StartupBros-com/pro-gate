@@ -12,8 +12,8 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB="$HERE/../lib/pro-gate-lib.sh"
-FAILS=0
-check() { if [ "$2" = 0 ]; then echo "ok - $1"; else echo "FAIL - $1: ${3:-}"; FAILS=$((FAILS + 1)); fi; }
+TEST_FAILURES=0
+check() { if [ "$2" = 0 ]; then echo "ok - $1"; else echo "FAIL - $1: ${3:-}"; TEST_FAILURES=$((TEST_FAILURES + 1)); fi; }
 
 TDIR="$(mktemp -d "${TMPDIR:-/tmp}/pg-daemon-test.XXXXXX")"
 DPID=""
@@ -76,7 +76,7 @@ typed_decision(){ # corpus-case index output
 # Prompt contracts carry only validated handles; they do not interpolate decision JSON or bypass the
 # full fixer lifecycle after the first exact guarded runtime effect.
 TYPED_BIN="$TYPED_HOME/bin"; mkdir -p "$TYPED_BIN"
-printf '#!/usr/bin/env bash\nprintf "%%s" "$2" > "$MOCK_PROMPT"\n' > "$TYPED_BIN/claude"; chmod +x "$TYPED_BIN/claude"
+printf '#!/usr/bin/env bash\n[ "${MOCK_CLAUDE_RC:-0}" = 0 ] || exit "$MOCK_CLAUDE_RC"\nprintf "%%s" "$2" > "$MOCK_PROMPT"\n' > "$TYPED_BIN/claude"; chmod +x "$TYPED_BIN/claude"
 PATH="$TYPED_BIN:$PATH"; CLAUDE_MODEL=test FALLBACK_MODEL=test MAX_BUDGET=1
 RUN_DECISION="$TYPED_HOME/run-decision.json"; typed_decision 2 "$RUN_DECISION"
 RUN_PROMPT="$TYPED_HOME/run.prompt"
@@ -86,9 +86,16 @@ check 'run worker prompt starts with the exact argv-quoted saved guarded effect'
 check 'run worker prompt restores fix/test/commit/push/comment lifecycle and no-merge guard' "$(grep -Fq '/pro-gate skill' "$RUN_PROMPT" && grep -Fq 'sanity-check every P0/P1' "$RUN_PROMPT" && grep -Fq 'tests and lint' "$RUN_PROMPT" && grep -Fq 'commit the fixes' "$RUN_PROMPT" && grep -Fq 'push this branch to origin' "$RUN_PROMPT" && grep -Fq 'exactly one audit PR comment' "$RUN_PROMPT" && grep -Fq 'Never merge' "$RUN_PROMPT"; echo $?)"
 AGENT_DECISION="$TYPED_HOME/agent-decision.json"; typed_decision 3 "$AGENT_DECISION"
 AGENT_PROMPT="$TYPED_HOME/agent.prompt"; raw_marker="$(jq -r '.facts.prior_review.marker' "$AGENT_DECISION")"
-MOCK_PROMPT="$AGENT_PROMPT" DD_ENGINE="$TYPED_ENGINE" DD_INPUT=both DD_NWO=acme/widgets DD_NUM=1983 DD_SHA=1111111111111111111111111111111111111111 DD_WORKTREE="$TYPED_HOME" DD_LOG="$TYPED_LOG" daemon_run_agent_task "$AGENT_DECISION" fix-review-findings
+MOCK_PROMPT="$AGENT_PROMPT" DD_ENGINE="$TYPED_ENGINE" DD_INPUT=both DD_NWO=acme/widgets DD_NUM=1983 DD_SHA=1111111111111111111111111111111111111111 DD_WORKTREE="$TYPED_HOME" DD_LOG="$TYPED_LOG" daemon_run_agent_task "$AGENT_DECISION" fix-review-findings; agent_rc=$?
+check 'successful typed agent task returns completion' "$([ "$agent_rc" -eq 0 ]; echo $?)" "rc=$agent_rc"
 check 'agent-task prompt identifies typed action target saved decision and valid query-only re-entry route' "$(grep -Fq 'Control-safe typed action: fix-review-findings.' "$AGENT_PROMPT" && grep -Fq "PR #1983 (acme/widgets), local repository $TYPED_HOME." "$AGENT_PROMPT" && grep -Fq "$AGENT_DECISION" "$AGENT_PROMPT" && grep -Fq -- '--review-decision --json --pr 1983' "$AGENT_PROMPT" && grep -Fq -- '--input both' "$AGENT_PROMPT" && ! grep -F -- '--review-decision --json' "$AGENT_PROMPT" | grep -Fq -- '--out'; echo $?)"
 check 'agent-task prompt excludes raw decision-envelope content' "$(! grep -Fq "$raw_marker" "$AGENT_PROMPT"; echo $?)" "marker=$raw_marker"
+daemon_agent_task_available(){ return 1; }
+MOCK_PROMPT="$AGENT_PROMPT" DD_ENGINE="$TYPED_ENGINE" DD_INPUT=both DD_NWO=acme/widgets DD_NUM=1983 DD_SHA=1111111111111111111111111111111111111111 DD_WORKTREE="$TYPED_HOME" DD_LOG="$TYPED_LOG" daemon_run_agent_task "$AGENT_DECISION" fix-review-findings; agent_rc=$?
+check 'unavailable typed agent task is deferred, not completed' "$([ "$agent_rc" -eq 2 ]; echo $?)" "rc=$agent_rc"
+daemon_agent_task_available(){ return 0; }
+MOCK_CLAUDE_RC=1 MOCK_PROMPT="$AGENT_PROMPT" DD_ENGINE="$TYPED_ENGINE" DD_INPUT=both DD_NWO=acme/widgets DD_NUM=1983 DD_SHA=1111111111111111111111111111111111111111 DD_WORKTREE="$TYPED_HOME" DD_LOG="$TYPED_LOG" daemon_run_agent_task "$AGENT_DECISION" fix-review-findings; agent_rc=$?
+check 'failed typed agent task is deferred, not completed' "$([ "$agent_rc" -eq 1 ]; echo $?)" "rc=$agent_rc"
 
 # A nonzero run worker must re-query with the same input before it can consume the wrapper budget.
 FAIL_NOTES=0
@@ -124,6 +131,49 @@ for index in $(seq 0 7); do
   check "$action has zero SHA/failure-budget effects unless it runs a granted review" "$([ "$action" = run-granted-review ] || { [ "$(wc -c < "$TYPED_STATE")" = "$before_state" ] && [ "$(wc -c < "$TYPED_FAILS")" = "$before_fails" ]; }; echo $?)" "processed=$(wc -c < "$TYPED_STATE") failures=$(wc -c < "$TYPED_FAILS")"
 done
 check 'default both input is reused by guarded effect rechecks' "$(grep -F -- '--review-decision-effect' "$TYPED_ENGINE_CALLS" | grep -Fq -- '--input both'; echo $?)"
+
+# A completed agent task uses the same processed.tsv behavior as a completed review worker. Its
+# failure/unavailable outcomes, and every non-agent action, remain retryable and budget-neutral.
+PROCESS_REPO="$TYPED_HOME/process-repo"; mkdir -p "$PROCESS_REPO/.git"
+PROCESS_SHA=1111111111111111111111111111111111111111
+PROCESS_NEW_SHA="$PROCESS_SHA"
+find_repo(){ printf '%s\n' "$PROCESS_REPO"; }
+git(){
+  if [ "${1:-}" = -C ] && [ "${3:-}" = worktree ] && [ "${4:-}" = add ]; then mkdir -p "$6"; fi
+  return 0
+}
+gh(){
+  [ "${1:-}" = pr ] && [ "${2:-}" = view ] && { printf '%s\n' "$PROCESS_NEW_SHA"; return 0; }
+  return 1
+}
+runtime_gate(){ return 0; }
+PROCESS_AGENT_RC=0
+daemon_run_agent_task(){ AGENT_TASKS=$((AGENT_TASKS + 1)); return "$PROCESS_AGENT_RC"; }
+PROCESS_DECISION="$TYPED_HOME/process-agent.json"; typed_decision 3 "$PROCESS_DECISION"
+: > "$TYPED_STATE"; : > "$TYPED_FAILS"
+MOCK_FRESH="$PROCESS_DECISION" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
+check 'successful no-push fix task marks its SHA and is skipped next poll' "$([ "$process_rc" -eq 0 ] && already_done acme/widgets 1983 "$PROCESS_SHA" && [ "$(wc -l < "$TYPED_STATE")" -eq 1 ]; echo $?)" "rc=$process_rc state=$(wc -l < "$TYPED_STATE")"
+PROCESS_PREPARE_DECISION="$TYPED_HOME/process-prepare.json"; typed_decision 4 "$PROCESS_PREPARE_DECISION"
+: > "$TYPED_STATE"; : > "$TYPED_FAILS"
+MOCK_FRESH="$PROCESS_PREPARE_DECISION" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
+check 'successful no-push evidence task marks its SHA and is skipped next poll' "$([ "$process_rc" -eq 0 ] && already_done acme/widgets 1983 "$PROCESS_SHA" && [ "$(wc -l < "$TYPED_STATE")" -eq 1 ]; echo $?)" "rc=$process_rc state=$(wc -l < "$TYPED_STATE")"
+PROCESS_NEW_SHA=2222222222222222222222222222222222222222
+: > "$TYPED_STATE"; : > "$TYPED_FAILS"
+MOCK_FRESH="$PROCESS_DECISION" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
+check 'successful pushed agent task marks original and new heads' "$([ "$process_rc" -eq 0 ] && already_done acme/widgets 1983 "$PROCESS_SHA" && already_done acme/widgets 1983 "$PROCESS_NEW_SHA" && [ "$(wc -l < "$TYPED_STATE")" -eq 2 ]; echo $?)" "rc=$process_rc state=$(wc -l < "$TYPED_STATE")"
+for PROCESS_AGENT_RC in 1 2; do
+  : > "$TYPED_STATE"; : > "$TYPED_FAILS"
+  MOCK_FRESH="$PROCESS_DECISION" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
+  check "agent task rc=$PROCESS_AGENT_RC stays retryable without a failure-budget row" "$([ "$process_rc" -eq "$PROCESS_AGENT_RC" ] && [ ! -s "$TYPED_STATE" ] && [ ! -s "$TYPED_FAILS" ]; echo $?)" "rc=$process_rc processed=$(wc -c < "$TYPED_STATE") failures=$(wc -c < "$TYPED_FAILS")"
+done
+PROCESS_AGENT_RC=0
+for action in collect-existing-result recover-existing-review stop-without-new-review allow-existing-merge-workflow ask-named-product-choice; do
+  index="$(jq -r --arg action "$action" '.cases | to_entries[] | select(.value.expected.action == $action) | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
+  decision="$TYPED_HOME/process-$action.json"; typed_decision "$index" "$decision"
+  : > "$TYPED_STATE"; : > "$TYPED_FAILS"
+  MOCK_FRESH="$decision" MOCK_RECOVERED="$TYPED_HOME/process-recovered" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
+  check "$action does not mark a processed SHA or failure budget" "$([ "$process_rc" -eq 0 ] && [ ! -s "$TYPED_STATE" ] && [ ! -s "$TYPED_FAILS" ]; echo $?)" "rc=$process_rc processed=$(wc -c < "$TYPED_STATE") failures=$(wc -c < "$TYPED_FAILS")"
+done
 # Observation is progress only: it reports, but never changes action selection or prompts.
 typed_decision 2 "$TYPED_HOME/observed-base.json"
 observed_facts="$(jq -cS '.facts | .observation.kind="waiting"' "$TYPED_HOME/observed-base.json")"
@@ -225,4 +275,4 @@ printf 'identity-converged-%s\n' "$(date +%s)" > "$TDIR/.deploy-stamp.tmp" && mv
 for _ in $(seq 1 60); do [ "$(grep -c 'pro-review-daemon starting' "$DLOG3" 2>/dev/null)" -ge 2 ] && break; sleep 0.2; done
 check 'compatible identity deploy reloads and recovers daemon readiness' "$( [ "$(grep -c 'pro-review-daemon starting' "$DLOG3" 2>/dev/null)" -ge 2 ] && [ "$(grep -c 'review-decision identity is missing' "$DLOG3" 2>/dev/null)" -eq 1 ] && grep -q 'no PRs pending' "$DLOG3"; echo $?)" "$(tail -8 "$DLOG3" 2>/dev/null)"
 
-[ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }
+[ "$TEST_FAILURES" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$TEST_FAILURES FAILURES"; exit 1; }

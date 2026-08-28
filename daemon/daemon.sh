@@ -93,7 +93,7 @@ daemon_run_agent_task(){ # saved decision-file validated action
   local decision="$1" action="$2" prompt target reentry
   daemon_agent_task_available || {
     daemon_note "  · $DD_NWO#$DD_NUM $action deferred: daemon has no safe typed agent-task capability"
-    return 0
+    return 2
   }
   printf -v target 'PR #%q (%q), local repository %q' "$DD_NUM" "$DD_NWO" "$DD_WORKTREE"
   printf -v reentry '%q ' "$DD_ENGINE" --review-decision --json --pr "$DD_NUM" --repo "$DD_WORKTREE" --input "$DD_INPUT"
@@ -108,8 +108,8 @@ When a valid typed decision makes it safe, finish the existing headless auto-fix
       --model "$CLAUDE_MODEL" --fallback-model "$FALLBACK_MODEL" --max-budget-usd "$MAX_BUDGET" \
       --add-dir "$DD_WORKTREE" --dangerously-skip-permissions --output-format text >>"$DD_LOG" 2>&1 ); then
     daemon_note "  ! $DD_NWO#$DD_NUM typed agent task $action ended without completion; deferred without charging the review failure budget"
+    return 1
   fi
-  return 0
 }
 
 daemon_handle_review_worker_failure(){ # worker-rc; fresh typed decision decides whether wrapper failure budget waits
@@ -135,8 +135,9 @@ daemon_handle_review_worker_failure(){ # worker-rc; fresh typed decision decides
 }
 
 daemon_dispatch_decision(){ # decision-file [redirect-depth]
-  local decision="$1" depth="${2:-0}" action class ref fresh fresh_action fresh_ref
+  local decision="$1" depth="${2:-0}" action class ref fresh fresh_action fresh_ref agent_rc
   DAEMON_DISPATCH_REVIEW_RAN=0
+  DAEMON_DISPATCH_AGENT_TASK_COMPLETED=0
   daemon_decision_valid "$decision" && daemon_decision_target_matches "$decision" "$DD_NWO" "$DD_NUM" "$DD_SHA" || {
     daemon_defer_decision "missing, malformed, stale, unknown, or corpus-mismatched envelope"
     return 2
@@ -175,7 +176,11 @@ daemon_dispatch_decision(){ # decision-file [redirect-depth]
       return 0 ;;
     agent-task/fix-review-findings|agent-task/prepare-matching-review-evidence)
       daemon_run_agent_task "$decision" "$action"
-      return 0 ;;
+      agent_rc=$?
+      if [ "$agent_rc" -eq 0 ]; then
+        DAEMON_DISPATCH_AGENT_TASK_COMPLETED=1
+      fi
+      return "$agent_rc" ;;
     report-only/stop-without-new-review)
       daemon_note "  · $DD_NWO#$DD_NUM stopped by runtime decision; no review worker, SHA completion, or failure-budget charge"
       return 0 ;;
@@ -195,11 +200,6 @@ daemon_dispatch_decision(){ # decision-file [redirect-depth]
 # `both` is the safe default: it lets the runtime select matching-evidence preparation while
 # keeping explicit connector-only deployments compatible.
 DD_INPUT="${PRO_REVIEW_INPUT:-both}"
-
-# Test seam: source only the decision transport functions, with no startup validation or watch loop.
-if [ "${PRO_GATE_DAEMON_LIB_ONLY:-0}" = 1 ]; then
-  return 0 2>/dev/null || exit 0
-fi
 
 case "$DD_INPUT" in
   both|bundle|connector) ;;
@@ -296,7 +296,7 @@ maybe_self_reload(){
   if [ -f "$SELF/run-daemon.sh" ]; then exec "$SELF/run-daemon.sh"; else exec "$SELF/daemon.sh"; fi
 }
 
-if [ -z "$OWNERS" ]; then
+if [ -z "$OWNERS" ] && [ "${PRO_GATE_DAEMON_LIB_ONLY:-0}" != 1 ]; then
   log "FATAL: PRO_REVIEW_OWNERS is not set in $ROOT/.env (e.g. PRO_REVIEW_OWNERS=my-org). Idling."
   # Still pick up a redeploy while parked here (this branch is idle -- no reviews run without OWNERS).
   while true; do maybe_self_reload; sleep 600; pg_load_env; OWNERS="${PRO_REVIEW_OWNERS:-}"; [ -n "$OWNERS" ] && break; done
@@ -315,12 +315,19 @@ session_up(){
 
 already_done(){ grep -qF "$(printf '%s\t%s\t%s' "$1" "$2" "$3")" "$STATE"; }
 mark_done(){ printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$STATE"; }
+mark_processed_heads(){ # nwo num original-sha
+  local nwo="$1" num="$2" sha="$3" newsha
+  mark_done "$nwo" "$num" "$sha"
+  newsha=$(gh pr view "$num" -R "$nwo" --json headRefOid -q .headRefOid 2>/dev/null)
+  [ -n "$newsha" ] && [ "$newsha" != "$sha" ] && mark_done "$nwo" "$num" "$newsha"
+  printf '%s' "$newsha"
+}
 
 # Count a failed attempt for repo#pr@sha (ANY failure class: clone, worktree, claude run) and
 # give up permanently after MAX_FAILS — previously only claude-run failures were counted, so a
 # broken clone/worktree retried every cycle forever.
 # #50 item 6: $FAILS (failcount.tsv) tracks DAEMON-WRAPPER orchestration failures only
-# (clone/worktree/agent rc!=0). Engine-level outcomes live in the engine's own ledger.jsonl;
+# (clone/worktree/run-granted-review child rc!=0). Engine-level outcomes live in the engine's own ledger.jsonl;
 # the two records are deliberately separate and are not expected to reconcile.
 note_fail(){ # nwo num sha log reason
   printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$FAILS"
@@ -391,15 +398,19 @@ process_pr(){
   fi
   DD_ENGINE="$engine" DD_DECISION="$decision" DD_NWO="$nwo" DD_NUM="$num" DD_SHA="$sha" DD_WORKTREE="$wt" DD_LOG="$lg"
   daemon_dispatch_decision "$decision"
-  local rc=$? review_ran="${DAEMON_DISPATCH_REVIEW_RAN:-0}"
+  local rc=$? review_ran="${DAEMON_DISPATCH_REVIEW_RAN:-0}" agent_task_completed="${DAEMON_DISPATCH_AGENT_TASK_COMPLETED:-0}"
 
-  # Only a run-granted-review worker participates in the existing wrapper failure budget and
-  # per-SHA completion ledger. Collection, recovery, agent tasks, reports, choices, stale effects,
-  # and incompatible envelopes leave both untouched. Before a failed worker can consume that
-  # budget, query the runtime again for this target/input; only its typed collect/recover actions
-  # defer a potentially paid or in-progress review.
+  # Only a run-granted-review worker participates in the existing wrapper failure budget. A
+  # successful typed agent task also completes this SHA: it either made the required fix/evidence
+  # progress or reported that none was needed. Its unavailable/nonzero states remain retryable and
+  # never consume that review-worker budget. Collection, recovery, reports, choices, stale effects,
+  # and incompatible envelopes leave the completion ledger untouched.
   if [ "$review_ran" != 1 ]; then
     git -C "$repodir" worktree remove --force "$wt" 2>/dev/null || true
+    if [ "$agent_task_completed" = 1 ] && [ "$rc" -eq 0 ]; then
+      local newsha; newsha="$(mark_processed_heads "$nwo" "$num" "$sha")"
+      log "  ✓ typed agent task completed $nwo#$num (head now ${newsha:0:8})"
+    fi
     return "$rc"
   fi
   if [ "$rc" -ne 0 ]; then
@@ -410,13 +421,16 @@ process_pr(){
   fi
 
   git -C "$repodir" worktree remove --force "$wt" 2>/dev/null || true
-  mark_done "$nwo" "$num" "$sha"
   # The worker may push an implementation after the runtime-selected review. Preserve the old
   # self-push idempotency behavior without granting merge authority.
-  local newsha; newsha=$(gh pr view "$num" -R "$nwo" --json headRefOid -q .headRefOid 2>/dev/null)
-  [ -n "$newsha" ] && [ "$newsha" != "$sha" ] && mark_done "$nwo" "$num" "$newsha"
+  local newsha; newsha="$(mark_processed_heads "$nwo" "$num" "$sha")"
   log "  ✓ runtime-selected review worker completed $nwo#$num (head now ${newsha:0:8})"
 }
+
+# Test seam: source all daemon functions and setup, with no startup watch loop.
+if [ "${PRO_GATE_DAEMON_LIB_ONLY:-0}" = 1 ]; then
+  return 0 2>/dev/null || exit 0
+fi
 
 # --- main loop --------------------------------------------------------------
 log "pro-review-daemon starting (os=$OS mode=$MODE owners='$OWNERS' poll=${POLL}s model=$CLAUDE_MODEL all_prs=$ALL_PRS autoclone=$AUTOCLONE $( [ "$ALL_PRS" = 1 ] && echo "skip-label='$SKIP_LABEL'" || echo "label='$LABEL'" ))"

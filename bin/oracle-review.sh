@@ -313,11 +313,14 @@ pg_review_decision_cli() {
   local input_marker="" input_record="" input_digest="" f marker candidate candidate_relation desired_relation exact=false active_marker="" active_state=none
   local endpoint reviewed manifest confirmation endpoint_digest reviewed_digest manifest_digest confirmation_digest lineage mode ship_digest
   local reservation_marker="" reservation_state=none governor_granted=false completed='[]' prior_candidates='[]' prior_review result artifact artifact_digest canonical
-  local facts decision effect_ok=false prospective exact_inputs='[]' choice_candidates='[]' choice_outcomes='[]' choice_selected="" choice_snapshot="" selection="" selection_supplied=false current_verdict=NONE current_canonical=""
+  local facts decision effect_ok=false prospective exact_inputs='[]' choice_candidates='[]' choice_outcomes='[]' choice_selected="" choice_snapshot="" selection="" selection_supplied=false current_verdict=NONE current_canonical="" effect_input
 
   pg_have jq || { echo 'ERROR: review-decision/v1 requires jq' >&2; return 2; }
   repo="${REPO:-$(pwd)}"
-  [ -d "$repo/.git" ] || { echo 'ERROR: review-decision requires a local git repository' >&2; return 2; }
+  # Linked worktrees have a .git *file*, while bare repositories answer false. Ask Git itself
+  # for the bounded working-tree proof instead of inferring repository shape from its metadata.
+  [ "$(git -C "$repo" rev-parse --is-inside-work-tree 2>/dev/null)" = true ] \
+    || { echo 'ERROR: review-decision requires a local git working tree' >&2; return 2; }
   case "$PR" in
     http*://*/pull/*) pr_num="${PR%/}"; pr_num="${pr_num##*/}" ;;
     *) pr_num="$PR" ;;
@@ -379,10 +382,29 @@ pg_review_decision_cli() {
       exact_inputs="$(jq -cS --arg marker "$marker" --argjson binding "$candidate" '. + [{binding:$binding,marker:$marker}]' <<<"$exact_inputs")"
     fi
 
-    # A result is credible only when its own marker-bound input digest and canonical artifact
-    # bytes validate. We inspect every linked sibling rather than inheriting one chosen input.
+    # Classify this exact marker's own captured bytes before result-binding validation. completed/
+    # is preferred; pending/ is the durable fallback and remains uncollected-only. This must happen
+    # per binding rather than only for the newest exact marker, or marker ordering can hide recovery.
+    artifact=""
+    if [ "$exact" = true ]; then
+      if [ -f "$(pg_completed_dir)/$marker" ] && [ ! -L "$(pg_completed_dir)/$marker" ] && pg_is_review "$(pg_completed_dir)/$marker"; then
+        artifact="$(pg_completed_dir)/$marker"
+      elif [ -f "$PRO_GATE_HOME/pending/$marker" ] && [ ! -L "$PRO_GATE_HOME/pending/$marker" ] && pg_is_review "$PRO_GATE_HOME/pending/$marker"; then
+        artifact="$PRO_GATE_HOME/pending/$marker"
+      fi
+    fi
+
+    # A result is credible only when its own marker-bound input digest and canonical completed
+    # artifact bytes validate. Missing bindings expose exact bytes as collect/recover-only facts.
     result="$(pg_review_result_binding_read "$marker" 2>/dev/null || true)"
-    [ -n "$result" ] || continue
+    if [ -z "$result" ]; then
+      if [ "$exact" = true ] && [ -n "$artifact" ]; then
+        artifact_digest="$(pg_sha256 "$artifact" 2>/dev/null || true)"
+        [ -n "$artifact_digest" ] && completed="$(jq -cS --arg marker "$marker" --arg artifact "$artifact_digest" --argjson epoch "$(jq -r .charged_spend_epoch <<<"$candidate")" \
+          '. + [{applicable:true,artifact_digest:$artifact,binding_valid:false,canonical_identity:$marker,charged_spend_epoch:$epoch,collected:false,legacy:false,marker:$marker,provenance_valid:false,verdict:"NONE"}]' <<<"$completed")"
+      fi
+      continue
+    fi
     artifact="$(pg_completed_dir)/$marker"
     [ -f "$artifact" ] && [ ! -L "$artifact" ] && pg_is_review "$artifact" || continue
     artifact_digest="$(pg_sha256 "$artifact" 2>/dev/null || true)"
@@ -480,16 +502,6 @@ pg_review_decision_cli() {
   if pg_reservation_marker_ok "$reservation_marker"; then reservation_state=live; else reservation_marker=""; fi
   if pg_round_guard "$round_key" >/dev/null 2>&1; then governor_granted=true; fi
 
-  # Canonical bytes that survived a crash before binding installation are collectable recovery
-  # facts, never terminal facts. A matching collect effect performs the marker-locked repair.
-  if [ -n "$input_marker" ] && [ -f "$(pg_completed_dir)/$input_marker" ] \
-     && [ ! -L "$(pg_completed_dir)/$input_marker" ] && pg_is_review "$(pg_completed_dir)/$input_marker" \
-     && ! pg_review_result_binding_read "$input_marker" >/dev/null 2>&1; then
-    artifact_digest="$(pg_sha256 "$(pg_completed_dir)/$input_marker")"
-    completed="$(jq -cS --arg marker "$input_marker" --arg artifact "$artifact_digest" --argjson epoch "$(jq -r .charged_spend_epoch <<<"$input_record")" \
-      '. + [{applicable:true,artifact_digest:$artifact,binding_valid:false,canonical_identity:$marker,charged_spend_epoch:$epoch,collected:false,legacy:false,marker:$marker,provenance_valid:false,verdict:"NONE"}]' <<<"$completed")"
-  fi
-
   facts="$(jq -cnS --arg h "$host" --arg o "$owner" --arg r "$repo_name" --arg head "$head" --argjson pr "$pr_num" \
     --arg identity "$input_identity" --arg evidence "$evidence_identity" --arg state "$evidence_state" \
     --arg marker "$active_marker" --arg astate "$active_state" --arg reservation "$reservation_marker" --arg rstate "$reservation_state" \
@@ -518,8 +530,11 @@ pg_review_decision_cli() {
     # fresh reduction. A mismatch falls through to the replacement decision with no mutation.
     if [ "$effect_ok" = true ] && [ "$(jq -r .action <<<"$decision")" = collect-existing-result ]; then
       effect_marker="$(jq -r '.effect_request.applicable_ref // ""' <<<"$decision")"
-      if [ "$effect_marker" = "$input_marker" ]; then
-        pg_review_decision_repair_result_binding "$effect_marker" "$input_record" || true
+      effect_input="$(pg_review_input_binding_read "$effect_marker" 2>/dev/null || true)"
+      if [ -n "$effect_input" ] \
+         && [ "$(jq -cS '{repository,target,evidence}' <<<"$effect_input" 2>/dev/null || true)" = "$desired_relation" ] \
+         && pg_review_decision_input_proof_current "$effect_input" "$repo" "$pr_num" "$host" "$owner" "$repo_name" "$head" "$base"; then
+        pg_review_decision_repair_result_binding "$effect_marker" "$effect_input" || true
       fi
     elif [ "$effect_ok" = true ] && [ "$(jq -r .action <<<"$decision")" = run-granted-review ]; then
       # The advisory request matched a freshly reduced grant. It still carries no authority:
@@ -1518,6 +1533,7 @@ pg_install_full_pr_input_binding() { # marker; only endpoint-fetched full PRs ga
 pg_fresh_dispatch_recheck() { # sets PG_FRESH_DECISION/PG_FRESH_ACTION
   local template="$REVIEW_DECISION_INPUT_TEMPLATE" marker="" state=none epoch=0 f rec m astate="" completed='[]'
   local input_ok=false input_digest evidence identity head base active_marker="" reservation="" granted=false facts
+  local template_relation="" candidate="" candidate_relation="" artifact="" artifact_digest=""
   [ -n "$template" ] || return 1
   input_digest="$(pg_review_sha256_text "$template" 2>/dev/null || true)"
   head="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || true)"
@@ -1526,18 +1542,37 @@ pg_fresh_dispatch_recheck() { # sets PG_FRESH_DECISION/PG_FRESH_ACTION
   # raw endpoint, reviewed payload, manifest, and confirmation remain four separate inputs.
   if pg_review_decision_input_proof_current "$template" "$REPO" "$PR_NUM" "$PG_META_HOST" "$PG_META_OWNER" "$PG_META_REPO" "$head" "$base"; then
     input_ok=true
+    template_relation="$(jq -cS '{repository,target,evidence}' <<<"$template" 2>/dev/null || true)"
   fi
   identity="${input_digest:-input-unproven}"
   evidence="$(jq -r '.evidence.identity // "evidence:none"' <<<"$template" 2>/dev/null || echo evidence:none)"
 
-  # Completed bytes are a collection authority even before result-binding work (the next slice).
-  # A marker-qualified artifact therefore supersedes a fresh dispatch rather than being ignored.
-  for f in "$(pg_completed_dir)"/pg-run-"$ROUND_KEY"-*; do
-    [ -f "$f" ] && [ ! -L "$f" ] && pg_is_review "$f" || continue
-    m="${f##*/}"
-    completed="$(jq -cS --arg marker "$m" --arg digest "$(pg_sha256 "$f")" \
-      '. + [{applicable:true,artifact_digest:$digest,binding_valid:false,canonical_identity:$marker,charged_spend_epoch:1,collected:false,legacy:true,marker:$marker,provenance_valid:false,verdict:"NONE"}]' <<<"$completed")"
-  done
+  # A saved grant may be superseded only by its exact-current marker-bound relation. Filename
+  # affinity alone is never proof: inspect the immutable input sibling, its target, relation
+  # (excluding marker/charged epoch), and live evidence before accepting completed or pending
+  # bytes. pending/ intentionally yields only an uncollected fact, so it cannot confer SHIP
+  # authority and the existing --recover path remains the no-spend recovery route.
+  if [ "$input_ok" = true ] && [ -n "$template_relation" ]; then
+    while IFS= read -r m; do
+      candidate="$(pg_review_input_binding_read "$m" 2>/dev/null || true)"
+      [ -n "$candidate" ] || continue
+      jq -e --arg h "$PG_META_HOST" --arg o "$PG_META_OWNER" --arg r "$PG_META_REPO" --argjson p "$PR_NUM" --arg head "$head" \
+        '.repository.host==$h and .repository.owner==$o and .repository.repo==$r and .target.pr==$p and .target.head_oid==$head' \
+        <<<"$candidate" >/dev/null 2>&1 || continue
+      candidate_relation="$(jq -cS '{repository,target,evidence}' <<<"$candidate" 2>/dev/null || true)"
+      [ "$candidate_relation" = "$template_relation" ] \
+        && pg_review_decision_input_proof_current "$candidate" "$REPO" "$PR_NUM" "$PG_META_HOST" "$PG_META_OWNER" "$PG_META_REPO" "$head" "$base" || continue
+      artifact="$(pg_completed_dir)/$m"
+      if ! { [ -f "$artifact" ] && [ ! -L "$artifact" ] && pg_is_review "$artifact"; }; then
+        artifact="$PRO_GATE_HOME/pending/$m"
+      fi
+      [ -f "$artifact" ] && [ ! -L "$artifact" ] && pg_is_review "$artifact" || continue
+      artifact_digest="$(pg_sha256 "$artifact" 2>/dev/null || true)"
+      [ -n "$artifact_digest" ] || continue
+      completed="$(jq -cS --arg marker "$m" --arg digest "$artifact_digest" --argjson charged "$(jq -r .charged_spend_epoch <<<"$candidate")" \
+        '. + [{applicable:true,artifact_digest:$digest,binding_valid:false,canonical_identity:$marker,charged_spend_epoch:$charged,collected:false,legacy:false,marker:$marker,provenance_valid:false,verdict:"NONE"}]' <<<"$completed")"
+    done < <(find "$(pg_review_input_binding_dir)" -mindepth 1 -maxdepth 1 -type f -name "pg-run-$ROUND_KEY-*" -printf '%f\n' 2>/dev/null | LC_ALL=C sort)
+  fi
   if [ -f "$(pg_active_dir)/$ROUND_KEY" ] && [ ! -L "$(pg_active_dir)/$ROUND_KEY" ]; then
     IFS=$'\t' read -r marker _ _ _ _ _ astate epoch < "$(pg_active_dir)/$ROUND_KEY" 2>/dev/null || true
     if pg_reservation_marker_ok "$marker" && [ "$marker" != "${RUN_MARKER:-}" ]; then
