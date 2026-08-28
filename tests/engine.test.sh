@@ -4457,4 +4457,177 @@ EXPIRED_RESERVATION_OUT="$(rd_reduce "$EXPIRED_RESERVATION_FACTS")"
 check 'expired reservation with no current binding stops rather than creating new spend' \
   "$(jq -e '.action == "stop-without-new-review" and .reason == "unproven-input"' <<<"$EXPIRED_RESERVATION_OUT" >/dev/null 2>&1; echo $?)" "$EXPIRED_RESERVATION_OUT"
 
+# Reopened U2: a NEEDS-DISCUSSION artifact admits only a small terminal data grammar. These are
+# deliberately red-before-green parser cases: no raw review prose is ever surfaced by the helper.
+echo '# U2 reopened: bounded named-product choice artifacts'
+CHOICE_ART="$TDIR/named-choice-review.md"
+choice_artifact() { # outcome lines supplied on stdin
+  { printf '%s\n' 'P0: none' 'P1: none'; cat; printf '%s\n' 'VERDICT: NEEDS-DISCUSSION — choose intentionally.'; } > "$CHOICE_ART"
+}
+printf '%s\n' 'CHOICE: keep | Keep compatibility | Existing users need no migration.' 'CHOICE: replace | Replace API | Users migrate to the new contract.' | choice_artifact
+CHOICE_PARSED="$(pg_review_decision_named_choices "$CHOICE_ART" 2>/dev/null)"; CHOICE_PARSE_RC=$?
+check 'well-formed NEEDS-DISCUSSION artifact yields bounded machine choice outcomes' \
+  "$([ "$CHOICE_PARSE_RC" -eq 0 ] && jq -e 'length==2 and .[0].id=="keep" and .[1].id=="replace"' <<<"$CHOICE_PARSED" >/dev/null 2>&1; echo $?)" "$CHOICE_PARSED"
+CHOICE_SHELL_SENTINEL="$TDIR/choice-shell-sentinel"
+printf '%s\n' "CHOICE: keep | Keep \$(touch $CHOICE_SHELL_SENTINEL) | Treat this as printable data only." 'CHOICE: replace | Replace | Migrate safely.' | choice_artifact
+CHOICE_SHELL_PARSED="$(pg_review_decision_named_choices "$CHOICE_ART" 2>/dev/null)"; CHOICE_SHELL_RC=$?
+check 'printable shell metacharacters remain inert normalized choice data' \
+  "$([ "$CHOICE_SHELL_RC" -eq 0 ] && [ ! -e "$CHOICE_SHELL_SENTINEL" ] && jq -e '.[0].label | contains("$(touch ")' <<<"$CHOICE_SHELL_PARSED" >/dev/null 2>&1; echo $?)" "$CHOICE_SHELL_PARSED"
+for choice_case in one duplicate oversized oversized-id control malformed extra-pipe; do
+  case "$choice_case" in
+    one) printf '%s\n' 'CHOICE: keep | Keep compatibility | Existing users need no migration.' | choice_artifact ;;
+    duplicate) printf '%s\n' 'CHOICE: keep | Keep compatibility | Existing users need no migration.' 'CHOICE: keep | Replace API | Users migrate.' | choice_artifact ;;
+    oversized) { printf 'CHOICE: keep | '; python3 -c 'print("x" * 121, end="")'; printf ' | consequence\nCHOICE: replace | Replace | migrate\n'; } | choice_artifact ;;
+    oversized-id) { printf 'CHOICE: '; python3 -c 'print("x" * 257, end="")'; printf ' | Keep | consequence\nCHOICE: replace | Replace | migrate\n'; } | choice_artifact ;;
+    control) { printf 'CHOICE: keep | Keep\001 | consequence\nCHOICE: replace | Replace | migrate\n'; } | choice_artifact ;;
+    malformed) printf '%s\n' 'CHOICE: keep | Only two fields' 'CHOICE: replace | Replace | migrate' | choice_artifact ;;
+    extra-pipe) printf '%s\n' 'CHOICE: keep | Keep | consequence | extra' 'CHOICE: replace | Replace | migrate' | choice_artifact ;;
+  esac
+  pg_review_decision_named_choices "$CHOICE_ART" >/dev/null 2>&1; CHOICE_CASE_RC=$?
+  check "invalid named choice artifact stops closed: $choice_case" "$([ "$CHOICE_CASE_RC" -ne 0 ]; echo $?)" "rc=$CHOICE_CASE_RC"
+done
+
+# The public CLI reads choices only from the exact immutable artifact. Selection is a canonical,
+# read-only input which can route only through the existing reducer's non-authorizing fixer action.
+echo '# U2 reopened: real CLI named-product selection'
+CHOICE_HOME="$TDIR/home-cli-choice"; CHOICE_MARKER='pg-run-acme-widgets-1983-1700017000-1'
+CHOICE_BINDING="$(jq -cS --arg marker "$CHOICE_MARKER" '.marker=$marker | .charged_spend_epoch=1700017000' <<<"$PC_SCOPED")"
+mkdir -p "$CHOICE_HOME/completed"
+printf '%s\n' 'P0: none' 'P1: none' 'CHOICE: keep | Keep compatibility | Existing users need no migration.' 'CHOICE: replace | Replace API | Users migrate to the new contract.' 'VERDICT: NEEDS-DISCUSSION — choose intentionally.' > "$CHOICE_HOME/completed/$CHOICE_MARKER"
+CHOICE_INPUT_DIGEST="$(printf '%s' "$CHOICE_BINDING" | sha256sum | awk '{print $1}')"
+CHOICE_ART_DIGEST="$(sha256sum "$CHOICE_HOME/completed/$CHOICE_MARKER" | awk '{print $1}')"
+CHOICE_RESULT="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg marker "$CHOICE_MARKER" --arg ib "$CHOICE_INPUT_DIGEST" --arg digest "$CHOICE_ART_DIGEST" '{accepted_epoch:1700017001,artifact:{digest:$digest,path:("completed/"+$marker)},contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,input_binding_digest:$ib,input_binding_identity:$marker,marker:$marker,named_choice:null,provenance:{outcome:"accepted",validated_epoch:1700017001},record_type:"review-result-binding/v1",record_version:1,ship_proof:null,verdict:"NEEDS-DISCUSSION"}')"
+PRO_GATE_HOME="$CHOICE_HOME" pg_review_input_binding_write "$CHOICE_MARKER" "$CHOICE_BINDING"
+PRO_GATE_HOME="$CHOICE_HOME" pg_review_result_binding_write "$CHOICE_MARKER" "$CHOICE_RESULT"
+env PRO_GATE_HOME="$CHOICE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+  bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
+  >"$TDIR/choice-ask.json" 2>"$TDIR/choice-ask.err"
+CHOICE_ASK_RC=$?
+CHOICE_SNAPSHOT="$(jq -r .effect_request.snapshot_digest "$TDIR/choice-ask.json")"
+check 'exact NEEDS-DISCUSSION CLI result exposes only validated outcomes and asks once' \
+  "$([ "$CHOICE_ASK_RC" -eq 0 ] && jq -e '.action=="ask-named-product-choice" and (.facts.named_choice.outcomes|length)==2 and .facts.named_choice.selected_id==null' "$TDIR/choice-ask.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$CHOICE_ASK_RC output=$(cat "$TDIR/choice-ask.json")"
+check 'initial named-choice effect snapshot is the reducer choice context' \
+  "$(jq -e --arg snap "$CHOICE_SNAPSHOT" '.facts as $facts | (.effect_request.snapshot_digest==$snap) and ($snap|test("^[0-9a-f]{64}$"))' "$TDIR/choice-ask.json" >/dev/null 2>&1; echo $?)" \
+  "snapshot=$CHOICE_SNAPSHOT"
+printf '%s' "$(jq -cnS --arg id keep --arg snap "$CHOICE_SNAPSHOT" '{selected_id:$id,snapshot_digest:$snap}')" > "$TDIR/choice-selection.json"
+CHOICE_STATE_BEFORE="$(find "$CHOICE_HOME" -mindepth 1 -maxdepth 2 -printf '%P\n' | sort)"
+env PRO_GATE_HOME="$CHOICE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+  bash "$ENGINE" --review-decision --json --review-choice-selection "$TDIR/choice-selection.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
+  >"$TDIR/choice-selected.json" 2>"$TDIR/choice-selected.err"
+CHOICE_SELECTED_RC=$?; CHOICE_STATE_AFTER="$(find "$CHOICE_HOME" -mindepth 1 -maxdepth 2 -printf '%P\n' | sort)"
+check 'exact canonical selection returns the existing non-authorizing named-choice fixer handoff without mutation' \
+  "$([ "$CHOICE_SELECTED_RC" -eq 0 ] && jq -e '.action=="fix-review-findings" and .reason=="named-product-choice-selected" and .facts.named_choice.selected_id=="keep"' "$TDIR/choice-selected.json" >/dev/null 2>&1 && [ "$CHOICE_STATE_BEFORE" = "$CHOICE_STATE_AFTER" ]; echo $?)" \
+  "rc=$CHOICE_SELECTED_RC output=$(cat "$TDIR/choice-selected.json")"
+for choice_selection_case in malformed unknown stale oversized symlink; do
+  rm -f "$TDIR/choice-bad.json"
+  case "$choice_selection_case" in
+    malformed) printf '%s\n' '{"selected_id":"keep"}' > "$TDIR/choice-bad.json" ;;
+    unknown) printf '%s' "$(jq -cnS --arg snap "$CHOICE_SNAPSHOT" '{selected_id:"unknown",snapshot_digest:$snap}')" > "$TDIR/choice-bad.json" ;;
+    stale) printf '%s' "$(jq -cnS '{selected_id:"keep",snapshot_digest:"0000000000000000000000000000000000000000000000000000000000000000"}')" > "$TDIR/choice-bad.json" ;;
+    oversized) python3 -c 'print("x" * 65537, end="")' > "$TDIR/choice-bad.json" ;;
+    symlink) ln -s "$TDIR/choice-selection.json" "$TDIR/choice-bad.json" ;;
+  esac
+  env PRO_GATE_HOME="$CHOICE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+    bash "$ENGINE" --review-decision --json --review-choice-selection "$TDIR/choice-bad.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
+    >"$TDIR/choice-$choice_selection_case.json" 2>"$TDIR/choice-$choice_selection_case.err"
+  CHOICE_BAD_RC=$?
+  check "malformed, unknown, or stale choice selection stops without a review: $choice_selection_case" \
+    "$([ "$CHOICE_BAD_RC" -eq 0 ] && jq -e '.action=="stop-without-new-review" and (.action!="run-granted-review")' "$TDIR/choice-$choice_selection_case.json" >/dev/null 2>&1; echo $?)" \
+    "rc=$CHOICE_BAD_RC output=$(cat "$TDIR/choice-$choice_selection_case.json")"
+done
+# Moving endpoint evidence invalidates the saved choice context; no previously selected outcome
+# is carried across to the newly reduced relation.
+printf 'moved endpoint\n' >> "$TDIR/scoped-raw-endpoint.patch"
+env PRO_GATE_HOME="$CHOICE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+  bash "$ENGINE" --review-decision --json --review-choice-selection "$TDIR/choice-selection.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
+  >"$TDIR/choice-evidence-moved.json" 2>"$TDIR/choice-evidence-moved.err"
+CHOICE_MOVED_RC=$?
+check 'moved scoped evidence invalidates a named selection without reusing it' \
+  "$([ "$CHOICE_MOVED_RC" -eq 0 ] && jq -e '.action!="fix-review-findings" and .action!="allow-existing-merge-workflow"' "$TDIR/choice-evidence-moved.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$CHOICE_MOVED_RC output=$(cat "$TDIR/choice-evidence-moved.json")"
+cp "$TDIR/proof-raw.patch" "$TDIR/scoped-raw-endpoint.patch"; printf 'unreviewed endpoint context\n' >> "$TDIR/scoped-raw-endpoint.patch"
+
+# A provenance-valid scoped SHIP is current merge-handoff evidence only while all independently
+# bound sources remain current. Connector SHIP remains explicitly non-authoritative.
+echo '# U2 reopened: scoped SHIP merge handoff'
+SCOPED_SHIP_HOME="$TDIR/home-scoped-ship"; SCOPED_SHIP_MARKER='pg-run-acme-widgets-1983-1700018000-1'
+SCOPED_SHIP_INPUT="$(jq -cS --arg marker "$SCOPED_SHIP_MARKER" '.marker=$marker | .charged_spend_epoch=1700018000' <<<"$PC_SCOPED")"
+mkdir -p "$SCOPED_SHIP_HOME/completed"
+printf '%s\n' 'P0: none' 'P1: none' 'P2: none' 'P3: none' 'VERDICT: SHIP — scoped endpoint reviewed.' > "$SCOPED_SHIP_HOME/completed/$SCOPED_SHIP_MARKER"
+PRO_GATE_HOME="$SCOPED_SHIP_HOME" pg_review_input_binding_write "$SCOPED_SHIP_MARKER" "$SCOPED_SHIP_INPUT"
+env PRO_GATE_HOME="$SCOPED_SHIP_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+  bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
+  >"$TDIR/scoped-ship-collect.json" 2>"$TDIR/scoped-ship-collect.err"
+SCOPED_COLLECT_RC=$?
+env PRO_GATE_HOME="$SCOPED_SHIP_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+  bash "$ENGINE" --review-decision --review-decision-effect "$TDIR/scoped-ship-collect.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
+  >"$TDIR/scoped-ship-repair.json" 2>"$TDIR/scoped-ship-repair.err"
+env PRO_GATE_HOME="$SCOPED_SHIP_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+  bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
+  >"$TDIR/scoped-ship-current.json" 2>"$TDIR/scoped-ship-current.err"
+SCOPED_CURRENT_RC=$?
+check 'unchanged provenance-valid scoped SHIP reaches report-only merge handoff, never another review' \
+  "$([ "$SCOPED_COLLECT_RC" -eq 0 ] && [ "$SCOPED_CURRENT_RC" -eq 0 ] && jq -e '.action=="allow-existing-merge-workflow" and .effect_request.execution_class=="report-only"' "$TDIR/scoped-ship-current.json" >/dev/null 2>&1; echo $?)" \
+  "collect=$(cat "$TDIR/scoped-ship-collect.json") current=$(cat "$TDIR/scoped-ship-current.json")"
+for scoped_move in raw reviewed manifest confirmation; do
+  case "$scoped_move" in
+    raw) printf 'different raw endpoint\n' >> "$TDIR/scoped-raw-endpoint.patch" ;;
+    reviewed) printf 'different reviewed payload\n' >> "$TDIR/proof-raw.patch" ;;
+    manifest) printf 'different manifest\n' >> "$TDIR/scoped-manifest" ;;
+    confirmation) printf '%s\n' 'P0: none' 'P1: none' 'P2: changed confirmation' 'P3: none' 'VERDICT: SHIP — changed.' > "$TDIR/scoped-confirmation.md" ;;
+  esac
+  env PRO_GATE_HOME="$SCOPED_SHIP_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+    bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
+    >"$TDIR/scoped-ship-$scoped_move.json" 2>"$TDIR/scoped-ship-$scoped_move.err"
+  SCOPED_MOVE_RC=$?
+  check "scoped SHIP with moved $scoped_move cannot reach merge handoff" \
+    "$([ "$SCOPED_MOVE_RC" -eq 0 ] && jq -e '.action!="allow-existing-merge-workflow"' "$TDIR/scoped-ship-$scoped_move.json" >/dev/null 2>&1; echo $?)" \
+    "rc=$SCOPED_MOVE_RC output=$(cat "$TDIR/scoped-ship-$scoped_move.json")"
+  cp "$TDIR/proof-raw.patch" "$TDIR/scoped-raw-endpoint.patch"; printf 'unreviewed endpoint context\n' >> "$TDIR/scoped-raw-endpoint.patch"
+  git -C "$DECISION_REPO" diff "$PROOF_BASE" "$PROOF_HEAD" > "$TDIR/proof-raw.patch"
+  printf 'proof.txt\n' > "$TDIR/scoped-manifest"
+  printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — prior review accepted' > "$TDIR/scoped-confirmation.md"
+done
+# Base movement is independently fail-closed even while the reviewed head stays fixed.
+git -C "$DECISION_REPO" branch scoped-base-alt "${PROOF_BASE}^"
+git -C "$DECISION_REPO" branch --set-upstream-to=scoped-base-alt >/dev/null 2>&1
+env PRO_GATE_HOME="$SCOPED_SHIP_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+  bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
+  >"$TDIR/scoped-ship-base.json" 2>"$TDIR/scoped-ship-base.err"
+SCOPED_BASE_RC=$?
+check 'scoped SHIP with moved base cannot reach merge handoff' \
+  "$([ "$SCOPED_BASE_RC" -eq 0 ] && jq -e '.action!="allow-existing-merge-workflow"' "$TDIR/scoped-ship-base.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$SCOPED_BASE_RC output=$(cat "$TDIR/scoped-ship-base.json")"
+git -C "$DECISION_REPO" branch --unset-upstream
+# Moving the repository head changes both the effect target and the scoped base/head proof. A
+# saved exact selection must become a fresh safe replacement, never a fixer or another review.
+printf 'head moved after choice\n' > "$DECISION_REPO/proof.txt"
+git -C "$DECISION_REPO" add proof.txt && git -C "$DECISION_REPO" commit -qm choice-head-moved
+env PRO_GATE_HOME="$CHOICE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+  bash "$ENGINE" --review-decision --json --review-choice-selection "$TDIR/choice-selection.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
+  >"$TDIR/choice-head-moved.json" 2>"$TDIR/choice-head-moved.err"
+CHOICE_HEAD_MOVED_RC=$?
+check 'moved head invalidates a named selection without granting review or merge' \
+  "$([ "$CHOICE_HEAD_MOVED_RC" -eq 0 ] && jq -e '.action!="fix-review-findings" and .action!="run-granted-review" and .action!="allow-existing-merge-workflow"' "$TDIR/choice-head-moved.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$CHOICE_HEAD_MOVED_RC output=$(cat "$TDIR/choice-head-moved.json")"
+env PRO_GATE_HOME="$SCOPED_SHIP_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+  bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
+  >"$TDIR/scoped-ship-head.json" 2>"$TDIR/scoped-ship-head.err"
+SCOPED_HEAD_RC=$?
+check 'scoped SHIP with moved head cannot reach merge handoff' \
+  "$([ "$SCOPED_HEAD_RC" -eq 0 ] && jq -e '.action!="allow-existing-merge-workflow"' "$TDIR/scoped-ship-head.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$SCOPED_HEAD_RC output=$(cat "$TDIR/scoped-ship-head.json")"
+CONNECTOR_SHIP_HOME="$TDIR/home-connector-ship"; CONNECTOR_SHIP_MARKER='pg-run-acme-widgets-1983-1700018001-2'
+CONNECTOR_SHIP_INPUT="$(jq -cS --arg marker "$CONNECTOR_SHIP_MARKER" '.marker=$marker | .charged_spend_epoch=1700018001' <<<"$PC_CONNECTOR")"
+mkdir -p "$CONNECTOR_SHIP_HOME/completed"; printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — connector observation.' > "$CONNECTOR_SHIP_HOME/completed/$CONNECTOR_SHIP_MARKER"
+CONNECTOR_INPUT_DIGEST="$(printf '%s' "$CONNECTOR_SHIP_INPUT" | sha256sum | awk '{print $1}')"; CONNECTOR_ART_DIGEST="$(sha256sum "$CONNECTOR_SHIP_HOME/completed/$CONNECTOR_SHIP_MARKER" | awk '{print $1}')"
+CONNECTOR_SHIP_RESULT="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg marker "$CONNECTOR_SHIP_MARKER" --arg ib "$CONNECTOR_INPUT_DIGEST" --arg digest "$CONNECTOR_ART_DIGEST" --arg base "$PROOF_BASE" --arg head "$PROOF_HEAD" --arg raw "$SCOPED_RAW_DIGEST" '{accepted_epoch:1700018002,artifact:{digest:$digest,path:("completed/"+$marker)},contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,input_binding_digest:$ib,input_binding_identity:$marker,marker:$marker,named_choice:null,provenance:{outcome:"accepted",validated_epoch:1700018002},record_type:"review-result-binding/v1",record_version:1,ship_proof:{base_oid:$base,diff_digest:$raw,head_oid:$head},verdict:"SHIP"}')"
+PRO_GATE_HOME="$CONNECTOR_SHIP_HOME" pg_review_input_binding_write "$CONNECTOR_SHIP_MARKER" "$CONNECTOR_SHIP_INPUT"; PRO_GATE_HOME="$CONNECTOR_SHIP_HOME" pg_review_result_binding_write "$CONNECTOR_SHIP_MARKER" "$CONNECTOR_SHIP_RESULT"
+env PRO_GATE_HOME="$CONNECTOR_SHIP_HOME" PRO_GATE_RUN_LOGS=0 bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --input connector >"$TDIR/connector-ship.json" 2>"$TDIR/connector-ship.err"
+CONNECTOR_SHIP_RC=$?
+check 'connector SHIP never becomes merge eligibility' \
+  "$([ "$CONNECTOR_SHIP_RC" -eq 0 ] && jq -e '.action!="allow-existing-merge-workflow"' "$TDIR/connector-ship.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$CONNECTOR_SHIP_RC output=$(cat "$TDIR/connector-ship.json")"
+
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }
