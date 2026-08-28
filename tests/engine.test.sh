@@ -4060,7 +4060,7 @@ env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 \
   >"$TDIR/review-decision-run.json" 2>"$TDIR/review-decision-run.err"
 DECISION_RUN_RC=$?
 check 'cold-start connector proof grants review without a seeded binding' \
-  "$([ "$DECISION_RUN_RC" -eq 0 ] && jq -e --arg head "$DECISION_HEAD" '.action == "run-granted-review" and .facts.input.proven and .facts.input.binding_valid and .facts.evidence.identity == ("connector:github.com/acme/widgets:" + $head)' "$TDIR/review-decision-run.json" >/dev/null 2>&1; echo $?)" \
+  "$([ "$DECISION_RUN_RC" -eq 0 ] && jq -e --arg head "$DECISION_HEAD" '.action == "run-granted-review" and .facts.input.proven and .facts.input.binding_valid and (.facts.evidence.identity | startswith("relation:"))' "$TDIR/review-decision-run.json" >/dev/null 2>&1; echo $?)" \
   "rc=$DECISION_RUN_RC output=$(cat "$TDIR/review-decision-run.json") stderr=$(cat "$TDIR/review-decision-run.err")"
 printf 'two\n' > "$DECISION_REPO/file.txt"
 git -C "$DECISION_REPO" add file.txt && git -C "$DECISION_REPO" commit -qm moved-head
@@ -4091,14 +4091,14 @@ cp "$TDIR/proof-endpoint.patch" "$TDIR/proof-raw.patch"
 PROOF_ENDPOINT_DIGEST="$(sha256sum "$TDIR/proof-endpoint.patch" | awk '{print $1}')"
 PROOF_RAW_DIGEST="$(sha256sum "$TDIR/proof-raw.patch" | awk '{print $1}')"
 FULL_MARKER='pg-run-acme-widgets-1983-1700013000-1'
-FULL_BINDING="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg base "$PROOF_BASE" --arg head "$PROOF_HEAD" --arg endpoint "$PROOF_ENDPOINT_DIGEST" --arg raw "$PROOF_RAW_DIGEST" '{charged_spend_epoch:1700013000,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:"full-proof-current",mode:"full-pr",proof:{base_oid:$base,endpoint_digest:$endpoint,head_oid:$head,raw_patch_digest:$raw}},marker:"pg-run-acme-widgets-1983-1700013000-1",record_type:"review-input-binding/v1",record_version:1,repository:{host:"github.com",owner:"acme",repo:"widgets"},target:{head_oid:$head,kind:"pull-request",pr:1983}}')"
+FULL_BINDING="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg base "$PROOF_BASE" --arg head "$PROOF_HEAD" --arg endpoint "$PROOF_ENDPOINT_DIGEST" --arg raw "$PROOF_RAW_DIGEST" '{charged_spend_epoch:1700013000,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("full-pr:"+$base+":"+$head),mode:"full-pr",proof:{base_oid:$base,endpoint_digest:$endpoint,head_oid:$head,raw_patch_digest:$raw}},marker:"pg-run-acme-widgets-1983-1700013000-1",record_type:"review-input-binding/v1",record_version:1,repository:{host:"github.com",owner:"acme",repo:"widgets"},target:{head_oid:$head,kind:"pull-request",pr:1983}}')"
 PRO_GATE_HOME="$DECISION_HOME" pg_review_input_binding_write "$FULL_MARKER" "$FULL_BINDING"
 env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
   bash "$ENGINE" --review-decision --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
   >"$TDIR/full-proof.json" 2>"$TDIR/full-proof.err"
 FULL_PROOF_RC=$?
 check 'full-PR proof requires current base head endpoint and raw patch digests' \
-  "$([ "$FULL_PROOF_RC" -eq 0 ] && jq -e '.action == "run-granted-review" and .facts.input.proven and .facts.evidence.identity == "full-proof-current"' "$TDIR/full-proof.json" >/dev/null 2>&1; echo $?)" \
+  "$([ "$FULL_PROOF_RC" -eq 0 ] && jq -e '.action == "run-granted-review" and .facts.input.proven and (.facts.evidence.identity | startswith("relation:"))' "$TDIR/full-proof.json" >/dev/null 2>&1; echo $?)" \
   "rc=$FULL_PROOF_RC output=$(cat "$TDIR/full-proof.json") stderr=$(cat "$TDIR/full-proof.err")"
 printf 'altered endpoint bytes\n' >> "$TDIR/proof-endpoint.patch"
 env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
@@ -4106,7 +4106,7 @@ env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_
   >"$TDIR/full-proof-moved.json" 2>"$TDIR/full-proof-moved.err"
 FULL_MOVED_RC=$?
 check 'changed full-PR endpoint bytes create a new cold-start advisory, not a stale binding match' \
-  "$([ "$FULL_MOVED_RC" -eq 0 ] && jq -e '.action == "run-granted-review" and (.facts.evidence.identity | startswith("full-pr:"))' "$TDIR/full-proof-moved.json" >/dev/null 2>&1; echo $?)" \
+  "$([ "$FULL_MOVED_RC" -eq 0 ] && jq -e '.action == "run-granted-review" and (.facts.evidence.identity | startswith("relation:"))' "$TDIR/full-proof-moved.json" >/dev/null 2>&1; echo $?)" \
   "rc=$FULL_MOVED_RC output=$(cat "$TDIR/full-proof-moved.json") stderr=$(cat "$TDIR/full-proof-moved.err")"
 
 printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — prior review accepted' > "$TDIR/scoped-confirmation.md"
@@ -4117,13 +4117,13 @@ SCOPED_RAW_DIGEST="$(sha256sum "$TDIR/scoped-raw-endpoint.patch" | awk '{print $
 SCOPED_MANIFEST_DIGEST="$(sha256sum "$TDIR/scoped-manifest" | awk '{print $1}')"
 SCOPED_CONFIRM_DIGEST="$(sha256sum "$TDIR/scoped-confirmation.md" | awk '{print $1}')"
 SCOPED_MARKER='pg-run-acme-widgets-1983-1700013001-2'
-SCOPED_BINDING="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg base "$PROOF_BASE" --arg head "$PROOF_HEAD" --arg raw "$SCOPED_RAW_DIGEST" --arg reviewed "$PROOF_RAW_DIGEST" --arg manifest "$SCOPED_MANIFEST_DIGEST" --arg lineage "confirmation:$SCOPED_CONFIRM_DIGEST" '{charged_spend_epoch:1700013001,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:"scoped-proof-current",mode:"scoped-delta",proof:{base_oid:$base,end_oid:$head,filtering_manifest_digest:$manifest,lineage_identity:$lineage,raw_digest:$raw,reviewed_payload_digest:$reviewed,scope_algorithm:"unified-diff-v1"}},marker:"pg-run-acme-widgets-1983-1700013001-2",record_type:"review-input-binding/v1",record_version:1,repository:{host:"github.com",owner:"acme",repo:"widgets"},target:{head_oid:$head,kind:"pull-request",pr:1983}}')"
+SCOPED_BINDING="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg base "$PROOF_BASE" --arg head "$PROOF_HEAD" --arg raw "$SCOPED_RAW_DIGEST" --arg reviewed "$PROOF_RAW_DIGEST" --arg manifest "$SCOPED_MANIFEST_DIGEST" --arg lineage "confirmation:$SCOPED_CONFIRM_DIGEST" '{charged_spend_epoch:1700013001,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("scoped-delta:"+$base+":"+$head+":"+$reviewed),mode:"scoped-delta",proof:{base_oid:$base,end_oid:$head,filtering_manifest_digest:$manifest,lineage_identity:$lineage,raw_digest:$raw,reviewed_payload_digest:$reviewed,scope_algorithm:"unified-diff-v1"}},marker:"pg-run-acme-widgets-1983-1700013001-2",record_type:"review-input-binding/v1",record_version:1,repository:{host:"github.com",owner:"acme",repo:"widgets"},target:{head_oid:$head,kind:"pull-request",pr:1983}}')"
 env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
   bash "$ENGINE" --review-decision --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
   >"$TDIR/scoped-proof.json" 2>"$TDIR/scoped-proof.err"
 SCOPED_PROOF_RC=$?
 check 'cold-start scoped delta binds distinct raw/reviewed payload bytes and lineage' \
-  "$([ "$SCOPED_PROOF_RC" -eq 0 ] && jq -e '(.action == "run-granted-review") and (.facts.evidence.identity | startswith("scoped-delta:"))' "$TDIR/scoped-proof.json" >/dev/null 2>&1; echo $?)" \
+  "$([ "$SCOPED_PROOF_RC" -eq 0 ] && jq -e '(.action == "run-granted-review") and (.facts.evidence.identity | startswith("relation:"))' "$TDIR/scoped-proof.json" >/dev/null 2>&1; echo $?)" \
   "rc=$SCOPED_PROOF_RC output=$(cat "$TDIR/scoped-proof.json") stderr=$(cat "$TDIR/scoped-proof.err")"
 printf 'different scope\n' > "$TDIR/scoped-manifest"
 env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
@@ -4185,6 +4185,105 @@ REPAIR_REPLAY_RC=$?
 check 'result-binding repair is idempotent and does not mutate canonical bytes' \
   "$([ "$REPAIR_REPLAY_RC" -eq 0 ] && [ "$(PRO_GATE_HOME="$DECISION_HOME" pg_review_result_binding_digest "$FULL_MARKER")" = "$REPAIR_BINDING_DIGEST" ] && cmp -s "$DECISION_HOME/completed/$FULL_MARKER" "$DECISION_HOME/completed/$FULL_MARKER"; echo $?)" \
   "rc=$REPAIR_REPLAY_RC binding=$(PRO_GATE_HOME="$DECISION_HOME" pg_review_result_binding_read "$FULL_MARKER" 2>/dev/null)"
+
+# U2 precedence is exercised through the real CLI rather than only reducer snapshots. These
+# records deliberately share canonical code while their marker, spend epoch, and evidence differ.
+echo '# U2: CLI current-evidence and result precedence'
+PRECEDENCE_HOME="$TDIR/home-review-precedence"
+PC_CONNECTOR_MARKER='pg-run-acme-widgets-1983-1700015000-1'
+PC_SCOPED_MARKER='pg-run-acme-widgets-1983-1700015001-2'
+PC_CONNECTOR="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg head "$PROOF_HEAD" '{charged_spend_epoch:1700015000,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("connector:github.com/acme/widgets:"+$head),mode:"connector",proof:{commit_target:$head,endpoint_digest:null,raw_diff_digest:null,repository_target:"github.com/acme/widgets"}},marker:"pg-run-acme-widgets-1983-1700015000-1",record_type:"review-input-binding/v1",record_version:1,repository:{host:"github.com",owner:"acme",repo:"widgets"},target:{head_oid:$head,kind:"pull-request",pr:1983}}')"
+PC_SCOPED="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg base "$PROOF_BASE" --arg head "$PROOF_HEAD" --arg raw "$SCOPED_RAW_DIGEST" --arg reviewed "$PROOF_RAW_DIGEST" --arg manifest "$SCOPED_MANIFEST_DIGEST" --arg lineage "confirmation:$SCOPED_CONFIRM_DIGEST" '{charged_spend_epoch:1700015001,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("scoped-delta:"+$base+":"+$head+":"+$reviewed),mode:"scoped-delta",proof:{base_oid:$base,end_oid:$head,filtering_manifest_digest:$manifest,lineage_identity:$lineage,raw_digest:$raw,reviewed_payload_digest:$reviewed,scope_algorithm:"unified-diff-v1"}},marker:"pg-run-acme-widgets-1983-1700015001-2",record_type:"review-input-binding/v1",record_version:1,repository:{host:"github.com",owner:"acme",repo:"widgets"},target:{head_oid:$head,kind:"pull-request",pr:1983}}')"
+precedence_result() { # marker input verdict accepted artifact
+  local marker="$1" input="$2" verdict="$3" accepted="$4" artifact="$5" digest input_digest proof
+  input_digest="$(printf '%s' "$input" | sha256sum | awk '{print $1}')"
+  proof=null
+  printf '%s\n' 'P0: none' "VERDICT: $verdict — fixture." > "$artifact"
+  digest="$(sha256sum "$artifact" | awk '{print $1}')"
+  jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg marker "$marker" --arg digest "$digest" --arg ib "$input_digest" --arg verdict "$verdict" --argjson accepted "$accepted" --argjson proof "$proof" \
+    '{accepted_epoch:$accepted,artifact:{digest:$digest,path:("completed/"+$marker)},contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,input_binding_digest:$ib,input_binding_identity:$marker,marker:$marker,named_choice:null,provenance:{outcome:"accepted",validated_epoch:$accepted},record_type:"review-result-binding/v1",record_version:1,ship_proof:$proof,verdict:$verdict}'
+}
+mkdir -p "$PRECEDENCE_HOME/completed"
+PRO_GATE_HOME="$PRECEDENCE_HOME" pg_review_input_binding_write "$PC_CONNECTOR_MARKER" "$PC_CONNECTOR"
+PC_CONNECTOR_RESULT="$(precedence_result "$PC_CONNECTOR_MARKER" "$PC_CONNECTOR" NEEDS-DISCUSSION 1700015999 "$PRECEDENCE_HOME/completed/$PC_CONNECTOR_MARKER")"
+PRO_GATE_HOME="$PRECEDENCE_HOME" pg_review_result_binding_write "$PC_CONNECTOR_MARKER" "$PC_CONNECTOR_RESULT"
+
+# Default INPUT=both must not downgrade from the absent bundle relation to this valid connector.
+env PRO_GATE_HOME="$PRECEDENCE_HOME" PRO_GATE_RUN_LOGS=0 \
+  bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" \
+  >"$TDIR/precedence-no-bundle.json" 2>"$TDIR/precedence-no-bundle.err"
+PC_NO_BUNDLE_RC=$?
+check 'default both prepares bundle evidence instead of selecting a current connector result' \
+  "$([ "$PC_NO_BUNDLE_RC" -eq 0 ] && jq -e '.action == "prepare-matching-review-evidence" and .facts.completed_results == []' "$TDIR/precedence-no-bundle.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$PC_NO_BUNDLE_RC output=$(cat "$TDIR/precedence-no-bundle.json") stderr=$(cat "$TDIR/precedence-no-bundle.err")"
+
+env PRO_GATE_HOME="$PRECEDENCE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+  bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input both \
+  >"$TDIR/precedence-scoped-grant.json" 2>"$TDIR/precedence-scoped-grant.err"
+PC_SCOPED_GRANT_RC=$?
+PC_CODE_ID="github.com:acme/widgets:1983:$PROOF_HEAD"
+check 'connector NEEDS-DISCUSSION plus same-head scoped proof grants review without a prompt' \
+  "$([ "$PC_SCOPED_GRANT_RC" -eq 0 ] && jq -e --arg code "$PC_CODE_ID" '.action == "run-granted-review" and .facts.input.identity == $code and .facts.prior_review.applicable == false and .facts.prior_review.verdict == "NEEDS-DISCUSSION"' "$TDIR/precedence-scoped-grant.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$PC_SCOPED_GRANT_RC output=$(cat "$TDIR/precedence-scoped-grant.json") stderr=$(cat "$TDIR/precedence-scoped-grant.err")"
+
+# The first grant above came only from prepared files; persist equivalent charged history now for
+# stable-identity, replay, and result-ordering cases.
+PRO_GATE_HOME="$PRECEDENCE_HOME" pg_review_input_binding_write "$PC_SCOPED_MARKER" "$PC_SCOPED"
+# The same relation remains stable as marker/epoch history changes, then its completed result is
+# terminal rather than another grant.
+PC_SCOPED_REPLAY_MARKER='pg-run-acme-widgets-1983-1700015002-3'
+PC_SCOPED_REPLAY="$(jq -cS --arg marker "$PC_SCOPED_REPLAY_MARKER" '.marker=$marker | .charged_spend_epoch=1700015002' <<<"$PC_SCOPED")"
+PRO_GATE_HOME="$PRECEDENCE_HOME" pg_review_input_binding_write "$PC_SCOPED_REPLAY_MARKER" "$PC_SCOPED_REPLAY"
+env PRO_GATE_HOME="$PRECEDENCE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+  bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input both \
+  >"$TDIR/precedence-identity.json" 2>"$TDIR/precedence-identity.err"
+PC_IDENTITY_RC=$?
+check 'current code identity is stable across equivalent marker and charged-epoch changes' \
+  "$([ "$PC_IDENTITY_RC" -eq 0 ] && jq -e --arg code "$PC_CODE_ID" '.facts.input.identity == $code' "$TDIR/precedence-identity.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$PC_IDENTITY_RC output=$(cat "$TDIR/precedence-identity.json")"
+PC_SCOPED_RESULT="$(precedence_result "$PC_SCOPED_MARKER" "$PC_SCOPED" FIX-FIRST 1700015998 "$PRECEDENCE_HOME/completed/$PC_SCOPED_MARKER")"
+PRO_GATE_HOME="$PRECEDENCE_HOME" pg_review_result_binding_write "$PC_SCOPED_MARKER" "$PC_SCOPED_RESULT"
+env PRO_GATE_HOME="$PRECEDENCE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+  bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input both \
+  >"$TDIR/precedence-repeat.json" 2>"$TDIR/precedence-repeat.err"
+PC_REPEAT_RC=$?
+check 'repeated scoped evidence with its completed result cannot grant another review' \
+  "$([ "$PC_REPEAT_RC" -eq 0 ] && jq -e '.action == "fix-review-findings" and .action != "run-granted-review"' "$TDIR/precedence-repeat.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$PC_REPEAT_RC output=$(cat "$TDIR/precedence-repeat.json") stderr=$(cat "$TDIR/precedence-repeat.err")"
+
+# Changed scoped evidence retains the previous same-code result as non-applicable progress, not a
+# terminal FIX-FIRST route.
+printf 'changed scope\n' > "$TDIR/precedence-manifest"
+env PRO_GATE_HOME="$PRECEDENCE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/precedence-manifest" \
+  bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input both \
+  >"$TDIR/precedence-changed.json" 2>"$TDIR/precedence-changed.err"
+PC_CHANGED_RC=$?
+check 'changed evidence is non-applicable prior progress and does not terminal-block continuation' \
+  "$([ "$PC_CHANGED_RC" -eq 0 ] && jq -e '.action == "run-granted-review" and .facts.prior_review.applicable == false and .facts.prior_review.verdict == "FIX-FIRST" and .facts.prior_review.evidence_identity != .facts.evidence.identity' "$TDIR/precedence-changed.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$PC_CHANGED_RC output=$(cat "$TDIR/precedence-changed.json") stderr=$(cat "$TDIR/precedence-changed.err")"
+
+# Exact-current results use their input binding's charged epoch, not acceptance time or directory
+# order. Equal charged epochs retain canonical-result-identity tie-breaking.
+PC_ORDER_HOME="$TDIR/home-review-precedence-order"
+mkdir -p "$PC_ORDER_HOME/completed"
+PC_ORDER_A_MARKER='pg-run-acme-widgets-1983-1700015100-4'
+PC_ORDER_Z_MARKER='pg-run-acme-widgets-1983-1700015101-5'
+PC_ORDER_A="$(jq -cS --arg marker "$PC_ORDER_A_MARKER" '.marker=$marker | .charged_spend_epoch=1700015100' <<<"$PC_SCOPED")"
+PC_ORDER_Z="$(jq -cS --arg marker "$PC_ORDER_Z_MARKER" '.marker=$marker | .charged_spend_epoch=1700015101' <<<"$PC_SCOPED")"
+PRO_GATE_HOME="$PC_ORDER_HOME" pg_review_input_binding_write "$PC_ORDER_A_MARKER" "$PC_ORDER_A"
+PRO_GATE_HOME="$PC_ORDER_HOME" pg_review_input_binding_write "$PC_ORDER_Z_MARKER" "$PC_ORDER_Z"
+PC_ORDER_A_RESULT="$(precedence_result "$PC_ORDER_A_MARKER" "$PC_ORDER_A" FIX-FIRST 1700015999 "$PC_ORDER_HOME/completed/$PC_ORDER_A_MARKER")"
+PC_ORDER_Z_RESULT="$(precedence_result "$PC_ORDER_Z_MARKER" "$PC_ORDER_Z" FIX-FIRST 1700015001 "$PC_ORDER_HOME/completed/$PC_ORDER_Z_MARKER")"
+PRO_GATE_HOME="$PC_ORDER_HOME" pg_review_result_binding_write "$PC_ORDER_A_MARKER" "$PC_ORDER_A_RESULT"
+PRO_GATE_HOME="$PC_ORDER_HOME" pg_review_result_binding_write "$PC_ORDER_Z_MARKER" "$PC_ORDER_Z_RESULT"
+PC_ORDER_Z_DIGEST="$(PRO_GATE_HOME="$PC_ORDER_HOME" pg_review_result_binding_digest "$PC_ORDER_Z_MARKER")"
+env PRO_GATE_HOME="$PC_ORDER_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+  bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input both \
+  >"$TDIR/precedence-order.json" 2>"$TDIR/precedence-order.err"
+PC_ORDER_RC=$?
+check 'exact completed results select newest input charged epoch despite older result acceptance' \
+  "$([ "$PC_ORDER_RC" -eq 0 ] && jq -e --arg digest "$PC_ORDER_Z_DIGEST" '.effect_request.applicable_ref == $digest and .action == "fix-review-findings"' "$TDIR/precedence-order.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$PC_ORDER_RC output=$(cat "$TDIR/precedence-order.json") stderr=$(cat "$TDIR/precedence-order.err")"
 
 # U2 fresh-dispatch effects are re-reduced at every existing handoff boundary. This cold-start
 # fixture proves its full-PR relation in-memory; the effect must create its FIRST durable marker

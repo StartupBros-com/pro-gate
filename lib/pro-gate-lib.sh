@@ -1870,7 +1870,7 @@ pg_review_decision_reject() { # reason snapshot; never reflect rejected untruste
 
 pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read stdin
   local supplied canonical snapshot unsafe valid reason selected selected_ref selected_count
-  local action prior verdict choice_snapshot
+  local action prior prior_applicable verdict choice_snapshot
   pg_have jq || return 1
   if [ "$#" -gt 0 ]; then supplied="$1"; else supplied="$(cat)"; fi
   canonical="$(pg_review_json_canonical "$supplied")" || return 1
@@ -2001,40 +2001,49 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
     pg_review_decision_emit stop-without-new-review invalid-binding "$canonical" "$snapshot"; return
   fi
 
-  # A collected result is the same terminal fact as prior_review, but carries stronger ordering.
-  if [ -n "$selected" ]; then prior="$selected"; else prior="$(jq -cS .prior_review <<<"$canonical")"; fi
-  if [ "$(jq -r '.legacy // false' <<<"$prior")" = true ]; then
-    pg_review_decision_emit stop-without-new-review legacy-not-authoritative "$canonical" "$snapshot"; return
+  # A collected exact-evidence result is terminal. A same-code prior with different evidence is
+  # progress context only: it participates in the identical-evidence check below, but its verdict
+  # cannot route this continuation.
+  if [ -n "$selected" ]; then
+    prior="$selected"; prior_applicable=true
+  else
+    prior="$(jq -cS .prior_review <<<"$canonical")"
+    prior_applicable="$(jq -r .applicable <<<"$prior")"
   fi
-  if [ "$(jq -r '.marker // ""' <<<"$prior")" != "" ] && \
-     { [ "$(jq -r '.binding_valid // false' <<<"$prior")" != true ] || [ "$(jq -r '.provenance_valid // false' <<<"$prior")" != true ]; }; then
-    if [ "$(jq -r '.binding_valid // false' <<<"$prior")" != true ]; then reason=invalid-binding; else reason=invalid-result-provenance; fi
-    pg_review_decision_emit stop-without-new-review "$reason" "$canonical" "$snapshot"; return
-  fi
+  if [ "$prior_applicable" = true ]; then
+    if [ "$(jq -r '.legacy // false' <<<"$prior")" = true ]; then
+      pg_review_decision_emit stop-without-new-review legacy-not-authoritative "$canonical" "$snapshot"; return
+    fi
+    if [ "$(jq -r '.marker // ""' <<<"$prior")" != "" ] && \
+       { [ "$(jq -r '.binding_valid // false' <<<"$prior")" != true ] || [ "$(jq -r '.provenance_valid // false' <<<"$prior")" != true ]; }; then
+      if [ "$(jq -r '.binding_valid // false' <<<"$prior")" != true ]; then reason=invalid-binding; else reason=invalid-result-provenance; fi
+      pg_review_decision_emit stop-without-new-review "$reason" "$canonical" "$snapshot"; return
+    fi
 
-  verdict="$(jq -r '.verdict // "NONE"' <<<"$prior")"
-  selected_ref="$(jq -r '.canonical_identity // .marker // ""' <<<"$prior")"
-  case "$verdict" in
-    FIX-FIRST)
-      pg_review_decision_emit fix-review-findings review-findings-require-fix "$canonical" "$snapshot" "$selected_ref"; return ;;
-    SHIP)
-      pg_review_decision_emit allow-existing-merge-workflow current-ship-is-merge-eligible "$canonical" "$snapshot" "$selected_ref"; return ;;
-    NEEDS-DISCUSSION)
-      if [ "$(jq -r '.named_choice.outcomes|length' <<<"$canonical")" -lt 2 ]; then
-        pg_review_decision_emit stop-without-new-review invalid-named-choice "$canonical" "$snapshot" "$selected_ref"; return
-      fi
-      if [ "$(jq -r '.named_choice.selected_id // ""' <<<"$canonical")" = "" ]; then
-        pg_review_decision_emit ask-named-product-choice named-product-choice-required "$canonical" "$snapshot" "$selected_ref"; return
-      fi
-      if ! jq -e '.named_choice as $c | any($c.outcomes[]; .id==$c.selected_id)' <<<"$canonical" >/dev/null 2>&1; then
-        pg_review_decision_emit stop-without-new-review invalid-named-choice "$canonical" "$snapshot" "$selected_ref"; return
-      fi
-      choice_snapshot="$(pg_review_decision_choice_snapshot "$canonical")" || return 1
-      if [ "$(jq -r .named_choice.snapshot_digest <<<"$canonical")" != "$choice_snapshot" ]; then
-        pg_review_decision_emit stop-without-new-review stale-named-choice "$canonical" "$snapshot" "$selected_ref"; return
-      fi
-      pg_review_decision_emit fix-review-findings named-product-choice-selected "$canonical" "$snapshot" "$selected_ref"; return ;;
-  esac
+    verdict="$(jq -r '.verdict // "NONE"' <<<"$prior")"
+    selected_ref="$(jq -r '.canonical_identity // .marker // ""' <<<"$prior")"
+    case "$verdict" in
+      FIX-FIRST)
+        pg_review_decision_emit fix-review-findings review-findings-require-fix "$canonical" "$snapshot" "$selected_ref"; return ;;
+      SHIP)
+        pg_review_decision_emit allow-existing-merge-workflow current-ship-is-merge-eligible "$canonical" "$snapshot" "$selected_ref"; return ;;
+      NEEDS-DISCUSSION)
+        if [ "$(jq -r '.named_choice.outcomes|length' <<<"$canonical")" -lt 2 ]; then
+          pg_review_decision_emit stop-without-new-review invalid-named-choice "$canonical" "$snapshot" "$selected_ref"; return
+        fi
+        if [ "$(jq -r '.named_choice.selected_id // ""' <<<"$canonical")" = "" ]; then
+          pg_review_decision_emit ask-named-product-choice named-product-choice-required "$canonical" "$snapshot" "$selected_ref"; return
+        fi
+        if ! jq -e '.named_choice as $c | any($c.outcomes[]; .id==$c.selected_id)' <<<"$canonical" >/dev/null 2>&1; then
+          pg_review_decision_emit stop-without-new-review invalid-named-choice "$canonical" "$snapshot" "$selected_ref"; return
+        fi
+        choice_snapshot="$(pg_review_decision_choice_snapshot "$canonical")" || return 1
+        if [ "$(jq -r .named_choice.snapshot_digest <<<"$canonical")" != "$choice_snapshot" ]; then
+          pg_review_decision_emit stop-without-new-review stale-named-choice "$canonical" "$snapshot" "$selected_ref"; return
+        fi
+        pg_review_decision_emit fix-review-findings named-product-choice-selected "$canonical" "$snapshot" "$selected_ref"; return ;;
+    esac
+  fi
 
   if jq -e '.prior_review.binding_valid and .prior_review.provenance_valid and
       .prior_review.code_identity==.input.identity and .prior_review.evidence_identity==.evidence.identity' \
