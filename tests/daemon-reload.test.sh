@@ -167,7 +167,7 @@ printf '1\n' > "$TDIR/.config/pro-gate/dangerous-mode-consent"
 printf '#!/bin/sh\nexit 0\n' > "$TDIR/.local/bin/gh"; chmod +x "$TDIR/.local/bin/gh"
 
 DLOG="$TDIR/daemon.log"
-HOME="$TDIR" PRO_GATE_HOME="$TDIR" PRO_REVIEW_OWNERS=fakeowner PRO_REVIEW_POLL_SECONDS=1 \
+HOME="$TDIR" PRO_GATE_HOME="$TDIR" PRO_GATE_CONSENT_HOME="$TDIR/.config/pro-gate" PRO_REVIEW_OWNERS=fakeowner PRO_REVIEW_POLL_SECONDS=1 \
   PRO_GATE_BROWSER_MODE=native PRO_GATE_DAEMON_SELF_RELOAD=1 PATH="/usr/bin:/bin" \
   bash "$TDIR/run-daemon.sh" > "$DLOG" 2>&1 &
 DPID=$!
@@ -198,7 +198,7 @@ kill "$DPID" 2>/dev/null; pkill -P "$DPID" 2>/dev/null; DPID=""
 sleep 0.5
 rm -f "$TDIR/.deploy-stamp"
 DLOG2="$TDIR/daemon2.log"
-HOME="$TDIR" PRO_GATE_HOME="$TDIR" PRO_REVIEW_OWNERS=fakeowner PRO_REVIEW_POLL_SECONDS=1 \
+HOME="$TDIR" PRO_GATE_HOME="$TDIR" PRO_GATE_CONSENT_HOME="$TDIR/.config/pro-gate" PRO_REVIEW_OWNERS=fakeowner PRO_REVIEW_POLL_SECONDS=1 \
   PRO_GATE_BROWSER_MODE=native PRO_GATE_DAEMON_SELF_RELOAD=0 PATH="/usr/bin:/bin" \
   bash "$TDIR/run-daemon.sh" > "$DLOG2" 2>&1 &
 DPID=$!
@@ -214,7 +214,7 @@ echo '# integration: identity mismatch globally defers, compatible reload recove
 kill "$DPID" 2>/dev/null; pkill -P "$DPID" 2>/dev/null; DPID=""
 rm -f "$TDIR/review-decision-v1.json" "$TDIR/.deploy-stamp"
 DLOG3="$TDIR/daemon-identity.log"
-HOME="$TDIR" PRO_GATE_HOME="$TDIR" PRO_REVIEW_OWNERS=fakeowner PRO_REVIEW_POLL_SECONDS=1 \
+HOME="$TDIR" PRO_GATE_HOME="$TDIR" PRO_GATE_CONSENT_HOME="$TDIR/.config/pro-gate" PRO_REVIEW_OWNERS=fakeowner PRO_REVIEW_POLL_SECONDS=1 \
   PRO_GATE_BROWSER_MODE=native PRO_GATE_DAEMON_SELF_RELOAD=1 PATH="/usr/bin:/bin" \
   bash "$TDIR/run-daemon.sh" > "$DLOG3" 2>&1 &
 DPID=$!
