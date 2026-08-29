@@ -4387,12 +4387,16 @@ for fresh_kind in completed active reserved unknown-fate; do
       mkdir -p "$FRESH_HOME/in-progress"
       printf '%s\t%s\t%s\t0\t\n' "$FRESH_KEY" "$TDIR/x" "$(date +%s)" > "$FRESH_HOME/in-progress/pg-run-acme-fresh.git-77-1700014002-3" ;;
     unknown-fate)
+      FRESH_UNKNOWN_MARKER='pg-run-acme-fresh.git-77-1700014003-4'
       mkdir -p "$FRESH_HOME/run-meta"
-      printf 'github.com\tacme\tfresh\t%s\t77\t%s\t1700014003\n' "$FRESH_KEY" "$TDIR/x" > "$FRESH_HOME/run-meta/pg-run-acme-fresh.git-77-1700014003-4" ;;
+      printf 'github.com\tacme\tfresh\t%s\t77\t%s\t1700014003\n' "$FRESH_KEY" "$TDIR/x" > "$FRESH_HOME/run-meta/$FRESH_UNKNOWN_MARKER" ;;
   esac
   fresh_effect "$TDIR/fresh-advisory.json" "$TDIR/fresh-$fresh_kind.md"
   check "fresh pre-lock guard supersedes advisory for $fresh_kind without Oracle dispatch" \
     "$([ ! -s "$TDIR/fresh-oracle.calls" ]; echo $?)" \
+    "rc=$FRESH_RC stdout=$(cat "$TDIR/fresh.stdout") stderr=$(cat "$TDIR/fresh.stderr")"
+  [ "$fresh_kind" != unknown-fate ] || check 'run-meta without terminal bytes remains recoverable unknown-fate work' \
+    "$([ "$FRESH_RC" -eq 9 ] && jq -e --arg marker "$FRESH_UNKNOWN_MARKER" '.action=="recover-existing-review" and .effect_request.applicable_ref==$marker' "$TDIR/fresh.stdout" >/dev/null 2>&1; echo $?)" \
     "rc=$FRESH_RC stdout=$(cat "$TDIR/fresh.stdout") stderr=$(cat "$TDIR/fresh.stderr")"
 done
 
@@ -4437,6 +4441,38 @@ check 'changed-evidence completed bytes do not suppress the current fresh dispat
   "rc=$FRESH_RC stdout=$(cat "$TDIR/fresh.stdout") stderr=$(cat "$TDIR/fresh.stderr")"
 git -C "$FRESH_REPO" diff "$FRESH_BASE" "$FRESH_HEAD" > "$TDIR/fresh-effect.patch"
 cp "$TDIR/fresh-effect.patch" "$TDIR/fresh-endpoint.patch"
+
+# A historical terminal artifact resolves only its own charged marker. It stays inapplicable to
+# the current relation, but its permanent run-meta sidecar must not turn it back into unknown-fate.
+for terminal_store in completed pending; do
+  fresh_reset_state
+  FRESH_ADVISORY="$(fresh_query)"; printf '%s\n' "$FRESH_ADVISORY" > "$TDIR/fresh-advisory.json"
+  FRESH_TERMINAL_MARKER='pg-run-acme-fresh.git-77-1700013998-8'
+  mkdir -p "$FRESH_HOME/$terminal_store" "$FRESH_HOME/run-meta"
+  printf 'P0: none\nP1: none\nVERDICT: FIX-FIRST - historical.\n' > "$FRESH_HOME/$terminal_store/$FRESH_TERMINAL_MARKER"
+  printf 'github.com\tacme\tfresh\t%s\t77\t%s\t1700013998\n' "$FRESH_KEY" "$TDIR/x" > "$FRESH_HOME/run-meta/$FRESH_TERMINAL_MARKER"
+  : > "$TDIR/fresh-oracle.calls"
+  fresh_effect "$TDIR/fresh-advisory.json" "$TDIR/fresh-terminal-$terminal_store.md"
+  check "historical $terminal_store bytes retire same-marker run-meta without gaining applicability" \
+    "$([ "$FRESH_RC" -eq 0 ] && [ -s "$TDIR/fresh-oracle.calls" ]; echo $?)" \
+    "rc=$FRESH_RC stdout=$(cat "$TDIR/fresh.stdout") stderr=$(cat "$TDIR/fresh.stderr")"
+done
+
+# Skipping a resolved marker must continue the scan: a separate charged marker with no terminal
+# bytes still wins as recovery work and prevents a new Oracle call.
+fresh_reset_state
+FRESH_ADVISORY="$(fresh_query)"; printf '%s\n' "$FRESH_ADVISORY" > "$TDIR/fresh-advisory.json"
+FRESH_RESOLVED_MARKER='pg-run-acme-fresh.git-77-1700013996-6'
+FRESH_UNRESOLVED_MARKER='pg-run-acme-fresh.git-77-1700013997-7'
+mkdir -p "$FRESH_HOME/completed" "$FRESH_HOME/run-meta"
+printf 'P0: none\nP1: none\nVERDICT: SHIP - historical.\n' > "$FRESH_HOME/completed/$FRESH_RESOLVED_MARKER"
+printf 'github.com\tacme\tfresh\t%s\t77\t%s\t1700013996\n' "$FRESH_KEY" "$TDIR/x" > "$FRESH_HOME/run-meta/$FRESH_RESOLVED_MARKER"
+printf 'github.com\tacme\tfresh\t%s\t77\t%s\t1700013997\n' "$FRESH_KEY" "$TDIR/x" > "$FRESH_HOME/run-meta/$FRESH_UNRESOLVED_MARKER"
+: > "$TDIR/fresh-oracle.calls"
+fresh_effect "$TDIR/fresh-advisory.json" "$TDIR/fresh-terminal-before-unresolved.md"
+check 'resolved run-meta does not hide a later unresolved charged marker' \
+  "$([ "$FRESH_RC" -eq 9 ] && [ ! -s "$TDIR/fresh-oracle.calls" ] && jq -e --arg marker "$FRESH_UNRESOLVED_MARKER" '.action=="recover-existing-review" and .effect_request.applicable_ref==$marker' "$TDIR/fresh.stdout" >/dev/null 2>&1; echo $?)" \
+  "rc=$FRESH_RC stdout=$(cat "$TDIR/fresh.stdout") stderr=$(cat "$TDIR/fresh.stderr")"
 
 # Effect-time proof/governor movement returns a replacement before it reaches the engine's
 # charge protocol. These are deliberately changes AFTER the advisory JSON was saved.

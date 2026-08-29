@@ -1582,13 +1582,18 @@ pg_fresh_dispatch_recheck() { # sets PG_FRESH_DECISION/PG_FRESH_ACTION
   fi
   reservation="$(pg_reservation_find_pr "$ROUND_KEY" 2>/dev/null || true)"
   if ! pg_reservation_marker_ok "$reservation"; then reservation=""; fi
-  # A run-meta row with no active/reservation is a charged unknown-fate predecessor. The old
-  # sidecar layout remains authoritative and untouched; only its existing epoch is read.
+  # A run-meta row with no active state is unknown-fate only while its own charged run has no
+  # durable terminal bytes. completed/pending resolves that marker's lifecycle, never whether its
+  # old result applies to the current relation; keep scanning so another unresolved run still wins.
   if [ -z "$active_marker" ]; then
     for f in "$(pg_run_meta_dir)"/pg-run-"$ROUND_KEY"-*; do
       [ -f "$f" ] && [ ! -L "$f" ] || continue
       m="${f##*/}"; rec="$(pg_run_meta_read "$m" 2>/dev/null || true)"
       [ -n "$rec" ] || continue
+      artifact="$(pg_completed_dir)/$m"
+      if [ -f "$artifact" ] && [ ! -L "$artifact" ] && pg_is_review "$artifact"; then continue; fi
+      artifact="$PRO_GATE_HOME/pending/$m"
+      if [ -f "$artifact" ] && [ ! -L "$artifact" ] && pg_is_review "$artifact"; then continue; fi
       active_marker="$m"; astate=unknown-fate; break
     done
   fi
