@@ -1,0 +1,1046 @@
+[
+  {
+    "run_id": 33443036305,
+    "url": "https://github.com/StartupBros-com/pro-gate/actions/runs/33443036305",
+    "event": "pull_request",
+    "title": "feat: unify review lifecycle and admission",
+    "head_sha": "c4a1dcced7107c9375c7f75ffea06fc9d898793f",
+    "created_at": "2026-08-31T21:46:30Z",
+    "updated_at": "2026-08-31T22:21:39Z",
+    "workflow_elapsed_s": 2109.0,
+    "job_elapsed_s": 2106.0,
+    "queue_s": 3.0,
+    "runner_name": "GitHub Actions 1000008317",
+    "runner_group_name": "GitHub Actions",
+    "labels": [
+      "ubuntu-24.04"
+    ],
+    "logs_available": true,
+    "steps_s": {
+      "Set up job": 1.0,
+      "Check out repository": 1.0,
+      "Provision pinned CI tools": 1.0,
+      "Validate data and shell files": 43.0,
+      "Require customer-ready notes for a version bump": 1.0,
+      "Run tests": 2057.0,
+      "Post Check out repository": 0.0,
+      "Complete job": 0.0
+    },
+    "test_scripts_s": {
+      "engine.test.sh": 1605.5,
+      "daemon-reload.test.sh": 16.903,
+      "autoupdate.test.sh": 3.108,
+      "browser-launch.test.sh": 11.119,
+      "cdp-salvage.test.mjs": 403.568,
+      "distribution.test.sh": 15.996,
+      "release-train.test.sh": 0.956,
+      "release-assets.test.sh": 0.257
+    },
+    "runner_fingerprint": {
+      "runner_version": "2.337.0",
+      "azure_region": "eastus",
+      "image": "ubuntu-24.04",
+      "image_version": "20260823.283.1",
+      "excerpt": [
+        "Current runner version: '2.337.0'",
+        "Hosted Compute Agent",
+        "Azure Region: eastus",
+        "Ubuntu",
+        "LTS",
+        "Image: ubuntu-24.04",
+        "Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260823.283/images/ubuntu/Ubuntu2404-Readme.md",
+        "Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260823.283"
+      ]
+    }
+  },
+  {
+    "run_id": 33381390543,
+    "url": "https://github.com/StartupBros-com/pro-gate/actions/runs/33381390543",
+    "event": "push",
+    "title": "chore(release): promote run-meta recovery fix as v0.36.2 (#108)",
+    "head_sha": "575cadcd6fde5b06cc2d321c3625adb0b77533cc",
+    "created_at": "2026-08-31T10:13:00Z",
+    "updated_at": "2026-08-31T10:46:57Z",
+    "workflow_elapsed_s": 2037.0,
+    "job_elapsed_s": 2034.0,
+    "queue_s": 2.0,
+    "runner_name": "GitHub Actions 1000008272",
+    "runner_group_name": "GitHub Actions",
+    "labels": [
+      "ubuntu-24.04"
+    ],
+    "logs_available": true,
+    "steps_s": {
+      "Set up job": 0.0,
+      "Check out repository": 1.0,
+      "Provision pinned CI tools": 2.0,
+      "Validate data and shell files": 28.0,
+      "Require customer-ready notes for a version bump": 0.0,
+      "Run tests": 2000.0,
+      "Post Check out repository": 0.0,
+      "Complete job": 0.0
+    },
+    "test_scripts_s": {
+      "engine.test.sh": 1567.681,
+      "daemon-reload.test.sh": 15.634,
+      "autoupdate.test.sh": 2.864,
+      "browser-launch.test.sh": 11.1,
+      "cdp-salvage.test.mjs": 389.51,
+      "distribution.test.sh": 13.012,
+      "release-train.test.sh": 0.792,
+      "release-assets.test.sh": 0.203
+    },
+    "runner_fingerprint": {
+      "runner_version": "2.336.0",
+      "azure_region": "northcentralus",
+      "image": "ubuntu-24.04",
+      "image_version": "20260823.283.1",
+      "excerpt": [
+        "Current runner version: '2.336.0'",
+        "Hosted Compute Agent",
+        "Azure Region: northcentralus",
+        "Ubuntu",
+        "LTS",
+        "Image: ubuntu-24.04",
+        "Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260823.283/images/ubuntu/Ubuntu2404-Readme.md",
+        "Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260823.283"
+      ]
+    }
+  },
+  {
+    "run_id": 33378615210,
+    "url": "https://github.com/StartupBros-com/pro-gate/actions/runs/33378615210",
+    "event": "pull_request",
+    "title": "chore(release): promote run-meta recovery fix as v0.36.2",
+    "head_sha": "739f23ea5dc0ac91e5f1c05ea31e37d9c7788ea3",
+    "created_at": "2026-08-31T09:37:45Z",
+    "updated_at": "2026-08-31T10:12:00Z",
+    "workflow_elapsed_s": 2055.0,
+    "job_elapsed_s": 2051.0,
+    "queue_s": 3.0,
+    "runner_name": "GitHub Actions 1000008262",
+    "runner_group_name": "GitHub Actions",
+    "labels": [
+      "ubuntu-24.04"
+    ],
+    "logs_available": true,
+    "steps_s": {
+      "Set up job": 1.0,
+      "Check out repository": 2.0,
+      "Provision pinned CI tools": 2.0,
+      "Validate data and shell files": 29.0,
+      "Require customer-ready notes for a version bump": 0.0,
+      "Run tests": 2013.0,
+      "Post Check out repository": 0.0,
+      "Complete job": 0.0
+    },
+    "test_scripts_s": {
+      "engine.test.sh": 1572.264,
+      "daemon-reload.test.sh": 15.214,
+      "autoupdate.test.sh": 3.152,
+      "browser-launch.test.sh": 11.103,
+      "cdp-salvage.test.mjs": 389.452,
+      "distribution.test.sh": 20.605,
+      "release-train.test.sh": 1.508,
+      "release-assets.test.sh": 0.16
+    },
+    "runner_fingerprint": {
+      "runner_version": "2.336.0",
+      "azure_region": "centralus",
+      "image": "ubuntu-24.04",
+      "image_version": "20260823.283.1",
+      "excerpt": [
+        "Current runner version: '2.336.0'",
+        "Hosted Compute Agent",
+        "Azure Region: centralus",
+        "Ubuntu",
+        "LTS",
+        "Image: ubuntu-24.04",
+        "Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260823.283/images/ubuntu/Ubuntu2404-Readme.md",
+        "Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260823.283"
+      ]
+    }
+  },
+  {
+    "run_id": 33375424446,
+    "url": "https://github.com/StartupBros-com/pro-gate/actions/runs/33375424446",
+    "event": "pull_request",
+    "title": "chore(release): promote run-meta recovery fix as v0.36.2",
+    "head_sha": "a4e209bab8cbf72edbeb05eb2ab834482aed98de",
+    "created_at": "2026-08-31T08:58:50Z",
+    "updated_at": "2026-08-31T09:33:22Z",
+    "workflow_elapsed_s": 2072.0,
+    "job_elapsed_s": 2069.0,
+    "queue_s": 2.0,
+    "runner_name": "GitHub Actions 1000008259",
+    "runner_group_name": "GitHub Actions",
+    "labels": [
+      "ubuntu-24.04"
+    ],
+    "logs_available": true,
+    "steps_s": {
+      "Set up job": 0.0,
+      "Check out repository": 1.0,
+      "Provision pinned CI tools": 1.0,
+      "Validate data and shell files": 36.0,
+      "Require customer-ready notes for a version bump": 0.0,
+      "Run tests": 2029.0,
+      "Post Check out repository": 0.0,
+      "Complete job": 0.0
+    },
+    "test_scripts_s": {
+      "engine.test.sh": 1591.024,
+      "daemon-reload.test.sh": 17.392,
+      "autoupdate.test.sh": 3.116,
+      "browser-launch.test.sh": 10.124,
+      "cdp-salvage.test.mjs": 391.426,
+      "distribution.test.sh": 14.788,
+      "release-train.test.sh": 1.03,
+      "release-assets.test.sh": 0.262
+    },
+    "runner_fingerprint": {
+      "runner_version": "2.336.0",
+      "azure_region": "eastus2",
+      "image": "ubuntu-24.04",
+      "image_version": "20260823.283.1",
+      "excerpt": [
+        "Current runner version: '2.336.0'",
+        "Hosted Compute Agent",
+        "Azure Region: eastus2",
+        "Ubuntu",
+        "LTS",
+        "Image: ubuntu-24.04",
+        "Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260823.283/images/ubuntu/Ubuntu2404-Readme.md",
+        "Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260823.283"
+      ]
+    }
+  },
+  {
+    "run_id": 33369777247,
+    "url": "https://github.com/StartupBros-com/pro-gate/actions/runs/33369777247",
+    "event": "pull_request",
+    "title": "feat: unify review lifecycle and admission",
+    "head_sha": "e1a8a52dce10c3b9b75e98fba08c65be9bb2e5af",
+    "created_at": "2026-08-31T07:45:24Z",
+    "updated_at": "2026-08-31T08:19:32Z",
+    "workflow_elapsed_s": 2048.0,
+    "job_elapsed_s": 2044.0,
+    "queue_s": 3.0,
+    "runner_name": "GitHub Actions 1000008255",
+    "runner_group_name": "GitHub Actions",
+    "labels": [
+      "ubuntu-24.04"
+    ],
+    "logs_available": true,
+    "steps_s": {
+      "Set up job": 1.0,
+      "Check out repository": 3.0,
+      "Provision pinned CI tools": 2.0,
+      "Validate data and shell files": 26.0,
+      "Require customer-ready notes for a version bump": 0.0,
+      "Run tests": 2010.0,
+      "Post Check out repository": 0.0,
+      "Complete job": 0.0
+    },
+    "test_scripts_s": {
+      "engine.test.sh": 1569.263,
+      "daemon-reload.test.sh": 14.999,
+      "autoupdate.test.sh": 3.336,
+      "browser-launch.test.sh": 10.089,
+      "cdp-salvage.test.mjs": 389.518,
+      "distribution.test.sh": 22.001,
+      "release-train.test.sh": 0.852,
+      "release-assets.test.sh": 0.27
+    },
+    "runner_fingerprint": {
+      "runner_version": "2.336.0",
+      "azure_region": "centralus",
+      "image": "ubuntu-24.04",
+      "image_version": "20260823.283.1",
+      "excerpt": [
+        "Current runner version: '2.336.0'",
+        "Hosted Compute Agent",
+        "Azure Region: centralus",
+        "Ubuntu",
+        "LTS",
+        "Image: ubuntu-24.04",
+        "Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260823.283/images/ubuntu/Ubuntu2404-Readme.md",
+        "Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260823.283"
+      ]
+    }
+  },
+  {
+    "run_id": 33367004997,
+    "url": "https://github.com/StartupBros-com/pro-gate/actions/runs/33367004997",
+    "event": "pull_request",
+    "title": "feat: unify review lifecycle and admission",
+    "head_sha": "dfd0c1f87741bdac97c93768fdd8b8f2bb95523c",
+    "created_at": "2026-08-31T07:07:38Z",
+    "updated_at": "2026-08-31T07:42:13Z",
+    "workflow_elapsed_s": 2075.0,
+    "job_elapsed_s": 2072.0,
+    "queue_s": 2.0,
+    "runner_name": "GitHub Actions 1000008254",
+    "runner_group_name": "GitHub Actions",
+    "labels": [
+      "ubuntu-24.04"
+    ],
+    "logs_available": true,
+    "steps_s": {
+      "Set up job": 0.0,
+      "Check out repository": 1.0,
+      "Provision pinned CI tools": 1.0,
+      "Validate data and shell files": 37.0,
+      "Require customer-ready notes for a version bump": 0.0,
+      "Run tests": 2029.0,
+      "Post Check out repository": 1.0,
+      "Complete job": 0.0
+    },
+    "test_scripts_s": {
+      "engine.test.sh": 1590.668,
+      "daemon-reload.test.sh": 17.326,
+      "autoupdate.test.sh": 3.117,
+      "browser-launch.test.sh": 10.125,
+      "cdp-salvage.test.mjs": 391.514,
+      "distribution.test.sh": 15.793,
+      "release-train.test.sh": 1.036,
+      "release-assets.test.sh": 0.261
+    },
+    "runner_fingerprint": {
+      "runner_version": "2.336.0",
+      "azure_region": "eastus2",
+      "image": "ubuntu-24.04",
+      "image_version": "20260823.283.1",
+      "excerpt": [
+        "Current runner version: '2.336.0'",
+        "Hosted Compute Agent",
+        "Azure Region: eastus2",
+        "Ubuntu",
+        "LTS",
+        "Image: ubuntu-24.04",
+        "Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260823.283/images/ubuntu/Ubuntu2404-Readme.md",
+        "Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260823.283"
+      ]
+    }
+  },
+  {
+    "run_id": 33355022933,
+    "url": "https://github.com/StartupBros-com/pro-gate/actions/runs/33355022933",
+    "event": "push",
+    "title": "fix: stabilize run-meta recovery decisions (#102)",
+    "head_sha": "5dc73803323c6932a8496ae6f2a4e05dedd64fed",
+    "created_at": "2026-08-31T03:48:34Z",
+    "updated_at": "2026-08-31T04:22:42Z",
+    "workflow_elapsed_s": 2048.0,
+    "job_elapsed_s": 2044.0,
+    "queue_s": 3.0,
+    "runner_name": "GitHub Actions 1000008229",
+    "runner_group_name": "GitHub Actions",
+    "labels": [
+      "ubuntu-24.04"
+    ],
+    "logs_available": true,
+    "steps_s": {
+      "Set up job": 0.0,
+      "Check out repository": 1.0,
+      "Provision pinned CI tools": 2.0,
+      "Validate data and shell files": 32.0,
+      "Require customer-ready notes for a version bump": 0.0,
+      "Run tests": 2006.0,
+      "Post Check out repository": 0.0,
+      "Complete job": 0.0
+    },
+    "test_scripts_s": {
+      "engine.test.sh": 1570.53,
+      "daemon-reload.test.sh": 15.755,
+      "autoupdate.test.sh": 2.842,
+      "browser-launch.test.sh": 11.1,
+      "cdp-salvage.test.mjs": 390.987,
+      "distribution.test.sh": 13.888,
+      "release-train.test.sh": 0.793,
+      "release-assets.test.sh": 0.192
+    },
+    "runner_fingerprint": {
+      "runner_version": "2.336.0",
+      "azure_region": "westus3",
+      "image": "ubuntu-24.04",
+      "image_version": "20260823.283.1",
+      "excerpt": [
+        "Current runner version: '2.336.0'",
+        "Hosted Compute Agent",
+        "Azure Region: westus3",
+        "Ubuntu",
+        "LTS",
+        "Image: ubuntu-24.04",
+        "Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260823.283/images/ubuntu/Ubuntu2404-Readme.md",
+        "Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260823.283"
+      ]
+    }
+  },
+  {
+    "run_id": 33353144767,
+    "url": "https://github.com/StartupBros-com/pro-gate/actions/runs/33353144767",
+    "event": "pull_request",
+    "title": "fix: stabilize run-meta recovery decisions",
+    "head_sha": "5d0c5b61d1b703bb9bfa37378d8ff63033408c75",
+    "created_at": "2026-08-31T03:13:23Z",
+    "updated_at": "2026-08-31T03:47:59Z",
+    "workflow_elapsed_s": 2076.0,
+    "job_elapsed_s": 2073.0,
+    "queue_s": 3.0,
+    "runner_name": "GitHub Actions 1000008228",
+    "runner_group_name": "GitHub Actions",
+    "labels": [
+      "ubuntu-24.04"
+    ],
+    "logs_available": true,
+    "steps_s": {
+      "Set up job": 1.0,
+      "Check out repository": 0.0,
+      "Provision pinned CI tools": 2.0,
+      "Validate data and shell files": 37.0,
+      "Require customer-ready notes for a version bump": 0.0,
+      "Run tests": 2031.0,
+      "Post Check out repository": 0.0,
+      "Complete job": 1.0
+    },
+    "test_scripts_s": {
+      "engine.test.sh": 1590.908,
+      "daemon-reload.test.sh": 17.441,
+      "autoupdate.test.sh": 3.143,
+      "browser-launch.test.sh": 12.131,
+      "cdp-salvage.test.mjs": 391.746,
+      "distribution.test.sh": 15.009,
+      "release-train.test.sh": 1.056,
+      "release-assets.test.sh": 0.269
+    },
+    "runner_fingerprint": {
+      "runner_version": "2.336.0",
+      "azure_region": "eastus2",
+      "image": "ubuntu-24.04",
+      "image_version": "20260823.283.1",
+      "excerpt": [
+        "Current runner version: '2.336.0'",
+        "Hosted Compute Agent",
+        "Azure Region: eastus2",
+        "Ubuntu",
+        "LTS",
+        "Image: ubuntu-24.04",
+        "Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260823.283/images/ubuntu/Ubuntu2404-Readme.md",
+        "Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260823.283"
+      ]
+    }
+  },
+  {
+    "run_id": 33334813999,
+    "url": "https://github.com/StartupBros-com/pro-gate/actions/runs/33334813999",
+    "event": "pull_request",
+    "title": "fix: stabilize run-meta recovery decisions",
+    "head_sha": "c9914ebb2af33dee7702124b39f022e164e0042f",
+    "created_at": "2026-08-30T20:51:40Z",
+    "updated_at": "2026-08-30T21:26:07Z",
+    "workflow_elapsed_s": 2067.0,
+    "job_elapsed_s": 2064.0,
+    "queue_s": 3.0,
+    "runner_name": "GitHub Actions 1000008155",
+    "runner_group_name": "GitHub Actions",
+    "labels": [
+      "ubuntu-24.04"
+    ],
+    "logs_available": true,
+    "steps_s": {
+      "Set up job": 1.0,
+      "Check out repository": 2.0,
+      "Provision pinned CI tools": 2.0,
+      "Validate data and shell files": 37.0,
+      "Require customer-ready notes for a version bump": 0.0,
+      "Run tests": 2018.0,
+      "Post Check out repository": 1.0,
+      "Complete job": 0.0
+    },
+    "test_scripts_s": {
+      "engine.test.sh": 1581.707,
+      "daemon-reload.test.sh": 16.72,
+      "autoupdate.test.sh": 3.047,
+      "browser-launch.test.sh": 10.114,
+      "cdp-salvage.test.mjs": 391.25,
+      "distribution.test.sh": 14.768,
+      "release-train.test.sh": 0.973,
+      "release-assets.test.sh": 0.241
+    },
+    "runner_fingerprint": {
+      "runner_version": "2.336.0",
+      "azure_region": "westus3",
+      "image": "ubuntu-24.04",
+      "image_version": "20260823.283.1",
+      "excerpt": [
+        "Current runner version: '2.336.0'",
+        "Hosted Compute Agent",
+        "Azure Region: westus3",
+        "Ubuntu",
+        "LTS",
+        "Image: ubuntu-24.04",
+        "Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260823.283/images/ubuntu/Ubuntu2404-Readme.md",
+        "Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260823.283"
+      ]
+    }
+  },
+  {
+    "run_id": 33224751568,
+    "url": "https://github.com/StartupBros-com/pro-gate/actions/runs/33224751568",
+    "event": "push",
+    "title": "fix-run-meta-terminal (#100)",
+    "head_sha": "43477ac944d72997a97a265007514437a7d8e577",
+    "created_at": "2026-08-29T00:51:14Z",
+    "updated_at": "2026-08-29T01:25:43Z",
+    "workflow_elapsed_s": 2069.0,
+    "job_elapsed_s": 2066.0,
+    "queue_s": 2.0,
+    "runner_name": "GitHub Actions 1000008105",
+    "runner_group_name": "GitHub Actions",
+    "labels": [
+      "ubuntu-24.04"
+    ],
+    "logs_available": true,
+    "steps_s": {
+      "Set up job": 1.0,
+      "Check out repository": 1.0,
+      "Provision pinned CI tools": 2.0,
+      "Validate data and shell files": 37.0,
+      "Require customer-ready notes for a version bump": 0.0,
+      "Run tests": 2020.0,
+      "Post Check out repository": 0.0,
+      "Complete job": 0.0
+    },
+    "test_scripts_s": {
+      "engine.test.sh": 1581.86,
+      "daemon-reload.test.sh": 16.698,
+      "autoupdate.test.sh": 3.022,
+      "browser-launch.test.sh": 12.119,
+      "cdp-salvage.test.mjs": 391.23,
+      "distribution.test.sh": 14.508,
+      "release-train.test.sh": 0.962,
+      "release-assets.test.sh": 0.245
+    },
+    "runner_fingerprint": {
+      "runner_version": "2.336.0",
+      "azure_region": "westus",
+      "image": "ubuntu-24.04",
+      "image_version": "20260823.283.1",
+      "excerpt": [
+        "Current runner version: '2.336.0'",
+        "Hosted Compute Agent",
+        "Azure Region: westus",
+        "Ubuntu",
+        "LTS",
+        "Image: ubuntu-24.04",
+        "Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260823.283/images/ubuntu/Ubuntu2404-Readme.md",
+        "Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260823.283"
+      ]
+    }
+  },
+  {
+    "run_id": 33219217848,
+    "url": "https://github.com/StartupBros-com/pro-gate/actions/runs/33219217848",
+    "event": "pull_request",
+    "title": "fix-run-meta-terminal",
+    "head_sha": "39cf16ce5735ef60524a9ad6c3ef9b7154cea2ca",
+    "created_at": "2026-08-28T23:05:39Z",
+    "updated_at": "2026-08-28T23:40:19Z",
+    "workflow_elapsed_s": 2080.0,
+    "job_elapsed_s": 2076.0,
+    "queue_s": 3.0,
+    "runner_name": "GitHub Actions 1000008102",
+    "runner_group_name": "GitHub Actions",
+    "labels": [
+      "ubuntu-24.04"
+    ],
+    "logs_available": true,
+    "steps_s": {
+      "Set up job": 0.0,
+      "Check out repository": 1.0,
+      "Provision pinned CI tools": 2.0,
+      "Validate data and shell files": 37.0,
+      "Require customer-ready notes for a version bump": 1.0,
+      "Run tests": 2032.0,
+      "Post Check out repository": 1.0,
+      "Complete job": 0.0
+    },
+    "test_scripts_s": {
+      "engine.test.sh": 1592.201,
+      "daemon-reload.test.sh": 17.585,
+      "autoupdate.test.sh": 3.123,
+      "browser-launch.test.sh": 11.129,
+      "cdp-salvage.test.mjs": 391.536,
+      "distribution.test.sh": 16.1,
+      "release-train.test.sh": 1.037,
+      "release-assets.test.sh": 0.266
+    },
+    "runner_fingerprint": {
+      "runner_version": "2.336.0",
+      "azure_region": "eastus2",
+      "image": "ubuntu-24.04",
+      "image_version": "20260823.283.1",
+      "excerpt": [
+        "Current runner version: '2.336.0'",
+        "Hosted Compute Agent",
+        "Azure Region: eastus2",
+        "Ubuntu",
+        "LTS",
+        "Image: ubuntu-24.04",
+        "Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260823.283/images/ubuntu/Ubuntu2404-Readme.md",
+        "Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260823.283"
+      ]
+    }
+  },
+  {
+    "run_id": 33214945088,
+    "url": "https://github.com/StartupBros-com/pro-gate/actions/runs/33214945088",
+    "event": "pull_request",
+    "title": "fix-run-meta-terminal",
+    "head_sha": "d9c296686e29dc385b0e1fad14f80de6069e1bdc",
+    "created_at": "2026-08-28T21:59:46Z",
+    "updated_at": "2026-08-28T22:33:27Z",
+    "workflow_elapsed_s": 2021.0,
+    "job_elapsed_s": 2019.0,
+    "queue_s": 2.0,
+    "runner_name": "GitHub Actions 1000008099",
+    "runner_group_name": "GitHub Actions",
+    "labels": [
+      "ubuntu-24.04"
+    ],
+    "logs_available": true,
+    "steps_s": {
+      "Set up job": 1.0,
+      "Check out repository": 2.0,
+      "Provision pinned CI tools": 2.0,
+      "Validate data and shell files": 28.0,
+      "Require customer-ready notes for a version bump": 0.0,
+      "Run tests": 1982.0,
+      "Post Check out repository": 0.0,
+      "Complete job": 0.0
+    },
+    "test_scripts_s": {
+      "engine.test.sh": 1547.057,
+      "daemon-reload.test.sh": 15.686,
+      "autoupdate.test.sh": 2.867,
+      "browser-launch.test.sh": 11.101,
+      "cdp-salvage.test.mjs": 389.603,
+      "distribution.test.sh": 14.873,
+      "release-train.test.sh": 0.792,
+      "release-assets.test.sh": 0.201
+    },
+    "runner_fingerprint": {
+      "runner_version": "2.336.0",
+      "azure_region": "westus3",
+      "image": "ubuntu-24.04",
+      "image_version": "20260823.283.1",
+      "excerpt": [
+        "Current runner version: '2.336.0'",
+        "Hosted Compute Agent",
+        "Azure Region: westus3",
+        "Ubuntu",
+        "LTS",
+        "Image: ubuntu-24.04",
+        "Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260823.283/images/ubuntu/Ubuntu2404-Readme.md",
+        "Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260823.283"
+      ]
+    }
+  },
+  {
+    "run_id": 33168330729,
+    "url": "https://github.com/StartupBros-com/pro-gate/actions/runs/33168330729",
+    "event": "push",
+    "title": "feat: make pro-gate take one clear next step (#98)",
+    "head_sha": "d2586af809bea240fba836eb681e6b64ec751e65",
+    "created_at": "2026-08-28T11:45:00Z",
+    "updated_at": "2026-08-28T12:19:28Z",
+    "workflow_elapsed_s": 2068.0,
+    "job_elapsed_s": 2065.0,
+    "queue_s": 2.0,
+    "runner_name": "GitHub Actions 1000008069",
+    "runner_group_name": "GitHub Actions",
+    "labels": [
+      "ubuntu-24.04"
+    ],
+    "logs_available": true,
+    "steps_s": {
+      "Set up job": 1.0,
+      "Check out repository": 1.0,
+      "Provision pinned CI tools": 2.0,
+      "Validate data and shell files": 34.0,
+      "Require customer-ready notes for a version bump": 0.0,
+      "Run tests": 2023.0,
+      "Post Check out repository": 1.0,
+      "Complete job": 0.0
+    },
+    "test_scripts_s": {
+      "engine.test.sh": 1582.289,
+      "daemon-reload.test.sh": 18.855,
+      "autoupdate.test.sh": 3.385,
+      "browser-launch.test.sh": 10.152,
+      "cdp-salvage.test.mjs": 392.016,
+      "distribution.test.sh": 15.984,
+      "release-train.test.sh": 1.021,
+      "release-assets.test.sh": 0.261
+    },
+    "runner_fingerprint": {
+      "runner_version": "2.336.0",
+      "azure_region": "northcentralus",
+      "image": "ubuntu-24.04",
+      "image_version": "20260823.283.1",
+      "excerpt": [
+        "Current runner version: '2.336.0'",
+        "Hosted Compute Agent",
+        "Azure Region: northcentralus",
+        "Ubuntu",
+        "LTS",
+        "Image: ubuntu-24.04",
+        "Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260823.283/images/ubuntu/Ubuntu2404-Readme.md",
+        "Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260823.283"
+      ]
+    }
+  },
+  {
+    "run_id": 33165961226,
+    "url": "https://github.com/StartupBros-com/pro-gate/actions/runs/33165961226",
+    "event": "pull_request",
+    "title": "feat: make pro-gate take one clear next step",
+    "head_sha": "853213dfdfa49dcfde657e8b544e455052c9d6e4",
+    "created_at": "2026-08-28T11:07:29Z",
+    "updated_at": "2026-08-28T11:41:45Z",
+    "workflow_elapsed_s": 2056.0,
+    "job_elapsed_s": 2052.0,
+    "queue_s": 3.0,
+    "runner_name": "GitHub Actions 1000008065",
+    "runner_group_name": "GitHub Actions",
+    "labels": [
+      "ubuntu-24.04"
+    ],
+    "logs_available": true,
+    "steps_s": {
+      "Set up job": 0.0,
+      "Check out repository": 1.0,
+      "Provision pinned CI tools": 2.0,
+      "Validate data and shell files": 37.0,
+      "Require customer-ready notes for a version bump": 0.0,
+      "Run tests": 2007.0,
+      "Post Check out repository": 1.0,
+      "Complete job": 0.0
+    },
+    "test_scripts_s": {
+      "engine.test.sh": 1567.942,
+      "daemon-reload.test.sh": 16.957,
+      "autoupdate.test.sh": 3.065,
+      "browser-launch.test.sh": 11.12,
+      "cdp-salvage.test.mjs": 391.568,
+      "distribution.test.sh": 16.098,
+      "release-train.test.sh": 0.985,
+      "release-assets.test.sh": 0.25
+    },
+    "runner_fingerprint": {
+      "runner_version": "2.336.0",
+      "azure_region": "westus2",
+      "image": "ubuntu-24.04",
+      "image_version": "20260823.283.1",
+      "excerpt": [
+        "Current runner version: '2.336.0'",
+        "Hosted Compute Agent",
+        "Azure Region: westus2",
+        "Ubuntu",
+        "LTS",
+        "Image: ubuntu-24.04",
+        "Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260823.283/images/ubuntu/Ubuntu2404-Readme.md",
+        "Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260823.283"
+      ]
+    }
+  },
+  {
+    "run_id": 33040085658,
+    "url": "https://github.com/StartupBros-com/pro-gate/actions/runs/33040085658",
+    "event": "push",
+    "title": "docs: plan one clear pro-gate next step (#97)",
+    "head_sha": "e907b7f3366a9424743f62255e48aa95634eed87",
+    "created_at": "2026-08-27T04:39:47Z",
+    "updated_at": "2026-08-27T05:12:24Z",
+    "workflow_elapsed_s": 1957.0,
+    "job_elapsed_s": 1954.0,
+    "queue_s": 2.0,
+    "runner_name": "GitHub Actions 1000008028",
+    "runner_group_name": "GitHub Actions",
+    "labels": [
+      "ubuntu-24.04"
+    ],
+    "logs_available": false,
+    "steps_s": {
+      "Set up job": 0.0,
+      "Check out repository": 1.0,
+      "Provision pinned CI tools": 2.0,
+      "Validate data and shell files": 20.0,
+      "Require customer-ready notes for a version bump": 0.0,
+      "Run tests": 1929.0,
+      "Post Check out repository": 0.0,
+      "Complete job": 0.0
+    },
+    "test_scripts_s": {},
+    "runner_fingerprint": {
+      "runner_version": null,
+      "azure_region": null,
+      "image": "ubuntu-24.04",
+      "image_version": null,
+      "excerpt": []
+    }
+  },
+  {
+    "run_id": 33038408491,
+    "url": "https://github.com/StartupBros-com/pro-gate/actions/runs/33038408491",
+    "event": "pull_request",
+    "title": "feat: make pro-gate take one clear next step",
+    "head_sha": "101c682e1f86f530da1504d2b6d78d50a962174d",
+    "created_at": "2026-08-27T04:06:54Z",
+    "updated_at": "2026-08-27T04:39:38Z",
+    "workflow_elapsed_s": 1964.0,
+    "job_elapsed_s": 1962.0,
+    "queue_s": 2.0,
+    "runner_name": "GitHub Actions 1000008026",
+    "runner_group_name": "GitHub Actions",
+    "labels": [
+      "ubuntu-24.04"
+    ],
+    "logs_available": true,
+    "steps_s": {
+      "Set up job": 1.0,
+      "Check out repository": 1.0,
+      "Provision pinned CI tools": 2.0,
+      "Validate data and shell files": 22.0,
+      "Require customer-ready notes for a version bump": 0.0,
+      "Run tests": 1932.0,
+      "Post Check out repository": 0.0,
+      "Complete job": 0.0
+    },
+    "test_scripts_s": {
+      "engine.test.sh": 1502.456,
+      "daemon-reload.test.sh": 9.24,
+      "autoupdate.test.sh": 3.083,
+      "browser-launch.test.sh": 11.135,
+      "cdp-salvage.test.mjs": 391.996,
+      "distribution.test.sh": 13.411,
+      "release-train.test.sh": 1.084,
+      "release-assets.test.sh": 0.269
+    },
+    "runner_fingerprint": {
+      "runner_version": "2.336.0",
+      "azure_region": "centralus",
+      "image": "ubuntu-24.04",
+      "image_version": "20260816.277.1",
+      "excerpt": [
+        "Current runner version: '2.336.0'",
+        "Hosted Compute Agent",
+        "Azure Region: centralus",
+        "Ubuntu",
+        "LTS",
+        "Image: ubuntu-24.04",
+        "Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260816.277/images/ubuntu/Ubuntu2404-Readme.md",
+        "Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260816.277"
+      ]
+    }
+  },
+  {
+    "run_id": 33038027759,
+    "url": "https://github.com/StartupBros-com/pro-gate/actions/runs/33038027759",
+    "event": "pull_request",
+    "title": "docs: plan one clear pro-gate next step",
+    "head_sha": "101c682e1f86f530da1504d2b6d78d50a962174d",
+    "created_at": "2026-08-27T03:59:44Z",
+    "updated_at": "2026-08-27T04:32:19Z",
+    "workflow_elapsed_s": 1955.0,
+    "job_elapsed_s": 1952.0,
+    "queue_s": 3.0,
+    "runner_name": "GitHub Actions 1000008024",
+    "runner_group_name": "GitHub Actions",
+    "labels": [
+      "ubuntu-24.04"
+    ],
+    "logs_available": true,
+    "steps_s": {
+      "Set up job": 1.0,
+      "Check out repository": 1.0,
+      "Provision pinned CI tools": 2.0,
+      "Validate data and shell files": 21.0,
+      "Require customer-ready notes for a version bump": 0.0,
+      "Run tests": 1923.0,
+      "Post Check out repository": 0.0,
+      "Complete job": 0.0
+    },
+    "test_scripts_s": {
+      "engine.test.sh": 1494.577,
+      "daemon-reload.test.sh": 9.208,
+      "autoupdate.test.sh": 2.983,
+      "browser-launch.test.sh": 11.116,
+      "cdp-salvage.test.mjs": 391.364,
+      "distribution.test.sh": 12.767,
+      "release-train.test.sh": 0.961,
+      "release-assets.test.sh": 0.242
+    },
+    "runner_fingerprint": {
+      "runner_version": "2.336.0",
+      "azure_region": "westus",
+      "image": "ubuntu-24.04",
+      "image_version": "20260823.283.1",
+      "excerpt": [
+        "Current runner version: '2.336.0'",
+        "Hosted Compute Agent",
+        "Azure Region: westus",
+        "Ubuntu",
+        "LTS",
+        "Image: ubuntu-24.04",
+        "Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260823.283/images/ubuntu/Ubuntu2404-Readme.md",
+        "Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260823.283"
+      ]
+    }
+  },
+  {
+    "run_id": 33029225716,
+    "url": "https://github.com/StartupBros-com/pro-gate/actions/runs/33029225716",
+    "event": "push",
+    "title": "docs: scope one clear pro-gate next step (#96)",
+    "head_sha": "af7cabae997d62d31727f4336e3b5d36182f06a7",
+    "created_at": "2026-08-27T01:10:08Z",
+    "updated_at": "2026-08-27T01:42:43Z",
+    "workflow_elapsed_s": 1955.0,
+    "job_elapsed_s": 1951.0,
+    "queue_s": 3.0,
+    "runner_name": "GitHub Actions 1000008021",
+    "runner_group_name": "GitHub Actions",
+    "labels": [
+      "ubuntu-24.04"
+    ],
+    "logs_available": false,
+    "steps_s": {
+      "Set up job": 1.0,
+      "Check out repository": 1.0,
+      "Provision pinned CI tools": 2.0,
+      "Validate data and shell files": 21.0,
+      "Require customer-ready notes for a version bump": 0.0,
+      "Run tests": 1924.0,
+      "Post Check out repository": 1.0,
+      "Complete job": 0.0
+    },
+    "test_scripts_s": {},
+    "runner_fingerprint": {
+      "runner_version": null,
+      "azure_region": null,
+      "image": "ubuntu-24.04",
+      "image_version": null,
+      "excerpt": []
+    }
+  },
+  {
+    "run_id": 33027464669,
+    "url": "https://github.com/StartupBros-com/pro-gate/actions/runs/33027464669",
+    "event": "pull_request",
+    "title": "docs: scope one clear pro-gate next step",
+    "head_sha": "26aa154c810a7163a49507cba4da1a84c9d385da",
+    "created_at": "2026-08-27T00:37:30Z",
+    "updated_at": "2026-08-27T01:09:48Z",
+    "workflow_elapsed_s": 1938.0,
+    "job_elapsed_s": 1934.0,
+    "queue_s": 3.0,
+    "runner_name": "GitHub Actions 1000008020",
+    "runner_group_name": "GitHub Actions",
+    "labels": [
+      "ubuntu-24.04"
+    ],
+    "logs_available": true,
+    "steps_s": {
+      "Set up job": 0.0,
+      "Check out repository": 0.0,
+      "Provision pinned CI tools": 2.0,
+      "Validate data and shell files": 16.0,
+      "Require customer-ready notes for a version bump": 0.0,
+      "Run tests": 1913.0,
+      "Post Check out repository": 0.0,
+      "Complete job": 0.0
+    },
+    "test_scripts_s": {
+      "engine.test.sh": 1487.515,
+      "daemon-reload.test.sh": 9.156,
+      "autoupdate.test.sh": 2.818,
+      "browser-launch.test.sh": 11.099,
+      "cdp-salvage.test.mjs": 389.549,
+      "distribution.test.sh": 11.916,
+      "release-train.test.sh": 0.788,
+      "release-assets.test.sh": 0.202
+    },
+    "runner_fingerprint": {
+      "runner_version": "2.336.0",
+      "azure_region": "northcentralus",
+      "image": "ubuntu-24.04",
+      "image_version": "20260816.277.1",
+      "excerpt": [
+        "Current runner version: '2.336.0'",
+        "Hosted Compute Agent",
+        "Azure Region: northcentralus",
+        "Ubuntu",
+        "LTS",
+        "Image: ubuntu-24.04",
+        "Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260816.277/images/ubuntu/Ubuntu2404-Readme.md",
+        "Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260816.277"
+      ]
+    }
+  },
+  {
+    "run_id": 33025317729,
+    "url": "https://github.com/StartupBros-com/pro-gate/actions/runs/33025317729",
+    "event": "push",
+    "title": "docs: ideate pro-gate simplification (#95)",
+    "head_sha": "52677398393f0746f994c58a7dd11015a78afa48",
+    "created_at": "2026-08-27T00:00:14Z",
+    "updated_at": "2026-08-27T00:32:54Z",
+    "workflow_elapsed_s": 1960.0,
+    "job_elapsed_s": 1957.0,
+    "queue_s": 2.0,
+    "runner_name": "GitHub Actions 1000008019",
+    "runner_group_name": "GitHub Actions",
+    "labels": [
+      "ubuntu-24.04"
+    ],
+    "logs_available": true,
+    "steps_s": {
+      "Set up job": 0.0,
+      "Check out repository": 1.0,
+      "Provision pinned CI tools": 2.0,
+      "Validate data and shell files": 21.0,
+      "Require customer-ready notes for a version bump": 0.0,
+      "Run tests": 1930.0,
+      "Post Check out repository": 1.0,
+      "Complete job": 0.0
+    },
+    "test_scripts_s": {
+      "engine.test.sh": 1502.005,
+      "daemon-reload.test.sh": 9.234,
+      "autoupdate.test.sh": 3.068,
+      "browser-launch.test.sh": 11.126,
+      "cdp-salvage.test.mjs": 391.434,
+      "distribution.test.sh": 12.719,
+      "release-train.test.sh": 1.039,
+      "release-assets.test.sh": 0.266
+    },
+    "runner_fingerprint": {
+      "runner_version": "2.336.0",
+      "azure_region": "eastus2",
+      "image": "ubuntu-24.04",
+      "image_version": "20260823.283.1",
+      "excerpt": [
+        "Current runner version: '2.336.0'",
+        "Hosted Compute Agent",
+        "Azure Region: eastus2",
+        "Ubuntu",
+        "LTS",
+        "Image: ubuntu-24.04",
+        "Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260823.283/images/ubuntu/Ubuntu2404-Readme.md",
+        "Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260823.283"
+      ]
+    }
+  }
+]

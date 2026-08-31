@@ -1,0 +1,5 @@
+ec34b3fc34d26d9cd29300725d6b55bca3e4bb50425ac2f97e1c443f61b25444  tests/artifacts/perf/2026-08-31-ci-runner/ci-baseline-samples.json
+7e01757c6546dc4f71549c988b6c1d53fa2b1d8b48ea319de1d5ee2e81191f84  tests/artifacts/perf/2026-08-31-ci-runner/ci-baseline-summary.json
+d6c1c13bb38991e3ea77b74ce0f515e98e247b8fe823efd0e541fa2842532d3e  tests/artifacts/perf/2026-08-31-ci-runner/representative-run-33443036305-test.log
+d3d5efb64ccacd84c43a228504f71a881d5246f3970e13b6ffdaef6f7064b90e  tests/artifacts/perf/2026-08-31-ci-runner/hosted-log-gap-analysis.json
+d6a5c9073a69078540c73e91b5b530f137f61f8da3e64d3b94096d06e0ddec2b  tests/artifacts/perf/2026-08-31-ci-runner/fingerprint.json

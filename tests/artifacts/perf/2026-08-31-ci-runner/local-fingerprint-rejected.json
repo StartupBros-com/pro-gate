@@ -1,0 +1,46 @@
+{
+  "run_id": "2026-08-31-ci-runner-local-rejected",
+  "captured_at_utc": "2026-08-31T22:44:01Z",
+  "git_sha": "183c705e0b67059062e3083d94fb0cf59929ad3a",
+  "git_dirty": true,
+  "hardware": {
+    "cpu_model": "Intel(R) Core(TM) i7-14700KF",
+    "cpu_cores_per_socket": 14,
+    "cpu_sockets": 1,
+    "cpu_threads_total": 28,
+    "cpu_mhz_reported": "",
+    "ram_total": "41071620 kB",
+    "swap_total": "37748728 kB"
+  },
+  "storage": {
+    "device": "/dev/sdd",
+    "model": "Virtual Disk",
+    "mount_point": "/home/will/SITES/pro-gate/.claude/worktrees/ci-runner-profile-110",
+    "filesystem": "ext4",
+    "mount_options": "rw,relatime,discard,errors=remount-ro,data=ordered"
+  },
+  "os": {
+    "distribution": "Ubuntu 24.04.4 LTS",
+    "kernel": "6.6.114.1-microsoft-standard-WSL2"
+  },
+  "toolchain": {
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+    "go": "go version go1.26.1 linux/amd64",
+    "node": "v24.12.0",
+    "python": "Python 3.12.3",
+    "clang": "",
+    "gcc": "gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0"
+  },
+  "build_profile": {
+    "name": "shell-node-tests"
+  },
+  "tuning_applied": {
+    "governor": "unknown",
+    "no_turbo": "n/a",
+    "smt_active": "1",
+    "perf_event_paranoid": "2",
+    "kptr_restrict": "1",
+    "nmi_watchdog": "0",
+    "thp": "madvise"
+  }
+}

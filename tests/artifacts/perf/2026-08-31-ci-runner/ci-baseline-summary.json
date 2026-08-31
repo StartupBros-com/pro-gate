@@ -1,0 +1,380 @@
+{
+  "schema_version": 1,
+  "collected_at": "2026-08-31T22:46:29.882288+00:00",
+  "scenario": {
+    "repository": "StartupBros-com/pro-gate",
+    "workflow": "CI",
+    "job": "trusted check",
+    "runner_label": "ubuntu-24.04",
+    "golden_output": "trusted check concludes success after all validation and test commands",
+    "primary_metric": "workflow and Run tests wall-clock p95",
+    "profiled_content_revision": "967a4eb00e64b2c75764c17c52ad508982fb9bd4",
+    "sample_window": {
+      "oldest_created_at": "2026-08-27T00:00:14Z",
+      "newest_created_at": "2026-08-31T21:46:30Z",
+      "distinct_head_shas": 19
+    }
+  },
+  "sample_count": 20,
+  "samples_with_detailed_logs": 18,
+  "quantile_method": "nearest-rank",
+  "comparability_limit": "GitHub-hosted runners are ephemeral. Samples share the ubuntu-24.04 label but not a physical host; use this as a service-level baseline, not a microbenchmark A/B baseline.",
+  "fingerprint_counts": [
+    {
+      "image_version": "20260823.283.1",
+      "azure_region": "eastus2",
+      "runner_version": "2.336.0",
+      "samples": 5
+    },
+    {
+      "image_version": "20260823.283.1",
+      "azure_region": "westus3",
+      "runner_version": "2.336.0",
+      "samples": 3
+    },
+    {
+      "image_version": "20260823.283.1",
+      "azure_region": "centralus",
+      "runner_version": "2.336.0",
+      "samples": 2
+    },
+    {
+      "image_version": "20260823.283.1",
+      "azure_region": "northcentralus",
+      "runner_version": "2.336.0",
+      "samples": 2
+    },
+    {
+      "image_version": "20260823.283.1",
+      "azure_region": "westus",
+      "runner_version": "2.336.0",
+      "samples": 2
+    },
+    {
+      "image_version": null,
+      "azure_region": null,
+      "runner_version": null,
+      "samples": 2
+    },
+    {
+      "image_version": "20260816.277.1",
+      "azure_region": "centralus",
+      "runner_version": "2.336.0",
+      "samples": 1
+    },
+    {
+      "image_version": "20260816.277.1",
+      "azure_region": "northcentralus",
+      "runner_version": "2.336.0",
+      "samples": 1
+    },
+    {
+      "image_version": "20260823.283.1",
+      "azure_region": "eastus",
+      "runner_version": "2.337.0",
+      "samples": 1
+    },
+    {
+      "image_version": "20260823.283.1",
+      "azure_region": "westus2",
+      "runner_version": "2.336.0",
+      "samples": 1
+    }
+  ],
+  "metrics": {
+    "workflow_elapsed": {
+      "samples": 20,
+      "min_s": 1938.0,
+      "mean_s": 2030.5,
+      "population_stdev_s": 52.608,
+      "cv_pct": 2.591,
+      "max_drift_from_median_pct": 5.533,
+      "p50_s": 2048.0,
+      "p95_s": 2080.0,
+      "p99_s": 2109.0,
+      "p99_9_s": 2109.0,
+      "p99_99_s": 2109.0,
+      "max_s": 2109.0,
+      "upper_tails_conservative": true
+    },
+    "job_elapsed": {
+      "samples": 20,
+      "min_s": 1934.0,
+      "mean_s": 2027.25,
+      "population_stdev_s": 52.572,
+      "cv_pct": 2.593,
+      "max_drift_from_median_pct": 5.543,
+      "p50_s": 2044.0,
+      "p95_s": 2076.0,
+      "p99_s": 2106.0,
+      "p99_9_s": 2106.0,
+      "p99_99_s": 2106.0,
+      "max_s": 2106.0,
+      "upper_tails_conservative": true
+    },
+    "queue": {
+      "samples": 20,
+      "min_s": 2.0,
+      "mean_s": 2.55,
+      "population_stdev_s": 0.497,
+      "cv_pct": 19.51,
+      "max_drift_from_median_pct": 33.333,
+      "p50_s": 3.0,
+      "p95_s": 3.0,
+      "p99_s": 3.0,
+      "p99_9_s": 3.0,
+      "p99_99_s": 3.0,
+      "max_s": 3.0,
+      "upper_tails_conservative": true
+    },
+    "throughput": {
+      "successful_jobs_per_hour_from_mean_workflow": 1.772962,
+      "bytes_per_second": null,
+      "note": "Byte throughput is not meaningful for this correctness-oriented CI workload."
+    }
+  },
+  "steps": {
+    "Check out repository": {
+      "samples": 20,
+      "min_s": 0.0,
+      "mean_s": 1.15,
+      "population_stdev_s": 0.654,
+      "cv_pct": 56.855,
+      "max_drift_from_median_pct": 200.0,
+      "p50_s": 1.0,
+      "p95_s": 2.0,
+      "p99_s": 3.0,
+      "p99_9_s": 3.0,
+      "p99_99_s": 3.0,
+      "max_s": 3.0,
+      "upper_tails_conservative": true
+    },
+    "Complete job": {
+      "samples": 20,
+      "min_s": 0.0,
+      "mean_s": 0.05,
+      "population_stdev_s": 0.218,
+      "cv_pct": 435.89,
+      "max_drift_from_median_pct": 0,
+      "p50_s": 0.0,
+      "p95_s": 0.0,
+      "p99_s": 1.0,
+      "p99_9_s": 1.0,
+      "p99_99_s": 1.0,
+      "max_s": 1.0,
+      "upper_tails_conservative": true
+    },
+    "Post Check out repository": {
+      "samples": 20,
+      "min_s": 0.0,
+      "mean_s": 0.35,
+      "population_stdev_s": 0.477,
+      "cv_pct": 136.277,
+      "max_drift_from_median_pct": 0,
+      "p50_s": 0.0,
+      "p95_s": 1.0,
+      "p99_s": 1.0,
+      "p99_9_s": 1.0,
+      "p99_99_s": 1.0,
+      "max_s": 1.0,
+      "upper_tails_conservative": true
+    },
+    "Provision pinned CI tools": {
+      "samples": 20,
+      "min_s": 1.0,
+      "mean_s": 1.85,
+      "population_stdev_s": 0.357,
+      "cv_pct": 19.301,
+      "max_drift_from_median_pct": 50.0,
+      "p50_s": 2.0,
+      "p95_s": 2.0,
+      "p99_s": 2.0,
+      "p99_9_s": 2.0,
+      "p99_99_s": 2.0,
+      "max_s": 2.0,
+      "upper_tails_conservative": true
+    },
+    "Require customer-ready notes for a version bump": {
+      "samples": 20,
+      "min_s": 0.0,
+      "mean_s": 0.1,
+      "population_stdev_s": 0.3,
+      "cv_pct": 300.0,
+      "max_drift_from_median_pct": 0,
+      "p50_s": 0.0,
+      "p95_s": 1.0,
+      "p99_s": 1.0,
+      "p99_9_s": 1.0,
+      "p99_99_s": 1.0,
+      "max_s": 1.0,
+      "upper_tails_conservative": true
+    },
+    "Run tests": {
+      "samples": 20,
+      "min_s": 1913.0,
+      "mean_s": 1990.4,
+      "population_stdev_s": 45.19,
+      "cv_pct": 2.27,
+      "max_drift_from_median_pct": 4.755,
+      "p50_s": 2007.0,
+      "p95_s": 2032.0,
+      "p99_s": 2057.0,
+      "p99_9_s": 2057.0,
+      "p99_99_s": 2057.0,
+      "max_s": 2057.0,
+      "upper_tails_conservative": true
+    },
+    "Set up job": {
+      "samples": 20,
+      "min_s": 0.0,
+      "mean_s": 0.55,
+      "population_stdev_s": 0.497,
+      "cv_pct": 90.453,
+      "max_drift_from_median_pct": 100.0,
+      "p50_s": 1.0,
+      "p95_s": 1.0,
+      "p99_s": 1.0,
+      "p99_9_s": 1.0,
+      "p99_99_s": 1.0,
+      "max_s": 1.0,
+      "upper_tails_conservative": true
+    },
+    "Validate data and shell files": {
+      "samples": 20,
+      "min_s": 16.0,
+      "mean_s": 29.95,
+      "population_stdev_s": 7.573,
+      "cv_pct": 25.285,
+      "max_drift_from_median_pct": 47.541,
+      "p50_s": 29.0,
+      "p95_s": 37.0,
+      "p99_s": 43.0,
+      "p99_9_s": 43.0,
+      "p99_99_s": 43.0,
+      "max_s": 43.0,
+      "upper_tails_conservative": true
+    }
+  },
+  "test_scripts": {
+    "engine.test.sh": {
+      "samples": 18,
+      "min_s": 1487.515,
+      "mean_s": 1560.969,
+      "population_stdev_s": 36.697,
+      "cv_pct": 2.351,
+      "max_drift_from_median_pct": 5.338,
+      "p50_s": 1570.53,
+      "p95_s": 1605.5,
+      "p99_s": 1605.5,
+      "p99_9_s": 1605.5,
+      "p99_99_s": 1605.5,
+      "max_s": 1605.5,
+      "upper_tails_conservative": true
+    },
+    "daemon-reload.test.sh": {
+      "samples": 18,
+      "min_s": 9.156,
+      "mean_s": 15.0,
+      "population_stdev_s": 3.228,
+      "cv_pct": 21.519,
+      "max_drift_from_median_pct": 43.574,
+      "p50_s": 15.755,
+      "p95_s": 18.855,
+      "p99_s": 18.855,
+      "p99_9_s": 18.855,
+      "p99_99_s": 18.855,
+      "max_s": 18.855,
+      "upper_tails_conservative": true
+    },
+    "autoupdate.test.sh": {
+      "samples": 18,
+      "min_s": 2.818,
+      "mean_s": 3.063,
+      "population_stdev_s": 0.149,
+      "cv_pct": 4.864,
+      "max_drift_from_median_pct": 10.063,
+      "p50_s": 3.068,
+      "p95_s": 3.385,
+      "p99_s": 3.385,
+      "p99_9_s": 3.385,
+      "p99_99_s": 3.385,
+      "max_s": 3.385,
+      "upper_tails_conservative": true
+    },
+    "browser-launch.test.sh": {
+      "samples": 18,
+      "min_s": 10.089,
+      "mean_s": 10.95,
+      "population_stdev_s": 0.601,
+      "cv_pct": 5.487,
+      "max_drift_from_median_pct": 9.269,
+      "p50_s": 11.101,
+      "p95_s": 12.131,
+      "p99_s": 12.131,
+      "p99_9_s": 12.131,
+      "p99_99_s": 12.131,
+      "max_s": 12.131,
+      "upper_tails_conservative": true
+    },
+    "cdp-salvage.test.mjs": {
+      "samples": 18,
+      "min_s": 389.452,
+      "mean_s": 391.626,
+      "population_stdev_s": 3.035,
+      "cv_pct": 0.775,
+      "max_drift_from_median_pct": 3.11,
+      "p50_s": 391.364,
+      "p95_s": 403.568,
+      "p99_s": 403.568,
+      "p99_9_s": 403.568,
+      "p99_99_s": 403.568,
+      "max_s": 403.568,
+      "upper_tails_conservative": true
+    },
+    "distribution.test.sh": {
+      "samples": 18,
+      "min_s": 11.916,
+      "mean_s": 15.235,
+      "population_stdev_s": 2.497,
+      "cv_pct": 16.388,
+      "max_drift_from_median_pct": 48.35,
+      "p50_s": 14.788,
+      "p95_s": 22.001,
+      "p99_s": 22.001,
+      "p99_9_s": 22.001,
+      "p99_99_s": 22.001,
+      "max_s": 22.001,
+      "upper_tails_conservative": true
+    },
+    "release-train.test.sh": {
+      "samples": 18,
+      "min_s": 0.788,
+      "mean_s": 0.981,
+      "population_stdev_s": 0.162,
+      "cv_pct": 16.459,
+      "max_drift_from_median_pct": 54.035,
+      "p50_s": 0.973,
+      "p95_s": 1.508,
+      "p99_s": 1.508,
+      "p99_9_s": 1.508,
+      "p99_99_s": 1.508,
+      "max_s": 1.508,
+      "upper_tails_conservative": true
+    },
+    "release-assets.test.sh": {
+      "samples": 18,
+      "min_s": 0.16,
+      "mean_s": 0.24,
+      "population_stdev_s": 0.032,
+      "cv_pct": 13.46,
+      "max_drift_from_median_pct": 36.884,
+      "p50_s": 0.25,
+      "p95_s": 0.27,
+      "p99_s": 0.27,
+      "p99_9_s": 0.27,
+      "p99_99_s": 0.27,
+      "max_s": 0.27,
+      "upper_tails_conservative": true
+    }
+  }
+}
