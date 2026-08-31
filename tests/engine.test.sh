@@ -1132,12 +1132,20 @@ check 'governor engine refusal names rounds used and wall clock' \
 echo '# v0.31 (#65): a provably-never-landed submission refunds its round'
 cat > "$TDIR/bin/oracle-dead" <<'FAKE_DEAD'
 #!/usr/bin/env bash
+[ "${1:-}" = session ] && exit 1
+prompt=""
+while [ $# -gt 0 ]; do case "$1" in -p) prompt="$2"; shift 2;; *) shift;; esac; done
+slug=fake-dead
+mkdir -p "${ORACLE_HOME_DIR:?}/sessions/$slug"
+jq -cn --arg id "$slug" --arg prompt "$prompt" '{id:$id,status:"error",options:{prompt:$prompt},browser:{runtime:{promptSubmitted:false}}}' \
+  > "$ORACLE_HOME_DIR/sessions/$slug/meta.json"
+printf 'Session: %s\n' "$slug"
 exit 1
 FAKE_DEAD
 chmod +x "$TDIR/bin/oracle-dead"
 RKEY_91="$(printf '%s-91' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
 printf 'foreign idle tab\n' > "$TDIR/tab.txt"
-env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+env PRO_GATE_HOME="$RHOME" ORACLE_HOME_DIR="$RHOME/oracle-dead" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
   PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 PRO_GATE_STALL_SECS=30 \
   PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-dead" NODE_OPTIONS= \
   bash "$ENGINE" --pr 91 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$RHOME/o-refund.md" --timeout 5s \
@@ -1204,9 +1212,15 @@ check 'symlinked transcript fails closed' "$([ "$LOG_RC" -ne 0 ]; echo $?)" "rc=
 cat > "$TDIR/bin/oracle-quiet-fail" <<'FAKE_QUIET_FAIL'
 #!/usr/bin/env bash
 [ "${1:-}" = session ] && exit 1
-count=0
+count=0; prompt=""
 [ -s "${PG_TEST_ATTEMPTS_FILE:?}" ] && count="$(cat "$PG_TEST_ATTEMPTS_FILE")"
-printf '%s\n' "$((count + 1))" > "$PG_TEST_ATTEMPTS_FILE"
+count=$((count + 1)); printf '%s\n' "$count" > "$PG_TEST_ATTEMPTS_FILE"
+while [ $# -gt 0 ]; do case "$1" in -p) prompt="$2"; shift 2;; *) shift;; esac; done
+slug="fake-quiet-$count"
+mkdir -p "${ORACLE_HOME_DIR:?}/sessions/$slug"
+jq -cn --arg id "$slug" --arg prompt "$prompt" '{id:$id,status:"error",options:{prompt:$prompt},browser:{runtime:{promptSubmitted:false}}}' \
+  > "$ORACLE_HOME_DIR/sessions/$slug/meta.json"
+printf 'Session: %s\n' "$slug"
 exit 1
 FAKE_QUIET_FAIL
 chmod +x "$TDIR/bin/oracle-quiet-fail"
@@ -1223,7 +1237,7 @@ CTL_HOME="$TDIR/home-tee-ok"; CTL_ATTEMPTS="$TDIR/tee-ok-attempts"
 mkdir -p "$CTL_HOME"; : > "$CTL_ATTEMPTS"
 RKEY_920="$(printf '%s-920' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
 printf 'foreign idle tab\n' > "$TDIR/tab.txt"
-env PRO_GATE_HOME="$CTL_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+env PRO_GATE_HOME="$CTL_HOME" ORACLE_HOME_DIR="$CTL_HOME/oracle" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
   PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
   PRO_GATE_MAX_RETRIES=1 PRO_GATE_RETRY_BACKOFF=0 PRO_GATE_REATTACH_TIMEOUT=1 \
   PRO_GATE_SALVAGE_SECS=2 PRO_GATE_RUN_LOGS=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-quiet-fail" \
@@ -1243,7 +1257,7 @@ LOSS_HOME="$TDIR/home-log-loss"; LOSS_ATTEMPTS="$TDIR/log-loss-attempts"
 mkdir -p "$LOSS_HOME"; : > "$LOSS_ATTEMPTS"
 RKEY_921="$(printf '%s-921' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
 printf 'foreign idle tab\n' > "$TDIR/tab.txt"
-env PRO_GATE_HOME="$LOSS_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+env PRO_GATE_HOME="$LOSS_HOME" ORACLE_HOME_DIR="$LOSS_HOME/oracle" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
   PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
   PRO_GATE_MAX_RETRIES=1 PRO_GATE_RETRY_BACKOFF=0 PRO_GATE_REATTACH_TIMEOUT=1 \
   PRO_GATE_SALVAGE_SECS=2 PRO_GATE_RUN_LOGS=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-quiet-fail" \
@@ -1419,14 +1433,15 @@ count=0
 count=$((count + 1)); printf '%s\n' "$count" > "$PG_TEST_ATTEMPTS_FILE"
 slug="fake-prompt-commit-$count"
 mkdir -p "${ORACLE_HOME_DIR:?}/sessions/$slug"
+submitted=true; [ "${PG_TEST_COMMIT_MODE:-complete}" != pre-submit ] || submitted=false
 jq -n --arg id "$slug" --arg prompt "$prompt" --arg tabUrl "$tab_url" \
-  --argjson promptLength "${#prompt}" '
+  --argjson promptLength "${#prompt}" --argjson submitted "$submitted" '
   {
     id: $id,
     status: "error",
     mode: "browser",
     options: {prompt: $prompt},
-    browser: {runtime: {promptSubmitted: true, tabUrl: $tabUrl}},
+    browser: {runtime: {promptSubmitted: $submitted, tabUrl: $tabUrl}},
     error: {
       category: "browser-automation",
       details: {
@@ -1516,6 +1531,33 @@ check 'partial commit metadata remains charged' \
   "$([ -s "$PARTIAL_HOME/rounds/$RKEY_94" ]; echo $?)" "rounds=$(cat "$PARTIAL_HOME/rounds/$RKEY_94" 2>/dev/null)"
 check 'partial commit metadata never announces a refund' \
   "$(! grep -q 'refunding this round' "$TDIR/stderr"; echo $?)" "$(tail -6 "$TDIR/stderr")"
+
+# Oracle 0.18.0 records promptSubmitted=false before attachment completion and changes it only
+# when Send is dispatched. Complete exact-session metadata plus the existing negative conversation
+# proof is therefore positive no-submit evidence even though browser/upload lifecycle lines exist.
+PRESUBMIT_HOME="$TDIR/home-prompt-presubmit"; PRESUBMIT_ORACLE="$TDIR/oracle-prompt-presubmit"
+PRESUBMIT_REPO="$TDIR/presubmit-repo"; git init -q "$PRESUBMIT_REPO"; git -C "$PRESUBMIT_REPO" remote add origin https://github.com/acme/presubmit.git
+PRESUBMIT_ATTEMPTS="$TDIR/prompt-presubmit-attempts"; mkdir -p "$PRESUBMIT_HOME" "$PRESUBMIT_ORACLE"; : > "$PRESUBMIT_ATTEMPTS"
+RKEY_95='acme-presubmit.git-95'
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+env PRO_GATE_HOME="$PRESUBMIT_HOME" ORACLE_HOME_DIR="$PRESUBMIT_ORACLE" ORACLE_BROWSER_PORT="$PORT" \
+  PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
+  PRO_GATE_MAX_RETRIES=0 PRO_GATE_RETRY_BACKOFF=0 PRO_GATE_REATTACH_TIMEOUT=1 PRO_GATE_SALVAGE_SECS=2 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-commit-timeout" PG_TEST_ATTEMPTS_FILE="$PRESUBMIT_ATTEMPTS" \
+  PG_TEST_COMMIT_MODE=pre-submit NODE_OPTIONS= bash "$ENGINE" --pr 95 --repo "$PRESUBMIT_REPO" \
+  --diff "$TDIR/small.diff" --out "$PRESUBMIT_HOME/o-presubmit.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+PRESUBMIT_MARKER="$(jq -r .marker "$PRESUBMIT_HOME/o-presubmit.md.status" 2>/dev/null)"
+check 'structured pre-submit failure exits 6 without a duplicate retry' \
+  "$([ "$RC" -eq 6 ] && [ "$(cat "$PRESUBMIT_ATTEMPTS")" = 1 ]; echo $?)" "rc=$RC attempts=$(cat "$PRESUBMIT_ATTEMPTS")"
+check 'structured promptSubmitted=false proof refunds the round exactly once' \
+  "$([ ! -s "$PRESUBMIT_HOME/rounds/$RKEY_95" ] && [ -s "$PRESUBMIT_HOME/attempt-dispositions/$PRESUBMIT_MARKER" ] \
+     && jq -e '.terminal_kind=="not-submitted" and .proof_kind=="proven-no-submit"' "$PRESUBMIT_HOME/attempt-dispositions/$PRESUBMIT_MARKER" >/dev/null 2>&1; echo $?)" \
+  "marker=$PRESUBMIT_MARKER dispositions=$(find "$PRESUBMIT_HOME/attempt-dispositions" -type f -printf '%f ' 2>/dev/null) disposition=$(cat "$PRESUBMIT_HOME/attempt-dispositions/$PRESUBMIT_MARKER" 2>/dev/null) rounds=$(cat "$PRESUBMIT_HOME/rounds/$RKEY_95" 2>/dev/null) stderr=$(tail -8 "$TDIR/stderr")"
+check 'structured pre-submit terminalization removes mutable recovery state' \
+  "$([ ! -e "$PRESUBMIT_HOME/run-meta/$PRESUBMIT_MARKER" ] && [ ! -e "$PRESUBMIT_HOME/active/$RKEY_95" ]; echo $?)" \
+  "run-meta=$(find "$PRESUBMIT_HOME/run-meta" -type f 2>/dev/null) active=$(find "$PRESUBMIT_HOME/active" -type f 2>/dev/null)"
 
 # #66 gate r2/r3 P1: the spend epoch is the one pg_round_record CHARGED at — not the
 # reservation's `created` field (written at exit-9 time, 35 min later on the live run that

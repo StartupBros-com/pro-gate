@@ -395,6 +395,32 @@ const MARKER = 'pg-run-test-1234567890-42';
   cdp.stop();
 }
 
+{ // exact-owned terminal ChatGPT infrastructure error: charged, but nothing remains to harvest
+  const cdp = await mockCdp(`run marker: ${MARKER}\nA network error occurred`);
+  const r = await runSalvage([MARKER, '3'], cdp.port);
+  check('exact-owned terminal network error exits 10', r.status === 10,
+    `status=${r.status} stderr=${r.stderr?.slice(0, 240)}`);
+  check('terminal network error names the bounded infrastructure outcome',
+    /terminal-infrastructure: A network error occurred/.test(r.stderr ?? ''), r.stderr);
+  check('terminal network error leaves the source tab for caller-owned cleanup', !cdp.closed.includes('tab1'),
+    `closed=${cdp.closed}`);
+  cdp.stop();
+}
+
+{ // planted negatives: a prompt quote or non-terminal line after the phrase cannot settle the run
+  const beforeMarker = await mockCdp(`A network error occurred\nrun marker: ${MARKER}\nReasoning continues...`);
+  const beforeResult = await runSalvage([MARKER, '3'], beforeMarker.port);
+  check('network-error phrase before the exact marker stays generating', beforeResult.status === 3,
+    `status=${beforeResult.status} stderr=${beforeResult.stderr?.slice(0, 200)}`);
+  beforeMarker.stop();
+
+  const notLast = await mockCdp(`run marker: ${MARKER}\nA network error occurred\nRetrying the response...`);
+  const notLastResult = await runSalvage([MARKER, '3'], notLast.port);
+  check('non-terminal text after a network-error phrase stays generating', notLastResult.status === 3,
+    `status=${notLastResult.status} stderr=${notLastResult.stderr?.slice(0, 200)}`);
+  notLast.stop();
+}
+
 { // U1: production-shaped divergence. The listed source is readable and marker-owned but stale;
   // the same canonical URL, rendered in a scratch tab, contains the completed server answer.
   // Recovery must never refresh, close, or otherwise mutate the source target.

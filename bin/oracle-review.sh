@@ -1641,24 +1641,20 @@ pg_install_effect_input_binding() { # clone the already-current validated relati
   binding="$(jq -cS --arg marker "$RUN_MARKER" --argjson epoch "$RUN_SPEND_EPOCH" '.marker=$marker | .charged_spend_epoch=$epoch' <<<"$REVIEW_DECISION_INPUT_TEMPLATE")" || return 1
   pg_review_input_binding_write "$RUN_MARKER" "$binding"
 }
-pg_fresh_dispatch_refund() { # only the current marker and its exact charged epoch may roll back
-  local f marker _ _ _ _ state epoch latest meta binding
-  f="$(pg_active_dir)/$ROUND_KEY"
-  [ -n "${RUN_SPEND_EPOCH:-}" ] && [ -f "$f" ] || return 1
-  IFS=$'\t' read -r marker _ _ _ _ _ state epoch < "$f" 2>/dev/null || return 1
-  [ "$marker" = "$RUN_MARKER" ] && [ "$epoch" = "$RUN_SPEND_EPOCH" ] || return 1
-  latest=""
-  while IFS= read -r latest; do :; done < "$(pg_rounds_dir)/$ROUND_KEY" 2>/dev/null
-  [ "$latest" = "$RUN_SPEND_EPOCH" ] || return 1
-  meta="$(pg_run_meta_read "$RUN_MARKER" 2>/dev/null || true)"
-  [ -n "$meta" ] && [ "${meta##*$'\t'}" = "$RUN_SPEND_EPOCH" ] || return 1
-  binding="$(pg_review_input_binding_read "$RUN_MARKER" 2>/dev/null || true)"
-  [ -n "$binding" ] && [ "$(jq -r .charged_spend_epoch <<<"$binding")" = "$RUN_SPEND_EPOCH" ] || return 1
+pg_fresh_dispatch_refund() { # terminalize and refund only the current exact charged attempt
+  [ -n "${RUN_SPEND_EPOCH:-}" ] || return 1
+  if [ -n "${PR_NUM:-}" ] && [ -n "${PG_META_HOST:-}" ] && [ -n "${PG_META_OWNER:-}" ] && [ -n "${PG_META_REPO:-}" ]; then
+    pg_attempt_terminal_transition "$PG_META_HOST" "$PG_META_OWNER" "$PG_META_REPO" "$PR_NUM" \
+      "$ROUND_KEY" "$RUN_MARKER" "$RUN_SPEND_EPOCH" not-submitted proven-no-submit || return 1
+    PG_ACTIVE_WRITTEN=0
+    return 0
+  fi
+  # Legacy --diff without a canonical PR has no durable target identity for a disposition.
+  # Preserve its exact historical refund behavior under the already-held per-change lock.
   pg_round_unrecord "$ROUND_KEY"
   pg_run_meta_remove "$RUN_MARKER"
-  rm -f "$(pg_review_input_binding_dir)/$RUN_MARKER" "$f" 2>/dev/null || true
+  rm -f "$(pg_review_input_binding_dir)/$RUN_MARKER" "$(pg_active_dir)/$ROUND_KEY" 2>/dev/null || true
   PG_ACTIVE_WRITTEN=0
-  return 0
 }
 
 pg_publish_out() {  # $1 = verified snapshot → atomically publish to $OUT; rc 0 only when
@@ -3207,14 +3203,30 @@ LIVE_CONVERSATION=0
 THROTTLED=0
 CLOUDFLARE=0
 
+pg_oracle_prompt_submitted_state() { # verified transcript proof -> true|false from exact Oracle session metadata
+  local transcript="$1" proof="$2" session meta root state expected actual
+  [ -f "$transcript" ] && [ ! -L "$transcript" ] && [ -f "$proof" ] && [ ! -L "$proof" ] || return 1
+  expected="$(tr -d '[:space:]' < "$proof" 2>/dev/null)"; actual="$(pg_sha256 "$transcript" 2>/dev/null || true)"
+  [ -n "$expected" ] && [ "$actual" = "$expected" ] || return 1
+  session="$(sed -nE 's/^Session: ([A-Za-z0-9._-]+)$/\1/p' "$transcript" | tail -1)"
+  case "$session" in ''|*[!A-Za-z0-9._-]*) return 1;; esac
+  root="${ORACLE_HOME_DIR:-$HOME/.oracle}"; meta="$root/sessions/$session/meta.json"
+  [ -f "$meta" ] && [ ! -L "$meta" ] && [ "$(wc -c < "$meta" 2>/dev/null)" -le 1048576 ] || return 1
+  state="$(jq -r --arg id "$session" --arg marker "$RUN_MARKER" '
+    select(.id==$id) | select(.options.prompt|type=="string" and contains($marker)) |
+    [.browser.runtime.promptSubmitted?,.error.details.runtime.promptSubmitted?]
+    | map(select(type=="boolean")) | unique | select(length==1) | .[0]
+  ' "$meta" 2>/dev/null)" || return 1
+  case "$state" in true|false) printf '%s\n' "$state";; *) return 1;; esac
+}
+
 # pg_attempt_provably_unsubmitted <marker-scan-rc>: the ONE shared bar for a no-spend
 # retry/refund. A clean marker scan, no remembered URL, no throttle/live evidence, and a stable
-# browser remain mandatory. Every Oracle invocation must also have a complete, digest-verified
-# transcript whose grep completed with no lifecycle match. Missing/truncated/unreadable capture is
-# ambiguous and therefore spent; DOM-only commit state cannot override that fail-closed decision.
+# browser remain mandatory. Every Oracle invocation must have a complete digest-verified transcript
+# bound to structured session metadata that says Send was never dispatched. Missing, conflicting,
+# or promptSubmitted=true metadata is ambiguous and therefore remains charged.
 pg_attempt_provably_unsubmitted() {
-  local scan_rc="${1:-}" i
-  local lifecycle='Launching browser mode|Acquired ChatGPT browser slot|Reattach: oracle session '
+  local scan_rc="${1:-}" i state
   [ "$scan_rc" = 4 ] || return 1
   [ "${LIVE_CONVERSATION:-0}" != 1 ] || return 1
   [ "${THROTTLED:-0}" != 1 ] || return 1
@@ -3222,8 +3234,8 @@ pg_attempt_provably_unsubmitted() {
   ! pg_browser_restarted_midrun "$RUN_START" >/dev/null || return 1
   [ "${#ORACLE_LOG_TRANSCRIPTS[@]}" -gt 0 ] || return 1
   for i in "${!ORACLE_LOG_TRANSCRIPTS[@]}"; do
-    pg_verified_log_lacks "${ORACLE_LOG_TRANSCRIPTS[$i]}" "${ORACLE_LOG_PROOFS[$i]}" \
-      "$lifecycle" || return 1
+    state="$(pg_oracle_prompt_submitted_state "${ORACLE_LOG_TRANSCRIPTS[$i]}" "${ORACLE_LOG_PROOFS[$i]}" 2>/dev/null || true)"
+    [ "$state" = false ] || return 1
   done
   return 0
 }
@@ -3406,12 +3418,8 @@ while :; do
     # The challenge PROVES no prompt reached the model: refund this invocation's round so a
     # few challenge hits inside the window cannot exit-12-block a change that spent nothing
     # (dogfood gate round-2 P1). Unknown-fate paths (throttle, watchdogs) never refund.
-    if [ "${REVIEW_DECISION_EXECUTE:-0}" = 1 ]; then
-      pg_fresh_dispatch_refund || echo "[oracle-review] charged marker state could not be proven for refund; preserving it for recovery." >&2
-    else
-      pg_round_unrecord "$ROUND_KEY"
-      pg_run_meta_remove "$RUN_MARKER"
-    fi
+    pg_fresh_dispatch_refund \
+      || echo "[oracle-review] charged marker state could not be proven for refund; preserving it for recovery." >&2
     pg_status cloudflare "anti-bot challenge; cooldown started"
     cdf="${PRO_GATE_COOLDOWN_FILE:-$PRO_GATE_HOME/throttle.cooldown}"
     { printf '%s cloudflare-challenge (pr %s)\n' "$(date +%Y-%m-%dT%H:%M:%S%z)" "${PR_NUM:-diff}" > "$cdf"; } 2>/dev/null || true
@@ -3581,6 +3589,17 @@ if ! pg_is_review "$CAPTURE_OUT" && [ "${CLOUDFLARE:-0}" != 1 ] && command -v no
   # reservation to stop the next invocation spending a second Pro slot on a review that exists.
   case "$SALVAGE_RC" in
     4) : ;;
+    10)
+      if [ -n "${PR_NUM:-}" ] && [ -n "${PG_META_HOST:-}" ] && [ -n "${PG_META_OWNER:-}" ] && [ -n "${PG_META_REPO:-}" ] \
+         && pg_attempt_terminal_transition "$PG_META_HOST" "$PG_META_OWNER" "$PG_META_REPO" "$PR_NUM" \
+              "$ROUND_KEY" "$RUN_MARKER" "$RUN_SPEND_EPOCH" submitted-terminal exact-owned-infrastructure-terminal; then
+        SALVAGE_TERMINAL_INFRA=1
+        echo "[oracle-review] exact-owned ChatGPT terminal infrastructure error; recovery released, round retained." >&2
+      else
+        SALVAGE_PRESERVE=1
+        echo "[oracle-review] terminal infrastructure evidence could not be persisted safely; preserving recovery state." >&2
+      fi
+      ;;
     0) [ "${SALVAGED:-0}" = 1 ] || SALVAGE_PRESERVE=1 ;;
     *) SALVAGE_PRESERVE=1 ;;
   esac
@@ -3732,6 +3751,8 @@ else
   RETRIES=$(( attempt > 0 ? attempt - 1 : 0 ))
   echo "ERROR: oracle produced no usable review after salvage + ${RETRIES} retr$([ "${RETRIES}" -eq 1 ] && echo y || echo ies) (reattach: oracle session ${SLUG_BASE})." >&2
   FAIL_DETAIL="no usable review after salvage"
+  [ "${SALVAGE_TERMINAL_INFRA:-0}" != 1 ] \
+    || FAIL_DETAIL="submitted review ended in an exact-owned ChatGPT infrastructure error; round retained, safe to retry with changed/current evidence"
   # v0.31 (#65): refund only through the same positive no-spend predicate used before a retry.
   # It requires a clean marker scan, no URL/live/throttle evidence, a stable browser, and complete,
   # digest-verified Oracle transcripts with no browser lifecycle. Missing capture and post-click DOM
@@ -3740,13 +3761,9 @@ else
   if _svc_up="$(pg_browser_restarted_midrun "$RUN_START")"; then _svc_restarted=1; fi
   if [ "${SALVAGE_RAN:-0}" = 1 ] \
      && pg_attempt_provably_unsubmitted "${SALVAGE_RC:-0}"; then
-    echo "[oracle-review] no conversation carried this run's marker and Oracle never reached its browser lifecycle (browser scanned clean, no URL memoized, browser stable): refunding this round; zero Pro quota was spent." >&2
-    if [ "${REVIEW_DECISION_EXECUTE:-0}" = 1 ]; then
-      pg_fresh_dispatch_refund || { echo "[oracle-review] charged marker state could not be proven for refund; preserving it for recovery." >&2; FAIL_DETAIL="submission fate uncertain; charged state preserved for recovery"; }
-    else
-      pg_round_unrecord "$ROUND_KEY"
-      pg_run_meta_remove "$RUN_MARKER"
-    fi
+    echo "[oracle-review] Oracle's exact session metadata proves Send was never dispatched (browser scanned clean, no URL memoized, browser stable): refunding this round; zero Pro quota was spent." >&2
+    pg_fresh_dispatch_refund \
+      || { echo "[oracle-review] charged marker state could not be proven for refund; preserving it for recovery." >&2; FAIL_DETAIL="submission fate uncertain; charged state preserved for recovery"; }
     [ "${FAIL_DETAIL:-}" = "submission fate uncertain; charged state preserved for recovery" ] || FAIL_DETAIL="submission never landed (send/upload failure before the prompt reached ChatGPT); round refunded, safe to retry"
   fi
   # Attribute the failure when the review browser restarted mid-run — almost always memory pressure

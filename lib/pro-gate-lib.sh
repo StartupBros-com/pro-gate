@@ -817,10 +817,11 @@ pg_attempt_terminal_transition() { # host owner repo pr key marker epoch kind pr
       active_file="$(pg_active_dir)/$key"; [ -f "$active_file" ] && [ ! -L "$active_file" ] || return 1
       IFS=$'\t' read -r active_marker _ _ _ _ _ _ active_epoch < "$active_file" 2>/dev/null || return 1
       [ "$active_marker" = "$marker" ] && [ "$active_epoch" = "$epoch" ] || return 1
-      while IFS= read -r latest; do :; done < "$(pg_rounds_dir)/$key" 2>/dev/null
+      latest="$(tail -n 1 "$(pg_rounds_dir)/$key" 2>/dev/null)"
       [ "$latest" = "$epoch" ] || return 1
-      binding="$(pg_review_input_binding_read "$marker" 2>/dev/null || true)"; [ -n "$binding" ] || return 1
-      [ "$(jq -r .charged_spend_epoch <<<"$binding")" = "$epoch" ] || return 1
+      binding="$(pg_review_input_binding_read "$marker" 2>/dev/null || true)"
+      if [ "${REVIEW_DECISION_EXECUTE:-0}" = 1 ]; then [ -n "$binding" ] || return 1; fi
+      if [ -n "$binding" ]; then [ "$(jq -r .charged_spend_epoch <<<"$binding")" = "$epoch" ] || return 1; fi
     fi
     pg_attempt_disposition_write "$host" "$owner" "$repo" "$pr" "$key" "$marker" "$epoch" "$kind" "$proof" || return 1
     disposition="$(pg_attempt_disposition_read "$marker" 2>/dev/null || true)"; [ -n "$disposition" ] || return 1
