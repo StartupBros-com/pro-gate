@@ -386,6 +386,28 @@ async function tabText(tab) {
   return result.ok ? result.value ?? null : null;
 }
 
+async function tabTerminalInfrastructure(tab) {
+  const expression = `(() => {
+    /* pro-gate:terminal-infrastructure */
+    const accepted = new Set(${JSON.stringify([...TERMINAL_INFRA_LINES])});
+    const text = (node) => (node?.innerText || node?.textContent || '').trim();
+    const candidates = Array.from(document.querySelectorAll('[role="alert"], [data-testid*="error" i], [class*="error" i], p, div, span'));
+    for (const node of candidates) {
+      const value = text(node);
+      if (!accepted.has(value)) continue;
+      if (node.closest('[data-message-author-role="user"]')) continue;
+      let scope = node;
+      for (let depth = 0; scope && depth < 6; depth += 1, scope = scope.parentElement) {
+        const retry = Array.from(scope.querySelectorAll('button')).some((button) => /^(retry|try again|regenerate)$/i.test(text(button)));
+        if (retry) return value;
+      }
+    }
+    return null;
+  })()`;
+  const result = await evaluateTab(tab, expression);
+  return result.ok && TERMINAL_INFRA_LINES.has(result.value) ? result.value : null;
+}
+
 async function closeTab(id) {
   try { return (await fetch(`http://127.0.0.1:${port}/json/close/${id}`)).ok; } catch { return false; }
 }
@@ -1077,16 +1099,16 @@ const TERMINAL_INFRA_LINES = new Set([
   'Something went wrong while generating the response',
   'There was an error generating a response',
 ]);
-function terminalInfrastructureAfterPrompt(text) {
+function terminalInfrastructureAfterPrompt(text, structuredError = null) {
+  if (!TERMINAL_INFRA_LINES.has(structuredError)) return null;
   const markerAt = lastExactMarkerAt(text, marker);
   if (markerAt < 0) return null;
   const afterPrompt = text.slice(markerAt + marker.length);
   const lines = afterPrompt.split('\n').map((value) => value.trim()).filter(Boolean);
-  const lastLine = lines.at(-1) ?? null;
-  return TERMINAL_INFRA_LINES.has(lastLine) ? lastLine : null;
+  return lines.includes(structuredError) ? structuredError : null;
 }
 
-function classifyEvidence(text) {
+function classifyEvidence(text, structuredError = null) {
   if (!text || !text.trim()) return { kind: 'inconclusive', reason: 'empty-text' };
   if (isThrottlePage(text)) return { kind: 'throttle' };
   if (!hasExactMarker(text, marker)) {
@@ -1096,7 +1118,7 @@ function classifyEvidence(text) {
   }
   const foreignMarker = foreignAnswerMarker(text);
   if (foreignMarker) return { kind: 'cross-bound', foreignMarker };
-  const infrastructureError = terminalInfrastructureAfterPrompt(text);
+  const infrastructureError = terminalInfrastructureAfterPrompt(text, structuredError);
   if (infrastructureError && !extractReview(text)) {
     return { kind: 'terminal-infrastructure', reason: infrastructureError };
   }
@@ -1249,8 +1271,12 @@ while (Date.now() < deadline) {
   stillGeneratingUrl = null;
   lastMatchWasSeeded = false;
   const deadTabs = [];
-  const reads = await Promise.all(tabs.map(async (tab) => ({ tab, text: await tabText(tab) })));
-  for (const { tab, text } of reads) {
+  const reads = await Promise.all(tabs.map(async (tab) => ({
+    tab,
+    text: await tabText(tab),
+    infrastructureError: await tabTerminalInfrastructure(tab),
+  })));
+  for (const { tab, text, infrastructureError } of reads) {
     if (text === null || text.trim() === '') { deadTabs.push(tab); continue; }
     if (isThrottlePage(text)) tripThrottle(`tab ${tab.url}`);
     // v0.28 (gate #54 r2): honor the per-marker blacklist for OPEN tabs too, not only
@@ -1266,7 +1292,7 @@ while (Date.now() < deadline) {
       if (tab.url === knownUrl && FOREIGN_MARKER_RE.test(text)) memoStale = true;
       continue;
     }
-    const evidence = classifyEvidence(text);
+    const evidence = classifyEvidence(text, infrastructureError);
     if (evidence.kind === 'cross-bound') {
       rejectCrossBound(tab.url, evidence.foreignMarker, 'tab');
       continue;

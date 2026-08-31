@@ -161,7 +161,9 @@ server.on('upgrade', (req, socket) => {
     const text = textForTarget(targetId);
     const expression = request.params?.expression ?? '';
     let value = text;
-    if (expression.includes('pro-gate-organizer:rename')) {
+    if (expression.includes('pro-gate:terminal-infrastructure')) {
+      value = readState().infrastructureError ?? null;
+    } else if (expression.includes('pro-gate-organizer:rename')) {
       const state = readState();
       const expected = expectedTitleFromExpression(expression);
       if (state.renameResult) value = state.renameResult;

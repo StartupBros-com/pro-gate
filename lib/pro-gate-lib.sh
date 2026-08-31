@@ -709,6 +709,23 @@ pg_attempt_disposition_scan() { # one canonical disposition JSON object per line
   done
 }
 
+pg_attempt_disposition_sweep() { # delete only old dispositions whose cleanup is complete
+  local dir now round_secs ttl retain f marker json mt age
+  dir="$(pg_attempt_disposition_dir)"; [ -d "$dir" ] || return 0
+  now="$(date +%s)"; round_secs="$(pg_round_window_secs)"; ttl="${PRO_GATE_RESERVATION_TTL:-21600}"
+  case "$ttl" in ''|*[!0-9]*) ttl=21600;; esac
+  retain="$round_secs"; [ "$ttl" -gt "$retain" ] && retain="$ttl"
+  for f in "$dir"/pg-run-*; do
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    marker="${f##*/}"; json="$(pg_attempt_disposition_read "$marker" 2>/dev/null || true)"; [ -n "$json" ] || continue
+    pg_attempt_disposition_cleanup_pending "$json" && continue
+    mt="$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo "$now")"
+    case "$mt" in ''|*[!0-9]*) continue;; esac
+    age=$(( now - mt )); [ "$age" -ge "$retain" ] || continue
+    rm -f "$f" 2>/dev/null || true
+  done
+}
+
 pg_attempt_disposition_find() { # host owner repo pr -> newest exact disposition
   local host="$1" owner="$2" repo="$3" pr="$4" dir f marker json epoch best="" best_epoch="" LC_ALL=C
   pg_canonical_repo_ok "$host" "$owner" "$repo" || return 1
@@ -866,24 +883,50 @@ pg_attempt_artifact() { # marker -> kind<TAB>path for a validated canonical revi
 pg_attempt_snapshot() { # host owner repo pr round-key [exclude-marker] -> canonical JSON
   local host="$1" owner="$2" repo="$3" pr="$4" key="$5" exclude="${6:-}"
   local marker="" source=none state=none active_state=none epoch=0 out="" rec artifact="" artifact_kind="" artifact_path=""
-  local active_file reservation latest_unresolved disposition="" disposition_artifact="" cleanup=false terminal_json=null recoverable=false fresh=true
-  local disposition_marker="" disposition_epoch=0 competing_marker="" competing_epoch=0 ignore_disposition=false
+  local active_file reservation latest_unresolved latest_review="" latest_review_epoch=0 disposition="" disposition_artifact="" cleanup=false terminal_json=null recoverable=false fresh=true
+  local disposition_marker="" disposition_epoch=0 competing_marker="" competing_epoch=0 competing_pid="" competing_token="" ignore_disposition=false
   pg_have jq || return 1
   pg_canonical_repo_ok "$host" "$owner" "$repo" || return 1
   pr="$(pg_pr_number_normalize "$pr")" || return 1
   pg_round_key_ok "$key" || return 1
 
+  latest_review="$(pg_run_meta_find_latest "$host" "$owner" "$repo" "$pr" review 2>/dev/null || true)"
+  if [ -n "$latest_review" ]; then
+    rec="$(pg_run_meta_read "$latest_review" 2>/dev/null || true)"
+    [ -z "$rec" ] || IFS=$'\t' read -r _ _ _ _ _ _ latest_review_epoch <<<"$rec"
+    case "$latest_review_epoch" in ''|*[!0-9]*) latest_review_epoch=0;; esac
+  fi
   disposition="$(pg_attempt_disposition_find "$host" "$owner" "$repo" "$pr" 2>/dev/null || true)"
   if [ -n "$disposition" ]; then
     disposition_marker="$(jq -r .marker <<<"$disposition")"; disposition_epoch="$(jq -r .charged_spend_epoch <<<"$disposition")"
     active_file="$(pg_active_dir)/$key"
     if [ -f "$active_file" ] && [ ! -L "$active_file" ]; then
-      IFS=$'\t' read -r competing_marker _ _ _ _ _ _ competing_epoch < "$active_file" 2>/dev/null || true
-      if pg_reservation_marker_ok "$competing_marker" && [ "$competing_marker" != "$disposition_marker" ] && [ "$competing_marker" != "$exclude" ]; then ignore_disposition=true; fi
+      IFS=$'\t' read -r competing_marker _ competing_pid _ _ competing_token _ competing_epoch < "$active_file" 2>/dev/null || true
+      if pg_reservation_marker_ok "$competing_marker" && [ "$competing_marker" != "$disposition_marker" ] && [ "$competing_marker" != "$exclude" ]; then
+        case "$competing_epoch" in
+          ''|*[!0-9]*)
+            case "$competing_pid" in ''|*[!0-9]*) ;; *)
+              if kill -0 "$competing_pid" 2>/dev/null \
+                 && { [ -z "$competing_token" ] || [ "$(pg_pid_token "$competing_pid" 2>/dev/null || true)" = "$competing_token" ]; }; then ignore_disposition=true; fi
+              ;;
+            esac
+            ;;
+          *) if [ "$competing_epoch" -gt "$disposition_epoch" ] || { [ "$competing_epoch" = "$disposition_epoch" ] && [[ "$competing_marker" > "$disposition_marker" ]]; }; then ignore_disposition=true; fi;;
+        esac
+      fi
     fi
     if [ "$ignore_disposition" = false ]; then
       competing_marker="$(pg_reservation_find_pr "$key" 2>/dev/null || true)"
-      if pg_reservation_marker_ok "$competing_marker" && [ "$competing_marker" != "$disposition_marker" ] && [ "$competing_marker" != "$exclude" ]; then ignore_disposition=true; fi
+      if pg_reservation_marker_ok "$competing_marker" && [ "$competing_marker" != "$disposition_marker" ] && [ "$competing_marker" != "$exclude" ]; then
+        competing_epoch="$(pg_reservation_read_spend "$competing_marker" 2>/dev/null || pg_marker_epoch "$competing_marker" 2>/dev/null || true)"
+        case "$competing_epoch" in
+          ''|*[!0-9]*) ignore_disposition=true;;
+          *) if [ "$competing_epoch" -gt "$disposition_epoch" ] || { [ "$competing_epoch" = "$disposition_epoch" ] && [[ "$competing_marker" > "$disposition_marker" ]]; }; then ignore_disposition=true; fi;;
+        esac
+      fi
+    fi
+    if [ "$ignore_disposition" = false ] && [ -n "$latest_review" ] && [ "$latest_review" != "$disposition_marker" ]; then
+      if [ "$latest_review_epoch" -gt "$disposition_epoch" ] || { [ "$latest_review_epoch" = "$disposition_epoch" ] && [[ "$latest_review" > "$disposition_marker" ]]; }; then ignore_disposition=true; fi
     fi
     if [ "$ignore_disposition" = false ]; then
       competing_marker="$(pg_run_meta_find_latest "$host" "$owner" "$repo" "$pr" unresolved 2>/dev/null || true)"
@@ -940,6 +983,10 @@ pg_attempt_snapshot() { # host owner repo pr round-key [exclude-marker] -> canon
       rec="$(pg_run_meta_read "$marker" 2>/dev/null || true)"
       if [ -n "$rec" ]; then IFS=$'\t' read -r _ _ _ _ _ out epoch <<<"$rec"; fi
     fi
+  fi
+
+  if [ -z "$marker" ] && [ -n "$latest_review" ] && [ "$latest_review" != "$exclude" ]; then
+    marker="$latest_review"; epoch="$latest_review_epoch"; source=artifact; state=review-ready; recoverable=false; fresh=false
   fi
 
   if [ -n "$marker" ]; then
@@ -1098,7 +1145,7 @@ pg_reservation_remove() { # marker
 # the miss limit is reached (reservation removed) or "retained miss/limit" otherwise. Shared by
 # reconciliation and the harvest not-found path so both apply the same fail-closed policy.
 pg_reservation_note_miss() {
-  local marker="$1" dir f pr out created misses slot model spend miss_limit
+  local marker="$1" dir f pr out created misses slot model spend miss_limit ttl now age
   miss_limit="${PRO_GATE_RESERVATION_MISSES:-3}"
   case "$miss_limit" in ''|*[!0-9]*) miss_limit=3;; esac
   [ "$miss_limit" -ge 2 ] 2>/dev/null || miss_limit=2
@@ -1118,8 +1165,11 @@ pg_reservation_note_miss() {
   model="$(awk -F'\t' 'NR==1{print $6}' "$f" 2>/dev/null)"
   spend="$(awk -F'\t' 'NR==1{print $7}' "$f" 2>/dev/null)"
   case "$misses" in ''|*[!0-9]*) misses=0;; esac
+  case "$created" in ''|*[!0-9]*) created=0;; esac
+  ttl="${PRO_GATE_RESERVATION_TTL:-21600}"; case "$ttl" in ''|*[!0-9]*) ttl=21600;; esac
+  now="$(date +%s)"; age=$(( now - created )); [ "$age" -lt 0 ] && age=0
   misses=$(( misses + 1 ))
-  if [ "$misses" -ge "$miss_limit" ]; then
+  if [ "$misses" -ge "$miss_limit" ] && [ "$created" -gt 0 ] && [ "$age" -ge "$ttl" ]; then
     # The miss threshold is terminal only when durable run-meta can bind the proof to one charged
     # attempt. Publish disposition BEFORE releasing the reservation so no fresh caller sees a gap.
     if pg_attempt_terminal_from_meta "$marker" recovery-exhausted bounded-recovery-exhausted; then

@@ -506,7 +506,9 @@ pg_review_decision_cli() {
   attempt_source="$(jq -r .source <<<"$attempt_snapshot")"
   active_marker="$(jq -r '.marker // ""' <<<"$attempt_snapshot")"
   active_state="$(jq -r '.state // "none"' <<<"$attempt_snapshot")"
-  if [ "$attempt_source" = disposition ]; then
+  if [ "$attempt_source" = artifact ]; then
+    active_marker=""; active_state=none
+  elif [ "$attempt_source" = disposition ]; then
     if [ "$(jq -r .fresh_eligible <<<"$attempt_snapshot")" = true ]; then active_marker=""; active_state=none; else active_state=unknown-fate; fi
   fi
   reservation_marker=""; reservation_state=none
@@ -1691,7 +1693,9 @@ pg_fresh_dispatch_recheck() { # sets PG_FRESH_DECISION/PG_FRESH_ACTION
   active_marker="$(jq -r '.marker // ""' <<<"$attempt_snapshot")"
   astate="$(jq -r '.state // "none"' <<<"$attempt_snapshot")"
   reservation=""
-  if [ "$attempt_source" = disposition ]; then
+  if [ "$attempt_source" = artifact ]; then
+    active_marker=""; astate=none
+  elif [ "$attempt_source" = disposition ]; then
     if [ "$(jq -r .fresh_eligible <<<"$attempt_snapshot")" = true ]; then active_marker=""; astate=none; else astate=unknown-fate; fi
   elif [ "$attempt_source" = reservation ]; then
     reservation="$active_marker"; active_marker=""; astate=none
@@ -2851,12 +2855,8 @@ find "${PRO_GATE_HARVEST_LOCK_DIR:-$PRO_GATE_HOME/harvest-locks}" -maxdepth 1 -t
 find "$(pg_active_dir)" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
 find "$(pg_manifest_dir)" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
 # Terminal dispositions survive long enough to make cleanup idempotent across both existing
-# recovery clocks, then retire through ordinary housekeeping. No new retention knob or service.
-_DISP_RET_SECS="$(pg_round_window_secs)"; _DISP_TTL="${PRO_GATE_RESERVATION_TTL:-21600}"
-case "$_DISP_TTL" in ''|*[!0-9]*) _DISP_TTL=21600;; esac
-[ "$_DISP_TTL" -gt "$_DISP_RET_SECS" ] && _DISP_RET_SECS="$_DISP_TTL"
-_DISP_RET_MIN=$(( (_DISP_RET_SECS + 59) / 60 ))
-find "$(pg_attempt_disposition_dir)" -maxdepth 1 -type f -mmin "+${_DISP_RET_MIN}" -delete 2>/dev/null || true
+# recovery clocks. Cleanup-pending proof is never swept merely because it aged.
+pg_attempt_disposition_sweep
 # #50 item 4: conversation-urls memos get the same time-based hygiene as every other state
 # dir. 14 days dwarfs every recovery window (reservation TTL 6h; pending/ holds real bytes)
 # while still covering late manual recovery of a weeks-old run.

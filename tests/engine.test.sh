@@ -180,11 +180,14 @@ printf '%s\n' "$INFRA_EPOCH" > "$INFRA_HOME/rounds/$INFRA_KEY"
 printf 'github.com\tacme\tinfra\t%s\t97\t/tmp/infra.md\t%s\n' "$INFRA_KEY" "$INFRA_EPOCH" > "$INFRA_HOME/run-meta/$INFRA_MARKER"
 printf '%s\t/tmp/infra.md\t%s\t0\t\t\t%s\n' "$INFRA_KEY" "$(date +%s)" "$INFRA_EPOCH" > "$INFRA_HOME/in-progress/$INFRA_MARKER"
 printf 'run marker: %s\nA network error occurred\n' "$INFRA_MARKER" > "$TDIR/tab.txt"
+INFRA_STATE="$TDIR/infra-state.json"; printf '{"infrastructureError":"A network error occurred"}\n' > "$INFRA_STATE"
+start_mock "$TDIR/tab.txt" "$INFRA_STATE"
 PRO_GATE_HOME="$INFRA_HOME" PRO_GATE_RECONCILE_INTERVAL=0 bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_reconcile '$HERE/../bin/cdp-salvage.mjs' '$PORT'"
 check 'reservation probe terminalizes exact-owned infrastructure error' \
   "$([ ! -e "$INFRA_HOME/in-progress/$INFRA_MARKER" ] && [ ! -e "$INFRA_HOME/run-meta/$INFRA_MARKER" ] \
      && [ -s "$INFRA_HOME/rounds/$INFRA_KEY" ] && jq -e '.terminal_kind=="submitted-terminal"' "$INFRA_HOME/attempt-dispositions/$INFRA_MARKER" >/dev/null 2>&1; echo $?)" \
   "disposition=$(cat "$INFRA_HOME/attempt-dispositions/$INFRA_MARKER" 2>/dev/null)"
+start_mock "$TDIR/tab.txt" "$ORGANIZER_STATE"
 
 echo '# marker validation'
 run_engine --harvest 'pg-run-../../../etc/passwd' --out "$TDIR/o-trav.md" --timeout 5s
@@ -1920,6 +1923,17 @@ printf 'selfkey\t%s/o6.md\t%s\t0\t\t\t\n' "$THOME" "$(date +%s)" > "$THOME/in-pr
 check 'expire_if_stale keeps an unexpired reservation' \
   "$([ -z "$(PRO_GATE_HOME="$THOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_expire_if_stale '$FRESH_SELF'")" ] && [ -f "$THOME/in-progress/$FRESH_SELF" ]; echo $?)" \
   "$(ls "$THOME/in-progress" 2>/dev/null)"
+
+EARLY_HOME="$TDIR/home-recovery-too-early"; EARLY_KEY=acme-early-95
+EARLY_MARKER='pg-run-acme-early-95-1700000009-95'; EARLY_EPOCH=1700000009
+mkdir -p "$EARLY_HOME/in-progress" "$EARLY_HOME/run-meta" "$EARLY_HOME/rounds"
+printf '%s\n' "$EARLY_EPOCH" > "$EARLY_HOME/rounds/$EARLY_KEY"
+printf 'github.com\tacme\tearly\t%s\t95\t/tmp/early.md\t%s\n' "$EARLY_KEY" "$EARLY_EPOCH" > "$EARLY_HOME/run-meta/$EARLY_MARKER"
+printf '%s\t/tmp/early.md\t%s\t0\t\t\t%s\n' "$EARLY_KEY" "$(date +%s)" "$EARLY_EPOCH" > "$EARLY_HOME/in-progress/$EARLY_MARKER"
+for _ in 1 2 3; do EARLY_RESULT="$(PRO_GATE_HOME="$EARLY_HOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_note_miss '$EARLY_MARKER'")"; done
+check 'confirmed miss threshold before TTL remains recoverable' \
+  "$([ -f "$EARLY_HOME/in-progress/$EARLY_MARKER" ] && [ ! -e "$EARLY_HOME/attempt-dispositions/$EARLY_MARKER" ] && [ "$EARLY_RESULT" != released ]; echo $?)" \
+  "result=$EARLY_RESULT record=$(cat "$EARLY_HOME/in-progress/$EARLY_MARKER" 2>/dev/null)"
 
 EXHAUST_HOME="$TDIR/home-recovery-exhausted"; EXHAUST_KEY=acme-exhausted-96
 EXHAUST_MARKER='pg-run-acme-exhausted-96-1700000010-96'; EXHAUST_EPOCH=1700000010
@@ -4591,6 +4605,19 @@ check 'late valid review bytes outrank the terminal disposition' \
   "$FRESH_TERMINAL_LATE"
 
 fresh_reset_state
+FRESH_NEW_TERMINAL='pg-run-acme-fresh.git-77-1700014006-7'
+FRESH_STALE_ACTIVE='pg-run-acme-fresh.git-77-1700014004-5'
+FRESH_STALE_RESERVATION='pg-run-acme-fresh.git-77-1700014005-6'
+PRO_GATE_HOME="$FRESH_HOME" pg_attempt_disposition_write github.com acme fresh 77 "$FRESH_KEY" "$FRESH_NEW_TERMINAL" 1700014006 submitted-terminal exact-owned-infrastructure-terminal
+mkdir -p "$FRESH_HOME/active" "$FRESH_HOME/in-progress"
+printf '%s\t%s\t99999999\t%s\tremote-chrome\ttoken\tsubmitted\t1700014004\n' "$FRESH_STALE_ACTIVE" "$TDIR/stale-active.md" "$(date +%s)" > "$FRESH_HOME/active/$FRESH_KEY"
+printf '%s\t%s\t%s\t0\t\t\t1700014005\n' "$FRESH_KEY" "$TDIR/stale-reservation.md" "$(date +%s)" > "$FRESH_HOME/in-progress/$FRESH_STALE_RESERVATION"
+FRESH_STALE_SNAPSHOT="$(PRO_GATE_HOME="$FRESH_HOME" pg_attempt_snapshot github.com acme fresh 77 "$FRESH_KEY")"
+check 'older stale active and reservation sidecars cannot override newer terminal disposition' \
+  "$(jq -e --arg marker "$FRESH_NEW_TERMINAL" '.marker==$marker and .source=="disposition" and .state=="submitted-terminal" and .fresh_eligible' <<<"$FRESH_STALE_SNAPSHOT" >/dev/null 2>&1; echo $?)" \
+  "$FRESH_STALE_SNAPSHOT"
+
+fresh_reset_state
 FRESH_OLD_TERMINAL='pg-run-acme-fresh.git-77-1700014005-6'
 FRESH_NEW_ACTIVE='pg-run-acme-fresh.git-77-1700014006-7'
 PRO_GATE_HOME="$FRESH_HOME" pg_attempt_disposition_write github.com acme fresh 77 "$FRESH_KEY" "$FRESH_OLD_TERMINAL" 1700014005 submitted-terminal exact-owned-infrastructure-terminal
@@ -4601,6 +4628,30 @@ FRESH_NEW_ACTIVE_SNAPSHOT="$(PRO_GATE_HOME="$FRESH_HOME" pg_attempt_snapshot git
 check 'older terminal disposition never hides a distinct newer active attempt' \
   "$(jq -e --arg marker "$FRESH_NEW_ACTIVE" '.marker==$marker and .source=="active" and .state=="submitted" and .recoverable and (.fresh_eligible|not)' <<<"$FRESH_NEW_ACTIVE_SNAPSHOT" >/dev/null 2>&1; echo $?)" \
   "$FRESH_NEW_ACTIVE_SNAPSHOT"
+
+fresh_reset_state
+FRESH_OLD_TERMINAL='pg-run-acme-fresh.git-77-1700014005-6'
+FRESH_NEW_REVIEW='pg-run-acme-fresh.git-77-1700014007-8'
+PRO_GATE_HOME="$FRESH_HOME" pg_attempt_disposition_write github.com acme fresh 77 "$FRESH_KEY" "$FRESH_OLD_TERMINAL" 1700014005 submitted-terminal exact-owned-infrastructure-terminal
+mkdir -p "$FRESH_HOME/run-meta" "$FRESH_HOME/completed"
+printf 'github.com\tacme\tfresh\t%s\t77\t%s\t1700014007\n' "$FRESH_KEY" "$TDIR/new-review.md" > "$FRESH_HOME/run-meta/$FRESH_NEW_REVIEW"
+printf 'P0: none\nP1: none\nP2: none\nP3: none\nVERDICT: SHIP - newer durable artifact.\n' > "$FRESH_HOME/completed/$FRESH_NEW_REVIEW"
+FRESH_NEW_REVIEW_SNAPSHOT="$(PRO_GATE_HOME="$FRESH_HOME" pg_attempt_snapshot github.com acme fresh 77 "$FRESH_KEY")"
+check 'newer valid review artifact outranks an older different-marker disposition' \
+  "$(jq -e --arg marker "$FRESH_NEW_REVIEW" '.marker==$marker and .source=="artifact" and .state=="review-ready" and .artifact.kind=="completed" and (.fresh_eligible|not)' <<<"$FRESH_NEW_REVIEW_SNAPSHOT" >/dev/null 2>&1; echo $?)" \
+  "$FRESH_NEW_REVIEW_SNAPSHOT"
+
+SWEEP_HOME="$TDIR/home-disposition-sweep"; SWEEP_KEY=acme-sweep-78
+SWEEP_CLEAN='pg-run-acme-sweep-78-1700014010-1'; SWEEP_PENDING='pg-run-acme-sweep-78-1700014011-2'
+mkdir -p "$SWEEP_HOME/run-meta"
+PRO_GATE_HOME="$SWEEP_HOME" pg_attempt_disposition_write github.com acme sweep 78 "$SWEEP_KEY" "$SWEEP_CLEAN" 1700014010 submitted-terminal exact-owned-infrastructure-terminal
+PRO_GATE_HOME="$SWEEP_HOME" pg_attempt_disposition_write github.com acme sweep 78 "$SWEEP_KEY" "$SWEEP_PENDING" 1700014011 recovery-exhausted bounded-recovery-exhausted
+printf 'github.com\tacme\tsweep\t%s\t78\t%s\t1700014011\n' "$SWEEP_KEY" "$TDIR/sweep-pending.md" > "$SWEEP_HOME/run-meta/$SWEEP_PENDING"
+touch -t 202001010000 "$SWEEP_HOME/attempt-dispositions/$SWEEP_CLEAN" "$SWEEP_HOME/attempt-dispositions/$SWEEP_PENDING"
+PRO_GATE_HOME="$SWEEP_HOME" PRO_GATE_ROUNDS_WINDOW=1m PRO_GATE_RESERVATION_TTL=60 pg_attempt_disposition_sweep
+check 'disposition sweep deletes old clean proof but retains cleanup-pending proof' \
+  "$([ ! -e "$SWEEP_HOME/attempt-dispositions/$SWEEP_CLEAN" ] && [ -s "$SWEEP_HOME/attempt-dispositions/$SWEEP_PENDING" ]; echo $?)" \
+  "remaining=$(find "$SWEEP_HOME/attempt-dispositions" -type f -printf '%f ' 2>/dev/null)"
 
 # A repository-qualified PR URL owns canonical recovery identity even when the checkout belongs to
 # a fork with the same PR number. Both public query and effect freshness must select upstream work.
