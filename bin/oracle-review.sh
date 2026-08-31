@@ -313,7 +313,7 @@ pg_review_decision_cli() {
   local input_marker="" input_record="" input_digest="" f marker candidate candidate_relation desired_relation exact=false active_marker="" active_state=none
   local endpoint reviewed manifest confirmation endpoint_digest reviewed_digest manifest_digest confirmation_digest lineage mode ship_digest
   local reservation_marker="" reservation_state=none governor_granted=false completed='[]' prior_candidates='[]' prior_review result artifact artifact_digest canonical
-  local facts decision effect_ok=false prospective exact_inputs='[]' choice_candidates='[]' choice_outcomes='[]' choice_selected="" choice_snapshot="" selection="" selection_supplied=false current_verdict=NONE current_canonical="" effect_input
+  local facts decision effect_ok=false prospective exact_inputs='[]' choice_candidates='[]' choice_outcomes='[]' choice_selected="" choice_snapshot="" selection="" selection_supplied=false current_verdict=NONE current_canonical="" effect_input attempt_snapshot
 
   pg_have jq || { echo 'ERROR: review-decision/v1 requires jq' >&2; return 2; }
   repo="${REPO:-$(pwd)}"
@@ -499,19 +499,16 @@ pg_review_decision_cli() {
     {code_identity:"",evidence_identity:"",marker:"",verdict:"NONE"} |
     {applicable:false,binding_valid:(.marker != ""),code_identity,evidence_identity,legacy:false,marker,provenance_valid:(.marker != ""),verdict}' <<<"$prior_candidates")"
 
-  # Active index, reservation, and charged run-meta authority are read directly without
-  # reconciliation. Querying stale work is conservative (recover), while reconciliation itself is
-  # an effect and forbidden. The shared run-meta selector is also used at guarded dispatch
-  # boundaries: a public recovery effect must not oscillate back to a fresh grant.
-  if [ -f "$PRO_GATE_HOME/active/$round_key" ] && [ ! -L "$PRO_GATE_HOME/active/$round_key" ]; then
-    IFS=$'\t' read -r active_marker _ _ _ _ _ < "$PRO_GATE_HOME/active/$round_key" 2>/dev/null || true
-    if pg_reservation_marker_ok "$active_marker"; then active_state=live; else active_marker=""; fi
-  fi
-  reservation_marker="$(pg_reservation_find_pr "$round_key" 2>/dev/null || true)"
-  if pg_reservation_marker_ok "$reservation_marker"; then reservation_state=live; else reservation_marker=""; fi
-  if [ -z "$active_marker" ]; then
-    active_marker="$(pg_run_meta_find_unresolved "$host" "$owner" "$repo_name" "$pr_num" 2>/dev/null || true)"
-    [ -z "$active_marker" ] || active_state=unknown-fate
+  # Lifecycle ownership comes from one canonical snapshot. Querying stale mutable state remains
+  # conservative (recover); reconciliation stays an effect and cannot happen in this read-only path.
+  attempt_snapshot="$(pg_attempt_snapshot "$host" "$owner" "$repo_name" "$pr_num" "$round_key" 2>/dev/null || true)"
+  [ -n "$attempt_snapshot" ] || { echo 'ERROR: review-decision could not assemble attempt lifecycle' >&2; return 2; }
+  active_marker="$(jq -r '.marker // ""' <<<"$attempt_snapshot")"
+  active_state="$(jq -r '.state // "none"' <<<"$attempt_snapshot")"
+  reservation_marker=""; reservation_state=none
+  if [ "$(jq -r .source <<<"$attempt_snapshot")" = reservation ]; then
+    reservation_marker="$active_marker"; reservation_state=live
+    active_marker=""; active_state=none
   fi
   if pg_round_guard "$round_key" >/dev/null 2>&1; then governor_granted=true; fi
 
@@ -1491,7 +1488,6 @@ MODEL_WARN=""     # U5: advisory downgrade marker (weak/unconfirmable model); ne
 # neither a reservation nor a ledger row exists yet: --status reads this instead of concluding
 # "no state" and inviting a duplicate spend (gate #53 P1; a dead wrapper also releases the
 # per-change flock, so the lock probe alone cannot see that case).
-pg_active_dir() { echo "$PRO_GATE_HOME/active"; }
 PG_ACTIVE_WRITTEN=0
 pg_active_write() { # [state] [charged epoch]
   local state="${1:-live}" charged_epoch="${2:-0}"
@@ -1548,7 +1544,7 @@ pg_install_full_pr_input_binding() { # marker; only endpoint-fetched full PRs ga
 # dispatch boundaries. It deliberately uses the U1 reducer and existing active/reservation/round
 # authorities; it neither creates an action token nor a second ledger or lock.
 pg_fresh_dispatch_recheck() { # sets PG_FRESH_DECISION/PG_FRESH_ACTION
-  local template="$REVIEW_DECISION_INPUT_TEMPLATE" marker="" state=none epoch=0 f rec m astate="" completed='[]'
+  local template="$REVIEW_DECISION_INPUT_TEMPLATE" marker="" state=none epoch=0 f rec m astate="" completed='[]' attempt_snapshot attempt_source
   local input_ok=false input_digest evidence identity head base active_marker="" reservation="" granted=false facts
   local template_relation="" candidate="" candidate_relation="" artifact="" artifact_digest=""
   [ -n "$template" ] || return 1
@@ -1590,21 +1586,14 @@ pg_fresh_dispatch_recheck() { # sets PG_FRESH_DECISION/PG_FRESH_ACTION
         '. + [{applicable:true,artifact_digest:$digest,binding_valid:false,canonical_identity:$marker,charged_spend_epoch:$charged,collected:false,legacy:false,marker:$marker,provenance_valid:false,verdict:"NONE"}]' <<<"$completed")"
     done < <(find "$(pg_review_input_binding_dir)" -mindepth 1 -maxdepth 1 -type f -name "pg-run-$ROUND_KEY-*" -printf '%f\n' 2>/dev/null | LC_ALL=C sort)
   fi
-  if [ -f "$(pg_active_dir)/$ROUND_KEY" ] && [ ! -L "$(pg_active_dir)/$ROUND_KEY" ]; then
-    IFS=$'\t' read -r marker _ _ _ _ _ astate epoch < "$(pg_active_dir)/$ROUND_KEY" 2>/dev/null || true
-    if pg_reservation_marker_ok "$marker" && [ "$marker" != "${RUN_MARKER:-}" ]; then
-      case "$astate" in pre-charge|round-recorded|charged|run-meta-written|input-bound|submitted|unknown-fate|live) ;; *) astate=unknown-fate;; esac
-      active_marker="$marker"
-    fi
-  fi
-  reservation="$(pg_reservation_find_pr "$ROUND_KEY" 2>/dev/null || true)"
-  if ! pg_reservation_marker_ok "$reservation"; then reservation=""; fi
-  # Run-meta-only lifecycle is assembled by the same read-only selector as the public decision
-  # query. It skips only exact-marker terminal review bytes and keeps scanning for another
-  # unresolved charge, so recovery remains fail-closed without diverging across dispatch layers.
-  if [ -z "$active_marker" ]; then
-    active_marker="$(pg_run_meta_find_unresolved "$PG_META_HOST" "$PG_META_OWNER" "$PG_META_REPO" "$PR_NUM" 2>/dev/null || true)"
-    [ -z "$active_marker" ] || astate=unknown-fate
+  attempt_snapshot="$(pg_attempt_snapshot "$PG_META_HOST" "$PG_META_OWNER" "$PG_META_REPO" "$PR_NUM" "$ROUND_KEY" "${RUN_MARKER:-}" 2>/dev/null || true)"
+  [ -n "$attempt_snapshot" ] || return 1
+  attempt_source="$(jq -r .source <<<"$attempt_snapshot")"
+  active_marker="$(jq -r '.marker // ""' <<<"$attempt_snapshot")"
+  astate="$(jq -r '.state // "none"' <<<"$attempt_snapshot")"
+  reservation=""
+  if [ "$attempt_source" = reservation ]; then
+    reservation="$active_marker"; active_marker=""; astate=none
   fi
   pg_round_guard "$ROUND_KEY" >/dev/null 2>&1 && granted=true
   facts="$(jq -cnS --arg h "$PG_META_HOST" --arg o "$PG_META_OWNER" --arg r "$PG_META_REPO" --arg head "$head" --argjson p "$PR_NUM" \

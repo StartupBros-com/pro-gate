@@ -493,6 +493,7 @@ pg_reservation_marker_ok() {
 # Recovery identity must retain the canonical host/owner/repo triple. ROUND_KEY's historic
 # owner-repo slug is deliberately NOT reversible: a-b/c and a/b-c both become a-b-c.
 pg_run_meta_dir() { echo "${PRO_GATE_RUN_META_DIR:-$PRO_GATE_HOME/run-meta}"; }
+pg_active_dir() { echo "${PRO_GATE_ACTIVE_DIR:-$PRO_GATE_HOME/active}"; }
 pg_canonical_repo_ok() { # host owner repo
   local host="${1:-}" owner="${2:-}" repo="${3:-}"
   case "$host" in ''|*[!A-Za-z0-9.-]*) return 1;; esac
@@ -607,21 +608,17 @@ pg_run_meta_has_terminal_review() { # marker
   [ -f "$artifact" ] && [ ! -L "$artifact" ] && pg_is_review "$artifact"
 }
 
-pg_run_meta_find_unresolved() { # host owner repo pr -> newest exact unresolved marker
-  local want_host="$1" want_owner="$2" want_repo="$3" want_pr="$4"
-  local marker host owner repo key pr out spend best_marker="" best_spend="" LC_ALL=C
+pg_run_meta_find_latest() { # host owner repo pr terminal-filter -> newest exact marker
+  local want_host="$1" want_owner="$2" want_repo="$3" want_pr="$4" filter="${5:-any}"
+  local marker host owner repo key pr out spend best_marker="" best_spend="" terminal LC_ALL=C
   pg_canonical_repo_ok "$want_host" "$want_owner" "$want_repo" || return 1
   want_pr="$(pg_pr_number_normalize "$want_pr")" || return 1
+  case "$filter" in any|review|unresolved) ;; *) return 1;; esac
   while IFS=$'\t' read -r marker host owner repo key pr out spend; do
-    # Canonical identity, not the lossy filename key, owns this match. Historical keys can retain
-    # a remote's trailing .git while pg_repo_identity_from_url normalizes it away; requiring both
-    # aliases would make the public query miss work the engine already knows is the same PR.
     [ "$host" = "$want_host" ] && [ "$owner" = "$want_owner" ] && [ "$repo" = "$want_repo" ] \
       && [ "$pr" = "$want_pr" ] || continue
-    pg_run_meta_has_terminal_review "$marker" && continue
-    # Prefer the authoritative charge epoch, not marker mint/glob order. Exact-marker recovery is
-    # safe when two charges share one-second precision; break that tie canonically so every query
-    # and effect chooses the same marker without authorizing another spend.
+    terminal=false; pg_run_meta_has_terminal_review "$marker" && terminal=true
+    case "$filter:$terminal" in review:false|unresolved:true) continue;; esac
     if [ -z "$best_spend" ] || [ "$spend" -gt "$best_spend" ] \
       || { [ "$spend" = "$best_spend" ] && [[ "$marker" > "$best_marker" ]]; }; then
       best_marker="$marker"; best_spend="$spend"
@@ -629,6 +626,84 @@ pg_run_meta_find_unresolved() { # host owner repo pr -> newest exact unresolved 
   done < <(pg_run_meta_scan)
   [ -n "$best_marker" ] || return 1
   printf '%s\n' "$best_marker"
+}
+
+pg_run_meta_find_unresolved() { pg_run_meta_find_latest "$1" "$2" "$3" "$4" unresolved; }
+
+pg_attempt_artifact() { # marker -> kind<TAB>path for a validated canonical review
+  local marker="$1" path
+  pg_reservation_marker_ok "$marker" || return 1
+  path="$(pg_completed_dir)/$marker"
+  if [ -f "$path" ] && [ ! -L "$path" ] && pg_is_review "$path"; then
+    printf 'completed\t%s\n' "$path"; return 0
+  fi
+  path="$PRO_GATE_HOME/pending/$marker"
+  if [ -f "$path" ] && [ ! -L "$path" ] && pg_is_review "$path"; then
+    printf 'pending\t%s\n' "$path"; return 0
+  fi
+  return 1
+}
+
+# Canonical read-only attempt ownership for one PR. Every caller gets the same precedence and
+# marker rather than independently interpreting active, reservation, run-meta, and artifacts.
+# A later terminal-disposition layer augments this snapshot without changing its interface.
+pg_attempt_snapshot() { # host owner repo pr round-key [exclude-marker] -> canonical JSON
+  local host="$1" owner="$2" repo="$3" pr="$4" key="$5" exclude="${6:-}"
+  local marker="" source=none state=none active_state=none epoch=0 out="" rec artifact="" artifact_kind="" artifact_path=""
+  local active_file reservation latest_unresolved recoverable=false fresh=true
+  pg_have jq || return 1
+  pg_canonical_repo_ok "$host" "$owner" "$repo" || return 1
+  pr="$(pg_pr_number_normalize "$pr")" || return 1
+  pg_round_key_ok "$key" || return 1
+
+  if [ -z "$marker" ]; then
+    active_file="$(pg_active_dir)/$key"
+    if [ -f "$active_file" ] && [ ! -L "$active_file" ]; then
+      IFS=$'\t' read -r marker out _ _ _ _ active_state epoch < "$active_file" 2>/dev/null || true
+      if ! pg_reservation_marker_ok "$marker" || [ "$marker" = "$exclude" ]; then marker=""; fi
+      if [ -n "$marker" ]; then
+        case "$active_state" in pre-charge|round-recorded|charged|run-meta-written|input-bound|submitted|unknown-fate|live) ;; *) active_state=unknown-fate;; esac
+        source=active; state="$active_state"; recoverable=true; fresh=false
+      fi
+    fi
+  fi
+
+  if [ -z "$marker" ]; then
+    reservation="$(pg_reservation_find_pr "$key" 2>/dev/null || true)"
+    if pg_reservation_marker_ok "$reservation" && [ "$reservation" != "$exclude" ]; then
+      marker="$reservation"; source=reservation; state=recoverable; recoverable=true; fresh=false
+      rec="$(pg_run_meta_read "$marker" 2>/dev/null || true)"
+      if [ -n "$rec" ]; then IFS=$'\t' read -r _ _ _ _ _ out epoch <<<"$rec"; fi
+    fi
+  fi
+
+  if [ -z "$marker" ]; then
+    latest_unresolved="$(pg_run_meta_find_latest "$host" "$owner" "$repo" "$pr" unresolved 2>/dev/null || true)"
+    if [ -n "$latest_unresolved" ] && [ "$latest_unresolved" != "$exclude" ]; then
+      marker="$latest_unresolved"; source=run-meta; state=unknown-fate; recoverable=true; fresh=false
+      rec="$(pg_run_meta_read "$marker" 2>/dev/null || true)"
+      if [ -n "$rec" ]; then IFS=$'\t' read -r _ _ _ _ _ out epoch <<<"$rec"; fi
+    fi
+  fi
+
+  if [ -n "$marker" ]; then
+    artifact="$(pg_attempt_artifact "$marker" 2>/dev/null || true)"
+    if [ -n "$artifact" ]; then
+      IFS=$'\t' read -r artifact_kind artifact_path <<<"$artifact"
+      source=artifact; state=review-ready; recoverable=false; fresh=false
+    fi
+    if [ "$epoch" = 0 ] || [ -z "$epoch" ]; then
+      rec="$(pg_run_meta_read "$marker" 2>/dev/null || true)"
+      if [ -n "$rec" ]; then IFS=$'\t' read -r _ _ _ _ _ out epoch <<<"$rec"; fi
+    fi
+  fi
+  case "$epoch" in ''|*[!0-9]*) epoch=0;; esac
+
+  jq -cnS --arg host "$host" --arg owner "$owner" --arg repo "$repo" --argjson pr "$pr" \
+    --arg key "$key" --arg marker "$marker" --arg source "$source" --arg state "$state" \
+    --arg out "$out" --arg kind "$artifact_kind" --arg path "$artifact_path" --argjson epoch "$epoch" \
+    --argjson recoverable "$recoverable" --argjson fresh "$fresh" \
+    '{artifact:{kind:$kind,path:$path},charged_spend_epoch:$epoch,cleanup_pending:false,fresh_eligible:$fresh,marker:$marker,out:$out,recoverable:$recoverable,source:$source,state:$state,target:{host:$host,owner:$owner,pr:$pr,repo:$repo,round_key:$key},terminal:null}'
 }
 
 # Shared guard for reservation writes/removes AND the fresh-run count+slot-acquire decision.

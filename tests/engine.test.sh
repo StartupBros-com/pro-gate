@@ -4437,6 +4437,10 @@ fresh_effect "$TDIR/fresh-recovery.json" "$TDIR/fresh-recovery.md"
 check 'run-meta-only recovery effect stays stable without Oracle dispatch or another spend' \
   "$([ "$FRESH_RC" -eq 0 ] && [ ! -s "$TDIR/fresh-oracle.calls" ] && [ "$(wc -l < "$FRESH_HOME/rounds/$FRESH_KEY")" -eq 1 ] && jq -e --arg marker "$FRESH_UNKNOWN_MARKER" '.action=="recover-existing-review" and .effect_request.applicable_ref==$marker' "$TDIR/fresh.stdout" >/dev/null 2>&1; echo $?)" \
   "rc=$FRESH_RC rounds=$(wc -l < "$FRESH_HOME/rounds/$FRESH_KEY") stdout=$(cat "$TDIR/fresh.stdout") stderr=$(cat "$TDIR/fresh.stderr")"
+FRESH_SNAPSHOT="$(PRO_GATE_HOME="$FRESH_HOME" pg_attempt_snapshot github.com acme fresh 77 "$FRESH_KEY")"
+check 'attempt snapshot reports the same run-meta-only recovery marker and charge' \
+  "$(jq -e --arg marker "$FRESH_UNKNOWN_MARKER" '.marker==$marker and .state=="unknown-fate" and .source=="run-meta" and .recoverable and (.fresh_eligible|not) and .charged_spend_epoch==1700014003' <<<"$FRESH_SNAPSHOT" >/dev/null 2>&1; echo $?)" \
+  "$FRESH_SNAPSHOT"
 FRESH_LEADING_ZERO="$(fresh_query 077)"
 check 'leading-zero PR spelling normalizes to the same run-meta recovery identity' \
   "$(jq -e --arg marker "$FRESH_UNKNOWN_MARKER" '.action=="recover-existing-review" and .effect_request.target.pr==77 and .effect_request.applicable_ref==$marker' <<<"$FRESH_LEADING_ZERO" >/dev/null 2>&1; echo $?)" \
