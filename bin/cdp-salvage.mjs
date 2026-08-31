@@ -56,7 +56,7 @@
 //                matching the marker EXISTS (no VERDICT wait). Used by the
 //                engine's no-think watchdog to distinguish "dead submission,
 //                safe to retry" from "live run, retry would double-spend".
-//                Also prints `probe-state: complete|generating` on stderr so the
+//                Also prints `probe-state: complete|generating|terminal-infrastructure` on stderr so the
 //                reservation reconciler can release the account slot of a review
 //                that has finished but has not been collected yet (#82). This is
 //                an additive LINE, never a new exit code: callers above key on
@@ -73,7 +73,9 @@
 //           feeds the engine's consecutive-miss counter toward "conversation gone"; 7 is absence
 //           of evidence and must never be counted as a miss. A successful TAB listing says
 //           nothing about SERVER-SIDE state, so it alone cannot promote 7 to 4 — only decisive
-//           evidence that the remembered conversation is another run's does that.
+//           evidence that the remembered conversation is another run's does that;
+//       10 = exact-owned terminal ChatGPT infrastructure error after this run's prompt. No review
+//            exists to harvest; the caller keeps the charge but releases recovery ownership.
 // Requires Node >= 21 (global WebSocket); the box runs Node 24.
 
 import fs from 'node:fs';
@@ -384,6 +386,28 @@ async function tabText(tab) {
   return result.ok ? result.value ?? null : null;
 }
 
+async function tabTerminalInfrastructure(tab) {
+  const expression = `(() => {
+    /* pro-gate:terminal-infrastructure */
+    const accepted = new Set(${JSON.stringify([...TERMINAL_INFRA_LINES])});
+    const text = (node) => (node?.innerText || node?.textContent || '').trim();
+    const candidates = Array.from(document.querySelectorAll('[role="alert"], [data-testid*="error" i], [class*="error" i], p, div, span'));
+    for (const node of candidates) {
+      const value = text(node);
+      if (!accepted.has(value)) continue;
+      if (node.closest('[data-message-author-role="user"]')) continue;
+      let scope = node;
+      for (let depth = 0; scope && depth < 6; depth += 1, scope = scope.parentElement) {
+        const retry = Array.from(scope.querySelectorAll('button')).some((button) => /^(retry|try again|regenerate)$/i.test(text(button)));
+        if (retry) return value;
+      }
+    }
+    return null;
+  })()`;
+  const result = await evaluateTab(tab, expression);
+  return result.ok && TERMINAL_INFRA_LINES.has(result.value) ? result.value : null;
+}
+
 async function closeTab(id) {
   try { return (await fetch(`http://127.0.0.1:${port}/json/close/${id}`)).ok; } catch { return false; }
 }
@@ -599,7 +623,7 @@ async function freshRenderText(url, port, outerDeadline, waitForDecisiveEvidence
         // only scratch navigation on the prompt marker ChatGPT hydrates before the answer. Reuse
         // the shared classifier: marker-only text remains owned-incomplete through the deadline.
         evidence = classifyEvidence(sample);
-        if (['terminal', 'foreign', 'cross-bound', 'throttle'].includes(evidence.kind)) {
+        if (['terminal', 'terminal-infrastructure', 'foreign', 'cross-bound', 'throttle'].includes(evidence.kind)) {
           return { text, reason: `${evidence.kind}-evidence`, evidence };
         }
       } else {
@@ -1070,7 +1094,21 @@ if (organize) {
 // scratch renders) enter here before a caller maps the result to an exit code. In particular,
 // probe cannot call a terminal answer "complete" from an old or nonce-less verdict: only a
 // verdict after this run's latest prompt marker that repeats the marker releases capacity.
-function classifyEvidence(text) {
+const TERMINAL_INFRA_LINES = new Set([
+  'A network error occurred',
+  'Something went wrong while generating the response',
+  'There was an error generating a response',
+]);
+function terminalInfrastructureAfterPrompt(text, structuredError = null) {
+  if (!TERMINAL_INFRA_LINES.has(structuredError)) return null;
+  const markerAt = lastExactMarkerAt(text, marker);
+  if (markerAt < 0) return null;
+  const afterPrompt = text.slice(markerAt + marker.length);
+  const lines = afterPrompt.split('\n').map((value) => value.trim()).filter(Boolean);
+  return lines.includes(structuredError) ? structuredError : null;
+}
+
+function classifyEvidence(text, structuredError = null) {
   if (!text || !text.trim()) return { kind: 'inconclusive', reason: 'empty-text' };
   if (isThrottlePage(text)) return { kind: 'throttle' };
   if (!hasExactMarker(text, marker)) {
@@ -1080,6 +1118,10 @@ function classifyEvidence(text) {
   }
   const foreignMarker = foreignAnswerMarker(text);
   if (foreignMarker) return { kind: 'cross-bound', foreignMarker };
+  const infrastructureError = terminalInfrastructureAfterPrompt(text, structuredError);
+  if (infrastructureError && !extractReview(text)) {
+    return { kind: 'terminal-infrastructure', reason: infrastructureError };
+  }
   const review = extractReview(text);
   if (!review) return { kind: 'owned-incomplete' };
   const verdict = terminalVerdict(text);
@@ -1114,7 +1156,7 @@ function classifyEvidence(text) {
 // cross-bound answer. The caller supplies the classification so readable incomplete sources can
 // defer promotion until their canonical scratch revalidation resolves the ambiguity.
 function onOurConversation(url, evidence) {
-  if (!['owned-incomplete', 'terminal'].includes(evidence.kind)) return evidence;
+  if (!['owned-incomplete', 'terminal', 'terminal-infrastructure'].includes(evidence.kind)) return evidence;
   ourUrls.add(url);
   // Positive ownership: the run is demonstrably NOT terminally cross-bound, whatever other
   // candidates this scan rejected (#68 gate r2/r3 P2). Decided at exit, so tab order is
@@ -1140,8 +1182,15 @@ function emitEvidence(url, evidence) {
     console.error(`live conversation: ${url}`);
     // rc 0 proves the conversation exists. Completeness is intentionally stricter than harvest
     // extraction: the terminal verdict must answer the latest exact prompt and echo this marker.
-    console.error(`probe-state: ${evidence.kind === 'terminal' && evidence.probeComplete ? 'complete' : 'generating'}`);
+    const probeState = evidence.kind === 'terminal-infrastructure'
+      ? 'terminal-infrastructure'
+      : evidence.kind === 'terminal' && evidence.probeComplete ? 'complete' : 'generating';
+    console.error(`probe-state: ${probeState}`);
     process.exit(0);
+  }
+  if (evidence.kind === 'terminal-infrastructure') {
+    console.error(`terminal-infrastructure: ${evidence.reason}`);
+    process.exit(10);
   }
   if (evidence.kind === 'terminal') {
     // v0.28 (gate #54 r5): name the EXACT source of this capture so the engine can blacklist
@@ -1222,8 +1271,12 @@ while (Date.now() < deadline) {
   stillGeneratingUrl = null;
   lastMatchWasSeeded = false;
   const deadTabs = [];
-  const reads = await Promise.all(tabs.map(async (tab) => ({ tab, text: await tabText(tab) })));
-  for (const { tab, text } of reads) {
+  const reads = await Promise.all(tabs.map(async (tab) => ({
+    tab,
+    text: await tabText(tab),
+    infrastructureError: await tabTerminalInfrastructure(tab),
+  })));
+  for (const { tab, text, infrastructureError } of reads) {
     if (text === null || text.trim() === '') { deadTabs.push(tab); continue; }
     if (isThrottlePage(text)) tripThrottle(`tab ${tab.url}`);
     // v0.28 (gate #54 r2): honor the per-marker blacklist for OPEN tabs too, not only
@@ -1239,12 +1292,12 @@ while (Date.now() < deadline) {
       if (tab.url === knownUrl && FOREIGN_MARKER_RE.test(text)) memoStale = true;
       continue;
     }
-    const evidence = classifyEvidence(text);
+    const evidence = classifyEvidence(text, infrastructureError);
     if (evidence.kind === 'cross-bound') {
       rejectCrossBound(tab.url, evidence.foreignMarker, 'tab');
       continue;
     }
-    if (evidence.kind === 'terminal') {
+    if (evidence.kind === 'terminal' || evidence.kind === 'terminal-infrastructure') {
       onOurConversation(tab.url, evidence);
       emitEvidence(tab.url, evidence);
     }
@@ -1297,7 +1350,7 @@ while (Date.now() < deadline) {
       }
       continue;
     }
-    if (fresh?.kind === 'terminal') {
+    if (fresh?.kind === 'terminal' || fresh?.kind === 'terminal-infrastructure') {
       onOurConversation(revalidateUrl, fresh);
       emitEvidence(revalidateUrl, fresh);
     }
@@ -1355,7 +1408,7 @@ while (Date.now() < deadline) {
       rejectCrossBound(tab.url, evidence.foreignMarker, 're-rendered');
       continue;
     }
-    if (evidence.kind === 'terminal') emitEvidence(tab.url, evidence);
+    if (evidence.kind === 'terminal' || evidence.kind === 'terminal-infrastructure') emitEvidence(tab.url, evidence);
     if (evidence.kind !== 'owned-incomplete') continue;
     stillGeneratingUrl = tab.url;
     lastMatchWasSeeded = false;
@@ -1389,9 +1442,9 @@ while (Date.now() < deadline) {
         // The memo itself is cross-bound. Evict it with claim-and-verify, but preserve a
         // concurrently republished survivor as the only possible genuine recovery handle.
         rejectCrossBound(seedUrl, evidence.foreignMarker, 'remembered conversation');
-      } else if (evidence.kind === 'terminal' || evidence.kind === 'owned-incomplete') {
+      } else if (['terminal', 'terminal-infrastructure', 'owned-incomplete'].includes(evidence.kind)) {
         const owned = onOurConversation(seedUrl, evidence);
-        if (owned.kind === 'terminal') emitEvidence(seedUrl, owned);
+        if (owned.kind === 'terminal' || owned.kind === 'terminal-infrastructure') emitEvidence(seedUrl, owned);
         if (owned.kind === 'owned-incomplete') {
           stillGeneratingUrl = seedUrl;
           lastMatchWasSeeded = true;

@@ -256,6 +256,15 @@ else W "memory pressure: ${memreason} — the engine will DEFER the slot (no quo
 # config
 [ -n "${PRO_REVIEW_OWNERS:-}" ] && P "PRO_REVIEW_OWNERS='${PRO_REVIEW_OWNERS}'" || W "PRO_REVIEW_OWNERS unset (daemon needs it; interactive /pro-gate does not)"
 P "concurrency: up to ${PRO_GATE_MAX_CONCURRENCY:-3} review slot(s) (per-PR serialized; health-governed)"
+ROUND_POLICY="$(pg_round_policy_mode doctor)"; ROUND_SOURCE="$(pg_round_policy_source)"
+P "round policy: ${ROUND_POLICY} (source: ${ROUND_SOURCE}; history and churn remain visible in --status)"
+TERMINAL_CLEANUP_PENDING=0
+while IFS= read -r disposition; do
+  [ -z "$disposition" ] || ! pg_attempt_disposition_cleanup_pending "$disposition" || TERMINAL_CLEANUP_PENDING=$((TERMINAL_CLEANUP_PENDING + 1))
+done < <(pg_attempt_disposition_scan)
+if [ "$TERMINAL_CLEANUP_PENDING" -gt 0 ]; then
+  W "$TERMINAL_CLEANUP_PENDING terminal attempt cleanup(s) pending — the same typed pro-gate request will reconcile them before any new charge"
+fi
 # .env can hold keys; warn when group/other can read it (installer sets 600 since v0.30.1).
 if [ -f "$PRO_GATE_HOME/.env" ]; then
   ENV_MODE="$(stat -c '%a' "$PRO_GATE_HOME/.env" 2>/dev/null || stat -f '%Lp' "$PRO_GATE_HOME/.env" 2>/dev/null || true)"

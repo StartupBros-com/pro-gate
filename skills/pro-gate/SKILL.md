@@ -132,7 +132,9 @@ Dispatch a replacement action instead of the stale one. Never translate collecti
 ```
 
 Recovery never launches a fresh review. Relay exactly one plain state: **Review ready**,
-**Checking for completed review**, **Still working**, or **Browser needs attention**. Expert read-only
+**Checking for completed review**, **Still working**, **No review remains**, or **Browser needs attention**.
+`No review remains` means terminal proof released recovery ownership; re-query the typed decision
+instead of deleting state or forcing a round. Expert read-only
 and direct marker diagnostics remain:
 
 ```bash

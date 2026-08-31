@@ -195,7 +195,9 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
       let delayMs = 0;
       let armMutation = null;
       let applyMutation = null;
-      if (expression.includes('pro-gate-organizer:rename')) {
+      if (expression.includes('pro-gate:terminal-infrastructure')) {
+        value = opts.infrastructureError ?? null;
+      } else if (expression.includes('pro-gate-organizer:rename')) {
         const expected = expectedTitleFromExpression(expression);
         const token = mutationTokenFromExpression(expression);
         const expiresAt = mutationExpiresAtFromExpression(expression);
@@ -393,6 +395,46 @@ const MARKER = 'pg-run-test-1234567890-42';
     !cdp.closed.includes('tab1') && cdp.closed.includes('scratch1'), `closed=${cdp.closed}`);
   check('still-generating names the conversation', /still-generating: .*mock-conversation/.test(r.stderr ?? ''));
   cdp.stop();
+}
+
+{ // exact-owned terminal ChatGPT infrastructure UI: charged, but nothing remains to harvest
+  const messages = [
+    'A network error occurred',
+    'Something went wrong while generating the response',
+    'There was an error generating a response',
+  ];
+  for (const message of messages) {
+    const cdp = await mockCdp(`run marker: ${MARKER}\n${message}`, [], { infrastructureError: message });
+    const r = await runSalvage([MARKER, '3'], cdp.port);
+    check(`exact-owned terminal UI exits 10: ${message}`, r.status === 10,
+      `status=${r.status} stderr=${r.stderr?.slice(0, 240)}`);
+    check(`terminal UI names bounded outcome: ${message}`,
+      r.stderr?.includes(`terminal-infrastructure: ${message}`), r.stderr);
+    check(`terminal UI leaves source tab for caller cleanup: ${message}`, !cdp.closed.includes('tab1'),
+      `closed=${cdp.closed}`);
+    cdp.stop();
+  }
+}
+
+{ // planted negatives: assistant/prompt text has no structured error UI and cannot settle the run
+  const messages = [
+    'A network error occurred',
+    'Something went wrong while generating the response',
+    'There was an error generating a response',
+  ];
+  for (const message of messages) {
+    const assistantText = await mockCdp(`run marker: ${MARKER}\n${message}`);
+    const assistantResult = await runSalvage([MARKER, '3'], assistantText.port);
+    check(`assistant error phrase stays generating: ${message}`, assistantResult.status === 3,
+      `status=${assistantResult.status} stderr=${assistantResult.stderr?.slice(0, 200)}`);
+    assistantText.stop();
+  }
+
+  const beforeMarker = await mockCdp(`A network error occurred\nrun marker: ${MARKER}\nReasoning continues...`, [], { infrastructureError: 'A network error occurred' });
+  const beforeResult = await runSalvage([MARKER, '3'], beforeMarker.port);
+  check('structured error before the exact marker stays generating', beforeResult.status === 3,
+    `status=${beforeResult.status} stderr=${beforeResult.stderr?.slice(0, 200)}`);
+  beforeMarker.stop();
 }
 
 { // U1: production-shaped divergence. The listed source is readable and marker-owned but stale;
