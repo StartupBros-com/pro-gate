@@ -1026,37 +1026,44 @@ gguard() { # $1=key, rest = env overrides; stdout = reason, rc = guard rc
   local key="$1"; shift
   env PRO_GATE_HOME="$GHOME" "$@" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_guard '$key'"
 }
+genforce() { local key="$1"; shift; gguard "$key" PRO_GATE_ROUND_GUARD=1 "$@"; }
 gscore() { # $1=key -> "earned<TAB>streak<TAB>elapsed_secs<TAB>scored" from pg_round_score
   env PRO_GATE_HOME="$GHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_score '$1'; printf '%s\t%s\t%s\t%s\n' \"\$PG_ROUND_EARNED\" \"\$PG_ROUND_STREAK\" \"\$PG_ROUND_ELAPSED_SECS\" \"\$PG_ROUND_SCORED\""
 }
-# No history: the base grant (3) is the whole budget.
+# No explicit policy: count, grant, and trajectory are advisory and never ration a safe review.
 gseed nohist 3
 GOUT="$(gguard nohist)"; GRC=$?
-check 'governor: base grant refuses round 4 without earned rounds' "$([ "$GRC" -eq 1 ]; echo $?)" "rc=$GRC out=$GOUT"
-check 'governor: exhaustion reason names base + earned + ceiling' "$(printf '%s' "$GOUT" | grep -q 'base 3 + 0 earned'; echo $?)" "$GOUT"
+GPOLICY="$(env PRO_GATE_HOME="$GHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_policy_mode nohist")"
+check 'default round policy is advisory after the computed grant is spent' "$([ "$GRC" -eq 0 ] && [ "$GPOLICY" = advisory ]; echo $?)" "rc=$GRC policy=$GPOLICY out=$GOUT"
+# Explicit guard preserves the former trajectory-aware enforcement contract.
+GOUT="$(genforce nohist)"; GRC=$?
+check 'explicit governor: base grant refuses round 4 without earned rounds' "$([ "$GRC" -eq 1 ]; echo $?)" "rc=$GRC out=$GOUT"
+check 'explicit governor: exhaustion reason names base + earned + ceiling' "$(printf '%s' "$GOUT" | grep -q 'base 3 + 0 earned'; echo $?)" "$GOUT"
 gseed nohist 2
-gguard nohist >/dev/null; GRC=$?
-check 'governor: round 3 of base 3 proceeds' "$([ "$GRC" -eq 0 ]; echo $?)" "rc=$GRC"
-# Shrinking trajectory earns extra rounds: open 5 -> 3 -> 1 = +2 earned (grant 5).
+genforce nohist >/dev/null; GRC=$?
+check 'explicit governor: round 3 of base 3 proceeds' "$([ "$GRC" -eq 0 ]; echo $?)" "rc=$GRC"
+# Shrinking trajectory earns extra enforced rounds: open 5 -> 3 -> 1 = +2 earned (grant 5).
 gseed shrink 4; ghist shrink 5 3 1
-gguard shrink >/dev/null; GRC=$?
-check 'governor: shrinking trajectory earns round 5' "$([ "$GRC" -eq 0 ]; echo $?)" "rc=$GRC $(gguard shrink)"
+genforce shrink >/dev/null; GRC=$?
+check 'explicit governor: shrinking trajectory earns round 5' "$([ "$GRC" -eq 0 ]; echo $?)" "rc=$GRC $(genforce shrink)"
 gseed shrink 5
-GOUT="$(gguard shrink)"; GRC=$?
-check 'governor: earned grant still exhausts (5/5)' "$([ "$GRC" -eq 1 ] && printf '%s' "$GOUT" | grep -q '5/5 rounds'; echo $?)" "rc=$GRC out=$GOUT"
-# Churn brake: two consecutive non-shrinking re-reviews stop the loop EARLY (before base).
+GOUT="$(genforce shrink)"; GRC=$?
+check 'explicit governor: earned grant still exhausts (5/5)' "$([ "$GRC" -eq 1 ] && printf '%s' "$GOUT" | grep -q '5/5 rounds'; echo $?)" "rc=$GRC out=$GOUT"
+# Churn remains telemetry by default and a brake only under explicit enforcement.
 gseed churn 3; ghist churn 5 7 8
-GOUT="$(gguard churn)"; GRC=$?
-check 'governor: churn brake refuses (not converging)' "$([ "$GRC" -eq 1 ] && printf '%s' "$GOUT" | grep -q 'churning, not converging'; echo $?)" "rc=$GRC out=$GOUT"
-check 'governor: churn reason carries the trajectory arrow' "$(printf '%s' "$GOUT" | grep -q '5→7→8'; echo $?)" "$GOUT"
+gguard churn >/dev/null; GRC=$?
+check 'default churn trajectory remains advisory' "$([ "$GRC" -eq 0 ]; echo $?)" "rc=$GRC"
+GOUT="$(genforce churn)"; GRC=$?
+check 'explicit governor: churn brake refuses (not converging)' "$([ "$GRC" -eq 1 ] && printf '%s' "$GOUT" | grep -q 'churning, not converging'; echo $?)" "rc=$GRC out=$GOUT"
+check 'explicit governor: churn reason carries the trajectory arrow' "$(printf '%s' "$GOUT" | grep -q '5→7→8'; echo $?)" "$GOUT"
 # A recovery round (shrink after churn) resets the streak: 5 -> 7 -> 8 -> 2 is earning again.
 ghist churn 5 7 8 2
-gguard churn >/dev/null; GRC=$?
-check 'governor: a shrinking round releases the brake' "$([ "$GRC" -eq 0 ]; echo $?)" "rc=$GRC $(gguard churn)"
-# Ceiling is immovable: 10 shrinking rounds cannot out-earn it.
+genforce churn >/dev/null; GRC=$?
+check 'explicit governor: a shrinking round releases the brake' "$([ "$GRC" -eq 0 ]; echo $?)" "rc=$GRC $(genforce churn)"
+# Ceiling remains the explicit-enforcement backstop while advisory mode still reports it.
 gseed marathon 8; ghist marathon 20 18 16 14 12 10 8 6 4 2 1
-GOUT="$(gguard marathon)"; GRC=$?
-check 'governor: ceiling 8 caps any earned run' "$([ "$GRC" -eq 1 ] && printf '%s' "$GOUT" | grep -q 'ceiling 8'; echo $?)" "rc=$GRC out=$GOUT"
+GOUT="$(genforce marathon)"; GRC=$?
+check 'explicit governor: ceiling 8 caps any earned run' "$([ "$GRC" -eq 1 ] && printf '%s' "$GOUT" | grep -q 'ceiling 8'; echo $?)" "rc=$GRC out=$GOUT"
 # Explicitly-set flat cap pins legacy behavior: churn trajectory is ignored.
 gseed flatkey 3; ghist flatkey 5 7 8
 gguard flatkey PRO_GATE_MAX_ROUNDS_PER_PR=4 >/dev/null; GRC=$?
@@ -1066,6 +1073,12 @@ check 'flat mode: explicit cap still enforces its number' "$([ "$GRC" -eq 1 ] &&
 # Base 0 keeps the lockdown reading in governor mode.
 GOUT="$(gguard nohist PRO_GATE_ROUNDS_BASE=0)"; GRC=$?
 check 'governor: base 0 is a lockdown' "$([ "$GRC" -eq 1 ] && printf '%s' "$GOUT" | grep -q 'PRO_GATE_ROUNDS_BASE=0'; echo $?)" "rc=$GRC out=$GOUT"
+GPOLICY="$(env PRO_GATE_HOME="$GHOME" PRO_GATE_ROUNDS_BASE=0 bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_policy_mode nohist")"
+check 'explicit zero base reports lockdown policy' "$([ "$GPOLICY" = lockdown ]; echo $?)" "policy=$GPOLICY"
+GPOLICY="$(env PRO_GATE_HOME="$GHOME" PRO_GATE_MAX_ROUNDS_PER_PR=4 bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_policy_mode nohist")"
+check 'explicit flat cap reports enforced policy' "$([ "$GPOLICY" = enforced ]; echo $?)" "policy=$GPOLICY"
+GPOLICY="$(env PRO_GATE_HOME="$GHOME" PRO_GATE_ROUND_GUARD=0 PRO_GATE_MAX_ROUNDS_PER_PR=0 bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_policy_mode nohist")"
+check 'explicit guard off outranks explicit lockdown knobs' "$([ "$GPOLICY" = off ]; echo $?)" "policy=$GPOLICY"
 # #66 gate P1: a base above the ceiling clamps the BASE DOWN — the ceiling never moves.
 gseed clampkey 8
 GOUT="$(gguard clampkey PRO_GATE_ROUNDS_BASE=10 PRO_GATE_ROUNDS_CEILING=8 2>/dev/null)"; GRC=$?
@@ -1118,7 +1131,7 @@ printf '%s\tFIX-FIRST\t0\t5\t0\t0\t3600\n%s\tFIX-FIRST\t0\t7\t0\t0\t3600\n%s\tFI
   "$(date +%s)" "$(date +%s)" "$(date +%s)" > "$RHOME/rounds/$RKEY_90.hist"
 printf 'foreign idle tab\n' > "$TDIR/tab.txt"
 env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
-  PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 PRO_GATE_ROUND_GUARD=1 \
   PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-ok" NODE_OPTIONS= \
   bash "$ENGINE" --pr 90 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$RHOME/o-gov.md" --timeout 5s \
   >"$TDIR/stdout" 2>"$TDIR/stderr"
@@ -1779,8 +1792,9 @@ PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 >"$TDIR/st.out" 2>"$TDIR/st.er
 check '--status exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(cat "$TDIR/st.err")"
 check '--status names the reservation marker' "$(grep -q "$SMARKER" "$TDIR/st.out"; echo $?)" "$(cat "$TDIR/st.out")"
 check '--status leads to a free harvest' "$(grep -q "FREE" "$TDIR/st.out" && grep -q -- "--harvest '$SMARKER'" "$TDIR/st.out"; echo $?)" "$(grep -i harvest "$TDIR/st.out")"
-# v0.31: governor default — base grant 3 with no trajectory history, so 2 spent leaves 1.
-check '--status reports rounds spent/remaining' "$(grep -q '2 spent, 1 remaining' "$TDIR/st.out"; echo $?)" "$(grep spent "$TDIR/st.out")"
+# Round scoring remains visible, but ordinary unset configuration is advisory.
+check '--status reports spent rounds and advisory computed grant' \
+  "$(grep -q '2 spent, policy=advisory, computed grant 3 is advisory' "$TDIR/st.out"; echo $?)" "$(grep spent "$TDIR/st.out")"
 check '--status reports rounds used and total wall clock' \
   "$(grep -q '2 rounds; ~2.0h recorded across 2 scored round(s)' "$TDIR/st.out"; echo $?)" "$(grep spent "$TDIR/st.out")"
 check '--status writes nothing' "$([ ! -f "$SHOME/ledger.jsonl.tmp" ] && [ "$(wc -l < "$SHOME/ledger.jsonl")" -eq 1 ]; echo $?)" 'state mutated'
@@ -1898,6 +1912,13 @@ check '--status --json exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC"
 check '--status --json reservation marker' "$([ "$(jq -r '.reservations[0].marker' "$TDIR/st.json")" = "$SMARKER" ]; echo $?)" "$(cat "$TDIR/st.json")"
 check '--status --json remembered url' "$([ "$(jq -r '.reservations[0].conversation_url' "$TDIR/st.json")" = "https://chatgpt.com/c/abc123" ]; echo $?)" "$(jq -c .reservations "$TDIR/st.json")"
 check '--status --json rounds remaining' "$([ "$(jq -r '.rounds[0].remaining' "$TDIR/st.json")" = 1 ] && [ "$(jq -r '.rounds[0].cap' "$TDIR/st.json")" = 3 ]; echo $?)" "$(jq -c .rounds "$TDIR/st.json")"
+check '--status --json reports default round policy as advisory' \
+  "$([ "$(jq -r '.rounds[0].policy' "$TDIR/st.json")" = advisory ] && [ "$(jq -r '.rounds[0].enforced' "$TDIR/st.json")" = false ]; echo $?)" \
+  "$(jq -c .rounds "$TDIR/st.json")"
+PRO_GATE_ROUND_GUARD=1 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 --json >"$TDIR/st-enforced.json" 2>/dev/null
+check '--status --json reports explicit round policy as enforced' \
+  "$([ "$(jq -r '.rounds[0].policy' "$TDIR/st-enforced.json")" = enforced ] && [ "$(jq -r '.rounds[0].enforced' "$TDIR/st-enforced.json")" = true ]; echo $?)" \
+  "$(jq -c .rounds "$TDIR/st-enforced.json")"
 # #66 gate P2: --status must expose the scored trajectory, not just the numbers.
 printf '%s\tFIX-FIRST\t0\t5\t0\t0\n%s\tFIX-FIRST\t0\t7\t0\t0\n%s\tFIX-FIRST\t0\t8\t0\t0\n' \
   "$(date +%s)" "$(date +%s)" "$(date +%s)" > "$SHOME/rounds/acme-widgets-42.hist"
@@ -1905,7 +1926,7 @@ PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 --json >"$TDIR/st2.json" 2>/de
 check '--status --json exposes the trajectory' "$([ "$(jq -r '.rounds[0].trajectory' "$TDIR/st2.json")" = '5→7→8' ]; echo $?)" "$(jq -c .rounds "$TDIR/st2.json")"
 check '--status --json flags the churn brake' "$([ "$(jq -r '.rounds[0].churn_braked' "$TDIR/st2.json")" = true ]; echo $?)" "$(jq -c .rounds "$TDIR/st2.json")"
 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 >"$TDIR/st2.out" 2>/dev/null
-check '--status text names the churn brake' "$(grep -q 'CHURN BRAKE' "$TDIR/st2.out"; echo $?)" "$(grep -i 'spent' "$TDIR/st2.out")"
+check '--status text names advisory churn without calling it a hard brake' "$(grep -q 'CHURN: not converging' "$TDIR/st2.out" && ! grep -q 'CHURN BRAKE' "$TDIR/st2.out"; echo $?)" "$(grep -i 'spent' "$TDIR/st2.out")"
 rm -f "$SHOME/rounds/acme-widgets-42.hist"
 check '--status --json recent runs' "$([ "$(jq -r '.recent_runs | length' "$TDIR/st.json")" = 1 ]; echo $?)" "$(jq -c .recent_runs "$TDIR/st.json")"
 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status "$SMARKER" --json >"$TDIR/st2.json" 2>/dev/null
@@ -4662,8 +4683,17 @@ check 'resolved run-meta does not hide a later unresolved charged marker' \
   "$([ "$FRESH_RC" -eq 0 ] && [ ! -s "$TDIR/fresh-oracle.calls" ] && jq -e --arg marker "$FRESH_UNRESOLVED_MARKER" '.action=="recover-existing-review" and .effect_request.applicable_ref==$marker' "$TDIR/fresh.stdout" >/dev/null 2>&1; echo $?)" \
   "rc=$FRESH_RC stdout=$(cat "$TDIR/fresh.stdout") stderr=$(cat "$TDIR/fresh.stderr")"
 
-# Effect-time proof/governor movement returns a replacement before it reaches the engine's
-# charge protocol. These are deliberately changes AFTER the advisory JSON was saved.
+# Default round history is advisory even when its computed grant is exhausted.
+fresh_reset_state
+mkdir -p "$FRESH_HOME/rounds"
+for _ in $(seq 1 3); do date +%s; done > "$FRESH_HOME/rounds/$FRESH_KEY"
+FRESH_ADVISORY_ROUNDS="$(fresh_query)"
+check 'default exhausted round history still grants changed proven evidence' \
+  "$(jq -e '.action=="run-granted-review" and .facts.governor.granted' <<<"$FRESH_ADVISORY_ROUNDS" >/dev/null 2>&1; echo $?)" \
+  "$FRESH_ADVISORY_ROUNDS"
+
+# Effect-time proof or explicitly-enforced governor movement returns a replacement before it reaches
+# the charge protocol. These are deliberately changes AFTER the advisory JSON was saved.
 for fresh_change in evidence governor; do
   fresh_reset_state
   FRESH_ADVISORY="$(fresh_query)"; printf '%s\n' "$FRESH_ADVISORY" > "$TDIR/fresh-advisory.json"
@@ -4675,9 +4705,11 @@ for fresh_change in evidence governor; do
     evidence) printf 'changed endpoint\n' >> "$TDIR/fresh-endpoint.patch" ;;
     governor)
       mkdir -p "$FRESH_HOME/rounds"
-      for _ in $(seq 1 3); do date +%s; done > "$FRESH_HOME/rounds/$FRESH_KEY" ;;
+      for _ in $(seq 1 3); do date +%s; done > "$FRESH_HOME/rounds/$FRESH_KEY"
+      export PRO_GATE_ROUND_GUARD=1 ;;
   esac
   fresh_effect "$TDIR/fresh-advisory.json" "$TDIR/fresh-$fresh_change.md"
+  [ "$fresh_change" != governor ] || unset PRO_GATE_ROUND_GUARD
   check "stale run-granted advisory re-reduces after $fresh_change without charge or Oracle" \
     "$([ ! -s "$TDIR/fresh-oracle.calls" ] && [ ! -d "$FRESH_HOME/active" ] && [ ! -d "$FRESH_HOME/run-meta" ]; echo $?)" \
     "rc=$FRESH_RC stdout=$(cat "$TDIR/fresh.stdout") stderr=$(cat "$TDIR/fresh.stderr")"

@@ -1853,9 +1853,28 @@ pg_round_score() {
 pg_round_trajectory() { pg_round_score "$1"; printf '%s\t%s\t%s\n' "$PG_ROUND_EARNED" "$PG_ROUND_STREAK" "$PG_ROUND_ARROW"; }
 pg_round_grant() { pg_round_score "$1"; echo "$PG_ROUND_GRANT"; }
 
-pg_round_guard() {  # $1 = key. 0 = proceed; 1 + a one-line reason on stdout = budget spent.
-  local key="$1" used
-  [ "${PRO_GATE_ROUND_GUARD:-1}" = 1 ] || return 0
+pg_round_policy_mode() { # advisory|enforced|lockdown|off
+  local guard_set=false guard="${PRO_GATE_ROUND_GUARD:-}"
+  [ -z "${PRO_GATE_ROUND_GUARD+x}" ] || guard_set=true
+  if [ "$guard_set" = true ]; then
+    [ "$guard" = 0 ] && { echo off; return; }
+    [ "$guard" = 1 ] || { echo advisory; return; }
+  elif [ -z "${PRO_GATE_MAX_ROUNDS_PER_PR+x}${PRO_GATE_ROUNDS_BASE+x}${PRO_GATE_ROUNDS_CEILING+x}" ]; then
+    echo advisory; return
+  fi
+  pg_round_score "${1:-}"
+  if { [ -n "${PRO_GATE_MAX_ROUNDS_PER_PR:-}" ] && [ "$PG_ROUND_GRANT" -eq 0 ]; } \
+     || { [ -z "${PRO_GATE_MAX_ROUNDS_PER_PR:-}" ] && [ "$PG_ROUND_BASE" -eq 0 ]; }; then
+    echo lockdown
+  else
+    echo enforced
+  fi
+}
+
+pg_round_guard() {  # $1 = key. 0 = proceed; 1 + a one-line reason on stdout = explicitly denied.
+  local key="$1" used policy
+  policy="$(pg_round_policy_mode "$key")"
+  case "$policy" in advisory|off) return 0;; enforced|lockdown) ;; *) return 0;; esac
   [ "${PRO_GATE_FORCE_ROUND:-0}" = 1 ] && return 0   # deliberate one-invocation override
   pg_round_key_ok "$key" || return 0
   pg_round_score "$key"

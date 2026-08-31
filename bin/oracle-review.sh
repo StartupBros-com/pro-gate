@@ -1154,6 +1154,7 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
     # and drop the trajectory globals, leaving --status unable to distinguish ordinary
     # exhaustion from a churn brake — the very signal this release exists to surface.
     pg_round_score "$k"
+    k_policy="$(pg_round_policy_mode "$k")"
     k_cap="$PG_ROUND_GRANT"; k_arrow="$PG_ROUND_ARROW"; k_earned="$PG_ROUND_EARNED"
     k_streak="$PG_ROUND_STREAK"; k_braked=0
     # ledger-timing-split R2: total wall clock spent on this change's rounds, alongside spent/cap.
@@ -1174,11 +1175,11 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
         --arg amarker "$a_marker" --arg aout "$a_out" --arg aalive "$a_alive" --arg amode "$a_mode" \
         --arg arrow "$k_arrow" --argjson earned "$k_earned" --argjson streak "$k_streak" \
         --argjson braked "$k_braked" --argjson elapsed_secs "$k_elapsed" --arg elapsed_h "$k_elapsed_h" \
-        --argjson scored "$k_scored" \
-        '{key:$key,spent:$spent,cap:$cap,remaining:$remaining,window_secs:$window_secs,in_flight:($in_flight == 1),trajectory:(if $arrow == "" then null else $arrow end),earned:$earned,streak:$streak,churn_braked:($braked == 1),elapsed_secs:$elapsed_secs,elapsed_h:$elapsed_h,scored:$scored,active:(if $amarker == "" and $aout == "" then null else {marker:$amarker,out:$aout,wrapper_alive:($aalive == "1"),mode:$amode} end)}' \
+        --argjson scored "$k_scored" --arg policy "$k_policy" \
+        '{key:$key,spent:$spent,cap:$cap,remaining:$remaining,window_secs:$window_secs,policy:$policy,enforced:($policy=="enforced" or $policy=="lockdown"),in_flight:($in_flight == 1),trajectory:(if $arrow == "" then null else $arrow end),earned:$earned,streak:$streak,churn_braked:($braked == 1),elapsed_secs:$elapsed_secs,elapsed_h:$elapsed_h,scored:$scored,active:(if $amarker == "" and $aout == "" then null else {marker:$amarker,out:$aout,wrapper_alive:($aalive == "1"),mode:$amode} end)}' \
         >> "$ST_TMP/rounds.jsonl" 2>/dev/null
     else
-      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$k" "$spent" "$k_cap" "$rem" "$k_live" "$k_arrow" "$k_braked" "$k_elapsed" "$k_scored" >> "$ST_TMP/rounds.tsv"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$k" "$spent" "$k_cap" "$rem" "$k_live" "$k_arrow" "$k_braked" "$k_elapsed" "$k_scored" "$k_policy" >> "$ST_TMP/rounds.tsv"
     fi
   done
 
@@ -1289,18 +1290,19 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
     fi
   fi
   if [ -s "$ST_TMP/rounds.jsonl" ] || [ -s "$ST_TMP/rounds.tsv" ]; then
-    echo "round budget (rolling window $(( ST_WIN / 3600 ))h, ${ST_CAP_DESC}):"
+    echo "round history (rolling window $(( ST_WIN / 3600 ))h, ${ST_CAP_DESC}):"
     if pg_have jq && [ -s "$ST_TMP/rounds.jsonl" ]; then
-      jq -r '"  " + .key + ": \(.spent) spent, \(.remaining) remaining"
+      jq -r '"  " + .key + ": \(.spent) spent, policy=" + .policy
+             + (if .enforced then ", \(.remaining) enforced remaining" else ", computed grant \(.cap) is advisory" end)
              + "  (\(.spent) rounds; ~" + .elapsed_h + "h recorded across \(.scored) scored round(s))"
              + (if .trajectory then "  (open P0/P1 by round: " + .trajectory + ")" else "" end)
-             + (if .churn_braked then "  [CHURN BRAKE: not converging — escalate instead of re-running]" else "" end)
+             + (if .churn_braked then "  [CHURN: not converging]" else "" end)
              + (if .in_flight then "  [REVIEW RUNNING NOW]" else "" end)' "$ST_TMP/rounds.jsonl"
     else
-      awk -F'\t' '{printf "  %s: %s spent, %s remaining (cap %s)  (%s rounds; ~%.1fh recorded across %s scored round(s))%s%s%s\n", $1, $2, $4, $3, $2, ($8+0)/3600, $9, ($6 == "" ? "" : "  (open P0/P1 by round: " $6 ")"), ($7 == 1 ? "  [CHURN BRAKE: not converging]" : ""), ($5 == 1 ? "  [REVIEW RUNNING NOW]" : "")}' "$ST_TMP/rounds.tsv" 2>/dev/null
+      awk -F'\t' '{printf "  %s: %s spent, policy=%s, computed grant %s  (%s rounds; ~%.1fh recorded across %s scored round(s))%s%s%s\n", $1, $2, $10, $3, $2, ($8+0)/3600, $9, ($6 == "" ? "" : "  (open P0/P1 by round: " $6 ")"), ($7 == 1 ? "  [CHURN: not converging]" : ""), ($5 == 1 ? "  [REVIEW RUNNING NOW]" : "")}' "$ST_TMP/rounds.tsv" 2>/dev/null
     fi
   else
-    echo "round budget: nothing spent in the current window for this query"
+    echo "round history: nothing spent in the current window for this query"
   fi
   if [ -s "$ST_TMP/ledger.jsonl" ]; then
     echo "recent runs (newest first):"
