@@ -313,7 +313,7 @@ pg_review_decision_cli() {
   local input_marker="" input_record="" input_digest="" f marker candidate candidate_relation desired_relation exact=false active_marker="" active_state=none
   local endpoint reviewed manifest confirmation endpoint_digest reviewed_digest manifest_digest confirmation_digest lineage mode ship_digest
   local reservation_marker="" reservation_state=none governor_granted=false completed='[]' prior_candidates='[]' prior_review result artifact artifact_digest canonical
-  local facts decision effect_ok=false prospective exact_inputs='[]' choice_candidates='[]' choice_outcomes='[]' choice_selected="" choice_snapshot="" selection="" selection_supplied=false current_verdict=NONE current_canonical="" effect_input attempt_snapshot
+  local facts decision effect_ok=false prospective exact_inputs='[]' choice_candidates='[]' choice_outcomes='[]' choice_selected="" choice_snapshot="" selection="" selection_supplied=false current_verdict=NONE current_canonical="" effect_input attempt_snapshot attempt_source
 
   pg_have jq || { echo 'ERROR: review-decision/v1 requires jq' >&2; return 2; }
   repo="${REPO:-$(pwd)}"
@@ -503,10 +503,14 @@ pg_review_decision_cli() {
   # conservative (recover); reconciliation stays an effect and cannot happen in this read-only path.
   attempt_snapshot="$(pg_attempt_snapshot "$host" "$owner" "$repo_name" "$pr_num" "$round_key" 2>/dev/null || true)"
   [ -n "$attempt_snapshot" ] || { echo 'ERROR: review-decision could not assemble attempt lifecycle' >&2; return 2; }
+  attempt_source="$(jq -r .source <<<"$attempt_snapshot")"
   active_marker="$(jq -r '.marker // ""' <<<"$attempt_snapshot")"
   active_state="$(jq -r '.state // "none"' <<<"$attempt_snapshot")"
+  if [ "$attempt_source" = disposition ]; then
+    if [ "$(jq -r .fresh_eligible <<<"$attempt_snapshot")" = true ]; then active_marker=""; active_state=none; else active_state=unknown-fate; fi
+  fi
   reservation_marker=""; reservation_state=none
-  if [ "$(jq -r .source <<<"$attempt_snapshot")" = reservation ]; then
+  if [ "$attempt_source" = reservation ]; then
     reservation_marker="$active_marker"; reservation_state=live
     active_marker=""; active_state=none
   fi
@@ -538,7 +542,19 @@ pg_review_decision_cli() {
       && effect_ok=true
     # Effects acquire their own marker protection only after a byte-for-byte request match and
     # fresh reduction. A mismatch falls through to the replacement decision with no mutation.
-    if [ "$effect_ok" = true ] && [ "$(jq -r .action <<<"$decision")" = collect-existing-result ]; then
+    if [ "$effect_ok" = true ] && [ "$(jq -r .action <<<"$decision")" = recover-existing-review ]; then
+      effect_marker="$(jq -r '.effect_request.applicable_ref // ""' <<<"$decision")"
+      if [ -n "$(pg_attempt_disposition_read "$effect_marker" 2>/dev/null || true)" ]; then
+        if ! pg_lock "${PRO_GATE_LOCKFILE:-$PRO_GATE_HOME/oracle.lock}.pr-${round_key}" "${PRO_GATE_RECOVER_LOCK_WAIT:-30}"; then
+          echo 'ERROR: terminal attempt cleanup is busy; retry recovery.' >&2; return 7
+        fi
+        pg_attempt_reconcile_terminal "$effect_marker" \
+          || { echo 'ERROR: terminal attempt cleanup failed closed; inspect --status.' >&2; return 3; }
+        REVIEW_DECISION_EFFECT_FILE=""
+        pg_review_decision_cli
+        return
+      fi
+    elif [ "$effect_ok" = true ] && [ "$(jq -r .action <<<"$decision")" = collect-existing-result ]; then
       effect_marker="$(jq -r '.effect_request.applicable_ref // ""' <<<"$decision")"
       effect_input="$(pg_review_input_binding_read "$effect_marker" 2>/dev/null || true)"
       if [ -n "$effect_input" ] \
@@ -1592,7 +1608,9 @@ pg_fresh_dispatch_recheck() { # sets PG_FRESH_DECISION/PG_FRESH_ACTION
   active_marker="$(jq -r '.marker // ""' <<<"$attempt_snapshot")"
   astate="$(jq -r '.state // "none"' <<<"$attempt_snapshot")"
   reservation=""
-  if [ "$attempt_source" = reservation ]; then
+  if [ "$attempt_source" = disposition ]; then
+    if [ "$(jq -r .fresh_eligible <<<"$attempt_snapshot")" = true ]; then active_marker=""; astate=none; else astate=unknown-fate; fi
+  elif [ "$attempt_source" = reservation ]; then
     reservation="$active_marker"; active_marker=""; astate=none
   fi
   pg_round_guard "$ROUND_KEY" >/dev/null 2>&1 && granted=true

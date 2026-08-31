@@ -4451,6 +4451,53 @@ check 'leading-zero recovery effect remains stable without a duplicate spend' \
   "$([ "$FRESH_RC" -eq 0 ] && [ "$(wc -l < "$FRESH_HOME/rounds/$FRESH_KEY")" -eq 1 ] && jq -e --arg marker "$FRESH_UNKNOWN_MARKER" '.action=="recover-existing-review" and .effect_request.applicable_ref==$marker' "$TDIR/fresh.stdout" >/dev/null 2>&1; echo $?)" \
   "rc=$FRESH_RC stdout=$(cat "$TDIR/fresh.stdout") stderr=$(cat "$TDIR/fresh.stderr")"
 
+# A terminal disposition is durable proof, not another mutable progress flag. It must outrank stale
+# active/run-meta state after a crash, complete exact cleanup/refund once, and let late review bytes
+# win without changing the disposition.
+fresh_reset_state
+FRESH_TERMINAL_MARKER='pg-run-acme-fresh.git-77-1700014004-5'
+FRESH_TERMINAL_EPOCH=1700014004
+FRESH_TERMINAL_BINDING="$(jq -cS --arg marker "$FRESH_TERMINAL_MARKER" --argjson epoch "$FRESH_TERMINAL_EPOCH" '.marker=$marker | .charged_spend_epoch=$epoch' <<<"$FRESH_BINDING")"
+mkdir -p "$FRESH_HOME/run-meta" "$FRESH_HOME/rounds" "$FRESH_HOME/active"
+printf '%s\n' "$FRESH_TERMINAL_EPOCH" > "$FRESH_HOME/rounds/$FRESH_KEY"
+printf 'github.com\tacme\tfresh\t%s\t77\t%s\t%s\n' "$FRESH_KEY" "$TDIR/terminal.md" "$FRESH_TERMINAL_EPOCH" > "$FRESH_HOME/run-meta/$FRESH_TERMINAL_MARKER"
+PRO_GATE_HOME="$FRESH_HOME" pg_review_input_binding_write "$FRESH_TERMINAL_MARKER" "$FRESH_TERMINAL_BINDING"
+printf '%s\t%s\t%s\t%s\tremote-chrome\ttoken\tcharged\t%s\n' "$FRESH_TERMINAL_MARKER" "$TDIR/terminal.md" "$$" "$(date +%s)" "$FRESH_TERMINAL_EPOCH" > "$FRESH_HOME/active/$FRESH_KEY"
+PRO_GATE_HOME="$FRESH_HOME" pg_attempt_disposition_write github.com acme fresh 77 "$FRESH_KEY" "$FRESH_TERMINAL_MARKER" "$FRESH_TERMINAL_EPOCH" not-submitted proven-no-submit
+FRESH_TERMINAL_PENDING="$(PRO_GATE_HOME="$FRESH_HOME" pg_attempt_snapshot github.com acme fresh 77 "$FRESH_KEY")"
+check 'terminal disposition outranks stale mutable attempt state and reports cleanup pending' \
+  "$(jq -e --arg marker "$FRESH_TERMINAL_MARKER" '.marker==$marker and .source=="disposition" and .state=="cleanup-pending" and .cleanup_pending and (.fresh_eligible|not) and (.terminal.terminal_kind=="not-submitted")' <<<"$FRESH_TERMINAL_PENDING" >/dev/null 2>&1; echo $?)" \
+  "$FRESH_TERMINAL_PENDING"
+PRO_GATE_HOME="$FRESH_HOME" pg_attempt_terminal_transition github.com acme fresh 77 "$FRESH_KEY" "$FRESH_TERMINAL_MARKER" "$FRESH_TERMINAL_EPOCH" not-submitted proven-no-submit
+FRESH_TERMINAL_DONE="$(PRO_GATE_HOME="$FRESH_HOME" pg_attempt_snapshot github.com acme fresh 77 "$FRESH_KEY")"
+check 'not-submitted transition refunds and cleans exact mutable state before fresh eligibility' \
+  "$(jq -e --arg marker "$FRESH_TERMINAL_MARKER" '.marker==$marker and .source=="disposition" and .state=="not-submitted" and (.cleanup_pending|not) and .fresh_eligible and (.recoverable|not)' <<<"$FRESH_TERMINAL_DONE" >/dev/null 2>&1 \
+     && [ ! -e "$FRESH_HOME/rounds/$FRESH_KEY" ] && [ ! -e "$FRESH_HOME/run-meta/$FRESH_TERMINAL_MARKER" ] \
+     && [ ! -e "$FRESH_HOME/active/$FRESH_KEY" ] && [ ! -e "$FRESH_HOME/review-input-bindings/$FRESH_TERMINAL_MARKER" ]; echo $?)" \
+  "snapshot=$FRESH_TERMINAL_DONE"
+PRO_GATE_HOME="$FRESH_HOME" pg_attempt_terminal_transition github.com acme fresh 77 "$FRESH_KEY" "$FRESH_TERMINAL_MARKER" "$FRESH_TERMINAL_EPOCH" not-submitted proven-no-submit
+check 'terminal transition replay is idempotent and never recreates a refunded round' \
+  "$([ ! -e "$FRESH_HOME/rounds/$FRESH_KEY" ] && [ -s "$FRESH_HOME/attempt-dispositions/$FRESH_TERMINAL_MARKER" ]; echo $?)" \
+  "round=$(cat "$FRESH_HOME/rounds/$FRESH_KEY" 2>/dev/null)"
+mkdir -p "$FRESH_HOME/completed"
+printf 'P0: none\nP1: none\nP2: none\nP3: none\nVERDICT: SHIP - late exact artifact.\n' > "$FRESH_HOME/completed/$FRESH_TERMINAL_MARKER"
+FRESH_TERMINAL_LATE="$(PRO_GATE_HOME="$FRESH_HOME" pg_attempt_snapshot github.com acme fresh 77 "$FRESH_KEY")"
+check 'late valid review bytes outrank the terminal disposition' \
+  "$(jq -e --arg marker "$FRESH_TERMINAL_MARKER" '.marker==$marker and .source=="artifact" and .state=="review-ready" and .artifact.kind=="completed" and (.fresh_eligible|not)' <<<"$FRESH_TERMINAL_LATE" >/dev/null 2>&1; echo $?)" \
+  "$FRESH_TERMINAL_LATE"
+
+fresh_reset_state
+FRESH_OLD_TERMINAL='pg-run-acme-fresh.git-77-1700014005-6'
+FRESH_NEW_ACTIVE='pg-run-acme-fresh.git-77-1700014006-7'
+PRO_GATE_HOME="$FRESH_HOME" pg_attempt_disposition_write github.com acme fresh 77 "$FRESH_KEY" "$FRESH_OLD_TERMINAL" 1700014005 submitted-terminal exact-owned-infrastructure-terminal
+mkdir -p "$FRESH_HOME/active" "$FRESH_HOME/run-meta"
+printf '%s\t%s\t%s\t%s\tremote-chrome\ttoken\tsubmitted\t1700014006\n' "$FRESH_NEW_ACTIVE" "$TDIR/new-active.md" "$$" "$(date +%s)" > "$FRESH_HOME/active/$FRESH_KEY"
+printf 'github.com\tacme\tfresh\t%s\t77\t%s\t1700014006\n' "$FRESH_KEY" "$TDIR/new-active.md" > "$FRESH_HOME/run-meta/$FRESH_NEW_ACTIVE"
+FRESH_NEW_ACTIVE_SNAPSHOT="$(PRO_GATE_HOME="$FRESH_HOME" pg_attempt_snapshot github.com acme fresh 77 "$FRESH_KEY")"
+check 'older terminal disposition never hides a distinct newer active attempt' \
+  "$(jq -e --arg marker "$FRESH_NEW_ACTIVE" '.marker==$marker and .source=="active" and .state=="submitted" and .recoverable and (.fresh_eligible|not)' <<<"$FRESH_NEW_ACTIVE_SNAPSHOT" >/dev/null 2>&1; echo $?)" \
+  "$FRESH_NEW_ACTIVE_SNAPSHOT"
+
 # A repository-qualified PR URL owns canonical recovery identity even when the checkout belongs to
 # a fork with the same PR number. Both public query and effect freshness must select upstream work.
 fresh_reset_state

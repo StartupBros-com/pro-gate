@@ -630,6 +630,204 @@ pg_run_meta_find_latest() { # host owner repo pr terminal-filter -> newest exact
 
 pg_run_meta_find_unresolved() { pg_run_meta_find_latest "$1" "$2" "$3" "$4" unresolved; }
 
+pg_attempt_disposition_dir() { printf '%s\n' "${PRO_GATE_ATTEMPT_DISPOSITION_DIR:-$PRO_GATE_HOME/attempt-dispositions}"; }
+
+pg_attempt_disposition_validate() { # canonical JSON [expected marker]
+  local json="${1-}" marker="${2:-}" canonical
+  canonical="$(printf '%s' "$json" | jq -cS . 2>/dev/null)" || return 1
+  jq -e --arg marker "$marker" '. as $d |
+    ($d|keys) == ["charged_spend_epoch","marker","observed_at","proof_kind","record_type","record_version","repository","round_key","target","terminal_kind"] and
+    $d.record_type=="review-attempt-disposition/v1" and $d.record_version==1 and
+    ($d.marker|type=="string" and test("^pg-run-[A-Za-z0-9.-]+$")) and ($marker=="" or $d.marker==$marker) and
+    ($d.round_key|type=="string" and test("^[A-Za-z0-9.-]+$")) and ($d.marker|startswith("pg-run-" + $d.round_key + "-")) and
+    ($d.charged_spend_epoch|type=="number" and floor==. and .>0) and
+    ($d.observed_at|type=="number" and floor==. and .>=$d.charged_spend_epoch) and
+    ($d.terminal_kind|IN("not-submitted","submitted-terminal","recovery-exhausted")) and
+    ($d.proof_kind|IN("proven-no-submit","exact-owned-infrastructure-terminal","bounded-recovery-exhausted")) and
+    (($d.terminal_kind=="not-submitted" and $d.proof_kind=="proven-no-submit") or
+     ($d.terminal_kind=="submitted-terminal" and $d.proof_kind=="exact-owned-infrastructure-terminal") or
+     ($d.terminal_kind=="recovery-exhausted" and $d.proof_kind=="bounded-recovery-exhausted")) and
+    ($d.repository|keys)==["host","owner","repo"] and
+    ($d.repository.host|test("^[A-Za-z0-9.-]+$")) and ($d.repository.owner|test("^[A-Za-z0-9._-]+$")) and ($d.repository.repo|test("^[A-Za-z0-9._-]+$")) and
+    ($d.target|keys)==["kind","pr"] and $d.target.kind=="pull-request" and ($d.target.pr|type=="number" and floor==. and .>0) and
+    ($d.round_key|endswith("-" + ($d.target.pr|tostring)))
+  ' <<<"$canonical" >/dev/null 2>&1 || return 1
+  printf '%s' "$canonical"
+}
+
+pg_attempt_disposition_read() { # marker -> canonical disposition
+  local marker="$1" f json
+  pg_reservation_marker_ok "$marker" || return 1
+  f="$(pg_attempt_disposition_dir)/$marker"
+  [ -f "$f" ] && [ ! -L "$f" ] || return 1
+  json="$(cat "$f" 2>/dev/null)" || return 1
+  pg_attempt_disposition_validate "$json" "$marker"
+}
+
+pg_attempt_disposition_write() { # host owner repo pr round-key marker charged-epoch terminal-kind proof-kind
+  local host="$1" owner="$2" repo="$3" pr="$4" key="$5" marker="$6" epoch="$7" kind="$8" proof="$9"
+  local dir f tmp canonical now rc=1
+  pg_canonical_repo_ok "$host" "$owner" "$repo" || return 1
+  pr="$(pg_pr_number_normalize "$pr")" || return 1
+  pg_round_key_ok "$key" || return 1
+  pg_reservation_marker_ok "$marker" || return 1
+  case "$epoch" in ''|*[!0-9]*) return 1;; esac
+  now="$(date +%s)"
+  canonical="$(jq -cnS --arg host "$host" --arg owner "$owner" --arg repo "$repo" --argjson pr "$pr" \
+    --arg key "$key" --arg marker "$marker" --argjson epoch "$epoch" --argjson now "$now" --arg kind "$kind" --arg proof "$proof" \
+    '{charged_spend_epoch:$epoch,marker:$marker,observed_at:$now,proof_kind:$proof,record_type:"review-attempt-disposition/v1",record_version:1,repository:{host:$host,owner:$owner,repo:$repo},round_key:$key,target:{kind:"pull-request",pr:$pr},terminal_kind:$kind}')" || return 1
+  canonical="$(pg_attempt_disposition_validate "$canonical" "$marker")" || return 1
+  dir="$(pg_attempt_disposition_dir)"; mkdir -p "$dir" 2>/dev/null || return 1
+  f="$dir/$marker"; tmp="$dir/.$marker.tmp.$$"
+  if [ -f "$f" ] && [ ! -L "$f" ]; then
+    local existing
+    existing="$(pg_attempt_disposition_read "$marker" 2>/dev/null || true)"
+    [ -n "$existing" ] || return 1
+    if jq -e --argjson candidate "$canonical" '
+      .charged_spend_epoch==$candidate.charged_spend_epoch and .marker==$candidate.marker and
+      .proof_kind==$candidate.proof_kind and .repository==$candidate.repository and
+      .round_key==$candidate.round_key and .target==$candidate.target and .terminal_kind==$candidate.terminal_kind
+    ' <<<"$existing" >/dev/null 2>&1; then return 0; fi
+    return 1
+  fi
+  if printf '%s' "$canonical" > "$tmp" 2>/dev/null && ln "$tmp" "$f" 2>/dev/null; then
+    rc=0
+  elif [ -f "$f" ] && [ ! -L "$f" ] && cmp -s "$tmp" "$f" 2>/dev/null; then
+    rc=0
+  fi
+  rm -f "$tmp" 2>/dev/null
+  return "$rc"
+}
+
+pg_attempt_disposition_find() { # host owner repo pr -> newest exact disposition
+  local host="$1" owner="$2" repo="$3" pr="$4" dir f marker json epoch best="" best_epoch="" LC_ALL=C
+  pg_canonical_repo_ok "$host" "$owner" "$repo" || return 1
+  pr="$(pg_pr_number_normalize "$pr")" || return 1
+  dir="$(pg_attempt_disposition_dir)"; [ -d "$dir" ] || return 1
+  for f in "$dir"/pg-run-*; do
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    marker="${f##*/}"; json="$(pg_attempt_disposition_read "$marker" 2>/dev/null || true)"; [ -n "$json" ] || continue
+    jq -e --arg h "$host" --arg o "$owner" --arg r "$repo" --argjson p "$pr" \
+      '.repository.host==$h and .repository.owner==$o and .repository.repo==$r and .target.pr==$p' <<<"$json" >/dev/null 2>&1 || continue
+    epoch="$(jq -r .charged_spend_epoch <<<"$json")"
+    if [ -z "$best_epoch" ] || [ "$epoch" -gt "$best_epoch" ] || { [ "$epoch" = "$best_epoch" ] && [[ "$marker" > "$best" ]]; }; then
+      best="$marker"; best_epoch="$epoch"
+    fi
+  done
+  [ -n "$best" ] || return 1
+  pg_attempt_disposition_read "$best"
+}
+
+pg_round_has_epoch() { # round-key epoch
+  local key="$1" epoch="$2" value
+  pg_round_key_ok "$key" || return 1
+  [ -f "$(pg_rounds_dir)/$key" ] || return 1
+  while IFS= read -r value; do [ "$value" = "$epoch" ] && return 0; done < "$(pg_rounds_dir)/$key"
+  return 1
+}
+
+pg_round_unrecord_epoch() { # round-key exact epoch; remove exactly one matching entry
+  local key="$1" epoch="$2" f rfd lockdir="" waited=0 value removed=0 rc=0
+  pg_round_key_ok "$key" || return 1
+  case "$epoch" in ''|*[!0-9]*) return 1;; esac
+  f="$(pg_rounds_dir)/$key"; [ -f "$f" ] || return 0
+  if pg_have flock; then
+    { exec {rfd}>>"$f.lock"; } 2>/dev/null && flock -w 10 "$rfd" 2>/dev/null || return 1
+  else
+    lockdir="$f.lock.d"
+    while ! mkdir "$lockdir" 2>/dev/null; do waited=$((waited + 1)); [ "$waited" -ge 10 ] && return 1; sleep 1; done
+  fi
+  if ! : > "$f.tmp" 2>/dev/null; then
+    rc=1
+  else
+    while IFS= read -r value; do
+      if [ "$removed" -eq 0 ] && [ "$value" = "$epoch" ]; then removed=1; continue; fi
+      printf '%s\n' "$value" >> "$f.tmp" 2>/dev/null || { rc=1; break; }
+    done < "$f"
+  fi
+  if [ "$rc" -eq 0 ] && [ "$removed" -eq 1 ]; then
+    if [ -s "$f.tmp" ]; then mv -f "$f.tmp" "$f" || rc=1; else rm -f "$f" "$f.tmp" || rc=1; fi
+  else
+    rm -f "$f.tmp" 2>/dev/null || true
+  fi
+  [ -n "${rfd:-}" ] && eval "exec ${rfd}>&-" 2>/dev/null
+  [ -n "$lockdir" ] && rmdir "$lockdir" 2>/dev/null
+  return "$rc"
+}
+
+pg_attempt_disposition_cleanup_pending() { # canonical disposition
+  local json="$1" marker key epoch kind active_file active_marker
+  marker="$(jq -r .marker <<<"$json")"; key="$(jq -r .round_key <<<"$json")"
+  epoch="$(jq -r .charged_spend_epoch <<<"$json")"; kind="$(jq -r .terminal_kind <<<"$json")"
+  [ -f "$(pg_run_meta_dir)/$marker" ] && return 0
+  [ -f "$(pg_reservation_dir)/$marker" ] && return 0
+  active_file="$(pg_active_dir)/$key"
+  if [ -f "$active_file" ] && [ ! -L "$active_file" ]; then
+    IFS=$'\t' read -r active_marker _ < "$active_file" 2>/dev/null || true
+    [ "$active_marker" = "$marker" ] && return 0
+  fi
+  if [ "$kind" = not-submitted ]; then
+    pg_round_has_epoch "$key" "$epoch" && return 0
+    [ -f "$(pg_review_input_binding_dir)/$marker" ] && return 0
+  fi
+  return 1
+}
+
+pg_attempt_disposition_cleanup() { # canonical disposition; idempotent after proof is durable
+  local json="$1" marker key epoch kind active_file active_marker
+  json="$(pg_attempt_disposition_validate "$json")" || return 1
+  marker="$(jq -r .marker <<<"$json")"; key="$(jq -r .round_key <<<"$json")"
+  epoch="$(jq -r .charged_spend_epoch <<<"$json")"; kind="$(jq -r .terminal_kind <<<"$json")"
+  if [ "$kind" = not-submitted ]; then
+    pg_round_unrecord_epoch "$key" "$epoch" || return 1
+    rm -f "$(pg_review_input_binding_dir)/$marker" 2>/dev/null || return 1
+  fi
+  pg_reservation_remove "$marker" 2>/dev/null || return 1
+  pg_run_meta_remove "$marker"
+  active_file="$(pg_active_dir)/$key"
+  if [ -f "$active_file" ] && [ ! -L "$active_file" ]; then
+    IFS=$'\t' read -r active_marker _ < "$active_file" 2>/dev/null || true
+    [ "$active_marker" != "$marker" ] || rm -f "$active_file" 2>/dev/null || return 1
+  fi
+  ! pg_attempt_disposition_cleanup_pending "$json"
+}
+
+pg_attempt_reconcile_terminal() { # marker; caller holds the per-change lock
+  local marker="$1" disposition
+  disposition="$(pg_attempt_disposition_read "$marker" 2>/dev/null || true)"
+  [ -n "$disposition" ] || return 1
+  pg_attempt_disposition_cleanup "$disposition"
+}
+
+pg_attempt_terminal_transition() { # host owner repo pr key marker epoch kind proof
+  local host="$1" owner="$2" repo="$3" pr="$4" key="$5" marker="$6" epoch="$7" kind="$8" proof="$9"
+  local disposition meta active_file active_marker active_epoch latest="" binding normalized_pr
+  normalized_pr="$(pg_pr_number_normalize "$pr")" || return 1
+  disposition="$(pg_attempt_disposition_read "$marker" 2>/dev/null || true)"
+  if [ -n "$disposition" ]; then
+    jq -e --arg h "$host" --arg o "$owner" --arg r "$repo" --arg key "$key" --argjson p "$normalized_pr" --argjson epoch "$epoch" --arg kind "$kind" --arg proof "$proof" \
+      '.repository.host==$h and .repository.owner==$o and .repository.repo==$r and .round_key==$key and .target.pr==$p and .charged_spend_epoch==$epoch and .terminal_kind==$kind and .proof_kind==$proof' \
+      <<<"$disposition" >/dev/null 2>&1 || return 1
+  else
+    meta="$(pg_run_meta_read "$marker" 2>/dev/null || true)"; [ -n "$meta" ] || return 1
+    IFS=$'\t' read -r _h _o _r _key _pr _out _epoch <<<"$meta"
+    [ "$_h" = "$host" ] && [ "$_o" = "$owner" ] && [ "$_r" = "$repo" ] && [ "$_key" = "$key" ] \
+      && [ "$_pr" = "$normalized_pr" ] && [ "$_epoch" = "$epoch" ] || return 1
+    if [ "$kind" = not-submitted ]; then
+      active_file="$(pg_active_dir)/$key"; [ -f "$active_file" ] && [ ! -L "$active_file" ] || return 1
+      IFS=$'\t' read -r active_marker _ _ _ _ _ _ active_epoch < "$active_file" 2>/dev/null || return 1
+      [ "$active_marker" = "$marker" ] && [ "$active_epoch" = "$epoch" ] || return 1
+      while IFS= read -r latest; do :; done < "$(pg_rounds_dir)/$key" 2>/dev/null
+      [ "$latest" = "$epoch" ] || return 1
+      binding="$(pg_review_input_binding_read "$marker" 2>/dev/null || true)"; [ -n "$binding" ] || return 1
+      [ "$(jq -r .charged_spend_epoch <<<"$binding")" = "$epoch" ] || return 1
+    fi
+    pg_attempt_disposition_write "$host" "$owner" "$repo" "$pr" "$key" "$marker" "$epoch" "$kind" "$proof" || return 1
+    disposition="$(pg_attempt_disposition_read "$marker" 2>/dev/null || true)"; [ -n "$disposition" ] || return 1
+  fi
+  pg_attempt_disposition_cleanup "$disposition"
+}
+
 pg_attempt_artifact() { # marker -> kind<TAB>path for a validated canonical review
   local marker="$1" path
   pg_reservation_marker_ok "$marker" || return 1
@@ -650,11 +848,51 @@ pg_attempt_artifact() { # marker -> kind<TAB>path for a validated canonical revi
 pg_attempt_snapshot() { # host owner repo pr round-key [exclude-marker] -> canonical JSON
   local host="$1" owner="$2" repo="$3" pr="$4" key="$5" exclude="${6:-}"
   local marker="" source=none state=none active_state=none epoch=0 out="" rec artifact="" artifact_kind="" artifact_path=""
-  local active_file reservation latest_unresolved recoverable=false fresh=true
+  local active_file reservation latest_unresolved disposition="" disposition_artifact="" cleanup=false terminal_json=null recoverable=false fresh=true
+  local disposition_marker="" disposition_epoch=0 competing_marker="" competing_epoch=0 ignore_disposition=false
   pg_have jq || return 1
   pg_canonical_repo_ok "$host" "$owner" "$repo" || return 1
   pr="$(pg_pr_number_normalize "$pr")" || return 1
   pg_round_key_ok "$key" || return 1
+
+  disposition="$(pg_attempt_disposition_find "$host" "$owner" "$repo" "$pr" 2>/dev/null || true)"
+  if [ -n "$disposition" ]; then
+    disposition_marker="$(jq -r .marker <<<"$disposition")"; disposition_epoch="$(jq -r .charged_spend_epoch <<<"$disposition")"
+    active_file="$(pg_active_dir)/$key"
+    if [ -f "$active_file" ] && [ ! -L "$active_file" ]; then
+      IFS=$'\t' read -r competing_marker _ _ _ _ _ _ competing_epoch < "$active_file" 2>/dev/null || true
+      if pg_reservation_marker_ok "$competing_marker" && [ "$competing_marker" != "$disposition_marker" ] && [ "$competing_marker" != "$exclude" ]; then ignore_disposition=true; fi
+    fi
+    if [ "$ignore_disposition" = false ]; then
+      competing_marker="$(pg_reservation_find_pr "$key" 2>/dev/null || true)"
+      if pg_reservation_marker_ok "$competing_marker" && [ "$competing_marker" != "$disposition_marker" ] && [ "$competing_marker" != "$exclude" ]; then ignore_disposition=true; fi
+    fi
+    if [ "$ignore_disposition" = false ]; then
+      competing_marker="$(pg_run_meta_find_latest "$host" "$owner" "$repo" "$pr" unresolved 2>/dev/null || true)"
+      if [ -n "$competing_marker" ] && [ "$competing_marker" != "$disposition_marker" ] && [ "$competing_marker" != "$exclude" ]; then
+        rec="$(pg_run_meta_read "$competing_marker" 2>/dev/null || true)"
+        [ -z "$rec" ] || IFS=$'\t' read -r _ _ _ _ _ _ competing_epoch <<<"$rec"
+        case "$competing_epoch" in ''|*[!0-9]*) competing_epoch=0;; esac
+        if [ "$competing_epoch" -gt "$disposition_epoch" ] || { [ "$competing_epoch" = "$disposition_epoch" ] && [[ "$competing_marker" > "$disposition_marker" ]]; }; then ignore_disposition=true; fi
+      fi
+    fi
+    if [ "$ignore_disposition" = true ]; then disposition=""; else
+      marker="$disposition_marker"; epoch="$disposition_epoch"
+      if [ "$marker" = "$exclude" ]; then marker=""; disposition=""; else
+      disposition_artifact="$(pg_attempt_artifact "$marker" 2>/dev/null || true)"
+      if [ -n "$disposition_artifact" ]; then
+        IFS=$'\t' read -r artifact_kind artifact_path <<<"$disposition_artifact"
+        source=artifact; state=review-ready; fresh=false; terminal_json=null
+      else
+        cleanup=false; pg_attempt_disposition_cleanup_pending "$disposition" && cleanup=true
+        source=disposition; recoverable=false; terminal_json="$disposition"
+        if [ "$cleanup" = true ]; then state=cleanup-pending; fresh=false; else state="$(jq -r .terminal_kind <<<"$disposition")"; fresh=true; fi
+      fi
+      rec="$(pg_run_meta_read "$marker" 2>/dev/null || true)"
+      if [ -n "$rec" ]; then IFS=$'\t' read -r _ _ _ _ _ out _ <<<"$rec"; fi
+    fi
+  fi
+  fi
 
   if [ -z "$marker" ]; then
     active_file="$(pg_active_dir)/$key"
@@ -702,8 +940,8 @@ pg_attempt_snapshot() { # host owner repo pr round-key [exclude-marker] -> canon
   jq -cnS --arg host "$host" --arg owner "$owner" --arg repo "$repo" --argjson pr "$pr" \
     --arg key "$key" --arg marker "$marker" --arg source "$source" --arg state "$state" \
     --arg out "$out" --arg kind "$artifact_kind" --arg path "$artifact_path" --argjson epoch "$epoch" \
-    --argjson recoverable "$recoverable" --argjson fresh "$fresh" \
-    '{artifact:{kind:$kind,path:$path},charged_spend_epoch:$epoch,cleanup_pending:false,fresh_eligible:$fresh,marker:$marker,out:$out,recoverable:$recoverable,source:$source,state:$state,target:{host:$host,owner:$owner,pr:$pr,repo:$repo,round_key:$key},terminal:null}'
+    --argjson recoverable "$recoverable" --argjson fresh "$fresh" --argjson cleanup "$cleanup" --argjson terminal "$terminal_json" \
+    '{artifact:{kind:$kind,path:$path},charged_spend_epoch:$epoch,cleanup_pending:$cleanup,fresh_eligible:$fresh,marker:$marker,out:$out,recoverable:$recoverable,source:$source,state:$state,target:{host:$host,owner:$owner,pr:$pr,repo:$repo,round_key:$key},terminal:$terminal}'
 }
 
 # Shared guard for reservation writes/removes AND the fresh-run count+slot-acquire decision.
