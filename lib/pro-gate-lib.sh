@@ -500,6 +500,13 @@ pg_canonical_repo_ok() { # host owner repo
   case "$repo" in ''|*[!A-Za-z0-9._-]*) return 1;; esac
   return 0
 }
+pg_pr_number_normalize() { # digit-only spelling -> canonical positive decimal
+  local pr="${1:-}"
+  case "$pr" in ''|*[!0-9]*) return 1;; esac
+  while [ "${pr#0}" != "$pr" ]; do pr="${pr#0}"; done
+  [ -n "$pr" ] || return 1
+  printf '%s\n' "$pr"
+}
 pg_repo_identity_from_url() { # GitHub/Git remote URL -> host<TAB>owner<TAB>repo
   local url="${1:-}" host owner repo
   if [[ "$url" =~ ^https?://([^/]+)/([^/]+)/([^/]+)(/pull/[0-9]+)?/?$ ]]; then
@@ -526,7 +533,9 @@ pg_run_meta_write() { # marker host owner repo round_key pr out charged_spend_ep
   pg_reservation_marker_ok "$marker" || return 1
   pg_canonical_repo_ok "$host" "$owner" "$repo" || return 1
   pg_round_key_ok "$key" || return 1
-  case "$pr" in ''|*[!0-9]*) return 1;; esac
+  pr="$(pg_pr_number_normalize "$pr")" || return 1
+  case "$key" in *-"$pr") ;; *) return 1;; esac
+  case "$marker" in "pg-run-${key}-"*) ;; *) return 1;; esac
   case "$out" in *$'\t'*|*$'\n'*) return 1;; esac
   case "$spend" in ''|*[!0-9]*) return 1;; esac
   dir="$(pg_run_meta_dir)"; mkdir -p "$dir" 2>/dev/null || return 1
@@ -550,7 +559,9 @@ pg_run_meta_read() { # marker -> one validated compact record
   IFS=$'\t' read -r host owner repo key pr out spend < "$f" 2>/dev/null || return 1
   pg_canonical_repo_ok "$host" "$owner" "$repo" || return 1
   pg_round_key_ok "$key" || return 1
-  case "$pr" in ''|*[!0-9]*) return 1;; esac
+  pr="$(pg_pr_number_normalize "$pr")" || return 1
+  case "$key" in *-"$pr") ;; *) return 1;; esac
+  case "$marker" in "pg-run-${key}-"*) ;; *) return 1;; esac
   case "$out" in *$'\t'*|*$'\n'*) return 1;; esac
   case "$spend" in ''|*[!0-9]*) return 1;; esac
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$host" "$owner" "$repo" "$key" "$pr" "$out" "$spend"
@@ -581,6 +592,43 @@ pg_run_meta_scan() {
     rec="$(pg_run_meta_read "$marker" 2>/dev/null)" || continue
     printf '%s\t%s\n' "$marker" "$rec"
   done
+}
+
+# A charged run-meta row is unresolved until that exact marker has durable review bytes. This is
+# lifecycle only: a terminal artifact can be stale for the caller's current code/evidence, but it
+# still proves its own attempt is no longer unknown-fate. Keep this predicate shared so public
+# decision queries and guarded dispatch rechecks cannot disagree about the same sidecar.
+pg_run_meta_has_terminal_review() { # marker
+  local marker="$1" artifact
+  pg_reservation_marker_ok "$marker" || return 1
+  artifact="$(pg_completed_dir)/$marker"
+  if [ -f "$artifact" ] && [ ! -L "$artifact" ] && pg_is_review "$artifact"; then return 0; fi
+  artifact="$PRO_GATE_HOME/pending/$marker"
+  [ -f "$artifact" ] && [ ! -L "$artifact" ] && pg_is_review "$artifact"
+}
+
+pg_run_meta_find_unresolved() { # host owner repo pr -> newest exact unresolved marker
+  local want_host="$1" want_owner="$2" want_repo="$3" want_pr="$4"
+  local marker host owner repo key pr out spend best_marker="" best_spend="" LC_ALL=C
+  pg_canonical_repo_ok "$want_host" "$want_owner" "$want_repo" || return 1
+  want_pr="$(pg_pr_number_normalize "$want_pr")" || return 1
+  while IFS=$'\t' read -r marker host owner repo key pr out spend; do
+    # Canonical identity, not the lossy filename key, owns this match. Historical keys can retain
+    # a remote's trailing .git while pg_repo_identity_from_url normalizes it away; requiring both
+    # aliases would make the public query miss work the engine already knows is the same PR.
+    [ "$host" = "$want_host" ] && [ "$owner" = "$want_owner" ] && [ "$repo" = "$want_repo" ] \
+      && [ "$pr" = "$want_pr" ] || continue
+    pg_run_meta_has_terminal_review "$marker" && continue
+    # Prefer the authoritative charge epoch, not marker mint/glob order. Exact-marker recovery is
+    # safe when two charges share one-second precision; break that tie canonically so every query
+    # and effect chooses the same marker without authorizing another spend.
+    if [ -z "$best_spend" ] || [ "$spend" -gt "$best_spend" ] \
+      || { [ "$spend" = "$best_spend" ] && [[ "$marker" > "$best_marker" ]]; }; then
+      best_marker="$marker"; best_spend="$spend"
+    fi
+  done < <(pg_run_meta_scan)
+  [ -n "$best_marker" ] || return 1
+  printf '%s\n' "$best_marker"
 }
 
 # Shared guard for reservation writes/removes AND the fresh-run count+slot-acquire decision.
@@ -1786,7 +1834,7 @@ pg_completed_lookup() {  # <marker> <out>: place the artifact at <out>; rc 0 on 
   local marker="$1" out="$2" src rc
   pg_reservation_marker_ok "$marker" || return 1
   src="$(pg_completed_dir)/$marker"
-  { [ -s "$src" ] && pg_is_review "$src"; } || return 1
+  { [ -s "$src" ] && [ ! -L "$src" ] && pg_is_review "$src"; } || return 1
   [ "$src" = "$out" ] && return 0
   # Copy-then-rename only — never pre-delete the destination (gate #54 r4 P2): a copy/rename
   # failure must leave any existing valid output intact, not destroy it and then fail.

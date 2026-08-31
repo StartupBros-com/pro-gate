@@ -322,13 +322,20 @@ pg_review_decision_cli() {
   [ "$(git -C "$repo" rev-parse --is-inside-work-tree 2>/dev/null)" = true ] \
     || { echo 'ERROR: review-decision requires a local git working tree' >&2; return 2; }
   case "$PR" in
-    http*://*/pull/*) pr_num="${PR%/}"; pr_num="${pr_num##*/}" ;;
-    *) pr_num="$PR" ;;
+    http*://*/pull/*)
+      pr_num="${PR%/}"; pr_num="${pr_num##*/}"
+      ident="$(pg_repo_identity_from_url "${PR%/}" 2>/dev/null || true)"
+      [ -n "$ident" ] || { echo 'ERROR: review-decision requires a canonical PR target' >&2; return 2; }
+      ;;
+    *)
+      pr_num="$PR"
+      remote="$(git -C "$repo" remote get-url origin 2>/dev/null || true)"
+      ident="$(pg_repo_identity_from_url "$remote" 2>/dev/null || true)"
+      [ -n "$ident" ] || { echo 'ERROR: review-decision requires canonical origin repository proof' >&2; return 2; }
+      ;;
   esac
-  case "$pr_num" in ''|*[!0-9]*) echo 'ERROR: review-decision requires a numeric or canonical PR target' >&2; return 2;; esac
-  remote="$(git -C "$repo" remote get-url origin 2>/dev/null || true)"
-  ident="$(pg_repo_identity_from_url "$remote" 2>/dev/null || true)"
-  [ -n "$ident" ] || { echo 'ERROR: review-decision requires canonical origin repository proof' >&2; return 2; }
+  pr_num="$(pg_pr_number_normalize "$pr_num")" \
+    || { echo 'ERROR: review-decision requires a numeric or canonical PR target' >&2; return 2; }
   IFS=$'\t' read -r host owner repo_name <<< "$ident"
   head="$(git -C "$repo" rev-parse HEAD 2>/dev/null || true)"
   case "$head" in *[!0-9a-f]*|'') echo 'ERROR: review-decision cannot prove the current head' >&2; return 2;; esac
@@ -492,14 +499,20 @@ pg_review_decision_cli() {
     {code_identity:"",evidence_identity:"",marker:"",verdict:"NONE"} |
     {applicable:false,binding_valid:(.marker != ""),code_identity,evidence_identity,legacy:false,marker,provenance_valid:(.marker != ""),verdict}' <<<"$prior_candidates")"
 
-  # Active index and reservation authority are read directly without reconciliation. Querying a
-  # stale record is conservative (recover), while reconciliation itself is an effect and forbidden.
+  # Active index, reservation, and charged run-meta authority are read directly without
+  # reconciliation. Querying stale work is conservative (recover), while reconciliation itself is
+  # an effect and forbidden. The shared run-meta selector is also used at guarded dispatch
+  # boundaries: a public recovery effect must not oscillate back to a fresh grant.
   if [ -f "$PRO_GATE_HOME/active/$round_key" ] && [ ! -L "$PRO_GATE_HOME/active/$round_key" ]; then
     IFS=$'\t' read -r active_marker _ _ _ _ _ < "$PRO_GATE_HOME/active/$round_key" 2>/dev/null || true
     if pg_reservation_marker_ok "$active_marker"; then active_state=live; else active_marker=""; fi
   fi
   reservation_marker="$(pg_reservation_find_pr "$round_key" 2>/dev/null || true)"
   if pg_reservation_marker_ok "$reservation_marker"; then reservation_state=live; else reservation_marker=""; fi
+  if [ -z "$active_marker" ]; then
+    active_marker="$(pg_run_meta_find_unresolved "$host" "$owner" "$repo_name" "$pr_num" 2>/dev/null || true)"
+    [ -z "$active_marker" ] || active_state=unknown-fate
+  fi
   if pg_round_guard "$round_key" >/dev/null 2>&1; then governor_granted=true; fi
 
   facts="$(jq -cnS --arg h "$host" --arg o "$owner" --arg r "$repo_name" --arg head "$head" --argjson pr "$pr_num" \
@@ -610,6 +623,10 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
       [ -n "$REC_IDENT" ] || recover_disambiguate "bare PR #$REC_QUERY_NUM has no canonical repository proof"
       IFS=$'\t' read -r REC_HOST REC_OWNER REC_REPO_NAME <<< "$REC_IDENT";;
   esac
+  if [ -z "$REC_SELECTED" ]; then
+    REC_QUERY_NUM="$(pg_pr_number_normalize "$REC_QUERY_NUM")" \
+      || recover_disambiguate "PR target is not a canonical positive number"
+  fi
 
   if [ -z "$REC_SELECTED" ]; then
     REC_SEEN=""; REC_NEW_COUNT=0; REC_LEGACY=""; REC_CONFLICT=""; REC_BEST_EPOCH=""; REC_BEST_MARKER=""; REC_BEST_OUT=""; REC_TIED=0
@@ -688,9 +705,9 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
   REC_ART="$(pg_completed_dir)/$REC_SELECTED"
   REC_PENDING_ART="$PRO_GATE_HOME/pending/$REC_SELECTED"
   REC_SRC=""
-  if [ -s "$REC_ART" ] && pg_is_review "$REC_ART"; then
+  if [ -s "$REC_ART" ] && [ ! -L "$REC_ART" ] && pg_is_review "$REC_ART"; then
     REC_SRC="$REC_ART"
-  elif [ -s "$REC_PENDING_ART" ] && pg_is_review "$REC_PENDING_ART"; then
+  elif [ -s "$REC_PENDING_ART" ] && [ ! -L "$REC_PENDING_ART" ] && pg_is_review "$REC_PENDING_ART"; then
     REC_SRC="$REC_PENDING_ART"
   fi
   if [ -n "$REC_SRC" ]; then
@@ -1582,20 +1599,12 @@ pg_fresh_dispatch_recheck() { # sets PG_FRESH_DECISION/PG_FRESH_ACTION
   fi
   reservation="$(pg_reservation_find_pr "$ROUND_KEY" 2>/dev/null || true)"
   if ! pg_reservation_marker_ok "$reservation"; then reservation=""; fi
-  # A run-meta row with no active state is unknown-fate only while its own charged run has no
-  # durable terminal bytes. completed/pending resolves that marker's lifecycle, never whether its
-  # old result applies to the current relation; keep scanning so another unresolved run still wins.
+  # Run-meta-only lifecycle is assembled by the same read-only selector as the public decision
+  # query. It skips only exact-marker terminal review bytes and keeps scanning for another
+  # unresolved charge, so recovery remains fail-closed without diverging across dispatch layers.
   if [ -z "$active_marker" ]; then
-    for f in "$(pg_run_meta_dir)"/pg-run-"$ROUND_KEY"-*; do
-      [ -f "$f" ] && [ ! -L "$f" ] || continue
-      m="${f##*/}"; rec="$(pg_run_meta_read "$m" 2>/dev/null || true)"
-      [ -n "$rec" ] || continue
-      artifact="$(pg_completed_dir)/$m"
-      if [ -f "$artifact" ] && [ ! -L "$artifact" ] && pg_is_review "$artifact"; then continue; fi
-      artifact="$PRO_GATE_HOME/pending/$m"
-      if [ -f "$artifact" ] && [ ! -L "$artifact" ] && pg_is_review "$artifact"; then continue; fi
-      active_marker="$m"; astate=unknown-fate; break
-    done
+    active_marker="$(pg_run_meta_find_unresolved "$PG_META_HOST" "$PG_META_OWNER" "$PG_META_REPO" "$PR_NUM" 2>/dev/null || true)"
+    [ -z "$active_marker" ] || astate=unknown-fate
   fi
   pg_round_guard "$ROUND_KEY" >/dev/null 2>&1 && granted=true
   facts="$(jq -cnS --arg h "$PG_META_HOST" --arg o "$PG_META_OWNER" --arg r "$PG_META_REPO" --arg head "$head" --argjson p "$PR_NUM" \
@@ -2056,7 +2065,8 @@ pg_finish() {  # $1 exit code — settle organization, ramp, and ledger exactly 
 # is down (the exact condition the artifact exists for). No lock needed: the artifact is
 # write-once and installed atomically, so a concurrent reader can never observe a torn copy.
 if [ -n "$HARVEST_MARKER" ] && pg_reservation_marker_ok "$HARVEST_MARKER" \
-   && [ -s "$(pg_completed_dir)/$HARVEST_MARKER" ] && pg_is_review "$(pg_completed_dir)/$HARVEST_MARKER"; then
+   && [ -s "$(pg_completed_dir)/$HARVEST_MARKER" ] && [ ! -L "$(pg_completed_dir)/$HARVEST_MARKER" ] \
+   && pg_is_review "$(pg_completed_dir)/$HARVEST_MARKER"; then
   # Full run identity BEFORE any status/ledger write (gate #54 r5 P2): without it this row
   # landed as pr=diff with no round_key, invisible to --status/stats and unable to retire a
   # dead active record. The RETURNED bytes come from a process-private snapshot of the
@@ -2347,6 +2357,7 @@ if [ -n "$HARVEST_MARKER" ]; then
          # a collection (gate #54 r1+r2 P1), and pre-existing $OUT content never counts.
          PRIOR_OUT=""; PRIOR_SHA=""; COLLECT_OK=0; COLLECT_SRC=""
          if [ -s "$(pg_completed_dir)/$RUN_MARKER" ] \
+            && [ ! -L "$(pg_completed_dir)/$RUN_MARKER" ] \
             && cp "$(pg_completed_dir)/$RUN_MARKER" "$WORK/already.snap" 2>/dev/null \
             && pg_is_review "$WORK/already.snap"; then
            # Snapshot-first here too (gate #54 r8): this branch is reachable when a second
@@ -2414,7 +2425,7 @@ fi
 PR_URL=""; PR_NUM=""
 if [ -n "$PR" ]; then
   if [[ "$PR" =~ ^https?:// ]]; then
-    PR_URL="$PR"; PR_NUM="${PR##*/}"
+    PR_URL="${PR%/}"; PR_NUM="${PR_URL##*/}"
     if [ -z "$REPO" ]; then
       NAME="$(printf '%s' "$PR_URL" | sed -E 's#https?://github.com/[^/]+/([^/]+)/pull/.*#\1#')"
       for base in "${PRO_GATE_REPOS_DIR:-$HOME/SITES}" "$HOME/src" "$HOME/code" "$HOME/dev"; do
@@ -2424,6 +2435,9 @@ if [ -n "$PR" ]; then
   else
     PR_NUM="$PR"
   fi
+fi
+if [ -n "$PR_NUM" ]; then
+  PR_NUM="$(pg_pr_number_normalize "$PR_NUM")" || usage
 fi
 [ -n "$REPO" ] || REPO="$(pwd)"
 cd "$REPO" || { echo "ERROR: repo dir not found: $REPO" >&2; pg_status failed "repo dir not found"; pg_finish 4; }

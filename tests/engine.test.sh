@@ -3128,6 +3128,22 @@ check 'recover artifact fast path has no fresh dispatch, status, ledger, round, 
   "$([ ! -s "$TDIR/recover-oracle-sentinel" ] && [ "$REC_BEFORE" = "$REC_AFTER" ] && [ ! -e "$TDIR/recover-out.md.status" ]; echo $?)" \
   "oracle=$(cat "$TDIR/recover-oracle-sentinel") before=$REC_BEFORE after=$REC_AFTER"
 
+# Marker-addressed recovery never follows a completed/pending symlink, even when its target contains
+# structurally valid review bytes. The lifecycle selector and exact recovery fast path must agree.
+for REC_LINK_STORE in completed pending; do
+  REC_LINK_HOME="$TDIR/home-recover-link-$REC_LINK_STORE"
+  REC_LINK_MARKER="pg-run-acme-widgets-43-1700001001-${REC_LINK_STORE#?}"
+  REC_LINK_TARGET="$TDIR/recover-link-$REC_LINK_STORE.md"
+  mkdir -p "$REC_LINK_HOME/$REC_LINK_STORE" "$REC_LINK_HOME/run-meta"
+  printf '[P1] src/link.sh:1 - symlink target\n  Why: unrelated bytes\nP2: none\nP3: none\nVERDICT: SHIP - linked.\n' > "$REC_LINK_TARGET"
+  ln -s "$REC_LINK_TARGET" "$REC_LINK_HOME/$REC_LINK_STORE/$REC_LINK_MARKER"
+  printf 'github.com\tacme\twidgets\tacme-widgets-43\t43\t%s\t1700002001\n' "$TDIR/recover-link-out.md" > "$REC_LINK_HOME/run-meta/$REC_LINK_MARKER"
+  recover_run "$REC_LINK_HOME" --recover "$REC_LINK_MARKER" --timeout 1s
+  check "recover exact marker refuses a $REC_LINK_STORE symlink instead of returning its target" \
+    "$([ "$RC" -ne 0 ] && ! grep -qF 'symlink target' "$TDIR/recover.stdout" && ! grep -qF 'Review ready' "$TDIR/recover.stderr"; echo $?)" \
+    "rc=$RC stdout=$(cat "$TDIR/recover.stdout") stderr=$(cat "$TDIR/recover.stderr")"
+done
+
 # Repo-qualified URL and a current-repo --repo bare PR both resolve one newest durable candidate.
 REC_NEW='pg-run-acme-widgets-42-1700000001-12'
 printf '[P1] src/new.sh:1 - newer finding\n  Why: newest fixture\nP2: none\nP3: none\nVERDICT: SHIP - newer.\n' > "$REC_HOME/completed/$REC_NEW"
@@ -4341,14 +4357,16 @@ fresh_reset_state() {
   rm -rf "$FRESH_HOME"
 }
 fresh_query() {
+  local target="${1:-77}"
   env PRO_GATE_HOME="$FRESH_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/fresh-endpoint.patch" \
-    bash "$ENGINE" --review-decision --repo "$FRESH_REPO" --pr 77 --diff "$TDIR/fresh-effect.patch" --input bundle
+    bash "$ENGINE" --review-decision --repo "$FRESH_REPO" --pr "$target" --diff "$TDIR/fresh-effect.patch" --input bundle
 }
 fresh_effect() {
+  local target="${3:-77}"
   env PATH="$TDIR/fresh-bin:$PATH" PRO_GATE_HOME="$FRESH_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/fresh-endpoint.patch" \
     ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_ORACLE_BIN="$TDIR/fresh-bin/oracle" \
     PG_TEST_FRESH_HOME="$FRESH_HOME" PG_TEST_FRESH_ORACLE="$TDIR/fresh-oracle.calls" PRO_GATE_EARLY_PROBE_SECS=0 \
-    bash "$ENGINE" --review-decision --review-decision-effect "$1" --repo "$FRESH_REPO" --pr 77 --diff "$TDIR/fresh-effect.patch" --input bundle --out "$2" --timeout 5s \
+    bash "$ENGINE" --review-decision --review-decision-effect "$1" --repo "$FRESH_REPO" --pr "$target" --diff "$TDIR/fresh-effect.patch" --input bundle --out "$2" --timeout 5s \
     >"$TDIR/fresh.stdout" 2>"$TDIR/fresh.stderr"
   FRESH_RC=$?
 }
@@ -4395,10 +4413,77 @@ for fresh_kind in completed active reserved unknown-fate; do
   check "fresh pre-lock guard supersedes advisory for $fresh_kind without Oracle dispatch" \
     "$([ ! -s "$TDIR/fresh-oracle.calls" ]; echo $?)" \
     "rc=$FRESH_RC stdout=$(cat "$TDIR/fresh.stdout") stderr=$(cat "$TDIR/fresh.stderr")"
-  [ "$fresh_kind" != unknown-fate ] || check 'run-meta without terminal bytes remains recoverable unknown-fate work' \
-    "$([ "$FRESH_RC" -eq 9 ] && jq -e --arg marker "$FRESH_UNKNOWN_MARKER" '.action=="recover-existing-review" and .effect_request.applicable_ref==$marker' "$TDIR/fresh.stdout" >/dev/null 2>&1; echo $?)" \
+  [ "$fresh_kind" != unknown-fate ] || check 'effect freshness exposes run-meta without terminal bytes as recoverable unknown-fate work' \
+    "$([ "$FRESH_RC" -eq 0 ] && jq -e --arg marker "$FRESH_UNKNOWN_MARKER" '.action=="recover-existing-review" and .effect_request.applicable_ref==$marker' "$TDIR/fresh.stdout" >/dev/null 2>&1; echo $?)" \
     "rc=$FRESH_RC stdout=$(cat "$TDIR/fresh.stdout") stderr=$(cat "$TDIR/fresh.stderr")"
 done
+
+# Run-meta-only recovery must be visible to the public query that issues effect requests, not
+# discovered for the first time after a run-granted effect enters pre-lock dispatch. Replaying the
+# exact recovery effect must preserve its marker and spend nothing instead of oscillating back to
+# run-granted-review.
+fresh_reset_state
+FRESH_UNKNOWN_MARKER='pg-run-acme-fresh.git-77-1700014003-4'
+mkdir -p "$FRESH_HOME/run-meta" "$FRESH_HOME/rounds"
+printf 'github.com\tacme\tfresh\t%s\t77\t%s\t1700014003\n' "$FRESH_KEY" "$TDIR/x" > "$FRESH_HOME/run-meta/$FRESH_UNKNOWN_MARKER"
+printf '%s\n' "$(date +%s)" > "$FRESH_HOME/rounds/$FRESH_KEY"
+FRESH_RECOVERY="$(fresh_query)"
+check 'public decision query exposes run-meta-only recovery with its exact marker' \
+  "$(jq -e --arg marker "$FRESH_UNKNOWN_MARKER" '.action=="recover-existing-review" and .effect_request.applicable_ref==$marker' <<<"$FRESH_RECOVERY" >/dev/null 2>&1; echo $?)" \
+  "$FRESH_RECOVERY"
+printf '%s\n' "$FRESH_RECOVERY" > "$TDIR/fresh-recovery.json"
+: > "$TDIR/fresh-oracle.calls"
+fresh_effect "$TDIR/fresh-recovery.json" "$TDIR/fresh-recovery.md"
+check 'run-meta-only recovery effect stays stable without Oracle dispatch or another spend' \
+  "$([ "$FRESH_RC" -eq 0 ] && [ ! -s "$TDIR/fresh-oracle.calls" ] && [ "$(wc -l < "$FRESH_HOME/rounds/$FRESH_KEY")" -eq 1 ] && jq -e --arg marker "$FRESH_UNKNOWN_MARKER" '.action=="recover-existing-review" and .effect_request.applicable_ref==$marker' "$TDIR/fresh.stdout" >/dev/null 2>&1; echo $?)" \
+  "rc=$FRESH_RC rounds=$(wc -l < "$FRESH_HOME/rounds/$FRESH_KEY") stdout=$(cat "$TDIR/fresh.stdout") stderr=$(cat "$TDIR/fresh.stderr")"
+FRESH_LEADING_ZERO="$(fresh_query 077)"
+check 'leading-zero PR spelling normalizes to the same run-meta recovery identity' \
+  "$(jq -e --arg marker "$FRESH_UNKNOWN_MARKER" '.action=="recover-existing-review" and .effect_request.target.pr==77 and .effect_request.applicable_ref==$marker' <<<"$FRESH_LEADING_ZERO" >/dev/null 2>&1; echo $?)" \
+  "$FRESH_LEADING_ZERO"
+printf '%s\n' "$FRESH_LEADING_ZERO" > "$TDIR/fresh-leading-zero.json"
+fresh_effect "$TDIR/fresh-leading-zero.json" "$TDIR/fresh-leading-zero.md" 077
+check 'leading-zero recovery effect remains stable without a duplicate spend' \
+  "$([ "$FRESH_RC" -eq 0 ] && [ "$(wc -l < "$FRESH_HOME/rounds/$FRESH_KEY")" -eq 1 ] && jq -e --arg marker "$FRESH_UNKNOWN_MARKER" '.action=="recover-existing-review" and .effect_request.applicable_ref==$marker' "$TDIR/fresh.stdout" >/dev/null 2>&1; echo $?)" \
+  "rc=$FRESH_RC stdout=$(cat "$TDIR/fresh.stdout") stderr=$(cat "$TDIR/fresh.stderr")"
+
+# A repository-qualified PR URL owns canonical recovery identity even when the checkout belongs to
+# a fork with the same PR number. Both public query and effect freshness must select upstream work.
+fresh_reset_state
+FRESH_FORK_MARKER='pg-run-acme-fresh.git-77-1700014004-5'
+FRESH_UPSTREAM_MARKER='pg-run-upstream-project-77-1700014005-6'
+mkdir -p "$FRESH_HOME/run-meta"
+printf 'github.com\tacme\tfresh\t%s\t77\t%s\t1700014004\n' "$FRESH_KEY" "$TDIR/fork" > "$FRESH_HOME/run-meta/$FRESH_FORK_MARKER"
+printf 'github.com\tupstream\tproject\tupstream-project-77\t77\t%s\t1700014005\n' "$TDIR/upstream" > "$FRESH_HOME/run-meta/$FRESH_UPSTREAM_MARKER"
+FRESH_URL_RECOVERY="$(fresh_query 'https://github.com/upstream/project/pull/77')"
+check 'repository-qualified decision query selects upstream run-meta instead of fork origin' \
+  "$(jq -e --arg marker "$FRESH_UPSTREAM_MARKER" '.action=="recover-existing-review" and .effect_request.target.owner=="upstream" and .effect_request.target.repo=="project" and .effect_request.applicable_ref==$marker' <<<"$FRESH_URL_RECOVERY" >/dev/null 2>&1; echo $?)" \
+  "$FRESH_URL_RECOVERY"
+printf '%s\n' "$FRESH_URL_RECOVERY" > "$TDIR/fresh-url-recovery.json"
+fresh_effect "$TDIR/fresh-url-recovery.json" "$TDIR/fresh-url-recovery.md" 'https://github.com/upstream/project/pull/77'
+check 'repository-qualified recovery effect preserves the upstream marker without Oracle dispatch' \
+  "$([ "$FRESH_RC" -eq 0 ] && [ ! -s "$TDIR/fresh-oracle.calls" ] && jq -e --arg marker "$FRESH_UPSTREAM_MARKER" '.action=="recover-existing-review" and .effect_request.applicable_ref==$marker' "$TDIR/fresh.stdout" >/dev/null 2>&1; echo $?)" \
+  "rc=$FRESH_RC stdout=$(cat "$TDIR/fresh.stdout") stderr=$(cat "$TDIR/fresh.stderr")"
+
+# Charge epoch, then canonical marker order, selects one stable unresolved attempt. A copied row
+# whose marker/key/PR disagree is invalid state and cannot redirect recovery across changes.
+fresh_reset_state
+FRESH_OLDER_MARKER='pg-run-acme-fresh.git-77-1700014006-1'
+FRESH_TIED_A='pg-run-acme-fresh.git-77-1700014010-7'
+FRESH_TIED_B='pg-run-acme-fresh.git-77-1700014010-8'
+FRESH_CORRUPT_MARKER='pg-run-acme-other-88-1700014011-9'
+mkdir -p "$FRESH_HOME/run-meta"
+printf 'github.com\tacme\tfresh\t%s\t77\t%s\t1700014006\n' "$FRESH_KEY" "$TDIR/older" > "$FRESH_HOME/run-meta/$FRESH_OLDER_MARKER"
+printf 'github.com\tacme\tfresh\t%s\t77\t%s\t1700014020\n' "$FRESH_KEY" "$TDIR/tied-a" > "$FRESH_HOME/run-meta/$FRESH_TIED_A"
+printf 'github.com\tacme\tfresh\t%s\t77\t%s\t1700014020\n' "$FRESH_KEY" "$TDIR/tied-b" > "$FRESH_HOME/run-meta/$FRESH_TIED_B"
+printf 'github.com\tacme\tfresh\tacme-other-88\t77\t%s\t1700014030\n' "$TDIR/corrupt" > "$FRESH_HOME/run-meta/$FRESH_CORRUPT_MARKER"
+FRESH_NEWEST_RECOVERY="$(fresh_query)"
+check 'unresolved selector uses newest charge and canonical tie-break while rejecting mismatched rows' \
+  "$(jq -e --arg marker "$FRESH_TIED_B" '.action=="recover-existing-review" and .effect_request.applicable_ref==$marker' <<<"$FRESH_NEWEST_RECOVERY" >/dev/null 2>&1; echo $?)" \
+  "$FRESH_NEWEST_RECOVERY"
+check 'run-meta scan excludes a marker/key/PR mismatch' \
+  "$(! PRO_GATE_HOME="$FRESH_HOME" pg_run_meta_read "$FRESH_CORRUPT_MARKER" >/dev/null 2>&1; echo $?)" \
+  "unexpectedly accepted $FRESH_CORRUPT_MARKER"
 
 # Exact marker-bound pending bytes are durable recovery work after active/reservation state has
 # cleared: dispatch must not spend again. A pending SHIP remains uncollected data, never merge
@@ -4451,6 +4536,11 @@ for terminal_store in completed pending; do
   mkdir -p "$FRESH_HOME/$terminal_store" "$FRESH_HOME/run-meta"
   printf 'P0: none\nP1: none\nVERDICT: FIX-FIRST - historical.\n' > "$FRESH_HOME/$terminal_store/$FRESH_TERMINAL_MARKER"
   printf 'github.com\tacme\tfresh\t%s\t77\t%s\t1700013998\n' "$FRESH_KEY" "$TDIR/x" > "$FRESH_HOME/run-meta/$FRESH_TERMINAL_MARKER"
+  FRESH_TERMINAL_ADVISORY="$(fresh_query)"
+  check "public query treats historical $terminal_store bytes as terminal for their own run-meta marker" \
+    "$(jq -e '.action=="run-granted-review"' <<<"$FRESH_TERMINAL_ADVISORY" >/dev/null 2>&1; echo $?)" \
+    "$FRESH_TERMINAL_ADVISORY"
+  printf '%s\n' "$FRESH_TERMINAL_ADVISORY" > "$TDIR/fresh-advisory.json"
   : > "$TDIR/fresh-oracle.calls"
   fresh_effect "$TDIR/fresh-advisory.json" "$TDIR/fresh-terminal-$terminal_store.md"
   check "historical $terminal_store bytes retire same-marker run-meta without gaining applicability" \
@@ -4468,10 +4558,15 @@ mkdir -p "$FRESH_HOME/completed" "$FRESH_HOME/run-meta"
 printf 'P0: none\nP1: none\nVERDICT: SHIP - historical.\n' > "$FRESH_HOME/completed/$FRESH_RESOLVED_MARKER"
 printf 'github.com\tacme\tfresh\t%s\t77\t%s\t1700013996\n' "$FRESH_KEY" "$TDIR/x" > "$FRESH_HOME/run-meta/$FRESH_RESOLVED_MARKER"
 printf 'github.com\tacme\tfresh\t%s\t77\t%s\t1700013997\n' "$FRESH_KEY" "$TDIR/x" > "$FRESH_HOME/run-meta/$FRESH_UNRESOLVED_MARKER"
+FRESH_UNRESOLVED_RECOVERY="$(fresh_query)"
+check 'public query skips resolved run-meta and selects a later unresolved charged marker' \
+  "$(jq -e --arg marker "$FRESH_UNRESOLVED_MARKER" '.action=="recover-existing-review" and .effect_request.applicable_ref==$marker' <<<"$FRESH_UNRESOLVED_RECOVERY" >/dev/null 2>&1; echo $?)" \
+  "$FRESH_UNRESOLVED_RECOVERY"
+printf '%s\n' "$FRESH_UNRESOLVED_RECOVERY" > "$TDIR/fresh-advisory.json"
 : > "$TDIR/fresh-oracle.calls"
 fresh_effect "$TDIR/fresh-advisory.json" "$TDIR/fresh-terminal-before-unresolved.md"
 check 'resolved run-meta does not hide a later unresolved charged marker' \
-  "$([ "$FRESH_RC" -eq 9 ] && [ ! -s "$TDIR/fresh-oracle.calls" ] && jq -e --arg marker "$FRESH_UNRESOLVED_MARKER" '.action=="recover-existing-review" and .effect_request.applicable_ref==$marker' "$TDIR/fresh.stdout" >/dev/null 2>&1; echo $?)" \
+  "$([ "$FRESH_RC" -eq 0 ] && [ ! -s "$TDIR/fresh-oracle.calls" ] && jq -e --arg marker "$FRESH_UNRESOLVED_MARKER" '.action=="recover-existing-review" and .effect_request.applicable_ref==$marker' "$TDIR/fresh.stdout" >/dev/null 2>&1; echo $?)" \
   "rc=$FRESH_RC stdout=$(cat "$TDIR/fresh.stdout") stderr=$(cat "$TDIR/fresh.stderr")"
 
 # Effect-time proof/governor movement returns a replacement before it reaches the engine's
