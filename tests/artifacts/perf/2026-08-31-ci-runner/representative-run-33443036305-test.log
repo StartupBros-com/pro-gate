@@ -1,0 +1,1518 @@
+﻿2026-08-31T21:47:20.0920778Z ##[group]Run bash tests/engine.test.sh
+2026-08-31T21:47:20.0921155Z [36;1mbash tests/engine.test.sh[0m
+2026-08-31T21:47:20.0921456Z [36;1mbash tests/daemon-reload.test.sh[0m
+2026-08-31T21:47:20.0921755Z [36;1mbash tests/autoupdate.test.sh[0m
+2026-08-31T21:47:20.0922074Z [36;1mbash tests/browser-launch.test.sh[0m
+2026-08-31T21:47:20.0922402Z [36;1mnode --test tests/cdp-salvage.test.mjs[0m
+2026-08-31T21:47:20.0922724Z [36;1mbash tests/distribution.test.sh[0m
+2026-08-31T21:47:20.0923019Z [36;1mbash tests/release-train.test.sh[0m
+2026-08-31T21:47:20.0923313Z [36;1mbash tests/release-assets.test.sh[0m
+2026-08-31T21:47:20.0960736Z shell: /usr/bin/bash -e {0}
+2026-08-31T21:47:20.0961021Z ##[endgroup]
+2026-08-31T21:47:20.1163343Z # hard-ceiling refusal (exit 11): only diffs past PRO_GATE_DIFF_HARD_MAX are refused
+2026-08-31T21:47:22.6980061Z ok - past-hard-ceiling diff exits 11
+2026-08-31T21:47:22.7029548Z ok - past-hard-ceiling status phase oversized
+2026-08-31T21:47:22.7036222Z ok - past-hard-ceiling spends nothing
+2026-08-31T21:47:22.8332190Z ok - native mode refuses over-cook diff (exit 11, no cook band)
+2026-08-31T21:47:22.8379784Z ok - native-mode refusal phase oversized
+2026-08-31T21:47:22.9868975Z ok - nonnumeric cook threshold still enforces hard ceiling (exit 11)
+2026-08-31T21:47:22.9869660Z # harvest: still generating
+2026-08-31T21:47:23.0069939Z ok - empty harvest marker exits 2
+2026-08-31T21:47:23.0075701Z ok - empty harvest marker cannot start a fresh review
+2026-08-31T21:47:28.3072244Z ok - harvest in-progress exits 9
+2026-08-31T21:47:28.3119911Z ok - harvest in-progress phase
+2026-08-31T21:47:28.3150064Z ok - harvest keeps the tab
+2026-08-31T21:47:28.3191037Z ok - exit-9 organizer exact-renames the owned conversation
+2026-08-31T21:47:28.3231105Z ok - exit-9 organizer never archives
+2026-08-31T21:47:28.3273073Z ok - exit-9 organizer performs rename only
+2026-08-31T21:47:28.3306895Z ok - status carries the marker
+2026-08-31T21:47:28.3312073Z ok - in-progress writes durable reservation
+2026-08-31T21:47:28.7769264Z ok - same-PR reservation blocks fresh spend
+2026-08-31T21:47:28.7801971Z ok - same-PR redirect exposes original marker
+2026-08-31T21:47:28.7836514Z ok - redirect status publishes RESERVED marker
+2026-08-31T21:47:28.9104561Z ok - different repo same number is NOT redirected
+2026-08-31T21:47:28.9105707Z # reservation reconciliation miss threshold
+2026-08-31T21:47:39.0000426Z [pro-gate] reservation pg-run-77-1700000000-11 probe miss -> retained 1/3
+2026-08-31T21:47:39.0026249Z ok - first marker miss retains reservation
+2026-08-31T21:47:39.0050933Z ok - first marker miss records streak one
+2026-08-31T21:47:46.6571700Z ok - positive probe resets miss streak
+2026-08-31T21:47:46.6711194Z ok - still-generating probe keeps the reservation occupying capacity
+2026-08-31T21:47:46.6712046Z # reservation releases capacity once its review is complete
+2026-08-31T21:47:46.8151556Z [pro-gate] reservation pg-run-77-1700000000-11 is complete — releasing its slot; collect it with --harvest (no new spend)
+2026-08-31T21:47:46.8292212Z ok - complete probe marks the reservation complete
+2026-08-31T21:47:46.8297838Z ok - completed reservation survives as a harvest pointer
+2026-08-31T21:47:46.8336454Z ok - completed reservation keeps its out path
+2026-08-31T21:47:46.8640018Z ok - completed reservation stops consuming a slot
+2026-08-31T21:47:47.1670180Z [pro-gate] reservation pg-run-acme-infra-97-1700000009-97 ended in an exact-owned ChatGPT infrastructure error — recovery released, round retained
+2026-08-31T21:47:47.1719265Z ok - reservation probe terminalizes exact-owned infrastructure error
+2026-08-31T21:47:47.2774039Z # marker validation
+2026-08-31T21:47:47.3632971Z ok - traversal marker rejected with exit 2
+2026-08-31T21:47:47.3673950Z ok - traversal marker creates no reservation state
+2026-08-31T21:47:47.3674746Z # harvest lock serializes same marker
+2026-08-31T21:47:47.4591530Z ok - concurrent same-marker harvest exits 7
+2026-08-31T21:47:47.4637263Z ok - harvest lock status is terminal failed
+2026-08-31T21:47:47.4638101Z # harvest: review completed
+2026-08-31T21:47:47.8599215Z ok - harvest done exits 0
+2026-08-31T21:47:47.8647462Z ok - harvest done phase
+2026-08-31T21:47:47.8681799Z ok - harvest writes the review
+2026-08-31T21:47:47.8711419Z ok - harvest closes the tab
+2026-08-31T21:47:47.8751785Z ok - durable harvest archives the server conversation
+2026-08-31T21:47:47.8792961Z ok - durable harvest organizes rename before archive
+2026-08-31T21:47:47.8828429Z ok - durable harvest has marker-addressed completed bytes before cleanup
+2026-08-31T21:47:47.8833806Z ok - successful harvest releases reservation
+2026-08-31T21:47:47.8881820Z ok - harvest ledger row is valid JSON
+2026-08-31T21:47:47.8915694Z ok - harvest ledger row records pre_slot_secs=0
+2026-08-31T21:47:47.8976232Z ok - harvest ledger row records post_slot_secs == secs
+2026-08-31T21:47:47.8976754Z # U2: readable stale source harvest lifecycle
+2026-08-31T21:47:50.8496195Z ok - readable stale harvest exits 0 from canonical scratch evidence
+2026-08-31T21:47:50.8527944Z ok - readable stale harvest publishes exact nonce-stripped review
+2026-08-31T21:47:50.8559809Z ok - readable stale harvest persists the exact durable artifact
+2026-08-31T21:47:50.8580515Z ok - readable stale harvest retires its reservation
+2026-08-31T21:47:50.8601222Z ok - readable stale harvest never dispatches Oracle
+2026-08-31T21:47:50.8643136Z ok - readable stale harvest leaves the source target untouched
+2026-08-31T21:47:50.8707944Z ok - readable stale harvest opens and closes exactly one scratch target
+2026-08-31T21:47:50.8748705Z ok - readable stale harvest requests the canonical conversation URL
+2026-08-31T21:47:51.3719781Z ok - stale harvest replays the completed artifact idempotently
+2026-08-31T21:47:51.3751706Z ok - idempotent stale harvest does not dispatch Oracle
+2026-08-31T21:47:51.3791809Z ok - idempotent stale harvest leaves the retired reservation absent
+2026-08-31T21:47:56.6698988Z ok - stale-incomplete stale scratch retains reservation with its existing exit
+2026-08-31T21:47:56.6736729Z ok - stale-incomplete stale scratch accepts no artifact or Oracle dispatch
+2026-08-31T21:47:56.6826147Z ok - stale-incomplete stale scratch closes only one scratch target
+2026-08-31T21:48:01.9912127Z ok - stale-inconclusive stale scratch retains reservation with its existing exit
+2026-08-31T21:48:01.9952710Z ok - stale-inconclusive stale scratch accepts no artifact or Oracle dispatch
+2026-08-31T21:48:02.0042747Z ok - stale-inconclusive stale scratch closes only one scratch target
+2026-08-31T21:48:07.3370352Z ok - stale-wrong-url stale scratch retains reservation with its existing exit
+2026-08-31T21:48:07.3407594Z ok - stale-wrong-url stale scratch accepts no artifact or Oracle dispatch
+2026-08-31T21:48:07.3496811Z ok - stale-wrong-url stale scratch closes only one scratch target
+2026-08-31T21:48:10.2412953Z ok - stale-throttle stale scratch retains reservation with its existing exit
+2026-08-31T21:48:10.2452559Z ok - stale-throttle stale scratch accepts no artifact or Oracle dispatch
+2026-08-31T21:48:10.2544963Z ok - stale-throttle stale scratch closes only one scratch target
+2026-08-31T21:48:10.2567788Z ok - throttled stale scratch keeps its reservation and writes the existing cooldown
+2026-08-31T21:48:15.6252313Z ok - stale-cross stale scratch retains reservation with its existing exit
+2026-08-31T21:48:15.6290420Z ok - stale-cross stale scratch accepts no artifact or Oracle dispatch
+2026-08-31T21:48:15.6379778Z ok - stale-cross stale scratch closes only one scratch target
+2026-08-31T21:48:18.4128808Z [pro-gate] reservation pg-run-stale-probe-77-1700000705-707 is complete — releasing its slot; collect it with --harvest (no new spend)
+2026-08-31T21:48:18.4277001Z ok - stale readable probe marks only the existing reservation state complete
+2026-08-31T21:48:18.4581969Z ok - stale readable probe frees only the completed reservation capacity
+2026-08-31T21:48:18.4649092Z ok - stale readable probe closes scratch without mutating its source target
+2026-08-31T21:48:18.6721160Z ok - concurrent stale harvest returns the established busy outcome
+2026-08-31T21:48:18.6779007Z ok - concurrent stale harvest starts neither scratch nor Oracle
+2026-08-31T21:48:18.6791115Z # harvest: already collected (v0.28) vs genuinely gone
+2026-08-31T21:48:19.1824975Z ok - already-collected re-harvest exits 0 (was exit 6 pre-v0.28)
+2026-08-31T21:48:19.1857806Z ok - already-collected re-harvest returns the same review
+2026-08-31T21:48:24.3278286Z ok - harvest lost exits 6
+2026-08-31T21:48:24.3326326Z ok - harvest lost phase failed
+2026-08-31T21:48:24.3326892Z # harvest: deferred under cooldown (v0.28: only when no completed artifact short-circuits)
+2026-08-31T21:48:24.4212037Z ok - harvest cooldown exits 8
+2026-08-31T21:48:24.4260068Z ok - harvest cooldown phase deferred
+2026-08-31T21:48:24.5343933Z ok - collected artifact returns even under cooldown
+2026-08-31T21:48:24.5355790Z # slot plan: reservations exclude their slot instead of shrinking the range
+2026-08-31T21:48:24.5717737Z ok - tagged slot 1 at eff 2 excludes slot 1
+2026-08-31T21:48:24.6152392Z ok - legacy reservation shrinks the range
+2026-08-31T21:48:24.6605805Z ok - out-of-range tagged slot shrinks the range
+2026-08-31T21:48:24.6617656Z # slot plan: available count is explicit and state-aware
+2026-08-31T21:48:24.6990803Z ok - generating reservation at eff 1 leaves zero available
+2026-08-31T21:48:24.7348658Z ok - generating reservation at eff 2 leaves one available
+2026-08-31T21:48:24.7657034Z ok - complete reservation frees its slot at eff 1
+2026-08-31T21:48:24.8019796Z ok - legacy record without state still holds capacity
+2026-08-31T21:48:24.8272581Z ok - legacy record counts as holding capacity
+2026-08-31T21:48:24.8713049Z ok - complete record is collectable but holds nothing
+2026-08-31T21:48:24.8725547Z # slot exclusion prevents overbooking through a freed lower slot
+2026-08-31T21:48:31.2806780Z ok - reserved slot 1 not reacquired while slot 2 held
+2026-08-31T21:48:41.8719637Z ok - non-reserved slot still acquirable
+2026-08-31T21:48:41.8724847Z ok - slotted reservation untouched by foreign run
+2026-08-31T21:48:41.8775699Z ok - happy-path ledger row is valid JSON
+2026-08-31T21:48:41.8807130Z ok - happy-path ledger row carries pre_slot_secs + post_slot_secs
+2026-08-31T21:48:41.8871054Z ok - happy-path pre_slot_secs + post_slot_secs equals secs
+2026-08-31T21:48:41.8889626Z # harvest miss policy: absent passes retain, limit releases
+2026-08-31T21:48:46.0551109Z ok - first harvest miss retains reservation (exit 9)
+2026-08-31T21:48:50.2231886Z ok - miss limit without canonical run-meta stays fail-closed
+2026-08-31T21:48:50.2233081Z # primary run: hard cap -> live probe -> final salvage -> exit 9
+2026-08-31T21:49:05.9636311Z ok - primary run exits 9
+2026-08-31T21:49:05.9681066Z ok - primary run status in-progress
+2026-08-31T21:49:05.9687624Z ok - primary run carries generated marker
+2026-08-31T21:49:05.9693703Z ok - primary run reserves capacity
+2026-08-31T21:49:05.9726337Z ok - primary run keeps its tab
+2026-08-31T21:49:05.9738718Z # v0.24: a large diff (> cook threshold, < hard ceiling) COOKS to in-progress, not refused
+2026-08-31T21:49:21.7088480Z ok - large diff cooks to in-progress (exit 9, not 11)
+2026-08-31T21:49:21.7139350Z ok - large diff lands in-progress phase, never oversized
+2026-08-31T21:49:21.7178465Z # ledger outcomes
+2026-08-31T21:49:21.7229130Z ok - ledger has oversized + in-progress rows
+2026-08-31T21:49:21.7254320Z # U1: selector default is current; select still reachable (R1/R2)
+2026-08-31T21:49:32.2972840Z ok - default run exits 0
+2026-08-31T21:49:32.3006182Z ok - default run requests strategy current
+2026-08-31T21:49:42.8780926Z ok - PRO_GATE_MODEL_STRATEGY=select passes select
+2026-08-31T21:49:42.8811905Z ok - select still passes -m requested hint
+2026-08-31T21:49:53.4532350Z ok - explicit PRO_GATE_BROWSER_ARCHIVE passes through unchanged
+2026-08-31T21:50:14.0353000Z ok - select switcher-error falls back to current and exits 0
+2026-08-31T21:50:14.0385491Z ok - fallback re-invoked oracle with strategy current
+2026-08-31T21:50:14.0421299Z ok - fallback produced a usable review
+2026-08-31T21:50:14.0422761Z # U2/U3: fresh run captures the resolved model into status + ledger (R4)
+2026-08-31T21:50:24.6114788Z ok - fresh capture run exits 0
+2026-08-31T21:50:24.6175941Z ok - status model equals resolved GPT-5.6 Pro
+2026-08-31T21:50:24.6211233Z ok - ledger model equals resolved GPT-5.6 Pro
+2026-08-31T21:50:24.6211975Z # U2/U3: unavailable resolved model degrades to role-based text (R5)
+2026-08-31T21:50:35.1937511Z ok - unavailable status model is role-based (no version)
+2026-08-31T21:50:35.1984432Z ok - unavailable ledger model is role-based (no version)
+2026-08-31T21:50:35.1985474Z # U5: soft downgrade warning is advisory, never changes exit status (R6)
+2026-08-31T21:50:45.7588912Z ok - weak model run still exits 0 (advisory)
+2026-08-31T21:50:45.7620634Z ok - weak model emits WARNING line
+2026-08-31T21:50:45.7682054Z ok - weak model sets status model_warn
+2026-08-31T21:50:56.3322606Z ok - strong non-Pro name run exits 0
+2026-08-31T21:50:56.3384785Z ok - strong non-Pro name does NOT warn (no allowlist false-positive)
+2026-08-31T21:51:06.9044490Z ok - unconfirmable model (non-benign status) warns
+2026-08-31T21:51:06.9050156Z ok - unconfirmable model run still exits 0
+2026-08-31T21:51:17.4713943Z ok - benign already-selected run exits 0
+2026-08-31T21:51:17.4775936Z ok - benign already-selected does NOT warn
+2026-08-31T21:51:17.4855636Z ok - benign already-selected model is role-based (no version)
+2026-08-31T21:51:17.4896512Z ok - benign already-selected emits no model WARNING line
+2026-08-31T21:51:17.4897463Z # U2: pg_model_label renders captured value or role-based fallback (R5)
+2026-08-31T21:51:17.4994831Z ok - pg_model_label echoes captured model
+2026-08-31T21:51:17.5128282Z ok - pg_model_label empty -> role-based, no version
+2026-08-31T21:51:17.5242486Z ok - pg_model_label (unavailable) -> role-based
+2026-08-31T21:51:17.5243317Z # U5: pg_derive_model_warn gates the warning (weak / cannot-confirm / benign) (R6)
+2026-08-31T21:51:17.5585872Z ok - weak captured model -> weak warning
+2026-08-31T21:51:17.5855759Z ok - strong captured model -> no warning
+2026-08-31T21:51:17.6046068Z ok - empty model + already-selected -> silent (benign)
+2026-08-31T21:51:17.6240171Z ok - empty model + other status -> cannot-confirm warning
+2026-08-31T21:51:17.6435364Z ok - empty model + empty status -> cannot-confirm warning
+2026-08-31T21:51:17.6436569Z # Portable semver compare for the oracle version floor (no sort -V; dogfood PR #32 P2)
+2026-08-31T21:51:17.6706513Z ok - pg_semver_lt 0.15.2 < 0.16.0
+2026-08-31T21:51:17.6982722Z ok - pg_semver_lt 0.9.0 < 0.16.0 (numeric)
+2026-08-31T21:51:17.7240420Z ok - pg_semver_lt 0.10.0 NOT < 0.9.0
+2026-08-31T21:51:17.7493169Z ok - pg_semver_lt equal -> not lt
+2026-08-31T21:51:17.7770124Z ok - pg_semver_lt 0.16.1 NOT < 0.16.0
+2026-08-31T21:51:17.7991390Z ok - pg_semver_lt non-semver -> rc 2
+2026-08-31T21:51:17.8160582Z ok - floor compare works under a BSD sort that rejects -V
+2026-08-31T21:51:17.8161703Z # U2: reservation 6-field format keeps positional readers correct
+2026-08-31T21:51:17.8514227Z ok - note_miss on 6-field record retains it
+2026-08-31T21:51:17.8551138Z ok - note_miss increments field 4 (misses)
+2026-08-31T21:51:17.8588141Z ok - note_miss preserves field 5 (slot)
+2026-08-31T21:51:17.8623933Z ok - note_miss preserves field 6 (model)
+2026-08-31T21:51:17.8749612Z ok - read_model returns field 6
+2026-08-31T21:51:17.8872878Z ok - read_model survives empty slot (no tab collapse)
+2026-08-31T21:51:17.8886336Z # U2: in-progress persists the model; --harvest reads it back (R4) [best case: oracle emitted evidence before the kill]
+2026-08-31T21:51:33.5186634Z ok - in-progress run exits 9
+2026-08-31T21:51:33.5230960Z ok - reservation persists the resolved model (field 6)
+2026-08-31T21:51:33.9447993Z ok - harvest of persisted run exits 0
+2026-08-31T21:51:33.9508357Z ok - harvest status names the persisted model
+2026-08-31T21:51:33.9569359Z ok - harvest of a real persisted model does NOT warn
+2026-08-31T21:51:33.9570280Z # U2/P1: realistic exit-9: oracle emits evidence ONLY at completion, so a killed run captures nothing
+2026-08-31T21:51:49.5879511Z ok - late-evidence exit-9 run exits 9
+2026-08-31T21:51:49.5922588Z ok - late-evidence run captures NO model (reservation field 6 empty)
+2026-08-31T21:51:49.5992351Z ok - late-evidence status model is role-based (no version)
+2026-08-31T21:51:49.6054089Z ok - late-evidence run warns (cannot confirm)
+2026-08-31T21:51:49.6055050Z # U2/U5/P2: harvest derives the downgrade warning too (harvest branch no longer drops it)
+2026-08-31T21:51:49.9986773Z ok - legacy-record harvest exits 0
+2026-08-31T21:51:50.0024367Z ok - legacy-record harvest model is role-based (no version)
+2026-08-31T21:51:50.0086352Z ok - legacy-record harvest WARNS (cannot confirm; P2 fix)
+2026-08-31T21:51:50.4062796Z ok - weak persisted model harvest exits 0
+2026-08-31T21:51:50.4124826Z ok - weak persisted model harvest names it
+2026-08-31T21:51:50.4192081Z ok - weak persisted model harvest WARNS (weak denylist)
+2026-08-31T21:51:50.4192790Z # v0.22: per-PR review round budget (exit 12, no spend)
+2026-08-31T21:52:00.9827400Z ok - round 1 proceeds (exit 0)
+2026-08-31T21:52:00.9867025Z ok - round 1 recorded
+2026-08-31T21:52:00.9915043Z ok - completed review writes severity sidecar (0 P0 / 1 P1)
+2026-08-31T21:52:00.9961905Z ok - completed review appends hist row (verdict + open counts)
+2026-08-31T21:52:01.0002709Z ok - completed review hist row has a seventh wall-clock field
+2026-08-31T21:52:01.0346987Z ok - formatted verdict records FIX-FIRST (shared hardened parser)
+2026-08-31T21:52:11.6023497Z ok - round 2 proceeds (exit 0)
+2026-08-31T21:52:11.6063221Z ok - round 2 recorded
+2026-08-31T21:52:11.8850666Z ok - round 3 refused with exit 12
+2026-08-31T21:52:11.8900926Z ok - round-capped status phase
+2026-08-31T21:52:11.8907234Z ok - capped run spends nothing (no review written)
+2026-08-31T21:52:11.8946773Z ok - capped run records no extra round
+2026-08-31T21:52:11.8982023Z ok - capped run lands in ledger as round-capped
+2026-08-31T21:52:11.9014296Z ok - capped run names the override on stderr
+2026-08-31T21:52:11.9050176Z ok - capped status detail reports last review severity
+2026-08-31T21:52:11.9084618Z ok - no open P0 -> no ATTENTION line
+2026-08-31T21:52:12.1833138Z ok - capped with open P0 still exits 12
+2026-08-31T21:52:12.1864148Z ok - open P0 raises the ATTENTION line
+2026-08-31T21:52:12.1899261Z ok - open P0 counts land in status detail
+2026-08-31T21:52:22.7606128Z ok - different PR is not capped by PR 88
+2026-08-31T21:52:33.3180818Z ok - FORCE_ROUND runs past the cap
+2026-08-31T21:52:33.3220436Z ok - forced run is still recorded
+2026-08-31T21:52:43.8954756Z ok - stale rounds outside the window do not cap
+2026-08-31T21:52:43.8994117Z ok - record prunes stale entries
+2026-08-31T21:52:54.4606482Z ok - ROUND_GUARD=0 disables the budget
+2026-08-31T21:53:05.0298756Z ok - pure --diff run proceeds under budget
+2026-08-31T21:53:05.0342799Z ok - pure --diff run records under a repo+branch diff key
+2026-08-31T21:53:05.2947868Z ok - cap 0 blocks a fresh change (exit 12)
+2026-08-31T21:53:05.2997561Z ok - cap 0 status phase round-capped
+2026-08-31T21:53:08.5755836Z ok - concurrent same-branch --diff run waits on the per-change lock (exit 7)
+2026-08-31T21:53:08.5810712Z ok - lock-timeout ledger row records post_slot_secs=0
+2026-08-31T21:53:08.5841530Z ok - lock-timeout ledger row records its full wait as pre_slot_secs (>= 2s of the 3s PRO_GATE_LOCK_WAIT)
+2026-08-31T21:53:08.5903916Z ok - lock-timeout pre_slot_secs + post_slot_secs equals secs
+2026-08-31T21:53:19.1763607Z ok - detached-HEAD --diff run proceeds
+2026-08-31T21:53:19.1817843Z ok - detached-HEAD key is per-commit (short SHA + cksum, not HEAD)
+2026-08-31T21:53:19.4623683Z ok - same-branch --diff reservation redirects to harvest (exit 9)
+2026-08-31T21:53:19.4657384Z ok - --diff redirect publishes the RESERVED marker
+2026-08-31T21:53:19.4770175Z ok - window typo (1d) falls back to 24h, not 30 min
+2026-08-31T21:53:30.0319071Z ok - stale round state is swept by housekeeping
+2026-08-31T21:53:30.0321250Z # v0.30.1 hygiene close-out: legacy-named logs, daemon/service logs, title-seq, blacklist
+2026-08-31T21:53:40.6020891Z ok - hygiene run exits 0
+2026-08-31T21:53:40.6045512Z ok - legacy epoch-named run log is swept
+2026-08-31T21:53:40.6051610Z ok - autoupdate.log survives the log sweep
+2026-08-31T21:53:40.6057989Z ok - launchd daemon log survives the log sweep (gate P1)
+2026-08-31T21:53:40.6064195Z ok - fresh pg-run log survives the sweep
+2026-08-31T21:53:40.6103886Z ok - idle title-seq counter is NEVER swept (gate P2: monotonic ordinal)
+2026-08-31T21:53:40.6145398Z ok - salvage blacklist is NEVER compacted by housekeeping
+2026-08-31T21:53:40.6146245Z # v0.31 (#65): trajectory-aware round governor
+2026-08-31T21:53:40.6391508Z ok - default round policy is advisory after the computed grant is spent
+2026-08-31T21:53:40.6553585Z ok - explicit governor: base grant refuses round 4 without earned rounds
+2026-08-31T21:53:40.6575603Z ok - explicit governor: exhaustion reason names base + earned + ceiling
+2026-08-31T21:53:40.6733034Z ok - explicit governor: round 3 of base 3 proceeds
+2026-08-31T21:53:40.7123101Z ok - explicit governor: shrinking trajectory earns round 5
+2026-08-31T21:53:40.7338280Z ok - explicit governor: earned grant still exhausts (5/5)
+2026-08-31T21:53:40.7449588Z ok - default churn trajectory remains advisory
+2026-08-31T21:53:40.7729641Z ok - explicit governor: churn brake refuses (not converging)
+2026-08-31T21:53:40.7750826Z ok - explicit governor: churn reason carries the trajectory arrow
+2026-08-31T21:53:40.8141059Z ok - explicit governor: a shrinking round releases the brake
+2026-08-31T21:53:40.8368747Z ok - explicit governor: ceiling 8 caps any earned run
+2026-08-31T21:53:40.8566133Z ok - flat mode: explicit cap ignores the trajectory
+2026-08-31T21:53:40.8779798Z ok - flat mode: explicit cap still enforces its number
+2026-08-31T21:53:40.8921189Z ok - governor: base 0 is a lockdown
+2026-08-31T21:53:40.9034697Z ok - explicit zero base reports lockdown policy
+2026-08-31T21:53:40.9149490Z ok - explicit flat cap reports enforced policy
+2026-08-31T21:53:40.9254461Z ok - explicit guard off outranks explicit lockdown knobs
+2026-08-31T21:53:40.9433858Z ok - governor: base above ceiling cannot raise the ceiling
+2026-08-31T21:53:40.9609547Z ok - governor: base clamp warns loudly
+2026-08-31T21:53:40.9774639Z ok - grant: churn brake collapses the grant to spent
+2026-08-31T21:53:40.9775915Z # ledger-timing-split R4: MIXED 6-field (pre-upgrade) and 7-field (post-upgrade) .hist rows
+2026-08-31T21:53:40.9981918Z ok - mixed-width .hist: trajectory scoring matches the pure 7-field sequence (2 earned, streak 0)
+2026-08-31T21:53:40.9986804Z ok - mixed-width .hist: elapsed sums only the 7-field durations, legacy row as 0
+2026-08-31T21:53:40.9992532Z ok - mixed-width .hist: scored count includes every in-window row (legacy + 7-field)
+2026-08-31T21:53:41.0103250Z ok - mixed-width .hist: governor still proceeds normally (earned round available)
+2026-08-31T21:53:41.0104753Z # v0.31 (#65): governor integration — engine exit 12 carries the trajectory
+2026-08-31T21:53:41.3140811Z ok - governor engine run: churn exits 12
+2026-08-31T21:53:41.3193439Z ok - governor engine run: phase round-capped
+2026-08-31T21:53:41.3227248Z ok - governor engine run: status detail carries the trajectory arrow
+2026-08-31T21:53:41.3260925Z ok - governor engine refusal names rounds used and wall clock
+2026-08-31T21:53:41.3261708Z # v0.31 (#65): a provably-never-landed submission refunds its round
+2026-08-31T21:54:21.9213178Z ok - never-landed run fails (exit 6)
+2026-08-31T21:54:21.9247938Z ok - never-landed run announces the refund
+2026-08-31T21:54:21.9269694Z ok - never-landed round is refunded (no in-window spend remains)
+2026-08-31T21:54:21.9303438Z ok - refund is named in the status detail
+2026-08-31T21:55:02.5121761Z ok - landed-but-lost run fails (exit 6)
+2026-08-31T21:55:02.5164587Z ok - landed-but-lost run does NOT announce a refund
+2026-08-31T21:55:02.5185496Z ok - landed-but-lost round STAYS charged
+2026-08-31T21:55:02.5454140Z ok - verified lifecycle-free transcript is accepted
+2026-08-31T21:55:02.5560428Z ok - missing transcript proof fails closed
+2026-08-31T21:55:02.5794469Z ok - transcript changed after proof fails closed
+2026-08-31T21:55:02.6047753Z ok - verified lifecycle evidence remains charged
+2026-08-31T21:55:02.6156310Z ok - symlinked transcript fails closed
+2026-08-31T21:55:55.3343932Z ok - intact log capture still refunds the pre-browser failure
+2026-08-31T21:55:55.3365421Z ok - intact log capture leaves no in-window spend
+2026-08-31T21:55:55.3397153Z ok - intact log capture permits the guarded retry
+2026-08-31T21:58:40.9334700Z ok - failed Oracle log capture exits 6
+2026-08-31T21:58:40.9367039Z ok - failed Oracle log capture suppresses retry
+2026-08-31T21:58:40.9398227Z ok - failed Oracle log capture invokes Oracle exactly once
+2026-08-31T21:58:40.9421222Z ok - failed Oracle log capture stays charged
+2026-08-31T21:58:40.9478844Z ok - failed Oracle log capture never announces a refund
+2026-08-31T21:59:04.5331427Z ok - watchdog-killed pre-browser stall exits 6
+2026-08-31T21:59:04.5355611Z ok - watchdog-killed stall stays charged even with a lifecycle-free log
+2026-08-31T21:59:04.5389615Z ok - watchdog-killed stall never announces a refund
+2026-08-31T21:59:28.1146681Z ok - watchdog-killed stall after lifecycle exits 6
+2026-08-31T21:59:28.1169619Z ok - watchdog-killed stall after lifecycle stays charged
+2026-08-31T21:59:28.1202446Z ok - watchdog-killed stall after lifecycle never announces a refund
+2026-08-31T22:00:11.7221060Z ok - hard-cap timeout kill exits 6
+2026-08-31T22:00:11.7252654Z ok - hard-cap timeout kill invokes Oracle exactly once
+2026-08-31T22:00:11.7273995Z ok - hard-cap timeout kill stays charged
+2026-08-31T22:00:11.7306884Z ok - hard-cap timeout kill never announces a refund
+2026-08-31T22:01:04.3765895Z ok - TERM-ignoring Oracle still terminates the attempt
+2026-08-31T22:01:04.3771580Z ok - TERM-ignoring Oracle actually started (fixture sanity)
+2026-08-31T22:01:04.3778752Z ok - TERM-ignoring Oracle leaves no surviving descendant
+2026-08-31T22:01:04.3800699Z ok - force-killed attempt stays charged
+2026-08-31T22:01:04.3834627Z ok - force-killed attempt never announces a refund
+2026-08-31T22:03:50.0077660Z ok - post-click timeout fails without a duplicate retry
+2026-08-31T22:03:50.0113940Z ok - Project URL is forwarded unchanged to Oracle
+2026-08-31T22:03:50.0147020Z ok - complete post-click metadata remains ambiguous and suppresses retry
+2026-08-31T22:03:50.0177975Z ok - post-click timeout invokes Oracle exactly once
+2026-08-31T22:03:50.0199689Z ok - post-click timeout stays charged
+2026-08-31T22:03:50.0256887Z ok - post-click timeout never announces a refund
+2026-08-31T22:06:35.6346867Z ok - partial commit metadata fails without a duplicate retry
+2026-08-31T22:06:35.6378366Z ok - partial commit metadata suppresses retry
+2026-08-31T22:06:35.6399648Z ok - partial commit metadata remains charged
+2026-08-31T22:06:35.6431579Z ok - partial commit metadata never announces a refund
+2026-08-31T22:06:48.3114573Z ok - structured pre-submit failure exits 6 without a duplicate retry
+2026-08-31T22:06:48.3206783Z ok - structured promptSubmitted=false proof refunds the round exactly once
+2026-08-31T22:06:48.3249141Z ok - structured pre-submit terminalization removes mutable recovery state
+2026-08-31T22:06:48.3450753Z ok - pg_round_record exports the epoch it charged
+2026-08-31T22:06:48.3760631Z ok - reservation persists the charged-round epoch
+2026-08-31T22:06:48.4160725Z ok - reservation rewrite preserves the spend epoch
+2026-08-31T22:06:48.4283394Z ok - reservation rewrite still preserves the model (7-field record)
+2026-08-31T22:06:48.4380365Z ok - pg_marker_epoch (fallback) extracts the launch epoch
+2026-08-31T22:06:48.4480040Z ok - pg_marker_epoch rejects a legacy marker
+2026-08-31T22:06:48.4617651Z ok - R3 audit: the marker mint epoch really is outside the round window
+2026-08-31T22:06:48.4908817Z ok - R3 audit: a round charged now counts in-window despite an out-of-window marker mint
+2026-08-31T22:06:48.5271375Z ok - harvested hist row carries the SPEND epoch
+2026-08-31T22:06:48.5308307Z ok - harvested hist row carries plausible positive wall-clock seconds
+2026-08-31T22:06:48.5879837Z ok - same-second hist rows keep write order (stable sort)
+2026-08-31T22:06:48.6229422Z ok - implausible spend epoch falls back to now
+2026-08-31T22:06:49.0183717Z ok - harvest in round-test home exits 0
+2026-08-31T22:06:49.0227116Z ok - harvest consumes no round
+2026-08-31T22:06:49.0227765Z # v0.22.1: --confirm mode (budget-accounted confirming pass)
+2026-08-31T22:06:59.5813676Z ok - confirm pass runs and exits 0
+2026-08-31T22:06:59.5847105Z ok - confirm prompt carries the confirming instructions
+2026-08-31T22:06:59.5866605Z ok - confirm attaches prior-review.md
+2026-08-31T22:06:59.5915390Z ok - confirm pass consumes a round (budget-accounted)
+2026-08-31T22:06:59.6109662Z ok - missing --confirm file is a usage error (exit 2)
+2026-08-31T22:06:59.6110556Z # v0.22.1: Cloudflare (provably-unsubmitted) refunds its round
+2026-08-31T22:07:10.1218242Z ok - cloudflare run fails without a usable review
+2026-08-31T22:07:10.1223207Z ok - cloudflare writes the account cooldown
+2026-08-31T22:07:10.1245532Z ok - cloudflare refunds the round (no spend, no budget charge)
+2026-08-31T22:07:10.1390182Z ok - cloudflare refund retires the unsubmitted run metadata
+2026-08-31T22:07:10.3033908Z ok - recover selects the newer refunded attempt instead of returning an older artifact
+2026-08-31T22:07:10.3067692Z ok - cloudflare failure never invokes organizer mode
+2026-08-31T22:07:10.3079508Z # v0.32: throttle evidence suppresses exit-9 organization
+2026-08-31T22:07:20.9381319Z ok - throttle salvage preserves the spent run as exit 9
+2026-08-31T22:07:20.9387150Z ok - throttle evidence writes the account cooldown
+2026-08-31T22:07:20.9419459Z ok - exit-9 under active throttle never invokes organizer mode
+2026-08-31T22:07:20.9420041Z # v0.22.1: pg_round_unrecord drops only the newest entry
+2026-08-31T22:07:20.9615740Z ok - unrecord drops one entry
+2026-08-31T22:07:20.9762801Z ok - unrecord removes an emptied file
+2026-08-31T22:07:20.9763515Z # memory-pressure messaging helpers (low-memory robustness)
+2026-08-31T22:07:20.9954534Z ok - pg_mem_status reports free RAM
+2026-08-31T22:07:21.0127552Z ok - mem pressure note silent above threshold
+2026-08-31T22:07:21.0328630Z ok - mem pressure note fires below threshold (swap present)
+2026-08-31T22:07:21.0461775Z ok - browser-restart detector fires (uptime<run)
+2026-08-31T22:07:21.0594264Z ok - browser-restart detector silent (stable uptime)
+2026-08-31T22:07:21.0709771Z ok - browser-restart detector native-safe
+2026-08-31T22:07:21.0840546Z ok - browser-restart detector silent when service down (uptime 0)
+2026-08-31T22:07:21.0841487Z # v0.27: --status run rediscovery (read-only, no browser needed)
+2026-08-31T22:07:21.1642829Z ok - --status exits 0
+2026-08-31T22:07:21.1674102Z ok - --status names the reservation marker
+2026-08-31T22:07:21.1722465Z ok - --status leads to a free harvest
+2026-08-31T22:07:21.1757563Z ok - --status reports spent rounds and advisory computed grant
+2026-08-31T22:07:21.1792883Z ok - --status reports rounds used and total wall clock
+2026-08-31T22:07:21.1815920Z ok - --status writes nothing
+2026-08-31T22:07:21.2558666Z ok - --status calls bare unbound captures AMBIGUOUS, not stuck
+2026-08-31T22:07:21.3303593Z ok - --status --json: unbindable-ambiguous with a count
+2026-08-31T22:07:21.4078866Z ok - --status flags a convicted cross-bind as STUCK
+2026-08-31T22:07:21.4125049Z ok - --status warns against REQUIRE_NONCE=0 on a cross-bind
+2026-08-31T22:07:21.4878667Z ok - --status --json: cross-bound state
+2026-08-31T22:07:21.5365778Z ok - note_miss preserves the spend epoch (field 7)
+2026-08-31T22:07:21.5502856Z ok - note_miss preserves the model too
+2026-08-31T22:07:21.5546026Z ok - note_miss still incremented the streak
+2026-08-31T22:07:36.8612335Z ok - harvest retains other past-TTL reservations without confirmed miss proof
+2026-08-31T22:07:52.0747951Z ok - harvest keeps a fresh reservation
+2026-08-31T22:08:07.3095684Z ok - harvest never reaps its OWN target reservation mid-collection
+2026-08-31T22:08:07.8259302Z ok - pg_harvest_claimed sees a held harvest lock
+2026-08-31T22:08:07.9171948Z ok - a foreign reconciler skips an actively-harvested marker
+2026-08-31T22:08:13.3266126Z ok - a released lock reads as unclaimed
+2026-08-31T22:08:13.4433148Z ok - an unclaimed past-TTL reservation remains without confirmed miss proof
+2026-08-31T22:08:13.4611357Z ok - expire_if_stale reports past TTL without releasing the reservation
+2026-08-31T22:08:13.4785515Z ok - expire_if_stale keeps an unexpired reservation
+2026-08-31T22:08:13.5770516Z ok - confirmed miss threshold before TTL remains recoverable
+2026-08-31T22:08:13.7433847Z ok - TTL plus confirmed miss threshold terminalizes recovery exhaustion
+2026-08-31T22:08:13.8141200Z ok - recovery-exhausted snapshot is fresh eligible without refund
+2026-08-31T22:08:13.8832835Z ok - --status --json exits 0
+2026-08-31T22:08:13.8877263Z ok - --status --json reservation marker
+2026-08-31T22:08:13.8931334Z ok - --status --json remembered url
+2026-08-31T22:08:13.9009886Z ok - --status --json rounds remaining
+2026-08-31T22:08:13.9111387Z ok - --status --json reports default round policy as advisory
+2026-08-31T22:08:13.9925737Z ok - --status --json reports explicit round policy as enforced
+2026-08-31T22:08:14.0727801Z ok - --status --json exposes the trajectory
+2026-08-31T22:08:14.0782529Z ok - --status --json flags the churn brake
+2026-08-31T22:08:14.1564766Z ok - --status text names advisory churn without calling it a hard brake
+2026-08-31T22:08:14.1629760Z ok - --status --json recent runs
+2026-08-31T22:08:14.2306667Z ok - --status by marker finds the reservation
+2026-08-31T22:08:14.2728540Z ok - --status unknown pr exits 0 with a spend warning
+2026-08-31T22:08:14.8349330Z ok - --status flags a live same-change run
+2026-08-31T22:08:14.8381759Z ok - --status live-run hint says do not launch
+2026-08-31T22:08:18.3453734Z ok - --status released lock no longer flagged live
+2026-08-31T22:08:18.4084932Z ok - --status active live pid flags RUNNING
+2026-08-31T22:08:18.4711664Z ok - --status dead wrapper leads to harvest, not fresh run
+2026-08-31T22:08:18.5473838Z ok - URL --status excludes foreign-repo rows
+2026-08-31T22:08:18.5527829Z ok - URL --status still finds its own repo
+2026-08-31T22:08:18.6262038Z ok - URL --status rejects prefix-colliding keys
+2026-08-31T22:08:19.1843688Z ok - --status sees a first-run lock with no rounds file
+2026-08-31T22:08:22.6972542Z ok - native dead wrapper avoids the harvest loop
+2026-08-31T22:08:22.7251080Z ok - --status rejects a malformed query (exit 2)
+2026-08-31T22:08:22.7438275Z ok - --json without --status is a usage error (exit 2)
+2026-08-31T22:08:22.7439039Z # v0.27: exit 4/5 land in the ledger; ledger rows carry marker+round_key
+2026-08-31T22:08:22.9307302Z ok - missing repo exits 4
+2026-08-31T22:08:22.9361496Z ok - exit 4 writes a ledger line (outcome bad-repo)
+2026-08-31T22:08:22.9391833Z ok - ledger lines carry marker+round_key fields
+2026-08-31T22:08:23.0892317Z ok - diff fetch failure exits 5
+2026-08-31T22:08:23.0945993Z ok - exit 5 ledger outcome diff-fetch-failed
+2026-08-31T22:08:23.0981179Z ok - exit 5 ledger carries a round_key
+2026-08-31T22:08:23.0987493Z ok - non-owning exit preserves predecessor active record
+2026-08-31T22:08:23.1773598Z ok - URL --status rejects prefix-colliding reservation
+2026-08-31T22:08:23.2361470Z ok - bare-number --status still finds the -7 key
+2026-08-31T22:08:23.3111942Z ok - stale .d lock (dead owner) not reported RUNNING
+2026-08-31T22:08:23.3860715Z ok - live .d lock (live owner) reported RUNNING
+2026-08-31T22:08:23.3872272Z # v0.27: pro-gate-stats.sh --pr filters every view
+2026-08-31T22:08:23.4075776Z ok - stats --pr --json filters runs
+2026-08-31T22:08:23.4274388Z ok - stats --pr filters --tail
+2026-08-31T22:08:23.4477140Z ok - stats --pr matches harvest rows by round key
+2026-08-31T22:08:23.4591716Z ok - stats --pr rejects non-numeric (exit 2)
+2026-08-31T22:08:23.4592482Z # U1: pro-gate-stats.sh queue/run percentiles on a MIXED ledger (old rows without the new
+2026-08-31T22:08:23.4594242Z # fields alongside new rows that carry them) — old .secs percentiles unchanged, new
+2026-08-31T22:08:23.4597756Z # percentiles computed from new-field rows only, no error, existing fields byte-compatible.
+2026-08-31T22:08:23.4799163Z ok - stats on mixed ledger emits valid JSON
+2026-08-31T22:08:23.4833549Z ok - stats mixed-ledger runs count is 5
+2026-08-31T22:08:23.4896559Z ok - stats duration_p50_s/p95_s unchanged by rows lacking queue/run fields
+2026-08-31T22:08:23.4959324Z ok - stats new pre_slot_p50_s/p95_s computed from new-field rows only
+2026-08-31T22:08:23.5021233Z ok - stats new post_slot_p50_s/p95_s computed from new-field rows only
+2026-08-31T22:08:23.5053005Z ok - stats mixed ledger keeps existing fields present (byte-compatible for old consumers)
+2026-08-31T22:08:23.5054322Z # ledger-timing-split Fix 3: lock-timeout rows join the pre-slot population; harvest rows
+2026-08-31T22:08:23.5055741Z # are excluded from both — kind names the invocation explicitly instead of guessing from
+2026-08-31T22:08:23.5056227Z # outcome.
+2026-08-31T22:08:23.5263839Z ok - stats kind ledger emits valid JSON
+2026-08-31T22:08:23.5327592Z ok - lock-timeout row included in pre_slot percentile population
+2026-08-31T22:08:23.5390992Z ok - harvest row excluded from pre_slot and post_slot percentile populations
+2026-08-31T22:08:23.5584080Z ok - missing kind field treated as fresh (historical rows still count)
+2026-08-31T22:08:23.5596221Z # v0.28: severity sidecar counts only OPEN findings (RESOLVED verification blocks excluded)
+2026-08-31T22:08:23.5988394Z ok - severity sidecar excludes only status-position RESOLVED
+2026-08-31T22:08:23.5989139Z # v0.28: provenance helpers (lib)
+2026-08-31T22:08:23.6169839Z ok - provenance rejects zero-overlap citations
+2026-08-31T22:08:23.6308758Z ok - provenance accepts a cited change file
+2026-08-31T22:08:23.6405457Z ok - provenance accepts when no manifest exists (legacy)
+2026-08-31T22:08:23.6545991Z ok - provenance accepts a single ambiguous citation
+2026-08-31T22:08:23.6699540Z ok - provenance rejects basename-only twins
+2026-08-31T22:08:23.6700703Z # v0.28: harvest provenance — foreign capture preserved, never returned as ours
+2026-08-31T22:08:24.0246501Z ok - nonce-less capture preserved as unbound (exit 9)
+2026-08-31T22:08:24.0252297Z ok - unbound harvest keeps the reservation
+2026-08-31T22:08:24.0273450Z ok - unbound capture set aside for inspection
+2026-08-31T22:08:24.0279711Z ok - unbound capture not returned as the review
+2026-08-31T22:08:24.0304129Z ok - nonce mode keeps the URL memo (older-verdict theory)
+2026-08-31T22:08:24.0339740Z ok - nonce mode blacklists nothing
+2026-08-31T22:08:24.2746709Z ok - legacy foreign harvest exits 9 with .foreign set-aside
+2026-08-31T22:08:24.2768201Z ok - legacy rejection removes the URL memo
+2026-08-31T22:08:24.2806069Z ok - legacy rejection blacklists the EXACT matched URL
+2026-08-31T22:08:24.3483768Z ok - manifest not counted as a reservation
+2026-08-31T22:08:29.5178090Z ok - replay harvest does not return the foreign review
+2026-08-31T22:08:29.5184117Z ok - replay harvest preserves the reservation (exit 9)
+2026-08-31T22:08:29.7572636Z ok - path overlap alone no longer accepts (nonce-or-nothing)
+2026-08-31T22:08:30.0829728Z ok - REQUIRE_NONCE=0 accepts on matching path overlap
+2026-08-31T22:08:30.0854569Z ok - matching harvest removes reservation + manifest
+2026-08-31T22:08:30.0856073Z # v0.28: positive run-binding — a nonce-bearing capture is accepted and stripped
+2026-08-31T22:08:30.5970826Z ok - nonce-bearing capture accepted despite path mismatch
+2026-08-31T22:08:30.6006364Z ok - nonce stripped from the returned review
+2026-08-31T22:08:30.6041447Z ok - VERDICT line survives the strip
+2026-08-31T22:08:30.6066233Z ok - clean collection writes the completed artifact
+2026-08-31T22:08:30.6115750Z ok - clean ledger row records the digest
+2026-08-31T22:08:30.6152375Z ok - RESULT_FILE names the canonical artifact
+2026-08-31T22:08:30.9644020Z ok - non-boolean REQUIRE_NONCE enforces (fails closed, exit 9)
+2026-08-31T22:08:30.9655430Z # v0.28: artifact-first recovery — no ledger row needed
+2026-08-31T22:08:31.0781179Z ok - artifact-first recovery exits 0 (even under cooldown, no ledger row)
+2026-08-31T22:08:31.0812821Z ok - artifact content returned verbatim
+2026-08-31T22:08:31.0844974Z ok - artifact retrieval under active cooldown never invokes organizer mode
+2026-08-31T22:08:33.4765788Z ok - artifact recovery still exits 0 when a peer starts cooldown during lock wait
+2026-08-31T22:08:33.4796948Z ok - post-lock cooldown recheck suppresses stale organizer traffic
+2026-08-31T22:08:33.6456384Z ok - artifact returns with the browser down
+2026-08-31T22:08:33.6533114Z ok - fast-path ledger row carries pr + round_key
+2026-08-31T22:08:33.6594988Z ok - fast-path ledger row records the artifact digest
+2026-08-31T22:08:33.6639844Z ok - organizer CDP failure preserves artifact-first exit 0 + output
+2026-08-31T22:08:33.6640906Z # v0.32: successful organizer controls preserve independent semantics
+2026-08-31T22:08:34.0497036Z ok - CHAT_ARCHIVE=0 keeps exit 0 and exact rename
+2026-08-31T22:08:34.0528806Z ok - CHAT_ARCHIVE=0 still closes the verified local tab
+2026-08-31T22:08:34.0563271Z ok - artifact finalization has no accepted URL without a validated CDP capture source
+2026-08-31T22:08:34.0604740Z ok - finalizer timeout keeps the organizer lock beyond both mutation windows
+2026-08-31T22:08:34.4539587Z ok - CHAT_RENAME=0 still archives durable success
+2026-08-31T22:08:34.4611060Z ok - CHAT_RENAME=0 performs archive only, then closes
+2026-08-31T22:08:34.8654402Z ok - KEEP_TABS=1 permits exact rename but suppresses archive
+2026-08-31T22:08:34.8687391Z ok - KEEP_TABS=1 leaves the local tab open
+2026-08-31T22:08:34.8730922Z ok - rename-only timeout keeps the organizer lock beyond its mutation lease
+2026-08-31T22:08:35.2649122Z ok - invalid mutation booleans warn and disable both UI mutations
+2026-08-31T22:08:35.2681279Z ok - invalid mutation booleans still permit verified local cleanup
+2026-08-31T22:08:35.4880972Z ok - native artifact recovery performs no CDP organization
+2026-08-31T22:08:35.4881539Z # v0.32: pending durability archives; volatile-only success stays recoverable
+2026-08-31T22:08:36.0017078Z ok - pending fallback is a durable exit-0 result
+2026-08-31T22:08:36.0088446Z ok - pending fallback still archives and closes
+2026-08-31T22:08:36.0126011Z ok - validated harvest forwards its exact CDP capture URL to finalization
+2026-08-31T22:08:36.5317595Z ok - volatile-only persistence still returns exit 0 with explicit warning
+2026-08-31T22:08:36.5387422Z ok - volatile-only success exact-renames but never archives
+2026-08-31T22:08:36.5438989Z ok - volatile-only success leaves the local tab open and reservation held
+2026-08-31T22:08:36.5439925Z # v0.28: provenance rejection blacklists precisely (compare-and-delete memo)
+2026-08-31T22:08:36.5635808Z ok - explicit-URL rejection blacklists the foreign URL
+2026-08-31T22:08:36.5642208Z ok - memo naming a DIFFERENT (genuine) URL survives
+2026-08-31T22:08:36.5784368Z ok - memo naming the rejected URL is removed
+2026-08-31T22:08:36.5785800Z # v0.28: unbindable captures fail closed when the nonce was promised
+2026-08-31T22:08:36.9313191Z ok - promised-nonce absent + 1 citation fails closed (exit 9)
+2026-08-31T22:08:36.9357750Z ok - unbindable capture set aside, reservation kept
+2026-08-31T22:08:37.2878366Z ok - PRO_GATE_REQUIRE_NONCE=0 restores best-effort acceptance
+2026-08-31T22:08:37.2879080Z # v0.28 r9: publication is verified; artifacts are rediscoverable
+2026-08-31T22:08:37.3239753Z ok - directory --out rejected up front (exit 2)
+2026-08-31T22:08:37.3704984Z ok - unwritable --out dir refused up front (exit 2, ownership guard)
+2026-08-31T22:08:37.4436187Z ok - --status surfaces the completed artifact
+2026-08-31T22:08:37.4436892Z # v0.28: digest mismatch rejects an overwritten ledgered source
+2026-08-31T22:08:37.4448934Z cp: cannot stat '/tmp/pg-engine-test.1DFp8V/prior-collected.md': No such file or directory
+2026-08-31T22:08:42.5858053Z ok - overwritten ledgered source rejected by digest (exit 6)
+2026-08-31T22:08:42.5859128Z # v0.28: already-collected harvest returns the ledgered review idempotently
+2026-08-31T22:08:47.8590206Z ok - digest-verified already-collected harvest exits 0
+2026-08-31T22:08:47.8624702Z ok - already-collected returns the prior review
+2026-08-31T22:08:53.0097926Z ok - digest-less legacy row routes to manual recovery (exit 6)
+2026-08-31T22:08:58.1560807Z ok - stale OUT content never passes as collected (exit 6)
+2026-08-31T22:09:03.3013374Z ok - absent reservation without ledger row still exits 6
+2026-08-31T22:09:03.3014480Z # v0.28: early URL capture + change manifest on a fresh run
+2026-08-31T22:09:49.9295789Z ok - early-capture run preserves as in-progress (exit 9)
+2026-08-31T22:09:49.9335836Z ok - conversation URL memo written DURING generation
+2026-08-31T22:09:49.9435411Z ok - early organizer applies the marker memo title exactly
+2026-08-31T22:09:49.9508625Z ok - early organizer leaves in-progress conversation unarchived
+2026-08-31T22:09:49.9549251Z ok - early organizer diagnostic is persisted in the run log
+2026-08-31T22:09:49.9574847Z ok - change manifest written beside the reservation
+2026-08-31T22:09:49.9599986Z ok - nonce expectation flag recorded
+2026-08-31T22:09:49.9600434Z # v0.32: a failed owned run stays named, unarchived, and locally untouched
+2026-08-31T22:10:02.6417666Z ok - owned failed run exits 6 after decisive loss
+2026-08-31T22:10:02.6482986Z ok - owned failed run keeps its exact early title
+2026-08-31T22:10:02.6580777Z ok - owned failed run is never archived or locally closed
+2026-08-31T22:10:02.6581960Z # v0.28: direct capture with an echoed nonce is stripped before output
+2026-08-31T22:10:13.2170178Z ok - direct nonce capture exits 0
+2026-08-31T22:10:13.2206599Z ok - direct capture nonce stripped
+2026-08-31T22:10:13.2239292Z ok - direct capture finalization never invents accepted URL authority
+2026-08-31T22:10:13.2243093Z # v0.32: a delayed early organizer cannot wake after terminal archive/close
+2026-08-31T22:10:23.9845619Z ok - terminal success beats the delayed organizer timer
+2026-08-31T22:10:29.9938044Z ok - revoked early organizer performs no post-finalization render or mutation
+2026-08-31T22:10:29.9962573Z # v0.32 gate: every terminal path joins an already-running early organizer
+2026-08-31T22:10:40.5784644Z ok - rename-disabled KEEP_TABS success waits for the marker organizer
+2026-08-31T22:10:51.1558650Z ok - missing title memo still waits for the marker organizer
+2026-08-31T22:10:51.1559887Z # v0.32 gate: organizer throttle precedes ramp and ledger settlement
+2026-08-31T22:11:01.8410792Z ok - organizer-detected throttle preserves collected exit 0
+2026-08-31T22:11:01.8446734Z ok - organizer throttle is ledgered instead of clean
+2026-08-31T22:11:01.8534174Z ok - organizer throttle applies exactly one ramp reset
+2026-08-31T22:11:01.8590214Z ok - pre-existing cooldown does not relabel artifact recovery as throttle
+2026-08-31T22:11:01.8591268Z # v0.32 gate: no-flock organizer lock never steals a publication-in-progress
+2026-08-31T22:11:06.2086775Z ok - no-flock contender preserves the live unpublished lock
+2026-08-31T22:11:06.2112048Z ok - no-flock lock metadata and directory are retired after the join
+2026-08-31T22:11:06.2112619Z # v0.32 gate: harvest-only recovery sweeps stale organizer locks
+2026-08-31T22:11:06.3388609Z ok - artifact-only harvest removes its stale no-flock lock before joining
+2026-08-31T22:11:06.3412799Z ok - organizer housekeeping honors the custom directory and preserves fresh locks
+2026-08-31T22:11:06.3449231Z ok - stale-lock recovery returns the exact durable artifact
+2026-08-31T22:11:06.4010732Z ok - --status does not sweep stale organizer locks
+2026-08-31T22:11:07.5202974Z ok - no-flock missing metadata stays busy instead of being stolen
+2026-08-31T22:11:07.6480711Z ok - no-flock acquisition fails when ownership publication fails
+2026-08-31T22:11:07.9846283Z ok - no-flock release cannot remove replacement ownership
+2026-08-31T22:11:07.9847523Z # v0.29: the prompt leads with the run-naming title line (#49 phase 1)
+2026-08-31T22:11:18.5484752Z ok - title-line run exits 0 (nonce echoed back from the dumped prompt)
+2026-08-31T22:11:18.5523310Z ok - prompt first line names the run + round
+2026-08-31T22:11:18.5605740Z ok - marker-scoped title memo equals the prompt title exactly
+2026-08-31T22:11:18.5646300Z ok - title memo publication leaves no partial temp file
+2026-08-31T22:11:29.1053285Z ok - second same-PR round exits 0
+2026-08-31T22:11:29.1090936Z ok - second round titles r2
+2026-08-31T22:11:39.6741290Z ok - ordinal advances past expired windows (r8)
+2026-08-31T22:11:39.6742397Z # v0.30 (#50 item 1): scratch dirs are cleaned on exit; a default --out inside WORK survives
+2026-08-31T22:11:39.9256416Z ok - scratch test still refuses oversized (rc=11)
+2026-08-31T22:11:39.9284160Z ok - external --out: WORK removed on exit
+2026-08-31T22:11:40.0714910Z ok - default --out: WORK dir kept for the caller
+2026-08-31T22:11:40.0763015Z ok - default --out: status sidecar survives, siblings swept
+2026-08-31T22:11:40.0775839Z # v0.30 (#50 item 3): harvest ledger rows carry pr=NUMBER and round_key=full key
+2026-08-31T22:11:45.2229386Z ok - harvest row pr field is the trailing number
+2026-08-31T22:11:45.2259307Z ok - harvest row round_key keeps the scoped key
+2026-08-31T22:11:45.2259950Z # v0.30 (#50 item 4): conversation-urls memos older than 14d are swept, fresh ones stay
+2026-08-31T22:11:55.8928613Z ok - old memo swept
+2026-08-31T22:11:55.8933896Z ok - fresh memo kept
+2026-08-31T22:11:55.8934374Z # v0.30 (#50 item 5): native-mode hard-max clamp is announced, not silent
+2026-08-31T22:11:56.0231645Z ok - clamp NOTE printed when operator value is cut
+2026-08-31T22:11:56.1542611Z ok - no NOTE when nothing was configured
+2026-08-31T22:11:56.1543758Z # v0.30 (#35): --status surfaces a FREE harvest for a failed run with a remembered URL
+2026-08-31T22:11:56.2165710Z ok - failed+memo status recommends FREE harvest
+2026-08-31T22:11:56.2752541Z ok - failed without memo keeps the spend warning
+2026-08-31T22:11:56.2753460Z # v0.30 (#50 item 8): run diagnostics persist to logs/<marker>.log
+2026-08-31T22:11:56.2778467Z ok - harvest run persisted a per-run log
+2026-08-31T22:11:56.2779202Z # v0.30 gate r1: --status recoverable field is freshness-checked, and the daemon guard consumes it end-to-end
+2026-08-31T22:11:56.3369669Z ok - unexpired reservation: recoverable=true
+2026-08-31T22:11:56.3914051Z ok - expired reservation: recoverable=false
+2026-08-31T22:11:56.3915489Z # v0.30 gate r1: pre-marker failures persist a provisional run log
+2026-08-31T22:11:56.4646276Z ok - bad-repo run still exits 4
+2026-08-31T22:11:56.4690627Z ok - provisional run log persisted for the pre-marker failure
+2026-08-31T22:11:56.4691925Z # v0.30 gate r2: EXIT handlers chain instead of clobbering (no-flock lock cleanup vs scratch cleanup)
+2026-08-31T22:11:56.4833838Z ok - both chained EXIT handlers ran
+2026-08-31T22:11:56.4834420Z # v0.30 gate r2: pid reuse cannot resurrect a dead run (token-verified liveness)
+2026-08-31T22:11:56.5397239Z ok - token mismatch: pid-1 record is NOT a live run
+2026-08-31T22:11:56.6079130Z ok - matching token: live run is recoverable
+2026-08-31T22:11:56.6609848Z ok - legacy stale record past TTL: not recoverable
+2026-08-31T22:11:56.6610813Z # v0.30 gate r2: a harvest never clobbers the original run log
+2026-08-31T22:12:01.8094750Z ok - second invocation adds a log instead of overwriting
+2026-08-31T22:12:01.8096146Z # U3: recovery-only resolver and no-spend control flow
+2026-08-31T22:12:01.8680425Z ok - recover exact marker returns durable artifact with CDP and Oracle unavailable
+2026-08-31T22:12:01.8712539Z ok - recover exact artifact prints Review ready only on stderr
+2026-08-31T22:12:01.8733018Z ok - recover artifact fast path has no fresh dispatch, status, ledger, round, reservation, or organizer effects
+2026-08-31T22:12:01.9792967Z ok - recover exact marker refuses a completed symlink instead of returning its target
+2026-08-31T22:12:02.0841640Z ok - recover exact marker refuses a pending symlink instead of returning its target
+2026-08-31T22:12:02.1511689Z ok - recover repo-qualified URL selects newest charged run before artifact lookup
+2026-08-31T22:12:02.2282018Z ok - recover bare PR with current repository proof selects newest charged run
+2026-08-31T22:12:02.2823348Z ok - recover orders completed runs by durable charged spend, not inverted marker epoch
+2026-08-31T22:12:02.3195445Z ok - recover refuses lossy legacy slug collision without canonical metadata proof
+2026-08-31T22:12:02.3646316Z ok - recover refuses tied durable charged-spend candidates
+2026-08-31T22:12:02.4802119Z ok - recover artifact absence enters harvest only and retains its operational exit
+2026-08-31T22:12:02.6016918Z ok - recover targets newer live run before older completed artifact
+2026-08-31T22:12:02.6539258Z ok - recover refuses mixed legacy and canonical candidate evidence
+2026-08-31T22:12:02.7142002Z ok - recover refuses conflicting sidecar and reservation charge evidence
+2026-08-31T22:12:02.7472757Z ok - recover bare PR without current canonical repository proof refuses cross-repo ambiguity
+2026-08-31T22:12:04.0086736Z ok - concurrent recover inherits marker harvest lock and busy state without fresh dispatch
+2026-08-31T22:12:04.1060889Z ok - recover exact legacy marker creates a safe fallback output before harvest
+2026-08-31T22:12:14.4649473Z ok - fresh run persists canonical repository identity and charged-spend ordering metadata
+2026-08-31T22:12:14.4650757Z # fix: uncharged terminal exit no longer mints a false run-meta record
+2026-08-31T22:12:14.8473833Z ok - uncharged round-capped run exits 12
+2026-08-31T22:12:14.8538579Z ok - uncharged terminal exit mints no run-meta record for its own marker
+2026-08-31T22:12:14.8571115Z ok - uncharged terminal exit emits no metadata WARNING
+2026-08-31T22:12:14.9040662Z ok - recover after an uncharged attempt still returns the prior charged artifact
+2026-08-31T22:12:14.9041600Z # fix: publication temps are excluded from the run-meta recovery scan
+2026-08-31T22:12:14.9250471Z ok - run-meta scan excludes a planted publication-temp record
+2026-08-31T22:12:14.9271357Z ok - run-meta scan still returns the committed record beside it
+2026-08-31T22:12:14.9292856Z ok - run-meta scan keeps a charged record whose repo name contains .tmp.
+2026-08-31T22:12:14.9293807Z # fix: --recover accepts one trailing slash on a canonical PR URL
+2026-08-31T22:12:14.9783413Z ok - recover of a trailing-slash canonical PR URL returns the prior charged artifact
+2026-08-31T22:12:14.9784605Z # fix: pg_repo_identity_from_url accepts SSH remotes without a .git suffix
+2026-08-31T22:12:14.9980841Z ok - git@host:owner/repo (no .git) parses to canonical identity
+2026-08-31T22:12:15.0180163Z ok - ssh://git@host/owner/repo (no .git) parses to canonical identity
+2026-08-31T22:12:15.0376374Z ok - git@host:owner/repo.git (with .git) still parses (existing strip preserved)
+2026-08-31T22:12:15.0574282Z ok - ssh://git@host/owner/repo.git (with .git) still parses
+2026-08-31T22:12:15.0669798Z ok - a malformed ssh-ish form (no colon, no ssh://) still refuses
+2026-08-31T22:12:15.0670991Z # --recover negative parser table: exclusive with every other mode, and rejects no query
+2026-08-31T22:12:15.0960418Z ok - recover + --pr exits 2
+2026-08-31T22:12:15.0992880Z ok - recover + --pr names the misuse on stderr
+2026-08-31T22:12:15.1226415Z ok - recover + --diff exits 2
+2026-08-31T22:12:15.1455132Z ok - recover + --harvest exits 2
+2026-08-31T22:12:15.1683795Z ok - recover + --status exits 2
+2026-08-31T22:12:15.1923746Z ok - recover + --json exits 2
+2026-08-31T22:12:15.2153020Z ok - recover with no query exits 2
+2026-08-31T22:12:15.2200186Z ok - negative recover table creates no run-meta/recovered/reservation state and never dispatches oracle
+2026-08-31T22:12:15.2201349Z # gate #91 P2 (:65): trailing two-arg flag with no operand fails fast, exit 2, not forever
+2026-08-31T22:12:15.2433377Z ok - trailing --pr with no operand exits 2 promptly (not 124-timeout, not unbound-variable crash)
+2026-08-31T22:12:15.2465063Z ok - trailing --pr with no operand names the flag on stderr
+2026-08-31T22:12:15.2685827Z ok - trailing --repo with no operand exits 2 promptly (not 124-timeout, not unbound-variable crash)
+2026-08-31T22:12:15.2717161Z ok - trailing --repo with no operand names the flag on stderr
+2026-08-31T22:12:15.2934775Z ok - trailing --diff with no operand exits 2 promptly (not 124-timeout, not unbound-variable crash)
+2026-08-31T22:12:15.2967108Z ok - trailing --diff with no operand names the flag on stderr
+2026-08-31T22:12:15.3183534Z ok - trailing --input with no operand exits 2 promptly (not 124-timeout, not unbound-variable crash)
+2026-08-31T22:12:15.3215487Z ok - trailing --input with no operand names the flag on stderr
+2026-08-31T22:12:15.3431215Z ok - trailing --out with no operand exits 2 promptly (not 124-timeout, not unbound-variable crash)
+2026-08-31T22:12:15.3462582Z ok - trailing --out with no operand names the flag on stderr
+2026-08-31T22:12:15.3674733Z ok - trailing --timeout with no operand exits 2 promptly (not 124-timeout, not unbound-variable crash)
+2026-08-31T22:12:15.3705922Z ok - trailing --timeout with no operand names the flag on stderr
+2026-08-31T22:12:15.3919522Z ok - trailing --extra-files with no operand exits 2 promptly (not 124-timeout, not unbound-variable crash)
+2026-08-31T22:12:15.3950735Z ok - trailing --extra-files with no operand names the flag on stderr
+2026-08-31T22:12:15.4164538Z ok - trailing --confirm with no operand exits 2 promptly (not 124-timeout, not unbound-variable crash)
+2026-08-31T22:12:15.4195630Z ok - trailing --confirm with no operand names the flag on stderr
+2026-08-31T22:12:15.4407899Z ok - trailing --harvest with no operand exits 2 promptly (not 124-timeout, not unbound-variable crash)
+2026-08-31T22:12:15.4439059Z ok - trailing --harvest with no operand names the flag on stderr
+2026-08-31T22:12:15.4652333Z ok - trailing --recover with no operand exits 2 promptly (not 124-timeout, not unbound-variable crash)
+2026-08-31T22:12:15.4682649Z ok - trailing --recover with no operand names the flag on stderr
+2026-08-31T22:12:15.5020413Z ok - --status with no trailing operand still works (excluded from the two-arg guard)
+2026-08-31T22:12:15.5021763Z # U3 publication-failure mapping: --recover --out with an unwritable/nonexistent parent
+2026-08-31T22:12:15.5418471Z ok - publication failure exits 6 with "Browser needs attention" on stderr
+2026-08-31T22:12:15.5437071Z ok - publication failure leaves the durable artifact byte-identical
+2026-08-31T22:12:15.5442902Z ok - publication failure creates no output file
+2026-08-31T22:12:15.5462691Z ok - publication failure has no browser/round/reservation side effects
+2026-08-31T22:12:15.5481400Z ok - publication failure stdout carries no review claim
+2026-08-31T22:12:15.5482152Z # gate #91 P1 (:169): --recover serves a pending-only durable artifact
+2026-08-31T22:12:15.5926896Z ok - recover returns a pending-only artifact by exact marker
+2026-08-31T22:12:15.5958209Z ok - recover pending-only artifact prints Review ready only on stderr
+2026-08-31T22:12:15.5976833Z ok - recover pending-only artifact never dispatches oracle
+2026-08-31T22:12:15.5996213Z ok - recover pending-only artifact leaves the pending file byte-identical and in place
+2026-08-31T22:12:15.6458207Z ok - recover returns a pending-only artifact by PR URL
+2026-08-31T22:12:15.6459539Z # gate #91 P1 (:192): recorded --out is resolved absolute at charge time and validated at recovery
+2026-08-31T22:12:25.9975082Z ok - fresh run with a relative --out records an absolute path in run-meta
+2026-08-31T22:12:26.0949508Z ok - a recorded relative OUT does not publish outside PRO_GATE_HOME
+2026-08-31T22:12:26.0972772Z ok - a recorded relative OUT falls back to the recovered/ directory instead
+2026-08-31T22:12:26.2056626Z ok - a recorded absolute OUT with a dead parent falls back to the recovered/ directory instead of failing to establish an output path
+2026-08-31T22:12:26.2062499Z ok - a recorded absolute OUT with a dead parent never creates the dead parent directory
+2026-08-31T22:12:26.7668493Z ok - a recorded valid absolute OUT is still used to publish the recovered artifact
+2026-08-31T22:12:26.7669683Z # gate #91 P2 (:199): recover harvest-delegation exposes one plain state line, not raw --harvest noise
+2026-08-31T22:12:27.3067580Z ok - recover harvest-delegation success exits 0
+2026-08-31T22:12:27.3098073Z ok - recover harvest-delegation success stdout carries only review bytes
+2026-08-31T22:12:27.3148523Z ok - recover harvest-delegation success stderr is exactly one plain state line
+2026-08-31T22:12:27.3149711Z # gate #91 P1 (:271): recover ignores a concurrently mutated --out, using the RESULT_FILE locator/captured body instead
+2026-08-31T22:12:27.9329146Z ok - recover under a continuous --out race still exits 0
+2026-08-31T22:12:27.9372829Z ok - recover under a continuous --out race prints the REAL review, not the racer garbage
+2026-08-31T22:12:27.9423642Z ok - recover under a continuous --out race still reports the plain success state line
+2026-08-31T22:12:27.9424855Z # gate #91 P1 (:271): a locator naming a non-review file falls back to the captured review body, still ignoring a raced --out
+2026-08-31T22:12:28.6150973Z ok - recover with a racing (locator-invalidating) completed artifact still exits 0 via captured-body fallback
+2026-08-31T22:12:28.6195734Z ok - recover with a racing completed artifact and racing --out prints the REAL review, not the racer garbage
+2026-08-31T22:12:28.6197043Z # gate #91 round3 P1 (:304): recover with locator AND captured body both invalid fails closed, never reading $OUT
+2026-08-31T22:12:29.0203513Z ok - recover with locator AND captured body both invalid reports the trouble state
+2026-08-31T22:12:29.0222763Z ok - recover with locator AND captured body both invalid prints nothing on stdout
+2026-08-31T22:12:29.0255703Z ok - recover with locator AND captured body both invalid never surfaces the foreign $OUT review
+2026-08-31T22:12:29.0817535Z ok - recover refuses a stale artifact while a newer metadata-less run is LIVE, naming that marker
+2026-08-31T22:12:29.1307772Z ok - recover ignores a dead active record and returns the durable older artifact
+2026-08-31T22:12:29.1671308Z ok - exact-marker recovery is unaffected by a live active record for the same round key
+2026-08-31T22:12:29.2051286Z ok - recover cannot publish over an --out whose guard another live run already holds
+2026-08-31T22:12:29.2086596Z ok - recover guard contention still prints exactly one plain state line
+2026-08-31T22:12:29.2563867Z ok - recover publishes normally once the --out guard is released
+2026-08-31T22:12:34.5498385Z ok - recover harvest-delegation still-generating exits 9
+2026-08-31T22:12:34.5517458Z ok - recover harvest-delegation still-generating stdout is empty
+2026-08-31T22:12:34.5568140Z ok - recover harvest-delegation still-generating stderr is exactly one plain state line
+2026-08-31T22:12:35.6718028Z ok - recover harvest-delegation lock contention exits 7
+2026-08-31T22:12:35.6737286Z ok - recover harvest-delegation lock contention stdout is empty
+2026-08-31T22:12:35.6788971Z ok - recover harvest-delegation lock contention stderr is exactly one plain state line
+2026-08-31T22:12:35.6808107Z ok - neither failure state dispatched oracle
+2026-08-31T22:12:36.2348980Z ok - PRO_GATE_RECOVER_VERBOSE=1 surfaces the raw harvest RESULT_FILE= line
+2026-08-31T22:12:36.2380671Z ok - PRO_GATE_RECOVER_VERBOSE=1 surfaces raw cdp-salvage diagnostics on stderr
+2026-08-31T22:12:36.2381641Z # U1: review-decision/v1 pure reducer, contract identity, and immutable bindings
+2026-08-31T22:12:36.2609783Z ok - contract fixture is byte-canonical JSON with no trailing newline
+2026-08-31T22:12:36.2699808Z ok - corpus fixture is byte-canonical JSON with no trailing newline
+2026-08-31T22:12:36.2718900Z ok - runtime publishes the exact canonical contract and corpus digests
+2026-08-31T22:12:36.3305332Z ok - review decision action: collect current completed result
+2026-08-31T22:12:36.3336848Z ok - review decision envelope is closed and status/next_action-free: collect current completed result
+2026-08-31T22:12:36.3845952Z ok - review decision action: recover charged work
+2026-08-31T22:12:36.3876856Z ok - review decision envelope is closed and status/next_action-free: recover charged work
+2026-08-31T22:12:36.4600761Z ok - review decision action: run a granted review
+2026-08-31T22:12:36.4632362Z ok - review decision envelope is closed and status/next_action-free: run a granted review
+2026-08-31T22:12:36.5435304Z ok - review decision action: fix current findings
+2026-08-31T22:12:36.5467937Z ok - review decision envelope is closed and status/next_action-free: fix current findings
+2026-08-31T22:12:36.6027799Z ok - review decision action: prepare missing evidence
+2026-08-31T22:12:36.6059740Z ok - review decision envelope is closed and status/next_action-free: prepare missing evidence
+2026-08-31T22:12:36.6758563Z ok - review decision action: stop at governor denial
+2026-08-31T22:12:36.6790489Z ok - review decision envelope is closed and status/next_action-free: stop at governor denial
+2026-08-31T22:12:36.7598248Z ok - review decision action: hand current ship to existing merge workflow
+2026-08-31T22:12:36.7629308Z ok - review decision envelope is closed and status/next_action-free: hand current ship to existing merge workflow
+2026-08-31T22:12:36.8581620Z ok - review decision action: ask one named product choice
+2026-08-31T22:12:36.8614247Z ok - review decision envelope is closed and status/next_action-free: ask one named product choice
+2026-08-31T22:12:37.0016061Z ok - identical normalized snapshots emit byte-identical canonical decisions
+2026-08-31T22:12:37.0049851Z ok - decision carries snapshot, contract, and corpus identity
+2026-08-31T22:12:37.0576032Z ok - undefined normalized state stops closed
+2026-08-31T22:12:37.1157487Z ok - invalid input binding stops closed
+2026-08-31T22:12:37.1568846Z ok - blocking-wait transport collision stops closed
+2026-08-31T22:12:37.1962716Z ok - unknown decision contract stops closed
+2026-08-31T22:12:37.2553780Z ok - legacy completed artifact remains collectable
+2026-08-31T22:12:37.3230146Z ok - legacy SHIP cannot authorize merge eligibility or paid continuation
+2026-08-31T22:12:37.3806584Z ok - newest charged completed result and canonical identity are selected
+2026-08-31T22:12:37.4329521Z ok - unresolved completed-result identity tie stops closed
+2026-08-31T22:12:37.4991332Z ok - identical verified code and evidence cannot authorize another review
+2026-08-31T22:12:37.5523728Z ok - no safe evidence action stops without caller inference
+2026-08-31T22:12:37.6051989Z ok - active-index crash state never becomes fresh-run eligibility: pre-charge
+2026-08-31T22:12:37.6577103Z ok - active-index crash state never becomes fresh-run eligibility: round-recorded
+2026-08-31T22:12:37.7101975Z ok - active-index crash state never becomes fresh-run eligibility: charged
+2026-08-31T22:12:37.7623508Z ok - active-index crash state never becomes fresh-run eligibility: run-meta-written
+2026-08-31T22:12:37.8147732Z ok - active-index crash state never becomes fresh-run eligibility: input-bound
+2026-08-31T22:12:37.8672949Z ok - active-index crash state never becomes fresh-run eligibility: submitted
+2026-08-31T22:12:37.9196152Z ok - active-index crash state never becomes fresh-run eligibility: unknown-fate
+2026-08-31T22:12:38.0276472Z ok - valid fresh named choice is a non-authorizing agent handoff
+2026-08-31T22:12:38.1172285Z ok - invalid named choice never falls back to caller inference
+2026-08-31T22:12:38.1504042Z ok - raw control fields are rejected from normalized input
+2026-08-31T22:12:38.1846442Z ok - credential-bearing normalized input is rejected and never echoed
+2026-08-31T22:12:38.2226215Z ok - input binding is marker-addressed, validated, canonical, and readable
+2026-08-31T22:12:38.2623609Z ok - input binding is immutable but byte-identical replay is idempotent
+2026-08-31T22:12:38.3067710Z ok - result binding is the only marker-bound sibling and validates input/artifact identity
+2026-08-31T22:12:38.3069227Z # U2: review-decision CLI resolution is read-only and proof-bounded
+2026-08-31T22:12:38.4670957Z ok - cold-start query without complete evidence asks to prepare matching evidence
+2026-08-31T22:12:38.4700094Z ok - review-decision query creates no durable state, lock, sidecar, cache, or binding
+2026-08-31T22:12:38.6818914Z ok - review-decision accepts a linked working tree with a .git file
+2026-08-31T22:12:38.7407147Z ok - review-decision rejects non-working-tree and bare repository paths
+2026-08-31T22:12:38.9458055Z ok - cold-start connector proof grants review without a seeded binding
+2026-08-31T22:12:38.9546673Z find: ‘/tmp/pg-engine-test.1DFp8V/home-review-decision’: No such file or directory
+2026-08-31T22:12:39.1540471Z find: ‘/tmp/pg-engine-test.1DFp8V/home-review-decision’: No such file or directory
+2026-08-31T22:12:39.1621046Z ok - stale connector head suppresses the saved effect and returns a new advisory only
+2026-08-31T22:12:39.1628575Z ok - effect re-resolution creates no lock, cache, sidecar, or binding mutation
+2026-08-31T22:12:39.4931988Z ok - full-PR proof requires current base head endpoint and raw patch digests
+2026-08-31T22:12:39.7388447Z ok - changed full-PR endpoint bytes create a new cold-start advisory, not a stale binding match
+2026-08-31T22:12:40.0285852Z ok - cold-start scoped delta binds distinct raw/reviewed payload bytes and lineage
+2026-08-31T22:12:40.3055091Z ok - changed scoped manifest becomes a new cold-start advisory rather than a stale binding match
+2026-08-31T22:12:40.5910606Z ok - stale scoped manifest bytes suppress saved-effect dispatch
+2026-08-31T22:12:40.8803277Z ok - stale scoped confirmation bytes suppress saved-effect dispatch
+2026-08-31T22:12:41.1678297Z ok - stale scoped raw bytes suppress saved-effect dispatch
+2026-08-31T22:12:41.5350590Z ok - canonical SHIP without result binding is collect-only, never merge eligible
+2026-08-31T22:12:42.0304292Z ok - matching collect effect repairs one validated marker-bound result binding
+2026-08-31T22:12:42.5260740Z ok - result-binding repair is idempotent and does not mutate canonical bytes
+2026-08-31T22:12:42.5261449Z # U2: CLI current-evidence and result precedence
+2026-08-31T22:12:42.8073393Z ok - default both prepares bundle evidence instead of selecting a current connector result
+2026-08-31T22:12:43.1569651Z ok - connector NEEDS-DISCUSSION plus same-head scoped proof grants review without a prompt
+2026-08-31T22:12:43.6957457Z ok - current code identity is stable across equivalent marker and charged-epoch changes
+2026-08-31T22:12:44.3409964Z ok - repeated scoped evidence with its completed result cannot grant another review
+2026-08-31T22:12:44.8021039Z ok - changed evidence is non-applicable prior progress and does not terminal-block continuation
+2026-08-31T22:12:45.5013171Z ok - exact completed results select newest input charged epoch despite older result acceptance
+2026-08-31T22:12:45.5014532Z # U2: fresh dispatch charge-to-input-binding guards
+2026-08-31T22:12:45.7600549Z ok - cold-start full-PR fixture resolves to advisory run-granted-review without a binding
+2026-08-31T22:12:57.2767070Z ok - matching fresh effect charges only after marker-bound input binding persists before Oracle submission
+2026-08-31T22:12:57.2842675Z ok - successful fresh charge records the exact binding epoch before submission
+2026-08-31T22:12:57.8044598Z ok - fresh pre-lock guard supersedes advisory for completed without Oracle dispatch
+2026-08-31T22:12:58.6130988Z ok - fresh pre-lock guard supersedes advisory for active without Oracle dispatch
+2026-08-31T22:12:59.3129773Z ok - fresh pre-lock guard supersedes advisory for reserved without Oracle dispatch
+2026-08-31T22:12:59.7411443Z ok - fresh pre-lock guard supersedes advisory for unknown-fate without Oracle dispatch
+2026-08-31T22:12:59.7470766Z ok - effect freshness exposes run-meta without terminal bytes as recoverable unknown-fate work
+2026-08-31T22:12:59.9555522Z ok - public decision query exposes run-meta-only recovery with its exact marker
+2026-08-31T22:13:00.1802109Z ok - run-meta-only recovery effect stays stable without Oracle dispatch or another spend
+2026-08-31T22:13:00.2091768Z ok - attempt snapshot reports the same run-meta-only recovery marker and charge
+2026-08-31T22:13:00.4129812Z ok - leading-zero PR spelling normalizes to the same run-meta recovery identity
+2026-08-31T22:13:00.6336114Z ok - leading-zero recovery effect remains stable without a duplicate spend
+2026-08-31T22:13:00.7456732Z ok - terminal disposition outranks stale mutable attempt state and reports cleanup pending
+2026-08-31T22:13:00.8701654Z ok - not-submitted transition refunds and cleans exact mutable state before fresh eligibility
+2026-08-31T22:13:01.0407769Z ok - status exposes canonical terminal attempt and fresh eligible next step without contradiction
+2026-08-31T22:13:01.1793807Z ok - direct PR recovery reports terminal no-review state without browser or fresh dispatch
+2026-08-31T22:13:01.2373363Z ok - terminal transition replay is idempotent and never recreates a refunded round
+2026-08-31T22:13:01.3045472Z ok - late valid review bytes outrank the terminal disposition
+2026-08-31T22:13:01.3991859Z ok - older stale active and reservation sidecars cannot override newer terminal disposition
+2026-08-31T22:13:01.4694949Z ok - older terminal disposition never hides a distinct newer active attempt
+2026-08-31T22:13:01.5738156Z ok - newer valid review artifact outranks an older different-marker disposition
+2026-08-31T22:13:01.6640681Z ok - disposition sweep deletes old clean proof but retains cleanup-pending proof
+2026-08-31T22:13:01.8751266Z ok - repository-qualified decision query selects upstream run-meta instead of fork origin
+2026-08-31T22:13:02.1003643Z ok - repository-qualified recovery effect preserves the upstream marker without Oracle dispatch
+2026-08-31T22:13:02.3302843Z ok - unresolved selector uses newest charge and canonical tie-break while rejecting mismatched rows
+2026-08-31T22:13:02.3327787Z ok - run-meta scan excludes a marker/key/PR mismatch
+2026-08-31T22:13:02.8567258Z ok - exact current pending review suppresses spend and routes only to collection/recovery
+2026-08-31T22:13:14.5527721Z ok - old-head completed bytes do not suppress the current fresh dispatch
+2026-08-31T22:13:26.2977982Z ok - changed-evidence completed bytes do not suppress the current fresh dispatch
+2026-08-31T22:13:26.7707372Z ok - public query treats historical completed bytes as terminal for their own run-meta marker
+2026-08-31T22:13:38.2879645Z ok - historical completed bytes retire same-marker run-meta without gaining applicability
+2026-08-31T22:13:38.7607495Z ok - public query treats historical pending bytes as terminal for their own run-meta marker
+2026-08-31T22:13:50.2707766Z ok - historical pending bytes retire same-marker run-meta without gaining applicability
+2026-08-31T22:13:50.7113967Z ok - public query skips resolved run-meta and selects a later unresolved charged marker
+2026-08-31T22:13:50.9511720Z ok - resolved run-meta does not hide a later unresolved charged marker
+2026-08-31T22:13:51.1742116Z ok - default exhausted round history still grants changed proven evidence
+2026-08-31T22:13:51.6127572Z ok - stale run-granted advisory re-reduces after evidence without charge or Oracle
+2026-08-31T22:13:52.4492645Z ok - stale run-granted advisory re-reduces after governor without charge or Oracle
+2026-08-31T22:13:53.7669870Z ok - failed round persistence preserves charged recovery state before Oracle
+2026-08-31T22:13:55.0988384Z ok - failed run-meta persistence preserves charged recovery state before Oracle
+2026-08-31T22:13:56.4534364Z ok - failed binding persistence preserves charged recovery state before Oracle
+2026-08-31T22:13:56.9030675Z ok - stale run-granted advisory re-reduces a moved head without charge or Oracle
+2026-08-31T22:13:56.9031417Z # U3: review-decision precedence and recovery-state conformance
+2026-08-31T22:13:56.9608565Z ok - same charged epoch deterministically selects canonical identity before collection
+2026-08-31T22:13:57.0162709Z ok - uncollected current result wins over newer active work without a fresh review
+2026-08-31T22:13:57.0721552Z ok - reservation state is recovery-only: live
+2026-08-31T22:13:57.1286271Z ok - reservation state is recovery-only: recoverable
+2026-08-31T22:13:57.1841240Z ok - reservation state is recovery-only: unknown-fate
+2026-08-31T22:13:57.2401006Z ok - expired reservation with no current binding stops rather than creating new spend
+2026-08-31T22:13:57.2402525Z # U2 reopened: bounded named-product choice artifacts
+2026-08-31T22:13:57.2765710Z ok - well-formed NEEDS-DISCUSSION artifact yields bounded machine choice outcomes
+2026-08-31T22:13:57.3136260Z ok - printable shell metacharacters remain inert normalized choice data
+2026-08-31T22:13:57.3374534Z ok - invalid named choice artifact stops closed: one
+2026-08-31T22:13:57.3670779Z ok - invalid named choice artifact stops closed: duplicate
+2026-08-31T22:13:57.4023438Z ok - invalid named choice artifact stops closed: oversized
+2026-08-31T22:13:57.4382043Z ok - invalid named choice artifact stops closed: oversized-id
+2026-08-31T22:13:57.4564760Z ok - invalid named choice artifact stops closed: control
+2026-08-31T22:13:57.4753165Z ok - invalid named choice artifact stops closed: malformed
+2026-08-31T22:13:57.4944673Z ok - invalid named choice artifact stops closed: extra-pipe
+2026-08-31T22:13:57.4945536Z # U2 reopened: real CLI named-product selection
+2026-08-31T22:13:58.0256601Z ok - exact NEEDS-DISCUSSION CLI result exposes only validated outcomes and asks once
+2026-08-31T22:13:58.0290952Z ok - initial named-choice effect snapshot is the reducer choice context
+2026-08-31T22:13:58.5509263Z ok - exact canonical selection returns the existing non-authorizing named-choice fixer handoff without mutation
+2026-08-31T22:13:59.0292009Z ok - malformed, unknown, or stale choice selection stops without a review: malformed
+2026-08-31T22:13:59.5350452Z ok - malformed, unknown, or stale choice selection stops without a review: unknown
+2026-08-31T22:14:00.0700673Z ok - malformed, unknown, or stale choice selection stops without a review: stale
+2026-08-31T22:14:00.5747985Z ok - malformed, unknown, or stale choice selection stops without a review: oversized
+2026-08-31T22:14:01.0571737Z ok - malformed, unknown, or stale choice selection stops without a review: symlink
+2026-08-31T22:14:01.3910796Z ok - moved scoped evidence invalidates a named selection without reusing it
+2026-08-31T22:14:01.3928457Z # U2 reopened: scoped SHIP merge handoff
+2026-08-31T22:14:02.6801371Z ok - unchanged provenance-valid scoped SHIP reaches report-only merge handoff, never another review
+2026-08-31T22:14:03.0216291Z ok - scoped SHIP with moved raw cannot reach merge handoff
+2026-08-31T22:14:03.3710641Z ok - scoped SHIP with moved reviewed cannot reach merge handoff
+2026-08-31T22:14:03.7232156Z ok - scoped SHIP with moved manifest cannot reach merge handoff
+2026-08-31T22:14:04.0676712Z ok - scoped SHIP with moved confirmation cannot reach merge handoff
+2026-08-31T22:14:04.4167817Z ok - scoped SHIP with moved base cannot reach merge handoff
+2026-08-31T22:14:04.6869692Z ok - moved head invalidates a named selection without granting review or merge
+2026-08-31T22:14:04.9588284Z ok - scoped SHIP with moved head cannot reach merge handoff
+2026-08-31T22:14:05.2253235Z ok - connector SHIP never becomes merge eligibility
+2026-08-31T22:14:05.5003901Z ok - exact pending connector SHIP is collect-only and never merge eligible
+2026-08-31T22:14:05.5004713Z ALL PASS
+2026-08-31T22:14:05.5712394Z # pg_file_sig: stable + change-sensitive
+2026-08-31T22:14:05.6046974Z ok - sig is non-empty
+2026-08-31T22:14:05.6051138Z ok - sig is stable across calls
+2026-08-31T22:14:05.6212719Z ok - sig changes when a file changes
+2026-08-31T22:14:05.6362226Z ok - sig changes when a file disappears
+2026-08-31T22:14:05.6363131Z # install.sh writes an atomic deploy stamp (= sig of the deployed daemon code) as its last deploy step
+2026-08-31T22:14:05.7500919Z ok - install wrote .deploy-stamp
+2026-08-31T22:14:05.7700590Z ok - stamp == sig of deployed daemon code
+2026-08-31T22:14:05.7706164Z ok - no leftover .deploy-stamp.tmp (atomic rename)
+2026-08-31T22:14:05.7710709Z ok - installer does not copy plugin-owned skill
+2026-08-31T22:14:05.7715737Z ok - installer does not copy plugin-owned agent
+2026-08-31T22:14:05.7716427Z # U4: daemon consumes all typed actions without legacy policy inference
+2026-08-31T22:14:05.7950435Z ok - daemon defaults PRO_REVIEW_INPUT to both
+2026-08-31T22:14:05.8152295Z ok - invalid PRO_REVIEW_INPUT fails closed at startup
+2026-08-31T22:14:05.9039973Z ok - run worker prompt starts with the exact argv-quoted saved guarded effect
+2026-08-31T22:14:05.9158830Z ok - run worker prompt restores fix/test/commit/push/comment lifecycle and no-merge guard
+2026-08-31T22:14:06.0164227Z ok - successful typed agent task returns completion
+2026-08-31T22:14:06.0249914Z ok - agent-task prompt identifies typed action target saved decision and valid query-only re-entry route
+2026-08-31T22:14:06.0269098Z ok - agent-task prompt excludes raw decision-envelope content
+2026-08-31T22:14:06.0279301Z ok - unavailable typed agent task is deferred, not completed
+2026-08-31T22:14:06.0333693Z ok - failed typed agent task is deferred, not completed
+2026-08-31T22:14:06.1739828Z ok - nonzero run worker + fresh typed collect-existing-result leaves wrapper failure budget untouched
+2026-08-31T22:14:06.3040644Z ok - nonzero run worker + fresh typed recover-existing-review leaves wrapper failure budget untouched
+2026-08-31T22:14:06.4817674Z ok - nonrecoverable fresh typed replacement retains note_fail behavior
+2026-08-31T22:14:06.4840096Z ok - default both input is reused by fresh query
+2026-08-31T22:14:06.7231299Z ok - typed daemon accepts corpus action collect-existing-result
+2026-08-31T22:14:06.7238909Z ok - collect-existing-result dispatches only its runtime-provided execution class without a routine prompt
+2026-08-31T22:14:06.7320125Z ok - collect-existing-result has zero SHA/failure-budget effects unless it runs a granted review
+2026-08-31T22:14:06.9519155Z ok - typed daemon accepts corpus action recover-existing-review
+2026-08-31T22:14:06.9526527Z ok - recover-existing-review dispatches only its runtime-provided execution class without a routine prompt
+2026-08-31T22:14:06.9606124Z ok - recover-existing-review has zero SHA/failure-budget effects unless it runs a granted review
+2026-08-31T22:14:07.1507143Z ok - typed daemon accepts corpus action run-granted-review
+2026-08-31T22:14:07.1514475Z ok - run-granted-review dispatches only its runtime-provided execution class without a routine prompt
+2026-08-31T22:14:07.1559325Z ok - run-granted-review has zero SHA/failure-budget effects unless it runs a granted review
+2026-08-31T22:14:07.3717758Z ok - typed daemon accepts corpus action fix-review-findings
+2026-08-31T22:14:07.3725020Z ok - fix-review-findings dispatches only its runtime-provided execution class without a routine prompt
+2026-08-31T22:14:07.3803843Z ok - fix-review-findings has zero SHA/failure-budget effects unless it runs a granted review
+2026-08-31T22:14:07.5392095Z ok - typed daemon accepts corpus action prepare-matching-review-evidence
+2026-08-31T22:14:07.5399169Z ok - prepare-matching-review-evidence dispatches only its runtime-provided execution class without a routine prompt
+2026-08-31T22:14:07.5480355Z ok - prepare-matching-review-evidence has zero SHA/failure-budget effects unless it runs a granted review
+2026-08-31T22:14:07.7370469Z ok - typed daemon accepts corpus action stop-without-new-review
+2026-08-31T22:14:07.7378465Z ok - stop-without-new-review dispatches only its runtime-provided execution class without a routine prompt
+2026-08-31T22:14:07.7462056Z ok - stop-without-new-review has zero SHA/failure-budget effects unless it runs a granted review
+2026-08-31T22:14:07.9585809Z ok - typed daemon accepts corpus action allow-existing-merge-workflow
+2026-08-31T22:14:07.9593142Z ok - allow-existing-merge-workflow dispatches only its runtime-provided execution class without a routine prompt
+2026-08-31T22:14:07.9674043Z ok - allow-existing-merge-workflow has zero SHA/failure-budget effects unless it runs a granted review
+2026-08-31T22:14:08.2097280Z ok - typed daemon accepts corpus action ask-named-product-choice
+2026-08-31T22:14:08.2104440Z ok - ask-named-product-choice dispatches only its runtime-provided execution class without a routine prompt
+2026-08-31T22:14:08.2184386Z ok - ask-named-product-choice has zero SHA/failure-budget effects unless it runs a granted review
+2026-08-31T22:14:08.2207719Z ok - default both input is reused by guarded effect rechecks
+2026-08-31T22:14:08.5463343Z ok - successful no-push fix task marks its SHA and is skipped next poll
+2026-08-31T22:14:08.7760289Z ok - successful no-push evidence task marks its SHA and is skipped next poll
+2026-08-31T22:14:09.0022329Z ok - successful pushed agent task marks original and new heads
+2026-08-31T22:14:09.2231346Z ok - agent task rc=1 stays retryable without a failure-budget row
+2026-08-31T22:14:09.4452252Z ok - agent task rc=2 stays retryable without a failure-budget row
+2026-08-31T22:14:09.7567439Z ok - collect-existing-result does not mark a processed SHA or failure budget
+2026-08-31T22:14:10.0462355Z ok - recover-existing-review does not mark a processed SHA or failure budget
+2026-08-31T22:14:10.3194665Z ok - stop-without-new-review does not mark a processed SHA or failure budget
+2026-08-31T22:14:10.6311030Z ok - allow-existing-merge-workflow does not mark a processed SHA or failure budget
+2026-08-31T22:14:10.9870031Z ok - ask-named-product-choice does not mark a processed SHA or failure budget
+2026-08-31T22:14:11.2390907Z ok - observation reports progress without changing granted runtime dispatch
+2026-08-31T22:14:11.6583089Z ok - stale runtime effect re-dispatches the fresh replacement action
+2026-08-31T22:14:11.7524418Z ok - malformed decision globally defers with zero worker/SHA/failure-budget effects
+2026-08-31T22:14:11.8520298Z ok - corpus decision globally defers with zero worker/SHA/failure-budget effects
+2026-08-31T22:14:11.9504833Z ok - unknown decision globally defers with zero worker/SHA/failure-budget effects
+2026-08-31T22:14:12.1296949Z ok - stale decision globally defers with zero worker/SHA/failure-budget effects
+2026-08-31T22:14:12.1297999Z # integration: daemon re-execs itself in place when the deploy stamp changes
+2026-08-31T22:14:12.3518857Z ok - daemon started
+2026-08-31T22:14:12.3526302Z ok - daemon process alive before reload
+2026-08-31T22:14:13.3798565Z ok - daemon detected the new deploy stamp
+2026-08-31T22:14:13.3876468Z ok - daemon re-started after reload (2 startup lines)
+2026-08-31T22:14:13.3884101Z ok - PID unchanged across reload (exec, not a fresh spawn)
+2026-08-31T22:14:17.3993732Z ok - reloaded exactly once (no reload-loop; identical stamp is inert)
+2026-08-31T22:14:17.4037626Z ok - started exactly twice (no reload-loop)
+2026-08-31T22:14:17.4038301Z # integration: self-reload disabled -> no re-exec on a new stamp
+2026-08-31T22:14:21.1353420Z ok - self-reload=0 does not detect/reload
+2026-08-31T22:14:21.1396691Z ok - self-reload=0 keeps a single startup line
+2026-08-31T22:14:21.1397425Z # integration: identity mismatch globally defers, compatible reload recovers
+2026-08-31T22:14:21.3656173Z ok - missing identity globally defers before browser or worker work
+2026-08-31T22:14:22.4034093Z ok - compatible identity deploy reloads and recovers daemon readiness
+2026-08-31T22:14:22.4034797Z ALL PASS
+2026-08-31T22:14:22.4435414Z # follow: manifest skew triggers the installer with services skipped
+2026-08-31T22:14:22.4898930Z ok - skew updates via installer (exit 0)
+2026-08-31T22:14:22.4926892Z ok - installer got the plugin version and INSTALL_SKIP_SERVICES=1
+2026-08-31T22:14:22.4927357Z # no-op: versions equal
+2026-08-31T22:14:22.5238285Z ok - equal versions do nothing
+2026-08-31T22:14:22.5239462Z # the ACTIVE manifest version wins over stale higher-versioned cache copies
+2026-08-31T22:14:22.5714917Z ok - manifest (0.23.0) beats stale cache (0.31.0)
+2026-08-31T22:14:22.5715996Z # fallback without a manifest: real cache layout is matched
+2026-08-31T22:14:22.6237247Z ok - cache-layout fallback finds versions (<mkt>/pro-gate/<ver>/)
+2026-08-31T22:14:22.6260416Z # fail closed: enabled daemon without recorded consent refuses the update
+2026-08-31T22:14:22.6690757Z ok - missing consent refuses (exit 3)
+2026-08-31T22:14:22.6707335Z ok - missing consent runs NO installer
+2026-08-31T22:14:22.6737660Z ok - refusal names the disclosure
+2026-08-31T22:14:22.6857319Z ok - missing consent file leaks no stderr
+2026-08-31T22:14:22.6858825Z # consent recorded: enabled daemon does not block, services still skipped
+2026-08-31T22:14:22.7358595Z ok - consented daemon box updates (services skipped)
+2026-08-31T22:14:22.7368808Z # v0.30.1 (gate r2 P2): autoupdate.log is bounded inside pgau_main, never at source time
+2026-08-31T22:14:22.7542833Z ok - library-only source does not touch the log
+2026-08-31T22:14:22.8052480Z ok - a locked run trims the log to ~400 lines
+2026-08-31T22:14:23.1251092Z ok - lock loser exits 0
+2026-08-31T22:14:23.1281675Z ok - lock loser announces the skip on stderr
+2026-08-31T22:14:23.1318045Z ok - lock loser never appends to or trims the log
+2026-08-31T22:14:24.8091284Z # fail closed: non-semver plugin versions are never followed
+2026-08-31T22:14:24.8404059Z ok - non-semver manifest version is ignored
+2026-08-31T22:14:24.8416155Z # downgrade follows the plugin and says so
+2026-08-31T22:14:24.8901396Z ok - downgrade runs the installer
+2026-08-31T22:14:24.8929951Z ok - downgrade is loudly logged
+2026-08-31T22:14:24.8930424Z # failure streak: three consecutive failures escalate; success clears
+2026-08-31T22:14:24.9419478Z ok - installer failure exits 5
+2026-08-31T22:14:25.0430147Z ok - third failure escalates
+2026-08-31T22:14:25.0470301Z ok - streak recorded in state file
+2026-08-31T22:14:25.1843393Z ok - doctor flags the failure streak
+2026-08-31T22:14:25.2294780Z ok - success clears the failure streak
+2026-08-31T22:14:25.2295650Z # no plugin installed: nothing to follow
+2026-08-31T22:14:25.2553691Z ok - no pro-gate entry -> no-op exit 0
+2026-08-31T22:14:25.2554594Z # identity pinning: other marketplaces and project scopes never move the runtime
+2026-08-31T22:14:25.3020820Z ok - pinned key + user scope wins (0.23.0, not 0.30.0 or 0.29.0)
+2026-08-31T22:14:25.3022148Z # a project-only install is NOT globally installed: never moves the machine-wide runtime
+2026-08-31T22:14:25.3301923Z ok - project-only entry -> nothing to follow (exit 0, no installer)
+2026-08-31T22:14:25.3303057Z # service template renders the actual PRO_GATE_HOME (custom-home installs)
+2026-08-31T22:14:25.3370240Z ok - unit ExecStart/Environment use the rendered runtime home
+2026-08-31T22:14:25.3371016Z # fail closed: a corrupt manifest never falls back to the cache glob
+2026-08-31T22:14:25.3700157Z ok - corrupt manifest refuses (exit 4)
+2026-08-31T22:14:25.3716514Z ok - corrupt manifest runs NO installer
+2026-08-31T22:14:25.3729475Z # legacy target installers (pre --skip-services) are refused, current ones accepted
+2026-08-31T22:14:25.3865137Z ok - probe rejects a pre-v0.23 installer
+2026-08-31T22:14:25.3998155Z ok - probe accepts the current installer
+2026-08-31T22:14:25.3998726Z # concurrency: a held lock skips the run
+2026-08-31T22:14:25.4187769Z ok - held lock skips (exit 0, no installer)
+2026-08-31T22:14:25.4188427Z # activity lands in the audit log
+2026-08-31T22:14:25.4211235Z ok - autoupdate.log written
+2026-08-31T22:14:25.4211891Z # install.sh --skip-services never reaches sudo/systemctl (deploy-only)
+2026-08-31T22:14:25.5094921Z ok - skip-services install succeeds without sudo on PATH
+2026-08-31T22:14:25.5118085Z ok - skip-services deploys the runtime
+2026-08-31T22:14:25.5118549Z ALL PASS
+2026-08-31T22:14:25.5275515Z ok - occupied CDP port is rejected
+2026-08-31T22:14:25.5276081Z ok - occupied CDP never starts Xvfb
+2026-08-31T22:14:25.5368751Z ok - non-CDP listener is rejected
+2026-08-31T22:14:25.5369295Z ok - non-CDP listener never starts Xvfb
+2026-08-31T22:14:25.5471861Z ok - socket inspection failure blocks startup
+2026-08-31T22:14:25.5472289Z ok - socket inspection failure never starts Xvfb
+2026-08-31T22:14:27.5571449Z ok - TERM during preflight exits with signal status
+2026-08-31T22:14:27.5571945Z ok - TERM during preflight never starts Xvfb
+2026-08-31T22:14:27.5697860Z ok - live profile owner is rejected
+2026-08-31T22:14:27.5700459Z ok - live profile owner never starts Xvfb
+2026-08-31T22:14:29.5872046Z ok - failed Xvfb blocks Chrome launch
+2026-08-31T22:14:29.5872768Z ok - failed Xvfb never starts Chrome
+2026-08-31T22:14:32.6059092Z ok - missing CDP readiness fails startup
+2026-08-31T22:14:32.6081799Z ok - CDP readiness failure cleans up Xvfb
+2026-08-31T22:14:36.6283210Z ok - Chrome receives software rasterizer guard
+2026-08-31T22:14:36.6296440Z ok - Chrome remains alive after Oracle closes the last target
+2026-08-31T22:14:36.6309949Z ok - wrapper cleans up Xvfb after Chrome exits
+2026-08-31T22:14:36.6310452Z ALL PASS
+2026-08-31T22:14:36.6870416Z TAP version 13
+2026-08-31T22:14:39.7958460Z # ok - still-generating exits 3
+2026-08-31T22:14:39.7962880Z # ok - still-generating leaves the source tab open after closing its scratch revalidation
+2026-08-31T22:14:39.7963958Z # ok - still-generating names the conversation
+2026-08-31T22:14:39.8843836Z # ok - exact-owned terminal UI exits 10: A network error occurred
+2026-08-31T22:14:39.8846491Z # ok - terminal UI names bounded outcome: A network error occurred
+2026-08-31T22:14:39.8847048Z # ok - terminal UI leaves source tab for caller cleanup: A network error occurred
+2026-08-31T22:14:39.9699249Z # ok - exact-owned terminal UI exits 10: Something went wrong while generating the response
+2026-08-31T22:14:39.9708450Z # ok - terminal UI names bounded outcome: Something went wrong while generating the response
+2026-08-31T22:14:39.9709423Z # ok - terminal UI leaves source tab for caller cleanup: Something went wrong while generating the response
+2026-08-31T22:14:40.0586193Z # ok - exact-owned terminal UI exits 10: There was an error generating a response
+2026-08-31T22:14:40.0588149Z # ok - terminal UI names bounded outcome: There was an error generating a response
+2026-08-31T22:14:40.0593317Z # ok - terminal UI leaves source tab for caller cleanup: There was an error generating a response
+2026-08-31T22:14:43.1025867Z # ok - assistant error phrase stays generating: A network error occurred
+2026-08-31T22:14:46.1440998Z # ok - assistant error phrase stays generating: Something went wrong while generating the response
+2026-08-31T22:14:49.1861388Z # ok - assistant error phrase stays generating: There was an error generating a response
+2026-08-31T22:14:52.2287809Z # ok - structured error before the exact marker stays generating
+2026-08-31T22:14:54.8250809Z # ok - readable stale source recovers the canonical scratch review
+2026-08-31T22:14:54.8251770Z # ok - readable stale source prints the canonical scratch review bytes
+2026-08-31T22:14:54.8252749Z # ok - readable stale source opens and closes one canonical scratch target
+2026-08-31T22:14:54.8253602Z # ok - readable stale source stays open and unnavigated
+2026-08-31T22:14:59.9296648Z # ok - readable stale source waits past a marker-only canonical scratch sample
+2026-08-31T22:14:59.9297716Z # ok - marker-hydration revalidation emits the later nonce-bearing verdict
+2026-08-31T22:14:59.9298557Z # ok - marker-hydration revalidation closes only its scratch target
+2026-08-31T22:15:02.5273209Z # ok - probe revalidates a readable stale source and remains live (exit 0)
+2026-08-31T22:15:02.5274361Z # ok - probe classifies fresh owned terminal evidence as complete
+2026-08-31T22:15:02.5276711Z # ok - probe emits no review body after stale-source revalidation
+2026-08-31T22:15:02.5277439Z # ok - probe closes only its canonical scratch target
+2026-08-31T22:15:05.5685550Z # ok - same-marker incomplete scratch remains still-generating
+2026-08-31T22:15:05.5687086Z # ok - same-marker incomplete scratch is attempted only once
+2026-08-31T22:15:05.5689530Z # ok - incomplete scratch keeps the canonical memo and avoids blacklist/cross-bind mutation
+2026-08-31T22:15:08.1672508Z # ok - probe keeps an old foreign-marked scratch verdict generating
+2026-08-31T22:15:08.1673434Z # ok - old verdict ordering closes only one scratch
+2026-08-31T22:15:10.7648111Z # ok - probe keeps an old same-marker terminal verdict before the latest prompt generating
+2026-08-31T22:15:13.8042448Z # ok - a stale same-marker verdict before the latest prompt does not exit 0
+2026-08-31T22:15:13.8043659Z # ok - a stale same-marker verdict is never printed as the harvested review
+2026-08-31T22:15:13.8044560Z # ok - a stale same-marker verdict keeps the run still-generating (exit 3)
+2026-08-31T22:15:18.9145756Z # ok - the superseded verdict is skipped and the newer verdict is emitted instead
+2026-08-31T22:15:18.9146826Z # ok - the stale verdict text never reaches stdout
+2026-08-31T22:15:21.9571077Z # ok - canonical URL drift is inconclusive while the readable source remains live
+2026-08-31T22:15:21.9572393Z # ok - canonical URL drift keeps memo and avoids blacklist/cross-bind mutation
+2026-08-31T22:15:21.9573048Z # ok - canonical URL drift closes only the disposable scratch
+2026-08-31T22:15:24.9987065Z # ok - scratch target disappearance is inconclusive while the readable source remains live
+2026-08-31T22:15:24.9988263Z # ok - scratch target disappearance keeps memo and avoids blacklist/cross-bind mutation
+2026-08-31T22:15:24.9989110Z # ok - scratch target disappearance closes only the disposable scratch
+2026-08-31T22:15:28.0385107Z # ok - scratch CDP listing failure is inconclusive while the readable source remains live
+2026-08-31T22:15:28.0387469Z # ok - scratch CDP listing failure keeps memo and avoids blacklist/cross-bind mutation
+2026-08-31T22:15:28.0400166Z # ok - scratch CDP listing failure closes only the disposable scratch
+2026-08-31T22:15:31.0817303Z # ok - login wall is inconclusive while the readable source remains live
+2026-08-31T22:15:31.0818160Z # ok - login wall keeps memo and avoids blacklist/cross-bind mutation
+2026-08-31T22:15:31.0818932Z # ok - login wall closes only the disposable scratch
+2026-08-31T22:15:34.1232193Z # ok - pre-hydration shell is inconclusive while the readable source remains live
+2026-08-31T22:15:34.1233492Z # ok - pre-hydration shell keeps memo and avoids blacklist/cross-bind mutation
+2026-08-31T22:15:34.1234799Z # ok - pre-hydration shell closes only the disposable scratch
+2026-08-31T22:15:36.7209514Z # ok - throttled canonical scratch takes the existing throttle exit
+2026-08-31T22:15:36.7210858Z # ok - throttled canonical scratch writes cooldown and closes only scratch
+2026-08-31T22:15:39.7573818Z # ok - cross-bound canonical scratch is never emitted as our review
+2026-08-31T22:15:39.7575075Z # ok - cross-bound canonical scratch forgets and blacklists the stale canonical memo
+2026-08-31T22:15:39.7576311Z # ok - cross-bound canonical scratch closes only scratch
+2026-08-31T22:15:42.7921284Z # ok - foreign canonical scratch is rejected as a decisive stale memo
+2026-08-31T22:15:42.7922480Z # ok - foreign canonical scratch forgets and blacklists the stale memo
+2026-08-31T22:15:45.3899640Z # ok - the one revalidation renders the remembered conversation A, not the duplicate tab B
+2026-08-31T22:15:45.3900885Z # ok - a terminal render of A is emitted and attributed to A
+2026-08-31T22:15:45.3902168Z # ok - the emitted review body is A's, not B's
+2026-08-31T22:15:45.3903011Z # ok - the duplicate tab B is never navigated, closed, or promoted in A's place
+2026-08-31T22:15:48.4333267Z # ok - the one revalidation renders A, not B, for the cross-bound case
+2026-08-31T22:15:48.4334391Z # ok - a cross-bound render of A is rejected and blacklisted as A
+2026-08-31T22:15:48.4335572Z # ok - B is not promoted into A's place as the new recovery handle
+2026-08-31T22:15:48.4336667Z # ok - the duplicate tab B stays open and unnavigated, and the still-generating exit reflects it
+2026-08-31T22:15:48.4337997Z # ok - the cross-bound rejection of A is recorded for --status
+2026-08-31T22:15:51.0302643Z # ok - probe reports tab B present and generating despite A's cross-bound rejection
+2026-08-31T22:15:51.0303428Z # ok - probe emits no review body for the cross-bound-A case
+2026-08-31T22:15:51.0304048Z # ok - the one revalidation still only ever rendered A
+2026-08-31T22:15:53.6243940Z # ok - probe reports tab B present and generating despite A's foreign rejection
+2026-08-31T22:15:56.6639759Z # ok - with no remembered conversation, revalidation still targets the readable tab's own URL
+2026-08-31T22:15:59.7627511Z # ok - normal scratch-open timeout returns before its watchdog fallback
+2026-08-31T22:15:59.7628895Z # ok - normal scratch-open timeout leaves source and recovery state unchanged
+2026-08-31T22:16:02.8010848Z # ok - probe scratch-open timeout returns before its watchdog fallback
+2026-08-31T22:16:02.8011858Z # ok - probe scratch-open timeout leaves source and recovery state unchanged
+2026-08-31T22:16:05.8458886Z # ok - normal scratch-list timeout returns before its watchdog fallback
+2026-08-31T22:16:05.8459886Z # ok - normal scratch-list timeout leaves source and recovery state unchanged
+2026-08-31T22:16:08.8862155Z # ok - probe scratch-list timeout returns before its watchdog fallback
+2026-08-31T22:16:08.8863423Z # ok - probe scratch-list timeout leaves source and recovery state unchanged
+2026-08-31T22:16:13.4881139Z # ok - normal scratch-close timeout returns before its watchdog fallback
+2026-08-31T22:16:13.4882358Z # ok - normal scratch-close timeout leaves source and recovery state unchanged
+2026-08-31T22:16:13.4883308Z # ok - normal scratch-close cleanup was attempted despite no reply
+2026-08-31T22:16:18.0802318Z # ok - probe scratch-close timeout returns before its watchdog fallback
+2026-08-31T22:16:18.0803490Z # ok - probe scratch-close timeout leaves source and recovery state unchanged
+2026-08-31T22:16:18.0804228Z # ok - probe scratch-close cleanup was attempted despite no reply
+2026-08-31T22:16:18.1592651Z # ok - completed review exits 0
+2026-08-31T22:16:18.1593722Z # ok - review block printed
+2026-08-31T22:16:18.1594489Z # ok - completed review leaves the tab for the caller to close
+2026-08-31T22:16:18.1595394Z # ok - completed review remembers the conversation URL
+2026-08-31T22:16:20.7993786Z # ok - tabless conversation is recovered from the remembered URL
+2026-08-31T22:16:20.7994742Z # ok - recovered review is printed
+2026-08-31T22:16:20.7995516Z # ok - recovery re-rendered the remembered URL
+2026-08-31T22:16:23.3938775Z # ok - a non-JSON PUT error still reaches the GET fallback and recovers the review
+2026-08-31T22:16:23.3939608Z # ok - the GET-recovered review is printed
+2026-08-31T22:16:23.3941290Z # ok - the scratch tab was actually opened (via GET, after PUT failed)
+2026-08-31T22:16:26.0261327Z # ok - probe finds a tabless conversation via the remembered URL
+2026-08-31T22:16:26.0262276Z # ok - shell alone clears the old 200-char gate
+2026-08-31T22:16:31.1307226Z # ok - a pre-hydration render is not treated as a miss
+2026-08-31T22:16:31.1307972Z # ok - the review is read once the page hydrates
+2026-08-31T22:16:33.7655691Z # ok - a legacy global blacklist entry does not hide our conversation
+2026-08-31T22:16:36.3611775Z # ok - a URL learned this invocation is used for recovery
+2026-08-31T22:16:36.3612844Z # ok - the learned URL is the one re-rendered
+2026-08-31T22:17:06.4024589Z # ok - server-side liveness survives later empty scans (exit 3)
+2026-08-31T22:17:06.4025702Z # ok - still-generating says it was proven server-side
+2026-08-31T22:17:36.4430495Z # ok - an undecided remembered conversation exits 7, not 4
+2026-08-31T22:18:06.4822640Z # ok - a stale memo pointing at another run still exits 4
+2026-08-31T22:18:36.5208952Z # ok - cross-bound memo is not accepted as our review
+2026-08-31T22:18:36.5212755Z # ok - cross-bound memo exits 4 (decisive), not 7/3
+2026-08-31T22:18:36.5213371Z # ok - cross-bound memo is reported as another run's answer
+2026-08-31T22:18:36.5213810Z # ok - the poisoned memo file is deleted
+2026-08-31T22:18:36.5214142Z # ok - no foreign review text is emitted on stdout
+2026-08-31T22:18:56.5658409Z # ok - an open tab with our marker but another run's answer is refused
+2026-08-31T22:18:56.5659695Z # ok - open-tab cross-bind never emits the foreign review
+2026-08-31T22:18:56.6564988Z # ok - our own nonce-bearing review is still returned (exit 0)
+2026-08-31T22:18:56.6566594Z # ok - our review reaches stdout
+2026-08-31T22:19:08.6973903Z # ok - still-generating stays exit 3 under the new check
+2026-08-31T22:19:08.7786491Z # ok - an OLDER verdict above our prompt is returned for engine adjudication
+2026-08-31T22:19:08.7787620Z # ok - the live conversation is not convicted
+2026-08-31T22:19:08.7788670Z # ok - no crossbound sidecar is written for scrollback
+2026-08-31T22:19:38.8207842Z # ok - a conviction is recorded in crossbound/<marker>
+2026-08-31T22:19:38.9047318Z # ok - a finding QUOTING a foreign marker is not a cross-bind
+2026-08-31T22:19:38.9048392Z # ok - the quoting review is returned, not convicted
+2026-08-31T22:19:38.9899070Z # ok - proving ownership clears any per-candidate conviction
+2026-08-31T22:19:38.9900235Z # ok - our review is still returned alongside a foreign tab
+2026-08-31T22:19:39.1473031Z # ok - cross-bound state is order-independent (foreignFirst=true): not stuck
+2026-08-31T22:19:39.1474285Z # ok - our review is found regardless of order (foreignFirst=true)
+2026-08-31T22:19:39.3025438Z # ok - cross-bound state is order-independent (foreignFirst=false): not stuck
+2026-08-31T22:19:39.3026690Z # ok - our review is found regardless of order (foreignFirst=false)
+2026-08-31T22:20:14.4065800Z # ok - a later CDP outage is not masked by an early successful scan
+2026-08-31T22:20:44.4449321Z # ok - a dead remembered tab proven foreign still exits 4
+2026-08-31T22:20:49.5134914Z # ok - CDP down exits 7 (inconclusive), not 4
+2026-08-31T22:20:49.5136411Z # ok - inconclusive names the cause
+2026-08-31T22:20:52.5531898Z # ok - no match exits 4
+2026-08-31T22:20:52.5532591Z # ok - foreign tab left open
+2026-08-31T22:21:00.1651594Z # ok - probe exits 0 on match
+2026-08-31T22:21:00.1652238Z # ok - probe never closes the source tab
+2026-08-31T22:21:00.1653407Z # ok - probe reports generating while no VERDICT has landed
+2026-08-31T22:21:00.2478353Z # ok - probe still exits 0 when the review is complete
+2026-08-31T22:21:00.2479392Z # ok - probe reports complete once an owned VERDICT is present
+2026-08-31T22:21:10.2848708Z # ok - foreign VERDICT never reports complete for our marker
+2026-08-31T22:21:13.3238095Z # ok - a vanished tab is never reported as still-generating
+2026-08-31T22:21:13.3239146Z # ok - a vanished tab is inconclusive, not "gone"
+2026-08-31T22:21:13.4023779Z # ok - sweep-root exits 0
+2026-08-31T22:21:13.4024629Z # ok - sweep-root closes only root tabs
+2026-08-31T22:21:13.4026005Z # ok - sweep-root keeps conversation and blank tabs
+2026-08-31T22:21:13.4818730Z # ok - sweep-root keeps a survivor tab
+2026-08-31T22:21:13.6329691Z # ok - organizer rename exits 0
+2026-08-31T22:21:13.6330479Z # ok - organizer applies the exact title
+2026-08-31T22:21:13.6331583Z # ok - rename-only organizer leaves the owned tab open
+2026-08-31T22:21:13.6332629Z # ok - rename-only organizer never archives
+2026-08-31T22:21:13.6333442Z # ok - organizer emits one bounded structured result
+2026-08-31T22:21:13.6334237Z # ok - CDP mock decoded and echoed nonconstant request ids
+2026-08-31T22:21:13.7852120Z # ok - an exact existing title is reported already
+2026-08-31T22:21:13.7852975Z # ok - an exact existing title causes no title mutation
+2026-08-31T22:21:13.8646241Z # ok - nonce-less completed answers never grant organizer mutation authority
+2026-08-31T22:21:13.8647792Z # ok - ambiguous completed ownership leaves title archive and tabs untouched
+2026-08-31T22:21:14.0268321Z # ok - an old nonce-less verdict above the newest prompt does not block safe rename
+2026-08-31T22:21:14.1731148Z # ok - organizer selects a genuine owned tab beside a cross-bound tab
+2026-08-31T22:21:14.1732422Z # ok - organizer action targets only the genuine tab
+2026-08-31T22:21:14.1733338Z # ok - organizer leaves the cross-bound tab open
+2026-08-31T22:21:14.2605563Z # ok - two distinct owned URLs fail closed as ambiguous
+2026-08-31T22:21:14.2606625Z # ok - ambiguity performs no UI action
+2026-08-31T22:21:14.4164307Z # ok - remembered URL resolves multiple owned targets
+2026-08-31T22:21:14.4166260Z # ok - remembered URL is preferred exactly
+2026-08-31T22:21:14.8094959Z # ok - organizer recovers a tabless owned conversation from its memo
+2026-08-31T22:21:14.8097367Z # ok - rename-only memo recovery keeps its owned scratch renderer open
+2026-08-31T22:21:15.1621177Z # ok - a non-JSON PUT error still reaches the GET fallback and opens the memo scratch tab
+2026-08-31T22:21:15.1622379Z # ok - the memo scratch tab was actually opened (via GET, after PUT failed)
+2026-08-31T22:21:15.5524181Z # ok - authorized memo finalization archives and closes its owned scratch
+2026-08-31T22:21:15.5525580Z # ok - authorized finalization closes the accepted memo scratch exactly once
+2026-08-31T22:21:15.9324637Z # ok - stale memo is rejected without mutation
+2026-08-31T22:21:15.9325541Z # ok - stale memo scratch is closed
+2026-08-31T22:21:16.0881962Z # ok - finalizer renames then archives then closes
+2026-08-31T22:21:16.0882848Z # ok - finalizer records ordered UI actions
+2026-08-31T22:21:16.0883534Z # ok - finalizer closes only its selected owned tab
+2026-08-31T22:21:16.1716699Z # ok - a newer exact run marker after the accepted verdict blocks finalization
+2026-08-31T22:21:16.1727230Z # ok - newer in-progress work prevents every older-run mutation and local close
+2026-08-31T22:21:16.3290839Z # ok - an embedded marker-like substring does not create a false freshness conflict
+2026-08-31T22:21:16.4919788Z # ok - a newer marker appearing after rename blocks archive and close
+2026-08-31T22:21:16.4921108Z # ok - freshness drift preserves the newer run after the already-dispatched rename
+2026-08-31T22:21:16.6462081Z # ok - same-URL owned duplicate tabs finalize successfully
+2026-08-31T22:21:16.6463486Z # ok - finalizer revalidates and closes every owned tab at the selected exact URL
+2026-08-31T22:21:16.8033450Z # ok - same-URL duplicate ownership drift blocks local cleanup
+2026-08-31T22:21:16.8034538Z # ok - duplicate ownership drift leaves every same-URL tab open
+2026-08-31T22:21:16.9631780Z # ok - already-archived state is idempotent
+2026-08-31T22:21:16.9632490Z # ok - finalization never closes an unrelated tab
+2026-08-31T22:21:17.1154038Z # ok - archive selector drift is reported once and remains nonfatal
+2026-08-31T22:21:17.2676119Z # ok - ownership drift after rename blocks archive and close
+2026-08-31T22:21:17.2676895Z # ok - ownership drift leaves the target recoverable
+2026-08-31T22:21:17.4175892Z # ok - rename suppression does not suppress archive or local cleanup
+2026-08-31T22:21:17.4177349Z # ok - rename suppression performs only the archive UI action
+2026-08-31T22:21:17.5005129Z # ok - finalization rejects a live same-marker page that rename would accept
+2026-08-31T22:21:17.5006257Z # ok - live finalization rejection performs no mutation or close
+2026-08-31T22:21:17.5840855Z # ok - durable byte mismatch blocks finalization
+2026-08-31T22:21:17.5841579Z # ok - byte mismatch leaves title archive and tab untouched
+2026-08-31T22:21:17.9817237Z # ok - accepted capture URL outranks a different live same-marker conversation
+2026-08-31T22:21:17.9818421Z # ok - accepted URL finalization leaves the unrelated live URL open
+2026-08-31T22:21:18.0700404Z # ok - remembered URL cannot resolve multiple byte-matching finalizer URLs
+2026-08-31T22:21:18.0704526Z # ok - ambiguous finalizer performs no mutation
+2026-08-31T22:21:18.1529699Z # ok - organizer stops immediately when any scanned page is a throttle interstitial
+2026-08-31T22:21:18.1530541Z # ok - throttle evidence prevents remembered-URL scratch traffic
+2026-08-31T22:21:18.5352248Z # ok - scratch-render throttle evidence stops organization
+2026-08-31T22:21:18.5353341Z # ok - scratch-render throttle evidence writes the account cooldown before returning
+2026-08-31T22:21:18.5354152Z # ok - throttled organizer scratch is closed
+2026-08-31T22:21:18.9996766Z # ok - timed-out UI mutation reports failure after revocation and absolute lease expiry
+2026-08-31T22:21:18.9997873Z # ok - positively cancelled renderer work cannot mutate after its CDP timeout
+2026-08-31T22:21:19.4684475Z # ok - cancellation-before-arm holds serialization through the absolute lease expiry
+2026-08-31T22:21:19.4685903Z # ok - a queued expression cannot arm and mutate after its token was revoked
+2026-08-31T22:21:19.9387571Z # ok - unconfirmed cancellation holds the organizer through absolute lease expiry
+2026-08-31T22:21:20.0147160Z # ok - expired renderer work cannot mutate after cancellation acknowledgement is lost
+2026-08-31T22:21:20.0148749Z # ok - an operational organizer failure still exits 0
+2026-08-31T22:21:20.0149923Z # ok - an operational organizer failure emits exactly one structured line
+2026-08-31T22:21:20.0152816Z # ok - rename expression serializes the exact title as data
+2026-08-31T22:21:20.0154231Z # ok - organizer expressions contain no ChatGPT backend API path
+2026-08-31T22:21:20.0156004Z # ok - UI mutations carry an expiring browser lease and a revocation tombstone
+2026-08-31T22:21:20.0156882Z # ok - mutation lease expires before the CDP mutation deadline
+2026-08-31T22:21:20.0161181Z # ok - rename expression uses native input state and exact verification
+2026-08-31T22:21:20.0162043Z # ok - organizer scopes the rendered sidebar menu to the exact conversation URL
+2026-08-31T22:21:20.0162960Z # ok - inline ChatGPT title editors commit through the rendered keyboard path
+2026-08-31T22:21:20.0163753Z # ok - exact sidebar title short-circuits a second editor open
+2026-08-31T22:21:20.0164583Z # ok - browser-side ownership rejects a terminal verdict without an exact marker echo
+2026-08-31T22:21:20.0165724Z # ok - browser-side finalization rejects any newer exact run marker
+2026-08-31T22:21:20.0166477Z # ok - archive expression excludes destructive and reverse actions
+2026-08-31T22:21:20.0167246Z # ok - archive expression verifies confirmation rather than trusting a click
+2026-08-31T22:21:20.0168040Z # ok - UI mutation ownership accepts the same formatted VERDICT labels as salvage
+2026-08-31T22:21:20.0967300Z # ok - --sweep-root exits without a temporal-dead-zone crash
+2026-08-31T22:21:20.0968452Z # ok - --sweep-root still runs the exit flush and clears a stale conviction
+2026-08-31T22:21:20.1842156Z # ok - --close exits without a temporal-dead-zone crash
+2026-08-31T22:21:20.1843465Z # ok - --close still runs the exit flush and clears a stale conviction
+2026-08-31T22:21:20.1982191Z # Subtest: tests/cdp-salvage.test.mjs
+2026-08-31T22:21:20.1987200Z ok 1 - tests/cdp-salvage.test.mjs
+2026-08-31T22:21:20.1987727Z   ---
+2026-08-31T22:21:20.1988144Z   duration_ms: 403515.104523
+2026-08-31T22:21:20.1988571Z   type: 'test'
+2026-08-31T22:21:20.1988917Z   ...
+2026-08-31T22:21:20.1989225Z 1..1
+2026-08-31T22:21:20.1989534Z # tests 1
+2026-08-31T22:21:20.1989873Z # suites 0
+2026-08-31T22:21:20.1990203Z # pass 1
+2026-08-31T22:21:20.1990849Z # fail 0
+2026-08-31T22:21:20.1992614Z # cancelled 0
+2026-08-31T22:21:20.1993191Z # skipped 0
+2026-08-31T22:21:20.1993855Z # todo 0
+2026-08-31T22:21:20.1994441Z # duration_ms 403523.101256
+2026-08-31T22:21:20.2132433Z ok - plugin owns one skill
+2026-08-31T22:21:20.2151070Z ok - plugin owns one agent
+2026-08-31T22:21:20.3130666Z ok - package creates archive
+2026-08-31T22:21:20.3131063Z ok - package creates checksum
+2026-08-31T22:21:20.3214002Z ok - runtime package excludes skill
+2026-08-31T22:21:20.3234157Z ok - runtime package excludes agent
+2026-08-31T22:21:20.3253620Z ok - runtime package excludes plugin manifest
+2026-08-31T22:21:20.3268482Z ok - runtime package includes organizer UI expressions
+2026-08-31T22:21:20.3289475Z ok - runtime package includes one identity record
+2026-08-31T22:21:20.3362600Z ok - runtime identity is byte-identical to plugin identity
+2026-08-31T22:21:20.4523530Z ok - runtime records installed version
+2026-08-31T22:21:20.4534802Z ok - runtime records expected version
+2026-08-31T22:21:20.4535605Z ok - runtime installs organizer UI expressions
+2026-08-31T22:21:20.4547833Z ok - runtime installs exact identity metadata beside its library
+2026-08-31T22:21:20.4568990Z ok - runtime daemon omits Codex doghouse admission
+2026-08-31T22:21:20.4589083Z ok - runtime daemon omits Codex usage endpoint
+2026-08-31T22:21:20.4608954Z ok - runtime daemon omits Codex quota probe
+2026-08-31T22:21:20.4628057Z ok - runtime daemon omits Codex quota gate
+2026-08-31T22:21:20.4628654Z ok - runtime install does not duplicate skill
+2026-08-31T22:21:20.4629287Z ok - runtime install does not duplicate agent
+2026-08-31T22:21:20.4643145Z ok - daemon defaults off
+2026-08-31T22:21:20.5138772Z ok - concurrent installer loses the portable lock
+2026-08-31T22:21:20.5140027Z ok - losing installer preserves winning lock
+2026-08-31T22:21:20.5760630Z ok - live portable lock blocks concurrent installer
+2026-08-31T22:21:20.5773710Z ok - loser preserves live lock owner
+2026-08-31T22:21:20.6958259Z ok - stale portable lock is reclaimed
+2026-08-31T22:21:20.6959085Z ok - successful install releases reclaimed lock
+2026-08-31T22:21:20.7459970Z ok - first stale-lock reclaimer reaches serialized section
+2026-08-31T22:21:20.7853239Z ok - concurrent stale-lock reclaimer is rejected
+2026-08-31T22:21:20.8972788Z ok - exactly one stale-lock reclaimer installs
+2026-08-31T22:21:20.8973242Z ok - stale-lock race leaves no portable lock
+2026-08-31T22:21:20.8973591Z ok - stale-lock race leaves no reaper lock
+2026-08-31T22:21:20.9477167Z ok - reclaimer reaches crash window
+2026-08-31T22:21:21.0735902Z ok - dead reaper owner is recovered
+2026-08-31T22:21:21.0757643Z ok - dead reaper recovery leaves no locks
+2026-08-31T22:21:21.2077849Z ok - aged ownerless reaper is recovered
+2026-08-31T22:21:21.2090966Z ok - reviewer agent enforces exact runtime
+2026-08-31T22:21:21.2104470Z ok - reviewer agent rejects invalid plugin versions
+2026-08-31T22:21:21.2121148Z ok - reviewer commands resolve runtime independently
+2026-08-31T22:21:21.2141000Z ok - reviewer agent has no cross-shell runtime dependency
+2026-08-31T22:21:21.2160898Z ok - reviewer agent has no hardcoded engine home
+2026-08-31T22:21:21.2197830Z ok - pro-gate documents recover grammar
+2026-08-31T22:21:21.2211250Z ok - pro-gate routes recover through engine recovery mode
+2026-08-31T22:21:21.2234333Z ok - pro-gate recover route has no fresh --pr dispatch
+2026-08-31T22:21:21.2247729Z ok - pro-gate guarantees recovery launches no fresh review
+2026-08-31T22:21:21.2268035Z ok - pro-gate recovery does not prescribe manual refresh
+2026-08-31T22:21:21.2316552Z ok - pro-gate documents four plain recovery states
+2026-08-31T22:21:21.2352636Z ok - agents documents recover grammar
+2026-08-31T22:21:21.2366116Z ok - agents routes recover through engine recovery mode
+2026-08-31T22:21:21.2388158Z ok - agents recover route has no fresh --pr dispatch
+2026-08-31T22:21:21.2401166Z ok - agents guarantees recovery launches no fresh review
+2026-08-31T22:21:21.2421431Z ok - agents recovery does not prescribe manual refresh
+2026-08-31T22:21:21.2470115Z ok - agents documents four plain recovery states
+2026-08-31T22:21:21.2489538Z ok - skill rejects open-tab ground-truth guidance
+2026-08-31T22:21:21.2503096Z ok - skill preserves expert status JSON diagnostics
+2026-08-31T22:21:21.2516528Z ok - skill preserves direct expert harvest
+2026-08-31T22:21:21.2530509Z ok - README documents engine recover command
+2026-08-31T22:21:21.2543990Z ok - README preserves expert status JSON command
+2026-08-31T22:21:21.2557842Z ok - README preserves direct expert harvest command
+2026-08-31T22:21:21.2571711Z ok - engine usage documents recover as no-fresh-run mode
+2026-08-31T22:21:21.2704970Z ok - separate reviewer shells use configured runtime
+2026-08-31T22:21:21.2721421Z ok - harvest shell reconstructs marker and output
+2026-08-31T22:21:21.3971579Z ok - piped installer does not infer hostile cwd source
+2026-08-31T22:21:21.3972212Z ok - piped installer did not execute hostile source
+2026-08-31T22:21:21.4947530Z ok - explicit local source installs source tree
+2026-08-31T22:21:21.4993293Z ok - piped local source is rejected
+2026-08-31T22:21:21.5007358Z ok - piped local source names real file requirement
+2026-08-31T22:21:21.6140903Z ok - normal systemd install enables Chrome
+2026-08-31T22:21:21.6155738Z ok - normal systemd install disables daemon
+2026-08-31T22:21:21.7556190Z ok - daemon install independently enables Chrome
+2026-08-31T22:21:21.7570243Z ok - daemon install enables daemon service
+2026-08-31T22:21:21.8595610Z ok - macOS normal install unloads daemon
+2026-08-31T22:21:21.8615068Z ok - macOS has no separate Chrome service
+2026-08-31T22:21:21.8727623Z ok - tampered checksum rejected
+2026-08-31T22:21:21.8741692Z ok - tampered archive leaves install untouched
+2026-08-31T22:21:21.8894447Z ok - extraction failure rejected
+2026-08-31T22:21:21.8908182Z ok - extraction failure leaves install untouched
+2026-08-31T22:21:21.9673470Z ok - mixed archive/library identity rejected
+2026-08-31T22:21:21.9687500Z ok - mixed archive/library identity leaves install untouched
+2026-08-31T22:21:22.0339316Z ok - malformed identity rejected
+2026-08-31T22:21:22.0352125Z ok - malformed identity leaves install untouched
+2026-08-31T22:21:22.1819922Z ok - live deploy permission failure triggers rollback
+2026-08-31T22:21:22.1833783Z ok - live rollback restores prior engine bytes
+2026-08-31T22:21:22.1846258Z ok - live rollback restores prior identity bytes
+2026-08-31T22:21:22.1858155Z ok - live rollback restores prior version bytes
+2026-08-31T22:21:22.1870144Z ok - live rollback restores prior deploy stamp
+2026-08-31T22:21:22.2439919Z ok - daemon refuses without consent
+2026-08-31T22:21:22.2440502Z ok - failed daemon enable leaves no runtime
+2026-08-31T22:21:22.3609963Z ok - operator-global consent recorded
+2026-08-31T22:21:22.4940973Z ok - doctor reports matching exact release
+2026-08-31T22:21:22.4954265Z ok - doctor reports accepted disclosure
+2026-08-31T22:21:22.6349005Z ok - doctor names a BEHIND runtime (upgrade path)
+2026-08-31T22:21:22.7778447Z ok - doctor flags an AHEAD runtime as a DOWNGRADE
+2026-08-31T22:21:22.7791350Z ok - doctor AHEAD message warns DOWNGRADE
+2026-08-31T22:21:22.9189711Z ok - doctor accepts matching runtime/plugin contract identity
+2026-08-31T22:21:23.0584314Z ok - doctor blocks runtime-newer contract before dispatch
+2026-08-31T22:21:23.1939020Z ok - doctor blocks adapter-newer contract before dispatch
+2026-08-31T22:21:23.3318428Z ok - doctor blocks unknown contract before dispatch
+2026-08-31T22:21:23.4698258Z ok - doctor blocks contract-digest mismatch before dispatch
+2026-08-31T22:21:23.6052217Z ok - doctor blocks corpus mismatch before dispatch
+2026-08-31T22:21:23.7371274Z ok - doctor blocks missing runtime identity metadata
+2026-08-31T22:21:23.8732092Z ok - doctor blocks malformed runtime identity metadata
+2026-08-31T22:21:24.0181919Z ok - doctor recovers after a compatible runtime identity converges
+2026-08-31T22:21:25.9990783Z ok - doctor uses configured oracle for version
+2026-08-31T22:21:26.0004949Z ok - doctor uses configured timeout
+2026-08-31T22:21:26.1070462Z ok - doctor reports configured oracle missing
+2026-08-31T22:21:26.1084930Z ok - doctor reports configured timeout missing
+2026-08-31T22:21:26.5052085Z ok - doctor warns once when published release is newer
+2026-08-31T22:21:26.5064863Z ok - doctor skew lookup uses exact endpoint and jq selector
+2026-08-31T22:21:26.5079139Z ok - doctor uses configured timeout with TERM and KILL deadlines
+2026-08-31T22:21:27.0147780Z ok - doctor stays quiet when local version equals latest release
+2026-08-31T22:21:27.4426959Z ok - doctor stays quiet when local version is ahead of latest release
+2026-08-31T22:21:27.8197916Z ok - doctor stays quiet for malformed latest release output
+2026-08-31T22:21:28.2098688Z ok - doctor stays quiet for latest release API failure
+2026-08-31T22:21:28.6392457Z ok - doctor reports a configured gh binary missing
+2026-08-31T22:21:28.6412423Z ok - doctor stays quiet when gh is missing
+2026-08-31T22:21:35.0179054Z ok - TERM-ignoring gh is hard-killed within the bounded window
+2026-08-31T22:21:35.0200050Z ok - doctor stays quiet after hard-killing a hung gh
+2026-08-31T22:21:35.0213807Z ok - hung gh received configured hard timeout
+2026-08-31T22:21:35.3233388Z ok - valid consent passes daemon guard
+2026-08-31T22:21:35.6255525Z ok - stale consent globally defers without exiting
+2026-08-31T22:21:35.6256416Z ok - stale consent does not charge per-PR failure
+2026-08-31T22:21:35.9279805Z ok - runtime mismatch globally defers without exiting
+2026-08-31T22:21:35.9297160Z ok - mismatch route names exact release
+2026-08-31T22:21:35.9311710Z ok - runtime mismatch is global deferred state
+2026-08-31T22:21:36.0610740Z ok - doctor blocks missing runtime
+2026-08-31T22:21:36.0623998Z ok - missing route names exact release setup
+2026-08-31T22:21:36.0981320Z ok - packaging rejects tag mismatch
+2026-08-31T22:21:36.0994964Z ok - packaging reports tag mismatch
+2026-08-31T22:21:36.1569284Z ok - packaging rejects manifest mismatch
+2026-08-31T22:21:36.1584107Z ok - packaging reports manifest mismatch
+2026-08-31T22:21:36.1942231Z ok - packaging rejects runtime mismatch
+2026-08-31T22:21:36.1956346Z ok - packaging reports runtime mismatch
+2026-08-31T22:21:36.1956742Z ALL PASS
+2026-08-31T22:21:36.2596377Z ok - strict gh double rejects wrong manifest header, path, repo, ref, method, and body
+2026-08-31T22:21:36.2874028Z ok - a stale marketplace card fails the run (planted negative 1)
+2026-08-31T22:21:36.2874939Z ok - run reports every value the marketplace repin PR needs
+2026-08-31T22:21:36.2875766Z ok - run names the repin step explicitly
+2026-08-31T22:21:36.2876454Z ok - stale failure names the actual consequence: published but not distributed
+2026-08-31T22:21:36.2902083Z ok - stale card leaves announce false
+2026-08-31T22:21:36.2914831Z ok - stale card never reaches final latest-release recheck
+2026-08-31T22:21:36.3223638Z ok - wrong source kind leaves announce false
+2026-08-31T22:21:36.3530953Z ok - wrong source url leaves announce false
+2026-08-31T22:21:36.3531752Z ok - canonical source kind and URL are required for a current card
+2026-08-31T22:21:36.3984408Z ok - duplicate marketplace tuple leaves announce false
+2026-08-31T22:21:36.4284372Z ok - missing-source marketplace tuple leaves announce false
+2026-08-31T22:21:36.4587215Z ok - type-invalid marketplace tuple leaves announce false
+2026-08-31T22:21:36.4896059Z ok - empty-source marketplace tuple leaves announce false
+2026-08-31T22:21:36.5199674Z ok - empty-kind marketplace tuple leaves announce false
+2026-08-31T22:21:36.5497030Z ok - zero-id marketplace tuple leaves announce false
+2026-08-31T22:21:36.5497990Z ok - duplicate, missing, empty, zero-id, and type-invalid cards fail closed as UNVERIFIED
+2026-08-31T22:21:36.5754658Z ok - unreadable marketplace (fail) leaves announce false
+2026-08-31T22:21:36.6052754Z ok - unreadable marketplace (malformed) leaves announce false
+2026-08-31T22:21:36.6053568Z ok - API and JSON failures stay distinct from a stale card
+2026-08-31T22:21:36.6402947Z ok - repin notice is absent when the marketplace card already matches (planted negative 2)
+2026-08-31T22:21:36.6403939Z ok - a current card prints a confirmation instead of a repin notice
+2026-08-31T22:21:36.6416317Z ok - current card writes announce=false before validation
+2026-08-31T22:21:36.6429206Z ok - current card plus final latest release enables announce
+2026-08-31T22:21:36.6442258Z ok - current train makes only the exact marketplace and final latest-release reads
+2026-08-31T22:21:36.6525595Z ok - initial latest-release resolution selects this release
+2026-08-31T22:21:36.6869410Z ok - final latest-release recheck reports a state change
+2026-08-31T22:21:36.6894630Z ok - stateful final latest-release change leaves announce false
+2026-08-31T22:21:36.6907898Z ok - stateful resolver makes initial and final exact latest-release reads
+2026-08-31T22:21:36.6967874Z ok - prerelease remains a no-op
+2026-08-31T22:21:36.6993243Z ok - prerelease leaves announce false
+2026-08-31T22:21:36.7006207Z ok - prerelease skips all GitHub API reads
+2026-08-31T22:21:36.7065346Z ok - a release that is not latest stable is a no-op
+2026-08-31T22:21:36.7090847Z ok - superseded release leaves announce false
+2026-08-31T22:21:36.7103408Z ok - superseded release skips all GitHub API reads
+2026-08-31T22:21:36.7206477Z ok - tag that disagrees with VERSION still fails the run
+2026-08-31T22:21:36.7231936Z ok - tag/VERSION mismatch leaves announce false
+2026-08-31T22:21:36.7244929Z ok - workflow carries no marketplace deploy key
+2026-08-31T22:21:36.7258253Z ok - release script never pushes
+2026-08-31T22:21:36.7321183Z ok - the notes checker runs after protected-branch ancestry proof
+2026-08-31T22:21:36.7321945Z ok - tool provisioning also runs after ancestry proof
+2026-08-31T22:21:36.8241525Z ok - a long Details section does not break Highlights detection (no SIGPIPE)
+2026-08-31T22:21:36.8257041Z ok - no printf|grep -q pipelines remain in the checker
+2026-08-31T22:21:36.8619030Z ok - revert: is rejected by generic subject detection
+2026-08-31T22:21:36.8982084Z ok - deps: is rejected by generic subject detection
+2026-08-31T22:21:36.9352191Z ok - an arbitrary scoped commit type is rejected
+2026-08-31T22:21:36.9726191Z ok - prose containing a colon is NOT mistaken for a commit subject
+2026-08-31T22:21:37.0099893Z ok - a wrapped Highlights bullet is rejected
+2026-08-31T22:21:37.0115170Z ok - PR CI requires notes for a version bump
+2026-08-31T22:21:37.0130029Z ok - the version-bump gate resolves the per-version notes file
+2026-08-31T22:21:37.0309316Z ok - historical tag source is data-only while trusted main runs every verifier
+2026-08-31T22:21:37.0310552Z ok - checked-in release train uses explicit output-gated hardened OIDC policy
+2026-08-31T22:21:37.0776293Z ok - retired workflow pin is rejected
+2026-08-31T22:21:37.0954718Z ok - blessed-SHA decoy cannot hide an attacker announce target
+2026-08-31T22:21:37.1133488Z ok - job-level permission shadowing is rejected
+2026-08-31T22:21:37.1315461Z ok - announce cannot run on verify success without explicit output true
+2026-08-31T22:21:37.1495410Z ok - tag checkout cannot replace the trusted default-branch verifier
+2026-08-31T22:21:37.1517678Z ok - direct secret or URL delivery cannot return in the release script
+2026-08-31T22:21:37.1518451Z ALL PASS
+2026-08-31T22:21:37.1683993Z ok - latest stable uses published_at globally with numeric ID tie-breaker
+2026-08-31T22:21:37.1747722Z ok - missing published_at on a stable release fails closed
+2026-08-31T22:21:37.1814906Z ok - malformed published_at on a stable release fails closed
+2026-08-31T22:21:37.1880088Z ok - non-integer ID on a stable release fails closed
+2026-08-31T22:21:37.1940034Z ok - all-draft release list fails closed
+2026-08-31T22:21:37.1964430Z ok - latest-release fixture accepts only the modeled paginated API request
+2026-08-31T22:21:37.2554308Z ok - stale marketplace card leaves the release a draft
+2026-08-31T22:21:37.2569641Z ok - stale card never publishes
+2026-08-31T22:21:37.3099035Z ok - current marketplace card publishes the release
+2026-08-31T22:21:37.3113379Z ok - publish happens exactly once
+2026-08-31T22:21:37.3467477Z ok - published rerun is idempotent
+2026-08-31T22:21:37.3481467Z ok - rerun refreshes exact assets
+2026-08-31T22:21:37.3954566Z ok - unreadable card leaves the release a draft
+2026-08-31T22:21:37.3979408Z ok - CI uses GitHub-hosted runner
+2026-08-31T22:21:37.3992264Z ok - PR CI never executes persistent runner
+2026-08-31T22:21:37.4004760Z ok - no marketplace commit identity remains
+2026-08-31T22:21:37.4018451Z ok - release workflow uses extracted helper
+2026-08-31T22:21:37.4031838Z ok - publish helper reads the card through the shared library
+2026-08-31T22:21:37.4045086Z ok - release train reads the card through the shared library
+2026-08-31T22:21:37.4059153Z ok - shared library retains typed exact-one card validation
+2026-08-31T22:21:37.4059606Z ok - staged releases have a publish workflow
+2026-08-31T22:21:37.4072551Z ok - publish workflow re-verifies the card before publishing
+2026-08-31T22:21:37.4085747Z ok - auto-release reports a staged draft as expected state
+2026-08-31T22:21:37.4086272Z ALL PASS

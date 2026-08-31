@@ -1,0 +1,1612 @@
+{
+  "schema_version": 1,
+  "source": "representative-run-33443036305-test.log",
+  "run_id": 33443036305,
+  "method": "Difference consecutive GitHub log timestamps; retain intervals >=1s and assign each to the active test script. Silence is a wait candidate, not standalone proof.",
+  "scripts": {
+    "engine.test.sh": {
+      "wall_s": 1605.408394,
+      "silent_intervals_ge_1s": 98,
+      "silent_cumulative_s": 1551.742204,
+      "silent_share_of_wall_pct": 96.66,
+      "silent_p50_s": 10.563461,
+      "silent_p95_s": 52.645901,
+      "silent_max_s": 165.624304
+    },
+    "daemon-reload.test.sh": {
+      "wall_s": 16.903008,
+      "silent_intervals_ge_1s": 4,
+      "silent_cumulative_s": 9.807493,
+      "silent_share_of_wall_pct": 58.02,
+      "silent_p50_s": 1.037792,
+      "silent_p95_s": 4.010963,
+      "silent_max_s": 4.010963
+    },
+    "autoupdate.test.sh": {
+      "wall_s": 3.108375,
+      "silent_intervals_ge_1s": 1,
+      "silent_cumulative_s": 1.677324,
+      "silent_share_of_wall_pct": 53.96,
+      "silent_p50_s": 1.677324,
+      "silent_p95_s": 1.677324,
+      "silent_max_s": 1.677324
+    },
+    "browser-launch.test.sh": {
+      "wall_s": 11.119191,
+      "silent_intervals_ge_1s": 4,
+      "silent_cumulative_s": 11.06585,
+      "silent_share_of_wall_pct": 99.52,
+      "silent_p50_s": 2.017159,
+      "silent_p95_s": 4.020142,
+      "silent_max_s": 4.020142
+    },
+    "cdp-salvage.test.mjs": {
+      "wall_s": 403.568399,
+      "silent_intervals_ge_1s": 52,
+      "silent_cumulative_s": 395.549289,
+      "silent_share_of_wall_pct": 98.01,
+      "silent_p50_s": 3.041513,
+      "silent_p95_s": 30.041174,
+      "silent_max_s": 35.103911
+    },
+    "distribution.test.sh": {
+      "wall_s": 15.99623,
+      "silent_intervals_ge_1s": 2,
+      "silent_cumulative_s": 8.35755,
+      "silent_share_of_wall_pct": 52.25,
+      "silent_p50_s": 1.980887,
+      "silent_p95_s": 6.376663,
+      "silent_max_s": 6.376663
+    },
+    "release-train.test.sh": {
+      "wall_s": 0.956171,
+      "silent_intervals_ge_1s": 0,
+      "silent_cumulative_s": 0,
+      "silent_share_of_wall_pct": 0.0,
+      "silent_p50_s": 0,
+      "silent_p95_s": 0,
+      "silent_max_s": 0
+    },
+    "release-assets.test.sh": {
+      "wall_s": 0.256782,
+      "silent_intervals_ge_1s": 0,
+      "silent_cumulative_s": 0,
+      "silent_share_of_wall_pct": 0.0,
+      "silent_p50_s": 0,
+      "silent_p95_s": 0,
+      "silent_max_s": 0
+    }
+  },
+  "top_intervals": [
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:01:04.383462+00:00",
+      "ended_at": "2026-08-31T22:03:50.007766+00:00",
+      "elapsed_s": 165.624304,
+      "before": "ok - force-killed attempt never announces a refund",
+      "after": "ok - post-click timeout fails without a duplicate retry"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:03:50.025688+00:00",
+      "ended_at": "2026-08-31T22:06:35.634686+00:00",
+      "elapsed_s": 165.608998,
+      "before": "ok - post-click timeout never announces a refund",
+      "after": "ok - partial commit metadata fails without a duplicate retry"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:55:55.339715+00:00",
+      "ended_at": "2026-08-31T21:58:40.933470+00:00",
+      "elapsed_s": 165.593755,
+      "before": "ok - intact log capture permits the guarded retry",
+      "after": "ok - failed Oracle log capture exits 6"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:55:02.615631+00:00",
+      "ended_at": "2026-08-31T21:55:55.334393+00:00",
+      "elapsed_s": 52.718762,
+      "before": "ok - symlinked transcript fails closed",
+      "after": "ok - intact log capture still refunds the pre-browser failure"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:00:11.730688+00:00",
+      "ended_at": "2026-08-31T22:01:04.376589+00:00",
+      "elapsed_s": 52.645901,
+      "before": "ok - hard-cap timeout kill never announces a refund",
+      "after": "ok - TERM-ignoring Oracle still terminates the attempt"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:09:03.301448+00:00",
+      "ended_at": "2026-08-31T22:09:49.929578+00:00",
+      "elapsed_s": 46.62813,
+      "before": "# v0.28: early URL capture + change manifest on a fresh run",
+      "after": "ok - early-capture run preserves as in-progress (exit 9)"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:59:28.120244+00:00",
+      "ended_at": "2026-08-31T22:00:11.722106+00:00",
+      "elapsed_s": 43.601862,
+      "before": "ok - watchdog-killed stall after lifecycle never announces a refund",
+      "after": "ok - hard-cap timeout kill exits 6"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:53:41.326170+00:00",
+      "ended_at": "2026-08-31T21:54:21.921317+00:00",
+      "elapsed_s": 40.595147,
+      "before": "# v0.31 (#65): a provably-never-landed submission refunds its round",
+      "after": "ok - never-landed run fails (exit 6)"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:54:21.930343+00:00",
+      "ended_at": "2026-08-31T21:55:02.512176+00:00",
+      "elapsed_s": 40.581833,
+      "before": "ok - refund is named in the status detail",
+      "after": "ok - landed-but-lost run fails (exit 6)"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:19:39.302669+00:00",
+      "ended_at": "2026-08-31T22:20:14.406580+00:00",
+      "elapsed_s": 35.103911,
+      "before": "# ok - our review is found regardless of order (foreignFirst=false)",
+      "after": "# ok - a later CDP outage is not masked by an early successful scan"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:19:08.778867+00:00",
+      "ended_at": "2026-08-31T22:19:38.820784+00:00",
+      "elapsed_s": 30.041917,
+      "before": "# ok - no crossbound sidecar is written for scrollback",
+      "after": "# ok - a conviction is recorded in crossbound/<marker>"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:16:36.361284+00:00",
+      "ended_at": "2026-08-31T22:17:06.402458+00:00",
+      "elapsed_s": 30.041174,
+      "before": "# ok - the learned URL is the one re-rendered",
+      "after": "# ok - server-side liveness survives later empty scans (exit 3)"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:17:06.402570+00:00",
+      "ended_at": "2026-08-31T22:17:36.443049+00:00",
+      "elapsed_s": 30.040479,
+      "before": "# ok - still-generating says it was proven server-side",
+      "after": "# ok - an undecided remembered conversation exits 7, not 4"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:17:36.443049+00:00",
+      "ended_at": "2026-08-31T22:18:06.482264+00:00",
+      "elapsed_s": 30.039215,
+      "before": "# ok - an undecided remembered conversation exits 7, not 4",
+      "after": "# ok - a stale memo pointing at another run still exits 4"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:18:06.482264+00:00",
+      "ended_at": "2026-08-31T22:18:36.520895+00:00",
+      "elapsed_s": 30.038631,
+      "before": "# ok - a stale memo pointing at another run still exits 4",
+      "after": "# ok - cross-bound memo is not accepted as our review"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:20:14.406580+00:00",
+      "ended_at": "2026-08-31T22:20:44.444932+00:00",
+      "elapsed_s": 30.038352,
+      "before": "# ok - a later CDP outage is not masked by an early successful scan",
+      "after": "# ok - a dead remembered tab proven foreign still exits 4"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:58:40.947884+00:00",
+      "ended_at": "2026-08-31T21:59:04.533142+00:00",
+      "elapsed_s": 23.585258,
+      "before": "ok - failed Oracle log capture never announces a refund",
+      "after": "ok - watchdog-killed pre-browser stall exits 6"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:59:04.538961+00:00",
+      "ended_at": "2026-08-31T21:59:28.114668+00:00",
+      "elapsed_s": 23.575707,
+      "before": "ok - watchdog-killed stall never announces a refund",
+      "after": "ok - watchdog-killed stall after lifecycle exits 6"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:49:53.453235+00:00",
+      "ended_at": "2026-08-31T21:50:14.035300+00:00",
+      "elapsed_s": 20.582065,
+      "before": "ok - explicit PRO_GATE_BROWSER_ARCHIVE passes through unchanged",
+      "after": "ok - select switcher-error falls back to current and exits 0"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:18:36.521414+00:00",
+      "ended_at": "2026-08-31T22:18:56.565840+00:00",
+      "elapsed_s": 20.044426,
+      "before": "# ok - no foreign review text is emitted on stdout",
+      "after": "# ok - an open tab with our marker but another run's answer is refused"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:48:50.223308+00:00",
+      "ended_at": "2026-08-31T21:49:05.963631+00:00",
+      "elapsed_s": 15.740323,
+      "before": "# primary run: hard cap -> live probe -> final salvage -> exit 9",
+      "after": "ok - primary run exits 9"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:49:05.973871+00:00",
+      "ended_at": "2026-08-31T21:49:21.708848+00:00",
+      "elapsed_s": 15.734977,
+      "before": "# v0.24: a large diff (> cook threshold, < hard ceiling) COOKS to in-progress, not refused",
+      "after": "ok - large diff cooks to in-progress (exit 9, not 11)"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:51:33.957028+00:00",
+      "ended_at": "2026-08-31T21:51:49.587951+00:00",
+      "elapsed_s": 15.630923,
+      "before": "# U2/P1: realistic exit-9: oracle emits evidence ONLY at completion, so a killed run captures nothing",
+      "after": "ok - late-evidence exit-9 run exits 9"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:51:17.888633+00:00",
+      "ended_at": "2026-08-31T21:51:33.518663+00:00",
+      "elapsed_s": 15.63003,
+      "before": "# U2: in-progress persists the model; --harvest reads it back (R4) [best case: oracle emitted evidence before the kill]",
+      "after": "ok - in-progress run exits 9"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:07:21.554602+00:00",
+      "ended_at": "2026-08-31T22:07:36.861233+00:00",
+      "elapsed_s": 15.306631,
+      "before": "ok - note_miss still incremented the streak",
+      "after": "ok - harvest retains other past-TTL reservations without confirmed miss proof"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:07:52.074795+00:00",
+      "ended_at": "2026-08-31T22:08:07.309568+00:00",
+      "elapsed_s": 15.234773,
+      "before": "ok - harvest keeps a fresh reservation",
+      "after": "ok - harvest never reaps its OWN target reservation mid-collection"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:07:36.861233+00:00",
+      "ended_at": "2026-08-31T22:07:52.074795+00:00",
+      "elapsed_s": 15.213562,
+      "before": "ok - harvest retains other past-TTL reservations without confirmed miss proof",
+      "after": "ok - harvest keeps a fresh reservation"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:09:49.960043+00:00",
+      "ended_at": "2026-08-31T22:10:02.641766+00:00",
+      "elapsed_s": 12.681723,
+      "before": "# v0.32: a failed owned run stays named, unarchived, and locally untouched",
+      "after": "ok - owned failed run exits 6 after decisive loss"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:06:35.643157+00:00",
+      "ended_at": "2026-08-31T22:06:48.311457+00:00",
+      "elapsed_s": 12.6683,
+      "before": "ok - partial commit metadata never announces a refund",
+      "after": "ok - structured pre-submit failure exits 6 without a duplicate retry"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:18:56.656659+00:00",
+      "ended_at": "2026-08-31T22:19:08.697390+00:00",
+      "elapsed_s": 12.040731,
+      "before": "# ok - our review reaches stdout",
+      "after": "# ok - still-generating stays exit 3 under the new check"
+    }
+  ],
+  "intervals": [
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:47:20.116334+00:00",
+      "ended_at": "2026-08-31T21:47:22.698006+00:00",
+      "elapsed_s": 2.581672,
+      "before": "# hard-ceiling refusal (exit 11): only diffs past PRO_GATE_DIFF_HARD_MAX are refused",
+      "after": "ok - past-hard-ceiling diff exits 11"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:47:23.007570+00:00",
+      "ended_at": "2026-08-31T21:47:28.307224+00:00",
+      "elapsed_s": 5.299654,
+      "before": "ok - empty harvest marker cannot start a fresh review",
+      "after": "ok - harvest in-progress exits 9"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:47:28.910570+00:00",
+      "ended_at": "2026-08-31T21:47:39.000042+00:00",
+      "elapsed_s": 10.089472,
+      "before": "# reservation reconciliation miss threshold",
+      "after": "[pro-gate] reservation pg-run-77-1700000000-11 probe miss -> retained 1/3"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:47:39.005093+00:00",
+      "ended_at": "2026-08-31T21:47:46.657170+00:00",
+      "elapsed_s": 7.652077,
+      "before": "ok - first marker miss records streak one",
+      "after": "ok - positive probe resets miss streak"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:47:47.897675+00:00",
+      "ended_at": "2026-08-31T21:47:50.849619+00:00",
+      "elapsed_s": 2.951944,
+      "before": "# U2: readable stale source harvest lifecycle",
+      "after": "ok - readable stale harvest exits 0 from canonical scratch evidence"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:47:51.379180+00:00",
+      "ended_at": "2026-08-31T21:47:56.669898+00:00",
+      "elapsed_s": 5.290718,
+      "before": "ok - idempotent stale harvest leaves the retired reservation absent",
+      "after": "ok - stale-incomplete stale scratch retains reservation with its existing exit"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:47:56.682614+00:00",
+      "ended_at": "2026-08-31T21:48:01.991212+00:00",
+      "elapsed_s": 5.308598,
+      "before": "ok - stale-incomplete stale scratch closes only one scratch target",
+      "after": "ok - stale-inconclusive stale scratch retains reservation with its existing exit"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:48:02.004274+00:00",
+      "ended_at": "2026-08-31T21:48:07.337035+00:00",
+      "elapsed_s": 5.332761,
+      "before": "ok - stale-inconclusive stale scratch closes only one scratch target",
+      "after": "ok - stale-wrong-url stale scratch retains reservation with its existing exit"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:48:07.349681+00:00",
+      "ended_at": "2026-08-31T21:48:10.241295+00:00",
+      "elapsed_s": 2.891614,
+      "before": "ok - stale-wrong-url stale scratch closes only one scratch target",
+      "after": "ok - stale-throttle stale scratch retains reservation with its existing exit"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:48:10.256778+00:00",
+      "ended_at": "2026-08-31T21:48:15.625231+00:00",
+      "elapsed_s": 5.368453,
+      "before": "ok - throttled stale scratch keeps its reservation and writes the existing cooldown",
+      "after": "ok - stale-cross stale scratch retains reservation with its existing exit"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:48:15.637977+00:00",
+      "ended_at": "2026-08-31T21:48:18.412880+00:00",
+      "elapsed_s": 2.774903,
+      "before": "ok - stale-cross stale scratch closes only one scratch target",
+      "after": "[pro-gate] reservation pg-run-stale-probe-77-1700000705-707 is complete \u2014 releasing its slot; collect it with --harvest (no new spend)"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:48:19.185780+00:00",
+      "ended_at": "2026-08-31T21:48:24.327828+00:00",
+      "elapsed_s": 5.142048,
+      "before": "ok - already-collected re-harvest returns the same review",
+      "after": "ok - harvest lost exits 6"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:48:24.872554+00:00",
+      "ended_at": "2026-08-31T21:48:31.280678+00:00",
+      "elapsed_s": 6.408124,
+      "before": "# slot exclusion prevents overbooking through a freed lower slot",
+      "after": "ok - reserved slot 1 not reacquired while slot 2 held"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:48:31.280678+00:00",
+      "ended_at": "2026-08-31T21:48:41.871963+00:00",
+      "elapsed_s": 10.591285,
+      "before": "ok - reserved slot 1 not reacquired while slot 2 held",
+      "after": "ok - non-reserved slot still acquirable"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:48:41.888962+00:00",
+      "ended_at": "2026-08-31T21:48:46.055110+00:00",
+      "elapsed_s": 4.166148,
+      "before": "# harvest miss policy: absent passes retain, limit releases",
+      "after": "ok - first harvest miss retains reservation (exit 9)"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:48:46.055110+00:00",
+      "ended_at": "2026-08-31T21:48:50.223188+00:00",
+      "elapsed_s": 4.168078,
+      "before": "ok - first harvest miss retains reservation (exit 9)",
+      "after": "ok - miss limit without canonical run-meta stays fail-closed"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:48:50.223308+00:00",
+      "ended_at": "2026-08-31T21:49:05.963631+00:00",
+      "elapsed_s": 15.740323,
+      "before": "# primary run: hard cap -> live probe -> final salvage -> exit 9",
+      "after": "ok - primary run exits 9"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:49:05.973871+00:00",
+      "ended_at": "2026-08-31T21:49:21.708848+00:00",
+      "elapsed_s": 15.734977,
+      "before": "# v0.24: a large diff (> cook threshold, < hard ceiling) COOKS to in-progress, not refused",
+      "after": "ok - large diff cooks to in-progress (exit 9, not 11)"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:49:21.725432+00:00",
+      "ended_at": "2026-08-31T21:49:32.297284+00:00",
+      "elapsed_s": 10.571852,
+      "before": "# U1: selector default is current; select still reachable (R1/R2)",
+      "after": "ok - default run exits 0"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:49:32.300618+00:00",
+      "ended_at": "2026-08-31T21:49:42.878092+00:00",
+      "elapsed_s": 10.577474,
+      "before": "ok - default run requests strategy current",
+      "after": "ok - PRO_GATE_MODEL_STRATEGY=select passes select"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:49:42.881190+00:00",
+      "ended_at": "2026-08-31T21:49:53.453235+00:00",
+      "elapsed_s": 10.572045,
+      "before": "ok - select still passes -m requested hint",
+      "after": "ok - explicit PRO_GATE_BROWSER_ARCHIVE passes through unchanged"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:49:53.453235+00:00",
+      "ended_at": "2026-08-31T21:50:14.035300+00:00",
+      "elapsed_s": 20.582065,
+      "before": "ok - explicit PRO_GATE_BROWSER_ARCHIVE passes through unchanged",
+      "after": "ok - select switcher-error falls back to current and exits 0"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:50:14.042276+00:00",
+      "ended_at": "2026-08-31T21:50:24.611478+00:00",
+      "elapsed_s": 10.569202,
+      "before": "# U2/U3: fresh run captures the resolved model into status + ledger (R4)",
+      "after": "ok - fresh capture run exits 0"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:50:24.621197+00:00",
+      "ended_at": "2026-08-31T21:50:35.193751+00:00",
+      "elapsed_s": 10.572554,
+      "before": "# U2/U3: unavailable resolved model degrades to role-based text (R5)",
+      "after": "ok - unavailable status model is role-based (no version)"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:50:35.198547+00:00",
+      "ended_at": "2026-08-31T21:50:45.758891+00:00",
+      "elapsed_s": 10.560344,
+      "before": "# U5: soft downgrade warning is advisory, never changes exit status (R6)",
+      "after": "ok - weak model run still exits 0 (advisory)"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:50:45.768205+00:00",
+      "ended_at": "2026-08-31T21:50:56.332260+00:00",
+      "elapsed_s": 10.564055,
+      "before": "ok - weak model sets status model_warn",
+      "after": "ok - strong non-Pro name run exits 0"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:50:56.338478+00:00",
+      "ended_at": "2026-08-31T21:51:06.904449+00:00",
+      "elapsed_s": 10.565971,
+      "before": "ok - strong non-Pro name does NOT warn (no allowlist false-positive)",
+      "after": "ok - unconfirmable model (non-benign status) warns"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:51:06.905015+00:00",
+      "ended_at": "2026-08-31T21:51:17.471394+00:00",
+      "elapsed_s": 10.566379,
+      "before": "ok - unconfirmable model run still exits 0",
+      "after": "ok - benign already-selected run exits 0"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:51:17.888633+00:00",
+      "ended_at": "2026-08-31T21:51:33.518663+00:00",
+      "elapsed_s": 15.63003,
+      "before": "# U2: in-progress persists the model; --harvest reads it back (R4) [best case: oracle emitted evidence before the kill]",
+      "after": "ok - in-progress run exits 9"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:51:33.957028+00:00",
+      "ended_at": "2026-08-31T21:51:49.587951+00:00",
+      "elapsed_s": 15.630923,
+      "before": "# U2/P1: realistic exit-9: oracle emits evidence ONLY at completion, so a killed run captures nothing",
+      "after": "ok - late-evidence exit-9 run exits 9"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:51:50.419279+00:00",
+      "ended_at": "2026-08-31T21:52:00.982740+00:00",
+      "elapsed_s": 10.563461,
+      "before": "# v0.22: per-PR review round budget (exit 12, no spend)",
+      "after": "ok - round 1 proceeds (exit 0)"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:52:01.034698+00:00",
+      "ended_at": "2026-08-31T21:52:11.602349+00:00",
+      "elapsed_s": 10.567651,
+      "before": "ok - formatted verdict records FIX-FIRST (shared hardened parser)",
+      "after": "ok - round 2 proceeds (exit 0)"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:52:12.189926+00:00",
+      "ended_at": "2026-08-31T21:52:22.760612+00:00",
+      "elapsed_s": 10.570686,
+      "before": "ok - open P0 counts land in status detail",
+      "after": "ok - different PR is not capped by PR 88"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:52:22.760612+00:00",
+      "ended_at": "2026-08-31T21:52:33.318081+00:00",
+      "elapsed_s": 10.557469,
+      "before": "ok - different PR is not capped by PR 88",
+      "after": "ok - FORCE_ROUND runs past the cap"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:52:33.322043+00:00",
+      "ended_at": "2026-08-31T21:52:43.895475+00:00",
+      "elapsed_s": 10.573432,
+      "before": "ok - forced run is still recorded",
+      "after": "ok - stale rounds outside the window do not cap"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:52:43.899411+00:00",
+      "ended_at": "2026-08-31T21:52:54.460648+00:00",
+      "elapsed_s": 10.561237,
+      "before": "ok - record prunes stale entries",
+      "after": "ok - ROUND_GUARD=0 disables the budget"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:52:54.460648+00:00",
+      "ended_at": "2026-08-31T21:53:05.029875+00:00",
+      "elapsed_s": 10.569227,
+      "before": "ok - ROUND_GUARD=0 disables the budget",
+      "after": "ok - pure --diff run proceeds under budget"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:53:05.299756+00:00",
+      "ended_at": "2026-08-31T21:53:08.575583+00:00",
+      "elapsed_s": 3.275827,
+      "before": "ok - cap 0 status phase round-capped",
+      "after": "ok - concurrent same-branch --diff run waits on the per-change lock (exit 7)"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:53:08.590391+00:00",
+      "ended_at": "2026-08-31T21:53:19.176360+00:00",
+      "elapsed_s": 10.585969,
+      "before": "ok - lock-timeout pre_slot_secs + post_slot_secs equals secs",
+      "after": "ok - detached-HEAD --diff run proceeds"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:53:19.477017+00:00",
+      "ended_at": "2026-08-31T21:53:30.031907+00:00",
+      "elapsed_s": 10.55489,
+      "before": "ok - window typo (1d) falls back to 24h, not 30 min",
+      "after": "ok - stale round state is swept by housekeeping"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:53:30.032125+00:00",
+      "ended_at": "2026-08-31T21:53:40.602089+00:00",
+      "elapsed_s": 10.569964,
+      "before": "# v0.30.1 hygiene close-out: legacy-named logs, daemon/service logs, title-seq, blacklist",
+      "after": "ok - hygiene run exits 0"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:53:41.326170+00:00",
+      "ended_at": "2026-08-31T21:54:21.921317+00:00",
+      "elapsed_s": 40.595147,
+      "before": "# v0.31 (#65): a provably-never-landed submission refunds its round",
+      "after": "ok - never-landed run fails (exit 6)"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:54:21.930343+00:00",
+      "ended_at": "2026-08-31T21:55:02.512176+00:00",
+      "elapsed_s": 40.581833,
+      "before": "ok - refund is named in the status detail",
+      "after": "ok - landed-but-lost run fails (exit 6)"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:55:02.615631+00:00",
+      "ended_at": "2026-08-31T21:55:55.334393+00:00",
+      "elapsed_s": 52.718762,
+      "before": "ok - symlinked transcript fails closed",
+      "after": "ok - intact log capture still refunds the pre-browser failure"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:55:55.339715+00:00",
+      "ended_at": "2026-08-31T21:58:40.933470+00:00",
+      "elapsed_s": 165.593755,
+      "before": "ok - intact log capture permits the guarded retry",
+      "after": "ok - failed Oracle log capture exits 6"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:58:40.947884+00:00",
+      "ended_at": "2026-08-31T21:59:04.533142+00:00",
+      "elapsed_s": 23.585258,
+      "before": "ok - failed Oracle log capture never announces a refund",
+      "after": "ok - watchdog-killed pre-browser stall exits 6"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:59:04.538961+00:00",
+      "ended_at": "2026-08-31T21:59:28.114668+00:00",
+      "elapsed_s": 23.575707,
+      "before": "ok - watchdog-killed stall never announces a refund",
+      "after": "ok - watchdog-killed stall after lifecycle exits 6"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T21:59:28.120244+00:00",
+      "ended_at": "2026-08-31T22:00:11.722106+00:00",
+      "elapsed_s": 43.601862,
+      "before": "ok - watchdog-killed stall after lifecycle never announces a refund",
+      "after": "ok - hard-cap timeout kill exits 6"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:00:11.730688+00:00",
+      "ended_at": "2026-08-31T22:01:04.376589+00:00",
+      "elapsed_s": 52.645901,
+      "before": "ok - hard-cap timeout kill never announces a refund",
+      "after": "ok - TERM-ignoring Oracle still terminates the attempt"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:01:04.383462+00:00",
+      "ended_at": "2026-08-31T22:03:50.007766+00:00",
+      "elapsed_s": 165.624304,
+      "before": "ok - force-killed attempt never announces a refund",
+      "after": "ok - post-click timeout fails without a duplicate retry"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:03:50.025688+00:00",
+      "ended_at": "2026-08-31T22:06:35.634686+00:00",
+      "elapsed_s": 165.608998,
+      "before": "ok - post-click timeout never announces a refund",
+      "after": "ok - partial commit metadata fails without a duplicate retry"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:06:35.643157+00:00",
+      "ended_at": "2026-08-31T22:06:48.311457+00:00",
+      "elapsed_s": 12.6683,
+      "before": "ok - partial commit metadata never announces a refund",
+      "after": "ok - structured pre-submit failure exits 6 without a duplicate retry"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:06:49.022776+00:00",
+      "ended_at": "2026-08-31T22:06:59.581367+00:00",
+      "elapsed_s": 10.558591,
+      "before": "# v0.22.1: --confirm mode (budget-accounted confirming pass)",
+      "after": "ok - confirm pass runs and exits 0"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:06:59.611055+00:00",
+      "ended_at": "2026-08-31T22:07:10.121824+00:00",
+      "elapsed_s": 10.510769,
+      "before": "# v0.22.1: Cloudflare (provably-unsubmitted) refunds its round",
+      "after": "ok - cloudflare run fails without a usable review"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:07:10.307950+00:00",
+      "ended_at": "2026-08-31T22:07:20.938131+00:00",
+      "elapsed_s": 10.630181,
+      "before": "# v0.32: throttle evidence suppresses exit-9 organization",
+      "after": "ok - throttle salvage preserves the spent run as exit 9"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:07:21.554602+00:00",
+      "ended_at": "2026-08-31T22:07:36.861233+00:00",
+      "elapsed_s": 15.306631,
+      "before": "ok - note_miss still incremented the streak",
+      "after": "ok - harvest retains other past-TTL reservations without confirmed miss proof"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:07:36.861233+00:00",
+      "ended_at": "2026-08-31T22:07:52.074795+00:00",
+      "elapsed_s": 15.213562,
+      "before": "ok - harvest retains other past-TTL reservations without confirmed miss proof",
+      "after": "ok - harvest keeps a fresh reservation"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:07:52.074795+00:00",
+      "ended_at": "2026-08-31T22:08:07.309568+00:00",
+      "elapsed_s": 15.234773,
+      "before": "ok - harvest keeps a fresh reservation",
+      "after": "ok - harvest never reaps its OWN target reservation mid-collection"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:08:07.917194+00:00",
+      "ended_at": "2026-08-31T22:08:13.326612+00:00",
+      "elapsed_s": 5.409418,
+      "before": "ok - a foreign reconciler skips an actively-harvested marker",
+      "after": "ok - a released lock reads as unclaimed"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:08:14.838175+00:00",
+      "ended_at": "2026-08-31T22:08:18.345373+00:00",
+      "elapsed_s": 3.507198,
+      "before": "ok - --status live-run hint says do not launch",
+      "after": "ok - --status released lock no longer flagged live"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:08:19.184368+00:00",
+      "ended_at": "2026-08-31T22:08:22.697254+00:00",
+      "elapsed_s": 3.512886,
+      "before": "ok - --status sees a first-run lock with no rounds file",
+      "after": "ok - native dead wrapper avoids the harvest loop"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:08:24.348376+00:00",
+      "ended_at": "2026-08-31T22:08:29.517809+00:00",
+      "elapsed_s": 5.169433,
+      "before": "ok - manifest not counted as a reservation",
+      "after": "ok - replay harvest does not return the foreign review"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:08:31.084497+00:00",
+      "ended_at": "2026-08-31T22:08:33.476578+00:00",
+      "elapsed_s": 2.392081,
+      "before": "ok - artifact retrieval under active cooldown never invokes organizer mode",
+      "after": "ok - artifact recovery still exits 0 when a peer starts cooldown during lock wait"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:08:37.444893+00:00",
+      "ended_at": "2026-08-31T22:08:42.585805+00:00",
+      "elapsed_s": 5.140912,
+      "before": "cp: cannot stat '/tmp/pg-engine-test.1DFp8V/prior-collected.md': No such file or directory",
+      "after": "ok - overwritten ledgered source rejected by digest (exit 6)"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:08:42.585912+00:00",
+      "ended_at": "2026-08-31T22:08:47.859020+00:00",
+      "elapsed_s": 5.273108,
+      "before": "# v0.28: already-collected harvest returns the ledgered review idempotently",
+      "after": "ok - digest-verified already-collected harvest exits 0"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:08:47.862470+00:00",
+      "ended_at": "2026-08-31T22:08:53.009792+00:00",
+      "elapsed_s": 5.147322,
+      "before": "ok - already-collected returns the prior review",
+      "after": "ok - digest-less legacy row routes to manual recovery (exit 6)"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:08:53.009792+00:00",
+      "ended_at": "2026-08-31T22:08:58.156080+00:00",
+      "elapsed_s": 5.146288,
+      "before": "ok - digest-less legacy row routes to manual recovery (exit 6)",
+      "after": "ok - stale OUT content never passes as collected (exit 6)"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:08:58.156080+00:00",
+      "ended_at": "2026-08-31T22:09:03.301337+00:00",
+      "elapsed_s": 5.145257,
+      "before": "ok - stale OUT content never passes as collected (exit 6)",
+      "after": "ok - absent reservation without ledger row still exits 6"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:09:03.301448+00:00",
+      "ended_at": "2026-08-31T22:09:49.929578+00:00",
+      "elapsed_s": 46.62813,
+      "before": "# v0.28: early URL capture + change manifest on a fresh run",
+      "after": "ok - early-capture run preserves as in-progress (exit 9)"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:09:49.960043+00:00",
+      "ended_at": "2026-08-31T22:10:02.641766+00:00",
+      "elapsed_s": 12.681723,
+      "before": "# v0.32: a failed owned run stays named, unarchived, and locally untouched",
+      "after": "ok - owned failed run exits 6 after decisive loss"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:10:02.658196+00:00",
+      "ended_at": "2026-08-31T22:10:13.217017+00:00",
+      "elapsed_s": 10.558821,
+      "before": "# v0.28: direct capture with an echoed nonce is stripped before output",
+      "after": "ok - direct nonce capture exits 0"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:10:13.224309+00:00",
+      "ended_at": "2026-08-31T22:10:23.984561+00:00",
+      "elapsed_s": 10.760252,
+      "before": "# v0.32: a delayed early organizer cannot wake after terminal archive/close",
+      "after": "ok - terminal success beats the delayed organizer timer"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:10:23.984561+00:00",
+      "ended_at": "2026-08-31T22:10:29.993804+00:00",
+      "elapsed_s": 6.009243,
+      "before": "ok - terminal success beats the delayed organizer timer",
+      "after": "ok - revoked early organizer performs no post-finalization render or mutation"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:10:29.996257+00:00",
+      "ended_at": "2026-08-31T22:10:40.578464+00:00",
+      "elapsed_s": 10.582207,
+      "before": "# v0.32 gate: every terminal path joins an already-running early organizer",
+      "after": "ok - rename-disabled KEEP_TABS success waits for the marker organizer"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:10:40.578464+00:00",
+      "ended_at": "2026-08-31T22:10:51.155865+00:00",
+      "elapsed_s": 10.577401,
+      "before": "ok - rename-disabled KEEP_TABS success waits for the marker organizer",
+      "after": "ok - missing title memo still waits for the marker organizer"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:10:51.155988+00:00",
+      "ended_at": "2026-08-31T22:11:01.841079+00:00",
+      "elapsed_s": 10.685091,
+      "before": "# v0.32 gate: organizer throttle precedes ramp and ledger settlement",
+      "after": "ok - organizer-detected throttle preserves collected exit 0"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:11:01.859126+00:00",
+      "ended_at": "2026-08-31T22:11:06.208677+00:00",
+      "elapsed_s": 4.349551,
+      "before": "# v0.32 gate: no-flock organizer lock never steals a publication-in-progress",
+      "after": "ok - no-flock contender preserves the live unpublished lock"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:11:06.401073+00:00",
+      "ended_at": "2026-08-31T22:11:07.520297+00:00",
+      "elapsed_s": 1.119224,
+      "before": "ok - --status does not sweep stale organizer locks",
+      "after": "ok - no-flock missing metadata stays busy instead of being stolen"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:11:07.984752+00:00",
+      "ended_at": "2026-08-31T22:11:18.548475+00:00",
+      "elapsed_s": 10.563723,
+      "before": "# v0.29: the prompt leads with the run-naming title line (#49 phase 1)",
+      "after": "ok - title-line run exits 0 (nonce echoed back from the dumped prompt)"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:11:18.564630+00:00",
+      "ended_at": "2026-08-31T22:11:29.105328+00:00",
+      "elapsed_s": 10.540698,
+      "before": "ok - title memo publication leaves no partial temp file",
+      "after": "ok - second same-PR round exits 0"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:11:29.109093+00:00",
+      "ended_at": "2026-08-31T22:11:39.674129+00:00",
+      "elapsed_s": 10.565036,
+      "before": "ok - second round titles r2",
+      "after": "ok - ordinal advances past expired windows (r8)"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:11:40.077583+00:00",
+      "ended_at": "2026-08-31T22:11:45.222938+00:00",
+      "elapsed_s": 5.145355,
+      "before": "# v0.30 (#50 item 3): harvest ledger rows carry pr=NUMBER and round_key=full key",
+      "after": "ok - harvest row pr field is the trailing number"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:11:45.225995+00:00",
+      "ended_at": "2026-08-31T22:11:55.892861+00:00",
+      "elapsed_s": 10.666866,
+      "before": "# v0.30 (#50 item 4): conversation-urls memos older than 14d are swept, fresh ones stay",
+      "after": "ok - old memo swept"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:11:56.661081+00:00",
+      "ended_at": "2026-08-31T22:12:01.809475+00:00",
+      "elapsed_s": 5.148394,
+      "before": "# v0.30 gate r2: a harvest never clobbers the original run log",
+      "after": "ok - second invocation adds a log instead of overwriting"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:12:02.747275+00:00",
+      "ended_at": "2026-08-31T22:12:04.008673+00:00",
+      "elapsed_s": 1.261398,
+      "before": "ok - recover bare PR without current canonical repository proof refuses cross-repo ambiguity",
+      "after": "ok - concurrent recover inherits marker harvest lock and busy state without fresh dispatch"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:12:04.106088+00:00",
+      "ended_at": "2026-08-31T22:12:14.464947+00:00",
+      "elapsed_s": 10.358859,
+      "before": "ok - recover exact legacy marker creates a safe fallback output before harvest",
+      "after": "ok - fresh run persists canonical repository identity and charged-spend ordering metadata"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:12:15.645953+00:00",
+      "ended_at": "2026-08-31T22:12:25.997508+00:00",
+      "elapsed_s": 10.351555,
+      "before": "# gate #91 P1 (:192): recorded --out is resolved absolute at charge time and validated at recovery",
+      "after": "ok - fresh run with a relative --out records an absolute path in run-meta"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:12:29.256386+00:00",
+      "ended_at": "2026-08-31T22:12:34.549838+00:00",
+      "elapsed_s": 5.293452,
+      "before": "ok - recover publishes normally once the --out guard is released",
+      "after": "ok - recover harvest-delegation still-generating exits 9"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:12:34.556814+00:00",
+      "ended_at": "2026-08-31T22:12:35.671802+00:00",
+      "elapsed_s": 1.114988,
+      "before": "ok - recover harvest-delegation still-generating stderr is exactly one plain state line",
+      "after": "ok - recover harvest-delegation lock contention exits 7"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:12:45.760054+00:00",
+      "ended_at": "2026-08-31T22:12:57.276707+00:00",
+      "elapsed_s": 11.516653,
+      "before": "ok - cold-start full-PR fixture resolves to advisory run-granted-review without a binding",
+      "after": "ok - matching fresh effect charges only after marker-bound input binding persists before Oracle submission"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:13:02.856725+00:00",
+      "ended_at": "2026-08-31T22:13:14.552772+00:00",
+      "elapsed_s": 11.696047,
+      "before": "ok - exact current pending review suppresses spend and routes only to collection/recovery",
+      "after": "ok - old-head completed bytes do not suppress the current fresh dispatch"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:13:14.552772+00:00",
+      "ended_at": "2026-08-31T22:13:26.297798+00:00",
+      "elapsed_s": 11.745026,
+      "before": "ok - old-head completed bytes do not suppress the current fresh dispatch",
+      "after": "ok - changed-evidence completed bytes do not suppress the current fresh dispatch"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:13:26.770737+00:00",
+      "ended_at": "2026-08-31T22:13:38.287964+00:00",
+      "elapsed_s": 11.517227,
+      "before": "ok - public query treats historical completed bytes as terminal for their own run-meta marker",
+      "after": "ok - historical completed bytes retire same-marker run-meta without gaining applicability"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:13:38.760749+00:00",
+      "ended_at": "2026-08-31T22:13:50.270776+00:00",
+      "elapsed_s": 11.510027,
+      "before": "ok - public query treats historical pending bytes as terminal for their own run-meta marker",
+      "after": "ok - historical pending bytes retire same-marker run-meta without gaining applicability"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:13:52.449264+00:00",
+      "ended_at": "2026-08-31T22:13:53.766987+00:00",
+      "elapsed_s": 1.317723,
+      "before": "ok - stale run-granted advisory re-reduces after governor without charge or Oracle",
+      "after": "ok - failed round persistence preserves charged recovery state before Oracle"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:13:53.766987+00:00",
+      "ended_at": "2026-08-31T22:13:55.098838+00:00",
+      "elapsed_s": 1.331851,
+      "before": "ok - failed round persistence preserves charged recovery state before Oracle",
+      "after": "ok - failed run-meta persistence preserves charged recovery state before Oracle"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:13:55.098838+00:00",
+      "ended_at": "2026-08-31T22:13:56.453436+00:00",
+      "elapsed_s": 1.354598,
+      "before": "ok - failed run-meta persistence preserves charged recovery state before Oracle",
+      "after": "ok - failed binding persistence preserves charged recovery state before Oracle"
+    },
+    {
+      "script": "engine.test.sh",
+      "started_at": "2026-08-31T22:14:01.392845+00:00",
+      "ended_at": "2026-08-31T22:14:02.680137+00:00",
+      "elapsed_s": 1.287292,
+      "before": "# U2 reopened: scoped SHIP merge handoff",
+      "after": "ok - unchanged provenance-valid scoped SHIP reaches report-only merge handoff, never another review"
+    },
+    {
+      "script": "daemon-reload.test.sh",
+      "started_at": "2026-08-31T22:14:12.352630+00:00",
+      "ended_at": "2026-08-31T22:14:13.379856+00:00",
+      "elapsed_s": 1.027226,
+      "before": "ok - daemon process alive before reload",
+      "after": "ok - daemon detected the new deploy stamp"
+    },
+    {
+      "script": "daemon-reload.test.sh",
+      "started_at": "2026-08-31T22:14:13.388410+00:00",
+      "ended_at": "2026-08-31T22:14:17.399373+00:00",
+      "elapsed_s": 4.010963,
+      "before": "ok - PID unchanged across reload (exec, not a fresh spawn)",
+      "after": "ok - reloaded exactly once (no reload-loop; identical stamp is inert)"
+    },
+    {
+      "script": "daemon-reload.test.sh",
+      "started_at": "2026-08-31T22:14:17.403830+00:00",
+      "ended_at": "2026-08-31T22:14:21.135342+00:00",
+      "elapsed_s": 3.731512,
+      "before": "# integration: self-reload disabled -> no re-exec on a new stamp",
+      "after": "ok - self-reload=0 does not detect/reload"
+    },
+    {
+      "script": "daemon-reload.test.sh",
+      "started_at": "2026-08-31T22:14:21.365617+00:00",
+      "ended_at": "2026-08-31T22:14:22.403409+00:00",
+      "elapsed_s": 1.037792,
+      "before": "ok - missing identity globally defers before browser or worker work",
+      "after": "ok - compatible identity deploy reloads and recovers daemon readiness"
+    },
+    {
+      "script": "autoupdate.test.sh",
+      "started_at": "2026-08-31T22:14:23.131804+00:00",
+      "ended_at": "2026-08-31T22:14:24.809128+00:00",
+      "elapsed_s": 1.677324,
+      "before": "ok - lock loser never appends to or trims the log",
+      "after": "# fail closed: non-semver plugin versions are never followed"
+    },
+    {
+      "script": "browser-launch.test.sh",
+      "started_at": "2026-08-31T22:14:25.547228+00:00",
+      "ended_at": "2026-08-31T22:14:27.557144+00:00",
+      "elapsed_s": 2.009916,
+      "before": "ok - socket inspection failure never starts Xvfb",
+      "after": "ok - TERM during preflight exits with signal status"
+    },
+    {
+      "script": "browser-launch.test.sh",
+      "started_at": "2026-08-31T22:14:27.570045+00:00",
+      "ended_at": "2026-08-31T22:14:29.587204+00:00",
+      "elapsed_s": 2.017159,
+      "before": "ok - live profile owner never starts Xvfb",
+      "after": "ok - failed Xvfb blocks Chrome launch"
+    },
+    {
+      "script": "browser-launch.test.sh",
+      "started_at": "2026-08-31T22:14:29.587276+00:00",
+      "ended_at": "2026-08-31T22:14:32.605909+00:00",
+      "elapsed_s": 3.018633,
+      "before": "ok - failed Xvfb never starts Chrome",
+      "after": "ok - missing CDP readiness fails startup"
+    },
+    {
+      "script": "browser-launch.test.sh",
+      "started_at": "2026-08-31T22:14:32.608179+00:00",
+      "ended_at": "2026-08-31T22:14:36.628321+00:00",
+      "elapsed_s": 4.020142,
+      "before": "ok - CDP readiness failure cleans up Xvfb",
+      "after": "ok - Chrome receives software rasterizer guard"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:14:36.687041+00:00",
+      "ended_at": "2026-08-31T22:14:39.795846+00:00",
+      "elapsed_s": 3.108805,
+      "before": "TAP version 13",
+      "after": "# ok - still-generating exits 3"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:14:40.059331+00:00",
+      "ended_at": "2026-08-31T22:14:43.102586+00:00",
+      "elapsed_s": 3.043255,
+      "before": "# ok - terminal UI leaves source tab for caller cleanup: There was an error generating a response",
+      "after": "# ok - assistant error phrase stays generating: A network error occurred"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:14:43.102586+00:00",
+      "ended_at": "2026-08-31T22:14:46.144099+00:00",
+      "elapsed_s": 3.041513,
+      "before": "# ok - assistant error phrase stays generating: A network error occurred",
+      "after": "# ok - assistant error phrase stays generating: Something went wrong while generating the response"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:14:46.144099+00:00",
+      "ended_at": "2026-08-31T22:14:49.186138+00:00",
+      "elapsed_s": 3.042039,
+      "before": "# ok - assistant error phrase stays generating: Something went wrong while generating the response",
+      "after": "# ok - assistant error phrase stays generating: There was an error generating a response"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:14:49.186138+00:00",
+      "ended_at": "2026-08-31T22:14:52.228780+00:00",
+      "elapsed_s": 3.042642,
+      "before": "# ok - assistant error phrase stays generating: There was an error generating a response",
+      "after": "# ok - structured error before the exact marker stays generating"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:14:52.228780+00:00",
+      "ended_at": "2026-08-31T22:14:54.825080+00:00",
+      "elapsed_s": 2.5963,
+      "before": "# ok - structured error before the exact marker stays generating",
+      "after": "# ok - readable stale source recovers the canonical scratch review"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:14:54.825360+00:00",
+      "ended_at": "2026-08-31T22:14:59.929664+00:00",
+      "elapsed_s": 5.104304,
+      "before": "# ok - readable stale source stays open and unnavigated",
+      "after": "# ok - readable stale source waits past a marker-only canonical scratch sample"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:14:59.929855+00:00",
+      "ended_at": "2026-08-31T22:15:02.527320+00:00",
+      "elapsed_s": 2.597465,
+      "before": "# ok - marker-hydration revalidation closes only its scratch target",
+      "after": "# ok - probe revalidates a readable stale source and remains live (exit 0)"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:15:02.527743+00:00",
+      "ended_at": "2026-08-31T22:15:05.568555+00:00",
+      "elapsed_s": 3.040812,
+      "before": "# ok - probe closes only its canonical scratch target",
+      "after": "# ok - same-marker incomplete scratch remains still-generating"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:15:05.568953+00:00",
+      "ended_at": "2026-08-31T22:15:08.167250+00:00",
+      "elapsed_s": 2.598297,
+      "before": "# ok - incomplete scratch keeps the canonical memo and avoids blacklist/cross-bind mutation",
+      "after": "# ok - probe keeps an old foreign-marked scratch verdict generating"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:15:08.167343+00:00",
+      "ended_at": "2026-08-31T22:15:10.764811+00:00",
+      "elapsed_s": 2.597468,
+      "before": "# ok - old verdict ordering closes only one scratch",
+      "after": "# ok - probe keeps an old same-marker terminal verdict before the latest prompt generating"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:15:10.764811+00:00",
+      "ended_at": "2026-08-31T22:15:13.804244+00:00",
+      "elapsed_s": 3.039433,
+      "before": "# ok - probe keeps an old same-marker terminal verdict before the latest prompt generating",
+      "after": "# ok - a stale same-marker verdict before the latest prompt does not exit 0"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:15:13.804456+00:00",
+      "ended_at": "2026-08-31T22:15:18.914575+00:00",
+      "elapsed_s": 5.110119,
+      "before": "# ok - a stale same-marker verdict keeps the run still-generating (exit 3)",
+      "after": "# ok - the superseded verdict is skipped and the newer verdict is emitted instead"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:15:18.914682+00:00",
+      "ended_at": "2026-08-31T22:15:21.957107+00:00",
+      "elapsed_s": 3.042425,
+      "before": "# ok - the stale verdict text never reaches stdout",
+      "after": "# ok - canonical URL drift is inconclusive while the readable source remains live"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:15:21.957304+00:00",
+      "ended_at": "2026-08-31T22:15:24.998706+00:00",
+      "elapsed_s": 3.041402,
+      "before": "# ok - canonical URL drift closes only the disposable scratch",
+      "after": "# ok - scratch target disappearance is inconclusive while the readable source remains live"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:15:24.998911+00:00",
+      "ended_at": "2026-08-31T22:15:28.038510+00:00",
+      "elapsed_s": 3.039599,
+      "before": "# ok - scratch target disappearance closes only the disposable scratch",
+      "after": "# ok - scratch CDP listing failure is inconclusive while the readable source remains live"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:15:28.040016+00:00",
+      "ended_at": "2026-08-31T22:15:31.081730+00:00",
+      "elapsed_s": 3.041714,
+      "before": "# ok - scratch CDP listing failure closes only the disposable scratch",
+      "after": "# ok - login wall is inconclusive while the readable source remains live"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:15:31.081893+00:00",
+      "ended_at": "2026-08-31T22:15:34.123219+00:00",
+      "elapsed_s": 3.041326,
+      "before": "# ok - login wall closes only the disposable scratch",
+      "after": "# ok - pre-hydration shell is inconclusive while the readable source remains live"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:15:34.123479+00:00",
+      "ended_at": "2026-08-31T22:15:36.720951+00:00",
+      "elapsed_s": 2.597472,
+      "before": "# ok - pre-hydration shell closes only the disposable scratch",
+      "after": "# ok - throttled canonical scratch takes the existing throttle exit"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:15:36.721085+00:00",
+      "ended_at": "2026-08-31T22:15:39.757381+00:00",
+      "elapsed_s": 3.036296,
+      "before": "# ok - throttled canonical scratch writes cooldown and closes only scratch",
+      "after": "# ok - cross-bound canonical scratch is never emitted as our review"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:15:39.757631+00:00",
+      "ended_at": "2026-08-31T22:15:42.792128+00:00",
+      "elapsed_s": 3.034497,
+      "before": "# ok - cross-bound canonical scratch closes only scratch",
+      "after": "# ok - foreign canonical scratch is rejected as a decisive stale memo"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:15:42.792248+00:00",
+      "ended_at": "2026-08-31T22:15:45.389964+00:00",
+      "elapsed_s": 2.597716,
+      "before": "# ok - foreign canonical scratch forgets and blacklists the stale memo",
+      "after": "# ok - the one revalidation renders the remembered conversation A, not the duplicate tab B"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:15:45.390301+00:00",
+      "ended_at": "2026-08-31T22:15:48.433326+00:00",
+      "elapsed_s": 3.043025,
+      "before": "# ok - the duplicate tab B is never navigated, closed, or promoted in A's place",
+      "after": "# ok - the one revalidation renders A, not B, for the cross-bound case"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:15:48.433799+00:00",
+      "ended_at": "2026-08-31T22:15:51.030264+00:00",
+      "elapsed_s": 2.596465,
+      "before": "# ok - the cross-bound rejection of A is recorded for --status",
+      "after": "# ok - probe reports tab B present and generating despite A's cross-bound rejection"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:15:51.030404+00:00",
+      "ended_at": "2026-08-31T22:15:53.624394+00:00",
+      "elapsed_s": 2.59399,
+      "before": "# ok - the one revalidation still only ever rendered A",
+      "after": "# ok - probe reports tab B present and generating despite A's foreign rejection"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:15:53.624394+00:00",
+      "ended_at": "2026-08-31T22:15:56.663975+00:00",
+      "elapsed_s": 3.039581,
+      "before": "# ok - probe reports tab B present and generating despite A's foreign rejection",
+      "after": "# ok - with no remembered conversation, revalidation still targets the readable tab's own URL"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:15:56.663975+00:00",
+      "ended_at": "2026-08-31T22:15:59.762751+00:00",
+      "elapsed_s": 3.098776,
+      "before": "# ok - with no remembered conversation, revalidation still targets the readable tab's own URL",
+      "after": "# ok - normal scratch-open timeout returns before its watchdog fallback"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:15:59.762889+00:00",
+      "ended_at": "2026-08-31T22:16:02.801084+00:00",
+      "elapsed_s": 3.038195,
+      "before": "# ok - normal scratch-open timeout leaves source and recovery state unchanged",
+      "after": "# ok - probe scratch-open timeout returns before its watchdog fallback"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:16:02.801185+00:00",
+      "ended_at": "2026-08-31T22:16:05.845888+00:00",
+      "elapsed_s": 3.044703,
+      "before": "# ok - probe scratch-open timeout leaves source and recovery state unchanged",
+      "after": "# ok - normal scratch-list timeout returns before its watchdog fallback"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:16:05.845988+00:00",
+      "ended_at": "2026-08-31T22:16:08.886215+00:00",
+      "elapsed_s": 3.040227,
+      "before": "# ok - normal scratch-list timeout leaves source and recovery state unchanged",
+      "after": "# ok - probe scratch-list timeout returns before its watchdog fallback"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:16:08.886342+00:00",
+      "ended_at": "2026-08-31T22:16:13.488113+00:00",
+      "elapsed_s": 4.601771,
+      "before": "# ok - probe scratch-list timeout leaves source and recovery state unchanged",
+      "after": "# ok - normal scratch-close timeout returns before its watchdog fallback"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:16:13.488330+00:00",
+      "ended_at": "2026-08-31T22:16:18.080231+00:00",
+      "elapsed_s": 4.591901,
+      "before": "# ok - normal scratch-close cleanup was attempted despite no reply",
+      "after": "# ok - probe scratch-close timeout returns before its watchdog fallback"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:16:18.159539+00:00",
+      "ended_at": "2026-08-31T22:16:20.799378+00:00",
+      "elapsed_s": 2.639839,
+      "before": "# ok - completed review remembers the conversation URL",
+      "after": "# ok - tabless conversation is recovered from the remembered URL"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:16:20.799551+00:00",
+      "ended_at": "2026-08-31T22:16:23.393877+00:00",
+      "elapsed_s": 2.594326,
+      "before": "# ok - recovery re-rendered the remembered URL",
+      "after": "# ok - a non-JSON PUT error still reaches the GET fallback and recovers the review"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:16:23.394129+00:00",
+      "ended_at": "2026-08-31T22:16:26.026132+00:00",
+      "elapsed_s": 2.632003,
+      "before": "# ok - the scratch tab was actually opened (via GET, after PUT failed)",
+      "after": "# ok - probe finds a tabless conversation via the remembered URL"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:16:26.026227+00:00",
+      "ended_at": "2026-08-31T22:16:31.130722+00:00",
+      "elapsed_s": 5.104495,
+      "before": "# ok - shell alone clears the old 200-char gate",
+      "after": "# ok - a pre-hydration render is not treated as a miss"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:16:31.130797+00:00",
+      "ended_at": "2026-08-31T22:16:33.765569+00:00",
+      "elapsed_s": 2.634772,
+      "before": "# ok - the review is read once the page hydrates",
+      "after": "# ok - a legacy global blacklist entry does not hide our conversation"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:16:33.765569+00:00",
+      "ended_at": "2026-08-31T22:16:36.361177+00:00",
+      "elapsed_s": 2.595608,
+      "before": "# ok - a legacy global blacklist entry does not hide our conversation",
+      "after": "# ok - a URL learned this invocation is used for recovery"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:16:36.361284+00:00",
+      "ended_at": "2026-08-31T22:17:06.402458+00:00",
+      "elapsed_s": 30.041174,
+      "before": "# ok - the learned URL is the one re-rendered",
+      "after": "# ok - server-side liveness survives later empty scans (exit 3)"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:17:06.402570+00:00",
+      "ended_at": "2026-08-31T22:17:36.443049+00:00",
+      "elapsed_s": 30.040479,
+      "before": "# ok - still-generating says it was proven server-side",
+      "after": "# ok - an undecided remembered conversation exits 7, not 4"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:17:36.443049+00:00",
+      "ended_at": "2026-08-31T22:18:06.482264+00:00",
+      "elapsed_s": 30.039215,
+      "before": "# ok - an undecided remembered conversation exits 7, not 4",
+      "after": "# ok - a stale memo pointing at another run still exits 4"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:18:06.482264+00:00",
+      "ended_at": "2026-08-31T22:18:36.520895+00:00",
+      "elapsed_s": 30.038631,
+      "before": "# ok - a stale memo pointing at another run still exits 4",
+      "after": "# ok - cross-bound memo is not accepted as our review"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:18:36.521414+00:00",
+      "ended_at": "2026-08-31T22:18:56.565840+00:00",
+      "elapsed_s": 20.044426,
+      "before": "# ok - no foreign review text is emitted on stdout",
+      "after": "# ok - an open tab with our marker but another run's answer is refused"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:18:56.656659+00:00",
+      "ended_at": "2026-08-31T22:19:08.697390+00:00",
+      "elapsed_s": 12.040731,
+      "before": "# ok - our review reaches stdout",
+      "after": "# ok - still-generating stays exit 3 under the new check"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:19:08.778867+00:00",
+      "ended_at": "2026-08-31T22:19:38.820784+00:00",
+      "elapsed_s": 30.041917,
+      "before": "# ok - no crossbound sidecar is written for scrollback",
+      "after": "# ok - a conviction is recorded in crossbound/<marker>"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:19:39.302669+00:00",
+      "ended_at": "2026-08-31T22:20:14.406580+00:00",
+      "elapsed_s": 35.103911,
+      "before": "# ok - our review is found regardless of order (foreignFirst=false)",
+      "after": "# ok - a later CDP outage is not masked by an early successful scan"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:20:14.406580+00:00",
+      "ended_at": "2026-08-31T22:20:44.444932+00:00",
+      "elapsed_s": 30.038352,
+      "before": "# ok - a later CDP outage is not masked by an early successful scan",
+      "after": "# ok - a dead remembered tab proven foreign still exits 4"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:20:44.444932+00:00",
+      "ended_at": "2026-08-31T22:20:49.513491+00:00",
+      "elapsed_s": 5.068559,
+      "before": "# ok - a dead remembered tab proven foreign still exits 4",
+      "after": "# ok - CDP down exits 7 (inconclusive), not 4"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:20:49.513641+00:00",
+      "ended_at": "2026-08-31T22:20:52.553189+00:00",
+      "elapsed_s": 3.039548,
+      "before": "# ok - inconclusive names the cause",
+      "after": "# ok - no match exits 4"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:20:52.553259+00:00",
+      "ended_at": "2026-08-31T22:21:00.165159+00:00",
+      "elapsed_s": 7.6119,
+      "before": "# ok - foreign tab left open",
+      "after": "# ok - probe exits 0 on match"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:21:00.247939+00:00",
+      "ended_at": "2026-08-31T22:21:10.284870+00:00",
+      "elapsed_s": 10.036931,
+      "before": "# ok - probe reports complete once an owned VERDICT is present",
+      "after": "# ok - foreign VERDICT never reports complete for our marker"
+    },
+    {
+      "script": "cdp-salvage.test.mjs",
+      "started_at": "2026-08-31T22:21:10.284870+00:00",
+      "ended_at": "2026-08-31T22:21:13.323809+00:00",
+      "elapsed_s": 3.038939,
+      "before": "# ok - foreign VERDICT never reports complete for our marker",
+      "after": "# ok - a vanished tab is never reported as still-generating"
+    },
+    {
+      "script": "distribution.test.sh",
+      "started_at": "2026-08-31T22:21:24.018191+00:00",
+      "ended_at": "2026-08-31T22:21:25.999078+00:00",
+      "elapsed_s": 1.980887,
+      "before": "ok - doctor recovers after a compatible runtime identity converges",
+      "after": "ok - doctor uses configured oracle for version"
+    },
+    {
+      "script": "distribution.test.sh",
+      "started_at": "2026-08-31T22:21:28.641242+00:00",
+      "ended_at": "2026-08-31T22:21:35.017905+00:00",
+      "elapsed_s": 6.376663,
+      "before": "ok - doctor stays quiet when gh is missing",
+      "after": "ok - TERM-ignoring gh is hard-killed within the bounded window"
+    }
+  ]
+}

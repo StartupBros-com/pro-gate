@@ -1,0 +1,65 @@
+{
+  "run_id": "2026-08-31-ci-runner",
+  "captured_at_utc": "2026-08-31T22:46:29Z",
+  "git_sha": "c4a1dcced7107c9375c7f75ffea06fc9d898793f",
+  "profiled_content_revision": "967a4eb00e64b2c75764c17c52ad508982fb9bd4",
+  "source_run": {
+    "id": 33443036305,
+    "url": "https://github.com/StartupBros-com/pro-gate/actions/runs/33443036305",
+    "job": "trusted check",
+    "requested_label": "ubuntu-24.04",
+    "runner_name": "GitHub Actions 1000008317",
+    "runner_group": "GitHub Actions"
+  },
+  "hardware": {
+    "provider": "GitHub-hosted runner",
+    "cpu_model": null,
+    "cpu_cores": null,
+    "cpu_threads": null,
+    "ram_total": null,
+    "swap_total": null,
+    "note": "The retained hosted log does not expose hardware capacity."
+  },
+  "storage": {
+    "device": null,
+    "model": null,
+    "filesystem": null,
+    "mount_options": null
+  },
+  "os": {
+    "distribution": "Ubuntu 24.04.4 LTS",
+    "kernel": null,
+    "runner_version": "2.337.0",
+    "runner_image": "ubuntu-24.04",
+    "runner_image_version": "20260823.283.1",
+    "runner_image_release": "ubuntu24/20260823.283",
+    "hosted_compute_agent_version": "20260819.586",
+    "azure_region": "eastus"
+  },
+  "toolchain": {
+    "bash": null,
+    "node": null,
+    "jq": "1.8.1 (provisioned and SHA-256 pinned)",
+    "yq": "4.50.1 (provisioned and SHA-256 pinned)",
+    "shellcheck": "0.11.0 (provisioned and SHA-256 pinned)",
+    "gh": "2.76.2 (provisioned and SHA-256 pinned)"
+  },
+  "build_profile": {
+    "name": "shell-node-tests",
+    "optimization": "not applicable"
+  },
+  "workload_isolation": {
+    "provider_managed_ephemeral_vm": true,
+    "physical_host_identity": null,
+    "taskset": null,
+    "cgroup": null
+  },
+  "cache_state": "fresh hosted runner; lower-level provider cache state unknown",
+  "tuning_applied": {
+    "requested": false,
+    "governor": null,
+    "no_turbo": null,
+    "perf_event_paranoid": null
+  },
+  "cohort_note": "ci-baseline-summary.json records two image versions, seven named Azure regions, two runner versions, and two expired fingerprints across the 20-sample operational cohort."
+}
