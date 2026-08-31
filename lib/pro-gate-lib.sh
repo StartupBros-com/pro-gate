@@ -699,6 +699,16 @@ pg_attempt_disposition_write() { # host owner repo pr round-key marker charged-e
   return "$rc"
 }
 
+pg_attempt_disposition_scan() { # one canonical disposition JSON object per line
+  local dir f marker json
+  dir="$(pg_attempt_disposition_dir)"; [ -d "$dir" ] || return 0
+  for f in "$dir"/pg-run-*; do
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    marker="${f##*/}"; json="$(pg_attempt_disposition_read "$marker" 2>/dev/null || true)"
+    [ -z "$json" ] || printf '%s\n' "$json"
+  done
+}
+
 pg_attempt_disposition_find() { # host owner repo pr -> newest exact disposition
   local host="$1" owner="$2" repo="$3" pr="$4" dir f marker json epoch best="" best_epoch="" LC_ALL=C
   pg_canonical_repo_ok "$host" "$owner" "$repo" || return 1
@@ -797,6 +807,13 @@ pg_attempt_reconcile_terminal() { # marker; caller holds the per-change lock
   disposition="$(pg_attempt_disposition_read "$marker" 2>/dev/null || true)"
   [ -n "$disposition" ] || return 1
   pg_attempt_disposition_cleanup "$disposition"
+}
+
+pg_attempt_terminal_from_meta() { # marker terminal-kind proof-kind -> persist proof without cleanup
+  local marker="$1" kind="$2" proof="$3" meta host owner repo key pr _out epoch
+  meta="$(pg_run_meta_read "$marker" 2>/dev/null || true)"; [ -n "$meta" ] || return 1
+  IFS=$'\t' read -r host owner repo key pr _out epoch <<<"$meta"
+  pg_attempt_disposition_write "$host" "$owner" "$repo" "$pr" "$key" "$marker" "$epoch" "$kind" "$proof"
 }
 
 pg_attempt_terminal_transition() { # host owner repo pr key marker epoch kind proof
@@ -1103,9 +1120,19 @@ pg_reservation_note_miss() {
   case "$misses" in ''|*[!0-9]*) misses=0;; esac
   misses=$(( misses + 1 ))
   if [ "$misses" -ge "$miss_limit" ]; then
-    rm -f "$f" "$(pg_manifest_dir)/$marker" "$(pg_manifest_dir)/$marker.nonce" 2>/dev/null
-    pg_reservation_guard_release
-    echo released
+    # The miss threshold is terminal only when durable run-meta can bind the proof to one charged
+    # attempt. Publish disposition BEFORE releasing the reservation so no fresh caller sees a gap.
+    if pg_attempt_terminal_from_meta "$marker" recovery-exhausted bounded-recovery-exhausted; then
+      rm -f "$f" "$(pg_manifest_dir)/$marker" "$(pg_manifest_dir)/$marker.nonce" 2>/dev/null
+      pg_reservation_guard_release
+      pg_attempt_reconcile_terminal "$marker" 2>/dev/null || true
+      echo released
+    else
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${pr:-diff}" "${out:-}" "${created:-0}" "$misses" "${slot:-}" "${model:-}" "${spend:-}" > "$f.tmp" 2>/dev/null \
+        && mv -f "$f.tmp" "$f"
+      pg_reservation_guard_release
+      echo "retained $misses/$miss_limit"
+    fi
   else
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${pr:-diff}" "${out:-}" "${created:-0}" "$misses" "${slot:-}" "${model:-}" "${spend:-}" > "$f.tmp" 2>/dev/null \
       && mv -f "$f.tmp" "$f"
@@ -1260,12 +1287,11 @@ pg_reservation_state() {
   case "$state" in complete) echo complete;; *) echo generating;; esac
 }
 
-# pg_reservation_expire_if_stale <marker>: release THIS marker's reservation when it is past
-# TTL. The collector calls it AFTER its capture, while still holding the marker's harvest lock
-# (#68 gate r3 P1) — reconcilers skip claimed markers, so without this the harvest target could
-# never expire and #67's self-clearing property was defeated for the one marker that needed it.
-# Caller MUST only invoke this on outcomes that did NOT positively prove the review is live.
-# Echoes "expired" when released, nothing otherwise.
+# pg_reservation_expire_if_stale <marker>: report THIS marker past TTL without releasing it.
+# TTL is a precondition for recovery exhaustion, never terminal proof by itself. The caller must
+# combine it with confirmed marker misses through pg_reservation_note_miss; only that bounded proof
+# publishes a disposition before releasing capacity.
+# Echoes "stale" when past TTL, nothing otherwise.
 pg_reservation_expire_if_stale() {
   local marker="$1" f created ttl now
   pg_reservation_marker_ok "$marker" || return 0
@@ -1276,8 +1302,7 @@ pg_reservation_expire_if_stale() {
   ttl="${PRO_GATE_RESERVATION_TTL:-21600}"; case "$ttl" in ''|*[!0-9]*) ttl=21600;; esac
   now="$(date +%s)"
   [ $(( now - created )) -ge "$ttl" ] || return 0
-  pg_reservation_remove "$marker"
-  echo expired
+  echo stale
 }
 
 # pg_harvest_claimed <marker>: 0 when some process is COLLECTING this marker right now, i.e.
@@ -1352,12 +1377,10 @@ pg_reservation_reconcile() {
     case "$misses" in ''|*[!0-9]*) misses=0;; esac
     age=$(( now - created ))
     if [ "$created" -gt 0 ] && [ "$age" -ge "$ttl" ]; then
-      echo "[pro-gate] releasing expired in-progress reservation $marker (${age}s >= ${ttl}s TTL)" >&2
-      pg_reservation_remove "$marker"; continue
+      echo "[pro-gate] reservation $marker is past TTL (${age}s >= ${ttl}s); retaining until bounded marker-miss proof terminalizes it" >&2
     fi
-    # TTL-only mode (#67): the harvest path sweeps expiry without probing. A probe there would
-    # cost a page render per harvest and could only duplicate the evidence the caller's own
-    # capture is about to produce; misses stay the fresh-dispatch path's business.
+    # TTL-only mode: harvest performs its own observation. It never releases on elapsed time alone;
+    # misses remain explicit proof and are counted by that caller when its capture is absent.
     [ "${PG_RES_TTL_ONLY:-0}" = 1 ] && continue
     # Rate-limit probes per marker by file mtime: N concurrent fresh runs must not turn one
     # real absence window into N miss increments, and back-to-back reconciles should not spam
@@ -1378,6 +1401,13 @@ pg_reservation_reconcile() {
           if [ "$(pg_reservation_state "$marker" 2>/dev/null)" != complete ] \
              && pg_reservation_set_state "$marker" complete; then
             echo "[pro-gate] reservation $marker is complete — releasing its slot; collect it with --harvest (no new spend)" >&2
+          fi
+        elif printf '%s' "$probe_out" | grep -q '^probe-state: terminal-infrastructure$'; then
+          if pg_attempt_terminal_from_meta "$marker" submitted-terminal exact-owned-infrastructure-terminal \
+             && pg_attempt_reconcile_terminal "$marker"; then
+            echo "[pro-gate] reservation $marker ended in an exact-owned ChatGPT infrastructure error — recovery released, round retained" >&2
+          else
+            echo "[pro-gate] terminal infrastructure proof for $marker could not be persisted safely — reservation retained" >&2
           fi
         else
           [ "$misses" -eq 0 ] || {
@@ -1868,6 +1898,15 @@ pg_round_policy_mode() { # advisory|enforced|lockdown|off
     echo lockdown
   else
     echo enforced
+  fi
+}
+
+pg_round_policy_source() {
+  if [ -n "${PRO_GATE_ROUND_GUARD+x}" ]; then echo PRO_GATE_ROUND_GUARD
+  elif [ -n "${PRO_GATE_MAX_ROUNDS_PER_PR+x}" ]; then echo PRO_GATE_MAX_ROUNDS_PER_PR
+  elif [ -n "${PRO_GATE_ROUNDS_BASE+x}" ]; then echo PRO_GATE_ROUNDS_BASE
+  elif [ -n "${PRO_GATE_ROUNDS_CEILING+x}" ]; then echo PRO_GATE_ROUNDS_CEILING
+  else echo default
   fi
 }
 

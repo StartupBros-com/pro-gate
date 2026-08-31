@@ -246,7 +246,8 @@ multiple repositories, tied candidates, or conflicting ordering returns disambig
 no action. Recovery first returns a verified completed artifact and otherwise performs only the
 existing marker harvest; it never dispatches a `--pr` review, creates a new slot, or spends a new
 round. Its plain states are **Review ready**, **Checking for completed review**, **Still working**,
-and **Browser needs attention**. A readable or open tab can be stale, so the engine safely
+**No review remains**, and **Browser needs attention**. `No review remains` means terminal proof
+released recovery ownership; re-query the typed decision instead of deleting state. A readable or open tab can be stale, so the engine safely
 revalidates the canonical server conversation without changing the source tab.
 
 Use direct `--status --json` and direct `--harvest` above for expert automation or degradation
@@ -261,12 +262,12 @@ diagnosis; ordinary callers should use `/pro-gate recover` instead.
 | 3 | Oracle/browser/CDP failure; run state kept | no |
 | 4 | Repo not found | no |
 | 5 | Diff fetch failed | no |
-| 6 | Ran but captured no usable review. Check the status `detail`: an already-collected review must not be resubmitted; a genuine loss is safe to re-run | maybe |
+| 6 | No usable review. Check `detail`/`attempt`: recoverable work must be harvested; `not-submitted` was refunded; `submitted-terminal` or `recovery-exhausted` remains charged but permits a fresh typed decision | maybe |
 | 7 | Per-change lock timeout (another run holds this change) | no |
 | 8 | Deferred: box unfit, low memory, or throttle cooldown; retry later | no |
 | 9 | In-progress: the model was still generating and the tab stays open. `--harvest` by marker; never submit a new review for it | yes |
 | 11 | Oversized diff, past `PRO_GATE_DIFF_HARD_MAX` (default 25,000 lines): scope the payload | no |
-| 12 | Round budget exhausted for this change's window: escalate to a human or set `PRO_GATE_FORCE_ROUND=1` for one deliberate extra run | no |
+| 12 | An explicitly enabled round policy denied this change. Default unset configuration is advisory; inspect `--status` for policy source | no |
 
 ## Configuration
 
@@ -277,14 +278,15 @@ All tunables live in [`.env.example`](.env.example) with inline docs; the engine
 |---|---|---|
 | `PRO_REVIEW_OWNERS` | *(required for daemon)* | GitHub owners the daemon may watch |
 | `PRO_REVIEW_MAX_BUDGET_USD` | `5` | Hard $ ceiling per PR for headless fixer runs |
-| `PRO_GATE_ROUNDS_BASE` | `3` | Governor base grant of slot-spending reviews per change per window |
-| `PRO_GATE_ROUNDS_CEILING` | `8` | Hard ceiling a shrinking-findings trajectory can earn up to (+1 per shrinking re-review) |
-| `PRO_GATE_MAX_ROUNDS_PER_PR` | *(unset)* | Set to pin the legacy flat cap instead of the governor |
-| `PRO_GATE_ROUNDS_WINDOW` | `24h` | The rolling window for that budget |
+| `PRO_GATE_ROUND_GUARD` | *(unset/advisory)* | Set `1` for hard trajectory enforcement; `0` forces advisory/off even when limit knobs exist |
+| `PRO_GATE_ROUNDS_BASE` | `3` advisory | Computed base grant shown in status; explicitly setting it enables enforcement (`0` = lockdown) |
+| `PRO_GATE_ROUNDS_CEILING` | `8` advisory | Computed trajectory ceiling; explicitly setting it enables enforcement |
+| `PRO_GATE_MAX_ROUNDS_PER_PR` | *(unset)* | Explicit legacy flat-cap enforcement (`0` = lockdown) |
+| `PRO_GATE_ROUNDS_WINDOW` | `24h` | The rolling telemetry/enforcement window |
 | `PRO_GATE_MAX_DIFF_LINES` | `6000` | Above this a run proceeds but usually lands in-progress → harvest |
 | `PRO_GATE_DIFF_HARD_MAX` | `25000` | Above this the engine refuses (exit 11, no spend) |
 | `PRO_GATE_MAX_CONCURRENCY` | `1` | Ceiling for parallel Pro chats; a ramp governor earns up to it on clean streaks |
-| `PRO_GATE_RESERVATION_TTL` | `21600` | Seconds an in-progress run's capacity stays reserved (6 h) |
+| `PRO_GATE_RESERVATION_TTL` | `21600` | Minimum age before confirmed exact-marker misses may exhaust recovery; elapsed time alone never releases it |
 | `PRO_GATE_REQUIRE_NONCE` | `1` | Reject any capture that doesn't echo this run's nonce (`0` restores path-overlap matching) |
 | `PRO_GATE_MODEL_STRATEGY` | `current` | Review with whatever Pro model the account has selected; the run reports the one it used |
 | `PRO_GATE_CHAT_RENAME` | `1` remote / prompt-only native | Apply and verify the exact canonical PR/round title through ChatGPT's rendered UI |
@@ -322,7 +324,7 @@ semantics. Native mode keeps the prompt's title hint and does not run remote-CDP
 | `bin/pro-gate-doctor.sh` | One-command setup verification (deps, versions, browser, consent) |
 | `bin/pro-gate-stats.sh` | Ledger stats: clean rate, exits, per-PR history |
 | `bin/pro-gate-autoupdate.sh` | The opt-in hourly skew-follower |
-| `lib/pro-gate-lib.sh` | Platform detection, browser mode, locks, reservations, round budget |
+| `lib/pro-gate-lib.sh` | Platform detection, locks, canonical attempt lifecycle, reservations, terminal dispositions, round telemetry/policy |
 | `skills/pro-gate/SKILL.md` | The `/pro-gate` skill, the authoritative caller guide |
 | `agents/oracle-reviewer.md` | Thin relay agent for other pipelines |
 | `daemon/daemon.sh` | Label-gated watcher (per-SHA idempotent, cost/failure caps) |
@@ -337,12 +339,10 @@ semantics. Native mode keeps the prompt's title hint and does not run remote-CDP
   ChatGPT accounts (one Chrome profile each).
 - **False positives**: every finding must cite `file:line`; an explicit "do not flag" list
   suppresses style/CI-enforced/generated/pre-existing/speculative noise.
-- **Convergence**: review→fix→re-review loops are governed by trajectory, not hope. The
-  skill's default `converge` policy continues only while each round strictly narrows the
-  findings (all prior P0/P1 resolved, fewer new ones) and stops on oscillation;
-  `pro_gate_rounds_policy: bounded` restores a fixed ceiling. The engine independently
-  enforces the per-change round budget (exit 12, no spend) — since v0.31 a trajectory-aware
-  governor that earns rounds while open findings shrink and brakes early on churn.
+- **Convergence**: identical code plus identical evidence never runs again. Round count,
+  open-P0/P1 trajectory, churn, and elapsed time remain visible advice, but default unset
+  configuration does not ration unobservable ChatGPT subscription capacity. Operators who need
+  hard automation containment can explicitly enable the trajectory governor, flat cap, or lockdown.
 - **Merge authority**: the daemon never merges; it stops after pushing fixes and commenting.
 
 ## Troubleshooting
@@ -363,12 +363,11 @@ it is deliberately neither archived nor closed.
 
 ### Exit 6 (`no usable review`)
 
-This exit covers two different situations, so read the status `detail` before acting. `already-collected`
-means the review exists (find it with `--status`; do not resubmit). A genuine loss is safe
-to retry: re-running the identical `--pr` command is engine-enforced safe (a live
-reservation redirects instead of double-spending). On a low-memory box this exit often means
-the review browser restarted mid-run, so free memory first. Failed runs are never archived or
-closed by the organizer; a proven owned conversation can still be renamed so it is easy to find.
+Read `--status --json` before acting. A canonical `attempt` reports one truth: active/recoverable
+work must be collected; `not-submitted` was positively proven and refunded; `submitted-terminal`
+or `recovery-exhausted` retains its charge but no longer owns recovery, so changed/current evidence
+may receive a fresh typed decision. Unknown post-click fate stays recoverable. Never delete state,
+quarantine files, or use a force flag as diagnosis. On a low-memory box, free memory before retrying.
 
 ### Exit 3 / CDP unreachable (WSL2/Linux)
 
@@ -377,9 +376,9 @@ The durable Chrome is down. `systemctl --user start oracle-chrome` (or rerun
 
 ### Exit 12 (`round-capped`)
 
-The change used its review rounds for the window. Post the unresolved findings for a human
-decision; a deliberate extra round is `PRO_GATE_FORCE_ROUND=1` on one invocation. Committed
-fixes stay on the branch either way.
+This exit occurs only when an operator explicitly enabled round enforcement through the guard,
+flat cap, governor values, or lockdown. Inspect `--status --json` for `rounds[].policy`. A deliberate
+one-invocation override remains `PRO_GATE_FORCE_ROUND=1`; committed fixes stay on the branch.
 
 ## Limitations
 

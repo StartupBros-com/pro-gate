@@ -657,6 +657,22 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
         REC_TIED=1
       fi
     done < <(pg_run_meta_scan)
+    # A terminal disposition intentionally retires run-meta. Include it as the same canonical
+    # candidate class so PR/URL recovery can explain terminal truth without requiring its marker.
+    while IFS= read -r disposition; do
+      [ -n "$disposition" ] || continue
+      h="$(jq -r .repository.host <<<"$disposition")"; o="$(jq -r .repository.owner <<<"$disposition")"
+      r="$(jq -r .repository.repo <<<"$disposition")"; pr="$(jq -r .target.pr <<<"$disposition")"
+      [ "$pr" = "$REC_QUERY_NUM" ] && [ "$h" = "$REC_HOST" ] && [ "$o" = "$REC_OWNER" ] && [ "$r" = "$REC_REPO_NAME" ] || continue
+      m="$(jq -r .marker <<<"$disposition")"; spend="$(jq -r .charged_spend_epoch <<<"$disposition")"
+      case " $REC_SEEN " in *" $m "*) continue;; esac
+      REC_SEEN="$REC_SEEN $m"; REC_NEW_COUNT=$(( REC_NEW_COUNT + 1 ))
+      if [ -z "$REC_BEST_EPOCH" ] || [ "$spend" -gt "$REC_BEST_EPOCH" ]; then
+        REC_BEST_EPOCH="$spend"; REC_BEST_MARKER="$m"; REC_BEST_OUT=""; REC_TIED=0
+      elif [ "$spend" = "$REC_BEST_EPOCH" ]; then
+        REC_TIED=1
+      fi
+    done < <(pg_attempt_disposition_scan)
 
     # gate #91 round3 P1 (:165): the charge site's run-meta write is best-effort — its failure
     # only WARNs, because a failed sidecar write must never block a real review from running —
@@ -756,6 +772,18 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
     echo "Review ready" >&2
     cat "$REC_SRC"
     exit 0
+  fi
+
+  REC_DISPOSITION="$(pg_attempt_disposition_read "$REC_SELECTED" 2>/dev/null || true)"
+  if [ -n "$REC_DISPOSITION" ]; then
+    REC_TERMINAL_KEY="$(jq -r .round_key <<<"$REC_DISPOSITION")"
+    if ! pg_lock "${PRO_GATE_LOCKFILE:-$PRO_GATE_HOME/oracle.lock}.pr-${REC_TERMINAL_KEY}" "${PRO_GATE_RECOVER_LOCK_WAIT:-30}"; then
+      echo "Checking for completed review" >&2; exit 7
+    fi
+    pg_attempt_reconcile_terminal "$REC_SELECTED" \
+      || { echo "Browser needs attention" >&2; exit 3; }
+    echo "No review remains" >&2
+    exit 6
   fi
 
   # Exact-marker input does not pass through the candidate scan, so recover its publication path
@@ -893,6 +921,7 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
   ST_NOW="$(date +%s)"
   ST_LOCKFILE="${PRO_GATE_LOCKFILE:-$PRO_GATE_HOME/oracle.lock}"
   ST_INFLIGHT_KEY=""; ST_SPENT_KEY=""; ST_SPENT_N=0; ST_ACTIVE_HINT=""
+  ST_ATTEMPT_JSON=null; ST_ATTEMPT_EPOCH=0; ST_ATTEMPT_HINT=""
 
   # Non-blocking in-flight probe (same technique as round_capped's): a held per-change lock
   # means a same-change review is RUNNING right now — the one state with no reservation and no
@@ -1012,7 +1041,7 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
       # "still generating" and "finished, just uncollected" call for different operator action.
       r_life="$(pg_reservation_state "$m" 2>/dev/null || echo generating)"
       if [ "$r_crossbound" -gt 0 ] 2>/dev/null; then
-        ST_HINT="STUCK (cross-bound): the conversation remembered for $m carries ANOTHER run's completed answer — see $PRO_GATE_HOME/crossbound/$m. Retrying --harvest cannot bind it. Engine >=v0.31.1 discards the bad memo and expires the reservation at the ${ST_RES_TTL}s TTL; to free the change now, remove $(pg_reservation_dir)/$m. Do NOT set PRO_GATE_REQUIRE_NONCE=0 — that would accept the other run's review."
+        ST_HINT="STUCK (cross-bound): the conversation remembered for $m carries ANOTHER run's completed answer — see $PRO_GATE_HOME/crossbound/$m. Do NOT delete state or set PRO_GATE_REQUIRE_NONCE=0. The bad memo is discarded; bounded exact-marker misses will terminalize recovery while retaining the charged round."
       elif [ "$r_unbound" -gt 0 ]; then
         ST_HINT="AMBIGUOUS: ${r_unbound} harvested capture(s) for $m completed but carried no run-marker echo (see ${r_out}.unbound.*). This is retryable — it may be an older answer while yours still generates. Retry the FREE harvest: $r_cmd"
       else
@@ -1135,7 +1164,7 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
       elif [ "$a_mode" = native ]; then
         # Native has no marker-addressable harvest (--harvest exits 3 there): pointing at it
         # would be an unusable loop that never clears (gate #53 r2 P1). Manual recovery only.
-        [ -n "$ST_ACTIVE_HINT" ] || ST_ACTIVE_HINT="the last run's wrapper DIED (native mode: no harvest path) — check ${a_out} and ${a_out}.status, and look for the conversation in the ChatGPT UI; once resolved, rm '$PRO_GATE_HOME/active/$k' to retire this notice (it also expires with the 24h sweep)"
+        [ -n "$ST_ACTIVE_HINT" ] || ST_ACTIVE_HINT="the last run's wrapper DIED (native mode: no marker-addressed harvest path) — check ${a_out} and ${a_out}.status plus the ChatGPT UI. Do not delete state manually; the same typed pro-gate request will remain fail-closed until proof can settle it."
       elif [ -n "$a_marker" ]; then
         # Recoverable only while FRESH: past the reservation TTL the browser is not still
         # generating; the stale record is debris awaiting the 24h sweep (gate #61 r1 P1).
@@ -1154,7 +1183,7 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
     # and drop the trajectory globals, leaving --status unable to distinguish ordinary
     # exhaustion from a churn brake — the very signal this release exists to surface.
     pg_round_score "$k"
-    k_policy="$(pg_round_policy_mode "$k")"
+    k_policy="$(pg_round_policy_mode "$k")"; k_policy_source="$(pg_round_policy_source)"
     k_cap="$PG_ROUND_GRANT"; k_arrow="$PG_ROUND_ARROW"; k_earned="$PG_ROUND_EARNED"
     k_streak="$PG_ROUND_STREAK"; k_braked=0
     # ledger-timing-split R2: total wall clock spent on this change's rounds, alongside spent/cap.
@@ -1175,13 +1204,64 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
         --arg amarker "$a_marker" --arg aout "$a_out" --arg aalive "$a_alive" --arg amode "$a_mode" \
         --arg arrow "$k_arrow" --argjson earned "$k_earned" --argjson streak "$k_streak" \
         --argjson braked "$k_braked" --argjson elapsed_secs "$k_elapsed" --arg elapsed_h "$k_elapsed_h" \
-        --argjson scored "$k_scored" --arg policy "$k_policy" \
-        '{key:$key,spent:$spent,cap:$cap,remaining:$remaining,window_secs:$window_secs,policy:$policy,enforced:($policy=="enforced" or $policy=="lockdown"),in_flight:($in_flight == 1),trajectory:(if $arrow == "" then null else $arrow end),earned:$earned,streak:$streak,churn_braked:($braked == 1),elapsed_secs:$elapsed_secs,elapsed_h:$elapsed_h,scored:$scored,active:(if $amarker == "" and $aout == "" then null else {marker:$amarker,out:$aout,wrapper_alive:($aalive == "1"),mode:$amode} end)}' \
+        --argjson scored "$k_scored" --arg policy "$k_policy" --arg policy_source "$k_policy_source" \
+        '{key:$key,spent:$spent,cap:$cap,remaining:$remaining,window_secs:$window_secs,policy:$policy,policy_source:$policy_source,enforced:($policy=="enforced" or $policy=="lockdown"),in_flight:($in_flight == 1),trajectory:(if $arrow == "" then null else $arrow end),earned:$earned,streak:$streak,churn_braked:($braked == 1),elapsed_secs:$elapsed_secs,elapsed_h:$elapsed_h,scored:$scored,active:(if $amarker == "" and $aout == "" then null else {marker:$amarker,out:$aout,wrapper_alive:($aalive == "1"),mode:$amode} end)}' \
         >> "$ST_TMP/rounds.jsonl" 2>/dev/null
     else
-      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$k" "$spent" "$k_cap" "$rem" "$k_live" "$k_arrow" "$k_braked" "$k_elapsed" "$k_scored" "$k_policy" >> "$ST_TMP/rounds.tsv"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$k" "$spent" "$k_cap" "$rem" "$k_live" "$k_arrow" "$k_braked" "$k_elapsed" "$k_scored" "$k_policy" "$k_policy_source" >> "$ST_TMP/rounds.tsv"
     fi
   done
+
+  # 2b) Canonical attempt lifecycle. This snapshot owns recoverability and terminal retry truth;
+  # ledger history below is diagnostic only and cannot resurrect an in-progress hint after the
+  # lifecycle module has settled or exhausted that attempt.
+  if pg_have jq && [ -n "$Q_NUM$Q_MARKER" ]; then
+    ST_ATTEMPT_SEEN=""
+    st_consider_attempt() { # canonical snapshot
+      local candidate="$1" candidate_epoch
+      [ -n "$candidate" ] && jq -e . <<<"$candidate" >/dev/null 2>&1 || return 0
+      candidate_epoch="$(jq -r '.charged_spend_epoch // 0' <<<"$candidate")"
+      case "$candidate_epoch" in ''|*[!0-9]*) candidate_epoch=0;; esac
+      if [ "$candidate_epoch" -gt "$ST_ATTEMPT_EPOCH" ] || [ "$ST_ATTEMPT_JSON" = null ]; then
+        ST_ATTEMPT_JSON="$candidate"; ST_ATTEMPT_EPOCH="$candidate_epoch"
+      fi
+    }
+    while IFS=$'\t' read -r m h o r key pr _out _spend; do
+      st_match "$m" "$pr" || continue
+      st_target="${h}/${o}/${r}#${pr}"
+      case "|$ST_ATTEMPT_SEEN|" in *"|$st_target|"*) continue;; esac
+      ST_ATTEMPT_SEEN="${ST_ATTEMPT_SEEN:+${ST_ATTEMPT_SEEN}|}${st_target}"
+      st_consider_attempt "$(pg_attempt_snapshot "$h" "$o" "$r" "$pr" "$key" 2>/dev/null || true)"
+    done < <(pg_run_meta_scan)
+    while IFS= read -r disposition; do
+      [ -n "$disposition" ] || continue
+      m="$(jq -r .marker <<<"$disposition")"; pr="$(jq -r .target.pr <<<"$disposition")"
+      st_match "$m" "$pr" || continue
+      h="$(jq -r .repository.host <<<"$disposition")"; o="$(jq -r .repository.owner <<<"$disposition")"
+      r="$(jq -r .repository.repo <<<"$disposition")"; key="$(jq -r .round_key <<<"$disposition")"
+      st_target="${h}/${o}/${r}#${pr}"
+      case "|$ST_ATTEMPT_SEEN|" in *"|$st_target|"*) continue;; esac
+      ST_ATTEMPT_SEEN="${ST_ATTEMPT_SEEN:+${ST_ATTEMPT_SEEN}|}${st_target}"
+      st_consider_attempt "$(pg_attempt_snapshot "$h" "$o" "$r" "$pr" "$key" 2>/dev/null || true)"
+    done < <(pg_attempt_disposition_scan)
+    if [ "$ST_ATTEMPT_JSON" != null ]; then
+      st_state="$(jq -r .state <<<"$ST_ATTEMPT_JSON")"; st_marker="$(jq -r .marker <<<"$ST_ATTEMPT_JSON")"
+      st_source="$(jq -r .source <<<"$ST_ATTEMPT_JSON")"
+      if [ "$(jq -r .recoverable <<<"$ST_ATTEMPT_JSON")" = true ]; then
+        ST_RECOVERABLE=1; ST_RECOVER_REASON="canonical attempt $st_marker is $st_state"
+        ST_ATTEMPT_HINT="canonical attempt is recoverable — inspect without new spend: $ST_ENGINE --recover '$st_marker'"
+      elif [ "$st_source" = disposition ]; then
+        st_terminal="$(jq -r '.terminal.terminal_kind' <<<"$ST_ATTEMPT_JSON")"
+        if [ "$(jq -r .cleanup_pending <<<"$ST_ATTEMPT_JSON")" = true ]; then
+          ST_ATTEMPT_HINT="terminal attempt cleanup is pending for $st_marker — re-run the same typed pro-gate request; cleanup finishes before any new charge"
+        elif [ "$st_terminal" = not-submitted ]; then
+          ST_ATTEMPT_HINT="the prior attempt was proven not submitted and its round was refunded — a fresh typed pro-gate review is eligible"
+        else
+          ST_ATTEMPT_HINT="the prior attempt ended $st_terminal; its round remains charged but no review is recoverable — a fresh typed pro-gate review is eligible"
+        fi
+      fi
+    fi
+  fi
 
   # 3) Ledger: recent finished runs for the query (newest first). Rows from engines <v0.27
   # carry no marker/round_key fields; treat them as empty rather than skipping the row. A URL
@@ -1216,6 +1296,7 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
   fi
   # Artifacts rank BELOW live-run signals but above ledger history (gate #54 r10).
   [ -n "$ST_HINT" ] || ST_HINT="$ST_ARTIFACT_HINT"
+  [ -n "$ST_HINT" ] || ST_HINT="$ST_ATTEMPT_HINT"
   if [ -z "$ST_HINT" ] && [ -s "$ST_TMP/ledger.jsonl" ] && pg_have jq; then
     ST_LAST_OUTCOME="$(head -n1 "$ST_TMP/ledger.jsonl" | jq -r '.outcome // ""')"
     ST_LAST_OUT="$(head -n1 "$ST_TMP/ledger.jsonl" | jq -r '.out // ""')"
@@ -1255,12 +1336,12 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
 
   if [ "$AS_JSON" = 1 ]; then
     jq -n --arg query "${STATUS_QUERY:-all}" --arg home "$PRO_GATE_HOME" --arg hint "$ST_HINT" \
-      --arg rec "$ST_RECOVERABLE" --arg rec_reason "$ST_RECOVER_REASON" \
+      --arg rec "$ST_RECOVERABLE" --arg rec_reason "$ST_RECOVER_REASON" --argjson attempt "$ST_ATTEMPT_JSON" \
       --slurpfile res <(cat "$ST_TMP/res.jsonl" 2>/dev/null; echo null) \
       --slurpfile rounds <(cat "$ST_TMP/rounds.jsonl" 2>/dev/null; echo null) \
       --slurpfile ledger <(cat "$ST_TMP/ledger.jsonl" 2>/dev/null; echo null) \
       --slurpfile artifacts <(cat "$ST_TMP/artifacts.jsonl" 2>/dev/null; echo null) \
-      '{query:$query,home:$home,recoverable:($rec == "1"),recoverable_reason:$rec_reason,reservations:($res[:-1]),completed_artifacts:($artifacts[:-1]),rounds:($rounds[:-1]),recent_runs:($ledger[:-1]),next_step:$hint}'
+      '{query:$query,home:$home,recoverable:($rec == "1"),recoverable_reason:$rec_reason,attempt:$attempt,reservations:($res[:-1]),completed_artifacts:($artifacts[:-1]),rounds:($rounds[:-1]),recent_runs:($ledger[:-1]),next_step:$hint}'
     exit 0
   fi
 
@@ -1292,14 +1373,14 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
   if [ -s "$ST_TMP/rounds.jsonl" ] || [ -s "$ST_TMP/rounds.tsv" ]; then
     echo "round history (rolling window $(( ST_WIN / 3600 ))h, ${ST_CAP_DESC}):"
     if pg_have jq && [ -s "$ST_TMP/rounds.jsonl" ]; then
-      jq -r '"  " + .key + ": \(.spent) spent, policy=" + .policy
+      jq -r '"  " + .key + ": \(.spent) spent, policy=" + .policy + " (source " + .policy_source + ")"
              + (if .enforced then ", \(.remaining) enforced remaining" else ", computed grant \(.cap) is advisory" end)
              + "  (\(.spent) rounds; ~" + .elapsed_h + "h recorded across \(.scored) scored round(s))"
              + (if .trajectory then "  (open P0/P1 by round: " + .trajectory + ")" else "" end)
              + (if .churn_braked then "  [CHURN: not converging]" else "" end)
              + (if .in_flight then "  [REVIEW RUNNING NOW]" else "" end)' "$ST_TMP/rounds.jsonl"
     else
-      awk -F'\t' '{printf "  %s: %s spent, policy=%s, computed grant %s  (%s rounds; ~%.1fh recorded across %s scored round(s))%s%s%s\n", $1, $2, $10, $3, $2, ($8+0)/3600, $9, ($6 == "" ? "" : "  (open P0/P1 by round: " $6 ")"), ($7 == 1 ? "  [CHURN: not converging]" : ""), ($5 == 1 ? "  [REVIEW RUNNING NOW]" : "")}' "$ST_TMP/rounds.tsv" 2>/dev/null
+      awk -F'\t' '{printf "  %s: %s spent, policy=%s (source %s), computed grant %s  (%s rounds; ~%.1fh recorded across %s scored round(s))%s%s%s\n", $1, $2, $10, $11, $3, $2, ($8+0)/3600, $9, ($6 == "" ? "" : "  (open P0/P1 by round: " $6 ")"), ($7 == 1 ? "  [CHURN: not converging]" : ""), ($5 == 1 ? "  [REVIEW RUNNING NOW]" : "")}' "$ST_TMP/rounds.tsv" 2>/dev/null
     fi
   else
     echo "round history: nothing spent in the current window for this query"
@@ -2264,10 +2345,14 @@ if [ -n "$HARVEST_MARKER" ]; then
       # skip markers under active collection. Without it the harvest target could never expire
       # and #67's "a stranded change frees itself" property died for the very marker it was
       # written for. Done while we still hold the harvest lock, so no peer races the decision.
-      if [ "${PRO_GATE_HARVEST_TTL_SWEEP:-1}" = 1 ] && [ -n "$(pg_reservation_expire_if_stale "$RUN_MARKER")" ]; then
-        echo "ERROR: this reservation is past its ${PRO_GATE_RESERVATION_TTL:-21600}s TTL and its conversation still cannot be bound to this run — releasing it so the change is no longer blocked. The set-aside capture is at $OUT.unbound.$$; a fresh review may now be run." >&2
-        pg_status failed "unbindable past TTL; reservation released (change unblocked)"
-        pg_finish 6
+      if [ "${PRO_GATE_HARVEST_TTL_SWEEP:-1}" = 1 ] && [ "$(pg_reservation_expire_if_stale "$RUN_MARKER")" = stale ]; then
+        TTL_MISS="$(pg_reservation_note_miss "$RUN_MARKER")"
+        if [ "$TTL_MISS" = released ]; then
+          echo "ERROR: this reservation is past its ${PRO_GATE_RESERVATION_TTL:-21600}s TTL and bounded marker probes proved no recoverable conversation. Recovery is exhausted; the round remains charged and a fresh typed review is eligible. The set-aside capture is at $OUT.unbound.$$." >&2
+          pg_status failed "recovery exhausted after TTL and confirmed marker misses; round retained"
+          pg_finish 6
+        fi
+        echo "[oracle-review] past-TTL recovery remains fail-closed until confirmed marker misses reach the threshold (${TTL_MISS})." >&2
       fi
       echo "ERROR: harvested a complete review that cannot be bound to this run (no run-marker echo — possibly an older answer while the current one is still generating). Reservation and candidate kept. Retry --harvest; inspect $OUT.unbound.$$; PRO_GATE_REQUIRE_NONCE=0 accepts best-effort captures." >&2
       pg_status in-progress "harvested review unbindable (no nonce echo); reservation kept, retry"
@@ -2765,6 +2850,13 @@ find "$(dirname "$LOCKFILE")" -maxdepth 1 -name "$(basename "$LOCKFILE").pr-*" -
 find "${PRO_GATE_HARVEST_LOCK_DIR:-$PRO_GATE_HOME/harvest-locks}" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
 find "$(pg_active_dir)" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
 find "$(pg_manifest_dir)" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
+# Terminal dispositions survive long enough to make cleanup idempotent across both existing
+# recovery clocks, then retire through ordinary housekeeping. No new retention knob or service.
+_DISP_RET_SECS="$(pg_round_window_secs)"; _DISP_TTL="${PRO_GATE_RESERVATION_TTL:-21600}"
+case "$_DISP_TTL" in ''|*[!0-9]*) _DISP_TTL=21600;; esac
+[ "$_DISP_TTL" -gt "$_DISP_RET_SECS" ] && _DISP_RET_SECS="$_DISP_TTL"
+_DISP_RET_MIN=$(( (_DISP_RET_SECS + 59) / 60 ))
+find "$(pg_attempt_disposition_dir)" -maxdepth 1 -type f -mmin "+${_DISP_RET_MIN}" -delete 2>/dev/null || true
 # #50 item 4: conversation-urls memos get the same time-based hygiene as every other state
 # dir. 14 days dwarfs every recovery window (reservation TTL 6h; pending/ holds real bytes)
 # while still covering late manual recovery of a weeks-old run.

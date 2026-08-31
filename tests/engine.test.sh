@@ -173,6 +173,19 @@ check 'completed reservation survives as a harvest pointer' "$([ -f "$TDIR/home/
 check 'completed reservation keeps its out path' "$(awk -F'\t' 'NR==1{exit !($2 != "")}' "$TDIR/home/in-progress/$MARKER"; echo $?)" "$(cat "$TDIR/home/in-progress/$MARKER")"
 check 'completed reservation stops consuming a slot' "$([ "$(PRO_GATE_HOME="$TDIR/home" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_slot_plan 1" | cut -d'|' -f3)" = 1 ]; echo $?)" "plan=$(PRO_GATE_HOME="$TDIR/home" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_slot_plan 1")"
 
+INFRA_HOME="$TDIR/home-probe-infrastructure"; INFRA_KEY=acme-infra-97
+INFRA_MARKER='pg-run-acme-infra-97-1700000009-97'; INFRA_EPOCH=1700000009
+mkdir -p "$INFRA_HOME/in-progress" "$INFRA_HOME/run-meta" "$INFRA_HOME/rounds"
+printf '%s\n' "$INFRA_EPOCH" > "$INFRA_HOME/rounds/$INFRA_KEY"
+printf 'github.com\tacme\tinfra\t%s\t97\t/tmp/infra.md\t%s\n' "$INFRA_KEY" "$INFRA_EPOCH" > "$INFRA_HOME/run-meta/$INFRA_MARKER"
+printf '%s\t/tmp/infra.md\t%s\t0\t\t\t%s\n' "$INFRA_KEY" "$(date +%s)" "$INFRA_EPOCH" > "$INFRA_HOME/in-progress/$INFRA_MARKER"
+printf 'run marker: %s\nA network error occurred\n' "$INFRA_MARKER" > "$TDIR/tab.txt"
+PRO_GATE_HOME="$INFRA_HOME" PRO_GATE_RECONCILE_INTERVAL=0 bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_reconcile '$HERE/../bin/cdp-salvage.mjs' '$PORT'"
+check 'reservation probe terminalizes exact-owned infrastructure error' \
+  "$([ ! -e "$INFRA_HOME/in-progress/$INFRA_MARKER" ] && [ ! -e "$INFRA_HOME/run-meta/$INFRA_MARKER" ] \
+     && [ -s "$INFRA_HOME/rounds/$INFRA_KEY" ] && jq -e '.terminal_kind=="submitted-terminal"' "$INFRA_HOME/attempt-dispositions/$INFRA_MARKER" >/dev/null 2>&1; echo $?)" \
+  "disposition=$(cat "$INFRA_HOME/attempt-dispositions/$INFRA_MARKER" 2>/dev/null)"
+
 echo '# marker validation'
 run_engine --harvest 'pg-run-../../../etc/passwd' --out "$TDIR/o-trav.md" --timeout 5s
 check 'traversal marker rejected with exit 2' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC"
@@ -507,7 +520,7 @@ PRO_GATE_HOME="$TDIR/home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO
   PRO_GATE_RESERVATION_MISSES=2 bash "$ENGINE" --harvest "$MARKER3" --out "$TDIR/o-miss.md" --timeout 4s \
   >"$TDIR/stdout" 2>"$TDIR/stderr"
 RC=$?
-check 'miss limit releases reservation (exit 6)' "$([ "$RC" -eq 6 ] && [ ! -f "$TDIR/home/in-progress/$MARKER3" ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
+check 'miss limit without canonical run-meta stays fail-closed' "$([ "$RC" -eq 9 ] && [ -f "$TDIR/home/in-progress/$MARKER3" ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
 
 echo '# primary run: hard cap -> live probe -> final salvage -> exit 9'
 # Fake oracle emits the submission evidence, updates the mock tab to carry the engine-generated
@@ -1709,8 +1722,8 @@ env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT=65530 PRO_GATE_SELF_HEAL=0 NODE_O
   bash "$ENGINE" --recover 'https://github.com/acme/widgets/pull/103' --out "$RHOME/recovered-prior-103.md" \
   >"$TDIR/stdout" 2>"$TDIR/recover.stderr"
 RC=$?
-check 'recover ignores refunded attempt and returns the prior charged artifact' \
-  "$([ "$RC" -eq 0 ] && cmp -s "$RHOME/completed/$CF_PRIOR" "$TDIR/stdout" && grep -qx 'Review ready' "$TDIR/recover.stderr"; echo $?)" \
+check 'recover selects the newer refunded attempt instead of returning an older artifact' \
+  "$([ "$RC" -eq 6 ] && [ ! -s "$TDIR/stdout" ] && grep -qx 'No review remains' "$TDIR/recover.stderr"; echo $?)" \
   "rc=$RC stderr=$(cat "$TDIR/recover.stderr")"
 check 'cloudflare failure never invokes organizer mode' "$(! grep -q -- '--organize' "$TDIR/node-args-cloudflare.log"; echo $?)" "$(cat "$TDIR/node-args-cloudflare.log" 2>/dev/null)"
 rm -f "$RHOME/throttle.cooldown"
@@ -1794,7 +1807,7 @@ check '--status names the reservation marker' "$(grep -q "$SMARKER" "$TDIR/st.ou
 check '--status leads to a free harvest' "$(grep -q "FREE" "$TDIR/st.out" && grep -q -- "--harvest '$SMARKER'" "$TDIR/st.out"; echo $?)" "$(grep -i harvest "$TDIR/st.out")"
 # Round scoring remains visible, but ordinary unset configuration is advisory.
 check '--status reports spent rounds and advisory computed grant' \
-  "$(grep -q '2 spent, policy=advisory, computed grant 3 is advisory' "$TDIR/st.out"; echo $?)" "$(grep spent "$TDIR/st.out")"
+  "$(grep -q '2 spent, policy=advisory (source default), computed grant 3 is advisory' "$TDIR/st.out"; echo $?)" "$(grep spent "$TDIR/st.out")"
 check '--status reports rounds used and total wall clock' \
   "$(grep -q '2 rounds; ~2.0h recorded across 2 scored round(s)' "$TDIR/st.out"; echo $?)" "$(grep spent "$TDIR/st.out")"
 check '--status writes nothing' "$([ ! -f "$SHOME/ledger.jsonl.tmp" ] && [ "$(wc -l < "$SHOME/ledger.jsonl")" -eq 1 ]; echo $?)" 'state mutated'
@@ -1816,7 +1829,7 @@ fi
 mkdir -p "$SHOME/crossbound"; printf '2026-01-01T00:00:00Z\thttps://chatgpt.com/c/x\tpg-run-other-9-1-1\n' > "$SHOME/crossbound/$SMARKER"
 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 >"$TDIR/st-stuck.out" 2>/dev/null
 check '--status flags a convicted cross-bind as STUCK' "$(grep -q 'STUCK' "$TDIR/st-stuck.out"; echo $?)" "$(cat "$TDIR/st-stuck.out")"
-check '--status warns against REQUIRE_NONCE=0 on a cross-bind' "$(grep -q 'Do NOT set PRO_GATE_REQUIRE_NONCE=0' "$TDIR/st-stuck.out"; echo $?)" "$(grep -i 'nonce' "$TDIR/st-stuck.out")"
+check '--status warns against REQUIRE_NONCE=0 on a cross-bind' "$(grep -q 'PRO_GATE_REQUIRE_NONCE=0' "$TDIR/st-stuck.out" && grep -q 'Do NOT' "$TDIR/st-stuck.out"; echo $?)" "$(grep -i 'nonce' "$TDIR/st-stuck.out")"
 if command -v jq >/dev/null 2>&1; then
   PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 --json >"$TDIR/st-stuck.json" 2>/dev/null
   check '--status --json: cross-bound state' \
@@ -1840,9 +1853,9 @@ check 'note_miss still incremented the streak' \
   "$([ "$(awk -F'\t' 'NR==1{print $4}' "$MHOME/in-progress/$MMARK")" = 1 ]; echo $?)" \
   "record: $(tr '\t' '|' < "$MHOME/in-progress/$MMARK")"
 
-# #67: --harvest must apply reservation TTL, so a stranded change is not blocked forever (the
-# fresh-run path is redirected to the reservation before it can submit, so if the harvest path
-# cannot expire it either, both exits are closed — pushbot#1334 lost its review that way).
+# TTL is a precondition for bounded recovery exhaustion, never terminal proof by itself. Harvest
+# and reconciliation retain past-TTL reservations until confirmed marker misses can bind a terminal
+# disposition to canonical charged run metadata.
 THOME="$TDIR/home-harvestttl"; mkdir -p "$THOME/in-progress"
 # A past-TTL reservation for a DIFFERENT marker is swept while harvesting this one — that is
 # the point of the sweep: a change stranded by an unbindable reservation frees itself instead
@@ -1855,8 +1868,8 @@ printf 'otherkey\t%s/oX.md\t%s\t0\t\t\t\n' "$THOME" "$(( $(date +%s) - 30000 ))"
 printf 'no tabs\n' > "$TDIR/tab.txt"; start_mock "$TDIR/tab.txt"
 env PRO_GATE_HOME="$THOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 NODE_OPTIONS= \
   bash "$ENGINE" --harvest "$TMARK" --out "$THOME/o.md" --timeout 15s >"$TDIR/stdout" 2>"$TDIR/stderr" || true
-check 'harvest expires OTHER past-TTL reservations (frees stranded changes)' \
-  "$([ ! -f "$THOME/in-progress/$OTHER_STALE" ]; echo $?)" "$(ls "$THOME/in-progress" 2>/dev/null)"
+check 'harvest retains other past-TTL reservations without confirmed miss proof' \
+  "$([ -f "$THOME/in-progress/$OTHER_STALE" ]; echo $?)" "$(ls "$THOME/in-progress" 2>/dev/null)"
 # An UNEXPIRED reservation must survive the same sweep untouched.
 UMARK="pg-run-ttlkey-1700000003-89"
 printf 'ttlkey\t%s/o2.md\t%s\t0\t\t\t\n' "$THOME" "$(date +%s)" > "$THOME/in-progress/$UMARK"
@@ -1887,37 +1900,56 @@ if command -v flock >/dev/null 2>&1; then
   check 'a foreign reconciler skips an actively-harvested marker' \
     "$([ -f "$THOME/in-progress/$CLAIMED" ]; echo $?)" "$(ls "$THOME/in-progress" 2>/dev/null)"
   wait "$CLAIM_PID" 2>/dev/null
-  # Once the claim is released, the same past-TTL reservation IS reaped.
+  # Once the claim is released, elapsed time alone still cannot terminalize the attempt.
   CLAIMED_RC="$(PRO_GATE_HOME="$THOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_harvest_claimed '$CLAIMED' && echo held || echo free")"
   check 'a released lock reads as unclaimed' "$([ "$CLAIMED_RC" = free ]; echo $?)" "got=$CLAIMED_RC"
   PRO_GATE_HOME="$THOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; PG_RES_TTL_ONLY=1 pg_reservation_reconcile '' 9222" >/dev/null 2>&1
-  check 'an unclaimed past-TTL reservation is still reaped' \
-    "$([ ! -f "$THOME/in-progress/$CLAIMED" ]; echo $?)" "$(ls "$THOME/in-progress" 2>/dev/null)"
+  check 'an unclaimed past-TTL reservation remains without confirmed miss proof' \
+    "$([ -f "$THOME/in-progress/$CLAIMED" ]; echo $?)" "$(ls "$THOME/in-progress" 2>/dev/null)"
 fi
 # #68 gate r3 P1: the TARGET's own expiry. Reconcilers skip claimed markers, so the collector
 # must decide its own target's fate post-capture — otherwise the one marker #67 exists for can
 # never self-clear, and repeatedly following --status's advice loops forever.
 EXPIRED_SELF="pg-run-selfkey-1700000007-93"
 printf 'selfkey\t%s/o5.md\t%s\t0\t\t\t\n' "$THOME" "$(( $(date +%s) - 30000 ))" > "$THOME/in-progress/$EXPIRED_SELF"
-check 'expire_if_stale releases a past-TTL reservation' \
-  "$([ "$(PRO_GATE_HOME="$THOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_expire_if_stale '$EXPIRED_SELF'")" = expired ]; echo $?)" \
+check 'expire_if_stale reports past TTL without releasing the reservation' \
+  "$([ "$(PRO_GATE_HOME="$THOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_expire_if_stale '$EXPIRED_SELF'")" = stale ] && [ -f "$THOME/in-progress/$EXPIRED_SELF" ]; echo $?)" \
   "$(ls "$THOME/in-progress" 2>/dev/null)"
 FRESH_SELF="pg-run-selfkey-1700000008-94"
 printf 'selfkey\t%s/o6.md\t%s\t0\t\t\t\n' "$THOME" "$(date +%s)" > "$THOME/in-progress/$FRESH_SELF"
 check 'expire_if_stale keeps an unexpired reservation' \
   "$([ -z "$(PRO_GATE_HOME="$THOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_expire_if_stale '$FRESH_SELF'")" ] && [ -f "$THOME/in-progress/$FRESH_SELF" ]; echo $?)" \
   "$(ls "$THOME/in-progress" 2>/dev/null)"
+
+EXHAUST_HOME="$TDIR/home-recovery-exhausted"; EXHAUST_KEY=acme-exhausted-96
+EXHAUST_MARKER='pg-run-acme-exhausted-96-1700000010-96'; EXHAUST_EPOCH=1700000010
+mkdir -p "$EXHAUST_HOME/in-progress" "$EXHAUST_HOME/run-meta" "$EXHAUST_HOME/rounds"
+printf '%s\n' "$EXHAUST_EPOCH" > "$EXHAUST_HOME/rounds/$EXHAUST_KEY"
+printf 'github.com\tacme\texhausted\t%s\t96\t/tmp/exhausted.md\t%s\n' "$EXHAUST_KEY" "$EXHAUST_EPOCH" > "$EXHAUST_HOME/run-meta/$EXHAUST_MARKER"
+printf '%s\t/tmp/exhausted.md\t%s\t0\t\t\t%s\n' "$EXHAUST_KEY" "$(( $(date +%s) - 30000 ))" "$EXHAUST_EPOCH" > "$EXHAUST_HOME/in-progress/$EXHAUST_MARKER"
+for _ in 1 2; do PRO_GATE_HOME="$EXHAUST_HOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_note_miss '$EXHAUST_MARKER' >/dev/null"; done
+EXHAUST_RESULT="$(PRO_GATE_HOME="$EXHAUST_HOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_note_miss '$EXHAUST_MARKER'")"
+check 'TTL plus confirmed miss threshold terminalizes recovery exhaustion' \
+  "$([ "$EXHAUST_RESULT" = released ] && [ ! -e "$EXHAUST_HOME/in-progress/$EXHAUST_MARKER" ] \
+     && [ ! -e "$EXHAUST_HOME/run-meta/$EXHAUST_MARKER" ] && [ -s "$EXHAUST_HOME/rounds/$EXHAUST_KEY" ] \
+     && jq -e '.terminal_kind=="recovery-exhausted" and .proof_kind=="bounded-recovery-exhausted"' "$EXHAUST_HOME/attempt-dispositions/$EXHAUST_MARKER" >/dev/null 2>&1; echo $?)" \
+  "result=$EXHAUST_RESULT disposition=$(cat "$EXHAUST_HOME/attempt-dispositions/$EXHAUST_MARKER" 2>/dev/null)"
+EXHAUST_SNAPSHOT="$(PRO_GATE_HOME="$EXHAUST_HOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_attempt_snapshot github.com acme exhausted 96 '$EXHAUST_KEY'")"
+check 'recovery-exhausted snapshot is fresh eligible without refund' \
+  "$(jq -e '.source=="disposition" and .state=="recovery-exhausted" and .fresh_eligible and (.recoverable|not) and .charged_spend_epoch==1700000010' <<<"$EXHAUST_SNAPSHOT" >/dev/null 2>&1; echo $?)" \
+  "$EXHAUST_SNAPSHOT"
+
 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 --json >"$TDIR/st.json" 2>/dev/null; RC=$?
 check '--status --json exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC"
 check '--status --json reservation marker' "$([ "$(jq -r '.reservations[0].marker' "$TDIR/st.json")" = "$SMARKER" ]; echo $?)" "$(cat "$TDIR/st.json")"
 check '--status --json remembered url' "$([ "$(jq -r '.reservations[0].conversation_url' "$TDIR/st.json")" = "https://chatgpt.com/c/abc123" ]; echo $?)" "$(jq -c .reservations "$TDIR/st.json")"
 check '--status --json rounds remaining' "$([ "$(jq -r '.rounds[0].remaining' "$TDIR/st.json")" = 1 ] && [ "$(jq -r '.rounds[0].cap' "$TDIR/st.json")" = 3 ]; echo $?)" "$(jq -c .rounds "$TDIR/st.json")"
 check '--status --json reports default round policy as advisory' \
-  "$([ "$(jq -r '.rounds[0].policy' "$TDIR/st.json")" = advisory ] && [ "$(jq -r '.rounds[0].enforced' "$TDIR/st.json")" = false ]; echo $?)" \
+  "$([ "$(jq -r '.rounds[0].policy' "$TDIR/st.json")" = advisory ] && [ "$(jq -r '.rounds[0].policy_source' "$TDIR/st.json")" = default ] && [ "$(jq -r '.rounds[0].enforced' "$TDIR/st.json")" = false ]; echo $?)" \
   "$(jq -c .rounds "$TDIR/st.json")"
 PRO_GATE_ROUND_GUARD=1 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 --json >"$TDIR/st-enforced.json" 2>/dev/null
 check '--status --json reports explicit round policy as enforced' \
-  "$([ "$(jq -r '.rounds[0].policy' "$TDIR/st-enforced.json")" = enforced ] && [ "$(jq -r '.rounds[0].enforced' "$TDIR/st-enforced.json")" = true ]; echo $?)" \
+  "$([ "$(jq -r '.rounds[0].policy' "$TDIR/st-enforced.json")" = enforced ] && [ "$(jq -r '.rounds[0].policy_source' "$TDIR/st-enforced.json")" = PRO_GATE_ROUND_GUARD ] && [ "$(jq -r '.rounds[0].enforced' "$TDIR/st-enforced.json")" = true ]; echo $?)" \
   "$(jq -c .rounds "$TDIR/st-enforced.json")"
 # #66 gate P2: --status must expose the scored trajectory, not just the numbers.
 printf '%s\tFIX-FIRST\t0\t5\t0\t0\n%s\tFIX-FIRST\t0\t7\t0\t0\n%s\tFIX-FIRST\t0\t8\t0\t0\n' \
@@ -1983,7 +2015,7 @@ rm -f "$SHOME/in-progress/$SMARKER"
 mkdir -p "$SHOME/active"
 printf '%s\t/tmp/pg-native-42.md\t99999999\t%s\tnative\n' "$SMARKER" "$(date +%s)" > "$SHOME/active/acme-widgets-42"
 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 >"$TDIR/st11.out" 2>/dev/null
-check 'native dead wrapper avoids the harvest loop' "$(grep -q 'no harvest path' "$TDIR/st11.out" && ! grep -q -- "--harvest '$SMARKER'" "$TDIR/st11.out"; echo $?)" "$(tail -2 "$TDIR/st11.out")"
+check 'native dead wrapper avoids the harvest loop' "$(grep -q 'no marker-addressed harvest path' "$TDIR/st11.out" && ! grep -q -- "--harvest '$SMARKER'" "$TDIR/st11.out"; echo $?)" "$(tail -2 "$TDIR/st11.out")"
 rm -rf "$SHOME/active"
 printf '42\t/tmp/pg-st-42.md\t%s\t0\t1\tGPT-X\n' "$(date +%s)" > "$SHOME/in-progress/$SMARKER"
 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status not.a.query >/dev/null 2>&1; RC=$?
@@ -4538,6 +4570,15 @@ check 'not-submitted transition refunds and cleans exact mutable state before fr
      && [ ! -e "$FRESH_HOME/rounds/$FRESH_KEY" ] && [ ! -e "$FRESH_HOME/run-meta/$FRESH_TERMINAL_MARKER" ] \
      && [ ! -e "$FRESH_HOME/active/$FRESH_KEY" ] && [ ! -e "$FRESH_HOME/review-input-bindings/$FRESH_TERMINAL_MARKER" ]; echo $?)" \
   "snapshot=$FRESH_TERMINAL_DONE"
+PRO_GATE_HOME="$FRESH_HOME" bash "$ENGINE" --status 77 --json > "$TDIR/fresh-terminal-status.json" 2>/dev/null
+check 'status exposes canonical terminal attempt and fresh eligible next step without contradiction' \
+  "$(jq -e --arg marker "$FRESH_TERMINAL_MARKER" '.recoverable==false and .attempt.marker==$marker and .attempt.state=="not-submitted" and .attempt.fresh_eligible and (.next_step|contains("fresh typed pro-gate review is eligible"))' "$TDIR/fresh-terminal-status.json" >/dev/null 2>&1; echo $?)" \
+  "$(cat "$TDIR/fresh-terminal-status.json")"
+: > "$TDIR/recover-oracle-sentinel"
+recover_run "$FRESH_HOME" --recover 77 --repo "$FRESH_REPO"
+check 'direct PR recovery reports terminal no-review state without browser or fresh dispatch' \
+  "$([ "$RC" -eq 6 ] && [ ! -s "$TDIR/recover.stdout" ] && grep -qx 'No review remains' "$TDIR/recover.stderr" && [ ! -s "$TDIR/recover-oracle-sentinel" ]; echo $?)" \
+  "rc=$RC stdout=$(cat "$TDIR/recover.stdout") stderr=$(cat "$TDIR/recover.stderr")"
 PRO_GATE_HOME="$FRESH_HOME" pg_attempt_terminal_transition github.com acme fresh 77 "$FRESH_KEY" "$FRESH_TERMINAL_MARKER" "$FRESH_TERMINAL_EPOCH" not-submitted proven-no-submit
 check 'terminal transition replay is idempotent and never recreates a refunded round' \
   "$([ ! -e "$FRESH_HOME/rounds/$FRESH_KEY" ] && [ -s "$FRESH_HOME/attempt-dispositions/$FRESH_TERMINAL_MARKER" ]; echo $?)" \
