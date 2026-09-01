@@ -743,7 +743,7 @@ echo '# U2: reservation 6-field format keeps positional readers correct'
 mkdir -p "$TDIR/home-fmt/in-progress"
 MKF="pg-run-fmt-1700000010-88"
 printf 'kF\toF\t%s\t0\t2\tGPT-5.6 Pro\n' "$(date +%s)" > "$TDIR/home-fmt/in-progress/$MKF"
-NOTE="$(PRO_GATE_HOME="$TDIR/home-fmt" PRO_GATE_RESERVATION_MISSES=3 bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_note_miss '$MKF'")"
+NOTE="$(PRO_GATE_HOME="$TDIR/home-fmt" PRO_GATE_RESERVATION_MISSES=3 PRO_GATE_RECONCILE_INTERVAL=0 bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_note_miss '$MKF'")"
 check 'note_miss on 6-field record retains it' "$([ "$NOTE" = 'retained 1/3' ]; echo $?)" "note=$NOTE"
 check 'note_miss increments field 4 (misses)' "$(awk -F'\t' 'NR==1{exit !($4==1)}' "$TDIR/home-fmt/in-progress/$MKF"; echo $?)" "rec=$(cat "$TDIR/home-fmt/in-progress/$MKF")"
 check 'note_miss preserves field 5 (slot)' "$(awk -F'\t' 'NR==1{exit !($5==2)}' "$TDIR/home-fmt/in-progress/$MKF"; echo $?)" "rec=$(cat "$TDIR/home-fmt/in-progress/$MKF")"
@@ -1845,7 +1845,7 @@ rm -rf "$SHOME/crossbound"; rm -f /tmp/pg-st-42.md.unbound.111 /tmp/pg-st-42.md.
 MHOME="$TDIR/home-missfields"; mkdir -p "$MHOME/in-progress"
 MMARK="pg-run-mk-1700000009-7"
 printf 'mk\t/tmp/o.md\t1700000000\t0\t\tGPT-X\t1700005555\n' > "$MHOME/in-progress/$MMARK"
-PRO_GATE_HOME="$MHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_note_miss '$MMARK' >/dev/null"
+PRO_GATE_HOME="$MHOME" PRO_GATE_RECONCILE_INTERVAL=0 bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_note_miss '$MMARK' >/dev/null"
 check 'note_miss preserves the spend epoch (field 7)' \
   "$([ "$(PRO_GATE_HOME="$MHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_read_spend '$MMARK'")" = 1700005555 ]; echo $?)" \
   "record: $(tr '\t' '|' < "$MHOME/in-progress/$MMARK")"
@@ -1930,7 +1930,7 @@ mkdir -p "$EARLY_HOME/in-progress" "$EARLY_HOME/run-meta" "$EARLY_HOME/rounds"
 printf '%s\n' "$EARLY_EPOCH" > "$EARLY_HOME/rounds/$EARLY_KEY"
 printf 'github.com\tacme\tearly\t%s\t95\t/tmp/early.md\t%s\n' "$EARLY_KEY" "$EARLY_EPOCH" > "$EARLY_HOME/run-meta/$EARLY_MARKER"
 printf '%s\t/tmp/early.md\t%s\t0\t\t\t%s\n' "$EARLY_KEY" "$(date +%s)" "$EARLY_EPOCH" > "$EARLY_HOME/in-progress/$EARLY_MARKER"
-for _ in 1 2 3; do EARLY_RESULT="$(PRO_GATE_HOME="$EARLY_HOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_note_miss '$EARLY_MARKER'")"; done
+for _ in 1 2 3; do EARLY_RESULT="$(PRO_GATE_HOME="$EARLY_HOME" PRO_GATE_RECONCILE_INTERVAL=0 bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_note_miss '$EARLY_MARKER'")"; done
 check 'confirmed miss threshold before TTL remains recoverable' \
   "$([ -f "$EARLY_HOME/in-progress/$EARLY_MARKER" ] && [ ! -e "$EARLY_HOME/attempt-dispositions/$EARLY_MARKER" ] && [ "$EARLY_RESULT" != released ]; echo $?)" \
   "result=$EARLY_RESULT record=$(cat "$EARLY_HOME/in-progress/$EARLY_MARKER" 2>/dev/null)"
@@ -1941,8 +1941,8 @@ mkdir -p "$EXHAUST_HOME/in-progress" "$EXHAUST_HOME/run-meta" "$EXHAUST_HOME/rou
 printf '%s\n' "$EXHAUST_EPOCH" > "$EXHAUST_HOME/rounds/$EXHAUST_KEY"
 printf 'github.com\tacme\texhausted\t%s\t96\t/tmp/exhausted.md\t%s\n' "$EXHAUST_KEY" "$EXHAUST_EPOCH" > "$EXHAUST_HOME/run-meta/$EXHAUST_MARKER"
 printf '%s\t/tmp/exhausted.md\t%s\t0\t\t\t%s\n' "$EXHAUST_KEY" "$(( $(date +%s) - 30000 ))" "$EXHAUST_EPOCH" > "$EXHAUST_HOME/in-progress/$EXHAUST_MARKER"
-for _ in 1 2; do PRO_GATE_HOME="$EXHAUST_HOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_note_miss '$EXHAUST_MARKER' >/dev/null"; done
-EXHAUST_RESULT="$(PRO_GATE_HOME="$EXHAUST_HOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_note_miss '$EXHAUST_MARKER'")"
+for _ in 1 2; do PRO_GATE_HOME="$EXHAUST_HOME" PRO_GATE_RECONCILE_INTERVAL=0 bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_note_miss '$EXHAUST_MARKER' >/dev/null"; done
+EXHAUST_RESULT="$(PRO_GATE_HOME="$EXHAUST_HOME" PRO_GATE_RECONCILE_INTERVAL=0 bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_note_miss '$EXHAUST_MARKER'")"
 check 'TTL plus confirmed miss threshold terminalizes recovery exhaustion' \
   "$([ "$EXHAUST_RESULT" = released ] && [ ! -e "$EXHAUST_HOME/in-progress/$EXHAUST_MARKER" ] \
      && [ ! -e "$EXHAUST_HOME/run-meta/$EXHAUST_MARKER" ] && [ -s "$EXHAUST_HOME/rounds/$EXHAUST_KEY" ] \
@@ -3236,6 +3236,67 @@ check 'recover exact artifact prints Review ready only on stderr' \
 check 'recover artifact fast path has no fresh dispatch, status, ledger, round, reservation, or organizer effects' \
   "$([ ! -s "$TDIR/recover-oracle-sentinel" ] && [ "$REC_BEFORE" = "$REC_AFTER" ] && [ ! -e "$TDIR/recover-out.md.status" ]; echo $?)" \
   "oracle=$(cat "$TDIR/recover-oracle-sentinel") before=$REC_BEFORE after=$REC_AFTER"
+
+# v0.37.1 upgrade: canonical run-meta from older runtimes may have no reservation, so no miss
+# counter can advance. One no-spend recover call restores ownership from the original charge and
+# consumes the existing TTL+confirmed-miss proof without launching Oracle or refunding the round.
+LEGACY_HOME="$TDIR/home-legacy-runmeta"; LEGACY_KEY=acme-widgets-43
+LEGACY_MARKER='pg-run-acme-widgets-43-1700001001-13'; LEGACY_EPOCH=1700001001
+mkdir -p "$LEGACY_HOME/run-meta" "$LEGACY_HOME/rounds"
+printf '%s\n' "$LEGACY_EPOCH" > "$LEGACY_HOME/rounds/$LEGACY_KEY"
+printf 'github.com\tacme\twidgets\t%s\t43\t%s\t%s\n' "$LEGACY_KEY" "$TDIR/legacy-recover.md" "$LEGACY_EPOCH" > "$LEGACY_HOME/run-meta/$LEGACY_MARKER"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"; start_mock "$TDIR/tab.txt"
+: > "$TDIR/recover-oracle-sentinel"
+env PRO_GATE_HOME="$LEGACY_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RESERVATION_MISSES=2 PRO_GATE_RECONCILE_INTERVAL=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-recover-sentinel" \
+  PG_TEST_RECOVER_ORACLE_SENTINEL="$TDIR/recover-oracle-sentinel" NODE_OPTIONS= \
+  bash "$ENGINE" --recover "$LEGACY_MARKER" >"$TDIR/recover.stdout" 2>"$TDIR/recover.stderr"
+RC=$?
+check 'legacy run-meta recovery terminalizes in one no-spend invocation after bounded misses' \
+  "$([ "$RC" -eq 6 ] && grep -qx 'No review remains' "$TDIR/recover.stderr" && [ ! -s "$TDIR/recover-oracle-sentinel" ] \
+     && [ ! -e "$LEGACY_HOME/in-progress/$LEGACY_MARKER" ] && [ ! -e "$LEGACY_HOME/run-meta/$LEGACY_MARKER" ] \
+     && [ -s "$LEGACY_HOME/rounds/$LEGACY_KEY" ] && jq -e '.terminal_kind=="recovery-exhausted"' "$LEGACY_HOME/attempt-dispositions/$LEGACY_MARKER" >/dev/null 2>&1; echo $?)" \
+  "rc=$RC stderr=$(cat "$TDIR/recover.stderr") disposition=$(cat "$LEGACY_HOME/attempt-dispositions/$LEGACY_MARKER" 2>/dev/null)"
+
+LEGACY_FUTURE_HOME="$TDIR/home-legacy-future"; LEGACY_FUTURE_KEY=acme-widgets-44
+LEGACY_FUTURE_MARKER='pg-run-acme-widgets-44-9999999999-14'; LEGACY_FUTURE_EPOCH=9999999999
+mkdir -p "$LEGACY_FUTURE_HOME/run-meta"
+printf 'github.com\tacme\twidgets\t%s\t44\t%s\t%s\n' "$LEGACY_FUTURE_KEY" "$TDIR/future.md" "$LEGACY_FUTURE_EPOCH" > "$LEGACY_FUTURE_HOME/run-meta/$LEGACY_FUTURE_MARKER"
+RESTORE_FUTURE="$(PRO_GATE_HOME="$LEGACY_FUTURE_HOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_restore_from_meta '$LEGACY_FUTURE_MARKER'")"
+check 'legacy restore preserves a future recorded charge epoch as creation time' \
+  "$([ "$RESTORE_FUTURE" = created ] && [ "$(awk -F'\t' 'NR==1{print $3" "$7}' "$LEGACY_FUTURE_HOME/in-progress/$LEGACY_FUTURE_MARKER")" = "$LEGACY_FUTURE_EPOCH $LEGACY_FUTURE_EPOCH" ]; echo $?)" \
+  "record=$(cat "$LEGACY_FUTURE_HOME/in-progress/$LEGACY_FUTURE_MARKER" 2>/dev/null)"
+FUTURE_MISS="$(PRO_GATE_HOME="$LEGACY_FUTURE_HOME" PRO_GATE_RECONCILE_INTERVAL=0 bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_note_miss '$LEGACY_FUTURE_MARKER'")"
+check 'future charge epoch cannot terminalize before local time catches up plus TTL' \
+  "$([ "$FUTURE_MISS" != released ] && [ -f "$LEGACY_FUTURE_HOME/in-progress/$LEGACY_FUTURE_MARKER" ] && [ ! -e "$LEGACY_FUTURE_HOME/attempt-dispositions/$LEGACY_FUTURE_MARKER" ]; echo $?)" \
+  "result=$FUTURE_MISS"
+
+LEGACY_LINK_HOME="$TDIR/home-legacy-link"; LEGACY_LINK_KEY=acme-widgets-45
+LEGACY_LINK_MARKER='pg-run-acme-widgets-45-1700001002-15'; LEGACY_LINK_TARGET="$TDIR/legacy-link-target"
+mkdir -p "$LEGACY_LINK_HOME/run-meta" "$LEGACY_LINK_HOME/in-progress"; printf 'sentinel\n' > "$LEGACY_LINK_TARGET"
+printf 'github.com\tacme\twidgets\t%s\t45\t%s\t1700001002\n' "$LEGACY_LINK_KEY" "$TDIR/link.md" > "$LEGACY_LINK_HOME/run-meta/$LEGACY_LINK_MARKER"
+ln -s "$LEGACY_LINK_TARGET" "$LEGACY_LINK_HOME/in-progress/$LEGACY_LINK_MARKER"
+PRO_GATE_HOME="$LEGACY_LINK_HOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_restore_from_meta '$LEGACY_LINK_MARKER'" >/dev/null 2>&1; LINK_RC=$?
+check 'legacy restore refuses a symlinked reservation without touching its target' \
+  "$([ "$LINK_RC" -ne 0 ] && [ "$(cat "$LEGACY_LINK_TARGET")" = sentinel ]; echo $?)" \
+  "rc=$LINK_RC target=$(cat "$LEGACY_LINK_TARGET")"
+
+LEGACY_RACE_HOME="$TDIR/home-legacy-race"; LEGACY_RACE_KEY=acme-widgets-46
+LEGACY_RACE_MARKER='pg-run-acme-widgets-46-1700001003-16'; mkdir -p "$LEGACY_RACE_HOME/run-meta"
+printf 'github.com\tacme\twidgets\t%s\t46\t%s\t1700001003\n' "$LEGACY_RACE_KEY" "$TDIR/race.md" > "$LEGACY_RACE_HOME/run-meta/$LEGACY_RACE_MARKER"
+PRO_GATE_HOME="$LEGACY_RACE_HOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_restore_from_meta '$LEGACY_RACE_MARKER'" > "$TDIR/restore-a" & RPA=$!
+PRO_GATE_HOME="$LEGACY_RACE_HOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_restore_from_meta '$LEGACY_RACE_MARKER'" > "$TDIR/restore-b" & RPB=$!
+wait "$RPA"; wait "$RPB"
+check 'concurrent legacy restore has exactly one creator and one idempotent observer' \
+  "$([ "$(sort "$TDIR/restore-a" "$TDIR/restore-b" | tr '\n' ' ')" = 'created existing ' ]; echo $?)" \
+  "a=$(cat "$TDIR/restore-a") b=$(cat "$TDIR/restore-b")"
+touch -t 202001010000 "$LEGACY_RACE_HOME/in-progress/$LEGACY_RACE_MARKER"
+PRO_GATE_HOME="$LEGACY_RACE_HOME" PRO_GATE_RECONCILE_INTERVAL=60 bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_note_miss '$LEGACY_RACE_MARKER'" > "$TDIR/miss-a" & MPA=$!
+PRO_GATE_HOME="$LEGACY_RACE_HOME" PRO_GATE_RECONCILE_INTERVAL=60 bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_note_miss '$LEGACY_RACE_MARKER'" > "$TDIR/miss-b" & MPB=$!
+wait "$MPA"; wait "$MPB"
+check 'concurrent miss calls increment at most once inside one reconcile interval' \
+  "$([ "$(awk -F'\t' 'NR==1{print $4}' "$LEGACY_RACE_HOME/in-progress/$LEGACY_RACE_MARKER")" = 1 ]; echo $?)" \
+  "record=$(cat "$LEGACY_RACE_HOME/in-progress/$LEGACY_RACE_MARKER") a=$(cat "$TDIR/miss-a") b=$(cat "$TDIR/miss-b")"
 
 # Marker-addressed recovery never follows a completed/pending symlink, even when its target contains
 # structurally valid review bytes. The lifecycle selector and exact recovery fast path must agree.

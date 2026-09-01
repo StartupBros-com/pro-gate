@@ -245,7 +245,9 @@ repository proof selects the unique newest charged run. A bare PR without reposi
 multiple repositories, tied candidates, or conflicting ordering returns disambiguation and takes
 no action. Recovery first returns a verified completed artifact and otherwise performs only the
 existing marker harvest; it never dispatches a `--pr` review, creates a new slot, or spends a new
-round. Its plain states are **Review ready**, **Checking for completed review**, **Still working**,
+round. For pre-v0.37 canonical run-meta whose reservation is missing, recovery reconstructs only
+that original charged attempt's reservation and applies the existing TTL plus spaced exact-marker
+miss proof in the same no-spend invocation. Its plain states are **Review ready**, **Checking for completed review**, **Still working**,
 **No review remains**, and **Browser needs attention**. `No review remains` means terminal proof
 released recovery ownership; re-query the typed decision instead of deleting state. A readable or open tab can be stale, so the engine safely
 revalidates the canonical server conversation without changing the source tab.
