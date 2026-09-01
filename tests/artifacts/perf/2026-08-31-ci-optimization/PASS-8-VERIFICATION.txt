@@ -1,0 +1,60 @@
+PASS 8/10 verification — ZERO-CHANGE
+Date: 2026-09-01
+
+Decision
+========
+No test or production behavior was changed. The current partial design scored 0.6
+(Impact 3 × Confidence 1 / Effort 5), below the required 2.0. A fixture-private
+process-event alternative scored 1.6 (4 × 2 / 5) and was also rejected.
+
+tests/engine.test.sh was restored exactly to HEAD before these checks. The existing
+.skill-loop-progress.md modification was not read, edited, reverted, or staged.
+
+Candidate checks and rejections
+================================
+1. Delayed organizer: the generic-sleep wrapper can create an event only by
+   intercepting PATH. Its parent-PID completion assertion is not a durable
+   fixture-owned completion signal, and the wrapper must affect every engine
+   subprocess that invokes sleep.
+2. Organizer join: the partial creates JOIN_BIN wrappers but never prepends JOIN_BIN
+   to PATH. Its runner also never supplies the required PG_TEST_JOIN release,
+   ready, helper-timeout, or trace variables. The proposed barrier is incomplete.
+3. No-flock publication: observing a fallback retry requires direct process-topology
+   assumptions (pgrep/ps command text) or an additional production hook. Releasing
+   at the first observed retry weakens the metadata-overlap assertion; retaining a
+   second retry reintroduces duration-based synchronization.
+4. Complexity: the partial was 201 insertions / 12 deletions; the rejected replacement
+   was 196 insertions / 27 deletions. Neither is a meaningful simplification.
+
+Deterministic budget
+====================
+- Direct fixture waits: 6 s + 3 s + 3 s = 12 s theoretical savings.
+- Related no-flock holder waits: 2 s + 2 s = 4 s raw ceiling.
+- A valid no-flock race retains one 1 s production retry, so the behavior-preserving
+  full ceiling would be about 15 s, not 16 s.
+- Delivered savings: 0 s.
+
+Checks run
+==========
+$ git diff --exit-code -- tests/engine.test.sh
+exit 0 (no output; file matches HEAD)
+
+$ bash -n tests/engine.test.sh
+exit 0 (no output)
+
+$ shellcheck -S error tests/engine.test.sh
+exit 0 (no output)
+
+$ sha256sum -c tests/artifacts/perf/2026-08-31-ci-optimization/golden_checksums.txt
+/home/will/SITES/pro-gate/.claude/worktrees/ci-wait-optimization-114/tests/artifacts/perf/2026-08-31-ci-optimization/engine-all-pass.txt: OK
+
+$ git diff --check
+exit 0 (no output)
+
+The complete foreground golden was not rerun because this is the zero-change branch:
+there is no changed mechanism to repeat and tests/engine.test.sh matches HEAD. The
+captured terminal golden remains checksum-verified above.
+
+Result
+======
+ZERO-CHANGE. Only PASS-8.md and PASS-8-VERIFICATION.txt are new in this pass.
