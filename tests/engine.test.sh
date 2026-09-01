@@ -4621,6 +4621,180 @@ check 'leading-zero recovery effect remains stable without a duplicate spend' \
   "$([ "$FRESH_RC" -eq 0 ] && [ "$(wc -l < "$FRESH_HOME/rounds/$FRESH_KEY")" -eq 1 ] && jq -e --arg marker "$FRESH_UNKNOWN_MARKER" '.action=="recover-existing-review" and .effect_request.applicable_ref==$marker' "$TDIR/fresh.stdout" >/dev/null 2>&1; echo $?)" \
   "rc=$FRESH_RC stdout=$(cat "$TDIR/fresh.stdout") stderr=$(cat "$TDIR/fresh.stderr")"
 
+# A review bound to an older head, or to a PR GitHub proves merged/closed, is obsolete rather than
+# unsubmitted. Exact recovery moves only its reservation to the monotonic non-capacity state; the
+# charge, immutable binding, marker-addressed audit path, and optional harvest all remain durable.
+echo '# v0.37.2: proof-backed superseded review capacity release'
+SUPER_KEY='acme-fresh-77'
+SUPER_GH="$TDIR/bin/gh-superseded"
+SUPER_GH_CALLS="$TDIR/superseded-gh.calls"
+cat > "$SUPER_GH" <<'SUPER_GH_STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${PG_TEST_GH_CALLS:?}"
+case "${PG_TEST_GH_MODE:-ok}" in
+  fail) exit 1 ;;
+  malformed) printf '%s\n' '{not-json'; exit 0 ;;
+  semantic) jq -nc --arg head "${PG_TEST_GH_HEAD:-}" '{state:"UNKNOWN",headRefOid:$head}'; exit 0 ;;
+esac
+jq -nc --arg state "${PG_TEST_GH_STATE:-OPEN}" --arg head "${PG_TEST_GH_HEAD:-}" \
+  '{state:$state,headRefOid:$head}'
+SUPER_GH_STUB
+chmod +x "$SUPER_GH"
+super_seed() { # home marker epoch bound-head
+  local home="$1" marker="$2" epoch="$3" bound_head="$4" binding
+  mkdir -p "$home/in-progress" "$home/run-meta" "$home/rounds"
+  printf '%s\n' "$epoch" > "$home/rounds/$SUPER_KEY"
+  printf 'github.com\tacme\tfresh\t%s\t77\t%s\t%s\n' "$SUPER_KEY" "$TDIR/superseded-audit.md" "$epoch" > "$home/run-meta/$marker"
+  printf '%s\t%s\t%s\t0\t1\tGPT-X\t%s\tgenerating\n' "$SUPER_KEY" "$TDIR/superseded-audit.md" "$(date +%s)" "$epoch" > "$home/in-progress/$marker"
+  binding="$(jq -cS --arg marker "$marker" --arg head "$bound_head" --argjson epoch "$epoch" \
+    '.marker=$marker | .charged_spend_epoch=$epoch | .target.head_oid=$head | .evidence.proof.head_oid=$head | .evidence.identity=("full-pr:" + .evidence.proof.base_oid + ":" + $head)' <<<"$FRESH_BINDING")"
+  PRO_GATE_HOME="$home" pg_review_input_binding_write "$marker" "$binding"
+}
+super_recover() { # home marker mode state current-head
+  local home="$1" marker="$2" mode="$3" state="$4" head="$5"
+  env PRO_GATE_HOME="$home" ORACLE_BROWSER_PORT=65530 PRO_GATE_SELF_HEAL=0 \
+    PRO_GATE_GH_BIN="$SUPER_GH" PG_TEST_GH_CALLS="$SUPER_GH_CALLS" PG_TEST_GH_MODE="$mode" \
+    PG_TEST_GH_STATE="$state" PG_TEST_GH_HEAD="$head" \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-recover-sentinel" PG_TEST_RECOVER_ORACLE_SENTINEL="$TDIR/recover-oracle-sentinel" NODE_OPTIONS= \
+    bash "$ENGINE" --recover "$marker" --timeout 1s >"$TDIR/super.stdout" 2>"$TDIR/super.stderr"
+  RC=$?
+}
+
+SUPER_HEAD_HOME="$TDIR/home-superseded-head"
+SUPER_HEAD_MARKER='pg-run-acme-fresh-77-1700014100-1'
+super_seed "$SUPER_HEAD_HOME" "$SUPER_HEAD_MARKER" 1700014100 "$FRESH_BASE"
+: > "$SUPER_GH_CALLS"; : > "$TDIR/recover-oracle-sentinel"
+super_recover "$SUPER_HEAD_HOME" "$SUPER_HEAD_MARKER" ok OPEN "$FRESH_HEAD"
+check 'exact recovery supersedes an immutable old-head review without browser or Oracle dispatch' \
+  "$([ "$RC" -eq 6 ] && grep -qx 'Review superseded' "$TDIR/super.stderr" \
+     && grep -qF 'pr view 77 --repo github.com/acme/fresh --json state,headRefOid' "$SUPER_GH_CALLS" \
+     && [ "$(awk -F'\t' 'NR==1{print $8}' "$SUPER_HEAD_HOME/in-progress/$SUPER_HEAD_MARKER")" = superseded ] \
+     && [ ! -s "$TDIR/recover-oracle-sentinel" ]; echo $?)" \
+  "rc=$RC state=$(cat "$SUPER_HEAD_HOME/in-progress/$SUPER_HEAD_MARKER") stderr=$(cat "$TDIR/super.stderr")"
+check 'supersession retains the charged round and durable proof event' \
+  "$([ "$(wc -l < "$SUPER_HEAD_HOME/rounds/$SUPER_KEY")" -eq 1 ] \
+     && jq -e --arg marker "$SUPER_HEAD_MARKER" --arg old "$FRESH_BASE" --arg new "$FRESH_HEAD" \
+       'select(.outcome=="superseded" and .marker==$marker and .charge_retained and (.holds_capacity|not) and .proof==("head-moved:"+$old+":"+$new))' \
+       "$SUPER_HEAD_HOME/ledger.jsonl" >/dev/null 2>&1; echo $?)" \
+  "rounds=$(cat "$SUPER_HEAD_HOME/rounds/$SUPER_KEY") ledger=$(cat "$SUPER_HEAD_HOME/ledger.jsonl" 2>/dev/null)"
+SUPER_SNAPSHOT="$(PRO_GATE_HOME="$SUPER_HEAD_HOME" pg_attempt_snapshot github.com acme fresh 77 "$SUPER_KEY")"
+SUPER_PLAN="$(PRO_GATE_HOME="$SUPER_HEAD_HOME" pg_reservation_slot_plan 1)"
+check 'superseded snapshot is fresh-eligible and holds zero capacity while remaining collectable' \
+  "$(jq -e --arg marker "$SUPER_HEAD_MARKER" '.marker==$marker and .source=="reservation" and .state=="superseded" and (.recoverable|not) and .fresh_eligible' <<<"$SUPER_SNAPSHOT" >/dev/null 2>&1 \
+     && [ "$(PRO_GATE_HOME="$SUPER_HEAD_HOME" pg_reservation_holding_count)" -eq 0 ] \
+     && [ "$(PRO_GATE_HOME="$SUPER_HEAD_HOME" pg_reservation_count)" -eq 1 ] \
+     && [ "$SUPER_PLAN" = '1||1' ]; echo $?)" \
+  "snapshot=$SUPER_SNAPSHOT plan=$SUPER_PLAN"
+SUPER_LIVE_MARKER='pg-run-acme-fresh-77-1700014101-9'
+printf '%s\t%s\t%s\t0\t2\tGPT-X\t1700014101\tgenerating\n' "$SUPER_KEY" "$TDIR/superseded-live.md" "$(date +%s)" > "$SUPER_HEAD_HOME/in-progress/$SUPER_LIVE_MARKER"
+printf 'github.com\tacme\tfresh\t%s\t77\t%s\t1700014101\n' "$SUPER_KEY" "$TDIR/superseded-live.md" > "$SUPER_HEAD_HOME/run-meta/$SUPER_LIVE_MARKER"
+SUPER_LIVE_SNAPSHOT="$(PRO_GATE_HOME="$SUPER_HEAD_HOME" pg_attempt_snapshot github.com acme fresh 77 "$SUPER_KEY")"
+check 'a capacity-holding reservation outranks an older audit-only superseded marker' \
+  "$(jq -e --arg marker "$SUPER_LIVE_MARKER" '.marker==$marker and .source=="reservation" and .state=="recoverable" and .recoverable and (.fresh_eligible|not)' <<<"$SUPER_LIVE_SNAPSHOT" >/dev/null 2>&1; echo $?)" \
+  "$SUPER_LIVE_SNAPSHOT"
+rm -f "$SUPER_HEAD_HOME/in-progress/$SUPER_LIVE_MARKER" "$SUPER_HEAD_HOME/run-meta/$SUPER_LIVE_MARKER"
+
+# Every generic mutation seam is monotonic: a still-rendering optional harvest may refresh output,
+# state, or miss bookkeeping, but none can turn obsolete work back into account occupancy.
+PRO_GATE_HOME="$SUPER_HEAD_HOME" pg_reservation_write "$SUPER_HEAD_MARKER" "$SUPER_KEY" "$TDIR/superseded-refreshed.md" 1 GPT-Y 1700014100
+PRO_GATE_HOME="$SUPER_HEAD_HOME" pg_reservation_set_state "$SUPER_HEAD_MARKER" generating
+SUPER_MISS="$(PRO_GATE_HOME="$SUPER_HEAD_HOME" PRO_GATE_RECONCILE_INTERVAL=0 pg_reservation_note_miss "$SUPER_HEAD_MARKER")"
+check 'write, state refresh, and confirmed miss cannot re-arm or delete superseded work' \
+  "$([ "$SUPER_MISS" = 'retained superseded' ] \
+     && [ "$(awk -F'\t' 'NR==1{print $2" "$4" "$8}' "$SUPER_HEAD_HOME/in-progress/$SUPER_HEAD_MARKER")" = "$TDIR/superseded-refreshed.md 0 superseded" ]; echo $?)" \
+  "miss=$SUPER_MISS record=$(cat "$SUPER_HEAD_HOME/in-progress/$SUPER_HEAD_MARKER")"
+
+# Supersession outranks stale cross-bind/unbound sidecars on status and is ignored by current-head
+# typed admission, which can use otherwise-idle ChatGPT capacity for the replacement evidence.
+mkdir -p "$SUPER_HEAD_HOME/crossbound"
+printf 'old cross-bind\n' > "$SUPER_HEAD_HOME/crossbound/$SUPER_HEAD_MARKER"
+: > "$TDIR/superseded-refreshed.md.unbound.1"
+PRO_GATE_HOME="$SUPER_HEAD_HOME" bash "$ENGINE" --status "$SUPER_HEAD_MARKER" --json > "$TDIR/superseded-status.json" 2>/dev/null
+check 'status reports superseded as non-recoverable non-capacity despite stale sidecars' \
+  "$(jq -e --arg marker "$SUPER_HEAD_MARKER" '.recoverable==false and .attempt.marker==$marker and .attempt.state=="superseded" and .attempt.fresh_eligible and .reservations[0].marker==$marker and .reservations[0].state=="superseded-awaiting-optional-harvest" and (.reservations[0].holds_capacity|not) and (.next_step|contains("superseded"))' "$TDIR/superseded-status.json" >/dev/null 2>&1; echo $?)" \
+  "$(cat "$TDIR/superseded-status.json")"
+mkdir -p "$SUPER_HEAD_HOME/active"
+printf '%s\t%s\t99999999\t%s\tremote-chrome\ttoken\tsubmitted\t1700014100\n' \
+  "$SUPER_HEAD_MARKER" "$TDIR/superseded-refreshed.md" "$(date +%s)" > "$SUPER_HEAD_HOME/active/$SUPER_KEY"
+env PRO_GATE_HOME="$SUPER_HEAD_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/fresh-endpoint.patch" \
+  bash "$ENGINE" --review-decision --json --repo "$FRESH_REPO" --pr 77 --diff "$TDIR/fresh-effect.patch" --input bundle \
+  > "$TDIR/superseded-decision.json" 2> "$TDIR/superseded-decision.err"
+SUPER_DECISION_RC=$?
+check 'typed current-head admission ignores superseded ownership and same-marker stale active state' \
+  "$([ "$SUPER_DECISION_RC" -eq 0 ] && jq -e '.action=="run-granted-review" and .facts.reservation.state=="none" and .facts.active_index.state=="none"' "$TDIR/superseded-decision.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$SUPER_DECISION_RC output=$(cat "$TDIR/superseded-decision.json") stderr=$(cat "$TDIR/superseded-decision.err")"
+
+# MERGED and CLOSED are independently sufficient even when the head has not moved.
+for SUPER_TERMINAL_STATE in MERGED CLOSED; do
+  SUPER_TERM_HOME="$TDIR/home-superseded-${SUPER_TERMINAL_STATE,,}"
+  SUPER_TERM_MARKER="pg-run-acme-fresh-77-1700014101-${SUPER_TERMINAL_STATE:0:1}"
+  super_seed "$SUPER_TERM_HOME" "$SUPER_TERM_MARKER" 1700014101 "$FRESH_BASE"
+  super_recover "$SUPER_TERM_HOME" "$SUPER_TERM_MARKER" ok "$SUPER_TERMINAL_STATE" "$FRESH_BASE"
+  check "GitHub $SUPER_TERMINAL_STATE proof supersedes a same-head review" \
+    "$([ "$RC" -eq 6 ] && [ "$(awk -F'\t' 'NR==1{print $8}' "$SUPER_TERM_HOME/in-progress/$SUPER_TERM_MARKER")" = superseded ] \
+       && jq -e --arg proof "pr-${SUPER_TERMINAL_STATE,,}" 'select(.proof==$proof)' "$SUPER_TERM_HOME/ledger.jsonl" >/dev/null 2>&1; echo $?)" \
+    "rc=$RC state=$(cat "$SUPER_TERM_HOME/in-progress/$SUPER_TERM_MARKER") ledger=$(cat "$SUPER_TERM_HOME/ledger.jsonl" 2>/dev/null)"
+done
+
+# Unavailable GitHub or unavailable immutable binding is inconclusive. Both remain generating and
+# enter ordinary fail-closed browser recovery; the missing-binding case never calls GitHub at all.
+SUPER_FAIL_HOME="$TDIR/home-superseded-gh-fail"
+SUPER_FAIL_MARKER='pg-run-acme-fresh-77-1700014102-2'
+super_seed "$SUPER_FAIL_HOME" "$SUPER_FAIL_MARKER" 1700014102 "$FRESH_BASE"
+: > "$SUPER_GH_CALLS"
+super_recover "$SUPER_FAIL_HOME" "$SUPER_FAIL_MARKER" fail OPEN "$FRESH_HEAD"
+check 'GitHub proof failure stays generating and fail-closed' \
+  "$([ "$RC" -eq 3 ] && [ -s "$SUPER_GH_CALLS" ] \
+     && [ "$(awk -F'\t' 'NR==1{print $8}' "$SUPER_FAIL_HOME/in-progress/$SUPER_FAIL_MARKER")" = generating ]; echo $?)" \
+  "rc=$RC state=$(cat "$SUPER_FAIL_HOME/in-progress/$SUPER_FAIL_MARKER") stderr=$(cat "$TDIR/super.stderr")"
+: > "$SUPER_GH_CALLS"
+super_recover "$SUPER_FAIL_HOME" "$SUPER_FAIL_MARKER" malformed OPEN "$FRESH_HEAD"
+check 'malformed GitHub response stays generating and fail-closed' \
+  "$([ "$RC" -eq 3 ] && [ -s "$SUPER_GH_CALLS" ] \
+     && [ "$(awk -F'\t' 'NR==1{print $8}' "$SUPER_FAIL_HOME/in-progress/$SUPER_FAIL_MARKER")" = generating ]; echo $?)" \
+  "rc=$RC state=$(cat "$SUPER_FAIL_HOME/in-progress/$SUPER_FAIL_MARKER") stderr=$(cat "$TDIR/super.stderr")"
+: > "$SUPER_GH_CALLS"
+super_recover "$SUPER_FAIL_HOME" "$SUPER_FAIL_MARKER" semantic OPEN "$FRESH_HEAD"
+check 'unknown GitHub state with a valid different head cannot supersede' \
+  "$([ "$RC" -eq 3 ] && [ -s "$SUPER_GH_CALLS" ] \
+     && [ "$(awk -F'\t' 'NR==1{print $8}' "$SUPER_FAIL_HOME/in-progress/$SUPER_FAIL_MARKER")" = generating ]; echo $?)" \
+  "rc=$RC state=$(cat "$SUPER_FAIL_HOME/in-progress/$SUPER_FAIL_MARKER") stderr=$(cat "$TDIR/super.stderr")"
+: > "$SUPER_GH_CALLS"
+super_recover "$SUPER_FAIL_HOME" "$SUPER_FAIL_MARKER" ok OPEN a
+check 'short hex GitHub head is malformed and cannot supersede' \
+  "$([ "$RC" -eq 3 ] && [ -s "$SUPER_GH_CALLS" ] \
+     && [ "$(awk -F'\t' 'NR==1{print $8}' "$SUPER_FAIL_HOME/in-progress/$SUPER_FAIL_MARKER")" = generating ]; echo $?)" \
+  "rc=$RC state=$(cat "$SUPER_FAIL_HOME/in-progress/$SUPER_FAIL_MARKER") stderr=$(cat "$TDIR/super.stderr")"
+SUPER_SAME_HOME="$TDIR/home-superseded-same-head"
+SUPER_SAME_MARKER='pg-run-acme-fresh-77-1700014105-5'
+super_seed "$SUPER_SAME_HOME" "$SUPER_SAME_MARKER" 1700014105 "$FRESH_BASE"
+super_recover "$SUPER_SAME_HOME" "$SUPER_SAME_MARKER" ok OPEN "$FRESH_BASE"
+check 'open PR at the exact bound head remains generating' \
+  "$([ "$RC" -eq 3 ] \
+     && [ "$(awk -F'\t' 'NR==1{print $8}' "$SUPER_SAME_HOME/in-progress/$SUPER_SAME_MARKER")" = generating ]; echo $?)" \
+  "rc=$RC state=$(cat "$SUPER_SAME_HOME/in-progress/$SUPER_SAME_MARKER") stderr=$(cat "$TDIR/super.stderr")"
+SUPER_NOBIND_HOME="$TDIR/home-superseded-no-binding"
+SUPER_NOBIND_MARKER='pg-run-acme-fresh-77-1700014103-3'
+super_seed "$SUPER_NOBIND_HOME" "$SUPER_NOBIND_MARKER" 1700014103 "$FRESH_BASE"
+rm -f "$SUPER_NOBIND_HOME/review-input-bindings/$SUPER_NOBIND_MARKER"
+: > "$SUPER_GH_CALLS"
+super_recover "$SUPER_NOBIND_HOME" "$SUPER_NOBIND_MARKER" ok MERGED "$FRESH_HEAD"
+check 'missing immutable binding stays generating without consulting GitHub' \
+  "$([ "$RC" -eq 3 ] && [ ! -s "$SUPER_GH_CALLS" ] \
+     && [ "$(awk -F'\t' 'NR==1{print $8}' "$SUPER_NOBIND_HOME/in-progress/$SUPER_NOBIND_MARKER")" = generating ]; echo $?)" \
+  "rc=$RC calls=$(cat "$SUPER_GH_CALLS") state=$(cat "$SUPER_NOBIND_HOME/in-progress/$SUPER_NOBIND_MARKER")"
+SUPER_CROSS_HOME="$TDIR/home-superseded-cross-binding"
+SUPER_CROSS_MARKER='pg-run-acme-fresh-77-1700014104-4'
+super_seed "$SUPER_CROSS_HOME" "$SUPER_CROSS_MARKER" 1700014104 "$FRESH_BASE"
+jq -cS '.repository.repo="other"' "$SUPER_CROSS_HOME/review-input-bindings/$SUPER_CROSS_MARKER" > "$SUPER_CROSS_HOME/review-input-bindings/$SUPER_CROSS_MARKER.cross"
+mv "$SUPER_CROSS_HOME/review-input-bindings/$SUPER_CROSS_MARKER.cross" "$SUPER_CROSS_HOME/review-input-bindings/$SUPER_CROSS_MARKER"
+: > "$SUPER_GH_CALLS"
+super_recover "$SUPER_CROSS_HOME" "$SUPER_CROSS_MARKER" ok MERGED "$FRESH_HEAD"
+check 'valid-but-crossed repository binding cannot supersede another canonical attempt' \
+  "$([ "$RC" -eq 3 ] && [ ! -s "$SUPER_GH_CALLS" ] \
+     && [ "$(awk -F'\t' 'NR==1{print $8}' "$SUPER_CROSS_HOME/in-progress/$SUPER_CROSS_MARKER")" = generating ]; echo $?)" \
+  "rc=$RC calls=$(cat "$SUPER_GH_CALLS") binding=$(cat "$SUPER_CROSS_HOME/review-input-bindings/$SUPER_CROSS_MARKER")"
+
 # A terminal disposition is durable proof, not another mutable progress flag. It must outrank stale
 # active/run-meta state after a crash, complete exact cleanup/refund once, and let late review bytes
 # win without changing the disposition.

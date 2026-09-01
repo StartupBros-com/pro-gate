@@ -98,7 +98,9 @@ July 2026). The Pro model spends that long reasoning; the engine is built around
 
 - **Protect the spend.** A Pro slot is scarce: every exit either produced a review, spent
   nothing, or left a recoverable reservation. A run that dies mid-generation keeps its
-  conversation reachable for 6 h so `--harvest` can collect it.
+  conversation reachable for 6 h so `--harvest` can collect it. If immutable proof later shows
+  that review targets an old head or merged/closed PR, it remains charged and optionally
+  collectable but stops occupying capacity.
 - **Fail closed, recover explicitly.** A plugin/runtime version skew blocks the run.
   Captures must echo the run's nonce. Unverifiable results are surfaced for manual
   recovery, never guessed at.
@@ -247,10 +249,15 @@ no action. Recovery first returns a verified completed artifact and otherwise pe
 existing marker harvest; it never dispatches a `--pr` review, creates a new slot, or spends a new
 round. For pre-v0.37 canonical run-meta whose reservation is missing, recovery reconstructs only
 that original charged attempt's reservation and applies the existing TTL plus spaced exact-marker
-miss proof in the same no-spend invocation. Its plain states are **Review ready**, **Checking for completed review**, **Still working**,
-**No review remains**, and **Browser needs attention**. `No review remains` means terminal proof
-released recovery ownership; re-query the typed decision instead of deleting state. A readable or open tab can be stale, so the engine safely
-revalidates the canonical server conversation without changing the source tab.
+miss proof in the same no-spend invocation. Before browser recovery, an immutable input binding plus
+GitHub `MERGED`/`CLOSED` state or a different current head can move the reservation to `superseded`:
+the charge, marker, URL, and optional audit harvest remain, while capacity and current-head ownership
+are released. Missing or malformed binding/GitHub proof leaves the review generating. Its plain states
+are **Review ready**, **Checking for completed review**, **Still working**, **Review superseded**,
+**No review remains**, and **Browser needs attention**. `Review superseded` means old-head or closed-PR
+proof released capacity without refunding; `No review remains` means terminal proof released recovery
+ownership. Re-query the typed decision instead of deleting state. A readable or open tab can be stale,
+so the engine safely revalidates the canonical server conversation without changing the source tab.
 
 Use direct `--status --json` and direct `--harvest` above for expert automation or degradation
 diagnosis; ordinary callers should use `/pro-gate recover` instead.
@@ -264,7 +271,7 @@ diagnosis; ordinary callers should use `/pro-gate recover` instead.
 | 3 | Oracle/browser/CDP failure; run state kept | no |
 | 4 | Repo not found | no |
 | 5 | Diff fetch failed | no |
-| 6 | No usable review. Check `detail`/`attempt`: recoverable work must be harvested; `not-submitted` was refunded; `submitted-terminal` or `recovery-exhausted` remains charged but permits a fresh typed decision | maybe |
+| 6 | No usable current review. Check `detail`/`attempt`: recoverable work must be harvested; `not-submitted` was refunded; `submitted-terminal`, `recovery-exhausted`, or `superseded` remains charged but permits a fresh typed decision | maybe |
 | 7 | Per-change lock timeout (another run holds this change) | no |
 | 8 | Deferred: box unfit, low memory, or throttle cooldown; retry later | no |
 | 9 | In-progress: the model was still generating and the tab stays open. `--harvest` by marker; never submit a new review for it | yes |
@@ -367,9 +374,11 @@ it is deliberately neither archived nor closed.
 
 Read `--status --json` before acting. A canonical `attempt` reports one truth: active/recoverable
 work must be collected; `not-submitted` was positively proven and refunded; `submitted-terminal`
-or `recovery-exhausted` retains its charge but no longer owns recovery, so changed/current evidence
-may receive a fresh typed decision. Unknown post-click fate stays recoverable. Never delete state,
-quarantine files, or use a force flag as diagnosis. On a low-memory box, free memory before retrying.
+or `recovery-exhausted` retains its charge but no longer owns recovery; `superseded` retains its
+charge and optional audit harvest but owns neither capacity nor the current head. Those settled states
+let changed/current evidence receive a fresh typed decision. Unknown post-click fate stays recoverable.
+Never delete state, quarantine files, or use a force flag as diagnosis. On a low-memory box, free
+memory before retrying.
 
 ### Exit 3 / CDP unreachable (WSL2/Linux)
 

@@ -129,8 +129,10 @@ contract/corpus mismatch, stop through the update path and never fall back to a 
 ```
 
 Recovery never launches a fresh review. Relay exactly one plain state: **Review ready**,
-**Checking for completed review**, **Still working**, or **Browser needs attention**. Expert
-read-only diagnostics remain available through:
+**Checking for completed review**, **Still working**, **Review superseded**, **No review remains**,
+or **Browser needs attention**. `Review superseded` retains the charge and optional audit harvest but
+releases old-head/closed-PR capacity; `No review remains` is terminal no-review proof. Re-query the
+typed decision after either state. Expert read-only diagnostics remain available through:
 
 ```bash
 "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --status <pr-number|pr-url|marker> --json
