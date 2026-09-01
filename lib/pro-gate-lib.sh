@@ -1131,6 +1131,41 @@ pg_derive_model_warn() {
   esac
 }
 
+pg_reservation_restore_from_meta() { # marker -> restore legacy recovery ownership without spending
+  local marker="$1" meta host owner repo key pr out spend dir f tmp created existing_pr existing_spend
+  meta="$(pg_run_meta_read "$marker" 2>/dev/null || true)"; [ -n "$meta" ] || return 1
+  IFS=$'\t' read -r host owner repo key pr out spend <<<"$meta"
+  pg_canonical_repo_ok "$host" "$owner" "$repo" || return 1
+  pg_round_key_ok "$key" || return 1
+  pr="$(pg_pr_number_normalize "$pr")" || return 1
+  case "$spend" in ''|*[!0-9]*) return 1;; esac
+  dir="$(pg_reservation_dir)"; mkdir -p "$dir" 2>/dev/null || return 1
+  f="$dir/$marker"; pg_reservation_guard_acquire || return 1
+  if [ -e "$f" ] || [ -L "$f" ]; then
+    if [ -f "$f" ] && [ ! -L "$f" ]; then
+      existing_pr="$(awk -F'\t' 'NR==1{print $1}' "$f" 2>/dev/null)"
+      existing_spend="$(awk -F'\t' 'NR==1{print $7}' "$f" 2>/dev/null)"
+      pg_reservation_guard_release
+      if [ "$existing_pr" = "$key" ] && [ "$existing_spend" = "$spend" ]; then echo existing; return 0; fi
+      return 1
+    fi
+    pg_reservation_guard_release
+    return 1
+  fi
+  created="$spend"
+  tmp="$(mktemp "$dir/.${marker}.restore.XXXXXX" 2>/dev/null || true)"
+  if [ -n "$tmp" ] && [ -f "$tmp" ] && [ ! -L "$tmp" ] \
+     && printf '%s\t%s\t%s\t0\t\t\t%s\tgenerating\n' "$key" "$out" "$created" "$spend" > "$tmp" 2>/dev/null \
+     && mv -f "$tmp" "$f" 2>/dev/null; then
+    pg_reservation_guard_release
+    echo created
+    return 0
+  fi
+  [ -z "$tmp" ] || rm -f "$tmp" 2>/dev/null || true
+  pg_reservation_guard_release
+  return 1
+}
+
 pg_reservation_remove() { # marker
   local marker="$1" dir
   pg_reservation_marker_ok "$marker" || return 0
@@ -1153,6 +1188,15 @@ pg_reservation_note_miss() {
   dir="$(pg_reservation_dir)"; f="$dir/$marker"
   pg_reservation_guard_acquire || { echo "retained 0/$miss_limit"; return 0; }
   if [ ! -f "$f" ]; then pg_reservation_guard_release; echo released; return 0; fi
+  # Every miss source shares the same wall-clock spacing. This check runs under the reservation
+  # guard so concurrent harvest/recover/reconcile callers cannot compress one absence window into
+  # the full terminal threshold.
+  local interval mt now
+  interval="${PRO_GATE_RECONCILE_INTERVAL:-60}"; case "$interval" in ''|*[!0-9]*) interval=60;; esac
+  mt="$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)"; now="$(date +%s)"
+  if [ "$(( now - mt ))" -lt "$interval" ] 2>/dev/null; then
+    pg_reservation_guard_release; echo "retained interval/$miss_limit"; return 0
+  fi
   # Per-field awk, and ALL SEVEN fields (#68 gate P1): `read` collapses consecutive tabs, and
   # a 6-field rewrite silently erased the v0.31 spend epoch on the first confirmed miss —
   # which then forced a later harvest onto the marker-time fallback and corrupted round

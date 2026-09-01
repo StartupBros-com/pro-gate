@@ -788,6 +788,38 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
     exit 6
   fi
 
+  # v0.37.1 upgrade compatibility: pre-disposition releases can leave canonical charged run-meta
+  # after their reservation disappeared. Restore only that marker's original recovery ownership;
+  # no new round, slot, model, or timestamp is invented. Existing recovery then owns all proof.
+  REC_RESTORED=0; REC_RESTORE_STATE=""
+  if [ ! -f "$(pg_reservation_dir)/$REC_SELECTED" ] \
+     && [ -n "$(pg_run_meta_read "$REC_SELECTED" 2>/dev/null || true)" ]; then
+    REC_RESTORE_STATE="$(pg_reservation_restore_from_meta "$REC_SELECTED" 2>/dev/null || true)"
+    case "$REC_RESTORE_STATE" in created) REC_RESTORED=1;; existing) :;; *) echo "Browser needs attention" >&2; exit 3;; esac
+  fi
+  if [ "$REC_RESTORED" = 1 ] && [ "${PRO_GATE_HARVEST_TTL_SWEEP:-1}" = 1 ] \
+     && [ "$(pg_reservation_expire_if_stale "$REC_SELECTED")" = stale ] \
+     && command -v node >/dev/null 2>&1; then
+    REC_PROBES="${PRO_GATE_RESERVATION_MISSES:-3}"; case "$REC_PROBES" in ''|*[!0-9]*) REC_PROBES=3;; esac
+    [ "$REC_PROBES" -ge 2 ] 2>/dev/null || REC_PROBES=2
+    REC_PROBE_INTERVAL="${PRO_GATE_RECONCILE_INTERVAL:-60}"; case "$REC_PROBE_INTERVAL" in ''|*[!0-9]*) REC_PROBE_INTERVAL=60;; esac
+    REC_PROBE_N=0
+    [ "$REC_PROBE_INTERVAL" -eq 0 ] || sleep "$REC_PROBE_INTERVAL"
+    while [ "$REC_PROBE_N" -lt "$REC_PROBES" ]; do
+      REC_PROBE_N=$(( REC_PROBE_N + 1 )); REC_PROBE_RC=2
+      node "$SELF/cdp-salvage.mjs" --probe "$REC_SELECTED" 10 "${ORACLE_BROWSER_PORT:-9222}" >/dev/null 2>/dev/null; REC_PROBE_RC=$?
+      case "$REC_PROBE_RC" in
+        0) break ;;
+        4)
+          REC_MISS="$(pg_reservation_note_miss "$REC_SELECTED")"
+          if [ "$REC_MISS" = released ]; then echo "No review remains" >&2; exit 6; fi
+          [ "$REC_PROBE_N" -ge "$REC_PROBES" ] || [ "$REC_PROBE_INTERVAL" -eq 0 ] || sleep "$REC_PROBE_INTERVAL"
+          ;;
+        *) break ;;
+      esac
+    done
+  fi
+
   # Exact-marker input does not pass through the candidate scan, so recover its publication path
   # from marker-addressed metadata or the live reservation before choosing a safe local default.
   if [ -z "$REC_SELECTED_OUT" ]; then
