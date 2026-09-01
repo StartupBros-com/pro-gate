@@ -24,6 +24,7 @@ import {
   buildRenameConversationExpression,
   ORGANIZER_MUTATION_LEASE_MS,
 } from '../bin/cdp-organizer-expressions.mjs';
+import { parseTestPollMs, TEST_POLL_MS_MIN, TEST_POLL_MS_MAX } from '../bin/cdp-poll-ms.mjs';
 
 const SALVAGE = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'cdp-salvage.mjs');
 const WS_MAGIC = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
@@ -100,6 +101,9 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
   const mutationExpiries = new Map();
   const revokedMutationTokens = new Set();
   let primaryPolls = 0;
+  let jsonListCalls = 0;   // main poll loop's own /json tab-list count, distinct from pollsByTab
+                           // (per-scratch-tab render count): proves how many times the salvage
+                           // loop actually woke up and re-scanned, independent of any render.
   const server = createServer((req, res) => {
     if (req.url === '/json/version') { res.end(JSON.stringify({ Browser: 'MockChrome/1.0' })); return; }
     if (req.url?.startsWith('/json/new')) {
@@ -124,6 +128,7 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
       return;
     }
     if (req.url === '/json') {
+      jsonListCalls += 1;
       if (opts.hangScratchList && created.some((t) => !closed.includes(t.id))) return;
       const port = server.address().port;
       res.setHeader('content-type', 'application/json');
@@ -272,6 +277,7 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
     created,
     requests,
     ui,
+    get jsonListCalls() { return jsonListCalls; },
     setText: (value) => {
       if (value !== tabText) {
         const closedAt = closed.indexOf('tab1');
@@ -386,6 +392,36 @@ function check(name, cond, detail) {
 }
 
 const MARKER = 'pg-run-test-1234567890-42';
+
+{ // Direct parser boundary coverage (bin/cdp-poll-ms.mjs), called in-process — no spawn. Every
+  // one of these is real production input shape: an unset/empty/malformed
+  // PRO_GATE_TEST_POLL_MS must fall back to cdp-salvage.mjs's own literal 20_000, never this
+  // parser's return value, so `null` here is the only value that preserves that default.
+  check('parseTestPollMs: unset (undefined) is rejected', parseTestPollMs(undefined) === null);
+  check('parseTestPollMs: empty string is rejected', parseTestPollMs('') === null);
+  check('parseTestPollMs: "0" is rejected', parseTestPollMs('0') === null);
+  check('parseTestPollMs: negative is rejected', parseTestPollMs('-50') === null);
+  check('parseTestPollMs: non-numeric is rejected', parseTestPollMs('abc') === null);
+  check('parseTestPollMs: fractional form is rejected', parseTestPollMs('100.5') === null);
+  check('parseTestPollMs: whitespace-padded form is rejected', parseTestPollMs(' 100 ') === null);
+  check('parseTestPollMs: leading-zero form is rejected', parseTestPollMs('0100') === null);
+  check('parseTestPollMs: leading-zero at the minimum is rejected',
+    parseTestPollMs(`0${TEST_POLL_MS_MIN}`) === null);
+  check('parseTestPollMs: a non-string input type is rejected', parseTestPollMs(100) === null);
+  check('parseTestPollMs: below the minimum bound is rejected',
+    parseTestPollMs(String(TEST_POLL_MS_MIN - 1)) === null);
+  check('parseTestPollMs: above the maximum bound is rejected',
+    parseTestPollMs(String(TEST_POLL_MS_MAX + 1)) === null);
+  check('parseTestPollMs: the maximum bound equals production POLL_MS', TEST_POLL_MS_MAX === 20_000);
+  check('parseTestPollMs: the exact minimum bound is honored',
+    parseTestPollMs(String(TEST_POLL_MS_MIN)) === TEST_POLL_MS_MIN);
+  check('parseTestPollMs: the exact maximum bound is honored',
+    parseTestPollMs(String(TEST_POLL_MS_MAX)) === TEST_POLL_MS_MAX);
+  check('parseTestPollMs: a valid mid-range value is honored',
+    parseTestPollMs('5000') === 5_000);
+  check('parseTestPollMs: a valid value can only ever shorten, never extend, the cadence',
+    parseTestPollMs(String(TEST_POLL_MS_MAX)) <= 20_000);
+}
 
 { // still generating: marker matches, no VERDICT -> exit 3, tab NOT closed
   const cdp = await mockCdp(`run marker: ${MARKER}\nReasoning about the diff...`);
@@ -957,6 +993,17 @@ const MARKER = 'pg-run-test-1234567890-42';
 { // gate P1: a URL learned THIS invocation must be usable immediately. The tab matches, then
   // dies (Chrome restart mid-salvage — the exact failure this file exists for). Recovery must
   // engage on the URL just learned, not wait for the next invocation.
+  //
+  // This scenario's decisive exit is reached inside the FIRST scan, through the pre-existing
+  // one-shot revalidateReadableStaleSource() -> freshRenderText() scratch-render path (bounded by
+  // its own untouched 2.5s sampling floor / 25s render budget), which returns a terminal VERDICT
+  // and calls process.exit(0) before the outer loop's POLL_MS sleep is ever reached — confirmed
+  // directly: an isolated A/B run of this exact scenario measured ~2.57-2.58s wall time and
+  // jsonListCalls=2 identically with and without a PRO_GATE_TEST_POLL_MS override (4 consecutive
+  // runs, <15ms spread). So this test intentionally carries NO override — the poll-cadence lever
+  // has nothing to speed up here, and adding one would misrepresent what the test proves. The
+  // 1.5s tab-death mutation and 40s deadline are unrelated to POLL_MS and are left exactly as in
+  // the original fixture.
   const cdp = await mockCdp(`run marker: ${MARKER}\nthinking...`, [], {
     renderText: () => `run marker: ${MARKER}\n[P1] z.ts:1: bug\n  Why: real\nVERDICT: SHIP: ok.`,
   });
@@ -967,6 +1014,36 @@ const MARKER = 'pg-run-test-1234567890-42';
   check('the learned URL is the one re-rendered',
     cdp.created.some((t) => t.url === 'https://chatgpt.com/c/mock-conversation'), `created=${JSON.stringify(cdp.created)}`);
   cdp.stop();
+}
+
+{ // Direct behavior proof for the poll-cadence override itself: a STABLE still-generating
+  // conversation (nothing ever changes) polled at the fastest valid cadence (TEST_POLL_MS_MIN)
+  // must classify identically to the same conversation polled at the production cadence —
+  // repeatedly re-scanning a state that hasn't changed must never flip the verdict. This isolates
+  // the override's own correctness from the timing-race scenario above.
+  const stableText = `run marker: ${MARKER}\nstill reasoning, nothing ever resolves...`;
+  const fastCdp = await mockCdp(stableText);
+  const fastResult = await runSalvage([MARKER, '2'], fastCdp.port, undefined,
+    { PRO_GATE_TEST_POLL_MS: String(TEST_POLL_MS_MIN) });
+  check('rapid polling at the minimum valid cadence still classifies still-generating (exit 3)',
+    fastResult.status === 3, `status=${fastResult.status} stderr=${fastResult.stderr?.slice(0, 300)}`);
+  check('the minimum cadence produced many scans within a short deadline',
+    fastCdp.jsonListCalls >= 5, `jsonListCalls=${fastCdp.jsonListCalls}`);
+  fastCdp.stop();
+
+  const slowCdp = await mockCdp(stableText);
+  const slowResult = await runSalvage([MARKER, '2'], slowCdp.port);   // no override: production cadence
+  check('the same stable state classifies identically without the override (exit 3)',
+    slowResult.status === 3, `status=${slowResult.status} stderr=${slowResult.stderr?.slice(0, 300)}`);
+  // Exactly 2, deterministically, not 1: one main-loop scan (production's 20s cadence never
+  // fires a second poll inside this 2s deadline) plus the pre-existing, unrelated post-loop
+  // "revalidate at the deadline" fetch (still-generating && not seeded, lines ~1472-1487) that
+  // runs before every exit-3 report. Neither call comes from the poll-cadence lever itself; the
+  // invariant this proves is the CONTRAST with the fast override's >=5 scans above, not a literal
+  // single scan.
+  check('production cadence yields far fewer scans than the fast override, not a rapid re-poll',
+    slowCdp.jsonListCalls === 2, `jsonListCalls=${slowCdp.jsonListCalls}`);
+  slowCdp.stop();
 }
 
 { // gate P1: proven SERVER-SIDE liveness must outlive a later empty tab scan. The remembered

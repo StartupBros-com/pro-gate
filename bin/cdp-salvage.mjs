@@ -88,6 +88,7 @@ import {
   buildRenameConversationExpression,
   ORGANIZER_MUTATION_LEASE_MS,
 } from './cdp-organizer-expressions.mjs';
+import { parseTestPollMs } from './cdp-poll-ms.mjs';
 
 const usage = () => {
   console.error('usage: cdp-salvage.mjs [--probe|--close|--sweep-root|--organize [--finalize --result-file <path>] [--accepted-url <url>] [--archive] [--no-rename]] <pr-marker|-> [timeout-secs] [cdp-port]');
@@ -132,7 +133,12 @@ const organize = mode === 'organize';
 const [marker, timeoutSecs = probe || organize ? '30' : '600', port = process.env.ORACLE_CDP_PORT ?? '9222'] = argv;
 if (!marker || argv.length > 3 || !/^\d+$/.test(String(timeoutSecs)) || Number(timeoutSecs) <= 0 || !/^\d+$/.test(String(port))) usage();
 const deadline = Date.now() + Number(timeoutSecs) * 1000;
-const POLL_MS = 20_000;
+// Test-only poll cadence override (see cdp-poll-ms.mjs): the Node test harness may shorten the
+// main wait loop's sleep below its production 20s cadence so fixtures don't burn real wall-clock
+// time waiting for a mocked state change it could otherwise detect within milliseconds. Nothing
+// in production workflow/config ever sets PRO_GATE_TEST_POLL_MS, so a deployed run always gets
+// exactly the literal 20_000 below.
+const POLL_MS = parseTestPollMs(process.env.PRO_GATE_TEST_POLL_MS) ?? 20_000;
 
 const PG_HOME = process.env.PRO_GATE_HOME ?? path.join(os.homedir(), '.pro-review-daemon');
 const BLACKLIST_FILE = path.join(PG_HOME, 'salvage-nonmatching.txt');
