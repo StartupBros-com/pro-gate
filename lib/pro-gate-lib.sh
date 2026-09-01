@@ -1323,6 +1323,38 @@ pg_reservation_slot_plan() {
 # `out` as an argument and would blank the harvest pointer when called without it, and it resets
 # the miss counter. Marking completion must change exactly one thing — whether this review still
 # occupies account capacity — and nothing about how it is later collected (#82).
+# pg_reservation_supersede <marker> <canonical-key> <spend>: exact transition for current and
+# legacy `diff` records. The caller has already bound immutable input + canonical run-meta + GitHub
+# proof; this helper serializes the final compare-and-swap so a concurrent harvest cannot change the
+# record between proof and mutation. Arbitrary key mismatches remain fail-closed.
+pg_reservation_supersede() {
+  local marker="$1" key="$2" expected_spend="$3" dir f rc pr out created misses slot model spend tmp
+  pg_reservation_marker_ok "$marker" || return 1
+  pg_round_key_ok "$key" || return 1
+  case "$expected_spend" in ''|*[!0-9]*) return 1;; esac
+  dir="$(pg_reservation_dir)"; f="$dir/$marker"
+  [ -f "$f" ] && [ ! -L "$f" ] || return 1
+  pg_reservation_guard_acquire || return 1
+  if [ ! -f "$f" ] || [ -L "$f" ]; then pg_reservation_guard_release; return 1; fi
+  pr="$(awk -F'\t' 'NR==1{print $1}' "$f" 2>/dev/null)"
+  out="$(awk -F'\t' 'NR==1{print $2}' "$f" 2>/dev/null)"
+  created="$(awk -F'\t' 'NR==1{print $3}' "$f" 2>/dev/null)"
+  misses="$(awk -F'\t' 'NR==1{print $4}' "$f" 2>/dev/null)"
+  slot="$(awk -F'\t' 'NR==1{print $5}' "$f" 2>/dev/null)"
+  model="$(awk -F'\t' 'NR==1{print $6}' "$f" 2>/dev/null)"
+  spend="$(awk -F'\t' 'NR==1{print $7}' "$f" 2>/dev/null)"
+  case "$pr" in "$key"|diff) ;; *) pg_reservation_guard_release; return 1;; esac
+  [ "$spend" = "$expected_spend" ] || { pg_reservation_guard_release; return 1; }
+  case "$misses" in ''|*[!0-9]*) misses=0;; esac
+  tmp="$(mktemp "$dir/.${marker}.supersede.XXXXXX" 2>/dev/null)" \
+    || { pg_reservation_guard_release; return 1; }
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\tsuperseded\n' \
+    "$key" "$out" "$created" "$misses" "$slot" "$model" "$spend" > "$tmp" 2>/dev/null \
+    && mv -f "$tmp" "$f"
+  rc=$?; [ "$rc" -eq 0 ] || rm -f "$tmp" 2>/dev/null
+  pg_reservation_guard_release; return "$rc"
+}
+
 pg_reservation_set_state() {
   local marker="$1" state="$2" dir f rc pr out created misses slot model spend current tmp
   case "$state" in generating|complete|superseded) ;; *) return 1;; esac

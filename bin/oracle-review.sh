@@ -634,7 +634,8 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
       && [ "$pr" = "$mpr" ] && [ "$binding_epoch" = "$mspend" ] || return 1
     rkey="$(awk -F'\t' 'NR==1{print $1}' "$(pg_reservation_dir)/$marker" 2>/dev/null)"
     rspend="$(awk -F'\t' 'NR==1{print $7}' "$(pg_reservation_dir)/$marker" 2>/dev/null)"
-    [ "$rkey" = "$mkey" ] && [ "$rspend" = "$mspend" ] || return 1
+    case "$rkey" in "$mkey"|diff) ;; *) return 1;; esac
+    [ "$rspend" = "$mspend" ] || return 1
     gh_bin="${PRO_GATE_GH_BIN:-gh}"; command -v "$gh_bin" >/dev/null 2>&1 || return 1
     timeout_bin="${PRO_GATE_TIMEOUT_BIN:-timeout}"
     command -v "$timeout_bin" >/dev/null 2>&1 || return 1
@@ -847,7 +848,9 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
   fi
   REC_SUPERSEDED_PROOF="$(recover_superseded_reason "$REC_SELECTED" 2>/dev/null || true)"
   if [ -n "$REC_SUPERSEDED_PROOF" ]; then
-    pg_reservation_set_state "$REC_SELECTED" superseded \
+    REC_SUPERSEDED_META="$(pg_run_meta_read "$REC_SELECTED" 2>/dev/null || true)"
+    IFS=$'\t' read -r _ _ _ REC_SUPERSEDED_KEY _ _ REC_SUPERSEDED_SPEND <<<"$REC_SUPERSEDED_META"
+    pg_reservation_supersede "$REC_SELECTED" "$REC_SUPERSEDED_KEY" "$REC_SUPERSEDED_SPEND" \
       || { echo "Browser needs attention" >&2; exit 3; }
     REC_SUPERSEDED_EVENT="$(jq -nc --arg ts "$(date +%Y-%m-%dT%H:%M:%S%z)" \
       --arg marker "$REC_SELECTED" --arg proof "$REC_SUPERSEDED_PROOF" \
@@ -1106,8 +1109,14 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
     for f in "$ST_RES_DIR"/pg-run-*; do
       [ -f "$f" ] || continue
       m="$(basename "$f")"
-      r_pr=""; r_out=""; r_created=""; r_miss=""; r_slot=""; r_model=""
-      IFS=$'\t' read -r r_pr r_out r_created r_miss r_slot r_model < "$f" 2>/dev/null || true
+      # Per-field reads preserve empty model/slot columns. `read` collapses consecutive tab
+      # separators, which made field 7+8 appear inside `.model` for legacy empty-model records.
+      r_pr="$(awk -F'\t' 'NR==1{print $1}' "$f" 2>/dev/null)"
+      r_out="$(awk -F'\t' 'NR==1{print $2}' "$f" 2>/dev/null)"
+      r_created="$(awk -F'\t' 'NR==1{print $3}' "$f" 2>/dev/null)"
+      r_miss="$(awk -F'\t' 'NR==1{print $4}' "$f" 2>/dev/null)"
+      r_slot="$(awk -F'\t' 'NR==1{print $5}' "$f" 2>/dev/null)"
+      r_model="$(awk -F'\t' 'NR==1{print $6}' "$f" 2>/dev/null)"
       st_match "$m" "$r_pr" || continue
       case "$r_created" in ''|*[!0-9]*) r_age="";; *) r_age=$(( ST_NOW - r_created ));; esac
       r_life="$(pg_reservation_state "$m" 2>/dev/null || echo generating)"
