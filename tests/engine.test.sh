@@ -1405,38 +1405,115 @@ check 'hard-cap timeout kill never announces a refund' \
 # script falls through, and the pipeline drains as if nothing were wrong, so the assertions below
 # would pass without testing anything. Block on a builtin read against a writer-less fifo instead:
 # no child to kill, no CPU burn, and only KILL ends it (verified: `timeout 3` cannot kill it).
+# CI wait optimization pass 4: a real (non-empty) TERM trap lets the fixture record its own
+# TERM_RECEIVED/RESISTING_AFTER_TERM/DRAIN_TICK event stream to a private file BEFORE the read
+# builtin is interrupted and re-armed with a short timeout — the process still never voluntarily
+# exits (only SIGKILL reaps it), so it is exactly as TERM-resistant as the original empty-trap
+# design, but now records ordered, non-time-based evidence of surviving inside the watchdog's
+# bounded drain window. It also plants a false "provably unsubmitted" session record (the same
+# shape v0.31's refund path trusts) so the charged/no-refund assertions below prove proof
+# revocation defeats that landmine, not merely that nothing crashed.
+# Both timing details below are load-bearing, verified by direct repro (not guessed):
+#   1. `timeout --signal=TERM` relays ONE received TERM as TWO near-simultaneous deliveries to
+#      the child process group (sub-millisecond apart) — the trap below must be reentrant-safe,
+#      so RESISTING_AFTER_TERM is recorded synchronously inside the trap itself, one-shot guarded,
+#      rather than from the main loop noticing a state flag on its next iteration.
+#   2. A plain blocking `read` (no -t) that is interrupted by that back-to-back signal pair never
+#      resumes in this bash — the builtin appears to wedge permanently once a second signal lands
+#      while its trap for the first is still unwinding. The fixture therefore never blocks
+#      indefinitely: it always polls the writer-less fifo with `read -t 1`, both before and after
+#      TERM, so a re-armed 1-second read is the ONLY blocking primitive in play at any time. This
+#      keeps the "no child to kill, no CPU burn, only KILL ends it" property (still no voluntary
+#      exit path) while eliminating the wedge.
 cat > "$TDIR/bin/oracle-term-ignoring" <<'FAKE_TERM_IGNORE'
 #!/usr/bin/env bash
 [ "${1:-}" = session ] && exit 1
-trap '' TERM
+event() { printf '%s\n' "$1" >> "${PG_TEST_TERM_EVENTS:?}"; }
+term_seen=0
+resisting=0
+on_term() {
+  term_seen=1
+  event TERM_RECEIVED
+  if [ "$resisting" -eq 0 ]; then
+    resisting=1
+    event RESISTING_AFTER_TERM
+  fi
+}
+trap on_term TERM
+prompt=""
+while [ $# -gt 0 ]; do case "$1" in -p) prompt="$2"; shift 2;; *) shift;; esac; done
+slug=fake-term-ignoring
+mkdir -p "${ORACLE_HOME_DIR:?}/sessions/$slug"
+# A false no-submit landmine: if proof revocation ever failed, this shape alone would earn a
+# refund (see the v0.31 oracle-dead fixture above). Proving it does NOT is the point.
+jq -cn --arg id "$slug" --arg prompt "$prompt" \
+  '{id:$id,status:"error",options:{prompt:$prompt},browser:{runtime:{promptSubmitted:false}}}' \
+  > "$ORACLE_HOME_DIR/sessions/$slug/meta.json"
 printf '%s\n' "$$" > "${PG_TEST_PRODUCER_PID:?}"
-printf 'Launching browser mode\n'
+ps -o pgid= -p "$$" | tr -d '[:space:]' > "${PG_TEST_PRODUCER_PGID:?}"
+event READY
+printf 'Session: %s\nLaunching browser mode\n' "$slug"
 exec 3<> "${PG_TEST_BLOCK_FIFO:?}"
-read -u 3 -r _
+while :; do
+  read -t 1 -u 3 -r _ || true
+  if [ "$term_seen" -ge 1 ]; then
+    event DRAIN_TICK
+  fi
+done
 FAKE_TERM_IGNORE
 chmod +x "$TDIR/bin/oracle-term-ignoring"
-ORPHAN_HOME="$TDIR/home-orphan"; ORPHAN_PID="$TDIR/orphan-producer.pid"
-ORPHAN_FIFO="$TDIR/orphan-block.fifo"
+ORPHAN_HOME="$TDIR/home-orphan"; ORPHAN_ORACLE="$TDIR/oracle-term-ignoring"
+ORPHAN_PID="$TDIR/orphan-producer.pid"; ORPHAN_PGID="$TDIR/orphan-producer.pgid"
+ORPHAN_EVENTS="$TDIR/orphan-term.events"; ORPHAN_FIFO="$TDIR/orphan-block.fifo"
 RKEY_924="$(printf '%s-924' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
-mkdir -p "$ORPHAN_HOME"; : > "$ORPHAN_PID"; rm -f "$ORPHAN_FIFO"; mkfifo "$ORPHAN_FIFO"
+mkdir -p "$ORPHAN_HOME" "$ORPHAN_ORACLE"; : > "$ORPHAN_PID"; : > "$ORPHAN_PGID"; : > "$ORPHAN_EVENTS"
+rm -f "$ORPHAN_FIFO"; mkfifo "$ORPHAN_FIFO"
 printf 'foreign idle tab\n' > "$TDIR/tab.txt"
-env PRO_GATE_HOME="$ORPHAN_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+# The drain/settle windows are shortened here ONLY (pass 4's test-only helpers); production
+# retains 30/5. Signal targets, trap grace, kill-after, wait/reap, and proof revocation order
+# are untouched — see PASS-4.md's isomorphism proof.
+env PRO_GATE_HOME="$ORPHAN_HOME" ORACLE_HOME_DIR="$ORPHAN_ORACLE" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
   PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
-  PRO_GATE_MAX_RETRIES=0 PRO_GATE_STALL_SECS=1 PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 PRO_GATE_REATTACH_TIMEOUT=1 \
+  PRO_GATE_MAX_RETRIES=0 PRO_GATE_STALL_SECS=1 PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 \
+  PRO_GATE_TEST_WATCHDOG_TERM_DRAIN_SECS=3 PRO_GATE_TEST_WATCHDOG_FORCE_SETTLE_SECS=1 PRO_GATE_REATTACH_TIMEOUT=1 \
   PRO_GATE_SALVAGE_SECS=2 PRO_GATE_RUN_LOGS=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-term-ignoring" \
-  PG_TEST_PRODUCER_PID="$ORPHAN_PID" PG_TEST_BLOCK_FIFO="$ORPHAN_FIFO" NODE_OPTIONS= \
+  PG_TEST_PRODUCER_PID="$ORPHAN_PID" PG_TEST_PRODUCER_PGID="$ORPHAN_PGID" PG_TEST_TERM_EVENTS="$ORPHAN_EVENTS" \
+  PG_TEST_BLOCK_FIFO="$ORPHAN_FIFO" NODE_OPTIONS= \
   bash "$ENGINE" --pr 924 --repo "$TDIR" --diff "$TDIR/small.diff" \
   --out "$ORPHAN_HOME/o-orphan.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
 RC=$?
 ORPHAN_SEEN="$(cat "$ORPHAN_PID" 2>/dev/null)"
+ORPHAN_PGID_SEEN="$(cat "$ORPHAN_PGID" 2>/dev/null)"
+ORPHAN_TERM_LINE="$(grep -n -x -F 'TERM_RECEIVED' "$ORPHAN_EVENTS" 2>/dev/null | head -1 | cut -d: -f1)"
+ORPHAN_RESIST_LINE="$(grep -n -x -F 'RESISTING_AFTER_TERM' "$ORPHAN_EVENTS" 2>/dev/null | head -1 | cut -d: -f1)"
+ORPHAN_TICK_LINE="$(grep -n -x -F 'DRAIN_TICK' "$ORPHAN_EVENTS" 2>/dev/null | head -1 | cut -d: -f1)"
+ORPHAN_TICK_COUNT="$(grep -c -x -F 'DRAIN_TICK' "$ORPHAN_EVENTS" 2>/dev/null)"; ORPHAN_TICK_COUNT="${ORPHAN_TICK_COUNT:-0}"
+ORPHAN_GROUP_SURVIVORS=""
+[ -n "$ORPHAN_PGID_SEEN" ] && ORPHAN_GROUP_SURVIVORS="$(pgrep -g "$ORPHAN_PGID_SEEN" 2>/dev/null || true)"
+ORPHAN_EVENTS_TEXT="$(tr '\n' ' ' < "$ORPHAN_EVENTS" 2>/dev/null)"
 check 'TERM-ignoring Oracle still terminates the attempt' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
 check 'TERM-ignoring Oracle actually started (fixture sanity)' \
-  "$([ -n "$ORPHAN_SEEN" ]; echo $?)" "pid=$ORPHAN_SEEN"
-check 'TERM-ignoring Oracle leaves no surviving descendant' \
-  "$([ -n "$ORPHAN_SEEN" ] && ! kill -0 "$ORPHAN_SEEN" 2>/dev/null; echo $?)" "pid=$ORPHAN_SEEN"
+  "$([ -n "$ORPHAN_SEEN" ] && [ -n "$ORPHAN_PGID_SEEN" ]; echo $?)" "pid=$ORPHAN_SEEN pgid=$ORPHAN_PGID_SEEN"
+# Ordering, not elapsed wall time, is the evidence: each event is a distinct line appended only
+# from inside the fixture, so its line number is a strict happens-before witness.
+check 'TERM-ignoring Oracle records TERM receipt before it can be reaped' \
+  "$([ -n "$ORPHAN_TERM_LINE" ]; echo $?)" "events=$ORPHAN_EVENTS_TEXT"
+check 'TERM-ignoring Oracle remains alive/resistant after TERM long enough to enter the bounded drain path' \
+  "$([ -n "$ORPHAN_TERM_LINE" ] && [ -n "$ORPHAN_RESIST_LINE" ] && [ -n "$ORPHAN_TICK_LINE" ] \
+     && [ "$ORPHAN_TERM_LINE" -lt "$ORPHAN_RESIST_LINE" ] && [ "$ORPHAN_RESIST_LINE" -lt "$ORPHAN_TICK_LINE" ] \
+     && [ "$ORPHAN_TICK_COUNT" -ge 1 ]; echo $?)" \
+  "events=$ORPHAN_EVENTS_TEXT ticks=$ORPHAN_TICK_COUNT"
+check 'TERM-ignoring Oracle process group has no surviving descendant after engine exit' \
+  "$([ -n "$ORPHAN_SEEN" ] && [ -n "$ORPHAN_PGID_SEEN" ] \
+     && ! kill -0 "$ORPHAN_SEEN" 2>/dev/null && [ -z "$ORPHAN_GROUP_SURVIVORS" ]; echo $?)" \
+  "pid=$ORPHAN_SEEN pgid=$ORPHAN_PGID_SEEN survivors=$ORPHAN_GROUP_SURVIVORS"
 # Same run also covers the BLUNT-fallback branch: the producer never drains, so the attempt is
-# force-killed. Its proof is revoked, so it must stay charged no matter how clean the log looks.
-check 'force-killed attempt stays charged' \
+# force-killed. It planted a false no-submit session record above; proof revocation must defeat
+# that landmine and stay charged no matter how clean the log or metadata looks.
+check 'TERM-ignoring fixture planted a false no-submit proof candidate (landmine sanity)' \
+  "$(jq -e '.browser.runtime.promptSubmitted == false' "$ORPHAN_ORACLE/sessions/fake-term-ignoring/meta.json" >/dev/null 2>&1; echo $?)" \
+  "meta=$(tr -s '[:space:]' ' ' < "$ORPHAN_ORACLE/sessions/fake-term-ignoring/meta.json" 2>/dev/null)"
+check 'force-killed attempt stays charged despite the false no-submit landmine (no certified proof)' \
   "$([ -s "$ORPHAN_HOME/rounds/$RKEY_924" ]; echo $?)" "rounds=$(cat "$ORPHAN_HOME/rounds/$RKEY_924" 2>/dev/null)"
 check 'force-killed attempt never announces a refund' \
   "$(! grep -q 'refunding this round' "$TDIR/stderr"; echo $?)" "$(tail -5 "$TDIR/stderr")"
@@ -1624,6 +1701,68 @@ check 'watchdog sleep seconds: valid middle value 5 is honored' \
   "$([ "$(wdsecs_for 5)" = 5 ]; echo $?)" "got=$(wdsecs_for 5)"
 check 'watchdog sleep seconds: valid maximum bound 10 is honored' \
   "$([ "$(wdsecs_for 10)" = 10 ]; echo $?)" "got=$(wdsecs_for 10)"
+
+# CI wait optimization pass 4: source the real private library helpers in a fresh Bash
+# process for each boundary. Both helpers are used only by the PR 924 TERM-ignoring fixture above.
+tdsecs_for() { # $1 = value for PRO_GATE_TEST_WATCHDOG_TERM_DRAIN_SECS, or literal UNSET to leave it unset
+  if [ "$1" = UNSET ]; then
+    ( unset PRO_GATE_TEST_WATCHDOG_TERM_DRAIN_SECS; bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_test_watchdog_term_drain_secs" )
+  else
+    PRO_GATE_TEST_WATCHDOG_TERM_DRAIN_SECS="$1" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_test_watchdog_term_drain_secs"
+  fi
+}
+check 'watchdog TERM-drain seconds: unset retains production default 30' \
+  "$([ "$(tdsecs_for UNSET)" = 30 ]; echo $?)" "got=$(tdsecs_for UNSET)"
+check 'watchdog TERM-drain seconds: empty string retains production default 30' \
+  "$([ "$(tdsecs_for '')" = 30 ]; echo $?)" "got=$(tdsecs_for '')"
+check 'watchdog TERM-drain seconds: zero retains production default 30' \
+  "$([ "$(tdsecs_for 0)" = 30 ]; echo $?)" "got=$(tdsecs_for 0)"
+check 'watchdog TERM-drain seconds: negative retains production default 30' \
+  "$([ "$(tdsecs_for -1)" = 30 ]; echo $?)" "got=$(tdsecs_for -1)"
+check 'watchdog TERM-drain seconds: non-numeric retains production default 30' \
+  "$([ "$(tdsecs_for abc)" = 30 ]; echo $?)" "got=$(tdsecs_for abc)"
+check 'watchdog TERM-drain seconds: leading-zero form is rejected, retains default 30' \
+  "$([ "$(tdsecs_for 007)" = 30 ]; echo $?)" "got=$(tdsecs_for 007)"
+check 'watchdog TERM-drain seconds: above-bound 31 retains production default 30' \
+  "$([ "$(tdsecs_for 31)" = 30 ]; echo $?)" "got=$(tdsecs_for 31)"
+check 'watchdog TERM-drain seconds: three-digit value retains production default 30' \
+  "$([ "$(tdsecs_for 100)" = 30 ]; echo $?)" "got=$(tdsecs_for 100)"
+check 'watchdog TERM-drain seconds: valid minimum bound 1 is honored' \
+  "$([ "$(tdsecs_for 1)" = 1 ]; echo $?)" "got=$(tdsecs_for 1)"
+check 'watchdog TERM-drain seconds: valid mid-range value 15 is honored' \
+  "$([ "$(tdsecs_for 15)" = 15 ]; echo $?)" "got=$(tdsecs_for 15)"
+check 'watchdog TERM-drain seconds: valid maximum bound 30 is honored' \
+  "$([ "$(tdsecs_for 30)" = 30 ]; echo $?)" "got=$(tdsecs_for 30)"
+
+fssecs_for() { # $1 = value for PRO_GATE_TEST_WATCHDOG_FORCE_SETTLE_SECS, or literal UNSET to leave it unset
+  if [ "$1" = UNSET ]; then
+    ( unset PRO_GATE_TEST_WATCHDOG_FORCE_SETTLE_SECS; bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_test_watchdog_force_settle_secs" )
+  else
+    PRO_GATE_TEST_WATCHDOG_FORCE_SETTLE_SECS="$1" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_test_watchdog_force_settle_secs"
+  fi
+}
+check 'watchdog force-settle seconds: unset retains production default 5' \
+  "$([ "$(fssecs_for UNSET)" = 5 ]; echo $?)" "got=$(fssecs_for UNSET)"
+check 'watchdog force-settle seconds: empty string retains production default 5' \
+  "$([ "$(fssecs_for '')" = 5 ]; echo $?)" "got=$(fssecs_for '')"
+check 'watchdog force-settle seconds: zero retains production default 5' \
+  "$([ "$(fssecs_for 0)" = 5 ]; echo $?)" "got=$(fssecs_for 0)"
+check 'watchdog force-settle seconds: negative retains production default 5' \
+  "$([ "$(fssecs_for -1)" = 5 ]; echo $?)" "got=$(fssecs_for -1)"
+check 'watchdog force-settle seconds: non-numeric retains production default 5' \
+  "$([ "$(fssecs_for abc)" = 5 ]; echo $?)" "got=$(fssecs_for abc)"
+check 'watchdog force-settle seconds: leading-zero form is rejected, retains default 5' \
+  "$([ "$(fssecs_for 007)" = 5 ]; echo $?)" "got=$(fssecs_for 007)"
+check 'watchdog force-settle seconds: above-bound 6 retains production default 5' \
+  "$([ "$(fssecs_for 6)" = 5 ]; echo $?)" "got=$(fssecs_for 6)"
+check 'watchdog force-settle seconds: three-digit value retains production default 5' \
+  "$([ "$(fssecs_for 100)" = 5 ]; echo $?)" "got=$(fssecs_for 100)"
+check 'watchdog force-settle seconds: valid minimum bound 1 is honored' \
+  "$([ "$(fssecs_for 1)" = 1 ]; echo $?)" "got=$(fssecs_for 1)"
+check 'watchdog force-settle seconds: valid mid-range value 3 is honored' \
+  "$([ "$(fssecs_for 3)" = 3 ]; echo $?)" "got=$(fssecs_for 3)"
+check 'watchdog force-settle seconds: valid maximum bound 5 is honored' \
+  "$([ "$(fssecs_for 5)" = 5 ]; echo $?)" "got=$(fssecs_for 5)"
 
 # Oracle 0.18.0 records promptSubmitted=false before attachment completion and changes it only
 # when Send is dispatched. Complete exact-session metadata plus the existing negative conversation

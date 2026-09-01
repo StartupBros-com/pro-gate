@@ -57,6 +57,24 @@ pg_test_watchdog_sleep_secs() {
   esac
 }
 
+# Test-only watchdog TERM-drain duration. Invalid input deliberately falls back
+# to the production 30-second bound and can never extend it.
+pg_test_watchdog_term_drain_secs() {
+  case "${PRO_GATE_TEST_WATCHDOG_TERM_DRAIN_SECS:-}" in
+    [1-9]|[12][0-9]|30) printf '%s\n' "$PRO_GATE_TEST_WATCHDOG_TERM_DRAIN_SECS" ;;
+    *) printf '30\n' ;;
+  esac
+}
+
+# Test-only watchdog post-drain force-settle wait. Invalid input deliberately
+# falls back to the production 5-second bound and can never extend it.
+pg_test_watchdog_force_settle_secs() {
+  case "${PRO_GATE_TEST_WATCHDOG_FORCE_SETTLE_SECS:-}" in
+    [1-5]) printf '%s\n' "$PRO_GATE_TEST_WATCHDOG_FORCE_SETTLE_SECS" ;;
+    *) printf '5\n' ;;
+  esac
+}
+
 pg_runtime_version() {
   tr -d '[:space:]' < "$PRO_GATE_HOME/VERSION" 2>/dev/null || true
 }

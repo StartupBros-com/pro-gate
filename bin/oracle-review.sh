@@ -3243,10 +3243,13 @@ NOTHINK_SECS="${PRO_GATE_NOTHINK_SECS:-600}"
 
 run_oracle() {  # $1 = browser model strategy (select|current|ignore)
   local strategy="$1" job started size last_size last_change now last_line prc watchdog_sleep_secs
+  local watchdog_term_drain_secs watchdog_force_settle_secs
   local transcript="$WORK/oracle.${#ORACLE_LOG_TRANSCRIPTS[@]}.log"
   local proof="$WORK/oracle.${#ORACLE_LOG_TRANSCRIPTS[@]}.sha256"
   local producer_file="${transcript%.log}.pid" producer drained
   watchdog_sleep_secs="$(pg_test_watchdog_sleep_secs)"
+  watchdog_term_drain_secs="$(pg_test_watchdog_term_drain_secs)"
+  watchdog_force_settle_secs="$(pg_test_watchdog_force_settle_secs)"
   ORACLE_LOG_TRANSCRIPTS+=("$transcript")
   ORACLE_LOG_PROOFS+=("$proof")
   rm -f "$transcript" "$proof" "$producer_file"
@@ -3349,7 +3352,7 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
     if [ -n "$producer" ]; then
       pg_signal_producer TERM "$producer"
       drained=0
-      while [ "$drained" -lt 30 ] && kill -0 "$job" 2>/dev/null; do sleep 1; drained=$((drained + 1)); done
+      while [ "$drained" -lt "$watchdog_term_drain_secs" ] && kill -0 "$job" 2>/dev/null; do sleep 1; drained=$((drained + 1)); done
     fi
     # Refused to drain (or the pid was never published): publish NOTHING, so the attempt stays
     # charged rather than resting on a possibly-truncated capture. Take Oracle's process group down
@@ -3359,7 +3362,7 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
     if kill -0 "$job" 2>/dev/null; then
       pg_signal_producer KILL "$producer"
       pkill -TERM -P "$job" 2>/dev/null; kill -TERM "$job" 2>/dev/null
-      sleep 5
+      sleep "$watchdog_force_settle_secs"
       pg_signal_producer KILL "$producer"
       pkill -KILL -P "$job" 2>/dev/null; kill -KILL "$job" 2>/dev/null
     fi
