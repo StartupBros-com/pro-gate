@@ -1,0 +1,187 @@
+Pass 6 verification transcript — scratch-render hydration/sample test seam
+==========================================================================
+
+Host: Linux 6.6.114.1-microsoft-standard-WSL2 x86_64 GNU/Linux
+Node: v24.12.0
+Repo HEAD before and after pass: 327da2784c2e9da9105810ceb3f4d26d860fc10d
+Worktree: /home/will/SITES/pro-gate/.claude/worktrees/ci-wait-optimization-114
+Scratch evidence directory: /tmp/pro-gate-pass6-20260901
+
+0. Scope and opportunity
+------------------------
+
+Score: impact 4 x confidence 4 / effort 2 = 8.0.
+
+Inventory before editing found exactly two live `2_500` uses, both in
+`freshRenderText()`:
+
+  while (Date.now() + 2_500 < renderDeadline)
+  await sleep(2_500)
+
+The same inspection confirmed the protected values: 25,000ms render budgets,
+2,000ms consume/cleanup grace, 90,000ms re-render interval, pass-5 POLL_MS
+main-loop behavior, retry backoff, classifier branches, and the fresh-render
+open/list/close sequence. All `renderText` callbacks were reviewed; the three
+callbacks whose result changes by sample number were the only hydration/order
+fixtures opted into the 50ms test child seam. The hung-close fixture also opts
+in solely to retain and assert its scratch open/list/close ordering.
+
+1. Pre-edit foreground same-host baseline
+-----------------------------------------
+
+Command:
+
+  /usr/bin/time -f 'real=%e user=%U sys=%S maxrss_kb=%M exit=%x' \
+    -o /tmp/pro-gate-pass6-20260901/baseline.time \
+    node --test tests/cdp-salvage.test.mjs \
+    > /tmp/pro-gate-pass6-20260901/baseline.tap \
+    2> /tmp/pro-gate-pass6-20260901/baseline.stderr
+
+Result:
+
+  command exit: 0
+  TAP internal assertions: 253 ok, 0 FAIL
+  node:test: tests=1, pass=1, fail=0, cancelled=0, skipped=0, todo=0
+  node:test duration: 405639.264816ms
+  /usr/bin/time: real=405.65s user=8.42s sys=2.75s maxrss_kb=86092 exit=0
+  stderr: 0 bytes
+
+The baseline was run once in the foreground before this pass edited code. It
+needed no rerun.
+
+2. Implementation and direct parser check
+-----------------------------------------
+
+Consolidated the pass-5 poll and pass-6 render bounded-decimal parsers in the
+shared `bin/cdp-test-timing.mjs`; the duplicate `bin/cdp-poll-ms.mjs` and
+`bin/cdp-render-sample-ms.mjs` modules are removed. The shared module preserves
+all internal public exports used by `cdp-salvage.mjs` and its tests:
+`parseTestPollMs`, `TEST_POLL_MS_MIN`, `TEST_POLL_MS_MAX`,
+`parseTestRenderSampleMs`, `TEST_RENDER_SAMPLE_MS_MIN`, and
+`TEST_RENDER_SAMPLE_MS_MAX`. Both values are resolved once at module load:
+
+  const POLL_MS = parseTestPollMs(process.env.PRO_GATE_TEST_POLL_MS) ?? 20_000;
+  const RENDER_SAMPLE_MS =
+    parseTestRenderSampleMs(process.env.PRO_GATE_TEST_RENDER_SAMPLE_MS) ?? 2_500;
+
+Direct in-process boundary checks passed for both parsers: unset, empty, zero,
+negative, non-numeric, fractional, whitespace-padded, leading-zero, non-string,
+below-minimum, above-maximum, exact minimum, exact maximum, and a valid
+mid-range input. An independent direct command also passed:
+
+  poll-parser-boundaries=pass min=50 max=20000
+  render-parser-boundaries=pass min=50 max=2500
+
+`runScratchSalvage()` merges `PRO_GATE_TEST_RENDER_SAMPLE_MS=50` only into a
+selected spawned child. It is used for marker-only → later verdict,
+stale-terminal → newer verdict, shell/sidebar → review, and both hung-close
+ordering variants. It never changes the parent process environment or regular
+salvage children.
+
+Focused observations passed:
+
+  - marker-only first sample then later nonce-bearing verdict: observations=1,2
+  - stale terminal first sample then newer terminal verdict: observations=1,2
+  - shell/sidebar first sample then hydrated review: observations=1,2
+  - hung peer cleanup: PUT /json/new -> GET /json -> GET /json/close/scratch1
+
+The first readable DOM sample therefore remains non-terminal in every
+sample-count fixture.
+
+3. Static checks
+----------------
+
+  node --check bin/cdp-test-timing.mjs                     PASS
+  node --check bin/cdp-salvage.mjs                         PASS
+  node --check tests/cdp-salvage.test.mjs                  PASS
+  direct poll and render parser boundaries                 PASS
+  git diff --check                                         PASS (no output)
+
+4. Post-change foreground complete Node suite
+----------------------------------------------
+
+Command (timeout configured to 1,200,000ms):
+
+  /usr/bin/time -f 'real=%e user=%U sys=%S maxrss_kb=%M exit=%x' \
+    -o /tmp/pro-gate-pass6-20260901/postchange.time \
+    node --test tests/cdp-salvage.test.mjs \
+    > /tmp/pro-gate-pass6-20260901/postchange.tap \
+    2> /tmp/pro-gate-pass6-20260901/postchange.stderr
+
+Result:
+
+  command exit: 0
+  TAP internal assertions: 274 ok, 0 FAIL
+  node:test: tests=1, pass=1, fail=0, cancelled=0, skipped=0, todo=0
+  node:test duration: 386425.979649ms
+  /usr/bin/time: real=386.44s user=7.92s sys=2.25s maxrss_kb=82912 exit=0
+  stderr: 0 bytes
+
+Exact same-host comparison:
+
+  before: 405.65s
+  after:  386.44s
+  delta:  -19.21s (-4.74%)
+
+The source-derived causal budget is 19.6s: the three hydration fixtures each
+take exactly two samples, so 3 x 2 x (2500 - 50)ms = 14.7s; the two hung-close
+variants each take one sample, so 2 x (2500 - 50)ms = 4.9s. Their total expected
+saving is 19.6s, versus 19.21s observed. The 4.74% alone is within a broad noise
+envelope, but the 19.6s source-derived budget plus exact sample counts
+triangulate causality.
+
+This is a direct wall-time improvement, not a neutral prerequisite. It exceeds
+the separately scored >=2s retention bar, so the pass-7 conditional-revert rule
+does not apply. No clean rerun was needed.
+
+5. Golden, production-default, and scope proofs
+------------------------------------------------
+
+  sha256sum -c tests/artifacts/perf/2026-08-31-ci-optimization/golden_checksums.txt
+  tests/artifacts/perf/2026-08-31-ci-optimization/engine-all-pass.txt: OK
+
+A post-change scope search found the render test variable only in
+`bin/cdp-test-timing.mjs`, `bin/cdp-salvage.mjs`, and
+`tests/cdp-salvage.test.mjs`; it has zero uses in `.github/`, `lib/`,
+`scripts/`, or `install.sh`. The no-stale-import search found no active imports
+of `cdp-poll-ms.mjs` or `cdp-render-sample-ms.mjs`; their names remain only in
+pass-5 historical evidence. Invalid parser input returns null, which selects the
+literal 2,500ms fallback. The render parser maximum is exactly 2,500ms, so a
+valid override can only shorten and cannot extend production sampling.
+
+The retained source constants are:
+
+  RENDER_INTERVAL_MS = 90_000
+  CONSUME_GRACE_MS = 2_000
+  fresh render budget = 25_000
+  invalid/unset test sample fallback = 2_500
+
+No engine test was run: this pass changes only Node salvage/test modules and
+artifacts, not shared shell/runtime files (`lib/pro-gate-lib.sh` or
+`bin/oracle-review.sh`).
+
+6. Isomorphism proof and durable revert/removal
+------------------------------------------------
+
+Ordering preserved: yes. The production loop keeps its open -> list -> sample
+-> finally-close sequence; focused hung-close assertions prove open/list/close
+request order under an unresponsive close peer.
+
+Tie-breaking/classification: unchanged. Only wait duration in explicitly opted
+in test children changes. All classifier branches, exit codes, retry backoff,
+source-tab preservation, memo persistence, blacklist/cross-bind behavior, and
+pass-5 main polling are unmodified; the full suite passed.
+
+Floating point: N/A; input accepts integer milliseconds only.
+RNG: N/A; no random behavior changed.
+Golden output: verified above.
+
+Durable revert/removal: after pass 6 is committed, revert that commit to undo
+the seam. To remove only the render seam later while preserving pass 5,
+restore `bin/cdp-poll-ms.mjs` from commit 327da27, point the poll imports back
+to it, restore only the render sample literal `2_500`, and remove only the
+render parser/helper/assertions and scratch-sample fixture overrides. Keep the
+poll override and its tests. Do not alter PASS-5 artifacts: they remain
+historical evidence for commit 327da27. Do not retain the render seam if it is
+later shown to alter the literal 2,500ms production default or first-sample
+ordering.

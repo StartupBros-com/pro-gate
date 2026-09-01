@@ -24,7 +24,14 @@ import {
   buildRenameConversationExpression,
   ORGANIZER_MUTATION_LEASE_MS,
 } from '../bin/cdp-organizer-expressions.mjs';
-import { parseTestPollMs, TEST_POLL_MS_MIN, TEST_POLL_MS_MAX } from '../bin/cdp-poll-ms.mjs';
+import {
+  parseTestPollMs,
+  TEST_POLL_MS_MIN,
+  TEST_POLL_MS_MAX,
+  parseTestRenderSampleMs,
+  TEST_RENDER_SAMPLE_MS_MIN,
+  TEST_RENDER_SAMPLE_MS_MAX,
+} from '../bin/cdp-test-timing.mjs';
 
 const SALVAGE = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'cdp-salvage.mjs');
 const WS_MAGIC = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
@@ -95,6 +102,7 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
   const created = [];              // scratch tabs opened via /json/new
   const pollsByTab = new Map();    // scratch tab id -> how many times its DOM has been read
   const requests = [];
+  const httpRequests = [];         // request-order proof for scratch open/list/close cleanup
   const ui = opts.ui ?? { title: null, archived: false, events: [] };
   ui.events ??= [];
   const mutationTokens = new Map();
@@ -105,6 +113,7 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
                            // (per-scratch-tab render count): proves how many times the salvage
                            // loop actually woke up and re-scanned, independent of any render.
   const server = createServer((req, res) => {
+    httpRequests.push(`${req.method} ${req.url}`);
     if (req.url === '/json/version') { res.end(JSON.stringify({ Browser: 'MockChrome/1.0' })); return; }
     if (req.url?.startsWith('/json/new')) {
       const port = server.address().port;
@@ -276,6 +285,7 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
     closed,
     created,
     requests,
+    httpRequests,
     ui,
     get jsonListCalls() { return jsonListCalls; },
     setText: (value) => {
@@ -332,6 +342,15 @@ function runSalvage(args, port, seed, extraEnv = {}) {
       });
     });
   });
+}
+
+// Deliberately opt in only scratch hydration/order fixtures. The override is merged into the
+// spawned child alone; this test process and all regular salvage fixtures keep their inherited env.
+const SCRATCH_SAMPLE_TEST_ENV = Object.freeze({
+  PRO_GATE_TEST_RENDER_SAMPLE_MS: String(TEST_RENDER_SAMPLE_MS_MIN),
+});
+function runScratchSalvage(args, port, seed, extraEnv = {}) {
+  return runSalvage(args, port, seed, { ...extraEnv, ...SCRATCH_SAMPLE_TEST_ENV });
 }
 
 // Write a remembered-conversation memo, exactly as a previous invocation would have.
@@ -393,7 +412,7 @@ function check(name, cond, detail) {
 
 const MARKER = 'pg-run-test-1234567890-42';
 
-{ // Direct parser boundary coverage (bin/cdp-poll-ms.mjs), called in-process — no spawn. Every
+{ // Direct poll-parser boundary coverage (bin/cdp-test-timing.mjs), called in-process — no spawn. Every
   // one of these is real production input shape: an unset/empty/malformed
   // PRO_GATE_TEST_POLL_MS must fall back to cdp-salvage.mjs's own literal 20_000, never this
   // parser's return value, so `null` here is the only value that preserves that default.
@@ -421,6 +440,33 @@ const MARKER = 'pg-run-test-1234567890-42';
     parseTestPollMs('5000') === 5_000);
   check('parseTestPollMs: a valid value can only ever shorten, never extend, the cadence',
     parseTestPollMs(String(TEST_POLL_MS_MAX)) <= 20_000);
+}
+
+{ // Direct render-parser boundary coverage (bin/cdp-test-timing.mjs), called in-process — no spawn.
+  // A null result makes cdp-salvage.mjs retain its literal 2_500ms production sample interval.
+  check('parseTestRenderSampleMs: unset (undefined) is rejected', parseTestRenderSampleMs(undefined) === null);
+  check('parseTestRenderSampleMs: empty string is rejected', parseTestRenderSampleMs('') === null);
+  check('parseTestRenderSampleMs: "0" is rejected', parseTestRenderSampleMs('0') === null);
+  check('parseTestRenderSampleMs: negative is rejected', parseTestRenderSampleMs('-50') === null);
+  check('parseTestRenderSampleMs: non-numeric is rejected', parseTestRenderSampleMs('abc') === null);
+  check('parseTestRenderSampleMs: fractional form is rejected', parseTestRenderSampleMs('100.5') === null);
+  check('parseTestRenderSampleMs: whitespace-padded form is rejected', parseTestRenderSampleMs(' 100 ') === null);
+  check('parseTestRenderSampleMs: leading-zero form is rejected', parseTestRenderSampleMs('050') === null);
+  check('parseTestRenderSampleMs: a non-string input type is rejected', parseTestRenderSampleMs(100) === null);
+  check('parseTestRenderSampleMs: below the minimum bound is rejected',
+    parseTestRenderSampleMs(String(TEST_RENDER_SAMPLE_MS_MIN - 1)) === null);
+  check('parseTestRenderSampleMs: above the maximum bound is rejected',
+    parseTestRenderSampleMs(String(TEST_RENDER_SAMPLE_MS_MAX + 1)) === null);
+  check('parseTestRenderSampleMs: the maximum bound equals production sample interval',
+    TEST_RENDER_SAMPLE_MS_MAX === 2_500);
+  check('parseTestRenderSampleMs: the exact minimum bound is honored',
+    parseTestRenderSampleMs(String(TEST_RENDER_SAMPLE_MS_MIN)) === TEST_RENDER_SAMPLE_MS_MIN);
+  check('parseTestRenderSampleMs: the exact maximum bound is honored',
+    parseTestRenderSampleMs(String(TEST_RENDER_SAMPLE_MS_MAX)) === TEST_RENDER_SAMPLE_MS_MAX);
+  check('parseTestRenderSampleMs: a valid mid-range value is honored',
+    parseTestRenderSampleMs('500') === 500);
+  check('parseTestRenderSampleMs: a valid value can only ever shorten, never extend, sampling',
+    parseTestRenderSampleMs(String(TEST_RENDER_SAMPLE_MS_MAX)) <= 2_500);
 }
 
 { // still generating: marker matches, no VERDICT -> exit 3, tab NOT closed
@@ -511,12 +557,18 @@ const MARKER = 'pg-run-test-1234567890-42';
     'P2: none',
     `VERDICT: FIX-FIRST — recovered after marker hydration. (run marker: ${MARKER})`,
   ].join('\n');
+  const observations = [];
   const cdp = await mockCdp(staleSource, [], {
-    renderText: (url, n) => url === canonicalUrl && n === 1 ? markerOnlyScratch : serverReview,
+    renderText: (url, n) => {
+      observations.push(n);
+      return url === canonicalUrl && n === 1 ? markerOnlyScratch : serverReview;
+    },
   });
-  const r = await runSalvage([MARKER, '8'], cdp.port, seedMemo(MARKER, canonicalUrl));
+  const r = await runScratchSalvage([MARKER, '8'], cdp.port, seedMemo(MARKER, canonicalUrl));
   check('readable stale source waits past a marker-only canonical scratch sample', r.status === 0,
     `status=${r.status} stderr=${r.stderr?.slice(0, 300)}`);
+  check('marker-hydration revalidation samples marker-only text first then the later verdict exactly once',
+    observations.join(',') === '1,2', `observations=${observations}`);
   check('marker-hydration revalidation emits the later nonce-bearing verdict',
     r.stdout.trim() === serverReview.split('\n').slice(1).join('\n'), `stdout=${r.stdout?.slice(0, 300)}`);
   check('marker-hydration revalidation closes only its scratch target',
@@ -628,13 +680,19 @@ const MARKER = 'pg-run-test-1234567890-42';
     '  Why: real bug',
     `VERDICT: FIX-FIRST — newer round is final. (run marker: ${MARKER})`,
   ].join('\n');
-  // Reuse the readable-stale-source -> canonical-scratch-revalidation path (U1): its scratch
-  // samples every 2.5s with no render-interval throttle, unlike the remembered-URL seeded
-  // render (90s), so it can observe the newer verdict landing within a normal test budget.
+  // Reuse the readable-stale-source -> canonical-scratch-revalidation path (U1): production
+  // samples every 2.5s with no render-interval throttle, unlike the remembered-URL seeded render
+  // (90s). This focused fixture opts its spawned child into the 50ms test-only sample seam.
+  const observations = [];
   const seededCdp = await mockCdp(staleTerminal, [], {
-    renderText: (_url, n) => (n === 1 ? staleTerminal : newerFinal),
+    renderText: (_url, n) => {
+      observations.push(n);
+      return n === 1 ? staleTerminal : newerFinal;
+    },
   });
-  const seededResult = await runSalvage([MARKER, '8'], seededCdp.port, seedMemo(MARKER, canonicalUrl));
+  const seededResult = await runScratchSalvage([MARKER, '8'], seededCdp.port, seedMemo(MARKER, canonicalUrl));
+  check('the stale terminal sample is observed before exactly one later terminal sample',
+    observations.join(',') === '1,2', `observations=${observations}`);
   check('the superseded verdict is skipped and the newer verdict is emitted instead',
     seededResult.status === 0 && /VERDICT: FIX-FIRST — newer round is final/.test(seededResult.stdout ?? ''),
     `status=${seededResult.status} stdout=${seededResult.stdout?.slice(0, 300)}`);
@@ -894,12 +952,10 @@ const MARKER = 'pg-run-test-1234567890-42';
     ['probe', ['--probe', MARKER, '3'], 0],
   ]) {
     const cdp = await mockCdp(source, [], { hangScratchClose: true, scratchTarget: () => null });
-    // This variant is the slowest of the three by construction: the render loop must burn its
-    // 2.5s sample before the target-disappeared return, and only THEN does the cleanup close
-    // spend its own 2s grace against a peer that never replies (~4.5s before spawn overhead).
-    // So it gets a proportionally later kill fallback and ceiling rather than the 6000/5_500 the
-    // open- and list-timeout variants use, where the abort lands at the 3s caller deadline.
-    const r = await runSalvage(args, cdp.port, seedMemo(MARKER, priorUrl), {
+    // The test child opts into the 50ms test-only sample interval so target disappearance reaches
+    // its cleanup path promptly. Production still samples after 2.5s; these established timeout
+    // arguments stay deliberately unchanged in this pass.
+    const r = await runScratchSalvage(args, cdp.port, seedMemo(MARKER, priorUrl), {
       PRO_GATE_TEST_CHILD_TIMEOUT_MS: '9000',
     });
     check(`${label} scratch-close timeout returns before its watchdog fallback`,
@@ -911,6 +967,12 @@ const MARKER = 'pg-run-test-1234567890-42';
     check(`${label} scratch-close cleanup was attempted despite no reply`,
       cdp.closed.includes('scratch1'),
       `closed=${cdp.closed}`);
+    const openAt = cdp.httpRequests.findIndex((request) => request.startsWith('PUT /json/new?'));
+    const listAt = cdp.httpRequests.findIndex((request, index) => index > openAt && request === 'GET /json');
+    const closeAt = cdp.httpRequests.findIndex((request, index) => index > listAt && request === 'GET /json/close/scratch1');
+    check(`${label} scratch cleanup preserves open then list then close ordering`,
+      openAt >= 0 && listAt > openAt && closeAt > listAt,
+      `httpRequests=${cdp.httpRequests.join(',')}`);
     cdp.stop();
   }
 }
@@ -971,9 +1033,17 @@ const MARKER = 'pg-run-test-1234567890-42';
     + `Pinned\n${'Some earlier conversation title\n'.repeat(40)}`;
   const review = `run marker: ${MARKER}\n[P2] b.ts:2: nit\n  Why: real\nVERDICT: SHIP: fine.`;
   check('shell alone clears the old 200-char gate', shell.length > 200, `len=${shell.length}`);
-  const cdp = await mockCdp('__NO_TABS__', [], { renderText: (_url, n) => (n === 1 ? shell : review) });
-  const r = await runSalvage([MARKER, '30'], cdp.port, seedMemo(MARKER, 'https://chatgpt.com/c/remembered'));
+  const observations = [];
+  const cdp = await mockCdp('__NO_TABS__', [], {
+    renderText: (_url, n) => {
+      observations.push(n);
+      return n === 1 ? shell : review;
+    },
+  });
+  const r = await runScratchSalvage([MARKER, '30'], cdp.port, seedMemo(MARKER, 'https://chatgpt.com/c/remembered'));
   check('a pre-hydration render is not treated as a miss', r.status === 0, `status=${r.status} stderr=${r.stderr?.slice(0, 300)}`);
+  check('shell/sidebar is retained as the first sample until the second sample hydrates the review',
+    observations.join(',') === '1,2', `observations=${observations}`);
   check('the review is read once the page hydrates', /VERDICT: SHIP/.test(r.stdout ?? ''), `stdout=${r.stdout?.slice(0, 160)}`);
   cdp.stop();
 }
