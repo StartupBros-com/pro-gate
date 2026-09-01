@@ -1325,7 +1325,7 @@ RKEY_922="$(printf '%s-922' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
 printf 'foreign idle tab\n' > "$TDIR/tab.txt"
 env PRO_GATE_HOME="$STALL_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
   PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
-  PRO_GATE_MAX_RETRIES=0 PRO_GATE_STALL_SECS=1 PRO_GATE_REATTACH_TIMEOUT=1 \
+  PRO_GATE_MAX_RETRIES=0 PRO_GATE_STALL_SECS=1 PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 PRO_GATE_REATTACH_TIMEOUT=1 \
   PRO_GATE_SALVAGE_SECS=2 PRO_GATE_RUN_LOGS=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-stall" \
   PG_TEST_ATTEMPTS_FILE="$STALL_ATTEMPTS" NODE_OPTIONS= \
   bash "$ENGINE" --pr 922 --repo "$TDIR" --diff "$TDIR/small.diff" \
@@ -1352,7 +1352,7 @@ RKEY_923="$(printf '%s-923' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
 printf 'foreign idle tab\n' > "$TDIR/tab.txt"
 env PRO_GATE_HOME="$SLANDED_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
   PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
-  PRO_GATE_MAX_RETRIES=0 PRO_GATE_STALL_SECS=1 PRO_GATE_REATTACH_TIMEOUT=1 \
+  PRO_GATE_MAX_RETRIES=0 PRO_GATE_STALL_SECS=1 PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 PRO_GATE_REATTACH_TIMEOUT=1 \
   PRO_GATE_SALVAGE_SECS=2 PRO_GATE_RUN_LOGS=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-stall-landed" \
   NODE_OPTIONS= \
   bash "$ENGINE" --pr 923 --repo "$TDIR" --diff "$TDIR/small.diff" \
@@ -1422,7 +1422,7 @@ mkdir -p "$ORPHAN_HOME"; : > "$ORPHAN_PID"; rm -f "$ORPHAN_FIFO"; mkfifo "$ORPHA
 printf 'foreign idle tab\n' > "$TDIR/tab.txt"
 env PRO_GATE_HOME="$ORPHAN_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
   PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
-  PRO_GATE_MAX_RETRIES=0 PRO_GATE_STALL_SECS=1 PRO_GATE_REATTACH_TIMEOUT=1 \
+  PRO_GATE_MAX_RETRIES=0 PRO_GATE_STALL_SECS=1 PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 PRO_GATE_REATTACH_TIMEOUT=1 \
   PRO_GATE_SALVAGE_SECS=2 PRO_GATE_RUN_LOGS=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-term-ignoring" \
   PG_TEST_PRODUCER_PID="$ORPHAN_PID" PG_TEST_BLOCK_FIFO="$ORPHAN_FIFO" NODE_OPTIONS= \
   bash "$ENGINE" --pr 924 --repo "$TDIR" --diff "$TDIR/small.diff" \
@@ -1592,6 +1592,38 @@ check 'pre-retry probe seconds: valid mid-range value 15 is honored' \
   "$([ "$(prsecs_for 15)" = 15 ]; echo $?)" "got=$(prsecs_for 15)"
 check 'pre-retry probe seconds: valid maximum bound 30 is honored' \
   "$([ "$(prsecs_for 30)" = 30 ]; echo $?)" "got=$(prsecs_for 30)"
+
+# CI wait optimization pass 3: source the real private library helper in a fresh Bash
+# process for each boundary. The helper is set only in the watchdog-kill fixtures below.
+wdsecs_for() { # $1 = value for PRO_GATE_TEST_WATCHDOG_SLEEP_SECS, or literal UNSET to leave it unset
+  if [ "$1" = UNSET ]; then
+    ( unset PRO_GATE_TEST_WATCHDOG_SLEEP_SECS; bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_test_watchdog_sleep_secs" )
+  else
+    PRO_GATE_TEST_WATCHDOG_SLEEP_SECS="$1" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_test_watchdog_sleep_secs"
+  fi
+}
+check 'watchdog sleep seconds: unset retains production default 10' \
+  "$([ "$(wdsecs_for UNSET)" = 10 ]; echo $?)" "got=$(wdsecs_for UNSET)"
+check 'watchdog sleep seconds: empty string retains production default 10' \
+  "$([ "$(wdsecs_for '')" = 10 ]; echo $?)" "got=$(wdsecs_for '')"
+check 'watchdog sleep seconds: zero retains production default 10' \
+  "$([ "$(wdsecs_for 0)" = 10 ]; echo $?)" "got=$(wdsecs_for 0)"
+check 'watchdog sleep seconds: negative retains production default 10' \
+  "$([ "$(wdsecs_for -1)" = 10 ]; echo $?)" "got=$(wdsecs_for -1)"
+check 'watchdog sleep seconds: non-numeric retains production default 10' \
+  "$([ "$(wdsecs_for abc)" = 10 ]; echo $?)" "got=$(wdsecs_for abc)"
+check 'watchdog sleep seconds: leading-zero form is rejected, retains default 10' \
+  "$([ "$(wdsecs_for 007)" = 10 ]; echo $?)" "got=$(wdsecs_for 007)"
+check 'watchdog sleep seconds: above-bound 11 retains production default 10' \
+  "$([ "$(wdsecs_for 11)" = 10 ]; echo $?)" "got=$(wdsecs_for 11)"
+check 'watchdog sleep seconds: three-digit value retains production default 10' \
+  "$([ "$(wdsecs_for 100)" = 10 ]; echo $?)" "got=$(wdsecs_for 100)"
+check 'watchdog sleep seconds: valid minimum bound 1 is honored' \
+  "$([ "$(wdsecs_for 1)" = 1 ]; echo $?)" "got=$(wdsecs_for 1)"
+check 'watchdog sleep seconds: valid middle value 5 is honored' \
+  "$([ "$(wdsecs_for 5)" = 5 ]; echo $?)" "got=$(wdsecs_for 5)"
+check 'watchdog sleep seconds: valid maximum bound 10 is honored' \
+  "$([ "$(wdsecs_for 10)" = 10 ]; echo $?)" "got=$(wdsecs_for 10)"
 
 # Oracle 0.18.0 records promptSubmitted=false before attachment completion and changes it only
 # when Send is dispatched. Complete exact-session metadata plus the existing negative conversation

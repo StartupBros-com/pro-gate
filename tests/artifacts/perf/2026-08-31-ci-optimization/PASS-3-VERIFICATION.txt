@@ -1,0 +1,124 @@
+# Pass 3 verification
+
+Command: `bash tests/engine.test.sh` (run in foreground via /usr/bin/time, not backgrounded)
+Result: exit 0; terminal output `ALL PASS`; 800/800 `ok -` lines counted; zero `not ok`,
+        `FAIL`, or `FAILURES` lines found via grep (stdout and stderr both checked).
+Elapsed: 1189.53 seconds (19m49.53s), measured by `/usr/bin/time -f 'ELAPSED_SECONDS=%e'`.
+
+Raw capture:
+  stdout: /tmp/pro-gate-pass3-reverify-114-20260831-2350/full-suite.stdout
+  stderr: /tmp/pro-gate-pass3-reverify-114-20260831-2350/full-suite.stderr
+  timing: /tmp/pro-gate-pass3-reverify-114-20260831-2350/full-suite.time -> ELAPSED_SECONDS=1189.53 / EXIT_STATUS=0
+  driver: /tmp/pro-gate-pass3-reverify-114-20260831-2350/run-full-suite.sh (foreground wrapper, waited for
+          process exit; no progress-stall path was exercised — the run completed inside a single
+          tool call, well under the 35-minute no-progress checkpoint and the 45-minute tool ceiling)
+
+The suite ran to completion on this foreground invocation; no other worktree's engine.test.sh
+process interfered (this run used its own fresh mktemp TDIR under `/tmp/pg-engine-test.*`,
+confirmed in the stderr capture below), and no wait/PID-reuse ambiguity arose because the process
+was waited on directly to exit, not polled by PID.
+
+An earlier foreground attempt this pass (`/tmp/pro-gate-pass3-reverify-114-20260831-2325`, exit 1,
+798/800 `ok -` lines, elapsed 1195.48s) hit two `FAIL` lines in the unrelated `--harvest`
+stale-throttle fixture (`stale-throttle stale scratch retains reservation with its existing exit`
+and `throttled stale scratch keeps its reservation and writes the existing cooldown`), both timing
+out on a fixed 5-second CDP-probe window (`rc=9 ... has no VERDICT after 5s`) while the host was
+under heavy concurrent load (`uptime` load average 2.79-3.55 with multiple competing `claude
+bg-spare`/`tsc` processes). That code path is `--harvest`, which never calls `run_oracle` or reads
+`pg_test_watchdog_sleep_secs`/`PRO_GATE_TEST_WATCHDOG_SLEEP_SECS` (confirmed by grep: `run_oracle`
+is invoked only at the two fresh-dispatch call sites, never from the `--harvest` branch), so it
+cannot be a regression from this pass's hoisted-cadence-resolution change. The immediate re-run
+above reproduced neither failure and is the evidence of record for this pass.
+
+stderr contents (7 lines total) are expected diagnostic noise from fixtures that intentionally
+exercise reservation-release and missing-fixture-file code paths (same category of lines seen in
+pass 1/pass 2 runs), not suite failures:
+  [pro-gate] reservation pg-run-77-1700000000-11 probe miss -> retained 1/3
+  [pro-gate] reservation pg-run-77-1700000000-11 is complete — releasing its slot; collect it with --harvest (no new spend)
+  [pro-gate] reservation pg-run-acme-infra-97-1700000009-97 ended in an exact-owned ChatGPT infrastructure error — recovery released, round retained
+  [pro-gate] reservation pg-run-stale-probe-77-1700000705-707 is complete — releasing its slot; collect it with --harvest (no new spend)
+  cp: cannot stat '/tmp/pg-engine-test.9S0Itf/prior-collected.md': No such file or directory
+  find: '/tmp/pg-engine-test.9S0Itf/home-review-decision': No such file or directory
+  find: '/tmp/pg-engine-test.9S0Itf/home-review-decision': No such file or directory
+
+New watchdog-cadence assertions, all "ok" in the captured run (11 cases, lines 333-343 of
+full-suite.stdout):
+  ok - watchdog sleep seconds: unset retains production default 10
+  ok - watchdog sleep seconds: empty string retains production default 10
+  ok - watchdog sleep seconds: zero retains production default 10
+  ok - watchdog sleep seconds: negative retains production default 10
+  ok - watchdog sleep seconds: non-numeric retains production default 10
+  ok - watchdog sleep seconds: leading-zero form is rejected, retains default 10
+  ok - watchdog sleep seconds: above-bound 11 retains production default 10
+  ok - watchdog sleep seconds: three-digit value retains production default 10
+  ok - watchdog sleep seconds: valid minimum bound 1 is honored
+  ok - watchdog sleep seconds: valid middle value 5 is honored
+  ok - watchdog sleep seconds: valid maximum bound 10 is honored
+
+Assertion count reconciliation: pass 2's completed run counted 789 `ok -` lines; this pass counts
+800 (789 + 11 new watchdog-cadence assertions above, matching PASS-3.md's stated new-assertion
+count exactly). No assertions were removed or renamed.
+
+Interpretation:
+
+- This is an observed post-change local full-suite behavior run, not a controlled same-host A/B
+  comparison against a hosted baseline. It does not by itself establish an actual wall-time
+  saving for this pass.
+- The code-level deadline budget: with the pre-existing fixture-local `STALL_SECS=1` and the
+  previously-unmodified production `sleep 10` at the watchdog loop's own poll, each of the three
+  watchdog fixtures (PR 922, PR 923, PR 924) paid a full 10-second sleep before evaluating a
+  1-second stall threshold that had already elapsed on the loop's first poll. Reducing that
+  interval to 1 second in exactly these three fixtures is a deterministic 9-second reduction per
+  fixture, 27 seconds (9 x 3) across the three — on top of pass 1's 357-second timeout-grace
+  reduction and pass 2's 87-second pre-retry-probe reduction on the separate ambiguity-fixture set.
+  This is a code-level budget reduction only; actual wall-clock savings depend on how quickly the
+  producer/tee pipeline drains within the loop's kill path and are not asserted here.
+- Cadence resolution itself is hoisted once per `run_oracle` invocation (`watchdog_sleep_secs="$(pg_test_watchdog_sleep_secs)"`
+  at line 3154, before the producer/watchdog loop begins) rather than re-run as a command
+  substitution on every iteration of the production watchdog loop's `sleep` at line 3207 — avoiding
+  repeated subprocess overhead per poll in production while preserving the exact same test-only
+  cadence lever.
+- Authoritative performance acceptance is deferred to pass 10, using a same-revision hosted
+  comparison, per mission scope.
+
+Direct boundary evidence (real library helper, sourced fresh per case via
+`bash -c ". lib/pro-gate-lib.sh; pg_test_watchdog_sleep_secs"`, matching the repository's existing
+bash -c source-lib pattern):
+
+  PASS unset: 10
+  PASS empty: 10
+  PASS zero: 10
+  PASS negative: 10
+  PASS non_numeric: 10
+  PASS leading_zero: 10
+  PASS above_max: 10
+  PASS three_digit: 10
+  PASS minimum: 1
+  PASS middle: 5
+  PASS maximum: 10
+  DIRECT_BOUNDARY_CHECKS=PASS
+
+  Script: /tmp/pro-gate-pass3-boundary-114-20260901-0000/boundary-checks.sh
+  Output: /tmp/pro-gate-pass3-boundary-114-20260901-0000/boundary-checks.out
+
+Additional completed checks:
+
+- `bash -n lib/pro-gate-lib.sh`: exit 0.
+- `bash -n bin/oracle-review.sh`: exit 0.
+- `bash -n tests/engine.test.sh`: exit 0.
+- `shellcheck --severity=error lib/pro-gate-lib.sh bin/oracle-review.sh tests/engine.test.sh`
+  (shellcheck 0.11.0): exit 0, no output.
+- `git diff --check`: exit 0 (no output).
+- `sha256sum -c tests/artifacts/perf/2026-08-31-ci-optimization/golden_checksums.txt`:
+  `engine-all-pass.txt: OK`. This file is unchanged from pass 1; pass 3 introduces no new golden
+  artifact.
+- Call-site scope grep confirms `pg_test_watchdog_sleep_secs` is invoked exactly once in
+  `bin/oracle-review.sh` — `run_oracle` resolves it into the local variable
+  `watchdog_sleep_secs` once, at line 3154, before entering the producer/watchdog loop; the loop's
+  own `sleep` at line 3207 reads that local variable rather than calling the helper again — is
+  defined exactly once in `lib/pro-gate-lib.sh` (line 53), and `PRO_GATE_TEST_WATCHDOG_SLEEP_SECS`
+  appears only in the three named fixture blocks (PR 922 line 1328, PR 923 line 1355, PR 924
+  line 1425) plus the suite's own `wdsecs_for` boundary-check driver (lines 1598-1602); no other
+  fixture gained the override and no generic fast-mode flag was introduced.
+
+Timestamp: 2026-09-01T04:08:19Z

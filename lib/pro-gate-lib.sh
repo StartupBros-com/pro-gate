@@ -48,6 +48,15 @@ pg_test_pre_retry_probe_secs() {
   esac
 }
 
+# Test-only watchdog observation cadence. Invalid input deliberately falls back
+# to the production 10-second cadence and can never extend it.
+pg_test_watchdog_sleep_secs() {
+  case "${PRO_GATE_TEST_WATCHDOG_SLEEP_SECS:-}" in
+    [1-9]|10) printf '%s\n' "$PRO_GATE_TEST_WATCHDOG_SLEEP_SECS" ;;
+    *) printf '10\n' ;;
+  esac
+}
+
 pg_runtime_version() {
   tr -d '[:space:]' < "$PRO_GATE_HOME/VERSION" 2>/dev/null || true
 }

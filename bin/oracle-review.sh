@@ -3242,10 +3242,11 @@ STALL_SECS="${PRO_GATE_STALL_SECS:-600}"
 NOTHINK_SECS="${PRO_GATE_NOTHINK_SECS:-600}"
 
 run_oracle() {  # $1 = browser model strategy (select|current|ignore)
-  local strategy="$1" job started size last_size last_change now last_line prc
+  local strategy="$1" job started size last_size last_change now last_line prc watchdog_sleep_secs
   local transcript="$WORK/oracle.${#ORACLE_LOG_TRANSCRIPTS[@]}.log"
   local proof="$WORK/oracle.${#ORACLE_LOG_TRANSCRIPTS[@]}.sha256"
   local producer_file="${transcript%.log}.pid" producer drained
+  watchdog_sleep_secs="$(pg_test_watchdog_sleep_secs)"
   ORACLE_LOG_TRANSCRIPTS+=("$transcript")
   ORACLE_LOG_PROOFS+=("$proof")
   rm -f "$transcript" "$proof" "$producer_file"
@@ -3298,7 +3299,7 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
   job=$!
   started=$SECONDS; last_size=-1; last_change=$SECONDS
   while kill -0 "$job" 2>/dev/null; do
-    sleep 10
+    sleep "$watchdog_sleep_secs"
     [ -s "$CAPTURE_OUT" ] && continue   # findings are landing — let the run finish undisturbed
     size=$(wc -c < "$RUNLOG" 2>/dev/null) || size=0
     if [ "$size" != "$last_size" ]; then last_size="$size"; last_change=$SECONDS; fi
