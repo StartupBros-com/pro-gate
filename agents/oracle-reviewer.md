@@ -133,7 +133,8 @@ Recovery never launches a fresh review. Relay exactly one plain state: **Review 
 or **Browser needs attention**. `Review superseded` retains the charge and optional audit harvest but
 releases old-head/closed-PR capacity; `No review remains` is terminal no-review proof. Re-query the
 typed decision after either state. Historical literal-`diff` keys migrate only inside exact
-proof-backed supersession; other mismatches stay fail-closed. Expert read-only diagnostics remain
+proof-backed supersession; a pre-v0.31 empty spend additionally requires marker epoch equality.
+Other mismatches stay fail-closed. Expert read-only diagnostics remain
 available through:
 
 ```bash

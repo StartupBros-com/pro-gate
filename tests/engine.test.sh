@@ -4910,9 +4910,9 @@ super_recover() { # home marker mode state current-head
 SUPER_HEAD_HOME="$TDIR/home-superseded-head"
 SUPER_HEAD_MARKER='pg-run-acme-fresh-77-1700014100-1'
 super_seed "$SUPER_HEAD_HOME" "$SUPER_HEAD_MARKER" 1700014100 "$FRESH_BASE"
-# Historical harvest fallback used literal `diff` and may carry an empty model; exact canonical
-# proof can migrate only this one legacy key during the same atomic supersession transition.
-printf 'diff\t%s\t1700014000\t2\t1\t\t1700014100\tgenerating\n' "$TDIR/superseded-audit.md" > "$SUPER_HEAD_HOME/in-progress/$SUPER_HEAD_MARKER"
+# Pre-v0.31 harvest fallback used literal `diff` with no model or spend. Binding + run-meta +
+# marker epoch prove the missing spend before the same atomic supersession transition fills it.
+printf 'diff\t%s\t1700014000\t2\t1\t\t\tgenerating\n' "$TDIR/superseded-audit.md" > "$SUPER_HEAD_HOME/in-progress/$SUPER_HEAD_MARKER"
 : > "$SUPER_GH_CALLS"; : > "$TDIR/recover-oracle-sentinel"
 super_recover "$SUPER_HEAD_HOME" "$SUPER_HEAD_MARKER" ok OPEN "$FRESH_HEAD"
 check 'exact recovery atomically canonicalizes and supersedes a legacy diff reservation' \
@@ -5063,6 +5063,26 @@ check 'arbitrary reservation key mismatch remains generating without consulting 
   "$([ "$RC" -eq 3 ] && [ ! -s "$SUPER_GH_CALLS" ] \
      && [ "$(awk -F'\t' 'NR==1{print $1" "$8}' "$SUPER_BADKEY_HOME/in-progress/$SUPER_BADKEY_MARKER")" = 'other-77 generating' ]; echo $?)" \
   "rc=$RC calls=$(cat "$SUPER_GH_CALLS") record=$(cat "$SUPER_BADKEY_HOME/in-progress/$SUPER_BADKEY_MARKER")"
+SUPER_CANON_EMPTY_HOME="$TDIR/home-superseded-canonical-empty-spend"
+SUPER_CANON_EMPTY_MARKER='pg-run-acme-fresh-77-1700014107-7'
+super_seed "$SUPER_CANON_EMPTY_HOME" "$SUPER_CANON_EMPTY_MARKER" 1700014107 "$FRESH_BASE"
+printf '%s\t%s\t1700014107\t0\t1\t\t\tgenerating\n' "$SUPER_KEY" "$TDIR/superseded-audit.md" > "$SUPER_CANON_EMPTY_HOME/in-progress/$SUPER_CANON_EMPTY_MARKER"
+: > "$SUPER_GH_CALLS"
+super_recover "$SUPER_CANON_EMPTY_HOME" "$SUPER_CANON_EMPTY_MARKER" ok MERGED "$FRESH_HEAD"
+check 'canonical key with missing spend remains fail-closed before GitHub' \
+  "$([ "$RC" -eq 3 ] && [ ! -s "$SUPER_GH_CALLS" ] \
+     && [ "$(awk -F'\t' 'NR==1{print $7" "$8}' "$SUPER_CANON_EMPTY_HOME/in-progress/$SUPER_CANON_EMPTY_MARKER")" = ' generating' ]; echo $?)" \
+  "rc=$RC calls=$(cat "$SUPER_GH_CALLS") record=$(cat "$SUPER_CANON_EMPTY_HOME/in-progress/$SUPER_CANON_EMPTY_MARKER")"
+SUPER_EPOCH_HOME="$TDIR/home-superseded-diff-wrong-epoch"
+SUPER_EPOCH_MARKER='pg-run-acme-fresh-77-1700014108-8'
+super_seed "$SUPER_EPOCH_HOME" "$SUPER_EPOCH_MARKER" 1700014107 "$FRESH_BASE"
+printf 'diff\t%s\t1700014107\t0\t1\t\t\tgenerating\n' "$TDIR/superseded-audit.md" > "$SUPER_EPOCH_HOME/in-progress/$SUPER_EPOCH_MARKER"
+: > "$SUPER_GH_CALLS"
+super_recover "$SUPER_EPOCH_HOME" "$SUPER_EPOCH_MARKER" ok MERGED "$FRESH_HEAD"
+check 'empty-spend diff with a different marker epoch remains fail-closed before GitHub' \
+  "$([ "$RC" -eq 3 ] && [ ! -s "$SUPER_GH_CALLS" ] \
+     && [ "$(awk -F'\t' 'NR==1{print $1" "$7" "$8}' "$SUPER_EPOCH_HOME/in-progress/$SUPER_EPOCH_MARKER")" = 'diff  generating' ]; echo $?)" \
+  "rc=$RC calls=$(cat "$SUPER_GH_CALLS") record=$(cat "$SUPER_EPOCH_HOME/in-progress/$SUPER_EPOCH_MARKER")"
 
 # A terminal disposition is durable proof, not another mutable progress flag. It must outrank stale
 # active/run-meta state after a crash, complete exact cleanup/refund once, and let late review bytes
