@@ -960,6 +960,11 @@ pg_attempt_snapshot() { # host owner repo pr round-key [exclude-marker] -> canon
     if [ -f "$active_file" ] && [ ! -L "$active_file" ]; then
       IFS=$'\t' read -r marker out _ _ _ _ active_state epoch < "$active_file" 2>/dev/null || true
       if ! pg_reservation_marker_ok "$marker" || [ "$marker" = "$exclude" ]; then marker=""; fi
+      # Supersession is exact-marker proof and outranks mutable sidecars left by that same attempt.
+      # A distinct active marker still wins below as newer applicable work.
+      if [ -n "$marker" ] && [ "$(pg_reservation_state "$marker" 2>/dev/null || true)" = superseded ]; then
+        marker=""; active_state=none
+      fi
       if [ -n "$marker" ]; then
         case "$active_state" in pre-charge|round-recorded|charged|run-meta-written|input-bound|submitted|unknown-fate|live) ;; *) active_state=unknown-fate;; esac
         source=active; state="$active_state"; recoverable=true; fresh=false
@@ -968,9 +973,17 @@ pg_attempt_snapshot() { # host owner repo pr round-key [exclude-marker] -> canon
   fi
 
   if [ -z "$marker" ]; then
+    # Applicable work always outranks audit-only superseded records for the same change. Only fall
+    # back to superseded when no capacity-holding reservation exists.
     reservation="$(pg_reservation_find_pr "$key" 2>/dev/null || true)"
+    [ -n "$reservation" ] || reservation="$(pg_reservation_find_pr "$key" include-superseded 2>/dev/null || true)"
     if pg_reservation_marker_ok "$reservation" && [ "$reservation" != "$exclude" ]; then
-      marker="$reservation"; source=reservation; state=recoverable; recoverable=true; fresh=false
+      marker="$reservation"; source=reservation
+      if [ "$(pg_reservation_state "$marker" 2>/dev/null || echo generating)" = superseded ]; then
+        state=superseded; recoverable=false; fresh=true
+      else
+        state=recoverable; recoverable=true; fresh=false
+      fi
       rec="$(pg_run_meta_read "$marker" 2>/dev/null || true)"
       if [ -n "$rec" ]; then IFS=$'\t' read -r _ _ _ _ _ out epoch <<<"$rec"; fi
     fi
@@ -1037,7 +1050,7 @@ pg_reservation_guard_release() {
 }
 
 pg_reservation_write() { # marker [pr] [out] [slot] [model] [spend_epoch] -- empty fields preserve the record's
-  local marker="$1" pr="${2:-}" out="${3:-}" slot="${4:-}" model="${5:-}" spend="${6:-}" dir rc created prev_pr="" prev_slot="" prev_model="" prev_spend=""
+  local marker="$1" pr="${2:-}" out="${3:-}" slot="${4:-}" model="${5:-}" spend="${6:-}" dir rc created state tmp prev_pr="" prev_slot="" prev_model="" prev_spend="" prev_state=""
   pg_reservation_marker_ok "$marker" || return 1
   dir="$(pg_reservation_dir)"; mkdir -p "$dir" 2>/dev/null || return 1
   pg_reservation_guard_acquire || return 1
@@ -1050,12 +1063,14 @@ pg_reservation_write() { # marker [pr] [out] [slot] [model] [spend_epoch] -- emp
   created=""
   # awk (NOT `read`): tab is IFS-whitespace, so consecutive tabs from an empty slot/model
   # collapse and shift later fields — the same trap pg_reservation_read_model documents.
+  if [ -L "$dir/$marker" ]; then pg_reservation_guard_release; return 1; fi
   if [ -f "$dir/$marker" ]; then
     prev_pr="$(awk -F'\t' 'NR==1{print $1}' "$dir/$marker" 2>/dev/null)"
     created="$(awk -F'\t' 'NR==1{print $3}' "$dir/$marker" 2>/dev/null)"
     prev_slot="$(awk -F'\t' 'NR==1{print $5}' "$dir/$marker" 2>/dev/null)"
     prev_model="$(awk -F'\t' 'NR==1{print $6}' "$dir/$marker" 2>/dev/null)"
     prev_spend="$(awk -F'\t' 'NR==1{print $7}' "$dir/$marker" 2>/dev/null)"
+    prev_state="$(awk -F'\t' 'NR==1{print $8}' "$dir/$marker" 2>/dev/null)"
   fi
   case "$created" in ''|*[!0-9]*) created="$(date +%s)";; esac
   [ -n "$pr" ] || pr="${prev_pr:-diff}"
@@ -1068,13 +1083,16 @@ pg_reservation_write() { # marker [pr] [out] [slot] [model] [spend_epoch] -- emp
   # marker's pre-queue launch time. Empty on legacy records; readers fall back accordingly.
   [ -n "$spend" ] || spend="$prev_spend"
   case "$spend" in *[!0-9]*) spend="";; esac
-  # v0.33 (#82): field 8 is the lifecycle state. THIS write is a positive live observation (a run
-  # reserving, or a harvest that found it still generating), so it re-arms "generating" rather
-  # than inheriting a stale "complete" — capacity must be re-held the moment the turn is live
-  # again. Only pg_reservation_set_state marks completion.
-  printf '%s\t%s\t%s\t0\t%s\t%s\t%s\tgenerating\n' "$pr" "$out" "$created" "$slot" "$model" "$spend" > "$dir/$marker.tmp" 2>/dev/null \
-    && mv -f "$dir/$marker.tmp" "$dir/$marker"
-  rc=$?; pg_reservation_guard_release; return "$rc"
+  # v0.33 (#82): field 8 is the lifecycle state. Positive live evidence re-arms an ordinary
+  # complete/generating record, but never a proof-backed superseded one: an old-head review stays
+  # collectable without regaining capacity merely because its conversation is still rendering.
+  case "$prev_state" in superseded) state=superseded;; *) state=generating;; esac
+  tmp="$(mktemp "$dir/.${marker}.write.XXXXXX" 2>/dev/null)" \
+    || { pg_reservation_guard_release; return 1; }
+  printf '%s\t%s\t%s\t0\t%s\t%s\t%s\t%s\n' "$pr" "$out" "$created" "$slot" "$model" "$spend" "$state" > "$tmp" 2>/dev/null \
+    && mv -f "$tmp" "$dir/$marker"
+  rc=$?; [ "$rc" -eq 0 ] || rm -f "$tmp" 2>/dev/null
+  pg_reservation_guard_release; return "$rc"
 }
 
 # pg_reservation_read_model <marker>: echo the model field (6th) recorded for an in-progress
@@ -1188,6 +1206,11 @@ pg_reservation_note_miss() {
   dir="$(pg_reservation_dir)"; f="$dir/$marker"
   pg_reservation_guard_acquire || { echo "retained 0/$miss_limit"; return 0; }
   if [ ! -f "$f" ]; then pg_reservation_guard_release; echo released; return 0; fi
+  # Superseded work is intentionally retained for optional audit harvest and already holds no
+  # capacity. Absence cannot improve that proof, so it must not rewrite or terminalize the record.
+  if [ "$(awk -F'\t' 'NR==1{print $8}' "$f" 2>/dev/null)" = superseded ]; then
+    pg_reservation_guard_release; echo "retained superseded"; return 0
+  fi
   # Every miss source shares the same wall-clock spacing. This check runs under the reservation
   # guard so concurrent harvest/recover/reconcile callers cannot compress one absence window into
   # the full terminal threshold.
@@ -1235,14 +1258,16 @@ pg_reservation_note_miss() {
   fi
 }
 
-pg_reservation_find_pr() { # pr-key -> marker (oldest, best-effort; files are reconciled first)
-  local pr="$1" dir f found_pr
+pg_reservation_find_pr() { # pr-key [include-superseded] -> marker (oldest, best-effort)
+  local pr="$1" include="${2:-}" dir f found_pr state
   [ -n "$pr" ] || return 1
   dir="$(pg_reservation_dir)"; [ -d "$dir" ] || return 1
   for f in "$dir"/*; do
     [ -f "$f" ] || continue
     pg_reservation_marker_ok "$(basename "$f")" || continue
-    { IFS=$'\t' read -r found_pr _ < "$f"; } 2>/dev/null || continue
+    found_pr="$(awk -F'\t' 'NR==1{print $1}' "$f" 2>/dev/null)"
+    state="$(awk -F'\t' 'NR==1{print $8}' "$f" 2>/dev/null)"
+    [ "$state" = superseded ] && [ "$include" != include-superseded ] && continue
     [ "$found_pr" = "$pr" ] && { basename "$f"; return 0; }
   done
   return 1
@@ -1271,7 +1296,7 @@ pg_reservation_slot_plan() {
       # Empty/legacy state reads as generating, so pre-state records keep their hold — an
       # unknown state must never free capacity (overbooking the account is the worse error).
       state="$(awk -F'\t' 'NR==1{print $8}' "$f" 2>/dev/null)"
-      [ "$state" = complete ] && continue
+      case "$state" in complete|superseded) continue;; esac
       slot="$(awk -F'\t' 'NR==1{print $5}' "$f" 2>/dev/null)"
       case "$slot" in
         ''|*[!0-9]*) legacy=$(( legacy + 1 ));;
@@ -1293,21 +1318,25 @@ pg_reservation_slot_plan() {
   printf '%s|%s|%s\n' "$r" "${excl# }" "$avail"
 }
 
-# pg_reservation_set_state <marker> <generating|complete>: flip ONLY the lifecycle field,
+# pg_reservation_set_state <marker> <generating|complete|superseded>: flip ONLY the lifecycle field,
 # preserving every other field verbatim. Deliberately not pg_reservation_write: that helper takes
 # `out` as an argument and would blank the harvest pointer when called without it, and it resets
 # the miss counter. Marking completion must change exactly one thing — whether this review still
 # occupies account capacity — and nothing about how it is later collected (#82).
 pg_reservation_set_state() {
-  local marker="$1" state="$2" dir f rc pr out created misses slot model spend
-  case "$state" in generating|complete) ;; *) return 1;; esac
+  local marker="$1" state="$2" dir f rc pr out created misses slot model spend current tmp
+  case "$state" in generating|complete|superseded) ;; *) return 1;; esac
   pg_reservation_marker_ok "$marker" || return 1
   dir="$(pg_reservation_dir)"; f="$dir/$marker"
-  [ -f "$f" ] || return 1
+  [ -f "$f" ] && [ ! -L "$f" ] || return 1
   pg_reservation_guard_acquire || return 1
   # Re-check under the guard: a concurrent harvest may have released the record while we probed,
   # and rewriting here would resurrect a collected reservation and re-block capacity until TTL.
-  if [ ! -f "$f" ]; then pg_reservation_guard_release; return 1; fi
+  if [ ! -f "$f" ] || [ -L "$f" ]; then pg_reservation_guard_release; return 1; fi
+  # Supersession is monotonic. Later recovery/harvest bookkeeping may refresh the record, but no
+  # generic state write can make obsolete evidence occupy account capacity again.
+  current="$(awk -F'\t' 'NR==1{print $8}' "$f" 2>/dev/null)"
+  [ "$current" = superseded ] && state=superseded
   # awk per field, NOT `read`: tab is IFS-whitespace, so consecutive tabs from an empty
   # slot/model collapse and shift every later field.
   pr="$(awk -F'\t' 'NR==1{print $1}' "$f" 2>/dev/null)"
@@ -1318,14 +1347,17 @@ pg_reservation_set_state() {
   model="$(awk -F'\t' 'NR==1{print $6}' "$f" 2>/dev/null)"
   spend="$(awk -F'\t' 'NR==1{print $7}' "$f" 2>/dev/null)"
   case "$misses" in ''|*[!0-9]*) misses=0;; esac
+  tmp="$(mktemp "$dir/.${marker}.state.XXXXXX" 2>/dev/null)" \
+    || { pg_reservation_guard_release; return 1; }
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$pr" "$out" "$created" "$misses" "$slot" "$model" "$spend" "$state" > "$f.tmp" 2>/dev/null \
-    && mv -f "$f.tmp" "$f"
-  rc=$?; pg_reservation_guard_release; return "$rc"
+    "$pr" "$out" "$created" "$misses" "$slot" "$model" "$spend" "$state" > "$tmp" 2>/dev/null \
+    && mv -f "$tmp" "$f"
+  rc=$?; [ "$rc" -eq 0 ] || rm -f "$tmp" 2>/dev/null
+  pg_reservation_guard_release; return "$rc"
 }
 
 # pg_reservation_holding_count: how many reservations actually OCCUPY account capacity, i.e.
-# everything except the ones proven complete. Distinct from pg_reservation_count, which counts
+# everything except the ones proven complete or superseded. Distinct from pg_reservation_count, which counts
 # collectable records: once a finished review stops holding its slot, "a reservation exists" and
 # "capacity is reserved" stop being the same question, and a timeout caused by genuinely busy
 # runs must not be blamed on an uncollected review that is holding nothing (#82).
@@ -1334,7 +1366,7 @@ pg_reservation_holding_count() {
   dir="$(pg_reservation_dir)"; [ -d "$dir" ] || { echo 0; return 0; }
   for f in "$dir"/*; do
     [ -f "$f" ] || continue
-    [ "$(awk -F'\t' 'NR==1{print $8}' "$f" 2>/dev/null)" = complete ] && continue
+    case "$(awk -F'\t' 'NR==1{print $8}' "$f" 2>/dev/null)" in complete|superseded) continue;; esac
     n=$(( n + 1 ))
   done
   echo "$n"
@@ -1350,6 +1382,7 @@ pg_report_capacity_holders() {
   dir="$(pg_reservation_dir)"; [ -d "$dir" ] || return 0
   for f in "$dir"/*; do
     [ -f "$f" ] || continue
+    case "$(awk -F'\t' 'NR==1{print $8}' "$f" 2>/dev/null)" in complete|superseded) continue;; esac
     held=$(( held + 1 ))
   done
   [ "$held" -gt 0 ] || return 0
@@ -1360,8 +1393,8 @@ pg_report_capacity_holders() {
     pr="$(awk -F'\t' 'NR==1{print $1}' "$f" 2>/dev/null)"
     state="$(pg_reservation_state "$marker" 2>/dev/null || echo generating)"
     case "$state" in
-      complete) echo "  $marker  [$pr] complete — finished, awaiting collection" >&2 ;;
-      *)        echo "  $marker  [$pr] generating — still using the account" >&2 ;;
+      complete|superseded) continue ;;
+      *) echo "  $marker  [$pr] generating — still using the account" >&2 ;;
     esac
   done
   echo "  collect a finished one for FREE (no new spend, never re-run):" >&2
@@ -1369,16 +1402,16 @@ pg_report_capacity_holders() {
 }
 
 # pg_reservation_state <marker>: echo the lifecycle state (8th field) of a reservation —
-# "complete" once its review is provably finished, "generating" otherwise. Legacy records
-# (pre-v0.33, fewer than 8 fields) read back empty and are reported as generating, so every
-# caller treats an unknown state as still occupying account capacity.
+# "complete" once its review is provably finished, "superseded" once immutable target proof shows
+# it cannot apply to the current/merged PR, and "generating" otherwise. Legacy/unknown states keep
+# occupying capacity (fail closed).
 pg_reservation_state() {
   local marker="$1" f state
   pg_reservation_marker_ok "$marker" || return 1
   f="$(pg_reservation_dir)/$marker"
   [ -f "$f" ] || return 1
   state="$(awk -F'\t' 'NR==1{print $8}' "$f" 2>/dev/null)"
-  case "$state" in complete) echo complete;; *) echo generating;; esac
+  case "$state" in complete) echo complete;; superseded) echo superseded;; *) echo generating;; esac
 }
 
 # pg_reservation_expire_if_stale <marker>: report THIS marker past TTL without releasing it.
@@ -1449,6 +1482,7 @@ pg_reservation_reconcile() {
   for f in "$dir"/*; do
     [ -f "$f" ] || continue; marker="$(basename "$f")"
     pg_reservation_marker_ok "$marker" || continue
+    [ "$(pg_reservation_state "$marker" 2>/dev/null || echo generating)" = superseded ] && continue
     # Never reap a marker that is being COLLECTED RIGHT NOW (#68 gate P1, r2 P1). Removing it
     # mid-harvest lets a concurrent same-change run submit a duplicate, and a still-generating
     # result would then recreate the record from scratch — fresh `created` (defeating TTL

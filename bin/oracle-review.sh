@@ -34,7 +34,8 @@
 #       newest charged run, while unproved or ambiguous candidates only disambiguate. It returns
 #       a verified artifact or runs marker-only harvest; it never dispatches --pr, creates a new
 #       slot, or spends a new round. Plain states: Review ready; Checking for completed review;
-#       Still working; Browser needs attention. A readable tab can be stale, so the engine safely
+#       Still working; Review superseded; No review remains; Browser needs attention. A readable
+#       tab can be stale, so the engine safely
 #       revalidates the canonical server conversation without changing the source tab.
 set -uo pipefail
 
@@ -513,8 +514,12 @@ pg_review_decision_cli() {
   fi
   reservation_marker=""; reservation_state=none
   if [ "$attempt_source" = reservation ]; then
-    reservation_marker="$active_marker"; reservation_state=live
-    active_marker=""; active_state=none
+    if [ "$active_state" = superseded ]; then
+      active_marker=""; active_state=none
+    else
+      reservation_marker="$active_marker"; reservation_state=live
+      active_marker=""; active_state=none
+    fi
   fi
   if pg_round_guard "$round_key" >/dev/null 2>&1; then governor_granted=true; fi
 
@@ -611,6 +616,41 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
     exit 2
   }
   recover_marker_key() { local m="$1" k; k="${m#pg-run-}"; printf '%s\n' "${k%-*-*}"; }
+  recover_superseded_reason() { # marker -> proof-backed reason when PR closed/merged or head moved
+    local marker="$1" binding meta host owner repo pr bound_head binding_epoch mh mo mr mkey mpr mout mspend rkey rspend gh_bin timeout_bin payload state current_head
+    # The immutable binding and canonical charged run metadata must identify the same exact attempt.
+    # A valid-but-crossed sidecar must never let another repository/PR release this marker.
+    binding="$(pg_review_input_binding_read "$marker" 2>/dev/null || true)"; [ -n "$binding" ] || return 1
+    meta="$(pg_run_meta_read "$marker" 2>/dev/null || true)"; [ -n "$meta" ] || return 1
+    IFS=$'\t' read -r mh mo mr mkey mpr mout mspend <<<"$meta"
+    host="$(jq -r .repository.host <<<"$binding")"; owner="$(jq -r .repository.owner <<<"$binding")"
+    repo="$(jq -r .repository.repo <<<"$binding")"; pr="$(jq -r .target.pr <<<"$binding")"
+    bound_head="$(jq -r .target.head_oid <<<"$binding")"; binding_epoch="$(jq -r .charged_spend_epoch <<<"$binding")"
+    pg_canonical_repo_ok "$host" "$owner" "$repo" || return 1
+    case "$pr" in ''|*[!0-9]*) return 1;; esac
+    case "$bound_head" in ''|*[!0-9a-f]*) return 1;; esac
+    { [ "${#bound_head}" -eq 40 ] || [ "${#bound_head}" -eq 64 ]; } || return 1
+    [ "$host" = "$mh" ] && [ "$owner" = "$mo" ] && [ "$repo" = "$mr" ] \
+      && [ "$pr" = "$mpr" ] && [ "$binding_epoch" = "$mspend" ] || return 1
+    rkey="$(awk -F'\t' 'NR==1{print $1}' "$(pg_reservation_dir)/$marker" 2>/dev/null)"
+    rspend="$(awk -F'\t' 'NR==1{print $7}' "$(pg_reservation_dir)/$marker" 2>/dev/null)"
+    [ "$rkey" = "$mkey" ] && [ "$rspend" = "$mspend" ] || return 1
+    gh_bin="${PRO_GATE_GH_BIN:-gh}"; command -v "$gh_bin" >/dev/null 2>&1 || return 1
+    timeout_bin="${PRO_GATE_TIMEOUT_BIN:-timeout}"
+    command -v "$timeout_bin" >/dev/null 2>&1 || return 1
+    payload="$("$timeout_bin" -k 1s 10s "$gh_bin" pr view "$pr" --repo "$host/$owner/$repo" --json state,headRefOid 2>/dev/null || true)"
+    state="$(jq -r '.state // ""' <<<"$payload" 2>/dev/null)"
+    current_head="$(jq -r '.headRefOid // ""' <<<"$payload" 2>/dev/null)"
+    case "$state" in
+      MERGED|CLOSED) printf 'pr-%s\n' "$(printf '%s' "$state" | tr '[:upper:]' '[:lower:]')"; return 0;;
+      OPEN) ;;
+      *) return 1;;
+    esac
+    case "$current_head" in ''|*[!0-9a-f]*) return 1;; esac
+    { [ "${#current_head}" -eq 40 ] || [ "${#current_head}" -eq 64 ]; } || return 1
+    [ "$current_head" = "$bound_head" ] && return 1
+    printf 'head-moved:%s:%s\n' "$bound_head" "$current_head"
+  }
   REC_SELECTED=""; REC_SELECTED_OUT=""; REC_QUERY_NUM=""; REC_HOST=""; REC_OWNER=""; REC_REPO_NAME=""
   case "$RECOVER_QUERY" in
     pg-run-*)
@@ -797,6 +837,26 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
     REC_RESTORE_STATE="$(pg_reservation_restore_from_meta "$REC_SELECTED" 2>/dev/null || true)"
     case "$REC_RESTORE_STATE" in created) REC_RESTORED=1;; existing) :;; *) echo "Browser needs attention" >&2; exit 3;; esac
   fi
+  # A closed/merged PR or immutable binding to an older head makes this review obsolete, not
+  # unsubmitted. Preserve its charge and all marker-addressed artifacts for optional audit harvest,
+  # but release shared capacity before any browser probe. Missing or malformed proof stays fail-closed.
+  REC_RES_STATE="$(pg_reservation_state "$REC_SELECTED" 2>/dev/null || true)"
+  if [ "$REC_RES_STATE" = superseded ]; then
+    echo "Review superseded" >&2
+    exit 6
+  fi
+  REC_SUPERSEDED_PROOF="$(recover_superseded_reason "$REC_SELECTED" 2>/dev/null || true)"
+  if [ -n "$REC_SUPERSEDED_PROOF" ]; then
+    pg_reservation_set_state "$REC_SELECTED" superseded \
+      || { echo "Browser needs attention" >&2; exit 3; }
+    REC_SUPERSEDED_EVENT="$(jq -nc --arg ts "$(date +%Y-%m-%dT%H:%M:%S%z)" \
+      --arg marker "$REC_SELECTED" --arg proof "$REC_SUPERSEDED_PROOF" \
+      '{ts:$ts,outcome:"superseded",marker:$marker,proof:$proof,holds_capacity:false,charge_retained:true}' 2>/dev/null || true)"
+    pg_ledger_append "$REC_SUPERSEDED_EVENT"
+    echo "Review superseded" >&2
+    exit 6
+  fi
+
   if [ "$REC_RESTORED" = 1 ] && [ "${PRO_GATE_HARVEST_TTL_SWEEP:-1}" = 1 ] \
      && [ "$(pg_reservation_expire_if_stale "$REC_SELECTED")" = stale ] \
      && command -v node >/dev/null 2>&1; then
@@ -1050,10 +1110,12 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
       IFS=$'\t' read -r r_pr r_out r_created r_miss r_slot r_model < "$f" 2>/dev/null || true
       st_match "$m" "$r_pr" || continue
       case "$r_created" in ''|*[!0-9]*) r_age="";; *) r_age=$(( ST_NOW - r_created ));; esac
-      # Only an UNEXPIRED reservation marks the change recoverable: an expired one will be
+      r_life="$(pg_reservation_state "$m" 2>/dev/null || echo generating)"
+      # Only an UNEXPIRED, applicable reservation marks the change recoverable. Superseded review
+      # state remains optionally collectable but cannot block current-head admission or capacity.
       # reaped at the next fresh-run reconciliation, and treating it as live would let a
       # repeatedly-failing caller defer forever (gate #61 r1 P1).
-      if [ -z "$r_age" ] || [ "$r_age" -lt "$ST_RES_TTL" ] 2>/dev/null; then
+      if { [ -z "$r_age" ] || [ "$r_age" -lt "$ST_RES_TTL" ] 2>/dev/null; } && [ "$r_life" != superseded ]; then
         ST_RECOVERABLE=1
         [ -n "$ST_RECOVER_REASON" ] || ST_RECOVER_REASON="unexpired in-progress reservation ($m)"
       fi
@@ -1071,10 +1133,10 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
       for _ub in "$r_out".unbound.*; do [ -e "$_ub" ] && r_unbound=$(( r_unbound + 1 )); done
       r_crossbound=0
       [ -s "$PRO_GATE_HOME/crossbound/$m" ] && r_crossbound="$(grep -c . "$PRO_GATE_HOME/crossbound/$m" 2>/dev/null || echo 1)"
-      # v0.33 (#82): a reservation proven complete no longer holds a review slot, so say so —
-      # "still generating" and "finished, just uncollected" call for different operator action.
-      r_life="$(pg_reservation_state "$m" 2>/dev/null || echo generating)"
-      if [ "$r_crossbound" -gt 0 ] 2>/dev/null; then
+      # v0.33+ lifecycle state distinguishes capacity ownership from optional collectability.
+      if [ "$r_life" = superseded ]; then
+        [ -n "$ST_HINT" ] || ST_HINT="superseded old-head review holds no capacity and cannot authorize the current PR; optional audit harvest: $r_cmd"
+      elif [ "$r_crossbound" -gt 0 ] 2>/dev/null; then
         ST_HINT="STUCK (cross-bound): the conversation remembered for $m carries ANOTHER run's completed answer — see $PRO_GATE_HOME/crossbound/$m. Do NOT delete state or set PRO_GATE_REQUIRE_NONCE=0. The bad memo is discarded; bounded exact-marker misses will terminalize recovery while retaining the charged round."
       elif [ "$r_unbound" -gt 0 ]; then
         ST_HINT="AMBIGUOUS: ${r_unbound} harvested capture(s) for $m completed but carried no run-marker echo (see ${r_out}.unbound.*). This is retryable — it may be an older answer while yours still generates. Retry the FREE harvest: $r_cmd"
@@ -1086,7 +1148,7 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
           --arg age "${r_age:-}" --arg miss "${r_miss:-}" --arg model "${r_model:-}" \
           --arg url "$r_url" --arg harvest_cmd "$r_cmd" --argjson unbound "$r_unbound" \
           --argjson crossbound "$r_crossbound" --arg life "$r_life" \
-          '{marker:$marker,pr:$pr,out:$out,age_secs:(($age|tonumber?)//null),miss_streak:(($miss|tonumber?)//null),model:$model,conversation_url:$url,harvest_cmd:$harvest_cmd,unbound_captures:$unbound,crossbound_hits:$crossbound,holds_capacity:($life != "complete"),state:(if $crossbound > 0 then "cross-bound" elif $unbound > 0 then "unbindable-ambiguous" elif $life == "complete" then "complete-awaiting-harvest" else "generating-or-recoverable" end)}' \
+          '{marker:$marker,pr:$pr,out:$out,age_secs:(($age|tonumber?)//null),miss_streak:(($miss|tonumber?)//null),model:$model,conversation_url:$url,harvest_cmd:$harvest_cmd,unbound_captures:$unbound,crossbound_hits:$crossbound,holds_capacity:($life != "complete" and $life != "superseded"),state:(if $life == "superseded" then "superseded-awaiting-optional-harvest" elif $crossbound > 0 then "cross-bound" elif $unbound > 0 then "unbindable-ambiguous" elif $life == "complete" then "complete-awaiting-harvest" else "generating-or-recoverable" end)}' \
           >> "$ST_TMP/res.jsonl" 2>/dev/null
       else
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$m" "${r_pr:-?}" "${r_age:-?}" "${r_miss:-?}" "$r_unbound" "$r_crossbound" "$r_cmd" >> "$ST_TMP/res.tsv"
@@ -1730,7 +1792,8 @@ pg_fresh_dispatch_recheck() { # sets PG_FRESH_DECISION/PG_FRESH_ACTION
   elif [ "$attempt_source" = disposition ]; then
     if [ "$(jq -r .fresh_eligible <<<"$attempt_snapshot")" = true ]; then active_marker=""; astate=none; else astate=unknown-fate; fi
   elif [ "$attempt_source" = reservation ]; then
-    reservation="$active_marker"; active_marker=""; astate=none
+    if [ "$astate" = superseded ]; then active_marker=""; astate=none
+    else reservation="$active_marker"; active_marker=""; astate=none; fi
   fi
   pg_round_guard "$ROUND_KEY" >/dev/null 2>&1 && granted=true
   facts="$(jq -cnS --arg h "$PG_META_HOST" --arg o "$PG_META_OWNER" --arg r "$PG_META_REPO" --arg head "$head" --argjson p "$PR_NUM" \

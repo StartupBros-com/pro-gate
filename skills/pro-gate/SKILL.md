@@ -132,10 +132,12 @@ Dispatch a replacement action instead of the stale one. Never translate collecti
 ```
 
 Recovery never launches a fresh review. Relay exactly one plain state: **Review ready**,
-**Checking for completed review**, **Still working**, **No review remains**, or **Browser needs attention**.
-`No review remains` means terminal proof released recovery ownership; re-query the typed decision
-instead of deleting state or forcing a round. A pre-v0.37 run-meta-only attempt is migrated into
-bounded no-spend recovery automatically. Expert read-only
+**Checking for completed review**, **Still working**, **Review superseded**, **No review remains**,
+or **Browser needs attention**. `Review superseded` means immutable old-head or merged/closed PR
+proof released capacity while retaining the charge and optional audit harvest. `No review remains`
+means terminal proof released recovery ownership. In either case, re-query the typed decision instead
+of deleting state or forcing a round. Missing binding/GitHub proof remains fail-closed. A pre-v0.37
+run-meta-only attempt is migrated into bounded no-spend recovery automatically. Expert read-only
 and direct marker diagnostics remain:
 
 ```bash

@@ -144,7 +144,7 @@ for caller in "$ROOT/skills/pro-gate/SKILL.md" "$ROOT/agents/oracle-reviewer.md"
   check "$caller_name recover route has no fresh --pr dispatch" sh -c "! grep -F -- '--recover <PR|URL|marker> --pr' '$caller' | grep -q ."
   check "$caller_name guarantees recovery launches no fresh review" grep -Fq 'never launches a fresh review' "$caller"
   check "$caller_name recovery does not prescribe manual refresh" sh -c "! grep -Eqi 'manual (browser )?(refresh|reload)' '$caller'"
-  check "$caller_name documents four plain recovery states" sh -c "for state in 'Review ready' 'Checking for completed review' 'Still working' 'Browser needs attention'; do grep -Fq \"\$state\" '$caller' || exit 1; done"
+  check "$caller_name documents all plain recovery states" sh -c "for state in 'Review ready' 'Checking for completed review' 'Still working' 'Review superseded' 'No review remains' 'Browser needs attention'; do grep -Fq \"\$state\" '$caller' || exit 1; done"
 done
 check "skill rejects open-tab ground-truth guidance" sh -c "! grep -Fq 'Ground truth is the BROWSER' '$ROOT/skills/pro-gate/SKILL.md'"
 check "skill preserves expert status JSON diagnostics" grep -Fq 'oracle-review.sh" --status <pr-number|pr-url|marker> --json' "$ROOT/skills/pro-gate/SKILL.md"
