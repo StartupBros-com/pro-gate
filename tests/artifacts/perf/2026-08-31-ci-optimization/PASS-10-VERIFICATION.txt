@@ -1,0 +1,172 @@
+PASS 10/10 VERIFICATION — CONVERGED (golden + hosted convergence gate)
+=======================================================================
+
+Scope
+-----
+Pass 10 ran the exact `.github/workflows/ci.yml` "Validate data and shell files" block plus all
+eight exact "Run tests" commands, serially, in the foreground, from one Bash tool call with a
+3,600,000ms (3600s) timeout, using a fresh scratch directory
+/tmp/pro-gate-pass10.hRASi2/ (created via mktemp -d). No test command was parallelized or
+backgrounded. No prior artifact, golden file, source file, test file, or .skill-loop-progress.md
+was read for the purpose of re-review; only .skill-loop-progress.md's pre-existing modification
+(from prior passes) remains uncommitted, as before. This pass does not re-review the diff (the
+prior adversarial diff review already found zero correctness findings and verified all production
+defaults — that finding is carried into PASS-10.md, not reproduced here).
+
+Driver
+------
+/tmp/pro-gate-pass10.hRASi2/run-pass10.sh — one foreground driver script invoked once via Bash
+with timeout 3600000ms. Captured each command's stdout/stderr/time to scratch files via
+`/usr/bin/time -f 'wall_seconds=%e\nexit_status=%x'`; printed only compact per-step summary lines.
+The driver's built-in retry path (allowed exactly once, only for the documented stale-throttle
+`--harvest` flake per pass 3's precedent) was present but not triggered — every step passed on
+attempt 1.
+
+A post-hoc fix (/tmp/pro-gate-pass10.hRASi2/fix-node-parse.sh) corrected the driver's summary
+parser for `node --test`'s spec-reporter TAP summary (it prints `tests`/`pass`/`fail` counts as
+color-coded info-glyph lines in stdout, not as `# tests N` TAP lines) — this reran no command; it
+only recomputed the manifest row and the PASS/FAIL verdict from the single already-captured
+05-cdp-salvage.stdout/.stderr/.time files.
+
+Captured manifest commands and results
+---------------------------------------
+00-validation
+  command: find … -name '*.json' … -exec jq empty; find … -name '*.yaml' -o -name '*.yml' …
+           -exec yq eval '.'; find … -name '*.sh' -print0 | xargs -0 shellcheck --severity=error
+           (exact three-line block from ci.yml's "Validate data and shell files" step)
+  result: returncode=0, wall_seconds=21.91, terminal=VALIDATION PASS (exit 0 stands in for a
+          marker; this block has no ALL PASS/TAP output by design)
+
+01-engine
+  command: bash tests/engine.test.sh
+  result: returncode=0, wall_seconds=1131.50, internal_ok_dash=825, not_ok=0, terminal=ALL PASS,
+          attempts=1
+
+02-daemon-reload
+  command: bash tests/daemon-reload.test.sh
+  result: returncode=0, wall_seconds=13.58, internal_ok_dash=74, not_ok=0, terminal=ALL PASS
+
+03-autoupdate
+  command: bash tests/autoupdate.test.sh
+  result: returncode=0, wall_seconds=5.69, internal_ok_dash=35, not_ok=0, terminal=ALL PASS
+
+04-browser-launch
+  command: bash tests/browser-launch.test.sh
+  result: returncode=0, wall_seconds=11.06, internal_ok_dash=17, not_ok=0, terminal=ALL PASS
+
+05-cdp-salvage
+  command: node --test tests/cdp-salvage.test.mjs
+  result: returncode=0, wall_seconds=151.78, internal_ok_dash=298, not_ok=0,
+          node:test tests=1 pass=1 fail=0
+
+06-distribution
+  command: bash tests/distribution.test.sh
+  result: returncode=0, wall_seconds=57.88, internal_ok_dash=133, not_ok=0, terminal=ALL PASS
+
+07-release-train
+  command: bash tests/release-train.test.sh
+  result: returncode=0, wall_seconds=0.55, internal_ok_dash=58, not_ok=0, terminal=ALL PASS
+
+08-release-assets
+  command: bash tests/release-assets.test.sh
+  result: returncode=0, wall_seconds=0.14, internal_ok_dash=23, not_ok=0, terminal=ALL PASS
+
+Manifest invariants
+--------------------
+- status=passed; command count (validation + 8 tests)=9; every returncode=0.
+- Total wall (validation + 8 tests) = 21.91 + 1131.50 + 13.58 + 5.69 + 11.06 + 151.78 + 57.88 +
+  0.55 + 0.14 = 1394.09 seconds.
+- All 6 shell suites terminal marker = ALL PASS. Node suite = 1 pass / 0 fail.
+- Internal assertion total across the 8 test commands = 825+74+35+17+298+133+58+23 = 1463
+  (identical assertion count to pass 9's 1463; no assertion was added or removed since pass 9,
+  consistent with passes 8-9 being non-code-changing).
+- attempts=1 for every step; the one-clean-rerun allowance for the documented stale-throttle
+  `--harvest` flake was available but not exercised.
+
+Determinism / golden cross-check
+---------------------------------
+sha256sum of each of this pass's stdout captures compared against PASS-9-current-profile.json's
+recorded capture_sha256.stdout for the same command id:
+  01-engine:          b958a76879eae90fa61e277f4925cc7aad635adebb17bb5994497c6b8677c86c  MATCH
+  02-daemon-reload:   2619db201d95ae5d65cac4c59219bea631b1811d24256bd24c464383edbcf889  MATCH
+  03-autoupdate:      63938641f3c2475277ea0392162bc69cbf5cbb82abdbf1ad14619868537b77c3  MATCH
+  04-browser-launch:  b6600cddfeae81fd914091bd1f77f9d458efb3e465cfc4d3f6d63d0c0e70bde1  MATCH
+  06-distribution:    9f7b58beebbcabfc7a70db3f2d298f56fc710d71a768555505d83480636a5b05  MATCH
+  07-release-train:   6cc0a8f1a2c2d35c0168456c465e84c1e47c6bd1f663561a3f3770262cb5ab9c  MATCH
+  08-release-assets:  a55301b63e39a17c3b3f648a0118da60e67b230a42c35ffd5b078cf63e191957  MATCH
+  05-cdp-salvage:     6f64b70784f10a2bffe92fb9b7c106f6771e502491bc016b5184ce81a8ff02bb  DIFFERS
+    (expected: Node's spec reporter embeds a non-deterministic `duration_ms` float in stdout;
+    the 298 internal ok-assertions and the tests=1/pass=1/fail=0 summary are identical)
+
+engine-all-pass.txt (pass 1's golden, 789-assertion pre-pass-2/3/4 snapshot) self-integrity:
+  sha256sum -c tests/artifacts/perf/2026-08-31-ci-optimization/golden_checksums.txt
+  result: engine-all-pass.txt: OK
+  (this file intentionally still reflects pass 1's state, as documented since pass 4; pass 10's own
+  01-engine capture, 825 assertions, is the current golden for this closure and is not expected to
+  byte-match the pass-1 snapshot)
+
+Prior artifact integrity re-check
+-----------------------------------
+sha256sum -c tests/artifacts/perf/2026-08-31-ci-optimization/PASS-9-checksums.txt
+  result:
+    tests/artifacts/perf/2026-08-31-ci-optimization/PASS-9-current-profile.json: OK
+    tests/artifacts/perf/2026-08-31-ci-optimization/PASS-9.md: OK
+    tests/artifacts/perf/2026-08-31-ci-optimization/PASS-9-VERIFICATION.txt: OK
+
+JSON validation
+----------------
+find tests/artifacts/perf/2026-08-31-ci-optimization -name '*.json' -exec jq empty {} \;
+  result: exit 0, no output. One JSON file present: PASS-9-current-profile.json (valid).
+  (Pass 10 introduces no new JSON artifact.)
+
+Syntax checks
+--------------
+bash -n on lib/pro-gate-lib.sh, bin/oracle-review.sh, tests/engine.test.sh,
+  tests/daemon-reload.test.sh, tests/autoupdate.test.sh, tests/browser-launch.test.sh,
+  tests/distribution.test.sh, tests/release-train.test.sh, tests/release-assets.test.sh
+  result: exit 0 for every file (BASH_SYNTAX_OK).
+
+node --check on tests/cdp-salvage.test.mjs, bin/cdp-salvage.mjs, bin/cdp-test-timing.mjs
+  result: exit 0 for every file (NODE_SYNTAX_OK).
+
+ShellCheck error severity
+---------------------------
+Covered by step 00-validation, which runs the CI's exact
+`find … -name '*.sh' -print0 | xargs -0 shellcheck --severity=error` over the whole repository.
+result: returncode=0 (see 00-validation above).
+
+git diff --check
+------------------
+git diff --check
+  result: exit 0, no whitespace errors.
+
+No-source-diff proof
+----------------------
+git diff --exit-code -- bin lib tests .github
+  result: exit 0, no unstaged source, test-code, or workflow diff.
+git diff --cached --exit-code -- bin lib tests .github
+  result: exit 0, no staged source, test-code, or workflow diff.
+
+Uncommitted-scope proof
+--------------------------
+git status --short (run after writing PASS-10.md, PASS-10-VERIFICATION.txt, FINAL-SUMMARY.md, and
+PASS-10-checksums.txt):
+   M .skill-loop-progress.md
+  ?? tests/artifacts/perf/2026-08-31-ci-optimization/FINAL-SUMMARY.md
+  ?? tests/artifacts/perf/2026-08-31-ci-optimization/PASS-10-VERIFICATION.txt
+  ?? tests/artifacts/perf/2026-08-31-ci-optimization/PASS-10-checksums.txt
+  ?? tests/artifacts/perf/2026-08-31-ci-optimization/PASS-10.md
+Only the pre-existing modified .skill-loop-progress.md and this pass's four new artifacts are
+uncommitted. No prior artifact, golden file, or progress-file content was edited; no stash, commit,
+or push was performed; no source or test file was modified.
+
+Hosted PR status (read-only check, no mutation)
+--------------------------------------------------
+gh pr view 115 --json number,state,url,headRefName,isDraft,mergeable
+  result: {"number":115,"state":"OPEN","isDraft":true,
+           "headRefName":"worktree-ci-wait-optimization-114","mergeable":"UNKNOWN"}
+
+No commit was created. No stash was used. No file outside this artifact directory was written.
+
+Timestamp: 2026-09-01T14:11:10Z (UTC, verification-write time; see individual .time captures in
+/tmp/pro-gate-pass10.hRASi2/ for exact per-step wall times)
