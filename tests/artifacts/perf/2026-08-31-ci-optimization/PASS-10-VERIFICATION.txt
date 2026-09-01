@@ -170,3 +170,94 @@ No commit was created. No stash was used. No file outside this artifact director
 
 Timestamp: 2026-09-01T14:11:10Z (UTC, verification-write time; see individual .time captures in
 /tmp/pro-gate-pass10.hRASi2/ for exact per-step wall times)
+
+========================================================================
+POST-REBASE TERMINAL GOLDEN — CURRENT CHECKPOINT
+========================================================================
+
+Historical record retained
+---------------------------
+The preceding section is retained unmodified as the pre-rebase checkpoint evidence. This appended
+section is the authoritative terminal capture after rebasing on `ef99b8f` (v0.37.2), not a rewrite
+of its historical measurements.
+
+Rebase proof
+------------
+HEAD = `84981c736ad8dd7eab55466cccc87dee2d699e68` (`84981c7`).
+`git merge-base ef99b8f HEAD` = `ef99b8f6ee8b5b2fa74bccafa7c07626aa67de7d`.
+`git merge-base --is-ancestor ef99b8f HEAD` = exit 0.
+Therefore HEAD is based on the required `ef99b8f` origin/main revision.
+
+Exact current CI census and capture
+-----------------------------------
+The validation source remains ci.yml lines 26-29: JSON `jq empty`, YAML `yq eval '.'`, and the
+repository-wide `shellcheck --severity=error` command. The current ci.yml lines 51-59 contain nine
+test commands rather than the historical eight because main now adds
+`bash tests/resolve-identity.test.sh`; all nine were run serially in one foreground driver with a
+3,600,000ms tool timeout.
+
+Scratch driver: `/tmp/pro-gate-pass10-post-rebase.WDq9DG/run-pass10-post-rebase.sh`
+Scratch evidence: `/tmp/pro-gate-pass10-post-rebase.WDq9DG/` (full stdout, stderr, `.time`, and
+`manifest.tsv` for each step).
+
+The successful processes captured validation through resolve-identity before the driver's original
+marker recognizer rejected that suite's documented `resolve-identity: all checks pass` terminator.
+A second recognizer correction accepted that exact terminator and Node's ANSI-suffixed summary
+lines. The same driver reused every stored successful capture and continued only the unexecuted
+commands. No validation/test process was re-executed; all actual commands have attempts=1 and the
+allowed stale-throttle `--harvest` rerun count is zero.
+
+Results
+-------
+00 validation: 0, 25.50s, VALIDATION PASS
+01 engine: 0, 1524.93s, ALL PASS, 847 `ok -`, 0 `not ok`
+02 daemon-reload: 0, 14.30s, ALL PASS, 74 `ok -`, 0 `not ok`
+03 autoupdate: 0, 5.50s, ALL PASS, 35 `ok -`, 0 `not ok`
+04 resolve-identity: 0, 0.04s, `resolve-identity: all checks pass`, 3 `ok -`, 0 `not ok`
+05 browser-launch: 0, 11.72s, ALL PASS, 17 `ok -`, 0 `not ok`
+06 cdp-salvage: 0, 152.36s, node:test tests=1/pass=1/fail=0, 298 `ok -`, 0 `not ok`
+07 distribution: 0, 56.04s, ALL PASS, 133 `ok -`, 0 `not ok`
+08 release-train: 0, 0.59s, ALL PASS, 58 `ok -`, 0 `not ok`
+09 release-assets: 0, 0.14s, ALL PASS, 23 `ok -`, 0 `not ok`
+
+Invariants: 10/10 process exits are 0; seven conventional shell suites have literal `ALL PASS` and
+the eighth has its explicit resolver success marker; Node is 1 pass / 0 fail; aggregate test
+assertions are 1,488 `ok -` and 0 `not ok`; serial total is 1,791.12s (29m 51.12s), beneath 45m.
+The detailed command strings and stdout SHA-256 values are in `PASS-10-POST-REBASE.txt`.
+
+Rebased pass map
+----------------
+Pass  historical -> current
+1     8ee53de -> 45e2384
+2     eb11e66 -> aaf2293
+3     201fd69 -> d6efb96
+4     438ed7f -> 31da6b7
+5     327da27 -> 926c66e
+6     6f5d1cd -> d97a798
+7     31c8262 -> 9afe24b
+8     e71d1a2 -> 66c91e5
+9     8a695fd -> d0f0a86
+10    verification-only historical checkpoint -> 84981c7 checkpoint
+Base for every current mapping: ef99b8f.
+
+Post-write checks
+-----------------
+The post-rebase closeout validates repository JSON with jq; this artifact set's checksum manifest;
+Bash and Node syntax; ShellCheck at error severity; `git diff --check`; and both staged/unstaged
+source, test-code, and workflow diffs with `tests/artifacts` excluded. The latter proves this
+golden closeout does not introduce an uncommitted source/test/workflow change; the intentional
+rebased branch changes relative to ef99b8f are not being denied.
+
+Review-fix closeout
+--------------------
+Final review resolves the high-severity test-mode boundary: valid timing overrides require exact
+`PRO_GATE_TEST_MODE=ci-fixture`, and accepted inherited-variable engine evidence confirms that an
+unset mode retains production defaults. PR-924's hard-cap P2 is refuted (`HARD_SECS=125` versus the
+approximately 6-second watchdog path). The outage child-ack P2 is fixed with the primary
+`Runtime.evaluate` DOM poll before stop.
+
+Focused accepted evidence: engine exit 0, 855 `ok -`, terminal `ALL PASS`; Node tests=1, pass=1,
+fail=0, 302 `ok -`, duration 159.88833346s. Fresh unaffected capture: exact validation plus daemon-
+reload, autoupdate, resolve-identity, browser-launch, distribution, release-train, and release-assets
+all exited 0 in one 900,000ms foreground-driver capture. See PASS-10-REVIEW-FIXES.md for the exact
+per-step results. This appended closeout preserves every historical measurement above.

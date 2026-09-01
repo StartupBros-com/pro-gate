@@ -116,3 +116,63 @@ overrides. Pass 10 does not re-run that review per instruction.
   was, not a single confirmation run.
 - No merge, push, stash, or commit was performed by this pass. The next human/agent action is to
   mark PR #115 ready for review once the hosted `check` run is triggered and green.
+
+---
+
+## Post-rebase terminal golden — current rebased checkpoint
+
+**Verdict: PASS.** The historical capture above remains checkpoint evidence. This clearly separated
+post-rebase capture verifies the exact current branch at `84981c7`, which descends from required
+base `ef99b8f` (`git merge-base ef99b8f HEAD` returned that base and
+`git merge-base --is-ancestor ef99b8f HEAD` exited 0).
+
+The current `.github/workflows/ci.yml` has **nine** `Run tests` commands, rather than the historical
+eight: it now includes `bash tests/resolve-identity.test.sh` between autoupdate and browser launch.
+The foreground driver ran its exact validation block and all nine current commands serially. All ten
+process steps exited 0 in **1,791.12s** (29m 51.12s), inside the job's 45-minute limit; every step
+had one attempt and the permitted stale-throttle `--harvest` rerun was unused.
+
+- Seven conventional shell suites ended `ALL PASS`; the eighth, `resolve-identity`, intentionally
+  ended `resolve-identity: all checks pass`. All eight shell suites had zero `not ok` records.
+- Node: `tests=1`, `pass=1`, `fail=0`, with 298 internal `ok -` assertions and zero `not ok`.
+- Aggregate across nine tests: **1,488** `ok -`, zero `not ok`.
+- Full compact manifest, individual wall times, assertion counts, stdout SHA-256 values, and the
+  manifest-recognizer correction record: `PASS-10-POST-REBASE.txt`.
+
+### Current rebased pass table and historical-to-current map
+
+| Pass | Historical pre-rebase commit | Current rebased commit |
+| ---: | --- | --- |
+| 1 | `8ee53de` | `45e2384` |
+| 2 | `eb11e66` | `aaf2293` |
+| 3 | `201fd69` | `d6efb96` |
+| 4 | `438ed7f` | `31da6b7` |
+| 5 | `327da27` | `926c66e` |
+| 6 | `6f5d1cd` | `d97a798` |
+| 7 | `31c8262` | `9afe24b` |
+| 8 | `e71d1a2` | `66c91e5` |
+| 9 | `8a695fd` | `d0f0a86` |
+| 10 | verification-only historical checkpoint | `84981c7` checkpoint |
+
+All current mappings are based on `ef99b8f` (v0.37.2). The terminal verification introduced no
+source, test-code, or workflow edit: both staged and unstaged comparisons for `bin`, `lib`,
+`.github`, and `tests` excluding `tests/artifacts` exit 0. This does not claim the branch has no
+intentional pass changes relative to `ef99b8f`; it proves the rebase/golden closeout added only its
+requested artifacts.
+
+---
+
+## Review-fix closeout
+
+**Verdict: PASS.** Final review resolves the high-severity timing mode boundary: valid timing
+values are honored only with exact `PRO_GATE_TEST_MODE=ci-fixture`; the accepted inherited-variable
+engine run unsets that mode and keeps production defaults. PR-924's hard-cap P2 is refuted because
+`HARD_SECS=125` does not match the approximately 6-second watchdog path. The outage child-ack P2 is
+fixed by performing the primary `Runtime.evaluate` DOM poll before stop.
+
+Accepted focused evidence: engine exit 0, 855 `ok -`, `ALL PASS`; Node `tests=1`, `pass=1`,
+`fail=0`, 302 `ok -`, duration 159.88833346s. A fresh compact 900,000ms foreground driver also ran
+the exact CI validation block and the seven unaffected suites serially: every step exited 0; walls
+were validation 24s, daemon-reload 13s, autoupdate 6s, resolve-identity 0s, browser-launch 11s,
+distribution 53s, release-train 0s, and release-assets 0s. Detailed evidence:
+`PASS-10-REVIEW-FIXES.md`. This supplements, and does not replace, historical measurements above.

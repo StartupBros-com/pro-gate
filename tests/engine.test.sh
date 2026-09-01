@@ -1289,7 +1289,7 @@ printf 'foreign idle tab\n' > "$TDIR/tab.txt"
 env PRO_GATE_HOME="$LOSS_HOME" ORACLE_HOME_DIR="$LOSS_HOME/oracle" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
   PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
   PRO_GATE_MAX_RETRIES=1 PRO_GATE_RETRY_BACKOFF=0 PRO_GATE_REATTACH_TIMEOUT=1 \
-  PRO_GATE_TIMEOUT_GRACE=1 PRO_GATE_TEST_PRE_RETRY_PROBE_SECS=1 PRO_GATE_SALVAGE_SECS=2 PRO_GATE_RUN_LOGS=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-quiet-fail" \
+  PRO_GATE_TIMEOUT_GRACE=1 PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_PRE_RETRY_PROBE_SECS=1 PRO_GATE_SALVAGE_SECS=2 PRO_GATE_RUN_LOGS=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-quiet-fail" \
   PRO_GATE_TEE_BIN="$TDIR/tee-fail-bin/tee" \
   PG_TEST_ATTEMPTS_FILE="$LOSS_ATTEMPTS" NODE_OPTIONS= \
   bash "$ENGINE" --pr 921 --repo "$TDIR" --diff "$TDIR/small.diff" \
@@ -1325,7 +1325,7 @@ RKEY_922="$(printf '%s-922' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
 printf 'foreign idle tab\n' > "$TDIR/tab.txt"
 env PRO_GATE_HOME="$STALL_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
   PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
-  PRO_GATE_MAX_RETRIES=0 PRO_GATE_STALL_SECS=1 PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 PRO_GATE_REATTACH_TIMEOUT=1 \
+  PRO_GATE_MAX_RETRIES=0 PRO_GATE_STALL_SECS=1 PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 PRO_GATE_REATTACH_TIMEOUT=1 \
   PRO_GATE_SALVAGE_SECS=2 PRO_GATE_RUN_LOGS=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-stall" \
   PG_TEST_ATTEMPTS_FILE="$STALL_ATTEMPTS" NODE_OPTIONS= \
   bash "$ENGINE" --pr 922 --repo "$TDIR" --diff "$TDIR/small.diff" \
@@ -1352,7 +1352,7 @@ RKEY_923="$(printf '%s-923' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
 printf 'foreign idle tab\n' > "$TDIR/tab.txt"
 env PRO_GATE_HOME="$SLANDED_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
   PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
-  PRO_GATE_MAX_RETRIES=0 PRO_GATE_STALL_SECS=1 PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 PRO_GATE_REATTACH_TIMEOUT=1 \
+  PRO_GATE_MAX_RETRIES=0 PRO_GATE_STALL_SECS=1 PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 PRO_GATE_REATTACH_TIMEOUT=1 \
   PRO_GATE_SALVAGE_SECS=2 PRO_GATE_RUN_LOGS=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-stall-landed" \
   NODE_OPTIONS= \
   bash "$ENGINE" --pr 923 --repo "$TDIR" --diff "$TDIR/small.diff" \
@@ -1474,7 +1474,7 @@ printf 'foreign idle tab\n' > "$TDIR/tab.txt"
 # are untouched — see PASS-4.md's isomorphism proof.
 env PRO_GATE_HOME="$ORPHAN_HOME" ORACLE_HOME_DIR="$ORPHAN_ORACLE" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
   PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
-  PRO_GATE_MAX_RETRIES=0 PRO_GATE_STALL_SECS=1 PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 \
+  PRO_GATE_MAX_RETRIES=0 PRO_GATE_STALL_SECS=1 PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 \
   PRO_GATE_TEST_WATCHDOG_TERM_DRAIN_SECS=3 PRO_GATE_TEST_WATCHDOG_FORCE_SETTLE_SECS=1 PRO_GATE_REATTACH_TIMEOUT=1 \
   PRO_GATE_SALVAGE_SECS=2 PRO_GATE_RUN_LOGS=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-term-ignoring" \
   PG_TEST_PRODUCER_PID="$ORPHAN_PID" PG_TEST_PRODUCER_PGID="$ORPHAN_PGID" PG_TEST_TERM_EVENTS="$ORPHAN_EVENTS" \
@@ -1595,7 +1595,7 @@ printf 'foreign idle tab\n' > "$TDIR/tab.txt"
 env PRO_GATE_HOME="$PROOF_HOME" ORACLE_HOME_DIR="$PROOF_ORACLE" ORACLE_BROWSER_PORT="$PORT" \
   ORACLE_CHATGPT_URL="$PROJECT_URL" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 \
   PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=1 PRO_GATE_RETRY_BACKOFF=0 \
-  PRO_GATE_REATTACH_TIMEOUT=1 PRO_GATE_TIMEOUT_GRACE=1 PRO_GATE_TEST_PRE_RETRY_PROBE_SECS=1 PRO_GATE_SALVAGE_SECS=2 \
+  PRO_GATE_REATTACH_TIMEOUT=1 PRO_GATE_TIMEOUT_GRACE=1 PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_PRE_RETRY_PROBE_SECS=1 PRO_GATE_SALVAGE_SECS=2 \
   PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-commit-timeout" PG_TEST_ATTEMPTS_FILE="$PROOF_ATTEMPTS" \
   PG_TEST_CHATGPT_URL_FILE="$PROOF_URL" PG_TEST_TAB_URL="$PROJECT_URL" \
   NODE_OPTIONS= bash "$ENGINE" --pr 93 --repo "$TDIR" --diff "$TDIR/small.diff" \
@@ -1624,7 +1624,7 @@ RKEY_94="$(printf '%s-94' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
 printf 'foreign idle tab\n' > "$TDIR/tab.txt"
 env PRO_GATE_HOME="$PARTIAL_HOME" ORACLE_HOME_DIR="$PARTIAL_ORACLE" ORACLE_BROWSER_PORT="$PORT" \
   PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
-  PRO_GATE_MAX_RETRIES=1 PRO_GATE_RETRY_BACKOFF=0 PRO_GATE_REATTACH_TIMEOUT=1 PRO_GATE_TIMEOUT_GRACE=1 PRO_GATE_TEST_PRE_RETRY_PROBE_SECS=1 PRO_GATE_SALVAGE_SECS=2 \
+  PRO_GATE_MAX_RETRIES=1 PRO_GATE_RETRY_BACKOFF=0 PRO_GATE_REATTACH_TIMEOUT=1 PRO_GATE_TIMEOUT_GRACE=1 PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_PRE_RETRY_PROBE_SECS=1 PRO_GATE_SALVAGE_SECS=2 \
   PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-commit-timeout" PG_TEST_ATTEMPTS_FILE="$PARTIAL_ATTEMPTS" \
   PG_TEST_COMMIT_MODE=partial NODE_OPTIONS= bash "$ENGINE" --pr 94 --repo "$TDIR" \
   --diff "$TDIR/small.diff" --out "$PARTIAL_HOME/o-partial.md" --timeout 5s \
@@ -1640,11 +1640,18 @@ check 'partial commit metadata never announces a refund' \
 
 # CI wait optimization pass 2: source the real private library helper in a fresh Bash
 # process for each boundary. The helper is used only by the three ambiguity fixtures above.
-prsecs_for() { # $1 = value for PRO_GATE_TEST_PRE_RETRY_PROBE_SECS, or literal UNSET to leave it unset
+prsecs_for() { # $1 = timing value or UNSET; $2 = mode (defaults to the fixture token)
+  local mode="${2:-ci-fixture}"
   if [ "$1" = UNSET ]; then
-    ( unset PRO_GATE_TEST_PRE_RETRY_PROBE_SECS; bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_test_pre_retry_probe_secs" )
+    if [ "$mode" = UNSET_MODE ]; then
+      ( unset PRO_GATE_TEST_MODE PRO_GATE_TEST_PRE_RETRY_PROBE_SECS; bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_test_pre_retry_probe_secs" )
+    else
+      ( unset PRO_GATE_TEST_PRE_RETRY_PROBE_SECS; PRO_GATE_TEST_MODE="$mode" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_test_pre_retry_probe_secs" )
+    fi
+  elif [ "$mode" = UNSET_MODE ]; then
+    ( unset PRO_GATE_TEST_MODE; PRO_GATE_TEST_PRE_RETRY_PROBE_SECS="$1" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_test_pre_retry_probe_secs" )
   else
-    PRO_GATE_TEST_PRE_RETRY_PROBE_SECS="$1" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_test_pre_retry_probe_secs"
+    PRO_GATE_TEST_MODE="$mode" PRO_GATE_TEST_PRE_RETRY_PROBE_SECS="$1" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_test_pre_retry_probe_secs"
   fi
 }
 check 'pre-retry probe seconds: unset retains production default 30' \
@@ -1663,7 +1670,11 @@ check 'pre-retry probe seconds: out-of-bounds above 30 retains production defaul
   "$([ "$(prsecs_for 31)" = 30 ]; echo $?)" "got=$(prsecs_for 31)"
 check 'pre-retry probe seconds: three-digit value retains production default 30' \
   "$([ "$(prsecs_for 100)" = 30 ]; echo $?)" "got=$(prsecs_for 100)"
-check 'pre-retry probe seconds: valid minimum bound 1 is honored' \
+check 'pre-retry probe seconds: valid value without test mode retains production default 30' \
+  "$([ "$(prsecs_for 1 UNSET_MODE)" = 30 ]; echo $?)" "got=$(prsecs_for 1 UNSET_MODE)"
+check 'pre-retry probe seconds: valid value with wrong mode retains production default 30' \
+  "$([ "$(prsecs_for 1 not-ci-fixture)" = 30 ]; echo $?)" "got=$(prsecs_for 1 not-ci-fixture)"
+check 'pre-retry probe seconds: valid minimum bound 1 is honored only in exact ci-fixture mode' \
   "$([ "$(prsecs_for 1)" = 1 ]; echo $?)" "got=$(prsecs_for 1)"
 check 'pre-retry probe seconds: valid mid-range value 15 is honored' \
   "$([ "$(prsecs_for 15)" = 15 ]; echo $?)" "got=$(prsecs_for 15)"
@@ -1672,11 +1683,18 @@ check 'pre-retry probe seconds: valid maximum bound 30 is honored' \
 
 # CI wait optimization pass 3: source the real private library helper in a fresh Bash
 # process for each boundary. The helper is set only in the watchdog-kill fixtures below.
-wdsecs_for() { # $1 = value for PRO_GATE_TEST_WATCHDOG_SLEEP_SECS, or literal UNSET to leave it unset
+wdsecs_for() { # $1 = timing value or UNSET; $2 = mode (defaults to the fixture token)
+  local mode="${2:-ci-fixture}"
   if [ "$1" = UNSET ]; then
-    ( unset PRO_GATE_TEST_WATCHDOG_SLEEP_SECS; bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_test_watchdog_sleep_secs" )
+    if [ "$mode" = UNSET_MODE ]; then
+      ( unset PRO_GATE_TEST_MODE PRO_GATE_TEST_WATCHDOG_SLEEP_SECS; bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_test_watchdog_sleep_secs" )
+    else
+      ( unset PRO_GATE_TEST_WATCHDOG_SLEEP_SECS; PRO_GATE_TEST_MODE="$mode" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_test_watchdog_sleep_secs" )
+    fi
+  elif [ "$mode" = UNSET_MODE ]; then
+    ( unset PRO_GATE_TEST_MODE; PRO_GATE_TEST_WATCHDOG_SLEEP_SECS="$1" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_test_watchdog_sleep_secs" )
   else
-    PRO_GATE_TEST_WATCHDOG_SLEEP_SECS="$1" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_test_watchdog_sleep_secs"
+    PRO_GATE_TEST_MODE="$mode" PRO_GATE_TEST_WATCHDOG_SLEEP_SECS="$1" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_test_watchdog_sleep_secs"
   fi
 }
 check 'watchdog sleep seconds: unset retains production default 10' \
@@ -1695,7 +1713,11 @@ check 'watchdog sleep seconds: above-bound 11 retains production default 10' \
   "$([ "$(wdsecs_for 11)" = 10 ]; echo $?)" "got=$(wdsecs_for 11)"
 check 'watchdog sleep seconds: three-digit value retains production default 10' \
   "$([ "$(wdsecs_for 100)" = 10 ]; echo $?)" "got=$(wdsecs_for 100)"
-check 'watchdog sleep seconds: valid minimum bound 1 is honored' \
+check 'watchdog sleep seconds: valid value without test mode retains production default 10' \
+  "$([ "$(wdsecs_for 1 UNSET_MODE)" = 10 ]; echo $?)" "got=$(wdsecs_for 1 UNSET_MODE)"
+check 'watchdog sleep seconds: valid value with wrong mode retains production default 10' \
+  "$([ "$(wdsecs_for 1 not-ci-fixture)" = 10 ]; echo $?)" "got=$(wdsecs_for 1 not-ci-fixture)"
+check 'watchdog sleep seconds: valid minimum bound 1 is honored only in exact ci-fixture mode' \
   "$([ "$(wdsecs_for 1)" = 1 ]; echo $?)" "got=$(wdsecs_for 1)"
 check 'watchdog sleep seconds: valid middle value 5 is honored' \
   "$([ "$(wdsecs_for 5)" = 5 ]; echo $?)" "got=$(wdsecs_for 5)"
@@ -1704,11 +1726,18 @@ check 'watchdog sleep seconds: valid maximum bound 10 is honored' \
 
 # CI wait optimization pass 4: source the real private library helpers in a fresh Bash
 # process for each boundary. Both helpers are used only by the PR 924 TERM-ignoring fixture above.
-tdsecs_for() { # $1 = value for PRO_GATE_TEST_WATCHDOG_TERM_DRAIN_SECS, or literal UNSET to leave it unset
+tdsecs_for() { # $1 = timing value or UNSET; $2 = mode (defaults to the fixture token)
+  local mode="${2:-ci-fixture}"
   if [ "$1" = UNSET ]; then
-    ( unset PRO_GATE_TEST_WATCHDOG_TERM_DRAIN_SECS; bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_test_watchdog_term_drain_secs" )
+    if [ "$mode" = UNSET_MODE ]; then
+      ( unset PRO_GATE_TEST_MODE PRO_GATE_TEST_WATCHDOG_TERM_DRAIN_SECS; bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_test_watchdog_term_drain_secs" )
+    else
+      ( unset PRO_GATE_TEST_WATCHDOG_TERM_DRAIN_SECS; PRO_GATE_TEST_MODE="$mode" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_test_watchdog_term_drain_secs" )
+    fi
+  elif [ "$mode" = UNSET_MODE ]; then
+    ( unset PRO_GATE_TEST_MODE; PRO_GATE_TEST_WATCHDOG_TERM_DRAIN_SECS="$1" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_test_watchdog_term_drain_secs" )
   else
-    PRO_GATE_TEST_WATCHDOG_TERM_DRAIN_SECS="$1" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_test_watchdog_term_drain_secs"
+    PRO_GATE_TEST_MODE="$mode" PRO_GATE_TEST_WATCHDOG_TERM_DRAIN_SECS="$1" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_test_watchdog_term_drain_secs"
   fi
 }
 check 'watchdog TERM-drain seconds: unset retains production default 30' \
@@ -1727,18 +1756,29 @@ check 'watchdog TERM-drain seconds: above-bound 31 retains production default 30
   "$([ "$(tdsecs_for 31)" = 30 ]; echo $?)" "got=$(tdsecs_for 31)"
 check 'watchdog TERM-drain seconds: three-digit value retains production default 30' \
   "$([ "$(tdsecs_for 100)" = 30 ]; echo $?)" "got=$(tdsecs_for 100)"
-check 'watchdog TERM-drain seconds: valid minimum bound 1 is honored' \
+check 'watchdog TERM-drain seconds: valid value without test mode retains production default 30' \
+  "$([ "$(tdsecs_for 1 UNSET_MODE)" = 30 ]; echo $?)" "got=$(tdsecs_for 1 UNSET_MODE)"
+check 'watchdog TERM-drain seconds: valid value with wrong mode retains production default 30' \
+  "$([ "$(tdsecs_for 1 not-ci-fixture)" = 30 ]; echo $?)" "got=$(tdsecs_for 1 not-ci-fixture)"
+check 'watchdog TERM-drain seconds: valid minimum bound 1 is honored only in exact ci-fixture mode' \
   "$([ "$(tdsecs_for 1)" = 1 ]; echo $?)" "got=$(tdsecs_for 1)"
 check 'watchdog TERM-drain seconds: valid mid-range value 15 is honored' \
   "$([ "$(tdsecs_for 15)" = 15 ]; echo $?)" "got=$(tdsecs_for 15)"
 check 'watchdog TERM-drain seconds: valid maximum bound 30 is honored' \
   "$([ "$(tdsecs_for 30)" = 30 ]; echo $?)" "got=$(tdsecs_for 30)"
 
-fssecs_for() { # $1 = value for PRO_GATE_TEST_WATCHDOG_FORCE_SETTLE_SECS, or literal UNSET to leave it unset
+fssecs_for() { # $1 = timing value or UNSET; $2 = mode (defaults to the fixture token)
+  local mode="${2:-ci-fixture}"
   if [ "$1" = UNSET ]; then
-    ( unset PRO_GATE_TEST_WATCHDOG_FORCE_SETTLE_SECS; bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_test_watchdog_force_settle_secs" )
+    if [ "$mode" = UNSET_MODE ]; then
+      ( unset PRO_GATE_TEST_MODE PRO_GATE_TEST_WATCHDOG_FORCE_SETTLE_SECS; bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_test_watchdog_force_settle_secs" )
+    else
+      ( unset PRO_GATE_TEST_WATCHDOG_FORCE_SETTLE_SECS; PRO_GATE_TEST_MODE="$mode" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_test_watchdog_force_settle_secs" )
+    fi
+  elif [ "$mode" = UNSET_MODE ]; then
+    ( unset PRO_GATE_TEST_MODE; PRO_GATE_TEST_WATCHDOG_FORCE_SETTLE_SECS="$1" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_test_watchdog_force_settle_secs" )
   else
-    PRO_GATE_TEST_WATCHDOG_FORCE_SETTLE_SECS="$1" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_test_watchdog_force_settle_secs"
+    PRO_GATE_TEST_MODE="$mode" PRO_GATE_TEST_WATCHDOG_FORCE_SETTLE_SECS="$1" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_test_watchdog_force_settle_secs"
   fi
 }
 check 'watchdog force-settle seconds: unset retains production default 5' \
@@ -1757,7 +1797,11 @@ check 'watchdog force-settle seconds: above-bound 6 retains production default 5
   "$([ "$(fssecs_for 6)" = 5 ]; echo $?)" "got=$(fssecs_for 6)"
 check 'watchdog force-settle seconds: three-digit value retains production default 5' \
   "$([ "$(fssecs_for 100)" = 5 ]; echo $?)" "got=$(fssecs_for 100)"
-check 'watchdog force-settle seconds: valid minimum bound 1 is honored' \
+check 'watchdog force-settle seconds: valid value without test mode retains production default 5' \
+  "$([ "$(fssecs_for 1 UNSET_MODE)" = 5 ]; echo $?)" "got=$(fssecs_for 1 UNSET_MODE)"
+check 'watchdog force-settle seconds: valid value with wrong mode retains production default 5' \
+  "$([ "$(fssecs_for 1 not-ci-fixture)" = 5 ]; echo $?)" "got=$(fssecs_for 1 not-ci-fixture)"
+check 'watchdog force-settle seconds: valid minimum bound 1 is honored only in exact ci-fixture mode' \
   "$([ "$(fssecs_for 1)" = 1 ]; echo $?)" "got=$(fssecs_for 1)"
 check 'watchdog force-settle seconds: valid mid-range value 3 is honored' \
   "$([ "$(fssecs_for 3)" = 3 ]; echo $?)" "got=$(fssecs_for 3)"

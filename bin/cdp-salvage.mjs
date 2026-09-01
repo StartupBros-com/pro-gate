@@ -136,11 +136,14 @@ const organize = mode === 'organize';
 const [marker, timeoutSecs = probe || organize ? '30' : '600', port = process.env.ORACLE_CDP_PORT ?? '9222'] = argv;
 if (!marker || argv.length > 3 || !/^\d+$/.test(String(timeoutSecs)) || Number(timeoutSecs) <= 0 || !/^\d+$/.test(String(port))) usage();
 const deadline = Date.now() + Number(timeoutSecs) * 1000;
-// Test-only timing overrides (see cdp-test-timing.mjs): the Node test harness may shorten only
-// selected child processes. Nothing in production workflow/config sets either variable, so
-// malformed input preserves the exact production fallback literals below.
-const POLL_MS = parseTestPollMs(process.env.PRO_GATE_TEST_POLL_MS) ?? 20_000;
-const RENDER_SAMPLE_MS = parseTestRenderSampleMs(process.env.PRO_GATE_TEST_RENDER_SAMPLE_MS) ?? 2_500;
+// Test-only timing overrides (see cdp-test-timing.mjs): only deliberately tagged fixture
+// children may shorten these waits. Unset, malformed, or any other mode preserves the exact
+// production literals below; this token is intentionally not a production configuration surface.
+const TEST_TIMING_ENABLED = process.env.PRO_GATE_TEST_MODE === 'ci-fixture';
+const POLL_MS = TEST_TIMING_ENABLED ? (parseTestPollMs(process.env.PRO_GATE_TEST_POLL_MS) ?? 20_000) : 20_000;
+const RENDER_SAMPLE_MS = TEST_TIMING_ENABLED
+  ? (parseTestRenderSampleMs(process.env.PRO_GATE_TEST_RENDER_SAMPLE_MS) ?? 2_500)
+  : 2_500;
 
 const PG_HOME = process.env.PRO_GATE_HOME ?? path.join(os.homedir(), '.pro-review-daemon');
 const BLACKLIST_FILE = path.join(PG_HOME, 'salvage-nonmatching.txt');

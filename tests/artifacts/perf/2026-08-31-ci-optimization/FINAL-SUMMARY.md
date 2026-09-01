@@ -98,3 +98,65 @@ per its scope.
 `PASS-9-checksums.txt`, `golden_checksums.txt`, `engine-all-pass.txt`, `VERIFICATION.txt`
 (pass 1's), and this pass's `PASS-10.md`, `PASS-10-VERIFICATION.txt`, `FINAL-SUMMARY.md`, and
 `PASS-10-checksums.txt`.
+
+---
+
+## Post-rebase terminal golden — `ef99b8f` base / `84981c7` checkpoint
+
+The preceding final summary and measurements are retained as historical pre-rebase checkpoint
+evidence. The terminal post-rebase verification proves `HEAD` `84981c7` descends from required
+origin/main base `ef99b8f`: `git merge-base ef99b8f HEAD` resolved to `ef99b8f`, and the
+`--is-ancestor` check exited 0.
+
+The exact current CI workflow adds `bash tests/resolve-identity.test.sh`, so its current test block
+has **nine**, not the historical eight, commands. One compact foreground driver ran the exact CI
+validation block and all nine commands serially under the requested 3,600,000ms timeout. Results:
+
+- **10/10** process steps (validation plus nine tests) exited 0; total serial wall:
+  **1,791.12s** (29m 51.12s), below the CI job's 45-minute timeout.
+- Seven conventional shell suites printed `ALL PASS`; the current resolver uses its documented
+  terminal `resolve-identity: all checks pass`. All eight shell suites exited 0 with zero `not ok`.
+- Node `cdp-salvage`: **1 pass / 0 fail**, 298 `ok -`, zero `not ok`.
+- Aggregate: **1,488** internal `ok -`, zero `not ok`; every command had one actual attempt and
+  the permitted stale-throttle `--harvest` rerun was not used.
+- `PASS-10-POST-REBASE.txt` contains the manifest, per-step walls/assertions, stdout checksums,
+  driver-continuation accounting, and post-write validation evidence.
+
+### Rebased current pass table
+
+| Pass | Historical commit | Rebased current commit |
+| ---: | --- | --- |
+| 1 | `8ee53de` | `45e2384` |
+| 2 | `eb11e66` | `aaf2293` |
+| 3 | `201fd69` | `d6efb96` |
+| 4 | `438ed7f` | `31da6b7` |
+| 5 | `327da27` | `926c66e` |
+| 6 | `6f5d1cd` | `d97a798` |
+| 7 | `31c8262` | `9afe24b` |
+| 8 | `e71d1a2` | `66c91e5` |
+| 9 | `8a695fd` | `d0f0a86` |
+| 10 | verification-only historical checkpoint | `84981c7` checkpoint |
+
+Every current row is based on `ef99b8f` (v0.37.2). The post-rebase closeout adds only the requested
+artifacts: staged and unstaged diffs for `bin`, `lib`, `.github`, and `tests` excluding
+`tests/artifacts` are required to be empty. This does not erase the intentional branch delta from
+`ef99b8f`; it proves no source/test/workflow diff was introduced by the terminal golden itself.
+
+The post-rebase checksum manifest now covers `PASS-10.md`, `PASS-10-VERIFICATION.txt`,
+`FINAL-SUMMARY.md`, and `PASS-10-POST-REBASE.txt`, while excluding itself.
+
+---
+
+## Review-fix closeout
+
+The historical measurements above remain unchanged. Final review fixes the high-severity timing
+mode boundary: valid test timing values require exact `PRO_GATE_TEST_MODE=ci-fixture`, and accepted
+engine evidence with that mode unset proves production defaults prevail. PR-924 hard-cap P2 is
+refuted (`HARD_SECS=125` versus an approximately 6-second watchdog path). Outage child-ack P2 is
+fixed by a primary `Runtime.evaluate` DOM poll before stop.
+
+Focused evidence: engine exit 0, 855 `ok -`, `ALL PASS`; Node tests=1, pass=1, fail=0, 302 `ok -`,
+159.88833346s. Fresh unaffected validation and seven-suite results are all exit 0 in serial walls of
+24s (validation), 13s, 6s, 0s, 11s, 53s, 0s, and 0s. `PASS-10-REVIEW-FIXES.md` preserves the detailed
+closeout record. The regenerated manifest covers the four historical final artifacts plus that
+review-fixes record, excluding itself.

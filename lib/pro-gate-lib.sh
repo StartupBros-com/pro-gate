@@ -39,9 +39,16 @@ pg_service_mgr() {
 
 pg_have() { command -v "$1" >/dev/null 2>&1; }
 
+# Timing overrides are an internal fixture seam, not production configuration. Every
+# timing helper requires this exact test-private token before it reads a PRO_GATE_TEST_* value.
+pg_test_timing_enabled() {
+  [ "${PRO_GATE_TEST_MODE:-}" = 'ci-fixture' ]
+}
+
 # Test-only override for the pre-retry CDP probe. Invalid input deliberately
 # falls back to the production 30-second deadline and can never extend it.
 pg_test_pre_retry_probe_secs() {
+  pg_test_timing_enabled || { printf '30\n'; return; }
   case "${PRO_GATE_TEST_PRE_RETRY_PROBE_SECS:-}" in
     [1-9]|[12][0-9]|30) printf '%s\n' "$PRO_GATE_TEST_PRE_RETRY_PROBE_SECS" ;;
     *) printf '30\n' ;;
@@ -51,6 +58,7 @@ pg_test_pre_retry_probe_secs() {
 # Test-only watchdog observation cadence. Invalid input deliberately falls back
 # to the production 10-second cadence and can never extend it.
 pg_test_watchdog_sleep_secs() {
+  pg_test_timing_enabled || { printf '10\n'; return; }
   case "${PRO_GATE_TEST_WATCHDOG_SLEEP_SECS:-}" in
     [1-9]|10) printf '%s\n' "$PRO_GATE_TEST_WATCHDOG_SLEEP_SECS" ;;
     *) printf '10\n' ;;
@@ -60,6 +68,7 @@ pg_test_watchdog_sleep_secs() {
 # Test-only watchdog TERM-drain duration. Invalid input deliberately falls back
 # to the production 30-second bound and can never extend it.
 pg_test_watchdog_term_drain_secs() {
+  pg_test_timing_enabled || { printf '30\n'; return; }
   case "${PRO_GATE_TEST_WATCHDOG_TERM_DRAIN_SECS:-}" in
     [1-9]|[12][0-9]|30) printf '%s\n' "$PRO_GATE_TEST_WATCHDOG_TERM_DRAIN_SECS" ;;
     *) printf '30\n' ;;
@@ -69,6 +78,7 @@ pg_test_watchdog_term_drain_secs() {
 # Test-only watchdog post-drain force-settle wait. Invalid input deliberately
 # falls back to the production 5-second bound and can never extend it.
 pg_test_watchdog_force_settle_secs() {
+  pg_test_timing_enabled || { printf '5\n'; return; }
   case "${PRO_GATE_TEST_WATCHDOG_FORCE_SETTLE_SECS:-}" in
     [1-5]) printf '%s\n' "$PRO_GATE_TEST_WATCHDOG_FORCE_SETTLE_SECS" ;;
     *) printf '5\n' ;;

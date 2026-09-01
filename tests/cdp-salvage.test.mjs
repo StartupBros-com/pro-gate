@@ -109,13 +109,14 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
   const mutationExpiries = new Map();
   const revokedMutationTokens = new Set();
   let primaryPolls = 0;
+  let primaryDomPolls = 0;
   let jsonListCalls = 0;   // All /json hits, retained for pass 5's production-vs-fast contrast.
   let successfulJsonListCalls = 0;
   let outerJsonListCalls = 0;   // Lists made when no disposable scratch target is open.
   let scratchJsonListCalls = 0; // Lists that observe an open scratch target during its render.
   const jsonListEvents = [];
   const trackCdpDeadlineEvents = opts.trackCdpDeadlineEvents === true;
-  let stoppedAfterSuccessfulJsonList = null;
+  let stoppedAfterPrimaryDomPoll = null;
   let stopped = false;
   let server = null;
   const stop = (cb) => {
@@ -196,14 +197,6 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
           source: listSource,
           tabIds: listed.map((tab) => tab.id),
         });
-        const stopAfter = Number(opts.stopAfterSuccessfulJsonLists);
-        if (
-          Number.isInteger(stopAfter) && stopAfter >= 1 &&
-          stoppedAfterSuccessfulJsonList === null && successfulJsonListCalls >= stopAfter
-        ) {
-          stoppedAfterSuccessfulJsonList = successfulJsonListCalls;
-          queueMicrotask(() => stop());
-        }
       }
       return;
     }
@@ -301,6 +294,8 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
         value = ui.cancelUnconfirmed ? false : true;
       }
       const armLate = ui.armMutationAfterDelay && armMutation;
+      const primaryDomPoll = id === 'tab1' && request.method === 'Runtime.evaluate' &&
+        expression === 'document.body.innerText';
       const response = () => {
         if (armLate) armMutation();
         applyMutation?.();
@@ -308,6 +303,21 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
           id: request.id,
           result: { result: { value } },
         })));
+        // Pass 7's later-outage fixture may stop only after the child consumed the successful
+        // outer list enough to issue the listed primary tab's DOM poll. Scheduling after the
+        // response is written preserves that successful-read-before-outage ordering.
+        if (primaryDomPoll) {
+          primaryDomPolls += 1;
+          const stopAfter = Number(opts.stopAfterPrimaryDomPoll);
+          if (
+            Number.isInteger(stopAfter) && stopAfter >= 1 &&
+            stoppedAfterPrimaryDomPoll === null && primaryDomPolls >= stopAfter &&
+            outerJsonListCalls >= 1
+          ) {
+            stoppedAfterPrimaryDomPoll = primaryDomPolls;
+            queueMicrotask(() => stop());
+          }
+        }
       };
       if (armMutation && !armLate) armMutation();
       if (delayMs > 0) setTimeout(response, delayMs);
@@ -326,8 +336,9 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
     get successfulJsonListCalls() { return successfulJsonListCalls; },
     get outerJsonListCalls() { return outerJsonListCalls; },
     get scratchJsonListCalls() { return scratchJsonListCalls; },
+    get primaryDomPolls() { return primaryDomPolls; },
     get jsonListEvents() { return jsonListEvents.map((event) => ({ ...event, tabIds: [...event.tabIds] })); },
-    get stoppedAfterSuccessfulJsonList() { return stoppedAfterSuccessfulJsonList; },
+    get stoppedAfterPrimaryDomPoll() { return stoppedAfterPrimaryDomPoll; },
     setText: (value) => {
       if (value !== tabText) {
         const closedAt = closed.indexOf('tab1');
@@ -352,8 +363,14 @@ function runSalvage(args, port, seed, extraEnv = {}) {
   return new Promise((resolve) => {
     const startedAt = Date.now();
     const expandedArgs = args.map((arg) => arg.replace(/^PG_HOME\//, `${home}/`));
+    const childEnv = { ...process.env, PRO_GATE_HOME: home, ...extraEnv };
+    // Explicit undefined removes an inherited environment key for boundary tests. It lets a test
+    // prove the child has no test mode at all instead of merely replacing it with another string.
+    for (const [name, value] of Object.entries(childEnv)) {
+      if (value === undefined) delete childEnv[name];
+    }
     const child = spawn(process.execPath, [SALVAGE, ...expandedArgs, String(port)], {
-      env: { ...process.env, PRO_GATE_HOME: home, ...extraEnv },
+      env: childEnv,
     });
     let stdout = '', stderr = '';
     child.stdout.on('data', (d) => { stdout += d; });
@@ -390,6 +407,7 @@ function runSalvage(args, port, seed, extraEnv = {}) {
 // The override is merged into the spawned child alone; this test process and all regular salvage
 // fixtures keep their inherited environment.
 const SCRATCH_SAMPLE_TEST_ENV = Object.freeze({
+  PRO_GATE_TEST_MODE: 'ci-fixture',
   PRO_GATE_TEST_RENDER_SAMPLE_MS: String(TEST_RENDER_SAMPLE_MS_MIN),
 });
 function runScratchSalvage(args, port, seed, extraEnv = {}) {
@@ -401,6 +419,7 @@ function runScratchSalvage(args, port, seed, extraEnv = {}) {
 // deadline; fast scratch sampling preserves ordered render observations when that fixture needs
 // them before the same deadline arrives.
 const FAST_POLL_TEST_ENV = Object.freeze({
+  PRO_GATE_TEST_MODE: 'ci-fixture',
   PRO_GATE_TEST_POLL_MS: String(TEST_POLL_MS_MIN),
 });
 const FAST_CDP_DEADLINE_TEST_ENV = Object.freeze({
@@ -534,6 +553,42 @@ const MARKER = 'pg-run-test-1234567890-42';
     parseTestRenderSampleMs('500') === 500);
   check('parseTestRenderSampleMs: a valid value can only ever shorten, never extend, sampling',
     parseTestRenderSampleMs(String(TEST_RENDER_SAMPLE_MS_MAX)) <= 2_500);
+}
+
+{ // Direct runtime boundary proof for the fresh-render cadence. A four-second deadline leaves
+  // startup slack for one production 2,500ms sample; exact fixture mode gets a second 50ms sample.
+  const rememberedUrl = 'https://chatgpt.com/c/render-timing-boundary';
+  const review = `run marker: ${MARKER}\n[P1] render.ts:1: proof\n  Why: timing boundary\nVERDICT: SHIP: done.`;
+  async function renderTimingBoundary(mode) {
+    const samples = [];
+    const cdp = await mockCdp('__NO_TABS__', [], {
+      renderText: (_url, n) => {
+        samples.push(n);
+        return n === 1 ? 'Chat history\nNew chat\nSidebar only' : review;
+      },
+    });
+    const result = await runSalvage([MARKER, '4'], cdp.port, seedMemo(MARKER, rememberedUrl), {
+      PRO_GATE_TEST_MODE: mode,
+      PRO_GATE_TEST_RENDER_SAMPLE_MS: String(TEST_RENDER_SAMPLE_MS_MIN),
+    });
+    cdp.stop();
+    return { result, samples };
+  }
+
+  const noMode = await renderTimingBoundary(undefined);
+  check('a valid render override without test mode retains the production 2,500ms sample cadence',
+    noMode.samples.join(',') === '1' && noMode.result.elapsedMs >= 2_200,
+    `samples=${noMode.samples} elapsed=${noMode.result.elapsedMs} status=${noMode.result.status}`);
+
+  const wrongMode = await renderTimingBoundary('not-ci-fixture');
+  check('a valid render override with a wrong mode retains the production 2,500ms sample cadence',
+    wrongMode.samples.join(',') === '1' && wrongMode.result.elapsedMs >= 2_200,
+    `samples=${wrongMode.samples} elapsed=${wrongMode.result.elapsedMs} status=${wrongMode.result.status}`);
+
+  const exactMode = await renderTimingBoundary('ci-fixture');
+  check('exact ci-fixture mode honors the valid rapid render override',
+    exactMode.result.status === 0 && exactMode.samples.join(',') === '1,2' && exactMode.result.elapsedMs < 1_000,
+    `samples=${exactMode.samples} elapsed=${exactMode.result.elapsedMs} status=${exactMode.result.status}`);
 }
 
 { // still generating: marker matches, no VERDICT -> exit 3, tab NOT closed
@@ -1157,20 +1212,37 @@ const MARKER = 'pg-run-test-1234567890-42';
   cdp.stop();
 }
 
-{ // Direct behavior proof for the poll-cadence override itself: a STABLE still-generating
-  // conversation (nothing ever changes) polled at the fastest valid cadence (TEST_POLL_MS_MIN)
-  // must classify identically to the same conversation polled at the production cadence —
-  // repeatedly re-scanning a state that hasn't changed must never flip the verdict. This isolates
-  // the override's own correctness from the timing-race scenario above.
+{ // Direct runtime boundary proof for the poll override. A valid value must have no effect until
+  // the exact fixture token is present; the stable state also proves rapid re-polling never changes
+  // the exit classification.
   const stableText = `run marker: ${MARKER}\nstill reasoning, nothing ever resolves...`;
   const fastCdp = await mockCdp(stableText);
   const fastResult = await runSalvage([MARKER, '2'], fastCdp.port, undefined,
-    { PRO_GATE_TEST_POLL_MS: String(TEST_POLL_MS_MIN) });
-  check('rapid polling at the minimum valid cadence still classifies still-generating (exit 3)',
-    fastResult.status === 3, `status=${fastResult.status} stderr=${fastResult.stderr?.slice(0, 300)}`);
-  check('the minimum cadence produced many scans within a short deadline',
-    fastCdp.jsonListCalls >= 5, `jsonListCalls=${fastCdp.jsonListCalls}`);
+    { PRO_GATE_TEST_MODE: 'ci-fixture', PRO_GATE_TEST_POLL_MS: String(TEST_POLL_MS_MIN) });
+  check('exact ci-fixture mode honors the valid rapid-poll override and retains exit 3',
+    fastResult.status === 3 && fastCdp.jsonListCalls >= 5,
+    `status=${fastResult.status} jsonListCalls=${fastCdp.jsonListCalls}`);
   fastCdp.stop();
+
+  const noModeCdp = await mockCdp(stableText);
+  const noModeResult = await runSalvage([MARKER, '2'], noModeCdp.port, undefined, {
+    PRO_GATE_TEST_MODE: undefined,
+    PRO_GATE_TEST_POLL_MS: String(TEST_POLL_MS_MIN),
+  });
+  check('a valid poll override without test mode retains the production 20,000ms cadence',
+    noModeResult.status === 3 && noModeCdp.jsonListCalls === 2,
+    `status=${noModeResult.status} jsonListCalls=${noModeCdp.jsonListCalls}`);
+  noModeCdp.stop();
+
+  const wrongModeCdp = await mockCdp(stableText);
+  const wrongModeResult = await runSalvage([MARKER, '2'], wrongModeCdp.port, undefined, {
+    PRO_GATE_TEST_MODE: 'not-ci-fixture',
+    PRO_GATE_TEST_POLL_MS: String(TEST_POLL_MS_MIN),
+  });
+  check('a valid poll override with a wrong mode retains the production 20,000ms cadence',
+    wrongModeResult.status === 3 && wrongModeCdp.jsonListCalls === 2,
+    `status=${wrongModeResult.status} jsonListCalls=${wrongModeCdp.jsonListCalls}`);
+  wrongModeCdp.stop();
 
   const slowCdp = await mockCdp(stableText);
   const slowResult = await runSalvage([MARKER, '2'], slowCdp.port);   // no override: production cadence
@@ -1179,10 +1251,8 @@ const MARKER = 'pg-run-test-1234567890-42';
   // Exactly 2, deterministically, not 1: one main-loop scan (production's 20s cadence never
   // fires a second poll inside this 2s deadline) plus the pre-existing, unrelated post-loop
   // "revalidate at the deadline" fetch (still-generating && not seeded, lines ~1472-1487) that
-  // runs before every exit-3 report. Neither call comes from the poll-cadence lever itself; the
-  // invariant this proves is the CONTRAST with the fast override's >=5 scans above, not a literal
-  // single scan.
-  check('production cadence yields far fewer scans than the fast override, not a rapid re-poll',
+  // runs before every exit-3 report. Neither call comes from the poll-cadence lever itself.
+  check('production cadence yields two scans, not a rapid re-poll',
     slowCdp.jsonListCalls === 2, `jsonListCalls=${slowCdp.jsonListCalls}`);
   slowCdp.stop();
 }
@@ -1498,21 +1568,21 @@ const FOREIGN_ANSWER = (m) => [
   }
 }
 
-{ // gate round-2 P1: one EARLY successful listing must not mask a later CDP outage. The mock
-  // closes only after it has served its first successful /json response; the fast poll then proves
-  // the subsequent failed-list path, rather than assuming a blind timer happened after startup.
+{ // gate round-2 P1: one EARLY successful listing must not mask a later CDP outage. Shutdown
+  // waits for the child to open the listed primary tab and issue its DOM poll, so the fixture proves
+  // the child consumed that successful outer list rather than merely racing res.end().
   const cdp = await mockCdp('some other conversation, no marker here', [], {
     trackCdpDeadlineEvents: true,
-    stopAfterSuccessfulJsonLists: 1,
+    stopAfterPrimaryDomPoll: 1,
   });
   const r = await runFastPollSalvage([MARKER, '3'], cdp.port);
   const failedLists = (r.stderr.match(/CDP list failed/g) ?? []).length;
   check('a later CDP outage is not masked by an early successful scan', r.status === 7, `status=${r.status} stderr=${r.stderr?.slice(-300)}`);
-  check('later-outage fixture stops only after its first successful outer list',
-    cdp.successfulJsonListCalls >= 1 && cdp.stoppedAfterSuccessfulJsonList === 1 &&
-      cdp.jsonListEvents[0]?.source === 'outer',
-    `successful=${cdp.successfulJsonListCalls} stoppedAfter=${cdp.stoppedAfterSuccessfulJsonList} events=${JSON.stringify(cdp.jsonListEvents)}`);
-  check('later-outage fixture records at least one failed list after that success',
+  check('later-outage fixture records child primary-tab DOM consumption before shutdown',
+    cdp.successfulJsonListCalls >= 1 && cdp.outerJsonListCalls >= 1 && cdp.primaryDomPolls >= 1 &&
+      cdp.stoppedAfterPrimaryDomPoll === 1 && cdp.jsonListEvents[0]?.source === 'outer',
+    `successful=${cdp.successfulJsonListCalls} outer=${cdp.outerJsonListCalls} primaryPolls=${cdp.primaryDomPolls} stoppedAfter=${cdp.stoppedAfterPrimaryDomPoll} events=${JSON.stringify(cdp.jsonListEvents)}`);
+  check('later-outage fixture records at least one failed list after that consumed success',
     failedLists >= 1 && r.elapsedMs >= 2_500,
     `failedLists=${failedLists} elapsed=${r.elapsedMs} stderr=${r.stderr?.slice(-500)}`);
   cdp.stop();
