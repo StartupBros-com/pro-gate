@@ -137,8 +137,9 @@ or **Browser needs attention**. `Review superseded` means immutable old-head or 
 proof released capacity while retaining the charge and optional audit harvest. `No review remains`
 means terminal proof released recovery ownership. In either case, re-query the typed decision instead
 of deleting state or forcing a round. Missing binding/GitHub proof remains fail-closed. A historical
-literal-`diff` reservation key is canonicalized only inside that exact proof-backed transition;
-arbitrary mismatches remain generating. A pre-v0.37 run-meta-only attempt is migrated into bounded
+literal-`diff` reservation key is canonicalized only inside that exact proof-backed transition; a
+pre-v0.31 empty spend additionally requires marker epoch equality. Arbitrary mismatches remain
+generating. A pre-v0.37 run-meta-only attempt is migrated into bounded
 no-spend recovery automatically. Expert read-only
 and direct marker diagnostics remain:
 

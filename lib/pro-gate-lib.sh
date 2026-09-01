@@ -1374,7 +1374,7 @@ pg_reservation_slot_plan() {
 # proof; this helper serializes the final compare-and-swap so a concurrent harvest cannot change the
 # record between proof and mutation. Arbitrary key mismatches remain fail-closed.
 pg_reservation_supersede() {
-  local marker="$1" key="$2" expected_spend="$3" dir f rc pr out created misses slot model spend tmp
+  local marker="$1" key="$2" expected_spend="$3" dir f rc pr out created misses slot model spend marker_epoch tmp
   pg_reservation_marker_ok "$marker" || return 1
   pg_round_key_ok "$key" || return 1
   case "$expected_spend" in ''|*[!0-9]*) return 1;; esac
@@ -1390,7 +1390,12 @@ pg_reservation_supersede() {
   model="$(awk -F'\t' 'NR==1{print $6}' "$f" 2>/dev/null)"
   spend="$(awk -F'\t' 'NR==1{print $7}' "$f" 2>/dev/null)"
   case "$pr" in "$key"|diff) ;; *) pg_reservation_guard_release; return 1;; esac
-  [ "$spend" = "$expected_spend" ] || { pg_reservation_guard_release; return 1; }
+  if [ "$spend" != "$expected_spend" ]; then
+    if [ "$pr" != diff ] || [ -n "$spend" ]; then pg_reservation_guard_release; return 1; fi
+    marker_epoch="$(pg_marker_epoch "$marker" 2>/dev/null || true)"
+    if [ "$marker_epoch" != "$expected_spend" ]; then pg_reservation_guard_release; return 1; fi
+    spend="$expected_spend"
+  fi
   case "$misses" in ''|*[!0-9]*) misses=0;; esac
   tmp="$(mktemp "$dir/.${marker}.supersede.XXXXXX" 2>/dev/null)" \
     || { pg_reservation_guard_release; return 1; }

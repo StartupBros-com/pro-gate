@@ -253,7 +253,8 @@ miss proof in the same no-spend invocation. Before browser recovery, an immutabl
 GitHub `MERGED`/`CLOSED` state or a different current head can move the reservation to `superseded`:
 the charge, marker, URL, and optional audit harvest remain, while capacity and current-head ownership
 are released. Historical reservations keyed as literal `diff` are canonicalized during that exact
-transition only after the immutable identity and charge agree; other key mismatches remain fail-closed.
+transition only after immutable identity and charge agree. For pre-v0.31 empty spend fields, the marker
+epoch must independently equal that charge; other missing or mismatched proof remains fail-closed.
 Missing or malformed binding/GitHub proof leaves the review generating. Its plain states
 are **Review ready**, **Checking for completed review**, **Still working**, **Review superseded**,
 **No review remains**, and **Browser needs attention**. `Review superseded` means old-head or closed-PR
