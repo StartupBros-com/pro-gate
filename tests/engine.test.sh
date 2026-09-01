@@ -4910,14 +4910,22 @@ super_recover() { # home marker mode state current-head
 SUPER_HEAD_HOME="$TDIR/home-superseded-head"
 SUPER_HEAD_MARKER='pg-run-acme-fresh-77-1700014100-1'
 super_seed "$SUPER_HEAD_HOME" "$SUPER_HEAD_MARKER" 1700014100 "$FRESH_BASE"
+# Historical harvest fallback used literal `diff` and may carry an empty model; exact canonical
+# proof can migrate only this one legacy key during the same atomic supersession transition.
+printf 'diff\t%s\t1700014000\t2\t1\t\t1700014100\tgenerating\n' "$TDIR/superseded-audit.md" > "$SUPER_HEAD_HOME/in-progress/$SUPER_HEAD_MARKER"
 : > "$SUPER_GH_CALLS"; : > "$TDIR/recover-oracle-sentinel"
 super_recover "$SUPER_HEAD_HOME" "$SUPER_HEAD_MARKER" ok OPEN "$FRESH_HEAD"
-check 'exact recovery supersedes an immutable old-head review without browser or Oracle dispatch' \
+check 'exact recovery atomically canonicalizes and supersedes a legacy diff reservation' \
   "$([ "$RC" -eq 6 ] && grep -qx 'Review superseded' "$TDIR/super.stderr" \
      && grep -qF 'pr view 77 --repo github.com/acme/fresh --json state,headRefOid' "$SUPER_GH_CALLS" \
-     && [ "$(awk -F'\t' 'NR==1{print $8}' "$SUPER_HEAD_HOME/in-progress/$SUPER_HEAD_MARKER")" = superseded ] \
+     && [ "$(awk -F'\t' 'NR==1{print $1" "$2" "$3" "$4" "$5" "$6" "$7" "$8}' "$SUPER_HEAD_HOME/in-progress/$SUPER_HEAD_MARKER")" = "$SUPER_KEY $TDIR/superseded-audit.md 1700014000 2 1  1700014100 superseded" ] \
      && [ ! -s "$TDIR/recover-oracle-sentinel" ]; echo $?)" \
   "rc=$RC state=$(cat "$SUPER_HEAD_HOME/in-progress/$SUPER_HEAD_MARKER") stderr=$(cat "$TDIR/super.stderr")"
+SUPER_LEGACY_RECORD="$(cat "$SUPER_HEAD_HOME/in-progress/$SUPER_HEAD_MARKER")"
+PRO_GATE_HOME="$SUPER_HEAD_HOME" pg_reservation_supersede "$SUPER_HEAD_MARKER" "$SUPER_KEY" 1700014100
+check 'canonical supersession replay is byte-idempotent' \
+  "$([ "$(cat "$SUPER_HEAD_HOME/in-progress/$SUPER_HEAD_MARKER")" = "$SUPER_LEGACY_RECORD" ]; echo $?)" \
+  "before=$SUPER_LEGACY_RECORD after=$(cat "$SUPER_HEAD_HOME/in-progress/$SUPER_HEAD_MARKER")"
 check 'supersession retains the charged round and durable proof event' \
   "$([ "$(wc -l < "$SUPER_HEAD_HOME/rounds/$SUPER_KEY")" -eq 1 ] \
      && jq -e --arg marker "$SUPER_HEAD_MARKER" --arg old "$FRESH_BASE" --arg new "$FRESH_HEAD" \
@@ -4932,6 +4940,10 @@ check 'superseded snapshot is fresh-eligible and holds zero capacity while remai
      && [ "$(PRO_GATE_HOME="$SUPER_HEAD_HOME" pg_reservation_count)" -eq 1 ] \
      && [ "$SUPER_PLAN" = '1||1' ]; echo $?)" \
   "snapshot=$SUPER_SNAPSHOT plan=$SUPER_PLAN"
+PRO_GATE_HOME="$SUPER_HEAD_HOME" bash "$ENGINE" --status "$SUPER_HEAD_MARKER" --json > "$TDIR/superseded-empty-model-status.json" 2>/dev/null
+check 'status preserves empty model and positional fields after legacy canonicalization' \
+  "$(jq -e --arg key "$SUPER_KEY" '.reservations[0].pr==$key and .reservations[0].model=="" and .reservations[0].miss_streak==2 and .reservations[0].state=="superseded-awaiting-optional-harvest"' "$TDIR/superseded-empty-model-status.json" >/dev/null 2>&1; echo $?)" \
+  "$(jq -c '.reservations[0]' "$TDIR/superseded-empty-model-status.json" 2>/dev/null)"
 SUPER_LIVE_MARKER='pg-run-acme-fresh-77-1700014101-9'
 printf '%s\t%s\t%s\t0\t2\tGPT-X\t1700014101\tgenerating\n' "$SUPER_KEY" "$TDIR/superseded-live.md" "$(date +%s)" > "$SUPER_HEAD_HOME/in-progress/$SUPER_LIVE_MARKER"
 printf 'github.com\tacme\tfresh\t%s\t77\t%s\t1700014101\n' "$SUPER_KEY" "$TDIR/superseded-live.md" > "$SUPER_HEAD_HOME/run-meta/$SUPER_LIVE_MARKER"
@@ -5041,6 +5053,16 @@ check 'valid-but-crossed repository binding cannot supersede another canonical a
   "$([ "$RC" -eq 3 ] && [ ! -s "$SUPER_GH_CALLS" ] \
      && [ "$(awk -F'\t' 'NR==1{print $8}' "$SUPER_CROSS_HOME/in-progress/$SUPER_CROSS_MARKER")" = generating ]; echo $?)" \
   "rc=$RC calls=$(cat "$SUPER_GH_CALLS") binding=$(cat "$SUPER_CROSS_HOME/review-input-bindings/$SUPER_CROSS_MARKER")"
+SUPER_BADKEY_HOME="$TDIR/home-superseded-bad-key"
+SUPER_BADKEY_MARKER='pg-run-acme-fresh-77-1700014106-6'
+super_seed "$SUPER_BADKEY_HOME" "$SUPER_BADKEY_MARKER" 1700014106 "$FRESH_BASE"
+printf 'other-77\t%s\t1700014106\t0\t1\tGPT-X\t1700014106\tgenerating\n' "$TDIR/superseded-audit.md" > "$SUPER_BADKEY_HOME/in-progress/$SUPER_BADKEY_MARKER"
+: > "$SUPER_GH_CALLS"
+super_recover "$SUPER_BADKEY_HOME" "$SUPER_BADKEY_MARKER" ok MERGED "$FRESH_HEAD"
+check 'arbitrary reservation key mismatch remains generating without consulting GitHub' \
+  "$([ "$RC" -eq 3 ] && [ ! -s "$SUPER_GH_CALLS" ] \
+     && [ "$(awk -F'\t' 'NR==1{print $1" "$8}' "$SUPER_BADKEY_HOME/in-progress/$SUPER_BADKEY_MARKER")" = 'other-77 generating' ]; echo $?)" \
+  "rc=$RC calls=$(cat "$SUPER_GH_CALLS") record=$(cat "$SUPER_BADKEY_HOME/in-progress/$SUPER_BADKEY_MARKER")"
 
 # A terminal disposition is durable proof, not another mutable progress flag. It must outrank stale
 # active/run-meta state after a crash, complete exact cleanup/refund once, and let late review bytes
