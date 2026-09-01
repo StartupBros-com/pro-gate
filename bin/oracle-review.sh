@@ -3652,9 +3652,11 @@ while :; do
   # collect the review instead. (If Chrome itself is unreachable the probe
   # errors and the retry proceeds — a server-side-completed run cannot be
   # salvaged through a dead browser anyway.)
+  # CI ambiguity fixtures alone may shorten this otherwise-30s CDP absence wait.
+  PRE_RETRY_PROBE_SECS="$(pg_test_pre_retry_probe_secs)"
   PRC=2
   if command -v node >/dev/null 2>&1; then
-    node "$SELF/cdp-salvage.mjs" --probe "$RUN_MARKER" 30 "$PORT" >/dev/null 2>>"$RUNLOG"; PRC=$?
+    node "$SELF/cdp-salvage.mjs" --probe "$RUN_MARKER" "$PRE_RETRY_PROBE_SECS" "$PORT" >/dev/null 2>>"$RUNLOG"; PRC=$?
   fi
   if [ "$PRC" -eq 0 ]; then
     echo "[oracle-review] pre-retry probe found a live conversation for this run — retry suppressed (quota already spent); CDP salvage will collect it." >&2

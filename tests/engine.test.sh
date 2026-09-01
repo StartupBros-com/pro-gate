@@ -1289,7 +1289,7 @@ printf 'foreign idle tab\n' > "$TDIR/tab.txt"
 env PRO_GATE_HOME="$LOSS_HOME" ORACLE_HOME_DIR="$LOSS_HOME/oracle" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
   PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
   PRO_GATE_MAX_RETRIES=1 PRO_GATE_RETRY_BACKOFF=0 PRO_GATE_REATTACH_TIMEOUT=1 \
-  PRO_GATE_TIMEOUT_GRACE=1 PRO_GATE_SALVAGE_SECS=2 PRO_GATE_RUN_LOGS=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-quiet-fail" \
+  PRO_GATE_TIMEOUT_GRACE=1 PRO_GATE_TEST_PRE_RETRY_PROBE_SECS=1 PRO_GATE_SALVAGE_SECS=2 PRO_GATE_RUN_LOGS=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-quiet-fail" \
   PRO_GATE_TEE_BIN="$TDIR/tee-fail-bin/tee" \
   PG_TEST_ATTEMPTS_FILE="$LOSS_ATTEMPTS" NODE_OPTIONS= \
   bash "$ENGINE" --pr 921 --repo "$TDIR" --diff "$TDIR/small.diff" \
@@ -1518,7 +1518,7 @@ printf 'foreign idle tab\n' > "$TDIR/tab.txt"
 env PRO_GATE_HOME="$PROOF_HOME" ORACLE_HOME_DIR="$PROOF_ORACLE" ORACLE_BROWSER_PORT="$PORT" \
   ORACLE_CHATGPT_URL="$PROJECT_URL" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 \
   PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=1 PRO_GATE_RETRY_BACKOFF=0 \
-  PRO_GATE_REATTACH_TIMEOUT=1 PRO_GATE_TIMEOUT_GRACE=1 PRO_GATE_SALVAGE_SECS=2 \
+  PRO_GATE_REATTACH_TIMEOUT=1 PRO_GATE_TIMEOUT_GRACE=1 PRO_GATE_TEST_PRE_RETRY_PROBE_SECS=1 PRO_GATE_SALVAGE_SECS=2 \
   PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-commit-timeout" PG_TEST_ATTEMPTS_FILE="$PROOF_ATTEMPTS" \
   PG_TEST_CHATGPT_URL_FILE="$PROOF_URL" PG_TEST_TAB_URL="$PROJECT_URL" \
   NODE_OPTIONS= bash "$ENGINE" --pr 93 --repo "$TDIR" --diff "$TDIR/small.diff" \
@@ -1547,7 +1547,7 @@ RKEY_94="$(printf '%s-94' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
 printf 'foreign idle tab\n' > "$TDIR/tab.txt"
 env PRO_GATE_HOME="$PARTIAL_HOME" ORACLE_HOME_DIR="$PARTIAL_ORACLE" ORACLE_BROWSER_PORT="$PORT" \
   PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
-  PRO_GATE_MAX_RETRIES=1 PRO_GATE_RETRY_BACKOFF=0 PRO_GATE_REATTACH_TIMEOUT=1 PRO_GATE_TIMEOUT_GRACE=1 PRO_GATE_SALVAGE_SECS=2 \
+  PRO_GATE_MAX_RETRIES=1 PRO_GATE_RETRY_BACKOFF=0 PRO_GATE_REATTACH_TIMEOUT=1 PRO_GATE_TIMEOUT_GRACE=1 PRO_GATE_TEST_PRE_RETRY_PROBE_SECS=1 PRO_GATE_SALVAGE_SECS=2 \
   PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-commit-timeout" PG_TEST_ATTEMPTS_FILE="$PARTIAL_ATTEMPTS" \
   PG_TEST_COMMIT_MODE=partial NODE_OPTIONS= bash "$ENGINE" --pr 94 --repo "$TDIR" \
   --diff "$TDIR/small.diff" --out "$PARTIAL_HOME/o-partial.md" --timeout 5s \
@@ -1560,6 +1560,38 @@ check 'partial commit metadata remains charged' \
   "$([ -s "$PARTIAL_HOME/rounds/$RKEY_94" ]; echo $?)" "rounds=$(cat "$PARTIAL_HOME/rounds/$RKEY_94" 2>/dev/null)"
 check 'partial commit metadata never announces a refund' \
   "$(! grep -q 'refunding this round' "$TDIR/stderr"; echo $?)" "$(tail -6 "$TDIR/stderr")"
+
+# CI wait optimization pass 2: source the real private library helper in a fresh Bash
+# process for each boundary. The helper is used only by the three ambiguity fixtures above.
+prsecs_for() { # $1 = value for PRO_GATE_TEST_PRE_RETRY_PROBE_SECS, or literal UNSET to leave it unset
+  if [ "$1" = UNSET ]; then
+    ( unset PRO_GATE_TEST_PRE_RETRY_PROBE_SECS; bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_test_pre_retry_probe_secs" )
+  else
+    PRO_GATE_TEST_PRE_RETRY_PROBE_SECS="$1" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_test_pre_retry_probe_secs"
+  fi
+}
+check 'pre-retry probe seconds: unset retains production default 30' \
+  "$([ "$(prsecs_for UNSET)" = 30 ]; echo $?)" "got=$(prsecs_for UNSET)"
+check 'pre-retry probe seconds: empty string retains production default 30' \
+  "$([ "$(prsecs_for '')" = 30 ]; echo $?)" "got=$(prsecs_for '')"
+check 'pre-retry probe seconds: zero retains production default 30' \
+  "$([ "$(prsecs_for 0)" = 30 ]; echo $?)" "got=$(prsecs_for 0)"
+check 'pre-retry probe seconds: negative retains production default 30' \
+  "$([ "$(prsecs_for -1)" = 30 ]; echo $?)" "got=$(prsecs_for -1)"
+check 'pre-retry probe seconds: non-numeric retains production default 30' \
+  "$([ "$(prsecs_for abc)" = 30 ]; echo $?)" "got=$(prsecs_for abc)"
+check 'pre-retry probe seconds: leading-zero form is rejected, retains default 30' \
+  "$([ "$(prsecs_for 007)" = 30 ]; echo $?)" "got=$(prsecs_for 007)"
+check 'pre-retry probe seconds: out-of-bounds above 30 retains production default 30' \
+  "$([ "$(prsecs_for 31)" = 30 ]; echo $?)" "got=$(prsecs_for 31)"
+check 'pre-retry probe seconds: three-digit value retains production default 30' \
+  "$([ "$(prsecs_for 100)" = 30 ]; echo $?)" "got=$(prsecs_for 100)"
+check 'pre-retry probe seconds: valid minimum bound 1 is honored' \
+  "$([ "$(prsecs_for 1)" = 1 ]; echo $?)" "got=$(prsecs_for 1)"
+check 'pre-retry probe seconds: valid mid-range value 15 is honored' \
+  "$([ "$(prsecs_for 15)" = 15 ]; echo $?)" "got=$(prsecs_for 15)"
+check 'pre-retry probe seconds: valid maximum bound 30 is honored' \
+  "$([ "$(prsecs_for 30)" = 30 ]; echo $?)" "got=$(prsecs_for 30)"
 
 # Oracle 0.18.0 records promptSubmitted=false before attachment completion and changes it only
 # when Send is dispatched. Complete exact-session metadata plus the existing negative conversation

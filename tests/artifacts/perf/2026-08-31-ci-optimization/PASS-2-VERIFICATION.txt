@@ -1,0 +1,72 @@
+# Pass 2 verification
+
+Command: `bash tests/engine.test.sh` (run in foreground, not backgrounded)
+Result: exit 0; terminal output `ALL PASS`; 789/789 `ok -` lines counted; zero `not ok`,
+        `FAIL`, or `FAILURES` lines found via grep.
+Elapsed: 1345.98 seconds (22m25.98s), measured by `/usr/bin/time -f 'ELAPSED_SECONDS=%e'`.
+
+Raw capture:
+  stdout: /tmp/pro-gate-pass2-boundary-114-20260831/full-suite.stdout
+  stderr: /tmp/pro-gate-pass2-boundary-114-20260831/full-suite.stderr
+  timing: /tmp/pro-gate-pass2-boundary-114-20260831/full-suite.time -> ELAPSED_SECONDS=1345.98
+
+New pre-retry probe assertions, all "ok" in the captured run:
+  ok - pre-retry probe seconds: unset retains production default 30
+  ok - pre-retry probe seconds: empty string retains production default 30
+  ok - pre-retry probe seconds: zero retains production default 30
+  ok - pre-retry probe seconds: negative retains production default 30
+  ok - pre-retry probe seconds: non-numeric retains production default 30
+  ok - pre-retry probe seconds: leading-zero form is rejected, retains default 30
+  ok - pre-retry probe seconds: out-of-bounds above 30 retains production default 30
+  ok - pre-retry probe seconds: three-digit value retains production default 30
+  ok - pre-retry probe seconds: valid minimum bound 1 is honored
+  ok - pre-retry probe seconds: valid mid-range value 15 is honored
+  ok - pre-retry probe seconds: valid maximum bound 30 is honored
+
+Interpretation:
+
+- This is an observed post-change local full-suite behavior run, not a controlled same-host A/B
+  comparison against a hosted baseline. It does not by itself establish an actual wall-time
+  saving for this pass.
+- The code-level deadline budget for each of the three ambiguity fixtures (PR 921, PR 93,
+  PR 94) drops the pre-retry probe deadline argument from the production literal 30 seconds to
+  the fixture-local 1 second: a deterministic 29-second reduction per fixture, 87 seconds
+  (29 x 3) across the three fixtures. This stacks with pass 1's separate 357-second
+  timeout-grace reduction on the same three fixtures. Actual wall-time savings require
+  controlled measurement.
+- Authoritative performance acceptance is deferred to pass 10, using a same-revision hosted
+  comparison, per mission scope.
+
+Direct boundary evidence (real library helper, sourced fresh per case via
+`bash -c ". lib/pro-gate-lib.sh; pg_test_pre_retry_probe_secs"`, matching the repository's
+existing bash -c source-lib pattern):
+
+  PASS unset: 30
+  PASS empty: 30
+  PASS zero: 30
+  PASS negative: 30
+  PASS non_numeric: 30
+  PASS leading_zero: 30
+  PASS above_max: 30
+  PASS three_digit: 30
+  PASS minimum: 1
+  PASS middle: 15
+  PASS maximum: 30
+  DIRECT_BOUNDARY_CHECKS=PASS
+
+Additional completed checks:
+
+- `bash -n lib/pro-gate-lib.sh`: exit 0.
+- `bash -n bin/oracle-review.sh`: exit 0.
+- `bash -n tests/engine.test.sh`: exit 0.
+- `git diff --check`: exit 0 (no output).
+- `sha256sum -c tests/artifacts/perf/2026-08-31-ci-optimization/golden_checksums.txt`:
+  `engine-all-pass.txt: OK`. This file is unchanged from pass 1; pass 2 introduces no new
+  golden artifact.
+- Call-site scope grep confirms `pg_test_pre_retry_probe_secs` is invoked exactly once in
+  `bin/oracle-review.sh` (the pre-retry probe, line ~3561), and the other two
+  `cdp-salvage.mjs --probe` call sites (no-think watchdog probe, line ~3229; reservation-write
+  salvage-wait loop, line ~3832) both remain the literal `30`, untouched.
+- `PRO_GATE_TEST_PRE_RETRY_PROBE_SECS=1` remains set only in the same three fixture blocks
+  (PR 921 near line 1292, PR 93 near line 1521, PR 94 near line 1550); no other fixture gained
+  the override.

@@ -39,6 +39,15 @@ pg_service_mgr() {
 
 pg_have() { command -v "$1" >/dev/null 2>&1; }
 
+# Test-only override for the pre-retry CDP probe. Invalid input deliberately
+# falls back to the production 30-second deadline and can never extend it.
+pg_test_pre_retry_probe_secs() {
+  case "${PRO_GATE_TEST_PRE_RETRY_PROBE_SECS:-}" in
+    [1-9]|[12][0-9]|30) printf '%s\n' "$PRO_GATE_TEST_PRE_RETRY_PROBE_SECS" ;;
+    *) printf '30\n' ;;
+  esac
+}
+
 pg_runtime_version() {
   tr -d '[:space:]' < "$PRO_GATE_HOME/VERSION" 2>/dev/null || true
 }
