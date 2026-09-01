@@ -5,6 +5,19 @@ skill_root="${PRO_GATE_SKILL_ROOT:-${SKILL_ROOT:-}}"
 if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ]; then
   skill_root="$CLAUDE_PLUGIN_ROOT/skills/pro-gate"
 fi
+if [ -z "$skill_root" ]; then
+  # Self-location: callers overwhelmingly invoke this script by absolute path
+  # (papercut telemetry 2026-09-01: 20 failures across 12 projects in 3 days,
+  # every one a by-path invocation from a scratch script with no env set).
+  # The script knows where it lives; the sibling identity file is the proof
+  # the location is a real skill root. Env and CLAUDE_PLUGIN_ROOT still win
+  # above; this only replaces dying when they are absent.
+  self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+  candidate="${self_dir%/scripts}"
+  if [ -f "$candidate/review-decision-v1.json" ]; then
+    skill_root="$candidate"
+  fi
+fi
 [ -n "$skill_root" ] || {
   echo "ERROR: set SKILL_ROOT or PRO_GATE_SKILL_ROOT to the directory containing pro-gate SKILL.md" >&2
   exit 1
