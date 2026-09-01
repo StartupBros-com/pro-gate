@@ -1,0 +1,217 @@
+{
+  "schema_version": 1,
+  "pass": 9,
+  "classification": "PRODUCTIVE-MEASUREMENT",
+  "capture": {
+    "status": "passed",
+    "started_at_utc": "2026-09-01T12:47:56.890098Z",
+    "ended_at_utc": "2026-09-01T13:11:02.459964Z",
+    "source_head": "e71d1a2ad7c3df3b0cb140b36f41dac1dc52d25e",
+    "capture_location": "ephemeral local capture; absolute scratch path omitted"
+  },
+  "environment_fingerprint": {
+    "platform": "Linux 6.6.114.1-microsoft-standard-WSL2 x86_64, Ubuntu 24.04.4 LTS",
+    "cpu_count": 28,
+    "memory_total_kib": 41071616,
+    "memory_available_kib": 18297664,
+    "loadavg_1_5_15": [0.4072265625, 0.92041015625, 1.048828125],
+    "filesystem_available_bytes": 349112279040,
+    "tool_versions": {
+      "bash": "5.2.21",
+      "node": "v24.12.0",
+      "jq": "jq-1.8.1",
+      "shellcheck": "0.11.0"
+    },
+    "preflight": {
+      "ci_environment_names": [],
+      "pro_gate_environment_names": [],
+      "browser_processes_already_present": 15,
+      "limits": {
+        "nofile": 1048576,
+        "nproc": 160396
+      }
+    }
+  },
+  "commands": [
+    {
+      "id": "01-engine",
+      "argv": ["bash", "tests/engine.test.sh"],
+      "exit_status": 0,
+      "result": "passed",
+      "wall_seconds": 1143.22,
+      "cpu_seconds": 55.75,
+      "cpu_to_wall_ratio": 0.048766,
+      "max_rss_kb": 84720,
+      "assertions": {"internal_ok_dash": 825, "not_ok": 0, "terminal": "ALL PASS"},
+      "capture_sha256": {
+        "stdout": "b958a76879eae90fa61e277f4925cc7aad635adebb17bb5994497c6b8677c86c",
+        "stderr": "51f46096947a08857332a1a41dea337458cc34cc6cefb32ae7ba7bbb7230985b",
+        "time": "4353cc5cadf8fb8ffa8953b3811a84977e649b08a3c6035224e272d7340db822",
+        "timeline": "0ce1cc726bec0ef92bfc5a4a93a37dce9b152762b84d02cee830e721b097e517"
+      }
+    },
+    {
+      "id": "02-daemon-reload",
+      "argv": ["bash", "tests/daemon-reload.test.sh"],
+      "exit_status": 0,
+      "result": "passed",
+      "wall_seconds": 14.44,
+      "cpu_seconds": 2.09,
+      "cpu_to_wall_ratio": 0.144737,
+      "max_rss_kb": 6272,
+      "assertions": {"internal_ok_dash": 74, "not_ok": 0, "terminal": "ALL PASS"},
+      "capture_sha256": {
+        "stdout": "2619db201d95ae5d65cac4c59219bea631b1811d24256bd24c464383edbcf889",
+        "stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "time": "49972bf01f41c7182438b3ce3a5cdb0b8deb4cfd0c5d606040fb3588a7cc3f57",
+        "timeline": "8fe984613ec2b9883f5732e823f87cb11072a69c2d448314c9aca28747f0462c"
+      }
+    },
+    {
+      "id": "03-autoupdate",
+      "argv": ["bash", "tests/autoupdate.test.sh"],
+      "exit_status": 0,
+      "result": "passed",
+      "wall_seconds": 6.23,
+      "cpu_seconds": 1.31,
+      "cpu_to_wall_ratio": 0.210273,
+      "max_rss_kb": 106832,
+      "assertions": {"internal_ok_dash": 35, "not_ok": 0, "terminal": "ALL PASS"},
+      "capture_sha256": {
+        "stdout": "63938641f3c2475277ea0392162bc69cbf5cbb82abdbf1ad14619868537b77c3",
+        "stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "time": "aa55788284f9d91fa1fc2e618f20cb29a2c12f1674c684c0b331322c6179e03d",
+        "timeline": "8c38302ccaa8f5e2d1f58d169339b2050e71d1323a75ebf1538324a2794072f4"
+      }
+    },
+    {
+      "id": "04-browser-launch",
+      "argv": ["bash", "tests/browser-launch.test.sh"],
+      "exit_status": 0,
+      "result": "passed",
+      "wall_seconds": 11.06,
+      "cpu_seconds": 0.05,
+      "cpu_to_wall_ratio": 0.004521,
+      "max_rss_kb": 4032,
+      "assertions": {"internal_ok_dash": 17, "not_ok": 0, "terminal": "ALL PASS"},
+      "capture_sha256": {
+        "stdout": "b6600cddfeae81fd914091bd1f77f9d458efb3e465cfc4d3f6d63d0c0e70bde1",
+        "stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "time": "09636d7ade0b18c603c8e6c92b58ac2b592055f4e34dbeeddc3fc950787ece17",
+        "timeline": "6d53b19a7fb42fb414857d3dafec1418af8a92303fdf67b74e4422f92e5b5009"
+      }
+    },
+    {
+      "id": "05-cdp-salvage",
+      "argv": ["node", "--test", "tests/cdp-salvage.test.mjs"],
+      "exit_status": 0,
+      "result": "passed",
+      "wall_seconds": 151.09,
+      "cpu_seconds": 9.26,
+      "cpu_to_wall_ratio": 0.061288,
+      "max_rss_kb": 84288,
+      "assertions": {"internal_ok_dash": 298, "not_ok": 0, "node_test": {"tests": 1, "pass": 1, "fail": 0}},
+      "capture_sha256": {
+        "stdout": "454a4649e8a0f2414dc94ec36f6c11e1bfd4d04ff64aac71da4ebf9f1c888c69",
+        "stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "time": "29e974dbd38dd6dc6c64e7177f8142a88853d0197fc638c1595000ec022e8d80",
+        "timeline": "43b77bc6b56a8b1894ba849c50d6b9ef770cdd5d2dfdde447c03f4cd173c422a"
+      }
+    },
+    {
+      "id": "06-distribution",
+      "argv": ["bash", "tests/distribution.test.sh"],
+      "exit_status": 0,
+      "result": "passed",
+      "wall_seconds": 58.79,
+      "cpu_seconds": 15.6,
+      "cpu_to_wall_ratio": 0.265351,
+      "max_rss_kb": 112560,
+      "assertions": {"internal_ok_dash": 133, "not_ok": 0, "terminal": "ALL PASS"},
+      "capture_sha256": {
+        "stdout": "9f7b58beebbcabfc7a70db3f2d298f56fc710d71a768555505d83480636a5b05",
+        "stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "time": "d35498a1cfe253f29327926fd90cde47ab990a6c6b0b9ee166d05afab3e6d46f",
+        "timeline": "88b23955c03809613722f1b14b4dcef7521e2ecdd9c388795d991a399dac97f9"
+      }
+    },
+    {
+      "id": "07-release-train",
+      "argv": ["bash", "tests/release-train.test.sh"],
+      "exit_status": 0,
+      "result": "passed",
+      "wall_seconds": 0.55,
+      "cpu_seconds": 0.34,
+      "cpu_to_wall_ratio": 0.618182,
+      "max_rss_kb": 12096,
+      "assertions": {"internal_ok_dash": 58, "not_ok": 0, "terminal": "ALL PASS"},
+      "capture_sha256": {
+        "stdout": "6cc0a8f1a2c2d35c0168456c465e84c1e47c6bd1f663561a3f3770262cb5ab9c",
+        "stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "time": "a4c95829b29c59fbf005b18433ad8373da2dc0827039187050f7ce746b6f3193",
+        "timeline": "eee90e15e7b99aca78e40b2afaf80c2d317a6d3f481c55fea6fe68473913dd85"
+      }
+    },
+    {
+      "id": "08-release-assets",
+      "argv": ["bash", "tests/release-assets.test.sh"],
+      "exit_status": 0,
+      "result": "passed",
+      "wall_seconds": 0.14,
+      "cpu_seconds": 0.07,
+      "cpu_to_wall_ratio": 0.5,
+      "max_rss_kb": 3360,
+      "assertions": {"internal_ok_dash": 23, "not_ok": 0, "terminal": "ALL PASS"},
+      "capture_sha256": {
+        "stdout": "a55301b63e39a17c3b3f648a0118da60e67b230a42c35ffd5b078cf63e191957",
+        "stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "time": "588cdcf95212ae25d4ce1aa349bddb0a60dc6123a01d914e38a3f741647d6f6b",
+        "timeline": "f02aced02e7a29947e46a6dbaf8d72ba26a7ead363da3bd84b396183b07c06be"
+      }
+    }
+  ],
+  "top_five_by_wall_seconds": [
+    {"rank": 1, "id": "01-engine", "wall_seconds": 1143.22, "share_of_serial_wall_pct": 82.51},
+    {"rank": 2, "id": "05-cdp-salvage", "wall_seconds": 151.09, "share_of_serial_wall_pct": 10.90},
+    {"rank": 3, "id": "06-distribution", "wall_seconds": 58.79, "share_of_serial_wall_pct": 4.24},
+    {"rank": 4, "id": "02-daemon-reload", "wall_seconds": 14.44, "share_of_serial_wall_pct": 1.04},
+    {"rank": 5, "id": "04-browser-launch", "wall_seconds": 11.06, "share_of_serial_wall_pct": 0.80}
+  ],
+  "top_output_gaps_seconds": [
+    {"command": "01-engine", "seconds": 53.48086, "from_label": "ok - symlinked transcript fails closed", "to_label": "ok - intact log capture still refunds the pre-browser failure"},
+    {"command": "01-engine", "seconds": 48.72769, "from_label": "# v0.28: early URL capture + change manifest on a fresh run", "to_label": "ok - early-capture run preserves as in-progress (exit 9)"},
+    {"command": "01-engine", "seconds": 45.156266, "from_label": "ok - watchdog-killed stall after lifecycle never announces a refund", "to_label": "ok - hard-cap timeout kill exits 6"},
+    {"command": "01-engine", "seconds": 42.986119, "from_label": "# v0.31 (#65): a provably-never-landed submission refunds its round", "to_label": "ok - never-landed run fails (exit 6)"},
+    {"command": "01-engine", "seconds": 41.705639, "from_label": "ok - refund is named in the status detail", "to_label": "ok - landed-but-lost run fails (exit 6)"}
+  ],
+  "totals": {
+    "command_count": 8,
+    "all_exit_status_zero": true,
+    "serial_wall_seconds": 1385.52,
+    "cpu_seconds": 84.47,
+    "cpu_to_wall_ratio": 0.060966
+  },
+  "original_comparison": {
+    "scope": "Original measurements are GitHub-hosted ubuntu-24.04 service-level samples; current measurement is one local WSL serial capture, so deltas are directional only.",
+    "original_run_tests_seconds": {"mean": 1990.4, "p50": 2007.0, "p95": 2032.0},
+    "current_serial_wall_seconds": 1385.52,
+    "delta_from_original_run_tests_mean_seconds": -604.88,
+    "delta_from_original_run_tests_mean_pct": -30.39,
+    "per_command_vs_original_mean_seconds": [
+      {"id": "01-engine", "original_mean": 1560.969, "current": 1143.22, "delta": -417.749, "delta_pct": -26.76},
+      {"id": "02-daemon-reload", "original_mean": 15.0, "current": 14.44, "delta": -0.56, "delta_pct": -3.73},
+      {"id": "03-autoupdate", "original_mean": 3.063, "current": 6.23, "delta": 3.167, "delta_pct": 103.39},
+      {"id": "04-browser-launch", "original_mean": 10.95, "current": 11.06, "delta": 0.11, "delta_pct": 1.0},
+      {"id": "05-cdp-salvage", "original_mean": 391.626, "current": 151.09, "delta": -240.536, "delta_pct": -61.42},
+      {"id": "06-distribution", "original_mean": 15.235, "current": 58.79, "delta": 43.555, "delta_pct": 285.88},
+      {"id": "07-release-train", "original_mean": 0.981, "current": 0.55, "delta": -0.431, "delta_pct": -43.93},
+      {"id": "08-release-assets", "original_mean": 0.24, "current": 0.14, "delta": -0.1, "delta_pct": -41.67}
+    ]
+  },
+  "input_sha256": {
+    "current_profile_intermediate": "d455230d7809c64cbd3ceea38fa88186b7f93c4998924f466057a572b225c7a3",
+    "run_manifest": "1f888195306cdcbc68f30249c5c167c62e9e858e7411cf27a0be103dcd101c7d",
+    "environment_before": "4321bdf9b378746a42f63c36e05b5e9265608e2135a876468e8f32797dd7fc34",
+    "original_ci_baseline_summary": "7e01757c6546dc4f71549c988b6c1d53fa2b1d8b48ea319de1d5ee2e81191f84"
+  }
+}

@@ -1,0 +1,5 @@
+d79e0c32d972ce3b2b8bbf7344b642fbd4ee1a12feadd9903a1958a1f81b83d2  tests/artifacts/perf/2026-08-31-ci-optimization/PASS-10.md
+29c060e32a5f003153423a8e3ef4d219173ae7b5c612149684b37aae31b89724  tests/artifacts/perf/2026-08-31-ci-optimization/PASS-10-VERIFICATION.txt
+b9482248b029e57257105a8433dee54dd708389d8b0877e5880b7434794828e4  tests/artifacts/perf/2026-08-31-ci-optimization/PASS-10-POST-REBASE.txt
+be7b9a3781c59db242e79e8f1a768590f4dfcbbae9e0fc4af5e5cdef885dcb20  tests/artifacts/perf/2026-08-31-ci-optimization/FINAL-SUMMARY.md
+74a1e25fa98c9b41db86711d6b74494bbfbca46c1fc94a0f5f5d5ed8a7179bc1  tests/artifacts/perf/2026-08-31-ci-optimization/PASS-10-REVIEW-FIXES.md

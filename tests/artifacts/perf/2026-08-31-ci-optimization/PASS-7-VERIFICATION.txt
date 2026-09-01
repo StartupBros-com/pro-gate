@@ -1,0 +1,185 @@
+PASS 7 verification transcript — classified CDP deadline reductions
+====================================================================
+
+Date: 2026-09-01
+Worktree: /home/will/SITES/pro-gate/.claude/worktrees/ci-wait-optimization-114
+Scope: tests/cdp-salvage.test.mjs and PASS-7 artifacts only.
+Untouched by this pass: bin/, lib/, production defaults, parsers, workflows, CLI behavior,
+prior artifacts, golden files, and .skill-loop-progress.md.
+
+1. Pre-edit profile
+-------------------
+
+Current pre-edit foreground baseline:
+
+  /usr/bin/time ... node --test tests/cdp-salvage.test.mjs
+  real=386.31s user=6.64s sys=1.97s maxrss_kb=83552 exit=0
+  node:test duration=384601.355587ms
+  274 internal ok assertions, 0 FAIL, tests=1, pass=1, fail=0
+
+Raw baseline:
+
+  /tmp/pro-gate-pass7-20260901-cdp-deadlines/baseline.time
+  /tmp/pro-gate-pass7-20260901-cdp-deadlines/baseline.tap
+  /tmp/pro-gate-pass7-20260901-cdp-deadlines/baseline.stderr
+  /tmp/pro-gate-pass7-20260901-cdp-deadlines/baseline.timeline.tsv
+
+The timestamp profile found these deadline-bound gaps (sum 246.566s):
+
+  server-side liveness                         29.632s
+  undecided remembered shell                   30.038s
+  stale foreign remembered memo                30.041s
+  cross-bound remembered memo                  30.043s
+  open-tab cross-bind                          20.034s
+  still-generating ownership check             11.601s
+  conviction sidecar                           30.039s
+  later CDP outage after success               35.085s
+  dead remembered tab proven foreign           30.053s
+
+Mission score: impact 4 x confidence 3 / effort 4 = 3.00 (eligible: >=2.0).
+
+2. Classified test changes
+--------------------------
+
+All nine deadline fixtures now use a 3s invocation timeout only through their own call site.
+They use the existing bounded child-only timing seams as required:
+
+  - runFastCdpDeadlineSalvage(): POLL_MS=50, RENDER_SAMPLE_MS=50
+  - runFastPollSalvage(): POLL_MS=50
+
+Behavior proof added per semantic class:
+
+  stable server-side liveness
+    owned scratch sample first; >=3 later empty outer lists; elapsed >=2500ms;
+    exit 3, proven-server-side stderr, memo/no-blacklist/no-crossbound preserved.
+
+  undecided remembered shell
+    >=5 consecutive scratch samples and >=5 scratch lists; elapsed >=2500ms;
+    exit 7, memo/no-blacklist/no-crossbound/no-stdout preserved.
+
+  stale foreign remembered memo
+    decisive first scratch sample; >=3 later outer lists; elapsed >=2500ms;
+    exit 4, retained memo, no blacklist/crossbind/no stdout preserved.
+
+  cross-bound memo and conviction
+    decisive first scratch sample; >=3 later outer lists; elapsed >=2500ms;
+    exit 4, memo deletion, marker-scoped blacklist, cross-bound sidecar, and no
+    foreign stdout retained.
+
+  open-tab cross-bind
+    >=3 later outer lists; elapsed >=2500ms; exit 4; source tab remains open;
+    marker-scoped blacklist/cross-bound state and no foreign stdout retained.
+
+  still generating
+    >=5 consecutive owned-incomplete samples and >=5 scratch lists; final outer
+    revalidation; elapsed >=2500ms; exit 3; source tab/memo/no-rejection state retained.
+
+  later outage
+    mock stops only after first successful served outer /json; stderr must record
+    at least one later failed list; exit 7. The production 5s first-failure retry
+    backoff remains unchanged, so this test's real lower bound is about 5s.
+
+  dead remembered foreign renderer
+    decisive first scratch sample; >=3 later outer lists; elapsed >=2500ms;
+    exit 4, retained remembered memo and no blacklist/cross-bind state preserved.
+
+The mock diagnostics are opt-in (`trackCdpDeadlineEvents: true`) on only the nine deadline
+fixtures. Existing pass-5 jsonListCalls behavior remains unchanged for all other fixtures.
+
+3. Existing short-scratch stability repair
+------------------------------------------
+
+Four initial complete post-edit diagnostic runs failed in different pre-existing 3s static
+canonical-scratch fixtures. The original 2500ms sample left only 500ms to list/evaluate the
+result, and failures landed in distinct unmodified paths (probe complete, terminal remembered A,
+cross-bound canonical scratch, and readable stale source). No deadline reduction sub-batch was
+implicated.
+
+The existing pass-6 runScratchSalvage() seam now applies to the 13 selected static decisive,
+seeded 3s canonical revalidation fixtures. Their timeout literals are unchanged, they have no
+required first/second sample ordering, and their pre-existing terminal/foreign/cross-bind/memo
+assertions remain. This is a child-local test setting, not a global environment setting.
+
+Rejected instead of changing:
+
+  - scratch open/list/close 6000ms and 9000ms watchdogs and elapsed ceilings;
+  - shell deadlines below 3s;
+  - any production poll/sample default, retry backoff, render budget, parser, or CLI behavior;
+  - any global numeric literal replacement.
+
+4. Acceptance: three consecutive foreground complete suites
+-------------------------------------------------------------
+
+Each command used a 900,000ms tool timeout:
+
+  /usr/bin/time -f 'real=%e user=%U sys=%S maxrss_kb=%M exit=%x' \
+    -o /tmp/pro-gate-pass7-20260901-cdp-deadlines/postchange/final-run-N.time \
+    node --test /home/will/SITES/pro-gate/.claude/worktrees/ci-wait-optimization-114/tests/cdp-salvage.test.mjs \
+    > /tmp/pro-gate-pass7-20260901-cdp-deadlines/postchange/final-run-N.tap \
+    2> /tmp/pro-gate-pass7-20260901-cdp-deadlines/postchange/final-run-N.stderr
+
+  Run 1: real=151.18s user=7.33s sys=1.95s maxrss_kb=84028 exit=0
+         node:test duration=147146.791328ms; 298 ok / 0 FAIL; tests=1 pass=1 fail=0;
+         stderr=0 bytes.
+
+  Run 2: real=151.38s user=7.21s sys=2.03s maxrss_kb=83552 exit=0
+         node:test duration=147467.556361ms; 298 ok / 0 FAIL; tests=1 pass=1 fail=0;
+         stderr=0 bytes.
+
+  Run 3: real=153.69s user=7.44s sys=1.92s maxrss_kb=86232 exit=0
+         node:test duration=149643.749876ms; 298 ok / 0 FAIL; tests=1 pass=1 fail=0;
+         stderr=0 bytes.
+
+  p50=151.38s
+  max=153.69s
+  mean=152.083333s
+  population standard deviation=1.139015s
+  CV=0.7489%
+
+Against the exact 386.31s pre-edit baseline, p50 improves by 234.93s (60.81%).
+Against the 386.39s pass-6 run of record, p50 improves by 235.01s (60.82%).
+The conservative deadline-only budget is 246.566s - (8 * 3s + 5s outage first retry) =
+217.566s, independently well above the required 2s gain.
+
+Raw final evidence:
+
+  /tmp/pro-gate-pass7-20260901-cdp-deadlines/postchange/final-run-1.{time,tap,stderr}
+  /tmp/pro-gate-pass7-20260901-cdp-deadlines/postchange/final-run-2.{time,tap,stderr}
+  /tmp/pro-gate-pass7-20260901-cdp-deadlines/postchange/final-run-3.{time,tap,stderr}
+
+Non-acceptance diagnostics retained:
+
+  /tmp/pro-gate-pass7-20260901-cdp-deadlines/postchange/run-1.{time,tap,stderr}
+  /tmp/pro-gate-pass7-20260901-cdp-deadlines/postchange/diagnostic-run-2.{time,tap,stderr}
+  /tmp/pro-gate-pass7-20260901-cdp-deadlines/postchange/diagnostic-run-3.{time,tap,stderr}
+  /tmp/pro-gate-pass7-20260901-cdp-deadlines/postchange/diagnostic-run-4.{time,tap,stderr}
+
+5. Final static and scope checks
+--------------------------------
+
+  node --check tests/cdp-salvage.test.mjs                 PASS
+  node --check bin/cdp-salvage.mjs                        PASS
+  node --check bin/cdp-test-timing.mjs                    PASS
+  direct parseTestPollMs/parseTestRenderSampleMs bounds   PASS
+  sha256sum -c tests/artifacts/perf/2026-08-31-ci-optimization/golden_checksums.txt
+    engine-all-pass.txt: OK
+  git diff --check                                        PASS (no output)
+  git diff --name-only -- bin lib .github scripts install.sh
+    PASS (no output; no production/workflow file changed)
+
+6. Isomorphism and retention
+----------------------------
+
+Ordering: preserved and newly asserted for every shortened semantic class. The hang safety
+fixtures still prove abort-before-watchdog and open -> list -> close cleanup ordering.
+Tie-breaking/classification: unchanged; no production source changed.
+Floating point: N/A; selected values are canonical integer milliseconds.
+RNG: unchanged/N/A.
+Golden: verified above.
+
+Pass 5 is no longer conditionally retained: pass 7's independently scored 3.00 opportunity
+produced a conservative 217.566s deadline-only budget and a 234.93s measured p50 win, both far
+above the >=2s requirement.
+
+Rollback: after committing pass 7, revert that one pass-7 commit. Do not revert pass 5 or pass 6;
+their bounded test-only timing parsers/defaults remain independently covered.

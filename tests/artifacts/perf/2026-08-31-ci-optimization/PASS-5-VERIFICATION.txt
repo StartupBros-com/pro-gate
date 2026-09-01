@@ -1,0 +1,260 @@
+Pass 5 verification transcript — CDP main poll seam, test-only POLL_MS override
+================================================================================
+
+Host: Linux wm 6.6.114.1-microsoft-standard-WSL2 #1 SMP PREEMPT_DYNAMIC (WSL2), x86_64
+Node: v24.12.0
+Repo HEAD at time of baseline: 438ed7f03f8a1fb0700489381c515a00e5969bf2
+Worktree: /home/will/SITES/pro-gate/.claude/worktrees/ci-wait-optimization-114
+Scratch dir: /tmp/pg-pass5-verify/
+
+--------------------------------------------------------------------------------
+0. Pre-existing WIP found at session start
+--------------------------------------------------------------------------------
+This worktree already carried uncommitted changes to bin/cdp-salvage.mjs,
+tests/cdp-salvage.test.mjs, and a new untracked bin/cdp-poll-ms.mjs (evidently
+left by a prior, interrupted attempt at this exact pass 5 mission — mtimes
+2026-09-01 02:26-04:16, /tmp/pg-pass5, /tmp/pro-gate-pass5-114-20260901,
+/tmp/pro-gate-pass5-114-20260901-0348 contained matching prior baseline/postchange
+experiment logs). A leftover `git stash` entry "pass5-baseline-temp" from that
+prior session was also present (left untouched — not part of this pass's required
+artifacts, not destructive to remove but not needed either).
+
+I independently re-verified the entire implementation from scratch rather than
+trusting the prior WIP as-is: inspected every POLL_MS use site, ran my own clean
+pristine baseline (after temporarily stashing the pass-5 diff), ran my own
+post-change full-suite verification, and independently re-checked the parser's
+boundary behavior directly (not just via the embedded suite assertions).
+
+--------------------------------------------------------------------------------
+1. Inventory: every use of POLL_MS / runSalvage extraEnv / scan-count assertions
+--------------------------------------------------------------------------------
+
+$ grep -rn "POLL_MS" bin/ tests/ --include="*.mjs"
+bin/cdp-poll-ms.mjs:15:export const TEST_POLL_MS_MIN = 50;
+bin/cdp-poll-ms.mjs:16:export const TEST_POLL_MS_MAX = 20_000;
+bin/cdp-poll-ms.mjs:23:  return value >= TEST_POLL_MS_MIN && value <= TEST_POLL_MS_MAX ? value : null;
+bin/cdp-salvage.mjs:141:const POLL_MS = parseTestPollMs(process.env.PRO_GATE_TEST_POLL_MS) ?? 20_000;
+bin/cdp-salvage.mjs:1476:  await sleep(Math.min(probe ? 5_000 : POLL_MS, Math.max(0, deadline - Date.now())));
+tests/cdp-salvage.test.mjs:27:import { parseTestPollMs, TEST_POLL_MS_MIN, TEST_POLL_MS_MAX } from '../bin/cdp-poll-ms.mjs';
+  (+ boundary-check call sites, all listed in PASS-5.md)
+
+Exactly ONE production read site (line 1476, inside the pre-existing `while
+(Date.now() < deadline)` loop at line 1257). `parseTestPollMs` called exactly
+once, at module load (line 141) — confirmed no other call site exists:
+
+$ grep -n "^while\|parseTestPollMs" bin/cdp-salvage.mjs
+91:import { parseTestPollMs } from './cdp-poll-ms.mjs';
+141:const POLL_MS = parseTestPollMs(process.env.PRO_GATE_TEST_POLL_MS) ?? 20_000;
+1257:while (Date.now() < deadline) {
+
+`runSalvage`'s extraEnv construction (tests/cdp-salvage.test.mjs:305-307):
+  const child = spawn(process.execPath, [SALVAGE, ...expandedArgs, String(port)], {
+    env: { ...process.env, PRO_GATE_HOME: home, ...extraEnv },
+  });
+-> extraEnv merges only into the SPAWNED CHILD's env, never process.env globally.
+   Confirmed: no assignment to process.env.PRO_GATE_TEST_POLL_MS anywhere.
+
+Other timing constants confirmed untouched (grep, all outside the diff):
+$ grep -n "RENDER_INTERVAL_MS\|2_500\|25_000\|CONSUME_GRACE_MS" bin/cdp-salvage.mjs
+473:const RENDER_INTERVAL_MS = 90_000;
+556:const CONSUME_GRACE_MS = 2_000;
+597:    const renderDeadline = Math.min(Date.now() + 25_000, outerDeadline);
+600:    while (Date.now() + 2_500 < renderDeadline) {
+601:      await sleep(2_500);
+820:    const renderDeadline = Math.min(deadline, Date.now() + 25_000);
+(unchanged by this pass's diff — the diff has exactly 2 hunks in bin/cdp-salvage.mjs:
+ the new import line, and the POLL_MS assignment line)
+
+--------------------------------------------------------------------------------
+2. Baseline (pristine commit 438ed7f), BEFORE any pass-5 edit
+--------------------------------------------------------------------------------
+Stashed the pass-5 diff (bin/cdp-salvage.mjs, tests/cdp-salvage.test.mjs,
+bin/cdp-poll-ms.mjs) to get a true pre-edit tree, confirmed via `git status
+--short` (only the untouched .skill-loop-progress.md remained modified), ran:
+
+$ /usr/bin/time -f 'exit=%x elapsed=%E user=%U sys=%S maxrss=%M' \
+    -o baseline.time node tests/cdp-salvage.test.mjs > baseline.tap 2> baseline.stderr
+command_exit=0
+ok-count: 232
+FAIL-count: 0
+exit=0 elapsed=6:40.82 user=7.21 sys=2.24 maxrss=86272
+
+RESULT: exit 0, 232/232 ok, 0 FAIL, 0 stderr bytes, elapsed 400.82s. Clean on the
+first attempt; no rerun needed. (An earlier, discarded run using the prior
+session's leftover baseline logs had shown 3 transient timing FAILs consistent
+with host-load flakiness documented in PASS-3-VERIFICATION.txt / PASS-4.md; my
+own clean rerun above is the evidence of record and needed no retry.)
+
+Restored the pass-5 diff (`git stash pop`); confirmed via `git status --short`
+that bin/cdp-salvage.mjs, tests/cdp-salvage.test.mjs (modified) and
+bin/cdp-poll-ms.mjs (untracked) were back in place, unchanged from before the
+stash (stash push/pop is lossless).
+
+--------------------------------------------------------------------------------
+3. Syntax checks (post-change tree)
+--------------------------------------------------------------------------------
+$ node --check bin/cdp-salvage.mjs && echo OK       -> OK
+$ node --check bin/cdp-poll-ms.mjs && echo OK        -> OK
+$ node --check tests/cdp-salvage.test.mjs && echo OK -> OK
+$ git diff --check                                   -> (no output, exit 0)
+
+--------------------------------------------------------------------------------
+4. Direct parser boundary re-verification (independent of the embedded suite)
+--------------------------------------------------------------------------------
+Standalone script importing the real bin/cdp-poll-ms.mjs directly:
+
+unset                input=undefined  -> null
+empty                input=""         -> null
+zero                 input="0"        -> null
+negative             input="-1"       -> null
+negative-large       input="-20000"   -> null
+malformed-abc        input="abc"      -> null
+malformed-mixed      input="123abc"   -> null
+leading-zero         input="0100"     -> null
+leading-zero-min     input="050"      -> null
+fractional           input="100.5"    -> null
+whitespace           input=" 100 "    -> null
+plus-sign            input="+100"     -> null
+below-min            input="49"       -> null
+exactly-min          input="50"       -> 50
+exactly-max          input="20000"    -> 20000
+above-max            input="20001"    -> null
+way-above-max        input="999999"   -> null
+non-string-number    input=100        -> null
+null                 input=null       -> null
+NaN-string           input="NaN"      -> null
+Infinity-string      input="Infinity" -> null
+MIN= 50 MAX= 20000 MAX===20000: true
+
+Every unset/empty/zero/negative/malformed/leading-zero/below-minimum/above-bound
+case rejected (null -> production 20_000 fallback); only [50, 20000] canonical
+positive decimals honored; 20000 (max) equals the literal production default.
+
+--------------------------------------------------------------------------------
+5. Production-default proof: PRO_GATE_TEST_POLL_MS absent from every prod path
+--------------------------------------------------------------------------------
+$ grep -rn "PRO_GATE_TEST_POLL_MS" bin/ lib/ install.sh scripts/ .github/
+bin/cdp-poll-ms.mjs:4    (comment)
+bin/cdp-salvage.mjs:139  (comment)
+bin/cdp-salvage.mjs:141  (the fallback expression itself)
+-> zero occurrences in install.sh, scripts/, .github/workflows/*.yml, or lib/.
+
+$ grep -rln "PRO_GATE_TEST_POLL_MS" . --include="*.json" --include="*.env*"
+-> no matches.
+
+Only other occurrences are in tests/cdp-salvage.test.mjs (comments + the two new
+extraEnv usages), confirmed by the full grep in section 1 above.
+
+--------------------------------------------------------------------------------
+6. Post-change full suite, foreground, exact command the file's own header
+   documents ("Run: node tests/cdp-salvage.test.mjs")
+--------------------------------------------------------------------------------
+$ /usr/bin/time -f 'exit=%x elapsed=%E user=%U sys=%S maxrss=%M' \
+    -o postchange.time node tests/cdp-salvage.test.mjs > postchange.tap 2> postchange.stderr
+command_exit=0
+ok-count: 253
+FAIL-count: 0
+exit=0 elapsed=6:44.61 user=7.35 sys=2.19 maxrss=86304
+
+RESULT: exit 0, 253/253 ok, 0 FAIL, 0 stderr bytes, elapsed 404.61s. Clean on the
+first attempt; no rerun needed. Delta vs. baseline: +21 assertions (232 -> 253,
+matching the 21 new `check(` calls added by the diff), +3.79s (+0.9%, within
+normal host-load noise — pass 4's own two same-code reruns spread ~1%, 1171.47s
+vs 1183.13s).
+
+--------------------------------------------------------------------------------
+7. Post-change, actual CI invocation (.github/workflows/ci.yml:55 /
+   release.yml:45 both run `node --test tests/cdp-salvage.test.mjs`)
+--------------------------------------------------------------------------------
+$ /usr/bin/time -f 'exit=%x elapsed=%E user=%U sys=%S maxrss=%M' \
+    -o postchange-nodetest.time node --test tests/cdp-salvage.test.mjs \
+    > postchange-nodetest.tap 2> postchange-nodetest.stderr
+command_exit=0
+tests 1
+suites 0
+pass 1
+fail 0
+cancelled 0
+skipped 0
+todo 0
+duration_ms 405032.800621
+exit=0 elapsed=6:45.05 user=7.82 sys=2.28 maxrss=83104
+
+RESULT: exit 0, node:test summary tests=1/pass=1/fail=0 (the file has no internal
+node:test subtests; node:test treats the whole file's exit code as the single
+test's outcome, and it exited 0 with 253/253 internal ok lines, confirmed in the
+captured stdout tail). Clean on the first attempt; no rerun needed.
+
+--------------------------------------------------------------------------------
+8. Golden checksum (unaffected — this pass does not touch tests/engine.test.sh)
+--------------------------------------------------------------------------------
+$ sha256sum -c tests/artifacts/perf/2026-08-31-ci-optimization/golden_checksums.txt
+tests/artifacts/perf/2026-08-31-ci-optimization/engine-all-pass.txt: OK
+
+Full `bash tests/engine.test.sh` engine check was NOT re-run: this pass touches
+only bin/cdp-salvage.mjs, the new bin/cdp-poll-ms.mjs, and
+tests/cdp-salvage.test.mjs — no shared shell/runtime code (lib/pro-gate-lib.sh,
+bin/oracle-review.sh) changed, so the mission's conditional for that check does
+not apply.
+
+--------------------------------------------------------------------------------
+9. Baseline profiling: why POLL_MS cannot reduce the existing suite's dominant
+   cost (see PASS-5.md "Profiling" section for full narrative)
+--------------------------------------------------------------------------------
+Timestamped wrapper (pipes the real test file's own stdout, no file modified)
+against the pristine pre-pass-5 code found nine existing test blocks each
+gapped by almost exactly their own `runSalvage(..., timeoutSecs)` argument
+(20024-35096ms each), summing to ~247s of the 400.82s baseline (~62%). These
+gaps are governed by `const deadline = Date.now() + Number(timeoutSecs) * 1000`
+(wall-clock, caller-supplied `timeoutSecs`) — a value the mission explicitly
+protects ("Do not change ... timeout arguments") — not by `POLL_MS` (the sleep
+interval WITHIN that already-fixed window). This pass's own new comparison test
+(section 6/7 above, "rapid polling ... " checks) directly confirms this: the
+same 2-second-deadline scenario takes ~2s wall time whether POLL_MS is 50 or
+20_000. Full timestamped gap list is reproduced in PASS-5.md.
+
+--------------------------------------------------------------------------------
+10. Files touched / not touched
+--------------------------------------------------------------------------------
+$ git status --short
+ M .skill-loop-progress.md      <- pre-existing from prior passes; NOT touched by pass 5
+ M bin/cdp-salvage.mjs
+ M tests/cdp-salvage.test.mjs
+?? bin/cdp-poll-ms.mjs
+
+$ git diff --stat -- bin/cdp-salvage.mjs tests/cdp-salvage.test.mjs
+ bin/cdp-salvage.mjs        |  8 ++++-
+ tests/cdp-salvage.test.mjs | 77 ++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 84 insertions(+), 1 deletion(-)
+$ wc -l bin/cdp-poll-ms.mjs
+24 bin/cdp-poll-ms.mjs
+
+git diff tests/cdp-salvage.test.mjs contains ZERO removed content lines (only
+the standard `--- a/...` diff header) — purely additive; every pre-existing
+assertion (including "a later CDP outage is not masked by an early successful
+scan" -> exit 7, "an undecided remembered conversation exits 7, not 4", and
+every memo/blacklist/cross-bind/source-tab assertion) is unmodified and still
+present, and all passed in section 6/7's clean runs.
+
+PASS-1.md, PASS-2.md, PASS-2-VERIFICATION.txt, PASS-3.md, PASS-3-VERIFICATION.txt,
+PASS-4.md, PASS-4-VERIFICATION.txt, VERIFICATION.txt, engine-all-pass.txt, and
+golden_checksums.txt: not modified by this pass (confirmed via git status above
+listing only the four paths noted).
+
+--------------------------------------------------------------------------------
+Summary
+--------------------------------------------------------------------------------
+| Check                                        | Result                        |
+|-----------------------------------------------|-------------------------------|
+| node --check (3 files)                        | PASS, all exit 0              |
+| git diff --check                              | PASS, no whitespace errors    |
+| Direct parser boundary re-verification        | PASS, all 21 cases correct    |
+| Production-default grep sweep                 | PASS, zero prod-path matches  |
+| Baseline (pristine, node tests/cdp-...)        | exit 0, 232/232, 400.82s      |
+| Post-change (node tests/cdp-...)               | exit 0, 253/253, 404.61s      |
+| Post-change (CI: node --test tests/cdp-...)    | exit 0, 1/1 pass, 405.05s     |
+| sha256sum -c golden_checksums.txt              | OK                            |
+| Full engine check (tests/engine.test.sh)       | not required, not run (scope)|
+
+No cleanRerun was needed anywhere in this pass — every run listed above was
+clean on its first foreground attempt.

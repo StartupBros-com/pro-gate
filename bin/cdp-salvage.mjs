@@ -88,6 +88,10 @@ import {
   buildRenameConversationExpression,
   ORGANIZER_MUTATION_LEASE_MS,
 } from './cdp-organizer-expressions.mjs';
+import {
+  parseTestPollMs,
+  parseTestRenderSampleMs,
+} from './cdp-test-timing.mjs';
 
 const usage = () => {
   console.error('usage: cdp-salvage.mjs [--probe|--close|--sweep-root|--organize [--finalize --result-file <path>] [--accepted-url <url>] [--archive] [--no-rename]] <pr-marker|-> [timeout-secs] [cdp-port]');
@@ -132,7 +136,14 @@ const organize = mode === 'organize';
 const [marker, timeoutSecs = probe || organize ? '30' : '600', port = process.env.ORACLE_CDP_PORT ?? '9222'] = argv;
 if (!marker || argv.length > 3 || !/^\d+$/.test(String(timeoutSecs)) || Number(timeoutSecs) <= 0 || !/^\d+$/.test(String(port))) usage();
 const deadline = Date.now() + Number(timeoutSecs) * 1000;
-const POLL_MS = 20_000;
+// Test-only timing overrides (see cdp-test-timing.mjs): only deliberately tagged fixture
+// children may shorten these waits. Unset, malformed, or any other mode preserves the exact
+// production literals below; this token is intentionally not a production configuration surface.
+const TEST_TIMING_ENABLED = process.env.PRO_GATE_TEST_MODE === 'ci-fixture';
+const POLL_MS = TEST_TIMING_ENABLED ? (parseTestPollMs(process.env.PRO_GATE_TEST_POLL_MS) ?? 20_000) : 20_000;
+const RENDER_SAMPLE_MS = TEST_TIMING_ENABLED
+  ? (parseTestRenderSampleMs(process.env.PRO_GATE_TEST_RENDER_SAMPLE_MS) ?? 2_500)
+  : 2_500;
 
 const PG_HOME = process.env.PRO_GATE_HOME ?? path.join(os.homedir(), '.pro-review-daemon');
 const BLACKLIST_FILE = path.join(PG_HOME, 'salvage-nonmatching.txt');
@@ -591,8 +602,8 @@ async function freshRenderText(url, port, outerDeadline, waitForDecisiveEvidence
     const renderDeadline = Math.min(Date.now() + 25_000, outerDeadline);
     let text = null;
     let evidence = null;
-    while (Date.now() + 2_500 < renderDeadline) {
-      await sleep(2_500);
+    while (Date.now() + RENDER_SAMPLE_MS < renderDeadline) {
+      await sleep(RENDER_SAMPLE_MS);
       let tabs;
       try {
         ({ value: tabs } = await fetchJsonBeforeDeadline(`http://127.0.0.1:${port}/json`, {}, renderDeadline));

@@ -1,0 +1,18 @@
+# Pass 1 verification
+
+Command: `bash tests/engine.test.sh`
+Result: exit 0; terminal output `ALL PASS` (line 881 of captured stdout); no `FAILURES` output.
+Elapsed: 1465.03 seconds (24m25.03s), measured by `/usr/bin/time -f 'ELAPSED_SECONDS=%e'`.
+
+Interpretation:
+
+- This is an observed post-change local full-suite behavior run, not a controlled same-host A/B comparison against the hosted multi-SHA baseline. It does not establish an actual wall-time saving or a percentage speedup.
+- The code-level hard deadline budget for each target path changes from `HARD_SECS=125` (5s timeout plus default 120s grace) to 6 (5s timeout plus fixture-local 1s grace): a deterministic 119s reduction per path and 357s across the three fixtures. Actual wall-time savings require controlled measurement.
+- The authoritative performance acceptance is the same-revision hosted comparison in pass 10.
+
+Additional completed checks:
+
+- `bash -n tests/engine.test.sh`: exit 0.
+- `git diff --check`: exit 0.
+- `sha256sum -c tests/artifacts/perf/2026-08-31-ci-runner/evidence-checksums.txt`: all five archived baseline inputs OK.
+- The terminal golden `engine-all-pass.txt` is checked against the captured `ALL PASS` result and against `golden_checksums.txt`.

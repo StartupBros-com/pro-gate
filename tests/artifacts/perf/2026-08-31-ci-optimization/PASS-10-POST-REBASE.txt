@@ -1,0 +1,117 @@
+PASS 10 POST-REBASE TERMINAL GOLDEN — PASS
+============================================
+
+Scope and rebase proof
+----------------------
+- Current HEAD: 84981c736ad8dd7eab55466cccc87dee2d699e68 (84981c7).
+- Required rebase base: ef99b8f6ee8b5b2fa74bccafa7c07626aa67de7d (ef99b8f).
+- `git merge-base ef99b8f HEAD` returned ef99b8f6ee8b5b2fa74bccafa7c07626aa67de7d and
+  `git merge-base --is-ancestor ef99b8f HEAD` exited 0: HEAD is based on the required origin/main
+  v0.37.2 base.
+
+CI command census
+-----------------
+`.github/workflows/ci.yml` lines 26-29 supply the exact validation block: JSON `jq empty`, YAML
+`yq eval '.'`, then repository-wide `shellcheck --severity=error`. Its current "Run tests" block
+(lines 51-59) contains nine commands, not the historical eight: the rebase-base revision includes
+`bash tests/resolve-identity.test.sh` between autoupdate and browser-launch. This capture ran the
+current workflow source of truth serially, including all nine commands.
+
+Foreground capture
+------------------
+Scratch: /tmp/pro-gate-pass10-post-rebase.WDq9DG/
+Driver: /tmp/pro-gate-pass10-post-rebase.WDq9DG/run-pass10-post-rebase.sh
+Tool timeout: 3,600,000ms. Full stdout, stderr, GNU time, and the compact manifest are retained
+under the scratch directory. No test command was parallelized or backgrounded.
+
+The driver first captured validation through resolve-identity and then correctly preserved those
+successful captures while correcting two manifest-only terminal-marker recognizers: the new resolver
+intentionally prints `resolve-identity: all checks pass` rather than `ALL PASS`, and Node's ANSI
+spec reporter puts color bytes after its summary numbers. The same driver then continued from the
+stored captures. No validation or test command was re-executed; every command has attempts=1. The
+one permitted stale-throttle `--harvest` rerun was available but unused.
+
+Compact manifest
+----------------
+ID  Command                                      Exit  Wall(s)  Terminal/result                              ok  not-ok  stdout SHA-256
+00  CI validation block                              0    25.50  VALIDATION PASS                              0       0  9e4e70b6c903107bca7056bead3a82fbffab4050d92fe1ac8eb2770ac533369e
+01  bash tests/engine.test.sh                        0  1524.93  ALL PASS                                   847       0  668bb241382effdc81a4e98aa3132fc60264d05a7ef113b8827d9b7d7feaf63f
+02  bash tests/daemon-reload.test.sh                 0    14.30  ALL PASS                                    74       0  2619db201d95ae5d65cac4c59219bea631b1811d24256bd24c464383edbcf889
+03  bash tests/autoupdate.test.sh                    0     5.50  ALL PASS                                    35       0  63938641f3c2475277ea0392162bc69cbf5cbb82abdbf1ad14619868537b77c3
+04  bash tests/resolve-identity.test.sh              0     0.04  resolve-identity: all checks pass            3       0  77c65417ade7724a976f5eb05761eb2df431194046e78a3f5a7398ef25a84bc7
+05  bash tests/browser-launch.test.sh                0    11.72  ALL PASS                                    17       0  b6600cddfeae81fd914091bd1f77f9d458efb3e465cfc4d3f6d63d0c0e70bde1
+06  node --test tests/cdp-salvage.test.mjs           0   152.36  node:test tests=1 pass=1 fail=0            298       0  371aa42916673ea2e7bd39e5e42a9d90542691782ec9a125256fa286f72a3f30
+07  bash tests/distribution.test.sh                  0    56.04  ALL PASS                                   133       0  70a82e28ed0677cebbc77df1e9248459d4661ed42d45a168e1bdb7fa1e979621
+08  bash tests/release-train.test.sh                 0     0.59  ALL PASS                                    58       0  6cc0a8f1a2c2d35c0168456c465e84c1e47c6bd1f663561a3f3770262cb5ab9c
+09  bash tests/release-assets.test.sh                0     0.14  ALL PASS                                    23       0  a55301b63e39a17c3b3f648a0118da60e67b230a42c35ffd5b078cf63e191957
+
+Assertions and result
+---------------------
+- 10/10 process steps (validation plus nine current CI test commands) exited 0.
+- Seven conventional shell suites printed literal `ALL PASS`; the eighth current shell suite,
+  resolve-identity, printed its explicit success terminal `resolve-identity: all checks pass`.
+  All eight shell suites exited 0 with 0 `not ok` records.
+- Node suite: tests=1, pass=1, fail=0; 298 `ok -` records and 0 `not ok` records.
+- Aggregate internal assertions: 1,488 `ok -`; 0 `not ok`.
+- Total serial wall, validation plus nine tests: 1,791.12 seconds (29m 51.12s), inside the CI job's
+  45-minute limit.
+- Attempts: 1 for each step; stale-throttle harvest retry consumption: 0.
+
+Rebased pass map
+----------------
+Pass  Historical pre-rebase commit  Rebased current commit
+1     8ee53de                       45e2384
+2     eb11e66                       aaf2293
+3     201fd69                       d6efb96
+4     438ed7f                       31da6b7
+5     327da27                       926c66e
+6     6f5d1cd                       d97a798
+7     31c8262                       9afe24b
+8     e71d1a2                       66c91e5
+9     8a695fd                       d0f0a86
+10    verification-only historical   84981c7 checkpoint
+
+The base for every current mapping is ef99b8f (v0.37.2). Historical pre-rebase measurements in
+PASS-10.md, PASS-10-VERIFICATION.txt, and FINAL-SUMMARY.md remain checkpoint evidence; this file
+is the terminal post-rebase capture and does not overwrite them.
+
+No source/test/workflow change proof
+------------------------------------
+After artifact writing, both unstaged and staged comparisons excluding the requested artifact
+folder are required to exit 0:
+  git diff --exit-code -- bin lib .github tests ':!tests/artifacts'
+  git diff --cached --exit-code -- bin lib .github tests ':!tests/artifacts'
+The branch intentionally contains its rebased pass changes relative to ef99b8f; these commands
+prove this terminal verification introduced no additional uncommitted source, test-code, or
+workflow change.
+
+Post-write validation results
+-----------------------------
+All checks below exited 0 after the artifacts were written:
+- `find . -path './.git' -prune -o -name '*.json' -print -exec jq empty {} \\;` validated all ten
+  repository JSON files, including `PASS-9-current-profile.json`.
+- `sha256sum -c PASS-10-checksums.txt` reported OK for PASS-10.md,
+  PASS-10-VERIFICATION.txt, FINAL-SUMMARY.md, and this POST-REBASE file; the checksum manifest
+  intentionally excludes itself.
+- Repository-wide Bash syntax (`bash -n`), Node syntax (`node --check`), and ShellCheck
+  `--severity=error` all passed.
+- `git diff --check` passed with no whitespace errors.
+- Staged and unstaged source/test/workflow exclusion checks above both passed. The only working
+  changes are the requested Pass 10 artifact updates and this new POST-REBASE artifact; no prior
+  PASS-1 through PASS-9 artifact, golden file, progress file, source, test, or workflow was edited.
+
+Final verdict: POST-REBASE TERMINAL GOLDEN PASS.
+
+Review-fix closeout
+--------------------
+This terminal record retains its historical post-rebase measurements. The later final review closes
+the high-severity timing mode boundary (valid overrides require exact
+`PRO_GATE_TEST_MODE=ci-fixture`; an accepted inherited-variable engine run unsets it and retains
+production defaults), refutes PR-924 hard-cap P2 (`HARD_SECS=125` versus an approximately 6-second
+watchdog path), and fixes outage child-ack P2 through a primary `Runtime.evaluate` DOM poll before
+stop.
+
+Focused accepted results are engine exit 0 / 855 `ok -` / `ALL PASS` and Node tests=1 / pass=1 /
+fail=0 / 302 `ok -` / 159.88833346s. The exact validation block plus all seven unaffected CI suites
+also passed serially in a fresh 900,000ms foreground capture. PASS-10-REVIEW-FIXES.md is the detailed
+final-review record.

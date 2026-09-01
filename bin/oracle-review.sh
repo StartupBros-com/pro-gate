@@ -3242,10 +3242,14 @@ STALL_SECS="${PRO_GATE_STALL_SECS:-600}"
 NOTHINK_SECS="${PRO_GATE_NOTHINK_SECS:-600}"
 
 run_oracle() {  # $1 = browser model strategy (select|current|ignore)
-  local strategy="$1" job started size last_size last_change now last_line prc
+  local strategy="$1" job started size last_size last_change now last_line prc watchdog_sleep_secs
+  local watchdog_term_drain_secs watchdog_force_settle_secs
   local transcript="$WORK/oracle.${#ORACLE_LOG_TRANSCRIPTS[@]}.log"
   local proof="$WORK/oracle.${#ORACLE_LOG_TRANSCRIPTS[@]}.sha256"
   local producer_file="${transcript%.log}.pid" producer drained
+  watchdog_sleep_secs="$(pg_test_watchdog_sleep_secs)"
+  watchdog_term_drain_secs="$(pg_test_watchdog_term_drain_secs)"
+  watchdog_force_settle_secs="$(pg_test_watchdog_force_settle_secs)"
   ORACLE_LOG_TRANSCRIPTS+=("$transcript")
   ORACLE_LOG_PROOFS+=("$proof")
   rm -f "$transcript" "$proof" "$producer_file"
@@ -3298,7 +3302,7 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
   job=$!
   started=$SECONDS; last_size=-1; last_change=$SECONDS
   while kill -0 "$job" 2>/dev/null; do
-    sleep 10
+    sleep "$watchdog_sleep_secs"
     [ -s "$CAPTURE_OUT" ] && continue   # findings are landing — let the run finish undisturbed
     size=$(wc -c < "$RUNLOG" 2>/dev/null) || size=0
     if [ "$size" != "$last_size" ]; then last_size="$size"; last_change=$SECONDS; fi
@@ -3348,7 +3352,7 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
     if [ -n "$producer" ]; then
       pg_signal_producer TERM "$producer"
       drained=0
-      while [ "$drained" -lt 30 ] && kill -0 "$job" 2>/dev/null; do sleep 1; drained=$((drained + 1)); done
+      while [ "$drained" -lt "$watchdog_term_drain_secs" ] && kill -0 "$job" 2>/dev/null; do sleep 1; drained=$((drained + 1)); done
     fi
     # Refused to drain (or the pid was never published): publish NOTHING, so the attempt stays
     # charged rather than resting on a possibly-truncated capture. Take Oracle's process group down
@@ -3358,7 +3362,7 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
     if kill -0 "$job" 2>/dev/null; then
       pg_signal_producer KILL "$producer"
       pkill -TERM -P "$job" 2>/dev/null; kill -TERM "$job" 2>/dev/null
-      sleep 5
+      sleep "$watchdog_force_settle_secs"
       pg_signal_producer KILL "$producer"
       pkill -KILL -P "$job" 2>/dev/null; kill -KILL "$job" 2>/dev/null
     fi
@@ -3652,9 +3656,11 @@ while :; do
   # collect the review instead. (If Chrome itself is unreachable the probe
   # errors and the retry proceeds — a server-side-completed run cannot be
   # salvaged through a dead browser anyway.)
+  # CI ambiguity fixtures alone may shorten this otherwise-30s CDP absence wait.
+  PRE_RETRY_PROBE_SECS="$(pg_test_pre_retry_probe_secs)"
   PRC=2
   if command -v node >/dev/null 2>&1; then
-    node "$SELF/cdp-salvage.mjs" --probe "$RUN_MARKER" 30 "$PORT" >/dev/null 2>>"$RUNLOG"; PRC=$?
+    node "$SELF/cdp-salvage.mjs" --probe "$RUN_MARKER" "$PRE_RETRY_PROBE_SECS" "$PORT" >/dev/null 2>>"$RUNLOG"; PRC=$?
   fi
   if [ "$PRC" -eq 0 ]; then
     echo "[oracle-review] pre-retry probe found a live conversation for this run — retry suppressed (quota already spent); CDP salvage will collect it." >&2

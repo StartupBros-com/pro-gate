@@ -24,6 +24,14 @@ import {
   buildRenameConversationExpression,
   ORGANIZER_MUTATION_LEASE_MS,
 } from '../bin/cdp-organizer-expressions.mjs';
+import {
+  parseTestPollMs,
+  TEST_POLL_MS_MIN,
+  TEST_POLL_MS_MAX,
+  parseTestRenderSampleMs,
+  TEST_RENDER_SAMPLE_MS_MIN,
+  TEST_RENDER_SAMPLE_MS_MAX,
+} from '../bin/cdp-test-timing.mjs';
 
 const SALVAGE = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'cdp-salvage.mjs');
 const WS_MAGIC = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
@@ -94,13 +102,33 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
   const created = [];              // scratch tabs opened via /json/new
   const pollsByTab = new Map();    // scratch tab id -> how many times its DOM has been read
   const requests = [];
+  const httpRequests = [];         // request-order proof for scratch open/list/close cleanup
   const ui = opts.ui ?? { title: null, archived: false, events: [] };
   ui.events ??= [];
   const mutationTokens = new Map();
   const mutationExpiries = new Map();
   const revokedMutationTokens = new Set();
   let primaryPolls = 0;
-  const server = createServer((req, res) => {
+  let primaryDomPolls = 0;
+  let jsonListCalls = 0;   // All /json hits, retained for pass 5's production-vs-fast contrast.
+  let successfulJsonListCalls = 0;
+  let outerJsonListCalls = 0;   // Lists made when no disposable scratch target is open.
+  let scratchJsonListCalls = 0; // Lists that observe an open scratch target during its render.
+  const jsonListEvents = [];
+  const trackCdpDeadlineEvents = opts.trackCdpDeadlineEvents === true;
+  let stoppedAfterPrimaryDomPoll = null;
+  let stopped = false;
+  let server = null;
+  const stop = (cb) => {
+    if (stopped || !server?.listening) {
+      if (cb) queueMicrotask(cb);
+      return;
+    }
+    stopped = true;
+    server.close(cb);
+  };
+  server = createServer((req, res) => {
+    httpRequests.push(`${req.method} ${req.url}`);
     if (req.url === '/json/version') { res.end(JSON.stringify({ Browser: 'MockChrome/1.0' })); return; }
     if (req.url?.startsWith('/json/new')) {
       const port = server.address().port;
@@ -124,7 +152,10 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
       return;
     }
     if (req.url === '/json') {
-      if (opts.hangScratchList && created.some((t) => !closed.includes(t.id))) return;
+      jsonListCalls += 1;
+      const scratchOpen = created.some((t) => !closed.includes(t.id));
+      const listSource = scratchOpen ? 'scratch' : 'outer';
+      if (opts.hangScratchList && scratchOpen) return;
       const port = server.address().port;
       res.setHeader('content-type', 'application/json');
       // Extras are listed verbatim EXCEPT that a caller-supplied tab with no debugger URL
@@ -136,7 +167,7 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
           ? { type: 'page', ...t, webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/${t.id}` }
           : t
       ));
-      if (opts.failScratchList && created.some((t) => !closed.includes(t.id))) {
+      if (opts.failScratchList && scratchOpen) {
         res.statusCode = 503; res.end('scratch list unavailable'); return;
       }
       const scratch = created.filter((t) => !closed.includes(t.id)).flatMap((t) => {
@@ -148,14 +179,25 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
           ...(override ?? {}),
         }];
       });
-      if (tabText === '__NO_TABS__' || closed.includes('tab1')) {
-        res.end(JSON.stringify([...extras, ...scratch]));
-        return;
+      const listed = tabText === '__NO_TABS__' || closed.includes('tab1')
+        ? [...extras, ...scratch]
+        : [{
+          id: 'tab1', type: 'page', url: 'https://chatgpt.com/c/mock-conversation',
+          webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/tab1`,
+        }, ...extras, ...scratch];
+      res.end(JSON.stringify(listed));
+      // Only shortened deadline fixtures opt into these diagnostic events. Ordinary fixtures keep
+      // the original mock's hot request path and only retain jsonListCalls for pass 5's contrast.
+      if (trackCdpDeadlineEvents) {
+        successfulJsonListCalls += 1;
+        if (listSource === 'scratch') scratchJsonListCalls += 1;
+        else outerJsonListCalls += 1;
+        jsonListEvents.push({
+          count: successfulJsonListCalls,
+          source: listSource,
+          tabIds: listed.map((tab) => tab.id),
+        });
       }
-      res.end(JSON.stringify([{
-        id: 'tab1', type: 'page', url: 'https://chatgpt.com/c/mock-conversation',
-        webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/tab1`,
-      }, ...extras, ...scratch]));
       return;
     }
     if (req.url?.startsWith('/json/close/')) {
@@ -252,6 +294,8 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
         value = ui.cancelUnconfirmed ? false : true;
       }
       const armLate = ui.armMutationAfterDelay && armMutation;
+      const primaryDomPoll = id === 'tab1' && request.method === 'Runtime.evaluate' &&
+        expression === 'document.body.innerText';
       const response = () => {
         if (armLate) armMutation();
         applyMutation?.();
@@ -259,6 +303,21 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
           id: request.id,
           result: { result: { value } },
         })));
+        // Pass 7's later-outage fixture may stop only after the child consumed the successful
+        // outer list enough to issue the listed primary tab's DOM poll. Scheduling after the
+        // response is written preserves that successful-read-before-outage ordering.
+        if (primaryDomPoll) {
+          primaryDomPolls += 1;
+          const stopAfter = Number(opts.stopAfterPrimaryDomPoll);
+          if (
+            Number.isInteger(stopAfter) && stopAfter >= 1 &&
+            stoppedAfterPrimaryDomPoll === null && primaryDomPolls >= stopAfter &&
+            outerJsonListCalls >= 1
+          ) {
+            stoppedAfterPrimaryDomPoll = primaryDomPolls;
+            queueMicrotask(() => stop());
+          }
+        }
       };
       if (armMutation && !armLate) armMutation();
       if (delayMs > 0) setTimeout(response, delayMs);
@@ -271,7 +330,15 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
     closed,
     created,
     requests,
+    httpRequests,
     ui,
+    get jsonListCalls() { return jsonListCalls; },
+    get successfulJsonListCalls() { return successfulJsonListCalls; },
+    get outerJsonListCalls() { return outerJsonListCalls; },
+    get scratchJsonListCalls() { return scratchJsonListCalls; },
+    get primaryDomPolls() { return primaryDomPolls; },
+    get jsonListEvents() { return jsonListEvents.map((event) => ({ ...event, tabIds: [...event.tabIds] })); },
+    get stoppedAfterPrimaryDomPoll() { return stoppedAfterPrimaryDomPoll; },
     setText: (value) => {
       if (value !== tabText) {
         const closedAt = closed.indexOf('tab1');
@@ -279,7 +346,7 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
       }
       tabText = value;
     },
-    stop: (cb) => server.close(cb),
+    stop,
   })));
 }
 
@@ -296,8 +363,14 @@ function runSalvage(args, port, seed, extraEnv = {}) {
   return new Promise((resolve) => {
     const startedAt = Date.now();
     const expandedArgs = args.map((arg) => arg.replace(/^PG_HOME\//, `${home}/`));
+    const childEnv = { ...process.env, PRO_GATE_HOME: home, ...extraEnv };
+    // Explicit undefined removes an inherited environment key for boundary tests. It lets a test
+    // prove the child has no test mode at all instead of merely replacing it with another string.
+    for (const [name, value] of Object.entries(childEnv)) {
+      if (value === undefined) delete childEnv[name];
+    }
     const child = spawn(process.execPath, [SALVAGE, ...expandedArgs, String(port)], {
-      env: { ...process.env, PRO_GATE_HOME: home, ...extraEnv },
+      env: childEnv,
     });
     let stdout = '', stderr = '';
     child.stdout.on('data', (d) => { stdout += d; });
@@ -326,6 +399,38 @@ function runSalvage(args, port, seed, extraEnv = {}) {
       });
     });
   });
+}
+
+// Deliberately opt in only scratch fixtures that need it: hydration/order checks, hung-close
+// cleanup, and static decisive 3s canonical revalidations. The latter have no required first/second
+// state transition; their old 2.5s sample left only 500ms of scheduler slack before the assertion.
+// The override is merged into the spawned child alone; this test process and all regular salvage
+// fixtures keep their inherited environment.
+const SCRATCH_SAMPLE_TEST_ENV = Object.freeze({
+  PRO_GATE_TEST_MODE: 'ci-fixture',
+  PRO_GATE_TEST_RENDER_SAMPLE_MS: String(TEST_RENDER_SAMPLE_MS_MIN),
+});
+function runScratchSalvage(args, port, seed, extraEnv = {}) {
+  return runSalvage(args, port, seed, { ...extraEnv, ...SCRATCH_SAMPLE_TEST_ENV });
+}
+
+// Pass 7's deadline fixtures opt in by semantic class, never through the parent environment or
+// every salvage child. Fast polling preserves multiple main-list observations inside a short
+// deadline; fast scratch sampling preserves ordered render observations when that fixture needs
+// them before the same deadline arrives.
+const FAST_POLL_TEST_ENV = Object.freeze({
+  PRO_GATE_TEST_MODE: 'ci-fixture',
+  PRO_GATE_TEST_POLL_MS: String(TEST_POLL_MS_MIN),
+});
+const FAST_CDP_DEADLINE_TEST_ENV = Object.freeze({
+  ...FAST_POLL_TEST_ENV,
+  PRO_GATE_TEST_RENDER_SAMPLE_MS: String(TEST_RENDER_SAMPLE_MS_MIN),
+});
+function runFastPollSalvage(args, port, seed, extraEnv = {}) {
+  return runSalvage(args, port, seed, { ...extraEnv, ...FAST_POLL_TEST_ENV });
+}
+function runFastCdpDeadlineSalvage(args, port, seed, extraEnv = {}) {
+  return runSalvage(args, port, seed, { ...extraEnv, ...FAST_CDP_DEADLINE_TEST_ENV });
 }
 
 // Write a remembered-conversation memo, exactly as a previous invocation would have.
@@ -385,7 +490,106 @@ function check(name, cond, detail) {
   failures += 1; console.log(`FAIL - ${name}${detail ? `: ${detail}` : ''}`);
 }
 
+// Deadline fixtures use this test-private proof so a shorter test deadline never turns an
+// ordered scratch render into a single lucky sample. The mock supplies 1-based sample counts.
+function hasConsecutiveSamples(samples, minimum) {
+  return samples.length >= minimum && samples.every((sample, index) => sample === index + 1);
+}
+
 const MARKER = 'pg-run-test-1234567890-42';
+
+{ // Direct poll-parser boundary coverage (bin/cdp-test-timing.mjs), called in-process — no spawn. Every
+  // one of these is real production input shape: an unset/empty/malformed
+  // PRO_GATE_TEST_POLL_MS must fall back to cdp-salvage.mjs's own literal 20_000, never this
+  // parser's return value, so `null` here is the only value that preserves that default.
+  check('parseTestPollMs: unset (undefined) is rejected', parseTestPollMs(undefined) === null);
+  check('parseTestPollMs: empty string is rejected', parseTestPollMs('') === null);
+  check('parseTestPollMs: "0" is rejected', parseTestPollMs('0') === null);
+  check('parseTestPollMs: negative is rejected', parseTestPollMs('-50') === null);
+  check('parseTestPollMs: non-numeric is rejected', parseTestPollMs('abc') === null);
+  check('parseTestPollMs: fractional form is rejected', parseTestPollMs('100.5') === null);
+  check('parseTestPollMs: whitespace-padded form is rejected', parseTestPollMs(' 100 ') === null);
+  check('parseTestPollMs: leading-zero form is rejected', parseTestPollMs('0100') === null);
+  check('parseTestPollMs: leading-zero at the minimum is rejected',
+    parseTestPollMs(`0${TEST_POLL_MS_MIN}`) === null);
+  check('parseTestPollMs: a non-string input type is rejected', parseTestPollMs(100) === null);
+  check('parseTestPollMs: below the minimum bound is rejected',
+    parseTestPollMs(String(TEST_POLL_MS_MIN - 1)) === null);
+  check('parseTestPollMs: above the maximum bound is rejected',
+    parseTestPollMs(String(TEST_POLL_MS_MAX + 1)) === null);
+  check('parseTestPollMs: the maximum bound equals production POLL_MS', TEST_POLL_MS_MAX === 20_000);
+  check('parseTestPollMs: the exact minimum bound is honored',
+    parseTestPollMs(String(TEST_POLL_MS_MIN)) === TEST_POLL_MS_MIN);
+  check('parseTestPollMs: the exact maximum bound is honored',
+    parseTestPollMs(String(TEST_POLL_MS_MAX)) === TEST_POLL_MS_MAX);
+  check('parseTestPollMs: a valid mid-range value is honored',
+    parseTestPollMs('5000') === 5_000);
+  check('parseTestPollMs: a valid value can only ever shorten, never extend, the cadence',
+    parseTestPollMs(String(TEST_POLL_MS_MAX)) <= 20_000);
+}
+
+{ // Direct render-parser boundary coverage (bin/cdp-test-timing.mjs), called in-process — no spawn.
+  // A null result makes cdp-salvage.mjs retain its literal 2_500ms production sample interval.
+  check('parseTestRenderSampleMs: unset (undefined) is rejected', parseTestRenderSampleMs(undefined) === null);
+  check('parseTestRenderSampleMs: empty string is rejected', parseTestRenderSampleMs('') === null);
+  check('parseTestRenderSampleMs: "0" is rejected', parseTestRenderSampleMs('0') === null);
+  check('parseTestRenderSampleMs: negative is rejected', parseTestRenderSampleMs('-50') === null);
+  check('parseTestRenderSampleMs: non-numeric is rejected', parseTestRenderSampleMs('abc') === null);
+  check('parseTestRenderSampleMs: fractional form is rejected', parseTestRenderSampleMs('100.5') === null);
+  check('parseTestRenderSampleMs: whitespace-padded form is rejected', parseTestRenderSampleMs(' 100 ') === null);
+  check('parseTestRenderSampleMs: leading-zero form is rejected', parseTestRenderSampleMs('050') === null);
+  check('parseTestRenderSampleMs: a non-string input type is rejected', parseTestRenderSampleMs(100) === null);
+  check('parseTestRenderSampleMs: below the minimum bound is rejected',
+    parseTestRenderSampleMs(String(TEST_RENDER_SAMPLE_MS_MIN - 1)) === null);
+  check('parseTestRenderSampleMs: above the maximum bound is rejected',
+    parseTestRenderSampleMs(String(TEST_RENDER_SAMPLE_MS_MAX + 1)) === null);
+  check('parseTestRenderSampleMs: the maximum bound equals production sample interval',
+    TEST_RENDER_SAMPLE_MS_MAX === 2_500);
+  check('parseTestRenderSampleMs: the exact minimum bound is honored',
+    parseTestRenderSampleMs(String(TEST_RENDER_SAMPLE_MS_MIN)) === TEST_RENDER_SAMPLE_MS_MIN);
+  check('parseTestRenderSampleMs: the exact maximum bound is honored',
+    parseTestRenderSampleMs(String(TEST_RENDER_SAMPLE_MS_MAX)) === TEST_RENDER_SAMPLE_MS_MAX);
+  check('parseTestRenderSampleMs: a valid mid-range value is honored',
+    parseTestRenderSampleMs('500') === 500);
+  check('parseTestRenderSampleMs: a valid value can only ever shorten, never extend, sampling',
+    parseTestRenderSampleMs(String(TEST_RENDER_SAMPLE_MS_MAX)) <= 2_500);
+}
+
+{ // Direct runtime boundary proof for the fresh-render cadence. A four-second deadline leaves
+  // startup slack for one production 2,500ms sample; exact fixture mode gets a second 50ms sample.
+  const rememberedUrl = 'https://chatgpt.com/c/render-timing-boundary';
+  const review = `run marker: ${MARKER}\n[P1] render.ts:1: proof\n  Why: timing boundary\nVERDICT: SHIP: done.`;
+  async function renderTimingBoundary(mode) {
+    const samples = [];
+    const cdp = await mockCdp('__NO_TABS__', [], {
+      renderText: (_url, n) => {
+        samples.push(n);
+        return n === 1 ? 'Chat history\nNew chat\nSidebar only' : review;
+      },
+    });
+    const result = await runSalvage([MARKER, '4'], cdp.port, seedMemo(MARKER, rememberedUrl), {
+      PRO_GATE_TEST_MODE: mode,
+      PRO_GATE_TEST_RENDER_SAMPLE_MS: String(TEST_RENDER_SAMPLE_MS_MIN),
+    });
+    cdp.stop();
+    return { result, samples };
+  }
+
+  const noMode = await renderTimingBoundary(undefined);
+  check('a valid render override without test mode retains the production 2,500ms sample cadence',
+    noMode.samples.join(',') === '1' && noMode.result.elapsedMs >= 2_200,
+    `samples=${noMode.samples} elapsed=${noMode.result.elapsedMs} status=${noMode.result.status}`);
+
+  const wrongMode = await renderTimingBoundary('not-ci-fixture');
+  check('a valid render override with a wrong mode retains the production 2,500ms sample cadence',
+    wrongMode.samples.join(',') === '1' && wrongMode.result.elapsedMs >= 2_200,
+    `samples=${wrongMode.samples} elapsed=${wrongMode.result.elapsedMs} status=${wrongMode.result.status}`);
+
+  const exactMode = await renderTimingBoundary('ci-fixture');
+  check('exact ci-fixture mode honors the valid rapid render override',
+    exactMode.result.status === 0 && exactMode.samples.join(',') === '1,2' && exactMode.result.elapsedMs < 1_000,
+    `samples=${exactMode.samples} elapsed=${exactMode.result.elapsedMs} status=${exactMode.result.status}`);
+}
 
 { // still generating: marker matches, no VERDICT -> exit 3, tab NOT closed
   const cdp = await mockCdp(`run marker: ${MARKER}\nReasoning about the diff...`);
@@ -449,7 +653,7 @@ const MARKER = 'pg-run-test-1234567890-42';
     `VERDICT: FIX-FIRST — recovered from the canonical conversation. (run marker: ${MARKER})`,
   ].join('\n');
   const cdp = await mockCdp(staleSource, [], { renderText: (url) => url === canonicalUrl ? serverReview : '' });
-  const r = await runSalvage([MARKER, '3'], cdp.port, seedMemo(MARKER, canonicalUrl));
+  const r = await runScratchSalvage([MARKER, '3'], cdp.port, seedMemo(MARKER, canonicalUrl));
   check('readable stale source recovers the canonical scratch review', r.status === 0,
     `status=${r.status} stderr=${r.stderr?.slice(0, 300)}`);
   const expectedReview = serverReview.split('\n').slice(1).join('\n');
@@ -475,12 +679,18 @@ const MARKER = 'pg-run-test-1234567890-42';
     'P2: none',
     `VERDICT: FIX-FIRST — recovered after marker hydration. (run marker: ${MARKER})`,
   ].join('\n');
+  const observations = [];
   const cdp = await mockCdp(staleSource, [], {
-    renderText: (url, n) => url === canonicalUrl && n === 1 ? markerOnlyScratch : serverReview,
+    renderText: (url, n) => {
+      observations.push(n);
+      return url === canonicalUrl && n === 1 ? markerOnlyScratch : serverReview;
+    },
   });
-  const r = await runSalvage([MARKER, '8'], cdp.port, seedMemo(MARKER, canonicalUrl));
+  const r = await runScratchSalvage([MARKER, '8'], cdp.port, seedMemo(MARKER, canonicalUrl));
   check('readable stale source waits past a marker-only canonical scratch sample', r.status === 0,
     `status=${r.status} stderr=${r.stderr?.slice(0, 300)}`);
+  check('marker-hydration revalidation samples marker-only text first then the later verdict exactly once',
+    observations.join(',') === '1,2', `observations=${observations}`);
   check('marker-hydration revalidation emits the later nonce-bearing verdict',
     r.stdout.trim() === serverReview.split('\n').slice(1).join('\n'), `stdout=${r.stdout?.slice(0, 300)}`);
   check('marker-hydration revalidation closes only its scratch target',
@@ -498,7 +708,9 @@ const MARKER = 'pg-run-test-1234567890-42';
     `VERDICT: SHIP — server-complete. (run marker: ${MARKER})`,
   ].join('\n');
   const cdp = await mockCdp(staleSource, [], { renderText: (url) => url === canonicalUrl ? serverReview : '' });
-  const r = await runSalvage(['--probe', MARKER, '3'], cdp.port, seedMemo(MARKER, canonicalUrl));
+  // This 3s canonical revalidation has one static decisive sample; use the pass-6 test seam so
+  // scheduler jitter cannot consume the original 500ms post-sample slack.
+  const r = await runScratchSalvage(['--probe', MARKER, '3'], cdp.port, seedMemo(MARKER, canonicalUrl));
   check('probe revalidates a readable stale source and remains live (exit 0)', r.status === 0,
     `status=${r.status} stderr=${r.stderr?.slice(0, 300)}`);
   check('probe classifies fresh owned terminal evidence as complete', /^probe-state: complete$/m.test(r.stderr || ''),
@@ -515,7 +727,7 @@ const MARKER = 'pg-run-test-1234567890-42';
   const cdp = await mockCdp(`run marker: ${MARKER}\nstale readable source`, [], {
     renderText: () => `run marker: ${MARKER}\nstill generating on the server`,
   });
-  const r = await runSalvage([MARKER, '3'], cdp.port, seedMemo(MARKER, canonicalUrl));
+  const r = await runScratchSalvage([MARKER, '3'], cdp.port, seedMemo(MARKER, canonicalUrl));
   check('same-marker incomplete scratch remains still-generating', r.status === 3, `status=${r.status} stderr=${r.stderr}`);
   check('same-marker incomplete scratch is attempted only once', cdp.created.length === 1 && cdp.closed.includes('scratch1'),
     `created=${JSON.stringify(cdp.created)} closed=${cdp.closed}`);
@@ -534,7 +746,7 @@ const MARKER = 'pg-run-test-1234567890-42';
     'new answer still generating',
   ].join('\n');
   const cdp = await mockCdp(`run marker: ${MARKER}\nstale readable source`, [], { renderText: () => oldBeforePrompt });
-  const r = await runSalvage(['--probe', MARKER, '3'], cdp.port, seedMemo(MARKER, canonicalUrl));
+  const r = await runScratchSalvage(['--probe', MARKER, '3'], cdp.port, seedMemo(MARKER, canonicalUrl));
   check('probe keeps an old foreign-marked scratch verdict generating',
     r.status === 0 && /^probe-state: generating$/m.test(r.stderr || ''), `status=${r.status} stderr=${r.stderr}`);
   check('old verdict ordering closes only one scratch', cdp.created.length === 1 && !cdp.closed.includes('tab1'),
@@ -551,7 +763,7 @@ const MARKER = 'pg-run-test-1234567890-42';
   const ownCdp = await mockCdp(`run marker: ${MARKER}\nstale readable source`, [], {
     renderText: () => oldOwnedBeforePrompt,
   });
-  const ownResult = await runSalvage(['--probe', MARKER, '3'], ownCdp.port, seedMemo(MARKER, canonicalUrl));
+  const ownResult = await runScratchSalvage(['--probe', MARKER, '3'], ownCdp.port, seedMemo(MARKER, canonicalUrl));
   check('probe keeps an old same-marker terminal verdict before the latest prompt generating',
     ownResult.status === 0 && /^probe-state: generating$/m.test(ownResult.stderr || ''),
     `status=${ownResult.status} stderr=${ownResult.stderr}`);
@@ -592,13 +804,19 @@ const MARKER = 'pg-run-test-1234567890-42';
     '  Why: real bug',
     `VERDICT: FIX-FIRST — newer round is final. (run marker: ${MARKER})`,
   ].join('\n');
-  // Reuse the readable-stale-source -> canonical-scratch-revalidation path (U1): its scratch
-  // samples every 2.5s with no render-interval throttle, unlike the remembered-URL seeded
-  // render (90s), so it can observe the newer verdict landing within a normal test budget.
+  // Reuse the readable-stale-source -> canonical-scratch-revalidation path (U1): production
+  // samples every 2.5s with no render-interval throttle, unlike the remembered-URL seeded render
+  // (90s). This focused fixture opts its spawned child into the 50ms test-only sample seam.
+  const observations = [];
   const seededCdp = await mockCdp(staleTerminal, [], {
-    renderText: (_url, n) => (n === 1 ? staleTerminal : newerFinal),
+    renderText: (_url, n) => {
+      observations.push(n);
+      return n === 1 ? staleTerminal : newerFinal;
+    },
   });
-  const seededResult = await runSalvage([MARKER, '8'], seededCdp.port, seedMemo(MARKER, canonicalUrl));
+  const seededResult = await runScratchSalvage([MARKER, '8'], seededCdp.port, seedMemo(MARKER, canonicalUrl));
+  check('the stale terminal sample is observed before exactly one later terminal sample',
+    observations.join(',') === '1,2', `observations=${observations}`);
   check('the superseded verdict is skipped and the newer verdict is emitted instead',
     seededResult.status === 0 && /VERDICT: FIX-FIRST — newer round is final/.test(seededResult.stdout ?? ''),
     `status=${seededResult.status} stdout=${seededResult.stdout?.slice(0, 300)}`);
@@ -620,7 +838,7 @@ const MARKER = 'pg-run-test-1234567890-42';
   ];
   for (const [name, opts] of cases) {
     const cdp = await mockCdp(source, [], opts);
-    const r = await runSalvage([MARKER, '3'], cdp.port, seedMemo(MARKER, canonicalUrl));
+    const r = await runScratchSalvage([MARKER, '3'], cdp.port, seedMemo(MARKER, canonicalUrl));
     check(`${name} is inconclusive while the readable source remains live`, r.status === 3,
       `status=${r.status} stderr=${r.stderr}`);
     check(`${name} keeps memo and avoids blacklist/cross-bind mutation`,
@@ -638,7 +856,7 @@ const MARKER = 'pg-run-test-1234567890-42';
   const source = `run marker: ${MARKER}\nstale readable source`;
   const throttle = "You're making requests too quickly. Temporarily limited access to your conversations.";
   const throttled = await mockCdp(source, [], { renderText: () => throttle });
-  const throttleResult = await runSalvage([MARKER, '3'], throttled.port, seedMemo(MARKER, canonicalUrl));
+  const throttleResult = await runScratchSalvage([MARKER, '3'], throttled.port, seedMemo(MARKER, canonicalUrl));
   check('throttled canonical scratch takes the existing throttle exit', throttleResult.status === 5,
     `status=${throttleResult.status} stderr=${throttleResult.stderr}`);
   check('throttled canonical scratch writes cooldown and closes only scratch',
@@ -652,7 +870,7 @@ const MARKER = 'pg-run-test-1234567890-42';
     'VERDICT: FIX-FIRST — not ours. (run marker: pg-run-other-repo-42-1111111111-9)',
   ].join('\n');
   const crossBound = await mockCdp(source, [], { renderText: () => foreignAnswer });
-  const crossBoundResult = await runSalvage([MARKER, '3'], crossBound.port, seedMemo(MARKER, canonicalUrl));
+  const crossBoundResult = await runScratchSalvage([MARKER, '3'], crossBound.port, seedMemo(MARKER, canonicalUrl));
   check('cross-bound canonical scratch is never emitted as our review',
     crossBoundResult.status !== 0 && !/VERDICT/.test(crossBoundResult.stdout ?? ''),
     `status=${crossBoundResult.status} stdout=${crossBoundResult.stdout}`);
@@ -666,7 +884,7 @@ const MARKER = 'pg-run-test-1234567890-42';
   const foreignOnly = await mockCdp(source, [], {
     renderText: () => 'run marker: pg-run-other-repo-42-1111111111-9\nVERDICT: SHIP — foreign.',
   });
-  const foreignResult = await runSalvage([MARKER, '3'], foreignOnly.port, seedMemo(MARKER, canonicalUrl));
+  const foreignResult = await runScratchSalvage([MARKER, '3'], foreignOnly.port, seedMemo(MARKER, canonicalUrl));
   check('foreign canonical scratch is rejected as a decisive stale memo', foreignResult.status === 4,
     `status=${foreignResult.status} stderr=${foreignResult.stderr}`);
   check('foreign canonical scratch forgets and blacklists the stale memo',
@@ -694,7 +912,9 @@ const MARKER = 'pg-run-test-1234567890-42';
   const terminalCdp = await mockCdp(duplicateTabB, [], {
     renderText: (url) => (url === knownUrlA ? terminalReviewA : wrongUrlRendered),
   });
-  const terminalResult = await runSalvage([MARKER, '3'], terminalCdp.port, seedMemo(MARKER, knownUrlA));
+  // Static terminal scratch evidence has no delayed state to preserve; the 50ms test seam avoids
+  // a flaky 2.5s sample landing after this fixture's 3s invocation deadline.
+  const terminalResult = await runScratchSalvage([MARKER, '3'], terminalCdp.port, seedMemo(MARKER, knownUrlA));
   check('the one revalidation renders the remembered conversation A, not the duplicate tab B',
     terminalCdp.created.length === 1 && terminalCdp.created[0]?.url === knownUrlA,
     `created=${JSON.stringify(terminalCdp.created)}`);
@@ -718,7 +938,7 @@ const MARKER = 'pg-run-test-1234567890-42';
   const crossBoundCdp = await mockCdp(duplicateTabB, [], {
     renderText: (url) => (url === knownUrlA ? crossBoundAnswerA : duplicateTabB),
   });
-  const crossBoundResult = await runSalvage([MARKER, '3'], crossBoundCdp.port, seedMemo(MARKER, knownUrlA));
+  const crossBoundResult = await runScratchSalvage([MARKER, '3'], crossBoundCdp.port, seedMemo(MARKER, knownUrlA));
   check('the one revalidation renders A, not B, for the cross-bound case',
     crossBoundCdp.created.length === 1 && crossBoundCdp.created[0]?.url === knownUrlA,
     `created=${JSON.stringify(crossBoundCdp.created)}`);
@@ -757,7 +977,7 @@ const MARKER = 'pg-run-test-1234567890-42';
   const crossBoundCdp = await mockCdp(duplicateTabB, [], {
     renderText: (url) => (url === knownUrlA ? crossBoundAnswerA : duplicateTabB),
   });
-  const crossBoundResult = await runSalvage(['--probe', MARKER, '3'], crossBoundCdp.port, seedMemo(MARKER, knownUrlA));
+  const crossBoundResult = await runScratchSalvage(['--probe', MARKER, '3'], crossBoundCdp.port, seedMemo(MARKER, knownUrlA));
   check('probe reports tab B present and generating despite A\'s cross-bound rejection',
     crossBoundResult.status === 0 && /^probe-state: generating$/m.test(crossBoundResult.stderr || ''),
     `status=${crossBoundResult.status} stderr=${crossBoundResult.stderr}`);
@@ -771,7 +991,7 @@ const MARKER = 'pg-run-test-1234567890-42';
   const foreignCdp = await mockCdp(duplicateTabB, [], {
     renderText: (url) => (url === knownUrlA ? foreignOnlyA : duplicateTabB),
   });
-  const foreignResult = await runSalvage(['--probe', MARKER, '3'], foreignCdp.port, seedMemo(MARKER, knownUrlA));
+  const foreignResult = await runScratchSalvage(['--probe', MARKER, '3'], foreignCdp.port, seedMemo(MARKER, knownUrlA));
   check('probe reports tab B present and generating despite A\'s foreign rejection',
     foreignResult.status === 0 && /^probe-state: generating$/m.test(foreignResult.stderr || ''),
     `status=${foreignResult.status} stderr=${foreignResult.stderr}`);
@@ -858,12 +1078,10 @@ const MARKER = 'pg-run-test-1234567890-42';
     ['probe', ['--probe', MARKER, '3'], 0],
   ]) {
     const cdp = await mockCdp(source, [], { hangScratchClose: true, scratchTarget: () => null });
-    // This variant is the slowest of the three by construction: the render loop must burn its
-    // 2.5s sample before the target-disappeared return, and only THEN does the cleanup close
-    // spend its own 2s grace against a peer that never replies (~4.5s before spawn overhead).
-    // So it gets a proportionally later kill fallback and ceiling rather than the 6000/5_500 the
-    // open- and list-timeout variants use, where the abort lands at the 3s caller deadline.
-    const r = await runSalvage(args, cdp.port, seedMemo(MARKER, priorUrl), {
+    // The test child opts into the 50ms test-only sample interval so target disappearance reaches
+    // its cleanup path promptly. Production still samples after 2.5s; these established timeout
+    // arguments stay deliberately unchanged in this pass.
+    const r = await runScratchSalvage(args, cdp.port, seedMemo(MARKER, priorUrl), {
       PRO_GATE_TEST_CHILD_TIMEOUT_MS: '9000',
     });
     check(`${label} scratch-close timeout returns before its watchdog fallback`,
@@ -875,6 +1093,12 @@ const MARKER = 'pg-run-test-1234567890-42';
     check(`${label} scratch-close cleanup was attempted despite no reply`,
       cdp.closed.includes('scratch1'),
       `closed=${cdp.closed}`);
+    const openAt = cdp.httpRequests.findIndex((request) => request.startsWith('PUT /json/new?'));
+    const listAt = cdp.httpRequests.findIndex((request, index) => index > openAt && request === 'GET /json');
+    const closeAt = cdp.httpRequests.findIndex((request, index) => index > listAt && request === 'GET /json/close/scratch1');
+    check(`${label} scratch cleanup preserves open then list then close ordering`,
+      openAt >= 0 && listAt > openAt && closeAt > listAt,
+      `httpRequests=${cdp.httpRequests.join(',')}`);
     cdp.stop();
   }
 }
@@ -935,9 +1159,17 @@ const MARKER = 'pg-run-test-1234567890-42';
     + `Pinned\n${'Some earlier conversation title\n'.repeat(40)}`;
   const review = `run marker: ${MARKER}\n[P2] b.ts:2: nit\n  Why: real\nVERDICT: SHIP: fine.`;
   check('shell alone clears the old 200-char gate', shell.length > 200, `len=${shell.length}`);
-  const cdp = await mockCdp('__NO_TABS__', [], { renderText: (_url, n) => (n === 1 ? shell : review) });
-  const r = await runSalvage([MARKER, '30'], cdp.port, seedMemo(MARKER, 'https://chatgpt.com/c/remembered'));
+  const observations = [];
+  const cdp = await mockCdp('__NO_TABS__', [], {
+    renderText: (_url, n) => {
+      observations.push(n);
+      return n === 1 ? shell : review;
+    },
+  });
+  const r = await runScratchSalvage([MARKER, '30'], cdp.port, seedMemo(MARKER, 'https://chatgpt.com/c/remembered'));
   check('a pre-hydration render is not treated as a miss', r.status === 0, `status=${r.status} stderr=${r.stderr?.slice(0, 300)}`);
+  check('shell/sidebar is retained as the first sample until the second sample hydrates the review',
+    observations.join(',') === '1,2', `observations=${observations}`);
   check('the review is read once the page hydrates', /VERDICT: SHIP/.test(r.stdout ?? ''), `stdout=${r.stdout?.slice(0, 160)}`);
   cdp.stop();
 }
@@ -957,6 +1189,17 @@ const MARKER = 'pg-run-test-1234567890-42';
 { // gate P1: a URL learned THIS invocation must be usable immediately. The tab matches, then
   // dies (Chrome restart mid-salvage — the exact failure this file exists for). Recovery must
   // engage on the URL just learned, not wait for the next invocation.
+  //
+  // This scenario's decisive exit is reached inside the FIRST scan, through the pre-existing
+  // one-shot revalidateReadableStaleSource() -> freshRenderText() scratch-render path (bounded by
+  // its own untouched 2.5s sampling floor / 25s render budget), which returns a terminal VERDICT
+  // and calls process.exit(0) before the outer loop's POLL_MS sleep is ever reached — confirmed
+  // directly: an isolated A/B run of this exact scenario measured ~2.57-2.58s wall time and
+  // jsonListCalls=2 identically with and without a PRO_GATE_TEST_POLL_MS override (4 consecutive
+  // runs, <15ms spread). So this test intentionally carries NO override — the poll-cadence lever
+  // has nothing to speed up here, and adding one would misrepresent what the test proves. The
+  // 1.5s tab-death mutation and 40s deadline are unrelated to POLL_MS and are left exactly as in
+  // the original fixture.
   const cdp = await mockCdp(`run marker: ${MARKER}\nthinking...`, [], {
     renderText: () => `run marker: ${MARKER}\n[P1] z.ts:1: bug\n  Why: real\nVERDICT: SHIP: ok.`,
   });
@@ -969,32 +1212,129 @@ const MARKER = 'pg-run-test-1234567890-42';
   cdp.stop();
 }
 
-{ // gate P1: proven SERVER-SIDE liveness must outlive a later empty tab scan. The remembered
-  // render proves the conversation is alive but unfinished; subsequent scans see no tabs. That
-  // must end as still-generating (3), not a confirmed miss (4) that pushes toward "gone".
-  const cdp = await mockCdp('__NO_TABS__', [], { renderText: () => `run marker: ${MARKER}\nstill reasoning...` });
-  const r = await runSalvage([MARKER, '30'], cdp.port, seedMemo(MARKER, 'https://chatgpt.com/c/remembered'));
+{ // Direct runtime boundary proof for the poll override. A valid value must have no effect until
+  // the exact fixture token is present; the stable state also proves rapid re-polling never changes
+  // the exit classification.
+  const stableText = `run marker: ${MARKER}\nstill reasoning, nothing ever resolves...`;
+  const fastCdp = await mockCdp(stableText);
+  const fastResult = await runSalvage([MARKER, '2'], fastCdp.port, undefined,
+    { PRO_GATE_TEST_MODE: 'ci-fixture', PRO_GATE_TEST_POLL_MS: String(TEST_POLL_MS_MIN) });
+  check('exact ci-fixture mode honors the valid rapid-poll override and retains exit 3',
+    fastResult.status === 3 && fastCdp.jsonListCalls >= 5,
+    `status=${fastResult.status} jsonListCalls=${fastCdp.jsonListCalls}`);
+  fastCdp.stop();
+
+  const noModeCdp = await mockCdp(stableText);
+  const noModeResult = await runSalvage([MARKER, '2'], noModeCdp.port, undefined, {
+    PRO_GATE_TEST_MODE: undefined,
+    PRO_GATE_TEST_POLL_MS: String(TEST_POLL_MS_MIN),
+  });
+  check('a valid poll override without test mode retains the production 20,000ms cadence',
+    noModeResult.status === 3 && noModeCdp.jsonListCalls === 2,
+    `status=${noModeResult.status} jsonListCalls=${noModeCdp.jsonListCalls}`);
+  noModeCdp.stop();
+
+  const wrongModeCdp = await mockCdp(stableText);
+  const wrongModeResult = await runSalvage([MARKER, '2'], wrongModeCdp.port, undefined, {
+    PRO_GATE_TEST_MODE: 'not-ci-fixture',
+    PRO_GATE_TEST_POLL_MS: String(TEST_POLL_MS_MIN),
+  });
+  check('a valid poll override with a wrong mode retains the production 20,000ms cadence',
+    wrongModeResult.status === 3 && wrongModeCdp.jsonListCalls === 2,
+    `status=${wrongModeResult.status} jsonListCalls=${wrongModeCdp.jsonListCalls}`);
+  wrongModeCdp.stop();
+
+  const slowCdp = await mockCdp(stableText);
+  const slowResult = await runSalvage([MARKER, '2'], slowCdp.port);   // no override: production cadence
+  check('the same stable state classifies identically without the override (exit 3)',
+    slowResult.status === 3, `status=${slowResult.status} stderr=${slowResult.stderr?.slice(0, 300)}`);
+  // Exactly 2, deterministically, not 1: one main-loop scan (production's 20s cadence never
+  // fires a second poll inside this 2s deadline) plus the pre-existing, unrelated post-loop
+  // "revalidate at the deadline" fetch (still-generating && not seeded, lines ~1472-1487) that
+  // runs before every exit-3 report. Neither call comes from the poll-cadence lever itself.
+  check('production cadence yields two scans, not a rapid re-poll',
+    slowCdp.jsonListCalls === 2, `jsonListCalls=${slowCdp.jsonListCalls}`);
+  slowCdp.stop();
+}
+
+{ // gate P1: proven SERVER-SIDE liveness must outlive later empty tab scans. The remembered
+  // render proves the conversation is alive but unfinished; subsequent scans see no tabs. The
+  // fast test-only cadences leave enough 3s-deadline room to prove both phases, not just exit 3.
+  const rememberedUrl = 'https://chatgpt.com/c/remembered';
+  const samples = [];
+  const cdp = await mockCdp('__NO_TABS__', [], {
+    trackCdpDeadlineEvents: true,
+    renderText: (_url, n) => {
+      samples.push(n);
+      return `run marker: ${MARKER}\nstill reasoning...`;
+    },
+  });
+  const r = await runFastCdpDeadlineSalvage([MARKER, '3'], cdp.port, seedMemo(MARKER, rememberedUrl));
   check('server-side liveness survives later empty scans (exit 3)', r.status === 3, `status=${r.status} stderr=${r.stderr?.slice(0, 300)}`);
   check('still-generating says it was proven server-side',
     /proven server-side/.test(r.stderr ?? ''), `stderr=${r.stderr?.slice(-300)}`);
+  check('server-side liveness records its owned scratch sample before later scans',
+    hasConsecutiveSamples(samples, 1) && samples.length === 1, `samples=${samples}`);
+  check('server-side liveness makes multiple later empty outer scans',
+    cdp.outerJsonListCalls >= 3 && cdp.jsonListEvents.filter((event) =>
+      event.source === 'outer' && event.tabIds.length === 0).length >= 3,
+    `outerLists=${cdp.outerJsonListCalls} events=${JSON.stringify(cdp.jsonListEvents)}`);
+  check('server-side liveness reaches the shortened deadline with its recovery state intact',
+    r.elapsedMs >= 2_500 && r.memoUrl === rememberedUrl && r.blacklist === null &&
+      r.crossbound === 0 && r.stdout === '',
+    `elapsed=${r.elapsedMs} memo=${r.memoUrl} blacklist=${r.blacklist} crossbound=${r.crossbound} stdout=${r.stdout}`);
   cdp.stop();
 }
 
 { // gate P1: an INCONCLUSIVE remembered render (shell that never hydrates) must not be laundered
-  // into a confirmed absence by a successful tab listing.
+  // into a confirmed absence by a successful tab listing. It consumes the short deadline by
+  // repeatedly sampling the undecided shell, so the samples themselves prove the ordered state.
+  const rememberedUrl = 'https://chatgpt.com/c/remembered';
   const shell = `Skip to content\nChat history\nNew chat\n${'Another conversation\n'.repeat(30)}`;
-  const cdp = await mockCdp('__NO_TABS__', [], { renderText: () => shell });
-  const r = await runSalvage([MARKER, '30'], cdp.port, seedMemo(MARKER, 'https://chatgpt.com/c/remembered'));
+  const samples = [];
+  const cdp = await mockCdp('__NO_TABS__', [], {
+    trackCdpDeadlineEvents: true,
+    renderText: (_url, n) => {
+      samples.push(n);
+      return shell;
+    },
+  });
+  const r = await runFastCdpDeadlineSalvage([MARKER, '3'], cdp.port, seedMemo(MARKER, rememberedUrl));
   check('an undecided remembered conversation exits 7, not 4', r.status === 7, `status=${r.status} stderr=${r.stderr?.slice(0, 300)}`);
+  check('undecided remembered shell is sampled repeatedly and in order before exit',
+    hasConsecutiveSamples(samples, 5) && cdp.scratchJsonListCalls >= 5,
+    `samples=${samples} scratchLists=${cdp.scratchJsonListCalls}`);
+  check('undecided remembered shell reaches the deadline without absence mutation',
+    r.elapsedMs >= 2_500 && r.memoUrl === rememberedUrl && r.blacklist === null &&
+      r.crossbound === 0 && r.stdout === '',
+    `elapsed=${r.elapsedMs} memo=${r.memoUrl} blacklist=${r.blacklist} crossbound=${r.crossbound} stdout=${r.stdout}`);
   cdp.stop();
 }
 
-{ // ...but a memo that decisively points at ANOTHER run's conversation IS a real negative.
+{ // ...but a memo that decisively points at ANOTHER run's conversation IS a real negative. A
+  // foreign scratch sample makes that decision promptly; empty outer scans still carry it to the
+  // deadline without turning it into a blacklist or a cross-bind conviction.
+  const rememberedUrl = 'https://chatgpt.com/c/remembered';
+  const samples = [];
   const cdp = await mockCdp('__NO_TABS__', [], {
-    renderText: () => 'run marker: pg-run-someone-else-1111111111-9\na different review entirely',
+    trackCdpDeadlineEvents: true,
+    renderText: (_url, n) => {
+      samples.push(n);
+      return 'run marker: pg-run-someone-else-1111111111-9\na different review entirely';
+    },
   });
-  const r = await runSalvage([MARKER, '30'], cdp.port, seedMemo(MARKER, 'https://chatgpt.com/c/remembered'));
+  const r = await runFastCdpDeadlineSalvage([MARKER, '3'], cdp.port, seedMemo(MARKER, rememberedUrl));
   check('a stale memo pointing at another run still exits 4', r.status === 4, `status=${r.status} stderr=${r.stderr?.slice(0, 300)}`);
+  check('a stale foreign remembered render records its decisive first sample',
+    hasConsecutiveSamples(samples, 1) && samples.length === 1,
+    `samples=${samples}`);
+  check('a stale foreign memo remains a memo, not a blacklist or cross-bind mutation',
+    r.memoUrl === rememberedUrl && r.memos.length === 1 && r.blacklist === null &&
+      r.crossbound === 0 && r.stdout === '',
+    `memo=${r.memoUrl} memos=${JSON.stringify(r.memos)} blacklist=${r.blacklist} crossbound=${r.crossbound} stdout=${r.stdout}`);
+  check('a stale foreign memo continues through multiple empty scans to the deadline',
+    r.elapsedMs >= 2_500 && cdp.outerJsonListCalls >= 3,
+    `elapsed=${r.elapsedMs} outerLists=${cdp.outerJsonListCalls}`);
   cdp.stop();
 }
 
@@ -1013,9 +1353,18 @@ const FOREIGN_ANSWER = (m) => [
 ].join('\n');
 
 { // The cross-bind itself: a remembered URL whose completed answer is another run's must be
-  // discarded, not re-memoized — and must NOT be returned as our review.
-  const cdp = await mockCdp('__NO_TABS__', [], { renderText: () => FOREIGN_ANSWER(MARKER) });
-  const r = await runSalvage([MARKER, '30'], cdp.port, seedMemo(MARKER, 'https://chatgpt.com/c/crossbound'));
+  // discarded, not re-memoized — and must NOT be returned as our review. Its first scratch
+  // sample is decisive, while later empty scans prove the terminal state lasts to deadline.
+  const rememberedUrl = 'https://chatgpt.com/c/crossbound';
+  const samples = [];
+  const cdp = await mockCdp('__NO_TABS__', [], {
+    trackCdpDeadlineEvents: true,
+    renderText: (_url, n) => {
+      samples.push(n);
+      return FOREIGN_ANSWER(MARKER);
+    },
+  });
+  const r = await runFastCdpDeadlineSalvage([MARKER, '3'], cdp.port, seedMemo(MARKER, rememberedUrl));
   check('cross-bound memo is not accepted as our review', r.status !== 0, `status=${r.status}`);
   check('cross-bound memo exits 4 (decisive), not 7/3', r.status === 4, `status=${r.status} stderr=${r.stderr?.slice(-300)}`);
   check('cross-bound memo is reported as another run\'s answer',
@@ -1023,15 +1372,35 @@ const FOREIGN_ANSWER = (m) => [
   check('the poisoned memo file is deleted', (r.memos ?? []).length === 0, `memos=${JSON.stringify(r.memos)}`);
   check('no foreign review text is emitted on stdout',
     !/VERDICT/.test(r.stdout ?? ''), `stdout=${r.stdout?.slice(0, 200)}`);
+  check('cross-bound memo observes the decisive scratch sample before deleting state',
+    hasConsecutiveSamples(samples, 1) && samples.length === 1,
+    `samples=${samples}`);
+  check('cross-bound memo writes marker-scoped blacklist and cross-bind evidence',
+    (r.blacklist ?? '').includes(`${MARKER}\t${rememberedUrl}`) && r.crossbound > 0,
+    `blacklist=${r.blacklist} crossbound=${r.crossbound}`);
+  check('cross-bound memo keeps scanning empty tabs through the shortened deadline',
+    r.elapsedMs >= 2_500 && cdp.outerJsonListCalls >= 3,
+    `elapsed=${r.elapsedMs} outerLists=${cdp.outerJsonListCalls}`);
   cdp.stop();
 }
 
-{ // Same page shape, but arriving as an OPEN TAB rather than a memo: also refused.
-  const cdp = await mockCdp(FOREIGN_ANSWER(MARKER));
-  const r = await runSalvage([MARKER, '20'], cdp.port);
+{ // Same page shape, but arriving as an OPEN TAB rather than a memo: also refused. The
+  // blacklisted source stays open; repeated fast outer scans must not re-emit or rehabilitate it.
+  const sourceUrl = 'https://chatgpt.com/c/mock-conversation';
+  const cdp = await mockCdp(FOREIGN_ANSWER(MARKER), [], { trackCdpDeadlineEvents: true });
+  const r = await runFastPollSalvage([MARKER, '3'], cdp.port);
   check('an open tab with our marker but another run\'s answer is refused', r.status !== 0, `status=${r.status}`);
   check('open-tab cross-bind never emits the foreign review',
     !/VERDICT/.test(r.stdout ?? ''), `stdout=${r.stdout?.slice(0, 200)}`);
+  check('open-tab cross-bind remains a decisive exit 4 and preserves the source tab',
+    r.status === 4 && /ANOTHER run's completed answer/.test(r.stderr ?? '') && !cdp.closed.includes('tab1'),
+    `status=${r.status} stderr=${r.stderr?.slice(-400)} closed=${cdp.closed}`);
+  check('open-tab cross-bind records marker-scoped blacklist and cross-bind state',
+    (r.blacklist ?? '').includes(`${MARKER}\t${sourceUrl}`) && r.crossbound > 0,
+    `blacklist=${r.blacklist} crossbound=${r.crossbound}`);
+  check('open-tab cross-bind makes multiple later lists through the shortened deadline',
+    r.elapsedMs >= 2_500 && cdp.outerJsonListCalls >= 3,
+    `elapsed=${r.elapsedMs} outerLists=${cdp.outerJsonListCalls}`);
   cdp.stop();
 }
 
@@ -1054,9 +1423,26 @@ const FOREIGN_ANSWER = (m) => [
 
 { // A still-generating conversation (our marker, NO completed verdict yet) must remain
   // "live", not be mistaken for a cross-bind: the foreign check only fires on a COMPLETE answer.
-  const cdp = await mockCdp(`run marker: ${MARKER}\nthinking hard, no verdict yet`);
-  const r = await runSalvage([MARKER, '12'], cdp.port);
+  // Its canonical scratch revalidation deliberately keeps sampling owned-incomplete evidence to
+  // the deadline, so the shortened child records several ordered samples before exit 3.
+  const sourceUrl = 'https://chatgpt.com/c/mock-conversation';
+  const samples = [];
+  const cdp = await mockCdp(`run marker: ${MARKER}\nthinking hard, no verdict yet`, [], {
+    trackCdpDeadlineEvents: true,
+    renderText: (_url, n) => {
+      samples.push(n);
+      return `run marker: ${MARKER}\nthinking hard, no verdict yet`;
+    },
+  });
+  const r = await runFastCdpDeadlineSalvage([MARKER, '3'], cdp.port);
   check('still-generating stays exit 3 under the new check', r.status === 3, `status=${r.status} stderr=${r.stderr?.slice(-300)}`);
+  check('still-generating samples owned-incomplete scratch state repeatedly and in order',
+    hasConsecutiveSamples(samples, 5) && cdp.scratchJsonListCalls >= 5,
+    `samples=${samples} scratchLists=${cdp.scratchJsonListCalls}`);
+  check('still-generating reaches the deadline with a live source and untouched rejection state',
+    r.elapsedMs >= 2_500 && cdp.outerJsonListCalls >= 2 && r.memoUrl === sourceUrl &&
+      r.blacklist === null && r.crossbound === 0 && !cdp.closed.includes('tab1'),
+    `elapsed=${r.elapsedMs} outerLists=${cdp.outerJsonListCalls} memo=${r.memoUrl} blacklist=${r.blacklist} crossbound=${r.crossbound} closed=${cdp.closed}`);
   cdp.stop();
 }
 
@@ -1089,11 +1475,30 @@ const FOREIGN_ANSWER = (m) => [
 }
 
 { // A convicted cross-bind records a sidecar so --status can distinguish terminally-stuck
-  // from merely-ambiguous (#68 gate P2).
-  const cdp = await mockCdp('__NO_TABS__', [], { renderText: () => FOREIGN_ANSWER(MARKER) });
-  const r = await runSalvage([MARKER, '30'], cdp.port, seedMemo(MARKER, 'https://chatgpt.com/c/crossbound2'));
+  // from merely-ambiguous (#68 gate P2). This separately proves the full deletion/blacklist/
+  // sidecar contract under the short deadline rather than relying on the earlier cross-bind case.
+  const rememberedUrl = 'https://chatgpt.com/c/crossbound2';
+  const samples = [];
+  const cdp = await mockCdp('__NO_TABS__', [], {
+    trackCdpDeadlineEvents: true,
+    renderText: (_url, n) => {
+      samples.push(n);
+      return FOREIGN_ANSWER(MARKER);
+    },
+  });
+  const r = await runFastCdpDeadlineSalvage([MARKER, '3'], cdp.port, seedMemo(MARKER, rememberedUrl));
   check('a conviction is recorded in crossbound/<marker>', (r.crossbound ?? 0) > 0,
     `crossbound=${r.crossbound} stderr=${r.stderr?.slice(-300)}`);
+  check('conviction keeps the decisive cross-bound exit and rejects all foreign output',
+    r.status === 4 && !/VERDICT/.test(r.stdout ?? ''),
+    `status=${r.status} stdout=${r.stdout}`);
+  check('conviction deletes the poisoned memo and records its marker-scoped blacklist',
+    r.memos.length === 0 && (r.blacklist ?? '').includes(`${MARKER}\t${rememberedUrl}`),
+    `memos=${JSON.stringify(r.memos)} blacklist=${r.blacklist}`);
+  check('conviction observes its decisive scratch sample then later empty deadline scans',
+    hasConsecutiveSamples(samples, 1) && samples.length === 1 && r.elapsedMs >= 2_500 &&
+      cdp.outerJsonListCalls >= 3,
+    `samples=${samples} elapsed=${r.elapsedMs} outerLists=${cdp.outerJsonListCalls}`);
   cdp.stop();
 }
 
@@ -1163,24 +1568,51 @@ const FOREIGN_ANSWER = (m) => [
   }
 }
 
-{ // gate round-2 P1: one EARLY successful listing must not mask a later CDP outage. Scan once
-  // (before the conversation appears), then lose Chrome for the rest of the window — that ends
-  // inconclusive (7), not a confirmed absence (4).
-  const cdp = await mockCdp('some other conversation, no marker here');
-  setTimeout(() => cdp.stop(), 3_000);   // Chrome dies after the first successful scan
-  const r = await runSalvage([MARKER, '30'], cdp.port);
+{ // gate round-2 P1: one EARLY successful listing must not mask a later CDP outage. Shutdown
+  // waits for the child to open the listed primary tab and issue its DOM poll, so the fixture proves
+  // the child consumed that successful outer list rather than merely racing res.end().
+  const cdp = await mockCdp('some other conversation, no marker here', [], {
+    trackCdpDeadlineEvents: true,
+    stopAfterPrimaryDomPoll: 1,
+  });
+  const r = await runFastPollSalvage([MARKER, '3'], cdp.port);
+  const failedLists = (r.stderr.match(/CDP list failed/g) ?? []).length;
   check('a later CDP outage is not masked by an early successful scan', r.status === 7, `status=${r.status} stderr=${r.stderr?.slice(-300)}`);
+  check('later-outage fixture records child primary-tab DOM consumption before shutdown',
+    cdp.successfulJsonListCalls >= 1 && cdp.outerJsonListCalls >= 1 && cdp.primaryDomPolls >= 1 &&
+      cdp.stoppedAfterPrimaryDomPoll === 1 && cdp.jsonListEvents[0]?.source === 'outer',
+    `successful=${cdp.successfulJsonListCalls} outer=${cdp.outerJsonListCalls} primaryPolls=${cdp.primaryDomPolls} stoppedAfter=${cdp.stoppedAfterPrimaryDomPoll} events=${JSON.stringify(cdp.jsonListEvents)}`);
+  check('later-outage fixture records at least one failed list after that consumed success',
+    failedLists >= 1 && r.elapsedMs >= 2_500,
+    `failedLists=${failedLists} elapsed=${r.elapsedMs} stderr=${r.stderr?.slice(-500)}`);
+  cdp.stop();
 }
 
 { // gate round-2 P1: the remembered conversation's tab is LISTED but its renderer is dead, and
   // re-rendering it proves it carries another run's marker. blacklist() no-ops on a remembered
   // URL, and the seeded branch is skipped while the tab is listed — so staleness has to be
   // recorded here or the reservation sits "inconclusive" forever instead of releasing.
+  const rememberedUrl = 'https://chatgpt.com/c/mock-conversation';
+  const samples = [];
   const cdp = await mockCdp('', [], {   // '' => renderer returns nothing => dead tab
-    renderText: () => 'run marker: pg-run-someone-else-2222222222-3\nanother review entirely',
+    trackCdpDeadlineEvents: true,
+    renderText: (_url, n) => {
+      samples.push(n);
+      return 'run marker: pg-run-someone-else-2222222222-3\nanother review entirely';
+    },
   });
-  const r = await runSalvage([MARKER, '30'], cdp.port, seedMemo(MARKER, 'https://chatgpt.com/c/mock-conversation'));
+  const r = await runFastCdpDeadlineSalvage([MARKER, '3'], cdp.port, seedMemo(MARKER, rememberedUrl));
   check('a dead remembered tab proven foreign still exits 4', r.status === 4, `status=${r.status} stderr=${r.stderr?.slice(-300)}`);
+  check('dead remembered tab observes its decisive foreign scratch sample',
+    hasConsecutiveSamples(samples, 1) && samples.length === 1,
+    `samples=${samples}`);
+  check('dead remembered foreign result retains its memo but avoids blacklist and cross-bind state',
+    r.memoUrl === rememberedUrl && r.memos.length === 1 && r.blacklist === null &&
+      r.crossbound === 0 && r.stdout === '' && !cdp.closed.includes('tab1'),
+    `memo=${r.memoUrl} memos=${JSON.stringify(r.memos)} blacklist=${r.blacklist} crossbound=${r.crossbound} stdout=${r.stdout} closed=${cdp.closed}`);
+  check('dead remembered tab continues listing through the shortened deadline after foreign proof',
+    r.elapsedMs >= 2_500 && cdp.outerJsonListCalls >= 3,
+    `elapsed=${r.elapsedMs} outerLists=${cdp.outerJsonListCalls}`);
   cdp.stop();
 }
 

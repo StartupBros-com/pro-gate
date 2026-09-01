@@ -1,0 +1,115 @@
+PASS 9/10 VERIFICATION — PRODUCTIVE-MEASUREMENT
+=================================================
+
+Scope
+-----
+Pass 9 analyzed an already-completed profile. No test command was run in this pass.
+All absolute /tmp capture locations below are ephemeral profile inputs, not repository artifacts.
+
+Captured manifest commands and results
+--------------------------------------
+01-engine
+  command: bash tests/engine.test.sh
+  result: returncode=0, wall_seconds=1143.22, cpu_seconds=55.75,
+          internal_ok_dash=825, not_ok=0, terminal=ALL PASS
+
+02-daemon-reload
+  command: bash tests/daemon-reload.test.sh
+  result: returncode=0, wall_seconds=14.44, cpu_seconds=2.09,
+          internal_ok_dash=74, not_ok=0, terminal=ALL PASS
+
+03-autoupdate
+  command: bash tests/autoupdate.test.sh
+  result: returncode=0, wall_seconds=6.23, cpu_seconds=1.31,
+          internal_ok_dash=35, not_ok=0, terminal=ALL PASS
+
+04-browser-launch
+  command: bash tests/browser-launch.test.sh
+  result: returncode=0, wall_seconds=11.06, cpu_seconds=0.05,
+          internal_ok_dash=17, not_ok=0, terminal=ALL PASS
+
+05-cdp-salvage
+  command: node --test tests/cdp-salvage.test.mjs
+  result: returncode=0, wall_seconds=151.09, cpu_seconds=9.26,
+          internal_ok_dash=298, not_ok=0, node:test tests=1 pass=1 fail=0
+
+06-distribution
+  command: bash tests/distribution.test.sh
+  result: returncode=0, wall_seconds=58.79, cpu_seconds=15.60,
+          internal_ok_dash=133, not_ok=0, terminal=ALL PASS
+
+07-release-train
+  command: bash tests/release-train.test.sh
+  result: returncode=0, wall_seconds=0.55, cpu_seconds=0.34,
+          internal_ok_dash=58, not_ok=0, terminal=ALL PASS
+
+08-release-assets
+  command: bash tests/release-assets.test.sh
+  result: returncode=0, wall_seconds=0.14, cpu_seconds=0.07,
+          internal_ok_dash=23, not_ok=0, terminal=ALL PASS
+
+Manifest invariants
+-------------------
+- status=passed; command count=8; every manifest returncode=0.
+- serial_wall_seconds=1385.52; cpu_seconds=84.47; CPU-to-wall ratio=0.060966.
+- Internal assertion total=1463 (825+74+35+17+298+133+58+23).
+- Node result is deliberately represented by node:test pass/fail rather than an ALL PASS marker.
+
+JSON validation and derivation checks
+-------------------------------------
+1. jq empty <ephemeral-capture-root>/current-profile-intermediate.json
+   jq empty <ephemeral-capture-root>/captures/run-manifest.json
+   jq empty <ephemeral-capture-root>/captures/environment-before.json
+   jq empty tests/artifacts/perf/2026-08-31-ci-runner/ci-baseline-summary.json
+   result: exit 0, no output.
+
+2. jq empty tests/artifacts/perf/2026-08-31-ci-optimization/PASS-9-current-profile.json
+   result: exit 0, no output.
+
+3. jq -e verifies capture status, eight passed zero-exit commands, 1,385.52s wall,
+   84.47s CPU, 1,463 internal assertions, and five wall-time leaders in
+   PASS-9-current-profile.json.
+   result: true; exit 0.
+
+4. jq -e verifies cdp-salvage node:test tests=1, pass=1, fail=0.
+   result: true; exit 0.
+
+5. jq -e -s compares the intermediate profile with PASS-9-current-profile.json for
+   capture status, totals, command count, ordered IDs, exit statuses, and wall times.
+   result: true; exit 0.
+
+Capture and artifact checksums
+------------------------------
+Input SHA-256:
+  d455230d7809c64cbd3ceea38fa88186b7f93c4998924f466057a572b225c7a3  current-profile-intermediate.json (ephemeral)
+  1f888195306cdcbc68f30249c5c167c62e9e858e7411cf27a0be103dcd101c7d  run-manifest.json (ephemeral)
+  4321bdf9b378746a42f63c36e05b5e9265608e2135a876468e8f32797dd7fc34  environment-before.json (ephemeral)
+  7e01757c6546dc4f71549c988b6c1d53fa2b1d8b48ea319de1d5ee2e81191f84  ci-baseline-summary.json
+
+Manifest capture verification:
+  jq -r '.commands[] | . as $command | .sha256 | to_entries[] |
+    "\(.value)  <ephemeral-capture-root>/captures/" +
+    (if .key == "stdout" then $command.stdout_file elif .key == "stderr" then
+    $command.stderr_file elif .key == "time" then $command.time_file else
+    $command.timeline_file end)' <ephemeral-capture-root>/captures/run-manifest.json |
+    sha256sum -c -
+  result: 32/32 captured stdout, stderr, time, and timeline SHA-256 entries OK.
+
+Final artifact verification:
+  sha256sum -c tests/artifacts/perf/2026-08-31-ci-optimization/PASS-9-checksums.txt
+  result: all three listed Pass-9 artifacts OK. The checksum file intentionally excludes itself.
+
+No-source-diff proof
+--------------------
+- git diff --check
+  result: exit 0, no whitespace errors.
+- git diff --exit-code -- bin lib tests .github
+  result: exit 0, no unstaged source, test-code, or workflow diff.
+- git diff --cached --exit-code -- bin lib tests .github
+  result: exit 0, no staged source, test-code, or workflow diff.
+- The status snapshot after writing the first two Pass-9 artifacts contained only the pre-existing
+  modified .skill-loop-progress.md and the two untracked Pass-9 artifacts. Pass 9 did not read,
+  edit, stage, or restore .skill-loop-progress.md; the final status check records all four expected
+  Pass-9 artifacts.
+
+No commit was created.
