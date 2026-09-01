@@ -1,0 +1,3 @@
+5317fd8e172fc7d70b4936358424e04097cb5670748e69e6c96927b8b1b868d5  tests/artifacts/perf/2026-08-31-ci-optimization/PASS-9-current-profile.json
+e05fb735e08eb9946abaa270a10e81d9b7d12422eac397defa5cdea72b90d0a8  tests/artifacts/perf/2026-08-31-ci-optimization/PASS-9.md
+6a6ed95a7775e5703a16565a503159943d4aec91d0f30e8abbd128dd64e1d9c1  tests/artifacts/perf/2026-08-31-ci-optimization/PASS-9-VERIFICATION.txt
