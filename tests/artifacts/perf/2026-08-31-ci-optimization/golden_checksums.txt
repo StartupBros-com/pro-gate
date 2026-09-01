@@ -1,0 +1,1 @@
+8a3279e783a1623353792c9ae9ed02ad87b41c4c4f1dcf094ae8632c8fea2ad6 */home/will/SITES/pro-gate/.claude/worktrees/ci-wait-optimization-114/tests/artifacts/perf/2026-08-31-ci-optimization/engine-all-pass.txt
