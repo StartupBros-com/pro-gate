@@ -57,9 +57,9 @@ unset PRO_REVIEW_INPUT
 export PRO_GATE_HOME="$TYPED_HOME" PRO_GATE_DAEMON_LIB_ONLY=1
 . "$HERE/../daemon/daemon.sh"
 unset PRO_GATE_DAEMON_LIB_ONLY
-check 'daemon defaults PRO_REVIEW_INPUT to both' "$([ "$DD_INPUT" = both ]; echo $?)" "input=$DD_INPUT"
+check 'daemon defaults PRO_REVIEW_INPUT to empty/inherit-engine' "$([ -z "$DD_INPUT" ] && [ "${#DD_INPUT_ARGS[@]}" -eq 0 ]; echo $?)" "input=$DD_INPUT args=${DD_INPUT_ARGS[*]}"
 PRO_GATE_HOME="$TYPED_HOME" PRO_REVIEW_INPUT=invalid bash "$HERE/../daemon/daemon.sh" >"$TYPED_HOME/invalid-input.log" 2>&1; input_rc=$?
-check 'invalid PRO_REVIEW_INPUT fails closed at startup' "$([ "$input_rc" -ne 0 ] && grep -Fq 'must be one of: both, bundle, connector' "$TYPED_HOME/invalid-input.log"; echo $?)" "rc=$input_rc"
+check 'invalid PRO_REVIEW_INPUT fails closed at startup' "$([ "$input_rc" -ne 0 ] && grep -Fq 'must be one of: empty, both, bundle, connector' "$TYPED_HOME/invalid-input.log"; echo $?)" "rc=$input_rc"
 TYPED_STATE="$TYPED_HOME/processed.tsv"; TYPED_FAILS="$TYPED_HOME/failcount.tsv"; : > "$TYPED_STATE"; : > "$TYPED_FAILS"
 TYPED_LOG="$TYPED_HOME/typed.log"; : > "$TYPED_LOG"
 log(){ printf '%s\n' "$*" >> "$TYPED_LOG"; }
@@ -80,22 +80,32 @@ printf '#!/usr/bin/env bash\n[ "${MOCK_CLAUDE_RC:-0}" = 0 ] || exit "$MOCK_CLAUD
 PATH="$TYPED_BIN:$PATH"; CLAUDE_MODEL=test FALLBACK_MODEL=test MAX_BUDGET=1
 RUN_DECISION="$TYPED_HOME/run-decision.json"; typed_decision 2 "$RUN_DECISION"
 RUN_PROMPT="$TYPED_HOME/run.prompt"
-printf -v EXPECTED_EFFECT '%q ' "$TYPED_ENGINE" --review-decision --review-decision-effect "$RUN_DECISION" --pr 1983 --repo "$TYPED_HOME" --input both --out "$TYPED_LOG.review" --timeout "${PRO_REVIEW_ENGINE_TIMEOUT:-30m}"
-MOCK_PROMPT="$RUN_PROMPT" DD_ENGINE="$TYPED_ENGINE" DD_INPUT=both DD_NWO=acme/widgets DD_NUM=1983 DD_SHA=1111111111111111111111111111111111111111 DD_WORKTREE="$TYPED_HOME" DD_LOG="$TYPED_LOG" daemon_run_review_worker "$RUN_DECISION"; worker_rc=$?
-check 'run worker prompt starts with the exact argv-quoted saved guarded effect' "$(grep -Fqx 'First action: execute this exact argv-quoted guarded runtime effect; it rechecks the saved review-decision/v1 before any charge or submission:' "$RUN_PROMPT" && grep -Fq "$EXPECTED_EFFECT" "$RUN_PROMPT"; echo $?)" "rc=$worker_rc"
+printf -v EXPECTED_EFFECT '%q ' "$TYPED_ENGINE" --review-decision --review-decision-effect "$RUN_DECISION" --pr 1983 --repo "$TYPED_HOME" --out "$TYPED_LOG.review" --timeout "${PRO_REVIEW_ENGINE_TIMEOUT:-30m}"
+MOCK_PROMPT="$RUN_PROMPT" DD_ENGINE="$TYPED_ENGINE" DD_NWO=acme/widgets DD_NUM=1983 DD_SHA=1111111111111111111111111111111111111111 DD_WORKTREE="$TYPED_HOME" DD_LOG="$TYPED_LOG" daemon_run_review_worker "$RUN_DECISION"; worker_rc=$?
+check 'empty daemon input omits --input from the guarded effect worker argv' "$(grep -Fqx 'First action: execute this exact argv-quoted guarded runtime effect; it rechecks the saved review-decision/v1 before any charge or submission:' "$RUN_PROMPT" && grep -Fq "$EXPECTED_EFFECT" "$RUN_PROMPT" && ! grep -Fq -- '--input ' "$RUN_PROMPT"; echo $?)" "rc=$worker_rc"
 check 'run worker prompt restores fix/test/commit/push/comment lifecycle and no-merge guard' "$(grep -Fq '/pro-gate skill' "$RUN_PROMPT" && grep -Fq 'sanity-check every P0/P1' "$RUN_PROMPT" && grep -Fq 'tests and lint' "$RUN_PROMPT" && grep -Fq 'commit the fixes' "$RUN_PROMPT" && grep -Fq 'push this branch to origin' "$RUN_PROMPT" && grep -Fq 'exactly one audit PR comment' "$RUN_PROMPT" && grep -Fq 'Never merge' "$RUN_PROMPT"; echo $?)"
 AGENT_DECISION="$TYPED_HOME/agent-decision.json"; typed_decision 3 "$AGENT_DECISION"
 AGENT_PROMPT="$TYPED_HOME/agent.prompt"; raw_marker="$(jq -r '.facts.prior_review.marker' "$AGENT_DECISION")"
-MOCK_PROMPT="$AGENT_PROMPT" DD_ENGINE="$TYPED_ENGINE" DD_INPUT=both DD_NWO=acme/widgets DD_NUM=1983 DD_SHA=1111111111111111111111111111111111111111 DD_WORKTREE="$TYPED_HOME" DD_LOG="$TYPED_LOG" daemon_run_agent_task "$AGENT_DECISION" fix-review-findings; agent_rc=$?
+MOCK_PROMPT="$AGENT_PROMPT" DD_ENGINE="$TYPED_ENGINE" DD_NWO=acme/widgets DD_NUM=1983 DD_SHA=1111111111111111111111111111111111111111 DD_WORKTREE="$TYPED_HOME" DD_LOG="$TYPED_LOG" daemon_run_agent_task "$AGENT_DECISION" fix-review-findings; agent_rc=$?
 check 'successful typed agent task returns completion' "$([ "$agent_rc" -eq 0 ]; echo $?)" "rc=$agent_rc"
-check 'agent-task prompt identifies typed action target saved decision and valid query-only re-entry route' "$(grep -Fq 'Control-safe typed action: fix-review-findings.' "$AGENT_PROMPT" && grep -Fq "PR #1983 (acme/widgets), local repository $TYPED_HOME." "$AGENT_PROMPT" && grep -Fq "$AGENT_DECISION" "$AGENT_PROMPT" && grep -Fq -- '--review-decision --json --pr 1983' "$AGENT_PROMPT" && grep -Fq -- '--input both' "$AGENT_PROMPT" && ! grep -F -- '--review-decision --json' "$AGENT_PROMPT" | grep -Fq -- '--out'; echo $?)"
+check 'empty daemon input omits --input from query-only agent re-entry' "$(grep -Fq 'Control-safe typed action: fix-review-findings.' "$AGENT_PROMPT" && grep -Fq "PR #1983 (acme/widgets), local repository $TYPED_HOME." "$AGENT_PROMPT" && grep -Fq "$AGENT_DECISION" "$AGENT_PROMPT" && grep -Fq -- '--review-decision --json --pr 1983' "$AGENT_PROMPT" && ! grep -Fq -- '--input ' "$AGENT_PROMPT" && ! grep -F -- '--review-decision --json' "$AGENT_PROMPT" | grep -Fq -- '--out'; echo $?)"
 check 'agent-task prompt excludes raw decision-envelope content' "$(! grep -Fq "$raw_marker" "$AGENT_PROMPT"; echo $?)" "marker=$raw_marker"
 daemon_agent_task_available(){ return 1; }
-MOCK_PROMPT="$AGENT_PROMPT" DD_ENGINE="$TYPED_ENGINE" DD_INPUT=both DD_NWO=acme/widgets DD_NUM=1983 DD_SHA=1111111111111111111111111111111111111111 DD_WORKTREE="$TYPED_HOME" DD_LOG="$TYPED_LOG" daemon_run_agent_task "$AGENT_DECISION" fix-review-findings; agent_rc=$?
+MOCK_PROMPT="$AGENT_PROMPT" DD_ENGINE="$TYPED_ENGINE" DD_NWO=acme/widgets DD_NUM=1983 DD_SHA=1111111111111111111111111111111111111111 DD_WORKTREE="$TYPED_HOME" DD_LOG="$TYPED_LOG" daemon_run_agent_task "$AGENT_DECISION" fix-review-findings; agent_rc=$?
 check 'unavailable typed agent task is deferred, not completed' "$([ "$agent_rc" -eq 2 ]; echo $?)" "rc=$agent_rc"
 daemon_agent_task_available(){ return 0; }
-MOCK_CLAUDE_RC=1 MOCK_PROMPT="$AGENT_PROMPT" DD_ENGINE="$TYPED_ENGINE" DD_INPUT=both DD_NWO=acme/widgets DD_NUM=1983 DD_SHA=1111111111111111111111111111111111111111 DD_WORKTREE="$TYPED_HOME" DD_LOG="$TYPED_LOG" daemon_run_agent_task "$AGENT_DECISION" fix-review-findings; agent_rc=$?
+MOCK_CLAUDE_RC=1 MOCK_PROMPT="$AGENT_PROMPT" DD_ENGINE="$TYPED_ENGINE" DD_NWO=acme/widgets DD_NUM=1983 DD_SHA=1111111111111111111111111111111111111111 DD_WORKTREE="$TYPED_HOME" DD_LOG="$TYPED_LOG" daemon_run_agent_task "$AGENT_DECISION" fix-review-findings; agent_rc=$?
 check 'failed typed agent task is deferred, not completed' "$([ "$agent_rc" -eq 1 ]; echo $?)" "rc=$agent_rc"
+: > "$TYPED_ENGINE_CALLS"
+MOCK_ENGINE_CALLS="$TYPED_ENGINE_CALLS" MOCK_FRESH="$RUN_DECISION" DD_ENGINE="$TYPED_ENGINE" DD_NWO=acme/widgets DD_NUM=1983 DD_SHA=1111111111111111111111111111111111111111 DD_WORKTREE="$TYPED_HOME" DD_LOG="$TYPED_LOG" daemon_handle_review_worker_failure 124; default_query_rc=$?
+check 'empty daemon input omits --input from replacement query argv' "$([ "$default_query_rc" -eq 1 ] && grep -Fq -- '--review-decision --json --pr 1983' "$TYPED_ENGINE_CALLS" && ! grep -Fq -- '--input ' "$TYPED_ENGINE_CALLS"; echo $?)" "rc=$default_query_rc calls=$(cat "$TYPED_ENGINE_CALLS")"
+
+# An explicit daemon value stays byte-identical across every subsequent command.
+DD_INPUT=connector; DD_INPUT_ARGS=(--input "$DD_INPUT")
+EXPLICIT_RUN_PROMPT="$TYPED_HOME/run-explicit.prompt"
+printf -v EXPLICIT_EFFECT '%q ' "$TYPED_ENGINE" --review-decision --review-decision-effect "$RUN_DECISION" --pr 1983 --repo "$TYPED_HOME" --input connector --out "$TYPED_LOG.review" --timeout "${PRO_REVIEW_ENGINE_TIMEOUT:-30m}"
+MOCK_PROMPT="$EXPLICIT_RUN_PROMPT" DD_ENGINE="$TYPED_ENGINE" DD_NWO=acme/widgets DD_NUM=1983 DD_SHA=1111111111111111111111111111111111111111 DD_WORKTREE="$TYPED_HOME" DD_LOG="$TYPED_LOG" daemon_run_review_worker "$RUN_DECISION"; explicit_worker_rc=$?
+check 'explicit connector input is preserved byte-identically in worker argv' "$([ "$explicit_worker_rc" -eq 0 ] && grep -Fq "$EXPLICIT_EFFECT" "$EXPLICIT_RUN_PROMPT"; echo $?)" "rc=$explicit_worker_rc"
 
 # A nonzero run worker must re-query with the same input before it can consume the wrapper budget.
 FAIL_NOTES=0
@@ -110,7 +120,7 @@ done
 NONRECOVERABLE_DECISION="$TYPED_HOME/fresh-run.json"; typed_decision 2 "$NONRECOVERABLE_DECISION"; FAIL_NOTES=0
 MOCK_ENGINE_CALLS="$TYPED_ENGINE_CALLS" MOCK_FRESH="$NONRECOVERABLE_DECISION" DD_ENGINE="$TYPED_ENGINE" DD_INPUT=both DD_NWO=acme/widgets DD_NUM=1983 DD_SHA=1111111111111111111111111111111111111111 DD_WORKTREE="$TYPED_HOME" DD_LOG="$TYPED_LOG" daemon_handle_review_worker_failure 124; failure_rc=$?
 check 'nonrecoverable fresh typed replacement retains note_fail behavior' "$([ "$failure_rc" -eq 1 ] && [ "$FAIL_NOTES" -eq 1 ]; echo $?)" "rc=$failure_rc notes=$FAIL_NOTES"
-check 'default both input is reused by fresh query' "$(grep -F -- '--review-decision --json' "$TYPED_ENGINE_CALLS" | grep -Fq -- '--input both'; echo $?)"
+check 'explicit connector input is reused by fresh query' "$(grep -F -- '--review-decision --json' "$TYPED_ENGINE_CALLS" | grep -Fq -- '--input connector'; echo $?)"
 
 REVIEW_WORKERS=0; AGENT_TASKS=0
 daemon_run_review_worker(){ REVIEW_WORKERS=$((REVIEW_WORKERS + 1)); return 0; }
@@ -130,7 +140,7 @@ for index in $(seq 0 7); do
   check "$action dispatches only its runtime-provided execution class without a routine prompt" "$([ "$REVIEW_WORKERS" -eq "$expected_review" ] && [ "$AGENT_TASKS" -eq "$expected_agent" ]; echo $?)" "review=$REVIEW_WORKERS agent=$AGENT_TASKS"
   check "$action has zero SHA/failure-budget effects unless it runs a granted review" "$([ "$action" = run-granted-review ] || { [ "$(wc -c < "$TYPED_STATE")" = "$before_state" ] && [ "$(wc -c < "$TYPED_FAILS")" = "$before_fails" ]; }; echo $?)" "processed=$(wc -c < "$TYPED_STATE") failures=$(wc -c < "$TYPED_FAILS")"
 done
-check 'default both input is reused by guarded effect rechecks' "$(grep -F -- '--review-decision-effect' "$TYPED_ENGINE_CALLS" | grep -Fq -- '--input both'; echo $?)"
+check 'explicit connector input is reused by guarded effect rechecks' "$(grep -F -- '--review-decision-effect' "$TYPED_ENGINE_CALLS" | grep -Fq -- '--input connector'; echo $?)"
 
 # A completed agent task uses the same processed.tsv behavior as a completed review worker. Its
 # failure/unavailable outcomes, and every non-agent action, remain retryable and budget-neutral.

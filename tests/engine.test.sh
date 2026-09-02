@@ -23,6 +23,9 @@ mkdir -p "$TDIR/home" "$TDIR/bin" "$TDIR/user/.local/bin"
 while IFS='=' read -r name _; do
   case "$name" in PRO_GATE_*|ORACLE_*) unset "$name" ;; esac
 done < <(env)
+# Most legacy cases intentionally retain connector-capable behavior. Dedicated policy cases below
+# remove or override this export to exercise the production-safe bundle-only default.
+export PRO_GATE_INPUT_POLICY=connector-enabled
 export PRO_GATE_MIN_AVAIL_MB=0 PRO_GATE_MAX_SWAP_PCT=101 PRO_GATE_TIMEOUT_BIN=/usr/bin/timeout
 # v0.28: the early URL-capture probe is off by default in tests (its sleep would slow every
 # fresh-run case); the dedicated early-capture test re-enables it explicitly.
@@ -30,6 +33,21 @@ export PRO_GATE_EARLY_PROBE_SECS=0
 
 cat > "$TDIR/bin/oracle-preflight" <<'FAKE_PREFLIGHT'
 #!/usr/bin/env bash
+if [ -n "${PG_TEST_ORACLE_SENTINEL:-}" ]; then printf '%s\n' "$*" >> "$PG_TEST_ORACLE_SENTINEL"; fi
+if [ "${PG_TEST_ORACLE_COMPLETE:-0}" = 1 ]; then
+  prompt=""; output=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -p) prompt="$2"; shift 2 ;;
+      --write-output) output="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  if [ -n "${PG_TEST_PROMPT_CAPTURE:-}" ]; then printf '%s' "$prompt" > "$PG_TEST_PROMPT_CAPTURE"; fi
+  [[ "$prompt" =~ \(run\ marker:\ ([A-Za-z0-9.-]+) ]] || exit 99
+  printf '[P1] policy/input.sh:1 - fixture finding\nP2: none\nVERDICT: SHIP - fixture complete. (run marker: %s)\n' "${BASH_REMATCH[1]}" > "$output"
+  exit 0
+fi
 printf 'unexpected generic oracle invocation\n' >&2
 exit 99
 FAKE_PREFLIGHT
@@ -62,6 +80,20 @@ run_engine() { # args... ; captures RC
   RC=$?
 }
 
+run_engine_policy() { # policy|__unset__ args... ; captures RC
+  local policy="$1"; shift
+  if [ "$policy" = __unset__ ]; then
+    env -u PRO_GATE_INPUT_POLICY PRO_GATE_HOME="$TDIR/policy-home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+      PRO_GATE_SELF_HEAL=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" \
+      bash "$ENGINE" "$@" >"$TDIR/stdout" 2>"$TDIR/stderr"
+  else
+    PRO_GATE_INPUT_POLICY="$policy" PRO_GATE_HOME="$TDIR/policy-home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+      PRO_GATE_SELF_HEAL=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" \
+      bash "$ENGINE" "$@" >"$TDIR/stdout" 2>"$TDIR/stderr"
+  fi
+  RC=$?
+}
+
 # Opt-in timeout shim for lifecycle assertions. Set PRO_GATE_TIMEOUT_BIN to this wrapper and
 # PG_TEST_NODE_ARGS to a log file; it records only organizer subprocesses, then preserves timeout.
 REAL_TIMEOUT=/usr/bin/timeout
@@ -84,6 +116,91 @@ printf '{"title":null,"archived":false,"events":[]}\n' > "$ORGANIZER_STATE"
 mkdir -p "$TDIR/home/conversation-titles"
 printf '%s\n' "$ORGANIZER_TITLE" > "$TDIR/home/conversation-titles/$MARKER"
 start_mock "$TDIR/tab.txt" "$ORGANIZER_STATE"
+
+# Input policy is resolved immediately after parsing. Rejections must precede every state or output
+# mutation, CDP request, and Oracle process; queries/effects use the same engine boundary.
+echo '# input delivery policy'
+printf 'diff --git a/policy b/policy\n--- a/policy\n+++ b/policy\n@@ -0,0 +1 @@\n+bundle\n' > "$TDIR/policy.diff"
+POLICY_SENTINEL="$TDIR/policy-oracle-invocations"; export POLICY_SENTINEL
+: > "$POLICY_SENTINEL"; : > "$TDIR/mock.log"
+for policy_input in both connector; do
+  run_engine_policy bundle-only --diff "$TDIR/policy.diff" --repo "$TDIR" --input "$policy_input" --out "$TDIR/policy-$policy_input.md" --timeout 5s
+  check "bundle-only rejects explicit $policy_input with exit 2" "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC $(cat "$TDIR/stderr")"
+done
+run_engine_policy invalid-policy --diff "$TDIR/policy.diff" --repo "$TDIR" --out "$TDIR/policy-invalid.md" --timeout 5s
+check 'invalid input policy rejects fresh review with exit 2' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC $(cat "$TDIR/stderr")"
+run_engine_policy connector-enabled --diff "$TDIR/policy.diff" --repo "$TDIR" --input '' --out "$TDIR/policy-empty.md" --timeout 5s
+check 'explicit empty input is rejected rather than treated as omission' \
+  "$([ "$RC" -eq 2 ] && grep -Fq -- '--input must be one of: bundle, both, connector (got empty)' "$TDIR/stderr"; echo $?)" \
+  "rc=$RC stderr=$(cat "$TDIR/stderr")"
+run_engine_policy bundle-only --review-decision --json --pr 77 --repo "$TDIR" --input both
+check 'bundle-only policy rejects review-decision query before resolution' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC $(cat "$TDIR/stderr")"
+run_engine_policy bundle-only --review-decision --review-decision-effect "$TDIR/no-decision.json" --pr 77 --repo "$TDIR" --input connector
+check 'bundle-only policy rejects guarded review-decision effect before resolution' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC $(cat "$TDIR/stderr")"
+check 'bundle-only policy rejection creates no PRO_GATE_HOME state' "$([ ! -e "$TDIR/policy-home" ]; echo $?)" 'policy home exists'
+check 'bundle-only policy rejection creates no output or status sidecar' "$(! find "$TDIR" -maxdepth 1 -name 'policy-*.md*' | grep -q .; echo $?)" 'output created'
+check 'bundle-only policy rejection creates no Oracle call' "$([ ! -s "$POLICY_SENTINEL" ]; echo $?)" "$(cat "$POLICY_SENTINEL")"
+check 'bundle-only policy rejection creates no browser/mock call' "$([ ! -s "$TDIR/mock.log" ]; echo $?)" "$(cat "$TDIR/mock.log")"
+
+# Omitted input follows the engine policy, while explicit bundle remains valid under the safe default.
+# A preflight invocation proves the normalized mode reaches the real fresh-review path.
+PG_TEST_ORACLE_SENTINEL="$POLICY_SENTINEL"; PG_TEST_ORACLE_COMPLETE=1
+POLICY_PROMPT="$TDIR/policy.prompt"; PG_TEST_PROMPT_CAPTURE="$POLICY_PROMPT"
+export PG_TEST_ORACLE_SENTINEL PG_TEST_ORACLE_COMPLETE PG_TEST_PROMPT_CAPTURE
+: > "$POLICY_PROMPT"
+run_engine_policy __unset__ --pr 'https://github.com/acme/policy/pull/77' --diff "$TDIR/policy.diff" --repo "$TDIR" --out "$TDIR/policy-omitted.md" --timeout 5s
+check 'unset policy resolves omitted input to bundle with attachment and no connector directive' \
+  "$([ "$RC" -ne 2 ] && grep -Fq -- "--file $TDIR/policy.diff" "$POLICY_SENTINEL" && ! grep -Fq '@GitHub' "$POLICY_PROMPT"; echo $?)" \
+  "rc=$RC calls=$(cat "$POLICY_SENTINEL") prompt=$(cat "$POLICY_PROMPT")"
+: > "$POLICY_SENTINEL"; : > "$POLICY_PROMPT"
+run_engine_policy bundle-only --pr 'https://github.com/acme/policy/pull/77' --diff "$TDIR/policy.diff" --repo "$TDIR" --input bundle --out "$TDIR/policy-bundle.md" --timeout 5s
+check 'bundle-only explicit bundle uses attachment and no connector directive' \
+  "$([ "$RC" -ne 2 ] && grep -Fq -- "--file $TDIR/policy.diff" "$POLICY_SENTINEL" && ! grep -Fq '@GitHub' "$POLICY_PROMPT"; echo $?)" \
+  "rc=$RC calls=$(cat "$POLICY_SENTINEL") prompt=$(cat "$POLICY_PROMPT")"
+: > "$POLICY_SENTINEL"; : > "$POLICY_PROMPT"
+run_engine_policy connector-enabled --pr 'https://github.com/acme/policy/pull/77' --diff "$TDIR/policy.diff" --repo "$TDIR" --out "$TDIR/policy-connector-default.md" --timeout 5s
+check 'connector-enabled omitted input uses both connector directive and bundle attachment' \
+  "$([ "$RC" -ne 2 ] && grep -Fq -- "--file $TDIR/policy.diff" "$POLICY_SENTINEL" && grep -Fq '@GitHub' "$POLICY_PROMPT"; echo $?)" \
+  "rc=$RC calls=$(cat "$POLICY_SENTINEL") prompt=$(cat "$POLICY_PROMPT")"
+: > "$POLICY_SENTINEL"; : > "$POLICY_PROMPT"
+run_engine_policy connector-enabled --pr 'https://github.com/acme/policy/pull/77' --diff "$TDIR/policy.diff" --repo "$TDIR" --input connector --out "$TDIR/policy-connector.md" --timeout 5s
+check 'connector-enabled explicit connector uses connector directive without bundle attachment' \
+  "$([ "$RC" -ne 2 ] && ! grep -Fq -- "--file $TDIR/policy.diff" "$POLICY_SENTINEL" && grep -Fq '@GitHub' "$POLICY_PROMPT"; echo $?)" \
+  "rc=$RC calls=$(cat "$POLICY_SENTINEL") prompt=$(cat "$POLICY_PROMPT")"
+unset PG_TEST_ORACLE_SENTINEL PG_TEST_ORACLE_COMPLETE PG_TEST_PROMPT_CAPTURE
+
+# Lifecycle-only modes remain usable under an invalid policy: the engine reaches their normal
+# handler instead of rejecting an unrelated historical inspection or recovery action.
+PRO_GATE_INPUT_POLICY=invalid-policy PRO_GATE_HOME="$TDIR/policy-lifecycle" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" \
+  bash "$ENGINE" --status --json >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'status remains usable with invalid input policy' "$([ "$RC" -eq 0 ] && ! grep -Fq 'PRO_GATE_INPUT_POLICY' "$TDIR/stderr"; echo $?)" "rc=$RC $(cat "$TDIR/stderr")"
+PRO_GATE_INPUT_POLICY=invalid-policy PRO_GATE_HOME="$TDIR/policy-lifecycle" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" \
+  bash "$ENGINE" --recover 'pg-run-policy-77-1700000000-1' --repo "$TDIR" --out "$TDIR/policy-recover.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'exact recover remains usable with invalid input policy' "$([ "$RC" -ne 2 ] && ! grep -Fq 'PRO_GATE_INPUT_POLICY' "$TDIR/stderr"; echo $?)" "rc=$RC $(cat "$TDIR/stderr")"
+printf 'still thinking, run marker: pg-run-policy-77-1700000000-1\n' > "$TDIR/tab.txt"
+PRO_GATE_INPUT_POLICY=invalid-policy PRO_GATE_HOME="$TDIR/policy-lifecycle" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" \
+  bash "$ENGINE" --harvest 'pg-run-policy-77-1700000000-1' --out "$TDIR/policy-harvest.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'harvest remains usable with invalid input policy' "$([ "$RC" -ne 2 ] && ! grep -Fq 'PRO_GATE_INPUT_POLICY' "$TDIR/stderr"; echo $?)" "rc=$RC $(cat "$TDIR/stderr")"
+for lifecycle_mode in status recover harvest; do
+  case "$lifecycle_mode" in
+    status) lifecycle_args=(--status --json --input bundle) ;;
+    recover) lifecycle_args=(--recover pg-run-policy-77-1700000000-1 --input bundle) ;;
+    harvest) lifecycle_args=(--harvest pg-run-policy-77-1700000000-1 --input bundle) ;;
+  esac
+  run_engine_policy invalid-policy "${lifecycle_args[@]}"
+  check "$lifecycle_mode rejects an explicit irrelevant input before lifecycle work" \
+    "$([ "$RC" -eq 2 ] && grep -Fq -- '--input applies only to review queries and fresh reviews' "$TDIR/stderr"; echo $?)" \
+    "rc=$RC stderr=$(cat "$TDIR/stderr")"
+done
+printf 'still thinking, run marker: %s\n' "$MARKER" > "$TDIR/tab.txt"
+start_mock "$TDIR/tab.txt" "$ORGANIZER_STATE"
+
 # > default hard ceiling (25000): still refused up front, no slot spent.
 seq 1 26000 | sed 's/^/+/' > "$TDIR/huge.diff"
 run_engine --diff "$TDIR/huge.diff" --repo "$TDIR" --out "$TDIR/o-big.md" --timeout 5m

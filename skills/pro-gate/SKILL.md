@@ -52,14 +52,17 @@ The installer owns runtime files only; this plugin owns the skill and relay.
 
 ## 2. Resolve one action
 
-Resolve the canonical repository and PR. `INPUT` is `both` by default; honor an explicit
-`both|bundle|connector` selection. Build one argv array and reuse it unchanged for the query and its
-effect so proof paths cannot drift:
+Resolve the canonical repository and PR. The engine owns input policy: omit `--input` when the
+caller did not explicitly supply `INPUT`, so its safe default or configured connector opt-in decides
+delivery. An explicit `bundle|both|connector` selection is passed through unchanged. Reuse the exact
+input arguments for the query and effect so proof paths cannot drift:
 
 ```bash
 DECISION="$(mktemp "${TMPDIR:-/tmp}/pro-gate-decision.XXXXXX.json")"
 trap 'rm -f "$DECISION"' EXIT
-QUERY_ARGS=(--review-decision --json --pr "$PR" --repo "$REPO" --input "${INPUT:-both}")
+INPUT_ARGS=()
+[ -n "${INPUT:-}" ] && INPUT_ARGS=(--input "$INPUT")
+QUERY_ARGS=(--review-decision --json --pr "$PR" --repo "$REPO" "${INPUT_ARGS[@]}")
 
 # After prepare-matching-review-evidence, append the exact applicable proof inputs:
 # QUERY_ARGS+=(--diff "$REVIEWED_DIFF")
@@ -98,7 +101,7 @@ Every compatible safe runtime effect and agent task proceeds without routine con
 runtime effect, reuse the exact proof arguments from the advisory query:
 
 ```bash
-EFFECT_ARGS=(--review-decision-effect "$DECISION" --pr "$PR" --repo "$REPO" --input "${INPUT:-both}")
+EFFECT_ARGS=(--review-decision-effect "$DECISION" --pr "$PR" --repo "$REPO" "${INPUT_ARGS[@]}")
 # Append the same --diff/--confirm arguments and proof-path environment used by QUERY_ARGS.
 ```
 

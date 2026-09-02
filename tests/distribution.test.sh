@@ -133,6 +133,20 @@ check "reviewer commands resolve runtime independently" test "$(grep -c '\${PRO_
 check "reviewer agent has no cross-shell runtime dependency" sh -c "! grep -q '\$RUNTIME_HOME/oracle-review.sh' '$ROOT/agents/oracle-reviewer.md'"
 check "reviewer agent has no hardcoded engine home" sh -c "! grep -q '~/.pro-review-daemon/oracle-review.sh' '$ROOT/agents/oracle-reviewer.md'"
 
+# Input policy is engine-owned: both plugin callers omit the flag unless INPUT was explicit, and
+# use the same array for advisory query and guarded effect.
+for caller in "$ROOT/skills/pro-gate/SKILL.md" "$ROOT/agents/oracle-reviewer.md"; do
+  caller_name="$(basename "$(dirname "$caller")")"
+  check "$caller_name initializes optional input args" grep -Fq 'INPUT_ARGS=()' "$caller"
+  check "$caller_name appends explicit input unchanged" grep -Fq '[ -n "${INPUT:-}" ] && INPUT_ARGS=(--input "$INPUT")' "$caller"
+  check "$caller_name reuses optional input args for query" grep -Fq 'QUERY_ARGS=(--review-decision --json --pr "$PR" --repo "$REPO" "${INPUT_ARGS[@]}")' "$caller"
+  check "$caller_name reuses optional input args for effect" grep -Fq 'EFFECT_ARGS=(--review-decision-effect "$DECISION" --pr "$PR" --repo "$REPO" "${INPUT_ARGS[@]}")' "$caller"
+  check "$caller_name does not hard-code both input" sh -c "! grep -Fq -- '--input \"\${INPUT:-both}\"' '$caller'"
+done
+check "README names both engine input policy values" sh -c "grep -Fq 'bundle-only' '$ROOT/README.md' && grep -Fq 'connector-enabled' '$ROOT/README.md'"
+check "env example names both engine input policy values" sh -c "grep -Fq 'bundle-only' '$ROOT/.env.example' && grep -Fq 'connector-enabled' '$ROOT/.env.example'"
+check "README states browser connector trust boundary" grep -Fq 'operator trust boundary' "$ROOT/README.md"
+
 # U4: novice recovery is a thin, no-spend relay over the engine's exclusive --recover mode.
 # Keep the skill and agent in lockstep while preserving the older diagnostic/harvest expert paths.
 RECOVERY_GRAMMAR='recover <PR|URL|marker>'

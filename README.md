@@ -176,8 +176,9 @@ exact installer command.
 
 **macOS (oracle native).** Oracle reuses your signed-in Chrome (Keychain cookie sync); no
 Xvfb, no background service for interactive use. Open Chrome, sign into `chatgpt.com`,
-confirm your Pro model is selectable and **Settings → Apps → GitHub** connector is enabled,
-then run the doctor and `/pro-gate <pr>`.
+confirm your Pro model is selectable, then run the doctor and `/pro-gate <pr>`. The default
+bundle-only delivery does not request the GitHub connector; enable it only for the explicit
+connector-enabled opt-in below.
 
 **WSL2 / Linux (headless Chrome under Xvfb).** Run
 `~/.pro-review-daemon/login-view.sh`, open `http://localhost:6080/vnc.html`, sign into
@@ -236,6 +237,7 @@ the skill, the relay agent, and the daemon all go through it.
 ```bash
 oracle-review.sh --pr <url|number> [--repo <dir>] [--input both|bundle|connector]
                  [--out <file>] [--timeout <dur>] [--extra-files <glob>]
+                 # omitted --input follows PRO_GATE_INPUT_POLICY (bundle-only by default)
 oracle-review.sh --diff <patchfile> --repo <dir> [--pr <n>] ...   # review a local diff; pass --pr
                                                                   # too so budget/locks stay the PR's
 oracle-review.sh --confirm <prior-review-file> ...                # confirming pass: verify every prior
@@ -290,10 +292,25 @@ diagnosis; ordinary callers should use `/pro-gate recover` instead.
 ## Configuration
 
 All tunables live in [`.env.example`](.env.example) with inline docs; the engine reads
-`~/.pro-review-daemon/.env`. The ones most worth knowing:
+`~/.pro-review-daemon/.env`.
+
+### Input delivery policy
+
+`PRO_GATE_INPUT_POLICY=bundle-only` is the safe default: omitted `--input` attaches the reviewed
+diff as a bundle and Pro-Gate does not request connector delivery. To enable connector delivery,
+make the one-time, explicit opt-in `PRO_GATE_INPUT_POLICY=connector-enabled`; omitted input then
+uses `both`, while explicit `bundle`, `both`, and `connector` remain available. Any other nonempty
+policy value is rejected before review setup. The daemon's `PRO_REVIEW_INPUT` is empty by default so
+it inherits this policy; set it only for an explicit daemon-wide mode.
+
+Bundle-only prevents Pro-Gate from requesting connector delivery but cannot attest to or revoke
+external ChatGPT browser connector grants. Known connector-bound browser or project permissions
+remain an operator trust boundary.
 
 | Variable | Default | What it controls |
 |---|---|---|
+| `PRO_GATE_INPUT_POLICY` | `bundle-only` | `bundle-only` permits only bundled review input; `connector-enabled` opts into connector-capable input |
+| `PRO_REVIEW_INPUT` | *(empty/inherit engine)* | Optional daemon-wide explicit `bundle`, `both`, or `connector` input mode |
 | `PRO_REVIEW_OWNERS` | *(required for daemon)* | GitHub owners the daemon may watch |
 | `PRO_REVIEW_MAX_BUDGET_USD` | `5` | Hard $ ceiling per PR for headless fixer runs |
 | `PRO_GATE_ROUND_GUARD` | *(unset/advisory)* | Set `1` for hard trajectory enforcement; `0` forces advisory/off even when limit knobs exist |

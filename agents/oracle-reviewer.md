@@ -56,13 +56,17 @@ authoritative for compatibility, bindings, markers, recovery, nonce, status, and
 
 ## Resolve and dispatch
 
-Use one argv array for the advisory query and its effect. The caller supplies `PR`, `REPO`, the
-selected `both|bundle|connector` input, and any already-prepared proof paths:
+Use one argv array for the advisory query and its effect. The engine owns input policy: omit
+`--input` when the caller did not explicitly supply `INPUT`, so its safe default or configured
+connector opt-in decides delivery. Pass explicit `bundle|both|connector` values through unchanged,
+along with any already-prepared proof paths:
 
 ```bash
 DECISION="$(mktemp "${TMPDIR:-/tmp}/oracle-reviewer-decision.XXXXXX.json")"
 trap 'rm -f "$DECISION"' EXIT
-QUERY_ARGS=(--review-decision --json --pr "$PR" --repo "$REPO" --input "${INPUT:-both}")
+INPUT_ARGS=()
+[ -n "${INPUT:-}" ] && INPUT_ARGS=(--input "$INPUT")
+QUERY_ARGS=(--review-decision --json --pr "$PR" --repo "$REPO" "${INPUT_ARGS[@]}")
 # If present: QUERY_ARGS+=(--diff "$REVIEWED_DIFF" [--confirm "$PRIOR_REVIEW"])
 # Full/scoped proof paths use PRO_GATE_REVIEW_ENDPOINT_PATCH and, for scoped input,
 # PRO_GATE_REVIEW_FILTER_MANIFEST.
@@ -99,7 +103,7 @@ Every compatible safe runtime effect and agent task proceeds without routine con
 runtime effect, reuse the exact query proof arguments:
 
 ```bash
-EFFECT_ARGS=(--review-decision-effect "$DECISION" --pr "$PR" --repo "$REPO" --input "${INPUT:-both}")
+EFFECT_ARGS=(--review-decision-effect "$DECISION" --pr "$PR" --repo "$REPO" "${INPUT_ARGS[@]}")
 # Append the same --diff/--confirm arguments and proof-path environment as QUERY_ARGS.
 ```
 

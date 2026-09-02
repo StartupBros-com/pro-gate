@@ -79,7 +79,7 @@ daemon_agent_task_available(){
 
 daemon_run_review_worker(){ # saved run-granted-review decision-file
   local decision="$1" command_text prompt
-  printf -v command_text '%q ' "$DD_ENGINE" --review-decision --review-decision-effect "$decision" --pr "$DD_NUM" --repo "$DD_WORKTREE" --input "$DD_INPUT" --out "$DD_LOG.review" --timeout "${PRO_REVIEW_ENGINE_TIMEOUT:-30m}"
+  printf -v command_text '%q ' "$DD_ENGINE" --review-decision --review-decision-effect "$decision" --pr "$DD_NUM" --repo "$DD_WORKTREE" "${DD_INPUT_ARGS[@]}" --out "$DD_LOG.review" --timeout "${PRO_REVIEW_ENGINE_TIMEOUT:-30m}"
   prompt="First action: execute this exact argv-quoted guarded runtime effect; it rechecks the saved review-decision/v1 before any charge or submission:
 $command_text
 After that action, invoke the /pro-gate skill and let its typed review-decision/v1 re-resolution select every subsequent fix, evidence, or reporting action. Do not infer a continuation from verdict, prose, phase, exit status, recoverability, or rounds, and do not ask routine permission.
@@ -96,7 +96,7 @@ daemon_run_agent_task(){ # saved decision-file validated action
     return 2
   }
   printf -v target 'PR #%q (%q), local repository %q' "$DD_NUM" "$DD_NWO" "$DD_WORKTREE"
-  printf -v reentry '%q ' "$DD_ENGINE" --review-decision --json --pr "$DD_NUM" --repo "$DD_WORKTREE" --input "$DD_INPUT"
+  printf -v reentry '%q ' "$DD_ENGINE" --review-decision --json --pr "$DD_NUM" --repo "$DD_WORKTREE" "${DD_INPUT_ARGS[@]}"
   prompt="Control-safe typed action: $action.
 Target: $target.
 Saved validated review-decision/v1 path: $(printf '%q' "$decision").
@@ -115,7 +115,7 @@ When a valid typed decision makes it safe, finish the existing headless auto-fix
 daemon_handle_review_worker_failure(){ # worker-rc; fresh typed decision decides whether wrapper failure budget waits
   local worker_rc="$1" fresh action
   fresh="$DD_LOG.decision-after-run.json"
-  if ! "$DD_ENGINE" --review-decision --json --pr "$DD_NUM" --repo "$DD_WORKTREE" --input "$DD_INPUT" >"$fresh" 2>>"$DD_LOG"; then
+  if ! "$DD_ENGINE" --review-decision --json --pr "$DD_NUM" --repo "$DD_WORKTREE" "${DD_INPUT_ARGS[@]}" >"$fresh" 2>>"$DD_LOG"; then
     note_fail "$DD_NWO" "$DD_NUM" "$DD_SHA" "$DD_LOG" "runtime-selected review worker rc=$worker_rc; replacement query failed"
     return 1
   fi
@@ -151,7 +151,7 @@ daemon_dispatch_decision(){ # decision-file [redirect-depth]
       return $? ;;
     runtime-guarded-effect/collect-existing-result|runtime-guarded-effect/recover-existing-review)
       fresh="$DD_LOG.decision-effect-$depth.json"
-      if ! "$DD_ENGINE" --review-decision --review-decision-effect "$decision" --pr "$DD_NUM" --repo "$DD_WORKTREE" --input "$DD_INPUT" >"$fresh" 2>>"$DD_LOG"; then
+      if ! "$DD_ENGINE" --review-decision --review-decision-effect "$decision" --pr "$DD_NUM" --repo "$DD_WORKTREE" "${DD_INPUT_ARGS[@]}" >"$fresh" 2>>"$DD_LOG"; then
         daemon_defer_decision "runtime effect recheck failed"
         return 2
       fi
@@ -196,15 +196,16 @@ daemon_dispatch_decision(){ # decision-file [redirect-depth]
   esac
 }
 
-# The same validated input reaches every decision query, effect recheck, and worker command.
-# `both` is the safe default: it lets the runtime select matching-evidence preparation while
-# keeping explicit connector-only deployments compatible.
-DD_INPUT="${PRO_REVIEW_INPUT:-both}"
+# An empty daemon input inherits the engine's policy. When explicitly selected, the same bytes
+# reach every decision query, effect recheck, and worker command.
+DD_INPUT="${PRO_REVIEW_INPUT:-}"
 
 case "$DD_INPUT" in
-  both|bundle|connector) ;;
-  *) echo "FATAL: PRO_REVIEW_INPUT must be one of: both, bundle, connector (got '$DD_INPUT')" >&2; exit 10 ;;
+  ''|both|bundle|connector) ;;
+  *) echo "FATAL: PRO_REVIEW_INPUT must be one of: empty, both, bundle, connector (got '$DD_INPUT')" >&2; exit 10 ;;
 esac
+DD_INPUT_ARGS=()
+[ -n "$DD_INPUT" ] && DD_INPUT_ARGS=(--input "$DD_INPUT")
 
 privileged_runtime_ready() {
   local installed expected plugin_v
@@ -381,7 +382,7 @@ process_pr(){
   # Resolve and validate the runtime's one action before any review worker can start. The decision
   # is advisory; the matching effect re-reduces under runtime protections at execution time.
   local decision="$lg.decision" engine="${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh"
-  if ! "$engine" --review-decision --json --pr "$num" --repo "$wt" --input "$DD_INPUT" >"$decision" 2>>"$lg" \
+  if ! "$engine" --review-decision --json --pr "$num" --repo "$wt" "${DD_INPUT_ARGS[@]}" >"$decision" 2>>"$lg" \
       || ! daemon_decision_valid "$decision" || ! daemon_decision_target_matches "$decision" "$nwo" "$num" "$sha"; then
     git -C "$repodir" worktree remove --force "$wt" 2>/dev/null || true
     daemon_defer_decision "missing, malformed, stale, unknown, or corpus-mismatched envelope"
