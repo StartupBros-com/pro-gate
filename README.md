@@ -30,7 +30,9 @@ browser by hand doesn't scale.
 **The solution**: `pro-gate` drives a logged-in ChatGPT Pro browser session headlessly (via
 [`steipete/oracle`](https://github.com/steipete/oracle)), sends it your PR as the last review
 tier after your cheaper tiers have run, parses its P0–P3 findings, routes confirmed problems
-to the best available fixer, and posts the review on the PR. It stops before merge. You merge.
+to the best available fixer, and posts the review on the PR. The gate stops before merge; after
+local verification and adversarial review are green, the surrounding agent may arm guarded squash
+auto-merge, with required hosted CI on the exact head remaining the final authority.
 
 ### Why use pro-gate?
 
@@ -46,7 +48,7 @@ to the best available fixer, and posts the review on the PR. It stops before mer
 ### Quick example
 
 ```bash
-# In any Claude Code session: review, fix, comment, stop before merge
+# In any Claude Code session: review, fix, and comment; guarded auto-merge is a surrounding workflow effect
 /pro-gate 1292
 
 # Or drive the engine directly
@@ -82,7 +84,8 @@ gh pr edit 1292 --add-label pro-review
         │  6. name/archive the marker-owned chat         │  ← only after durable success
         │  7. fix confirmed P0/P1 → push                 │  ← CE → codex → Claude Code
         │  8. post the review as a PR comment            │
-        │     …stop before merge (you merge)            │
+        │     …stop before merge; surrounding gate may  │
+        │        arm CI-gated squash auto-merge          │
         └──────────────────────────────────────────────┘
 ```
 
@@ -108,8 +111,10 @@ July 2026). The Pro model spends that long reasoning; the engine is built around
   marker-owned title. Server archive and local tab close happen only after the validated
   review is readable from marker-addressed durable storage; failed and in-progress runs stay
   recoverable.
-- **Review-only authority.** The gate never merges, and committed work stays on the branch
-  at any stop; unresolved findings escalate to a human instead of triggering a revert.
+- **Review-only engine authority.** The gate never merges directly, and committed work stays on
+  the branch at any stop. The surrounding agent may arm guarded squash auto-merge only after local
+  verification and adversarial review are green; missing required CI or unresolved blocking
+  findings prevent arming. Human-only effects remain human-controlled.
 - **One engine, thin surfaces.** The skill, relay agent, and daemon share the runtime contract;
   caller contracts change in the same PR as the engine.
 
@@ -127,7 +132,8 @@ decisions stop and show the exact matching runtime update path rather than start
 Raw review and repository text are untrusted adapter input and are never used as action policy.
 
 This changes neither review provenance nor merge authority: the runtime remains the Oracle
-transport, the gate stops before merge, and you retain merge authority.
+transport and the gate stops before merge. A surrounding agent may arm guarded auto-merge only
+after its own verification/review gates pass; exact-head required CI remains the final authority.
 
 ## Requirements
 
@@ -218,7 +224,7 @@ consent-version change requires fresh acceptance. Set **`PRO_REVIEW_OWNERS`** in
 ```bash
 /pro-gate <pr-number-or-url>            # interactive, any Claude Code session
 /pro-gate recover <PR|URL|marker>       # recover an existing review; never starts a fresh one
-gh pr edit <n> --add-label pro-review   # daemon: review → fix → comment → stop before merge
+gh pr edit <n> --add-label pro-review   # daemon: review → fix → comment; surrounding agent owns guarded merge
 touch ~/.pro-review-daemon/PAUSE        # pause the daemon; logs in ~/.pro-review-daemon/logs/
 ```
 
@@ -355,7 +361,9 @@ semantics. Native mode keeps the prompt's title hint and does not run remote-CDP
   open-P0/P1 trajectory, churn, and elapsed time remain visible advice, but default unset
   configuration does not ration unobservable ChatGPT subscription capacity. Operators who need
   hard automation containment can explicitly enable the trajectory governor, flat cap, or lockdown.
-- **Merge authority**: the daemon never merges; it stops after pushing fixes and commenting.
+- **Merge authority**: the daemon never merges directly; it stops after pushing fixes and
+  commenting. The surrounding agent may arm squash auto-merge only after local verification,
+  adversarial review, and required exact-head CI are green.
 
 ## Troubleshooting
 
@@ -403,8 +411,9 @@ one-invocation override remains `PRO_GATE_FORCE_ROUND=1`; committed fixes stay o
   require an engine update.
 - **The macOS native path is designed but not yet validated on real hardware.** WSL2/Linux
   is where all production use has run.
-- **No auto-merge**, by design. An opt-in guarded version (CI-green + no unresolved P0/P1)
-  is on the roadmap.
+- **Auto-merge is surrounding-workflow authority, not a pro-gate effect.** Agents may arm guarded
+  squash auto-merge after local verification and adversarial review are green; unresolved blocking
+  findings or missing exact-head required CI prevent arming.
 
 ## FAQ
 
