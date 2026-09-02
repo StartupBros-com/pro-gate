@@ -1,6 +1,6 @@
 # CI runner serial optimization — final summary (10/10)
 
-Tracking: issue #114, draft PR #115. Target: `.github/workflows/ci.yml`'s `check` job (`bash
+Historical tracking: issue #114, draft PR #115; shipped by replacement PR #121. Target: `.github/workflows/ci.yml`'s `check` job (`bash
 tests/engine.test.sh`, `tests/daemon-reload.test.sh`, `tests/autoupdate.test.sh`,
 `tests/browser-launch.test.sh`, `node --test tests/cdp-salvage.test.mjs`,
 `tests/distribution.test.sh`, `tests/release-train.test.sh`, `tests/release-assets.test.sh`).
@@ -76,11 +76,11 @@ poll, 2,500ms scratch sample interval) is unchanged outside its narrowly-scoped,
 fixture-only test overrides. Pass 10 did not re-run that review and did not re-implement anything,
 per its scope.
 
-## Hosted PR acceptance plan
+## Historical hosted PR acceptance plan (completed by PR #121)
 
-- PR #115 (draft, tracks issue #114) targets `main` from `worktree-ci-wait-optimization-114`;
-  currently `OPEN`/`isDraft=true`/`mergeable=UNKNOWN` (read-only `gh pr view` check, no mutation
-  performed by this pass).
+- At the time of this pass, PR #115 (draft, tracking issue #114) targeted `main` from
+  `worktree-ci-wait-optimization-114` and was `OPEN`/`isDraft=true`/`mergeable=UNKNOWN` in the
+  read-only `gh pr view` capture. It was later superseded by merged PR #121; see Shipped closeout.
 - Plan: mark the PR ready for review, let the hosted `check` job (`ubuntu-24.04`,
   `timeout-minutes: 45`) run once against this final tree, and record its wall time as one more
   directional data point beside the existing 20-sample original hosted baseline
@@ -160,3 +160,13 @@ Focused evidence: engine exit 0, 855 `ok -`, `ALL PASS`; Node tests=1, pass=1, f
 24s (validation), 13s, 6s, 0s, 11s, 53s, 0s, and 0s. `PASS-10-REVIEW-FIXES.md` preserves the detailed
 closeout record. The regenerated manifest covers the four historical final artifacts plus that
 review-fixes record, excluding itself.
+
+---
+
+## Shipped closeout
+
+The hosted acceptance plan above is complete. Historical draft PR #115 closed unmerged after the
+required rebase; replacement PR #121 carried exact final head `dc6b78a`, passed the required
+`trusted check`, and squash-merged on 2026-09-01. Issue #114 closed with that merge. The hosted run
+confirms the final tree on GitHub infrastructure but remains one observation, not a replacement p95
+for the original 20-sample baseline.
