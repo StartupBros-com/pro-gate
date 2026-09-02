@@ -109,7 +109,7 @@ pg_out_guard_acquire() {
   return 0
 }
 
-PR=""; REPO=""; DIFF_FILE=""; DIFF_IS_CALLER_SUPPLIED=0; INPUT="both"; OUT=""; TIMEOUT="30m"; EXTRA_GLOB=""; HARVEST_MARKER=""; HARVEST_REQUESTED=0; CONFIRM_FILE=""
+PR=""; REPO=""; DIFF_FILE=""; DIFF_IS_CALLER_SUPPLIED=0; INPUT=""; INPUT_SUPPLIED=0; OUT=""; TIMEOUT="30m"; EXTRA_GLOB=""; HARVEST_MARKER=""; HARVEST_REQUESTED=0; CONFIRM_FILE=""
 STATUS_REQUESTED=0; STATUS_QUERY=""; AS_JSON=0; RECOVER_REQUESTED=0; RECOVER_QUERY=""
 REVIEW_DECISION_REQUESTED=0; REVIEW_DECISION_EFFECT_FILE=""; REVIEW_CHOICE_SELECTION_FILE=""
 while [ $# -gt 0 ]; do
@@ -130,7 +130,7 @@ while [ $# -gt 0 ]; do
     --pr) PR="$2"; shift 2;;
     --repo) REPO="$2"; shift 2;;
     --diff) DIFF_FILE="$2"; DIFF_IS_CALLER_SUPPLIED=1; shift 2;;
-    --input) INPUT="$2"; shift 2;;
+    --input) INPUT="$2"; INPUT_SUPPLIED=1; shift 2;;
     --out) OUT="$2"; shift 2;;
     --timeout) TIMEOUT="$2"; shift 2;;
     --extra-files) EXTRA_GLOB="$2"; shift 2;;
@@ -147,6 +147,47 @@ while [ $# -gt 0 ]; do
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
+
+# Input delivery is an engine-owned policy, resolved before any state, output, lock, browser,
+# repository, or Oracle work. Lifecycle-only inspection/recovery remains available even when a
+# deployment has an invalid policy setting, because it neither requests nor submits a review.
+# An explicit input on a lifecycle-only command is still a usage error, never silently ignored.
+# Likewise, an explicit empty string is not omission: callers must either omit the flag or name a mode.
+if [ "$INPUT_SUPPLIED" = 1 ] && [ -z "$INPUT" ]; then
+  echo "ERROR: --input must be one of: bundle, both, connector (got empty)" >&2
+  exit 2
+fi
+if [ "$INPUT_SUPPLIED" = 1 ] && { [ "$STATUS_REQUESTED" = 1 ] || [ "$RECOVER_REQUESTED" = 1 ] || [ "$HARVEST_REQUESTED" = 1 ]; }; then
+  echo "ERROR: --input applies only to review queries and fresh reviews, not status/recover/harvest" >&2
+  exit 2
+fi
+if [ "$STATUS_REQUESTED" != 1 ] && [ "$RECOVER_REQUESTED" != 1 ] && [ "$HARVEST_REQUESTED" != 1 ]; then
+  case "${PRO_GATE_INPUT_POLICY:-bundle-only}" in
+    bundle-only)
+      case "$INPUT" in
+        '') INPUT=bundle ;;
+        bundle) ;;
+        both|connector)
+          echo "ERROR: PRO_GATE_INPUT_POLICY=bundle-only permits only --input bundle; set PRO_GATE_INPUT_POLICY=connector-enabled to request connector delivery." >&2
+          exit 2 ;;
+        *)
+          echo "ERROR: --input must be one of: bundle, both, connector (got '$INPUT')" >&2
+          exit 2 ;;
+      esac ;;
+    connector-enabled)
+      case "$INPUT" in
+        '') INPUT=both ;;
+        bundle|both|connector) ;;
+        *)
+          echo "ERROR: --input must be one of: bundle, both, connector (got '$INPUT')" >&2
+          exit 2 ;;
+      esac ;;
+    *)
+      echo "ERROR: PRO_GATE_INPUT_POLICY must be bundle-only or connector-enabled (got '${PRO_GATE_INPUT_POLICY}')" >&2
+      exit 2 ;;
+  esac
+fi
+
 if [ "$AS_JSON" = 1 ] && [ "$STATUS_REQUESTED" != 1 ] && [ "$REVIEW_DECISION_REQUESTED" != 1 ]; then
   echo "ERROR: --json is only meaningful with --status or --review-decision" >&2
   exit 2
