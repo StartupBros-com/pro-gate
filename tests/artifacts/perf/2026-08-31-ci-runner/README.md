@@ -1,6 +1,6 @@
 # CI runner profiling artifacts
 
-Measurement-only profile for issue #110 and draft PR #111.
+Measurement-only profile for issue #110 and PR #111, merged on 2026-08-31.
 
 ## Conclusions
 
