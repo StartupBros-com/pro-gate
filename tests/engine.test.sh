@@ -5263,8 +5263,9 @@ done
 
 # #134 review follow-up: the expected-head SHAPE gate is a fail-closed check on a shared helper.
 # Both present callers pre-validate the head before it ever reaches here, so no production path can
-# arrive malformed — which is precisely why the gate needs direct coverage. Without it a regression
-# that loosened the charset or dropped the length check would pass the whole suite unnoticed.
+# arrive malformed. Every input below would also fail the equality check against the seeded binding
+# head, so this does not detect a loosened gate on its own; it pins the contract that a malformed
+# head is refused with the record untouched, as documented behaviour rather than a side effect.
 super_shape_reject() { # label bad-head
   local label="$1" bad_head="$2" home marker epoch before rc
   home="$TDIR/home-superseded-shape-$label"
@@ -5306,23 +5307,35 @@ check 'supersession accepts a 64-character SHA-256 head that matches the binding
 # the unlink fails, not leaked. A leak is the self-deadlock the adjacent comment warns about, and it
 # is deterministically testable without concurrency — make the binding directory unwritable so the
 # rm fails, then prove a fresh acquire still succeeds.
+# The disposition MUST come from the real writer: pg_attempt_disposition_cleanup validates the exact
+# canonical schema first, and a hand-built subset fails that validation and returns before the guard
+# is ever taken — the check then passes without exercising the release path at all (caught in
+# review). The preconditions are asserted explicitly so the test cannot regress into that vacuity.
 SUPER_LEAK_HOME="$TDIR/home-cleanup-guard-leak"
 SUPER_LEAK_MARKER='pg-run-acme-fresh-77-1700014302-L'
 super_seed "$SUPER_LEAK_HOME" "$SUPER_LEAK_MARKER" 1700014302 "$FRESH_BASE"
 printf 'diff\t%s\t1700014302\t0\t1\t\t\tgenerating\n' "$TDIR/superseded-audit.md" > "$SUPER_LEAK_HOME/in-progress/$SUPER_LEAK_MARKER"
-SUPER_LEAK_DISP="$(jq -nc --arg m "$SUPER_LEAK_MARKER" --arg k "$SUPER_KEY" --argjson e 1700014302 \
-  '{marker:$m,round_key:$k,charged_spend_epoch:$e,terminal_kind:"not-submitted"}')"
+PRO_GATE_HOME="$SUPER_LEAK_HOME" pg_attempt_disposition_write github.com acme fresh 77 "$SUPER_KEY" \
+  "$SUPER_LEAK_MARKER" 1700014302 not-submitted proven-no-submit >/dev/null 2>&1
+SUPER_LEAK_DISP="$(PRO_GATE_HOME="$SUPER_LEAK_HOME" pg_attempt_disposition_read "$SUPER_LEAK_MARKER" 2>/dev/null || true)"
+SUPER_LEAK_BINDING="$SUPER_LEAK_HOME/review-input-bindings/$SUPER_LEAK_MARKER"
+# Root ignores directory modes, so there the unlink succeeds and only the success-path release is
+# exercised; the unlink-failed assertions apply to the non-root runs CI and development use.
+SUPER_LEAK_EXPECT_FAIL=1; [ "$(id -u)" -eq 0 ] && SUPER_LEAK_EXPECT_FAIL=0
 chmod 500 "$SUPER_LEAK_HOME/review-input-bindings" 2>/dev/null
 PRO_GATE_HOME="$SUPER_LEAK_HOME" pg_attempt_disposition_cleanup "$SUPER_LEAK_DISP" >/dev/null 2>&1
 SUPER_LEAK_RC=$?
 chmod 700 "$SUPER_LEAK_HOME/review-input-bindings" 2>/dev/null
+SUPER_LEAK_BINDING_PRESENT=no; [ -f "$SUPER_LEAK_BINDING" ] && SUPER_LEAK_BINDING_PRESENT=yes
 # If the guard leaked, this acquire blocks for the full flock timeout and then fails.
 PRO_GATE_HOME="$SUPER_LEAK_HOME" pg_reservation_guard_acquire
 SUPER_LEAK_REACQUIRE=$?
 [ "$SUPER_LEAK_REACQUIRE" -eq 0 ] && PRO_GATE_HOME="$SUPER_LEAK_HOME" pg_reservation_guard_release
 check 'disposition cleanup releases the reservation guard when the binding unlink fails' \
-  "$([ "$SUPER_LEAK_REACQUIRE" -eq 0 ]; echo $?)" \
-  "cleanup_rc=$SUPER_LEAK_RC reacquire_rc=$SUPER_LEAK_REACQUIRE"
+  "$([ -n "$SUPER_LEAK_DISP" ] && [ "$SUPER_LEAK_REACQUIRE" -eq 0 ] \
+     && { [ "$SUPER_LEAK_EXPECT_FAIL" -eq 0 ] \
+          || { [ "$SUPER_LEAK_RC" -ne 0 ] && [ "$SUPER_LEAK_BINDING_PRESENT" = yes ]; }; }; echo $?)" \
+  "disposition_valid=$([ -n "$SUPER_LEAK_DISP" ] && echo yes || echo no) cleanup_rc=$SUPER_LEAK_RC binding_present=$SUPER_LEAK_BINDING_PRESENT reacquire_rc=$SUPER_LEAK_REACQUIRE"
 
 # A terminal disposition is durable proof, not another mutable progress flag. It must outrank stale
 # active/run-meta state after a crash, complete exact cleanup/refund once, and let late review bytes
