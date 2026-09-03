@@ -858,6 +858,11 @@ pg_attempt_disposition_cleanup() { # canonical disposition; idempotent after pro
     # what made remove-then-rewrite-with-a-different-head reachable against a concurrent supersede.
     # Scope is the unlink ONLY: pg_reservation_remove below acquires the guard itself and the flock
     # here is not reentrant, so widening this would self-deadlock for the full 10s timeout.
+    # Acquire can now fail (10s flock timeout) AFTER pg_round_unrecord_epoch above already
+    # succeeded — a partial-state exit that did not exist when this was a bare `rm -f`. Safe to
+    # retry rather than unwind: the terminal disposition is written durably before any caller
+    # reaches cleanup, pg_round_unrecord_epoch is a no-op once the epoch is gone, and the
+    # TTL/miss sweep in pg_reservation_note_miss reclaims capacity regardless.
     pg_reservation_guard_acquire || return 1
     rm -f "$(pg_review_input_binding_dir)/$marker" 2>/dev/null \
       || { pg_reservation_guard_release; return 1; }

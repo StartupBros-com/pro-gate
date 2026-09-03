@@ -67,9 +67,19 @@ are excluded by `pg_reservation_holding_count` (`lib/pro-gate-lib.sh:1462-1471`)
 manually synchronized “active count.”
 
 Supersession is monotonic. The transition rechecks the exact marker, canonical key, charged epoch,
-and legacy proof under the reservation lock before writing the canonical record
-(`lib/pro-gate-lib.sh:1376-1422`). It preserves the charge and audit/recovery pointers while releasing
-capacity and current applicability. It is not a refund and does not accept review bytes.
+legacy proof, **and the head OID the caller validated against GitHub** under the reservation lock
+before writing the canonical record (`lib/pro-gate-lib.sh:1376-1422`). It preserves the charge and
+audit/recovery pointers while releasing capacity and current applicability. It is not a refund and
+does not accept review bytes.
+
+The head belongs in that list for the same reason the others do (#134). The decision is taken in
+`recover_superseded_reason` against a binding read before the GitHub query; without the head in the
+compare-and-swap, the commit could land against a *different* binding substituted afterwards —
+reachable because `pg_attempt_disposition_cleanup` unlinked the binding outside the guard, and
+bindings are otherwise write-once. The failure it prevents is releasing a slot still held by
+current-head work. Note what the control is: a serialization guarantee between cooperating callers,
+not an authorization boundary. `flock` is advisory, so a process writing `$PRO_GATE_HOME` directly
+bypasses this API entirely — that trust boundary is the single-user-owned state directory, unchanged.
 
 Terminal dispositions are also proof records, not guesses. Their immutable payload binds repository,
 target, marker, round key, charged epoch, terminal kind, and proof kind

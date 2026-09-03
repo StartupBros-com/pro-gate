@@ -5261,6 +5261,69 @@ for SUPER_ATOMIC_CASE in key expected-spend host owner repo pr binding-charge he
   super_locked_reject "$SUPER_ATOMIC_CASE" "$SUPER_ATOMIC_N"
 done
 
+# #134 review follow-up: the expected-head SHAPE gate is a fail-closed check on a shared helper.
+# Both present callers pre-validate the head before it ever reaches here, so no production path can
+# arrive malformed — which is precisely why the gate needs direct coverage. Without it a regression
+# that loosened the charset or dropped the length check would pass the whole suite unnoticed.
+super_shape_reject() { # label bad-head
+  local label="$1" bad_head="$2" home marker epoch before rc
+  home="$TDIR/home-superseded-shape-$label"
+  epoch=1700014300
+  marker="pg-run-acme-fresh-77-${epoch}-${label}"
+  super_seed "$home" "$marker" "$epoch" "$FRESH_BASE"
+  printf 'diff\t%s\t%s\t0\t1\t\t\tgenerating\n' "$TDIR/superseded-audit.md" "$epoch" > "$home/in-progress/$marker"
+  before="$(cat "$home/in-progress/$marker")"
+  PRO_GATE_HOME="$home" pg_reservation_supersede "$marker" "$SUPER_KEY" "$epoch" "$bad_head"
+  rc=$?
+  check "supersession fails closed on $label expected-head" \
+    "$([ "$rc" -ne 0 ] && [ "$(cat "$home/in-progress/$marker")" = "$before" ]; echo $?)" \
+    "rc=$rc before=$before after=$(cat "$home/in-progress/$marker")"
+}
+super_shape_reject empty ''
+super_shape_reject nonhex 'zzzzbeefdeadbeefdeadbeefdeadbeefdeadbeef'
+super_shape_reject short 'deadbeef'
+super_shape_reject uppercase 'DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF'
+
+# The 40/64 length gate has a second arm for SHA-256 object ids. Every other fixture is a 40-char
+# SHA-1, so without this the 64-char branch is never executed and could regress silently.
+SUPER_SHA256_HOME="$TDIR/home-superseded-sha256"
+SUPER_SHA256_MARKER='pg-run-acme-fresh-77-1700014301-X'
+SUPER_SHA256_HEAD='c3a46ae3e16a6ecbe7ce01c3a1675ed2d2abd18bc3a46ae3e16a6ecbe7ce01c3'
+super_seed "$SUPER_SHA256_HOME" "$SUPER_SHA256_MARKER" 1700014301 "$FRESH_BASE"
+printf 'diff\t%s\t1700014301\t0\t1\t\t\tgenerating\n' "$TDIR/superseded-audit.md" > "$SUPER_SHA256_HOME/in-progress/$SUPER_SHA256_MARKER"
+super_replace_binding "$SUPER_SHA256_HOME" "$SUPER_SHA256_MARKER" \
+  ".target.head_oid=\"$SUPER_SHA256_HEAD\"
+   | (if (.evidence.proof|has(\"head_oid\")) then .evidence.proof.head_oid=\"$SUPER_SHA256_HEAD\" else . end)
+   | (if (.evidence.proof|has(\"end_oid\")) then .evidence.proof.end_oid=\"$SUPER_SHA256_HEAD\" else . end)"
+PRO_GATE_HOME="$SUPER_SHA256_HOME" pg_reservation_supersede "$SUPER_SHA256_MARKER" "$SUPER_KEY" 1700014301 "$SUPER_SHA256_HEAD"
+SUPER_SHA256_RC=$?
+check 'supersession accepts a 64-character SHA-256 head that matches the binding' \
+  "$([ "$SUPER_SHA256_RC" -eq 0 ] \
+     && [ "$(awk -F'\t' 'NR==1{print $8}' "$SUPER_SHA256_HOME/in-progress/$SUPER_SHA256_MARKER")" = superseded ]; echo $?)" \
+  "rc=$SUPER_SHA256_RC record=$(cat "$SUPER_SHA256_HOME/in-progress/$SUPER_SHA256_MARKER")"
+
+# #134 review follow-up: the guard added around the disposition-cleanup unlink must be RELEASED when
+# the unlink fails, not leaked. A leak is the self-deadlock the adjacent comment warns about, and it
+# is deterministically testable without concurrency — make the binding directory unwritable so the
+# rm fails, then prove a fresh acquire still succeeds.
+SUPER_LEAK_HOME="$TDIR/home-cleanup-guard-leak"
+SUPER_LEAK_MARKER='pg-run-acme-fresh-77-1700014302-L'
+super_seed "$SUPER_LEAK_HOME" "$SUPER_LEAK_MARKER" 1700014302 "$FRESH_BASE"
+printf 'diff\t%s\t1700014302\t0\t1\t\t\tgenerating\n' "$TDIR/superseded-audit.md" > "$SUPER_LEAK_HOME/in-progress/$SUPER_LEAK_MARKER"
+SUPER_LEAK_DISP="$(jq -nc --arg m "$SUPER_LEAK_MARKER" --arg k "$SUPER_KEY" --argjson e 1700014302 \
+  '{marker:$m,round_key:$k,charged_spend_epoch:$e,terminal_kind:"not-submitted"}')"
+chmod 500 "$SUPER_LEAK_HOME/review-input-bindings" 2>/dev/null
+PRO_GATE_HOME="$SUPER_LEAK_HOME" pg_attempt_disposition_cleanup "$SUPER_LEAK_DISP" >/dev/null 2>&1
+SUPER_LEAK_RC=$?
+chmod 700 "$SUPER_LEAK_HOME/review-input-bindings" 2>/dev/null
+# If the guard leaked, this acquire blocks for the full flock timeout and then fails.
+PRO_GATE_HOME="$SUPER_LEAK_HOME" pg_reservation_guard_acquire
+SUPER_LEAK_REACQUIRE=$?
+[ "$SUPER_LEAK_REACQUIRE" -eq 0 ] && PRO_GATE_HOME="$SUPER_LEAK_HOME" pg_reservation_guard_release
+check 'disposition cleanup releases the reservation guard when the binding unlink fails' \
+  "$([ "$SUPER_LEAK_REACQUIRE" -eq 0 ]; echo $?)" \
+  "cleanup_rc=$SUPER_LEAK_RC reacquire_rc=$SUPER_LEAK_REACQUIRE"
+
 # A terminal disposition is durable proof, not another mutable progress flag. It must outrank stale
 # active/run-meta state after a crash, complete exact cleanup/refund once, and let late review bytes
 # win without changing the disposition.
