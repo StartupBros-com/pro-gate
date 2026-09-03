@@ -1370,11 +1370,12 @@ pg_reservation_slot_plan() {
 # the miss counter. Marking completion must change exactly one thing — whether this review still
 # occupies account capacity — and nothing about how it is later collected (#82).
 # pg_reservation_supersede <marker> <canonical-key> <spend>: exact transition for current and
-# legacy `diff` records. The caller has already bound immutable input + canonical run-meta + GitHub
-# proof; this helper serializes the final compare-and-swap so a concurrent harvest cannot change the
-# record between proof and mutation. Arbitrary key mismatches remain fail-closed.
+# legacy `diff` records. The caller has already proved GitHub supersession; this helper revalidates
+# immutable input + canonical run-meta under the reservation guard before its final compare-and-swap.
+# Arbitrary key, identity, and charge mismatches remain fail-closed.
 pg_reservation_supersede() {
-  local marker="$1" key="$2" expected_spend="$3" dir f rc pr out created misses slot model spend marker_epoch tmp
+  local marker="$1" key="$2" expected_spend="$3" dir f rc pr out created misses slot model spend tmp
+  local meta mh mo mr mkey mpr mout mspend binding bh bo br bpr bepoch
   pg_reservation_marker_ok "$marker" || return 1
   pg_round_key_ok "$key" || return 1
   case "$expected_spend" in ''|*[!0-9]*) return 1;; esac
@@ -1382,6 +1383,22 @@ pg_reservation_supersede() {
   [ -f "$f" ] && [ ! -L "$f" ] || return 1
   pg_reservation_guard_acquire || return 1
   if [ ! -f "$f" ] || [ -L "$f" ]; then pg_reservation_guard_release; return 1; fi
+
+  # Re-read both marker-addressed immutable identities inside the mutation critical section. Marker
+  # mint time can precede charge while a run waits for locks, so it is not charge evidence.
+  meta="$(pg_run_meta_read "$marker" 2>/dev/null || true)"
+  binding="$(pg_review_input_binding_read "$marker" 2>/dev/null || true)"
+  if [ -z "$meta" ] || [ -z "$binding" ]; then pg_reservation_guard_release; return 1; fi
+  IFS=$'\t' read -r mh mo mr mkey mpr mout mspend <<<"$meta"
+  bh="$(jq -r .repository.host <<<"$binding")"; bo="$(jq -r .repository.owner <<<"$binding")"
+  br="$(jq -r .repository.repo <<<"$binding")"; bpr="$(jq -r .target.pr <<<"$binding")"
+  bepoch="$(jq -r .charged_spend_epoch <<<"$binding")"
+  if [ "$mkey" != "$key" ] || [ "$mspend" != "$expected_spend" ] \
+     || [ "$bh" != "$mh" ] || [ "$bo" != "$mo" ] || [ "$br" != "$mr" ] \
+     || [ "$bpr" != "$mpr" ] || [ "$bepoch" != "$mspend" ]; then
+    pg_reservation_guard_release; return 1
+  fi
+
   pr="$(awk -F'\t' 'NR==1{print $1}' "$f" 2>/dev/null)"
   out="$(awk -F'\t' 'NR==1{print $2}' "$f" 2>/dev/null)"
   created="$(awk -F'\t' 'NR==1{print $3}' "$f" 2>/dev/null)"
@@ -1392,8 +1409,6 @@ pg_reservation_supersede() {
   case "$pr" in "$key"|diff) ;; *) pg_reservation_guard_release; return 1;; esac
   if [ "$spend" != "$expected_spend" ]; then
     if [ "$pr" != diff ] || [ -n "$spend" ]; then pg_reservation_guard_release; return 1; fi
-    marker_epoch="$(pg_marker_epoch "$marker" 2>/dev/null || true)"
-    if [ "$marker_epoch" != "$expected_spend" ]; then pg_reservation_guard_release; return 1; fi
     spend="$expected_spend"
   fi
   case "$misses" in ''|*[!0-9]*) misses=0;; esac

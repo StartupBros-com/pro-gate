@@ -55,20 +55,20 @@ attempt can outrank old proof; stale mutable sidecars from the same superseded a
 Callers must not recreate this precedence from status prose.
 
 `review-decision/v1` is a pure continuation policy over normalized facts. Its contract explicitly
-excludes filesystem, lock, browser, round, and publication work (`lib/pro-gate-lib.sh:2431-2437`),
-and the reducer implements that policy at `lib/pro-gate-lib.sh:2570-2759`. The skill,
+excludes filesystem, lock, browser, round, and publication work (`lib/pro-gate-lib.sh:2445-2453`),
+and the reducer implements that policy at `lib/pro-gate-lib.sh:2585-2774`. The skill,
 relay, and daemon dispatch its typed action and re-resolve at the effect boundary; they do not infer a
 continuation from a `VERDICT`, exit code, recoverability flag, or round count.
 
 ### Make capacity a query over proof-backed attempt state
 
 A durable reservation can exist without consuming capacity. Completed and superseded reservations
-are excluded by `pg_reservation_holding_count` (`lib/pro-gate-lib.sh:1442-1455`). This avoids a second
+are excluded by `pg_reservation_holding_count` (`lib/pro-gate-lib.sh:1462-1471`). This avoids a second
 manually synchronized “active count.”
 
 Supersession is monotonic. The transition rechecks the exact marker, canonical key, charged epoch,
 and legacy proof under the reservation lock before writing the canonical record
-(`lib/pro-gate-lib.sh:1376-1406`). It preserves the charge and audit/recovery pointers while releasing
+(`lib/pro-gate-lib.sh:1376-1422`). It preserves the charge and audit/recovery pointers while releasing
 capacity and current applicability. It is not a refund and does not accept review bytes.
 
 Terminal dispositions are also proof records, not guesses. Their immutable payload binds repository,
@@ -84,13 +84,15 @@ hydration failure, crashed wrapper, or long-running answer into duplicate paid w
 
 The same principle applies to legacy compatibility: each added compatibility path narrowed a positive
 proof predicate rather than making missing evidence acceptable. PR #120 admitted only a literal
-legacy `diff` key after exact identity agreement; PR #123 admitted an empty legacy spend only when the
-marker epoch independently equaled the immutable charged epoch.
+legacy `diff` key after exact identity agreement; PR #123 initially admitted an empty legacy spend
+when marker time equaled the immutable charged epoch. Queued runs later disproved marker time as charge
+evidence, so v0.38.1 instead revalidates exact immutable binding and canonical run metadata under the
+reservation lock before filling the proven charge.
 
 ### Treat local round history as advisory, not quota
 
 By default, `pg_round_policy_mode` returns `advisory` unless an operator explicitly configures an
-enforced cap or lockdown (`lib/pro-gate-lib.sh:2097-2127`). History and convergence signals remain
+enforced cap or lockdown (`lib/pro-gate-lib.sh:2112-2128`). History and convergence signals remain
 useful diagnostics, but they do not impersonate ChatGPT subscription allowance or block changed,
 proven evidence.
 

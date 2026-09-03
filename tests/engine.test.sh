@@ -5014,6 +5014,13 @@ super_seed() { # home marker epoch bound-head
     '.marker=$marker | .charged_spend_epoch=$epoch | .target.head_oid=$head | .evidence.proof.head_oid=$head | .evidence.identity=("full-pr:" + .evidence.proof.base_oid + ":" + $head)' <<<"$FRESH_BINDING")"
   PRO_GATE_HOME="$home" pg_review_input_binding_write "$marker" "$binding"
 }
+super_replace_binding() { # home marker jq-filter -- preserve immutable binding's canonical bytes
+  local home="$1" marker="$2" filter="$3" current replacement f
+  current="$(PRO_GATE_HOME="$home" pg_review_input_binding_read "$marker")" || return 1
+  replacement="$(jq -cS "$filter" <<<"$current")" || return 1
+  f="$home/review-input-bindings/$marker"
+  printf '%s' "$replacement" > "$f.cross" && mv "$f.cross" "$f"
+}
 super_recover() { # home marker mode state current-head
   local home="$1" marker="$2" mode="$3" state="$4" head="$5"
   env PRO_GATE_HOME="$home" ORACLE_BROWSER_PORT=65530 PRO_GATE_SELF_HEAL=0 \
@@ -5027,8 +5034,8 @@ super_recover() { # home marker mode state current-head
 SUPER_HEAD_HOME="$TDIR/home-superseded-head"
 SUPER_HEAD_MARKER='pg-run-acme-fresh-77-1700014100-1'
 super_seed "$SUPER_HEAD_HOME" "$SUPER_HEAD_MARKER" 1700014100 "$FRESH_BASE"
-# Pre-v0.31 harvest fallback used literal `diff` with no model or spend. Binding + run-meta +
-# marker epoch prove the missing spend before the same atomic supersession transition fills it.
+# Pre-v0.31 harvest fallback used literal `diff` with no model or spend. Exact immutable binding +
+# canonical run-meta prove the missing spend before the atomic supersession transition fills it.
 printf 'diff\t%s\t1700014000\t2\t1\t\t\tgenerating\n' "$TDIR/superseded-audit.md" > "$SUPER_HEAD_HOME/in-progress/$SUPER_HEAD_MARKER"
 : > "$SUPER_GH_CALLS"; : > "$TDIR/recover-oracle-sentinel"
 super_recover "$SUPER_HEAD_HOME" "$SUPER_HEAD_MARKER" ok OPEN "$FRESH_HEAD"
@@ -5040,9 +5047,11 @@ check 'exact recovery atomically canonicalizes and supersedes a legacy diff rese
   "rc=$RC state=$(cat "$SUPER_HEAD_HOME/in-progress/$SUPER_HEAD_MARKER") stderr=$(cat "$TDIR/super.stderr")"
 SUPER_LEGACY_RECORD="$(cat "$SUPER_HEAD_HOME/in-progress/$SUPER_HEAD_MARKER")"
 PRO_GATE_HOME="$SUPER_HEAD_HOME" pg_reservation_supersede "$SUPER_HEAD_MARKER" "$SUPER_KEY" 1700014100
-check 'canonical supersession replay is byte-idempotent' \
-  "$([ "$(cat "$SUPER_HEAD_HOME/in-progress/$SUPER_HEAD_MARKER")" = "$SUPER_LEGACY_RECORD" ]; echo $?)" \
-  "before=$SUPER_LEGACY_RECORD after=$(cat "$SUPER_HEAD_HOME/in-progress/$SUPER_HEAD_MARKER")"
+SUPER_REPLAY_RC=$?
+check 'canonical supersession replay returns success and is byte-idempotent' \
+  "$([ "$SUPER_REPLAY_RC" -eq 0 ] \
+     && [ "$(cat "$SUPER_HEAD_HOME/in-progress/$SUPER_HEAD_MARKER")" = "$SUPER_LEGACY_RECORD" ]; echo $?)" \
+  "rc=$SUPER_REPLAY_RC before=$SUPER_LEGACY_RECORD after=$(cat "$SUPER_HEAD_HOME/in-progress/$SUPER_HEAD_MARKER")"
 check 'supersession retains the charged round and durable proof event' \
   "$([ "$(wc -l < "$SUPER_HEAD_HOME/rounds/$SUPER_KEY")" -eq 1 ] \
      && jq -e --arg marker "$SUPER_HEAD_MARKER" --arg old "$FRESH_BASE" --arg new "$FRESH_HEAD" \
@@ -5162,14 +5171,14 @@ check 'missing immutable binding stays generating without consulting GitHub' \
 SUPER_CROSS_HOME="$TDIR/home-superseded-cross-binding"
 SUPER_CROSS_MARKER='pg-run-acme-fresh-77-1700014104-4'
 super_seed "$SUPER_CROSS_HOME" "$SUPER_CROSS_MARKER" 1700014104 "$FRESH_BASE"
-jq -cS '.repository.repo="other"' "$SUPER_CROSS_HOME/review-input-bindings/$SUPER_CROSS_MARKER" > "$SUPER_CROSS_HOME/review-input-bindings/$SUPER_CROSS_MARKER.cross"
-mv "$SUPER_CROSS_HOME/review-input-bindings/$SUPER_CROSS_MARKER.cross" "$SUPER_CROSS_HOME/review-input-bindings/$SUPER_CROSS_MARKER"
+super_replace_binding "$SUPER_CROSS_HOME" "$SUPER_CROSS_MARKER" '.repository.repo="other"'
+SUPER_CROSS_BINDING="$(PRO_GATE_HOME="$SUPER_CROSS_HOME" pg_review_input_binding_read "$SUPER_CROSS_MARKER" 2>/dev/null || true)"
 : > "$SUPER_GH_CALLS"
 super_recover "$SUPER_CROSS_HOME" "$SUPER_CROSS_MARKER" ok MERGED "$FRESH_HEAD"
 check 'valid-but-crossed repository binding cannot supersede another canonical attempt' \
-  "$([ "$RC" -eq 3 ] && [ ! -s "$SUPER_GH_CALLS" ] \
+  "$([ "$RC" -eq 3 ] && [ -n "$SUPER_CROSS_BINDING" ] && [ ! -s "$SUPER_GH_CALLS" ] \
      && [ "$(awk -F'\t' 'NR==1{print $8}' "$SUPER_CROSS_HOME/in-progress/$SUPER_CROSS_MARKER")" = generating ]; echo $?)" \
-  "rc=$RC calls=$(cat "$SUPER_GH_CALLS") binding=$(cat "$SUPER_CROSS_HOME/review-input-bindings/$SUPER_CROSS_MARKER")"
+  "rc=$RC calls=$(cat "$SUPER_GH_CALLS") binding=$SUPER_CROSS_BINDING"
 SUPER_BADKEY_HOME="$TDIR/home-superseded-bad-key"
 SUPER_BADKEY_MARKER='pg-run-acme-fresh-77-1700014106-6'
 super_seed "$SUPER_BADKEY_HOME" "$SUPER_BADKEY_MARKER" 1700014106 "$FRESH_BASE"
@@ -5190,16 +5199,51 @@ check 'canonical key with missing spend remains fail-closed before GitHub' \
   "$([ "$RC" -eq 3 ] && [ ! -s "$SUPER_GH_CALLS" ] \
      && [ "$(awk -F'\t' 'NR==1{print $7" "$8}' "$SUPER_CANON_EMPTY_HOME/in-progress/$SUPER_CANON_EMPTY_MARKER")" = ' generating' ]; echo $?)" \
   "rc=$RC calls=$(cat "$SUPER_GH_CALLS") record=$(cat "$SUPER_CANON_EMPTY_HOME/in-progress/$SUPER_CANON_EMPTY_MARKER")"
-SUPER_EPOCH_HOME="$TDIR/home-superseded-diff-wrong-epoch"
-SUPER_EPOCH_MARKER='pg-run-acme-fresh-77-1700014108-8'
-super_seed "$SUPER_EPOCH_HOME" "$SUPER_EPOCH_MARKER" 1700014107 "$FRESH_BASE"
-printf 'diff\t%s\t1700014107\t0\t1\t\t\tgenerating\n' "$TDIR/superseded-audit.md" > "$SUPER_EPOCH_HOME/in-progress/$SUPER_EPOCH_MARKER"
+SUPER_QUEUED_HOME="$TDIR/home-superseded-diff-queued"
+SUPER_QUEUED_MARKER='pg-run-acme-fresh-77-1700014106-8'
+super_seed "$SUPER_QUEUED_HOME" "$SUPER_QUEUED_MARKER" 1700014107 "$FRESH_BASE"
+printf 'diff\t%s\t1700014107\t0\t1\t\t\tgenerating\n' "$TDIR/superseded-audit.md" > "$SUPER_QUEUED_HOME/in-progress/$SUPER_QUEUED_MARKER"
 : > "$SUPER_GH_CALLS"
-super_recover "$SUPER_EPOCH_HOME" "$SUPER_EPOCH_MARKER" ok MERGED "$FRESH_HEAD"
-check 'empty-spend diff with a different marker epoch remains fail-closed before GitHub' \
-  "$([ "$RC" -eq 3 ] && [ ! -s "$SUPER_GH_CALLS" ] \
-     && [ "$(awk -F'\t' 'NR==1{print $1" "$7" "$8}' "$SUPER_EPOCH_HOME/in-progress/$SUPER_EPOCH_MARKER")" = 'diff  generating' ]; echo $?)" \
-  "rc=$RC calls=$(cat "$SUPER_GH_CALLS") record=$(cat "$SUPER_EPOCH_HOME/in-progress/$SUPER_EPOCH_MARKER")"
+super_recover "$SUPER_QUEUED_HOME" "$SUPER_QUEUED_MARKER" ok MERGED "$FRESH_HEAD"
+check 'queued legacy diff supersedes when marker mint precedes the exact proven charge' \
+  "$([ "$RC" -eq 6 ] && [ -s "$SUPER_GH_CALLS" ] \
+     && [ "$(awk -F'\t' 'NR==1{print $1" "$7" "$8}' "$SUPER_QUEUED_HOME/in-progress/$SUPER_QUEUED_MARKER")" = "$SUPER_KEY 1700014107 superseded" ]; echo $?)" \
+  "rc=$RC calls=$(cat "$SUPER_GH_CALLS") record=$(cat "$SUPER_QUEUED_HOME/in-progress/$SUPER_QUEUED_MARKER")"
+
+# The mutation helper independently repeats every exact identity and charge comparison under its lock.
+# Each fixture keeps both sidecars valid so rejection cannot silently fall through malformed-input.
+super_locked_reject() { # scenario suffix
+  local scenario="$1" suffix="$2" home marker epoch binding meta before call_key call_spend rc
+  home="$TDIR/home-superseded-atomic-$scenario"
+  epoch=$(( 1700014200 + suffix ))
+  marker="pg-run-acme-fresh-77-${epoch}-${suffix}"
+  super_seed "$home" "$marker" "$epoch" "$FRESH_BASE"
+  printf 'diff\t%s\t%s\t0\t1\t\t\tgenerating\n' "$TDIR/superseded-audit.md" "$epoch" > "$home/in-progress/$marker"
+  call_key="$SUPER_KEY"; call_spend="$epoch"
+  case "$scenario" in
+    key) call_key="${SUPER_KEY%77}78" ;;
+    expected-spend) call_spend=$(( epoch + 1 )) ;;
+    host) super_replace_binding "$home" "$marker" '.repository.host="git.example.com"' ;;
+    owner) super_replace_binding "$home" "$marker" '.repository.owner="other"' ;;
+    repo) super_replace_binding "$home" "$marker" '.repository.repo="other"' ;;
+    pr) super_replace_binding "$home" "$marker" '.target.pr=78' ;;
+    binding-charge) super_replace_binding "$home" "$marker" ".charged_spend_epoch=$(( epoch + 1 ))" ;;
+  esac
+  binding="$(PRO_GATE_HOME="$home" pg_review_input_binding_read "$marker" 2>/dev/null || true)"
+  meta="$(PRO_GATE_HOME="$home" pg_run_meta_read "$marker" 2>/dev/null || true)"
+  before="$(cat "$home/in-progress/$marker")"
+  PRO_GATE_HOME="$home" pg_reservation_supersede "$marker" "$call_key" "$call_spend"
+  rc=$?
+  check "locked supersession rejects $scenario mismatch with valid sidecars" \
+    "$([ "$rc" -ne 0 ] && [ -n "$binding" ] && [ -n "$meta" ] \
+       && [ "$(cat "$home/in-progress/$marker")" = "$before" ]; echo $?)" \
+    "rc=$rc binding=$binding meta=$meta before=$before after=$(cat "$home/in-progress/$marker")"
+}
+SUPER_ATOMIC_N=0
+for SUPER_ATOMIC_CASE in key expected-spend host owner repo pr binding-charge; do
+  SUPER_ATOMIC_N=$(( SUPER_ATOMIC_N + 1 ))
+  super_locked_reject "$SUPER_ATOMIC_CASE" "$SUPER_ATOMIC_N"
+done
 
 # A terminal disposition is durable proof, not another mutable progress flag. It must outrank stale
 # active/run-meta state after a crash, complete exact cleanup/refund once, and let late review bytes
