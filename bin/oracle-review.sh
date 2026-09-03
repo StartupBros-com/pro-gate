@@ -658,7 +658,7 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
   }
   recover_marker_key() { local m="$1" k; k="${m#pg-run-}"; printf '%s\n' "${k%-*-*}"; }
   recover_superseded_reason() { # marker -> proof-backed reason when PR closed/merged or head moved
-    local marker="$1" binding meta host owner repo pr bound_head binding_epoch mh mo mr mkey mpr mout mspend rkey rspend marker_epoch gh_bin timeout_bin payload state current_head
+    local marker="$1" binding meta host owner repo pr bound_head binding_epoch mh mo mr mkey mpr mout mspend rkey rspend gh_bin timeout_bin payload state current_head
     # The immutable binding and canonical charged run metadata must identify the same exact attempt.
     # A valid-but-crossed sidecar must never let another repository/PR release this marker.
     binding="$(pg_review_input_binding_read "$marker" 2>/dev/null || true)"; [ -n "$binding" ] || return 1
@@ -677,11 +677,10 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
     rspend="$(awk -F'\t' 'NR==1{print $7}' "$(pg_reservation_dir)/$marker" 2>/dev/null)"
     case "$rkey" in "$mkey"|diff) ;; *) return 1;; esac
     if [ "$rspend" != "$mspend" ]; then
-      # Pre-v0.31 `diff` reservations have no spend field. Their marker epoch was the historical
-      # charge fallback, so accept the empty field only when that third proof equals binding+meta.
+      # Pre-v0.31 `diff` reservations have no spend field. Exact immutable binding + canonical
+      # run-meta already identify this marker's charge; queued runs legitimately mint the marker
+      # before that charge, so marker time is not a third equality proof.
       [ "$rkey" = diff ] && [ -z "$rspend" ] || return 1
-      marker_epoch="$(pg_marker_epoch "$marker" 2>/dev/null || true)"
-      [ "$marker_epoch" = "$mspend" ] || return 1
     fi
     gh_bin="${PRO_GATE_GH_BIN:-gh}"; command -v "$gh_bin" >/dev/null 2>&1 || return 1
     timeout_bin="${PRO_GATE_TIMEOUT_BIN:-timeout}"
