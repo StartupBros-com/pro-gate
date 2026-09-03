@@ -5046,7 +5046,7 @@ check 'exact recovery atomically canonicalizes and supersedes a legacy diff rese
      && [ ! -s "$TDIR/recover-oracle-sentinel" ]; echo $?)" \
   "rc=$RC state=$(cat "$SUPER_HEAD_HOME/in-progress/$SUPER_HEAD_MARKER") stderr=$(cat "$TDIR/super.stderr")"
 SUPER_LEGACY_RECORD="$(cat "$SUPER_HEAD_HOME/in-progress/$SUPER_HEAD_MARKER")"
-PRO_GATE_HOME="$SUPER_HEAD_HOME" pg_reservation_supersede "$SUPER_HEAD_MARKER" "$SUPER_KEY" 1700014100
+PRO_GATE_HOME="$SUPER_HEAD_HOME" pg_reservation_supersede "$SUPER_HEAD_MARKER" "$SUPER_KEY" 1700014100 "$FRESH_BASE"
 SUPER_REPLAY_RC=$?
 check 'canonical supersession replay returns success and is byte-idempotent' \
   "$([ "$SUPER_REPLAY_RC" -eq 0 ] \
@@ -5115,9 +5115,12 @@ for SUPER_TERMINAL_STATE in MERGED CLOSED; do
   SUPER_TERM_MARKER="pg-run-acme-fresh-77-1700014101-${SUPER_TERMINAL_STATE:0:1}"
   super_seed "$SUPER_TERM_HOME" "$SUPER_TERM_MARKER" 1700014101 "$FRESH_BASE"
   super_recover "$SUPER_TERM_HOME" "$SUPER_TERM_MARKER" ok "$SUPER_TERMINAL_STATE" "$FRESH_BASE"
+  # #134: the proof now carries the bound head the caller validated against GitHub, so the ledger
+  # records WHICH head was superseded and the caller has a head to feed the compare-and-swap.
+  # Asserting the fuller string keeps this check strictly stronger than before.
   check "GitHub $SUPER_TERMINAL_STATE proof supersedes a same-head review" \
     "$([ "$RC" -eq 6 ] && [ "$(awk -F'\t' 'NR==1{print $8}' "$SUPER_TERM_HOME/in-progress/$SUPER_TERM_MARKER")" = superseded ] \
-       && jq -e --arg proof "pr-${SUPER_TERMINAL_STATE,,}" 'select(.proof==$proof)' "$SUPER_TERM_HOME/ledger.jsonl" >/dev/null 2>&1; echo $?)" \
+       && jq -e --arg proof "pr-${SUPER_TERMINAL_STATE,,}:$FRESH_BASE" 'select(.proof==$proof)' "$SUPER_TERM_HOME/ledger.jsonl" >/dev/null 2>&1; echo $?)" \
     "rc=$RC state=$(cat "$SUPER_TERM_HOME/in-progress/$SUPER_TERM_MARKER") ledger=$(cat "$SUPER_TERM_HOME/ledger.jsonl" 2>/dev/null)"
 done
 
@@ -5228,11 +5231,24 @@ super_locked_reject() { # scenario suffix
     repo) super_replace_binding "$home" "$marker" '.repository.repo="other"' ;;
     pr) super_replace_binding "$home" "$marker" '.target.pr=78' ;;
     binding-charge) super_replace_binding "$home" "$marker" ".charged_spend_epoch=$(( epoch + 1 ))" ;;
+    # #134 planted negative: the caller validated $FRESH_BASE against GitHub, then the binding was
+    # removed and rewritten pointing at a different head (reachable because
+    # pg_attempt_disposition_cleanup unlinked bindings outside the reservation guard). Every other
+    # field still matches, so this passes the pre-#134 comparison and wrongly supersedes
+    # current-head work. The transition must refuse.
+    # The evidence proof's own oid must equal .target.head_oid (pg_review_input_binding_validate),
+    # so a naive target-only tamper yields an INVALID binding and would be rejected for being
+    # unreadable rather than for the head — proving nothing. Rewrite both so the binding stays
+    # fully valid and differs from the caller's validated head in exactly one dimension.
+    head) super_replace_binding "$home" "$marker" \
+      '.target.head_oid="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+       | (if (.evidence.proof|has("head_oid")) then .evidence.proof.head_oid="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" else . end)
+       | (if (.evidence.proof|has("end_oid")) then .evidence.proof.end_oid="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" else . end)' ;;
   esac
   binding="$(PRO_GATE_HOME="$home" pg_review_input_binding_read "$marker" 2>/dev/null || true)"
   meta="$(PRO_GATE_HOME="$home" pg_run_meta_read "$marker" 2>/dev/null || true)"
   before="$(cat "$home/in-progress/$marker")"
-  PRO_GATE_HOME="$home" pg_reservation_supersede "$marker" "$call_key" "$call_spend"
+  PRO_GATE_HOME="$home" pg_reservation_supersede "$marker" "$call_key" "$call_spend" "$FRESH_BASE"
   rc=$?
   check "locked supersession rejects $scenario mismatch with valid sidecars" \
     "$([ "$rc" -ne 0 ] && [ -n "$binding" ] && [ -n "$meta" ] \
@@ -5240,10 +5256,86 @@ super_locked_reject() { # scenario suffix
     "rc=$rc binding=$binding meta=$meta before=$before after=$(cat "$home/in-progress/$marker")"
 }
 SUPER_ATOMIC_N=0
-for SUPER_ATOMIC_CASE in key expected-spend host owner repo pr binding-charge; do
+for SUPER_ATOMIC_CASE in key expected-spend host owner repo pr binding-charge head; do
   SUPER_ATOMIC_N=$(( SUPER_ATOMIC_N + 1 ))
   super_locked_reject "$SUPER_ATOMIC_CASE" "$SUPER_ATOMIC_N"
 done
+
+# #134 review follow-up: the expected-head SHAPE gate is a fail-closed check on a shared helper.
+# Both present callers pre-validate the head before it ever reaches here, so no production path can
+# arrive malformed. Every input below would also fail the equality check against the seeded binding
+# head, so this does not detect a loosened gate on its own; it pins the contract that a malformed
+# head is refused with the record untouched, as documented behaviour rather than a side effect.
+super_shape_reject() { # label bad-head
+  local label="$1" bad_head="$2" home marker epoch before rc
+  home="$TDIR/home-superseded-shape-$label"
+  epoch=1700014300
+  marker="pg-run-acme-fresh-77-${epoch}-${label}"
+  super_seed "$home" "$marker" "$epoch" "$FRESH_BASE"
+  printf 'diff\t%s\t%s\t0\t1\t\t\tgenerating\n' "$TDIR/superseded-audit.md" "$epoch" > "$home/in-progress/$marker"
+  before="$(cat "$home/in-progress/$marker")"
+  PRO_GATE_HOME="$home" pg_reservation_supersede "$marker" "$SUPER_KEY" "$epoch" "$bad_head"
+  rc=$?
+  check "supersession fails closed on $label expected-head" \
+    "$([ "$rc" -ne 0 ] && [ "$(cat "$home/in-progress/$marker")" = "$before" ]; echo $?)" \
+    "rc=$rc before=$before after=$(cat "$home/in-progress/$marker")"
+}
+super_shape_reject empty ''
+super_shape_reject nonhex 'zzzzbeefdeadbeefdeadbeefdeadbeefdeadbeef'
+super_shape_reject short 'deadbeef'
+super_shape_reject uppercase 'DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF'
+
+# The 40/64 length gate has a second arm for SHA-256 object ids. Every other fixture is a 40-char
+# SHA-1, so without this the 64-char branch is never executed and could regress silently.
+SUPER_SHA256_HOME="$TDIR/home-superseded-sha256"
+SUPER_SHA256_MARKER='pg-run-acme-fresh-77-1700014301-X'
+SUPER_SHA256_HEAD='c3a46ae3e16a6ecbe7ce01c3a1675ed2d2abd18bc3a46ae3e16a6ecbe7ce01c3'
+super_seed "$SUPER_SHA256_HOME" "$SUPER_SHA256_MARKER" 1700014301 "$FRESH_BASE"
+printf 'diff\t%s\t1700014301\t0\t1\t\t\tgenerating\n' "$TDIR/superseded-audit.md" > "$SUPER_SHA256_HOME/in-progress/$SUPER_SHA256_MARKER"
+super_replace_binding "$SUPER_SHA256_HOME" "$SUPER_SHA256_MARKER" \
+  ".target.head_oid=\"$SUPER_SHA256_HEAD\"
+   | (if (.evidence.proof|has(\"head_oid\")) then .evidence.proof.head_oid=\"$SUPER_SHA256_HEAD\" else . end)
+   | (if (.evidence.proof|has(\"end_oid\")) then .evidence.proof.end_oid=\"$SUPER_SHA256_HEAD\" else . end)"
+PRO_GATE_HOME="$SUPER_SHA256_HOME" pg_reservation_supersede "$SUPER_SHA256_MARKER" "$SUPER_KEY" 1700014301 "$SUPER_SHA256_HEAD"
+SUPER_SHA256_RC=$?
+check 'supersession accepts a 64-character SHA-256 head that matches the binding' \
+  "$([ "$SUPER_SHA256_RC" -eq 0 ] \
+     && [ "$(awk -F'\t' 'NR==1{print $8}' "$SUPER_SHA256_HOME/in-progress/$SUPER_SHA256_MARKER")" = superseded ]; echo $?)" \
+  "rc=$SUPER_SHA256_RC record=$(cat "$SUPER_SHA256_HOME/in-progress/$SUPER_SHA256_MARKER")"
+
+# #134 review follow-up: the guard added around the disposition-cleanup unlink must be RELEASED when
+# the unlink fails, not leaked. A leak is the self-deadlock the adjacent comment warns about, and it
+# is deterministically testable without concurrency — make the binding directory unwritable so the
+# rm fails, then prove a fresh acquire still succeeds.
+# The disposition MUST come from the real writer: pg_attempt_disposition_cleanup validates the exact
+# canonical schema first, and a hand-built subset fails that validation and returns before the guard
+# is ever taken — the check then passes without exercising the release path at all (caught in
+# review). The preconditions are asserted explicitly so the test cannot regress into that vacuity.
+SUPER_LEAK_HOME="$TDIR/home-cleanup-guard-leak"
+SUPER_LEAK_MARKER='pg-run-acme-fresh-77-1700014302-L'
+super_seed "$SUPER_LEAK_HOME" "$SUPER_LEAK_MARKER" 1700014302 "$FRESH_BASE"
+printf 'diff\t%s\t1700014302\t0\t1\t\t\tgenerating\n' "$TDIR/superseded-audit.md" > "$SUPER_LEAK_HOME/in-progress/$SUPER_LEAK_MARKER"
+PRO_GATE_HOME="$SUPER_LEAK_HOME" pg_attempt_disposition_write github.com acme fresh 77 "$SUPER_KEY" \
+  "$SUPER_LEAK_MARKER" 1700014302 not-submitted proven-no-submit >/dev/null 2>&1
+SUPER_LEAK_DISP="$(PRO_GATE_HOME="$SUPER_LEAK_HOME" pg_attempt_disposition_read "$SUPER_LEAK_MARKER" 2>/dev/null || true)"
+SUPER_LEAK_BINDING="$SUPER_LEAK_HOME/review-input-bindings/$SUPER_LEAK_MARKER"
+# Root ignores directory modes, so there the unlink succeeds and only the success-path release is
+# exercised; the unlink-failed assertions apply to the non-root runs CI and development use.
+SUPER_LEAK_EXPECT_FAIL=1; [ "$(id -u)" -eq 0 ] && SUPER_LEAK_EXPECT_FAIL=0
+chmod 500 "$SUPER_LEAK_HOME/review-input-bindings" 2>/dev/null
+PRO_GATE_HOME="$SUPER_LEAK_HOME" pg_attempt_disposition_cleanup "$SUPER_LEAK_DISP" >/dev/null 2>&1
+SUPER_LEAK_RC=$?
+chmod 700 "$SUPER_LEAK_HOME/review-input-bindings" 2>/dev/null
+SUPER_LEAK_BINDING_PRESENT=no; [ -f "$SUPER_LEAK_BINDING" ] && SUPER_LEAK_BINDING_PRESENT=yes
+# If the guard leaked, this acquire blocks for the full flock timeout and then fails.
+PRO_GATE_HOME="$SUPER_LEAK_HOME" pg_reservation_guard_acquire
+SUPER_LEAK_REACQUIRE=$?
+[ "$SUPER_LEAK_REACQUIRE" -eq 0 ] && PRO_GATE_HOME="$SUPER_LEAK_HOME" pg_reservation_guard_release
+check 'disposition cleanup releases the reservation guard when the binding unlink fails' \
+  "$([ -n "$SUPER_LEAK_DISP" ] && [ "$SUPER_LEAK_REACQUIRE" -eq 0 ] \
+     && { [ "$SUPER_LEAK_EXPECT_FAIL" -eq 0 ] \
+          || { [ "$SUPER_LEAK_RC" -ne 0 ] && [ "$SUPER_LEAK_BINDING_PRESENT" = yes ]; }; }; echo $?)" \
+  "disposition_valid=$([ -n "$SUPER_LEAK_DISP" ] && echo yes || echo no) cleanup_rc=$SUPER_LEAK_RC binding_present=$SUPER_LEAK_BINDING_PRESENT reacquire_rc=$SUPER_LEAK_REACQUIRE"
 
 # A terminal disposition is durable proof, not another mutable progress flag. It must outrank stale
 # active/run-meta state after a crash, complete exact cleanup/refund once, and let late review bytes

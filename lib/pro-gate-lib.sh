@@ -853,7 +853,22 @@ pg_attempt_disposition_cleanup() { # canonical disposition; idempotent after pro
   epoch="$(jq -r .charged_spend_epoch <<<"$json")"; kind="$(jq -r .terminal_kind <<<"$json")"
   if [ "$kind" = not-submitted ]; then
     pg_round_unrecord_epoch "$key" "$epoch" || return 1
-    rm -f "$(pg_review_input_binding_dir)/$marker" 2>/dev/null || return 1
+    # #134: this unlink was the reservation-adjacent mutation outside the guard on the supersession
+    # path (pg_fresh_dispatch_refund's legacy no-PR branch has another, but nothing without a PR
+    # number can reach pg_reservation_supersede). Bindings are otherwise write-once
+    # (pg_review_binding_write_immutable uses `ln`), so an unguarded removal is what made
+    # remove-then-rewrite-with-a-different-head reachable against a concurrent supersede.
+    # Scope is the unlink ONLY: pg_reservation_remove below acquires the guard itself and the flock
+    # here is not reentrant, so widening this would self-deadlock for the full 10s timeout.
+    # Acquire can fail (10s flock timeout) AFTER pg_round_unrecord_epoch above already succeeded —
+    # the same partial-state exit a failing bare `rm -f` already produced, now with a second trigger.
+    # Safe to retry rather than unwind: the terminal disposition is written durably before any caller
+    # reaches cleanup, pg_round_unrecord_epoch is a no-op once the epoch is gone, and the
+    # TTL/miss sweep in pg_reservation_note_miss reclaims capacity regardless.
+    pg_reservation_guard_acquire || return 1
+    rm -f "$(pg_review_input_binding_dir)/$marker" 2>/dev/null \
+      || { pg_reservation_guard_release; return 1; }
+    pg_reservation_guard_release
   fi
   pg_reservation_remove "$marker" 2>/dev/null || return 1
   pg_run_meta_remove "$marker"
@@ -1369,16 +1384,28 @@ pg_reservation_slot_plan() {
 # `out` as an argument and would blank the harvest pointer when called without it, and it resets
 # the miss counter. Marking completion must change exactly one thing — whether this review still
 # occupies account capacity — and nothing about how it is later collected (#82).
-# pg_reservation_supersede <marker> <canonical-key> <spend>: exact transition for current and
-# legacy `diff` records. The caller has already proved GitHub supersession; this helper revalidates
-# immutable input + canonical run-meta under the reservation guard before its final compare-and-swap.
-# Arbitrary key, identity, and charge mismatches remain fail-closed.
+# pg_reservation_supersede <marker> <canonical-key> <spend> <expected-head>: exact transition for
+# current and legacy `diff` records. The caller has already proved GitHub supersession; this helper
+# revalidates immutable input + canonical run-meta under the reservation guard before its final
+# compare-and-swap. Arbitrary key, identity, and charge mismatches remain fail-closed.
+#
+# <expected-head> (#134) is the head OID the CALLER read from the binding and then validated against
+# GitHub. Without it the CAS compared repository, PR and charge but never the head, so a decision
+# taken against one binding could commit against another: bindings are write-once via `ln`, but
+# pg_attempt_disposition_cleanup unlinks one outside this guard, making remove-then-rewrite with a
+# different head reachable. That releases capacity for CURRENT-head work and permits a second paid
+# review of the same change. Required and fail-closed: an empty or malformed head is a refusal, never
+# a fall-through to the old unchecked behaviour.
 pg_reservation_supersede() {
-  local marker="$1" key="$2" expected_spend="$3" dir f rc pr out created misses slot model spend tmp
-  local meta mh mo mr mkey mpr mout mspend binding bh bo br bpr bepoch
+  local marker="$1" key="$2" expected_spend="$3" expected_head="${4:-}"
+  local dir f rc pr out created misses slot model spend tmp
+  local meta mh mo mr mkey mpr mout mspend binding bh bo br bpr bepoch bhead
   pg_reservation_marker_ok "$marker" || return 1
   pg_round_key_ok "$key" || return 1
   case "$expected_spend" in ''|*[!0-9]*) return 1;; esac
+  # Same shape gate the caller applies to a binding head before trusting it (oracle-review.sh).
+  case "$expected_head" in ''|*[!0-9a-f]*) return 1;; esac
+  { [ "${#expected_head}" -eq 40 ] || [ "${#expected_head}" -eq 64 ]; } || return 1
   dir="$(pg_reservation_dir)"; f="$dir/$marker"
   [ -f "$f" ] && [ ! -L "$f" ] || return 1
   pg_reservation_guard_acquire || return 1
@@ -1393,9 +1420,13 @@ pg_reservation_supersede() {
   bh="$(jq -r .repository.host <<<"$binding")"; bo="$(jq -r .repository.owner <<<"$binding")"
   br="$(jq -r .repository.repo <<<"$binding")"; bpr="$(jq -r .target.pr <<<"$binding")"
   bepoch="$(jq -r .charged_spend_epoch <<<"$binding")"
+  bhead="$(jq -r '.target.head_oid // ""' <<<"$binding")"
+  # #134: the head is part of the compare-and-swap, not just the caller's private reasoning. The
+  # binding under this guard must still carry the exact head the caller validated against GitHub.
   if [ "$mkey" != "$key" ] || [ "$mspend" != "$expected_spend" ] \
      || [ "$bh" != "$mh" ] || [ "$bo" != "$mo" ] || [ "$br" != "$mr" ] \
-     || [ "$bpr" != "$mpr" ] || [ "$bepoch" != "$mspend" ]; then
+     || [ "$bpr" != "$mpr" ] || [ "$bepoch" != "$mspend" ] \
+     || [ "$bhead" != "$expected_head" ]; then
     pg_reservation_guard_release; return 1
   fi
 

@@ -50,31 +50,43 @@ proof.
 ### Resolve one canonical attempt before choosing an action
 
 `pg_attempt_snapshot` gives every caller the same precedence over dispositions, durable artifacts,
-active state, reservations, and run metadata (`lib/pro-gate-lib.sh:929-1069`). A newer distinct
+active state, reservations, and run metadata (`lib/pro-gate-lib.sh:944-1084`). A newer distinct
 attempt can outrank old proof; stale mutable sidecars from the same superseded attempt cannot.
 Callers must not recreate this precedence from status prose.
 
 `review-decision/v1` is a pure continuation policy over normalized facts. Its contract explicitly
-excludes filesystem, lock, browser, round, and publication work (`lib/pro-gate-lib.sh:2445-2453`),
-and the reducer implements that policy at `lib/pro-gate-lib.sh:2585-2774`. The skill,
+excludes filesystem, lock, browser, round, and publication work (`lib/pro-gate-lib.sh:2476-2484`),
+and the reducer implements that policy at `lib/pro-gate-lib.sh:2616-2805`. The skill,
 relay, and daemon dispatch its typed action and re-resolve at the effect boundary; they do not infer a
 continuation from a `VERDICT`, exit code, recoverability flag, or round count.
 
 ### Make capacity a query over proof-backed attempt state
 
 A durable reservation can exist without consuming capacity. Completed and superseded reservations
-are excluded by `pg_reservation_holding_count` (`lib/pro-gate-lib.sh:1462-1471`). This avoids a second
+are excluded by `pg_reservation_holding_count` (`lib/pro-gate-lib.sh:1493-1502`). This avoids a second
 manually synchronized “active count.”
 
 Supersession is monotonic. The transition rechecks the exact marker, canonical key, charged epoch,
-and legacy proof under the reservation lock before writing the canonical record
-(`lib/pro-gate-lib.sh:1376-1422`). It preserves the charge and audit/recovery pointers while releasing
-capacity and current applicability. It is not a refund and does not accept review bytes.
+legacy proof, **and the head OID the caller validated against GitHub** under the reservation lock
+before writing the canonical record (`lib/pro-gate-lib.sh:1399-1453`). It preserves the charge and
+audit/recovery pointers while releasing capacity and current applicability. It is not a refund and
+does not accept review bytes.
+
+The head belongs in that list for the same reason the others do (#134). The decision is taken in
+`recover_superseded_reason` against a binding read before the GitHub query; without the head in the
+compare-and-swap, the commit could land against a *different* binding substituted afterwards —
+reachable because `pg_attempt_disposition_cleanup` unlinked the binding outside the guard, and
+bindings are otherwise write-once. The failure it prevents is releasing a slot still held by
+current-head work. Review of that change found no current production caller that writes a binding
+for a marker which already exists (every run mints a fresh marker), so the head clause is defense in
+depth for that invariant rather than a fix for an observed release. Note what the control is: a
+serialization guarantee between cooperating callers, not an authorization boundary. `flock` is advisory, so a process writing `$PRO_GATE_HOME` directly
+bypasses this API entirely — that trust boundary is the single-user-owned state directory, unchanged.
 
 Terminal dispositions are also proof records, not guesses. Their immutable payload binds repository,
 target, marker, round key, charged epoch, terminal kind, and proof kind
-(`lib/pro-gate-lib.sh:713-745`). Only positively proven non-submission can remove the recorded round;
-post-submission terminal outcomes retain the charge (`lib/pro-gate-lib.sh:849-865`).
+(`lib/pro-gate-lib.sh:713-746`). Only positively proven non-submission can remove the recorded round;
+post-submission terminal outcomes retain the charge (`lib/pro-gate-lib.sh:849-881`).
 
 ### Recover the exact attempt; never “try again” as diagnosis
 
@@ -92,7 +104,7 @@ reservation lock before filling the proven charge.
 ### Treat local round history as advisory, not quota
 
 By default, `pg_round_policy_mode` returns `advisory` unless an operator explicitly configures an
-enforced cap or lockdown (`lib/pro-gate-lib.sh:2112-2128`). History and convergence signals remain
+enforced cap or lockdown (`lib/pro-gate-lib.sh:2143-2159`). History and convergence signals remain
 useful diagnostics, but they do not impersonate ChatGPT subscription allowance or block changed,
 proven evidence.
 

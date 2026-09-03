@@ -688,8 +688,10 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
     payload="$("$timeout_bin" -k 1s 10s "$gh_bin" pr view "$pr" --repo "$host/$owner/$repo" --json state,headRefOid 2>/dev/null || true)"
     state="$(jq -r '.state // ""' <<<"$payload" 2>/dev/null)"
     current_head="$(jq -r '.headRefOid // ""' <<<"$payload" 2>/dev/null)"
+    # #134: every branch emits the bound head it validated against, so the caller can require the
+    # compare-and-swap to commit against that exact binding rather than whatever is on disk later.
     case "$state" in
-      MERGED|CLOSED) printf 'pr-%s\n' "$(printf '%s' "$state" | tr '[:upper:]' '[:lower:]')"; return 0;;
+      MERGED|CLOSED) printf 'pr-%s:%s\n' "$(printf '%s' "$state" | tr '[:upper:]' '[:lower:]')" "$bound_head"; return 0;;
       OPEN) ;;
       *) return 1;;
     esac
@@ -698,6 +700,9 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
     [ "$current_head" = "$bound_head" ] && return 1
     printf 'head-moved:%s:%s\n' "$bound_head" "$current_head"
   }
+  # Extract the validated bound head from any proof shape: pr-merged:<head>, pr-closed:<head>,
+  # head-moved:<bound>:<current>. Field 2 is the bound head in all three.
+  recover_superseded_head() { printf '%s' "${1#*:}" | cut -d: -f1; }
   REC_SELECTED=""; REC_SELECTED_OUT=""; REC_QUERY_NUM=""; REC_HOST=""; REC_OWNER=""; REC_REPO_NAME=""
   case "$RECOVER_QUERY" in
     pg-run-*)
@@ -896,7 +901,11 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
   if [ -n "$REC_SUPERSEDED_PROOF" ]; then
     REC_SUPERSEDED_META="$(pg_run_meta_read "$REC_SELECTED" 2>/dev/null || true)"
     IFS=$'\t' read -r _ _ _ REC_SUPERSEDED_KEY _ _ REC_SUPERSEDED_SPEND <<<"$REC_SUPERSEDED_META"
+    # #134: commit the transition against the exact binding GitHub was queried about, not whatever
+    # binding is on disk by the time the guard is taken.
+    REC_SUPERSEDED_HEAD="$(recover_superseded_head "$REC_SUPERSEDED_PROOF")"
     pg_reservation_supersede "$REC_SELECTED" "$REC_SUPERSEDED_KEY" "$REC_SUPERSEDED_SPEND" \
+      "$REC_SUPERSEDED_HEAD" \
       || { echo "Browser needs attention" >&2; exit 3; }
     REC_SUPERSEDED_EVENT="$(jq -nc --arg ts "$(date +%Y-%m-%dT%H:%M:%S%z)" \
       --arg marker "$REC_SELECTED" --arg proof "$REC_SUPERSEDED_PROOF" \
