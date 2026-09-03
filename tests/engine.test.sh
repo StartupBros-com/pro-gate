@@ -5046,7 +5046,7 @@ check 'exact recovery atomically canonicalizes and supersedes a legacy diff rese
      && [ ! -s "$TDIR/recover-oracle-sentinel" ]; echo $?)" \
   "rc=$RC state=$(cat "$SUPER_HEAD_HOME/in-progress/$SUPER_HEAD_MARKER") stderr=$(cat "$TDIR/super.stderr")"
 SUPER_LEGACY_RECORD="$(cat "$SUPER_HEAD_HOME/in-progress/$SUPER_HEAD_MARKER")"
-PRO_GATE_HOME="$SUPER_HEAD_HOME" pg_reservation_supersede "$SUPER_HEAD_MARKER" "$SUPER_KEY" 1700014100
+PRO_GATE_HOME="$SUPER_HEAD_HOME" pg_reservation_supersede "$SUPER_HEAD_MARKER" "$SUPER_KEY" 1700014100 "$FRESH_BASE"
 SUPER_REPLAY_RC=$?
 check 'canonical supersession replay returns success and is byte-idempotent' \
   "$([ "$SUPER_REPLAY_RC" -eq 0 ] \
@@ -5115,9 +5115,12 @@ for SUPER_TERMINAL_STATE in MERGED CLOSED; do
   SUPER_TERM_MARKER="pg-run-acme-fresh-77-1700014101-${SUPER_TERMINAL_STATE:0:1}"
   super_seed "$SUPER_TERM_HOME" "$SUPER_TERM_MARKER" 1700014101 "$FRESH_BASE"
   super_recover "$SUPER_TERM_HOME" "$SUPER_TERM_MARKER" ok "$SUPER_TERMINAL_STATE" "$FRESH_BASE"
+  # #134: the proof now carries the bound head the caller validated against GitHub, so the ledger
+  # records WHICH head was superseded and the caller has a head to feed the compare-and-swap.
+  # Asserting the fuller string keeps this check strictly stronger than before.
   check "GitHub $SUPER_TERMINAL_STATE proof supersedes a same-head review" \
     "$([ "$RC" -eq 6 ] && [ "$(awk -F'\t' 'NR==1{print $8}' "$SUPER_TERM_HOME/in-progress/$SUPER_TERM_MARKER")" = superseded ] \
-       && jq -e --arg proof "pr-${SUPER_TERMINAL_STATE,,}" 'select(.proof==$proof)' "$SUPER_TERM_HOME/ledger.jsonl" >/dev/null 2>&1; echo $?)" \
+       && jq -e --arg proof "pr-${SUPER_TERMINAL_STATE,,}:$FRESH_BASE" 'select(.proof==$proof)' "$SUPER_TERM_HOME/ledger.jsonl" >/dev/null 2>&1; echo $?)" \
     "rc=$RC state=$(cat "$SUPER_TERM_HOME/in-progress/$SUPER_TERM_MARKER") ledger=$(cat "$SUPER_TERM_HOME/ledger.jsonl" 2>/dev/null)"
 done
 
@@ -5228,11 +5231,24 @@ super_locked_reject() { # scenario suffix
     repo) super_replace_binding "$home" "$marker" '.repository.repo="other"' ;;
     pr) super_replace_binding "$home" "$marker" '.target.pr=78' ;;
     binding-charge) super_replace_binding "$home" "$marker" ".charged_spend_epoch=$(( epoch + 1 ))" ;;
+    # #134 planted negative: the caller validated $FRESH_BASE against GitHub, then the binding was
+    # removed and rewritten pointing at a different head (reachable because
+    # pg_attempt_disposition_cleanup unlinked bindings outside the reservation guard). Every other
+    # field still matches, so this passes the pre-#134 comparison and wrongly supersedes
+    # current-head work. The transition must refuse.
+    # The evidence proof's own oid must equal .target.head_oid (pg_review_input_binding_validate),
+    # so a naive target-only tamper yields an INVALID binding and would be rejected for being
+    # unreadable rather than for the head — proving nothing. Rewrite both so the binding stays
+    # fully valid and differs from the caller's validated head in exactly one dimension.
+    head) super_replace_binding "$home" "$marker" \
+      '.target.head_oid="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+       | (if (.evidence.proof|has("head_oid")) then .evidence.proof.head_oid="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" else . end)
+       | (if (.evidence.proof|has("end_oid")) then .evidence.proof.end_oid="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" else . end)' ;;
   esac
   binding="$(PRO_GATE_HOME="$home" pg_review_input_binding_read "$marker" 2>/dev/null || true)"
   meta="$(PRO_GATE_HOME="$home" pg_run_meta_read "$marker" 2>/dev/null || true)"
   before="$(cat "$home/in-progress/$marker")"
-  PRO_GATE_HOME="$home" pg_reservation_supersede "$marker" "$call_key" "$call_spend"
+  PRO_GATE_HOME="$home" pg_reservation_supersede "$marker" "$call_key" "$call_spend" "$FRESH_BASE"
   rc=$?
   check "locked supersession rejects $scenario mismatch with valid sidecars" \
     "$([ "$rc" -ne 0 ] && [ -n "$binding" ] && [ -n "$meta" ] \
@@ -5240,7 +5256,7 @@ super_locked_reject() { # scenario suffix
     "rc=$rc binding=$binding meta=$meta before=$before after=$(cat "$home/in-progress/$marker")"
 }
 SUPER_ATOMIC_N=0
-for SUPER_ATOMIC_CASE in key expected-spend host owner repo pr binding-charge; do
+for SUPER_ATOMIC_CASE in key expected-spend host owner repo pr binding-charge head; do
   SUPER_ATOMIC_N=$(( SUPER_ATOMIC_N + 1 ))
   super_locked_reject "$SUPER_ATOMIC_CASE" "$SUPER_ATOMIC_N"
 done
