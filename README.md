@@ -242,12 +242,29 @@ oracle-review.sh --diff <patchfile> --repo <dir> [--pr <n>] ...   # review a loc
                                                                   # too so budget/locks stay the PR's
 oracle-review.sh --confirm <prior-review-file> ...                # confirming pass: verify every prior
                                                                   # P0/P1 RESOLVED or STILL-PRESENT first
+oracle-review.sh --brief <task-file> --diff <patch> --repo <dir>  # custom task body: spend the slot on an
+                                                                  # analysis other than the default review
 oracle-review.sh --recover <PR|URL|marker> [--repo <dir>] [--out <file>] [--timeout <dur>]
                                                                   # recover an existing run only; no fresh slot
 oracle-review.sh --harvest <run-marker> --out <file>              # expert/degradation collection of an exit-9 run
 oracle-review.sh --status [<pr|url|marker>] [--json]              # expert diagnostics: read-only rediscovery,
                                                                   # machine-readable with --json
 ```
+
+`--brief` replaces the built-in reviewer persona with a task body you supply, so a Pro slot can be
+spent on an analysis the engine does not otherwise ship — an architecture critique, a migration-risk
+read, a security-only deep dive. It composes with an existing target (`--diff` or `--pr`) rather than
+adding a target-less lane, because reservations, the round budget, and supersession are all keyed on
+the change identity.
+
+A brief chooses the **question**, never the answer's shape. The engine always appends its own
+contract footer — the findings format, the terminal `VERDICT:` line, and the run marker — because the
+return path is review-shaped end to end: a capture is accepted only when it carries a `[Pn]` marker
+and one of `SHIP | FIX-FIRST | NEEDS-DISCUSSION`, and the collector bounds its extraction at the
+verdict line. A brief that could suppress that footer would leave a conversation that never reaches a
+terminal state and holds its slot until recovery. So a brief inherits a severity-ranked-analysis
+contract: findings as `[P0]`–`[P3]`, and a verdict that reads as no-blockers / fix-these-first /
+needs-a-decision. Briefs are capped at 64 KiB; attach bulk context with `--extra-files`.
 
 `recover` accepts exactly one decimal PR number, canonical PR URL, or exact `pg-run-...` marker.
 It selects an exact marker directly; a repository-qualified URL or PR number with canonical

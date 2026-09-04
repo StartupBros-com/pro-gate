@@ -12,7 +12,7 @@
 # Usage:
 #   oracle-review.sh --pr <url|number> [--repo <dir>] [--input both|bundle|connector]
 #                    [--out <file>] [--timeout <dur>] [--extra-files <glob>]
-#                    [--confirm <prior-review-file>]
+#                    [--confirm <prior-review-file>] [--brief <task-file>]
 #   oracle-review.sh --diff <patchfile> --repo <dir> [--out <file>] ...
 #       Pass --pr TOGETHER with --diff when the diff belongs to a PR: the change identity
 #       (round budget, per-change lock, reservations) stays the PR's instead of forking into
@@ -21,6 +21,18 @@
 #       Confirming pass (v0.22): attaches the prior review and instructs the model to verify
 #       EVERY prior P0/P1 as RESOLVED or STILL-PRESENT before reporting new findings. A
 #       budget-accounted engine run like any other.
+#   oracle-review.sh --brief <task-file> --diff <patchfile> --repo <dir> ...
+#       Custom task body (v0.39): replaces the built-in reviewer persona with <task-file>, so
+#       the Pro slot can be spent on an analysis this engine does not otherwise ship — an
+#       architecture critique, a migration-risk read, a security-only deep dive. It composes
+#       with an existing target (--diff or --pr); it does not add a target-less lane, because
+#       reservations, the round budget, and supersession are all keyed on the change identity.
+#       The brief chooses the QUESTION only. The engine always appends its own contract footer
+#       (findings format, terminal VERDICT line, run marker), because the return path is
+#       review-shaped end to end: a capture is accepted only when it carries a [Pn] marker and
+#       one of SHIP|FIX-FIRST|NEEDS-DISCUSSION. So a brief inherits a severity-ranked-analysis
+#       contract: findings as [P0]..[P3], and a verdict that reads as no-blockers /
+#       fix-these-first / needs-a-decision. Max 65536 bytes; use --extra-files for bulk context.
 #   oracle-review.sh --harvest <run-marker> --out <file> [--timeout <dur>]
 #       Collect a review whose run ended in-progress (exit 9): the Pro slot was spent but the
 #       model was still generating when the salvage budget ran out. No new slot is spent.
@@ -109,7 +121,7 @@ pg_out_guard_acquire() {
   return 0
 }
 
-PR=""; REPO=""; DIFF_FILE=""; DIFF_IS_CALLER_SUPPLIED=0; INPUT=""; INPUT_SUPPLIED=0; OUT=""; TIMEOUT="30m"; EXTRA_GLOB=""; HARVEST_MARKER=""; HARVEST_REQUESTED=0; CONFIRM_FILE=""
+PR=""; REPO=""; DIFF_FILE=""; DIFF_IS_CALLER_SUPPLIED=0; INPUT=""; INPUT_SUPPLIED=0; OUT=""; TIMEOUT="30m"; EXTRA_GLOB=""; HARVEST_MARKER=""; HARVEST_REQUESTED=0; CONFIRM_FILE=""; BRIEF_FILE=""
 STATUS_REQUESTED=0; STATUS_QUERY=""; AS_JSON=0; RECOVER_REQUESTED=0; RECOVER_QUERY=""
 REVIEW_DECISION_REQUESTED=0; REVIEW_DECISION_EFFECT_FILE=""; REVIEW_CHOICE_SELECTION_FILE=""
 while [ $# -gt 0 ]; do
@@ -123,7 +135,7 @@ while [ $# -gt 0 ]; do
   # symptoms with a clean usage error. --status is excluded: its second argument is deliberately
   # optional (its own branch below already handles "missing").
   case "$1" in
-    --pr|--repo|--diff|--input|--out|--timeout|--extra-files|--confirm|--harvest|--recover|--review-decision-effect|--review-choice-selection)
+    --pr|--repo|--diff|--input|--out|--timeout|--extra-files|--confirm|--brief|--harvest|--recover|--review-decision-effect|--review-choice-selection)
       [ $# -ge 2 ] || { echo "ERROR: $1 requires a value" >&2; exit 2; };;
   esac
   case "$1" in
@@ -135,6 +147,7 @@ while [ $# -gt 0 ]; do
     --timeout) TIMEOUT="$2"; shift 2;;
     --extra-files) EXTRA_GLOB="$2"; shift 2;;
     --confirm) CONFIRM_FILE="$2"; shift 2;;
+    --brief) BRIEF_FILE="$2"; shift 2;;
     --harvest) HARVEST_REQUESTED=1; HARVEST_MARKER="${2:-}"; shift 2;;
     --recover) RECOVER_REQUESTED=1; RECOVER_QUERY="${2:-}"; shift 2;;
     --review-decision) REVIEW_DECISION_REQUESTED=1; shift;;
@@ -160,6 +173,32 @@ fi
 if [ "$INPUT_SUPPLIED" = 1 ] && { [ "$STATUS_REQUESTED" = 1 ] || [ "$RECOVER_REQUESTED" = 1 ] || [ "$HARVEST_REQUESTED" = 1 ]; }; then
   echo "ERROR: --input applies only to review queries and fresh reviews, not status/recover/harvest" >&2
   exit 2
+fi
+# --brief swaps the engine's default reviewer persona for a caller-supplied task body. Like
+# --input it is a fresh-review-only concern: a lifecycle command replays an existing run's
+# stored prompt, so accepting a brief there would silently do nothing.
+if [ -n "$BRIEF_FILE" ] && { [ "$STATUS_REQUESTED" = 1 ] || [ "$RECOVER_REQUESTED" = 1 ] || [ "$HARVEST_REQUESTED" = 1 ]; }; then
+  echo "ERROR: --brief applies only to fresh reviews, not status/recover/harvest" >&2
+  exit 2
+fi
+# Validate the brief before any state, lock, reservation, or browser work: every failure below
+# would otherwise surface only after a Pro slot had been committed.
+if [ -n "$BRIEF_FILE" ]; then
+  if [ ! -f "$BRIEF_FILE" ]; then
+    echo "ERROR: --brief file not found: $BRIEF_FILE" >&2
+    exit 2
+  fi
+  if [ ! -s "$BRIEF_FILE" ]; then
+    echo "ERROR: --brief file is empty: $BRIEF_FILE" >&2
+    exit 2
+  fi
+  # The brief is pasted into the prompt as one block. An oversized file does not fail cleanly —
+  # it wedges the submission after the slot is spent, so cap it here where the cost is zero.
+  BRIEF_BYTES="$(wc -c < "$BRIEF_FILE" 2>/dev/null || echo 0)"
+  if [ "$BRIEF_BYTES" -gt 65536 ]; then
+    echo "ERROR: --brief file is ${BRIEF_BYTES} bytes; the limit is 65536. Attach bulk context with --extra-files instead." >&2
+    exit 2
+  fi
 fi
 if [ "$STATUS_REQUESTED" != 1 ] && [ "$RECOVER_REQUESTED" != 1 ] && [ "$HARVEST_REQUESTED" != 1 ]; then
   case "${PRO_GATE_INPUT_POLICY:-bundle-only}" in
@@ -2903,6 +2942,18 @@ ORACLE_LOG_PROOFS=()
 
 EOF
   fi
+  # --brief substitutes the TASK BODY only. Everything after this block — the findings format,
+  # the terminal VERDICT line, and the run marker — is engine-appended and never caller-
+  # controlled, because the entire return path is review-shaped: pg_is_review accepts a capture
+  # only if it carries a [Pn] marker AND one of exactly three verdict tokens, and cdp-salvage
+  # bounds its extraction at the VERDICT line. A brief able to suppress that footer would leave
+  # a conversation that never reaches terminal state and pins its reservation until recovery —
+  # the #131/#109 zombie shape. So a brief chooses the QUESTION, never the answer's shape, and
+  # inherits a severity-ranked-analysis contract.
+  if [ -n "$BRIEF_FILE" ]; then
+    cat "$BRIEF_FILE"
+    echo
+  else
   cat <<EOF
 You are the FINAL, highest-tier code reviewer for a pull request that has ALREADY been through automated review tiers (Claude correctness/security/maintainability personas and a cloud bug+security scan) and their fixes have been applied. The cheap, obvious issues are already gone.
 
@@ -2919,6 +2970,7 @@ Be skeptical, specific, and concrete. Prefer a few HIGH-CONFIDENCE real defects 
 Cite a concrete <file>:<line> for EVERY finding — if you cannot point to a specific changed line, do not raise it.
 Do NOT flag: style/formatting/naming; anything CI, linters, or type-checkers already enforce; generated files or lockfiles; pre-existing issues unrelated to this change; or speculative/theoretical problems with no demonstrated impact path.
 EOF
+  fi
   if [ "$INPUT" = "bundle" ] || [ "$INPUT" = "both" ]; then
     cat <<EOF
 
