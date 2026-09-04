@@ -24,15 +24,18 @@
 #   oracle-review.sh --brief <task-file> --diff <patchfile> --repo <dir> ...
 #       Custom task body (v0.39): replaces the built-in reviewer persona with <task-file>, so
 #       the Pro slot can be spent on an analysis this engine does not otherwise ship — an
-#       architecture critique, a migration-risk read, a security-only deep dive. It composes
-#       with an existing target (--diff or --pr); it does not add a target-less lane, because
-#       reservations, the round budget, and supersession are all keyed on the change identity.
-#       The brief chooses the QUESTION only. The engine always appends its own contract footer
-#       (findings format, terminal VERDICT line, run marker), because the return path is
-#       review-shaped end to end: a capture is accepted only when it carries a [Pn] marker and
-#       one of SHIP|FIX-FIRST|NEEDS-DISCUSSION. So a brief inherits a severity-ranked-analysis
-#       contract: findings as [P0]..[P3], and a verdict that reads as no-blockers /
-#       fix-these-first / needs-a-decision. Max 65536 bytes; use --extra-files for bulk context.
+#       architecture critique, a migration-risk read, a security-only deep dive. Requires
+#       --diff and is REFUSED with --pr: round budget, the per-change guard, supersession and
+#       recovery are all keyed on change identity, so a brief sharing a PR's identity could
+#       spend that PR's rounds and be handed back by --recover in place of the real review.
+#       The engine appends its own contract footer (findings format, terminal VERDICT line,
+#       run marker), so a brief inherits a severity-ranked-analysis contract: findings as
+#       [P0]..[P3], and a verdict reading as no-blockers / fix-these-first / needs-a-decision.
+#       That footer is COOPERATIVE, not enforced — brief text and footer carry equal authority,
+#       so a brief can preselect a verdict. Safe only because briefs are operator-authored and
+#       no typed decision path consumes them; do not expose --brief through the skill or relay.
+#       Max 65536 bytes; use --extra-files for bulk context. Note a --diff-only run cannot write
+#       run-meta (pg_run_meta_write requires a PR number), so --recover on it is degraded.
 #   oracle-review.sh --harvest <run-marker> --out <file> [--timeout <dur>]
 #       Collect a review whose run ended in-progress (exit 9): the Pro slot was spent but the
 #       model was still generating when the salvage budget ran out. No new slot is spent.
@@ -179,6 +182,17 @@ fi
 # stored prompt, so accepting a brief there would silently do nothing.
 if [ -n "$BRIEF_FILE" ] && { [ "$STATUS_REQUESTED" = 1 ] || [ "$RECOVER_REQUESTED" = 1 ] || [ "$HARVEST_REQUESTED" = 1 ]; }; then
   echo "ERROR: --brief applies only to fresh reviews, not status/recover/harvest" >&2
+  exit 2
+fi
+# Round budget, the per-change guard, supersession and recovery are ALL keyed on change identity.
+# A brief passed together with --pr would therefore occupy that PR's identity: it would spend the
+# PR's round budget, serialize against the real review, share supersession state, and could be
+# handed back by `--recover <PR>` in place of the canonical review. An analysis task and the merge
+# gate are different questions and must not share that state, so the combination is refused rather
+# than merely discouraged (#138 finding 3). Brief runs therefore always take a diff-derived
+# identity of their own.
+if [ -n "$BRIEF_FILE" ] && [ -n "$PR" ]; then
+  echo "ERROR: --brief cannot be combined with --pr: a brief would occupy that PR's change identity (round budget, per-change lock, supersession, recovery). Run the brief against --diff alone so it gets its own identity." >&2
   exit 2
 fi
 # Validate the brief before any state, lock, reservation, or browser work: every failure below
@@ -2942,16 +2956,37 @@ ORACLE_LOG_PROOFS=()
 
 EOF
   fi
-  # --brief substitutes the TASK BODY only. Everything after this block — the findings format,
-  # the terminal VERDICT line, and the run marker — is engine-appended and never caller-
-  # controlled, because the entire return path is review-shaped: pg_is_review accepts a capture
-  # only if it carries a [Pn] marker AND one of exactly three verdict tokens, and cdp-salvage
-  # bounds its extraction at the VERDICT line. A brief able to suppress that footer would leave
-  # a conversation that never reaches terminal state and pins its reservation until recovery —
-  # the #131/#109 zombie shape. So a brief chooses the QUESTION, never the answer's shape, and
-  # inherits a severity-ranked-analysis contract.
+  # --brief substitutes the TASK BODY only; the engine always APPENDS its contract footer (the
+  # findings format, the terminal VERDICT line, the run marker) below. That matters because the
+  # return path is review-shaped: pg_is_review accepts a capture only if it carries a [Pn] marker
+  # AND one of exactly three verdict tokens, and cdp-salvage bounds extraction at the VERDICT
+  # line, so an answer without the footer's shape is discarded and its reservation held until
+  # recovery — the #131/#109 zombie shape.
+  #
+  # Be precise about what appending buys: the footer is a COOPERATIVE contract, not an enforced
+  # one. The brief and the footer are instructions at the same authority level, so a brief can
+  # request an incompatible format, tell the model to disregard what follows, or preselect a
+  # verdict — pg_extract_verdict only greps the terminal line and cannot tell a reasoned verdict
+  # from a dictated one (#138 finding 1; an earlier comment here wrongly claimed a brief could
+  # "never" control the answer's shape). What actually makes that safe today is narrower: no
+  # untrusted party supplies briefs, and no typed decision path consumes a brief run's verdict,
+  # because --brief is deliberately NOT exposed through the skill or the relay agent. Treat that
+  # non-exposure as a security boundary, not a scoping preference: wiring --brief into a surface
+  # that feeds review-decision/v1 would make a caller-authored SHIP verdict reachable.
   if [ -n "$BRIEF_FILE" ]; then
     cat "$BRIEF_FILE"
+    # Engine-owned, and deliberately AFTER the brief so a cooperative brief cannot drop it. The
+    # 64 KiB cap validates a brief's size, not its answerability: a brief that invites a
+    # clarifying question yields a completed turn carrying no findings and no verdict, which
+    # fails pg_is_review, is discarded, and drives retry while the reservation stays held until
+    # recovery. Ordinary ambiguity would otherwise become a shared-capacity denial path
+    # (found by the v0.39.0 pre-release live run, #138 finding 2).
+    cat <<'EOF'
+
+This run has exactly one turn and must end in the format below. Answer the task above using only
+the material provided. If something is ambiguous or missing, state your assumption explicitly and
+continue — do NOT ask a clarifying question, and do not defer or postpone the answer.
+EOF
     echo
   else
   cat <<EOF
