@@ -2085,6 +2085,14 @@ check 'brief keeps the closed verdict vocabulary' \
   'verdict vocabulary lost under --brief'
 check 'brief keeps the run-marker provenance footer' \
   "$(grep -qF 'run marker:' "$TDIR/argv-brief.txt"; echo $?)" 'run marker lost under --brief'
+# A brief spends a real Pro slot, so it is budget-accounted like any other run: pg_round_guard is
+# charged on the dispatch path, well before the prompt is assembled, so --brief cannot influence
+# it. Pinned here rather than left to prose because it has a consequence — a brief composed onto a
+# --pr target spends THAT PR's per-change round budget and feeds its trajectory governor. Callers
+# who want an analysis to keep its own budget pass --diff without --pr, forking the identity.
+check 'brief run is budget-accounted (spends a round on the change identity)' \
+  "$([ -f "$RHOME/rounds/$(printf '%s-104' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')" ]; echo $?)" \
+  "rounds dir: $(ls "$RHOME/rounds" 2>/dev/null)"
 # Every --brief rejection must land BEFORE a slot is committed, so each is an exit-2 usage error.
 run_engine --brief /nonexistent-brief.md --pr 102 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$RHOME/o-bbad.md" --timeout 5s
 check 'missing --brief file is a usage error (exit 2)' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC"
