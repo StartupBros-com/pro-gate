@@ -624,6 +624,9 @@ check 'slotted reservation untouched by foreign run' "$([ -f "$TDIR/home3/in-pro
 SLOTS2_ROW="$(grep -F "\"out\":\"$TDIR/o-slots2.md\"" "$TDIR/home3/ledger.jsonl" | tail -1)"
 check 'happy-path ledger row is valid JSON' "$(printf '%s' "$SLOTS2_ROW" | jq empty >/dev/null 2>&1; echo $?)" "$SLOTS2_ROW"
 check 'happy-path ledger row carries pre_slot_secs + post_slot_secs' "$(printf '%s' "$SLOTS2_ROW" | jq -e 'has("pre_slot_secs") and has("post_slot_secs") and has("secs")' >/dev/null 2>&1; echo $?)" "$SLOTS2_ROW"
+# #143: a clean row carries reason/detail as EMPTY strings — present, never absent, never populated.
+check '#143 clean ledger row carries empty reason and detail (present, not absent)' \
+  "$(printf '%s' "$SLOTS2_ROW" | jq -e 'has("reason") and has("detail") and .reason == "" and .detail == ""' >/dev/null 2>&1; echo $?)" "$SLOTS2_ROW"
 check 'happy-path pre_slot_secs + post_slot_secs equals secs' "$([ "$(printf '%s' "$SLOTS2_ROW" | jq -r '(.pre_slot_secs // "MISSING") as $q | (.post_slot_secs // "MISSING") as $r | if ($q == "MISSING" or $r == "MISSING") then "MISSING" else ($q + $r) end')" = "$(printf '%s' "$SLOTS2_ROW" | jq -r .secs)" ]; echo $?)" "$SLOTS2_ROW"
 rm -rf "$TDIR/home3"
 
@@ -1299,6 +1302,12 @@ env PRO_GATE_HOME="$RHOME" ORACLE_HOME_DIR="$RHOME/oracle-dead" ORACLE_BROWSER_P
 RC=$?
 check 'never-landed run fails (exit 6)' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
 check 'never-landed run announces the refund' "$(grep -q 'refunding this round' "$TDIR/stderr"; echo $?)" "$(tail -5 "$TDIR/stderr")"
+# #143: the ledger row must say WHY it failed, from a closed enum, and carry the status detail.
+REFUND_ROW="$(grep -F "\"out\":\"$RHOME/o-refund.md\"" "$RHOME/ledger.jsonl" | tail -1)"
+check '#143 never-landed ledger row carries reason=refunded-unsubmitted' \
+  "$([ "$(printf '%s' "$REFUND_ROW" | jq -r '.reason // "MISSING"')" = refunded-unsubmitted ]; echo $?)" "$REFUND_ROW"
+check '#143 never-landed ledger row carries the status detail verbatim' \
+  "$(printf '%s' "$REFUND_ROW" | jq -e '.detail | test("round refunded")' >/dev/null 2>&1; echo $?)" "$REFUND_ROW"
 check 'never-landed round is refunded (no in-window spend remains)' \
   "$([ ! -s "$RHOME/rounds/$RKEY_91" ]; echo $?)" "rounds: $(cat "$RHOME/rounds/$RKEY_91" 2>/dev/null)"
 check 'refund is named in the status detail' "$(grep -q 'round refunded' "$RHOME/o-refund.md.status"; echo $?)" "$(cat "$RHOME/o-refund.md.status" 2>/dev/null)"
@@ -1320,6 +1329,13 @@ env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO
   >"$TDIR/stdout" 2>"$TDIR/stderr"
 RC=$?
 check 'landed-but-lost run fails (exit 6)' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+# #143: same exit code as the never-landed run above, DIFFERENT reason — this is the whole point.
+LANDED_ROW="$(grep -F "\"out\":\"$RHOME/o-landed.md\"" "$RHOME/ledger.jsonl" | tail -1)"
+check '#143 landed-but-lost ledger row carries reason=salvage-empty (not the refund reason)' \
+  "$([ "$(printf '%s' "$LANDED_ROW" | jq -r '.reason // "MISSING"')" = salvage-empty ]; echo $?)" "$LANDED_ROW"
+check '#143 two exit-6 rows with different fates carry different reasons' \
+  "$([ "$(printf '%s' "$REFUND_ROW" | jq -r .reason)" != "$(printf '%s' "$LANDED_ROW" | jq -r .reason)" ]; echo $?)" \
+  "refund=$(printf '%s' "$REFUND_ROW" | jq -r .reason) landed=$(printf '%s' "$LANDED_ROW" | jq -r .reason)"
 check 'landed-but-lost run does NOT announce a refund' "$(grep -qv 'refunding this round' "$TDIR/stderr" && ! grep -q 'refunding this round' "$TDIR/stderr"; echo $?)" "$(tail -5 "$TDIR/stderr")"
 check 'landed-but-lost round STAYS charged' \
   "$([ -s "$RHOME/rounds/$RKEY_92" ]; echo $?)" "rounds: $(cat "$RHOME/rounds/$RKEY_92" 2>/dev/null)"
@@ -2157,6 +2173,11 @@ env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO
   >"$TDIR/stdout" 2>"$TDIR/stderr"
 RC=$?
 check 'cloudflare run fails without a usable review' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+# #143: cloudflare keeps its own `outcome`, so the reason field stays empty — reason is
+# failed-only by construction, and this proves a non-`failed` exit-6 row does not get one.
+CF_ROW="$(grep -F "\"out\":\"$RHOME/o-cf.md\"" "$RHOME/ledger.jsonl" | tail -1)"
+check '#143 cloudflare row keeps outcome=cloudflare with an empty reason' \
+  "$([ "$(printf '%s' "$CF_ROW" | jq -r .outcome)" = cloudflare ] && [ "$(printf '%s' "$CF_ROW" | jq -r '.reason // "MISSING"')" = "" ]; echo $?)" "$CF_ROW"
 check 'cloudflare writes the account cooldown' "$([ -f "$RHOME/throttle.cooldown" ]; echo $?)" 'no cooldown file'
 check 'cloudflare refunds the round (no spend, no budget charge)' "$([ ! -f "$RHOME/rounds/$RKEY_103" ]; echo $?)" "rounds file: $(cat "$RHOME/rounds/$RKEY_103" 2>/dev/null)"
 CF_META_MATCHES="$(PRO_GATE_HOME="$RHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_run_meta_scan" \
