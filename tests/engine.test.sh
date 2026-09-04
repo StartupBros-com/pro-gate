@@ -2064,11 +2064,17 @@ echo '# v0.39: --brief custom task body with engine-owned contract footer'
 printf 'UNIQUE_BRIEF_BODY_MARKER\nYou are a database migration risk analyst. Assess rollback safety and lock duration.\n' > "$TDIR/brief-src.md"
 : > "$TDIR/argv-brief.txt"
 printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+# --brief is diff-only by construction (it is refused with --pr, see below), so the round it
+# spends lands on a diff-derived identity. A round is an APPENDED EPOCH LINE in a per-key file,
+# so count lines across the rounds dir, not files: an earlier test in this same home already
+# created the file for this diff identity, and a file-count assertion reported no change while
+# the round was in fact charged.
+BRIEF_ROUNDS_BEFORE="$(cat "$RHOME"/rounds/* 2>/dev/null | wc -l)"
 env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
   PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
   PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-evidence" PG_TEST_ARGV_FILE="$TDIR/argv-brief.txt" \
   PG_TEST_EVIDENCE= NODE_OPTIONS= \
-  bash "$ENGINE" --pr 104 --repo "$TDIR" --diff "$TDIR/small.diff" \
+  bash "$ENGINE" --repo "$TDIR" --diff "$TDIR/small.diff" \
   --brief "$TDIR/brief-src.md" --out "$RHOME/o-brief.md" --timeout 5s \
   >"$TDIR/stdout" 2>"$TDIR/stderr"
 RC=$?
@@ -2091,18 +2097,34 @@ check 'brief keeps the run-marker provenance footer' \
 # --pr target spends THAT PR's per-change round budget and feeds its trajectory governor. Callers
 # who want an analysis to keep its own budget pass --diff without --pr, forking the identity.
 check 'brief run is budget-accounted (spends a round on the change identity)' \
-  "$([ -f "$RHOME/rounds/$(printf '%s-104' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')" ]; echo $?)" \
-  "rounds dir: $(ls "$RHOME/rounds" 2>/dev/null)"
+  "$([ "$(cat "$RHOME"/rounds/* 2>/dev/null | wc -l)" -gt "$BRIEF_ROUNDS_BEFORE" ]; echo $?)" \
+  "before=$BRIEF_ROUNDS_BEFORE after=$(cat "$RHOME"/rounds/* 2>/dev/null | wc -l)"
+# The footer instruction that keeps an ambiguous brief from ending the turn with a question and no
+# verdict — a completed-but-unparseable answer holds its reservation until recovery (#138 r2).
+check 'brief footer forbids a clarifying question and pins one turn' \
+  "$(grep -qF 'do NOT ask a clarifying question' "$TDIR/argv-brief.txt"; echo $?)" \
+  'one-turn / no-clarifying-question instruction missing under --brief'
 # Every --brief rejection must land BEFORE a slot is committed, so each is an exit-2 usage error.
-run_engine --brief /nonexistent-brief.md --pr 102 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$RHOME/o-bbad.md" --timeout 5s
-check 'missing --brief file is a usage error (exit 2)' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC"
+# Each guard asserts its OWN message, not just exit 2: --brief now has several exit-2 paths and
+# the --pr refusal below fires before the file checks, so an rc-only assertion would pass
+# vacuously for the wrong reason if a case were mis-specified.
+run_engine --brief /nonexistent-brief.md --repo "$TDIR" --diff "$TDIR/small.diff" --out "$RHOME/o-bbad.md" --timeout 5s
+check 'missing --brief file is a usage error (exit 2)' \
+  "$([ "$RC" -eq 2 ] && grep -qF 'brief file not found' "$TDIR/stderr"; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
 : > "$TDIR/brief-empty.md"
-run_engine --brief "$TDIR/brief-empty.md" --pr 102 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$RHOME/o-bempty.md" --timeout 5s
-check 'empty --brief file is a usage error (exit 2)' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC"
+run_engine --brief "$TDIR/brief-empty.md" --repo "$TDIR" --diff "$TDIR/small.diff" --out "$RHOME/o-bempty.md" --timeout 5s
+check 'empty --brief file is a usage error (exit 2)' \
+  "$([ "$RC" -eq 2 ] && grep -qF 'brief file is empty' "$TDIR/stderr"; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
 head -c 70000 /dev/zero | tr '\0' 'x' > "$TDIR/brief-big.md"
-run_engine --brief "$TDIR/brief-big.md" --pr 102 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$RHOME/o-bbig.md" --timeout 5s
+run_engine --brief "$TDIR/brief-big.md" --repo "$TDIR" --diff "$TDIR/small.diff" --out "$RHOME/o-bbig.md" --timeout 5s
 check 'oversized --brief refused before any slot work (exit 2)' \
   "$([ "$RC" -eq 2 ] && grep -q '65536' "$TDIR/stderr"; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
+# #138 finding 3: a brief must never occupy a PR's change identity, or it would spend that PR's
+# round budget, serialize against the real review, and be selectable by --recover <PR> in its
+# place. Refused outright rather than documented as guidance.
+run_engine --brief "$TDIR/brief-src.md" --pr 102 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$RHOME/o-bpr.md" --timeout 5s
+check '--brief with --pr is refused (cannot occupy the canonical review identity)' \
+  "$([ "$RC" -eq 2 ] && grep -qF 'cannot be combined with --pr' "$TDIR/stderr"; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
 # Lifecycle commands replay a stored prompt, so a brief there would silently do nothing.
 run_engine --status --brief "$TDIR/brief-src.md"
 check '--brief on --status is a usage error (exit 2)' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC"
