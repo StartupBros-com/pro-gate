@@ -38,9 +38,16 @@ The engine-issued typed continuation chosen from normalized lifecycle, evidence,
 
 The deployment-level rule that controls whether Pro-Gate supplies only the reviewed bundle or may request connector-capable delivery. It governs Pro-Gate's request surface, not permissions independently granted to the browser identity.
 
+### Brief
+
+A caller-supplied task body that replaces the built-in final-tier reviewer persona, so a review slot can be spent on a different question — an architecture critique, a migration-risk read — while the answer is still collected the usual way. Where Input Policy governs what context is attached, a Brief governs what is asked.
+
+The engine appends its own output contract after a brief, so a brief chooses the question but inherits the severity-ranked findings-and-verdict shape the collector requires. That appended contract is cooperative, not enforced: brief text and appended contract carry equal authority, so a brief can dictate its own verdict rather than reason to one. The boundary that holds instead is who supplies and who consumes — briefs are operator-authored, and no Review Decision consumes a brief run's verdict. A brief never shares a pull request's change identity, so it cannot spend that review's capacity, serialize against it, or be returned by Exact Recovery in its place.
+
 ## Relationships
 
 - A Review Attempt may own one Reservation; Exact Recovery resumes that same attempt.
 - A Terminal Disposition or Supersession can release a Reservation's capacity without deleting the attempt's audit history.
 - Applicability is an input to the Review Decision, not a synonym for completion.
 - Input Policy constrains evidence delivery before a Review Attempt can be submitted.
+- A Brief redirects what a Review Attempt asks; it never widens who may act on the answer.
