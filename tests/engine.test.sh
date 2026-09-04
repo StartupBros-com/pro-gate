@@ -2054,6 +2054,55 @@ check 'confirm pass consumes a round (budget-accounted)' "$([ -f "$RHOME/rounds/
 run_engine --confirm /nonexistent-prior.md --pr 102 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$RHOME/o-cbad.md" --timeout 5s
 check 'missing --confirm file is a usage error (exit 2)' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC"
 
+# v0.39: --brief swaps the TASK BODY only; the contract footer stays engine-owned. The whole
+# return path is review-shaped — pg_is_review accepts a capture only when it carries a [Pn]
+# marker AND one of exactly three verdict tokens, and cdp-salvage bounds extraction at the
+# VERDICT line — so a brief able to suppress that footer would leave a conversation that never
+# reaches terminal state and pins its reservation (the #131/#109 zombie shape). Both halves are
+# pinned below: the brief IS substituted, and the footer SURVIVES it.
+echo '# v0.39: --brief custom task body with engine-owned contract footer'
+printf 'UNIQUE_BRIEF_BODY_MARKER\nYou are a database migration risk analyst. Assess rollback safety and lock duration.\n' > "$TDIR/brief-src.md"
+: > "$TDIR/argv-brief.txt"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-evidence" PG_TEST_ARGV_FILE="$TDIR/argv-brief.txt" \
+  PG_TEST_EVIDENCE= NODE_OPTIONS= \
+  bash "$ENGINE" --pr 104 --repo "$TDIR" --diff "$TDIR/small.diff" \
+  --brief "$TDIR/brief-src.md" --out "$RHOME/o-brief.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'brief run exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+check 'brief body is substituted into the prompt' \
+  "$(grep -qF 'UNIQUE_BRIEF_BODY_MARKER' "$TDIR/argv-brief.txt"; echo $?)" 'brief body missing from oracle argv'
+check 'brief REPLACES the built-in reviewer persona' \
+  "$(grep -qF 'You are the FINAL, highest-tier code reviewer' "$TDIR/argv-brief.txt" && echo 1 || echo 0)" \
+  'default persona still present alongside the brief'
+check 'brief keeps the engine OUTPUT FORMAT contract' \
+  "$(grep -qF 'OUTPUT FORMAT' "$TDIR/argv-brief.txt"; echo $?)" 'contract footer lost under --brief'
+check 'brief keeps the closed verdict vocabulary' \
+  "$(grep -qF 'VERDICT: SHIP | FIX-FIRST | NEEDS-DISCUSSION' "$TDIR/argv-brief.txt"; echo $?)" \
+  'verdict vocabulary lost under --brief'
+check 'brief keeps the run-marker provenance footer' \
+  "$(grep -qF 'run marker:' "$TDIR/argv-brief.txt"; echo $?)" 'run marker lost under --brief'
+# Every --brief rejection must land BEFORE a slot is committed, so each is an exit-2 usage error.
+run_engine --brief /nonexistent-brief.md --pr 102 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$RHOME/o-bbad.md" --timeout 5s
+check 'missing --brief file is a usage error (exit 2)' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC"
+: > "$TDIR/brief-empty.md"
+run_engine --brief "$TDIR/brief-empty.md" --pr 102 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$RHOME/o-bempty.md" --timeout 5s
+check 'empty --brief file is a usage error (exit 2)' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC"
+head -c 70000 /dev/zero | tr '\0' 'x' > "$TDIR/brief-big.md"
+run_engine --brief "$TDIR/brief-big.md" --pr 102 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$RHOME/o-bbig.md" --timeout 5s
+check 'oversized --brief refused before any slot work (exit 2)' \
+  "$([ "$RC" -eq 2 ] && grep -q '65536' "$TDIR/stderr"; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
+# Lifecycle commands replay a stored prompt, so a brief there would silently do nothing.
+run_engine --status --brief "$TDIR/brief-src.md"
+check '--brief on --status is a usage error (exit 2)' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC"
+run_engine --harvest pg-run-brief-x --brief "$TDIR/brief-src.md"
+check '--brief on --harvest is a usage error (exit 2)' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC"
+run_engine --recover 123 --brief "$TDIR/brief-src.md"
+check '--brief on --recover is a usage error (exit 2)' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC"
+
 echo '# v0.22.1: Cloudflare (provably-unsubmitted) refunds its round'
 CF_REPO="$TDIR/cloudflare-repo"; git init -q "$CF_REPO"
 git -C "$CF_REPO" remote add origin https://github.com/acme/widgets.git
@@ -3956,7 +4005,7 @@ check 'negative recover table creates no run-meta/recovered/reservation state an
 # a regression hangs this one test instead of the whole CI job.
 echo '# gate #91 P2 (:65): trailing two-arg flag with no operand fails fast, exit 2, not forever'
 ARGP_HOME="$TDIR/home-argparse"; mkdir -p "$ARGP_HOME"
-for f in --pr --repo --diff --input --out --timeout --extra-files --confirm --harvest --recover; do
+for f in --pr --repo --diff --input --out --timeout --extra-files --confirm --brief --harvest --recover; do
   timeout 10 env PRO_GATE_HOME="$ARGP_HOME" bash "$ENGINE" "$f" >"$TDIR/stdout" 2>"$TDIR/stderr"
   RC=$?
   check "trailing $f with no operand exits 2 promptly (not 124-timeout, not unbound-variable crash)" \
