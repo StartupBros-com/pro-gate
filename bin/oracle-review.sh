@@ -905,6 +905,10 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
         # stderr, which is right for the engine's dispatch but breaks --recover's promise of
         # EXACTLY ONE plain state line. Every other failure site in this branch calls a silent
         # helper; this one must be silenced explicitly or contention prints two lines.
+        # #143 scope note: these three exit-6 sites are out of the ledger's reach by design —
+        # --recover exits bare (never pg_finish), writes no ledger row, and runs before
+        # pg_status is even defined. Its one-plain-state-line stderr contract (asserted by
+        # the suite) must not grow a second line, so they stay undifferentiated here.
         pg_out_guard_acquire 2>/dev/null || { echo "Browser needs attention" >&2; exit 6; }
         if [ "$REC_SRC" = "$REC_ART" ]; then
           pg_completed_lookup "$REC_SELECTED" "$OUT" || { echo "Browser needs attention" >&2; exit 6; }
@@ -1746,6 +1750,10 @@ pg_status() {  # $1 phase, $2 optional detail — variable fields are JSON-escap
   # $OUT is caller-supplied; a quote/backslash in it would corrupt the polling contract)
   local phase="$1" detail="${2:-}" ts model_label
   ts="$(date +%Y-%m-%dT%H:%M:%S%z)"
+  # #143: every failure site calls `pg_status failed "<why>"` right before it exits, so this is
+  # the ONE chokepoint that sees the human-readable cause. Remember it for the ledger row;
+  # pg_finish otherwise wrote 311 exit-6 rows that were byte-identical after the fact.
+  [ "$phase" = failed ] && PG_FAIL_DETAIL="$detail"
   # v0.21: `model` is the run's resolved model rendered through pg_model_label (captured label or
   # role-based fallback, never a hardcoded version); `model_warn` carries the advisory downgrade
   # marker (empty unless the model looked weak/unreadable). Human surfaces read both from here.
@@ -2333,6 +2341,32 @@ pg_finish() {  # $1 exit code — settle organization, ramp, and ledger exactly 
 
   [ -n "${PG_FINAL_SRC:-}" ] && [ "$PG_FINAL_SRC" != "$OUT" ] && [ "${PG_KEEP_FINAL:-0}" != 1 ] \
     && rm -f "$PG_FINAL_SRC" 2>/dev/null
+  # #143: classify a failed row from flags the run already set. `reason` is a CLOSED enum derived
+  # mechanically — never from model output, the prompt, or a URL — so it stays greppable and
+  # structurally cannot leak response bytes into the ledger. `detail` is the same string
+  # pg_status already JSON-escaped for the .status file. Both are empty (present, not absent)
+  # on every non-failure row, matching the v0.27 marker/round_key convention.
+  local reason="" fail_detail=""
+  if [ "$outcome" = failed ]; then
+    fail_detail="${PG_FAIL_DETAIL:-}"
+    if [ "${_svc_restarted:-0}" = 1 ]; then
+      reason=browser-restart
+    elif [ "${SALVAGE_TERMINAL_INFRA:-0}" = 1 ]; then
+      reason=infra-error
+    elif [ "${SALVAGE_RAN:-0}" = 1 ]; then
+      case "$fail_detail" in
+        *"round refunded"*)          reason=refunded-unsubmitted ;;
+        *"fate uncertain"*)          reason=fate-uncertain ;;
+        *)                           reason=salvage-empty ;;
+      esac
+    elif [ "${HARVEST:-0}" = 1 ]; then
+      reason=harvest-failed
+    elif [ -n "${RUN_MARKER:-}" ] && [ "${attempt:-0}" -gt 0 ]; then
+      reason=post-dispatch
+    else
+      reason=pre-dispatch
+    fi
+  fi
   # v0.27: marker and round_key make every row independently recoverable. Failures before
   # identity derivation carry empty values — present, not absent.
   if pg_have jq; then
@@ -2345,16 +2379,18 @@ pg_finish() {  # $1 exit code — settle organization, ramp, and ledger exactly 
       --argjson live "${LIVE_CONVERSATION:-0}" --argjson salvaged "${SALVAGED:-0}" \
       --argjson diff_lines "${DIFF_LINES:-0}" --arg out "$OUT" --arg model "$model_label" \
       --arg marker "${RUN_MARKER:-}" --arg round_key "${ROUND_KEY:-}" --arg sha256 "$OUT_SHA" \
-      '{ts:$ts,pr:$pr,repo:$repo,exit:$exit,outcome:$outcome,secs:$secs,pre_slot_secs:$pre_slot_secs,post_slot_secs:$post_slot_secs,kind:$kind,attempts:$attempts,conc:$conc,ceiling:$ceiling,live:$live,salvaged:$salvaged,diff_lines:$diff_lines,out:$out,model:$model,marker:$marker,round_key:$round_key,sha256:$sha256}' 2>/dev/null)"
+      --arg reason "$reason" --arg detail "$fail_detail" \
+      '{ts:$ts,pr:$pr,repo:$repo,exit:$exit,outcome:$outcome,secs:$secs,pre_slot_secs:$pre_slot_secs,post_slot_secs:$post_slot_secs,kind:$kind,attempts:$attempts,conc:$conc,ceiling:$ceiling,live:$live,salvaged:$salvaged,diff_lines:$diff_lines,out:$out,model:$model,marker:$marker,round_key:$round_key,sha256:$sha256,reason:$reason,detail:$detail}' 2>/dev/null)"
   else
-    line="$(printf '{"ts":"%s","pr":"%s","exit":%d,"outcome":"%s","secs":%d,"pre_slot_secs":%d,"post_slot_secs":%d,"kind":"%s","attempts":%d,"conc":%d,"ceiling":%d,"live":%d,"salvaged":%d,"out":"%s","model":"%s","marker":"%s","round_key":"%s","sha256":"%s"}' \
+    line="$(printf '{"ts":"%s","pr":"%s","exit":%d,"outcome":"%s","secs":%d,"pre_slot_secs":%d,"post_slot_secs":%d,"kind":"%s","attempts":%d,"conc":%d,"ceiling":%d,"live":%d,"salvaged":%d,"out":"%s","model":"%s","marker":"%s","round_key":"%s","sha256":"%s","reason":"%s","detail":"%s"}' \
       "$(date +%Y-%m-%dT%H:%M:%S%z)" "${PR_NUM:-diff}" "$rc" "$outcome" "$dur" "$pre_slot_secs" "$post_slot_secs" "$kind" "${attempt:-0}" \
       "${EFF_CONC:-0}" "${MAX_CONC:-1}" "${LIVE_CONVERSATION:-0}" "${SALVAGED:-0}" \
       "$(printf '%s' "$OUT" | tr -d '"\\' | tr '\n' ' ')" \
       "$(printf '%s' "$model_label" | tr -d '"\\' | tr '\n' ' ')" \
       "$(printf '%s' "${RUN_MARKER:-}" | tr -d '"\\' | tr '\n' ' ')" \
       "$(printf '%s' "${ROUND_KEY:-}" | tr -d '"\\' | tr '\n' ' ')" \
-      "$OUT_SHA")"
+      "$OUT_SHA" "$reason" \
+      "$(printf '%s' "$fail_detail" | tr -d '"\\' | tr '\n' ' ')")"
   fi
   pg_ledger_append "$line"
   [ "${PG_PRESERVE_STATE:-0}" = 1 ] || pg_active_clear "$rc"
