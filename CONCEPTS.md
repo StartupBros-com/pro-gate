@@ -28,6 +28,10 @@ Proof that a charged attempt no longer applies to the current target. Supersessi
 
 Collection or reconciliation of one canonically identified attempt without a new submission. Ambiguous ownership fails closed rather than selecting a plausible conversation or spending again.
 
+### Conversation Memo
+
+The conversation URL remembered for a marker so later passes can find the same conversation without rescanning. A memo is authoritative only while its conversation id has the shape of a real conversation id; a memo that fails that check, or that proves to carry foreign content, is revoked so the next pass rescans every candidate. A blank render of a real-id memo is a transient, not a miss, and does not revoke it.
+
 ## Review authority
 
 ### Review Decision
