@@ -614,6 +614,8 @@ const MARKER = 'pg-run-test-1234567890-42';
       `status=${r.status} stderr=${r.stderr?.slice(0, 240)}`);
     check(`terminal UI names bounded outcome: ${message}`,
       r.stderr?.includes(`terminal-infrastructure: ${message}`), r.stderr);
+    check(`terminal UI names its conclusion as terminal-infrastructure: ${message}`,
+      /^evidence-kind: terminal-infrastructure$/m.test(r.stderr ?? ''), r.stderr);
     check(`terminal UI leaves source tab for caller cleanup: ${message}`, !cdp.closed.includes('tab1'),
       `closed=${cdp.closed}`);
     cdp.stop();
@@ -859,6 +861,8 @@ const MARKER = 'pg-run-test-1234567890-42';
   const throttleResult = await runScratchSalvage([MARKER, '3'], throttled.port, seedMemo(MARKER, canonicalUrl));
   check('throttled canonical scratch takes the existing throttle exit', throttleResult.status === 5,
     `status=${throttleResult.status} stderr=${throttleResult.stderr}`);
+  check('throttled canonical scratch names its conclusion as throttle',
+    /^evidence-kind: throttle$/m.test(throttleResult.stderr ?? ''), `stderr=${throttleResult.stderr}`);
   check('throttled canonical scratch writes cooldown and closes only scratch',
     /canonical scratch/.test(throttleResult.cooldown ?? '') && throttled.closed.includes('scratch1') && !throttled.closed.includes('tab1'),
     `cooldown=${throttleResult.cooldown} closed=${throttled.closed}`);
@@ -921,6 +925,8 @@ const MARKER = 'pg-run-test-1234567890-42';
   check('a terminal render of A is emitted and attributed to A', terminalResult.status === 0 &&
     /^matched-url https:\/\/chatgpt\.com\/c\/known-conversation-a$/m.test(terminalResult.stderr ?? ''),
     `status=${terminalResult.status} stderr=${terminalResult.stderr?.slice(0, 300)}`);
+  check('a terminal render of A names its conclusion as terminal',
+    /^evidence-kind: terminal$/m.test(terminalResult.stderr ?? ''), `stderr=${terminalResult.stderr?.slice(0, 300)}`);
   check('the emitted review body is A\'s, not B\'s',
     terminalResult.stdout.trim() === terminalReviewA.split('\n').slice(1).join('\n'),
     `stdout=${terminalResult.stdout?.slice(0, 300)}`);
@@ -1369,6 +1375,8 @@ const FOREIGN_ANSWER = (m) => [
   check('cross-bound memo exits 4 (decisive), not 7/3', r.status === 4, `status=${r.status} stderr=${r.stderr?.slice(-300)}`);
   check('cross-bound memo is reported as another run\'s answer',
     /ANOTHER run's completed answer/.test(r.stderr ?? ''), `stderr=${r.stderr?.slice(-400)}`);
+  check('cross-bound memo names its conclusion as cross-bound',
+    /^evidence-kind: cross-bound$/m.test(r.stderr ?? ''), `stderr=${r.stderr?.slice(-400)}`);
   check('the poisoned memo file is deleted', (r.memos ?? []).length === 0, `memos=${JSON.stringify(r.memos)}`);
   check('no foreign review text is emitted on stdout',
     !/VERDICT/.test(r.stdout ?? ''), `stdout=${r.stdout?.slice(0, 200)}`);
@@ -1436,6 +1444,8 @@ const FOREIGN_ANSWER = (m) => [
   });
   const r = await runFastCdpDeadlineSalvage([MARKER, '3'], cdp.port);
   check('still-generating stays exit 3 under the new check', r.status === 3, `status=${r.status} stderr=${r.stderr?.slice(-300)}`);
+  check('still-generating names its conclusion as owned-incomplete',
+    /^evidence-kind: owned-incomplete$/m.test(r.stderr ?? ''), `stderr=${r.stderr?.slice(-300)}`);
   check('still-generating samples owned-incomplete scratch state repeatedly and in order',
     hasConsecutiveSamples(samples, 5) && cdp.scratchJsonListCalls >= 5,
     `samples=${samples} scratchLists=${cdp.scratchJsonListCalls}`);
@@ -1624,6 +1634,8 @@ const FOREIGN_ANSWER = (m) => [
   const r = await runSalvage([MARKER, '3'], deadPort);
   check('CDP down exits 7 (inconclusive), not 4', r.status === 7, `status=${r.status} stderr=${r.stderr?.slice(0, 200)}`);
   check('inconclusive names the cause', /inconclusive/.test(r.stderr ?? ''), `stderr=${r.stderr?.slice(0, 200)}`);
+  check('CDP down names its conclusion as browser-down',
+    /^evidence-kind: browser-down$/m.test(r.stderr ?? ''), `stderr=${r.stderr?.slice(0, 200)}`);
 }
 
 { // nothing matches the marker -> exit 4 (foreign conversation left alone)

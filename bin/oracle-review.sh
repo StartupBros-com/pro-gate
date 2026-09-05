@@ -1257,7 +1257,9 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
       # v0.42 (#109): what the latest salvage pass concluded (sidecar, see pg_salvage_class_write)
       # and how long until the reservation TTL is satisfied. Additive, observation-only fields: a
       # parked run (placeholder memo, dead page) and a genuinely generating one used to read the
-      # same "in-progress" here.
+      # same "in-progress" here. The hint below is worded per class (#109 finding 6): the same
+      # "collect it for FREE" phrasing was wrong for browser-down and throttle and misleading for
+      # terminal-infrastructure, so each classification gets its own plain-language next step.
       r_class=""; r_class_at=""; r_ttl_left=""
       _sc="$(pg_salvage_class_read "$m" 2>/dev/null || true)"
       if [ -n "$_sc" ]; then
@@ -1273,7 +1275,28 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
       elif [ "$r_unbound" -gt 0 ]; then
         ST_HINT="AMBIGUOUS: ${r_unbound} harvested capture(s) for $m completed but carried no run-marker echo (see ${r_out}.unbound.*). This is retryable — it may be an older answer while yours still generates. Retry the FREE harvest: $r_cmd"
       elif [ -n "$r_class" ]; then
-        [ -n "$ST_HINT" ] || ST_HINT="in-progress reservation $m: latest pass saw $r_class (${r_age:-?}s old, ${r_miss:-0} confirmed miss(es), ${r_ttl_left:-?}s until the TTL is satisfied) — collect it for FREE: $r_cmd"
+        if [ -z "$ST_HINT" ]; then
+          case "$r_class" in
+            owned-incomplete)
+              ST_HINT="in-progress reservation $m: the model was still writing on the latest pass (${r_age:-?}s old, ${r_miss:-0} confirmed miss(es), ${r_ttl_left:-?}s until the TTL is satisfied); collect it for FREE: $r_cmd" ;;
+            inconclusive)
+              ST_HINT="in-progress reservation $m: the latest pass rendered the remembered conversation without a decisive result (${r_age:-?}s old, ${r_miss:-0} confirmed miss(es), ${r_ttl_left:-?}s until the TTL is satisfied); it stays held, not released; collect it for FREE: $r_cmd" ;;
+            browser-down)
+              ST_HINT="in-progress reservation $m: the browser was unreachable on the latest pass (${r_age:-?}s old, ${r_miss:-0} confirmed miss(es), ${r_ttl_left:-?}s until the TTL is satisfied); check that Chrome and the CDP port are up, then collect it for FREE: $r_cmd" ;;
+            absent)
+              ST_HINT="in-progress reservation $m: no conversation carried this marker on the latest pass (${r_age:-?}s old, ${r_miss:-0} confirmed miss(es), ${r_ttl_left:-?}s until the TTL is satisfied); it releases only after the TTL and the miss threshold are both met; collect it for FREE to re-check: $r_cmd" ;;
+            cross-bound)
+              ST_HINT="in-progress reservation $m: the latest probe found only another run's completed answer where this conversation was expected (${r_age:-?}s old, ${r_miss:-0} confirmed miss(es), ${r_ttl_left:-?}s until the TTL is satisfied). Do NOT delete state or set PRO_GATE_REQUIRE_NONCE=0; run the harvest so the conviction is recorded: $r_cmd" ;;
+            throttle)
+              ST_HINT="in-progress reservation $m: ChatGPT throttled the account on the latest pass (${r_age:-?}s old, ${r_miss:-0} confirmed miss(es), ${r_ttl_left:-?}s until the TTL is satisfied); back off and do NOT resubmit; collect later for FREE: $r_cmd" ;;
+            terminal)
+              ST_HINT="in-progress reservation $m: a completed answer was seen on the latest pass (${r_age:-?}s old, ${r_miss:-0} confirmed miss(es), ${r_ttl_left:-?}s until the TTL is satisfied); collect it for FREE: $r_cmd" ;;
+            terminal-infrastructure)
+              ST_HINT="in-progress reservation $m: the conversation ended in a terminal infrastructure state (${r_age:-?}s old, ${r_miss:-0} confirmed miss(es), ${r_ttl_left:-?}s until the TTL is satisfied); collect it for FREE to record the outcome: $r_cmd" ;;
+            *)
+              ST_HINT="in-progress reservation $m: latest pass saw $r_class (${r_age:-?}s old, ${r_miss:-0} confirmed miss(es), ${r_ttl_left:-?}s until the TTL is satisfied) — collect it for FREE: $r_cmd" ;;
+          esac
+        fi
       else
         [ -n "$ST_HINT" ] || ST_HINT="in-progress reservation found — collect it for FREE: $r_cmd"
       fi

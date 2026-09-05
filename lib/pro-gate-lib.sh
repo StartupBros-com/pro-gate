@@ -528,31 +528,42 @@ pg_reservation_dir() { echo "${PRO_GATE_RESERVATION_DIR:-$PRO_GATE_HOME/in-progr
 pg_manifest_dir() { echo "${PRO_GATE_MANIFEST_DIR:-$PRO_GATE_HOME/manifests}"; }
 # v0.42 (#109): per-marker record of what the salvage helper concluded on its LATEST pass, so
 # --status can name a stall (owned-incomplete, inconclusive, browser-down, absent, cross-bound,
-# throttle, terminal, terminal-infrastructure, foreign) instead of one word for every unresolved
+# throttle, terminal, terminal-infrastructure) instead of one word for every unresolved
 # attempt. A sidecar directory, not a reservation column: the record's tab-separated column count
 # is fragile (the per-field reads above exist because `read` collapses empty columns). The kind is
 # the closed vocabulary the helper prints as `evidence-kind: <kind>`; anything else is dropped.
+# pg_salvage_class_ok is the single allowlist gating both the writer and the reader, so a
+# malformed or unrecognized sidecar can never be read back as a valid classification.
 # Swept with the same 14-day hygiene as conversation memos. Observation only — nothing reads this
 # to decide release, refund, or admission.
 pg_salvage_class_dir() { printf '%s\n' "${PRO_GATE_SALVAGE_CLASS_DIR:-$PRO_GATE_HOME/salvage-class}"; }
+pg_salvage_class_ok() { # kind
+  case "$1" in
+    owned-incomplete|inconclusive|browser-down|absent|cross-bound|throttle|terminal|terminal-infrastructure) return 0;;
+    *) return 1;;
+  esac
+}
 pg_salvage_class_write() { # marker kind
   local marker="$1" kind="$2" dir tmp
   pg_reservation_marker_ok "$marker" || return 1
-  case "$kind" in
-    owned-incomplete|inconclusive|browser-down|absent|cross-bound|throttle|terminal|terminal-infrastructure|foreign) ;;
-    *) return 1;;
-  esac
+  pg_salvage_class_ok "$kind" || return 1
   dir="$(pg_salvage_class_dir)"; mkdir -p "$dir" 2>/dev/null || return 1
   tmp="$dir/$marker.tmp.$$"
   printf '%s\t%s\n' "$kind" "$(date +%s)" > "$tmp" 2>/dev/null && mv -f "$tmp" "$dir/$marker" 2>/dev/null
 }
 pg_salvage_class_read() { # marker -> "kind<TAB>epoch" (empty and rc 1 when absent or malformed)
-  local marker="$1" f line
+  local marker="$1" f line kind epoch
   pg_reservation_marker_ok "$marker" || return 1
   f="$(pg_salvage_class_dir)/$marker"; [ -s "$f" ] || return 1
-  line="$(head -n1 "$f" 2>/dev/null | awk -F'\t' 'NR==1 && $1 ~ /^[a-z-]+$/ && $2 ~ /^[0-9]+$/ {print $1 "\t" $2}')"
+  line="$(head -n1 "$f" 2>/dev/null | awk -F'\t' 'NF==2 {print $1 "\t" $2}')"
   [ -n "$line" ] || return 1
-  printf '%s\n' "$line"
+  kind="${line%%$'\t'*}"
+  epoch="${line#*$'\t'}"
+  pg_salvage_class_ok "$kind" || return 1
+  case "$epoch" in
+    ''|*[!0-9]*) return 1;;
+  esac
+  printf '%s\t%s\n' "$kind" "$epoch"
 }
 
 pg_reservation_lock() { echo "${PRO_GATE_RESERVATION_LOCK:-$PRO_GATE_HOME/in-progress.lock}"; }

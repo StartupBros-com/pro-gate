@@ -345,6 +345,12 @@ check 'third confirmed miss past the TTL exhausts recovery with the round retain
   "$([ ! -e "$DRAIN_HOME/in-progress/$DRAIN_MARKER" ] && [ -s "$DRAIN_HOME/rounds/$DRAIN_KEY" ] \
      && jq -e '.terminal_kind=="recovery-exhausted"' "$DRAIN_HOME/attempt-dispositions/$DRAIN_MARKER" >/dev/null 2>&1; echo $?)" \
   "disposition=$(cat "$DRAIN_HOME/attempt-dispositions/$DRAIN_MARKER" 2>/dev/null) record=$(cat "$DRAIN_HOME/in-progress/$DRAIN_MARKER" 2>/dev/null) log=$(tail -3 "$TDIR/drain.log")"
+# v0.42 (#109 AE6): the drain path retires the RESERVATION (miss-count exhaustion), never the
+# ledger's charged round — refunds are the oracle-review.sh engine's own no-spend predicate, a
+# completely different mechanism this probe-only reconcile never touches or announces.
+check 'placeholder drain never announces or records a refund' \
+  "$(! grep -qi 'refund' "$TDIR/drain.log" && [ -s "$DRAIN_HOME/rounds/$DRAIN_KEY" ]; echo $?)" \
+  "log=$(tail -5 "$TDIR/drain.log") rounds=$(cat "$DRAIN_HOME/rounds/$DRAIN_KEY" 2>/dev/null)"
 check 'the real-id reservation is untouched by the placeholder drain' \
   "$([ -f "$DRAIN_HOME/in-progress/$REAL_MARKER" ] && [ ! -e "$DRAIN_HOME/attempt-dispositions/$REAL_MARKER" ]; echo $?)" "$(ls "$DRAIN_HOME/in-progress" 2>/dev/null | tr '\n' ' ')"
 
@@ -1398,6 +1404,86 @@ check 'landed-but-lost run does NOT announce a refund' "$(grep -qv 'refunding th
 check 'landed-but-lost round STAYS charged' \
   "$([ -s "$RHOME/rounds/$RKEY_92" ]; echo $?)" "rounds: $(cat "$RHOME/rounds/$RKEY_92" 2>/dev/null)"
 
+# v0.42 (#109 AE6/KTD5): a revoked placeholder removes only the memo negative; never-submitted
+# evidence still decides the refund. Same never-landed shape as oracle-dead above, but the
+# oracle-visible prompt carries a PRE-EXISTING placeholder memo (https://chatgpt.com/c/WEB:<uuid>)
+# for this run's marker — the engine's own salvage/marker scan must revoke it (it fails the
+# conversation-id shape gate) on read, and the refund predicate proceeds exactly as if no memo
+# had ever existed: revocation is memo hygiene, not evidence of submission either way.
+echo '# v0.42 (#109 AE6/KTD5): a revoked placeholder removes only the memo negative; never-submitted evidence still decides the refund'
+cat > "$TDIR/bin/oracle-dead-placeholder" <<'FAKE_DEAD_PH'
+#!/usr/bin/env bash
+[ "${1:-}" = session ] && exit 1
+prompt=""
+while [ $# -gt 0 ]; do case "$1" in -p) prompt="$2"; shift 2;; *) shift;; esac; done
+marker="$(printf '%s' "$prompt" | grep -o 'pg-run-[A-Za-z0-9.-]*' | head -1)"
+mkdir -p "${PRO_GATE_HOME:?}/conversation-urls"
+printf 'https://chatgpt.com/c/WEB:57cc5403-ad61-4ccd-af90-ad28a539081e\n' > "$PRO_GATE_HOME/conversation-urls/$marker"
+slug=fake-dead-ph
+mkdir -p "${ORACLE_HOME_DIR:?}/sessions/$slug"
+jq -cn --arg id "$slug" --arg prompt "$prompt" '{id:$id,status:"error",options:{prompt:$prompt},browser:{runtime:{promptSubmitted:false}}}' \
+  > "$ORACLE_HOME_DIR/sessions/$slug/meta.json"
+printf 'Session: %s\n' "$slug"
+exit 1
+FAKE_DEAD_PH
+chmod +x "$TDIR/bin/oracle-dead-placeholder"
+RKEY_93="$(printf '%s-93' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+env PRO_GATE_HOME="$RHOME" ORACLE_HOME_DIR="$RHOME/oracle-dead-ph" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 PRO_GATE_STALL_SECS=30 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-dead-placeholder" NODE_OPTIONS= \
+  bash "$ENGINE" --pr 93 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$RHOME/o-refund-placeholder.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'placeholder-memo never-landed run fails (exit 6)' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+check 'placeholder-memo never-landed run announces the refund' "$(grep -q 'refunding this round' "$TDIR/stderr"; echo $?)" "$(tail -5 "$TDIR/stderr")"
+REFUND_PH_ROW="$(grep -F "\"out\":\"$RHOME/o-refund-placeholder.md\"" "$RHOME/ledger.jsonl" | tail -1)"
+check 'placeholder-memo ledger row carries reason=refunded-unsubmitted' \
+  "$([ "$(printf '%s' "$REFUND_PH_ROW" | jq -r '.reason // "MISSING"')" = refunded-unsubmitted ]; echo $?)" "$REFUND_PH_ROW"
+check 'placeholder-memo round is refunded (no in-window spend remains)' \
+  "$([ ! -s "$RHOME/rounds/$RKEY_93" ]; echo $?)" "rounds: $(cat "$RHOME/rounds/$RKEY_93" 2>/dev/null)"
+REFUND_PH_MARKER="$(jq -r .marker "$RHOME/o-refund-placeholder.md.status" 2>/dev/null)"
+check 'the placeholder memo for this run marker is gone (revoked, not just refunded)' \
+  "$([ -n "$REFUND_PH_MARKER" ] && [ ! -e "$RHOME/conversation-urls/$REFUND_PH_MARKER" ]; echo $?)" \
+  "marker=$REFUND_PH_MARKER memos=$(ls "$RHOME/conversation-urls" 2>/dev/null | tr '\n' ' ')"
+
+# v0.42 (#109 AE6): revoking a placeholder never refunds a charged attempt. Same landed-but-lost
+# shape as oracle-landed above (browser lifecycle reached, so the quota is presumed spent), but
+# this oracle ALSO leaves a pre-existing placeholder memo for the marker. The memo still gets
+# revoked (memo hygiene runs unconditionally) — but revocation must never itself trigger or imply
+# a refund of an attempt the lifecycle evidence says is charged.
+echo '# v0.42 (#109 AE6): revoking a placeholder never refunds a charged attempt'
+cat > "$TDIR/bin/oracle-landed-placeholder" <<'FAKE_LANDED_PH'
+#!/usr/bin/env bash
+prompt=""
+while [ $# -gt 0 ]; do case "$1" in -p) prompt="$2"; shift 2;; *) shift;; esac; done
+marker="$(printf '%s' "$prompt" | grep -o 'pg-run-[A-Za-z0-9.-]*' | head -1)"
+mkdir -p "${PRO_GATE_HOME:?}/conversation-urls"
+printf 'https://chatgpt.com/c/WEB:57cc5403-ad61-4ccd-af90-ad28a539081e\n' > "$PRO_GATE_HOME/conversation-urls/$marker"
+echo "Acquired ChatGPT browser slot" >&2
+exit 1
+FAKE_LANDED_PH
+chmod +x "$TDIR/bin/oracle-landed-placeholder"
+RKEY_94="$(printf '%s-94' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 PRO_GATE_STALL_SECS=30 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-landed-placeholder" NODE_OPTIONS= \
+  bash "$ENGINE" --pr 94 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$RHOME/o-landed-placeholder.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'placeholder-memo landed-but-lost run fails (exit 6)' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+check 'placeholder-memo landed-but-lost run does NOT announce a refund' "$(! grep -q 'refunding this round' "$TDIR/stderr"; echo $?)" "$(tail -5 "$TDIR/stderr")"
+LANDED_PH_ROW="$(grep -F "\"out\":\"$RHOME/o-landed-placeholder.md\"" "$RHOME/ledger.jsonl" | tail -1)"
+check 'placeholder-memo landed-but-lost ledger row carries reason=salvage-empty (not the refund reason)' \
+  "$([ "$(printf '%s' "$LANDED_PH_ROW" | jq -r '.reason // "MISSING"')" = salvage-empty ]; echo $?)" "$LANDED_PH_ROW"
+check 'placeholder-memo landed-but-lost round STAYS charged' \
+  "$([ -s "$RHOME/rounds/$RKEY_94" ]; echo $?)" "rounds: $(cat "$RHOME/rounds/$RKEY_94" 2>/dev/null)"
+LANDED_PH_MARKER="$(jq -r .marker "$RHOME/o-landed-placeholder.md.status" 2>/dev/null)"
+check 'the placeholder memo is revoked even though the attempt stays charged' \
+  "$([ -n "$LANDED_PH_MARKER" ] && [ ! -e "$RHOME/conversation-urls/$LANDED_PH_MARKER" ]; echo $?)" \
+  "marker=$LANDED_PH_MARKER memos=$(ls "$RHOME/conversation-urls" 2>/dev/null | tr '\n' ' ')"
+
 # Gate #72 r8 P1: lifecycle ABSENCE is proof only in a complete, immutable transcript whose tee
 # drained successfully. Pin the helper's fail-closed contract before exercising the full pipeline.
 LOG_PROOF_DIR="$TDIR/log-proof"; mkdir -p "$LOG_PROOF_DIR"
@@ -2339,7 +2425,7 @@ check '--status reports rounds used and total wall clock' \
   "$(grep -q '2 rounds; ~2.0h recorded across 2 scored round(s)' "$TDIR/st.out"; echo $?)" "$(grep spent "$TDIR/st.out")"
 check '--status writes nothing' "$([ ! -f "$SHOME/ledger.jsonl.tmp" ] && [ "$(wc -l < "$SHOME/ledger.jsonl")" -eq 1 ]; echo $?)" 'state mutated'
 check '--status names the latest salvage classification and the time until the TTL' \
-  "$(grep -q 'latest pass saw owned-incomplete' "$TDIR/st.out" && grep -q 'until the TTL is satisfied' "$TDIR/st.out"; echo $?)" "$(grep -i 'latest pass' "$TDIR/st.out")"
+  "$(grep -q 'the model was still writing on the latest pass' "$TDIR/st.out" && grep -q 'until the TTL is satisfied' "$TDIR/st.out"; echo $?)" "$(grep -i 'latest pass' "$TDIR/st.out")"
 if command -v jq >/dev/null 2>&1; then
   PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 --json >"$TDIR/st-class.json" 2>/dev/null
   check '--status --json carries classification, classified_at, and ttl_remaining_secs' \

@@ -192,7 +192,18 @@ function recallUrl(m) {
   // not termination — the pass still has to find or miss the conversation on its own evidence.
   const survivor = forgetUrl(m, url);
   console.error(`memo-revoked: the remembered conversation for "${m}" is not a conversation id (${url}); rescanning candidates`);
-  return survivor && conversationUrlOk(survivor) ? survivor : null;
+  if (survivor && conversationUrlOk(survivor)) return survivor;
+  // v0.42 review finding #2: forgetUrl only restores a genuine memo republished DURING its
+  // claim rename (the file existed as `f` again by the time forgetUrl read `claim`). A memo
+  // republished in the window between that rename and the unlink of `claim` lands back at `f`
+  // unheld and unseen by forgetUrl, so re-read `f` once more here to close it before giving up.
+  let value = '';
+  try { value = fs.readFileSync(f, 'utf8').trim(); } catch { return null; }
+  if (conversationUrlOk(value)) {
+    console.error(`memo-republished: a genuine conversation for "${m}" was published while the placeholder was being revoked; using ${value}`);
+    return value;
+  }
+  return null;
 }
 
 function recallTitle(m) {
