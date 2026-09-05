@@ -108,7 +108,7 @@ EFFECT_ARGS=(--review-decision-effect "$DECISION" --pr "$PR" --repo "$REPO" "${I
 For `run-granted-review`:
 
 ```bash
-"$PG" "${EFFECT_ARGS[@]}" --out "$OUT" --timeout 30m
+"$PG" "${EFFECT_ARGS[@]}" --out "$OUT" --timeout 60m
 ```
 
 For collection or recovery, first execute the freshness check/repair and verify that it still
@@ -120,7 +120,7 @@ FRESH="${DECISION}.fresh"
 ACTION="$(jq -r .action "$FRESH")"
 REF="$(jq -r '.effect_request.applicable_ref // empty' "$FRESH")"
 # Continue only when ACTION and REF still match the requested collect/recover operation.
-"$PG" --recover "$REF" --repo "$REPO" --out "$OUT" --timeout 30m
+"$PG" --recover "$REF" --repo "$REPO" --out "$OUT" --timeout 45m
 ```
 
 Dispatch a replacement action instead of the stale one. Never translate collection or recovery into
@@ -149,7 +149,7 @@ and direct marker diagnostics remain:
 
 ```bash
 "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --status <pr-number|pr-url|marker> --json
-"${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --harvest <run-marker> --out <out> --timeout 20m
+"${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --harvest <run-marker> --out <out> --timeout 45m
 ```
 
 ask-named-product-choice is the only prompt. Present only the normalized

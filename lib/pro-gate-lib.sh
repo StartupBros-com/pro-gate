@@ -1083,30 +1083,91 @@ pg_attempt_snapshot() { # host owner repo pr round-key [exclude-marker] -> canon
     '{artifact:{kind:$kind,path:$path},charged_spend_epoch:$epoch,cleanup_pending:$cleanup,fresh_eligible:$fresh,marker:$marker,out:$out,recoverable:$recoverable,source:$source,state:$state,target:{host:$host,owner:$owner,pr:$pr,repo:$repo,round_key:$key},terminal:$terminal}'
 }
 
+# pg_dirlock_reclaim_dead <lockdir>: reclaim a mkdir-spinlock directory whose every owner is dead,
+# or that carries no owner at all. Ownership is a marker file named owner.<pid> INSIDE the
+# directory, and this helper only ever (a) unlinks a dead marker by its exact name and (b) rmdir()s
+# the directory, which the kernel refuses unless it is empty. There is no rm -rf on a shared
+# pathname and no rename, so a slow reclaimer, or a remover orphaned by a holder that died
+# mid-release, can never delete a directory a live process has since re-created: that holder's
+# own marker makes the rmdir fail (gate #148 r1 P1: two reclaimers of one dead owner both entered;
+# r2 P1: an orphaned release deleted a replacement). The one window is a directory a contender has
+# mkdir'd but not yet marked; rmdir can take it, and the contender learns that when its marker
+# creation fails and simply tries again. Returns 0 when the directory is gone, 1 when a live owner
+# still holds it.
+pg_dirlock_reclaim_dead() {
+  local lockdir="$1" f pid
+  for f in "$lockdir"/owner.*; do
+    [ -e "$f" ] || continue
+    pid="${f##*/owner.}"
+    case "$pid" in ''|*[!0-9]*) rm -f "$f" 2>/dev/null; continue;; esac
+    kill -0 "$pid" 2>/dev/null && return 1
+    rm -f "$f" 2>/dev/null
+  done
+  rmdir "$lockdir" 2>/dev/null || [ ! -d "$lockdir" ]
+}
+
 # Shared guard for reservation writes/removes AND the fresh-run count+slot-acquire decision.
 # This makes the handoff atomic: an exit-9 run writes its durable reservation while it still
 # owns the process slot; no waiter can observe "slot released, reservation not counted" (or
 # compute capacity before the write and acquire the just-released slot on stale information).
 pg_reservation_guard_acquire() {
-  local lock; lock="$(pg_reservation_lock)"
+  local lock wait_s; lock="$(pg_reservation_lock)"
+  wait_s="${PRO_GATE_RESERVATION_GUARD_WAIT:-10}"; case "$wait_s" in ''|*[!0-9]*) wait_s=10;; esac
   if pg_have flock; then
-    { exec {PG_RESERVATION_GUARD_FD}>>"$lock"; } 2>/dev/null \
-      && flock -w 10 "$PG_RESERVATION_GUARD_FD" 2>/dev/null
-    return $?
+    { exec {PG_RESERVATION_GUARD_FD}>>"$lock"; } 2>/dev/null || { PG_RESERVATION_GUARD_FD=""; return 1; }
+    if ! flock -w "$wait_s" "$PG_RESERVATION_GUARD_FD" 2>/dev/null; then
+      # A timed-out acquire returns 1 to a caller that never calls release, so the descriptor
+      # must be closed HERE or every contended acquire leaks one fd for the life of the process
+      # (v0.41; pg_lock_n already closes its losing descriptors the same way).
+      eval "exec ${PG_RESERVATION_GUARD_FD}>&-" 2>/dev/null
+      PG_RESERVATION_GUARD_FD=""
+      return 1
+    fi
+    return 0
   fi
+  # macOS / no flock: mkdir spinlock with the dead-pid self-heal pg_lock uses. Without it a guard
+  # directory left by a killed process wedged every later reservation write for the full wait, and
+  # a failed acquire left PG_RESERVATION_GUARD_DIR pointing at a directory this process did not
+  # own, so a later release could remove another process's guard. Ownership is the marker file
+  # owner.<pid> inside the directory and reclamation goes through pg_dirlock_reclaim_dead (gate
+  # #148 r1 P1 and r2 P1): the bare `rm -rf` that used to live here let two waiters that read the
+  # same dead pid both end up inside the guard, and let a remover orphaned by a dying holder
+  # delete the replacement a reclaimer had already re-created.
   PG_RESERVATION_GUARD_DIR="${lock}.d"
+  # gate #148 r2 P1: $$ is the parent shell even inside a command substitution or subshell, so a
+  # restore running under $( ) would publish an owner pid that can die while the real holder lives.
+  # BASHPID names the shell that actually holds the guard and performs the guarded mutation.
+  PG_RESERVATION_GUARD_OWNER="${BASHPID:-$$}"
   local waited=0
-  while ! mkdir "$PG_RESERVATION_GUARD_DIR" 2>/dev/null; do
-    waited=$(( waited + 1 )); [ "$waited" -ge 10 ] && return 1; sleep 1
+  while :; do
+    if mkdir "$PG_RESERVATION_GUARD_DIR" 2>/dev/null; then
+      # The marker can only fail to appear when a reclaimer rmdir'd our still-empty directory
+      # between the mkdir and this line; the directory is then no longer ours to hold.
+      : > "$PG_RESERVATION_GUARD_DIR/owner.$PG_RESERVATION_GUARD_OWNER" 2>/dev/null && return 0
+      rmdir "$PG_RESERVATION_GUARD_DIR" 2>/dev/null
+    elif pg_dirlock_reclaim_dead "$PG_RESERVATION_GUARD_DIR"; then
+      continue
+    fi
+    waited=$(( waited + 1 ))
+    [ "$waited" -ge "$wait_s" ] && { PG_RESERVATION_GUARD_DIR=""; PG_RESERVATION_GUARD_OWNER=""; return 1; }
+    sleep 1
   done
 }
 pg_reservation_guard_release() {
+  local dir owner
   if [ -n "${PG_RESERVATION_GUARD_FD:-}" ]; then
     eval "exec ${PG_RESERVATION_GUARD_FD}>&-" 2>/dev/null
     PG_RESERVATION_GUARD_FD=""
   fi
   if [ -n "${PG_RESERVATION_GUARD_DIR:-}" ]; then
-    rmdir "$PG_RESERVATION_GUARD_DIR" 2>/dev/null; PG_RESERVATION_GUARD_DIR=""
+    dir="$PG_RESERVATION_GUARD_DIR"; owner="${PG_RESERVATION_GUARD_OWNER:-}"
+    PG_RESERVATION_GUARD_DIR=""; PG_RESERVATION_GUARD_OWNER=""
+    # gate #148 r2 P1: unlink only OUR marker, by exact name, then rmdir. A remover orphaned by a
+    # holder that dies here cannot touch a replacement: the replacement's marker has another name
+    # and rmdir refuses a directory that still holds one. Never rm -rf a pathname another live
+    # process may own by now.
+    [ -n "$owner" ] && rm -f "$dir/owner.$owner" 2>/dev/null
+    rmdir "$dir" 2>/dev/null
   fi
 }
 
@@ -2611,6 +2672,38 @@ pg_review_decision_emit() { # action reason facts snapshot-digest applicable-ref
 
 pg_review_decision_reject() { # reason snapshot; never reflect rejected untrusted data
   pg_review_decision_emit stop-without-new-review "$1" '{}' "$2" ''
+}
+
+# Shared envelope validator for bash consumers (v0.41). The daemon used to carry this schema
+# privately, which made it the one renderer of the closed action table no conformance test
+# covered. Every bash consumer now validates a saved decision here: exact key sets, the installed
+# runtime's contract identity, the closed action/effect/execution-class table, no status or
+# next_action field anywhere, no control characters, and finally a byte-identical re-run of the
+# pure reducer over the envelope's own facts, so a fabricated outer action cannot ride on
+# otherwise plausible JSON. Files must be regular, non-symlink, and at most 64 KiB.
+pg_review_decision_envelope_valid() { # decision-file
+  local decision="$1" canonical facts expected
+  [ -f "$decision" ] && [ ! -L "$decision" ] && command -v jq >/dev/null 2>&1 || return 1
+  [ "$(wc -c < "$decision" 2>/dev/null | tr -d ' ')" -le 65536 ] || return 1
+  jq -e --arg cd "$(pg_review_decision_contract_digest)" --arg xd "$(pg_review_decision_corpus_digest)" '
+    type == "object" and keys == ["action","contract","effect_request","facts","observation","reason"] and
+    .contract == {contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,corpus_digest:$xd} and
+    (.action | IN("collect-existing-result","recover-existing-review","fix-review-findings","prepare-matching-review-evidence","run-granted-review","stop-without-new-review","allow-existing-merge-workflow","ask-named-product-choice")) and
+    (. as $envelope | .effect_request | type == "object" and keys == ["action","applicable_ref","contract_digest","effect","execution_class","snapshot_digest","target"] and
+      .effect == .action and .contract_digest == $cd and
+      (.snapshot_digest | type == "string" and test("^[0-9a-f]{64}$")) and .target == $envelope.facts.target and
+      ((.action == "collect-existing-result" or .action == "recover-existing-review" or .action == "run-granted-review") and .execution_class == "runtime-guarded-effect" or
+       ((.action == "fix-review-findings" or .action == "prepare-matching-review-evidence") and .execution_class == "agent-task") or
+       ((.action == "stop-without-new-review" or .action == "allow-existing-merge-workflow") and .execution_class == "report-only") or
+       (.action == "ask-named-product-choice" and .execution_class == "named-product-choice"))) and
+    (.effect_request.action == .action) and
+    ([.. | objects | keys[] | select(. == "status" or . == "next_action")] | length == 0) and
+    ([.. | strings | select(test("[[:cntrl:]]"))] | length == 0)
+  ' "$decision" >/dev/null 2>&1 || return 1
+  facts="$(jq -cS .facts "$decision" 2>/dev/null)" || return 1
+  expected="$(pg_review_decision_reduce "$facts")" || return 1
+  canonical="$(pg_review_json_canonical "$(<"$decision")")" || return 1
+  [ "$canonical" = "$expected" ]
 }
 
 pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read stdin
