@@ -341,6 +341,12 @@ Bundle-only prevents Pro-Gate from requesting connector delivery but cannot atte
 external ChatGPT browser connector grants. Known connector-bound browser or project permissions
 remain an operator trust boundary.
 
+Connector delivery can drive fix rounds but never attests an allow. Merge eligibility binds the
+bytes the engine delivered, and a connector observation carries no such proof, so a
+connector-delivered `SHIP` reduces to `stop-without-new-review` with reason
+`result-not-bindable-for-mode` (the facts name the mode and marker) rather than a merge handoff or
+an endless collect. Use `bundle` or `both` for the final round.
+
 | Variable | Default | What it controls |
 |---|---|---|
 | `PRO_GATE_INPUT_POLICY` | `bundle-only` | `bundle-only` permits only bundled review input; `connector-enabled` opts into connector-capable input |

@@ -262,8 +262,36 @@ fi
 # the regular engine's housekeeping, browser preflight, locks, reconciliation, status sidecars,
 # slots, round recording, or binding/publication writes: the answer is advisory until an effect
 # boundary assembles the same facts again. The U1 reducer remains the sole policy authority.
+# Merge-eligibility proof exists only for evidence the engine delivered byte-for-byte. A connector
+# observation can drive a fix round but never attests an allow (#147, decision b): callers switch to
+# bundle or both for the final round. This predicate is the one source of that rule for the repair
+# effect and for the normalized facts the reducer consumes.
+pg_review_decision_ship_mode_bindable() { # evidence-mode
+  case "$1" in full-pr|scoped-delta) return 0 ;; *) return 1 ;; esac
+}
+pg_review_decision_result_mode() { # input-binding-json -> closed evidence-mode label for normalized facts
+  case "$(jq -r '.evidence.mode // ""' <<<"$1" 2>/dev/null)" in
+    full-pr) printf 'full-pr' ;; scoped-delta) printf 'scoped-delta' ;; connector) printf 'connector' ;; *) printf 'none' ;;
+  esac
+}
+# Whether a collect effect could ever bind this exact artifact. Only a completed/ SHIP in a mode
+# without merge proof is permanently unrepairable; pending/ bytes remain collect-only recovery data,
+# and every other verdict binds with a null proof. The reducer turns false into a typed stop so a
+# caller can tell an unrepairable result from a transient one instead of collecting forever.
+pg_review_decision_result_bindable() { # artifact-path input-binding-json -> prints true|false
+  local artifact="$1" input="$2"
+  case "$artifact" in
+    "$(pg_completed_dir)"/*)
+      if [ "$(pg_extract_verdict "$artifact")" = SHIP ] \
+         && ! pg_review_decision_ship_mode_bindable "$(jq -r '.evidence.mode // ""' <<<"$input" 2>/dev/null)"; then
+        printf 'false'; return 0
+      fi ;;
+  esac
+  printf 'true'
+}
+
 pg_review_decision_repair_result_binding() { # marker input-binding-json
-  local marker="$1" input="$2" artifact verdict input_digest accepted epoch base head proof result lock
+  local marker="$1" input="$2" artifact verdict input_digest accepted epoch base head proof result lock mode
   pg_reservation_marker_ok "$marker" || return 1
   artifact="$(pg_completed_dir)/$marker"
   [ -f "$artifact" ] && [ ! -L "$artifact" ] && pg_is_review "$artifact" || return 1
@@ -275,7 +303,9 @@ pg_review_decision_repair_result_binding() { # marker input-binding-json
   accepted="$(date +%s)"
   proof=null
   if [ "$verdict" = SHIP ]; then
-    case "$(jq -r .evidence.mode <<<"$input")" in
+    mode="$(jq -r .evidence.mode <<<"$input")"
+    pg_review_decision_ship_mode_bindable "$mode" || return 1
+    case "$mode" in
       full-pr)
         base="$(jq -r .evidence.proof.base_oid <<<"$input")"; head="$(jq -r .evidence.proof.head_oid <<<"$input")"
         proof="$(jq -cnS --arg base "$base" --arg head "$head" --arg digest "$(jq -r .evidence.proof.raw_patch_digest <<<"$input")" '{base_oid:$base,diff_digest:$digest,head_oid:$head}')" || return 1 ;;
@@ -503,7 +533,8 @@ pg_review_decision_cli() {
       if [ "$exact" = true ] && [ -n "$artifact" ]; then
         artifact_digest="$(pg_sha256 "$artifact" 2>/dev/null || true)"
         [ -n "$artifact_digest" ] && completed="$(jq -cS --arg marker "$marker" --arg artifact "$artifact_digest" --argjson epoch "$(jq -r .charged_spend_epoch <<<"$candidate")" \
-          '. + [{applicable:true,artifact_digest:$artifact,binding_valid:false,canonical_identity:$marker,charged_spend_epoch:$epoch,collected:false,legacy:false,marker:$marker,provenance_valid:false,verdict:"NONE"}]' <<<"$completed")"
+          --arg mode "$(pg_review_decision_result_mode "$candidate")" --argjson bindable "$(pg_review_decision_result_bindable "$artifact" "$candidate")" \
+          '. + [{applicable:true,artifact_digest:$artifact,bindable:$bindable,binding_valid:false,canonical_identity:$marker,charged_spend_epoch:$epoch,collected:false,evidence_mode:$mode,legacy:false,marker:$marker,provenance_valid:false,verdict:"NONE"}]' <<<"$completed")"
       fi
       continue
     fi
@@ -539,7 +570,8 @@ pg_review_decision_cli() {
       fi
       completed="$(jq -cS --arg marker "$marker" --arg canonical "$canonical" --arg artifact "$artifact_digest" \
         --argjson epoch "$(jq -r .charged_spend_epoch <<<"$candidate")" --arg verdict "$(jq -r .verdict <<<"$result")" \
-        '. + [{applicable:true,artifact_digest:$artifact,binding_valid:true,canonical_identity:$canonical,charged_spend_epoch:$epoch,collected:true,legacy:false,marker:$marker,provenance_valid:true,verdict:$verdict}]' <<<"$completed")"
+        --arg mode "$(pg_review_decision_result_mode "$candidate")" \
+        '. + [{applicable:true,artifact_digest:$artifact,bindable:true,binding_valid:true,canonical_identity:$canonical,charged_spend_epoch:$epoch,collected:true,evidence_mode:$mode,legacy:false,marker:$marker,provenance_valid:true,verdict:$verdict}]' <<<"$completed")"
       if [ "$(jq -r .verdict <<<"$result")" = NEEDS-DISCUSSION ]; then
         choice_outcomes="$(pg_review_decision_named_choices "$artifact" 2>/dev/null || true)"
         [ -n "$choice_outcomes" ] || choice_outcomes='[]'
@@ -1903,7 +1935,8 @@ pg_fresh_dispatch_recheck() { # sets PG_FRESH_DECISION/PG_FRESH_ACTION
       artifact_digest="$(pg_sha256 "$artifact" 2>/dev/null || true)"
       [ -n "$artifact_digest" ] || continue
       completed="$(jq -cS --arg marker "$m" --arg digest "$artifact_digest" --argjson charged "$(jq -r .charged_spend_epoch <<<"$candidate")" \
-        '. + [{applicable:true,artifact_digest:$digest,binding_valid:false,canonical_identity:$marker,charged_spend_epoch:$charged,collected:false,legacy:false,marker:$marker,provenance_valid:false,verdict:"NONE"}]' <<<"$completed")"
+        --arg mode "$(pg_review_decision_result_mode "$candidate")" --argjson bindable "$(pg_review_decision_result_bindable "$artifact" "$candidate")" \
+        '. + [{applicable:true,artifact_digest:$digest,bindable:$bindable,binding_valid:false,canonical_identity:$marker,charged_spend_epoch:$charged,collected:false,evidence_mode:$mode,legacy:false,marker:$marker,provenance_valid:false,verdict:"NONE"}]' <<<"$completed")"
     done < <(find "$(pg_review_input_binding_dir)" -mindepth 1 -maxdepth 1 -type f -name "pg-run-$ROUND_KEY-*" -printf '%f\n' 2>/dev/null | LC_ALL=C sort)
   fi
   attempt_snapshot="$(pg_attempt_snapshot "$PG_META_HOST" "$PG_META_OWNER" "$PG_META_REPO" "$PR_NUM" "$ROUND_KEY" "${RUN_MARKER:-}" 2>/dev/null || true)"

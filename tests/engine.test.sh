@@ -4632,19 +4632,32 @@ UNKNOWN_OUT="$(rd_reduce "$UNKNOWN_FACTS")"
 check 'unknown decision contract stops closed' \
   "$(jq -e '.action == "stop-without-new-review" and .reason == "unknown-contract"' <<<"$UNKNOWN_OUT" >/dev/null 2>&1; echo $?)" "$UNKNOWN_OUT"
 
-LEGACY_COLLECT='{"completed_results":[{"applicable":false,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binding_valid":false,"canonical_identity":"legacy-a","charged_spend_epoch":1700000100,"collected":false,"legacy":true,"marker":"pg-run-legacy-1983-1700000100-1","provenance_valid":false,"verdict":"SHIP"}]}'
+LEGACY_COLLECT='{"completed_results":[{"applicable":false,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bindable":true,"binding_valid":false,"canonical_identity":"legacy-a","charged_spend_epoch":1700000100,"collected":false,"evidence_mode":"none","legacy":true,"marker":"pg-run-legacy-1983-1700000100-1","provenance_valid":false,"verdict":"SHIP"}]}'
 LEGACY_COLLECT_OUT="$(rd_reduce "$(rd_facts "$LEGACY_COLLECT")")"
 check 'legacy completed artifact remains collectable' \
   "$(jq -e '.action == "collect-existing-result"' <<<"$LEGACY_COLLECT_OUT" >/dev/null 2>&1; echo $?)" "$LEGACY_COLLECT_OUT"
 rd_expect_stop 'legacy SHIP cannot authorize merge eligibility or paid continuation' \
   '{"prior_review":{"applicable":true,"binding_valid":false,"code_identity":"input-current","evidence_identity":"evidence-current","legacy":true,"marker":"pg-run-legacy-1983-1-1","provenance_valid":false,"verdict":"SHIP"}}' 'legacy-not-authoritative'
 
-SELECT_PATCH='{"completed_results":[{"applicable":true,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binding_valid":true,"canonical_identity":"result-a","charged_spend_epoch":1700000200,"collected":false,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000200-1","provenance_valid":true,"verdict":"SHIP"},{"applicable":true,"artifact_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","binding_valid":true,"canonical_identity":"result-b","charged_spend_epoch":1700000201,"collected":false,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000201-2","provenance_valid":true,"verdict":"FIX-FIRST"}]}'
+SELECT_PATCH='{"completed_results":[{"applicable":true,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bindable":true,"binding_valid":true,"canonical_identity":"result-a","charged_spend_epoch":1700000200,"collected":false,"evidence_mode":"full-pr","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000200-1","provenance_valid":true,"verdict":"SHIP"},{"applicable":true,"artifact_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","bindable":true,"binding_valid":true,"canonical_identity":"result-b","charged_spend_epoch":1700000201,"collected":false,"evidence_mode":"full-pr","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000201-2","provenance_valid":true,"verdict":"FIX-FIRST"}]}'
 SELECT_OUT="$(rd_reduce "$(rd_facts "$SELECT_PATCH")")"
 check 'newest charged completed result and canonical identity are selected' \
   "$(jq -e '.action == "collect-existing-result" and .effect_request.applicable_ref == "result-b"' <<<"$SELECT_OUT" >/dev/null 2>&1; echo $?)" "$SELECT_OUT"
 rd_expect_stop 'unresolved completed-result identity tie stops closed' \
-  '{"completed_results":[{"applicable":true,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binding_valid":true,"canonical_identity":"same","charged_spend_epoch":1700000300,"collected":false,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000300-1","provenance_valid":true,"verdict":"SHIP"},{"applicable":true,"artifact_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","binding_valid":true,"canonical_identity":"same","charged_spend_epoch":1700000300,"collected":false,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000300-2","provenance_valid":true,"verdict":"SHIP"}]}' 'completed-result-tie'
+  '{"completed_results":[{"applicable":true,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bindable":true,"binding_valid":true,"canonical_identity":"same","charged_spend_epoch":1700000300,"collected":false,"evidence_mode":"full-pr","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000300-1","provenance_valid":true,"verdict":"SHIP"},{"applicable":true,"artifact_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","bindable":true,"binding_valid":true,"canonical_identity":"same","charged_spend_epoch":1700000300,"collected":false,"evidence_mode":"full-pr","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000300-2","provenance_valid":true,"verdict":"SHIP"}]}' 'completed-result-tie'
+
+# #147: an uncollected result whose evidence mode can never carry merge proof is unrepairable. The
+# reducer must say so in a closed reason that names the mode and marker, never re-issue collect.
+NOT_BINDABLE_PATCH='{"completed_results":[{"applicable":true,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bindable":false,"binding_valid":false,"canonical_identity":"pg-run-acme-widgets-1983-1700000350-1","charged_spend_epoch":1700000350,"collected":false,"evidence_mode":"connector","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000350-1","provenance_valid":false,"verdict":"NONE"}]}'
+NOT_BINDABLE_OUT="$(rd_reduce "$(rd_facts "$NOT_BINDABLE_PATCH")")"
+check 'uncollected result that can never bind stops typed with its mode and marker, never collects' \
+  "$(jq -e '.action == "stop-without-new-review" and .reason == "result-not-bindable-for-mode" and .effect_request.execution_class == "report-only" and .effect_request.applicable_ref == "pg-run-acme-widgets-1983-1700000350-1" and .facts.completed_results[0].evidence_mode == "connector" and .facts.completed_results[0].marker == "pg-run-acme-widgets-1983-1700000350-1"' <<<"$NOT_BINDABLE_OUT" >/dev/null 2>&1; echo $?)" "$NOT_BINDABLE_OUT"
+check 'result-not-bindable-for-mode is enumerated by the frozen contract' \
+  "$(jq -e '.reasons | index("result-not-bindable-for-mode") != null' "$RD_CONTRACT" >/dev/null 2>&1; echo $?)"
+BINDABLE_PATCH="$(jq -c '.completed_results[0].bindable=true' <<<"$NOT_BINDABLE_PATCH")"
+BINDABLE_OUT="$(rd_reduce "$(rd_facts "$BINDABLE_PATCH")")"
+check 'the same uncollected result marked bindable still collects' \
+  "$(jq -e '.action == "collect-existing-result" and .reason == "completed-result-awaits-collection"' <<<"$BINDABLE_OUT" >/dev/null 2>&1; echo $?)" "$BINDABLE_OUT"
 
 rd_expect_stop 'identical verified code and evidence cannot authorize another review' \
   '{"prior_review":{"applicable":false,"binding_valid":true,"code_identity":"input-current","evidence_identity":"evidence-current","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000400-1","provenance_valid":true,"verdict":"NONE"}}' 'identical-code-and-evidence'
@@ -5748,12 +5761,12 @@ check 'stale run-granted advisory re-reduces a moved head without charge or Orac
 # selection case did not cover. These remain pure snapshots: race/restart fixture setup belongs
 # to U2's guarded-effect tests above.
 echo '# U3: review-decision precedence and recovery-state conformance'
-SAME_EPOCH_ORDER_PATCH='{"completed_results":[{"applicable":true,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binding_valid":true,"canonical_identity":"canonical-a","charged_spend_epoch":1700000900,"collected":false,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000900-1","provenance_valid":true,"verdict":"SHIP"},{"applicable":true,"artifact_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","binding_valid":true,"canonical_identity":"canonical-z","charged_spend_epoch":1700000900,"collected":false,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000900-2","provenance_valid":true,"verdict":"FIX-FIRST"}]}'
+SAME_EPOCH_ORDER_PATCH='{"completed_results":[{"applicable":true,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bindable":true,"binding_valid":true,"canonical_identity":"canonical-a","charged_spend_epoch":1700000900,"collected":false,"evidence_mode":"full-pr","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000900-1","provenance_valid":true,"verdict":"SHIP"},{"applicable":true,"artifact_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","bindable":true,"binding_valid":true,"canonical_identity":"canonical-z","charged_spend_epoch":1700000900,"collected":false,"evidence_mode":"full-pr","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000900-2","provenance_valid":true,"verdict":"FIX-FIRST"}]}'
 SAME_EPOCH_ORDER_OUT="$(rd_reduce "$(rd_facts "$SAME_EPOCH_ORDER_PATCH")")"
 check 'same charged epoch deterministically selects canonical identity before collection' \
   "$(jq -e '.action == "collect-existing-result" and .effect_request.applicable_ref == "canonical-z"' <<<"$SAME_EPOCH_ORDER_OUT" >/dev/null 2>&1; echo $?)" "$SAME_EPOCH_ORDER_OUT"
 
-COMPLETED_BEATS_ACTIVE_PATCH='{"active_index":{"binding_valid":true,"charged_spend_epoch":1700000902,"marker":"pg-run-acme-widgets-1983-1700000902-2","state":"charged"},"completed_results":[{"applicable":true,"artifact_digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","binding_valid":true,"canonical_identity":"completed-first","charged_spend_epoch":1700000901,"collected":false,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000901-1","provenance_valid":true,"verdict":"SHIP"}]}'
+COMPLETED_BEATS_ACTIVE_PATCH='{"active_index":{"binding_valid":true,"charged_spend_epoch":1700000902,"marker":"pg-run-acme-widgets-1983-1700000902-2","state":"charged"},"completed_results":[{"applicable":true,"artifact_digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","bindable":true,"binding_valid":true,"canonical_identity":"completed-first","charged_spend_epoch":1700000901,"collected":false,"evidence_mode":"full-pr","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000901-1","provenance_valid":true,"verdict":"SHIP"}]}'
 COMPLETED_BEATS_ACTIVE_OUT="$(rd_reduce "$(rd_facts "$COMPLETED_BEATS_ACTIVE_PATCH")")"
 check 'uncollected current result wins over newer active work without a fresh review' \
   "$(jq -e '.action == "collect-existing-result" and .effect_request.applicable_ref == "completed-first"' <<<"$COMPLETED_BEATS_ACTIVE_OUT" >/dev/null 2>&1; echo $?)" "$COMPLETED_BEATS_ACTIVE_OUT"
@@ -5959,5 +5972,75 @@ CONNECTOR_PENDING_RC=$?
 check 'exact pending connector SHIP is collect-only and never merge eligible' \
   "$([ "$CONNECTOR_PENDING_RC" -eq 0 ] && jq -e '.action=="collect-existing-result" and .action!="allow-existing-merge-workflow"' "$TDIR/connector-pending.json" >/dev/null 2>&1; echo $?)" \
   "rc=$CONNECTOR_PENDING_RC output=$(cat "$TDIR/connector-pending.json") stderr=$(cat "$TDIR/connector-pending.err")"
+
+# #147: a connector-delivered SHIP that reached completed/ can never be bound (no merge proof exists
+# for that mode), so the typed answer is a closed stop naming the mode and marker, not an endless
+# collect-existing-result. A FIX-FIRST connector result still binds (null proof) and routes to the
+# fixer, and a full-pr SHIP still repairs to the merge handoff. Every row below is built at the
+# repository's current head so each case is exact rather than a vacuous non-match.
+echo '# #147: unrepairable completed results stop typed instead of collecting forever'
+NB_HEAD="$(git -C "$DECISION_REPO" rev-parse HEAD)"
+NB_BASE="$(git -C "$DECISION_REPO" rev-parse HEAD^)"
+nb_connector_binding() { # marker epoch
+  jq -cS --arg marker "$1" --argjson epoch "$2" --arg head "$NB_HEAD" '.marker=$marker | .charged_spend_epoch=$epoch | .target.head_oid=$head | .evidence.identity=("connector:github.com/acme/widgets:" + $head) | .evidence.proof.commit_target=$head' <<<"$PC_CONNECTOR"
+}
+# (a) connector SHIP in completed/ with no result binding: typed stop, never collect, never merge.
+NB_SHIP_HOME="$TDIR/home-not-bindable-ship"; NB_SHIP_MARKER='pg-run-acme-widgets-1983-1700019000-1'
+mkdir -p "$NB_SHIP_HOME/completed"
+printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — connector observation.' > "$NB_SHIP_HOME/completed/$NB_SHIP_MARKER"
+NB_SHIP_BINDING="$(nb_connector_binding "$NB_SHIP_MARKER" 1700019000)"
+PRO_GATE_HOME="$NB_SHIP_HOME" pg_review_input_binding_write "$NB_SHIP_MARKER" "$NB_SHIP_BINDING"
+env PRO_GATE_HOME="$NB_SHIP_HOME" PRO_GATE_RUN_LOGS=0 bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --input connector >"$TDIR/nb-ship.json" 2>"$TDIR/nb-ship.err"
+NB_SHIP_RC=$?
+check 'connector SHIP in completed/ reduces to a typed stop with reason result-not-bindable-for-mode' \
+  "$([ "$NB_SHIP_RC" -eq 0 ] && jq -e '.action=="stop-without-new-review" and .reason=="result-not-bindable-for-mode" and .effect_request.execution_class=="report-only"' "$TDIR/nb-ship.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$NB_SHIP_RC output=$(cat "$TDIR/nb-ship.json") stderr=$(cat "$TDIR/nb-ship.err")"
+check 'typed stop carries the connector mode and the exact marker in its facts' \
+  "$(jq -e --arg marker "$NB_SHIP_MARKER" '.effect_request.applicable_ref==$marker and (.facts.completed_results|length==1) and .facts.completed_results[0].marker==$marker and .facts.completed_results[0].evidence_mode=="connector" and .facts.completed_results[0].bindable==false and .facts.completed_results[0].collected==false' "$TDIR/nb-ship.json" >/dev/null 2>&1; echo $?)" \
+  "output=$(cat "$TDIR/nb-ship.json")"
+# Replaying the stop as an effect is inert: no binding is repaired, nothing is written, no drift.
+NB_SHIP_STATE_BEFORE="$(find "$NB_SHIP_HOME" -mindepth 1 -printf '%P\n' | sort)"
+env PRO_GATE_HOME="$NB_SHIP_HOME" PRO_GATE_RUN_LOGS=0 bash "$ENGINE" --review-decision --review-decision-effect "$TDIR/nb-ship.json" --repo "$DECISION_REPO" --pr 1983 --input connector >"$TDIR/nb-ship-effect.json" 2>"$TDIR/nb-ship-effect.err"
+NB_SHIP_EFFECT_RC=$?
+NB_SHIP_STATE_AFTER="$(find "$NB_SHIP_HOME" -mindepth 1 -printf '%P\n' | sort)"
+check 'connector SHIP stop never repairs a result binding or becomes merge eligibility' \
+  "$([ "$NB_SHIP_EFFECT_RC" -eq 0 ] && [ "$NB_SHIP_STATE_AFTER" = "$NB_SHIP_STATE_BEFORE" ] && [ ! -e "$NB_SHIP_HOME/review-result-bindings/$NB_SHIP_MARKER" ] && jq -e '.action=="stop-without-new-review" and .reason=="result-not-bindable-for-mode"' "$TDIR/nb-ship-effect.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$NB_SHIP_EFFECT_RC output=$(cat "$TDIR/nb-ship-effect.json") stderr=$(cat "$TDIR/nb-ship-effect.err")"
+# (b) connector FIX-FIRST in completed/ is bindable: collect, repair with a null proof, then fix.
+NB_FIX_HOME="$TDIR/home-not-bindable-fix"; NB_FIX_MARKER='pg-run-acme-widgets-1983-1700019001-2'
+mkdir -p "$NB_FIX_HOME/completed"
+printf '%s\n' '[P1] a.sh:1 — fixture finding' 'P2: none' 'VERDICT: FIX-FIRST — connector observation.' > "$NB_FIX_HOME/completed/$NB_FIX_MARKER"
+NB_FIX_BINDING="$(nb_connector_binding "$NB_FIX_MARKER" 1700019001)"
+PRO_GATE_HOME="$NB_FIX_HOME" pg_review_input_binding_write "$NB_FIX_MARKER" "$NB_FIX_BINDING"
+env PRO_GATE_HOME="$NB_FIX_HOME" PRO_GATE_RUN_LOGS=0 bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --input connector >"$TDIR/nb-fix-collect.json" 2>"$TDIR/nb-fix-collect.err"
+NB_FIX_COLLECT_RC=$?
+check 'connector FIX-FIRST in completed/ is still collectable and marked bindable' \
+  "$([ "$NB_FIX_COLLECT_RC" -eq 0 ] && jq -e '.action=="collect-existing-result" and .reason=="completed-result-awaits-collection" and .facts.completed_results[0].bindable==true and .facts.completed_results[0].evidence_mode=="connector"' "$TDIR/nb-fix-collect.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$NB_FIX_COLLECT_RC output=$(cat "$TDIR/nb-fix-collect.json") stderr=$(cat "$TDIR/nb-fix-collect.err")"
+env PRO_GATE_HOME="$NB_FIX_HOME" PRO_GATE_RUN_LOGS=0 bash "$ENGINE" --review-decision --review-decision-effect "$TDIR/nb-fix-collect.json" --repo "$DECISION_REPO" --pr 1983 --input connector >"$TDIR/nb-fix-repair.json" 2>"$TDIR/nb-fix-repair.err"
+env PRO_GATE_HOME="$NB_FIX_HOME" PRO_GATE_RUN_LOGS=0 bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --input connector >"$TDIR/nb-fix-current.json" 2>"$TDIR/nb-fix-current.err"
+NB_FIX_CURRENT_RC=$?
+check 'repaired connector FIX-FIRST reduces to fix-review-findings' \
+  "$([ "$NB_FIX_CURRENT_RC" -eq 0 ] && [ -f "$NB_FIX_HOME/review-result-bindings/$NB_FIX_MARKER" ] && jq -e '.action=="fix-review-findings" and .reason=="review-findings-require-fix" and .facts.completed_results[0].collected==true and .facts.completed_results[0].evidence_mode=="connector"' "$TDIR/nb-fix-current.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$NB_FIX_CURRENT_RC repair=$(cat "$TDIR/nb-fix-repair.json") current=$(cat "$TDIR/nb-fix-current.json") stderr=$(cat "$TDIR/nb-fix-current.err")"
+# (c) full-pr SHIP in completed/ keeps its collect -> repair -> merge-handoff path unchanged.
+NB_FULL_HOME="$TDIR/home-not-bindable-full"; NB_FULL_MARKER='pg-run-acme-widgets-1983-1700019002-3'
+git -C "$DECISION_REPO" diff "$NB_BASE" "$NB_HEAD" > "$TDIR/nb-full.patch"
+NB_FULL_DIGEST="$(sha256sum "$TDIR/nb-full.patch" | awk '{print $1}')"
+NB_FULL_BINDING="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg marker "$NB_FULL_MARKER" --arg base "$NB_BASE" --arg head "$NB_HEAD" --arg digest "$NB_FULL_DIGEST" '{charged_spend_epoch:1700019002,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("full-pr:"+$base+":"+$head),mode:"full-pr",proof:{base_oid:$base,endpoint_digest:$digest,head_oid:$head,raw_patch_digest:$digest}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:"github.com",owner:"acme",repo:"widgets"},target:{head_oid:$head,kind:"pull-request",pr:1983}}')"
+mkdir -p "$NB_FULL_HOME/completed"
+printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — full endpoint reviewed.' > "$NB_FULL_HOME/completed/$NB_FULL_MARKER"
+PRO_GATE_HOME="$NB_FULL_HOME" pg_review_input_binding_write "$NB_FULL_MARKER" "$NB_FULL_BINDING"
+env PRO_GATE_HOME="$NB_FULL_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/nb-full.patch" bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/nb-full.patch" --input bundle >"$TDIR/nb-full-collect.json" 2>"$TDIR/nb-full-collect.err"
+NB_FULL_COLLECT_RC=$?
+check 'full-pr SHIP in completed/ is collectable and marked bindable' \
+  "$([ "$NB_FULL_COLLECT_RC" -eq 0 ] && jq -e '.action=="collect-existing-result" and .facts.completed_results[0].bindable==true and .facts.completed_results[0].evidence_mode=="full-pr"' "$TDIR/nb-full-collect.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$NB_FULL_COLLECT_RC output=$(cat "$TDIR/nb-full-collect.json") stderr=$(cat "$TDIR/nb-full-collect.err")"
+env PRO_GATE_HOME="$NB_FULL_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/nb-full.patch" bash "$ENGINE" --review-decision --review-decision-effect "$TDIR/nb-full-collect.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/nb-full.patch" --input bundle >"$TDIR/nb-full-repair.json" 2>"$TDIR/nb-full-repair.err"
+env PRO_GATE_HOME="$NB_FULL_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/nb-full.patch" bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/nb-full.patch" --input bundle >"$TDIR/nb-full-current.json" 2>"$TDIR/nb-full-current.err"
+NB_FULL_CURRENT_RC=$?
+check 'repaired full-pr SHIP still reduces to allow-existing-merge-workflow' \
+  "$([ "$NB_FULL_CURRENT_RC" -eq 0 ] && jq -e '.action=="allow-existing-merge-workflow" and .reason=="current-ship-is-merge-eligible"' "$TDIR/nb-full-current.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$NB_FULL_CURRENT_RC repair=$(cat "$TDIR/nb-full-repair.json") current=$(cat "$TDIR/nb-full-current.json") stderr=$(cat "$TDIR/nb-full-current.err")"
 
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }
