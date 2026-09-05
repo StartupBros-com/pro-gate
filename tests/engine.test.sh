@@ -808,8 +808,15 @@ git -C "$CLASSIC_REPO" diff HEAD^ HEAD > "$TDIR/classic-endpoint.patch"
 CLASSIC_GH_DIR="$TDIR/gh-classic"; mkdir -p "$CLASSIC_GH_DIR"
 cat > "$CLASSIC_GH_DIR/gh" <<'FAKE_GH'
 #!/usr/bin/env bash
+printf '%s\n' "$*" >> "${PG_TEST_GH_CALLS:-/dev/null}"
 case "$1 $2" in
-  'pr view') printf 'https://github.com/acme/classic/pull/%s\n' "$3" ;;
+  'pr view')
+    # The engine asks this endpoint two different questions: --json url for PR_URL on the classic
+    # path, and --json state,headRefOid for recovery's supersession proof. Answer by requested field.
+    case "$*" in
+      *state,headRefOid*) jq -nc --arg state "${PG_TEST_GH_STATE:-OPEN}" --arg head "${PG_TEST_GH_HEAD:-}" '{state:$state,headRefOid:$head}' ;;
+      *) printf 'https://github.com/acme/classic/pull/%s\n' "$3" ;;
+    esac ;;
   'pr diff') cat "${PG_TEST_GH_DIFF:?}" ;;
   *) echo "unexpected gh invocation: $*" >&2; exit 1 ;;
 esac
@@ -827,9 +834,59 @@ classicrun() { # $1=home $2=input
 }
 classicrun "$TDIR/home-classic-connector" connector
 check 'classic --input connector without --diff completes on the engine-fetched patch' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+CLASSIC_CONNECTOR_BINDING="$(find "$TDIR/home-classic-connector/review-input-bindings" -type f 2>/dev/null | head -1)"
+CLASSIC_HEAD="$(git -C "$CLASSIC_REPO" rev-parse HEAD)"
 check 'classic --input connector without --diff installs no full-pr input binding' \
-  "$(! find "$TDIR/home-classic-connector/review-input-bindings" -type f 2>/dev/null | grep -q .; echo $?)" \
-  "bindings=$(find "$TDIR/home-classic-connector/review-input-bindings" -type f 2>/dev/null | tr '\n' ' ')"
+  "$([ -n "$CLASSIC_CONNECTOR_BINDING" ] && jq -e '.evidence.mode!="full-pr"' "$CLASSIC_CONNECTOR_BINDING" >/dev/null 2>&1; echo $?)" \
+  "binding=$(cat "$CLASSIC_CONNECTOR_BINDING" 2>/dev/null)"
+# gate #159 r1 P1: mode correctness is not lifecycle identity. Skipping the record entirely left the
+# attempt with no immutable binding, and both recover_superseded_reason and pg_reservation_supersede
+# refuse a marker without one — so an obsolete connector attempt could never release its capacity.
+# The record it now writes is the same connector relation the typed path already produces.
+check 'gate #159 r1 P1: classic connector run installs a connector-mode lifecycle binding with null patch digests' \
+  "$([ -n "$CLASSIC_CONNECTOR_BINDING" ] && jq -e --arg head "$CLASSIC_HEAD" \
+     '.evidence.mode=="connector" and .evidence.proof.commit_target==$head and .target.head_oid==$head
+      and .evidence.proof.repository_target=="github.com/acme/classic" and .evidence.proof.endpoint_digest==null
+      and .evidence.proof.raw_diff_digest==null and .repository.owner=="acme" and .repository.repo=="classic"
+      and .target.pr==4242 and (.charged_spend_epoch|type=="number" and .>0)' \
+     "$CLASSIC_CONNECTOR_BINDING" >/dev/null 2>&1; echo $?)" \
+  "head=$CLASSIC_HEAD binding=$(cat "$CLASSIC_CONNECTOR_BINDING" 2>/dev/null)"
+# The other half of the fix: a lifecycle record must not become merge proof. The fixture oracle
+# returns SHIP, so this run has completed bytes whose result binding would carry a ship_proof in a
+# delivered-bytes mode; pg_review_decision_ship_mode_bindable must keep the connector run without one.
+check 'gate #159 r1 P1: a connector SHIP still earns no result binding (no merge proof)' \
+  "$(! find "$TDIR/home-classic-connector/review-result-bindings" -type f 2>/dev/null | grep -q .; echo $?)" \
+  "result-bindings=$(find "$TDIR/home-classic-connector/review-result-bindings" -type f 2>/dev/null | tr '\n' ' ') verdict=$(grep -m1 VERDICT "$TDIR/home-classic-connector/completed/$(ls -1 "$TDIR/home-classic-connector/completed" 2>/dev/null | head -1)" 2>/dev/null)"
+# The lifecycle claim end to end: put that same charged run back into the in-progress shape a stuck
+# review leaves (charged reservation, no result bytes), move the PR head on GitHub, and require exact
+# recovery to supersede it and hand the slot back. Before the fix this reported "Browser needs
+# attention" (exit 3) with the reservation still generating and one slot held.
+CLASSIC_REC_MARKER="$(ls -1 "$TDIR/home-classic-connector/run-meta" 2>/dev/null | head -1)"
+IFS=$'\t' read -r _ _ _ CLASSIC_REC_KEY _ CLASSIC_REC_OUT CLASSIC_REC_SPEND \
+  < "$TDIR/home-classic-connector/run-meta/$CLASSIC_REC_MARKER"
+rm -f "$TDIR/home-classic-connector/completed/$CLASSIC_REC_MARKER"
+printf '%s\t%s\t%s\t0\t1\tGPT-X\t%s\tgenerating\n' \
+  "$CLASSIC_REC_KEY" "$CLASSIC_REC_OUT" "$(date +%s)" "$CLASSIC_REC_SPEND" \
+  > "$TDIR/home-classic-connector/in-progress/$CLASSIC_REC_MARKER"
+: > "$TDIR/classic-recover-gh.calls"
+env PRO_GATE_HOME="$TDIR/home-classic-connector" ORACLE_BROWSER_PORT=65530 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_HARVEST_TTL_SWEEP=0 PRO_GATE_RECONCILE_INTERVAL=0 PRO_GATE_GH_BIN="$CLASSIC_GH_DIR/gh" \
+  PG_TEST_GH_CALLS="$TDIR/classic-recover-gh.calls" PG_TEST_GH_STATE=OPEN \
+  PG_TEST_GH_HEAD=0000000000000000000000000000000000000042 NODE_OPTIONS= \
+  bash "$ENGINE" --recover "$CLASSIC_REC_MARKER" --timeout 1s \
+  >"$TDIR/classic-recover.out" 2>"$TDIR/classic-recover.err"
+CLASSIC_REC_RC=$?
+check 'gate #159 r1 P1: recovery supersedes an in-progress classic connector run whose PR head moved' \
+  "$([ "$CLASSIC_REC_RC" -eq 6 ] && grep -qx 'Review superseded' "$TDIR/classic-recover.err" \
+     && grep -qF 'pr view 4242 --repo github.com/acme/classic --json state,headRefOid' "$TDIR/classic-recover-gh.calls" \
+     && [ "$(awk -F'\t' 'NR==1{print $8}' "$TDIR/home-classic-connector/in-progress/$CLASSIC_REC_MARKER")" = superseded ]; echo $?)" \
+  "rc=$CLASSIC_REC_RC stderr=$(cat "$TDIR/classic-recover.err") record=$(cat "$TDIR/home-classic-connector/in-progress/$CLASSIC_REC_MARKER" 2>/dev/null) gh=$(cat "$TDIR/classic-recover-gh.calls")"
+# The lib is not sourced into this shell until much later in the file; use the subshell idiom.
+classic_res_count() { PRO_GATE_HOME="$TDIR/home-classic-connector" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; $1"; }
+check 'gate #159 r1 P1: superseded classic connector attempt releases its review capacity' \
+  "$([ "$(classic_res_count pg_reservation_holding_count)" -eq 0 ] \
+     && [ "$(classic_res_count pg_reservation_count)" -eq 1 ]; echo $?)" \
+  "holding=$(classic_res_count pg_reservation_holding_count) total=$(classic_res_count pg_reservation_count)"
 classicrun "$TDIR/home-classic-bundle" bundle
 CLASSIC_BUNDLE_BINDING="$(find "$TDIR/home-classic-bundle/review-input-bindings" -type f 2>/dev/null | head -1)"
 check 'planted negative: classic --input bundle with the same setup installs a full-pr binding' \

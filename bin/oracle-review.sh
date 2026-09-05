@@ -1895,19 +1895,34 @@ pg_active_clear() {  # $1 = exit code
   fi
   rm -f "$f" 2>/dev/null || true
 }
-pg_install_full_pr_input_binding() { # marker; only endpoint-fetched full PRs gain automatic applicability
+pg_install_full_pr_input_binding() { # marker; every endpoint-fetched classic run gets a lifecycle
+  # binding, but only the delivered-bytes modes earn automatic merge applicability.
   local marker="$1" binding
   [ "${PG_FULL_PR_PROVEN:-0}" = 1 ] || return 0  # caller-supplied/scoped/bare patches remain bounded
-  # Merge eligibility binds bytes the engine delivered. FILE_ARGS attaches the endpoint patch only
-  # for bundle|both, so a connector-only classic run never handed the model those bytes and earns
-  # no full-pr relation (#150); it stays bounded like a bare patch, exactly as the typed path does.
-  case "$INPUT" in bundle|both) ;; *) return 0 ;; esac
   [ -n "${RUN_SPEND_EPOCH:-}" ] && [ -n "${PG_META_HOST:-}${PG_META_OWNER:-}${PG_META_REPO:-}" ] || return 1
-  binding="$(jq -cnS --arg cd "$(pg_review_decision_contract_digest)" --arg marker "$marker" \
-    --arg host "$PG_META_HOST" --arg owner "$PG_META_OWNER" --arg repo "$PG_META_REPO" --argjson pr "$PR_NUM" \
-    --arg base "$PG_FULL_PR_BASE" --arg head "$PG_FULL_PR_HEAD" --arg endpoint "$PG_FULL_PR_ENDPOINT_DIGEST" --arg raw "$PG_FULL_PR_RAW_DIGEST" \
-    --argjson epoch "$RUN_SPEND_EPOCH" \
-    '{charged_spend_epoch:$epoch,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("full-pr:"+$base+":"+$head),mode:"full-pr",proof:{base_oid:$base,endpoint_digest:$endpoint,head_oid:$head,raw_patch_digest:$raw}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:$host,owner:$owner,repo:$repo},target:{head_oid:$head,kind:"pull-request",pr:$pr}}')" || return 1
+  # Merge eligibility binds bytes the engine delivered. FILE_ARGS attaches the endpoint patch only
+  # for bundle|both, so a connector-only classic run never handed the model those bytes and earns no
+  # full-pr relation (#150). It still earns a RECORD: merge-proof eligibility and lifecycle identity
+  # are separate, and recover_superseded_reason plus pg_reservation_supersede both refuse a marker
+  # whose immutable binding is missing — so skipping the write entirely left an obsolete connector
+  # attempt occupying shared capacity with no way to release it (gate #159 r1 P1). The connector
+  # record is byte-identical in relation to the one the typed path already writes: repository,
+  # commit target, charged epoch, null patch digests. pg_review_decision_ship_mode_bindable keeps
+  # its SHIP results ineligible for merge proof exactly as before.
+  case "$INPUT" in
+    bundle|both)
+      binding="$(jq -cnS --arg cd "$(pg_review_decision_contract_digest)" --arg marker "$marker" \
+        --arg host "$PG_META_HOST" --arg owner "$PG_META_OWNER" --arg repo "$PG_META_REPO" --argjson pr "$PR_NUM" \
+        --arg base "$PG_FULL_PR_BASE" --arg head "$PG_FULL_PR_HEAD" --arg endpoint "$PG_FULL_PR_ENDPOINT_DIGEST" --arg raw "$PG_FULL_PR_RAW_DIGEST" \
+        --argjson epoch "$RUN_SPEND_EPOCH" \
+        '{charged_spend_epoch:$epoch,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("full-pr:"+$base+":"+$head),mode:"full-pr",proof:{base_oid:$base,endpoint_digest:$endpoint,head_oid:$head,raw_patch_digest:$raw}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:$host,owner:$owner,repo:$repo},target:{head_oid:$head,kind:"pull-request",pr:$pr}}')" || return 1 ;;
+    connector)
+      binding="$(jq -cnS --arg cd "$(pg_review_decision_contract_digest)" --arg marker "$marker" \
+        --arg host "$PG_META_HOST" --arg owner "$PG_META_OWNER" --arg repo "$PG_META_REPO" --argjson pr "$PR_NUM" \
+        --arg head "$PG_FULL_PR_HEAD" --argjson epoch "$RUN_SPEND_EPOCH" \
+        '{charged_spend_epoch:$epoch,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("connector:"+$host+"/"+$owner+"/"+$repo+":"+$head),mode:"connector",proof:{commit_target:$head,endpoint_digest:null,raw_diff_digest:null,repository_target:($host+"/"+$owner+"/"+$repo)}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:$host,owner:$owner,repo:$repo},target:{head_oid:$head,kind:"pull-request",pr:$pr}}')" || return 1 ;;
+    *) return 0 ;;
+  esac
   pg_review_input_binding_write "$marker" "$binding"
 }
 
