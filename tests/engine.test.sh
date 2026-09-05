@@ -6185,4 +6185,94 @@ check '#155 r1: a sweep mutex stranded by a killed sweeper fails closed, never s
      && [ -d "$DL_WEDGE_NS/.pg-reclaim-sweep.d" ] \
      && [ "$(cat "$DL_WEDGE_NS/.pg-reclaim-sweep.d/pid" 2>/dev/null)" = "$DL_SER_DEAD" ]; echo $?)" \
   "rc=$DL_WEDGE_RC remaining=$(ls -a "$DL_WEDGE_NS" | tr '\n' ' ')"
+# Gate #155 r2 P1: the engine's OWN housekeeping could delete an in-flight reclaim mutex. The
+# legacy per-PR lock sweep is age-only, takes no mutex, and runs BEFORE the ownership-aware sweep
+# above — and its glob (<lockfile>.pr-*) matches the no-flock spinlock's `<lock>.d` and
+# `<lock>.d.reclaim` DIRECTORIES as readily as the 0-byte flock files it was written for.
+# `-delete` removes an EMPTY one, which is exactly a reclaimer suspended between its `mkdir` and
+# the `echo $$ > pid` one line later; removing it admits a second reclaimer while the first still
+# holds an already-decided `rm -rf`, the double-reclaim of #152 with housekeeping standing in for
+# the missing serialization. The check runs the engine's own sweep sequence for that namespace,
+# extracted verbatim and in the engine's order, against exactly that state — and pins that the
+# 0-byte lock FILES the sweep exists for are still collected.
+DL_HK_NS="$TDIR/home-housekeeping-sweep"; mkdir -p "$DL_HK_NS"
+DL_HK_LOCKFILE="$DL_HK_NS/oracle.lock"; DL_HK_PR="$DL_HK_LOCKFILE.pr-acme-widgets-77"
+mkdir -p "$DL_HK_PR.d.reclaim"                                  # live reclaimer, pid not published
+mkdir -p "$DL_HK_PR.d"; printf '%s\n' "$DL_SER_DEAD" > "$DL_HK_PR.d/pid"   # its dead-owner subject
+: > "$DL_HK_LOCKFILE.pr-acme-widgets-99"                        # the aged flock file, still sweepable
+touch -t 202001010000 "$DL_HK_PR.d.reclaim" "$DL_HK_PR.d" "$DL_HK_LOCKFILE.pr-acme-widgets-99"
+DL_HK_LEGACY="$(grep -F 'find "$(dirname "$LOCKFILE")" -maxdepth 1' "$ENGINE" || true)"
+DL_HK_RUN="$(PRO_GATE_HOME="$DL_HK_NS" bash -c '. "$1"; LOCKFILE="$2"
+  eval "$3"                              # the age-only per-PR lock sweep from the engine, verbatim
+  pg_stale_reclaim_sweep "$(dirname "$LOCKFILE")"' \
+  _ "$HERE/../lib/pro-gate-lib.sh" "$DL_HK_LOCKFILE" "$DL_HK_LEGACY" 2>&1)"
+DL_HK_RUN_RC=$?
+# The surviving mutex must still exclude the second reclaimer it exists to keep out.
+DL_HK_INTRUDER=1; mkdir "$DL_HK_PR.d.reclaim" 2>/dev/null && DL_HK_INTRUDER=0
+check '#155 r2: housekeeping never deletes a reclaim lock whose reclaimer has not published its pid' \
+  "$([ -n "$DL_HK_LEGACY" ] && [ "$DL_HK_RUN_RC" -eq 0 ] \
+     && [ -d "$DL_HK_PR.d.reclaim" ] && [ "$DL_HK_INTRUDER" -eq 1 ] \
+     && [ -d "$DL_HK_PR.d" ] \
+     && [ ! -e "$DL_HK_LOCKFILE.pr-acme-widgets-99" ]; echo $?)" \
+  "rc=$DL_HK_RUN_RC intruder_entered=$((1 - DL_HK_INTRUDER)) legacy=$DL_HK_LEGACY out=$DL_HK_RUN remaining=$(ls -a "$DL_HK_NS" | tr '\n' ' ')"
+
+# Gate #155 r2 P2: only FRESH dispatch ever reached that housekeeping. --harvest takes its lock at
+# the top of its own block and exits at every outcome long before the sweep, and --recover reaches
+# collection only by delegating to that same path (`bash "$0" --harvest`). So on a no-flock host a
+# reclaim lock orphaned beside a stale harvest lock — a reclaimer killed after publishing its pid,
+# before its `rm -rf` landed — made every harvest AND every recovery return exit 7 forever:
+# acquisition refuses to reclaim a reclaim lock by design, so only the sweep can clear one, and
+# nothing on those paths ran it. The check runs the engine's own harvest-path sweep statement,
+# extracted verbatim, immediately before the same acquisition, against exactly that state.
+DL_RECOV_HOME="$TDIR/home-recovery-sweep"; DL_RECOV_NS="$DL_RECOV_HOME/harvest-locks"
+mkdir -p "$DL_RECOV_NS"
+DL_RECOV_LOCK="$DL_RECOV_NS/pg-run-acme-widgets-77-1700000000-1"
+mkdir -p "$DL_RECOV_LOCK.d"; printf '%s\n' "$DL_SER_DEAD" > "$DL_RECOV_LOCK.d/pid"
+dl_seed_reclaim "$DL_RECOV_LOCK.d.reclaim" "$DL_SER_DEAD" aged
+DL_RECOV_WIRE="$(grep -F 'pg_stale_reclaim_sweep "$(dirname "$HARVEST_LOCK")"' "$ENGINE" || true)"
+PRO_GATE_HOME="$DL_RECOV_HOME" bash -c '. "$1"
+  pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
+  HARVEST_LOCK="$2"
+  eval "$3"                                  # the harvest path sweep from the engine, verbatim
+  pg_lock "$HARVEST_LOCK" 2' \
+  _ "$HERE/../lib/pro-gate-lib.sh" "$DL_RECOV_LOCK" "$DL_RECOV_WIRE"
+DL_RECOV_RC=$?
+check '#155 r2: recovery clears an eligible dead-owner reclaim lock without a fresh dispatch' \
+  "$([ -n "$DL_RECOV_WIRE" ] && [ "$DL_RECOV_RC" -eq 0 ] \
+     && [ ! -d "$DL_RECOV_LOCK.d.reclaim" ]; echo $?)" \
+  "rc=$DL_RECOV_RC wire=$DL_RECOV_WIRE remaining=$(ls -a "$DL_RECOV_NS" | tr '\n' ' ')"
+
+# ...and the sweep has to precede the acquisition it unblocks, on EVERY mutating harvest/recovery
+# entry point, not just the two whose symptom was reported. Placed after the lock it would sweep
+# for, or omitted from one of them, the orphan is still there when that entry point acquires and
+# the wedge survives the fix. Four acquisitions qualify: the harvest lock; --recover's terminal
+# per-PR lock; the recover-existing-review EFFECT, which takes that same per-PR lock for that same
+# pg_attempt_reconcile_terminal and is the route daemon/daemon.sh actually dispatches; and the
+# result-binding repair the collect-existing-result effect reaches, whose failure the caller
+# swallows with `|| true`. Read-only resolution stays untouched by design — it mutates nothing and
+# can wait for the next mutating pass, and its contract forbids borrowing engine housekeeping.
+dl_sweep_precedes() { # acquisition-literal sweep-literal — 0 when a sweep of that namespace sits
+  local acq sweeps n                                    # within 20 lines above the acquisition
+  acq="$(grep -nF "$1" "$ENGINE" | head -1 | cut -d: -f1)"
+  [ -n "$acq" ] || return 1
+  sweeps="$(grep -nF "$2" "$ENGINE" | cut -d: -f1)"
+  for n in $sweeps; do
+    [ "$n" -lt "$acq" ] && [ $(( acq - n )) -le 20 ] && return 0
+  done
+  return 1
+}
+DL_ORDER_PER_PR='pg_stale_reclaim_sweep "$(dirname "${PRO_GATE_LOCKFILE:-$PRO_GATE_HOME/oracle.lock}")"'
+DL_ORDER_MISSING=""
+dl_sweep_precedes 'pg_lock "$HARVEST_LOCK"' \
+  'pg_stale_reclaim_sweep "$(dirname "$HARVEST_LOCK")"' || DL_ORDER_MISSING="$DL_ORDER_MISSING harvest"
+dl_sweep_precedes 'pg_lock "${PRO_GATE_LOCKFILE:-$PRO_GATE_HOME/oracle.lock}.pr-${REC_TERMINAL_KEY}"' \
+  "$DL_ORDER_PER_PR" || DL_ORDER_MISSING="$DL_ORDER_MISSING recover-terminal"
+dl_sweep_precedes 'pg_lock "${PRO_GATE_LOCKFILE:-$PRO_GATE_HOME/oracle.lock}.pr-${round_key}"' \
+  "$DL_ORDER_PER_PR" || DL_ORDER_MISSING="$DL_ORDER_MISSING effect-recover-existing-review"
+dl_sweep_precedes 'pg_lock "$lock" "${PRO_GATE_REVIEW_EFFECT_LOCK_WAIT:-5}"' \
+  'pg_stale_reclaim_sweep "$(dirname "$lock")"' || DL_ORDER_MISSING="$DL_ORDER_MISSING effect-result-binding"
+check '#155 r2: every mutating recovery entry point sweeps its lock namespace before acquiring it' \
+  "$([ -z "$DL_ORDER_MISSING" ]; echo $?)" \
+  "unswept acquisitions:$DL_ORDER_MISSING"
+
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }

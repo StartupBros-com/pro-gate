@@ -291,6 +291,13 @@ pg_review_decision_repair_result_binding() { # marker input-binding-json
     '{accepted_epoch:$accepted,artifact:{digest:$digest,path:("completed/"+$marker)},contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,input_binding_digest:$ib,input_binding_identity:$marker,marker:$marker,named_choice:null,provenance:{outcome:"accepted",validated_epoch:$accepted},record_type:"review-result-binding/v1",record_version:1,ship_proof:$proof,verdict:$verdict}')" || return 1
   lock="${PRO_GATE_REVIEW_DECISION_LOCK_DIR:-$PRO_GATE_HOME/review-decision-locks}/$marker"
   mkdir -p "$(dirname "$lock")" 2>/dev/null || return 1
+  # gate #155 r2 P2: the collect-existing-result effect reaches this write without ever running
+  # the engine's 24h housekeeping (it exits at line ~688), so an orphaned reclaim lock in this
+  # namespace made the repair fail closed on every retry — and silently, since the caller there
+  # swallows the failure with `|| true`. Guarded here rather than at that call site so the
+  # fresh-dispatch caller is covered by the same statement; on that path housekeeping has already
+  # swept, and a namespace with no reclaim lock costs one glob and takes no lock.
+  pg_stale_reclaim_sweep "$(dirname "$lock")"
   pg_lock "$lock" "${PRO_GATE_REVIEW_EFFECT_LOCK_WAIT:-5}" || return 1
   # The no-clobber artifact was already persisted. This only installs its one immutable sibling;
   # a byte-identical replay succeeds, while a conflicting sibling remains collect-only.
@@ -646,6 +653,16 @@ pg_review_decision_cli() {
     if [ "$effect_ok" = true ] && [ "$(jq -r .action <<<"$decision")" = recover-existing-review ]; then
       effect_marker="$(jq -r '.effect_request.applicable_ref // ""' <<<"$decision")"
       if [ -n "$(pg_attempt_disposition_read "$effect_marker" 2>/dev/null || true)" ]; then
+        # gate #155 r2 P2: an EFFECT is a mutating recovery entry point, and this one takes the
+        # same per-PR lock, for the same pg_attempt_reconcile_terminal, as --recover. It is also
+        # the route the daemon actually drives (daemon/daemon.sh dispatches
+        # runtime-guarded-effect/recover-existing-review straight back through
+        # --review-decision-effect), and it exits at line ~688 without ever reaching the engine's
+        # 24h housekeeping, so an orphaned reclaim lock here wedges the daemon's recovery loop at
+        # exit 7 forever. Sweep this lock's namespace first, exactly as --recover and --harvest do.
+        # Effects only: the read-only resolution above this boundary stays untouched, as its
+        # contract at the top of this section requires.
+        pg_stale_reclaim_sweep "$(dirname "${PRO_GATE_LOCKFILE:-$PRO_GATE_HOME/oracle.lock}")"
         if ! pg_lock "${PRO_GATE_LOCKFILE:-$PRO_GATE_HOME/oracle.lock}.pr-${round_key}" "${PRO_GATE_RECOVER_LOCK_WAIT:-30}"; then
           echo 'ERROR: terminal attempt cleanup is busy; retry recovery.' >&2; return 7
         fi
@@ -928,6 +945,12 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
   REC_DISPOSITION="$(pg_attempt_disposition_read "$REC_SELECTED" 2>/dev/null || true)"
   if [ -n "$REC_DISPOSITION" ]; then
     REC_TERMINAL_KEY="$(jq -r .round_key <<<"$REC_DISPOSITION")"
+    # gate #155 r2 P2, same gap as the harvest lock below: --recover never reaches the engine's
+    # 24h housekeeping either, so an orphaned reclaim lock in the per-PR namespace would wedge
+    # this terminal cleanup at exit 7 until some unrelated fresh dispatch happened to sweep it.
+    # Every step of the sweep redirects its own output, so the single-plain-state-line contract
+    # this mode promises is untouched.
+    pg_stale_reclaim_sweep "$(dirname "${PRO_GATE_LOCKFILE:-$PRO_GATE_HOME/oracle.lock}")"
     if ! pg_lock "${PRO_GATE_LOCKFILE:-$PRO_GATE_HOME/oracle.lock}.pr-${REC_TERMINAL_KEY}" "${PRO_GATE_RECOVER_LOCK_WAIT:-30}"; then
       echo "Checking for completed review" >&2; exit 7
     fi
@@ -2514,6 +2537,16 @@ if [ -n "$HARVEST_MARKER" ]; then
   # reservation removal). Linux uses flock; macOS/no-flock uses the existing pg_lock mkdir path.
   HARVEST_LOCK="${PRO_GATE_HARVEST_LOCK_DIR:-$PRO_GATE_HOME/harvest-locks}/${RUN_MARKER}"
   mkdir -p "$(dirname "$HARVEST_LOCK")" 2>/dev/null || { pg_status failed "harvest lock dir unavailable"; pg_finish 3; }
+  # gate #155 r2 P2: this block exits at every outcome long before the engine's 24h housekeeping,
+  # and --recover reaches collection only by delegating here (`bash "$0" --harvest`). So on a
+  # no-flock host a reclaim lock orphaned in THIS namespace — a reclaimer killed after publishing
+  # its pid, before its `rm -rf` landed — wedged the whole documented recovery workflow at exit 7
+  # forever: acquisition deliberately refuses to reclaim a reclaim lock, so only the sweep can
+  # clear one, and only fresh dispatch ever ran it. Sweep this lock's own namespace first, under
+  # the same proven-dead-owner + 24h proof and the same per-namespace mutex. A namespace holding
+  # no reclaim lock (every flock host) costs one glob and takes no lock, and the sweep is silent,
+  # so neither the harvest contract nor --recover's one-plain-state-line contract changes.
+  pg_stale_reclaim_sweep "$(dirname "$HARVEST_LOCK")"
   if ! pg_lock "$HARVEST_LOCK" "${PRO_GATE_HARVEST_LOCK_WAIT:-5}"; then
     echo "ERROR: another harvest is already collecting marker ${RUN_MARKER}; not racing it." >&2
     pg_status failed "harvest already running"
@@ -3132,7 +3165,15 @@ EFF_CONC="$(pg_ramp_level "$MAX_CONC")"
 # untouched for >24h — any legitimate holder finishes within the ~35 min hard cap. Same for
 # per-marker harvest locks (v0.20.2 dogfood left one stale for 10h; flock holders keep the
 # file's inode alive, so deleting an unheld file is always safe).
-find "$(dirname "$LOCKFILE")" -maxdepth 1 -name "$(basename "$LOCKFILE").pr-*" -mmin +1440 -delete 2>/dev/null || true
+# `-type f` is load-bearing (gate #155 r2 P1), not tidiness: the same glob also matches the
+# no-flock spinlock's own DIRECTORIES beside those files — `<lock>.pr-<key>.d` and its
+# `.d.reclaim` sibling — and `-delete` removes an EMPTY one. Empty is exactly a live holder or
+# reclaimer one statement short of publishing its pid, and age cannot tell that apart from a
+# process that died there. Deleting a reclaim lock admits a second reclaimer beside the first's
+# already-decided `rm -rf`: the double-reclaim #152 closes, re-opened by our own housekeeping,
+# unserialized and with no ownership check. Directories are reclaimed only under the
+# ownership-aware, mutex-held protocol (pg_stale_dirlock_reap / pg_stale_reclaim_sweep below).
+find "$(dirname "$LOCKFILE")" -maxdepth 1 -type f -name "$(basename "$LOCKFILE").pr-*" -mmin +1440 -delete 2>/dev/null || true
 find "${PRO_GATE_HARVEST_LOCK_DIR:-$PRO_GATE_HOME/harvest-locks}" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
 find "$(pg_active_dir)" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
 find "$(pg_manifest_dir)" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
