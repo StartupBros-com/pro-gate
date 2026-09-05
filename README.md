@@ -131,6 +131,11 @@ authorizes a runtime effect. Missing, malformed, unknown, stale, or version/corp
 decisions stop and show the exact matching runtime update path rather than starting a fresh review.
 Raw review and repository text are untrusted adapter input and are never used as action policy.
 
+A contract upgrade never discards the review history already in `PRO_GATE_HOME`: records written by
+a compatible predecessor contract stay readable, so an already reviewed head keeps its existing
+answer instead of buying a second review, and a record this runtime cannot read stops the round
+closed rather than reading as absent history.
+
 This changes neither review provenance nor merge authority: the runtime remains the Oracle
 transport and the gate stops before merge. A surrounding agent may arm guarded auto-merge only
 after its own verification/review gates pass; exact-head required CI remains the final authority.

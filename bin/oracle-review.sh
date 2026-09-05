@@ -437,7 +437,7 @@ pg_review_decision_cli() {
   local input_proven=false input_binding_valid=false input_identity evidence_identity evidence_state
   local input_marker="" input_record="" input_digest="" f marker candidate candidate_relation desired_relation exact=false active_marker="" active_state=none
   local endpoint reviewed manifest confirmation endpoint_digest reviewed_digest manifest_digest confirmation_digest lineage mode ship_digest
-  local reservation_marker="" reservation_state=none governor_granted=false completed='[]' prior_candidates='[]' prior_review result artifact artifact_digest canonical
+  local reservation_marker="" reservation_state=none governor_granted=false completed='[]' prior_candidates='[]' prior_review result artifact artifact_digest canonical legacy_history=false
   local facts decision effect_ok=false prospective exact_inputs='[]' choice_candidates='[]' choice_outcomes='[]' choice_selected="" choice_snapshot="" selection="" selection_supplied=false current_verdict=NONE current_canonical="" effect_input attempt_snapshot attempt_source
 
   pg_have jq || { echo 'ERROR: review-decision/v1 requires jq' >&2; return 2; }
@@ -502,7 +502,16 @@ pg_review_decision_cli() {
   # the desired invocation relation; marker and charged epoch are intentionally excluded.
   while IFS= read -r marker; do
     candidate="$(pg_review_input_binding_read "$marker" 2>/dev/null || true)"
-    [ -n "$candidate" ] || continue
+    if [ -z "$candidate" ]; then
+      # A record this runtime cannot read is not absent history. Predecessor contracts whose record
+      # shapes are unchanged read normally above; anything else that is still a structurally whole
+      # record for this exact target is unreadable history, and unreadable history must stop the
+      # round closed rather than let it buy a second review of the same head (gate #159 r1 P1).
+      if pg_review_input_binding_foreign_contract "$marker" "$host" "$owner" "$repo_name" "$pr_num" "$head"; then
+        legacy_history=true
+      fi
+      continue
+    fi
     jq -e --arg h "$host" --arg o "$owner" --arg r "$repo_name" --argjson p "$pr_num" --arg head "$head" \
       '.repository.host==$h and .repository.owner==$o and .repository.repo==$r and .target.pr==$p and .target.head_oid==$head' \
       <<<"$candidate" >/dev/null 2>&1 || continue
@@ -625,6 +634,12 @@ pg_review_decision_cli() {
     sort_by(.charged_spend_epoch,.canonical_identity) | last //
     {code_identity:"",evidence_identity:"",marker:"",verdict:"NONE"} |
     {applicable:false,binding_valid:(.marker != ""),code_identity,evidence_identity,legacy:false,marker,provenance_valid:(.marker != ""),verdict}' <<<"$prior_candidates")"
+  # Unreadable predecessor history is applicable but never authoritative: the reducer's existing
+  # closed legacy-not-authoritative stop keeps it out of merge eligibility, fix routing, and any
+  # fresh grant. A readable completed result for this head still outranks it in the reducer.
+  if [ "$legacy_history" = true ]; then
+    prior_review="$(jq -cS '.applicable=true | .legacy=true' <<<"$prior_review")"
+  fi
 
   # Lifecycle ownership comes from one canonical snapshot. Querying stale mutable state remains
   # conservative (recover); reconciliation stays an effect and cannot happen in this read-only path.
@@ -1982,7 +1997,11 @@ pg_fresh_dispatch_require_run() { # boundary label; exits through existing statu
 pg_install_effect_input_binding() { # clone the already-current validated relation to this charged marker
   local binding
   [ -n "${RUN_SPEND_EPOCH:-}" ] || return 1
-  binding="$(jq -cS --arg marker "$RUN_MARKER" --argjson epoch "$RUN_SPEND_EPOCH" '.marker=$marker | .charged_spend_epoch=$epoch' <<<"$REVIEW_DECISION_INPUT_TEMPLATE")" || return 1
+  # Only the proof relation is inherited. The template may be a persisted record written under a
+  # predecessor contract (readable history, gate #159 r1 P1), while this is a NEW record for a new
+  # marker and charge, so it is stamped with the current contract exactly like every other write.
+  binding="$(jq -cS --arg marker "$RUN_MARKER" --argjson epoch "$RUN_SPEND_EPOCH" --arg cd "$(pg_review_decision_contract_digest)" \
+    '.marker=$marker | .charged_spend_epoch=$epoch | .contract_digest=$cd' <<<"$REVIEW_DECISION_INPUT_TEMPLATE")" || return 1
   pg_review_input_binding_write "$RUN_MARKER" "$binding"
 }
 pg_fresh_dispatch_refund() { # terminalize and refund only the current exact charged attempt
