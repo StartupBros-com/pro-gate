@@ -2414,4 +2414,86 @@ const FOREIGN_ANSWER = (m) => [
   }
 }
 
+// v0.42 (#109): a synthetic placeholder such as https://chatgpt.com/c/WEB:<uuid> once passed the
+// prefix-only memo check, was remembered as authoritative, and parked its run forever: the page
+// behind it carries no marker, so every later pass was inconclusive and never counted a miss.
+// The memo's conversation id must now be one path segment of letters, digits, and dashes, checked
+// when a URL is remembered AND every time one is read.
+const PLACEHOLDER_URLS = [
+  'https://chatgpt.com/c/WEB:57cc5403-ad61-4ccd-af90-ad28a539081e',
+  // A well-formed UUID after the prefix must still fail: the check anchors the whole segment.
+  'https://chatgpt.com/c/WEB:b385e15b-9c62-4dca-bec7-0be2f579c0f3',
+];
+const REAL_ID_URL = 'https://chatgpt.com/c/6a959c8f-c95c-83ea-81b8-85a3ea5d6cbc';
+
+{ // AE1: write time — a placeholder-URL tab that carries our marker is NEVER remembered.
+  const placeholder = PLACEHOLDER_URLS[0];
+  const cdp = await mockCdp('__NO_TABS__', [{ id: 'ph1', type: 'page', url: placeholder }], {
+    tabText: () => `run marker: ${MARKER}\nthinking hard, no verdict yet`,
+  });
+  const r = await runFastPollSalvage([MARKER, '3'], cdp.port);
+  check('placeholder tab still counts as our still-generating conversation (exit 3)', r.status === 3, `status=${r.status} stderr=${r.stderr?.slice(-300)}`);
+  check('placeholder URL is not remembered as a memo', r.memos.length === 0, `memos=${r.memos} memo=${r.memoUrl}`);
+  check('rejection names the marker and the offending id',
+    (r.stderr || '').includes('memo-rejected') && (r.stderr || '').includes(MARKER) && (r.stderr || '').includes('WEB:57cc5403'),
+    `stderr=${r.stderr?.slice(-400)}`);
+  cdp.stop();
+}
+
+{ // AE5: write time — a real conversation id is remembered exactly as before.
+  const cdp = await mockCdp('__NO_TABS__', [{ id: 'real1', type: 'page', url: REAL_ID_URL }], {
+    tabText: () => `run marker: ${MARKER}\nthinking hard, no verdict yet`,
+  });
+  const r = await runFastPollSalvage([MARKER, '3'], cdp.port);
+  check('real-id tab is remembered', r.memoUrl === REAL_ID_URL, `memo=${r.memoUrl} status=${r.status}`);
+  check('real-id memo has no rejection line', !/memo-rejected/.test(r.stderr || ''), `stderr=${r.stderr?.slice(-300)}`);
+  cdp.stop();
+}
+
+for (const placeholder of PLACEHOLDER_URLS) {
+  // AE2 (first pass): read time — a seeded placeholder memo is revoked in the SAME pass, the
+  // pass rescans, and with no candidate carrying the marker it exits confirmed-absent (4), not
+  // inconclusive (7). Before the fix the remembered render never rendered the marker and the
+  // pass parked at exit 7 forever, never counting a miss.
+  const cdp = await mockCdp('an unrelated page with no run marker at all');
+  const r = await runFastPollSalvage([MARKER, '3'], cdp.port, seedMemo(MARKER, placeholder));
+  const id = placeholder.split('/c/')[1];
+  check(`placeholder memo ${id.slice(0, 12)} is revoked on read`, r.memos.length === 0, `memos=${r.memos} memo=${r.memoUrl}`);
+  check(`revocation names the marker and id (${id.slice(0, 12)})`,
+    (r.stderr || '').includes('memo-revoked') && (r.stderr || '').includes(MARKER) && (r.stderr || '').includes(id),
+    `stderr=${r.stderr?.slice(-400)}`);
+  check(`same pass reaches confirmed-absent after revoking ${id.slice(0, 12)}`, r.status === 4, `status=${r.status} stderr=${r.stderr?.slice(-300)}`);
+  cdp.stop();
+}
+
+{ // AE2 with a genuine candidate elsewhere: the placeholder is revoked and the pass binds the
+  // genuine conversation instead of parking on the placeholder.
+  const cdp = await mockCdp(`run marker: ${MARKER}\nthinking hard, no verdict yet`);
+  const r = await runFastPollSalvage([MARKER, '3'], cdp.port, seedMemo(MARKER, PLACEHOLDER_URLS[0]));
+  check('placeholder revoked when a genuine candidate exists', /memo-revoked/.test(r.stderr || ''), `stderr=${r.stderr?.slice(-300)}`);
+  check('genuine candidate is bound and remembered', r.memoUrl === 'https://chatgpt.com/c/mock-conversation', `memo=${r.memoUrl}`);
+  check('genuine still-generating candidate keeps exit 3', r.status === 3, `status=${r.status}`);
+  cdp.stop();
+}
+
+{ // AE3: a real-id memo whose page renders WITHOUT the marker stays inconclusive and is kept:
+  // a blank render is a transient, never a miss, and never a revocation.
+  const cdp = await mockCdp('an unrelated page with no run marker at all');
+  const r = await runFastPollSalvage([MARKER, '3'], cdp.port, seedMemo(MARKER, REAL_ID_URL));
+  check('real-id blank render stays inconclusive (exit 7)', r.status === 7, `status=${r.status} stderr=${r.stderr?.slice(-300)}`);
+  check('real-id memo is kept', r.memoUrl === REAL_ID_URL, `memo=${r.memoUrl}`);
+  check('real-id memo is not revoked', !/memo-revoked/.test(r.stderr || ''), `stderr=${r.stderr?.slice(-300)}`);
+  cdp.stop();
+}
+
+{ // The organize step reads the memo too, so it revokes a placeholder as well.
+  const cdp = await mockCdp(`run marker: ${MARKER}\nstill thinking`);
+  const r = await runSalvage(['--organize', MARKER, '5'], cdp.port, seedOrganizer(MARKER, 'pro-gate review: PR #42 r1', PLACEHOLDER_URLS[0]));
+  // The organize step then re-remembers the genuine conversation it found, so the memo is
+  // replaced, not merely removed: what must never survive is the placeholder.
+  check('organize revokes a placeholder memo', r.memoUrl !== PLACEHOLDER_URLS[0], `memos=${r.memos} memo=${r.memoUrl} status=${r.status}`);
+  check('organize names the revoked id', /memo-revoked/.test(r.stderr || ''), `stderr=${r.stderr?.slice(-300)}`);
+  cdp.stop();
+}
+
 process.exit(failures === 0 ? 0 : 1);
