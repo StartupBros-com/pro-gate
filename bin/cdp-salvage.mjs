@@ -333,6 +333,7 @@ function recordThrottle(where) {
 }
 function tripThrottle(where) {
   recordThrottle(where);
+  console.error('evidence-kind: throttle');
   process.exit(5);
 }
 
@@ -1223,6 +1224,7 @@ function rememberInconclusiveReadableSource(url) {
 function emitEvidence(url, evidence) {
   if (probe) {
     console.error(`live conversation: ${url}`);
+    console.error(`evidence-kind: ${evidence.kind}`);
     // rc 0 proves the conversation exists. Completeness is intentionally stricter than harvest
     // extraction: the terminal verdict must answer the latest exact prompt and echo this marker.
     const probeState = evidence.kind === 'terminal-infrastructure'
@@ -1232,12 +1234,14 @@ function emitEvidence(url, evidence) {
     process.exit(0);
   }
   if (evidence.kind === 'terminal-infrastructure') {
+    console.error('evidence-kind: terminal-infrastructure');
     console.error(`terminal-infrastructure: ${evidence.reason}`);
     process.exit(10);
   }
   if (evidence.kind === 'terminal') {
     // v0.28 (gate #54 r5): name the EXACT source of this capture so the engine can blacklist
     // precisely on a provenance rejection — reading the shared memo afterwards races probes.
+    console.error('evidence-kind: terminal');
     console.error(`matched-url ${url}`);
     console.log(evidence.review);
     process.exit(0);
@@ -1538,6 +1542,7 @@ if (!probe && liveUrl) {
   // tab lets the caller harvest later instead of respending.
   console.error(`still-generating: ${liveUrl} matches "${marker}" but has no VERDICT after ${timeoutSecs}s`
     + `${stillGeneratingUrl ? ': tab left open' : ' (proven server-side; no tab needed)'}; harvest later (oracle-review.sh --harvest '${marker}')`);
+  console.error('evidence-kind: owned-incomplete');
   process.exit(3);
 }
 if (!lastListOk) {
@@ -1546,6 +1551,7 @@ if (!lastListOk) {
   // lost, re-run justified") must not advance on it. Distinct code, so callers keep the
   // reservation and retry instead.
   console.error(`inconclusive: the last CDP tab list failed (${listFailures} consecutive) within ${timeoutSecs}s — browser down or restarting; NOT evidence the conversation is gone`);
+  console.error('evidence-kind: browser-down');
   process.exit(7);
 }
 if (knownUrl && !memoStale) {
@@ -1555,8 +1561,14 @@ if (knownUrl && !memoStale) {
   // into a confirmed absence: three of those releases a live reservation and permits a
   // double-spending resubmit (gate P1). Stay inconclusive; the reservation TTL bounds it.
   console.error(`inconclusive: remembered conversation ${knownUrl} re-rendered ${seededRenders}x without a decisive result in ${timeoutSecs}s — NOT evidence it is gone`);
+  console.error('evidence-kind: inconclusive');
   process.exit(7);
 }
 console.error(`timeout: no ${probe ? 'conversation tab' : 'completed review'} matching "${marker}" after ${timeoutSecs}s`
   + (memoStale ? ' (the remembered conversation belongs to another run; memo was stale)' : ''));
+// v0.42 (#109): one closed-vocabulary line naming what this pass concluded, printed at every exit
+// (see the other `evidence-kind:` sites). The engine records it per marker so --status can name a
+// stall instead of calling every unresolved attempt "generating". A conviction without a proven
+// owner is cross-bound; every other timeout here is a confirmed absence for this marker.
+console.error(`evidence-kind: ${crossBindHits.size > 0 && !ownershipProven ? 'cross-bound' : 'absent'}`);
 process.exit(4);

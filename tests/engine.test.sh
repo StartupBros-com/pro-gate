@@ -242,6 +242,10 @@ check 'exit-9 organizer never archives' "$([ "$(jq -r .archived "$ORGANIZER_STAT
 check 'exit-9 organizer performs rename only' "$([ "$(jq -r '[.events[].action] | join(",")' "$ORGANIZER_STATE")" = rename ]; echo $?)" "$(cat "$ORGANIZER_STATE")"
 check 'status carries the marker' "$(grep -qF "\"marker\":\"$MARKER\"" "$TDIR/o-h1.md.status"; echo $?)" "$(cat "$TDIR/o-h1.md.status" 2>/dev/null)"
 check 'in-progress writes durable reservation' "$([ -f "$TDIR/home/in-progress/$MARKER" ]; echo $?)" "reservation missing"
+# v0.42 (#109): every pass records what the salvage helper concluded, so --status can name a stall.
+check 'harvest records the salvage classification (owned-incomplete)' \
+  "$(awk -F'\t' 'NR==1{exit !($1=="owned-incomplete" && $2 ~ /^[0-9]+$/)}' "$TDIR/home/salvage-class/$MARKER" 2>/dev/null; echo $?)" \
+  "$(cat "$TDIR/home/salvage-class/$MARKER" 2>/dev/null)"
 
 # A fresh same-PR invocation must NOT launch a second oracle request while the reserved tab is
 # active. It redirects to harvest (exit 9) before acquiring/spending a slot. The reservation is
@@ -273,9 +277,11 @@ printf 'run marker: pg-run-999-1700000001-99\nforeign conversation\n' > "$TDIR/t
 PRO_GATE_HOME="$TDIR/home" PRO_GATE_RESERVATION_MISSES=3 PRO_GATE_RECONCILE_INTERVAL=0 bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_reconcile '$HERE/../bin/cdp-salvage.mjs' '$PORT'"
 check 'first marker miss retains reservation' "$([ -f "$TDIR/home/in-progress/$MARKER" ]; echo $?)" 'reservation released on one miss'
 check 'first marker miss records streak one' "$(awk -F'\t' 'NR==1{exit !($4==1)}' "$TDIR/home/in-progress/$MARKER"; echo $?)" "$(cat "$TDIR/home/in-progress/$MARKER")"
+check 'miss probe records the absent classification' "$(awk -F'\t' 'NR==1{exit !($1=="absent")}' "$TDIR/home/salvage-class/$MARKER" 2>/dev/null; echo $?)" "$(cat "$TDIR/home/salvage-class/$MARKER" 2>/dev/null)"
 printf 'still thinking, run marker: %s\n' "$MARKER" > "$TDIR/tab.txt"
 PRO_GATE_HOME="$TDIR/home" PRO_GATE_RESERVATION_MISSES=3 PRO_GATE_RECONCILE_INTERVAL=0 bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_reconcile '$HERE/../bin/cdp-salvage.mjs' '$PORT'"
 check 'positive probe resets miss streak' "$(awk -F'\t' 'NR==1{exit !($4==0)}' "$TDIR/home/in-progress/$MARKER"; echo $?)" "$(cat "$TDIR/home/in-progress/$MARKER")"
+check 'live probe records the owned-incomplete classification' "$(awk -F'\t' 'NR==1{exit !($1=="owned-incomplete")}' "$TDIR/home/salvage-class/$MARKER" 2>/dev/null; echo $?)" "$(cat "$TDIR/home/salvage-class/$MARKER" 2>/dev/null)"
 check 'still-generating probe keeps the reservation occupying capacity' "$([ "$(PRO_GATE_HOME="$TDIR/home" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_state '$MARKER'")" = generating ]; echo $?)" "$(cat "$TDIR/home/in-progress/$MARKER")"
 
 # ChatGPT keeps conversations server-side forever, so a FINISHED review probes as present on
@@ -287,8 +293,60 @@ printf 'run marker: %s\nP0: none\n\nVERDICT: SHIP — looks good. (run marker: %
 PRO_GATE_HOME="$TDIR/home" PRO_GATE_RESERVATION_MISSES=3 PRO_GATE_RECONCILE_INTERVAL=0 bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_reconcile '$HERE/../bin/cdp-salvage.mjs' '$PORT'"
 check 'complete probe marks the reservation complete' "$([ "$(PRO_GATE_HOME="$TDIR/home" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_state '$MARKER'")" = complete ]; echo $?)" "$(cat "$TDIR/home/in-progress/$MARKER")"
 check 'completed reservation survives as a harvest pointer' "$([ -f "$TDIR/home/in-progress/$MARKER" ]; echo $?)" 'record removed instead of released'
+check 'complete probe records the terminal classification' "$(awk -F'\t' 'NR==1{exit !($1=="terminal")}' "$TDIR/home/salvage-class/$MARKER" 2>/dev/null; echo $?)" "$(cat "$TDIR/home/salvage-class/$MARKER" 2>/dev/null)"
 check 'completed reservation keeps its out path' "$(awk -F'\t' 'NR==1{exit !($2 != "")}' "$TDIR/home/in-progress/$MARKER"; echo $?)" "$(cat "$TDIR/home/in-progress/$MARKER")"
 check 'completed reservation stops consuming a slot' "$([ "$(PRO_GATE_HOME="$TDIR/home" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_slot_plan 1" | cut -d'|' -f3)" = 1 ]; echo $?)" "plan=$(PRO_GATE_HOME="$TDIR/home" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_slot_plan 1")"
+
+# v0.42 (#109): a placeholder conversation memo (https://chatgpt.com/c/WEB:<uuid>) used to park a
+# run forever: its page rendered no marker, every pass was inconclusive, and inconclusive never
+# counts a miss. Now the memo is revoked on read, the pass rescans, and with nothing carrying the
+# marker it takes the ordinary confirmed-absent path: one miss per probe, release only after the
+# TTL and the miss threshold, round retained. A real-id memo whose page renders blank stays held.
+echo '# v0.42: placeholder memo drains through the confirmed-absent sweep'
+DRAIN_HOME="$TDIR/home-placeholder-drain"; DRAIN_KEY=acme-drain-98
+DRAIN_MARKER='pg-run-acme-drain-98-1700000011-98'; DRAIN_EPOCH=1700000011
+REAL_MARKER='pg-run-acme-drain-99-1700000012-99'; REAL_KEY=acme-drain-99; REAL_EPOCH=1700000012
+mkdir -p "$DRAIN_HOME/in-progress" "$DRAIN_HOME/run-meta" "$DRAIN_HOME/rounds" "$DRAIN_HOME/conversation-urls"
+printf '%s\n' "$DRAIN_EPOCH" > "$DRAIN_HOME/rounds/$DRAIN_KEY"
+printf 'github.com\tacme\tdrain\t%s\t98\t/tmp/drain.md\t%s\n' "$DRAIN_KEY" "$DRAIN_EPOCH" > "$DRAIN_HOME/run-meta/$DRAIN_MARKER"
+printf '%s\t/tmp/drain.md\t%s\t0\t\t\t%s\n' "$DRAIN_KEY" "$(( $(date +%s) - 30000 ))" "$DRAIN_EPOCH" > "$DRAIN_HOME/in-progress/$DRAIN_MARKER"
+printf 'https://chatgpt.com/c/WEB:5789ac7a-755a-4385-82db-0c1eb37ccf88\n' > "$DRAIN_HOME/conversation-urls/$DRAIN_MARKER"
+printf '%s\n' "$REAL_EPOCH" > "$DRAIN_HOME/rounds/$REAL_KEY"
+printf 'github.com\tacme\tdrain\t%s\t99\t/tmp/drain-real.md\t%s\n' "$REAL_KEY" "$REAL_EPOCH" > "$DRAIN_HOME/run-meta/$REAL_MARKER"
+printf '%s\t/tmp/drain-real.md\t%s\t0\t\t\t%s\n' "$REAL_KEY" "$(( $(date +%s) - 30000 ))" "$REAL_EPOCH" > "$DRAIN_HOME/in-progress/$REAL_MARKER"
+printf 'https://chatgpt.com/c/6a959c8f-c95c-83ea-81b8-85a3ea5d6cbc\n' > "$DRAIN_HOME/conversation-urls/$REAL_MARKER"
+printf 'an unrelated page with no run marker at all\n' > "$TDIR/tab.txt"
+drain_probe() { # [reconcile-interval]
+  PRO_GATE_HOME="$DRAIN_HOME" PRO_GATE_RESERVATION_MISSES=3 PRO_GATE_RECONCILE_INTERVAL="${1:-0}" \
+    bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_reconcile '$HERE/../bin/cdp-salvage.mjs' '$PORT'" >"$TDIR/drain.log" 2>&1
+}
+drain_probe
+check 'placeholder memo is revoked by the first reconcile probe' \
+  "$([ ! -e "$DRAIN_HOME/conversation-urls/$DRAIN_MARKER" ]; echo $?)" \
+  "memos=$(ls "$DRAIN_HOME/conversation-urls" 2>/dev/null | tr '\n' ' ') log=$(tail -3 "$TDIR/drain.log")"
+check 'revoked placeholder counts one confirmed miss, not an inconclusive pass' \
+  "$(awk -F'\t' 'NR==1{exit !($4==1)}' "$DRAIN_HOME/in-progress/$DRAIN_MARKER"; echo $?)" \
+  "record=$(cat "$DRAIN_HOME/in-progress/$DRAIN_MARKER" 2>/dev/null) log=$(tail -3 "$TDIR/drain.log")"
+check 'revocation pass records the absent classification' \
+  "$(awk -F'\t' 'NR==1{exit !($1=="absent")}' "$DRAIN_HOME/salvage-class/$DRAIN_MARKER" 2>/dev/null; echo $?)" "$(cat "$DRAIN_HOME/salvage-class/$DRAIN_MARKER" 2>/dev/null)"
+check 'real-id memo whose page renders blank is kept and counts no miss' \
+  "$([ -f "$DRAIN_HOME/conversation-urls/$REAL_MARKER" ] && awk -F'\t' 'NR==1{exit !($4==0)}' "$DRAIN_HOME/in-progress/$REAL_MARKER"; echo $?)" \
+  "record=$(cat "$DRAIN_HOME/in-progress/$REAL_MARKER" 2>/dev/null) memo=$(cat "$DRAIN_HOME/conversation-urls/$REAL_MARKER" 2>/dev/null)"
+check 'real-id blank render records the inconclusive classification' \
+  "$(awk -F'\t' 'NR==1{exit !($1=="inconclusive")}' "$DRAIN_HOME/salvage-class/$REAL_MARKER" 2>/dev/null; echo $?)" "$(cat "$DRAIN_HOME/salvage-class/$REAL_MARKER" 2>/dev/null)"
+drain_probe 600
+check 'a probe inside the reconcile interval counts no second miss' \
+  "$(awk -F'\t' 'NR==1{exit !($4==1)}' "$DRAIN_HOME/in-progress/$DRAIN_MARKER"; echo $?)" "$(cat "$DRAIN_HOME/in-progress/$DRAIN_MARKER" 2>/dev/null)"
+drain_probe
+check 'second spaced probe keeps the charged reservation recoverable at two misses' \
+  "$([ -f "$DRAIN_HOME/in-progress/$DRAIN_MARKER" ] && awk -F'\t' 'NR==1{exit !($4==2)}' "$DRAIN_HOME/in-progress/$DRAIN_MARKER"; echo $?)" "$(cat "$DRAIN_HOME/in-progress/$DRAIN_MARKER" 2>/dev/null)"
+drain_probe
+check 'third confirmed miss past the TTL exhausts recovery with the round retained' \
+  "$([ ! -e "$DRAIN_HOME/in-progress/$DRAIN_MARKER" ] && [ -s "$DRAIN_HOME/rounds/$DRAIN_KEY" ] \
+     && jq -e '.terminal_kind=="recovery-exhausted"' "$DRAIN_HOME/attempt-dispositions/$DRAIN_MARKER" >/dev/null 2>&1; echo $?)" \
+  "disposition=$(cat "$DRAIN_HOME/attempt-dispositions/$DRAIN_MARKER" 2>/dev/null) record=$(cat "$DRAIN_HOME/in-progress/$DRAIN_MARKER" 2>/dev/null) log=$(tail -3 "$TDIR/drain.log")"
+check 'the real-id reservation is untouched by the placeholder drain' \
+  "$([ -f "$DRAIN_HOME/in-progress/$REAL_MARKER" ] && [ ! -e "$DRAIN_HOME/attempt-dispositions/$REAL_MARKER" ]; echo $?)" "$(ls "$DRAIN_HOME/in-progress" 2>/dev/null | tr '\n' ' ')"
 
 INFRA_HOME="$TDIR/home-probe-infrastructure"; INFRA_KEY=acme-infra-97
 INFRA_MARKER='pg-run-acme-infra-97-1700000009-97'; INFRA_EPOCH=1700000009
@@ -2267,6 +2325,8 @@ printf '%s\n%s\n' "$(( $(date +%s) - 60 ))" "$(( $(date +%s) - 120 ))" > "$SHOME
 # the elapsed-wall-clock assertion two real hist rows (2h total) to sum.
 printf '%s\tFIX-FIRST\t0\t5\t0\t0\t3600\n%s\tFIX-FIRST\t0\t5\t0\t0\t3600\n' "$(date +%s)" "$(date +%s)" > "$SHOME/rounds/acme-widgets-42.hist"
 printf 'https://chatgpt.com/c/abc123\n' > "$SHOME/conversation-urls/$SMARKER"
+# v0.42 (#109): the latest salvage classification rides a sidecar; status names it beside age/misses.
+mkdir -p "$SHOME/salvage-class"; printf 'owned-incomplete\t%s\n' "$(( $(date +%s) - 30 ))" > "$SHOME/salvage-class/$SMARKER"
 printf '{"ts":"2026-01-01T00:00:00+0000","pr":"42","repo":"/tmp/acme","exit":9,"outcome":"in-progress","secs":100,"attempts":0,"conc":1,"ceiling":1,"live":1,"salvaged":0,"diff_lines":10,"out":"/tmp/pg-st-42.md","model":"m","marker":"%s","round_key":"acme-widgets-42"}\n' "$SMARKER" > "$SHOME/ledger.jsonl"
 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 >"$TDIR/st.out" 2>"$TDIR/st.err"; RC=$?
 check '--status exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(cat "$TDIR/st.err")"
@@ -2278,6 +2338,19 @@ check '--status reports spent rounds and advisory computed grant' \
 check '--status reports rounds used and total wall clock' \
   "$(grep -q '2 rounds; ~2.0h recorded across 2 scored round(s)' "$TDIR/st.out"; echo $?)" "$(grep spent "$TDIR/st.out")"
 check '--status writes nothing' "$([ ! -f "$SHOME/ledger.jsonl.tmp" ] && [ "$(wc -l < "$SHOME/ledger.jsonl")" -eq 1 ]; echo $?)" 'state mutated'
+check '--status names the latest salvage classification and the time until the TTL' \
+  "$(grep -q 'latest pass saw owned-incomplete' "$TDIR/st.out" && grep -q 'until the TTL is satisfied' "$TDIR/st.out"; echo $?)" "$(grep -i 'latest pass' "$TDIR/st.out")"
+if command -v jq >/dev/null 2>&1; then
+  PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 --json >"$TDIR/st-class.json" 2>/dev/null
+  check '--status --json carries classification, classified_at, and ttl_remaining_secs' \
+    "$([ "$(jq -r '.reservations[0].classification' "$TDIR/st-class.json")" = owned-incomplete ] \
+       && jq -e '.reservations[0].classified_at | type == "number"' "$TDIR/st-class.json" >/dev/null \
+       && jq -e '.reservations[0].ttl_remaining_secs > 0 and .reservations[0].ttl_remaining_secs <= 21600' "$TDIR/st-class.json" >/dev/null; echo $?)" \
+    "$(jq -c '.reservations[0] | {classification, classified_at, ttl_remaining_secs, age_secs, miss_streak}' "$TDIR/st-class.json" 2>/dev/null)"
+  check '--status --json existing fields are unchanged beside the new ones' \
+    "$([ "$(jq -r '.reservations[0].marker' "$TDIR/st-class.json")" = "$SMARKER" ] && [ "$(jq -r '.reservations[0].state' "$TDIR/st-class.json")" = generating-or-recoverable ]; echo $?)" \
+    "$(jq -c '.reservations[0]' "$TDIR/st-class.json" 2>/dev/null)"
+fi
 # #67/#68 P2: THREE states. Bare .unbound captures are AMBIGUOUS and retryable (strict nonce
 # mode makes one when an older answer is visible while ours generates); only a positively
 # convicted cross-bind is terminally stuck. Reporting the first as STUCK would tell an operator

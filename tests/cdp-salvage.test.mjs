@@ -2463,6 +2463,7 @@ for (const placeholder of PLACEHOLDER_URLS) {
     (r.stderr || '').includes('memo-revoked') && (r.stderr || '').includes(MARKER) && (r.stderr || '').includes(id),
     `stderr=${r.stderr?.slice(-400)}`);
   check(`same pass reaches confirmed-absent after revoking ${id.slice(0, 12)}`, r.status === 4, `status=${r.status} stderr=${r.stderr?.slice(-300)}`);
+  check(`revocation pass names its conclusion as absent (${id.slice(0, 12)})`, /^evidence-kind: absent$/m.test(r.stderr || ''), `stderr=${r.stderr?.slice(-300)}`);
   cdp.stop();
 }
 
@@ -2483,6 +2484,7 @@ for (const placeholder of PLACEHOLDER_URLS) {
   check('real-id blank render stays inconclusive (exit 7)', r.status === 7, `status=${r.status} stderr=${r.stderr?.slice(-300)}`);
   check('real-id memo is kept', r.memoUrl === REAL_ID_URL, `memo=${r.memoUrl}`);
   check('real-id memo is not revoked', !/memo-revoked/.test(r.stderr || ''), `stderr=${r.stderr?.slice(-300)}`);
+  check('blank render names its conclusion as inconclusive', /^evidence-kind: inconclusive$/m.test(r.stderr || ''), `stderr=${r.stderr?.slice(-300)}`);
   cdp.stop();
 }
 

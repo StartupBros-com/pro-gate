@@ -439,6 +439,11 @@ work must be collected; `not-submitted` was positively proven and refunded; `sub
 or `recovery-exhausted` retains its charge but no longer owns recovery; `superseded` retains its
 charge and optional audit harvest but owns neither capacity nor the current head. Those settled states
 let changed/current evidence receive a fresh typed decision. Unknown post-click fate stays recoverable.
+Each unresolved reservation also carries `classification` (what the latest collection pass concluded:
+`owned-incomplete`, `inconclusive`, `browser-down`, `absent`, `cross-bound`, `throttle`, `terminal`,
+`terminal-infrastructure`), `classified_at`, and `ttl_remaining_secs`, so a parked run and a genuinely
+generating one no longer read alike. A remembered conversation URL whose id is not a real conversation
+id (a `WEB:<uuid>` placeholder) is revoked on read and the pass rescans; nothing is terminalized from age alone.
 Never delete state, quarantine files, or use a force flag as diagnosis. On a low-memory box, free
 memory before retrying.
 
