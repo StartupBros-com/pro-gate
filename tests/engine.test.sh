@@ -5929,4 +5929,350 @@ check 'exact pending connector SHIP is collect-only and never merge eligible' \
   "$([ "$CONNECTOR_PENDING_RC" -eq 0 ] && jq -e '.action=="collect-existing-result" and .action!="allow-existing-merge-workflow"' "$TDIR/connector-pending.json" >/dev/null 2>&1; echo $?)" \
   "rc=$CONNECTOR_PENDING_RC output=$(cat "$TDIR/connector-pending.json") stderr=$(cat "$TDIR/connector-pending.err")"
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# #152: the generic no-flock spinlocks reclaim a dead owner through
+# pg_stale_dirlock_reap, so two waiters that read ONE dead pid can never both
+# hold a pg_lock section or one pg_lock_n slot. Unserialized, A removed the
+# directory, re-created it and proceeded, and B's removal then landed on A's
+# LIVE directory and let B proceed too (the reservation guard's #148 r1 P1,
+# left in its two siblings because the reviewer named only the guard).
+# ─────────────────────────────────────────────────────────────────────────────
+echo '# #152 gate: serialized dead-owner reclamation in pg_lock and pg_lock_n'
+
+DL_HOME="$TDIR/home-dirlock-race"; mkdir -p "$DL_HOME/bin"
+# B is slowed only at its `rm`, which is where the two reclaimers interleave: the shim signals
+# once B has read the dead pid and is about to remove the directory, so A can be released at
+# exactly that point, and B's removal then arrives long after A owns the lock. The delay is
+# dropped once the lock is held: only ACQUISITION is under test, and a delayed release would
+# just add dead time to the run.
+printf '#!/usr/bin/env bash\nif [ -n "${PG_TEST_RM_DELAY:-}" ]; then : > "${PG_TEST_RM_SENTINEL:?}"; sleep "$PG_TEST_RM_DELAY"; fi\nexec "%s" "$@"\n' "$(command -v rm)" > "$DL_HOME/bin/rm"
+chmod +x "$DL_HOME/bin/rm"
+# enter/exit pairs, never nested: exactly one holder at a time, and both holders got in.
+dl_sections_exclusive() { # log
+  [ "$(wc -l < "$1" | tr -d ' ')" -eq 4 ] \
+    && awk '$1=="enter"{if(open)bad=1; open=1} $1=="exit"{open=0} END{exit bad}' "$1"
+}
+
+DL_SECTION_LOCK="$DL_HOME/section.lock"; DL_SECTION_LOG="$DL_HOME/section.log"; : > "$DL_SECTION_LOG"
+DL_SECTION_SENTINEL="$DL_HOME/section-b-read-dead-pid"
+sleep 0 & DL_SECTION_DEAD=$!; wait "$DL_SECTION_DEAD"
+mkdir -p "$DL_SECTION_LOCK.d"; echo "$DL_SECTION_DEAD" > "$DL_SECTION_LOCK.d/pid"
+dl_section_holder() { # name rm-delay log lock
+  PATH="$DL_HOME/bin:$PATH" PG_TEST_RM_DELAY="$2" PG_TEST_RM_SENTINEL="$DL_SECTION_SENTINEL" \
+  PRO_GATE_HOME="$DL_HOME" \
+    bash -c '. "$1"; pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
+      pg_lock "$4" 30 || { echo "fail $2" >> "$3"; exit 1; }
+      unset PG_TEST_RM_DELAY
+      echo "enter $2" >> "$3"; sleep 3; echo "exit $2" >> "$3"' \
+      _ "$HERE/../lib/pro-gate-lib.sh" "$1" "$3" "$4"
+}
+dl_section_holder B 1 "$DL_SECTION_LOG" "$DL_SECTION_LOCK" & DL_SECTION_B=$!
+for _ in $(seq 1 200); do [ -e "$DL_SECTION_SENTINEL" ] && break; sleep 0.1; done
+dl_section_holder A "" "$DL_SECTION_LOG" "$DL_SECTION_LOCK" & DL_SECTION_A=$!
+wait "$DL_SECTION_A"; DL_SECTION_A_RC=$?; wait "$DL_SECTION_B"; DL_SECTION_B_RC=$?
+check '#152: two no-flock reclaimers of one dead pg_lock owner never both hold the section' \
+  "$([ -e "$DL_SECTION_SENTINEL" ] && [ "$DL_SECTION_A_RC" -eq 0 ] && [ "$DL_SECTION_B_RC" -eq 0 ] \
+     && dl_sections_exclusive "$DL_SECTION_LOG"; echo $?)" \
+  "a_rc=$DL_SECTION_A_RC b_rc=$DL_SECTION_B_RC sentinel=$(test -e "$DL_SECTION_SENTINEL"; echo $?) log=$(tr '\n' ';' < "$DL_SECTION_LOG")"
+
+# Same race for the account semaphore, where two holders of one slot OVERBOOK capacity. The scan
+# moves on to the next slot after a reclaim instead of retrying this one at once, so B's stale
+# removal has to be held past a full scan tick to land after A owns the slot.
+DL_SLOT_BASE="$DL_HOME/slots.lock"; DL_SLOT_LOG="$DL_HOME/slots.log"; : > "$DL_SLOT_LOG"
+DL_SLOT_SENTINEL="$DL_HOME/slot-b-read-dead-pid"
+sleep 0 & DL_SLOT_DEAD=$!; wait "$DL_SLOT_DEAD"
+mkdir -p "$DL_SLOT_BASE.slot1.d"; echo "$DL_SLOT_DEAD" > "$DL_SLOT_BASE.slot1.d/pid"
+dl_slot_holder() { # name rm-delay log base
+  PATH="$DL_HOME/bin:$PATH" PG_TEST_RM_DELAY="$2" PG_TEST_RM_SENTINEL="$DL_SLOT_SENTINEL" \
+  PRO_GATE_HOME="$DL_HOME" \
+    bash -c '. "$1"; pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
+      pg_lock_n "$4" 1 60 "" || { echo "fail $2" >> "$3"; exit 1; }
+      unset PG_TEST_RM_DELAY
+      echo "enter $2 slot${PG_SLOT_ACQUIRED}" >> "$3"; sleep 7; echo "exit $2" >> "$3"' \
+      _ "$HERE/../lib/pro-gate-lib.sh" "$1" "$3" "$4"
+}
+dl_slot_holder B 5 "$DL_SLOT_LOG" "$DL_SLOT_BASE" & DL_SLOT_B=$!
+for _ in $(seq 1 200); do [ -e "$DL_SLOT_SENTINEL" ] && break; sleep 0.1; done
+dl_slot_holder A "" "$DL_SLOT_LOG" "$DL_SLOT_BASE" & DL_SLOT_A=$!
+wait "$DL_SLOT_A"; DL_SLOT_A_RC=$?; wait "$DL_SLOT_B"; DL_SLOT_B_RC=$?
+check '#152: two no-flock reclaimers of one dead pg_lock_n owner never both hold the slot' \
+  "$([ -e "$DL_SLOT_SENTINEL" ] && [ "$DL_SLOT_A_RC" -eq 0 ] && [ "$DL_SLOT_B_RC" -eq 0 ] \
+     && dl_sections_exclusive "$DL_SLOT_LOG" \
+     && [ "$(grep -c 'slot1' "$DL_SLOT_LOG")" -eq 2 ]; echo $?)" \
+  "a_rc=$DL_SLOT_A_RC b_rc=$DL_SLOT_B_RC sentinel=$(test -e "$DL_SLOT_SENTINEL"; echo $?) log=$(tr '\n' ';' < "$DL_SLOT_LOG")"
+
+# Ordinary self-heal is unchanged: with no competing reclaimer, a directory left by a dead owner
+# is reclaimed and the lock acquired on the spot (the serialization must not cost the fallback
+# the recovery the dead-pid check exists for), and the reclaim lock never outlives the reap.
+DL_HEAL_LOCK="$DL_HOME/heal.lock"
+(
+  pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
+  sleep 0 & dead=$!; wait "$dead"
+  mkdir -p "$DL_HEAL_LOCK.d"; echo "$dead" > "$DL_HEAL_LOCK.d/pid"
+  pg_lock "$DL_HEAL_LOCK" 5; rc=$?
+  [ "$rc" -eq 0 ] && [ "$(cat "$DL_HEAL_LOCK.d/pid" 2>/dev/null)" = "$$" ] \
+    && [ ! -d "$DL_HEAL_LOCK.d.reclaim" ]
+); DL_HEAL_RC=$?
+check '#152: pg_lock still self-heals a dead owner and leaves no reclaim lock behind' "$DL_HEAL_RC"
+DL_SLOT_HEAL_BASE="$DL_HOME/slot-heal.lock"
+(
+  pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
+  sleep 0 & dead=$!; wait "$dead"
+  mkdir -p "$DL_SLOT_HEAL_BASE.slot1.d"; echo "$dead" > "$DL_SLOT_HEAL_BASE.slot1.d/pid"
+  pg_lock_n "$DL_SLOT_HEAL_BASE" 1 10 ""; rc=$?
+  [ "$rc" -eq 0 ] && [ "$PG_SLOT_ACQUIRED" = 1 ] \
+    && [ "$(cat "$DL_SLOT_HEAL_BASE.slot1.d/pid" 2>/dev/null)" = "$$" ] \
+    && [ ! -d "$DL_SLOT_HEAL_BASE.slot1.d.reclaim" ]
+); DL_SLOT_HEAL_RC=$?
+check '#152: pg_lock_n still self-heals a dead slot owner and leaves no reclaim lock behind' "$DL_SLOT_HEAL_RC"
+
+# A reclaim lock held by a live reclaimer is never removed and never bypassed: both directories
+# survive and the acquire fails closed inside its budget. Reaping the reclaim lock is exactly
+# what would break exclusion (#148 r1), so neither caller may treat it as reclaimable state.
+DL_BUSY_LOCK="$DL_HOME/busy.lock"
+(
+  pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
+  sleep 0 & dead=$!; wait "$dead"
+  sleep 60 & live=$!
+  mkdir -p "$DL_BUSY_LOCK.d" "$DL_BUSY_LOCK.d.reclaim"
+  echo "$dead" > "$DL_BUSY_LOCK.d/pid"; echo "$live" > "$DL_BUSY_LOCK.d.reclaim/pid"
+  pg_lock "$DL_BUSY_LOCK" 2; rc=$?
+  kill "$live" 2>/dev/null
+  [ "$rc" -ne 0 ] && [ "$(cat "$DL_BUSY_LOCK.d/pid" 2>/dev/null)" = "$dead" ] \
+    && [ "$(cat "$DL_BUSY_LOCK.d.reclaim/pid" 2>/dev/null)" = "$live" ]
+); DL_BUSY_RC=$?
+check '#152: pg_lock leaves a live reclaimer lock alone and fails closed' "$DL_BUSY_RC"
+DL_SLOT_BUSY_BASE="$DL_HOME/slot-busy.lock"
+(
+  pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
+  sleep 0 & dead=$!; wait "$dead"
+  sleep 60 & live=$!
+  mkdir -p "$DL_SLOT_BUSY_BASE.slot1.d" "$DL_SLOT_BUSY_BASE.slot1.d.reclaim"
+  echo "$dead" > "$DL_SLOT_BUSY_BASE.slot1.d/pid"; echo "$live" > "$DL_SLOT_BUSY_BASE.slot1.d.reclaim/pid"
+  pg_lock_n "$DL_SLOT_BUSY_BASE" 1 1 ""; rc=$?
+  kill "$live" 2>/dev/null
+  [ "$rc" -ne 0 ] && [ -z "$PG_SLOT_ACQUIRED" ] \
+    && [ "$(cat "$DL_SLOT_BUSY_BASE.slot1.d/pid" 2>/dev/null)" = "$dead" ] \
+    && [ "$(cat "$DL_SLOT_BUSY_BASE.slot1.d.reclaim/pid" 2>/dev/null)" = "$live" ]
+); DL_SLOT_BUSY_RC=$?
+check '#152: pg_lock_n leaves a live reclaimer lock alone and never overbooks the slot' "$DL_SLOT_BUSY_RC"
+
+# The orphan sweep removes a reclaim lock only on PROVEN absence of its recorded owner — age alone
+# authorizes nothing. A suspended reclaimer (a laptop asleep mid-reap) still answers kill -0, and a
+# torn record is a reclaimer one statement short of writing its pid just as much as it is a process
+# that died there; removing either would admit a second reclaimer while the first still has an
+# already-decided removal to run, re-entering the very double-reclaim this change closes, one level
+# up. Every ambiguity therefore keeps the lock, and age only decides how long a proven-dead owner's
+# record has to have sat there.
+DL_SWEEP="$DL_HOME/sweep"; mkdir -p "$DL_SWEEP"
+sleep 0 & DL_SWEEP_DEAD=$!; wait "$DL_SWEEP_DEAD"
+sleep 120 & DL_SWEEP_LIVE=$!
+dl_seed_reclaim() { # dir owner-pid aged|fresh
+  mkdir -p "$1"
+  [ -n "$2" ] && printf '%s\n' "$2" > "$1/pid"
+  [ "$3" = aged ] && touch -t 202001010000 "$1"
+  return 0
+}
+dl_seed_reclaim "$DL_SWEEP/orphan.lock.d.reclaim" "$DL_SWEEP_DEAD" aged
+dl_seed_reclaim "$DL_SWEEP/suspended.lock.d.reclaim" "$DL_SWEEP_LIVE" aged
+dl_seed_reclaim "$DL_SWEEP/inflight.lock.d.reclaim" "$DL_SWEEP_DEAD" fresh
+dl_seed_reclaim "$DL_SWEEP/torn.lock.d.reclaim" "" aged
+mkdir -p "$DL_SWEEP/section.lock.d"; printf '%s\n' "$DL_SWEEP_DEAD" > "$DL_SWEEP/section.lock.d/pid"
+touch -t 202001010000 "$DL_SWEEP/section.lock.d"
+pg_stale_reclaim_sweep "$DL_SWEEP" "$DL_HOME/no-such-lock-dir"
+DL_SWEEP_RC=$?
+kill "$DL_SWEEP_LIVE" 2>/dev/null
+check '#152: the reclaim-lock sweep removes only a proven-dead owner past the 24h horizon' \
+  "$([ "$DL_SWEEP_RC" -eq 0 ] \
+     && [ ! -d "$DL_SWEEP/orphan.lock.d.reclaim" ] \
+     && [ -d "$DL_SWEEP/suspended.lock.d.reclaim" ] && [ -d "$DL_SWEEP/inflight.lock.d.reclaim" ] \
+     && [ -d "$DL_SWEEP/torn.lock.d.reclaim" ] && [ -d "$DL_SWEEP/section.lock.d" ]; echo $?)" \
+  "rc=$DL_SWEEP_RC remaining=$(ls "$DL_SWEEP" | tr '\n' ' ')"
+
+# The engine must hand that sweep every namespace pg_lock and pg_lock_n are called against, or an
+# orphan in the missing one wedges its lock for good while the sweep looks like it covers the host.
+DL_WIRE="$(grep -A2 '^pg_stale_reclaim_sweep ' "$HERE/../bin/oracle-review.sh")"
+check '#152: the engine sweeps every reclaim-lock namespace the no-flock locks use' \
+  "$(printf '%s\n' "$DL_WIRE" | grep -q 'dirname "\$LOCKFILE"' \
+     && printf '%s\n' "$DL_WIRE" | grep -q 'PRO_GATE_HARVEST_LOCK_DIR' \
+     && printf '%s\n' "$DL_WIRE" | grep -q 'PRO_GATE_REVIEW_DECISION_LOCK_DIR'; echo $?)" \
+  "call=$(printf '%s' "$DL_WIRE" | tr '\n' ' ')"
+
+# Gate #155 r1 P1: that sweep is itself concurrent — every engine runs this housekeeping BEFORE it
+# acquires its own locks — so two sweepers validate ONE aged orphan at the same time. Unserialized,
+# the first removes it, a reclaimer creates a replacement at that path, and the second's delayed
+# `rm -rf` (authorized by the directory it validated, not the one it deletes) destroys that LIVE
+# reclaim lock, readmitting the two simultaneous reclaimers — and so the two simultaneous section
+# and slot holders — this whole change exists to close. The check pauses one sweeper INSIDE its
+# removal with a PATH `rm` shim, runs a real competing sweeper against the same namespace, and then
+# tries to install a live replacement exactly as pg_stale_dirlock_reap would (`mkdir`, then its
+# pid). Serialized, the competing sweeper removes nothing, so the replacement is IMPOSSIBLE while
+# the first sweeper's removal is still pending — and that removal still lands. Unserialized, the
+# replacement is created and then deleted with its owner alive.
+DL_SER_HOME="$TDIR/home-sweep-serialize"; mkdir -p "$DL_SER_HOME/bin"
+DL_SER_NS="$DL_SER_HOME/ns"; mkdir -p "$DL_SER_NS"
+DL_SER_ORPHAN="$DL_SER_NS/orphan.lock.d.reclaim"
+DL_SER_ARMED="$DL_SER_HOME/sweeper-armed"
+# Delays only the removal of the orphan under test — never the sweep mutex's own release, and only
+# for the sweeper that carries this shim on its PATH.
+printf '#!/usr/bin/env bash\nif [ -n "${PG_SWEEP_RM_MATCH:-}" ]; then\n  case " $* " in *"$PG_SWEEP_RM_MATCH"*) : > "${PG_SWEEP_RM_SENTINEL:?}"; sleep "${PG_SWEEP_RM_DELAY:-0}" ;; esac\nfi\nexec "%s" "$@"\n' "$(command -v rm)" > "$DL_SER_HOME/bin/rm"
+chmod +x "$DL_SER_HOME/bin/rm"
+sleep 0 & DL_SER_DEAD=$!; wait "$DL_SER_DEAD"
+sleep 120 & DL_SER_LIVE=$!
+dl_seed_reclaim "$DL_SER_ORPHAN" "$DL_SER_DEAD" aged
+PATH="$DL_SER_HOME/bin:$PATH" PG_SWEEP_RM_MATCH="orphan.lock.d.reclaim" \
+PG_SWEEP_RM_SENTINEL="$DL_SER_ARMED" PG_SWEEP_RM_DELAY=6 PRO_GATE_HOME="$DL_SER_HOME" \
+  bash -c '. "$1"; pg_stale_reclaim_sweep "$2"' _ "$HERE/../lib/pro-gate-lib.sh" "$DL_SER_NS" &
+DL_SER_HOLDER=$!
+for _ in $(seq 1 300); do [ -e "$DL_SER_ARMED" ] && break; sleep 0.1; done
+PRO_GATE_HOME="$DL_SER_HOME" \
+  bash -c '. "$1"; pg_stale_reclaim_sweep "$2"' _ "$HERE/../lib/pro-gate-lib.sh" "$DL_SER_NS"
+DL_SER_RIVAL_RC=$?
+if mkdir "$DL_SER_ORPHAN" 2>/dev/null; then
+  DL_SER_REPL=1; printf '%s\n' "$DL_SER_LIVE" > "$DL_SER_ORPHAN/pid"
+else DL_SER_REPL=0; fi
+wait "$DL_SER_HOLDER"; DL_SER_HOLDER_RC=$?
+DL_SER_SURVIVED=0; [ -d "$DL_SER_ORPHAN" ] && DL_SER_SURVIVED=1
+kill "$DL_SER_LIVE" 2>/dev/null
+# The mutex is held for one pass and released, never leaked: a later sweep of the same namespace
+# still reaps a fresh orphan, so serializing sweepers cannot wedge the cleanup it protects.
+dl_seed_reclaim "$DL_SER_NS/after.lock.d.reclaim" "$DL_SER_DEAD" aged
+pg_stale_reclaim_sweep "$DL_SER_NS"
+check '#155 r1: a competing reclaim-lock sweep never removes an orphan another sweeper is deleting' \
+  "$([ -e "$DL_SER_ARMED" ] && [ "$DL_SER_RIVAL_RC" -eq 0 ] && [ "$DL_SER_HOLDER_RC" -eq 0 ] \
+     && [ "$DL_SER_REPL" -eq 0 ] && [ "$DL_SER_SURVIVED" -eq 0 ] \
+     && [ ! -d "$DL_SER_NS/after.lock.d.reclaim" ]; echo $?)" \
+  "armed=$(test -e "$DL_SER_ARMED"; echo $?) rival_rc=$DL_SER_RIVAL_RC holder_rc=$DL_SER_HOLDER_RC replacement_installed=$DL_SER_REPL replacement_survived=$DL_SER_SURVIVED remaining=$(ls -a "$DL_SER_NS" | tr '\n' ' ')"
+
+# That mutex is never reclaimed — every reclaimable variant readmits the second sweeper — so a
+# process killed while holding it strands it and suspends this cleanup for the namespace. The
+# pre-filter keeps that exposure off the hot path: a namespace with no reclaim lock at all is
+# skipped WITHOUT taking the mutex, which is every housekeeping pass on a flock host, where no
+# reclaim lock can exist. A PATH `mkdir` shim records which mutexes the sweep actually tried to
+# take; a namespace with an orphan must still take one, or the pre-filter would be a way to skip
+# the serialization instead of a way to avoid an idle lock.
+DL_PRE_HOME="$TDIR/home-sweep-prefilter"; mkdir -p "$DL_PRE_HOME/bin"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "${PG_MKDIR_LOG:?}"\nexec "%s" "$@"\n' "$(command -v mkdir)" > "$DL_PRE_HOME/bin/mkdir"
+chmod +x "$DL_PRE_HOME/bin/mkdir"
+DL_PRE_EMPTY="$DL_PRE_HOME/empty"; DL_PRE_FULL="$DL_PRE_HOME/full"
+mkdir -p "$DL_PRE_EMPTY" "$DL_PRE_FULL"; : > "$DL_PRE_HOME/mkdir.log"
+dl_seed_reclaim "$DL_PRE_FULL/orphan.lock.d.reclaim" "$DL_SER_DEAD" aged
+PATH="$DL_PRE_HOME/bin:$PATH" PG_MKDIR_LOG="$DL_PRE_HOME/mkdir.log" PRO_GATE_HOME="$DL_PRE_HOME" \
+  bash -c '. "$1"; pg_stale_reclaim_sweep "$2" "$3"' \
+    _ "$HERE/../lib/pro-gate-lib.sh" "$DL_PRE_EMPTY" "$DL_PRE_FULL"
+DL_PRE_RC=$?
+check '#155 r1: the reclaim-lock sweep takes its never-reclaimed mutex only where there is work' \
+  "$([ "$DL_PRE_RC" -eq 0 ] \
+     && ! grep -qF "$DL_PRE_EMPTY/.pg-reclaim-sweep.d" "$DL_PRE_HOME/mkdir.log" \
+     && grep -qF "$DL_PRE_FULL/.pg-reclaim-sweep.d" "$DL_PRE_HOME/mkdir.log" \
+     && [ ! -d "$DL_PRE_FULL/orphan.lock.d.reclaim" ]; echo $?)" \
+  "rc=$DL_PRE_RC mkdirs=$(tr '\n' ';' < "$DL_PRE_HOME/mkdir.log")"
+
+# And a mutex stranded by a killed sweeper fails CLOSED — deliberately. Reclaiming it on a dead
+# owner IS the delayed-removal race one level up (two sweepers again, one of them holding a removal
+# it already decided), and no rename- or quarantine-based takeover avoids that, so the namespace is
+# skipped until an operator removes the directory and no sweeper ever proceeds unserialized. The
+# same shape as its subject one level down: '#152: pg_lock leaves a live reclaimer lock alone and
+# fails closed'. Pinned so a later "self-healing" change to this lock has to argue with the reason
+# it is not self-healing.
+DL_WEDGE_NS="$DL_PRE_HOME/stranded"; mkdir -p "$DL_WEDGE_NS/.pg-reclaim-sweep.d"
+printf '%s\n' "$DL_SER_DEAD" > "$DL_WEDGE_NS/.pg-reclaim-sweep.d/pid"
+dl_seed_reclaim "$DL_WEDGE_NS/orphan.lock.d.reclaim" "$DL_SER_DEAD" aged
+pg_stale_reclaim_sweep "$DL_WEDGE_NS"; DL_WEDGE_RC=$?
+check '#155 r1: a sweep mutex stranded by a killed sweeper fails closed, never sweeping unserialized' \
+  "$([ "$DL_WEDGE_RC" -eq 0 ] && [ -d "$DL_WEDGE_NS/orphan.lock.d.reclaim" ] \
+     && [ -d "$DL_WEDGE_NS/.pg-reclaim-sweep.d" ] \
+     && [ "$(cat "$DL_WEDGE_NS/.pg-reclaim-sweep.d/pid" 2>/dev/null)" = "$DL_SER_DEAD" ]; echo $?)" \
+  "rc=$DL_WEDGE_RC remaining=$(ls -a "$DL_WEDGE_NS" | tr '\n' ' ')"
+# Gate #155 r2 P1: the engine's OWN housekeeping could delete an in-flight reclaim mutex. The
+# legacy per-PR lock sweep is age-only, takes no mutex, and runs BEFORE the ownership-aware sweep
+# above — and its glob (<lockfile>.pr-*) matches the no-flock spinlock's `<lock>.d` and
+# `<lock>.d.reclaim` DIRECTORIES as readily as the 0-byte flock files it was written for.
+# `-delete` removes an EMPTY one, which is exactly a reclaimer suspended between its `mkdir` and
+# the `echo $$ > pid` one line later; removing it admits a second reclaimer while the first still
+# holds an already-decided `rm -rf`, the double-reclaim of #152 with housekeeping standing in for
+# the missing serialization. The check runs the engine's own sweep sequence for that namespace,
+# extracted verbatim and in the engine's order, against exactly that state — and pins that the
+# 0-byte lock FILES the sweep exists for are still collected.
+DL_HK_NS="$TDIR/home-housekeeping-sweep"; mkdir -p "$DL_HK_NS"
+DL_HK_LOCKFILE="$DL_HK_NS/oracle.lock"; DL_HK_PR="$DL_HK_LOCKFILE.pr-acme-widgets-77"
+mkdir -p "$DL_HK_PR.d.reclaim"                                  # live reclaimer, pid not published
+mkdir -p "$DL_HK_PR.d"; printf '%s\n' "$DL_SER_DEAD" > "$DL_HK_PR.d/pid"   # its dead-owner subject
+: > "$DL_HK_LOCKFILE.pr-acme-widgets-99"                        # the aged flock file, still sweepable
+touch -t 202001010000 "$DL_HK_PR.d.reclaim" "$DL_HK_PR.d" "$DL_HK_LOCKFILE.pr-acme-widgets-99"
+DL_HK_LEGACY="$(grep -F 'find "$(dirname "$LOCKFILE")" -maxdepth 1' "$ENGINE" || true)"
+DL_HK_RUN="$(PRO_GATE_HOME="$DL_HK_NS" bash -c '. "$1"; LOCKFILE="$2"
+  eval "$3"                              # the age-only per-PR lock sweep from the engine, verbatim
+  pg_stale_reclaim_sweep "$(dirname "$LOCKFILE")"' \
+  _ "$HERE/../lib/pro-gate-lib.sh" "$DL_HK_LOCKFILE" "$DL_HK_LEGACY" 2>&1)"
+DL_HK_RUN_RC=$?
+# The surviving mutex must still exclude the second reclaimer it exists to keep out.
+DL_HK_INTRUDER=1; mkdir "$DL_HK_PR.d.reclaim" 2>/dev/null && DL_HK_INTRUDER=0
+check '#155 r2: housekeeping never deletes a reclaim lock whose reclaimer has not published its pid' \
+  "$([ -n "$DL_HK_LEGACY" ] && [ "$DL_HK_RUN_RC" -eq 0 ] \
+     && [ -d "$DL_HK_PR.d.reclaim" ] && [ "$DL_HK_INTRUDER" -eq 1 ] \
+     && [ -d "$DL_HK_PR.d" ] \
+     && [ ! -e "$DL_HK_LOCKFILE.pr-acme-widgets-99" ]; echo $?)" \
+  "rc=$DL_HK_RUN_RC intruder_entered=$((1 - DL_HK_INTRUDER)) legacy=$DL_HK_LEGACY out=$DL_HK_RUN remaining=$(ls -a "$DL_HK_NS" | tr '\n' ' ')"
+
+# Gate #155 r2 P2: only FRESH dispatch ever reached that housekeeping. --harvest takes its lock at
+# the top of its own block and exits at every outcome long before the sweep, and --recover reaches
+# collection only by delegating to that same path (`bash "$0" --harvest`). So on a no-flock host a
+# reclaim lock orphaned beside a stale harvest lock — a reclaimer killed after publishing its pid,
+# before its `rm -rf` landed — made every harvest AND every recovery return exit 7 forever:
+# acquisition refuses to reclaim a reclaim lock by design, so only the sweep can clear one, and
+# nothing on those paths ran it. The check runs the engine's own harvest-path sweep statement,
+# extracted verbatim, immediately before the same acquisition, against exactly that state.
+DL_RECOV_HOME="$TDIR/home-recovery-sweep"; DL_RECOV_NS="$DL_RECOV_HOME/harvest-locks"
+mkdir -p "$DL_RECOV_NS"
+DL_RECOV_LOCK="$DL_RECOV_NS/pg-run-acme-widgets-77-1700000000-1"
+mkdir -p "$DL_RECOV_LOCK.d"; printf '%s\n' "$DL_SER_DEAD" > "$DL_RECOV_LOCK.d/pid"
+dl_seed_reclaim "$DL_RECOV_LOCK.d.reclaim" "$DL_SER_DEAD" aged
+DL_RECOV_WIRE="$(grep -F 'pg_stale_reclaim_sweep "$(dirname "$HARVEST_LOCK")"' "$ENGINE" || true)"
+PRO_GATE_HOME="$DL_RECOV_HOME" bash -c '. "$1"
+  pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
+  HARVEST_LOCK="$2"
+  eval "$3"                                  # the harvest path sweep from the engine, verbatim
+  pg_lock "$HARVEST_LOCK" 2' \
+  _ "$HERE/../lib/pro-gate-lib.sh" "$DL_RECOV_LOCK" "$DL_RECOV_WIRE"
+DL_RECOV_RC=$?
+check '#155 r2: recovery clears an eligible dead-owner reclaim lock without a fresh dispatch' \
+  "$([ -n "$DL_RECOV_WIRE" ] && [ "$DL_RECOV_RC" -eq 0 ] \
+     && [ ! -d "$DL_RECOV_LOCK.d.reclaim" ]; echo $?)" \
+  "rc=$DL_RECOV_RC wire=$DL_RECOV_WIRE remaining=$(ls -a "$DL_RECOV_NS" | tr '\n' ' ')"
+
+# ...and the sweep has to precede the acquisition it unblocks, on EVERY mutating harvest/recovery
+# entry point, not just the two whose symptom was reported. Placed after the lock it would sweep
+# for, or omitted from one of them, the orphan is still there when that entry point acquires and
+# the wedge survives the fix. Four acquisitions qualify: the harvest lock; --recover's terminal
+# per-PR lock; the recover-existing-review EFFECT, which takes that same per-PR lock for that same
+# pg_attempt_reconcile_terminal and is the route daemon/daemon.sh actually dispatches; and the
+# result-binding repair the collect-existing-result effect reaches, whose failure the caller
+# swallows with `|| true`. Read-only resolution stays untouched by design — it mutates nothing and
+# can wait for the next mutating pass, and its contract forbids borrowing engine housekeeping.
+dl_sweep_precedes() { # acquisition-literal sweep-literal — 0 when a sweep of that namespace sits
+  local acq sweeps n                                    # within 20 lines above the acquisition
+  acq="$(grep -nF "$1" "$ENGINE" | head -1 | cut -d: -f1)"
+  [ -n "$acq" ] || return 1
+  sweeps="$(grep -nF "$2" "$ENGINE" | cut -d: -f1)"
+  for n in $sweeps; do
+    [ "$n" -lt "$acq" ] && [ $(( acq - n )) -le 20 ] && return 0
+  done
+  return 1
+}
+DL_ORDER_PER_PR='pg_stale_reclaim_sweep "$(dirname "${PRO_GATE_LOCKFILE:-$PRO_GATE_HOME/oracle.lock}")"'
+DL_ORDER_MISSING=""
+dl_sweep_precedes 'pg_lock "$HARVEST_LOCK"' \
+  'pg_stale_reclaim_sweep "$(dirname "$HARVEST_LOCK")"' || DL_ORDER_MISSING="$DL_ORDER_MISSING harvest"
+dl_sweep_precedes 'pg_lock "${PRO_GATE_LOCKFILE:-$PRO_GATE_HOME/oracle.lock}.pr-${REC_TERMINAL_KEY}"' \
+  "$DL_ORDER_PER_PR" || DL_ORDER_MISSING="$DL_ORDER_MISSING recover-terminal"
+dl_sweep_precedes 'pg_lock "${PRO_GATE_LOCKFILE:-$PRO_GATE_HOME/oracle.lock}.pr-${round_key}"' \
+  "$DL_ORDER_PER_PR" || DL_ORDER_MISSING="$DL_ORDER_MISSING effect-recover-existing-review"
+dl_sweep_precedes 'pg_lock "$lock" "${PRO_GATE_REVIEW_EFFECT_LOCK_WAIT:-5}"' \
+  'pg_stale_reclaim_sweep "$(dirname "$lock")"' || DL_ORDER_MISSING="$DL_ORDER_MISSING effect-result-binding"
+check '#155 r2: every mutating recovery entry point sweeps its lock namespace before acquiring it' \
+  "$([ -z "$DL_ORDER_MISSING" ]; echo $?)" \
+  "unswept acquisitions:$DL_ORDER_MISSING"
+
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }
