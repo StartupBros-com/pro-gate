@@ -124,7 +124,7 @@ Since 2026-08-30 four reviews have pinned a ChatGPT slot for a day or more while
 
 ### Success Criteria
 
-- The conversation-memo directory on the operator's box holds zero memos with a non-conversation id after one upgrade cycle, with no manual deletion.
+- The conversation-memo directory on the operator's box holds zero memos with a non-conversation id tied to an active reservation after one upgrade cycle, with no manual deletion; orphaned memos with no reservation clear through the existing 14-day sweep.
 - Every reservation that held a placeholder memo at upgrade time reaches recovery-exhausted through the absence path within the TTL plus three confirmed misses.
 - Charge and refund counts for runs without a placeholder memo are unchanged across the release.
 - An operator can tell a parked run from a generating one from status alone.
@@ -275,6 +275,7 @@ U1 then U2 (salvage helper), U3 (engine drain and refund tests, no engine code e
   - Covers AE2. Three spaced passes: miss streak 1, 2, 3; final state recovery-exhausted; round history unchanged; capacity released.
   - Two passes inside the reconcile interval count one miss, not two.
   - Covers AE6. After revocation the attempt is not provably unsubmitted and no refund is recorded.
+  - With decisive never-submitted oracle session evidence seeded beside a placeholder memo, the attempt is not refund-eligible before the pass and becomes refund-eligible once the memo is revoked, proving the predicate's memo negative is the only thing the revocation removes.
   - Covers AE3. A real-id blank-render memo: miss streak stays 0 and the memo file remains.
   - A fresh `--pr` dispatch for the same change runs the reconcile probe, which revokes the placeholder without a harvest being invoked.
 - **Verification:** `bash tests/engine.test.sh` passes; the new cases fail against the pre-U2 helper (run once to confirm they exercise the change).
@@ -286,14 +287,14 @@ U1 then U2 (salvage helper), U3 (engine drain and refund tests, no engine code e
 - **Dependencies:** U2 (log-line vocabulary).
 - **Files:** `bin/cdp-salvage.mjs` (evidence emission near 1191-1200 and the exit sites at 1507-1530); `bin/oracle-review.sh` (harvest capture at 2556-2561; the 14-day sweep at 3145); `lib/pro-gate-lib.sh` (`pg_reservation_reconcile` at 1648-1687 and a small sidecar write helper beside the reservation helpers); `tests/cdp-salvage.test.mjs`; `tests/engine.test.sh`.
 - **Approach:**
-  1. Have the helper print one stderr line `evidence-kind: <kind>` in harvest and probe modes, with a closed vocabulary drawn from its existing classifications: owned-incomplete, inconclusive, browser-down, memo-revoked, foreign, cross-bound, throttle, terminal, terminal-infrastructure, absent (KTD3).
+  1. Have the helper print one stderr line `evidence-kind: <kind>` in harvest and probe modes, with a closed vocabulary of the seven kinds its classifier returns today (owned-incomplete, inconclusive, foreign, cross-bound, throttle, terminal, terminal-infrastructure) plus two this plan adds at named call sites: `absent` at the confirmed-absent exit, and `browser-down` split out of the generic inconclusive case when the tab list itself failed (KTD3). A pass that revoked a placeholder reports the outcome it then reached, normally `absent`; the revocation itself is the R3 stderr diagnostic, not a sidecar value.
   2. Capture the line in the harvest path the way `matched-url` is captured, and in the reconcile probe, and write `salvage-class/<marker>` as one line, kind and epoch, through an atomic temp-plus-rename.
   3. Extend the existing 14-day sweep to the new directory.
 - **Patterns to follow:** the `matched-url` grep at `bin/oracle-review.sh:2561`; the `crossbound/` sidecar for a per-marker file the status block already reads; the `probe-state` line for how the helper already reports to the reconcile probe.
 - **Test scenarios:**
   - A harvest pass that ends still-generating writes `owned-incomplete` and an epoch for the marker.
   - A probe pass that ends inconclusive writes `inconclusive`.
-  - A pass that revoked a placeholder writes `memo-revoked` on that pass and `absent` on the next.
+  - A pass that revoked a placeholder and found no candidate writes `absent` on that same pass; the revocation appears only in the stderr diagnostic.
   - The sweep removes a sidecar older than 14 days and leaves a fresh one.
   - A malformed sidecar line is ignored by readers rather than crashing status.
 - **Verification:** both suites pass; a manual `--harvest` against the mock CDP leaves the expected sidecar.
