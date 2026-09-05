@@ -760,6 +760,37 @@ check 'select still passes -m requested hint' "$(grep -q -- '-m gpt-5.6' "$TDIR/
 freshrun "$TDIR/home-u1c" "$TDIR/argv-archive.txt" "$EV_PRO" "$TDIR/o-u1c.md" current always
 check 'explicit PRO_GATE_BROWSER_ARCHIVE passes through unchanged' "$(grep -q -- '--browser-archive always' "$TDIR/argv-archive.txt"; echo $?)" "argv=$(head -1 "$TDIR/argv-archive.txt")"
 
+# #145: oracle's --browser-attachments (default auto) switches a bundle to a file upload past its
+# 60,000-char inline budget, and that upload path stalls. The engine pins oracle's default explicitly
+# and exposes PRO_GATE_BROWSER_ATTACHMENTS so an operator can keep text bundles inline (`never`).
+# Connector mode is deliberately unasserted: its engine line is a no-claim. Every call gets its own
+# fresh home, so no cleanup is needed between runs.
+attachrun() { # $1=home $2=argv-file $3=input [attachments-env]
+  mkdir -p "$1/in-progress"; : > "$2"; printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+  env ${4:+PRO_GATE_BROWSER_ATTACHMENTS="$4"} \
+    PRO_GATE_HOME="$1" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+    PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-evidence" PG_TEST_ARGV_FILE="$2" PG_TEST_EVIDENCE="$EV_PRO" NODE_OPTIONS= \
+    bash "$ENGINE" --diff "$TDIR/small.diff" --repo "$TDIR" --input "$3" --out "$TDIR/o-attach-$3${4:+-$4}.md" --timeout 5s \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+  RC=$?
+}
+echo '# #145: --browser-attachments seam'
+attachrun "$TDIR/home-attach-bundle" "$TDIR/argv-attach-bundle.txt" bundle
+check 'bundle mode passes --browser-attachments auto to oracle by default' \
+  "$([ "$RC" -eq 0 ] && grep -q -- '--browser-attachments auto' "$TDIR/argv-attach-bundle.txt"; echo $?)" "rc=$RC argv=$(head -1 "$TDIR/argv-attach-bundle.txt")"
+attachrun "$TDIR/home-attach-both" "$TDIR/argv-attach-both.txt" both
+check 'both mode passes --browser-attachments auto to oracle by default' \
+  "$([ "$RC" -eq 0 ] && grep -q -- '--browser-attachments auto' "$TDIR/argv-attach-both.txt"; echo $?)" "rc=$RC argv=$(head -1 "$TDIR/argv-attach-both.txt")"
+attachrun "$TDIR/home-attach-bundle-never" "$TDIR/argv-attach-bundle-never.txt" bundle never
+check 'PRO_GATE_BROWSER_ATTACHMENTS=never overrides the bundle default' \
+  "$([ "$RC" -eq 0 ] && grep -q -- '--browser-attachments never' "$TDIR/argv-attach-bundle-never.txt" && ! grep -q -- '--browser-attachments auto' "$TDIR/argv-attach-bundle-never.txt"; echo $?)" \
+  "rc=$RC argv=$(head -1 "$TDIR/argv-attach-bundle-never.txt")"
+attachrun "$TDIR/home-attach-both-never" "$TDIR/argv-attach-both-never.txt" both never
+check 'PRO_GATE_BROWSER_ATTACHMENTS=never overrides the both default' \
+  "$([ "$RC" -eq 0 ] && grep -q -- '--browser-attachments never' "$TDIR/argv-attach-both-never.txt" && ! grep -q -- '--browser-attachments auto' "$TDIR/argv-attach-both-never.txt"; echo $?)" \
+  "rc=$RC argv=$(head -1 "$TDIR/argv-attach-both-never.txt")"
+
 # Fallback: a `select` run whose requested model is not selectable (oracle emits "... in the model
 # switcher") must auto-fall-back to `current` and still produce a review, not fail the whole run
 # (dogfood 2026-07-17, PR #32: `select` + gpt-5.6 -> "Unable to find model option matching

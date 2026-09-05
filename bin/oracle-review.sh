@@ -3110,6 +3110,13 @@ ENGINE_ARGS=(-e browser)
 # leave the tab intact so probe/salvage can always find it, then let the marker-owned organizer
 # archive/close only after durable validation in pg_finish. Override with PRO_GATE_BROWSER_ARCHIVE.
 ENGINE_ARGS+=(--browser-archive "${PRO_GATE_BROWSER_ARCHIVE:-never}")
+# Oracle's --browser-attachments (default auto) uploads the composer text as a file once it passes
+# oracle's 60,000-character inline budget, and that upload path has stalled on every bundle review
+# above the cutoff since 2026-08-31 (#145: "Attachments did not finish uploading before timeout").
+# `never` keeps a text-only bundle inline regardless of size. The default stays oracle's `auto`
+# until live runs prove ChatGPT's composer accepts large pastes reliably; the seam lets an operator
+# opt in per deployment now. Override with PRO_GATE_BROWSER_ATTACHMENTS.
+ENGINE_ARGS+=(--browser-attachments "${PRO_GATE_BROWSER_ATTACHMENTS:-auto}")
 
 # --- Bound concurrent Pro review runs against the single ChatGPT account ---
 # DEFAULT IS SERIALIZED (1). The 2026-07-03 throttle incident showed one account under
