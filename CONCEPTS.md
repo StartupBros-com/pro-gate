@@ -28,6 +28,14 @@ Proof that a charged attempt no longer applies to the current target. Supersessi
 
 Collection or reconciliation of one canonically identified attempt without a new submission. Ambiguous ownership fails closed rather than selecting a plausible conversation or spending again.
 
+### Conversation Memo
+
+The conversation URL remembered for a marker so later passes can find the same conversation without rescanning. A memo is authoritative only while its conversation id has the shape of a real conversation id; a memo that fails that check, or that proves to carry foreign content, is revoked so the next pass rescans every candidate. A blank render of a real-id memo is a transient, not a miss, and does not revoke it.
+
+### Salvage classification
+
+What the latest salvage pass concluded about a reservation's conversation: `owned-incomplete` (the model was still writing), `inconclusive` (rendered without a decisive result), `browser-down` (the browser was unreachable), `absent` (no conversation carried the marker), `cross-bound` (another run's completed answer was found instead), `throttle` (ChatGPT throttled the account), `terminal` (a completed answer was seen), or `terminal-infrastructure` (the conversation ended in a terminal infrastructure state). Status surfaces it as `classification`; it is observation only — never a release, a refund, or an admission input.
+
 ## Review authority
 
 ### Review Decision

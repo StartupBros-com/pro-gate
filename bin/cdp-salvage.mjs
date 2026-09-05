@@ -47,6 +47,10 @@
 //   harvest AND --probe, so reservation reconciliation inherits it too) re-render that URL in a
 //   scratch tab when no open tab matches. A remembered URL is authoritative for its marker: it
 //   is exempt from the foreign-marker blacklist and from the per-URL render cap.
+//   v0.42 (#109): authority is conditional on the memo's conversation id passing the shape gate
+//   below (CONVERSATION_URL_RE), checked when a URL is remembered AND every time one is read. A
+//   memo that fails is revoked on read with the same claim-and-verify as a foreign memo, so the
+//   pass rescans candidates instead of re-rendering a placeholder page forever.
 //
 // Usage: cdp-salvage.mjs [--probe] <pr-marker> [timeout-secs] [cdp-port]
 //   pr-marker    substring identifying the right conversation (e.g. the PR
@@ -160,16 +164,46 @@ const COMPLETED_DIR = process.env.PRO_GATE_COMPLETED_DIR ?? path.join(PG_HOME, '
 const PENDING_DIR = path.join(PG_HOME, 'pending');
 const MEMO_KEEP = 200;                  // newest N memos retained; older ones are pruned on write
 const MARKER_SAFE_RE = /^pg-run-[A-Za-z0-9.-]+$/;
+// v0.42 (#109): the shape a remembered conversation URL must have. A synthetic placeholder such as
+// https://chatgpt.com/c/WEB:<uuid> passed the old prefix-only check, was remembered as
+// authoritative, and rendered a page with no marker on every later pass — an inconclusive result
+// the engine deliberately never counts as a miss — so its run held a ChatGPT slot for days. The
+// boundary enforced here: the segment after /c/ is one path segment of letters, digits, and
+// dashes, optionally followed by a query or fragment. Every real id observed on the operator's box
+// (36-char hex-and-dash, 196 of 196) passes; the placeholder's colon fails, including one whose
+// body after the prefix is a well-formed UUID, because the whole segment is anchored. This is a
+// shape gate like MARKER_SAFE_RE, not proof the conversation exists; a stricter hex-and-dash
+// shape is deferred until test fixtures stop using named ids such as mock-conversation.
+const CONVERSATION_URL_RE = /^https:\/\/chatgpt\.com\/c\/[A-Za-z0-9-]+(?:[?#].*)?$/;
+const conversationUrlOk = (url) => CONVERSATION_URL_RE.test(url || '');
 const memoPath = (m) => (MARKER_SAFE_RE.test(m) ? path.join(URL_MEMO_DIR, m) : null);
 const titleMemoPath = (m) => (MARKER_SAFE_RE.test(m) ? path.join(TITLE_MEMO_DIR, m) : null);
 
 function recallUrl(m) {
   const f = memoPath(m);
   if (!f) return null;
-  try {
-    const url = fs.readFileSync(f, 'utf8').trim();
-    return /^https:\/\/chatgpt\.com\/c\//.test(url) ? url : null;
-  } catch { return null; }
+  let url = '';
+  try { url = fs.readFileSync(f, 'utf8').trim(); } catch { return null; }
+  if (conversationUrlOk(url)) return url;
+  if (!url) return null;
+  // v0.42 (#109): a memo whose id fails the shape gate is revoked HERE, on read, so this very pass
+  // rescans candidates instead of trusting it. Claim-and-verify (forgetUrl), never a plain unlink:
+  // a concurrently republished genuine memo survives and is used instead. This is memo hygiene,
+  // not termination — the pass still has to find or miss the conversation on its own evidence.
+  const survivor = forgetUrl(m, url);
+  console.error(`memo-revoked: the remembered conversation for "${m}" is not a conversation id (${url}); rescanning candidates`);
+  if (survivor && conversationUrlOk(survivor)) return survivor;
+  // v0.42 review finding #2: forgetUrl only restores a genuine memo republished DURING its
+  // claim rename (the file existed as `f` again by the time forgetUrl read `claim`). A memo
+  // republished in the window between that rename and the unlink of `claim` lands back at `f`
+  // unheld and unseen by forgetUrl, so re-read `f` once more here to close it before giving up.
+  let value = '';
+  try { value = fs.readFileSync(f, 'utf8').trim(); } catch { return null; }
+  if (conversationUrlOk(value)) {
+    console.error(`memo-republished: a genuine conversation for "${m}" was published while the placeholder was being revoked; using ${value}`);
+    return value;
+  }
+  return null;
 }
 
 function recallTitle(m) {
@@ -257,7 +291,16 @@ process.on('exit', () => { if (!probe && !organize) flushCrossBind(marker); });
 
 function rememberUrl(m, url) {
   const f = memoPath(m);
-  if (!f || !/^https:\/\/chatgpt\.com\/c\//.test(url || '')) return;
+  if (!f) return;
+  if (!conversationUrlOk(url)) {
+    // v0.42 (#109): a /c/ URL whose id fails the shape gate is the placeholder class; say so once
+    // rather than silently dropping it. Non-conversation URLs (the root page, a login wall) stay
+    // silent exactly as before.
+    if (/^https:\/\/chatgpt\.com\/c\//.test(url || '')) {
+      console.error(`memo-rejected: not remembering ${url} for "${m}": its conversation id is not letters, digits, and dashes`);
+    }
+    return;
+  }
   if (recallUrl(m) === url) return;     // already known: no churn, no prune
   try {
     fs.mkdirSync(URL_MEMO_DIR, { recursive: true });
@@ -301,6 +344,7 @@ function recordThrottle(where) {
 }
 function tripThrottle(where) {
   recordThrottle(where);
+  console.error('evidence-kind: throttle');
   process.exit(5);
 }
 
@@ -1191,6 +1235,7 @@ function rememberInconclusiveReadableSource(url) {
 function emitEvidence(url, evidence) {
   if (probe) {
     console.error(`live conversation: ${url}`);
+    console.error(`evidence-kind: ${evidence.kind}`);
     // rc 0 proves the conversation exists. Completeness is intentionally stricter than harvest
     // extraction: the terminal verdict must answer the latest exact prompt and echo this marker.
     const probeState = evidence.kind === 'terminal-infrastructure'
@@ -1200,12 +1245,14 @@ function emitEvidence(url, evidence) {
     process.exit(0);
   }
   if (evidence.kind === 'terminal-infrastructure') {
+    console.error('evidence-kind: terminal-infrastructure');
     console.error(`terminal-infrastructure: ${evidence.reason}`);
     process.exit(10);
   }
   if (evidence.kind === 'terminal') {
     // v0.28 (gate #54 r5): name the EXACT source of this capture so the engine can blacklist
     // precisely on a provenance rejection — reading the shared memo afterwards races probes.
+    console.error('evidence-kind: terminal');
     console.error(`matched-url ${url}`);
     console.log(evidence.review);
     process.exit(0);
@@ -1506,6 +1553,7 @@ if (!probe && liveUrl) {
   // tab lets the caller harvest later instead of respending.
   console.error(`still-generating: ${liveUrl} matches "${marker}" but has no VERDICT after ${timeoutSecs}s`
     + `${stillGeneratingUrl ? ': tab left open' : ' (proven server-side; no tab needed)'}; harvest later (oracle-review.sh --harvest '${marker}')`);
+  console.error('evidence-kind: owned-incomplete');
   process.exit(3);
 }
 if (!lastListOk) {
@@ -1514,6 +1562,7 @@ if (!lastListOk) {
   // lost, re-run justified") must not advance on it. Distinct code, so callers keep the
   // reservation and retry instead.
   console.error(`inconclusive: the last CDP tab list failed (${listFailures} consecutive) within ${timeoutSecs}s — browser down or restarting; NOT evidence the conversation is gone`);
+  console.error('evidence-kind: browser-down');
   process.exit(7);
 }
 if (knownUrl && !memoStale) {
@@ -1523,8 +1572,14 @@ if (knownUrl && !memoStale) {
   // into a confirmed absence: three of those releases a live reservation and permits a
   // double-spending resubmit (gate P1). Stay inconclusive; the reservation TTL bounds it.
   console.error(`inconclusive: remembered conversation ${knownUrl} re-rendered ${seededRenders}x without a decisive result in ${timeoutSecs}s — NOT evidence it is gone`);
+  console.error('evidence-kind: inconclusive');
   process.exit(7);
 }
 console.error(`timeout: no ${probe ? 'conversation tab' : 'completed review'} matching "${marker}" after ${timeoutSecs}s`
   + (memoStale ? ' (the remembered conversation belongs to another run; memo was stale)' : ''));
+// v0.42 (#109): one closed-vocabulary line naming what this pass concluded, printed at every exit
+// (see the other `evidence-kind:` sites). The engine records it per marker so --status can name a
+// stall instead of calling every unresolved attempt "generating". A conviction without a proven
+// owner is cross-bound; every other timeout here is a confirmed absence for this marker.
+console.error(`evidence-kind: ${crossBindHits.size > 0 && !ownershipProven ? 'cross-bound' : 'absent'}`);
 process.exit(4);
