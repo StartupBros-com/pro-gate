@@ -1,0 +1,479 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ideation refresh: pro-gate at v0.40.0 — what still matters</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f5f1; --card: #ffffff; --ink: #202127; --muted: #666a73; --line: #d9d8d2; --soft: #efeee9;
+    --accent: #4f46e5; --accent-text: #3730a3; --accent-soft: #e8e7ff;
+    --good-text: #166534; --good-soft: #dcfce7; --warn-text: #92400e; --warn-soft: #fef3c7;
+    --bad-text: #991b1b; --bad-soft: #fee2e2; --info-text: #1e3a8a; --info-soft: #dbeafe;
+    --shadow: 0 10px 28px rgba(32,33,39,.07); --radius: 12px;
+    --sans: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#17181d; --card:#202127; --ink:#f2f2ef; --muted:#b5b7c0; --line:#3a3c45; --soft:#292b32;
+      --accent:#a5b4fc; --accent-text:#c7d2fe; --accent-soft:#303158; --good-text:#bbf7d0; --good-soft:#173f2a;
+      --warn-text:#fde68a; --warn-soft:#4a3715; --bad-text:#fecaca; --bad-soft:#4d2427; --info-text:#bfdbfe; --info-soft:#1e2a4a; --shadow:none; }
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15.5px/1.62 var(--sans); }
+  main { width:min(960px, calc(100% - 32px)); margin:0 auto; padding:56px 0 72px; }
+  header { margin-bottom:34px; }
+  .eyebrow { font-size:12px; letter-spacing:.14em; text-transform:uppercase; color:var(--accent-text); font-weight:600; }
+  h1 { font-size:30px; line-height:1.2; margin:8px 0 12px; }
+  h2 { font-size:22px; margin:0 0 14px; }
+  h3 { font-size:17px; margin:0 0 6px; }
+  h4 { font-size:14.5px; margin:18px 0 6px; }
+  p, li { max-width:72ch; }
+  .lede { font-size:17px; color:var(--ink); max-width:70ch; }
+  .meta { color:var(--muted); font-size:14px; }
+  code { font-family:var(--mono); font-size:.9em; background:var(--soft); padding:1px 5px; border-radius:5px; }
+  a { color:var(--accent-text); }
+  .stats { display:flex; flex-wrap:wrap; gap:10px; list-style:none; padding:0; margin:18px 0 0; }
+  .stats li { background:var(--card); border:1px solid var(--line); border-radius:999px; padding:6px 14px; font-size:13.5px; box-shadow:var(--shadow); }
+  .stats b { font-weight:600; }
+  section { margin:0 0 44px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:var(--radius); padding:22px 24px; box-shadow:var(--shadow); margin:0 0 18px; }
+  .card h3 { display:flex; flex-wrap:wrap; align-items:center; gap:10px; }
+  .chip { display:inline-block; font-size:12px; font-weight:600; letter-spacing:.02em; padding:2px 10px; border-radius:999px; border:1px solid transparent; }
+  .chip.axis { background:var(--accent-soft); color:var(--accent-text); }
+  .chip.good { background:var(--good-soft); color:var(--good-text); }
+  .chip.warn { background:var(--warn-soft); color:var(--warn-text); }
+  .chip.bad { background:var(--bad-soft); color:var(--bad-text); }
+  .chip.info { background:var(--info-soft); color:var(--info-text); }
+  .chip.neutral { background:var(--soft); color:var(--ink); }
+  dl.fields { display:grid; grid-template-columns:max-content 1fr; gap:6px 16px; margin:12px 0 0; }
+  dl.fields dt { font-size:12px; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); font-weight:600; padding-top:3px; }
+  dl.fields dd { margin:0; max-width:72ch; }
+  table { border-collapse:collapse; width:100%; font-size:14px; margin:8px 0 14px; }
+  th, td { text-align:left; vertical-align:top; padding:8px 10px; border-bottom:1px solid var(--line); }
+  th { font-size:12px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); }
+  td.id { font-family:var(--mono); white-space:nowrap; }
+  .jump { margin:0 0 18px; padding:14px 18px; background:var(--soft); border-radius:var(--radius); }
+  .jump ol { margin:6px 0 0; padding-left:22px; }
+  .jump li { margin:3px 0; }
+  figure { margin:16px 0 6px; }
+  figure svg { width:100%; height:auto; display:block; }
+  figcaption { font-size:13px; color:var(--muted); margin-top:6px; max-width:72ch; }
+  .callout { background:var(--warn-soft); color:var(--ink); border-radius:var(--radius); padding:14px 18px; margin:12px 0; }
+  .callout .eyebrow { color:var(--warn-text); }
+  .callout.info { background:var(--info-soft); }
+  .callout.info .eyebrow { color:var(--info-text); }
+  footer.composition-signal { margin-top:56px; padding-top:16px; border-top:1px solid var(--line); color:var(--muted); font-size:13px; }
+  .two { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  @media (max-width:720px) { .two { grid-template-columns:1fr; } dl.fields { grid-template-columns:1fr; } }
+</style>
+</head>
+<body>
+<main>
+<header>
+  <div class="eyebrow">Ideation · refresh</div>
+  <h1>pro-gate at v0.40.0: which ideas still matter</h1>
+  <p class="lede">Since the last two ideation docs, pro-gate shipped a typed continuation contract, a proof-backed attempt lifecycle, supersession, advisory rounds, input policy, briefs, and ledger failure reasons. This refresh re-triages every prior survivor against that system and the ledger it produced, ranks what is worth building next, and then pressure-tests that ranking with six refuting skeptics, two sequencing judges, and a completeness critic.</p>
+  <p class="meta">Date: <time datetime="2026-09-04">2026-09-04</time> · Topic: <code>pro-gate-ideation-refresh</code> · Focus: update and refresh the pro-gate ideation docs; decide which ideas remain relevant and valuable given progress, decisions, and conversations since · Mode: repo-grounded</p>
+  <ul class="stats" aria-label="Refresh counts">
+    <li><b>4</b> prior ideation docs triaged</li>
+    <li><b>19</b> prior survivors mapped: 11 shipped or delivered, 3 superseded or retired, 5 still open</li>
+    <li><b>47</b> raw ideas → 24 clusters + 4 syntheses → 7 survivors → pressure-tested to <b>6</b></li>
+    <li><b>5</b> axes, all covered</li>
+    <li>Weekly clean share <b>81% → 27%</b> since mid-August</li>
+    <li><b>6.56</b> harvest passes per collected review</li>
+  </ul>
+</header>
+
+<section id="grounding-context">
+  <h2>Grounding Context</h2>
+
+  <h4>Codebase Context</h4>
+  <p>pro-gate is a final-tier pull-request review gate that drives a logged-in ChatGPT Pro web session over the Chrome DevTools Protocol, then routes findings to a coding-agent fixer. The plugin (skill plus relay agent) ships through the HOV marketplace; the runtime (engine, library, daemon, salvage helper, doctor, stats) installs separately as a version-matched archive. The engine is about 4,200 lines of bash, the library about 3,000, the engine test suite about 5,900.</p>
+  <p><strong>What shipped between the last ideation docs and today.</strong> v0.34.0 split ledger durations at slot acquisition and added wall-clock per round. v0.35.0 recovered finished reviews from stale tabs. v0.36.0 introduced <code>review-decision/v1</code>: one typed next action, checked by contract identity on the skill, relay, daemon, and doctor, with a single named product choice as the only prompt. v0.37.0 unified the attempt lifecycle behind one canonical snapshot, added marker-addressed terminal dispositions, and made round history advisory by default. v0.37.2 through v0.38.2 added proof-backed supersession so an old-head or merged review releases capacity without a refund. v0.38.0 made bundle-only input the default. v0.39.1 added <code>--brief</code>, a swappable task body that is deliberately unexposed through the skill and relay. v0.40.0, today, records a closed-enum failure reason on every failed ledger row.</p>
+  <p><strong>What was closed.</strong> The blocking <code>--wait</code> verb with heartbeat and next-action fields (PR #89, issue #88) was closed unmerged on 2026-09-01 because it added a second controller without adding submit, collect, or recover capability. The ChatGPT-web bridge research (PR #79, the rosetta completion contract) was closed as stale once the lifecycle findings had shipped. The connector-isolation branch was superseded by input policy.</p>
+  <p><strong>What is still open.</strong> Issue #109: a current-head, exact-owned conversation that never emits a verdict pins a slot indefinitely. The root cause found was a synthetic <code>WEB:&lt;uuid&gt;</code> placeholder persisted as the marker's authoritative conversation URL, plus a real-id owned-incomplete case. The issue's guidance forbids any terminalizer from age, TTL, repeated missing verdicts, or an absent spinner alone, and blocks the fix on a turn-scoped terminal predicate verified across bounded fresh renders. Four reproductions exist.</p>
+  <p><strong>Decisions made outside this repo.</strong> The per-PR supervisor from the August ideation was built in dotfiles as a bash wrapper, <code>pro-gate-loop.sh</code> (PR #986): CI wait, typed query, closed action table, a fresh fixer per round, a flat four-round cap, a 30-second poll. The dotfiles umbrella #849 named two Pro capacity lanes, enabled the daemon for a measurement week that ends 2026-09-09, shipped the send-to-Pro primitive as <code>--brief</code>, and withdrew the tunnel-based async lane because the GitHub connector already covers that corpus. The operator's standing instruction is to keep this work in plain operational language: agents take a knowable safe next step without asking routine permission, never repeat the same review without new evidence, and merge only after a verified SHIP.</p>
+
+  <h4>Ledger evidence (2026-08-17 to 2026-09-04, 1,006 rows, versus 573 in the prior fortnight)</h4>
+  <figure>
+    <svg viewBox="0 0 900 250" role="img" aria-label="Weekly clean-verdict share, ISO weeks 30 to 35 of 2026: 81, 70, 59, 27, 46, 27 percent">
+      <rect x="0" y="0" width="900" height="250" fill="transparent"/>
+      <line x1="70" y1="200" x2="870" y2="200" stroke="#9a9a9a" stroke-width="1"/>
+      <text x="20" y="46" font-size="12" fill="#666a73">100%</text>
+      <text x="26" y="124" font-size="12" fill="#666a73">50%</text>
+      <text x="32" y="204" font-size="12" fill="#666a73">0%</text>
+      <rect x="100" y="70.4" width="90" height="129.6" rx="6" fill="#dcfce7" stroke="#166534"/>
+      <text x="145" y="62" font-size="13" text-anchor="middle" fill="#166534" font-weight="600">81%</text>
+      <text x="145" y="222" font-size="12" text-anchor="middle" fill="#666a73">wk 30</text>
+      <rect x="225" y="88" width="90" height="112" rx="6" fill="#dcfce7" stroke="#166534"/>
+      <text x="270" y="80" font-size="13" text-anchor="middle" fill="#166534" font-weight="600">70%</text>
+      <text x="270" y="222" font-size="12" text-anchor="middle" fill="#666a73">wk 31</text>
+      <rect x="350" y="105.6" width="90" height="94.4" rx="6" fill="#fef3c7" stroke="#92400e"/>
+      <text x="395" y="97" font-size="13" text-anchor="middle" fill="#92400e" font-weight="600">59%</text>
+      <text x="395" y="222" font-size="12" text-anchor="middle" fill="#666a73">wk 32</text>
+      <rect x="475" y="156.8" width="90" height="43.2" rx="6" fill="#fee2e2" stroke="#991b1b"/>
+      <text x="520" y="148" font-size="13" text-anchor="middle" fill="#991b1b" font-weight="600">27%</text>
+      <text x="520" y="222" font-size="12" text-anchor="middle" fill="#666a73">wk 33</text>
+      <rect x="600" y="126.4" width="90" height="73.6" rx="6" fill="#fef3c7" stroke="#92400e"/>
+      <text x="645" y="118" font-size="13" text-anchor="middle" fill="#92400e" font-weight="600">46%</text>
+      <text x="645" y="222" font-size="12" text-anchor="middle" fill="#666a73">wk 34</text>
+      <rect x="725" y="156.8" width="90" height="43.2" rx="6" fill="#fee2e2" stroke="#991b1b"/>
+      <text x="770" y="148" font-size="13" text-anchor="middle" fill="#991b1b" font-weight="600">27%</text>
+      <text x="770" y="222" font-size="12" text-anchor="middle" fill="#666a73">wk 35</text>
+      <text x="470" y="244" font-size="12" text-anchor="middle" fill="#666a73">Share of ledger rows with outcome clean, by ISO week. The August ideation docs were written in week 33.</text>
+    </svg>
+    <figcaption>The system became safer while its yield fell. Weeks 33 to 35 include a large share of repeat collection passes on the same runs, which is itself the finding.</figcaption>
+  </figure>
+  <table>
+    <thead><tr><th>Signal</th><th>Prior fortnight (Aug 3 to 16)</th><th>Since Aug 17</th></tr></thead>
+    <tbody>
+      <tr><td>Rows</td><td>573</td><td>1,006</td></tr>
+      <tr><td>Clean (exit 0)</td><td>64%</td><td>35%</td></tr>
+      <tr><td>Still generating, collect later (exit 9)</td><td>19.5%</td><td>39.6% (398 rows; 242 of them are repeat collection passes)</td></tr>
+      <tr><td>No usable review (exit 6)</td><td>4.4%</td><td>13.6% (137 rows; only 3 carry the new reason field so far)</td></tr>
+      <tr><td>Lock timeout (exit 7)</td><td>30</td><td>59</td></tr>
+      <tr><td>Runs per PR</td><td>2.92</td><td>3.96 (one PR consumed 50 rows; the #109 wedge consumed 40)</td></tr>
+      <tr><td>Harvest passes per collected review</td><td>not measurable</td><td>6.56 (328 harvest rows, 50 successes)</td></tr>
+      <tr><td>Queue wait before a slot (p50 / p90)</td><td>not measurable</td><td>2 s / 210 s, with a two-day burst at 614 s median and 19 timeouts</td></tr>
+      <tr><td>Diffs over 6,000 lines</td><td>—</td><td>25 clean, 38 failed, 40 stuck, 10 lock-timeouts, 3 refused</td></tr>
+      <tr><td>Exit-9 rows ending at exactly 1,200 s</td><td>—</td><td>101 of 398</td></tr>
+      <tr><td>State directory now</td><td>—</td><td>8 in-progress markers, oldest 80 h; 4 conversation memos still pointing at <code>WEB:</code> placeholders</td></tr>
+    </tbody>
+  </table>
+
+  <h4>Prior ideation survivors — where they stand</h4>
+  <p>This table is the answer to the question this refresh was asked. Status is judged against the code, release notes, closed pull requests, and the ledger, not against intent.</p>
+  <table>
+    <thead><tr><th>Doc</th><th>Prior idea</th><th>Status</th><th>Evidence and where it goes now</th></tr></thead>
+    <tbody>
+      <tr><td>UX 08-17</td><td>U1 Blocking <code>--wait</code> verb and wake-on-terminal</td><td><span class="chip bad">Retired</span></td><td>PR #89 closed unmerged, issue #88 not planned (2026-09-01). The goal, a wait that costs no tokens, was delivered by the dotfiles supervisor script instead.</td></tr>
+      <tr><td>UX 08-17</td><td>U2 Status v2 additive schema (holders, heartbeat, next action, reason enum, rounds preview)</td><td><span class="chip warn">Superseded</span></td><td>Replaced by the typed decision and the status JSON's capacity fields. Heartbeat and next-action were explicitly rejected. The reason enum landed on the ledger, not status. The still-valid intent is refreshed as idea 5, re-homed on the contract and staged one field at a time.</td></tr>
+      <tr><td>UX 08-17</td><td>U3 Fleet-wide harvest sweep and spent-and-wasted accounting</td><td><span class="chip info">Still open</span></td><td>The capacity half is moot since supersession. The collection half got worse: 6.56 passes per collected review and 80-hour markers. Refreshed as idea 2 (collection) and idea 1 (accounting).</td></tr>
+      <tr><td>UX 08-17</td><td>U4 Measure queue and spend honestly</td><td><span class="chip good">Shipped</span></td><td>v0.34.0. The abandonment-rate residual goes to idea 1.</td></tr>
+      <tr><td>UX 08-17</td><td>U5 One supervisor per PR</td><td><span class="chip good">Delivered elsewhere</span></td><td>dotfiles PR #986 as a bash wrapper, not a plugin agent. Interactive sessions still hold each wait. Open question recorded in the rejection summary: should pro-gate ship the supervisor.</td></tr>
+      <tr><td>UX 08-17</td><td>U6 Churn Pareto, then an evidence-justified fast tier</td><td><span class="chip info">Still open</span></td><td>Round history is still never aggregated. Runs per PR rose from 2.92 to 3.96. The Pareto half is refreshed as idea 1. The fast pre-tier half is still unaddressed and stays gated on what that Pareto shows (see the rejection summary).</td></tr>
+      <tr><td>UX 08-17</td><td>U7 Fair-share slot admission</td><td><span class="chip info">Still open</span></td><td>Resurfaced in the dotfiles ROI doc as fairness at reservation acquisition. Pressure-tested out of the ranked set: the ledger cannot yet test its premise. The instrumentation it needs lands with idea 3 and is read by idea 1; the mechanism waits for that data (see the rejection summary).</td></tr>
+      <tr><td>Simplification 08-26</td><td>S1 Terminal disposition, not terminal question</td><td><span class="chip good">Shipped</span></td><td>v0.36.0 typed decision with one named product choice; v0.37.0 terminal dispositions.</td></tr>
+      <tr><td>Simplification 08-26</td><td>S2 Snapshot plus wait observer</td><td><span class="chip good">Snapshot shipped</span></td><td>Canonical attempt snapshot and the read-only decision query shipped in v0.37.0. The wait mode was closed with PR #89.</td></tr>
+      <tr><td>Simplification 08-26</td><td>S3 Exact-input passport</td><td><span class="chip good">Shipped</span></td><td>Immutable input binding with head OID; contract digest; head OID in the supersession compare-and-swap (v0.38.2).</td></tr>
+      <tr><td>Simplification 08-26</td><td>S4 Versioned typed outcomes with harness-local renderers</td><td><span class="chip good">Shipped</span></td><td>Claude skill, relay, daemon, and a Codex-mounted skill. The Pi adapter was never built. The bash renderer in dotfiles is untested by the conformance suite, which idea 4 closes.</td></tr>
+      <tr><td>Simplification 08-26</td><td>S5 One engine-issued round disposition</td><td><span class="chip good">Shipped differently</span></td><td>Rounds advisory by default; the typed decision owns continuation; identical code plus evidence stops.</td></tr>
+      <tr><td>Bridge PR #79 (08-11)</td><td>Vendor rosetta's REST-verified completion contract</td><td><span class="chip warn">Closed as stale</span></td><td>Its lifecycle findings shipped through v0.37.4. Its completion-proof question is exactly what #109 is blocked on; see the rejection summary entry for the network-layer proof.</td></tr>
+      <tr><td>dotfiles lanes 09-01</td><td>Two-lane architecture; send-to-Pro primitive; harness vet; fleet status; tunnel lane</td><td><span class="chip good">Mostly done</span></td><td>Lanes doc merged; the primitive shipped as <code>--brief</code>; the vet and fleet status landed; the tunnel lane was withdrawn.</td></tr>
+      <tr><td>dotfiles ROI 09-04</td><td>Exit-6 reason; capacity loop; connector grant; rework a rejected capture; kind-aware extractor to un-fence brief; fairness</td><td><span class="chip info">Mixed</span></td><td>Exit-6 reason shipped today as v0.40.0. The capacity loop's weekly row is idea 1. The connector grant is an operator decision (#988). The extractor idea is discussed under rejection W. Fairness is deferred (rejection summary). The mathfleet blindness invariant is a mathfleet custody control, out of scope here (rejection summary).</td></tr>
+    </tbody>
+  </table>
+  <div class="callout">
+    <div class="eyebrow">Still binding from the prior docs</div>
+    <p>No raising or softening of the round ceiling as a quota. No daemon dollar budget for Pro rounds. No exit-7 as a durable ticket. No multi-PR multiplexing in one conversation. No self-spawning per-run auto-harvester. No protocol compiler or manifest. No autonomy envelope, per-finding ledger, or one-shot evidence substitution. No terminalizer from age, TTL, missing verdict, or absent spinner alone. <code>--brief</code> stays unexposed through the skill and relay.</p>
+  </div>
+
+  <h4>Past learnings</h4>
+  <p>Ship the legible core and let the gate decline fragile automation: repeated FIX-FIRST across two or more rounds on one feature is a signal to drop it, and for a credentialed distributable a clear message plus one manual command beats automation. Separate lifecycle, applicability, capacity, and input trust: one canonical attempt snapshot, capacity as a query over proof, exact recovery instead of retry-as-diagnosis, and evidence-gated residuals left open rather than forced into a timeout. An appended prompt contract is cooperative, not enforced. A staged release tag can predate a later fix on the same version.</p>
+
+  <h4>External context</h4>
+  <p>Review-gate yield has a vocabulary already: Meta's RADAR escalates only high-risk changes to the expensive tier and reports a 35 percent cut in median review wall time; SWE-PRBench puts AI reviewers at 15 to 31 percent detection with 19 to 42 percent false positives; CodeHerder's review-debt dashboards track p50 and p90 latency, reject-loop depth and cap, and first-pass rate; Span names turn yield. Job systems distinguish never-claimed from claimed-then-died orphans with separate clocks (AWS Step Functions), mark dead-letter rows terminal so a sweep stops re-picking them (Cabana issue 23), and run a scheduled finalize-reconciler distinct from a one-time sweep (Canopy). Kubernetes keeps liveness, completion, and orphan detection as three questions. For completion of a chat turn, browser test guidance converges on asserting an explicit completion-state attribute rather than a hidden spinner or a timeout; ChatGPT's own backend carries a per-message status plus an end-turn flag, but the closest prior art on this product, rosetta, rejects end-turn and stream terminators as proof for the preamble-then-resume behavior pro-gate already hit. Large-diff review at scale is chunked (Qwen Code), two-staged (GitLab Duo), or split recursively (Datadog); stacked review can lose the integration reviewer.</p>
+</section>
+
+<section id="topic-axes">
+  <h2>Topic Axes</h2>
+  <ol>
+    <li><strong>Stuck and verdict-less runs</strong> — owned-incomplete conversations, placeholder memos, 80-hour markers, collection passes that return exit 9 six times per success.</li>
+    <li><strong>Review yield per slot</strong> — the clean-share collapse, exit-6 by reason, large-diff failure, lock timeouts, harvest churn.</li>
+    <li><strong>Where the loop lives</strong> — the interactive skill, the relay, the daemon, and the dotfiles supervisor as four renderers of one action table; the wait.</li>
+    <li><strong>The weekly read</strong> — ledger fields, the stats script, round history, the dotfiles lane report, the measurement week ending 2026-09-09.</li>
+    <li><strong>Contract and distribution hygiene</strong> — contract evolution, runtime and plugin version desync, install atomicity, the brief boundary, adapters.</li>
+  </ol>
+</section>
+
+<section id="ranked-ideas">
+  <h2>Ranked Ideas</h2>
+  <nav class="jump" aria-label="Ranked idea links">
+    <strong>Jump to:</strong>
+    <ol>
+      <li><a href="#idea-1">A native weekly yield row, with yield by size, in time for the measurement week</a></li>
+      <li><a href="#idea-2">The legible core of #109: visible, revocable, swept — before terminal</a></li>
+      <li><a href="#idea-3">Hygiene batch: guard self-heal, honest desync refusals, ledger schema, install atomicity</a></li>
+      <li><a href="#idea-4">One action table, four renderers: conformance for the daemon, one shared bash module</a></li>
+      <li><a href="#idea-5">Decision facts, staged: failure reason first, round trajectory next</a></li>
+      <li><a href="#idea-6">A size-aware collect timeout, then a structural tier for large diffs</a></li>
+    </ol>
+  </nav>
+
+  <article class="card" id="idea-1">
+    <h3>1. A native weekly yield row, with yield by size, in time for the measurement week <span class="chip axis">The weekly read</span> <span class="chip good">Confidence 85%</span> <span class="chip neutral">Complexity Medium</span></h3>
+    <dl class="fields">
+      <dt>Description</dt>
+      <dd>Add a weekly mode to <code>pro-gate-stats.sh</code> that prints about six lines from data already written every round. The failure-reason mix with the floor-plus-week-over-week trend warning. A churn Pareto from the round history files: rounds per change that reaches SHIP, which is computable locally, and which changes fail to shrink round over round; rounds per merged change would need a GitHub check and is out. Turn yield, meaning clean verdicts per slot spent, broken down by diff-size band, which is also the size-by-outcome view idea 6 depends on. Abandonment with two clocks, borrowed from job schedulers: attempts never observed generating versus attempts observed generating and then dark, and how many passes each cost. Under-submission aging: in-progress markers past a threshold and memos still pointing at placeholders. And, once the ledger carries the two fields idea 3 adds, a split by invoker and the capacity state at wait start. Given the 2026-09-09 deadline, prototype the four genuinely new metrics in the dotfiles lane report first, since it already parses the same rows, computes the reason mix, and owns the trend warning, then port them to the native script so the numbers ship with the runtime and the lane report reads them instead of re-deriving.</dd>
+      <dt>Axis</dt><dd>The weekly read</dd>
+      <dt>Basis</dt>
+      <dd><code>direct:</code> the stats script's header at <code>bin/pro-gate-stats.sh:4-5</code> lists the ledger fields and still omits reason and detail after v0.40.0, and the script never references the rounds directory; the round history format at <code>lib/pro-gate-lib.sh:1803-1806</code> is written every round and aggregated nowhere in the repo; the dotfiles lane report already computes the reason mix (<code>pro-lane-report.py:214-242</code>) and the floor-plus-ratio trend warning (<code>:32-35</code>) but prints "operator-attention minutes: not measured" and has no size band, churn, abandonment, or aging line; the ledger shows runs per PR rising from 2.92 to 3.96 and one PR at 50 rows. <code>external:</code> CodeHerder's review-debt vocabulary; Span's turn yield; AWS Step Functions' two orphan clocks.</dd>
+      <dt>Rationale</dt>
+      <dd>Both sequencing judges put this first: it is the only survivor with zero behavioral risk and it is the ruler every other one needs. The measurement week set up under the dotfiles umbrella ends on 2026-09-09 to answer whether Pro capacity is the bottleneck, and nothing in this repo prints a number that answers it. It refreshes the churn Pareto from August with worse numbers and closes the abandonment residual left by the ledger split.</dd>
+      <dt>Downsides</dt>
+      <dd>The churn Pareto and size-band aggregation in bash and jq are medium work, not low; the reason-mix and wait-time lines are low because a working Python reference already exists. Historical failed rows carry no reason and must be labeled unclassified. Two implementations coexist during the port; the native script is canonical, and the lane report's duplicate logic is retired once the port lands. The output must be capped at a handful of lines or it becomes a dashboard nobody reads.</dd>
+      <dt>First step</dt>
+      <dd>Add a size-band yield line and a rounds-history churn count to the lane report's summarize function and run it once against the live ledger; this proves the numbers before any bash port.</dd>
+      <dt>Falsifier</dt>
+      <dd>A line that cannot be computed from fields the ledger already writes, such as rounds per merged change, is dropped rather than approximated.</dd>
+    </dl>
+  </article>
+
+  <article class="card" id="idea-2">
+    <h3>2. The legible core of #109: visible, revocable, swept — before terminal <span class="chip axis">Stuck and verdict-less runs</span> <span class="chip good">Confidence 83%</span> <span class="chip neutral">Complexity Medium</span></h3>
+    <dl class="fields">
+      <dt>Description</dt>
+      <dd>Four moves that need no new termination authority, preceded by one reading step. First, read what the installed oracle already proves: its browser mode marks an assistant timeout as an incomplete capture and keeps session metadata for later recovery, runs recheck and auto-reattach for Pro runs that finish late, and emits heartbeat liveness metadata from the Thinking disclosure; its browser timeout defaults to twenty minutes, which is where the fixed collect window comes from. Any pro-gate-side stall signal must build on that, not beside it. Then the moves. Parity on the sweep: the plain still-generating harvest branch re-writes the reservation and exits 9 forever, while the unbindable-capture branch already gates on the reservation TTL plus a run of confirmed-absent probes; give the plain branch that same two-factor gate, where the miss must come from an independent absence probe, because this pass's own positive still-generating finding can never count as a miss. Make a remembered conversation URL prove itself: today a memo is exempt from the foreign-marker blacklist and the per-URL render cap forever, so a placeholder page titled "ChatGPT" keeps being re-rendered and reported as generating; validate the URL cheaply each pass and let the existing provenance-revocation fire on a page that is not a conversation. Stop collapsing the salvage probe's classification: it already distinguishes inconclusive, throttle, foreign, cross-bound, terminal-infrastructure, owned-incomplete, and terminal, with target-url-drift and stale-terminal as sub-reasons, then reports one word; surface the class with age, probe count, and remaining TTL in status, and persist it as a closed-enum stall class on in-progress and harvest ledger rows once idea 3's schema exists. Hand the aging view to idea 1.</dd>
+      <dt>Axis</dt><dd>Stuck and verdict-less runs</dd>
+      <dt>Basis</dt>
+      <dd><code>direct:</code> the rc=3 harvest branch at <code>bin/oracle-review.sh:2658-2662</code> writes the reservation and calls <code>pg_finish 9</code> with no TTL or miss check, while the unbindable branch at <code>:2600-2607</code> does; <code>lib/pro-gate-lib.sh:1546-1562</code> states "TTL is a precondition for recovery exhaustion, never terminal proof by itself" and <code>pg_reservation_note_miss</code> at <code>:1258</code> records "one confirmed-absent observation"; <code>bin/cdp-salvage.mjs:44-49</code> "A remembered URL is authoritative for its marker: it is exempt from the foreign-marker blacklist and from the per-URL render cap"; <code>bin/cdp-salvage.mjs:1196-1199</code> collapses the probe classification to <code>generating</code>; oracle's browser-mode documentation describes the incomplete-capture marking, recheck and auto-reattach flags, heartbeat liveness metadata, and the twenty-minute default browser timeout (installed oracle is 0.18.0); the state directory holds 8 in-progress markers, the oldest 80 hours, and 4 memos pointing at <code>WEB:</code> placeholders; issue #109 comments of 2026-08-31 and 2026-09-01. Every citation was checked by two independent reviewers.</dd>
+      <dt>Rationale</dt>
+      <dd>Every #109 reproduction was invisible until an operator grepped stderr and listed a state directory. The issue reporter's own first suggestion was to validate before remembering and make authority revocable. This is the part of the fix that needs no unproven completion predicate, so it can ship first and keep paying even if the predicate never lands, and it attacks the 6.56 harvest passes per collected review at the point where a pass is wasted. The risk-first judge ranked it last because it is the one idea that touches reservation release; the value-first judge ranked it second because the gate it extends is already proven on the sibling branch. It sits second here because the safety proof exists in the code and the value is the largest in the set.</dd>
+      <dt>Downsides</dt>
+      <dd>The parity sweep must be proven never to release a live review: counting a just-confirmed-live conversation as a miss would break the exact property the two-factor gate protects, so the implementation needs an independent absence probe, and the engine tests that today assert indefinite re-sampling as correct must be rewritten deliberately rather than deleted. These moves relieve the placeholder-memo and TTL-parity reproductions (PRs 2333 and 2307); the deepest one (PR 2368, a real-id owned-incomplete conversation) stays blocked on an evidence-gated completion predicate, discussed under rejection A. The stall class waits for the ledger schema in idea 3.</dd>
+      <dt>First step</dt>
+      <dd>Ship the parity move alone at the rc=3 branch, with an independent absence probe rather than this pass's own finding, rewrite the tests that assert indefinite re-sampling, and watch harvest rows per collected review for a week against idea 1's line.</dd>
+      <dt>Falsifier</dt>
+      <dd>A conversation that a harvest pass just proved live gets marked recovery-exhausted and its capacity released while the review is still running server-side.</dd>
+    </dl>
+    <figure>
+      <svg viewBox="0 0 900 300" role="img" aria-label="Before: every harvest pass renders the remembered URL, collapses the probe classification to generating, exits 9, and repeats. After: the pass validates the memo, reports the stall class and age, and applies the TTL plus confirmed-miss sweep that already exists on the sibling branch.">
+        <rect x="0" y="0" width="900" height="300" fill="transparent"/>
+        <text x="20" y="28" font-size="12" font-weight="600" fill="#991b1b" letter-spacing="1.5">TODAY</text>
+        <rect x="20" y="44" width="150" height="54" rx="8" fill="#efeee9" stroke="#9a9a9a"/>
+        <text x="95" y="66" font-size="12.5" text-anchor="middle" fill="#202127">harvest pass</text>
+        <text x="95" y="84" font-size="11.5" text-anchor="middle" fill="#666a73">renders memo URL</text>
+        <rect x="210" y="44" width="180" height="54" rx="8" fill="#fee2e2" stroke="#991b1b"/>
+        <text x="300" y="66" font-size="12.5" text-anchor="middle" fill="#202127">classify, then collapse</text>
+        <text x="300" y="84" font-size="11.5" text-anchor="middle" fill="#991b1b">7 classes → "generating"</text>
+        <rect x="430" y="44" width="150" height="54" rx="8" fill="#efeee9" stroke="#9a9a9a"/>
+        <text x="505" y="66" font-size="12.5" text-anchor="middle" fill="#202127">exit 9</text>
+        <text x="505" y="84" font-size="11.5" text-anchor="middle" fill="#666a73">no TTL, no miss check</text>
+        <rect x="620" y="44" width="260" height="54" rx="8" fill="#fee2e2" stroke="#991b1b"/>
+        <text x="750" y="66" font-size="12.5" text-anchor="middle" fill="#202127">"Still working" for 80 hours</text>
+        <text x="750" y="84" font-size="11.5" text-anchor="middle" fill="#991b1b">6.56 passes per collected review</text>
+        <line x1="170" y1="71" x2="206" y2="71" stroke="#9a9a9a" stroke-width="1.5"/>
+        <line x1="390" y1="71" x2="426" y2="71" stroke="#9a9a9a" stroke-width="1.5"/>
+        <line x1="580" y1="71" x2="616" y2="71" stroke="#9a9a9a" stroke-width="1.5"/>
+        <path d="M750 98 L750 118 L95 118 L95 98" fill="none" stroke="#991b1b" stroke-width="1.5" stroke-dasharray="4 3"/>
+        <text x="420" y="134" font-size="11.5" text-anchor="middle" fill="#991b1b">repeat, same memo, same answer</text>
+        <text x="20" y="176" font-size="12" font-weight="600" fill="#166534" letter-spacing="1.5">PROPOSED</text>
+        <rect x="20" y="192" width="150" height="54" rx="8" fill="#efeee9" stroke="#9a9a9a"/>
+        <text x="95" y="214" font-size="12.5" text-anchor="middle" fill="#202127">harvest pass</text>
+        <text x="95" y="232" font-size="11.5" text-anchor="middle" fill="#666a73">validates memo first</text>
+        <rect x="210" y="192" width="180" height="54" rx="8" fill="#dcfce7" stroke="#166534"/>
+        <text x="300" y="214" font-size="12.5" text-anchor="middle" fill="#202127">stall class + age</text>
+        <text x="300" y="232" font-size="11.5" text-anchor="middle" fill="#166534">in status and ledger</text>
+        <rect x="430" y="192" width="150" height="54" rx="8" fill="#dcfce7" stroke="#166534"/>
+        <text x="505" y="214" font-size="12.5" text-anchor="middle" fill="#202127">same sweep rule</text>
+        <text x="505" y="232" font-size="11.5" text-anchor="middle" fill="#166534">TTL + independent misses</text>
+        <rect x="620" y="192" width="260" height="54" rx="8" fill="#efeee9" stroke="#9a9a9a"/>
+        <text x="750" y="214" font-size="12.5" text-anchor="middle" fill="#202127">placeholder memo revoked</text>
+        <text x="750" y="232" font-size="11.5" text-anchor="middle" fill="#666a73">next pass rescans candidates</text>
+        <line x1="170" y1="219" x2="206" y2="219" stroke="#9a9a9a" stroke-width="1.5"/>
+        <line x1="390" y1="219" x2="426" y2="219" stroke="#9a9a9a" stroke-width="1.5"/>
+        <line x1="580" y1="219" x2="616" y2="219" stroke="#9a9a9a" stroke-width="1.5"/>
+        <text x="450" y="282" font-size="11.5" text-anchor="middle" fill="#666a73">No step decides a run is finished. Each step makes the stuck run visible, distrusts a bad memo, or applies a rule the sibling branch already has.</text>
+      </svg>
+      <figcaption>Illustrative: the same harvest pass, with the three mechanical moves inserted where a pass is wasted today.</figcaption>
+    </figure>
+  </article>
+
+  <article class="card" id="idea-3">
+    <h3>3. Hygiene batch: guard self-heal, honest desync refusals, ledger schema, install atomicity <span class="chip axis">Contract and distribution hygiene</span> <span class="chip good">Confidence 82%</span> <span class="chip neutral">Complexity Low to Medium</span></h3>
+    <dl class="fields">
+      <dt>Description</dt>
+      <dd>Four fixes that share an axis and fit one release, ordered so the schema lands first because idea 2 depends on it. The ledger row gets the same record-type and record-version identity every other typed record already has, since it gained four fields in three releases on nothing but a tolerant-reader convention, and it carries three additive fields the pressure test asked for: the stall class from idea 2, an invoker field (daemon, skill, relay, loop script) so the measurement week can be split by caller, and the capacity state at wait start (held by uncollected reviews, busy, or free) so any admission change can be tested against history before it ships. The reservation guard leaks a file descriptor on every lock timeout and its directory fallback has no dead-process self-heal, while the sibling lock primitives in the same file already do both; route the guard through the primitive that works. The unknown-contract refusal is direction-blind although the doctor already computes whether the runtime or the adapter is newer; attach that message at the refusal, and let exactly two read-only verbs, status and the advisory decision query, run when only the digest or corpus differs, with contract id and version still required to match, an explicit degraded-compatibility marker on the payload, and the full four-field exact match unchanged before any effect. Install atomicity: the installer's rollback is an EXIT trap that does not survive a hard kill, and the version and expected-version files are published as two separate moves after a dozen per-file swaps; stage the runtime into a directory and publish it with one rename, keeping the deploy stamp last.</dd>
+      <dt>Axis</dt><dd>Contract and distribution hygiene</dd>
+      <dt>Basis</dt>
+      <dd><code>direct:</code> the identity validator at <code>lib/pro-gate-lib.sh:2504-2517</code> and the v0.40.0 release note's "every reader tolerates extra keys"; <code>lib/pro-gate-lib.sh:1090-1100</code> returns on flock timeout without closing the guard descriptor and its mkdir fallback has no liveness check, versus the self-healing <code>pg_lock</code> at <code>:299-302,341</code>; the unknown-contract rejection at <code>:2639-2644</code> versus the directional messages at <code>bin/pro-gate-doctor.sh:116,118</code>; <code>install.sh:96</code> installs the rollback on an EXIT trap, <code>:298-326</code> publishes the runtime file by file with VERSION and EXPECTED_VERSION as separate moves at <code>:323</code> and <code>:325</code>; the daemon was enabled for the measurement week on 2026-09-02, inside the analysis window, and no ledger field records which surface invoked a run. All verified by two independent reviewers.</dd>
+      <dt>Rationale</dt>
+      <dd>Each part reuses logic that already exists two functions away or one script over; the discussion is how to fold them, not whether to build. Both judges ranked this third: it is low blast radius and it is a dependency of ideas 2 and 5. The guard sits on the path where 59 lock timeouts landed. The ledger is the most externally consumed artifact in the system and the only typed record without a schema, and the two new fields turn two untestable questions, whether the daemon skews the yield numbers and whether admission changes would help, into ledger queries.</dd>
+      <dt>Downsides</dt>
+      <dd>The lighter read-only check weakens a deliberately fail-closed posture; it is scoped to two verbs, two of the four identity fields, and a visible degraded marker, and any widening beyond that is a different decision. A ledger schema must stay additive or every external reader breaks at once. The oracle package pin, originally in this batch, is split out: it is a policy reversal that forgoes automatic pickup of upstream fixes the doctor already warns about, and it needs an owner and a bump trigger before it ships (see the rejection summary).</dd>
+      <dt>First step</dt>
+      <dd>Ship the ledger record-type and record-version fields with the invoker and capacity-at-wait-start columns; it matches the v0.40 typed-outcome pattern exactly and needs none of the compatibility decisions.</dd>
+      <dt>Falsifier</dt>
+      <dd>If a read-only query under the lighter check is ever consumed by a renderer as if it were fully matched, the degraded marker failed and the loosening must be reverted.</dd>
+    </dl>
+  </article>
+
+  <article class="card" id="idea-4">
+    <h3>4. One action table, four renderers: conformance for the daemon, one shared bash module <span class="chip axis">Where the loop lives</span> <span class="chip good">Confidence 80%</span> <span class="chip neutral">Complexity Medium</span></h3>
+    <dl class="fields">
+      <dt>Description</dt>
+      <dd>The conformance suite checks the skill and the relay. The daemon renders the same eight-action table with its own validator at its own strictness, and nothing catches drift between them. In this repo, now: add the daemon's validator to the suite's consumer list and run it against the existing fixture corpus; extract that validator into one sourceable library function the daemon calls, so there is one hand-written bash implementation instead of a second; add the nine hard-coded twenty-minute harvest hints to the drift checks. In dotfiles, later: the loop script already resolves the plugin identity and runs the doctor at startup, so it does not need a new self-check; what it needs is a dotfiles-side test that exercises its action table against the shipped contract-identity file, rather than vendoring a private script into a marketplace-distributed test suite. The two prose renderers for language-model callers stay hand-written; the suite already covers them, and the daemon's fixer prompt invokes the skill, so it inherits the skill's fixer order rather than restating it. Only the loop script restates the fixer route, and that is a code-reading finding with no observed misfire yet.</dd>
+      <dt>Axis</dt><dd>Where the loop lives</dd>
+      <dt>Basis</dt>
+      <dd><code>direct:</code> <code>tests/review-decision-adapters.test.sh:111</code> sets <code>CONSUMERS=("$SKILL" "$RELAY")</code> and its own comment says the daemon and loop script have no equivalent check; <code>daemon/daemon.sh:23-49</code> is an independent jq decision validator; <code>daemon/daemon.sh:85</code> tells its agent to "invoke the /pro-gate skill", inheriting the fixer order at <code>skills/pro-gate/SKILL.md:174</code>; the loop script resolves identity and runs the doctor at <code>pro-gate-loop.sh:154-181</code> and calls the fixer directly; <code>--timeout 20m</code> appears seven times in the engine's hint strings and once each in the skill and relay. All verified by two independent reviewers, who corrected the earlier claim that the daemon restates the fixer order.</dd>
+      <dt>Rationale</dt>
+      <dd>The daemon drives unattended, credentialed rounds; a drift there ships a wrong action silently, which is the failure class the typed contract was built to prevent. This is a hand-written shared bash module, not the protocol compiler the August doc rejected. Five of six ideation frames converged on the gap, and the risk-first judge ranked it second because it is test-only and cannot regress the browser session.</dd>
+      <dt>Downsides</dt>
+      <dd>A shared module is a new dependency surface for the daemon. The loop-script coverage is only as good as the dotfiles test that owns it, and this doc cannot promise that test. Prose renderers still need human maintenance and can drift in wording the suite cannot see.</dd>
+      <dt>First step</dt>
+      <dd>Run the daemon's validator against the existing fixture corpus in the conformance suite; this alone tells you whether the two bash renderers already disagree.</dd>
+      <dt>Falsifier</dt>
+      <dd>If the daemon's validator accepts and rejects exactly the same fixtures as the suite today, the drift claim is weaker and the module extraction becomes cleanup rather than protection.</dd>
+    </dl>
+  </article>
+
+  <article class="card" id="idea-5">
+    <h3>5. Decision facts, staged: failure reason first, round trajectory next <span class="chip axis">Where the loop lives</span> <span class="chip warn">Confidence 75%</span> <span class="chip neutral">Complexity Medium to High</span></h3>
+    <dl class="fields">
+      <dt>Description</dt>
+      <dd>Additive, versioned facts on the typed decision, one field per point release rather than one bundle, because every bump moves the corpus digest and all four renderers together. First the most recent same-marker failure reason and detail, which the ledger records since v0.40 and the decision never reads; it is the one field with a stated operator use, making "never repeat the same review without new evidence" checkable from the decision itself. Next the round trajectory the engine already computes in one place, meaning base, earned, ceiling, and streak, together with the policy mode, which has four states: off, advisory, enforced, and lockdown. The dotfiles loop script may then replace its private flat cap with the runtime's numbers only when the mode is enforced or lockdown; under advisory, the default, the loop keeps its own cap, because today that cap is the only limit that binds. Then the stall class and age from idea 2, once idea 3's schema exists. No field is a wake, a prompt, or an instruction, which is what keeps this clear of the closed heartbeat and next-action design. The poll-cadence hint proposed earlier is dropped: no incident or missed collection window was ever cited as its cost.</dd>
+      <dt>Axis</dt><dd>Where the loop lives</dd>
+      <dt>Basis</dt>
+      <dd><code>direct:</code> the contract validator at <code>lib/pro-gate-lib.sh:2672</code> locks the governor object to the single key <code>granted</code>; the grant is computed "in ONE place so --status and enforcement cannot drift" at <code>:2081-2082,2130</code>; the facts builder at <code>:2586-2609</code> never reads the ledger; the policy mode at <code>:2143-2159</code> returns off, advisory, enforced, or lockdown and defaults to advisory; the loop script's round cap is a wrapper-local counter with no call into the engine's scoring; <code>skills/pro-gate/SKILL.md:12</code> "Observation is non-prompting and is not blocking-wait next_action".</dd>
+      <dt>Rationale</dt>
+      <dd>This is the August status-schema idea, re-homed on the contract that actually shipped instead of the status file, and staged so each release carries one reviewable field. Both judges placed it after ideas 3 and 4: it changes a contract two renderers consume unattended, so it wants the daemon's conformance coverage and the typed-record convention in place first.</dd>
+      <dt>Downsides</dt>
+      <dd>Each bump changes the corpus digest, so the skill, relay, daemon, Codex mount, and loop script must move together; that is the same desync class the dotfiles harness already reports, and idea 3's lighter read-only check is what keeps a bump from refusing every status query in the gap. Advisory numbers in a trust-sensitive facts object need explicit labeling so no renderer treats them as authority. Per-field conformance fixtures must land before any renderer consumes a field.</dd>
+      <dt>First step</dt>
+      <dd>Ship the failure-reason field as v1.1 with its validator, corpus digest, and skill, relay, and daemon fixtures; it needs no new computation.</dd>
+      <dt>Falsifier</dt>
+      <dd>A renderer found already reading any of these facts from the contract rather than re-deriving them locally.</dd>
+    </dl>
+    <figure>
+      <svg viewBox="0 0 900 260" role="img" aria-label="Engine facts flow into one review-decision contract, which four renderers consume: skill, relay, daemon, and loop script. Each renderer currently re-derives round budget, failure reason, and stall state on its own.">
+        <rect x="0" y="0" width="900" height="260" fill="transparent"/>
+        <rect x="20" y="40" width="200" height="150" rx="10" fill="#efeee9" stroke="#9a9a9a"/>
+        <text x="120" y="66" font-size="12.5" font-weight="600" text-anchor="middle" fill="#202127">engine already knows</text>
+        <text x="120" y="92" font-size="12" text-anchor="middle" fill="#202127">last failure reason</text>
+        <text x="120" y="112" font-size="12" text-anchor="middle" fill="#202127">round trajectory + mode</text>
+        <text x="120" y="132" font-size="12" text-anchor="middle" fill="#202127">stall class and age</text>
+        <text x="120" y="176" font-size="11" text-anchor="middle" fill="#666a73">computed, then discarded</text>
+        <line x1="220" y1="115" x2="318" y2="115" stroke="#4f46e5" stroke-width="2"/>
+        <rect x="322" y="70" width="230" height="90" rx="10" fill="#e8e7ff" stroke="#4f46e5"/>
+        <text x="437" y="100" font-size="13" font-weight="600" text-anchor="middle" fill="#3730a3">review-decision v1.1, v1.2, v1.3</text>
+        <text x="437" y="122" font-size="12" text-anchor="middle" fill="#3730a3">one additive field per release</text>
+        <text x="437" y="142" font-size="11.5" text-anchor="middle" fill="#3730a3">no wake, no prompt, no instruction</text>
+        <line x1="552" y1="115" x2="640" y2="60" stroke="#9a9a9a" stroke-width="1.5"/>
+        <line x1="552" y1="115" x2="640" y2="100" stroke="#9a9a9a" stroke-width="1.5"/>
+        <line x1="552" y1="115" x2="640" y2="140" stroke="#9a9a9a" stroke-width="1.5"/>
+        <line x1="552" y1="115" x2="640" y2="180" stroke="#9a9a9a" stroke-width="1.5"/>
+        <rect x="644" y="44" width="236" height="32" rx="8" fill="#dcfce7" stroke="#166534"/>
+        <text x="762" y="65" font-size="12.5" text-anchor="middle" fill="#202127">skill — drops prose re-derivation</text>
+        <rect x="644" y="84" width="236" height="32" rx="8" fill="#dcfce7" stroke="#166534"/>
+        <text x="762" y="105" font-size="12.5" text-anchor="middle" fill="#202127">relay — same</text>
+        <rect x="644" y="124" width="236" height="32" rx="8" fill="#dcfce7" stroke="#166534"/>
+        <text x="762" y="145" font-size="12.5" text-anchor="middle" fill="#202127">daemon — reads the same facts</text>
+        <rect x="644" y="164" width="236" height="32" rx="8" fill="#dcfce7" stroke="#166534"/>
+        <text x="762" y="185" font-size="12.5" text-anchor="middle" fill="#202127">loop script — real rounds when enforced</text>
+        <text x="450" y="236" font-size="11.5" text-anchor="middle" fill="#666a73">One field at a time at the choke point every renderer already validates; private re-derivations retire as each field lands.</text>
+      </svg>
+      <figcaption>Illustrative: the contract as the single place engine facts are published, replacing per-renderer guesses.</figcaption>
+    </figure>
+  </article>
+
+  <article class="card" id="idea-6">
+    <h3>6. A size-aware collect timeout, then a structural tier for large diffs <span class="chip axis">Review yield per slot</span> <span class="chip warn">Confidence 65%</span> <span class="chip neutral">Complexity Medium</span></h3>
+    <dl class="fields">
+      <dt>Description</dt>
+      <dd>Two steps on the evidence chain idea 1 provides. First, size the collection timeout to the diff. The twenty-minute value that operators, the skill, and the relay copy from nine hint strings is fixed regardless of payload, it is oracle's own default browser timeout, and a quarter of all still-generating rows end at exactly that boundary. Derive a per-size-band collect timeout from clean-outcome rows only, since harvest and timed-out rows are right-censored at the very value being replaced, use a wide percentile with a floor because the largest band has only 25 clean rows, and have the runtime supply the value so the engine's timeout and oracle's are sized together. The timeout says when to check back; it never becomes authority to terminalize a still-generating review from elapsed time, and the confirmed-absent-probe requirement stays mandatory. Second, only if the band over six thousand lines still loses after the window is fixed, trial the cheapest structural option, risk-ordered hunks in a single payload, and after that a two-turn pre-scan issued as one pre-planned protocol at submission, a scoped first turn and a full second turn in one conversation with one final verdict, never a reactive follow-up when a turn lacks a verdict line, with the second turn's capture checked against the same nonce binding the single-turn path enforces. The cook-and-harvest thresholds, set from one July anecdote, are re-derived from idea 1's size view.</dd>
+      <dt>Axis</dt><dd>Review yield per slot</dd>
+      <dt>Basis</dt>
+      <dd><code>direct:</code> the ledger's 6,000-plus band since 2026-08-17 shows 25 clean, 38 failed, and 40 stuck; the cook-and-harvest rationale at <code>bin/oracle-review.sh:2881-2890</code> rests on a single 2026-07-09 observation; 101 of 398 exit-9 rows ended at exactly 1,200 seconds, traced to the hard-coded <code>--timeout 20m</code> hint at seven engine sites plus <code>skills/pro-gate/SKILL.md:152</code> and <code>agents/oracle-reviewer.md:147</code>, and to oracle's documented twenty-minute default browser timeout; the nonce rule at <code>bin/oracle-review.sh:2575</code> "NONCE OR NOTHING". <code>external:</code> Meta RADAR's risk-stratified escalation and 35 percent wall-time cut; GitLab Duo's two-stage pre-scan; Qwen Code's hunk-aware chunking; the Software Letters critique that stacked review loses the integration reviewer.</dd>
+      <dt>Rationale</dt>
+      <dd>This is the only size band pro-gate chose to keep spending on rather than refuse, and it is the band with the worst yield. The ladder turns competing proposals into one sequence where the cheap step may make the expensive one unnecessary, and it finally uses the timing split shipped in v0.34 to decide something.</dd>
+      <dt>Downsides</dt>
+      <dd>A second turn in one conversation is new complexity and tests the nonce binding; it must stay one PR, one conversation, one verdict. Timeouts derived from a few dozen rows can overfit and must be re-checked after more weeks. A longer collect timeout for the biggest diffs lengthens their worst case, so the cap must stay well inside the reservation TTL.</dd>
+      <dt>First step</dt>
+      <dd>Compute post-slot duration percentiles by diff-size band over clean rows only and compare the largest band's p90 against 1,200 seconds; no code change is needed for this.</dd>
+      <dt>Falsifier</dt>
+      <dd>If the clean-row p90 for large diffs is at or below 1,200 seconds, the window is not the cause and the first step is dropped.</dd>
+    </dl>
+    <figure>
+      <svg viewBox="0 0 900 230" role="img" aria-label="Outcome mix of fresh runs by diff size since 2026-08-17. Under 500 lines: 104 clean, 8 failed, 51 stuck. Under 2,000: 115 clean, 37 failed, 30 stuck. Under 6,000: 55 clean, 31 failed, 35 stuck. Over 6,000: 25 clean, 38 failed, 40 stuck.">
+        <rect x="0" y="0" width="900" height="230" fill="transparent"/>
+        <text x="20" y="24" font-size="12" fill="#666a73">Fresh runs by diff size, since 2026-08-17 (clean / failed / stuck)</text>
+        <text x="20" y="64" font-size="12.5" fill="#202127">&lt; 500 lines</text>
+        <rect x="150" y="48" width="416" height="22" rx="5" fill="#dcfce7" stroke="#166534"/>
+        <rect x="566" y="48" width="32" height="22" rx="5" fill="#fee2e2" stroke="#991b1b"/>
+        <rect x="598" y="48" width="204" height="22" rx="5" fill="#fef3c7" stroke="#92400e"/>
+        <text x="810" y="64" font-size="12" fill="#666a73">104 / 8 / 51</text>
+        <text x="20" y="108" font-size="12.5" fill="#202127">&lt; 2,000 lines</text>
+        <rect x="150" y="92" width="460" height="22" rx="5" fill="#dcfce7" stroke="#166534"/>
+        <rect x="610" y="92" width="148" height="22" rx="5" fill="#fee2e2" stroke="#991b1b"/>
+        <rect x="758" y="92" width="120" height="22" rx="5" fill="#fef3c7" stroke="#92400e"/>
+        <text x="20" y="128" font-size="11" fill="#666a73">115 / 37 / 30</text>
+        <text x="20" y="160" font-size="12.5" fill="#202127">&lt; 6,000 lines</text>
+        <rect x="150" y="144" width="220" height="22" rx="5" fill="#dcfce7" stroke="#166534"/>
+        <rect x="370" y="144" width="124" height="22" rx="5" fill="#fee2e2" stroke="#991b1b"/>
+        <rect x="494" y="144" width="140" height="22" rx="5" fill="#fef3c7" stroke="#92400e"/>
+        <text x="650" y="160" font-size="12" fill="#666a73">55 / 31 / 35</text>
+        <text x="20" y="204" font-size="12.5" fill="#202127">6,000+ lines</text>
+        <rect x="150" y="188" width="100" height="22" rx="5" fill="#dcfce7" stroke="#166534"/>
+        <rect x="250" y="188" width="152" height="22" rx="5" fill="#fee2e2" stroke="#991b1b"/>
+        <rect x="402" y="188" width="160" height="22" rx="5" fill="#fef3c7" stroke="#92400e"/>
+        <text x="580" y="204" font-size="12" fill="#666a73">25 / 38 / 40 — the only band where failed beats clean</text>
+      </svg>
+      <figcaption>Bars are proportional within each row, not across rows. Lock timeouts, deferrals, and refusals are omitted for legibility.</figcaption>
+    </figure>
+  </article>
+</section>
+
+<section id="rejection-summary">
+  <h2>Rejection Summary</h2>
+  <p>Twenty-eight candidates reached the fresh-context verifier: eighteen sound, eight weak, one refuted; three failed the meeting test. The seven survivors were then pressure-tested by a nine-agent workflow: six skeptics across evidence, doctrine, and value lenses returned 42 verdicts with one refutation, two sequencing judges with opposite biases proposed build orders, and a completeness critic found four material gaps. The orchestrator weighed those against the code and folded, corrected, or dropped as recorded below.</p>
+  <table>
+    <thead><tr><th>#</th><th>Idea</th><th>Reason rejected or folded</th></tr></thead>
+    <tbody>
+      <tr><td class="id">A</td><td>Network-layer completion proof: intercept ChatGPT's per-message status and end-turn flag over the CDP network domain as positive terminal proof</td><td>Refuted as stated. The closest prior art on this product, rosetta, rejects end-turn and stream terminators as proof for exactly the preamble-then-resume behavior pro-gate already hit, and #109's guidance requires a predicate verified across bounded fresh renders. The direction that survives is rosetta's own: a server-asserted message-graph completion check, run as a live experiment against the open reproductions before it is given any terminal authority, and checked first against what the installed oracle already marks (incomplete capture, reattach, heartbeat liveness). Not promoted; recorded so the route is not lost.</td></tr>
+      <tr><td class="id">7</td><td>Former idea 7: instant typed no-capacity answer before the lock loop, then ground-delay-program substitution (the August fair-share idea, U7)</td><td>Refuted by the value skeptic and dropped by both judges. An immediate no-capacity answer only makes exit 7 faster for callers that have no retry loop; the recheck window would have to be sized to observed burst recovery (614-second median, not seconds); and the ledger has no capacity-state-at-wait-start field, so the premise cannot be tested against history. The instrumentation moves into idea 3's schema and idea 1's weekly line; substitution is revisited only with that data, scoped to a PR's own uncollected attempt versus its own fresh retry, never a carried entitlement.</td></tr>
+      <tr><td class="id">B, C, D</td><td>Parity sweep on the still-generating branch; stall class in status and ledger; memo revalidation and revocation</td><td>Sound; folded into idea 2, with the skeptics' correction that the miss must come from an independent absence probe.</td></tr>
+      <tr><td class="id">E</td><td>A paid-for, never-collected answer gets its own name and clock</td><td>Weak on its own, fully overlapped by the stall class and the weekly read; its two-clock accounting is a line in idea 1.</td></tr>
+      <tr><td class="id">F, G</td><td>Re-derive cook-and-harvest thresholds from yield data; two-stage, chunked, or risk-ranked review for large diffs</td><td>Sound; the report is idea 1's size view and the structural tier is idea 6's second step, issued as one pre-planned submission with the second turn nonce-bound.</td></tr>
+      <tr><td class="id">H</td><td>Scale the first observation window to diff size</td><td>Weak as cited: the 1,200-second figure is the hard-coded twenty-minute harvest hint and oracle's default browser timeout, not the cook-and-harvest window. Corrected and folded into idea 6's first step, derived from clean rows only.</td></tr>
+      <tr><td class="id">I</td><td>Failure reason in the decision facts</td><td>Sound; it is the first field of idea 5.</td></tr>
+      <tr><td class="id">Q</td><td>A runtime-supplied poll-cadence hint in the decision facts</td><td>Dropped by the value skeptic and both judges: no wasted-poll incident or missed collection window was ever cited as its cost. Revisit only with such evidence.</td></tr>
+      <tr><td class="id">J</td><td>One engine-authored follow-up in the same conversation when findings exist but the verdict line is missing</td><td>Weak. It breaks neither the nonce rule nor the single-verdict contract, but an autonomous reactive write into a live paid conversation is new attack surface. Idea 6's two-turn protocol is the pre-planned form; the reactive form stays a brainstorm variant.</td></tr>
+      <tr><td class="id">K, L</td><td>Ground-delay-program slot substitution; instant typed no-capacity answer</td><td>See former idea 7 above.</td></tr>
+      <tr><td class="id">M</td><td>Opt-in ensemble double review for non-converging or release-blocking PRs</td><td>Sound as a trade-off note, not a build direction: the account throttle is the real limiter, so a second slot per PR is the scarcest thing to spend. Revisit only if idea 1's churn Pareto shows failure concentrated in a few non-converging PRs.</td></tr>
+      <tr><td class="id">N</td><td>Extend conformance to all four renderers; shared bash dispatcher</td><td>Sound; promoted as idea 4, minus two parts the skeptics removed: vendoring the private loop script into a marketplace-distributed test suite (a distribution-boundary problem; replaced by a dotfiles-side test against the shipped identity file) and a startup digest self-check for the loop script, which already exists at <code>pro-gate-loop.sh:154-181</code>.</td></tr>
+      <tr><td class="id">O</td><td>Round trajectory in the governor object; delete the loop script's flat cap</td><td>Weak as stated: rounds are advisory by default, so the loop script's cap is the only limit that binds today. The trajectory fields are idea 5's second release, and the loop may drop its cap only under enforced or lockdown mode.</td></tr>
+      <tr><td class="id">P</td><td>Teach the interactive skill to hand multi-round work to the supervisor script</td><td>Sound in intent, out of scope as written: the supervisor is a private dotfiles script and the distributed skill cannot route to it. It leaves an open question the prior docs did not settle: whether pro-gate should ship the supervisor as a runtime verb. That is a decision for the operator, not an idea this doc can promote.</td></tr>
+      <tr><td class="id">R, S</td><td>Native weekly rollup; aging report for under-submission runs</td><td>Sound and weak respectively; both folded into idea 1, with the aging view also fed by idea 2. The skeptics added that the lane report already computes the reason mix and trend warning, so idea 1 prototypes there first and states the native script as canonical.</td></tr>
+      <tr><td class="id">T, U, V</td><td>Reservation guard self-heal; version-desync refusal names its direction and lighter read-only gate; ledger-row schema</td><td>Sound; batched as idea 3 with the read-only gate pinned to two verbs, two identity fields, and a degraded marker.</td></tr>
+      <tr><td class="id">—</td><td>Pin the oracle package version</td><td>Split out of idea 3 as a follow-up: it is a policy reversal that forgoes automatic pickup of upstream fixes the doctor already warns about, and it needs a named owner and a bump trigger (for example the doctor's floor warning) before it ships. The doctor's own comment at <code>bin/pro-gate-doctor.sh:171</code> records the unpinned install.</td></tr>
+      <tr><td class="id">—</td><td>Install atomicity (axis 5 named it; no survivor covered it)</td><td>Gap found by the completeness critic; added to idea 3 as its fourth part.</td></tr>
+      <tr><td class="id">—</td><td>U6's fast pre-tier half</td><td>Still unaddressed, not folded into idea 1 as the earlier table implied. It stays gated on idea 1's Pareto showing churn concentrated in categories a cheap pass can catch; if the Pareto shows churn is irreducibly deep-model territory, it is not built.</td></tr>
+      <tr><td class="id">—</td><td>Mathfleet blindness invariant (dotfiles ROI item 6)</td><td>Out of scope: a mathfleet custody control enforced in that repo's CI, not a pro-gate capacity, contract, or reporting lever. Listed so the ROI row's seventh item is accounted for.</td></tr>
+      <tr><td class="id">—</td><td>The daemon as a confound in the yield numbers</td><td>Not an idea; a gap the critic found. The daemon was enabled on 2026-09-02, inside the analysis window, and no ledger field records the invoker. Handled by the invoker field in idea 3 and the per-invoker split in idea 1.</td></tr>
+      <tr><td class="id">W</td><td>A disjoint brief-analysis contract to un-fence <code>--brief</code></td><td>Weak: it relocates the security boundary from structural non-exposure to a schema promise every consumer must honor. Keep <code>--brief</code> unexposed; if the dotfiles ROI item is pursued, brainstorm it against this boundary first.</td></tr>
+      <tr><td class="id">X</td><td>No account field anywhere in ledger or reservation state</td><td>Correct and cheap to confirm, but self-scoped as not a call to build and fails the meeting test. Recorded as a fact for whoever first needs a second account.</td></tr>
+      <tr><td class="id">X1–X4</td><td>The four cross-cutting syntheses</td><td>Promoted as ideas 2, 6, 5, and 1 respectively, each corrected by the verifier and the pressure test.</td></tr>
+      <tr><td class="id">—</td><td>Rejections carried forward from 2026-08-17 and 2026-08-26</td><td>All still binding; listed in the grounding callout above. None of the six survivors touches them.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="grounding-references">
+  <h2>Grounding References</h2>
+  <ul>
+    <li><a href="https://github.com/StartupBros-com/pro-gate/blob/main/docs/ideation/2026-08-17-pro-gate-gate-run-ux-ideation.html">docs/ideation/2026-08-17-pro-gate-gate-run-ux-ideation.html</a> — prior gate-run UX and performance ideation (U1–U7)</li>
+    <li><a href="https://github.com/StartupBros-com/pro-gate/blob/main/docs/ideation/2026-08-26-pro-gate-simplification-ideation.html">docs/ideation/2026-08-26-pro-gate-simplification-ideation.html</a> — prior simplification ideation (S1–S5)</li>
+    <li><a href="https://github.com/StartupBros-com/pro-gate/pull/79">PR #79</a> — ChatGPT-web bridge ideation, closed as stale</li>
+    <li><a href="https://github.com/StartupBros-com/pro-gate/pull/89">PR #89</a> and <a href="https://github.com/StartupBros-com/pro-gate/issues/88">issue #88</a> — blocking wait verb, closed unmerged</li>
+    <li><a href="https://github.com/StartupBros-com/pro-gate/issues/109">issue #109</a> — current-head verdict-less conversation pins a slot</li>
+    <li><a href="https://github.com/StartupBros-com/pro-gate/blob/main/skills/pro-gate/SKILL.md">skills/pro-gate/SKILL.md</a>, <a href="https://github.com/StartupBros-com/pro-gate/blob/main/agents/oracle-reviewer.md">agents/oracle-reviewer.md</a>, <a href="https://github.com/StartupBros-com/pro-gate/blob/main/daemon/daemon.sh">daemon/daemon.sh</a> — the three in-repo renderers</li>
+    <li><a href="https://github.com/StartupBros-com/pro-gate/blob/main/bin/oracle-review.sh">bin/oracle-review.sh</a>, <a href="https://github.com/StartupBros-com/pro-gate/blob/main/lib/pro-gate-lib.sh">lib/pro-gate-lib.sh</a>, <a href="https://github.com/StartupBros-com/pro-gate/blob/main/bin/cdp-salvage.mjs">bin/cdp-salvage.mjs</a>, <a href="https://github.com/StartupBros-com/pro-gate/blob/main/bin/pro-gate-stats.sh">bin/pro-gate-stats.sh</a>, <a href="https://github.com/StartupBros-com/pro-gate/blob/main/bin/pro-gate-doctor.sh">bin/pro-gate-doctor.sh</a> — engine, library, salvage, stats, doctor</li>
+    <li><a href="https://github.com/StartupBros-com/pro-gate/blob/main/tests/review-decision-adapters.test.sh">tests/review-decision-adapters.test.sh</a> — the conformance suite</li>
+    <li><a href="https://github.com/StartupBros-com/pro-gate/tree/main/docs/release-notes">docs/release-notes/</a> — v0.34.0 through v0.40.0</li>
+    <li><a href="https://github.com/StartupBros-com/pro-gate/tree/main/docs/solutions/conventions">docs/solutions/conventions/</a> — the four learnings cited</li>
+    \1\n    <li><code>~/dotfiles/claude/scripts/pro-lane-report.py</code> — the dotfiles weekly lane report (reason mix, trend warning, headroom); local path, not a public URL</li>\n    <li><code>~/SITES/oracle/docs/browser-mode.md</code> — the oracle fork\'s browser-mode documentation: incomplete-capture marking, recheck and auto-reattach, heartbeat liveness, the twenty-minute default browser timeout; local path</li>
+    <li><a href="https://github.com/StartupBros-com/dotfiles/issues/849">dotfiles #849</a> — ChatGPT Pro capacity lanes umbrella and the measurement week</li>
+    <li><a href="https://github.com/StartupBros-com/dotfiles/issues/925">dotfiles #925</a> — runtime and plugin-cache version desync</li>
+    <li><a href="https://arxiv.org/abs/2605.30208">Meta RADAR</a>, <a href="https://arxiv.org/abs/2603.26130">SWE-PRBench</a>, <a href="https://codeherder.com/docs/review-debt/">CodeHerder review debt</a>, <a href="https://www.span.app/research/agent-effectiveness-july2026">Span turn yield</a> — review-gate yield</li>
+    <li><a href="https://docs.aws.amazon.com/step-functions/latest/dg/troubleshooting.html">AWS Step Functions orphan clocks</a>, <a href="https://github.com/kristenmartino/cabana/issues/23">Cabana issue 23</a>, <a href="https://kubernetes.io/docs/concepts/workloads/controllers/job/">Kubernetes Jobs</a> — collect-later economics</li>
+    <li><a href="https://docs.gitlab.com/user/duo_agent_platform/flows/foundational_flows/code_review/">GitLab Duo code review</a>, <a href="https://github.com/QwenLM/qwen-code/blob/main/docs/users/features/code-review.md">Qwen Code chunked review</a> — large-diff review</li>
+  </ul>
+</section>
+
+<footer class="composition-signal">Composed 2026-09-05T00:58Z by ce-ideate from the user's refresh prompt, origin/main at 96590c1 (v0.40.0), the run ledger at ~/.pro-review-daemon, five evidence dossiers, and external research; bases checked by a fresh-context verifier against the live repo; revised 2026-09-05 after a nine-agent pressure test (six refuting skeptics across evidence, doctrine, and value lenses, two sequencing judges, one completeness critic).</footer>
+</main>
+</body>
+</html>
