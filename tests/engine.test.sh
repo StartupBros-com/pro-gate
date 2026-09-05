@@ -5454,11 +5454,12 @@ check 'contended reservation guard acquire fails without leaking a descriptor' \
 (
   pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
   sleep 0 & GUARD_DEAD=$!; wait "$GUARD_DEAD"
-  mkdir -p "$GUARD_LOCK.d"; echo "$GUARD_DEAD" > "$GUARD_LOCK.d/pid"
+  mkdir -p "$GUARD_LOCK.d"; : > "$GUARD_LOCK.d/owner.$GUARD_DEAD"
   PRO_GATE_HOME="$GUARD_HOME" PRO_GATE_RESERVATION_GUARD_WAIT=3 pg_reservation_guard_acquire; rc=$?
-  owner="$(cat "$GUARD_LOCK.d/pid" 2>/dev/null)"
+  owner=""; for f in "$GUARD_LOCK.d"/owner.*; do [ -e "$f" ] && owner="${f##*/owner.}"; done
   PRO_GATE_HOME="$GUARD_HOME" pg_reservation_guard_release
-  [ "$rc" -eq 0 ] && [ "$owner" = "$$" ] && [ ! -d "$GUARD_LOCK.d" ]
+  # the owner is the shell that holds the guard (BASHPID of this subshell), never the parent $$
+  [ "$rc" -eq 0 ] && [ "$owner" = "$BASHPID" ] && [ ! -e "$GUARD_LOCK.d/owner.$GUARD_DEAD" ] && [ ! -d "$GUARD_LOCK.d" ]
 ); GUARD_STALE_RC=$?
 check 'no-flock reservation guard self-heals a directory left by a dead process and releases its own' "$GUARD_STALE_RC"
 
@@ -5470,7 +5471,7 @@ check 'no-flock reservation guard self-heals a directory left by a dead process 
 GUARD_RACE_HOME="$TDIR/home-guard-race"; mkdir -p "$GUARD_RACE_HOME/bin"
 GUARD_RACE_LOCK="$(PRO_GATE_HOME="$GUARD_RACE_HOME" pg_reservation_lock)"; mkdir -p "$(dirname "$GUARD_RACE_LOCK")"
 sleep 0 & GUARD_RACE_DEAD=$!; wait "$GUARD_RACE_DEAD"
-mkdir -p "$GUARD_RACE_LOCK.d"; echo "$GUARD_RACE_DEAD" > "$GUARD_RACE_LOCK.d/pid"
+mkdir -p "$GUARD_RACE_LOCK.d"; : > "$GUARD_RACE_LOCK.d/owner.$GUARD_RACE_DEAD"
 GUARD_RACE_RM="$(command -v rm)"
 printf '#!/usr/bin/env bash\nif [ -n "${PG_TEST_RM_DELAY:-}" ]; then : > "${PG_TEST_RM_SENTINEL:?}"; sleep "$PG_TEST_RM_DELAY"; fi\nexec "%s" "$@"\n' "$GUARD_RACE_RM" > "$GUARD_RACE_HOME/bin/rm"
 chmod +x "$GUARD_RACE_HOME/bin/rm"
@@ -5492,36 +5493,97 @@ check 'gate #148 r1 P1: two no-flock reclaimers of one dead guard owner never bo
      && [ "$(wc -l < "$GUARD_RACE_LOG" | tr -d ' ')" -eq 4 ] \
      && awk '$1=="enter"{if(open)bad=1; open=1} $1=="exit"{open=0} END{exit bad}' "$GUARD_RACE_LOG"; echo $?)" \
   "a_rc=$GUARD_RACE_A_RC b_rc=$GUARD_RACE_B_RC sentinel=$(test -e "$GUARD_RACE_SENTINEL"; echo $?) log=$(tr '\n' ';' < "$GUARD_RACE_LOG")"
-# Reclamation is never recursive: moving a replacement live reclaim lock aside, even briefly,
-# breaks exclusion. An orphaned or live reclaim lock therefore leaves both directories untouched
-# and fails within the acquire budget. Quiescent operator cleanup is required for an orphan.
+# An ownerless guard directory is one a holder died inside between mkdir and its marker, or
+# between its marker's removal and the rmdir; it is empty, so rmdir reclaims it without any
+# pathname-level deletion that could hit a replacement.
 (
   pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
-  sleep 0 & dead=$!; wait "$dead"
-  mkdir -p "$GUARD_RACE_LOCK.d" "$GUARD_RACE_LOCK.d.reclaim"
-  echo "$dead" > "$GUARD_RACE_LOCK.d/pid"; echo "$dead" > "$GUARD_RACE_LOCK.d.reclaim/pid"
+  mkdir -p "$GUARD_RACE_LOCK.d"
   PRO_GATE_HOME="$GUARD_RACE_HOME" PRO_GATE_RESERVATION_GUARD_WAIT=2 pg_reservation_guard_acquire; rc=$?
-  owner="$(cat "$GUARD_RACE_LOCK.d/pid" 2>/dev/null)"
-  reclaim_owner="$(cat "$GUARD_RACE_LOCK.d.reclaim/pid" 2>/dev/null)"
+  owner=""; for f in "$GUARD_RACE_LOCK.d"/owner.*; do [ -e "$f" ] && owner="${f##*/owner.}"; done
   PRO_GATE_HOME="$GUARD_RACE_HOME" pg_reservation_guard_release
-  [ "$rc" -ne 0 ] && [ -z "${PG_RESERVATION_GUARD_DIR:-}" ] \
-    && [ "$owner" = "$dead" ] && [ "$reclaim_owner" = "$dead" ] \
-    && [ -d "$GUARD_RACE_LOCK.d" ] && [ -d "$GUARD_RACE_LOCK.d.reclaim" ]
+  [ "$rc" -eq 0 ] && [ "$owner" = "$BASHPID" ] && [ ! -d "$GUARD_RACE_LOCK.d" ]
 ); GUARD_RECLAIM_DEAD_RC=$?
-check 'gate #148 r1 P1: an orphaned reclaim lock is never recursively reclaimed and the acquire fails closed' "$GUARD_RECLAIM_DEAD_RC"
+check 'gate #148 r1 P1: an ownerless empty guard directory is reclaimed by rmdir and then released cleanly' "$GUARD_RECLAIM_DEAD_RC"
 (
   pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
-  sleep 0 & dead=$!; wait "$dead"
   sleep 60 & live=$!
-  mkdir -p "$GUARD_RACE_LOCK.d" "$GUARD_RACE_LOCK.d.reclaim"
-  echo "$dead" > "$GUARD_RACE_LOCK.d/pid"; echo "$live" > "$GUARD_RACE_LOCK.d.reclaim/pid"
+  mkdir -p "$GUARD_RACE_LOCK.d"; : > "$GUARD_RACE_LOCK.d/owner.$live"
   PRO_GATE_HOME="$GUARD_RACE_HOME" PRO_GATE_RESERVATION_GUARD_WAIT=2 pg_reservation_guard_acquire; rc=$?
   kill "$live" 2>/dev/null
-  guard_pid="$(cat "$GUARD_RACE_LOCK.d/pid" 2>/dev/null)"; reclaim_pid="$(cat "$GUARD_RACE_LOCK.d.reclaim/pid" 2>/dev/null)"
-  rm -rf "$GUARD_RACE_LOCK.d" "$GUARD_RACE_LOCK.d.reclaim"
-  [ "$rc" -ne 0 ] && [ -z "${PG_RESERVATION_GUARD_DIR:-}" ] && [ "$guard_pid" = "$dead" ] && [ "$reclaim_pid" = "$live" ]
+  marker_kept=$([ -e "$GUARD_RACE_LOCK.d/owner.$live" ]; echo $?)
+  rm -rf "$GUARD_RACE_LOCK.d"
+  [ "$rc" -ne 0 ] && [ -z "${PG_RESERVATION_GUARD_DIR:-}" ] && [ "$marker_kept" -eq 0 ]
 ); GUARD_RECLAIM_LIVE_RC=$?
-check 'gate #148 r1 P1: a reclaim lock held by a live reclaimer is never removed and the acquire fails closed' "$GUARD_RECLAIM_LIVE_RC"
+check 'gate #148 r1 P1: a guard whose marker names a live process is never removed and the acquire fails closed' "$GUARD_RECLAIM_LIVE_RC"
+
+# gate #148 r2 P1: a guard acquired inside a command substitution records the subshell that holds
+# it (BASHPID), never the parent wrapper ($$). Killing the parent must not make a live guard look
+# dead, so a contender stays excluded while the substitution's holder is still inside.
+GUARD_SUB_HOME="$TDIR/home-guard-subshell"; mkdir -p "$GUARD_SUB_HOME"
+GUARD_SUB_LOCK="$(PRO_GATE_HOME="$GUARD_SUB_HOME" pg_reservation_lock)"; mkdir -p "$(dirname "$GUARD_SUB_LOCK")"
+GUARD_SUB_LOG="$GUARD_SUB_HOME/sections.log"; : > "$GUARD_SUB_LOG"
+PRO_GATE_HOME="$GUARD_SUB_HOME" bash -c '. "$1"; pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
+  out="$(pg_reservation_guard_acquire || exit 9; echo "enter sub" >> "$2"; echo "held"; : > "$3"; until [ -e "$4" ]; do sleep 0.1; done; echo "exit sub" >> "$2"; pg_reservation_guard_release)"
+  [ "$out" = held ]' _ "$HERE/../lib/pro-gate-lib.sh" "$GUARD_SUB_LOG" "$GUARD_SUB_HOME/held" "$GUARD_SUB_HOME/go" & GUARD_SUB_PARENT=$!
+for _ in $(seq 1 100); do [ -e "$GUARD_SUB_HOME/held" ] && break; sleep 0.1; done
+GUARD_SUB_OWNER=""; for f in "$GUARD_SUB_LOCK.d"/owner.*; do [ -e "$f" ] && GUARD_SUB_OWNER="${f##*/owner.}"; done
+kill "$GUARD_SUB_PARENT" 2>/dev/null
+(
+  pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
+  PRO_GATE_HOME="$GUARD_SUB_HOME" PRO_GATE_RESERVATION_GUARD_WAIT=2 pg_reservation_guard_acquire; rc=$?
+  [ "$rc" -ne 0 ] && [ -z "${PG_RESERVATION_GUARD_DIR:-}" ]
+); GUARD_SUB_CONTENDER_RC=$?
+: > "$GUARD_SUB_HOME/go"
+wait "$GUARD_SUB_PARENT" 2>/dev/null
+for _ in $(seq 1 100); do grep -q 'exit sub' "$GUARD_SUB_LOG" && break; sleep 0.1; done
+check 'gate #148 r2 P1: a guard held from a command substitution records the holder, not the wrapper' \
+  "$([ -n "$GUARD_SUB_OWNER" ] && [ "$GUARD_SUB_OWNER" != "$GUARD_SUB_PARENT" ] && [ "$GUARD_SUB_CONTENDER_RC" -eq 0 ]; echo $?)" \
+  "owner=$GUARD_SUB_OWNER parent=$GUARD_SUB_PARENT contender_rc=$GUARD_SUB_CONTENDER_RC log=$(tr '\n' ';' < "$GUARD_SUB_LOG")"
+check 'gate #148 r2 P1: the substitution holder still releases its own guard after the wrapper dies' \
+  "$([ ! -d "$GUARD_SUB_LOCK.d" ]; echo $?)" "$(ls -d "$GUARD_SUB_LOCK.d"* 2>/dev/null | tr '\n' ' ')"
+
+# gate #148 r2 P1: an orphaned release must never delete a replacement guard. Holder A's release
+# has already unlinked its own marker and is parked inside its `rmdir` (PATH shim); A's shell is
+# then killed, so the directory is empty and ownerless. B reclaims it by rmdir, re-creates it,
+# marks it and enters; A's surviving rmdir resumes and must fail against B's marker, so B's guard
+# survives and a third contender C stays excluded while B is inside.
+GUARD_REL_HOME="$TDIR/home-guard-release"; mkdir -p "$GUARD_REL_HOME/bin"
+GUARD_REL_LOCK="$(PRO_GATE_HOME="$GUARD_REL_HOME" pg_reservation_lock)"; mkdir -p "$(dirname "$GUARD_REL_LOCK")"
+GUARD_REL_RMDIR="$(command -v rmdir)"
+printf '#!/usr/bin/env bash\nif [ -n "${PG_TEST_RMDIR_GATE:-}" ] && [ "${@: -1}" = "${PG_TEST_RMDIR_TARGET:-}" ]; then : > "${PG_TEST_RMDIR_GATE}.ready"; until [ -e "$PG_TEST_RMDIR_GATE" ]; do sleep 0.1; done; fi\nexec "%s" "$@"\n' "$GUARD_REL_RMDIR" > "$GUARD_REL_HOME/bin/rmdir"
+chmod +x "$GUARD_REL_HOME/bin/rmdir"
+GUARD_REL_LOG="$GUARD_REL_HOME/sections.log"; : > "$GUARD_REL_LOG"
+PATH="$GUARD_REL_HOME/bin:$PATH" PG_TEST_RMDIR_GATE="$GUARD_REL_HOME/rmdir-gate" PG_TEST_RMDIR_TARGET="$GUARD_REL_LOCK.d" \
+PRO_GATE_HOME="$GUARD_REL_HOME" PRO_GATE_RESERVATION_GUARD_WAIT=20 \
+  bash -c '. "$1"; pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
+    pg_reservation_guard_acquire || exit 9; echo "enter A" >> "$2"; echo "exit A" >> "$2"; pg_reservation_guard_release' _ "$HERE/../lib/pro-gate-lib.sh" "$GUARD_REL_LOG" & GUARD_REL_A=$!
+for _ in $(seq 1 100); do [ -e "$GUARD_REL_HOME/rmdir-gate.ready" ] && break; sleep 0.1; done
+GUARD_REL_A_PARKED=$([ -e "$GUARD_REL_HOME/rmdir-gate.ready" ]; echo $?)
+# A's marker is gone and its rmdir is parked. Kill A's shell but not the parked remover.
+kill "$GUARD_REL_A" 2>/dev/null; wait "$GUARD_REL_A" 2>/dev/null
+PRO_GATE_HOME="$GUARD_REL_HOME" PRO_GATE_RESERVATION_GUARD_WAIT=20 \
+  bash -c '. "$1"; pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
+    pg_reservation_guard_acquire || { echo "fail B" >> "$2"; exit 9; }; echo "enter B" >> "$2"; : > "$3"; until [ -e "$4" ]; do sleep 0.1; done; echo "exit B" >> "$2"; pg_reservation_guard_release' _ "$HERE/../lib/pro-gate-lib.sh" "$GUARD_REL_LOG" "$GUARD_REL_HOME/b-in" "$GUARD_REL_HOME/b-go" & GUARD_REL_B=$!
+for _ in $(seq 1 200); do [ -e "$GUARD_REL_HOME/b-in" ] && break; sleep 0.1; done
+GUARD_REL_B_IN=$([ -e "$GUARD_REL_HOME/b-in" ]; echo $?)
+# Resume A's orphaned rmdir while B is inside, then try a third contender.
+: > "$GUARD_REL_HOME/rmdir-gate"
+sleep 1
+(
+  pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
+  PRO_GATE_HOME="$GUARD_REL_HOME" PRO_GATE_RESERVATION_GUARD_WAIT=2 pg_reservation_guard_acquire; rc=$?
+  [ "$rc" -ne 0 ] && [ -z "${PG_RESERVATION_GUARD_DIR:-}" ]
+); GUARD_REL_C_RC=$?
+GUARD_REL_B_GUARD_ALIVE=$([ -d "$GUARD_REL_LOCK.d" ] && [ -e "$GUARD_REL_LOCK.d/owner.$GUARD_REL_B" ]; echo $?)
+: > "$GUARD_REL_HOME/b-go"
+wait "$GUARD_REL_B" 2>/dev/null
+check 'gate #148 r2 P1: an orphaned release never deletes a replacement live guard' \
+  "$([ "$GUARD_REL_A_PARKED" -eq 0 ] && [ "$GUARD_REL_B_IN" -eq 0 ] && [ "$GUARD_REL_B_GUARD_ALIVE" -eq 0 ] && [ "$GUARD_REL_C_RC" -eq 0 ] \
+     && awk '$1=="enter"{if(open)bad=1; open=1} $1=="exit"{open=0} END{exit bad}' "$GUARD_REL_LOG"; echo $?)" \
+  "a_parked=$GUARD_REL_A_PARKED b_in=$GUARD_REL_B_IN b_guard_alive=$GUARD_REL_B_GUARD_ALIVE c_rc=$GUARD_REL_C_RC log=$(tr '\n' ';' < "$GUARD_REL_LOG") dirs=$(ls -d "$GUARD_REL_LOCK.d"* 2>/dev/null | tr '\n' ' ')"
+check 'gate #148 r2 P1: the replacement holder releases its own guard after the orphaned rmdir failed' \
+  "$([ ! -d "$GUARD_REL_LOCK.d" ]; echo $?)" "$(ls -d "$GUARD_REL_LOCK.d"* 2>/dev/null | tr '\n' ' ')"
 
 # gate #148 r1 P2 (engine side): a --harvest/--recover with no --timeout takes its budget from
 # PRO_GATE_HARVEST_TIMEOUT (default 45m). The daemon's recovery now relies on exactly this instead
