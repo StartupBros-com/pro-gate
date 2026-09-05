@@ -298,7 +298,14 @@ pg_lock() {
   start=$(date +%s)
   while ! mkdir "$lockdir" 2>/dev/null; do
     opid=$(cat "$lockdir/pid" 2>/dev/null || true)
-    if [ -n "$opid" ] && ! kill -0 "$opid" 2>/dev/null; then rm -rf "$lockdir" 2>/dev/null; continue; fi
+    # Reclamation goes through pg_stale_dirlock_reap (#152, the same defect the gate found in the
+    # reservation guard as #148 r1 P1): a bare `rm -rf` here let two waiters that read the SAME
+    # dead pid both enter this section — A removed the directory, re-created it and proceeded; B's
+    # removal then landed on A's LIVE directory and B proceeded too. A failed reclaim (another
+    # reclaimer holds the sibling reclaim lock) is no longer an instant retry either: it counts
+    # against the wait budget instead of spinning without ever reaching the timeout check.
+    if [ -n "$opid" ] && ! kill -0 "$opid" 2>/dev/null \
+       && pg_stale_dirlock_reap "$lockdir" "$opid"; then continue; fi
     [ $(( $(date +%s) - start )) -ge "$wait_s" ] && return 1
     sleep 2
   done
@@ -312,7 +319,8 @@ pg_lock() {
 # single ChatGPT account concurrently (the account tolerates several parallel chats; this just
 # bounds it). Returns 0 with a slot HELD until the process exits, 1 on timeout. flock-based on Linux
 # (the winning fd is kept open and auto-released on exit); mkdir-spinlock fallback on macOS scans N
-# slot dirs and self-heals stale ones via the dead-pid check. maxn<=1 is plain mutual exclusion.
+# slot dirs and self-heals stale ones via the dead-pid check, serialized through
+# pg_stale_dirlock_reap. maxn<=1 is plain mutual exclusion.
 pg_lock_n() {
   local base="$1" maxn="${2:-1}" wait_s="${3:-2400}" exclude="${4:-}" start i fd lockdir opid
   [ "${maxn:-1}" -ge 1 ] 2>/dev/null || maxn=1
@@ -352,7 +360,13 @@ pg_lock_n() {
         return 0
       fi
       opid=$(cat "$lockdir/pid" 2>/dev/null || true)
-      [ -n "$opid" ] && ! kill -0 "$opid" 2>/dev/null && rm -rf "$lockdir" 2>/dev/null
+      # Serialized reclamation, exactly as in pg_lock (#152): an unserialized `rm -rf` let two
+      # scanners that read one dead slot owner both take the slot — the second deleted the
+      # first's live directory on its cached pid — which OVERBOOKS the account (two live reviews
+      # inside one slot of the capacity plan). The scan still moves on to the next slot after a
+      # reclaim, successful or not: the outer pass re-tries this slot after its usual tick, and
+      # returning early here would skip slots this pass had not looked at yet.
+      [ -n "$opid" ] && ! kill -0 "$opid" 2>/dev/null && pg_stale_dirlock_reap "$lockdir" "$opid"
       i=$((i + 1))
     done
     [ $(( $(date +%s) - start )) -ge "$wait_s" ] && return 1
@@ -1081,6 +1095,70 @@ pg_attempt_snapshot() { # host owner repo pr round-key [exclude-marker] -> canon
     --arg out "$out" --arg kind "$artifact_kind" --arg path "$artifact_path" --argjson epoch "$epoch" \
     --argjson recoverable "$recoverable" --argjson fresh "$fresh" --argjson cleanup "$cleanup" --argjson terminal "$terminal_json" \
     '{artifact:{kind:$kind,path:$path},charged_spend_epoch:$epoch,cleanup_pending:$cleanup,fresh_eligible:$fresh,marker:$marker,out:$out,recoverable:$recoverable,source:$source,state:$state,target:{host:$host,owner:$owner,pr:$pr,repo:$repo,round_key:$key},terminal:$terminal}'
+}
+
+# pg_stale_dirlock_reap <lockdir> <observed-dead-pid>: remove a mkdir-spinlock directory whose
+# recorded owner is dead, serialized so two reclaimers can never act on one observation. Without
+# the serialization A and B both read the same dead pid; A removes the directory, re-creates it and
+# enters its critical section; B then removes A's LIVE directory on its cached pid and enters too
+# (gate #148 r1 P1: two reservation-guard holders at once let a fresh run plan its slots before an
+# exiting review published its reservation, and acquire capacity that review had just reserved).
+# The reclaim lock is a sibling directory; under it the owner is re-read and the directory removed
+# only while it is still that same dead owner, so a replacement (a fresh directory, pid written or
+# not yet) is never touched. Returns 0 when the observed stale directory is gone, removed here or
+# already replaced, so the caller retries mkdir at once; 1 when another reclaimer holds the reclaim
+# lock or the removal failed, so the caller waits its usual tick and counts it against its budget.
+pg_stale_dirlock_reap() {
+  local lockdir="$1" dead="$2" reclaim="${1}.reclaim" cur rc=0
+  # Never reclaim this serialization lock: a delayed healer could rename a replacement LIVE
+  # lock away, admitting a second reclaimer before it restores the first one's directory.
+  # An orphan here therefore fails closed within the caller's wait budget; operator cleanup
+  # requires all contenders to be stopped. Ordinary dead-owner guard recovery remains automatic.
+  mkdir "$reclaim" 2>/dev/null || return 1
+  echo "$$" > "$reclaim/pid" 2>/dev/null || true
+  cur="$(cat "$lockdir/pid" 2>/dev/null || true)"
+  if [ -d "$lockdir" ] && [ "$cur" = "$dead" ] && ! kill -0 "$cur" 2>/dev/null; then
+    rm -rf "$lockdir" 2>/dev/null
+  fi
+  # Still there under the same dead owner (removal failed): report it so the caller waits instead
+  # of spinning. A replacement, or nothing, means the observed stale directory is gone.
+  [ -d "$lockdir" ] && [ "$(cat "$lockdir/pid" 2>/dev/null || true)" = "$dead" ] && rc=1
+  [ "$(cat "$reclaim/pid" 2>/dev/null || true)" = "$$" ] && rm -rf "$reclaim" 2>/dev/null
+  return "$rc"
+}
+
+# pg_stale_reclaim_sweep <dir>...: remove ORPHANED reclaim locks (#152) — the sibling directories
+# pg_stale_dirlock_reap holds for the length of one `rm -rf`. A reclaim lock is never reclaimed on
+# demand, because a healer that moved a LIVE one aside would admit a second reclaimer and destroy
+# the exclusion the lock exists for. One left behind by a process killed inside that window would
+# otherwise wedge dead-owner recovery for its section or slot forever on a no-flock host: the stale
+# lock directory beside it could never be reclaimed again, so the section refuses every later run
+# and a semaphore slot silently drops out of capacity.
+# Removal is authorized by PROVEN absence, never by ambiguity, and both conditions are required:
+#   - the directory records a numeric owner and that process is gone. A merely slow or SUSPENDED
+#     reclaimer (a laptop asleep mid-reap) still answers kill -0 and is never touched: removing its
+#     lock would let a second reclaimer in while the first still has an already-decided `rm -rf` to
+#     run, which is this very double-reclaim one level up. A MISSING or torn record is BUSY for the
+#     same reason, not an orphan — a reclaimer one statement past its mkdir has not written its pid
+#     yet, and no sweep can tell that apart from a process that died in the same gap (the organizer
+#     lock reads torn ownership the same way). A recycled pid reads as live and simply keeps its
+#     lock: every ambiguity here fails closed, at the price of operator cleanup in the rare case.
+#   - the directory is older than the engine's 24h lock-sweep horizon, so a reclaim in flight is
+#     never judged on a pid that was simply read at an unlucky moment.
+pg_stale_reclaim_sweep() {
+  local dir d owner
+  for dir in "$@"; do
+    [ -d "$dir" ] || continue
+    for d in "$dir"/*.d.reclaim; do
+      [ -d "$d" ] || continue      # no match: the glob stays literal
+      [ -L "$d" ] && continue      # never follow a planted link into another lock's namespace
+      owner="$(cat "$d/pid" 2>/dev/null || true)"
+      case "$owner" in ''|*[!0-9]*) continue ;; esac
+      kill -0 "$owner" 2>/dev/null && continue
+      [ -n "$(find "$d" -maxdepth 0 -mmin +1440 2>/dev/null)" ] || continue
+      rm -rf "$d" 2>/dev/null || true
+    done
+  done
 }
 
 # Shared guard for reservation writes/removes AND the fresh-run count+slot-acquire decision.

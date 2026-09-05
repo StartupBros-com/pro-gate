@@ -3136,6 +3136,15 @@ find "$(dirname "$LOCKFILE")" -maxdepth 1 -name "$(basename "$LOCKFILE").pr-*" -
 find "${PRO_GATE_HARVEST_LOCK_DIR:-$PRO_GATE_HOME/harvest-locks}" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
 find "$(pg_active_dir)" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
 find "$(pg_manifest_dir)" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
+# #152: a reclaim lock left behind by a process killed mid-reclamation is never reclaimed on
+# demand (that is what would break the exclusion it provides), so an orphan would wedge dead-owner
+# recovery for its section or slot forever on a no-flock host. Same 24h horizon as the sweeps
+# above, but gated on the recorded owner being gone — see pg_stale_reclaim_sweep. Every namespace
+# pg_lock and pg_lock_n are called against: the per-PR sections and slot semaphore beside
+# $LOCKFILE, the per-marker harvest locks, and the review-decision effect locks.
+pg_stale_reclaim_sweep "$(dirname "$LOCKFILE")" \
+  "${PRO_GATE_HARVEST_LOCK_DIR:-$PRO_GATE_HOME/harvest-locks}" \
+  "${PRO_GATE_REVIEW_DECISION_LOCK_DIR:-$PRO_GATE_HOME/review-decision-locks}"
 # Terminal dispositions survive long enough to make cleanup idempotent across both existing
 # recovery clocks. Cleanup-pending proof is never swept merely because it aged.
 pg_attempt_disposition_sweep
