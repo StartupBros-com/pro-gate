@@ -1083,6 +1083,36 @@ pg_attempt_snapshot() { # host owner repo pr round-key [exclude-marker] -> canon
     '{artifact:{kind:$kind,path:$path},charged_spend_epoch:$epoch,cleanup_pending:$cleanup,fresh_eligible:$fresh,marker:$marker,out:$out,recoverable:$recoverable,source:$source,state:$state,target:{host:$host,owner:$owner,pr:$pr,repo:$repo,round_key:$key},terminal:$terminal}'
 }
 
+# pg_stale_dirlock_reap <lockdir> <observed-dead-pid>: remove a mkdir-spinlock directory whose
+# recorded owner is dead, serialized so two reclaimers can never act on one observation. Without
+# the serialization A and B both read the same dead pid; A removes the directory, re-creates it and
+# enters its critical section; B then removes A's LIVE directory on its cached pid and enters too
+# (gate #148 r1 P1: two reservation-guard holders at once let a fresh run plan its slots before an
+# exiting review published its reservation, and acquire capacity that review had just reserved).
+# The reclaim lock is a sibling directory; under it the owner is re-read and the directory removed
+# only while it is still that same dead owner, so a replacement (a fresh directory, pid written or
+# not yet) is never touched. Returns 0 when the observed stale directory is gone, removed here or
+# already replaced, so the caller retries mkdir at once; 1 when another reclaimer holds the reclaim
+# lock or the removal failed, so the caller waits its usual tick and counts it against its budget.
+pg_stale_dirlock_reap() {
+  local lockdir="$1" dead="$2" reclaim="${1}.reclaim" cur rc=0
+  # Never reclaim this serialization lock: a delayed healer could rename a replacement LIVE
+  # lock away, admitting a second reclaimer before it restores the first one's directory.
+  # An orphan here therefore fails closed within the caller's wait budget; operator cleanup
+  # requires all contenders to be stopped. Ordinary dead-owner guard recovery remains automatic.
+  mkdir "$reclaim" 2>/dev/null || return 1
+  echo "$$" > "$reclaim/pid" 2>/dev/null || true
+  cur="$(cat "$lockdir/pid" 2>/dev/null || true)"
+  if [ -d "$lockdir" ] && [ "$cur" = "$dead" ] && ! kill -0 "$cur" 2>/dev/null; then
+    rm -rf "$lockdir" 2>/dev/null
+  fi
+  # Still there under the same dead owner (removal failed): report it so the caller waits instead
+  # of spinning. A replacement, or nothing, means the observed stale directory is gone.
+  [ -d "$lockdir" ] && [ "$(cat "$lockdir/pid" 2>/dev/null || true)" = "$dead" ] && rc=1
+  [ "$(cat "$reclaim/pid" 2>/dev/null || true)" = "$$" ] && rm -rf "$reclaim" 2>/dev/null
+  return "$rc"
+}
+
 # Shared guard for reservation writes/removes AND the fresh-run count+slot-acquire decision.
 # This makes the handoff atomic: an exit-9 run writes its durable reservation while it still
 # owns the process slot; no waiter can observe "slot released, reservation not counted" (or
@@ -1105,12 +1135,15 @@ pg_reservation_guard_acquire() {
   # macOS / no flock: mkdir spinlock with the dead-pid self-heal pg_lock uses. Without it a guard
   # directory left by a killed process wedged every later reservation write for the full wait, and
   # a failed acquire left PG_RESERVATION_GUARD_DIR pointing at a directory this process did not
-  # own, so a later release could remove another process's guard.
+  # own, so a later release could remove another process's guard. Reclamation itself goes through
+  # pg_stale_dirlock_reap (gate #148 r1 P1): an unserialized `rm -rf` here let two waiters that read
+  # the same dead pid both end up inside the guard.
   PG_RESERVATION_GUARD_DIR="${lock}.d"
   local waited=0 opid
   while ! mkdir "$PG_RESERVATION_GUARD_DIR" 2>/dev/null; do
     opid=$(cat "$PG_RESERVATION_GUARD_DIR/pid" 2>/dev/null || true)
-    if [ -n "$opid" ] && ! kill -0 "$opid" 2>/dev/null; then rm -rf "$PG_RESERVATION_GUARD_DIR" 2>/dev/null; continue; fi
+    if [ -n "$opid" ] && ! kill -0 "$opid" 2>/dev/null \
+       && pg_stale_dirlock_reap "$PG_RESERVATION_GUARD_DIR" "$opid"; then continue; fi
     waited=$(( waited + 1 ))
     [ "$waited" -ge "$wait_s" ] && { PG_RESERVATION_GUARD_DIR=""; return 1; }
     sleep 1

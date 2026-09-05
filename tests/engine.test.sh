@@ -5462,6 +5462,85 @@ check 'contended reservation guard acquire fails without leaking a descriptor' \
 ); GUARD_STALE_RC=$?
 check 'no-flock reservation guard self-heals a directory left by a dead process and releases its own' "$GUARD_STALE_RC"
 
+# gate #148 r1 P1: two no-flock waiters that observe the same dead guard owner must never both hold
+# the guard. Unserialized reclamation let B's cached dead pid remove A's freshly re-created LIVE
+# directory and enter A's critical section. B is slowed only at its `rm` (a PATH shim that also
+# signals once B has read the dead pid), so A reclaims and enters first and B's removal lands while
+# A is inside; the section log must never show two enters without an exit between them.
+GUARD_RACE_HOME="$TDIR/home-guard-race"; mkdir -p "$GUARD_RACE_HOME/bin"
+GUARD_RACE_LOCK="$(PRO_GATE_HOME="$GUARD_RACE_HOME" pg_reservation_lock)"; mkdir -p "$(dirname "$GUARD_RACE_LOCK")"
+sleep 0 & GUARD_RACE_DEAD=$!; wait "$GUARD_RACE_DEAD"
+mkdir -p "$GUARD_RACE_LOCK.d"; echo "$GUARD_RACE_DEAD" > "$GUARD_RACE_LOCK.d/pid"
+GUARD_RACE_RM="$(command -v rm)"
+printf '#!/usr/bin/env bash\nif [ -n "${PG_TEST_RM_DELAY:-}" ]; then : > "${PG_TEST_RM_SENTINEL:?}"; sleep "$PG_TEST_RM_DELAY"; fi\nexec "%s" "$@"\n' "$GUARD_RACE_RM" > "$GUARD_RACE_HOME/bin/rm"
+chmod +x "$GUARD_RACE_HOME/bin/rm"
+GUARD_RACE_LOG="$GUARD_RACE_HOME/sections.log"; : > "$GUARD_RACE_LOG"
+GUARD_RACE_SENTINEL="$GUARD_RACE_HOME/b-read-dead-pid"
+guard_race_holder() { # name rm-delay
+  PATH="$GUARD_RACE_HOME/bin:$PATH" PG_TEST_RM_DELAY="$2" PG_TEST_RM_SENTINEL="$GUARD_RACE_SENTINEL" \
+  PRO_GATE_HOME="$GUARD_RACE_HOME" PRO_GATE_RESERVATION_GUARD_WAIT=20 \
+    bash -c '. "$1"; pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
+      pg_reservation_guard_acquire || { echo "fail $2" >> "$3"; exit 1; }
+      echo "enter $2" >> "$3"; sleep 3; echo "exit $2" >> "$3"; pg_reservation_guard_release' _ "$HERE/../lib/pro-gate-lib.sh" "$1" "$GUARD_RACE_LOG"
+}
+guard_race_holder B 1 & GUARD_RACE_B=$!
+for _ in $(seq 1 100); do [ -e "$GUARD_RACE_SENTINEL" ] && break; sleep 0.1; done
+guard_race_holder A "" & GUARD_RACE_A=$!
+wait "$GUARD_RACE_A"; GUARD_RACE_A_RC=$?; wait "$GUARD_RACE_B"; GUARD_RACE_B_RC=$?
+check 'gate #148 r1 P1: two no-flock reclaimers of one dead guard owner never both hold the guard' \
+  "$([ -e "$GUARD_RACE_SENTINEL" ] && [ "$GUARD_RACE_A_RC" -eq 0 ] && [ "$GUARD_RACE_B_RC" -eq 0 ] \
+     && [ "$(wc -l < "$GUARD_RACE_LOG" | tr -d ' ')" -eq 4 ] \
+     && awk '$1=="enter"{if(open)bad=1; open=1} $1=="exit"{open=0} END{exit bad}' "$GUARD_RACE_LOG"; echo $?)" \
+  "a_rc=$GUARD_RACE_A_RC b_rc=$GUARD_RACE_B_RC sentinel=$(test -e "$GUARD_RACE_SENTINEL"; echo $?) log=$(tr '\n' ';' < "$GUARD_RACE_LOG")"
+# Reclamation is never recursive: moving a replacement live reclaim lock aside, even briefly,
+# breaks exclusion. An orphaned or live reclaim lock therefore leaves both directories untouched
+# and fails within the acquire budget. Quiescent operator cleanup is required for an orphan.
+(
+  pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
+  sleep 0 & dead=$!; wait "$dead"
+  mkdir -p "$GUARD_RACE_LOCK.d" "$GUARD_RACE_LOCK.d.reclaim"
+  echo "$dead" > "$GUARD_RACE_LOCK.d/pid"; echo "$dead" > "$GUARD_RACE_LOCK.d.reclaim/pid"
+  PRO_GATE_HOME="$GUARD_RACE_HOME" PRO_GATE_RESERVATION_GUARD_WAIT=2 pg_reservation_guard_acquire; rc=$?
+  owner="$(cat "$GUARD_RACE_LOCK.d/pid" 2>/dev/null)"
+  reclaim_owner="$(cat "$GUARD_RACE_LOCK.d.reclaim/pid" 2>/dev/null)"
+  PRO_GATE_HOME="$GUARD_RACE_HOME" pg_reservation_guard_release
+  [ "$rc" -ne 0 ] && [ -z "${PG_RESERVATION_GUARD_DIR:-}" ] \
+    && [ "$owner" = "$dead" ] && [ "$reclaim_owner" = "$dead" ] \
+    && [ -d "$GUARD_RACE_LOCK.d" ] && [ -d "$GUARD_RACE_LOCK.d.reclaim" ]
+); GUARD_RECLAIM_DEAD_RC=$?
+check 'gate #148 r1 P1: an orphaned reclaim lock is never recursively reclaimed and the acquire fails closed' "$GUARD_RECLAIM_DEAD_RC"
+(
+  pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
+  sleep 0 & dead=$!; wait "$dead"
+  sleep 60 & live=$!
+  mkdir -p "$GUARD_RACE_LOCK.d" "$GUARD_RACE_LOCK.d.reclaim"
+  echo "$dead" > "$GUARD_RACE_LOCK.d/pid"; echo "$live" > "$GUARD_RACE_LOCK.d.reclaim/pid"
+  PRO_GATE_HOME="$GUARD_RACE_HOME" PRO_GATE_RESERVATION_GUARD_WAIT=2 pg_reservation_guard_acquire; rc=$?
+  kill "$live" 2>/dev/null
+  guard_pid="$(cat "$GUARD_RACE_LOCK.d/pid" 2>/dev/null)"; reclaim_pid="$(cat "$GUARD_RACE_LOCK.d.reclaim/pid" 2>/dev/null)"
+  rm -rf "$GUARD_RACE_LOCK.d" "$GUARD_RACE_LOCK.d.reclaim"
+  [ "$rc" -ne 0 ] && [ -z "${PG_RESERVATION_GUARD_DIR:-}" ] && [ "$guard_pid" = "$dead" ] && [ "$reclaim_pid" = "$live" ]
+); GUARD_RECLAIM_LIVE_RC=$?
+check 'gate #148 r1 P1: a reclaim lock held by a live reclaimer is never removed and the acquire fails closed' "$GUARD_RECLAIM_LIVE_RC"
+
+# gate #148 r1 P2 (engine side): a --harvest/--recover with no --timeout takes its budget from
+# PRO_GATE_HARVEST_TIMEOUT (default 45m). The daemon's recovery now relies on exactly this instead
+# of supplying the 60m fresh-review wait. The outer coreutils timeout turns a regression (the env
+# value ignored, a 45-minute wait) into a fast failure rather than a hung suite.
+HTO_HOME="$TDIR/home-harvest-timeout"; mkdir -p "$HTO_HOME/conversation-titles"
+HTO_MARKER="pg-run-148-1700000148-1"
+printf 'still thinking, run marker: %s\n' "$HTO_MARKER" > "$TDIR/tab-hto.txt"
+printf 'pro-gate review: PR #148 r1 [harvest-timeout]\n' > "$HTO_HOME/conversation-titles/$HTO_MARKER"
+printf '{"title":null,"archived":false,"events":[]}\n' > "$TDIR/organizer-hto.json"
+start_mock "$TDIR/tab-hto.txt" "$TDIR/organizer-hto.json"
+PRO_GATE_HOME="$HTO_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PRO_GATE_HARVEST_TIMEOUT=5s \
+  /usr/bin/timeout 120 bash "$ENGINE" --harvest "$HTO_MARKER" --out "$TDIR/o-hto.md" >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'gate #148 r1 P2: a harvest with no --timeout takes its budget from PRO_GATE_HARVEST_TIMEOUT' \
+  "$([ "$RC" -eq 9 ] && grep -Fq "marker ${HTO_MARKER}, up to 5s," "$TDIR/stderr"; echo $?)" \
+  "rc=$RC $(grep -F 'harvesting' "$TDIR/stderr" | head -1) $(tail -2 "$TDIR/stderr" | tr '\n' ' ')"
+
 # A terminal disposition is durable proof, not another mutable progress flag. It must outrank stale
 # active/run-meta state after a crash, complete exact cleanup/refund once, and let late review bytes
 # win without changing the disposition.
