@@ -1883,6 +1883,10 @@ pg_active_clear() {  # $1 = exit code
 pg_install_full_pr_input_binding() { # marker; only endpoint-fetched full PRs gain automatic applicability
   local marker="$1" binding
   [ "${PG_FULL_PR_PROVEN:-0}" = 1 ] || return 0  # caller-supplied/scoped/bare patches remain bounded
+  # Merge eligibility binds bytes the engine delivered. FILE_ARGS attaches the endpoint patch only
+  # for bundle|both, so a connector-only classic run never handed the model those bytes and earns
+  # no full-pr relation (#150); it stays bounded like a bare patch, exactly as the typed path does.
+  case "$INPUT" in bundle|both) ;; *) return 0 ;; esac
   [ -n "${RUN_SPEND_EPOCH:-}" ] && [ -n "${PG_META_HOST:-}${PG_META_OWNER:-}${PG_META_REPO:-}" ] || return 1
   binding="$(jq -cnS --arg cd "$(pg_review_decision_contract_digest)" --arg marker "$marker" \
     --arg host "$PG_META_HOST" --arg owner "$PG_META_OWNER" --arg repo "$PG_META_REPO" --argjson pr "$PR_NUM" \
@@ -2816,7 +2820,8 @@ if [ -n "$PR_NUM" ]; then
 fi
 [ -n "$REPO" ] || REPO="$(pwd)"
 cd "$REPO" || { echo "ERROR: repo dir not found: $REPO" >&2; pg_status failed "repo dir not found"; pg_finish 4; }
-[ -n "$PR_URL" ] || PR_URL="$(gh pr view "$PR_NUM" --json url -q .url 2>/dev/null || echo "")"
+# PRO_GATE_GH_BIN is the same test seam the recover path already honors; production leaves it unset.
+[ -n "$PR_URL" ] || PR_URL="$("${PRO_GATE_GH_BIN:-gh}" pr view "$PR_NUM" --json url -q .url 2>/dev/null || echo "")"
 
 # PR_KEY: repo-scoped identity for locks, reservations, and markers. PR numbers repeat across
 # repositories; keying on the bare number let an in-progress repo-A#77 redirect a repo-B#77 gate
@@ -2866,7 +2871,7 @@ fi
 
 if [ -z "$DIFF_FILE" ]; then
   DIFF_FILE="$WORK/pr.diff"
-  gh pr diff "$PR_NUM" --patch > "$DIFF_FILE" 2>"$WORK/diff.err" || {
+  "${PRO_GATE_GH_BIN:-gh}" pr diff "$PR_NUM" --patch > "$DIFF_FILE" 2>"$WORK/diff.err" || {
     echo "ERROR: gh pr diff $PR_NUM failed in $REPO: $(cat "$WORK/diff.err")" >&2; pg_status failed "gh pr diff failed"; pg_finish 5; }
 fi
 

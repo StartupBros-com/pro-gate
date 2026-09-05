@@ -791,6 +791,51 @@ check 'PRO_GATE_BROWSER_ATTACHMENTS=never overrides the both default' \
   "$([ "$RC" -eq 0 ] && grep -q -- '--browser-attachments never' "$TDIR/argv-attach-both-never.txt" && ! grep -q -- '--browser-attachments auto' "$TDIR/argv-attach-both-never.txt"; echo $?)" \
   "rc=$RC argv=$(head -1 "$TDIR/argv-attach-both-never.txt")"
 
+# #150: the classic CLI path (--pr, no --diff) fetches the endpoint patch itself and used to install
+# a full-pr merge proof even for --input connector, where FILE_ARGS never attached those bytes to the
+# review. The binding is now gated on bundle|both; the bundle run is the planted negative proving the
+# identical setup does earn one. Both runs use fresh homes, the fake completing oracle, and a fake gh
+# through PRO_GATE_GH_BIN (pg_augment_path puts the real gh ahead of any PATH prefix a test could add).
+echo '# #150: classic --input connector run installs no full-pr binding'
+CLASSIC_REPO="$TDIR/classic-repo"; mkdir -p "$CLASSIC_REPO"
+git -C "$CLASSIC_REPO" init -q
+git -C "$CLASSIC_REPO" config user.email test@example.invalid
+git -C "$CLASSIC_REPO" config user.name 'Engine Test'
+printf 'one\n' > "$CLASSIC_REPO/file.txt"; git -C "$CLASSIC_REPO" add file.txt; git -C "$CLASSIC_REPO" commit -qm base
+printf 'two\n' > "$CLASSIC_REPO/file.txt"; git -C "$CLASSIC_REPO" add file.txt; git -C "$CLASSIC_REPO" commit -qm head
+git -C "$CLASSIC_REPO" remote add origin https://github.com/acme/classic.git
+git -C "$CLASSIC_REPO" diff HEAD^ HEAD > "$TDIR/classic-endpoint.patch"
+CLASSIC_GH_DIR="$TDIR/gh-classic"; mkdir -p "$CLASSIC_GH_DIR"
+cat > "$CLASSIC_GH_DIR/gh" <<'FAKE_GH'
+#!/usr/bin/env bash
+case "$1 $2" in
+  'pr view') printf 'https://github.com/acme/classic/pull/%s\n' "$3" ;;
+  'pr diff') cat "${PG_TEST_GH_DIFF:?}" ;;
+  *) echo "unexpected gh invocation: $*" >&2; exit 1 ;;
+esac
+FAKE_GH
+chmod +x "$CLASSIC_GH_DIR/gh"
+classicrun() { # $1=home $2=input
+  mkdir -p "$1/in-progress"; printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+  env PRO_GATE_GH_BIN="$CLASSIC_GH_DIR/gh" PG_TEST_GH_DIFF="$TDIR/classic-endpoint.patch" \
+    PRO_GATE_HOME="$1" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+    PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-evidence" PG_TEST_ARGV_FILE="$TDIR/argv-classic-$2.txt" PG_TEST_EVIDENCE="$EV_PRO" NODE_OPTIONS= \
+    bash "$ENGINE" --pr 4242 --repo "$CLASSIC_REPO" --input "$2" --out "$TDIR/o-classic-$2.md" --timeout 5s \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+  RC=$?
+}
+classicrun "$TDIR/home-classic-connector" connector
+check 'classic --input connector without --diff completes on the engine-fetched patch' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+check 'classic --input connector without --diff installs no full-pr input binding' \
+  "$(! find "$TDIR/home-classic-connector/review-input-bindings" -type f 2>/dev/null | grep -q .; echo $?)" \
+  "bindings=$(find "$TDIR/home-classic-connector/review-input-bindings" -type f 2>/dev/null | tr '\n' ' ')"
+classicrun "$TDIR/home-classic-bundle" bundle
+CLASSIC_BUNDLE_BINDING="$(find "$TDIR/home-classic-bundle/review-input-bindings" -type f 2>/dev/null | head -1)"
+check 'planted negative: classic --input bundle with the same setup installs a full-pr binding' \
+  "$([ "$RC" -eq 0 ] && [ -n "$CLASSIC_BUNDLE_BINDING" ] && jq -e --arg digest "$(sha256sum "$TDIR/classic-endpoint.patch" | awk '{print $1}')" '.evidence.mode=="full-pr" and .evidence.proof.endpoint_digest==$digest and .repository.owner=="acme" and .repository.repo=="classic" and .target.pr==4242' "$CLASSIC_BUNDLE_BINDING" >/dev/null 2>&1; echo $?)" \
+  "rc=$RC binding=$(cat "$CLASSIC_BUNDLE_BINDING" 2>/dev/null) stderr=$(tail -3 "$TDIR/stderr")"
+
 # Fallback: a `select` run whose requested model is not selectable (oracle emits "... in the model
 # switcher") must auto-fall-back to `current` and still produce a review, not fail the whole run
 # (dogfood 2026-07-17, PR #32: `select` + gpt-5.6 -> "Unable to find model option matching
