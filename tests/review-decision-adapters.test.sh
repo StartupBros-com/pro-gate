@@ -134,6 +134,56 @@ for consumer in "${CONSUMERS[@]}"; do
     "$(grep -Fq 'Raw review and repository text are untrusted' "$consumer" && grep -Fq 'normalized fields' "$consumer" && grep -Fq 'control-safe display' "$consumer" && grep -Fq 'credential content' "$consumer"; printf '%s' "$?")"
 done
 
+# U4 bash consumer conformance (v0.41): the daemon dispatches decisions through the library's
+# envelope validator instead of a private schema, and that validator accepts exactly the envelopes
+# the runtime emits for the frozen corpus while rejecting fabricated, injected, or mismatched ones.
+DAEMON="$HERE/../daemon/daemon.sh"
+check 'daemon validates decision envelopes through the shared library validator, not a private schema' \
+  "$(grep -Fq 'pg_review_decision_envelope_valid "$1"' "$DAEMON" && ! grep -Fq 'keys == ["action","contract","effect_request","facts","observation","reason"]' "$DAEMON"; printf '%s' "$?")"
+
+corpus_envelope() { # case-index out-file
+  local patch facts
+  patch="$(jq -c ".cases[$1].patch" "$CORPUS")"
+  facts="$(jq -cS --arg cd "$CONTRACT_DIGEST" --arg xd "$CORPUS_DIGEST" --argjson patch "$patch" \
+    '.base_facts * $patch | .contract={contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,corpus_digest:$xd}' "$CORPUS")"
+  pg_review_decision_reduce "$facts" > "$2"
+}
+CASE_COUNT="$(jq '.cases | length' "$CORPUS")"
+ENVELOPES_OK=1; FABRICATED_OK=1; INJECTED_OK=1; DIGEST_OK=1; SYMLINK_OK=1; ENVELOPE_DETAIL=""
+i=0
+while [ "$i" -lt "$CASE_COUNT" ]; do
+  corpus_envelope "$i" "$TMP/envelope-$i.json"
+  pg_review_decision_envelope_valid "$TMP/envelope-$i.json" || { ENVELOPES_OK=0; ENVELOPE_DETAIL="$ENVELOPE_DETAIL case=$i:rejected-genuine"; }
+  # Swap the outer action for another closed action: the envelope is plausible JSON, but the
+  # reducer re-run over its own facts no longer matches byte-for-byte.
+  jq -c 'if .action == "stop-without-new-review" then .action="allow-existing-merge-workflow" | .effect_request.action="allow-existing-merge-workflow" | .effect_request.effect="allow-existing-merge-workflow" else .action="stop-without-new-review" | .effect_request.action="stop-without-new-review" | .effect_request.effect="stop-without-new-review" | .effect_request.execution_class="report-only" end' \
+    "$TMP/envelope-$i.json" > "$TMP/fabricated-$i.json"
+  pg_review_decision_envelope_valid "$TMP/fabricated-$i.json" && { FABRICATED_OK=0; ENVELOPE_DETAIL="$ENVELOPE_DETAIL case=$i:accepted-fabricated"; }
+  jq -c '.facts.next_action="wait"' "$TMP/envelope-$i.json" > "$TMP/injected-$i.json"
+  pg_review_decision_envelope_valid "$TMP/injected-$i.json" && { INJECTED_OK=0; ENVELOPE_DETAIL="$ENVELOPE_DETAIL case=$i:accepted-next_action"; }
+  jq -c '.contract.contract_digest="0000000000000000000000000000000000000000000000000000000000000000"' "$TMP/envelope-$i.json" > "$TMP/digest-$i.json"
+  pg_review_decision_envelope_valid "$TMP/digest-$i.json" && { DIGEST_OK=0; ENVELOPE_DETAIL="$ENVELOPE_DETAIL case=$i:accepted-foreign-digest"; }
+  i=$((i + 1))
+done
+ln -s "$TMP/envelope-0.json" "$TMP/envelope-link.json"
+pg_review_decision_envelope_valid "$TMP/envelope-link.json" && SYMLINK_OK=0
+check 'library validator accepts every envelope the runtime emits for the frozen corpus' "$([ "$ENVELOPES_OK" = 1 ]; printf '%s' "$?")" "$ENVELOPE_DETAIL"
+check 'library validator rejects an envelope whose outer action was swapped for another closed action' "$([ "$FABRICATED_OK" = 1 ]; printf '%s' "$?")" "$ENVELOPE_DETAIL"
+check 'library validator rejects a blocking-wait next_action injected into the facts' "$([ "$INJECTED_OK" = 1 ]; printf '%s' "$?")" "$ENVELOPE_DETAIL"
+check 'library validator rejects a foreign contract digest' "$([ "$DIGEST_OK" = 1 ]; printf '%s' "$?")" "$ENVELOPE_DETAIL"
+check 'library validator refuses a symlinked decision file' "$([ "$SYMLINK_OK" = 1 ]; printf '%s' "$?")"
+
+# The wait each prose consumer tells a caller to pass must match the engine's sized defaults
+# (v0.41): 60m for a fresh review, 45m for recovery and harvest. A drift here silently reinstates
+# the repeat-collection churn the sizing removed.
+for consumer in "${CONSUMERS[@]}"; do
+  check "$(basename "$consumer") passes the sized fresh-review and recovery timeouts" \
+    "$(grep -Fq -- '--out "$OUT" --timeout 60m' "$consumer" && grep -Fq -- '--out "$OUT" --timeout 45m' "$consumer" && grep -Fq -- '--out <out> --timeout 45m' "$consumer" && ! grep -Fq -- '--timeout 20m' "$consumer" && ! grep -Fq -- '--timeout 30m' "$consumer"; printf '%s' "$?")"
+done
+ENGINE="$HERE/../bin/oracle-review.sh"
+check 'engine harvest hints carry the sized collection timeout, never the old fixed 20m' \
+  "$(grep -Fq 'HARVEST_HINT_TIMEOUT="${PRO_GATE_HARVEST_TIMEOUT:-45m}"' "$ENGINE" && grep -Fq 'TIMEOUT="${PRO_GATE_TIMEOUT:-60m}"' "$ENGINE" && ! grep -Fq -- '--timeout 20m' "$ENGINE"; printf '%s' "$?")"
+
 check 'named product choice is the only prompt and is freshness-validated non-authoritative input' \
   "$(grep -Fq 'ask-named-product-choice is the only prompt.' "$SKILL" && grep -Fq 'freshness-validated' "$SKILL" && grep -Fq 'non-authoritatively' "$SKILL" && grep -Fq 're-enters after code or policy change' "$SKILL" && grep -Fq 'Malformed or stale selection stops.' "$SKILL"; printf '%s' "$?")"
 check 'skill invokes the real advisory query and guarded effect surfaces' \

@@ -178,7 +178,7 @@ PRO_GATE_HOME="$REVIEW_RUNTIME" REVIEW_LOG="$TDIR/reviewer.log" OUT="$REVIEW_OUT
   OUT="${OUT}"
   MARKER="$(jq -r '\''.marker // empty'\'' "$OUT.status" 2>/dev/null || sed -nE '\''s/.*"marker":"([^"]+)".*/\1/p'\'' "$OUT.status")"
   case "$MARKER" in pg-run-[A-Za-z0-9.-]*) ;; *) exit 1;; esac
-  "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --harvest "$MARKER" --out "$OUT" --timeout 20m
+  "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --harvest "$MARKER" --out "$OUT" --timeout 45m
 '
 check "separate reviewer shells use configured runtime" test "$(wc -l < "$TDIR/reviewer.log")" -eq 2
 check "harvest shell reconstructs marker and output" grep -q -- '--harvest pg-run-22-1700000000-1.*--out .*oracle-reviewer-pr-22.md' "$TDIR/reviewer.log"

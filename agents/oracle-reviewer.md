@@ -110,14 +110,14 @@ EFFECT_ARGS=(--review-decision-effect "$DECISION" --pr "$PR" --repo "$REPO" "${I
 A granted run executes:
 
 ```bash
-"$PG" "${EFFECT_ARGS[@]}" --out "$OUT" --timeout 30m
+"$PG" "${EFFECT_ARGS[@]}" --out "$OUT" --timeout 60m
 ```
 
 Collection and recovery first execute `"$PG" "${EFFECT_ARGS[@]}"` into a fresh decision, verify
 that action and `effect_request.applicable_ref` still match, then invoke only:
 
 ```bash
-"$PG" --recover "$REF" --repo "$REPO" --out "$OUT" --timeout 30m
+"$PG" --recover "$REF" --repo "$REPO" --out "$OUT" --timeout 45m
 ```
 
 A stale effect returns the freshly reduced replacement action; dispatch that replacement instead.
@@ -144,7 +144,7 @@ available through:
 
 ```bash
 "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --status <pr-number|pr-url|marker> --json
-"${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --harvest <run-marker> --out <out> --timeout 20m
+"${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --harvest <run-marker> --out <out> --timeout 45m
 ```
 
 `ask-named-product-choice is the only prompt.` Present only the normalized outcomes. Return the

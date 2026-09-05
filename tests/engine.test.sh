@@ -5437,6 +5437,31 @@ check 'disposition cleanup releases the reservation guard when the binding unlin
           || { [ "$SUPER_LEAK_RC" -ne 0 ] && [ "$SUPER_LEAK_BINDING_PRESENT" = yes ]; }; }; echo $?)" \
   "disposition_valid=$([ -n "$SUPER_LEAK_DISP" ] && echo yes || echo no) cleanup_rc=$SUPER_LEAK_RC binding_present=$SUPER_LEAK_BINDING_PRESENT reacquire_rc=$SUPER_LEAK_REACQUIRE"
 
+# v0.41: a CONTENDED guard acquire must fail without leaking its descriptor (the caller never
+# calls release on failure), and the no-flock fallback must self-heal a guard directory left by
+# a dead process instead of waiting out the full window on every later reservation write.
+GUARD_HOME="$TDIR/home-guard-contended"; mkdir -p "$GUARD_HOME"
+GUARD_LOCK="$(PRO_GATE_HOME="$GUARD_HOME" pg_reservation_lock)"; mkdir -p "$(dirname "$GUARD_LOCK")"
+exec {GUARD_HOLD_FD}>>"$GUARD_LOCK"; flock -n "$GUARD_HOLD_FD"
+GUARD_FDS_BEFORE="$(ls /proc/$$/fd 2>/dev/null | wc -l | tr -d ' ')"
+PRO_GATE_HOME="$GUARD_HOME" PRO_GATE_RESERVATION_GUARD_WAIT=1 pg_reservation_guard_acquire; GUARD_CONTENDED_RC=$?
+GUARD_FDS_AFTER="$(ls /proc/$$/fd 2>/dev/null | wc -l | tr -d ' ')"
+eval "exec ${GUARD_HOLD_FD}>&-"
+check 'contended reservation guard acquire fails without leaking a descriptor' \
+  "$([ "$GUARD_CONTENDED_RC" -ne 0 ] && [ -z "${PG_RESERVATION_GUARD_FD:-}" ] \
+     && { [ ! -d /proc/$$/fd ] || [ "$GUARD_FDS_BEFORE" = "$GUARD_FDS_AFTER" ]; }; echo $?)" \
+  "rc=$GUARD_CONTENDED_RC fd_var=${PG_RESERVATION_GUARD_FD:-} fds_before=$GUARD_FDS_BEFORE fds_after=$GUARD_FDS_AFTER"
+(
+  pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
+  sleep 0 & GUARD_DEAD=$!; wait "$GUARD_DEAD"
+  mkdir -p "$GUARD_LOCK.d"; echo "$GUARD_DEAD" > "$GUARD_LOCK.d/pid"
+  PRO_GATE_HOME="$GUARD_HOME" PRO_GATE_RESERVATION_GUARD_WAIT=3 pg_reservation_guard_acquire; rc=$?
+  owner="$(cat "$GUARD_LOCK.d/pid" 2>/dev/null)"
+  PRO_GATE_HOME="$GUARD_HOME" pg_reservation_guard_release
+  [ "$rc" -eq 0 ] && [ "$owner" = "$$" ] && [ ! -d "$GUARD_LOCK.d" ]
+); GUARD_STALE_RC=$?
+check 'no-flock reservation guard self-heals a directory left by a dead process and releases its own' "$GUARD_STALE_RC"
+
 # A terminal disposition is durable proof, not another mutable progress flag. It must outrank stale
 # active/run-meta state after a crash, complete exact cleanup/refund once, and let late review bytes
 # win without changing the disposition.

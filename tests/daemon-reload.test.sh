@@ -80,7 +80,7 @@ printf '#!/usr/bin/env bash\n[ "${MOCK_CLAUDE_RC:-0}" = 0 ] || exit "$MOCK_CLAUD
 PATH="$TYPED_BIN:$PATH"; CLAUDE_MODEL=test FALLBACK_MODEL=test MAX_BUDGET=1
 RUN_DECISION="$TYPED_HOME/run-decision.json"; typed_decision 2 "$RUN_DECISION"
 RUN_PROMPT="$TYPED_HOME/run.prompt"
-printf -v EXPECTED_EFFECT '%q ' "$TYPED_ENGINE" --review-decision --review-decision-effect "$RUN_DECISION" --pr 1983 --repo "$TYPED_HOME" --out "$TYPED_LOG.review" --timeout "${PRO_REVIEW_ENGINE_TIMEOUT:-30m}"
+printf -v EXPECTED_EFFECT '%q ' "$TYPED_ENGINE" --review-decision --review-decision-effect "$RUN_DECISION" --pr 1983 --repo "$TYPED_HOME" --out "$TYPED_LOG.review" --timeout "${PRO_REVIEW_ENGINE_TIMEOUT:-60m}"
 MOCK_PROMPT="$RUN_PROMPT" DD_ENGINE="$TYPED_ENGINE" DD_NWO=acme/widgets DD_NUM=1983 DD_SHA=1111111111111111111111111111111111111111 DD_WORKTREE="$TYPED_HOME" DD_LOG="$TYPED_LOG" daemon_run_review_worker "$RUN_DECISION"; worker_rc=$?
 check 'empty daemon input omits --input from the guarded effect worker argv' "$(grep -Fqx 'First action: execute this exact argv-quoted guarded runtime effect; it rechecks the saved review-decision/v1 before any charge or submission:' "$RUN_PROMPT" && grep -Fq "$EXPECTED_EFFECT" "$RUN_PROMPT" && ! grep -Fq -- '--input ' "$RUN_PROMPT"; echo $?)" "rc=$worker_rc"
 check 'run worker prompt restores fix/test/commit/push/comment lifecycle and no-merge guard' "$(grep -Fq '/pro-gate skill' "$RUN_PROMPT" && grep -Fq 'sanity-check every P0/P1' "$RUN_PROMPT" && grep -Fq 'tests and lint' "$RUN_PROMPT" && grep -Fq 'commit the fixes' "$RUN_PROMPT" && grep -Fq 'push this branch to origin' "$RUN_PROMPT" && grep -Fq 'exactly one audit PR comment' "$RUN_PROMPT" && grep -Fq 'Never merge' "$RUN_PROMPT"; echo $?)"
@@ -103,7 +103,7 @@ check 'empty daemon input omits --input from replacement query argv' "$([ "$defa
 # An explicit daemon value stays byte-identical across every subsequent command.
 DD_INPUT=connector; DD_INPUT_ARGS=(--input "$DD_INPUT")
 EXPLICIT_RUN_PROMPT="$TYPED_HOME/run-explicit.prompt"
-printf -v EXPLICIT_EFFECT '%q ' "$TYPED_ENGINE" --review-decision --review-decision-effect "$RUN_DECISION" --pr 1983 --repo "$TYPED_HOME" --input connector --out "$TYPED_LOG.review" --timeout "${PRO_REVIEW_ENGINE_TIMEOUT:-30m}"
+printf -v EXPLICIT_EFFECT '%q ' "$TYPED_ENGINE" --review-decision --review-decision-effect "$RUN_DECISION" --pr 1983 --repo "$TYPED_HOME" --input connector --out "$TYPED_LOG.review" --timeout "${PRO_REVIEW_ENGINE_TIMEOUT:-60m}"
 MOCK_PROMPT="$EXPLICIT_RUN_PROMPT" DD_ENGINE="$TYPED_ENGINE" DD_NWO=acme/widgets DD_NUM=1983 DD_SHA=1111111111111111111111111111111111111111 DD_WORKTREE="$TYPED_HOME" DD_LOG="$TYPED_LOG" daemon_run_review_worker "$RUN_DECISION"; explicit_worker_rc=$?
 check 'explicit connector input is preserved byte-identically in worker argv' "$([ "$explicit_worker_rc" -eq 0 ] && grep -Fq "$EXPLICIT_EFFECT" "$EXPLICIT_RUN_PROMPT"; echo $?)" "rc=$explicit_worker_rc"
 

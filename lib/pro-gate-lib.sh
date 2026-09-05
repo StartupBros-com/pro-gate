@@ -1088,17 +1088,35 @@ pg_attempt_snapshot() { # host owner repo pr round-key [exclude-marker] -> canon
 # owns the process slot; no waiter can observe "slot released, reservation not counted" (or
 # compute capacity before the write and acquire the just-released slot on stale information).
 pg_reservation_guard_acquire() {
-  local lock; lock="$(pg_reservation_lock)"
+  local lock wait_s; lock="$(pg_reservation_lock)"
+  wait_s="${PRO_GATE_RESERVATION_GUARD_WAIT:-10}"; case "$wait_s" in ''|*[!0-9]*) wait_s=10;; esac
   if pg_have flock; then
-    { exec {PG_RESERVATION_GUARD_FD}>>"$lock"; } 2>/dev/null \
-      && flock -w 10 "$PG_RESERVATION_GUARD_FD" 2>/dev/null
-    return $?
+    { exec {PG_RESERVATION_GUARD_FD}>>"$lock"; } 2>/dev/null || { PG_RESERVATION_GUARD_FD=""; return 1; }
+    if ! flock -w "$wait_s" "$PG_RESERVATION_GUARD_FD" 2>/dev/null; then
+      # A timed-out acquire returns 1 to a caller that never calls release, so the descriptor
+      # must be closed HERE or every contended acquire leaks one fd for the life of the process
+      # (v0.41; pg_lock_n already closes its losing descriptors the same way).
+      eval "exec ${PG_RESERVATION_GUARD_FD}>&-" 2>/dev/null
+      PG_RESERVATION_GUARD_FD=""
+      return 1
+    fi
+    return 0
   fi
+  # macOS / no flock: mkdir spinlock with the dead-pid self-heal pg_lock uses. Without it a guard
+  # directory left by a killed process wedged every later reservation write for the full wait, and
+  # a failed acquire left PG_RESERVATION_GUARD_DIR pointing at a directory this process did not
+  # own, so a later release could remove another process's guard.
   PG_RESERVATION_GUARD_DIR="${lock}.d"
-  local waited=0
+  local waited=0 opid
   while ! mkdir "$PG_RESERVATION_GUARD_DIR" 2>/dev/null; do
-    waited=$(( waited + 1 )); [ "$waited" -ge 10 ] && return 1; sleep 1
+    opid=$(cat "$PG_RESERVATION_GUARD_DIR/pid" 2>/dev/null || true)
+    if [ -n "$opid" ] && ! kill -0 "$opid" 2>/dev/null; then rm -rf "$PG_RESERVATION_GUARD_DIR" 2>/dev/null; continue; fi
+    waited=$(( waited + 1 ))
+    [ "$waited" -ge "$wait_s" ] && { PG_RESERVATION_GUARD_DIR=""; return 1; }
+    sleep 1
   done
+  echo "$$" > "$PG_RESERVATION_GUARD_DIR/pid" 2>/dev/null || true
+  return 0
 }
 pg_reservation_guard_release() {
   if [ -n "${PG_RESERVATION_GUARD_FD:-}" ]; then
@@ -1106,7 +1124,7 @@ pg_reservation_guard_release() {
     PG_RESERVATION_GUARD_FD=""
   fi
   if [ -n "${PG_RESERVATION_GUARD_DIR:-}" ]; then
-    rmdir "$PG_RESERVATION_GUARD_DIR" 2>/dev/null; PG_RESERVATION_GUARD_DIR=""
+    rm -rf "$PG_RESERVATION_GUARD_DIR" 2>/dev/null; PG_RESERVATION_GUARD_DIR=""
   fi
 }
 
@@ -2611,6 +2629,38 @@ pg_review_decision_emit() { # action reason facts snapshot-digest applicable-ref
 
 pg_review_decision_reject() { # reason snapshot; never reflect rejected untrusted data
   pg_review_decision_emit stop-without-new-review "$1" '{}' "$2" ''
+}
+
+# Shared envelope validator for bash consumers (v0.41). The daemon used to carry this schema
+# privately, which made it the one renderer of the closed action table no conformance test
+# covered. Every bash consumer now validates a saved decision here: exact key sets, the installed
+# runtime's contract identity, the closed action/effect/execution-class table, no status or
+# next_action field anywhere, no control characters, and finally a byte-identical re-run of the
+# pure reducer over the envelope's own facts, so a fabricated outer action cannot ride on
+# otherwise plausible JSON. Files must be regular, non-symlink, and at most 64 KiB.
+pg_review_decision_envelope_valid() { # decision-file
+  local decision="$1" canonical facts expected
+  [ -f "$decision" ] && [ ! -L "$decision" ] && command -v jq >/dev/null 2>&1 || return 1
+  [ "$(wc -c < "$decision" 2>/dev/null | tr -d ' ')" -le 65536 ] || return 1
+  jq -e --arg cd "$(pg_review_decision_contract_digest)" --arg xd "$(pg_review_decision_corpus_digest)" '
+    type == "object" and keys == ["action","contract","effect_request","facts","observation","reason"] and
+    .contract == {contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,corpus_digest:$xd} and
+    (.action | IN("collect-existing-result","recover-existing-review","fix-review-findings","prepare-matching-review-evidence","run-granted-review","stop-without-new-review","allow-existing-merge-workflow","ask-named-product-choice")) and
+    (. as $envelope | .effect_request | type == "object" and keys == ["action","applicable_ref","contract_digest","effect","execution_class","snapshot_digest","target"] and
+      .effect == .action and .contract_digest == $cd and
+      (.snapshot_digest | type == "string" and test("^[0-9a-f]{64}$")) and .target == $envelope.facts.target and
+      ((.action == "collect-existing-result" or .action == "recover-existing-review" or .action == "run-granted-review") and .execution_class == "runtime-guarded-effect" or
+       ((.action == "fix-review-findings" or .action == "prepare-matching-review-evidence") and .execution_class == "agent-task") or
+       ((.action == "stop-without-new-review" or .action == "allow-existing-merge-workflow") and .execution_class == "report-only") or
+       (.action == "ask-named-product-choice" and .execution_class == "named-product-choice"))) and
+    (.effect_request.action == .action) and
+    ([.. | objects | keys[] | select(. == "status" or . == "next_action")] | length == 0) and
+    ([.. | strings | select(test("[[:cntrl:]]"))] | length == 0)
+  ' "$decision" >/dev/null 2>&1 || return 1
+  facts="$(jq -cS .facts "$decision" 2>/dev/null)" || return 1
+  expected="$(pg_review_decision_reduce "$facts")" || return 1
+  canonical="$(pg_review_json_canonical "$(<"$decision")")" || return 1
+  [ "$canonical" = "$expected" ]
 }
 
 pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read stdin

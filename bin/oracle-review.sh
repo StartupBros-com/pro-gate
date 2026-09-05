@@ -39,6 +39,8 @@
 #   oracle-review.sh --harvest <run-marker> --out <file> [--timeout <dur>]
 #       Collect a review whose run ended in-progress (exit 9): the Pro slot was spent but the
 #       model was still generating when the salvage budget ran out. No new slot is spent.
+#       --timeout defaults to 45m for --harvest/--recover and 60m for a fresh review
+#       (PRO_GATE_HARVEST_TIMEOUT / PRO_GATE_TIMEOUT), sized to the ledger's p90 review time.
 #   oracle-review.sh --status [<pr-number|pr-url|pg-run-marker>] [--json]
 #       Expert/read-only diagnostics (v0.27): join reservations, round budget, remembered
 #       conversation URLs, and the ledger, and print each matching run's state plus the exact
@@ -124,7 +126,7 @@ pg_out_guard_acquire() {
   return 0
 }
 
-PR=""; REPO=""; DIFF_FILE=""; DIFF_IS_CALLER_SUPPLIED=0; INPUT=""; INPUT_SUPPLIED=0; OUT=""; TIMEOUT="30m"; EXTRA_GLOB=""; HARVEST_MARKER=""; HARVEST_REQUESTED=0; CONFIRM_FILE=""; BRIEF_FILE=""
+PR=""; REPO=""; DIFF_FILE=""; DIFF_IS_CALLER_SUPPLIED=0; INPUT=""; INPUT_SUPPLIED=0; OUT=""; TIMEOUT=""; EXTRA_GLOB=""; HARVEST_MARKER=""; HARVEST_REQUESTED=0; CONFIRM_FILE=""; BRIEF_FILE=""
 STATUS_REQUESTED=0; STATUS_QUERY=""; AS_JSON=0; RECOVER_REQUESTED=0; RECOVER_QUERY=""
 REVIEW_DECISION_REQUESTED=0; REVIEW_DECISION_EFFECT_FILE=""; REVIEW_CHOICE_SELECTION_FILE=""
 while [ $# -gt 0 ]; do
@@ -163,6 +165,22 @@ while [ $# -gt 0 ]; do
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
+
+# Wait sizing (v0.41): one --timeout governs both the fresh oracle wait and every harvest pass.
+# The ledger (2026-08-17..09-05, clean outcomes, seconds after acquiring a slot) put the median
+# review at 22-48 min by diff size and the p90 at 40-62 min. The old 30m fresh default therefore
+# cut off the median large review, and the 20m the harvest hints told operators to copy guaranteed
+# repeat collection passes (6.56 per collected review). Defaults now cover the p90: 60m for a fresh
+# review, 45m per collection pass. PRO_GATE_TIMEOUT / PRO_GATE_HARVEST_TIMEOUT override; an
+# explicit --timeout always wins. Both stay far inside the 6h reservation TTL.
+HARVEST_HINT_TIMEOUT="${PRO_GATE_HARVEST_TIMEOUT:-45m}"
+if [ -z "$TIMEOUT" ]; then
+  if [ "$HARVEST_REQUESTED" = 1 ] || [ "$RECOVER_REQUESTED" = 1 ]; then
+    TIMEOUT="$HARVEST_HINT_TIMEOUT"
+  else
+    TIMEOUT="${PRO_GATE_TIMEOUT:-60m}"
+  fi
+fi
 
 # Input delivery is an engine-owned policy, resolved before any state, output, lock, browser,
 # repository, or Oracle work. Lifecycle-only inspection/recovery remains available even when a
@@ -1242,7 +1260,7 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
       fi
       r_url=""; [ -f "$ST_URLS_DIR/$m" ] && r_url="$(head -c 300 "$ST_URLS_DIR/$m" 2>/dev/null | tr -d '\n')"
       [ -n "$r_out" ] || r_out="${TMPDIR:-/tmp}/pro-gate-${r_pr:-review}.md"
-      r_cmd="$ST_ENGINE --harvest '$m' --out '$r_out' --timeout 20m"
+      r_cmd="$ST_ENGINE --harvest '$m' --out '$r_out' --timeout ${HARVEST_HINT_TIMEOUT}"
       # #67/#68: distinguish three states, not two. A set-aside <out>.unbound.* capture alone
       # is AMBIGUOUS — strict nonce mode deliberately produces one when an older completed
       # answer is visible while OUR answer may still be generating, and that case IS
@@ -1389,7 +1407,7 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
           ST_RECOVERABLE=1
           [ -n "$ST_RECOVER_REASON" ] || ST_RECOVER_REASON="dead wrapper, browser may still be generating ($a_marker)"
         fi
-        [ -n "$ST_ACTIVE_HINT" ] || ST_ACTIVE_HINT="the last run's wrapper DIED but the browser may still be generating — recover by marker, never a fresh run: $ST_ENGINE --harvest '$a_marker' --out '${a_out:-${TMPDIR:-/tmp}/pro-gate-recovered.md}' --timeout 20m"
+        [ -n "$ST_ACTIVE_HINT" ] || ST_ACTIVE_HINT="the last run's wrapper DIED but the browser may still be generating — recover by marker, never a fresh run: $ST_ENGINE --harvest '$a_marker' --out '${a_out:-${TMPDIR:-/tmp}/pro-gate-recovered.md}' --timeout ${HARVEST_HINT_TIMEOUT}"
       fi
     fi
     # 'all' queries skip idle debris — but never a key with anything live on it.
@@ -1521,7 +1539,7 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
     case "$ST_LAST_OUTCOME" in
       in-progress)
         if [ -n "$ST_LAST_MARKER" ]; then
-          ST_HINT="last run is in-progress — harvest it for FREE: $ST_ENGINE --harvest '$ST_LAST_MARKER' --out '$ST_LAST_OUT' --timeout 20m"
+          ST_HINT="last run is in-progress — harvest it for FREE: $ST_ENGINE --harvest '$ST_LAST_MARKER' --out '$ST_LAST_OUT' --timeout ${HARVEST_HINT_TIMEOUT}"
         else
           ST_HINT="last run is in-progress but predates v0.27 (no marker in ledger): read the run's <out>.status for .marker, or re-run the identical --pr command and let the engine redirect"
         fi;;
@@ -1532,7 +1550,7 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
         # (Chrome died before collection). Offer the FREE harvest before any fresh spend.
         if [ -n "$ST_LAST_MARKER" ] && [ -f "$ST_URLS_DIR/$ST_LAST_MARKER" ]; then
           ST_FAILED_URL="$(head -c 300 "$ST_URLS_DIR/$ST_LAST_MARKER" 2>/dev/null | tr -d '\n')"
-          ST_HINT="last run FAILED but its conversation URL is remembered (${ST_FAILED_URL:-unknown}) — the review may exist server-side; try a FREE harvest before spending: $ST_ENGINE --harvest '$ST_LAST_MARKER' --out '$ST_LAST_OUT' --timeout 20m"
+          ST_HINT="last run FAILED but its conversation URL is remembered (${ST_FAILED_URL:-unknown}) — the review may exist server-side; try a FREE harvest before spending: $ST_ENGINE --harvest '$ST_LAST_MARKER' --out '$ST_LAST_OUT' --timeout ${HARVEST_HINT_TIMEOUT}"
         else
           ST_HINT="last run ended 'failed' with no reservation held — a fresh run will SPEND a slot (round budget permitting)"
         fi;;
@@ -3210,7 +3228,7 @@ if [ "$MODE" = remote-chrome ]; then
     RUN_MARKER="$RESERVED_MARKER"
     echo "[oracle-review] ${ROUND_KEY} already has an in-progress Pro conversation (${RESERVED_MARKER}): harvesting it instead of submitting again." >&2
     pg_status in-progress "existing reservation ${RESERVED_MARKER}; harvest required"
-    echo "  ${PRO_GATE_HOME:-\$HOME/.pro-review-daemon}/oracle-review.sh --harvest '${RESERVED_MARKER}' --out '${OUT}' --timeout 20m" >&2
+    echo "  ${PRO_GATE_HOME:-\$HOME/.pro-review-daemon}/oracle-review.sh --harvest '${RESERVED_MARKER}' --out '${OUT}' --timeout ${HARVEST_HINT_TIMEOUT}" >&2
     pg_finish 9
   fi
 fi
@@ -4126,7 +4144,7 @@ elif [ "${SALVAGE_RAN:-0}" = 1 ] && [ "${SALVAGE_PRESERVE:-0}" = 1 ]; then
     *) echo "ERROR: the salvage read this run's conversation but the capture failed validation (truncated or malformed). Conversation KEPT and account capacity RESERVED — re-collect rather than re-spend." >&2 ;;
   esac
   echo "  Collect it later WITHOUT spending another Pro slot:" >&2
-  echo "    ${PRO_GATE_HOME:-\$HOME/.pro-review-daemon}/oracle-review.sh --harvest '${RUN_MARKER}' --out '${OUT}' --timeout 20m" >&2
+  echo "    ${PRO_GATE_HOME:-\$HOME/.pro-review-daemon}/oracle-review.sh --harvest '${RUN_MARKER}' --out '${OUT}' --timeout ${HARVEST_HINT_TIMEOUT}" >&2
   pg_status in-progress "slot spent, model still generating; harvest with --harvest"
   pg_finish 9
 else
@@ -4164,7 +4182,7 @@ else
     if [ -n "$_memo" ]; then
       echo "  The conversation URL was captured before the crash: $_memo" >&2
       echo "  The review may be complete server-side. Recover it WITHOUT spending another Pro slot:" >&2
-      echo "    ${PRO_GATE_HOME:-\$HOME/.pro-review-daemon}/oracle-review.sh --harvest '${RUN_MARKER}' --out '${OUT}' --timeout 20m" >&2
+      echo "    ${PRO_GATE_HOME:-\$HOME/.pro-review-daemon}/oracle-review.sh --harvest '${RUN_MARKER}' --out '${OUT}' --timeout ${HARVEST_HINT_TIMEOUT}" >&2
       echo "  Or inspect all state for this change first: ${PRO_GATE_HOME:-\$HOME/.pro-review-daemon}/oracle-review.sh --status '${PR_URL:-${PR_NUM:-}}'" >&2
       FAIL_DETAIL="review browser restarted mid-run (chrome up ${_svc_up}s); conversation URL remembered — recover FREE with --harvest '${RUN_MARKER}'"
     else
