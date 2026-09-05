@@ -1145,10 +1145,41 @@ pg_stale_dirlock_reap() {
 #     lock: every ambiguity here fails closed, at the price of operator cleanup in the rare case.
 #   - the directory is older than the engine's 24h lock-sweep horizon, so a reclaim in flight is
 #     never judged on a pid that was simply read at an unlucky moment.
+# Both checks are made, and the removal performed, while holding a per-namespace sweep mutex
+# (gate #155 r1 P1). Every engine runs this housekeeping before it acquires its own locks, so
+# sweepers ARE concurrent, and an unserialized sweep authorizes a removal against the directory it
+# validated rather than the one it deletes: two sweepers validate one aged orphan, the first
+# removes it, a reclaimer creates a replacement at that same path, and the second's delayed
+# `rm -rf` then destroys that LIVE reclaim lock — readmitting the two simultaneous reclaimers, and
+# so the two simultaneous section/slot holders, this whole change exists to prevent. Under the
+# mutex no other sweeper can remove a reclaim lock in this namespace, and a reclaimer can only
+# create one where a sweeper has removed one, so a candidate cannot be replaced between its checks
+# and its removal.
 pg_stale_reclaim_sweep() {
-  local dir d owner
+  local dir d owner sweep present
   for dir in "$@"; do
     [ -d "$dir" ] || continue
+    # Take no lock at all when the namespace holds no reclaim lock of any kind. This is a
+    # PRE-FILTER, never a decision — every removal is still decided under the mutex below — and it
+    # is deliberately weaker than the real test, so a lock that merely exists still costs a pass.
+    # It matters because the mutex below is never reclaimed: a process killed while holding it
+    # strands it, and without this the housekeeping block would take and drop that lock on EVERY
+    # run of EVERY engine, most of them on flock hosts where no reclaim lock can exist at all.
+    present=0
+    for d in "$dir"/*.d.reclaim; do [ -d "$d" ] && { present=1; break; }; done
+    [ "$present" -eq 1 ] || continue
+    sweep="$dir/.pg-reclaim-sweep.d"
+    # Not reclaimable on a dead owner, for the same reason its subjects are not: a healer moving a
+    # LIVE sweep mutex aside would readmit the second sweeper and hand back the delayed-removal
+    # race, and no rename- or quarantine-based takeover fixes that — each one leaves a window in
+    # which the true holder's directory is absent and a third sweeper can take it. A competing
+    # sweeper therefore just skips the namespace and the next housekeeping pass retries, so
+    # contention costs nothing. An orphan left here by a process killed mid-sweep suspends only
+    # the cleanup of orphaned reclaim locks — itself the fail-closed side, and already conditional
+    # on a second process having been killed inside pg_stale_dirlock_reap's own window — and an
+    # operator clears it by removing the directory with no run in flight.
+    mkdir "$sweep" 2>/dev/null || continue
+    echo "$$" > "$sweep/pid" 2>/dev/null || true
     for d in "$dir"/*.d.reclaim; do
       [ -d "$d" ] || continue      # no match: the glob stays literal
       [ -L "$d" ] && continue      # never follow a planted link into another lock's namespace
@@ -1158,7 +1189,12 @@ pg_stale_reclaim_sweep() {
       [ -n "$(find "$d" -maxdepth 0 -mmin +1440 2>/dev/null)" ] || continue
       rm -rf "$d" 2>/dev/null || true
     done
+    # Release only what this process still owns, exactly as pg_stale_dirlock_reap does.
+    if [ "$(cat "$sweep/pid" 2>/dev/null || true)" = "$$" ]; then
+      rm -rf "$sweep" 2>/dev/null || true
+    fi
   done
+  return 0   # housekeeping is best-effort: a skipped namespace never fails the caller
 }
 
 # Shared guard for reservation writes/removes AND the fresh-run count+slot-acquire decision.

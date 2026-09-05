@@ -6098,4 +6098,91 @@ check '#152: the engine sweeps every reclaim-lock namespace the no-flock locks u
      && printf '%s\n' "$DL_WIRE" | grep -q 'PRO_GATE_HARVEST_LOCK_DIR' \
      && printf '%s\n' "$DL_WIRE" | grep -q 'PRO_GATE_REVIEW_DECISION_LOCK_DIR'; echo $?)" \
   "call=$(printf '%s' "$DL_WIRE" | tr '\n' ' ')"
+
+# Gate #155 r1 P1: that sweep is itself concurrent — every engine runs this housekeeping BEFORE it
+# acquires its own locks — so two sweepers validate ONE aged orphan at the same time. Unserialized,
+# the first removes it, a reclaimer creates a replacement at that path, and the second's delayed
+# `rm -rf` (authorized by the directory it validated, not the one it deletes) destroys that LIVE
+# reclaim lock, readmitting the two simultaneous reclaimers — and so the two simultaneous section
+# and slot holders — this whole change exists to close. The check pauses one sweeper INSIDE its
+# removal with a PATH `rm` shim, runs a real competing sweeper against the same namespace, and then
+# tries to install a live replacement exactly as pg_stale_dirlock_reap would (`mkdir`, then its
+# pid). Serialized, the competing sweeper removes nothing, so the replacement is IMPOSSIBLE while
+# the first sweeper's removal is still pending — and that removal still lands. Unserialized, the
+# replacement is created and then deleted with its owner alive.
+DL_SER_HOME="$TDIR/home-sweep-serialize"; mkdir -p "$DL_SER_HOME/bin"
+DL_SER_NS="$DL_SER_HOME/ns"; mkdir -p "$DL_SER_NS"
+DL_SER_ORPHAN="$DL_SER_NS/orphan.lock.d.reclaim"
+DL_SER_ARMED="$DL_SER_HOME/sweeper-armed"
+# Delays only the removal of the orphan under test — never the sweep mutex's own release, and only
+# for the sweeper that carries this shim on its PATH.
+printf '#!/usr/bin/env bash\nif [ -n "${PG_SWEEP_RM_MATCH:-}" ]; then\n  case " $* " in *"$PG_SWEEP_RM_MATCH"*) : > "${PG_SWEEP_RM_SENTINEL:?}"; sleep "${PG_SWEEP_RM_DELAY:-0}" ;; esac\nfi\nexec "%s" "$@"\n' "$(command -v rm)" > "$DL_SER_HOME/bin/rm"
+chmod +x "$DL_SER_HOME/bin/rm"
+sleep 0 & DL_SER_DEAD=$!; wait "$DL_SER_DEAD"
+sleep 120 & DL_SER_LIVE=$!
+dl_seed_reclaim "$DL_SER_ORPHAN" "$DL_SER_DEAD" aged
+PATH="$DL_SER_HOME/bin:$PATH" PG_SWEEP_RM_MATCH="orphan.lock.d.reclaim" \
+PG_SWEEP_RM_SENTINEL="$DL_SER_ARMED" PG_SWEEP_RM_DELAY=6 PRO_GATE_HOME="$DL_SER_HOME" \
+  bash -c '. "$1"; pg_stale_reclaim_sweep "$2"' _ "$HERE/../lib/pro-gate-lib.sh" "$DL_SER_NS" &
+DL_SER_HOLDER=$!
+for _ in $(seq 1 300); do [ -e "$DL_SER_ARMED" ] && break; sleep 0.1; done
+PRO_GATE_HOME="$DL_SER_HOME" \
+  bash -c '. "$1"; pg_stale_reclaim_sweep "$2"' _ "$HERE/../lib/pro-gate-lib.sh" "$DL_SER_NS"
+DL_SER_RIVAL_RC=$?
+if mkdir "$DL_SER_ORPHAN" 2>/dev/null; then
+  DL_SER_REPL=1; printf '%s\n' "$DL_SER_LIVE" > "$DL_SER_ORPHAN/pid"
+else DL_SER_REPL=0; fi
+wait "$DL_SER_HOLDER"; DL_SER_HOLDER_RC=$?
+DL_SER_SURVIVED=0; [ -d "$DL_SER_ORPHAN" ] && DL_SER_SURVIVED=1
+kill "$DL_SER_LIVE" 2>/dev/null
+# The mutex is held for one pass and released, never leaked: a later sweep of the same namespace
+# still reaps a fresh orphan, so serializing sweepers cannot wedge the cleanup it protects.
+dl_seed_reclaim "$DL_SER_NS/after.lock.d.reclaim" "$DL_SER_DEAD" aged
+pg_stale_reclaim_sweep "$DL_SER_NS"
+check '#155 r1: a competing reclaim-lock sweep never removes an orphan another sweeper is deleting' \
+  "$([ -e "$DL_SER_ARMED" ] && [ "$DL_SER_RIVAL_RC" -eq 0 ] && [ "$DL_SER_HOLDER_RC" -eq 0 ] \
+     && [ "$DL_SER_REPL" -eq 0 ] && [ "$DL_SER_SURVIVED" -eq 0 ] \
+     && [ ! -d "$DL_SER_NS/after.lock.d.reclaim" ]; echo $?)" \
+  "armed=$(test -e "$DL_SER_ARMED"; echo $?) rival_rc=$DL_SER_RIVAL_RC holder_rc=$DL_SER_HOLDER_RC replacement_installed=$DL_SER_REPL replacement_survived=$DL_SER_SURVIVED remaining=$(ls -a "$DL_SER_NS" | tr '\n' ' ')"
+
+# That mutex is never reclaimed — every reclaimable variant readmits the second sweeper — so a
+# process killed while holding it strands it and suspends this cleanup for the namespace. The
+# pre-filter keeps that exposure off the hot path: a namespace with no reclaim lock at all is
+# skipped WITHOUT taking the mutex, which is every housekeeping pass on a flock host, where no
+# reclaim lock can exist. A PATH `mkdir` shim records which mutexes the sweep actually tried to
+# take; a namespace with an orphan must still take one, or the pre-filter would be a way to skip
+# the serialization instead of a way to avoid an idle lock.
+DL_PRE_HOME="$TDIR/home-sweep-prefilter"; mkdir -p "$DL_PRE_HOME/bin"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "${PG_MKDIR_LOG:?}"\nexec "%s" "$@"\n' "$(command -v mkdir)" > "$DL_PRE_HOME/bin/mkdir"
+chmod +x "$DL_PRE_HOME/bin/mkdir"
+DL_PRE_EMPTY="$DL_PRE_HOME/empty"; DL_PRE_FULL="$DL_PRE_HOME/full"
+mkdir -p "$DL_PRE_EMPTY" "$DL_PRE_FULL"; : > "$DL_PRE_HOME/mkdir.log"
+dl_seed_reclaim "$DL_PRE_FULL/orphan.lock.d.reclaim" "$DL_SER_DEAD" aged
+PATH="$DL_PRE_HOME/bin:$PATH" PG_MKDIR_LOG="$DL_PRE_HOME/mkdir.log" PRO_GATE_HOME="$DL_PRE_HOME" \
+  bash -c '. "$1"; pg_stale_reclaim_sweep "$2" "$3"' \
+    _ "$HERE/../lib/pro-gate-lib.sh" "$DL_PRE_EMPTY" "$DL_PRE_FULL"
+DL_PRE_RC=$?
+check '#155 r1: the reclaim-lock sweep takes its never-reclaimed mutex only where there is work' \
+  "$([ "$DL_PRE_RC" -eq 0 ] \
+     && ! grep -qF "$DL_PRE_EMPTY/.pg-reclaim-sweep.d" "$DL_PRE_HOME/mkdir.log" \
+     && grep -qF "$DL_PRE_FULL/.pg-reclaim-sweep.d" "$DL_PRE_HOME/mkdir.log" \
+     && [ ! -d "$DL_PRE_FULL/orphan.lock.d.reclaim" ]; echo $?)" \
+  "rc=$DL_PRE_RC mkdirs=$(tr '\n' ';' < "$DL_PRE_HOME/mkdir.log")"
+
+# And a mutex stranded by a killed sweeper fails CLOSED — deliberately. Reclaiming it on a dead
+# owner IS the delayed-removal race one level up (two sweepers again, one of them holding a removal
+# it already decided), and no rename- or quarantine-based takeover avoids that, so the namespace is
+# skipped until an operator removes the directory and no sweeper ever proceeds unserialized. The
+# same shape as its subject one level down: '#152: pg_lock leaves a live reclaimer lock alone and
+# fails closed'. Pinned so a later "self-healing" change to this lock has to argue with the reason
+# it is not self-healing.
+DL_WEDGE_NS="$DL_PRE_HOME/stranded"; mkdir -p "$DL_WEDGE_NS/.pg-reclaim-sweep.d"
+printf '%s\n' "$DL_SER_DEAD" > "$DL_WEDGE_NS/.pg-reclaim-sweep.d/pid"
+dl_seed_reclaim "$DL_WEDGE_NS/orphan.lock.d.reclaim" "$DL_SER_DEAD" aged
+pg_stale_reclaim_sweep "$DL_WEDGE_NS"; DL_WEDGE_RC=$?
+check '#155 r1: a sweep mutex stranded by a killed sweeper fails closed, never sweeping unserialized' \
+  "$([ "$DL_WEDGE_RC" -eq 0 ] && [ -d "$DL_WEDGE_NS/orphan.lock.d.reclaim" ] \
+     && [ -d "$DL_WEDGE_NS/.pg-reclaim-sweep.d" ] \
+     && [ "$(cat "$DL_WEDGE_NS/.pg-reclaim-sweep.d/pid" 2>/dev/null)" = "$DL_SER_DEAD" ]; echo $?)" \
+  "rc=$DL_WEDGE_RC remaining=$(ls -a "$DL_WEDGE_NS" | tr '\n' ' ')"
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }
