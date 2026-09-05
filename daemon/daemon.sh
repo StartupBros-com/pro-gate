@@ -113,7 +113,7 @@ daemon_handle_review_worker_failure(){ # worker-rc; fresh typed decision decides
 }
 
 daemon_dispatch_decision(){ # decision-file [redirect-depth]
-  local decision="$1" depth="${2:-0}" action class ref fresh fresh_action fresh_ref agent_rc
+  local decision="$1" depth="${2:-0}" action class ref fresh fresh_action fresh_ref agent_rc recover_timeout
   DAEMON_DISPATCH_REVIEW_RAN=0
   DAEMON_DISPATCH_AGENT_TASK_COMPLETED=0
   daemon_decision_valid "$decision" && daemon_decision_target_matches "$decision" "$DD_NWO" "$DD_NUM" "$DD_SHA" || {
@@ -148,7 +148,12 @@ daemon_dispatch_decision(){ # decision-file [redirect-depth]
         return $?
       fi
       if [ -n "$ref" ]; then
-        "$DD_ENGINE" --recover "$ref" --repo "$DD_WORKTREE" --out "$DD_LOG.recover" --timeout "${PRO_REVIEW_ENGINE_TIMEOUT:-60m}" >>"$DD_LOG" 2>&1 \
+        # gate #148 r1 P2: the engine treats any --timeout it receives as final, so pass one only
+        # when the operator configured it. Left unset, a recovery gets the engine's own collection
+        # default (45m, or PRO_GATE_HARVEST_TIMEOUT), not the 60m fresh-review wait.
+        recover_timeout=()
+        [ -z "${PRO_REVIEW_ENGINE_TIMEOUT:-}" ] || recover_timeout=(--timeout "$PRO_REVIEW_ENGINE_TIMEOUT")
+        "$DD_ENGINE" --recover "$ref" --repo "$DD_WORKTREE" --out "$DD_LOG.recover" "${recover_timeout[@]}" >>"$DD_LOG" 2>&1 \
           || daemon_note "  · $DD_NWO#$DD_NUM $action remains deferred after runtime recovery; review failure budget untouched"
       fi
       return 0 ;;

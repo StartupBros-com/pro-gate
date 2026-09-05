@@ -140,6 +140,23 @@ for index in $(seq 0 7); do
   check "$action dispatches only its runtime-provided execution class without a routine prompt" "$([ "$REVIEW_WORKERS" -eq "$expected_review" ] && [ "$AGENT_TASKS" -eq "$expected_agent" ]; echo $?)" "review=$REVIEW_WORKERS agent=$AGENT_TASKS"
   check "$action has zero SHA/failure-budget effects unless it runs a granted review" "$([ "$action" = run-granted-review ] || { [ "$(wc -c < "$TYPED_STATE")" = "$before_state" ] && [ "$(wc -c < "$TYPED_FAILS")" = "$before_fails" ]; }; echo $?)" "processed=$(wc -c < "$TYPED_STATE") failures=$(wc -c < "$TYPED_FAILS")"
 done
+# gate #148 r1 P2: an unattended recovery passes --timeout only when PRO_REVIEW_ENGINE_TIMEOUT is
+# configured. The engine treats any --timeout it receives as final, so the fixed 60m the daemon used
+# to send bypassed the 45m collection default and PRO_GATE_HARVEST_TIMEOUT on every recovery.
+RECOVER_INDEX="$(jq -r '.cases | to_entries[] | select(.value.expected.action == "recover-existing-review") | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
+RECOVER_DECISION="$TYPED_HOME/recover-timeout.json"; typed_decision "$RECOVER_INDEX" "$RECOVER_DECISION"
+: > "$TYPED_ENGINE_CALLS"
+( unset PRO_REVIEW_ENGINE_TIMEOUT; export PRO_GATE_HARVEST_TIMEOUT=5m
+  MOCK_FRESH="$RECOVER_DECISION" MOCK_RECOVERED="$TYPED_HOME/recover-timeout-unset" DD_ENGINE="$TYPED_ENGINE" DD_NWO=acme/widgets DD_NUM=1983 DD_SHA=1111111111111111111111111111111111111111 DD_WORKTREE="$TYPED_HOME" DD_LOG="$TYPED_LOG" daemon_dispatch_decision "$RECOVER_DECISION" )
+RECOVER_CALL="$(grep -F -- '--recover ' "$TYPED_ENGINE_CALLS" | tail -1)"
+check 'gate #148 r1 P2: daemon recovery sends no --timeout when PRO_REVIEW_ENGINE_TIMEOUT is unset, so the engine collection default applies' \
+  "$([ -n "$RECOVER_CALL" ] && ! grep -Fq -- '--timeout' <<<"$RECOVER_CALL"; echo $?)" "call=$RECOVER_CALL"
+: > "$TYPED_ENGINE_CALLS"
+( export PRO_REVIEW_ENGINE_TIMEOUT=7m
+  MOCK_FRESH="$RECOVER_DECISION" MOCK_RECOVERED="$TYPED_HOME/recover-timeout-set" DD_ENGINE="$TYPED_ENGINE" DD_NWO=acme/widgets DD_NUM=1983 DD_SHA=1111111111111111111111111111111111111111 DD_WORKTREE="$TYPED_HOME" DD_LOG="$TYPED_LOG" daemon_dispatch_decision "$RECOVER_DECISION" )
+RECOVER_CALL="$(grep -F -- '--recover ' "$TYPED_ENGINE_CALLS" | tail -1)"
+check 'gate #148 r1 P2: daemon recovery passes an explicit PRO_REVIEW_ENGINE_TIMEOUT through as --timeout' \
+  "$(grep -Fq -- '--timeout 7m' <<<"$RECOVER_CALL"; echo $?)" "call=$RECOVER_CALL"
 check 'explicit connector input is reused by guarded effect rechecks' "$(grep -F -- '--review-decision-effect' "$TYPED_ENGINE_CALLS" | grep -Fq -- '--input connector'; echo $?)"
 
 # A completed agent task uses the same processed.tsv behavior as a completed review worker. Its
