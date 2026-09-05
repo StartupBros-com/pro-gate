@@ -356,6 +356,8 @@ remain an operator trust boundary.
 | `PRO_GATE_DIFF_HARD_MAX` | `25000` | Above this the engine refuses (exit 11, no spend) |
 | `PRO_GATE_MAX_CONCURRENCY` | `1` | Ceiling for parallel Pro chats; a ramp governor earns up to it on clean streaks |
 | `PRO_GATE_RESERVATION_TTL` | `21600` | Minimum age before confirmed exact-marker misses may exhaust recovery; elapsed time alone never releases it |
+| `PRO_GATE_TIMEOUT` | `60m` | Default `--timeout` for a fresh review, sized to the ledger's p90 review time; an explicit `--timeout` wins |
+| `PRO_GATE_HARVEST_TIMEOUT` | `45m` | Default `--timeout` for `--harvest`/`--recover` and the value harvest hints print; one pass now usually collects |
 | `PRO_GATE_REQUIRE_NONCE` | `1` | Reject any capture that doesn't echo this run's nonce (`0` restores path-overlap matching) |
 | `PRO_GATE_MODEL_STRATEGY` | `current` | Review with whatever Pro model the account has selected; the run reports the one it used |
 | `PRO_GATE_CHAT_RENAME` | `1` remote / prompt-only native | Apply and verify the exact canonical PR/round title through ChatGPT's rendered UI |

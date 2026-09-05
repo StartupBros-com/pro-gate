@@ -21,31 +21,9 @@ daemon_note(){
 }
 
 daemon_decision_valid(){ # decision-file
-  local decision="$1" canonical facts expected
-  [ -f "$decision" ] && [ ! -L "$decision" ] && command -v jq >/dev/null 2>&1 || return 1
-  [ "$(wc -c < "$decision" 2>/dev/null | tr -d ' ')" -le 65536 ] || return 1
-  jq -e --arg cd "$(pg_review_decision_contract_digest)" --arg xd "$(pg_review_decision_corpus_digest)" '
-    type == "object" and keys == ["action","contract","effect_request","facts","observation","reason"] and
-    .contract == {contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,corpus_digest:$xd} and
-    (.action | IN("collect-existing-result","recover-existing-review","fix-review-findings","prepare-matching-review-evidence","run-granted-review","stop-without-new-review","allow-existing-merge-workflow","ask-named-product-choice")) and
-    (. as $envelope | .effect_request | type == "object" and keys == ["action","applicable_ref","contract_digest","effect","execution_class","snapshot_digest","target"] and
-      .effect == .action and .contract_digest == $cd and
-      (.snapshot_digest | type == "string" and test("^[0-9a-f]{64}$")) and .target == $envelope.facts.target and
-      ((.action == "collect-existing-result" or .action == "recover-existing-review" or .action == "run-granted-review") and .execution_class == "runtime-guarded-effect" or
-       ((.action == "fix-review-findings" or .action == "prepare-matching-review-evidence") and .execution_class == "agent-task") or
-       ((.action == "stop-without-new-review" or .action == "allow-existing-merge-workflow") and .execution_class == "report-only") or
-       (.action == "ask-named-product-choice" and .execution_class == "named-product-choice"))) and
-    (.effect_request.action == .action) and
-    ([.. | objects | keys[] | select(. == "status" or . == "next_action")] | length == 0) and
-    ([.. | strings | select(test("[[:cntrl:]]"))] | length == 0)
-  ' "$decision" >/dev/null 2>&1 || return 1
-  # Reject envelopes whose outer action or effect was fabricated against otherwise plausible JSON.
-  # The pure runtime reducer is re-run over the normalized facts, so this consumer accepts only the
-  # byte-identical decision the installed compatible runtime would emit.
-  facts="$(jq -cS .facts "$decision" 2>/dev/null)" || return 1
-  expected="$(pg_review_decision_reduce "$facts")" || return 1
-  canonical="$(pg_review_json_canonical "$(<"$decision")")" || return 1
-  [ "$canonical" = "$expected" ]
+  # v0.41: the schema lives in the library (pg_review_decision_envelope_valid) so the conformance
+  # suite covers this renderer too; the daemon keeps no private copy of the contract shape.
+  pg_review_decision_envelope_valid "$1"
 }
 
 daemon_decision_target_matches(){ # decision-file nwo pr sha
@@ -79,7 +57,7 @@ daemon_agent_task_available(){
 
 daemon_run_review_worker(){ # saved run-granted-review decision-file
   local decision="$1" command_text prompt
-  printf -v command_text '%q ' "$DD_ENGINE" --review-decision --review-decision-effect "$decision" --pr "$DD_NUM" --repo "$DD_WORKTREE" "${DD_INPUT_ARGS[@]}" --out "$DD_LOG.review" --timeout "${PRO_REVIEW_ENGINE_TIMEOUT:-30m}"
+  printf -v command_text '%q ' "$DD_ENGINE" --review-decision --review-decision-effect "$decision" --pr "$DD_NUM" --repo "$DD_WORKTREE" "${DD_INPUT_ARGS[@]}" --out "$DD_LOG.review" --timeout "${PRO_REVIEW_ENGINE_TIMEOUT:-60m}"
   prompt="First action: execute this exact argv-quoted guarded runtime effect; it rechecks the saved review-decision/v1 before any charge or submission:
 $command_text
 After that action, invoke the /pro-gate skill and let its typed review-decision/v1 re-resolution select every subsequent fix, evidence, or reporting action. Do not infer a continuation from verdict, prose, phase, exit status, recoverability, or rounds, and do not ask routine permission.
@@ -170,7 +148,7 @@ daemon_dispatch_decision(){ # decision-file [redirect-depth]
         return $?
       fi
       if [ -n "$ref" ]; then
-        "$DD_ENGINE" --recover "$ref" --repo "$DD_WORKTREE" --out "$DD_LOG.recover" --timeout "${PRO_REVIEW_ENGINE_TIMEOUT:-30m}" >>"$DD_LOG" 2>&1 \
+        "$DD_ENGINE" --recover "$ref" --repo "$DD_WORKTREE" --out "$DD_LOG.recover" --timeout "${PRO_REVIEW_ENGINE_TIMEOUT:-60m}" >>"$DD_LOG" 2>&1 \
           || daemon_note "  · $DD_NWO#$DD_NUM $action remains deferred after runtime recovery; review failure budget untouched"
       fi
       return 0 ;;
