@@ -341,13 +341,13 @@ U1 then U2 (salvage helper), U3 (engine drain and refund tests, no engine code e
 | Release notes | `bash scripts/check-release-notes.sh docs/release-notes/v0.42.0.md` | U6 |
 | Live memo audit before merge | list the memo directory on the operator's box and confirm every real id passes the rule | U1 |
 
-CI runs all eight suites on push; the engine suite's wall time is by design.
+CI runs its full test battery on push, which includes the six automated checks above; the live memo audit is a manual pre-merge check on the operator's box. The engine suite's wall time is by design.
 
 ---
 
 ## Definition of Done
 
-- All eight CI suites green on the branch; the new salvage and engine cases present and passing.
+- The full CI battery green on the branch, including the six automated checks in the Verification Contract; the new salvage and engine cases present and passing.
 - The live memo directory audit shows the rule accepts every real id and rejects every placeholder.
 - One `/pro-gate` round on the PR before merge, with any FIX-FIRST findings fixed or, if two rounds surface new findings on the revocation mechanism, the status half (U4, U5) shipped alone per the legible-core learning.
 - v0.42.0 notes pass the check; VERSION and plugin.json agree; CHANGELOG row present.
