@@ -38,6 +38,10 @@ The engine-issued typed continuation chosen from normalized lifecycle, evidence,
 
 The deployment-level rule that controls whether Pro-Gate supplies only the reviewed bundle or may request connector-capable delivery. It governs Pro-Gate's request surface, not permissions independently granted to the browser identity.
 
+### Account Cooldown
+
+The engine-wide back-off that follows any proof that ChatGPT is rate-limiting the review account: the short interstitial page, the "Too many requests" modal painted over a live conversation, or a Cloudflare challenge. While it runs, no fresh review is submitted, reservation probes and organizer traffic stay off the account, harvest defers, and the Review Decision reports `account-cooldown-active` with the seconds remaining instead of a grant. A probe that finds a conversation under the modal reports `throttled`: the conversation exists, is not progressing, and is not evidence of absence.
+
 ### Brief
 
 A caller-supplied task body that replaces the built-in final-tier reviewer persona, so a review slot can be spent on a different question — an architecture critique, a migration-risk read — while the answer is still collected the usual way. Where Input Policy governs what context is attached, a Brief governs what is asked.
@@ -51,3 +55,4 @@ The engine appends its own output contract after a brief, so a brief chooses the
 - Applicability is an input to the Review Decision, not a synonym for completion.
 - Input Policy constrains evidence delivery before a Review Attempt can be submitted.
 - A Brief redirects what a Review Attempt asks; it never widens who may act on the answer.
+- An Account Cooldown pauses fresh spend and browser traffic; it neither releases a Reservation nor advances its miss count.

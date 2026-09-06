@@ -93,7 +93,7 @@ update path above. A saved decision is advisory, not authority.
 | `runtime-guarded-effect` | `run-granted-review` | Re-enter with `--review-decision-effect`, adding `--out` and `--timeout`; the runtime rechecks before charge and submission. |
 | `agent-task` | `fix-review-findings` | Verify normalized current findings, fix them, run applicable checks, then re-query at the changed head. |
 | `agent-task` | `prepare-matching-review-evidence` | Prepare the requested raw/reviewed evidence without changing code, append its proof inputs above, then re-query. |
-| `report-only` | `stop-without-new-review` | Report the normalized reason and preserve branch work; do not infer a retry. |
+| `report-only` | `stop-without-new-review` | Report the normalized reason and preserve branch work; do not infer a retry. `account-cooldown-active` is the one stop a caller may wait out: ChatGPT is rate-limiting the account, `.facts.cooldown.seconds_remaining` says for how long, and only re-querying after at least that long can change the answer. |
 | `report-only` | `allow-existing-merge-workflow` | Re-query immediately before handing off to the existing merge workflow; pro-gate has no merge authority. |
 | `named-product-choice` | `ask-named-product-choice` | Ask only the validated named outcomes and consequences supplied by the decision. |
 

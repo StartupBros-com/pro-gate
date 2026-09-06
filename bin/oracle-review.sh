@@ -407,7 +407,7 @@ pg_review_decision_cli() {
   local input_proven=false input_binding_valid=false input_identity evidence_identity evidence_state
   local input_marker="" input_record="" input_digest="" f marker candidate candidate_relation desired_relation exact=false active_marker="" active_state=none
   local endpoint reviewed manifest confirmation endpoint_digest reviewed_digest manifest_digest confirmation_digest lineage mode ship_digest
-  local reservation_marker="" reservation_state=none governor_granted=false completed='[]' prior_candidates='[]' prior_review result artifact artifact_digest canonical
+  local reservation_marker="" reservation_state=none governor_granted=false cooldown_left=0 completed='[]' prior_candidates='[]' prior_review result artifact artifact_digest canonical
   local facts decision effect_ok=false prospective exact_inputs='[]' choice_candidates='[]' choice_outcomes='[]' choice_selected="" choice_snapshot="" selection="" selection_supplied=false current_verdict=NONE current_canonical="" effect_input attempt_snapshot attempt_source
 
   pg_have jq || { echo 'ERROR: review-decision/v1 requires jq' >&2; return 2; }
@@ -616,14 +616,19 @@ pg_review_decision_cli() {
     fi
   fi
   if pg_round_guard "$round_key" >/dev/null 2>&1; then governor_granted=true; fi
+  # #162: the account back-off cooldown is a normalized fact, so a wrapper learns how long to
+  # wait from the closed decision instead of retrying a query that pg_health_gate would refuse.
+  cooldown_left="$(pg_cooldown_remaining_secs)"; case "$cooldown_left" in ''|*[!0-9]*) cooldown_left=0;; esac
 
   facts="$(jq -cnS --arg h "$host" --arg o "$owner" --arg r "$repo_name" --arg head "$head" --argjson pr "$pr_num" \
     --arg identity "$input_identity" --arg evidence "$evidence_identity" --arg state "$evidence_state" \
     --arg marker "$active_marker" --arg astate "$active_state" --arg reservation "$reservation_marker" --arg rstate "$reservation_state" \
     --argjson input_proven "$input_proven" --argjson input_binding "$input_binding_valid" --argjson granted "$governor_granted" \
+    --argjson cooldown_left "$cooldown_left" \
     --argjson completed "$completed" --argjson prior "$prior_review" --argjson choices "$choice_outcomes" --arg choice "$choice_selected" --arg choice_snap "$choice_snapshot" --arg cd "$(pg_review_decision_contract_digest)" --arg xd "$(pg_review_decision_corpus_digest)" '
     {active_index:{binding_valid:$input_binding,charged_spend_epoch:0,marker:$marker,state:$astate},completed_results:$completed,
      contract:{contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,corpus_digest:$xd},
+     cooldown:{active:($cooldown_left > 0),seconds_remaining:$cooldown_left},
      evidence:{identity:$evidence,safe_to_prepare:true,state:$state},governor:{granted:$granted},
      input:{binding_valid:$input_binding,identity:$identity,proven:$input_proven},named_choice:{outcomes:$choices,selected_id:(if $choice=="" then null else $choice end),snapshot_digest:$choice_snap},
      observation:{kind:"idle"},prior_review:$prior,
@@ -1865,7 +1870,7 @@ pg_install_full_pr_input_binding() { # marker; only endpoint-fetched full PRs ga
 # authorities; it neither creates an action token nor a second ledger or lock.
 pg_fresh_dispatch_recheck() { # sets PG_FRESH_DECISION/PG_FRESH_ACTION
   local template="$REVIEW_DECISION_INPUT_TEMPLATE" marker="" state=none epoch=0 f rec m astate="" completed='[]' attempt_snapshot attempt_source
-  local input_ok=false input_digest evidence identity head base active_marker="" reservation="" granted=false facts
+  local input_ok=false input_digest evidence identity head base active_marker="" reservation="" granted=false cooldown_left=0 facts
   local template_relation="" candidate="" candidate_relation="" artifact="" artifact_digest=""
   [ -n "$template" ] || return 1
   input_digest="$(pg_review_sha256_text "$template" 2>/dev/null || true)"
@@ -1921,10 +1926,11 @@ pg_fresh_dispatch_recheck() { # sets PG_FRESH_DECISION/PG_FRESH_ACTION
     else reservation="$active_marker"; active_marker=""; astate=none; fi
   fi
   pg_round_guard "$ROUND_KEY" >/dev/null 2>&1 && granted=true
+  cooldown_left="$(pg_cooldown_remaining_secs)"; case "$cooldown_left" in ''|*[!0-9]*) cooldown_left=0;; esac
   facts="$(jq -cnS --arg h "$PG_META_HOST" --arg o "$PG_META_OWNER" --arg r "$PG_META_REPO" --arg head "$head" --argjson p "$PR_NUM" \
     --arg identity "$identity" --arg evidence "$evidence" --arg marker "$active_marker" --arg astate "${astate:-none}" --arg reservation "$reservation" \
-    --argjson valid "$input_ok" --argjson granted "$granted" --argjson completed "$completed" --arg cd "$(pg_review_decision_contract_digest)" --arg xd "$(pg_review_decision_corpus_digest)" \
-    '{active_index:{binding_valid:$valid,charged_spend_epoch:0,marker:$marker,state:$astate},completed_results:$completed,contract:{contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,corpus_digest:$xd},evidence:{identity:$evidence,safe_to_prepare:true,state:(if $valid then "matching" else "missing" end)},governor:{granted:$granted},input:{binding_valid:$valid,identity:$identity,proven:$valid},named_choice:{outcomes:[],selected_id:null,snapshot_digest:""},observation:{kind:"idle"},prior_review:{applicable:false,binding_valid:false,code_identity:"",evidence_identity:"",legacy:false,marker:"",provenance_valid:false,verdict:"NONE"},reservation:{binding_valid:false,legacy:false,marker:$reservation,state:(if $reservation=="" then "none" else "live" end)},target:{head_oid:$head,host:$h,owner:$o,pr:$p,repo:$r},transport:"review-decision/v1"}')" || return 1
+    --argjson valid "$input_ok" --argjson granted "$granted" --argjson cooldown_left "$cooldown_left" --argjson completed "$completed" --arg cd "$(pg_review_decision_contract_digest)" --arg xd "$(pg_review_decision_corpus_digest)" \
+    '{active_index:{binding_valid:$valid,charged_spend_epoch:0,marker:$marker,state:$astate},completed_results:$completed,contract:{contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,corpus_digest:$xd},cooldown:{active:($cooldown_left > 0),seconds_remaining:$cooldown_left},evidence:{identity:$evidence,safe_to_prepare:true,state:(if $valid then "matching" else "missing" end)},governor:{granted:$granted},input:{binding_valid:$valid,identity:$identity,proven:$valid},named_choice:{outcomes:[],selected_id:null,snapshot_digest:""},observation:{kind:"idle"},prior_review:{applicable:false,binding_valid:false,code_identity:"",evidence_identity:"",legacy:false,marker:"",provenance_valid:false,verdict:"NONE"},reservation:{binding_valid:false,legacy:false,marker:$reservation,state:(if $reservation=="" then "none" else "live" end)},target:{head_oid:$head,host:$h,owner:$o,pr:$p,repo:$r},transport:"review-decision/v1"}')" || return 1
   PG_FRESH_DECISION="$(pg_review_decision_reduce "$facts")" || return 1
   PG_FRESH_ACTION="$(jq -r .action <<<"$PG_FRESH_DECISION")"
   [ "$PG_FRESH_ACTION" = run-granted-review ]
@@ -1937,8 +1943,11 @@ pg_fresh_dispatch_require_run() { # boundary label; exits through existing statu
   # A replacement is data, not an authorization token. Emit it before the legacy status/exit so
   # callers can re-enter through the ordinary collect/recover/stop path without inferring action.
   [ -n "${PG_FRESH_DECISION:-}" ] && printf '%s\n' "$PG_FRESH_DECISION"
-  case "${PG_FRESH_ACTION:-}" in
-    collect-existing-result|recover-existing-review) pg_status in-progress "review-decision superseded at $boundary: $PG_FRESH_ACTION/$reason"; pg_finish 9 ;;
+  case "${PG_FRESH_ACTION:-}/$reason" in
+    collect-existing-result/*|recover-existing-review/*) pg_status in-progress "review-decision superseded at $boundary: $PG_FRESH_ACTION/$reason"; pg_finish 9 ;;
+    # #162: the account cooldown is the same deferral pg_health_gate reports — nothing was
+    # spent and the box is not at fault, so it keeps exit 8 rather than becoming a failure.
+    stop-without-new-review/account-cooldown-active) pg_status deferred "review-decision at $boundary: $(pg_cooldown_active || echo 'account cooldown active')"; pg_finish 8 ;;
     *) pg_status failed "review-decision superseded at $boundary: ${PG_FRESH_ACTION:-stop-without-new-review}/$reason"; pg_finish 3 ;;
   esac
 }
@@ -3512,12 +3521,20 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
       # like live: never resubmit, and let the post-cooldown salvage decide.
       prc=2
       if command -v node >/dev/null 2>&1; then
-        node "$SELF/cdp-salvage.mjs" --probe "$RUN_MARKER" 30 "$PORT" >/dev/null 2>>"$RUNLOG"; prc=$?
+        node "$SELF/cdp-salvage.mjs" --probe "$RUN_MARKER" 30 "$PORT" >/dev/null 2>"$WORK/probe.err"; prc=$?
+        cat "$WORK/probe.err" >> "$RUNLOG" 2>/dev/null
       fi
       if [ "$prc" -eq 0 ]; then
         echo "[oracle-review] watchdog: no-think after $(( now - started ))s BUT a conversation tab matches this PR — submission is LIVE, detection missed. Freeing the slot; CDP salvage will collect the review (retry suppressed: quota already spent)." >&2
         LIVE_CONVERSATION=1
         pg_status live-detected "no-think probe found the conversation"
+        # #162: live UNDER the rate-limit modal. Existence still suppresses the retry; the
+        # throttle flag additionally pauses before salvage and settles the ramp/ledger as one.
+        if grep -q '^probe-state: throttled$' "$WORK/probe.err" 2>/dev/null; then
+          echo "[oracle-review] watchdog: that conversation sits under ChatGPT's rate-limit modal — cooldown started; salvage after the pause." >&2
+          THROTTLED=1
+          pg_status throttled "rate-limit modal over the live conversation (no-think probe)"
+        fi
       elif [ "$prc" -eq 5 ]; then
         echo "[oracle-review] watchdog: ChatGPT is rate-limiting this account — killing this attempt; retry suppressed, cooldown started (salvage after the pause)." >&2
         THROTTLED=1
@@ -3847,12 +3864,18 @@ while :; do
   PRE_RETRY_PROBE_SECS="$(pg_test_pre_retry_probe_secs)"
   PRC=2
   if command -v node >/dev/null 2>&1; then
-    node "$SELF/cdp-salvage.mjs" --probe "$RUN_MARKER" "$PRE_RETRY_PROBE_SECS" "$PORT" >/dev/null 2>>"$RUNLOG"; PRC=$?
+    node "$SELF/cdp-salvage.mjs" --probe "$RUN_MARKER" "$PRE_RETRY_PROBE_SECS" "$PORT" >/dev/null 2>"$WORK/probe.err"; PRC=$?
+    cat "$WORK/probe.err" >> "$RUNLOG" 2>/dev/null
   fi
   if [ "$PRC" -eq 0 ]; then
     echo "[oracle-review] pre-retry probe found a live conversation for this run — retry suppressed (quota already spent); CDP salvage will collect it." >&2
     LIVE_CONVERSATION=1
     pg_status live-detected "pre-retry probe found the conversation"
+    if grep -q '^probe-state: throttled$' "$WORK/probe.err" 2>/dev/null; then
+      echo "[oracle-review] pre-retry probe: that conversation sits under ChatGPT's rate-limit modal — cooldown started; salvage after the pause." >&2
+      THROTTLED=1
+      pg_status throttled "rate-limit modal over the live conversation (pre-retry probe)"
+    fi
     break
   elif [ "$PRC" -eq 5 ]; then
     echo "[oracle-review] pre-retry probe hit the ChatGPT throttle — retry suppressed; cooldown started (salvage after the pause)." >&2

@@ -56,11 +56,15 @@
 //                matching the marker EXISTS (no VERDICT wait). Used by the
 //                engine's no-think watchdog to distinguish "dead submission,
 //                safe to retry" from "live run, retry would double-spend".
-//                Also prints `probe-state: complete|generating|terminal-infrastructure` on stderr so the
-//                reservation reconciler can release the account slot of a review
-//                that has finished but has not been collected yet (#82). This is
+//                Also prints `probe-state: complete|generating|terminal-infrastructure|throttled`
+//                on stderr so the reservation reconciler can release the account slot of a
+//                review that has finished but has not been collected yet (#82). This is
 //                an additive LINE, never a new exit code: callers above key on
 //                rc 0 meaning "live", and a new code would fall through them.
+//                `throttled` (#162): the conversation renders this run's marker UNDER
+//                ChatGPT's "Too many requests" modal. It exists (rc 0: a retry would
+//                double-spend) but is not progressing; the cooldown file is written, the
+//                reconciler leaves the miss streak untouched, and callers back off.
 // Exit: 0 = review printed (probe: tab found); 4 = scanned successfully, nothing matched;
 //       2 = usage error;
 //       3 = timeout but a conversation matching the marker IS live with no VERDICT yet (the
@@ -86,7 +90,9 @@ import {
   buildArchiveConversationExpression,
   buildCancelOrganizerMutationExpression,
   buildRenameConversationExpression,
+  buildThrottleModalExpression,
   ORGANIZER_MUTATION_LEASE_MS,
+  THROTTLE_RE,
 } from './cdp-organizer-expressions.mjs';
 import {
   parseTestPollMs,
@@ -277,9 +283,8 @@ function rememberUrl(m, url) {
     }
   } catch {}
 }
-// The interstitial's two distinctive sentences. Deliberately NOT a generic
-// /rate.?limit/ — review findings routinely discuss rate limits.
-const THROTTLE_RE = /making requests too quickly|temporarily limited access to your conversations/i;
+// THROTTLE_RE (the limiter's two distinctive sentences) is shared with the in-page modal
+// evaluator in cdp-organizer-expressions.mjs so both surfaces recognize the same copy.
 // Any pro-gate run marker. On a page that does NOT carry our own marker, a hit here is positive
 // evidence the page rendered a DIFFERENT run's conversation (vs. merely not having loaded yet).
 const FOREIGN_MARKER_RE = /pg-run-[A-Za-z0-9.-]+/;
@@ -302,6 +307,25 @@ function recordThrottle(where) {
 function tripThrottle(where) {
   recordThrottle(where);
   process.exit(5);
+}
+// #162: the limiter's MODAL over a conversation that renders this run's EXACT marker. The
+// conversation demonstrably exists — probe rc 0 keeps meaning "live; a retry would double-spend"
+// — but the account is throttled, so probe reports the closed state `throttled` instead of
+// `generating`: the reconciler neither resets the miss streak nor treats it as progress, and
+// every caller backs off through the cooldown written here. Outside probe the existing exit 5
+// applies unchanged: cooldown written, do NOT resubmit, harvest again after the pause.
+function tripThrottleOverConversation(url, where) {
+  recordThrottle(where);
+  if (!probe) process.exit(5);
+  console.error(`live conversation: ${url}`);
+  console.error('probe-state: throttled');
+  process.exit(0);
+}
+// Route throttle evidence from any surface: owned (modal over our marker) proves existence,
+// anything else (interstitial, modal over a foreign or blacklisted page) proves only the limiter.
+function tripThrottleEvidence(url, evidence, where) {
+  if (evidence.owned) tripThrottleOverConversation(url, where);
+  tripThrottle(where);
 }
 
 let evaluateRequestId = 0;
@@ -417,6 +441,14 @@ async function tabTerminalInfrastructure(tab) {
   })()`;
   const result = await evaluateTab(tab, expression);
   return result.ok && TERMINAL_INFRA_LINES.has(result.value) ? result.value : null;
+}
+
+// #162: the "Too many requests" modal over a rendered conversation, read as an ELEMENT rather
+// than from whole-page text (see buildThrottleModalExpression). Returns the bounded dialog text
+// or null; the shared THROTTLE_RE recheck keeps an unexpected evaluator value from counting.
+async function tabThrottleModal(tab) {
+  const result = await evaluateTab(tab, buildThrottleModalExpression());
+  return result.ok && typeof result.value === 'string' && THROTTLE_RE.test(result.value) ? result.value : null;
 }
 
 async function closeTab(id) {
@@ -617,7 +649,10 @@ async function freshRenderText(url, port, outerDeadline, waitForDecisiveEvidence
       // A scratch target may redirect, be reused, or be replaced underneath us. Its DOM is
       // evidence only for the canonical URL requested above, never merely for a matching target id.
       if (live.url !== url) return { text: null, reason: 'target-url-drift' };
-      const sample = await tabText(live);
+      // #162: a scratch render against a limited account can paint the modal over the
+      // conversation it just loaded. Read the element alongside the text (one bail, not two)
+      // before any marker test below can call that page "ours and still generating".
+      const [sample, throttleModal] = await Promise.all([tabText(live), tabThrottleModal(live)]);
       if (!sample) continue;
       text = sample;
       // Return only on DECISIVE evidence, never on "looks long enough".
@@ -633,14 +668,19 @@ async function freshRenderText(url, port, outerDeadline, waitForDecisiveEvidence
         // A readable source can be a stale snapshot, so this one revalidation must not spend its
         // only scratch navigation on the prompt marker ChatGPT hydrates before the answer. Reuse
         // the shared classifier: marker-only text remains owned-incomplete through the deadline.
-        evidence = classifyEvidence(sample);
+        evidence = classifyEvidence(sample, null, throttleModal);
         if (['terminal', 'terminal-infrastructure', 'foreign', 'cross-bound', 'throttle'].includes(evidence.kind)) {
           return { text, reason: `${evidence.kind}-evidence`, evidence };
         }
       } else {
+        // Throttle first: the modal sits OVER a marker-bearing page, so a marker test taken
+        // first would report a limited account as an ordinary hydrated conversation.
+        if (isThrottlePage(sample) || throttleModal) {
+          evidence = classifyEvidence(sample, null, throttleModal);
+          return { text, reason: 'throttle', evidence }; // interstitial or modal — done
+        }
         if (hasExactMarker(sample, marker)) return { text, reason: 'marker-found' }; // ours — done
         if (FOREIGN_MARKER_RE.test(sample)) return { text, reason: 'foreign-marker' }; // provably another run's — done
-        if (isThrottlePage(sample)) return { text, reason: 'throttle' }; // interstitial — done
       }
       // Anything else (shell, pre-hydration, login wall, or a marker-only stale-source render)
       // is NOT an answer: keep sampling and return the last text at the render deadline.
@@ -836,9 +876,10 @@ async function openOrganizerScratch(url) {
       } catch { return { target, reason: 'cdp-list-failed' }; }
       if (!live) return { target, reason: 'memo-tab-disappeared' };
       if (live.url !== url) return { target: live, reason: 'memo-url-drift' };
-      const text = await tabText(live);
+      const [text, throttleModal] = await Promise.all([tabText(live), tabThrottleModal(live)]);
       if (!text) continue;
-      if (isThrottlePage(text)) return { target: live, reason: 'throttle' };
+      // #162: the modal is throttle evidence too; organizer traffic must stop on either form.
+      if (isThrottlePage(text) || throttleModal) return { target: live, reason: 'throttle' };
       if (hasExactMarker(text, marker)) {
         const ownership = mutationOwnership(text);
         return ownership.owned
@@ -955,8 +996,11 @@ async function organizeConversation() {
       .filter((tab) => tab.type === 'page' && /^https:\/\/chatgpt\.com\/c\//.test(tab.url || ''));
   } catch { return { ...result, reason: 'cdp-list-failed' }; }
 
-  const reads = await Promise.all(tabs.map(async (tab) => ({ tab, text: await tabText(tab) })));
-  if (reads.some(({ text }) => isThrottlePage(text))) {
+  const reads = await Promise.all(tabs.map(async (tab) => {
+    const [text, throttleModal] = await Promise.all([tabText(tab), tabThrottleModal(tab)]);
+    return { tab, text, throttleModal };
+  }));
+  if (reads.some(({ text, throttleModal }) => isThrottlePage(text) || throttleModal)) {
     recordThrottle('organizer scan');
     return { ...result, reason: 'throttle' };
   }
@@ -1119,9 +1163,12 @@ function terminalInfrastructureAfterPrompt(text, structuredError = null) {
   return lines.includes(structuredError) ? structuredError : null;
 }
 
-function classifyEvidence(text, structuredError = null) {
+function classifyEvidence(text, structuredError = null, throttleModal = null) {
   if (!text || !text.trim()) return { kind: 'inconclusive', reason: 'empty-text' };
-  if (isThrottlePage(text)) return { kind: 'throttle' };
+  if (isThrottlePage(text)) return { kind: 'throttle', reason: 'interstitial', owned: false };
+  // #162: the modal is account state painted over whatever conversation rendered. `owned` says
+  // whether THIS run's exact marker is on the page beneath it (existence proof for --probe).
+  if (throttleModal) return { kind: 'throttle', reason: 'modal', owned: hasExactMarker(text, marker) };
   if (!hasExactMarker(text, marker)) {
     return FOREIGN_MARKER_RE.test(text)
       ? { kind: 'foreign' }
@@ -1282,11 +1329,25 @@ while (Date.now() < deadline) {
   stillGeneratingUrl = null;
   lastMatchWasSeeded = false;
   const deadTabs = [];
-  const reads = await Promise.all(tabs.map(async (tab) => ({
-    tab,
-    text: await tabText(tab),
-    infrastructureError: await tabTerminalInfrastructure(tab),
-  })));
+  // The three reads per tab are independent; run them concurrently so a suspended renderer
+  // costs one evaluate bail per tab, not three, inside probe's fixed budget.
+  const reads = await Promise.all(tabs.map(async (tab) => {
+    const [text, infrastructureError, throttleModal] = await Promise.all([
+      tabText(tab), tabTerminalInfrastructure(tab), tabThrottleModal(tab),
+    ]);
+    return { tab, text, infrastructureError, throttleModal };
+  }));
+  // #162: the modal is account-wide, so decide ownership over the WHOLE scan, never on the first
+  // tab in list order (the same order-independence onOurConversation documents): a foreign or
+  // blacklisted tab listed ahead of ours must not hide the proof that our conversation exists.
+  // Only a non-blacklisted page rendering our EXACT marker proves that; any other modal hit is
+  // proof of the limiter alone.
+  const modalHits = reads.filter(({ text, throttleModal }) => throttleModal && text && text.trim() !== '');
+  if (modalHits.length > 0) {
+    const ownedHit = modalHits.find(({ tab, text }) => !nonMatching.has(tab.url) && hasExactMarker(text, marker));
+    const hit = ownedHit ?? modalHits[0];
+    tripThrottleEvidence(hit.tab.url, { kind: 'throttle', reason: 'modal', owned: !!ownedHit }, `modal over tab ${hit.tab.url}`);
+  }
   for (const { tab, text, infrastructureError } of reads) {
     if (text === null || text.trim() === '') { deadTabs.push(tab); continue; }
     if (isThrottlePage(text)) tripThrottle(`tab ${tab.url}`);
@@ -1333,7 +1394,7 @@ while (Date.now() < deadline) {
         + `conversation (${revalidateUrl}) — spending the one canonical revalidation there instead`);
     }
     const fresh = await revalidateReadableStaleSource(revalidateUrl);
-    if (fresh?.kind === 'throttle') tripThrottle(`canonical scratch ${revalidateUrl}`);
+    if (fresh?.kind === 'throttle') tripThrottleEvidence(revalidateUrl, fresh, `canonical scratch ${revalidateUrl}`);
     if (fresh?.kind === 'cross-bound') {
       rejectCrossBound(revalidateUrl, fresh.foreignMarker, 'canonical scratch');
       // Only null the signal when the rejected URL IS the tab we were scanning: a rejected
@@ -1392,9 +1453,9 @@ while (Date.now() < deadline) {
     nextRenderAt.set(tab.url, Date.now() + RENDER_INTERVAL_MS);
     renders += 1;
     console.error(`tab unreadable (renderer dead?): ${tab.url} — re-rendering in a scratch tab...`);
-    const { text } = await freshRenderText(tab.url, port, deadline);
+    const { text, evidence: renderEvidence } = await freshRenderText(tab.url, port, deadline);
     if (!text) continue;
-    if (isThrottlePage(text)) tripThrottle(`fresh render ${tab.url}`);
+    if (renderEvidence?.kind === 'throttle') tripThrottleEvidence(tab.url, renderEvidence, `fresh render ${tab.url}`);
     if (!text.includes(marker)) {
       // Blacklist ONLY on positive evidence: the page carries someone
       // ELSE's run marker, proving it rendered a different review's
@@ -1445,10 +1506,10 @@ while (Date.now() < deadline) {
     nextRenderAt.set(seedUrl, Date.now() + RENDER_INTERVAL_MS);
     seededRenders += 1;
     console.error(`no open tab carries "${marker}" — re-rendering the remembered conversation ${seedUrl} (${seededRenders}/${MAX_SEEDED_RENDERS})...`);
-    const { text } = await freshRenderText(seedUrl, port, deadline);
+    const { text, evidence: renderEvidence } = await freshRenderText(seedUrl, port, deadline);
     if (text) {
-      const evidence = classifyEvidence(text);
-      if (evidence.kind === 'throttle') tripThrottle(`remembered render ${seedUrl}`);
+      const evidence = renderEvidence ?? classifyEvidence(text);
+      if (evidence.kind === 'throttle') tripThrottleEvidence(seedUrl, evidence, `remembered render ${seedUrl}`);
       if (evidence.kind === 'cross-bound') {
         // The memo itself is cross-bound. Evict it with claim-and-verify, but preserve a
         // concurrently republished survivor as the only possible genuine recovery handle.

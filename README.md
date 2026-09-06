@@ -297,6 +297,11 @@ transition only after immutable identity and charge agree. For pre-v0.31 empty s
 immutable binding and canonical run metadata are revalidated under the reservation lock before the
 proven charge is filled; marker mint time is not charge evidence. Other missing or mismatched proof
 remains fail-closed.
+When ChatGPT's "Too many requests" modal covers the conversation, the probe reports it as
+`throttled` rather than generating: the reservation keeps its miss count, the account cooldown
+engages, reservation probes pause until it clears, and `--harvest` defers with exit 8 instead of
+waiting out its window. A typed query during that cooldown returns `stop-without-new-review` /
+`account-cooldown-active` with the seconds remaining in `facts.cooldown`.
 Missing or malformed binding/GitHub proof leaves the review generating. Its plain states
 are **Review ready**, **Checking for completed review**, **Still working**, **Review superseded**,
 **No review remains**, and **Browser needs attention**. `Review superseded` means old-head or closed-PR
@@ -318,7 +323,7 @@ diagnosis; ordinary callers should use `/pro-gate recover` instead.
 | 5 | Diff fetch failed | no |
 | 6 | No usable current review. Check `detail`/`attempt`: recoverable work must be harvested; `not-submitted` was refunded; `submitted-terminal`, `recovery-exhausted`, or `superseded` remains charged but permits a fresh typed decision | maybe |
 | 7 | Per-change lock timeout (another run holds this change) | no |
-| 8 | Deferred: box unfit, low memory, or throttle cooldown; retry later | no |
+| 8 | Deferred: box unfit, low memory, or throttle cooldown (including ChatGPT's rate-limit modal over a live conversation); retry later | no |
 | 9 | In-progress: the model was still generating and the tab stays open. `--harvest` by marker; never submit a new review for it | yes |
 | 11 | Oversized diff, past `PRO_GATE_DIFF_HARD_MAX` (default 25,000 lines): scope the payload | no |
 | 12 | An explicitly enabled round policy denied this change. Default unset configuration is advisory; inspect `--status` for policy source | no |

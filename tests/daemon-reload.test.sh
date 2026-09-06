@@ -126,7 +126,7 @@ REVIEW_WORKERS=0; AGENT_TASKS=0
 daemon_run_review_worker(){ REVIEW_WORKERS=$((REVIEW_WORKERS + 1)); return 0; }
 daemon_agent_task_available(){ return 0; }
 daemon_run_agent_task(){ AGENT_TASKS=$((AGENT_TASKS + 1)); return 0; }
-for index in $(seq 0 7); do
+for index in $(seq 0 "$(jq '.cases | length - 1' "$HERE/fixtures/review-decision/v1/corpus.json")"); do
   decision="$TYPED_HOME/decision-$index.json"; typed_decision "$index" "$decision"
   action="$(jq -r .action "$decision")"; expected="$(jq -r ".cases[$index].expected.action" "$HERE/fixtures/review-decision/v1/corpus.json")"
   before_review="$REVIEW_WORKERS"; before_agent="$AGENT_TASKS"; before_state="$(wc -c < "$TYPED_STATE")"; before_fails="$(wc -c < "$TYPED_FAILS")"
@@ -178,7 +178,9 @@ for PROCESS_AGENT_RC in 1 2; do
 done
 PROCESS_AGENT_RC=0
 for action in collect-existing-result recover-existing-review stop-without-new-review allow-existing-merge-workflow ask-named-product-choice; do
-  index="$(jq -r --arg action "$action" '.cases | to_entries[] | select(.value.expected.action == $action) | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
+  # Several corpus cases can share an action (stop-without-new-review has a governor case and a
+  # cooldown case); the process-level assertion needs any one exemplar, so take the first.
+  index="$(jq -r --arg action "$action" 'first(.cases | to_entries[] | select(.value.expected.action == $action)) | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
   decision="$TYPED_HOME/process-$action.json"; typed_decision "$index" "$decision"
   : > "$TYPED_STATE"; : > "$TYPED_FAILS"
   MOCK_FRESH="$decision" MOCK_RECOVERED="$TYPED_HOME/process-recovered" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?

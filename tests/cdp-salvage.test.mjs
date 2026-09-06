@@ -22,6 +22,7 @@ import {
   buildArchiveConversationExpression,
   buildCancelOrganizerMutationExpression,
   buildRenameConversationExpression,
+  buildThrottleModalExpression,
   ORGANIZER_MUTATION_LEASE_MS,
 } from '../bin/cdp-organizer-expressions.mjs';
 import {
@@ -228,17 +229,26 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
       // without it every listed tab serves the same text, which cannot express "one tab is
       // ours and another is foreign" — the shape #68's ordering regression needs.
       if (extra && opts.tabText) value = opts.tabText(extra.url, extra.id) ?? value;
-      if (scratch && opts.renderText) {
+      const expression = request.params?.expression ?? '';
+      // A scratch "sample" is one DOM text read. The salvage also evaluates element probes
+      // (terminal-infrastructure, throttle-modal) against the same target each poll; those are
+      // answered by sentinel below and must not advance the ordered sample count fixtures assert.
+      if (scratch && opts.renderText && expression === 'document.body.innerText') {
         const n = (pollsByTab.get(id) ?? 0) + 1;
         pollsByTab.set(id, n);
         value = opts.renderText(scratch.url, n);
       }
-      const expression = request.params?.expression ?? '';
       let delayMs = 0;
       let armMutation = null;
       let applyMutation = null;
       if (expression.includes('pro-gate:terminal-infrastructure')) {
         value = opts.infrastructureError ?? null;
+      } else if (expression.includes('pro-gate:throttle-modal')) {
+        // #162: an ELEMENT read distinct from the page text. With no fixture value the evaluator
+        // sees no dialog — never the body — so quoted throttle copy cannot leak into a match.
+        value = typeof opts.throttleModal === 'function'
+          ? (opts.throttleModal(id, scratch?.url ?? extra?.url ?? 'https://chatgpt.com/c/mock-conversation') ?? null)
+          : (opts.throttleModal ?? null);
       } else if (expression.includes('pro-gate-organizer:rename')) {
         const expected = expectedTitleFromExpression(expression);
         const token = mutationTokenFromExpression(expression);
@@ -2412,6 +2422,144 @@ const FOREIGN_ANSWER = (m) => [
       r.crossbound === 0, `crossbound=${r.crossbound} stderr=${r.stderr?.slice(0, 300)}`);
     cdp.stop();
   }
+}
+
+{ // #162: the throttle-modal page expression itself, executed against a minimal DOM stand-in. The
+  // mock browsers answer this expression by sentinel, so this is the only place its element
+  // scoping (dialog-only, marker-free, visible, bounded) is actually exercised.
+  const expression = buildThrottleModalExpression();
+  const modal = "Too many requests. You're making requests too quickly. We've temporarily limited access to your conversations to protect your data. Please wait a few minutes before trying again.";
+  const node = (text, { rects = 1 } = {}) => ({
+    innerText: text, textContent: text, getClientRects: () => Array.from({ length: rects }),
+  });
+  const evaluate = (dialogs) => new Function('document', `return ${expression};`)({ querySelectorAll: () => dialogs });
+  check('modal expression carries the mock sentinel', expression.includes('pro-gate:throttle-modal'));
+  check('modal expression reads the throttle copy from a visible dialog', evaluate([node(modal)]) === modal,
+    `got=${evaluate([node(modal)])}`);
+  check('modal expression sees no dialog on a page that only quotes the copy in its body', evaluate([]) === null);
+  check('modal expression ignores a dialog that renders a run marker',
+    evaluate([node(`${modal}\nrun marker: ${MARKER}`)]) === null);
+  check('modal expression ignores a hidden dialog', evaluate([node(modal, { rects: 0 })]) === null);
+  check('modal expression ignores an unrelated dialog', evaluate([node('Rename conversation\nSave')]) === null);
+  check('modal expression ignores an oversized dialog', evaluate([node(`${modal}\n${'x'.repeat(2100)}`)]) === null);
+  check('modal expression picks the throttle dialog among several',
+    evaluate([node('Share link'), node(modal), node('Archive?')]) === modal);
+  // The caller re-runs THROTTLE_RE over the returned value: a match that sits past any fixed
+  // prefix must survive the round trip whole, or the modal goes undetected again.
+  const latePhrase = `${'Before you continue, please read this notice. '.repeat(8)}${modal}`;
+  check('modal expression returns the whole dialog text so a late match survives the caller recheck',
+    latePhrase.length > 300 && latePhrase.length < 2000 && evaluate([node(latePhrase)]) === latePhrase,
+    `length=${latePhrase.length}`);
+}
+
+{ // #162: ChatGPT's "Too many requests" modal shown OVER a real review conversation. The page is
+  // long (far past the interstitial guard's 5,000 characters) and carries this run's marker, so
+  // whole-page text shape can never call it a throttle; before this fix --probe read it as
+  // `generating` for six hours (PR #148, 2026-09-05) and --harvest exited 9 at its deadline.
+  const modal = "Too many requests. You're making requests too quickly. We've temporarily limited access to your conversations to protect your data. Please wait a few minutes before trying again.";
+  const reasoning = Array.from({ length: 120 }, (_, i) =>
+    `Reviewed concurrency risks in module ${i}: lock ordering, retry budgets, and reservation TTL handling.`).join('\n');
+  const conversation = `${modal}\nrun marker: ${MARKER}\n${reasoning}\nReviewed concurrency risks`;
+  check('modal fixture is longer than the interstitial guard and carries the marker',
+    conversation.length > 5000 && conversation.includes(MARKER), `length=${conversation.length}`);
+
+  const probed = await mockCdp(conversation, [], { throttleModal: modal });
+  const r = await runSalvage(['--probe', MARKER, '3'], probed.port);
+  check('probe under the throttle modal stays live (exit 0: a retry would double-spend)', r.status === 0,
+    `status=${r.status} stderr=${r.stderr?.slice(0, 300)}`);
+  check('probe under the throttle modal reports the closed throttled state, never generating',
+    /^probe-state: throttled$/m.test(r.stderr || '') && !/^probe-state: generating$/m.test(r.stderr || ''),
+    `stderr=${r.stderr?.slice(0, 300)}`);
+  check('probe under the throttle modal writes the account cooldown naming the modal',
+    /modal over tab/.test(r.cooldown ?? ''), `cooldown=${r.cooldown}`);
+  check('probe under the throttle modal opens no scratch render against the limited account',
+    probed.created.length === 0 && !probed.closed.includes('tab1'),
+    `created=${JSON.stringify(probed.created)} closed=${probed.closed}`);
+  probed.stop();
+
+  const harvested = await mockCdp(conversation, [], { throttleModal: modal });
+  const h = await runSalvage([MARKER, '3'], harvested.port);
+  check('salvage under the throttle modal takes the existing throttle exit (5) and keeps the tab',
+    h.status === 5 && !harvested.closed.includes('tab1') && /modal over tab/.test(h.cooldown ?? ''),
+    `status=${h.status} closed=${harvested.closed} cooldown=${h.cooldown}`);
+  check('salvage under the throttle modal prints no review', h.stdout === '', `stdout=${h.stdout}`);
+  harvested.stop();
+
+  // Planted negative: the same page shape with NO dialog element — the review merely quotes the
+  // limiter's copy. Text shape alone would flag it; element detection must not.
+  const quoting = `run marker: ${MARKER}\n${reasoning}\nThe engine's guard matches "You're making requests too quickly" and `
+    + '"temporarily limited access to your conversations"; both phrases appear here as review text.';
+  const quoted = await mockCdp(quoting);
+  const q = await runSalvage(['--probe', MARKER, '3'], quoted.port);
+  check('quoted throttle copy without a dialog still probes as generating with no cooldown',
+    q.status === 0 && /^probe-state: generating$/m.test(q.stderr || '') && q.cooldown === null,
+    `status=${q.status} cooldown=${q.cooldown} stderr=${q.stderr?.slice(0, 300)}`);
+  quoted.stop();
+  const finished = await mockCdp(`${quoting}\nP1: none\nVERDICT: SHIP — quotes the limiter copy. (run marker: ${MARKER})`);
+  const d = await runSalvage([MARKER, '3'], finished.port);
+  check('quoted throttle copy inside a finished review is still extracted (exit 0, no cooldown)',
+    d.status === 0 && /VERDICT: SHIP/.test(d.stdout) && d.cooldown === null,
+    `status=${d.status} cooldown=${d.cooldown} stdout=${d.stdout.slice(0, 120)}`);
+  finished.stop();
+
+  // The original interstitial guard's own false-positive case: a SHORT marker-less page quoting
+  // the copy is the interstitial, and a long marker-bearing page quoting it is not.
+  const shortQuote = `The guard matches "temporarily limited access to your conversations".`;
+  check('interstitial guard still treats a short marker-less page with the copy as the interstitial',
+    shortQuote.length < 5000 && !/pg-run-/.test(shortQuote));
+  const interstitial = await mockCdp(shortQuote);
+  const i = await runSalvage(['--probe', MARKER, '3'], interstitial.port);
+  check('short marker-less page with the copy keeps the existing interstitial exit (5)',
+    i.status === 5 && /tab /.test(i.cooldown ?? ''), `status=${i.status} cooldown=${i.cooldown}`);
+  interstitial.stop();
+
+  // The modal over ANOTHER run's conversation proves the limiter, not our conversation's
+  // existence: probe must not answer "live" for a page that renders a foreign marker.
+  const foreign = `${modal}\nrun marker: pg-run-other-1111111111-1\n${reasoning}`;
+  const foreignCdp = await mockCdp(foreign, [], { throttleModal: modal });
+  const f = await runSalvage(['--probe', MARKER, '3'], foreignCdp.port);
+  check("probe: modal over another run's conversation proves only the limiter (exit 5, cooldown written)",
+    f.status === 5 && /modal over tab/.test(f.cooldown ?? '') && !/^probe-state:/m.test(f.stderr || ''),
+    `status=${f.status} cooldown=${f.cooldown} stderr=${f.stderr?.slice(0, 200)}`);
+  foreignCdp.stop();
+
+  // The modal is account-wide, so with several tabs open it covers all of them. Ownership must be
+  // decided over the whole scan: a foreign conversation listed FIRST must not hide the proof that
+  // the second tab renders this run's marker.
+  const ownUrl = 'https://chatgpt.com/c/ours-under-the-modal';
+  const twoTabs = await mockCdp(`${modal}\nrun marker: pg-run-other-1111111111-1\n${reasoning}`,
+    [{ id: 'ours', url: ownUrl }],
+    { tabText: (url, id) => (id === 'ours' ? conversation : null), throttleModal: () => modal });
+  const two = await runSalvage(['--probe', MARKER, '3'], twoTabs.port);
+  check('probe: a foreign tab listed ahead of ours under the same modal still proves our conversation (live, throttled)',
+    two.status === 0 && /^probe-state: throttled$/m.test(two.stderr || '') && two.stderr.includes(`live conversation: ${ownUrl}`),
+    `status=${two.status} stderr=${two.stderr?.slice(0, 300)}`);
+  check('two-tab modal names the owned tab in the cooldown', (two.cooldown ?? '').includes(ownUrl), `cooldown=${two.cooldown}`);
+  twoTabs.stop();
+  const twoTabsBlacklisted = await mockCdp(`${modal}\nrun marker: pg-run-other-1111111111-1\n${reasoning}`,
+    [{ id: 'ours', url: ownUrl }],
+    { tabText: (url, id) => (id === 'ours' ? conversation : null), throttleModal: () => modal });
+  const seedBlacklist = (home) => fs.writeFileSync(path.join(home, 'salvage-nonmatching.txt'), `${MARKER}\t${ownUrl}\n`);
+  const blk = await runSalvage(['--probe', MARKER, '3'], twoTabsBlacklisted.port, seedBlacklist);
+  check('probe: a blacklisted marker-bearing tab under the modal proves only the limiter (exit 5)',
+    blk.status === 5 && !/^probe-state:/m.test(blk.stderr || ''), `status=${blk.status} stderr=${blk.stderr?.slice(0, 200)}`);
+  twoTabsBlacklisted.stop();
+
+  // A remembered conversation re-rendered in a scratch tab can come up under the modal too:
+  // the render must stop on the element, not fall through to "marker found, still generating".
+  const canonicalUrl = 'https://chatgpt.com/c/mock-conversation';
+  const scratchModal = await mockCdp('__NO_TABS__', [], {
+    renderText: () => conversation,
+    throttleModal: (id) => (id.startsWith('scratch') ? modal : null),
+  });
+  const sr = await runScratchSalvage(['--probe', MARKER, '3'], scratchModal.port, seedMemo(MARKER, canonicalUrl));
+  check('remembered render under the throttle modal probes as live but throttled',
+    sr.status === 0 && /^probe-state: throttled$/m.test(sr.stderr || '') && /remembered render/.test(sr.cooldown ?? ''),
+    `status=${sr.status} cooldown=${sr.cooldown} stderr=${sr.stderr?.slice(0, 300)}`);
+  check('remembered render under the throttle modal closes its scratch tab',
+    scratchModal.created.length === 1 && scratchModal.closed.includes(scratchModal.created[0].id),
+    `created=${JSON.stringify(scratchModal.created)} closed=${scratchModal.closed}`);
+  scratchModal.stop();
 }
 
 process.exit(failures === 0 ? 0 : 1);
