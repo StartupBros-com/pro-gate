@@ -760,6 +760,139 @@ check 'select still passes -m requested hint' "$(grep -q -- '-m gpt-5.6' "$TDIR/
 freshrun "$TDIR/home-u1c" "$TDIR/argv-archive.txt" "$EV_PRO" "$TDIR/o-u1c.md" current always
 check 'explicit PRO_GATE_BROWSER_ARCHIVE passes through unchanged' "$(grep -q -- '--browser-archive always' "$TDIR/argv-archive.txt"; echo $?)" "argv=$(head -1 "$TDIR/argv-archive.txt")"
 
+# #145: oracle's --browser-attachments (default auto) switches a bundle to a file upload past its
+# 60,000-char inline budget, and that upload path stalls. The engine pins oracle's default explicitly
+# and exposes PRO_GATE_BROWSER_ATTACHMENTS so an operator can keep text bundles inline (`never`).
+# Connector mode is deliberately unasserted: its engine line is a no-claim. Every call gets its own
+# fresh home, so no cleanup is needed between runs.
+attachrun() { # $1=home $2=argv-file $3=input [attachments-env]
+  mkdir -p "$1/in-progress"; : > "$2"; printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+  env ${4:+PRO_GATE_BROWSER_ATTACHMENTS="$4"} \
+    PRO_GATE_HOME="$1" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+    PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-evidence" PG_TEST_ARGV_FILE="$2" PG_TEST_EVIDENCE="$EV_PRO" NODE_OPTIONS= \
+    bash "$ENGINE" --diff "$TDIR/small.diff" --repo "$TDIR" --input "$3" --out "$TDIR/o-attach-$3${4:+-$4}.md" --timeout 5s \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+  RC=$?
+}
+echo '# #145: --browser-attachments seam'
+attachrun "$TDIR/home-attach-bundle" "$TDIR/argv-attach-bundle.txt" bundle
+check 'bundle mode passes --browser-attachments auto to oracle by default' \
+  "$([ "$RC" -eq 0 ] && grep -q -- '--browser-attachments auto' "$TDIR/argv-attach-bundle.txt"; echo $?)" "rc=$RC argv=$(head -1 "$TDIR/argv-attach-bundle.txt")"
+attachrun "$TDIR/home-attach-both" "$TDIR/argv-attach-both.txt" both
+check 'both mode passes --browser-attachments auto to oracle by default' \
+  "$([ "$RC" -eq 0 ] && grep -q -- '--browser-attachments auto' "$TDIR/argv-attach-both.txt"; echo $?)" "rc=$RC argv=$(head -1 "$TDIR/argv-attach-both.txt")"
+attachrun "$TDIR/home-attach-bundle-never" "$TDIR/argv-attach-bundle-never.txt" bundle never
+check 'PRO_GATE_BROWSER_ATTACHMENTS=never overrides the bundle default' \
+  "$([ "$RC" -eq 0 ] && grep -q -- '--browser-attachments never' "$TDIR/argv-attach-bundle-never.txt" && ! grep -q -- '--browser-attachments auto' "$TDIR/argv-attach-bundle-never.txt"; echo $?)" \
+  "rc=$RC argv=$(head -1 "$TDIR/argv-attach-bundle-never.txt")"
+attachrun "$TDIR/home-attach-both-never" "$TDIR/argv-attach-both-never.txt" both never
+check 'PRO_GATE_BROWSER_ATTACHMENTS=never overrides the both default' \
+  "$([ "$RC" -eq 0 ] && grep -q -- '--browser-attachments never' "$TDIR/argv-attach-both-never.txt" && ! grep -q -- '--browser-attachments auto' "$TDIR/argv-attach-both-never.txt"; echo $?)" \
+  "rc=$RC argv=$(head -1 "$TDIR/argv-attach-both-never.txt")"
+
+# #150: the classic CLI path (--pr, no --diff) fetches the endpoint patch itself and used to install
+# a full-pr merge proof even for --input connector, where FILE_ARGS never attached those bytes to the
+# review. The binding is now gated on bundle|both; the bundle run is the planted negative proving the
+# identical setup does earn one. Both runs use fresh homes, the fake completing oracle, and a fake gh
+# through PRO_GATE_GH_BIN (pg_augment_path puts the real gh ahead of any PATH prefix a test could add).
+echo '# #150: classic --input connector run installs no full-pr binding'
+CLASSIC_REPO="$TDIR/classic-repo"; mkdir -p "$CLASSIC_REPO"
+git -C "$CLASSIC_REPO" init -q
+git -C "$CLASSIC_REPO" config user.email test@example.invalid
+git -C "$CLASSIC_REPO" config user.name 'Engine Test'
+printf 'one\n' > "$CLASSIC_REPO/file.txt"; git -C "$CLASSIC_REPO" add file.txt; git -C "$CLASSIC_REPO" commit -qm base
+printf 'two\n' > "$CLASSIC_REPO/file.txt"; git -C "$CLASSIC_REPO" add file.txt; git -C "$CLASSIC_REPO" commit -qm head
+git -C "$CLASSIC_REPO" remote add origin https://github.com/acme/classic.git
+git -C "$CLASSIC_REPO" diff HEAD^ HEAD > "$TDIR/classic-endpoint.patch"
+CLASSIC_GH_DIR="$TDIR/gh-classic"; mkdir -p "$CLASSIC_GH_DIR"
+cat > "$CLASSIC_GH_DIR/gh" <<'FAKE_GH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${PG_TEST_GH_CALLS:-/dev/null}"
+case "$1 $2" in
+  'pr view')
+    # The engine asks this endpoint two different questions: --json url for PR_URL on the classic
+    # path, and --json state,headRefOid for recovery's supersession proof. Answer by requested field.
+    case "$*" in
+      *state,headRefOid*) jq -nc --arg state "${PG_TEST_GH_STATE:-OPEN}" --arg head "${PG_TEST_GH_HEAD:-}" '{state:$state,headRefOid:$head}' ;;
+      *) printf 'https://github.com/acme/classic/pull/%s\n' "$3" ;;
+    esac ;;
+  'pr diff') cat "${PG_TEST_GH_DIFF:?}" ;;
+  *) echo "unexpected gh invocation: $*" >&2; exit 1 ;;
+esac
+FAKE_GH
+chmod +x "$CLASSIC_GH_DIR/gh"
+classicrun() { # $1=home $2=input
+  mkdir -p "$1/in-progress"; printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+  env PRO_GATE_GH_BIN="$CLASSIC_GH_DIR/gh" PG_TEST_GH_DIFF="$TDIR/classic-endpoint.patch" \
+    PRO_GATE_HOME="$1" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+    PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-evidence" PG_TEST_ARGV_FILE="$TDIR/argv-classic-$2.txt" PG_TEST_EVIDENCE="$EV_PRO" NODE_OPTIONS= \
+    bash "$ENGINE" --pr 4242 --repo "$CLASSIC_REPO" --input "$2" --out "$TDIR/o-classic-$2.md" --timeout 5s \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+  RC=$?
+}
+classicrun "$TDIR/home-classic-connector" connector
+check 'classic --input connector without --diff completes on the engine-fetched patch' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+CLASSIC_CONNECTOR_BINDING="$(find "$TDIR/home-classic-connector/review-input-bindings" -type f 2>/dev/null | head -1)"
+CLASSIC_HEAD="$(git -C "$CLASSIC_REPO" rev-parse HEAD)"
+check 'classic --input connector without --diff installs no full-pr input binding' \
+  "$([ -n "$CLASSIC_CONNECTOR_BINDING" ] && jq -e '.evidence.mode!="full-pr"' "$CLASSIC_CONNECTOR_BINDING" >/dev/null 2>&1; echo $?)" \
+  "binding=$(cat "$CLASSIC_CONNECTOR_BINDING" 2>/dev/null)"
+# gate #159 r1 P1: mode correctness is not lifecycle identity. Skipping the record entirely left the
+# attempt with no immutable binding, and both recover_superseded_reason and pg_reservation_supersede
+# refuse a marker without one — so an obsolete connector attempt could never release its capacity.
+# The record it now writes is the same connector relation the typed path already produces.
+check 'gate #159 r1 P1: classic connector run installs a connector-mode lifecycle binding with null patch digests' \
+  "$([ -n "$CLASSIC_CONNECTOR_BINDING" ] && jq -e --arg head "$CLASSIC_HEAD" \
+     '.evidence.mode=="connector" and .evidence.proof.commit_target==$head and .target.head_oid==$head
+      and .evidence.proof.repository_target=="github.com/acme/classic" and .evidence.proof.endpoint_digest==null
+      and .evidence.proof.raw_diff_digest==null and .repository.owner=="acme" and .repository.repo=="classic"
+      and .target.pr==4242 and (.charged_spend_epoch|type=="number" and .>0)' \
+     "$CLASSIC_CONNECTOR_BINDING" >/dev/null 2>&1; echo $?)" \
+  "head=$CLASSIC_HEAD binding=$(cat "$CLASSIC_CONNECTOR_BINDING" 2>/dev/null)"
+# The other half of the fix: a lifecycle record must not become merge proof. The fixture oracle
+# returns SHIP, so this run has completed bytes whose result binding would carry a ship_proof in a
+# delivered-bytes mode; pg_review_decision_ship_mode_bindable must keep the connector run without one.
+check 'gate #159 r1 P1: a connector SHIP still earns no result binding (no merge proof)' \
+  "$(! find "$TDIR/home-classic-connector/review-result-bindings" -type f 2>/dev/null | grep -q .; echo $?)" \
+  "result-bindings=$(find "$TDIR/home-classic-connector/review-result-bindings" -type f 2>/dev/null | tr '\n' ' ') verdict=$(grep -m1 VERDICT "$TDIR/home-classic-connector/completed/$(ls -1 "$TDIR/home-classic-connector/completed" 2>/dev/null | head -1)" 2>/dev/null)"
+# The lifecycle claim end to end: put that same charged run back into the in-progress shape a stuck
+# review leaves (charged reservation, no result bytes), move the PR head on GitHub, and require exact
+# recovery to supersede it and hand the slot back. Before the fix this reported "Browser needs
+# attention" (exit 3) with the reservation still generating and one slot held.
+CLASSIC_REC_MARKER="$(ls -1 "$TDIR/home-classic-connector/run-meta" 2>/dev/null | head -1)"
+IFS=$'\t' read -r _ _ _ CLASSIC_REC_KEY _ CLASSIC_REC_OUT CLASSIC_REC_SPEND \
+  < "$TDIR/home-classic-connector/run-meta/$CLASSIC_REC_MARKER"
+rm -f "$TDIR/home-classic-connector/completed/$CLASSIC_REC_MARKER"
+printf '%s\t%s\t%s\t0\t1\tGPT-X\t%s\tgenerating\n' \
+  "$CLASSIC_REC_KEY" "$CLASSIC_REC_OUT" "$(date +%s)" "$CLASSIC_REC_SPEND" \
+  > "$TDIR/home-classic-connector/in-progress/$CLASSIC_REC_MARKER"
+: > "$TDIR/classic-recover-gh.calls"
+env PRO_GATE_HOME="$TDIR/home-classic-connector" ORACLE_BROWSER_PORT=65530 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_HARVEST_TTL_SWEEP=0 PRO_GATE_RECONCILE_INTERVAL=0 PRO_GATE_GH_BIN="$CLASSIC_GH_DIR/gh" \
+  PG_TEST_GH_CALLS="$TDIR/classic-recover-gh.calls" PG_TEST_GH_STATE=OPEN \
+  PG_TEST_GH_HEAD=0000000000000000000000000000000000000042 NODE_OPTIONS= \
+  bash "$ENGINE" --recover "$CLASSIC_REC_MARKER" --timeout 1s \
+  >"$TDIR/classic-recover.out" 2>"$TDIR/classic-recover.err"
+CLASSIC_REC_RC=$?
+check 'gate #159 r1 P1: recovery supersedes an in-progress classic connector run whose PR head moved' \
+  "$([ "$CLASSIC_REC_RC" -eq 6 ] && grep -qx 'Review superseded' "$TDIR/classic-recover.err" \
+     && grep -qF 'pr view 4242 --repo github.com/acme/classic --json state,headRefOid' "$TDIR/classic-recover-gh.calls" \
+     && [ "$(awk -F'\t' 'NR==1{print $8}' "$TDIR/home-classic-connector/in-progress/$CLASSIC_REC_MARKER")" = superseded ]; echo $?)" \
+  "rc=$CLASSIC_REC_RC stderr=$(cat "$TDIR/classic-recover.err") record=$(cat "$TDIR/home-classic-connector/in-progress/$CLASSIC_REC_MARKER" 2>/dev/null) gh=$(cat "$TDIR/classic-recover-gh.calls")"
+# The lib is not sourced into this shell until much later in the file; use the subshell idiom.
+classic_res_count() { PRO_GATE_HOME="$TDIR/home-classic-connector" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; $1"; }
+check 'gate #159 r1 P1: superseded classic connector attempt releases its review capacity' \
+  "$([ "$(classic_res_count pg_reservation_holding_count)" -eq 0 ] \
+     && [ "$(classic_res_count pg_reservation_count)" -eq 1 ]; echo $?)" \
+  "holding=$(classic_res_count pg_reservation_holding_count) total=$(classic_res_count pg_reservation_count)"
+classicrun "$TDIR/home-classic-bundle" bundle
+CLASSIC_BUNDLE_BINDING="$(find "$TDIR/home-classic-bundle/review-input-bindings" -type f 2>/dev/null | head -1)"
+check 'planted negative: classic --input bundle with the same setup installs a full-pr binding' \
+  "$([ "$RC" -eq 0 ] && [ -n "$CLASSIC_BUNDLE_BINDING" ] && jq -e --arg digest "$(sha256sum "$TDIR/classic-endpoint.patch" | awk '{print $1}')" '.evidence.mode=="full-pr" and .evidence.proof.endpoint_digest==$digest and .repository.owner=="acme" and .repository.repo=="classic" and .target.pr==4242' "$CLASSIC_BUNDLE_BINDING" >/dev/null 2>&1; echo $?)" \
+  "rc=$RC binding=$(cat "$CLASSIC_BUNDLE_BINDING" 2>/dev/null) stderr=$(tail -3 "$TDIR/stderr")"
+
 # Fallback: a `select` run whose requested model is not selectable (oracle emits "... in the model
 # switcher") must auto-fall-back to `current` and still produce a review, not fail the whole run
 # (dogfood 2026-07-17, PR #32: `select` + gpt-5.6 -> "Unable to find model option matching
@@ -4601,19 +4734,32 @@ UNKNOWN_OUT="$(rd_reduce "$UNKNOWN_FACTS")"
 check 'unknown decision contract stops closed' \
   "$(jq -e '.action == "stop-without-new-review" and .reason == "unknown-contract"' <<<"$UNKNOWN_OUT" >/dev/null 2>&1; echo $?)" "$UNKNOWN_OUT"
 
-LEGACY_COLLECT='{"completed_results":[{"applicable":false,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binding_valid":false,"canonical_identity":"legacy-a","charged_spend_epoch":1700000100,"collected":false,"legacy":true,"marker":"pg-run-legacy-1983-1700000100-1","provenance_valid":false,"verdict":"SHIP"}]}'
+LEGACY_COLLECT='{"completed_results":[{"applicable":false,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bindable":true,"binding_valid":false,"canonical_identity":"legacy-a","charged_spend_epoch":1700000100,"collected":false,"evidence_mode":"none","legacy":true,"marker":"pg-run-legacy-1983-1700000100-1","provenance_valid":false,"verdict":"SHIP"}]}'
 LEGACY_COLLECT_OUT="$(rd_reduce "$(rd_facts "$LEGACY_COLLECT")")"
 check 'legacy completed artifact remains collectable' \
   "$(jq -e '.action == "collect-existing-result"' <<<"$LEGACY_COLLECT_OUT" >/dev/null 2>&1; echo $?)" "$LEGACY_COLLECT_OUT"
 rd_expect_stop 'legacy SHIP cannot authorize merge eligibility or paid continuation' \
   '{"prior_review":{"applicable":true,"binding_valid":false,"code_identity":"input-current","evidence_identity":"evidence-current","legacy":true,"marker":"pg-run-legacy-1983-1-1","provenance_valid":false,"verdict":"SHIP"}}' 'legacy-not-authoritative'
 
-SELECT_PATCH='{"completed_results":[{"applicable":true,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binding_valid":true,"canonical_identity":"result-a","charged_spend_epoch":1700000200,"collected":false,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000200-1","provenance_valid":true,"verdict":"SHIP"},{"applicable":true,"artifact_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","binding_valid":true,"canonical_identity":"result-b","charged_spend_epoch":1700000201,"collected":false,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000201-2","provenance_valid":true,"verdict":"FIX-FIRST"}]}'
+SELECT_PATCH='{"completed_results":[{"applicable":true,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bindable":true,"binding_valid":true,"canonical_identity":"result-a","charged_spend_epoch":1700000200,"collected":false,"evidence_mode":"full-pr","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000200-1","provenance_valid":true,"verdict":"SHIP"},{"applicable":true,"artifact_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","bindable":true,"binding_valid":true,"canonical_identity":"result-b","charged_spend_epoch":1700000201,"collected":false,"evidence_mode":"full-pr","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000201-2","provenance_valid":true,"verdict":"FIX-FIRST"}]}'
 SELECT_OUT="$(rd_reduce "$(rd_facts "$SELECT_PATCH")")"
 check 'newest charged completed result and canonical identity are selected' \
   "$(jq -e '.action == "collect-existing-result" and .effect_request.applicable_ref == "result-b"' <<<"$SELECT_OUT" >/dev/null 2>&1; echo $?)" "$SELECT_OUT"
 rd_expect_stop 'unresolved completed-result identity tie stops closed' \
-  '{"completed_results":[{"applicable":true,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binding_valid":true,"canonical_identity":"same","charged_spend_epoch":1700000300,"collected":false,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000300-1","provenance_valid":true,"verdict":"SHIP"},{"applicable":true,"artifact_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","binding_valid":true,"canonical_identity":"same","charged_spend_epoch":1700000300,"collected":false,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000300-2","provenance_valid":true,"verdict":"SHIP"}]}' 'completed-result-tie'
+  '{"completed_results":[{"applicable":true,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bindable":true,"binding_valid":true,"canonical_identity":"same","charged_spend_epoch":1700000300,"collected":false,"evidence_mode":"full-pr","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000300-1","provenance_valid":true,"verdict":"SHIP"},{"applicable":true,"artifact_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","bindable":true,"binding_valid":true,"canonical_identity":"same","charged_spend_epoch":1700000300,"collected":false,"evidence_mode":"full-pr","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000300-2","provenance_valid":true,"verdict":"SHIP"}]}' 'completed-result-tie'
+
+# #147: an uncollected result whose evidence mode can never carry merge proof is unrepairable. The
+# reducer must say so in a closed reason that names the mode and marker, never re-issue collect.
+NOT_BINDABLE_PATCH='{"completed_results":[{"applicable":true,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bindable":false,"binding_valid":false,"canonical_identity":"pg-run-acme-widgets-1983-1700000350-1","charged_spend_epoch":1700000350,"collected":false,"evidence_mode":"connector","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000350-1","provenance_valid":false,"verdict":"NONE"}]}'
+NOT_BINDABLE_OUT="$(rd_reduce "$(rd_facts "$NOT_BINDABLE_PATCH")")"
+check 'uncollected result that can never bind stops typed with its mode and marker, never collects' \
+  "$(jq -e '.action == "stop-without-new-review" and .reason == "result-not-bindable-for-mode" and .effect_request.execution_class == "report-only" and .effect_request.applicable_ref == "pg-run-acme-widgets-1983-1700000350-1" and .facts.completed_results[0].evidence_mode == "connector" and .facts.completed_results[0].marker == "pg-run-acme-widgets-1983-1700000350-1"' <<<"$NOT_BINDABLE_OUT" >/dev/null 2>&1; echo $?)" "$NOT_BINDABLE_OUT"
+check 'result-not-bindable-for-mode is enumerated by the frozen contract' \
+  "$(jq -e '.reasons | index("result-not-bindable-for-mode") != null' "$RD_CONTRACT" >/dev/null 2>&1; echo $?)"
+BINDABLE_PATCH="$(jq -c '.completed_results[0].bindable=true' <<<"$NOT_BINDABLE_PATCH")"
+BINDABLE_OUT="$(rd_reduce "$(rd_facts "$BINDABLE_PATCH")")"
+check 'the same uncollected result marked bindable still collects' \
+  "$(jq -e '.action == "collect-existing-result" and .reason == "completed-result-awaits-collection"' <<<"$BINDABLE_OUT" >/dev/null 2>&1; echo $?)" "$BINDABLE_OUT"
 
 rd_expect_stop 'identical verified code and evidence cannot authorize another review' \
   '{"prior_review":{"applicable":false,"binding_valid":true,"code_identity":"input-current","evidence_identity":"evidence-current","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000400-1","provenance_valid":true,"verdict":"NONE"}}' 'identical-code-and-evidence'
@@ -5717,12 +5863,12 @@ check 'stale run-granted advisory re-reduces a moved head without charge or Orac
 # selection case did not cover. These remain pure snapshots: race/restart fixture setup belongs
 # to U2's guarded-effect tests above.
 echo '# U3: review-decision precedence and recovery-state conformance'
-SAME_EPOCH_ORDER_PATCH='{"completed_results":[{"applicable":true,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binding_valid":true,"canonical_identity":"canonical-a","charged_spend_epoch":1700000900,"collected":false,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000900-1","provenance_valid":true,"verdict":"SHIP"},{"applicable":true,"artifact_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","binding_valid":true,"canonical_identity":"canonical-z","charged_spend_epoch":1700000900,"collected":false,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000900-2","provenance_valid":true,"verdict":"FIX-FIRST"}]}'
+SAME_EPOCH_ORDER_PATCH='{"completed_results":[{"applicable":true,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bindable":true,"binding_valid":true,"canonical_identity":"canonical-a","charged_spend_epoch":1700000900,"collected":false,"evidence_mode":"full-pr","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000900-1","provenance_valid":true,"verdict":"SHIP"},{"applicable":true,"artifact_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","bindable":true,"binding_valid":true,"canonical_identity":"canonical-z","charged_spend_epoch":1700000900,"collected":false,"evidence_mode":"full-pr","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000900-2","provenance_valid":true,"verdict":"FIX-FIRST"}]}'
 SAME_EPOCH_ORDER_OUT="$(rd_reduce "$(rd_facts "$SAME_EPOCH_ORDER_PATCH")")"
 check 'same charged epoch deterministically selects canonical identity before collection' \
   "$(jq -e '.action == "collect-existing-result" and .effect_request.applicable_ref == "canonical-z"' <<<"$SAME_EPOCH_ORDER_OUT" >/dev/null 2>&1; echo $?)" "$SAME_EPOCH_ORDER_OUT"
 
-COMPLETED_BEATS_ACTIVE_PATCH='{"active_index":{"binding_valid":true,"charged_spend_epoch":1700000902,"marker":"pg-run-acme-widgets-1983-1700000902-2","state":"charged"},"completed_results":[{"applicable":true,"artifact_digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","binding_valid":true,"canonical_identity":"completed-first","charged_spend_epoch":1700000901,"collected":false,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000901-1","provenance_valid":true,"verdict":"SHIP"}]}'
+COMPLETED_BEATS_ACTIVE_PATCH='{"active_index":{"binding_valid":true,"charged_spend_epoch":1700000902,"marker":"pg-run-acme-widgets-1983-1700000902-2","state":"charged"},"completed_results":[{"applicable":true,"artifact_digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","bindable":true,"binding_valid":true,"canonical_identity":"completed-first","charged_spend_epoch":1700000901,"collected":false,"evidence_mode":"full-pr","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000901-1","provenance_valid":true,"verdict":"SHIP"}]}'
 COMPLETED_BEATS_ACTIVE_OUT="$(rd_reduce "$(rd_facts "$COMPLETED_BEATS_ACTIVE_PATCH")")"
 check 'uncollected current result wins over newer active work without a fresh review' \
   "$(jq -e '.action == "collect-existing-result" and .effect_request.applicable_ref == "completed-first"' <<<"$COMPLETED_BEATS_ACTIVE_OUT" >/dev/null 2>&1; echo $?)" "$COMPLETED_BEATS_ACTIVE_OUT"
@@ -5928,5 +6074,357 @@ CONNECTOR_PENDING_RC=$?
 check 'exact pending connector SHIP is collect-only and never merge eligible' \
   "$([ "$CONNECTOR_PENDING_RC" -eq 0 ] && jq -e '.action=="collect-existing-result" and .action!="allow-existing-merge-workflow"' "$TDIR/connector-pending.json" >/dev/null 2>&1; echo $?)" \
   "rc=$CONNECTOR_PENDING_RC output=$(cat "$TDIR/connector-pending.json") stderr=$(cat "$TDIR/connector-pending.err")"
+
+# #147: a connector-delivered SHIP that reached completed/ can never be bound (no merge proof exists
+# for that mode), so the typed answer is a closed stop naming the mode and marker, not an endless
+# collect-existing-result. A FIX-FIRST connector result still binds (null proof) and routes to the
+# fixer, and a full-pr SHIP still repairs to the merge handoff. Every row below is built at the
+# repository's current head so each case is exact rather than a vacuous non-match.
+echo '# #147: unrepairable completed results stop typed instead of collecting forever'
+NB_HEAD="$(git -C "$DECISION_REPO" rev-parse HEAD)"
+NB_BASE="$(git -C "$DECISION_REPO" rev-parse HEAD^)"
+nb_connector_binding() { # marker epoch
+  jq -cS --arg marker "$1" --argjson epoch "$2" --arg head "$NB_HEAD" '.marker=$marker | .charged_spend_epoch=$epoch | .target.head_oid=$head | .evidence.identity=("connector:github.com/acme/widgets:" + $head) | .evidence.proof.commit_target=$head' <<<"$PC_CONNECTOR"
+}
+# (a) connector SHIP in completed/ with no result binding: typed stop, never collect, never merge.
+NB_SHIP_HOME="$TDIR/home-not-bindable-ship"; NB_SHIP_MARKER='pg-run-acme-widgets-1983-1700019000-1'
+mkdir -p "$NB_SHIP_HOME/completed"
+printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — connector observation.' > "$NB_SHIP_HOME/completed/$NB_SHIP_MARKER"
+NB_SHIP_BINDING="$(nb_connector_binding "$NB_SHIP_MARKER" 1700019000)"
+PRO_GATE_HOME="$NB_SHIP_HOME" pg_review_input_binding_write "$NB_SHIP_MARKER" "$NB_SHIP_BINDING"
+env PRO_GATE_HOME="$NB_SHIP_HOME" PRO_GATE_RUN_LOGS=0 bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --input connector >"$TDIR/nb-ship.json" 2>"$TDIR/nb-ship.err"
+NB_SHIP_RC=$?
+check 'connector SHIP in completed/ reduces to a typed stop with reason result-not-bindable-for-mode' \
+  "$([ "$NB_SHIP_RC" -eq 0 ] && jq -e '.action=="stop-without-new-review" and .reason=="result-not-bindable-for-mode" and .effect_request.execution_class=="report-only"' "$TDIR/nb-ship.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$NB_SHIP_RC output=$(cat "$TDIR/nb-ship.json") stderr=$(cat "$TDIR/nb-ship.err")"
+check 'typed stop carries the connector mode and the exact marker in its facts' \
+  "$(jq -e --arg marker "$NB_SHIP_MARKER" '.effect_request.applicable_ref==$marker and (.facts.completed_results|length==1) and .facts.completed_results[0].marker==$marker and .facts.completed_results[0].evidence_mode=="connector" and .facts.completed_results[0].bindable==false and .facts.completed_results[0].collected==false' "$TDIR/nb-ship.json" >/dev/null 2>&1; echo $?)" \
+  "output=$(cat "$TDIR/nb-ship.json")"
+# Replaying the stop as an effect is inert: no binding is repaired, nothing is written, no drift.
+NB_SHIP_STATE_BEFORE="$(find "$NB_SHIP_HOME" -mindepth 1 -printf '%P\n' | sort)"
+env PRO_GATE_HOME="$NB_SHIP_HOME" PRO_GATE_RUN_LOGS=0 bash "$ENGINE" --review-decision --review-decision-effect "$TDIR/nb-ship.json" --repo "$DECISION_REPO" --pr 1983 --input connector >"$TDIR/nb-ship-effect.json" 2>"$TDIR/nb-ship-effect.err"
+NB_SHIP_EFFECT_RC=$?
+NB_SHIP_STATE_AFTER="$(find "$NB_SHIP_HOME" -mindepth 1 -printf '%P\n' | sort)"
+check 'connector SHIP stop never repairs a result binding or becomes merge eligibility' \
+  "$([ "$NB_SHIP_EFFECT_RC" -eq 0 ] && [ "$NB_SHIP_STATE_AFTER" = "$NB_SHIP_STATE_BEFORE" ] && [ ! -e "$NB_SHIP_HOME/review-result-bindings/$NB_SHIP_MARKER" ] && jq -e '.action=="stop-without-new-review" and .reason=="result-not-bindable-for-mode"' "$TDIR/nb-ship-effect.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$NB_SHIP_EFFECT_RC output=$(cat "$TDIR/nb-ship-effect.json") stderr=$(cat "$TDIR/nb-ship-effect.err")"
+# (b) connector FIX-FIRST in completed/ is bindable: collect, repair with a null proof, then fix.
+NB_FIX_HOME="$TDIR/home-not-bindable-fix"; NB_FIX_MARKER='pg-run-acme-widgets-1983-1700019001-2'
+mkdir -p "$NB_FIX_HOME/completed"
+printf '%s\n' '[P1] a.sh:1 — fixture finding' 'P2: none' 'VERDICT: FIX-FIRST — connector observation.' > "$NB_FIX_HOME/completed/$NB_FIX_MARKER"
+NB_FIX_BINDING="$(nb_connector_binding "$NB_FIX_MARKER" 1700019001)"
+PRO_GATE_HOME="$NB_FIX_HOME" pg_review_input_binding_write "$NB_FIX_MARKER" "$NB_FIX_BINDING"
+env PRO_GATE_HOME="$NB_FIX_HOME" PRO_GATE_RUN_LOGS=0 bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --input connector >"$TDIR/nb-fix-collect.json" 2>"$TDIR/nb-fix-collect.err"
+NB_FIX_COLLECT_RC=$?
+check 'connector FIX-FIRST in completed/ is still collectable and marked bindable' \
+  "$([ "$NB_FIX_COLLECT_RC" -eq 0 ] && jq -e '.action=="collect-existing-result" and .reason=="completed-result-awaits-collection" and .facts.completed_results[0].bindable==true and .facts.completed_results[0].evidence_mode=="connector"' "$TDIR/nb-fix-collect.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$NB_FIX_COLLECT_RC output=$(cat "$TDIR/nb-fix-collect.json") stderr=$(cat "$TDIR/nb-fix-collect.err")"
+env PRO_GATE_HOME="$NB_FIX_HOME" PRO_GATE_RUN_LOGS=0 bash "$ENGINE" --review-decision --review-decision-effect "$TDIR/nb-fix-collect.json" --repo "$DECISION_REPO" --pr 1983 --input connector >"$TDIR/nb-fix-repair.json" 2>"$TDIR/nb-fix-repair.err"
+env PRO_GATE_HOME="$NB_FIX_HOME" PRO_GATE_RUN_LOGS=0 bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --input connector >"$TDIR/nb-fix-current.json" 2>"$TDIR/nb-fix-current.err"
+NB_FIX_CURRENT_RC=$?
+check 'repaired connector FIX-FIRST reduces to fix-review-findings' \
+  "$([ "$NB_FIX_CURRENT_RC" -eq 0 ] && [ -f "$NB_FIX_HOME/review-result-bindings/$NB_FIX_MARKER" ] && jq -e '.action=="fix-review-findings" and .reason=="review-findings-require-fix" and .facts.completed_results[0].collected==true and .facts.completed_results[0].evidence_mode=="connector"' "$TDIR/nb-fix-current.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$NB_FIX_CURRENT_RC repair=$(cat "$TDIR/nb-fix-repair.json") current=$(cat "$TDIR/nb-fix-current.json") stderr=$(cat "$TDIR/nb-fix-current.err")"
+# (c) full-pr SHIP in completed/ keeps its collect -> repair -> merge-handoff path unchanged.
+NB_FULL_HOME="$TDIR/home-not-bindable-full"; NB_FULL_MARKER='pg-run-acme-widgets-1983-1700019002-3'
+git -C "$DECISION_REPO" diff "$NB_BASE" "$NB_HEAD" > "$TDIR/nb-full.patch"
+NB_FULL_DIGEST="$(sha256sum "$TDIR/nb-full.patch" | awk '{print $1}')"
+NB_FULL_BINDING="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg marker "$NB_FULL_MARKER" --arg base "$NB_BASE" --arg head "$NB_HEAD" --arg digest "$NB_FULL_DIGEST" '{charged_spend_epoch:1700019002,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("full-pr:"+$base+":"+$head),mode:"full-pr",proof:{base_oid:$base,endpoint_digest:$digest,head_oid:$head,raw_patch_digest:$digest}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:"github.com",owner:"acme",repo:"widgets"},target:{head_oid:$head,kind:"pull-request",pr:1983}}')"
+mkdir -p "$NB_FULL_HOME/completed"
+printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — full endpoint reviewed.' > "$NB_FULL_HOME/completed/$NB_FULL_MARKER"
+PRO_GATE_HOME="$NB_FULL_HOME" pg_review_input_binding_write "$NB_FULL_MARKER" "$NB_FULL_BINDING"
+env PRO_GATE_HOME="$NB_FULL_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/nb-full.patch" bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/nb-full.patch" --input bundle >"$TDIR/nb-full-collect.json" 2>"$TDIR/nb-full-collect.err"
+NB_FULL_COLLECT_RC=$?
+check 'full-pr SHIP in completed/ is collectable and marked bindable' \
+  "$([ "$NB_FULL_COLLECT_RC" -eq 0 ] && jq -e '.action=="collect-existing-result" and .facts.completed_results[0].bindable==true and .facts.completed_results[0].evidence_mode=="full-pr"' "$TDIR/nb-full-collect.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$NB_FULL_COLLECT_RC output=$(cat "$TDIR/nb-full-collect.json") stderr=$(cat "$TDIR/nb-full-collect.err")"
+env PRO_GATE_HOME="$NB_FULL_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/nb-full.patch" bash "$ENGINE" --review-decision --review-decision-effect "$TDIR/nb-full-collect.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/nb-full.patch" --input bundle >"$TDIR/nb-full-repair.json" 2>"$TDIR/nb-full-repair.err"
+env PRO_GATE_HOME="$NB_FULL_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/nb-full.patch" bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/nb-full.patch" --input bundle >"$TDIR/nb-full-current.json" 2>"$TDIR/nb-full-current.err"
+NB_FULL_CURRENT_RC=$?
+check 'repaired full-pr SHIP still reduces to allow-existing-merge-workflow' \
+  "$([ "$NB_FULL_CURRENT_RC" -eq 0 ] && jq -e '.action=="allow-existing-merge-workflow" and .reason=="current-ship-is-merge-eligible"' "$TDIR/nb-full-current.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$NB_FULL_CURRENT_RC repair=$(cat "$TDIR/nb-full-repair.json") current=$(cat "$TDIR/nb-full-current.json") stderr=$(cat "$TDIR/nb-full-current.err")"
+
+# #159 r1 P1: a contract-digest bump must not silently discard existing review history. Records in
+# PRO_GATE_HOME carry the digest of the contract that WROTE them and outlive an upgrade; if the two
+# persisted-record validators stopped reading them, an unchanged head with a completed review would
+# read as virgin history and buy a second paid review. Every record below is written DIRECTLY, byte
+# for byte as the predecessor runtime left it, because the write path refuses a non-current stamp.
+echo '# #159 r1 P1: predecessor-contract review history survives a contract-digest upgrade'
+RD_BASE_CONTRACT_DIGEST='7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee'
+RD_UNKNOWN_CONTRACT_DIGEST='0000000000000000000000000000000000000000000000000000000000000000'
+check 'the base review-decision/v1 runtime digest is still an accepted persisted-record digest' \
+  "$(pg_review_decision_record_contract_digest_ok "$RD_BASE_CONTRACT_DIGEST"; echo $?)" \
+  "set=$(pg_review_decision_contract_digest_set)"
+# Compared against rc 1 rather than negated: `! missing_function` would also report ok, because
+# bash inverts the 127 of a renamed or deleted helper into success.
+check 'an unknown contract digest is never an accepted persisted-record digest' \
+  "$([ "$(pg_review_decision_record_contract_digest_ok "$RD_UNKNOWN_CONTRACT_DIGEST"; echo $?)" = 1 ]; echo $?)" \
+  "set=$(pg_review_decision_contract_digest_set)"
+
+UP_HEAD="$(git -C "$DECISION_REPO" rev-parse HEAD)"
+UP_BASE="$(git -C "$DECISION_REPO" rev-parse HEAD^)"
+git -C "$DECISION_REPO" diff "$UP_BASE" "$UP_HEAD" > "$TDIR/upgrade.patch"
+UP_PATCH_DIGEST="$(sha256sum "$TDIR/upgrade.patch" | awk '{print $1}')"
+up_full_binding() { # marker epoch contract-digest
+  jq -cnS --arg cd "$3" --arg marker "$1" --argjson epoch "$2" --arg base "$UP_BASE" --arg head "$UP_HEAD" --arg digest "$UP_PATCH_DIGEST" \
+    '{charged_spend_epoch:$epoch,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("full-pr:"+$base+":"+$head),mode:"full-pr",proof:{base_oid:$base,endpoint_digest:$digest,head_oid:$head,raw_patch_digest:$digest}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:"github.com",owner:"acme",repo:"widgets"},target:{head_oid:$head,kind:"pull-request",pr:1983}}'
+}
+up_connector_binding() { # marker epoch contract-digest
+  jq -cnS --arg cd "$3" --arg marker "$1" --argjson epoch "$2" --arg head "$UP_HEAD" \
+    '{charged_spend_epoch:$epoch,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("connector:github.com/acme/widgets:"+$head),mode:"connector",proof:{commit_target:$head,endpoint_digest:null,raw_diff_digest:null,repository_target:"github.com/acme/widgets"}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:"github.com",owner:"acme",repo:"widgets"},target:{head_oid:$head,kind:"pull-request",pr:1983}}'
+}
+up_seed_record() { # home dir-name marker record-json
+  mkdir -p "$1/$2"
+  printf '%s' "$4" > "$1/$2/$3"
+}
+up_seed_result() { # home marker verdict input-record contract-digest
+  local artifact="$1/completed/$2" proof=null
+  if [ "$3" = SHIP ]; then
+    proof="$(jq -cnS --arg base "$UP_BASE" --arg head "$UP_HEAD" --arg digest "$UP_PATCH_DIGEST" '{base_oid:$base,diff_digest:$digest,head_oid:$head}')"
+  fi
+  up_seed_record "$1" review-result-bindings "$2" "$(jq -cnS --arg cd "$5" --arg marker "$2" --arg verdict "$3" \
+    --arg ib "$(printf '%s' "$4" | sha256sum | awk '{print $1}')" --arg digest "$(sha256sum "$artifact" | awk '{print $1}')" --argjson proof "$proof" \
+    '{accepted_epoch:1700020100,artifact:{digest:$digest,path:("completed/"+$marker)},contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,input_binding_digest:$ib,input_binding_identity:$marker,marker:$marker,named_choice:null,provenance:{outcome:"accepted",validated_epoch:1700020100},record_type:"review-result-binding/v1",record_version:1,ship_proof:$proof,verdict:$verdict}')"
+}
+
+# (a) gate #159 r3 P1: a collected predecessor-contract full-pr SHIP is history and charge, never
+# merge proof. This record is byte for byte what the base runtime's classic path wrote for a
+# `--pr N --input connector` run with no --diff (#150): it fetched and hashed the endpoint patch but
+# never attached it, and the record cannot say so, because nothing that runtime persisted for a run
+# records its input mode. r1 pinned the bundle query below to allow-existing-merge-workflow; that
+# accepted a ship proof for bytes the model may never have received. It must now reach the same typed
+# stop a connector SHIP reaches, leave every record untouched, charge no round, and never become a
+# fresh grant. The base-contract full-pr FIX-FIRST in (b) still routes to the fixer.
+UP_SHIP_HOME="$TDIR/home-upgrade-ship"; UP_SHIP_MARKER='pg-run-acme-widgets-1983-1700020000-1'
+UP_SHIP_BINDING="$(up_full_binding "$UP_SHIP_MARKER" 1700020000 "$RD_BASE_CONTRACT_DIGEST")"
+mkdir -p "$UP_SHIP_HOME/completed"
+printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — reviewed before the contract upgrade.' > "$UP_SHIP_HOME/completed/$UP_SHIP_MARKER"
+up_seed_record "$UP_SHIP_HOME" review-input-bindings "$UP_SHIP_MARKER" "$UP_SHIP_BINDING"
+up_seed_result "$UP_SHIP_HOME" "$UP_SHIP_MARKER" SHIP "$UP_SHIP_BINDING" "$RD_BASE_CONTRACT_DIGEST"
+UP_SHIP_INPUT_READ="$(PRO_GATE_HOME="$UP_SHIP_HOME" pg_review_input_binding_read "$UP_SHIP_MARKER" 2>/dev/null || true)"
+UP_SHIP_RESULT_READ="$(PRO_GATE_HOME="$UP_SHIP_HOME" pg_review_result_binding_read "$UP_SHIP_MARKER" 2>/dev/null || true)"
+check 'both persisted-record validators still read a predecessor-contract record' \
+  "$([ "$UP_SHIP_INPUT_READ" = "$UP_SHIP_BINDING" ] && [ -n "$UP_SHIP_RESULT_READ" ]; echo $?)" \
+  "input=$UP_SHIP_INPUT_READ result=$UP_SHIP_RESULT_READ"
+UP_SHIP_STATE_BEFORE="$(find "$UP_SHIP_HOME" -mindepth 1 -printf '%P\n' | sort)"
+env PRO_GATE_HOME="$UP_SHIP_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/upgrade.patch" \
+  bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/upgrade.patch" --input bundle \
+  >"$TDIR/upgrade-ship.json" 2>"$TDIR/upgrade-ship.err"
+UP_SHIP_RC=$?
+UP_SHIP_STATE_AFTER="$(find "$UP_SHIP_HOME" -mindepth 1 -printf '%P\n' | sort)"
+check 'gate #159 r3 P1: a predecessor-contract full-pr SHIP with its result binding stops typed instead of handing off to merge' \
+  "$([ "$UP_SHIP_RC" -eq 0 ] && jq -e --arg marker "$UP_SHIP_MARKER" '.action=="stop-without-new-review" and .reason=="result-not-bindable-for-mode" and .effect_request.execution_class=="report-only" and .effect_request.applicable_ref==$marker and (.facts.completed_results|length==1) and .facts.completed_results[0].marker==$marker and .facts.completed_results[0].evidence_mode=="full-pr" and .facts.completed_results[0].bindable==false and .facts.completed_results[0].collected==false and .action!="allow-existing-merge-workflow" and .action!="run-granted-review" and .action!="collect-existing-result"' "$TDIR/upgrade-ship.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$UP_SHIP_RC output=$(cat "$TDIR/upgrade-ship.json") stderr=$(cat "$TDIR/upgrade-ship.err")"
+check 'reading predecessor-contract history charges no round and writes no record' \
+  "$([ "$UP_SHIP_STATE_BEFORE" = "$UP_SHIP_STATE_AFTER" ] && [ ! -e "$UP_SHIP_HOME/rounds" ] \
+     && jq -e '.action!="run-granted-review"' "$TDIR/upgrade-ship.json" >/dev/null 2>&1; echo $?)" \
+  "before=$UP_SHIP_STATE_BEFORE after=$UP_SHIP_STATE_AFTER action=$(jq -r .action "$TDIR/upgrade-ship.json" 2>/dev/null)"
+# A caller cannot launder that stop into a repair: an effect file forged into collect-existing-result
+# matches the fresh snapshot byte for byte, and the effect path still obeys the FRESH reduction. The
+# persisted predecessor ship proof must survive untouched (it is history) and never be re-honored.
+jq -cS '.action="collect-existing-result" | .effect_request.action="collect-existing-result" | .effect_request.effect="collect-existing-result" | .effect_request.execution_class="runtime-guarded-effect"' \
+  "$TDIR/upgrade-ship.json" > "$TDIR/upgrade-ship-forged.json"
+UP_SHIP_RESULT_DIGEST_BEFORE="$(sha256sum "$UP_SHIP_HOME/review-result-bindings/$UP_SHIP_MARKER" | awk '{print $1}')"
+env PRO_GATE_HOME="$UP_SHIP_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/upgrade.patch" \
+  PRO_GATE_ORACLE_BIN=/nonexistent/no-oracle \
+  bash "$ENGINE" --review-decision --review-decision-effect "$TDIR/upgrade-ship-forged.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/upgrade.patch" --input bundle \
+  >"$TDIR/upgrade-ship-forged-out.json" 2>"$TDIR/upgrade-ship-forged-out.err"
+UP_SHIP_FORGED_RC=$?
+UP_SHIP_RESULT_DIGEST_AFTER="$(sha256sum "$UP_SHIP_HOME/review-result-bindings/$UP_SHIP_MARKER" | awk '{print $1}')"
+check 'gate #159 r3 P1: a forged collect effect on that SHIP repairs nothing and re-emits the typed stop' \
+  "$([ "$UP_SHIP_FORGED_RC" -eq 0 ] && [ "$UP_SHIP_RESULT_DIGEST_BEFORE" = "$UP_SHIP_RESULT_DIGEST_AFTER" ] \
+     && [ "$UP_SHIP_STATE_BEFORE" = "$(find "$UP_SHIP_HOME" -mindepth 1 -printf '%P\n' | sort)" ] \
+     && jq -e '.action=="stop-without-new-review" and .reason=="result-not-bindable-for-mode"' "$TDIR/upgrade-ship-forged-out.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$UP_SHIP_FORGED_RC output=$(cat "$TDIR/upgrade-ship-forged-out.json") stderr=$(cat "$TDIR/upgrade-ship-forged-out.err")"
+
+# (b) a collected predecessor-contract FIX-FIRST still routes to the fixer instead of buying a round.
+UP_FIX_HOME="$TDIR/home-upgrade-fix"; UP_FIX_MARKER='pg-run-acme-widgets-1983-1700020001-2'
+UP_FIX_BINDING="$(up_full_binding "$UP_FIX_MARKER" 1700020001 "$RD_BASE_CONTRACT_DIGEST")"
+mkdir -p "$UP_FIX_HOME/completed"
+printf '%s\n' '[P1] a.sh:1 — finding from before the upgrade' 'P2: none' 'VERDICT: FIX-FIRST — reviewed before the contract upgrade.' > "$UP_FIX_HOME/completed/$UP_FIX_MARKER"
+up_seed_record "$UP_FIX_HOME" review-input-bindings "$UP_FIX_MARKER" "$UP_FIX_BINDING"
+up_seed_result "$UP_FIX_HOME" "$UP_FIX_MARKER" FIX-FIRST "$UP_FIX_BINDING" "$RD_BASE_CONTRACT_DIGEST"
+env PRO_GATE_HOME="$UP_FIX_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/upgrade.patch" \
+  bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/upgrade.patch" --input bundle \
+  >"$TDIR/upgrade-fix.json" 2>"$TDIR/upgrade-fix.err"
+UP_FIX_RC=$?
+check 'predecessor-contract FIX-FIRST still reduces to fix-review-findings, never a fresh grant' \
+  "$([ "$UP_FIX_RC" -eq 0 ] && jq -e '.action=="fix-review-findings" and .reason=="review-findings-require-fix" and .action!="run-granted-review"' "$TDIR/upgrade-fix.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$UP_FIX_RC output=$(cat "$TDIR/upgrade-fix.json") stderr=$(cat "$TDIR/upgrade-fix.err")"
+
+# (c) a predecessor-contract connector SHIP still reaches #147's typed stop instead of vanishing.
+UP_CONN_HOME="$TDIR/home-upgrade-connector"; UP_CONN_MARKER='pg-run-acme-widgets-1983-1700020002-3'
+mkdir -p "$UP_CONN_HOME/completed"
+printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — connector observation before the upgrade.' > "$UP_CONN_HOME/completed/$UP_CONN_MARKER"
+up_seed_record "$UP_CONN_HOME" review-input-bindings "$UP_CONN_MARKER" "$(up_connector_binding "$UP_CONN_MARKER" 1700020002 "$RD_BASE_CONTRACT_DIGEST")"
+env PRO_GATE_HOME="$UP_CONN_HOME" PRO_GATE_RUN_LOGS=0 \
+  bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --input connector \
+  >"$TDIR/upgrade-connector.json" 2>"$TDIR/upgrade-connector.err"
+UP_CONN_RC=$?
+check 'predecessor-contract connector SHIP still reaches the typed result-not-bindable-for-mode stop' \
+  "$([ "$UP_CONN_RC" -eq 0 ] && jq -e --arg marker "$UP_CONN_MARKER" '.action=="stop-without-new-review" and .reason=="result-not-bindable-for-mode" and .effect_request.applicable_ref==$marker and .facts.completed_results[0].evidence_mode=="connector"' "$TDIR/upgrade-connector.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$UP_CONN_RC output=$(cat "$TDIR/upgrade-connector.json") stderr=$(cat "$TDIR/upgrade-connector.err")"
+
+# (d) a record under a digest this runtime does NOT accept is unreadable history, not absent
+# history: it stops the round closed and can never route a verdict or authorize a grant.
+UP_UNKNOWN_HOME="$TDIR/home-upgrade-unknown"; UP_UNKNOWN_MARKER='pg-run-acme-widgets-1983-1700020003-4'
+UP_UNKNOWN_BINDING="$(up_full_binding "$UP_UNKNOWN_MARKER" 1700020003 "$RD_UNKNOWN_CONTRACT_DIGEST")"
+mkdir -p "$UP_UNKNOWN_HOME/completed"
+printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — written by a contract this runtime cannot read.' > "$UP_UNKNOWN_HOME/completed/$UP_UNKNOWN_MARKER"
+up_seed_record "$UP_UNKNOWN_HOME" review-input-bindings "$UP_UNKNOWN_MARKER" "$UP_UNKNOWN_BINDING"
+up_seed_result "$UP_UNKNOWN_HOME" "$UP_UNKNOWN_MARKER" SHIP "$UP_UNKNOWN_BINDING" "$RD_UNKNOWN_CONTRACT_DIGEST"
+env PRO_GATE_HOME="$UP_UNKNOWN_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/upgrade.patch" \
+  bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/upgrade.patch" --input bundle \
+  >"$TDIR/upgrade-unknown.json" 2>"$TDIR/upgrade-unknown.err"
+UP_UNKNOWN_RC=$?
+check 'unreadable-contract history stops closed instead of authorizing another review' \
+  "$([ "$UP_UNKNOWN_RC" -eq 0 ] && jq -e '.action=="stop-without-new-review" and .reason=="legacy-not-authoritative" and .effect_request.execution_class=="report-only" and .facts.prior_review.legacy==true and .action!="allow-existing-merge-workflow" and .action!="run-granted-review" and .action!="fix-review-findings" and .action!="collect-existing-result"' "$TDIR/upgrade-unknown.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$UP_UNKNOWN_RC output=$(cat "$TDIR/upgrade-unknown.json") stderr=$(cat "$TDIR/upgrade-unknown.err")"
+
+# (e) reads accept predecessor history; writes still stamp the current contract only.
+UP_WRITE_HOME="$TDIR/home-upgrade-write"; UP_WRITE_MARKER='pg-run-acme-widgets-1983-1700020004-5'
+PRO_GATE_HOME="$UP_WRITE_HOME" pg_review_input_binding_write "$UP_WRITE_MARKER" "$(up_full_binding "$UP_WRITE_MARKER" 1700020004 "$RD_BASE_CONTRACT_DIGEST")" >/dev/null 2>&1
+UP_WRITE_OLD_RC=$?
+PRO_GATE_HOME="$UP_WRITE_HOME" pg_review_input_binding_write "$UP_WRITE_MARKER" "$(up_full_binding "$UP_WRITE_MARKER" 1700020004 "$RD_CONTRACT_DIGEST")" >/dev/null 2>&1
+UP_WRITE_NEW_RC=$?
+check 'a new record is refused unless it stamps the current contract digest' \
+  "$([ "$UP_WRITE_OLD_RC" -ne 0 ] && [ "$UP_WRITE_NEW_RC" -eq 0 ] && [ -f "$UP_WRITE_HOME/review-input-bindings/$UP_WRITE_MARKER" ]; echo $?)" \
+  "old_rc=$UP_WRITE_OLD_RC new_rc=$UP_WRITE_NEW_RC written=$([ -f "$UP_WRITE_HOME/review-input-bindings/$UP_WRITE_MARKER" ] && echo yes || echo no)"
+
+# (f) gate #159 r3 P1: the same record in the common upgrade state, completed SHIP bytes whose result
+# binding was never written. r1 pinned this to collect, and the collect effect then repaired the
+# sibling forward WITH a full-pr ship proof, so the next query handed off to merge. It must now be the
+# typed stop from the first query, the effect must write no sibling, and the immutable predecessor
+# input record must be left exactly as the older runtime wrote it.
+UP_FWD_HOME="$TDIR/home-upgrade-forward"; UP_FWD_MARKER='pg-run-acme-widgets-1983-1700020005-6'
+UP_FWD_BINDING="$(up_full_binding "$UP_FWD_MARKER" 1700020005 "$RD_BASE_CONTRACT_DIGEST")"
+mkdir -p "$UP_FWD_HOME/completed"
+printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — collected after the contract upgrade.' > "$UP_FWD_HOME/completed/$UP_FWD_MARKER"
+up_seed_record "$UP_FWD_HOME" review-input-bindings "$UP_FWD_MARKER" "$UP_FWD_BINDING"
+env PRO_GATE_HOME="$UP_FWD_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/upgrade.patch" \
+  bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/upgrade.patch" --input bundle \
+  >"$TDIR/upgrade-forward-collect.json" 2>"$TDIR/upgrade-forward-collect.err"
+UP_FWD_COLLECT_RC=$?
+check 'gate #159 r3 P1: an uncollected predecessor-contract full-pr SHIP stops typed instead of collecting or buying a round' \
+  "$([ "$UP_FWD_COLLECT_RC" -eq 0 ] && jq -e --arg marker "$UP_FWD_MARKER" '.action=="stop-without-new-review" and .reason=="result-not-bindable-for-mode" and .effect_request.applicable_ref==$marker and .facts.completed_results[0].evidence_mode=="full-pr" and .facts.completed_results[0].bindable==false and .action!="collect-existing-result" and .action!="run-granted-review"' "$TDIR/upgrade-forward-collect.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$UP_FWD_COLLECT_RC output=$(cat "$TDIR/upgrade-forward-collect.json") stderr=$(cat "$TDIR/upgrade-forward-collect.err")"
+# The effect must never reach a browser. Pinning an absent oracle keeps the no-spend claim
+# structural: if this case ever regressed into a grant, the effect would fail instead of paying.
+env PRO_GATE_HOME="$UP_FWD_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/upgrade.patch" \
+  PRO_GATE_ORACLE_BIN=/nonexistent/no-oracle \
+  bash "$ENGINE" --review-decision --review-decision-effect "$TDIR/upgrade-forward-collect.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/upgrade.patch" --input bundle \
+  >"$TDIR/upgrade-forward-repair.json" 2>"$TDIR/upgrade-forward-repair.err"
+env PRO_GATE_HOME="$UP_FWD_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/upgrade.patch" \
+  bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/upgrade.patch" --input bundle \
+  >"$TDIR/upgrade-forward-current.json" 2>"$TDIR/upgrade-forward-current.err"
+UP_FWD_CURRENT_RC=$?
+check 'gate #159 r3 P1: post-upgrade repair writes no ship proof for the predecessor full-pr record, input record untouched' \
+  "$([ "$UP_FWD_CURRENT_RC" -eq 0 ] \
+     && [ ! -e "$UP_FWD_HOME/review-result-bindings/$UP_FWD_MARKER" ] \
+     && [ "$(jq -r .contract_digest "$UP_FWD_HOME/review-input-bindings/$UP_FWD_MARKER")" = "$RD_BASE_CONTRACT_DIGEST" ] \
+     && jq -e '.action=="stop-without-new-review" and .reason=="result-not-bindable-for-mode" and .action!="allow-existing-merge-workflow"' "$TDIR/upgrade-forward-current.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$UP_FWD_CURRENT_RC repair=$(cat "$TDIR/upgrade-forward-repair.json") current=$(cat "$TDIR/upgrade-forward-current.json") stderr=$(cat "$TDIR/upgrade-forward-current.err")"
+
+# (f2) the shared predicate and the repair effect's own guard, called directly. The CLI can no longer
+# route this record to repair, but pg_persist_result and any future caller share the same function,
+# so the refusal is pinned at the function and not only at the one path that reaches it today. The
+# engine has no source guard, so its three functions are lifted by definition range into a shell
+# that has the lib. Planted negatives: a CURRENT-contract full-pr record and a predecessor
+# scoped-delta record (the typed path always gated those on bundle|both) still attest.
+up_engine_fn() { # home fn args... -> runs an engine function with the lib sourced
+  local home="$1"; shift
+  PRO_GATE_HOME="$home" bash -c '. "$0"; eval "$(sed -n "/^pg_review_decision_ship_mode_bindable()/,/^}/p;/^pg_review_decision_input_ship_bindable()/,/^}/p;/^pg_review_decision_repair_result_binding()/,/^}/p" "$1")"; shift; "$@"' \
+    "$HERE/../lib/pro-gate-lib.sh" "$ENGINE" "$@"
+}
+UP_ATTEST_HOME="$TDIR/home-upgrade-attest"; mkdir -p "$UP_ATTEST_HOME"
+check 'gate #159 r3 P1: the base contract digest does not attest full-pr delivery; the current one does; an unknown one never does' \
+  "$([ "$(pg_review_decision_record_full_pr_attested "$RD_BASE_CONTRACT_DIGEST"; echo $?)" = 1 ] \
+     && [ "$(pg_review_decision_record_full_pr_attested "$RD_CONTRACT_DIGEST"; echo $?)" = 0 ] \
+     && [ "$(pg_review_decision_record_full_pr_attested "$RD_UNKNOWN_CONTRACT_DIGEST"; echo $?)" = 1 ] \
+     && [ "$(pg_review_decision_record_contract_digest_ok "$RD_BASE_CONTRACT_DIGEST"; echo $?)" = 0 ]; echo $?)" \
+  "unattested=$PG_REVIEW_DECISION_CONTRACT_DIGESTS_UNATTESTED_FULL_PR"
+UP_ATTEST_SCOPED_BASE="$(jq -cn --arg cd "$RD_BASE_CONTRACT_DIGEST" '{contract_digest:$cd,evidence:{mode:"scoped-delta"}}')"
+check 'gate #159 r3 P1: the SHIP predicate refuses a predecessor full-pr record and a connector record, accepts current full-pr and predecessor scoped-delta' \
+  "$([ "$(up_engine_fn "$UP_ATTEST_HOME" pg_review_decision_input_ship_bindable "$(up_full_binding "$UP_SHIP_MARKER" 1700020000 "$RD_BASE_CONTRACT_DIGEST")"; echo $?)" = 1 ] \
+     && [ "$(up_engine_fn "$UP_ATTEST_HOME" pg_review_decision_input_ship_bindable "$(up_connector_binding "$UP_SHIP_MARKER" 1700020000 "$RD_CONTRACT_DIGEST")"; echo $?)" = 1 ] \
+     && [ "$(up_engine_fn "$UP_ATTEST_HOME" pg_review_decision_input_ship_bindable "$(up_full_binding "$UP_SHIP_MARKER" 1700020000 "$RD_CONTRACT_DIGEST")"; echo $?)" = 0 ] \
+     && [ "$(up_engine_fn "$UP_ATTEST_HOME" pg_review_decision_input_ship_bindable "$UP_ATTEST_SCOPED_BASE"; echo $?)" = 0 ]; echo $?)" \
+  "base=$RD_BASE_CONTRACT_DIGEST current=$RD_CONTRACT_DIGEST"
+UP_REPAIR_HOME="$TDIR/home-upgrade-repair"; mkdir -p "$UP_REPAIR_HOME/completed"
+UP_REPAIR_SHIP_MARKER='pg-run-acme-widgets-1983-1700020008-9'; UP_REPAIR_FIX_MARKER='pg-run-acme-widgets-1983-1700020009-10'
+printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — repaired directly after the upgrade.' > "$UP_REPAIR_HOME/completed/$UP_REPAIR_SHIP_MARKER"
+printf '%s\n' '[P1] a.sh:1 — finding from before the upgrade' 'P2: none' 'VERDICT: FIX-FIRST — repaired directly after the upgrade.' > "$UP_REPAIR_HOME/completed/$UP_REPAIR_FIX_MARKER"
+up_engine_fn "$UP_REPAIR_HOME" pg_review_decision_repair_result_binding "$UP_REPAIR_SHIP_MARKER" "$(up_full_binding "$UP_REPAIR_SHIP_MARKER" 1700020008 "$RD_BASE_CONTRACT_DIGEST")" >/dev/null 2>&1
+UP_REPAIR_SHIP_RC=$?
+up_engine_fn "$UP_REPAIR_HOME" pg_review_decision_repair_result_binding "$UP_REPAIR_FIX_MARKER" "$(up_full_binding "$UP_REPAIR_FIX_MARKER" 1700020009 "$RD_BASE_CONTRACT_DIGEST")" >/dev/null 2>&1
+UP_REPAIR_FIX_RC=$?
+check 'gate #159 r3 P1: the repair effect itself refuses a SHIP proof for a predecessor full-pr input, and still binds its FIX-FIRST with a null proof' \
+  "$([ "$UP_REPAIR_SHIP_RC" -ne 0 ] && [ ! -e "$UP_REPAIR_HOME/review-result-bindings/$UP_REPAIR_SHIP_MARKER" ] \
+     && [ "$UP_REPAIR_FIX_RC" -eq 0 ] \
+     && jq -e --arg cd "$RD_CONTRACT_DIGEST" '.verdict=="FIX-FIRST" and .ship_proof==null and .contract_digest==$cd' "$UP_REPAIR_HOME/review-result-bindings/$UP_REPAIR_FIX_MARKER" >/dev/null 2>&1; echo $?)" \
+  "ship_rc=$UP_REPAIR_SHIP_RC fix_rc=$UP_REPAIR_FIX_RC bindings=$(ls -1 "$UP_REPAIR_HOME/review-result-bindings" 2>/dev/null | tr '\n' ' ')"
+
+# (g) the charged clone. When the exact-current input template IS a predecessor-contract record, the
+# charged attempt must still install its own marker-bound binding — stamped with the CURRENT
+# contract, since it is a new record — instead of failing closed with the round already spent.
+# Reuses the fresh-dispatch fixture above (fake oracle, mock browser); no review is ever paid for.
+UP_CLONE_MARKER='pg-run-acme-fresh.git-77-1700020006-7'
+fresh_reset_state
+mkdir -p "$FRESH_HOME/review-input-bindings"
+UP_CLONE_TEMPLATE="$(jq -cS --arg cd "$RD_BASE_CONTRACT_DIGEST" --arg marker "$UP_CLONE_MARKER" '.contract_digest=$cd | .marker=$marker' <<<"$FRESH_BINDING")"
+printf '%s' "$UP_CLONE_TEMPLATE" > "$FRESH_HOME/review-input-bindings/$UP_CLONE_MARKER"
+UP_CLONE_ADVISORY="$(fresh_query)"
+printf '%s\n' "$UP_CLONE_ADVISORY" > "$TDIR/upgrade-clone-advisory.json"
+check 'a predecessor-contract exact input with no result still advises run-granted-review' \
+  "$(jq -e '.action == "run-granted-review"' <<<"$UP_CLONE_ADVISORY" >/dev/null 2>&1; echo $?)" "$UP_CLONE_ADVISORY"
+: > "$TDIR/fresh-oracle.calls"
+start_mock "$TDIR/tab.txt" "$ORGANIZER_STATE"
+fresh_effect "$TDIR/upgrade-clone-advisory.json" "$TDIR/upgrade-clone.md"
+UP_CLONE_NEW_MARKER="$(find "$FRESH_HOME/review-input-bindings" -type f -name 'pg-run-*' ! -name "$UP_CLONE_MARKER" -printf '%f\n' | head -1)"
+check 'a charge cloned from a predecessor template installs its binding under the current contract' \
+  "$([ "$FRESH_RC" -eq 0 ] && [ -n "$UP_CLONE_NEW_MARKER" ] \
+     && [ "$(jq -r .contract_digest "$FRESH_HOME/review-input-bindings/$UP_CLONE_NEW_MARKER")" = "$RD_CONTRACT_DIGEST" ] \
+     && [ "$(jq -r .contract_digest "$FRESH_HOME/review-input-bindings/$UP_CLONE_MARKER")" = "$RD_BASE_CONTRACT_DIGEST" ]; echo $?)" \
+  "rc=$FRESH_RC new=$UP_CLONE_NEW_MARKER stderr=$(tail -n 5 "$TDIR/fresh.stderr" 2>/dev/null)"
+
+# (h) gate #159 r3 P1: the way out is the documented one, a bundle round on the same head. Seed the
+# unattested predecessor SHIP for the classic fixture's head, run a classic --input bundle round
+# through the fake completing oracle (the run that actually attaches the patch), and require the next
+# bundle query to hand off on the NEW record while the old one remains a non-bindable fact beside it.
+# The seeded record and its ship proof are byte for byte what the base classic path persisted.
+UP_WAY_HOME="$TDIR/home-upgrade-way-out"; UP_WAY_MARKER='pg-run-acme-classic-4242-1700020010-11'
+UP_WAY_HEAD="$(git -C "$CLASSIC_REPO" rev-parse HEAD)"; UP_WAY_BASE="$(git -C "$CLASSIC_REPO" rev-parse HEAD^)"
+UP_WAY_DIGEST="$(sha256sum "$TDIR/classic-endpoint.patch" | awk '{print $1}')"
+UP_WAY_BINDING="$(jq -cnS --arg cd "$RD_BASE_CONTRACT_DIGEST" --arg marker "$UP_WAY_MARKER" --arg base "$UP_WAY_BASE" --arg head "$UP_WAY_HEAD" --arg digest "$UP_WAY_DIGEST" \
+  '{charged_spend_epoch:1700020010,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("full-pr:"+$base+":"+$head),mode:"full-pr",proof:{base_oid:$base,endpoint_digest:$digest,head_oid:$head,raw_patch_digest:$digest}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:"github.com",owner:"acme",repo:"classic"},target:{head_oid:$head,kind:"pull-request",pr:4242}}')"
+mkdir -p "$UP_WAY_HOME/completed"
+printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — connector-only classic run before the upgrade.' > "$UP_WAY_HOME/completed/$UP_WAY_MARKER"
+up_seed_record "$UP_WAY_HOME" review-input-bindings "$UP_WAY_MARKER" "$UP_WAY_BINDING"
+up_seed_record "$UP_WAY_HOME" review-result-bindings "$UP_WAY_MARKER" "$(jq -cnS --arg cd "$RD_BASE_CONTRACT_DIGEST" --arg marker "$UP_WAY_MARKER" \
+  --arg ib "$(printf '%s' "$UP_WAY_BINDING" | sha256sum | awk '{print $1}')" --arg digest "$(sha256sum "$UP_WAY_HOME/completed/$UP_WAY_MARKER" | awk '{print $1}')" \
+  --arg base "$UP_WAY_BASE" --arg head "$UP_WAY_HEAD" --arg diff "$UP_WAY_DIGEST" \
+  '{accepted_epoch:1700020110,artifact:{digest:$digest,path:("completed/"+$marker)},contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,input_binding_digest:$ib,input_binding_identity:$marker,marker:$marker,named_choice:null,provenance:{outcome:"accepted",validated_epoch:1700020110},record_type:"review-result-binding/v1",record_version:1,ship_proof:{base_oid:$base,diff_digest:$diff,head_oid:$head},verdict:"SHIP"}')"
+env PRO_GATE_HOME="$UP_WAY_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/classic-endpoint.patch" \
+  bash "$ENGINE" --review-decision --json --repo "$CLASSIC_REPO" --pr 4242 --diff "$TDIR/classic-endpoint.patch" --input bundle \
+  >"$TDIR/upgrade-way-before.json" 2>"$TDIR/upgrade-way-before.err"
+UP_WAY_BEFORE_RC=$?
+check 'gate #159 r3 P1: the seeded base-classic SHIP alone stops typed for the classic fixture head' \
+  "$([ "$UP_WAY_BEFORE_RC" -eq 0 ] && jq -e --arg marker "$UP_WAY_MARKER" '.action=="stop-without-new-review" and .reason=="result-not-bindable-for-mode" and .effect_request.applicable_ref==$marker' "$TDIR/upgrade-way-before.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$UP_WAY_BEFORE_RC output=$(cat "$TDIR/upgrade-way-before.json") stderr=$(cat "$TDIR/upgrade-way-before.err")"
+start_mock "$TDIR/tab.txt" "$ORGANIZER_STATE"
+classicrun "$UP_WAY_HOME" bundle
+UP_WAY_RUN_RC=$RC
+UP_WAY_NEW_MARKER="$(find "$UP_WAY_HOME/review-input-bindings" -type f -name 'pg-run-*' ! -name "$UP_WAY_MARKER" -printf '%f\n' | head -1)"
+env PRO_GATE_HOME="$UP_WAY_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/classic-endpoint.patch" \
+  bash "$ENGINE" --review-decision --json --repo "$CLASSIC_REPO" --pr 4242 --diff "$TDIR/classic-endpoint.patch" --input bundle \
+  >"$TDIR/upgrade-way-after.json" 2>"$TDIR/upgrade-way-after.err"
+UP_WAY_AFTER_RC=$?
+check 'gate #159 r3 P1: a post-upgrade classic bundle round on the same head earns the merge handoff the predecessor record could not' \
+  "$([ "$UP_WAY_RUN_RC" -eq 0 ] && [ "$UP_WAY_AFTER_RC" -eq 0 ] && [ -n "$UP_WAY_NEW_MARKER" ] \
+     && [ "$(jq -r .contract_digest "$UP_WAY_HOME/review-input-bindings/$UP_WAY_NEW_MARKER")" = "$RD_CONTRACT_DIGEST" ] \
+     && jq -e '.verdict=="SHIP" and (.ship_proof|type=="object")' "$UP_WAY_HOME/review-result-bindings/$UP_WAY_NEW_MARKER" >/dev/null 2>&1 \
+     && jq -e --arg old "$UP_WAY_MARKER" --arg new "$UP_WAY_NEW_MARKER" '.action=="allow-existing-merge-workflow" and .reason=="current-ship-is-merge-eligible" and .effect_request.applicable_ref!=$old and (.facts.completed_results|length==2) and any(.facts.completed_results[]; .marker==$old and .bindable==false and .collected==false) and any(.facts.completed_results[]; .marker==$new and .collected==true and .verdict=="SHIP" and .evidence_mode=="full-pr")' "$TDIR/upgrade-way-after.json" >/dev/null 2>&1; echo $?)" \
+  "run_rc=$UP_WAY_RUN_RC query_rc=$UP_WAY_AFTER_RC new=$UP_WAY_NEW_MARKER output=$(cat "$TDIR/upgrade-way-after.json") stderr=$(cat "$TDIR/upgrade-way-after.err") run_stderr=$(tail -3 "$TDIR/stderr")"
 
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }

@@ -54,7 +54,9 @@ The installer owns runtime files only; this plugin owns the skill and relay.
 
 Resolve the canonical repository and PR. The engine owns input policy: omit `--input` when the
 caller did not explicitly supply `INPUT`, so its safe default or configured connector opt-in decides
-delivery. An explicit `bundle|both|connector` selection is passed through unchanged. Reuse the exact
+delivery. An explicit `bundle|both|connector` selection is passed through unchanged. Connector
+delivery can drive fix rounds but never attests an allow: a connector-delivered SHIP stops typed with
+reason `result-not-bindable-for-mode`, so use `bundle` or `both` for the final round. Reuse the exact
 input arguments for the query and effect so proof paths cannot drift:
 
 ```bash

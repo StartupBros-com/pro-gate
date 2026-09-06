@@ -2484,13 +2484,71 @@ pg_completed_lookup() {  # <marker> <out>: place the artifact at <out>; rc 0 on 
 # ─────────────────────────────────────────────────────────────────────────────
 PG_REVIEW_DECISION_CONTRACT_ID='review-decision/v1'
 PG_REVIEW_DECISION_CONTRACT_VERSION=1
-PG_REVIEW_DECISION_CONTRACT_DIGEST='7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee'
-PG_REVIEW_DECISION_CORPUS_DIGEST='2a1e347e4c15766ab9c530074ae75aead7397349f5e13328c40183ced8b70b69'
+PG_REVIEW_DECISION_CONTRACT_DIGEST='f807f99c8cc01cd6cee258d32e0ff2e7ebf862cbbb3c265af92f29d7620f0fb2'
+PG_REVIEW_DECISION_CORPUS_DIGEST='8b251183b189d7a1bb165b3bde1f5b3c4575ac5fcf55c472381579f9a450b017'
+# Persisted marker-addressed records carry the digest of the contract that WROTE them, and those
+# records outlive an upgrade in PRO_GATE_HOME. A digest bump must therefore never make predecessor
+# records unreadable: an unreadable record reads as ABSENT history, and absent history authorizes
+# another paid review of an unchanged head (gate #159 r1 P1). Records are validated against the
+# current digest plus this closed set of predecessors whose review-input-binding/v1 and
+# review-result-binding/v1 shapes are byte-identical to the current ones — a bump that only moves
+# reducer vocabulary or normalized-fact shape belongs here. A change to a RECORD's own shape bumps
+# that record_version instead and must NOT be added. Writes always stamp the current digest, and a
+# record carrying a digest outside this set is unreadable history that stops closed, never absent.
+# Space-separated, newest predecessor first.
+#   7f5ece9b… — the base review-decision/v1 runtime (#98); #147 added a reason and two normalized
+#               completed-result fields, leaving both binding record shapes untouched.
+PG_REVIEW_DECISION_CONTRACT_DIGEST_PREDECESSORS='7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee'
+# Accepted digests whose full-pr input bindings do NOT attest delivered bytes. The base runtime's
+# classic path installed a full-pr relation for every engine-fetched patch, including a
+# `--input connector` run that never attached those bytes to the review (#150), and nothing else it
+# persisted for that run records the input mode, so the record cannot say which it was. A full-pr
+# record under one of these digests is therefore lifecycle history and charge only: it is read, it
+# supersedes, and it stops a duplicate spend, but its SHIP never becomes merge proof (gate #159 r3
+# P1). A digest whose writer already gated full-pr on bundle|both must NOT be listed here.
+PG_REVIEW_DECISION_CONTRACT_DIGESTS_UNATTESTED_FULL_PR='7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee'
 
 pg_review_decision_contract_id() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_ID"; }
 pg_review_decision_contract_version() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_VERSION"; }
 pg_review_decision_contract_digest() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_DIGEST"; }
 pg_review_decision_corpus_digest() { printf '%s\n' "$PG_REVIEW_DECISION_CORPUS_DIGEST"; }
+# The closed JSON array of contract digests a PERSISTED record may carry. Reducer envelopes and the
+# daemon contract check keep using the single current digest above; only stored records read history
+# written by a predecessor. Built once from the constants, hex-filtered, never from record bytes.
+# An argument pins that one exact digest instead, for detecting a record this runtime cannot accept.
+pg_review_decision_contract_digest_set() { # [exact digest]
+  local d pinned="${1:-}" out=''
+  if [ -n "$pinned" ]; then
+    case "$pinned" in *[!0-9a-f]*) return 1;; esac
+    [ "${#pinned}" -eq 64 ] || return 1
+    printf '["%s"]' "$pinned"
+    return 0
+  fi
+  for d in $PG_REVIEW_DECISION_CONTRACT_DIGEST $PG_REVIEW_DECISION_CONTRACT_DIGEST_PREDECESSORS; do
+    case "$d" in ''|*[!0-9a-f]*) continue;; esac
+    [ "${#d}" -eq 64 ] || continue
+    out="${out}${out:+,}\"$d\""
+  done
+  printf '[%s]' "$out"
+}
+pg_review_decision_record_contract_digest_ok() { # digest -> rc 0 when a persisted record may carry it
+  local want="$1" d
+  [ -n "$want" ] || return 1
+  for d in $PG_REVIEW_DECISION_CONTRACT_DIGEST $PG_REVIEW_DECISION_CONTRACT_DIGEST_PREDECESSORS; do
+    [ "$want" = "$d" ] && return 0
+  done
+  return 1
+}
+# rc 0 when a full-pr input binding carrying this digest attests that the engine delivered the patch
+# bytes it names. Unreadable digests fail closed; listed predecessors fail by design (see above).
+pg_review_decision_record_full_pr_attested() { # digest
+  local want="$1" d
+  pg_review_decision_record_contract_digest_ok "$want" || return 1
+  for d in $PG_REVIEW_DECISION_CONTRACT_DIGESTS_UNATTESTED_FULL_PR; do
+    [ "$want" = "$d" ] && return 1
+  done
+  return 0
+}
 
 # Compatibility metadata only: reducers continue to use the compiled constants above.
 pg_review_decision_identity_json() {
@@ -2655,10 +2713,11 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
     def hex: type=="string" and test("^[0-9a-f]{64}$");
     def oid: type=="string" and test("^[0-9a-f]{40}([0-9a-f]{24})?$");
     def result:
-      keys_are(["applicable","artifact_digest","binding_valid","canonical_identity","charged_spend_epoch","collected","legacy","marker","provenance_valid","verdict"])
-      and (.applicable|type=="boolean") and (.artifact_digest|hex) and (.binding_valid|type=="boolean")
+      keys_are(["applicable","artifact_digest","bindable","binding_valid","canonical_identity","charged_spend_epoch","collected","evidence_mode","legacy","marker","provenance_valid","verdict"])
+      and (.applicable|type=="boolean") and (.artifact_digest|hex) and (.bindable|type=="boolean") and (.binding_valid|type=="boolean")
       and (.canonical_identity|ident and length>0) and (.charged_spend_epoch|type=="number" and floor==.)
-      and (.collected|type=="boolean") and (.legacy|type=="boolean") and (.marker|marker and length>0)
+      and (.collected|type=="boolean") and (.evidence_mode|IN("full-pr","scoped-delta","connector","none"))
+      and (.legacy|type=="boolean") and (.marker|marker and length>0)
       and (.provenance_valid|type=="boolean") and (.verdict|IN("SHIP","FIX-FIRST","NEEDS-DISCUSSION","NONE"));
     (keys_are(["active_index","completed_results","contract","evidence","governor","input","named_choice","observation","prior_review","reservation","target","transport"]))
     and (.contract|keys_are(["contract_digest","contract_id","contract_version","corpus_digest"]))
@@ -2708,6 +2767,12 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
     fi
     selected_ref="$(jq -r .canonical_identity <<<"$selected")"
     if [ "$(jq -r .collected <<<"$selected")" = false ]; then
+      # An uncollected result whose evidence mode can never carry merge proof (a connector SHIP,
+      # #147) is unrepairable, not transient: re-issuing collect would loop forever. Stop typed,
+      # with the mode and marker in the facts, and never route it to merge eligibility.
+      if [ "$(jq -r .bindable <<<"$selected")" = false ]; then
+        pg_review_decision_emit stop-without-new-review result-not-bindable-for-mode "$canonical" "$snapshot" "$selected_ref"; return
+      fi
       pg_review_decision_emit collect-existing-result completed-result-awaits-collection "$canonical" "$snapshot" "$selected_ref"; return
     fi
   fi
@@ -2809,18 +2874,22 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
 pg_review_input_binding_dir() { printf '%s\n' "${PRO_GATE_REVIEW_INPUT_BINDING_DIR:-$PRO_GATE_HOME/review-input-bindings}"; }
 pg_review_result_binding_dir() { printf '%s\n' "${PRO_GATE_REVIEW_RESULT_BINDING_DIR:-$PRO_GATE_HOME/review-result-bindings}"; }
 
-pg_review_input_binding_validate() { # canonical record JSON [expected marker]
-  local json="${1-}" marker="${2:-}" canonical
+# The optional third argument pins ONE exact contract digest instead of the accepted set. It exists
+# for foreign-record detection, which must prove a record is structurally whole under a digest this
+# runtime does not accept; nothing it validates is ever authority.
+pg_review_input_binding_validate() { # canonical record JSON [expected marker] [exact contract digest]
+  local json="${1-}" marker="${2:-}" pinned="${3:-}" canonical cds
   canonical="$(pg_review_json_canonical "$json")" || return 1
+  cds="$(pg_review_decision_contract_digest_set "$pinned")" || return 1
   jq -e --arg marker "$marker" --arg cid "$PG_REVIEW_DECISION_CONTRACT_ID" \
-    --argjson cv "$PG_REVIEW_DECISION_CONTRACT_VERSION" --arg cd "$PG_REVIEW_DECISION_CONTRACT_DIGEST" '
+    --argjson cv "$PG_REVIEW_DECISION_CONTRACT_VERSION" --argjson cds "$cds" '
     def keys_are($x): keys == ($x|sort);
     def hex: type=="string" and test("^[0-9a-f]{64}$");
     def oid: type=="string" and test("^[0-9a-f]{40}([0-9a-f]{24})?$");
     ([.. | strings | (length>1024 or test("[\u0000-\u001f\u007f]"))] | any | not)
     and keys_are(["charged_spend_epoch","contract_digest","contract_id","contract_version","evidence","marker","record_type","record_version","repository","target"])
     and .record_type=="review-input-binding/v1" and .record_version==1
-    and .contract_id==$cid and .contract_version==$cv and .contract_digest==$cd
+    and .contract_id==$cid and .contract_version==$cv and (.contract_digest|IN($cds[]))
     and (.marker|test("^pg-run-[A-Za-z0-9.-]+$")) and ($marker=="" or .marker==$marker)
     and (.charged_spend_epoch|type=="number" and floor==. and .>0)
     and (.repository|keys_are(["host","owner","repo"]))
@@ -2848,18 +2917,19 @@ pg_review_input_binding_validate() { # canonical record JSON [expected marker]
     end)' <<<"$canonical" >/dev/null 2>&1
 }
 
-pg_review_result_binding_validate() { # canonical record JSON [expected marker]
-  local json="${1-}" marker="${2:-}" canonical
+pg_review_result_binding_validate() { # canonical record JSON [expected marker] [exact contract digest]
+  local json="${1-}" marker="${2:-}" pinned="${3:-}" canonical cds
   canonical="$(pg_review_json_canonical "$json")" || return 1
+  cds="$(pg_review_decision_contract_digest_set "$pinned")" || return 1
   jq -e --arg marker "$marker" --arg cid "$PG_REVIEW_DECISION_CONTRACT_ID" \
-    --argjson cv "$PG_REVIEW_DECISION_CONTRACT_VERSION" --arg cd "$PG_REVIEW_DECISION_CONTRACT_DIGEST" '
+    --argjson cv "$PG_REVIEW_DECISION_CONTRACT_VERSION" --argjson cds "$cds" '
     def keys_are($x): keys == ($x|sort);
     def hex: type=="string" and test("^[0-9a-f]{64}$");
     def oid: type=="string" and test("^[0-9a-f]{40}([0-9a-f]{24})?$");
     ([.. | strings | (length>1024 or test("[\u0000-\u001f\u007f]"))] | any | not)
     and keys_are(["accepted_epoch","artifact","contract_digest","contract_id","contract_version","input_binding_digest","input_binding_identity","marker","named_choice","provenance","record_type","record_version","ship_proof","verdict"])
     and .record_type=="review-result-binding/v1" and .record_version==1
-    and .contract_id==$cid and .contract_version==$cv and .contract_digest==$cd
+    and .contract_id==$cid and .contract_version==$cv and (.contract_digest|IN($cds[]))
     and (.marker|test("^pg-run-[A-Za-z0-9.-]+$")) and ($marker=="" or .marker==$marker)
     and (.accepted_epoch|type=="number" and floor==. and .>0)
     and (.input_binding_digest|hex) and .input_binding_identity==.marker
@@ -2878,6 +2948,9 @@ pg_review_binding_write_immutable() { # type marker json
   local type="$1" marker="$2" json="$3" canonical dir f tmp rc
   pg_reservation_marker_ok "$marker" || return 1
   canonical="$(pg_review_json_canonical "$json")" || return 1
+  # Reads accept predecessor-contract history; a NEW record always stamps the current contract, so
+  # the accepted set only ever grows backwards and never becomes a way to mint older records.
+  jq -e --arg cd "$PG_REVIEW_DECISION_CONTRACT_DIGEST" '.contract_digest==$cd' <<<"$canonical" >/dev/null 2>&1 || return 1
   case "$type" in
     input) pg_review_input_binding_validate "$canonical" "$marker" || return 1; dir="$(pg_review_input_binding_dir)" ;;
     result) pg_review_result_binding_validate "$canonical" "$marker" || return 1; dir="$(pg_review_result_binding_dir)" ;;
@@ -2909,6 +2982,27 @@ pg_review_binding_read() { # type marker
   [ "$(wc -c < "$f" 2>/dev/null | tr -d ' ')" = "${#canonical}" ] || return 1
   case "$type" in input) pg_review_input_binding_validate "$canonical" "$marker";; result) pg_review_result_binding_validate "$canonical" "$marker";; esac || return 1
   printf '%s' "$canonical"
+}
+
+# A record carrying a contract digest outside the accepted set is UNREADABLE history, never absent
+# history: treating it as absent lets an unchanged head buy a second review (gate #159 r1 P1). This
+# proves such a record exists for one exact target. Detection only — it returns no record bytes, and
+# its answer can only stop a round, never authorize or route one.
+pg_review_input_binding_foreign_contract() { # marker host owner repo pr head
+  local marker="$1" host="$2" owner="$3" name="$4" pr="$5" head="$6" f json canonical digest
+  pg_reservation_marker_ok "$marker" || return 1
+  f="$(pg_review_input_binding_dir)/$marker"
+  [ -f "$f" ] && [ ! -L "$f" ] || return 1
+  json="$(cat "$f" 2>/dev/null)" || return 1
+  canonical="$(pg_review_json_canonical "$json")" || return 1
+  digest="$(jq -r '.contract_digest // ""' <<<"$canonical" 2>/dev/null)" || return 1
+  case "$digest" in ''|*[!0-9a-f]*) return 1;; esac
+  [ "${#digest}" -eq 64 ] || return 1
+  if pg_review_decision_record_contract_digest_ok "$digest"; then return 1; fi
+  pg_review_input_binding_validate "$canonical" "$marker" "$digest" || return 1
+  jq -e --arg h "$host" --arg o "$owner" --arg r "$name" --argjson p "$pr" --arg head "$head" \
+    '.repository.host==$h and .repository.owner==$o and .repository.repo==$r
+     and .target.pr==$p and .target.head_oid==$head' <<<"$canonical" >/dev/null 2>&1
 }
 
 pg_review_input_binding_read() { pg_review_binding_read input "$1"; }
