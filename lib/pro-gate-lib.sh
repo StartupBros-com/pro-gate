@@ -2377,6 +2377,137 @@ pg_strip_nonce() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# v0.44 (#164): ONE run's block per published result. Two runs' prompts can reach a single
+# ChatGPT conversation, and the model then answers both — the collected page holds two
+# complete verdict-terminated blocks, one per marker. The v0.28 nonce check looks only at the
+# tail, so a page whose LAST verdict echoes this marker passed while a foreign run's findings
+# rode along above it; the caller's loop read the FIRST verdict line and dispatched a fixer at
+# a file that exists in another repository (ai-hedge-fund #176 r4, 2026-09-05). A foreign
+# marker in a published result is a provenance failure, not text.
+# ─────────────────────────────────────────────────────────────────────────────
+# pg_capture_foreign_echo <file> <marker> [any]: echo the first "(run marker: X)" ownership token
+# in <file> whose X is NOT <marker>, or nothing.
+#
+# Scope matters more than it looks. By default only VERDICT lines are scanned, because only a
+# verdict line CLAIMS ownership — the same invariant bin/cdp-salvage.mjs states at
+# foreignAnswerMarker (#68 gate r2 P1): a finding that merely mentions another run's marker is
+# prose, and this repo's own reviews quote incident markers verbatim. Scanning finding text for a
+# hard rejection would strand exactly those reviews, retry into the same text, and lose the round
+# — the failure #68 was written to prevent. Pass `any` for the whole-file read, which the
+# collector uses to WARN, never to refuse.
+pg_capture_foreign_echo() {
+  local f="$1" marker="$2" scope="${3:-verdict}" src
+  [ -s "$f" ] || return 1
+  if [ "$scope" = any ]; then src="$(cat "$f" 2>/dev/null)"
+  else src="$(grep -iE '^[[:space:]]*[*_>#-]*[[:space:]]*VERDICT[*_[:space:]]*:' "$f" 2>/dev/null)"; fi
+  printf '%s\n' "$src" \
+    | grep -oiE '\(run marker:[[:space:]]*pg-run-[A-Za-z0-9.-]+[[:space:]]*\)' 2>/dev/null \
+    | sed -E 's/^\([^:]*:[[:space:]]*//; s/[[:space:]]*\)$//' \
+    | grep -vxF -- "$marker" | head -1
+}
+
+# pg_capture_own_segment <file> <marker>: rewrite <file> in place to the review block terminated
+# by the VERDICT line that echoes <marker>, dropping every other run's block. Prints the foreign
+# markers whose blocks were dropped, one per line.
+#   rc 0 — this run owns the only verdict line: nothing to cut, bytes untouched (so the common
+#          clean capture reaches the caller byte-for-byte, exactly as before this guard existed)
+#   rc 2 — this run's block was isolated and <file> REWRITTEN; the caller must re-validate it
+#   rc 1 — no VERDICT line echoes <marker>: the file is left untouched and the caller adjudicates
+#          it exactly as before (nonce rejection under REQUIRE_NONCE, path overlap in legacy mode)
+#   rc 3 — an owned block WAS identified but the cut could not be written (disk/permissions).
+#          Distinct from rc 1 on purpose: the uncut bytes still carry a foreign block, so this
+#          must fail closed rather than fall through to the tail-only nonce check.
+pg_capture_own_segment() {
+  local f="$1" marker="$2" tmp="$1.segment.$$" dropped
+  [ -s "$f" ] || return 1
+  dropped="$(awk -v mk="$marker" -v out="$tmp" '
+    function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
+    {
+      n++; line[n] = $0
+      low = tolower($0)
+      if (low ~ /^[ \t]*[*_>#-]*[ \t]*verdict[*_ \t]*:/) {
+        vcount++; vidx[vcount] = n
+        p = index(low, "(run marker:")
+        if (p > 0) {
+          rest = substr($0, p + 12)
+          q = index(rest, ")")
+          if (q > 0) echo[n] = trim(substr(rest, 1, q - 1))
+        }
+      }
+    }
+    END {
+      if (vcount == 0) exit 1
+      pick = 0
+      for (k = vcount; k >= 1; k--) if (echo[vidx[k]] == mk) { pick = k; break }
+      if (pick == 0) exit 1
+      if (vcount == 1) exit 0                 # nothing to cut: leave the bytes alone
+      vi = vidx[pick]
+      # A block may never reach back past the verdict that closed the block before it.
+      floor = (pick > 1) ? vidx[pick - 1] + 1 : 1
+      start = 0
+      for (i = vi; i >= floor; i--) {
+        t = tolower(trim(line[i]))
+        if (t ~ /^[*_>#-]*[ \t]*(p0[ \t]*[:-]|p0([^0-9a-z_]|$)|\[p[0-3]\])/) start = i
+      }
+      if (start == 0) { start = vi - 120; if (start < floor) start = floor }
+      for (i = start; i <= vi; i++) print line[i] > out
+      close(out)
+      for (k = 1; k <= vcount; k++) if (k != pick && echo[vidx[k]] != "" && echo[vidx[k]] != mk) print echo[vidx[k]]
+      exit 2
+    }
+  ' "$f" 2>/dev/null)"
+  case $? in
+    0) rm -f "$tmp" 2>/dev/null; return 0 ;;
+    2) if [ -s "$tmp" ] && mv -f "$tmp" "$f" 2>/dev/null; then
+         [ -n "$dropped" ] && printf '%s\n' "$dropped"
+         return 2
+       fi
+       rm -f "$tmp" 2>/dev/null; return 3 ;;
+    *) rm -f "$tmp" 2>/dev/null; return 1 ;;
+  esac
+}
+
+# pg_capture_bind <file> <marker>: the collector's single provenance chokepoint. Isolates this
+# run's block, then refuses anything that would publish another run's ownership token.
+#   rc 0 — <file> now holds exactly this run's block
+#   rc 1 — no VERDICT line echoes this marker; <file> untouched, caller adjudicates as before
+#   rc 2 — provenance failure: the cut left an incomplete review, or a second run still CLAIMS
+#          the surviving block. Never publish; PG_CAPTURE_FOREIGN names the reason or marker.
+# PG_CAPTURE_CUT lists the foreign markers whose blocks were dropped (empty when none were).
+# PG_CAPTURE_QUOTED names a foreign marker mentioned in the surviving findings. That is prose,
+# not a provenance failure (see pg_capture_foreign_echo), so it is reported, never enforced.
+pg_capture_bind() {
+  local f="$1" marker="$2" cut rc keep="$1.pre-cut.$$"
+  PG_CAPTURE_CUT=""; PG_CAPTURE_FOREIGN=""; PG_CAPTURE_QUOTED=""
+  [ -s "$f" ] || return 1
+  # A rejected capture is set aside for a human to read, so the rejection must hand back the
+  # bytes that were actually collected — not the cut residue that proves nothing about why.
+  cp "$f" "$keep" 2>/dev/null || keep=""
+  cut="$(pg_capture_own_segment "$f" "$marker")"; rc=$?
+  case "$rc" in
+    0) ;;   # single owned verdict: nothing was rewritten, so nothing needs re-validating
+    2) PG_CAPTURE_CUT="$(printf '%s' "$cut" | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+       # A cut that leaves less than a complete review has isolated a verdict with no findings
+       # to attribute to it. Publishing that would report a verdict this run cannot evidence.
+       if ! pg_is_review "$f"; then
+         PG_CAPTURE_FOREIGN=incomplete-after-cut
+         [ -n "$keep" ] && mv -f "$keep" "$f" 2>/dev/null
+         rm -f "$keep" 2>/dev/null; return 2
+       fi ;;
+    3) PG_CAPTURE_FOREIGN=cut-write-failed; rm -f "$keep" 2>/dev/null; return 2 ;;
+    *) rm -f "$keep" 2>/dev/null; return 1 ;;
+  esac
+  PG_CAPTURE_FOREIGN="$(pg_capture_foreign_echo "$f" "$marker")"
+  if [ -n "$PG_CAPTURE_FOREIGN" ]; then
+    [ -n "$keep" ] && mv -f "$keep" "$f" 2>/dev/null
+    rm -f "$keep" 2>/dev/null; return 2
+  fi
+  PG_CAPTURE_QUOTED="$(pg_capture_foreign_echo "$f" "$marker" any)"
+  rm -f "$keep" 2>/dev/null
+  return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # v0.28 (#56): immutable completed-artifact store — $PRO_GATE_HOME/completed/<marker>,
 # written ONCE at collection time. Recovery paths previously trusted mutable, path-addressed
 # files (a reused/overwritten --out could impersonate a collection); the artifact store is

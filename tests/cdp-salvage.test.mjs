@@ -959,6 +959,37 @@ const MARKER = 'pg-run-test-1234567890-42';
   crossBoundCdp.stop();
 }
 
+{ // #164: two runs' prompts can reach ONE conversation, and the model then answers both — the
+  // page holds two complete verdict-terminated blocks, one per marker. Only the block closed by
+  // THIS run's verdict may be emitted, in EITHER layout. The inverse layout matters as much as
+  // the reported one: convicting a page that carries our own verdict blacklists and forgets the
+  // conversation holding our answer, which costs the whole charged round.
+  const foreign = 'pg-run-other-repo-2619-1111111111-9';
+  const ourBlock = ['P0: none', 'P1: none', `VERDICT: SHIP — ours. (run marker: ${MARKER})`];
+  const foreignBlock = [
+    '[P0] apps/blog-writer/src/hazards.claims.ts:31 — a tree this repository does not have',
+    'P1: none',
+    `VERDICT: FIX-FIRST — theirs. (run marker: ${foreign})`,
+  ];
+  for (const [layout, body] of [
+    ['foreign block first', [`run marker: ${MARKER}`, ...foreignBlock, '', ...ourBlock]],
+    ['foreign block last', [`run marker: ${MARKER}`, ...ourBlock, '', ...foreignBlock]],
+  ]) {
+    const cdp = await mockCdp(body.join('\n'));
+    const r = await runSalvage([MARKER, '3'], cdp.port);
+    check(`two-marker answer emits only this run's block (${layout})`,
+      r.status === 0 && r.stdout.trim() === ourBlock.join('\n'),
+      `status=${r.status} stdout=${JSON.stringify(r.stdout)}`);
+    check(`two-marker answer emits no foreign finding or marker (${layout})`,
+      !r.stdout.includes(foreign) && !r.stdout.includes('hazards.claims.ts'),
+      `stdout=${JSON.stringify(r.stdout)}`);
+    check(`a page carrying this run's own verdict is never convicted cross-bound (${layout})`,
+      r.crossbound === 0 && r.blacklist === null,
+      `crossbound=${r.crossbound} blacklist=${r.blacklist}`);
+    cdp.stop();
+  }
+}
+
 { // P1 (gate #91 r3): --probe must not report the conversation ABSENT just because the one-shot
   // revalidation was spent on a DIFFERENT remembered URL (A) that comes back cross-bound or
   // foreign, while the tab actually scanned (B) is demonstrably ours and still generating. Before

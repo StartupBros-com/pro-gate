@@ -261,7 +261,8 @@ handed back by `--recover <PR>` in place of it. Brief runs always take a diff-de
 The engine appends its own contract footer — the findings format, the terminal `VERDICT:` line, and
 the run marker — because the return path is review-shaped end to end: a capture is accepted only when
 it carries a `[Pn]` marker and one of `SHIP | FIX-FIRST | NEEDS-DISCUSSION`, and the collector bounds
-its extraction at the verdict line. An answer lacking that shape is discarded and its slot held until
+its extraction at the verdict line that echoes **this run's** marker — so when one conversation has
+received two runs' prompts, neither answer can bleed into the other's published result. An answer lacking that shape is discarded and its slot held until
 recovery. So a brief inherits a severity-ranked-analysis contract: findings as `[P0]`–`[P3]`, and a
 verdict reading as no-blockers / fix-these-first / needs-a-decision. Briefs are capped at 64 KiB;
 attach bulk context with `--extra-files`.

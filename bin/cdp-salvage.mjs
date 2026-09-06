@@ -665,14 +665,34 @@ async function freshRenderText(url, port, outerDeadline, waitForDecisiveEvidence
 // whitespace, and markers/space between the label and its colon (e.g. `**VERDICT:**`, `- P0 :`).
 const VERDICT_RE = /^\s*[*_>#-]*\s*VERDICT[*_\s]*:/i;
 const PBLOCK_START_RE = /^\s*[*_>#-]*\s*(P0\s*[:\-]|P0\b|\[P[0-3]\])/i;
+const ECHO_RE = /\(run marker:\s*(pg-run-[A-Za-z0-9.-]+)\s*\)/i;
+const echoedMarker = (line) => line.match(ECHO_RE)?.[1] ?? null;
+
+// #164: a single conversation can receive TWO runs' prompts, and the model then answers both —
+// the page holds two complete verdict-terminated blocks, one per marker. Returns the index of
+// the verdict line this run may claim (the LAST one echoing our marker) alongside every verdict
+// index, so callers can bound a block at the verdict that closed the block before it. Without
+// that floor the extraction reaches back past a foreign verdict and sweeps another repository's
+// findings into ours (ai-hedge-fund #176 r4, 2026-09-05).
+function verdictIndex(lines) {
+  const all = [];
+  for (let i = 0; i < lines.length; i++) if (VERDICT_RE.test(lines[i])) all.push(i);
+  let owned = -1;
+  for (let k = all.length - 1; k >= 0; k--) if (echoedMarker(lines[all[k]]) === marker) { owned = k; break; }
+  // No owned verdict: fall back to the terminal one and let the engine's nonce check adjudicate,
+  // exactly as before — the ambiguity this file must not resolve unilaterally.
+  const pick = owned >= 0 ? owned : all.length - 1;
+  return { all, pick, owned: owned >= 0 };
+}
 function extractReview(text) {
   const lines = text.split('\n');
-  let verdictIdx = -1;
-  for (let i = lines.length - 1; i >= 0; i--) if (VERDICT_RE.test(lines[i])) { verdictIdx = i; break; }
-  if (verdictIdx < 0) return null;
+  const { all, pick } = verdictIndex(lines);
+  if (pick < 0) return null;
+  const verdictIdx = all[pick];
+  const floor = pick > 0 ? all[pick - 1] + 1 : 0;
   let start = -1;
-  for (let i = verdictIdx; i >= 0; i--) if (PBLOCK_START_RE.test(lines[i].trim())) start = i;
-  if (start < 0) start = Math.max(0, verdictIdx - 120);
+  for (let i = verdictIdx; i >= floor; i--) if (PBLOCK_START_RE.test(lines[i].trim())) start = i;
+  if (start < 0) start = Math.max(floor, verdictIdx - 120);
   return lines.slice(start, verdictIdx + 1).join('\n').trim();
 }
 
@@ -684,6 +704,12 @@ function extractReview(text) {
 // remembered URL is exempt from blacklisting, poisoned that marker's memo permanently.
 // Returns the foreign marker when the ANSWER is provably another run's, else null.
 function foreignAnswerMarker(text) {
+  // #164: a page holding a verdict line that echoes OUR marker demonstrably answered OUR prompt,
+  // whatever else landed in the same conversation. Convicting it would blacklist and forget the
+  // conversation that carries our own answer — the inverse layout (our block, then a foreign
+  // one) cost a whole charged round that way. extractReview() isolates our block; the rest of
+  // the page is another run's business, not evidence that this one is cross-bound.
+  if (verdictIndex(text.split('\n')).owned) return null;
   const review = extractReview(text);
   if (!review) return null;                       // no completed answer here: decides nothing
   // ONLY the terminal VERDICT line carries ownership (#68 gate r2 P1). Scanning the last six
@@ -745,26 +771,48 @@ function lastExactRunMarkerAt(text) {
   return found;
 }
 
-function terminalVerdict(text) {
+// The verdict line that decides ownership: the last one echoing THIS run's marker when the page
+// carries one, else the terminal verdict (#164 — on a page two runs wrote to, "last" and "ours"
+// are different lines, and only "ours" may speak for this run). Identical to the former
+// terminal-only reading on every single-answer page.
+function ownedVerdict(text) {
   const lines = text.split('\n');
+  const { all, pick } = verdictIndex(lines);
+  if (pick < 0) return null;
   let at = 0;
-  let terminal = null;
-  for (const line of lines) {
-    if (VERDICT_RE.test(line)) terminal = { line, at };
-    at += line.length + 1;
-  }
-  return terminal;
+  for (let i = 0; i < all[pick]; i++) at += lines[i].length + 1;
+  return { line: lines[all[pick]], at };
 }
 
 // Mutation authority is intentionally stricter than salvage extraction. The engine may capture a
 // nonce-less completed answer and adjudicate it as retryable, but the organizer must not mutate that
 // page: once a verdict follows this run's prompt, only an exact marker echo proves it is our answer.
+// Any exact run marker AFTER `from` that is not ours. A conversation two runs wrote to is not
+// this run's to rename, archive or close: the other run may still be collecting from it.
+function foreignRunMarkerAfter(text, from) {
+  const tail = text.slice(from);
+  for (const match of tail.matchAll(/pg-run-[A-Za-z0-9.-]+/g)) {
+    const at = match.index;
+    if (isRunMarkerChar(at > 0 ? tail[at - 1] : '') || isRunMarkerChar(tail[at + match[0].length] ?? '')) continue;
+    if (match[0] !== marker) return match[0];
+  }
+  return null;
+}
+
 function organizerOwnership(text) {
   if (!hasExactMarker(text, marker)) return { owned: false, reason: 'marker-missing' };
-  const verdict = terminalVerdict(text);
+  const verdict = ownedVerdict(text);
   if (!verdict) return { owned: true, reason: 'live' };
   const answerMarker = verdict.line.match(/\(run marker:\s*(pg-run-[A-Za-z0-9.-]+)\s*\)/i)?.[1] ?? null;
-  if (answerMarker === marker) return { owned: true, reason: 'completed' };
+  if (answerMarker === marker) {
+    // #164: our answer can be genuinely ours AND be followed by another run's block in the same
+    // conversation. Collection reads that page happily (it cuts to our block); MUTATION must not,
+    // or the early rename relabels a chat the other run is still using. finalizerOwnership already
+    // refuses on a trailing run marker — this is the same refusal, so the two cannot disagree.
+    const shared = foreignRunMarkerAfter(text, verdict.at + verdict.line.length);
+    if (shared) return { owned: false, reason: 'shared-conversation', foreignMarker: shared };
+    return { owned: true, reason: 'completed' };
+  }
   if (verdict.at < lastExactMarkerAt(text, marker)) return { owned: true, reason: 'old-verdict' };
   return answerMarker
     ? { owned: false, reason: 'cross-bound', foreignMarker: answerMarker }
@@ -787,7 +835,7 @@ function stripMarkerEcho(value) {
 let acceptedReview = null;
 function finalizerOwnership(text) {
   if (acceptedReview === null) return { owned: false, reason: 'result-file-missing' };
-  const verdict = terminalVerdict(text);
+  const verdict = ownedVerdict(text);
   if (!verdict) return { owned: false, reason: 'answer-incomplete' };
   const promptMarkerAt = lastExactMarkerAt(text.slice(0, verdict.at), marker);
   if (promptMarkerAt < 0) return { owned: false, reason: 'answer-incomplete' };
@@ -1135,7 +1183,7 @@ function classifyEvidence(text, structuredError = null) {
   }
   const review = extractReview(text);
   if (!review) return { kind: 'owned-incomplete' };
-  const verdict = terminalVerdict(text);
+  const verdict = ownedVerdict(text);
   const promptMarkerAt = verdict ? lastExactMarkerAt(text.slice(0, verdict.at), marker) : -1;
   const answerMarker = verdict?.line.match(/\(run marker:\s*(pg-run-[A-Za-z0-9.-]+)\s*\)/i)?.[1] ?? null;
   // The marker echoed in the terminal line is not a later prompt. A separate exact marker after

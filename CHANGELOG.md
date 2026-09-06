@@ -19,6 +19,7 @@ Conventions in this file:
 
 | Version | Date | Artifact | Theme |
 |---|---|---|---|
+| v0.44.0 | 2026-09-06 | Pending release | One run's block per published result: the collector cuts a two-marker answer to this run's verdict, refuses what it cannot attribute, and the Oracle session name is pinned to the run marker |
 | v0.40.0 | 2026-09-04 | Pending release | Ledger failure reasons: a closed-enum `reason` and the status `detail` on every failed row |
 | v0.33.0 | 2026-08-15 | Pending release | Reservation lifecycle: a finished review releases its account slot instead of holding it to TTL |
 | [v0.32.0](https://github.com/StartupBros-com/pro-gate/releases/tag/v0.32.0) | 2026-08-08 | Release | Exact marker-owned conversation titles and durable-success archive lifecycle |
