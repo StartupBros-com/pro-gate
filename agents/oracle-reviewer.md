@@ -94,6 +94,9 @@ Dispatch all eight closed actions:
 - `agent-task` / `prepare-matching-review-evidence`: return the requested proof shape to the caller,
   then re-query after preparation without changing code.
 - `report-only` / `stop-without-new-review`: relay the normalized reason with no retry inference.
+  For `account-cooldown-active`, also relay `.facts.cooldown.seconds_remaining`: ChatGPT is
+  rate-limiting the account, and re-querying before that many seconds have passed cannot change
+  the answer.
 - `report-only` / `allow-existing-merge-workflow`: re-query immediately before handoff; the relay
   has no merge authority.
 - `named-product-choice` / `ask-named-product-choice`: ask only the validated named outcomes and

@@ -457,16 +457,24 @@ pg_browser_restarted_midrun() {
 # file expires by mtime, no cleanup needed. GNU stat || BSD stat. Checked alone by --harvest
 # (which spends nothing, so box-fitness gates don't apply) and inside pg_health_gate.
 pg_cooldown_active() {
+  local cdf left
+  cdf="${PRO_GATE_COOLDOWN_FILE:-$PRO_GATE_HOME/throttle.cooldown}"
+  left="$(pg_cooldown_remaining_secs)"
+  [ "$left" -gt 0 ] 2>/dev/null || return 1
+  echo "ChatGPT account back-off cooldown active (${left}s left; throttle/cloudflare; rm $cdf to override)"
+}
+# pg_cooldown_remaining_secs: whole seconds left on that cooldown, 0 when none is active. The
+# typed review decision carries this number (#162) so a wrapper can wait it out instead of
+# re-querying blindly; pg_cooldown_active derives its one-line reason from the same clock.
+pg_cooldown_remaining_secs() {
   local cdf cds mt age
   cdf="${PRO_GATE_COOLDOWN_FILE:-$PRO_GATE_HOME/throttle.cooldown}"
   cds="${PRO_GATE_THROTTLE_COOLDOWN:-900}"
-  [ -f "$cdf" ] || return 1
+  case "$cds" in ''|*[!0-9]*) cds=900;; esac
+  [ -f "$cdf" ] || { echo 0; return 0; }
   mt="$(stat -c %Y "$cdf" 2>/dev/null || stat -f %m "$cdf" 2>/dev/null || echo 0)"
   age=$(( $(date +%s) - mt ))
-  if [ "$age" -ge 0 ] && [ "$age" -lt "$cds" ]; then
-    echo "ChatGPT account back-off cooldown active ($(( cds - age ))s left; throttle/cloudflare; rm $cdf to override)"; return 0
-  fi
-  return 1
+  if [ "$age" -ge 0 ] && [ "$age" -lt "$cds" ]; then echo $(( cds - age )); else echo 0; fi
 }
 
 # pg_health_gate: call right before spending a Pro review slot (and before each retry).
@@ -1600,9 +1608,13 @@ pg_harvest_claimed() {
 # pg_reservation_reconcile <salvage-script> <port>: drop reservations older than TTL or only
 # after N consecutive confirmed-absent probes. A single 10s miss is NOT proof of loss: suspended
 # renderers, hydration delays, and temporary marker-read failures caused false releases in review.
-# Live (0) resets misses; throttle (5) and other errors keep state fail-closed.
+# Live (0) resets misses; throttle (5) and other errors keep state fail-closed. A live probe that
+# reports `probe-state: throttled` (#162: the limiter's modal over this run's conversation) is
+# neither progress nor absence: the record is retained with its miss streak untouched, and
+# because every probe is a page load against the throttled account, no further marker is probed
+# while the cooldown that probe wrote is active. TTL-only sweeps never rendered and still run.
 pg_reservation_reconcile() {
-  local salvage="$1" port="$2" dir ttl miss_limit interval now f marker pr out created misses slot model spend age mt rc probe_out
+  local salvage="$1" port="$2" dir ttl miss_limit interval now f marker pr out created misses slot model spend age mt rc probe_out cooldown_noted=0
   dir="$(pg_reservation_dir)"; [ -d "$dir" ] || return 0
   ttl="${PRO_GATE_RESERVATION_TTL:-21600}"; miss_limit="${PRO_GATE_RESERVATION_MISSES:-3}"
   interval="${PRO_GATE_RECONCILE_INTERVAL:-60}"; now="$(date +%s)"
@@ -1639,6 +1651,13 @@ pg_reservation_reconcile() {
     # TTL-only mode: harvest performs its own observation. It never releases on elapsed time alone;
     # misses remain explicit proof and are counted by that caller when its capture is absent.
     [ "${PG_RES_TTL_ONLY:-0}" = 1 ] && continue
+    # Checked per marker, not once per sweep: the throttle can first surface on this sweep's own
+    # probe of an earlier marker, and every later render would deepen the block.
+    if pg_cooldown_active >/dev/null 2>&1; then
+      [ "$cooldown_noted" = 1 ] || echo "[pro-gate] reservation probes skipped: $(pg_cooldown_active) — records retained, misses unchanged" >&2
+      cooldown_noted=1
+      continue
+    fi
     # Rate-limit probes per marker by file mtime: N concurrent fresh runs must not turn one
     # real absence window into N miss increments, and back-to-back reconciles should not spam
     # conversation probes. Writes/updates touch mtime, so consecutive misses are spaced by at
@@ -1666,6 +1685,11 @@ pg_reservation_reconcile() {
           else
             echo "[pro-gate] terminal infrastructure proof for $marker could not be persisted safely — reservation retained" >&2
           fi
+        elif printf '%s' "$probe_out" | grep -q '^probe-state: throttled$'; then
+          # The conversation exists under the "Too many requests" modal: not absence (no miss),
+          # not progress (no reset). The probe wrote the cooldown; the check above skips the rest
+          # of this sweep, pg_health_gate pauses fresh spends, and --harvest defers until it clears.
+          echo "[pro-gate] reservation $marker is throttled — ChatGPT's rate-limit modal covers its conversation; retained with misses unchanged, cooldown engaged" >&2
         else
           [ "$misses" -eq 0 ] || {
             pg_reservation_guard_acquire || continue
@@ -2484,8 +2508,8 @@ pg_completed_lookup() {  # <marker> <out>: place the artifact at <out>; rc 0 on 
 # ─────────────────────────────────────────────────────────────────────────────
 PG_REVIEW_DECISION_CONTRACT_ID='review-decision/v1'
 PG_REVIEW_DECISION_CONTRACT_VERSION=1
-PG_REVIEW_DECISION_CONTRACT_DIGEST='7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee'
-PG_REVIEW_DECISION_CORPUS_DIGEST='2a1e347e4c15766ab9c530074ae75aead7397349f5e13328c40183ced8b70b69'
+PG_REVIEW_DECISION_CONTRACT_DIGEST='bf36fdb5f8625e917be0539ca014fec518649d1160584846aca1cb9149533abb'
+PG_REVIEW_DECISION_CORPUS_DIGEST='60b4059115dd0651de8b209775f0783b3095f432842c036f618308a307b01358'
 
 pg_review_decision_contract_id() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_ID"; }
 pg_review_decision_contract_version() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_VERSION"; }
@@ -2660,8 +2684,10 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
       and (.canonical_identity|ident and length>0) and (.charged_spend_epoch|type=="number" and floor==.)
       and (.collected|type=="boolean") and (.legacy|type=="boolean") and (.marker|marker and length>0)
       and (.provenance_valid|type=="boolean") and (.verdict|IN("SHIP","FIX-FIRST","NEEDS-DISCUSSION","NONE"));
-    (keys_are(["active_index","completed_results","contract","evidence","governor","input","named_choice","observation","prior_review","reservation","target","transport"]))
+    (keys_are(["active_index","completed_results","contract","cooldown","evidence","governor","input","named_choice","observation","prior_review","reservation","target","transport"]))
     and (.contract|keys_are(["contract_digest","contract_id","contract_version","corpus_digest"]))
+    and (.cooldown|keys_are(["active","seconds_remaining"])) and (.cooldown.active|type=="boolean")
+    and (.cooldown.seconds_remaining|type=="number" and floor==. and .>=0)
     and (.active_index|keys_are(["binding_valid","charged_spend_epoch","marker","state"]))
     and (.active_index.binding_valid|type=="boolean") and (.active_index.charged_spend_epoch|type=="number" and floor==.)
     and (.active_index.marker|marker)
@@ -2797,6 +2823,12 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
   fi
   if [ "$(jq -r .governor.granted <<<"$canonical")" != true ]; then
     pg_review_decision_emit stop-without-new-review round-governor-denied "$canonical" "$snapshot"; return
+  fi
+  # The account back-off cooldown (#162) gates only a FRESH spend: collection, recovery, fixes,
+  # evidence preparation, and merge handoff above spend nothing and stay reachable during it.
+  # facts.cooldown.seconds_remaining tells the wrapper how long to wait before re-querying.
+  if [ "$(jq -r .cooldown.active <<<"$canonical")" = true ]; then
+    pg_review_decision_emit stop-without-new-review account-cooldown-active "$canonical" "$snapshot"; return
   fi
   if [ "$(jq -r .evidence.state <<<"$canonical")" = matching ]; then
     pg_review_decision_emit run-granted-review round-granted-for-changed-input "$canonical" "$snapshot"; return

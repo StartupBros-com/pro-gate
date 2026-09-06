@@ -135,7 +135,7 @@ daemon_handle_review_worker_failure(){ # worker-rc; fresh typed decision decides
 }
 
 daemon_dispatch_decision(){ # decision-file [redirect-depth]
-  local decision="$1" depth="${2:-0}" action class ref fresh fresh_action fresh_ref agent_rc
+  local decision="$1" depth="${2:-0}" action class ref fresh fresh_action fresh_ref agent_rc reason cooldown_left
   DAEMON_DISPATCH_REVIEW_RAN=0
   DAEMON_DISPATCH_AGENT_TASK_COMPLETED=0
   daemon_decision_valid "$decision" && daemon_decision_target_matches "$decision" "$DD_NWO" "$DD_NUM" "$DD_SHA" || {
@@ -182,7 +182,15 @@ daemon_dispatch_decision(){ # decision-file [redirect-depth]
       fi
       return "$agent_rc" ;;
     report-only/stop-without-new-review)
-      daemon_note "  · $DD_NWO#$DD_NUM stopped by runtime decision; no review worker, SHA completion, or failure-budget charge"
+      reason="$(jq -r '.reason // ""' "$decision" 2>/dev/null)"
+      if [ "$reason" = account-cooldown-active ]; then
+        # #162: the account is rate-limited. The SHA stays unprocessed, so the next poll re-queries;
+        # the decision carries how long the runtime will keep refusing a fresh spend.
+        cooldown_left="$(jq -r '.facts.cooldown.seconds_remaining // 0' "$decision" 2>/dev/null)"
+        daemon_note "  · $DD_NWO#$DD_NUM stopped by runtime decision ($reason, ${cooldown_left}s left); re-queried next poll — no review worker, SHA completion, or failure-budget charge"
+      else
+        daemon_note "  · $DD_NWO#$DD_NUM stopped by runtime decision (${reason:-unspecified}); no review worker, SHA completion, or failure-budget charge"
+      fi
       return 0 ;;
     report-only/allow-existing-merge-workflow)
       daemon_note "  · $DD_NWO#$DD_NUM has a runtime-reported merge-workflow handoff; daemon reports only and never merges"

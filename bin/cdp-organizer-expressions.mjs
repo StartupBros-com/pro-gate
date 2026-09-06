@@ -540,3 +540,39 @@ export function buildArchiveConversationExpression({
   })).finally(releaseMutationLease);
 })()`;
 }
+
+// ChatGPT's account-level rate-limit copy. The same two sentences appear on the short
+// interstitial page (no conversation rendered at all) and inside the "Too many requests" modal
+// ChatGPT shows OVER a real conversation. Deliberately NOT a generic /rate.?limit/ — review
+// findings routinely discuss rate limits.
+export const THROTTLE_RE = /making requests too quickly|temporarily limited access to your conversations/i;
+
+// #162: the limiter's MODAL over a rendered conversation. Whole-page text shape cannot see it —
+// the page is long and carries the run marker, so the interstitial guard (short, marker-less)
+// never matches and the probe reads "generating" for hours. Detect the dialog ELEMENT instead:
+// a visible modal container whose own text carries the throttle copy. Conversation text lives
+// outside any dialog, so a review that merely QUOTES the phrase never matches, and a dialog
+// that renders a run marker is a conversation surface, not the limiter. Evaluates to the
+// dialog text (already bounded by the admission cap below, and returned whole so the caller's
+// own THROTTLE_RE recheck sees the same bytes the in-page test matched), or null.
+export function buildThrottleModalExpression() {
+  return String.raw`(() => {
+    /* pro-gate:throttle-modal */
+    const pattern = new RegExp(${JSON.stringify(THROTTLE_RE.source)}, 'i');
+    const markerPattern = /pg-run-[A-Za-z0-9.-]+/;
+    const text = (node) => (node?.innerText || node?.textContent || '').trim();
+    const visible = (node) => {
+      try { return node.getClientRects().length > 0; } catch { return true; }
+    };
+    const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"], [aria-modal="true"]'));
+    for (const dialog of dialogs) {
+      const value = text(dialog);
+      if (!value || value.length > 2000) continue;
+      if (markerPattern.test(value)) continue;
+      if (!pattern.test(value)) continue;
+      if (!visible(dialog)) continue;
+      return value;
+    }
+    return null;
+  })()`;
+}

@@ -278,6 +278,84 @@ PRO_GATE_HOME="$TDIR/home" PRO_GATE_RESERVATION_MISSES=3 PRO_GATE_RECONCILE_INTE
 check 'positive probe resets miss streak' "$(awk -F'\t' 'NR==1{exit !($4==0)}' "$TDIR/home/in-progress/$MARKER"; echo $?)" "$(cat "$TDIR/home/in-progress/$MARKER")"
 check 'still-generating probe keeps the reservation occupying capacity' "$([ "$(PRO_GATE_HOME="$TDIR/home" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_state '$MARKER'")" = generating ]; echo $?)" "$(cat "$TDIR/home/in-progress/$MARKER")"
 
+# #162: every reconciliation probe is a page load against the account. While the back-off cooldown
+# is active the sweep must not render at all — a sentinel stands in for the salvage so "no probe"
+# is proven by an empty invocation log rather than inferred from unchanged state.
+echo '# reservation reconciliation under an active account cooldown performs no probe (#162)'
+cat > "$TDIR/probe-sentinel.mjs" <<'PROBE_SENTINEL'
+import fs from 'node:fs';
+fs.appendFileSync(process.env.PG_TEST_PROBE_LOG, `${process.argv.slice(2).join(' ')}\n`);
+console.error('probe-state: generating');
+process.exit(0);
+PROBE_SENTINEL
+: > "$TDIR/probe-sentinel.log"
+printf '%s cooldown-fixture\n' "$(date +%Y-%m-%dT%H:%M:%S%z)" > "$TDIR/home/throttle.cooldown"
+PRO_GATE_HOME="$TDIR/home" PRO_GATE_RESERVATION_MISSES=3 PRO_GATE_RECONCILE_INTERVAL=0 PG_TEST_PROBE_LOG="$TDIR/probe-sentinel.log" \
+  bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_reconcile '$TDIR/probe-sentinel.mjs' '$PORT'" 2>"$TDIR/reconcile-cooldown.err"
+check 'reconcile under active cooldown invokes no probe' "$([ ! -s "$TDIR/probe-sentinel.log" ]; echo $?)" "probes=$(cat "$TDIR/probe-sentinel.log")"
+check 'reconcile under active cooldown says so once and retains the record unchanged' \
+  "$([ "$(grep -cF 'reservation probes skipped' "$TDIR/reconcile-cooldown.err")" -eq 1 ] && [ -f "$TDIR/home/in-progress/$MARKER" ] \
+     && [ "$(PRO_GATE_HOME="$TDIR/home" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_state '$MARKER'")" = generating ]; echo $?)" \
+  "$(cat "$TDIR/reconcile-cooldown.err")"
+rm -f "$TDIR/home/throttle.cooldown"
+PRO_GATE_HOME="$TDIR/home" PRO_GATE_RESERVATION_MISSES=3 PRO_GATE_RECONCILE_INTERVAL=0 PG_TEST_PROBE_LOG="$TDIR/probe-sentinel.log" \
+  bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_reconcile '$TDIR/probe-sentinel.mjs' '$PORT'" 2>/dev/null
+check 'the same sweep probes once the cooldown has cleared (sentinel control)' \
+  "$([ "$(grep -cF -- "--probe $MARKER" "$TDIR/probe-sentinel.log")" -eq 1 ]; echo $?)" "probes=$(cat "$TDIR/probe-sentinel.log")"
+
+# #162: ChatGPT's "Too many requests" modal over the real conversation. The page is long and carries
+# the marker, so text shape reads it as an ordinary generating conversation; the element read must
+# classify it `throttled`: no miss (the conversation exists), no reset (it is not progressing),
+# cooldown engaged so the next sweep and every fresh spend back off.
+echo '# reservation probe classifies the throttle modal over a live conversation as throttled (#162)'
+THROTTLE_MODAL_TEXT="Too many requests. You're making requests too quickly. We've temporarily limited access to your conversations to protect your data. Please wait a few minutes before trying again."
+THROTTLE_MODAL_STATE="$TDIR/throttle-modal-state.json"
+jq -cn --arg modal "$THROTTLE_MODAL_TEXT" '{title:null,archived:false,events:[],throttleModal:$modal}' > "$THROTTLE_MODAL_STATE"
+{ printf '%s\nrun marker: %s\n' "$THROTTLE_MODAL_TEXT" "$MARKER"
+  awk 'BEGIN{for(i=0;i<120;i++) print "Reviewed concurrency risks in module " i ": lock ordering, retry budgets, and reservation TTL handling."}'
+  printf 'Reviewed concurrency risks\n'; } > "$TDIR/tab.txt"
+check 'modal fixture is longer than the interstitial guard and carries the marker' \
+  "$([ "$(wc -c < "$TDIR/tab.txt")" -gt 5000 ] && grep -qF "$MARKER" "$TDIR/tab.txt"; echo $?)" "bytes=$(wc -c < "$TDIR/tab.txt")"
+printf '%s\t%s\t%s\t2\t\t\t\tgenerating\n' "$PR_KEY_77" "$TDIR/o-h1.md" "$(date +%s)" > "$TDIR/home/in-progress/$MARKER"
+start_mock "$TDIR/tab.txt" "$THROTTLE_MODAL_STATE"
+PRO_GATE_HOME="$TDIR/home" PRO_GATE_RESERVATION_MISSES=3 PRO_GATE_RECONCILE_INTERVAL=0 \
+  bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_reconcile '$HERE/../bin/cdp-salvage.mjs' '$PORT'" 2>"$TDIR/reconcile-throttled.err"
+check 'throttled probe leaves the miss streak untouched (neither reset nor incremented)' \
+  "$(awk -F'\t' 'NR==1{exit !($4==2)}' "$TDIR/home/in-progress/$MARKER"; echo $?)" "$(cat "$TDIR/home/in-progress/$MARKER")"
+check 'throttled probe keeps the reservation generating (still occupying capacity)' \
+  "$([ "$(PRO_GATE_HOME="$TDIR/home" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_state '$MARKER'")" = generating ]; echo $?)" "$(cat "$TDIR/home/in-progress/$MARKER")"
+check 'throttled probe writes the account cooldown naming the modal' \
+  "$([ -f "$TDIR/home/throttle.cooldown" ] && grep -qF 'modal over tab' "$TDIR/home/throttle.cooldown"; echo $?)" "$(cat "$TDIR/home/throttle.cooldown" 2>/dev/null)"
+check 'reconciler reports the throttled reservation by name' \
+  "$(grep -qF "reservation $MARKER is throttled" "$TDIR/reconcile-throttled.err"; echo $?)" "$(cat "$TDIR/reconcile-throttled.err")"
+# pg_health_gate returns 1 by design here; under pipefail that status would mask a matched
+# reason, so capture its stdout and test the text directly.
+THROTTLED_GATE_REASON="$(PRO_GATE_HOME="$TDIR/home" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_health_gate" || true)"
+check 'throttled probe writes the cooldown pg_health_gate refuses fresh spends on' \
+  "$(case "$THROTTLED_GATE_REASON" in *'cooldown active'*) echo 0;; *) echo 1;; esac)" "$THROTTLED_GATE_REASON"
+rm -f "$TDIR/home/throttle.cooldown"
+
+# The observed symptom: a 45-minute --harvest waited its whole window and exited 9 "still
+# generating" under this modal. It must now defer (exit 8) at once, writing the cooldown, with the
+# reservation kept for a later harvest. Isolated home: pg_finish settles ramp and ledger state.
+echo '# harvest under the throttle modal defers instead of waiting out its window (#162)'
+MODAL_HOME="$TDIR/home-throttle-modal"
+mkdir -p "$MODAL_HOME/in-progress"
+printf '%s\t%s\t%s\t0\t\t\t\tgenerating\n' "$PR_KEY_77" "$MODAL_HOME/o-modal.md" "$(date +%s)" > "$MODAL_HOME/in-progress/$MARKER"
+MODAL_START="$(date +%s)"
+PRO_GATE_HOME="$MODAL_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" NODE_OPTIONS= \
+  bash "$ENGINE" --harvest "$MARKER" --out "$MODAL_HOME/o-modal.md" --timeout 5m >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'harvest under the throttle modal defers (exit 8) instead of exit 9' "$([ "$RC" -eq 8 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+check 'harvest under the throttle modal returns well inside its window' "$([ $(( $(date +%s) - MODAL_START )) -lt 120 ]; echo $?)" "secs=$(( $(date +%s) - MODAL_START ))"
+check 'harvest under the throttle modal publishes phase deferred' "$([ "$(phase_of "$MODAL_HOME/o-modal.md.status")" = deferred ]; echo $?)" "$(cat "$MODAL_HOME/o-modal.md.status" 2>/dev/null)"
+check 'harvest under the throttle modal writes the account cooldown and keeps the reservation' \
+  "$([ -f "$MODAL_HOME/throttle.cooldown" ] && [ -f "$MODAL_HOME/in-progress/$MARKER" ]; echo $?)" "cooldown=$(cat "$MODAL_HOME/throttle.cooldown" 2>/dev/null)"
+printf 'still thinking, run marker: %s\n' "$MARKER" > "$TDIR/tab.txt"
+printf '%s\t%s\t%s\t0\t\t\t\tgenerating\n' "$PR_KEY_77" "$TDIR/o-h1.md" "$(date +%s)" > "$TDIR/home/in-progress/$MARKER"
+start_mock "$TDIR/tab.txt" "$ORGANIZER_STATE"
+
 # ChatGPT keeps conversations server-side forever, so a FINISHED review probes as present on
 # every sweep and used to hold its slot for the whole 6h TTL — at effective concurrency 1 a
 # single uncollected review starved every other run (#82). Completion must release the capacity
@@ -4619,6 +4697,32 @@ rd_expect_stop 'identical verified code and evidence cannot authorize another re
   '{"prior_review":{"applicable":false,"binding_valid":true,"code_identity":"input-current","evidence_identity":"evidence-current","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000400-1","provenance_valid":true,"verdict":"NONE"}}' 'identical-code-and-evidence'
 rd_expect_stop 'no safe evidence action stops without caller inference' \
   '{"evidence":{"identity":"","safe_to_prepare":false,"state":"unsafe"}}' 'no-safe-action'
+# #162: the account cooldown is a normalized fact that stops only a FRESH spend.
+rd_expect_stop 'account cooldown stops a fresh spend with the closed reason' \
+  '{"cooldown":{"active":true,"seconds_remaining":120}}' 'account-cooldown-active'
+COOLDOWN_OUT="$(rd_reduce "$(rd_facts '{"cooldown":{"active":true,"seconds_remaining":120}}')")"
+check 'cooldown decision carries the seconds remaining for the wrapper to wait' \
+  "$(jq -e '.facts.cooldown.seconds_remaining == 120 and .facts.cooldown.active == true' <<<"$COOLDOWN_OUT" >/dev/null 2>&1; echo $?)" "$COOLDOWN_OUT"
+rd_expect_stop 'governor denial outranks the cooldown (waiting it out would not help)' \
+  '{"cooldown":{"active":true,"seconds_remaining":120},"governor":{"granted":false}}' 'round-governor-denied'
+COOLDOWN_COLLECT_OUT="$(rd_reduce "$(rd_facts '{"cooldown":{"active":true,"seconds_remaining":120},"completed_results":[{"applicable":true,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binding_valid":true,"canonical_identity":"result-cool","charged_spend_epoch":1700000900,"collected":false,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000900-1","provenance_valid":true,"verdict":"SHIP"}]}')")"
+check 'account cooldown never blocks collecting an existing result' \
+  "$(jq -e '.action == "collect-existing-result"' <<<"$COOLDOWN_COLLECT_OUT" >/dev/null 2>&1; echo $?)" "$COOLDOWN_COLLECT_OUT"
+COOLDOWN_FIX_OUT="$(rd_reduce "$(rd_facts '{"cooldown":{"active":true,"seconds_remaining":120},"prior_review":{"applicable":true,"binding_valid":true,"code_identity":"input-current","evidence_identity":"evidence-current","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000901-1","provenance_valid":true,"verdict":"FIX-FIRST"}}')")"
+check 'account cooldown never blocks fixing current findings' \
+  "$(jq -e '.action == "fix-review-findings"' <<<"$COOLDOWN_FIX_OUT" >/dev/null 2>&1; echo $?)" "$COOLDOWN_FIX_OUT"
+COOLDOWN_RECOVER_OUT="$(rd_reduce "$(rd_facts '{"cooldown":{"active":true,"seconds_remaining":120},"reservation":{"binding_valid":false,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000902-1","state":"live"}}')")"
+check 'account cooldown never blocks recovering reserved work' \
+  "$(jq -e '.action == "recover-existing-review"' <<<"$COOLDOWN_RECOVER_OUT" >/dev/null 2>&1; echo $?)" "$COOLDOWN_RECOVER_OUT"
+COOLDOWN_PREP_OUT="$(rd_reduce "$(rd_facts '{"cooldown":{"active":true,"seconds_remaining":120},"evidence":{"identity":"","safe_to_prepare":true,"state":"missing"}}')")"
+check 'account cooldown never blocks preparing evidence (spends nothing)' \
+  "$(jq -e '.action == "prepare-matching-review-evidence"' <<<"$COOLDOWN_PREP_OUT" >/dev/null 2>&1; echo $?)" "$COOLDOWN_PREP_OUT"
+rd_expect_stop 'malformed cooldown facts stop closed' '{"cooldown":{"active":"yes","seconds_remaining":120}}' 'undefined-state'
+rd_expect_stop 'negative cooldown seconds stop closed' '{"cooldown":{"active":true,"seconds_remaining":-1}}' 'undefined-state'
+COOLDOWN_MISSING="$(rd_facts '{}')"; COOLDOWN_MISSING="$(jq -cS 'del(.cooldown)' <<<"$COOLDOWN_MISSING")"
+COOLDOWN_MISSING_OUT="$(rd_reduce "$COOLDOWN_MISSING")"
+check 'facts without the cooldown relation are an undefined state, never an implicit grant' \
+  "$(jq -e '.action == "stop-without-new-review" and .reason == "undefined-state"' <<<"$COOLDOWN_MISSING_OUT" >/dev/null 2>&1; echo $?)" "$COOLDOWN_MISSING_OUT"
 for crash_state in pre-charge round-recorded charged run-meta-written input-bound submitted unknown-fate; do
   crash_patch="$(jq -cn --arg s "$crash_state" '{active_index:{binding_valid:($s == "input-bound" or $s == "submitted"),charged_spend_epoch:1700000500,marker:"pg-run-acme-widgets-1983-1700000500-1",state:$s}}')"
   crash_out="$(rd_reduce "$(rd_facts "$crash_patch")")"
@@ -4699,6 +4803,23 @@ DECISION_LINKED_RC=$?
 check 'review-decision accepts a linked working tree with a .git file' \
   "$([ "$DECISION_LINKED_RC" -eq 0 ] && [ -f "$DECISION_LINKED/.git" ] && jq -e '.action=="run-granted-review"' "$TDIR/review-decision-linked.json" >/dev/null 2>&1; echo $?)" \
   "rc=$DECISION_LINKED_RC output=$(cat "$TDIR/review-decision-linked.json") stderr=$(cat "$TDIR/review-decision-linked.err")"
+# #162: the same grant under an active account cooldown reduces to a closed stop that names the
+# seconds remaining, so a wrapper waits rather than retrying a query pg_health_gate would refuse.
+COOLDOWN_QUERY_FILE="$TDIR/review-decision-cooldown.stamp"; : > "$COOLDOWN_QUERY_FILE"
+env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_COOLDOWN_FILE="$COOLDOWN_QUERY_FILE" \
+  bash "$ENGINE" --review-decision --json --repo "$DECISION_LINKED" --pr 1983 --input connector \
+  >"$TDIR/review-decision-cooldown.json" 2>"$TDIR/review-decision-cooldown.err"
+DECISION_COOLDOWN_RC=$?
+check 'active account cooldown reduces the granted query to a closed stop with seconds remaining' \
+  "$([ "$DECISION_COOLDOWN_RC" -eq 0 ] && jq -e '.action == "stop-without-new-review" and .reason == "account-cooldown-active" and .effect_request.execution_class == "report-only" and .facts.cooldown.active == true and (.facts.cooldown.seconds_remaining | type == "number" and . > 0 and . <= 900)' "$TDIR/review-decision-cooldown.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$DECISION_COOLDOWN_RC output=$(cat "$TDIR/review-decision-cooldown.json") stderr=$(cat "$TDIR/review-decision-cooldown.err")"
+check 'cooldown query creates no durable state' "$([ ! -e "$DECISION_HOME" ]; echo $?)" "state=$(find "$DECISION_HOME" -mindepth 1 -maxdepth 2 -print 2>/dev/null | tr '\n' ' ')"
+rm -f "$COOLDOWN_QUERY_FILE"
+env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_COOLDOWN_FILE="$COOLDOWN_QUERY_FILE" \
+  bash "$ENGINE" --review-decision --json --repo "$DECISION_LINKED" --pr 1983 --input connector \
+  >"$TDIR/review-decision-cooldown-clear.json" 2>/dev/null
+check 'the grant returns once the cooldown clears, with inactive cooldown facts' \
+  "$(jq -e '.action == "run-granted-review" and .facts.cooldown == {active:false,seconds_remaining:0}' "$TDIR/review-decision-cooldown-clear.json" >/dev/null 2>&1; echo $?)" "$(cat "$TDIR/review-decision-cooldown-clear.json")"
 mkdir -p "$TDIR/review-decision-nonrepo"
 env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 \
   bash "$ENGINE" --review-decision --repo "$TDIR/review-decision-nonrepo" --pr 1983 --input connector \
