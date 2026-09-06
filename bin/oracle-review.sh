@@ -3634,14 +3634,21 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
 # A precious Pro review slot is spent only when the box is fit; a dropped connection is first
 # SALVAGED (the answer may have finished server-side), and only a truly-lost run is retried once.
 # Exit 8 = deferred (no slot spent); exit 6 = ran but produced nothing after salvage + retry.
-# v0.44 (#164): the Oracle session name is PINNED TO THE RUN MARKER, never to the PR number.
+# v0.44 (#164): the Oracle session name is PINNED PER INVOCATION, never to the PR number.
 # A PR-scoped name is shared by every round and every retry of that PR, so Oracle disambiguated
 # with a collision suffix (`pro-gate-review-pr-176-4`) — a name a LATER invocation can mint or
 # reattach to as readily as this one. That is one of the three routes by which two runs' prompts
 # reached a single conversation and the model answered both (the collector now refuses to publish
-# such an answer; this stops it being produced). The marker is unique per invocation — it carries
-# the change key, the launch epoch and the pid — so no two runs can ever name the same session.
-SLUG_BASE="$RUN_MARKER"
+# such an answer; this stops it being produced).
+#
+# Derived from the marker rather than being the marker (#166 gate r1 P2): Oracle NORMALIZES a
+# custom slug down to five ten-character words, which reduces a raw marker to "pg-run-startupbro-
+# com-pro" — the same name for every run in the repository, and not the name the reattach fallback
+# below would then ask for. pg_oracle_slug keeps the epoch and pid that make the marker unique, is
+# a fixed point of that normalization so the name we send is the name Oracle stores, and does not
+# itself parse as a run marker — the slug rides oracle's argv and run log, and a second token
+# claiming to be a marker is the bug class #164 is about.
+SLUG_BASE="$(pg_oracle_slug "$RUN_MARKER")"
 REATTACH_TIMEOUT="${PRO_GATE_REATTACH_TIMEOUT:-150}"
 MAX_RETRIES="${PRO_GATE_MAX_RETRIES:-1}"
 BACKOFF="${PRO_GATE_RETRY_BACKOFF:-20}"
@@ -3884,9 +3891,12 @@ while :; do
 
   # No output. The generation may have COMPLETED server-side after a dropped Chrome connection —
   # try a bounded salvage (never hangs) before spending another slot. Capture the slug oracle
-  # actually used. Since #164 pinned SLUG_BASE to the run marker a collision suffix should be
-  # unreachable, but reading it back stays authoritative: reattach must address the session
-  # Oracle really created, never the one this process asked for.
+  # actually used. Since #164 pinned SLUG_BASE per invocation, and SLUG_BASE survives Oracle's slug
+  # normalization unchanged (#166 gate r1 P2), the fallback now names a session Oracle really
+  # stored — where before it named one Oracle had truncated away. Reading the log stays
+  # authoritative regardless: a SECOND oracle call in this same process (the model-picker re-run,
+  # or a retry) reserves the same name again and Oracle appends its own "-2", so only the log knows
+  # which session this attempt got.
   SLUG="$(grep -oE 'oracle session [A-Za-z0-9._-]+' "$RUNLOG" 2>/dev/null | tail -1 | awk '{print $NF}')"
   [ -n "$SLUG" ] || SLUG="$SLUG_BASE"
   echo "[oracle-review] no output — bounded salvage via reattach (session ${SLUG}, ${REATTACH_TIMEOUT}s)..." >&2

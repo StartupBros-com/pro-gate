@@ -2395,6 +2395,14 @@ pg_strip_nonce() {
 # hard rejection would strand exactly those reviews, retry into the same text, and lose the round
 # — the failure #68 was written to prevent. Pass `any` for the whole-file read, which the
 # collector uses to WARN, never to refuse.
+#
+# The exclusion is case-INSENSITIVE to match the extraction above it (#166 gate r1 P1). A marker
+# carries un-lowercased repo text ("pg-run-StartupBros-com-…"), so a model that lowercases its own
+# echo was being reported as a DIFFERENT run and its clean single-answer review refused as
+# unattributable — durably, since every retry re-reads the same text. Two genuinely different runs
+# cannot differ only in case: the marker ends in the launch epoch and pid, and one process has one
+# of each. Recognizing the echo here does NOT grant ownership — pg_capture_nonce_ok stays exact, so
+# a mis-cased echo remains an unbound, retryable capture exactly as it was before this guard.
 pg_capture_foreign_echo() {
   local f="$1" marker="$2" scope="${3:-verdict}" src
   [ -s "$f" ] || return 1
@@ -2403,7 +2411,7 @@ pg_capture_foreign_echo() {
   printf '%s\n' "$src" \
     | grep -oiE '\(run marker:[[:space:]]*pg-run-[A-Za-z0-9.-]+[[:space:]]*\)' 2>/dev/null \
     | sed -E 's/^\([^:]*:[[:space:]]*//; s/[[:space:]]*\)$//' \
-    | grep -vxF -- "$marker" | head -1
+    | grep -vixF -- "$marker" | head -1
 }
 
 # pg_capture_own_segment <file> <marker>: rewrite <file> in place to the review block terminated
@@ -2412,8 +2420,9 @@ pg_capture_foreign_echo() {
 #   rc 0 — this run owns the only verdict line: nothing to cut, bytes untouched (so the common
 #          clean capture reaches the caller byte-for-byte, exactly as before this guard existed)
 #   rc 2 — this run's block was isolated and <file> REWRITTEN; the caller must re-validate it
-#   rc 1 — no VERDICT line echoes <marker>: the file is left untouched and the caller adjudicates
-#          it exactly as before (nonce rejection under REQUIRE_NONCE, path overlap in legacy mode)
+#   rc 1 — no VERDICT line echoes <marker>: the file is left untouched and pg_capture_bind decides
+#          (an explicit foreign claim is refused there; anything else the caller adjudicates
+#          exactly as before — nonce rejection under REQUIRE_NONCE, path overlap in legacy mode)
 #   rc 3 — an owned block WAS identified but the cut could not be written (disk/permissions).
 #          Distinct from rc 1 on purpose: the uncut bytes still carry a foreign block, so this
 #          must fail closed rather than fall through to the tail-only nonce check.
@@ -2422,11 +2431,22 @@ pg_capture_own_segment() {
   [ -s "$f" ] || return 1
   dropped="$(awk -v mk="$marker" -v out="$tmp" '
     function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
+    function isblockstart(s,   t) {
+      t = tolower(trim(s))
+      return (t ~ /^[*_>#-]*[ \t]*(p0[ \t]*[:-]|p0([^0-9a-z_]|$)|\[p[0-3]\])/)
+    }
     {
       n++; line[n] = $0
+      if ($0 ~ /^[ \t]*(```|~~~)/) { fenced = !fenced; next }
       low = tolower($0)
       if (low ~ /^[ \t]*[*_>#-]*[ \t]*verdict[*_ \t]*:/) {
         vcount++; vidx[vcount] = n
+        # #166 gate r1 P1: a verdict BOUNDS a block only when it is a real terminator. A review
+        # may quote one as an example inside a finding ("> VERDICT: SHIP - example"), and treating
+        # that as a boundary floors the cut in the middle of the finding and publishes the suffix
+        # with its own header deleted. Quoted, indented and fenced verdicts stay ownership
+        # candidates (the model may format its real one that way) but never bound anything.
+        bound[n] = (!fenced && $0 !~ /^([ ][ ]|\t|[ ]*>)/)
         p = index(low, "(run marker:")
         if (p > 0) {
           rest = substr($0, p + 12)
@@ -2440,14 +2460,31 @@ pg_capture_own_segment() {
       pick = 0
       for (k = vcount; k >= 1; k--) if (echo[vidx[k]] == mk) { pick = k; break }
       if (pick == 0) exit 1
-      if (vcount == 1) exit 0                 # nothing to cut: leave the bytes alone
       vi = vidx[pick]
+      # Nothing to cut unless some OTHER verdict really closes a block: an example quoted inside
+      # this run own findings is not another answer, and rewriting on account of it would delete
+      # the finding that wrote it.
+      others = 0
+      bn = 0
+      for (k = 1; k <= vcount; k++) {
+        if (!bound[vidx[k]] || vidx[k] == vi) continue
+        others++
+        if (vidx[k] < vi) { bn++; bpre[bn] = vidx[k] }
+      }
+      if (others == 0) exit 0                 # nothing to cut: leave the bytes alone
       # A block may never reach back past the verdict that closed the block before it.
-      floor = (pick > 1) ? vidx[pick - 1] + 1 : 1
+      j = bn
+      floor = (bn > 0) ? bpre[bn] + 1 : 1
       start = 0
-      for (i = vi; i >= floor; i--) {
-        t = tolower(trim(line[i]))
-        if (t ~ /^[*_>#-]*[ \t]*(p0[ \t]*[:-]|p0([^0-9a-z_]|$)|\[p[0-3]\])/) start = i
+      while (1) {
+        for (i = vi; i >= floor; i--) if (isblockstart(line[i])) start = i
+        if (start > 0 || j == 0) break
+        # No block header under this floor, so the floor did not open a block - it landed inside
+        # one, and cutting there would publish a headerless suffix. Widen by one block. NEVER past
+        # a verdict that CLAIMS another run: those bytes can not be ours whatever they look like.
+        if (echo[bpre[j]] != "" && echo[bpre[j]] != mk) break
+        j--
+        floor = (j > 0) ? bpre[j] + 1 : 1
       }
       if (start == 0) { start = vi - 120; if (start < floor) start = floor }
       for (i = start; i <= vi; i++) print line[i] > out
@@ -2470,9 +2507,11 @@ pg_capture_own_segment() {
 # pg_capture_bind <file> <marker>: the collector's single provenance chokepoint. Isolates this
 # run's block, then refuses anything that would publish another run's ownership token.
 #   rc 0 — <file> now holds exactly this run's block
-#   rc 1 — no VERDICT line echoes this marker; <file> untouched, caller adjudicates as before
-#   rc 2 — provenance failure: the cut left an incomplete review, or a second run still CLAIMS
-#          the surviving block. Never publish; PG_CAPTURE_FOREIGN names the reason or marker.
+#   rc 1 — no VERDICT line echoes this marker AND none claims another run; <file> untouched,
+#          caller adjudicates as before
+#   rc 2 — provenance failure: the cut left an incomplete review, or a verdict line still CLAIMS
+#          another run — including when NO line echoes ours, since a foreign claim is a claim
+#          whatever else shares the line. Never publish; PG_CAPTURE_FOREIGN names reason/marker.
 # PG_CAPTURE_CUT lists the foreign markers whose blocks were dropped (empty when none were).
 # PG_CAPTURE_QUOTED names a foreign marker mentioned in the surviving findings. That is prose,
 # not a provenance failure (see pg_capture_foreign_echo), so it is reported, never enforced.
@@ -2495,7 +2534,19 @@ pg_capture_bind() {
          rm -f "$keep" 2>/dev/null; return 2
        fi ;;
     3) PG_CAPTURE_FOREIGN=cut-write-failed; rm -f "$keep" 2>/dev/null; return 2 ;;
-    *) rm -f "$keep" 2>/dev/null; return 1 ;;
+    *) # No verdict line echoes this marker. That is NOT automatically the caller's to adjudicate
+       # (#166 gate r1 P1): an EXPLICIT foreign ownership claim on a verdict line is a provenance
+       # failure whatever else that line carries. pg_capture_own_segment reads the FIRST echo on a
+       # line, so "(run marker: THEIRS) (run marker: OURS)" lands HERE - and the tail nonce check
+       # downstream then accepts it on the second token alone, while a DIRECT oracle capture,
+       # exempt from that check entirely, accepts a foreign-only answer outright. Reject both here,
+       # where every source passes, so marker order on the line cannot decide ownership.
+       PG_CAPTURE_FOREIGN="$(pg_capture_foreign_echo "$f" "$marker")"
+       if [ -n "$PG_CAPTURE_FOREIGN" ]; then
+         [ -n "$keep" ] && mv -f "$keep" "$f" 2>/dev/null
+         rm -f "$keep" 2>/dev/null; return 2
+       fi
+       rm -f "$keep" 2>/dev/null; return 1 ;;
   esac
   PG_CAPTURE_FOREIGN="$(pg_capture_foreign_echo "$f" "$marker")"
   if [ -n "$PG_CAPTURE_FOREIGN" ]; then
@@ -2505,6 +2556,52 @@ pg_capture_bind() {
   PG_CAPTURE_QUOTED="$(pg_capture_foreign_echo "$f" "$marker" any)"
   rm -f "$keep" 2>/dev/null
   return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.44 (#164, gate r1 P2): the Oracle session name a run asks for.
+#
+# Oracle NORMALIZES a custom --slug before storing it (sessionManager.js slugify/normalizeCustomSlug:
+# lowercase, split into [a-z0-9]+ words, keep the FIRST 5, truncate each to 10 characters, join with
+# "-", and reject fewer than 3 words). A run marker handed over raw does not survive that:
+# "pg-run-StartupBros-com-pro-gate-166-1788719459-1312546" is stored as "pg-run-startupbro-com-pro",
+# dropping the PR number, launch epoch and pid — everything that made the marker unique — so EVERY
+# run in the repository asks for one name and Oracle disambiguates with the same collision counter
+# the pin was meant to retire. The name we send must therefore be a FIXED POINT of that normalizer:
+# then what we ask for is exactly what Oracle stores, which is what the reattach fallback addresses
+# when the run log carries no session id of its own.
+# ─────────────────────────────────────────────────────────────────────────────
+# pg_slug_normalize <text>: Oracle's normalization, reimplemented. Idempotent by construction.
+pg_slug_normalize() {
+  printf '%s\n' "$1" | awk '{
+    s = tolower($0); out = ""; n = 0
+    while (n < 5 && match(s, /[a-z0-9]+/)) {
+      w = substr(s, RSTART, RLENGTH); s = substr(s, RSTART + RLENGTH)
+      if (length(w) > 10) w = substr(w, 1, 10)
+      out = (out == "" ? w : out "-" w); n++
+    }
+    print out
+  }'
+}
+# pg_oracle_slug <marker>: the session name for a run marker — unique per invocation AND a fixed
+# point of pg_slug_normalize. A marker is "pg-run-<round key>-<epoch>-<pid>": the epoch and pid are
+# what make it unique, and the round key's last field (the PR number, or "diff") is what makes the
+# session recognizable in `oracle sessions`. Five words, none over ten characters, so Oracle stores
+# it verbatim. A marker of another shape still round-trips: it is normalized rather than trusted.
+#
+# Deliberately NOT prefixed "pg-run-": a run marker is a token this codebase scans for wherever
+# text might carry one (FOREIGN_MARKER_RE, foreignRunMarkerAfter, isThrottlePage), and the slug
+# travels in oracle's argv and run log. A session name that parses as a marker is a second thing
+# claiming to be one, which is the whole class of bug #164 is about.
+pg_oracle_slug() {
+  local marker="$1" pid rest epoch key keytail
+  pid="${marker##*-}"; rest="${marker%-*}"
+  epoch="${rest##*-}"; key="${rest%-*}"
+  keytail="$(printf '%s' "${key##*-}" | tr -cd 'A-Za-z0-9' | cut -c1-10)"
+  case "$epoch$pid" in
+    ''|*[!0-9]*) pg_slug_normalize "pro-gate-review-$marker" ;;
+    *) pg_slug_normalize "pro-gate-${keytail:-review}-$epoch-$pid" ;;
+  esac
 }
 
 # ─────────────────────────────────────────────────────────────────────────────

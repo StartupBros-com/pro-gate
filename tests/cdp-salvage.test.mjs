@@ -990,6 +990,56 @@ const MARKER = 'pg-run-test-1234567890-42';
   }
 }
 
+{ // #166 gate r1 P1: a review may QUOTE a verdict inside a finding. Flooring the emitted block on
+  // that quoted line deletes the finding's own header and publishes the remainder, which still
+  // looks structurally like a review — nothing downstream catches it. Only a real terminator
+  // (unquoted, unindented, unfenced) may bound a block; mirrored by pg_capture_own_segment.
+  const body = [
+    `run marker: ${MARKER}`,
+    '',
+    '[P1] src/real.sh:4 — reviews sometimes show a verdict inline',
+    '  > VERDICT: SHIP — example',
+    '  and keep explaining afterwards',
+    'P2: none',
+    'P3: none',
+    `VERDICT: FIX-FIRST — ours. (run marker: ${MARKER})`,
+  ];
+  const cdp = await mockCdp(body.join('\n'));
+  const r = await runSalvage([MARKER, '3'], cdp.port);
+  check('a verdict quoted in a finding does not truncate the emitted block',
+    r.status === 0 && r.stdout.includes('[P1] src/real.sh:4') && r.stdout.includes('and keep explaining afterwards'),
+    `status=${r.status} stdout=${JSON.stringify(r.stdout)}`);
+  check('a verdict quoted in a finding still ends the block at OUR terminal verdict',
+    r.stdout.trim() === body.slice(2).join('\n'),
+    `stdout=${JSON.stringify(r.stdout)}`);
+  cdp.stop();
+}
+
+{ // #166 gate r1 P1, the other half: a REAL foreign terminator must still floor the block. The
+  // quoted-verdict exemption may not reopen the #164 hole it sits next to.
+  const foreign = 'pg-run-other-repo-2619-1111111111-9';
+  const ourBlock = [
+    '[P1] src/real.sh:4 — a finding that quotes a verdict',
+    '  > VERDICT: SHIP — example',
+    'P2: none',
+    `VERDICT: FIX-FIRST — ours. (run marker: ${MARKER})`,
+  ];
+  const body = [
+    `run marker: ${MARKER}`,
+    '[P0] apps/blog-writer/src/hazards.claims.ts:31 — a tree this repository does not have',
+    'P1: none',
+    `VERDICT: FIX-FIRST — theirs. (run marker: ${foreign})`,
+    '',
+    ...ourBlock,
+  ];
+  const cdp = await mockCdp(body.join('\n'));
+  const r = await runSalvage([MARKER, '3'], cdp.port);
+  check('a quoted verdict does not stop a real foreign terminator from flooring the block',
+    r.status === 0 && r.stdout.trim() === ourBlock.join('\n'),
+    `status=${r.status} stdout=${JSON.stringify(r.stdout)}`);
+  cdp.stop();
+}
+
 { // P1 (gate #91 r3): --probe must not report the conversation ABSENT just because the one-shot
   // revalidation was spent on a DIFFERENT remembered URL (A) that comes back cross-bound or
   // foreign, while the tab actually scanned (B) is demonstrably ours and still generating. Before

@@ -674,24 +674,52 @@ const echoedMarker = (line) => line.match(ECHO_RE)?.[1] ?? null;
 // index, so callers can bound a block at the verdict that closed the block before it. Without
 // that floor the extraction reaches back past a foreign verdict and sweeps another repository's
 // findings into ours (ai-hedge-fund #176 r4, 2026-09-05).
+//
+// `bounds` is the subset that may act as that floor (#166 gate r1 P1). A review can QUOTE a
+// verdict inside a finding — "> VERDICT: SHIP — example" — and flooring on it cuts the finding's
+// own header away and publishes the remainder as if it were a whole block. A quoted, indented or
+// fenced verdict stays an ownership candidate, because the model may format its real one that
+// way, but it never bounds anything. Mirrored by pg_capture_own_segment in lib/pro-gate-lib.sh.
+const FENCE_RE = /^[ \t]*(```|~~~)/;
+const VERDICT_EMBEDDED_RE = /^([ ][ ]|\t|[ ]*>)/;
+const isBlockStart = (line) => PBLOCK_START_RE.test(line.trim());
 function verdictIndex(lines) {
   const all = [];
-  for (let i = 0; i < lines.length; i++) if (VERDICT_RE.test(lines[i])) all.push(i);
+  const bounds = [];
+  let fenced = false;
+  for (let i = 0; i < lines.length; i++) {
+    if (FENCE_RE.test(lines[i])) { fenced = !fenced; continue; }
+    if (!VERDICT_RE.test(lines[i])) continue;
+    all.push(i);
+    if (!fenced && !VERDICT_EMBEDDED_RE.test(lines[i])) bounds.push(i);
+  }
   let owned = -1;
   for (let k = all.length - 1; k >= 0; k--) if (echoedMarker(lines[all[k]]) === marker) { owned = k; break; }
   // No owned verdict: fall back to the terminal one and let the engine's nonce check adjudicate,
   // exactly as before — the ambiguity this file must not resolve unilaterally.
   const pick = owned >= 0 ? owned : all.length - 1;
-  return { all, pick, owned: owned >= 0 };
+  return { all, bounds, pick, owned: owned >= 0 };
 }
 function extractReview(text) {
   const lines = text.split('\n');
-  const { all, pick } = verdictIndex(lines);
+  const { all, bounds, pick } = verdictIndex(lines);
   if (pick < 0) return null;
   const verdictIdx = all[pick];
-  const floor = pick > 0 ? all[pick - 1] + 1 : 0;
+  const before = bounds.filter((b) => b < verdictIdx);
+  let j = before.length;
+  let floor = j > 0 ? before[j - 1] + 1 : 0;
   let start = -1;
-  for (let i = verdictIdx; i >= floor; i--) if (PBLOCK_START_RE.test(lines[i].trim())) start = i;
+  for (;;) {
+    for (let i = verdictIdx; i >= floor; i--) if (isBlockStart(lines[i])) start = i;
+    if (start >= 0 || j === 0) break;
+    // No block header under this floor, so the floor did not open a block — it landed inside one,
+    // and cutting there would publish a headerless suffix missing its enclosing finding. Widen by
+    // one block. NEVER past a verdict that CLAIMS another run: those bytes cannot be ours.
+    const claim = echoedMarker(lines[before[j - 1]]);
+    if (claim && claim !== marker) break;
+    j -= 1;
+    floor = j > 0 ? before[j - 1] + 1 : 0;
+  }
   if (start < 0) start = Math.max(floor, verdictIdx - 120);
   return lines.slice(start, verdictIdx + 1).join('\n').trim();
 }

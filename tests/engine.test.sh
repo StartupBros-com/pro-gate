@@ -2933,6 +2933,132 @@ QUOTED="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_capture_bind '$TDIR/bind
 check 'pg_capture_bind accepts a quoted marker and names it for the operator' \
   "$([ "$QUOTED" = "$FOREIGN164" ]; echo $?)" "quoted=$QUOTED"
 
+# ── #166 gate r1 P1: ownership is decided per CLAIM, not per marker order ──────────────────────
+# pg_capture_own_segment reads only the FIRST "(run marker: …)" echo on a verdict line, so a line
+# reading "(run marker: THEIRS) (run marker: OURS)" reports NO owned verdict — and the unowned
+# branch used to hand the file straight back. Harvest then accepted it on the tail nonce check
+# (which sees the second token), and a DIRECT oracle capture, exempt from that check entirely,
+# accepted a foreign-only answer outright. Both are refused at the one chokepoint both paths use.
+printf 'P0: none\nP1: none\nVERDICT: SHIP — ours. (run marker: %s) (run marker: %s)\n' \
+  "$FOREIGN164" "$BIND_MARKER" > "$TDIR/bind-dual.md"
+cp "$TDIR/bind-dual.md" "$TDIR/bind-dual.orig"
+DUAL_FOREIGN="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_capture_bind '$TDIR/bind-dual.md' '$BIND_MARKER'; printf '%s' \"\$PG_CAPTURE_FOREIGN\"")"
+bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_capture_bind '$TDIR/bind-dual.md' '$BIND_MARKER'"; RC=$?
+check 'r1 P1: pg_capture_bind refuses a foreign-FIRST dual-claimed verdict line' \
+  "$([ "$RC" -eq 2 ] && [ "$DUAL_FOREIGN" = "$FOREIGN164" ] && cmp -s "$TDIR/bind-dual.md" "$TDIR/bind-dual.orig"; echo $?)" \
+  "rc=$RC foreign=$DUAL_FOREIGN $(cat "$TDIR/bind-dual.md")"
+# The bypass this closes: the tail nonce check DOES accept that line, so refusing later is too late.
+check 'r1 P1: the dual-claimed line would have passed the tail nonce check' \
+  "$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_capture_nonce_ok '$TDIR/bind-dual.md' '$BIND_MARKER'"; echo $?)" \
+  "$(cat "$TDIR/bind-dual.md")"
+# Foreign-only, no owned verdict at all: the direct/reattach capture path never reaches a nonce
+# check (it applies only to SALVAGED/REATTACHED captures), so this must be refused by the bind.
+printf '[P0] other/a.ts:1 — theirs\nP1: none\nVERDICT: FIX-FIRST — theirs. (run marker: %s)\n' \
+  "$FOREIGN164" > "$TDIR/bind-foreign-only.md"
+cp "$TDIR/bind-foreign-only.md" "$TDIR/bind-foreign-only.orig"
+FO_FOREIGN="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_capture_bind '$TDIR/bind-foreign-only.md' '$BIND_MARKER'; printf '%s' \"\$PG_CAPTURE_FOREIGN\"")"
+bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_capture_bind '$TDIR/bind-foreign-only.md' '$BIND_MARKER'"; RC=$?
+check 'r1 P1: pg_capture_bind refuses a foreign-only capture (the direct path is nonce-exempt)' \
+  "$([ "$RC" -eq 2 ] && [ "$FO_FOREIGN" = "$FOREIGN164" ] && cmp -s "$TDIR/bind-foreign-only.md" "$TDIR/bind-foreign-only.orig"; echo $?)" \
+  "rc=$RC foreign=$FO_FOREIGN"
+# A model that lowercases its OWN echo is not another run: a marker carries un-lowercased repo
+# text, and two real runs cannot differ only in case (the marker ends in one process's epoch and
+# pid). Reporting that as a foreign claim would refuse a clean single-answer review as
+# unattributable — durably, because every retry re-reads the same text.
+BIND_MIXED='pg-run-StartupBros-com-pro-gate-166-1788719459-1312546'
+printf 'P0: none\nP1: none\nVERDICT: SHIP — ours. (run marker: %s)\n' \
+  "$(printf '%s' "$BIND_MIXED" | tr 'A-Z' 'a-z')" > "$TDIR/bind-case.md"
+cp "$TDIR/bind-case.md" "$TDIR/bind-case.orig"
+CASE_FOREIGN="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_capture_bind '$TDIR/bind-case.md' '$BIND_MIXED'; printf '%s' \"\$PG_CAPTURE_FOREIGN\"")"
+bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_capture_bind '$TDIR/bind-case.md' '$BIND_MIXED'"; RC=$?
+check 'r1 P1: an own-marker echo differing only in letter case is not a foreign claim' \
+  "$([ "$RC" -eq 1 ] && [ -z "$CASE_FOREIGN" ] && cmp -s "$TDIR/bind-case.md" "$TDIR/bind-case.orig"; echo $?)" \
+  "rc=$RC foreign=$CASE_FOREIGN"
+# …and a genuinely different run is still refused against that same mixed-case marker.
+printf 'P0: none\nVERDICT: FIX-FIRST — theirs. (run marker: %s)\n' "$FOREIGN164" > "$TDIR/bind-case-foreign.md"
+bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_capture_bind '$TDIR/bind-case-foreign.md' '$BIND_MIXED'"; RC=$?
+check 'r1 P1: case-insensitive self-recognition does not weaken foreign refusal' \
+  "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC"
+
+# A capture with NO ownership token anywhere is still the caller's to adjudicate, unchanged.
+printf 'P0: none\nVERDICT: SHIP — nobody claims this\n' > "$TDIR/bind-noclaim.md"
+cp "$TDIR/bind-noclaim.md" "$TDIR/bind-noclaim.orig"
+bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_capture_bind '$TDIR/bind-noclaim.md' '$BIND_MARKER'"; RC=$?
+check 'r1 P1: an unclaimed capture is still returned unrewritten for the caller to adjudicate' \
+  "$([ "$RC" -eq 1 ] && cmp -s "$TDIR/bind-noclaim.md" "$TDIR/bind-noclaim.orig"; echo $?)" "rc=$RC"
+
+# ── #166 gate r1 P1: a verdict QUOTED inside a finding is not a block terminator ───────────────
+# Flooring the cut on one deletes the finding that wrote it and publishes the remainder — which
+# still passes pg_is_review, the nonce check and the foreign-echo check, so nothing downstream
+# catches it. A quoted/indented/fenced verdict may still be OURS, so it stays an ownership
+# candidate; it just never bounds a block.
+printf '[P1] src/x.sh:3 — reviews sometimes show a verdict inline\n  > VERDICT: SHIP — example\n  and keep explaining afterwards\nP2: none\nP3: none\nVERDICT: FIX-FIRST — ours. (run marker: %s)\n' \
+  "$BIND_MARKER" > "$TDIR/bind-qverdict.md"
+cp "$TDIR/bind-qverdict.md" "$TDIR/bind-qverdict.orig"
+bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_capture_bind '$TDIR/bind-qverdict.md' '$BIND_MARKER'"; RC=$?
+check 'r1 P1: a verdict quoted in a finding never floors the cut (block kept byte-for-byte)' \
+  "$([ "$RC" -eq 0 ] && cmp -s "$TDIR/bind-qverdict.md" "$TDIR/bind-qverdict.orig"; echo $?)" \
+  "rc=$RC $(cat "$TDIR/bind-qverdict.md")"
+printf '[P1] src/x.sh:3 — a fenced example\n```\nVERDICT: SHIP — example\n```\nP2: none\nVERDICT: FIX-FIRST — ours. (run marker: %s)\n' \
+  "$BIND_MARKER" > "$TDIR/bind-fverdict.md"
+cp "$TDIR/bind-fverdict.md" "$TDIR/bind-fverdict.orig"
+bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_capture_bind '$TDIR/bind-fverdict.md' '$BIND_MARKER'"; RC=$?
+check 'r1 P1: a verdict inside a fenced block never floors the cut' \
+  "$([ "$RC" -eq 0 ] && cmp -s "$TDIR/bind-fverdict.md" "$TDIR/bind-fverdict.orig"; echo $?)" \
+  "rc=$RC $(cat "$TDIR/bind-fverdict.md")"
+# The floor must still hold where it matters: a real foreign terminator above our block.
+printf '[P0] other/a.ts:1 — theirs\nP1: none\nVERDICT: FIX-FIRST — theirs. (run marker: %s)\nP0: none\nP1: none\nVERDICT: SHIP — ours. (run marker: %s)\n' \
+  "$FOREIGN164" "$BIND_MARKER" > "$TDIR/bind-still-cuts.md"
+check 'r1 P1: a real foreign terminator still floors the cut' \
+  "$(bind_case "$TDIR/bind-still-cuts.md"; echo $?)" "$(cat "$TDIR/bind-still-cuts.md")"
+
+echo '# gate r1 P1 (#166): a quoted verdict example survives the whole harvest path'
+M164D="pg-run-crossfeed-176-1700000073-24"
+printf '176\t%s\t%s\t0\t1\tGPT-X\n' "$TDIR/o-crossfeed-d.md" "$(date +%s)" > "$TDIR/home/in-progress/$M164D"
+printf 'src/real.sh\n' > "$TDIR/home/manifests/$M164D"
+cat > "$TDIR/tab.txt" <<TAB
+conversation for run marker: $M164D
+
+[P1] src/real.sh:4 — reviews sometimes show a verdict inline
+  > VERDICT: SHIP — example
+  and keep explaining afterwards
+P2: none
+P3: none
+VERDICT: FIX-FIRST — ours. (run marker: $M164D)
+TAB
+start_mock "$TDIR/tab.txt"
+run_engine --harvest "$M164D" --out "$TDIR/o-crossfeed-d.md" --timeout 5s
+check 'r1 P1: a review quoting a verdict example is still published' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
+check 'r1 P1: harvest keeps the finding that encloses a quoted verdict example' \
+  "$(grep -qF 'src/real.sh:4' "$TDIR/o-crossfeed-d.md" 2>/dev/null && grep -qF 'and keep explaining afterwards' "$TDIR/o-crossfeed-d.md" 2>/dev/null; echo $?)" \
+  "$(cat "$TDIR/o-crossfeed-d.md" 2>/dev/null)"
+
+# ── #166 gate r1 P2: the Oracle session name must survive Oracle's own slug normalization ──────
+# Oracle stores a custom --slug as five ten-character alphanumeric words. A raw run marker is
+# reduced to "pg-run-startupbro-com-pro": one name for EVERY run in the repository, and not the
+# name the reattach fallback then asks for. pg_oracle_slug must be a fixed point of that rule.
+SLUG_MARKER_A='pg-run-StartupBros-com-pro-gate-166-1788719459-1312546'
+SLUG_MARKER_B='pg-run-StartupBros-com-pro-gate-166-1788719999-1312999'
+SLUG_A="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_oracle_slug '$SLUG_MARKER_A'")"
+SLUG_B="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_oracle_slug '$SLUG_MARKER_B'")"
+SLUG_RAW="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_slug_normalize '$SLUG_MARKER_A'")"
+SLUG_RT="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_slug_normalize '$SLUG_A'")"
+check 'r1 P2: the raw marker does NOT survive Oracle slug normalization' \
+  "$([ "$SLUG_RAW" = 'pg-run-startupbro-com-pro' ]; echo $?)" "normalized=$SLUG_RAW"
+check 'r1 P2: pg_oracle_slug is a fixed point of that normalization' \
+  "$([ -n "$SLUG_A" ] && [ "$SLUG_RT" = "$SLUG_A" ]; echo $?)" "slug=$SLUG_A roundtrip=$SLUG_RT"
+check 'r1 P2: pg_oracle_slug keeps the epoch and pid, so two runs of one PR differ' \
+  "$([ "$SLUG_A" != "$SLUG_B" ] && [ "$SLUG_A" = 'pro-gate-166-1788719459-1312546' ]; echo $?)" "a=$SLUG_A b=$SLUG_B"
+check 'r1 P2: the session name never parses as a run marker' \
+  "$(printf '%s\n%s' "$SLUG_A" "$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_oracle_slug 'pg-run-repo-branch-ab12cd-diff-1788719459-99'")" | grep -qE 'pg-run-'; [ $? -ne 0 ]; echo $?)" \
+  "slug=$SLUG_A"
+check 'r1 P2: pg_oracle_slug yields the 3-to-5 lowercase words Oracle accepts' \
+  "$(printf '%s' "$SLUG_A" | awk -F- '{ ok = (NF >= 3 && NF <= 5); for (i = 1; i <= NF; i++) if (length($i) > 10 || $i !~ /^[a-z0-9]+$/) ok = 0; exit ok ? 0 : 1 }'; echo $?)" \
+  "slug=$SLUG_A"
+check 'r1 P2: a --diff run keeps its own epoch and pid too' \
+  "$([ "$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_oracle_slug 'pg-run-repo-branch-ab12cd-diff-1788719459-99'")" = 'pro-gate-diff-1788719459-99' ]; echo $?)" \
+  "$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_oracle_slug 'pg-run-repo-branch-ab12cd-diff-1788719459-99'")"
+
 echo '# v0.28: artifact-first recovery — no ledger row needed'
 M9="pg-run-artifact-4-1700000035-99"
 mkdir -p "$TDIR/home/completed"
