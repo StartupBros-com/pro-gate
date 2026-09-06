@@ -2499,6 +2499,14 @@ PG_REVIEW_DECISION_CORPUS_DIGEST='8b251183b189d7a1bb165b3bde1f5b3c4575ac5fcf55c4
 #   7f5ece9b… — the base review-decision/v1 runtime (#98); #147 added a reason and two normalized
 #               completed-result fields, leaving both binding record shapes untouched.
 PG_REVIEW_DECISION_CONTRACT_DIGEST_PREDECESSORS='7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee'
+# Accepted digests whose full-pr input bindings do NOT attest delivered bytes. The base runtime's
+# classic path installed a full-pr relation for every engine-fetched patch, including a
+# `--input connector` run that never attached those bytes to the review (#150), and nothing else it
+# persisted for that run records the input mode, so the record cannot say which it was. A full-pr
+# record under one of these digests is therefore lifecycle history and charge only: it is read, it
+# supersedes, and it stops a duplicate spend, but its SHIP never becomes merge proof (gate #159 r3
+# P1). A digest whose writer already gated full-pr on bundle|both must NOT be listed here.
+PG_REVIEW_DECISION_CONTRACT_DIGESTS_UNATTESTED_FULL_PR='7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee'
 
 pg_review_decision_contract_id() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_ID"; }
 pg_review_decision_contract_version() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_VERSION"; }
@@ -2530,6 +2538,16 @@ pg_review_decision_record_contract_digest_ok() { # digest -> rc 0 when a persist
     [ "$want" = "$d" ] && return 0
   done
   return 1
+}
+# rc 0 when a full-pr input binding carrying this digest attests that the engine delivered the patch
+# bytes it names. Unreadable digests fail closed; listed predecessors fail by design (see above).
+pg_review_decision_record_full_pr_attested() { # digest
+  local want="$1" d
+  pg_review_decision_record_contract_digest_ok "$want" || return 1
+  for d in $PG_REVIEW_DECISION_CONTRACT_DIGESTS_UNATTESTED_FULL_PR; do
+    [ "$want" = "$d" ] && return 1
+  done
+  return 0
 }
 
 # Compatibility metadata only: reducers continue to use the compiled constants above.

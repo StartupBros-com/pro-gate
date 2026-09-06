@@ -134,7 +134,11 @@ Raw review and repository text are untrusted adapter input and are never used as
 A contract upgrade never discards the review history already in `PRO_GATE_HOME`: records written by
 a compatible predecessor contract stay readable, so an already reviewed head keeps its existing
 answer instead of buying a second review, and a record this runtime cannot read stops the round
-closed rather than reading as absent history.
+closed rather than reading as absent history. One predecessor record is deliberately history only:
+a full-pr SHIP written by an older runtime may have come from a classic `--input connector` run that
+never attached the patch, and the record cannot say which, so it keeps its history and its charge
+but never hands off to merge. It stops typed as not bindable for its mode, exactly like a connector
+SHIP, and a `bundle` or `both` round on that head earns the proof.
 
 This changes neither review provenance nor merge authority: the runtime remains the Oracle
 transport and the gate stops before merge. A surrounding agent may arm guarded auto-merge only

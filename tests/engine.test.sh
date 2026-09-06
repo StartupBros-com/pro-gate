@@ -6188,7 +6188,14 @@ up_seed_result() { # home marker verdict input-record contract-digest
     '{accepted_epoch:1700020100,artifact:{digest:$digest,path:("completed/"+$marker)},contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,input_binding_digest:$ib,input_binding_identity:$marker,marker:$marker,named_choice:null,provenance:{outcome:"accepted",validated_epoch:1700020100},record_type:"review-result-binding/v1",record_version:1,ship_proof:$proof,verdict:$verdict}')"
 }
 
-# (a) a collected predecessor-contract SHIP on the unchanged head still hands off to merge.
+# (a) gate #159 r3 P1: a collected predecessor-contract full-pr SHIP is history and charge, never
+# merge proof. This record is byte for byte what the base runtime's classic path wrote for a
+# `--pr N --input connector` run with no --diff (#150): it fetched and hashed the endpoint patch but
+# never attached it, and the record cannot say so, because nothing that runtime persisted for a run
+# records its input mode. r1 pinned the bundle query below to allow-existing-merge-workflow; that
+# accepted a ship proof for bytes the model may never have received. It must now reach the same typed
+# stop a connector SHIP reaches, leave every record untouched, charge no round, and never become a
+# fresh grant. The base-contract full-pr FIX-FIRST in (b) still routes to the fixer.
 UP_SHIP_HOME="$TDIR/home-upgrade-ship"; UP_SHIP_MARKER='pg-run-acme-widgets-1983-1700020000-1'
 UP_SHIP_BINDING="$(up_full_binding "$UP_SHIP_MARKER" 1700020000 "$RD_BASE_CONTRACT_DIGEST")"
 mkdir -p "$UP_SHIP_HOME/completed"
@@ -6206,13 +6213,30 @@ env PRO_GATE_HOME="$UP_SHIP_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_P
   >"$TDIR/upgrade-ship.json" 2>"$TDIR/upgrade-ship.err"
 UP_SHIP_RC=$?
 UP_SHIP_STATE_AFTER="$(find "$UP_SHIP_HOME" -mindepth 1 -printf '%P\n' | sort)"
-check 'predecessor-contract SHIP still reduces to allow-existing-merge-workflow, never a fresh grant' \
-  "$([ "$UP_SHIP_RC" -eq 0 ] && jq -e --arg marker "$UP_SHIP_MARKER" '.action=="allow-existing-merge-workflow" and .reason=="current-ship-is-merge-eligible" and .action!="run-granted-review" and (.facts.completed_results|length==1) and .facts.completed_results[0].marker==$marker and .facts.completed_results[0].collected==true' "$TDIR/upgrade-ship.json" >/dev/null 2>&1; echo $?)" \
+check 'gate #159 r3 P1: a predecessor-contract full-pr SHIP with its result binding stops typed instead of handing off to merge' \
+  "$([ "$UP_SHIP_RC" -eq 0 ] && jq -e --arg marker "$UP_SHIP_MARKER" '.action=="stop-without-new-review" and .reason=="result-not-bindable-for-mode" and .effect_request.execution_class=="report-only" and .effect_request.applicable_ref==$marker and (.facts.completed_results|length==1) and .facts.completed_results[0].marker==$marker and .facts.completed_results[0].evidence_mode=="full-pr" and .facts.completed_results[0].bindable==false and .facts.completed_results[0].collected==false and .action!="allow-existing-merge-workflow" and .action!="run-granted-review" and .action!="collect-existing-result"' "$TDIR/upgrade-ship.json" >/dev/null 2>&1; echo $?)" \
   "rc=$UP_SHIP_RC output=$(cat "$TDIR/upgrade-ship.json") stderr=$(cat "$TDIR/upgrade-ship.err")"
 check 'reading predecessor-contract history charges no round and writes no record' \
   "$([ "$UP_SHIP_STATE_BEFORE" = "$UP_SHIP_STATE_AFTER" ] && [ ! -e "$UP_SHIP_HOME/rounds" ] \
      && jq -e '.action!="run-granted-review"' "$TDIR/upgrade-ship.json" >/dev/null 2>&1; echo $?)" \
   "before=$UP_SHIP_STATE_BEFORE after=$UP_SHIP_STATE_AFTER action=$(jq -r .action "$TDIR/upgrade-ship.json" 2>/dev/null)"
+# A caller cannot launder that stop into a repair: an effect file forged into collect-existing-result
+# matches the fresh snapshot byte for byte, and the effect path still obeys the FRESH reduction. The
+# persisted predecessor ship proof must survive untouched (it is history) and never be re-honored.
+jq -cS '.action="collect-existing-result" | .effect_request.action="collect-existing-result" | .effect_request.effect="collect-existing-result" | .effect_request.execution_class="runtime-guarded-effect"' \
+  "$TDIR/upgrade-ship.json" > "$TDIR/upgrade-ship-forged.json"
+UP_SHIP_RESULT_DIGEST_BEFORE="$(sha256sum "$UP_SHIP_HOME/review-result-bindings/$UP_SHIP_MARKER" | awk '{print $1}')"
+env PRO_GATE_HOME="$UP_SHIP_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/upgrade.patch" \
+  PRO_GATE_ORACLE_BIN=/nonexistent/no-oracle \
+  bash "$ENGINE" --review-decision --review-decision-effect "$TDIR/upgrade-ship-forged.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/upgrade.patch" --input bundle \
+  >"$TDIR/upgrade-ship-forged-out.json" 2>"$TDIR/upgrade-ship-forged-out.err"
+UP_SHIP_FORGED_RC=$?
+UP_SHIP_RESULT_DIGEST_AFTER="$(sha256sum "$UP_SHIP_HOME/review-result-bindings/$UP_SHIP_MARKER" | awk '{print $1}')"
+check 'gate #159 r3 P1: a forged collect effect on that SHIP repairs nothing and re-emits the typed stop' \
+  "$([ "$UP_SHIP_FORGED_RC" -eq 0 ] && [ "$UP_SHIP_RESULT_DIGEST_BEFORE" = "$UP_SHIP_RESULT_DIGEST_AFTER" ] \
+     && [ "$UP_SHIP_STATE_BEFORE" = "$(find "$UP_SHIP_HOME" -mindepth 1 -printf '%P\n' | sort)" ] \
+     && jq -e '.action=="stop-without-new-review" and .reason=="result-not-bindable-for-mode"' "$TDIR/upgrade-ship-forged-out.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$UP_SHIP_FORGED_RC output=$(cat "$TDIR/upgrade-ship-forged-out.json") stderr=$(cat "$TDIR/upgrade-ship-forged-out.err")"
 
 # (b) a collected predecessor-contract FIX-FIRST still routes to the fixer instead of buying a round.
 UP_FIX_HOME="$TDIR/home-upgrade-fix"; UP_FIX_MARKER='pg-run-acme-widgets-1983-1700020001-2'
@@ -6268,9 +6292,11 @@ check 'a new record is refused unless it stamps the current contract digest' \
   "$([ "$UP_WRITE_OLD_RC" -ne 0 ] && [ "$UP_WRITE_NEW_RC" -eq 0 ] && [ -f "$UP_WRITE_HOME/review-input-bindings/$UP_WRITE_MARKER" ]; echo $?)" \
   "old_rc=$UP_WRITE_OLD_RC new_rc=$UP_WRITE_NEW_RC written=$([ -f "$UP_WRITE_HOME/review-input-bindings/$UP_WRITE_MARKER" ] && echo yes || echo no)"
 
-# (f) the common upgrade state: a predecessor-contract artifact whose result binding was never
-# written still collects, and the repair writes its sibling forward under the CURRENT contract while
-# the immutable predecessor input record is left exactly as the older runtime wrote it.
+# (f) gate #159 r3 P1: the same record in the common upgrade state, completed SHIP bytes whose result
+# binding was never written. r1 pinned this to collect, and the collect effect then repaired the
+# sibling forward WITH a full-pr ship proof, so the next query handed off to merge. It must now be the
+# typed stop from the first query, the effect must write no sibling, and the immutable predecessor
+# input record must be left exactly as the older runtime wrote it.
 UP_FWD_HOME="$TDIR/home-upgrade-forward"; UP_FWD_MARKER='pg-run-acme-widgets-1983-1700020005-6'
 UP_FWD_BINDING="$(up_full_binding "$UP_FWD_MARKER" 1700020005 "$RD_BASE_CONTRACT_DIGEST")"
 mkdir -p "$UP_FWD_HOME/completed"
@@ -6280,10 +6306,10 @@ env PRO_GATE_HOME="$UP_FWD_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PA
   bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/upgrade.patch" --input bundle \
   >"$TDIR/upgrade-forward-collect.json" 2>"$TDIR/upgrade-forward-collect.err"
 UP_FWD_COLLECT_RC=$?
-check 'an uncollected predecessor-contract artifact still collects instead of buying a round' \
-  "$([ "$UP_FWD_COLLECT_RC" -eq 0 ] && jq -e --arg marker "$UP_FWD_MARKER" '.action=="collect-existing-result" and .reason=="completed-result-awaits-collection" and .effect_request.applicable_ref==$marker' "$TDIR/upgrade-forward-collect.json" >/dev/null 2>&1; echo $?)" \
+check 'gate #159 r3 P1: an uncollected predecessor-contract full-pr SHIP stops typed instead of collecting or buying a round' \
+  "$([ "$UP_FWD_COLLECT_RC" -eq 0 ] && jq -e --arg marker "$UP_FWD_MARKER" '.action=="stop-without-new-review" and .reason=="result-not-bindable-for-mode" and .effect_request.applicable_ref==$marker and .facts.completed_results[0].evidence_mode=="full-pr" and .facts.completed_results[0].bindable==false and .action!="collect-existing-result" and .action!="run-granted-review"' "$TDIR/upgrade-forward-collect.json" >/dev/null 2>&1; echo $?)" \
   "rc=$UP_FWD_COLLECT_RC output=$(cat "$TDIR/upgrade-forward-collect.json") stderr=$(cat "$TDIR/upgrade-forward-collect.err")"
-# The repair effect must never reach a browser. Pinning an absent oracle keeps the no-spend claim
+# The effect must never reach a browser. Pinning an absent oracle keeps the no-spend claim
 # structural: if this case ever regressed into a grant, the effect would fail instead of paying.
 env PRO_GATE_HOME="$UP_FWD_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/upgrade.patch" \
   PRO_GATE_ORACLE_BIN=/nonexistent/no-oracle \
@@ -6293,12 +6319,51 @@ env PRO_GATE_HOME="$UP_FWD_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PA
   bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/upgrade.patch" --input bundle \
   >"$TDIR/upgrade-forward-current.json" 2>"$TDIR/upgrade-forward-current.err"
 UP_FWD_CURRENT_RC=$?
-check 'repair writes the result sibling forward under the current contract, input record untouched' \
+check 'gate #159 r3 P1: post-upgrade repair writes no ship proof for the predecessor full-pr record, input record untouched' \
   "$([ "$UP_FWD_CURRENT_RC" -eq 0 ] \
-     && [ "$(jq -r .contract_digest "$UP_FWD_HOME/review-result-bindings/$UP_FWD_MARKER" 2>/dev/null)" = "$RD_CONTRACT_DIGEST" ] \
+     && [ ! -e "$UP_FWD_HOME/review-result-bindings/$UP_FWD_MARKER" ] \
      && [ "$(jq -r .contract_digest "$UP_FWD_HOME/review-input-bindings/$UP_FWD_MARKER")" = "$RD_BASE_CONTRACT_DIGEST" ] \
-     && jq -e '.action=="allow-existing-merge-workflow" and .reason=="current-ship-is-merge-eligible"' "$TDIR/upgrade-forward-current.json" >/dev/null 2>&1; echo $?)" \
+     && jq -e '.action=="stop-without-new-review" and .reason=="result-not-bindable-for-mode" and .action!="allow-existing-merge-workflow"' "$TDIR/upgrade-forward-current.json" >/dev/null 2>&1; echo $?)" \
   "rc=$UP_FWD_CURRENT_RC repair=$(cat "$TDIR/upgrade-forward-repair.json") current=$(cat "$TDIR/upgrade-forward-current.json") stderr=$(cat "$TDIR/upgrade-forward-current.err")"
+
+# (f2) the shared predicate and the repair effect's own guard, called directly. The CLI can no longer
+# route this record to repair, but pg_persist_result and any future caller share the same function,
+# so the refusal is pinned at the function and not only at the one path that reaches it today. The
+# engine has no source guard, so its three functions are lifted by definition range into a shell
+# that has the lib. Planted negatives: a CURRENT-contract full-pr record and a predecessor
+# scoped-delta record (the typed path always gated those on bundle|both) still attest.
+up_engine_fn() { # home fn args... -> runs an engine function with the lib sourced
+  local home="$1"; shift
+  PRO_GATE_HOME="$home" bash -c '. "$0"; eval "$(sed -n "/^pg_review_decision_ship_mode_bindable()/,/^}/p;/^pg_review_decision_input_ship_bindable()/,/^}/p;/^pg_review_decision_repair_result_binding()/,/^}/p" "$1")"; shift; "$@"' \
+    "$HERE/../lib/pro-gate-lib.sh" "$ENGINE" "$@"
+}
+UP_ATTEST_HOME="$TDIR/home-upgrade-attest"; mkdir -p "$UP_ATTEST_HOME"
+check 'gate #159 r3 P1: the base contract digest does not attest full-pr delivery; the current one does; an unknown one never does' \
+  "$([ "$(pg_review_decision_record_full_pr_attested "$RD_BASE_CONTRACT_DIGEST"; echo $?)" = 1 ] \
+     && [ "$(pg_review_decision_record_full_pr_attested "$RD_CONTRACT_DIGEST"; echo $?)" = 0 ] \
+     && [ "$(pg_review_decision_record_full_pr_attested "$RD_UNKNOWN_CONTRACT_DIGEST"; echo $?)" = 1 ] \
+     && [ "$(pg_review_decision_record_contract_digest_ok "$RD_BASE_CONTRACT_DIGEST"; echo $?)" = 0 ]; echo $?)" \
+  "unattested=$PG_REVIEW_DECISION_CONTRACT_DIGESTS_UNATTESTED_FULL_PR"
+UP_ATTEST_SCOPED_BASE="$(jq -cn --arg cd "$RD_BASE_CONTRACT_DIGEST" '{contract_digest:$cd,evidence:{mode:"scoped-delta"}}')"
+check 'gate #159 r3 P1: the SHIP predicate refuses a predecessor full-pr record and a connector record, accepts current full-pr and predecessor scoped-delta' \
+  "$([ "$(up_engine_fn "$UP_ATTEST_HOME" pg_review_decision_input_ship_bindable "$(up_full_binding "$UP_SHIP_MARKER" 1700020000 "$RD_BASE_CONTRACT_DIGEST")"; echo $?)" = 1 ] \
+     && [ "$(up_engine_fn "$UP_ATTEST_HOME" pg_review_decision_input_ship_bindable "$(up_connector_binding "$UP_SHIP_MARKER" 1700020000 "$RD_CONTRACT_DIGEST")"; echo $?)" = 1 ] \
+     && [ "$(up_engine_fn "$UP_ATTEST_HOME" pg_review_decision_input_ship_bindable "$(up_full_binding "$UP_SHIP_MARKER" 1700020000 "$RD_CONTRACT_DIGEST")"; echo $?)" = 0 ] \
+     && [ "$(up_engine_fn "$UP_ATTEST_HOME" pg_review_decision_input_ship_bindable "$UP_ATTEST_SCOPED_BASE"; echo $?)" = 0 ]; echo $?)" \
+  "base=$RD_BASE_CONTRACT_DIGEST current=$RD_CONTRACT_DIGEST"
+UP_REPAIR_HOME="$TDIR/home-upgrade-repair"; mkdir -p "$UP_REPAIR_HOME/completed"
+UP_REPAIR_SHIP_MARKER='pg-run-acme-widgets-1983-1700020008-9'; UP_REPAIR_FIX_MARKER='pg-run-acme-widgets-1983-1700020009-10'
+printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — repaired directly after the upgrade.' > "$UP_REPAIR_HOME/completed/$UP_REPAIR_SHIP_MARKER"
+printf '%s\n' '[P1] a.sh:1 — finding from before the upgrade' 'P2: none' 'VERDICT: FIX-FIRST — repaired directly after the upgrade.' > "$UP_REPAIR_HOME/completed/$UP_REPAIR_FIX_MARKER"
+up_engine_fn "$UP_REPAIR_HOME" pg_review_decision_repair_result_binding "$UP_REPAIR_SHIP_MARKER" "$(up_full_binding "$UP_REPAIR_SHIP_MARKER" 1700020008 "$RD_BASE_CONTRACT_DIGEST")" >/dev/null 2>&1
+UP_REPAIR_SHIP_RC=$?
+up_engine_fn "$UP_REPAIR_HOME" pg_review_decision_repair_result_binding "$UP_REPAIR_FIX_MARKER" "$(up_full_binding "$UP_REPAIR_FIX_MARKER" 1700020009 "$RD_BASE_CONTRACT_DIGEST")" >/dev/null 2>&1
+UP_REPAIR_FIX_RC=$?
+check 'gate #159 r3 P1: the repair effect itself refuses a SHIP proof for a predecessor full-pr input, and still binds its FIX-FIRST with a null proof' \
+  "$([ "$UP_REPAIR_SHIP_RC" -ne 0 ] && [ ! -e "$UP_REPAIR_HOME/review-result-bindings/$UP_REPAIR_SHIP_MARKER" ] \
+     && [ "$UP_REPAIR_FIX_RC" -eq 0 ] \
+     && jq -e --arg cd "$RD_CONTRACT_DIGEST" '.verdict=="FIX-FIRST" and .ship_proof==null and .contract_digest==$cd' "$UP_REPAIR_HOME/review-result-bindings/$UP_REPAIR_FIX_MARKER" >/dev/null 2>&1; echo $?)" \
+  "ship_rc=$UP_REPAIR_SHIP_RC fix_rc=$UP_REPAIR_FIX_RC bindings=$(ls -1 "$UP_REPAIR_HOME/review-result-bindings" 2>/dev/null | tr '\n' ' ')"
 
 # (g) the charged clone. When the exact-current input template IS a predecessor-contract record, the
 # charged attempt must still install its own marker-bound binding — stamped with the CURRENT
@@ -6322,5 +6387,44 @@ check 'a charge cloned from a predecessor template installs its binding under th
      && [ "$(jq -r .contract_digest "$FRESH_HOME/review-input-bindings/$UP_CLONE_NEW_MARKER")" = "$RD_CONTRACT_DIGEST" ] \
      && [ "$(jq -r .contract_digest "$FRESH_HOME/review-input-bindings/$UP_CLONE_MARKER")" = "$RD_BASE_CONTRACT_DIGEST" ]; echo $?)" \
   "rc=$FRESH_RC new=$UP_CLONE_NEW_MARKER stderr=$(tail -n 5 "$TDIR/fresh.stderr" 2>/dev/null)"
+
+# (h) gate #159 r3 P1: the way out is the documented one, a bundle round on the same head. Seed the
+# unattested predecessor SHIP for the classic fixture's head, run a classic --input bundle round
+# through the fake completing oracle (the run that actually attaches the patch), and require the next
+# bundle query to hand off on the NEW record while the old one remains a non-bindable fact beside it.
+# The seeded record and its ship proof are byte for byte what the base classic path persisted.
+UP_WAY_HOME="$TDIR/home-upgrade-way-out"; UP_WAY_MARKER='pg-run-acme-classic-4242-1700020010-11'
+UP_WAY_HEAD="$(git -C "$CLASSIC_REPO" rev-parse HEAD)"; UP_WAY_BASE="$(git -C "$CLASSIC_REPO" rev-parse HEAD^)"
+UP_WAY_DIGEST="$(sha256sum "$TDIR/classic-endpoint.patch" | awk '{print $1}')"
+UP_WAY_BINDING="$(jq -cnS --arg cd "$RD_BASE_CONTRACT_DIGEST" --arg marker "$UP_WAY_MARKER" --arg base "$UP_WAY_BASE" --arg head "$UP_WAY_HEAD" --arg digest "$UP_WAY_DIGEST" \
+  '{charged_spend_epoch:1700020010,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("full-pr:"+$base+":"+$head),mode:"full-pr",proof:{base_oid:$base,endpoint_digest:$digest,head_oid:$head,raw_patch_digest:$digest}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:"github.com",owner:"acme",repo:"classic"},target:{head_oid:$head,kind:"pull-request",pr:4242}}')"
+mkdir -p "$UP_WAY_HOME/completed"
+printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — connector-only classic run before the upgrade.' > "$UP_WAY_HOME/completed/$UP_WAY_MARKER"
+up_seed_record "$UP_WAY_HOME" review-input-bindings "$UP_WAY_MARKER" "$UP_WAY_BINDING"
+up_seed_record "$UP_WAY_HOME" review-result-bindings "$UP_WAY_MARKER" "$(jq -cnS --arg cd "$RD_BASE_CONTRACT_DIGEST" --arg marker "$UP_WAY_MARKER" \
+  --arg ib "$(printf '%s' "$UP_WAY_BINDING" | sha256sum | awk '{print $1}')" --arg digest "$(sha256sum "$UP_WAY_HOME/completed/$UP_WAY_MARKER" | awk '{print $1}')" \
+  --arg base "$UP_WAY_BASE" --arg head "$UP_WAY_HEAD" --arg diff "$UP_WAY_DIGEST" \
+  '{accepted_epoch:1700020110,artifact:{digest:$digest,path:("completed/"+$marker)},contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,input_binding_digest:$ib,input_binding_identity:$marker,marker:$marker,named_choice:null,provenance:{outcome:"accepted",validated_epoch:1700020110},record_type:"review-result-binding/v1",record_version:1,ship_proof:{base_oid:$base,diff_digest:$diff,head_oid:$head},verdict:"SHIP"}')"
+env PRO_GATE_HOME="$UP_WAY_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/classic-endpoint.patch" \
+  bash "$ENGINE" --review-decision --json --repo "$CLASSIC_REPO" --pr 4242 --diff "$TDIR/classic-endpoint.patch" --input bundle \
+  >"$TDIR/upgrade-way-before.json" 2>"$TDIR/upgrade-way-before.err"
+UP_WAY_BEFORE_RC=$?
+check 'gate #159 r3 P1: the seeded base-classic SHIP alone stops typed for the classic fixture head' \
+  "$([ "$UP_WAY_BEFORE_RC" -eq 0 ] && jq -e --arg marker "$UP_WAY_MARKER" '.action=="stop-without-new-review" and .reason=="result-not-bindable-for-mode" and .effect_request.applicable_ref==$marker' "$TDIR/upgrade-way-before.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$UP_WAY_BEFORE_RC output=$(cat "$TDIR/upgrade-way-before.json") stderr=$(cat "$TDIR/upgrade-way-before.err")"
+start_mock "$TDIR/tab.txt" "$ORGANIZER_STATE"
+classicrun "$UP_WAY_HOME" bundle
+UP_WAY_RUN_RC=$RC
+UP_WAY_NEW_MARKER="$(find "$UP_WAY_HOME/review-input-bindings" -type f -name 'pg-run-*' ! -name "$UP_WAY_MARKER" -printf '%f\n' | head -1)"
+env PRO_GATE_HOME="$UP_WAY_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/classic-endpoint.patch" \
+  bash "$ENGINE" --review-decision --json --repo "$CLASSIC_REPO" --pr 4242 --diff "$TDIR/classic-endpoint.patch" --input bundle \
+  >"$TDIR/upgrade-way-after.json" 2>"$TDIR/upgrade-way-after.err"
+UP_WAY_AFTER_RC=$?
+check 'gate #159 r3 P1: a post-upgrade classic bundle round on the same head earns the merge handoff the predecessor record could not' \
+  "$([ "$UP_WAY_RUN_RC" -eq 0 ] && [ "$UP_WAY_AFTER_RC" -eq 0 ] && [ -n "$UP_WAY_NEW_MARKER" ] \
+     && [ "$(jq -r .contract_digest "$UP_WAY_HOME/review-input-bindings/$UP_WAY_NEW_MARKER")" = "$RD_CONTRACT_DIGEST" ] \
+     && jq -e '.verdict=="SHIP" and (.ship_proof|type=="object")' "$UP_WAY_HOME/review-result-bindings/$UP_WAY_NEW_MARKER" >/dev/null 2>&1 \
+     && jq -e --arg old "$UP_WAY_MARKER" --arg new "$UP_WAY_NEW_MARKER" '.action=="allow-existing-merge-workflow" and .reason=="current-ship-is-merge-eligible" and .effect_request.applicable_ref!=$old and (.facts.completed_results|length==2) and any(.facts.completed_results[]; .marker==$old and .bindable==false and .collected==false) and any(.facts.completed_results[]; .marker==$new and .collected==true and .verdict=="SHIP" and .evidence_mode=="full-pr")' "$TDIR/upgrade-way-after.json" >/dev/null 2>&1; echo $?)" \
+  "run_rc=$UP_WAY_RUN_RC query_rc=$UP_WAY_AFTER_RC new=$UP_WAY_NEW_MARKER output=$(cat "$TDIR/upgrade-way-after.json") stderr=$(cat "$TDIR/upgrade-way-after.err") run_stderr=$(tail -3 "$TDIR/stderr")"
 
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }

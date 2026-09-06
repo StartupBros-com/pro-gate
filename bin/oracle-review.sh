@@ -269,6 +269,19 @@ fi
 pg_review_decision_ship_mode_bindable() { # evidence-mode
   case "$1" in full-pr|scoped-delta) return 0 ;; *) return 1 ;; esac
 }
+# The record-level form of that rule. A SHIP binds merge proof only when the input relation is a
+# delivered-bytes mode AND the record carrying it attests the delivery: a full-pr record written
+# under a predecessor contract whose classic path also stamped full-pr on connector-only runs (#150)
+# cannot tell the two apart, so it stays history and charge but never merge proof (gate #159 r3 P1).
+# Every SHIP-proof decision below goes through here; the mode-only predicate is its first clause.
+pg_review_decision_input_ship_bindable() { # input-binding-json
+  local mode digest
+  mode="$(jq -r '.evidence.mode // ""' <<<"$1" 2>/dev/null)" || return 1
+  pg_review_decision_ship_mode_bindable "$mode" || return 1
+  [ "$mode" = full-pr ] || return 0
+  digest="$(jq -r '.contract_digest // ""' <<<"$1" 2>/dev/null)" || return 1
+  pg_review_decision_record_full_pr_attested "$digest"
+}
 pg_review_decision_result_mode() { # input-binding-json -> closed evidence-mode label for normalized facts
   case "$(jq -r '.evidence.mode // ""' <<<"$1" 2>/dev/null)" in
     full-pr) printf 'full-pr' ;; scoped-delta) printf 'scoped-delta' ;; connector) printf 'connector' ;; *) printf 'none' ;;
@@ -282,8 +295,7 @@ pg_review_decision_result_bindable() { # artifact-path input-binding-json -> pri
   local artifact="$1" input="$2"
   case "$artifact" in
     "$(pg_completed_dir)"/*)
-      if [ "$(pg_extract_verdict "$artifact")" = SHIP ] \
-         && ! pg_review_decision_ship_mode_bindable "$(jq -r '.evidence.mode // ""' <<<"$input" 2>/dev/null)"; then
+      if [ "$(pg_extract_verdict "$artifact")" = SHIP ] && ! pg_review_decision_input_ship_bindable "$input"; then
         printf 'false'; return 0
       fi ;;
   esac
@@ -304,7 +316,7 @@ pg_review_decision_repair_result_binding() { # marker input-binding-json
   proof=null
   if [ "$verdict" = SHIP ]; then
     mode="$(jq -r .evidence.mode <<<"$input")"
-    pg_review_decision_ship_mode_bindable "$mode" || return 1
+    pg_review_decision_input_ship_bindable "$input" || return 1
     case "$mode" in
       full-pr)
         base="$(jq -r .evidence.proof.base_oid <<<"$input")"; head="$(jq -r .evidence.proof.head_oid <<<"$input")"
@@ -560,6 +572,19 @@ pg_review_decision_cli() {
     if [ "$exact" = true ]; then
       if [ "$(jq -r .verdict <<<"$result")" = SHIP ]; then
         mode="$(jq -r .evidence.mode <<<"$candidate")"
+        if ! pg_review_decision_input_ship_bindable "$candidate"; then
+          # Connector observations never become merge handoff authority. Neither does a full-pr SHIP
+          # whose record cannot attest that the patch was delivered (a predecessor classic run, gate
+          # #159 r3 P1): its persisted ship proof is not honored, so the exact artifact is exposed as
+          # the same uncollected, unbindable fact a connector SHIP is. History and charge stay; the
+          # reducer's typed result-not-bindable-for-mode stop keeps it out of merge eligibility and
+          # out of any fresh grant, and a bundle|both round on this head earns the proof.
+          if [ "$mode" = full-pr ]; then
+            completed="$(jq -cS --arg marker "$marker" --arg artifact "$artifact_digest" --argjson epoch "$(jq -r .charged_spend_epoch <<<"$candidate")" \
+              '. + [{applicable:true,artifact_digest:$artifact,bindable:false,binding_valid:false,canonical_identity:$marker,charged_spend_epoch:$epoch,collected:false,evidence_mode:"full-pr",legacy:false,marker:$marker,provenance_valid:false,verdict:"NONE"}]' <<<"$completed")"
+          fi
+          continue
+        fi
         case "$mode" in
           full-pr)
             [ -n "$base" ] && [ -n "$raw_digest" ] || continue
@@ -568,9 +593,6 @@ pg_review_decision_cli() {
             # The binding recheck above proved endpoint, reviewed payload, manifest, confirmation,
             # base, and head. Handoff additionally binds the result to that full raw endpoint.
             ship_digest="$(jq -r .evidence.proof.raw_digest <<<"$candidate")" ;;
-          connector)
-            # Connector observations never become merge handoff authority.
-            continue ;;
           *) continue ;;
         esac
         jq -e --arg base "$base" --arg head "$head" --arg digest "$ship_digest" \
