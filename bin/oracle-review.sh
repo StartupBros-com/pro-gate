@@ -3143,6 +3143,15 @@ pg_attempt_disposition_sweep
 # dir. 14 days dwarfs every recovery window (reservation TTL 6h; pending/ holds real bytes)
 # while still covering late manual recovery of a weeks-old run.
 find "$PRO_GATE_HOME/conversation-urls" -maxdepth 1 -type f -mmin +20160 -delete 2>/dev/null || true
+# #170: cross-bind sidecars are on the SAME 14-day clock, for the same reason. They used to
+# self-clear — any later salvage unlinked one whose scan found nothing — but that "cleanup" was
+# the bug: a blacklisted marker's URLs are skipped before they can be re-classified, so the
+# emptiness proved nothing and the delete threw away the conviction's conversation URL while the
+# append-only blacklist kept suppressing it. Now only proven ownership clears a sidecar, which
+# leaves abandoned markers holding one forever without this sweep. 14 days matches the URL memo
+# it stands in for (the conviction deleted conversation-urls/<marker>), so the two records expire
+# together instead of one outliving the other — the same disagreement #170 was about.
+find "$PRO_GATE_HOME/crossbound" -maxdepth 1 -type f -mmin +20160 -delete 2>/dev/null || true
 # Canonical title memos serve the same late-harvest lifecycle as URL memos. Sequence counters
 # remain exempt below because they prevent server-side title reuse across idle windows.
 find "$(pg_conversation_title_dir)" -maxdepth 1 -type f -mmin +20160 -delete 2>/dev/null || true

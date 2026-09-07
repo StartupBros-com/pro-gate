@@ -3574,6 +3574,14 @@ printf 'https://chatgpt.com/c/old' > "$SWHOME/conversation-urls/pg-run-old-16000
 printf 'https://chatgpt.com/c/new' > "$SWHOME/conversation-urls/pg-run-new-1700000000-1"
 touch -d '20 days ago' "$SWHOME/conversation-urls/pg-run-old-1600000000-1" 2>/dev/null \
   || touch -t "$(date -v-20d +%Y%m%d%H%M 2>/dev/null || echo 202601010000)" "$SWHOME/conversation-urls/pg-run-old-1600000000-1"
+# #170: cross-bind sidecars ride the same 14-day clock. Only proven ownership clears one now,
+# so without this sweep an abandoned marker's conviction would sit in PRO_GATE_HOME forever —
+# and it stands in for the URL memo the conviction deleted, so the two must expire together.
+mkdir -p "$SWHOME/crossbound"
+printf '2026-01-01T00:00:00.000Z\thttps://chatgpt.com/c/old\tpg-run-someone-else\n' > "$SWHOME/crossbound/pg-run-old-1600000000-1"
+printf '2026-01-01T00:00:00.000Z\thttps://chatgpt.com/c/new\tpg-run-someone-else\n' > "$SWHOME/crossbound/pg-run-new-1700000000-1"
+touch -d '20 days ago' "$SWHOME/crossbound/pg-run-old-1600000000-1" 2>/dev/null \
+  || touch -t "$(date -v-20d +%Y%m%d%H%M 2>/dev/null || echo 202601010000)" "$SWHOME/crossbound/pg-run-old-1600000000-1"
 printf 'foreign idle tab\n' > "$TDIR/tab.txt"
 start_mock "$TDIR/tab.txt"
 env PRO_GATE_HOME="$SWHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
@@ -3583,6 +3591,8 @@ env PRO_GATE_HOME="$SWHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PR
   >"$TDIR/stdout" 2>"$TDIR/stderr"
 check 'old memo swept' "$([ ! -f "$SWHOME/conversation-urls/pg-run-old-1600000000-1" ]; echo $?)" "still present"
 check 'fresh memo kept' "$([ -f "$SWHOME/conversation-urls/pg-run-new-1700000000-1" ]; echo $?)" "missing"
+check 'old cross-bind sidecar swept (#170)' "$([ ! -f "$SWHOME/crossbound/pg-run-old-1600000000-1" ]; echo $?)" "still present"
+check 'fresh cross-bind sidecar kept (#170)' "$([ -f "$SWHOME/crossbound/pg-run-new-1700000000-1" ]; echo $?)" "missing"
 
 echo '# v0.30 (#50 item 5): native-mode hard-max clamp is announced, not silent'
 # The NOTE fires before the oversized refusal, so the fast exit-11 path exercises it.
