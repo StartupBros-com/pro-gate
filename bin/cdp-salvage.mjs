@@ -290,8 +290,20 @@ function flushCrossBind(m) {
 // #76 keeps close/sweep-root flushing (they clear a stale conviction, and their test asserts it);
 // v0.32 excludes only --organize. It exits before the scan that can call noteCrossBind, so it
 // never has hits and never proves ownership — flushing there would just DELETE a genuine
-// conviction an earlier salvage recorded. probe stays excluded exactly as before.
-process.on('exit', () => { if (!probe && !organize) flushCrossBind(marker); });
+// conviction an earlier salvage recorded.
+process.on('exit', () => {
+  if (organize) return;
+  // #170: a probe still never RECORDS a conviction — with ownershipProven false it returns right
+  // here, so a probe's crossBindHits can never reach the write branch below. What it may now do
+  // is CLEAR one, because a probe that positively proved ownership holds exactly the proof the
+  // flush requires, and refusing to act on it is what turned a transient mis-report into a
+  // durable one: sidecars stopped self-clearing (above), and pg_reservation_reconcile's periodic
+  // probe is the invocation that notices a review finished. A run whose earlier salvage convicted
+  // a duplicate tab would otherwise keep reporting "STUCK (cross-bound)" — telling the operator
+  // NOT to run the free harvest that would in fact succeed — until the 14-day sweep.
+  if (probe && !ownershipProven) return;
+  flushCrossBind(marker);
+});
 
 function rememberUrl(m, url) {
   const f = memoPath(m);

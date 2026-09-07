@@ -1442,6 +1442,45 @@ const FOREIGN_ANSWER = (m) => [
   cdp.stop();
 }
 
+{ // #170: making the sidecar durable would strand a review that FINISHED, because the invocation
+  // that notices completion is pg_reservation_reconcile's periodic --probe, and probe was excluded
+  // from the exit flush outright. --status ranks a conviction above `complete`, so the operator
+  // would be told "STUCK ... retrying cannot bind" about a harvest that would in fact succeed.
+  // A probe that PROVED ownership holds exactly the proof the flush requires, so it may now clear.
+  const convictedUrl = 'https://chatgpt.com/c/convicted-duplicate';
+  const conviction = `2026-01-01T00:00:00.000Z\t${convictedUrl}\tpg-run-other-repo-42-1111111111-9\n`;
+  const seedConvicted = (home) => {
+    fs.mkdirSync(path.join(home, 'crossbound'), { recursive: true });
+    fs.writeFileSync(path.join(home, 'crossbound', MARKER), conviction);
+    fs.writeFileSync(path.join(home, 'salvage-nonmatching.txt'), `${MARKER}\t${convictedUrl}\n`);
+  };
+  const ours = [
+    `run marker: ${MARKER}`,
+    '[P1] lib/z.sh:1 — ours',
+    'P2: none',
+    'P3: none',
+    `VERDICT: SHIP — ours. (run marker: ${MARKER})`,
+  ].join('\n');
+  const doneCdp = await mockCdp(ours);
+  const done = await runSalvage(['--probe', MARKER, '10'], doneCdp.port, seedConvicted);
+  check('a probe that proves ownership reports the review complete',
+    done.status === 0 && /^probe-state: complete$/m.test(done.stderr ?? ''),
+    `status=${done.status} stderr=${done.stderr?.slice(-300)}`);
+  check('the seed really was in place (blacklist entry survived the probe)',
+    (done.blacklist ?? '').includes(`${MARKER}\t${convictedUrl}`), `blacklist=${done.blacklist}`);
+  check('a probe that proves ownership clears the conviction instead of stranding it',
+    done.crossbound === 0, `crossbound=${done.crossbound} body=${JSON.stringify(done.crossboundBody)}`);
+  doneCdp.stop();
+
+  // The other half of the contract: a probe that proves NOTHING stays read-only. It must neither
+  // clear the conviction nor record one — the property the blanket exclusion used to guarantee.
+  const openCdp = await mockCdp('__NO_TABS__', [], { trackCdpDeadlineEvents: true });
+  const open = await runFastPollSalvage(['--probe', MARKER, '3'], openCdp.port, seedConvicted);
+  check('a probe that proves nothing leaves the conviction exactly as it found it',
+    open.crossboundBody === conviction, `body=${JSON.stringify(open.crossboundBody)} status=${open.status}`);
+  openCdp.stop();
+}
+
 { // NON-NEGOTIABLE: the fix must not make us laxer. A page carrying our marker AND our own
   // nonce echo is still accepted exactly as before.
   const ours = [
