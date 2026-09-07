@@ -262,8 +262,48 @@ fi
 # the regular engine's housekeeping, browser preflight, locks, reconciliation, status sidecars,
 # slots, round recording, or binding/publication writes: the answer is advisory until an effect
 # boundary assembles the same facts again. The U1 reducer remains the sole policy authority.
+# Merge-eligibility proof exists only for evidence the engine delivered byte-for-byte. A connector
+# observation can drive a fix round but never attests an allow (#147, decision b): callers switch to
+# bundle or both for the final round. This predicate is the one source of that rule for the repair
+# effect and for the normalized facts the reducer consumes.
+pg_review_decision_ship_mode_bindable() { # evidence-mode
+  case "$1" in full-pr|scoped-delta) return 0 ;; *) return 1 ;; esac
+}
+# The record-level form of that rule. A SHIP binds merge proof only when the input relation is a
+# delivered-bytes mode AND the record carrying it attests the delivery: a full-pr record written
+# under a predecessor contract whose classic path also stamped full-pr on connector-only runs (#150)
+# cannot tell the two apart, so it stays history and charge but never merge proof (gate #159 r3 P1).
+# Every SHIP-proof decision below goes through here; the mode-only predicate is its first clause.
+pg_review_decision_input_ship_bindable() { # input-binding-json
+  local mode digest
+  mode="$(jq -r '.evidence.mode // ""' <<<"$1" 2>/dev/null)" || return 1
+  pg_review_decision_ship_mode_bindable "$mode" || return 1
+  [ "$mode" = full-pr ] || return 0
+  digest="$(jq -r '.contract_digest // ""' <<<"$1" 2>/dev/null)" || return 1
+  pg_review_decision_record_full_pr_attested "$digest"
+}
+pg_review_decision_result_mode() { # input-binding-json -> closed evidence-mode label for normalized facts
+  case "$(jq -r '.evidence.mode // ""' <<<"$1" 2>/dev/null)" in
+    full-pr) printf 'full-pr' ;; scoped-delta) printf 'scoped-delta' ;; connector) printf 'connector' ;; *) printf 'none' ;;
+  esac
+}
+# Whether a collect effect could ever bind this exact artifact. Only a completed/ SHIP in a mode
+# without merge proof is permanently unrepairable; pending/ bytes remain collect-only recovery data,
+# and every other verdict binds with a null proof. The reducer turns false into a typed stop so a
+# caller can tell an unrepairable result from a transient one instead of collecting forever.
+pg_review_decision_result_bindable() { # artifact-path input-binding-json -> prints true|false
+  local artifact="$1" input="$2"
+  case "$artifact" in
+    "$(pg_completed_dir)"/*)
+      if [ "$(pg_extract_verdict "$artifact")" = SHIP ] && ! pg_review_decision_input_ship_bindable "$input"; then
+        printf 'false'; return 0
+      fi ;;
+  esac
+  printf 'true'
+}
+
 pg_review_decision_repair_result_binding() { # marker input-binding-json
-  local marker="$1" input="$2" artifact verdict input_digest accepted epoch base head proof result lock
+  local marker="$1" input="$2" artifact verdict input_digest accepted epoch base head proof result lock mode
   pg_reservation_marker_ok "$marker" || return 1
   artifact="$(pg_completed_dir)/$marker"
   [ -f "$artifact" ] && [ ! -L "$artifact" ] && pg_is_review "$artifact" || return 1
@@ -275,7 +315,9 @@ pg_review_decision_repair_result_binding() { # marker input-binding-json
   accepted="$(date +%s)"
   proof=null
   if [ "$verdict" = SHIP ]; then
-    case "$(jq -r .evidence.mode <<<"$input")" in
+    mode="$(jq -r .evidence.mode <<<"$input")"
+    pg_review_decision_input_ship_bindable "$input" || return 1
+    case "$mode" in
       full-pr)
         base="$(jq -r .evidence.proof.base_oid <<<"$input")"; head="$(jq -r .evidence.proof.head_oid <<<"$input")"
         proof="$(jq -cnS --arg base "$base" --arg head "$head" --arg digest "$(jq -r .evidence.proof.raw_patch_digest <<<"$input")" '{base_oid:$base,diff_digest:$digest,head_oid:$head}')" || return 1 ;;
@@ -407,7 +449,7 @@ pg_review_decision_cli() {
   local input_proven=false input_binding_valid=false input_identity evidence_identity evidence_state
   local input_marker="" input_record="" input_digest="" f marker candidate candidate_relation desired_relation exact=false active_marker="" active_state=none
   local endpoint reviewed manifest confirmation endpoint_digest reviewed_digest manifest_digest confirmation_digest lineage mode ship_digest
-  local reservation_marker="" reservation_state=none governor_granted=false completed='[]' prior_candidates='[]' prior_review result artifact artifact_digest canonical
+  local reservation_marker="" reservation_state=none governor_granted=false completed='[]' prior_candidates='[]' prior_review result artifact artifact_digest canonical legacy_history=false
   local facts decision effect_ok=false prospective exact_inputs='[]' choice_candidates='[]' choice_outcomes='[]' choice_selected="" choice_snapshot="" selection="" selection_supplied=false current_verdict=NONE current_canonical="" effect_input attempt_snapshot attempt_source
 
   pg_have jq || { echo 'ERROR: review-decision/v1 requires jq' >&2; return 2; }
@@ -472,7 +514,16 @@ pg_review_decision_cli() {
   # the desired invocation relation; marker and charged epoch are intentionally excluded.
   while IFS= read -r marker; do
     candidate="$(pg_review_input_binding_read "$marker" 2>/dev/null || true)"
-    [ -n "$candidate" ] || continue
+    if [ -z "$candidate" ]; then
+      # A record this runtime cannot read is not absent history. Predecessor contracts whose record
+      # shapes are unchanged read normally above; anything else that is still a structurally whole
+      # record for this exact target is unreadable history, and unreadable history must stop the
+      # round closed rather than let it buy a second review of the same head (gate #159 r1 P1).
+      if pg_review_input_binding_foreign_contract "$marker" "$host" "$owner" "$repo_name" "$pr_num" "$head"; then
+        legacy_history=true
+      fi
+      continue
+    fi
     jq -e --arg h "$host" --arg o "$owner" --arg r "$repo_name" --argjson p "$pr_num" --arg head "$head" \
       '.repository.host==$h and .repository.owner==$o and .repository.repo==$r and .target.pr==$p and .target.head_oid==$head' \
       <<<"$candidate" >/dev/null 2>&1 || continue
@@ -503,7 +554,8 @@ pg_review_decision_cli() {
       if [ "$exact" = true ] && [ -n "$artifact" ]; then
         artifact_digest="$(pg_sha256 "$artifact" 2>/dev/null || true)"
         [ -n "$artifact_digest" ] && completed="$(jq -cS --arg marker "$marker" --arg artifact "$artifact_digest" --argjson epoch "$(jq -r .charged_spend_epoch <<<"$candidate")" \
-          '. + [{applicable:true,artifact_digest:$artifact,binding_valid:false,canonical_identity:$marker,charged_spend_epoch:$epoch,collected:false,legacy:false,marker:$marker,provenance_valid:false,verdict:"NONE"}]' <<<"$completed")"
+          --arg mode "$(pg_review_decision_result_mode "$candidate")" --argjson bindable "$(pg_review_decision_result_bindable "$artifact" "$candidate")" \
+          '. + [{applicable:true,artifact_digest:$artifact,bindable:$bindable,binding_valid:false,canonical_identity:$marker,charged_spend_epoch:$epoch,collected:false,evidence_mode:$mode,legacy:false,marker:$marker,provenance_valid:false,verdict:"NONE"}]' <<<"$completed")"
       fi
       continue
     fi
@@ -520,6 +572,19 @@ pg_review_decision_cli() {
     if [ "$exact" = true ]; then
       if [ "$(jq -r .verdict <<<"$result")" = SHIP ]; then
         mode="$(jq -r .evidence.mode <<<"$candidate")"
+        if ! pg_review_decision_input_ship_bindable "$candidate"; then
+          # Connector observations never become merge handoff authority. Neither does a full-pr SHIP
+          # whose record cannot attest that the patch was delivered (a predecessor classic run, gate
+          # #159 r3 P1): its persisted ship proof is not honored, so the exact artifact is exposed as
+          # the same uncollected, unbindable fact a connector SHIP is. History and charge stay; the
+          # reducer's typed result-not-bindable-for-mode stop keeps it out of merge eligibility and
+          # out of any fresh grant, and a bundle|both round on this head earns the proof.
+          if [ "$mode" = full-pr ]; then
+            completed="$(jq -cS --arg marker "$marker" --arg artifact "$artifact_digest" --argjson epoch "$(jq -r .charged_spend_epoch <<<"$candidate")" \
+              '. + [{applicable:true,artifact_digest:$artifact,bindable:false,binding_valid:false,canonical_identity:$marker,charged_spend_epoch:$epoch,collected:false,evidence_mode:"full-pr",legacy:false,marker:$marker,provenance_valid:false,verdict:"NONE"}]' <<<"$completed")"
+          fi
+          continue
+        fi
         case "$mode" in
           full-pr)
             [ -n "$base" ] && [ -n "$raw_digest" ] || continue
@@ -528,9 +593,6 @@ pg_review_decision_cli() {
             # The binding recheck above proved endpoint, reviewed payload, manifest, confirmation,
             # base, and head. Handoff additionally binds the result to that full raw endpoint.
             ship_digest="$(jq -r .evidence.proof.raw_digest <<<"$candidate")" ;;
-          connector)
-            # Connector observations never become merge handoff authority.
-            continue ;;
           *) continue ;;
         esac
         jq -e --arg base "$base" --arg head "$head" --arg digest "$ship_digest" \
@@ -539,7 +601,8 @@ pg_review_decision_cli() {
       fi
       completed="$(jq -cS --arg marker "$marker" --arg canonical "$canonical" --arg artifact "$artifact_digest" \
         --argjson epoch "$(jq -r .charged_spend_epoch <<<"$candidate")" --arg verdict "$(jq -r .verdict <<<"$result")" \
-        '. + [{applicable:true,artifact_digest:$artifact,binding_valid:true,canonical_identity:$canonical,charged_spend_epoch:$epoch,collected:true,legacy:false,marker:$marker,provenance_valid:true,verdict:$verdict}]' <<<"$completed")"
+        --arg mode "$(pg_review_decision_result_mode "$candidate")" \
+        '. + [{applicable:true,artifact_digest:$artifact,bindable:true,binding_valid:true,canonical_identity:$canonical,charged_spend_epoch:$epoch,collected:true,evidence_mode:$mode,legacy:false,marker:$marker,provenance_valid:true,verdict:$verdict}]' <<<"$completed")"
       if [ "$(jq -r .verdict <<<"$result")" = NEEDS-DISCUSSION ]; then
         choice_outcomes="$(pg_review_decision_named_choices "$artifact" 2>/dev/null || true)"
         [ -n "$choice_outcomes" ] || choice_outcomes='[]'
@@ -593,6 +656,12 @@ pg_review_decision_cli() {
     sort_by(.charged_spend_epoch,.canonical_identity) | last //
     {code_identity:"",evidence_identity:"",marker:"",verdict:"NONE"} |
     {applicable:false,binding_valid:(.marker != ""),code_identity,evidence_identity,legacy:false,marker,provenance_valid:(.marker != ""),verdict}' <<<"$prior_candidates")"
+  # Unreadable predecessor history is applicable but never authoritative: the reducer's existing
+  # closed legacy-not-authoritative stop keeps it out of merge eligibility, fix routing, and any
+  # fresh grant. A readable completed result for this head still outranks it in the reducer.
+  if [ "$legacy_history" = true ]; then
+    prior_review="$(jq -cS '.applicable=true | .legacy=true' <<<"$prior_review")"
+  fi
 
   # Lifecycle ownership comes from one canonical snapshot. Querying stale mutable state remains
   # conservative (recover); reconciliation stays an effect and cannot happen in this read-only path.
@@ -1848,15 +1917,34 @@ pg_active_clear() {  # $1 = exit code
   fi
   rm -f "$f" 2>/dev/null || true
 }
-pg_install_full_pr_input_binding() { # marker; only endpoint-fetched full PRs gain automatic applicability
+pg_install_full_pr_input_binding() { # marker; every endpoint-fetched classic run gets a lifecycle
+  # binding, but only the delivered-bytes modes earn automatic merge applicability.
   local marker="$1" binding
   [ "${PG_FULL_PR_PROVEN:-0}" = 1 ] || return 0  # caller-supplied/scoped/bare patches remain bounded
   [ -n "${RUN_SPEND_EPOCH:-}" ] && [ -n "${PG_META_HOST:-}${PG_META_OWNER:-}${PG_META_REPO:-}" ] || return 1
-  binding="$(jq -cnS --arg cd "$(pg_review_decision_contract_digest)" --arg marker "$marker" \
-    --arg host "$PG_META_HOST" --arg owner "$PG_META_OWNER" --arg repo "$PG_META_REPO" --argjson pr "$PR_NUM" \
-    --arg base "$PG_FULL_PR_BASE" --arg head "$PG_FULL_PR_HEAD" --arg endpoint "$PG_FULL_PR_ENDPOINT_DIGEST" --arg raw "$PG_FULL_PR_RAW_DIGEST" \
-    --argjson epoch "$RUN_SPEND_EPOCH" \
-    '{charged_spend_epoch:$epoch,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("full-pr:"+$base+":"+$head),mode:"full-pr",proof:{base_oid:$base,endpoint_digest:$endpoint,head_oid:$head,raw_patch_digest:$raw}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:$host,owner:$owner,repo:$repo},target:{head_oid:$head,kind:"pull-request",pr:$pr}}')" || return 1
+  # Merge eligibility binds bytes the engine delivered. FILE_ARGS attaches the endpoint patch only
+  # for bundle|both, so a connector-only classic run never handed the model those bytes and earns no
+  # full-pr relation (#150). It still earns a RECORD: merge-proof eligibility and lifecycle identity
+  # are separate, and recover_superseded_reason plus pg_reservation_supersede both refuse a marker
+  # whose immutable binding is missing — so skipping the write entirely left an obsolete connector
+  # attempt occupying shared capacity with no way to release it (gate #159 r1 P1). The connector
+  # record is byte-identical in relation to the one the typed path already writes: repository,
+  # commit target, charged epoch, null patch digests. pg_review_decision_ship_mode_bindable keeps
+  # its SHIP results ineligible for merge proof exactly as before.
+  case "$INPUT" in
+    bundle|both)
+      binding="$(jq -cnS --arg cd "$(pg_review_decision_contract_digest)" --arg marker "$marker" \
+        --arg host "$PG_META_HOST" --arg owner "$PG_META_OWNER" --arg repo "$PG_META_REPO" --argjson pr "$PR_NUM" \
+        --arg base "$PG_FULL_PR_BASE" --arg head "$PG_FULL_PR_HEAD" --arg endpoint "$PG_FULL_PR_ENDPOINT_DIGEST" --arg raw "$PG_FULL_PR_RAW_DIGEST" \
+        --argjson epoch "$RUN_SPEND_EPOCH" \
+        '{charged_spend_epoch:$epoch,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("full-pr:"+$base+":"+$head),mode:"full-pr",proof:{base_oid:$base,endpoint_digest:$endpoint,head_oid:$head,raw_patch_digest:$raw}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:$host,owner:$owner,repo:$repo},target:{head_oid:$head,kind:"pull-request",pr:$pr}}')" || return 1 ;;
+    connector)
+      binding="$(jq -cnS --arg cd "$(pg_review_decision_contract_digest)" --arg marker "$marker" \
+        --arg host "$PG_META_HOST" --arg owner "$PG_META_OWNER" --arg repo "$PG_META_REPO" --argjson pr "$PR_NUM" \
+        --arg head "$PG_FULL_PR_HEAD" --argjson epoch "$RUN_SPEND_EPOCH" \
+        '{charged_spend_epoch:$epoch,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("connector:"+$host+"/"+$owner+"/"+$repo+":"+$head),mode:"connector",proof:{commit_target:$head,endpoint_digest:null,raw_diff_digest:null,repository_target:($host+"/"+$owner+"/"+$repo)}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:$host,owner:$owner,repo:$repo},target:{head_oid:$head,kind:"pull-request",pr:$pr}}')" || return 1 ;;
+    *) return 0 ;;
+  esac
   pg_review_input_binding_write "$marker" "$binding"
 }
 
@@ -1903,7 +1991,8 @@ pg_fresh_dispatch_recheck() { # sets PG_FRESH_DECISION/PG_FRESH_ACTION
       artifact_digest="$(pg_sha256 "$artifact" 2>/dev/null || true)"
       [ -n "$artifact_digest" ] || continue
       completed="$(jq -cS --arg marker "$m" --arg digest "$artifact_digest" --argjson charged "$(jq -r .charged_spend_epoch <<<"$candidate")" \
-        '. + [{applicable:true,artifact_digest:$digest,binding_valid:false,canonical_identity:$marker,charged_spend_epoch:$charged,collected:false,legacy:false,marker:$marker,provenance_valid:false,verdict:"NONE"}]' <<<"$completed")"
+        --arg mode "$(pg_review_decision_result_mode "$candidate")" --argjson bindable "$(pg_review_decision_result_bindable "$artifact" "$candidate")" \
+        '. + [{applicable:true,artifact_digest:$digest,bindable:$bindable,binding_valid:false,canonical_identity:$marker,charged_spend_epoch:$charged,collected:false,evidence_mode:$mode,legacy:false,marker:$marker,provenance_valid:false,verdict:"NONE"}]' <<<"$completed")"
     done < <(find "$(pg_review_input_binding_dir)" -mindepth 1 -maxdepth 1 -type f -name "pg-run-$ROUND_KEY-*" -printf '%f\n' 2>/dev/null | LC_ALL=C sort)
   fi
   attempt_snapshot="$(pg_attempt_snapshot "$PG_META_HOST" "$PG_META_OWNER" "$PG_META_REPO" "$PR_NUM" "$ROUND_KEY" "${RUN_MARKER:-}" 2>/dev/null || true)"
@@ -1945,7 +2034,11 @@ pg_fresh_dispatch_require_run() { # boundary label; exits through existing statu
 pg_install_effect_input_binding() { # clone the already-current validated relation to this charged marker
   local binding
   [ -n "${RUN_SPEND_EPOCH:-}" ] || return 1
-  binding="$(jq -cS --arg marker "$RUN_MARKER" --argjson epoch "$RUN_SPEND_EPOCH" '.marker=$marker | .charged_spend_epoch=$epoch' <<<"$REVIEW_DECISION_INPUT_TEMPLATE")" || return 1
+  # Only the proof relation is inherited. The template may be a persisted record written under a
+  # predecessor contract (readable history, gate #159 r1 P1), while this is a NEW record for a new
+  # marker and charge, so it is stamped with the current contract exactly like every other write.
+  binding="$(jq -cS --arg marker "$RUN_MARKER" --argjson epoch "$RUN_SPEND_EPOCH" --arg cd "$(pg_review_decision_contract_digest)" \
+    '.marker=$marker | .charged_spend_epoch=$epoch | .contract_digest=$cd' <<<"$REVIEW_DECISION_INPUT_TEMPLATE")" || return 1
   pg_review_input_binding_write "$RUN_MARKER" "$binding"
 }
 pg_fresh_dispatch_refund() { # terminalize and refund only the current exact charged attempt
@@ -2783,7 +2876,8 @@ if [ -n "$PR_NUM" ]; then
 fi
 [ -n "$REPO" ] || REPO="$(pwd)"
 cd "$REPO" || { echo "ERROR: repo dir not found: $REPO" >&2; pg_status failed "repo dir not found"; pg_finish 4; }
-[ -n "$PR_URL" ] || PR_URL="$(gh pr view "$PR_NUM" --json url -q .url 2>/dev/null || echo "")"
+# PRO_GATE_GH_BIN is the same test seam the recover path already honors; production leaves it unset.
+[ -n "$PR_URL" ] || PR_URL="$("${PRO_GATE_GH_BIN:-gh}" pr view "$PR_NUM" --json url -q .url 2>/dev/null || echo "")"
 
 # PR_KEY: repo-scoped identity for locks, reservations, and markers. PR numbers repeat across
 # repositories; keying on the bare number let an in-progress repo-A#77 redirect a repo-B#77 gate
@@ -2833,7 +2927,7 @@ fi
 
 if [ -z "$DIFF_FILE" ]; then
   DIFF_FILE="$WORK/pr.diff"
-  gh pr diff "$PR_NUM" --patch > "$DIFF_FILE" 2>"$WORK/diff.err" || {
+  "${PRO_GATE_GH_BIN:-gh}" pr diff "$PR_NUM" --patch > "$DIFF_FILE" 2>"$WORK/diff.err" || {
     echo "ERROR: gh pr diff $PR_NUM failed in $REPO: $(cat "$WORK/diff.err")" >&2; pg_status failed "gh pr diff failed"; pg_finish 5; }
 fi
 
@@ -3110,6 +3204,13 @@ ENGINE_ARGS=(-e browser)
 # leave the tab intact so probe/salvage can always find it, then let the marker-owned organizer
 # archive/close only after durable validation in pg_finish. Override with PRO_GATE_BROWSER_ARCHIVE.
 ENGINE_ARGS+=(--browser-archive "${PRO_GATE_BROWSER_ARCHIVE:-never}")
+# Oracle's --browser-attachments (default auto) uploads the composer text as a file once it passes
+# oracle's 60,000-character inline budget, and that upload path has stalled on every bundle review
+# above the cutoff since 2026-08-31 (#145: "Attachments did not finish uploading before timeout").
+# `never` keeps a text-only bundle inline regardless of size. The default stays oracle's `auto`
+# until live runs prove ChatGPT's composer accepts large pastes reliably; the seam lets an operator
+# opt in per deployment now. Override with PRO_GATE_BROWSER_ATTACHMENTS.
+ENGINE_ARGS+=(--browser-attachments "${PRO_GATE_BROWSER_ATTACHMENTS:-auto}")
 
 # --- Bound concurrent Pro review runs against the single ChatGPT account ---
 # DEFAULT IS SERIALIZED (1). The 2026-07-03 throttle incident showed one account under
