@@ -2356,10 +2356,19 @@ pg_trim_file() {
 # foreign or stale conversation's answer. The engine strips the token before returning output.
 # ─────────────────────────────────────────────────────────────────────────────
 # pg_capture_nonce_ok <file> <marker>: rc 0 when the capture's tail carries this run's token.
+# Case-insensitive (#167). The marker carries un-lowercased repo text
+# ("pg-run-StartupBros-com-pro-gate-166-..."), and a model that lowercased its own echo used to
+# fail to bind here: under PRO_GATE_REQUIRE_NONCE=1 the capture was set aside .unbound and every
+# retry re-read the same text until the reservation aged out. Two genuinely different runs cannot
+# differ only in letter case — a marker ends in "-<launch epoch>-<pid>" and one process has one of
+# each — so folding case cannot accept another run's answer.
+# LC_ALL=C is load-bearing, not decoration: grep -i consults LC_CTYPE, and under a Turkish locale
+# 'I' does NOT fold to 'i', which would reinstate exactly this bug for any marker carrying an I.
+# It also keeps the shell's fold identical to cdp-salvage.mjs's deliberately ASCII-only asciiFold.
 pg_capture_nonce_ok() {
   local f="$1" marker="$2"
   [ -s "$f" ] || return 1
-  tail -n 6 "$f" 2>/dev/null | grep -qF "(run marker: $marker)"
+  tail -n 6 "$f" 2>/dev/null | LC_ALL=C grep -qiF "(run marker: $marker)"
 }
 # pg_strip_nonce <file> <marker>: remove the echoed token (harmless when absent).
 pg_strip_nonce() {
@@ -2367,8 +2376,16 @@ pg_strip_nonce() {
   [ -s "$f" ] || return 0
   # Fixed-string removal via awk (the marker is regex-safe by charset, but the parentheses
   # around it are not; index/substr avoids regex entirely).
-  awk -v tok="(run marker: $marker)" '{
-    i = index($0, tok)
+  # The LOOKUP is case-folded and the SLICE is not (#167): pg_capture_nonce_ok now binds a
+  # lowercased self-echo, so this must remove that same echo or the raw marker token would reach
+  # the caller-facing review. tolower() applies only to the search operands, so every other byte
+  # on the line is published exactly as the model wrote it. Same LC_ALL=C reasoning as
+  # pg_capture_nonce_ok: gawk's tolower() is locale-sensitive, and the C locale keeps
+  # index()/substr()/length() on one consistent byte basis.
+  LC_ALL=C awk -v tok="(run marker: $marker)" '
+  BEGIN { lower_tok = tolower(tok) }
+  {
+    i = index(tolower($0), lower_tok)
     if (i > 0) { $0 = substr($0, 1, i - 1) substr($0, i + length(tok)) ; sub(/[ \t]+$/, "") }
     print
   }' "$f" > "$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null

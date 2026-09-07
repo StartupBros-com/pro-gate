@@ -460,6 +460,11 @@ const completedReview = (marker, summary = 'owned') => [
   'P3: none',
   `VERDICT: SHIP — ${summary}. (run marker: ${marker})`,
 ].join('\n');
+// #167: mirrors bin/cdp-salvage.mjs's asciiFold. The engine's pg_strip_nonce and the browser-side
+// stripMarkerEcho both remove the echo case-insensitively, so this test-side reimplementation must
+// too — otherwise a lowercased-echo fixture would produce durable bytes the finalizer's own strip
+// disagrees with, and the fixture would fail as result-mismatch for a reason that is not the code.
+const testAsciiFold = (value) => String(value ?? '').replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
 const durableReview = (review, marker) => {
   const lines = review.split('\n');
   let verdict = -1;
@@ -471,8 +476,12 @@ const durableReview = (review, marker) => {
     if (/^\s*[*_>#-]*\s*(P0\s*[:\-]|P0\b|\[P[0-3]\])/i.test(lines[i].trim())) start = i;
   }
   if (start < 0) start = Math.max(0, verdict - 120);
-  return lines.slice(start, verdict + 1).join('\n')
-    .replace(`(run marker: ${marker})`, '')
+  const token = `(run marker: ${marker})`;
+  const foldedToken = testAsciiFold(token);
+  return lines.slice(start, verdict + 1).map((line) => {
+    const at = testAsciiFold(line).indexOf(foldedToken);
+    return at < 0 ? line : `${line.slice(0, at)}${line.slice(at + token.length)}`;
+  }).join('\n')
     .replace(/[ \t]+$/gm, '')
     .trim();
 };
@@ -497,6 +506,10 @@ function hasConsecutiveSamples(samples, minimum) {
 }
 
 const MARKER = 'pg-run-test-1234567890-42';
+// #167: a marker embeds ROUND_KEY, which preserves letter case from owner/repo text
+// ("pg-run-StartupBros-com-pro-gate-166-..."). Fixtures that vary the ECHO's case need a marker
+// whose case can actually vary — MARKER is already all-lowercase and cannot express the bug.
+const MIXED_MARKER = 'pg-run-Test-Case-1234567890-43';
 
 { // Direct poll-parser boundary coverage (bin/cdp-test-timing.mjs), called in-process — no spawn. Every
   // one of these is real production input shape: an unset/empty/malformed
@@ -1421,6 +1434,69 @@ const FOREIGN_ANSWER = (m) => [
   cdp.stop();
 }
 
+{ // #167: the marker was EXTRACTED case-insensitively but COMPARED case-sensitively, so a model
+  // that lowercased its own echo read as a different run: the conversation was blacklisted, its
+  // memo discarded, and this run's finished, PAID answer became unrecoverable. Both directions of
+  // case drift are pinned — a model can shout as easily as it can whisper.
+  //
+  // The fold is safe because two genuinely different runs cannot differ ONLY in letter case: a
+  // marker ends in "-<launch epoch>-<pid>" and one process has exactly one of each. The refusal
+  // half of that argument is pinned immediately below, including a sibling run that folds to
+  // nearly the same string and must still be refused.
+  const answerWithEcho = (echo) => [
+    `run marker: ${MIXED_MARKER}`,
+    '',
+    '[P1] lib/thing.sh:3 — a real finding',
+    'P2: none',
+    'P3: none',
+    `VERDICT: FIX-FIRST — ours. (run marker: ${echo})`,
+  ].join('\n');
+
+  for (const [label, echo] of [
+    ['a lowercased', MIXED_MARKER.toLowerCase()],
+    ['an uppercased', MIXED_MARKER.toUpperCase()],
+  ]) {
+    const cdp = await mockCdp(answerWithEcho(echo));
+    const r = await runSalvage([MIXED_MARKER, '20'], cdp.port);
+    check(`${label} self-echo binds positively rather than convicting (exit 0)`, r.status === 0,
+      `status=${r.status} stderr=${r.stderr?.slice(-400)}`);
+    check(`${label} self-echo's review reaches stdout`, /VERDICT: FIX-FIRST/.test(r.stdout ?? ''),
+      `stdout=${r.stdout?.slice(0, 200)}`);
+    check(`${label} self-echo is never convicted cross-bound or blacklisted`,
+      (r.crossbound ?? 0) === 0 && (r.blacklist ?? '') === '',
+      `crossbound=${r.crossbound} blacklist=${r.blacklist}`);
+    cdp.stop();
+  }
+
+  // NON-NEGOTIABLE: case is the only thing the fold may ignore. A marker for another repo, and a
+  // SIBLING run of this same round that differs only in its pid, must both still be refused.
+  for (const [label, foreign] of [
+    ['a foreign marker', 'pg-run-other-repo-42-1111111111-9'],
+    ['an uppercased foreign marker', 'PG-RUN-OTHER-REPO-42-1111111111-9'],
+    ['a sibling run of the same round', 'pg-run-test-case-1234567890-44'],
+  ]) {
+    const cdp = await mockCdp(answerWithEcho(foreign));
+    const r = await runSalvage([MIXED_MARKER, '3'], cdp.port);
+    check(`${label} is still refused, never emitted as ours`,
+      r.status !== 0 && !/VERDICT/.test(r.stdout ?? ''),
+      `status=${r.status} stdout=${r.stdout?.slice(0, 200)}`);
+    check(`${label} is still convicted as a cross-bind`, r.crossbound > 0,
+      `crossbound=${r.crossbound} stderr=${r.stderr?.slice(-300)}`);
+    cdp.stop();
+  }
+}
+
+{ // #167: --close matches the tab by marker too. A conversation whose rendered text carries only
+  // a case-drifted occurrence used to be left open, leaking a /c/ tab per run.
+  const cdp = await mockCdp(
+    `run marker: ${MIXED_MARKER.toLowerCase()}\nVERDICT: SHIP — ours. (run marker: ${MIXED_MARKER.toLowerCase()})`,
+  );
+  const r = await runSalvage(['--close', MIXED_MARKER, '10'], cdp.port);
+  check('--close closes a conversation tab whose marker differs only in case',
+    r.status === 0 && cdp.closed.includes('tab1'), `status=${r.status} closed=${cdp.closed}`);
+  cdp.stop();
+}
+
 { // A still-generating conversation (our marker, NO completed verdict yet) must remain
   // "live", not be mistaken for a cross-bind: the foreign check only fires on a COMPLETE answer.
   // Its canonical scratch revalidation deliberately keeps sampling owned-incomplete evidence to
@@ -1930,6 +2006,58 @@ const FOREIGN_ANSWER = (m) => [
   cdp.stop();
 }
 
+{ // #167, mutation authority. organizerOwnership/finalizerOwnership are deliberately stricter
+  // than salvage extraction, and their "exact marker echo" rule used to mean case-exact: a
+  // lowercased self-echo returned cross-bound, so the run's own conversation was never renamed,
+  // archived or closed. "Exact" now means token-exact, not case-exact.
+  //
+  // The finalizer case doubles as the strip contract's only end-to-end pin. Its accepted bytes
+  // come from the ENGINE, whose pg_strip_nonce removed the echo case-insensitively; the browser
+  // side must fold identically or the byte comparison lands on result-mismatch instead of ok.
+  const title = 'pro-gate review: PR #167 r1 [pro-gate]';
+  const lowerEcho = completedReview(MIXED_MARKER.toLowerCase(), 'case-drifted echo');
+  const organizeCdp = await mockCdp(`run marker: ${MIXED_MARKER}\n${lowerEcho}`);
+  const organizeResult = await runSalvage(
+    ['--organize', MIXED_MARKER, '5'],
+    organizeCdp.port,
+    seedOrganizer(MIXED_MARKER, title),
+  );
+  check('organizer grants rename authority on a lowercased self-echo',
+    /rename=renamed/.test(organizeResult.stdout) && /reason=ok/.test(organizeResult.stdout),
+    `stdout=${organizeResult.stdout}`);
+  check('organizer applies the exact title for a lowercased self-echo',
+    organizeCdp.ui.title === title, `title=${organizeCdp.ui.title}`);
+  organizeCdp.stop();
+
+  const finalizeTitle = 'pro-gate review: PR #167 r2 [pro-gate]';
+  const finalizeCdp = await mockCdp(`run marker: ${MIXED_MARKER}\n${lowerEcho}`);
+  const finalizeResult = await runSalvage(
+    finalizerArgs(MIXED_MARKER),
+    finalizeCdp.port,
+    seedOrganizer(MIXED_MARKER, finalizeTitle, null, durableReview(lowerEcho, MIXED_MARKER)),
+  );
+  check('finalizer accepts a lowercased self-echo and agrees with the engine-stripped bytes',
+    /rename=renamed archive=archived close=closed reason=ok/.test(finalizeResult.stdout),
+    `stdout=${finalizeResult.stdout}`);
+  finalizeCdp.stop();
+
+  // And still refuses a genuinely foreign echo, whatever its case: /i widens EXTRACTION, never
+  // acceptance. Without this, an over-broad fold could grant mutation authority over another
+  // run's live conversation.
+  const foreignTitle = 'pro-gate review: PR #167 r3 [pro-gate]';
+  const foreignEcho = completedReview('PG-RUN-OTHER-REPO-42-1111111111-9', 'not ours');
+  const foreignCdp = await mockCdp(`run marker: ${MIXED_MARKER}\n${foreignEcho}`);
+  const foreignResult = await runSalvage(
+    ['--organize', MIXED_MARKER, '5'],
+    foreignCdp.port,
+    seedOrganizer(MIXED_MARKER, foreignTitle),
+  );
+  check('organizer still refuses an uppercased FOREIGN echo',
+    /reason=cross-bound/.test(foreignResult.stdout) && foreignCdp.ui.events.length === 0,
+    `stdout=${foreignResult.stdout} events=${JSON.stringify(foreignCdp.ui.events)}`);
+  foreignCdp.stop();
+}
+
 {
   const title = 'pro-gate review: PR #71 r8a [pro-gate]';
   const newerMarker = 'pg-run-test-1234567891-43';
@@ -2379,8 +2507,25 @@ const FOREIGN_ANSWER = (m) => [
       /expectedFinalReview === null[\s\S]*verdictAt > ownMarkerAt/.test(renameExpression));
   check('browser-side finalization rejects any newer exact run marker',
     /lastExactRunMarkerAt/.test(renameExpression) &&
-      /matchAll\(\/pg-run-\[A-Za-z0-9.-\]\+\/g\)/.test(renameExpression) &&
+      /matchAll\(\/pg-run-\[A-Za-z0-9.-\]\+\/gi\)/.test(renameExpression) &&
       /target-newer-run-marker/.test(renameExpression));
+  // #167: the browser-side ownership check is a textual TWIN of cdp-salvage.mjs's, inlined into
+  // a String.raw template because the page cannot import. A fix applied to one copy and not the
+  // other is invisible at runtime until the organizer silently refuses to rename a conversation
+  // whose only fault is that the model lowercased its own echo. Assert the fold is present here
+  // AND that no bare case-sensitive comparison survives in the emitted source.
+  check('browser-side marker identity is ASCII-case-folded, not byte-exact',
+    /const asciiFold = /.test(renameExpression) &&
+      /const sameMarker = /.test(renameExpression) &&
+      /sameMarker\(answerMarker, expectedMarker\)/.test(renameExpression) &&
+      !/answerMarker !== expectedMarker/.test(renameExpression));
+  check('browser-side marker search folds the haystack, keeping indexes into the original text',
+    /const haystack = asciiFold\(text\)/.test(renameExpression) &&
+      /const needle = asciiFold\(wanted\)/.test(renameExpression) &&
+      !/text\.indexOf\(wanted, from\)/.test(renameExpression));
+  check('browser-side marker-echo strip folds the lookup but slices the original line',
+    /asciiFold\(line\)\.indexOf\(asciiFold\(token\)\)/.test(renameExpression) &&
+      !/const at = line\.indexOf\(token\)/.test(renameExpression));
   check('archive expression excludes destructive and reverse actions',
     /label\.includes\('delete'\)/.test(archiveExpression) &&
       /label\.includes\('unarchive'\)/.test(archiveExpression) &&

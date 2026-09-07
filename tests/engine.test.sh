@@ -5929,4 +5929,75 @@ check 'exact pending connector SHIP is collect-only and never merge eligible' \
   "$([ "$CONNECTOR_PENDING_RC" -eq 0 ] && jq -e '.action=="collect-existing-result" and .action!="allow-existing-merge-workflow"' "$TDIR/connector-pending.json" >/dev/null 2>&1; echo $?)" \
   "rc=$CONNECTOR_PENDING_RC output=$(cat "$TDIR/connector-pending.json") stderr=$(cat "$TDIR/connector-pending.err")"
 
+# U2 (#167): the run-marker echo is EXTRACTED case-insensitively but used to be COMPARED
+# case-sensitively. A marker embeds ROUND_KEY, which preserves letter case from repo text
+# ("pg-run-StartupBros-com-pro-gate-166-..."), so a model that lowercased its own echo never bound
+# here: under PRO_GATE_REQUIRE_NONCE=1 the capture was set aside .unbound and every retry re-read
+# the same text until the reservation aged out. Two genuinely different runs cannot differ only in
+# letter case — a marker ends in "-<launch epoch>-<pid>" and one process has one of each — so the
+# fold cannot accept another run's answer. Both halves are pinned: bind ours, refuse theirs.
+echo '# U2 (#167): run-marker binding folds ASCII case, and only ASCII case'
+NC_MARKER='pg-run-Case-Fold-Repo-1700000900-901'
+NC_LOWER="$(printf '%s' "$NC_MARKER" | tr 'A-Z' 'a-z')"
+NC_UPPER="$(printf '%s' "$NC_MARKER" | tr 'a-z' 'A-Z')"
+NC_DIR="$TDIR/nonce-case"; mkdir -p "$NC_DIR"
+# Non-ASCII on the finding line on purpose: the fold is a LOOKUP key, never the published bytes.
+nonce_capture() { # <file> <echoed marker>
+  printf '[P1] lib/x.sh:1 — a real finding, é ünïcode ✓\nP2: none\nVERDICT: SHIP — ours. (run marker: %s)\n' "$2" > "$1"
+}
+NC_STRIPPED="$(printf '[P1] lib/x.sh:1 — a real finding, é ünïcode ✓\nP2: none\nVERDICT: SHIP — ours.')"
+
+nonce_capture "$NC_DIR/exact.md" "$NC_MARKER"
+check 'pg_capture_nonce_ok still binds a byte-exact echo' \
+  "$(pg_capture_nonce_ok "$NC_DIR/exact.md" "$NC_MARKER"; echo $?)" "$(cat "$NC_DIR/exact.md")"
+nonce_capture "$NC_DIR/lower.md" "$NC_LOWER"
+check 'pg_capture_nonce_ok binds a lowercased self-echo' \
+  "$(pg_capture_nonce_ok "$NC_DIR/lower.md" "$NC_MARKER"; echo $?)" "$(cat "$NC_DIR/lower.md")"
+nonce_capture "$NC_DIR/upper.md" "$NC_UPPER"
+check 'pg_capture_nonce_ok binds an uppercased self-echo' \
+  "$(pg_capture_nonce_ok "$NC_DIR/upper.md" "$NC_MARKER"; echo $?)" "$(cat "$NC_DIR/upper.md")"
+nonce_capture "$NC_DIR/foreign.md" 'pg-run-other-repo-42-1111111111-9'
+check 'pg_capture_nonce_ok still refuses another repo run' \
+  "$(! pg_capture_nonce_ok "$NC_DIR/foreign.md" "$NC_MARKER"; echo $?)" "$(cat "$NC_DIR/foreign.md")"
+# The safety argument itself: a sibling attempt of the SAME round folds to a nearly identical
+# string and differs only in its pid. It must still be refused, or the fold would be laundering.
+nonce_capture "$NC_DIR/sibling.md" 'pg-run-case-fold-repo-1700000900-902'
+check 'pg_capture_nonce_ok still refuses a sibling run of the same round' \
+  "$(! pg_capture_nonce_ok "$NC_DIR/sibling.md" "$NC_MARKER"; echo $?)" "$(cat "$NC_DIR/sibling.md")"
+
+# Binding without stripping would publish the raw marker token to the caller. The two must move
+# together, so the strip folds its lookup while slicing the original, unfolded line.
+cp "$NC_DIR/lower.md" "$NC_DIR/strip-lower.md"
+pg_strip_nonce "$NC_DIR/strip-lower.md" "$NC_MARKER"
+check 'pg_strip_nonce removes a lowercased echo, leaking no marker into the published review' \
+  "$(! LC_ALL=C grep -qi 'pg-run-' "$NC_DIR/strip-lower.md"; echo $?)" "$(cat "$NC_DIR/strip-lower.md")"
+check 'pg_strip_nonce publishes every other byte unchanged, non-ASCII included' \
+  "$([ "$(cat "$NC_DIR/strip-lower.md")" = "$NC_STRIPPED" ]; echo $?)" "$(cat "$NC_DIR/strip-lower.md")"
+cp "$NC_DIR/foreign.md" "$NC_DIR/strip-foreign.md"
+pg_strip_nonce "$NC_DIR/strip-foreign.md" "$NC_MARKER"
+check 'pg_strip_nonce never removes another run marker' \
+  "$(grep -qF 'pg-run-other-repo-42-1111111111-9' "$NC_DIR/strip-foreign.md"; echo $?)" \
+  "$(cat "$NC_DIR/strip-foreign.md")"
+
+# grep -i and gawk's tolower() consult LC_CTYPE. Under a Turkish locale 'I' does NOT fold to 'i',
+# which would reinstate this exact bug for any marker carrying an I — so both helpers pin
+# LC_ALL=C, matching cdp-salvage.mjs's deliberately ASCII-only asciiFold. Built on demand because
+# CI images rarely ship tr_TR, and skipped loudly when the host cannot express the hazard.
+NC_LOCPATH="$TDIR/locales"; mkdir -p "$NC_LOCPATH"
+if command -v localedef >/dev/null 2>&1 \
+   && localedef -i tr_TR -f UTF-8 "$NC_LOCPATH/tr_TR.UTF-8" >/dev/null 2>&1 \
+   && ! LOCPATH="$NC_LOCPATH" LC_ALL=tr_TR.UTF-8 bash -c 'printf i | grep -qi I'; then
+  NC_TR='pg-run-Istanbul-Iyi-1700000902-902'
+  nonce_capture "$NC_DIR/tr.md" "$(printf '%s' "$NC_TR" | tr 'A-Z' 'a-z')"
+  check 'pg_capture_nonce_ok folds identically under a Turkish locale' \
+    "$(LOCPATH="$NC_LOCPATH" LC_ALL=tr_TR.UTF-8 bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_capture_nonce_ok '$NC_DIR/tr.md' '$NC_TR'"; echo $?)" \
+    "$(cat "$NC_DIR/tr.md")"
+  cp "$NC_DIR/tr.md" "$NC_DIR/tr-strip.md"
+  LOCPATH="$NC_LOCPATH" LC_ALL=tr_TR.UTF-8 bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_strip_nonce '$NC_DIR/tr-strip.md' '$NC_TR'"
+  check 'pg_strip_nonce strips identically under a Turkish locale' \
+    "$(! LC_ALL=C grep -qi 'pg-run-' "$NC_DIR/tr-strip.md"; echo $?)" "$(cat "$NC_DIR/tr-strip.md")"
+else
+  echo 'ok - Turkish-locale fold case skipped (localedef unavailable, or grep -i is already locale-independent on this host)'
+fi
+
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }

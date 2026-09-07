@@ -71,14 +71,22 @@ function targetContext(marker, conversationUrl, {
       delete globalThis[revocationRegistryName]?.[mutationToken];
     };
     const isRunMarkerChar = (char) => /[A-Za-z0-9.-]/.test(char ?? '');
+    // The browser-side twins of cdp-salvage.mjs's marker helpers. This expression is evaluated
+    // inside the page and cannot import, so the fold is redeclared rather than shared — keep the
+    // two copies identical. ASCII-only and length-preserving on purpose (#167): every index
+    // below indexes back into the ORIGINAL, unfolded page text.
+    const asciiFold = (value) => String(value ?? '').replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
+    const sameMarker = (a, b) => !!a && !!b && asciiFold(a) === asciiFold(b);
     const lastExactMarkerAt = (text, wanted) => {
+      const haystack = asciiFold(text);
+      const needle = asciiFold(wanted);
       let found = -1;
       let from = 0;
-      while (from <= text.length - wanted.length) {
-        const at = text.indexOf(wanted, from);
+      while (from <= haystack.length - needle.length) {
+        const at = haystack.indexOf(needle, from);
         if (at < 0) break;
-        const before = at > 0 ? text[at - 1] : '';
-        const after = text[at + wanted.length] ?? '';
+        const before = at > 0 ? haystack[at - 1] : '';
+        const after = haystack[at + needle.length] ?? '';
         if (!isRunMarkerChar(before) && !isRunMarkerChar(after)) found = at;
         from = at + 1;
       }
@@ -86,7 +94,7 @@ function targetContext(marker, conversationUrl, {
     };
     const lastExactRunMarkerAt = (text) => {
       let found = -1;
-      for (const match of text.matchAll(/pg-run-[A-Za-z0-9.-]+/g)) {
+      for (const match of text.matchAll(/pg-run-[A-Za-z0-9.-]+/gi)) {
         const at = match.index;
         const before = at > 0 ? text[at - 1] : '';
         const after = text[at + match[0].length] ?? '';
@@ -98,7 +106,7 @@ function targetContext(marker, conversationUrl, {
       .replace(/\r\n?/g, '\n').replace(/\n$/, '');
     const stripMarkerEcho = (value) => String(value ?? '').split('\n').map((line) => {
       const token = '(run marker: ' + expectedMarker + ')';
-      const at = line.indexOf(token);
+      const at = asciiFold(line).indexOf(asciiFold(token));
       if (at < 0) return line;
       return (line.slice(0, at) + line.slice(at + token.length)).replace(/[ \t]+$/, '');
     }).join('\n');
@@ -140,7 +148,7 @@ function targetContext(marker, conversationUrl, {
       if (expectedFinalReview === null && verdictAt > ownMarkerAt) {
         const answerMarker = verdictLine.match(/\(run marker:\s*(pg-run-[A-Za-z0-9.-]+)\s*\)/i)?.[1] ?? null;
         if (!answerMarker) return 'target-answer-marker-missing';
-        if (answerMarker !== expectedMarker) return 'target-cross-bound';
+        if (!sameMarker(answerMarker, expectedMarker)) return 'target-cross-bound';
       }
       if (expectedFinalReview !== null) {
         if (verdictAt < 0 || promptMarkerAt < 0) return 'target-answer-incomplete';
@@ -149,7 +157,7 @@ function targetContext(marker, conversationUrl, {
         }
         const answerMarker = verdictLine.match(/\(run marker:\s*(pg-run-[A-Za-z0-9.-]+)\s*\)/i)?.[1] ?? null;
         if (!answerMarker) return 'target-answer-marker-missing';
-        if (answerMarker !== expectedMarker) return 'target-cross-bound';
+        if (!sameMarker(answerMarker, expectedMarker)) return 'target-cross-bound';
         const renderedReview = extractFinalReview(text);
         if (!renderedReview || normalizeReviewBytes(stripMarkerEcho(renderedReview)) !== expectedFinalReview) {
           return 'target-result-mismatch';
