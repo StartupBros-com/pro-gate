@@ -227,14 +227,52 @@ let ownershipProven = false;       // any candidate positively proved ours this 
 // Record a per-candidate conviction. Persisted only by flushCrossBind() at exit.
 function noteCrossBind(_m, url, foreign) { crossBindHits.set(url, foreign); }
 
+// #170: does salvage-nonmatching.txt still hold an entry for this marker? Read from the FILE,
+// not from the `nonMatching` Set: that Set is declared with the blacklist block far below, and
+// --sweep-root (exits at the "closed N idle root tab(s)" line) and --close both exit ABOVE it,
+// so touching it from the exit hook would resurrect exactly the #76 temporal-dead-zone crash
+// this state placement exists to prevent. Re-reading also answers the question that actually
+// matters — "will the NEXT scan skip this marker's URLs?" — including entries the shell's
+// pg_provenance_reject appended concurrently. Line filter is the load's, character for character.
+function markerHasBlacklistEntry(m) {
+  try {
+    for (const raw of fs.readFileSync(BLACKLIST_FILE, 'utf8').split('\n')) {
+      const line = raw.trim();
+      if (!line) continue;
+      const sep = line.indexOf('\t');
+      if (sep < 0) continue;         // legacy global entry: ignore (same filter as the load below)
+      if (line.slice(0, sep) === m) return true;
+    }
+  } catch {}
+  return false;
+}
+
 // Persist terminal cross-bound state ONLY when the completed scan found no candidate we could
 // prove is ours. Order-independent by construction: every candidate has been classified by the
 // time this runs.
 function flushCrossBind(m) {
   const dir = path.join(PG_HOME, 'crossbound');
   const f = path.join(dir, m);
-  if (ownershipProven || crossBindHits.size === 0) {
+  // Positive ownership is the ONLY proof a conviction went stale, so it is the only thing that
+  // clears the sidecar unconditionally.
+  if (ownershipProven) {
     try { fs.unlinkSync(f); } catch {}
+    return;
+  }
+  if (crossBindHits.size === 0) {
+    // #170: an empty scan is NOT that proof. A conviction blacklists its own URL
+    // (rejectCrossBound -> discardForeignUrl -> blacklist), and every later scan skips a
+    // blacklisted URL before it can be re-classified — both the open-tab loop and the dead-tab
+    // re-render loop test `nonMatching.has(tab.url)` ahead of any marker comparison. So a
+    // still-suppressed conviction produces exactly the same empty crossBindHits as a genuinely
+    // cleared one. Unlinking on that emptiness left the append-only blacklist (never swept, by
+    // design — see the housekeeping note in oracle-review.sh) still hiding the conversation
+    // while --status downgraded "STUCK (cross-bound)" to a retry hint, and threw away the
+    // sidecar's URL, which is the only surviving handle to that conversation: the conviction
+    // deleted conversation-urls/<marker> in the same breath.
+    // Clear only when this marker has no blacklist entry that could have produced the emptiness.
+    // --close/--sweep-root keep clearing an otherwise-unsupported stale conviction (#76).
+    if (!markerHasBlacklistEntry(m)) { try { fs.unlinkSync(f); } catch {} }
     return;
   }
   try {

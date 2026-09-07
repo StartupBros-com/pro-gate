@@ -392,10 +392,20 @@ function runSalvage(args, port, seed, extraEnv = {}) {
             .reduce((n, f) => n + (read(path.join('crossbound', f)) ?? '').split('\n').filter(Boolean).length, 0);
         } catch { return 0; }
       })();
+      // #170: a line COUNT cannot tell a retained conviction from one this run rewrote — both
+      // are "> 0". The sidecar's second field is the conversation URL and, after a conviction
+      // deleted conversation-urls/<marker>, the only surviving copy of it, so tests that care
+      // about survival compare the exact bytes.
+      const crossboundBody = (() => {
+        try {
+          return fs.readdirSync(path.join(home, 'crossbound'))
+            .map((f) => read(path.join('crossbound', f)) ?? '').join('');
+        } catch { return ''; }
+      })();
       fs.rmSync(home, { recursive: true, force: true });
       resolve({
         status, stdout, stderr, elapsedMs: Date.now() - startedAt,
-        memoUrl: memoUrl?.trim() ?? null, memos, blacklist, cooldown, crossbound,
+        memoUrl: memoUrl?.trim() ?? null, memos, blacklist, cooldown, crossbound, crossboundBody,
       });
     });
   });
@@ -1401,6 +1411,34 @@ const FOREIGN_ANSWER = (m) => [
   check('open-tab cross-bind makes multiple later lists through the shortened deadline',
     r.elapsedMs >= 2_500 && cdp.outerJsonListCalls >= 3,
     `elapsed=${r.elapsedMs} outerLists=${cdp.outerJsonListCalls}`);
+  cdp.stop();
+}
+
+{ // #170: round TWO of the open-tab cross-bind above, with that run's state already on disk.
+  // The conviction blacklisted its own URL, so this scan skips the tab BEFORE any marker
+  // comparison and records no hits — emptiness produced by the suppression itself, not by the
+  // conviction going stale. Deleting the sidecar on that emptiness made the two records
+  // disagree: the append-only blacklist kept hiding the conversation while --status downgraded
+  // "STUCK (cross-bound)" to "collect it for FREE", and the sidecar's URL — the only surviving
+  // copy, since the conviction deleted conversation-urls/<marker> in the same breath — was gone.
+  const sourceUrl = 'https://chatgpt.com/c/mock-conversation';
+  const conviction = `2026-01-01T00:00:00.000Z\t${sourceUrl}\tpg-run-other-repo-42-1111111111-9\n`;
+  const seedConvicted = (home) => {
+    fs.mkdirSync(path.join(home, 'crossbound'), { recursive: true });
+    fs.writeFileSync(path.join(home, 'crossbound', MARKER), conviction);
+    fs.writeFileSync(path.join(home, 'salvage-nonmatching.txt'), `${MARKER}\t${sourceUrl}\n`);
+  };
+  const cdp = await mockCdp(FOREIGN_ANSWER(MARKER), [], { trackCdpDeadlineEvents: true });
+  const r = await runFastPollSalvage([MARKER, '3'], cdp.port, seedConvicted);
+  check('the blacklist skips the convicted tab before it can be re-classified',
+    r.status === 4 && !/ANOTHER run's completed answer/.test(r.stderr ?? ''),
+    `status=${r.status} stderr=${r.stderr?.slice(-400)}`);
+  check('a blacklisted marker\'s sidecar survives a scan that finds nothing',
+    r.crossbound > 0, `crossbound=${r.crossbound} stderr=${r.stderr?.slice(-300)}`);
+  check('the surviving sidecar keeps the original conversation URL and foreign marker verbatim',
+    r.crossboundBody === conviction, `body=${JSON.stringify(r.crossboundBody)}`);
+  check('the blacklist entry that produced the empty scan is still there, so the records agree',
+    (r.blacklist ?? '').includes(`${MARKER}\t${sourceUrl}`), `blacklist=${r.blacklist}`);
   cdp.stop();
 }
 
@@ -2410,6 +2448,30 @@ const FOREIGN_ANSWER = (m) => [
       !/ReferenceError/.test(r.stderr ?? ''), `stderr=${r.stderr?.slice(0, 300)}`);
     check(`${mode} still runs the exit flush and clears a stale conviction`,
       r.crossbound === 0, `crossbound=${r.crossbound} stderr=${r.stderr?.slice(0, 300)}`);
+    cdp.stop();
+  }
+}
+
+{ // #170 on the same early-exit paths: the flush now has to DISTINGUISH. Unsupported stale
+  // conviction -> cleared (the block above). Conviction the blacklist is still suppressing ->
+  // kept. The check that decides this runs where --sweep-root and --close return, which is
+  // ABOVE the `nonMatching` declaration — reading that Set from the hook would revive the exact
+  // #76 dead-zone crash, so this asserts the retention AND the absence of a ReferenceError.
+  const suppressedUrl = 'https://chatgpt.com/c/other';
+  const stale = `2026-01-01T00:00:00.000Z\t${suppressedUrl}\tpg-run-someone-else\n`;
+  const seedSuppressed = (home) => {
+    fs.mkdirSync(path.join(home, 'crossbound'), { recursive: true });
+    fs.writeFileSync(path.join(home, 'crossbound', MARKER), stale);
+    fs.writeFileSync(path.join(home, 'salvage-nonmatching.txt'), `${MARKER}\t${suppressedUrl}\n`);
+  };
+  for (const mode of ['--sweep-root', '--close']) {
+    const cdp = await mockCdp(`run marker: ${MARKER}\nstill thinking`,
+      [{ id: 'root1', type: 'page', url: 'https://chatgpt.com/' }]);
+    const r = await runSalvage([mode, MARKER, '10'], cdp.port, seedSuppressed);
+    check(`${mode} consults the blacklist without a temporal-dead-zone crash`,
+      !/ReferenceError/.test(r.stderr ?? ''), `stderr=${r.stderr?.slice(0, 300)}`);
+    check(`${mode} keeps a conviction the blacklist is still suppressing`,
+      r.crossboundBody === stale, `body=${JSON.stringify(r.crossboundBody)} stderr=${r.stderr?.slice(0, 300)}`);
     cdp.stop();
   }
 }
