@@ -1089,6 +1089,111 @@ const MARKER = 'pg-run-test-1234567890-42';
   cdp.stop();
 }
 
+{ // #166 gate r3 P1: the echoed marker cannot be what earns a bare verdict the right to bound.
+  // A review quotes an incident's verdict COMPLETE WITH its "(run marker: …)" token — this
+  // repository's own reviews do — and rendered, that example claims a run exactly as a real
+  // terminator does. Flooring on the claim deleted the [P1] that wrote it, and the remainder,
+  // starting at [P2], still passed structure, binding and the nonce check downstream.
+  const foreign = 'pg-run-other-repo-2619-1111111111-9';
+  const body = [
+    `run marker: ${MARKER}`,
+    '',
+    'P0: none',
+    '[P1] src/real.sh:4 — a finding quoting an incident verdict',
+    'the incident answer ended',
+    `VERDICT: FIX-FIRST — theirs. (run marker: ${foreign})`,
+    'and this is why it mattered',
+    '[P2] src/other.sh:9 — a second finding',
+    'P3: none',
+    `VERDICT: FIX-FIRST — ours. (run marker: ${MARKER})`,
+  ];
+  const cdp = await mockCdp(body.join('\n'));
+  const r = await runSalvage([MARKER, '3'], cdp.port);
+  check('r3 P1: a rendered SIGNED verdict example keeps the finding that encloses it',
+    r.status === 0 && r.stdout.includes('[P1] src/real.sh:4') && r.stdout.includes('and this is why it mattered'),
+    `status=${r.status} stdout=${JSON.stringify(r.stdout)}`);
+  check('r3 P1: a rendered SIGNED verdict example emits the whole block for the engine to judge',
+    r.stdout.trim() === body.slice(2).join('\n'),
+    `stdout=${JSON.stringify(r.stdout)}`);
+  cdp.stop();
+}
+
+{ // #166 gate r3 P1: a complete foreign block followed by nothing but this run's signed verdict.
+  // The cut can only produce a headerless fragment, and emitting THAT hands the engine bytes its
+  // structural guard drops before pg_capture_bind ever runs: the capture is deleted, harvest exits
+  // 3, and neither the quarantine nor the unattributable TTL is reached. Hand back the original
+  // candidate instead and let the engine's one provenance chokepoint refuse it.
+  const foreign = 'pg-run-other-repo-2619-1111111111-9';
+  const body = [
+    `run marker: ${MARKER}`,
+    '',
+    '[P0] apps/blog-writer/src/hazards.claims.ts:31 — a tree this repository does not have',
+    'P1: none',
+    `VERDICT: FIX-FIRST — theirs. (run marker: ${foreign})`,
+    `VERDICT: SHIP — bare. (run marker: ${MARKER})`,
+  ];
+  const cdp = await mockCdp(body.join('\n'));
+  const r = await runSalvage([MARKER, '3'], cdp.port);
+  check('r3 P1: a verdict-only cut emits the original capture, not the bare verdict line',
+    r.status === 0 && r.stdout.trim() === body.slice(2).join('\n'),
+    `status=${r.status} stdout=${JSON.stringify(r.stdout)}`);
+  cdp.stop();
+}
+
+{ // #166 gate r3 P1, the branch itself: a floor IS established here (the foreign terminator is
+  // followed by "P1: none", a section no deeper than the [P1] above it) but nothing under that
+  // floor opens a block. Cutting there would publish "P1: none" plus a verdict — a headerless
+  // tail evidencing nothing. Both collectors widen to the same headed block instead, so the
+  // engine refuses one capture rather than publishing one extraction while --finalize re-derives
+  // the other and calls it result-mismatch.
+  const foreign = 'pg-run-other-repo-2619-1111111111-9';
+  const body = [
+    `run marker: ${MARKER}`,
+    '',
+    '[P0] other/a.ts:1 — theirs',
+    '[P1] other/b.ts:2 — theirs too',
+    `VERDICT: FIX-FIRST — theirs. (run marker: ${foreign})`,
+    'P1: none',
+    `VERDICT: SHIP — ours. (run marker: ${MARKER})`,
+  ];
+  const cdp = await mockCdp(body.join('\n'));
+  const r = await runSalvage([MARKER, '3'], cdp.port);
+  check('r3 P1: a floor with no block header under it widens instead of emitting a headerless tail',
+    r.status === 0 && r.stdout.trim() === body.slice(2).join('\n'),
+    `status=${r.status} stdout=${JSON.stringify(r.stdout)}`);
+  cdp.stop();
+}
+
+{ // #166 gate r3 P1: chronology the engine cannot recover from the extracted block. An old foreign
+  // verdict ABOVE this run's prompt is scrollback in a reused conversation — the classifier
+  // deliberately declines to convict it, because our answer may still be generating. The engine
+  // refuses to publish it either way, but it must stay RETRYABLE rather than expiring recovery at
+  // the reservation TTL, and only this collector can see where the prompt sits.
+  const foreign = 'pg-run-other-repo-2619-1111111111-9';
+  const body = [
+    '[P0] apps/blog-writer/src/hazards.claims.ts:31 — a tree this repository does not have',
+    'P1: none',
+    `VERDICT: FIX-FIRST — theirs, answered before we asked. (run marker: ${foreign})`,
+    '',
+    `now please review this change. run marker: ${MARKER}`,
+  ];
+  const cdp = await mockCdp(body.join('\n'));
+  const r = await runSalvage([MARKER, '3'], cdp.port);
+  check('r3 P1: an answer above this run prompt is reported as precedes-prompt chronology',
+    r.status === 0 && r.stderr.includes('answer-chronology precedes-prompt'),
+    `status=${r.status} stderr=${JSON.stringify(r.stderr)}`);
+  cdp.stop();
+  // …and the ordinary page, where the answer follows the prompt, must never be reported that way.
+  const cleanCdp = await mockCdp([
+    `run marker: ${MARKER}`, 'P0: none', 'P1: none', `VERDICT: SHIP — ours. (run marker: ${MARKER})`,
+  ].join('\n'));
+  const clean = await runSalvage([MARKER, '3'], cleanCdp.port);
+  check('r3 P1: an answer BELOW this run prompt carries no chronology warning',
+    clean.status === 0 && !clean.stderr.includes('answer-chronology'),
+    `status=${clean.status} stderr=${JSON.stringify(clean.stderr)}`);
+  cleanCdp.stop();
+}
+
 { // P1 (gate #91 r3): --probe must not report the conversation ABSENT just because the one-shot
   // revalidation was spent on a DIFFERENT remembered URL (A) that comes back cross-bound or
   // foreign, while the tab actually scanned (B) is demonstrably ours and still generating. Before

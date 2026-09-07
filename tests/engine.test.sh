@@ -3173,6 +3173,207 @@ check 'r2 P1: an in-TTL unattributable harvest keeps the reservation and re-arms
   "rc=$RC record=$(cat "$TDIR/home/in-progress/$UNATT_M3" 2>/dev/null) was=$(cat "$TDIR/unattr3.orig")"
 rm -f "$TDIR/home/in-progress/$UNATT_M3" "$TDIR/home/manifests/$UNATT_M3"
 
+# ── #166 gate r3 P1: an echoed marker is not a boundary either ─────────────────────────────────
+# r2 let a bare verdict bound a block when it CLAIMED a run. But a review quotes an incident's
+# verdict complete with its marker — this repository's own reviews do — and once the renderer has
+# eaten the quote syntax that example claims a run exactly as a terminator does. The floor landed
+# inside the [P1] that wrote it, the headerless remainder still passed pg_is_review, the nonce
+# check and the foreign-echo check, and it was published one finding short. A boundary is now
+# established by the lines AROUND the verdict: the next Pn section must not be DEEPER than the
+# last one before it, which is what a block restarting looks like and what a quoted example
+# (…[P2], P3: none, its own terminator) never is.
+printf 'P0: none\n[P1] src/x.sh:3 — a finding quoting an incident verdict\nthe incident answer ended\nVERDICT: FIX-FIRST — theirs. (run marker: %s)\nand this is why it mattered\n[P2] src/y.sh:9 — a second finding\nP3: none\nVERDICT: FIX-FIRST — ours. (run marker: %s)\n' \
+  "$FOREIGN164" "$BIND_MARKER" > "$TDIR/bind-signed-example.md"
+cp "$TDIR/bind-signed-example.md" "$TDIR/bind-signed-example.orig"
+SIGNED_FOREIGN="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_capture_bind '$TDIR/bind-signed-example.md' '$BIND_MARKER'; printf '%s' \"\$PG_CAPTURE_FOREIGN\"")"
+bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_capture_bind '$TDIR/bind-signed-example.md' '$BIND_MARKER'"; RC=$?
+check 'r3 P1: a rendered SIGNED verdict example never deletes the finding that encloses it' \
+  "$([ "$RC" -eq 2 ] && [ "$SIGNED_FOREIGN" = "$FOREIGN164" ] && cmp -s "$TDIR/bind-signed-example.md" "$TDIR/bind-signed-example.orig" \
+     && grep -qF 'src/x.sh:3' "$TDIR/bind-signed-example.md"; echo $?)" \
+  "rc=$RC foreign=$SIGNED_FOREIGN $(cat "$TDIR/bind-signed-example.md")"
+# The floor must still hold for a real terminator whose next block opens at [P1] rather than P0 —
+# the r2 rule read only a P0 opening, and leaned on the marker echo for everything else.
+printf '[P0] other/a.ts:1 — theirs\nP1: none\nVERDICT: FIX-FIRST — theirs. (run marker: %s)\n\n[P1] src/real.sh:4 — ours\nP2: none\nVERDICT: SHIP — ours. (run marker: %s)\n' \
+  "$FOREIGN164" "$BIND_MARKER" > "$TDIR/bind-p1open.md"
+printf '[P1] src/real.sh:4 — ours\nP2: none\nVERDICT: SHIP — ours. (run marker: %s)\n' "$BIND_MARKER" > "$TDIR/bind-p1open-want.md"
+bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_capture_bind '$TDIR/bind-p1open.md' '$BIND_MARKER'"; RC=$?
+check 'r3 P1: a real foreign terminator still floors a block that opens at [P1]' \
+  "$([ "$RC" -eq 0 ] && cmp -s "$TDIR/bind-p1open.md" "$TDIR/bind-p1open-want.md"; echo $?)" \
+  "rc=$RC $(cat "$TDIR/bind-p1open.md")"
+# The same layout with NO marker echo on the foreign terminator is what actually pins the new rule:
+# the r2 rule saw neither a claim nor a P0 opening, so it did not floor at all — and with no
+# ownership token to catch it downstream either, the other run's findings were PUBLISHED.
+printf '[P0] other/a.ts:1 — theirs\nP1: none\nVERDICT: FIX-FIRST — theirs, no echo at all\n\n[P1] src/real.sh:4 — ours\nP2: none\nVERDICT: SHIP — ours. (run marker: %s)\n' \
+  "$BIND_MARKER" > "$TDIR/bind-p1open-noecho.md"
+bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_capture_bind '$TDIR/bind-p1open-noecho.md' '$BIND_MARKER'"; RC=$?
+check 'r3 P1: an unsigned foreign terminator floors a block that opens at [P1] too' \
+  "$([ "$RC" -eq 0 ] && cmp -s "$TDIR/bind-p1open-noecho.md" "$TDIR/bind-p1open-want.md"; echo $?)" \
+  "rc=$RC $(cat "$TDIR/bind-p1open-noecho.md")"
+# When a floor IS established but nothing under it opens a block, neither collector may invent one
+# from the fragment that is left. Both hand back the widest headed block — the same bytes — so the
+# engine refuses the capture instead of publishing a headerless tail, and --finalize, which
+# compares the published bytes against a fresh JavaScript extraction, has nothing to disagree with.
+printf '[P0] other/a.ts:1 — theirs\n[P1] other/b.ts:2 — theirs too\nVERDICT: FIX-FIRST — theirs. (run marker: %s)\nP1: none\nVERDICT: SHIP — ours. (run marker: %s)\n' \
+  "$FOREIGN164" "$BIND_MARKER" > "$TDIR/bind-headless.md"
+cp "$TDIR/bind-headless.md" "$TDIR/bind-headless.orig"
+HEADLESS_FOREIGN="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_capture_bind '$TDIR/bind-headless.md' '$BIND_MARKER'; printf '%s' \"\$PG_CAPTURE_FOREIGN\"")"
+bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_capture_bind '$TDIR/bind-headless.md' '$BIND_MARKER'"; RC=$?
+check 'r3 P1: a floor with no block header under it refuses rather than publishing the tail' \
+  "$([ "$RC" -eq 2 ] && [ "$HEADLESS_FOREIGN" = "$FOREIGN164" ] && cmp -s "$TDIR/bind-headless.md" "$TDIR/bind-headless.orig"; echo $?)" \
+  "rc=$RC foreign=$HEADLESS_FOREIGN $(cat "$TDIR/bind-headless.md")"
+# pg_capture_bind's out-parameters must not survive into the next call in the same shell.
+printf 'P0: none\nP1: none\nVERDICT: SHIP — ours. (run marker: %s)\n' "$BIND_MARKER" > "$TDIR/bind-reset-clean.md"
+RESET_STATE="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'
+  pg_capture_bind '$TDIR/bind-foreign-only.md' '$BIND_MARKER' || true
+  pg_capture_bind '$TDIR/bind-reset-clean.md' '$BIND_MARKER' || true
+  printf 'unowned=%s foreign=%s' \"\${PG_CAPTURE_UNOWNED:-}\" \"\${PG_CAPTURE_FOREIGN:-}\"")"
+check 'r3 P1: pg_capture_bind clears its refusal flags before the next capture' \
+  "$([ "$RESET_STATE" = 'unowned= foreign=' ]; echo $?)" "$RESET_STATE"
+# …and the marker grammar is the SAME one bin/cdp-salvage.mjs matches. Accepting arbitrary text
+# between "(run marker:" and ")" made a rendered PLACEHOLDER an ownership claim in the shell and
+# nothing in JavaScript, so the two collectors disagreed about what the review even was.
+printf 'P0: none\n[P1] src/x.sh:3 — the protocol appends "(run marker: <marker>)" to the verdict\nVERDICT: SHIP — example. (run marker: <marker>)\nand then explains why\n[P2] src/y.sh:9 — a second finding\nP3: none\nVERDICT: SHIP — ours. (run marker: %s)\n' \
+  "$BIND_MARKER" > "$TDIR/bind-placeholder.md"
+cp "$TDIR/bind-placeholder.md" "$TDIR/bind-placeholder.orig"
+PLACEHOLDER_CUT="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_capture_bind '$TDIR/bind-placeholder.md' '$BIND_MARKER'; printf '%s' \"\$PG_CAPTURE_CUT\"")"
+bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_capture_bind '$TDIR/bind-placeholder.md' '$BIND_MARKER'"; RC=$?
+check 'r3 P1: a placeholder marker is not an ownership claim and floors nothing' \
+  "$([ "$RC" -eq 0 ] && [ -z "$PLACEHOLDER_CUT" ] && cmp -s "$TDIR/bind-placeholder.md" "$TDIR/bind-placeholder.orig"; echo $?)" \
+  "rc=$RC cut=$PLACEHOLDER_CUT $(cat "$TDIR/bind-placeholder.md")"
+
+echo '# gate r3 P1 (#166): the two collectors must agree byte-for-byte on the same rendered answer'
+# The engine persists what the SHELL binds; --finalize compares those bytes against a fresh
+# JavaScript extraction of the live page and reports any difference as result-mismatch. So the
+# browser collector's emission, handed straight to pg_capture_bind, must come back untouched.
+M166X="pg-run-crossfeed-176-1700000075-26"
+cat > "$TDIR/tab.txt" <<TAB
+conversation for run marker: $M166X
+
+P0: none
+[P1] src/real.sh:3 — the protocol appends "(run marker: <marker>)" to the verdict
+VERDICT: SHIP — example. (run marker: <marker>)
+and then explains why
+[P2] src/other.sh:9 — a second finding
+P3: none
+VERDICT: SHIP — ours. (run marker: $M166X)
+TAB
+start_mock "$TDIR/tab.txt"
+node "$HERE/../bin/cdp-salvage.mjs" "$M166X" 5 "$PORT" > "$TDIR/xlang-js.md" 2>/dev/null
+cp "$TDIR/xlang-js.md" "$TDIR/xlang-sh.md"
+bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_capture_bind '$TDIR/xlang-sh.md' '$M166X'"; RC=$?
+check 'r3 P1: the shell binds the browser collector own emission byte-for-byte' \
+  "$([ "$RC" -eq 0 ] && [ -s "$TDIR/xlang-js.md" ] && cmp -s "$TDIR/xlang-js.md" "$TDIR/xlang-sh.md" \
+     && grep -qF 'src/real.sh:3' "$TDIR/xlang-sh.md"; echo $?)" \
+  "rc=$RC js=$(cat "$TDIR/xlang-js.md" 2>/dev/null) sh=$(cat "$TDIR/xlang-sh.md" 2>/dev/null)"
+
+# The harder half of the same invariant: a page where the cut CANNOT produce a headed block. Both
+# collectors fall back to the widest headed block, so they must reach for the same bytes — if only
+# one of them widened, the engine would publish one extraction while --finalize re-derived the
+# other and reported result-mismatch on a page it had handled correctly.
+M166W="pg-run-crossfeed-176-1700000078-29"
+cat > "$TDIR/tab.txt" <<TAB
+conversation for run marker: $M166W
+
+[P0] other/a.ts:1 — theirs
+[P1] other/b.ts:2 — theirs too
+VERDICT: FIX-FIRST — theirs. (run marker: $FOREIGN164)
+P1: none
+VERDICT: SHIP — ours. (run marker: $M166W)
+TAB
+start_mock "$TDIR/tab.txt"
+node "$HERE/../bin/cdp-salvage.mjs" "$M166W" 5 "$PORT" > "$TDIR/xlang2-js.md" 2>/dev/null
+cp "$TDIR/tab.txt" "$TDIR/xlang2-sh.md"
+bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_capture_own_segment '$TDIR/xlang2-sh.md' '$M166W'" >/dev/null; RC=$?
+check 'r3 P1: both collectors widen to the same bytes when no headed cut exists' \
+  "$([ "$RC" -eq 2 ] && [ -s "$TDIR/xlang2-js.md" ] \
+     && [ "$(cat "$TDIR/xlang2-js.md")" = "$(cat "$TDIR/xlang2-sh.md")" ] \
+     && grep -qF 'other/a.ts:1' "$TDIR/xlang2-js.md"; echo $?)" \
+  "rc=$RC js=$(cat "$TDIR/xlang2-js.md" 2>/dev/null) sh=$(cat "$TDIR/xlang2-sh.md" 2>/dev/null)"
+
+echo '# gate r3 P1 (#166): a signed verdict example is refused, never published one finding short'
+M166S="pg-run-crossfeed-176-1700000076-27"
+printf '176\t%s\t%s\t0\t1\tGPT-X\n' "$TDIR/o-signed.md" "$(date +%s)" > "$TDIR/home/in-progress/$M166S"
+printf 'src/real.sh\n' > "$TDIR/home/manifests/$M166S"
+cat > "$TDIR/tab.txt" <<TAB
+conversation for run marker: $M166S
+
+P0: none
+[P1] src/real.sh:4 — a finding quoting an incident verdict
+the incident answer ended
+VERDICT: FIX-FIRST — theirs. (run marker: $FOREIGN164)
+and this is why it mattered
+[P2] src/other.sh:9 — a second finding
+P3: none
+VERDICT: FIX-FIRST — ours. (run marker: $M166S)
+TAB
+start_mock "$TDIR/tab.txt"
+run_engine --harvest "$M166S" --out "$TDIR/o-signed.md" --timeout 5s
+check 'r3 P1: a signed verdict example is refused rather than published without its finding' \
+  "$([ "$RC" -eq 9 ] && [ ! -s "$TDIR/o-signed.md" ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
+check 'r3 P1: the refused bytes keep the enclosing finding for a human to read' \
+  "$(ls "$TDIR"/o-signed.md.crossfed.* >/dev/null 2>&1 && grep -qF 'src/real.sh:4' "$TDIR"/o-signed.md.crossfed.* 2>/dev/null; echo $?)" \
+  "asides=$(ls "$TDIR"/o-signed.md.crossfed.* 2>/dev/null) $(cat "$TDIR"/o-signed.md.crossfed.* 2>/dev/null)"
+rm -f "$TDIR/home/in-progress/$M166S" "$TDIR/home/manifests/$M166S"
+
+echo '# gate r3 P1 (#166): a cut that leaves no findings reaches quarantine, not a deleted capture'
+# The browser collector used to emit the bare verdict line the cut left behind. Harvest structural
+# guard drops that BEFORE pg_capture_bind runs, so the capture was deleted and the run exited 3 —
+# no quarantine, no unattributable TTL, and a probe that reports the conversation COMPLETE, so
+# reconciliation never accumulated absence evidence either. The same page was re-read forever.
+M166V="pg-run-crossfeed-176-1700000077-28"
+printf '176\t%s\t%s\t0\t1\tGPT-X\n' "$TDIR/o-vonly.md" "$(date +%s)" > "$TDIR/home/in-progress/$M166V"
+printf 'src/real.sh\n' > "$TDIR/home/manifests/$M166V"
+cat > "$TDIR/tab.txt" <<TAB
+conversation for run marker: $M166V
+
+[P0] apps/blog-writer/src/hazards.claims.ts:31 — a tree this repository does not have
+P1: none
+P2: none
+P3: none
+VERDICT: FIX-FIRST — theirs. (run marker: $FOREIGN164)
+VERDICT: SHIP — bare. (run marker: $M166V)
+TAB
+start_mock "$TDIR/tab.txt"
+run_engine --harvest "$M166V" --out "$TDIR/o-vonly.md" --timeout 5s
+check 'r3 P1: a verdict-only cut is quarantined instead of deleted with exit 3' \
+  "$([ "$RC" -eq 9 ] && [ ! -s "$TDIR/o-vonly.md" ] && ls "$TDIR"/o-vonly.md.crossfed.* >/dev/null 2>&1; echo $?)" \
+  "rc=$RC asides=$(ls "$TDIR"/o-vonly.md.crossfed.* 2>/dev/null) $(tail -2 "$TDIR/stderr")"
+check 'r3 P1: the quarantined verdict-only capture carries the block it could not be cut from' \
+  "$(grep -qF 'hazards.claims.ts' "$TDIR"/o-vonly.md.crossfed.* 2>/dev/null; echo $?)" \
+  "$(cat "$TDIR"/o-vonly.md.crossfed.* 2>/dev/null)"
+rm -f "$TDIR/home/in-progress/$M166V" "$TDIR/home/manifests/$M166V"
+
+echo '# gate r3 P1 (#166): foreign SCROLLBACK above this run prompt stays retryable, not terminal'
+# An old foreign verdict sitting ABOVE this run's prompt is what the CDP classifier deliberately
+# declines to convict: our answer may still be generating. The bind refuses those bytes — rightly
+# — but labelling every refusal `unattributable` expired recovery at the reservation TTL and
+# freed another paid run with no evidence the current answer ever finished or disappeared.
+SCROLL_KEY=crossfed-179; SCROLL_M="pg-run-crossfed-179-1700000094-44"
+mkdir -p "$TDIR/home/run-meta" "$TDIR/home/rounds"
+printf '%s\n' 1700000094 > "$TDIR/home/rounds/$SCROLL_KEY"
+printf 'github.com\tacme\tcrossfed\t%s\t179\t%s\t1700000094\n' "$SCROLL_KEY" "$TDIR/o-scroll.md" > "$TDIR/home/run-meta/$SCROLL_M"
+printf '%s\t%s\t%s\t0\t1\tGPT-X\t1700000094\tgenerating\n' "$SCROLL_KEY" "$TDIR/o-scroll.md" "$(( $(date +%s) - 30000 ))" > "$TDIR/home/in-progress/$SCROLL_M"
+printf 'src/real.sh\n' > "$TDIR/home/manifests/$SCROLL_M"
+cat > "$TDIR/tab.txt" <<TAB
+[P0] apps/blog-writer/src/hazards.claims.ts:31 — a tree this repository does not have
+P1: none
+P2: none
+P3: none
+VERDICT: FIX-FIRST — theirs, answered before we asked. (run marker: $FOREIGN164)
+
+now please review this change. run marker: $SCROLL_M
+TAB
+start_mock "$TDIR/tab.txt"
+run_engine --harvest "$SCROLL_M" --out "$TDIR/o-scroll.md" --timeout 5s
+check 'r3 P1: a past-TTL foreign-scrollback harvest stays retryable instead of exhausting recovery' \
+  "$([ "$RC" -eq 9 ] && [ -f "$TDIR/home/in-progress/$SCROLL_M" ] \
+     && [ ! -e "$TDIR/home/attempt-dispositions/$SCROLL_M" ]; echo $?)" \
+  "rc=$RC reservation=$(cat "$TDIR/home/in-progress/$SCROLL_M" 2>/dev/null) $(tail -3 "$TDIR/stderr")"
+check 'r3 P1: foreign scrollback is set aside as unbound, not as an unattributable cross-feed' \
+  "$(ls "$TDIR"/o-scroll.md.unbound.* >/dev/null 2>&1 && ! ls "$TDIR"/o-scroll.md.crossfed.* >/dev/null 2>&1; echo $?)" \
+  "unbound=$(ls "$TDIR"/o-scroll.md.unbound.* 2>/dev/null) crossfed=$(ls "$TDIR"/o-scroll.md.crossfed.* 2>/dev/null)"
+rm -f "$TDIR/home/in-progress/$SCROLL_M" "$TDIR/home/manifests/$SCROLL_M"
+
 # ── #166 gate r1 P2: the Oracle session name must survive Oracle's own slug normalization ──────
 # Oracle stores a custom --slug as five ten-character alphanumeric words. A raw run marker is
 # reduced to "pg-run-startupbro-com-pro": one name for EVERY run in the repository, and not the

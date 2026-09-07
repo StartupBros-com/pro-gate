@@ -2647,6 +2647,9 @@ if [ -n "$HARVEST_MARKER" ]; then
   [ -s "$HARVEST_TMP.err" ] && sed 's/^/[cdp-salvage] /' "$HARVEST_TMP.err" >&2
   # v0.28 (gate #54 r5): the CDP child names its capture's exact source URL.
   HARVEST_URL="$(sed -n 's/^matched-url //p' "$HARVEST_TMP.err" 2>/dev/null | tail -1)"
+  # …and, since #166 gate r3 P1, the one chronology fact that is invisible in the extracted block:
+  # "precedes-prompt" means this answer was written ABOVE the prompt this run submitted.
+  HARVEST_CHRONO="$(sed -n 's/^answer-chronology //p' "$HARVEST_TMP.err" 2>/dev/null | tail -1)"
   rm -f "$HARVEST_TMP.err"
   if [ "$HARVEST_RC" -eq 0 ] && pg_is_review "$HARVEST_TMP"; then
     # v0.28 (#48/#55): provenance before acceptance, positive binding first. A capture whose
@@ -2667,6 +2670,18 @@ if [ -n "$HARVEST_MARKER" ]; then
     [ -n "${PG_CAPTURE_CUT:-}" ] && echo "[oracle-review] harvested page carried another run's review; dropped the block(s) bound to: ${PG_CAPTURE_CUT}" >&2
     [ -n "${PG_CAPTURE_QUOTED:-}" ] && echo "[oracle-review] NOTE: this run's own findings mention another run's marker (${PG_CAPTURE_QUOTED}). Reported, not enforced — a review may legitimately quote one." >&2
     if [ "$HARVEST_BIND" = 2 ]; then
+      # #166 gate r3 P1: a refusal is not automatically an UNATTRIBUTABLE one. When the capture
+      # holds no verdict of ours at all AND the collector reports it sits above this run's prompt,
+      # it is an older answer in a reused conversation and OURS may still be generating — exactly
+      # the layout the CDP classifier deliberately declines to convict (probeComplete: false).
+      # Expiring recovery on it at the reservation TTL would end the round with no evidence the
+      # current answer ever finished or disappeared, so it stays retryable and laddered, as it was
+      # before the bind refused it at all. Only a FINISHED page naming two runs is unattributable.
+      if [ "${PG_CAPTURE_UNOWNED:-}" = 1 ] && [ "${HARVEST_CHRONO:-}" = precedes-prompt ]; then
+        harvest_preserve_capture "$OUT.unbound.$$" \
+          "ERROR: harvested a complete review that claims another run (${PG_CAPTURE_FOREIGN}) and was written ABOVE this run's prompt — scrollback in a reused conversation, not this run's answer, which may still be generating. Nothing was published. Reservation and candidate kept. Retry --harvest; inspect $OUT.unbound.$$." \
+          "harvested review is older scrollback claiming another run (${PG_CAPTURE_FOREIGN}); reservation kept, retry"
+      fi
       harvest_preserve_capture "$OUT.crossfed.$$" \
         "ERROR: harvested a review whose bytes cannot be attributed to this run alone (${PG_CAPTURE_FOREIGN}) — another run's answer reached this conversation. Nothing was published. Reservation and candidate kept until this reservation's TTL, after which a fresh typed review is eligible. Retry --harvest; inspect $OUT.crossfed.$$." \
         "harvested review carries another run's block (${PG_CAPTURE_FOREIGN}); reservation kept until TTL" \

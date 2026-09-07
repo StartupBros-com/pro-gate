@@ -2481,11 +2481,15 @@ pg_capture_own_segment() {
       t = tolower(trim(s))
       return (t ~ /^[*_>#-]*[ \t]*(p0[ \t]*[:-]|p0([^0-9a-z_]|$)|\[p[0-3]\])/)
     }
-    # Where a BLOCK opens, as opposed to where a section inside one starts: [P2] is a section,
-    # a P0 line is the top of an answer. Mirrors isBlockOpen in bin/cdp-salvage.mjs.
-    function isblockopen(s,   t) {
+    # The Pn SECTION header and its depth, as opposed to where a block may start: "P1: none" is
+    # a section but never a cut point. Mirrors sectionLevel in bin/cdp-salvage.mjs.
+    function seclevel(s,   t) {
       t = tolower(trim(s))
-      return (t ~ /^[*_>#-]*[ \t]*(p0[ \t]*[:-]|p0([^0-9a-z_]|$)|\[p0\])/)
+      sub(/^[*_>#-]*[ \t]*/, "", t)
+      if (t ~ /^\[p[0-3]\]/) return substr(t, 3, 1) + 0
+      if (t ~ /^p[0-3][ \t]*[:-]/) return substr(t, 2, 1) + 0
+      if (t ~ /^p[0-3]([^0-9a-z_]|$)/) return substr(t, 2, 1) + 0
+      return -1
     }
     {
       n++; line[n] = $0
@@ -2502,11 +2506,18 @@ pg_capture_own_segment() {
         # where the blockquote and the fence are already gone (#166 gate r2 P1). The rest of the
         # rule is applied in END, where the next verdict line is known.
         plain[n] = (!fenced && $0 !~ /^([ ][ ]|\t|[ ]*>)/)
-        p = index(low, "(run marker:")
-        if (p > 0) {
-          rest = substr($0, p + 12)
-          q = index(rest, ")")
-          if (q > 0) echo[n] = trim(substr(rest, 1, q - 1))
+        # #166 gate r3 P1: the SAME ownership grammar bin/cdp-salvage.mjs matches. Accepting any
+        # text between "(run marker:" and ")" made a rendered PLACEHOLDER - "(run marker:
+        # <marker>)", which a review writes when it describes the protocol - a claim here and
+        # nothing there, so the two collectors disagreed about what the review even was. The
+        # organizer reports that disagreement as result-mismatch, having already published.
+        # RSTART/RLENGTH index the lowercased copy, whose characters map 1:1 onto $0; the token
+        # is read back out of $0 because the ownership comparison below is case-EXACT.
+        if (match(low, /\(run marker:[ \t]*pg-run-[a-z0-9.-]+[ \t]*\)/)) {
+          tok = substr($0, RSTART, RLENGTH)
+          sub(/^\([^:]*:[ \t]*/, "", tok)
+          sub(/[ \t]*\)$/, "", tok)
+          echo[n] = tok
         }
       }
     }
@@ -2516,28 +2527,39 @@ pg_capture_own_segment() {
       for (k = vcount; k >= 1; k--) if (echo[vidx[k]] == mk) { pick = k; break }
       if (pick == 0) exit 1
       vi = vidx[pick]
-      # #166 gate r2 P1: a bare verdict EARNS the right to bound a block, because the rendered
-      # text it was read from carries no quote or fence syntax to disqualify it by. A real
-      # terminator either CLAIMS a run - the "(run marker: ...)" token every answer in this
-      # protocol appends - or is followed by the next block P0 opening before the next verdict.
-      # An example quoted inside a finding has neither: what follows it is the rest of its own
-      # block. Mirrors verdictIndex in bin/cdp-salvage.mjs, which must agree byte for byte.
+      # #166 gate r2/r3 P1: a bare verdict EARNS the right to bound a block, because the rendered
+      # text it was read from carries no quote or fence syntax to disqualify it by. The echoed
+      # run marker cannot be what earns it - a review quotes an incident verdict complete with
+      # its token, and rendered, that example claims a run exactly as a terminator does. Only the
+      # surrounding lines can: sections ASCEND inside one block, so a real terminator is followed
+      # by the next answer restarting its numbering, while a quoted example is followed by the
+      # rest of its own block ("[P2]", "P3: none", the terminator).
+      # Mirrors verdictIndex in bin/cdp-salvage.mjs, which must agree byte for byte.
       for (bk = 1; bk <= vcount; bk++) {
         bv = vidx[bk]
+        bstart = (bk > 1) ? vidx[bk - 1] + 1 : 1
         bstop = (bk < vcount) ? vidx[bk + 1] : n + 1
-        bopens = 0
-        for (bi = bv + 1; bi < bstop; bi++) if (isblockopen(line[bi])) { bopens = 1; break }
-        bound[bv] = (plain[bv] && (echo[bv] != "" || bopens))
+        bprev = -1
+        for (bi = bstart; bi < bv; bi++) { bl = seclevel(line[bi]); if (bl >= 0) bprev = bl }
+        bnext = -1
+        for (bi = bv + 1; bi < bstop && bnext < 0; bi++) bnext = seclevel(line[bi])
+        bound[bv] = (plain[bv] && bnext >= 0 && (bprev < 0 || bnext <= bprev))
+        # WHETHER another answer is present is a weaker question than WHERE its block ends, and
+        # the claim still answers it: a foreign terminator sitting AFTER this run block (the
+        # inverse layout #164 reported) has no next block behind it to be bounded by, yet the
+        # capture must still be cut down to our own answer. It is only the FLOOR - the line a
+        # cut may not reach back past - that a claim may never establish on its own.
+        answers[bv] = (plain[bv] && (echo[bv] != "" || bound[bv]))
       }
-      # Nothing to cut unless some OTHER verdict really closes a block: an example quoted inside
-      # this run own findings is not another answer, and rewriting on account of it would delete
-      # the finding that wrote it.
+      # Nothing to cut unless some OTHER verdict really is another answer: an example quoted
+      # inside this run own findings is not one, and rewriting on account of it would delete the
+      # finding that wrote it.
       others = 0
       bn = 0
       for (k = 1; k <= vcount; k++) {
-        if (!bound[vidx[k]] || vidx[k] == vi) continue
-        others++
-        if (vidx[k] < vi) { bn++; bpre[bn] = vidx[k] }
+        if (vidx[k] == vi) continue
+        if (answers[vidx[k]]) others++
+        if (bound[vidx[k]] && vidx[k] < vi) { bn++; bpre[bn] = vidx[k] }
       }
       if (others == 0) exit 0                 # nothing to cut: leave the bytes alone
       # A block may never reach back past the verdict that closed the block before it.
@@ -2554,7 +2576,17 @@ pg_capture_own_segment() {
         j--
         floor = (j > 0) ? bpre[j] + 1 : 1
       }
-      if (start == 0) { start = vi - 120; if (start < floor) start = floor }
+      if (start == 0) {
+        # #166 gate r3 P1: every floor was refused and no block header survives under the last
+        # one, so cutting at the floor would publish a HEADERLESS fragment - a verdict with
+        # whatever section line happened to precede it, evidencing nothing. Hand back the widest
+        # headed block instead and let the foreign-echo check below refuse it. Mirrors the same
+        # fallback in extractReview (bin/cdp-salvage.mjs): where a cut cannot be trusted, both
+        # collectors must hand the engine the SAME untrusted bytes, or --finalize compares the
+        # one it published against the other it would have extracted and reports result-mismatch.
+        for (i = vi; i >= 1; i--) if (isblockstart(line[i])) start = i
+      }
+      if (start == 0) { start = vi - 120; if (start < 1) start = 1 }
       for (i = start; i <= vi; i++) print line[i] > out
       close(out)
       for (k = 1; k <= vcount; k++) if (k != pick && echo[vidx[k]] != "" && echo[vidx[k]] != mk) print echo[vidx[k]]
@@ -2583,9 +2615,14 @@ pg_capture_own_segment() {
 # PG_CAPTURE_CUT lists the foreign markers whose blocks were dropped (empty when none were).
 # PG_CAPTURE_QUOTED names a foreign marker mentioned in the surviving findings. That is prose,
 # not a provenance failure (see pg_capture_foreign_echo), so it is reported, never enforced.
+# PG_CAPTURE_UNOWNED is 1 when the refusal came from a capture holding NO verdict of this run's at
+# all (#166 gate r3 P1). Both refusals are absolute, but they are not the same event: a page that
+# answered us AND someone else is finished and refuses identically on every retry, while a foreign
+# answer with no answer of ours anywhere may be scrollback above a prompt still generating. Only
+# the caller can tell them apart, because only the caller has the collector's chronology.
 pg_capture_bind() {
   local f="$1" marker="$2" cut rc keep="$1.pre-cut.$$"
-  PG_CAPTURE_CUT=""; PG_CAPTURE_FOREIGN=""; PG_CAPTURE_QUOTED=""
+  PG_CAPTURE_CUT=""; PG_CAPTURE_FOREIGN=""; PG_CAPTURE_QUOTED=""; PG_CAPTURE_UNOWNED=""
   [ -s "$f" ] || return 1
   # A rejected capture is set aside for a human to read, so the rejection must hand back the
   # bytes that were actually collected — not the cut residue that proves nothing about why.
@@ -2611,6 +2648,7 @@ pg_capture_bind() {
        # where every source passes, so marker order on the line cannot decide ownership.
        PG_CAPTURE_FOREIGN="$(pg_capture_foreign_echo "$f" "$marker")"
        if [ -n "$PG_CAPTURE_FOREIGN" ]; then
+         PG_CAPTURE_UNOWNED=1
          [ -n "$keep" ] && mv -f "$keep" "$f" 2>/dev/null
          rm -f "$keep" 2>/dev/null; return 2
        fi

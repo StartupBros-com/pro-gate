@@ -665,7 +665,12 @@ async function freshRenderText(url, port, outerDeadline, waitForDecisiveEvidence
 // whitespace, and markers/space between the label and its colon (e.g. `**VERDICT:**`, `- P0 :`).
 const VERDICT_RE = /^\s*[*_>#-]*\s*VERDICT[*_\s]*:/i;
 const PBLOCK_START_RE = /^\s*[*_>#-]*\s*(P0\s*[:\-]|P0\b|\[P[0-3]\])/i;
-const ECHO_RE = /\(run marker:\s*(pg-run-[A-Za-z0-9.-]+)\s*\)/i;
+// ASCII space/tab only, not `\s` (#166 gate r3 P1). This is an OWNERSHIP grammar, and the
+// authority it has to agree with is exact: pg_capture_nonce_ok greps for the literal
+// "(run marker: <marker>)" with one space, and pg_capture_own_segment's awk mirror matches
+// [ \t]. A wider class here recognises an echo separated by a non-breaking space that neither
+// of those can see, so one collector reports the page as OURS while the other refuses it.
+const ECHO_RE = /\(run marker:[ \t]*(pg-run-[A-Za-z0-9.-]+)[ \t]*\)/i;
 const echoedMarker = (line) => line.match(ECHO_RE)?.[1] ?? null;
 
 // #164: a single conversation can receive TWO runs' prompts, and the model then answers both —
@@ -687,41 +692,57 @@ const echoedMarker = (line) => line.match(ECHO_RE)?.[1] ?? null;
 // indistinguishable from a terminator. Flooring on it deleted the enclosing [P1] finding while
 // the truncated remainder still passed structural, nonce and foreign-echo validation — published,
 // silently, one finding short. So a bare verdict must EARN the right to bound, from the text
-// alone (both implementations see only text, and the organizer's --finalize compares their bytes):
+// alone (both implementations see only text, and the organizer's --finalize compares their bytes).
+//
+// The echoed marker cannot be what earns it (#166 gate r3 P1). A review quotes an incident's
+// verdict COMPLETE WITH its "(run marker: …)" token — this repository's own reviews do — and once
+// the renderer has eaten the quote syntax that example claims a run exactly as a real terminator
+// does. Bounding on the claim alone cut the enclosing finding away again, this time without even
+// a following block to corroborate it. What is left is the one signal the quoted line cannot
+// fake, because it is established by the lines AROUND it rather than by the line itself:
 //
 //   a verdict bounds  <=>  it is not quoted/indented/fenced
-//                          AND ( it CLAIMS a run — "(run marker: …)", the token every real
-//                                terminator in this protocol carries —
-//                                OR the next block's P0 opening follows it before the next
-//                                verdict line, which is what a block boundary looks like )
+//                          AND the first Pn section header after it (before the next verdict
+//                          line) is no DEEPER than the last section header before it — or there
+//                          is no section header before it at all
 //
-// A quoted example inside a finding has neither: what follows it is the rest of its own block
-// ([P2], "P3: none", the terminator). This is why the P0 opening, and not any [Pn] header, is the
-// signal — [P2] is a section inside a block, P0 is where a block starts.
+// Sections ascend inside one block (P0, P1, P2, P3), so a header that does NOT descend is the
+// continuation of the block the verdict sits in, which is exactly what follows a quoted example:
+// "[P2]", "P3: none", then the block's own terminator. A real terminator is followed by the next
+// answer restarting its numbering. This subsumes the r2 "next block opens at P0" rule, which was
+// too narrow the other way: an answer whose first section is [P1] opens a block just as much.
 const FENCE_RE = /^[ \t]*(```|~~~)/;
 const VERDICT_EMBEDDED_RE = /^([ ][ ]|\t|[ ]*>)/;
-const PBLOCK_OPEN_RE = /^\s*[*_>#-]*\s*(P0\s*[:\-]|P0\b|\[P0\])/i;
+// The Pn SECTION header and its depth, as opposed to where a block may start: "P1: none" is a
+// section but never a cut point. Mirrors seclevel() in lib/pro-gate-lib.sh.
+const SECTION_RE = /^[*_>#-]*[ \t]*(?:\[P([0-3])\]|P([0-3])[ \t]*[:\-]|P([0-3])(?![0-9A-Za-z_]))/i;
 const isBlockStart = (line) => PBLOCK_START_RE.test(line.trim());
-const isBlockOpen = (line) => PBLOCK_OPEN_RE.test(line.trim());
+const sectionLevel = (line) => {
+  const m = line.trim().match(SECTION_RE);
+  return m ? Number(m[1] ?? m[2] ?? m[3]) : -1;
+};
 function verdictIndex(lines) {
   const all = [];
   const plain = [];
-  const claims = [];
   let fenced = false;
   for (let i = 0; i < lines.length; i++) {
     if (FENCE_RE.test(lines[i])) { fenced = !fenced; continue; }
     if (!VERDICT_RE.test(lines[i])) continue;
     all.push(i);
     plain.push(!fenced && !VERDICT_EMBEDDED_RE.test(lines[i]));
-    claims.push(echoedMarker(lines[i]));
   }
   const bounds = [];
   for (let k = 0; k < all.length; k++) {
     if (!plain[k]) continue;
+    let prev = -1;
+    for (let i = k > 0 ? all[k - 1] + 1 : 0; i < all[k]; i++) {
+      const level = sectionLevel(lines[i]);
+      if (level >= 0) prev = level;
+    }
+    let next = -1;
     const stop = k + 1 < all.length ? all[k + 1] : lines.length;
-    let opens = false;
-    for (let i = all[k] + 1; i < stop && !opens; i++) opens = isBlockOpen(lines[i]);
-    if (claims[k] || opens) bounds.push(all[k]);
+    for (let i = all[k] + 1; i < stop && next < 0; i++) next = sectionLevel(lines[i]);
+    if (next >= 0 && (prev < 0 || next <= prev)) bounds.push(all[k]);
   }
   let owned = -1;
   for (let k = all.length - 1; k >= 0; k--) if (echoedMarker(lines[all[k]]) === marker) { owned = k; break; }
@@ -750,7 +771,21 @@ function extractReview(text) {
     j -= 1;
     floor = j > 0 ? before[j - 1] + 1 : 0;
   }
-  if (start < 0) start = Math.max(floor, verdictIdx - 120);
+  if (start < 0) {
+    // #166 gate r3 P1: every floor was refused and no block header survives under the last one,
+    // so the only thing left to cut to is a HEADERLESS fragment — in the reported layout, a
+    // complete foreign block followed by nothing but this run's own signed verdict line. Emitting
+    // that fragment hands the engine bytes its structural guard drops BEFORE pg_capture_bind
+    // runs: the capture is deleted, the harvest exits 3, and neither the pre-cut quarantine nor
+    // the unattributable TTL is ever reached, so the reservation keeps redirecting the change
+    // into a harvest that can only fail. Hand back the widest headed block instead — the original
+    // capture, foreign block included — and let the engine's one provenance chokepoint refuse it
+    // and set it aside. The cut rule above is unchanged for every block that HAS a header.
+    for (let i = verdictIdx; i >= 0; i--) if (isBlockStart(lines[i])) start = i;
+  }
+  // No header anywhere above this verdict: the floor is meaningless too, so the last resort is
+  // the same fixed window on both sides (mirrored in pg_capture_own_segment).
+  if (start < 0) start = Math.max(0, verdictIdx - 120);
   return lines.slice(start, verdictIdx + 1).join('\n').trim();
 }
 
@@ -1266,6 +1301,13 @@ function classifyEvidence(text, structuredError = null) {
     // above); the `&& !newerPromptMarker` term stays as a guard against that combination
     // ever being reported probe-complete, even though only --probe reads this field.
     probeComplete: promptMarkerAt >= 0 && answerMarker === marker && !newerPromptMarker,
+    // …and that same combination is the ONE chronology fact the engine cannot recover from the
+    // extracted block alone (#166 gate r3 P1). This verdict was written BEFORE the prompt that
+    // sits under it, so it is scrollback and OUR answer may still be generating. The engine
+    // refuses to publish it either way, but the refusal must stay retryable: treating it as a
+    // conversation that answered two runs at once expires recovery at the reservation TTL with
+    // no evidence the current answer ever finished or disappeared.
+    precedesPrompt: !!newerPromptMarker,
   };
 }
 
@@ -1313,6 +1355,8 @@ function emitEvidence(url, evidence) {
     // v0.28 (gate #54 r5): name the EXACT source of this capture so the engine can blacklist
     // precisely on a provenance rejection — reading the shared memo afterwards races probes.
     console.error(`matched-url ${url}`);
+    // Chronology the engine cannot see: this block predates the prompt below it (#166 gate r3 P1).
+    if (evidence.precedesPrompt) console.error('answer-chronology precedes-prompt');
     console.log(evidence.review);
     process.exit(0);
   }
