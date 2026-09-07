@@ -881,9 +881,16 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
   REC_ART="$(pg_completed_dir)/$REC_SELECTED"
   REC_PENDING_ART="$PRO_GATE_HOME/pending/$REC_SELECTED"
   REC_SRC=""
-  if [ -s "$REC_ART" ] && [ ! -L "$REC_ART" ] && pg_is_review "$REC_ART"; then
+  # #164: an artifact carrying another run's verdict line is not this run's review, so it is not
+  # eligible here either. Excluded from SELECTION rather than refused with a new message:
+  # --recover promises exactly one plain state line from a closed vocabulary, and falling through
+  # reaches the marker-recovery path below, where a live conversation is re-collected through the
+  # fixed collector and a dead one lands on an existing state.
+  if [ -s "$REC_ART" ] && [ ! -L "$REC_ART" ] && pg_is_review "$REC_ART" \
+     && [ -z "$(pg_capture_foreign_echo "$REC_ART" "$REC_SELECTED")" ]; then
     REC_SRC="$REC_ART"
-  elif [ -s "$REC_PENDING_ART" ] && [ ! -L "$REC_PENDING_ART" ] && pg_is_review "$REC_PENDING_ART"; then
+  elif [ -s "$REC_PENDING_ART" ] && [ ! -L "$REC_PENDING_ART" ] && pg_is_review "$REC_PENDING_ART" \
+     && [ -z "$(pg_capture_foreign_echo "$REC_PENDING_ART" "$REC_SELECTED")" ]; then
     REC_SRC="$REC_PENDING_ART"
   fi
   if [ -n "$REC_SRC" ]; then
@@ -1254,11 +1261,19 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
       for _ub in "$r_out".unbound.*; do [ -e "$_ub" ] && r_unbound=$(( r_unbound + 1 )); done
       r_crossbound=0
       [ -s "$PRO_GATE_HOME/crossbound/$m" ] && r_crossbound="$(grep -c . "$PRO_GATE_HOME/crossbound/$m" 2>/dev/null || echo 1)"
+      # #164: a THIRD set-aside class, distinct from both. Here the page answered THIS run AND
+      # another one, and the collector could not attribute the surviving bytes to us alone, so it
+      # published nothing. Retrying re-reads the same page and refuses again, so this is not the
+      # ambiguous-and-retryable case .unbound describes — say so, and name the file to read.
+      r_crossfed=0
+      for _cf in "$r_out".crossfed.*; do [ -e "$_cf" ] && r_crossfed=$(( r_crossfed + 1 )); done
       # v0.33+ lifecycle state distinguishes capacity ownership from optional collectability.
       if [ "$r_life" = superseded ]; then
         [ -n "$ST_HINT" ] || ST_HINT="superseded old-head review holds no capacity and cannot authorize the current PR; optional audit harvest: $r_cmd"
       elif [ "$r_crossbound" -gt 0 ] 2>/dev/null; then
         ST_HINT="STUCK (cross-bound): the conversation remembered for $m carries ANOTHER run's completed answer — see $PRO_GATE_HOME/crossbound/$m. Do NOT delete state or set PRO_GATE_REQUIRE_NONCE=0. The bad memo is discarded; bounded exact-marker misses will terminalize recovery while retaining the charged round."
+      elif [ "$r_crossfed" -gt 0 ] 2>/dev/null; then
+        ST_HINT="UNATTRIBUTABLE: ${r_crossfed} capture(s) for $m answered this run AND another one in the same conversation, and the collector could not separate them (see ${r_out}.crossfed.*). Retrying re-reads the same page. Read the set-aside; the round stays charged until the reservation expires, then a fresh typed review is eligible."
       elif [ "$r_unbound" -gt 0 ]; then
         ST_HINT="AMBIGUOUS: ${r_unbound} harvested capture(s) for $m completed but carried no run-marker echo (see ${r_out}.unbound.*). This is retryable — it may be an older answer while yours still generates. Retry the FREE harvest: $r_cmd"
       else
@@ -1268,11 +1283,11 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
         jq -nc --arg marker "$m" --arg pr "${r_pr:-}" --arg out "$r_out" \
           --arg age "${r_age:-}" --arg miss "${r_miss:-}" --arg model "${r_model:-}" \
           --arg url "$r_url" --arg harvest_cmd "$r_cmd" --argjson unbound "$r_unbound" \
-          --argjson crossbound "$r_crossbound" --arg life "$r_life" \
-          '{marker:$marker,pr:$pr,out:$out,age_secs:(($age|tonumber?)//null),miss_streak:(($miss|tonumber?)//null),model:$model,conversation_url:$url,harvest_cmd:$harvest_cmd,unbound_captures:$unbound,crossbound_hits:$crossbound,holds_capacity:($life != "complete" and $life != "superseded"),state:(if $life == "superseded" then "superseded-awaiting-optional-harvest" elif $crossbound > 0 then "cross-bound" elif $unbound > 0 then "unbindable-ambiguous" elif $life == "complete" then "complete-awaiting-harvest" else "generating-or-recoverable" end)}' \
+          --argjson crossbound "$r_crossbound" --argjson crossfed "$r_crossfed" --arg life "$r_life" \
+          '{marker:$marker,pr:$pr,out:$out,age_secs:(($age|tonumber?)//null),miss_streak:(($miss|tonumber?)//null),model:$model,conversation_url:$url,harvest_cmd:$harvest_cmd,unbound_captures:$unbound,crossbound_hits:$crossbound,crossfed_captures:$crossfed,holds_capacity:($life != "complete" and $life != "superseded"),state:(if $life == "superseded" then "superseded-awaiting-optional-harvest" elif $crossbound > 0 then "cross-bound" elif $crossfed > 0 then "crossfed-unattributable" elif $unbound > 0 then "unbindable-ambiguous" elif $life == "complete" then "complete-awaiting-harvest" else "generating-or-recoverable" end)}' \
           >> "$ST_TMP/res.jsonl" 2>/dev/null
       else
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$m" "${r_pr:-?}" "${r_age:-?}" "${r_miss:-?}" "$r_unbound" "$r_crossbound" "$r_cmd" >> "$ST_TMP/res.tsv"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$m" "${r_pr:-?}" "${r_age:-?}" "${r_miss:-?}" "$r_unbound" "$r_crossbound" "$r_cmd" "$r_crossfed" >> "$ST_TMP/res.tsv"
       fi
     done
   fi
@@ -1571,10 +1586,12 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
     if pg_have jq && [ -s "$ST_TMP/res.jsonl" ]; then
       jq -r '"  " + .marker + "  pr=" + .pr + (if .age_secs then "  age=\(.age_secs / 60 | floor)m" else "" end) + (if .conversation_url != "" then "  url=remembered" else "" end)
              + (if .holds_capacity then "  [holding a review slot]" else "  [complete — slot already released, collect when convenient]" end)
-             + (if .crossbound_hits > 0 then "  [STUCK: cross-bound to another run - retrying cannot bind it]" else (if .unbound_captures > 0 then "  [\(.unbound_captures) unbindable capture(s) - ambiguous, still retryable]" else "" end) end)
+             + (if .crossbound_hits > 0 then "  [STUCK: cross-bound to another run - retrying cannot bind it]"
+                elif (.crossfed_captures // 0) > 0 then "  [UNATTRIBUTABLE: \(.crossfed_captures) capture(s) answered two runs at once - retrying re-reads the same page]"
+                else (if .unbound_captures > 0 then "  [\(.unbound_captures) unbindable capture(s) - ambiguous, still retryable]" else "" end) end)
              + "\n    harvest: " + .harvest_cmd' "$ST_TMP/res.jsonl"
     else
-      awk -F'\t' '{printf "  %s  pr=%s  age=%ss  miss=%s%s\n    harvest: %s\n", $1, $2, $3, $4, ($6 > 0 ? "  [STUCK: cross-bound to another run]" : ($5 > 0 ? "  [" $5 " unbindable capture(s) — ambiguous, retryable]" : "")), $7}' "$ST_TMP/res.tsv" 2>/dev/null
+      awk -F'\t' '{printf "  %s  pr=%s  age=%ss  miss=%s%s\n    harvest: %s\n", $1, $2, $3, $4, ($6 > 0 ? "  [STUCK: cross-bound to another run]" : ($8 > 0 ? "  [UNATTRIBUTABLE: " $8 " capture(s) answered two runs at once]" : ($5 > 0 ? "  [" $5 " unbindable capture(s) — ambiguous, retryable]" : ""))), $7}' "$ST_TMP/res.tsv" 2>/dev/null
     fi
   else
     echo "in-progress reservations: none"
@@ -2422,6 +2439,16 @@ if [ -n "$HARVEST_MARKER" ] && pg_reservation_marker_ok "$HARVEST_MARKER" \
   FASTPATH_ART="$(pg_completed_dir)/$RUN_MARKER"
   FASTPATH_SNAP="$WORK/fastpath.snap"
   if cp "$FASTPATH_ART" "$FASTPATH_SNAP" 2>/dev/null && pg_is_review "$FASTPATH_SNAP"; then
+    # #164: the durable record is re-served verbatim by every recovery path, so an artifact
+    # stored before the collector cut two-marker answers would keep handing back another run's
+    # verdict. Refuse rather than republish; the file stays readable at its named path.
+    FASTPATH_FOREIGN="$(pg_capture_foreign_echo "$FASTPATH_SNAP" "$RUN_MARKER")"
+    if [ -n "$FASTPATH_FOREIGN" ]; then
+      rm -f "$FASTPATH_SNAP" 2>/dev/null
+      echo "ERROR: the stored review for ${RUN_MARKER} carries another run's verdict (${FASTPATH_FOREIGN}), so it is not this run's result. Nothing published — read it at ${FASTPATH_ART}; a fresh typed review is eligible." >&2
+      pg_status failed "stored review carries another run verdict; not republished"
+      pg_finish 6
+    fi
     PG_FINAL_SRC="$FASTPATH_SNAP"
     PG_RESULT_DURABLE=1
     SALVAGED=1
@@ -2553,6 +2580,67 @@ if [ -n "$HARVEST_MARKER" ]; then
   esac
   echo "[oracle-review] harvesting in-progress review (marker ${RUN_MARKER}, up to ${HARVEST_SECS}s, no new slot spent)..." >&2
   pg_status salvaging "harvest up to ${HARVEST_SECS}s"
+  # One preserve path for every harvest capture the engine refuses to publish (#54 r3-r14, #164):
+  # the reservation, its TTL sweep, and the exit-9 contract are identical whatever the reason —
+  # only the set-aside name, the operator message, and the status detail differ. Never returns.
+  harvest_preserve_capture() { # <aside-path> <error-message> <status-detail> [class]
+    local aside="$1" message="$2" detail="$3" class="${4:-retryable}" res_key ttl_miss ttl_state
+    mv "$HARVEST_TMP" "$aside" 2>/dev/null || rm -f "$HARVEST_TMP"
+    res_key="${RUN_MARKER#pg-run-}"; res_key="${res_key%-*-*}"
+    # #166 gate r2 P1: the two classes need OPPOSITE treatment here, and only one of them is
+    # evidence that a recoverable review is live.
+    #
+    # A `retryable` capture (complete, but with no marker echo) may well be an older answer read
+    # while ours is still generating, so re-asserting the reservation is honest — and the bounded
+    # miss ladder below is what eventually ends it.
+    #
+    # An `unattributable` one is the opposite: the page is finished, it names two runs, and every
+    # retry re-reads those same bytes and refuses them again. Re-writing the reservation for it
+    # zeroed the miss streak and refreshed the mtime that the ladder's spacing check reads, so the
+    # streak could never advance ("retained interval/3" forever, "retained 1/3" even at interval
+    # zero) — and the marker probe, which sees a COMPLETE conversation, records no miss either.
+    # The reservation therefore outlived its own TTL and kept redirecting every fresh run for this
+    # change back into a harvest that can only refuse. So: assert nothing, and let the capture's
+    # own durable expiry decide (pg_reservation_expire_unattributable).
+    if [ "$class" = unattributable ] && [ "${PRO_GATE_HARVEST_TTL_SWEEP:-1}" = 1 ]; then
+      ttl_state="$(pg_reservation_expire_unattributable "$RUN_MARKER")"
+      if [ "$ttl_state" = released ]; then
+        echo "ERROR: this capture cannot be attributed to this run alone and retrying re-reads the same page, so recovery is exhausted at the ${PRO_GATE_RESERVATION_TTL:-21600}s reservation TTL. The round remains charged, the set-aside capture is at $aside, and a fresh typed review is now eligible for this change." >&2
+        pg_status failed "unattributable capture past TTL; recovery ownership released, round retained"
+        pg_finish 6
+      fi
+      echo "[oracle-review] unattributable capture holds same-change recovery until its TTL (${ttl_state})." >&2
+    # The exit-9 contract PROMISES a live reservation keyed to the real change; a harvest
+    # can reach here for a marker whose reservation already released. An EMPTY key would
+    # default to the literal "diff" and be undiscoverable (gate #54 r14): derive the key
+    # from the marker, and fail CLOSED (state preserved, exit 3) when even the reservation
+    # cannot be persisted — exit 9 must never claim protection it does not have.
+    elif ! pg_reservation_write "$RUN_MARKER" "$res_key" "$OUT" 2>/dev/null; then
+      PG_PRESERVE_STATE=1
+      echo "ERROR: unbindable capture preserved, but its reservation could not be persisted ($PRO_GATE_HOME unwritable?). Tab and state KEPT; retry --harvest once the home is writable." >&2
+      pg_status failed "unbindable capture; reservation write failed; state preserved"
+      pg_finish 3
+    fi
+    # #68 gate r3 P1: an unbindable capture does NOT prove the review is live, so this is a
+    # legitimate moment to apply the target's own TTL — and the only one, since reconcilers
+    # skip markers under active collection. Without it the harvest target could never expire
+    # and #67's "a stranded change frees itself" property died for the very marker it was
+    # written for. Done while we still hold the harvest lock, so no peer races the decision.
+    # The unattributable class is deliberately NOT laddered: recording a confirmed-ABSENCE miss
+    # against a conversation we just read would be false evidence, and its expiry ran above.
+    if [ "$class" != unattributable ] && [ "${PRO_GATE_HARVEST_TTL_SWEEP:-1}" = 1 ] && [ "$(pg_reservation_expire_if_stale "$RUN_MARKER")" = stale ]; then
+      ttl_miss="$(pg_reservation_note_miss "$RUN_MARKER")"
+      if [ "$ttl_miss" = released ]; then
+        echo "ERROR: this reservation is past its ${PRO_GATE_RESERVATION_TTL:-21600}s TTL and bounded marker probes proved no recoverable conversation. Recovery is exhausted; the round remains charged and a fresh typed review is eligible. The set-aside capture is at $aside." >&2
+        pg_status failed "recovery exhausted after TTL and confirmed marker misses; round retained"
+        pg_finish 6
+      fi
+      echo "[oracle-review] past-TTL recovery remains fail-closed until confirmed marker misses reach the threshold (${ttl_miss})." >&2
+    fi
+    echo "$message" >&2
+    pg_status in-progress "$detail"
+    pg_finish 9
+  }
   HARVEST_RC=0
   HARVEST_TMP="$WORK/harvest.capture"
   node "$SELF/cdp-salvage.mjs" "$RUN_MARKER" "$HARVEST_SECS" "$PORT" > "$HARVEST_TMP" 2> "$HARVEST_TMP.err" || HARVEST_RC=$?
@@ -2569,6 +2657,21 @@ if [ -n "$HARVEST_MARKER" ]; then
     # reservation, counts no miss, and invalidates the memoized candidate (blacklist + memo
     # removal) so the NEXT pass rescans instead of replaying the same foreign conversation.
     HARVEST_MANIFEST="$(pg_manifest_dir)/${RUN_MARKER}"
+    # v0.44 (#164): the answer this run may publish is the block its OWN verdict line closes.
+    # Two runs' prompts can land in one conversation, and the model then answers both; the
+    # tail-only nonce check below passes on such a page whenever OUR verdict happens to be last,
+    # and the caller's loop reads the FIRST verdict it finds. Cut to this run's block first (and
+    # refuse outright when a foreign ownership token would survive the cut), so every check that
+    # follows — and everything published — sees one run's answer.
+    pg_capture_bind "$HARVEST_TMP" "$RUN_MARKER"; HARVEST_BIND=$?
+    [ -n "${PG_CAPTURE_CUT:-}" ] && echo "[oracle-review] harvested page carried another run's review; dropped the block(s) bound to: ${PG_CAPTURE_CUT}" >&2
+    [ -n "${PG_CAPTURE_QUOTED:-}" ] && echo "[oracle-review] NOTE: this run's own findings mention another run's marker (${PG_CAPTURE_QUOTED}). Reported, not enforced — a review may legitimately quote one." >&2
+    if [ "$HARVEST_BIND" = 2 ]; then
+      harvest_preserve_capture "$OUT.crossfed.$$" \
+        "ERROR: harvested a review whose bytes cannot be attributed to this run alone (${PG_CAPTURE_FOREIGN}) — another run's answer reached this conversation. Nothing was published. Reservation and candidate kept until this reservation's TTL, after which a fresh typed review is eligible. Retry --harvest; inspect $OUT.crossfed.$$." \
+        "harvested review carries another run's block (${PG_CAPTURE_FOREIGN}); reservation kept until TTL" \
+        unattributable
+    fi
     if pg_capture_nonce_ok "$HARVEST_TMP" "$RUN_MARKER"; then
       :  # positively bound to this run
     elif [ "$REQUIRE_NONCE" = 1 ]; then
@@ -2579,36 +2682,9 @@ if [ -n "$HARVEST_MARKER" ]; then
       # eventual nonce-bearing result (r6 P1). Preserve everything and retry: the real answer
       # arrives with the echo, or the reservation ages out for manual recovery. Deliberately
       # independent of manifest/sidecar persistence (r4 P1): missing metadata fails CLOSED.
-      mv "$HARVEST_TMP" "$OUT.unbound.$$" 2>/dev/null || rm -f "$HARVEST_TMP"
-      # The exit-9 contract PROMISES a live reservation keyed to the real change; a harvest
-      # can reach here for a marker whose reservation already released. An EMPTY key would
-      # default to the literal "diff" and be undiscoverable (gate #54 r14): derive the key
-      # from the marker, and fail CLOSED (state preserved, exit 3) when even the reservation
-      # cannot be persisted — exit 9 must never claim protection it does not have.
-      RES_KEY="${RUN_MARKER#pg-run-}"; RES_KEY="${RES_KEY%-*-*}"
-      if ! pg_reservation_write "$RUN_MARKER" "$RES_KEY" "$OUT" 2>/dev/null; then
-        PG_PRESERVE_STATE=1
-        echo "ERROR: unbindable capture preserved, but its reservation could not be persisted ($PRO_GATE_HOME unwritable?). Tab and state KEPT; retry --harvest once the home is writable." >&2
-        pg_status failed "unbindable capture; reservation write failed; state preserved"
-        pg_finish 3
-      fi
-      # #68 gate r3 P1: an unbindable capture does NOT prove the review is live, so this is a
-      # legitimate moment to apply the target's own TTL — and the only one, since reconcilers
-      # skip markers under active collection. Without it the harvest target could never expire
-      # and #67's "a stranded change frees itself" property died for the very marker it was
-      # written for. Done while we still hold the harvest lock, so no peer races the decision.
-      if [ "${PRO_GATE_HARVEST_TTL_SWEEP:-1}" = 1 ] && [ "$(pg_reservation_expire_if_stale "$RUN_MARKER")" = stale ]; then
-        TTL_MISS="$(pg_reservation_note_miss "$RUN_MARKER")"
-        if [ "$TTL_MISS" = released ]; then
-          echo "ERROR: this reservation is past its ${PRO_GATE_RESERVATION_TTL:-21600}s TTL and bounded marker probes proved no recoverable conversation. Recovery is exhausted; the round remains charged and a fresh typed review is eligible. The set-aside capture is at $OUT.unbound.$$." >&2
-          pg_status failed "recovery exhausted after TTL and confirmed marker misses; round retained"
-          pg_finish 6
-        fi
-        echo "[oracle-review] past-TTL recovery remains fail-closed until confirmed marker misses reach the threshold (${TTL_MISS})." >&2
-      fi
-      echo "ERROR: harvested a complete review that cannot be bound to this run (no run-marker echo — possibly an older answer while the current one is still generating). Reservation and candidate kept. Retry --harvest; inspect $OUT.unbound.$$; PRO_GATE_REQUIRE_NONCE=0 accepts best-effort captures." >&2
-      pg_status in-progress "harvested review unbindable (no nonce echo); reservation kept, retry"
-      pg_finish 9
+      harvest_preserve_capture "$OUT.unbound.$$" \
+        "ERROR: harvested a complete review that cannot be bound to this run (no run-marker echo — possibly an older answer while the current one is still generating). Reservation and candidate kept. Retry --harvest; inspect $OUT.unbound.$$; PRO_GATE_REQUIRE_NONCE=0 accepts best-effort captures." \
+        "harvested review unbindable (no nonce echo); reservation kept, retry"
     elif [ -s "$HARVEST_MANIFEST" ] && ! pg_review_matches_change "$HARVEST_TMP" "$HARVEST_MANIFEST"; then
       # Legacy mode (REQUIRE_NONCE=0): path overlap is authoritative, so a zero-overlap
       # capture IS foreign here — blacklist its exact source and rescan.
@@ -2729,6 +2805,15 @@ if [ -n "$HARVEST_MARKER" ]; then
                rm -f "$SNAP" 2>/dev/null
              fi
            fi
+         fi
+         # #164: an artifact stored BEFORE the collector learned to cut a two-marker answer can
+         # still carry another run's verdict line. Re-serving it hands the caller the same wrong
+         # verdict the incident produced — out of durable storage, on every retry, forever.
+         # Refuse and name the file: the bytes stay readable by a human, no loop acts on them.
+         if [ "$COLLECT_OK" = 1 ] && [ -n "$(pg_capture_foreign_echo "$PG_FINAL_SRC" "$RUN_MARKER")" ]; then
+           echo "ERROR: the already-collected review for ${RUN_MARKER} (${COLLECT_SRC}) carries another run's verdict line, so it is not this run's result. Nothing published — read it at that path; a fresh typed review is eligible." >&2
+           pg_status failed "stored review carries another run verdict; not republished"
+           pg_finish 6
          fi
          if [ "$COLLECT_OK" = 1 ]; then
            SALVAGED=1
@@ -3456,7 +3541,7 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
       stdbuf -oL -eL "$TIMEOUT_BIN" --signal=TERM --kill-after=30 "$HARD_SECS" \
         "$ORACLE_BIN" "${ENGINE_ARGS[@]}" -m "$MODEL" \
         --browser-model-strategy "$strategy" ${force_args[0]:+"${force_args[@]}"} \
-        --slug "pro gate review pr ${PR_NUM:-diff}" \
+        --slug "$SLUG_BASE" \
         "${URL_ARGS[@]}" "${FILE_ARGS[@]}" \
         -p "$(cat "$PROMPT_FILE")" \
         --no-notify --timeout "$TIMEOUT" \
@@ -3575,7 +3660,21 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
 # A precious Pro review slot is spent only when the box is fit; a dropped connection is first
 # SALVAGED (the answer may have finished server-side), and only a truly-lost run is retried once.
 # Exit 8 = deferred (no slot spent); exit 6 = ran but produced nothing after salvage + retry.
-SLUG_BASE="pro-gate-review-pr-${PR_NUM:-diff}"
+# v0.44 (#164): the Oracle session name is PINNED PER INVOCATION, never to the PR number.
+# A PR-scoped name is shared by every round and every retry of that PR, so Oracle disambiguated
+# with a collision suffix (`pro-gate-review-pr-176-4`) — a name a LATER invocation can mint or
+# reattach to as readily as this one. That is one of the three routes by which two runs' prompts
+# reached a single conversation and the model answered both (the collector now refuses to publish
+# such an answer; this stops it being produced).
+#
+# Derived from the marker rather than being the marker (#166 gate r1 P2): Oracle NORMALIZES a
+# custom slug down to five ten-character words, which reduces a raw marker to "pg-run-startupbro-
+# com-pro" — the same name for every run in the repository, and not the name the reattach fallback
+# below would then ask for. pg_oracle_slug keeps the epoch and pid that make the marker unique, is
+# a fixed point of that normalization so the name we send is the name Oracle stores, and does not
+# itself parse as a run marker — the slug rides oracle's argv and run log, and a second token
+# claiming to be a marker is the bug class #164 is about.
+SLUG_BASE="$(pg_oracle_slug "$RUN_MARKER")"
 REATTACH_TIMEOUT="${PRO_GATE_REATTACH_TIMEOUT:-150}"
 MAX_RETRIES="${PRO_GATE_MAX_RETRIES:-1}"
 BACKOFF="${PRO_GATE_RETRY_BACKOFF:-20}"
@@ -3818,7 +3917,12 @@ while :; do
 
   # No output. The generation may have COMPLETED server-side after a dropped Chrome connection —
   # try a bounded salvage (never hangs) before spending another slot. Capture the slug oracle
-  # actually used (it may differ from SLUG_BASE on a collision, e.g. ...-pr-804-2).
+  # actually used. Since #164 pinned SLUG_BASE per invocation, and SLUG_BASE survives Oracle's slug
+  # normalization unchanged (#166 gate r1 P2), the fallback now names a session Oracle really
+  # stored — where before it named one Oracle had truncated away. Reading the log stays
+  # authoritative regardless: a SECOND oracle call in this same process (the model-picker re-run,
+  # or a retry) reserves the same name again and Oracle appends its own "-2", so only the log knows
+  # which session this attempt got.
   SLUG="$(grep -oE 'oracle session [A-Za-z0-9._-]+' "$RUNLOG" 2>/dev/null | tail -1 | awk '{print $NF}')"
   [ -n "$SLUG" ] || SLUG="$SLUG_BASE"
   echo "[oracle-review] no output — bounded salvage via reattach (session ${SLUG}, ${REATTACH_TIMEOUT}s)..." >&2
@@ -4012,6 +4116,24 @@ elif pg_is_review "$CAPTURE_OUT"; then
   # preserve the run — the capture stays at $CAPTURE_OUT and the tab/reservation survive.
   echo "[oracle-review] valid capture at $CAPTURE_OUT could not be snapshotted; preserving the run for --harvest." >&2
   SALVAGE_RAN=1; SALVAGE_PRESERVE=1
+fi
+# v0.44 (#164): ONE run's block per published result — applied to EVERY source, including direct
+# oracle output. The v0.28 exemption below is about PATH-OVERLAP heuristics, which false-positive
+# on a legitimate review that cites a caller file; a foreign "(run marker: …)" ownership token is
+# not a heuristic. Two runs' prompts reaching one conversation makes the model answer both, and
+# the process that submitted the prompt writes back whatever that conversation now holds. Cut to
+# this run's block; refuse outright when a foreign ownership token would survive the cut.
+if [ -n "$FINAL_SNAP" ]; then
+  pg_capture_bind "$FINAL_SNAP" "$RUN_MARKER"; CAPTURE_BIND=$?
+  [ -n "${PG_CAPTURE_CUT:-}" ] && echo "[oracle-review] captured page carried another run's review; dropped the block(s) bound to: ${PG_CAPTURE_CUT}" >&2
+  [ -n "${PG_CAPTURE_QUOTED:-}" ] && echo "[oracle-review] NOTE: this run's own findings mention another run's marker (${PG_CAPTURE_QUOTED}). Reported, not enforced — a review may legitimately quote one." >&2
+  if [ "$CAPTURE_BIND" = 2 ]; then
+    echo "[oracle-review] captured a review whose bytes cannot be attributed to this run alone (${PG_CAPTURE_FOREIGN}) — another run's answer reached this conversation; NOT accepting it. Preserving for --harvest; inspect $OUT.crossfed.$$." >&2
+    mv "$FINAL_SNAP" "$OUT.crossfed.$$" 2>/dev/null || rm -f "$FINAL_SNAP"
+    FINAL_SNAP=""
+    rm -f "$CAPTURE_OUT" 2>/dev/null
+    SALVAGE_RAN=1; SALVAGE_PRESERVE=1
+  fi
 fi
 # FAIL CLOSED for unbindable browser-matched captures (gate #54 r3): every v0.28 prompt
 # promises the nonce echo; a capture without it whose path check cannot bind either (no
