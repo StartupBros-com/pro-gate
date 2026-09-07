@@ -680,18 +680,48 @@ const echoedMarker = (line) => line.match(ECHO_RE)?.[1] ?? null;
 // own header away and publishes the remainder as if it were a whole block. A quoted, indented or
 // fenced verdict stays an ownership candidate, because the model may format its real one that
 // way, but it never bounds anything. Mirrored by pg_capture_own_segment in lib/pro-gate-lib.sh.
+//
+// The markdown test alone is not enough (#166 gate r2 P1). What arrives here is `innerText` of a
+// RENDERED answer, and the renderer has already eaten the syntax: a blockquote is a <blockquote>
+// and a fence is a <pre>, so a quoted example reads as a bare "VERDICT: SHIP" in column 0,
+// indistinguishable from a terminator. Flooring on it deleted the enclosing [P1] finding while
+// the truncated remainder still passed structural, nonce and foreign-echo validation — published,
+// silently, one finding short. So a bare verdict must EARN the right to bound, from the text
+// alone (both implementations see only text, and the organizer's --finalize compares their bytes):
+//
+//   a verdict bounds  <=>  it is not quoted/indented/fenced
+//                          AND ( it CLAIMS a run — "(run marker: …)", the token every real
+//                                terminator in this protocol carries —
+//                                OR the next block's P0 opening follows it before the next
+//                                verdict line, which is what a block boundary looks like )
+//
+// A quoted example inside a finding has neither: what follows it is the rest of its own block
+// ([P2], "P3: none", the terminator). This is why the P0 opening, and not any [Pn] header, is the
+// signal — [P2] is a section inside a block, P0 is where a block starts.
 const FENCE_RE = /^[ \t]*(```|~~~)/;
 const VERDICT_EMBEDDED_RE = /^([ ][ ]|\t|[ ]*>)/;
+const PBLOCK_OPEN_RE = /^\s*[*_>#-]*\s*(P0\s*[:\-]|P0\b|\[P0\])/i;
 const isBlockStart = (line) => PBLOCK_START_RE.test(line.trim());
+const isBlockOpen = (line) => PBLOCK_OPEN_RE.test(line.trim());
 function verdictIndex(lines) {
   const all = [];
-  const bounds = [];
+  const plain = [];
+  const claims = [];
   let fenced = false;
   for (let i = 0; i < lines.length; i++) {
     if (FENCE_RE.test(lines[i])) { fenced = !fenced; continue; }
     if (!VERDICT_RE.test(lines[i])) continue;
     all.push(i);
-    if (!fenced && !VERDICT_EMBEDDED_RE.test(lines[i])) bounds.push(i);
+    plain.push(!fenced && !VERDICT_EMBEDDED_RE.test(lines[i]));
+    claims.push(echoedMarker(lines[i]));
+  }
+  const bounds = [];
+  for (let k = 0; k < all.length; k++) {
+    if (!plain[k]) continue;
+    const stop = k + 1 < all.length ? all[k + 1] : lines.length;
+    let opens = false;
+    for (let i = all[k] + 1; i < stop && !opens; i++) opens = isBlockOpen(lines[i]);
+    if (claims[k] || opens) bounds.push(all[k]);
   }
   let owned = -1;
   for (let k = all.length - 1; k >= 0; k--) if (echoedMarker(lines[all[k]]) === marker) { owned = k; break; }

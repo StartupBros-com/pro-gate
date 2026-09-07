@@ -3033,6 +3033,146 @@ check 'r1 P1: harvest keeps the finding that encloses a quoted verdict example' 
   "$(grep -qF 'src/real.sh:4' "$TDIR/o-crossfeed-d.md" 2>/dev/null && grep -qF 'and keep explaining afterwards' "$TDIR/o-crossfeed-d.md" 2>/dev/null; echo $?)" \
   "$(cat "$TDIR/o-crossfeed-d.md" 2>/dev/null)"
 
+# ── #166 gate r2 P1: the quote markers are already GONE by the time either reader sees them ────
+# Every fixture above hands the readers literal Markdown. Production hands them innerText of a
+# RENDERED answer, where the blockquote and the fence have been consumed by the renderer, so a
+# quoted example verdict arrives as a bare "VERDICT: …" in column 0. Flooring on that deleted the
+# [P1] finding that wrote it and published the remainder — which still passes pg_is_review, the
+# nonce check and the foreign-echo check, so nothing downstream noticed.
+printf 'P0: none\n[P1] src/x.sh:3 — a finding that shows a verdict example\nthe reviewer wrote\nVERDICT: SHIP — example\nand kept explaining afterwards\n[P2] src/y.sh:9 — a second, separate finding\nP3: none\nVERDICT: FIX-FIRST — ours. (run marker: %s)\n' \
+  "$BIND_MARKER" > "$TDIR/bind-rverdict.md"
+cp "$TDIR/bind-rverdict.md" "$TDIR/bind-rverdict.orig"
+bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_capture_bind '$TDIR/bind-rverdict.md' '$BIND_MARKER'"; RC=$?
+check 'r2 P1: a RENDERED quoted verdict never floors the cut (block kept byte-for-byte)' \
+  "$([ "$RC" -eq 0 ] && cmp -s "$TDIR/bind-rverdict.md" "$TDIR/bind-rverdict.orig"; echo $?)" \
+  "rc=$RC $(cat "$TDIR/bind-rverdict.md")"
+# The other half: the exemption may not simply disable flooring. A real terminator with no marker
+# echo of its own is still recognisable, because the NEXT block's P0 opening follows it.
+printf '[P0] other/a.ts:1 — theirs\nP1: none\nVERDICT: FIX-FIRST — theirs, no echo at all\nP0: none\nP1: none\nVERDICT: SHIP — ours. (run marker: %s)\n' \
+  "$BIND_MARKER" > "$TDIR/bind-rfloor.md"
+check 'r2 P1: a marker-less terminator followed by a P0 opening still floors the cut' \
+  "$(bind_case "$TDIR/bind-rfloor.md"; echo $?)" "$(cat "$TDIR/bind-rfloor.md")"
+
+echo '# gate r2 P1 (#166): a RENDERED quoted verdict example survives the whole harvest path'
+M164E="pg-run-crossfeed-176-1700000074-25"
+printf '176\t%s\t%s\t0\t1\tGPT-X\n' "$TDIR/o-crossfeed-e.md" "$(date +%s)" > "$TDIR/home/in-progress/$M164E"
+printf 'src/real.sh\n' > "$TDIR/home/manifests/$M164E"
+cat > "$TDIR/tab.txt" <<TAB
+conversation for run marker: $M164E
+
+P0: none
+[P1] src/real.sh:4 — a finding that shows a verdict example
+the reviewer wrote
+VERDICT: SHIP — example
+and kept explaining afterwards
+[P2] src/other.sh:9 — a second, separate finding
+P3: none
+VERDICT: FIX-FIRST — ours. (run marker: $M164E)
+TAB
+start_mock "$TDIR/tab.txt"
+run_engine --harvest "$M164E" --out "$TDIR/o-crossfeed-e.md" --timeout 5s
+check 'r2 P1: a review with a rendered verdict example is still published' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
+check 'r2 P1: harvest publishes BOTH findings around a rendered verdict example' \
+  "$(grep -qF 'src/real.sh:4' "$TDIR/o-crossfeed-e.md" 2>/dev/null && grep -qF 'src/other.sh:9' "$TDIR/o-crossfeed-e.md" 2>/dev/null \
+     && grep -qF 'and kept explaining afterwards' "$TDIR/o-crossfeed-e.md" 2>/dev/null; echo $?)" \
+  "$(cat "$TDIR/o-crossfeed-e.md" 2>/dev/null)"
+
+# ── #166 gate r2 P1: an unattributable capture must EXPIRE, not hold the change forever ────────
+# A verdict line claimed by two runs is refused on every retry, by construction: the page never
+# changes. The refusal used to re-write the reservation, which zeroed the miss streak and the
+# mtime the ladder's spacing check reads, so the streak could never advance — and the marker probe
+# reads that conversation as COMPLETE, so background reconciliation never advanced it either. The
+# reservation therefore outlived its TTL and kept redirecting every fresh run for the change into
+# a harvest that could only refuse again.
+UNATT_HOME="$TDIR/home-unattributable"; UNATT_KEY=acme-unattr-177
+UNATT_MARKER='pg-run-acme-unattr-177-1700000090-40'; UNATT_EPOCH=1700000090
+mkdir -p "$UNATT_HOME/in-progress" "$UNATT_HOME/run-meta" "$UNATT_HOME/rounds" "$UNATT_HOME/manifests"
+printf '%s\n' "$UNATT_EPOCH" > "$UNATT_HOME/rounds/$UNATT_KEY"
+printf 'github.com\tacme\tunattr\t%s\t177\t/tmp/unattr.md\t%s\n' "$UNATT_KEY" "$UNATT_EPOCH" > "$UNATT_HOME/run-meta/$UNATT_MARKER"
+printf '%s\t/tmp/unattr.md\t%s\t2\t1\tGPT-X\t%s\tgenerating\n' "$UNATT_KEY" "$(date +%s)" "$UNATT_EPOCH" > "$UNATT_HOME/in-progress/$UNATT_MARKER"
+cp "$UNATT_HOME/in-progress/$UNATT_MARKER" "$UNATT_HOME/unattr.orig"
+UNATT_FRESH="$(PRO_GATE_HOME="$UNATT_HOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_expire_unattributable '$UNATT_MARKER'")"
+check 'r2 P1: an unattributable capture inside TTL keeps its reservation untouched' \
+  "$([ "$UNATT_FRESH" = 'retained within-ttl' ] && cmp -s "$UNATT_HOME/in-progress/$UNATT_MARKER" "$UNATT_HOME/unattr.orig"; echo $?)" \
+  "state=$UNATT_FRESH record=$(cat "$UNATT_HOME/in-progress/$UNATT_MARKER" 2>/dev/null)"
+# Past TTL the durable refusal is itself the proof: hand back same-change recovery ownership, keep
+# the charged round, and account for the release with a published disposition. Idempotent, because
+# the trap being closed is a harvest that can be retried without limit.
+printf '%s\t/tmp/unattr.md\t%s\t0\t1\tGPT-X\t%s\tgenerating\n' "$UNATT_KEY" "$(( $(date +%s) - 30000 ))" "$UNATT_EPOCH" > "$UNATT_HOME/in-progress/$UNATT_MARKER"
+printf 'src/real.sh\n' > "$UNATT_HOME/manifests/$UNATT_MARKER"
+UNATT_STALE="$(PRO_GATE_HOME="$UNATT_HOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_expire_unattributable '$UNATT_MARKER'")"
+UNATT_AGAIN="$(PRO_GATE_HOME="$UNATT_HOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_expire_unattributable '$UNATT_MARKER'")"
+check 'r2 P1: an unattributable capture past TTL releases same-change recovery ownership' \
+  "$([ "$UNATT_STALE" = released ] && [ "$UNATT_AGAIN" = released ] \
+     && [ ! -e "$UNATT_HOME/in-progress/$UNATT_MARKER" ] && [ ! -e "$UNATT_HOME/manifests/$UNATT_MARKER" ] \
+     && [ -s "$UNATT_HOME/rounds/$UNATT_KEY" ] \
+     && jq -e '.terminal_kind=="recovery-exhausted" and .proof_kind=="bounded-recovery-exhausted"' "$UNATT_HOME/attempt-dispositions/$UNATT_MARKER" >/dev/null 2>&1; echo $?)" \
+  "first=$UNATT_STALE second=$UNATT_AGAIN disposition=$(cat "$UNATT_HOME/attempt-dispositions/$UNATT_MARKER" 2>/dev/null)"
+check 'r2 P1: releasing an unattributable reservation makes the change fresh-eligible again' \
+  "$([ -z "$(PRO_GATE_HOME="$UNATT_HOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_find_pr '$UNATT_KEY'")" ]; echo $?)" \
+  "$(ls "$UNATT_HOME/in-progress" 2>/dev/null)"
+# A record with no durable run-meta cannot bind the release to one charged attempt, so it fails
+# CLOSED and says which case it was, rather than releasing capacity nobody can account for.
+UNATT_ORPHAN='pg-run-acme-unattr-177-1700000093-43'
+printf '%s\t/tmp/unattr.md\t%s\t0\t1\tGPT-X\t%s\tgenerating\n' "$UNATT_KEY" "$(( $(date +%s) - 30000 ))" "$UNATT_EPOCH" > "$UNATT_HOME/in-progress/$UNATT_ORPHAN"
+UNATT_ORPH_STATE="$(PRO_GATE_HOME="$UNATT_HOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_expire_unattributable '$UNATT_ORPHAN'")"
+check 'r2 P1: an unattributable capture with no run-meta stays fail-closed' \
+  "$([ "$UNATT_ORPH_STATE" = 'retained unrecorded-attempt' ] && [ -f "$UNATT_HOME/in-progress/$UNATT_ORPHAN" ]; echo $?)" \
+  "state=$UNATT_ORPH_STATE"
+rm -f "$UNATT_HOME/in-progress/$UNATT_ORPHAN"
+
+echo '# gate r2 P1 (#166): a post-TTL unattributable harvest ends recovery instead of looping'
+UNATT_KEY2=crossfed-177; UNATT_M2="pg-run-crossfed-177-1700000091-41"
+mkdir -p "$TDIR/home/run-meta" "$TDIR/home/rounds"
+printf '%s\n' 1700000091 > "$TDIR/home/rounds/$UNATT_KEY2"
+printf 'github.com\tacme\tcrossfed\t%s\t177\t%s\t1700000091\n' "$UNATT_KEY2" "$TDIR/o-unattr.md" > "$TDIR/home/run-meta/$UNATT_M2"
+printf '%s\t%s\t%s\t0\t1\tGPT-X\t1700000091\tgenerating\n' "$UNATT_KEY2" "$TDIR/o-unattr.md" "$(( $(date +%s) - 30000 ))" > "$TDIR/home/in-progress/$UNATT_M2"
+printf 'src/real.sh\n' > "$TDIR/home/manifests/$UNATT_M2"
+cat > "$TDIR/tab.txt" <<TAB
+conversation for run marker: $UNATT_M2
+
+P0: none
+P1: none
+P2: none
+P3: none
+VERDICT: SHIP — ours. (run marker: $UNATT_M2) (run marker: $FOREIGN164)
+TAB
+start_mock "$TDIR/tab.txt"
+run_engine --harvest "$UNATT_M2" --out "$TDIR/o-unattr.md" --timeout 5s
+check 'r2 P1: a post-TTL unattributable harvest exits terminal, not exit 9 forever' \
+  "$([ "$RC" -eq 6 ] && [ ! -e "$TDIR/home/in-progress/$UNATT_M2" ] && [ ! -s "$TDIR/o-unattr.md" ]; echo $?)" \
+  "rc=$RC $(tail -3 "$TDIR/stderr")"
+check 'r2 P1: the refused bytes stay quarantined and the charged round is retained' \
+  "$(ls "$TDIR"/o-unattr.md.crossfed.* >/dev/null 2>&1 && [ -s "$TDIR/home/rounds/$UNATT_KEY2" ] \
+     && jq -e '.terminal_kind=="recovery-exhausted"' "$TDIR/home/attempt-dispositions/$UNATT_M2" >/dev/null 2>&1; echo $?)" \
+  "asides=$(ls "$TDIR"/o-unattr.md.crossfed.* 2>/dev/null) rounds=$(cat "$TDIR/home/rounds/$UNATT_KEY2" 2>/dev/null)"
+check 'r2 P1: after the release the change is no longer redirected to harvest' \
+  "$([ -z "$(PRO_GATE_HOME="$TDIR/home" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_find_pr '$UNATT_KEY2'")" ]; echo $?)" \
+  "$(ls "$TDIR/home/in-progress" 2>/dev/null)"
+
+# Inside TTL the same capture is still recoverable by hand, so the reservation is KEPT — but it is
+# kept exactly as it was. Re-writing it here is what reset the miss streak and mtime that every
+# other release route depends on, and a refusal we will repeat verbatim is not evidence of life.
+UNATT_KEY3=crossfed-178; UNATT_M3="pg-run-crossfed-178-1700000092-42"
+printf '%s\t%s\t%s\t2\t1\tGPT-X\t1700000092\tgenerating\n' "$UNATT_KEY3" "$TDIR/o-unattr3.md" "$(date +%s)" > "$TDIR/home/in-progress/$UNATT_M3"
+printf 'src/real.sh\n' > "$TDIR/home/manifests/$UNATT_M3"
+cp "$TDIR/home/in-progress/$UNATT_M3" "$TDIR/unattr3.orig"
+cat > "$TDIR/tab.txt" <<TAB
+conversation for run marker: $UNATT_M3
+
+P0: none
+P1: none
+P2: none
+P3: none
+VERDICT: SHIP — ours. (run marker: $UNATT_M3) (run marker: $FOREIGN164)
+TAB
+start_mock "$TDIR/tab.txt"
+run_engine --harvest "$UNATT_M3" --out "$TDIR/o-unattr3.md" --timeout 5s
+check 'r2 P1: an in-TTL unattributable harvest keeps the reservation and re-arms nothing' \
+  "$([ "$RC" -eq 9 ] && cmp -s "$TDIR/home/in-progress/$UNATT_M3" "$TDIR/unattr3.orig"; echo $?)" \
+  "rc=$RC record=$(cat "$TDIR/home/in-progress/$UNATT_M3" 2>/dev/null) was=$(cat "$TDIR/unattr3.orig")"
+rm -f "$TDIR/home/in-progress/$UNATT_M3" "$TDIR/home/manifests/$UNATT_M3"
+
 # ── #166 gate r1 P2: the Oracle session name must survive Oracle's own slug normalization ──────
 # Oracle stores a custom --slug as five ten-character alphanumeric words. A raw run marker is
 # reduced to "pg-run-startupbro-com-pro": one name for EVERY run in the repository, and not the

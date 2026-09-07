@@ -1040,6 +1040,55 @@ const MARKER = 'pg-run-test-1234567890-42';
   cdp.stop();
 }
 
+{ // #166 gate r2 P1: the r1 fixtures above hand the extractor literal Markdown, which is NOT what
+  // it gets in production. tabText() reads document.body.innerText of a RENDERED answer, where the
+  // blockquote is a <blockquote> and the fence is a <pre> — the syntax is gone, so a quoted example
+  // arrives as a bare "VERDICT: …" in column 0, indistinguishable from a terminator by shape alone.
+  // Flooring on it deleted the [P1] that wrote it, and the shortened block still passed structural,
+  // nonce and foreign-echo validation, so it was published one finding short and in silence.
+  const body = [
+    `run marker: ${MARKER}`,
+    '',
+    'P0: none',
+    '[P1] src/real.sh:4 — a finding that shows a verdict example',
+    'the reviewer wrote',
+    'VERDICT: SHIP — example',
+    'and kept explaining afterwards',
+    '[P2] src/other.sh:9 — a second, separate finding',
+    'P3: none',
+    `VERDICT: FIX-FIRST — ours. (run marker: ${MARKER})`,
+  ];
+  const cdp = await mockCdp(body.join('\n'));
+  const r = await runSalvage([MARKER, '3'], cdp.port);
+  check('r2 P1: a RENDERED quoted verdict keeps the finding that encloses it',
+    r.status === 0 && r.stdout.includes('[P1] src/real.sh:4') && r.stdout.includes('and kept explaining afterwards'),
+    `status=${r.status} stdout=${JSON.stringify(r.stdout)}`);
+  check('r2 P1: a RENDERED quoted verdict emits the whole block, both findings',
+    r.stdout.trim() === body.slice(2).join('\n'),
+    `stdout=${JSON.stringify(r.stdout)}`);
+  cdp.stop();
+}
+
+{ // #166 gate r2 P1, the other half: the rendered-quote exemption may not simply disable flooring.
+  // A REAL terminator that carries no marker echo of its own is still recognisable, because what
+  // follows it is the next block's P0 opening rather than the rest of its own block.
+  const ourBlock = ['P0: none', '[P1] src/real.sh:4 — ours', 'P2: none', `VERDICT: SHIP — ours. (run marker: ${MARKER})`];
+  const body = [
+    `run marker: ${MARKER}`,
+    '[P0] apps/blog-writer/src/hazards.claims.ts:31 — a tree this repository does not have',
+    'P1: none',
+    'VERDICT: FIX-FIRST — theirs, with no marker echo at all',
+    '',
+    ...ourBlock,
+  ];
+  const cdp = await mockCdp(body.join('\n'));
+  const r = await runSalvage([MARKER, '3'], cdp.port);
+  check('r2 P1: a marker-less terminator followed by a P0 opening still floors the block',
+    r.status === 0 && r.stdout.trim() === ourBlock.join('\n'),
+    `status=${r.status} stdout=${JSON.stringify(r.stdout)}`);
+  cdp.stop();
+}
+
 { // P1 (gate #91 r3): --probe must not report the conversation ABSENT just because the one-shot
   // revalidation was spent on a DIFFERENT remembered URL (A) that comes back cross-bound or
   // foreign, while the tab actually scanned (B) is demonstrably ours and still generating. Before

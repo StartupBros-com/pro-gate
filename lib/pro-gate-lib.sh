@@ -1319,6 +1319,52 @@ pg_reservation_note_miss() {
   fi
 }
 
+# pg_reservation_expire_unattributable <marker>: the expiry transition for a capture that can
+# never bind, however often it is retried (#166 gate r2 P1).
+#
+# The bounded-miss ladder above cannot reach this case, by construction. Its proof is CONFIRMED
+# ABSENCE — the conversation is gone — and here the conversation is emphatically present: it holds
+# a completed answer whose bytes name two runs. The marker probe reads it as complete and records
+# no miss; every harvest re-reads the same page and refuses it again; and a reservation, complete
+# or generating, keeps redirecting fresh same-change runs to harvest (pg_reservation_find_pr).
+# Without its own transition such a capture holds a change in harvest forever, and the exit-9
+# promise that recovery ages out to a fresh review is never kept.
+#
+# So the durable refusal itself is the proof, and TTL is when it becomes terminal: the round stays
+# charged, the quarantined bytes stay on disk for a human, and only same-change RECOVERY OWNERSHIP
+# is handed back. Disposition is published before the release, exactly as the ladder does it, so no
+# fresh caller sees a gap. Echoes "released", or "retained <why>" when the record must be kept.
+pg_reservation_expire_unattributable() {
+  local marker="$1" f created ttl now
+  pg_reservation_marker_ok "$marker" || { echo released; return 0; }
+  f="$(pg_reservation_dir)/$marker"
+  pg_reservation_guard_acquire || { echo "retained guard-busy"; return 0; }
+  if [ ! -f "$f" ]; then pg_reservation_guard_release; echo released; return 0; fi
+  # Superseded work holds no capacity already and is retained for optional audit harvest; an
+  # unattributable capture is no reason to retire that record (mirrors pg_reservation_note_miss).
+  if [ "$(awk -F'\t' 'NR==1{print $8}' "$f" 2>/dev/null)" = superseded ]; then
+    pg_reservation_guard_release; echo "retained superseded"; return 0
+  fi
+  created="$(awk -F'\t' 'NR==1{print $3}' "$f" 2>/dev/null)"
+  case "$created" in ''|*[!0-9]*) pg_reservation_guard_release; echo "retained no-created"; return 0;; esac
+  ttl="${PRO_GATE_RESERVATION_TTL:-21600}"; case "$ttl" in ''|*[!0-9]*) ttl=21600;; esac
+  now="$(date +%s)"
+  if [ "$(( now - created ))" -lt "$ttl" ] 2>/dev/null; then
+    pg_reservation_guard_release; echo "retained within-ttl"; return 0
+  fi
+  # No durable run-meta means no disposition can bind this release to one charged attempt, and a
+  # release nobody can account for is worse than a retained one. Fail closed and say which it was.
+  if pg_attempt_terminal_from_meta "$marker" recovery-exhausted bounded-recovery-exhausted; then
+    rm -f "$f" "$(pg_manifest_dir)/$marker" "$(pg_manifest_dir)/$marker.nonce" 2>/dev/null
+    pg_reservation_guard_release
+    pg_attempt_reconcile_terminal "$marker" 2>/dev/null || true
+    echo released
+  else
+    pg_reservation_guard_release
+    echo "retained unrecorded-attempt"
+  fi
+}
+
 pg_reservation_find_pr() { # pr-key [include-superseded] -> marker (oldest, best-effort)
   local pr="$1" include="${2:-}" dir f found_pr state
   [ -n "$pr" ] || return 1
@@ -2435,6 +2481,12 @@ pg_capture_own_segment() {
       t = tolower(trim(s))
       return (t ~ /^[*_>#-]*[ \t]*(p0[ \t]*[:-]|p0([^0-9a-z_]|$)|\[p[0-3]\])/)
     }
+    # Where a BLOCK opens, as opposed to where a section inside one starts: [P2] is a section,
+    # a P0 line is the top of an answer. Mirrors isBlockOpen in bin/cdp-salvage.mjs.
+    function isblockopen(s,   t) {
+      t = tolower(trim(s))
+      return (t ~ /^[*_>#-]*[ \t]*(p0[ \t]*[:-]|p0([^0-9a-z_]|$)|\[p0\])/)
+    }
     {
       n++; line[n] = $0
       if ($0 ~ /^[ \t]*(```|~~~)/) { fenced = !fenced; next }
@@ -2446,7 +2498,10 @@ pg_capture_own_segment() {
         # that as a boundary floors the cut in the middle of the finding and publishes the suffix
         # with its own header deleted. Quoted, indented and fenced verdicts stay ownership
         # candidates (the model may format its real one that way) but never bound anything.
-        bound[n] = (!fenced && $0 !~ /^([ ][ ]|\t|[ ]*>)/)
+        # Half the answer only: the bytes reaching here came from innerText of a RENDERED page,
+        # where the blockquote and the fence are already gone (#166 gate r2 P1). The rest of the
+        # rule is applied in END, where the next verdict line is known.
+        plain[n] = (!fenced && $0 !~ /^([ ][ ]|\t|[ ]*>)/)
         p = index(low, "(run marker:")
         if (p > 0) {
           rest = substr($0, p + 12)
@@ -2461,6 +2516,19 @@ pg_capture_own_segment() {
       for (k = vcount; k >= 1; k--) if (echo[vidx[k]] == mk) { pick = k; break }
       if (pick == 0) exit 1
       vi = vidx[pick]
+      # #166 gate r2 P1: a bare verdict EARNS the right to bound a block, because the rendered
+      # text it was read from carries no quote or fence syntax to disqualify it by. A real
+      # terminator either CLAIMS a run - the "(run marker: ...)" token every answer in this
+      # protocol appends - or is followed by the next block P0 opening before the next verdict.
+      # An example quoted inside a finding has neither: what follows it is the rest of its own
+      # block. Mirrors verdictIndex in bin/cdp-salvage.mjs, which must agree byte for byte.
+      for (bk = 1; bk <= vcount; bk++) {
+        bv = vidx[bk]
+        bstop = (bk < vcount) ? vidx[bk + 1] : n + 1
+        bopens = 0
+        for (bi = bv + 1; bi < bstop; bi++) if (isblockopen(line[bi])) { bopens = 1; break }
+        bound[bv] = (plain[bv] && (echo[bv] != "" || bopens))
+      }
       # Nothing to cut unless some OTHER verdict really closes a block: an example quoted inside
       # this run own findings is not another answer, and rewriting on account of it would delete
       # the finding that wrote it.

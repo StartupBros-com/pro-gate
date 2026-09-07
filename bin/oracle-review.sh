@@ -2583,16 +2583,39 @@ if [ -n "$HARVEST_MARKER" ]; then
   # One preserve path for every harvest capture the engine refuses to publish (#54 r3-r14, #164):
   # the reservation, its TTL sweep, and the exit-9 contract are identical whatever the reason —
   # only the set-aside name, the operator message, and the status detail differ. Never returns.
-  harvest_preserve_capture() { # <aside-path> <error-message> <status-detail>
-    local aside="$1" message="$2" detail="$3" res_key ttl_miss
+  harvest_preserve_capture() { # <aside-path> <error-message> <status-detail> [class]
+    local aside="$1" message="$2" detail="$3" class="${4:-retryable}" res_key ttl_miss ttl_state
     mv "$HARVEST_TMP" "$aside" 2>/dev/null || rm -f "$HARVEST_TMP"
+    res_key="${RUN_MARKER#pg-run-}"; res_key="${res_key%-*-*}"
+    # #166 gate r2 P1: the two classes need OPPOSITE treatment here, and only one of them is
+    # evidence that a recoverable review is live.
+    #
+    # A `retryable` capture (complete, but with no marker echo) may well be an older answer read
+    # while ours is still generating, so re-asserting the reservation is honest — and the bounded
+    # miss ladder below is what eventually ends it.
+    #
+    # An `unattributable` one is the opposite: the page is finished, it names two runs, and every
+    # retry re-reads those same bytes and refuses them again. Re-writing the reservation for it
+    # zeroed the miss streak and refreshed the mtime that the ladder's spacing check reads, so the
+    # streak could never advance ("retained interval/3" forever, "retained 1/3" even at interval
+    # zero) — and the marker probe, which sees a COMPLETE conversation, records no miss either.
+    # The reservation therefore outlived its own TTL and kept redirecting every fresh run for this
+    # change back into a harvest that can only refuse. So: assert nothing, and let the capture's
+    # own durable expiry decide (pg_reservation_expire_unattributable).
+    if [ "$class" = unattributable ] && [ "${PRO_GATE_HARVEST_TTL_SWEEP:-1}" = 1 ]; then
+      ttl_state="$(pg_reservation_expire_unattributable "$RUN_MARKER")"
+      if [ "$ttl_state" = released ]; then
+        echo "ERROR: this capture cannot be attributed to this run alone and retrying re-reads the same page, so recovery is exhausted at the ${PRO_GATE_RESERVATION_TTL:-21600}s reservation TTL. The round remains charged, the set-aside capture is at $aside, and a fresh typed review is now eligible for this change." >&2
+        pg_status failed "unattributable capture past TTL; recovery ownership released, round retained"
+        pg_finish 6
+      fi
+      echo "[oracle-review] unattributable capture holds same-change recovery until its TTL (${ttl_state})." >&2
     # The exit-9 contract PROMISES a live reservation keyed to the real change; a harvest
     # can reach here for a marker whose reservation already released. An EMPTY key would
     # default to the literal "diff" and be undiscoverable (gate #54 r14): derive the key
     # from the marker, and fail CLOSED (state preserved, exit 3) when even the reservation
     # cannot be persisted — exit 9 must never claim protection it does not have.
-    res_key="${RUN_MARKER#pg-run-}"; res_key="${res_key%-*-*}"
-    if ! pg_reservation_write "$RUN_MARKER" "$res_key" "$OUT" 2>/dev/null; then
+    elif ! pg_reservation_write "$RUN_MARKER" "$res_key" "$OUT" 2>/dev/null; then
       PG_PRESERVE_STATE=1
       echo "ERROR: unbindable capture preserved, but its reservation could not be persisted ($PRO_GATE_HOME unwritable?). Tab and state KEPT; retry --harvest once the home is writable." >&2
       pg_status failed "unbindable capture; reservation write failed; state preserved"
@@ -2603,7 +2626,9 @@ if [ -n "$HARVEST_MARKER" ]; then
     # skip markers under active collection. Without it the harvest target could never expire
     # and #67's "a stranded change frees itself" property died for the very marker it was
     # written for. Done while we still hold the harvest lock, so no peer races the decision.
-    if [ "${PRO_GATE_HARVEST_TTL_SWEEP:-1}" = 1 ] && [ "$(pg_reservation_expire_if_stale "$RUN_MARKER")" = stale ]; then
+    # The unattributable class is deliberately NOT laddered: recording a confirmed-ABSENCE miss
+    # against a conversation we just read would be false evidence, and its expiry ran above.
+    if [ "$class" != unattributable ] && [ "${PRO_GATE_HARVEST_TTL_SWEEP:-1}" = 1 ] && [ "$(pg_reservation_expire_if_stale "$RUN_MARKER")" = stale ]; then
       ttl_miss="$(pg_reservation_note_miss "$RUN_MARKER")"
       if [ "$ttl_miss" = released ]; then
         echo "ERROR: this reservation is past its ${PRO_GATE_RESERVATION_TTL:-21600}s TTL and bounded marker probes proved no recoverable conversation. Recovery is exhausted; the round remains charged and a fresh typed review is eligible. The set-aside capture is at $aside." >&2
@@ -2643,8 +2668,9 @@ if [ -n "$HARVEST_MARKER" ]; then
     [ -n "${PG_CAPTURE_QUOTED:-}" ] && echo "[oracle-review] NOTE: this run's own findings mention another run's marker (${PG_CAPTURE_QUOTED}). Reported, not enforced — a review may legitimately quote one." >&2
     if [ "$HARVEST_BIND" = 2 ]; then
       harvest_preserve_capture "$OUT.crossfed.$$" \
-        "ERROR: harvested a review whose bytes cannot be attributed to this run alone (${PG_CAPTURE_FOREIGN}) — another run's answer reached this conversation. Nothing was published. Reservation and candidate kept. Retry --harvest; inspect $OUT.crossfed.$$." \
-        "harvested review carries another run's block (${PG_CAPTURE_FOREIGN}); reservation kept, retry"
+        "ERROR: harvested a review whose bytes cannot be attributed to this run alone (${PG_CAPTURE_FOREIGN}) — another run's answer reached this conversation. Nothing was published. Reservation and candidate kept until this reservation's TTL, after which a fresh typed review is eligible. Retry --harvest; inspect $OUT.crossfed.$$." \
+        "harvested review carries another run's block (${PG_CAPTURE_FOREIGN}); reservation kept until TTL" \
+        unattributable
     fi
     if pg_capture_nonce_ok "$HARVEST_TMP" "$RUN_MARKER"; then
       :  # positively bound to this run
