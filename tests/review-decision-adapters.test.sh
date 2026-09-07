@@ -181,8 +181,21 @@ for consumer in "${CONSUMERS[@]}"; do
     "$(grep -Fq -- '--out "$OUT" --timeout 60m' "$consumer" && grep -Fq -- '--out "$OUT" --timeout 45m' "$consumer" && grep -Fq -- '--out <out> --timeout 45m' "$consumer" && ! grep -Fq -- '--timeout 20m' "$consumer" && ! grep -Fq -- '--timeout 30m' "$consumer"; printf '%s' "$?")"
 done
 ENGINE="$HERE/../bin/oracle-review.sh"
+LIBSH="$HERE/../lib/pro-gate-lib.sh"
 check 'engine harvest hints carry the sized collection timeout, never the old fixed 20m' \
-  "$(grep -Fq 'HARVEST_HINT_TIMEOUT="${PRO_GATE_HARVEST_TIMEOUT:-45m}"' "$ENGINE" && grep -Fq 'TIMEOUT="${PRO_GATE_TIMEOUT:-60m}"' "$ENGINE" && ! grep -Fq -- '--timeout 20m' "$ENGINE"; printf '%s' "$?")"
+  "$(grep -Fq 'HARVEST_HINT_TIMEOUT="$(pg_harvest_hint_timeout)"' "$ENGINE" && grep -Fq 'TIMEOUT="${PRO_GATE_TIMEOUT:-60m}"' "$ENGINE" && ! grep -Fq -- '--timeout 20m' "$ENGINE"; printf '%s' "$?")"
+# The library prints operator-facing harvest hints too (pg_report_capacity_holders). Grepping only
+# the engine is how a hardcoded 20m survived the v0.41 sizing pass while this very check passed, so
+# EVERY shipped shell file is scanned for a stale fixed collection wait, not just the engine.
+STALE_WAIT_FILES=""
+for f in "$ENGINE" "$LIBSH" "$HERE/../daemon/daemon.sh"; do
+  grep -Fq -- '--timeout 20m' "$f" && STALE_WAIT_FILES="$STALE_WAIT_FILES $(basename "$f")"
+  grep -Fq -- '--timeout 30m' "$f" && STALE_WAIT_FILES="$STALE_WAIT_FILES $(basename "$f")"
+done
+check 'no shipped shell file hardcodes a pre-v0.41 collection or review wait' \
+  "$([ -z "$STALE_WAIT_FILES" ]; printf '%s' "$?")" "$STALE_WAIT_FILES"
+check 'the sized collection wait has one definition every renderer shares' \
+  "$(grep -Fq 'pg_harvest_hint_timeout() { echo "${PRO_GATE_HARVEST_TIMEOUT:-45m}"; }' "$LIBSH" && grep -Fq 'pg_harvest_hint_timeout)' "$LIBSH"; printf '%s' "$?")"
 
 check 'named product choice is the only prompt and is freshness-validated non-authoritative input' \
   "$(grep -Fq 'ask-named-product-choice is the only prompt.' "$SKILL" && grep -Fq 'freshness-validated' "$SKILL" && grep -Fq 'non-authoritatively' "$SKILL" && grep -Fq 're-enters after code or policy change' "$SKILL" && grep -Fq 'Malformed or stale selection stops.' "$SKILL"; printf '%s' "$?")"

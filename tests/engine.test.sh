@@ -5538,15 +5538,23 @@ check 'gate #148 r1 P1: two no-flock reclaimers of one dead guard owner never bo
 # An ownerless guard directory is one a holder died inside between mkdir and its marker, or
 # between its marker's removal and the rmdir; it is empty, so rmdir reclaims it without any
 # pathname-level deletion that could hit a replacement.
+#
+# r3 P1 refined WHEN that reclaim is allowed. "Ownerless" alone does not mean abandoned: a live
+# contender is ownerless for the instant between its mkdir and its marker write, and reclaiming it
+# there is what let two shells hold one guard. So the directory must also be older than
+# PRO_GATE_DIRLOCK_ORPHAN_GRACE, and this fixture ages it to represent the genuine crash this case
+# is about. The young-directory half of the same rule is asserted separately below; setting the
+# grace to 0 here would re-assert the unsafe behaviour rather than the intended one.
 (
   pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
   mkdir -p "$GUARD_RACE_LOCK.d"
+  touch -t 202001010000 "$GUARD_RACE_LOCK.d" 2>/dev/null
   PRO_GATE_HOME="$GUARD_RACE_HOME" PRO_GATE_RESERVATION_GUARD_WAIT=2 pg_reservation_guard_acquire; rc=$?
   owner=""; for f in "$GUARD_RACE_LOCK.d"/owner.*; do [ -e "$f" ] && owner="${f##*/owner.}"; done
   PRO_GATE_HOME="$GUARD_RACE_HOME" pg_reservation_guard_release
   [ "$rc" -eq 0 ] && [ "$owner" = "$BASHPID" ] && [ ! -d "$GUARD_RACE_LOCK.d" ]
 ); GUARD_RECLAIM_DEAD_RC=$?
-check 'gate #148 r1 P1: an ownerless empty guard directory is reclaimed by rmdir and then released cleanly' "$GUARD_RECLAIM_DEAD_RC"
+check 'gate #148 r1 P1: an abandoned ownerless guard directory is reclaimed by rmdir and then released cleanly' "$GUARD_RECLAIM_DEAD_RC"
 (
   pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
   sleep 60 & live=$!
@@ -5626,6 +5634,62 @@ check 'gate #148 r2 P1: an orphaned release never deletes a replacement live gua
   "a_parked=$GUARD_REL_A_PARKED b_in=$GUARD_REL_B_IN b_guard_alive=$GUARD_REL_B_GUARD_ALIVE c_rc=$GUARD_REL_C_RC log=$(tr '\n' ';' < "$GUARD_REL_LOG") dirs=$(ls -d "$GUARD_REL_LOCK.d"* 2>/dev/null | tr '\n' ' ')"
 check 'gate #148 r2 P1: the replacement holder releases its own guard after the orphaned rmdir failed' \
   "$([ ! -d "$GUARD_REL_LOCK.d" ]; echo $?)" "$(ls -d "$GUARD_REL_LOCK.d"* 2>/dev/null | tr '\n' ' ')"
+
+# gate #148 r3 P1: mkdir can fail for reasons that are NOT contention (a missing or unwritable
+# parent). Treating "the directory is not there" as a successful reclaim made acquire retry with no
+# sleep and no counter increment, so it spun at 100% CPU forever and never honoured its own wait
+# bound. The outer coreutils timeout is what turns a regression back into a fast failure instead of
+# a hung suite: without the fix this call never returns.
+GUARD_SPIN_HOME="$TDIR/home-guard-spin"; mkdir -p "$GUARD_SPIN_HOME"
+GUARD_SPIN_START=$(date +%s)
+/usr/bin/timeout 20 bash -c '
+  . "$1"
+  pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
+  PRO_GATE_RESERVATION_LOCK="$2" PRO_GATE_RESERVATION_GUARD_WAIT=3 pg_reservation_guard_acquire
+' _ "$HERE/../lib/pro-gate-lib.sh" "$GUARD_SPIN_HOME/absent-parent/in-progress.lock"
+GUARD_SPIN_RC=$?
+GUARD_SPIN_ELAPSED=$(( $(date +%s) - GUARD_SPIN_START ))
+check 'gate #148 r3 P1: a non-EEXIST mkdir failure honours the guard wait instead of spinning forever' \
+  "$([ "$GUARD_SPIN_RC" -eq 1 ] && [ "$GUARD_SPIN_ELAPSED" -lt 15 ]; echo $?)" \
+  "rc=$GUARD_SPIN_RC (124=timed out, i.e. spun) elapsed=${GUARD_SPIN_ELAPSED}s"
+
+# gate #148 r3 P1: a contender that has mkdir'd but not yet written its marker must not have the
+# directory reclaimed out from under it. When that happened, the contender's marker write landed in
+# a REPLACEMENT directory another shell had already claimed at the same pathname, and both shells
+# believed they held the guard. The reclaim helper must refuse a young unmarked directory.
+GUARD_YOUNG_HOME="$TDIR/home-guard-young"; mkdir -p "$GUARD_YOUNG_HOME"
+GUARD_YOUNG_DIR="$GUARD_YOUNG_HOME/in-progress.lock.d"
+mkdir -p "$GUARD_YOUNG_DIR"                      # A has mkdir'd and not yet marked
+pg_dirlock_reclaim_dead "$GUARD_YOUNG_DIR"; GUARD_YOUNG_RECLAIM_RC=$?
+: > "$GUARD_YOUNG_DIR/owner.1111"                # A resumes and writes its marker
+GUARD_YOUNG_OWNERS="$(pg_dirlock_owner_count "$GUARD_YOUNG_DIR")"
+check 'gate #148 r3 P1: a young unmarked guard directory is never reclaimed from under its creator' \
+  "$([ "$GUARD_YOUNG_RECLAIM_RC" -ne 0 ] && [ -d "$GUARD_YOUNG_DIR" ] && [ "$GUARD_YOUNG_OWNERS" = 1 ]; echo $?)" \
+  "reclaim_rc=$GUARD_YOUNG_RECLAIM_RC owners=$GUARD_YOUNG_OWNERS"
+# ...but a genuinely orphaned unmarked directory (older than the grace) is still reclaimable, or a
+# process that died between mkdir and marker would wedge the guard forever.
+GUARD_ORPHAN_DIR="$GUARD_YOUNG_HOME/orphan.lock.d"
+mkdir -p "$GUARD_ORPHAN_DIR"
+touch -t 202001010000 "$GUARD_ORPHAN_DIR" 2>/dev/null
+pg_dirlock_reclaim_dead "$GUARD_ORPHAN_DIR"; GUARD_ORPHAN_RC=$?
+check 'gate #148 r3 P1: an unmarked directory older than the orphan grace is still reclaimed' \
+  "$([ "$GUARD_ORPHAN_RC" -eq 0 ] && [ ! -d "$GUARD_ORPHAN_DIR" ]; echo $?)" "rc=$GUARD_ORPHAN_RC"
+
+# gate #148 r3 P2: a recycled pid must not read as a live owner. kill -0 alone would keep the guard
+# held forever once the OS hands a dead owner's pid to an unrelated live process, so the marker
+# carries pg_pid_token's start time and BOTH must match for the owner to count as alive.
+GUARD_TOK_DIR="$GUARD_YOUNG_HOME/token.lock.d"
+mkdir -p "$GUARD_TOK_DIR"
+printf 'not-the-start-time-of-this-pid' > "$GUARD_TOK_DIR/owner.$$"   # live pid, WRONG token
+pg_dirlock_reclaim_dead "$GUARD_TOK_DIR"; GUARD_TOK_RC=$?
+check 'gate #148 r3 P2: a live pid whose start-time token does not match is reclaimed, not trusted' \
+  "$([ "$GUARD_TOK_RC" -eq 0 ] && [ ! -d "$GUARD_TOK_DIR" ]; echo $?)" "rc=$GUARD_TOK_RC"
+GUARD_LIVE_DIR="$GUARD_YOUNG_HOME/live.lock.d"
+mkdir -p "$GUARD_LIVE_DIR"
+pg_pid_token "$$" > "$GUARD_LIVE_DIR/owner.$$"                        # live pid, CORRECT token
+pg_dirlock_reclaim_dead "$GUARD_LIVE_DIR"; GUARD_LIVE_RC=$?
+check 'gate #148 r3 P2: a live pid with a matching token still holds its guard' \
+  "$([ "$GUARD_LIVE_RC" -ne 0 ] && [ -d "$GUARD_LIVE_DIR" ]; echo $?)" "rc=$GUARD_LIVE_RC"
 
 # gate #148 r1 P2 (engine side): a --harvest/--recover with no --timeout takes its budget from
 # PRO_GATE_HARVEST_TIMEOUT (default 45m). The daemon's recovery now relies on exactly this instead

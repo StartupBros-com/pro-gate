@@ -173,7 +173,8 @@ done
 # repeat collection passes (6.56 per collected review). Defaults now cover the p90: 60m for a fresh
 # review, 45m per collection pass. PRO_GATE_TIMEOUT / PRO_GATE_HARVEST_TIMEOUT override; an
 # explicit --timeout always wins. Both stay far inside the 6h reservation TTL.
-HARVEST_HINT_TIMEOUT="${PRO_GATE_HARVEST_TIMEOUT:-45m}"
+# pg_harvest_hint_timeout is the single source for this default; the library prints hints too.
+HARVEST_HINT_TIMEOUT="$(pg_harvest_hint_timeout)"
 if [ -z "$TIMEOUT" ]; then
   if [ "$HARVEST_REQUESTED" = 1 ] || [ "$RECOVER_REQUESTED" = 1 ]; then
     TIMEOUT="$HARVEST_HINT_TIMEOUT"
@@ -3142,12 +3143,17 @@ ENGINE_ARGS+=(--browser-archive "${PRO_GATE_BROWSER_ARCHIVE:-never}")
 # oracle unless that env raises the cap to match (the ChatGPT account throttle, not oracle's
 # tab cap, is the real limiter, so raising it only helps a genuinely tolerant account).
 LOCKFILE="${PRO_GATE_LOCKFILE:-$PRO_GATE_HOME/oracle.lock}"
-LOCK_WAIT="${PRO_GATE_LOCK_WAIT:-2400}"
+# v0.41: sized with the review wait, not independently. A queued run waits for the holder of the
+# per-change lock, and that holder may now legitimately run for the full 60m fresh-review default
+# plus TIMEOUT_GRACE. The old 2400s (40m) therefore expired while the run it was waiting for was
+# still working, turning a normal long review into a spurious give-up for everyone behind it.
+LOCK_WAIT="${PRO_GATE_LOCK_WAIT:-3900}"
 MAX_CONC="${PRO_GATE_MAX_CONCURRENCY:-1}"
 EFF_CONC="$(pg_ramp_level "$MAX_CONC")"
 
 # Housekeeping: per-PR lock files are 0-byte and used to accumulate forever. Sweep ones
-# untouched for >24h — any legitimate holder finishes within the ~35 min hard cap. Same for
+# untouched for >24h — any legitimate holder finishes within the ~62 min hard cap (v0.41 sizing:
+# the 60m fresh-review default plus TIMEOUT_GRACE; this text said ~35 min under the old 30m). Same for
 # per-marker harvest locks (v0.20.2 dogfood left one stale for 10h; flock holders keep the
 # file's inode alive, so deleting an unheld file is always safe).
 find "$(dirname "$LOCKFILE")" -maxdepth 1 -name "$(basename "$LOCKFILE").pr-*" -mmin +1440 -delete 2>/dev/null || true

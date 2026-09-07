@@ -527,6 +527,11 @@ pg_reservation_dir() { echo "${PRO_GATE_RESERVATION_DIR:-$PRO_GATE_HOME/in-progr
 # record, destroying the manifest (gate #54 P1).
 pg_manifest_dir() { echo "${PRO_GATE_MANIFEST_DIR:-$PRO_GATE_HOME/manifests}"; }
 pg_reservation_lock() { echo "${PRO_GATE_RESERVATION_LOCK:-$PRO_GATE_HOME/in-progress.lock}"; }
+# The collection wait every operator-facing hint prints. It lives here, not in the engine, because
+# the library prints hints too (pg_report_capacity_holders): v0.41 sized the engine's hints but
+# left this one at the old fixed 20m, and the test that guards the sizing grepped only the engine,
+# so the drift was invisible. One helper, one default, every renderer.
+pg_harvest_hint_timeout() { echo "${PRO_GATE_HARVEST_TIMEOUT:-45m}"; }
 # Markers become filenames under PRO_GATE_HOME and lock paths; every character must be from the
 # safe class (in particular no "/" anywhere), not just the first one after the prefix.
 pg_reservation_marker_ok() {
@@ -1083,26 +1088,72 @@ pg_attempt_snapshot() { # host owner repo pr round-key [exclude-marker] -> canon
     '{artifact:{kind:$kind,path:$path},charged_spend_epoch:$epoch,cleanup_pending:$cleanup,fresh_eligible:$fresh,marker:$marker,out:$out,recoverable:$recoverable,source:$source,state:$state,target:{host:$host,owner:$owner,pr:$pr,repo:$repo,round_key:$key},terminal:$terminal}'
 }
 
-# pg_dirlock_reclaim_dead <lockdir>: reclaim a mkdir-spinlock directory whose every owner is dead,
-# or that carries no owner at all. Ownership is a marker file named owner.<pid> INSIDE the
-# directory, and this helper only ever (a) unlinks a dead marker by its exact name and (b) rmdir()s
-# the directory, which the kernel refuses unless it is empty. There is no rm -rf on a shared
-# pathname and no rename, so a slow reclaimer, or a remover orphaned by a holder that died
-# mid-release, can never delete a directory a live process has since re-created: that holder's
-# own marker makes the rmdir fail (gate #148 r1 P1: two reclaimers of one dead owner both entered;
-# r2 P1: an orphaned release deleted a replacement). The one window is a directory a contender has
-# mkdir'd but not yet marked; rmdir can take it, and the contender learns that when its marker
-# creation fails and simply tries again. Returns 0 when the directory is gone, 1 when a live owner
-# still holds it.
+# pg_dir_age_secs <dir>: seconds since <dir> was last modified, or failure when it cannot be read.
+# Creating the owner marker inside a directory updates that directory's mtime, so an UNMARKED
+# directory's age is the age of its mkdir.
+pg_dir_age_secs() {
+  local d="$1" mt now
+  mt="$(stat -c %Y "$d" 2>/dev/null || stat -f %m "$d" 2>/dev/null || true)"
+  case "$mt" in ''|*[!0-9]*) return 1;; esac
+  now="$(date +%s 2>/dev/null)"; case "$now" in ''|*[!0-9]*) return 1;; esac
+  echo $(( now - mt ))
+}
+
+# pg_dirlock_owner_count <dir>: how many owner.* markers the directory currently holds. A correctly
+# held guard has exactly one; two means a race let a second shell in and BOTH must stand down.
+pg_dirlock_owner_count() {
+  local d="$1" f n=0
+  for f in "$d"/owner.*; do [ -e "$f" ] && n=$(( n + 1 )); done
+  echo "$n"
+}
+
+# pg_dirlock_reclaim_dead <lockdir>: reclaim a mkdir-spinlock directory whose every owner is dead.
+# Ownership is a marker file named owner.<pid> INSIDE the directory whose CONTENTS are that pid's
+# start-time token, and this helper only ever (a) unlinks a dead marker by its exact name and
+# (b) rmdir()s the directory, which the kernel refuses unless it is empty. There is no rm -rf on a
+# shared pathname and no rename (gate #148 r1 P1, r2 P1).
+#
+# Three rules this helper must not lose, each of which cost a round:
+#
+#  1. ABSENCE IS NOT SUCCESS. The directory is probed first and a missing one returns 1. Reporting
+#     success for a directory that was never there made pg_reservation_guard_acquire spin forever
+#     at 100% CPU, ignoring its own wait bound, whenever mkdir failed for any reason other than
+#     EEXIST -- an unwritable or missing parent, for instance (v0.41 defect, reproduced).
+#  2. A RECYCLED PID IS NOT A LIVE OWNER. kill -0 alone wedges the guard permanently once the OS
+#     hands a dead owner's pid to an unrelated live process, so the marker carries pg_pid_token's
+#     process start time and liveness requires BOTH to match. This is the guard pg_lock has used
+#     since it started writing a `token` beside its `pid`; the v0.41 helper shipped without it.
+#  3. AN UNMARKED DIRECTORY IS NOT AN ORPHAN YET. A contender that has just mkdir'd is about to
+#     write its marker. Deleting the directory in that window let the contender's later marker
+#     write land inside a REPLACEMENT directory another process had already claimed, so two live
+#     shells each believed they held the guard (v0.41 defect, reproduced: the previous comment
+#     claimed "the contender learns that when its marker creation fails", but the write succeeds
+#     because the pathname was re-created). An unmarked directory is therefore only reclaimed once
+#     it has sat unmarked for PRO_GATE_DIRLOCK_ORPHAN_GRACE seconds -- a bound a live contender
+#     never reaches and a process that died between mkdir and marker always does.
+#
+# Returns 0 when the directory is gone, 1 when it is held or too young to judge.
 pg_dirlock_reclaim_dead() {
-  local lockdir="$1" f pid
+  local lockdir="$1" f pid tok had_marker=0 grace age
+  [ -d "$lockdir" ] || return 1
   for f in "$lockdir"/owner.*; do
     [ -e "$f" ] || continue
+    had_marker=1
     pid="${f##*/owner.}"
     case "$pid" in ''|*[!0-9]*) rm -f "$f" 2>/dev/null; continue;; esac
-    kill -0 "$pid" 2>/dev/null && return 1
+    if kill -0 "$pid" 2>/dev/null; then
+      tok="$(head -c 64 "$f" 2>/dev/null | tr -d '\n')"
+      # An unreadable or tokenless marker cannot be disproved: fail closed and leave it held.
+      [ -n "$tok" ] || return 1
+      [ "$tok" = "$(pg_pid_token "$pid" 2>/dev/null || true)" ] && return 1
+    fi
     rm -f "$f" 2>/dev/null
   done
+  if [ "$had_marker" = 0 ]; then
+    grace="${PRO_GATE_DIRLOCK_ORPHAN_GRACE:-5}"; case "$grace" in ''|*[!0-9]*) grace=5;; esac
+    age="$(pg_dir_age_secs "$lockdir")" || return 1
+    [ "$age" -ge "$grace" ] 2>/dev/null || return 1
+  fi
   rmdir "$lockdir" 2>/dev/null || [ ! -d "$lockdir" ]
 }
 
@@ -1136,16 +1187,40 @@ pg_reservation_guard_acquire() {
   PG_RESERVATION_GUARD_DIR="${lock}.d"
   # gate #148 r2 P1: $$ is the parent shell even inside a command substitution or subshell, so a
   # restore running under $( ) would publish an owner pid that can die while the real holder lives.
-  # BASHPID names the shell that actually holds the guard and performs the guarded mutation.
-  PG_RESERVATION_GUARD_OWNER="${BASHPID:-$$}"
-  local waited=0
+  # BASHPID names the shell that actually holds the guard and performs the guarded mutation, and it
+  # MUST be read by direct expansion here -- reading it inside $( ) would name the substitution's
+  # own short-lived subshell and reinstate exactly the defect it fixes.
+  #
+  # BASHPID is bash 4+. Stock macOS /bin/bash is 3.2, and macOS is also the platform with no flock,
+  # so the one shell that always reaches this fallback was the one silently falling back to $$ and
+  # re-opening r2 P1 (v0.41 defect). `sh -c 'echo $PPID'` runs in a forked child of whichever shell
+  # evaluates it, so its PPID is that shell: verified identical to BASHPID both at top level and
+  # inside a command substitution.
+  PG_RESERVATION_GUARD_OWNER="${BASHPID:-}"
+  [ -n "$PG_RESERVATION_GUARD_OWNER" ] \
+    || PG_RESERVATION_GUARD_OWNER="$(sh -c 'echo $PPID' 2>/dev/null || printf '%s' "$$")"
+  local waited=0 spins=0 max_spins
+  # Reclaim retries are not sleeps, so they need their own bound or a pathological alternation of
+  # dead owners loops without ever reaching the wait bound.
+  max_spins=$(( wait_s * 100 + 100 ))
   while :; do
     if mkdir "$PG_RESERVATION_GUARD_DIR" 2>/dev/null; then
-      # The marker can only fail to appear when a reclaimer rmdir'd our still-empty directory
-      # between the mkdir and this line; the directory is then no longer ours to hold.
-      : > "$PG_RESERVATION_GUARD_DIR/owner.$PG_RESERVATION_GUARD_OWNER" 2>/dev/null && return 0
+      # Publish the start-time token so a recycled pid cannot later impersonate this owner, then
+      # confirm we are the ONLY owner. A second marker means a reclaimer took our still-empty
+      # directory and another shell re-created it at the same pathname, in which case our write
+      # landed in a guard we do not hold: stand down and retry rather than return a false hold.
+      if printf '%s' "$(pg_pid_token "$PG_RESERVATION_GUARD_OWNER" 2>/dev/null || true)" \
+           > "$PG_RESERVATION_GUARD_DIR/owner.$PG_RESERVATION_GUARD_OWNER" 2>/dev/null \
+         && [ "$(pg_dirlock_owner_count "$PG_RESERVATION_GUARD_DIR")" = 1 ]; then
+        return 0
+      fi
+      rm -f "$PG_RESERVATION_GUARD_DIR/owner.$PG_RESERVATION_GUARD_OWNER" 2>/dev/null
       rmdir "$PG_RESERVATION_GUARD_DIR" 2>/dev/null
-    elif pg_dirlock_reclaim_dead "$PG_RESERVATION_GUARD_DIR"; then
+    elif [ -d "$PG_RESERVATION_GUARD_DIR" ] && pg_dirlock_reclaim_dead "$PG_RESERVATION_GUARD_DIR"; then
+      # mkdir failing while the directory does not exist is NOT contention (a missing or unwritable
+      # parent, say); it must fall through to the bounded wait instead of retrying forever.
+      spins=$(( spins + 1 ))
+      [ "$spins" -ge "$max_spins" ] && { PG_RESERVATION_GUARD_DIR=""; PG_RESERVATION_GUARD_OWNER=""; return 1; }
       continue
     fi
     waited=$(( waited + 1 ))
@@ -1588,7 +1663,7 @@ pg_report_capacity_holders() {
     esac
   done
   echo "  collect a finished one for FREE (no new spend, never re-run):" >&2
-  echo "    oracle-review.sh --harvest <marker> --out <path> --timeout 20m" >&2
+  echo "    oracle-review.sh --harvest <marker> --out <path> --timeout $(pg_harvest_hint_timeout)" >&2
 }
 
 # pg_reservation_state <marker>: echo the lifecycle state (8th field) of a reservation —
