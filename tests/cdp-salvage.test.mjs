@@ -1497,6 +1497,61 @@ const FOREIGN_ANSWER = (m) => [
   cdp.stop();
 }
 
+{ // #169 gate r1 P2: the fold above corrects the COMPARISON; it does not retract a conviction an
+  // older pro-gate already reached. That conviction persisted "<marker>\t<url>" to
+  // salvage-nonmatching.txt and deleted conversation-urls/<marker> — and both tab scans consult
+  // the blacklist BEFORE the folded comparison, while the remembered-URL branch has no memo left.
+  // So an already-convicted run stays unreachable after the upgrade, which is why v0.45.0's notes
+  // document a per-run correction instead of promising that a harvest heals it.
+  //
+  // These three checks ARE that paragraph's proof. If the first goes red because salvage recovers
+  // unaided, the release note is what changes; if either of the others goes red, the documented
+  // procedure no longer works and the note is wrong.
+  const CONVICTED_URL = 'https://chatgpt.com/c/mock-conversation';
+  const convicted = [
+    `run marker: ${MIXED_MARKER}`,
+    'P0: none',
+    'P1: none',
+    'P2: none',
+    'P3: none',
+    `VERDICT: SHIP — ours. (run marker: ${MIXED_MARKER.toLowerCase()})`,
+  ].join('\n');
+  // Another run's conviction, left in place throughout: the documented correction removes ONE
+  // line, and the recoveries below must succeed without touching anybody else's.
+  const strangersLine = 'pg-run-other-repo-42-1111111111-9\thttps://chatgpt.com/c/someone-else\n';
+  const writeBlacklist = (lines) => (home) =>
+    fs.writeFileSync(path.join(home, 'salvage-nonmatching.txt'), lines);
+
+  const stuck = await mockCdp(convicted);
+  const stuckResult = await runSalvage([MIXED_MARKER, '3'], stuck.port,
+    writeBlacklist(`${strangersLine}${MIXED_MARKER}\t${CONVICTED_URL}\n`));
+  check('a pre-upgrade cross-bind conviction still hides a case-drifted self-echo after the fold fix',
+    stuckResult.status !== 0 && !/VERDICT/.test(stuckResult.stdout ?? ''),
+    `status=${stuckResult.status} stdout=${stuckResult.stdout?.slice(0, 200)}`);
+  stuck.stop();
+
+  // Documented step 3, tab still open: dropping that one line is what lets the scan classify the
+  // conversation at all, and the fold then binds it.
+  const openTab = await mockCdp(convicted);
+  const openResult = await runSalvage([MIXED_MARKER, '20'], openTab.port, writeBlacklist(strangersLine));
+  check("dropping only that run's blacklist line recovers the review from an open tab",
+    openResult.status === 0 && /VERDICT: SHIP/.test(openResult.stdout ?? ''),
+    `status=${openResult.status} stderr=${openResult.stderr?.slice(-300)}`);
+  openTab.stop();
+
+  // ...and with no tab left, the restored memo is the only handle there is — which is why the
+  // documented correction rewrites conversation-urls/<marker> as well as dropping the line.
+  const noTab = await mockCdp('__NO_TABS__', [], { renderText: () => convicted });
+  const noTabResult = await runSalvage([MIXED_MARKER, '30'], noTab.port, (home) => {
+    writeBlacklist(strangersLine)(home);
+    seedMemo(MIXED_MARKER, CONVICTED_URL)(home);
+  });
+  check('restoring the URL memo recovers the review once no tab carries it',
+    noTabResult.status === 0 && /VERDICT: SHIP/.test(noTabResult.stdout ?? ''),
+    `status=${noTabResult.status} stderr=${noTabResult.stderr?.slice(-300)}`);
+  noTab.stop();
+}
+
 { // A still-generating conversation (our marker, NO completed verdict yet) must remain
   // "live", not be mistaken for a cross-bind: the foreign check only fires on a COMPLETE answer.
   // Its canonical scratch revalidation deliberately keeps sampling owned-incomplete evidence to
