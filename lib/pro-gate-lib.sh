@@ -2384,10 +2384,21 @@ pg_strip_nonce() {
 # the 24h sweeps: these are the durable record (bounded by review volume, a few KB each).
 # ─────────────────────────────────────────────────────────────────────────────
 pg_completed_dir() { echo "${PRO_GATE_COMPLETED_DIR:-$PRO_GATE_HOME/completed}"; }
+# Hash through STDIN so the pathname is invisible to the tool (#168). GNU sha256sum and
+# shasum -a 256 frame their output line around the filename and escape that WHOLE line with a
+# leading backslash when the name carries a backslash, a CR or a newline, so `awk '{print $1}'`
+# reads `\<hex>`; openssl prints `SHA2-256(<name>)= <hex>`, whose $NF is the name's own last
+# token once the name contains a newline. Either way the digest binds to nothing — not to the
+# same bytes hashed elsewhere, and not to itself on recovery: pg_publish_log_proof stores the
+# digest that pg_verified_log_lacks then recomputes, and a `\<hex>` is rejected by that reader's
+# own 64-hex shape check, so a transcript under such a path fails closed against itself.
+# The redirect belongs INSIDE a group whose stderr is discarded: a failed redirect is the
+# shell's own diagnostic, raised before a `2>` on the command itself is installed, so the naive
+# rewrite leaks `No such file or directory` for a missing file where the pathname form was silent.
 pg_sha256() {  # <file>: echo the hex digest, or nothing when no tool is available
-  if pg_have sha256sum; then sha256sum "$1" 2>/dev/null | awk '{print $1}'
-  elif pg_have shasum; then shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
-  elif pg_have openssl; then openssl dgst -sha256 "$1" 2>/dev/null | awk '{print $NF}'
+  if pg_have sha256sum; then { sha256sum < "$1" | awk '{print $1}'; } 2>/dev/null
+  elif pg_have shasum; then { shasum -a 256 < "$1" | awk '{print $1}'; } 2>/dev/null
+  elif pg_have openssl; then { openssl dgst -sha256 < "$1" | awk '{print $NF}'; } 2>/dev/null
   fi
 }
 # pg_signal_producer <signal> <pid>: signal Oracle's whole PROCESS GROUP, falling back to the pid

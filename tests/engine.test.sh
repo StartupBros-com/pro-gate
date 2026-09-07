@@ -1365,6 +1365,38 @@ ln -s "$LOG_TRANSCRIPT" "$LOG_PROOF_DIR/symlink.log"
 verified_log_rc "$LOG_PROOF_DIR/symlink.log" "$LOG_PROOF"; LOG_RC=$?
 check 'symlinked transcript fails closed' "$([ "$LOG_RC" -ne 0 ]; echo $?)" "rc=$LOG_RC"
 
+# #168: pg_sha256 must bind to the file's BYTES, never to its pathname. GNU sha256sum and
+# shasum -a 256 frame their output line around the filename and escape that WHOLE line with a
+# leading backslash when the name carries a backslash, a CR or a newline, so the old pathname
+# form published `\<hex>` — a value that matches nothing computed from the same bytes anywhere
+# else, INCLUDING this proof's own reader, whose 64-hex shape check then rejects it. A workdir
+# under such a directory therefore made every run fail closed against itself.
+PG_LIB="$HERE/../lib/pro-gate-lib.sh"
+ESC_DIR="$LOG_PROOF_DIR/esc\\dir"; mkdir -p "$ESC_DIR"
+ESC_TRANSCRIPT="$ESC_DIR/oracle.log"; ESC_PROOF="$ESC_DIR/oracle.sha256"
+printf 'pre-browser failure\n' > "$ESC_TRANSCRIPT"
+ESC_WANT="$(sha256sum < "$ESC_TRANSCRIPT" | awk '{print $1}')"
+ESC_GOT="$(bash -c '. "$1"; pg_sha256 "$2"' _ "$PG_LIB" "$ESC_TRANSCRIPT")"
+check '#168 digest under a backslash path is the file bytes, not the escaped output line' \
+  "$([ "$ESC_GOT" = "$ESC_WANT" ] && [[ "$ESC_GOT" =~ ^[0-9a-f]{64}$ ]]; echo $?)" "got=$ESC_GOT want=$ESC_WANT"
+CR_DIR="$(printf '%s/cr\rdir' "$LOG_PROOF_DIR")"; mkdir -p "$CR_DIR"
+printf 'pre-browser failure\n' > "$CR_DIR/oracle.log"
+CR_GOT="$(bash -c '. "$1"; pg_sha256 "$2"' _ "$PG_LIB" "$CR_DIR/oracle.log")"
+check '#168 digest under a carriage-return path matches the same bytes hashed elsewhere' \
+  "$([ "$CR_GOT" = "$ESC_WANT" ]; echo $?)" "got=$CR_GOT want=$ESC_WANT"
+bash -c '. "$1"; pg_publish_log_proof "$2" "$3"' _ "$PG_LIB" "$ESC_TRANSCRIPT" "$ESC_PROOF"
+verified_log_rc "$ESC_TRANSCRIPT" "$ESC_PROOF"; LOG_RC=$?
+check '#168 a proof published under an escaping path verifies its own transcript' \
+  "$([ "$LOG_RC" -eq 0 ]; echo $?)" "rc=$LOG_RC proof=$(cat "$ESC_PROOF" 2>/dev/null)"
+# Reading stdin must not start leaking the shell's OWN redirect diagnostic where the pathname
+# form was silent: in `cmd < missing 2>/dev/null` the open fails before that 2> is installed, so
+# the redirect lives inside a group whose stderr is discarded. Exit status stays unchanged too.
+MISSING_ERR="$LOG_PROOF_DIR/missing.stderr"
+MISSING_OUT="$(bash -c '. "$1"; pg_sha256 "$2"' _ "$PG_LIB" "$LOG_PROOF_DIR/absent.log" 2>"$MISSING_ERR")"; LOG_RC=$?
+check '#168 a missing file yields no digest, no stderr, and the same exit status as before' \
+  "$([ -z "$MISSING_OUT" ] && [ ! -s "$MISSING_ERR" ] && [ "$LOG_RC" -eq 0 ]; echo $?)" \
+  "rc=$LOG_RC out=$MISSING_OUT stderr=$(cat "$MISSING_ERR")"
+
 # Gate #72 r8 P1 end-to-end. These two runs are IDENTICAL except for the tee binary, which is the
 # only way to attribute the outcome to log capture alone: a pre-browser oracle failure that would
 # otherwise refund and retry must become charged and single-shot when its capture fails.
