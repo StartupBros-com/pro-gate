@@ -1288,6 +1288,160 @@ const MARKER = 'pg-run-test-1234567890-42';
       'result=' + JSON.stringify(finalized),
     );
   }
+
+  for (const [kind, code, suffix] of [
+    ['unsigned example', 'VERDICT: SHIP', ''],
+    ['verdict label fragment', 'VERDICT: FIX-FIRST', ' — ours. (run marker: ' + MARKER + ')'],
+    ['signed verdict fragment', 'VERDICT: FIX-FIRST (run marker: ' + MARKER + ')', ' — ours.'],
+  ]) {
+    const real = 'VERDICT: FIX-FIRST — ours. (run marker: ' + MARKER + ')';
+    const lines = ['P0: none', '[P1] src/real.sh:4 — regression', ...(suffix ? [] : [real]), code + suffix];
+    const last = node('p', code + suffix, [node('span', code, [node('code', code)])]);
+    const turns = [
+      node('div', 'run marker: ' + MARKER, [], 'user'),
+      node('div', lines.join('\n'), [...lines.slice(0, -1).map((line) => node('p', line)), last], 'assistant'),
+    ];
+    const document = {
+      body: node('body', turns.map((turn) => turn.innerText).join('\n'), turns),
+      querySelectorAll: () => turns,
+    };
+    const cdp = await mockCdp(document.body.innerText, [], { document });
+    const capture = await runSalvage([MARKER, '3'], cdp.port);
+    const expected = (suffix ? lines : lines.slice(0, -1)).join('\n') + '\n';
+    const binding = bindCapture(capture.stdout, MARKER);
+    check(
+      'DOM inline-code context distinguishes ' + kind + ' without changing authority',
+      capture.status === 0 && capture.stdout === expected && binding.status === 0,
+      'status=' + capture.status + ' bind=' + binding.status + ' stdout=' + JSON.stringify(capture.stdout),
+    );
+    cdp.stop();
+  }
+
+  const verdictNode = (marker, summary, wrapMarker) => {
+    const signature = '(run marker: ' + marker + ')';
+    const line = 'VERDICT: SHIP — ' + summary + '. ' + signature;
+    return node(
+      'p',
+      line,
+      wrapMarker ? [node('span', marker, [node('code', marker)])] : [],
+    );
+  };
+  const reviewDocument = (answerNodes) => {
+    const assistant = node(
+      'div',
+      answerNodes.map((answerNode) => answerNode.innerText).join('\n'),
+      answerNodes,
+      'assistant',
+    );
+    const turns = [node('div', 'run marker: ' + MARKER, [], 'user'), assistant];
+    return {
+      body: node('body', turns.map((turn) => turn.innerText).join('\n'), turns),
+      querySelectorAll: () => turns,
+    };
+  };
+
+  {
+    const answerNodes = [node('p', 'P0: none'), verdictNode(MARKER, 'ours', true)];
+    const answer = answerNodes.map((answerNode) => answerNode.innerText).join('\n');
+    const document = reviewDocument(answerNodes);
+    const cdp = await mockCdp(document.body.innerText, [], { document });
+    const capture = await runSalvage([MARKER, '3'], cdp.port);
+    check(
+      'DOM code-wrapped own marker preserves exact review bytes',
+      capture.status === 0 && capture.stdout === answer + '\n',
+      'status=' + capture.status + ' stdout=' + JSON.stringify(capture.stdout),
+    );
+    const binding = bindCapture(capture.stdout, MARKER);
+    check(
+      'DOM code-wrapped own marker passes shell binding unchanged',
+      binding.status === 0 && binding.retained === capture.stdout,
+      'status=' + binding.status + ' stderr=' + binding.stderr,
+    );
+    const probe = await runSalvage(['--probe', MARKER, '3'], cdp.port);
+    check(
+      'DOM code-wrapped own marker proves completed review ownership',
+      probe.status === 0 && probe.stderr.includes('probe-state: complete'),
+      'status=' + probe.status + ' stderr=' + probe.stderr,
+    );
+    cdp.stop();
+    const fixture = organizerExpressionFixture(document.body.innerText, { document });
+    const expression = buildRenameConversationExpression('unchanged title', {
+      marker: MARKER,
+      conversationUrl: 'https://chatgpt.com/c/mock-conversation',
+      mutationToken: 'dom-code-own.finalize',
+      mutationExpiresAt: Date.now() + 10_000,
+      expectedReview: durableReview(capture.stdout, MARKER),
+    });
+    const finalized = await runInNewContext(expression, fixture.context);
+    check(
+      'independent finalization guard accepts DOM code-wrapped own marker bytes',
+      finalized.status === 'already' && fixture.sidebarReads() > 0 && fixture.events.length === 0,
+      'result=' + JSON.stringify(finalized),
+    );
+  }
+
+  {
+    const foreign = 'pg-run-other-repo-2619-1111111111-9';
+    const ours = [node('p', 'P0: none'), verdictNode(MARKER, 'ours', false)];
+    const theirs = [
+      node('p', '[P0] other/a.ts:1 — foreign finding'),
+      verdictNode(foreign, 'theirs', true),
+    ];
+    for (const [layout, answerNodes] of [
+      ['foreign first', [...theirs, ...ours]],
+      ['foreign last', [...ours, ...theirs]],
+    ]) {
+      const answer = answerNodes.map((answerNode) => answerNode.innerText).join('\n');
+      const document = reviewDocument(answerNodes);
+      const cdp = await mockCdp(document.body.innerText, [], { document });
+      const capture = await runSalvage([MARKER, '3'], cdp.port);
+      check(
+        'DOM code-wrapped foreign marker preserves mixed review bytes (' + layout + ')',
+        capture.status === 0 && capture.stdout === answer + '\n',
+        'status=' + capture.status + ' stdout=' + JSON.stringify(capture.stdout),
+      );
+      const binding = bindCapture(capture.stdout, MARKER);
+      check(
+        'DOM code-wrapped foreign marker fails shell binding unchanged (' + layout + ')',
+        binding.status === 2 && binding.retained === capture.stdout,
+        'status=' + binding.status + ' stderr=' + binding.stderr,
+      );
+      const probe = await runSalvage(['--probe', MARKER, '3'], cdp.port);
+      check(
+        'DOM code-wrapped foreign marker keeps probe generating (' + layout + ')',
+        probe.status === 0 &&
+          probe.stderr.includes('probe-state: generating') &&
+          !probe.stderr.includes('probe-state: complete'),
+        'status=' + probe.status + ' stderr=' + probe.stderr,
+      );
+      cdp.stop();
+      for (const action of ['rename', 'archive']) {
+        const fixture = organizerExpressionFixture(document.body.innerText, { document });
+        const target = {
+          marker: MARKER,
+          conversationUrl: 'https://chatgpt.com/c/mock-conversation',
+          mutationToken: 'dom-code-mixed.' + action + '.' + layout.replace(' ', '-'),
+          mutationExpiresAt: Date.now() + 10_000,
+          expectedReview: action === 'archive'
+            ? durableReview(ours.map((answerNode) => answerNode.innerText).join('\n'), MARKER)
+            : null,
+        };
+        const expression = action === 'rename'
+          ? buildRenameConversationExpression('unchanged title', target)
+          : buildArchiveConversationExpression(target);
+        const result = await runInNewContext(expression, fixture.context);
+        check(
+          'independent ' + action + ' guard rejects DOM code-wrapped mixed review (' + layout + ')',
+          result.status === 'skipped' &&
+            result.reason === 'target-mixed-review' &&
+            fixture.sidebarReads() === 0 &&
+            fixture.events.length === 0,
+          'result=' + JSON.stringify(result) + ' events=' + fixture.events,
+        );
+      }
+    }
+  }
+
   const answer = [
     'P0: none',
     example,

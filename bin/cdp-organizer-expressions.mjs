@@ -17,9 +17,16 @@ export const ORGANIZER_MUTATION_LEASE_MS = 10_000;
 export function readReviewText(document, marker) {
   const exact = (value) => [...value.matchAll(/pg-run-[A-Za-z0-9.-]+/g)].some((match) =>
     match[0] === marker && !/[A-Za-z0-9.-]/.test(value[match.index - 1] ?? ''));
-  const read = (node) => {
+  const read = (node, before = '', after = '') => {
     const text = node?.innerText ?? node?.textContent ?? '';
-    if (node?.matches?.('blockquote, pre, code')) return text.split('\n').map((line) => '> ' + line).join('\n');
+    // Inline fragments belong to the surrounding verdict/signature. Only a complete code
+    // example on its own rendered line gets reference context, with or without a signature.
+    const completeVerdictExample = node?.matches?.('code') && !before.trim() && !after.trim() &&
+      text.split('\n').some((line) =>
+        /^[*_# \t-]*VERDICT[*_ \t]*:[*_ \t]*(ship|fix-first|needs-discussion)([^a-z0-9_-]|$)/i.test(line));
+    if (node?.matches?.('blockquote, pre') || completeVerdictExample) {
+      return text.split('\n').map((line) => '> ' + line).join('\n');
+    }
     let cursor = 0;
     let result = '';
     for (const child of node?.children ?? []) {
@@ -27,7 +34,9 @@ export function readReviewText(document, marker) {
       if (!original) continue;
       const at = text.indexOf(original, cursor);
       if (at < 0) continue;
-      result += text.slice(cursor, at) + read(child);
+      const lineBefore = (before + text.slice(0, at)).split('\n').at(-1);
+      const lineAfter = (text.slice(at + original.length) + after).split('\n')[0];
+      result += text.slice(cursor, at) + read(child, lineBefore, lineAfter);
       cursor = at + original.length;
     }
     return result + text.slice(cursor);
@@ -38,7 +47,7 @@ export function readReviewText(document, marker) {
     if (turns[i].getAttribute('data-message-author-role') === 'user' && exact(turns[i].innerText ?? '')) prompt = i;
   }
   if (prompt >= 0) return {
-    text: 'run marker: ' + marker + '\n' + turns.slice(prompt + 1).map(read).join('\n\n'),
+    text: 'run marker: ' + marker + '\n' + turns.slice(prompt + 1).map((turn) => read(turn)).join('\n\n'),
     promptAt: 0,
   };
   return { text: read(document.body), promptAt: null };

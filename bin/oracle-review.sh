@@ -409,7 +409,7 @@ pg_review_decision_cli() {
   local input_marker="" input_record="" input_digest="" f marker candidate candidate_relation desired_relation exact=false active_marker="" active_state=none
   local endpoint reviewed manifest confirmation endpoint_digest reviewed_digest manifest_digest confirmation_digest lineage mode ship_digest
   local reservation_marker="" reservation_state=none governor_granted=false completed='[]' prior_candidates='[]' prior_review result artifact artifact_digest canonical
-  local facts decision effect_ok=false prospective exact_inputs='[]' choice_candidates='[]' choice_outcomes='[]' choice_selected="" choice_snapshot="" selection="" selection_supplied=false current_verdict=NONE current_canonical="" effect_input attempt_snapshot attempt_source
+  local facts decision effect_ok=false prospective exact_inputs='[]' choice_candidates='[]' choice_outcomes='[]' choice_selected="" choice_snapshot="" selection="" selection_supplied=false current_verdict=NONE current_canonical="" effect_input attempt_snapshot attempt_source parsed_verdict stored_verdict
 
   pg_have jq || { echo 'ERROR: review-decision/v1 requires jq' >&2; return 2; }
   repo="${REPO:-$(pwd)}"
@@ -523,6 +523,17 @@ pg_review_decision_cli() {
     input_digest="$(pg_review_sha256_text "$candidate")"
     jq -e --arg ib "$input_digest" --arg digest "$artifact_digest" \
       '.input_binding_digest==$ib and .artifact.digest==$digest' <<<"$result" >/dev/null 2>&1 || continue
+    stored_verdict="$(jq -r .verdict <<<"$result")"
+    parsed_verdict="$(pg_extract_verdict "$artifact")"
+    if [ "$stored_verdict" != "$parsed_verdict" ]; then
+      echo "ERROR: result binding verdict $stored_verdict disagrees with parsed artifact verdict ${parsed_verdict:-NONE} for $marker; artifact=completed/$marker binding=review-result-bindings/$marker. Stop concurrent writers, archive the original binding outside the active result directory without deleting it, then rerun the query and apply its collect-existing-result effect." >&2
+      if [ "$exact" = true ]; then
+        completed="$(jq -cS --arg marker "$marker" --arg artifact "$artifact_digest" \
+          --argjson epoch "$(jq -r .charged_spend_epoch <<<"$candidate")" \
+          '. + [{applicable:true,artifact_digest:$artifact,binding_valid:true,canonical_identity:$marker,charged_spend_epoch:$epoch,collected:true,legacy:false,marker:$marker,provenance_valid:false,verdict:"NONE"}]' <<<"$completed")"
+      fi
+      continue
+    fi
     canonical="$(pg_review_result_binding_digest "$marker" 2>/dev/null || true)"
     [ -n "$canonical" ] || continue
 

@@ -5199,6 +5199,117 @@ check 'result-binding repair is idempotent and does not mutate canonical bytes' 
   "$([ "$REPAIR_REPLAY_RC" -eq 0 ] && [ "$(PRO_GATE_HOME="$DECISION_HOME" pg_review_result_binding_digest "$FULL_MARKER")" = "$REPAIR_BINDING_DIGEST" ] && cmp -s "$DECISION_HOME/completed/$FULL_MARKER" "$DECISION_HOME/completed/$FULL_MARKER"; echo $?)" \
   "rc=$REPAIR_REPLAY_RC binding=$(PRO_GATE_HOME="$DECISION_HOME" pg_review_result_binding_read "$FULL_MARKER" 2>/dev/null)"
 
+# Legacy result bindings can remain structurally and digest-valid after verdict extraction evolves.
+# Re-resolution must compare the current parsed verdict before either exact or prior admission.
+mismatch_result() { # marker input stored-verdict artifact
+  local marker="$1" input="$2" stored="$3" artifact="$4" input_digest artifact_digest proof
+  input_digest="$(printf '%s' "$input" | sha256sum | awk '{print $1}')"
+  artifact_digest="$(sha256sum "$artifact" | awk '{print $1}')"
+  proof=null
+  if [ "$stored" = SHIP ]; then
+    proof="$(jq -cnS --arg base "$PROOF_BASE" --arg head "$PROOF_HEAD" --arg digest "$PROOF_RAW_DIGEST" '{base_oid:$base,diff_digest:$digest,head_oid:$head}')"
+  fi
+  jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg marker "$marker" --arg digest "$artifact_digest" \
+    --arg ib "$input_digest" --arg verdict "$stored" --argjson proof "$proof" \
+    '{accepted_epoch:1700013999,artifact:{digest:$digest,path:("completed/"+$marker)},contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,input_binding_digest:$ib,input_binding_identity:$marker,marker:$marker,named_choice:null,provenance:{outcome:"accepted",validated_epoch:1700013999},record_type:"review-result-binding/v1",record_version:1,ship_proof:$proof,verdict:$verdict}'
+}
+MISMATCH_CASE=0
+for STORED_VERDICT in SHIP FIX-FIRST NEEDS-DISCUSSION; do
+  for PARSED_VERDICT in SHIP FIX-FIRST NEEDS-DISCUSSION; do
+    [ "$STORED_VERDICT" = "$PARSED_VERDICT" ] && continue
+    MISMATCH_CASE=$((MISMATCH_CASE + 1))
+    MISMATCH_HOME="$TDIR/home-verdict-mismatch-$MISMATCH_CASE"
+    MISMATCH_MARKER="pg-run-acme-widgets-1983-17000131${MISMATCH_CASE}-${MISMATCH_CASE}"
+    MISMATCH_INPUT="$(jq -cS --arg marker "$MISMATCH_MARKER" --argjson epoch "17000131${MISMATCH_CASE}" '.marker=$marker | .charged_spend_epoch=$epoch' <<<"$FULL_BINDING")"
+    mkdir -p "$MISMATCH_HOME/completed"
+    PRO_GATE_HOME="$MISMATCH_HOME" pg_review_input_binding_write "$MISMATCH_MARKER" "$MISMATCH_INPUT"
+    if [ "$STORED_VERDICT" = SHIP ] && [ "$PARSED_VERDICT" = FIX-FIRST ]; then
+      printf 'P0: none\nP1: none\n> VERDICT: SHIP — quoted legacy example. (run marker: %s)\nVERDICT: FIX-FIRST — current parser decision. (run marker: %s)\n' \
+        "$FOREIGN164" "$MISMATCH_MARKER" > "$MISMATCH_HOME/completed/$MISMATCH_MARKER"
+      MIGRATION_HOME="$MISMATCH_HOME"; MIGRATION_MARKER="$MISMATCH_MARKER"
+    else
+      printf 'P0: none\nP1: none\nVERDICT: %s — current parser decision. (run marker: %s)\n' \
+        "$PARSED_VERDICT" "$MISMATCH_MARKER" > "$MISMATCH_HOME/completed/$MISMATCH_MARKER"
+    fi
+    MISMATCH_RESULT="$(mismatch_result "$MISMATCH_MARKER" "$MISMATCH_INPUT" "$STORED_VERDICT" "$MISMATCH_HOME/completed/$MISMATCH_MARKER")"
+    PRO_GATE_HOME="$MISMATCH_HOME" pg_review_result_binding_write "$MISMATCH_MARKER" "$MISMATCH_RESULT"
+    cp "$MISMATCH_HOME/completed/$MISMATCH_MARKER" "$MISMATCH_HOME/artifact.before"
+    cp "$MISMATCH_HOME/review-result-bindings/$MISMATCH_MARKER" "$MISMATCH_HOME/binding.before"
+    env PRO_GATE_HOME="$MISMATCH_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+      bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
+      >"$TDIR/verdict-mismatch-$MISMATCH_CASE-query.json" 2>"$TDIR/verdict-mismatch-$MISMATCH_CASE-query.err"
+    MISMATCH_QUERY_RC=$?
+    env PRO_GATE_HOME="$MISMATCH_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+      bash "$ENGINE" --review-decision --review-decision-effect "$TDIR/verdict-mismatch-$MISMATCH_CASE-query.json" --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
+      >"$TDIR/verdict-mismatch-$MISMATCH_CASE-effect.json" 2>"$TDIR/verdict-mismatch-$MISMATCH_CASE-effect.err"
+    MISMATCH_EFFECT_RC=$?
+    check "stored $STORED_VERDICT cannot override parsed $PARSED_VERDICT on exact replay" \
+      "$([ "$MISMATCH_QUERY_RC" -eq 0 ] && [ "$MISMATCH_EFFECT_RC" -eq 0 ] \
+         && jq -e '.action=="stop-without-new-review" and .reason=="invalid-result-provenance" and (.facts.completed_results | length)==1 and .facts.completed_results[0].collected and (.facts.completed_results[0].provenance_valid|not) and .facts.completed_results[0].verdict=="NONE"' "$TDIR/verdict-mismatch-$MISMATCH_CASE-query.json" >/dev/null 2>&1 \
+         && cmp -s "$TDIR/verdict-mismatch-$MISMATCH_CASE-query.json" "$TDIR/verdict-mismatch-$MISMATCH_CASE-effect.json"; echo $?)" \
+      "query_rc=$MISMATCH_QUERY_RC effect_rc=$MISMATCH_EFFECT_RC query=$(cat "$TDIR/verdict-mismatch-$MISMATCH_CASE-query.json") stderr=$(cat "$TDIR/verdict-mismatch-$MISMATCH_CASE-query.err" "$TDIR/verdict-mismatch-$MISMATCH_CASE-effect.err")"
+    check "stored $STORED_VERDICT versus parsed $PARSED_VERDICT preserves artifact and binding bytes" \
+      "$([ -s "$TDIR/verdict-mismatch-$MISMATCH_CASE-query.err" ] \
+         && grep -qF "result binding verdict $STORED_VERDICT disagrees with parsed artifact verdict $PARSED_VERDICT" "$TDIR/verdict-mismatch-$MISMATCH_CASE-query.err" \
+         && grep -qF "$MISMATCH_MARKER" "$TDIR/verdict-mismatch-$MISMATCH_CASE-query.err" \
+         && cmp -s "$MISMATCH_HOME/completed/$MISMATCH_MARKER" "$MISMATCH_HOME/artifact.before" \
+         && cmp -s "$MISMATCH_HOME/review-result-bindings/$MISMATCH_MARKER" "$MISMATCH_HOME/binding.before"; echo $?)" \
+      "query_stderr=$(cat "$TDIR/verdict-mismatch-$MISMATCH_CASE-query.err")"
+  done
+done
+
+PRIOR_MISMATCH_HOME="$TDIR/home-prior-verdict-mismatch"
+PRIOR_MISMATCH_MARKER='pg-run-acme-widgets-1983-1700013200-20'
+PRIOR_MISMATCH_INPUT="$(jq -cS --arg marker "$PRIOR_MISMATCH_MARKER" '.marker=$marker | .charged_spend_epoch=1700013200 | .evidence.proof.endpoint_digest="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' <<<"$FULL_BINDING")"
+mkdir -p "$PRIOR_MISMATCH_HOME/completed"
+PRO_GATE_HOME="$PRIOR_MISMATCH_HOME" pg_review_input_binding_write "$PRIOR_MISMATCH_MARKER" "$PRIOR_MISMATCH_INPUT"
+printf 'P0: none\nP1: none\nVERDICT: FIX-FIRST — stale prior result. (run marker: %s)\n' "$PRIOR_MISMATCH_MARKER" > "$PRIOR_MISMATCH_HOME/completed/$PRIOR_MISMATCH_MARKER"
+PRIOR_MISMATCH_RESULT="$(mismatch_result "$PRIOR_MISMATCH_MARKER" "$PRIOR_MISMATCH_INPUT" SHIP "$PRIOR_MISMATCH_HOME/completed/$PRIOR_MISMATCH_MARKER")"
+PRO_GATE_HOME="$PRIOR_MISMATCH_HOME" pg_review_result_binding_write "$PRIOR_MISMATCH_MARKER" "$PRIOR_MISMATCH_RESULT"
+env PRO_GATE_HOME="$PRIOR_MISMATCH_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+  bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
+  >"$TDIR/prior-verdict-mismatch.json" 2>"$TDIR/prior-verdict-mismatch.err"
+PRIOR_MISMATCH_RC=$?
+check 'a verdict-mismatched prior candidate is not admitted as review history' \
+  "$([ "$PRIOR_MISMATCH_RC" -eq 0 ] && jq -e '.action=="run-granted-review" and .facts.prior_review.marker=="" and .facts.prior_review.verdict=="NONE"' "$TDIR/prior-verdict-mismatch.json" >/dev/null 2>&1 \
+     && grep -qF "$PRIOR_MISMATCH_MARKER" "$TDIR/prior-verdict-mismatch.err"; echo $?)" \
+  "rc=$PRIOR_MISMATCH_RC output=$(cat "$TDIR/prior-verdict-mismatch.json") stderr=$(cat "$TDIR/prior-verdict-mismatch.err")"
+
+# Explicit migration preserves both original records: with writers stopped, move only the binding
+# outside the active store, then use the ordinary collect effect to rebuild from unchanged bytes.
+MIGRATION_ARCHIVE="$MIGRATION_HOME/review-result-bindings-archive"
+mkdir -p "$MIGRATION_ARCHIVE"
+mv "$MIGRATION_HOME/review-result-bindings/$MIGRATION_MARKER" "$MIGRATION_ARCHIVE/$MIGRATION_MARKER"
+env PRO_GATE_HOME="$MIGRATION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+  bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
+  >"$TDIR/verdict-migration-collect.json" 2>"$TDIR/verdict-migration-collect.err"
+MIGRATION_COLLECT_RC=$?
+env PRO_GATE_HOME="$MIGRATION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+  bash "$ENGINE" --review-decision --review-decision-effect "$TDIR/verdict-migration-collect.json" --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
+  >"$TDIR/verdict-migration-effect.json" 2>"$TDIR/verdict-migration-effect.err"
+MIGRATION_EFFECT_RC=$?
+MIGRATION_REPAIRED="$(PRO_GATE_HOME="$MIGRATION_HOME" pg_review_result_binding_read "$MIGRATION_MARKER" 2>/dev/null || true)"
+MIGRATION_REPAIRED_DIGEST="$(PRO_GATE_HOME="$MIGRATION_HOME" pg_review_result_binding_digest "$MIGRATION_MARKER" 2>/dev/null || true)"
+env PRO_GATE_HOME="$MIGRATION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+  bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
+  >"$TDIR/verdict-migration-replay-a.json" 2>"$TDIR/verdict-migration-replay-a.err"
+env PRO_GATE_HOME="$MIGRATION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+  bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
+  >"$TDIR/verdict-migration-replay-b.json" 2>"$TDIR/verdict-migration-replay-b.err"
+check 'archival plus normal collect repairs a mismatched legacy binding without losing evidence' \
+  "$([ "$MIGRATION_COLLECT_RC" -eq 0 ] && [ "$MIGRATION_EFFECT_RC" -eq 0 ] \
+     && jq -e --arg marker "$MIGRATION_MARKER" '.action=="collect-existing-result" and .effect_request.applicable_ref==$marker' "$TDIR/verdict-migration-collect.json" >/dev/null 2>&1 \
+     && jq -e '.verdict=="FIX-FIRST" and .ship_proof==null' <<<"$MIGRATION_REPAIRED" >/dev/null 2>&1 \
+     && cmp -s "$MIGRATION_HOME/completed/$MIGRATION_MARKER" "$MIGRATION_HOME/artifact.before" \
+     && cmp -s "$MIGRATION_ARCHIVE/$MIGRATION_MARKER" "$MIGRATION_HOME/binding.before"; echo $?)" \
+  "collect_rc=$MIGRATION_COLLECT_RC effect_rc=$MIGRATION_EFFECT_RC binding=$MIGRATION_REPAIRED stderr=$(cat "$TDIR/verdict-migration-collect.err" "$TDIR/verdict-migration-effect.err")"
+check 'repaired verdict binding has stable replay bytes and routes by the parsed verdict' \
+  "$([ -n "$MIGRATION_REPAIRED_DIGEST" ] \
+     && [ "$(PRO_GATE_HOME="$MIGRATION_HOME" pg_review_result_binding_digest "$MIGRATION_MARKER")" = "$MIGRATION_REPAIRED_DIGEST" ] \
+     && cmp -s "$TDIR/verdict-migration-replay-a.json" "$TDIR/verdict-migration-replay-b.json" \
+     && jq -e '.action=="fix-review-findings" and .reason=="review-findings-require-fix"' "$TDIR/verdict-migration-replay-a.json" >/dev/null 2>&1; echo $?)" \
+  "replay=$(cat "$TDIR/verdict-migration-replay-a.json") stderr=$(cat "$TDIR/verdict-migration-replay-a.err" "$TDIR/verdict-migration-replay-b.err")"
+
 # A prior accepted SHIP with a matching digest must still pass current ownership validation.
 # Recompute the fixture binding digest so this cannot pass by relying on unrelated hash mismatch.
 cp "$DECISION_HOME/completed/$FULL_MARKER" "$TDIR/ownership-clean-artifact"

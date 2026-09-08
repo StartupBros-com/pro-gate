@@ -71,6 +71,25 @@ artifact bytes. A mixed legacy artifact remains intact on disk and is refused th
 provenance-failure path. A stored result binding or digest proves which bytes were saved, not
 that those bytes meet the replacement ownership policy.
 
+### Repairing a legacy verdict-binding mismatch
+
+If `--review-decision` reports that a stored result-binding verdict disagrees with the verdict now
+parsed from its artifact, preserve both records and rebuild only the active binding:
+
+1. Stop concurrent writers for that marker. Do not edit the artifact or binding in place.
+2. Move `$PRO_GATE_HOME/review-result-bindings/<marker>` to a durable archive directory outside
+   `$PRO_GATE_HOME/review-result-bindings/`. This archives the original binding rather than deleting
+   it; retain the unchanged `$PRO_GATE_HOME/completed/<marker>` beside the archived evidence.
+3. Repeat the same `--review-decision` query with the original repository, PR, input mode, diff, and
+   evidence files. Confirm it returns `collect-existing-result` for `<marker>`.
+4. Pass that saved decision back with `--review-decision-effect`. The existing collect effect parses
+   the unchanged artifact and installs a new immutable binding with the current verdict.
+5. Repeat the query. It must stably route by the parsed verdict; retain the archived original binding
+   for audit evidence.
+
+This is an explicit operator migration, not an automatic rewrite: a plain query or mismatched effect
+leaves both active records byte-for-byte unchanged.
+
 Rejection is not lifecycle proof. It does not release a reservation, refund a charge, delete
 state, or make a fresh paid review eligible after a timeout. An absent spinner or verdict and
 repeated refusal do not establish that the review is gone. Existing authoritative lifecycle
