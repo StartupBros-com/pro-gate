@@ -62,9 +62,13 @@ daemon_run_review_worker(){ # saved run-granted-review decision-file
   # own sized default -- and therefore a machine-wide PRO_GATE_TIMEOUT, which README and
   # .env.example both document as THE fresh-review default -- could never reach a daemon-launched
   # review. Pass a timeout only when the operator configured one; otherwise let the engine size it.
+  # ${arr[@]+...} and not a bare "${arr[@]}": this file runs under `set -u` (line 9), and expanding
+  # a zero-length array bare is an "unbound variable" abort before bash 4.4 -- which includes the
+  # stock macOS /bin/bash 3.2 this release's no-flock guard path exists for. Unset is the DEFAULT
+  # here, so the bare form would fail on the common path, not an edge case.
   local review_timeout=()
   [ -z "${PRO_REVIEW_ENGINE_TIMEOUT:-}" ] || review_timeout=(--timeout "$PRO_REVIEW_ENGINE_TIMEOUT")
-  printf -v command_text '%q ' "$DD_ENGINE" --review-decision --review-decision-effect "$decision" --pr "$DD_NUM" --repo "$DD_WORKTREE" "${DD_INPUT_ARGS[@]}" --out "$DD_LOG.review" "${review_timeout[@]}"
+  printf -v command_text '%q ' "$DD_ENGINE" --review-decision --review-decision-effect "$decision" --pr "$DD_NUM" --repo "$DD_WORKTREE" "${DD_INPUT_ARGS[@]}" --out "$DD_LOG.review" ${review_timeout[@]+"${review_timeout[@]}"}
   prompt="First action: execute this exact argv-quoted guarded runtime effect; it rechecks the saved review-decision/v1 before any charge or submission:
 $command_text
 After that action, invoke the /pro-gate skill and let its typed review-decision/v1 re-resolution select every subsequent fix, evidence, or reporting action. Do not infer a continuation from verdict, prose, phase, exit status, recoverability, or rounds, and do not ask routine permission.
@@ -158,9 +162,11 @@ daemon_dispatch_decision(){ # decision-file [redirect-depth]
         # gate #148 r1 P2: the engine treats any --timeout it receives as final, so pass one only
         # when the operator configured it. Left unset, a recovery gets the engine's own collection
         # default (45m, or PRO_GATE_HARVEST_TIMEOUT), not the 60m fresh-review wait.
+        # ${arr[@]+...}: see daemon_run_review_worker -- a bare empty-array expansion under set -u
+        # aborts on bash < 4.4, and unset is the default configuration here.
         recover_timeout=()
         [ -z "${PRO_REVIEW_ENGINE_TIMEOUT:-}" ] || recover_timeout=(--timeout "$PRO_REVIEW_ENGINE_TIMEOUT")
-        "$DD_ENGINE" --recover "$ref" --repo "$DD_WORKTREE" --out "$DD_LOG.recover" "${recover_timeout[@]}" >>"$DD_LOG" 2>&1 \
+        "$DD_ENGINE" --recover "$ref" --repo "$DD_WORKTREE" --out "$DD_LOG.recover" ${recover_timeout[@]+"${recover_timeout[@]}"} >>"$DD_LOG" 2>&1 \
           || daemon_note "  · $DD_NWO#$DD_NUM $action remains deferred after runtime recovery; review failure budget untouched"
       fi
       return 0 ;;

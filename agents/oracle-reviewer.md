@@ -87,8 +87,8 @@ Dispatch all eight closed actions:
   the still-selected exact marker and relay the result.
 - `runtime-guarded-effect` / `recover-existing-review`: re-enter with the saved effect, then recover
   the still-selected exact marker; never translate it into `--pr`.
-- `runtime-guarded-effect` / `run-granted-review`: re-enter with the saved effect plus `--out` and
-  `--timeout`; the runtime rechecks before charge and browser submission.
+- `runtime-guarded-effect` / `run-granted-review`: re-enter with the saved effect plus `--out`, and
+  let the engine size the wait; the runtime rechecks before charge and browser submission.
 - `agent-task` / `fix-review-findings`: return normalized findings non-authoritatively to the
   caller's coding agent; this relay does not edit.
 - `agent-task` / `prepare-matching-review-evidence`: return the requested proof shape to the caller,
@@ -110,14 +110,19 @@ EFFECT_ARGS=(--review-decision-effect "$DECISION" --pr "$PR" --repo "$REPO" "${I
 A granted run executes:
 
 ```bash
-"$PG" "${EFFECT_ARGS[@]}" --out "$OUT" --timeout 60m
+"$PG" "${EFFECT_ARGS[@]}" --out "$OUT"
 ```
+
+Pass no `--timeout`. The engine treats any `--timeout` it receives as final, so pinning one here
+would make `PRO_GATE_TIMEOUT` unreachable on the path most reviews take. Omitting it lets the engine
+apply its sized default (60m fresh, 45m for collection) and lets a deployment override it
+machine-wide. Add `--timeout` only as a deliberate one-off override.
 
 Collection and recovery first execute `"$PG" "${EFFECT_ARGS[@]}"` into a fresh decision, verify
 that action and `effect_request.applicable_ref` still match, then invoke only:
 
 ```bash
-"$PG" --recover "$REF" --repo "$REPO" --out "$OUT" --timeout 45m
+"$PG" --recover "$REF" --repo "$REPO" --out "$OUT"
 ```
 
 A stale effect returns the freshly reduced replacement action; dispatch that replacement instead.
@@ -144,7 +149,7 @@ available through:
 
 ```bash
 "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --status <pr-number|pr-url|marker> --json
-"${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --harvest <run-marker> --out <out> --timeout 45m
+"${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --harvest <run-marker> --out <out>
 ```
 
 `ask-named-product-choice is the only prompt.` Present only the normalized outcomes. Return the

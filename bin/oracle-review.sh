@@ -3349,7 +3349,7 @@ fi
 [ "${REVIEW_DECISION_EXECUTE:-0}" != 1 ] || pg_fresh_dispatch_require_run under-lock
 
 # Round-budget re-check for ALL runs, now that we own the per-change lock: the same-change
-# run(s) this waiter queued behind may have consumed the last round during the (up to 40 min)
+# run(s) this waiter queued behind may have consumed the last round during the (up to 65 min,
 # wait. Check-then-record is race-free from here on because the lock is held until exit.
 if ! ROUND_REASON="$(pg_round_guard "$ROUND_KEY")"; then
   round_capped "$ROUND_REASON (spent while this run waited on the per-change lock)"

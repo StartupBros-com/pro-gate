@@ -5691,6 +5691,24 @@ pg_dirlock_reclaim_dead "$GUARD_LIVE_DIR"; GUARD_LIVE_RC=$?
 check 'gate #148 r3 P2: a live pid with a matching token still holds its guard' \
   "$([ "$GUARD_LIVE_RC" -ne 0 ] && [ -d "$GUARD_LIVE_DIR" ]; echo $?)" "rc=$GUARD_LIVE_RC"
 
+# gate #148 r8 P0: liveness must be positively DISPROVED, never inferred from a failed measurement.
+# Recomputing the owner's start-time token can fail transiently for a perfectly live pid (a /proc
+# read or a `ps` fork under memory pressure). An empty result then compares unequal to a valid
+# stored token, and the old code fell straight through to unlink a LIVE owner's marker -- handing
+# the guard to a reclaimer while its real holder was still inside. The stored token already failed
+# closed on empty; the recomputed one must too. Stubbed inside a subshell so the override cannot
+# leak into any later check.
+GUARD_TOKFAIL_DIR="$GUARD_YOUNG_HOME/tokfail.lock.d"
+mkdir -p "$GUARD_TOKFAIL_DIR"
+pg_pid_token "$$" > "$GUARD_TOKFAIL_DIR/owner.$$"                     # live pid, VALID stored token
+(
+  pg_pid_token() { return 1; }                                        # recomputation fails
+  pg_dirlock_reclaim_dead "$GUARD_TOKFAIL_DIR"
+); GUARD_TOKFAIL_RC=$?
+check 'gate #148 r8 P0: a live owner survives a transient start-time-token read failure' \
+  "$([ "$GUARD_TOKFAIL_RC" -ne 0 ] && [ -d "$GUARD_TOKFAIL_DIR" ] && [ -e "$GUARD_TOKFAIL_DIR/owner.$$" ]; echo $?)" \
+  "rc=$GUARD_TOKFAIL_RC dir=$([ -d "$GUARD_TOKFAIL_DIR" ] && echo yes || echo NO) marker=$([ -e "$GUARD_TOKFAIL_DIR/owner.$$" ] && echo yes || echo GONE)"
+
 # gate #148 r5 P1: the no-BASHPID fallback must name the shell that actually holds the guard.
 # Two contenders, flock disabled AND BASHPID unset — the exact bash 3.2 path, and the only path
 # that uses the fallback at all. When the fallback published an already-exited pid (an `||` inside
@@ -5732,6 +5750,37 @@ touch -t 202001010000 "$GUARD_TOKENLESS_DIR" 2>/dev/null
 pg_dirlock_reclaim_dead "$GUARD_TOKENLESS_DIR"; GUARD_TOKENLESS_RC=$?
 check 'gate #148 r5 P1: an empty-token marker for a dead pid is reclaimed, never treated as held' \
   "$([ "$GUARD_TOKENLESS_RC" -eq 0 ] && [ ! -d "$GUARD_TOKENLESS_DIR" ]; echo $?)" "rc=$GUARD_TOKENLESS_RC"
+
+# gate #148 r8 P1: the two conditions that produced r5 must be tested TOGETHER. The checks above
+# unset BASHPID but acquire at the top level of their shell; the pre-existing subshell check
+# acquires inside $( ) but with BASHPID available. The r5 defect needed both at once: no BASHPID,
+# AND acquisition inside a command substitution. The broken fallback published an already-exited
+# pid there, which produced an empty token and read as dead to every reclaimer. Assert the
+# published owner is genuinely alive by proving a reclaimer REFUSES the guard while it is held.
+GUARD_NEST_HOME="$TDIR/home-guard-nested"; mkdir -p "$GUARD_NEST_HOME"
+GUARD_NEST_OUT="$(
+  bash --noprofile --norc -c '
+    LIB="$1"; HOMEDIR="$2"
+    unset BASHPID
+    . "$LIB"
+    pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
+    export PRO_GATE_HOME="$HOMEDIR"
+    # Acquire INSIDE a command substitution, with no BASHPID.
+    inner="$(PRO_GATE_RESERVATION_GUARD_WAIT=2 pg_reservation_guard_acquire || exit 9
+      d="$PRO_GATE_HOME/in-progress.lock.d"
+      owner=""; for m in "$d"/owner.*; do [ -e "$m" ] && owner="${m##*/owner.}"; done
+      tok="$(head -c 64 "$d/owner.$owner" 2>/dev/null | tr -d "\n")"
+      alive=no; kill -0 "$owner" 2>/dev/null && alive=yes
+      # A reclaimer must refuse this guard: its owner is live and its token matches.
+      reclaim=taken; pg_dirlock_reclaim_dead "$d" || reclaim=refused
+      printf "owner=%s alive=%s token=%s reclaim=%s" "${owner:-none}" "$alive" "$([ -n "$tok" ] && echo present || echo EMPTY)" "$reclaim"
+      pg_reservation_guard_release)"
+    printf "%s" "$inner"
+  ' _ "$HERE/../lib/pro-gate-lib.sh" "$GUARD_NEST_HOME" 2>/dev/null
+)"
+check 'gate #148 r8 P1: acquiring inside a command substitution with no BASHPID publishes a LIVE owner' \
+  "$(printf '%s' "$GUARD_NEST_OUT" | grep -q 'alive=yes' && printf '%s' "$GUARD_NEST_OUT" | grep -q 'token=present' && printf '%s' "$GUARD_NEST_OUT" | grep -q 'reclaim=refused'; echo $?)" \
+  "out=${GUARD_NEST_OUT:-<empty>}"
 
 # gate #148 r1 P2 (engine side): a --harvest/--recover with no --timeout takes its budget from
 # PRO_GATE_HARVEST_TIMEOUT (default 45m). The daemon's recovery now relies on exactly this instead

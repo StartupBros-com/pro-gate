@@ -1121,8 +1121,14 @@ pg_dirlock_owner_count() {
 #     EEXIST -- an unwritable or missing parent, for instance (v0.41 defect, reproduced).
 #  2. A RECYCLED PID IS NOT A LIVE OWNER. kill -0 alone wedges the guard permanently once the OS
 #     hands a dead owner's pid to an unrelated live process, so the marker carries pg_pid_token's
-#     process start time and liveness requires BOTH to match. This is the guard pg_lock has used
-#     since it started writing a `token` beside its `pid`; the v0.41 helper shipped without it.
+#     process start time and liveness requires BOTH to match. Be precise about the precedent: this
+#     is the check pg_harvest_claimed applies on reclaim. pg_lock and pg_lock_n WRITE a `token`
+#     beside their `pid` but never read it back when they reclaim a dead-owner directory, so they
+#     still carry the recycled-pid hazard (and an unscoped rm -rf with it). This helper is
+#     deliberately STRICTER than they are; do not "align" it down to match them.
+#     Liveness must also be positively DISPROVED, never inferred from a failed measurement: a
+#     token that cannot be RECOMPUTED for a live pid fails closed exactly as an unreadable stored
+#     token does, or a transient /proc or `ps` failure unlinks a live owner's marker (r8 P0).
 #  3. AN UNMARKED DIRECTORY IS NOT AN ORPHAN YET. A contender that has just mkdir'd is about to
 #     write its marker. Deleting the directory in that window let the contender's later marker
 #     write land inside a REPLACEMENT directory another process had already claimed, so two live
@@ -1134,7 +1140,7 @@ pg_dirlock_owner_count() {
 #
 # Returns 0 when the directory is gone, 1 when it is held or too young to judge.
 pg_dirlock_reclaim_dead() {
-  local lockdir="$1" f pid tok had_marker=0 grace age
+  local lockdir="$1" f pid tok cur had_marker=0 grace age
   [ -d "$lockdir" ] || return 1
   for f in "$lockdir"/owner.*; do
     [ -e "$f" ] || continue
@@ -1145,7 +1151,15 @@ pg_dirlock_reclaim_dead() {
       tok="$(head -c 64 "$f" 2>/dev/null | tr -d '\n')"
       # An unreadable or tokenless marker cannot be disproved: fail closed and leave it held.
       [ -n "$tok" ] || return 1
-      [ "$tok" = "$(pg_pid_token "$pid" 2>/dev/null || true)" ] && return 1
+      # The RECOMPUTED token must fail closed on exactly the same terms as the stored one. Reading
+      # it can fail transiently for a perfectly live pid -- a /proc read or a `ps` fork under
+      # memory pressure -- and an empty result then compares unequal to a valid stored token,
+      # falling through to unlink a LIVE owner's marker and letting a reclaimer take a guard whose
+      # holder is still inside it. Liveness must be positively DISPROVED before removal, never
+      # inferred from a failed measurement.
+      cur="$(pg_pid_token "$pid" 2>/dev/null || true)"
+      [ -n "$cur" ] || return 1
+      [ "$tok" = "$cur" ] && return 1
     fi
     rm -f "$f" 2>/dev/null
   done
@@ -1176,7 +1190,8 @@ pg_reservation_guard_acquire() {
     fi
     return 0
   fi
-  # macOS / no flock: mkdir spinlock with the dead-pid self-heal pg_lock uses. Without it a guard
+  # macOS / no flock: a mkdir spinlock in the same family as pg_lock's, but with a stricter reclaim
+  # (see pg_dirlock_reclaim_dead: token-checked liveness, orphan grace, no rm -rf). Without it a guard
   # directory left by a killed process wedged every later reservation write for the full wait, and
   # a failed acquire left PG_RESERVATION_GUARD_DIR pointing at a directory this process did not
   # own, so a later release could remove another process's guard. Ownership is the marker file
@@ -2035,8 +2050,9 @@ pg_round_record() {  # $1 = key; prune entries older than the window, append now
   # PG_ROUND_SPEND_EPOCH to the epoch actually appended — the round's charge time, which is
   # what trajectory history must be stamped with (#66 gate r3 P1). The marker's epoch is NOT
   # that moment: it is minted before the per-change lock AND the account-slot wait (each up to
-  # PRO_GATE_LOCK_WAIT, 2400s by default), so a queued run's history row could expire ~80 min
-  # before its own spend, or order concurrent runs by process start rather than charge order.
+  # PRO_GATE_LOCK_WAIT, 3900s by default since v0.41), so a queued run's history row could expire
+  # ~130 min before its own spend, or order concurrent runs by process start rather than charge
+  # order.
   # Best-effort
   # bookkeeping (same posture as pg_ledger_append): it must never fail a review, but every
   # fail-open path WARNS on stderr, because a silently unrecordable round means the budget

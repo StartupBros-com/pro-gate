@@ -149,6 +149,25 @@ corpus_envelope() { # case-index out-file
   pg_review_decision_reduce "$facts" > "$2"
 }
 CASE_COUNT="$(jq '.cases | length' "$CORPUS")"
+# gate #148 r8 P1: the four rejection checks below used `validator file && FLAG=0`, which clears the
+# flag ONLY when the validator returns 0. That cannot tell "correctly rejected the attack" from
+# "validator is missing, renamed, or crashed" -- rc=127 leaves every flag at its passing value.
+# Verified against the base commit, where the function does not exist at all: FABRICATED_OK,
+# INJECTED_OK, DIGEST_OK and SYMLINK_OK all read 1, identical to a genuinely correct run. These are
+# the only coverage for four attack vectors on the envelope that gates daemon_decision_valid, so
+# assert the validator is callable FIRST and fail the suite closed if it is not.
+VALIDATOR_PRESENT=1
+command -v pg_review_decision_envelope_valid >/dev/null 2>&1 || VALIDATOR_PRESENT=0
+[ "$VALIDATOR_PRESENT" = 1 ] && declare -F pg_review_decision_envelope_valid >/dev/null 2>&1 || VALIDATOR_PRESENT=0
+check 'library validator is defined and callable before any rejection case is scored' \
+  "$([ "$VALIDATOR_PRESENT" = 1 ]; printf '%s' "$?")" "present=$VALIDATOR_PRESENT"
+# Every rejection case now scores an EXPLICIT return code: 0 means the attack was accepted (bad),
+# and anything other than a clean non-zero rejection (e.g. 127 not-found) also fails the case.
+envelope_rejects() { # file -> 0 when the validator cleanly REJECTED it
+  local f="$1" rc
+  pg_review_decision_envelope_valid "$f" >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] && [ "$rc" -ne 127 ]
+}
 ENVELOPES_OK=1; FABRICATED_OK=1; INJECTED_OK=1; DIGEST_OK=1; SYMLINK_OK=1; ENVELOPE_DETAIL=""
 i=0
 while [ "$i" -lt "$CASE_COUNT" ]; do
@@ -158,27 +177,32 @@ while [ "$i" -lt "$CASE_COUNT" ]; do
   # reducer re-run over its own facts no longer matches byte-for-byte.
   jq -c 'if .action == "stop-without-new-review" then .action="allow-existing-merge-workflow" | .effect_request.action="allow-existing-merge-workflow" | .effect_request.effect="allow-existing-merge-workflow" else .action="stop-without-new-review" | .effect_request.action="stop-without-new-review" | .effect_request.effect="stop-without-new-review" | .effect_request.execution_class="report-only" end' \
     "$TMP/envelope-$i.json" > "$TMP/fabricated-$i.json"
-  pg_review_decision_envelope_valid "$TMP/fabricated-$i.json" && { FABRICATED_OK=0; ENVELOPE_DETAIL="$ENVELOPE_DETAIL case=$i:accepted-fabricated"; }
+  envelope_rejects "$TMP/fabricated-$i.json" || { FABRICATED_OK=0; ENVELOPE_DETAIL="$ENVELOPE_DETAIL case=$i:not-rejected-fabricated"; }
   jq -c '.facts.next_action="wait"' "$TMP/envelope-$i.json" > "$TMP/injected-$i.json"
-  pg_review_decision_envelope_valid "$TMP/injected-$i.json" && { INJECTED_OK=0; ENVELOPE_DETAIL="$ENVELOPE_DETAIL case=$i:accepted-next_action"; }
+  envelope_rejects "$TMP/injected-$i.json" || { INJECTED_OK=0; ENVELOPE_DETAIL="$ENVELOPE_DETAIL case=$i:not-rejected-next_action"; }
   jq -c '.contract.contract_digest="0000000000000000000000000000000000000000000000000000000000000000"' "$TMP/envelope-$i.json" > "$TMP/digest-$i.json"
-  pg_review_decision_envelope_valid "$TMP/digest-$i.json" && { DIGEST_OK=0; ENVELOPE_DETAIL="$ENVELOPE_DETAIL case=$i:accepted-foreign-digest"; }
+  envelope_rejects "$TMP/digest-$i.json" || { DIGEST_OK=0; ENVELOPE_DETAIL="$ENVELOPE_DETAIL case=$i:not-rejected-foreign-digest"; }
   i=$((i + 1))
 done
 ln -s "$TMP/envelope-0.json" "$TMP/envelope-link.json"
-pg_review_decision_envelope_valid "$TMP/envelope-link.json" && SYMLINK_OK=0
+envelope_rejects "$TMP/envelope-link.json" || SYMLINK_OK=0
 check 'library validator accepts every envelope the runtime emits for the frozen corpus' "$([ "$ENVELOPES_OK" = 1 ]; printf '%s' "$?")" "$ENVELOPE_DETAIL"
 check 'library validator rejects an envelope whose outer action was swapped for another closed action' "$([ "$FABRICATED_OK" = 1 ]; printf '%s' "$?")" "$ENVELOPE_DETAIL"
 check 'library validator rejects a blocking-wait next_action injected into the facts' "$([ "$INJECTED_OK" = 1 ]; printf '%s' "$?")" "$ENVELOPE_DETAIL"
 check 'library validator rejects a foreign contract digest' "$([ "$DIGEST_OK" = 1 ]; printf '%s' "$?")" "$ENVELOPE_DETAIL"
 check 'library validator refuses a symlinked decision file' "$([ "$SYMLINK_OK" = 1 ]; printf '%s' "$?")"
 
-# The wait each prose consumer tells a caller to pass must match the engine's sized defaults
-# (v0.41): 60m for a fresh review, 45m for recovery and harvest. A drift here silently reinstates
-# the repeat-collection churn the sizing removed.
+# gate #148 r8 P1: a prose consumer must NOT pin the wait at all. The engine treats any --timeout
+# it receives as final (bin/oracle-review.sh: `if [ -z "$TIMEOUT" ]`), so a skill or relay that
+# hardcodes one makes PRO_GATE_TIMEOUT and PRO_GATE_HARVEST_TIMEOUT unreachable on the path most
+# reviews actually take — the two knobs this release introduces would be inert everywhere that
+# matters. The earlier version of this check REQUIRED the hardcoded 60m/45m, so it enforced the
+# bypass instead of catching it. The rule is now the same one the daemon follows: supply a timeout
+# only when the operator configured one.
 for consumer in "${CONSUMERS[@]}"; do
-  check "$(basename "$consumer") passes the sized fresh-review and recovery timeouts" \
-    "$(grep -Fq -- '--out "$OUT" --timeout 60m' "$consumer" && grep -Fq -- '--out "$OUT" --timeout 45m' "$consumer" && grep -Fq -- '--out <out> --timeout 45m' "$consumer" && ! grep -Fq -- '--timeout 20m' "$consumer" && ! grep -Fq -- '--timeout 30m' "$consumer"; printf '%s' "$?")"
+  check "$(basename "$consumer") lets the engine size the wait instead of pinning it" \
+    "$(! grep -Eq -- '--timeout[[:space:]]+[0-9]+[smh]' "$consumer"; printf '%s' "$?")" \
+    "$(grep -En -- '--timeout[[:space:]]+[0-9]+[smh]' "$consumer" | tr '\n' ';')"
 done
 ENGINE="$HERE/../bin/oracle-review.sh"
 LIBSH="$HERE/../lib/pro-gate-lib.sh"
