@@ -3143,18 +3143,21 @@ ENGINE_ARGS+=(--browser-archive "${PRO_GATE_BROWSER_ARCHIVE:-never}")
 # oracle unless that env raises the cap to match (the ChatGPT account throttle, not oracle's
 # tab cap, is the real limiter, so raising it only helps a genuinely tolerant account).
 LOCKFILE="${PRO_GATE_LOCKFILE:-$PRO_GATE_HOME/oracle.lock}"
-# v0.41: sized with the review wait, not independently. A queued run waits for the holder of the
-# per-change lock, and that holder may now legitimately run for the full 60m fresh-review default
-# plus TIMEOUT_GRACE. The old 2400s (40m) therefore expired while the run it was waiting for was
-# still working, turning a normal long review into a spurious give-up for everyone behind it.
-LOCK_WAIT="${PRO_GATE_LOCK_WAIT:-3900}"
+# Resolve the fresh review's hard cap once. The change-lock budget and watchdog must use the same
+# effective --timeout > PRO_GATE_TIMEOUT > 60m value plus grace.
+HARD_SECS=$(( $(pg_dur_secs "$TIMEOUT") + ${PRO_GATE_TIMEOUT_GRACE:-120} ))
+# PRO_GATE_LOCK_WAIT remains the account-slot queue budget. A same-change waiter must additionally
+# cover the holder's legal review hard cap because the holder acquires this guard before its own slot
+# wait. Keep the budgets independently overridable without changing the acquisition order.
+SLOT_WAIT="${PRO_GATE_LOCK_WAIT:-3900}"
+CHANGE_LOCK_WAIT="${PRO_GATE_CHANGE_LOCK_WAIT:-$(( SLOT_WAIT + HARD_SECS ))}"
 MAX_CONC="${PRO_GATE_MAX_CONCURRENCY:-1}"
 EFF_CONC="$(pg_ramp_level "$MAX_CONC")"
 
 # Housekeeping: per-PR lock files are 0-byte and used to accumulate forever. Sweep ones
-# untouched for >24h — any legitimate holder finishes within the ~62 min hard cap (v0.41 sizing:
-# the 60m fresh-review default plus TIMEOUT_GRACE; this text said ~35 min under the old 30m). Same for
-# per-marker harvest locks (v0.20.2 dogfood left one stale for 10h; flock holders keep the
+# untouched for >24h — the default holder envelope is ~127 min (65m account-slot wait plus the
+# ~62m review hard cap), still far inside this horizon. Same for per-marker harvest locks
+# (v0.20.2 dogfood left one stale for 10h; flock holders keep the
 # file's inode alive, so deleting an unheld file is always safe).
 find "$(dirname "$LOCKFILE")" -maxdepth 1 -name "$(basename "$LOCKFILE").pr-*" -mmin +1440 -delete 2>/dev/null || true
 find "${PRO_GATE_HARVEST_LOCK_DIR:-$PRO_GATE_HOME/harvest-locks}" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
@@ -3328,8 +3331,8 @@ fi
 # double-spend the per-PR lock exists to stop.
 echo "[oracle-review] per-change guard for ${PR_NUM:+pr #}${PR_NUM:-this diff} (${ROUND_KEY}; serializes same-change reviews)..." >&2
 pg_status waiting-pr-lock
-if ! pg_lock "${LOCKFILE}.pr-${ROUND_KEY}" "$LOCK_WAIT"; then
-  echo "ERROR: timed out after ${LOCK_WAIT}s — ${ROUND_KEY} is already under review elsewhere." >&2
+if ! pg_lock "${LOCKFILE}.pr-${ROUND_KEY}" "$CHANGE_LOCK_WAIT"; then
+  echo "ERROR: timed out after ${CHANGE_LOCK_WAIT}s — ${ROUND_KEY} is already under review elsewhere." >&2
   pg_status failed "per-change lock timeout"
   pg_finish 7
 fi
@@ -3349,7 +3352,7 @@ fi
 [ "${REVIEW_DECISION_EXECUTE:-0}" != 1 ] || pg_fresh_dispatch_require_run under-lock
 
 # Round-budget re-check for ALL runs, now that we own the per-change lock: the same-change
-# run(s) this waiter queued behind may have consumed the last round during the (up to 65 min,
+# run(s) this waiter queued behind may have consumed the last round during the full change-lock
 # wait. Check-then-record is race-free from here on because the lock is held until exit.
 if ! ROUND_REASON="$(pg_round_guard "$ROUND_KEY")"; then
   round_capped "$ROUND_REASON (spent while this run waited on the per-change lock)"
@@ -3387,12 +3390,12 @@ if ! pg_conversation_title_write "$RUN_MARKER" "$TITLE_LINE"; then
   echo "[oracle-review] WARNING: could not publish the canonical conversation-title memo; browser rename will be skipped safely." >&2
 fi
 
-echo "[oracle-review] acquiring a review slot (effective ${EFF_CONC} of ceiling ${MAX_CONC}; waits up to ${LOCK_WAIT}s if all busy)..." >&2
+echo "[oracle-review] acquiring a review slot (effective ${EFF_CONC} of ceiling ${MAX_CONC}; waits up to ${SLOT_WAIT}s if all busy)..." >&2
 pg_status waiting-slot "effective ${EFF_CONC} / ceiling ${MAX_CONC}"
 # v0.19.1 (pro-gate self-review P1): re-read the ramp level every wait slice — a run that
 # queued at level 3 must NOT acquire slot 3 after a concurrent throttle dropped the level
 # to 1 mid-wait. Short pg_lock_n slices keep the wait responsive to governor changes.
-SLOT_DEADLINE=$(( $(date +%s) + LOCK_WAIT ))
+SLOT_DEADLINE=$(( $(date +%s) + SLOT_WAIT ))
 SLOT_OK=0
 SLOT_HELD=""
 while :; do
@@ -3432,10 +3435,10 @@ while :; do
 done
 if [ "$SLOT_OK" != 1 ]; then
   if [ "$(pg_reservation_holding_count 2>/dev/null || echo 0)" -gt 0 ] 2>/dev/null; then
-    echo "ERROR: timed out after ${LOCK_WAIT}s — 0 of ${EFF_CONC} effective slots free; capacity is held by uncollected review(s), not by running ones." >&2
+    echo "ERROR: timed out after ${SLOT_WAIT}s — 0 of ${EFF_CONC} effective slots free; capacity is held by uncollected review(s), not by running ones." >&2
     pg_report_capacity_holders "$EFF_CONC"
   else
-    echo "ERROR: timed out after ${LOCK_WAIT}s — all ${EFF_CONC} review slots are busy with running reviews." >&2
+    echo "ERROR: timed out after ${SLOT_WAIT}s — all ${EFF_CONC} review slots are busy with running reviews." >&2
   fi
   pg_status failed "slot timeout"
   pg_finish 7
@@ -3456,8 +3459,7 @@ LAUNCH_EPOCH="$(date +%s)"
 #   no-think   — still "no thinking status detected" after PRO_GATE_NOTHINK_SECS (default 600)
 # A watchdog kill returns 124; the caller's salvage + guarded-retry path takes over. Dead
 # submissions never consumed the Pro thinking window, so the retry is not a
-# double-spend.
-HARD_SECS=$(( $(pg_dur_secs "$TIMEOUT") + ${PRO_GATE_TIMEOUT_GRACE:-120} ))
+# double-spend. HARD_SECS was resolved with TIMEOUT before lock sizing so both use one cap.
 STALL_SECS="${PRO_GATE_STALL_SECS:-600}"
 NOTHINK_SECS="${PRO_GATE_NOTHINK_SECS:-600}"
 

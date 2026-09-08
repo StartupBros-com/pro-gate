@@ -203,6 +203,87 @@ if bash -s -- --local-source --version "$VERSION" < "$ROOT/install.sh" >"$TDIR/p
 else echo "ok - piped local source is rejected"; fi
 check "piped local source names real file requirement" grep -q 'real regular on-disk file' "$TDIR/piped-local.log"
 
+# gate #148 r1 P2 legacy-lock-wait-env-migration: v0.40 generated this exact assignment.
+# Upgrade only that byte-exact line; an operator's values, syntax, comments, and other config are data.
+LEGACY_LOCK_WAIT_LINE='PRO_GATE_LOCK_WAIT=2400                # seconds a queued review waits before giving up'
+MIGRATED_LOCK_WAIT_LINE='PRO_GATE_LOCK_WAIT=3900                # seconds to wait for account capacity (was 2400 before v0.41)'
+MIGRATION_HOME="$TDIR/migration-home"; MIGRATION_RUNTIME="$TDIR/migration-runtime"
+mkdir -p "$MIGRATION_HOME" "$MIGRATION_RUNTIME"
+cat > "$MIGRATION_RUNTIME/.env" <<'EOF'
+PRO_GATE_PLUGIN_KEY=keep-this-test-value
+PRO_GATE_LOCK_WAIT=2400                # seconds a queued review waits before giving up
+PRO_GATE_CUSTOM_SETTING=preserved
+EOF
+cat > "$TDIR/migration-expected.env" <<'EOF'
+PRO_GATE_PLUGIN_KEY=keep-this-test-value
+PRO_GATE_LOCK_WAIT=3900                # seconds to wait for account capacity (was 2400 before v0.41)
+PRO_GATE_CUSTOM_SETTING=preserved
+EOF
+chmod 644 "$MIGRATION_RUNTIME/.env"
+HOME="$MIGRATION_HOME" PRO_GATE_HOME="$MIGRATION_RUNTIME" PRO_GATE_BROWSER_MODE=native \
+  bash "$ROOT/install.sh" --local-source --version "$VERSION" >"$TDIR/migration.log" 2>&1
+check "gate #148 r1 P2 legacy-lock-wait-env-migration upgrades the exact v0.40 generated env and preserves other config" \
+  cmp -s "$MIGRATION_RUNTIME/.env" "$TDIR/migration-expected.env"
+MIGRATION_ENV_MODE="$(stat -c %a "$MIGRATION_RUNTIME/.env" 2>/dev/null || stat -f %Lp "$MIGRATION_RUNTIME/.env")"
+check "gate #148 r1 P2 legacy-lock-wait-env-migration publishes the migrated env owner-only" \
+  test "$MIGRATION_ENV_MODE" = 600
+cp "$MIGRATION_RUNTIME/.env" "$TDIR/migration-first.env"
+HOME="$MIGRATION_HOME" PRO_GATE_HOME="$MIGRATION_RUNTIME" PRO_GATE_BROWSER_MODE=native \
+  bash "$ROOT/install.sh" --local-source --version "$VERSION" >"$TDIR/migration-second.log" 2>&1
+check "gate #148 r1 P2 legacy-lock-wait-env-migration is idempotent" \
+  cmp -s "$MIGRATION_RUNTIME/.env" "$TDIR/migration-first.env"
+
+CUSTOM_BARE_RUNTIME="$TDIR/custom-bare-runtime"; mkdir -p "$CUSTOM_BARE_RUNTIME"
+printf '%s\n' 'PRO_GATE_LOCK_WAIT=2400' 'PRO_GATE_CUSTOM_SETTING=bare-preserved' > "$CUSTOM_BARE_RUNTIME/.env"
+cp "$CUSTOM_BARE_RUNTIME/.env" "$TDIR/custom-bare.before"
+HOME="$MIGRATION_HOME" PRO_GATE_HOME="$CUSTOM_BARE_RUNTIME" PRO_GATE_BROWSER_MODE=native \
+  bash "$ROOT/install.sh" --local-source --version "$VERSION" >"$TDIR/custom-bare.log" 2>&1
+check "gate #148 r1 P2 legacy-lock-wait-env-migration preserves a deliberately bare operator 2400" \
+  cmp -s "$CUSTOM_BARE_RUNTIME/.env" "$TDIR/custom-bare.before"
+
+CUSTOM_QUOTED_RUNTIME="$TDIR/custom-quoted-runtime"; mkdir -p "$CUSTOM_QUOTED_RUNTIME"
+printf '%s\n' 'PRO_GATE_LOCK_WAIT="2400" # operator intentionally quoted this legacy-sized value' > "$CUSTOM_QUOTED_RUNTIME/.env"
+cp "$CUSTOM_QUOTED_RUNTIME/.env" "$TDIR/custom-quoted.before"
+HOME="$MIGRATION_HOME" PRO_GATE_HOME="$CUSTOM_QUOTED_RUNTIME" PRO_GATE_BROWSER_MODE=native \
+  bash "$ROOT/install.sh" --local-source --version "$VERSION" >"$TDIR/custom-quoted.log" 2>&1
+check "gate #148 r1 P2 legacy-lock-wait-env-migration preserves a deliberately quoted operator 2400" \
+  cmp -s "$CUSTOM_QUOTED_RUNTIME/.env" "$TDIR/custom-quoted.before"
+
+CUSTOM_VALUE_RUNTIME="$TDIR/custom-value-runtime"; mkdir -p "$CUSTOM_VALUE_RUNTIME"
+printf '%s\n' 'PRO_GATE_LOCK_WAIT=7200 # operator custom wait' > "$CUSTOM_VALUE_RUNTIME/.env"
+cp "$CUSTOM_VALUE_RUNTIME/.env" "$TDIR/custom-value.before"
+HOME="$MIGRATION_HOME" PRO_GATE_HOME="$CUSTOM_VALUE_RUNTIME" PRO_GATE_BROWSER_MODE=native \
+  bash "$ROOT/install.sh" --local-source --version "$VERSION" >"$TDIR/custom-value.log" 2>&1
+check "gate #148 r1 P2 legacy-lock-wait-env-migration preserves a custom operator lock wait" \
+  cmp -s "$CUSTOM_VALUE_RUNTIME/.env" "$TDIR/custom-value.before"
+
+MIGRATION_ROLLBACK_RUNTIME="$TDIR/migration-rollback-runtime"; MIGRATION_ROLLBACK_BIN="$TDIR/migration-rollback-bin"
+mkdir -p "$MIGRATION_ROLLBACK_RUNTIME" "$MIGRATION_ROLLBACK_BIN"
+printf '%s\n' "$LEGACY_LOCK_WAIT_LINE" 'PRO_GATE_CUSTOM_SETTING=rollback-preserved' > "$MIGRATION_ROLLBACK_RUNTIME/.env"
+chmod 600 "$MIGRATION_ROLLBACK_RUNTIME/.env"
+cp -p "$MIGRATION_ROLLBACK_RUNTIME/.env" "$TDIR/migration-rollback.before"
+REAL_CHMOD_MIGRATION="$(command -v chmod)"
+cat > "$MIGRATION_ROLLBACK_BIN/chmod" <<'EOF'
+#!/usr/bin/env bash
+if [ "${2:-}" = "${MIGRATION_ROLLBACK_ENV:?}" ]; then
+  if grep -Fxq "${MIGRATED_LOCK_WAIT_LINE:?}" "$2"; then : > "${MIGRATION_OBSERVED:?}"; fi
+  exit 1
+fi
+exec "${REAL_CHMOD_MIGRATION:?}" "$@"
+EOF
+chmod +x "$MIGRATION_ROLLBACK_BIN/chmod"
+if HOME="$MIGRATION_HOME" PRO_GATE_HOME="$MIGRATION_ROLLBACK_RUNTIME" PRO_GATE_BROWSER_MODE=native \
+  MIGRATION_ROLLBACK_ENV="$MIGRATION_ROLLBACK_RUNTIME/.env" MIGRATED_LOCK_WAIT_LINE="$MIGRATED_LOCK_WAIT_LINE" \
+  MIGRATION_OBSERVED="$TDIR/migration-observed" REAL_CHMOD_MIGRATION="$REAL_CHMOD_MIGRATION" \
+  PATH="$MIGRATION_ROLLBACK_BIN:$PATH" bash "$ROOT/install.sh" --local-source --version "$VERSION" \
+  >"$TDIR/migration-rollback.log" 2>&1; then
+  echo "FAIL - gate #148 r1 P2 legacy-lock-wait-env-migration failure after migration triggers rollback"; FAILS=$((FAILS + 1))
+else echo "ok - gate #148 r1 P2 legacy-lock-wait-env-migration failure after migration triggers rollback"; fi
+check "gate #148 r1 P2 legacy-lock-wait-env-migration reaches the secured env after atomic migration" \
+  test -e "$TDIR/migration-observed"
+check "gate #148 r1 P2 legacy-lock-wait-env-migration rollback restores the exact prior env" \
+  cmp -s "$MIGRATION_ROLLBACK_RUNTIME/.env" "$TDIR/migration-rollback.before"
+
 SVC_BIN="$TDIR/service-bin"; SVC_LOG="$TDIR/service.log"; mkdir -p "$SVC_BIN"
 printf '#!/usr/bin/env bash\nprintf "sudo %%s\\n" "$*" >> "$SVC_LOG"\nif [ "$1" = tee ]; then cat >/dev/null; fi\n' > "$SVC_BIN/sudo"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$SVC_BIN/systemctl"
