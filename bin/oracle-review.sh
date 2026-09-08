@@ -3146,17 +3146,45 @@ LOCKFILE="${PRO_GATE_LOCKFILE:-$PRO_GATE_HOME/oracle.lock}"
 # Resolve the fresh review's hard cap once. The change-lock budget and watchdog must use the same
 # effective --timeout > PRO_GATE_TIMEOUT > 60m value plus grace.
 HARD_SECS=$(( $(pg_dur_secs "$TIMEOUT") + ${PRO_GATE_TIMEOUT_GRACE:-120} ))
-# PRO_GATE_LOCK_WAIT remains the account-slot queue budget. A same-change waiter must additionally
-# cover the holder's legal review hard cap because the holder acquires this guard before its own slot
-# wait. Keep the budgets independently overridable without changing the acquisition order.
+# Every OTHER window a holder may legally occupy while it holds the per-change guard is resolved
+# here too, before that guard is sized. Their consumers further down read these same variables, so
+# there is exactly one definition per knob and the budget cannot drift from the windows it covers.
+REATTACH_TIMEOUT="${PRO_GATE_REATTACH_TIMEOUT:-150}"
+MAX_RETRIES="${PRO_GATE_MAX_RETRIES:-1}"
+BACKOFF="${PRO_GATE_RETRY_BACKOFF:-20}"
+STALL_SECS="${PRO_GATE_STALL_SECS:-600}"
+NOTHINK_SECS="${PRO_GATE_NOTHINK_SECS:-600}"
+THROTTLE_PAUSE="${PRO_GATE_THROTTLE_PAUSE:-300}"
+SALVAGE_WINDOW="${PRO_GATE_SALVAGE_SECS:-$STALL_SECS}"
+# CI ambiguity fixtures alone may shorten this otherwise-30s CDP absence wait.
+PRE_RETRY_PROBE_SECS="$(pg_test_pre_retry_probe_secs)"
+# PRO_GATE_LOCK_WAIT remains the account-slot queue budget. The same-change budget is a DIFFERENT
+# quantity: the holder's full guarded lifetime. The holder takes this guard BEFORE queueing for a
+# slot and keeps it until exit, so one legitimate holder can occupy, in order: the slot wait;
+# MAX_RETRIES+1 attempts of the hard cap, each ending in a bounded reattach and each retry adding a
+# pre-retry probe plus backoff; a throttle pause; and one CDP salvage, which runs with the FULL hard
+# cap once a live conversation is detected. (Gate #148 r1 P2: the earlier SLOT_WAIT+HARD_SECS budget
+# stopped at the first attempt, so a waiter gave up at 7620s while the holder was still legally
+# working.) The waiter's own --timeout may only RAISE that baseline, never lower it: a one-off
+# `--timeout 5m` must not credit a normal 60m holder with five minutes of life. Keep the budgets
+# independently overridable without changing the acquisition order.
 SLOT_WAIT="${PRO_GATE_LOCK_WAIT:-3900}"
-CHANGE_LOCK_WAIT="${PRO_GATE_CHANGE_LOCK_WAIT:-$(( SLOT_WAIT + HARD_SECS ))}"
+HOLDER_HARD_SECS=$(( $(pg_dur_secs "${PRO_GATE_TIMEOUT:-60m}") + ${PRO_GATE_TIMEOUT_GRACE:-120} ))
+# Raise-only comparisons: a knob that is not a plain integer leaves the arithmetic-derived
+# baseline in place instead of poisoning the sum with its own unusable value.
+[ "$HARD_SECS" -gt "$HOLDER_HARD_SECS" ] 2>/dev/null && HOLDER_HARD_SECS="$HARD_SECS"
+HOLDER_SALVAGE_SECS="$HOLDER_HARD_SECS"
+[ "$SALVAGE_WINDOW" -gt "$HOLDER_SALVAGE_SECS" ] 2>/dev/null && HOLDER_SALVAGE_SECS="$SALVAGE_WINDOW"
+CHANGE_LOCK_DEFAULT=$(( SLOT_WAIT + (MAX_RETRIES + 1) * (HOLDER_HARD_SECS + REATTACH_TIMEOUT) \
+  + MAX_RETRIES * (PRE_RETRY_PROBE_SECS + BACKOFF) + THROTTLE_PAUSE + HOLDER_SALVAGE_SECS ))
+CHANGE_LOCK_WAIT="${PRO_GATE_CHANGE_LOCK_WAIT:-$CHANGE_LOCK_DEFAULT}"
 MAX_CONC="${PRO_GATE_MAX_CONCURRENCY:-1}"
 EFF_CONC="$(pg_ramp_level "$MAX_CONC")"
 
 # Housekeeping: per-PR lock files are 0-byte and used to accumulate forever. Sweep ones
-# untouched for >24h — the default holder envelope is ~127 min (65m account-slot wait plus the
-# ~62m review hard cap), still far inside this horizon. Same for per-marker harvest locks
+# untouched for >24h — the default holder envelope is ~262 min (65m account-slot wait, two 62m
+# attempts, their reattach/probe/backoff, a 5m throttle pause and a 62m salvage), still far inside
+# this horizon and inside the 6h reservation TTL. Same for per-marker harvest locks
 # (v0.20.2 dogfood left one stale for 10h; flock holders keep the
 # file's inode alive, so deleting an unheld file is always safe).
 find "$(dirname "$LOCKFILE")" -maxdepth 1 -name "$(basename "$LOCKFILE").pr-*" -mmin +1440 -delete 2>/dev/null || true
@@ -3459,9 +3487,8 @@ LAUNCH_EPOCH="$(date +%s)"
 #   no-think   — still "no thinking status detected" after PRO_GATE_NOTHINK_SECS (default 600)
 # A watchdog kill returns 124; the caller's salvage + guarded-retry path takes over. Dead
 # submissions never consumed the Pro thinking window, so the retry is not a
-# double-spend. HARD_SECS was resolved with TIMEOUT before lock sizing so both use one cap.
-STALL_SECS="${PRO_GATE_STALL_SECS:-600}"
-NOTHINK_SECS="${PRO_GATE_NOTHINK_SECS:-600}"
+# double-spend. HARD_SECS, STALL_SECS and NOTHINK_SECS were all resolved before lock sizing so the
+# watchdog and the change-lock budget use one definition of each window.
 
 run_oracle() {  # $1 = browser model strategy (select|current|ignore)
   local strategy="$1" job started size last_size last_change now last_line prc watchdog_sleep_secs
@@ -3611,9 +3638,8 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
 # SALVAGED (the answer may have finished server-side), and only a truly-lost run is retried once.
 # Exit 8 = deferred (no slot spent); exit 6 = ran but produced nothing after salvage + retry.
 SLUG_BASE="pro-gate-review-pr-${PR_NUM:-diff}"
-REATTACH_TIMEOUT="${PRO_GATE_REATTACH_TIMEOUT:-150}"
-MAX_RETRIES="${PRO_GATE_MAX_RETRIES:-1}"
-BACKOFF="${PRO_GATE_RETRY_BACKOFF:-20}"
+# REATTACH_TIMEOUT, MAX_RETRIES and BACKOFF were resolved before lock sizing: the same-change
+# guard's budget is the sum of the windows this loop can occupy, so they share one definition.
 LIVE_CONVERSATION=0
 THROTTLED=0
 CLOUDFLARE=0
@@ -3878,8 +3904,7 @@ while :; do
   # collect the review instead. (If Chrome itself is unreachable the probe
   # errors and the retry proceeds — a server-side-completed run cannot be
   # salvaged through a dead browser anyway.)
-  # CI ambiguity fixtures alone may shorten this otherwise-30s CDP absence wait.
-  PRE_RETRY_PROBE_SECS="$(pg_test_pre_retry_probe_secs)"
+  # PRE_RETRY_PROBE_SECS was resolved before lock sizing (the change-lock budget counts it).
   PRC=2
   if command -v node >/dev/null 2>&1; then
     node "$SELF/cdp-salvage.mjs" --probe "$RUN_MARKER" "$PRE_RETRY_PROBE_SECS" "$PORT" >/dev/null 2>>"$RUNLOG"; PRC=$?
@@ -3958,12 +3983,12 @@ if ! pg_is_review "$CAPTURE_OUT" && [ "${CLOUDFLARE:-0}" != 1 ] && command -v no
   # tuning the stall watchdog DOWN (justified: healthy oracle prints every 30s, and the
   # 2026-08-03 timing analysis showed true silence only on hung runs) silently halved the
   # recovery window for stall/disconnect kills too. Default preserves the historical tie.
-  SALVAGE_SECS="${PRO_GATE_SALVAGE_SECS:-$STALL_SECS}"; [ "$LIVE_CONVERSATION" = 1 ] && SALVAGE_SECS="$HARD_SECS"
+  SALVAGE_SECS="$SALVAGE_WINDOW"; [ "$LIVE_CONVERSATION" = 1 ] && SALVAGE_SECS="$HARD_SECS"
   # v0.18: after a throttle hit, pause before the single polite salvage pass —
   # rendering the conversation immediately just re-triggers the limiter. The
   # salvage itself exits 5 fast if the account is still throttled.
   if [ "$THROTTLED" = 1 ]; then
-    THROTTLE_PAUSE="${PRO_GATE_THROTTLE_PAUSE:-300}"
+    # THROTTLE_PAUSE was resolved before lock sizing (the change-lock budget counts this pause).
     echo "[oracle-review] throttled — pausing ${THROTTLE_PAUSE}s before one polite salvage attempt..." >&2
     pg_status throttled "pausing ${THROTTLE_PAUSE}s before salvage"
     sleep "$THROTTLE_PAUSE"

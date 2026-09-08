@@ -112,6 +112,9 @@ chmod +x "$TIMEOUT_LOG_BIN"
 # slot, so its default must cover both the slot queue and the effective review hard cap. Exercise
 # the real engine path with a flock recorder that refuses only the per-change lock immediately;
 # this proves the budget passed to pg_lock without making the suite wait for minute-scale defaults.
+# gate #148 r2 P2 change-lock-holder-envelope: the same recorder also pins the REST of the holder's
+# guarded lifetime — its retries, throttle pause and salvage window — and the rule that a waiter's
+# own shorter --timeout can never shrink the envelope it credits a holder with.
 run_change_lock_wait_budget_tests() {
   local wait_user="$TDIR/wait-sizing-user" wait_bin="$TDIR/wait-sizing-user/.local/bin" wait_path wait_real_flock
   local wait_diff="$TDIR/wait-sizing.diff" wait_log="$TDIR/wait-sizing-flock.log"
@@ -148,13 +151,71 @@ WAIT_FLOCK
   RC=$?
   wait_observed="$(awk -F '\t' '$2 ~ /\.pr-/ { value=$1 } END { print value }' "$wait_log")"
   check 'gate #148 r1 P2 change-lock-wait-budget: default includes slot wait plus 60m timeout and grace' \
-    "$([ "$RC" -eq 7 ] && [ "$wait_observed" = 7620 ] && grep -Fq 'timed out after 7620s' "$TDIR/stderr"; echo $?)" \
+    "$([ "$RC" -eq 7 ] && [ "$wait_observed" = 11790 ] && grep -Fq 'timed out after 11790s' "$TDIR/stderr"; echo $?)" \
+    "rc=$RC observed=$wait_observed trace=$(cat "$wait_log") stderr=$(tail -3 "$TDIR/stderr")"
+
+  # gate #148 r2 P2: with nothing configured at all, the budget is the WHOLE holder envelope —
+  # 3900 slot wait + 2 attempts x (3720 hard cap + 150 reattach) + 1 x (30 probe + 20 backoff)
+  # + 300 throttle pause + 3720 salvage. The pre-fix formula stopped at 7620 (slot + one attempt),
+  # so a waiter expired while a holder that retried, paused or salvaged was still legally working.
+  wait_home="$TDIR/home-wait-envelope"; mkdir -p "$wait_home"; : > "$wait_log"
+  env -u PRO_GATE_TIMEOUT -u PRO_GATE_LOCK_WAIT -u PRO_GATE_CHANGE_LOCK_WAIT -u PRO_GATE_TIMEOUT_GRACE \
+    -u PRO_GATE_MAX_RETRIES -u PRO_GATE_REATTACH_TIMEOUT -u PRO_GATE_RETRY_BACKOFF \
+    -u PRO_GATE_STALL_SECS -u PRO_GATE_SALVAGE_SECS -u PRO_GATE_THROTTLE_PAUSE -u PRO_GATE_TEST_MODE \
+    HOME="$wait_user" PRO_GATE_HOME="$wait_home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+    PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_FLOCK_LOG="$wait_log" \
+    PG_TEST_FAIL_CHANGE_LOCK=1 PATH="$wait_path" NODE_OPTIONS= \
+    bash "$ENGINE" --diff "$wait_diff" --repo "$TDIR" --out "$wait_home/review.md" \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+  RC=$?
+  wait_observed="$(awk -F '\t' '$2 ~ /\.pr-/ { value=$1 } END { print value }' "$wait_log")"
+  check 'gate #148 r2 P2 change-lock-holder-envelope: shipped default covers the holder full guarded lifetime' \
+    "$([ "$RC" -eq 7 ] && [ "$wait_observed" = 15710 ] && grep -Fq 'timed out after 15710s' "$TDIR/stderr"; echo $?)" \
+    "rc=$RC observed=$wait_observed trace=$(cat "$wait_log") stderr=$(tail -3 "$TDIR/stderr")"
+
+  # gate #148 r2 P2: every retry/throttle/salvage window is counted, and a salvage window an
+  # operator raised above the hard cap raises the budget with it.
+  # 100 + 3 x (200 + 7) + 2 x (30 + 3) + 9 + 1000 = 1796.
+  wait_home="$TDIR/home-wait-retry-envelope"; mkdir -p "$wait_home"; : > "$wait_log"
+  env -u PRO_GATE_TEST_MODE HOME="$wait_user" PRO_GATE_HOME="$wait_home" ORACLE_BROWSER_PORT="$PORT" \
+    PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
+    PRO_GATE_LOCK_WAIT=100 PRO_GATE_TIMEOUT=200s PRO_GATE_TIMEOUT_GRACE=0 PRO_GATE_MAX_RETRIES=2 \
+    PRO_GATE_REATTACH_TIMEOUT=7 PRO_GATE_RETRY_BACKOFF=3 PRO_GATE_THROTTLE_PAUSE=9 \
+    PRO_GATE_STALL_SECS=11 PRO_GATE_SALVAGE_SECS=1000 \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_FLOCK_LOG="$wait_log" \
+    PG_TEST_FAIL_CHANGE_LOCK=1 PATH="$wait_path" NODE_OPTIONS= \
+    bash "$ENGINE" --diff "$wait_diff" --repo "$TDIR" --out "$wait_home/review.md" \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+  RC=$?
+  wait_observed="$(awk -F '\t' '$2 ~ /\.pr-/ { value=$1 } END { print value }' "$wait_log")"
+  check 'gate #148 r2 P2 change-lock-holder-envelope: retry, throttle and salvage windows are counted' \
+    "$([ "$RC" -eq 7 ] && [ "$wait_observed" = 1796 ] && grep -Fq 'timed out after 1796s' "$TDIR/stderr"; echo $?)" \
+    "rc=$RC observed=$wait_observed trace=$(cat "$wait_log") stderr=$(tail -3 "$TDIR/stderr")"
+
+  # gate #148 r2 P2: a one-off SHORTER --timeout must not shrink the envelope credited to a holder
+  # running on the configured default. 17 + 1 x (105 + 7) + 9 + 105 = 243, not the 35 a budget
+  # derived from this waiter's own 13s cap would produce.
+  wait_home="$TDIR/home-wait-short-timeout"; mkdir -p "$wait_home"; : > "$wait_log"
+  env HOME="$wait_user" PRO_GATE_HOME="$wait_home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+    PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
+    PRO_GATE_LOCK_WAIT=17 PRO_GATE_TIMEOUT=100s PRO_GATE_TIMEOUT_GRACE=5 \
+    PRO_GATE_REATTACH_TIMEOUT=7 PRO_GATE_THROTTLE_PAUSE=9 PRO_GATE_STALL_SECS=11 \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_FLOCK_LOG="$wait_log" \
+    PG_TEST_FAIL_CHANGE_LOCK=1 PATH="$wait_path" NODE_OPTIONS= \
+    bash "$ENGINE" --diff "$wait_diff" --repo "$TDIR" --out "$wait_home/review.md" --timeout 13s \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+  RC=$?
+  wait_observed="$(awk -F '\t' '$2 ~ /\.pr-/ { value=$1 } END { print value }' "$wait_log")"
+  check 'gate #148 r2 P2 change-lock-holder-envelope: a shorter waiter --timeout never shrinks the baseline' \
+    "$([ "$RC" -eq 7 ] && [ "$wait_observed" = 243 ] && grep -Fq 'timed out after 243s' "$TDIR/stderr"; echo $?)" \
     "rc=$RC observed=$wait_observed trace=$(cat "$wait_log") stderr=$(tail -3 "$TDIR/stderr")"
 
   wait_home="$TDIR/home-wait-configured"; mkdir -p "$wait_home"; : > "$wait_log"
   env HOME="$wait_user" PRO_GATE_HOME="$wait_home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
     PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
     PRO_GATE_LOCK_WAIT=17 PRO_GATE_TIMEOUT=23s PRO_GATE_TIMEOUT_GRACE=5 \
+    PRO_GATE_REATTACH_TIMEOUT=7 PRO_GATE_THROTTLE_PAUSE=9 PRO_GATE_STALL_SECS=11 \
     PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_FLOCK_LOG="$wait_log" \
     PG_TEST_FAIL_CHANGE_LOCK=1 PATH="$wait_path" NODE_OPTIONS= \
     bash "$ENGINE" --diff "$wait_diff" --repo "$TDIR" --out "$wait_home/review.md" \
@@ -162,21 +223,22 @@ WAIT_FLOCK
   RC=$?
   wait_observed="$(awk -F '\t' '$2 ~ /\.pr-/ { value=$1 } END { print value }' "$wait_log")"
   check 'gate #148 r1 P2 change-lock-wait-budget: configured timeout contributes to change budget' \
-    "$([ "$RC" -eq 7 ] && [ "$wait_observed" = 45 ] && grep -Fq 'timed out after 45s' "$TDIR/stderr"; echo $?)" \
+    "$([ "$RC" -eq 7 ] && [ "$wait_observed" = 89 ] && grep -Fq 'timed out after 89s' "$TDIR/stderr"; echo $?)" \
     "rc=$RC observed=$wait_observed trace=$(cat "$wait_log") stderr=$(tail -3 "$TDIR/stderr")"
 
   wait_home="$TDIR/home-wait-cli"; mkdir -p "$wait_home"; : > "$wait_log"
   env HOME="$wait_user" PRO_GATE_HOME="$wait_home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
     PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
     PRO_GATE_LOCK_WAIT=11 PRO_GATE_TIMEOUT=99s PRO_GATE_TIMEOUT_GRACE=7 \
+    PRO_GATE_REATTACH_TIMEOUT=7 PRO_GATE_THROTTLE_PAUSE=9 PRO_GATE_STALL_SECS=11 \
     PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_FLOCK_LOG="$wait_log" \
     PG_TEST_FAIL_CHANGE_LOCK=1 PATH="$wait_path" NODE_OPTIONS= \
-    bash "$ENGINE" --diff "$wait_diff" --repo "$TDIR" --out "$wait_home/review.md" --timeout 13s \
+    bash "$ENGINE" --diff "$wait_diff" --repo "$TDIR" --out "$wait_home/review.md" --timeout 199s \
     >"$TDIR/stdout" 2>"$TDIR/stderr"
   RC=$?
   wait_observed="$(awk -F '\t' '$2 ~ /\.pr-/ { value=$1 } END { print value }' "$wait_log")"
   check 'gate #148 r1 P2 change-lock-wait-budget: --timeout overrides configured timeout in change budget' \
-    "$([ "$RC" -eq 7 ] && [ "$wait_observed" = 31 ] && grep -Fq 'timed out after 31s' "$TDIR/stderr"; echo $?)" \
+    "$([ "$RC" -eq 7 ] && [ "$wait_observed" = 439 ] && grep -Fq 'timed out after 439s' "$TDIR/stderr"; echo $?)" \
     "rc=$RC observed=$wait_observed trace=$(cat "$wait_log") stderr=$(tail -3 "$TDIR/stderr")"
 
   wait_home="$TDIR/home-wait-override"; mkdir -p "$wait_home"; : > "$wait_log"
@@ -198,6 +260,7 @@ WAIT_FLOCK
   env HOME="$wait_user" PRO_GATE_HOME="$wait_home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
     PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
     PRO_GATE_LOCK_WAIT=0 PRO_GATE_TIMEOUT=23s PRO_GATE_TIMEOUT_GRACE=5 \
+    PRO_GATE_REATTACH_TIMEOUT=7 PRO_GATE_THROTTLE_PAUSE=9 PRO_GATE_STALL_SECS=11 \
     PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_FLOCK_LOG="$wait_log" \
     PATH="$wait_path" NODE_OPTIONS= \
     bash "$ENGINE" --diff "$wait_diff" --repo "$TDIR" --out "$wait_home/review.md" \
@@ -206,7 +269,7 @@ WAIT_FLOCK
   eval "exec ${wait_slot_fd}>&-"
   wait_observed="$(awk -F '\t' '$2 ~ /\.pr-/ { value=$1 } END { print value }' "$wait_log")"
   check 'gate #148 r1 P2 change-lock-wait-budget: slot wait remains separately bounded' \
-    "$([ "$RC" -eq 7 ] && [ "$wait_observed" = 28 ] && grep -Fq 'waits up to 0s if all busy' "$TDIR/stderr" && grep -Fq 'timed out after 0s — all 1 review slots are busy' "$TDIR/stderr"; echo $?)" \
+    "$([ "$RC" -eq 7 ] && [ "$wait_observed" = 72 ] && grep -Fq 'waits up to 0s if all busy' "$TDIR/stderr" && grep -Fq 'timed out after 0s — all 1 review slots are busy' "$TDIR/stderr"; echo $?)" \
     "rc=$RC observed-change=$wait_observed trace=$(cat "$wait_log") stderr=$(tail -5 "$TDIR/stderr")"
 
   # Hold the only account slot, let the first same-change run queue behind it, then start a waiter.
