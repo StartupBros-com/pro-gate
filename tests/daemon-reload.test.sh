@@ -80,7 +80,10 @@ printf '#!/usr/bin/env bash\n[ "${MOCK_CLAUDE_RC:-0}" = 0 ] || exit "$MOCK_CLAUD
 PATH="$TYPED_BIN:$PATH"; CLAUDE_MODEL=test FALLBACK_MODEL=test MAX_BUDGET=1
 RUN_DECISION="$TYPED_HOME/run-decision.json"; typed_decision 2 "$RUN_DECISION"
 RUN_PROMPT="$TYPED_HOME/run.prompt"
-printf -v EXPECTED_EFFECT '%q ' "$TYPED_ENGINE" --review-decision --review-decision-effect "$RUN_DECISION" --pr 1983 --repo "$TYPED_HOME" --out "$TYPED_LOG.review" --timeout "${PRO_REVIEW_ENGINE_TIMEOUT:-60m}"
+# #151: with PRO_REVIEW_ENGINE_TIMEOUT unset the worker argv carries NO --timeout, so the engine's
+# own sized fresh-review default (and a machine-wide PRO_GATE_TIMEOUT) reaches a daemon-launched
+# review. Same rule as the r1 P2 recovery path below.
+printf -v EXPECTED_EFFECT '%q ' "$TYPED_ENGINE" --review-decision --review-decision-effect "$RUN_DECISION" --pr 1983 --repo "$TYPED_HOME" --out "$TYPED_LOG.review"
 MOCK_PROMPT="$RUN_PROMPT" DD_ENGINE="$TYPED_ENGINE" DD_NWO=acme/widgets DD_NUM=1983 DD_SHA=1111111111111111111111111111111111111111 DD_WORKTREE="$TYPED_HOME" DD_LOG="$TYPED_LOG" daemon_run_review_worker "$RUN_DECISION"; worker_rc=$?
 check 'empty daemon input omits --input from the guarded effect worker argv' "$(grep -Fqx 'First action: execute this exact argv-quoted guarded runtime effect; it rechecks the saved review-decision/v1 before any charge or submission:' "$RUN_PROMPT" && grep -Fq "$EXPECTED_EFFECT" "$RUN_PROMPT" && ! grep -Fq -- '--input ' "$RUN_PROMPT"; echo $?)" "rc=$worker_rc"
 check 'run worker prompt restores fix/test/commit/push/comment lifecycle and no-merge guard' "$(grep -Fq '/pro-gate skill' "$RUN_PROMPT" && grep -Fq 'sanity-check every P0/P1' "$RUN_PROMPT" && grep -Fq 'tests and lint' "$RUN_PROMPT" && grep -Fq 'commit the fixes' "$RUN_PROMPT" && grep -Fq 'push this branch to origin' "$RUN_PROMPT" && grep -Fq 'exactly one audit PR comment' "$RUN_PROMPT" && grep -Fq 'Never merge' "$RUN_PROMPT"; echo $?)"
@@ -103,9 +106,25 @@ check 'empty daemon input omits --input from replacement query argv' "$([ "$defa
 # An explicit daemon value stays byte-identical across every subsequent command.
 DD_INPUT=connector; DD_INPUT_ARGS=(--input "$DD_INPUT")
 EXPLICIT_RUN_PROMPT="$TYPED_HOME/run-explicit.prompt"
-printf -v EXPLICIT_EFFECT '%q ' "$TYPED_ENGINE" --review-decision --review-decision-effect "$RUN_DECISION" --pr 1983 --repo "$TYPED_HOME" --input connector --out "$TYPED_LOG.review" --timeout "${PRO_REVIEW_ENGINE_TIMEOUT:-60m}"
+printf -v EXPLICIT_EFFECT '%q ' "$TYPED_ENGINE" --review-decision --review-decision-effect "$RUN_DECISION" --pr 1983 --repo "$TYPED_HOME" --input connector --out "$TYPED_LOG.review"
 MOCK_PROMPT="$EXPLICIT_RUN_PROMPT" DD_ENGINE="$TYPED_ENGINE" DD_NWO=acme/widgets DD_NUM=1983 DD_SHA=1111111111111111111111111111111111111111 DD_WORKTREE="$TYPED_HOME" DD_LOG="$TYPED_LOG" daemon_run_review_worker "$RUN_DECISION"; explicit_worker_rc=$?
 check 'explicit connector input is preserved byte-identically in worker argv' "$([ "$explicit_worker_rc" -eq 0 ] && grep -Fq "$EXPLICIT_EFFECT" "$EXPLICIT_RUN_PROMPT"; echo $?)" "rc=$explicit_worker_rc"
+
+# #151: the FRESH-review worker obeys the same rule as the r1 P2 recovery path. It used to send a
+# fixed 60m whenever PRO_REVIEW_ENGINE_TIMEOUT was unset, and because the engine treats any
+# --timeout it receives as final, a machine-wide PRO_GATE_TIMEOUT could never reach a
+# daemon-launched review at all. These must run BEFORE the stub that replaces
+# daemon_run_review_worker further down, or they assert nothing.
+FRESH_TIMEOUT_PROMPT="$TYPED_HOME/run-timeout.prompt"
+( unset PRO_REVIEW_ENGINE_TIMEOUT
+  MOCK_PROMPT="$FRESH_TIMEOUT_PROMPT" DD_ENGINE="$TYPED_ENGINE" DD_NWO=acme/widgets DD_NUM=1983 DD_SHA=1111111111111111111111111111111111111111 DD_WORKTREE="$TYPED_HOME" DD_LOG="$TYPED_LOG" daemon_run_review_worker "$RUN_DECISION" )
+check '#151: daemon fresh review sends no --timeout when PRO_REVIEW_ENGINE_TIMEOUT is unset, so the engine fresh default applies' \
+  "$([ -s "$FRESH_TIMEOUT_PROMPT" ] && ! grep -Fq -- '--timeout' "$FRESH_TIMEOUT_PROMPT"; echo $?)" "prompt=$(head -c 200 "$FRESH_TIMEOUT_PROMPT" 2>/dev/null | tr '\n' ' ')"
+FRESH_TIMEOUT_SET_PROMPT="$TYPED_HOME/run-timeout-set.prompt"
+( export PRO_REVIEW_ENGINE_TIMEOUT=9m
+  MOCK_PROMPT="$FRESH_TIMEOUT_SET_PROMPT" DD_ENGINE="$TYPED_ENGINE" DD_NWO=acme/widgets DD_NUM=1983 DD_SHA=1111111111111111111111111111111111111111 DD_WORKTREE="$TYPED_HOME" DD_LOG="$TYPED_LOG" daemon_run_review_worker "$RUN_DECISION" )
+check '#151: daemon fresh review passes an explicit PRO_REVIEW_ENGINE_TIMEOUT through as --timeout' \
+  "$([ -s "$FRESH_TIMEOUT_SET_PROMPT" ] && grep -Fq -- '--timeout 9m' "$FRESH_TIMEOUT_SET_PROMPT"; echo $?)" "prompt=$(head -c 200 "$FRESH_TIMEOUT_SET_PROMPT" 2>/dev/null | tr '\n' ' ')"
 
 # A nonzero run worker must re-query with the same input before it can consume the wrapper budget.
 FAIL_NOTES=0

@@ -57,7 +57,14 @@ daemon_agent_task_available(){
 
 daemon_run_review_worker(){ # saved run-granted-review decision-file
   local decision="$1" command_text prompt
-  printf -v command_text '%q ' "$DD_ENGINE" --review-decision --review-decision-effect "$decision" --pr "$DD_NUM" --repo "$DD_WORKTREE" "${DD_INPUT_ARGS[@]}" --out "$DD_LOG.review" --timeout "${PRO_REVIEW_ENGINE_TIMEOUT:-60m}"
+  # Closes #151, and the exact symmetry of the r1 P2 fix on the recovery path below: the engine
+  # treats any --timeout it receives as final, so supplying one unconditionally means the engine's
+  # own sized default -- and therefore a machine-wide PRO_GATE_TIMEOUT, which README and
+  # .env.example both document as THE fresh-review default -- could never reach a daemon-launched
+  # review. Pass a timeout only when the operator configured one; otherwise let the engine size it.
+  local review_timeout=()
+  [ -z "${PRO_REVIEW_ENGINE_TIMEOUT:-}" ] || review_timeout=(--timeout "$PRO_REVIEW_ENGINE_TIMEOUT")
+  printf -v command_text '%q ' "$DD_ENGINE" --review-decision --review-decision-effect "$decision" --pr "$DD_NUM" --repo "$DD_WORKTREE" "${DD_INPUT_ARGS[@]}" --out "$DD_LOG.review" "${review_timeout[@]}"
   prompt="First action: execute this exact argv-quoted guarded runtime effect; it rechecks the saved review-decision/v1 before any charge or submission:
 $command_text
 After that action, invoke the /pro-gate skill and let its typed review-decision/v1 re-resolution select every subsequent fix, evidence, or reporting action. Do not infer a continuation from verdict, prose, phase, exit status, recoverability, or rounds, and do not ask routine permission.
