@@ -2808,6 +2808,8 @@ bind_case own-extra-space 1 "P0: none
 VERDICT: SHIP (run marker:  $BIND_MARKER )"
 bind_case own-no-space 1 "P0: none
 VERDICT: SHIP (run marker:$BIND_MARKER)"
+bind_case own-code 1 "P0: none
+VERDICT: SHIP (run marker: \`$BIND_MARKER\`)"
 bind_case own-nonterminal 1 "P0: none
 VERDICT: SHIP (run marker: $BIND_MARKER)
 VERDICT: FIX-FIRST — no final owned echo"
@@ -2819,6 +2821,9 @@ $OWN164"
 bind_case foreign-last 2 "$OWN164
 $OTHER164"
 bind_case foreign-only 2 "$OTHER164"
+bind_case foreign-code 2 "P0: none
+VERDICT: SHIP (run marker: \`$FOREIGN164\`)
+$OWN164"
 bind_case dual-own-first 2 "P0: none
 VERDICT: SHIP (run marker: $BIND_MARKER) (run marker: $FOREIGN164)"
 bind_case dual-foreign-first 2 "P0: none
@@ -2971,6 +2976,7 @@ marker="${BASH_REMATCH[1]}"
 printf '%s\n' "$marker" > "${PG_TEST_MARKER_FILE:?}"
 {
   [ "$PG_TEST_MODE" = foreign-first ] && printf '[P0] other/a.ts:1 — foreign\nVERDICT: FIX-FIRST (run marker: %s)\n\n' "$PG_TEST_FOREIGN"
+  [ "$PG_TEST_MODE" = foreign-first-code ] && printf '[P0] other/a.ts:1 — foreign\nVERDICT: FIX-FIRST (run marker: `%s`)\n\n' "$PG_TEST_FOREIGN"
   printf '[P1] src/real.sh:4 — direct fixture finding\nP2: none\nP3: none\nVERDICT: SHIP — direct. (run marker: %s)' "$marker"
   [ "$PG_TEST_MODE" = dual ] && printf ' (run marker: %s)' "$PG_TEST_FOREIGN"
   printf '\n'
@@ -2981,7 +2987,7 @@ printf 'Acquired ChatGPT browser slot\n'
 exit 0
 ORACLE_CROSSFEED
 chmod +x "$TDIR/bin/oracle-crossfeed"
-for DIRECT_MODE in clean foreign-first foreign-last dual; do
+for DIRECT_MODE in clean foreign-first foreign-first-code foreign-last dual; do
   DIRECT_HOME="$TDIR/home-direct-$DIRECT_MODE"; DIRECT_OUT="$TDIR/direct-$DIRECT_MODE.md"
   mkdir -p "$DIRECT_HOME"
   printf 'idle fixture tab\n' > "$TDIR/tab.txt"

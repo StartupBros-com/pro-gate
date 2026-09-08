@@ -2370,10 +2370,13 @@ pg_strip_nonce() {
 }
 
 # Review ownership is claimed by top-level authoritative verdicts, never by arbitrary
-# marker mentions. Mirror reviewVerdictClaims in bin/cdp-organizer-expressions.mjs. Markdown quotes,
-# indented examples and fenced code are reference text; the browser preserves that context
-# when collecting rendered blockquote/pre elements. Scan the WHOLE response before accepting
-# it: a foreign verdict after our own is just as mixed as one before it.
+# marker mentions. Mirror reviewVerdictClaims in bin/cdp-organizer-expressions.mjs.
+# Markdown quotes, indented examples and fenced code are reference text; the browser
+# preserves that context when collecting rendered blockquote/pre elements.
+# In CLAIMS mode, normalize inline-code around run-marker tokens so a code-wrapped
+# foreign marker still counts as foreign. Keep terminal ownership strictly canonical.
+# Scan the WHOLE response before accepting it: a foreign verdict after our own is just
+# as mixed as one before it.
 pg_capture_verdict_claims() { # file [verdict|terminal] -> claims, decision or terminal claims
   awk -v mode="${2:-claims}" '
     {
@@ -2399,12 +2402,13 @@ pg_capture_verdict_claims() { # file [verdict|terminal] -> claims, decision or t
         decision = toupper(substr(low, RSTART, RLENGTH))
         next
       }
-      while (match(tolower(s), /\(run marker:[ \t]*pg-run-[a-z0-9.-]+[ \t]*\)/)) {
+      while (match(tolower(s), /\(run marker:[ \t]*`?pg-run-[a-z0-9.-]+`?[ \t]*\)/)) {
         token = substr(s, RSTART, RLENGTH)
         literal = token
         s = substr(s, RSTART + RLENGTH)
         sub(/^\([^:]*:[ \t]*/, "", token)
         sub(/[ \t]*\)$/, "", token)
+        gsub(/^`|`$/, "", token)
         if (mode == "terminal") {
           if (literal == "(run marker: " token ")") terminal = terminal token "\n"
         } else print token

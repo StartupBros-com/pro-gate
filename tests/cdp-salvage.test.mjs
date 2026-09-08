@@ -2100,6 +2100,33 @@ const FOREIGN_ANSWER = (m) => [
   cdp.stop();
 }
 
+{ // #68 gate r2 P3: flat-text fallback keeps the first no-role run marker line as the prompt
+  // boundary, so a later `run marker: <ours>` cannot erase an earlier foreign verdict.
+  const foreign = 'pg-run-foreigntest-2619-1111111111-9';
+  const promptBoundaryDrift = [
+    `run marker: ${MARKER}`,
+    '[P1] lib/example.sh:1 — mixed review sample',
+    `VERDICT: FIX-FIRST — foreign run's claim. (run marker: ${foreign})`,
+    '[P1] lib/example.sh:2 — prompt marker appears in findings text',
+    `run marker: ${MARKER}`,
+    'P2: none',
+    `VERDICT: SHIP — ours. (run marker: ${MARKER})`,
+  ].join('\n');
+  const promptBoundaryCapture = promptBoundaryDrift.split('\n').slice(1).join('\n');
+  const cdp = await mockCdp(promptBoundaryDrift);
+  const capture = await runSalvage([MARKER, '15'], cdp.port);
+  const binding = bindCapture(capture.stdout, MARKER);
+  check(
+    'flat-text foreign verdict survives a later own-marker line and fails shell binding',
+    capture.status === 0 &&
+      capture.stdout === promptBoundaryCapture + '\n' &&
+      binding.status === 2 &&
+      binding.retained === capture.stdout,
+    'status=' + capture.status + ' bind=' + binding.status + ' stdout=' + JSON.stringify(capture.stdout),
+  );
+  cdp.stop();
+}
+
 { // #68 gate r2 P2: a conviction is per-CANDIDATE. If another tab turns out to be genuinely
   // ours, the marker must not stay flagged terminally cross-bound.
   const foreignTab = { id: 'foreign1', url: 'https://chatgpt.com/c/foreign-one' };

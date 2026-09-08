@@ -68,8 +68,10 @@ export function reviewVerdictClaims(text, marker) {
     }
     if (delimiter) { fence = delimiter[1]; continue; }
     if (/^(?: {4}|\t| {0,3}>)/.test(line)) continue;
-    if (line === 'run marker: ' + marker ||
-        line.startsWith('(run marker: ' + marker + ' — internal correlation id')) promptAt = start;
+    if (promptAt < 0 && (
+      line === 'run marker: ' + marker ||
+      line.startsWith('(run marker: ' + marker + ' — internal correlation id')
+    )) promptAt = start;
     if (!/^[*_# \t-]*VERDICT[*_ \t]*:[*_ \t]*(ship|fix-first|needs-discussion)([^a-z0-9_-]|$)/i.test(line)) continue;
     const markers = [...line.matchAll(/\(run marker:[ \t]*(pg-run-[A-Za-z0-9.-]+)[ \t]*\)/gi)].map((match) => match[1]);
     claims.push({ line, at: start, markers });
