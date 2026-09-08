@@ -5691,6 +5691,48 @@ pg_dirlock_reclaim_dead "$GUARD_LIVE_DIR"; GUARD_LIVE_RC=$?
 check 'gate #148 r3 P2: a live pid with a matching token still holds its guard' \
   "$([ "$GUARD_LIVE_RC" -ne 0 ] && [ -d "$GUARD_LIVE_DIR" ]; echo $?)" "rc=$GUARD_LIVE_RC"
 
+# gate #148 r5 P1: the no-BASHPID fallback must name the shell that actually holds the guard.
+# Two contenders, flock disabled AND BASHPID unset — the exact bash 3.2 path, and the only path
+# that uses the fallback at all. When the fallback published an already-exited pid (an `||` inside
+# the command substitution defeats bash's exec replacement, so `sh` reported an inner subshell),
+# that owner had no /proc entry, produced an empty token, and read as dead to every reclaimer, so
+# B took the guard while A was still inside it. The log must never show a second `enter` before
+# the matching `exit`.
+GUARD_FB_HOME="$TDIR/home-guard-fallback"; mkdir -p "$GUARD_FB_HOME/home"
+GUARD_FB_LOG="$GUARD_FB_HOME/log"; : > "$GUARD_FB_LOG"
+guard_fb_holder() { # name start-delay
+  bash --noprofile --norc -c '
+    LIB="$1"; NAME="$2"; DELAY="$3"; HOMEDIR="$4"; LOG="$5"
+    unset BASHPID
+    . "$LIB"
+    pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
+    [ "$DELAY" = 0 ] || sleep "$DELAY"
+    export PRO_GATE_HOME="$HOMEDIR/home"
+    PRO_GATE_RESERVATION_GUARD_WAIT=2 pg_reservation_guard_acquire || { echo "fail $NAME" >> "$LOG"; exit 9; }
+    echo "enter $NAME" >> "$LOG"; sleep 3; echo "exit $NAME" >> "$LOG"
+    pg_reservation_guard_release
+  ' _ "$HERE/../lib/pro-gate-lib.sh" "$1" "$2" "$GUARD_FB_HOME" "$GUARD_FB_LOG"
+}
+guard_fb_holder A 0 & GUARD_FB_A=$!
+guard_fb_holder B 1 & GUARD_FB_B=$!
+wait "$GUARD_FB_A" 2>/dev/null; wait "$GUARD_FB_B" 2>/dev/null
+check 'gate #148 r5 P1: with no BASHPID, two contenders never both hold the reservation guard' \
+  "$(awk '$1=="enter"{if(open)bad=1; open=1} $1=="exit"{open=0} END{exit bad}' "$GUARD_FB_LOG"; echo $?)" \
+  "log=$(tr '\n' ';' < "$GUARD_FB_LOG")"
+# The holder that did get in must have published a provable owner: a numeric pid and a NON-EMPTY
+# start-time token. An empty token is what made the bogus owner read as dead.
+GUARD_FB_ACQUIRED="$(grep -c '^enter ' "$GUARD_FB_LOG" 2>/dev/null || echo 0)"
+check 'gate #148 r5 P1: the no-BASHPID fallback still lets exactly one contender acquire' \
+  "$([ "$GUARD_FB_ACQUIRED" -ge 1 ]; echo $?)" "entered=$GUARD_FB_ACQUIRED log=$(tr '\n' ';' < "$GUARD_FB_LOG")"
+# A marker may only be published with a non-empty token, so an unprovable owner refuses instead.
+GUARD_TOKENLESS_DIR="$GUARD_FB_HOME/tokenless.lock.d"
+mkdir -p "$GUARD_TOKENLESS_DIR"
+: > "$GUARD_TOKENLESS_DIR/owner.999999999"          # dead pid, empty token
+touch -t 202001010000 "$GUARD_TOKENLESS_DIR" 2>/dev/null
+pg_dirlock_reclaim_dead "$GUARD_TOKENLESS_DIR"; GUARD_TOKENLESS_RC=$?
+check 'gate #148 r5 P1: an empty-token marker for a dead pid is reclaimed, never treated as held' \
+  "$([ "$GUARD_TOKENLESS_RC" -eq 0 ] && [ ! -d "$GUARD_TOKENLESS_DIR" ]; echo $?)" "rc=$GUARD_TOKENLESS_RC"
+
 # gate #148 r1 P2 (engine side): a --harvest/--recover with no --timeout takes its budget from
 # PRO_GATE_HARVEST_TIMEOUT (default 45m). The daemon's recovery now relies on exactly this instead
 # of supplying the 60m fresh-review wait. The outer coreutils timeout turns a regression (the env

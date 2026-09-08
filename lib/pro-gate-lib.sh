@@ -1192,14 +1192,25 @@ pg_reservation_guard_acquire() {
   # own short-lived subshell and reinstate exactly the defect it fixes.
   #
   # BASHPID is bash 4+. Stock macOS /bin/bash is 3.2, and macOS is also the platform with no flock,
-  # so the one shell that always reaches this fallback was the one silently falling back to $$ and
-  # re-opening r2 P1 (v0.41 defect). `sh -c 'echo $PPID'` runs in a forked child of whichever shell
-  # evaluates it, so its PPID is that shell: verified identical to BASHPID both at top level and
-  # inside a command substitution.
+  # so the one shell that always reaches this fallback is the one that was silently falling back to
+  # $$ and re-opening r2 P1 (v0.41 defect).
+  #
+  # `exec` is load-bearing (gate #148 r5 P1). Bash replaces a command-substitution subshell with a
+  # lone simple command, so $PPID there names the shell that actually holds the guard. Adding any
+  # `|| fallback` INSIDE the substitution makes it a compound command, bash forks an extra subshell,
+  # and sh reports THAT subshell -- a pid which has already exited by the time the marker is
+  # published, whose /proc entry is gone, and which therefore yields an empty token and reads as
+  # dead to every reclaimer. A contender then reclaimed a guard whose real holder was still inside
+  # its critical section: the exact double-hold this release fixes, reintroduced by the fallback.
+  # Failure is handled OUT here and REFUSES the acquisition rather than publishing a wrong owner.
   PG_RESERVATION_GUARD_OWNER="${BASHPID:-}"
-  [ -n "$PG_RESERVATION_GUARD_OWNER" ] \
-    || PG_RESERVATION_GUARD_OWNER="$(sh -c 'echo $PPID' 2>/dev/null || printf '%s' "$$")"
-  local waited=0 spins=0 max_spins
+  if [ -z "$PG_RESERVATION_GUARD_OWNER" ]; then
+    PG_RESERVATION_GUARD_OWNER="$(exec sh -c 'echo "$PPID"' 2>/dev/null)"
+    case "$PG_RESERVATION_GUARD_OWNER" in
+      ''|*[!0-9]*) PG_RESERVATION_GUARD_DIR=""; PG_RESERVATION_GUARD_OWNER=""; return 1;;
+    esac
+  fi
+  local waited=0 spins=0 max_spins guard_token
   # Reclaim retries are not sleeps, so they need their own bound or a pathological alternation of
   # dead owners loops without ever reaching the wait bound.
   max_spins=$(( wait_s * 100 + 100 ))
@@ -1209,7 +1220,13 @@ pg_reservation_guard_acquire() {
       # confirm we are the ONLY owner. A second marker means a reclaimer took our still-empty
       # directory and another shell re-created it at the same pathname, in which case our write
       # landed in a guard we do not hold: stand down and retry rather than return a false hold.
-      if printf '%s' "$(pg_pid_token "$PG_RESERVATION_GUARD_OWNER" 2>/dev/null || true)" \
+      #
+      # gate #148 r5 P1: the token must be NON-EMPTY before the marker is published. An empty token
+      # means the owner pid has no readable process, so every reclaimer reads this marker as dead
+      # and takes the guard while we are inside it. Refuse rather than publish an unprovable owner.
+      guard_token="$(pg_pid_token "$PG_RESERVATION_GUARD_OWNER" 2>/dev/null || true)"
+      if [ -n "$guard_token" ] \
+         && printf '%s' "$guard_token" \
            > "$PG_RESERVATION_GUARD_DIR/owner.$PG_RESERVATION_GUARD_OWNER" 2>/dev/null \
          && [ "$(pg_dirlock_owner_count "$PG_RESERVATION_GUARD_DIR")" = 1 ]; then
         return 0
