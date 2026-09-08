@@ -12,11 +12,12 @@
 // Run: node tests/cdp-salvage.test.mjs
 import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
+import { runInNewContext } from 'node:vm';
 
 import {
   buildArchiveConversationExpression,
@@ -34,7 +35,95 @@ import {
 } from '../bin/cdp-test-timing.mjs';
 
 const SALVAGE = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'cdp-salvage.mjs');
+const LIBRARY = path.join(path.dirname(SALVAGE), '..', 'lib', 'pro-gate-lib.sh');
 const WS_MAGIC = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+
+function bindCapture(bytes, marker) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-dom-bind-'));
+  const capture = path.join(home, 'capture.txt');
+  fs.writeFileSync(capture, bytes);
+  const result = spawnSync(
+    'bash',
+    ['-c', '. "$1"; pg_capture_bind "$2" "$3"', 'browser-capture-fixture', LIBRARY, capture, marker],
+    {
+      env: { ...process.env, PRO_GATE_HOME: home },
+      encoding: 'utf8',
+    },
+  );
+  if (result.stderr) process.stderr.write(result.stderr);
+  const retained = fs.readFileSync(capture, 'utf8');
+  fs.rmSync(home, { recursive: true, force: true });
+  return { ...result, retained };
+}
+
+// A small rendered control fixture for executing the real independent mutation expression.
+// Drift happens after its first ownership check, when it discovers the sidebar menu control.
+function organizerExpressionFixture(
+  body,
+  { document = null, driftText = null, title = 'unchanged title' } = {},
+) {
+  const events = [];
+  let currentText = body;
+  let sidebarReads = 0;
+  class Element {
+    getBoundingClientRect() {
+      return { width: 20, height: 20, left: 0, top: 0, right: 20 };
+    }
+    getAttribute(name) {
+      return name === 'aria-label' ? 'Open conversation options' : null;
+    }
+    dispatchEvent(event) {
+      events.push(event.type);
+    }
+  }
+  const button = new Element();
+  const row = { querySelectorAll: () => [button] };
+  const link = new Element();
+  link.getAttribute = (name) => (name === 'href' ? '/c/mock-conversation' : null);
+  link.closest = () => row;
+  link.textContent = title;
+  const fixtureDocument = document ?? {
+    body: {
+      get innerText() {
+        return currentText;
+      },
+    },
+  };
+  const priorQuery = fixtureDocument.querySelectorAll?.bind(fixtureDocument);
+  fixtureDocument.querySelectorAll = (selector) => {
+    if (selector === '[data-message-author-role]') return priorQuery?.(selector) ?? [];
+    if (selector === 'a[href]') {
+      sidebarReads += 1;
+      if (driftText !== null) currentText = driftText;
+      return [link];
+    }
+    return [];
+  };
+  fixtureDocument.dispatchEvent = (event) => events.push(event.type);
+  class FixtureEvent {
+    constructor(type) {
+      this.type = type;
+    }
+  }
+  return {
+    events,
+    sidebarReads: () => sidebarReads,
+    context: {
+      document: fixtureDocument,
+      location: { href: 'https://chatgpt.com/c/mock-conversation' },
+      window: { innerWidth: 1200 },
+      URL,
+      setTimeout,
+      HTMLElement: Element,
+      HTMLInputElement: Element,
+      getComputedStyle: () => ({ visibility: 'visible', display: 'block' }),
+      MouseEvent: FixtureEvent,
+      KeyboardEvent: FixtureEvent,
+      InputEvent: FixtureEvent,
+      Event: FixtureEvent,
+    },
+  };
+}
 
 // Minimal RFC6455 server-side text frame (unmasked, handles lengths up to 64KiB).
 function wsTextFrame(payload) {
@@ -237,7 +326,9 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
       let delayMs = 0;
       let armMutation = null;
       let applyMutation = null;
-      if (expression.includes('pro-gate:terminal-infrastructure')) {
+      if (expression.includes('pro-gate:review-text') && opts.document) {
+        value = runInNewContext(expression, { document: opts.document });
+      } else if (expression.includes('pro-gate:terminal-infrastructure')) {
         value = opts.infrastructureError ?? null;
       } else if (expression.includes('pro-gate-organizer:rename')) {
         const expected = expectedTitleFromExpression(expression);
@@ -295,7 +386,7 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
       }
       const armLate = ui.armMutationAfterDelay && armMutation;
       const primaryDomPoll = id === 'tab1' && request.method === 'Runtime.evaluate' &&
-        expression === 'document.body.innerText';
+        expression.includes('pro-gate:review-text');
       const response = () => {
         if (armLate) armMutation();
         applyMutation?.();
@@ -959,239 +1050,337 @@ const MARKER = 'pg-run-test-1234567890-42';
   crossBoundCdp.stop();
 }
 
-{ // #164: two runs' prompts can reach ONE conversation, and the model then answers both — the
-  // page holds two complete verdict-terminated blocks, one per marker. Only the block closed by
-  // THIS run's verdict may be emitted, in EITHER layout. The inverse layout matters as much as
-  // the reported one: convicting a page that carries our own verdict blacklists and forgets the
-  // conversation holding our answer, which costs the whole charged round.
+{
+  // Mixed results remain intact as diagnostic capture evidence for the engine's provenance gate.
   const foreign = 'pg-run-other-repo-2619-1111111111-9';
-  const ourBlock = ['P0: none', 'P1: none', `VERDICT: SHIP — ours. (run marker: ${MARKER})`];
-  const foreignBlock = [
-    '[P0] apps/blog-writer/src/hazards.claims.ts:31 — a tree this repository does not have',
-    'P1: none',
-    `VERDICT: FIX-FIRST — theirs. (run marker: ${foreign})`,
+  const ours = ['P0: none', 'P1: none', 'VERDICT: SHIP — ours. (run marker: ' + MARKER + ')'];
+  const theirs = [
+    '[P0] other/a.ts:1 — foreign finding',
+    'VERDICT: FIX-FIRST — theirs. (run marker: ' + foreign + ')',
   ];
-  for (const [layout, body] of [
-    ['foreign block first', [`run marker: ${MARKER}`, ...foreignBlock, '', ...ourBlock]],
-    ['foreign block last', [`run marker: ${MARKER}`, ...ourBlock, '', ...foreignBlock]],
+  const dual = ['P0: none', 'VERDICT: SHIP (run marker: ' + MARKER + ') (run marker: ' + foreign + ')'];
+  for (const [layout, answer] of [
+    ['foreign first', [...theirs, '', ...ours]],
+    ['foreign last', [...ours, '', ...theirs]],
+    ...['- **VERDICT:**', '## **VERDICT:**'].flatMap((label) => {
+      const formattedTheirs = theirs.map((line) => line.replace('VERDICT:', label));
+      const formattedOurs = ours.map((line) => line.replace('VERDICT:', label));
+      return [
+        [label + ' foreign first', [...formattedTheirs, '', ...formattedOurs]],
+        [label + ' foreign last', [...formattedOurs, '', ...formattedTheirs]],
+      ];
+    }),
+    ['dual marker verdict', dual],
+    ['foreign verdict without heading', [theirs[1], ...ours]],
+    ['owned verdict without heading', [...theirs, ours[2]]],
+    ['own marker mentioned in a finding', [...theirs, '[P1] src/own.ts:4 — run marker: ' + MARKER, ...ours]],
+    [
+      'fenced compact prompt example',
+      [...theirs, '[P1] src/own.ts:4 — prompt example', '~~~', 'run marker: ' + MARKER, '~~~', ...ours],
+    ],
+    [
+      'fenced engine prompt example',
+      [
+        ...theirs,
+        '[P1] src/own.ts:4 — prompt example',
+        '~~~',
+        '(run marker: ' + MARKER + ' — internal correlation id)',
+        '~~~',
+        ...ours,
+      ],
+    ],
   ]) {
-    const cdp = await mockCdp(body.join('\n'));
+    const body = 'run marker: ' + MARKER + '\n' + answer.join('\n');
+    const cdp = await mockCdp(body);
+    const capture = await runSalvage([MARKER, '3'], cdp.port);
+    check(
+      'mixed capture keeps every byte for engine rejection (' + layout + ')',
+      capture.status === 0 && capture.stdout === answer.join('\n') + '\n',
+      'status=' + capture.status + ' stdout=' + JSON.stringify(capture.stdout),
+    );
+    const binding = bindCapture(capture.stdout, MARKER);
+    check(
+      'browser mixed evidence fails shell binding without rewriting (' + layout + ')',
+      binding.status === 2 && binding.retained === capture.stdout,
+      'status=' + binding.status + ' stderr=' + binding.stderr,
+    );
+    check(
+      'mixed capture preserves conversation evidence (' + layout + ')',
+      cdp.closed.length === 0 && capture.crossbound === 0 && capture.blacklist === null,
+      'closed=' + cdp.closed + ' blacklist=' + capture.blacklist,
+    );
+    const probe = await runSalvage(['--probe', MARKER, '3'], cdp.port);
+    check(
+      'mixed capture never proves completed review ownership (' + layout + ')',
+      probe.status === 0 &&
+        probe.stderr.includes('probe-state: generating') &&
+        !probe.stderr.includes('probe-state: complete'),
+      'status=' + probe.status + ' stderr=' + probe.stderr,
+    );
+    cdp.stop();
+    for (const owner of [MARKER, foreign]) {
+      for (const mode of ['organize', 'finalize', 'close']) {
+        const mutationCdp = await mockCdp(body);
+        const args = mode === 'finalize' ? finalizerArgs(owner) : ['--' + mode, owner, '3'];
+        const result = await runSalvage(
+          args,
+          mutationCdp.port,
+          seedOrganizer(owner, 'pro-gate review: mixed', null, durableReview(ours.join('\n'), owner)),
+        );
+        check(
+          'shared mixed conversation cannot mutate for either owner (' +
+            layout +
+            ', ' +
+            owner +
+            ', ' +
+            mode +
+            ')',
+          result.status === 0 && mutationCdp.ui.events.length === 0 && mutationCdp.closed.length === 0,
+          'status=' + result.status + ' stdout=' + result.stdout + ' closed=' + mutationCdp.closed,
+        );
+        mutationCdp.stop();
+      }
+    }
+  }
+}
+
+{
+  // Reference text never creates cross-task ownership, and extraction keeps the complete finding.
+  const foreign = 'pg-run-other-repo-2619-1111111111-9';
+  const example = 'VERDICT: SHIP — incident. (run marker: ' + foreign + ')';
+  const tick = String.fromCharCode(96);
+  for (const [kind, reference] of [
+    ['prose marker', ['The incident used (run marker: ' + foreign + ').']],
+    ['inline verdict quote', ['The incident said "' + example + '".']],
+    ['blockquote', ['> ' + example]],
+    ['indented block', ['    ' + example]],
+    ['tab indented block', ['\t' + example]],
+    ['backtick fence', [tick.repeat(3) + 'text', example, tick.repeat(3)]],
+    ['tilde fence', ['~~~text', example, '~~~']],
+    ['long fence with short embedded fence', [tick.repeat(4), tick.repeat(3), example, tick.repeat(4)]],
+    ['other fence cannot close code', [tick.repeat(3), '~~~', example, tick.repeat(3)]],
+    ['heading without decision', ['VERDICT: example from ' + foreign]],
+  ]) {
+    const answer = [
+      'P0: none',
+      '[P1] src/real.sh:4 — reference example',
+      ...reference,
+      'and the finding continues',
+      '[P2] src/other.sh:9 — another finding',
+      'VERDICT: FIX-FIRST — ours. (run marker: ' + MARKER + ')',
+    ].join('\n');
+    const cdp = await mockCdp('run marker: ' + MARKER + '\n' + answer);
     const r = await runSalvage([MARKER, '3'], cdp.port);
-    check(`two-marker answer emits only this run's block (${layout})`,
-      r.status === 0 && r.stdout.trim() === ourBlock.join('\n'),
-      `status=${r.status} stdout=${JSON.stringify(r.stdout)}`);
-    check(`two-marker answer emits no foreign finding or marker (${layout})`,
-      !r.stdout.includes(foreign) && !r.stdout.includes('hazards.claims.ts'),
-      `stdout=${JSON.stringify(r.stdout)}`);
-    check(`a page carrying this run's own verdict is never convicted cross-bound (${layout})`,
-      r.crossbound === 0 && r.blacklist === null,
-      `crossbound=${r.crossbound} blacklist=${r.blacklist}`);
+    check(
+      'ordinary owned answer preserves exact capture bytes (' + kind + ')',
+      r.status === 0 && r.stdout === answer + '\n',
+      'status=' + r.status + ' stdout=' + JSON.stringify(r.stdout),
+    );
+    const probe = await runSalvage(['--probe', MARKER, '3'], cdp.port);
+    check(
+      'inert references preserve owned completion (' + kind + ')',
+      probe.status === 0 && probe.stderr.includes('probe-state: complete'),
+      'stderr=' + probe.stderr,
+    );
     cdp.stop();
   }
 }
 
-{ // #166 gate r1 P1: a review may QUOTE a verdict inside a finding. Flooring the emitted block on
-  // that quoted line deletes the finding's own header and publishes the remainder, which still
-  // looks structurally like a review — nothing downstream catches it. Only a real terminator
-  // (unquoted, unindented, unfenced) may bound a block; mirrored by pg_capture_own_segment.
-  const body = [
-    `run marker: ${MARKER}`,
-    '',
-    '[P1] src/real.sh:4 — reviews sometimes show a verdict inline',
-    '  > VERDICT: SHIP — example',
-    '  and keep explaining afterwards',
-    'P2: none',
-    'P3: none',
-    `VERDICT: FIX-FIRST — ours. (run marker: ${MARKER})`,
-  ];
-  const cdp = await mockCdp(body.join('\n'));
-  const r = await runSalvage([MARKER, '3'], cdp.port);
-  check('a verdict quoted in a finding does not truncate the emitted block',
-    r.status === 0 && r.stdout.includes('[P1] src/real.sh:4') && r.stdout.includes('and keep explaining afterwards'),
-    `status=${r.status} stdout=${JSON.stringify(r.stdout)}`);
-  check('a verdict quoted in a finding still ends the block at OUR terminal verdict',
-    r.stdout.trim() === body.slice(2).join('\n'),
-    `stdout=${JSON.stringify(r.stdout)}`);
-  cdp.stop();
+{
+  for (const label of ['- **VERDICT:**', '## **VERDICT:**']) {
+    const answer = 'P0: none\n' + label + ' SHIP — ours. (run marker: ' + MARKER + ')';
+    const cdp = await mockCdp('run marker: ' + MARKER + '\n' + answer);
+    const capture = await runSalvage([MARKER, '3'], cdp.port);
+    const binding = bindCapture(capture.stdout, MARKER);
+    check(
+      'formatted owned verdict publishes byte-preserving capture (' + label + ')',
+      capture.status === 0 &&
+        capture.stdout === answer + '\n' &&
+        binding.status === 0 &&
+        binding.retained === capture.stdout,
+      'status=' + capture.status + ' bind=' + binding.status + ' stdout=' + capture.stdout,
+    );
+    const probe = await runSalvage(['--probe', MARKER, '3'], cdp.port);
+    check(
+      'formatted owned verdict proves completion (' + label + ')',
+      probe.status === 0 && probe.stderr.includes('probe-state: complete'),
+      'stderr=' + probe.stderr,
+    );
+    cdp.stop();
+  }
 }
 
-{ // #166 gate r1 P1, the other half: a REAL foreign terminator must still floor the block. The
-  // quoted-verdict exemption may not reopen the #164 hole it sits next to.
-  const foreign = 'pg-run-other-repo-2619-1111111111-9';
-  const ourBlock = [
-    '[P1] src/real.sh:4 — a finding that quotes a verdict',
-    '  > VERDICT: SHIP — example',
-    'P2: none',
-    `VERDICT: FIX-FIRST — ours. (run marker: ${MARKER})`,
-  ];
-  const body = [
-    `run marker: ${MARKER}`,
-    '[P0] apps/blog-writer/src/hazards.claims.ts:31 — a tree this repository does not have',
-    'P1: none',
-    `VERDICT: FIX-FIRST — theirs. (run marker: ${foreign})`,
-    '',
-    ...ourBlock,
-  ];
-  const cdp = await mockCdp(body.join('\n'));
-  const r = await runSalvage([MARKER, '3'], cdp.port);
-  check('a quoted verdict does not stop a real foreign terminator from flooring the block',
-    r.status === 0 && r.stdout.trim() === ourBlock.join('\n'),
-    `status=${r.status} stdout=${JSON.stringify(r.stdout)}`);
-  cdp.stop();
-}
-
-{ // #166 gate r2 P1: the r1 fixtures above hand the extractor literal Markdown, which is NOT what
-  // it gets in production. tabText() reads document.body.innerText of a RENDERED answer, where the
-  // blockquote is a <blockquote> and the fence is a <pre> — the syntax is gone, so a quoted example
-  // arrives as a bare "VERDICT: …" in column 0, indistinguishable from a terminator by shape alone.
-  // Flooring on it deleted the [P1] that wrote it, and the shortened block still passed structural,
-  // nonce and foreign-echo validation, so it was published one finding short and in silence.
-  const body = [
-    `run marker: ${MARKER}`,
-    '',
+{
+  // Execute the actual CDP expression against rendered DOM nodes. innerText has lost the quote
+  // syntax; the blockquote/pre context must survive the capture so the shell agrees with CDP.
+  const foreign = 'pg-run-old-2619-1111111111-9';
+  const example = 'VERDICT: SHIP — incident. (run marker: ' + foreign + ')';
+  const node = (tag, innerText, children = [], role = null) => ({
+    innerText,
+    textContent: innerText,
+    children,
+    matches: (selector) => selector.split(', ').includes(tag),
+    getAttribute: (attribute) => (attribute === 'data-message-author-role' ? role : null),
+  });
+  for (const tag of ['blockquote', 'pre', 'code']) {
+    const answer = [
+      'P0: none',
+      '[P1] src/real.sh:4 — incident example',
+      example,
+      '[P2] src/other.sh:9 — another finding',
+      'VERDICT: FIX-FIRST — ours. (run marker: ' + MARKER + ')',
+    ];
+    const ownAnswer = node(
+      'div',
+      answer.join('\n'),
+      answer.map((line, index) => node(index === 2 ? tag : 'p', line)),
+      'assistant',
+    );
+    const turns = [
+      node('div', 'run marker: ' + foreign, [], 'user'),
+      node('div', 'P0: none\n' + example, [], 'assistant'),
+      node('div', 'Please review this change. run marker: ' + MARKER, [], 'user'),
+      ownAnswer,
+    ];
+    const document = {
+      body: node('body', turns.map((turn) => turn.innerText).join('\n'), turns),
+      querySelectorAll: () => turns,
+    };
+    const cdp = await mockCdp(document.body.innerText, [], { document });
+    const capture = await runSalvage([MARKER, '3'], cdp.port);
+    const expected = answer.map((line, index) => (index === 2 ? '> ' + line : line)).join('\n');
+    check(
+      'rendered ' + tag + ' retains context and full finding bytes',
+      capture.status === 0 && capture.stdout === expected + '\n',
+      'status=' + capture.status + ' stdout=' + JSON.stringify(capture.stdout),
+    );
+    const binding = bindCapture(capture.stdout, MARKER);
+    check(
+      'actual DOM ' + tag + ' capture passes shell binding without rewriting',
+      binding.status === 0 && binding.retained === capture.stdout,
+      'status=' + binding.status + ' stderr=' + binding.stderr,
+    );
+    const probe = await runSalvage(['--probe', MARKER, '3'], cdp.port);
+    check(
+      'rendered ' + tag + ' example is inert and old scrollback is excluded',
+      probe.status === 0 && probe.stderr.includes('probe-state: complete'),
+      'stderr=' + probe.stderr,
+    );
+    check(
+      'DOM context capture executes the actual review-text expression',
+      cdp.requests.some((request) => request.params?.expression?.includes('pro-gate:review-text')),
+      'requests=' + cdp.requests.length,
+    );
+    cdp.stop();
+    const title = 'unchanged title';
+    const fixture = organizerExpressionFixture(document.body.innerText, { document, title });
+    const expression = buildRenameConversationExpression(title, {
+      marker: MARKER,
+      conversationUrl: 'https://chatgpt.com/c/mock-conversation',
+      mutationToken: 'dom-reference.' + tag,
+      mutationExpiresAt: Date.now() + 10_000,
+      expectedReview: durableReview(capture.stdout, MARKER),
+    });
+    const finalized = await runInNewContext(expression, fixture.context);
+    check(
+      'independent finalization guard accepts the same rendered ' + tag + ' bytes',
+      finalized.status === 'already' && fixture.sidebarReads() > 0 && fixture.events.length === 0,
+      'result=' + JSON.stringify(finalized),
+    );
+  }
+  const answer = [
     'P0: none',
-    '[P1] src/real.sh:4 — a finding that shows a verdict example',
-    'the reviewer wrote',
-    'VERDICT: SHIP — example',
-    'and kept explaining afterwards',
-    '[P2] src/other.sh:9 — a second, separate finding',
-    'P3: none',
-    `VERDICT: FIX-FIRST — ours. (run marker: ${MARKER})`,
-  ];
-  const cdp = await mockCdp(body.join('\n'));
-  const r = await runSalvage([MARKER, '3'], cdp.port);
-  check('r2 P1: a RENDERED quoted verdict keeps the finding that encloses it',
-    r.status === 0 && r.stdout.includes('[P1] src/real.sh:4') && r.stdout.includes('and kept explaining afterwards'),
-    `status=${r.status} stdout=${JSON.stringify(r.stdout)}`);
-  check('r2 P1: a RENDERED quoted verdict emits the whole block, both findings',
-    r.stdout.trim() === body.slice(2).join('\n'),
-    `stdout=${JSON.stringify(r.stdout)}`);
+    example,
+    '[P1] src/real.sh:4 — a literal prompt marker in a finding',
+    'run marker: ' + MARKER,
+    'VERDICT: SHIP — ours. (run marker: ' + MARKER + ')',
+  ].join('\n');
+  const turns = [node('div', 'run marker: ' + MARKER, [], 'user'), node('div', answer, [], 'assistant')];
+  const document = {
+    body: node('body', turns.map((turn) => turn.innerText).join('\n'), turns),
+    querySelectorAll: () => turns,
+  };
+  const cdp = await mockCdp(document.body.innerText, [], { document });
+  const capture = await runSalvage([MARKER, '3'], cdp.port);
+  const binding = bindCapture(capture.stdout, MARKER);
+  check(
+    'DOM user-turn scope cannot be reset by a literal prompt marker inside the answer',
+    capture.status === 0 && capture.stdout === answer + '\n' && binding.status === 2,
+    'status=' + capture.status + ' stdout=' + JSON.stringify(capture.stdout) + ' bind=' + binding.status,
+  );
   cdp.stop();
 }
 
-{ // #166 gate r2 P1, the other half: the rendered-quote exemption may not simply disable flooring.
-  // A REAL terminator that carries no marker echo of its own is still recognisable, because what
-  // follows it is the next block's P0 opening rather than the rest of its own block.
-  const ourBlock = ['P0: none', '[P1] src/real.sh:4 — ours', 'P2: none', `VERDICT: SHIP — ours. (run marker: ${MARKER})`];
-  const body = [
-    `run marker: ${MARKER}`,
-    '[P0] apps/blog-writer/src/hazards.claims.ts:31 — a tree this repository does not have',
-    'P1: none',
-    'VERDICT: FIX-FIRST — theirs, with no marker echo at all',
-    '',
-    ...ourBlock,
-  ];
-  const cdp = await mockCdp(body.join('\n'));
-  const r = await runSalvage([MARKER, '3'], cdp.port);
-  check('r2 P1: a marker-less terminator followed by a P0 opening still floors the block',
-    r.status === 0 && r.stdout.trim() === ourBlock.join('\n'),
-    `status=${r.status} stdout=${JSON.stringify(r.stdout)}`);
-  cdp.stop();
-}
-
-{ // #166 gate r3 P1: the echoed marker cannot be what earns a bare verdict the right to bound.
-  // A review quotes an incident's verdict COMPLETE WITH its "(run marker: …)" token — this
-  // repository's own reviews do — and rendered, that example claims a run exactly as a real
-  // terminator does. Flooring on the claim deleted the [P1] that wrote it, and the remainder,
-  // starting at [P2], still passed structure, binding and the nonce check downstream.
+{
+  // The live DOM can drift after the collector validated it. Execute the actual renderer guard
+  // and prove neither rename nor archive dispatches even its first event after mixed drift.
   const foreign = 'pg-run-other-repo-2619-1111111111-9';
-  const body = [
-    `run marker: ${MARKER}`,
-    '',
-    'P0: none',
-    '[P1] src/real.sh:4 — a finding quoting an incident verdict',
-    'the incident answer ended',
-    `VERDICT: FIX-FIRST — theirs. (run marker: ${foreign})`,
-    'and this is why it mattered',
-    '[P2] src/other.sh:9 — a second finding',
-    'P3: none',
-    `VERDICT: FIX-FIRST — ours. (run marker: ${MARKER})`,
-  ];
-  const cdp = await mockCdp(body.join('\n'));
-  const r = await runSalvage([MARKER, '3'], cdp.port);
-  check('r3 P1: a rendered SIGNED verdict example keeps the finding that encloses it',
-    r.status === 0 && r.stdout.includes('[P1] src/real.sh:4') && r.stdout.includes('and this is why it mattered'),
-    `status=${r.status} stdout=${JSON.stringify(r.stdout)}`);
-  check('r3 P1: a rendered SIGNED verdict example emits the whole block for the engine to judge',
-    r.stdout.trim() === body.slice(2).join('\n'),
-    `stdout=${JSON.stringify(r.stdout)}`);
-  cdp.stop();
+  const ours = completedReview(MARKER);
+  const theirs = 'P0: none\nVERDICT: FIX-FIRST (run marker: ' + foreign + ')';
+  for (const [layout, mixed] of [
+    ['foreign first', theirs + '\n' + ours],
+    ['foreign last', ours + '\n' + theirs],
+  ]) {
+    for (const action of ['rename', 'archive']) {
+      const fixture = organizerExpressionFixture('run marker: ' + MARKER + '\n' + ours, {
+        driftText: 'run marker: ' + MARKER + '\n' + mixed,
+      });
+      const target = {
+        marker: MARKER,
+        conversationUrl: 'https://chatgpt.com/c/mock-conversation',
+        mutationToken: 'mixed-drift.' + action,
+        mutationExpiresAt: Date.now() + 10_000,
+        expectedReview: action === 'archive' ? durableReview(ours, MARKER) : null,
+      };
+      const expression =
+        action === 'rename'
+          ? buildRenameConversationExpression('new title', target)
+          : buildArchiveConversationExpression(target);
+      const result = await runInNewContext(expression, fixture.context);
+      check(
+        'independent ' + action + ' guard rejects mixed DOM drift before effect (' + layout + ')',
+        result.status === 'skipped' &&
+          result.reason === 'target-mixed-review' &&
+          fixture.sidebarReads() > 0 &&
+          fixture.events.length === 0,
+        'result=' + JSON.stringify(result) + ' events=' + fixture.events,
+      );
+    }
+  }
 }
 
-{ // #166 gate r3 P1: a complete foreign block followed by nothing but this run's signed verdict.
-  // The cut can only produce a headerless fragment, and emitting THAT hands the engine bytes its
-  // structural guard drops before pg_capture_bind ever runs: the capture is deleted, harvest exits
-  // 3, and neither the quarantine nor the unattributable TTL is reached. Hand back the original
-  // candidate instead and let the engine's one provenance chokepoint refuse it.
+{
+  // Text-only old foreign scrollback stays outside a newly completed owned response.
   const foreign = 'pg-run-other-repo-2619-1111111111-9';
+  const old = ['[P0] other/a.ts:1 — old finding', 'VERDICT: FIX-FIRST (run marker: ' + foreign + ')'];
+  const answer = ['P0: none', 'P1: none', 'VERDICT: SHIP — ours. (run marker: ' + MARKER + ')'];
   const body = [
-    `run marker: ${MARKER}`,
-    '',
-    '[P0] apps/blog-writer/src/hazards.claims.ts:31 — a tree this repository does not have',
-    'P1: none',
-    `VERDICT: FIX-FIRST — theirs. (run marker: ${foreign})`,
-    `VERDICT: SHIP — bare. (run marker: ${MARKER})`,
-  ];
-  const cdp = await mockCdp(body.join('\n'));
-  const r = await runSalvage([MARKER, '3'], cdp.port);
-  check('r3 P1: a verdict-only cut emits the original capture, not the bare verdict line',
-    r.status === 0 && r.stdout.trim() === body.slice(2).join('\n'),
-    `status=${r.status} stdout=${JSON.stringify(r.stdout)}`);
+    ...old,
+    '(run marker: ' + MARKER + ' — internal correlation id, echo on the verdict line)',
+    ...answer,
+  ].join('\n');
+  const cdp = await mockCdp(body);
+  const capture = await runSalvage([MARKER, '3'], cdp.port);
+  check(
+    'old foreign scrollback is excluded from a clean new answer',
+    capture.status === 0 && capture.stdout === answer.join('\n') + '\n',
+    'stdout=' + capture.stdout,
+  );
+  const probe = await runSalvage(['--probe', MARKER, '3'], cdp.port);
+  check(
+    'clean new answer after old foreign scrollback proves completion',
+    probe.status === 0 && probe.stderr.includes('probe-state: complete'),
+    'stderr=' + probe.stderr,
+  );
   cdp.stop();
-}
-
-{ // #166 gate r3 P1, the branch itself: a floor IS established here (the foreign terminator is
-  // followed by "P1: none", a section no deeper than the [P1] above it) but nothing under that
-  // floor opens a block. Cutting there would publish "P1: none" plus a verdict — a headerless
-  // tail evidencing nothing. Both collectors widen to the same headed block instead, so the
-  // engine refuses one capture rather than publishing one extraction while --finalize re-derives
-  // the other and calls it result-mismatch.
-  const foreign = 'pg-run-other-repo-2619-1111111111-9';
-  const body = [
-    `run marker: ${MARKER}`,
-    '',
-    '[P0] other/a.ts:1 — theirs',
-    '[P1] other/b.ts:2 — theirs too',
-    `VERDICT: FIX-FIRST — theirs. (run marker: ${foreign})`,
-    'P1: none',
-    `VERDICT: SHIP — ours. (run marker: ${MARKER})`,
-  ];
-  const cdp = await mockCdp(body.join('\n'));
-  const r = await runSalvage([MARKER, '3'], cdp.port);
-  check('r3 P1: a floor with no block header under it widens instead of emitting a headerless tail',
-    r.status === 0 && r.stdout.trim() === body.slice(2).join('\n'),
-    `status=${r.status} stdout=${JSON.stringify(r.stdout)}`);
-  cdp.stop();
-}
-
-{ // #166 gate r3 P1: chronology the engine cannot recover from the extracted block. An old foreign
-  // verdict ABOVE this run's prompt is scrollback in a reused conversation — the classifier
-  // deliberately declines to convict it, because our answer may still be generating. The engine
-  // refuses to publish it either way, but it must stay RETRYABLE rather than expiring recovery at
-  // the reservation TTL, and only this collector can see where the prompt sits.
-  const foreign = 'pg-run-other-repo-2619-1111111111-9';
-  const body = [
-    '[P0] apps/blog-writer/src/hazards.claims.ts:31 — a tree this repository does not have',
-    'P1: none',
-    `VERDICT: FIX-FIRST — theirs, answered before we asked. (run marker: ${foreign})`,
-    '',
-    `now please review this change. run marker: ${MARKER}`,
-  ];
-  const cdp = await mockCdp(body.join('\n'));
-  const r = await runSalvage([MARKER, '3'], cdp.port);
-  check('r3 P1: an answer above this run prompt is reported as precedes-prompt chronology',
-    r.status === 0 && r.stderr.includes('answer-chronology precedes-prompt'),
-    `status=${r.status} stderr=${JSON.stringify(r.stderr)}`);
-  cdp.stop();
-  // …and the ordinary page, where the answer follows the prompt, must never be reported that way.
-  const cleanCdp = await mockCdp([
-    `run marker: ${MARKER}`, 'P0: none', 'P1: none', `VERDICT: SHIP — ours. (run marker: ${MARKER})`,
-  ].join('\n'));
-  const clean = await runSalvage([MARKER, '3'], cleanCdp.port);
-  check('r3 P1: an answer BELOW this run prompt carries no chronology warning',
-    clean.status === 0 && !clean.stderr.includes('answer-chronology'),
-    `status=${clean.status} stderr=${JSON.stringify(clean.stderr)}`);
-  cleanCdp.stop();
+  const staleCdp = await mockCdp([...old, 'run marker: ' + MARKER].join('\n'));
+  const stale = await runSalvage([MARKER, '3'], staleCdp.port);
+  check(
+    'old foreign answer preceding a still-pending prompt preserves chronology',
+    stale.status === 0 && stale.stderr.includes('answer-chronology precedes-prompt'),
+    'status=' + stale.status + ' stderr=' + stale.stderr,
+  );
+  staleCdp.stop();
 }
 
 { // P1 (gate #91 r3): --probe must not report the conversation ABSENT just because the one-shot
@@ -2622,8 +2811,14 @@ const FOREIGN_ANSWER = (m) => [
       /label\.includes\('restore'\)/.test(archiveExpression));
   check('archive expression verifies confirmation rather than trusting a click',
     /verifyArchivedStateFromMenu/.test(archiveExpression) && /hasArchiveToast/.test(archiveExpression));
+  const formattedFixture = organizerExpressionFixture(
+    `run marker: ${MARKER}\nP0: none\n**VERDICT:** SHIP (run marker: ${MARKER})`,
+    { title: dangerousTitle },
+  );
+  const formattedResult = await runInNewContext(renameExpression, formattedFixture.context);
   check('UI mutation ownership accepts the same formatted VERDICT labels as salvage',
-    /\[\*_>#-\]/.test(renameExpression) && /VERDICT\[\*_\\s\]/.test(renameExpression));
+    formattedResult.status === 'already' && formattedFixture.sidebarReads() > 0,
+    `result=${JSON.stringify(formattedResult)}`);
 }
 
 { // #76: the exit hook must actually RUN on the early-exit paths, not just leave a 0 status.

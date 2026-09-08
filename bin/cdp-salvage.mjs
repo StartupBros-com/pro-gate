@@ -87,6 +87,8 @@ import {
   buildCancelOrganizerMutationExpression,
   buildRenameConversationExpression,
   ORGANIZER_MUTATION_LEASE_MS,
+  readReviewText,
+  reviewTextContext,
 } from './cdp-organizer-expressions.mjs';
 import {
   parseTestPollMs,
@@ -392,9 +394,20 @@ async function evaluateMutation(tab, buildExpression) {
   return result;
 }
 
+const scopedResponses = new Set();
 async function tabText(tab) {
-  const result = await evaluateTab(tab, 'document.body.innerText');
-  return result.ok ? result.value ?? null : null;
+  const expression =
+    '/* pro-gate:review-text */ (' +
+    readReviewText.toString() +
+    ')(document, ' +
+    JSON.stringify(marker) +
+    ')';
+  const result = await evaluateTab(tab, expression);
+  if (!result.ok) return null;
+  if (typeof result.value === 'string') return result.value;
+  if (typeof result.value?.text !== 'string') return null;
+  if (result.value.promptAt === 0) scopedResponses.add(result.value.text);
+  return result.value.text;
 }
 
 async function tabTerminalInfrastructure(tab) {
@@ -449,21 +462,6 @@ if (sweepRoot) {
 // probe/salvage can always find the conversation by marker), the wrapper must close the tab
 // itself once the review is confirmed, or /c/ tabs would accumulate. Close every conversation
 // tab carrying THIS run's marker. Best-effort, bounded, non-fatal (never fail a finished run).
-if (close) {
-  let tabs = [];
-  try {
-    tabs = (await (await fetch(`http://127.0.0.1:${port}/json`)).json())
-      .filter((t) => t.type === 'page' && /chatgpt\.com\/c\//.test(t.url || ''));
-  } catch { process.exit(0); }
-  let closed = 0;
-  for (const tab of tabs) {
-    const text = await tabText(tab);
-    if (text && text.includes(marker)) { await closeTab(tab.id); closed += 1; }
-  }
-  console.error(`cdp-salvage --close: closed ${closed} conversation tab(s) matching "${marker}"`);
-  process.exit(0);
-}
-
 // v0.17: renderer-dead-tab fallback. Under Xvfb a background conversation
 // tab's renderer can suspend or crash: Runtime.evaluate then returns nothing
 // (and /json/activate does NOT revive it) even though the finished review
@@ -661,173 +659,18 @@ async function freshRenderText(url, port, outerDeadline, waitForDecisiveEvidence
   }
 }
 
-// VERDICT / Pn matchers tolerate GPT-5.6 formatting drift: leading bold/bullet/quote markers and
-// whitespace, and markers/space between the label and its colon (e.g. `**VERDICT:**`, `- P0 :`).
-const VERDICT_RE = /^\s*[*_>#-]*\s*VERDICT[*_\s]*:/i;
-const PBLOCK_START_RE = /^\s*[*_>#-]*\s*(P0\s*[:\-]|P0\b|\[P[0-3]\])/i;
-// ASCII space/tab only, not `\s` (#166 gate r3 P1). This is an OWNERSHIP grammar, and the
-// authority it has to agree with is exact: pg_capture_nonce_ok greps for the literal
-// "(run marker: <marker>)" with one space, and pg_capture_own_segment's awk mirror matches
-// [ \t]. A wider class here recognises an echo separated by a non-breaking space that neither
-// of those can see, so one collector reports the page as OURS while the other refuses it.
-const ECHO_RE = /\(run marker:[ \t]*(pg-run-[A-Za-z0-9.-]+)[ \t]*\)/i;
-const echoedMarker = (line) => line.match(ECHO_RE)?.[1] ?? null;
+const responseClaims = (text) => reviewTextContext(text, marker, scopedResponses.has(text) ? 0 : null);
+const mixedAnswer = (text) => responseClaims(text).mixed;
+const extractReview = (text) => responseClaims(text).review;
 
-// #164: a single conversation can receive TWO runs' prompts, and the model then answers both —
-// the page holds two complete verdict-terminated blocks, one per marker. Returns the index of
-// the verdict line this run may claim (the LAST one echoing our marker) alongside every verdict
-// index, so callers can bound a block at the verdict that closed the block before it. Without
-// that floor the extraction reaches back past a foreign verdict and sweeps another repository's
-// findings into ours (ai-hedge-fund #176 r4, 2026-09-05).
-//
-// `bounds` is the subset that may act as that floor (#166 gate r1 P1). A review can QUOTE a
-// verdict inside a finding — "> VERDICT: SHIP — example" — and flooring on it cuts the finding's
-// own header away and publishes the remainder as if it were a whole block. A quoted, indented or
-// fenced verdict stays an ownership candidate, because the model may format its real one that
-// way, but it never bounds anything. Mirrored by pg_capture_own_segment in lib/pro-gate-lib.sh.
-//
-// The markdown test alone is not enough (#166 gate r2 P1). What arrives here is `innerText` of a
-// RENDERED answer, and the renderer has already eaten the syntax: a blockquote is a <blockquote>
-// and a fence is a <pre>, so a quoted example reads as a bare "VERDICT: SHIP" in column 0,
-// indistinguishable from a terminator. Flooring on it deleted the enclosing [P1] finding while
-// the truncated remainder still passed structural, nonce and foreign-echo validation — published,
-// silently, one finding short. So a bare verdict must EARN the right to bound, from the text
-// alone (both implementations see only text, and the organizer's --finalize compares their bytes).
-//
-// The echoed marker cannot be what earns it (#166 gate r3 P1). A review quotes an incident's
-// verdict COMPLETE WITH its "(run marker: …)" token — this repository's own reviews do — and once
-// the renderer has eaten the quote syntax that example claims a run exactly as a real terminator
-// does. Bounding on the claim alone cut the enclosing finding away again, this time without even
-// a following block to corroborate it. What is left is the one signal the quoted line cannot
-// fake, because it is established by the lines AROUND it rather than by the line itself:
-//
-//   a verdict bounds  <=>  it is not quoted/indented/fenced
-//                          AND the first Pn section header after it (before the next verdict
-//                          line) is no DEEPER than the last section header before it — or there
-//                          is no section header before it at all
-//
-// Sections ascend inside one block (P0, P1, P2, P3), so a header that does NOT descend is the
-// continuation of the block the verdict sits in, which is exactly what follows a quoted example:
-// "[P2]", "P3: none", then the block's own terminator. A real terminator is followed by the next
-// answer restarting its numbering. This subsumes the r2 "next block opens at P0" rule, which was
-// too narrow the other way: an answer whose first section is [P1] opens a block just as much.
-const FENCE_RE = /^[ \t]*(```|~~~)/;
-const VERDICT_EMBEDDED_RE = /^([ ][ ]|\t|[ ]*>)/;
-// The Pn SECTION header and its depth, as opposed to where a block may start: "P1: none" is a
-// section but never a cut point. Mirrors seclevel() in lib/pro-gate-lib.sh.
-const SECTION_RE = /^[*_>#-]*[ \t]*(?:\[P([0-3])\]|P([0-3])[ \t]*[:\-]|P([0-3])(?![0-9A-Za-z_]))/i;
-const isBlockStart = (line) => PBLOCK_START_RE.test(line.trim());
-const sectionLevel = (line) => {
-  const m = line.trim().match(SECTION_RE);
-  return m ? Number(m[1] ?? m[2] ?? m[3]) : -1;
-};
-function verdictIndex(lines) {
-  const all = [];
-  const plain = [];
-  let fenced = false;
-  for (let i = 0; i < lines.length; i++) {
-    if (FENCE_RE.test(lines[i])) { fenced = !fenced; continue; }
-    if (!VERDICT_RE.test(lines[i])) continue;
-    all.push(i);
-    plain.push(!fenced && !VERDICT_EMBEDDED_RE.test(lines[i]));
-  }
-  const bounds = [];
-  for (let k = 0; k < all.length; k++) {
-    if (!plain[k]) continue;
-    let prev = -1;
-    for (let i = k > 0 ? all[k - 1] + 1 : 0; i < all[k]; i++) {
-      const level = sectionLevel(lines[i]);
-      if (level >= 0) prev = level;
-    }
-    let next = -1;
-    const stop = k + 1 < all.length ? all[k + 1] : lines.length;
-    for (let i = all[k] + 1; i < stop && next < 0; i++) next = sectionLevel(lines[i]);
-    if (next >= 0 && (prev < 0 || next <= prev)) bounds.push(all[k]);
-  }
-  let owned = -1;
-  for (let k = all.length - 1; k >= 0; k--) if (echoedMarker(lines[all[k]]) === marker) { owned = k; break; }
-  // No owned verdict: fall back to the terminal one and let the engine's nonce check adjudicate,
-  // exactly as before — the ambiguity this file must not resolve unilaterally.
-  const pick = owned >= 0 ? owned : all.length - 1;
-  return { all, bounds, pick, owned: owned >= 0 };
-}
-function extractReview(text) {
-  const lines = text.split('\n');
-  const { all, bounds, pick } = verdictIndex(lines);
-  if (pick < 0) return null;
-  const verdictIdx = all[pick];
-  const before = bounds.filter((b) => b < verdictIdx);
-  let j = before.length;
-  let floor = j > 0 ? before[j - 1] + 1 : 0;
-  let start = -1;
-  for (;;) {
-    for (let i = verdictIdx; i >= floor; i--) if (isBlockStart(lines[i])) start = i;
-    if (start >= 0 || j === 0) break;
-    // No block header under this floor, so the floor did not open a block — it landed inside one,
-    // and cutting there would publish a headerless suffix missing its enclosing finding. Widen by
-    // one block. NEVER past a verdict that CLAIMS another run: those bytes cannot be ours.
-    const claim = echoedMarker(lines[before[j - 1]]);
-    if (claim && claim !== marker) break;
-    j -= 1;
-    floor = j > 0 ? before[j - 1] + 1 : 0;
-  }
-  if (start < 0) {
-    // #166 gate r3 P1: every floor was refused and no block header survives under the last one,
-    // so the only thing left to cut to is a HEADERLESS fragment — in the reported layout, a
-    // complete foreign block followed by nothing but this run's own signed verdict line. Emitting
-    // that fragment hands the engine bytes its structural guard drops BEFORE pg_capture_bind
-    // runs: the capture is deleted, the harvest exits 3, and neither the pre-cut quarantine nor
-    // the unattributable TTL is ever reached, so the reservation keeps redirecting the change
-    // into a harvest that can only fail. Hand back the widest headed block instead — the original
-    // capture, foreign block included — and let the engine's one provenance chokepoint refuse it
-    // and set it aside. The cut rule above is unchanged for every block that HAS a header.
-    for (let i = verdictIdx; i >= 0; i--) if (isBlockStart(lines[i])) start = i;
-  }
-  // No header anywhere above this verdict: the floor is meaningless too, so the last resort is
-  // the same fixed window on both sides (mirrored in pg_capture_own_segment).
-  if (start < 0) start = Math.max(0, verdictIdx - 120);
-  return lines.slice(start, verdictIdx + 1).join('\n').trim();
-}
-
-// #67: a page carrying a COMPLETED answer whose verdict echoes a DIFFERENT run's marker is
-// that run's conversation, full stop — even though our own marker also appears on the page,
-// because the marker rides the submitted PROMPT and a mis-navigated render can show ours
-// above someone else's answer. Two live incidents (pro-gate#66 <- pushbot#1336,
-// pushbot#1334 <- pushbot#1323) memoized exactly such a page as "ours" and, because a
-// remembered URL is exempt from blacklisting, poisoned that marker's memo permanently.
-// Returns the foreign marker when the ANSWER is provably another run's, else null.
 function foreignAnswerMarker(text) {
-  // #164: a page holding a verdict line that echoes OUR marker demonstrably answered OUR prompt,
-  // whatever else landed in the same conversation. Convicting it would blacklist and forget the
-  // conversation that carries our own answer — the inverse layout (our block, then a foreign
-  // one) cost a whole charged round that way. extractReview() isolates our block; the rest of
-  // the page is another run's business, not evidence that this one is cross-bound.
-  if (verdictIndex(text.split('\n')).owned) return null;
-  const review = extractReview(text);
-  if (!review) return null;                       // no completed answer here: decides nothing
-  // ONLY the terminal VERDICT line carries ownership (#68 gate r2 P1). Scanning the last six
-  // lines convicts a genuine nonce-less answer whose FINDINGS merely mention another marker —
-  // routine in this repo, whose reviews quote incident markers verbatim. A verdict line with
-  // no marker at all is ambiguous, not foreign: return null and let the engine's nonce check
-  // file it as retryable.
-  const lines = review.split('\n');
-  let verdictLine = '';
-  for (let i = lines.length - 1; i >= 0; i--) if (VERDICT_RE.test(lines[i])) { verdictLine = lines[i]; break; }
-  if (!verdictLine) return null;
-  if (verdictLine.includes(`(run marker: ${marker})`)) return null;   // ours, positively
-  const m = verdictLine.match(/\(run marker:\s*(pg-run-[A-Za-z0-9.-]+)\s*\)/);
-  if (!m || m[1] === marker) return null;
-  // POSITION MATTERS (#68 gate P1). A reused conversation can hold an OLDER nonce-bearing
-  // verdict ABOVE our freshly-submitted prompt while our answer is still generating.
-  // extractReview() takes the LAST verdict in the page, which in that layout is the old one —
-  // convicting on it would blacklist and forget the genuine LIVE conversation and let a probe
-  // count misses toward a duplicate spend. Only convict when the foreign verdict comes AFTER
-  // the last occurrence of our marker, i.e. it is the answer to our prompt rather than
-  // scrollback above it.
-  const lastMarkerAt = lastExactMarkerAt(text, marker);
-  const foreignAt = text.lastIndexOf(m[0]);
-  if (lastMarkerAt >= 0 && foreignAt >= 0 && foreignAt < lastMarkerAt) return null;
-  return m[1];
+  const { claims } = responseClaims(text);
+  if (claims.some((claim) => claim.markers.some((value) => value.toLowerCase() === marker.toLowerCase()))) return null;
+  const verdict = claims.at(-1);
+  if (!verdict) return null;
+  const foreign = verdict.markers.find((value) => value.toLowerCase() !== marker.toLowerCase());
+  if (!foreign || verdict.at < lastExactMarkerAt(text, marker)) return null;
+  return foreign;
 }
 
 const organizerToken = (value, fallback = 'unknown') => {
@@ -864,17 +707,8 @@ function lastExactRunMarkerAt(text) {
   return found;
 }
 
-// The verdict line that decides ownership: the last one echoing THIS run's marker when the page
-// carries one, else the terminal verdict (#164 — on a page two runs wrote to, "last" and "ours"
-// are different lines, and only "ours" may speak for this run). Identical to the former
-// terminal-only reading on every single-answer page.
 function ownedVerdict(text) {
-  const lines = text.split('\n');
-  const { all, pick } = verdictIndex(lines);
-  if (pick < 0) return null;
-  let at = 0;
-  for (let i = 0; i < all[pick]; i++) at += lines[i].length + 1;
-  return { line: lines[all[pick]], at };
+  return responseClaims(text).verdict;
 }
 
 // Mutation authority is intentionally stricter than salvage extraction. The engine may capture a
@@ -894,14 +728,12 @@ function foreignRunMarkerAfter(text, from) {
 
 function organizerOwnership(text) {
   if (!hasExactMarker(text, marker)) return { owned: false, reason: 'marker-missing' };
+  if (mixedAnswer(text)) return { owned: false, reason: 'shared-conversation' };
   const verdict = ownedVerdict(text);
   if (!verdict) return { owned: true, reason: 'live' };
   const answerMarker = verdict.line.match(/\(run marker:\s*(pg-run-[A-Za-z0-9.-]+)\s*\)/i)?.[1] ?? null;
   if (answerMarker === marker) {
-    // #164: our answer can be genuinely ours AND be followed by another run's block in the same
-    // conversation. Collection reads that page happily (it cuts to our block); MUTATION must not,
-    // or the early rename relabels a chat the other run is still using. finalizerOwnership already
-    // refuses on a trailing run marker — this is the same refusal, so the two cannot disagree.
+    // A later prompt may still be generating in this shared conversation.
     const shared = foreignRunMarkerAfter(text, verdict.at + verdict.line.length);
     if (shared) return { owned: false, reason: 'shared-conversation', foreignMarker: shared };
     return { owned: true, reason: 'completed' };
@@ -928,6 +760,7 @@ function stripMarkerEcho(value) {
 let acceptedReview = null;
 function finalizerOwnership(text) {
   if (acceptedReview === null) return { owned: false, reason: 'result-file-missing' };
+  if (mixedAnswer(text)) return { owned: false, reason: 'shared-conversation' };
   const verdict = ownedVerdict(text);
   if (!verdict) return { owned: false, reason: 'answer-incomplete' };
   const promptMarkerAt = lastExactMarkerAt(text.slice(0, verdict.at), marker);
@@ -1225,6 +1058,21 @@ async function organizeConversation() {
   return result;
 }
 
+if (close) {
+  let tabs = [];
+  try {
+    tabs = (await (await fetch(`http://127.0.0.1:${port}/json`)).json())
+      .filter((t) => t.type === 'page' && /chatgpt\.com\/c\//.test(t.url || ''));
+  } catch { process.exit(0); }
+  let closed = 0;
+  for (const tab of tabs) {
+    const text = await tabText(tab);
+    if (text && organizerOwnership(text).owned) { await closeTab(tab.id); closed += 1; }
+  }
+  console.error(`cdp-salvage --close: closed ${closed} conversation tab(s) matching "${marker}"`);
+  process.exit(0);
+}
+
 if (organize) {
   let result;
   try {
@@ -1300,13 +1148,8 @@ function classifyEvidence(text, structuredError = null) {
     // newerPromptMarker can still be true here for a foreign answerMarker (scrollback case
     // above); the `&& !newerPromptMarker` term stays as a guard against that combination
     // ever being reported probe-complete, even though only --probe reads this field.
-    probeComplete: promptMarkerAt >= 0 && answerMarker === marker && !newerPromptMarker,
-    // …and that same combination is the ONE chronology fact the engine cannot recover from the
-    // extracted block alone (#166 gate r3 P1). This verdict was written BEFORE the prompt that
-    // sits under it, so it is scrollback and OUR answer may still be generating. The engine
-    // refuses to publish it either way, but the refusal must stay retryable: treating it as a
-    // conversation that answered two runs at once expires recovery at the reservation TTL with
-    // no evidence the current answer ever finished or disappeared.
+    probeComplete: promptMarkerAt >= 0 && answerMarker === marker && !newerPromptMarker && !mixedAnswer(text),
+    // Old foreign scrollback is retryable; the extracted review cannot carry this chronology.
     precedesPrompt: !!newerPromptMarker,
   };
 }

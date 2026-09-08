@@ -646,12 +646,7 @@ pg_run_meta_scan() {
 # still proves its own attempt is no longer unknown-fate. Keep this predicate shared so public
 # decision queries and guarded dispatch rechecks cannot disagree about the same sidecar.
 pg_run_meta_has_terminal_review() { # marker
-  local marker="$1" artifact
-  pg_reservation_marker_ok "$marker" || return 1
-  artifact="$(pg_completed_dir)/$marker"
-  if [ -f "$artifact" ] && [ ! -L "$artifact" ] && pg_is_review "$artifact"; then return 0; fi
-  artifact="$PRO_GATE_HOME/pending/$marker"
-  [ -f "$artifact" ] && [ ! -L "$artifact" ] && pg_is_review "$artifact"
+  pg_attempt_artifact "$1" >/dev/null
 }
 
 pg_run_meta_find_latest() { # host owner repo pr terminal-filter -> newest exact marker
@@ -928,11 +923,13 @@ pg_attempt_artifact() { # marker -> kind<TAB>path for a validated canonical revi
   local marker="$1" path
   pg_reservation_marker_ok "$marker" || return 1
   path="$(pg_completed_dir)/$marker"
-  if [ -f "$path" ] && [ ! -L "$path" ] && pg_is_review "$path"; then
+  if [ -f "$path" ] && [ ! -L "$path" ] && pg_is_review "$path" \
+     && [ -z "$(pg_capture_foreign_echo "$path" "$marker")" ]; then
     printf 'completed\t%s\n' "$path"; return 0
   fi
   path="$PRO_GATE_HOME/pending/$marker"
-  if [ -f "$path" ] && [ ! -L "$path" ] && pg_is_review "$path"; then
+  if [ -f "$path" ] && [ ! -L "$path" ] && pg_is_review "$path" \
+     && [ -z "$(pg_capture_foreign_echo "$path" "$marker")" ]; then
     printf 'pending\t%s\n' "$path"; return 0
   fi
   return 1
@@ -1316,52 +1313,6 @@ pg_reservation_note_miss() {
       && mv -f "$f.tmp" "$f"
     pg_reservation_guard_release
     echo "retained $misses/$miss_limit"
-  fi
-}
-
-# pg_reservation_expire_unattributable <marker>: the expiry transition for a capture that can
-# never bind, however often it is retried (#166 gate r2 P1).
-#
-# The bounded-miss ladder above cannot reach this case, by construction. Its proof is CONFIRMED
-# ABSENCE — the conversation is gone — and here the conversation is emphatically present: it holds
-# a completed answer whose bytes name two runs. The marker probe reads it as complete and records
-# no miss; every harvest re-reads the same page and refuses it again; and a reservation, complete
-# or generating, keeps redirecting fresh same-change runs to harvest (pg_reservation_find_pr).
-# Without its own transition such a capture holds a change in harvest forever, and the exit-9
-# promise that recovery ages out to a fresh review is never kept.
-#
-# So the durable refusal itself is the proof, and TTL is when it becomes terminal: the round stays
-# charged, the quarantined bytes stay on disk for a human, and only same-change RECOVERY OWNERSHIP
-# is handed back. Disposition is published before the release, exactly as the ladder does it, so no
-# fresh caller sees a gap. Echoes "released", or "retained <why>" when the record must be kept.
-pg_reservation_expire_unattributable() {
-  local marker="$1" f created ttl now
-  pg_reservation_marker_ok "$marker" || { echo released; return 0; }
-  f="$(pg_reservation_dir)/$marker"
-  pg_reservation_guard_acquire || { echo "retained guard-busy"; return 0; }
-  if [ ! -f "$f" ]; then pg_reservation_guard_release; echo released; return 0; fi
-  # Superseded work holds no capacity already and is retained for optional audit harvest; an
-  # unattributable capture is no reason to retire that record (mirrors pg_reservation_note_miss).
-  if [ "$(awk -F'\t' 'NR==1{print $8}' "$f" 2>/dev/null)" = superseded ]; then
-    pg_reservation_guard_release; echo "retained superseded"; return 0
-  fi
-  created="$(awk -F'\t' 'NR==1{print $3}' "$f" 2>/dev/null)"
-  case "$created" in ''|*[!0-9]*) pg_reservation_guard_release; echo "retained no-created"; return 0;; esac
-  ttl="${PRO_GATE_RESERVATION_TTL:-21600}"; case "$ttl" in ''|*[!0-9]*) ttl=21600;; esac
-  now="$(date +%s)"
-  if [ "$(( now - created ))" -lt "$ttl" ] 2>/dev/null; then
-    pg_reservation_guard_release; echo "retained within-ttl"; return 0
-  fi
-  # No durable run-meta means no disposition can bind this release to one charged attempt, and a
-  # release nobody can account for is worse than a retained one. Fail closed and say which it was.
-  if pg_attempt_terminal_from_meta "$marker" recovery-exhausted bounded-recovery-exhausted; then
-    rm -f "$f" "$(pg_manifest_dir)/$marker" "$(pg_manifest_dir)/$marker.nonce" 2>/dev/null
-    pg_reservation_guard_release
-    pg_attempt_reconcile_terminal "$marker" 2>/dev/null || true
-    echo released
-  else
-    pg_reservation_guard_release
-    echo "retained unrecorded-attempt"
   fi
 }
 
@@ -2270,14 +2221,10 @@ pg_filter_diff() {
   ' "$in" > "$out"
 }
 
-# pg_extract_verdict <file>: echo SHIP/FIX-FIRST/NEEDS-DISCUSSION from the terminal verdict
-# line. Shared with pg_is_review and trajectory history so formatting drift cannot make a
-# structurally-accepted review record UNKNOWN. The matcher tolerates leading bold/bullet/quote
-# markers and whitespace, and markers/space before the colon (`**VERDICT:**`, `- VERDICT :`).
+# pg_extract_verdict <file>: the final authoritative verdict must be within the last six
+# non-empty lines. Use the ownership scanner so quoted examples cannot supply SHIP authority.
 pg_extract_verdict() {
-  grep -vE '^[[:space:]]*$' "$1" 2>/dev/null | tail -n 6 \
-    | grep -iE '^[[:space:]]*[*_>#-]*[[:space:]]*VERDICT[*_[:space:]]*:' \
-    | grep -oiE 'SHIP|FIX-FIRST|NEEDS-DISCUSSION' | head -1 | tr '[:lower:]' '[:upper:]'
+  pg_capture_verdict_claims "$1" verdict
 }
 
 # pg_is_review <file>: true only when <file> looks like a COMPLETE review, not a truncated or
@@ -2401,11 +2348,11 @@ pg_trim_file() {
 # was provably written for THIS prompt — content heuristics can't be fooled into accepting a
 # foreign or stale conversation's answer. The engine strips the token before returning output.
 # ─────────────────────────────────────────────────────────────────────────────
-# pg_capture_nonce_ok <file> <marker>: rc 0 when the capture's tail carries this run's token.
+# pg_capture_nonce_ok <file> <marker>: the terminal authoritative verdict must echo this run.
 pg_capture_nonce_ok() {
   local f="$1" marker="$2"
   [ -s "$f" ] || return 1
-  tail -n 6 "$f" 2>/dev/null | grep -qF "(run marker: $marker)"
+  pg_capture_verdict_claims "$f" terminal | grep -qxF -- "$marker"
 }
 # pg_strip_nonce <file> <marker>: remove the echoed token (harmless when absent).
 pg_strip_nonce() {
@@ -2422,246 +2369,75 @@ pg_strip_nonce() {
   return 0
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# v0.44 (#164): ONE run's block per published result. Two runs' prompts can reach a single
-# ChatGPT conversation, and the model then answers both — the collected page holds two
-# complete verdict-terminated blocks, one per marker. The v0.28 nonce check looks only at the
-# tail, so a page whose LAST verdict echoes this marker passed while a foreign run's findings
-# rode along above it; the caller's loop read the FIRST verdict line and dispatched a fixer at
-# a file that exists in another repository (ai-hedge-fund #176 r4, 2026-09-05). A foreign
-# marker in a published result is a provenance failure, not text.
-# ─────────────────────────────────────────────────────────────────────────────
-# pg_capture_foreign_echo <file> <marker> [any]: echo the first "(run marker: X)" ownership token
-# in <file> whose X is NOT <marker>, or nothing.
-#
-# Scope matters more than it looks. By default only VERDICT lines are scanned, because only a
-# verdict line CLAIMS ownership — the same invariant bin/cdp-salvage.mjs states at
-# foreignAnswerMarker (#68 gate r2 P1): a finding that merely mentions another run's marker is
-# prose, and this repo's own reviews quote incident markers verbatim. Scanning finding text for a
-# hard rejection would strand exactly those reviews, retry into the same text, and lose the round
-# — the failure #68 was written to prevent. Pass `any` for the whole-file read, which the
-# collector uses to WARN, never to refuse.
-#
-# The exclusion is case-INSENSITIVE to match the extraction above it (#166 gate r1 P1). A marker
-# carries un-lowercased repo text ("pg-run-StartupBros-com-…"), so a model that lowercases its own
-# echo was being reported as a DIFFERENT run and its clean single-answer review refused as
-# unattributable — durably, since every retry re-reads the same text. Two genuinely different runs
-# cannot differ only in case: the marker ends in the launch epoch and pid, and one process has one
-# of each. Recognizing the echo here does NOT grant ownership — pg_capture_nonce_ok stays exact, so
-# a mis-cased echo remains an unbound, retryable capture exactly as it was before this guard.
-pg_capture_foreign_echo() {
-  local f="$1" marker="$2" scope="${3:-verdict}" src
-  [ -s "$f" ] || return 1
-  if [ "$scope" = any ]; then src="$(cat "$f" 2>/dev/null)"
-  else src="$(grep -iE '^[[:space:]]*[*_>#-]*[[:space:]]*VERDICT[*_[:space:]]*:' "$f" 2>/dev/null)"; fi
-  printf '%s\n' "$src" \
-    | grep -oiE '\(run marker:[[:space:]]*pg-run-[A-Za-z0-9.-]+[[:space:]]*\)' 2>/dev/null \
-    | sed -E 's/^\([^:]*:[[:space:]]*//; s/[[:space:]]*\)$//' \
-    | grep -vixF -- "$marker" | head -1
-}
-
-# pg_capture_own_segment <file> <marker>: rewrite <file> in place to the review block terminated
-# by the VERDICT line that echoes <marker>, dropping every other run's block. Prints the foreign
-# markers whose blocks were dropped, one per line.
-#   rc 0 — this run owns the only verdict line: nothing to cut, bytes untouched (so the common
-#          clean capture reaches the caller byte-for-byte, exactly as before this guard existed)
-#   rc 2 — this run's block was isolated and <file> REWRITTEN; the caller must re-validate it
-#   rc 1 — no VERDICT line echoes <marker>: the file is left untouched and pg_capture_bind decides
-#          (an explicit foreign claim is refused there; anything else the caller adjudicates
-#          exactly as before — nonce rejection under REQUIRE_NONCE, path overlap in legacy mode)
-#   rc 3 — an owned block WAS identified but the cut could not be written (disk/permissions).
-#          Distinct from rc 1 on purpose: the uncut bytes still carry a foreign block, so this
-#          must fail closed rather than fall through to the tail-only nonce check.
-pg_capture_own_segment() {
-  local f="$1" marker="$2" tmp="$1.segment.$$" dropped
-  [ -s "$f" ] || return 1
-  dropped="$(awk -v mk="$marker" -v out="$tmp" '
-    function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
-    function isblockstart(s,   t) {
-      t = tolower(trim(s))
-      return (t ~ /^[*_>#-]*[ \t]*(p0[ \t]*[:-]|p0([^0-9a-z_]|$)|\[p[0-3]\])/)
-    }
-    # The Pn SECTION header and its depth, as opposed to where a block may start: "P1: none" is
-    # a section but never a cut point. Mirrors sectionLevel in bin/cdp-salvage.mjs.
-    function seclevel(s,   t) {
-      t = tolower(trim(s))
-      sub(/^[*_>#-]*[ \t]*/, "", t)
-      if (t ~ /^\[p[0-3]\]/) return substr(t, 3, 1) + 0
-      if (t ~ /^p[0-3][ \t]*[:-]/) return substr(t, 2, 1) + 0
-      if (t ~ /^p[0-3]([^0-9a-z_]|$)/) return substr(t, 2, 1) + 0
-      return -1
-    }
+# Review ownership is claimed by top-level authoritative verdicts, never by arbitrary
+# marker mentions. Mirror reviewVerdictClaims in bin/cdp-organizer-expressions.mjs. Markdown quotes,
+# indented examples and fenced code are reference text; the browser preserves that context
+# when collecting rendered blockquote/pre elements. Scan the WHOLE response before accepting
+# it: a foreign verdict after our own is just as mixed as one before it.
+pg_capture_verdict_claims() { # file [verdict|terminal] -> claims, decision or terminal claims
+  awk -v mode="${2:-claims}" '
     {
-      n++; line[n] = $0
-      if ($0 ~ /^[ \t]*(```|~~~)/) { fenced = !fenced; next }
-      low = tolower($0)
-      if (low ~ /^[ \t]*[*_>#-]*[ \t]*verdict[*_ \t]*:/) {
-        vcount++; vidx[vcount] = n
-        # #166 gate r1 P1: a verdict BOUNDS a block only when it is a real terminator. A review
-        # may quote one as an example inside a finding ("> VERDICT: SHIP - example"), and treating
-        # that as a boundary floors the cut in the middle of the finding and publishes the suffix
-        # with its own header deleted. Quoted, indented and fenced verdicts stay ownership
-        # candidates (the model may format its real one that way) but never bound anything.
-        # Half the answer only: the bytes reaching here came from innerText of a RENDERED page,
-        # where the blockquote and the fence are already gone (#166 gate r2 P1). The rest of the
-        # rule is applied in END, where the next verdict line is known.
-        plain[n] = (!fenced && $0 !~ /^([ ][ ]|\t|[ ]*>)/)
-        # #166 gate r3 P1: the SAME ownership grammar bin/cdp-salvage.mjs matches. Accepting any
-        # text between "(run marker:" and ")" made a rendered PLACEHOLDER - "(run marker:
-        # <marker>)", which a review writes when it describes the protocol - a claim here and
-        # nothing there, so the two collectors disagreed about what the review even was. The
-        # organizer reports that disagreement as result-mismatch, having already published.
-        # RSTART/RLENGTH index the lowercased copy, whose characters map 1:1 onto $0; the token
-        # is read back out of $0 because the ownership comparison below is case-EXACT.
-        if (match(low, /\(run marker:[ \t]*pg-run-[a-z0-9.-]+[ \t]*\)/)) {
-          tok = substr($0, RSTART, RLENGTH)
-          sub(/^\([^:]*:[ \t]*/, "", tok)
-          sub(/[ \t]*\)$/, "", tok)
-          echo[n] = tok
-        }
+      s = $0
+      if (s !~ /^[ \t\r]*$/) nonempty++
+      sub(/\r$/, "", s)
+      if (s ~ /^(    |\t)/) next
+      sub(/^ +/, "", s)
+      if (s ~ /^>/) next
+      if (match(s, /^(```+|~~~+)/)) {
+        run = substr(s, 1, RLENGTH)
+        rest = substr(s, RLENGTH + 1)
+        if (fence == "") { fence = substr(run, 1, 1); width = length(run) }
+        else if (substr(run, 1, 1) == fence && length(run) >= width && rest ~ /^[ \t]*$/) fence = ""
+        next
+      }
+      if (fence != "") next
+      if (tolower(s) !~ /^[*_# \t-]*verdict[*_ \t]*:[*_ \t]*(ship|fix-first|needs-discussion)([^a-z0-9_-]|$)/) next
+      last = nonempty; last_line = NR; terminal = ""
+      if (mode == "verdict") {
+        low = tolower(s)
+        match(low, /(ship|fix-first|needs-discussion)/)
+        decision = toupper(substr(low, RSTART, RLENGTH))
+        next
+      }
+      while (match(tolower(s), /\(run marker:[ \t]*pg-run-[a-z0-9.-]+[ \t]*\)/)) {
+        token = substr(s, RSTART, RLENGTH)
+        literal = token
+        s = substr(s, RSTART + RLENGTH)
+        sub(/^\([^:]*:[ \t]*/, "", token)
+        sub(/[ \t]*\)$/, "", token)
+        if (mode == "terminal") {
+          if (literal == "(run marker: " token ")") terminal = terminal token "\n"
+        } else print token
       }
     }
     END {
-      if (vcount == 0) exit 1
-      pick = 0
-      for (k = vcount; k >= 1; k--) if (echo[vidx[k]] == mk) { pick = k; break }
-      if (pick == 0) exit 1
-      vi = vidx[pick]
-      # #166 gate r2/r3 P1: a bare verdict EARNS the right to bound a block, because the rendered
-      # text it was read from carries no quote or fence syntax to disqualify it by. The echoed
-      # run marker cannot be what earns it - a review quotes an incident verdict complete with
-      # its token, and rendered, that example claims a run exactly as a terminator does. Only the
-      # surrounding lines can: sections ASCEND inside one block, so a real terminator is followed
-      # by the next answer restarting its numbering, while a quoted example is followed by the
-      # rest of its own block ("[P2]", "P3: none", the terminator).
-      # Mirrors verdictIndex in bin/cdp-salvage.mjs, which must agree byte for byte.
-      for (bk = 1; bk <= vcount; bk++) {
-        bv = vidx[bk]
-        bstart = (bk > 1) ? vidx[bk - 1] + 1 : 1
-        bstop = (bk < vcount) ? vidx[bk + 1] : n + 1
-        bprev = -1
-        for (bi = bstart; bi < bv; bi++) { bl = seclevel(line[bi]); if (bl >= 0) bprev = bl }
-        bnext = -1
-        for (bi = bv + 1; bi < bstop && bnext < 0; bi++) bnext = seclevel(line[bi])
-        bound[bv] = (plain[bv] && bnext >= 0 && (bprev < 0 || bnext <= bprev))
-        # WHETHER another answer is present is a weaker question than WHERE its block ends, and
-        # the claim still answers it: a foreign terminator sitting AFTER this run block (the
-        # inverse layout #164 reported) has no next block behind it to be bounded by, yet the
-        # capture must still be cut down to our own answer. It is only the FLOOR - the line a
-        # cut may not reach back past - that a claim may never establish on its own.
-        answers[bv] = (plain[bv] && (echo[bv] != "" || bound[bv]))
-      }
-      # Nothing to cut unless some OTHER verdict really is another answer: an example quoted
-      # inside this run own findings is not one, and rewriting on account of it would delete the
-      # finding that wrote it.
-      others = 0
-      bn = 0
-      for (k = 1; k <= vcount; k++) {
-        if (vidx[k] == vi) continue
-        if (answers[vidx[k]]) others++
-        if (bound[vidx[k]] && vidx[k] < vi) { bn++; bpre[bn] = vidx[k] }
-      }
-      if (others == 0) exit 0                 # nothing to cut: leave the bytes alone
-      # A block may never reach back past the verdict that closed the block before it.
-      j = bn
-      floor = (bn > 0) ? bpre[bn] + 1 : 1
-      start = 0
-      while (1) {
-        for (i = vi; i >= floor; i--) if (isblockstart(line[i])) start = i
-        if (start > 0 || j == 0) break
-        # No block header under this floor, so the floor did not open a block - it landed inside
-        # one, and cutting there would publish a headerless suffix. Widen by one block. NEVER past
-        # a verdict that CLAIMS another run: those bytes can not be ours whatever they look like.
-        if (echo[bpre[j]] != "" && echo[bpre[j]] != mk) break
-        j--
-        floor = (j > 0) ? bpre[j] + 1 : 1
-      }
-      if (start == 0) {
-        # #166 gate r3 P1: every floor was refused and no block header survives under the last
-        # one, so cutting at the floor would publish a HEADERLESS fragment - a verdict with
-        # whatever section line happened to precede it, evidencing nothing. Hand back the widest
-        # headed block instead and let the foreign-echo check below refuse it. Mirrors the same
-        # fallback in extractReview (bin/cdp-salvage.mjs): where a cut cannot be trusted, both
-        # collectors must hand the engine the SAME untrusted bytes, or --finalize compares the
-        # one it published against the other it would have extracted and reports result-mismatch.
-        for (i = vi; i >= 1; i--) if (isblockstart(line[i])) start = i
-      }
-      if (start == 0) { start = vi - 120; if (start < 1) start = 1 }
-      for (i = start; i <= vi; i++) print line[i] > out
-      close(out)
-      for (k = 1; k <= vcount; k++) if (k != pick && echo[vidx[k]] != "" && echo[vidx[k]] != mk) print echo[vidx[k]]
-      exit 2
+      if (mode == "verdict" && decision != "" && nonempty - last < 6) print decision
+      if (mode == "terminal" && NR - last_line < 6) printf "%s", terminal
     }
-  ' "$f" 2>/dev/null)"
-  case $? in
-    0) rm -f "$tmp" 2>/dev/null; return 0 ;;
-    2) if [ -s "$tmp" ] && mv -f "$tmp" "$f" 2>/dev/null; then
-         [ -n "$dropped" ] && printf '%s\n' "$dropped"
-         return 2
-       fi
-       rm -f "$tmp" 2>/dev/null; return 3 ;;
-    *) rm -f "$tmp" 2>/dev/null; return 1 ;;
-  esac
+  ' "$1"
 }
 
-# pg_capture_bind <file> <marker>: the collector's single provenance chokepoint. Isolates this
-# run's block, then refuses anything that would publish another run's ownership token.
-#   rc 0 — <file> now holds exactly this run's block
-#   rc 1 — no VERDICT line echoes this marker AND none claims another run; <file> untouched,
-#          caller adjudicates as before
-#   rc 2 — provenance failure: the cut left an incomplete review, or a verdict line still CLAIMS
-#          another run — including when NO line echoes ours, since a foreign claim is a claim
-#          whatever else shares the line. Never publish; PG_CAPTURE_FOREIGN names reason/marker.
-# PG_CAPTURE_CUT lists the foreign markers whose blocks were dropped (empty when none were).
-# PG_CAPTURE_QUOTED names a foreign marker mentioned in the surviving findings. That is prose,
-# not a provenance failure (see pg_capture_foreign_echo), so it is reported, never enforced.
-# PG_CAPTURE_UNOWNED is 1 when the refusal came from a capture holding NO verdict of this run's at
-# all (#166 gate r3 P1). Both refusals are absolute, but they are not the same event: a page that
-# answered us AND someone else is finished and refuses identically on every retry, while a foreign
-# answer with no answer of ours anywhere may be scrollback above a prompt still generating. Only
-# the caller can tell them apart, because only the caller has the collector's chronology.
+pg_capture_foreign_echo() { # file marker -> first foreign authoritative claim, or nothing
+  pg_capture_verdict_claims "$1" | awk -v marker="$2" '
+    tolower($0) != tolower(marker) { print; exit }
+  '
+}
+
+# Pure acceptance predicate shared by fresh/direct capture, harvest and artifact replay.
+# rc 0: exact owned claim and no foreign claim; rc 1: no claim for this run (caller applies
+# its existing nonce/legacy rules); rc 2: foreign authoritative claim, including mixed answers
+# and a single verdict claiming two markers. Never cut, rewrite or delete the input.
+# Case-only echo drift stays nonce-less, as before; it is not another run.
 pg_capture_bind() {
-  local f="$1" marker="$2" cut rc keep="$1.pre-cut.$$"
-  PG_CAPTURE_CUT=""; PG_CAPTURE_FOREIGN=""; PG_CAPTURE_QUOTED=""; PG_CAPTURE_UNOWNED=""
+  local f="$1" marker="$2" claims
+  PG_CAPTURE_FOREIGN=""
   [ -s "$f" ] || return 1
-  # A rejected capture is set aside for a human to read, so the rejection must hand back the
-  # bytes that were actually collected — not the cut residue that proves nothing about why.
-  cp "$f" "$keep" 2>/dev/null || keep=""
-  cut="$(pg_capture_own_segment "$f" "$marker")"; rc=$?
-  case "$rc" in
-    0) ;;   # single owned verdict: nothing was rewritten, so nothing needs re-validating
-    2) PG_CAPTURE_CUT="$(printf '%s' "$cut" | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
-       # A cut that leaves less than a complete review has isolated a verdict with no findings
-       # to attribute to it. Publishing that would report a verdict this run cannot evidence.
-       if ! pg_is_review "$f"; then
-         PG_CAPTURE_FOREIGN=incomplete-after-cut
-         [ -n "$keep" ] && mv -f "$keep" "$f" 2>/dev/null
-         rm -f "$keep" 2>/dev/null; return 2
-       fi ;;
-    3) PG_CAPTURE_FOREIGN=cut-write-failed; rm -f "$keep" 2>/dev/null; return 2 ;;
-    *) # No verdict line echoes this marker. That is NOT automatically the caller's to adjudicate
-       # (#166 gate r1 P1): an EXPLICIT foreign ownership claim on a verdict line is a provenance
-       # failure whatever else that line carries. pg_capture_own_segment reads the FIRST echo on a
-       # line, so "(run marker: THEIRS) (run marker: OURS)" lands HERE - and the tail nonce check
-       # downstream then accepts it on the second token alone, while a DIRECT oracle capture,
-       # exempt from that check entirely, accepts a foreign-only answer outright. Reject both here,
-       # where every source passes, so marker order on the line cannot decide ownership.
-       PG_CAPTURE_FOREIGN="$(pg_capture_foreign_echo "$f" "$marker")"
-       if [ -n "$PG_CAPTURE_FOREIGN" ]; then
-         PG_CAPTURE_UNOWNED=1
-         [ -n "$keep" ] && mv -f "$keep" "$f" 2>/dev/null
-         rm -f "$keep" 2>/dev/null; return 2
-       fi
-       rm -f "$keep" 2>/dev/null; return 1 ;;
-  esac
-  PG_CAPTURE_FOREIGN="$(pg_capture_foreign_echo "$f" "$marker")"
-  if [ -n "$PG_CAPTURE_FOREIGN" ]; then
-    [ -n "$keep" ] && mv -f "$keep" "$f" 2>/dev/null
-    rm -f "$keep" 2>/dev/null; return 2
-  fi
-  PG_CAPTURE_QUOTED="$(pg_capture_foreign_echo "$f" "$marker" any)"
-  rm -f "$keep" 2>/dev/null
-  return 0
+  claims="$(pg_capture_verdict_claims "$f")" || { PG_CAPTURE_FOREIGN=unreadable; return 2; }
+  PG_CAPTURE_FOREIGN="$(printf '%s\n' "$claims" | awk -v marker="$marker" '
+    NF && tolower($0) != tolower(marker) { print; exit }
+  ')"
+  [ -z "$PG_CAPTURE_FOREIGN" ] || return 2
+  pg_capture_nonce_ok "$f" "$marker"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2772,6 +2548,8 @@ pg_completed_write() {  # <marker> <file>: write-once; an existing artifact is n
   local marker="$1" f="$2" dir rc
   pg_reservation_marker_ok "$marker" || return 1
   [ -s "$f" ] || return 1
+  pg_capture_bind "$f" "$marker" && rc=0 || rc=$?
+  [ "$rc" != 2 ] || return 1
   dir="$(pg_completed_dir)"
   mkdir -p "$dir" 2>/dev/null || return 1
   # Atomic NO-CLOBBER install (gate #54 r14): link(2) fails when the artifact exists, so
@@ -2798,6 +2576,8 @@ pg_completed_lookup() {  # <marker> <out>: place the artifact at <out>; rc 0 on 
   pg_reservation_marker_ok "$marker" || return 1
   src="$(pg_completed_dir)/$marker"
   { [ -s "$src" ] && [ ! -L "$src" ] && pg_is_review "$src"; } || return 1
+  pg_capture_bind "$src" "$marker" && rc=0 || rc=$?
+  [ "$rc" != 2 ] || return 1
   [ "$src" = "$out" ] && return 0
   # Copy-then-rename only — never pre-delete the destination (gate #54 r4 P2): a copy/rename
   # failure must leave any existing valid output intact, not destroy it and then fail.

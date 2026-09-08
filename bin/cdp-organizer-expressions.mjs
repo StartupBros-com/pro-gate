@@ -12,6 +12,95 @@ const REVOCATION_REGISTRY = '__proGateOrganizerRevocations';
 
 export const ORGANIZER_MUTATION_LEASE_MS = 10_000;
 
+// Shared by capture and the independent mutation guard. Preserve rendered reference context
+// before classifying claims; priority-section numbering never establishes ownership.
+export function readReviewText(document, marker) {
+  const exact = (value) => [...value.matchAll(/pg-run-[A-Za-z0-9.-]+/g)].some((match) =>
+    match[0] === marker && !/[A-Za-z0-9.-]/.test(value[match.index - 1] ?? ''));
+  const read = (node) => {
+    const text = node?.innerText ?? node?.textContent ?? '';
+    if (node?.matches?.('blockquote, pre, code')) return text.split('\n').map((line) => '> ' + line).join('\n');
+    let cursor = 0;
+    let result = '';
+    for (const child of node?.children ?? []) {
+      const original = child.innerText ?? child.textContent ?? '';
+      if (!original) continue;
+      const at = text.indexOf(original, cursor);
+      if (at < 0) continue;
+      result += text.slice(cursor, at) + read(child);
+      cursor = at + original.length;
+    }
+    return result + text.slice(cursor);
+  };
+  const turns = [...document.querySelectorAll('[data-message-author-role]')];
+  let prompt = -1;
+  for (let i = 0; i < turns.length; i++) {
+    if (turns[i].getAttribute('data-message-author-role') === 'user' && exact(turns[i].innerText ?? '')) prompt = i;
+  }
+  if (prompt >= 0) return {
+    text: 'run marker: ' + marker + '\n' + turns.slice(prompt + 1).map(read).join('\n\n'),
+    promptAt: 0,
+  };
+  return { text: read(document.body), promptAt: null };
+}
+
+export function reviewVerdictClaims(text, marker) {
+  const claims = [];
+  let fence = null;
+  let at = 0;
+  let promptAt = -1;
+  for (const line of text.split('\n')) {
+    const start = at;
+    at += line.length + 1;
+    const delimiter = line.match(/^[ ]{0,3}(`{3,}|~{3,})(.*)$/);
+    if (fence) {
+      if (delimiter && delimiter[1][0] === fence[0] && delimiter[1].length >= fence.length && !delimiter[2].trim()) fence = null;
+      continue;
+    }
+    if (delimiter) { fence = delimiter[1]; continue; }
+    if (/^(?: {4}|\t| {0,3}>)/.test(line)) continue;
+    if (line === 'run marker: ' + marker ||
+        line.startsWith('(run marker: ' + marker + ' — internal correlation id')) promptAt = start;
+    if (!/^[*_# \t-]*VERDICT[*_ \t]*:[*_ \t]*(ship|fix-first|needs-discussion)([^a-z0-9_-]|$)/i.test(line)) continue;
+    const markers = [...line.matchAll(/\(run marker:[ \t]*(pg-run-[A-Za-z0-9.-]+)[ \t]*\)/gi)].map((match) => match[1]);
+    claims.push({ line, at: start, markers });
+  }
+  return { claims, promptAt };
+}
+
+export function reviewTextContext(text, marker, promptAt = null) {
+  const scanned = reviewVerdictClaims(text, marker);
+  const all = scanned.claims;
+  // DOM user-turn scope is authoritative. Legacy text sources retain the known prompt-line
+  // shapes only; a prose marker mention cannot erase an earlier verdict.
+  if (promptAt === null) promptAt = scanned.promptAt;
+  const claims = all.filter((claim) => claim.at > promptAt);
+  const markers = new Set(claims.flatMap((claim) => claim.markers.map((value) => value.toLowerCase())));
+  const mixed = markers.has(marker.toLowerCase()) && [...markers].some((value) => value !== marker.toLowerCase());
+  const verdict = claims.at(-1) ?? all.at(-1) ?? null;
+  let review = null;
+  if (verdict) {
+    if (mixed) {
+      const from = promptAt < 0 ? 0 : text.indexOf('\n', promptAt) + 1;
+      review = text.slice(from, verdict.at + verdict.line.length).trim();
+    } else {
+      const lines = text.split('\n');
+      let at = 0;
+      let start = -1;
+      let end = -1;
+      for (let i = 0; i < lines.length; i++) {
+        if (at === verdict.at) end = i;
+        if (at <= verdict.at && (verdict.at < promptAt || at > promptAt) && start < 0 &&
+            /^\s*[*_>#-]*\s*(P0\s*[:\-]|P0\b|\[P[0-3]\])/i.test(lines[i].trim())) start = i;
+        at += lines[i].length + 1;
+      }
+      if (start < 0) start = Math.max(0, end - 120);
+      review = lines.slice(start, end + 1).join('\n').trim();
+    }
+  }
+  return { claims, verdict, mixed, review, promptAt };
+}
+
 function targetContext(marker, conversationUrl, {
   mutationToken,
   mutationExpiresAt,
@@ -102,37 +191,19 @@ function targetContext(marker, conversationUrl, {
       if (at < 0) return line;
       return (line.slice(0, at) + line.slice(at + token.length)).replace(/[ \t]+$/, '');
     }).join('\n');
-    const extractFinalReview = (text) => {
-      const lines = text.split('\n');
-      let verdictIdx = -1;
-      for (let i = lines.length - 1; i >= 0; i -= 1) {
-        if (/^\s*[*_>#-]*\s*VERDICT[*_\s]*:/i.test(lines[i])) {
-          verdictIdx = i;
-          break;
-        }
-      }
-      if (verdictIdx < 0) return null;
-      let start = -1;
-      for (let i = verdictIdx; i >= 0; i -= 1) {
-        if (/^\s*[*_>#-]*\s*(P0\s*[:\-]|P0\b|\[P[0-3]\])/i.test(lines[i].trim())) start = i;
-      }
-      if (start < 0) start = Math.max(0, verdictIdx - 120);
-      return lines.slice(start, verdictIdx + 1).join('\n').trim();
-    };
+    const readReviewText = ${readReviewText.toString()};
+    const reviewVerdictClaims = ${reviewVerdictClaims.toString()};
+    const reviewTextContext = ${reviewTextContext.toString()};
     const validateTarget = () => {
       if (!mutationLeaseActive()) return 'mutation-lease-expired';
       if (typeof location !== 'object' || location.href !== expectedUrl) return 'target-url-drift';
-      const text = String(document.body?.innerText ?? '');
+      const captured = readReviewText(document, expectedMarker);
+      const text = captured.text;
+      const context = reviewTextContext(text, expectedMarker, captured.promptAt);
+      if (context.mixed) return 'target-mixed-review';
       if (lastExactMarkerAt(text, expectedMarker) < 0) return 'target-marker-missing';
-      const lines = text.split('\n');
-      let verdictLine = '';
-      for (let i = lines.length - 1; i >= 0; i -= 1) {
-        if (/^\s*[*_>#-]*\s*VERDICT[*_\s]*:/i.test(lines[i])) {
-          verdictLine = lines[i];
-          break;
-        }
-      }
-      const verdictAt = verdictLine ? text.lastIndexOf(verdictLine) : -1;
+      const verdictLine = context.verdict?.line ?? '';
+      const verdictAt = context.verdict?.at ?? -1;
       const ownMarkerAt = lastExactMarkerAt(text, expectedMarker);
       const promptMarkerAt = verdictAt >= 0
         ? lastExactMarkerAt(text.slice(0, verdictAt), expectedMarker)
@@ -150,7 +221,7 @@ function targetContext(marker, conversationUrl, {
         const answerMarker = verdictLine.match(/\(run marker:\s*(pg-run-[A-Za-z0-9.-]+)\s*\)/i)?.[1] ?? null;
         if (!answerMarker) return 'target-answer-marker-missing';
         if (answerMarker !== expectedMarker) return 'target-cross-bound';
-        const renderedReview = extractFinalReview(text);
+        const renderedReview = context.review;
         if (!renderedReview || normalizeReviewBytes(stripMarkerEcho(renderedReview)) !== expectedFinalReview) {
           return 'target-result-mismatch';
         }
