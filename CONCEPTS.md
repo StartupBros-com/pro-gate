@@ -30,6 +30,8 @@ Immutable positive proof that an attempt no longer owns recovery. Its proof dete
 
 Proof that a charged attempt no longer applies to the current target. Supersession preserves charge and auditability while releasing capacity, and cannot be reversed by later mutable observations.
 
+The proof is external to the attempt's own execution: it comes from the repository target moving on, not from anything the attempt itself reports. So an attempt whose own work never reaches a terminal signal can still be superseded, and waiting on that attempt to conclude is not a precondition. Where an attempt carries no immutable record of the input it was bound to, supersession cannot be proven for it at all and the lifecycle fails closed rather than guessing.
+
 ### Exact Recovery
 
 Collection or reconciliation of one canonically identified attempt without a new submission. Ambiguous ownership fails closed rather than selecting a plausible conversation or spending again.
