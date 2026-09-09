@@ -2762,8 +2762,25 @@ if [ -n "$HARVEST_MARKER" ]; then
     cat "$PG_FINAL_SRC"
     pg_finish 0
   fi
+  # Salvage returning bytes that do not validate is a REFUSAL, and this file's own rule for
+  # every other refusal is that the evidence survives it (.unbound.$/.foreign.$). This path
+  # deleted the only copy: HARVEST_TMP comes straight from cdp-salvage stdout and is mirrored
+  # nowhere, so the loss was total (gate #166 r3 P1).
+  HARVEST_KEEP=""
+  if [ "$HARVEST_RC" -eq 0 ] && [ -s "$HARVEST_TMP" ]; then
+    HARVEST_KEEP="$OUT.unrecognized.$$"
+    cp "$HARVEST_TMP" "$HARVEST_KEEP" 2>/dev/null || HARVEST_KEEP=""
+  fi
   rm -f "$HARVEST_TMP"
   case "$HARVEST_RC" in
+    0) # Salvage SUCCEEDED and returned text; it just did not validate as a review. The
+       # generic arm below blamed browser/CDP health and told the operator to retry, which
+       # against static, already-generated text can never succeed. Name the real cause and
+       # point at the preserved bytes. Exit 3 is retained so existing callers keep their
+       # handling; only the diagnostic and the evidence change.
+       echo "ERROR: harvest captured the answer but it did not validate as a review${HARVEST_KEEP:+; kept at $HARVEST_KEEP}. The conversation and reservation are kept. Retrying --harvest re-reads the same text and will fail the same way; inspect the capture instead." >&2
+       pg_status failed "harvest capture failed validation; reservation kept"
+       pg_finish 3 ;;
     3) pg_reservation_write "$RUN_MARKER" "" "$OUT" || true
        echo "[oracle-review] still generating: tab left open; run --harvest again later." >&2
        pg_status in-progress "still generating; retry --harvest later"

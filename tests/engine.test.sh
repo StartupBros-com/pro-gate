@@ -3128,9 +3128,32 @@ bind_case indented-verdict 0 "[P1] src/real.sh:4 — an old verdict example
 $OWN164"
 bind_case fenced-verdict 0 "$(printf '[P1] src/real.sh:4 — an old verdict example\n```text\nVERDICT: FIX-FIRST (run marker: %s)\n```\n%s\n' "$FOREIGN164" "$OWN164")"
 bind_case tilde-fenced-verdict 0 "$(printf '[P1] src/real.sh:4 — an old verdict example\n~~~text\nVERDICT: FIX-FIRST (run marker: %s)\n~~~\n%s\n' "$FOREIGN164" "$OWN164")"
+# gate #166 r3 P1: a fence that is never closed is not a code block, it is a model that
+# forgot a ```. Suppressing to EOF hid this run's OWN terminal verdict, so a complete,
+# single-run, unambiguous review classified as "still generating" and was discarded and
+# retried against text that could never change. These four pin both directions of the fix:
+# the tail is recovered, and recovery stays fail-closed.
+bind_case unterminated-fence-own-binds 0 "$(printf '[P1] src/real.sh:4 — example\n```text\nsome snippet the model never closed\n%s\n' "$OWN164")"
+# A foreign verdict recovered from behind an unterminated fence must REFUSE, never publish.
+bind_case unterminated-fence-foreign-refuses 2 "$(printf '[P1] src/real.sh:4 — example\n```text\nVERDICT: FIX-FIRST — theirs. (run marker: %s)\n%s\n' "$FOREIGN164" "$OWN164")"
+# An odd fence count: two closed blocks then a third left open, our verdict after it.
+bind_case odd-fence-count-still-binds 0 "$(printf '[P1] a\n```\nx\n```\n[P2] b\n```\ny\n```\n[P3] c\n```\nz\n%s\n' "$OWN164")"
+# Genuinely still generating — unterminated fence, no verdict anywhere — stays unclaimed,
+# so the fix does not turn "not finished yet" into a publishable answer.
+bind_case unterminated-fence-no-verdict 1 "$(printf '[P1] a\n```\npartial snippet, still being written\n')"
 bind_case placeholder 0 "P0: none
 VERDICT: SHIP — example. (run marker: <marker>)
 $OWN164"
+# gate #166 r3: lib/pro-gate-lib.sh strips a trailing CR and skips a TAB-or-four-space
+# indented line, but no fixture reached either branch, so the two shapes most likely to
+# arrive from a real browser capture were the two the ownership table never exercised.
+# A tab-indented foreign verdict is reference text exactly as the four-space case is.
+bind_case tab-indented-verdict 0 "$(printf '[P1] src/real.sh:4 — an old verdict example\n\tVERDICT: FIX-FIRST (run marker: %s)\n%s\n' "$FOREIGN164" "$OWN164")"
+# CRLF must not cost a clean capture its ownership: the trailing CR would otherwise sit
+# inside the marker token and no echo would match, silently demoting a valid review to
+# unclaimed. It must also not hide a foreign claim.
+bind_case crlf-clean 0 "$(printf 'P0: none\r\nP1: none\r\nVERDICT: SHIP — ours. (run marker: %s)\r\nSources: retained\r\n' "$BIND_MARKER")"
+bind_case crlf-foreign-first 2 "$(printf '[P0] other/a.ts:1 — theirs\r\nVERDICT: FIX-FIRST — theirs. (run marker: %s)\r\nP0: none\r\nVERDICT: SHIP — ours. (run marker: %s)\r\n' "$FOREIGN164" "$BIND_MARKER")"
 BIND_MIXED='pg-run-StartupBros-com-pro-gate-166-1788719459-1312546'
 printf 'P0: none\nVERDICT: SHIP (run marker: %s)\n' "$(printf '%s' "$BIND_MIXED" | tr 'A-Z' 'a-z')" > "$TDIR/bind-case.md"
 cp "$TDIR/bind-case.md" "$TDIR/bind-case.orig"

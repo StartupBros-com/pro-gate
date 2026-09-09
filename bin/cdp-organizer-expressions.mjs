@@ -55,13 +55,30 @@ export function readReviewText(document, marker) {
 
 export function reviewVerdictClaims(text, marker) {
   const claims = [];
+  const lines = text.split('\n');
+  // A fence that is never closed is not a code block, it is a missing ```. Suppressing to
+  // EOF hid this run's own terminal VERDICT and made a complete review read as "still
+  // generating" (gate #166 r3 P1). Find the opener still open at EOF and demote just that
+  // line to ordinary text. Kept in lockstep with pg_capture_verdict_claims in the library.
+  let dangling = -1;
+  {
+    let scan = null;
+    for (let i = 0; i < lines.length; i += 1) {
+      const d = lines[i].match(/^[ ]{0,3}(`{3,}|~{3,})(.*)$/);
+      if (!d) continue;
+      if (/^(?: {4}|\t| {0,3}>)/.test(lines[i])) continue;
+      if (!scan) { scan = d[1]; dangling = i; }
+      else if (d[1][0] === scan[0] && d[1].length >= scan.length && !d[2].trim()) { scan = null; dangling = -1; }
+    }
+  }
   let fence = null;
   let at = 0;
   let promptAt = -1;
-  for (const line of text.split('\n')) {
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
     const start = at;
     at += line.length + 1;
-    const delimiter = line.match(/^[ ]{0,3}(`{3,}|~{3,})(.*)$/);
+    const delimiter = index === dangling ? null : line.match(/^[ ]{0,3}(`{3,}|~{3,})(.*)$/);
     if (fence) {
       if (delimiter && delimiter[1][0] === fence[0] && delimiter[1].length >= fence.length && !delimiter[2].trim()) fence = null;
       continue;

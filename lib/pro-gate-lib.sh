@@ -2423,7 +2423,30 @@ pg_strip_nonce() {
 # Scan the WHOLE response before accepting it: a foreign verdict after our own is just
 # as mixed as one before it.
 pg_capture_verdict_claims() { # file [verdict|terminal] -> claims, decision or terminal claims
+  # Read the file TWICE. A fence suppresses the lines inside it, but a fence that is never
+  # closed is not a code block -- it is a model that forgot a ``` -- and treating it as one
+  # made every later line invisible, INCLUDING this run's own terminal VERDICT. A complete,
+  # single-run, unambiguous review then read as "still generating" and was discarded and
+  # retried forever (gate #166 r3 P1; verified by two documents differing only by a closing
+  # fence). The first pass finds the opener still open at EOF; the second treats that one
+  # line as ordinary text so the tail is classified normally. Recovery stays fail-closed:
+  # mixed-claim detection runs over the recovered region too, so a foreign verdict hiding
+  # behind an unterminated fence is refused rather than published.
   awk -v mode="${2:-claims}" '
+    NR == FNR {
+      p = $0
+      sub(/\r$/, "", p)
+      if (p ~ /^(    |\t)/) next
+      sub(/^ +/, "", p)
+      if (p ~ /^>/) next
+      if (match(p, /^(```+|~~~+)/)) {
+        prun = substr(p, 1, RLENGTH)
+        prest = substr(p, RLENGTH + 1)
+        if (pfence == "") { pfence = substr(prun, 1, 1); pwidth = length(prun); dangling = FNR }
+        else if (substr(prun, 1, 1) == pfence && length(prun) >= pwidth && prest ~ /^[ \t]*$/) { pfence = ""; dangling = 0 }
+      }
+      next
+    }
     {
       s = $0
       if (s !~ /^[ \t\r]*$/) nonempty++
@@ -2431,7 +2454,7 @@ pg_capture_verdict_claims() { # file [verdict|terminal] -> claims, decision or t
       if (s ~ /^(    |\t)/) next
       sub(/^ +/, "", s)
       if (s ~ /^>/) next
-      if (match(s, /^(```+|~~~+)/)) {
+      if (match(s, /^(```+|~~~+)/) && FNR != dangling) {
         run = substr(s, 1, RLENGTH)
         rest = substr(s, RLENGTH + 1)
         if (fence == "") { fence = substr(run, 1, 1); width = length(run) }
@@ -2463,7 +2486,7 @@ pg_capture_verdict_claims() { # file [verdict|terminal] -> claims, decision or t
       if (mode == "verdict" && decision != "" && nonempty - last < 6) print decision
       if (mode == "terminal" && NR - last_line < 6) printf "%s", terminal
     }
-  ' "$1"
+  ' "$1" "$1"
 }
 
 pg_capture_foreign_echo() { # file marker -> first foreign authoritative claim, or nothing
