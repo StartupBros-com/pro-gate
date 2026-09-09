@@ -2548,14 +2548,15 @@ check 'browser-restart detector silent when service down (uptime 0)' "$([ "$RC" 
 echo '# v0.27: --status run rediscovery (read-only, no browser needed)'
 SHOME="$TDIR/sthome"; mkdir -p "$SHOME/in-progress" "$SHOME/rounds" "$SHOME/conversation-urls"
 SMARKER="pg-run-acme-widgets-42-1700000001-77"
-printf '42\t/tmp/pg-st-42.md\t%s\t0\t1\tGPT-X\n' "$(date +%s)" > "$SHOME/in-progress/$SMARKER"
+STATUS_OUT="$TDIR/status-review.md"
+printf '42\t%s\t%s\t0\t1\tGPT-X\n' "$STATUS_OUT" "$(date +%s)" > "$SHOME/in-progress/$SMARKER"
 printf '%s\n%s\n' "$(( $(date +%s) - 60 ))" "$(( $(date +%s) - 120 ))" > "$SHOME/rounds/acme-widgets-42"
 # Flat (non-shrinking) open counts so this fixture earns no extra round and leaves the
 # base-grant assertion below ('2 spent, 1 remaining') undisturbed — it exists only to give
 # the elapsed-wall-clock assertion two real hist rows (2h total) to sum.
 printf '%s\tFIX-FIRST\t0\t5\t0\t0\t3600\n%s\tFIX-FIRST\t0\t5\t0\t0\t3600\n' "$(date +%s)" "$(date +%s)" > "$SHOME/rounds/acme-widgets-42.hist"
 printf 'https://chatgpt.com/c/abc123\n' > "$SHOME/conversation-urls/$SMARKER"
-printf '{"ts":"2026-01-01T00:00:00+0000","pr":"42","repo":"/tmp/acme","exit":9,"outcome":"in-progress","secs":100,"attempts":0,"conc":1,"ceiling":1,"live":1,"salvaged":0,"diff_lines":10,"out":"/tmp/pg-st-42.md","model":"m","marker":"%s","round_key":"acme-widgets-42"}\n' "$SMARKER" > "$SHOME/ledger.jsonl"
+printf '{"ts":"2026-01-01T00:00:00+0000","pr":"42","repo":"/tmp/acme","exit":9,"outcome":"in-progress","secs":100,"attempts":0,"conc":1,"ceiling":1,"live":1,"salvaged":0,"diff_lines":10,"out":"%s","model":"m","marker":"%s","round_key":"acme-widgets-42"}\n' "$STATUS_OUT" "$SMARKER" > "$SHOME/ledger.jsonl"
 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 >"$TDIR/st.out" 2>"$TDIR/st.err"; RC=$?
 check '--status exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(cat "$TDIR/st.err")"
 check '--status names the reservation marker' "$(grep -q "$SMARKER" "$TDIR/st.out"; echo $?)" "$(cat "$TDIR/st.out")"
@@ -2570,7 +2571,7 @@ check '--status writes nothing' "$([ ! -f "$SHOME/ledger.jsonl.tmp" ] && [ "$(wc
 # mode makes one when an older answer is visible while ours generates); only a positively
 # convicted cross-bind is terminally stuck. Reporting the first as STUCK would tell an operator
 # to delete a live reservation.
-: > /tmp/pg-st-42.md.unbound.111; : > /tmp/pg-st-42.md.unbound.222
+: > "$STATUS_OUT.unbound.111"; : > "$STATUS_OUT.unbound.222"
 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 >"$TDIR/st-amb.out" 2>/dev/null
 check '--status calls bare unbound captures AMBIGUOUS, not stuck' \
   "$(grep -q 'ambiguous, still retryable' "$TDIR/st-amb.out" && ! grep -q 'STUCK' "$TDIR/st-amb.out"; echo $?)" "$(cat "$TDIR/st-amb.out")"
@@ -2591,7 +2592,7 @@ if command -v jq >/dev/null 2>&1; then
     "$([ "$(jq -r '.reservations[0].state' "$TDIR/st-stuck.json")" = 'cross-bound' ]; echo $?)" \
     "$(jq -c '.reservations[0]' "$TDIR/st-stuck.json" 2>/dev/null)"
 fi
-rm -rf "$SHOME/crossbound"; rm -f /tmp/pg-st-42.md.unbound.111 /tmp/pg-st-42.md.unbound.222
+rm -rf "$SHOME/crossbound"; rm -f "$STATUS_OUT.unbound.111" "$STATUS_OUT.unbound.222"
 
 # #68 gate P1: a confirmed miss must NOT erase the v0.31 spend epoch (field 7).
 MHOME="$TDIR/home-missfields"; mkdir -p "$MHOME/in-progress"
@@ -2755,18 +2756,18 @@ printf '%s\t/tmp/pg-dead-42.md\t99999999\t%s\n' "$SMARKER" "$(date +%s)" > "$SHO
 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 >"$TDIR/st7.out" 2>/dev/null
 check '--status dead wrapper leads to harvest, not fresh run' "$(grep -q 'wrapper DIED' "$TDIR/st7.out" && grep -q -- "--harvest '$SMARKER'" "$TDIR/st7.out"; echo $?)" "$(tail -2 "$TDIR/st7.out")"
 rm -rf "$SHOME/active"
-printf '42\t/tmp/pg-st-42.md\t%s\t0\t1\tGPT-X\n' "$(date +%s)" > "$SHOME/in-progress/$SMARKER"
+printf '42\t%s\t%s\t0\t1\tGPT-X\n' "$STATUS_OUT" "$(date +%s)" > "$SHOME/in-progress/$SMARKER"
 # URL queries repo-scope the ledger (gate #53 P1): a foreign repo's identical PR number must
 # not drive next_step or appear in recent runs.
 printf '{"ts":"2026-01-03T00:00:00+0000","pr":"42","repo":"/tmp/other","exit":0,"outcome":"clean","secs":50,"attempts":0,"conc":1,"ceiling":1,"live":0,"salvaged":0,"diff_lines":5,"out":"/tmp/FOREIGN-42.md","model":"m","marker":"pg-run-other-repo-42-1700000009-88","round_key":"other-repo-42"}\n' >> "$SHOME/ledger.jsonl"
 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status "https://github.com/acme/widgets/pull/42" --json >"$TDIR/st8.json" 2>/dev/null
-check 'URL --status excludes foreign-repo rows' "$(jq -e '[.recent_runs[].out] | inside(["/tmp/pg-st-42.md"])' "$TDIR/st8.json" >/dev/null 2>&1; echo $?)" "$(jq -c .recent_runs "$TDIR/st8.json")"
+check 'URL --status excludes foreign-repo rows' "$(jq -e --arg out "$STATUS_OUT" '[.recent_runs[].out] | inside([$out])' "$TDIR/st8.json" >/dev/null 2>&1; echo $?)" "$(jq -c .recent_runs "$TDIR/st8.json")"
 check 'URL --status still finds its own repo' "$([ "$(jq -r '.recent_runs | length' "$TDIR/st8.json")" = 1 ]; echo $?)" "$(jq -c .recent_runs "$TDIR/st8.json")"
 # Round keys are not prefix-free (gate #53 r2 P1): a row whose key merely EXTENDS the queried
 # slug-num (acme-widgets-42-tools-7) must not match a URL query for acme/widgets#42.
 printf '{"ts":"2026-01-04T00:00:00+0000","pr":"7","repo":"/tmp/tools","exit":0,"outcome":"clean","secs":40,"attempts":0,"conc":1,"ceiling":1,"live":0,"salvaged":0,"diff_lines":3,"out":"/tmp/PREFIX-COLLIDE.md","model":"m","marker":"pg-run-acme-widgets-42-tools-7-1700000010-99","round_key":"acme-widgets-42-tools-7"}\n' >> "$SHOME/ledger.jsonl"
 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status "https://github.com/acme/widgets/pull/42" --json >"$TDIR/st9.json" 2>/dev/null
-check 'URL --status rejects prefix-colliding keys' "$(jq -e '[.recent_runs[].out] | inside(["/tmp/pg-st-42.md"])' "$TDIR/st9.json" >/dev/null 2>&1; echo $?)" "$(jq -c .recent_runs "$TDIR/st9.json")"
+check 'URL --status rejects prefix-colliding keys' "$(jq -e --arg out "$STATUS_OUT" '[.recent_runs[].out] | inside([$out])' "$TDIR/st9.json" >/dev/null 2>&1; echo $?)" "$(jq -c .recent_runs "$TDIR/st9.json")"
 # First-ever run waiting for the account slot (gate #53 r2 P1): per-change lock held, but no
 # rounds/ or active/ file yet — --status must still see it, not report "no state".
 ( exec 9>>"$SHOME/oracle.lock.pr-fresh-repo-90"; flock 9; sleep 4 ) &
@@ -2783,7 +2784,7 @@ printf '%s\t/tmp/pg-native-42.md\t99999999\t%s\tnative\n' "$SMARKER" "$(date +%s
 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 >"$TDIR/st11.out" 2>/dev/null
 check 'native dead wrapper avoids the harvest loop' "$(grep -q 'no marker-addressed harvest path' "$TDIR/st11.out" && ! grep -q -- "--harvest '$SMARKER'" "$TDIR/st11.out"; echo $?)" "$(tail -2 "$TDIR/st11.out")"
 rm -rf "$SHOME/active"
-printf '42\t/tmp/pg-st-42.md\t%s\t0\t1\tGPT-X\n' "$(date +%s)" > "$SHOME/in-progress/$SMARKER"
+printf '42\t%s\t%s\t0\t1\tGPT-X\n' "$STATUS_OUT" "$(date +%s)" > "$SHOME/in-progress/$SMARKER"
 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status not.a.query >/dev/null 2>&1; RC=$?
 check '--status rejects a malformed query (exit 2)' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC"
 PRO_GATE_HOME="$SHOME" bash "$ENGINE" --json >/dev/null 2>&1; RC=$?
@@ -3072,6 +3073,289 @@ RC=$?
 check 'non-boolean REQUIRE_NONCE enforces (fails closed, exit 9)' "$([ "$RC" -eq 9 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
 rm -f "$TDIR/home/in-progress/$M13" "$TDIR/home/manifests/$M13"
 
+# #164: ownership is validated on the full response before publication. Fixtures exercise both
+# collectors, immutable replay, and charge retention; they do not prove live ChatGPT behavior.
+FOREIGN164='pg-run-crossfeed-2619-1700000069-20'
+BIND_MARKER='pg-run-bindunit-1-1700000080-31'
+bind_case() { # <name> <expected-rc> <body>
+  local name="$1" expected="$2" body="$3" actual
+  printf '%s' "$body" > "$TDIR/bind-$name.md"
+  cp "$TDIR/bind-$name.md" "$TDIR/bind-$name.orig"
+  bash -c '. "$1"; pg_capture_bind "$2" "$3"' _ "$LIB" "$TDIR/bind-$name.md" "$BIND_MARKER"
+  actual=$?
+  check "ownership predicate $name returns $expected and preserves all bytes" \
+    "$([ "$actual" -eq "$expected" ] && cmp -s "$TDIR/bind-$name.md" "$TDIR/bind-$name.orig"; echo $?)" \
+    "rc=$actual $(cat "$TDIR/bind-$name.md")"
+}
+OWN164="$(printf 'P0: none\nP1: none\nVERDICT: SHIP — ours. (run marker: %s)\nSources: retained\n' "$BIND_MARKER")"
+OTHER164="$(printf '[P0] other/a.ts:1 — theirs\nP1: none\nVERDICT: FIX-FIRST — theirs. (run marker: %s)\n' "$FOREIGN164")"
+bind_case clean 0 "$OWN164"
+# The permissive scanner may recognize FOREIGN claims with formatting drift, but
+# positive ownership still requires the canonical literal used by nonce stripping.
+bind_case own-extra-space 1 "P0: none
+VERDICT: SHIP (run marker:  $BIND_MARKER )"
+bind_case own-no-space 1 "P0: none
+VERDICT: SHIP (run marker:$BIND_MARKER)"
+bind_case own-code 1 "P0: none
+VERDICT: SHIP (run marker: \`$BIND_MARKER\`)"
+bind_case own-nonterminal 1 "P0: none
+VERDICT: SHIP (run marker: $BIND_MARKER)
+VERDICT: FIX-FIRST — no final owned echo"
+bind_case foreign-extra-space 2 "P0: none
+VERDICT: SHIP (run marker:  $FOREIGN164 )
+$OWN164"
+bind_case foreign-first 2 "$OTHER164
+$OWN164"
+bind_case foreign-last 2 "$OWN164
+$OTHER164"
+bind_case foreign-only 2 "$OTHER164"
+bind_case foreign-code 2 "P0: none
+VERDICT: SHIP (run marker: \`$FOREIGN164\`)
+$OWN164"
+bind_case dual-own-first 2 "P0: none
+VERDICT: SHIP (run marker: $BIND_MARKER) (run marker: $FOREIGN164)"
+bind_case dual-foreign-first 2 "P0: none
+VERDICT: SHIP (run marker: $FOREIGN164) (run marker: $BIND_MARKER)"
+bind_case unclaimed 1 'P0: none
+VERDICT: SHIP — no ownership echo'
+bind_case prose-reference 0 "[P1] src/real.sh:4 — the incident ended (run marker: $FOREIGN164)
+$OWN164"
+bind_case quoted-verdict 0 "[P1] src/real.sh:4 — an old verdict example
+> VERDICT: FIX-FIRST (run marker: $FOREIGN164)
+$OWN164"
+bind_case indented-verdict 0 "[P1] src/real.sh:4 — an old verdict example
+    VERDICT: FIX-FIRST (run marker: $FOREIGN164)
+$OWN164"
+bind_case fenced-verdict 0 "$(printf '[P1] src/real.sh:4 — an old verdict example\n```text\nVERDICT: FIX-FIRST (run marker: %s)\n```\n%s\n' "$FOREIGN164" "$OWN164")"
+bind_case tilde-fenced-verdict 0 "$(printf '[P1] src/real.sh:4 — an old verdict example\n~~~text\nVERDICT: FIX-FIRST (run marker: %s)\n~~~\n%s\n' "$FOREIGN164" "$OWN164")"
+# gate #166 r3 P1: a fence that is never closed is not a code block, it is a model that
+# forgot a ```. Suppressing to EOF hid this run's OWN terminal verdict, so a complete,
+# single-run, unambiguous review classified as "still generating" and was discarded and
+# retried against text that could never change. These four pin both directions of the fix:
+# the tail is recovered, and recovery stays fail-closed.
+bind_case unterminated-fence-own-binds 0 "$(printf '[P1] src/real.sh:4 — example\n```text\nsome snippet the model never closed\n%s\n' "$OWN164")"
+# A foreign verdict recovered from behind an unterminated fence must REFUSE, never publish.
+bind_case unterminated-fence-foreign-refuses 2 "$(printf '[P1] src/real.sh:4 — example\n```text\nVERDICT: FIX-FIRST — theirs. (run marker: %s)\n%s\n' "$FOREIGN164" "$OWN164")"
+# An odd fence count: two closed blocks then a third left open, our verdict after it.
+bind_case odd-fence-count-still-binds 0 "$(printf '[P1] a\n```\nx\n```\n[P2] b\n```\ny\n```\n[P3] c\n```\nz\n%s\n' "$OWN164")"
+# Genuinely still generating — unterminated fence, no verdict anywhere — stays unclaimed,
+# so the fix does not turn "not finished yet" into a publishable answer.
+bind_case unterminated-fence-no-verdict 1 "$(printf '[P1] a\n```\npartial snippet, still being written\n')"
+bind_case placeholder 0 "P0: none
+VERDICT: SHIP — example. (run marker: <marker>)
+$OWN164"
+# gate #166 r3: lib/pro-gate-lib.sh strips a trailing CR and skips a TAB-or-four-space
+# indented line, but no fixture reached either branch, so the two shapes most likely to
+# arrive from a real browser capture were the two the ownership table never exercised.
+# A tab-indented foreign verdict is reference text exactly as the four-space case is.
+bind_case tab-indented-verdict 0 "$(printf '[P1] src/real.sh:4 — an old verdict example\n\tVERDICT: FIX-FIRST (run marker: %s)\n%s\n' "$FOREIGN164" "$OWN164")"
+# CRLF must not cost a clean capture its ownership: the trailing CR would otherwise sit
+# inside the marker token and no echo would match, silently demoting a valid review to
+# unclaimed. It must also not hide a foreign claim.
+bind_case crlf-clean 0 "$(printf 'P0: none\r\nP1: none\r\nVERDICT: SHIP — ours. (run marker: %s)\r\nSources: retained\r\n' "$BIND_MARKER")"
+bind_case crlf-foreign-first 2 "$(printf '[P0] other/a.ts:1 — theirs\r\nVERDICT: FIX-FIRST — theirs. (run marker: %s)\r\nP0: none\r\nVERDICT: SHIP — ours. (run marker: %s)\r\n' "$FOREIGN164" "$BIND_MARKER")"
+BIND_MIXED='pg-run-StartupBros-com-pro-gate-166-1788719459-1312546'
+printf 'P0: none\nVERDICT: SHIP (run marker: %s)\n' "$(printf '%s' "$BIND_MIXED" | tr 'A-Z' 'a-z')" > "$TDIR/bind-case.md"
+cp "$TDIR/bind-case.md" "$TDIR/bind-case.orig"
+bash -c '. "$1"; pg_capture_bind "$2" "$3"' _ "$LIB" "$TDIR/bind-case.md" "$BIND_MIXED"; RC=$?
+check 'mis-cased own echo remains unbound without becoming a foreign claim' \
+  "$([ "$RC" -eq 1 ] && cmp -s "$TDIR/bind-case.md" "$TDIR/bind-case.orig"; echo $?)" "rc=$RC"
+RESET_FOREIGN="$(bash -c '. "$1"; pg_capture_bind "$2" "$4"; pg_capture_bind "$3" "$4"; printf "%s" "${PG_CAPTURE_FOREIGN:-}"' _ "$LIB" "$TDIR/bind-foreign-only.md" "$TDIR/bind-clean.md" "$BIND_MARKER")"
+check 'ownership predicate clears foreign state before the next clean capture' "$([ -z "$RESET_FOREIGN" ]; echo $?)" "$RESET_FOREIGN"
+
+crossfeed_case() { # <case-name> <marker> <mode:clean|reference|scrollback|foreign-first|foreign-last|dual>
+  local name="$1" marker="$2" mode="$3" out="$TDIR/o-crossfeed-$1.md" home="$TDIR/home-crossfeed-$1"
+  local verdict=SHIP
+  [ "$mode" = reference ] && verdict=FIX-FIRST
+  local key="acme-crossfeed-176" epoch=1700000070 raw="$TDIR/crossfeed-$1.raw" expected="$TDIR/crossfeed-$1.expected" i evidence
+  mkdir -p "$home/in-progress" "$home/manifests" "$home/run-meta" "$home/rounds"
+  printf '%s\n' "$epoch" > "$home/rounds/$key"
+  printf 'github.com\tacme\tcrossfeed\t%s\t176\t%s\t%s\n' "$key" "$out" "$epoch" > "$home/run-meta/$marker"
+  # Already past TTL, with a prior miss streak: rejection must leave this exact reservation alone.
+  printf '%s\t%s\t%s\t2\t1\tGPT-X\t%s\tgenerating\n' "$key" "$out" "$(( $(date +%s) - 30000 ))" "$epoch" > "$home/in-progress/$marker"
+  cp "$home/in-progress/$marker" "$home/reservation.before"
+  cp "$home/rounds/$key" "$home/charge.before"
+  printf 'src/real.sh\n' > "$home/manifests/$marker"
+  {
+    [ "$mode" = foreign-first ] && printf '[P0] other/a.ts:1 — theirs\nP1: none\nVERDICT: FIX-FIRST — theirs. (run marker: %s)\n\n' "$FOREIGN164"
+    printf '[P1] src/real.sh:4 — owned finding\n'
+    if [ "$mode" = reference ]; then
+      printf 'The incident used (run marker: %s).\n> VERDICT: FIX-FIRST — quoted example. (run marker: %s)\n    VERDICT: FIX-FIRST — indented example. (run marker: %s)\n```text\nVERDICT: FIX-FIRST — fenced example. (run marker: %s)\n```\n' "$FOREIGN164" "$FOREIGN164" "$FOREIGN164" "$FOREIGN164"
+    fi
+    printf 'P2: none\nP3: none\n'
+    [ "$mode" = reference ] && printf '> VERDICT: SHIP — adjacent example. (run marker: %s)\n' "$FOREIGN164"
+    printf 'VERDICT: %s — ours. (run marker: %s)' "$verdict" "$marker"
+    [ "$mode" = dual ] && printf ' (run marker: %s)' "$FOREIGN164"
+    printf '\n'
+    [ "$mode" = foreign-last ] && printf '\n[P0] other/a.ts:1 — theirs\nP1: none\nVERDICT: FIX-FIRST — theirs. (run marker: %s)\n' "$FOREIGN164"
+  } > "$raw"
+  {
+    [ "$mode" = scrollback ] && printf '[P0] old/a.ts:1 — old task\nVERDICT: FIX-FIRST (run marker: %s)\n\n' "$FOREIGN164"
+    printf 'run marker: %s\n\n' "$marker"
+    cat "$raw"
+  } > "$TDIR/tab.txt"
+  printf '{"title":null,"archived":false,"events":[]}\n' > "$home/browser.json"
+  start_mock "$TDIR/tab.txt" "$home/browser.json"
+  for i in 1 2; do
+    env PRO_GATE_HOME="$home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+      PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PRO_GATE_RESERVATION_TTL=1 NODE_OPTIONS= \
+      bash "$ENGINE" --harvest "$marker" --out "$out" --timeout 5s >"$home/stdout.$i" 2>"$home/stderr.$i"
+    RC=$?
+    if [ "$mode" = clean ] || [ "$mode" = reference ] || [ "$mode" = scrollback ]; then
+      # Baseline publication removes only the owned nonce. The full permitted answer survives.
+      sed "s/ (run marker: $marker)//" "$raw" > "$expected"
+      check "harvest $name pass $i publishes and persists exact permitted bytes" \
+        "$([ "$RC" -eq 0 ] && cmp -s "$out" "$expected" && cmp -s "$home/completed/$marker" "$expected"; echo $?)" \
+        "rc=$RC $(cat "$home/stderr.$i")"
+      check "harvest $name pass $i extracts only its authoritative verdict" \
+        "$([ "$(bash -c '. "$1"; pg_extract_verdict "$2"' _ "$LIB" "$out")" = "$verdict" ]; echo $?)" \
+        "$(cat "$home/stderr.$i")"
+    else
+      check "harvest $name pass $i refuses before publication or durable persistence" \
+        "$([ "$RC" -eq 9 ] && [ ! -s "$out" ] && [ ! -e "$home/completed/$marker" ] && [ ! -e "$home/pending/$marker" ] && ! grep -q '^RESULT_FILE=' "$home/stdout.$i"; echo $?)" \
+        "rc=$RC $(cat "$home/stdout.$i" "$home/stderr.$i")"
+      evidence=0
+      for aside in "$out".unbound.*; do
+        if [ -f "$aside" ] && cmp -s "$aside" "$raw"; then evidence=1; fi
+      done
+      check "harvest $name pass $i preserves unsliced diagnostic evidence" "$([ "$evidence" = 1 ]; echo $?)" "$(cat "$home/stderr.$i")"
+      check "harvest $name pass $i retains charge and reservation despite TTL and repeated refusal" \
+        "$(cmp -s "$home/in-progress/$marker" "$home/reservation.before" && cmp -s "$home/rounds/$key" "$home/charge.before" && [ ! -e "$home/attempt-dispositions/$marker" ]; echo $?)" \
+        "$(cat "$home/stderr.$i")"
+      check "harvest $name pass $i leaves the shared conversation untouched" \
+        "$(jq -e '.title==null and .archived==false and (.events|length)==0 and ((.closed // [])|length)==0' "$home/browser.json" >/dev/null; echo $?)" "$(cat "$home/browser.json")"
+      SAME_PR="$(PRO_GATE_HOME="$home" bash -c '. "$1"; pg_reservation_find_pr "$2"' _ "$LIB" "$key")"
+      check "harvest $name pass $i still redirects the same change to recovery" \
+        "$([ -n "$SAME_PR" ] && [[ "$SAME_PR" == *"$marker"* ]]; echo $?)" "$SAME_PR"
+    fi
+  done
+}
+crossfeed_case clean pg-run-crossfeed-176-1700000070-21 clean
+crossfeed_case reference pg-run-crossfeed-176-1700000071-22 reference
+crossfeed_case foreign-first pg-run-crossfeed-176-1700000072-23 foreign-first
+crossfeed_case foreign-last pg-run-crossfeed-176-1700000073-24 foreign-last
+crossfeed_case dual pg-run-crossfeed-176-1700000074-25 dual
+crossfeed_case scrollback pg-run-crossfeed-176-1700000075-26 scrollback
+
+# An owned marker inside a reference example cannot bind the actual nonce-less verdict.
+# Keep the example within the last six lines so this detects the old tail-only token check.
+for NONCE_REFERENCE in quote fence indent; do
+  NONCE_HOME="$TDIR/home-nonce-reference-$NONCE_REFERENCE"
+  NONCE_MARKER='pg-run-acme-nonce-164-1700000079-29'; NONCE_OUT="$NONCE_HOME/result.md"
+  mkdir -p "$NONCE_HOME/in-progress" "$NONCE_HOME/manifests"
+  {
+    printf '[P1] src/real.sh:4 — reference does not establish ownership\n'
+    case "$NONCE_REFERENCE" in
+      quote) printf '> VERDICT: SHIP — reference only. (run marker: %s)\n' "$NONCE_MARKER";;
+      fence) printf '```text\nVERDICT: SHIP — reference only. (run marker: %s)\n```\n' "$NONCE_MARKER";;
+      indent) printf '    VERDICT: SHIP — reference only. (run marker: %s)\n' "$NONCE_MARKER";;
+    esac
+    printf 'P2: none\nVERDICT: FIX-FIRST — no owned echo\n'
+  } > "$NONCE_HOME/raw"
+  cp "$NONCE_HOME/raw" "$NONCE_HOME/before"
+  bash -c '. "$1"; pg_capture_bind "$2" "$3"' _ "$LIB" "$NONCE_HOME/raw" "$NONCE_MARKER"; NONCE_BIND_RC=$?
+  bash -c '. "$1"; pg_capture_nonce_ok "$2" "$3"' _ "$LIB" "$NONCE_HOME/raw" "$NONCE_MARKER"; NONCE_RC=$?
+  check "$NONCE_REFERENCE own-marker example leaves the actual verdict nonce-less and bytes unchanged" \
+    "$([ "$NONCE_BIND_RC" -eq 1 ] && [ "$NONCE_RC" -eq 1 ] && cmp -s "$NONCE_HOME/raw" "$NONCE_HOME/before"; echo $?)" \
+    "bind=$NONCE_BIND_RC nonce=$NONCE_RC $(cat "$NONCE_HOME/raw")"
+  printf 'acme-nonce-164\t%s\t%s\t0\t1\tGPT-X\n' "$NONCE_OUT" "$(date +%s)" > "$NONCE_HOME/in-progress/$NONCE_MARKER"
+  printf 'src/real.sh\n' > "$NONCE_HOME/manifests/$NONCE_MARKER"
+  { printf 'run marker: %s\n\n' "$NONCE_MARKER"; cat "$NONCE_HOME/raw"; } > "$TDIR/tab.txt"
+  start_mock "$TDIR/tab.txt"
+  env PRO_GATE_HOME="$NONCE_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 NODE_OPTIONS= \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" bash "$ENGINE" --harvest "$NONCE_MARKER" --out "$NONCE_OUT" --timeout 5s \
+    >"$NONCE_HOME/stdout" 2>"$NONCE_HOME/stderr"
+  RC=$?
+  check "harvest refuses $NONCE_REFERENCE own-marker example as authority for a nonce-less answer" \
+    "$([ "$RC" -eq 9 ] && [ ! -s "$NONCE_OUT" ] && [ ! -e "$NONCE_HOME/completed/$NONCE_MARKER" ] && [ ! -e "$NONCE_HOME/pending/$NONCE_MARKER" ] && [ -f "$NONCE_HOME/in-progress/$NONCE_MARKER" ] && ! grep -q '^RESULT_FILE=' "$NONCE_HOME/stdout"; echo $?)" \
+    "rc=$RC $(cat "$NONCE_HOME/stdout" "$NONCE_HOME/stderr")"
+done
+bash -c '. "$1"; pg_capture_nonce_ok "$2" "$3"' _ "$LIB" "$TDIR/bind-clean.md" "$BIND_MARKER"; RC=$?
+check 'a normal authoritative owned verdict still passes nonce validation' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC"
+
+# Fresh Oracle stdout/file capture reaches a different acceptance path from --harvest. The fixture
+# writes exactly what Oracle would write; the engine must validate before stripping or persisting.
+cat > "$TDIR/bin/oracle-crossfeed" <<'ORACLE_CROSSFEED'
+#!/usr/bin/env bash
+[ "${1:-}" = session ] && exit 1
+prompt=''; out=''
+while [ $# -gt 0 ]; do
+  case "$1" in -p) prompt="$2"; shift 2;; --write-output) out="$2"; shift 2;; *) shift;; esac
+done
+[[ "$prompt" =~ \(run\ marker:\ ([A-Za-z0-9.-]+) ]] || exit 99
+marker="${BASH_REMATCH[1]}"
+printf '%s\n' "$marker" > "${PG_TEST_MARKER_FILE:?}"
+{
+  [ "$PG_TEST_MODE" = foreign-first ] && printf '[P0] other/a.ts:1 — foreign\nVERDICT: FIX-FIRST (run marker: %s)\n\n' "$PG_TEST_FOREIGN"
+  [ "$PG_TEST_MODE" = foreign-first-code ] && printf '[P0] other/a.ts:1 — foreign\nVERDICT: FIX-FIRST (run marker: `%s`)\n\n' "$PG_TEST_FOREIGN"
+  printf '[P1] src/real.sh:4 — direct fixture finding\nP2: none\nP3: none\nVERDICT: SHIP — direct. (run marker: %s)' "$marker"
+  [ "$PG_TEST_MODE" = dual ] && printf ' (run marker: %s)' "$PG_TEST_FOREIGN"
+  printf '\n'
+  [ "$PG_TEST_MODE" = foreign-last ] && printf '\n[P0] other/a.ts:1 — foreign\nVERDICT: FIX-FIRST (run marker: %s)\n' "$PG_TEST_FOREIGN"
+} > "$out"
+cp "$out" "${PG_TEST_RAW_FILE:?}"
+printf 'Acquired ChatGPT browser slot\n'
+exit 0
+ORACLE_CROSSFEED
+chmod +x "$TDIR/bin/oracle-crossfeed"
+for DIRECT_MODE in clean foreign-first foreign-first-code foreign-last dual; do
+  DIRECT_HOME="$TDIR/home-direct-$DIRECT_MODE"; DIRECT_OUT="$TDIR/direct-$DIRECT_MODE.md"
+  mkdir -p "$DIRECT_HOME"
+  printf 'idle fixture tab\n' > "$TDIR/tab.txt"
+  start_mock "$TDIR/tab.txt"
+  env PRO_GATE_HOME="$DIRECT_HOME" ORACLE_HOME_DIR="$DIRECT_HOME/oracle" ORACLE_BROWSER_PORT="$PORT" \
+    PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_MAX_RETRIES=0 \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-crossfeed" NODE_OPTIONS= \
+    PG_TEST_MODE="$DIRECT_MODE" PG_TEST_FOREIGN="$FOREIGN164" PG_TEST_MARKER_FILE="$DIRECT_HOME/marker" PG_TEST_RAW_FILE="$DIRECT_HOME/raw" \
+    bash "$ENGINE" --pr 176 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$DIRECT_OUT" --timeout 5s \
+    >"$DIRECT_HOME/stdout" 2>"$DIRECT_HOME/stderr"
+  RC=$?
+  DIRECT_MARKER="$(cat "$DIRECT_HOME/marker")"
+  if [ "$DIRECT_MODE" = clean ]; then
+    sed "s/ (run marker: $DIRECT_MARKER)//" "$DIRECT_HOME/raw" > "$DIRECT_HOME/expected"
+    check 'fresh direct Oracle capture publishes exact clean bytes' \
+      "$([ "$RC" -eq 0 ] && cmp -s "$DIRECT_OUT" "$DIRECT_HOME/expected" && cmp -s "$DIRECT_HOME/completed/$DIRECT_MARKER" "$DIRECT_HOME/expected"; echo $?)" \
+      "rc=$RC $(cat "$DIRECT_HOME/stderr")"
+  else
+    check "fresh direct Oracle capture refuses $DIRECT_MODE before result persistence" \
+      "$([ "$RC" -eq 9 ] && [ ! -s "$DIRECT_OUT" ] && [ ! -e "$DIRECT_HOME/completed/$DIRECT_MARKER" ] && [ ! -e "$DIRECT_HOME/pending/$DIRECT_MARKER" ] && ! grep -q '^RESULT_FILE=' "$DIRECT_HOME/stdout"; echo $?)" \
+      "rc=$RC $(cat "$DIRECT_HOME/stdout" "$DIRECT_HOME/stderr")"
+    DIRECT_EVIDENCE=0
+    for aside in "$DIRECT_OUT".unbound.*; do
+      if [ -f "$aside" ] && cmp -s "$aside" "$DIRECT_HOME/raw"; then DIRECT_EVIDENCE=1; fi
+    done
+    check "fresh direct Oracle capture preserves $DIRECT_MODE evidence and charge" \
+      "$([ "$DIRECT_EVIDENCE" = 1 ] && [ -f "$DIRECT_HOME/in-progress/$DIRECT_MARKER" ] && [ "$(find "$DIRECT_HOME/rounds" -type f ! -name '*.lock' | wc -l)" -gt 0 ]; echo $?)" \
+      "$(cat "$DIRECT_HOME/stderr")"
+  fi
+done
+
+# ── #166 gate r1 P2: the Oracle session name must survive Oracle's own slug normalization ──────
+# Oracle stores a custom --slug as five ten-character alphanumeric words. A raw run marker is
+# reduced to "pg-run-startupbro-com-pro": one name for EVERY run in the repository, and not the
+# name the reattach fallback then asks for. pg_oracle_slug must be a fixed point of that rule.
+SLUG_MARKER_A='pg-run-StartupBros-com-pro-gate-166-1788719459-1312546'
+SLUG_MARKER_B='pg-run-StartupBros-com-pro-gate-166-1788719999-1312999'
+SLUG_A="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_oracle_slug '$SLUG_MARKER_A'")"
+SLUG_B="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_oracle_slug '$SLUG_MARKER_B'")"
+SLUG_RAW="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_slug_normalize '$SLUG_MARKER_A'")"
+SLUG_RT="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_slug_normalize '$SLUG_A'")"
+check 'r1 P2: the raw marker does NOT survive Oracle slug normalization' \
+  "$([ "$SLUG_RAW" = 'pg-run-startupbro-com-pro' ]; echo $?)" "normalized=$SLUG_RAW"
+check 'r1 P2: pg_oracle_slug is a fixed point of that normalization' \
+  "$([ -n "$SLUG_A" ] && [ "$SLUG_RT" = "$SLUG_A" ]; echo $?)" "slug=$SLUG_A roundtrip=$SLUG_RT"
+check 'r1 P2: pg_oracle_slug keeps the epoch and pid, so two runs of one PR differ' \
+  "$([ "$SLUG_A" != "$SLUG_B" ] && [ "$SLUG_A" = 'pro-gate-166-1788719459-1312546' ]; echo $?)" "a=$SLUG_A b=$SLUG_B"
+check 'r1 P2: the session name never parses as a run marker' \
+  "$(printf '%s\n%s' "$SLUG_A" "$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_oracle_slug 'pg-run-repo-branch-ab12cd-diff-1788719459-99'")" | grep -qE 'pg-run-'; [ $? -ne 0 ]; echo $?)" \
+  "slug=$SLUG_A"
+check 'r1 P2: pg_oracle_slug yields the 3-to-5 lowercase words Oracle accepts' \
+  "$(printf '%s' "$SLUG_A" | awk -F- '{ ok = (NF >= 3 && NF <= 5); for (i = 1; i <= NF; i++) if (length($i) > 10 || $i !~ /^[a-z0-9]+$/) ok = 0; exit ok ? 0 : 1 }'; echo $?)" \
+  "slug=$SLUG_A"
+check 'r1 P2: a --diff run keeps its own epoch and pid too' \
+  "$([ "$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_oracle_slug 'pg-run-repo-branch-ab12cd-diff-1788719459-99'")" = 'pro-gate-diff-1788719459-99' ]; echo $?)" \
+  "$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_oracle_slug 'pg-run-repo-branch-ab12cd-diff-1788719459-99'")"
+
 echo '# v0.28: artifact-first recovery — no ledger row needed'
 M9="pg-run-artifact-4-1700000035-99"
 mkdir -p "$TDIR/home/completed"
@@ -3314,6 +3598,40 @@ printf 'idle tab with no markers at all\n' > "$TDIR/tab.txt"
 run_engine --harvest "$M4" --out "$TDIR/o-already.md" --timeout 5s
 check 'digest-verified already-collected harvest exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
 check 'already-collected returns the prior review' "$(cmp -s "$TDIR/o-already.md" "$TDIR/prior-collected.md"; echo $?)" "$(head -2 "$TDIR/o-already.md" 2>/dev/null)"
+# Legacy results can also exist only at a digest-bound ledger path. They must be checked before
+# browser probing or reservation reconciliation; repeated rejection is not lifecycle evidence.
+for LEDGER_ORDER in foreign-first foreign-last; do
+  LEDGER_HOME="$TDIR/home-ledger-$LEDGER_ORDER"; LEDGER_MARKER='pg-run-acme-ledger-164-1700000090-41'
+  LEDGER_OUT="$LEDGER_HOME/result.md"; LEDGER_PRIOR="$LEDGER_HOME/prior.md"; LEDGER_KEY=acme-ledger-164
+  mkdir -p "$LEDGER_HOME/in-progress" "$LEDGER_HOME/run-meta" "$LEDGER_HOME/rounds" "$LEDGER_HOME/active"
+  {
+    [ "$LEDGER_ORDER" = foreign-first ] && printf '[P0] other/a.ts:1 — foreign\nVERDICT: FIX-FIRST (run marker: %s)\n' "$FOREIGN164"
+    printf '[P1] src/real.sh:4 — owned historical finding\nP2: none\nVERDICT: SHIP — owned legacy answer.\n'
+    [ "$LEDGER_ORDER" = foreign-last ] && printf '[P0] other/a.ts:1 — foreign\nVERDICT: FIX-FIRST (run marker: %s)\n' "$FOREIGN164"
+  } > "$LEDGER_PRIOR"
+  cp "$LEDGER_PRIOR" "$LEDGER_HOME/prior.before"
+  LEDGER_SHA="$(sha256sum "$LEDGER_PRIOR" | awk '{print $1}')"
+  jq -cn --arg marker "$LEDGER_MARKER" --arg out "$LEDGER_PRIOR" --arg sha "$LEDGER_SHA" \
+    '{ts:"2026-01-05T00:00:00+0000",pr:"164",repo:"fixture",exit:0,outcome:"clean",secs:10,attempts:1,conc:1,ceiling:1,live:0,salvaged:0,diff_lines:4,out:$out,model:"fixture",marker:$marker,round_key:"acme-ledger-164",sha256:$sha}' > "$LEDGER_HOME/ledger.jsonl"
+  printf 'github.com\tacme\tledger\t%s\t164\t%s\t1700000090\n' "$LEDGER_KEY" "$LEDGER_PRIOR" > "$LEDGER_HOME/run-meta/$LEDGER_MARKER"
+  printf '%s\t%s\t%s\t2\t1\tGPT-X\t1700000090\tgenerating\n' "$LEDGER_KEY" "$LEDGER_PRIOR" "$(( $(date +%s) - 30000 ))" > "$LEDGER_HOME/in-progress/$LEDGER_MARKER"
+  cp "$LEDGER_HOME/in-progress/$LEDGER_MARKER" "$LEDGER_HOME/reservation.before"
+  printf '%s\t%s\t99999999\t1700000090\tremote-chrome\tBOGUS-TOKEN\n' "$LEDGER_MARKER" "$LEDGER_PRIOR" > "$LEDGER_HOME/active/$LEDGER_KEY"
+  cp "$LEDGER_HOME/active/$LEDGER_KEY" "$LEDGER_HOME/active.before"
+  printf '1700000090\n' > "$LEDGER_HOME/rounds/$LEDGER_KEY"
+  for LEDGER_PASS in 1 2; do
+    env PRO_GATE_HOME="$LEDGER_HOME" ORACLE_BROWSER_PORT=65530 PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 NODE_OPTIONS= \
+      bash "$ENGINE" --harvest "$LEDGER_MARKER" --out "$LEDGER_OUT" --timeout 1s >"$LEDGER_HOME/stdout" 2>"$LEDGER_HOME/stderr"
+    RC=$?
+    check "legacy ledger $LEDGER_ORDER pass $LEDGER_PASS refuses mixed result before unavailable CDP" \
+      "$([ "$RC" -eq 6 ] && [ ! -s "$LEDGER_OUT" ] && ! grep -q '^RESULT_FILE=' "$LEDGER_HOME/stdout"; echo $?)" \
+      "rc=$RC $(cat "$LEDGER_HOME/stdout" "$LEDGER_HOME/stderr")"
+    check "legacy ledger $LEDGER_ORDER pass $LEDGER_PASS preserves bytes, charge, reservation and miss streak" \
+      "$(cmp -s "$LEDGER_PRIOR" "$LEDGER_HOME/prior.before" && cmp -s "$LEDGER_HOME/in-progress/$LEDGER_MARKER" "$LEDGER_HOME/reservation.before" && cmp -s "$LEDGER_HOME/active/$LEDGER_KEY" "$LEDGER_HOME/active.before" && [ "$(cat "$LEDGER_HOME/rounds/$LEDGER_KEY")" = 1700000090 ] && [ ! -e "$LEDGER_HOME/attempt-dispositions/$LEDGER_MARKER" ] && [ ! -e "$LEDGER_HOME/completed/$LEDGER_MARKER" ] && [ ! -e "$LEDGER_HOME/pending/$LEDGER_MARKER" ]; echo $?)" \
+      "$(cat "$LEDGER_HOME/stderr")"
+  done
+done
+
 # A pre-v0.28 row WITHOUT a digest cannot prove the mutable path still holds the collected
 # review (gate #54 r3): report for manual recovery (exit 6, never respend), never copy it.
 M4L="pg-run-legacyrow-5-1700000040-22"
@@ -3987,6 +4305,63 @@ recover_run() { # home, then engine args; CDP deliberately unavailable unless ha
     bash "$ENGINE" "$@" >"$TDIR/recover.stdout" 2>"$TDIR/recover.stderr"
   RC=$?
 }
+echo '# #164: completed and pending replay reject mixed bytes without altering prior artifacts'
+for REPLAY_STORE in completed pending; do
+  for REPLAY_KIND in clean-current clean-legacy mixed-first mixed-last mixed-dual mixed-legacy; do
+    REPLAY_HOME="$TDIR/replay-$REPLAY_STORE-$REPLAY_KIND"
+    REPLAY_MARKER='pg-run-acme-replay-164-1700000080-31'
+    REPLAY_KEY='acme-replay-164'; REPLAY_OUT="$REPLAY_HOME/result.md"
+    mkdir -p "$REPLAY_HOME/$REPLAY_STORE" "$REPLAY_HOME/run-meta" "$REPLAY_HOME/in-progress" "$REPLAY_HOME/rounds" "$REPLAY_HOME/active"
+    REPLAY_ART="$REPLAY_HOME/$REPLAY_STORE/$REPLAY_MARKER"
+    printf 'github.com\tacme\treplay\t%s\t164\t%s\t1700000080\n' "$REPLAY_KEY" "$REPLAY_OUT" > "$REPLAY_HOME/run-meta/$REPLAY_MARKER"
+    printf '%s\t%s\t%s\t2\t1\tGPT-X\t1700000080\tgenerating\n' "$REPLAY_KEY" "$REPLAY_OUT" "$(( $(date +%s) - 30000 ))" > "$REPLAY_HOME/in-progress/$REPLAY_MARKER"
+    printf '1700000080\n' > "$REPLAY_HOME/rounds/$REPLAY_KEY"
+    cp "$REPLAY_HOME/in-progress/$REPLAY_MARKER" "$REPLAY_HOME/reservation.before"
+    printf '%s\t%s\t99999999\t1700000080\tremote-chrome\tBOGUS-TOKEN\n' "$REPLAY_MARKER" "$REPLAY_OUT" > "$REPLAY_HOME/active/$REPLAY_KEY"
+    cp "$REPLAY_HOME/active/$REPLAY_KEY" "$REPLAY_HOME/active.before"
+    cp "$REPLAY_HOME/rounds/$REPLAY_KEY" "$REPLAY_HOME/charge.before"
+    {
+      [ "$REPLAY_KIND" = mixed-first ] && printf '[P0] other/a.ts:1 — foreign\nVERDICT: FIX-FIRST (run marker: %s)\n' "$FOREIGN164"
+      printf '[P1] src/real.sh:4 — preserved artifact finding\n'
+      case "$REPLAY_KIND" in clean-*) printf '> VERDICT: FIX-FIRST — reference only. (run marker: %s)\n' "$FOREIGN164";; esac
+      printf 'P2: none\nP3: none\nVERDICT: SHIP — original artifact.'
+      case "$REPLAY_KIND" in *legacy) ;; *) printf ' (run marker: %s)' "$REPLAY_MARKER";; esac
+      [ "$REPLAY_KIND" = mixed-dual ] && printf ' (run marker: %s)' "$FOREIGN164"
+      printf '\n'
+      case "$REPLAY_KIND" in mixed-last|mixed-legacy) printf '[P0] other/a.ts:1 — foreign\nVERDICT: FIX-FIRST (run marker: %s)\n' "$FOREIGN164";; esac
+    } > "$REPLAY_ART"
+    cp "$REPLAY_ART" "$REPLAY_HOME/artifact.before"
+    for REPLAY_PASS in 1 2; do
+      recover_run "$REPLAY_HOME" --recover "$REPLAY_MARKER" --out "$REPLAY_OUT" --timeout 1s
+      case "$REPLAY_KIND" in
+        clean-*)
+          check "$REPLAY_STORE $REPLAY_KIND replay $REPLAY_PASS succeeds with exact bytes" \
+            "$([ "$RC" -eq 0 ] && cmp -s "$TDIR/recover.stdout" "$REPLAY_HOME/artifact.before" && cmp -s "$REPLAY_OUT" "$REPLAY_HOME/artifact.before"; echo $?)" \
+            "rc=$RC $(cat "$TDIR/recover.stderr")";;
+        *)
+          check "$REPLAY_STORE $REPLAY_KIND replay $REPLAY_PASS refuses before publication" \
+            "$([ "$RC" -eq 6 ] && [ ! -s "$TDIR/recover.stdout" ] && [ ! -s "$REPLAY_OUT" ] && grep -qx 'Browser needs attention' "$TDIR/recover.stderr"; echo $?)" \
+            "rc=$RC stdout=$(cat "$TDIR/recover.stdout") stderr=$(cat "$TDIR/recover.stderr")";;
+      esac
+      check "$REPLAY_STORE $REPLAY_KIND replay $REPLAY_PASS leaves artifact, reservation and charge unchanged" \
+        "$(cmp -s "$REPLAY_ART" "$REPLAY_HOME/artifact.before" && cmp -s "$REPLAY_HOME/in-progress/$REPLAY_MARKER" "$REPLAY_HOME/reservation.before" && cmp -s "$REPLAY_HOME/active/$REPLAY_KEY" "$REPLAY_HOME/active.before" && cmp -s "$REPLAY_HOME/rounds/$REPLAY_KEY" "$REPLAY_HOME/charge.before" && [ ! -e "$REPLAY_HOME/attempt-dispositions/$REPLAY_MARKER" ] && [ ! -s "$TDIR/recover-oracle-sentinel" ]; echo $?)" \
+        "$(cat "$TDIR/recover.stderr")"
+    done
+    if [ "$REPLAY_STORE" = completed ]; then
+      env PRO_GATE_HOME="$REPLAY_HOME" ORACLE_BROWSER_PORT=65530 PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 NODE_OPTIONS= \
+        bash "$ENGINE" --harvest "$REPLAY_MARKER" --out "$REPLAY_OUT" --timeout 1s >"$REPLAY_HOME/harvest.stdout" 2>"$REPLAY_HOME/harvest.stderr"
+      RC=$?
+      case "$REPLAY_KIND" in
+        clean-*) check "completed $REPLAY_KIND harvest replay publishes original bytes" \
+          "$([ "$RC" -eq 0 ] && cmp -s "$REPLAY_OUT" "$REPLAY_HOME/artifact.before" && cmp -s "$REPLAY_ART" "$REPLAY_HOME/artifact.before"; echo $?)" "rc=$RC $(cat "$REPLAY_HOME/harvest.stderr")";;
+        *) check "completed $REPLAY_KIND harvest replay refuses and preserves state" \
+          "$([ "$RC" -eq 6 ] && [ ! -s "$REPLAY_OUT" ] && ! grep -q '^RESULT_FILE=' "$REPLAY_HOME/harvest.stdout" && cmp -s "$REPLAY_ART" "$REPLAY_HOME/artifact.before" && cmp -s "$REPLAY_HOME/in-progress/$REPLAY_MARKER" "$REPLAY_HOME/reservation.before" && cmp -s "$REPLAY_HOME/active/$REPLAY_KEY" "$REPLAY_HOME/active.before" && cmp -s "$REPLAY_HOME/rounds/$REPLAY_KEY" "$REPLAY_HOME/charge.before"; echo $?)" \
+          "rc=$RC $(cat "$REPLAY_HOME/harvest.stdout" "$REPLAY_HOME/harvest.stderr")";;
+      esac
+    fi
+  done
+done
+
 REC_BEFORE="$(find "$REC_HOME" -mindepth 1 -maxdepth 2 -type f -printf '%P:%s\n' | sort)"
 recover_run "$REC_HOME" --recover "$REC_MARKER" --out "$TDIR/recover-out.md" --timeout 1s
 REC_AFTER="$(find "$REC_HOME" -mindepth 1 -maxdepth 2 -type f -printf '%P:%s\n' | sort)"
@@ -5150,6 +5525,173 @@ REPAIR_REPLAY_RC=$?
 check 'result-binding repair is idempotent and does not mutate canonical bytes' \
   "$([ "$REPAIR_REPLAY_RC" -eq 0 ] && [ "$(PRO_GATE_HOME="$DECISION_HOME" pg_review_result_binding_digest "$FULL_MARKER")" = "$REPAIR_BINDING_DIGEST" ] && cmp -s "$DECISION_HOME/completed/$FULL_MARKER" "$DECISION_HOME/completed/$FULL_MARKER"; echo $?)" \
   "rc=$REPAIR_REPLAY_RC binding=$(PRO_GATE_HOME="$DECISION_HOME" pg_review_result_binding_read "$FULL_MARKER" 2>/dev/null)"
+
+# Legacy result bindings can remain structurally and digest-valid after verdict extraction evolves.
+# Re-resolution must compare the current parsed verdict before either exact or prior admission.
+mismatch_result() { # marker input stored-verdict artifact
+  local marker="$1" input="$2" stored="$3" artifact="$4" input_digest artifact_digest proof
+  input_digest="$(printf '%s' "$input" | sha256sum | awk '{print $1}')"
+  artifact_digest="$(sha256sum "$artifact" | awk '{print $1}')"
+  proof=null
+  if [ "$stored" = SHIP ]; then
+    proof="$(jq -cnS --arg base "$PROOF_BASE" --arg head "$PROOF_HEAD" --arg digest "$PROOF_RAW_DIGEST" '{base_oid:$base,diff_digest:$digest,head_oid:$head}')"
+  fi
+  jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg marker "$marker" --arg digest "$artifact_digest" \
+    --arg ib "$input_digest" --arg verdict "$stored" --argjson proof "$proof" \
+    '{accepted_epoch:1700013999,artifact:{digest:$digest,path:("completed/"+$marker)},contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,input_binding_digest:$ib,input_binding_identity:$marker,marker:$marker,named_choice:null,provenance:{outcome:"accepted",validated_epoch:1700013999},record_type:"review-result-binding/v1",record_version:1,ship_proof:$proof,verdict:$verdict}'
+}
+MISMATCH_CASE=0
+for STORED_VERDICT in SHIP FIX-FIRST NEEDS-DISCUSSION; do
+  for PARSED_VERDICT in SHIP FIX-FIRST NEEDS-DISCUSSION; do
+    [ "$STORED_VERDICT" = "$PARSED_VERDICT" ] && continue
+    MISMATCH_CASE=$((MISMATCH_CASE + 1))
+    MISMATCH_HOME="$TDIR/home-verdict-mismatch-$MISMATCH_CASE"
+    MISMATCH_MARKER="pg-run-acme-widgets-1983-17000131${MISMATCH_CASE}-${MISMATCH_CASE}"
+    MISMATCH_INPUT="$(jq -cS --arg marker "$MISMATCH_MARKER" --argjson epoch "17000131${MISMATCH_CASE}" '.marker=$marker | .charged_spend_epoch=$epoch' <<<"$FULL_BINDING")"
+    mkdir -p "$MISMATCH_HOME/completed"
+    PRO_GATE_HOME="$MISMATCH_HOME" pg_review_input_binding_write "$MISMATCH_MARKER" "$MISMATCH_INPUT"
+    if [ "$STORED_VERDICT" = SHIP ] && [ "$PARSED_VERDICT" = FIX-FIRST ]; then
+      printf 'P0: none\nP1: none\n> VERDICT: SHIP — quoted legacy example. (run marker: %s)\nVERDICT: FIX-FIRST — current parser decision. (run marker: %s)\n' \
+        "$FOREIGN164" "$MISMATCH_MARKER" > "$MISMATCH_HOME/completed/$MISMATCH_MARKER"
+      MIGRATION_HOME="$MISMATCH_HOME"; MIGRATION_MARKER="$MISMATCH_MARKER"
+    else
+      printf 'P0: none\nP1: none\nVERDICT: %s — current parser decision. (run marker: %s)\n' \
+        "$PARSED_VERDICT" "$MISMATCH_MARKER" > "$MISMATCH_HOME/completed/$MISMATCH_MARKER"
+    fi
+    MISMATCH_RESULT="$(mismatch_result "$MISMATCH_MARKER" "$MISMATCH_INPUT" "$STORED_VERDICT" "$MISMATCH_HOME/completed/$MISMATCH_MARKER")"
+    PRO_GATE_HOME="$MISMATCH_HOME" pg_review_result_binding_write "$MISMATCH_MARKER" "$MISMATCH_RESULT"
+    cp "$MISMATCH_HOME/completed/$MISMATCH_MARKER" "$MISMATCH_HOME/artifact.before"
+    cp "$MISMATCH_HOME/review-result-bindings/$MISMATCH_MARKER" "$MISMATCH_HOME/binding.before"
+    env PRO_GATE_HOME="$MISMATCH_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+      bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
+      >"$TDIR/verdict-mismatch-$MISMATCH_CASE-query.json" 2>"$TDIR/verdict-mismatch-$MISMATCH_CASE-query.err"
+    MISMATCH_QUERY_RC=$?
+    env PRO_GATE_HOME="$MISMATCH_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+      bash "$ENGINE" --review-decision --review-decision-effect "$TDIR/verdict-mismatch-$MISMATCH_CASE-query.json" --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
+      >"$TDIR/verdict-mismatch-$MISMATCH_CASE-effect.json" 2>"$TDIR/verdict-mismatch-$MISMATCH_CASE-effect.err"
+    MISMATCH_EFFECT_RC=$?
+    check "stored $STORED_VERDICT cannot override parsed $PARSED_VERDICT on exact replay" \
+      "$([ "$MISMATCH_QUERY_RC" -eq 0 ] && [ "$MISMATCH_EFFECT_RC" -eq 0 ] \
+         && jq -e '.action=="stop-without-new-review" and .reason=="invalid-result-provenance" and (.facts.completed_results | length)==1 and .facts.completed_results[0].collected and (.facts.completed_results[0].provenance_valid|not) and .facts.completed_results[0].verdict=="NONE"' "$TDIR/verdict-mismatch-$MISMATCH_CASE-query.json" >/dev/null 2>&1 \
+         && cmp -s "$TDIR/verdict-mismatch-$MISMATCH_CASE-query.json" "$TDIR/verdict-mismatch-$MISMATCH_CASE-effect.json"; echo $?)" \
+      "query_rc=$MISMATCH_QUERY_RC effect_rc=$MISMATCH_EFFECT_RC query=$(cat "$TDIR/verdict-mismatch-$MISMATCH_CASE-query.json") stderr=$(cat "$TDIR/verdict-mismatch-$MISMATCH_CASE-query.err" "$TDIR/verdict-mismatch-$MISMATCH_CASE-effect.err")"
+    check "stored $STORED_VERDICT versus parsed $PARSED_VERDICT preserves artifact and binding bytes" \
+      "$([ -s "$TDIR/verdict-mismatch-$MISMATCH_CASE-query.err" ] \
+         && grep -qF "result binding verdict $STORED_VERDICT disagrees with parsed artifact verdict $PARSED_VERDICT" "$TDIR/verdict-mismatch-$MISMATCH_CASE-query.err" \
+         && grep -qF "$MISMATCH_MARKER" "$TDIR/verdict-mismatch-$MISMATCH_CASE-query.err" \
+         && cmp -s "$MISMATCH_HOME/completed/$MISMATCH_MARKER" "$MISMATCH_HOME/artifact.before" \
+         && cmp -s "$MISMATCH_HOME/review-result-bindings/$MISMATCH_MARKER" "$MISMATCH_HOME/binding.before"; echo $?)" \
+      "query_stderr=$(cat "$TDIR/verdict-mismatch-$MISMATCH_CASE-query.err")"
+  done
+done
+
+PRIOR_MISMATCH_HOME="$TDIR/home-prior-verdict-mismatch"
+PRIOR_MISMATCH_MARKER='pg-run-acme-widgets-1983-1700013200-20'
+PRIOR_MISMATCH_INPUT="$(jq -cS --arg marker "$PRIOR_MISMATCH_MARKER" '.marker=$marker | .charged_spend_epoch=1700013200 | .evidence.proof.endpoint_digest="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' <<<"$FULL_BINDING")"
+mkdir -p "$PRIOR_MISMATCH_HOME/completed"
+PRO_GATE_HOME="$PRIOR_MISMATCH_HOME" pg_review_input_binding_write "$PRIOR_MISMATCH_MARKER" "$PRIOR_MISMATCH_INPUT"
+printf 'P0: none\nP1: none\nVERDICT: FIX-FIRST — stale prior result. (run marker: %s)\n' "$PRIOR_MISMATCH_MARKER" > "$PRIOR_MISMATCH_HOME/completed/$PRIOR_MISMATCH_MARKER"
+PRIOR_MISMATCH_RESULT="$(mismatch_result "$PRIOR_MISMATCH_MARKER" "$PRIOR_MISMATCH_INPUT" SHIP "$PRIOR_MISMATCH_HOME/completed/$PRIOR_MISMATCH_MARKER")"
+PRO_GATE_HOME="$PRIOR_MISMATCH_HOME" pg_review_result_binding_write "$PRIOR_MISMATCH_MARKER" "$PRIOR_MISMATCH_RESULT"
+env PRO_GATE_HOME="$PRIOR_MISMATCH_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+  bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
+  >"$TDIR/prior-verdict-mismatch.json" 2>"$TDIR/prior-verdict-mismatch.err"
+PRIOR_MISMATCH_RC=$?
+check 'a verdict-mismatched prior candidate is not admitted as review history' \
+  "$([ "$PRIOR_MISMATCH_RC" -eq 0 ] && jq -e '.action=="run-granted-review" and .facts.prior_review.marker=="" and .facts.prior_review.verdict=="NONE"' "$TDIR/prior-verdict-mismatch.json" >/dev/null 2>&1 \
+     && grep -qF "$PRIOR_MISMATCH_MARKER" "$TDIR/prior-verdict-mismatch.err"; echo $?)" \
+  "rc=$PRIOR_MISMATCH_RC output=$(cat "$TDIR/prior-verdict-mismatch.json") stderr=$(cat "$TDIR/prior-verdict-mismatch.err")"
+
+# Explicit migration preserves both original records: with writers stopped, move only the binding
+# outside the active store, then use the ordinary collect effect to rebuild from unchanged bytes.
+MIGRATION_ARCHIVE="$MIGRATION_HOME/review-result-bindings-archive"
+mkdir -p "$MIGRATION_ARCHIVE"
+mv "$MIGRATION_HOME/review-result-bindings/$MIGRATION_MARKER" "$MIGRATION_ARCHIVE/$MIGRATION_MARKER"
+env PRO_GATE_HOME="$MIGRATION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+  bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
+  >"$TDIR/verdict-migration-collect.json" 2>"$TDIR/verdict-migration-collect.err"
+MIGRATION_COLLECT_RC=$?
+env PRO_GATE_HOME="$MIGRATION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+  bash "$ENGINE" --review-decision --review-decision-effect "$TDIR/verdict-migration-collect.json" --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
+  >"$TDIR/verdict-migration-effect.json" 2>"$TDIR/verdict-migration-effect.err"
+MIGRATION_EFFECT_RC=$?
+MIGRATION_REPAIRED="$(PRO_GATE_HOME="$MIGRATION_HOME" pg_review_result_binding_read "$MIGRATION_MARKER" 2>/dev/null || true)"
+MIGRATION_REPAIRED_DIGEST="$(PRO_GATE_HOME="$MIGRATION_HOME" pg_review_result_binding_digest "$MIGRATION_MARKER" 2>/dev/null || true)"
+env PRO_GATE_HOME="$MIGRATION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+  bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
+  >"$TDIR/verdict-migration-replay-a.json" 2>"$TDIR/verdict-migration-replay-a.err"
+env PRO_GATE_HOME="$MIGRATION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+  bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
+  >"$TDIR/verdict-migration-replay-b.json" 2>"$TDIR/verdict-migration-replay-b.err"
+check 'archival plus normal collect repairs a mismatched legacy binding without losing evidence' \
+  "$([ "$MIGRATION_COLLECT_RC" -eq 0 ] && [ "$MIGRATION_EFFECT_RC" -eq 0 ] \
+     && jq -e --arg marker "$MIGRATION_MARKER" '.action=="collect-existing-result" and .effect_request.applicable_ref==$marker' "$TDIR/verdict-migration-collect.json" >/dev/null 2>&1 \
+     && jq -e '.verdict=="FIX-FIRST" and .ship_proof==null' <<<"$MIGRATION_REPAIRED" >/dev/null 2>&1 \
+     && cmp -s "$MIGRATION_HOME/completed/$MIGRATION_MARKER" "$MIGRATION_HOME/artifact.before" \
+     && cmp -s "$MIGRATION_ARCHIVE/$MIGRATION_MARKER" "$MIGRATION_HOME/binding.before"; echo $?)" \
+  "collect_rc=$MIGRATION_COLLECT_RC effect_rc=$MIGRATION_EFFECT_RC binding=$MIGRATION_REPAIRED stderr=$(cat "$TDIR/verdict-migration-collect.err" "$TDIR/verdict-migration-effect.err")"
+check 'repaired verdict binding has stable replay bytes and routes by the parsed verdict' \
+  "$([ -n "$MIGRATION_REPAIRED_DIGEST" ] \
+     && [ "$(PRO_GATE_HOME="$MIGRATION_HOME" pg_review_result_binding_digest "$MIGRATION_MARKER")" = "$MIGRATION_REPAIRED_DIGEST" ] \
+     && cmp -s "$TDIR/verdict-migration-replay-a.json" "$TDIR/verdict-migration-replay-b.json" \
+     && jq -e '.action=="fix-review-findings" and .reason=="review-findings-require-fix"' "$TDIR/verdict-migration-replay-a.json" >/dev/null 2>&1; echo $?)" \
+  "replay=$(cat "$TDIR/verdict-migration-replay-a.json") stderr=$(cat "$TDIR/verdict-migration-replay-a.err" "$TDIR/verdict-migration-replay-b.err")"
+
+# A prior accepted SHIP with a matching digest must still pass current ownership validation.
+# Recompute the fixture binding digest so this cannot pass by relying on unrelated hash mismatch.
+cp "$DECISION_HOME/completed/$FULL_MARKER" "$TDIR/ownership-clean-artifact"
+MIXED_RESULT_FILE="$(PRO_GATE_HOME="$DECISION_HOME" pg_review_result_binding_dir)/$FULL_MARKER"
+cp "$MIXED_RESULT_FILE" "$TDIR/ownership-clean-binding"
+for DECISION_MIXED_ORDER in foreign-first foreign-last; do
+  {
+    [ "$DECISION_MIXED_ORDER" = foreign-first ] && printf '[P0] other/a.ts:1 — foreign task\nVERDICT: FIX-FIRST (run marker: %s)\n' "$FOREIGN164"
+    cat "$TDIR/ownership-clean-artifact"
+    [ "$DECISION_MIXED_ORDER" = foreign-last ] && printf '[P0] other/a.ts:1 — foreign task\nVERDICT: FIX-FIRST (run marker: %s)\n' "$FOREIGN164"
+  } > "$DECISION_HOME/completed/$FULL_MARKER"
+  MIXED_DECISION_DIGEST="$(sha256sum "$DECISION_HOME/completed/$FULL_MARKER" | awk '{print $1}')"
+  jq -cS --arg digest "$MIXED_DECISION_DIGEST" '.artifact.digest=$digest' "$TDIR/ownership-clean-binding" > "$MIXED_RESULT_FILE"
+  env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+    bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
+    >"$TDIR/mixed-decision.json" 2>"$TDIR/mixed-decision.err"
+  RC=$?
+  check "mixed $DECISION_MIXED_ORDER stored SHIP cannot authorize merge or a fresh review" \
+    "$([ "$RC" -eq 0 ] && jq -e '.action != "allow-existing-merge-workflow" and .action != "run-granted-review"' "$TDIR/mixed-decision.json" >/dev/null; echo $?)" \
+    "rc=$RC $(cat "$TDIR/mixed-decision.json" "$TDIR/mixed-decision.err")"
+  check "mixed $DECISION_MIXED_ORDER decision leaves original artifact bytes intact" \
+    "$([ "$(sha256sum "$DECISION_HOME/completed/$FULL_MARKER" | awk '{print $1}')" = "$MIXED_DECISION_DIGEST" ]; echo $?)" \
+    "$(cat "$TDIR/mixed-decision.err")"
+done
+cp "$TDIR/ownership-clean-artifact" "$DECISION_HOME/completed/$FULL_MARKER"
+cp "$TDIR/ownership-clean-binding" "$MIXED_RESULT_FILE"
+
+# Accepted reference examples must not become the decision itself. Exercise real binding repair
+# with adjacent quoted and fenced SHIP examples followed by the owned FIX-FIRST verdict.
+REFERENCE_HOME="$TDIR/home-reference-binding"
+REFERENCE_MARKER='pg-run-acme-widgets-1983-1700013010-10'
+REFERENCE_INPUT="$(jq -cS --arg marker "$REFERENCE_MARKER" '.marker=$marker | .charged_spend_epoch=1700013010' <<<"$FULL_BINDING")"
+mkdir -p "$REFERENCE_HOME/completed"
+PRO_GATE_HOME="$REFERENCE_HOME" pg_review_input_binding_write "$REFERENCE_MARKER" "$REFERENCE_INPUT"
+printf '[P1] src/real.sh:4 — a current defect\nP2: none\n```text\nVERDICT: SHIP — fenced old decision. (run marker: %s)\n```\n> VERDICT: SHIP — quoted old decision. (run marker: %s)\nVERDICT: FIX-FIRST — repair required. (run marker: %s)\n' \
+  "$FOREIGN164" "$FOREIGN164" "$REFERENCE_MARKER" > "$REFERENCE_HOME/completed/$REFERENCE_MARKER"
+cp "$REFERENCE_HOME/completed/$REFERENCE_MARKER" "$REFERENCE_HOME/artifact.before"
+check 'adjacent quoted and fenced SHIP examples do not override owned FIX-FIRST extraction' \
+  "$([ "$(pg_extract_verdict "$REFERENCE_HOME/completed/$REFERENCE_MARKER")" = FIX-FIRST ]; echo $?)" \
+  "$(cat "$REFERENCE_HOME/completed/$REFERENCE_MARKER")"
+env PRO_GATE_HOME="$REFERENCE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+  bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
+  >"$TDIR/reference-before.json" 2>"$TDIR/reference-before.err"
+REFERENCE_RC=$?
+check 'owned FIX-FIRST with old SHIP references is eligible for normal artifact collection' \
+  "$([ "$REFERENCE_RC" -eq 0 ] && jq -e '.action=="collect-existing-result"' "$TDIR/reference-before.json" >/dev/null; echo $?)" \
+  "rc=$REFERENCE_RC $(cat "$TDIR/reference-before.json" "$TDIR/reference-before.err")"
+env PRO_GATE_HOME="$REFERENCE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+  bash "$ENGINE" --review-decision --review-decision-effect "$TDIR/reference-before.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
+  >"$TDIR/reference-effect.json" 2>"$TDIR/reference-effect.err"
+REFERENCE_RC=$?
+REFERENCE_RESULT="$(PRO_GATE_HOME="$REFERENCE_HOME" pg_review_result_binding_read "$REFERENCE_MARKER")"
+check 'binding repair records owned FIX-FIRST and preserves every reference byte' \
+  "$([ "$REFERENCE_RC" -eq 0 ] && jq -e '.verdict=="FIX-FIRST" and .ship_proof==null' <<<"$REFERENCE_RESULT" >/dev/null && cmp -s "$REFERENCE_HOME/completed/$REFERENCE_MARKER" "$REFERENCE_HOME/artifact.before"; echo $?)" \
+  "rc=$REFERENCE_RC binding=$REFERENCE_RESULT $(cat "$TDIR/reference-effect.err")"
 
 # U2 precedence is exercised through the real CLI rather than only reducer snapshots. These
 # records deliberately share canonical code while their marker, spend epoch, and evidence differ.

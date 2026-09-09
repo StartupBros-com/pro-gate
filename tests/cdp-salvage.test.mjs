@@ -12,11 +12,12 @@
 // Run: node tests/cdp-salvage.test.mjs
 import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
+import { runInNewContext } from 'node:vm';
 
 import {
   buildArchiveConversationExpression,
@@ -34,7 +35,95 @@ import {
 } from '../bin/cdp-test-timing.mjs';
 
 const SALVAGE = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'cdp-salvage.mjs');
+const LIBRARY = path.join(path.dirname(SALVAGE), '..', 'lib', 'pro-gate-lib.sh');
 const WS_MAGIC = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+
+function bindCapture(bytes, marker) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-dom-bind-'));
+  const capture = path.join(home, 'capture.txt');
+  fs.writeFileSync(capture, bytes);
+  const result = spawnSync(
+    'bash',
+    ['-c', '. "$1"; pg_capture_bind "$2" "$3"', 'browser-capture-fixture', LIBRARY, capture, marker],
+    {
+      env: { ...process.env, PRO_GATE_HOME: home },
+      encoding: 'utf8',
+    },
+  );
+  if (result.stderr) process.stderr.write(result.stderr);
+  const retained = fs.readFileSync(capture, 'utf8');
+  fs.rmSync(home, { recursive: true, force: true });
+  return { ...result, retained };
+}
+
+// A small rendered control fixture for executing the real independent mutation expression.
+// Drift happens after its first ownership check, when it discovers the sidebar menu control.
+function organizerExpressionFixture(
+  body,
+  { document = null, driftText = null, title = 'unchanged title' } = {},
+) {
+  const events = [];
+  let currentText = body;
+  let sidebarReads = 0;
+  class Element {
+    getBoundingClientRect() {
+      return { width: 20, height: 20, left: 0, top: 0, right: 20 };
+    }
+    getAttribute(name) {
+      return name === 'aria-label' ? 'Open conversation options' : null;
+    }
+    dispatchEvent(event) {
+      events.push(event.type);
+    }
+  }
+  const button = new Element();
+  const row = { querySelectorAll: () => [button] };
+  const link = new Element();
+  link.getAttribute = (name) => (name === 'href' ? '/c/mock-conversation' : null);
+  link.closest = () => row;
+  link.textContent = title;
+  const fixtureDocument = document ?? {
+    body: {
+      get innerText() {
+        return currentText;
+      },
+    },
+  };
+  const priorQuery = fixtureDocument.querySelectorAll?.bind(fixtureDocument);
+  fixtureDocument.querySelectorAll = (selector) => {
+    if (selector === '[data-message-author-role]') return priorQuery?.(selector) ?? [];
+    if (selector === 'a[href]') {
+      sidebarReads += 1;
+      if (driftText !== null) currentText = driftText;
+      return [link];
+    }
+    return [];
+  };
+  fixtureDocument.dispatchEvent = (event) => events.push(event.type);
+  class FixtureEvent {
+    constructor(type) {
+      this.type = type;
+    }
+  }
+  return {
+    events,
+    sidebarReads: () => sidebarReads,
+    context: {
+      document: fixtureDocument,
+      location: { href: 'https://chatgpt.com/c/mock-conversation' },
+      window: { innerWidth: 1200 },
+      URL,
+      setTimeout,
+      HTMLElement: Element,
+      HTMLInputElement: Element,
+      getComputedStyle: () => ({ visibility: 'visible', display: 'block' }),
+      MouseEvent: FixtureEvent,
+      KeyboardEvent: FixtureEvent,
+      InputEvent: FixtureEvent,
+      Event: FixtureEvent,
+    },
+  };
+}
 
 // Minimal RFC6455 server-side text frame (unmasked, handles lengths up to 64KiB).
 function wsTextFrame(payload) {
@@ -237,7 +326,9 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
       let delayMs = 0;
       let armMutation = null;
       let applyMutation = null;
-      if (expression.includes('pro-gate:terminal-infrastructure')) {
+      if (expression.includes('pro-gate:review-text') && opts.document) {
+        value = runInNewContext(expression, { document: opts.document });
+      } else if (expression.includes('pro-gate:terminal-infrastructure')) {
         value = opts.infrastructureError ?? null;
       } else if (expression.includes('pro-gate-organizer:rename')) {
         const expected = expectedTitleFromExpression(expression);
@@ -295,7 +386,7 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
       }
       const armLate = ui.armMutationAfterDelay && armMutation;
       const primaryDomPoll = id === 'tab1' && request.method === 'Runtime.evaluate' &&
-        expression === 'document.body.innerText';
+        expression.includes('pro-gate:review-text');
       const response = () => {
         if (armLate) armMutation();
         applyMutation?.();
@@ -969,6 +1060,493 @@ const MARKER = 'pg-run-test-1234567890-42';
   crossBoundCdp.stop();
 }
 
+{
+  // Mixed results remain intact as diagnostic capture evidence for the engine's provenance gate.
+  const foreign = 'pg-run-other-repo-2619-1111111111-9';
+  const ours = ['P0: none', 'P1: none', 'VERDICT: SHIP — ours. (run marker: ' + MARKER + ')'];
+  const theirs = [
+    '[P0] other/a.ts:1 — foreign finding',
+    'VERDICT: FIX-FIRST — theirs. (run marker: ' + foreign + ')',
+  ];
+  const dual = ['P0: none', 'VERDICT: SHIP (run marker: ' + MARKER + ') (run marker: ' + foreign + ')'];
+  for (const [layout, answer] of [
+    ['foreign first', [...theirs, '', ...ours]],
+    ['foreign last', [...ours, '', ...theirs]],
+    ...['- **VERDICT:**', '## **VERDICT:**'].flatMap((label) => {
+      const formattedTheirs = theirs.map((line) => line.replace('VERDICT:', label));
+      const formattedOurs = ours.map((line) => line.replace('VERDICT:', label));
+      return [
+        [label + ' foreign first', [...formattedTheirs, '', ...formattedOurs]],
+        [label + ' foreign last', [...formattedOurs, '', ...formattedTheirs]],
+      ];
+    }),
+    ['dual marker verdict', dual],
+    ['foreign verdict without heading', [theirs[1], ...ours]],
+    ['owned verdict without heading', [...theirs, ours[2]]],
+    ['own marker mentioned in a finding', [...theirs, '[P1] src/own.ts:4 — run marker: ' + MARKER, ...ours]],
+    [
+      'fenced compact prompt example',
+      [...theirs, '[P1] src/own.ts:4 — prompt example', '~~~', 'run marker: ' + MARKER, '~~~', ...ours],
+    ],
+    [
+      'fenced engine prompt example',
+      [
+        ...theirs,
+        '[P1] src/own.ts:4 — prompt example',
+        '~~~',
+        '(run marker: ' + MARKER + ' — internal correlation id)',
+        '~~~',
+        ...ours,
+      ],
+    ],
+  ]) {
+    const body = 'run marker: ' + MARKER + '\n' + answer.join('\n');
+    const cdp = await mockCdp(body);
+    const capture = await runSalvage([MARKER, '3'], cdp.port);
+    check(
+      'mixed capture keeps every byte for engine rejection (' + layout + ')',
+      capture.status === 0 && capture.stdout === answer.join('\n') + '\n',
+      'status=' + capture.status + ' stdout=' + JSON.stringify(capture.stdout),
+    );
+    const binding = bindCapture(capture.stdout, MARKER);
+    check(
+      'browser mixed evidence fails shell binding without rewriting (' + layout + ')',
+      binding.status === 2 && binding.retained === capture.stdout,
+      'status=' + binding.status + ' stderr=' + binding.stderr,
+    );
+    check(
+      'mixed capture preserves conversation evidence (' + layout + ')',
+      cdp.closed.length === 0 && capture.crossbound === 0 && capture.blacklist === null,
+      'closed=' + cdp.closed + ' blacklist=' + capture.blacklist,
+    );
+    const probe = await runSalvage(['--probe', MARKER, '3'], cdp.port);
+    check(
+      'mixed capture never proves completed review ownership (' + layout + ')',
+      probe.status === 0 &&
+        probe.stderr.includes('probe-state: generating') &&
+        !probe.stderr.includes('probe-state: complete'),
+      'status=' + probe.status + ' stderr=' + probe.stderr,
+    );
+    cdp.stop();
+    for (const owner of [MARKER, foreign]) {
+      for (const mode of ['organize', 'finalize', 'close']) {
+        const mutationCdp = await mockCdp(body);
+        const args = mode === 'finalize' ? finalizerArgs(owner) : ['--' + mode, owner, '3'];
+        const result = await runSalvage(
+          args,
+          mutationCdp.port,
+          seedOrganizer(owner, 'pro-gate review: mixed', null, durableReview(ours.join('\n'), owner)),
+        );
+        check(
+          'shared mixed conversation cannot mutate for either owner (' +
+            layout +
+            ', ' +
+            owner +
+            ', ' +
+            mode +
+            ')',
+          result.status === 0 && mutationCdp.ui.events.length === 0 && mutationCdp.closed.length === 0,
+          'status=' + result.status + ' stdout=' + result.stdout + ' closed=' + mutationCdp.closed,
+        );
+        mutationCdp.stop();
+      }
+    }
+  }
+}
+
+{
+  // Reference text never creates cross-task ownership, and extraction keeps the complete finding.
+  const foreign = 'pg-run-other-repo-2619-1111111111-9';
+  const example = 'VERDICT: SHIP — incident. (run marker: ' + foreign + ')';
+  const tick = String.fromCharCode(96);
+  for (const [kind, reference] of [
+    ['prose marker', ['The incident used (run marker: ' + foreign + ').']],
+    ['inline verdict quote', ['The incident said "' + example + '".']],
+    ['blockquote', ['> ' + example]],
+    ['indented block', ['    ' + example]],
+    ['tab indented block', ['\t' + example]],
+    ['backtick fence', [tick.repeat(3) + 'text', example, tick.repeat(3)]],
+    ['tilde fence', ['~~~text', example, '~~~']],
+    ['long fence with short embedded fence', [tick.repeat(4), tick.repeat(3), example, tick.repeat(4)]],
+    ['other fence cannot close code', [tick.repeat(3), '~~~', example, tick.repeat(3)]],
+    ['heading without decision', ['VERDICT: example from ' + foreign]],
+  ]) {
+    const answer = [
+      'P0: none',
+      '[P1] src/real.sh:4 — reference example',
+      ...reference,
+      'and the finding continues',
+      '[P2] src/other.sh:9 — another finding',
+      'VERDICT: FIX-FIRST — ours. (run marker: ' + MARKER + ')',
+    ].join('\n');
+    const cdp = await mockCdp('run marker: ' + MARKER + '\n' + answer);
+    const r = await runSalvage([MARKER, '3'], cdp.port);
+    check(
+      'ordinary owned answer preserves exact capture bytes (' + kind + ')',
+      r.status === 0 && r.stdout === answer + '\n',
+      'status=' + r.status + ' stdout=' + JSON.stringify(r.stdout),
+    );
+    const probe = await runSalvage(['--probe', MARKER, '3'], cdp.port);
+    check(
+      'inert references preserve owned completion (' + kind + ')',
+      probe.status === 0 && probe.stderr.includes('probe-state: complete'),
+      'stderr=' + probe.stderr,
+    );
+    cdp.stop();
+  }
+}
+
+{
+  for (const label of ['- **VERDICT:**', '## **VERDICT:**']) {
+    const answer = 'P0: none\n' + label + ' SHIP — ours. (run marker: ' + MARKER + ')';
+    const cdp = await mockCdp('run marker: ' + MARKER + '\n' + answer);
+    const capture = await runSalvage([MARKER, '3'], cdp.port);
+    const binding = bindCapture(capture.stdout, MARKER);
+    check(
+      'formatted owned verdict publishes byte-preserving capture (' + label + ')',
+      capture.status === 0 &&
+        capture.stdout === answer + '\n' &&
+        binding.status === 0 &&
+        binding.retained === capture.stdout,
+      'status=' + capture.status + ' bind=' + binding.status + ' stdout=' + capture.stdout,
+    );
+    const probe = await runSalvage(['--probe', MARKER, '3'], cdp.port);
+    check(
+      'formatted owned verdict proves completion (' + label + ')',
+      probe.status === 0 && probe.stderr.includes('probe-state: complete'),
+      'stderr=' + probe.stderr,
+    );
+    cdp.stop();
+  }
+}
+
+{
+  // Execute the actual CDP expression against rendered DOM nodes. innerText has lost the quote
+  // syntax; the blockquote/pre context must survive the capture so the shell agrees with CDP.
+  const foreign = 'pg-run-old-2619-1111111111-9';
+  const example = 'VERDICT: SHIP — incident. (run marker: ' + foreign + ')';
+  const node = (tag, innerText, children = [], role = null) => ({
+    innerText,
+    textContent: innerText,
+    children,
+    matches: (selector) => selector.split(', ').includes(tag),
+    getAttribute: (attribute) => (attribute === 'data-message-author-role' ? role : null),
+  });
+  for (const tag of ['blockquote', 'pre', 'code']) {
+    const answer = [
+      'P0: none',
+      '[P1] src/real.sh:4 — incident example',
+      example,
+      '[P2] src/other.sh:9 — another finding',
+      'VERDICT: FIX-FIRST — ours. (run marker: ' + MARKER + ')',
+    ];
+    const ownAnswer = node(
+      'div',
+      answer.join('\n'),
+      answer.map((line, index) => node(index === 2 ? tag : 'p', line)),
+      'assistant',
+    );
+    const turns = [
+      node('div', 'run marker: ' + foreign, [], 'user'),
+      node('div', 'P0: none\n' + example, [], 'assistant'),
+      node('div', 'Please review this change. run marker: ' + MARKER, [], 'user'),
+      ownAnswer,
+    ];
+    const document = {
+      body: node('body', turns.map((turn) => turn.innerText).join('\n'), turns),
+      querySelectorAll: () => turns,
+    };
+    const cdp = await mockCdp(document.body.innerText, [], { document });
+    const capture = await runSalvage([MARKER, '3'], cdp.port);
+    const expected = answer.map((line, index) => (index === 2 ? '> ' + line : line)).join('\n');
+    check(
+      'rendered ' + tag + ' retains context and full finding bytes',
+      capture.status === 0 && capture.stdout === expected + '\n',
+      'status=' + capture.status + ' stdout=' + JSON.stringify(capture.stdout),
+    );
+    const binding = bindCapture(capture.stdout, MARKER);
+    check(
+      'actual DOM ' + tag + ' capture passes shell binding without rewriting',
+      binding.status === 0 && binding.retained === capture.stdout,
+      'status=' + binding.status + ' stderr=' + binding.stderr,
+    );
+    const probe = await runSalvage(['--probe', MARKER, '3'], cdp.port);
+    check(
+      'rendered ' + tag + ' example is inert and old scrollback is excluded',
+      probe.status === 0 && probe.stderr.includes('probe-state: complete'),
+      'stderr=' + probe.stderr,
+    );
+    check(
+      'DOM context capture executes the actual review-text expression',
+      cdp.requests.some((request) => request.params?.expression?.includes('pro-gate:review-text')),
+      'requests=' + cdp.requests.length,
+    );
+    cdp.stop();
+    const title = 'unchanged title';
+    const fixture = organizerExpressionFixture(document.body.innerText, { document, title });
+    const expression = buildRenameConversationExpression(title, {
+      marker: MARKER,
+      conversationUrl: 'https://chatgpt.com/c/mock-conversation',
+      mutationToken: 'dom-reference.' + tag,
+      mutationExpiresAt: Date.now() + 10_000,
+      expectedReview: durableReview(capture.stdout, MARKER),
+    });
+    const finalized = await runInNewContext(expression, fixture.context);
+    check(
+      'independent finalization guard accepts the same rendered ' + tag + ' bytes',
+      finalized.status === 'already' && fixture.sidebarReads() > 0 && fixture.events.length === 0,
+      'result=' + JSON.stringify(finalized),
+    );
+  }
+
+  for (const [kind, code, suffix] of [
+    ['unsigned example', 'VERDICT: SHIP', ''],
+    ['verdict label fragment', 'VERDICT: FIX-FIRST', ' — ours. (run marker: ' + MARKER + ')'],
+    ['signed verdict fragment', 'VERDICT: FIX-FIRST (run marker: ' + MARKER + ')', ' — ours.'],
+  ]) {
+    const real = 'VERDICT: FIX-FIRST — ours. (run marker: ' + MARKER + ')';
+    const lines = ['P0: none', '[P1] src/real.sh:4 — regression', ...(suffix ? [] : [real]), code + suffix];
+    const last = node('p', code + suffix, [node('span', code, [node('code', code)])]);
+    const turns = [
+      node('div', 'run marker: ' + MARKER, [], 'user'),
+      node('div', lines.join('\n'), [...lines.slice(0, -1).map((line) => node('p', line)), last], 'assistant'),
+    ];
+    const document = {
+      body: node('body', turns.map((turn) => turn.innerText).join('\n'), turns),
+      querySelectorAll: () => turns,
+    };
+    const cdp = await mockCdp(document.body.innerText, [], { document });
+    const capture = await runSalvage([MARKER, '3'], cdp.port);
+    const expected = (suffix ? lines : lines.slice(0, -1)).join('\n') + '\n';
+    const binding = bindCapture(capture.stdout, MARKER);
+    check(
+      'DOM inline-code context distinguishes ' + kind + ' without changing authority',
+      capture.status === 0 && capture.stdout === expected && binding.status === 0,
+      'status=' + capture.status + ' bind=' + binding.status + ' stdout=' + JSON.stringify(capture.stdout),
+    );
+    cdp.stop();
+  }
+
+  const verdictNode = (marker, summary, wrapMarker) => {
+    const signature = '(run marker: ' + marker + ')';
+    const line = 'VERDICT: SHIP — ' + summary + '. ' + signature;
+    return node(
+      'p',
+      line,
+      wrapMarker ? [node('span', marker, [node('code', marker)])] : [],
+    );
+  };
+  const reviewDocument = (answerNodes) => {
+    const assistant = node(
+      'div',
+      answerNodes.map((answerNode) => answerNode.innerText).join('\n'),
+      answerNodes,
+      'assistant',
+    );
+    const turns = [node('div', 'run marker: ' + MARKER, [], 'user'), assistant];
+    return {
+      body: node('body', turns.map((turn) => turn.innerText).join('\n'), turns),
+      querySelectorAll: () => turns,
+    };
+  };
+
+  {
+    const answerNodes = [node('p', 'P0: none'), verdictNode(MARKER, 'ours', true)];
+    const answer = answerNodes.map((answerNode) => answerNode.innerText).join('\n');
+    const document = reviewDocument(answerNodes);
+    const cdp = await mockCdp(document.body.innerText, [], { document });
+    const capture = await runSalvage([MARKER, '3'], cdp.port);
+    check(
+      'DOM code-wrapped own marker preserves exact review bytes',
+      capture.status === 0 && capture.stdout === answer + '\n',
+      'status=' + capture.status + ' stdout=' + JSON.stringify(capture.stdout),
+    );
+    const binding = bindCapture(capture.stdout, MARKER);
+    check(
+      'DOM code-wrapped own marker passes shell binding unchanged',
+      binding.status === 0 && binding.retained === capture.stdout,
+      'status=' + binding.status + ' stderr=' + binding.stderr,
+    );
+    const probe = await runSalvage(['--probe', MARKER, '3'], cdp.port);
+    check(
+      'DOM code-wrapped own marker proves completed review ownership',
+      probe.status === 0 && probe.stderr.includes('probe-state: complete'),
+      'status=' + probe.status + ' stderr=' + probe.stderr,
+    );
+    cdp.stop();
+    const fixture = organizerExpressionFixture(document.body.innerText, { document });
+    const expression = buildRenameConversationExpression('unchanged title', {
+      marker: MARKER,
+      conversationUrl: 'https://chatgpt.com/c/mock-conversation',
+      mutationToken: 'dom-code-own.finalize',
+      mutationExpiresAt: Date.now() + 10_000,
+      expectedReview: durableReview(capture.stdout, MARKER),
+    });
+    const finalized = await runInNewContext(expression, fixture.context);
+    check(
+      'independent finalization guard accepts DOM code-wrapped own marker bytes',
+      finalized.status === 'already' && fixture.sidebarReads() > 0 && fixture.events.length === 0,
+      'result=' + JSON.stringify(finalized),
+    );
+  }
+
+  {
+    const foreign = 'pg-run-other-repo-2619-1111111111-9';
+    const ours = [node('p', 'P0: none'), verdictNode(MARKER, 'ours', false)];
+    const theirs = [
+      node('p', '[P0] other/a.ts:1 — foreign finding'),
+      verdictNode(foreign, 'theirs', true),
+    ];
+    for (const [layout, answerNodes] of [
+      ['foreign first', [...theirs, ...ours]],
+      ['foreign last', [...ours, ...theirs]],
+    ]) {
+      const answer = answerNodes.map((answerNode) => answerNode.innerText).join('\n');
+      const document = reviewDocument(answerNodes);
+      const cdp = await mockCdp(document.body.innerText, [], { document });
+      const capture = await runSalvage([MARKER, '3'], cdp.port);
+      check(
+        'DOM code-wrapped foreign marker preserves mixed review bytes (' + layout + ')',
+        capture.status === 0 && capture.stdout === answer + '\n',
+        'status=' + capture.status + ' stdout=' + JSON.stringify(capture.stdout),
+      );
+      const binding = bindCapture(capture.stdout, MARKER);
+      check(
+        'DOM code-wrapped foreign marker fails shell binding unchanged (' + layout + ')',
+        binding.status === 2 && binding.retained === capture.stdout,
+        'status=' + binding.status + ' stderr=' + binding.stderr,
+      );
+      const probe = await runSalvage(['--probe', MARKER, '3'], cdp.port);
+      check(
+        'DOM code-wrapped foreign marker keeps probe generating (' + layout + ')',
+        probe.status === 0 &&
+          probe.stderr.includes('probe-state: generating') &&
+          !probe.stderr.includes('probe-state: complete'),
+        'status=' + probe.status + ' stderr=' + probe.stderr,
+      );
+      cdp.stop();
+      for (const action of ['rename', 'archive']) {
+        const fixture = organizerExpressionFixture(document.body.innerText, { document });
+        const target = {
+          marker: MARKER,
+          conversationUrl: 'https://chatgpt.com/c/mock-conversation',
+          mutationToken: 'dom-code-mixed.' + action + '.' + layout.replace(' ', '-'),
+          mutationExpiresAt: Date.now() + 10_000,
+          expectedReview: action === 'archive'
+            ? durableReview(ours.map((answerNode) => answerNode.innerText).join('\n'), MARKER)
+            : null,
+        };
+        const expression = action === 'rename'
+          ? buildRenameConversationExpression('unchanged title', target)
+          : buildArchiveConversationExpression(target);
+        const result = await runInNewContext(expression, fixture.context);
+        check(
+          'independent ' + action + ' guard rejects DOM code-wrapped mixed review (' + layout + ')',
+          result.status === 'skipped' &&
+            result.reason === 'target-mixed-review' &&
+            fixture.sidebarReads() === 0 &&
+            fixture.events.length === 0,
+          'result=' + JSON.stringify(result) + ' events=' + fixture.events,
+        );
+      }
+    }
+  }
+
+  const answer = [
+    'P0: none',
+    example,
+    '[P1] src/real.sh:4 — a literal prompt marker in a finding',
+    'run marker: ' + MARKER,
+    'VERDICT: SHIP — ours. (run marker: ' + MARKER + ')',
+  ].join('\n');
+  const turns = [node('div', 'run marker: ' + MARKER, [], 'user'), node('div', answer, [], 'assistant')];
+  const document = {
+    body: node('body', turns.map((turn) => turn.innerText).join('\n'), turns),
+    querySelectorAll: () => turns,
+  };
+  const cdp = await mockCdp(document.body.innerText, [], { document });
+  const capture = await runSalvage([MARKER, '3'], cdp.port);
+  const binding = bindCapture(capture.stdout, MARKER);
+  check(
+    'DOM user-turn scope cannot be reset by a literal prompt marker inside the answer',
+    capture.status === 0 && capture.stdout === answer + '\n' && binding.status === 2,
+    'status=' + capture.status + ' stdout=' + JSON.stringify(capture.stdout) + ' bind=' + binding.status,
+  );
+  cdp.stop();
+}
+
+{
+  // The live DOM can drift after the collector validated it. Execute the actual renderer guard
+  // and prove neither rename nor archive dispatches even its first event after mixed drift.
+  const foreign = 'pg-run-other-repo-2619-1111111111-9';
+  const ours = completedReview(MARKER);
+  const theirs = 'P0: none\nVERDICT: FIX-FIRST (run marker: ' + foreign + ')';
+  for (const [layout, mixed] of [
+    ['foreign first', theirs + '\n' + ours],
+    ['foreign last', ours + '\n' + theirs],
+  ]) {
+    for (const action of ['rename', 'archive']) {
+      const fixture = organizerExpressionFixture('run marker: ' + MARKER + '\n' + ours, {
+        driftText: 'run marker: ' + MARKER + '\n' + mixed,
+      });
+      const target = {
+        marker: MARKER,
+        conversationUrl: 'https://chatgpt.com/c/mock-conversation',
+        mutationToken: 'mixed-drift.' + action,
+        mutationExpiresAt: Date.now() + 10_000,
+        expectedReview: action === 'archive' ? durableReview(ours, MARKER) : null,
+      };
+      const expression =
+        action === 'rename'
+          ? buildRenameConversationExpression('new title', target)
+          : buildArchiveConversationExpression(target);
+      const result = await runInNewContext(expression, fixture.context);
+      check(
+        'independent ' + action + ' guard rejects mixed DOM drift before effect (' + layout + ')',
+        result.status === 'skipped' &&
+          result.reason === 'target-mixed-review' &&
+          fixture.sidebarReads() > 0 &&
+          fixture.events.length === 0,
+        'result=' + JSON.stringify(result) + ' events=' + fixture.events,
+      );
+    }
+  }
+}
+
+{
+  // Text-only old foreign scrollback stays outside a newly completed owned response.
+  const foreign = 'pg-run-other-repo-2619-1111111111-9';
+  const old = ['[P0] other/a.ts:1 — old finding', 'VERDICT: FIX-FIRST (run marker: ' + foreign + ')'];
+  const answer = ['P0: none', 'P1: none', 'VERDICT: SHIP — ours. (run marker: ' + MARKER + ')'];
+  const body = [
+    ...old,
+    '(run marker: ' + MARKER + ' — internal correlation id, echo on the verdict line)',
+    ...answer,
+  ].join('\n');
+  const cdp = await mockCdp(body);
+  const capture = await runSalvage([MARKER, '3'], cdp.port);
+  check(
+    'old foreign scrollback is excluded from a clean new answer',
+    capture.status === 0 && capture.stdout === answer.join('\n') + '\n',
+    'stdout=' + capture.stdout,
+  );
+  const probe = await runSalvage(['--probe', MARKER, '3'], cdp.port);
+  check(
+    'clean new answer after old foreign scrollback proves completion',
+    probe.status === 0 && probe.stderr.includes('probe-state: complete'),
+    'stderr=' + probe.stderr,
+  );
+  cdp.stop();
+  const staleCdp = await mockCdp([...old, 'run marker: ' + MARKER].join('\n'));
+  const stale = await runSalvage([MARKER, '3'], staleCdp.port);
+  check(
+    'old foreign answer preceding a still-pending prompt preserves chronology',
+    stale.status === 0 && stale.stderr.includes('answer-chronology precedes-prompt'),
+    'status=' + stale.status + ' stderr=' + stale.stderr,
+  );
+  staleCdp.stop();
+}
+
 { // P1 (gate #91 r3): --probe must not report the conversation ABSENT just because the one-shot
   // revalidation was spent on a DIFFERENT remembered URL (A) that comes back cross-bound or
   // foreign, while the tab actually scanned (B) is demonstrably ours and still generating. Before
@@ -1596,6 +2174,33 @@ const FOREIGN_ANSWER = (m) => [
     `crossbound=${r.crossbound} stderr=${r.stderr?.slice(-400)}`);
   check('the quoting review is returned, not convicted', r.status === 0,
     `status=${r.status} stderr=${r.stderr?.slice(-400)}`);
+  cdp.stop();
+}
+
+{ // #68 gate r2 P3: flat-text fallback keeps the first no-role run marker line as the prompt
+  // boundary, so a later `run marker: <ours>` cannot erase an earlier foreign verdict.
+  const foreign = 'pg-run-foreigntest-2619-1111111111-9';
+  const promptBoundaryDrift = [
+    `run marker: ${MARKER}`,
+    '[P1] lib/example.sh:1 — mixed review sample',
+    `VERDICT: FIX-FIRST — foreign run's claim. (run marker: ${foreign})`,
+    '[P1] lib/example.sh:2 — prompt marker appears in findings text',
+    `run marker: ${MARKER}`,
+    'P2: none',
+    `VERDICT: SHIP — ours. (run marker: ${MARKER})`,
+  ].join('\n');
+  const promptBoundaryCapture = promptBoundaryDrift.split('\n').slice(1).join('\n');
+  const cdp = await mockCdp(promptBoundaryDrift);
+  const capture = await runSalvage([MARKER, '15'], cdp.port);
+  const binding = bindCapture(capture.stdout, MARKER);
+  check(
+    'flat-text foreign verdict survives a later own-marker line and fails shell binding',
+    capture.status === 0 &&
+      capture.stdout === promptBoundaryCapture + '\n' &&
+      binding.status === 2 &&
+      binding.retained === capture.stdout,
+    'status=' + capture.status + ' bind=' + binding.status + ' stdout=' + JSON.stringify(capture.stdout),
+  );
   cdp.stop();
 }
 
@@ -2464,8 +3069,14 @@ const FOREIGN_ANSWER = (m) => [
       /label\.includes\('restore'\)/.test(archiveExpression));
   check('archive expression verifies confirmation rather than trusting a click',
     /verifyArchivedStateFromMenu/.test(archiveExpression) && /hasArchiveToast/.test(archiveExpression));
+  const formattedFixture = organizerExpressionFixture(
+    `run marker: ${MARKER}\nP0: none\n**VERDICT:** SHIP (run marker: ${MARKER})`,
+    { title: dangerousTitle },
+  );
+  const formattedResult = await runInNewContext(renameExpression, formattedFixture.context);
   check('UI mutation ownership accepts the same formatted VERDICT labels as salvage',
-    /\[\*_>#-\]/.test(renameExpression) && /VERDICT\[\*_\\s\]/.test(renameExpression));
+    formattedResult.status === 'already' && formattedFixture.sidebarReads() > 0,
+    `result=${JSON.stringify(formattedResult)}`);
 }
 
 { // #76: the exit hook must actually RUN on the early-exit paths, not just leave a 0 status.

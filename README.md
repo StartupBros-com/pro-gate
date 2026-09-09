@@ -260,9 +260,14 @@ handed back by `--recover <PR>` in place of it. Brief runs always take a diff-de
 
 The engine appends its own contract footer — the findings format, the terminal `VERDICT:` line, and
 the run marker — because the return path is review-shaped end to end: a capture is accepted only when
-it carries a `[Pn]` marker and one of `SHIP | FIX-FIRST | NEEDS-DISCUSSION`, and the collector bounds
-its extraction at the verdict line. An answer lacking that shape is discarded and its slot held until
-recovery. So a brief inherits a severity-ranked-analysis contract: findings as `[P0]`–`[P3]`, and a
+it carries a `[Pn]` marker and one of `SHIP | FIX-FIRST | NEEDS-DISCUSSION`. Before publication or
+replay, ownership validation rejects an answer that supplies authoritative verdicts for different
+runs, in either order, including one verdict claiming two run markers. The ownership check leaves
+accepted text untouched. Markers in ordinary prose and quoted, fenced, or indented verdict examples
+are reference text; older conversation history before this run's prompt is outside the response.
+Rejected captures remain available for diagnosis, and rejection does not release the charged run
+or make a fresh review eligible after a timeout. Existing authoritative lifecycle proofs still
+govern release. So a brief inherits a severity-ranked-analysis contract: findings as `[P0]`–`[P3]`, and a
 verdict reading as no-blockers / fix-these-first / needs-a-decision. Briefs are capped at 64 KiB;
 attach bulk context with `--extra-files`.
 

@@ -667,12 +667,7 @@ pg_run_meta_scan() {
 # still proves its own attempt is no longer unknown-fate. Keep this predicate shared so public
 # decision queries and guarded dispatch rechecks cannot disagree about the same sidecar.
 pg_run_meta_has_terminal_review() { # marker
-  local marker="$1" artifact
-  pg_reservation_marker_ok "$marker" || return 1
-  artifact="$(pg_completed_dir)/$marker"
-  if [ -f "$artifact" ] && [ ! -L "$artifact" ] && pg_is_review "$artifact"; then return 0; fi
-  artifact="$PRO_GATE_HOME/pending/$marker"
-  [ -f "$artifact" ] && [ ! -L "$artifact" ] && pg_is_review "$artifact"
+  pg_attempt_artifact "$1" >/dev/null
 }
 
 pg_run_meta_find_latest() { # host owner repo pr terminal-filter -> newest exact marker
@@ -949,11 +944,13 @@ pg_attempt_artifact() { # marker -> kind<TAB>path for a validated canonical revi
   local marker="$1" path
   pg_reservation_marker_ok "$marker" || return 1
   path="$(pg_completed_dir)/$marker"
-  if [ -f "$path" ] && [ ! -L "$path" ] && pg_is_review "$path"; then
+  if [ -f "$path" ] && [ ! -L "$path" ] && pg_is_review "$path" \
+     && [ -z "$(pg_capture_foreign_echo "$path" "$marker")" ]; then
     printf 'completed\t%s\n' "$path"; return 0
   fi
   path="$PRO_GATE_HOME/pending/$marker"
-  if [ -f "$path" ] && [ ! -L "$path" ] && pg_is_review "$path"; then
+  if [ -f "$path" ] && [ ! -L "$path" ] && pg_is_review "$path" \
+     && [ -z "$(pg_capture_foreign_echo "$path" "$marker")" ]; then
     printf 'pending\t%s\n' "$path"; return 0
   fi
   return 1
@@ -2269,14 +2266,10 @@ pg_filter_diff() {
   ' "$in" > "$out"
 }
 
-# pg_extract_verdict <file>: echo SHIP/FIX-FIRST/NEEDS-DISCUSSION from the terminal verdict
-# line. Shared with pg_is_review and trajectory history so formatting drift cannot make a
-# structurally-accepted review record UNKNOWN. The matcher tolerates leading bold/bullet/quote
-# markers and whitespace, and markers/space before the colon (`**VERDICT:**`, `- VERDICT :`).
+# pg_extract_verdict <file>: the final authoritative verdict must be within the last six
+# non-empty lines. Use the ownership scanner so quoted examples cannot supply SHIP authority.
 pg_extract_verdict() {
-  grep -vE '^[[:space:]]*$' "$1" 2>/dev/null | tail -n 6 \
-    | grep -iE '^[[:space:]]*[*_>#-]*[[:space:]]*VERDICT[*_[:space:]]*:' \
-    | grep -oiE 'SHIP|FIX-FIRST|NEEDS-DISCUSSION' | head -1 | tr '[:lower:]' '[:upper:]'
+  pg_capture_verdict_claims "$1" verdict
 }
 
 # pg_is_review <file>: true only when <file> looks like a COMPLETE review, not a truncated or
@@ -2400,11 +2393,11 @@ pg_trim_file() {
 # was provably written for THIS prompt — content heuristics can't be fooled into accepting a
 # foreign or stale conversation's answer. The engine strips the token before returning output.
 # ─────────────────────────────────────────────────────────────────────────────
-# pg_capture_nonce_ok <file> <marker>: rc 0 when the capture's tail carries this run's token.
+# pg_capture_nonce_ok <file> <marker>: the terminal authoritative verdict must echo this run.
 pg_capture_nonce_ok() {
   local f="$1" marker="$2"
   [ -s "$f" ] || return 1
-  tail -n 6 "$f" 2>/dev/null | grep -qF "(run marker: $marker)"
+  pg_capture_verdict_claims "$f" terminal | grep -qxF -- "$marker"
 }
 # pg_strip_nonce <file> <marker>: remove the echoed token (harmless when absent).
 pg_strip_nonce() {
@@ -2419,6 +2412,150 @@ pg_strip_nonce() {
   }' "$f" > "$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null
   rm -f "$tmp" 2>/dev/null
   return 0
+}
+
+# Review ownership is claimed by top-level authoritative verdicts, never by arbitrary
+# marker mentions. Mirror reviewVerdictClaims in bin/cdp-organizer-expressions.mjs.
+# Markdown quotes, indented examples and fenced code are reference text; the browser
+# preserves that context when collecting rendered blockquote/pre elements.
+# In CLAIMS mode, normalize inline-code around run-marker tokens so a code-wrapped
+# foreign marker still counts as foreign. Keep terminal ownership strictly canonical.
+# Scan the WHOLE response before accepting it: a foreign verdict after our own is just
+# as mixed as one before it.
+pg_capture_verdict_claims() { # file [verdict|terminal] -> claims, decision or terminal claims
+  # Read the file TWICE. A fence suppresses the lines inside it, but a fence that is never
+  # closed is not a code block -- it is a model that forgot a ``` -- and treating it as one
+  # made every later line invisible, INCLUDING this run's own terminal VERDICT. A complete,
+  # single-run, unambiguous review then read as "still generating" and was discarded and
+  # retried forever (gate #166 r3 P1; verified by two documents differing only by a closing
+  # fence). The first pass finds the opener still open at EOF; the second treats that one
+  # line as ordinary text so the tail is classified normally. Recovery stays fail-closed:
+  # mixed-claim detection runs over the recovered region too, so a foreign verdict hiding
+  # behind an unterminated fence is refused rather than published.
+  awk -v mode="${2:-claims}" '
+    NR == FNR {
+      p = $0
+      sub(/\r$/, "", p)
+      if (p ~ /^(    |\t)/) next
+      sub(/^ +/, "", p)
+      if (p ~ /^>/) next
+      if (match(p, /^(```+|~~~+)/)) {
+        prun = substr(p, 1, RLENGTH)
+        prest = substr(p, RLENGTH + 1)
+        if (pfence == "") { pfence = substr(prun, 1, 1); pwidth = length(prun); dangling = FNR }
+        else if (substr(prun, 1, 1) == pfence && length(prun) >= pwidth && prest ~ /^[ \t]*$/) { pfence = ""; dangling = 0 }
+      }
+      next
+    }
+    {
+      s = $0
+      if (s !~ /^[ \t\r]*$/) nonempty++
+      sub(/\r$/, "", s)
+      if (s ~ /^(    |\t)/) next
+      sub(/^ +/, "", s)
+      if (s ~ /^>/) next
+      if (match(s, /^(```+|~~~+)/) && FNR != dangling) {
+        run = substr(s, 1, RLENGTH)
+        rest = substr(s, RLENGTH + 1)
+        if (fence == "") { fence = substr(run, 1, 1); width = length(run) }
+        else if (substr(run, 1, 1) == fence && length(run) >= width && rest ~ /^[ \t]*$/) fence = ""
+        next
+      }
+      if (fence != "") next
+      if (tolower(s) !~ /^[*_# \t-]*verdict[*_ \t]*:[*_ \t]*(ship|fix-first|needs-discussion)([^a-z0-9_-]|$)/) next
+      last = nonempty; last_line = NR; terminal = ""
+      if (mode == "verdict") {
+        low = tolower(s)
+        match(low, /(ship|fix-first|needs-discussion)/)
+        decision = toupper(substr(low, RSTART, RLENGTH))
+        next
+      }
+      while (match(tolower(s), /\(run marker:[ \t]*`?pg-run-[a-z0-9.-]+`?[ \t]*\)/)) {
+        token = substr(s, RSTART, RLENGTH)
+        literal = token
+        s = substr(s, RSTART + RLENGTH)
+        sub(/^\([^:]*:[ \t]*/, "", token)
+        sub(/[ \t]*\)$/, "", token)
+        gsub(/^`|`$/, "", token)
+        if (mode == "terminal") {
+          if (literal == "(run marker: " token ")") terminal = terminal token "\n"
+        } else print token
+      }
+    }
+    END {
+      if (mode == "verdict" && decision != "" && nonempty - last < 6) print decision
+      if (mode == "terminal" && NR - last_line < 6) printf "%s", terminal
+    }
+  ' "$1" "$1"
+}
+
+pg_capture_foreign_echo() { # file marker -> first foreign authoritative claim, or nothing
+  pg_capture_verdict_claims "$1" | awk -v marker="$2" '
+    tolower($0) != tolower(marker) { print; exit }
+  '
+}
+
+# Pure acceptance predicate shared by fresh/direct capture, harvest and artifact replay.
+# rc 0: exact owned claim and no foreign claim; rc 1: no claim for this run (caller applies
+# its existing nonce/legacy rules); rc 2: foreign authoritative claim, including mixed answers
+# and a single verdict claiming two markers. Never cut, rewrite or delete the input.
+# Case-only echo drift stays nonce-less, as before; it is not another run.
+pg_capture_bind() {
+  local f="$1" marker="$2" claims
+  PG_CAPTURE_FOREIGN=""
+  [ -s "$f" ] || return 1
+  claims="$(pg_capture_verdict_claims "$f")" || { PG_CAPTURE_FOREIGN=unreadable; return 2; }
+  PG_CAPTURE_FOREIGN="$(printf '%s\n' "$claims" | awk -v marker="$marker" '
+    NF && tolower($0) != tolower(marker) { print; exit }
+  ')"
+  [ -z "$PG_CAPTURE_FOREIGN" ] || return 2
+  pg_capture_nonce_ok "$f" "$marker"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.42 (#164, gate r1 P2): the Oracle session name a run asks for.
+#
+# Oracle NORMALIZES a custom --slug before storing it (sessionManager.js slugify/normalizeCustomSlug:
+# lowercase, split into [a-z0-9]+ words, keep the FIRST 5, truncate each to 10 characters, join with
+# "-", and reject fewer than 3 words). A run marker handed over raw does not survive that:
+# "pg-run-StartupBros-com-pro-gate-166-1788719459-1312546" is stored as "pg-run-startupbro-com-pro",
+# dropping the PR number, launch epoch and pid — everything that made the marker unique — so EVERY
+# run in the repository asks for one name and Oracle disambiguates with the same collision counter
+# the pin was meant to retire. The name we send must therefore be a FIXED POINT of that normalizer:
+# then what we ask for is exactly what Oracle stores, which is what the reattach fallback addresses
+# when the run log carries no session id of its own.
+# ─────────────────────────────────────────────────────────────────────────────
+# pg_slug_normalize <text>: Oracle's normalization, reimplemented. Idempotent by construction.
+pg_slug_normalize() {
+  printf '%s\n' "$1" | awk '{
+    s = tolower($0); out = ""; n = 0
+    while (n < 5 && match(s, /[a-z0-9]+/)) {
+      w = substr(s, RSTART, RLENGTH); s = substr(s, RSTART + RLENGTH)
+      if (length(w) > 10) w = substr(w, 1, 10)
+      out = (out == "" ? w : out "-" w); n++
+    }
+    print out
+  }'
+}
+# pg_oracle_slug <marker>: the session name for a run marker — unique per invocation AND a fixed
+# point of pg_slug_normalize. A marker is "pg-run-<round key>-<epoch>-<pid>": the epoch and pid are
+# what make it unique, and the round key's last field (the PR number, or "diff") is what makes the
+# session recognizable in `oracle sessions`. Five words, none over ten characters, so Oracle stores
+# it verbatim. A marker of another shape still round-trips: it is normalized rather than trusted.
+#
+# Deliberately NOT prefixed "pg-run-": a run marker is a token this codebase scans for wherever
+# text might carry one (FOREIGN_MARKER_RE, foreignRunMarkerAfter, isThrottlePage), and the slug
+# travels in oracle's argv and run log. A session name that parses as a marker is a second thing
+# claiming to be one, which is the whole class of bug #164 is about.
+pg_oracle_slug() {
+  local marker="$1" pid rest epoch key keytail
+  pid="${marker##*-}"; rest="${marker%-*}"
+  epoch="${rest##*-}"; key="${rest%-*}"
+  keytail="$(printf '%s' "${key##*-}" | tr -cd 'A-Za-z0-9' | cut -c1-10)"
+  case "$epoch$pid" in
+    ''|*[!0-9]*) pg_slug_normalize "pro-gate-review-$marker" ;;
+    *) pg_slug_normalize "pro-gate-${keytail:-review}-$epoch-$pid" ;;
+  esac
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2494,6 +2631,8 @@ pg_completed_write() {  # <marker> <file>: write-once; an existing artifact is n
   local marker="$1" f="$2" dir rc
   pg_reservation_marker_ok "$marker" || return 1
   [ -s "$f" ] || return 1
+  pg_capture_bind "$f" "$marker" && rc=0 || rc=$?
+  [ "$rc" != 2 ] || return 1
   dir="$(pg_completed_dir)"
   mkdir -p "$dir" 2>/dev/null || return 1
   # Atomic NO-CLOBBER install (gate #54 r14): link(2) fails when the artifact exists, so
@@ -2520,6 +2659,8 @@ pg_completed_lookup() {  # <marker> <out>: place the artifact at <out>; rc 0 on 
   pg_reservation_marker_ok "$marker" || return 1
   src="$(pg_completed_dir)/$marker"
   { [ -s "$src" ] && [ ! -L "$src" ] && pg_is_review "$src"; } || return 1
+  pg_capture_bind "$src" "$marker" && rc=0 || rc=$?
+  [ "$rc" != 2 ] || return 1
   [ "$src" = "$out" ] && return 0
   # Copy-then-rename only — never pre-delete the destination (gate #54 r4 P2): a copy/rename
   # failure must leave any existing valid output intact, not destroy it and then fail.
