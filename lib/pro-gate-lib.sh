@@ -532,6 +532,22 @@ pg_reservation_lock() { echo "${PRO_GATE_RESERVATION_LOCK:-$PRO_GATE_HOME/in-pro
 # left this one at the old fixed 20m, and the test that guards the sizing grepped only the engine,
 # so the drift was invisible. One helper, one default, every renderer.
 pg_harvest_hint_timeout() { echo "${PRO_GATE_HARVEST_TIMEOUT:-45m}"; }
+# The fresh review's hard cap, sibling of the above. The engine needs this value in two places
+# ~3000 lines apart -- the run's own --timeout default and the change-lock budget's holder
+# envelope -- and a second literal is exactly how the 20m harvest default drifted out of sync
+# and survived a passing test. One helper, one default, every reader.
+pg_fresh_hint_timeout() { echo "${PRO_GATE_TIMEOUT:-60m}"; }
+
+# A plain-integer knob, or the default when it is anything else. The change-lock budget feeds
+# several operator-settable knobs straight into $(( )), where a duration-style typo is not a
+# small error: under `set -e` an arithmetic abort kills the whole run before any lock is taken.
+# .env.example documents 60m/45m durations a few lines from these second-valued knobs, so
+# PRO_GATE_TIMEOUT_GRACE=2m is an invited mistake rather than a hostile one. This is the same
+# idiom PRO_GATE_RESERVATION_TTL already uses in three places; one helper so every budget term
+# gets it instead of two of six.
+pg_int_or() {
+  case "${1:-}" in ''|*[!0-9]*) printf '%s\n' "$2" ;; *) printf '%s\n' "$1" ;; esac
+}
 # Markers become filenames under PRO_GATE_HOME and lock paths; every character must be from the
 # safe class (in particular no "/" anywhere), not just the first one after the prefix.
 pg_reservation_marker_ok() {

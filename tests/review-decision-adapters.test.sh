@@ -199,15 +199,34 @@ check 'library validator refuses a symlinked decision file' "$([ "$SYMLINK_OK" =
 # matters. The earlier version of this check REQUIRED the hardcoded 60m/45m, so it enforced the
 # bypass instead of catching it. The rule is now the same one the daemon follows: supply a timeout
 # only when the operator configured one.
+# The pattern deliberately does NOT require a trailing unit: pg_dur_secs treats a bare digit run
+# as raw seconds, so `--timeout 1800` is a fully valid pin and reintroduces the identical bypass.
+# Requiring [smh] left this check reporting ok for that whole class of value.
 for consumer in "${CONSUMERS[@]}"; do
   check "$(basename "$consumer") lets the engine size the wait instead of pinning it" \
-    "$(! grep -Eq -- '--timeout[[:space:]]+[0-9]+[smh]' "$consumer"; printf '%s' "$?")" \
-    "$(grep -En -- '--timeout[[:space:]]+[0-9]+[smh]' "$consumer" | tr '\n' ';')"
+    "$(! grep -Eq -- '--timeout[[:space:]]+[0-9]' "$consumer"; printf '%s' "$?")" \
+    "$(grep -En -- '--timeout[[:space:]]+[0-9]' "$consumer" | tr '\n' ';')"
 done
+# Planted negatives for the pattern itself. The check above can only report a real bypass if
+# the pattern matches one, and the pre-fix pattern (which required a trailing [smh]) reported
+# ok for the bare-seconds spelling -- a fully valid pin, since pg_dur_secs reads a bare digit
+# run as raw seconds. Assert both spellings match, and that an unpinned consumer still does not.
+PINNED_SECS="$TMP/pinned-seconds.md"
+PINNED_UNIT="$TMP/pinned-unit.md"
+UNPINNED="$TMP/unpinned.md"
+printf 'run: oracle-review.sh --pr 1 --timeout 1800 --out x\n' > "$PINNED_SECS"
+printf 'run: oracle-review.sh --pr 1 --timeout 30m --out x\n' > "$PINNED_UNIT"
+printf 'run: oracle-review.sh --pr 1 --out x\n' > "$UNPINNED"
+check 'no-hardcoded-timeout pattern catches a bare-seconds pin (planted negative)' \
+  "$(grep -Eq -- '--timeout[[:space:]]+[0-9]' "$PINNED_SECS"; printf '%s' "$?")"
+check 'no-hardcoded-timeout pattern still catches a unit-suffixed pin' \
+  "$(grep -Eq -- '--timeout[[:space:]]+[0-9]' "$PINNED_UNIT"; printf '%s' "$?")"
+check 'no-hardcoded-timeout pattern does not fire on an unpinned consumer' \
+  "$(! grep -Eq -- '--timeout[[:space:]]+[0-9]' "$UNPINNED"; printf '%s' "$?")"
 ENGINE="$HERE/../bin/oracle-review.sh"
 LIBSH="$HERE/../lib/pro-gate-lib.sh"
 check 'engine harvest hints carry the sized collection timeout, never the old fixed 20m' \
-  "$(grep -Fq 'HARVEST_HINT_TIMEOUT="$(pg_harvest_hint_timeout)"' "$ENGINE" && grep -Fq 'TIMEOUT="${PRO_GATE_TIMEOUT:-60m}"' "$ENGINE" && ! grep -Fq -- '--timeout 20m' "$ENGINE"; printf '%s' "$?")"
+  "$(grep -Fq 'HARVEST_HINT_TIMEOUT="$(pg_harvest_hint_timeout)"' "$ENGINE" && grep -Fq 'TIMEOUT="$(pg_fresh_hint_timeout)"' "$ENGINE" && ! grep -Fq -- '--timeout 20m' "$ENGINE"; printf '%s' "$?")"
 # The library prints operator-facing harvest hints too (pg_report_capacity_holders). Grepping only
 # the engine is how a hardcoded 20m survived the v0.41 sizing pass while this very check passed, so
 # EVERY shipped shell file is scanned for a stale fixed collection wait, not just the engine.

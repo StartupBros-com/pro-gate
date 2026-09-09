@@ -193,6 +193,53 @@ WAIT_FLOCK
     "$([ "$RC" -eq 7 ] && [ "$wait_observed" = 1796 ] && grep -Fq 'timed out after 1796s' "$TDIR/stderr"; echo $?)" \
     "rc=$RC observed=$wait_observed trace=$(cat "$wait_log") stderr=$(tail -3 "$TDIR/stderr")"
 
+  # gate #148 r3 P1: a duration-style typo in a knob that feeds the budget arithmetic used to
+  # abort the entire run -- $(( ... + 2m )) is a fatal arithmetic error under set -e, thrown
+  # before any lock is taken, so a single bad character in .env took out every review. Both an
+  # unprotected term (REATTACH_TIMEOUT) and the grace added to the hard cap are typo'd here;
+  # each must fall back to its own default rather than poison the sum. .env.example documents
+  # 60m/45m durations a few lines from these second-valued knobs, so this is an invited typo.
+  # 100 + 3 x (320 + 150) + 2 x (30 + 3) + 9 + 1000 = 2585, with 320 = 200s + the default 120
+  # grace and 150 the default reattach.
+  wait_home="$TDIR/home-wait-typo-knob"; mkdir -p "$wait_home"; : > "$wait_log"
+  env -u PRO_GATE_TEST_MODE HOME="$wait_user" PRO_GATE_HOME="$wait_home" ORACLE_BROWSER_PORT="$PORT" \
+    PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
+    PRO_GATE_LOCK_WAIT=100 PRO_GATE_TIMEOUT=200s PRO_GATE_TIMEOUT_GRACE=2m PRO_GATE_MAX_RETRIES=2 \
+    PRO_GATE_REATTACH_TIMEOUT=7m PRO_GATE_RETRY_BACKOFF=3 PRO_GATE_THROTTLE_PAUSE=9 \
+    PRO_GATE_STALL_SECS=11 PRO_GATE_SALVAGE_SECS=1000 \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_FLOCK_LOG="$wait_log" \
+    PG_TEST_FAIL_CHANGE_LOCK=1 PATH="$wait_path" NODE_OPTIONS= \
+    bash "$ENGINE" --diff "$wait_diff" --repo "$TDIR" --out "$wait_home/review.md" \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+  RC=$?
+  wait_observed="$(awk -F '\t' '$2 ~ /\.pr-/ { value=$1 } END { print value }' "$wait_log")"
+  check 'gate #148 r3 P1 budget-knob-validation: a duration-style typo degrades to the default, never aborts' \
+    "$([ "$RC" -eq 7 ] && [ "$wait_observed" = 2585 ] && grep -Fq 'timed out after 2585s' "$TDIR/stderr"; echo $?)" \
+    "rc=$RC observed=$wait_observed trace=$(cat "$wait_log") stderr=$(tail -3 "$TDIR/stderr")"
+
+  # gate #148 r3 P2: the derived budget must fit inside the reservation TTL it lives under, or a
+  # reconciler can exhaust the recovery of a holder that is still legally working. One documented
+  # override parts them: PRO_GATE_TIMEOUT=95m derives 3900 + 2 x (5820 + 150) + (30 + 20) + 300
+  # + 5820 = 22010 against the 21600 default TTL. Nothing clamps -- clamping the waiter would
+  # recreate the r1 P2 bug -- so the incoherent pair must at least be announced.
+  wait_home="$TDIR/home-wait-ttl-warn"; mkdir -p "$wait_home"; : > "$wait_log"
+  env -u PRO_GATE_TEST_MODE -u PRO_GATE_LOCK_WAIT -u PRO_GATE_CHANGE_LOCK_WAIT \
+    -u PRO_GATE_TIMEOUT_GRACE -u PRO_GATE_MAX_RETRIES -u PRO_GATE_REATTACH_TIMEOUT \
+    -u PRO_GATE_RETRY_BACKOFF -u PRO_GATE_STALL_SECS -u PRO_GATE_SALVAGE_SECS \
+    -u PRO_GATE_THROTTLE_PAUSE -u PRO_GATE_RESERVATION_TTL \
+    HOME="$wait_user" PRO_GATE_HOME="$wait_home" ORACLE_BROWSER_PORT="$PORT" \
+    PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
+    PRO_GATE_TIMEOUT=95m \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_FLOCK_LOG="$wait_log" \
+    PG_TEST_FAIL_CHANGE_LOCK=1 PATH="$wait_path" NODE_OPTIONS= \
+    bash "$ENGINE" --diff "$wait_diff" --repo "$TDIR" --out "$wait_home/review.md" \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+  RC=$?
+  wait_observed="$(awk -F '\t' '$2 ~ /\.pr-/ { value=$1 } END { print value }' "$wait_log")"
+  check 'gate #148 r3 P2 change-lock-vs-reservation-ttl: a budget outliving the TTL is announced, not silent' \
+    "$([ "$wait_observed" = 22010 ] && grep -Fq 'exceeds PRO_GATE_RESERVATION_TTL' "$TDIR/stderr"; echo $?)" \
+    "rc=$RC observed=$wait_observed stderr=$(tail -3 "$TDIR/stderr")"
+
   # gate #148 r2 P2: a one-off SHORTER --timeout must not shrink the envelope credited to a holder
   # running on the configured default. 17 + 1 x (105 + 7) + 9 + 105 = 243, not the 35 a budget
   # derived from this waiter's own 13s cap would produce.

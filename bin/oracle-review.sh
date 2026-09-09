@@ -179,7 +179,7 @@ if [ -z "$TIMEOUT" ]; then
   if [ "$HARVEST_REQUESTED" = 1 ] || [ "$RECOVER_REQUESTED" = 1 ]; then
     TIMEOUT="$HARVEST_HINT_TIMEOUT"
   else
-    TIMEOUT="${PRO_GATE_TIMEOUT:-60m}"
+    TIMEOUT="$(pg_fresh_hint_timeout)"
   fi
 fi
 
@@ -3145,17 +3145,21 @@ ENGINE_ARGS+=(--browser-archive "${PRO_GATE_BROWSER_ARCHIVE:-never}")
 LOCKFILE="${PRO_GATE_LOCKFILE:-$PRO_GATE_HOME/oracle.lock}"
 # Resolve the fresh review's hard cap once. The change-lock budget and watchdog must use the same
 # effective --timeout > PRO_GATE_TIMEOUT > 60m value plus grace.
-HARD_SECS=$(( $(pg_dur_secs "$TIMEOUT") + ${PRO_GATE_TIMEOUT_GRACE:-120} ))
+TIMEOUT_GRACE="$(pg_int_or "${PRO_GATE_TIMEOUT_GRACE:-120}" 120)"
+HARD_SECS=$(( $(pg_dur_secs "$TIMEOUT") + TIMEOUT_GRACE ))
 # Every OTHER window a holder may legally occupy while it holds the per-change guard is resolved
 # here too, before that guard is sized. Their consumers further down read these same variables, so
 # there is exactly one definition per knob and the budget cannot drift from the windows it covers.
-REATTACH_TIMEOUT="${PRO_GATE_REATTACH_TIMEOUT:-150}"
-MAX_RETRIES="${PRO_GATE_MAX_RETRIES:-1}"
-BACKOFF="${PRO_GATE_RETRY_BACKOFF:-20}"
-STALL_SECS="${PRO_GATE_STALL_SECS:-600}"
-NOTHINK_SECS="${PRO_GATE_NOTHINK_SECS:-600}"
-THROTTLE_PAUSE="${PRO_GATE_THROTTLE_PAUSE:-300}"
-SALVAGE_WINDOW="${PRO_GATE_SALVAGE_SECS:-$STALL_SECS}"
+# Each is validated at its single definition, so the budget below and the windows further down
+# read the same usable number. A raise-only comparison protects only the term it compares;
+# these four had neither, which left four of the six budget terms able to abort the arithmetic.
+REATTACH_TIMEOUT="$(pg_int_or "${PRO_GATE_REATTACH_TIMEOUT:-150}" 150)"
+MAX_RETRIES="$(pg_int_or "${PRO_GATE_MAX_RETRIES:-1}" 1)"
+BACKOFF="$(pg_int_or "${PRO_GATE_RETRY_BACKOFF:-20}" 20)"
+STALL_SECS="$(pg_int_or "${PRO_GATE_STALL_SECS:-600}" 600)"
+NOTHINK_SECS="$(pg_int_or "${PRO_GATE_NOTHINK_SECS:-600}" 600)"
+THROTTLE_PAUSE="$(pg_int_or "${PRO_GATE_THROTTLE_PAUSE:-300}" 300)"
+SALVAGE_WINDOW="$(pg_int_or "${PRO_GATE_SALVAGE_SECS:-$STALL_SECS}" "$STALL_SECS")"
 # CI ambiguity fixtures alone may shorten this otherwise-30s CDP absence wait.
 PRE_RETRY_PROBE_SECS="$(pg_test_pre_retry_probe_secs)"
 # PRO_GATE_LOCK_WAIT remains the account-slot queue budget. The same-change budget is a DIFFERENT
@@ -3168,8 +3172,8 @@ PRE_RETRY_PROBE_SECS="$(pg_test_pre_retry_probe_secs)"
 # working.) The waiter's own --timeout may only RAISE that baseline, never lower it: a one-off
 # `--timeout 5m` must not credit a normal 60m holder with five minutes of life. Keep the budgets
 # independently overridable without changing the acquisition order.
-SLOT_WAIT="${PRO_GATE_LOCK_WAIT:-3900}"
-HOLDER_HARD_SECS=$(( $(pg_dur_secs "${PRO_GATE_TIMEOUT:-60m}") + ${PRO_GATE_TIMEOUT_GRACE:-120} ))
+SLOT_WAIT="$(pg_int_or "${PRO_GATE_LOCK_WAIT:-3900}" 3900)"
+HOLDER_HARD_SECS=$(( $(pg_dur_secs "$(pg_fresh_hint_timeout)") + TIMEOUT_GRACE ))
 # Raise-only comparisons: a knob that is not a plain integer leaves the arithmetic-derived
 # baseline in place instead of poisoning the sum with its own unusable value.
 [ "$HARD_SECS" -gt "$HOLDER_HARD_SECS" ] 2>/dev/null && HOLDER_HARD_SECS="$HARD_SECS"
@@ -3178,6 +3182,17 @@ HOLDER_SALVAGE_SECS="$HOLDER_HARD_SECS"
 CHANGE_LOCK_DEFAULT=$(( SLOT_WAIT + (MAX_RETRIES + 1) * (HOLDER_HARD_SECS + REATTACH_TIMEOUT) \
   + MAX_RETRIES * (PRE_RETRY_PROBE_SECS + BACKOFF) + THROTTLE_PAUSE + HOLDER_SALVAGE_SECS ))
 CHANGE_LOCK_WAIT="${PRO_GATE_CHANGE_LOCK_WAIT:-$CHANGE_LOCK_DEFAULT}"
+# The guarded lifetime this budget describes has to fit inside the reservation TTL, or a
+# reconciler can count confirmed misses against a holder that is still legally working and
+# exhaust its recovery. Nothing here clamps: lowering the WAITER would recreate the r1 P2 bug
+# (give up while the holder works on), and raising the TTL silently would move a capacity
+# accounting number to satisfy a timing one. Defaults are coherent (15710 < 21600); a single
+# documented override is enough to part them (PRO_GATE_TIMEOUT=95m derives 22010), so say it
+# once on stderr and let the operator reconcile the pair deliberately.
+RESERVATION_TTL_SECS="$(pg_int_or "${PRO_GATE_RESERVATION_TTL:-21600}" 21600)"
+if [ "$CHANGE_LOCK_WAIT" -gt "$RESERVATION_TTL_SECS" ]; then
+  echo "[oracle-review] WARNING: same-change budget ${CHANGE_LOCK_WAIT}s exceeds PRO_GATE_RESERVATION_TTL ${RESERVATION_TTL_SECS}s; a holder can outlive the reservation that protects it. Raise PRO_GATE_RESERVATION_TTL or lower PRO_GATE_TIMEOUT." >&2
+fi
 MAX_CONC="${PRO_GATE_MAX_CONCURRENCY:-1}"
 EFF_CONC="$(pg_ramp_level "$MAX_CONC")"
 
