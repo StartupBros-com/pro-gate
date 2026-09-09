@@ -7,7 +7,7 @@
 # Uses tests/mock-cdp.mjs as the browser. Run: bash tests/engine.test.sh
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENGINE="$HERE/../bin/oracle-review.sh"
+ENGINE="${PG_TEST_ENGINE:-$HERE/../bin/oracle-review.sh}"
 FAILS=0
 check() { # name condition-result detail
   if [ "$2" = 0 ]; then echo "ok - $1"; else echo "FAIL - $1: ${3:-}"; FAILS=$((FAILS + 1)); fi
@@ -107,6 +107,262 @@ esac
 exec "$REAL_TIMEOUT" "\$@"
 TIMEOUT_LOG
 chmod +x "$TIMEOUT_LOG_BIN"
+
+# gate #148 r1 P2 change-lock-wait-budget: the per-change guard is acquired before the account
+# slot, so its default must cover both the slot queue and the effective review hard cap. Exercise
+# the real engine path with a flock recorder that refuses only the per-change lock immediately;
+# this proves the budget passed to pg_lock without making the suite wait for minute-scale defaults.
+# gate #148 r2 P2 change-lock-holder-envelope: the same recorder also pins the REST of the holder's
+# guarded lifetime — its retries, throttle pause and salvage window — and the rule that a waiter's
+# own shorter --timeout can never shrink the envelope it credits a holder with.
+run_change_lock_wait_budget_tests() {
+  local wait_user="$TDIR/wait-sizing-user" wait_bin="$TDIR/wait-sizing-user/.local/bin" wait_path wait_real_flock
+  local wait_diff="$TDIR/wait-sizing.diff" wait_log="$TDIR/wait-sizing-flock.log"
+  local wait_home wait_observed wait_slot_fd wait_slot_holder_pid wait_holder_pid wait_waiter_pid wait_holder_rc wait_waiter_rc
+  mkdir -p "$wait_bin"
+  wait_real_flock="$(command -v flock)"
+  cat > "$wait_bin/flock" <<WAIT_FLOCK
+#!/usr/bin/env bash
+if [ "\${1:-}" = -w ]; then
+  wait_s="\${2:-}"
+  fd="\${3:-}"
+  target="\$(readlink "/proc/\$\$/fd/\$fd" 2>/dev/null || true)"
+  printf '%s\t%s\n' "\$wait_s" "\$target" >> "\${PG_TEST_FLOCK_LOG:?}"
+  case "\$target" in
+    *.pr-*) [ "\${PG_TEST_FAIL_CHANGE_LOCK:-0}" = 1 ] && exit 1 ;;
+  esac
+fi
+exec "$wait_real_flock" "\$@"
+WAIT_FLOCK
+  chmod +x "$wait_bin/flock"
+  wait_path="$wait_bin:$PATH"
+  printf 'diff --git a/wait b/wait\n--- a/wait\n+++ b/wait\n@@ -0,0 +1 @@\n+wait\n' > "$wait_diff"
+  printf 'foreign idle tab\n' > "$TDIR/wait-sizing-tab.txt"
+  start_mock "$TDIR/wait-sizing-tab.txt"
+
+  wait_home="$TDIR/home-wait-default"; mkdir -p "$wait_home"; : > "$wait_log"
+  env -u PRO_GATE_TIMEOUT -u PRO_GATE_LOCK_WAIT -u PRO_GATE_CHANGE_LOCK_WAIT -u PRO_GATE_TIMEOUT_GRACE \
+    HOME="$wait_user" PRO_GATE_HOME="$wait_home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+    PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_FLOCK_LOG="$wait_log" \
+    PG_TEST_FAIL_CHANGE_LOCK=1 PATH="$wait_path" NODE_OPTIONS= \
+    bash "$ENGINE" --diff "$wait_diff" --repo "$TDIR" --out "$wait_home/review.md" \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+  RC=$?
+  wait_observed="$(awk -F '\t' '$2 ~ /\.pr-/ { value=$1 } END { print value }' "$wait_log")"
+  check 'gate #148 r1 P2 change-lock-wait-budget: default includes slot wait plus 60m timeout and grace' \
+    "$([ "$RC" -eq 7 ] && [ "$wait_observed" = 11790 ] && grep -Fq 'timed out after 11790s' "$TDIR/stderr"; echo $?)" \
+    "rc=$RC observed=$wait_observed trace=$(cat "$wait_log") stderr=$(tail -3 "$TDIR/stderr")"
+
+  # gate #148 r2 P2: with nothing configured at all, the budget is the WHOLE holder envelope —
+  # 3900 slot wait + 2 attempts x (3720 hard cap + 150 reattach) + 1 x (30 probe + 20 backoff)
+  # + 300 throttle pause + 3720 salvage. The pre-fix formula stopped at 7620 (slot + one attempt),
+  # so a waiter expired while a holder that retried, paused or salvaged was still legally working.
+  wait_home="$TDIR/home-wait-envelope"; mkdir -p "$wait_home"; : > "$wait_log"
+  env -u PRO_GATE_TIMEOUT -u PRO_GATE_LOCK_WAIT -u PRO_GATE_CHANGE_LOCK_WAIT -u PRO_GATE_TIMEOUT_GRACE \
+    -u PRO_GATE_MAX_RETRIES -u PRO_GATE_REATTACH_TIMEOUT -u PRO_GATE_RETRY_BACKOFF \
+    -u PRO_GATE_STALL_SECS -u PRO_GATE_SALVAGE_SECS -u PRO_GATE_THROTTLE_PAUSE -u PRO_GATE_TEST_MODE \
+    HOME="$wait_user" PRO_GATE_HOME="$wait_home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+    PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_FLOCK_LOG="$wait_log" \
+    PG_TEST_FAIL_CHANGE_LOCK=1 PATH="$wait_path" NODE_OPTIONS= \
+    bash "$ENGINE" --diff "$wait_diff" --repo "$TDIR" --out "$wait_home/review.md" \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+  RC=$?
+  wait_observed="$(awk -F '\t' '$2 ~ /\.pr-/ { value=$1 } END { print value }' "$wait_log")"
+  check 'gate #148 r2 P2 change-lock-holder-envelope: shipped default covers the holder full guarded lifetime' \
+    "$([ "$RC" -eq 7 ] && [ "$wait_observed" = 15710 ] && grep -Fq 'timed out after 15710s' "$TDIR/stderr"; echo $?)" \
+    "rc=$RC observed=$wait_observed trace=$(cat "$wait_log") stderr=$(tail -3 "$TDIR/stderr")"
+
+  # gate #148 r2 P2: every retry/throttle/salvage window is counted, and a salvage window an
+  # operator raised above the hard cap raises the budget with it.
+  # 100 + 3 x (200 + 7) + 2 x (30 + 3) + 9 + 1000 = 1796.
+  wait_home="$TDIR/home-wait-retry-envelope"; mkdir -p "$wait_home"; : > "$wait_log"
+  env -u PRO_GATE_TEST_MODE HOME="$wait_user" PRO_GATE_HOME="$wait_home" ORACLE_BROWSER_PORT="$PORT" \
+    PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
+    PRO_GATE_LOCK_WAIT=100 PRO_GATE_TIMEOUT=200s PRO_GATE_TIMEOUT_GRACE=0 PRO_GATE_MAX_RETRIES=2 \
+    PRO_GATE_REATTACH_TIMEOUT=7 PRO_GATE_RETRY_BACKOFF=3 PRO_GATE_THROTTLE_PAUSE=9 \
+    PRO_GATE_STALL_SECS=11 PRO_GATE_SALVAGE_SECS=1000 \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_FLOCK_LOG="$wait_log" \
+    PG_TEST_FAIL_CHANGE_LOCK=1 PATH="$wait_path" NODE_OPTIONS= \
+    bash "$ENGINE" --diff "$wait_diff" --repo "$TDIR" --out "$wait_home/review.md" \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+  RC=$?
+  wait_observed="$(awk -F '\t' '$2 ~ /\.pr-/ { value=$1 } END { print value }' "$wait_log")"
+  check 'gate #148 r2 P2 change-lock-holder-envelope: retry, throttle and salvage windows are counted' \
+    "$([ "$RC" -eq 7 ] && [ "$wait_observed" = 1796 ] && grep -Fq 'timed out after 1796s' "$TDIR/stderr"; echo $?)" \
+    "rc=$RC observed=$wait_observed trace=$(cat "$wait_log") stderr=$(tail -3 "$TDIR/stderr")"
+
+  # gate #148 r3 P1: a duration-style typo in a knob that feeds the budget arithmetic used to
+  # abort the entire run -- $(( ... + 2m )) is a fatal arithmetic error under set -e, thrown
+  # before any lock is taken, so a single bad character in .env took out every review. Both an
+  # unprotected term (REATTACH_TIMEOUT) and the grace added to the hard cap are typo'd here;
+  # each must fall back to its own default rather than poison the sum. .env.example documents
+  # 60m/45m durations a few lines from these second-valued knobs, so this is an invited typo.
+  # 100 + 3 x (320 + 150) + 2 x (30 + 3) + 9 + 1000 = 2585, with 320 = 200s + the default 120
+  # grace and 150 the default reattach.
+  wait_home="$TDIR/home-wait-typo-knob"; mkdir -p "$wait_home"; : > "$wait_log"
+  env -u PRO_GATE_TEST_MODE HOME="$wait_user" PRO_GATE_HOME="$wait_home" ORACLE_BROWSER_PORT="$PORT" \
+    PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
+    PRO_GATE_LOCK_WAIT=100 PRO_GATE_TIMEOUT=200s PRO_GATE_TIMEOUT_GRACE=2m PRO_GATE_MAX_RETRIES=2 \
+    PRO_GATE_REATTACH_TIMEOUT=7m PRO_GATE_RETRY_BACKOFF=3 PRO_GATE_THROTTLE_PAUSE=9 \
+    PRO_GATE_STALL_SECS=11 PRO_GATE_SALVAGE_SECS=1000 \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_FLOCK_LOG="$wait_log" \
+    PG_TEST_FAIL_CHANGE_LOCK=1 PATH="$wait_path" NODE_OPTIONS= \
+    bash "$ENGINE" --diff "$wait_diff" --repo "$TDIR" --out "$wait_home/review.md" \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+  RC=$?
+  wait_observed="$(awk -F '\t' '$2 ~ /\.pr-/ { value=$1 } END { print value }' "$wait_log")"
+  check 'gate #148 r3 P1 budget-knob-validation: a duration-style typo degrades to the default, never aborts' \
+    "$([ "$RC" -eq 7 ] && [ "$wait_observed" = 2585 ] && grep -Fq 'timed out after 2585s' "$TDIR/stderr"; echo $?)" \
+    "rc=$RC observed=$wait_observed trace=$(cat "$wait_log") stderr=$(tail -3 "$TDIR/stderr")"
+
+  # gate #148 r3 P2: the derived budget must fit inside the reservation TTL it lives under, or a
+  # reconciler can exhaust the recovery of a holder that is still legally working. One documented
+  # override parts them: PRO_GATE_TIMEOUT=95m derives 3900 + 2 x (5820 + 150) + (30 + 20) + 300
+  # + 5820 = 22010 against the 21600 default TTL. Nothing clamps -- clamping the waiter would
+  # recreate the r1 P2 bug -- so the incoherent pair must at least be announced.
+  wait_home="$TDIR/home-wait-ttl-warn"; mkdir -p "$wait_home"; : > "$wait_log"
+  env -u PRO_GATE_TEST_MODE -u PRO_GATE_LOCK_WAIT -u PRO_GATE_CHANGE_LOCK_WAIT \
+    -u PRO_GATE_TIMEOUT_GRACE -u PRO_GATE_MAX_RETRIES -u PRO_GATE_REATTACH_TIMEOUT \
+    -u PRO_GATE_RETRY_BACKOFF -u PRO_GATE_STALL_SECS -u PRO_GATE_SALVAGE_SECS \
+    -u PRO_GATE_THROTTLE_PAUSE -u PRO_GATE_RESERVATION_TTL \
+    HOME="$wait_user" PRO_GATE_HOME="$wait_home" ORACLE_BROWSER_PORT="$PORT" \
+    PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
+    PRO_GATE_TIMEOUT=95m \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_FLOCK_LOG="$wait_log" \
+    PG_TEST_FAIL_CHANGE_LOCK=1 PATH="$wait_path" NODE_OPTIONS= \
+    bash "$ENGINE" --diff "$wait_diff" --repo "$TDIR" --out "$wait_home/review.md" \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+  RC=$?
+  wait_observed="$(awk -F '\t' '$2 ~ /\.pr-/ { value=$1 } END { print value }' "$wait_log")"
+  check 'gate #148 r3 P2 change-lock-vs-reservation-ttl: a budget outliving the TTL is announced, not silent' \
+    "$([ "$wait_observed" = 22010 ] && grep -Fq 'exceeds PRO_GATE_RESERVATION_TTL' "$TDIR/stderr"; echo $?)" \
+    "rc=$RC observed=$wait_observed stderr=$(tail -3 "$TDIR/stderr")"
+
+  # gate #148 r2 P2: a one-off SHORTER --timeout must not shrink the envelope credited to a holder
+  # running on the configured default. 17 + 1 x (105 + 7) + 9 + 105 = 243, not the 35 a budget
+  # derived from this waiter's own 13s cap would produce.
+  wait_home="$TDIR/home-wait-short-timeout"; mkdir -p "$wait_home"; : > "$wait_log"
+  env HOME="$wait_user" PRO_GATE_HOME="$wait_home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+    PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
+    PRO_GATE_LOCK_WAIT=17 PRO_GATE_TIMEOUT=100s PRO_GATE_TIMEOUT_GRACE=5 \
+    PRO_GATE_REATTACH_TIMEOUT=7 PRO_GATE_THROTTLE_PAUSE=9 PRO_GATE_STALL_SECS=11 \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_FLOCK_LOG="$wait_log" \
+    PG_TEST_FAIL_CHANGE_LOCK=1 PATH="$wait_path" NODE_OPTIONS= \
+    bash "$ENGINE" --diff "$wait_diff" --repo "$TDIR" --out "$wait_home/review.md" --timeout 13s \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+  RC=$?
+  wait_observed="$(awk -F '\t' '$2 ~ /\.pr-/ { value=$1 } END { print value }' "$wait_log")"
+  check 'gate #148 r2 P2 change-lock-holder-envelope: a shorter waiter --timeout never shrinks the baseline' \
+    "$([ "$RC" -eq 7 ] && [ "$wait_observed" = 243 ] && grep -Fq 'timed out after 243s' "$TDIR/stderr"; echo $?)" \
+    "rc=$RC observed=$wait_observed trace=$(cat "$wait_log") stderr=$(tail -3 "$TDIR/stderr")"
+
+  wait_home="$TDIR/home-wait-configured"; mkdir -p "$wait_home"; : > "$wait_log"
+  env HOME="$wait_user" PRO_GATE_HOME="$wait_home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+    PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
+    PRO_GATE_LOCK_WAIT=17 PRO_GATE_TIMEOUT=23s PRO_GATE_TIMEOUT_GRACE=5 \
+    PRO_GATE_REATTACH_TIMEOUT=7 PRO_GATE_THROTTLE_PAUSE=9 PRO_GATE_STALL_SECS=11 \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_FLOCK_LOG="$wait_log" \
+    PG_TEST_FAIL_CHANGE_LOCK=1 PATH="$wait_path" NODE_OPTIONS= \
+    bash "$ENGINE" --diff "$wait_diff" --repo "$TDIR" --out "$wait_home/review.md" \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+  RC=$?
+  wait_observed="$(awk -F '\t' '$2 ~ /\.pr-/ { value=$1 } END { print value }' "$wait_log")"
+  check 'gate #148 r1 P2 change-lock-wait-budget: configured timeout contributes to change budget' \
+    "$([ "$RC" -eq 7 ] && [ "$wait_observed" = 89 ] && grep -Fq 'timed out after 89s' "$TDIR/stderr"; echo $?)" \
+    "rc=$RC observed=$wait_observed trace=$(cat "$wait_log") stderr=$(tail -3 "$TDIR/stderr")"
+
+  wait_home="$TDIR/home-wait-cli"; mkdir -p "$wait_home"; : > "$wait_log"
+  env HOME="$wait_user" PRO_GATE_HOME="$wait_home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+    PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
+    PRO_GATE_LOCK_WAIT=11 PRO_GATE_TIMEOUT=99s PRO_GATE_TIMEOUT_GRACE=7 \
+    PRO_GATE_REATTACH_TIMEOUT=7 PRO_GATE_THROTTLE_PAUSE=9 PRO_GATE_STALL_SECS=11 \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_FLOCK_LOG="$wait_log" \
+    PG_TEST_FAIL_CHANGE_LOCK=1 PATH="$wait_path" NODE_OPTIONS= \
+    bash "$ENGINE" --diff "$wait_diff" --repo "$TDIR" --out "$wait_home/review.md" --timeout 199s \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+  RC=$?
+  wait_observed="$(awk -F '\t' '$2 ~ /\.pr-/ { value=$1 } END { print value }' "$wait_log")"
+  check 'gate #148 r1 P2 change-lock-wait-budget: --timeout overrides configured timeout in change budget' \
+    "$([ "$RC" -eq 7 ] && [ "$wait_observed" = 439 ] && grep -Fq 'timed out after 439s' "$TDIR/stderr"; echo $?)" \
+    "rc=$RC observed=$wait_observed trace=$(cat "$wait_log") stderr=$(tail -3 "$TDIR/stderr")"
+
+  wait_home="$TDIR/home-wait-override"; mkdir -p "$wait_home"; : > "$wait_log"
+  env HOME="$wait_user" PRO_GATE_HOME="$wait_home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+    PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
+    PRO_GATE_LOCK_WAIT=17 PRO_GATE_CHANGE_LOCK_WAIT=6 PRO_GATE_TIMEOUT=23s PRO_GATE_TIMEOUT_GRACE=5 \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_FLOCK_LOG="$wait_log" \
+    PG_TEST_FAIL_CHANGE_LOCK=1 PATH="$wait_path" NODE_OPTIONS= \
+    bash "$ENGINE" --diff "$wait_diff" --repo "$TDIR" --out "$wait_home/review.md" \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+  RC=$?
+  wait_observed="$(awk -F '\t' '$2 ~ /\.pr-/ { value=$1 } END { print value }' "$wait_log")"
+  check 'gate #148 r1 P2 change-lock-wait-budget: explicit change-lock override wins' \
+    "$([ "$RC" -eq 7 ] && [ "$wait_observed" = 6 ] && grep -Fq 'timed out after 6s' "$TDIR/stderr"; echo $?)" \
+    "rc=$RC observed=$wait_observed trace=$(cat "$wait_log") stderr=$(tail -3 "$TDIR/stderr")"
+
+  wait_home="$TDIR/home-wait-slot"; mkdir -p "$wait_home"; : > "$wait_log"
+  exec {wait_slot_fd}>>"$wait_home/oracle.lock.slot1"; "$wait_real_flock" -n "$wait_slot_fd"
+  env HOME="$wait_user" PRO_GATE_HOME="$wait_home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+    PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
+    PRO_GATE_LOCK_WAIT=0 PRO_GATE_TIMEOUT=23s PRO_GATE_TIMEOUT_GRACE=5 \
+    PRO_GATE_REATTACH_TIMEOUT=7 PRO_GATE_THROTTLE_PAUSE=9 PRO_GATE_STALL_SECS=11 \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_FLOCK_LOG="$wait_log" \
+    PATH="$wait_path" NODE_OPTIONS= \
+    bash "$ENGINE" --diff "$wait_diff" --repo "$TDIR" --out "$wait_home/review.md" \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+  RC=$?
+  eval "exec ${wait_slot_fd}>&-"
+  wait_observed="$(awk -F '\t' '$2 ~ /\.pr-/ { value=$1 } END { print value }' "$wait_log")"
+  check 'gate #148 r1 P2 change-lock-wait-budget: slot wait remains separately bounded' \
+    "$([ "$RC" -eq 7 ] && [ "$wait_observed" = 72 ] && grep -Fq 'waits up to 0s if all busy' "$TDIR/stderr" && grep -Fq 'timed out after 0s — all 1 review slots are busy' "$TDIR/stderr"; echo $?)" \
+    "rc=$RC observed-change=$wait_observed trace=$(cat "$wait_log") stderr=$(tail -5 "$TDIR/stderr")"
+
+  # Hold the only account slot, let the first same-change run queue behind it, then start a waiter.
+  # Releasing the slot after the old 2s shared budget proves the new waiter survives long enough to
+  # observe the holder's completed round and exits through the under-lock recheck, without submitting.
+  wait_home="$TDIR/home-wait-contention"; mkdir -p "$wait_home"; : > "$TDIR/wait-sizing-oracle.calls"
+  : > "$TDIR/wait-sizing-holder.err"; : > "$TDIR/wait-sizing-waiter.err"
+  rm -f "$TDIR/wait-sizing-slot-held"
+  "$wait_real_flock" "$wait_home/oracle.lock.slot1" bash -c \
+    "printf held > '$TDIR/wait-sizing-slot-held'; sleep 2.5" &
+  wait_slot_holder_pid=$!
+  for _ in $(seq 1 100); do [ -s "$TDIR/wait-sizing-slot-held" ] && break; sleep 0.05; done
+  env HOME="$TDIR/user" PRO_GATE_HOME="$wait_home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+    PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
+    PRO_GATE_MAX_ROUNDS_PER_PR=1 PRO_GATE_LOCK_WAIT=2 PRO_GATE_TIMEOUT_GRACE=0 \
+    PRO_GATE_BROWSER_MODE=native PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_ORACLE_COMPLETE=1 \
+    PG_TEST_ORACLE_SENTINEL="$TDIR/wait-sizing-oracle.calls" NODE_OPTIONS= \
+    bash "$ENGINE" --diff "$wait_diff" --repo "$TDIR" --out "$wait_home/holder.md" --timeout 10s \
+    >"$TDIR/wait-sizing-holder.out" 2>"$TDIR/wait-sizing-holder.err" &
+  wait_holder_pid=$!
+  for _ in $(seq 1 100); do
+    grep -Fq 'acquiring a review slot' "$TDIR/wait-sizing-holder.err" && break
+    sleep 0.05
+  done
+  env HOME="$TDIR/user" PRO_GATE_HOME="$wait_home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+    PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
+    PRO_GATE_MAX_ROUNDS_PER_PR=1 PRO_GATE_LOCK_WAIT=2 PRO_GATE_TIMEOUT_GRACE=0 \
+    PRO_GATE_BROWSER_MODE=native PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_ORACLE_COMPLETE=1 \
+    PG_TEST_ORACLE_SENTINEL="$TDIR/wait-sizing-oracle.calls" NODE_OPTIONS= \
+    bash "$ENGINE" --diff "$wait_diff" --repo "$TDIR" --out "$wait_home/waiter.md" --timeout 10s \
+    >"$TDIR/wait-sizing-waiter.out" 2>"$TDIR/wait-sizing-waiter.err" &
+  wait_waiter_pid=$!
+  wait "$wait_slot_holder_pid"
+  wait "$wait_holder_pid"; wait_holder_rc=$?
+  wait "$wait_waiter_pid"; wait_waiter_rc=$?
+  check 'gate #148 r1 P2 change-lock-wait-budget: same-change waiter outlives holder slot queue and rechecks' \
+    "$([ "$wait_holder_rc" -eq 0 ] && [ "$wait_waiter_rc" -eq 12 ] && [ "$(grep -c -- '--browser-model-strategy' "$TDIR/wait-sizing-oracle.calls")" -eq 1 ] && grep -Fq 'spent while this run waited on the per-change lock' "$TDIR/wait-sizing-waiter.err"; echo $?)" \
+    "holder_rc=$wait_holder_rc waiter_rc=$wait_waiter_rc oracle_calls=$(grep -c -- '--browser-model-strategy' "$TDIR/wait-sizing-oracle.calls") holder=$(tail -4 "$TDIR/wait-sizing-holder.err") waiter=$(tail -5 "$TDIR/wait-sizing-waiter.err")"
+}
+
+run_change_lock_wait_budget_tests
+if [ "${PG_TEST_ONLY:-}" = change-lock-wait-budget ]; then
+  [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }
+fi
 
 echo '# hard-ceiling refusal (exit 11): only diffs past PRO_GATE_DIFF_HARD_MAX are refused'
 printf 'still thinking, run marker: %s\n' "$MARKER" > "$TDIR/tab.txt"
@@ -1067,7 +1323,7 @@ exec {DLFD}>>"$RHOME/oracle.lock.pr-${DKEY}"; flock -n "$DLFD"
 printf 'foreign idle tab\n' > "$TDIR/tab.txt"
 env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
   PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 PRO_GATE_LOCK_WAIT=3 \
-  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-ok" NODE_OPTIONS= \
+  PRO_GATE_CHANGE_LOCK_WAIT=3 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-ok" NODE_OPTIONS= \
   bash "$ENGINE" --diff "$TDIR/small.diff" --repo "$TDIR" --out "$RHOME/o-dlock.md" --timeout 5s \
   >"$TDIR/stdout" 2>"$TDIR/stderr"
 RC=$?
@@ -1076,7 +1332,7 @@ check 'concurrent same-branch --diff run waits on the per-change lock (exit 7)' 
 # wait) records its FULL wait as pre_slot_secs with post_slot_secs 0 — LAUNCH_EPOCH is never set.
 DLOCK_ROW="$(grep -F "\"out\":\"$RHOME/o-dlock.md\"" "$RHOME/ledger.jsonl" | tail -1)"
 check 'lock-timeout ledger row records post_slot_secs=0' "$([ "$(printf '%s' "$DLOCK_ROW" | jq -r '.post_slot_secs // "MISSING"')" = 0 ]; echo $?)" "$DLOCK_ROW"
-check 'lock-timeout ledger row records its full wait as pre_slot_secs (>= 2s of the 3s PRO_GATE_LOCK_WAIT)' "$(printf '%s' "$DLOCK_ROW" | jq -e '(.pre_slot_secs // -1) >= 2' >/dev/null 2>&1; echo $?)" "$DLOCK_ROW"
+check 'lock-timeout ledger row records its full wait as pre_slot_secs (>= 2s of the 3s PRO_GATE_CHANGE_LOCK_WAIT)' "$(printf '%s' "$DLOCK_ROW" | jq -e '(.pre_slot_secs // -1) >= 2' >/dev/null 2>&1; echo $?)" "$DLOCK_ROW"
 check 'lock-timeout pre_slot_secs + post_slot_secs equals secs' "$([ "$(printf '%s' "$DLOCK_ROW" | jq -r '(.pre_slot_secs // "MISSING") as $q | (.post_slot_secs // "MISSING") as $r | if ($q == "MISSING" or $r == "MISSING") then "MISSING" else ($q + $r) end')" = "$(printf '%s' "$DLOCK_ROW" | jq -r .secs)" ]; echo $?)" "$DLOCK_ROW"
 eval "exec ${DLFD}>&-"
 
@@ -1364,6 +1620,38 @@ check 'verified lifecycle evidence remains charged' "$([ "$LOG_RC" -ne 0 ]; echo
 ln -s "$LOG_TRANSCRIPT" "$LOG_PROOF_DIR/symlink.log"
 verified_log_rc "$LOG_PROOF_DIR/symlink.log" "$LOG_PROOF"; LOG_RC=$?
 check 'symlinked transcript fails closed' "$([ "$LOG_RC" -ne 0 ]; echo $?)" "rc=$LOG_RC"
+
+# #168: pg_sha256 must bind to the file's BYTES, never to its pathname. GNU sha256sum and
+# shasum -a 256 frame their output line around the filename and escape that WHOLE line with a
+# leading backslash when the name carries a backslash, a CR or a newline, so the old pathname
+# form published `\<hex>` — a value that matches nothing computed from the same bytes anywhere
+# else, INCLUDING this proof's own reader, whose 64-hex shape check then rejects it. A workdir
+# under such a directory therefore made every run fail closed against itself.
+PG_LIB="$HERE/../lib/pro-gate-lib.sh"
+ESC_DIR="$LOG_PROOF_DIR/esc\\dir"; mkdir -p "$ESC_DIR"
+ESC_TRANSCRIPT="$ESC_DIR/oracle.log"; ESC_PROOF="$ESC_DIR/oracle.sha256"
+printf 'pre-browser failure\n' > "$ESC_TRANSCRIPT"
+ESC_WANT="$(sha256sum < "$ESC_TRANSCRIPT" | awk '{print $1}')"
+ESC_GOT="$(bash -c '. "$1"; pg_sha256 "$2"' _ "$PG_LIB" "$ESC_TRANSCRIPT")"
+check '#168 digest under a backslash path is the file bytes, not the escaped output line' \
+  "$([ "$ESC_GOT" = "$ESC_WANT" ] && [[ "$ESC_GOT" =~ ^[0-9a-f]{64}$ ]]; echo $?)" "got=$ESC_GOT want=$ESC_WANT"
+CR_DIR="$(printf '%s/cr\rdir' "$LOG_PROOF_DIR")"; mkdir -p "$CR_DIR"
+printf 'pre-browser failure\n' > "$CR_DIR/oracle.log"
+CR_GOT="$(bash -c '. "$1"; pg_sha256 "$2"' _ "$PG_LIB" "$CR_DIR/oracle.log")"
+check '#168 digest under a carriage-return path matches the same bytes hashed elsewhere' \
+  "$([ "$CR_GOT" = "$ESC_WANT" ]; echo $?)" "got=$CR_GOT want=$ESC_WANT"
+bash -c '. "$1"; pg_publish_log_proof "$2" "$3"' _ "$PG_LIB" "$ESC_TRANSCRIPT" "$ESC_PROOF"
+verified_log_rc "$ESC_TRANSCRIPT" "$ESC_PROOF"; LOG_RC=$?
+check '#168 a proof published under an escaping path verifies its own transcript' \
+  "$([ "$LOG_RC" -eq 0 ]; echo $?)" "rc=$LOG_RC proof=$(cat "$ESC_PROOF" 2>/dev/null)"
+# Reading stdin must not start leaking the shell's OWN redirect diagnostic where the pathname
+# form was silent: in `cmd < missing 2>/dev/null` the open fails before that 2> is installed, so
+# the redirect lives inside a group whose stderr is discarded. Exit status stays unchanged too.
+MISSING_ERR="$LOG_PROOF_DIR/missing.stderr"
+MISSING_OUT="$(bash -c '. "$1"; pg_sha256 "$2"' _ "$PG_LIB" "$LOG_PROOF_DIR/absent.log" 2>"$MISSING_ERR")"; LOG_RC=$?
+check '#168 a missing file yields no digest, no stderr, and the same exit status as before' \
+  "$([ -z "$MISSING_OUT" ] && [ ! -s "$MISSING_ERR" ] && [ "$LOG_RC" -eq 0 ]; echo $?)" \
+  "rc=$LOG_RC out=$MISSING_OUT stderr=$(cat "$MISSING_ERR")"
 
 # Gate #72 r8 P1 end-to-end. These two runs are IDENTICAL except for the tee binary, which is the
 # only way to attribute the outcome to log capture alone: a pre-browser oracle failure that would
@@ -1970,8 +2258,8 @@ check 'structured pre-submit terminalization removes mutable recovery state' \
 
 # #66 gate r2/r3 P1: the spend epoch is the one pg_round_record CHARGED at — not the
 # reservation's `created` field (written at exit-9 time, 35 min later on the live run that
-# exposed this) and not the marker's launch time (minted before two lock waits of up to
-# PRO_GATE_LOCK_WAIT each, so a queued run could be charged ~80 min after its marker).
+# exposed this) and not the marker's launch time (minted before a change-lock wait and a slot
+# wait, so a queued run can be charged long after its marker).
 EHOME="$TDIR/home-spendepoch"; mkdir -p "$EHOME/rounds"
 SPEND_OUT="$(PRO_GATE_HOME="$EHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_record spendkey; printf '%s|%s' \"\$PG_ROUND_SPEND_EPOCH\" \"\$(cat '$EHOME/rounds/spendkey')\"")"
 check 'pg_round_record exports the epoch it charged' \
@@ -3837,6 +4125,14 @@ printf 'https://chatgpt.com/c/old' > "$SWHOME/conversation-urls/pg-run-old-16000
 printf 'https://chatgpt.com/c/new' > "$SWHOME/conversation-urls/pg-run-new-1700000000-1"
 touch -d '20 days ago' "$SWHOME/conversation-urls/pg-run-old-1600000000-1" 2>/dev/null \
   || touch -t "$(date -v-20d +%Y%m%d%H%M 2>/dev/null || echo 202601010000)" "$SWHOME/conversation-urls/pg-run-old-1600000000-1"
+# #170: cross-bind sidecars ride the same 14-day clock. Only proven ownership clears one now,
+# so without this sweep an abandoned marker's conviction would sit in PRO_GATE_HOME forever —
+# and it stands in for the URL memo the conviction deleted, so the two must expire together.
+mkdir -p "$SWHOME/crossbound"
+printf '2026-01-01T00:00:00.000Z\thttps://chatgpt.com/c/old\tpg-run-someone-else\n' > "$SWHOME/crossbound/pg-run-old-1600000000-1"
+printf '2026-01-01T00:00:00.000Z\thttps://chatgpt.com/c/new\tpg-run-someone-else\n' > "$SWHOME/crossbound/pg-run-new-1700000000-1"
+touch -d '20 days ago' "$SWHOME/crossbound/pg-run-old-1600000000-1" 2>/dev/null \
+  || touch -t "$(date -v-20d +%Y%m%d%H%M 2>/dev/null || echo 202601010000)" "$SWHOME/crossbound/pg-run-old-1600000000-1"
 printf 'foreign idle tab\n' > "$TDIR/tab.txt"
 start_mock "$TDIR/tab.txt"
 env PRO_GATE_HOME="$SWHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
@@ -3846,6 +4142,8 @@ env PRO_GATE_HOME="$SWHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PR
   >"$TDIR/stdout" 2>"$TDIR/stderr"
 check 'old memo swept' "$([ ! -f "$SWHOME/conversation-urls/pg-run-old-1600000000-1" ]; echo $?)" "still present"
 check 'fresh memo kept' "$([ -f "$SWHOME/conversation-urls/pg-run-new-1700000000-1" ]; echo $?)" "missing"
+check 'old cross-bind sidecar swept (#170)' "$([ ! -f "$SWHOME/crossbound/pg-run-old-1600000000-1" ]; echo $?)" "still present"
+check 'fresh cross-bind sidecar kept (#170)' "$([ -f "$SWHOME/crossbound/pg-run-new-1700000000-1" ]; echo $?)" "missing"
 
 echo '# v0.30 (#50 item 5): native-mode hard-max clamp is announced, not silent'
 # The NOTE fires before the oversized refusal, so the fast exit-11 path exercises it.
@@ -5955,6 +6253,44 @@ check 'disposition cleanup releases the reservation guard when the binding unlin
      && { [ "$SUPER_LEAK_EXPECT_FAIL" -eq 0 ] \
           || { [ "$SUPER_LEAK_RC" -ne 0 ] && [ "$SUPER_LEAK_BINDING_PRESENT" = yes ]; }; }; echo $?)" \
   "disposition_valid=$([ -n "$SUPER_LEAK_DISP" ] && echo yes || echo no) cleanup_rc=$SUPER_LEAK_RC binding_present=$SUPER_LEAK_BINDING_PRESENT reacquire_rc=$SUPER_LEAK_REACQUIRE"
+
+# v0.41: a CONTENDED guard acquire must fail without leaking its descriptor (the caller never
+# calls release on failure), and the no-flock fallback must self-heal a guard directory left by
+# a dead process instead of waiting out the full window on every later reservation write.
+GUARD_HOME="$TDIR/home-guard-contended"; mkdir -p "$GUARD_HOME"
+GUARD_LOCK="$(PRO_GATE_HOME="$GUARD_HOME" pg_reservation_lock)"; mkdir -p "$(dirname "$GUARD_LOCK")"
+exec {GUARD_HOLD_FD}>>"$GUARD_LOCK"; flock -n "$GUARD_HOLD_FD"
+GUARD_FDS_BEFORE="$(ls /proc/$$/fd 2>/dev/null | wc -l | tr -d ' ')"
+PRO_GATE_HOME="$GUARD_HOME" PRO_GATE_RESERVATION_GUARD_WAIT=1 pg_reservation_guard_acquire; GUARD_CONTENDED_RC=$?
+GUARD_FDS_AFTER="$(ls /proc/$$/fd 2>/dev/null | wc -l | tr -d ' ')"
+eval "exec ${GUARD_HOLD_FD}>&-"
+check 'contended reservation guard acquire fails without leaking a descriptor' \
+  "$([ "$GUARD_CONTENDED_RC" -ne 0 ] && [ -z "${PG_RESERVATION_GUARD_FD:-}" ] \
+     && { [ ! -d /proc/$$/fd ] || [ "$GUARD_FDS_BEFORE" = "$GUARD_FDS_AFTER" ]; }; echo $?)" \
+  "rc=$GUARD_CONTENDED_RC fd_var=${PG_RESERVATION_GUARD_FD:-} fds_before=$GUARD_FDS_BEFORE fds_after=$GUARD_FDS_AFTER"
+
+# The no-flock dead-owner self-heal that used to live here moved out of v0.41.0 with the mechanism
+# it covers. Its regressions (reclaim serialization, owner markers, start-time tokens, the orphan
+# grace, the no-BASHPID fallback) travel with that change so the tests never drift from the code
+# they guard. The flock-path fd-leak check above stays: it covers behaviour this release ships.
+
+# gate #148 r1 P2 (engine side): a --harvest/--recover with no --timeout takes its budget from
+# PRO_GATE_HARVEST_TIMEOUT (default 45m). The daemon's recovery now relies on exactly this instead
+# of supplying the 60m fresh-review wait. The outer coreutils timeout turns a regression (the env
+# value ignored, a 45-minute wait) into a fast failure rather than a hung suite.
+HTO_HOME="$TDIR/home-harvest-timeout"; mkdir -p "$HTO_HOME/conversation-titles"
+HTO_MARKER="pg-run-148-1700000148-1"
+printf 'still thinking, run marker: %s\n' "$HTO_MARKER" > "$TDIR/tab-hto.txt"
+printf 'pro-gate review: PR #148 r1 [harvest-timeout]\n' > "$HTO_HOME/conversation-titles/$HTO_MARKER"
+printf '{"title":null,"archived":false,"events":[]}\n' > "$TDIR/organizer-hto.json"
+start_mock "$TDIR/tab-hto.txt" "$TDIR/organizer-hto.json"
+PRO_GATE_HOME="$HTO_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PRO_GATE_HARVEST_TIMEOUT=5s \
+  /usr/bin/timeout 120 bash "$ENGINE" --harvest "$HTO_MARKER" --out "$TDIR/o-hto.md" >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check 'gate #148 r1 P2: a harvest with no --timeout takes its budget from PRO_GATE_HARVEST_TIMEOUT' \
+  "$([ "$RC" -eq 9 ] && grep -Fq "marker ${HTO_MARKER}, up to 5s," "$TDIR/stderr"; echo $?)" \
+  "rc=$RC $(grep -F 'harvesting' "$TDIR/stderr" | head -1) $(tail -2 "$TDIR/stderr" | tr '\n' ' ')"
 
 # A terminal disposition is durable proof, not another mutable progress flag. It must outrank stale
 # active/run-meta state after a crash, complete exact cleanup/refund once, and let late review bytes

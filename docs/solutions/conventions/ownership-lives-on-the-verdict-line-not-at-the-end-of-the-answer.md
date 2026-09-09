@@ -119,6 +119,6 @@ prove live ChatGPT reliability, review completeness, unattended delivery, or mod
 
 ## Related
 
-- `docs/release-notes/v0.44.0.md`
+- `docs/release-notes/v0.42.0.md`
 - Issue #164; gate lineage #48 (provenance), #54 (nonce-or-nothing), #55 (positive run-binding),
   #67/#68 (cross-bound memos, verdict-line-only conviction).
