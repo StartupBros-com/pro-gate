@@ -2,6 +2,7 @@
 title: "A dead-owner lock reclaim must prove death, not infer it from absence"
 module: "pro-gate"
 date: "2026-09-08"
+last_updated: "2026-09-09"
 category: "conventions"
 problem_type: "design_pattern"
 component: "development_workflow"
@@ -192,6 +193,47 @@ helper while its sibling knob (there, a 60-minute fresh-review default) stays a 
 multiple call sites reintroduces, on the sibling, exactly the drift the helper was built to close on
 the first knob -- and a "single definition" test that only greps the file where the first knob lives
 will not catch it.
+
+### Related pattern worth watching for elsewhere: a test that cannot fail proves nothing
+
+The same review round that produced rule 4 also found two tests that asserted nothing, and both are
+rule 4's shape pointed at a suite instead of a lock: a check passed for a reason unrelated to the
+behaviour it claimed to cover, and absence was read as success.
+
+**A right-hand-side-only clear cannot tell "rejected" from "absent".** The conformance suite guards a
+validator that must reject a fabricated action, an injected blocking-wait field, a foreign contract
+digest, and a symlinked decision file. Each case was written as a flag cleared only on success:
+
+```
+FABRICATED_OK=1
+validator "$TMP/fabricated-$i.json" && { FABRICATED_OK=0; ... }
+check '...rejects a swapped outer action' "$([ "$FABRICATED_OK" = 1 ]; ...)"
+```
+
+The flag clears only when the validator returns 0, so "correctly rejected the attack" and "the
+validator is missing, renamed, or crashed" produce the same reading — a `127` leaves every flag at
+its passing value. Executed against the base commit where the function did not exist at all, all
+four flags read exactly what a genuinely correct run produces. Four attack vectors, the only
+coverage they had, and none of it load-bearing. What let it survive review is worth noting: the
+*acceptance* check in the same block used the opposite polarity and did fail when the validator was
+absent, so one sound check made the group read as sound. The fix scores an explicit return code per
+case, treats a not-found status as a failure rather than a rejection, and asserts the validator is
+callable before scoring anything (`tests/review-decision-adapters.test.sh:166`).
+
+**A check placed after the suite stubs the function under test asserts nothing.** The daemon suite
+replaces the function under test with a counting stub partway down the file
+(`tests/daemon-reload.test.sh:145`). Two regressions written below that line grepped a prompt file
+the stub never writes, so absence trivially satisfied the "sends no timeout when unset" assertion.
+Its sibling — "passes an explicit value through" — failed loudly, and that asymmetry is the trap: a
+one-sided pair where only the negative case is vacuous still leaves the suite red, so the loud half
+gets fixed and the silent half ships. Both were moved above the stub and now additionally require a
+non-empty prompt file.
+
+The rule both cases converge on is the same one this document's four rules rest on: a test proves
+nothing unless it fails against code that lacks the behaviour. That is cheap to establish and almost
+never done — `git show <base>:<path>` into a scratch copy, run the new assertion against it, and
+confirm it goes red before trusting it green. Every regression accompanying the four rules above was
+established that way; the two vacuous checks were not, until a later round caught them.
 
 ## Why This Matters
 
