@@ -46,29 +46,67 @@ daemon_decision_class(){ jq -r '.effect_request.execution_class' "$1"; }
 daemon_decision_ref(){ jq -r '.effect_request.applicable_ref // empty' "$1"; }
 daemon_decision_reason(){ jq -r '.reason // empty' "$1"; }
 
-# #184c stop-completion proof: a report-only/stop-without-new-review decision is completion
-# evidence for the CURRENT head only when its own facts satisfy EXACTLY the reducer's own
-# "identical-code-and-evidence" gate (pg_review_decision_reduce, lib/pro-gate-lib.sh), reproduced
-# verbatim here rather than an invented equivalent:
-#   .prior_review.binding_valid and .prior_review.provenance_valid and
-#   .prior_review.code_identity==.input.identity and .prior_review.evidence_identity==.evidence.identity
-# translated to the envelope this helper receives (.facts is the reducer's bare canonical facts,
-# so .facts.prior_review / .facts.input.identity / .facts.evidence.identity are the same fields).
-# Note deliberately absent: .applicable and .legacy. The real producer (oracle-review.sh) ALWAYS
-# emits prior_review.applicable=false -- requiring true here made a genuine identical-code/evidence
-# stop unsatisfiable and caused the daemon to retry forever (#184c finding 3). This mirrors the
-# reducer rather than an allowlist of stop reasons -- reasons are an open set (round-governor-denied,
-# unproven-input, invalid-binding, evidence-preparation-unsafe, no-safe-action, undefined-state,
-# legacy-not-authoritative, a completed-result tie, ...) and every one of those is a NON-completion
-# stop. Positive facts, not reason strings, decide -- see #184 finding 1.
-daemon_stop_is_completion_proof(){ # decision-file
-  jq -e '
-    .facts.prior_review as $p |
-    ($p.binding_valid == true) and
-    ($p.provenance_valid == true) and
-    ($p.code_identity == .facts.input.identity) and
-    ($p.evidence_identity == .facts.evidence.identity)
-  ' "$1" >/dev/null 2>&1
+# #184/#184c consolidated current-head completion proof: the ONE definition of "this typed
+# decision proves the CURRENT head was terminally, positively reviewed", reused at every site that
+# can write $STATE (the report-only dispatch below, and the post-worker re-resolution in
+# process_pr). #184 finding 1 (round 5): the first version of this helper only recognized a
+# REPEAT (a report-only stop whose facts satisfy the reducer's own "identical-code-and-evidence"
+# gate) and missed the FIRST-SUCCESS shape entirely -- a validated fresh SHIP puts its exact
+# result in .facts.completed_results, never in .facts.prior_review, so a first successful review
+# re-reduced to allow-existing-merge-workflow, this helper returned false, and the unchanged head
+# was re-cloned and reprocessed on every poll forever. The reducer (pg_review_decision_reduce,
+# lib/pro-gate-lib.sh) can only ever reach completion two ways, and this checks exactly those two:
+#
+#  1. report-only/stop-without-new-review, reason identical-code-and-evidence -- a REPEAT of an
+#     already-reviewed head. Proven by reproducing the reducer's own gate verbatim rather than an
+#     invented equivalent:
+#       .prior_review.binding_valid and .prior_review.provenance_valid and
+#       .prior_review.code_identity==.input.identity and .prior_review.evidence_identity==.evidence.identity
+#     translated to the envelope this helper receives (.facts is the reducer's bare canonical
+#     facts, so .facts.prior_review / .facts.input.identity / .facts.evidence.identity are the
+#     same fields). Note deliberately absent: .applicable and .legacy. The real producer
+#     (oracle-review.sh) ALWAYS emits prior_review.applicable=false -- requiring true here made a
+#     genuine identical-code/evidence stop unsatisfiable and caused the daemon to retry forever
+#     (#184c finding 3).
+#
+#  2. report-only/allow-existing-merge-workflow, reason current-ship-is-merge-eligible -- a FIRST
+#     SHIP. oracle-review.sh puts an exact-current, provenance-validated SHIP result into
+#     .facts.completed_results (never .facts.prior_review, which is built only from NON-exact
+#     candidates -- oracle-review.sh:589-592,631-634 -- so it stays .applicable=false here too).
+#     Re-deriving the reducer's completed_results selection here (sort_by(charged_spend_epoch,
+#     canonical_identity)|last, lib/pro-gate-lib.sh:3072) would grow a SECOND parallel notion of
+#     "selected" that could drift from the real one. Instead this trusts the action+reason pair
+#     alone, which is sound ONLY because daemon_decision_valid (pg_review_decision_envelope_valid)
+#     already re-ran the pure reducer over these exact facts and required a byte-identical match
+#     before this helper is ever reached at either call site below -- so seeing
+#     allow-existing-merge-workflow/current-ship-is-merge-eligible on an envelope that already
+#     passed that check IS the reducer's own completed_results-backed SHIP selection.
+#
+# Every other action, and every other stop/report reason (round-governor-denied, unproven-input,
+# invalid-binding, evidence-preparation-unsafe, no-safe-action, undefined-state,
+# legacy-not-authoritative, a completed-result tie, invalid-named-choice, stale-named-choice,
+# fix-review-findings, prepare-matching-review-evidence, ask-named-product-choice, ...) is
+# explicitly NOT completion -- reasons are an open set, so this checks the two positive shapes
+# rather than excluding a list. Positive facts, not reason strings alone, decide -- see #184
+# finding 1.
+daemon_decision_completes_current_head(){ # decision-file
+  local action reason
+  action="$(daemon_decision_action "$1")"
+  reason="$(daemon_decision_reason "$1")"
+  case "$action/$reason" in
+    stop-without-new-review/identical-code-and-evidence)
+      jq -e '
+        .facts.prior_review as $p |
+        ($p.binding_valid == true) and
+        ($p.provenance_valid == true) and
+        ($p.code_identity == .facts.input.identity) and
+        ($p.evidence_identity == .facts.evidence.identity)
+      ' "$1" >/dev/null 2>&1 ;;
+    allow-existing-merge-workflow/current-ship-is-merge-eligible)
+      return 0 ;;
+    *)
+      return 1 ;;
+  esac
 }
 
 daemon_report_observation(){ # decision-file
@@ -204,21 +242,23 @@ daemon_dispatch_decision(){ # decision-file [redirect-depth]
       DAEMON_DISPATCH_AGENT_TASK_RAN=1
       daemon_run_agent_task "$decision" "$action"
       return $? ;;
-    report-only/stop-without-new-review)
-      # A report-only stop is completion evidence ONLY when its facts positively attest a
-      # completed, applicable, current-head review (#184c finding 1) -- most stop reasons
-      # (round-governor-denied, unproven-input, invalid-binding, evidence-preparation-unsafe,
-      # no-safe-action, undefined-state, legacy-not-authoritative, a tied completed result, ...)
-      # mean no applicable review ran for this head at all, and must stay retryable.
-      if daemon_stop_is_completion_proof "$decision"; then
+    report-only/stop-without-new-review|report-only/allow-existing-merge-workflow)
+      # #184 finding 1 (round 5): a report-only decision -- a stop OR a merge-workflow handoff --
+      # is completion evidence for the CURRENT head only when it positively proves one of the two
+      # shapes daemon_decision_completes_current_head recognizes (a REPEAT stop with
+      # identical-code-and-evidence facts, or a FIRST SHIP handed to the existing merge workflow).
+      # Most stop reasons (round-governor-denied, unproven-input, invalid-binding,
+      # evidence-preparation-unsafe, no-safe-action, undefined-state, legacy-not-authoritative, a
+      # tied completed result, invalid-named-choice, ...) mean no applicable review ran for this
+      # head at all and must stay retryable. The daemon reports only and never merges either way --
+      # completing here just means the CURRENT head's own review already reached a terminal
+      # outcome, so it settles instead of being re-cloned and re-queried on every poll forever.
+      if daemon_decision_completes_current_head "$decision"; then
         DAEMON_DISPATCH_TERMINAL_COMPLETED=1
-        daemon_note "  · $DD_NWO#$DD_NUM stopped by runtime decision with current-head review proof; no review worker or failure-budget charge, current head completes"
+        daemon_note "  · $DD_NWO#$DD_NUM $action decision attests current-head review proof; no review worker or failure-budget charge, current head completes"
       else
-        daemon_note "  · $DD_NWO#$DD_NUM stopped by runtime decision ($(daemon_decision_reason "$decision")) without current-head review proof; no worker dispatched, head stays retryable"
+        daemon_note "  · $DD_NWO#$DD_NUM $action decision ($(daemon_decision_reason "$decision")) lacks current-head review proof; no worker dispatched, head stays retryable"
       fi
-      return 0 ;;
-    report-only/allow-existing-merge-workflow)
-      daemon_note "  · $DD_NWO#$DD_NUM has a runtime-reported merge-workflow handoff; daemon reports only and never merges"
       return 0 ;;
     named-product-choice/ask-named-product-choice)
       daemon_note "  · $DD_NWO#$DD_NUM requires the runtime-validated named product choice; daemon defers without a review worker"
@@ -286,8 +326,8 @@ ROOT="$PRO_GATE_HOME"
 # proof-bearing ledger would keep every one of those unverified rows "done" forever -- even after
 # finding 1 lands, an already-poisoned current SHA would stay permanently skipped. STATE is now a
 # NEW, versioned file: the ONLY writer is mark_processed_heads, and it is only ever called after
-# daemon_stop_is_completion_proof (or the finding-1 post-worker re-resolution built on the same
-# predicate) returns true for the CURRENT head. STATE_LEGACY is the old file: read-only from here
+# daemon_decision_completes_current_head (or the finding-1 post-worker re-resolution built on the
+# same predicate) returns true for the CURRENT head. STATE_LEGACY is the old file: read-only from here
 # on, migrated exactly once per row (daemon_migrate_legacy_processed, below) into STATE (when
 # durable evidence is found) or QUARANTINE (when it is not); it is NEVER deleted and NEVER written
 # again by any code past that migration.
@@ -309,6 +349,14 @@ LOGDIR="$ROOT/logs"; mkdir -p "$LOGDIR"
 PAUSE="$ROOT/PAUSE"
 touch "$STATE" "$STATE_LEGACY" "$QUARANTINE" "$FAILS" "$CIDEFER" "$AGENTCAP" "$AGENTFAIL" "$BLOCKED"
 
+# #184 finding 3 (round 5): every (repo,pr,sha) identity this daemon tracks -- STATE, STATE_LEGACY,
+# QUARANTINE, the round_key it derives -- is nwo/num/sha only; there is no host field anywhere in
+# this file's own records, because every gh invocation here (gh pr view, gh search prs, gh repo
+# clone) is unqualified and therefore targets a single implicit host for the whole fleet, same as
+# the `gh` CLI itself (github.com, or whatever GH_HOST already points `gh` at). The legacy-migration
+# identity check below needs a host to compare a binding's `.repository.host` against; this is that
+# one implicit truth, made explicit and overridable rather than a bare literal.
+DAEMON_HOST="${GH_HOST:-github.com}"
 OWNERS="${PRO_REVIEW_OWNERS:-}"                          # space-separated gh owners to watch (REQUIRED)
 POLL="${PRO_REVIEW_POLL_SECONDS:-180}"
 LABEL="${PRO_REVIEW_LABEL:-pro-review}"
@@ -459,17 +507,57 @@ mark_processed_heads(){ # nwo num reviewed-sha
 # that case, including when the binding record itself is missing or unreadable (a genuinely
 # unavailable historical shape): quarantine only re-evaluates the head next poll (safe); a wrong
 # promotion is permanent.
+#
+# #184 finding 2 (round 5): an exact-sha binding alone is not completion -- it proves WHICH head an
+# artifact reviewed, never that the review reached a completion-authorizing outcome, and never that
+# the artifact is even this marker's own result. The old daemon wrote processed.tsv after ANY
+# successful agent task; if that same sha also carries the clean FIX-FIRST or NEEDS-DISCUSSION
+# review that CAUSED the agent task, an exact head binding on that review artifact would satisfy a
+# sha-only check and silently promote a row the new lifecycle deliberately treats as non-terminal
+# (agent-task success is not completion; see daemon_decision_completes_current_head above). A
+# historical mixed/foreign capture -- an artifact whose trailing verdict claims cover more than one
+# marker -- must quarantine the same way. Reuse the SAME authoritative validation the live path
+# reuses for exactly this question rather than inventing a parallel one:
+#   - pg_capture_foreign_echo <artifact> <marker> (lib/pro-gate-lib.sh) -- non-empty means the
+#     artifact's trailing verdict claims a DIFFERENT marker; oracle-review.sh itself refuses to
+#     treat such an artifact as this marker's own result at every one of its own read sites (e.g.
+#     oracle-review.sh:289,519,539). Reused verbatim here for the same reason.
+#   - pg_extract_verdict <artifact> = SHIP -- the only completion-authorizing outcome this daemon
+#     ever ledgers (daemon_decision_completes_current_head, above); a legacy FIX-FIRST or
+#     NEEDS-DISCUSSION artifact is real, structurally-complete, exact-sha-bound evidence that a
+#     review ran and did NOT ship, so it must quarantine rather than promote.
+#
+# #184 finding 3 (round 5): round_key ("${nwo//\//-}-${num}", i.e. owner-repo-pr as one dashed
+# string) is used ONLY to narrow the ledger scan to a small candidate set -- it is lossy by
+# construction (`foo-bar/baz#1` and `foo/bar-baz#1` both collapse to the string "foo-bar-baz-1")
+# and is NEVER itself compared back as proof of identity. The binding read below already carries
+# the real, individually-validated identity fields (`pg_review_input_binding_validate` guarantees
+# `.repository.host`/`.owner`/`.repo` and `.target.pr`/`.head_oid` are well-formed whenever the read
+# succeeds) -- every one of host, owner, repo, PR number, AND head sha is now required to match the
+# legacy row's own (nwo,num,sha) exactly, so two different repositories or PRs that happen to
+# collide on the same coarse round_key string can never durable-evidence each other's row, even
+# when they share a head sha.
 daemon_legacy_row_has_durable_evidence(){ # nwo num sha -> rc 0 when durable evidence binds EXACTLY this sha
-  local nwo="$1" num="$2" sha="$3" ledger completed_dir round_key marker bound_head found=1
+  local nwo="$1" num="$2" sha="$3" owner repo_name ledger completed_dir round_key marker artifact binding found=1
+  owner="${nwo%%/*}"; repo_name="${nwo#*/}"
   ledger="${PRO_GATE_LEDGER:-$ROOT/ledger.jsonl}"
   completed_dir="$(pg_completed_dir)"
   [ -s "$ledger" ] && command -v jq >/dev/null 2>&1 || return 1
-  round_key="${nwo//\//-}-${num}"
+  round_key="${nwo//\//-}-${num}" # coarse lookup key ONLY (finding 3) -- never compared as identity below
   while IFS= read -r marker; do
     [ -n "$marker" ] || continue
-    [ -s "$completed_dir/$marker" ] && [ ! -L "$completed_dir/$marker" ] && pg_is_review "$completed_dir/$marker" || continue
-    bound_head="$(pg_review_binding_read input "$marker" 2>/dev/null | jq -r '.target.head_oid // empty' 2>/dev/null)"
-    if [ -n "$bound_head" ] && [ "$bound_head" = "$sha" ]; then
+    artifact="$completed_dir/$marker"
+    [ -s "$artifact" ] && [ ! -L "$artifact" ] && pg_is_review "$artifact" || continue
+    [ -z "$(pg_capture_foreign_echo "$artifact" "$marker")" ] || continue   # finding 2: reject foreign/mixed capture
+    [ "$(pg_extract_verdict "$artifact")" = SHIP ] || continue             # finding 2: only a SHIP outcome completes
+    binding="$(pg_review_binding_read input "$marker" 2>/dev/null)" || continue
+    if jq -e --arg h "$DAEMON_HOST" --arg o "$owner" --arg r "$repo_name" --argjson p "$num" --arg sha "$sha" '
+         (.repository.host // "") == $h and
+         (.repository.owner // "") == $o and
+         (.repository.repo // "") == $r and
+         (.target.pr // -1) == $p and
+         (.target.head_oid // "") == $sha
+       ' <<<"$binding" >/dev/null 2>&1; then # finding 3: identity-exact, not round_key-exact
       found=0; break
     fi
   done < <(jq -r --arg rk "$round_key" 'select(.outcome=="clean" and (.round_key // "")==$rk) | .marker // empty' "$ledger" 2>/dev/null)
@@ -740,16 +828,17 @@ process_pr(){
   # worker could have been killed mid-write, hit its own budget cap, or simply run out of turns
   # without the runtime ever granting completion). Before marking anything, RE-RESOLVE the typed
   # decision against the SAME worktree (must happen before it is removed) and require the SAME
-  # durable current-head proof used for a report-only stop above (daemon_stop_is_completion_proof)
-  # -- there is exactly one definition of "proven" in this file, reused for every path that can
-  # mark $STATE. If the re-resolved decision does not attest completion, nothing is marked; the
-  # freshly re-resolved decision is left for the NEXT poll cycle to dispatch or defer on its own
-  # merits (not acted on here, to avoid a second dispatch inside this same cycle).
+  # durable current-head proof used at the report-only dispatch sites above
+  # (daemon_decision_completes_current_head, covering both a REPEAT stop and a FIRST SHIP) -- there
+  # is exactly one definition of "proven" in this file, reused for every path that can mark
+  # $STATE. If the re-resolved decision does not attest completion, nothing is marked; the freshly
+  # re-resolved decision is left for the NEXT poll cycle to dispatch or defer on its own merits
+  # (not acted on here, to avoid a second dispatch inside this same cycle).
   local redecision="$lg.redecision"
   if "$engine" --review-decision --json --pr "$num" --repo "$wt" "${DD_INPUT_ARGS[@]}" >"$redecision" 2>>"$lg" \
       && daemon_decision_valid "$redecision" \
       && daemon_decision_target_matches "$redecision" "$nwo" "$num" "$sha" \
-      && daemon_stop_is_completion_proof "$redecision"; then
+      && daemon_decision_completes_current_head "$redecision"; then
     git -C "$repodir" worktree remove --force "$wt" 2>/dev/null || true
     # Mark only the SHA this decision proved was reviewed (#184b). The worker may still push an
     # implementation after the runtime-selected review, but that produces an unreviewed head; the

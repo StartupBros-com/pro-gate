@@ -60,7 +60,12 @@ unset PRO_GATE_DAEMON_LIB_ONLY
 check 'daemon defaults PRO_REVIEW_INPUT to empty/inherit-engine' "$([ -z "$DD_INPUT" ] && [ "${#DD_INPUT_ARGS[@]}" -eq 0 ]; echo $?)" "input=$DD_INPUT args=${DD_INPUT_ARGS[*]}"
 PRO_GATE_HOME="$TYPED_HOME" PRO_REVIEW_INPUT=invalid bash "$HERE/../daemon/daemon.sh" >"$TYPED_HOME/invalid-input.log" 2>&1; input_rc=$?
 check 'invalid PRO_REVIEW_INPUT fails closed at startup' "$([ "$input_rc" -ne 0 ] && grep -Fq 'must be one of: empty, both, bundle, connector' "$TYPED_HOME/invalid-input.log"; echo $?)" "rc=$input_rc"
-TYPED_STATE="$TYPED_HOME/processed.tsv"; TYPED_FAILS="$TYPED_HOME/failcount.tsv"; : > "$TYPED_STATE"; : > "$TYPED_FAILS"
+# TYPED_STATE tracks daemon.sh's real $STATE ledger (processed-v2.tsv), not $STATE_LEGACY's
+# processed.tsv -- #184 finding 1 (round 5): before that fix, allow-existing-merge-workflow never
+# reached mark_processed_heads, so pointing this at the wrong file was silently inert; now that a
+# FIRST SHIP correctly marks the head done, a case below (line ~224) legitimately writes here, and
+# a later case reusing the same PROCESS_SHA needs this truncated first or it inherits that mark.
+TYPED_STATE="$TYPED_HOME/processed-v2.tsv"; TYPED_FAILS="$TYPED_HOME/failcount.tsv"; : > "$TYPED_STATE"; : > "$TYPED_FAILS"
 TYPED_LOG="$TYPED_HOME/typed.log"; : > "$TYPED_LOG"
 log(){ printf '%s\n' "$*" >> "$TYPED_LOG"; }
 TYPED_ENGINE="$TYPED_HOME/oracle-review.sh"; TYPED_ENGINE_CALLS="$TYPED_HOME/engine-calls.log"; : > "$TYPED_ENGINE_CALLS"; export MOCK_ENGINE_CALLS="$TYPED_ENGINE_CALLS"
@@ -216,13 +221,25 @@ for PROCESS_AGENT_RC in 1 2; do
   check "agent task rc=$PROCESS_AGENT_RC stays retryable without a failure-budget row" "$([ "$process_rc" -eq "$PROCESS_AGENT_RC" ] && [ ! -s "$TYPED_STATE" ] && [ ! -s "$TYPED_FAILS" ]; echo $?)" "rc=$process_rc processed=$(wc -c < "$TYPED_STATE") failures=$(wc -c < "$TYPED_FAILS")"
 done
 PROCESS_AGENT_RC=0
-for action in collect-existing-result recover-existing-review allow-existing-merge-workflow ask-named-product-choice; do
+for action in collect-existing-result recover-existing-review ask-named-product-choice; do
   index="$(jq -r --arg action "$action" '.cases | to_entries[] | select(.value.expected.action == $action) | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
   decision="$TYPED_HOME/process-$action.json"; typed_decision "$index" "$decision"
   : > "$TYPED_STATE"; : > "$TYPED_FAILS"
   MOCK_FRESH="$decision" MOCK_RECOVERED="$TYPED_HOME/process-recovered" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
   check "$action does not mark a processed SHA or failure budget" "$([ "$process_rc" -eq 0 ] && [ ! -s "$TYPED_STATE" ] && [ ! -s "$TYPED_FAILS" ]; echo $?)" "rc=$process_rc processed=$(wc -c < "$TYPED_STATE") failures=$(wc -c < "$TYPED_FAILS")"
 done
+# #184 finding 1 (round 5): allow-existing-merge-workflow/current-ship-is-merge-eligible is one of
+# the two positive shapes daemon_decision_completes_current_head recognizes (the producer's FIRST
+# SHIP result lives in .facts.completed_results, never .facts.prior_review) -- unlike the three
+# report/collection actions above, it correctly DOES mark the head done, or the unchanged head
+# re-clones and re-queries forever. Split out of the "does not mark" loop above on purpose.
+MERGE_INDEX="$(jq -r --arg action allow-existing-merge-workflow '.cases | to_entries[] | select(.value.expected.action == $action) | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
+MERGE_DECISION="$TYPED_HOME/process-allow-existing-merge-workflow.json"; typed_decision "$MERGE_INDEX" "$MERGE_DECISION"
+check 'sanity: the allow-existing-merge-workflow corpus fixture is the FIRST-SHIP completion reason (current-ship-is-merge-eligible)' "$([ "$(jq -r .reason "$MERGE_DECISION")" = current-ship-is-merge-eligible ]; echo $?)" "$(jq -r .reason "$MERGE_DECISION")"
+: > "$TYPED_STATE"; : > "$TYPED_FAILS"
+MOCK_FRESH="$MERGE_DECISION" MOCK_RECOVERED="$TYPED_HOME/process-recovered" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
+check 'allow-existing-merge-workflow (current-ship-is-merge-eligible) completes the current head without a failure-budget charge' "$([ "$process_rc" -eq 0 ] && already_done acme/widgets 1983 "$PROCESS_SHA" && [ ! -s "$TYPED_FAILS" ]; echo $?)" "rc=$process_rc processed=$(wc -c < "$TYPED_STATE") failures=$(wc -c < "$TYPED_FAILS")"
+: > "$TYPED_STATE"; : > "$TYPED_FAILS"
 # #184c finding 1: this corpus's only stop-without-new-review case is round-governor-denied --
 # no applicable review ran, so it must NOT complete the head. Positive current-head review proof
 # ("identical-code-and-evidence") is covered by tests/daemon-current-head-completion.test.sh,

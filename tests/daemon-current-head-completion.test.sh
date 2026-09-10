@@ -333,17 +333,64 @@ PROOF_DECISION="$HOME_D/stop-proof.json"
 # #184c finding 3: the real producer (oracle-review.sh) ALWAYS emits prior_review.applicable=false
 # (see oracle-review.sh:631-634 -- prior_review is built only from non-exact prior_candidates, which
 # hardcode applicable:false) and legacy=false. A patch with applicable:true is a shape the producer
-# can never emit; requiring it in daemon_stop_is_completion_proof made a genuine identical-code/
-# evidence stop unsatisfiable and caused the daemon to retry forever. This is the producer's real
-# shape -- identical to the already-verified reducer-level case in
+# can never emit; requiring it in daemon_decision_completes_current_head made a genuine
+# identical-code/evidence stop unsatisfiable and caused the daemon to retry forever. This is the
+# producer's real shape -- identical to the already-verified reducer-level case in
 # tests/engine.test.sh:5291-5292 ("identical verified code and evidence cannot authorize another
 # review") -- proving the helper against genuine producer output, not an invented equivalent.
 typed_decision_patch '{"prior_review":{"applicable":false,"binding_valid":true,"code_identity":"input-current","evidence_identity":"evidence-current","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000400-1","provenance_valid":true,"verdict":"NONE"}}' "$PROOF_DECISION"
 check 'sanity: the real-shape decision is stop-without-new-review/identical-code-and-evidence' "$([ "$(jq -r .action "$PROOF_DECISION")" = stop-without-new-review ] && [ "$(jq -r .reason "$PROOF_DECISION")" = identical-code-and-evidence ]; echo $?)" "action=$(jq -r .action "$PROOF_DECISION") reason=$(jq -r .reason "$PROOF_DECISION")"
-check 'the completion-proof helper accepts the producer real applicable:false identical-code-and-evidence shape' "$(daemon_stop_is_completion_proof "$PROOF_DECISION"; echo $?)"
-check 'the completion-proof helper rejects the round-governor-denied stop (non-completion reason)' "$(! daemon_stop_is_completion_proof "$STOP_DECISION"; echo $?)"
+check 'the completion-proof helper accepts the producer real applicable:false identical-code-and-evidence shape' "$(daemon_decision_completes_current_head "$PROOF_DECISION"; echo $?)"
+check 'the completion-proof helper rejects the round-governor-denied stop (non-completion reason)' "$(! daemon_decision_completes_current_head "$STOP_DECISION"; echo $?)"
 MOCK_FRESH="$PROOF_DECISION" process_pr "$NWO" "$NUM" "$SHA" "$BRANCH" "$URL"; rc=$?
 check 'a stop WITH positive current-head review proof (real applicable:false shape) completes the head' "$([ "$rc" -eq 0 ] && already_done "$NWO" "$NUM" "$SHA"; echo $?)" "rc=$rc"
+
+echo '# #184 finding 1 (round 5): a FIRST successful SHIP puts its exact result in .facts.completed_results,'
+echo '# never .facts.prior_review (which the real producer, oracle-review.sh, ALWAYS emits applicable:false --'
+echo '# oracle-review.sh:589-592,631-634, built only from NON-exact prior candidates). The old helper only'
+echo '# recognized the prior_review-based REPEAT shape above and missed this FIRST-SUCCESS shape entirely, so'
+echo '# a first successful review re-reduced to allow-existing-merge-workflow, the old helper returned false,'
+echo '# and the unchanged head was re-cloned and reprocessed on every poll forever.'
+
+# Real-producer completed_results entry shape (verified by actually running pg_review_decision_reduce
+# over it, /tmp/pgtest1/run.sh in the working session -- not a hand-built envelope): an exact-current,
+# provenance-validated SHIP candidate with an EMPTY prior_review, matching what oracle-review.sh's
+# "exact" branch installs.
+SHIP_PATCH='{"completed_results":[{"applicable":true,"artifact_digest":"0000000000000000000000000000000000000000000000000000000000000000","binding_valid":true,"canonical_identity":"input-current","charged_spend_epoch":1700000004,"collected":true,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000004-4","provenance_valid":true,"verdict":"SHIP"}]}'
+SHIP_DECISION="$HOME_D/ship-first-success.json"
+typed_decision_patch "$SHIP_PATCH" "$SHIP_DECISION"
+check 'sanity: the first-success completed_results patch reduces to allow-existing-merge-workflow/current-ship-is-merge-eligible' "$([ "$(jq -r .action "$SHIP_DECISION")" = allow-existing-merge-workflow ] && [ "$(jq -r .reason "$SHIP_DECISION")" = current-ship-is-merge-eligible ]; echo $?)" "action=$(jq -r .action "$SHIP_DECISION") reason=$(jq -r .reason "$SHIP_DECISION")"
+check 'sanity: the first-success shape carries an EMPTY (non-applicable) prior_review, exactly like the real producer' "$([ "$(jq -r .facts.prior_review.applicable "$SHIP_DECISION")" = false ]; echo $?)" "$(jq -c .facts.prior_review "$SHIP_DECISION")"
+check 'the completion-proof helper accepts the producer real first-success SHIP shape (completed_results, empty prior_review)' "$(daemon_decision_completes_current_head "$SHIP_DECISION"; echo $?)"
+
+reset_state
+daemon_run_review_worker(){ MOCK_FRESH="$SHIP_DECISION"; return 0; }
+SHIP_RUN_DECISION="$HOME_D/ship-run.json"; typed_decision "$(decision_for_action run-granted-review)" "$SHIP_RUN_DECISION"
+MOCK_FRESH="$SHIP_RUN_DECISION" process_pr "$NWO" "$NUM" "$SHA" "$BRANCH" "$URL"; ship_rc=$?
+check 'a first successful SHIP review (completed_results, empty prior_review) completes the current head end-to-end' "$([ "$ship_rc" -eq 0 ] && already_done "$NWO" "$NUM" "$SHA"; echo $?)" "rc=$ship_rc"
+
+echo '# #184 finding 1 (round 5): the negative -- a FIX-FIRST or NEEDS-DISCUSSION decision at the SAME head must NOT complete'
+
+FIXFIRST_PATCH='{"completed_results":[{"applicable":true,"artifact_digest":"0000000000000000000000000000000000000000000000000000000000000000","binding_valid":true,"canonical_identity":"input-current","charged_spend_epoch":1700000004,"collected":true,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000004-4","provenance_valid":true,"verdict":"FIX-FIRST"}]}'
+FIXFIRST_DECISION="$HOME_D/fixfirst-first-success.json"
+typed_decision_patch "$FIXFIRST_PATCH" "$FIXFIRST_DECISION"
+check 'sanity: the FIX-FIRST completed_results patch reduces to fix-review-findings/review-findings-require-fix' "$([ "$(jq -r .action "$FIXFIRST_DECISION")" = fix-review-findings ] && [ "$(jq -r .reason "$FIXFIRST_DECISION")" = review-findings-require-fix ]; echo $?)" "action=$(jq -r .action "$FIXFIRST_DECISION") reason=$(jq -r .reason "$FIXFIRST_DECISION")"
+check 'the completion-proof helper rejects a FIX-FIRST decision at the same head' "$(! daemon_decision_completes_current_head "$FIXFIRST_DECISION"; echo $?)"
+
+NEEDSDISC_PATCH='{"completed_results":[{"applicable":true,"artifact_digest":"0000000000000000000000000000000000000000000000000000000000000000","binding_valid":true,"canonical_identity":"input-current","charged_spend_epoch":1700000004,"collected":true,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000004-4","provenance_valid":true,"verdict":"NEEDS-DISCUSSION"}]}'
+NEEDSDISC_DECISION="$HOME_D/needsdisc-first-success.json"
+typed_decision_patch "$NEEDSDISC_PATCH" "$NEEDSDISC_DECISION"
+check 'sanity: the NEEDS-DISCUSSION completed_results patch (no named-choice outcomes) reduces to a non-completion stop reason' "$([ "$(jq -r .action "$NEEDSDISC_DECISION")" = stop-without-new-review ] && [ "$(jq -r .reason "$NEEDSDISC_DECISION")" != identical-code-and-evidence ]; echo $?)" "action=$(jq -r .action "$NEEDSDISC_DECISION") reason=$(jq -r .reason "$NEEDSDISC_DECISION")"
+check 'the completion-proof helper rejects a NEEDS-DISCUSSION decision at the same head' "$(! daemon_decision_completes_current_head "$NEEDSDISC_DECISION"; echo $?)"
+
+reset_state
+daemon_run_review_worker(){ MOCK_FRESH="$FIXFIRST_DECISION"; return 0; }
+FIXFIRST_RUN_DECISION="$HOME_D/fixfirst-run.json"; typed_decision "$(decision_for_action run-granted-review)" "$FIXFIRST_RUN_DECISION"
+MOCK_FRESH="$FIXFIRST_RUN_DECISION" process_pr "$NWO" "$NUM" "$SHA" "$BRANCH" "$URL"; fixfirst_rc=$?
+# rc=2 (not 0) is the CORRECT outcome here, matching the existing "worker rc=0 whose re-resolved
+# decision does NOT attest completion" case above: the worker ran, but with no completion proof the
+# head stays retryable/deferred rather than being marked done.
+check 'a FIX-FIRST result at the same head never completes it end-to-end (worker ran, no completion proof -> retryable, not marked)' "$([ "$fixfirst_rc" -eq 2 ] && ! already_done "$NWO" "$NUM" "$SHA"; echo $?)" "rc=$fixfirst_rc"
 
 echo '# finding 2: an unrecognized/invented check state is UNSETTLED, never settled (closed allowlist)'
 
@@ -499,5 +546,82 @@ check 'the genuinely-reviewed head A promotes into the new ledger' "$(already_do
 check 'the never-reviewed successor B does NOT promote, even though it shares As artifact-bearing round_key' "$(! already_done "$AB_NWO" "$AB_NUM" "$SHA_B"; echo $?)" "$(cat "$STATE_FILE")"
 check 'B is quarantined (re-evaluated next poll), not silently dropped' "$(grep -qF "$(printf '%s\t%s\t%s' "$AB_NWO" "$AB_NUM" "$SHA_B")" "$QUARANTINE_FILE"; echo $?)" "$(cat "$QUARANTINE_FILE")"
 check 'A is never quarantined' "$(! grep -qF "$(printf '%s\t%s\t%s' "$AB_NWO" "$AB_NUM" "$SHA_A")" "$QUARANTINE_FILE"; echo $?)"
+
+echo '# #184 finding 2 (round 5): an exact-sha-bound legacy artifact still must not promote unless it is a genuine, unmixed SHIP -- outcome-appropriateness, not sha-binding alone'
+
+# A FIX-FIRST review IS the reason the old daemon's separate agent-task ran; the new lifecycle
+# deliberately treats agent-task success as non-terminal (see the "a successful agent-task does not
+# complete the head" check above). If the exact-sha binding alone were sufficient, this exact-sha,
+# structurally-complete, non-foreign FIX-FIRST artifact would satisfy the old check and re-promote a
+# row the new lifecycle refuses to complete.
+FF_NWO=acme/probes; FF_NUM=9
+FF_SHA=9111111111111111111111111111111111111111
+FF_MARKER=pg-run-acme-probes-9-1700000800-1
+printf 'P0: none\nP1: none\nP2: none\nP3: none\nVERDICT: FIX-FIRST\n' > "$COMPLETED_DIR/$FF_MARKER"
+write_input_binding "$FF_MARKER" "$FF_SHA" "$FF_NWO" "$FF_NUM"   # exact-sha binding, otherwise valid
+append_clean_ledger_row "$FF_MARKER" "${FF_NWO//\//-}-${FF_NUM}" "$FF_NUM" "$COMPLETED_DIR/$FF_MARKER"
+: > "$LEGACY_FILE"; : > "$QUARANTINE_FILE"; : > "$STATE_FILE"
+printf '%s\t%s\t%s\n' "$FF_NWO" "$FF_NUM" "$FF_SHA" >> "$LEGACY_FILE"
+
+daemon_migrate_legacy_processed
+
+check 'sanity: the FIX-FIRST artifact is structurally a complete review (pg_is_review) with an exact-sha binding' "$(pg_is_review "$COMPLETED_DIR/$FF_MARKER"; echo $?)"
+check 'an exact-sha-bound legacy artifact whose verdict is FIX-FIRST (not SHIP) is quarantined, not promoted' "$(! already_done "$FF_NWO" "$FF_NUM" "$FF_SHA" && grep -qF "$(printf '%s\t%s\t%s' "$FF_NWO" "$FF_NUM" "$FF_SHA")" "$QUARANTINE_FILE"; echo $?)" "$(cat "$STATE_FILE") / $(cat "$QUARANTINE_FILE")"
+
+# A NEEDS-DISCUSSION review is the other non-terminal outcome; same requirement.
+ND_NWO=acme/probes; ND_NUM=10
+ND_SHA=9222222222222222222222222222222222222222
+ND_MARKER=pg-run-acme-probes-10-1700000900-1
+printf 'P0: none\nP1: none\nP2: none\nP3: none\nVERDICT: NEEDS-DISCUSSION\n' > "$COMPLETED_DIR/$ND_MARKER"
+write_input_binding "$ND_MARKER" "$ND_SHA" "$ND_NWO" "$ND_NUM"
+append_clean_ledger_row "$ND_MARKER" "${ND_NWO//\//-}-${ND_NUM}" "$ND_NUM" "$COMPLETED_DIR/$ND_MARKER"
+: > "$LEGACY_FILE"; : > "$QUARANTINE_FILE"; : > "$STATE_FILE"
+printf '%s\t%s\t%s\n' "$ND_NWO" "$ND_NUM" "$ND_SHA" >> "$LEGACY_FILE"
+
+daemon_migrate_legacy_processed
+
+check 'an exact-sha-bound legacy artifact whose verdict is NEEDS-DISCUSSION (not SHIP) is quarantined, not promoted' "$(! already_done "$ND_NWO" "$ND_NUM" "$ND_SHA" && grep -qF "$(printf '%s\t%s\t%s' "$ND_NWO" "$ND_NUM" "$ND_SHA")" "$QUARANTINE_FILE"; echo $?)" "$(cat "$STATE_FILE") / $(cat "$QUARANTINE_FILE")"
+
+# A foreign/mixed capture: structurally a complete SHIP review, exact-sha bound to OUR marker, but
+# its own trailing verdict line's "(run marker: ...)" annotation names a DIFFERENT marker --
+# pg_capture_foreign_echo (the SAME rejection oracle-review.sh's own live path applies at its own
+# read sites, e.g. oracle-review.sh:289,519,539) must reject it the same way here.
+FOREIGN_NWO=acme/probes; FOREIGN_NUM=11
+FOREIGN_SHA=9333333333333333333333333333333333333333
+FOREIGN_MARKER=pg-run-acme-probes-11-1700001000-1
+printf 'P0: none\nP1: none\nP2: none\nP3: none\nVERDICT: SHIP (run marker: pg-run-someone-elses-review-1)\n' > "$COMPLETED_DIR/$FOREIGN_MARKER"
+write_input_binding "$FOREIGN_MARKER" "$FOREIGN_SHA" "$FOREIGN_NWO" "$FOREIGN_NUM"
+append_clean_ledger_row "$FOREIGN_MARKER" "${FOREIGN_NWO//\//-}-${FOREIGN_NUM}" "$FOREIGN_NUM" "$COMPLETED_DIR/$FOREIGN_MARKER"
+: > "$LEGACY_FILE"; : > "$QUARANTINE_FILE"; : > "$STATE_FILE"
+printf '%s\t%s\t%s\n' "$FOREIGN_NWO" "$FOREIGN_NUM" "$FOREIGN_SHA" >> "$LEGACY_FILE"
+
+daemon_migrate_legacy_processed
+
+check 'sanity: the foreign-capture artifact DOES echo a foreign run-marker claim (pg_capture_foreign_echo non-empty)' "$([ -n "$(pg_capture_foreign_echo "$COMPLETED_DIR/$FOREIGN_MARKER" "$FOREIGN_MARKER")" ]; echo $?)" "$(pg_capture_foreign_echo "$COMPLETED_DIR/$FOREIGN_MARKER" "$FOREIGN_MARKER")"
+check 'an exact-sha-bound legacy artifact carrying a foreign/mixed verdict claim is quarantined, not promoted' "$(! already_done "$FOREIGN_NWO" "$FOREIGN_NUM" "$FOREIGN_SHA" && grep -qF "$(printf '%s\t%s\t%s' "$FOREIGN_NWO" "$FOREIGN_NUM" "$FOREIGN_SHA")" "$QUARANTINE_FILE"; echo $?)" "$(cat "$STATE_FILE") / $(cat "$QUARANTINE_FILE")"
+
+echo '# #184 finding 3 (round 5): round_key is a LOSSY composite (owner-repo-pr dashed together) -- two different repositories that collide on the same round_key string must never durable-evidence each others row, even sharing the same head sha'
+
+# "${nwo//\//-}-${num}" collapses "foo-bar/baz#1" and "foo/bar-baz#1" to the identical string
+# "foo-bar-baz-1" -- exactly the collision named in the finding.
+COLLIDE_NWO_A=foo-bar/baz; COLLIDE_NUM_A=1     # owner=foo-bar repo=baz
+COLLIDE_NWO_B=foo/bar-baz; COLLIDE_NUM_B=1     # owner=foo    repo=bar-baz
+check 'sanity: the two different (owner,repo) pairs collide on the SAME lossy round_key' "$([ "${COLLIDE_NWO_A//\//-}-${COLLIDE_NUM_A}" = "${COLLIDE_NWO_B//\//-}-${COLLIDE_NUM_B}" ]; echo $?)" "${COLLIDE_NWO_A//\//-}-${COLLIDE_NUM_A} vs ${COLLIDE_NWO_B//\//-}-${COLLIDE_NUM_B}"
+
+COLLIDE_SHA=9444444444444444444444444444444444444444   # the SAME sha on both rows, to isolate identity from sha
+COLLIDE_MARKER=pg-run-foo-bar-baz-1-1700001100-1
+printf 'P0: none\nP1: none\nP2: none\nP3: none\nVERDICT: SHIP\n' > "$COMPLETED_DIR/$COLLIDE_MARKER"
+write_input_binding "$COLLIDE_MARKER" "$COLLIDE_SHA" "$COLLIDE_NWO_A" "$COLLIDE_NUM_A"   # binding exists for A (owner=foo-bar) only
+append_clean_ledger_row "$COLLIDE_MARKER" "${COLLIDE_NWO_A//\//-}-${COLLIDE_NUM_A}" "$COLLIDE_NUM_A" "$COMPLETED_DIR/$COLLIDE_MARKER"
+
+: > "$LEGACY_FILE"; : > "$QUARANTINE_FILE"; : > "$STATE_FILE"
+printf '%s\t%s\t%s\n' "$COLLIDE_NWO_A" "$COLLIDE_NUM_A" "$COLLIDE_SHA" >> "$LEGACY_FILE"
+printf '%s\t%s\t%s\n' "$COLLIDE_NWO_B" "$COLLIDE_NUM_B" "$COLLIDE_SHA" >> "$LEGACY_FILE"   # different repo, SAME round_key, SAME sha
+
+daemon_migrate_legacy_processed
+
+check 'the genuinely-bound repository A promotes into the new ledger' "$(already_done "$COLLIDE_NWO_A" "$COLLIDE_NUM_A" "$COLLIDE_SHA"; echo $?)" "$(cat "$STATE_FILE")"
+check 'a DIFFERENT repository B sharing As lossy round_key and even the same sha does NOT promote off As review' "$(! already_done "$COLLIDE_NWO_B" "$COLLIDE_NUM_B" "$COLLIDE_SHA"; echo $?)" "$(cat "$STATE_FILE")"
+check 'B is quarantined rather than silently dropped' "$(grep -qF "$(printf '%s\t%s\t%s' "$COLLIDE_NWO_B" "$COLLIDE_NUM_B" "$COLLIDE_SHA")" "$QUARANTINE_FILE"; echo $?)" "$(cat "$QUARANTINE_FILE")"
 
 [ "$TEST_FAILURES" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$TEST_FAILURES FAILURES"; exit 1; }
