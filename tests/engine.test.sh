@@ -6495,7 +6495,7 @@ check 'gate #148 r3 P2: a live pid with a matching token still holds its guard' 
 DL_HOME="$TDIR/home-dirlock"; mkdir -p "$DL_HOME"
 
 # The pid/token shape pg_lock records is not the guard's owner.<pid> marker. Two readers
-# outside the reclaimer depend on it (st_inflight, pg_reservation_claim_live), so the shape
+# outside the reclaimer depend on it (st_inflight, pg_harvest_claimed), so the shape
 # stays and the reclaimer understands both.
 DL_DEAD="$DL_HOME/dead.lock.d"; mkdir -p "$DL_DEAD"
 sleep 0 & DL_DEAD_PID=$!; wait "$DL_DEAD_PID"       # a pid that has certainly exited
