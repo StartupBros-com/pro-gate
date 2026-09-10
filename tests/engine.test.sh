@@ -6536,11 +6536,61 @@ check '#155: a live pid/token owner survives a transient token read failure' \
   "rc=$DL_TOKFAIL_RC"
 
 # A torn record -- mkdir succeeded, the pid write did not -- is not a live claim, and the old
-# code could not reap it at all ("pg_lock cannot reap an empty-pid directory either").
+# code could not reap it at all ("pg_lock cannot reap an empty-pid directory either"). It is
+# reclaimable, but ONLY once the orphan grace has elapsed: see the pair below for why. The
+# v0.44.0 version of this case asserted immediate reclaim, which enshrined the very defect
+# rule 3 forbids -- a test that passes against the bug is worth less than no test.
 DL_TORN="$DL_HOME/torn.lock.d"; mkdir -p "$DL_TORN"; : > "$DL_TORN/pid"
-pg_dirlock_reclaim_dead "$DL_TORN"; DL_TORN_RC=$?
-check '#155: an empty pid record is reclaimed rather than wedging the lock forever' \
+( PRO_GATE_DIRLOCK_ORPHAN_GRACE=0; pg_dirlock_reclaim_dead "$DL_TORN" ); DL_TORN_RC=$?
+check '#155: an empty pid record past the orphan grace is reclaimed, not wedged forever' \
   "$([ "$DL_TORN_RC" -eq 0 ] && [ ! -d "$DL_TORN" ]; echo $?)" "rc=$DL_TORN_RC"
+
+# ── v0.44.0 regression: the torn record must not skip the orphan grace ────────────────────
+# pg_lock's winner runs `mkdir "$lockdir"` then `echo "$$" > "$lockdir/pid"`. The redirection
+# creates the file (O_CREAT|O_TRUNC) BEFORE writing into it, so a live winner is momentarily a
+# directory holding an EMPTY pid file -- and that is also the persistent state when the write
+# fails, since the call is `|| true`. v0.44.0 set had_marker=1 on the file merely existing,
+# which skipped rule 3's grace and made the winner's own directory reclaimable mid-write.
+# These two cases are the same live winner one syscall apart; both must be KEPT.
+DL_G1="$DL_HOME/grace-nofile.lock.d"; mkdir -p "$DL_G1"
+( PRO_GATE_DIRLOCK_ORPHAN_GRACE=300; pg_dirlock_reclaim_dead "$DL_G1" ); DL_G1_RC=$?
+check '#155 r2/v0.44.0: a just-created lock dir with no pid file yet is held by the grace' \
+  "$([ "$DL_G1_RC" -ne 0 ] && [ -d "$DL_G1" ]; echo $?)" "rc=$DL_G1_RC"
+
+DL_G2="$DL_HOME/grace-emptypid.lock.d"; mkdir -p "$DL_G2"; : > "$DL_G2/pid"
+( PRO_GATE_DIRLOCK_ORPHAN_GRACE=300; pg_dirlock_reclaim_dead "$DL_G2" ); DL_G2_RC=$?
+check '#155 r2/v0.44.0: an EMPTY pid file does not count as a marker and cannot skip the grace' \
+  "$([ "$DL_G2_RC" -ne 0 ] && [ -d "$DL_G2" ] && [ -e "$DL_G2/pid" ]; echo $?)" "rc=$DL_G2_RC"
+
+# ...and a real, live owner is still held on its own merits, not on the grace.
+DL_G3="$DL_HOME/grace-liveowner.lock.d"; mkdir -p "$DL_G3"
+printf '%s\n' "$$" > "$DL_G3/pid"; pg_pid_token "$$" > "$DL_G3/token"
+( PRO_GATE_DIRLOCK_ORPHAN_GRACE=0; pg_dirlock_reclaim_dead "$DL_G3" ); DL_G3_RC=$?
+check '#155 r2/v0.44.0: a live recorded owner is held even with the grace disabled' \
+  "$([ "$DL_G3_RC" -ne 0 ] && [ -d "$DL_G3" ]; echo $?)" "rc=$DL_G3_RC"
+
+# A SLOW winner that completes its record WHILE the reclaimer is deciding must keep the lock.
+# For the owner.<pid> shape the closing rmdir is itself this check -- the kernel refuses a
+# directory a contender has written into -- so the torn-record path must re-read the owner
+# rather than unlink it by name, which would discard that guarantee.
+#
+# The interleaving has to be forced, or the test passes for the wrong reason: the record is torn
+# at the first read, and the winner completes it before the reclaimer acts. Stretching
+# pg_dir_age_secs holds the window open long enough to be deterministic. Note the pid must be
+# written with NO token, and would still be held by the tokenless-legacy branch if it were seen
+# on the FIRST read -- it is not, which is what makes this the re-read's answer and not that one.
+DL_G4="$DL_HOME/grace-slowwinner.lock.d"; mkdir -p "$DL_G4"
+: > "$DL_G4/pid"                                   # torn at the moment the reclaimer looks
+( sleep 1; printf '%s\n' "$$" > "$DL_G4/pid" ) &   # the winner finishes mid-decision
+DL_G4_W=$!
+(
+  PRO_GATE_DIRLOCK_ORPHAN_GRACE=0
+  pg_dir_age_secs() { sleep 2; echo 999; }
+  pg_dirlock_reclaim_dead "$DL_G4"
+); DL_G4_RC=$?
+wait "$DL_G4_W" 2>/dev/null
+check '#155 r2/v0.44.0: a winner that completes its record mid-decision keeps the lock' \
+  "$([ "$DL_G4_RC" -ne 0 ] && [ -d "$DL_G4" ] && [ -s "$DL_G4/pid" ]; echo $?)" "rc=$DL_G4_RC"
 
 # The release must never take a REPLACEMENT. A holder reclaimed while it believed it held
 # the lock runs its exit handler against a path a live process now owns; rm -rf took it.
