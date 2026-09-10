@@ -178,48 +178,53 @@ check 'gate #148 r1 P2: daemon recovery passes an explicit PRO_REVIEW_ENGINE_TIM
   "$(grep -Fq -- '--timeout 7m' <<<"$RECOVER_CALL"; echo $?)" "call=$RECOVER_CALL"
 check 'explicit connector input is reused by guarded effect rechecks' "$(grep -F -- '--review-decision-effect' "$TYPED_ENGINE_CALLS" | grep -Fq -- '--input connector'; echo $?)"
 
-# A completed agent task uses the same processed.tsv behavior as a completed review worker. Its
-# failure/unavailable outcomes, and every non-agent action, remain retryable and budget-neutral.
+# #184: completion requires a typed current-head outcome, not a subprocess exit code. A successful
+# agent task is progress -- it never marks the SHA. A completed run-granted-review worker, and a
+# report-only stop-without-new-review decision, are the only two outcomes that complete it. Every
+# other action, and agent-task failure/unavailable outcomes, remain retryable and budget-neutral.
+# CI is reported settled (empty rollup) throughout this block; #184's own CI-gate/deferral-cap and
+# agent-task-attempt-cap coverage lives in tests/daemon-current-head-completion.test.sh.
 PROCESS_REPO="$TYPED_HOME/process-repo"; mkdir -p "$PROCESS_REPO/.git"
 PROCESS_SHA=1111111111111111111111111111111111111111
-PROCESS_NEW_SHA="$PROCESS_SHA"
 find_repo(){ printf '%s\n' "$PROCESS_REPO"; }
 git(){
   if [ "${1:-}" = -C ] && [ "${3:-}" = worktree ] && [ "${4:-}" = add ]; then mkdir -p "$6"; fi
   return 0
 }
 gh(){
-  [ "${1:-}" = pr ] && [ "${2:-}" = view ] && { printf '%s\n' "$PROCESS_NEW_SHA"; return 0; }
+  [ "${1:-}" = pr ] && [ "${2:-}" = view ] && { printf '{"statusCheckRollup":[]}\n'; return 0; }
   return 1
 }
 runtime_gate(){ return 0; }
 PROCESS_AGENT_RC=0
 daemon_run_agent_task(){ AGENT_TASKS=$((AGENT_TASKS + 1)); return "$PROCESS_AGENT_RC"; }
 PROCESS_DECISION="$TYPED_HOME/process-agent.json"; typed_decision 3 "$PROCESS_DECISION"
-: > "$TYPED_STATE"; : > "$TYPED_FAILS"
+: > "$TYPED_STATE"; : > "$TYPED_FAILS"; : > "$TYPED_HOME/agent-task-attempts.tsv"
 MOCK_FRESH="$PROCESS_DECISION" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
-check 'successful no-push fix task marks its SHA and is skipped next poll' "$([ "$process_rc" -eq 0 ] && already_done acme/widgets 1983 "$PROCESS_SHA" && [ "$(wc -l < "$TYPED_STATE")" -eq 1 ]; echo $?)" "rc=$process_rc state=$(wc -l < "$TYPED_STATE")"
+check 'successful fix agent task does not mark its SHA and is retried next poll' "$([ "$process_rc" -eq 0 ] && ! already_done acme/widgets 1983 "$PROCESS_SHA" && [ ! -s "$TYPED_STATE" ]; echo $?)" "rc=$process_rc state=$(wc -l < "$TYPED_STATE")"
+check 'successful agent task counts toward its bounded no-progress attempt cap' "$([ "$(wc -l < "$TYPED_HOME/agent-task-attempts.tsv")" -eq 1 ]; echo $?)" "attempts=$(cat "$TYPED_HOME/agent-task-attempts.tsv")"
 PROCESS_PREPARE_DECISION="$TYPED_HOME/process-prepare.json"; typed_decision 4 "$PROCESS_PREPARE_DECISION"
-: > "$TYPED_STATE"; : > "$TYPED_FAILS"
+: > "$TYPED_STATE"; : > "$TYPED_FAILS"; : > "$TYPED_HOME/agent-task-attempts.tsv"
 MOCK_FRESH="$PROCESS_PREPARE_DECISION" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
-check 'successful no-push evidence task marks its SHA and is skipped next poll' "$([ "$process_rc" -eq 0 ] && already_done acme/widgets 1983 "$PROCESS_SHA" && [ "$(wc -l < "$TYPED_STATE")" -eq 1 ]; echo $?)" "rc=$process_rc state=$(wc -l < "$TYPED_STATE")"
-PROCESS_NEW_SHA=2222222222222222222222222222222222222222
-: > "$TYPED_STATE"; : > "$TYPED_FAILS"
-MOCK_FRESH="$PROCESS_DECISION" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
-check 'successful pushed agent task marks original and new heads' "$([ "$process_rc" -eq 0 ] && already_done acme/widgets 1983 "$PROCESS_SHA" && already_done acme/widgets 1983 "$PROCESS_NEW_SHA" && [ "$(wc -l < "$TYPED_STATE")" -eq 2 ]; echo $?)" "rc=$process_rc state=$(wc -l < "$TYPED_STATE")"
+check 'successful evidence-prep agent task does not mark its SHA and is retried next poll' "$([ "$process_rc" -eq 0 ] && ! already_done acme/widgets 1983 "$PROCESS_SHA" && [ ! -s "$TYPED_STATE" ]; echo $?)" "rc=$process_rc state=$(wc -l < "$TYPED_STATE")"
 for PROCESS_AGENT_RC in 1 2; do
-  : > "$TYPED_STATE"; : > "$TYPED_FAILS"
+  : > "$TYPED_STATE"; : > "$TYPED_FAILS"; : > "$TYPED_HOME/agent-task-attempts.tsv"
   MOCK_FRESH="$PROCESS_DECISION" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
   check "agent task rc=$PROCESS_AGENT_RC stays retryable without a failure-budget row" "$([ "$process_rc" -eq "$PROCESS_AGENT_RC" ] && [ ! -s "$TYPED_STATE" ] && [ ! -s "$TYPED_FAILS" ]; echo $?)" "rc=$process_rc processed=$(wc -c < "$TYPED_STATE") failures=$(wc -c < "$TYPED_FAILS")"
 done
 PROCESS_AGENT_RC=0
-for action in collect-existing-result recover-existing-review stop-without-new-review allow-existing-merge-workflow ask-named-product-choice; do
+for action in collect-existing-result recover-existing-review allow-existing-merge-workflow ask-named-product-choice; do
   index="$(jq -r --arg action "$action" '.cases | to_entries[] | select(.value.expected.action == $action) | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
   decision="$TYPED_HOME/process-$action.json"; typed_decision "$index" "$decision"
   : > "$TYPED_STATE"; : > "$TYPED_FAILS"
   MOCK_FRESH="$decision" MOCK_RECOVERED="$TYPED_HOME/process-recovered" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
   check "$action does not mark a processed SHA or failure budget" "$([ "$process_rc" -eq 0 ] && [ ! -s "$TYPED_STATE" ] && [ ! -s "$TYPED_FAILS" ]; echo $?)" "rc=$process_rc processed=$(wc -c < "$TYPED_STATE") failures=$(wc -c < "$TYPED_FAILS")"
 done
+STOP_INDEX="$(jq -r '.cases | to_entries[] | select(.value.expected.action == "stop-without-new-review") | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
+STOP_DECISION="$TYPED_HOME/process-stop.json"; typed_decision "$STOP_INDEX" "$STOP_DECISION"
+: > "$TYPED_STATE"; : > "$TYPED_FAILS"
+MOCK_FRESH="$STOP_DECISION" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
+check 'report-only stop-without-new-review completes the current head' "$([ "$process_rc" -eq 0 ] && already_done acme/widgets 1983 "$PROCESS_SHA" && [ "$(wc -l < "$TYPED_STATE")" -eq 1 ]; echo $?)" "rc=$process_rc state=$(wc -l < "$TYPED_STATE")"
 # Observation is progress only: it reports, but never changes action selection or prompts.
 typed_decision 2 "$TYPED_HOME/observed-base.json"
 observed_facts="$(jq -cS '.facts | .observation.kind="waiting"' "$TYPED_HOME/observed-base.json")"

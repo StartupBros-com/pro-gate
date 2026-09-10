@@ -126,7 +126,8 @@ daemon_handle_review_worker_failure(){ # worker-rc; fresh typed decision decides
 daemon_dispatch_decision(){ # decision-file [redirect-depth]
   local decision="$1" depth="${2:-0}" action class ref fresh fresh_action fresh_ref agent_rc recover_timeout
   DAEMON_DISPATCH_REVIEW_RAN=0
-  DAEMON_DISPATCH_AGENT_TASK_COMPLETED=0
+  DAEMON_DISPATCH_AGENT_TASK_RAN=0
+  DAEMON_DISPATCH_TERMINAL_COMPLETED=0
   daemon_decision_valid "$decision" && daemon_decision_target_matches "$decision" "$DD_NWO" "$DD_NUM" "$DD_SHA" || {
     daemon_defer_decision "missing, malformed, stale, unknown, or corpus-mismatched envelope"
     return 2
@@ -171,14 +172,17 @@ daemon_dispatch_decision(){ # decision-file [redirect-depth]
       fi
       return 0 ;;
     agent-task/fix-review-findings|agent-task/prepare-matching-review-evidence)
+      # #184c: a successful agent-task process is progress (a fix or evidence-prep run), not a
+      # typed terminal-review receipt for the current head. It must never complete the SHA here --
+      # process_pr only counts the attempt (agent_task_attempt_count) toward its own bounded cap.
+      DAEMON_DISPATCH_AGENT_TASK_RAN=1
       daemon_run_agent_task "$decision" "$action"
-      agent_rc=$?
-      if [ "$agent_rc" -eq 0 ]; then
-        DAEMON_DISPATCH_AGENT_TASK_COMPLETED=1
-      fi
-      return "$agent_rc" ;;
+      return $? ;;
     report-only/stop-without-new-review)
-      daemon_note "  · $DD_NWO#$DD_NUM stopped by runtime decision; no review worker, SHA completion, or failure-budget charge"
+      # A terminal report-only decision: the runtime has typed this current head as needing no
+      # further review work. That IS a valid current-head outcome, so it completes the SHA.
+      DAEMON_DISPATCH_TERMINAL_COMPLETED=1
+      daemon_note "  · $DD_NWO#$DD_NUM stopped by runtime decision; no review worker or failure-budget charge, current head completes"
       return 0 ;;
     report-only/allow-existing-merge-workflow)
       daemon_note "  · $DD_NWO#$DD_NUM has a runtime-reported merge-workflow handoff; daemon reports only and never merges"
@@ -244,9 +248,11 @@ DAEMON_START_STAMP="$(cat "$DAEMON_STAMP_FILE" 2>/dev/null || true)"
 ROOT="$PRO_GATE_HOME"
 STATE="$ROOT/processed.tsv"          # repo<TAB>pr<TAB>sha  (idempotency)
 FAILS="$ROOT/failcount.tsv"          # repo<TAB>pr<TAB>sha  (one line per failed attempt)
+CIDEFER="$ROOT/ci-defer.tsv"         # repo<TAB>pr<TAB>sha  (CI-not-settled deferral count; #184)
+AGENTCAP="$ROOT/agent-task-attempts.tsv"  # repo<TAB>pr<TAB>sha (agent-task dispatch count with no head progress; #184)
 LOGDIR="$ROOT/logs"; mkdir -p "$LOGDIR"
 PAUSE="$ROOT/PAUSE"
-touch "$STATE" "$FAILS"
+touch "$STATE" "$FAILS" "$CIDEFER" "$AGENTCAP"
 
 OWNERS="${PRO_REVIEW_OWNERS:-}"                          # space-separated gh owners to watch (REQUIRED)
 POLL="${PRO_REVIEW_POLL_SECONDS:-180}"
@@ -255,6 +261,12 @@ CLAUDE_MODEL="${PRO_REVIEW_CLAUDE_MODEL:-sonnet}"
 FALLBACK_MODEL="${PRO_REVIEW_FALLBACK_MODEL:-haiku}"
 MAX_BUDGET="${PRO_REVIEW_MAX_BUDGET_USD:-5}"
 MAX_FAILS="${PRO_REVIEW_MAX_FAILS:-3}"
+# #184: two bounded per-(repo,pr,sha) counters, deliberately separate from MAX_FAILS/FAILS above
+# (those count wrapper-orchestration failures; these count deferrals/attempts that are not
+# failures). Each caps a specific stall so a PR cannot strand forever: a check stuck pending, or a
+# decision that keeps returning the same agent-task with no head progress.
+CI_DEFER_MAX="${PRO_REVIEW_CI_DEFER_MAX:-20}"
+AGENT_TASK_MAX="${PRO_REVIEW_AGENT_TASK_MAX:-5}"
 CDP_PORT="${ORACLE_BROWSER_PORT:-9222}"
 REPOS_DIR="${PRO_GATE_REPOS_DIR:-$HOME/SITES}"
 ALL_PRS="${PRO_REVIEW_ALL_PRS:-0}"                      # 1 = review ALL open non-draft PRs in OWNERS (not just `pro-review`-labeled)
@@ -312,12 +324,14 @@ session_up(){
 
 already_done(){ grep -qF "$(printf '%s\t%s\t%s' "$1" "$2" "$3")" "$STATE"; }
 mark_done(){ printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$STATE"; }
-mark_processed_heads(){ # nwo num original-sha
-  local nwo="$1" num="$2" sha="$3" newsha
-  mark_done "$nwo" "$num" "$sha"
-  newsha=$(gh pr view "$num" -R "$nwo" --json headRefOid -q .headRefOid 2>/dev/null)
-  [ -n "$newsha" ] && [ "$newsha" != "$sha" ] && mark_done "$nwo" "$num" "$newsha"
-  printf '%s' "$newsha"
+mark_processed_heads(){ # nwo num reviewed-sha
+  # #184b: mark ONLY the SHA a valid typed decision proved was reviewed (daemon_decision_target_matches
+  # already checked it against the decision's head_oid before dispatch). Do not also look up and mark
+  # whatever SHA `gh pr view` reports now -- a worker self-push and an external push both produce a
+  # head this run never proved was reviewed. The runtime's own review-decision (prior_review binding +
+  # round governor) is the dedupe authority for that changed head on the next cycle; the local ledger
+  # must not pre-consume it.
+  mark_done "$1" "$2" "$3"
 }
 
 # Count a failed attempt for repo#pr@sha (ANY failure class: clone, worktree, claude run) and
@@ -337,6 +351,49 @@ note_fail(){ # nwo num sha log reason
   fi
 }
 
+# #184: agent-task dispatches (fix-review-findings / prepare-matching-review-evidence) no longer
+# self-complete the SHA (see daemon_dispatch_decision / process_pr below) -- a decision that keeps
+# returning the same agent-task for an UNCHANGED sha would otherwise loop forever. Count every
+# dispatch of an agent-task for a given (repo,pr,sha); a real push advances the sha and the counter
+# for the new sha starts fresh, so this only bounds genuine no-progress loops.
+agent_task_attempt_count(){ # nwo num sha -> increments and echoes the new count
+  printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$AGENTCAP"
+  grep -cF "$(printf '%s\t%s\t%s' "$1" "$2" "$3")" "$AGENTCAP" 2>/dev/null || echo 1
+}
+
+# #184a: CI-readiness gate. QUEUED/IN_PROGRESS/PENDING on the CURRENT head is a deferral, never
+# completed work; an empty rollup means no checks are configured for this repo and counts as
+# settled (never a permanent block). A `gh` query failure is treated the same as not-settled --
+# fail closed rather than dispatch a worker against an unknown CI state.
+ci_rollup_state(){ # nwo num -> "settled", "query-failed", or the first unsettled status token
+  local nwo="$1" num="$2" rollup
+  rollup=$(gh pr view "$num" -R "$nwo" --json statusCheckRollup 2>/dev/null) || { echo "query-failed"; return; }
+  printf '%s' "$rollup" | jq -r '
+    ([.statusCheckRollup[]? | (.status // .state // "UNKNOWN")]
+      | map(select(. == "QUEUED" or . == "IN_PROGRESS" or . == "PENDING"))
+      | .[0]) // "settled"
+  ' 2>/dev/null || echo "query-failed"
+}
+# Bound the deferral with the same per-(repo,pr,sha) ledger shape as $FAILS, so a check stuck
+# pending (or a `gh` outage) forever cannot strand the PR -- after $CI_DEFER_MAX attempts, proceed
+# once with a logged notice instead of deferring again.
+ci_defer_count(){ # nwo num sha -> increments and echoes the new count
+  printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$CIDEFER"
+  grep -cF "$(printf '%s\t%s\t%s' "$1" "$2" "$3")" "$CIDEFER" 2>/dev/null || echo 1
+}
+ci_ready(){ # nwo num sha -> 0 = proceed, 1 = defer (retryable, nothing marked)
+  local nwo="$1" num="$2" sha="$3" state n
+  state="$(ci_rollup_state "$nwo" "$num")"
+  [ "$state" = "settled" ] && return 0
+  n="$(ci_defer_count "$nwo" "$num" "$sha")"
+  if [ "$n" -lt "$CI_DEFER_MAX" ]; then
+    log "  · $nwo#$num @ ${sha:0:8} CI not settled ($state); deferring without marking done (attempt $n/$CI_DEFER_MAX)"
+    return 1
+  fi
+  log "  · $nwo#$num @ ${sha:0:8} CI still $state after $n attempts; proceeding once (deferral cap reached)"
+  return 0
+}
+
 # --- find a local checkout of owner/repo ------------------------------------
 find_repo(){
   local nwo="$1" name="${1##*/}"
@@ -353,6 +410,11 @@ find_repo(){
 process_pr(){
   local nwo="$1" num="$2" sha="$3" branch="$4" url="$5"
   local slug="${nwo//\//-}-${num}"
+
+  # #184a: gate dispatch on the current head's CI state before doing ANY work for it (clone,
+  # worktree, decision query, worker). Not settled -> retryable defer, nothing marked.
+  ci_ready "$nwo" "$num" "$sha" || return 2
+
   local repodir; repodir="$(find_repo "$nwo")"
   if [ -z "$repodir" ]; then
     if [ "$AUTOCLONE" = "1" ]; then
@@ -395,18 +457,27 @@ process_pr(){
   fi
   DD_ENGINE="$engine" DD_DECISION="$decision" DD_NWO="$nwo" DD_NUM="$num" DD_SHA="$sha" DD_WORKTREE="$wt" DD_LOG="$lg"
   daemon_dispatch_decision "$decision"
-  local rc=$? review_ran="${DAEMON_DISPATCH_REVIEW_RAN:-0}" agent_task_completed="${DAEMON_DISPATCH_AGENT_TASK_COMPLETED:-0}"
+  local rc=$? review_ran="${DAEMON_DISPATCH_REVIEW_RAN:-0}" agent_task_ran="${DAEMON_DISPATCH_AGENT_TASK_RAN:-0}" terminal_completed="${DAEMON_DISPATCH_TERMINAL_COMPLETED:-0}"
 
-  # Only a run-granted-review worker participates in the existing wrapper failure budget. A
-  # successful typed agent task also completes this SHA: it either made the required fix/evidence
-  # progress or reported that none was needed. Its unavailable/nonzero states remain retryable and
-  # never consume that review-worker budget. Collection, recovery, reports, choices, stale effects,
-  # and incompatible envelopes leave the completion ledger untouched.
+  # Only a run-granted-review worker participates in the existing wrapper failure budget.
+  # Completion of the current-head SHA (#184b/c) requires a typed terminal-review outcome, never a
+  # bare exit code: a run-granted-review worker that completed, or a report-only
+  # stop-without-new-review decision. A successful typed agent task is progress, not a receipt --
+  # it never completes the SHA; it only counts toward its own bounded no-progress attempt cap so a
+  # decision that keeps returning the same agent-task for this unchanged sha cannot loop forever.
+  # Collection, recovery, other reports, choices, stale effects, and incompatible envelopes leave
+  # the completion ledger untouched.
   if [ "$review_ran" != 1 ]; then
     git -C "$repodir" worktree remove --force "$wt" 2>/dev/null || true
-    if [ "$agent_task_completed" = 1 ] && [ "$rc" -eq 0 ]; then
-      local newsha; newsha="$(mark_processed_heads "$nwo" "$num" "$sha")"
-      log "  ✓ typed agent task completed $nwo#$num (head now ${newsha:0:8})"
+    if [ "$agent_task_ran" = 1 ]; then
+      local attempts; attempts="$(agent_task_attempt_count "$nwo" "$num" "$sha")"
+      if [ "$attempts" -ge "$AGENT_TASK_MAX" ]; then
+        log "  ✗ $nwo#$num @ ${sha:0:8} agent task dispatched ${attempts}x with no head progress — giving up (marking done; re-push to retry)."
+        mark_done "$nwo" "$num" "$sha"
+      fi
+    elif [ "$terminal_completed" = 1 ] && [ "$rc" -eq 0 ]; then
+      mark_processed_heads "$nwo" "$num" "$sha"
+      log "  ✓ terminal decision completed $nwo#$num @ ${sha:0:8}"
     fi
     return "$rc"
   fi
@@ -418,10 +489,11 @@ process_pr(){
   fi
 
   git -C "$repodir" worktree remove --force "$wt" 2>/dev/null || true
-  # The worker may push an implementation after the runtime-selected review. Preserve the old
-  # self-push idempotency behavior without granting merge authority.
-  local newsha; newsha="$(mark_processed_heads "$nwo" "$num" "$sha")"
-  log "  ✓ runtime-selected review worker completed $nwo#$num (head now ${newsha:0:8})"
+  # Mark only the SHA this decision proved was reviewed (#184b). The worker may still push an
+  # implementation after the runtime-selected review, but that produces an unreviewed head; the
+  # runtime's own review-decision is the dedupe authority for it on the next cycle.
+  mark_processed_heads "$nwo" "$num" "$sha"
+  log "  ✓ runtime-selected review worker completed $nwo#$num @ ${sha:0:8}"
 }
 
 # Test seam: source all daemon functions and setup, with no startup watch loop.
