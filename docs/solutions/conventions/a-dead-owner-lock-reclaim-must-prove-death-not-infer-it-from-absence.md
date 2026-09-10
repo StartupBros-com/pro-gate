@@ -2,7 +2,7 @@
 title: "A dead-owner lock reclaim must prove death, not infer it from absence"
 module: "pro-gate"
 date: "2026-09-08"
-last_updated: "2026-09-09"
+last_updated: "2026-09-10"
 category: "conventions"
 problem_type: "design_pattern"
 component: "development_workflow"
@@ -12,6 +12,7 @@ applies_when:
   - "a liveness check can transiently fail to read process state (/proc, ps) for a process that is genuinely still alive"
   - "a lock's marker write happens after its directory create, leaving a window where the directory exists but is not yet attributable to an owner"
   - "extracting a shared timeout or config helper for one call site while a sibling call site keeps its own duplicated literal"
+  - "extending an existing guard to a second on-disk shape, so a rule already enforced for the first shape is re-decided by a new predicate"
 symptoms:
   - "a reclaimed lock directory ends up simultaneously marked by two owners (owner.1111 and owner.2222 both present)"
   - "acquire spins at 100% CPU past its own configured wait bound when mkdir fails for a reason other than EEXIST"
@@ -63,6 +64,15 @@ that tolerates pid reuse, an orphan grace so a live contender is not reclaimed b
 its marker, and removal that can never touch a replacement directory; every one of those was gotten
 wrong at least once, in six consecutive review rounds." Those are the four rules below.
 
+**Update, 2026-09-10 — the deferral is over, and the deferred mechanism promptly broke rule 1 again.**
+The two paragraphs above describe the tree as it stood with PR #178 open. Since then the helper
+shipped and spread: v0.43.0 (#182) landed `pg_dirlock_reclaim_dead` for the reservation guard, and
+v0.44.0 (#183) moved `pg_lock` and `pg_lock_n` onto the same helper so all three no-flock lock sites
+answer "is this owner really gone?" once rather than three times. v0.44.0 also **re-opened rule 1**
+in the act of extending it, and v0.44.1 (#188) closed it. The recurrence is recorded under rule 1;
+the test that was supposed to catch it, and did not, is recorded in the "test that cannot fail"
+section. Read the rules below as live constraints on shipped code, not as a rationale for deferring.
+
 PR #148 set out to add self-healing here -- reclaim a guard directory whose owner process died.
 That work would not converge: per the PR #178 commit message that eventually split it out, "six
 consecutive review rounds each found a NEW defect here, twice because a fix introduced the next
@@ -111,13 +121,51 @@ before (asserted safe, not actually safe):
   for f in "$lockdir"/owner.*; do ...; done   # no markers found -> straight to rmdir
   rmdir "$lockdir" 2>/dev/null || [ ! -d "$lockdir" ]
 
-after (pending, PR #178):
+after (shipped in v0.43.0, #182):
   # no markers found -> only reclaim once the directory is older than the grace window
   age="$(pg_dir_age_secs "$lockdir")" || return 1
   [ "$age" -ge "$grace" ] || return 1
   rmdir "$lockdir" ...
   # acquirer side: publish the marker, then confirm owner count == 1 before reporting a hold
 ```
+
+**The recurrence: a second on-disk shape re-decided "is it marked?" and lost the rule again
+(v0.44.0, #183; fixed in v0.44.1, #188).**
+
+Extending the helper to `pg_lock`/`pg_lock_n` meant teaching it a second owner shape — a `pid` file
+beside a `token` file, rather than an `owner.<pid>` marker. Rule 1 was never edited and its comment
+still read correctly. What changed was the *predicate that decides whether the rule applies*: the new
+branch set `had_marker=1` the instant `[ -e "$lockdir/pid" ]` was true, without looking inside the
+file. But a winner runs `mkdir "$lockdir"` and then `echo "$$" > "$lockdir/pid"`, and the shell's
+redirection opens that file with `O_CREAT|O_TRUNC` **before** the write lands. "Exists but empty" is
+therefore a state every live winner passes through — so the grace was skipped for exactly the window
+it exists to protect. It is also the *persistent* state when the write fails at all, since the call
+is `|| true`, which quietly turns a full disk into a lock that provides no mutual exclusion.
+
+Measured against the shipped v0.44.0 library, both directories brand new:
+
+```
+A. mkdir done, pid file not yet created   -> KEPT     (grace protects it)
+B. pid file created, not yet written into -> REMOVED  (same live winner, one syscall later)
+```
+
+The fix is not a new rule but a narrower predicate: an empty or non-numeric record leaves
+`had_marker` at 0 so the existing grace still governs it, and `had_marker=1` is set only inside the
+branch that confirmed an actual numeric pid (`lib/pro-gate-lib.sh`, `pg_dirlock_reclaim_dead`).
+Past the grace the record is still cleared, so the empty-record cleanup path stays.
+
+The transferable shape: **a rule is only as strong as the predicate that decides it applies.** Adding
+a second representation of the same concept re-asks "does this rule apply here?" in new code, far
+from the rule's own comment, and that new answer is where an invariant silently lapses. When
+extending a guard to a second shape, re-derive each existing rule against the new shape explicitly
+rather than assuming the rule travels with the function.
+
+A second, smaller instance of rule 4 arrived in the *fix* for this one and was caught by adversarial
+review before release: the new post-grace re-read was written
+`pid="$(cat "$lockdir/pid" 2>/dev/null || true)"`, which reports a genuinely empty record and a
+*failed read* as the same empty string, and then unlinks. Dropping `|| true` separates them — `cat`
+on an empty file succeeds and yields `""`, while a failed `cat` exits non-zero and holds the lock.
+This is rule 4 landing in the one branch that unlinks another process's claim.
 
 ### 2. Absence is not success
 
@@ -229,11 +277,57 @@ one-sided pair where only the negative case is vacuous still leaves the suite re
 gets fixed and the silent half ships. Both were moved above the stub and now additionally require a
 non-empty prompt file.
 
-The rule both cases converge on is the same one this document's four rules rest on: a test proves
+**The sharpest variant: the assertion IS the defect (2026-09-10).** The two cases above pass for a
+reason unrelated to what they claim. A third shape is worse, because nothing about it looks vacuous:
+the assertion is specific, it exercises the real function, and it is precisely wrong. v0.44.0 (#183)
+shipped, alongside the rule-1 recurrence described earlier, a case named `#155: an empty pid record
+is reclaimed rather than wedging the lock forever`, asserting that a brand-new lock directory holding
+an empty `pid` file is reclaimed **immediately** — rc 0, directory gone, no grace applied. That is a
+verbatim statement of the bug. The defect and its coverage were the same sentence, so the engine
+suite reported **1138/1138** and carried no information at all about the most severe defect in the
+change. The v0.44.1 fix had to rewrite the assertion, not only the code.
+
+The tell is not vacuity, it is provenance: the assertion was derived from *what the patched code did*
+rather than from the rule the function documents four screens above it. Restate the invariant in
+prose without mentioning the implementation, then check the assertion says that. Rule 1 says an
+unmarked directory is reclaimable only past the grace; "an empty pid record is reclaimed immediately"
+contradicts it in plain English, which is visible without running anything.
+
+**A soak test is not evidence for a narrow window.** A 12-worker end-to-end probe driving the real
+acquire/release cycle passed clean against the *buggy* v0.44.0 library — all 12 entered, zero
+overlap, lock released. The window is two syscalls wide, so stochastic contention essentially never
+lands in it. Unit-green and stress-green are the two signals most reach for to trust a locking fix,
+and here both were silent. Construct the state directly and ask the function what it does with it.
+
+**Distinguish a regression test from a control, and keep both.** Running the block verbatim against
+four libraries — the fix, v0.44.0, one with the post-grace re-read replaced by an unconditional
+unlink, and one with `|| true` restored on that re-read — each new assertion failed against at least
+one variant, and the one isolating the read-failure guard failed against three:
+
+| assertion | fixed | v0.44.0 | re-check reverted | `\|\| true` restored |
+|---|---|---|---|---|
+| an EMPTY pid file cannot skip the grace | PASS | FAIL | PASS | PASS |
+| a winner completing mid-decision keeps the lock | PASS | FAIL | FAIL | PASS |
+| a failed re-read holds the lock | PASS | FAIL | FAIL | FAIL |
+
+Two further cases passed against all four. That is not weakness — they are controls proving the fix
+did not overshoot by removing the grace or applying it to a genuinely live owner. A concurrency fix
+wants both: assertions that separate it from every plausible partial revert, and controls that prove
+it did not overcorrect. Label them, and do not mistake a control for a failed regression test.
+
+**Inject an interleaving; do not race it.** The first rewrite of the "winner completes mid-decision"
+case backgrounded a writer behind `sleep 1` against a stub sleeping 2, with nothing ordering either
+against the reclaimer's first read — flaky in both directions: an early write returned "held" via an
+unrelated tokenless-legacy branch, satisfying every assertion while the code under test never ran; a
+late write failed correct code. `pg_dir_age_secs` is called exactly once, between the two reads, so
+performing the write inside that stub pins the interleaving to the only point that exercises the
+re-read. Deterministic, no sleeps; verified stable over 12 consecutive runs.
+
+The rule all these cases converge on is the same one this document's four rules rest on: a test proves
 nothing unless it fails against code that lacks the behaviour. That is cheap to establish and almost
 never done — `git show <base>:<path>` into a scratch copy, run the new assertion against it, and
 confirm it goes red before trusting it green. Every regression accompanying the four rules above was
-established that way; the two vacuous checks were not, until a later round caught them.
+established that way; the vacuous checks were not, until a later round caught them.
 
 ## Why This Matters
 

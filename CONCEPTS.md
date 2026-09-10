@@ -18,6 +18,12 @@ The serialization that makes recording a Reservation and deciding review capacit
 
 Where the host offers no kernel-level file lock, the guard falls back to a directory it creates and removes. That fallback needs its own answer to a question the kernel otherwise settles — whether a directory left behind belongs to a process that is still running — and answering it wrongly is how two holders end up inside a guard whose entire purpose is that there is only ever one.
 
+### Orphan Grace
+
+The waiting period that separates "nobody has claimed this yet" from "the claimant is gone". Taking a directory-based lock and recording who holds it are two steps, so between them the lock exists while naming no owner — a state a live winner passes through and an interrupted one stays in forever. The grace is the age past which the second reading is the only one left: long enough that a running claimant always finishes recording itself within it, short enough that an abandoned lock clears on its own.
+
+It answers a different question from the liveness check a Reservation Guard's fallback performs, and the two are easy to conflate. Liveness asks whether a *named* owner still exists; the grace applies precisely when there is no name to ask about. Treating an unnamed lock as abandoned on sight deletes the winner's lock while it is still being written, and a replacement then admits a second holder — so whatever decides that a lock counts as claimed governs this rule, and any new way of recording a holder re-decides it.
+
 ### Applicability
 
 Whether review evidence still describes the current target. Applicability is independent of whether the attempt completed: finished evidence may be stale, while unfinished evidence may stop applying after the target moves or closes.
@@ -56,6 +62,7 @@ The engine appends its own output contract after a brief, so a brief chooses the
 
 - A Review Attempt may own one Reservation; Exact Recovery resumes that same attempt.
 - A Reservation Guard serializes the recording of a Reservation against the capacity decision that reads it; it is not itself capacity, and it is held for far less time than a Reservation.
+- The Orphan Grace governs a Reservation Guard's lockless fallback only, and covers the window before an owner is recorded; the liveness check covers every moment after.
 - A Terminal Disposition or Supersession can release a Reservation's capacity without deleting the attempt's audit history.
 - Applicability is an input to the Review Decision, not a synonym for completion.
 - Input Policy constrains evidence delivery before a Review Attempt can be submitted.
