@@ -431,12 +431,16 @@ run_slot_guard_bound_tests() {
   # A short but non-zero budget proves the loop really waits and then STOPS: the guard is retried
   # across several slices (each `sleep 3`) and the run still ends inside its own budget. Counting
   # guard attempts is what separates "bounded" from "expired before it ever looped".
+  # The budget is 13s rather than the 7s that would already demonstrate this, so the asserted floor
+  # of 3 attempts keeps real margin: 13s yields 6 observed attempts on an idle box and still clears
+  # 3 if every slice takes four times as long on a loaded runner. A floor one attempt below the
+  # expected count is a flake waiting for a slow CI runner.
   guard_home="$TDIR/home-slot-guard-short"; mkdir -p "$guard_home"
   : > "$guard_log"; : > "$guard_sentinel"
   guard_started="$(date +%s)"
   env HOME="$guard_user" PRO_GATE_HOME="$guard_home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
     PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
-    PRO_GATE_LOCK_WAIT=7 PRO_GATE_TIMEOUT=23s PRO_GATE_TIMEOUT_GRACE=5 \
+    PRO_GATE_LOCK_WAIT=13 PRO_GATE_TIMEOUT=23s PRO_GATE_TIMEOUT_GRACE=5 \
     PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_ORACLE_SENTINEL="$guard_sentinel" \
     PG_TEST_FLOCK_LOG="$guard_log" PG_TEST_FAIL_RESERVATION_GUARD=1 PATH="$guard_path" NODE_OPTIONS= \
     "$REAL_TIMEOUT" 120s bash "$ENGINE" --diff "$guard_diff" --repo "$TDIR" --out "$guard_home/review.md" \
@@ -446,7 +450,7 @@ run_slot_guard_bound_tests() {
   guard_attempts="$(grep -c '/in-progress\.lock$' "$guard_log" 2>/dev/null || echo 0)"
   check '#179 slot-guard-bound: a short budget retries the guard across slices and still expires' \
     "$([ "$RC" -eq 7 ] && [ "$guard_elapsed" -lt 120 ] && [ "${guard_attempts:-0}" -ge 3 ] \
-       && [ ! -s "$guard_sentinel" ] && grep -Fq 'timed out after 7s' "$TDIR/stderr"; echo $?)" \
+       && [ ! -s "$guard_sentinel" ] && grep -Fq 'timed out after 13s' "$TDIR/stderr"; echo $?)" \
     "rc=$RC elapsed=${guard_elapsed}s guard_attempts=$guard_attempts sentinel=$(cat "$guard_sentinel" 2>/dev/null) stderr=$(tail -5 "$TDIR/stderr")"
 
   # The guard is still load-bearing: with it available and the only slot held, the run takes the
