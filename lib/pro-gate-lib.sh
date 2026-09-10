@@ -1190,11 +1190,22 @@ pg_dirlock_reclaim_dead() {
   # read outside this function too (st_inflight in the engine, pg_harvest_claimed here),
   # so it stays as it is and the reclaimer learns it.
   if [ "$had_marker" = 0 ] && [ -e "$lockdir/pid" ]; then
-    had_marker=1
     pid="$(cat "$lockdir/pid" 2>/dev/null || true)"
     case "$pid" in
-      ''|*[!0-9]*) : ;;                 # torn or empty record: never a live claim
+      ''|*[!0-9]*)
+        # A torn or empty record is not a live claim -- but it is NOT a marker either, and
+        # counting it as one skips rule 3 above. `echo "$$" > "$lockdir/pid"` opens with
+        # O_CREAT|O_TRUNC and writes a syscall later, so "exists but empty" is a state every
+        # live winner passes through on its way to publishing itself, and it is the PERSISTENT
+        # state when that write fails (the call is `|| true`). Treating it as a marker made a
+        # winner's directory reclaimable mid-write with no grace at all, which is exactly the
+        # double-entry rule 3 exists to prevent (v0.44.0 defect, reproduced: the same winner was
+        # kept one syscall earlier and removed one syscall later). Leave had_marker at 0 so the
+        # grace still has to elapse, and leave the file alone so a merely slow winner can still
+        # finish its own record.
+        : ;;
       *)
+        had_marker=1
         if kill -0 "$pid" 2>/dev/null; then
           tok="$(head -c 64 "$lockdir/token" 2>/dev/null | tr -d '\n')"
           # A tokenless lock is legacy: a live pid is the whole claim, so it holds.
@@ -1205,14 +1216,33 @@ pg_dirlock_reclaim_dead() {
           [ -n "$cur" ] || return 1
           [ "$tok" = "$cur" ] && return 1
         fi
+        rm -f "$lockdir/pid" "$lockdir/token" 2>/dev/null
         ;;
     esac
-    rm -f "$lockdir/pid" "$lockdir/token" 2>/dev/null
   fi
   if [ "$had_marker" = 0 ]; then
     grace="${PRO_GATE_DIRLOCK_ORPHAN_GRACE:-5}"; case "$grace" in ''|*[!0-9]*) grace=5;; esac
     age="$(pg_dir_age_secs "$lockdir")" || return 1
     [ "$age" -ge "$grace" ] 2>/dev/null || return 1
+    # Past the grace the directory is provably abandoned -- a live winner records itself in
+    # microseconds -- so a torn record may be cleared here, where age has authorized it, and
+    # nowhere else. RE-READ it first: for the owner.<pid> shape the final rmdir is itself the
+    # check, because the kernel refuses a directory a contender has just written a marker into.
+    # Unlinking by name would throw that away, so re-reading restores the equivalent guarantee
+    # and narrows the window from the whole grace to the gap before rmdir.
+    if [ -e "$lockdir/pid" ]; then
+      # No `|| true` here, deliberately. An unreadable record and an EMPTY one are different
+      # facts, and `|| true` reports both as the empty string -- so a cat that merely failed
+      # (a fork under memory pressure, a stalled mount) would authorize deleting a record that
+      # may name a live owner. That is the same fail-open the token checks above refuse, and it
+      # would be a new instance of it in the one branch that unlinks another process's claim.
+      # A failed READ is not evidence of an absent owner: keep the lock and re-decide later.
+      pid="$(cat "$lockdir/pid" 2>/dev/null)" || return 1
+      case "$pid" in
+        ''|*[!0-9]*) rm -f "$lockdir/pid" "$lockdir/token" 2>/dev/null ;;
+        *) return 1 ;;   # a slow winner finished its record during the grace: it holds
+      esac
+    fi
   fi
   rmdir "$lockdir" 2>/dev/null || [ ! -d "$lockdir" ]
 }
