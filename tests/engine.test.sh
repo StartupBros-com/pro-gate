@@ -114,7 +114,15 @@ chmod +x "$TIMEOUT_LOG_BIN"
 #   PG_TEST_FAIL_CHANGE_LOCK=1        refuses the per-change lock  (*.pr-*)
 #   PG_TEST_FAIL_RESERVATION_GUARD=1  refuses the reservation handoff guard (*/in-progress.lock,
 #                                     lib pg_reservation_lock)
-# Both default off, so installing the shim alone changes nothing. The fd is resolved through
+#   PG_TEST_FAIL_GUARD_AFTER_SLOT_SCAN=<file>
+#                                     records every nonblocking slot scan to <file> and refuses the
+#                                     reservation handoff guard from the first one onward. A slot
+#                                     scan is pg_lock_n's `flock -n` probe, which the engine only
+#                                     reaches while HOLDING the guard, so it is direct proof that
+#                                     account capacity was read. Ordering, not wall-clock timing,
+#                                     is what makes the resulting "read, then guard-blocked" wait
+#                                     deterministic.
+# All three default off, so installing the shim alone changes nothing. The fd is resolved through
 # /proc/self/fd because bash hands the descriptor down by inheritance, not by name — that works
 # for pg_lock's fixed fd 9 and for the guard's {var}-allocated fd alike.
 install_flock_shim() { # $1 = bin directory to install into
@@ -123,6 +131,12 @@ install_flock_shim() { # $1 = bin directory to install into
   mkdir -p "$dir"
   cat > "$dir/flock" <<SHIM_FLOCK
 #!/usr/bin/env bash
+if [ "\${1:-}" = -n ] && [ -n "\${PG_TEST_FAIL_GUARD_AFTER_SLOT_SCAN:-}" ]; then
+  scan_target="\$(readlink "/proc/\$\$/fd/\${2:-}" 2>/dev/null || true)"
+  case "\$scan_target" in
+    *oracle.lock.slot*) printf '%s\n' "\$scan_target" >> "\$PG_TEST_FAIL_GUARD_AFTER_SLOT_SCAN" ;;
+  esac
+fi
 if [ "\${1:-}" = -w ]; then
   wait_s="\${2:-}"
   fd="\${3:-}"
@@ -130,7 +144,11 @@ if [ "\${1:-}" = -w ]; then
   printf '%s\t%s\n' "\$wait_s" "\$target" >> "\${PG_TEST_FLOCK_LOG:?}"
   case "\$target" in
     *.pr-*) [ "\${PG_TEST_FAIL_CHANGE_LOCK:-0}" = 1 ] && exit 1 ;;
-    */in-progress.lock) [ "\${PG_TEST_FAIL_RESERVATION_GUARD:-0}" = 1 ] && exit 1 ;;
+    */in-progress.lock)
+      [ "\${PG_TEST_FAIL_RESERVATION_GUARD:-0}" = 1 ] && exit 1
+      [ -n "\${PG_TEST_FAIL_GUARD_AFTER_SLOT_SCAN:-}" ] \
+        && [ -s "\$PG_TEST_FAIL_GUARD_AFTER_SLOT_SCAN" ] && exit 1
+      ;;
   esac
 fi
 exec "$real" "\$@"
@@ -391,7 +409,7 @@ fi
 run_slot_guard_bound_tests() {
   local guard_user="$TDIR/slot-guard-user" guard_bin="$TDIR/slot-guard-user/.local/bin" guard_path
   local guard_diff="$TDIR/slot-guard.diff" guard_log="$TDIR/slot-guard-flock.log"
-  local guard_home guard_sentinel guard_attempts guard_started guard_elapsed
+  local guard_home guard_sentinel guard_attempts guard_started guard_elapsed guard_scan_mark
   install_flock_shim "$guard_bin"
   guard_path="$guard_bin:$PATH"
   printf 'diff --git a/guard b/guard\n--- a/guard\n+++ b/guard\n@@ -0,0 +1 @@\n+guard\n' > "$guard_diff"
@@ -473,6 +491,49 @@ run_slot_guard_bound_tests() {
     "$([ "$RC" -eq 7 ] && grep -Fq 'all 1 review slots are busy' "$TDIR/stderr" \
        && ! grep -Fq 'reservation handoff guard' "$TDIR/stderr" && [ ! -s "$guard_sentinel" ]; echo $?)" \
     "rc=$RC sentinel=$(cat "$guard_sentinel" 2>/dev/null) stderr=$(tail -5 "$TDIR/stderr")"
+
+  # gate #187 r1 P2 mixed-wait-diagnosis: the two cases above are pure — the guard is refused for
+  # the WHOLE wait, or never. The real defect lives in between. SLOT_GUARD_BLOCKED records only the
+  # last slice, so a wait that read busy capacity and then lost the guard as the deadline passed
+  # claimed capacity "was never read" and skipped the running/uncollected diagnosis entirely,
+  # sending the operator to a lock path that was not the reason it gave up.
+  #
+  # The shim refuses the guard from the first slot scan onward, and a slot scan can only happen
+  # under a HELD guard: slice 1 therefore always reads occupancy and every later slice is
+  # guard-blocked. The mixed shape comes from that ordering, not from racing a clock — the only
+  # timing assumption left is that slice 1 finishes inside the 13s budget, which is why the scan
+  # and guard-attempt floors below are asserted: a runner slow enough to break that assumption
+  # fails on a floor and says so, instead of failing on the message and reading as a regression.
+  # The only slot is held by a live flock, so the reading is "busy with running reviews" — and the
+  # expiry must report THAT, in the past tense it was actually observed in, not a present-tense
+  # claim about a deadline at which this run could read nothing.
+  guard_scan_mark="$TDIR/slot-guard-scan.mark"
+  guard_home="$TDIR/home-slot-guard-mixed"; mkdir -p "$guard_home"
+  : > "$guard_log"; : > "$guard_sentinel"; : > "$guard_scan_mark"
+  guard_started="$(date +%s)"
+  exec {guard_slot_fd}>>"$guard_home/oracle.lock.slot1"; "$(command -v flock)" -n "$guard_slot_fd"
+  env HOME="$guard_user" PRO_GATE_HOME="$guard_home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+    PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
+    PRO_GATE_LOCK_WAIT=13 PRO_GATE_TIMEOUT=23s PRO_GATE_TIMEOUT_GRACE=5 \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_ORACLE_SENTINEL="$guard_sentinel" \
+    PG_TEST_FLOCK_LOG="$guard_log" PG_TEST_FAIL_GUARD_AFTER_SLOT_SCAN="$guard_scan_mark" \
+    PATH="$guard_path" NODE_OPTIONS= \
+    "$REAL_TIMEOUT" 120s bash "$ENGINE" --diff "$guard_diff" --repo "$TDIR" --out "$guard_home/review.md" \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+  RC=$?
+  guard_elapsed=$(( $(date +%s) - guard_started ))
+  eval "exec ${guard_slot_fd}>&-"
+  check '#187 r1 P2 mixed-wait-diagnosis: a final-slice guard miss still reports the capacity the wait read' \
+    "$([ "$RC" -eq 7 ] && [ "$guard_elapsed" -lt 120 ] \
+       && [ "$(wc -l < "$guard_scan_mark")" -ge 1 ] \
+       && [ "$(grep -c '/in-progress\.lock$' "$guard_log")" -ge 2 ] \
+       && grep -Fq 'when this run last read account capacity, all 1 review slots were busy with running reviews' "$TDIR/stderr" \
+       && grep -Fq 'unacquirable again when the wait expired' "$TDIR/stderr" \
+       && grep -Fq 'account capacity is unreadable this slice' "$TDIR/stderr" \
+       && ! grep -Fq 'account capacity was never read' "$TDIR/stderr" \
+       && ! grep -Fq 'review slots are busy with running reviews' "$TDIR/stderr" \
+       && [ ! -s "$guard_sentinel" ]; echo $?)" \
+    "rc=$RC elapsed=${guard_elapsed}s scans=$(wc -l < "$guard_scan_mark" 2>/dev/null) guard_attempts=$(grep -c '/in-progress\.lock$' "$guard_log" 2>/dev/null) sentinel=$(cat "$guard_sentinel" 2>/dev/null) stderr=$(tail -6 "$TDIR/stderr")"
 }
 
 run_slot_guard_bound_tests
