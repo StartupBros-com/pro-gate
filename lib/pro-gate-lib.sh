@@ -294,17 +294,24 @@ pg_lock() {
     fi
     return 0   # unwritable lock path -> proceed unlocked (preserves prior behavior)
   fi
-  local lockdir="${lockfile}.d" start opid
+  local lockdir="${lockfile}.d" start
   start=$(date +%s)
   while ! mkdir "$lockdir" 2>/dev/null; do
-    opid=$(cat "$lockdir/pid" 2>/dev/null || true)
-    if [ -n "$opid" ] && ! kill -0 "$opid" 2>/dev/null; then rm -rf "$lockdir" 2>/dev/null; continue; fi
-    [ $(( $(date +%s) - start )) -ge "$wait_s" ] && return 1
-    sleep 2
+    # The old inline reclaim read the owner pid, and on a dead one rm -rf'd the directory and
+    # retried. Three things were wrong with it and all three are the reclaimer's job now:
+    # two waiters reading the same dead pid could both remove and both enter; rm -rf could
+    # take a REPLACEMENT directory a live winner had already created; and the token written
+    # on the line below was never read back, so a recycled pid read as the original owner.
+    # Racing this is safe -- reclaiming is not the mutual exclusion, mkdir is, and the loser
+    # of that simply comes round again.
+    if ! pg_dirlock_reclaim_dead "$lockdir" 2>/dev/null; then
+      [ $(( $(date +%s) - start )) -ge "$wait_s" ] && return 1
+      sleep 2
+    fi
   done
   echo "$$" > "$lockdir/pid" 2>/dev/null || true
   pg_pid_token "$$" > "$lockdir/token" 2>/dev/null || true
-  pg_on_exit 'rm -rf "'"$lockdir"'" 2>/dev/null'
+  pg_on_exit 'pg_dirlock_release_own "'"$lockdir"'" "'"$$"'"'
   return 0
 }
 
@@ -314,7 +321,7 @@ pg_lock() {
 # (the winning fd is kept open and auto-released on exit); mkdir-spinlock fallback on macOS scans N
 # slot dirs and self-heals stale ones via the dead-pid check. maxn<=1 is plain mutual exclusion.
 pg_lock_n() {
-  local base="$1" maxn="${2:-1}" wait_s="${3:-2400}" exclude="${4:-}" start i fd lockdir opid
+  local base="$1" maxn="${2:-1}" wait_s="${3:-2400}" exclude="${4:-}" start i fd lockdir
   [ "${maxn:-1}" -ge 1 ] 2>/dev/null || maxn=1
   # v0.20.3: report WHICH slot was won (durable reservations must remember their slot so fresh
   # runs exclude it instead of shrinking the scan range, which overbooked real capacity), and
@@ -347,12 +354,12 @@ pg_lock_n() {
       if mkdir "$lockdir" 2>/dev/null; then
         echo "$$" > "$lockdir/pid" 2>/dev/null || true
         pg_pid_token "$$" > "$lockdir/token" 2>/dev/null || true
-        pg_on_exit 'rm -rf "'"$lockdir"'" 2>/dev/null'
+        pg_on_exit 'pg_dirlock_release_own "'"$lockdir"'" "'"$$"'"'
         PG_SLOT_ACQUIRED="$i"
         return 0
       fi
-      opid=$(cat "$lockdir/pid" 2>/dev/null || true)
-      [ -n "$opid" ] && ! kill -0 "$opid" 2>/dev/null && rm -rf "$lockdir" 2>/dev/null
+      # Same hardened reclaimer as pg_lock and the reservation guard; see the note there.
+      pg_dirlock_reclaim_dead "$lockdir" 2>/dev/null || true
       i=$((i + 1))
     done
     [ $(( $(date +%s) - start )) -ge "$wait_s" ] && return 1
@@ -1176,12 +1183,53 @@ pg_dirlock_reclaim_dead() {
     fi
     rm -f "$f" 2>/dev/null
   done
+  # pg_lock and pg_lock_n record their holder as a `pid` file with the token beside it,
+  # rather than as an owner.<pid> marker. Same question, same fail-closed rules, one
+  # implementation -- v0.41 deferred the guard's self-heal specifically so one hardened
+  # helper could serve all three call sites instead of two divergent ones. Their shape is
+  # read outside this function too (st_inflight in the engine, pg_harvest_claimed here),
+  # so it stays as it is and the reclaimer learns it.
+  if [ "$had_marker" = 0 ] && [ -e "$lockdir/pid" ]; then
+    had_marker=1
+    pid="$(cat "$lockdir/pid" 2>/dev/null || true)"
+    case "$pid" in
+      ''|*[!0-9]*) : ;;                 # torn or empty record: never a live claim
+      *)
+        if kill -0 "$pid" 2>/dev/null; then
+          tok="$(head -c 64 "$lockdir/token" 2>/dev/null | tr -d '\n')"
+          # A tokenless lock is legacy: a live pid is the whole claim, so it holds.
+          [ -n "$tok" ] || return 1
+          # Same rule as above -- the recomputed token must fail closed too, or a transient
+          # read makes a live holder look dead and hands its lock to a reclaimer.
+          cur="$(pg_pid_token "$pid" 2>/dev/null || true)"
+          [ -n "$cur" ] || return 1
+          [ "$tok" = "$cur" ] && return 1
+        fi
+        ;;
+    esac
+    rm -f "$lockdir/pid" "$lockdir/token" 2>/dev/null
+  fi
   if [ "$had_marker" = 0 ]; then
     grace="${PRO_GATE_DIRLOCK_ORPHAN_GRACE:-5}"; case "$grace" in ''|*[!0-9]*) grace=5;; esac
     age="$(pg_dir_age_secs "$lockdir")" || return 1
     [ "$age" -ge "$grace" ] 2>/dev/null || return 1
   fi
   rmdir "$lockdir" 2>/dev/null || [ ! -d "$lockdir" ]
+}
+
+# Release a mkdir-fallback lock this process still owns. A holder whose directory was
+# reclaimed -- correctly, because it looked dead -- must never delete the replacement a live
+# process has since created at the same path. Check the recorded owner is still us, drop our
+# own two files by name, then rmdir, which refuses a directory that still holds anyone's.
+# Never rm -rf a pathname another live process may own by now (the same rule the reservation
+# guard's release follows).
+pg_dirlock_release_own() { # <lockdir> <pid>
+  local dir="$1" pid="$2" opid
+  [ -d "$dir" ] || return 0
+  opid="$(cat "$dir/pid" 2>/dev/null || true)"
+  [ "$opid" = "$pid" ] || return 0
+  rm -f "$dir/pid" "$dir/token" 2>/dev/null
+  rmdir "$dir" 2>/dev/null || true
 }
 
 # Shared guard for reservation writes/removes AND the fresh-run count+slot-acquire decision.
