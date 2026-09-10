@@ -279,20 +279,35 @@ DAEMON_STAMP_FILE="${PRO_GATE_HOME}/.deploy-stamp"
 DAEMON_START_STAMP="$(cat "$DAEMON_STAMP_FILE" 2>/dev/null || true)"
 
 ROOT="$PRO_GATE_HOME"
-STATE="$ROOT/processed.tsv"          # repo<TAB>pr<TAB>sha  (idempotency; a completed, typed terminal review ONLY)
+# #184 finding 2 (round 3): the pre-#184x daemon used THIS SAME FILENAME as a bare idempotency
+# cache -- any (repo,pr,sha) whose worker subprocess once exited 0, with no notion of re-resolved
+# proof (that gap is finding 1). Daemon state survives upgrades, and `already_done` is consulted
+# before any new CI or typed-completion logic runs, so reusing that file directly as today's
+# proof-bearing ledger would keep every one of those unverified rows "done" forever -- even after
+# finding 1 lands, an already-poisoned current SHA would stay permanently skipped. STATE is now a
+# NEW, versioned file: the ONLY writer is mark_processed_heads, and it is only ever called after
+# daemon_stop_is_completion_proof (or the finding-1 post-worker re-resolution built on the same
+# predicate) returns true for the CURRENT head. STATE_LEGACY is the old file: read-only from here
+# on, migrated exactly once per row (daemon_migrate_legacy_processed, below) into STATE (when
+# durable evidence is found) or QUARANTINE (when it is not); it is NEVER deleted and NEVER written
+# again by any code past that migration.
+STATE="$ROOT/processed-v2.tsv"       # repo<TAB>pr<TAB>sha  (idempotency; a completed, typed terminal review ONLY)
+STATE_LEGACY="$ROOT/processed.tsv"   # pre-#184x ledger; read-only input to the migration below, kept for audit
+QUARANTINE="$ROOT/processed-quarantine.tsv"  # repo<TAB>pr<TAB>sha (legacy rows with no durable evidence; audit trail, NEVER treated as done -- the head is re-evaluated on the next poll, not skipped)
 FAILS="$ROOT/failcount.tsv"          # repo<TAB>pr<TAB>sha  (one line per failed attempt)
 CIDEFER="$ROOT/ci-defer.tsv"         # repo<TAB>pr<TAB>sha  (CI-not-settled deferral count; #184)
 AGENTCAP="$ROOT/agent-task-attempts.tsv"  # repo<TAB>pr<TAB>sha (agent-task dispatch count with no head progress; #184)
+AGENTFAIL="$ROOT/agent-task-failures.tsv"  # repo<TAB>pr<TAB>sha (agent-task LAUNCH failures, rc=1 only; #184c finding 3)
 # #184c findings 1+2: a cap (CI_DEFER_MAX or AGENT_TASK_MAX) being exhausted is an escalation, not
-# completion. It is recorded ONLY here, one line per (repo,pr,sha), and NEVER in $STATE
-# (processed.tsv) -- a blocked head must be findable by a human but must never look "done" to the
-# idempotency ledger. Deliberately distinct from $FAILS/MAX_FAILS (that budget is wrapper-orchestration
-# failures and its semantics are unchanged by this ledger). Keyed by sha, so a new push naturally
-# clears it -- the new sha simply has no line here yet.
-BLOCKED="$ROOT/blocked.tsv"          # repo<TAB>pr<TAB>sha<TAB>reason  (cap-exhaustion escalation; never processed.tsv)
+# completion. It is recorded ONLY here, one line per (repo,pr,sha), and NEVER in $STATE -- a
+# blocked head must be findable by a human but must never look "done" to the idempotency ledger.
+# Deliberately distinct from $FAILS/MAX_FAILS (that budget is wrapper-orchestration failures and
+# its semantics are unchanged by this ledger). Keyed by sha, so a new push naturally clears it --
+# the new sha simply has no line here yet.
+BLOCKED="$ROOT/blocked.tsv"          # repo<TAB>pr<TAB>sha<TAB>reason  (cap-exhaustion escalation; never $STATE)
 LOGDIR="$ROOT/logs"; mkdir -p "$LOGDIR"
 PAUSE="$ROOT/PAUSE"
-touch "$STATE" "$FAILS" "$CIDEFER" "$AGENTCAP" "$BLOCKED"
+touch "$STATE" "$STATE_LEGACY" "$QUARANTINE" "$FAILS" "$CIDEFER" "$AGENTCAP" "$AGENTFAIL" "$BLOCKED"
 
 OWNERS="${PRO_REVIEW_OWNERS:-}"                          # space-separated gh owners to watch (REQUIRED)
 POLL="${PRO_REVIEW_POLL_SECONDS:-180}"
@@ -307,6 +322,15 @@ MAX_FAILS="${PRO_REVIEW_MAX_FAILS:-3}"
 # decision that keeps returning the same agent-task with no head progress.
 CI_DEFER_MAX="${PRO_REVIEW_CI_DEFER_MAX:-20}"
 AGENT_TASK_MAX="${PRO_REVIEW_AGENT_TASK_MAX:-5}"
+# #184c finding 3 (round 3 regression fix): a THIRD bounded counter, structurally separate from
+# both of the above -- AGENT_TASK_MAX/AGENTCAP counts genuinely SUCCESSFUL (rc=0) agent-task
+# dispatches with no head progress; MAX_FAILS/FAILS counts daemon-wrapper orchestration failures
+# (clone/worktree/review-worker) and stays untouched by this. This one counts real agent-task
+# LAUNCH failures (rc=1 -- the claude subprocess itself returned non-zero) so that a typed decision
+# which keeps selecting the same agent-task action for an unchanged sha cannot relaunch an
+# expensive multi-hour task every cycle forever. rc=2 (no safe typed agent-task capability -- the
+# task never actually launched) is never counted here or anywhere: nothing was spent.
+AGENT_TASK_FAIL_MAX="${PRO_REVIEW_AGENT_TASK_FAIL_MAX:-5}"
 CDP_PORT="${ORACLE_BROWSER_PORT:-9222}"
 REPOS_DIR="${PRO_GATE_REPOS_DIR:-$HOME/SITES}"
 ALL_PRS="${PRO_REVIEW_ALL_PRS:-0}"                      # 1 = review ALL open non-draft PRs in OWNERS (not just `pro-review`-labeled)
@@ -383,6 +407,64 @@ mark_processed_heads(){ # nwo num reviewed-sha
   mark_done "$1" "$2" "$3"
 }
 
+# #184 finding 2 (round 3): "durable evidence" for a legacy (repo,pr,sha) row = an immutable,
+# write-once completed-review artifact (pg_completed_write / $PRO_GATE_HOME/completed/<marker>,
+# v0.28 #56 -- lib/pro-gate-lib.sh) backing a CLEAN run-ledger row scoped to that exact repo+PR
+# (round_key == "<nwo-with-/-as-dash>-<num>", the same slug daemon.sh itself uses -- see `slug` in
+# process_pr, below). The legacy ledger never recorded a head SHA per completed review, only
+# (repo,pr) -- so this evidence is necessarily PR-scoped, not sha-exact. That is still a strictly
+# stronger claim than the bare presence this finding describes: a hit here means the runtime
+# actually reduced spend into a real, installed, write-once review artifact for this PR at some
+# point, not merely that some old code path once exited 0 and appended a TSV line.
+daemon_legacy_row_has_durable_evidence(){ # nwo num -> rc 0 when a durable completed-artifact review exists for this repo+PR
+  local nwo="$1" num="$2" ledger completed_dir round_key marker found=1
+  ledger="${PRO_GATE_LEDGER:-$ROOT/ledger.jsonl}"
+  completed_dir="$(pg_completed_dir)"
+  [ -s "$ledger" ] && command -v jq >/dev/null 2>&1 || return 1
+  round_key="${nwo//\//-}-${num}"
+  while IFS= read -r marker; do
+    [ -n "$marker" ] || continue
+    if [ -s "$completed_dir/$marker" ] && [ ! -L "$completed_dir/$marker" ] && pg_is_review "$completed_dir/$marker"; then
+      found=0; break
+    fi
+  done < <(jq -r --arg rk "$round_key" 'select(.outcome=="clean" and (.round_key // "")==$rk) | .marker // empty' "$ledger" 2>/dev/null)
+  return "$found"
+}
+
+# #184 finding 2 (round 3): migrate the pre-#184x ledger (STATE_LEGACY) into the proof-bearing one
+# (STATE) exactly once per row, WITHOUT ever deleting or rewriting STATE_LEGACY.
+#
+# Blast radius is small and bounded, on purpose: the poll loop's `already_done` check (main loop,
+# below) only ever consults STATE for the CURRENT head of each open PR, so quarantining a row here
+# cannot stampede every historical sha this daemon has ever touched -- only a PR's live head is
+# ever re-examined, and that head still has to clear ci_ready (CI positively settled) and a fresh
+# typed decision (with its own round governor) before anything is dispatched or paid for. A future
+# reader must not "optimize" the quarantine step away on the theory that those gates make it
+# redundant: those gates protect a NEWLY dispatched review; quarantine is what stops an old,
+# never-actually-reverified row from silently granting a pass those gates never got to run.
+#
+# Idempotent by construction, not by a separate "have I migrated" marker: a row already present in
+# STATE (already_done) or already recorded in QUARANTINE is skipped, so running this twice (e.g.
+# across a restart, or because PRO_GATE_DAEMON_SELF_RELOAD re-execs mid-poll) reads STATE_LEGACY
+# again but writes nothing new the second time.
+daemon_migrate_legacy_processed(){
+  [ -s "$STATE_LEGACY" ] || return 0
+  local nwo num sha
+  while IFS=$'\t' read -r nwo num sha; do
+    [ -n "$nwo" ] && [ -n "$num" ] && [ -n "$sha" ] || continue
+    already_done "$nwo" "$num" "$sha" && continue
+    grep -qF "$(printf '%s\t%s\t%s' "$nwo" "$num" "$sha")" "$QUARANTINE" 2>/dev/null && continue
+    if daemon_legacy_row_has_durable_evidence "$nwo" "$num"; then
+      mark_done "$nwo" "$num" "$sha"
+      daemon_note "  · migrated legacy $nwo#$num @ ${sha:0:8} -> $STATE (durable completed-artifact evidence found)"
+    else
+      printf '%s\t%s\t%s\n' "$nwo" "$num" "$sha" >> "$QUARANTINE"
+      daemon_note "  · quarantined legacy $nwo#$num @ ${sha:0:8} -> $QUARANTINE (no durable evidence found; re-evaluated on the next poll, not skipped)"
+    fi
+  done < "$STATE_LEGACY"
+}
+daemon_migrate_legacy_processed
+
 # Count a failed attempt for repo#pr@sha (ANY failure class: clone, worktree, claude run) and
 # give up permanently after MAX_FAILS — previously only claude-run failures were counted, so a
 # broken clone/worktree retried every cycle forever.
@@ -408,6 +490,20 @@ note_fail(){ # nwo num sha log reason
 agent_task_attempt_count(){ # nwo num sha -> increments and echoes the new count
   printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$AGENTCAP"
   grep -cF "$(printf '%s\t%s\t%s' "$1" "$2" "$3")" "$AGENTCAP" 2>/dev/null || echo 1
+}
+
+# #184c finding 3 (round 3 regression fix): count a REAL agent-task LAUNCH failure (rc=1 -- the
+# claude subprocess itself returned non-zero, as opposed to rc=2's capability-unavailable defer
+# where nothing launched). Deliberately its own ledger, separate from $AGENTCAP above (successful
+# launches counted toward the no-progress cap) and from $FAILS/$MAX_FAILS (daemon-wrapper
+# orchestration failures, e.g. clone/worktree). Without this bound, a typed decision that keeps
+# selecting the same agent-task for an UNCHANGED sha, where the launch itself keeps failing
+# (rc=1), would relaunch an expensive multi-hour claude task forever -- rc!=0 previously fell
+# through both the success-only $AGENTCAP cap and note_fail (which only guards clone/worktree/
+# review-worker failures), leaving this class of failure completely unbounded.
+agent_task_failure_count(){ # nwo num sha -> increments and echoes the new count
+  printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$AGENTFAIL"
+  grep -cF "$(printf '%s\t%s\t%s' "$1" "$2" "$3")" "$AGENTFAIL" 2>/dev/null || echo 1
 }
 
 # #184a: CI-readiness gate. A CLOSED allowlist of SETTLED states, not an open-set enumeration of
@@ -545,22 +641,34 @@ process_pr(){
   if [ "$review_ran" != 1 ]; then
     git -C "$repodir" worktree remove --force "$wt" 2>/dev/null || true
     if [ "$agent_task_ran" = 1 ]; then
-      # #184c finding 3: only a genuinely SUCCESSFUL agent task (rc==0) is no-progress-cap
-      # attempt; a failed run (rc=1) or a capability-unavailable defer (rc=2) is not an attempt at
-      # all and must never advance the cap or reach mark_done -- that stays the wrapper failure
-      # budget's business ($FAILS / MAX_FAILS), deliberately separate from this ledger.
+      # #184c finding 3: only a genuinely SUCCESSFUL agent task (rc==0) is a no-progress-cap
+      # attempt; it is progress, never a terminal-review receipt, and must never reach mark_done.
+      # rc=1 (the claude subprocess itself was LAUNCHED and returned failure -- a real, expensive
+      # attempt) is bounded separately below (round-3 regression fix: previously rc!=0 fell
+      # through BOTH the success-only no-progress cap and note_fail, so a typed decision that kept
+      # selecting the same agent-task on an unchanged sha with every launch itself failing could
+      # relaunch an expensive multi-hour claude task forever). rc=2 (capability-unavailable --
+      # nothing was launched at all) stays uncounted by any cap; it is not an attempt.
       if [ "$rc" -eq 0 ]; then
         local attempts; attempts="$(agent_task_attempt_count "$nwo" "$num" "$sha")"
         if [ "$attempts" -ge "$AGENT_TASK_MAX" ]; then
           # #184c finding 2: an rc=0 agent task is progress, never a terminal-review receipt -- it
-          # must never consume the sha in processed.tsv. Exhaustion here is BLOCKED (escalation),
+          # must never consume the sha in $STATE. Exhaustion here is BLOCKED (escalation),
           # same as the CI cap: logged clearly, recorded only in $BLOCKED, and the is_blocked gate at
           # the top of process_pr suppresses further dispatch for this exact head from here on.
           log "  ✗ $nwo#$num @ ${sha:0:8} agent task SUCCEEDED ${attempts}x with no head progress — BLOCKED (no-progress cap reached; not marking done; re-push to retry)."
           mark_blocked "$nwo" "$num" "$sha" "agent-task-no-progress-cap-exhausted"
         fi
+      elif [ "$rc" -eq 1 ]; then
+        local failures; failures="$(agent_task_failure_count "$nwo" "$num" "$sha")"
+        if [ "$failures" -ge "$AGENT_TASK_FAIL_MAX" ]; then
+          log "  ✗ $nwo#$num @ ${sha:0:8} agent task LAUNCH FAILED ${failures}x — BLOCKED (launch-failure cap reached; not marking done; re-push to retry)."
+          mark_blocked "$nwo" "$num" "$sha" "agent-task-launch-failure-cap-exhausted"
+        else
+          log "  ! $nwo#$num @ ${sha:0:8} agent task launch failed (attempt ${failures}/${AGENT_TASK_FAIL_MAX}); will retry next cycle"
+        fi
       else
-        log "  · $nwo#$num @ ${sha:0:8} agent task rc=$rc (not a success); not counted toward the no-progress cap, head stays retryable"
+        log "  · $nwo#$num @ ${sha:0:8} agent task rc=$rc (capability unavailable; nothing launched); not counted toward any cap, head stays retryable"
       fi
     elif [ "$terminal_completed" = 1 ] && [ "$rc" -eq 0 ]; then
       mark_processed_heads "$nwo" "$num" "$sha"
@@ -575,12 +683,32 @@ process_pr(){
     return "$rc"
   fi
 
+  # #184 finding 1 (round 3 fix): worker rc=0 only proves the headless claude subprocess exited
+  # cleanly -- it is not itself proof the runtime completed a current-head terminal review (the
+  # worker could have been killed mid-write, hit its own budget cap, or simply run out of turns
+  # without the runtime ever granting completion). Before marking anything, RE-RESOLVE the typed
+  # decision against the SAME worktree (must happen before it is removed) and require the SAME
+  # durable current-head proof used for a report-only stop above (daemon_stop_is_completion_proof)
+  # -- there is exactly one definition of "proven" in this file, reused for every path that can
+  # mark $STATE. If the re-resolved decision does not attest completion, nothing is marked; the
+  # freshly re-resolved decision is left for the NEXT poll cycle to dispatch or defer on its own
+  # merits (not acted on here, to avoid a second dispatch inside this same cycle).
+  local redecision="$lg.redecision"
+  if "$engine" --review-decision --json --pr "$num" --repo "$wt" "${DD_INPUT_ARGS[@]}" >"$redecision" 2>>"$lg" \
+      && daemon_decision_valid "$redecision" \
+      && daemon_decision_target_matches "$redecision" "$nwo" "$num" "$sha" \
+      && daemon_stop_is_completion_proof "$redecision"; then
+    git -C "$repodir" worktree remove --force "$wt" 2>/dev/null || true
+    # Mark only the SHA this decision proved was reviewed (#184b). The worker may still push an
+    # implementation after the runtime-selected review, but that produces an unreviewed head; the
+    # runtime's own review-decision is the dedupe authority for it on the next cycle.
+    mark_processed_heads "$nwo" "$num" "$sha"
+    log "  ✓ runtime-selected review worker completed $nwo#$num @ ${sha:0:8} (re-resolved decision attests current-head completion)"
+    return 0
+  fi
   git -C "$repodir" worktree remove --force "$wt" 2>/dev/null || true
-  # Mark only the SHA this decision proved was reviewed (#184b). The worker may still push an
-  # implementation after the runtime-selected review, but that produces an unreviewed head; the
-  # runtime's own review-decision is the dedupe authority for it on the next cycle.
-  mark_processed_heads "$nwo" "$num" "$sha"
-  log "  ✓ runtime-selected review worker completed $nwo#$num @ ${sha:0:8}"
+  log "  · $nwo#$num @ ${sha:0:8} review worker exited 0 but the re-resolved decision does not attest current-head completion — not marking done; re-evaluated next cycle"
+  return 2
 }
 
 # Test seam: source all daemon functions and setup, with no startup watch loop.

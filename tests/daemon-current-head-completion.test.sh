@@ -29,15 +29,23 @@ unset PRO_REVIEW_INPUT
 . "$HERE/../daemon/daemon.sh"
 unset PRO_GATE_DAEMON_LIB_ONLY
 
-STATE_FILE="$HOME_D/processed.tsv"; FAILS_FILE="$HOME_D/failcount.tsv"
+# #184 finding 2 (round 3): STATE_FILE now points at the NEW versioned ledger (processed-v2.tsv);
+# LEGACY_FILE is the pre-#184x file (processed.tsv), QUARANTINE_FILE is the migration's audit
+# trail for legacy rows lacking durable evidence, and AGENTFAIL_FILE is finding 3's bounded
+# launch-failure ledger.
+STATE_FILE="$HOME_D/processed-v2.tsv"; LEGACY_FILE="$HOME_D/processed.tsv"
+QUARANTINE_FILE="$HOME_D/processed-quarantine.tsv"
+FAILS_FILE="$HOME_D/failcount.tsv"
 CIDEFER_FILE="$HOME_D/ci-defer.tsv"; AGENTCAP_FILE="$HOME_D/agent-task-attempts.tsv"
+AGENTFAIL_FILE="$HOME_D/agent-task-failures.tsv"
 BLOCKED_FILE="$HOME_D/blocked.tsv"
 LOG_FILE="$HOME_D/t.log"; : > "$LOG_FILE"
 log(){ printf '%s\n' "$*" >> "$LOG_FILE"; }
 
 check 'daemon.sh created the bounded #184 ledger files at startup' "$([ -f "$CIDEFER_FILE" ] && [ -f "$AGENTCAP_FILE" ] && [ -f "$BLOCKED_FILE" ]; echo $?)" "$(ls "$HOME_D")"
+check 'daemon.sh created the #184 finding-2/3 (round 3) ledger files at startup' "$([ -f "$STATE_FILE" ] && [ -f "$LEGACY_FILE" ] && [ -f "$QUARANTINE_FILE" ] && [ -f "$AGENTFAIL_FILE" ]; echo $?)" "$(ls "$HOME_D")"
 
-reset_state(){ : > "$STATE_FILE"; : > "$FAILS_FILE"; : > "$CIDEFER_FILE"; : > "$AGENTCAP_FILE"; : > "$BLOCKED_FILE"; : > "$LOG_FILE"; }
+reset_state(){ : > "$STATE_FILE"; : > "$FAILS_FILE"; : > "$CIDEFER_FILE"; : > "$AGENTCAP_FILE"; : > "$AGENTFAIL_FILE"; : > "$BLOCKED_FILE"; : > "$LOG_FILE"; }
 
 # --- corpus decision helper (mirrors tests/daemon-reload.test.sh) -----------------------------
 typed_decision(){ # corpus-case index output
@@ -184,8 +192,19 @@ gh(){
 
 echo '# b) mark only the reviewed SHA -- never a worker self-push or an externally-advanced head'
 
+# #184 finding 1 (round 3): a real, producer-shape completion-proof patch (same shape as the
+# PROOF_DECISION case below, and the same real-producer shape already verified against
+# tests/engine.test.sh:5291-5292 -- see the comment there). The stub below reassigns MOCK_FRESH
+# (a plain, non-`export`ed reassignment -- verified to update what a LATER child process within
+# this same process_pr call sees, while never leaking past process_pr's return) to a NEW file
+# holding this proof content, so process_pr's post-worker RE-RESOLUTION reads it, while the
+# INITIAL decision resolution (which already ran, before the worker was ever dispatched) is
+# unaffected.
+PROOF_PATCH='{"prior_review":{"applicable":false,"binding_valid":true,"code_identity":"input-current","evidence_identity":"evidence-current","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000400-1","provenance_valid":true,"verdict":"NONE"}}'
+REWORKER_PROOF="$HOME_D/reworker-proof.json"; typed_decision_patch "$PROOF_PATCH" "$REWORKER_PROOF"
+
 reset_state
-daemon_run_review_worker(){ return 0; }   # completed review; the worker may also have pushed a fix
+daemon_run_review_worker(){ MOCK_FRESH="$REWORKER_PROOF"; return 0; }   # completed review; the re-resolution now attests proof
 DECISION="$HOME_D/run.json"; typed_decision "$(decision_for_action run-granted-review)" "$DECISION"
 PUSHED_SHA=2222222222222222222222222222222222222222   # what a self-push would advance the head to
 MOCK_FRESH="$DECISION" process_pr "$NWO" "$NUM" "$SHA" "$BRANCH" "$URL"; rc=$?
@@ -244,10 +263,26 @@ check 'a real push (new sha) starts the attempt counter fresh, not a stuck loop'
 
 echo '# a completed current-head review does complete it'
 reset_state
-daemon_run_review_worker(){ return 0; }
+daemon_run_review_worker(){ MOCK_FRESH="$REWORKER_PROOF"; return 0; }
 RUN_DECISION="$HOME_D/run2.json"; typed_decision "$(decision_for_action run-granted-review)" "$RUN_DECISION"
 MOCK_FRESH="$RUN_DECISION" process_pr "$NWO" "$NUM" "$SHA" "$BRANCH" "$URL"; rc=$?
 check 'run-granted-review completion marks the current head' "$([ "$rc" -eq 0 ] && already_done "$NWO" "$NUM" "$SHA"; echo $?)" "rc=$rc"
+
+echo '# finding 1 (round 3): a worker rc=0 whose re-resolved decision does NOT attest completion leaves the ledger untouched'
+reset_state
+STATE_BEFORE_NOPROOF="$(cat "$STATE_FILE")"
+daemon_run_review_worker(){ return 0; }   # rc=0, but MOCK_FRESH is left pointing at the SAME unproven base decision
+NOPROOF_DECISION="$HOME_D/run-noproof.json"; typed_decision "$(decision_for_action run-granted-review)" "$NOPROOF_DECISION"
+MOCK_FRESH="$NOPROOF_DECISION" process_pr "$NWO" "$NUM" "$SHA" "$BRANCH" "$URL"; noproof_rc=$?
+check 'a worker rc=0 whose re-resolved decision lacks completion proof does NOT mark the head' "$([ "$noproof_rc" -ne 0 ] && ! already_done "$NWO" "$NUM" "$SHA"; echo $?)" "rc=$noproof_rc"
+check 'a worker rc=0 without re-resolved proof leaves processed-v2.tsv byte-identical' "$([ "$(cat "$STATE_FILE")" = "$STATE_BEFORE_NOPROOF" ]; echo $?)" "before=[$STATE_BEFORE_NOPROOF] after=[$(cat "$STATE_FILE")]"
+
+echo '# finding 1 (round 3): a worker rc=0 WITH a re-resolved attested completion DOES mark it'
+reset_state
+daemon_run_review_worker(){ MOCK_FRESH="$REWORKER_PROOF"; return 0; }
+WORKERPROOF_DECISION="$HOME_D/run-workerproof.json"; typed_decision "$(decision_for_action run-granted-review)" "$WORKERPROOF_DECISION"
+MOCK_FRESH="$WORKERPROOF_DECISION" process_pr "$NWO" "$NUM" "$SHA" "$BRANCH" "$URL"; withproof_rc=$?
+check 'a worker rc=0 with a re-resolved attested completion marks the head' "$([ "$withproof_rc" -eq 0 ] && already_done "$NWO" "$NUM" "$SHA"; echo $?)" "rc=$withproof_rc"
 
 echo '# finding 1: a report-only stop completes the head ONLY with positive current-head review proof'
 
@@ -295,20 +330,32 @@ state="$(ci_rollup_state "$NWO" "$NUM")"
 check "GitHub's EXPECTED status-context state reads as unsettled" "$([ "$state" = EXPECTED ]; echo $?)" "state=$state"
 GH_ROLLUP='{"statusCheckRollup":[]}'
 
-echo '# finding 3: only a SUCCESSFUL (rc=0) agent task counts toward the no-progress cap'
+echo '# finding 3 (round 3 regression fix): repeated agent-task LAUNCH failures (rc=1) are bounded and land in blocked.tsv, never relaunched forever'
 
 reset_state
-daemon_run_agent_task(){ return 1; }   # agent task ended without completion
+AGENT_TASK_RUNS=0
+daemon_run_agent_task(){ AGENT_TASK_RUNS=$((AGENT_TASK_RUNS + 1)); return 1; }   # the claude subprocess itself launched and failed -- a real, expensive attempt
 below_cap_ok=1
 i=1
-while [ "$i" -le "$((AGENT_TASK_MAX * 2))" ]; do
+while [ "$i" -lt "$AGENT_TASK_FAIL_MAX" ]; do
+  : > "$LOG_FILE"
   MOCK_FRESH="$AGENT_DECISION" process_pr "$NWO" "$NUM" "$SHA" "$BRANCH" "$URL"; rc=$?
   { [ "$rc" -eq 1 ] && ! already_done "$NWO" "$NUM" "$SHA"; } || below_cap_ok=0
   i=$((i + 1))
 done
-check "a failing agent task (rc=1), dispatched well past the cap ($((AGENT_TASK_MAX * 2))x), never completes the head" "$([ "$below_cap_ok" -eq 1 ]; echo $?)"
-check 'a failing agent task never advances the no-progress attempt cap' "$([ ! -s "$AGENTCAP_FILE" ]; echo $?)" "$(cat "$AGENTCAP_FILE")"
-check 'a failing agent task never writes processed.tsv' "$([ ! -s "$STATE_FILE" ]; echo $?)" "$(cat "$STATE_FILE")"
+check "every rc=1 launch below the cap ($((AGENT_TASK_FAIL_MAX - 1)) of them) stays retryable, never completes the head" "$([ "$below_cap_ok" -eq 1 ] && [ "$(wc -l < "$AGENTFAIL_FILE")" -eq $((AGENT_TASK_FAIL_MAX - 1)) ]; echo $?)" "$(cat "$AGENTFAIL_FILE")"
+: > "$LOG_FILE"
+MOCK_FRESH="$AGENT_DECISION" process_pr "$NWO" "$NUM" "$SHA" "$BRANCH" "$URL"; cap_rc=$?
+check 'the cap-th rc=1 launch BLOCKS (never marks done), with a logged notice' "$([ "$cap_rc" -eq 1 ] && ! already_done "$NWO" "$NUM" "$SHA" && grep -Fq 'BLOCKED' "$LOG_FILE"; echo $?)" "$(tail -1 "$LOG_FILE")"
+check 'the cap-th rc=1 launch is recorded in blocked.tsv, never processed-v2.tsv' "$([ ! -s "$STATE_FILE" ] && grep -qF "$(printf '%s\t%s\t%s\t' "$NWO" "$NUM" "$SHA")" "$BLOCKED_FILE"; echo $?)" "$(cat "$BLOCKED_FILE")"
+check "the agent task actually launched $AGENT_TASK_FAIL_MAX times (each attempt is real, not skipped)" "$([ "$AGENT_TASK_RUNS" -eq "$AGENT_TASK_FAIL_MAX" ]; echo $?)" "runs=$AGENT_TASK_RUNS"
+check 'repeated rc=1 launches never advance the (separate) no-progress attempt cap' "$([ ! -s "$AGENTCAP_FILE" ]; echo $?)" "$(cat "$AGENTCAP_FILE")"
+
+: > "$LOG_FILE"
+MOCK_FRESH="$AGENT_DECISION" process_pr "$NWO" "$NUM" "$SHA" "$BRANCH" "$URL"; after_block_rc=$?
+check 'a further poll on the launch-failure-blocked head never relaunches the agent task' "$([ "$after_block_rc" -eq 2 ] && [ "$AGENT_TASK_RUNS" -eq "$AGENT_TASK_FAIL_MAX" ]; echo $?)" "rc=$after_block_rc runs=$AGENT_TASK_RUNS"
+check 'the launch-failure counter does not keep growing once blocked' "$([ "$(wc -l < "$AGENTFAIL_FILE")" -eq "$AGENT_TASK_FAIL_MAX" ]; echo $?)" "$(wc -l < "$AGENTFAIL_FILE")"
+check 'still not marked done after the extra poll' "$(! already_done "$NWO" "$NUM" "$SHA"; echo $?)"
 
 reset_state
 daemon_run_agent_task(){ return 2; }   # no safe typed agent-task capability
@@ -322,5 +369,48 @@ done
 check "a capability-unavailable agent task (rc=2), dispatched well past the cap ($((AGENT_TASK_MAX * 2))x), never completes the head" "$([ "$below_cap_ok" -eq 1 ]; echo $?)"
 check 'a capability-unavailable agent task never advances the no-progress attempt cap' "$([ ! -s "$AGENTCAP_FILE" ]; echo $?)" "$(cat "$AGENTCAP_FILE")"
 check 'a capability-unavailable agent task never writes processed.tsv' "$([ ! -s "$STATE_FILE" ]; echo $?)" "$(cat "$STATE_FILE")"
+
+echo '# finding 2 (round 3): legacy-ledger migration -- durable evidence carries forward, missing evidence is quarantined and re-evaluated, migration is idempotent'
+
+# "Durable evidence" = a CLEAN ledger.jsonl row, in the REAL pg_ledger_append/oracle-review.sh
+# shape (oracle-review.sh:2428-2431, written here via the real pg_ledger_append writer, not an
+# invented format), whose round_key matches the PR's slug, and whose .marker names a real,
+# structurally-complete (pg_is_review-passing) artifact in $(pg_completed_dir) -- the same
+# write-once store oracle-review.sh itself writes into (pg_completed_write, v0.28 #56).
+LEDGER_FILE="$HOME_D/ledger.jsonl"
+COMPLETED_DIR="$(pg_completed_dir)"; mkdir -p "$COMPLETED_DIR"
+
+EVIDENT_NWO=acme/widgets; EVIDENT_NUM=1983   # same slug as $NWO#$NUM -> round_key acme-widgets-1983
+EVIDENT_SHA=4444444444444444444444444444444444444444
+EVIDENT_MARKER=pg-run-acme-widgets-1983-1700000500-1
+printf 'P0: none\nP1: none\nP2: none\nP3: none\nVERDICT: SHIP\n' > "$COMPLETED_DIR/$EVIDENT_MARKER"
+
+UNEVIDENT_NWO=acme/gadgets; UNEVIDENT_NUM=77
+UNEVIDENT_SHA=5555555555555555555555555555555555555555   # no ledger row, no completed artifact: unprovable
+
+: > "$LEDGER_FILE"; : > "$LEGACY_FILE"; : > "$QUARANTINE_FILE"; : > "$STATE_FILE"
+printf '%s\t%s\t%s\n' "$EVIDENT_NWO" "$EVIDENT_NUM" "$EVIDENT_SHA" >> "$LEGACY_FILE"
+printf '%s\t%s\t%s\n' "$UNEVIDENT_NWO" "$UNEVIDENT_NUM" "$UNEVIDENT_SHA" >> "$LEGACY_FILE"
+
+LEDGER_LINE="$(jq -nc --arg ts "2026-01-01T00:00:00+0000" --arg pr "$EVIDENT_NUM" --arg repo "/repos/widgets" \
+  --argjson exit 0 --arg outcome clean --argjson secs 120 --argjson pre_slot_secs 0 --argjson post_slot_secs 0 \
+  --arg kind pr --argjson attempts 1 --argjson conc 1 --argjson ceiling 1 --argjson live 0 --argjson salvaged 0 \
+  --argjson diff_lines 10 --arg out "$COMPLETED_DIR/$EVIDENT_MARKER" --arg model test \
+  --arg marker "$EVIDENT_MARKER" --arg round_key "${EVIDENT_NWO//\//-}-${EVIDENT_NUM}" --arg sha256 deadbeef \
+  --arg reason "" --arg detail "" \
+  '{ts:$ts,pr:$pr,repo:$repo,exit:$exit,outcome:$outcome,secs:$secs,pre_slot_secs:$pre_slot_secs,post_slot_secs:$post_slot_secs,kind:$kind,attempts:$attempts,conc:$conc,ceiling:$ceiling,live:$live,salvaged:$salvaged,diff_lines:$diff_lines,out:$out,model:$model,marker:$marker,round_key:$round_key,sha256:$sha256,reason:$reason,detail:$detail}')"
+pg_ledger_append "$LEDGER_LINE"
+
+daemon_migrate_legacy_processed
+
+check 'a legacy row WITH durable completed-artifact evidence is carried forward into the new ledger' "$(already_done "$EVIDENT_NWO" "$EVIDENT_NUM" "$EVIDENT_SHA"; echo $?)" "$(cat "$STATE_FILE")"
+check 'a legacy row lacking durable evidence is quarantined, not carried forward' "$(! already_done "$UNEVIDENT_NWO" "$UNEVIDENT_NUM" "$UNEVIDENT_SHA" && grep -qF "$(printf '%s\t%s\t%s' "$UNEVIDENT_NWO" "$UNEVIDENT_NUM" "$UNEVIDENT_SHA")" "$QUARANTINE_FILE"; echo $?)" "$(cat "$QUARANTINE_FILE")"
+check 'the legacy file itself is never deleted or truncated by migration' "$([ -s "$LEGACY_FILE" ] && [ "$(wc -l < "$LEGACY_FILE")" -eq 2 ]; echo $?)" "$(cat "$LEGACY_FILE")"
+check 'a quarantined head is genuinely re-evaluated on the next poll, not permanently skipped (already_done is false, so the main loops already_done-continue gate does not suppress it)' "$(! already_done "$UNEVIDENT_NWO" "$UNEVIDENT_NUM" "$UNEVIDENT_SHA"; echo $?)"
+
+STATE_AFTER_FIRST="$(cat "$STATE_FILE")"; QUARANTINE_AFTER_FIRST="$(cat "$QUARANTINE_FILE")"
+daemon_migrate_legacy_processed
+check 'migration run a second time is idempotent: processed-v2.tsv unchanged' "$([ "$(cat "$STATE_FILE")" = "$STATE_AFTER_FIRST" ]; echo $?)" "before=[$STATE_AFTER_FIRST] after=[$(cat "$STATE_FILE")]"
+check 'migration run a second time is idempotent: quarantine unchanged (no duplicate row)' "$([ "$(cat "$QUARANTINE_FILE")" = "$QUARANTINE_AFTER_FIRST" ]; echo $?)" "before=[$QUARANTINE_AFTER_FIRST] after=[$(cat "$QUARANTINE_FILE")]"
 
 [ "$TEST_FAILURES" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$TEST_FAILURES FAILURES"; exit 1; }
