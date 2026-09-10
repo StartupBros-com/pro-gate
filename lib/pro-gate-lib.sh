@@ -1187,8 +1187,8 @@ pg_dirlock_reclaim_dead() {
   # rather than as an owner.<pid> marker. Same question, same fail-closed rules, one
   # implementation -- v0.41 deferred the guard's self-heal specifically so one hardened
   # helper could serve all three call sites instead of two divergent ones. Their shape is
-  # read outside this function too (st_inflight in the engine, pg_reservation_claim_live
-  # here), so it stays as it is and the reclaimer learns it.
+  # read outside this function too (st_inflight in the engine, pg_harvest_claimed here),
+  # so it stays as it is and the reclaimer learns it.
   if [ "$had_marker" = 0 ] && [ -e "$lockdir/pid" ]; then
     had_marker=1
     pid="$(cat "$lockdir/pid" 2>/dev/null || true)"
