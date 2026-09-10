@@ -39,13 +39,17 @@ FAILS_FILE="$HOME_D/failcount.tsv"
 CIDEFER_FILE="$HOME_D/ci-defer.tsv"; AGENTCAP_FILE="$HOME_D/agent-task-attempts.tsv"
 AGENTFAIL_FILE="$HOME_D/agent-task-failures.tsv"
 BLOCKED_FILE="$HOME_D/blocked.tsv"
+# #184 finding 3 (round 6): the new bounded no-progress ledger for exit-zero review workers whose
+# re-resolved decision still requests the same unstarted run-granted-review.
+REVIEWNOPROG_FILE="$HOME_D/review-worker-no-progress.tsv"
 LOG_FILE="$HOME_D/t.log"; : > "$LOG_FILE"
 log(){ printf '%s\n' "$*" >> "$LOG_FILE"; }
 
 check 'daemon.sh created the bounded #184 ledger files at startup' "$([ -f "$CIDEFER_FILE" ] && [ -f "$AGENTCAP_FILE" ] && [ -f "$BLOCKED_FILE" ]; echo $?)" "$(ls "$HOME_D")"
 check 'daemon.sh created the #184 finding-2/3 (round 3) ledger files at startup' "$([ -f "$STATE_FILE" ] && [ -f "$LEGACY_FILE" ] && [ -f "$QUARANTINE_FILE" ] && [ -f "$AGENTFAIL_FILE" ]; echo $?)" "$(ls "$HOME_D")"
+check 'daemon.sh created the #184 finding-1/3 (round 6) evidence dir and no-progress ledger at startup' "$([ -d "$REVIEW_EVIDENCE_DIR" ] && [ -f "$REVIEWNOPROG_FILE" ]; echo $?)" "$(ls "$HOME_D")"
 
-reset_state(){ : > "$STATE_FILE"; : > "$FAILS_FILE"; : > "$CIDEFER_FILE"; : > "$AGENTCAP_FILE"; : > "$AGENTFAIL_FILE"; : > "$BLOCKED_FILE"; : > "$LOG_FILE"; }
+reset_state(){ : > "$STATE_FILE"; : > "$FAILS_FILE"; : > "$CIDEFER_FILE"; : > "$AGENTCAP_FILE"; : > "$AGENTFAIL_FILE"; : > "$BLOCKED_FILE"; : > "$REVIEWNOPROG_FILE"; : > "$LOG_FILE"; }
 
 # --- corpus decision helper (mirrors tests/daemon-reload.test.sh) -----------------------------
 typed_decision(){ # corpus-case index output
@@ -82,13 +86,37 @@ ENGINE="$HOME_D/oracle-review.sh"
 printf '#!/usr/bin/env bash\ncase " $* " in\n  *" --review-decision-effect "*|*" --review-decision "*) cat "$MOCK_FRESH";;\n  *" --recover "*) :;;\nesac\n' > "$ENGINE"
 chmod +x "$ENGINE"
 
-# gh() answers only the #184a CI-readiness query (statusCheckRollup). Nothing else in the fixed
-# daemon.sh flow should call gh once mark_processed_heads no longer looks up the live head.
+# gh() answers the #184a CI-readiness query (statusCheckRollup) and, since round 6 (#184 finding
+# 1), the evidence-persistence fetch daemon_prepare_review_evidence makes (gh pr diff --patch).
+# GH_DIFF_RC lets individual checks simulate a fetch failure (no evidence ever gets persisted,
+# reproducing the pre-fix daemon which never even tried). GH_DIFF_CALLS_FILE counts real fetch
+# attempts so a test can prove the fetch actually happened (not just that a cached file already
+# existed) -- a FILE, not a shell variable, because daemon_prepare_review_evidence invokes gh
+# inside a `( cd "$wt" && gh ... )` subshell, and a subshell's variable mutations never propagate
+# back to this outer shell; a file write does. Read the count with gh_diff_calls().
 GH_ROLLUP='{"statusCheckRollup":[]}'   # default: no checks configured -> settled
+GH_DIFF_RC=0
+GH_DIFF_CALLS_FILE="$HOME_D/gh-diff-calls"; : > "$GH_DIFF_CALLS_FILE"
+gh_diff_calls(){ wc -l < "$GH_DIFF_CALLS_FILE"; }
+GH_DIFF='diff --git a/x b/x
+index e69de29..d00491fd7e5bb6fa28c517a0bb32b8b506539d4d 100644
+--- a/x
++++ b/x
+@@ -0,0 +1 @@
++1
+'
 gh(){
   if [ "${1:-}" = pr ] && [ "${2:-}" = view ]; then
     case " $* " in
       *' --json statusCheckRollup '*) printf '%s\n' "$GH_ROLLUP"; return 0 ;;
+    esac
+  fi
+  if [ "${1:-}" = pr ] && [ "${2:-}" = diff ]; then
+    case " $* " in
+      *' --patch '*)
+        printf 'x\n' >> "$GH_DIFF_CALLS_FILE"
+        [ "${GH_DIFF_RC:-0}" -eq 0 ] && printf '%s\n' "$GH_DIFF"
+        return "${GH_DIFF_RC:-0}" ;;
     esac
   fi
   return 1
@@ -219,6 +247,14 @@ gh(){
   if [ "${1:-}" = pr ] && [ "${2:-}" = view ]; then
     case " $* " in
       *' --json statusCheckRollup '*) printf '%s\n' "$GH_ROLLUP"; return 0 ;;
+    esac
+  fi
+  if [ "${1:-}" = pr ] && [ "${2:-}" = diff ]; then
+    case " $* " in
+      *' --patch '*)
+        printf 'x\n' >> "$GH_DIFF_CALLS_FILE"
+        [ "${GH_DIFF_RC:-0}" -eq 0 ] && printf '%s\n' "$GH_DIFF"
+        return "${GH_DIFF_RC:-0}" ;;
     esac
   fi
   return 1
@@ -476,6 +512,27 @@ write_input_binding(){ # marker head-oid nwo num
     '{charged_spend_epoch:1,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("full-pr:"+$base+":"+$head),mode:"full-pr",proof:{base_oid:$base,endpoint_digest:$endpoint,head_oid:$head,raw_patch_digest:$raw}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:$host,owner:$owner,repo:$repo},target:{head_oid:$head,kind:"pull-request",pr:$pr}}')"
   pg_review_input_binding_write "$marker" "$binding"
 }
+# #184 finding 2 (round 6): mirrors the real producer's ONE writer of review-result-binding/v1
+# records (pg_review_decision_repair_result_binding, oracle-review.sh:284-318) -- for a SHIP verdict,
+# ship_proof is derived from the INPUT BINDING's own already-written evidence.proof fields, never a
+# live re-fetch, which is exactly the offline-checkable invariant daemon_legacy_row_has_durable_evidence
+# now requires (see its comment in daemon/daemon.sh). Requires write_input_binding for this marker
+# to have already run. Written through the real write-once writer, exactly like write_input_binding.
+write_result_binding(){ # marker verdict
+  local marker="$1" verdict="$2" input_binding input_digest artifact_digest ship_proof result
+  input_binding="$(pg_review_input_binding_read "$marker")" || return 1
+  input_digest="$(pg_review_input_binding_digest "$marker")" || return 1
+  artifact_digest="$(pg_sha256 "$COMPLETED_DIR/$marker")" || return 1
+  if [ "$verdict" = SHIP ]; then
+    ship_proof="$(jq -cnS --argjson b "$input_binding" '{base_oid:$b.evidence.proof.base_oid,diff_digest:$b.evidence.proof.raw_patch_digest,head_oid:$b.evidence.proof.head_oid}')"
+  else
+    ship_proof=null
+  fi
+  result="$(jq -cnS --arg cd "$PG_REVIEW_DECISION_CONTRACT_DIGEST" --arg marker "$marker" \
+    --arg id "$input_digest" --arg ad "$artifact_digest" --arg verdict "$verdict" --argjson sp "$ship_proof" \
+    '{accepted_epoch:1,artifact:{digest:$ad,path:("completed/"+$marker)},contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,input_binding_digest:$id,input_binding_identity:$marker,marker:$marker,named_choice:null,provenance:{outcome:"accepted",validated_epoch:1},record_type:"review-result-binding/v1",record_version:1,ship_proof:$sp,verdict:$verdict}')"
+  pg_review_result_binding_write "$marker" "$result"
+}
 append_clean_ledger_row(){ # marker round-key pr artifact-path
   local marker="$1" round_key="$2" pr="$3" out="$4" line
   line="$(jq -nc --arg ts "2026-01-01T00:00:00+0000" --arg pr "$pr" --arg repo "/repos/widgets" \
@@ -504,6 +561,7 @@ printf '%s\t%s\t%s\n' "$EVIDENT_NWO" "$EVIDENT_NUM" "$EVIDENT_SHA" >> "$LEGACY_F
 printf '%s\t%s\t%s\n' "$UNEVIDENT_NWO" "$UNEVIDENT_NUM" "$UNEVIDENT_SHA" >> "$LEGACY_FILE"
 
 write_input_binding "$EVIDENT_MARKER" "$EVIDENT_SHA" "$EVIDENT_NWO" "$EVIDENT_NUM"
+write_result_binding "$EVIDENT_MARKER" SHIP   # #184 finding 2 (round 6): durable evidence now also requires a validated, digest-matching result binding
 append_clean_ledger_row "$EVIDENT_MARKER" "${EVIDENT_NWO//\//-}-${EVIDENT_NUM}" "$EVIDENT_NUM" "$COMPLETED_DIR/$EVIDENT_MARKER"
 
 daemon_migrate_legacy_processed
@@ -532,6 +590,7 @@ SHA_B=7777777777777777777777777777777777777777   # never reviewed; only recorded
 AB_MARKER=pg-run-acme-rockets-42-1700000600-1
 printf 'P0: none\nP1: none\nP2: none\nP3: none\nVERDICT: SHIP\n' > "$COMPLETED_DIR/$AB_MARKER"
 write_input_binding "$AB_MARKER" "$SHA_A" "$AB_NWO" "$AB_NUM"   # binding exists for A only
+write_result_binding "$AB_MARKER" SHIP   # #184 finding 2 (round 6): A also has a validated, digest-matching result binding
 append_clean_ledger_row "$AB_MARKER" "$AB_ROUND_KEY" "$AB_NUM" "$COMPLETED_DIR/$AB_MARKER"
 
 : > "$LEGACY_FILE"; : > "$QUARANTINE_FILE"; : > "$STATE_FILE"
@@ -612,6 +671,7 @@ COLLIDE_SHA=9444444444444444444444444444444444444444   # the SAME sha on both ro
 COLLIDE_MARKER=pg-run-foo-bar-baz-1-1700001100-1
 printf 'P0: none\nP1: none\nP2: none\nP3: none\nVERDICT: SHIP\n' > "$COMPLETED_DIR/$COLLIDE_MARKER"
 write_input_binding "$COLLIDE_MARKER" "$COLLIDE_SHA" "$COLLIDE_NWO_A" "$COLLIDE_NUM_A"   # binding exists for A (owner=foo-bar) only
+write_result_binding "$COLLIDE_MARKER" SHIP   # #184 finding 2 (round 6): A also has a validated, digest-matching result binding
 append_clean_ledger_row "$COLLIDE_MARKER" "${COLLIDE_NWO_A//\//-}-${COLLIDE_NUM_A}" "$COLLIDE_NUM_A" "$COMPLETED_DIR/$COLLIDE_MARKER"
 
 : > "$LEGACY_FILE"; : > "$QUARANTINE_FILE"; : > "$STATE_FILE"
@@ -623,5 +683,187 @@ daemon_migrate_legacy_processed
 check 'the genuinely-bound repository A promotes into the new ledger' "$(already_done "$COLLIDE_NWO_A" "$COLLIDE_NUM_A" "$COLLIDE_SHA"; echo $?)" "$(cat "$STATE_FILE")"
 check 'a DIFFERENT repository B sharing As lossy round_key and even the same sha does NOT promote off As review' "$(! already_done "$COLLIDE_NWO_B" "$COLLIDE_NUM_B" "$COLLIDE_SHA"; echo $?)" "$(cat "$STATE_FILE")"
 check 'B is quarantined rather than silently dropped' "$(grep -qF "$(printf '%s\t%s\t%s' "$COLLIDE_NWO_B" "$COLLIDE_NUM_B" "$COLLIDE_SHA")" "$QUARANTINE_FILE"; echo $?)" "$(cat "$QUARANTINE_FILE")"
+
+echo '# #184 finding 2 (round 6): a SHIP artifact plus a valid exact-sha input binding but a MISSING result binding is quarantined, not promoted -- pg_persist_result (oracle-review.sh) explicitly tolerates result-binding repair failure, so a clean ledger row, a completed SHIP artifact, and a valid input binding can coexist with no result binding, and the live engine treats that as collect-existing-result, not terminal completion'
+
+NORESULT_NWO=acme/relays; NORESULT_NUM=55
+NORESULT_SHA=9555555555555555555555555555555555555555
+NORESULT_MARKER=pg-run-acme-relays-55-1700001200-1
+printf 'P0: none\nP1: none\nP2: none\nP3: none\nVERDICT: SHIP\n' > "$COMPLETED_DIR/$NORESULT_MARKER"
+write_input_binding "$NORESULT_MARKER" "$NORESULT_SHA" "$NORESULT_NWO" "$NORESULT_NUM"   # valid exact-sha input binding; deliberately NO result binding
+append_clean_ledger_row "$NORESULT_MARKER" "${NORESULT_NWO//\//-}-${NORESULT_NUM}" "$NORESULT_NUM" "$COMPLETED_DIR/$NORESULT_MARKER"
+: > "$LEGACY_FILE"; : > "$QUARANTINE_FILE"; : > "$STATE_FILE"
+printf '%s\t%s\t%s\n' "$NORESULT_NWO" "$NORESULT_NUM" "$NORESULT_SHA" >> "$LEGACY_FILE"
+
+check 'sanity: no result binding exists yet for this marker' "$(! pg_review_result_binding_read "$NORESULT_MARKER" >/dev/null 2>&1; echo $?)"
+
+daemon_migrate_legacy_processed
+
+check 'RED: a SHIP artifact + valid input binding but a MISSING result binding is NOT promoted (the live engine would resolve this to collect-existing-result, not terminal completion)' "$(! already_done "$NORESULT_NWO" "$NORESULT_NUM" "$NORESULT_SHA"; echo $?)" "$(cat "$STATE_FILE")"
+check 'the missing-result-binding row is quarantined so normal collect-existing-result can repair it, not silently dropped' "$(grep -qF "$(printf '%s\t%s\t%s' "$NORESULT_NWO" "$NORESULT_NUM" "$NORESULT_SHA")" "$QUARANTINE_FILE"; echo $?)" "$(cat "$QUARANTINE_FILE")"
+
+# Attach a valid, digest-matching result binding for the SAME marker/artifact/input-binding and
+# re-run migration: this is the GREEN half of the red-then-green pair above -- the identical
+# artifact and input-binding state now promotes once (and only once) genuine collection evidence
+# exists.
+write_result_binding "$NORESULT_MARKER" SHIP
+: > "$LEGACY_FILE"; : > "$QUARANTINE_FILE"; : > "$STATE_FILE"
+printf '%s\t%s\t%s\n' "$NORESULT_NWO" "$NORESULT_NUM" "$NORESULT_SHA" >> "$LEGACY_FILE"
+
+daemon_migrate_legacy_processed
+
+check 'GREEN: the SAME row promotes once a validated, digest-matching result binding exists' "$(already_done "$NORESULT_NWO" "$NORESULT_NUM" "$NORESULT_SHA"; echo $?)" "$(cat "$STATE_FILE")"
+
+echo '# #184 finding 2 (round 6): a result binding whose ship_proof does not match the input bindings own stored evidence proof (tampered, or written by a different query) is quarantined too -- offline-checkable per pg_review_decision_repair_result_binings own derivation, oracle-review.sh:284-318'
+
+MISMATCH_NWO=acme/relays; MISMATCH_NUM=56
+MISMATCH_SHA=9666666666666666666666666666666666666666
+MISMATCH_MARKER=pg-run-acme-relays-56-1700001300-1
+printf 'P0: none\nP1: none\nP2: none\nP3: none\nVERDICT: SHIP\n' > "$COMPLETED_DIR/$MISMATCH_MARKER"
+write_input_binding "$MISMATCH_MARKER" "$MISMATCH_SHA" "$MISMATCH_NWO" "$MISMATCH_NUM"
+mismatch_binding="$(pg_review_input_binding_read "$MISMATCH_MARKER")"
+mismatch_input_digest="$(pg_review_input_binding_digest "$MISMATCH_MARKER")"
+mismatch_artifact_digest="$(pg_sha256 "$COMPLETED_DIR/$MISMATCH_MARKER")"
+mismatch_result="$(jq -cnS --arg cd "$PG_REVIEW_DECISION_CONTRACT_DIGEST" --arg marker "$MISMATCH_MARKER" \
+  --arg id "$mismatch_input_digest" --arg ad "$mismatch_artifact_digest" --argjson b "$mismatch_binding" \
+  '{accepted_epoch:1,artifact:{digest:$ad,path:("completed/"+$marker)},contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,input_binding_digest:$id,input_binding_identity:$marker,marker:$marker,named_choice:null,provenance:{outcome:"accepted",validated_epoch:1},record_type:"review-result-binding/v1",record_version:1,ship_proof:{base_oid:"cccccccccccccccccccccccccccccccccccccccc",diff_digest:$b.evidence.proof.raw_patch_digest,head_oid:$b.evidence.proof.head_oid},verdict:"SHIP"}')"
+pg_review_result_binding_write "$MISMATCH_MARKER" "$mismatch_result"
+append_clean_ledger_row "$MISMATCH_MARKER" "${MISMATCH_NWO//\//-}-${MISMATCH_NUM}" "$MISMATCH_NUM" "$COMPLETED_DIR/$MISMATCH_MARKER"
+: > "$LEGACY_FILE"; : > "$QUARANTINE_FILE"; : > "$STATE_FILE"
+printf '%s\t%s\t%s\n' "$MISMATCH_NWO" "$MISMATCH_NUM" "$MISMATCH_SHA" >> "$LEGACY_FILE"
+
+daemon_migrate_legacy_processed
+
+check 'a result binding whose ship_proof.base_oid does not match the input bindings own stored proof is quarantined, not promoted' "$(! already_done "$MISMATCH_NWO" "$MISMATCH_NUM" "$MISMATCH_SHA" && grep -qF "$(printf '%s\t%s\t%s' "$MISMATCH_NWO" "$MISMATCH_NUM" "$MISMATCH_SHA")" "$QUARANTINE_FILE"; echo $?)" "$(cat "$STATE_FILE") / $(cat "$QUARANTINE_FILE")"
+
+echo '# #184 finding 1 (round 6): the daemon persists review evidence outside the disposable worktree and passes it (--diff plus PRO_GATE_REVIEW_ENDPOINT_PATCH) into every subsequent decision query for that exact head, so a head whose evidence is unavailable can never be proven complete, while a head whose evidence IS available resolves instead of looping on prepare-matching-review-evidence forever'
+
+# CRITICAL TEST REQUIREMENT (round 6): the double above (ENGINE, defined near the top of this file)
+# is ARGV-INSENSITIVE by construction -- it returns whatever $MOCK_FRESH points to on any
+# --review-decision/--review-decision-effect call, regardless of whether --diff or
+# PRO_GATE_REVIEW_ENDPOINT_PATCH were passed. That is exactly the flaw the finding names: such a
+# double cannot distinguish a query that would really resolve (matching evidence present) from one
+# that cannot (evidence absent), so it could not have caught a regression that silently stopped
+# wiring evidence into these queries. A full run of the REAL engine (oracle-review.sh) needs a live
+# git repo, gh auth, and a real claude subprocess, and is impractical inside this offline,
+# ~20-test-file-budget unit suite -- so, per the finding's own stated fallback, the double is
+# rebuilt here to be ARGV-AWARE instead: for every --review-decision/--review-decision-effect call
+# it returns the same prepare-matching-review-evidence action the real engine's read-only query
+# returns when it cannot establish a current evidence relation (the real engine's --diff-gated
+# auto-fetch is DIFF_IS_CALLER_SUPPLIED-controlled; a query with neither --diff nor
+# PRO_GATE_REVIEW_ENDPOINT_PATCH can never reach the evidence this fixture models) UNLESS BOTH
+# --diff and PRO_GATE_REVIEW_ENDPOINT_PATCH are present, in which case it returns the nominated
+# completing decision -- so a daemon regression that stops wiring evidence into a query reproduces
+# the real engine's actual failure mode here, not a stub artifact that cannot fail the way
+# production fails. This is scoped to this section only: it is installed after every prior check in
+# this file has already run against the original argv-insensitive double, and nothing after this
+# point relies on the original double's unconditional behavior.
+NOEVID_DECISION="$HOME_D/noevid.json"; typed_decision "$(decision_for_action prepare-matching-review-evidence)" "$NOEVID_DECISION"
+check 'sanity: the no-evidence corpus fixture is agent-task/prepare-matching-review-evidence' "$([ "$(jq -r .action "$NOEVID_DECISION")" = prepare-matching-review-evidence ] && [ "$(jq -r .effect_request.execution_class "$NOEVID_DECISION")" = agent-task ]; echo $?)" "$(jq -c '{action:.action,class:.effect_request.execution_class}' "$NOEVID_DECISION")"
+
+cat > "$ENGINE" <<'ENGINESCRIPT'
+#!/usr/bin/env bash
+case " $* " in
+  *" --review-decision-effect "*|*" --review-decision "*)
+    case " $* " in
+      *" --diff "*)
+        if [ -n "${PRO_GATE_REVIEW_ENDPOINT_PATCH:-}" ]; then cat "$MOCK_FRESH"; else cat "$NOEVID_DECISION"; fi ;;
+      *) cat "$NOEVID_DECISION" ;;
+    esac
+    ;;
+  *" --recover "*) : ;;
+esac
+ENGINESCRIPT
+chmod +x "$ENGINE"
+export NOEVID_DECISION
+
+echo '# finding 1 RED: evidence fetch unavailable -- the daemon can never resolve a completing decision for this head, only prepare-matching-review-evidence, bounded only by the pre-existing agent-task no-progress cap, never completed'
+reset_state
+rm -f "$REVIEW_EVIDENCE_DIR"/*.diff 2>/dev/null
+GH_DIFF_RC=1   # simulate gh pr diff failing -- no evidence is ever persisted, matching a daemon that never wires evidence in at all
+AGENT_RUNS_NOEVID=0
+daemon_run_agent_task(){ AGENT_RUNS_NOEVID=$((AGENT_RUNS_NOEVID + 1)); return 0; }
+i=1
+noevid_ok=1
+while [ "$i" -lt "$AGENT_TASK_MAX" ]; do
+  MOCK_FRESH="$NOEVID_DECISION" process_pr "$NWO" "$NUM" "$SHA" "$BRANCH" "$URL" >/dev/null; rc=$?
+  { [ "$rc" -eq 0 ] && ! already_done "$NWO" "$NUM" "$SHA"; } || noevid_ok=0
+  i=$((i + 1))
+done
+check "without evidence, every poll below the cap ($((AGENT_TASK_MAX - 1)) of them) resolves to prepare-matching-review-evidence and never completes the head" "$([ "$noevid_ok" -eq 1 ]; echo $?)"
+MOCK_FRESH="$NOEVID_DECISION" process_pr "$NWO" "$NUM" "$SHA" "$BRANCH" "$URL"; noevid_cap_rc=$?
+check 'without evidence, the head is eventually BLOCKED by the pre-existing agent-task no-progress cap -- never completed, never marked done' "$([ "$noevid_cap_rc" -eq 0 ] && ! already_done "$NWO" "$NUM" "$SHA" && is_blocked "$NWO" "$NUM" "$SHA"; echo $?)" "rc=$noevid_cap_rc $(cat "$BLOCKED_FILE")"
+check 'the evidence directory stayed empty for this head the whole time (fetch never succeeded)' "$([ -z "$(ls -A "$REVIEW_EVIDENCE_DIR" 2>/dev/null)" ]; echo $?)" "$(ls "$REVIEW_EVIDENCE_DIR" 2>/dev/null)"
+
+echo '# finding 1 GREEN: evidence fetch available -- the daemon persists it outside the worktree, passes it into the query, and the SAME head resolves to completion instead of relaunching'
+reset_state
+rm -f "$REVIEW_EVIDENCE_DIR"/*.diff 2>/dev/null
+GH_DIFF_RC=0
+: > "$GH_DIFF_CALLS_FILE"
+GREEN_DECISION="$HOME_D/green-complete.json"
+typed_decision_patch '{"prior_review":{"applicable":false,"binding_valid":true,"code_identity":"input-current","evidence_identity":"evidence-current","legacy":false,"marker":"pg-run-acme-widgets-1983-1700002000-1","provenance_valid":true,"verdict":"NONE"}}' "$GREEN_DECISION"
+check 'sanity: the green completing fixture is stop-without-new-review/identical-code-and-evidence' "$([ "$(jq -r .action "$GREEN_DECISION")" = stop-without-new-review ] && [ "$(jq -r .reason "$GREEN_DECISION")" = identical-code-and-evidence ]; echo $?)"
+MOCK_FRESH="$GREEN_DECISION" process_pr "$NWO" "$NUM" "$SHA" "$BRANCH" "$URL"; green_rc=$?
+check 'with evidence persisted and wired into the query, the SAME head completes on this poll (no agent-task relaunch)' "$([ "$green_rc" -eq 0 ] && already_done "$NWO" "$NUM" "$SHA"; echo $?)" "rc=$green_rc"
+check 'the evidence fetch was actually made exactly once (not skipped)' "$([ "$(gh_diff_calls)" -eq 1 ]; echo $?)" "calls=$(gh_diff_calls)"
+check 'completion cleans up the now-unneeded persisted evidence file for this exact head' "$([ ! -e "$(daemon_evidence_file "$NWO" "$NUM" "$SHA")" ]; echo $?)" "$(ls "$REVIEW_EVIDENCE_DIR" 2>/dev/null)"
+
+echo '# finding 1: superseding a head (new push, new sha) prunes its now-stale persisted evidence rather than accumulating unboundedly'
+reset_state
+rm -f "$REVIEW_EVIDENCE_DIR"/*.diff 2>/dev/null
+daemon_run_agent_task(){ return 2; }   # capability-unavailable; a deliberate no-op so this section only exercises evidence bookkeeping
+MOCK_FRESH="$NOEVID_DECISION" process_pr "$NWO" "$NUM" "$SHA" "$BRANCH" "$URL" >/dev/null
+check 'evidence for the current sha now exists on disk' "$([ -s "$(daemon_evidence_file "$NWO" "$NUM" "$SHA")" ]; echo $?)" "$(ls "$REVIEW_EVIDENCE_DIR" 2>/dev/null)"
+SUPERSEDE_SHA=8888888888888888888888888888888888888888
+MOCK_FRESH="$NOEVID_DECISION" process_pr "$NWO" "$NUM" "$SUPERSEDE_SHA" "$BRANCH" "$URL" >/dev/null
+check 'a new push (new sha) prunes the OLD shas persisted evidence rather than accumulating both' "$([ ! -e "$(daemon_evidence_file "$NWO" "$NUM" "$SHA")" ]; echo $?)" "$(ls "$REVIEW_EVIDENCE_DIR" 2>/dev/null)"
+check 'the new shas own evidence file now exists in its place' "$([ -s "$(daemon_evidence_file "$NWO" "$NUM" "$SUPERSEDE_SHA")" ]; echo $?)" "$(ls "$REVIEW_EVIDENCE_DIR" 2>/dev/null)"
+
+echo '# #184 finding 3 (round 6): a review worker that exits 0 but never actually submits (the re-resolved decision still requests the SAME unstarted run-granted-review) is bounded by its own no-progress cap, escalating to blocked.tsv, never the completion ledger; genuine progress toward a different outcome is never penalised'
+
+reset_state
+rm -f "$REVIEW_EVIDENCE_DIR"/*.diff 2>/dev/null
+GH_DIFF_RC=0
+NOPROG_RUN_DECISION="$HOME_D/noprog-run.json"; typed_decision "$(decision_for_action run-granted-review)" "$NOPROG_RUN_DECISION"
+daemon_run_review_worker(){ return 0; }   # exits 0 but never actually submitted -- MOCK_FRESH stays the SAME unstarted run-granted-review decision on re-resolution
+below_noprog_cap_ok=1
+i=1
+while [ "$i" -lt "$REVIEW_WORKER_NO_PROGRESS_MAX" ]; do
+  MOCK_FRESH="$NOPROG_RUN_DECISION" process_pr "$NWO" "$NUM" "$SHA" "$BRANCH" "$URL"; rc=$?
+  { [ "$rc" -eq 2 ] && ! already_done "$NWO" "$NUM" "$SHA" && ! is_blocked "$NWO" "$NUM" "$SHA"; } || below_noprog_cap_ok=0
+  i=$((i + 1))
+done
+check "every exit-0-no-progress review worker below the cap ($((REVIEW_WORKER_NO_PROGRESS_MAX - 1)) of them) stays retryable, never blocked, never completed" "$([ "$below_noprog_cap_ok" -eq 1 ] && [ "$(wc -l < "$REVIEWNOPROG_FILE")" -eq $((REVIEW_WORKER_NO_PROGRESS_MAX - 1)) ]; echo $?)" "$(cat "$REVIEWNOPROG_FILE")"
+MOCK_FRESH="$NOPROG_RUN_DECISION" process_pr "$NWO" "$NUM" "$SHA" "$BRANCH" "$URL"; noprog_cap_rc=$?
+# Note: unlike the agent-task no-progress cap (which returns the underlying rc=0 agent-task exit
+# code even once blocked), this review-worker re-resolve path returns 2 (retryable-defer)
+# UNCONDITIONALLY on this branch, whether or not the no-progress cap was just exhausted -- see
+# daemon.sh's process_pr, the "review_ran" re-resolve block. That numeric code carries no
+# production meaning: the dispatch loop (daemon.sh ~line 1093) never reads process_pr's exit
+# status at all, only is_blocked()/already_done() (checked at the top of the NEXT process_pr call)
+# govern whether dispatch happens again. So the meaningful assertion here is is_blocked +
+# !already_done, not a specific rc.
+check 'the cap-th exit-0-no-progress review worker BLOCKS (never completes)' "$(! already_done "$NWO" "$NUM" "$SHA" && is_blocked "$NWO" "$NUM" "$SHA"; echo $?)" "rc=$noprog_cap_rc $(cat "$BLOCKED_FILE")"
+check 'the no-progress exhaustion is recorded as review-worker-no-progress-cap-exhausted in blocked.tsv, never processed-v2.tsv' "$([ ! -s "$STATE_FILE" ] && grep -qF "$(printf '%s\t%s\t%s\treview-worker-no-progress-cap-exhausted' "$NWO" "$NUM" "$SHA")" "$BLOCKED_FILE"; echo $?)" "$(cat "$BLOCKED_FILE")"
+
+WORKER_RUNS_NOPROG=0
+daemon_run_review_worker(){ WORKER_RUNS_NOPROG=$((WORKER_RUNS_NOPROG + 1)); return 0; }
+MOCK_FRESH="$NOPROG_RUN_DECISION" process_pr "$NWO" "$NUM" "$SHA" "$BRANCH" "$URL"
+check 'a further poll on the no-progress-blocked head never relaunches the review worker again' "$([ "$WORKER_RUNS_NOPROG" -eq 0 ]; echo $?)" "runs=$WORKER_RUNS_NOPROG"
+
+echo '# finding 3: genuine progress toward a DIFFERENT outcome (collect-existing-result) is never charged against the no-progress cap, however many times it is driven past the cap'
+reset_state
+rm -f "$REVIEW_EVIDENCE_DIR"/*.diff 2>/dev/null
+COLLECT_DECISION="$HOME_D/progress-collect.json"; typed_decision "$(decision_for_action collect-existing-result)" "$COLLECT_DECISION"
+check 'sanity: the progress fixture is runtime-guarded-effect/collect-existing-result' "$([ "$(jq -r .action "$COLLECT_DECISION")" = collect-existing-result ]; echo $?)" "$(jq -r .action "$COLLECT_DECISION")"
+daemon_run_review_worker(){ MOCK_FRESH="$COLLECT_DECISION"; return 0; }
+PROGRESS_RUN_DECISION="$HOME_D/progress-run.json"; typed_decision "$(decision_for_action run-granted-review)" "$PROGRESS_RUN_DECISION"
+i=1
+while [ "$i" -le "$((REVIEW_WORKER_NO_PROGRESS_MAX * 2))" ]; do
+  MOCK_FRESH="$PROGRESS_RUN_DECISION" process_pr "$NWO" "$NUM" "$SHA" "$BRANCH" "$URL" >/dev/null
+  i=$((i + 1))
+done
+check "a review worker whose re-resolved decision advances to a DIFFERENT action (collect-existing-result), driven well past the no-progress cap ($((REVIEW_WORKER_NO_PROGRESS_MAX * 2))x), never increments the no-progress counter" "$([ ! -s "$REVIEWNOPROG_FILE" ]; echo $?)" "$(cat "$REVIEWNOPROG_FILE")"
+check 'and is therefore never blocked by it' "$(! is_blocked "$NWO" "$NUM" "$SHA"; echo $?)"
 
 [ "$TEST_FAILURES" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$TEST_FAILURES FAILURES"; exit 1; }

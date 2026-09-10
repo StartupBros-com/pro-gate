@@ -132,7 +132,18 @@ daemon_run_review_worker(){ # saved run-granted-review decision-file
   # here, so the bare form would fail on the common path, not an edge case.
   local review_timeout=()
   [ -z "${PRO_REVIEW_ENGINE_TIMEOUT:-}" ] || review_timeout=(--timeout "$PRO_REVIEW_ENGINE_TIMEOUT")
-  printf -v command_text '%q ' "$DD_ENGINE" --review-decision --review-decision-effect "$decision" --pr "$DD_NUM" --repo "$DD_WORKTREE" "${DD_INPUT_ARGS[@]}" --out "$DD_LOG.review" ${review_timeout[@]+"${review_timeout[@]}"}
+  # #184 finding 1 (round 6): the charged binding installed for THIS effect (run-granted-review)
+  # clones the query-time REVIEW_DECISION_INPUT_TEMPLATE (oracle-review.sh), so the evidence
+  # relation this exact invocation sees must be the persisted (nwo,num,sha) evidence file, not
+  # whatever the engine would auto-fetch on its own. endpoint_prefix is built in a SEPARATE printf
+  # call from command_text on purpose: printf's %q format string is reapplied (recycled) to every
+  # extra argument once more arguments are supplied than conversions, so folding a literal
+  # env-assignment prefix into the SAME recycled-format call as the rest of the argv would
+  # re-prefix "PRO_GATE_REVIEW_ENDPOINT_PATCH=" onto later argv tokens too.
+  local endpoint_prefix=""
+  [ -n "${DD_EVIDENCE_FILE:-}" ] && printf -v endpoint_prefix 'PRO_GATE_REVIEW_ENDPOINT_PATCH=%q ' "$DD_EVIDENCE_FILE"
+  printf -v command_text '%q ' "$DD_ENGINE" --review-decision --review-decision-effect "$decision" --pr "$DD_NUM" --repo "$DD_WORKTREE" "${DD_INPUT_ARGS[@]}" "${DD_EVIDENCE_ARGS[@]}" --out "$DD_LOG.review" ${review_timeout[@]+"${review_timeout[@]}"}
+  command_text="${endpoint_prefix}${command_text}"
   prompt="First action: execute this exact argv-quoted guarded runtime effect; it rechecks the saved review-decision/v1 before any charge or submission:
 $command_text
 After that action, invoke the /pro-gate skill and let its typed review-decision/v1 re-resolution select every subsequent fix, evidence, or reporting action. Do not infer a continuation from verdict, prose, phase, exit status, recoverability, or rounds, and do not ask routine permission.
@@ -149,7 +160,12 @@ daemon_run_agent_task(){ # saved decision-file validated action
     return 2
   }
   printf -v target 'PR #%q (%q), local repository %q' "$DD_NUM" "$DD_NWO" "$DD_WORKTREE"
-  printf -v reentry '%q ' "$DD_ENGINE" --review-decision --json --pr "$DD_NUM" --repo "$DD_WORKTREE" "${DD_INPUT_ARGS[@]}"
+  # #184 finding 1 (round 6): see daemon_run_review_worker above for why the env-assignment prefix
+  # is built via a separate printf call rather than folded into the recycled-format one.
+  local reentry_prefix=""
+  [ -n "${DD_EVIDENCE_FILE:-}" ] && printf -v reentry_prefix 'PRO_GATE_REVIEW_ENDPOINT_PATCH=%q ' "$DD_EVIDENCE_FILE"
+  printf -v reentry '%q ' "$DD_ENGINE" --review-decision --json --pr "$DD_NUM" --repo "$DD_WORKTREE" "${DD_INPUT_ARGS[@]}" "${DD_EVIDENCE_ARGS[@]}"
+  reentry="${reentry_prefix}${reentry}"
   prompt="Control-safe typed action: $action.
 Target: $target.
 Saved validated review-decision/v1 path: $(printf '%q' "$decision").
@@ -168,7 +184,7 @@ When a valid typed decision makes it safe, finish the existing headless auto-fix
 daemon_handle_review_worker_failure(){ # worker-rc; fresh typed decision decides whether wrapper failure budget waits
   local worker_rc="$1" fresh action
   fresh="$DD_LOG.decision-after-run.json"
-  if ! "$DD_ENGINE" --review-decision --json --pr "$DD_NUM" --repo "$DD_WORKTREE" "${DD_INPUT_ARGS[@]}" >"$fresh" 2>>"$DD_LOG"; then
+  if ! PRO_GATE_REVIEW_ENDPOINT_PATCH="${DD_EVIDENCE_FILE:-}" "$DD_ENGINE" --review-decision --json --pr "$DD_NUM" --repo "$DD_WORKTREE" "${DD_INPUT_ARGS[@]}" "${DD_EVIDENCE_ARGS[@]}" >"$fresh" 2>>"$DD_LOG"; then
     note_fail "$DD_NWO" "$DD_NUM" "$DD_SHA" "$DD_LOG" "runtime-selected review worker rc=$worker_rc; replacement query failed"
     return 1
   fi
@@ -205,7 +221,7 @@ daemon_dispatch_decision(){ # decision-file [redirect-depth]
       return $? ;;
     runtime-guarded-effect/collect-existing-result|runtime-guarded-effect/recover-existing-review)
       fresh="$DD_LOG.decision-effect-$depth.json"
-      if ! "$DD_ENGINE" --review-decision --review-decision-effect "$decision" --pr "$DD_NUM" --repo "$DD_WORKTREE" "${DD_INPUT_ARGS[@]}" >"$fresh" 2>>"$DD_LOG"; then
+      if ! PRO_GATE_REVIEW_ENDPOINT_PATCH="${DD_EVIDENCE_FILE:-}" "$DD_ENGINE" --review-decision --review-decision-effect "$decision" --pr "$DD_NUM" --repo "$DD_WORKTREE" "${DD_INPUT_ARGS[@]}" "${DD_EVIDENCE_ARGS[@]}" >"$fresh" 2>>"$DD_LOG"; then
         daemon_defer_decision "runtime effect recheck failed"
         return 2
       fi
@@ -338,6 +354,7 @@ FAILS="$ROOT/failcount.tsv"          # repo<TAB>pr<TAB>sha  (one line per failed
 CIDEFER="$ROOT/ci-defer.tsv"         # repo<TAB>pr<TAB>sha  (CI-not-settled deferral count; #184)
 AGENTCAP="$ROOT/agent-task-attempts.tsv"  # repo<TAB>pr<TAB>sha (agent-task dispatch count with no head progress; #184)
 AGENTFAIL="$ROOT/agent-task-failures.tsv"  # repo<TAB>pr<TAB>sha (agent-task LAUNCH failures, rc=1 only; #184c finding 3)
+REVIEWNOPROG="$ROOT/review-worker-no-progress.tsv"  # repo<TAB>pr<TAB>sha (review-worker rc=0, re-resolved decision still run-granted-review; #184 finding 3 round 6)
 # #184c findings 1+2: a cap (CI_DEFER_MAX or AGENT_TASK_MAX) being exhausted is an escalation, not
 # completion. It is recorded ONLY here, one line per (repo,pr,sha), and NEVER in $STATE -- a
 # blocked head must be findable by a human but must never look "done" to the idempotency ledger.
@@ -345,9 +362,16 @@ AGENTFAIL="$ROOT/agent-task-failures.tsv"  # repo<TAB>pr<TAB>sha (agent-task LAU
 # its semantics are unchanged by this ledger). Keyed by sha, so a new push naturally clears it --
 # the new sha simply has no line here yet.
 BLOCKED="$ROOT/blocked.tsv"          # repo<TAB>pr<TAB>sha<TAB>reason  (cap-exhaustion escalation; never $STATE)
+# #184 finding 1 (round 6): persisted review evidence, OUTSIDE the disposable worktree and outside
+# the engine's own always-deleted WORK scratch dir (pg_scratch_cleanup). One raw diff file per
+# (nwo,num,sha), reused as BOTH --diff and PRO_GATE_REVIEW_ENDPOINT_PATCH on every
+# --review-decision query and the actual dispatch command for that exact head -- see the
+# daemon_evidence_* helpers and daemon_prepare_review_evidence below for the full rationale.
+REVIEW_EVIDENCE_DIR="$ROOT/review-evidence"  # nwo-num-sha.diff; pruned on supersession and on completion
 LOGDIR="$ROOT/logs"; mkdir -p "$LOGDIR"
 PAUSE="$ROOT/PAUSE"
-touch "$STATE" "$STATE_LEGACY" "$QUARANTINE" "$FAILS" "$CIDEFER" "$AGENTCAP" "$AGENTFAIL" "$BLOCKED"
+touch "$STATE" "$STATE_LEGACY" "$QUARANTINE" "$FAILS" "$CIDEFER" "$AGENTCAP" "$AGENTFAIL" "$BLOCKED" "$REVIEWNOPROG"
+mkdir -p "$REVIEW_EVIDENCE_DIR"
 
 # #184 finding 3 (round 5): every (repo,pr,sha) identity this daemon tracks -- STATE, STATE_LEGACY,
 # QUARANTINE, the round_key it derives -- is nwo/num/sha only; there is no host field anywhere in
@@ -379,6 +403,18 @@ AGENT_TASK_MAX="${PRO_REVIEW_AGENT_TASK_MAX:-5}"
 # expensive multi-hour task every cycle forever. rc=2 (no safe typed agent-task capability -- the
 # task never actually launched) is never counted here or anywhere: nothing was spent.
 AGENT_TASK_FAIL_MAX="${PRO_REVIEW_AGENT_TASK_FAIL_MAX:-5}"
+# #184 finding 3 (round 6): a FOURTH bounded counter, structurally separate from all of the above.
+# A review worker (runtime-guarded-effect/run-granted-review) that exits 0 WITHOUT ever submitting
+# the guarded review is neither a wrapper-orchestration failure (FAILS/MAX_FAILS -- the subprocess
+# itself did not fail) nor an agent-task attempt (AGENTCAP/AGENTFAIL -- this is the review-worker
+# dispatch path, not the agent-task path): daemon_handle_review_worker_failure only ever runs on a
+# NONZERO worker exit, so a clean-but-empty exit was completely unbounded before this counter --
+# the post-worker re-resolve (process_pr, below) would see the SAME run-granted-review action again
+# and relaunch a paid worker every poll forever. Counts ONLY the specific no-progress shape: worker
+# rc=0 AND the freshly re-resolved decision still selects runtime-guarded-effect/run-granted-review
+# for this UNCHANGED sha. Recovery, collection (any other action), or a head that actually advanced
+# (the fresh decision's target no longer matches this sha) are progress, not counted here.
+REVIEW_WORKER_NO_PROGRESS_MAX="${PRO_REVIEW_WORKER_NO_PROGRESS_MAX:-5}"
 CDP_PORT="${ORACLE_BROWSER_PORT:-9222}"
 REPOS_DIR="${PRO_GATE_REPOS_DIR:-$HOME/SITES}"
 ALL_PRS="${PRO_REVIEW_ALL_PRS:-0}"                      # 1 = review ALL open non-draft PRs in OWNERS (not just `pro-review`-labeled)
@@ -480,6 +516,71 @@ mark_processed_heads(){ # nwo num reviewed-sha
   # round governor) is the dedupe authority for that changed head on the next cycle; the local ledger
   # must not pre-consume it.
   mark_done "$1" "$2" "$3"
+  # #184 finding 1 (round 6): once a head is durably completed it is never re-processed (already_done
+  # short-circuits the main loop below), so its persisted evidence file will never be read again --
+  # remove it now rather than waiting for a later push to prune it via daemon_prune_stale_evidence.
+  rm -f "$(daemon_evidence_file "$1" "$2" "$3")" 2>/dev/null
+}
+
+# #184 finding 1 (round 6): daemon_decision queries never supplied --diff/PRO_GATE_REVIEW_ENDPOINT_PATCH,
+# so pg_review_decision_prospective_input_binding (oracle-review.sh) could never form a non-empty
+# "desired relation" for bundle/both input modes -- evidence.state stayed "missing" forever, and the
+# pure reducer (pg_review_decision_reduce, lib/pro-gate-lib.sh) always answered
+# prepare-matching-review-evidence, even right after an agent successfully completed a SHIP review:
+# nothing the daemon ever persisted OUTSIDE the disposable worktree could satisfy that relation on a
+# LATER poll, once the worktree (and the engine's own WORK scratch dir -- always deleted by
+# pg_scratch_cleanup, oracle-review.sh, independent of the daemon's worktree lifecycle) was gone.
+#
+# Fix: persist ONE raw diff per (nwo,num,sha), keyed to the exact head, OUTSIDE the worktree (under
+# $REVIEW_EVIDENCE_DIR), and feed that SAME file as both --diff and PRO_GATE_REVIEW_ENDPOINT_PATCH
+# into every --review-decision query and the actual dispatch command for that head. This reproduces
+# the engine's own normal (non-caller-supplied) full-pr identity shape, where PG_FULL_PR_RAW_DIGEST
+# is LITERALLY PG_FULL_PR_ENDPOINT_DIGEST (oracle-review.sh ~2985:
+# "PG_FULL_PR_RAW_DIGEST=$PG_FULL_PR_ENDPOINT_DIGEST"), so one persisted file faithfully stands in
+# for both roles. Binding installation for a run-granted-review effect clones the QUERY-TIME
+# template (REVIEW_DECISION_INPUT_TEMPLATE, set inside pg_review_decision_cli only when the effect
+# matches run-granted-review, then cloned onto the charged marker by
+# pg_install_effect_input_binding) rather than independently re-deriving digests later, so reusing
+# the SAME persisted file across every call site for one head is sufficient for a byte-identical
+# relation across the whole daemon-driven lifecycle -- there is no need to byte-match against a
+# hypothetical "true" GitHub-computed diff independently fetched at a different moment.
+daemon_evidence_base(){ printf '%s-%s' "${1//\//-}" "$2"; } # nwo num
+daemon_evidence_file(){ printf '%s/%s-%s.diff' "$REVIEW_EVIDENCE_DIR" "$(daemon_evidence_base "$1" "$2")" "$3"; } # nwo num sha
+
+# Deletes every OTHER sha's persisted evidence for this (nwo,num) -- called on every process_pr
+# entry (below) so a superseded head's evidence never lingers past its next poll. Bounded growth:
+# at most one evidence file per PR the daemon is CURRENTLY tracking; mark_processed_heads (above)
+# removes the file for a head the instant it durably completes.
+daemon_prune_stale_evidence(){ # nwo num keep_sha
+  local nwo="$1" num="$2" keep="$3" base keepfile f
+  base="$(daemon_evidence_base "$nwo" "$num")"
+  keepfile="$(daemon_evidence_file "$nwo" "$num" "$keep")"
+  for f in "$REVIEW_EVIDENCE_DIR/$base-"*.diff; do
+    [ -e "$f" ] || continue
+    [ "$f" = "$keepfile" ] && continue
+    rm -f "$f" 2>/dev/null
+  done
+}
+
+# Ensures a persisted raw diff exists for this exact head and echoes its path. Reused verbatim
+# across polls once fetched (no re-fetch churn), so every --review-decision query and dispatch for
+# this head sees byte-identical evidence. On fetch failure, returns 1 with nothing on stdout: the
+# decision query then runs WITHOUT --diff/PRO_GATE_REVIEW_ENDPOINT_PATCH, same as before this fix,
+# so a genuinely unreachable diff still degrades to the honest prepare-matching-review-evidence
+# answer instead of silently faking completion.
+daemon_prepare_review_evidence(){ # nwo num sha worktree log
+  local nwo="$1" num="$2" sha="$3" wt="$4" lg="$5" f tmp
+  f="$(daemon_evidence_file "$nwo" "$num" "$sha")"
+  daemon_prune_stale_evidence "$nwo" "$num" "$sha"
+  if [ -s "$f" ]; then
+    printf '%s' "$f"; return 0
+  fi
+  tmp="$f.tmp.$$"
+  if ( cd "$wt" && gh pr diff "$num" --patch ) >"$tmp" 2>>"$lg" && [ -s "$tmp" ]; then
+    mv -f "$tmp" "$f" 2>/dev/null && { printf '%s' "$f"; return 0; }
+  fi
+  rm -f "$tmp" 2>/dev/null
+  return 1
 }
 
 # #184 finding 1 (round 4): "durable evidence" for a legacy (repo,pr,sha) row must bind to the
@@ -537,8 +638,32 @@ mark_processed_heads(){ # nwo num reviewed-sha
 # legacy row's own (nwo,num,sha) exactly, so two different repositories or PRs that happen to
 # collide on the same coarse round_key string can never durable-evidence each other's row, even
 # when they share a head sha.
+# #184 finding 2 (round 6): an exact-sha input binding plus a SHIP artifact is STILL not
+# completion -- pg_persist_result (oracle-review.sh) explicitly tolerates result-binding repair
+# failure, so a clean ledger row, a completed SHIP artifact, and a valid input binding can all
+# coexist with a MISSING result binding. The live engine treats that state as
+# collect-existing-result, not terminal completion (pg_review_decision_cli,
+# oracle-review.sh ~524-577): a marker is only "collected" once its review-result-binding/v1
+# record is read back AND its input_binding_digest/artifact.digest match the input binding and
+# artifact actually on disk, verdict matches the artifact's own parsed verdict, and -- for SHIP --
+# its ship_proof matches the evidence the input binding itself proves. Require the identical
+# checks here, reusing pg_review_binding_read/pg_review_input_binding_digest rather than inventing
+# a parallel notion of completion.
+#
+# ship_proof is compared against the INPUT BINDING's own stored proof fields, never a freshly
+# fetched diff: the engine's only writer of ship_proof (pg_review_decision_repair_result_binding,
+# oracle-review.sh:284-318, called both at original charge-time completion oracle-review.sh:2048
+# and at collect-existing-result repair oracle-review.sh:703) derives
+# ship_proof.{base_oid,head_oid,diff_digest} DIRECTLY from the input binding's own evidence.proof
+# fields -- never from a live re-fetch. That equality is therefore an invariant of every result
+# binding the engine has ever written, so it is checkable fully offline, without depending on the
+# PR or its diff still being fetchable at migration time (migration must stay network-free and
+# idempotent; see daemon_migrate_legacy_processed below). A connector-mode SHIP is rejected
+# outright: the live engine never lets a connector observation confer merge-eligibility authority
+# (oracle-review.sh ~576, "Connector observations never become merge handoff authority").
 daemon_legacy_row_has_durable_evidence(){ # nwo num sha -> rc 0 when durable evidence binds EXACTLY this sha
   local nwo="$1" num="$2" sha="$3" owner repo_name ledger completed_dir round_key marker artifact binding found=1
+  local result input_digest artifact_digest mode
   owner="${nwo%%/*}"; repo_name="${nwo#*/}"
   ledger="${PRO_GATE_LEDGER:-$ROOT/ledger.jsonl}"
   completed_dir="$(pg_completed_dir)"
@@ -551,15 +676,40 @@ daemon_legacy_row_has_durable_evidence(){ # nwo num sha -> rc 0 when durable evi
     [ -z "$(pg_capture_foreign_echo "$artifact" "$marker")" ] || continue   # finding 2: reject foreign/mixed capture
     [ "$(pg_extract_verdict "$artifact")" = SHIP ] || continue             # finding 2: only a SHIP outcome completes
     binding="$(pg_review_binding_read input "$marker" 2>/dev/null)" || continue
-    if jq -e --arg h "$DAEMON_HOST" --arg o "$owner" --arg r "$repo_name" --argjson p "$num" --arg sha "$sha" '
+    jq -e --arg h "$DAEMON_HOST" --arg o "$owner" --arg r "$repo_name" --argjson p "$num" --arg sha "$sha" '
          (.repository.host // "") == $h and
          (.repository.owner // "") == $o and
          (.repository.repo // "") == $r and
          (.target.pr // -1) == $p and
          (.target.head_oid // "") == $sha
-       ' <<<"$binding" >/dev/null 2>&1; then # finding 3: identity-exact, not round_key-exact
-      found=0; break
-    fi
+       ' <<<"$binding" >/dev/null 2>&1 || continue # finding 3: identity-exact, not round_key-exact
+
+    # finding 2 (round 6): require a validated, digest-matching result binding -- see comment
+    # above the function. No result binding, or a digest/verdict mismatch, means this row is
+    # NOT durably completed; leave it uncollected so normal collect-existing-result can repair it.
+    result="$(pg_review_binding_read result "$marker" 2>/dev/null)" || continue
+    input_digest="$(pg_review_input_binding_digest "$marker" 2>/dev/null)" || continue
+    artifact_digest="$(pg_sha256 "$artifact" 2>/dev/null)" || continue
+    jq -e --arg ib "$input_digest" --arg ad "$artifact_digest" \
+        '.input_binding_digest==$ib and .artifact.digest==$ad and .verdict=="SHIP"' \
+        <<<"$result" >/dev/null 2>&1 || continue
+    mode="$(jq -r '.evidence.mode // empty' <<<"$binding")"
+    case "$mode" in
+      full-pr)
+        jq -e --argjson binding "$binding" '
+            .ship_proof.base_oid==$binding.evidence.proof.base_oid and
+            .ship_proof.head_oid==$binding.evidence.proof.head_oid and
+            .ship_proof.diff_digest==$binding.evidence.proof.raw_patch_digest
+          ' <<<"$result" >/dev/null 2>&1 || continue ;;
+      scoped-delta)
+        jq -e --argjson binding "$binding" '
+            .ship_proof.base_oid==$binding.evidence.proof.base_oid and
+            .ship_proof.head_oid==$binding.evidence.proof.end_oid and
+            .ship_proof.diff_digest==$binding.evidence.proof.raw_digest
+          ' <<<"$result" >/dev/null 2>&1 || continue ;;
+      *) continue ;; # connector: never SHIP merge-eligibility authority
+    esac
+    found=0; break
   done < <(jq -r --arg rk "$round_key" 'select(.outcome=="clean" and (.round_key // "")==$rk) | .marker // empty' "$ledger" 2>/dev/null)
   return "$found"
 }
@@ -637,6 +787,20 @@ agent_task_attempt_count(){ # nwo num sha -> increments and echoes the new count
 agent_task_failure_count(){ # nwo num sha -> increments and echoes the new count
   printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$AGENTFAIL"
   grep -cF "$(printf '%s\t%s\t%s' "$1" "$2" "$3")" "$AGENTFAIL" 2>/dev/null || echo 1
+}
+
+# #184 finding 3 (round 6): count a review worker that exited 0 WITHOUT ever submitting the
+# guarded review -- the fresh, re-resolved decision (process_pr, below) still selects
+# runtime-guarded-effect/run-granted-review for the SAME unchanged sha. Structurally separate from
+# every existing counter: daemon_handle_review_worker_failure/note_fail only ever run on a NONZERO
+# worker exit, and AGENTCAP/AGENTFAIL are the agent-task dispatch path, not the review-worker path.
+# Without this, a clean-but-empty worker exit was completely unbounded -- every later poll would
+# relaunch another paid worker forever. A real push advances the sha and this counter starts fresh
+# for the new sha, so this only bounds a genuine no-progress loop, never a legitimately advancing
+# head.
+review_worker_no_progress_count(){ # nwo num sha -> increments and echoes the new count
+  printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$REVIEWNOPROG"
+  grep -cF "$(printf '%s\t%s\t%s' "$1" "$2" "$3")" "$REVIEWNOPROG" 2>/dev/null || echo 1
 }
 
 # #184a: CI-readiness gate. A CLOSED allowlist of SETTLED states, not an open-set enumeration of
@@ -748,10 +912,18 @@ process_pr(){
   fi
   ( cd "$wt" && git switch -C "$branch" "origin/$branch" >>"$lg" 2>&1 || git checkout -B "$branch" >>"$lg" 2>&1 )
 
+  # #184 finding 1 (round 6): persist this exact head's evidence BEFORE the first decision query --
+  # see daemon_prepare_review_evidence above. evidence_file is empty on fetch failure, which is
+  # honest degradation (the query then runs unevidenced, same as before this fix) rather than a
+  # hard failure of process_pr.
+  local evidence_file evidence_args=()
+  evidence_file="$(daemon_prepare_review_evidence "$nwo" "$num" "$sha" "$wt" "$lg")" || evidence_file=""
+  [ -n "$evidence_file" ] && evidence_args=(--diff "$evidence_file")
+
   # Resolve and validate the runtime's one action before any review worker can start. The decision
   # is advisory; the matching effect re-reduces under runtime protections at execution time.
   local decision="$lg.decision" engine="${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh"
-  if ! "$engine" --review-decision --json --pr "$num" --repo "$wt" "${DD_INPUT_ARGS[@]}" >"$decision" 2>>"$lg" \
+  if ! PRO_GATE_REVIEW_ENDPOINT_PATCH="$evidence_file" "$engine" --review-decision --json --pr "$num" --repo "$wt" "${DD_INPUT_ARGS[@]}" "${evidence_args[@]}" >"$decision" 2>>"$lg" \
       || ! daemon_decision_valid "$decision" || ! daemon_decision_target_matches "$decision" "$nwo" "$num" "$sha"; then
     git -C "$repodir" worktree remove --force "$wt" 2>/dev/null || true
     daemon_defer_decision "missing, malformed, stale, unknown, or corpus-mismatched envelope"
@@ -767,6 +939,7 @@ process_pr(){
     return 2
   fi
   DD_ENGINE="$engine" DD_DECISION="$decision" DD_NWO="$nwo" DD_NUM="$num" DD_SHA="$sha" DD_WORKTREE="$wt" DD_LOG="$lg"
+  DD_EVIDENCE_FILE="$evidence_file"; DD_EVIDENCE_ARGS=("${evidence_args[@]}")
   daemon_dispatch_decision "$decision"
   local rc=$? review_ran="${DAEMON_DISPATCH_REVIEW_RAN:-0}" agent_task_ran="${DAEMON_DISPATCH_AGENT_TASK_RAN:-0}" terminal_completed="${DAEMON_DISPATCH_TERMINAL_COMPLETED:-0}"
 
@@ -834,21 +1007,49 @@ process_pr(){
   # $STATE. If the re-resolved decision does not attest completion, nothing is marked; the freshly
   # re-resolved decision is left for the NEXT poll cycle to dispatch or defer on its own merits
   # (not acted on here, to avoid a second dispatch inside this same cycle).
+  # #184 finding 1 (round 6): reuse the SAME persisted evidence prepared for this head at the top
+  # of process_pr -- $sha (and therefore the evidence file) is unchanged for the whole call, even
+  # though the worker may have pushed a new (unreviewed) commit; see daemon_prepare_review_evidence.
   local redecision="$lg.redecision"
-  if "$engine" --review-decision --json --pr "$num" --repo "$wt" "${DD_INPUT_ARGS[@]}" >"$redecision" 2>>"$lg" \
+  if PRO_GATE_REVIEW_ENDPOINT_PATCH="$evidence_file" "$engine" --review-decision --json --pr "$num" --repo "$wt" "${DD_INPUT_ARGS[@]}" "${evidence_args[@]}" >"$redecision" 2>>"$lg" \
       && daemon_decision_valid "$redecision" \
-      && daemon_decision_target_matches "$redecision" "$nwo" "$num" "$sha" \
-      && daemon_decision_completes_current_head "$redecision"; then
+      && daemon_decision_target_matches "$redecision" "$nwo" "$num" "$sha"; then
+    if daemon_decision_completes_current_head "$redecision"; then
+      git -C "$repodir" worktree remove --force "$wt" 2>/dev/null || true
+      # Mark only the SHA this decision proved was reviewed (#184b). The worker may still push an
+      # implementation after the runtime-selected review, but that produces an unreviewed head; the
+      # runtime's own review-decision is the dedupe authority for it on the next cycle.
+      mark_processed_heads "$nwo" "$num" "$sha"
+      log "  ✓ runtime-selected review worker completed $nwo#$num @ ${sha:0:8} (re-resolved decision attests current-head completion)"
+      return 0
+    fi
     git -C "$repodir" worktree remove --force "$wt" 2>/dev/null || true
-    # Mark only the SHA this decision proved was reviewed (#184b). The worker may still push an
-    # implementation after the runtime-selected review, but that produces an unreviewed head; the
-    # runtime's own review-decision is the dedupe authority for it on the next cycle.
-    mark_processed_heads "$nwo" "$num" "$sha"
-    log "  ✓ runtime-selected review worker completed $nwo#$num @ ${sha:0:8} (re-resolved decision attests current-head completion)"
-    return 0
+    # #184 finding 3 (round 6): the re-resolved decision successfully resolved AND still targets
+    # this exact unchanged sha, but does not attest completion. If it still selects the SAME
+    # unstarted runtime-guarded-effect/run-granted-review, the worker made NO progress at all --
+    # nothing was submitted or charged -- and every later poll would otherwise relaunch another
+    # paid worker forever (see REVIEW_WORKER_NO_PROGRESS_MAX above). Any OTHER action
+    # (collect-existing-result, recover-existing-review, an agent-task, or a differently-reasoned
+    # report-only stop) is real progress toward a different outcome and must never be charged
+    # against this cap.
+    local redecision_action redecision_class
+    redecision_action="$(daemon_decision_action "$redecision")"
+    redecision_class="$(daemon_decision_class "$redecision")"
+    if [ "$redecision_class/$redecision_action" = "runtime-guarded-effect/run-granted-review" ]; then
+      local noprog; noprog="$(review_worker_no_progress_count "$nwo" "$num" "$sha")"
+      if [ "$noprog" -ge "$REVIEW_WORKER_NO_PROGRESS_MAX" ]; then
+        log "  ✗ $nwo#$num @ ${sha:0:8} review worker exited 0 with NO PROGRESS ${noprog}x (still $redecision_action, never submitted) — BLOCKED (no-progress cap reached; not marking done; re-push to retry)."
+        mark_blocked "$nwo" "$num" "$sha" "review-worker-no-progress-cap-exhausted"
+      else
+        log "  · $nwo#$num @ ${sha:0:8} review worker exited 0 but re-resolved decision still requests the same unstarted $redecision_action (no-progress attempt ${noprog}/${REVIEW_WORKER_NO_PROGRESS_MAX}); re-evaluated next cycle"
+      fi
+    else
+      log "  · $nwo#$num @ ${sha:0:8} review worker exited 0; re-resolved decision ($redecision_action) shows progress but not yet current-head completion — not marking done; re-evaluated next cycle, no-progress cap untouched"
+    fi
+    return 2
   fi
   git -C "$repodir" worktree remove --force "$wt" 2>/dev/null || true
-  log "  · $nwo#$num @ ${sha:0:8} review worker exited 0 but the re-resolved decision does not attest current-head completion — not marking done; re-evaluated next cycle"
+  log "  · $nwo#$num @ ${sha:0:8} review worker exited 0 but the re-resolved decision could not be resolved/validated (query failure, invalid envelope, or the head has since moved) — not marking done; re-evaluated next cycle, no-progress cap untouched"
   return 2
 }
 
