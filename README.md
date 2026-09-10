@@ -361,6 +361,7 @@ remain an operator trust boundary.
 | `PRO_GATE_DIFF_HARD_MAX` | `25000` | Above this the engine refuses (exit 11, no spend) |
 | `PRO_GATE_MAX_CONCURRENCY` | `1` | Ceiling for parallel Pro chats; a ramp governor earns up to it on clean streaks |
 | `PRO_GATE_RESERVATION_TTL` | `21600` | Minimum age before confirmed exact-marker misses may exhaust recovery; elapsed time alone never releases it |
+| `PRO_GATE_DIRLOCK_ORPHAN_GRACE` | `5` | No-flock platforms only: seconds an unmarked guard directory must sit before a reclaimer may remove it |
 | `PRO_GATE_TIMEOUT` | `60m` | Default `--timeout` for a fresh review, sized to the ledger's p90 review time; an explicit `--timeout` wins |
 | `PRO_GATE_LOCK_WAIT` | `3900` | How long a queued review waits for an account capacity slot before giving up |
 | `PRO_GATE_CHANGE_LOCK_WAIT` | *(derived)* | Wait for the same-change guard; defaults to the holder's whole guarded lifetime (`15710` at stock settings) |
