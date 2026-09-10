@@ -44,6 +44,14 @@ typed_decision(){ # corpus-case index output
 decision_for_action(){ # action -> corpus index
   jq -r --arg action "$1" '.cases | to_entries[] | select(.value.expected.action == $action) | .key' "$HERE/fixtures/review-decision/v1/corpus.json"
 }
+# Same base_facts as typed_decision, but with an ad-hoc patch not stored in the shared corpus --
+# used for finding-1 coverage so this file's cases don't perturb corpus.json's case count (relied
+# on by tests/review-decision-adapters.test.sh) or engine.test.sh's own corpus iteration.
+typed_decision_patch(){ # patch-json output
+  local patch="$1" out="$2" facts
+  facts="$(jq -cS --arg cd "$(pg_review_decision_contract_digest)" --arg xd "$(pg_review_decision_corpus_digest)" --argjson patch "$patch" '.base_facts * $patch | .contract={contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,corpus_digest:$xd}' "$HERE/fixtures/review-decision/v1/corpus.json")"
+  pg_review_decision_reduce "$facts" > "$out"
+}
 
 NWO=acme/widgets; NUM=1983
 SHA=1111111111111111111111111111111111111111   # matches corpus.json base_facts.target.head_oid
@@ -187,10 +195,68 @@ RUN_DECISION="$HOME_D/run2.json"; typed_decision "$(decision_for_action run-gran
 MOCK_FRESH="$RUN_DECISION" process_pr "$NWO" "$NUM" "$SHA" "$BRANCH" "$URL"; rc=$?
 check 'run-granted-review completion marks the current head' "$([ "$rc" -eq 0 ] && already_done "$NWO" "$NUM" "$SHA"; echo $?)" "rc=$rc"
 
-echo '# a report-only terminal decision completes it'
+echo '# finding 1: a report-only stop completes the head ONLY with positive current-head review proof'
+
 reset_state
 STOP_DECISION="$HOME_D/stop.json"; typed_decision "$(decision_for_action stop-without-new-review)" "$STOP_DECISION"
+check 'sanity: the stop-without-new-review corpus fixture is a NON-completion reason (round-governor-denied)' "$([ "$(jq -r .reason "$STOP_DECISION")" = round-governor-denied ]; echo $?)" "$(jq -r .reason "$STOP_DECISION")"
+STATE_BEFORE="$(cat "$STATE_FILE")"
 MOCK_FRESH="$STOP_DECISION" process_pr "$NWO" "$NUM" "$SHA" "$BRANCH" "$URL"; rc=$?
-check 'stop-without-new-review marks the current head' "$([ "$rc" -eq 0 ] && already_done "$NWO" "$NUM" "$SHA"; echo $?)" "rc=$rc"
+check 'a stop without current-head review proof does NOT complete the head' "$([ "$rc" -eq 0 ] && ! already_done "$NWO" "$NUM" "$SHA"; echo $?)" "rc=$rc"
+check 'a stop without current-head review proof leaves processed.tsv byte-identical' "$([ "$(cat "$STATE_FILE")" = "$STATE_BEFORE" ]; echo $?)" "before=[$STATE_BEFORE] after=[$(cat "$STATE_FILE")]"
+
+reset_state
+PROOF_DECISION="$HOME_D/stop-proof.json"
+typed_decision_patch '{"prior_review":{"applicable":true,"binding_valid":true,"code_identity":"input-current","evidence_identity":"evidence-current","legacy":false,"marker":"pg-run-test-identical","provenance_valid":true,"verdict":"NONE"}}' "$PROOF_DECISION"
+check 'sanity: the synthetic decision is stop-without-new-review/identical-code-and-evidence' "$([ "$(jq -r .action "$PROOF_DECISION")" = stop-without-new-review ] && [ "$(jq -r .reason "$PROOF_DECISION")" = identical-code-and-evidence ]; echo $?)" "action=$(jq -r .action "$PROOF_DECISION") reason=$(jq -r .reason "$PROOF_DECISION")"
+MOCK_FRESH="$PROOF_DECISION" process_pr "$NWO" "$NUM" "$SHA" "$BRANCH" "$URL"; rc=$?
+check 'a stop WITH positive current-head review proof completes the head' "$([ "$rc" -eq 0 ] && already_done "$NWO" "$NUM" "$SHA"; echo $?)" "rc=$rc"
+
+echo '# finding 2: an unrecognized/invented check state is UNSETTLED, never settled (closed allowlist)'
+
+GH_ROLLUP='{"statusCheckRollup":[{"status":"SOMETHING_GITHUB_INVENTS_LATER"}]}'
+state="$(ci_rollup_state "$NWO" "$NUM")"
+check 'an unrecognized CheckRun .status (not in daemon.sh anywhere) reads as unsettled, not settled' "$([ "$state" = SOMETHING_GITHUB_INVENTS_LATER ]; echo $?)" "state=$state"
+
+GH_ROLLUP='{"statusCheckRollup":[{"state":"SOMETHING_GITHUB_INVENTS_LATER"}]}'
+state="$(ci_rollup_state "$NWO" "$NUM")"
+check 'an unrecognized StatusContext .state (not in daemon.sh anywhere) reads as unsettled, not settled' "$([ "$state" = SOMETHING_GITHUB_INVENTS_LATER ]; echo $?)" "state=$state"
+
+GH_ROLLUP='{"statusCheckRollup":[{"status":"REQUESTED"}]}'
+state="$(ci_rollup_state "$NWO" "$NUM")"
+check "GitHub's REQUESTED check-run status reads as unsettled" "$([ "$state" = REQUESTED ]; echo $?)" "state=$state"
+
+GH_ROLLUP='{"statusCheckRollup":[{"state":"EXPECTED"}]}'
+state="$(ci_rollup_state "$NWO" "$NUM")"
+check "GitHub's EXPECTED status-context state reads as unsettled" "$([ "$state" = EXPECTED ]; echo $?)" "state=$state"
+GH_ROLLUP='{"statusCheckRollup":[]}'
+
+echo '# finding 3: only a SUCCESSFUL (rc=0) agent task counts toward the no-progress cap'
+
+reset_state
+daemon_run_agent_task(){ return 1; }   # agent task ended without completion
+below_cap_ok=1
+i=1
+while [ "$i" -le "$((AGENT_TASK_MAX * 2))" ]; do
+  MOCK_FRESH="$AGENT_DECISION" process_pr "$NWO" "$NUM" "$SHA" "$BRANCH" "$URL"; rc=$?
+  { [ "$rc" -eq 1 ] && ! already_done "$NWO" "$NUM" "$SHA"; } || below_cap_ok=0
+  i=$((i + 1))
+done
+check "a failing agent task (rc=1), dispatched well past the cap ($((AGENT_TASK_MAX * 2))x), never completes the head" "$([ "$below_cap_ok" -eq 1 ]; echo $?)"
+check 'a failing agent task never advances the no-progress attempt cap' "$([ ! -s "$AGENTCAP_FILE" ]; echo $?)" "$(cat "$AGENTCAP_FILE")"
+check 'a failing agent task never writes processed.tsv' "$([ ! -s "$STATE_FILE" ]; echo $?)" "$(cat "$STATE_FILE")"
+
+reset_state
+daemon_run_agent_task(){ return 2; }   # no safe typed agent-task capability
+below_cap_ok=1
+i=1
+while [ "$i" -le "$((AGENT_TASK_MAX * 2))" ]; do
+  MOCK_FRESH="$AGENT_DECISION" process_pr "$NWO" "$NUM" "$SHA" "$BRANCH" "$URL"; rc=$?
+  { [ "$rc" -eq 2 ] && ! already_done "$NWO" "$NUM" "$SHA"; } || below_cap_ok=0
+  i=$((i + 1))
+done
+check "a capability-unavailable agent task (rc=2), dispatched well past the cap ($((AGENT_TASK_MAX * 2))x), never completes the head" "$([ "$below_cap_ok" -eq 1 ]; echo $?)"
+check 'a capability-unavailable agent task never advances the no-progress attempt cap' "$([ ! -s "$AGENTCAP_FILE" ]; echo $?)" "$(cat "$AGENTCAP_FILE")"
+check 'a capability-unavailable agent task never writes processed.tsv' "$([ ! -s "$STATE_FILE" ]; echo $?)" "$(cat "$STATE_FILE")"
 
 [ "$TEST_FAILURES" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$TEST_FAILURES FAILURES"; exit 1; }

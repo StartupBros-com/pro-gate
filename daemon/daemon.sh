@@ -44,6 +44,30 @@ daemon_defer_decision(){ # reason
 daemon_decision_action(){ jq -r '.action' "$1"; }
 daemon_decision_class(){ jq -r '.effect_request.execution_class' "$1"; }
 daemon_decision_ref(){ jq -r '.effect_request.applicable_ref // empty' "$1"; }
+daemon_decision_reason(){ jq -r '.reason // empty' "$1"; }
+
+# #184c stop-completion proof: a report-only/stop-without-new-review decision is completion
+# evidence for the CURRENT head only when its own facts positively attest a completed, applicable,
+# non-legacy prior review whose code AND evidence identity match what the runtime just observed for
+# this head (.facts.input.identity / .facts.evidence.identity). This mirrors the reducer's own
+# "identical-code-and-evidence" gate (pg_review_decision_reduce in lib/pro-gate-lib.sh) rather than
+# an allowlist of stop reasons -- reasons are an open set (round-governor-denied, unproven-input,
+# invalid-binding, evidence-preparation-unsafe, no-safe-action, undefined-state, legacy-not-
+# authoritative, a completed-result tie, ...) and every one of those is a NON-completion stop.
+# Positive facts, not reason strings, decide -- see #184 finding 1.
+daemon_stop_is_completion_proof(){ # decision-file
+  jq -e '
+    .facts.prior_review as $p |
+    ($p.applicable == true) and
+    ($p.binding_valid == true) and
+    ($p.provenance_valid == true) and
+    ($p.legacy != true) and
+    ($p.code_identity | type == "string" and length > 0) and
+    ($p.code_identity == .facts.input.identity) and
+    ($p.evidence_identity | type == "string" and length > 0) and
+    ($p.evidence_identity == .facts.evidence.identity)
+  ' "$1" >/dev/null 2>&1
+}
 
 daemon_report_observation(){ # decision-file
   local kind
@@ -179,10 +203,17 @@ daemon_dispatch_decision(){ # decision-file [redirect-depth]
       daemon_run_agent_task "$decision" "$action"
       return $? ;;
     report-only/stop-without-new-review)
-      # A terminal report-only decision: the runtime has typed this current head as needing no
-      # further review work. That IS a valid current-head outcome, so it completes the SHA.
-      DAEMON_DISPATCH_TERMINAL_COMPLETED=1
-      daemon_note "  · $DD_NWO#$DD_NUM stopped by runtime decision; no review worker or failure-budget charge, current head completes"
+      # A report-only stop is completion evidence ONLY when its facts positively attest a
+      # completed, applicable, current-head review (#184c finding 1) -- most stop reasons
+      # (round-governor-denied, unproven-input, invalid-binding, evidence-preparation-unsafe,
+      # no-safe-action, undefined-state, legacy-not-authoritative, a tied completed result, ...)
+      # mean no applicable review ran for this head at all, and must stay retryable.
+      if daemon_stop_is_completion_proof "$decision"; then
+        DAEMON_DISPATCH_TERMINAL_COMPLETED=1
+        daemon_note "  · $DD_NWO#$DD_NUM stopped by runtime decision with current-head review proof; no review worker or failure-budget charge, current head completes"
+      else
+        daemon_note "  · $DD_NWO#$DD_NUM stopped by runtime decision ($(daemon_decision_reason "$decision")) without current-head review proof; no worker dispatched, head stays retryable"
+      fi
       return 0 ;;
     report-only/allow-existing-merge-workflow)
       daemon_note "  · $DD_NWO#$DD_NUM has a runtime-reported merge-workflow handoff; daemon reports only and never merges"
@@ -361,17 +392,24 @@ agent_task_attempt_count(){ # nwo num sha -> increments and echoes the new count
   grep -cF "$(printf '%s\t%s\t%s' "$1" "$2" "$3")" "$AGENTCAP" 2>/dev/null || echo 1
 }
 
-# #184a: CI-readiness gate. QUEUED/IN_PROGRESS/PENDING on the CURRENT head is a deferral, never
-# completed work; an empty rollup means no checks are configured for this repo and counts as
-# settled (never a permanent block). A `gh` query failure is treated the same as not-settled --
-# fail closed rather than dispatch a worker against an unknown CI state.
-ci_rollup_state(){ # nwo num -> "settled", "query-failed", or the first unsettled status token
+# #184a: CI-readiness gate. A CLOSED allowlist of SETTLED states, not an open-set enumeration of
+# unsettled ones (finding 2) -- statusCheckRollup mixes two node types: a CheckRun (.status) is
+# settled only at COMPLETED; a StatusContext (.state) is settled only at SUCCESS/FAILURE/ERROR.
+# Anything else -- GitHub's REQUESTED/WAITING check-run states, EXPECTED status-context state, a
+# future value GitHub adds later, or an unrecognized node shape -- defaults to UNSETTLED. This
+# fails toward deferral, bounded by $CI_DEFER_MAX below. An empty rollup means no checks are
+# configured for this repo and still counts as settled (never a permanent block). A `gh` query
+# failure is treated the same as not-settled -- fail closed rather than dispatch a worker against
+# an unknown CI state.
+ci_rollup_state(){ # nwo num -> "settled", "query-failed", or the first unsettled status/state token
   local nwo="$1" num="$2" rollup
   rollup=$(gh pr view "$num" -R "$nwo" --json statusCheckRollup 2>/dev/null) || { echo "query-failed"; return; }
   printf '%s' "$rollup" | jq -r '
-    ([.statusCheckRollup[]? | (.status // .state // "UNKNOWN")]
-      | map(select(. == "QUEUED" or . == "IN_PROGRESS" or . == "PENDING"))
-      | .[0]) // "settled"
+    def settled:
+      if has("status") then .status == "COMPLETED"
+      elif has("state") then (.state == "SUCCESS" or .state == "FAILURE" or .state == "ERROR")
+      else false end;
+    ([.statusCheckRollup[]? | select(settled | not) | (.status // .state // "UNKNOWN")] | .[0]) // "settled"
   ' 2>/dev/null || echo "query-failed"
 }
 # Bound the deferral with the same per-(repo,pr,sha) ledger shape as $FAILS, so a check stuck
@@ -470,10 +508,18 @@ process_pr(){
   if [ "$review_ran" != 1 ]; then
     git -C "$repodir" worktree remove --force "$wt" 2>/dev/null || true
     if [ "$agent_task_ran" = 1 ]; then
-      local attempts; attempts="$(agent_task_attempt_count "$nwo" "$num" "$sha")"
-      if [ "$attempts" -ge "$AGENT_TASK_MAX" ]; then
-        log "  ✗ $nwo#$num @ ${sha:0:8} agent task dispatched ${attempts}x with no head progress — giving up (marking done; re-push to retry)."
-        mark_done "$nwo" "$num" "$sha"
+      # #184c finding 3: only a genuinely SUCCESSFUL agent task (rc==0) is no-progress-cap
+      # attempt; a failed run (rc=1) or a capability-unavailable defer (rc=2) is not an attempt at
+      # all and must never advance the cap or reach mark_done -- that stays the wrapper failure
+      # budget's business ($FAILS / MAX_FAILS), deliberately separate from this ledger.
+      if [ "$rc" -eq 0 ]; then
+        local attempts; attempts="$(agent_task_attempt_count "$nwo" "$num" "$sha")"
+        if [ "$attempts" -ge "$AGENT_TASK_MAX" ]; then
+          log "  ✗ $nwo#$num @ ${sha:0:8} agent task SUCCEEDED ${attempts}x with no head progress — giving up (marking done; re-push to retry)."
+          mark_done "$nwo" "$num" "$sha"
+        fi
+      else
+        log "  · $nwo#$num @ ${sha:0:8} agent task rc=$rc (not a success); not counted toward the no-progress cap, head stays retryable"
       fi
     elif [ "$terminal_completed" = 1 ] && [ "$rc" -eq 0 ]; then
       mark_processed_heads "$nwo" "$num" "$sha"

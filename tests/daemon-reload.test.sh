@@ -178,10 +178,13 @@ check 'gate #148 r1 P2: daemon recovery passes an explicit PRO_REVIEW_ENGINE_TIM
   "$(grep -Fq -- '--timeout 7m' <<<"$RECOVER_CALL"; echo $?)" "call=$RECOVER_CALL"
 check 'explicit connector input is reused by guarded effect rechecks' "$(grep -F -- '--review-decision-effect' "$TYPED_ENGINE_CALLS" | grep -Fq -- '--input connector'; echo $?)"
 
-# #184: completion requires a typed current-head outcome, not a subprocess exit code. A successful
-# agent task is progress -- it never marks the SHA. A completed run-granted-review worker, and a
-# report-only stop-without-new-review decision, are the only two outcomes that complete it. Every
-# other action, and agent-task failure/unavailable outcomes, remain retryable and budget-neutral.
+# #184/#184c: completion requires a typed current-head outcome, not a subprocess exit code. A
+# successful agent task is progress -- it never marks the SHA. A completed run-granted-review
+# worker completes it; a report-only stop-without-new-review decision completes it ONLY when its
+# facts positively attest a completed, applicable, current-head review (daemon_stop_is_completion_
+# proof) -- most stop reasons (round-governor-denied included) mean no applicable review ran at
+# all. Every other action, and agent-task failure/unavailable outcomes, remain retryable and
+# budget-neutral.
 # CI is reported settled (empty rollup) throughout this block; #184's own CI-gate/deferral-cap and
 # agent-task-attempt-cap coverage lives in tests/daemon-current-head-completion.test.sh.
 PROCESS_REPO="$TYPED_HOME/process-repo"; mkdir -p "$PROCESS_REPO/.git"
@@ -220,11 +223,16 @@ for action in collect-existing-result recover-existing-review allow-existing-mer
   MOCK_FRESH="$decision" MOCK_RECOVERED="$TYPED_HOME/process-recovered" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
   check "$action does not mark a processed SHA or failure budget" "$([ "$process_rc" -eq 0 ] && [ ! -s "$TYPED_STATE" ] && [ ! -s "$TYPED_FAILS" ]; echo $?)" "rc=$process_rc processed=$(wc -c < "$TYPED_STATE") failures=$(wc -c < "$TYPED_FAILS")"
 done
+# #184c finding 1: this corpus's only stop-without-new-review case is round-governor-denied --
+# no applicable review ran, so it must NOT complete the head. Positive current-head review proof
+# ("identical-code-and-evidence") is covered by tests/daemon-current-head-completion.test.sh,
+# which is not in the shared corpus so it does not perturb this file's case count.
 STOP_INDEX="$(jq -r '.cases | to_entries[] | select(.value.expected.action == "stop-without-new-review") | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
 STOP_DECISION="$TYPED_HOME/process-stop.json"; typed_decision "$STOP_INDEX" "$STOP_DECISION"
+check 'sanity: the stop-without-new-review corpus fixture is a NON-completion reason (round-governor-denied)' "$([ "$(jq -r .reason "$STOP_DECISION")" = round-governor-denied ]; echo $?)" "$(jq -r .reason "$STOP_DECISION")"
 : > "$TYPED_STATE"; : > "$TYPED_FAILS"
 MOCK_FRESH="$STOP_DECISION" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
-check 'report-only stop-without-new-review completes the current head' "$([ "$process_rc" -eq 0 ] && already_done acme/widgets 1983 "$PROCESS_SHA" && [ "$(wc -l < "$TYPED_STATE")" -eq 1 ]; echo $?)" "rc=$process_rc state=$(wc -l < "$TYPED_STATE")"
+check 'report-only stop-without-new-review WITHOUT current-head review proof does not complete the head' "$([ "$process_rc" -eq 0 ] && ! already_done acme/widgets 1983 "$PROCESS_SHA" && [ ! -s "$TYPED_STATE" ]; echo $?)" "rc=$process_rc state=$(wc -l < "$TYPED_STATE")"
 # Observation is progress only: it reports, but never changes action selection or prompts.
 typed_decision 2 "$TYPED_HOME/observed-base.json"
 observed_facts="$(jq -cS '.facts | .observation.kind="waiting"' "$TYPED_HOME/observed-base.json")"
