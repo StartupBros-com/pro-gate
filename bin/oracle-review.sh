@@ -3624,7 +3624,11 @@ if [ "$SLOT_OK" != 1 ]; then
   # gave up. Name the lock instead: that is the part an operator can act on (#179).
   if [ "${SLOT_GUARD_BLOCKED:-0}" = 1 ]; then
     echo "ERROR: timed out after ${SLOT_WAIT}s — the reservation handoff guard ($(pg_reservation_lock)) was still unacquirable; account capacity was never read, so no slot was planned or taken and no review was submitted." >&2
-    echo "  This is a lock-path problem, not a busy account: check that ${PRO_GATE_HOME} is writable, and on a system without flock that $(pg_reservation_lock).d is not a directory left behind by a process that is gone." >&2
+    # Do NOT send the operator after a stale guard directory: pg_reservation_guard_acquire runs
+    # pg_dirlock_reclaim_dead on every attempt, so a directory left by a dead process is already
+    # reclaimed inside this same wait, thousands of times over on a default budget. Name only what
+    # can still be true once the whole budget has elapsed.
+    echo "  This is a lock-path problem, not a busy account. A guard left behind by a dead process is reclaimed automatically inside this same wait, so what remains after a full budget is a ${PRO_GATE_HOME} that cannot be written (mkdir and flock must both succeed there), or a live process that is genuinely still holding the guard." >&2
   elif [ "$(pg_reservation_holding_count 2>/dev/null || echo 0)" -gt 0 ] 2>/dev/null; then
     echo "ERROR: timed out after ${SLOT_WAIT}s — 0 of ${EFF_CONC} effective slots free; capacity is held by uncollected review(s), not by running ones." >&2
     pg_report_capacity_holders "$EFF_CONC"

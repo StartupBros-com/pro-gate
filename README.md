@@ -322,7 +322,7 @@ diagnosis; ordinary callers should use `/pro-gate recover` instead.
 | 4 | Repo not found | no |
 | 5 | Diff fetch failed | no |
 | 6 | No usable current review. Check `detail`/`attempt`: recoverable work must be harvested; `not-submitted` was refunded; `submitted-terminal`, `recovery-exhausted`, or `superseded` remains charged but permits a fresh typed decision | maybe |
-| 7 | Per-change lock timeout (another run holds this change) | no |
+| 7 | A wait for exclusive access expired: another run holds this change, every account slot is busy, or the reservation handoff guard could not be acquired. stderr names which, and no review is submitted in any of the three | no |
 | 8 | Deferred: box unfit, low memory, or throttle cooldown; retry later | no |
 | 9 | In-progress: the model was still generating and the tab stays open. `--harvest` by marker; never submit a new review for it | yes |
 | 11 | Oversized diff, past `PRO_GATE_DIFF_HARD_MAX` (default 25,000 lines): scope the payload | no |
