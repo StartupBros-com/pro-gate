@@ -6574,23 +6574,41 @@ check '#155 r2/v0.44.0: a live recorded owner is held even with the grace disabl
 # directory a contender has written into -- so the torn-record path must re-read the owner
 # rather than unlink it by name, which would discard that guarantee.
 #
-# The interleaving has to be forced, or the test passes for the wrong reason: the record is torn
-# at the first read, and the winner completes it before the reclaimer acts. Stretching
-# pg_dir_age_secs holds the window open long enough to be deterministic. Note the pid must be
-# written with NO token, and would still be held by the tokenless-legacy branch if it were seen
-# on the FIRST read -- it is not, which is what makes this the re-read's answer and not that one.
+# The interleaving is INJECTED, not raced. An earlier draft backgrounded a writer behind a sleep
+# and was flaky in both directions: land the write before the reclaimer's FIRST read and the
+# tokenless-legacy branch returns 1, satisfying every assertion here without the re-read ever
+# running; land it after the age check and correct code fails. pg_dir_age_secs is called exactly
+# once, between the two reads, so publishing the winner's record from inside that stub puts the
+# write at the only point that exercises the re-read -- deterministically, with no sleeps.
 DL_G4="$DL_HOME/grace-slowwinner.lock.d"; mkdir -p "$DL_G4"
-: > "$DL_G4/pid"                                   # torn at the moment the reclaimer looks
-( sleep 1; printf '%s\n' "$$" > "$DL_G4/pid" ) &   # the winner finishes mid-decision
-DL_G4_W=$!
+: > "$DL_G4/pid"                                   # torn at the moment the reclaimer first looks
 (
   PRO_GATE_DIRLOCK_ORPHAN_GRACE=0
-  pg_dir_age_secs() { sleep 2; echo 999; }
+  pg_dir_age_secs() { printf '%s\n' "$$" > "$DL_G4/pid"; echo 999; }
   pg_dirlock_reclaim_dead "$DL_G4"
 ); DL_G4_RC=$?
-wait "$DL_G4_W" 2>/dev/null
 check '#155 r2/v0.44.0: a winner that completes its record mid-decision keeps the lock' \
   "$([ "$DL_G4_RC" -ne 0 ] && [ -d "$DL_G4" ] && [ -s "$DL_G4/pid" ]; echo $?)" "rc=$DL_G4_RC"
+
+# The post-grace re-read must fail CLOSED when the read itself fails. An unreadable record and an
+# empty one are different facts; conflating them would let a transient cat failure authorize
+# deleting a record that may name a live owner -- the same fail-open the token checks refuse.
+# cat is stubbed to fail only on the SECOND call, so the first read still sees a torn record and
+# only the re-read is affected.
+DL_G5="$DL_HOME/grace-readfail.lock.d"; mkdir -p "$DL_G5"
+: > "$DL_G5/pid"
+DL_G5_N="$DL_HOME/g5.count"; printf '0\n' > "$DL_G5_N"
+(
+  PRO_GATE_DIRLOCK_ORPHAN_GRACE=0
+  cat() {
+    local n; n="$(command cat "$DL_G5_N")"; printf '%s\n' "$(( n + 1 ))" > "$DL_G5_N"
+    [ "$n" -ge 1 ] && return 1
+    command cat "$@"
+  }
+  pg_dirlock_reclaim_dead "$DL_G5"
+); DL_G5_RC=$?
+check '#155 r2/v0.44.1: a failed re-read of the owner record holds the lock, never deletes it' \
+  "$([ "$DL_G5_RC" -ne 0 ] && [ -d "$DL_G5" ] && [ -e "$DL_G5/pid" ]; echo $?)" "rc=$DL_G5_RC"
 
 # The release must never take a REPLACEMENT. A holder reclaimed while it believed it held
 # the lock runs its exit handler against a path a live process now owns; rm -rf took it.

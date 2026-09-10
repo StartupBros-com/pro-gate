@@ -1231,7 +1231,13 @@ pg_dirlock_reclaim_dead() {
     # Unlinking by name would throw that away, so re-reading restores the equivalent guarantee
     # and narrows the window from the whole grace to the gap before rmdir.
     if [ -e "$lockdir/pid" ]; then
-      pid="$(cat "$lockdir/pid" 2>/dev/null || true)"
+      # No `|| true` here, deliberately. An unreadable record and an EMPTY one are different
+      # facts, and `|| true` reports both as the empty string -- so a cat that merely failed
+      # (a fork under memory pressure, a stalled mount) would authorize deleting a record that
+      # may name a live owner. That is the same fail-open the token checks above refuse, and it
+      # would be a new instance of it in the one branch that unlinks another process's claim.
+      # A failed READ is not evidence of an absent owner: keep the lock and re-decide later.
+      pid="$(cat "$lockdir/pid" 2>/dev/null)" || return 1
       case "$pid" in
         ''|*[!0-9]*) rm -f "$lockdir/pid" "$lockdir/token" 2>/dev/null ;;
         *) return 1 ;;   # a slow winner finished its record during the grace: it holds
