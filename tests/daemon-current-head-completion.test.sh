@@ -173,6 +173,40 @@ MOCK_FRESH="$DECISION" process_pr "$NWO" "$NUM" "$SHA" "$BRANCH" "$URL"; cap_pro
 check 'a further poll on the blocked head still never dispatches and never marks done' "$([ "$cap_process_rc2" -eq 2 ] && [ ! -f "$HOME_D/dispatched" ] && [ ! -s "$STATE_FILE" ]; echo $?)" "rc=$cap_process_rc2"
 GH_ROLLUP='{"statusCheckRollup":[]}'
 
+echo '# finding 2 (round 4): a ci-defer-cap block is lifted once CI positively settles on the SAME unchanged sha, and dispatch actually resumes'
+reset_state
+rm -f "$HOME_D/dispatched-ciclear"
+daemon_run_review_worker(){ echo DISPATCHED >> "$HOME_D/dispatched-ciclear"; return 0; }
+DECISION_F2="$HOME_D/run-f2.json"; typed_decision "$(decision_for_action run-granted-review)" "$DECISION_F2"
+GH_ROLLUP='{"statusCheckRollup":[{"status":"IN_PROGRESS"}]}'
+i=1
+while [ "$i" -lt "$CI_DEFER_MAX" ]; do
+  MOCK_FRESH="$DECISION_F2" process_pr "$NWO" "$NUM" "$SHA" "$BRANCH" "$URL" >/dev/null
+  i=$((i + 1))
+done
+MOCK_FRESH="$DECISION_F2" process_pr "$NWO" "$NUM" "$SHA" "$BRANCH" "$URL"; drive_rc=$?
+check 'driving the sha IN_PROGRESS through the cap blocks it (ci-defer-cap-exhausted)' "$([ "$drive_rc" -eq 2 ] && is_blocked "$NWO" "$NUM" "$SHA" && grep -qF "$(printf '%s\t%s\t%s\tci-defer-cap-exhausted' "$NWO" "$NUM" "$SHA")" "$BLOCKED_FILE"; echo $?)" "$(cat "$BLOCKED_FILE")"
+check '(sanity) dispatch never fired while the sha was CI-not-settled' "$([ ! -f "$HOME_D/dispatched-ciclear" ]; echo $?)"
+
+GH_ROLLUP='{"statusCheckRollup":[{"status":"COMPLETED","conclusion":"SUCCESS"}]}'   # CI now positively settled, unchanged sha
+MOCK_FRESH="$DECISION_F2" process_pr "$NWO" "$NUM" "$SHA" "$BRANCH" "$URL" >/dev/null
+check 'CI settling on the unchanged sha lifts the ci-defer-cap block' "$(! is_blocked "$NWO" "$NUM" "$SHA"; echo $?)" "$(cat "$BLOCKED_FILE")"
+check 'CI settling on the unchanged sha actually resumes dispatch (worker runs, not silently re-suppressed)' "$([ -f "$HOME_D/dispatched-ciclear" ]; echo $?)"
+GH_ROLLUP='{"statusCheckRollup":[]}'
+
+echo '# finding 2 (round 4): an agent-task-exhausted block on the SAME sha is a DIFFERENT condition and is untouched by CI settling'
+reset_state
+mark_blocked "$NWO" "$NUM" "$SHA" "agent-task-no-progress-cap-exhausted"
+check 'sanity: the agent-task block is recorded' "$(is_blocked "$NWO" "$NUM" "$SHA"; echo $?)"
+GH_ROLLUP='{"statusCheckRollup":[]}'   # empty rollup -> settled
+ci_ready "$NWO" "$NUM" "$SHA"; agent_ci_rc=$?
+check 'ci_ready itself proceeds (CI is settled) even though the head remains blocked for an unrelated reason' "$([ "$agent_ci_rc" -eq 0 ]; echo $?)"
+check 'the agent-task block is left in place -- CI settling clears ONLY ci-defer-cap-exhausted rows' "$(is_blocked "$NWO" "$NUM" "$SHA" && grep -qF "$(printf '%s\t%s\t%s\tagent-task-no-progress-cap-exhausted' "$NWO" "$NUM" "$SHA")" "$BLOCKED_FILE"; echo $?)" "$(cat "$BLOCKED_FILE")"
+rm -f "$HOME_D/dispatched-agentblock"
+daemon_run_review_worker(){ echo UNEXPECTED-DISPATCH >> "$HOME_D/dispatched-agentblock"; return 0; }
+MOCK_FRESH="$DECISION_F2" process_pr "$NWO" "$NUM" "$SHA" "$BRANCH" "$URL"; agent_block_rc=$?
+check 'process_pr still suppresses dispatch for the agent-task-blocked head even though CI is settled' "$([ "$agent_block_rc" -eq 2 ] && [ ! -f "$HOME_D/dispatched-agentblock" ]; echo $?)" "rc=$agent_block_rc"
+
 echo '# a gh query failure is treated the same as not-settled, bounded by the same cap'
 GH_ROLLUP='{"statusCheckRollup":[]}'
 reset_state
@@ -374,9 +408,39 @@ echo '# finding 2 (round 3): legacy-ledger migration -- durable evidence carries
 
 # "Durable evidence" = a CLEAN ledger.jsonl row, in the REAL pg_ledger_append/oracle-review.sh
 # shape (oracle-review.sh:2428-2431, written here via the real pg_ledger_append writer, not an
-# invented format), whose round_key matches the PR's slug, and whose .marker names a real,
+# invented format), whose round_key matches the PR's slug, whose .marker names a real,
 # structurally-complete (pg_is_review-passing) artifact in $(pg_completed_dir) -- the same
-# write-once store oracle-review.sh itself writes into (pg_completed_write, v0.28 #56).
+# write-once store oracle-review.sh itself writes into (pg_completed_write, v0.28 #56) -- AND
+# (finding 1, round 4) whose marker carries a review-input-binding record whose target.head_oid
+# is the EXACT legacy sha. write_input_binding below builds that record in the real producer
+# shape oracle-review.sh installs for every dispatched attempt (oracle-review.sh:396-399,
+# `pg_install_effect_input_binding` -> `pg_review_input_binding_write`), not an invented shape,
+# and writes it through the real write-once writer (lib/pro-gate-lib.sh:3178+,
+# `pg_review_binding_write_immutable`).
+write_input_binding(){ # marker head-oid nwo num
+  local marker="$1" head="$2" nwo="$3" num="$4" owner repo base raw endpoint binding
+  owner="${nwo%%/*}"; repo="${nwo#*/}"
+  base=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  raw=1111111111111111111111111111111111111111111111111111111111111111
+  endpoint=2222222222222222222222222222222222222222222222222222222222222222
+  binding="$(jq -cnS --arg cd "$PG_REVIEW_DECISION_CONTRACT_DIGEST" --arg marker "$marker" \
+    --arg host github.com --arg owner "$owner" --arg repo "$repo" --argjson pr "$num" \
+    --arg base "$base" --arg head "$head" --arg endpoint "$endpoint" --arg raw "$raw" \
+    '{charged_spend_epoch:1,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("full-pr:"+$base+":"+$head),mode:"full-pr",proof:{base_oid:$base,endpoint_digest:$endpoint,head_oid:$head,raw_patch_digest:$raw}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:$host,owner:$owner,repo:$repo},target:{head_oid:$head,kind:"pull-request",pr:$pr}}')"
+  pg_review_input_binding_write "$marker" "$binding"
+}
+append_clean_ledger_row(){ # marker round-key pr artifact-path
+  local marker="$1" round_key="$2" pr="$3" out="$4" line
+  line="$(jq -nc --arg ts "2026-01-01T00:00:00+0000" --arg pr "$pr" --arg repo "/repos/widgets" \
+    --argjson exit 0 --arg outcome clean --argjson secs 120 --argjson pre_slot_secs 0 --argjson post_slot_secs 0 \
+    --arg kind pr --argjson attempts 1 --argjson conc 1 --argjson ceiling 1 --argjson live 0 --argjson salvaged 0 \
+    --argjson diff_lines 10 --arg out "$out" --arg model test \
+    --arg marker "$marker" --arg round_key "$round_key" --arg sha256 deadbeef \
+    --arg reason "" --arg detail "" \
+    '{ts:$ts,pr:$pr,repo:$repo,exit:$exit,outcome:$outcome,secs:$secs,pre_slot_secs:$pre_slot_secs,post_slot_secs:$post_slot_secs,kind:$kind,attempts:$attempts,conc:$conc,ceiling:$ceiling,live:$live,salvaged:$salvaged,diff_lines:$diff_lines,out:$out,model:$model,marker:$marker,round_key:$round_key,sha256:$sha256,reason:$reason,detail:$detail}')"
+  pg_ledger_append "$line"
+}
+
 LEDGER_FILE="$HOME_D/ledger.jsonl"
 COMPLETED_DIR="$(pg_completed_dir)"; mkdir -p "$COMPLETED_DIR"
 
@@ -392,18 +456,12 @@ UNEVIDENT_SHA=5555555555555555555555555555555555555555   # no ledger row, no com
 printf '%s\t%s\t%s\n' "$EVIDENT_NWO" "$EVIDENT_NUM" "$EVIDENT_SHA" >> "$LEGACY_FILE"
 printf '%s\t%s\t%s\n' "$UNEVIDENT_NWO" "$UNEVIDENT_NUM" "$UNEVIDENT_SHA" >> "$LEGACY_FILE"
 
-LEDGER_LINE="$(jq -nc --arg ts "2026-01-01T00:00:00+0000" --arg pr "$EVIDENT_NUM" --arg repo "/repos/widgets" \
-  --argjson exit 0 --arg outcome clean --argjson secs 120 --argjson pre_slot_secs 0 --argjson post_slot_secs 0 \
-  --arg kind pr --argjson attempts 1 --argjson conc 1 --argjson ceiling 1 --argjson live 0 --argjson salvaged 0 \
-  --argjson diff_lines 10 --arg out "$COMPLETED_DIR/$EVIDENT_MARKER" --arg model test \
-  --arg marker "$EVIDENT_MARKER" --arg round_key "${EVIDENT_NWO//\//-}-${EVIDENT_NUM}" --arg sha256 deadbeef \
-  --arg reason "" --arg detail "" \
-  '{ts:$ts,pr:$pr,repo:$repo,exit:$exit,outcome:$outcome,secs:$secs,pre_slot_secs:$pre_slot_secs,post_slot_secs:$post_slot_secs,kind:$kind,attempts:$attempts,conc:$conc,ceiling:$ceiling,live:$live,salvaged:$salvaged,diff_lines:$diff_lines,out:$out,model:$model,marker:$marker,round_key:$round_key,sha256:$sha256,reason:$reason,detail:$detail}')"
-pg_ledger_append "$LEDGER_LINE"
+write_input_binding "$EVIDENT_MARKER" "$EVIDENT_SHA" "$EVIDENT_NWO" "$EVIDENT_NUM"
+append_clean_ledger_row "$EVIDENT_MARKER" "${EVIDENT_NWO//\//-}-${EVIDENT_NUM}" "$EVIDENT_NUM" "$COMPLETED_DIR/$EVIDENT_MARKER"
 
 daemon_migrate_legacy_processed
 
-check 'a legacy row WITH durable completed-artifact evidence is carried forward into the new ledger' "$(already_done "$EVIDENT_NWO" "$EVIDENT_NUM" "$EVIDENT_SHA"; echo $?)" "$(cat "$STATE_FILE")"
+check 'a legacy row WITH durable evidence bound to its exact sha is carried forward into the new ledger' "$(already_done "$EVIDENT_NWO" "$EVIDENT_NUM" "$EVIDENT_SHA"; echo $?)" "$(cat "$STATE_FILE")"
 check 'a legacy row lacking durable evidence is quarantined, not carried forward' "$(! already_done "$UNEVIDENT_NWO" "$UNEVIDENT_NUM" "$UNEVIDENT_SHA" && grep -qF "$(printf '%s\t%s\t%s' "$UNEVIDENT_NWO" "$UNEVIDENT_NUM" "$UNEVIDENT_SHA")" "$QUARANTINE_FILE"; echo $?)" "$(cat "$QUARANTINE_FILE")"
 check 'the legacy file itself is never deleted or truncated by migration' "$([ -s "$LEGACY_FILE" ] && [ "$(wc -l < "$LEGACY_FILE")" -eq 2 ]; echo $?)" "$(cat "$LEGACY_FILE")"
 check 'a quarantined head is genuinely re-evaluated on the next poll, not permanently skipped (already_done is false, so the main loops already_done-continue gate does not suppress it)' "$(! already_done "$UNEVIDENT_NWO" "$UNEVIDENT_NUM" "$UNEVIDENT_SHA"; echo $?)"
@@ -412,5 +470,34 @@ STATE_AFTER_FIRST="$(cat "$STATE_FILE")"; QUARANTINE_AFTER_FIRST="$(cat "$QUARAN
 daemon_migrate_legacy_processed
 check 'migration run a second time is idempotent: processed-v2.tsv unchanged' "$([ "$(cat "$STATE_FILE")" = "$STATE_AFTER_FIRST" ]; echo $?)" "before=[$STATE_AFTER_FIRST] after=[$(cat "$STATE_FILE")]"
 check 'migration run a second time is idempotent: quarantine unchanged (no duplicate row)' "$([ "$(cat "$QUARANTINE_FILE")" = "$QUARANTINE_AFTER_FIRST" ]; echo $?)" "before=[$QUARANTINE_AFTER_FIRST] after=[$(cat "$QUARANTINE_FILE")]"
+
+echo '# finding 1 (round 4): sha-exact binding -- one round_key with a real artifact for head A only must promote A and quarantine B, never let As evidence vouch for B'
+
+# Reproduces the actual #184 finding-1 defect: the pre-#184x mark_processed_heads wrote BOTH a
+# genuinely-reviewed head (A) and its never-reviewed successor (B) into processed.tsv for the SAME
+# PR. Only A has a real review-input-binding; B has none. A round_key-only check (the pre-fix
+# behavior) validates both rows off the one artifact that actually backs A alone.
+AB_NWO=acme/rockets; AB_NUM=42
+AB_ROUND_KEY="${AB_NWO//\//-}-${AB_NUM}"
+SHA_A=6666666666666666666666666666666666666666   # genuinely reviewed
+SHA_B=7777777777777777777777777777777777777777   # never reviewed; only recorded because the old
+                                                   # mark_processed_heads looked up the LIVE head
+AB_MARKER=pg-run-acme-rockets-42-1700000600-1
+printf 'P0: none\nP1: none\nP2: none\nP3: none\nVERDICT: SHIP\n' > "$COMPLETED_DIR/$AB_MARKER"
+write_input_binding "$AB_MARKER" "$SHA_A" "$AB_NWO" "$AB_NUM"   # binding exists for A only
+append_clean_ledger_row "$AB_MARKER" "$AB_ROUND_KEY" "$AB_NUM" "$COMPLETED_DIR/$AB_MARKER"
+
+: > "$LEGACY_FILE"; : > "$QUARANTINE_FILE"; : > "$STATE_FILE"
+printf '%s\t%s\t%s\n' "$AB_NWO" "$AB_NUM" "$SHA_A" >> "$LEGACY_FILE"
+printf '%s\t%s\t%s\n' "$AB_NWO" "$AB_NUM" "$SHA_B" >> "$LEGACY_FILE"
+
+check 'sanity: the shared marker DOES carry durable completed-artifact evidence for the round_key (the old, insufficient check would pass both rows on this alone)' "$([ -s "$COMPLETED_DIR/$AB_MARKER" ]; echo $?)"
+
+daemon_migrate_legacy_processed
+
+check 'the genuinely-reviewed head A promotes into the new ledger' "$(already_done "$AB_NWO" "$AB_NUM" "$SHA_A"; echo $?)" "$(cat "$STATE_FILE")"
+check 'the never-reviewed successor B does NOT promote, even though it shares As artifact-bearing round_key' "$(! already_done "$AB_NWO" "$AB_NUM" "$SHA_B"; echo $?)" "$(cat "$STATE_FILE")"
+check 'B is quarantined (re-evaluated next poll), not silently dropped' "$(grep -qF "$(printf '%s\t%s\t%s' "$AB_NWO" "$AB_NUM" "$SHA_B")" "$QUARANTINE_FILE"; echo $?)" "$(cat "$QUARANTINE_FILE")"
+check 'A is never quarantined' "$(! grep -qF "$(printf '%s\t%s\t%s' "$AB_NWO" "$AB_NUM" "$SHA_A")" "$QUARANTINE_FILE"; echo $?)"
 
 [ "$TEST_FAILURES" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$TEST_FAILURES FAILURES"; exit 1; }

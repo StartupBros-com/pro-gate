@@ -397,6 +397,33 @@ mark_blocked(){ # nwo num sha reason
   is_blocked "$1" "$2" "$3" && return 0
   printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >> "$BLOCKED"
 }
+# #184 finding 2 (round 4): a suppression must stay exactly as narrow as the evidence that
+# justified it. A ci-defer-cap-exhausted block (mark_blocked below, reason
+# "ci-defer-cap-exhausted:$state") means "CI readiness was never positively proven for this exact
+# sha" -- so the moment ci_ready positively proves that SAME sha IS settled, that specific reason
+# no longer holds and must be lifted before the generic is_blocked gate (process_pr, below) sees
+# it; otherwise a long-running check or a transient GitHub outage would suppress review FOREVER,
+# even after full recovery, while the cap's own log line ("push a new commit ... or resolve CI")
+# keeps promising a recovery path that never fires.
+#
+# Matched by reason PREFIX, not blanket-cleared: an agent-task block (no-progress or repeated
+# launch-failure on this UNCHANGED sha) is a different condition entirely -- CI settling says
+# nothing about either -- so it is left untouched by this function, by construction (it never
+# matches the "ci-defer-cap-exhausted" prefix). Rewritten atomically so a mid-write crash cannot
+# leave $BLOCKED truncated.
+daemon_clear_ci_defer_block(){ # nwo num sha
+  local nwo="$1" num="$2" sha="$3" prefix tmp grc
+  prefix="$(printf '%s\t%s\t%s\tci-defer-cap-exhausted' "$nwo" "$num" "$sha")"
+  grep -qF "$prefix" "$BLOCKED" 2>/dev/null || return 0
+  tmp="$BLOCKED.tmp.$$"
+  # grep -v exits 1 when EVERY line matched (nothing left to output) -- that is the expected,
+  # successful case here (a block ledger with exactly one row for this sha), not an error. Only
+  # rc>=2 (a real grep failure, e.g. an unreadable file) aborts the clear.
+  grep -vF "$prefix" "$BLOCKED" > "$tmp" 2>/dev/null; grc=$?
+  if [ "$grc" -gt 1 ]; then rm -f "$tmp" 2>/dev/null; return 1; fi
+  mv -f "$tmp" "$BLOCKED" || { rm -f "$tmp" 2>/dev/null; return 1; }
+  daemon_note "  · $nwo#$num @ ${sha:0:8} CI now settled — clearing its prior CI-defer-cap block (any agent-task block on this sha is untouched)"
+}
 mark_processed_heads(){ # nwo num reviewed-sha
   # #184b: mark ONLY the SHA a valid typed decision proved was reviewed (daemon_decision_target_matches
   # already checked it against the decision's head_oid before dispatch). Do not also look up and mark
@@ -407,24 +434,42 @@ mark_processed_heads(){ # nwo num reviewed-sha
   mark_done "$1" "$2" "$3"
 }
 
-# #184 finding 2 (round 3): "durable evidence" for a legacy (repo,pr,sha) row = an immutable,
-# write-once completed-review artifact (pg_completed_write / $PRO_GATE_HOME/completed/<marker>,
-# v0.28 #56 -- lib/pro-gate-lib.sh) backing a CLEAN run-ledger row scoped to that exact repo+PR
-# (round_key == "<nwo-with-/-as-dash>-<num>", the same slug daemon.sh itself uses -- see `slug` in
-# process_pr, below). The legacy ledger never recorded a head SHA per completed review, only
-# (repo,pr) -- so this evidence is necessarily PR-scoped, not sha-exact. That is still a strictly
-# stronger claim than the bare presence this finding describes: a hit here means the runtime
-# actually reduced spend into a real, installed, write-once review artifact for this PR at some
-# point, not merely that some old code path once exited 0 and appended a TSV line.
-daemon_legacy_row_has_durable_evidence(){ # nwo num -> rc 0 when a durable completed-artifact review exists for this repo+PR
-  local nwo="$1" num="$2" ledger completed_dir round_key marker found=1
+# #184 finding 1 (round 4): "durable evidence" for a legacy (repo,pr,sha) row must bind to the
+# EXACT legacy sha, not merely to the PR's round_key -- a round_key (owner-repo-pr, no sha; see
+# `round_key="$(printf '%s-%s-%s' "$owner" "$repo_name" "$pr_num" ...)"` in oracle-review.sh)
+# matches EVERY head this daemon ever reviewed for that PR. The old (pre-#184x) `mark_processed_heads`
+# wrote both a genuinely-reviewed head and its never-reviewed successor into processed.tsv (see the
+# comment on the current `mark_processed_heads`, above) -- a round_key-only check validates BOTH rows
+# off the one artifact that actually backs the first, reintroducing exactly the poisoned-current-head
+# skip this PR exists to repair.
+#
+# The exact-sha binding this reads is the review-input-binding record oracle-review.sh installs for
+# EVERY dispatched (submitted) attempt, before the outcome is known -- `pg_install_effect_input_binding`
+# writes `target:{head_oid:$head,kind:"pull-request",pr:$pr}` (oracle-review.sh:390-404) via
+# `pg_review_input_binding_write` into $(pg_review_input_binding_dir)/<marker>
+# (lib/pro-gate-lib.sh:3178, `pg_review_binding_write_immutable`). It is write-once (`ln`, no
+# overwrite) and is deleted ONLY on the not-submitted refund path (`pg_attempt_disposition_cleanup`,
+# lib/pro-gate-lib.sh ~864-880); a submitted/clean marker's binding is never removed, so it remains
+# the durable per-marker sha record. `pg_review_binding_read input <marker>` re-validates the record
+# (pg_review_input_binding_validate) and echoes it back; `.target.head_oid` is compared against the
+# legacy row's exact sha.
+#
+# A completed-artifact hit whose marker carries no matching binding is NOT durable evidence for this
+# sha -- it proves some head of this PR was reviewed, never which one. Quarantine (never promote) in
+# that case, including when the binding record itself is missing or unreadable (a genuinely
+# unavailable historical shape): quarantine only re-evaluates the head next poll (safe); a wrong
+# promotion is permanent.
+daemon_legacy_row_has_durable_evidence(){ # nwo num sha -> rc 0 when durable evidence binds EXACTLY this sha
+  local nwo="$1" num="$2" sha="$3" ledger completed_dir round_key marker bound_head found=1
   ledger="${PRO_GATE_LEDGER:-$ROOT/ledger.jsonl}"
   completed_dir="$(pg_completed_dir)"
   [ -s "$ledger" ] && command -v jq >/dev/null 2>&1 || return 1
   round_key="${nwo//\//-}-${num}"
   while IFS= read -r marker; do
     [ -n "$marker" ] || continue
-    if [ -s "$completed_dir/$marker" ] && [ ! -L "$completed_dir/$marker" ] && pg_is_review "$completed_dir/$marker"; then
+    [ -s "$completed_dir/$marker" ] && [ ! -L "$completed_dir/$marker" ] && pg_is_review "$completed_dir/$marker" || continue
+    bound_head="$(pg_review_binding_read input "$marker" 2>/dev/null | jq -r '.target.head_oid // empty' 2>/dev/null)"
+    if [ -n "$bound_head" ] && [ "$bound_head" = "$sha" ]; then
       found=0; break
     fi
   done < <(jq -r --arg rk "$round_key" 'select(.outcome=="clean" and (.round_key // "")==$rk) | .marker // empty' "$ledger" 2>/dev/null)
@@ -454,12 +499,12 @@ daemon_migrate_legacy_processed(){
     [ -n "$nwo" ] && [ -n "$num" ] && [ -n "$sha" ] || continue
     already_done "$nwo" "$num" "$sha" && continue
     grep -qF "$(printf '%s\t%s\t%s' "$nwo" "$num" "$sha")" "$QUARANTINE" 2>/dev/null && continue
-    if daemon_legacy_row_has_durable_evidence "$nwo" "$num"; then
+    if daemon_legacy_row_has_durable_evidence "$nwo" "$num" "$sha"; then
       mark_done "$nwo" "$num" "$sha"
-      daemon_note "  · migrated legacy $nwo#$num @ ${sha:0:8} -> $STATE (durable completed-artifact evidence found)"
+      daemon_note "  · migrated legacy $nwo#$num @ ${sha:0:8} -> $STATE (durable evidence bound to this exact sha found)"
     else
       printf '%s\t%s\t%s\n' "$nwo" "$num" "$sha" >> "$QUARANTINE"
-      daemon_note "  · quarantined legacy $nwo#$num @ ${sha:0:8} -> $QUARANTINE (no durable evidence found; re-evaluated on the next poll, not skipped)"
+      daemon_note "  · quarantined legacy $nwo#$num @ ${sha:0:8} -> $QUARANTINE (no evidence bound to this exact sha; re-evaluated on the next poll, not skipped)"
     fi
   done < "$STATE_LEGACY"
 }
@@ -538,7 +583,14 @@ ci_ready(){ # nwo num sha -> 0 = proceed (CI positively proven settled), 1 = def
             # (retryable only by a new push), and neither ever reaches mark_processed_heads/mark_done.
   local nwo="$1" num="$2" sha="$3" state n
   state="$(ci_rollup_state "$nwo" "$num")"
-  [ "$state" = "settled" ] && return 0
+  if [ "$state" = "settled" ]; then
+    # #184 finding 2 (round 4): CI is positively proven settled for this EXACT sha now -- lift a
+    # prior ci-defer-cap block for it (only that reason; see daemon_clear_ci_defer_block) BEFORE
+    # returning "proceed", so process_pr's generic is_blocked gate (right after this call) does not
+    # keep rejecting a head whose blocking condition has demonstrably cleared.
+    daemon_clear_ci_defer_block "$nwo" "$num" "$sha"
+    return 0
+  fi
   # Already escalated for this EXACT head: stay silent (no re-log, no re-increment) so a
   # permanently-stuck check cannot spam every poll -- #184c finding 1's "proceed once becomes
   # proceed forever" counter bug, corrected by never incrementing/logging past the first escalation.
