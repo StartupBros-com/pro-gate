@@ -47,24 +47,26 @@ daemon_decision_ref(){ jq -r '.effect_request.applicable_ref // empty' "$1"; }
 daemon_decision_reason(){ jq -r '.reason // empty' "$1"; }
 
 # #184c stop-completion proof: a report-only/stop-without-new-review decision is completion
-# evidence for the CURRENT head only when its own facts positively attest a completed, applicable,
-# non-legacy prior review whose code AND evidence identity match what the runtime just observed for
-# this head (.facts.input.identity / .facts.evidence.identity). This mirrors the reducer's own
-# "identical-code-and-evidence" gate (pg_review_decision_reduce in lib/pro-gate-lib.sh) rather than
-# an allowlist of stop reasons -- reasons are an open set (round-governor-denied, unproven-input,
-# invalid-binding, evidence-preparation-unsafe, no-safe-action, undefined-state, legacy-not-
-# authoritative, a completed-result tie, ...) and every one of those is a NON-completion stop.
-# Positive facts, not reason strings, decide -- see #184 finding 1.
+# evidence for the CURRENT head only when its own facts satisfy EXACTLY the reducer's own
+# "identical-code-and-evidence" gate (pg_review_decision_reduce, lib/pro-gate-lib.sh), reproduced
+# verbatim here rather than an invented equivalent:
+#   .prior_review.binding_valid and .prior_review.provenance_valid and
+#   .prior_review.code_identity==.input.identity and .prior_review.evidence_identity==.evidence.identity
+# translated to the envelope this helper receives (.facts is the reducer's bare canonical facts,
+# so .facts.prior_review / .facts.input.identity / .facts.evidence.identity are the same fields).
+# Note deliberately absent: .applicable and .legacy. The real producer (oracle-review.sh) ALWAYS
+# emits prior_review.applicable=false -- requiring true here made a genuine identical-code/evidence
+# stop unsatisfiable and caused the daemon to retry forever (#184c finding 3). This mirrors the
+# reducer rather than an allowlist of stop reasons -- reasons are an open set (round-governor-denied,
+# unproven-input, invalid-binding, evidence-preparation-unsafe, no-safe-action, undefined-state,
+# legacy-not-authoritative, a completed-result tie, ...) and every one of those is a NON-completion
+# stop. Positive facts, not reason strings, decide -- see #184 finding 1.
 daemon_stop_is_completion_proof(){ # decision-file
   jq -e '
     .facts.prior_review as $p |
-    ($p.applicable == true) and
     ($p.binding_valid == true) and
     ($p.provenance_valid == true) and
-    ($p.legacy != true) and
-    ($p.code_identity | type == "string" and length > 0) and
     ($p.code_identity == .facts.input.identity) and
-    ($p.evidence_identity | type == "string" and length > 0) and
     ($p.evidence_identity == .facts.evidence.identity)
   ' "$1" >/dev/null 2>&1
 }
@@ -277,13 +279,20 @@ DAEMON_STAMP_FILE="${PRO_GATE_HOME}/.deploy-stamp"
 DAEMON_START_STAMP="$(cat "$DAEMON_STAMP_FILE" 2>/dev/null || true)"
 
 ROOT="$PRO_GATE_HOME"
-STATE="$ROOT/processed.tsv"          # repo<TAB>pr<TAB>sha  (idempotency)
+STATE="$ROOT/processed.tsv"          # repo<TAB>pr<TAB>sha  (idempotency; a completed, typed terminal review ONLY)
 FAILS="$ROOT/failcount.tsv"          # repo<TAB>pr<TAB>sha  (one line per failed attempt)
 CIDEFER="$ROOT/ci-defer.tsv"         # repo<TAB>pr<TAB>sha  (CI-not-settled deferral count; #184)
 AGENTCAP="$ROOT/agent-task-attempts.tsv"  # repo<TAB>pr<TAB>sha (agent-task dispatch count with no head progress; #184)
+# #184c findings 1+2: a cap (CI_DEFER_MAX or AGENT_TASK_MAX) being exhausted is an escalation, not
+# completion. It is recorded ONLY here, one line per (repo,pr,sha), and NEVER in $STATE
+# (processed.tsv) -- a blocked head must be findable by a human but must never look "done" to the
+# idempotency ledger. Deliberately distinct from $FAILS/MAX_FAILS (that budget is wrapper-orchestration
+# failures and its semantics are unchanged by this ledger). Keyed by sha, so a new push naturally
+# clears it -- the new sha simply has no line here yet.
+BLOCKED="$ROOT/blocked.tsv"          # repo<TAB>pr<TAB>sha<TAB>reason  (cap-exhaustion escalation; never processed.tsv)
 LOGDIR="$ROOT/logs"; mkdir -p "$LOGDIR"
 PAUSE="$ROOT/PAUSE"
-touch "$STATE" "$FAILS" "$CIDEFER" "$AGENTCAP"
+touch "$STATE" "$FAILS" "$CIDEFER" "$AGENTCAP" "$BLOCKED"
 
 OWNERS="${PRO_REVIEW_OWNERS:-}"                          # space-separated gh owners to watch (REQUIRED)
 POLL="${PRO_REVIEW_POLL_SECONDS:-180}"
@@ -355,6 +364,15 @@ session_up(){
 
 already_done(){ grep -qF "$(printf '%s\t%s\t%s' "$1" "$2" "$3")" "$STATE"; }
 mark_done(){ printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$STATE"; }
+# #184c findings 1+2: blocked is the escalation state for an exhausted cap. Idempotent (one line per
+# (repo,pr,sha)) so a stuck head logs once, not on every poll. Never writes $STATE -- see BLOCKED
+# above. is_blocked also gates re-dispatch: process_pr checks it right after ci_ready so an
+# already-blocked head is skipped entirely on later polls (nothing spins) until a new sha appears.
+is_blocked(){ grep -qF "$(printf '%s\t%s\t%s\t' "$1" "$2" "$3")" "$BLOCKED"; }
+mark_blocked(){ # nwo num sha reason
+  is_blocked "$1" "$2" "$3" && return 0
+  printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >> "$BLOCKED"
+}
 mark_processed_heads(){ # nwo num reviewed-sha
   # #184b: mark ONLY the SHA a valid typed decision proved was reviewed (daemon_decision_target_matches
   # already checked it against the decision's head_oid before dispatch). Do not also look up and mark
@@ -419,17 +437,27 @@ ci_defer_count(){ # nwo num sha -> increments and echoes the new count
   printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$CIDEFER"
   grep -cF "$(printf '%s\t%s\t%s' "$1" "$2" "$3")" "$CIDEFER" 2>/dev/null || echo 1
 }
-ci_ready(){ # nwo num sha -> 0 = proceed, 1 = defer (retryable, nothing marked)
+ci_ready(){ # nwo num sha -> 0 = proceed (CI positively proven settled), 1 = defer/blocked -- NEVER
+            # proceed on unproven CI; process_pr's caller treats both defer and blocked identically
+            # (retryable only by a new push), and neither ever reaches mark_processed_heads/mark_done.
   local nwo="$1" num="$2" sha="$3" state n
   state="$(ci_rollup_state "$nwo" "$num")"
   [ "$state" = "settled" ] && return 0
+  # Already escalated for this EXACT head: stay silent (no re-log, no re-increment) so a
+  # permanently-stuck check cannot spam every poll -- #184c finding 1's "proceed once becomes
+  # proceed forever" counter bug, corrected by never incrementing/logging past the first escalation.
+  is_blocked "$nwo" "$num" "$sha" && return 1
   n="$(ci_defer_count "$nwo" "$num" "$sha")"
   if [ "$n" -lt "$CI_DEFER_MAX" ]; then
     log "  · $nwo#$num @ ${sha:0:8} CI not settled ($state); deferring without marking done (attempt $n/$CI_DEFER_MAX)"
     return 1
   fi
-  log "  · $nwo#$num @ ${sha:0:8} CI still $state after $n attempts; proceeding once (deferral cap reached)"
-  return 0
+  # #184c finding 1: exhaustion is not completion. CI readiness was never positively proven for this
+  # head, so it is BLOCKED (escalation), not proceeded -- no worker is dispatched, and processed.tsv
+  # is never written for it. A human can find it in $BLOCKED; a new push (new sha) starts fresh.
+  log "  ✗ $nwo#$num @ ${sha:0:8} CI still $state after $n attempts — BLOCKED (deferral cap reached; CI readiness was never proven, so no review will be dispatched for this head; push a new commit to re-enter, or resolve CI)"
+  mark_blocked "$nwo" "$num" "$sha" "ci-defer-cap-exhausted:$state"
+  return 1
 }
 
 # --- find a local checkout of owner/repo ------------------------------------
@@ -452,6 +480,15 @@ process_pr(){
   # #184a: gate dispatch on the current head's CI state before doing ANY work for it (clone,
   # worktree, decision query, worker). Not settled -> retryable defer, nothing marked.
   ci_ready "$nwo" "$num" "$sha" || return 2
+
+  # #184c findings 1+2: an already-blocked head (CI-defer cap or agent-task no-progress cap
+  # exhausted) suppresses ALL further dispatch -- including a re-attempt of the agent task itself --
+  # so nothing spins. Checked separately from ci_ready because the agent-task cap can trip even once
+  # CI is settled. A new push (new sha) is never in $BLOCKED, so it re-enters normally.
+  if is_blocked "$nwo" "$num" "$sha"; then
+    log "  · $nwo#$num @ ${sha:0:8} is blocked (see $BLOCKED) — suppressing dispatch until a new push changes the head"
+    return 2
+  fi
 
   local repodir; repodir="$(find_repo "$nwo")"
   if [ -z "$repodir" ]; then
@@ -515,8 +552,12 @@ process_pr(){
       if [ "$rc" -eq 0 ]; then
         local attempts; attempts="$(agent_task_attempt_count "$nwo" "$num" "$sha")"
         if [ "$attempts" -ge "$AGENT_TASK_MAX" ]; then
-          log "  ✗ $nwo#$num @ ${sha:0:8} agent task SUCCEEDED ${attempts}x with no head progress — giving up (marking done; re-push to retry)."
-          mark_done "$nwo" "$num" "$sha"
+          # #184c finding 2: an rc=0 agent task is progress, never a terminal-review receipt -- it
+          # must never consume the sha in processed.tsv. Exhaustion here is BLOCKED (escalation),
+          # same as the CI cap: logged clearly, recorded only in $BLOCKED, and the is_blocked gate at
+          # the top of process_pr suppresses further dispatch for this exact head from here on.
+          log "  ✗ $nwo#$num @ ${sha:0:8} agent task SUCCEEDED ${attempts}x with no head progress — BLOCKED (no-progress cap reached; not marking done; re-push to retry)."
+          mark_blocked "$nwo" "$num" "$sha" "agent-task-no-progress-cap-exhausted"
         fi
       else
         log "  · $nwo#$num @ ${sha:0:8} agent task rc=$rc (not a success); not counted toward the no-progress cap, head stays retryable"
