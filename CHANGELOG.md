@@ -19,6 +19,7 @@ Conventions in this file:
 
 | Version | Date | Artifact | Theme |
 |---|---|---|---|
+| v0.44.0 | 2026-09-10 | Pending release | One hardened dirlock reclaimer for every no-flock lock: a recycled pid no longer reads as the original owner, two reclaimers cannot both enter, and a release never takes a replacement |
 | v0.43.0 | 2026-09-09 | Pending release | No-flock reservation guard self-heal: a directory left by a killed process is reclaimed, a live owner is never reclaimed, and liveness must be positively disproved rather than inferred from a failed measurement |
 | v0.42.0 | 2026-09-09 | Pending release | Mixed cross-task verdicts rejected before publication or replay; owned answers and quoted examples preserved; Oracle session names remain unique per invocation |
 | v0.41.0 | 2026-09-08 | Pending release | Wait sizing: 60m fresh / 45m collection defaults from the ledger's p90, with the queued-review wait sized to match and the skill, relay and daemon no longer pinning the value past it; daemon envelope validation moved to the library and conformance-tested |
