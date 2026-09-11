@@ -204,6 +204,12 @@ gh(){
   return 1
 }
 runtime_gate(){ return 0; }
+# #184 finding 1 (round 7): this block's empty GH_ROLLUP fixture is meant to report CI as settled
+# immediately (per the comment above), not exercise the new empty-rollup grace mechanic -- that
+# mechanic has its own dedicated red/green coverage in
+# tests/daemon-current-head-completion.test.sh. Pin the grace to 1 so a single observation already
+# satisfies it here, matching every process_pr call below's existing expectation.
+CI_EMPTY_GRACE=1
 PROCESS_AGENT_RC=0
 daemon_run_agent_task(){ AGENT_TASKS=$((AGENT_TASKS + 1)); return "$PROCESS_AGENT_RC"; }
 PROCESS_DECISION="$TYPED_HOME/process-agent.json"; typed_decision 3 "$PROCESS_DECISION"

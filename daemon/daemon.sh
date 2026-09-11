@@ -130,6 +130,21 @@ daemon_run_review_worker(){ # saved run-granted-review decision-file
   # a zero-length array bare is an "unbound variable" abort before bash 4.4 -- which includes the
   # stock macOS /bin/bash 3.2 this release's no-flock guard path exists for. Unset is the DEFAULT
   # here, so the bare form would fail on the common path, not an edge case.
+  #
+  # #184 finding 2 (round 7): DD_INPUT_ARGS and DD_EVIDENCE_ARGS (both possibly-empty globals --
+  # DD_INPUT_ARGS is empty whenever PRO_REVIEW_INPUT is unset, the common case; DD_EVIDENCE_ARGS is
+  # empty whenever daemon_prepare_review_evidence could not fetch a diff) were expanded BARE at
+  # every one of their call sites below and in daemon_run_agent_task/daemon_handle_review_worker_
+  # failure/daemon_dispatch_decision/process_pr -- the exact same bash-3.2 unbound-variable class
+  # this comment already documents for review_timeout, just left unguarded on the two arrays added
+  # after it. A file-wide sweep for every OTHER bare `"${name[@]}"` expansion of a possibly-empty
+  # array found and fixed: DD_INPUT_ARGS/DD_EVIDENCE_ARGS at lines ~146-147, ~168, ~188-189,
+  # ~225-226 (this function, daemon_run_agent_task, daemon_handle_review_worker_failure,
+  # daemon_dispatch_decision's collect/recover branch); DD_INPUT_ARGS/evidence_args in
+  # process_pr's two --review-decision invocations and evidence_args in the DD_EVIDENCE_ARGS copy
+  # assignment (daemon_prepare_review_evidence's caller). Every one now uses the same
+  # ${arr[@]+"${arr[@]}"} idiom; DD_ENGINE/DD_NUM/DD_WORKTREE/etc. are always-set scalars, not
+  # arrays, and are unaffected.
   local review_timeout=()
   [ -z "${PRO_REVIEW_ENGINE_TIMEOUT:-}" ] || review_timeout=(--timeout "$PRO_REVIEW_ENGINE_TIMEOUT")
   # #184 finding 1 (round 6): the charged binding installed for THIS effect (run-granted-review)
@@ -142,7 +157,7 @@ daemon_run_review_worker(){ # saved run-granted-review decision-file
   # re-prefix "PRO_GATE_REVIEW_ENDPOINT_PATCH=" onto later argv tokens too.
   local endpoint_prefix=""
   [ -n "${DD_EVIDENCE_FILE:-}" ] && printf -v endpoint_prefix 'PRO_GATE_REVIEW_ENDPOINT_PATCH=%q ' "$DD_EVIDENCE_FILE"
-  printf -v command_text '%q ' "$DD_ENGINE" --review-decision --review-decision-effect "$decision" --pr "$DD_NUM" --repo "$DD_WORKTREE" "${DD_INPUT_ARGS[@]}" "${DD_EVIDENCE_ARGS[@]}" --out "$DD_LOG.review" ${review_timeout[@]+"${review_timeout[@]}"}
+  printf -v command_text '%q ' "$DD_ENGINE" --review-decision --review-decision-effect "$decision" --pr "$DD_NUM" --repo "$DD_WORKTREE" ${DD_INPUT_ARGS[@]+"${DD_INPUT_ARGS[@]}"} ${DD_EVIDENCE_ARGS[@]+"${DD_EVIDENCE_ARGS[@]}"} --out "$DD_LOG.review" ${review_timeout[@]+"${review_timeout[@]}"}
   command_text="${endpoint_prefix}${command_text}"
   prompt="First action: execute this exact argv-quoted guarded runtime effect; it rechecks the saved review-decision/v1 before any charge or submission:
 $command_text
@@ -164,7 +179,7 @@ daemon_run_agent_task(){ # saved decision-file validated action
   # is built via a separate printf call rather than folded into the recycled-format one.
   local reentry_prefix=""
   [ -n "${DD_EVIDENCE_FILE:-}" ] && printf -v reentry_prefix 'PRO_GATE_REVIEW_ENDPOINT_PATCH=%q ' "$DD_EVIDENCE_FILE"
-  printf -v reentry '%q ' "$DD_ENGINE" --review-decision --json --pr "$DD_NUM" --repo "$DD_WORKTREE" "${DD_INPUT_ARGS[@]}" "${DD_EVIDENCE_ARGS[@]}"
+  printf -v reentry '%q ' "$DD_ENGINE" --review-decision --json --pr "$DD_NUM" --repo "$DD_WORKTREE" ${DD_INPUT_ARGS[@]+"${DD_INPUT_ARGS[@]}"} ${DD_EVIDENCE_ARGS[@]+"${DD_EVIDENCE_ARGS[@]}"}
   reentry="${reentry_prefix}${reentry}"
   prompt="Control-safe typed action: $action.
 Target: $target.
@@ -184,7 +199,7 @@ When a valid typed decision makes it safe, finish the existing headless auto-fix
 daemon_handle_review_worker_failure(){ # worker-rc; fresh typed decision decides whether wrapper failure budget waits
   local worker_rc="$1" fresh action
   fresh="$DD_LOG.decision-after-run.json"
-  if ! PRO_GATE_REVIEW_ENDPOINT_PATCH="${DD_EVIDENCE_FILE:-}" "$DD_ENGINE" --review-decision --json --pr "$DD_NUM" --repo "$DD_WORKTREE" "${DD_INPUT_ARGS[@]}" "${DD_EVIDENCE_ARGS[@]}" >"$fresh" 2>>"$DD_LOG"; then
+  if ! PRO_GATE_REVIEW_ENDPOINT_PATCH="${DD_EVIDENCE_FILE:-}" "$DD_ENGINE" --review-decision --json --pr "$DD_NUM" --repo "$DD_WORKTREE" ${DD_INPUT_ARGS[@]+"${DD_INPUT_ARGS[@]}"} ${DD_EVIDENCE_ARGS[@]+"${DD_EVIDENCE_ARGS[@]}"} >"$fresh" 2>>"$DD_LOG"; then
     note_fail "$DD_NWO" "$DD_NUM" "$DD_SHA" "$DD_LOG" "runtime-selected review worker rc=$worker_rc; replacement query failed"
     return 1
   fi
@@ -221,7 +236,7 @@ daemon_dispatch_decision(){ # decision-file [redirect-depth]
       return $? ;;
     runtime-guarded-effect/collect-existing-result|runtime-guarded-effect/recover-existing-review)
       fresh="$DD_LOG.decision-effect-$depth.json"
-      if ! PRO_GATE_REVIEW_ENDPOINT_PATCH="${DD_EVIDENCE_FILE:-}" "$DD_ENGINE" --review-decision --review-decision-effect "$decision" --pr "$DD_NUM" --repo "$DD_WORKTREE" "${DD_INPUT_ARGS[@]}" "${DD_EVIDENCE_ARGS[@]}" >"$fresh" 2>>"$DD_LOG"; then
+      if ! PRO_GATE_REVIEW_ENDPOINT_PATCH="${DD_EVIDENCE_FILE:-}" "$DD_ENGINE" --review-decision --review-decision-effect "$decision" --pr "$DD_NUM" --repo "$DD_WORKTREE" ${DD_INPUT_ARGS[@]+"${DD_INPUT_ARGS[@]}"} ${DD_EVIDENCE_ARGS[@]+"${DD_EVIDENCE_ARGS[@]}"} >"$fresh" 2>>"$DD_LOG"; then
         daemon_defer_decision "runtime effect recheck failed"
         return 2
       fi
@@ -352,6 +367,7 @@ STATE_LEGACY="$ROOT/processed.tsv"   # pre-#184x ledger; read-only input to the 
 QUARANTINE="$ROOT/processed-quarantine.tsv"  # repo<TAB>pr<TAB>sha (legacy rows with no durable evidence; audit trail, NEVER treated as done -- the head is re-evaluated on the next poll, not skipped)
 FAILS="$ROOT/failcount.tsv"          # repo<TAB>pr<TAB>sha  (one line per failed attempt)
 CIDEFER="$ROOT/ci-defer.tsv"         # repo<TAB>pr<TAB>sha  (CI-not-settled deferral count; #184)
+CIEMPTY="$ROOT/ci-empty-rollup.tsv"  # repo<TAB>pr<TAB>sha  (empty-rollup observation count for a newly seen head; #184 finding 1 round 7)
 AGENTCAP="$ROOT/agent-task-attempts.tsv"  # repo<TAB>pr<TAB>sha (agent-task dispatch count with no head progress; #184)
 AGENTFAIL="$ROOT/agent-task-failures.tsv"  # repo<TAB>pr<TAB>sha (agent-task LAUNCH failures, rc=1 only; #184c finding 3)
 REVIEWNOPROG="$ROOT/review-worker-no-progress.tsv"  # repo<TAB>pr<TAB>sha (review-worker rc=0, re-resolved decision still run-granted-review; #184 finding 3 round 6)
@@ -368,9 +384,10 @@ BLOCKED="$ROOT/blocked.tsv"          # repo<TAB>pr<TAB>sha<TAB>reason  (cap-exha
 # --review-decision query and the actual dispatch command for that exact head -- see the
 # daemon_evidence_* helpers and daemon_prepare_review_evidence below for the full rationale.
 REVIEW_EVIDENCE_DIR="$ROOT/review-evidence"  # nwo-num-sha.diff; pruned on supersession and on completion
+ACTIVE_EVIDENCE_KEEP="$ROOT/active-evidence-keep.tmp"  # rebuilt every poll cycle; see daemon_sweep_orphaned_evidence (#184 finding 4, round 7)
 LOGDIR="$ROOT/logs"; mkdir -p "$LOGDIR"
 PAUSE="$ROOT/PAUSE"
-touch "$STATE" "$STATE_LEGACY" "$QUARANTINE" "$FAILS" "$CIDEFER" "$AGENTCAP" "$AGENTFAIL" "$BLOCKED" "$REVIEWNOPROG"
+touch "$STATE" "$STATE_LEGACY" "$QUARANTINE" "$FAILS" "$CIDEFER" "$CIEMPTY" "$AGENTCAP" "$AGENTFAIL" "$BLOCKED" "$REVIEWNOPROG"
 mkdir -p "$REVIEW_EVIDENCE_DIR"
 
 # #184 finding 3 (round 5): every (repo,pr,sha) identity this daemon tracks -- STATE, STATE_LEGACY,
@@ -393,6 +410,17 @@ MAX_FAILS="${PRO_REVIEW_MAX_FAILS:-3}"
 # failures). Each caps a specific stall so a PR cannot strand forever: a check stuck pending, or a
 # decision that keeps returning the same agent-task with no head progress.
 CI_DEFER_MAX="${PRO_REVIEW_CI_DEFER_MAX:-20}"
+# #184 finding 1 (round 7): a SEPARATE, small bound for a newly observed head reporting an EMPTY
+# statusCheckRollup -- see ci_rollup_state/ci_ready below. Deliberately much smaller than
+# CI_DEFER_MAX: this only waits out the ordinary GitHub-side gap between a push registering and its
+# checks appearing, never a stuck/pending check (that is CI_DEFER_MAX's job, on the unsettled-token
+# path). A genuinely check-less repo proceeds once this grace is exhausted -- it is never escalated
+# to $BLOCKED -- so the daemon cannot stall a repo that will never grow a rollup.
+CI_EMPTY_GRACE="${PRO_REVIEW_CI_EMPTY_GRACE:-2}"
+# #184 finding 4 (round 7, P2): see daemon_sweep_orphaned_evidence below. Deliberately large next to
+# $POLL's 180s default (~480 polls) so a single transient `gh search prs` failure or rate-limit gap
+# can never evict evidence for a PR that is still genuinely open and simply missing from one query.
+EVIDENCE_ORPHAN_TTL="${PRO_REVIEW_EVIDENCE_ORPHAN_TTL_SECONDS:-86400}"
 AGENT_TASK_MAX="${PRO_REVIEW_AGENT_TASK_MAX:-5}"
 # #184c finding 3 (round 3 regression fix): a THIRD bounded counter, structurally separate from
 # both of the above -- AGENT_TASK_MAX/AGENTCAP counts genuinely SUCCESSFUL (rc=0) agent-task
@@ -544,7 +572,35 @@ mark_processed_heads(){ # nwo num reviewed-sha
 # the SAME persisted file across every call site for one head is sufficient for a byte-identical
 # relation across the whole daemon-driven lifecycle -- there is no need to byte-match against a
 # hypothetical "true" GitHub-computed diff independently fetched at a different moment.
-daemon_evidence_base(){ printf '%s-%s' "${1//\//-}" "$2"; } # nwo num
+# #184 finding 3 (round 7): the old daemon_evidence_base replaced "/" with "-" in nwo, so
+# foo-bar/baz#1 and foo/bar-baz#1 both collapsed to the SAME "foo-bar-baz-1" prefix -- the exact
+# lossy-composite-key class the legacy-migration round_key comment above already documents and
+# fixes for ledger LOOKUPS (round_key is deliberately narrowing-only there, never compared back as
+# identity; every legacy row is re-verified on host+owner+repo+pr+sha). This evidence key was never
+# audited the same way and WAS used as identity: daemon_prepare_review_evidence trusts
+# `[ -s "$f" ]` on the collided path alone, so if two such PRs ever shared a head sha, the second
+# would silently read and dispatch the FIRST PR's cached diff as its own review evidence (with
+# differing shas they instead prune each other's file every poll via daemon_prune_stale_evidence's
+# glob). Fix: derive the on-disk key from a sha256 digest of the NUL-delimited (host,owner,repo,pr)
+# tuple, piped straight into the hash tool and never held in a bash variable (bash strings cannot
+# contain an embedded NUL) -- NUL cannot occur in a valid GitHub host, owner, repo, or decimal PR
+# number, so this join is injective for the tuple regardless of "/" or "-" inside any component.
+# Falls back to a length-prefixed (netstring-style) encoding, not another delimiter-join, when no
+# hash tool is on PATH (pg_have sha256sum/shasum/openssl, same detection order as pg_sha256 in
+# lib/pro-gate-lib.sh) -- a delimiter fallback would just reintroduce a different collision class.
+daemon_evidence_identity(){ # nwo num -> injective identity for (DAEMON_HOST, owner, repo, num)
+  local nwo="$1" num="$2" owner="${1%%/*}" repo="${1#*/}"
+  if pg_have sha256sum; then
+    printf '%s\0%s\0%s\0%s' "$DAEMON_HOST" "$owner" "$repo" "$num" | sha256sum | awk '{print $1}'
+  elif pg_have shasum; then
+    printf '%s\0%s\0%s\0%s' "$DAEMON_HOST" "$owner" "$repo" "$num" | shasum -a 256 | awk '{print $1}'
+  elif pg_have openssl; then
+    printf '%s\0%s\0%s\0%s' "$DAEMON_HOST" "$owner" "$repo" "$num" | openssl dgst -sha256 | awk '{print $NF}'
+  else
+    printf '%d:%s,%d:%s,%d:%s,%d:%s,' "${#DAEMON_HOST}" "$DAEMON_HOST" "${#owner}" "$owner" "${#repo}" "$repo" "${#num}" "$num"
+  fi
+}
+daemon_evidence_base(){ daemon_evidence_identity "$1" "$2"; } # nwo num -> injective on-disk key (never lossy-dash-joined)
 daemon_evidence_file(){ printf '%s/%s-%s.diff' "$REVIEW_EVIDENCE_DIR" "$(daemon_evidence_base "$1" "$2")" "$3"; } # nwo num sha
 
 # Deletes every OTHER sha's persisted evidence for this (nwo,num) -- called on every process_pr
@@ -559,6 +615,30 @@ daemon_prune_stale_evidence(){ # nwo num keep_sha
     [ -e "$f" ] || continue
     [ "$f" = "$keepfile" ] && continue
     rm -f "$f" 2>/dev/null
+  done
+}
+
+# #184 finding 4 (round 7, P2): the two existing cleanup paths above -- daemon_prune_stale_evidence
+# (a superseded sha for a PR the daemon is STILL processing) and mark_processed_heads (durable
+# completion) -- both require process_pr to run again for the PR. A PR that is closed, has its
+# label removed, or otherwise drops out of the watched set before either fires is never process_pr'd
+# again, so its cached diff (a raw source-code snapshot) was retained under $REVIEW_EVIDENCE_DIR
+# with no bound. Sweep the whole store once per poll against that poll's actual active (repo,pr,sha)
+# set instead of relying solely on the two per-PR paths: the main loop writes one absolute
+# daemon_evidence_file path per PR it observed (whether or not it dispatches, defers, or skips it as
+# already-done) into $keep, and anything else old enough (>= $EVIDENCE_ORPHAN_TTL, not merely
+# "unseen this poll" -- see the TTL comment above) is removed here.
+daemon_sweep_orphaned_evidence(){ # active-keep-file (one absolute evidence path per line, from this poll)
+  local keep="$1" f now mtime age
+  [ -d "$REVIEW_EVIDENCE_DIR" ] || return 0
+  now="$(date +%s)"
+  for f in "$REVIEW_EVIDENCE_DIR"/*.diff; do
+    [ -e "$f" ] || continue
+    grep -qxF "$f" "$keep" 2>/dev/null && continue
+    mtime="$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo "$now")"
+    age=$(( now - mtime ))
+    [ "$age" -ge "$EVIDENCE_ORPHAN_TTL" ] || continue
+    rm -f "$f" 2>/dev/null && daemon_note "  · pruning orphaned review evidence $(basename "$f") (untracked for ${age}s, no longer in the active PR set)"
   done
 }
 
@@ -808,11 +888,23 @@ review_worker_no_progress_count(){ # nwo num sha -> increments and echoes the ne
 # settled only at COMPLETED; a StatusContext (.state) is settled only at SUCCESS/FAILURE/ERROR.
 # Anything else -- GitHub's REQUESTED/WAITING check-run states, EXPECTED status-context state, a
 # future value GitHub adds later, or an unrecognized node shape -- defaults to UNSETTLED. This
-# fails toward deferral, bounded by $CI_DEFER_MAX below. An empty rollup means no checks are
-# configured for this repo and still counts as settled (never a permanent block). A `gh` query
-# failure is treated the same as not-settled -- fail closed rather than dispatch a worker against
-# an unknown CI state.
-ci_rollup_state(){ # nwo num -> "settled", "query-failed", or the first unsettled status/state token
+# fails toward deferral, bounded by $CI_DEFER_MAX below. A `gh` query failure is treated the same
+# as not-settled -- fail closed rather than dispatch a worker against an unknown CI state.
+#
+# #184 finding 1 (round 7): an EMPTY rollup is reported distinctly as "empty", never folded into
+# "settled" by the jq fallback the way it used to be. GitHub can transiently report
+# `statusCheckRollup: []` immediately after a push, before Actions or any check run has registered
+# at all -- that is indistinguishable, from this one query, from a repository that genuinely has no
+# checks configured. The old `// "settled"` fallback treated both as settled immediately, so a head
+# could be marked complete by ci_ready and consumed by process_pr's decision/dispatch/mark_done path
+# before CI had even started, let alone failed. ci_ready (below) now treats "empty" as PROVISIONAL
+# for a newly observed head: it defers (same as an unsettled token) for up to $CI_EMPTY_GRACE polls
+# of this EXACT sha, re-querying the rollup fresh each time, before treating a STILL-empty rollup as
+# positively establishing "no checks are expected for this repository" and proceeding. This keeps
+# the genuine no-checks-configured case working (it still terminates, and is never sent to
+# $BLOCKED -- see ci_ready) while closing the window where a real CI run had simply not registered
+# yet on the first poll after a push.
+ci_rollup_state(){ # nwo num -> "settled", "empty", "query-failed", or the first unsettled status/state token
   local nwo="$1" num="$2" rollup
   rollup=$(gh pr view "$num" -R "$nwo" --json statusCheckRollup 2>/dev/null) || { echo "query-failed"; return; }
   printf '%s' "$rollup" | jq -r '
@@ -820,7 +912,9 @@ ci_rollup_state(){ # nwo num -> "settled", "query-failed", or the first unsettle
       if has("status") then .status == "COMPLETED"
       elif has("state") then (.state == "SUCCESS" or .state == "FAILURE" or .state == "ERROR")
       else false end;
-    ([.statusCheckRollup[]? | select(settled | not) | (.status // .state // "UNKNOWN")] | .[0]) // "settled"
+    if ((.statusCheckRollup // []) | length) == 0 then "empty"
+    else ([.statusCheckRollup[]? | select(settled | not) | (.status // .state // "UNKNOWN")] | .[0]) // "settled"
+    end
   ' 2>/dev/null || echo "query-failed"
 }
 # Bound the deferral with the same per-(repo,pr,sha) ledger shape as $FAILS, so a check stuck
@@ -830,9 +924,20 @@ ci_defer_count(){ # nwo num sha -> increments and echoes the new count
   printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$CIDEFER"
   grep -cF "$(printf '%s\t%s\t%s' "$1" "$2" "$3")" "$CIDEFER" 2>/dev/null || echo 1
 }
-ci_ready(){ # nwo num sha -> 0 = proceed (CI positively proven settled), 1 = defer/blocked -- NEVER
-            # proceed on unproven CI; process_pr's caller treats both defer and blocked identically
-            # (retryable only by a new push), and neither ever reaches mark_processed_heads/mark_done.
+# #184 finding 1 (round 7): a structurally separate, smaller bound for the "empty rollup on a newly
+# observed head" grace above -- keyed by the same (repo,pr,sha) shape as every other ledger here so
+# a real push (new sha) always starts fresh. Deliberately its own file: CIDEFER/CI_DEFER_MAX governs
+# a check GitHub has already registered as unsettled (or a `gh` failure) and terminates by
+# escalating to $BLOCKED; this one governs "has GitHub registered anything yet at all" and
+# terminates by proceeding, never by blocking (see ci_ready).
+ci_empty_count(){ # nwo num sha -> increments and echoes the new count
+  printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$CIEMPTY"
+  grep -cF "$(printf '%s\t%s\t%s' "$1" "$2" "$3")" "$CIEMPTY" 2>/dev/null || echo 1
+}
+ci_ready(){ # nwo num sha -> 0 = proceed (CI positively proven settled, or genuinely check-less
+            # after grace), 1 = defer/blocked -- NEVER proceed on unproven CI; process_pr's caller
+            # treats both defer and blocked identically (retryable only by a new push), and neither
+            # ever reaches mark_processed_heads/mark_done.
   local nwo="$1" num="$2" sha="$3" state n
   state="$(ci_rollup_state "$nwo" "$num")"
   if [ "$state" = "settled" ]; then
@@ -843,10 +948,35 @@ ci_ready(){ # nwo num sha -> 0 = proceed (CI positively proven settled), 1 = def
     daemon_clear_ci_defer_block "$nwo" "$num" "$sha"
     return 0
   fi
-  # Already escalated for this EXACT head: stay silent (no re-log, no re-increment) so a
-  # permanently-stuck check cannot spam every poll -- #184c finding 1's "proceed once becomes
-  # proceed forever" counter bug, corrected by never incrementing/logging past the first escalation.
-  is_blocked "$nwo" "$num" "$sha" && return 1
+  if [ "$state" = "empty" ]; then
+    # #184 finding 1 (round 7): provisional, not settled -- see the comment on ci_rollup_state.
+    # Bounded by CI_EMPTY_GRACE, and this path NEVER calls mark_blocked: a repository that truly
+    # never grows a rollup must still terminate (proceed), not strand the PR the way an unsettled
+    # check that never completes correctly does. Deliberately does NOT consult is_blocked at all:
+    # this branch can only ever defer or proceed, never escalate, so there is no self-created
+    # escalation here to stay silent about, and an is_blocked short-circuit would wrongly suppress
+    # "proceed" once CI is empty-and-grace-satisfied just because the head happens to be blocked for
+    # an UNRELATED reason (e.g. an agent-task no-progress cap) -- ci_ready's own verdict about CI
+    # state must stay accurate regardless of other escalations; process_pr's separate, generic
+    # is_blocked gate (checked right after ci_ready returns) is what actually suppresses dispatch.
+    n="$(ci_empty_count "$nwo" "$num" "$sha")"
+    if [ "$n" -lt "$CI_EMPTY_GRACE" ]; then
+      log "  · $nwo#$num @ ${sha:0:8} CI rollup empty for a newly observed head; waiting to see whether checks register (attempt $n/$CI_EMPTY_GRACE)"
+      return 1
+    fi
+    log "  · $nwo#$num @ ${sha:0:8} CI rollup still empty after $n observations — treating as no checks configured for this repository; proceeding"
+    daemon_clear_ci_defer_block "$nwo" "$num" "$sha"
+    return 0
+  fi
+  # Already escalated for this EXACT head BY THIS EXACT REASON: stay silent (no re-log, no
+  # re-increment) so a permanently-stuck check cannot spam every poll -- #184c finding 1's "proceed
+  # once becomes proceed forever" counter bug, corrected by never incrementing/logging past the
+  # first escalation. Matched by reason prefix (same prefix daemon_clear_ci_defer_block uses), not
+  # the generic is_blocked -- an UNRELATED block (agent-task no-progress/launch-failure) must not
+  # silence this unsettled-CI branch's own logging/counting; only a ci-defer-cap block this same
+  # branch could have created should ever suppress it. #184 finding 1 (round 7): moved below the
+  # "empty" branch above, which must never be short-circuited by any is_blocked reason at all.
+  grep -qF "$(printf '%s\t%s\t%s\tci-defer-cap-exhausted' "$nwo" "$num" "$sha")" "$BLOCKED" 2>/dev/null && return 1
   n="$(ci_defer_count "$nwo" "$num" "$sha")"
   if [ "$n" -lt "$CI_DEFER_MAX" ]; then
     log "  · $nwo#$num @ ${sha:0:8} CI not settled ($state); deferring without marking done (attempt $n/$CI_DEFER_MAX)"
@@ -923,7 +1053,7 @@ process_pr(){
   # Resolve and validate the runtime's one action before any review worker can start. The decision
   # is advisory; the matching effect re-reduces under runtime protections at execution time.
   local decision="$lg.decision" engine="${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh"
-  if ! PRO_GATE_REVIEW_ENDPOINT_PATCH="$evidence_file" "$engine" --review-decision --json --pr "$num" --repo "$wt" "${DD_INPUT_ARGS[@]}" "${evidence_args[@]}" >"$decision" 2>>"$lg" \
+  if ! PRO_GATE_REVIEW_ENDPOINT_PATCH="$evidence_file" "$engine" --review-decision --json --pr "$num" --repo "$wt" ${DD_INPUT_ARGS[@]+"${DD_INPUT_ARGS[@]}"} ${evidence_args[@]+"${evidence_args[@]}"} >"$decision" 2>>"$lg" \
       || ! daemon_decision_valid "$decision" || ! daemon_decision_target_matches "$decision" "$nwo" "$num" "$sha"; then
     git -C "$repodir" worktree remove --force "$wt" 2>/dev/null || true
     daemon_defer_decision "missing, malformed, stale, unknown, or corpus-mismatched envelope"
@@ -939,7 +1069,7 @@ process_pr(){
     return 2
   fi
   DD_ENGINE="$engine" DD_DECISION="$decision" DD_NWO="$nwo" DD_NUM="$num" DD_SHA="$sha" DD_WORKTREE="$wt" DD_LOG="$lg"
-  DD_EVIDENCE_FILE="$evidence_file"; DD_EVIDENCE_ARGS=("${evidence_args[@]}")
+  DD_EVIDENCE_FILE="$evidence_file"; DD_EVIDENCE_ARGS=(${evidence_args[@]+"${evidence_args[@]}"})
   daemon_dispatch_decision "$decision"
   local rc=$? review_ran="${DAEMON_DISPATCH_REVIEW_RAN:-0}" agent_task_ran="${DAEMON_DISPATCH_AGENT_TASK_RAN:-0}" terminal_completed="${DAEMON_DISPATCH_TERMINAL_COMPLETED:-0}"
 
@@ -1011,7 +1141,7 @@ process_pr(){
   # of process_pr -- $sha (and therefore the evidence file) is unchanged for the whole call, even
   # though the worker may have pushed a new (unreviewed) commit; see daemon_prepare_review_evidence.
   local redecision="$lg.redecision"
-  if PRO_GATE_REVIEW_ENDPOINT_PATCH="$evidence_file" "$engine" --review-decision --json --pr "$num" --repo "$wt" "${DD_INPUT_ARGS[@]}" "${evidence_args[@]}" >"$redecision" 2>>"$lg" \
+  if PRO_GATE_REVIEW_ENDPOINT_PATCH="$evidence_file" "$engine" --review-decision --json --pr "$num" --repo "$wt" ${DD_INPUT_ARGS[@]+"${DD_INPUT_ARGS[@]}"} ${evidence_args[@]+"${evidence_args[@]}"} >"$redecision" 2>>"$lg" \
       && daemon_decision_valid "$redecision" \
       && daemon_decision_target_matches "$redecision" "$nwo" "$num" "$sha"; then
     if daemon_decision_completes_current_head "$redecision"; then
@@ -1070,6 +1200,11 @@ while true; do
   if ! session_up; then log "browser session down — idling"; sleep "$POLL"; continue; fi
 
   found=0
+  # #184 finding 4 (round 7): rebuilt fresh every poll cycle -- every PR this cycle actually
+  # observes (whether dispatched, deferred, blocked, or already-done) records its current head's
+  # evidence path here BEFORE any per-PR `continue`, so daemon_sweep_orphaned_evidence below has
+  # the true active set this poll proved, not a guess.
+  : > "$ACTIVE_EVIDENCE_KEEP" 2>/dev/null
   for owner in $OWNERS; do
     if [ "$ALL_PRS" = "1" ]; then
       # Review EVERY open non-draft PR in the owner, except ones opted out via $SKIP_LABEL.
@@ -1088,6 +1223,7 @@ while true; do
       meta=$(gh pr view "$num" -R "$nwo" --json headRefOid,headRefName 2>/dev/null)
       sha=$(echo "$meta" | jq -r '.headRefOid // empty'); branch=$(echo "$meta" | jq -r '.headRefName // empty')
       [ -z "$sha" ] && continue
+      printf '%s\n' "$(daemon_evidence_file "$nwo" "$num" "$sha")" >> "$ACTIVE_EVIDENCE_KEEP" 2>/dev/null
       already_done "$nwo" "$num" "$sha" && continue
       found=1
       process_pr "$nwo" "$num" "$sha" "$branch" "$url"
@@ -1096,5 +1232,6 @@ while true; do
     [ "$DECISION_DEFERRED" = 1 ] && break
   done
   [ "$found" -eq 0 ] && log "no PRs pending"
+  daemon_sweep_orphaned_evidence "$ACTIVE_EVIDENCE_KEEP"
   sleep "$POLL"
 done

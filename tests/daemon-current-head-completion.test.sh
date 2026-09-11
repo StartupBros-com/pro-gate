@@ -37,6 +37,8 @@ STATE_FILE="$HOME_D/processed-v2.tsv"; LEGACY_FILE="$HOME_D/processed.tsv"
 QUARANTINE_FILE="$HOME_D/processed-quarantine.tsv"
 FAILS_FILE="$HOME_D/failcount.tsv"
 CIDEFER_FILE="$HOME_D/ci-defer.tsv"; AGENTCAP_FILE="$HOME_D/agent-task-attempts.tsv"
+# #184 finding 1 (round 7): the empty-rollup grace ledger -- see CI_EMPTY_GRACE below.
+CIEMPTY_FILE="$HOME_D/ci-empty-rollup.tsv"
 AGENTFAIL_FILE="$HOME_D/agent-task-failures.tsv"
 BLOCKED_FILE="$HOME_D/blocked.tsv"
 # #184 finding 3 (round 6): the new bounded no-progress ledger for exit-zero review workers whose
@@ -48,8 +50,9 @@ log(){ printf '%s\n' "$*" >> "$LOG_FILE"; }
 check 'daemon.sh created the bounded #184 ledger files at startup' "$([ -f "$CIDEFER_FILE" ] && [ -f "$AGENTCAP_FILE" ] && [ -f "$BLOCKED_FILE" ]; echo $?)" "$(ls "$HOME_D")"
 check 'daemon.sh created the #184 finding-2/3 (round 3) ledger files at startup' "$([ -f "$STATE_FILE" ] && [ -f "$LEGACY_FILE" ] && [ -f "$QUARANTINE_FILE" ] && [ -f "$AGENTFAIL_FILE" ]; echo $?)" "$(ls "$HOME_D")"
 check 'daemon.sh created the #184 finding-1/3 (round 6) evidence dir and no-progress ledger at startup' "$([ -d "$REVIEW_EVIDENCE_DIR" ] && [ -f "$REVIEWNOPROG_FILE" ]; echo $?)" "$(ls "$HOME_D")"
+check 'daemon.sh created the #184 finding 1 (round 7) empty-rollup grace ledger and finding 4 active-keep file at startup' "$([ -f "$CIEMPTY_FILE" ] && [ -n "${ACTIVE_EVIDENCE_KEEP:-}" ]; echo $?)" "$(ls "$HOME_D")"
 
-reset_state(){ : > "$STATE_FILE"; : > "$FAILS_FILE"; : > "$CIDEFER_FILE"; : > "$AGENTCAP_FILE"; : > "$AGENTFAIL_FILE"; : > "$BLOCKED_FILE"; : > "$REVIEWNOPROG_FILE"; : > "$LOG_FILE"; }
+reset_state(){ : > "$STATE_FILE"; : > "$FAILS_FILE"; : > "$CIDEFER_FILE"; : > "$CIEMPTY_FILE"; : > "$AGENTCAP_FILE"; : > "$AGENTFAIL_FILE"; : > "$BLOCKED_FILE"; : > "$REVIEWNOPROG_FILE"; : > "$LOG_FILE"; }
 
 # --- corpus decision helper (mirrors tests/daemon-reload.test.sh) -----------------------------
 typed_decision(){ # corpus-case index output
@@ -123,6 +126,15 @@ gh(){
 }
 
 CLAUDE_MODEL=test FALLBACK_MODEL=test MAX_BUDGET=1
+# #184 finding 1 (round 7): pin the empty-rollup grace to 1 for the ambient default here, so
+# every OTHER test section in this file (which reuses the fixed $SHA and the default empty
+# GH_ROLLUP fixture as "settled" after a reset_state, and never intends to exercise the grace
+# mechanic itself) keeps observing the SAME immediate-proceed behavior it always has: with
+# grace=1, the first observation already satisfies the bound and proceeds, exactly like the
+# pre-fix "empty == settled" rule did for these unrelated callers. The dedicated grace-mechanic
+# coverage below temporarily raises CI_EMPTY_GRACE to exercise multi-poll deferral explicitly,
+# then restores it to 1 before any other section runs.
+CI_EMPTY_GRACE=1
 
 echo '# a) CI-readiness gate before dispatch'
 
@@ -143,16 +155,53 @@ GH_ROLLUP='{"statusCheckRollup":[{"status":"COMPLETED","conclusion":"SUCCESS"},{
 state="$(ci_rollup_state "$NWO" "$NUM")"
 check 'one unsettled check among several settled ones still reads as not settled' "$([ "$state" = IN_PROGRESS ]; echo $?)" "state=$state"
 
-echo '# empty rollup proceeds (never a permanent block)'
+echo '# empty rollup proceeds after grace (never a permanent block) -- CI_EMPTY_GRACE=1 here, so a
+# single observation already satisfies the bound; the multi-poll grace mechanic itself is covered
+# in the dedicated #184 finding 1 section below with the bound temporarily raised.'
 GH_ROLLUP='{"statusCheckRollup":[]}'
 reset_state
 ci_ready "$NWO" "$NUM" "$SHA"; empty_rc=$?
-check 'ci_ready treats an empty rollup as settled' "$([ "$empty_rc" -eq 0 ]; echo $?)" "rc=$empty_rc"
-check 'an empty rollup never writes a deferral row' "$([ ! -s "$CIDEFER_FILE" ]; echo $?)"
+check 'ci_ready treats an empty rollup as settled once grace is satisfied' "$([ "$empty_rc" -eq 0 ]; echo $?)" "rc=$empty_rc"
+check 'an empty rollup never writes a CI-defer-cap deferral row (it uses its own separate ledger)' "$([ ! -s "$CIDEFER_FILE" ]; echo $?)"
+check 'the empty-rollup observation is recorded in its own grace ledger, not CIDEFER' "$([ "$(wc -l < "$CIEMPTY_FILE")" -eq 1 ]; echo $?)" "$(cat "$CIEMPTY_FILE")"
+check 'reaching grace never blocks the head' "$(! is_blocked "$NWO" "$NUM" "$SHA"; echo $?)"
 
 GH_ROLLUP='{}'
+reset_state
 ci_ready "$NWO" "$NUM" "$SHA"; missing_rc=$?
 check 'a missing statusCheckRollup key (repo has no checks configured) also proceeds' "$([ "$missing_rc" -eq 0 ]; echo $?)" "rc=$missing_rc"
+
+echo '# #184 finding 1 (round 7) RED->GREEN: a newly observed head reporting an EMPTY rollup is'
+echo '# PROVISIONAL, not settled -- it must defer for CI_EMPTY_GRACE consecutive observations of the'
+echo '# exact same sha before proceeding, it must never touch blocked.tsv while doing so (bounded'
+echo '# termination by proceeding, not escalation), and a new sha must reset the counter.'
+reset_state
+GRACE_SHA=7777777777777777777777777777777777777777
+CI_EMPTY_GRACE=3   # temporarily raised so the multi-poll deferral is actually exercised
+GH_ROLLUP='{"statusCheckRollup":[]}'
+ci_ready "$NWO" "$NUM" "$GRACE_SHA"; g1_rc=$?
+check 'RED: the FIRST empty-rollup observation on a newly observed head defers (does not yet proceed)' "$([ "$g1_rc" -eq 1 ]; echo $?)" "rc=$g1_rc"
+check 'the first observation is recorded in the grace ledger, exactly once' "$([ "$(wc -l < "$CIEMPTY_FILE")" -eq 1 ]; echo $?)" "$(cat "$CIEMPTY_FILE")"
+check 'deferring for grace never writes to blocked.tsv' "$(! is_blocked "$NWO" "$NUM" "$GRACE_SHA"; echo $?)" "$(cat "$BLOCKED_FILE")"
+check 'deferring for grace never writes to the unrelated CI-defer-cap ledger' "$([ ! -s "$CIDEFER_FILE" ]; echo $?)"
+ci_ready "$NWO" "$NUM" "$GRACE_SHA"; g2_rc=$?
+check 'the SECOND observation (still below the raised grace of 3) also defers' "$([ "$g2_rc" -eq 1 ]; echo $?)" "rc=$g2_rc"
+ci_ready "$NWO" "$NUM" "$GRACE_SHA"; g3_rc=$?
+check 'GREEN: the THIRD observation (reaching CI_EMPTY_GRACE) proceeds -- a genuinely check-less repo terminates rather than stalling forever' "$([ "$g3_rc" -eq 0 ]; echo $?)" "rc=$g3_rc"
+check 'reaching grace-exhaustion proceeds, it never escalates to blocked.tsv' "$(! is_blocked "$NWO" "$NUM" "$GRACE_SHA"; echo $?)" "$(cat "$BLOCKED_FILE")"
+check 'grace-exhaustion is never recorded in the CI-defer-cap ledger either' "$([ ! -s "$CIDEFER_FILE" ]; echo $?)"
+NEWPUSH_SHA=6666666666666666666666666666666666666666
+ci_ready "$NWO" "$NUM" "$NEWPUSH_SHA"; newpush_rc=$?
+check 'a new push (different sha) resets the grace counter and defers again from scratch' "$([ "$newpush_rc" -eq 1 ]; echo $?)" "rc=$newpush_rc"
+i=1
+while [ "$i" -le 50 ]; do
+  ci_ready "$NWO" "$NUM" "$NEWPUSH_SHA" >/dev/null; hammer_rc=$?
+  i=$((i + 1))
+done
+check 'hammering a genuinely check-less head far past grace (50x) still never blocks it -- the bound terminates only by proceeding' "$(! is_blocked "$NWO" "$NUM" "$NEWPUSH_SHA"; echo $?)" "$(cat "$BLOCKED_FILE")"
+check 'and it does proceed once hammered' "$([ "$hammer_rc" -eq 0 ]; echo $?)" "rc=$hammer_rc"
+CI_EMPTY_GRACE=1   # restore the ambient default this file relies on everywhere else
+reset_state
 
 echo '# #184c finding 1: the deferral cap BLOCKS (never proceeds) once exhausted'
 GH_ROLLUP='{"statusCheckRollup":[{"status":"IN_PROGRESS"}]}'
@@ -865,5 +914,127 @@ while [ "$i" -le "$((REVIEW_WORKER_NO_PROGRESS_MAX * 2))" ]; do
 done
 check "a review worker whose re-resolved decision advances to a DIFFERENT action (collect-existing-result), driven well past the no-progress cap ($((REVIEW_WORKER_NO_PROGRESS_MAX * 2))x), never increments the no-progress counter" "$([ ! -s "$REVIEWNOPROG_FILE" ]; echo $?)" "$(cat "$REVIEWNOPROG_FILE")"
 check 'and is therefore never blocked by it' "$(! is_blocked "$NWO" "$NUM" "$SHA"; echo $?)"
+
+echo '# #184 finding 2 (round 7): every possibly-empty array expansion in daemon.sh is guarded against'
+echo '# the bash <4.4 (stock macOS /bin/bash 3.2) "unbound variable" crash on a bare "${arr[@]}"'
+echo '# expansion of a zero-element array under set -u.'
+echo '#'
+echo '# What this DOES verify, executed on this host (bash 5.2, no bash 3.2 binary available here):'
+echo '#   1. A file-wide structural sweep: every "[@]" array expansion in daemon.sh is part of the'
+echo '#      ${arr[@]+"${arr[@]}"} guard idiom (a bare "${arr[@]}" would fail this grep).'
+echo '#   2. The guard idiom itself runs clean under set -u for both an empty and a populated array,'
+echo '#      on THIS bash -- a non-regression check, not a reproduction of the original bug.'
+echo '# What this does NOT verify: bash 4.4 (2016) fixed the underlying bug so a bare "${arr[@]}"'
+echo '# expansion of a DECLARED-BUT-EMPTY array no longer throws under set -u even on bash 5.2 --'
+echo '# so a bare-vs-guarded comparison run on this host would show NO difference either way, and'
+echo '# cannot demonstrate the actual pre-4.4 crash. No bash 3.2 binary is available in this'
+echo '# environment; the fix is verified structurally (idiom present at every site) and by citing the'
+echo '# documented bash changelog behavior, NOT by an executed reproduction of the original crash.'
+DAEMON_SH="$HERE/../daemon/daemon.sh"
+# Strip every full guard-idiom occurrence ( ${name[@]+"${name[@]}"} ) out of the file text first,
+# then any "[@]" expansion still remaining on a CODE line (excluding the 3 explanatory comment
+# lines that spell the idiom out as prose, ~129/140/146) is a genuine unguarded bare expansion.
+UNGUARDED_LINES="$(sed -E 's/\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\+"\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\}"\}//g' "$DAEMON_SH" \
+  | grep -noE '\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\}' \
+  | cut -d: -f1 | sort -un | grep -vxE '129|140|146' || true)"
+check 'every "[@]" array expansion outside the explanatory comment block is wrapped in the ${arr[@]+"${arr[@]}"} guard idiom' "$([ -z "$UNGUARDED_LINES" ]; echo $?)" "unguarded lines: $UNGUARDED_LINES"
+check 'sanity: at least the 7 known call sites (daemon_run_review_worker x4, its recover branch, and process_pr/daemon_dispatch_decision x2 more) still use the guard' "$([ "$(grep -c '\[@\]+"\${[A-Za-z_]*\[@\]}"}' "$DAEMON_SH")" -ge 7 ]; echo $?)" "count=$(grep -c '\[@\]+"\${[A-Za-z_]*\[@\]}"}' "$DAEMON_SH")"
+
+GUARD_PROBE="$TDIR/guard-probe.sh"
+cat > "$GUARD_PROBE" <<'PROBE'
+#!/usr/bin/env bash
+set -u
+arr=()
+out="$(printf '%s|' one two ${arr[@]+"${arr[@]}"} three)"
+[ "$out" = "one|two|three|" ] || { echo "MISMATCH: $out"; exit 1; }
+arr=(a b)
+out="$(printf '%s|' ${arr[@]+"${arr[@]}"})"
+[ "$out" = "a|b|" ] || { echo "MISMATCH2: $out"; exit 1; }
+exit 0
+PROBE
+chmod +x "$GUARD_PROBE"
+"$GUARD_PROBE"; guard_probe_rc=$?
+check 'the guard idiom runs clean under set -u for both an empty and a populated array on this bash (non-regression; does not reproduce the pre-4.4 bug itself -- see comment above)' "$([ "$guard_probe_rc" -eq 0 ]; echo $?)" "rc=$guard_probe_rc"
+
+echo '# #184 finding 3 (round 7): the evidence key for (host, owner, repo, pr) is injective -- two'
+echo '# different (owner,repo) pairs that COLLIDE under the old "/" -> "-" dash-join scheme must now'
+echo '# produce DIFFERENT on-disk evidence files.'
+NWO_A="foo-bar/baz"
+NWO_B="foo/bar-baz"
+OLD_KEY_A="${NWO_A//\//-}-1"
+OLD_KEY_B="${NWO_B//\//-}-1"
+check 'RED (documenting the old bug): the naive dash-join scheme collides these two distinct (owner,repo) pairs at PR #1' "$([ "$OLD_KEY_A" = "$OLD_KEY_B" ]; echo $?)" "A=$OLD_KEY_A B=$OLD_KEY_B"
+NEW_FILE_A="$(daemon_evidence_file "$NWO_A" 1 "$SHA")"
+NEW_FILE_B="$(daemon_evidence_file "$NWO_B" 1 "$SHA")"
+check 'GREEN: daemon_evidence_file now produces DISTINCT paths for the two colliding pairs' "$([ "$NEW_FILE_A" != "$NEW_FILE_B" ]; echo $?)" "A=$NEW_FILE_A B=$NEW_FILE_B"
+check 'sanity: daemon_evidence_file is still deterministic (same inputs -> same path, so pruning/lookup keeps working)' "$([ "$(daemon_evidence_file "$NWO_A" 1 "$SHA")" = "$NEW_FILE_A" ]; echo $?)"
+check 'a different PR number under the SAME (owner,repo) still produces a different path' "$([ "$(daemon_evidence_file "$NWO_A" 2 "$SHA")" != "$NEW_FILE_A" ]; echo $?)"
+check 'a different sha under the same (owner,repo,pr) still produces a different path' "$([ "$(daemon_evidence_file "$NWO_A" 1 "$SHA" | sed 's/\.diff$//')" != "$(daemon_evidence_file "$NWO_A" 1 8888888888888888888888888888888888888888 | sed 's/\.diff$//')" ]; echo $?)"
+
+echo '# end-to-end: the two colliding repos never share persisted evidence bytes through process_pr'
+reset_state
+rm -f "$REVIEW_EVIDENCE_DIR"/*.diff 2>/dev/null
+daemon_run_agent_task(){ return 2; }
+GH_DIFF='diff --git a/a b/a
+index e69de29..d00491fd7 100644
+--- a/a
++++ a/a
+@@ -0,0 +1 @@
++A
+'
+MOCK_FRESH="$NOEVID_DECISION" process_pr "$NWO_A" 1 "$SHA" "$BRANCH" "$URL" >/dev/null
+GH_DIFF='diff --git a/b b/b
+index e69de29..d00491fd7 100644
+--- a/b
++++ a/b
+@@ -0,0 +1 @@
++B
+'
+MOCK_FRESH="$NOEVID_DECISION" process_pr "$NWO_B" 1 "$SHA" "$BRANCH" "$URL" >/dev/null
+check 'both colliding repos persisted their own evidence file (2 files on disk, not 1 clobbered)' "$([ "$(ls "$REVIEW_EVIDENCE_DIR"/*.diff 2>/dev/null | wc -l)" -eq 2 ]; echo $?)" "$(ls "$REVIEW_EVIDENCE_DIR")"
+check "repo A's evidence file was never overwritten by repo B's fetch" "$(grep -qF '+A' "$(daemon_evidence_file "$NWO_A" 1 "$SHA")"; echo $?)" "$(cat "$(daemon_evidence_file "$NWO_A" 1 "$SHA")" 2>/dev/null)"
+check "repo B's evidence file was never overwritten by repo A's fetch" "$(grep -qF '+B' "$(daemon_evidence_file "$NWO_B" 1 "$SHA")"; echo $?)" "$(cat "$(daemon_evidence_file "$NWO_B" 1 "$SHA")" 2>/dev/null)"
+rm -f "$REVIEW_EVIDENCE_DIR"/*.diff 2>/dev/null
+GH_DIFF='diff --git a/x b/x
+index e69de29..d00491fd7e5bb6fa28c517a0bb32b8b506539d4d 100644
+--- a/x
++++ b/x
+@@ -0,0 +1 @@
++1
+'
+
+echo '# #184 finding 4 (round 7, P2): daemon_sweep_orphaned_evidence prunes evidence for a PR that has'
+echo '# left the watched set (a conservative TTL, never a same-poll "unseen this cycle" eviction),'
+echo '# and leaves anything still in the active set or still within the TTL alone.'
+rm -f "$REVIEW_EVIDENCE_DIR"/*.diff 2>/dev/null
+ACTIVE_FILE="$(daemon_evidence_file "$NWO" "$NUM" "$SHA")"
+ORPHAN_OLD_FILE="$(daemon_evidence_file acme/other-repo 42 "$SHA")"
+ORPHAN_FRESH_FILE="$(daemon_evidence_file acme/yet-another 43 "$SHA")"
+printf 'active\n' > "$ACTIVE_FILE"
+printf 'orphan-old\n' > "$ORPHAN_OLD_FILE"
+printf 'orphan-fresh\n' > "$ORPHAN_FRESH_FILE"
+OLD_TS="$(( $(date +%s) - 999999 ))"
+touch -d "@$OLD_TS" "$ORPHAN_OLD_FILE" 2>/dev/null || touch -t "$(date -d "@$OLD_TS" +%Y%m%d%H%M.%S 2>/dev/null)" "$ORPHAN_OLD_FILE" 2>/dev/null || true
+check 'sanity: the old orphan file was actually backdated past the TTL' "$([ "$(( $(date +%s) - $(stat -c %Y "$ORPHAN_OLD_FILE" 2>/dev/null || stat -f %m "$ORPHAN_OLD_FILE") )) " -gt "$EVIDENCE_ORPHAN_TTL" ]; echo $?)"
+KEEP_FILE="$HOME_D/sweep-keep.tmp"
+printf '%s\n' "$ACTIVE_FILE" > "$KEEP_FILE"
+daemon_sweep_orphaned_evidence "$KEEP_FILE"
+check 'RED->GREEN: an orphaned evidence file older than the TTL, absent from the active-keep set, is removed' "$([ ! -e "$ORPHAN_OLD_FILE" ]; echo $?)" "$(ls "$REVIEW_EVIDENCE_DIR")"
+check 'an evidence file still in the active-keep set is never removed, however old it is not (it is fresh here, but keep-membership alone protects it)' "$([ -e "$ACTIVE_FILE" ]; echo $?)"
+check 'an orphaned evidence file still WITHIN the TTL (a single missed poll / transient gh gap) is NOT removed' "$([ -e "$ORPHAN_FRESH_FILE" ]; echo $?)"
+rm -f "$ACTIVE_FILE" "$ORPHAN_FRESH_FILE" "$KEEP_FILE" 2>/dev/null
+
+echo '# finding 4: the main loop wires the sweep in -- a PR still actively polled this cycle is kept'
+echo '# even though its own evidence file mtime may be old (freshness alone never protects it; only'
+echo '# active-set membership does), and a PR no longer observed at all eventually gets swept.'
+reset_state
+rm -f "$REVIEW_EVIDENCE_DIR"/*.diff 2>/dev/null
+STILL_ACTIVE_OLD="$(daemon_evidence_file "$NWO" "$NUM" "$SHA")"
+printf 'still-active-but-old\n' > "$STILL_ACTIVE_OLD"
+touch -d "@$OLD_TS" "$STILL_ACTIVE_OLD" 2>/dev/null || true
+printf '%s\n' "$STILL_ACTIVE_OLD" > "$KEEP_FILE"
+daemon_sweep_orphaned_evidence "$KEEP_FILE"
+check 'an evidence file that IS in this cycles active-keep set survives the sweep even with an old mtime' "$([ -e "$STILL_ACTIVE_OLD" ]; echo $?)"
+rm -f "$STILL_ACTIVE_OLD" "$KEEP_FILE" 2>/dev/null
 
 [ "$TEST_FAILURES" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$TEST_FAILURES FAILURES"; exit 1; }
