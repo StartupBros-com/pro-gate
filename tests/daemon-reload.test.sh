@@ -60,7 +60,12 @@ unset PRO_GATE_DAEMON_LIB_ONLY
 check 'daemon defaults PRO_REVIEW_INPUT to empty/inherit-engine' "$([ -z "$DD_INPUT" ] && [ "${#DD_INPUT_ARGS[@]}" -eq 0 ]; echo $?)" "input=$DD_INPUT args=${DD_INPUT_ARGS[*]}"
 PRO_GATE_HOME="$TYPED_HOME" PRO_REVIEW_INPUT=invalid bash "$HERE/../daemon/daemon.sh" >"$TYPED_HOME/invalid-input.log" 2>&1; input_rc=$?
 check 'invalid PRO_REVIEW_INPUT fails closed at startup' "$([ "$input_rc" -ne 0 ] && grep -Fq 'must be one of: empty, both, bundle, connector' "$TYPED_HOME/invalid-input.log"; echo $?)" "rc=$input_rc"
-TYPED_STATE="$TYPED_HOME/processed.tsv"; TYPED_FAILS="$TYPED_HOME/failcount.tsv"; : > "$TYPED_STATE"; : > "$TYPED_FAILS"
+# TYPED_STATE tracks daemon.sh's real $STATE ledger (processed-v2.tsv), not $STATE_LEGACY's
+# processed.tsv -- #184 finding 1 (round 5): before that fix, allow-existing-merge-workflow never
+# reached mark_processed_heads, so pointing this at the wrong file was silently inert; now that a
+# FIRST SHIP correctly marks the head done, a case below (line ~224) legitimately writes here, and
+# a later case reusing the same PROCESS_SHA needs this truncated first or it inherits that mark.
+TYPED_STATE="$TYPED_HOME/processed-v2.tsv"; TYPED_FAILS="$TYPED_HOME/failcount.tsv"; : > "$TYPED_STATE"; : > "$TYPED_FAILS"
 TYPED_LOG="$TYPED_HOME/typed.log"; : > "$TYPED_LOG"
 log(){ printf '%s\n' "$*" >> "$TYPED_LOG"; }
 TYPED_ENGINE="$TYPED_HOME/oracle-review.sh"; TYPED_ENGINE_CALLS="$TYPED_HOME/engine-calls.log"; : > "$TYPED_ENGINE_CALLS"; export MOCK_ENGINE_CALLS="$TYPED_ENGINE_CALLS"
@@ -178,48 +183,80 @@ check 'gate #148 r1 P2: daemon recovery passes an explicit PRO_REVIEW_ENGINE_TIM
   "$(grep -Fq -- '--timeout 7m' <<<"$RECOVER_CALL"; echo $?)" "call=$RECOVER_CALL"
 check 'explicit connector input is reused by guarded effect rechecks' "$(grep -F -- '--review-decision-effect' "$TYPED_ENGINE_CALLS" | grep -Fq -- '--input connector'; echo $?)"
 
-# A completed agent task uses the same processed.tsv behavior as a completed review worker. Its
-# failure/unavailable outcomes, and every non-agent action, remain retryable and budget-neutral.
+# #184/#184c: completion requires a typed current-head outcome, not a subprocess exit code. A
+# successful agent task is progress -- it never marks the SHA. A completed run-granted-review
+# worker completes it; a report-only stop-without-new-review decision completes it ONLY when its
+# facts positively attest a completed, applicable, current-head review (daemon_stop_is_completion_
+# proof) -- most stop reasons (round-governor-denied included) mean no applicable review ran at
+# all. Every other action, and agent-task failure/unavailable outcomes, remain retryable and
+# budget-neutral.
+# CI is reported settled throughout this block; #184's own CI-gate/deferral-cap and
+# agent-task-attempt-cap coverage lives in tests/daemon-current-head-completion.test.sh.
 PROCESS_REPO="$TYPED_HOME/process-repo"; mkdir -p "$PROCESS_REPO/.git"
 PROCESS_SHA=1111111111111111111111111111111111111111
-PROCESS_NEW_SHA="$PROCESS_SHA"
 find_repo(){ printf '%s\n' "$PROCESS_REPO"; }
 git(){
   if [ "${1:-}" = -C ] && [ "${3:-}" = worktree ] && [ "${4:-}" = add ]; then mkdir -p "$6"; fi
   return 0
 }
+# #184 finding 3 (round 8): an EMPTY rollup no longer means "settled" (see ci_ready in daemon.sh) --
+# an unconfigured repo now blocks once the empty-rollup grace is exhausted instead of proceeding, so
+# reusing an empty rollup here would trip that new (correct) block and fail every process_pr call in
+# this block, none of which intends to exercise the empty-rollup/no-CI-config mechanic (that has its
+# own dedicated red/green coverage in tests/daemon-current-head-completion.test.sh). Report a
+# positively SETTLED check instead, matching this block's actual, stated intent.
 gh(){
-  [ "${1:-}" = pr ] && [ "${2:-}" = view ] && { printf '%s\n' "$PROCESS_NEW_SHA"; return 0; }
+  [ "${1:-}" = pr ] && [ "${2:-}" = view ] && { printf '{"statusCheckRollup":[{"status":"COMPLETED","conclusion":"SUCCESS"}]}\n'; return 0; }
   return 1
 }
 runtime_gate(){ return 0; }
+CI_EMPTY_GRACE=1
 PROCESS_AGENT_RC=0
 daemon_run_agent_task(){ AGENT_TASKS=$((AGENT_TASKS + 1)); return "$PROCESS_AGENT_RC"; }
 PROCESS_DECISION="$TYPED_HOME/process-agent.json"; typed_decision 3 "$PROCESS_DECISION"
-: > "$TYPED_STATE"; : > "$TYPED_FAILS"
+: > "$TYPED_STATE"; : > "$TYPED_FAILS"; : > "$TYPED_HOME/agent-task-attempts.tsv"
 MOCK_FRESH="$PROCESS_DECISION" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
-check 'successful no-push fix task marks its SHA and is skipped next poll' "$([ "$process_rc" -eq 0 ] && already_done acme/widgets 1983 "$PROCESS_SHA" && [ "$(wc -l < "$TYPED_STATE")" -eq 1 ]; echo $?)" "rc=$process_rc state=$(wc -l < "$TYPED_STATE")"
+check 'successful fix agent task does not mark its SHA and is retried next poll' "$([ "$process_rc" -eq 0 ] && ! already_done acme/widgets 1983 "$PROCESS_SHA" && [ ! -s "$TYPED_STATE" ]; echo $?)" "rc=$process_rc state=$(wc -l < "$TYPED_STATE")"
+check 'successful agent task counts toward its bounded no-progress attempt cap' "$([ "$(wc -l < "$TYPED_HOME/agent-task-attempts.tsv")" -eq 1 ]; echo $?)" "attempts=$(cat "$TYPED_HOME/agent-task-attempts.tsv")"
 PROCESS_PREPARE_DECISION="$TYPED_HOME/process-prepare.json"; typed_decision 4 "$PROCESS_PREPARE_DECISION"
-: > "$TYPED_STATE"; : > "$TYPED_FAILS"
+: > "$TYPED_STATE"; : > "$TYPED_FAILS"; : > "$TYPED_HOME/agent-task-attempts.tsv"
 MOCK_FRESH="$PROCESS_PREPARE_DECISION" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
-check 'successful no-push evidence task marks its SHA and is skipped next poll' "$([ "$process_rc" -eq 0 ] && already_done acme/widgets 1983 "$PROCESS_SHA" && [ "$(wc -l < "$TYPED_STATE")" -eq 1 ]; echo $?)" "rc=$process_rc state=$(wc -l < "$TYPED_STATE")"
-PROCESS_NEW_SHA=2222222222222222222222222222222222222222
-: > "$TYPED_STATE"; : > "$TYPED_FAILS"
-MOCK_FRESH="$PROCESS_DECISION" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
-check 'successful pushed agent task marks original and new heads' "$([ "$process_rc" -eq 0 ] && already_done acme/widgets 1983 "$PROCESS_SHA" && already_done acme/widgets 1983 "$PROCESS_NEW_SHA" && [ "$(wc -l < "$TYPED_STATE")" -eq 2 ]; echo $?)" "rc=$process_rc state=$(wc -l < "$TYPED_STATE")"
+check 'successful evidence-prep agent task does not mark its SHA and is retried next poll' "$([ "$process_rc" -eq 0 ] && ! already_done acme/widgets 1983 "$PROCESS_SHA" && [ ! -s "$TYPED_STATE" ]; echo $?)" "rc=$process_rc state=$(wc -l < "$TYPED_STATE")"
 for PROCESS_AGENT_RC in 1 2; do
-  : > "$TYPED_STATE"; : > "$TYPED_FAILS"
+  : > "$TYPED_STATE"; : > "$TYPED_FAILS"; : > "$TYPED_HOME/agent-task-attempts.tsv"
   MOCK_FRESH="$PROCESS_DECISION" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
   check "agent task rc=$PROCESS_AGENT_RC stays retryable without a failure-budget row" "$([ "$process_rc" -eq "$PROCESS_AGENT_RC" ] && [ ! -s "$TYPED_STATE" ] && [ ! -s "$TYPED_FAILS" ]; echo $?)" "rc=$process_rc processed=$(wc -c < "$TYPED_STATE") failures=$(wc -c < "$TYPED_FAILS")"
 done
 PROCESS_AGENT_RC=0
-for action in collect-existing-result recover-existing-review stop-without-new-review allow-existing-merge-workflow ask-named-product-choice; do
+for action in collect-existing-result recover-existing-review ask-named-product-choice; do
   index="$(jq -r --arg action "$action" '.cases | to_entries[] | select(.value.expected.action == $action) | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
   decision="$TYPED_HOME/process-$action.json"; typed_decision "$index" "$decision"
   : > "$TYPED_STATE"; : > "$TYPED_FAILS"
   MOCK_FRESH="$decision" MOCK_RECOVERED="$TYPED_HOME/process-recovered" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
   check "$action does not mark a processed SHA or failure budget" "$([ "$process_rc" -eq 0 ] && [ ! -s "$TYPED_STATE" ] && [ ! -s "$TYPED_FAILS" ]; echo $?)" "rc=$process_rc processed=$(wc -c < "$TYPED_STATE") failures=$(wc -c < "$TYPED_FAILS")"
 done
+# #184 finding 1 (round 5): allow-existing-merge-workflow/current-ship-is-merge-eligible is one of
+# the two positive shapes daemon_decision_completes_current_head recognizes (the producer's FIRST
+# SHIP result lives in .facts.completed_results, never .facts.prior_review) -- unlike the three
+# report/collection actions above, it correctly DOES mark the head done, or the unchanged head
+# re-clones and re-queries forever. Split out of the "does not mark" loop above on purpose.
+MERGE_INDEX="$(jq -r --arg action allow-existing-merge-workflow '.cases | to_entries[] | select(.value.expected.action == $action) | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
+MERGE_DECISION="$TYPED_HOME/process-allow-existing-merge-workflow.json"; typed_decision "$MERGE_INDEX" "$MERGE_DECISION"
+check 'sanity: the allow-existing-merge-workflow corpus fixture is the FIRST-SHIP completion reason (current-ship-is-merge-eligible)' "$([ "$(jq -r .reason "$MERGE_DECISION")" = current-ship-is-merge-eligible ]; echo $?)" "$(jq -r .reason "$MERGE_DECISION")"
+: > "$TYPED_STATE"; : > "$TYPED_FAILS"
+MOCK_FRESH="$MERGE_DECISION" MOCK_RECOVERED="$TYPED_HOME/process-recovered" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
+check 'allow-existing-merge-workflow (current-ship-is-merge-eligible) completes the current head without a failure-budget charge' "$([ "$process_rc" -eq 0 ] && already_done acme/widgets 1983 "$PROCESS_SHA" && [ ! -s "$TYPED_FAILS" ]; echo $?)" "rc=$process_rc processed=$(wc -c < "$TYPED_STATE") failures=$(wc -c < "$TYPED_FAILS")"
+: > "$TYPED_STATE"; : > "$TYPED_FAILS"
+# #184c finding 1: this corpus's only stop-without-new-review case is round-governor-denied --
+# no applicable review ran, so it must NOT complete the head. Positive current-head review proof
+# ("identical-code-and-evidence") is covered by tests/daemon-current-head-completion.test.sh,
+# which is not in the shared corpus so it does not perturb this file's case count.
+STOP_INDEX="$(jq -r '.cases | to_entries[] | select(.value.expected.action == "stop-without-new-review") | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
+STOP_DECISION="$TYPED_HOME/process-stop.json"; typed_decision "$STOP_INDEX" "$STOP_DECISION"
+check 'sanity: the stop-without-new-review corpus fixture is a NON-completion reason (round-governor-denied)' "$([ "$(jq -r .reason "$STOP_DECISION")" = round-governor-denied ]; echo $?)" "$(jq -r .reason "$STOP_DECISION")"
+: > "$TYPED_STATE"; : > "$TYPED_FAILS"
+MOCK_FRESH="$STOP_DECISION" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
+check 'report-only stop-without-new-review WITHOUT current-head review proof does not complete the head' "$([ "$process_rc" -eq 0 ] && ! already_done acme/widgets 1983 "$PROCESS_SHA" && [ ! -s "$TYPED_STATE" ]; echo $?)" "rc=$process_rc state=$(wc -l < "$TYPED_STATE")"
 # Observation is progress only: it reports, but never changes action selection or prompts.
 typed_decision 2 "$TYPED_HOME/observed-base.json"
 observed_facts="$(jq -cS '.facts | .observation.kind="waiting"' "$TYPED_HOME/observed-base.json")"

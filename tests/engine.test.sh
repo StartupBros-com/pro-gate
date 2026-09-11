@@ -5278,8 +5278,14 @@ LEGACY_COLLECT='{"completed_results":[{"applicable":false,"artifact_digest":"aaa
 LEGACY_COLLECT_OUT="$(rd_reduce "$(rd_facts "$LEGACY_COLLECT")")"
 check 'legacy completed artifact remains collectable' \
   "$(jq -e '.action == "collect-existing-result"' <<<"$LEGACY_COLLECT_OUT" >/dev/null 2>&1; echo $?)" "$LEGACY_COLLECT_OUT"
+# #184c: `.prior_review.applicable` is a raw fact the real producer (oracle-review.sh) always emits
+# as false (it only ever populates `prior_review` from non-exact `prior_candidates`); a hand-built
+# `prior_review.applicable:true` is a shape the producer can never emit. `prior_applicable` (and thus
+# this branch) is genuinely reachable only via a matched, ALREADY-COLLECTED `completed_results` entry
+# (`selected`), which forces prior_applicable=true regardless of that entry's own `applicable` field --
+# see LEGACY_COLLECT above for the `collected:false` sibling of this same real shape.
 rd_expect_stop 'legacy SHIP cannot authorize merge eligibility or paid continuation' \
-  '{"prior_review":{"applicable":true,"binding_valid":false,"code_identity":"input-current","evidence_identity":"evidence-current","legacy":true,"marker":"pg-run-legacy-1983-1-1","provenance_valid":false,"verdict":"SHIP"}}' 'legacy-not-authoritative'
+  '{"completed_results":[{"applicable":false,"artifact_digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","binding_valid":false,"canonical_identity":"legacy-ship","charged_spend_epoch":1700000090,"collected":true,"legacy":true,"marker":"pg-run-legacy-1983-1700000090-1","provenance_valid":false,"verdict":"SHIP"}]}' 'legacy-not-authoritative'
 
 SELECT_PATCH='{"completed_results":[{"applicable":true,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binding_valid":true,"canonical_identity":"result-a","charged_spend_epoch":1700000200,"collected":false,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000200-1","provenance_valid":true,"verdict":"SHIP"},{"applicable":true,"artifact_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","binding_valid":true,"canonical_identity":"result-b","charged_spend_epoch":1700000201,"collected":false,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000201-2","provenance_valid":true,"verdict":"FIX-FIRST"}]}'
 SELECT_OUT="$(rd_reduce "$(rd_facts "$SELECT_PATCH")")"
