@@ -8,8 +8,8 @@ CANONICAL_SOURCE_KIND='url'
 CANONICAL_SOURCE_URL='https://github.com/StartupBros-com/pro-gate.git'
 trap 'rm -rf "$TMP"' EXIT
 
-HARDENED_SHA='08f7d22f3a5b59b1658ab2e96a20d0d3c352869c'
-RETIRED_SHA='c981b872ebf650805200ad72c8b7142232f8b3f6'
+HARDENED_SHA='66e197874fe627f3d5f58dff49737e7747d20bfe'
+RETIRED_SHA='08f7d22f3a5b59b1658ab2e96a20d0d3c352869c'
 ANNOUNCE_WORKFLOW='StartupBros-com/hov-marketplace/.github/workflows/hov-tool-drop-announce.yml'
 HARDENED_USES="$ANNOUNCE_WORKFLOW@$HARDENED_SHA"
 ANNOUNCE_IF="github.event.release.draft == false && github.event.release.prerelease == false && needs.verify.result == 'success' && needs.verify.outputs.announce == 'true'"
@@ -399,23 +399,23 @@ grep -q 'docs/release-notes/v\$version.md' "$ROOT/.github/workflows/ci.yml" \
 # The COUPLING is asserted, not just the prose: the automatic-recovery claim may return only
 # together with a migration that revalidates those convictions. While the blacklist still gates
 # the scan, the notes must not promise self-healing.
-NOTES_045="$ROOT/docs/release-notes/v0.45.0.md"
-UPGRADE_045="$(sed -n '/^## Upgrade/,/^## Details/p' "$NOTES_045")"
+NOTES_046="$ROOT/docs/release-notes/v0.46.0.md"
+UPGRADE_046="$(sed -n '/^## Upgrade/,/^## Details/p' "$NOTES_046")"
 grep -qF 'if (nonMatching.has(tab.url)) continue;' "$ROOT/bin/cdp-salvage.mjs" \
   && pass 'the salvage scan still skips a blacklisted URL before it is ever classified' \
-  || fail 'blacklist gating changed; re-derive the v0.45.0 upgrade guidance before relaxing it'
-grep -qiE 'no state needs clearing|nothing to do\.' <<<"$UPGRADE_045" \
-  && fail 'v0.45.0 upgrade section still promises automatic recovery for an already-convicted run' \
-  || pass 'v0.45.0 upgrade section does not promise automatic recovery for an already-convicted run'
-grep -qF 'STUCK (cross-bound)' <<<"$UPGRADE_045" \
-  && pass 'v0.45.0 upgrade section names the state that does not recover on its own' \
-  || fail 'v0.45.0 upgrade section does not name the cross-bound state an upgrade cannot clear'
-grep -qF 'salvage-nonmatching.txt' "$NOTES_045" && grep -qF 'conversation-urls/' "$NOTES_045" \
-  && pass 'v0.45.0 documents both pieces of state a targeted recovery must correct' \
-  || fail 'v0.45.0 does not document the blacklist and memo a targeted recovery must correct'
-grep -qF 'crossbound/' "$NOTES_045" \
-  && pass 'v0.45.0 documents how to verify the conviction was case-only before clearing it' \
-  || fail 'v0.45.0 gives no way to tell a false conviction from a genuine cross-bind'
+  || fail 'blacklist gating changed; re-derive the v0.46.0 upgrade guidance before relaxing it'
+grep -qiE 'no state needs clearing|nothing to do\.' <<<"$UPGRADE_046" \
+  && fail 'v0.46.0 upgrade section still promises automatic recovery for an already-convicted run' \
+  || pass 'v0.46.0 upgrade section does not promise automatic recovery for an already-convicted run'
+grep -qF 'STUCK (cross-bound)' <<<"$UPGRADE_046" \
+  && pass 'v0.46.0 upgrade section names the state that does not recover on its own' \
+  || fail 'v0.46.0 upgrade section does not name the cross-bound state an upgrade cannot clear'
+grep -qF 'salvage-nonmatching.txt' "$NOTES_046" && grep -qF 'conversation-urls/' "$NOTES_046" \
+  && pass 'v0.46.0 documents both pieces of state a targeted recovery must correct' \
+  || fail 'v0.46.0 does not document the blacklist and memo a targeted recovery must correct'
+grep -qF 'crossbound/' "$NOTES_046" \
+  && pass 'v0.46.0 documents how to verify the conviction was case-only before clearing it' \
+  || fail 'v0.46.0 gives no way to tell a false conviction from a genuine cross-bind'
 
 SCRIPT="$ROOT/scripts/release-train.sh"
 validate_release_policy "$WF" "$SCRIPT"

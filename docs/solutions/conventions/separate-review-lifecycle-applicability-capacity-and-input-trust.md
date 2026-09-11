@@ -1,6 +1,7 @@
 ---
 title: "Separate review lifecycle, applicability, capacity, and input trust"
 date: "2026-09-02"
+last_updated: "2026-09-09"
 category: "conventions"
 module: "pro-gate"
 problem_type: "architecture_pattern"
@@ -100,6 +101,46 @@ legacy `diff` key after exact identity agreement; PR #123 initially admitted an 
 when marker time equaled the immutable charged epoch. Queued runs later disproved marker time as charge
 evidence, so v0.38.1 instead revalidates exact immutable binding and canonical run metadata under the
 reservation lock before filling the proven charge.
+
+### A stalled attempt is superseded by external proof, not by its own state
+
+The head-OID clause above has an operational consequence that is easy to miss, and missing it is
+expensive. When a review conversation stalls and never renders a terminal signal, its reservation
+holds a shared slot with **zero misses, indefinitely** — every probe observes it still generating, so
+the miss threshold that would release it is never reached. From the outside this reads as a slot only
+the provider's own UI can free.
+
+It is not. Supersession's proof is *external to the attempt's execution*: a moved head, or a MERGED
+or CLOSED pull request, read from the repository host. The conversation's own state is not an input.
+So the remedy is to move the head for a legitimate reason and then recover that exact marker — the
+transition releases capacity, retains the charge, and keeps the attempt collectable for audit.
+
+Four constraints keep this honest, and the last two bound where it applies at all:
+
+- **The head move must be work you were going to do anyway.** A rebase the branch needs, a fix, a
+  real commit. Manufacturing a commit to free a slot games the runtime and corrupts the proof this
+  whole model rests on. When nothing is pending, the accurate statement is that the slot stays held
+  until the next real push — not that it cannot be released.
+- **A free collection attempt is not a substitute.** Harvesting a stalled conversation returns the
+  same in-progress result; it neither completes nor releases anything.
+- **This is not the current-head stuck case.** If the head has *not* moved, no proof exists yet and
+  the reservation is correctly still recoverable — that is the open terminal-without-verdict research
+  question, a genuinely different shape. The error being described here is mistaking a
+  proof-already-exists situation for that one, not skipping proof.
+- **It requires an input binding.** The proof path reads the attempt's immutable input binding before
+  it will query the host, and fails closed when there is none. A classic run given a caller-supplied
+  diff has no such binding, so supersession can never be proven for it and this remedy simply does
+  not apply — a known open gap, not a misuse.
+
+The failure this prevents is a reasoning error, not a code defect: treating the absence of one proof
+(the conversation terminating) as the absence of *any* proof, and escalating to a human for something
+the runtime could already settle. A session that made exactly this call left a slot pinned for 57
+hours while other work queued behind it, and reported to its operator that only they could resolve
+it. Once recognised, the same release took seconds and was exercised three times in one session.
+
+This is the same shape as the sibling learning on dead-owner lock reclaim: infer nothing from the
+absence of evidence, require positive proof — and be precise about *which* proof the mechanism
+actually asks for.
 
 ### Treat local round history as advisory, not quota
 
