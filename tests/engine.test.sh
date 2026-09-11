@@ -6495,6 +6495,159 @@ pg_dirlock_reclaim_dead "$GUARD_LIVE_DIR"; GUARD_LIVE_RC=$?
 check 'gate #148 r3 P2: a live pid with a matching token still holds its guard' \
   "$([ "$GUARD_LIVE_RC" -ne 0 ] && [ -d "$GUARD_LIVE_DIR" ]; echo $?)" "rc=$GUARD_LIVE_RC"
 
+# ── #155: pg_lock and pg_lock_n on the same hardened reclaimer ────────────────
+# The inline reclaim these replace read the owner pid and, on a dead one, rm -rf'd the
+# directory and retried. Every case below is one of the three things wrong with that.
+DL_HOME="$TDIR/home-dirlock"; mkdir -p "$DL_HOME"
+
+# The pid/token shape pg_lock records is not the guard's owner.<pid> marker. Two readers
+# outside the reclaimer depend on it (st_inflight, pg_harvest_claimed), so the shape
+# stays and the reclaimer understands both.
+DL_DEAD="$DL_HOME/dead.lock.d"; mkdir -p "$DL_DEAD"
+sleep 0 & DL_DEAD_PID=$!; wait "$DL_DEAD_PID"       # a pid that has certainly exited
+printf '%s\n' "$DL_DEAD_PID" > "$DL_DEAD/pid"
+pg_pid_token "$DL_DEAD_PID" > "$DL_DEAD/token" 2>/dev/null || : > "$DL_DEAD/token"
+pg_dirlock_reclaim_dead "$DL_DEAD"; DL_DEAD_RC=$?
+check '#155: a pid/token lock whose owner is dead is reclaimed by the shared helper' \
+  "$([ "$DL_DEAD_RC" -eq 0 ] && [ ! -d "$DL_DEAD" ]; echo $?)" "rc=$DL_DEAD_RC"
+
+# A live owner with a matching token holds it. This is the case the old code got right.
+DL_LIVE="$DL_HOME/live.lock.d"; mkdir -p "$DL_LIVE"
+printf '%s\n' "$$" > "$DL_LIVE/pid"
+pg_pid_token "$$" > "$DL_LIVE/token"
+pg_dirlock_reclaim_dead "$DL_LIVE"; DL_LIVE_RC=$?
+check '#155: a pid/token lock whose owner is live is never reclaimed' \
+  "$([ "$DL_LIVE_RC" -ne 0 ] && [ -d "$DL_LIVE" ] && [ -e "$DL_LIVE/pid" ]; echo $?)" "rc=$DL_LIVE_RC"
+
+# The token the old code wrote and never read. A live pid recycled from a long-dead holder
+# has a token that no longer matches, so the lock is stale and must be reclaimed -- the old
+# inline check saw `kill -0` succeed and wedged forever instead.
+DL_RECYC="$DL_HOME/recycled.lock.d"; mkdir -p "$DL_RECYC"
+printf '%s\n' "$$" > "$DL_RECYC/pid"
+printf 'not-the-token-of-this-process\n' > "$DL_RECYC/token"
+pg_dirlock_reclaim_dead "$DL_RECYC"; DL_RECYC_RC=$?
+check '#155: a live pid whose token does not match is reclaimed, not trusted (planted negative)' \
+  "$([ "$DL_RECYC_RC" -eq 0 ] && [ ! -d "$DL_RECYC" ]; echo $?)" "rc=$DL_RECYC_RC"
+
+# r8 P0 inherited: a transient failure to recompute the token must not read as "dead".
+DL_TOKFAIL="$DL_HOME/tokfail.lock.d"; mkdir -p "$DL_TOKFAIL"
+printf '%s\n' "$$" > "$DL_TOKFAIL/pid"
+pg_pid_token "$$" > "$DL_TOKFAIL/token"
+(
+  pg_pid_token() { return 1; }
+  pg_dirlock_reclaim_dead "$DL_TOKFAIL"
+); DL_TOKFAIL_RC=$?
+check '#155: a live pid/token owner survives a transient token read failure' \
+  "$([ "$DL_TOKFAIL_RC" -ne 0 ] && [ -d "$DL_TOKFAIL" ] && [ -e "$DL_TOKFAIL/pid" ]; echo $?)" \
+  "rc=$DL_TOKFAIL_RC"
+
+# A torn record -- mkdir succeeded, the pid write did not -- is not a live claim, and the old
+# code could not reap it at all ("pg_lock cannot reap an empty-pid directory either"). It is
+# reclaimable, but ONLY once the orphan grace has elapsed: see the pair below for why. The
+# v0.44.0 version of this case asserted immediate reclaim, which enshrined the very defect
+# rule 3 forbids -- a test that passes against the bug is worth less than no test.
+DL_TORN="$DL_HOME/torn.lock.d"; mkdir -p "$DL_TORN"; : > "$DL_TORN/pid"
+( PRO_GATE_DIRLOCK_ORPHAN_GRACE=0; pg_dirlock_reclaim_dead "$DL_TORN" ); DL_TORN_RC=$?
+check '#155: an empty pid record past the orphan grace is reclaimed, not wedged forever' \
+  "$([ "$DL_TORN_RC" -eq 0 ] && [ ! -d "$DL_TORN" ]; echo $?)" "rc=$DL_TORN_RC"
+
+# ── v0.44.0 regression: the torn record must not skip the orphan grace ────────────────────
+# pg_lock's winner runs `mkdir "$lockdir"` then `echo "$$" > "$lockdir/pid"`. The redirection
+# creates the file (O_CREAT|O_TRUNC) BEFORE writing into it, so a live winner is momentarily a
+# directory holding an EMPTY pid file -- and that is also the persistent state when the write
+# fails, since the call is `|| true`. v0.44.0 set had_marker=1 on the file merely existing,
+# which skipped rule 3's grace and made the winner's own directory reclaimable mid-write.
+# These two cases are the same live winner one syscall apart; both must be KEPT.
+DL_G1="$DL_HOME/grace-nofile.lock.d"; mkdir -p "$DL_G1"
+( PRO_GATE_DIRLOCK_ORPHAN_GRACE=300; pg_dirlock_reclaim_dead "$DL_G1" ); DL_G1_RC=$?
+check '#155 r2/v0.44.0: a just-created lock dir with no pid file yet is held by the grace' \
+  "$([ "$DL_G1_RC" -ne 0 ] && [ -d "$DL_G1" ]; echo $?)" "rc=$DL_G1_RC"
+
+DL_G2="$DL_HOME/grace-emptypid.lock.d"; mkdir -p "$DL_G2"; : > "$DL_G2/pid"
+( PRO_GATE_DIRLOCK_ORPHAN_GRACE=300; pg_dirlock_reclaim_dead "$DL_G2" ); DL_G2_RC=$?
+check '#155 r2/v0.44.0: an EMPTY pid file does not count as a marker and cannot skip the grace' \
+  "$([ "$DL_G2_RC" -ne 0 ] && [ -d "$DL_G2" ] && [ -e "$DL_G2/pid" ]; echo $?)" "rc=$DL_G2_RC"
+
+# ...and a real, live owner is still held on its own merits, not on the grace.
+DL_G3="$DL_HOME/grace-liveowner.lock.d"; mkdir -p "$DL_G3"
+printf '%s\n' "$$" > "$DL_G3/pid"; pg_pid_token "$$" > "$DL_G3/token"
+( PRO_GATE_DIRLOCK_ORPHAN_GRACE=0; pg_dirlock_reclaim_dead "$DL_G3" ); DL_G3_RC=$?
+check '#155 r2/v0.44.0: a live recorded owner is held even with the grace disabled' \
+  "$([ "$DL_G3_RC" -ne 0 ] && [ -d "$DL_G3" ]; echo $?)" "rc=$DL_G3_RC"
+
+# A SLOW winner that completes its record WHILE the reclaimer is deciding must keep the lock.
+# For the owner.<pid> shape the closing rmdir is itself this check -- the kernel refuses a
+# directory a contender has written into -- so the torn-record path must re-read the owner
+# rather than unlink it by name, which would discard that guarantee.
+#
+# The interleaving is INJECTED, not raced. An earlier draft backgrounded a writer behind a sleep
+# and was flaky in both directions: land the write before the reclaimer's FIRST read and the
+# tokenless-legacy branch returns 1, satisfying every assertion here without the re-read ever
+# running; land it after the age check and correct code fails. pg_dir_age_secs is called exactly
+# once, between the two reads, so publishing the winner's record from inside that stub puts the
+# write at the only point that exercises the re-read -- deterministically, with no sleeps.
+DL_G4="$DL_HOME/grace-slowwinner.lock.d"; mkdir -p "$DL_G4"
+: > "$DL_G4/pid"                                   # torn at the moment the reclaimer first looks
+(
+  PRO_GATE_DIRLOCK_ORPHAN_GRACE=0
+  pg_dir_age_secs() { printf '%s\n' "$$" > "$DL_G4/pid"; echo 999; }
+  pg_dirlock_reclaim_dead "$DL_G4"
+); DL_G4_RC=$?
+check '#155 r2/v0.44.0: a winner that completes its record mid-decision keeps the lock' \
+  "$([ "$DL_G4_RC" -ne 0 ] && [ -d "$DL_G4" ] && [ -s "$DL_G4/pid" ]; echo $?)" "rc=$DL_G4_RC"
+
+# The post-grace re-read must fail CLOSED when the read itself fails. An unreadable record and an
+# empty one are different facts; conflating them would let a transient cat failure authorize
+# deleting a record that may name a live owner -- the same fail-open the token checks refuse.
+# cat is stubbed to fail only on the SECOND call, so the first read still sees a torn record and
+# only the re-read is affected.
+DL_G5="$DL_HOME/grace-readfail.lock.d"; mkdir -p "$DL_G5"
+: > "$DL_G5/pid"
+DL_G5_N="$DL_HOME/g5.count"; printf '0\n' > "$DL_G5_N"
+(
+  PRO_GATE_DIRLOCK_ORPHAN_GRACE=0
+  cat() {
+    local n; n="$(command cat "$DL_G5_N")"; printf '%s\n' "$(( n + 1 ))" > "$DL_G5_N"
+    [ "$n" -ge 1 ] && return 1
+    command cat "$@"
+  }
+  pg_dirlock_reclaim_dead "$DL_G5"
+); DL_G5_RC=$?
+check '#155 r2/v0.44.1: a failed re-read of the owner record holds the lock, never deletes it' \
+  "$([ "$DL_G5_RC" -ne 0 ] && [ -d "$DL_G5" ] && [ -e "$DL_G5/pid" ]; echo $?)" "rc=$DL_G5_RC"
+
+# The release must never take a REPLACEMENT. A holder reclaimed while it believed it held
+# the lock runs its exit handler against a path a live process now owns; rm -rf took it.
+DL_REPL="$DL_HOME/replaced.lock.d"; mkdir -p "$DL_REPL"
+printf '%s\n' "$$" > "$DL_REPL/pid"                 # a DIFFERENT owner holds it now
+pg_pid_token "$$" > "$DL_REPL/token"
+pg_dirlock_release_own "$DL_REPL" 999999            # the orphaned holder's release
+check '#155: an orphaned release leaves a replacement holder untouched (planted negative)' \
+  "$([ -d "$DL_REPL" ] && [ -e "$DL_REPL/pid" ]; echo $?)" \
+  "dir=$([ -d "$DL_REPL" ] && echo yes || echo GONE)"
+
+# ...and still releases its own.
+pg_dirlock_release_own "$DL_REPL" "$$"
+check '#155: a holder releasing its own lock removes it' \
+  "$([ ! -d "$DL_REPL" ]; echo $?)" "dir=$([ -d "$DL_REPL" ] && echo STILL-THERE || echo gone)"
+
+# Two reclaimers of one dead owner: the defect #155 was opened for. Reclaiming is not the
+# mutual exclusion -- mkdir is -- so both may reclaim, but only one may end up inside.
+DL_RACE="$DL_HOME/race.lock.d"; DL_RACE_LOG="$DL_HOME/race.log"; : > "$DL_RACE_LOG"
+mkdir -p "$DL_RACE"
+printf '%s\n' "$DL_DEAD_PID" > "$DL_RACE/pid"
+: > "$DL_RACE/token"
+dl_contend() {
+  pg_dirlock_reclaim_dead "$DL_RACE" 2>/dev/null || true
+  if mkdir "$DL_RACE" 2>/dev/null; then printf 'enter\n' >> "$DL_RACE_LOG"; fi
+}
+dl_contend & DL_A=$!
+dl_contend & DL_B=$!
+wait "$DL_A" 2>/dev/null; wait "$DL_B" 2>/dev/null
+DL_ENTERED="$(grep -c '^enter$' "$DL_RACE_LOG" 2>/dev/null || echo 0)"
+check '#155: two reclaimers of one dead owner never both enter the lock' \
+  "$([ "$DL_ENTERED" -le 1 ]; echo $?)" "entered=$DL_ENTERED"
+
 # gate #148 r8 P0: liveness must be positively DISPROVED, never inferred from a failed measurement.
 # Recomputing the owner's start-time token can fail transiently for a perfectly live pid (a /proc
 # read or a `ps` fork under memory pressure). An empty result then compares unequal to a valid

@@ -3318,7 +3318,10 @@ EFF_CONC="$(pg_ramp_level "$MAX_CONC")"
 # this horizon and inside the 6h reservation TTL. Same for per-marker harvest locks
 # (v0.20.2 dogfood left one stale for 10h; flock holders keep the
 # file's inode alive, so deleting an unheld file is always safe).
-find "$(dirname "$LOCKFILE")" -maxdepth 1 -name "$(basename "$LOCKFILE").pr-*" -mmin +1440 -delete 2>/dev/null || true
+# -type f, because the glob also matches the mkdir-fallback lock DIRECTORIES ("<lock>.pr-<key>.d")
+# that pg_lock creates where flock is absent. Deleting one out from under its owner is exactly the
+# reclaim this release moved behind a helper that proves the owner dead first (#158).
+find "$(dirname "$LOCKFILE")" -maxdepth 1 -type f -name "$(basename "$LOCKFILE").pr-*" -mmin +1440 -delete 2>/dev/null || true
 find "${PRO_GATE_HARVEST_LOCK_DIR:-$PRO_GATE_HOME/harvest-locks}" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
 find "$(pg_active_dir)" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
 find "$(pg_manifest_dir)" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
