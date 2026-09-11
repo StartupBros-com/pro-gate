@@ -8,6 +8,16 @@
 # Pause:      touch $PRO_GATE_HOME/PAUSE   (resume: rm it)
 set -uo pipefail
 
+# #184 finding 4 (round 8, P2 SECURITY): every file/dir this process creates from here on
+# (state ledgers, logs, decision envelopes, and -- the finding's own trigger -- persisted raw PR
+# diffs under $REVIEW_EVIDENCE_DIR) must default to owner-only. Under a normal service umask
+# (022) a plain `>`/`mv` created 0644 file, and a traversable $HOME let ANY other local user read
+# private-repository source for the cache lifetime. This is the structural fix (one umask beats a
+# chmod at every call site); the mkdir/touch sites below additionally `chmod` explicitly, because
+# umask only governs NEWLY created paths -- an upgrade over an existing pre-fix deploy would
+# otherwise leave an already-created dir/file at its old, looser mode forever.
+umask 077
+
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 for c in "$SELF/lib.sh" "$SELF/../lib/pro-gate-lib.sh" "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/lib.sh"; do
   [ -f "$c" ] && { . "$c"; break; }
@@ -389,6 +399,18 @@ LOGDIR="$ROOT/logs"; mkdir -p "$LOGDIR"
 PAUSE="$ROOT/PAUSE"
 touch "$STATE" "$STATE_LEGACY" "$QUARANTINE" "$FAILS" "$CIDEFER" "$CIEMPTY" "$AGENTCAP" "$AGENTFAIL" "$BLOCKED" "$REVIEWNOPROG"
 mkdir -p "$REVIEW_EVIDENCE_DIR"
+# #184 finding 4 (round 8, P2 SECURITY): explicit chmod, not just the global `umask 077` set at the
+# top of this file. umask only governs paths created AFTER the umask takes effect; every path
+# chmod'd here (this $ROOT directory itself, its ledger files, $LOGDIR, $REVIEW_EVIDENCE_DIR) can
+# already exist from a pre-fix deploy, created under the old, looser ambient umask -- an upgrade
+# over such a deploy must not leave any of them world/group-readable forever just because this
+# startup sequence only ever mkdir/touch's them when missing. $ROOT itself is included because every
+# ledger below lives directly inside it, and the deploy-stamp read just above confirms this
+# script never creates $ROOT (that is the installer's job, out of scope here) -- but tightening a
+# directory this script otherwise treats as its own working directory, on every normal startup, is
+# ordinary self-provisioning, not an installer change.
+chmod 700 "$ROOT" "$LOGDIR" "$REVIEW_EVIDENCE_DIR" 2>/dev/null
+chmod 600 "$STATE" "$STATE_LEGACY" "$QUARANTINE" "$FAILS" "$CIDEFER" "$CIEMPTY" "$AGENTCAP" "$AGENTFAIL" "$BLOCKED" "$REVIEWNOPROG" "$ACTIVE_EVIDENCE_KEEP" 2>/dev/null
 
 # #184 finding 3 (round 5): every (repo,pr,sha) identity this daemon tracks -- STATE, STATE_LEGACY,
 # QUARANTINE, the round_key it derives -- is nwo/num/sha only; there is no host field anywhere in
@@ -414,9 +436,39 @@ CI_DEFER_MAX="${PRO_REVIEW_CI_DEFER_MAX:-20}"
 # statusCheckRollup -- see ci_rollup_state/ci_ready below. Deliberately much smaller than
 # CI_DEFER_MAX: this only waits out the ordinary GitHub-side gap between a push registering and its
 # checks appearing, never a stuck/pending check (that is CI_DEFER_MAX's job, on the unsettled-token
-# path). A genuinely check-less repo proceeds once this grace is exhausted -- it is never escalated
-# to $BLOCKED -- so the daemon cannot stall a repo that will never grow a rollup.
+# path).
+# #184 finding 3 (round 8, P1): what happens once this grace is exhausted changed. Previously an
+# empty rollup, after $CI_EMPTY_GRACE observations, was silently converted into "proceed" -- treating
+# the ABSENCE of CI evidence as proof that none is coming. The code's own comment already admitted
+# an empty rollup is indistinguishable from checks that just have not registered yet; waiting a fixed
+# extra N polls does not resolve that ambiguity, it only changes how long a genuinely slow CI
+# provider has to lose the race before this path completes and permanently skips the sha regardless.
+# This was corrected twice in the same wrong direction (empty=settled, then bounded-empty=settled);
+# both converted absence of evidence into readiness. The fix requires POSITIVE no-CI evidence instead:
+# explicit per-repository configuration naming a repo that genuinely runs no CI. Absent that
+# configuration, an empty rollup now DEFERS forever the same way an unsettled token does (subject to
+# the SAME $CI_DEFER_MAX cap and $BLOCKED escalation as every other non-settled state -- see ci_ready)
+# rather than ever silently completing. This does not strand a genuinely check-less repository: its
+# operator adds it to PRO_REVIEW_NO_CI_REPOS (below) and the very next poll proceeds -- the answer to
+# "no CI configured" is now configuration, not a silent timeout nobody can discover or tune per-repo.
 CI_EMPTY_GRACE="${PRO_REVIEW_CI_EMPTY_GRACE:-2}"
+# #184 finding 3 (round 8, P1): space-separated "owner/repo" list of repositories POSITIVELY known to
+# run no CI at all -- the only mechanism by which an empty statusCheckRollup is ever treated as
+# readiness rather than deferred. Matched by exact "owner/repo" membership (daemon_repo_configured_no_ci
+# below), same whitespace-list convention as $OWNERS. A repo NOT listed here that also has no CI is not
+# stranded: it simply defers (bounded by CI_DEFER_MAX, escalating to $BLOCKED like any other stuck
+# state) until an operator who has actually confirmed there is no CI adds it here, at which point the
+# very next poll clears any existing CI-empty block and proceeds. This is deliberately a repo-level
+# allowlist, not a per-PR or per-sha one -- "does this repo run CI" is a property of the repo, and
+# scoping it any narrower would just move the same guess to a different key.
+PRO_REVIEW_NO_CI_REPOS="${PRO_REVIEW_NO_CI_REPOS:-}"
+daemon_repo_configured_no_ci(){ # nwo -> rc 0 iff nwo is listed in PRO_REVIEW_NO_CI_REPOS
+  local nwo="$1" r
+  for r in $PRO_REVIEW_NO_CI_REPOS; do
+    [ "$r" = "$nwo" ] && return 0
+  done
+  return 1
+}
 # #184 finding 4 (round 7, P2): see daemon_sweep_orphaned_evidence below. Deliberately large next to
 # $POLL's 180s default (~480 polls) so a single transient `gh search prs` failure or rate-limit gap
 # can never evict evidence for a PR that is still genuinely open and simply missing from one query.
@@ -499,7 +551,97 @@ session_up(){
 }
 
 already_done(){ grep -qF "$(printf '%s\t%s\t%s' "$1" "$2" "$3")" "$STATE"; }
-mark_done(){ printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$STATE"; }
+# #184 finding 1 (round 8, P1): $STATE is a completion-PROOF ledger -- a row may be written ONLY by
+# a call site that has ALREADY proved (not merely attempted) that the current head was terminally,
+# positively reviewed. Before this fix, note_fail's MAX_FAILS exhaustion called a bare mark_done
+# directly (below): once $STATE became this proof-only ledger (round 3), three ORCHESTRATION
+# failures (clone/worktree/review-worker launch -- see note_fail) silently produced the exact same
+# "done, never revisited" row a genuine review would, and already_done (main loop, below) then
+# skipped that sha forever with no typed completion proof whatsoever. That was a spot-fix bug, not
+# just a missed case: mark_done had no way to refuse an unproven caller. Fix it structurally --
+# daemon_mark_state_proven is now the ONLY function in this file that appends to $STATE (audited:
+# `grep -n '>> "\$STATE"' daemon/daemon.sh` returns exactly the one line inside it, below), and it
+# refuses any proof tag outside a fixed, closed enum, loudly, so a FUTURE "just mark it done"
+# shortcut anywhere in this file fails fast instead of silently reintroducing an unproven row.
+#
+#   DAEMON_PROOF_CURRENT_HEAD    -- daemon_decision_completes_current_head returned true for the
+#                                   CURRENT head (mark_processed_heads, called from the report-only
+#                                   dispatch paths and the post-worker re-resolution in process_pr,
+#                                   all built on that one predicate). Carries the base_oid observed
+#                                   at proof time (#184 finding 2, round 8) so a later base change
+#                                   can be detected without changing this ledger's (nwo,num,sha) key.
+#   DAEMON_PROOF_LEGACY_EVIDENCE -- daemon_migrate_legacy_processed found durable, exact-sha,
+#                                   result-bound evidence for a pre-#184x row. No base_oid is ever
+#                                   known for a historical row, so this proof tag always records an
+#                                   empty base field.
+#
+# Audited callers, both already gated on proof before reaching this function: mark_processed_heads
+# (below) and daemon_migrate_legacy_processed. note_fail (below) no longer calls this at all --
+# MAX_FAILS exhaustion now routes to $BLOCKED (see note_fail), which is an escalation ledger, never
+# a completion one.
+DAEMON_PROOF_CURRENT_HEAD="current-head-decision"
+DAEMON_PROOF_LEGACY_EVIDENCE="legacy-durable-evidence"
+daemon_mark_state_proven(){ # nwo num sha proof_tag [base_oid]
+  local nwo="$1" num="$2" sha="$3" proof="$4" base_oid="${5:-}"
+  case "$proof" in
+    "$DAEMON_PROOF_CURRENT_HEAD"|"$DAEMON_PROOF_LEGACY_EVIDENCE") : ;;
+    *)
+      log "BUG: refusing to write \$STATE for $nwo#$num @ ${sha:0:8}: unrecognized proof tag '$proof' -- daemon_mark_state_proven is a structural guard, not a business rule; every legitimate caller passes one of the two fixed DAEMON_PROOF_* constants. Nothing written."
+      return 1
+      ;;
+  esac
+  printf '%s\t%s\t%s\t%s\n' "$nwo" "$num" "$sha" "$base_oid" >> "$STATE"
+}
+# #184 finding 2 (round 8): looks up the base_oid recorded for a $STATE row, if any. Echoes empty
+# (and returns 1) when the row is missing entirely OR when it exists but recorded no base (a
+# legacy-migrated row -- see DAEMON_PROOF_LEGACY_EVIDENCE above). Matched by exact field equality
+# (awk -F'\t'), not the substring grep already_done uses -- this one has to distinguish rows, not
+# merely prove one exists.
+daemon_state_base(){ # nwo num sha -> recorded base_oid on stdout; rc 1 if no row exists at all
+  awk -F'\t' -v nwo="$1" -v num="$2" -v sha="$3" '
+    $1==nwo && $2==num && $3==sha { print $4; found=1 }
+    END { if (!found) exit 1 }
+  ' "$STATE" 2>/dev/null
+}
+# #184 finding 2 (round 8): removes a STATE row this poll just proved stale (its recorded base_oid
+# no longer matches the PR's current base -- see daemon_head_still_complete). Deliberately DISTINCT
+# from the legacy quarantine machinery: this is not "unproven", it WAS proven, against a diff that
+# no longer exists. Removing it (rather than merely ignoring it) lets the row be re-proven cleanly
+# by a genuine re-review, and lets already_done stay a simple, honest membership test. Atomic
+# rewrite, same shape as daemon_clear_block_reason below, so a mid-write crash cannot truncate
+# $STATE.
+daemon_invalidate_state(){ # nwo num sha
+  local nwo="$1" num="$2" sha="$3" tmp grc
+  tmp="$STATE.tmp.$$"
+  awk -F'\t' -v nwo="$nwo" -v num="$num" -v sha="$sha" '!($1==nwo && $2==num && $3==sha)' "$STATE" > "$tmp" 2>/dev/null; grc=$?
+  if [ "$grc" -gt 0 ]; then rm -f "$tmp" 2>/dev/null; return 1; fi
+  mv -f "$tmp" "$STATE" || { rm -f "$tmp" 2>/dev/null; return 1; }
+}
+# #184 finding 2 (round 8): the main loop's already_done check (below) used to be the final word --
+# once a head was proven, it was skipped forever, even if the PR's BASE moved underneath it and the
+# actual diff the completion proof covers no longer exists. This is the revalidation gate: called
+# every poll for every already-done head with THAT poll's freshly observed base, so a base advance
+# or PR retarget is caught on the very next cycle, not merely at proof time.
+#   - empty recorded base (a legacy-migrated row, or any row this daemon never had a base for) has
+#     nothing to compare against -- trust it rather than invent a mismatch from absence of data.
+#   - empty current base (this poll's `gh pr view` did not report baseRefOid, e.g. a transient API
+#     hiccup) also skips comparison -- never invalidate on OUR missing data, only on a genuine,
+#     observed mismatch.
+#   - a genuine mismatch invalidates the row (removes it from $STATE, not merely ignores it) so a
+#     real re-review can re-prove it cleanly and already_done stays a simple, honest membership test.
+daemon_head_still_complete(){ # nwo num sha current_base -> rc 0 = still valid, skip; rc 1 = not proven (never was, or just invalidated)
+  local nwo="$1" num="$2" sha="$3" base="$4" recorded
+  already_done "$nwo" "$num" "$sha" || return 1
+  recorded="$(daemon_state_base "$nwo" "$num" "$sha")" || return 0
+  [ -z "$recorded" ] && return 0
+  [ -z "$base" ] && return 0
+  if [ "$recorded" != "$base" ]; then
+    daemon_note "  · $nwo#$num @ ${sha:0:8} PR base changed since completion (was ${recorded:0:8}, now ${base:0:8}) — invalidating stale completion proof; will be re-evaluated against the current diff"
+    daemon_invalidate_state "$nwo" "$num" "$sha"
+    return 1
+  fi
+  return 0
+}
 # #184c findings 1+2: blocked is the escalation state for an exhausted cap. Idempotent (one line per
 # (repo,pr,sha)) so a stuck head logs once, not on every poll. Never writes $STATE -- see BLOCKED
 # above. is_blocked also gates re-dispatch: process_pr checks it right after ci_ready so an
@@ -523,9 +665,12 @@ mark_blocked(){ # nwo num sha reason
 # nothing about either -- so it is left untouched by this function, by construction (it never
 # matches the "ci-defer-cap-exhausted" prefix). Rewritten atomically so a mid-write crash cannot
 # leave $BLOCKED truncated.
-daemon_clear_ci_defer_block(){ # nwo num sha
-  local nwo="$1" num="$2" sha="$3" prefix tmp grc
-  prefix="$(printf '%s\t%s\t%s\tci-defer-cap-exhausted' "$nwo" "$num" "$sha")"
+# #184 finding 3 (round 8) shares this with daemon_clear_ci_defer_block below -- both block reasons
+# are cleared the same way (atomic rewrite dropping every $BLOCKED row whose reason has this exact
+# prefix), so the mechanics live once here rather than twice.
+daemon_clear_block_reason(){ # nwo num sha reason-prefix note
+  local nwo="$1" num="$2" sha="$3" reason="$4" note="$5" prefix tmp grc
+  prefix="$(printf '%s\t%s\t%s\t%s' "$nwo" "$num" "$sha" "$reason")"
   grep -qF "$prefix" "$BLOCKED" 2>/dev/null || return 0
   tmp="$BLOCKED.tmp.$$"
   # grep -v exits 1 when EVERY line matched (nothing left to output) -- that is the expected,
@@ -534,20 +679,37 @@ daemon_clear_ci_defer_block(){ # nwo num sha
   grep -vF "$prefix" "$BLOCKED" > "$tmp" 2>/dev/null; grc=$?
   if [ "$grc" -gt 1 ]; then rm -f "$tmp" 2>/dev/null; return 1; fi
   mv -f "$tmp" "$BLOCKED" || { rm -f "$tmp" 2>/dev/null; return 1; }
-  daemon_note "  · $nwo#$num @ ${sha:0:8} CI now settled — clearing its prior CI-defer-cap block (any agent-task block on this sha is untouched)"
+  daemon_note "  · $nwo#$num @ ${sha:0:8} $note"
 }
-mark_processed_heads(){ # nwo num reviewed-sha
+daemon_clear_ci_defer_block(){ # nwo num sha
+  daemon_clear_block_reason "$1" "$2" "$3" "ci-defer-cap-exhausted" \
+    "CI now settled — clearing its prior CI-defer-cap block (any agent-task block on this sha is untouched)"
+}
+# #184 finding 3 (round 8): sibling of daemon_clear_ci_defer_block above, for the empty-rollup cap's
+# own BLOCKED reason -- see ci_ready. Cleared whenever CI is observed settled, or the moment an
+# operator adds the repo to PRO_REVIEW_NO_CI_REPOS (both paths in ci_ready call this).
+daemon_clear_ci_empty_block(){ # nwo num sha
+  daemon_clear_block_reason "$1" "$2" "$3" "ci-empty-cap-exhausted" \
+    "CI now resolved (settled, or repo configured as running no CI) — clearing its prior empty-rollup block (any agent-task block on this sha is untouched)"
+}
+mark_processed_heads(){ # nwo num reviewed-sha [base_oid]
   # #184b: mark ONLY the SHA a valid typed decision proved was reviewed (daemon_decision_target_matches
   # already checked it against the decision's head_oid before dispatch). Do not also look up and mark
   # whatever SHA `gh pr view` reports now -- a worker self-push and an external push both produce a
   # head this run never proved was reviewed. The runtime's own review-decision (prior_review binding +
   # round governor) is the dedupe authority for that changed head on the next cycle; the local ledger
   # must not pre-consume it.
-  mark_done "$1" "$2" "$3"
+  # #184 finding 2 (round 8): base_oid is the PR base identity observed AT PROOF TIME -- recorded so a
+  # later base-branch advance or PR retarget (changing the actual diff while this head sha stays the
+  # same) can be detected by daemon_head_still_complete and this row invalidated, rather than reused
+  # against an obsolete diff forever. See daemon_evidence_identity for the base being folded into the
+  # persisted-evidence key too.
+  local nwo="$1" num="$2" sha="$3" base_oid="${4:-}"
+  daemon_mark_state_proven "$nwo" "$num" "$sha" "$DAEMON_PROOF_CURRENT_HEAD" "$base_oid"
   # #184 finding 1 (round 6): once a head is durably completed it is never re-processed (already_done
   # short-circuits the main loop below), so its persisted evidence file will never be read again --
   # remove it now rather than waiting for a later push to prune it via daemon_prune_stale_evidence.
-  rm -f "$(daemon_evidence_file "$1" "$2" "$3")" 2>/dev/null
+  rm -f "$(daemon_evidence_file "$nwo" "$num" "$sha" "$base_oid")" 2>/dev/null
 }
 
 # #184 finding 1 (round 6): daemon_decision queries never supplied --diff/PRO_GATE_REVIEW_ENDPOINT_PATCH,
@@ -588,29 +750,41 @@ mark_processed_heads(){ # nwo num reviewed-sha
 # Falls back to a length-prefixed (netstring-style) encoding, not another delimiter-join, when no
 # hash tool is on PATH (pg_have sha256sum/shasum/openssl, same detection order as pg_sha256 in
 # lib/pro-gate-lib.sh) -- a delimiter fallback would just reintroduce a different collision class.
-daemon_evidence_identity(){ # nwo num -> injective identity for (DAEMON_HOST, owner, repo, num)
-  local nwo="$1" num="$2" owner="${1%%/*}" repo="${1#*/}"
+# #184 finding 2 (round 8, P1): base_oid is now folded into the SAME hashed tuple, not appended or
+# concatenated onto the digest -- concatenating a base_oid string after an already-computed digest
+# would just reintroduce a different delimiter-collision class (e.g. digest+"deadbeef" vs a shorter
+# digest+"dead"+"beef..."). Extending the NUL-delimited tuple before hashing keeps the whole key
+# injective the same way the (host,owner,repo,num) tuple already was. base_oid is OPTIONAL (defaults
+# to "") so every pre-existing 2-arg call site (all of them, across both test files, as of round 7)
+# keeps hashing the exact same bytes it always did; only call sites that now know the PR's current
+# base (the main loop and process_pr, below) pass it, and daemon_prepare_review_evidence's own
+# base_oid becomes part of the on-disk filename prefix itself -- a base change therefore produces a
+# DIFFERENT prefix, so the old (nwo,num) evidence family under the stale base is never matched by
+# daemon_prune_stale_evidence's glob again (it ages out via daemon_sweep_orphaned_evidence's TTL
+# instead of being actively reused), rather than being silently read as still-current.
+daemon_evidence_identity(){ # nwo num [base_oid] -> injective identity for (DAEMON_HOST, owner, repo, num, base_oid)
+  local nwo="$1" num="$2" base_oid="${3:-}" owner="${1%%/*}" repo="${1#*/}"
   if pg_have sha256sum; then
-    printf '%s\0%s\0%s\0%s' "$DAEMON_HOST" "$owner" "$repo" "$num" | sha256sum | awk '{print $1}'
+    printf '%s\0%s\0%s\0%s\0%s' "$DAEMON_HOST" "$owner" "$repo" "$num" "$base_oid" | sha256sum | awk '{print $1}'
   elif pg_have shasum; then
-    printf '%s\0%s\0%s\0%s' "$DAEMON_HOST" "$owner" "$repo" "$num" | shasum -a 256 | awk '{print $1}'
+    printf '%s\0%s\0%s\0%s\0%s' "$DAEMON_HOST" "$owner" "$repo" "$num" "$base_oid" | shasum -a 256 | awk '{print $1}'
   elif pg_have openssl; then
-    printf '%s\0%s\0%s\0%s' "$DAEMON_HOST" "$owner" "$repo" "$num" | openssl dgst -sha256 | awk '{print $NF}'
+    printf '%s\0%s\0%s\0%s\0%s' "$DAEMON_HOST" "$owner" "$repo" "$num" "$base_oid" | openssl dgst -sha256 | awk '{print $NF}'
   else
-    printf '%d:%s,%d:%s,%d:%s,%d:%s,' "${#DAEMON_HOST}" "$DAEMON_HOST" "${#owner}" "$owner" "${#repo}" "$repo" "${#num}" "$num"
+    printf '%d:%s,%d:%s,%d:%s,%d:%s,%d:%s,' "${#DAEMON_HOST}" "$DAEMON_HOST" "${#owner}" "$owner" "${#repo}" "$repo" "${#num}" "$num" "${#base_oid}" "$base_oid"
   fi
 }
-daemon_evidence_base(){ daemon_evidence_identity "$1" "$2"; } # nwo num -> injective on-disk key (never lossy-dash-joined)
-daemon_evidence_file(){ printf '%s/%s-%s.diff' "$REVIEW_EVIDENCE_DIR" "$(daemon_evidence_base "$1" "$2")" "$3"; } # nwo num sha
+daemon_evidence_base(){ daemon_evidence_identity "$1" "$2" "${3:-}"; } # nwo num [base_oid] -> injective on-disk key (never lossy-dash-joined)
+daemon_evidence_file(){ printf '%s/%s-%s.diff' "$REVIEW_EVIDENCE_DIR" "$(daemon_evidence_base "$1" "$2" "${4:-}")" "$3"; } # nwo num sha [base_oid]
 
-# Deletes every OTHER sha's persisted evidence for this (nwo,num) -- called on every process_pr
-# entry (below) so a superseded head's evidence never lingers past its next poll. Bounded growth:
-# at most one evidence file per PR the daemon is CURRENTLY tracking; mark_processed_heads (above)
-# removes the file for a head the instant it durably completes.
-daemon_prune_stale_evidence(){ # nwo num keep_sha
-  local nwo="$1" num="$2" keep="$3" base keepfile f
-  base="$(daemon_evidence_base "$nwo" "$num")"
-  keepfile="$(daemon_evidence_file "$nwo" "$num" "$keep")"
+# Deletes every OTHER sha's persisted evidence for this (nwo,num,base_oid) -- called on every
+# process_pr entry (below) so a superseded head's evidence never lingers past its next poll. Bounded
+# growth: at most one evidence file per PR the daemon is CURRENTLY tracking; mark_processed_heads
+# (above) removes the file for a head the instant it durably completes.
+daemon_prune_stale_evidence(){ # nwo num keep_sha [base_oid]
+  local nwo="$1" num="$2" keep="$3" base_oid="${4:-}" base keepfile f
+  base="$(daemon_evidence_base "$nwo" "$num" "$base_oid")"
+  keepfile="$(daemon_evidence_file "$nwo" "$num" "$keep" "$base_oid")"
   for f in "$REVIEW_EVIDENCE_DIR/$base-"*.diff; do
     [ -e "$f" ] || continue
     [ "$f" = "$keepfile" ] && continue
@@ -648,16 +822,22 @@ daemon_sweep_orphaned_evidence(){ # active-keep-file (one absolute evidence path
 # decision query then runs WITHOUT --diff/PRO_GATE_REVIEW_ENDPOINT_PATCH, same as before this fix,
 # so a genuinely unreachable diff still degrades to the honest prepare-matching-review-evidence
 # answer instead of silently faking completion.
-daemon_prepare_review_evidence(){ # nwo num sha worktree log
-  local nwo="$1" num="$2" sha="$3" wt="$4" lg="$5" f tmp
-  f="$(daemon_evidence_file "$nwo" "$num" "$sha")"
-  daemon_prune_stale_evidence "$nwo" "$num" "$sha"
+daemon_prepare_review_evidence(){ # nwo num sha base_oid worktree log
+  local nwo="$1" num="$2" sha="$3" base_oid="$4" wt="$5" lg="$6" f tmp
+  f="$(daemon_evidence_file "$nwo" "$num" "$sha" "$base_oid")"
+  daemon_prune_stale_evidence "$nwo" "$num" "$sha" "$base_oid"
   if [ -s "$f" ]; then
     printf '%s' "$f"; return 0
   fi
   tmp="$f.tmp.$$"
+  # #184 finding 4 (round 8, P2 SECURITY): explicit chmod 600, not just the process-wide `umask 077`
+  # set at the top of this file -- umask only governs newly created paths, so an upgrade over an
+  # already-running deploy (REVIEW_EVIDENCE_DIR created before this fix, under the old looser umask)
+  # would otherwise leave pre-existing files at their old mode forever, and this is the exact file
+  # class the finding named (persisted raw PR diffs -- private-repository source).
   if ( cd "$wt" && gh pr diff "$num" --patch ) >"$tmp" 2>>"$lg" && [ -s "$tmp" ]; then
-    mv -f "$tmp" "$f" 2>/dev/null && { printf '%s' "$f"; return 0; }
+    chmod 600 "$tmp" 2>/dev/null
+    mv -f "$tmp" "$f" 2>/dev/null && { chmod 600 "$f" 2>/dev/null; printf '%s' "$f"; return 0; }
   fi
   rm -f "$tmp" 2>/dev/null
   return 1
@@ -818,7 +998,7 @@ daemon_migrate_legacy_processed(){
     already_done "$nwo" "$num" "$sha" && continue
     grep -qF "$(printf '%s\t%s\t%s' "$nwo" "$num" "$sha")" "$QUARANTINE" 2>/dev/null && continue
     if daemon_legacy_row_has_durable_evidence "$nwo" "$num" "$sha"; then
-      mark_done "$nwo" "$num" "$sha"
+      daemon_mark_state_proven "$nwo" "$num" "$sha" "$DAEMON_PROOF_LEGACY_EVIDENCE"
       daemon_note "  · migrated legacy $nwo#$num @ ${sha:0:8} -> $STATE (durable evidence bound to this exact sha found)"
     else
       printf '%s\t%s\t%s\n' "$nwo" "$num" "$sha" >> "$QUARANTINE"
@@ -834,12 +1014,22 @@ daemon_migrate_legacy_processed
 # #50 item 6: $FAILS (failcount.tsv) tracks DAEMON-WRAPPER orchestration failures only
 # (clone/worktree/run-granted-review child rc!=0). Engine-level outcomes live in the engine's own ledger.jsonl;
 # the two records are deliberately separate and are not expected to reconcile.
+# #184 finding 1 (round 8, P1): MAX_FAILS exhaustion is an ORCHESTRATION-wrapper giving up (clone,
+# worktree, or review-worker launch never even got far enough to produce a typed decision) -- it is
+# not proof of anything about the review itself, so it must never write $STATE (see
+# daemon_mark_state_proven above for why that ledger is proof-gated now). Route it to $BLOCKED
+# instead: is_blocked (checked at the top of process_pr, before any of this even runs) then skips
+# the sha on later polls exactly like a genuine completion would, but the row is legible as "gave up
+# after N orchestration failures", not "reviewed", and a human/operator can tell the two apart from
+# blocked.tsv alone. Recovery is the same as every other $BLOCKED reason: a new push changes the sha
+# and is_blocked no longer matches it, or the underlying orchestration problem (bad clone creds, disk
+# full, etc.) gets fixed and the row is removed by hand.
 note_fail(){ # nwo num sha log reason
   printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$FAILS"
   local fc; fc=$(grep -cF "$(printf '%s\t%s\t%s' "$1" "$2" "$3")" "$FAILS" 2>/dev/null || echo 1)
   if [ "${fc:-1}" -ge "$MAX_FAILS" ]; then
-    log "  ✗ $1#$2 failed ${fc}x (${5}) — giving up (marking done; fix manually or re-push to retry). log $4"
-    mark_done "$1" "$2" "$3"
+    log "  ✗ $1#$2 failed ${fc}x (${5}) — giving up (BLOCKED, not marked done; fix manually or re-push to retry). log $4"
+    mark_blocked "$1" "$2" "$3" "wrapper-orchestration-cap-exhausted:${5}"
   else
     log "  ! $1#$2 failed (${5}, attempt ${fc}/${MAX_FAILS}) — will retry next cycle (log $4)"
   fi
@@ -897,13 +1087,16 @@ review_worker_no_progress_count(){ # nwo num sha -> increments and echoes the ne
 # at all -- that is indistinguishable, from this one query, from a repository that genuinely has no
 # checks configured. The old `// "settled"` fallback treated both as settled immediately, so a head
 # could be marked complete by ci_ready and consumed by process_pr's decision/dispatch/mark_done path
-# before CI had even started, let alone failed. ci_ready (below) now treats "empty" as PROVISIONAL
-# for a newly observed head: it defers (same as an unsettled token) for up to $CI_EMPTY_GRACE polls
-# of this EXACT sha, re-querying the rollup fresh each time, before treating a STILL-empty rollup as
-# positively establishing "no checks are expected for this repository" and proceeding. This keeps
-# the genuine no-checks-configured case working (it still terminates, and is never sent to
-# $BLOCKED -- see ci_ready) while closing the window where a real CI run had simply not registered
-# yet on the first poll after a push.
+# before CI had even started, let alone failed. ci_ready (below) treats "empty" as PROVISIONAL for
+# a newly observed head: it defers (same as an unsettled token) for up to $CI_EMPTY_GRACE polls of
+# this EXACT sha, re-querying the rollup fresh each time.
+# #184 finding 3 (round 8, P1): a STILL-empty rollup after that grace is no longer converted into
+# "proceed" -- an empty rollup is fundamentally indistinguishable from checks that have not
+# registered yet, no matter how many polls are waited, so the grace exhausting is not positive
+# evidence of anything. It now escalates to $BLOCKED (bounded, like every other exhausted cap in
+# this file) unless the repository is explicitly configured via PRO_REVIEW_NO_CI_REPOS as genuinely
+# running no CI, in which case ci_ready proceeds immediately without waiting through the grace at
+# all -- see PRO_REVIEW_NO_CI_REPOS and daemon_repo_configured_no_ci above, and ci_ready below.
 ci_rollup_state(){ # nwo num -> "settled", "empty", "query-failed", or the first unsettled status/state token
   local nwo="$1" num="$2" rollup
   rollup=$(gh pr view "$num" -R "$nwo" --json statusCheckRollup 2>/dev/null) || { echo "query-failed"; return; }
@@ -934,10 +1127,12 @@ ci_empty_count(){ # nwo num sha -> increments and echoes the new count
   printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$CIEMPTY"
   grep -cF "$(printf '%s\t%s\t%s' "$1" "$2" "$3")" "$CIEMPTY" 2>/dev/null || echo 1
 }
-ci_ready(){ # nwo num sha -> 0 = proceed (CI positively proven settled, or genuinely check-less
-            # after grace), 1 = defer/blocked -- NEVER proceed on unproven CI; process_pr's caller
-            # treats both defer and blocked identically (retryable only by a new push), and neither
-            # ever reaches mark_processed_heads/mark_done.
+ci_ready(){ # nwo num sha -> 0 = proceed (CI positively proven settled, or the repo is explicitly
+            # configured via PRO_REVIEW_NO_CI_REPOS as running no CI at all), 1 = defer/blocked --
+            # NEVER proceed on unproven CI, and an empty rollup alone (absence of evidence) is never
+            # by itself proof of readiness -- see the #184 finding 3 (round 8) comments above.
+            # process_pr's caller treats both defer and blocked identically (retryable only by a new
+            # push), and neither ever reaches mark_processed_heads/daemon_mark_state_proven.
   local nwo="$1" num="$2" sha="$3" state n
   state="$(ci_rollup_state "$nwo" "$num")"
   if [ "$state" = "settled" ]; then
@@ -946,27 +1141,45 @@ ci_ready(){ # nwo num sha -> 0 = proceed (CI positively proven settled, or genui
     # returning "proceed", so process_pr's generic is_blocked gate (right after this call) does not
     # keep rejecting a head whose blocking condition has demonstrably cleared.
     daemon_clear_ci_defer_block "$nwo" "$num" "$sha"
+    daemon_clear_ci_empty_block "$nwo" "$num" "$sha" # #184 finding 3 (round 8): same, for the empty-rollup cap
     return 0
   fi
   if [ "$state" = "empty" ]; then
-    # #184 finding 1 (round 7): provisional, not settled -- see the comment on ci_rollup_state.
-    # Bounded by CI_EMPTY_GRACE, and this path NEVER calls mark_blocked: a repository that truly
-    # never grows a rollup must still terminate (proceed), not strand the PR the way an unsettled
-    # check that never completes correctly does. Deliberately does NOT consult is_blocked at all:
-    # this branch can only ever defer or proceed, never escalate, so there is no self-created
-    # escalation here to stay silent about, and an is_blocked short-circuit would wrongly suppress
-    # "proceed" once CI is empty-and-grace-satisfied just because the head happens to be blocked for
-    # an UNRELATED reason (e.g. an agent-task no-progress cap) -- ci_ready's own verdict about CI
-    # state must stay accurate regardless of other escalations; process_pr's separate, generic
-    # is_blocked gate (checked right after ci_ready returns) is what actually suppresses dispatch.
+    # #184 finding 3 (round 8, P1): the ONLY way an empty rollup is ever treated as readiness is
+    # POSITIVE, explicit per-repository configuration (PRO_REVIEW_NO_CI_REPOS) -- never the mere
+    # passage of a fixed number of polls (that converts absence of evidence into readiness, the
+    # exact mistake this is the second correction of; see the comment on CI_EMPTY_GRACE above). A
+    # configured repo proceeds IMMEDIATELY: there is no ambiguity left to wait out once an operator
+    # has positively attested the repo runs no CI at all, so waiting here would only delay a
+    # correct answer the daemon already has.
+    if daemon_repo_configured_no_ci "$nwo"; then
+      log "  · $nwo#$num @ ${sha:0:8} CI rollup empty; $nwo is configured via PRO_REVIEW_NO_CI_REPOS as running no CI — proceeding"
+      daemon_clear_ci_defer_block "$nwo" "$num" "$sha"
+      daemon_clear_ci_empty_block "$nwo" "$num" "$sha"
+      return 0
+    fi
+    # Unconfigured: provisional, not settled -- see the comment on ci_rollup_state. Bounded by
+    # CI_EMPTY_GRACE the same shape as every other cap here, but its exhaustion now BLOCKS (escalates
+    # to $BLOCKED under its own "ci-empty-cap-exhausted" reason, cleared by daemon_clear_ci_empty_block
+    # the moment CI settles OR the repo is added to config) rather than ever silently proceeding --
+    # "exhaustion blocks, never completes" is the same rule every other bounded cap in this file
+    # already follows. This does not strand a genuinely check-less repository: the fix for THAT case
+    # is adding it to PRO_REVIEW_NO_CI_REPOS above (documented there), which clears this exact block
+    # on the very next poll -- configuration, not a silent timeout, is the answer for a repo that
+    # will never grow a rollup. Deliberately does NOT consult the generic is_blocked at all before
+    # this point, for the same reason the pre-fix version did not: ci_ready's own verdict about CI
+    # state must stay accurate regardless of OTHER escalations (e.g. an unrelated agent-task cap);
+    # process_pr's separate, generic is_blocked gate (checked right after ci_ready returns) is what
+    # actually suppresses dispatch.
+    grep -qF "$(printf '%s\t%s\t%s\tci-empty-cap-exhausted' "$nwo" "$num" "$sha")" "$BLOCKED" 2>/dev/null && return 1
     n="$(ci_empty_count "$nwo" "$num" "$sha")"
     if [ "$n" -lt "$CI_EMPTY_GRACE" ]; then
-      log "  · $nwo#$num @ ${sha:0:8} CI rollup empty for a newly observed head; waiting to see whether checks register (attempt $n/$CI_EMPTY_GRACE)"
+      log "  · $nwo#$num @ ${sha:0:8} CI rollup empty for a newly observed head; waiting to see whether checks register (attempt $n/$CI_EMPTY_GRACE) — not proof of no CI; add $nwo to PRO_REVIEW_NO_CI_REPOS if it genuinely runs none"
       return 1
     fi
-    log "  · $nwo#$num @ ${sha:0:8} CI rollup still empty after $n observations — treating as no checks configured for this repository; proceeding"
-    daemon_clear_ci_defer_block "$nwo" "$num" "$sha"
-    return 0
+    log "  ✗ $nwo#$num @ ${sha:0:8} CI rollup still empty after $n observations — BLOCKED (empty-rollup cap reached; this is NOT proof $nwo has no CI, only that none has registered yet in $n polls. If $nwo genuinely runs no CI, add it to PRO_REVIEW_NO_CI_REPOS to proceed immediately; otherwise push a new commit or resolve CI to re-enter)"
+    mark_blocked "$nwo" "$num" "$sha" "ci-empty-cap-exhausted"
+    return 1
   fi
   # Already escalated for this EXACT head BY THIS EXACT REASON: stay silent (no re-log, no
   # re-increment) so a permanently-stuck check cannot spam every poll -- #184c finding 1's "proceed
@@ -1004,7 +1217,12 @@ find_repo(){
 
 # --- process one PR ---------------------------------------------------------
 process_pr(){
-  local nwo="$1" num="$2" sha="$3" branch="$4" url="$5"
+  # #184 finding 2 (round 8): base is the PR's current baseRefOid, OPTIONAL/6th so every pre-existing
+  # 5-arg call site (both test files) keeps working with an empty base -- threaded through to
+  # persisted-evidence keying and the completion-proof row so a later base change never reuses
+  # evidence or a completion proof formed against an obsolete diff. See daemon_evidence_identity and
+  # daemon_mark_state_proven.
+  local nwo="$1" num="$2" sha="$3" branch="$4" url="$5" base="${6:-}"
   local slug="${nwo//\//-}-${num}"
 
   # #184a: gate dispatch on the current head's CI state before doing ANY work for it (clone,
@@ -1026,6 +1244,16 @@ process_pr(){
       repodir="$REPOS_DIR/${nwo##*/}"
       log "  + autoclone $nwo -> $repodir"
       gh repo clone "$nwo" "$repodir" >>"$LOGDIR/autoclone.log" 2>&1 || { note_fail "$nwo" "$num" "$sha" "$LOGDIR/autoclone.log" "clone failed"; return 1; }
+      # #184 finding 4 (round 8, P2 SECURITY): a fresh clone is repository SOURCE, the same
+      # sensitivity class the finding names for persisted diffs -- lock it down the moment this
+      # daemon is the one that created it. Recursive because `git clone` populates many files in one
+      # shot (the global `umask 077` already governs their creation mode, but this makes the
+      # tightening explicit and upgrade-safe the same way the ledger chmods above are, rather than
+      # relying solely on umask having been in effect for this exact call). Deliberately NOT applied
+      # to a pre-existing checkout found via find_repo above -- that tree belongs to
+      # $REPOS_DIR (default $HOME/SITES), the operator's own shared project directory, not daemon
+      # state, and this daemon only ever locks down what it itself just created.
+      chmod -R go-rwx "$repodir" 2>/dev/null
     else
       log "  ! no local checkout for $nwo under $REPOS_DIR — skipping (clone it there, or set PRO_REVIEW_AUTOCLONE=1)"; return 1
     fi
@@ -1040,6 +1268,14 @@ process_pr(){
   if ! git -C "$repodir" worktree add --force "$wt" "origin/$branch" >>"$lg" 2>&1; then
     note_fail "$nwo" "$num" "$sha" "$lg" "worktree add failed"; return 1
   fi
+  # #184 finding 4 (round 8, P2 SECURITY): $wt is a full checkout of PR source under
+  # ${TMPDIR:-/tmp} -- outside $ROOT, and /tmp is conventionally world-traversable (sticky bit, not
+  # private). It is freshly created by `worktree add` every single poll (removed with --force above,
+  # then recreated), so the global `umask 077` alone already covers it end to end; this chmod is
+  # belt-and-suspenders for the top-level directory the instant it exists, not an upgrade-safety
+  # concern the way the persistent ledgers/clones above are (there is no "pre-fix $wt" to inherit
+  # from -- it never survives past this one process_pr call).
+  chmod 700 "$wt" 2>/dev/null
   ( cd "$wt" && git switch -C "$branch" "origin/$branch" >>"$lg" 2>&1 || git checkout -B "$branch" >>"$lg" 2>&1 )
 
   # #184 finding 1 (round 6): persist this exact head's evidence BEFORE the first decision query --
@@ -1047,7 +1283,7 @@ process_pr(){
   # honest degradation (the query then runs unevidenced, same as before this fix) rather than a
   # hard failure of process_pr.
   local evidence_file evidence_args=()
-  evidence_file="$(daemon_prepare_review_evidence "$nwo" "$num" "$sha" "$wt" "$lg")" || evidence_file=""
+  evidence_file="$(daemon_prepare_review_evidence "$nwo" "$num" "$sha" "$base" "$wt" "$lg")" || evidence_file=""
   [ -n "$evidence_file" ] && evidence_args=(--diff "$evidence_file")
 
   # Resolve and validate the runtime's one action before any review worker can start. The decision
@@ -1114,7 +1350,7 @@ process_pr(){
         log "  · $nwo#$num @ ${sha:0:8} agent task rc=$rc (capability unavailable; nothing launched); not counted toward any cap, head stays retryable"
       fi
     elif [ "$terminal_completed" = 1 ] && [ "$rc" -eq 0 ]; then
-      mark_processed_heads "$nwo" "$num" "$sha"
+      mark_processed_heads "$nwo" "$num" "$sha" "$base"
       log "  ✓ terminal decision completed $nwo#$num @ ${sha:0:8}"
     fi
     return "$rc"
@@ -1149,7 +1385,7 @@ process_pr(){
       # Mark only the SHA this decision proved was reviewed (#184b). The worker may still push an
       # implementation after the runtime-selected review, but that produces an unreviewed head; the
       # runtime's own review-decision is the dedupe authority for it on the next cycle.
-      mark_processed_heads "$nwo" "$num" "$sha"
+      mark_processed_heads "$nwo" "$num" "$sha" "$base"
       log "  ✓ runtime-selected review worker completed $nwo#$num @ ${sha:0:8} (re-resolved decision attests current-head completion)"
       return 0
     fi
@@ -1220,13 +1456,17 @@ while true; do
     [ -z "$prs" ] && continue
     while IFS=$'\t' read -r nwo num url; do
       [ -z "$nwo" ] && continue
-      meta=$(gh pr view "$num" -R "$nwo" --json headRefOid,headRefName 2>/dev/null)
+      # #184 finding 2 (round 8): baseRefOid is fetched every poll, right alongside the head, and
+      # threaded into both the evidence key and the completion revalidation below -- a base-branch
+      # advance or PR retarget is then observable the very next cycle, not only at proof time.
+      meta=$(gh pr view "$num" -R "$nwo" --json headRefOid,headRefName,baseRefOid 2>/dev/null)
       sha=$(echo "$meta" | jq -r '.headRefOid // empty'); branch=$(echo "$meta" | jq -r '.headRefName // empty')
+      base=$(echo "$meta" | jq -r '.baseRefOid // empty')
       [ -z "$sha" ] && continue
-      printf '%s\n' "$(daemon_evidence_file "$nwo" "$num" "$sha")" >> "$ACTIVE_EVIDENCE_KEEP" 2>/dev/null
-      already_done "$nwo" "$num" "$sha" && continue
+      printf '%s\n' "$(daemon_evidence_file "$nwo" "$num" "$sha" "$base")" >> "$ACTIVE_EVIDENCE_KEEP" 2>/dev/null
+      daemon_head_still_complete "$nwo" "$num" "$sha" "$base" && continue
       found=1
-      process_pr "$nwo" "$num" "$sha" "$branch" "$url"
+      process_pr "$nwo" "$num" "$sha" "$branch" "$url" "$base"
       [ -f "$PAUSE" ] || [ "$DECISION_DEFERRED" = 1 ] && break
     done < <(echo "$prs" | jq -r '.[] | [.repository.nameWithOwner, (.number|tostring), .url] | @tsv')
     [ "$DECISION_DEFERRED" = 1 ] && break

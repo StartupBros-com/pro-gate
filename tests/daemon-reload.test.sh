@@ -190,7 +190,7 @@ check 'explicit connector input is reused by guarded effect rechecks' "$(grep -F
 # proof) -- most stop reasons (round-governor-denied included) mean no applicable review ran at
 # all. Every other action, and agent-task failure/unavailable outcomes, remain retryable and
 # budget-neutral.
-# CI is reported settled (empty rollup) throughout this block; #184's own CI-gate/deferral-cap and
+# CI is reported settled throughout this block; #184's own CI-gate/deferral-cap and
 # agent-task-attempt-cap coverage lives in tests/daemon-current-head-completion.test.sh.
 PROCESS_REPO="$TYPED_HOME/process-repo"; mkdir -p "$PROCESS_REPO/.git"
 PROCESS_SHA=1111111111111111111111111111111111111111
@@ -199,16 +199,17 @@ git(){
   if [ "${1:-}" = -C ] && [ "${3:-}" = worktree ] && [ "${4:-}" = add ]; then mkdir -p "$6"; fi
   return 0
 }
+# #184 finding 3 (round 8): an EMPTY rollup no longer means "settled" (see ci_ready in daemon.sh) --
+# an unconfigured repo now blocks once the empty-rollup grace is exhausted instead of proceeding, so
+# reusing an empty rollup here would trip that new (correct) block and fail every process_pr call in
+# this block, none of which intends to exercise the empty-rollup/no-CI-config mechanic (that has its
+# own dedicated red/green coverage in tests/daemon-current-head-completion.test.sh). Report a
+# positively SETTLED check instead, matching this block's actual, stated intent.
 gh(){
-  [ "${1:-}" = pr ] && [ "${2:-}" = view ] && { printf '{"statusCheckRollup":[]}\n'; return 0; }
+  [ "${1:-}" = pr ] && [ "${2:-}" = view ] && { printf '{"statusCheckRollup":[{"status":"COMPLETED","conclusion":"SUCCESS"}]}\n'; return 0; }
   return 1
 }
 runtime_gate(){ return 0; }
-# #184 finding 1 (round 7): this block's empty GH_ROLLUP fixture is meant to report CI as settled
-# immediately (per the comment above), not exercise the new empty-rollup grace mechanic -- that
-# mechanic has its own dedicated red/green coverage in
-# tests/daemon-current-head-completion.test.sh. Pin the grace to 1 so a single observation already
-# satisfies it here, matching every process_pr call below's existing expectation.
 CI_EMPTY_GRACE=1
 PROCESS_AGENT_RC=0
 daemon_run_agent_task(){ AGENT_TASKS=$((AGENT_TASKS + 1)); return "$PROCESS_AGENT_RC"; }

@@ -97,7 +97,12 @@ chmod +x "$ENGINE"
 # existed) -- a FILE, not a shell variable, because daemon_prepare_review_evidence invokes gh
 # inside a `( cd "$wt" && gh ... )` subshell, and a subshell's variable mutations never propagate
 # back to this outer shell; a file write does. Read the count with gh_diff_calls().
-GH_ROLLUP='{"statusCheckRollup":[]}'   # default: no checks configured -> settled
+# #184 finding 3 (round 8): an EMPTY rollup is no longer treated as settled (see the dedicated
+# section below) -- the ambient default a poll observes when nothing in this file is specifically
+# exercising CI-readiness semantics is a genuinely, positively SETTLED check, exactly like the
+# overwhelming majority of real polls the daemon makes (most PRs configure at least one check).
+GH_ROLLUP_SETTLED='{"statusCheckRollup":[{"status":"COMPLETED","conclusion":"SUCCESS"}]}'
+GH_ROLLUP="$GH_ROLLUP_SETTLED"
 GH_DIFF_RC=0
 GH_DIFF_CALLS_FILE="$HOME_D/gh-diff-calls"; : > "$GH_DIFF_CALLS_FILE"
 gh_diff_calls(){ wc -l < "$GH_DIFF_CALLS_FILE"; }
@@ -155,52 +160,75 @@ GH_ROLLUP='{"statusCheckRollup":[{"status":"COMPLETED","conclusion":"SUCCESS"},{
 state="$(ci_rollup_state "$NWO" "$NUM")"
 check 'one unsettled check among several settled ones still reads as not settled' "$([ "$state" = IN_PROGRESS ]; echo $?)" "state=$state"
 
-echo '# empty rollup proceeds after grace (never a permanent block) -- CI_EMPTY_GRACE=1 here, so a
-# single observation already satisfies the bound; the multi-poll grace mechanic itself is covered
-# in the dedicated #184 finding 1 section below with the bound temporarily raised.'
+echo '# #184 finding 3 (round 8, P1): an empty rollup is PROVISIONAL, never proof of no CI. This is the'
+echo '# SECOND correction of this rule (first: empty==settled; then: bounded grace==settled -- both'
+echo '# converted absence of evidence into readiness). An UNCONFIGURED repo defers through'
+echo '# CI_EMPTY_GRACE (=1 here) then BLOCKS on exhaustion, exactly like every other bounded cap in'
+echo '# this file -- never a silent proceed. A repo positively configured via PRO_REVIEW_NO_CI_REPOS'
+echo '# proceeds immediately instead, with no grace wait at all: that is the documented path for a'
+echo '# genuinely check-less repository.'
 GH_ROLLUP='{"statusCheckRollup":[]}'
 reset_state
 ci_ready "$NWO" "$NUM" "$SHA"; empty_rc=$?
-check 'ci_ready treats an empty rollup as settled once grace is satisfied' "$([ "$empty_rc" -eq 0 ]; echo $?)" "rc=$empty_rc"
-check 'an empty rollup never writes a CI-defer-cap deferral row (it uses its own separate ledger)' "$([ ! -s "$CIDEFER_FILE" ]; echo $?)"
-check 'the empty-rollup observation is recorded in its own grace ledger, not CIDEFER' "$([ "$(wc -l < "$CIEMPTY_FILE")" -eq 1 ]; echo $?)" "$(cat "$CIEMPTY_FILE")"
-check 'reaching grace never blocks the head' "$(! is_blocked "$NWO" "$NUM" "$SHA"; echo $?)"
+check 'RED (corrected): an UNCONFIGURED repos empty rollup, even after exhausting the 1-observation grace, BLOCKS rather than proceeding' "$([ "$empty_rc" -eq 1 ] && is_blocked "$NWO" "$NUM" "$SHA"; echo $?)" "rc=$empty_rc $(cat "$BLOCKED_FILE")"
+check 'the block is recorded under its own ci-empty-cap-exhausted reason, never processed-v2.tsv' "$([ ! -s "$STATE_FILE" ] && grep -qF "$(printf '%s\t%s\t%s\tci-empty-cap-exhausted' "$NWO" "$NUM" "$SHA")" "$BLOCKED_FILE"; echo $?)" "$(cat "$BLOCKED_FILE")"
+check 'the empty-rollup observation is recorded in its own grace ledger, not CIDEFER' "$([ "$(wc -l < "$CIEMPTY_FILE")" -eq 1 ] && [ ! -s "$CIDEFER_FILE" ]; echo $?)" "$(cat "$CIEMPTY_FILE")"
 
-GH_ROLLUP='{}'
+echo '# GREEN: the documented path for a genuinely check-less repo -- PRO_REVIEW_NO_CI_REPOS -- both'
+echo '# clears the block it just created and proceeds immediately, with no further grace wait.'
+PRO_REVIEW_NO_CI_REPOS="$NWO"
+ci_ready "$NWO" "$NUM" "$SHA"; configured_rc=$?
+check 'GREEN: a repo positively configured as running no CI proceeds immediately on an empty rollup' "$([ "$configured_rc" -eq 0 ]; echo $?)" "rc=$configured_rc"
+check 'configuring the repo clears the prior empty-rollup-cap block' "$(! is_blocked "$NWO" "$NUM" "$SHA"; echo $?)" "$(cat "$BLOCKED_FILE")"
+PRO_REVIEW_NO_CI_REPOS=""
+
 reset_state
+GH_ROLLUP='{}'
 ci_ready "$NWO" "$NUM" "$SHA"; missing_rc=$?
-check 'a missing statusCheckRollup key (repo has no checks configured) also proceeds' "$([ "$missing_rc" -eq 0 ]; echo $?)" "rc=$missing_rc"
+check 'a missing statusCheckRollup key (repo has no checks configured) is ALSO provisional, not proof -- unconfigured, it defers/blocks exactly like an explicit empty array' "$([ "$missing_rc" -eq 1 ]; echo $?)" "rc=$missing_rc"
+PRO_REVIEW_NO_CI_REPOS="$NWO"
+ci_ready "$NWO" "$NUM" "$SHA"; missing_configured_rc=$?
+check 'a missing statusCheckRollup key on a configured no-CI repo proceeds immediately' "$([ "$missing_configured_rc" -eq 0 ]; echo $?)" "rc=$missing_configured_rc"
+PRO_REVIEW_NO_CI_REPOS=""
 
-echo '# #184 finding 1 (round 7) RED->GREEN: a newly observed head reporting an EMPTY rollup is'
-echo '# PROVISIONAL, not settled -- it must defer for CI_EMPTY_GRACE consecutive observations of the'
-echo '# exact same sha before proceeding, it must never touch blocked.tsv while doing so (bounded'
-echo '# termination by proceeding, not escalation), and a new sha must reset the counter.'
+echo '# #184 finding 1 (round 7), corrected by finding 3 (round 8): a newly observed head reporting an'
+echo '# EMPTY rollup is PROVISIONAL, not settled -- it must defer for CI_EMPTY_GRACE consecutive'
+echo '# observations of the exact same sha, then BLOCK on exhaustion (never silently proceed -- that'
+echo '# converted absence of evidence into readiness, the exact defect finding 3 corrects), it must'
+echo '# never touch the unrelated CI-defer-cap ledger while doing so, a new sha resets the counter,'
+echo '# hammering an exhausted head never re-fires, and PRO_REVIEW_NO_CI_REPOS remains the one way'
+echo '# out for a repo that will never grow a rollup.'
 reset_state
 GRACE_SHA=7777777777777777777777777777777777777777
 CI_EMPTY_GRACE=3   # temporarily raised so the multi-poll deferral is actually exercised
 GH_ROLLUP='{"statusCheckRollup":[]}'
 ci_ready "$NWO" "$NUM" "$GRACE_SHA"; g1_rc=$?
-check 'RED: the FIRST empty-rollup observation on a newly observed head defers (does not yet proceed)' "$([ "$g1_rc" -eq 1 ]; echo $?)" "rc=$g1_rc"
+check 'RED: the FIRST empty-rollup observation on a newly observed head defers (does not yet proceed or block)' "$([ "$g1_rc" -eq 1 ] && ! is_blocked "$NWO" "$NUM" "$GRACE_SHA"; echo $?)" "rc=$g1_rc"
 check 'the first observation is recorded in the grace ledger, exactly once' "$([ "$(wc -l < "$CIEMPTY_FILE")" -eq 1 ]; echo $?)" "$(cat "$CIEMPTY_FILE")"
 check 'deferring for grace never writes to blocked.tsv' "$(! is_blocked "$NWO" "$NUM" "$GRACE_SHA"; echo $?)" "$(cat "$BLOCKED_FILE")"
 check 'deferring for grace never writes to the unrelated CI-defer-cap ledger' "$([ ! -s "$CIDEFER_FILE" ]; echo $?)"
 ci_ready "$NWO" "$NUM" "$GRACE_SHA"; g2_rc=$?
-check 'the SECOND observation (still below the raised grace of 3) also defers' "$([ "$g2_rc" -eq 1 ]; echo $?)" "rc=$g2_rc"
+check 'the SECOND observation (still below the raised grace of 3) also defers' "$([ "$g2_rc" -eq 1 ] && ! is_blocked "$NWO" "$NUM" "$GRACE_SHA"; echo $?)" "rc=$g2_rc"
 ci_ready "$NWO" "$NUM" "$GRACE_SHA"; g3_rc=$?
-check 'GREEN: the THIRD observation (reaching CI_EMPTY_GRACE) proceeds -- a genuinely check-less repo terminates rather than stalling forever' "$([ "$g3_rc" -eq 0 ]; echo $?)" "rc=$g3_rc"
-check 'reaching grace-exhaustion proceeds, it never escalates to blocked.tsv' "$(! is_blocked "$NWO" "$NUM" "$GRACE_SHA"; echo $?)" "$(cat "$BLOCKED_FILE")"
+check 'GREEN (corrected): the THIRD observation (reaching CI_EMPTY_GRACE) BLOCKS -- absence of CI evidence never converts into readiness for an unconfigured repo' "$([ "$g3_rc" -eq 1 ] && is_blocked "$NWO" "$NUM" "$GRACE_SHA"; echo $?)" "rc=$g3_rc $(cat "$BLOCKED_FILE")"
+check 'grace-exhaustion is recorded under ci-empty-cap-exhausted, never processed-v2.tsv' "$([ ! -s "$STATE_FILE" ] && grep -qF "$(printf '%s\t%s\t%s\tci-empty-cap-exhausted' "$NWO" "$NUM" "$GRACE_SHA")" "$BLOCKED_FILE"; echo $?)" "$(cat "$BLOCKED_FILE")"
 check 'grace-exhaustion is never recorded in the CI-defer-cap ledger either' "$([ ! -s "$CIDEFER_FILE" ]; echo $?)"
-NEWPUSH_SHA=6666666666666666666666666666666666666666
-ci_ready "$NWO" "$NUM" "$NEWPUSH_SHA"; newpush_rc=$?
-check 'a new push (different sha) resets the grace counter and defers again from scratch' "$([ "$newpush_rc" -eq 1 ]; echo $?)" "rc=$newpush_rc"
+CIEMPTY_LINES_AT_CAP="$(wc -l < "$CIEMPTY_FILE")"
 i=1
-while [ "$i" -le 50 ]; do
-  ci_ready "$NWO" "$NUM" "$NEWPUSH_SHA" >/dev/null; hammer_rc=$?
+while [ "$i" -le 5 ]; do
+  ci_ready "$NWO" "$NUM" "$GRACE_SHA" >/dev/null; hammer_blocked_rc=$?
   i=$((i + 1))
 done
-check 'hammering a genuinely check-less head far past grace (50x) still never blocks it -- the bound terminates only by proceeding' "$(! is_blocked "$NWO" "$NUM" "$NEWPUSH_SHA"; echo $?)" "$(cat "$BLOCKED_FILE")"
-check 'and it does proceed once hammered' "$([ "$hammer_rc" -eq 0 ]; echo $?)" "rc=$hammer_rc"
+check 'hammering the exhausted head stays blocked and never re-fires (no re-log/re-increment)' "$([ "$hammer_blocked_rc" -eq 1 ] && is_blocked "$NWO" "$NUM" "$GRACE_SHA" && [ "$(wc -l < "$CIEMPTY_FILE")" -eq "$CIEMPTY_LINES_AT_CAP" ]; echo $?)" "rc=$hammer_blocked_rc count=$(wc -l < "$CIEMPTY_FILE")"
+PRO_REVIEW_NO_CI_REPOS="$NWO"
+ci_ready "$NWO" "$NUM" "$GRACE_SHA"; configured_after_block_rc=$?
+check 'GREEN: configuring the repo as no-CI clears an existing empty-rollup-cap block and proceeds immediately -- the documented, non-timeout path for a genuinely check-less repo' "$([ "$configured_after_block_rc" -eq 0 ] && ! is_blocked "$NWO" "$NUM" "$GRACE_SHA"; echo $?)" "rc=$configured_after_block_rc $(cat "$BLOCKED_FILE")"
+PRO_REVIEW_NO_CI_REPOS=""
+NEWPUSH_SHA=6666666666666666666666666666666666666666
+ci_ready "$NWO" "$NUM" "$NEWPUSH_SHA"; newpush_rc=$?
+check 'a new push (different sha) resets the grace counter and defers again from scratch (unconfigured)' "$([ "$newpush_rc" -eq 1 ] && ! is_blocked "$NWO" "$NUM" "$NEWPUSH_SHA"; echo $?)" "rc=$newpush_rc"
 CI_EMPTY_GRACE=1   # restore the ambient default this file relies on everywhere else
+GH_ROLLUP="$GH_ROLLUP_SETTLED"   # restore the ambient settled default for every unrelated section below
 reset_state
 
 echo '# #184c finding 1: the deferral cap BLOCKS (never proceeds) once exhausted'
@@ -275,7 +303,7 @@ echo '# finding 2 (round 4): an agent-task-exhausted block on the SAME sha is a 
 reset_state
 mark_blocked "$NWO" "$NUM" "$SHA" "agent-task-no-progress-cap-exhausted"
 check 'sanity: the agent-task block is recorded' "$(is_blocked "$NWO" "$NUM" "$SHA"; echo $?)"
-GH_ROLLUP='{"statusCheckRollup":[]}'   # empty rollup -> settled
+GH_ROLLUP="$GH_ROLLUP_SETTLED"   # CI positively settled -- unrelated to the empty-rollup mechanic (#184 finding 3, round 8)
 ci_ready "$NWO" "$NUM" "$SHA"; agent_ci_rc=$?
 check 'ci_ready itself proceeds (CI is settled) even though the head remains blocked for an unrelated reason' "$([ "$agent_ci_rc" -eq 0 ]; echo $?)"
 check 'the agent-task block is left in place -- CI settling clears ONLY ci-defer-cap-exhausted rows' "$(is_blocked "$NWO" "$NUM" "$SHA" && grep -qF "$(printf '%s\t%s\t%s\tagent-task-no-progress-cap-exhausted' "$NWO" "$NUM" "$SHA")" "$BLOCKED_FILE"; echo $?)" "$(cat "$BLOCKED_FILE")"
@@ -285,7 +313,7 @@ MOCK_FRESH="$DECISION_F2" process_pr "$NWO" "$NUM" "$SHA" "$BRANCH" "$URL"; agen
 check 'process_pr still suppresses dispatch for the agent-task-blocked head even though CI is settled' "$([ "$agent_block_rc" -eq 2 ] && [ ! -f "$HOME_D/dispatched-agentblock" ]; echo $?)" "rc=$agent_block_rc"
 
 echo '# a gh query failure is treated the same as not-settled, bounded by the same cap'
-GH_ROLLUP='{"statusCheckRollup":[]}'
+GH_ROLLUP="$GH_ROLLUP_SETTLED"
 reset_state
 gh(){ return 1; }
 state="$(ci_rollup_state "$NWO" "$NUM")"
@@ -494,7 +522,11 @@ check "GitHub's REQUESTED check-run status reads as unsettled" "$([ "$state" = R
 GH_ROLLUP='{"statusCheckRollup":[{"state":"EXPECTED"}]}'
 state="$(ci_rollup_state "$NWO" "$NUM")"
 check "GitHub's EXPECTED status-context state reads as unsettled" "$([ "$state" = EXPECTED ]; echo $?)" "state=$state"
-GH_ROLLUP='{"statusCheckRollup":[]}'
+# #184 finding 3 (round 8): every section from here to the end of the file exercises evidence,
+# proof-ledger, migration, array-guard, evidence-key and orphan-sweep logic, none of which intends
+# to exercise CI-readiness itself -- restore the genuinely-settled ambient default so none of them
+# is newly, incidentally gated by the (correctly) stricter empty-rollup behavior fixed above.
+GH_ROLLUP="$GH_ROLLUP_SETTLED"
 
 echo '# finding 3 (round 3 regression fix): repeated agent-task LAUNCH failures (rc=1) are bounded and land in blocked.tsv, never relaunched forever'
 
@@ -932,11 +964,13 @@ echo '# environment; the fix is verified structurally (idiom present at every si
 echo '# documented bash changelog behavior, NOT by an executed reproduction of the original crash.'
 DAEMON_SH="$HERE/../daemon/daemon.sh"
 # Strip every full guard-idiom occurrence ( ${name[@]+"${name[@]}"} ) out of the file text first,
-# then any "[@]" expansion still remaining on a CODE line (excluding the 3 explanatory comment
-# lines that spell the idiom out as prose, ~129/140/146) is a genuine unguarded bare expansion.
+# then any "[@]" expansion still remaining on a CODE line (excluding the 2 explanatory comment
+# lines that spell the idiom out as prose, ~139/150 -- daemon.sh has grown since these line numbers
+# were first pinned; re-verify with the same sed|grep pipeline below whenever daemon.sh changes
+# enough to shift them again) is a genuine unguarded bare expansion.
 UNGUARDED_LINES="$(sed -E 's/\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\+"\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\}"\}//g' "$DAEMON_SH" \
   | grep -noE '\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\}' \
-  | cut -d: -f1 | sort -un | grep -vxE '129|140|146' || true)"
+  | cut -d: -f1 | sort -un | grep -vxE '139|150' || true)"
 check 'every "[@]" array expansion outside the explanatory comment block is wrapped in the ${arr[@]+"${arr[@]}"} guard idiom' "$([ -z "$UNGUARDED_LINES" ]; echo $?)" "unguarded lines: $UNGUARDED_LINES"
 check 'sanity: at least the 7 known call sites (daemon_run_review_worker x4, its recover branch, and process_pr/daemon_dispatch_decision x2 more) still use the guard' "$([ "$(grep -c '\[@\]+"\${[A-Za-z_]*\[@\]}"}' "$DAEMON_SH")" -ge 7 ]; echo $?)" "count=$(grep -c '\[@\]+"\${[A-Za-z_]*\[@\]}"}' "$DAEMON_SH")"
 
@@ -1036,5 +1070,127 @@ printf '%s\n' "$STILL_ACTIVE_OLD" > "$KEEP_FILE"
 daemon_sweep_orphaned_evidence "$KEEP_FILE"
 check 'an evidence file that IS in this cycles active-keep set survives the sweep even with an old mtime' "$([ -e "$STILL_ACTIVE_OLD" ]; echo $?)"
 rm -f "$STILL_ACTIVE_OLD" "$KEEP_FILE" 2>/dev/null
+
+echo '# #184 finding 1 (round 8): MAX_FAILS exhaustion is an ORCHESTRATION-wrapper giving up (clone,'
+echo '# worktree, or review-worker launch never even produced a typed decision) -- it must route to'
+echo '# $BLOCKED, never $STATE, so a run of transient infra failures can never masquerade as a proven'
+echo '# review. daemon_mark_state_proven is the single write API for $STATE and structurally rejects'
+echo '# any proof tag other than the two fixed DAEMON_PROOF_* constants.'
+reset_state
+F1_SHA=2222222222222222222222222222222222222222
+note_fail "$NWO" "$NUM" "$F1_SHA" "$LOG_FILE" "clone-failed"
+check 'below MAX_FAILS (1/3): not blocked yet' "$(! is_blocked "$NWO" "$NUM" "$F1_SHA"; echo $?)" "$(cat "$BLOCKED_FILE")"
+note_fail "$NWO" "$NUM" "$F1_SHA" "$LOG_FILE" "clone-failed"
+check 'below MAX_FAILS (2/3): still not blocked, $STATE still untouched' "$(! is_blocked "$NWO" "$NUM" "$F1_SHA" && [ ! -s "$STATE_FILE" ]; echo $?)" "$(cat "$BLOCKED_FILE")"
+note_fail "$NWO" "$NUM" "$F1_SHA" "$LOG_FILE" "clone-failed"
+check 'RED->GREEN: the cap-th failure (3/3) escalates to $BLOCKED under a wrapper-orchestration-cap-exhausted: reason, never $STATE' "$(is_blocked "$NWO" "$NUM" "$F1_SHA" && [ ! -s "$STATE_FILE" ]; echo $?)" "$(cat "$BLOCKED_FILE")"
+check 'the blocked reason carries the original failure reason as a suffix (legible to an operator)' "$(grep -qF "$(printf '%s\t%s\t%s\twrapper-orchestration-cap-exhausted:clone-failed' "$NWO" "$NUM" "$F1_SHA")" "$BLOCKED_FILE"; echo $?)" "$(cat "$BLOCKED_FILE")"
+check 'hammering an already-exhausted head with more failures does not add duplicate blocked rows' "$([ "$(wc -l < "$BLOCKED_FILE")" -eq 1 ]; echo $?)" "$(cat "$BLOCKED_FILE")"
+
+echo '# structural: daemon_mark_state_proven is the ONLY place that ever appends to $STATE (grep the'
+echo '# whole file for the literal append redirect) -- so every future caller is forced through the'
+echo '# proof-tag guard rather than being able to write the ledger directly.'
+STATE_APPENDERS="$(grep -cF '>> "$STATE"' "$DAEMON_SH" 2>/dev/null || true)"
+check 'exactly one $STATE appender exists in daemon.sh (daemon_mark_state_proven itself)' "$([ "${STATE_APPENDERS:-0}" -eq 1 ]; echo $?)" "appenders=$STATE_APPENDERS"
+
+reset_state
+daemon_mark_state_proven "$NWO" "$NUM" "$SHA" "some-invalid-tag"; bad_proof_rc=$?
+check 'an invalid proof tag is rejected (rc=1)' "$([ "$bad_proof_rc" -eq 1 ]; echo $?)"
+check 'an invalid proof tag writes nothing to $STATE' "$([ ! -s "$STATE_FILE" ]; echo $?)" "$(cat "$STATE_FILE")"
+check 'an invalid proof tag logs a BUG: line naming the unrecognized tag' "$(grep -qF 'BUG: refusing to write $STATE' "$LOG_FILE" && grep -qF 'some-invalid-tag' "$LOG_FILE"; echo $?)"
+
+reset_state
+daemon_mark_state_proven "$NWO" "$NUM" "$SHA" "$DAEMON_PROOF_CURRENT_HEAD" "someBaseOid"; good_proof_rc=$?
+check 'the current-head proof tag succeeds and writes exactly one row' "$([ "$good_proof_rc" -eq 0 ] && [ "$(wc -l < "$STATE_FILE")" -eq 1 ]; echo $?)" "$(cat "$STATE_FILE")"
+reset_state
+daemon_mark_state_proven "$NWO" "$NUM" "$SHA" "$DAEMON_PROOF_LEGACY_EVIDENCE"; legacy_proof_rc=$?
+check 'the legacy-evidence proof tag also succeeds (used only by the one-time migration)' "$([ "$legacy_proof_rc" -eq 0 ] && [ "$(wc -l < "$STATE_FILE")" -eq 1 ]; echo $?)" "$(cat "$STATE_FILE")"
+reset_state
+
+echo '# #184 finding 2 (round 8): persisted completion proof AND persisted evidence are keyed by the'
+echo '# PR BASE, not just the head sha -- a base-branch advance or PR retarget changes the actual diff'
+echo '# while the head sha stays put, so both must be invalidated/re-keyed rather than reused stale.'
+reset_state
+rm -f "$REVIEW_EVIDENCE_DIR"/*.diff 2>/dev/null
+F2_SHA=3333333333333333333333333333333333333333
+BASE_A=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+BASE_B=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+mark_processed_heads "$NWO" "$NUM" "$F2_SHA" "$BASE_A"
+check 'sanity: the head is recorded done, with the base recorded at proof time' "$(already_done "$NWO" "$NUM" "$F2_SHA" && [ "$(daemon_state_base "$NWO" "$NUM" "$F2_SHA")" = "$BASE_A" ]; echo $?)"
+check 'GREEN: an unchanged base is still trusted (still-complete rc=0), completion untouched' "$(daemon_head_still_complete "$NWO" "$NUM" "$F2_SHA" "$BASE_A" && already_done "$NWO" "$NUM" "$F2_SHA"; echo $?)"
+check 'RED->GREEN: a base-branch advance (unchanged head sha) is no longer trusted (still-complete rc=1)' "$(! daemon_head_still_complete "$NWO" "$NUM" "$F2_SHA" "$BASE_B"; echo $?)"
+check 'the stale completion proof was invalidated (removed from $STATE), so the head is re-evaluated rather than skipped against an obsolete diff' "$(! already_done "$NWO" "$NUM" "$F2_SHA"; echo $?)" "$(cat "$STATE_FILE")"
+check 'the invalidation is noted in the log for operator visibility' "$(grep -qF 'PR base changed since completion' "$LOG_FILE"; echo $?)"
+
+echo '# a row with no recorded base (legacy-migrated) has nothing to compare against -- trusted rather'
+echo '# than invalidated from absence of data; likewise a current base gh failed to report.'
+reset_state
+mark_processed_heads "$NWO" "$NUM" "$F2_SHA" ""
+check 'a legacy row with no recorded base is trusted regardless of the observed current base' "$(daemon_head_still_complete "$NWO" "$NUM" "$F2_SHA" "$BASE_B" && already_done "$NWO" "$NUM" "$F2_SHA"; echo $?)"
+reset_state
+mark_processed_heads "$NWO" "$NUM" "$F2_SHA" "$BASE_A"
+check 'a missing CURRENT base (transient gh gap) is also trusted, never invalidated on our own missing data' "$(daemon_head_still_complete "$NWO" "$NUM" "$F2_SHA" "" && already_done "$NWO" "$NUM" "$F2_SHA"; echo $?)"
+reset_state
+
+echo '# the injective evidence key extends to the base identity too: same (nwo,num,sha) under two'
+echo '# different bases must never resolve to the same on-disk path.'
+EVID_BASE_A="$(daemon_evidence_file "$NWO" "$NUM" "$F2_SHA" "$BASE_A")"
+EVID_BASE_B="$(daemon_evidence_file "$NWO" "$NUM" "$F2_SHA" "$BASE_B")"
+EVID_NO_BASE="$(daemon_evidence_file "$NWO" "$NUM" "$F2_SHA")"
+check 'evidence paths differ across two distinct bases for the identical (nwo,num,sha)' "$([ "$EVID_BASE_A" != "$EVID_BASE_B" ]; echo $?)" "A=$EVID_BASE_A B=$EVID_BASE_B"
+check 'an unset base also produces a path distinct from both concrete bases' "$([ "$EVID_NO_BASE" != "$EVID_BASE_A" ] && [ "$EVID_NO_BASE" != "$EVID_BASE_B" ]; echo $?)"
+check 'sanity: the evidence path is deterministic for a repeated (nwo,num,sha,base)' "$([ "$(daemon_evidence_file "$NWO" "$NUM" "$F2_SHA" "$BASE_A")" = "$EVID_BASE_A" ]; echo $?)"
+
+echo '# end-to-end (main-loop pattern): daemon_head_still_complete gating process_pr means a base'
+echo '# change actually causes a refetch of the new diff, never a reuse of the stale cached bytes.'
+reset_state
+rm -f "$REVIEW_EVIDENCE_DIR"/*.diff 2>/dev/null
+GH_DIFF_RC=0
+GH_DIFF='diff --git a/newbase b/newbase
+index e69de29..d00491fd7 100644
+--- a/newbase
++++ b/newbase
+@@ -0,0 +1 @@
++NEWBASE
+'
+mark_processed_heads "$NWO" "$NUM" "$F2_SHA" "$BASE_A"
+if daemon_head_still_complete "$NWO" "$NUM" "$F2_SHA" "$BASE_A"; then LOOP_A_REDISPATCHED=0; else LOOP_A_REDISPATCHED=1; fi
+check 'main-loop pattern: an unchanged base never re-enters process_pr' "$([ "$LOOP_A_REDISPATCHED" -eq 0 ]; echo $?)"
+if daemon_head_still_complete "$NWO" "$NUM" "$F2_SHA" "$BASE_B"; then
+  LOOP_B_REDISPATCHED=0
+else
+  LOOP_B_REDISPATCHED=1
+  MOCK_FRESH="$NOEVID_DECISION" process_pr "$NWO" "$NUM" "$F2_SHA" "$BRANCH" "$URL" "$BASE_B" >/dev/null
+fi
+check 'main-loop pattern: a base change re-enters process_pr for the same head sha' "$([ "$LOOP_B_REDISPATCHED" -eq 1 ]; echo $?)"
+NEWBASE_EVID="$(daemon_evidence_file "$NWO" "$NUM" "$F2_SHA" "$BASE_B")"
+check 'the refetched evidence under the new base reflects the NEW diff bytes, not the stale cached ones' "$(grep -qF '+NEWBASE' "$NEWBASE_EVID" 2>/dev/null; echo $?)" "$(cat "$NEWBASE_EVID" 2>/dev/null)"
+rm -f "$REVIEW_EVIDENCE_DIR"/*.diff 2>/dev/null
+reset_state
+
+echo '# #184 finding 4 (round 8, P2 SECURITY): daemon state -- and specifically persisted, raw PR'
+echo '# diffs of possibly-private-repository source -- is created least-privilege (0700 dirs, 0600'
+echo '# files) rather than inheriting an ambient 022 service umask. Assert the ACTUAL resulting octal'
+echo '# modes here, not merely that a umask/chmod call is present in the source.'
+mode_of(){ stat -c %a "$1" 2>/dev/null || stat -f %OLp "$1" 2>/dev/null; }
+check "\$ROOT (daemon state home) is 0700, not world/group readable" "$([ "$(mode_of "$ROOT")" = 700 ]; echo $?)" "mode=$(mode_of "$ROOT")"
+check "\$LOGDIR is 0700" "$([ "$(mode_of "$LOGDIR")" = 700 ]; echo $?)" "mode=$(mode_of "$LOGDIR")"
+check "\$REVIEW_EVIDENCE_DIR is 0700" "$([ "$(mode_of "$REVIEW_EVIDENCE_DIR")" = 700 ]; echo $?)" "mode=$(mode_of "$REVIEW_EVIDENCE_DIR")"
+LEDGER_MODE_FAIL=0
+for LEDGER_F in "$STATE" "$STATE_LEGACY" "$QUARANTINE" "$FAILS" "$CIDEFER" "$CIEMPTY" "$AGENTCAP" "$AGENTFAIL" "$BLOCKED" "$REVIEWNOPROG"; do
+  [ "$(mode_of "$LEDGER_F")" = 600 ] || { LEDGER_MODE_FAIL=1; echo "  (bad mode $(mode_of "$LEDGER_F") on $LEDGER_F)"; }
+done
+check 'every ledger file (processed-v2/processed/quarantine/failcount/ci-defer/ci-empty-rollup/agent-task-attempts/agent-task-failures/blocked/review-worker-no-progress) is 0600' "$([ "$LEDGER_MODE_FAIL" -eq 0 ]; echo $?)"
+
+rm -f "$REVIEW_EVIDENCE_DIR"/*.diff 2>/dev/null
+F4_SHA=5555555555555555555555555555555555555555
+F4_WT="$HOME_D/f4-wt"; mkdir -p "$F4_WT"
+F4_LOG="$HOME_D/f4.log"; : > "$F4_LOG"
+GH_DIFF_RC=0
+F4_EVID="$(daemon_prepare_review_evidence "$NWO" "$NUM" "$F4_SHA" "" "$F4_WT" "$F4_LOG")"
+check 'sanity: the diff was actually persisted' "$([ -n "$F4_EVID" ] && [ -s "$F4_EVID" ]; echo $?)" "F4_EVID=$F4_EVID"
+check 'RED->GREEN: a freshly persisted PR diff file is 0600 -- never left at the ambient-umask mode (0644 under a normal 022 service env), which on a traversable home directory would let any other local user read private-repository source' "$([ "$(mode_of "$F4_EVID")" = 600 ]; echo $?)" "mode=$(mode_of "$F4_EVID")"
+rm -f "$F4_EVID" 2>/dev/null
+reset_state
 
 [ "$TEST_FAILURES" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$TEST_FAILURES FAILURES"; exit 1; }
