@@ -162,6 +162,24 @@ const COMPLETED_DIR = process.env.PRO_GATE_COMPLETED_DIR ?? path.join(PG_HOME, '
 const PENDING_DIR = path.join(PG_HOME, 'pending');
 const MEMO_KEEP = 200;                  // newest N memos retained; older ones are pruned on write
 const MARKER_SAFE_RE = /^pg-run-[A-Za-z0-9.-]+$/;
+// #167: the marker is EXTRACTED case-insensitively everywhere but used to be COMPARED
+// case-sensitively, so a model that lowercased its own echo — markers legitimately carry
+// un-lowercased repo text, e.g. pg-run-StartupBros-com-pro-gate-166-... — read as another run
+// and got its own finished answer convicted cross-bound. Two genuinely different runs cannot
+// differ only in letter case: a marker ends in "-<launch epoch>-<pid>" and one process has one
+// of each, so folding case cannot mask another run's claim.
+//
+// ASCII-only and arithmetic ON PURPOSE. toLowerCase() is NOT length-preserving ('İ' folds
+// to two code units) and is not what the engine's shell side can cheaply agree with; every
+// marker position in this file is compared against other positions in the SAME string
+// (verdict.at, promptMarkerAt, lastMarkerAt, foreignAt, every text.slice boundary), so a fold
+// that shifted indices would silently corrupt ownership adjudication. A +32 fold over [A-Z]
+// leaves every other code unit — and therefore every index — exactly where it was.
+const asciiFold = (value) => String(value ?? '').replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
+const foldedIncludes = (text, wanted) => asciiFold(text).includes(asciiFold(wanted));
+// Marker identity. Null/empty on either side is NOT a match: an absent echo is "unproven", never
+// "ours" (organizerOwnership and finalizerOwnership both depend on that distinction).
+const sameMarker = (a, b) => !!a && !!b && asciiFold(a) === asciiFold(b);
 const memoPath = (m) => (MARKER_SAFE_RE.test(m) ? path.join(URL_MEMO_DIR, m) : null);
 const titleMemoPath = (m) => (MARKER_SAFE_RE.test(m) ? path.join(TITLE_MEMO_DIR, m) : null);
 
@@ -334,7 +352,11 @@ function rememberUrl(m, url) {
 const THROTTLE_RE = /making requests too quickly|temporarily limited access to your conversations/i;
 // Any pro-gate run marker. On a page that does NOT carry our own marker, a hit here is positive
 // evidence the page rendered a DIFFERENT run's conversation (vs. merely not having loaded yet).
-const FOREIGN_MARKER_RE = /pg-run-[A-Za-z0-9.-]+/;
+// Case-insensitive in lockstep with the ownership checks that gate it (#167): every caller asks
+// "is this ours?" first, and that question is now answered under asciiFold. Were this pattern
+// stricter than its gate, an UPPERCASED self-echo would newly read as foreign and blacklist the
+// run's own conversation — the exact conviction this issue exists to stop, in the other direction.
+const FOREIGN_MARKER_RE = /pg-run-[A-Za-z0-9.-]+/i;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -342,7 +364,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // marker at all (ours or foreign — real conversations can QUOTE the phrase,
 // e.g. a review of this very engine), and is short like an error page.
 function isThrottlePage(text) {
-  return !!text && text.length < 5000 && !/pg-run-[A-Za-z0-9.-]+/.test(text) && THROTTLE_RE.test(text);
+  return !!text && text.length < 5000 && !FOREIGN_MARKER_RE.test(text) && THROTTLE_RE.test(text);
 }
 function recordThrottle(where) {
   try {
@@ -732,14 +754,19 @@ function emitOrganizerResult({ source = 'none', renameStatus = 'skipped', archiv
 }
 
 const isRunMarkerChar = (char) => /[A-Za-z0-9.-]/.test(char ?? '');
+// "Exact" here means TOKEN-EXACT — the whole marker, bounded by non-marker characters — not
+// byte-exact. Letter case is folded (#167); asciiFold is length-preserving, so every index
+// returned still points into the caller's original `text`.
 function lastExactMarkerAt(text, wanted) {
+  const haystack = asciiFold(text);
+  const needle = asciiFold(wanted);
   let found = -1;
   let from = 0;
-  while (from <= text.length - wanted.length) {
-    const at = text.indexOf(wanted, from);
+  while (from <= haystack.length - needle.length) {
+    const at = haystack.indexOf(needle, from);
     if (at < 0) break;
-    const before = at > 0 ? text[at - 1] : '';
-    const after = text[at + wanted.length] ?? '';
+    const before = at > 0 ? haystack[at - 1] : '';
+    const after = haystack[at + needle.length] ?? '';
     if (!isRunMarkerChar(before) && !isRunMarkerChar(after)) found = at;
     from = at + 1;
   }
@@ -748,7 +775,7 @@ function lastExactMarkerAt(text, wanted) {
 const hasExactMarker = (text, wanted) => !!text && lastExactMarkerAt(text, wanted) >= 0;
 function lastExactRunMarkerAt(text) {
   let found = -1;
-  for (const match of text.matchAll(/pg-run-[A-Za-z0-9.-]+/g)) {
+  for (const match of text.matchAll(/pg-run-[A-Za-z0-9.-]+/gi)) {
     const at = match.index;
     const before = at > 0 ? text[at - 1] : '';
     const after = text[at + match[0].length] ?? '';
@@ -764,14 +791,16 @@ function ownedVerdict(text) {
 // Mutation authority is intentionally stricter than salvage extraction. The engine may capture a
 // nonce-less completed answer and adjudicate it as retryable, but the organizer must not mutate that
 // page: once a verdict follows this run's prompt, only an exact marker echo proves it is our answer.
+// "Exact" is token-exact, not case-exact (#167): an absent or genuinely different marker still
+// refuses, but this run's own lowercased self-echo is this run's answer.
 // Any exact run marker AFTER `from` that is not ours. A conversation two runs wrote to is not
 // this run's to rename, archive or close: the other run may still be collecting from it.
 function foreignRunMarkerAfter(text, from) {
   const tail = text.slice(from);
-  for (const match of tail.matchAll(/pg-run-[A-Za-z0-9.-]+/g)) {
+  for (const match of tail.matchAll(/pg-run-[A-Za-z0-9.-]+/gi)) {
     const at = match.index;
     if (isRunMarkerChar(at > 0 ? tail[at - 1] : '') || isRunMarkerChar(tail[at + match[0].length] ?? '')) continue;
-    if (match[0] !== marker) return match[0];
+    if (!sameMarker(match[0], marker)) return match[0];
   }
   return null;
 }
@@ -782,7 +811,7 @@ function organizerOwnership(text) {
   const verdict = ownedVerdict(text);
   if (!verdict) return { owned: true, reason: 'live' };
   const answerMarker = verdict.line.match(/\(run marker:\s*(pg-run-[A-Za-z0-9.-]+)\s*\)/i)?.[1] ?? null;
-  if (answerMarker === marker) {
+  if (sameMarker(answerMarker, marker)) {
     // A later prompt may still be generating in this shared conversation.
     const shared = foreignRunMarkerAfter(text, verdict.at + verdict.line.length);
     if (shared) return { owned: false, reason: 'shared-conversation', foreignMarker: shared };
@@ -798,10 +827,15 @@ function normalizeReviewBytes(value) {
   return String(value ?? '').replace(/\r\n?/g, '\n').replace(/\n$/, '');
 }
 
+// Locate the token case-insensitively, but slice the ORIGINAL line (#167): the fold is only a
+// lookup key, never the published bytes. Must stay in step with pg_strip_nonce and with the twin
+// inside cdp-organizer-expressions.mjs — the finalizer compares this output against the bytes the
+// engine already stripped, so one of the three folding and the others not is a result-mismatch.
 function stripMarkerEcho(value) {
   const token = `(run marker: ${marker})`;
+  const foldedToken = asciiFold(token);
   return String(value ?? '').split('\n').map((line) => {
-    const at = line.indexOf(token);
+    const at = asciiFold(line).indexOf(foldedToken);
     if (at < 0) return line;
     return `${line.slice(0, at)}${line.slice(at + token.length)}`.replace(/[ \t]+$/, '');
   }).join('\n');
@@ -820,7 +854,7 @@ function finalizerOwnership(text) {
   }
   const answerMarker = verdict.line.match(/\(run marker:\s*(pg-run-[A-Za-z0-9.-]+)\s*\)/i)?.[1] ?? null;
   if (!answerMarker) return { owned: false, reason: 'answer-marker-missing' };
-  if (answerMarker !== marker) {
+  if (!sameMarker(answerMarker, marker)) {
     return { owned: false, reason: 'cross-bound', foreignMarker: answerMarker };
   }
   const review = extractReview(text);
@@ -1180,25 +1214,25 @@ function classifyEvidence(text, structuredError = null) {
   // The marker echoed in the terminal line is not a later prompt. A separate exact marker after
   // that line is, and proves this otherwise-owned verdict belongs to an older turn in the same chat.
   const newerPromptMarker = verdict && hasExactMarker(text.slice(verdict.at + verdict.line.length), marker);
-  // A retry reuses this run's exact marker, so a stale SAME-marker verdict (answerMarker ===
-  // marker) passes every other check here (owned, non-foreign, well-formed) AND the shell's
+  // A retry reuses this run's exact marker, so a stale SAME-marker verdict (one this run's own
+  // marker binds) passes every other check here (owned, non-foreign, well-formed) AND the shell's
   // nonce check downstream — it would otherwise satisfy `kind: 'terminal'` while the newer
   // prompt it precedes is still generating, and the harvest path below emits on `kind` alone
   // (unlike --probe, which also gates on probeComplete), so that stale verdict would be reported
   // as THIS run's result and retire the reservation early. Fall back to owned-incomplete so every
   // caller (readable-tab match, scratch revalidation, remembered-URL render, freshRenderText's
   // decisive-evidence wait) keeps sampling instead of treating scrollback as a live answer.
-  // Gated on answerMarker === marker: a verdict carrying a DIFFERENT marker ahead of our prompt
-  // (#68 gate P1's reused-conversation scrollback) already fails the shell's nonce check on its
+  // Gated on sameMarker: a verdict carrying a DIFFERENT marker ahead of our prompt (#68 gate
+  // P1's reused-conversation scrollback) already fails the shell's nonce check on its
   // own — that case must stay 'terminal' so the engine can adjudicate it, not be swallowed here.
-  if (newerPromptMarker && answerMarker === marker) return { kind: 'owned-incomplete', reason: 'stale-terminal' };
+  if (newerPromptMarker && sameMarker(answerMarker, marker)) return { kind: 'owned-incomplete', reason: 'stale-terminal' };
   return {
     kind: 'terminal',
     review,
     // newerPromptMarker can still be true here for a foreign answerMarker (scrollback case
     // above); the `&& !newerPromptMarker` term stays as a guard against that combination
     // ever being reported probe-complete, even though only --probe reads this field.
-    probeComplete: promptMarkerAt >= 0 && answerMarker === marker && !newerPromptMarker && !mixedAnswer(text),
+    probeComplete: promptMarkerAt >= 0 && sameMarker(answerMarker, marker) && !newerPromptMarker && !mixedAnswer(text),
     // Old foreign scrollback is retryable; the extracted review cannot carry this chronology.
     precedesPrompt: !!newerPromptMarker,
   };
@@ -1338,7 +1372,7 @@ while (Date.now() < deadline) {
     // check — even a marker-bearing tab must be skipped then, or every later harvest replays
     // the same rejected conversation and starves the real one.
     if (nonMatching.has(tab.url)) continue;
-    if (!text.includes(marker)) {
+    if (!foldedIncludes(text, marker)) {
       // The remembered URL is open and rendered ANOTHER run's conversation: the memo is stale
       // (recycled URL, or it was never ours). This is the second way to prove staleness — the
       // first is a seeded render below — and without it an open-but-foreign remembered URL is
@@ -1438,7 +1472,7 @@ while (Date.now() < deadline) {
     const { text } = await freshRenderText(tab.url, port, deadline);
     if (!text) continue;
     if (isThrottlePage(text)) tripThrottle(`fresh render ${tab.url}`);
-    if (!text.includes(marker)) {
+    if (!foldedIncludes(text, marker)) {
       // Blacklist ONLY on positive evidence: the page carries someone
       // ELSE's run marker, proving it rendered a different review's
       // conversation. Shell/login/error pages and pre-hydration renders can
@@ -1533,7 +1567,7 @@ if (!probe && stillGeneratingUrl && !lastMatchWasSeeded) {
     const tabs = (await (await fetch(`http://127.0.0.1:${port}/json`)).json())
       .filter((t) => t.type === 'page' && /chatgpt\.com\/c\//.test(t.url || ''));
     const reads = await Promise.all(tabs.map(async (tab) => ({ tab, text: await tabText(tab) })));
-    const live = reads.find(({ text }) => text && text.includes(marker));
+    const live = reads.find(({ text }) => text && foldedIncludes(text, marker));
     stillGeneratingUrl = live?.tab?.url ?? null;
   } catch {
     // CDP outage is inconclusive: retain the last positive signal, fail-closed against respending.

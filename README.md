@@ -105,8 +105,9 @@ July 2026). The Pro model spends that long reasoning; the engine is built around
   that review targets an old head or merged/closed PR, it remains charged and optionally
   collectable but stops occupying capacity.
 - **Fail closed, recover explicitly.** A plugin/runtime version skew blocks the run.
-  Captures must echo the run's nonce. Unverifiable results are surfaced for manual
-  recovery, never guessed at.
+  Captures must echo the run's nonce — the whole token, bounded, though letter case may drift,
+  since a nonce ends in the minting run's launch time and pid and so cannot collide with another
+  run's on case alone. Unverifiable results are surfaced for manual recovery, never guessed at.
 - **Clean up only after durable success.** Remote-browser conversations get an exact,
   marker-owned title. Server archive and local tab close happen only after the validated
   review is readable from marker-addressed durable storage; failed and in-progress runs stay

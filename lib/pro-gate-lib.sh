@@ -2612,6 +2612,15 @@ pg_trim_file() {
 # foreign or stale conversation's answer. The engine strips the token before returning output.
 # ─────────────────────────────────────────────────────────────────────────────
 # pg_capture_nonce_ok <file> <marker>: the terminal authoritative verdict must echo this run.
+# Case-SENSITIVE on purpose, and the asymmetry with the browser side is the point (#166/#167).
+# This is an ACCEPTANCE predicate: rc 0 publishes the capture as this run's review. A false
+# positive here ships a possibly-foreign answer, so it fails closed and a case-only echo drift
+# stays nonce-less -- the run retries, costing liveness, never correctness. The browser-side
+# ownership checks in cdp-salvage.mjs are CONVICTION predicates: a false positive there
+# blacklists the conversation and discards a finished review permanently, so those fold case.
+# Fail closed where a wrong accept publishes; fail open where a wrong refusal destroys evidence.
+# #166 locked this direction with a test ("mis-cased own echo remains unbound without becoming a
+# foreign claim"); do not fold this comparison without retiring that test on the record.
 pg_capture_nonce_ok() {
   local f="$1" marker="$2"
   [ -s "$f" ] || return 1
@@ -2623,8 +2632,17 @@ pg_strip_nonce() {
   [ -s "$f" ] || return 0
   # Fixed-string removal via awk (the marker is regex-safe by charset, but the parentheses
   # around it are not; index/substr avoids regex entirely).
-  awk -v tok="(run marker: $marker)" '{
-    i = index($0, tok)
+  # The LOOKUP is case-folded and the SLICE is not (#167). This does NOT mirror
+  # pg_capture_nonce_ok, which stays case-sensitive by design; it mirrors cdp-salvage.mjs's
+  # stripMarkerEcho, because finalizerOwnership compares its stripped bytes against the bytes
+  # stripped here. One folding and the other not is a result-mismatch on a valid review. tolower() applies only to the search operands, so every other byte
+  # on the line is published exactly as the model wrote it. Same LC_ALL=C reasoning as
+  # pg_capture_nonce_ok: gawk's tolower() is locale-sensitive, and the C locale keeps
+  # index()/substr()/length() on one consistent byte basis.
+  LC_ALL=C awk -v tok="(run marker: $marker)" '
+  BEGIN { lower_tok = tolower(tok) }
+  {
+    i = index(tolower($0), lower_tok)
     if (i > 0) { $0 = substr($0, 1, i - 1) substr($0, i + length(tok)) ; sub(/[ \t]+$/, "") }
     print
   }' "$f" > "$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null

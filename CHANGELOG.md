@@ -19,6 +19,8 @@ Conventions in this file:
 
 | Version | Date | Artifact | Theme |
 |---|---|---|---|
+| v0.46.0 | 2026-09-11 | Pending release | Run-marker binding folds ASCII case: a lowercased self-echo binds instead of convicting the run's own conversation |
+| v0.45.0 | 2026-09-11 | Pending release | Only a finished review completes a revision; checks must settle before a review starts; exhausted retries are visible instead of counting as done |
 | v0.44.1 | 2026-09-10 | Pending release | An empty lock-owner record no longer counts as a marker, so a winner between creating its owner file and writing into it keeps the orphan grace that protects it from a concurrent reclaimer |
 | v0.44.0 | 2026-09-10 | Pending release | One hardened dirlock reclaimer for every no-flock lock: a recycled pid no longer reads as the original owner, two reclaimers cannot both enter, and a release never takes a replacement |
 | v0.43.0 | 2026-09-09 | Pending release | No-flock reservation guard self-heal: a directory left by a killed process is reclaimed, a live owner is never reclaimed, and liveness must be positively disproved rather than inferred from a failed measurement |
