@@ -229,7 +229,7 @@ daemon_handle_review_worker_failure(){ # worker-rc; fresh typed decision decides
 }
 
 daemon_dispatch_decision(){ # decision-file [redirect-depth]
-  local decision="$1" depth="${2:-0}" action class ref fresh fresh_action fresh_ref agent_rc recover_timeout
+  local decision="$1" depth="${2:-0}" action class ref fresh fresh_action fresh_ref agent_rc reason cooldown_left recover_timeout
   DAEMON_DISPATCH_REVIEW_RAN=0
   DAEMON_DISPATCH_AGENT_TASK_RAN=0
   DAEMON_DISPATCH_TERMINAL_COMPLETED=0
@@ -298,7 +298,18 @@ daemon_dispatch_decision(){ # decision-file [redirect-depth]
         DAEMON_DISPATCH_TERMINAL_COMPLETED=1
         daemon_note "  · $DD_NWO#$DD_NUM $action decision attests current-head review proof; no review worker or failure-budget charge, current head completes"
       else
-        daemon_note "  · $DD_NWO#$DD_NUM $action decision ($(daemon_decision_reason "$decision")) lacks current-head review proof; no worker dispatched, head stays retryable"
+        # #162: an account cooldown already lands here and is already correct --
+        # daemon_decision_completes_current_head whitelists two action/reason pairs and defaults to
+        # "does not complete", so the head stays retryable and nothing is charged. What was missing
+        # is legibility: say how long the runtime will keep refusing a fresh spend, so a quiet poll
+        # loop is distinguishable from a stuck one.
+        reason="$(daemon_decision_reason "$decision")"
+        if [ "$reason" = account-cooldown-active ]; then
+          cooldown_left="$(jq -r '.facts.cooldown.seconds_remaining // 0' "$decision" 2>/dev/null)"
+          daemon_note "  · $DD_NWO#$DD_NUM $action decision ($reason, ${cooldown_left}s left) lacks current-head review proof; no worker dispatched, head stays retryable"
+        else
+          daemon_note "  · $DD_NWO#$DD_NUM $action decision ($reason) lacks current-head review proof; no worker dispatched, head stays retryable"
+        fi
       fi
       return 0 ;;
     named-product-choice/ask-named-product-choice)

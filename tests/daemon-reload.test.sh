@@ -150,7 +150,7 @@ REVIEW_WORKERS=0; AGENT_TASKS=0
 daemon_run_review_worker(){ REVIEW_WORKERS=$((REVIEW_WORKERS + 1)); return 0; }
 daemon_agent_task_available(){ return 0; }
 daemon_run_agent_task(){ AGENT_TASKS=$((AGENT_TASKS + 1)); return 0; }
-for index in $(seq 0 7); do
+for index in $(seq 0 "$(jq '.cases | length - 1' "$HERE/fixtures/review-decision/v1/corpus.json")"); do
   decision="$TYPED_HOME/decision-$index.json"; typed_decision "$index" "$decision"
   action="$(jq -r .action "$decision")"; expected="$(jq -r ".cases[$index].expected.action" "$HERE/fixtures/review-decision/v1/corpus.json")"
   before_review="$REVIEW_WORKERS"; before_agent="$AGENT_TASKS"; before_state="$(wc -c < "$TYPED_STATE")"; before_fails="$(wc -c < "$TYPED_FAILS")"
@@ -235,6 +235,15 @@ for action in collect-existing-result recover-existing-review ask-named-product-
   MOCK_FRESH="$decision" MOCK_RECOVERED="$TYPED_HOME/process-recovered" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
   check "$action does not mark a processed SHA or failure budget" "$([ "$process_rc" -eq 0 ] && [ ! -s "$TYPED_STATE" ] && [ ! -s "$TYPED_FAILS" ]; echo $?)" "rc=$process_rc processed=$(wc -c < "$TYPED_STATE") failures=$(wc -c < "$TYPED_FAILS")"
 done
+# #162: account-cooldown-active is the OTHER non-completing stop-without-new-review shape. It is
+# deliberately not in the loop above -- #184 narrowed that list to the three report/collection
+# actions -- so assert it directly, the same way allow-existing-merge-workflow was split out below.
+# A cooldown defers a spend: the head must stay unprocessed and nothing may be charged.
+cooldown_index="$(jq -r 'first(.cases | to_entries[] | select(.value.expected.action == "stop-without-new-review" and .value.expected.reason == "account-cooldown-active")) | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
+decision="$TYPED_HOME/process-cooldown.json"; typed_decision "$cooldown_index" "$decision"
+: > "$TYPED_STATE"; : > "$TYPED_FAILS"
+MOCK_FRESH="$decision" MOCK_RECOVERED="$TYPED_HOME/process-recovered" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
+check "account-cooldown-active does not mark a processed SHA or failure budget" "$([ "$process_rc" -eq 0 ] && [ ! -s "$TYPED_STATE" ] && [ ! -s "$TYPED_FAILS" ]; echo $?)" "rc=$process_rc processed=$(wc -c < "$TYPED_STATE") failures=$(wc -c < "$TYPED_FAILS")"
 # #184 finding 1 (round 5): allow-existing-merge-workflow/current-ship-is-merge-eligible is one of
 # the two positive shapes daemon_decision_completes_current_head recognizes (the producer's FIRST
 # SHIP result lives in .facts.completed_results, never .facts.prior_review) -- unlike the three
@@ -247,11 +256,16 @@ check 'sanity: the allow-existing-merge-workflow corpus fixture is the FIRST-SHI
 MOCK_FRESH="$MERGE_DECISION" MOCK_RECOVERED="$TYPED_HOME/process-recovered" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
 check 'allow-existing-merge-workflow (current-ship-is-merge-eligible) completes the current head without a failure-budget charge' "$([ "$process_rc" -eq 0 ] && already_done acme/widgets 1983 "$PROCESS_SHA" && [ ! -s "$TYPED_FAILS" ]; echo $?)" "rc=$process_rc processed=$(wc -c < "$TYPED_STATE") failures=$(wc -c < "$TYPED_FAILS")"
 : > "$TYPED_STATE"; : > "$TYPED_FAILS"
-# #184c finding 1: this corpus's only stop-without-new-review case is round-governor-denied --
-# no applicable review ran, so it must NOT complete the head. Positive current-head review proof
-# ("identical-code-and-evidence") is covered by tests/daemon-current-head-completion.test.sh,
-# which is not in the shared corpus so it does not perturb this file's case count.
-STOP_INDEX="$(jq -r '.cases | to_entries[] | select(.value.expected.action == "stop-without-new-review") | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
+# #184c finding 1: a round-governor-denied stop means no applicable review ran, so it must NOT
+# complete the head. Positive current-head review proof ("identical-code-and-evidence") is covered
+# by tests/daemon-current-head-completion.test.sh, which is not in the shared corpus so it does not
+# perturb this file's case count.
+# #162: select on the REASON, not the action alone. This case used to be the corpus's only
+# stop-without-new-review entry, and selecting by action returned exactly one key; the cooldown case
+# added for #162 makes that selector return two, which silently feeds a malformed index to
+# typed_decision and fails this sanity check with an empty reason. The cooldown case has its own
+# non-completion assertion above.
+STOP_INDEX="$(jq -r 'first(.cases | to_entries[] | select(.value.expected.action == "stop-without-new-review" and .value.expected.reason == "round-governor-denied")) | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
 STOP_DECISION="$TYPED_HOME/process-stop.json"; typed_decision "$STOP_INDEX" "$STOP_DECISION"
 check 'sanity: the stop-without-new-review corpus fixture is a NON-completion reason (round-governor-denied)' "$([ "$(jq -r .reason "$STOP_DECISION")" = round-governor-denied ]; echo $?)" "$(jq -r .reason "$STOP_DECISION")"
 : > "$TYPED_STATE"; : > "$TYPED_FAILS"
