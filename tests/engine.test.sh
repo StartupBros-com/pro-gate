@@ -6648,6 +6648,136 @@ DL_ENTERED="$(grep -c '^enter$' "$DL_RACE_LOG" 2>/dev/null || echo 0)"
 check '#155: two reclaimers of one dead owner never both enter the lock' \
   "$([ "$DL_ENTERED" -le 1 ]; echo $?)" "entered=$DL_ENTERED"
 
+# ── #189: pg_lock's reclaim-success path carries its own bound ────────────────
+# A successful reclaim skips no-flock pg_lock's wait bound AND its sleep -- both lived in the same
+# `if !` body -- so the loop retried mkdir immediately. Finite reclaim-success is progress;
+# SUSTAINED reclaim-success with mkdir still failing was a 100% CPU spin that never honoured
+# wait_s, the same shape pg_reservation_guard_acquire fixed with its own spin counter.
+# The stub IS that pathological alternation, deterministically rather than raced: every call
+# really does reclaim (the dead owner's directory is removed and rc is 0) and another dead owner
+# really does take the pathname back before pg_lock's next mkdir. The outer coreutils timeout is
+# what turns a regression into a fast failure instead of a hung suite: without the fix this call
+# never returns (verified at HEAD: 2506 reclaim retries in 10s against a wait_s of 2).
+LOCKSPIN_HOME="$TDIR/home-lock-spin"; mkdir -p "$LOCKSPIN_HOME/change.lock.d"
+printf '%s\n' 999999 > "$LOCKSPIN_HOME/change.lock.d/pid"   # occupied, so the first mkdir fails
+LOCKSPIN_LOG="$LOCKSPIN_HOME/reclaims"; : > "$LOCKSPIN_LOG"
+LOCKSPIN_START=$(date +%s)
+/usr/bin/timeout 20 bash -c '
+  . "$1"
+  # SPINLOG, not "$3": inside a function the positional parameters are the FUNCTION s own, so a
+  # stub reading $3 logs nothing and the count below silently reads as "never reclaimed".
+  SPINLOG="$3"
+  pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
+  pg_dirlock_reclaim_dead() {
+    [ -d "$1" ] || return 1
+    rm -f "$1/pid" "$1/token" 2>/dev/null
+    rmdir "$1" 2>/dev/null || return 1                       # a real reclaim: the owner is gone
+    mkdir "$1" 2>/dev/null && printf "%s\n" 999999 > "$1/pid"  # another dead owner takes it back
+    echo x >> "$SPINLOG"
+    return 0
+  }
+  pg_lock "$2" 1
+' _ "$HERE/../lib/pro-gate-lib.sh" "$LOCKSPIN_HOME/change.lock" "$LOCKSPIN_LOG"
+LOCKSPIN_RC=$?
+LOCKSPIN_ELAPSED=$(( $(date +%s) - LOCKSPIN_START ))
+# awk, not `grep -c . || echo 0`: grep exits 1 on an empty file, so that idiom prints ITS zero AND
+# the fallback zero, and every later numeric test errors on the two-line value.
+LOCKSPIN_TRIES="$(awk 'END{print NR}' "$LOCKSPIN_LOG" 2>/dev/null)"
+case "$LOCKSPIN_TRIES" in ''|*[!0-9]*) LOCKSPIN_TRIES=0;; esac
+check '#189: pg_lock gives up on a lock whose reclaim keeps succeeding instead of spinning forever' \
+  "$([ "$LOCKSPIN_RC" -eq 1 ] && [ "$LOCKSPIN_ELAPSED" -lt 15 ]; echo $?)" \
+  "rc=$LOCKSPIN_RC (124=timed out, i.e. spun) elapsed=${LOCKSPIN_ELAPSED}s reclaims=$LOCKSPIN_TRIES"
+# ...and it ended because the reclaim-success path ran out of retries, not because it never took
+# that path: each logged line is one reclaim that reported success while mkdir still failed.
+check '#189: the bounded loop really did keep taking the reclaim-success path' \
+  "$([ "$LOCKSPIN_TRIES" -ge 2 ] && [ "$LOCKSPIN_TRIES" -le 1000 ]; echo $?)" \
+  "reclaims=$LOCKSPIN_TRIES (wait_s=1 bounds it at 1*100+100 retries)"
+
+# The bound must not cost pg_lock its crash recovery: ONE reclaim of a genuinely dead owner is
+# still followed by a successful mkdir, and the winner still records the pid/token shape that
+# st_inflight and pg_harvest_claimed read outside this function (#189 keeps that shape as it is).
+LOCKREC_HOME="$TDIR/home-lock-reclaim"; mkdir -p "$LOCKREC_HOME/change.lock.d"
+sleep 0 & LOCKREC_DEAD=$!; wait "$LOCKREC_DEAD"     # a pid that has certainly exited
+printf '%s\n' "$LOCKREC_DEAD" > "$LOCKREC_HOME/change.lock.d/pid"
+pg_pid_token "$LOCKREC_DEAD" > "$LOCKREC_HOME/change.lock.d/token" 2>/dev/null \
+  || : > "$LOCKREC_HOME/change.lock.d/token"
+LOCKREC_OUT="$(/usr/bin/timeout 20 bash -c '
+  . "$1"
+  pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
+  pg_lock "$2" 5 || { printf "rc=1"; exit 0; }
+  printf "rc=0 self=%s pid=%s token=%s" "$$" \
+    "$(cat "$2.d/pid" 2>/dev/null)" "$([ -s "$2.d/token" ] && echo present || echo EMPTY)"
+' _ "$HERE/../lib/pro-gate-lib.sh" "$LOCKREC_HOME/change.lock" 2>/dev/null)"
+LOCKREC_SELF="$(printf '%s' "$LOCKREC_OUT" | sed -nE 's/.*self=([0-9]+).*/\1/p')"
+LOCKREC_PID="$(printf '%s' "$LOCKREC_OUT" | sed -nE 's/.*pid=([0-9]+).*/\1/p')"
+check '#189: a single reclaim of a dead owner still acquires, and records pid+token as before' \
+  "$(printf '%s' "$LOCKREC_OUT" | grep -q '^rc=0 ' \
+     && [ -n "$LOCKREC_SELF" ] && [ "$LOCKREC_SELF" = "$LOCKREC_PID" ] \
+     && printf '%s' "$LOCKREC_OUT" | grep -q 'token=present'; echo $?)" \
+  "out=${LOCKREC_OUT:-<empty>}"
+
+# ...and a LIVE owner is still waited out for the full budget rather than refused early: the spin
+# counter bounds the reclaim path only, and that path is never taken against a live holder.
+LOCKLIVE_HOME="$TDIR/home-lock-live"; mkdir -p "$LOCKLIVE_HOME/change.lock.d"
+printf '%s\n' "$$" > "$LOCKLIVE_HOME/change.lock.d/pid"
+pg_pid_token "$$" > "$LOCKLIVE_HOME/change.lock.d/token"
+LOCKLIVE_START=$(date +%s)
+/usr/bin/timeout 30 bash -c '
+  . "$1"
+  pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
+  pg_lock "$2" 2
+' _ "$HERE/../lib/pro-gate-lib.sh" "$LOCKLIVE_HOME/change.lock"
+LOCKLIVE_RC=$?
+LOCKLIVE_ELAPSED=$(( $(date +%s) - LOCKLIVE_START ))
+check '#189: a live owner is still waited out for the whole wait bound, then refused' \
+  "$([ "$LOCKLIVE_RC" -eq 1 ] && [ "$LOCKLIVE_ELAPSED" -ge 2 ] && [ "$LOCKLIVE_ELAPSED" -lt 20 ] \
+     && [ -e "$LOCKLIVE_HOME/change.lock.d/pid" ]; echo $?)" \
+  "rc=$LOCKLIVE_RC elapsed=${LOCKLIVE_ELAPSED}s"
+
+# gate r1: the reclaim path must carry NO elapsed check beside its counter. A directory orphaned
+# between its mkdir and its owner record is reclaimable only once it has sat unmarked for the
+# orphan grace, so the reclaim that recovers a crashed run is routinely the LATE one -- at the
+# shipped defaults (5s budget, 5s grace) the waiter reaches it one sleep after its own budget has
+# run out. An elapsed check there discarded that reclaim and returned 1, refusing a lock this
+# process had itself just freed; crash recovery is the case the whole branch exists for. The
+# fixture compresses the shipped 5s/5s into 1s/2s: same ordering, two seconds instead of six.
+LOCKLATE_HOME="$TDIR/home-lock-late"; mkdir -p "$LOCKLATE_HOME/change.lock.d"   # unmarked orphan
+LOCKLATE_START=$(date +%s)
+LOCKLATE_OUT="$(/usr/bin/timeout 30 bash -c '
+  . "$1"
+  pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
+  PRO_GATE_DIRLOCK_ORPHAN_GRACE=2 pg_lock "$2" 1
+  printf "rc=%s" "$?"
+' _ "$HERE/../lib/pro-gate-lib.sh" "$LOCKLATE_HOME/change.lock")"
+LOCKLATE_ELAPSED=$(( $(date +%s) - LOCKLATE_START ))
+check '#189: a reclaim that only becomes possible after the budget still takes the lock' \
+  "$([ "$LOCKLATE_OUT" = "rc=0" ] && [ "$LOCKLATE_ELAPSED" -lt 20 ]; echo $?)" \
+  "out=${LOCKLATE_OUT:-<empty>} elapsed=${LOCKLATE_ELAPSED}s"
+
+# gate r1: a wait budget an operator can legally write must not change what pg_lock DOES. Two
+# values a naive `$(( wait_s * 100 + 100 ))` mishandles: a leading zero is OCTAL to bash, and "08"
+# is not even valid octal -- that arithmetic error aborts the whole function, so pg_lock refused
+# locks that were free; and a budget near the int64 ceiling overflows to a NEGATIVE bound, which
+# compares true on the first reclaim and refuses a lock whose owner is provably dead. Both are
+# regressions the spin bound introduced, and both are invisible unless the assertion is that the
+# lock is still ACQUIRED. stderr is asserted empty: the arithmetic error was loud as well as fatal.
+for LOCKARG_WAIT in 08 92233720368547758; do
+  LOCKARG_HOME="$TDIR/home-lock-arg-$LOCKARG_WAIT"; mkdir -p "$LOCKARG_HOME/change.lock.d"
+  sleep 0 & LOCKARG_DEAD=$!; wait "$LOCKARG_DEAD"          # a pid that has certainly exited
+  printf '%s\n' "$LOCKARG_DEAD" > "$LOCKARG_HOME/change.lock.d/pid"
+  pg_pid_token "$LOCKARG_DEAD" > "$LOCKARG_HOME/change.lock.d/token" 2>/dev/null \
+    || : > "$LOCKARG_HOME/change.lock.d/token"
+  LOCKARG_OUT="$(/usr/bin/timeout 30 bash -c '
+    . "$1"
+    pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
+    pg_lock "$2" "$3"
+    printf "rc=%s" "$?"
+  ' _ "$HERE/../lib/pro-gate-lib.sh" "$LOCKARG_HOME/change.lock" "$LOCKARG_WAIT" 2>"$LOCKARG_HOME/err")"
+  check "#189: a wait budget of $LOCKARG_WAIT still reclaims a dead owner and acquires" \
+    "$([ "$LOCKARG_OUT" = "rc=0" ] && [ ! -s "$LOCKARG_HOME/err" ]; echo $?)" \
+    "out=${LOCKARG_OUT:-<empty>} err=$(tr '\n' ';' < "$LOCKARG_HOME/err" | cut -c1-160)"
+done
+
 # gate #148 r8 P0: liveness must be positively DISPROVED, never inferred from a failed measurement.
 # Recomputing the owner's start-time token can fail transiently for a perfectly live pid (a /proc
 # read or a `ps` fork under memory pressure). An empty result then compares unequal to a valid

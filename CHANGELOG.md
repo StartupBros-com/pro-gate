@@ -19,6 +19,7 @@ Conventions in this file:
 
 | Version | Date | Artifact | Theme |
 |---|---|---|---|
+| v0.47.0 | 2026-09-11 | Pending release | Every retry inside the no-`flock` locks (change, harvest, recover, review-effect) is bounded: a reclaim that keeps succeeding while the lock keeps being retaken can no longer spin forever, and a reclaim that only becomes possible after the budget still takes the lock |
 | v0.46.0 | 2026-09-11 | Pending release | Run-marker binding folds ASCII case: a lowercased self-echo binds instead of convicting the run's own conversation |
 | v0.45.0 | 2026-09-11 | Pending release | Only a finished review completes a revision; checks must settle before a review starts; exhausted retries are visible instead of counting as done |
 | v0.44.1 | 2026-09-10 | Pending release | An empty lock-owner record no longer counts as a marker, so a winner between creating its owner file and writing into it keeps the orphan grace that protects it from a concurrent reclaimer |
