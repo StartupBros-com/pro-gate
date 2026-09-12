@@ -2,6 +2,7 @@
 title: "Extraction and comparison must share one normalization"
 module: "pro-gate"
 date: "2026-09-07"
+last_updated: "2026-09-11"
 category: "conventions"
 problem_type: "architecture_pattern"
 component: "development_workflow"
@@ -74,9 +75,23 @@ Only because the identifier carries its own uniqueness that letter case does not
 marker ends in `-<launch epoch>-<pid>`, and one process has exactly one of each. Two genuinely
 different runs therefore cannot differ *only* in case, so folding case cannot launder another run's
 claim. Establish that property before loosening a comparison — without it, this change would be a
-security regression rather than a fix. The regression tests pin both directions: a self-echo in
-either case binds, and a foreign marker, an all-caps foreign marker, and a sibling attempt of the
-same round differing only in its pid are all still refused.
+security regression rather than a fix.
+
+## What actually shipped, and where this rule stops
+
+**Correction (v0.46.0, PR #169).** An earlier revision of this document said the fold reached every
+reader listed above and that "a self-echo in either case binds". That is not what shipped. The fold
+reaches the **browser-side conviction** predicates only. The shell's acceptance predicate
+`pg_capture_nonce_ok` remains byte-exact — at `f2f09f4` it is still
+`pg_capture_verdict_claims "$f" terminal | grep -qxF -- "$marker"`, with no `-i` — and the suite
+pins that direction through #166's `mis-cased own echo remains unbound without becoming a foreign
+claim`. A case-drifted self-echo therefore still does **not** bind on the engine side; it stays
+nonce-less and the run retries.
+
+That is deliberate, not an oversight. "Normalize once" governs how an identifier is *parsed*; how
+strictly the parsed value is *compared* is set per consequence, because a false accept publishes a
+possibly-foreign review while a false conviction destroys a paid-for one. See
+[[one-identity-check-two-error-biases]]. Whether acceptance should fold too is open in issue #192.
 
 ## Related
 
