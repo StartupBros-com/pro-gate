@@ -19,7 +19,14 @@ Conventions in this file:
 
 | Version | Date | Artifact | Theme |
 |---|---|---|---|
-| v0.43.0 | 2026-09-06 | Pending release | Throttle modal over a live review: element-based detection, `throttled` probe state, cooldown-aware reconcile, typed `account-cooldown-active` |
+| v0.48.0 | 2026-09-12 | Pending release | A rate-limit modal over a live review conversation is a typed throttled state that engages the account cooldown, instead of reading as still-generating; the remaining cooldown is a normalized fact the daemon and callers can wait on |
+| v0.46.0 | 2026-09-11 | Pending release | Run-marker binding folds ASCII case: a lowercased self-echo binds instead of convicting the run's own conversation |
+| v0.45.0 | 2026-09-11 | Pending release | Only a finished review completes a revision; checks must settle before a review starts; exhausted retries are visible instead of counting as done |
+| v0.44.1 | 2026-09-10 | Pending release | An empty lock-owner record no longer counts as a marker, so a winner between creating its owner file and writing into it keeps the orphan grace that protects it from a concurrent reclaimer |
+| v0.44.0 | 2026-09-10 | Pending release | One hardened dirlock reclaimer for every no-flock lock: a recycled pid no longer reads as the original owner, two reclaimers cannot both enter, and a release never takes a replacement |
+| v0.43.0 | 2026-09-09 | Pending release | No-flock reservation guard self-heal: a directory left by a killed process is reclaimed, a live owner is never reclaimed, and liveness must be positively disproved rather than inferred from a failed measurement |
+| v0.42.0 | 2026-09-09 | Pending release | Mixed cross-task verdicts rejected before publication or replay; owned answers and quoted examples preserved; Oracle session names remain unique per invocation |
+| v0.41.0 | 2026-09-08 | Pending release | Wait sizing: 60m fresh / 45m collection defaults from the ledger's p90, with the queued-review wait sized to match and the skill, relay and daemon no longer pinning the value past it; daemon envelope validation moved to the library and conformance-tested |
 | v0.40.0 | 2026-09-04 | Pending release | Ledger failure reasons: a closed-enum `reason` and the status `detail` on every failed row |
 | v0.33.0 | 2026-08-15 | Pending release | Reservation lifecycle: a finished review releases its account slot instead of holding it to TTL |
 | [v0.32.0](https://github.com/StartupBros-com/pro-gate/releases/tag/v0.32.0) | 2026-08-08 | Release | Exact marker-owned conversation titles and durable-success archive lifecycle |

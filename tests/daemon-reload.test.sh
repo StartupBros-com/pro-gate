@@ -60,7 +60,12 @@ unset PRO_GATE_DAEMON_LIB_ONLY
 check 'daemon defaults PRO_REVIEW_INPUT to empty/inherit-engine' "$([ -z "$DD_INPUT" ] && [ "${#DD_INPUT_ARGS[@]}" -eq 0 ]; echo $?)" "input=$DD_INPUT args=${DD_INPUT_ARGS[*]}"
 PRO_GATE_HOME="$TYPED_HOME" PRO_REVIEW_INPUT=invalid bash "$HERE/../daemon/daemon.sh" >"$TYPED_HOME/invalid-input.log" 2>&1; input_rc=$?
 check 'invalid PRO_REVIEW_INPUT fails closed at startup' "$([ "$input_rc" -ne 0 ] && grep -Fq 'must be one of: empty, both, bundle, connector' "$TYPED_HOME/invalid-input.log"; echo $?)" "rc=$input_rc"
-TYPED_STATE="$TYPED_HOME/processed.tsv"; TYPED_FAILS="$TYPED_HOME/failcount.tsv"; : > "$TYPED_STATE"; : > "$TYPED_FAILS"
+# TYPED_STATE tracks daemon.sh's real $STATE ledger (processed-v2.tsv), not $STATE_LEGACY's
+# processed.tsv -- #184 finding 1 (round 5): before that fix, allow-existing-merge-workflow never
+# reached mark_processed_heads, so pointing this at the wrong file was silently inert; now that a
+# FIRST SHIP correctly marks the head done, a case below (line ~224) legitimately writes here, and
+# a later case reusing the same PROCESS_SHA needs this truncated first or it inherits that mark.
+TYPED_STATE="$TYPED_HOME/processed-v2.tsv"; TYPED_FAILS="$TYPED_HOME/failcount.tsv"; : > "$TYPED_STATE"; : > "$TYPED_FAILS"
 TYPED_LOG="$TYPED_HOME/typed.log"; : > "$TYPED_LOG"
 log(){ printf '%s\n' "$*" >> "$TYPED_LOG"; }
 TYPED_ENGINE="$TYPED_HOME/oracle-review.sh"; TYPED_ENGINE_CALLS="$TYPED_HOME/engine-calls.log"; : > "$TYPED_ENGINE_CALLS"; export MOCK_ENGINE_CALLS="$TYPED_ENGINE_CALLS"
@@ -80,7 +85,10 @@ printf '#!/usr/bin/env bash\n[ "${MOCK_CLAUDE_RC:-0}" = 0 ] || exit "$MOCK_CLAUD
 PATH="$TYPED_BIN:$PATH"; CLAUDE_MODEL=test FALLBACK_MODEL=test MAX_BUDGET=1
 RUN_DECISION="$TYPED_HOME/run-decision.json"; typed_decision 2 "$RUN_DECISION"
 RUN_PROMPT="$TYPED_HOME/run.prompt"
-printf -v EXPECTED_EFFECT '%q ' "$TYPED_ENGINE" --review-decision --review-decision-effect "$RUN_DECISION" --pr 1983 --repo "$TYPED_HOME" --out "$TYPED_LOG.review" --timeout "${PRO_REVIEW_ENGINE_TIMEOUT:-30m}"
+# #151: with PRO_REVIEW_ENGINE_TIMEOUT unset the worker argv carries NO --timeout, so the engine's
+# own sized fresh-review default (and a machine-wide PRO_GATE_TIMEOUT) reaches a daemon-launched
+# review. Same rule as the r1 P2 recovery path below.
+printf -v EXPECTED_EFFECT '%q ' "$TYPED_ENGINE" --review-decision --review-decision-effect "$RUN_DECISION" --pr 1983 --repo "$TYPED_HOME" --out "$TYPED_LOG.review"
 MOCK_PROMPT="$RUN_PROMPT" DD_ENGINE="$TYPED_ENGINE" DD_NWO=acme/widgets DD_NUM=1983 DD_SHA=1111111111111111111111111111111111111111 DD_WORKTREE="$TYPED_HOME" DD_LOG="$TYPED_LOG" daemon_run_review_worker "$RUN_DECISION"; worker_rc=$?
 check 'empty daemon input omits --input from the guarded effect worker argv' "$(grep -Fqx 'First action: execute this exact argv-quoted guarded runtime effect; it rechecks the saved review-decision/v1 before any charge or submission:' "$RUN_PROMPT" && grep -Fq "$EXPECTED_EFFECT" "$RUN_PROMPT" && ! grep -Fq -- '--input ' "$RUN_PROMPT"; echo $?)" "rc=$worker_rc"
 check 'run worker prompt restores fix/test/commit/push/comment lifecycle and no-merge guard' "$(grep -Fq '/pro-gate skill' "$RUN_PROMPT" && grep -Fq 'sanity-check every P0/P1' "$RUN_PROMPT" && grep -Fq 'tests and lint' "$RUN_PROMPT" && grep -Fq 'commit the fixes' "$RUN_PROMPT" && grep -Fq 'push this branch to origin' "$RUN_PROMPT" && grep -Fq 'exactly one audit PR comment' "$RUN_PROMPT" && grep -Fq 'Never merge' "$RUN_PROMPT"; echo $?)"
@@ -103,9 +111,25 @@ check 'empty daemon input omits --input from replacement query argv' "$([ "$defa
 # An explicit daemon value stays byte-identical across every subsequent command.
 DD_INPUT=connector; DD_INPUT_ARGS=(--input "$DD_INPUT")
 EXPLICIT_RUN_PROMPT="$TYPED_HOME/run-explicit.prompt"
-printf -v EXPLICIT_EFFECT '%q ' "$TYPED_ENGINE" --review-decision --review-decision-effect "$RUN_DECISION" --pr 1983 --repo "$TYPED_HOME" --input connector --out "$TYPED_LOG.review" --timeout "${PRO_REVIEW_ENGINE_TIMEOUT:-30m}"
+printf -v EXPLICIT_EFFECT '%q ' "$TYPED_ENGINE" --review-decision --review-decision-effect "$RUN_DECISION" --pr 1983 --repo "$TYPED_HOME" --input connector --out "$TYPED_LOG.review"
 MOCK_PROMPT="$EXPLICIT_RUN_PROMPT" DD_ENGINE="$TYPED_ENGINE" DD_NWO=acme/widgets DD_NUM=1983 DD_SHA=1111111111111111111111111111111111111111 DD_WORKTREE="$TYPED_HOME" DD_LOG="$TYPED_LOG" daemon_run_review_worker "$RUN_DECISION"; explicit_worker_rc=$?
 check 'explicit connector input is preserved byte-identically in worker argv' "$([ "$explicit_worker_rc" -eq 0 ] && grep -Fq "$EXPLICIT_EFFECT" "$EXPLICIT_RUN_PROMPT"; echo $?)" "rc=$explicit_worker_rc"
+
+# #151: the FRESH-review worker obeys the same rule as the r1 P2 recovery path. It used to send a
+# fixed 60m whenever PRO_REVIEW_ENGINE_TIMEOUT was unset, and because the engine treats any
+# --timeout it receives as final, a machine-wide PRO_GATE_TIMEOUT could never reach a
+# daemon-launched review at all. These must run BEFORE the stub that replaces
+# daemon_run_review_worker further down, or they assert nothing.
+FRESH_TIMEOUT_PROMPT="$TYPED_HOME/run-timeout.prompt"
+( unset PRO_REVIEW_ENGINE_TIMEOUT
+  MOCK_PROMPT="$FRESH_TIMEOUT_PROMPT" DD_ENGINE="$TYPED_ENGINE" DD_NWO=acme/widgets DD_NUM=1983 DD_SHA=1111111111111111111111111111111111111111 DD_WORKTREE="$TYPED_HOME" DD_LOG="$TYPED_LOG" daemon_run_review_worker "$RUN_DECISION" )
+check '#151: daemon fresh review sends no --timeout when PRO_REVIEW_ENGINE_TIMEOUT is unset, so the engine fresh default applies' \
+  "$([ -s "$FRESH_TIMEOUT_PROMPT" ] && ! grep -Fq -- '--timeout' "$FRESH_TIMEOUT_PROMPT"; echo $?)" "prompt=$(head -c 200 "$FRESH_TIMEOUT_PROMPT" 2>/dev/null | tr '\n' ' ')"
+FRESH_TIMEOUT_SET_PROMPT="$TYPED_HOME/run-timeout-set.prompt"
+( export PRO_REVIEW_ENGINE_TIMEOUT=9m
+  MOCK_PROMPT="$FRESH_TIMEOUT_SET_PROMPT" DD_ENGINE="$TYPED_ENGINE" DD_NWO=acme/widgets DD_NUM=1983 DD_SHA=1111111111111111111111111111111111111111 DD_WORKTREE="$TYPED_HOME" DD_LOG="$TYPED_LOG" daemon_run_review_worker "$RUN_DECISION" )
+check '#151: daemon fresh review passes an explicit PRO_REVIEW_ENGINE_TIMEOUT through as --timeout' \
+  "$([ -s "$FRESH_TIMEOUT_SET_PROMPT" ] && grep -Fq -- '--timeout 9m' "$FRESH_TIMEOUT_SET_PROMPT"; echo $?)" "prompt=$(head -c 200 "$FRESH_TIMEOUT_SET_PROMPT" 2>/dev/null | tr '\n' ' ')"
 
 # A nonzero run worker must re-query with the same input before it can consume the wrapper budget.
 FAIL_NOTES=0
@@ -140,52 +164,108 @@ for index in $(seq 0 "$(jq '.cases | length - 1' "$HERE/fixtures/review-decision
   check "$action dispatches only its runtime-provided execution class without a routine prompt" "$([ "$REVIEW_WORKERS" -eq "$expected_review" ] && [ "$AGENT_TASKS" -eq "$expected_agent" ]; echo $?)" "review=$REVIEW_WORKERS agent=$AGENT_TASKS"
   check "$action has zero SHA/failure-budget effects unless it runs a granted review" "$([ "$action" = run-granted-review ] || { [ "$(wc -c < "$TYPED_STATE")" = "$before_state" ] && [ "$(wc -c < "$TYPED_FAILS")" = "$before_fails" ]; }; echo $?)" "processed=$(wc -c < "$TYPED_STATE") failures=$(wc -c < "$TYPED_FAILS")"
 done
+# gate #148 r1 P2: an unattended recovery passes --timeout only when PRO_REVIEW_ENGINE_TIMEOUT is
+# configured. The engine treats any --timeout it receives as final, so the fixed 60m the daemon used
+# to send bypassed the 45m collection default and PRO_GATE_HARVEST_TIMEOUT on every recovery.
+RECOVER_INDEX="$(jq -r '.cases | to_entries[] | select(.value.expected.action == "recover-existing-review") | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
+RECOVER_DECISION="$TYPED_HOME/recover-timeout.json"; typed_decision "$RECOVER_INDEX" "$RECOVER_DECISION"
+: > "$TYPED_ENGINE_CALLS"
+( unset PRO_REVIEW_ENGINE_TIMEOUT; export PRO_GATE_HARVEST_TIMEOUT=5m
+  MOCK_FRESH="$RECOVER_DECISION" MOCK_RECOVERED="$TYPED_HOME/recover-timeout-unset" DD_ENGINE="$TYPED_ENGINE" DD_NWO=acme/widgets DD_NUM=1983 DD_SHA=1111111111111111111111111111111111111111 DD_WORKTREE="$TYPED_HOME" DD_LOG="$TYPED_LOG" daemon_dispatch_decision "$RECOVER_DECISION" )
+RECOVER_CALL="$(grep -F -- '--recover ' "$TYPED_ENGINE_CALLS" | tail -1)"
+check 'gate #148 r1 P2: daemon recovery sends no --timeout when PRO_REVIEW_ENGINE_TIMEOUT is unset, so the engine collection default applies' \
+  "$([ -n "$RECOVER_CALL" ] && ! grep -Fq -- '--timeout' <<<"$RECOVER_CALL"; echo $?)" "call=$RECOVER_CALL"
+: > "$TYPED_ENGINE_CALLS"
+( export PRO_REVIEW_ENGINE_TIMEOUT=7m
+  MOCK_FRESH="$RECOVER_DECISION" MOCK_RECOVERED="$TYPED_HOME/recover-timeout-set" DD_ENGINE="$TYPED_ENGINE" DD_NWO=acme/widgets DD_NUM=1983 DD_SHA=1111111111111111111111111111111111111111 DD_WORKTREE="$TYPED_HOME" DD_LOG="$TYPED_LOG" daemon_dispatch_decision "$RECOVER_DECISION" )
+RECOVER_CALL="$(grep -F -- '--recover ' "$TYPED_ENGINE_CALLS" | tail -1)"
+check 'gate #148 r1 P2: daemon recovery passes an explicit PRO_REVIEW_ENGINE_TIMEOUT through as --timeout' \
+  "$(grep -Fq -- '--timeout 7m' <<<"$RECOVER_CALL"; echo $?)" "call=$RECOVER_CALL"
 check 'explicit connector input is reused by guarded effect rechecks' "$(grep -F -- '--review-decision-effect' "$TYPED_ENGINE_CALLS" | grep -Fq -- '--input connector'; echo $?)"
 
-# A completed agent task uses the same processed.tsv behavior as a completed review worker. Its
-# failure/unavailable outcomes, and every non-agent action, remain retryable and budget-neutral.
+# #184/#184c: completion requires a typed current-head outcome, not a subprocess exit code. A
+# successful agent task is progress -- it never marks the SHA. A completed run-granted-review
+# worker completes it; a report-only stop-without-new-review decision completes it ONLY when its
+# facts positively attest a completed, applicable, current-head review (daemon_stop_is_completion_
+# proof) -- most stop reasons (round-governor-denied included) mean no applicable review ran at
+# all. Every other action, and agent-task failure/unavailable outcomes, remain retryable and
+# budget-neutral.
+# CI is reported settled throughout this block; #184's own CI-gate/deferral-cap and
+# agent-task-attempt-cap coverage lives in tests/daemon-current-head-completion.test.sh.
 PROCESS_REPO="$TYPED_HOME/process-repo"; mkdir -p "$PROCESS_REPO/.git"
 PROCESS_SHA=1111111111111111111111111111111111111111
-PROCESS_NEW_SHA="$PROCESS_SHA"
 find_repo(){ printf '%s\n' "$PROCESS_REPO"; }
 git(){
   if [ "${1:-}" = -C ] && [ "${3:-}" = worktree ] && [ "${4:-}" = add ]; then mkdir -p "$6"; fi
   return 0
 }
+# #184 finding 3 (round 8): an EMPTY rollup no longer means "settled" (see ci_ready in daemon.sh) --
+# an unconfigured repo now blocks once the empty-rollup grace is exhausted instead of proceeding, so
+# reusing an empty rollup here would trip that new (correct) block and fail every process_pr call in
+# this block, none of which intends to exercise the empty-rollup/no-CI-config mechanic (that has its
+# own dedicated red/green coverage in tests/daemon-current-head-completion.test.sh). Report a
+# positively SETTLED check instead, matching this block's actual, stated intent.
 gh(){
-  [ "${1:-}" = pr ] && [ "${2:-}" = view ] && { printf '%s\n' "$PROCESS_NEW_SHA"; return 0; }
+  [ "${1:-}" = pr ] && [ "${2:-}" = view ] && { printf '{"statusCheckRollup":[{"status":"COMPLETED","conclusion":"SUCCESS"}]}\n'; return 0; }
   return 1
 }
 runtime_gate(){ return 0; }
+CI_EMPTY_GRACE=1
 PROCESS_AGENT_RC=0
 daemon_run_agent_task(){ AGENT_TASKS=$((AGENT_TASKS + 1)); return "$PROCESS_AGENT_RC"; }
 PROCESS_DECISION="$TYPED_HOME/process-agent.json"; typed_decision 3 "$PROCESS_DECISION"
-: > "$TYPED_STATE"; : > "$TYPED_FAILS"
+: > "$TYPED_STATE"; : > "$TYPED_FAILS"; : > "$TYPED_HOME/agent-task-attempts.tsv"
 MOCK_FRESH="$PROCESS_DECISION" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
-check 'successful no-push fix task marks its SHA and is skipped next poll' "$([ "$process_rc" -eq 0 ] && already_done acme/widgets 1983 "$PROCESS_SHA" && [ "$(wc -l < "$TYPED_STATE")" -eq 1 ]; echo $?)" "rc=$process_rc state=$(wc -l < "$TYPED_STATE")"
+check 'successful fix agent task does not mark its SHA and is retried next poll' "$([ "$process_rc" -eq 0 ] && ! already_done acme/widgets 1983 "$PROCESS_SHA" && [ ! -s "$TYPED_STATE" ]; echo $?)" "rc=$process_rc state=$(wc -l < "$TYPED_STATE")"
+check 'successful agent task counts toward its bounded no-progress attempt cap' "$([ "$(wc -l < "$TYPED_HOME/agent-task-attempts.tsv")" -eq 1 ]; echo $?)" "attempts=$(cat "$TYPED_HOME/agent-task-attempts.tsv")"
 PROCESS_PREPARE_DECISION="$TYPED_HOME/process-prepare.json"; typed_decision 4 "$PROCESS_PREPARE_DECISION"
-: > "$TYPED_STATE"; : > "$TYPED_FAILS"
+: > "$TYPED_STATE"; : > "$TYPED_FAILS"; : > "$TYPED_HOME/agent-task-attempts.tsv"
 MOCK_FRESH="$PROCESS_PREPARE_DECISION" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
-check 'successful no-push evidence task marks its SHA and is skipped next poll' "$([ "$process_rc" -eq 0 ] && already_done acme/widgets 1983 "$PROCESS_SHA" && [ "$(wc -l < "$TYPED_STATE")" -eq 1 ]; echo $?)" "rc=$process_rc state=$(wc -l < "$TYPED_STATE")"
-PROCESS_NEW_SHA=2222222222222222222222222222222222222222
-: > "$TYPED_STATE"; : > "$TYPED_FAILS"
-MOCK_FRESH="$PROCESS_DECISION" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
-check 'successful pushed agent task marks original and new heads' "$([ "$process_rc" -eq 0 ] && already_done acme/widgets 1983 "$PROCESS_SHA" && already_done acme/widgets 1983 "$PROCESS_NEW_SHA" && [ "$(wc -l < "$TYPED_STATE")" -eq 2 ]; echo $?)" "rc=$process_rc state=$(wc -l < "$TYPED_STATE")"
+check 'successful evidence-prep agent task does not mark its SHA and is retried next poll' "$([ "$process_rc" -eq 0 ] && ! already_done acme/widgets 1983 "$PROCESS_SHA" && [ ! -s "$TYPED_STATE" ]; echo $?)" "rc=$process_rc state=$(wc -l < "$TYPED_STATE")"
 for PROCESS_AGENT_RC in 1 2; do
-  : > "$TYPED_STATE"; : > "$TYPED_FAILS"
+  : > "$TYPED_STATE"; : > "$TYPED_FAILS"; : > "$TYPED_HOME/agent-task-attempts.tsv"
   MOCK_FRESH="$PROCESS_DECISION" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
   check "agent task rc=$PROCESS_AGENT_RC stays retryable without a failure-budget row" "$([ "$process_rc" -eq "$PROCESS_AGENT_RC" ] && [ ! -s "$TYPED_STATE" ] && [ ! -s "$TYPED_FAILS" ]; echo $?)" "rc=$process_rc processed=$(wc -c < "$TYPED_STATE") failures=$(wc -c < "$TYPED_FAILS")"
 done
 PROCESS_AGENT_RC=0
-for action in collect-existing-result recover-existing-review stop-without-new-review allow-existing-merge-workflow ask-named-product-choice; do
-  # Several corpus cases can share an action (stop-without-new-review has a governor case and a
-  # cooldown case); the process-level assertion needs any one exemplar, so take the first.
-  index="$(jq -r --arg action "$action" 'first(.cases | to_entries[] | select(.value.expected.action == $action)) | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
+for action in collect-existing-result recover-existing-review ask-named-product-choice; do
+  index="$(jq -r --arg action "$action" '.cases | to_entries[] | select(.value.expected.action == $action) | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
   decision="$TYPED_HOME/process-$action.json"; typed_decision "$index" "$decision"
   : > "$TYPED_STATE"; : > "$TYPED_FAILS"
   MOCK_FRESH="$decision" MOCK_RECOVERED="$TYPED_HOME/process-recovered" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
   check "$action does not mark a processed SHA or failure budget" "$([ "$process_rc" -eq 0 ] && [ ! -s "$TYPED_STATE" ] && [ ! -s "$TYPED_FAILS" ]; echo $?)" "rc=$process_rc processed=$(wc -c < "$TYPED_STATE") failures=$(wc -c < "$TYPED_FAILS")"
 done
+# #162: account-cooldown-active is the OTHER non-completing stop-without-new-review shape. It is
+# deliberately not in the loop above -- #184 narrowed that list to the three report/collection
+# actions -- so assert it directly, the same way allow-existing-merge-workflow was split out below.
+# A cooldown defers a spend: the head must stay unprocessed and nothing may be charged.
+cooldown_index="$(jq -r 'first(.cases | to_entries[] | select(.value.expected.action == "stop-without-new-review" and .value.expected.reason == "account-cooldown-active")) | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
+decision="$TYPED_HOME/process-cooldown.json"; typed_decision "$cooldown_index" "$decision"
+: > "$TYPED_STATE"; : > "$TYPED_FAILS"
+MOCK_FRESH="$decision" MOCK_RECOVERED="$TYPED_HOME/process-recovered" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
+check "account-cooldown-active does not mark a processed SHA or failure budget" "$([ "$process_rc" -eq 0 ] && [ ! -s "$TYPED_STATE" ] && [ ! -s "$TYPED_FAILS" ]; echo $?)" "rc=$process_rc processed=$(wc -c < "$TYPED_STATE") failures=$(wc -c < "$TYPED_FAILS")"
+# #184 finding 1 (round 5): allow-existing-merge-workflow/current-ship-is-merge-eligible is one of
+# the two positive shapes daemon_decision_completes_current_head recognizes (the producer's FIRST
+# SHIP result lives in .facts.completed_results, never .facts.prior_review) -- unlike the three
+# report/collection actions above, it correctly DOES mark the head done, or the unchanged head
+# re-clones and re-queries forever. Split out of the "does not mark" loop above on purpose.
+MERGE_INDEX="$(jq -r --arg action allow-existing-merge-workflow '.cases | to_entries[] | select(.value.expected.action == $action) | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
+MERGE_DECISION="$TYPED_HOME/process-allow-existing-merge-workflow.json"; typed_decision "$MERGE_INDEX" "$MERGE_DECISION"
+check 'sanity: the allow-existing-merge-workflow corpus fixture is the FIRST-SHIP completion reason (current-ship-is-merge-eligible)' "$([ "$(jq -r .reason "$MERGE_DECISION")" = current-ship-is-merge-eligible ]; echo $?)" "$(jq -r .reason "$MERGE_DECISION")"
+: > "$TYPED_STATE"; : > "$TYPED_FAILS"
+MOCK_FRESH="$MERGE_DECISION" MOCK_RECOVERED="$TYPED_HOME/process-recovered" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
+check 'allow-existing-merge-workflow (current-ship-is-merge-eligible) completes the current head without a failure-budget charge' "$([ "$process_rc" -eq 0 ] && already_done acme/widgets 1983 "$PROCESS_SHA" && [ ! -s "$TYPED_FAILS" ]; echo $?)" "rc=$process_rc processed=$(wc -c < "$TYPED_STATE") failures=$(wc -c < "$TYPED_FAILS")"
+: > "$TYPED_STATE"; : > "$TYPED_FAILS"
+# #184c finding 1: this corpus's only stop-without-new-review case is round-governor-denied --
+# no applicable review ran, so it must NOT complete the head. Positive current-head review proof
+# ("identical-code-and-evidence") is covered by tests/daemon-current-head-completion.test.sh,
+# which is not in the shared corpus so it does not perturb this file's case count.
+STOP_INDEX="$(jq -r '.cases | to_entries[] | select(.value.expected.action == "stop-without-new-review") | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
+STOP_DECISION="$TYPED_HOME/process-stop.json"; typed_decision "$STOP_INDEX" "$STOP_DECISION"
+check 'sanity: the stop-without-new-review corpus fixture is a NON-completion reason (round-governor-denied)' "$([ "$(jq -r .reason "$STOP_DECISION")" = round-governor-denied ]; echo $?)" "$(jq -r .reason "$STOP_DECISION")"
+: > "$TYPED_STATE"; : > "$TYPED_FAILS"
+MOCK_FRESH="$STOP_DECISION" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
+check 'report-only stop-without-new-review WITHOUT current-head review proof does not complete the head' "$([ "$process_rc" -eq 0 ] && ! already_done acme/widgets 1983 "$PROCESS_SHA" && [ ! -s "$TYPED_STATE" ]; echo $?)" "rc=$process_rc state=$(wc -l < "$TYPED_STATE")"
 # Observation is progress only: it reports, but never changes action selection or prompts.
 typed_decision 2 "$TYPED_HOME/observed-base.json"
 observed_facts="$(jq -cS '.facts | .observation.kind="waiting"' "$TYPED_HOME/observed-base.json")"

@@ -90,7 +90,7 @@ update path above. A saved decision is advisory, not authority.
 |---|---|---|
 | `runtime-guarded-effect` | `collect-existing-result` | Re-enter with `--review-decision-effect`, then recover the still-selected exact marker and re-query. |
 | `runtime-guarded-effect` | `recover-existing-review` | Re-enter with `--review-decision-effect`, then recover the still-selected exact marker and re-query. |
-| `runtime-guarded-effect` | `run-granted-review` | Re-enter with `--review-decision-effect`, adding `--out` and `--timeout`; the runtime rechecks before charge and submission. |
+| `runtime-guarded-effect` | `run-granted-review` | Re-enter with `--review-decision-effect`, adding `--out` and letting the engine size the wait; the runtime rechecks before charge and submission. |
 | `agent-task` | `fix-review-findings` | Verify normalized current findings, fix them, run applicable checks, then re-query at the changed head. |
 | `agent-task` | `prepare-matching-review-evidence` | Prepare the requested raw/reviewed evidence without changing code, append its proof inputs above, then re-query. |
 | `report-only` | `stop-without-new-review` | Report the normalized reason and preserve branch work; do not infer a retry. `account-cooldown-active` is the one stop a caller may wait out: ChatGPT is rate-limiting the account, `.facts.cooldown.seconds_remaining` says for how long, and only re-querying after at least that long can change the answer. |
@@ -108,8 +108,13 @@ EFFECT_ARGS=(--review-decision-effect "$DECISION" --pr "$PR" --repo "$REPO" "${I
 For `run-granted-review`:
 
 ```bash
-"$PG" "${EFFECT_ARGS[@]}" --out "$OUT" --timeout 30m
+"$PG" "${EFFECT_ARGS[@]}" --out "$OUT"
 ```
+
+Pass no `--timeout`. The engine treats any `--timeout` it receives as final, so supplying one here
+would pin every dispatch and make `PRO_GATE_TIMEOUT` unreachable on the path most reviews take.
+Omitting it lets the engine apply its own sized default (60m fresh, 45m for collection) and lets a
+deployment override that machine-wide. Add `--timeout` only as a deliberate one-off override.
 
 For collection or recovery, first execute the freshness check/repair and verify that it still
 returns the same selected action and marker; a stale request returns the replacement action instead:
@@ -120,7 +125,7 @@ FRESH="${DECISION}.fresh"
 ACTION="$(jq -r .action "$FRESH")"
 REF="$(jq -r '.effect_request.applicable_ref // empty' "$FRESH")"
 # Continue only when ACTION and REF still match the requested collect/recover operation.
-"$PG" --recover "$REF" --repo "$REPO" --out "$OUT" --timeout 30m
+"$PG" --recover "$REF" --repo "$REPO" --out "$OUT"
 ```
 
 Dispatch a replacement action instead of the stale one. Never translate collection or recovery into
@@ -149,7 +154,7 @@ and direct marker diagnostics remain:
 
 ```bash
 "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --status <pr-number|pr-url|marker> --json
-"${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --harvest <run-marker> --out <out> --timeout 20m
+"${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" --harvest <run-marker> --out <out>
 ```
 
 ask-named-product-choice is the only prompt. Present only the normalized

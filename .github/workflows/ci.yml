@@ -50,6 +50,7 @@ jobs:
         run: |
           bash tests/engine.test.sh
           bash tests/daemon-reload.test.sh
+          bash tests/daemon-current-head-completion.test.sh
           bash tests/autoupdate.test.sh
           bash tests/resolve-identity.test.sh
           bash tests/browser-launch.test.sh

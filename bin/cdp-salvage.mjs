@@ -93,6 +93,8 @@ import {
   buildThrottleModalExpression,
   ORGANIZER_MUTATION_LEASE_MS,
   THROTTLE_RE,
+  readReviewText,
+  reviewTextContext,
 } from './cdp-organizer-expressions.mjs';
 import {
   parseTestPollMs,
@@ -166,6 +168,24 @@ const COMPLETED_DIR = process.env.PRO_GATE_COMPLETED_DIR ?? path.join(PG_HOME, '
 const PENDING_DIR = path.join(PG_HOME, 'pending');
 const MEMO_KEEP = 200;                  // newest N memos retained; older ones are pruned on write
 const MARKER_SAFE_RE = /^pg-run-[A-Za-z0-9.-]+$/;
+// #167: the marker is EXTRACTED case-insensitively everywhere but used to be COMPARED
+// case-sensitively, so a model that lowercased its own echo — markers legitimately carry
+// un-lowercased repo text, e.g. pg-run-StartupBros-com-pro-gate-166-... — read as another run
+// and got its own finished answer convicted cross-bound. Two genuinely different runs cannot
+// differ only in letter case: a marker ends in "-<launch epoch>-<pid>" and one process has one
+// of each, so folding case cannot mask another run's claim.
+//
+// ASCII-only and arithmetic ON PURPOSE. toLowerCase() is NOT length-preserving ('İ' folds
+// to two code units) and is not what the engine's shell side can cheaply agree with; every
+// marker position in this file is compared against other positions in the SAME string
+// (verdict.at, promptMarkerAt, lastMarkerAt, foreignAt, every text.slice boundary), so a fold
+// that shifted indices would silently corrupt ownership adjudication. A +32 fold over [A-Z]
+// leaves every other code unit — and therefore every index — exactly where it was.
+const asciiFold = (value) => String(value ?? '').replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
+const foldedIncludes = (text, wanted) => asciiFold(text).includes(asciiFold(wanted));
+// Marker identity. Null/empty on either side is NOT a match: an absent echo is "unproven", never
+// "ours" (organizerOwnership and finalizerOwnership both depend on that distinction).
+const sameMarker = (a, b) => !!a && !!b && asciiFold(a) === asciiFold(b);
 const memoPath = (m) => (MARKER_SAFE_RE.test(m) ? path.join(URL_MEMO_DIR, m) : null);
 const titleMemoPath = (m) => (MARKER_SAFE_RE.test(m) ? path.join(TITLE_MEMO_DIR, m) : null);
 
@@ -233,14 +253,52 @@ let ownershipProven = false;       // any candidate positively proved ours this 
 // Record a per-candidate conviction. Persisted only by flushCrossBind() at exit.
 function noteCrossBind(_m, url, foreign) { crossBindHits.set(url, foreign); }
 
+// #170: does salvage-nonmatching.txt still hold an entry for this marker? Read from the FILE,
+// not from the `nonMatching` Set: that Set is declared with the blacklist block far below, and
+// --sweep-root (exits at the "closed N idle root tab(s)" line) and --close both exit ABOVE it,
+// so touching it from the exit hook would resurrect exactly the #76 temporal-dead-zone crash
+// this state placement exists to prevent. Re-reading also answers the question that actually
+// matters — "will the NEXT scan skip this marker's URLs?" — including entries the shell's
+// pg_provenance_reject appended concurrently. Line filter is the load's, character for character.
+function markerHasBlacklistEntry(m) {
+  try {
+    for (const raw of fs.readFileSync(BLACKLIST_FILE, 'utf8').split('\n')) {
+      const line = raw.trim();
+      if (!line) continue;
+      const sep = line.indexOf('\t');
+      if (sep < 0) continue;         // legacy global entry: ignore (same filter as the load below)
+      if (line.slice(0, sep) === m) return true;
+    }
+  } catch {}
+  return false;
+}
+
 // Persist terminal cross-bound state ONLY when the completed scan found no candidate we could
 // prove is ours. Order-independent by construction: every candidate has been classified by the
 // time this runs.
 function flushCrossBind(m) {
   const dir = path.join(PG_HOME, 'crossbound');
   const f = path.join(dir, m);
-  if (ownershipProven || crossBindHits.size === 0) {
+  // Positive ownership is the ONLY proof a conviction went stale, so it is the only thing that
+  // clears the sidecar unconditionally.
+  if (ownershipProven) {
     try { fs.unlinkSync(f); } catch {}
+    return;
+  }
+  if (crossBindHits.size === 0) {
+    // #170: an empty scan is NOT that proof. A conviction blacklists its own URL
+    // (rejectCrossBound -> discardForeignUrl -> blacklist), and every later scan skips a
+    // blacklisted URL before it can be re-classified — both the open-tab loop and the dead-tab
+    // re-render loop test `nonMatching.has(tab.url)` ahead of any marker comparison. So a
+    // still-suppressed conviction produces exactly the same empty crossBindHits as a genuinely
+    // cleared one. Unlinking on that emptiness left the append-only blacklist (never swept, by
+    // design — see the housekeeping note in oracle-review.sh) still hiding the conversation
+    // while --status downgraded "STUCK (cross-bound)" to a retry hint, and threw away the
+    // sidecar's URL, which is the only surviving handle to that conversation: the conviction
+    // deleted conversation-urls/<marker> in the same breath.
+    // Clear only when this marker has no blacklist entry that could have produced the emptiness.
+    // --close/--sweep-root keep clearing an otherwise-unsupported stale conviction (#76).
+    if (!markerHasBlacklistEntry(m)) { try { fs.unlinkSync(f); } catch {} }
     return;
   }
   try {
@@ -258,8 +316,20 @@ function flushCrossBind(m) {
 // #76 keeps close/sweep-root flushing (they clear a stale conviction, and their test asserts it);
 // v0.32 excludes only --organize. It exits before the scan that can call noteCrossBind, so it
 // never has hits and never proves ownership — flushing there would just DELETE a genuine
-// conviction an earlier salvage recorded. probe stays excluded exactly as before.
-process.on('exit', () => { if (!probe && !organize) flushCrossBind(marker); });
+// conviction an earlier salvage recorded.
+process.on('exit', () => {
+  if (organize) return;
+  // #170: a probe still never RECORDS a conviction — with ownershipProven false it returns right
+  // here, so a probe's crossBindHits can never reach the write branch below. What it may now do
+  // is CLEAR one, because a probe that positively proved ownership holds exactly the proof the
+  // flush requires, and refusing to act on it is what turned a transient mis-report into a
+  // durable one: sidecars stopped self-clearing (above), and pg_reservation_reconcile's periodic
+  // probe is the invocation that notices a review finished. A run whose earlier salvage convicted
+  // a duplicate tab would otherwise keep reporting "STUCK (cross-bound)" — telling the operator
+  // NOT to run the free harvest that would in fact succeed — until the 14-day sweep.
+  if (probe && !ownershipProven) return;
+  flushCrossBind(marker);
+});
 
 function rememberUrl(m, url) {
   const f = memoPath(m);
@@ -287,7 +357,11 @@ function rememberUrl(m, url) {
 // evaluator in cdp-organizer-expressions.mjs so both surfaces recognize the same copy.
 // Any pro-gate run marker. On a page that does NOT carry our own marker, a hit here is positive
 // evidence the page rendered a DIFFERENT run's conversation (vs. merely not having loaded yet).
-const FOREIGN_MARKER_RE = /pg-run-[A-Za-z0-9.-]+/;
+// Case-insensitive in lockstep with the ownership checks that gate it (#167): every caller asks
+// "is this ours?" first, and that question is now answered under asciiFold. Were this pattern
+// stricter than its gate, an UPPERCASED self-echo would newly read as foreign and blacklist the
+// run's own conversation — the exact conviction this issue exists to stop, in the other direction.
+const FOREIGN_MARKER_RE = /pg-run-[A-Za-z0-9.-]+/i;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -295,7 +369,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // marker at all (ours or foreign — real conversations can QUOTE the phrase,
 // e.g. a review of this very engine), and is short like an error page.
 function isThrottlePage(text) {
-  return !!text && text.length < 5000 && !/pg-run-[A-Za-z0-9.-]+/.test(text) && THROTTLE_RE.test(text);
+  return !!text && text.length < 5000 && !FOREIGN_MARKER_RE.test(text) && THROTTLE_RE.test(text);
 }
 function recordThrottle(where) {
   try {
@@ -416,9 +490,20 @@ async function evaluateMutation(tab, buildExpression) {
   return result;
 }
 
+const scopedResponses = new Set();
 async function tabText(tab) {
-  const result = await evaluateTab(tab, 'document.body.innerText');
-  return result.ok ? result.value ?? null : null;
+  const expression =
+    '/* pro-gate:review-text */ (' +
+    readReviewText.toString() +
+    ')(document, ' +
+    JSON.stringify(marker) +
+    ')';
+  const result = await evaluateTab(tab, expression);
+  if (!result.ok) return null;
+  if (typeof result.value === 'string') return result.value;
+  if (typeof result.value?.text !== 'string') return null;
+  if (result.value.promptAt === 0) scopedResponses.add(result.value.text);
+  return result.value.text;
 }
 
 async function tabTerminalInfrastructure(tab) {
@@ -481,21 +566,6 @@ if (sweepRoot) {
 // probe/salvage can always find the conversation by marker), the wrapper must close the tab
 // itself once the review is confirmed, or /c/ tabs would accumulate. Close every conversation
 // tab carrying THIS run's marker. Best-effort, bounded, non-fatal (never fail a finished run).
-if (close) {
-  let tabs = [];
-  try {
-    tabs = (await (await fetch(`http://127.0.0.1:${port}/json`)).json())
-      .filter((t) => t.type === 'page' && /chatgpt\.com\/c\//.test(t.url || ''));
-  } catch { process.exit(0); }
-  let closed = 0;
-  for (const tab of tabs) {
-    const text = await tabText(tab);
-    if (text && text.includes(marker)) { await closeTab(tab.id); closed += 1; }
-  }
-  console.error(`cdp-salvage --close: closed ${closed} conversation tab(s) matching "${marker}"`);
-  process.exit(0);
-}
-
 // v0.17: renderer-dead-tab fallback. Under Xvfb a background conversation
 // tab's renderer can suspend or crash: Runtime.evaluate then returns nothing
 // (and /json/activate does NOT revive it) even though the finished review
@@ -701,54 +771,18 @@ async function freshRenderText(url, port, outerDeadline, waitForDecisiveEvidence
   }
 }
 
-// VERDICT / Pn matchers tolerate GPT-5.6 formatting drift: leading bold/bullet/quote markers and
-// whitespace, and markers/space between the label and its colon (e.g. `**VERDICT:**`, `- P0 :`).
-const VERDICT_RE = /^\s*[*_>#-]*\s*VERDICT[*_\s]*:/i;
-const PBLOCK_START_RE = /^\s*[*_>#-]*\s*(P0\s*[:\-]|P0\b|\[P[0-3]\])/i;
-function extractReview(text) {
-  const lines = text.split('\n');
-  let verdictIdx = -1;
-  for (let i = lines.length - 1; i >= 0; i--) if (VERDICT_RE.test(lines[i])) { verdictIdx = i; break; }
-  if (verdictIdx < 0) return null;
-  let start = -1;
-  for (let i = verdictIdx; i >= 0; i--) if (PBLOCK_START_RE.test(lines[i].trim())) start = i;
-  if (start < 0) start = Math.max(0, verdictIdx - 120);
-  return lines.slice(start, verdictIdx + 1).join('\n').trim();
-}
+const responseClaims = (text) => reviewTextContext(text, marker, scopedResponses.has(text) ? 0 : null);
+const mixedAnswer = (text) => responseClaims(text).mixed;
+const extractReview = (text) => responseClaims(text).review;
 
-// #67: a page carrying a COMPLETED answer whose verdict echoes a DIFFERENT run's marker is
-// that run's conversation, full stop — even though our own marker also appears on the page,
-// because the marker rides the submitted PROMPT and a mis-navigated render can show ours
-// above someone else's answer. Two live incidents (pro-gate#66 <- pushbot#1336,
-// pushbot#1334 <- pushbot#1323) memoized exactly such a page as "ours" and, because a
-// remembered URL is exempt from blacklisting, poisoned that marker's memo permanently.
-// Returns the foreign marker when the ANSWER is provably another run's, else null.
 function foreignAnswerMarker(text) {
-  const review = extractReview(text);
-  if (!review) return null;                       // no completed answer here: decides nothing
-  // ONLY the terminal VERDICT line carries ownership (#68 gate r2 P1). Scanning the last six
-  // lines convicts a genuine nonce-less answer whose FINDINGS merely mention another marker —
-  // routine in this repo, whose reviews quote incident markers verbatim. A verdict line with
-  // no marker at all is ambiguous, not foreign: return null and let the engine's nonce check
-  // file it as retryable.
-  const lines = review.split('\n');
-  let verdictLine = '';
-  for (let i = lines.length - 1; i >= 0; i--) if (VERDICT_RE.test(lines[i])) { verdictLine = lines[i]; break; }
-  if (!verdictLine) return null;
-  if (verdictLine.includes(`(run marker: ${marker})`)) return null;   // ours, positively
-  const m = verdictLine.match(/\(run marker:\s*(pg-run-[A-Za-z0-9.-]+)\s*\)/);
-  if (!m || m[1] === marker) return null;
-  // POSITION MATTERS (#68 gate P1). A reused conversation can hold an OLDER nonce-bearing
-  // verdict ABOVE our freshly-submitted prompt while our answer is still generating.
-  // extractReview() takes the LAST verdict in the page, which in that layout is the old one —
-  // convicting on it would blacklist and forget the genuine LIVE conversation and let a probe
-  // count misses toward a duplicate spend. Only convict when the foreign verdict comes AFTER
-  // the last occurrence of our marker, i.e. it is the answer to our prompt rather than
-  // scrollback above it.
-  const lastMarkerAt = lastExactMarkerAt(text, marker);
-  const foreignAt = text.lastIndexOf(m[0]);
-  if (lastMarkerAt >= 0 && foreignAt >= 0 && foreignAt < lastMarkerAt) return null;
-  return m[1];
+  const { claims } = responseClaims(text);
+  if (claims.some((claim) => claim.markers.some((value) => value.toLowerCase() === marker.toLowerCase()))) return null;
+  const verdict = claims.at(-1);
+  if (!verdict) return null;
+  const foreign = verdict.markers.find((value) => value.toLowerCase() !== marker.toLowerCase());
+  if (!foreign || verdict.at < lastExactMarkerAt(text, marker)) return null;
+  return foreign;
 }
 
 const organizerToken = (value, fallback = 'unknown') => {
@@ -760,14 +794,19 @@ function emitOrganizerResult({ source = 'none', renameStatus = 'skipped', archiv
 }
 
 const isRunMarkerChar = (char) => /[A-Za-z0-9.-]/.test(char ?? '');
+// "Exact" here means TOKEN-EXACT — the whole marker, bounded by non-marker characters — not
+// byte-exact. Letter case is folded (#167); asciiFold is length-preserving, so every index
+// returned still points into the caller's original `text`.
 function lastExactMarkerAt(text, wanted) {
+  const haystack = asciiFold(text);
+  const needle = asciiFold(wanted);
   let found = -1;
   let from = 0;
-  while (from <= text.length - wanted.length) {
-    const at = text.indexOf(wanted, from);
+  while (from <= haystack.length - needle.length) {
+    const at = haystack.indexOf(needle, from);
     if (at < 0) break;
-    const before = at > 0 ? text[at - 1] : '';
-    const after = text[at + wanted.length] ?? '';
+    const before = at > 0 ? haystack[at - 1] : '';
+    const after = haystack[at + needle.length] ?? '';
     if (!isRunMarkerChar(before) && !isRunMarkerChar(after)) found = at;
     from = at + 1;
   }
@@ -776,7 +815,7 @@ function lastExactMarkerAt(text, wanted) {
 const hasExactMarker = (text, wanted) => !!text && lastExactMarkerAt(text, wanted) >= 0;
 function lastExactRunMarkerAt(text) {
   let found = -1;
-  for (const match of text.matchAll(/pg-run-[A-Za-z0-9.-]+/g)) {
+  for (const match of text.matchAll(/pg-run-[A-Za-z0-9.-]+/gi)) {
     const at = match.index;
     const before = at > 0 ? text[at - 1] : '';
     const after = text[at + match[0].length] ?? '';
@@ -785,26 +824,39 @@ function lastExactRunMarkerAt(text) {
   return found;
 }
 
-function terminalVerdict(text) {
-  const lines = text.split('\n');
-  let at = 0;
-  let terminal = null;
-  for (const line of lines) {
-    if (VERDICT_RE.test(line)) terminal = { line, at };
-    at += line.length + 1;
-  }
-  return terminal;
+function ownedVerdict(text) {
+  return responseClaims(text).verdict;
 }
 
 // Mutation authority is intentionally stricter than salvage extraction. The engine may capture a
 // nonce-less completed answer and adjudicate it as retryable, but the organizer must not mutate that
 // page: once a verdict follows this run's prompt, only an exact marker echo proves it is our answer.
+// "Exact" is token-exact, not case-exact (#167): an absent or genuinely different marker still
+// refuses, but this run's own lowercased self-echo is this run's answer.
+// Any exact run marker AFTER `from` that is not ours. A conversation two runs wrote to is not
+// this run's to rename, archive or close: the other run may still be collecting from it.
+function foreignRunMarkerAfter(text, from) {
+  const tail = text.slice(from);
+  for (const match of tail.matchAll(/pg-run-[A-Za-z0-9.-]+/gi)) {
+    const at = match.index;
+    if (isRunMarkerChar(at > 0 ? tail[at - 1] : '') || isRunMarkerChar(tail[at + match[0].length] ?? '')) continue;
+    if (!sameMarker(match[0], marker)) return match[0];
+  }
+  return null;
+}
+
 function organizerOwnership(text) {
   if (!hasExactMarker(text, marker)) return { owned: false, reason: 'marker-missing' };
-  const verdict = terminalVerdict(text);
+  if (mixedAnswer(text)) return { owned: false, reason: 'shared-conversation' };
+  const verdict = ownedVerdict(text);
   if (!verdict) return { owned: true, reason: 'live' };
   const answerMarker = verdict.line.match(/\(run marker:\s*(pg-run-[A-Za-z0-9.-]+)\s*\)/i)?.[1] ?? null;
-  if (answerMarker === marker) return { owned: true, reason: 'completed' };
+  if (sameMarker(answerMarker, marker)) {
+    // A later prompt may still be generating in this shared conversation.
+    const shared = foreignRunMarkerAfter(text, verdict.at + verdict.line.length);
+    if (shared) return { owned: false, reason: 'shared-conversation', foreignMarker: shared };
+    return { owned: true, reason: 'completed' };
+  }
   if (verdict.at < lastExactMarkerAt(text, marker)) return { owned: true, reason: 'old-verdict' };
   return answerMarker
     ? { owned: false, reason: 'cross-bound', foreignMarker: answerMarker }
@@ -815,10 +867,15 @@ function normalizeReviewBytes(value) {
   return String(value ?? '').replace(/\r\n?/g, '\n').replace(/\n$/, '');
 }
 
+// Locate the token case-insensitively, but slice the ORIGINAL line (#167): the fold is only a
+// lookup key, never the published bytes. Must stay in step with pg_strip_nonce and with the twin
+// inside cdp-organizer-expressions.mjs — the finalizer compares this output against the bytes the
+// engine already stripped, so one of the three folding and the others not is a result-mismatch.
 function stripMarkerEcho(value) {
   const token = `(run marker: ${marker})`;
+  const foldedToken = asciiFold(token);
   return String(value ?? '').split('\n').map((line) => {
-    const at = line.indexOf(token);
+    const at = asciiFold(line).indexOf(foldedToken);
     if (at < 0) return line;
     return `${line.slice(0, at)}${line.slice(at + token.length)}`.replace(/[ \t]+$/, '');
   }).join('\n');
@@ -827,7 +884,8 @@ function stripMarkerEcho(value) {
 let acceptedReview = null;
 function finalizerOwnership(text) {
   if (acceptedReview === null) return { owned: false, reason: 'result-file-missing' };
-  const verdict = terminalVerdict(text);
+  if (mixedAnswer(text)) return { owned: false, reason: 'shared-conversation' };
+  const verdict = ownedVerdict(text);
   if (!verdict) return { owned: false, reason: 'answer-incomplete' };
   const promptMarkerAt = lastExactMarkerAt(text.slice(0, verdict.at), marker);
   if (promptMarkerAt < 0) return { owned: false, reason: 'answer-incomplete' };
@@ -836,7 +894,7 @@ function finalizerOwnership(text) {
   }
   const answerMarker = verdict.line.match(/\(run marker:\s*(pg-run-[A-Za-z0-9.-]+)\s*\)/i)?.[1] ?? null;
   if (!answerMarker) return { owned: false, reason: 'answer-marker-missing' };
-  if (answerMarker !== marker) {
+  if (!sameMarker(answerMarker, marker)) {
     return { owned: false, reason: 'cross-bound', foreignMarker: answerMarker };
   }
   const review = extractReview(text);
@@ -1128,6 +1186,21 @@ async function organizeConversation() {
   return result;
 }
 
+if (close) {
+  let tabs = [];
+  try {
+    tabs = (await (await fetch(`http://127.0.0.1:${port}/json`)).json())
+      .filter((t) => t.type === 'page' && /chatgpt\.com\/c\//.test(t.url || ''));
+  } catch { process.exit(0); }
+  let closed = 0;
+  for (const tab of tabs) {
+    const text = await tabText(tab);
+    if (text && organizerOwnership(text).owned) { await closeTab(tab.id); closed += 1; }
+  }
+  console.error(`cdp-salvage --close: closed ${closed} conversation tab(s) matching "${marker}"`);
+  process.exit(0);
+}
+
 if (organize) {
   let result;
   try {
@@ -1182,31 +1255,33 @@ function classifyEvidence(text, structuredError = null, throttleModal = null) {
   }
   const review = extractReview(text);
   if (!review) return { kind: 'owned-incomplete' };
-  const verdict = terminalVerdict(text);
+  const verdict = ownedVerdict(text);
   const promptMarkerAt = verdict ? lastExactMarkerAt(text.slice(0, verdict.at), marker) : -1;
   const answerMarker = verdict?.line.match(/\(run marker:\s*(pg-run-[A-Za-z0-9.-]+)\s*\)/i)?.[1] ?? null;
   // The marker echoed in the terminal line is not a later prompt. A separate exact marker after
   // that line is, and proves this otherwise-owned verdict belongs to an older turn in the same chat.
   const newerPromptMarker = verdict && hasExactMarker(text.slice(verdict.at + verdict.line.length), marker);
-  // A retry reuses this run's exact marker, so a stale SAME-marker verdict (answerMarker ===
-  // marker) passes every other check here (owned, non-foreign, well-formed) AND the shell's
+  // A retry reuses this run's exact marker, so a stale SAME-marker verdict (one this run's own
+  // marker binds) passes every other check here (owned, non-foreign, well-formed) AND the shell's
   // nonce check downstream — it would otherwise satisfy `kind: 'terminal'` while the newer
   // prompt it precedes is still generating, and the harvest path below emits on `kind` alone
   // (unlike --probe, which also gates on probeComplete), so that stale verdict would be reported
   // as THIS run's result and retire the reservation early. Fall back to owned-incomplete so every
   // caller (readable-tab match, scratch revalidation, remembered-URL render, freshRenderText's
   // decisive-evidence wait) keeps sampling instead of treating scrollback as a live answer.
-  // Gated on answerMarker === marker: a verdict carrying a DIFFERENT marker ahead of our prompt
-  // (#68 gate P1's reused-conversation scrollback) already fails the shell's nonce check on its
+  // Gated on sameMarker: a verdict carrying a DIFFERENT marker ahead of our prompt (#68 gate
+  // P1's reused-conversation scrollback) already fails the shell's nonce check on its
   // own — that case must stay 'terminal' so the engine can adjudicate it, not be swallowed here.
-  if (newerPromptMarker && answerMarker === marker) return { kind: 'owned-incomplete', reason: 'stale-terminal' };
+  if (newerPromptMarker && sameMarker(answerMarker, marker)) return { kind: 'owned-incomplete', reason: 'stale-terminal' };
   return {
     kind: 'terminal',
     review,
     // newerPromptMarker can still be true here for a foreign answerMarker (scrollback case
     // above); the `&& !newerPromptMarker` term stays as a guard against that combination
     // ever being reported probe-complete, even though only --probe reads this field.
-    probeComplete: promptMarkerAt >= 0 && answerMarker === marker && !newerPromptMarker,
+    probeComplete: promptMarkerAt >= 0 && sameMarker(answerMarker, marker) && !newerPromptMarker && !mixedAnswer(text),
+    // Old foreign scrollback is retryable; the extracted review cannot carry this chronology.
+    precedesPrompt: !!newerPromptMarker,
   };
 }
 
@@ -1254,6 +1329,8 @@ function emitEvidence(url, evidence) {
     // v0.28 (gate #54 r5): name the EXACT source of this capture so the engine can blacklist
     // precisely on a provenance rejection — reading the shared memo afterwards races probes.
     console.error(`matched-url ${url}`);
+    // Chronology the engine cannot see: this block predates the prompt below it (#166 gate r3 P1).
+    if (evidence.precedesPrompt) console.error('answer-chronology precedes-prompt');
     console.log(evidence.review);
     process.exit(0);
   }
@@ -1356,7 +1433,7 @@ while (Date.now() < deadline) {
     // check — even a marker-bearing tab must be skipped then, or every later harvest replays
     // the same rejected conversation and starves the real one.
     if (nonMatching.has(tab.url)) continue;
-    if (!text.includes(marker)) {
+    if (!foldedIncludes(text, marker)) {
       // The remembered URL is open and rendered ANOTHER run's conversation: the memo is stale
       // (recycled URL, or it was never ours). This is the second way to prove staleness — the
       // first is a seeded render below — and without it an open-but-foreign remembered URL is
@@ -1456,7 +1533,7 @@ while (Date.now() < deadline) {
     const { text, evidence: renderEvidence } = await freshRenderText(tab.url, port, deadline);
     if (!text) continue;
     if (renderEvidence?.kind === 'throttle') tripThrottleEvidence(tab.url, renderEvidence, `fresh render ${tab.url}`);
-    if (!text.includes(marker)) {
+    if (!foldedIncludes(text, marker)) {
       // Blacklist ONLY on positive evidence: the page carries someone
       // ELSE's run marker, proving it rendered a different review's
       // conversation. Shell/login/error pages and pre-hydration renders can
@@ -1551,7 +1628,7 @@ if (!probe && stillGeneratingUrl && !lastMatchWasSeeded) {
     const tabs = (await (await fetch(`http://127.0.0.1:${port}/json`)).json())
       .filter((t) => t.type === 'page' && /chatgpt\.com\/c\//.test(t.url || ''));
     const reads = await Promise.all(tabs.map(async (tab) => ({ tab, text: await tabText(tab) })));
-    const live = reads.find(({ text }) => text && text.includes(marker));
+    const live = reads.find(({ text }) => text && foldedIncludes(text, marker));
     stillGeneratingUrl = live?.tab?.url ?? null;
   } catch {
     // CDP outage is inconclusive: retain the last positive signal, fail-closed against respending.

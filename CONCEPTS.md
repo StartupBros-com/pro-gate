@@ -12,6 +12,12 @@ One invocation bound to an immutable review target and evidence identity. An att
 
 Durable ownership of review-account capacity for a submitted attempt that may outlive its invoking process. A reservation can remain collectable without holding capacity after proof-backed completion or supersession.
 
+### Reservation Guard
+
+The serialization that makes recording a Reservation and deciding review capacity one indivisible step. Without it a waiter can read capacity as free in the window after a slot is released but before the Reservation recording that spend exists, and spend the same capacity twice. The guard is mutual exclusion only: holding it is not itself a claim on capacity, and releasing it asserts nothing about whether an attempt finished.
+
+Where the host offers no kernel-level file lock, the guard falls back to a directory it creates and removes. That fallback needs its own answer to a question the kernel otherwise settles — whether a directory left behind belongs to a process that is still running — and answering it wrongly is how two holders end up inside a guard whose entire purpose is that there is only ever one.
+
 ### Applicability
 
 Whether review evidence still describes the current target. Applicability is independent of whether the attempt completed: finished evidence may be stale, while unfinished evidence may stop applying after the target moves or closes.
@@ -23,6 +29,8 @@ Immutable positive proof that an attempt no longer owns recovery. Its proof dete
 ### Supersession
 
 Proof that a charged attempt no longer applies to the current target. Supersession preserves charge and auditability while releasing capacity, and cannot be reversed by later mutable observations.
+
+The proof is external to the attempt's own execution: it comes from the repository target moving on, not from anything the attempt itself reports. So an attempt whose own work never reaches a terminal signal can still be superseded, and waiting on that attempt to conclude is not a precondition. Where an attempt carries no immutable record of the input it was bound to, supersession cannot be proven for it at all and the lifecycle fails closed rather than guessing.
 
 ### Exact Recovery
 
@@ -51,6 +59,7 @@ The engine appends its own output contract after a brief, so a brief chooses the
 ## Relationships
 
 - A Review Attempt may own one Reservation; Exact Recovery resumes that same attempt.
+- A Reservation Guard serializes the recording of a Reservation against the capacity decision that reads it; it is not itself capacity, and it is held for far less time than a Reservation.
 - A Terminal Disposition or Supersession can release a Reservation's capacity without deleting the attempt's audit history.
 - Applicability is an input to the Review Decision, not a synonym for completion.
 - Input Policy constrains evidence delivery before a Review Attempt can be submitted.
