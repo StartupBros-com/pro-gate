@@ -256,11 +256,16 @@ check 'sanity: the allow-existing-merge-workflow corpus fixture is the FIRST-SHI
 MOCK_FRESH="$MERGE_DECISION" MOCK_RECOVERED="$TYPED_HOME/process-recovered" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
 check 'allow-existing-merge-workflow (current-ship-is-merge-eligible) completes the current head without a failure-budget charge' "$([ "$process_rc" -eq 0 ] && already_done acme/widgets 1983 "$PROCESS_SHA" && [ ! -s "$TYPED_FAILS" ]; echo $?)" "rc=$process_rc processed=$(wc -c < "$TYPED_STATE") failures=$(wc -c < "$TYPED_FAILS")"
 : > "$TYPED_STATE"; : > "$TYPED_FAILS"
-# #184c finding 1: this corpus's only stop-without-new-review case is round-governor-denied --
-# no applicable review ran, so it must NOT complete the head. Positive current-head review proof
-# ("identical-code-and-evidence") is covered by tests/daemon-current-head-completion.test.sh,
-# which is not in the shared corpus so it does not perturb this file's case count.
-STOP_INDEX="$(jq -r '.cases | to_entries[] | select(.value.expected.action == "stop-without-new-review") | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
+# #184c finding 1: a round-governor-denied stop means no applicable review ran, so it must NOT
+# complete the head. Positive current-head review proof ("identical-code-and-evidence") is covered
+# by tests/daemon-current-head-completion.test.sh, which is not in the shared corpus so it does not
+# perturb this file's case count.
+# #162: select on the REASON, not the action alone. This case used to be the corpus's only
+# stop-without-new-review entry, and selecting by action returned exactly one key; the cooldown case
+# added for #162 makes that selector return two, which silently feeds a malformed index to
+# typed_decision and fails this sanity check with an empty reason. The cooldown case has its own
+# non-completion assertion above.
+STOP_INDEX="$(jq -r 'first(.cases | to_entries[] | select(.value.expected.action == "stop-without-new-review" and .value.expected.reason == "round-governor-denied")) | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
 STOP_DECISION="$TYPED_HOME/process-stop.json"; typed_decision "$STOP_INDEX" "$STOP_DECISION"
 check 'sanity: the stop-without-new-review corpus fixture is a NON-completion reason (round-governor-denied)' "$([ "$(jq -r .reason "$STOP_DECISION")" = round-governor-denied ]; echo $?)" "$(jq -r .reason "$STOP_DECISION")"
 : > "$TYPED_STATE"; : > "$TYPED_FAILS"
