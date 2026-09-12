@@ -3560,43 +3560,108 @@ pg_status waiting-slot "effective ${EFF_CONC} / ceiling ${MAX_CONC}"
 SLOT_DEADLINE=$(( $(date +%s) + SLOT_WAIT ))
 SLOT_OK=0
 SLOT_HELD=""
+SLOT_GUARD_BLOCKED=0
+# gate #187 r1 P2: SLOT_GUARD_BLOCKED describes the LAST slice only — it drives the 5-minute
+# in-wait note, which is a per-slice statement. The terminal report needs a statement about the
+# WHOLE wait, so the newest occupancy reading latches here and is never cleared.
+SLOT_CAPACITY_EVER_READ=0
+SLOT_READ_SUMMARY=""
 while :; do
   EFF_CONC="$(pg_ramp_level "$MAX_CONC")"
   # Durable reservations occupy real account capacity even though their wrapper process has
   # exited. Slot-tagged reservations EXCLUDE their exact slot from acquisition (shrinking the
   # scan range instead overbooked capacity when a lower-numbered slot freed: dogfood review
   # P1); legacy/out-of-range reservations shrink the range.
-  if ! pg_reservation_guard_acquire; then sleep 3; continue; fi
-  SLOT_PLAN="$(pg_reservation_slot_plan "$EFF_CONC")"
-  SCAN_MAX="${SLOT_PLAN%%|*}"
-  SCAN_EXCLUDE="$(printf '%s' "$SLOT_PLAN" | cut -d'|' -f2)"
-  # Gate on the plan's AVAILABLE count (field 3), never on the scan bound: a bound of 1 whose
-  # only slot is excluded is an EMPTY set, and gating on the bound spent every wait slice
-  # calling pg_lock_n against an impossible plan while reporting "all slots busy" (#82).
-  SCAN_AVAIL="$(printf '%s' "$SLOT_PLAN" | cut -d'|' -f3)"
-  # Nonblocking while holding the short handoff guard: waiting here would prevent an active
-  # run from writing its reservation before releasing its process slot (writer waits 10s).
-  # One immediate scan gives an atomic plan+acquire decision; the outer loop releases the
-  # guard and retries.
-  if [ "${SCAN_AVAIL:-0}" -gt 0 ] 2>/dev/null && pg_lock_n "$LOCKFILE" "$SCAN_MAX" 0 "$SCAN_EXCLUDE"; then
-    # Keep the acquired process slot, release only the short reservation handoff guard.
-    SLOT_HELD="$PG_SLOT_ACQUIRED"
-    pg_reservation_guard_release; SLOT_OK=1; break
-  fi
-  pg_reservation_guard_release
-  # Name what actually holds capacity. An operator staring at a free-looking account and an idle
-  # browser cannot tell "another review is generating" from "a finished review was never
-  # collected" — and only the second is theirs to fix, for free (#82).
-  if [ "${SCAN_AVAIL:-0}" -le 0 ] 2>/dev/null \
-     && { [ -z "${SLOT_BLOCK_LOGGED:-}" ] || [ $(( $(date +%s) - ${SLOT_BLOCK_LOGGED:-0} )) -ge 300 ]; }; then
-    SLOT_BLOCK_LOGGED="$(date +%s)"
-    pg_report_capacity_holders "$EFF_CONC"
+  #
+  # #179: EVERY path that ends an iteration must reach the ONE deadline boundary at the bottom.
+  # A failed guard acquisition used to `sleep 3; continue`, and `continue` jumps over that
+  # check — so any guard this run could not acquire for the whole wait (an unwritable lock
+  # path, sustained flock contention, a no-flock guard whose reclaim keeps losing the mkdir)
+  # turned a bounded slot wait into an unbounded one: SLOT_WAIT stopped meaning anything and
+  # the run neither timed out nor progressed. The guard still gates planning and acquisition,
+  # exactly as before: without it this iteration has read NO capacity state, so it books
+  # nothing and only waits.
+  if pg_reservation_guard_acquire; then
+    SLOT_GUARD_BLOCKED=0
+    SLOT_PLAN="$(pg_reservation_slot_plan "$EFF_CONC")"
+    SCAN_MAX="${SLOT_PLAN%%|*}"
+    SCAN_EXCLUDE="$(printf '%s' "$SLOT_PLAN" | cut -d'|' -f2)"
+    # Gate on the plan's AVAILABLE count (field 3), never on the scan bound: a bound of 1 whose
+    # only slot is excluded is an EMPTY set, and gating on the bound spent every wait slice
+    # calling pg_lock_n against an impossible plan while reporting "all slots busy" (#82).
+    SCAN_AVAIL="$(printf '%s' "$SLOT_PLAN" | cut -d'|' -f3)"
+    # Nonblocking while holding the short handoff guard: waiting here would prevent an active
+    # run from writing its reservation before releasing its process slot (writer waits 10s).
+    # One immediate scan gives an atomic plan+acquire decision; the outer loop releases the
+    # guard and retries.
+    if [ "${SCAN_AVAIL:-0}" -gt 0 ] 2>/dev/null && pg_lock_n "$LOCKFILE" "$SCAN_MAX" 0 "$SCAN_EXCLUDE"; then
+      # Keep the acquired process slot, release only the short reservation handoff guard.
+      SLOT_HELD="$PG_SLOT_ACQUIRED"
+      pg_reservation_guard_release; SLOT_OK=1; break
+    fi
+    pg_reservation_guard_release
+    # gate #187 r1 P2: this slice held the guard, read the plan and won no slot, so it is a
+    # COMPLETE occupancy reading — latch it. Latch the sentence and not just the fact, for two
+    # reasons: EFF_CONC is re-read at the top of every iteration including guard-blocked ones, so
+    # a count taken at expiry can describe a level this reading never saw; and only here is the
+    # KIND of occupancy known, which is the difference between capacity an operator can free for
+    # free and capacity they can only wait out (#82). A later slice that loses the guard leaves
+    # this the newest thing the run knows, and the expiry below reports exactly that.
+    SLOT_CAPACITY_EVER_READ=1
+    if [ "${SCAN_AVAIL:-0}" -gt 0 ] 2>/dev/null; then
+      SLOT_READ_SUMMARY="all ${EFF_CONC} review slots were busy with running reviews"
+    else
+      SLOT_READ_SUMMARY="0 of ${EFF_CONC} effective slots were free, with capacity held by uncollected review(s) rather than running ones"
+    fi
+    # Name what actually holds capacity. An operator staring at a free-looking account and an idle
+    # browser cannot tell "another review is generating" from "a finished review was never
+    # collected" — and only the second is theirs to fix, for free (#82).
+    if [ "${SCAN_AVAIL:-0}" -le 0 ] 2>/dev/null \
+       && { [ -z "${SLOT_BLOCK_LOGGED:-}" ] || [ $(( $(date +%s) - ${SLOT_BLOCK_LOGGED:-0} )) -ge 300 ]; }; then
+      SLOT_BLOCK_LOGGED="$(date +%s)"
+      pg_report_capacity_holders "$EFF_CONC"
+    fi
+  else
+    # No capacity reading this slice. Say so on the same 5-minute cadence as the capacity report
+    # above: a wait that is silent for an hour and then reports "all slots busy" sends an operator
+    # to look at an account that was never the problem.
+    SLOT_GUARD_BLOCKED=1
+    if [ -z "${SLOT_GUARD_LOGGED:-}" ] || [ $(( $(date +%s) - ${SLOT_GUARD_LOGGED:-0} )) -ge 300 ]; then
+      SLOT_GUARD_LOGGED="$(date +%s)"
+      echo "[oracle-review] the reservation handoff guard ($(pg_reservation_lock)) could not be acquired; account capacity is unreadable this slice, so no slot is planned or taken. Waiting out the remaining slot budget." >&2
+    fi
   fi
   if [ "$(date +%s)" -ge "$SLOT_DEADLINE" ]; then break; fi
   sleep 3
 done
 if [ "$SLOT_OK" != 1 ]; then
-  if [ "$(pg_reservation_holding_count 2>/dev/null || echo 0)" -gt 0 ] 2>/dev/null; then
+  # Report the state the wait actually ended in. A wait that NEVER got as far as reading capacity
+  # cannot claim "0 of N effective slots free" or "all N busy": both are claims about slot occupancy
+  # this run never measured. pg_reservation_holding_count would still answer — it scans the
+  # reservation directory unguarded — but it would be answering a question that is not why this run
+  # gave up. Name the lock instead: that is the part an operator can act on (#179).
+  #
+  # gate #187 r1 P2: the test is the latch, NOT the last slice. A wait that read busy capacity for
+  # an hour and then lost the guard on its final slice ends with SLOT_GUARD_BLOCKED=1, and keying
+  # off that alone told the operator capacity "was never read" and skipped the running/uncollected
+  # diagnosis that is the actual answer. Both conditions still hold together, so this branch only
+  # ever narrows: it is reached exactly when every slice failed to read occupancy.
+  if [ "${SLOT_GUARD_BLOCKED:-0}" = 1 ] && [ "${SLOT_CAPACITY_EVER_READ:-0}" != 1 ]; then
+    echo "ERROR: timed out after ${SLOT_WAIT}s — the reservation handoff guard ($(pg_reservation_lock)) was still unacquirable; account capacity was never read, so no slot was planned or taken and no review was submitted." >&2
+    # Do NOT send the operator after a stale guard directory: pg_reservation_guard_acquire runs
+    # pg_dirlock_reclaim_dead on every attempt, so a directory left by a dead process is already
+    # reclaimed inside this same wait, thousands of times over on a default budget. Name only what
+    # can still be true once the whole budget has elapsed.
+    echo "  This is a lock-path problem, not a busy account. A guard left behind by a dead process is reclaimed automatically inside this same wait, so what remains after a full budget is a ${PRO_GATE_HOME} that cannot be written (mkdir and flock must both succeed there), or a live process that is genuinely still holding the guard." >&2
+  elif [ "${SLOT_GUARD_BLOCKED:-0}" = 1 ]; then
+    # Read capacity, then lost the guard before the deadline. The two branches below re-derive
+    # their answer from a scan taken AT expiry; this wait cannot, because the guard it needs to
+    # take one is exactly what it could not get. So report the reading it does have, say when it
+    # was taken, and let the holder report — which scans the reservation directory unguarded and
+    # prints nothing when nothing is held — add whatever is still true right now (gate #187 r1 P2).
+    echo "ERROR: timed out after ${SLOT_WAIT}s — when this run last read account capacity, ${SLOT_READ_SUMMARY}; the reservation handoff guard ($(pg_reservation_lock)) was unacquirable again when the wait expired, so nothing newer could be read and no review was submitted." >&2
+    pg_report_capacity_holders "$EFF_CONC"
+  elif [ "$(pg_reservation_holding_count 2>/dev/null || echo 0)" -gt 0 ] 2>/dev/null; then
     echo "ERROR: timed out after ${SLOT_WAIT}s — 0 of ${EFF_CONC} effective slots free; capacity is held by uncollected review(s), not by running ones." >&2
     pg_report_capacity_holders "$EFF_CONC"
   else
