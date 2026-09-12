@@ -2,6 +2,7 @@
 title: "A stale branch's premise can be half-fixed underneath it, so neither rebase nor close is right"
 module: "pro-gate"
 date: "2026-09-11"
+last_updated: "2026-09-12"
 category: "conventions"
 problem_type: "architecture_pattern"
 component: "development_workflow"
@@ -39,7 +40,8 @@ issue.
 
 ## The diagnostic
 
-Before deciding a stale branch's fate, answer three separate questions. Age answers none of them.
+Before deciding a stale branch's fate, answer four separate questions. Age answers none of them, and
+the first three are all static — question 4 is the one that actually runs the code.
 
 **1. Is the defect still present?** Grep current default-branch state for the fix's distinguishing
 symbols, not for the issue title. Absence of the symbol is evidence the fix never landed; presence
@@ -56,9 +58,26 @@ exist in the same shape, a rebase is mechanical. If they were rewritten, the bra
 expressed against a structure that no longer exists, and the diff is now a description of intent
 rather than a patch.
 
+**4. Does the merged result still pass the suite — measured against a control?** Resolve the merge,
+then run the affected suites on the merge result *and* on the default branch alone. Two numbers, not
+one: "31 failures" means nothing until you know main scores zero on the same command. Without the
+control you cannot tell a regression the branch introduced from breakage it merely inherited, and
+you will attribute it to whichever you already believed.
+
+This question exists because the first three can all come back clean on a branch that does not
+integrate. Conflict count measures **textual overlap**; it says nothing about behavioural
+compatibility. A branch whose every hunk merges mechanically can still fail dozens of assertions,
+because the tests it must satisfy grew on the default branch while it sat. The most expensive
+failure mode here is a revival that looks cheap by questions 1-3 and is then landed unrun.
+
 ## What the answers imply
 
-- Defect present, structure intact, conflicts mechanical → **rebase and land**.
+- Defect present, structure intact, conflicts mechanical, **suite green against a green control** →
+  **rebase and land**. All four clauses, not the first three.
+- Defect present, conflicts mechanical, but the **suite is red where main is green** → the branch has
+  an integration problem with tests that grew while it sat, and fixing it is a design decision about
+  the branch's own approach, not conflict resolution. Land nothing; hand it back with the control
+  numbers and the failing assertion class named.
 - Defect present, structure rewritten → **re-derive the intent onto the new structure**. Take the
   new code's shape and reapply the old change's *meaning*; do not replay its hunks.
 - Defect present but the branch also carries a contested policy change → land the uncontested part,
