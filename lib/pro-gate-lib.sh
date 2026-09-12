@@ -294,17 +294,24 @@ pg_lock() {
     fi
     return 0   # unwritable lock path -> proceed unlocked (preserves prior behavior)
   fi
-  local lockdir="${lockfile}.d" start opid
+  local lockdir="${lockfile}.d" start
   start=$(date +%s)
   while ! mkdir "$lockdir" 2>/dev/null; do
-    opid=$(cat "$lockdir/pid" 2>/dev/null || true)
-    if [ -n "$opid" ] && ! kill -0 "$opid" 2>/dev/null; then rm -rf "$lockdir" 2>/dev/null; continue; fi
-    [ $(( $(date +%s) - start )) -ge "$wait_s" ] && return 1
-    sleep 2
+    # The old inline reclaim read the owner pid, and on a dead one rm -rf'd the directory and
+    # retried. Three things were wrong with it and all three are the reclaimer's job now:
+    # two waiters reading the same dead pid could both remove and both enter; rm -rf could
+    # take a REPLACEMENT directory a live winner had already created; and the token written
+    # on the line below was never read back, so a recycled pid read as the original owner.
+    # Racing this is safe -- reclaiming is not the mutual exclusion, mkdir is, and the loser
+    # of that simply comes round again.
+    if ! pg_dirlock_reclaim_dead "$lockdir" 2>/dev/null; then
+      [ $(( $(date +%s) - start )) -ge "$wait_s" ] && return 1
+      sleep 2
+    fi
   done
   echo "$$" > "$lockdir/pid" 2>/dev/null || true
   pg_pid_token "$$" > "$lockdir/token" 2>/dev/null || true
-  pg_on_exit 'rm -rf "'"$lockdir"'" 2>/dev/null'
+  pg_on_exit 'pg_dirlock_release_own "'"$lockdir"'" "'"$$"'"'
   return 0
 }
 
@@ -314,7 +321,7 @@ pg_lock() {
 # (the winning fd is kept open and auto-released on exit); mkdir-spinlock fallback on macOS scans N
 # slot dirs and self-heals stale ones via the dead-pid check. maxn<=1 is plain mutual exclusion.
 pg_lock_n() {
-  local base="$1" maxn="${2:-1}" wait_s="${3:-2400}" exclude="${4:-}" start i fd lockdir opid
+  local base="$1" maxn="${2:-1}" wait_s="${3:-2400}" exclude="${4:-}" start i fd lockdir
   [ "${maxn:-1}" -ge 1 ] 2>/dev/null || maxn=1
   # v0.20.3: report WHICH slot was won (durable reservations must remember their slot so fresh
   # runs exclude it instead of shrinking the scan range, which overbooked real capacity), and
@@ -347,12 +354,12 @@ pg_lock_n() {
       if mkdir "$lockdir" 2>/dev/null; then
         echo "$$" > "$lockdir/pid" 2>/dev/null || true
         pg_pid_token "$$" > "$lockdir/token" 2>/dev/null || true
-        pg_on_exit 'rm -rf "'"$lockdir"'" 2>/dev/null'
+        pg_on_exit 'pg_dirlock_release_own "'"$lockdir"'" "'"$$"'"'
         PG_SLOT_ACQUIRED="$i"
         return 0
       fi
-      opid=$(cat "$lockdir/pid" 2>/dev/null || true)
-      [ -n "$opid" ] && ! kill -0 "$opid" 2>/dev/null && rm -rf "$lockdir" 2>/dev/null
+      # Same hardened reclaimer as pg_lock and the reservation guard; see the note there.
+      pg_dirlock_reclaim_dead "$lockdir" 2>/dev/null || true
       i=$((i + 1))
     done
     [ $(( $(date +%s) - start )) -ge "$wait_s" ] && return 1
@@ -567,6 +574,27 @@ pg_salvage_class_read() { # marker -> "kind<TAB>epoch" (empty and rc 1 when abse
 }
 
 pg_reservation_lock() { echo "${PRO_GATE_RESERVATION_LOCK:-$PRO_GATE_HOME/in-progress.lock}"; }
+# The collection wait every operator-facing hint prints. It lives here, not in the engine, because
+# the library prints hints too (pg_report_capacity_holders): v0.41 sized the engine's hints but
+# left this one at the old fixed 20m, and the test that guards the sizing grepped only the engine,
+# so the drift was invisible. One helper, one default, every renderer.
+pg_harvest_hint_timeout() { echo "${PRO_GATE_HARVEST_TIMEOUT:-45m}"; }
+# The fresh review's hard cap, sibling of the above. The engine needs this value in two places
+# ~3000 lines apart -- the run's own --timeout default and the change-lock budget's holder
+# envelope -- and a second literal is exactly how the 20m harvest default drifted out of sync
+# and survived a passing test. One helper, one default, every reader.
+pg_fresh_hint_timeout() { echo "${PRO_GATE_TIMEOUT:-60m}"; }
+
+# A plain-integer knob, or the default when it is anything else. The change-lock budget feeds
+# several operator-settable knobs straight into $(( )), where a duration-style typo is not a
+# small error: under `set -e` an arithmetic abort kills the whole run before any lock is taken.
+# .env.example documents 60m/45m durations a few lines from these second-valued knobs, so
+# PRO_GATE_TIMEOUT_GRACE=2m is an invited mistake rather than a hostile one. This is the same
+# idiom PRO_GATE_RESERVATION_TTL already uses in three places; one helper so every budget term
+# gets it instead of two of six.
+pg_int_or() {
+  case "${1:-}" in ''|*[!0-9]*) printf '%s\n' "$2" ;; *) printf '%s\n' "$1" ;; esac
+}
 # Markers become filenames under PRO_GATE_HOME and lock paths; every character must be from the
 # safe class (in particular no "/" anywhere), not just the first one after the prefix.
 pg_reservation_marker_ok() {
@@ -686,12 +714,7 @@ pg_run_meta_scan() {
 # still proves its own attempt is no longer unknown-fate. Keep this predicate shared so public
 # decision queries and guarded dispatch rechecks cannot disagree about the same sidecar.
 pg_run_meta_has_terminal_review() { # marker
-  local marker="$1" artifact
-  pg_reservation_marker_ok "$marker" || return 1
-  artifact="$(pg_completed_dir)/$marker"
-  if [ -f "$artifact" ] && [ ! -L "$artifact" ] && pg_is_review "$artifact"; then return 0; fi
-  artifact="$PRO_GATE_HOME/pending/$marker"
-  [ -f "$artifact" ] && [ ! -L "$artifact" ] && pg_is_review "$artifact"
+  pg_attempt_artifact "$1" >/dev/null
 }
 
 pg_run_meta_find_latest() { # host owner repo pr terminal-filter -> newest exact marker
@@ -968,11 +991,13 @@ pg_attempt_artifact() { # marker -> kind<TAB>path for a validated canonical revi
   local marker="$1" path
   pg_reservation_marker_ok "$marker" || return 1
   path="$(pg_completed_dir)/$marker"
-  if [ -f "$path" ] && [ ! -L "$path" ] && pg_is_review "$path"; then
+  if [ -f "$path" ] && [ ! -L "$path" ] && pg_is_review "$path" \
+     && [ -z "$(pg_capture_foreign_echo "$path" "$marker")" ]; then
     printf 'completed\t%s\n' "$path"; return 0
   fi
   path="$PRO_GATE_HOME/pending/$marker"
-  if [ -f "$path" ] && [ ! -L "$path" ] && pg_is_review "$path"; then
+  if [ -f "$path" ] && [ ! -L "$path" ] && pg_is_review "$path" \
+     && [ -z "$(pg_capture_foreign_echo "$path" "$marker")" ]; then
     printf 'pending\t%s\n' "$path"; return 0
   fi
   return 1
@@ -1123,30 +1148,264 @@ pg_attempt_snapshot() { # host owner repo pr round-key [exclude-marker] -> canon
     '{artifact:{kind:$kind,path:$path},charged_spend_epoch:$epoch,cleanup_pending:$cleanup,fresh_eligible:$fresh,marker:$marker,out:$out,recoverable:$recoverable,source:$source,state:$state,target:{host:$host,owner:$owner,pr:$pr,repo:$repo,round_key:$key},terminal:$terminal}'
 }
 
+# pg_dir_age_secs <dir>: seconds since <dir> was last modified, or failure when it cannot be read.
+# Creating the owner marker inside a directory updates that directory's mtime, so an UNMARKED
+# directory's age is the age of its mkdir.
+pg_dir_age_secs() {
+  local d="$1" mt now
+  mt="$(stat -c %Y "$d" 2>/dev/null || stat -f %m "$d" 2>/dev/null || true)"
+  case "$mt" in ''|*[!0-9]*) return 1;; esac
+  now="$(date +%s 2>/dev/null)"; case "$now" in ''|*[!0-9]*) return 1;; esac
+  echo $(( now - mt ))
+}
+
+# pg_dirlock_owner_count <dir>: how many owner.* markers the directory currently holds. A correctly
+# held guard has exactly one; two means a race let a second shell in and BOTH must stand down.
+pg_dirlock_owner_count() {
+  local d="$1" f n=0
+  for f in "$d"/owner.*; do [ -e "$f" ] && n=$(( n + 1 )); done
+  echo "$n"
+}
+
+# pg_dirlock_reclaim_dead <lockdir>: reclaim a mkdir-spinlock directory whose every owner is dead.
+# Ownership is a marker file named owner.<pid> INSIDE the directory whose CONTENTS are that pid's
+# start-time token, and this helper only ever (a) unlinks a dead marker by its exact name and
+# (b) rmdir()s the directory, which the kernel refuses unless it is empty. There is no rm -rf on a
+# shared pathname and no rename (gate #148 r1 P1, r2 P1).
+#
+# Three rules this helper must not lose, each of which cost a round:
+#
+#  1. ABSENCE IS NOT SUCCESS. The directory is probed first and a missing one returns 1. Reporting
+#     success for a directory that was never there made pg_reservation_guard_acquire spin forever
+#     at 100% CPU, ignoring its own wait bound, whenever mkdir failed for any reason other than
+#     EEXIST -- an unwritable or missing parent, for instance (v0.41 defect, reproduced).
+#  2. A RECYCLED PID IS NOT A LIVE OWNER. kill -0 alone wedges the guard permanently once the OS
+#     hands a dead owner's pid to an unrelated live process, so the marker carries pg_pid_token's
+#     process start time and liveness requires BOTH to match. Be precise about the precedent: this
+#     is the check pg_harvest_claimed applies on reclaim. pg_lock and pg_lock_n WRITE a `token`
+#     beside their `pid` but never read it back when they reclaim a dead-owner directory, so they
+#     still carry the recycled-pid hazard (and an unscoped rm -rf with it). This helper is
+#     deliberately STRICTER than they are; do not "align" it down to match them.
+#     Liveness must also be positively DISPROVED, never inferred from a failed measurement: a
+#     token that cannot be RECOMPUTED for a live pid fails closed exactly as an unreadable stored
+#     token does, or a transient /proc or `ps` failure unlinks a live owner's marker (r8 P0).
+#  3. AN UNMARKED DIRECTORY IS NOT AN ORPHAN YET. A contender that has just mkdir'd is about to
+#     write its marker. Deleting the directory in that window let the contender's later marker
+#     write land inside a REPLACEMENT directory another process had already claimed, so two live
+#     shells each believed they held the guard (v0.41 defect, reproduced: the previous comment
+#     claimed "the contender learns that when its marker creation fails", but the write succeeds
+#     because the pathname was re-created). An unmarked directory is therefore only reclaimed once
+#     it has sat unmarked for PRO_GATE_DIRLOCK_ORPHAN_GRACE seconds -- a bound a live contender
+#     never reaches and a process that died between mkdir and marker always does.
+#
+# Returns 0 when the directory is gone, 1 when it is held or too young to judge.
+pg_dirlock_reclaim_dead() {
+  local lockdir="$1" f pid tok cur had_marker=0 grace age
+  [ -d "$lockdir" ] || return 1
+  for f in "$lockdir"/owner.*; do
+    [ -e "$f" ] || continue
+    had_marker=1
+    pid="${f##*/owner.}"
+    case "$pid" in ''|*[!0-9]*) rm -f "$f" 2>/dev/null; continue;; esac
+    if kill -0 "$pid" 2>/dev/null; then
+      tok="$(head -c 64 "$f" 2>/dev/null | tr -d '\n')"
+      # An unreadable or tokenless marker cannot be disproved: fail closed and leave it held.
+      [ -n "$tok" ] || return 1
+      # The RECOMPUTED token must fail closed on exactly the same terms as the stored one. Reading
+      # it can fail transiently for a perfectly live pid -- a /proc read or a `ps` fork under
+      # memory pressure -- and an empty result then compares unequal to a valid stored token,
+      # falling through to unlink a LIVE owner's marker and letting a reclaimer take a guard whose
+      # holder is still inside it. Liveness must be positively DISPROVED before removal, never
+      # inferred from a failed measurement.
+      cur="$(pg_pid_token "$pid" 2>/dev/null || true)"
+      [ -n "$cur" ] || return 1
+      [ "$tok" = "$cur" ] && return 1
+    fi
+    rm -f "$f" 2>/dev/null
+  done
+  # pg_lock and pg_lock_n record their holder as a `pid` file with the token beside it,
+  # rather than as an owner.<pid> marker. Same question, same fail-closed rules, one
+  # implementation -- v0.41 deferred the guard's self-heal specifically so one hardened
+  # helper could serve all three call sites instead of two divergent ones. Their shape is
+  # read outside this function too (st_inflight in the engine, pg_harvest_claimed here),
+  # so it stays as it is and the reclaimer learns it.
+  if [ "$had_marker" = 0 ] && [ -e "$lockdir/pid" ]; then
+    pid="$(cat "$lockdir/pid" 2>/dev/null || true)"
+    case "$pid" in
+      ''|*[!0-9]*)
+        # A torn or empty record is not a live claim -- but it is NOT a marker either, and
+        # counting it as one skips rule 3 above. `echo "$$" > "$lockdir/pid"` opens with
+        # O_CREAT|O_TRUNC and writes a syscall later, so "exists but empty" is a state every
+        # live winner passes through on its way to publishing itself, and it is the PERSISTENT
+        # state when that write fails (the call is `|| true`). Treating it as a marker made a
+        # winner's directory reclaimable mid-write with no grace at all, which is exactly the
+        # double-entry rule 3 exists to prevent (v0.44.0 defect, reproduced: the same winner was
+        # kept one syscall earlier and removed one syscall later). Leave had_marker at 0 so the
+        # grace still has to elapse, and leave the file alone so a merely slow winner can still
+        # finish its own record.
+        : ;;
+      *)
+        had_marker=1
+        if kill -0 "$pid" 2>/dev/null; then
+          tok="$(head -c 64 "$lockdir/token" 2>/dev/null | tr -d '\n')"
+          # A tokenless lock is legacy: a live pid is the whole claim, so it holds.
+          [ -n "$tok" ] || return 1
+          # Same rule as above -- the recomputed token must fail closed too, or a transient
+          # read makes a live holder look dead and hands its lock to a reclaimer.
+          cur="$(pg_pid_token "$pid" 2>/dev/null || true)"
+          [ -n "$cur" ] || return 1
+          [ "$tok" = "$cur" ] && return 1
+        fi
+        rm -f "$lockdir/pid" "$lockdir/token" 2>/dev/null
+        ;;
+    esac
+  fi
+  if [ "$had_marker" = 0 ]; then
+    grace="${PRO_GATE_DIRLOCK_ORPHAN_GRACE:-5}"; case "$grace" in ''|*[!0-9]*) grace=5;; esac
+    age="$(pg_dir_age_secs "$lockdir")" || return 1
+    [ "$age" -ge "$grace" ] 2>/dev/null || return 1
+    # Past the grace the directory is provably abandoned -- a live winner records itself in
+    # microseconds -- so a torn record may be cleared here, where age has authorized it, and
+    # nowhere else. RE-READ it first: for the owner.<pid> shape the final rmdir is itself the
+    # check, because the kernel refuses a directory a contender has just written a marker into.
+    # Unlinking by name would throw that away, so re-reading restores the equivalent guarantee
+    # and narrows the window from the whole grace to the gap before rmdir.
+    if [ -e "$lockdir/pid" ]; then
+      # No `|| true` here, deliberately. An unreadable record and an EMPTY one are different
+      # facts, and `|| true` reports both as the empty string -- so a cat that merely failed
+      # (a fork under memory pressure, a stalled mount) would authorize deleting a record that
+      # may name a live owner. That is the same fail-open the token checks above refuse, and it
+      # would be a new instance of it in the one branch that unlinks another process's claim.
+      # A failed READ is not evidence of an absent owner: keep the lock and re-decide later.
+      pid="$(cat "$lockdir/pid" 2>/dev/null)" || return 1
+      case "$pid" in
+        ''|*[!0-9]*) rm -f "$lockdir/pid" "$lockdir/token" 2>/dev/null ;;
+        *) return 1 ;;   # a slow winner finished its record during the grace: it holds
+      esac
+    fi
+  fi
+  rmdir "$lockdir" 2>/dev/null || [ ! -d "$lockdir" ]
+}
+
+# Release a mkdir-fallback lock this process still owns. A holder whose directory was
+# reclaimed -- correctly, because it looked dead -- must never delete the replacement a live
+# process has since created at the same path. Check the recorded owner is still us, drop our
+# own two files by name, then rmdir, which refuses a directory that still holds anyone's.
+# Never rm -rf a pathname another live process may own by now (the same rule the reservation
+# guard's release follows).
+pg_dirlock_release_own() { # <lockdir> <pid>
+  local dir="$1" pid="$2" opid
+  [ -d "$dir" ] || return 0
+  opid="$(cat "$dir/pid" 2>/dev/null || true)"
+  [ "$opid" = "$pid" ] || return 0
+  rm -f "$dir/pid" "$dir/token" 2>/dev/null
+  rmdir "$dir" 2>/dev/null || true
+}
+
 # Shared guard for reservation writes/removes AND the fresh-run count+slot-acquire decision.
 # This makes the handoff atomic: an exit-9 run writes its durable reservation while it still
 # owns the process slot; no waiter can observe "slot released, reservation not counted" (or
 # compute capacity before the write and acquire the just-released slot on stale information).
 pg_reservation_guard_acquire() {
-  local lock; lock="$(pg_reservation_lock)"
+  local lock wait_s; lock="$(pg_reservation_lock)"
+  wait_s="${PRO_GATE_RESERVATION_GUARD_WAIT:-10}"; case "$wait_s" in ''|*[!0-9]*) wait_s=10;; esac
   if pg_have flock; then
-    { exec {PG_RESERVATION_GUARD_FD}>>"$lock"; } 2>/dev/null \
-      && flock -w 10 "$PG_RESERVATION_GUARD_FD" 2>/dev/null
-    return $?
+    { exec {PG_RESERVATION_GUARD_FD}>>"$lock"; } 2>/dev/null || { PG_RESERVATION_GUARD_FD=""; return 1; }
+    if ! flock -w "$wait_s" "$PG_RESERVATION_GUARD_FD" 2>/dev/null; then
+      # A timed-out acquire returns 1 to a caller that never calls release, so the descriptor
+      # must be closed HERE or every contended acquire leaks one fd for the life of the process
+      # (v0.41; pg_lock_n already closes its losing descriptors the same way).
+      eval "exec ${PG_RESERVATION_GUARD_FD}>&-" 2>/dev/null
+      PG_RESERVATION_GUARD_FD=""
+      return 1
+    fi
+    return 0
   fi
+  # macOS / no flock: a mkdir spinlock in the same family as pg_lock's, but with a stricter reclaim
+  # (see pg_dirlock_reclaim_dead: token-checked liveness, orphan grace, no rm -rf). Without it a guard
+  # directory left by a killed process wedged every later reservation write for the full wait, and
+  # a failed acquire left PG_RESERVATION_GUARD_DIR pointing at a directory this process did not
+  # own, so a later release could remove another process's guard. Ownership is the marker file
+  # owner.<pid> inside the directory and reclamation goes through pg_dirlock_reclaim_dead (gate
+  # #148 r1 P1 and r2 P1): the bare `rm -rf` that used to live here let two waiters that read the
+  # same dead pid both end up inside the guard, and let a remover orphaned by a dying holder
+  # delete the replacement a reclaimer had already re-created.
   PG_RESERVATION_GUARD_DIR="${lock}.d"
-  local waited=0
-  while ! mkdir "$PG_RESERVATION_GUARD_DIR" 2>/dev/null; do
-    waited=$(( waited + 1 )); [ "$waited" -ge 10 ] && return 1; sleep 1
+  # gate #148 r2 P1: $$ is the parent shell even inside a command substitution or subshell, so a
+  # restore running under $( ) would publish an owner pid that can die while the real holder lives.
+  # BASHPID names the shell that actually holds the guard and performs the guarded mutation, and it
+  # MUST be read by direct expansion here -- reading it inside $( ) would name the substitution's
+  # own short-lived subshell and reinstate exactly the defect it fixes.
+  #
+  # BASHPID is bash 4+. Stock macOS /bin/bash is 3.2, and macOS is also the platform with no flock,
+  # so the one shell that always reaches this fallback is the one that was silently falling back to
+  # $$ and re-opening r2 P1 (v0.41 defect).
+  #
+  # `exec` is load-bearing (gate #148 r5 P1). Bash replaces a command-substitution subshell with a
+  # lone simple command, so $PPID there names the shell that actually holds the guard. Adding any
+  # `|| fallback` INSIDE the substitution makes it a compound command, bash forks an extra subshell,
+  # and sh reports THAT subshell -- a pid which has already exited by the time the marker is
+  # published, whose /proc entry is gone, and which therefore yields an empty token and reads as
+  # dead to every reclaimer. A contender then reclaimed a guard whose real holder was still inside
+  # its critical section: the exact double-hold this release fixes, reintroduced by the fallback.
+  # Failure is handled OUT here and REFUSES the acquisition rather than publishing a wrong owner.
+  PG_RESERVATION_GUARD_OWNER="${BASHPID:-}"
+  if [ -z "$PG_RESERVATION_GUARD_OWNER" ]; then
+    PG_RESERVATION_GUARD_OWNER="$(exec sh -c 'echo "$PPID"' 2>/dev/null)"
+    case "$PG_RESERVATION_GUARD_OWNER" in
+      ''|*[!0-9]*) PG_RESERVATION_GUARD_DIR=""; PG_RESERVATION_GUARD_OWNER=""; return 1;;
+    esac
+  fi
+  local waited=0 spins=0 max_spins guard_token
+  # Reclaim retries are not sleeps, so they need their own bound or a pathological alternation of
+  # dead owners loops without ever reaching the wait bound.
+  max_spins=$(( wait_s * 100 + 100 ))
+  while :; do
+    if mkdir "$PG_RESERVATION_GUARD_DIR" 2>/dev/null; then
+      # Publish the start-time token so a recycled pid cannot later impersonate this owner, then
+      # confirm we are the ONLY owner. A second marker means a reclaimer took our still-empty
+      # directory and another shell re-created it at the same pathname, in which case our write
+      # landed in a guard we do not hold: stand down and retry rather than return a false hold.
+      #
+      # gate #148 r5 P1: the token must be NON-EMPTY before the marker is published. An empty token
+      # means the owner pid has no readable process, so every reclaimer reads this marker as dead
+      # and takes the guard while we are inside it. Refuse rather than publish an unprovable owner.
+      guard_token="$(pg_pid_token "$PG_RESERVATION_GUARD_OWNER" 2>/dev/null || true)"
+      if [ -n "$guard_token" ] \
+         && printf '%s' "$guard_token" \
+           > "$PG_RESERVATION_GUARD_DIR/owner.$PG_RESERVATION_GUARD_OWNER" 2>/dev/null \
+         && [ "$(pg_dirlock_owner_count "$PG_RESERVATION_GUARD_DIR")" = 1 ]; then
+        return 0
+      fi
+      rm -f "$PG_RESERVATION_GUARD_DIR/owner.$PG_RESERVATION_GUARD_OWNER" 2>/dev/null
+      rmdir "$PG_RESERVATION_GUARD_DIR" 2>/dev/null
+    elif [ -d "$PG_RESERVATION_GUARD_DIR" ] && pg_dirlock_reclaim_dead "$PG_RESERVATION_GUARD_DIR"; then
+      # mkdir failing while the directory does not exist is NOT contention (a missing or unwritable
+      # parent, say); it must fall through to the bounded wait instead of retrying forever.
+      spins=$(( spins + 1 ))
+      [ "$spins" -ge "$max_spins" ] && { PG_RESERVATION_GUARD_DIR=""; PG_RESERVATION_GUARD_OWNER=""; return 1; }
+      continue
+    fi
+    waited=$(( waited + 1 ))
+    [ "$waited" -ge "$wait_s" ] && { PG_RESERVATION_GUARD_DIR=""; PG_RESERVATION_GUARD_OWNER=""; return 1; }
+    sleep 1
   done
 }
 pg_reservation_guard_release() {
+  local dir owner
   if [ -n "${PG_RESERVATION_GUARD_FD:-}" ]; then
     eval "exec ${PG_RESERVATION_GUARD_FD}>&-" 2>/dev/null
     PG_RESERVATION_GUARD_FD=""
   fi
   if [ -n "${PG_RESERVATION_GUARD_DIR:-}" ]; then
-    rmdir "$PG_RESERVATION_GUARD_DIR" 2>/dev/null; PG_RESERVATION_GUARD_DIR=""
+    dir="$PG_RESERVATION_GUARD_DIR"; owner="${PG_RESERVATION_GUARD_OWNER:-}"
+    PG_RESERVATION_GUARD_DIR=""; PG_RESERVATION_GUARD_OWNER=""
+    # gate #148 r2 P1: unlink only OUR marker, by exact name, then rmdir. A remover orphaned by a
+    # holder that dies here cannot touch a replacement: the replacement's marker has another name
+    # and rmdir refuses a directory that still holds one. Never rm -rf a pathname another live
+    # process may own by now.
+    [ -n "$owner" ] && rm -f "$dir/owner.$owner" 2>/dev/null
+    rmdir "$dir" 2>/dev/null
   fi
 }
 
@@ -1567,7 +1826,7 @@ pg_report_capacity_holders() {
     esac
   done
   echo "  collect a finished one for FREE (no new spend, never re-run):" >&2
-  echo "    oracle-review.sh --harvest <marker> --out <path> --timeout 20m" >&2
+  echo "    oracle-review.sh --harvest <marker> --out <path> --timeout $(pg_harvest_hint_timeout)" >&2
 }
 
 # pg_reservation_state <marker>: echo the lifecycle state (8th field) of a reservation —
@@ -1924,8 +2183,9 @@ pg_round_record() {  # $1 = key; prune entries older than the window, append now
   # PG_ROUND_SPEND_EPOCH to the epoch actually appended — the round's charge time, which is
   # what trajectory history must be stamped with (#66 gate r3 P1). The marker's epoch is NOT
   # that moment: it is minted before the per-change lock AND the account-slot wait (each up to
-  # PRO_GATE_LOCK_WAIT, 2400s by default), so a queued run's history row could expire ~80 min
-  # before its own spend, or order concurrent runs by process start rather than charge order.
+  # PRO_GATE_LOCK_WAIT, 3900s by default since v0.41), so a queued run's history row could expire
+  # ~130 min before its own spend, or order concurrent runs by process start rather than charge
+  # order.
   # Best-effort
   # bookkeeping (same posture as pg_ledger_append): it must never fail a review, but every
   # fail-open path WARNS on stderr, because a silently unrecordable round means the budget
@@ -2266,14 +2526,10 @@ pg_filter_diff() {
   ' "$in" > "$out"
 }
 
-# pg_extract_verdict <file>: echo SHIP/FIX-FIRST/NEEDS-DISCUSSION from the terminal verdict
-# line. Shared with pg_is_review and trajectory history so formatting drift cannot make a
-# structurally-accepted review record UNKNOWN. The matcher tolerates leading bold/bullet/quote
-# markers and whitespace, and markers/space before the colon (`**VERDICT:**`, `- VERDICT :`).
+# pg_extract_verdict <file>: the final authoritative verdict must be within the last six
+# non-empty lines. Use the ownership scanner so quoted examples cannot supply SHIP authority.
 pg_extract_verdict() {
-  grep -vE '^[[:space:]]*$' "$1" 2>/dev/null | tail -n 6 \
-    | grep -iE '^[[:space:]]*[*_>#-]*[[:space:]]*VERDICT[*_[:space:]]*:' \
-    | grep -oiE 'SHIP|FIX-FIRST|NEEDS-DISCUSSION' | head -1 | tr '[:lower:]' '[:upper:]'
+  pg_capture_verdict_claims "$1" verdict
 }
 
 # pg_is_review <file>: true only when <file> looks like a COMPLETE review, not a truncated or
@@ -2397,11 +2653,20 @@ pg_trim_file() {
 # was provably written for THIS prompt — content heuristics can't be fooled into accepting a
 # foreign or stale conversation's answer. The engine strips the token before returning output.
 # ─────────────────────────────────────────────────────────────────────────────
-# pg_capture_nonce_ok <file> <marker>: rc 0 when the capture's tail carries this run's token.
+# pg_capture_nonce_ok <file> <marker>: the terminal authoritative verdict must echo this run.
+# Case-SENSITIVE on purpose, and the asymmetry with the browser side is the point (#166/#167).
+# This is an ACCEPTANCE predicate: rc 0 publishes the capture as this run's review. A false
+# positive here ships a possibly-foreign answer, so it fails closed and a case-only echo drift
+# stays nonce-less -- the run retries, costing liveness, never correctness. The browser-side
+# ownership checks in cdp-salvage.mjs are CONVICTION predicates: a false positive there
+# blacklists the conversation and discards a finished review permanently, so those fold case.
+# Fail closed where a wrong accept publishes; fail open where a wrong refusal destroys evidence.
+# #166 locked this direction with a test ("mis-cased own echo remains unbound without becoming a
+# foreign claim"); do not fold this comparison without retiring that test on the record.
 pg_capture_nonce_ok() {
   local f="$1" marker="$2"
   [ -s "$f" ] || return 1
-  tail -n 6 "$f" 2>/dev/null | grep -qF "(run marker: $marker)"
+  pg_capture_verdict_claims "$f" terminal | grep -qxF -- "$marker"
 }
 # pg_strip_nonce <file> <marker>: remove the echoed token (harmless when absent).
 pg_strip_nonce() {
@@ -2409,13 +2674,166 @@ pg_strip_nonce() {
   [ -s "$f" ] || return 0
   # Fixed-string removal via awk (the marker is regex-safe by charset, but the parentheses
   # around it are not; index/substr avoids regex entirely).
-  awk -v tok="(run marker: $marker)" '{
-    i = index($0, tok)
+  # The LOOKUP is case-folded and the SLICE is not (#167). This does NOT mirror
+  # pg_capture_nonce_ok, which stays case-sensitive by design; it mirrors cdp-salvage.mjs's
+  # stripMarkerEcho, because finalizerOwnership compares its stripped bytes against the bytes
+  # stripped here. One folding and the other not is a result-mismatch on a valid review. tolower() applies only to the search operands, so every other byte
+  # on the line is published exactly as the model wrote it. Same LC_ALL=C reasoning as
+  # pg_capture_nonce_ok: gawk's tolower() is locale-sensitive, and the C locale keeps
+  # index()/substr()/length() on one consistent byte basis.
+  LC_ALL=C awk -v tok="(run marker: $marker)" '
+  BEGIN { lower_tok = tolower(tok) }
+  {
+    i = index(tolower($0), lower_tok)
     if (i > 0) { $0 = substr($0, 1, i - 1) substr($0, i + length(tok)) ; sub(/[ \t]+$/, "") }
     print
   }' "$f" > "$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null
   rm -f "$tmp" 2>/dev/null
   return 0
+}
+
+# Review ownership is claimed by top-level authoritative verdicts, never by arbitrary
+# marker mentions. Mirror reviewVerdictClaims in bin/cdp-organizer-expressions.mjs.
+# Markdown quotes, indented examples and fenced code are reference text; the browser
+# preserves that context when collecting rendered blockquote/pre elements.
+# In CLAIMS mode, normalize inline-code around run-marker tokens so a code-wrapped
+# foreign marker still counts as foreign. Keep terminal ownership strictly canonical.
+# Scan the WHOLE response before accepting it: a foreign verdict after our own is just
+# as mixed as one before it.
+pg_capture_verdict_claims() { # file [verdict|terminal] -> claims, decision or terminal claims
+  # Read the file TWICE. A fence suppresses the lines inside it, but a fence that is never
+  # closed is not a code block -- it is a model that forgot a ``` -- and treating it as one
+  # made every later line invisible, INCLUDING this run's own terminal VERDICT. A complete,
+  # single-run, unambiguous review then read as "still generating" and was discarded and
+  # retried forever (gate #166 r3 P1; verified by two documents differing only by a closing
+  # fence). The first pass finds the opener still open at EOF; the second treats that one
+  # line as ordinary text so the tail is classified normally. Recovery stays fail-closed:
+  # mixed-claim detection runs over the recovered region too, so a foreign verdict hiding
+  # behind an unterminated fence is refused rather than published.
+  awk -v mode="${2:-claims}" '
+    NR == FNR {
+      p = $0
+      sub(/\r$/, "", p)
+      if (p ~ /^(    |\t)/) next
+      sub(/^ +/, "", p)
+      if (p ~ /^>/) next
+      if (match(p, /^(```+|~~~+)/)) {
+        prun = substr(p, 1, RLENGTH)
+        prest = substr(p, RLENGTH + 1)
+        if (pfence == "") { pfence = substr(prun, 1, 1); pwidth = length(prun); dangling = FNR }
+        else if (substr(prun, 1, 1) == pfence && length(prun) >= pwidth && prest ~ /^[ \t]*$/) { pfence = ""; dangling = 0 }
+      }
+      next
+    }
+    {
+      s = $0
+      if (s !~ /^[ \t\r]*$/) nonempty++
+      sub(/\r$/, "", s)
+      if (s ~ /^(    |\t)/) next
+      sub(/^ +/, "", s)
+      if (s ~ /^>/) next
+      if (match(s, /^(```+|~~~+)/) && FNR != dangling) {
+        run = substr(s, 1, RLENGTH)
+        rest = substr(s, RLENGTH + 1)
+        if (fence == "") { fence = substr(run, 1, 1); width = length(run) }
+        else if (substr(run, 1, 1) == fence && length(run) >= width && rest ~ /^[ \t]*$/) fence = ""
+        next
+      }
+      if (fence != "") next
+      if (tolower(s) !~ /^[*_# \t-]*verdict[*_ \t]*:[*_ \t]*(ship|fix-first|needs-discussion)([^a-z0-9_-]|$)/) next
+      last = nonempty; last_line = NR; terminal = ""
+      if (mode == "verdict") {
+        low = tolower(s)
+        match(low, /(ship|fix-first|needs-discussion)/)
+        decision = toupper(substr(low, RSTART, RLENGTH))
+        next
+      }
+      while (match(tolower(s), /\(run marker:[ \t]*`?pg-run-[a-z0-9.-]+`?[ \t]*\)/)) {
+        token = substr(s, RSTART, RLENGTH)
+        literal = token
+        s = substr(s, RSTART + RLENGTH)
+        sub(/^\([^:]*:[ \t]*/, "", token)
+        sub(/[ \t]*\)$/, "", token)
+        gsub(/^`|`$/, "", token)
+        if (mode == "terminal") {
+          if (literal == "(run marker: " token ")") terminal = terminal token "\n"
+        } else print token
+      }
+    }
+    END {
+      if (mode == "verdict" && decision != "" && nonempty - last < 6) print decision
+      if (mode == "terminal" && NR - last_line < 6) printf "%s", terminal
+    }
+  ' "$1" "$1"
+}
+
+pg_capture_foreign_echo() { # file marker -> first foreign authoritative claim, or nothing
+  pg_capture_verdict_claims "$1" | awk -v marker="$2" '
+    tolower($0) != tolower(marker) { print; exit }
+  '
+}
+
+# Pure acceptance predicate shared by fresh/direct capture, harvest and artifact replay.
+# rc 0: exact owned claim and no foreign claim; rc 1: no claim for this run (caller applies
+# its existing nonce/legacy rules); rc 2: foreign authoritative claim, including mixed answers
+# and a single verdict claiming two markers. Never cut, rewrite or delete the input.
+# Case-only echo drift stays nonce-less, as before; it is not another run.
+pg_capture_bind() {
+  local f="$1" marker="$2" claims
+  PG_CAPTURE_FOREIGN=""
+  [ -s "$f" ] || return 1
+  claims="$(pg_capture_verdict_claims "$f")" || { PG_CAPTURE_FOREIGN=unreadable; return 2; }
+  PG_CAPTURE_FOREIGN="$(printf '%s\n' "$claims" | awk -v marker="$marker" '
+    NF && tolower($0) != tolower(marker) { print; exit }
+  ')"
+  [ -z "$PG_CAPTURE_FOREIGN" ] || return 2
+  pg_capture_nonce_ok "$f" "$marker"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.42 (#164, gate r1 P2): the Oracle session name a run asks for.
+#
+# Oracle NORMALIZES a custom --slug before storing it (sessionManager.js slugify/normalizeCustomSlug:
+# lowercase, split into [a-z0-9]+ words, keep the FIRST 5, truncate each to 10 characters, join with
+# "-", and reject fewer than 3 words). A run marker handed over raw does not survive that:
+# "pg-run-StartupBros-com-pro-gate-166-1788719459-1312546" is stored as "pg-run-startupbro-com-pro",
+# dropping the PR number, launch epoch and pid — everything that made the marker unique — so EVERY
+# run in the repository asks for one name and Oracle disambiguates with the same collision counter
+# the pin was meant to retire. The name we send must therefore be a FIXED POINT of that normalizer:
+# then what we ask for is exactly what Oracle stores, which is what the reattach fallback addresses
+# when the run log carries no session id of its own.
+# ─────────────────────────────────────────────────────────────────────────────
+# pg_slug_normalize <text>: Oracle's normalization, reimplemented. Idempotent by construction.
+pg_slug_normalize() {
+  printf '%s\n' "$1" | awk '{
+    s = tolower($0); out = ""; n = 0
+    while (n < 5 && match(s, /[a-z0-9]+/)) {
+      w = substr(s, RSTART, RLENGTH); s = substr(s, RSTART + RLENGTH)
+      if (length(w) > 10) w = substr(w, 1, 10)
+      out = (out == "" ? w : out "-" w); n++
+    }
+    print out
+  }'
+}
+# pg_oracle_slug <marker>: the session name for a run marker — unique per invocation AND a fixed
+# point of pg_slug_normalize. A marker is "pg-run-<round key>-<epoch>-<pid>": the epoch and pid are
+# what make it unique, and the round key's last field (the PR number, or "diff") is what makes the
+# session recognizable in `oracle sessions`. Five words, none over ten characters, so Oracle stores
+# it verbatim. A marker of another shape still round-trips: it is normalized rather than trusted.
+#
+# Deliberately NOT prefixed "pg-run-": a run marker is a token this codebase scans for wherever
+# text might carry one (FOREIGN_MARKER_RE, foreignRunMarkerAfter, isThrottlePage), and the slug
+# travels in oracle's argv and run log. A session name that parses as a marker is a second thing
+# claiming to be one, which is the whole class of bug #164 is about.
+pg_oracle_slug() {
+  local marker="$1" pid rest epoch key keytail
+  pid="${marker##*-}"; rest="${marker%-*}"
+  epoch="${rest##*-}"; key="${rest%-*}"
+  keytail="$(printf '%s' "${key##*-}" | tr -cd 'A-Za-z0-9' | cut -c1-10)"
+  case "$epoch$pid" in
+    ''|*[!0-9]*) pg_slug_normalize "pro-gate-review-$marker" ;;
+    *) pg_slug_normalize "pro-gate-${keytail:-review}-$epoch-$pid" ;;
+  esac
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2426,10 +2844,21 @@ pg_strip_nonce() {
 # the 24h sweeps: these are the durable record (bounded by review volume, a few KB each).
 # ─────────────────────────────────────────────────────────────────────────────
 pg_completed_dir() { echo "${PRO_GATE_COMPLETED_DIR:-$PRO_GATE_HOME/completed}"; }
+# Hash through STDIN so the pathname is invisible to the tool (#168). GNU sha256sum and
+# shasum -a 256 frame their output line around the filename and escape that WHOLE line with a
+# leading backslash when the name carries a backslash, a CR or a newline, so `awk '{print $1}'`
+# reads `\<hex>`; openssl prints `SHA2-256(<name>)= <hex>`, whose $NF is the name's own last
+# token once the name contains a newline. Either way the digest binds to nothing — not to the
+# same bytes hashed elsewhere, and not to itself on recovery: pg_publish_log_proof stores the
+# digest that pg_verified_log_lacks then recomputes, and a `\<hex>` is rejected by that reader's
+# own 64-hex shape check, so a transcript under such a path fails closed against itself.
+# The redirect belongs INSIDE a group whose stderr is discarded: a failed redirect is the
+# shell's own diagnostic, raised before a `2>` on the command itself is installed, so the naive
+# rewrite leaks `No such file or directory` for a missing file where the pathname form was silent.
 pg_sha256() {  # <file>: echo the hex digest, or nothing when no tool is available
-  if pg_have sha256sum; then sha256sum "$1" 2>/dev/null | awk '{print $1}'
-  elif pg_have shasum; then shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
-  elif pg_have openssl; then openssl dgst -sha256 "$1" 2>/dev/null | awk '{print $NF}'
+  if pg_have sha256sum; then { sha256sum < "$1" | awk '{print $1}'; } 2>/dev/null
+  elif pg_have shasum; then { shasum -a 256 < "$1" | awk '{print $1}'; } 2>/dev/null
+  elif pg_have openssl; then { openssl dgst -sha256 < "$1" | awk '{print $NF}'; } 2>/dev/null
   fi
 }
 # pg_signal_producer <signal> <pid>: signal Oracle's whole PROCESS GROUP, falling back to the pid
@@ -2480,6 +2909,8 @@ pg_completed_write() {  # <marker> <file>: write-once; an existing artifact is n
   local marker="$1" f="$2" dir rc
   pg_reservation_marker_ok "$marker" || return 1
   [ -s "$f" ] || return 1
+  pg_capture_bind "$f" "$marker" && rc=0 || rc=$?
+  [ "$rc" != 2 ] || return 1
   dir="$(pg_completed_dir)"
   mkdir -p "$dir" 2>/dev/null || return 1
   # Atomic NO-CLOBBER install (gate #54 r14): link(2) fails when the artifact exists, so
@@ -2506,6 +2937,8 @@ pg_completed_lookup() {  # <marker> <out>: place the artifact at <out>; rc 0 on 
   pg_reservation_marker_ok "$marker" || return 1
   src="$(pg_completed_dir)/$marker"
   { [ -s "$src" ] && [ ! -L "$src" ] && pg_is_review "$src"; } || return 1
+  pg_capture_bind "$src" "$marker" && rc=0 || rc=$?
+  [ "$rc" != 2 ] || return 1
   [ "$src" = "$out" ] && return 0
   # Copy-then-rename only — never pre-delete the destination (gate #54 r4 P2): a copy/rename
   # failure must leave any existing valid output intact, not destroy it and then fail.
@@ -2653,6 +3086,38 @@ pg_review_decision_emit() { # action reason facts snapshot-digest applicable-ref
 
 pg_review_decision_reject() { # reason snapshot; never reflect rejected untrusted data
   pg_review_decision_emit stop-without-new-review "$1" '{}' "$2" ''
+}
+
+# Shared envelope validator for bash consumers (v0.41). The daemon used to carry this schema
+# privately, which made it the one renderer of the closed action table no conformance test
+# covered. Every bash consumer now validates a saved decision here: exact key sets, the installed
+# runtime's contract identity, the closed action/effect/execution-class table, no status or
+# next_action field anywhere, no control characters, and finally a byte-identical re-run of the
+# pure reducer over the envelope's own facts, so a fabricated outer action cannot ride on
+# otherwise plausible JSON. Files must be regular, non-symlink, and at most 64 KiB.
+pg_review_decision_envelope_valid() { # decision-file
+  local decision="$1" canonical facts expected
+  [ -f "$decision" ] && [ ! -L "$decision" ] && command -v jq >/dev/null 2>&1 || return 1
+  [ "$(wc -c < "$decision" 2>/dev/null | tr -d ' ')" -le 65536 ] || return 1
+  jq -e --arg cd "$(pg_review_decision_contract_digest)" --arg xd "$(pg_review_decision_corpus_digest)" '
+    type == "object" and keys == ["action","contract","effect_request","facts","observation","reason"] and
+    .contract == {contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,corpus_digest:$xd} and
+    (.action | IN("collect-existing-result","recover-existing-review","fix-review-findings","prepare-matching-review-evidence","run-granted-review","stop-without-new-review","allow-existing-merge-workflow","ask-named-product-choice")) and
+    (. as $envelope | .effect_request | type == "object" and keys == ["action","applicable_ref","contract_digest","effect","execution_class","snapshot_digest","target"] and
+      .effect == .action and .contract_digest == $cd and
+      (.snapshot_digest | type == "string" and test("^[0-9a-f]{64}$")) and .target == $envelope.facts.target and
+      ((.action == "collect-existing-result" or .action == "recover-existing-review" or .action == "run-granted-review") and .execution_class == "runtime-guarded-effect" or
+       ((.action == "fix-review-findings" or .action == "prepare-matching-review-evidence") and .execution_class == "agent-task") or
+       ((.action == "stop-without-new-review" or .action == "allow-existing-merge-workflow") and .execution_class == "report-only") or
+       (.action == "ask-named-product-choice" and .execution_class == "named-product-choice"))) and
+    (.effect_request.action == .action) and
+    ([.. | objects | keys[] | select(. == "status" or . == "next_action")] | length == 0) and
+    ([.. | strings | select(test("[[:cntrl:]]"))] | length == 0)
+  ' "$decision" >/dev/null 2>&1 || return 1
+  facts="$(jq -cS .facts "$decision" 2>/dev/null)" || return 1
+  expected="$(pg_review_decision_reduce "$facts")" || return 1
+  canonical="$(pg_review_json_canonical "$(<"$decision")")" || return 1
+  [ "$canonical" = "$expected" ]
 }
 
 pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read stdin

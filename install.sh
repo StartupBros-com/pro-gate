@@ -34,6 +34,8 @@ PROXY_ARGS=()
 TMP=""
 BACKUP=""
 DEPLOYING=0
+ENV_MIGRATION_ACTIVE=0
+ENV_DEPLOY=""
 
 usage() {
   cat <<'EOF'
@@ -82,7 +84,9 @@ cleanup() {
     for f in lib.sh oracle-review.sh pro-gate-doctor.sh pro-gate-stats.sh pro-gate-autoupdate.sh cdp-salvage.mjs cdp-organizer-expressions.mjs daemon.sh run-daemon.sh run-oracle-chrome.sh login-view.sh review-decision-v1.json VERSION EXPECTED_VERSION .deploy-stamp; do
       if [ -e "$BACKUP/$f" ]; then mv -f "$BACKUP/$f" "$PRO_GATE_HOME/$f"; else rm -f "$PRO_GATE_HOME/$f"; fi
     done
+    [ "$ENV_MIGRATION_ACTIVE" = 1 ] && mv -f "$BACKUP/.env" "$PRO_GATE_HOME/.env"
   fi
+  [ -n "$ENV_DEPLOY" ] && rm -f "$ENV_DEPLOY"
   [ "$LOCK_ACQUIRED" = 1 ] && rm -rf "$LOCKDIR"
   if [ "$REAPER_LOCK_ACQUIRED" = 1 ] && [ "$(cat "$REAPER_LOCKDIR/owner" 2>/dev/null || true)" = "$$ $SELF_START" ]; then
     rm -f "$REAPER_LOCKDIR/owner"
@@ -312,7 +316,19 @@ for f in daemon.sh run-daemon.sh run-oracle-chrome.sh login-view.sh; do put "$SO
 # Deploy verified compatibility metadata before version/stamp publication. A failed write invokes
 # cleanup rollback, so no live runtime observes a new VERSION with an old identity record.
 put_data "$IDENTITY_FILE" "$PRO_GATE_HOME/review-decision-v1.json"
-[ -f "$PRO_GATE_HOME/.env" ] || cp "$SOURCE_ROOT/.env.example" "$PRO_GATE_HOME/.env"
+if [ ! -f "$PRO_GATE_HOME/.env" ]; then
+  cp "$SOURCE_ROOT/.env.example" "$PRO_GATE_HOME/.env"
+elif grep -Fxq 'PRO_GATE_LOCK_WAIT=2400                # seconds a queued review waits before giving up' "$PRO_GATE_HOME/.env"; then
+  # v0.40 generated this exact line. Treat every other spelling as operator-owned config.
+  cp -p "$PRO_GATE_HOME/.env" "$BACKUP/.env"
+  ENV_DEPLOY="$PRO_GATE_HOME/.env.deploy.$$"
+  install -m 0600 /dev/null "$ENV_DEPLOY"
+  sed 's/^PRO_GATE_LOCK_WAIT=2400                # seconds a queued review waits before giving up$/PRO_GATE_LOCK_WAIT=3900                # seconds to wait for account capacity (was 2400 before v0.41)/' \
+    "$PRO_GATE_HOME/.env" > "$ENV_DEPLOY"
+  ENV_MIGRATION_ACTIVE=1
+  mv -f "$ENV_DEPLOY" "$PRO_GATE_HOME/.env"
+  ENV_DEPLOY=""
+fi
 # .env can hold keys (PRO_GATE_PLUGIN_KEY etc.): owner-only, regardless of the box's umask
 # or the perms a pre-existing copy already carries. A chmod failure is a hard stop BEFORE
 # the version/deploy stamps land (#63 gate r2 P2): silently publishing a "successful"

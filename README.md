@@ -105,8 +105,9 @@ July 2026). The Pro model spends that long reasoning; the engine is built around
   that review targets an old head or merged/closed PR, it remains charged and optionally
   collectable but stops occupying capacity.
 - **Fail closed, recover explicitly.** A plugin/runtime version skew blocks the run.
-  Captures must echo the run's nonce. Unverifiable results are surfaced for manual
-  recovery, never guessed at.
+  Captures must echo the run's nonce — the whole token, bounded, though letter case may drift,
+  since a nonce ends in the minting run's launch time and pid and so cannot collide with another
+  run's on case alone. Unverifiable results are surfaced for manual recovery, never guessed at.
 - **Clean up only after durable success.** Remote-browser conversations get an exact,
   marker-owned title. Server archive and local tab close happen only after the validated
   review is readable from marker-addressed durable storage; failed and in-progress runs stay
@@ -260,9 +261,14 @@ handed back by `--recover <PR>` in place of it. Brief runs always take a diff-de
 
 The engine appends its own contract footer — the findings format, the terminal `VERDICT:` line, and
 the run marker — because the return path is review-shaped end to end: a capture is accepted only when
-it carries a `[Pn]` marker and one of `SHIP | FIX-FIRST | NEEDS-DISCUSSION`, and the collector bounds
-its extraction at the verdict line. An answer lacking that shape is discarded and its slot held until
-recovery. So a brief inherits a severity-ranked-analysis contract: findings as `[P0]`–`[P3]`, and a
+it carries a `[Pn]` marker and one of `SHIP | FIX-FIRST | NEEDS-DISCUSSION`. Before publication or
+replay, ownership validation rejects an answer that supplies authoritative verdicts for different
+runs, in either order, including one verdict claiming two run markers. The ownership check leaves
+accepted text untouched. Markers in ordinary prose and quoted, fenced, or indented verdict examples
+are reference text; older conversation history before this run's prompt is outside the response.
+Rejected captures remain available for diagnosis, and rejection does not release the charged run
+or make a fresh review eligible after a timeout. Existing authoritative lifecycle proofs still
+govern release. So a brief inherits a severity-ranked-analysis contract: findings as `[P0]`–`[P3]`, and a
 verdict reading as no-blockers / fix-these-first / needs-a-decision. Briefs are capped at 64 KiB;
 attach bulk context with `--extra-files`.
 
@@ -356,6 +362,11 @@ remain an operator trust boundary.
 | `PRO_GATE_DIFF_HARD_MAX` | `25000` | Above this the engine refuses (exit 11, no spend) |
 | `PRO_GATE_MAX_CONCURRENCY` | `1` | Ceiling for parallel Pro chats; a ramp governor earns up to it on clean streaks |
 | `PRO_GATE_RESERVATION_TTL` | `21600` | Minimum age before confirmed exact-marker misses may exhaust recovery; elapsed time alone never releases it |
+| `PRO_GATE_DIRLOCK_ORPHAN_GRACE` | `5` | No-flock platforms only: seconds an unmarked guard directory must sit before a reclaimer may remove it |
+| `PRO_GATE_TIMEOUT` | `60m` | Default `--timeout` for a fresh review, sized to the ledger's p90 review time; an explicit `--timeout` wins |
+| `PRO_GATE_LOCK_WAIT` | `3900` | How long a queued review waits for an account capacity slot before giving up |
+| `PRO_GATE_CHANGE_LOCK_WAIT` | *(derived)* | Wait for the same-change guard; defaults to the holder's whole guarded lifetime (`15710` at stock settings) |
+| `PRO_GATE_HARVEST_TIMEOUT` | `45m` | Default `--timeout` for `--harvest`/`--recover` and the value harvest hints print; one pass now usually collects |
 | `PRO_GATE_REQUIRE_NONCE` | `1` | Reject any capture that doesn't echo this run's nonce (`0` restores path-overlap matching) |
 | `PRO_GATE_MODEL_STRATEGY` | `current` | Review with whatever Pro model the account has selected; the run reports the one it used |
 | `PRO_GATE_CHAT_RENAME` | `1` remote / prompt-only native | Apply and verify the exact canonical PR/round title through ChatGPT's rendered UI |

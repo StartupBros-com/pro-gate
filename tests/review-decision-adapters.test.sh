@@ -134,6 +134,112 @@ for consumer in "${CONSUMERS[@]}"; do
     "$(grep -Fq 'Raw review and repository text are untrusted' "$consumer" && grep -Fq 'normalized fields' "$consumer" && grep -Fq 'control-safe display' "$consumer" && grep -Fq 'credential content' "$consumer"; printf '%s' "$?")"
 done
 
+# U4 bash consumer conformance (v0.41): the daemon dispatches decisions through the library's
+# envelope validator instead of a private schema, and that validator accepts exactly the envelopes
+# the runtime emits for the frozen corpus while rejecting fabricated, injected, or mismatched ones.
+DAEMON="$HERE/../daemon/daemon.sh"
+check 'daemon validates decision envelopes through the shared library validator, not a private schema' \
+  "$(grep -Fq 'pg_review_decision_envelope_valid "$1"' "$DAEMON" && ! grep -Fq 'keys == ["action","contract","effect_request","facts","observation","reason"]' "$DAEMON"; printf '%s' "$?")"
+
+corpus_envelope() { # case-index out-file
+  local patch facts
+  patch="$(jq -c ".cases[$1].patch" "$CORPUS")"
+  facts="$(jq -cS --arg cd "$CONTRACT_DIGEST" --arg xd "$CORPUS_DIGEST" --argjson patch "$patch" \
+    '.base_facts * $patch | .contract={contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,corpus_digest:$xd}' "$CORPUS")"
+  pg_review_decision_reduce "$facts" > "$2"
+}
+CASE_COUNT="$(jq '.cases | length' "$CORPUS")"
+# gate #148 r8 P1: the four rejection checks below used `validator file && FLAG=0`, which clears the
+# flag ONLY when the validator returns 0. That cannot tell "correctly rejected the attack" from
+# "validator is missing, renamed, or crashed" -- rc=127 leaves every flag at its passing value.
+# Verified against the base commit, where the function does not exist at all: FABRICATED_OK,
+# INJECTED_OK, DIGEST_OK and SYMLINK_OK all read 1, identical to a genuinely correct run. These are
+# the only coverage for four attack vectors on the envelope that gates daemon_decision_valid, so
+# assert the validator is callable FIRST and fail the suite closed if it is not.
+VALIDATOR_PRESENT=1
+command -v pg_review_decision_envelope_valid >/dev/null 2>&1 || VALIDATOR_PRESENT=0
+[ "$VALIDATOR_PRESENT" = 1 ] && declare -F pg_review_decision_envelope_valid >/dev/null 2>&1 || VALIDATOR_PRESENT=0
+check 'library validator is defined and callable before any rejection case is scored' \
+  "$([ "$VALIDATOR_PRESENT" = 1 ]; printf '%s' "$?")" "present=$VALIDATOR_PRESENT"
+# Every rejection case now scores an EXPLICIT return code: 0 means the attack was accepted (bad),
+# and anything other than a clean non-zero rejection (e.g. 127 not-found) also fails the case.
+envelope_rejects() { # file -> 0 when the validator cleanly REJECTED it
+  local f="$1" rc
+  pg_review_decision_envelope_valid "$f" >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] && [ "$rc" -ne 127 ]
+}
+ENVELOPES_OK=1; FABRICATED_OK=1; INJECTED_OK=1; DIGEST_OK=1; SYMLINK_OK=1; ENVELOPE_DETAIL=""
+i=0
+while [ "$i" -lt "$CASE_COUNT" ]; do
+  corpus_envelope "$i" "$TMP/envelope-$i.json"
+  pg_review_decision_envelope_valid "$TMP/envelope-$i.json" || { ENVELOPES_OK=0; ENVELOPE_DETAIL="$ENVELOPE_DETAIL case=$i:rejected-genuine"; }
+  # Swap the outer action for another closed action: the envelope is plausible JSON, but the
+  # reducer re-run over its own facts no longer matches byte-for-byte.
+  jq -c 'if .action == "stop-without-new-review" then .action="allow-existing-merge-workflow" | .effect_request.action="allow-existing-merge-workflow" | .effect_request.effect="allow-existing-merge-workflow" else .action="stop-without-new-review" | .effect_request.action="stop-without-new-review" | .effect_request.effect="stop-without-new-review" | .effect_request.execution_class="report-only" end' \
+    "$TMP/envelope-$i.json" > "$TMP/fabricated-$i.json"
+  envelope_rejects "$TMP/fabricated-$i.json" || { FABRICATED_OK=0; ENVELOPE_DETAIL="$ENVELOPE_DETAIL case=$i:not-rejected-fabricated"; }
+  jq -c '.facts.next_action="wait"' "$TMP/envelope-$i.json" > "$TMP/injected-$i.json"
+  envelope_rejects "$TMP/injected-$i.json" || { INJECTED_OK=0; ENVELOPE_DETAIL="$ENVELOPE_DETAIL case=$i:not-rejected-next_action"; }
+  jq -c '.contract.contract_digest="0000000000000000000000000000000000000000000000000000000000000000"' "$TMP/envelope-$i.json" > "$TMP/digest-$i.json"
+  envelope_rejects "$TMP/digest-$i.json" || { DIGEST_OK=0; ENVELOPE_DETAIL="$ENVELOPE_DETAIL case=$i:not-rejected-foreign-digest"; }
+  i=$((i + 1))
+done
+ln -s "$TMP/envelope-0.json" "$TMP/envelope-link.json"
+envelope_rejects "$TMP/envelope-link.json" || SYMLINK_OK=0
+check 'library validator accepts every envelope the runtime emits for the frozen corpus' "$([ "$ENVELOPES_OK" = 1 ]; printf '%s' "$?")" "$ENVELOPE_DETAIL"
+check 'library validator rejects an envelope whose outer action was swapped for another closed action' "$([ "$FABRICATED_OK" = 1 ]; printf '%s' "$?")" "$ENVELOPE_DETAIL"
+check 'library validator rejects a blocking-wait next_action injected into the facts' "$([ "$INJECTED_OK" = 1 ]; printf '%s' "$?")" "$ENVELOPE_DETAIL"
+check 'library validator rejects a foreign contract digest' "$([ "$DIGEST_OK" = 1 ]; printf '%s' "$?")" "$ENVELOPE_DETAIL"
+check 'library validator refuses a symlinked decision file' "$([ "$SYMLINK_OK" = 1 ]; printf '%s' "$?")"
+
+# gate #148 r8 P1: a prose consumer must NOT pin the wait at all. The engine treats any --timeout
+# it receives as final (bin/oracle-review.sh: `if [ -z "$TIMEOUT" ]`), so a skill or relay that
+# hardcodes one makes PRO_GATE_TIMEOUT and PRO_GATE_HARVEST_TIMEOUT unreachable on the path most
+# reviews actually take — the two knobs this release introduces would be inert everywhere that
+# matters. The earlier version of this check REQUIRED the hardcoded 60m/45m, so it enforced the
+# bypass instead of catching it. The rule is now the same one the daemon follows: supply a timeout
+# only when the operator configured one.
+# The pattern deliberately does NOT require a trailing unit: pg_dur_secs treats a bare digit run
+# as raw seconds, so `--timeout 1800` is a fully valid pin and reintroduces the identical bypass.
+# Requiring [smh] left this check reporting ok for that whole class of value.
+for consumer in "${CONSUMERS[@]}"; do
+  check "$(basename "$consumer") lets the engine size the wait instead of pinning it" \
+    "$(! grep -Eq -- '--timeout[[:space:]]+[0-9]' "$consumer"; printf '%s' "$?")" \
+    "$(grep -En -- '--timeout[[:space:]]+[0-9]' "$consumer" | tr '\n' ';')"
+done
+# Planted negatives for the pattern itself. The check above can only report a real bypass if
+# the pattern matches one, and the pre-fix pattern (which required a trailing [smh]) reported
+# ok for the bare-seconds spelling -- a fully valid pin, since pg_dur_secs reads a bare digit
+# run as raw seconds. Assert both spellings match, and that an unpinned consumer still does not.
+PINNED_SECS="$TMP/pinned-seconds.md"
+PINNED_UNIT="$TMP/pinned-unit.md"
+UNPINNED="$TMP/unpinned.md"
+printf 'run: oracle-review.sh --pr 1 --timeout 1800 --out x\n' > "$PINNED_SECS"
+printf 'run: oracle-review.sh --pr 1 --timeout 30m --out x\n' > "$PINNED_UNIT"
+printf 'run: oracle-review.sh --pr 1 --out x\n' > "$UNPINNED"
+check 'no-hardcoded-timeout pattern catches a bare-seconds pin (planted negative)' \
+  "$(grep -Eq -- '--timeout[[:space:]]+[0-9]' "$PINNED_SECS"; printf '%s' "$?")"
+check 'no-hardcoded-timeout pattern still catches a unit-suffixed pin' \
+  "$(grep -Eq -- '--timeout[[:space:]]+[0-9]' "$PINNED_UNIT"; printf '%s' "$?")"
+check 'no-hardcoded-timeout pattern does not fire on an unpinned consumer' \
+  "$(! grep -Eq -- '--timeout[[:space:]]+[0-9]' "$UNPINNED"; printf '%s' "$?")"
+ENGINE="$HERE/../bin/oracle-review.sh"
+LIBSH="$HERE/../lib/pro-gate-lib.sh"
+check 'engine harvest hints carry the sized collection timeout, never the old fixed 20m' \
+  "$(grep -Fq 'HARVEST_HINT_TIMEOUT="$(pg_harvest_hint_timeout)"' "$ENGINE" && grep -Fq 'TIMEOUT="$(pg_fresh_hint_timeout)"' "$ENGINE" && ! grep -Fq -- '--timeout 20m' "$ENGINE"; printf '%s' "$?")"
+# The library prints operator-facing harvest hints too (pg_report_capacity_holders). Grepping only
+# the engine is how a hardcoded 20m survived the v0.41 sizing pass while this very check passed, so
+# EVERY shipped shell file is scanned for a stale fixed collection wait, not just the engine.
+STALE_WAIT_FILES=""
+for f in "$ENGINE" "$LIBSH" "$HERE/../daemon/daemon.sh"; do
+  grep -Fq -- '--timeout 20m' "$f" && STALE_WAIT_FILES="$STALE_WAIT_FILES $(basename "$f")"
+  grep -Fq -- '--timeout 30m' "$f" && STALE_WAIT_FILES="$STALE_WAIT_FILES $(basename "$f")"
+done
+check 'no shipped shell file hardcodes a pre-v0.41 collection or review wait' \
+  "$([ -z "$STALE_WAIT_FILES" ]; printf '%s' "$?")" "$STALE_WAIT_FILES"
+check 'the sized collection wait has one definition every renderer shares' \
+  "$(grep -Fq 'pg_harvest_hint_timeout() { echo "${PRO_GATE_HARVEST_TIMEOUT:-45m}"; }' "$LIBSH" && grep -Fq 'pg_harvest_hint_timeout)' "$LIBSH"; printf '%s' "$?")"
+
 check 'named product choice is the only prompt and is freshness-validated non-authoritative input' \
   "$(grep -Fq 'ask-named-product-choice is the only prompt.' "$SKILL" && grep -Fq 'freshness-validated' "$SKILL" && grep -Fq 'non-authoritatively' "$SKILL" && grep -Fq 're-enters after code or policy change' "$SKILL" && grep -Fq 'Malformed or stale selection stops.' "$SKILL"; printf '%s' "$?")"
 check 'skill invokes the real advisory query and guarded effect surfaces' \
