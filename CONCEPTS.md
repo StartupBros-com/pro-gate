@@ -36,6 +36,14 @@ The proof is external to the attempt's own execution: it comes from the reposito
 
 Collection or reconciliation of one canonically identified attempt without a new submission. Ambiguous ownership fails closed rather than selecting a plausible conversation or spending again.
 
+### Acceptance Predicate / Conviction Predicate
+
+The two classes of answer to "is this captured answer ours?", distinguished by what being wrong costs rather than by what they compare.
+
+An **acceptance** predicate publishes a capture as this run's review, so a false positive presents a possibly-foreign answer as authoritative; it fails closed, and a near-miss costs a retry. A **conviction** predicate declares a conversation to be another run's, so a false positive blacklists it, discards the memo locating it, and destroys a finished answer the account already paid for; it fails open.
+
+The same identifier can therefore be compared at different strictness in the two classes without inconsistency. Treating them as one question and picking a single global strictness is wrong in one direction by construction.
+
 ### Conversation Memo
 
 The conversation URL remembered for a marker so later passes can find the same conversation without rescanning. A memo is authoritative only while its conversation id has the shape of a real conversation id; a memo that fails that check, or that proves to carry foreign content, is revoked so the next pass rescans every candidate. A blank render of a real-id memo is a transient, not a miss, and does not revoke it.
