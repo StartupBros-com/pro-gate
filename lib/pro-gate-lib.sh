@@ -294,8 +294,35 @@ pg_lock() {
     fi
     return 0   # unwritable lock path -> proceed unlocked (preserves prior behavior)
   fi
-  local lockdir="${lockfile}.d" start
+  local lockdir="${lockfile}.d" start spins=0 max_spins
   start=$(date +%s)
+  # A successful reclaim is not a wait: it retries mkdir at once, spending neither the sleep below
+  # nor the wait bound beside it. That is progress only while it is finite, so the reclaim path
+  # carries its own bound, exactly as pg_reservation_guard_acquire's does and for the same reason
+  # (#189). Without one, sustained reclaim-success with mkdir still failing -- the pathological
+  # alternation of dead owners, another process re-creating this pathname between our reclaim and
+  # our mkdir -- retried forever at 100% CPU and never honoured wait_s at all.
+  #
+  # The counter is the ONLY bound on that path, deliberately, and an elapsed check does NOT belong
+  # beside it: it would throw away a reclaim that had just succeeded, and the free lock with it.
+  # A directory orphaned between its mkdir and its owner record is reclaimable only once it has
+  # sat unmarked for PRO_GATE_DIRLOCK_ORPHAN_GRACE (default 5s), which a waiter reaches one sleep
+  # AFTER a stock 5s budget has already run out -- so the reclaim that recovers a crashed run is
+  # routinely the late one. It acquired the lock before this change and it must keep acquiring it;
+  # crash recovery is the case this whole branch exists for. Reproduced at the shipped 5s/5s
+  # defaults during review, with a regression test beside the spin test.
+  #
+  # Sized off wait_s but computed from a SANITIZED copy, never by overwriting wait_s: the value
+  # arrives from operator env knobs (PRO_GATE_CHANGE_LOCK_WAIT and friends) and is handed to
+  # `flock -w` above, so it must keep behaving exactly as it does today. `10#` forces base ten --
+  # a zero-padded budget like `08` is not a valid OCTAL literal, and bash aborts the whole function
+  # on that arithmetic error, refusing even an uncontended lock. The digit clamp keeps an absurd
+  # budget from overflowing int64 into a NEGATIVE bound, which would compare true on the first
+  # reclaim and refuse a lock whose owner is provably dead. Both were caught in review, both are
+  # regressions this bound would otherwise have introduced, and both have their own test.
+  max_spins="$wait_s"; case "$max_spins" in ''|*[!0-9]*) max_spins=2400;; esac
+  [ "${#max_spins}" -le 9 ] || max_spins=2400
+  max_spins=$(( 10#$max_spins * 100 + 100 ))
   while ! mkdir "$lockdir" 2>/dev/null; do
     # The old inline reclaim read the owner pid, and on a dead one rm -rf'd the directory and
     # retried. Three things were wrong with it and all three are the reclaimer's job now:
@@ -304,7 +331,10 @@ pg_lock() {
     # on the line below was never read back, so a recycled pid read as the original owner.
     # Racing this is safe -- reclaiming is not the mutual exclusion, mkdir is, and the loser
     # of that simply comes round again.
-    if ! pg_dirlock_reclaim_dead "$lockdir" 2>/dev/null; then
+    if pg_dirlock_reclaim_dead "$lockdir" 2>/dev/null; then
+      spins=$(( spins + 1 ))
+      [ "$spins" -ge "$max_spins" ] && return 1
+    else
       [ $(( $(date +%s) - start )) -ge "$wait_s" ] && return 1
       sleep 2
     fi
