@@ -36,19 +36,22 @@ validate_contract_and_corpus() { # contract corpus
     (.action_effects | length == 8 and ([.[].action] | unique | length == 8) and ([.[].execution_class] | unique | sort) == ["agent-task","named-product-choice","report-only","runtime-guarded-effect"]) and
     ([.action_effects[] | select(.action != .effect)] | length == 0) and
     ([.action_effects[] | select(.execution_class == "named-product-choice")] | length == 1) and
-    ([.action_effects[] | select(.execution_class == "named-product-choice") | .action] == ["ask-named-product-choice"])
+    ([.action_effects[] | select(.execution_class == "named-product-choice") | .action] == ["ask-named-product-choice"]) and
+    (.reasons | index("account-cooldown-active") != null)
   ' "$contract" >/dev/null || return 1
 
   jq -e --slurpfile contract "$contract" '
     .contract_id == $contract[0].contract_id and .corpus_version == 1 and
-    (.base_facts | keys | sort) == ["active_index","completed_results","evidence","governor","input","named_choice","observation","prior_review","reservation","target","transport"] and
+    (.base_facts | keys | sort) == ["active_index","completed_results","cooldown","evidence","governor","input","named_choice","observation","prior_review","reservation","target","transport"] and
     .base_facts.transport == "review-decision/v1" and
     ([.. | objects | keys[] | select(. == "status" or . == "next_action")] | length == 0) and
-    (.cases | length == 8) and
+    (.cases | length == 9) and
     ([.cases[].expected.action] | unique | sort) == ([$contract[0].action_effects[].action] | sort) and
     ([.cases[] | select(.expected.action != .expected.effect)] | length == 0) and
     ([.cases[] | select(.expected.execution_class == "named-product-choice") | .expected.action] == ["ask-named-product-choice"]) and
-    ([.cases[] | select(.expected.execution_class != "named-product-choice") | .expected.action] | length == 7)
+    ([.cases[] | select(.expected.execution_class != "named-product-choice") | .expected.action] | length == 8) and
+    any(.cases[]; .expected.reason == "account-cooldown-active" and .patch.cooldown.active == true) and
+    (.base_facts.cooldown == {active:false,seconds_remaining:0})
   ' "$corpus" >/dev/null || return 1
 
   while IFS=$'\t' read -r action effect class; do

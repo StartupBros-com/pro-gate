@@ -19,6 +19,7 @@ Conventions in this file:
 
 | Version | Date | Artifact | Theme |
 |---|---|---|---|
+| v0.48.0 | 2026-09-12 | Pending release | A rate-limit modal over a live review conversation is a typed throttled state that engages the account cooldown, instead of reading as still-generating; the remaining cooldown is a normalized fact the daemon and callers can wait on |
 | v0.47.0 | 2026-09-12 | Pending release | A remembered conversation URL must look like a conversation id, checked on write and on read, so a synthetic placeholder can no longer park a run on a slot forever; --status names the stall class and the TTL remaining |
 | v0.46.0 | 2026-09-11 | Pending release | Run-marker binding folds ASCII case: a lowercased self-echo binds instead of convicting the run's own conversation |
 | v0.45.0 | 2026-09-11 | Pending release | Only a finished review completes a revision; checks must settle before a review starts; exhausted retries are visible instead of counting as done |

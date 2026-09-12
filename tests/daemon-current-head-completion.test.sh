@@ -61,8 +61,21 @@ typed_decision(){ # corpus-case index output
   facts="$(jq -cS --arg cd "$(pg_review_decision_contract_digest)" --arg xd "$(pg_review_decision_corpus_digest)" --argjson patch "$patch" '.base_facts * $patch | .contract={contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,corpus_digest:$xd}' "$HERE/fixtures/review-decision/v1/corpus.json")"
   pg_review_decision_reduce "$facts" > "$out"
 }
-decision_for_action(){ # action -> corpus index
-  jq -r --arg action "$1" '.cases | to_entries[] | select(.value.expected.action == $action) | .key' "$HERE/fixtures/review-decision/v1/corpus.json"
+decision_for_action(){ # action [reason] -> corpus index (first match)
+  # #162: first() and the optional reason filter are load-bearing, not tidiness. This selector
+  # assumed one case per action, which held until stop-without-new-review gained a second corpus
+  # case (round-governor-denied AND account-cooldown-active). Selecting on action alone then
+  # emitted BOTH keys, typed_decision received "5\n8" as a single malformed index, and the decision
+  # it wrote had an empty reason -- surfacing as a sanity check failing with no value rather than as
+  # anything pointing at the corpus. Every other action still has exactly one case, so passing no
+  # reason keeps those call sites behaving exactly as before.
+  jq -r --arg action "$1" --arg reason "${2:-}" '
+    first(
+      .cases | to_entries[]
+      | select(.value.expected.action == $action)
+      | select($reason == "" or .value.expected.reason == $reason)
+    ) | .key
+  ' "$HERE/fixtures/review-decision/v1/corpus.json"
 }
 # Same base_facts as typed_decision, but with an ad-hoc patch not stored in the shared corpus --
 # used for finding-1 coverage so this file's cases don't perturb corpus.json's case count (relied
@@ -434,7 +447,7 @@ check 'a worker rc=0 with a re-resolved attested completion marks the head' "$([
 echo '# finding 1: a report-only stop completes the head ONLY with positive current-head review proof'
 
 reset_state
-STOP_DECISION="$HOME_D/stop.json"; typed_decision "$(decision_for_action stop-without-new-review)" "$STOP_DECISION"
+STOP_DECISION="$HOME_D/stop.json"; typed_decision "$(decision_for_action stop-without-new-review round-governor-denied)" "$STOP_DECISION"
 check 'sanity: the stop-without-new-review corpus fixture is a NON-completion reason (round-governor-denied)' "$([ "$(jq -r .reason "$STOP_DECISION")" = round-governor-denied ]; echo $?)" "$(jq -r .reason "$STOP_DECISION")"
 STATE_BEFORE="$(cat "$STATE_FILE")"
 MOCK_FRESH="$STOP_DECISION" process_pr "$NWO" "$NUM" "$SHA" "$BRANCH" "$URL"; rc=$?
