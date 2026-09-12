@@ -322,7 +322,12 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
       // A scratch "sample" is one DOM text read. The salvage also evaluates element probes
       // (terminal-infrastructure, throttle-modal) against the same target each poll; those are
       // answered by sentinel below and must not advance the ordered sample count fixtures assert.
-      if (scratch && opts.renderText && expression === 'document.body.innerText') {
+      // #162: gate on the page-text read itself. This predicate was `=== 'document.body.innerText'`
+      // when it was written; tabText has since moved to the pro-gate:review-text expression, which
+      // made the gate dead — renderText stopped firing at all and every scratch fixture served the
+      // listed tab's body instead of its own. Match what tabText actually sends, so adding a new
+      // element probe still cannot advance the count.
+      if (scratch && opts.renderText && expression.includes('pro-gate:review-text')) {
         const n = (pollsByTab.get(id) ?? 0) + 1;
         pollsByTab.set(id, n);
         value = opts.renderText(scratch.url, n);
