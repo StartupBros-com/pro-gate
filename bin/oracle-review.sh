@@ -1304,6 +1304,19 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
       for _ub in "$r_out".unbound.*; do [ -e "$_ub" ] && r_unbound=$(( r_unbound + 1 )); done
       r_crossbound=0
       [ -s "$PRO_GATE_HOME/crossbound/$m" ] && r_crossbound="$(grep -c . "$PRO_GATE_HOME/crossbound/$m" 2>/dev/null || echo 1)"
+      # v0.42 (#109): what the latest salvage pass concluded (sidecar, see pg_salvage_class_write)
+      # and how long until the reservation TTL is satisfied. Additive, observation-only fields: a
+      # parked run (placeholder memo, dead page) and a genuinely generating one used to read the
+      # same "in-progress" here. The hint below is worded per class (#109 finding 6): the same
+      # "collect it for FREE" phrasing was wrong for browser-down and throttle and misleading for
+      # terminal-infrastructure, so each classification gets its own plain-language next step.
+      r_class=""; r_class_at=""; r_ttl_left=""
+      _sc="$(pg_salvage_class_read "$m" 2>/dev/null || true)"
+      if [ -n "$_sc" ]; then
+        r_class="$(printf '%s' "$_sc" | awk -F'\t' 'NR==1{print $1}')"
+        r_class_at="$(printf '%s' "$_sc" | awk -F'\t' 'NR==1{print $2}')"
+      fi
+      case "$r_age" in ''|*[!0-9]*) ;; *) r_ttl_left=$(( ST_RES_TTL - r_age )); [ "$r_ttl_left" -ge 0 ] || r_ttl_left=0;; esac
       # v0.33+ lifecycle state distinguishes capacity ownership from optional collectability.
       if [ "$r_life" = superseded ]; then
         [ -n "$ST_HINT" ] || ST_HINT="superseded old-head review holds no capacity and cannot authorize the current PR; optional audit harvest: $r_cmd"
@@ -1311,6 +1324,29 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
         ST_HINT="STUCK (cross-bound): the conversation remembered for $m carries ANOTHER run's completed answer — see $PRO_GATE_HOME/crossbound/$m. Do NOT delete state or set PRO_GATE_REQUIRE_NONCE=0. The bad memo is discarded; bounded exact-marker misses will terminalize recovery while retaining the charged round."
       elif [ "$r_unbound" -gt 0 ]; then
         ST_HINT="AMBIGUOUS: ${r_unbound} capture(s) for $m could not be bound to this run (see ${r_out}.unbound.*). Inspect the preserved evidence; it may be older scrollback or a rejected mixed answer. Reservation and charge are retained. Retry the FREE harvest: $r_cmd"
+      elif [ -n "$r_class" ]; then
+        if [ -z "$ST_HINT" ]; then
+          case "$r_class" in
+            owned-incomplete)
+              ST_HINT="in-progress reservation $m: the model was still writing on the latest pass (${r_age:-?}s old, ${r_miss:-0} confirmed miss(es), ${r_ttl_left:-?}s until the TTL is satisfied); collect it for FREE: $r_cmd" ;;
+            inconclusive)
+              ST_HINT="in-progress reservation $m: the latest pass rendered the remembered conversation without a decisive result (${r_age:-?}s old, ${r_miss:-0} confirmed miss(es), ${r_ttl_left:-?}s until the TTL is satisfied); it stays held, not released; collect it for FREE: $r_cmd" ;;
+            browser-down)
+              ST_HINT="in-progress reservation $m: the browser was unreachable on the latest pass (${r_age:-?}s old, ${r_miss:-0} confirmed miss(es), ${r_ttl_left:-?}s until the TTL is satisfied); check that Chrome and the CDP port are up, then collect it for FREE: $r_cmd" ;;
+            absent)
+              ST_HINT="in-progress reservation $m: no conversation carried this marker on the latest pass (${r_age:-?}s old, ${r_miss:-0} confirmed miss(es), ${r_ttl_left:-?}s until the TTL is satisfied); it releases only after the TTL and the miss threshold are both met; collect it for FREE to re-check: $r_cmd" ;;
+            cross-bound)
+              ST_HINT="in-progress reservation $m: the latest probe found only another run's completed answer where this conversation was expected (${r_age:-?}s old, ${r_miss:-0} confirmed miss(es), ${r_ttl_left:-?}s until the TTL is satisfied). Do NOT delete state or set PRO_GATE_REQUIRE_NONCE=0; run the harvest so the conviction is recorded: $r_cmd" ;;
+            throttle)
+              ST_HINT="in-progress reservation $m: ChatGPT throttled the account on the latest pass (${r_age:-?}s old, ${r_miss:-0} confirmed miss(es), ${r_ttl_left:-?}s until the TTL is satisfied); back off and do NOT resubmit; collect later for FREE: $r_cmd" ;;
+            terminal)
+              ST_HINT="in-progress reservation $m: a completed answer was seen on the latest pass (${r_age:-?}s old, ${r_miss:-0} confirmed miss(es), ${r_ttl_left:-?}s until the TTL is satisfied); collect it for FREE: $r_cmd" ;;
+            terminal-infrastructure)
+              ST_HINT="in-progress reservation $m: the conversation ended in a terminal infrastructure state (${r_age:-?}s old, ${r_miss:-0} confirmed miss(es), ${r_ttl_left:-?}s until the TTL is satisfied); collect it for FREE to record the outcome: $r_cmd" ;;
+            *)
+              ST_HINT="in-progress reservation $m: latest pass saw $r_class (${r_age:-?}s old, ${r_miss:-0} confirmed miss(es), ${r_ttl_left:-?}s until the TTL is satisfied) — collect it for FREE: $r_cmd" ;;
+          esac
+        fi
       else
         [ -n "$ST_HINT" ] || ST_HINT="in-progress reservation found — collect it for FREE: $r_cmd"
       fi
@@ -1319,7 +1355,8 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
           --arg age "${r_age:-}" --arg miss "${r_miss:-}" --arg model "${r_model:-}" \
           --arg url "$r_url" --arg harvest_cmd "$r_cmd" --argjson unbound "$r_unbound" \
           --argjson crossbound "$r_crossbound" --arg life "$r_life" \
-          '{marker:$marker,pr:$pr,out:$out,age_secs:(($age|tonumber?)//null),miss_streak:(($miss|tonumber?)//null),model:$model,conversation_url:$url,harvest_cmd:$harvest_cmd,unbound_captures:$unbound,crossbound_hits:$crossbound,holds_capacity:($life != "complete" and $life != "superseded"),state:(if $life == "superseded" then "superseded-awaiting-optional-harvest" elif $crossbound > 0 then "cross-bound" elif $unbound > 0 then "unbindable-ambiguous" elif $life == "complete" then "complete-awaiting-harvest" else "generating-or-recoverable" end)}' \
+          --arg class "$r_class" --arg class_at "$r_class_at" --arg ttl_left "$r_ttl_left" \
+          '{marker:$marker,pr:$pr,out:$out,age_secs:(($age|tonumber?)//null),miss_streak:(($miss|tonumber?)//null),model:$model,conversation_url:$url,harvest_cmd:$harvest_cmd,unbound_captures:$unbound,crossbound_hits:$crossbound,classification:(if $class == "" then null else $class end),classified_at:(($class_at|tonumber?)//null),ttl_remaining_secs:(($ttl_left|tonumber?)//null),holds_capacity:($life != "complete" and $life != "superseded"),state:(if $life == "superseded" then "superseded-awaiting-optional-harvest" elif $crossbound > 0 then "cross-bound" elif $unbound > 0 then "unbindable-ambiguous" elif $life == "complete" then "complete-awaiting-harvest" else "generating-or-recoverable" end)}' \
           >> "$ST_TMP/res.jsonl" 2>/dev/null
       else
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$m" "${r_pr:-?}" "${r_age:-?}" "${r_miss:-?}" "$r_unbound" "$r_crossbound" "$r_cmd" >> "$ST_TMP/res.tsv"
@@ -2686,6 +2723,10 @@ if [ -n "$HARVEST_MARKER" ]; then
   # …and, since #166 gate r3 P1, the one chronology fact that is invisible in the extracted block:
   # "precedes-prompt" means this answer was written ABOVE the prompt this run submitted.
   HARVEST_CHRONO="$(sed -n 's/^answer-chronology //p' "$HARVEST_TMP.err" 2>/dev/null | tail -1)"
+  # v0.42 (#109): what the helper concluded on this pass, recorded per marker for --status
+  # (pg_salvage_class_write; observation only, never a lifecycle input).
+  HARVEST_KIND="$(sed -n 's/^evidence-kind: //p' "$HARVEST_TMP.err" 2>/dev/null | tail -1)"
+  [ -z "$HARVEST_KIND" ] || pg_salvage_class_write "$RUN_MARKER" "$HARVEST_KIND" 2>/dev/null || true
   rm -f "$HARVEST_TMP.err"
   if [ "$HARVEST_RC" -eq 0 ] && pg_is_review "$HARVEST_TMP"; then
     # v0.28 (#48/#55): provenance before acceptance, positive binding first. A capture whose
@@ -3341,6 +3382,8 @@ find "$PRO_GATE_HOME/conversation-urls" -maxdepth 1 -type f -mmin +20160 -delete
 # it stands in for (the conviction deleted conversation-urls/<marker>), so the two records expire
 # together instead of one outliving the other — the same disagreement #170 was about.
 find "$PRO_GATE_HOME/crossbound" -maxdepth 1 -type f -mmin +20160 -delete 2>/dev/null || true
+# v0.42 (#109): salvage classification sidecars ride the same horizon as the memos they describe.
+find "$(pg_salvage_class_dir)" -maxdepth 1 -type f -mmin +20160 -delete 2>/dev/null || true
 # Canonical title memos serve the same late-harvest lifecycle as URL memos. Sequence counters
 # remain exempt below because they prevent server-side title reuse across idle windows.
 find "$(pg_conversation_title_dir)" -maxdepth 1 -type f -mmin +20160 -delete 2>/dev/null || true
