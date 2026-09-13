@@ -44,7 +44,7 @@ An **acceptance** predicate publishes a capture as this run's review, so a false
 
 The same identifier can therefore be compared at different strictness in the two classes without inconsistency. Treating them as one question and picking a single global strictness is wrong in one direction by construction.
 
-What the acceptance predicate concluded about a published artifact is its **ownership**: `exact` (the authoritative verdict line named this run's marker) or `legacy` (a nonce-less artifact accepted under the pre-marker rules). A capture carrying a foreign authoritative claim has no ownership because it is never published.
+What the acceptance predicate concluded about a published artifact is its **ownership**: `exact` (the authoritative verdict line named this run's marker) or `nonce-less` (an artifact accepted under the pre-marker rules). A capture carrying a foreign authoritative claim has no ownership because it is never published.
 
 ### Conversation Memo
 
@@ -56,7 +56,7 @@ What the latest salvage pass concluded about a reservation's conversation: `owne
 
 ### Submit-Failure Class
 
-Why a Review Attempt's prompt never reached ChatGPT, when it did not: `upload-stalled` (the composer accepted the attachment but it never finished uploading), `send-unconfirmed` (the prompt did not appear in the conversation before the send timeout), `cloudflare-challenge` (the account met a challenge page before submission), or `none`. It is classified once from oracle's own transcript lines and the engine's salvage flags at the moment a round is refunded or preserved, and it is observation only: it never decides whether a charge is refunded, which the Terminal Disposition's proof owns.
+Why a Review Attempt's prompt never reached ChatGPT, when it did not: `upload-stalled` (the composer accepted the attachment but it never finished uploading), `send-unconfirmed` (the prompt did not appear in the conversation before the send timeout), `cloudflare-challenge` (the account met a challenge page before submission), `other` (an error oracle recorded before the prompt was confirmed submitted that matches none of those), or `none` (the prompt was confirmed submitted, or no error was recorded). It is classified once from oracle's own transcript lines and the engine's salvage flags at the moment a round is refunded or preserved, and it is observation only: it never decides whether a charge is refunded, which the Terminal Disposition's proof owns.
 
 ## Review authority
 
