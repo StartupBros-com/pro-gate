@@ -44,6 +44,8 @@ An **acceptance** predicate publishes a capture as this run's review, so a false
 
 The same identifier can therefore be compared at different strictness in the two classes without inconsistency. Treating them as one question and picking a single global strictness is wrong in one direction by construction.
 
+What the acceptance predicate concluded about a published artifact is its **ownership**: `exact` (the authoritative verdict line named this run's marker) or `legacy` (a nonce-less artifact accepted under the pre-marker rules). A capture carrying a foreign authoritative claim has no ownership because it is never published.
+
 ### Conversation Memo
 
 The conversation URL remembered for a marker so later passes can find the same conversation without rescanning. A memo is authoritative only while its conversation id has the shape of a real conversation id; a memo that fails that check, or that proves to carry foreign content, is revoked so the next pass rescans every candidate. A blank render of a real-id memo is a transient, not a miss, and does not revoke it.
@@ -51,6 +53,10 @@ The conversation URL remembered for a marker so later passes can find the same c
 ### Salvage classification
 
 What the latest salvage pass concluded about a reservation's conversation: `owned-incomplete` (the model was still writing), `inconclusive` (rendered without a decisive result), `browser-down` (the browser was unreachable), `absent` (no conversation carried the marker), `cross-bound` (another run's completed answer was found instead), `throttle` (ChatGPT throttled the account), `terminal` (a completed answer was seen), or `terminal-infrastructure` (the conversation ended in a terminal infrastructure state). Status surfaces it as `classification`; it is observation only — never a release, a refund, or an admission input.
+
+### Submit-Failure Class
+
+Why a Review Attempt's prompt never reached ChatGPT, when it did not: `upload-stalled` (the composer accepted the attachment but it never finished uploading), `send-unconfirmed` (the prompt did not appear in the conversation before the send timeout), `cloudflare-challenge` (the account met a challenge page before submission), or `none`. It is classified once from oracle's own transcript lines and the engine's salvage flags at the moment a round is refunded or preserved, and it is observation only: it never decides whether a charge is refunded, which the Terminal Disposition's proof owns.
 
 ## Review authority
 
