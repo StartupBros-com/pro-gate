@@ -58,6 +58,10 @@ What the latest salvage pass concluded about a reservation's conversation: `owne
 
 The engine-issued typed continuation chosen from normalized lifecycle, evidence, and policy facts. Callers execute this decision; they do not infer actions from verdict prose, exit codes, status messages, or local round history.
 
+### Round Convergence
+
+Whether successive charged rounds on one change are settling. The round governor scores each round by its open P0 plus P1 count and keeps a churn streak: the count of consecutive rounds that failed to shrink it. A streak of two is the convergence signal; it produces the typed stop `rounds-not-converging`, which is report-only and reversible by the operator, and it never alters the numeric round grant's own policy. Convergence is judged from the round history the engine writes, never from re-reading review text.
+
 ### Input Policy
 
 The deployment-level rule that controls whether Pro-Gate supplies only the reviewed bundle or may request connector-capable delivery. It governs Pro-Gate's request surface, not permissions independently granted to the browser identity.
