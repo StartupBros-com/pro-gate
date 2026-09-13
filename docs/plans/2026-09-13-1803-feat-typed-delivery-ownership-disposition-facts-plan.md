@@ -3,6 +3,7 @@ title: Typed Delivery, Ownership and Disposition Facts - Plan
 type: feat
 date: 2026-09-13
 topic: typed-review-facts
+deepened: 2026-09-13
 artifact_contract: ce-unified-plan/v1
 product_contract_source: ce-plan-bootstrap
 execution: code
@@ -74,7 +75,7 @@ Between 2026-09-04 and 2026-09-07 the dotfiles wrapper `claude/scripts/pro-gate-
 
 - R12. Each new field is added to the contract fixture, the corpus, the library validator, both engine builders, the two digest pins and the plugin's mirror file in one commit, so no decision is ever produced that its own validator rejects.
 - R13. The conformance suite runs in CI beside the other test files.
-- R14. Removing any new top-level object from an otherwise valid envelope makes the validator reject it; this is the planted negative from issue #175.
+- R14. Removing any new top-level object, or a new result key, from an otherwise valid envelope makes the validator reject it as `undefined-state`; this is the planted negative from issue #175, and it is distinct from the `unknown-contract` rejection the identity block produces.
 
 **Renderers and the wrapper**
 
@@ -123,7 +124,7 @@ Between 2026-09-04 and 2026-09-07 the dotfiles wrapper `claude/scripts/pro-gate-
   - **Covers:** R12, R14
   - **Given:** a corpus envelope with the `delivery` object removed.
   - **When:** the library validator runs.
-  - **Then:** the envelope is rejected, and the same holds for a removed `attempt` object and for a result entry missing `ownership`.
+  - **Then:** the envelope is rejected as `undefined-state`, and restoring the object alone restores acceptance, so the failing key is pinned; the same differential holds for a removed `attempt` object and for a result entry missing `ownership`.
 
 ### Success Criteria
 
@@ -141,6 +142,7 @@ Between 2026-09-04 and 2026-09-07 the dotfiles wrapper `claude/scripts/pro-gate-
 - A count of quoted foreign markers per result, only if a fixer misfire on a quoted block is ever observed after v0.42.0.
 - The daemon's legacy-migration check converging onto the typed ownership field instead of calling the capture primitives directly.
 - A consecutive-submit-failure count in the runtime, if more than one caller ends up keeping that counter.
+- A pre-existing edge in the advisory query's assembly loop: an artifact that exists only under `pending/` while a result binding exists for its marker is dropped when the loop reassigns the artifact path to the completed store. U3 derives ownership only for entries the loop already emits and does not change that ladder.
 - The remaining ideation-refresh facts (failure reason, round trajectory, policy mode) and issue #174's finding kind and convergence, which have their own brainstorm.
 
 ### Dependencies and Assumptions
@@ -148,6 +150,7 @@ Between 2026-09-04 and 2026-09-07 the dotfiles wrapper `claude/scripts/pro-gate-
 - The installed oracle is 0.18.0; the estimator mirrors its composer math and the constants are engine knobs so a later oracle changes one place.
 - The advisory query may carry the reviewed-diff proof as documented in the skill; when it does not, R3 applies.
 - Issue #177 and #163 fixes are in flight on separate branches and do not touch the facts builders.
+- A daemon restarted during the release is covered by its existing self-reload on a deploy-stamp change and its global deferral on an incompatible decision; the residual is one poll interval.
 
 ### Outstanding Questions
 
@@ -172,12 +175,12 @@ Between 2026-09-04 and 2026-09-07 the dotfiles wrapper `claude/scripts/pro-gate-
 
 - KTD1. **One atomic commit per fact group, covering fixture, corpus, validator, both builders, digest pins and mirror.** The validator's top-level key set is exact and a miss rejects every decision as `undefined-state`, not just the ones touching the new field. PR #165 shipped the cooldown fact this way. Governs R12.
 - KTD2. **Extract the new fact objects into small library builders both engine builders call, instead of editing two jq literals.** The advisory query and the effect recheck build near-identical facts objects with no shared function; adding three objects to both invites the drift this plan exists to remove. Each helper takes its inputs as arguments and returns compact JSON the builders splice in with `--argjson`. The existing literals are otherwise left alone.
-- KTD3. **`auto` is a fourth `--input` value resolved after Input Policy, and the estimator lives in the library.** Port the wrapper's `size_input` arithmetic verbatim into a library function with three knobs, `PRO_GATE_INLINE_BUDGET_CHARS` (60000), `PRO_GATE_INLINE_RESERVE_CHARS` (10000) and `PRO_GATE_INLINE_MAX_BYTES` (50000); the wrapper's byte-class line count and fence rule are the measured fidelity, not an approximation to redo. The measurement input is the reviewed diff file the query and effect already share, so both resolve identically; the composed prompt is not measured because it exists only at the effect. Governs R1 through R4.
-- KTD4. **Ownership fields come from the acceptance predicate's return, not a new scan.** `pg_capture_bind` already distinguishes an exact owned claim (rc 0), a nonce-less artifact (rc 1) and a foreign claim (rc 2), and `pg_capture_verdict_claims` yields the marker the verdict line named. The builder records `ownership: exact | legacy` and `verdict_marker` from those when a completed result is assembled; the field names avoid PR #159's `bindable` and `evidence_mode`. Governs R5, R6.
-- KTD5. **Submit failure is classified once, at the refund site, from fixed strings in oracle's transcript plus the engine's own flags, and persisted as a per-marker sidecar.** The transcript lines are oracle infrastructure output, the same class of evidence the Cloudflare skip and the refund predicate already read. The sidecar follows the `salvage-class/<marker>` pattern (one token and an epoch, an allowlist shared by writer and reader) so the read-only query needs no ledger scan and the disposition record's exact-key validator stays at record version 1. The ledger row mirrors the token as an additive key from the same variable. Governs R8, R9, R10.
+- KTD3. **`auto` is a fourth `--input` value, admitted by Input Policy and resolved only once the reviewed diff is known; the estimator lives in the library.** The policy `case` accepts `auto` and leaves it unresolved, because the documented first query carries no diff and the fresh dispatch fetches its diff after policy resolution; a delivery helper then resolves it in the query once the diff proof has been read, and in the fresh dispatch after the diff fetch and before the file arguments are assembled. Port the wrapper's `size_input` arithmetic verbatim into a library function with three knobs, `PRO_GATE_INLINE_BUDGET_CHARS` (60000), `PRO_GATE_INLINE_RESERVE_CHARS` (10000) and `PRO_GATE_INLINE_MAX_BYTES` (50000); the wrapper's byte-class line count and fence rule are the measured fidelity, not an approximation to redo. The measurement input is the reviewed diff file the query and effect already share, so both resolve identically; the composed prompt is not measured because it exists only at the effect. Governs R1 through R4.
+- KTD4. **Ownership is recomputed live from the acceptance predicate at both completed-results assembly sites; nothing is persisted.** `pg_capture_bind` already distinguishes an exact owned claim (rc 0), a nonce-less artifact (rc 1) and a foreign claim (rc 2), and `pg_capture_verdict_claims` yields the marker the verdict line named. The advisory query's assembly loop already scans each candidate artifact with `pg_capture_foreign_echo`; calling `pg_capture_bind` there instead is the same scan plus the nonce check, not a second pass. The effect recheck's assembly gains that one scan per completed entry for the round key, which is bounded and cheaper than a persisted copy that could drift from re-verified bytes. The builder records `ownership: exact | legacy` and `verdict_marker` from the return; the field names avoid PR #159's `bindable` and `evidence_mode`. Governs R5, R6.
+- KTD5. **Submit failure is classified once, at the failure-attribution point, from oracle's structured session metadata first and its transcript lines second, and persisted as a per-marker sidecar.** The classifier runs whether the round is refunded or preserved, reading the error recorded in the same session `meta.json` that `pg_oracle_prompt_submitted_state` already trusts, and falling back to the transcript's literal lines; both are oracle infrastructure output, never the answer. The sidecar follows the `salvage-class/<marker>` pattern (one token and an epoch, an allowlist shared by writer and reader) so the read-only query needs no ledger scan and the disposition record's exact-key validator stays at record version 1. Its sweep joins the housekeeping block that already sweeps `salvage-class/` and `crossbound/`, which only effect-reaching invocations run; a query never sweeps. The ledger row mirrors the token as an additive key from the same variable. Governs R8, R9, R10.
 - KTD6. **`attempt` projects records that already exist.** Marker and state come from `pg_attempt_snapshot`; `disposition` is the record's `terminal_kind`; `refunded` is true exactly when that kind is `not-submitted`; `result_produced` is a completed-store artifact for the marker that passes `pg_is_review`; `submit_failure` is the sidecar. No new terminal authority and no new state machine. Governs R8, R11.
 - KTD7. **Wire the conformance suite into CI as part of the first unit.** The suite that checks digests and every renderer is not in `ci.yml` today, so the acceptance criterion "with a test" would otherwise be unenforced. Governs R13.
-- KTD8. **Sequence against PR #159 by merge order, not by waiting.** Both PRs move `completed_results` and the digests. Whichever lands second rebases its fixture and digest pair; the field names in KTD4 make that a fixture merge, not a semantic conflict. Governs R12.
+- KTD8. **Sequence against PR #159 by merge order, not by waiting.** Both branches extend the result schema and both rewrite the same two digest literal lines in the library, so the second lander has a code-line conflict, not a fixture merge: it regenerates both digests over the union schema and reconciles four artifacts, the contract fixture, the corpus, the library digest lines and the plugin mirror, then reruns the conformance suite's live digest comparison. The field names in KTD4 keep the schemas semantically compatible so the union is mechanical. Governs R12.
 
 ### High-Level Technical Design
 
@@ -232,10 +235,28 @@ sequenceDiagram
   PG-->>W: attempt.submit_failure, cooldown (was: upload_failed, throttle_of greps)
 ```
 
+### System-Wide Impact
+
+- **Interfaces each fact crosses, and the unit that owns each:** the two engine builders (U2, U3, U4); the library validator, the two digest literals and the plugin mirror file (U2, U3, U4, one commit each per KTD1); the doctor's identity check, which needs no change because it compares the pins the release ships; the daemon's envelope validation, which delegates to the library and so follows automatically; the skill and relay prose (U5); the wrapper's decision reads (U7); the ledger row and the new sidecar (U1). Skipping the validator or the mirror in any fact commit rejects every decision, not only the new field.
+- **Three places scan an artifact for ownership today:** the advisory query's assembly loop, the recover artifact-first path, and the daemon's legacy-migration scan. Only the first publishes facts; recover returns bytes, and the daemon's scan is migration-only. U3 changes the first and the effect recheck; the other two keep calling the primitives directly and stay correct because the rule is the same primitive.
+- **Version skew is fail-closed in every direction.** A renderer behind the runtime rejects `unknown-contract` on the identity block; a validator miss inside a matching contract rejects `undefined-state`; the wrapper resolves its expected contract from the installed plugin mirror and halts on any digest mismatch, so a wrapper ahead of its runtime cannot read an absent field silently. The daemon re-executes itself when the deploy stamp changes and defers globally on an incompatible decision, so a mid-release restart is covered up to its poll window.
+- **The read-only query path gains reads, not writes:** the sidecar directory, the completed store and the attempt snapshot it already takes. The sidecar is written only at failure attribution inside an effect and swept only by the housekeeping block that effect-reaching invocations run.
+- **Delivery resolution moves later in the call.** Policy admission stays where it is; the resolved delivery is known only after the diff is, so the file arguments and the facts are built from the helper's result, never from the raw `--input` value.
+
+### Risks and Mitigations
+
+- **A single fact commit that misses the validator, a digest or the mirror rejects every decision as `undefined-state`.** Mitigation: KTD1's atomic commit rule, the conformance suite's live digest comparison, and U1 wiring that suite into CI before the first contract change ships. AE8's differential negatives pin which key a rejection came from.
+- **PR #159 lands in either order.** Mitigation: KTD8's union-and-regenerate rule; U3 checks the PR's state before it starts.
+- **The estimator mirrors oracle 0.18.0 and drifts silently on an oracle upgrade.** Mitigation: the three knobs live in one library function, and U2 adds one doctor line that records the oracle version the constants were measured against and warns when the installed version differs. No new artifact.
+- **The wrapper's companion PR ships ahead of a host's plugin refresh.** One shared wrapper serves several repositories on a host and halts for all of them on a digest mismatch. Mitigation: U7's pre-merge gate compares the host's resolved contract digest with the release's before deletion.
+- **A caller that runs many `auto` queries and few effects accumulates sidecars.** Mitigation: the sweep runs on every effect-reaching invocation with the same age rule as `salvage-class/`; the standing assumption is that effects keep running on any host that queries.
+- **The submit-failure class depends on oracle's error text and metadata shape.** Mitigation: classify from the structured metadata first and keep the literal strings in one classifier function with a test per string, so an oracle change breaks one test rather than a grep spread across callers.
+
 ### Assumptions
 
 - The field names below are the implementer's to keep or rename inside the closed grammar; the plan fixes their meaning, not their spelling: `delivery.{requested,resolved,policy,measured,estimate_chars,budget_chars,over_budget}`, result `ownership` and `verdict_marker`, `attempt.{marker,disposition,result_produced,refunded,submit_failure}`.
-- The advisory query is allowed to read the sidecar directory and the completed store; both are file reads on the path that already reads reservations and dispositions.
+- The advisory query may read the sidecar directory and the completed store, which are file reads on a path that already reads reservations and dispositions; the ownership scan in KTD4 is a content scan the query loop already performs for the foreign check, so it is a substitution, not a new cost.
+- Effects keep running on every host that issues queries, which is what bounds the sidecar directory.
 - The `auto` value is exposed through the skill as an optional caller choice; callers that omit `--input` keep today's policy default.
 - One runtime release carries all three facts; the wrapper's companion PR follows once the host that runs the wrapper has installed it.
 
@@ -258,16 +279,19 @@ sequenceDiagram
 - **Files:** `lib/pro-gate-lib.sh`, `bin/oracle-review.sh` (refund site, ledger row writer), `.github/workflows/ci.yml`, `tests/engine.test.sh`, `tests/review-decision-adapters.test.sh`
 - **Approach:**
   1. Add a library estimator that takes a diff path and returns bytes, content lines, fence width, estimate and an over-budget flag, porting the wrapper's `size_input` arithmetic and its `LC_ALL=C` whitespace byte classes; the three knobs from KTD3 default to the wrapper's values.
-  2. Add a submit-failure classifier that reads the oracle transcripts the refund predicate already iterates and the `CLOUDFLARE` flag, returning one token from the closed enum in R9; call it at the refund site and write the sidecar with a `pg_submit_failure_*` family shaped like `pg_salvage_class_*` (allowlist shared by writer and reader).
+  2. Add a submit-failure classifier that reads the error recorded in oracle's session metadata for the run (the file `pg_oracle_prompt_submitted_state` already reads), falls back to the transcript's literal lines the refund predicate already iterates, and honours the `CLOUDFLARE` flag, returning one token from the closed enum in R9; call it at the failure-attribution point for both the refunded and the preserved branch and write the sidecar with a `pg_submit_failure_*` family shaped like `pg_salvage_class_*` (allowlist shared by writer and reader).
   3. Emit the same token as an additive `submit_failure` key on the ledger row, empty on non-failure rows, matching how `reason` is present-but-empty.
-  4. Add the conformance suite to the CI test list.
+  4. Add the sidecar directory to the housekeeping sweep beside `salvage-class/`, with the same age rule.
+  5. Add the conformance suite to the CI test list in this unit's own commit, so the first contract change in U2 is already gated.
 - **Patterns to follow:** `pg_salvage_class_write` and `pg_salvage_class_read` for the sidecar; the ledger row writer's `reason` block for present-but-empty keys; `pg_attempt_provably_unsubmitted` for how transcripts are iterated.
 - **Test scenarios:**
   - Estimator on a diff with a long backtick run reports a fence wider than three and an estimate above bare bytes plus line tax.
   - Estimator on an empty file reports zero bytes, zero lines and not over budget.
   - Estimator with a whitespace-only trailing line counts lines the way the wrapper's byte-class rule does.
-  - Classifier returns `upload-stalled` for a transcript containing oracle's attachment-upload timeout line, `send-unconfirmed` for the prompt-did-not-appear line, `cloudflare-challenge` when the Cloudflare flag is set, `none` otherwise.
+  - Classifier returns `upload-stalled` from a session metadata error naming the attachment-upload timeout, `send-unconfirmed` from the prompt-did-not-appear error, `cloudflare-challenge` when the Cloudflare flag is set, `none` otherwise; the same tokens result from the transcript lines when the metadata carries no error.
   - Refund path in the engine suite writes the sidecar and a ledger row whose `submit_failure` matches it (Covers AE7, first half).
+  - Preserved path (fate uncertain, charge kept) still writes the sidecar with the classified token.
+  - Housekeeping on an effect-reaching run removes a sidecar older than the age rule and leaves a fresh one.
   - Sidecar reader rejects a token outside the allowlist.
   - CI workflow lists the conformance suite; the suite passes unchanged at this unit.
 - **Verification:** the estimator and classifier have unit coverage in the engine suite, a refunded run leaves a readable sidecar, and CI runs the conformance suite.
@@ -277,11 +301,13 @@ sequenceDiagram
 - **Goal:** The engine resolves `auto` inside Input Policy and every decision carries a `delivery` object.
 - **Requirements:** R1, R2, R3, R4, R12, R14
 - **Dependencies:** U1
-- **Files:** `bin/oracle-review.sh` (argument parsing, policy resolution, both facts builders, `FILE_ARGS`), `lib/pro-gate-lib.sh` (delivery helper, validator, digest pins), `tests/fixtures/review-decision/v1/contract.json`, `tests/fixtures/review-decision/v1/corpus.json`, `skills/pro-gate/review-decision-v1.json`, `tests/engine.test.sh`, `tests/review-decision-adapters.test.sh`
+- **Files:** `bin/oracle-review.sh` (argument parsing, policy resolution, both facts builders, `FILE_ARGS`), `lib/pro-gate-lib.sh` (delivery helper, validator, digest pins), `bin/pro-gate-doctor.sh`, `tests/fixtures/review-decision/v1/contract.json`, `tests/fixtures/review-decision/v1/corpus.json`, `skills/pro-gate/review-decision-v1.json`, `tests/engine.test.sh`, `tests/review-decision-adapters.test.sh`
 - **Approach:**
-  1. Accept `auto` in `--input` parsing and in both policy branches; resolve it after the policy default using the estimator when a reviewed diff is present, else per R3.
-  2. Build the `delivery` object in one helper (KTD2) and splice it into both builders; the effect's resolved value drives whether `FILE_ARGS` attaches the bundle.
-  3. Extend the validator with the `delivery` key set and value types, add `delivery` to the corpus base facts with cases for AE1 through AE4, regenerate both digests and the mirror file, all in this one commit (KTD1).
+  1. Accept `auto` in `--input` parsing and in both policy branches, leaving it unresolved there (KTD3).
+  2. Resolve it in the delivery helper: in the advisory query once the reviewed-diff proof has been read, and in the fresh dispatch after the diff fetch and before the file arguments; with no diff, resolve per R3 and mark the payload unmeasured.
+  3. Build the `delivery` object in the same helper (KTD2) and splice it into both builders; the effect's resolved value drives whether `FILE_ARGS` attaches the bundle.
+  4. Extend the validator with the `delivery` key set and value types, add `delivery` to the corpus base facts with cases for AE1 through AE4, regenerate both digests and the mirror file, all in this one commit (KTD1).
+  5. Add one doctor line that prints the oracle version the estimator constants were measured against beside the installed version and warns on a difference.
 - **Execution note:** Start from a failing conformance run that expects `delivery` in every corpus envelope, then make the engine and validator agree.
 - **Patterns to follow:** the cooldown fact's path through both builders, the validator and the corpus; the policy `case` for where `auto` slots in.
 - **Test scenarios:**
@@ -290,7 +316,9 @@ sequenceDiagram
   - Covers AE3. Over-budget diff under bundle-only resolves `bundle` with `over_budget` true.
   - Covers AE4. Query without a diff resolves `connector` with `measured` false and a null estimate.
   - Explicit `--input bundle|both|connector` still passes through unchanged and `delivery.requested` records it.
-  - Covers AE8. Corpus envelope without `delivery` is rejected by the validator.
+  - A fresh dispatch under `auto` resolves after its own diff fetch, so the classic path with no caller-supplied diff still measures.
+  - The doctor warns when the installed oracle version differs from the version the constants were measured against, and stays quiet when they match.
+  - Covers AE8. Corpus envelope without `delivery` is rejected as `undefined-state` and accepted again once restored.
   - Digest check in the conformance suite matches the regenerated pins and the mirror file.
 - **Verification:** the conformance suite and the engine suite are green with `delivery` present on every decision, and a daemon envelope validates through the shared library validator.
 
@@ -302,7 +330,7 @@ sequenceDiagram
 - **Files:** `bin/oracle-review.sh` (completed-results assembly in the advisory query, the effect recheck), `lib/pro-gate-lib.sh` (validator result schema, digest pins), the two fixtures and the mirror file, `tests/engine.test.sh`, `tests/review-decision-adapters.test.sh`
 - **Approach:**
   1. Before starting, check PR #159's state; if it merged, rebase and add these fields beside `bindable` and `evidence_mode` (KTD8).
-  2. When a completed result is assembled, derive `ownership` and `verdict_marker` from `pg_capture_bind`'s return and the accepted claim (KTD4); a nonce-less legacy artifact reports `legacy` and an empty marker.
+  2. At both completed-results assembly sites, the advisory query's loop and the effect recheck, derive `ownership` and `verdict_marker` from `pg_capture_bind`'s return and the accepted claim (KTD4), replacing the query loop's direct foreign-echo call with the bind call; a nonce-less legacy artifact reports `legacy` and an empty marker. Nothing is written to the result binding for this.
   3. Extend the validator's result key set, update every corpus result entry, regenerate digests and the mirror, one commit.
 - **Patterns to follow:** the existing result schema in the validator; the harvest and fresh paths where `pg_capture_bind` already runs before publication.
 - **Test scenarios:**
@@ -370,7 +398,7 @@ sequenceDiagram
   2. Delete `verdict_index`, `markers_in`, `foreign_in`, `foreign_markers`, `foreign_list`, `own_line`, `count_review`, `block_of` and `verdict_of`; read `verdict`, `ownership` and `marker` from the selected completed result, keeping `selected_marker` and `status_marker`.
   3. Delete `upload_failed` and the grep tiers of `throttle_of`; read `attempt.submit_failure` and `cooldown` from the next query; keep the two-consecutive-stalls counter over the typed value.
   4. Remove the three `PRO_GATE_LOOP_INLINE_*` knobs and update the test file's assertions to the typed reads.
-- **Execution note:** Confirm the installed runtime's contract digest equals the release's before deleting; the wrapper must not carry a fallback for an older runtime.
+- **Execution note:** Before merging, confirm on the host that the wrapper's resolved contract digest (the identity it reads from the installed plugin mirror) equals the digest the U6 release tagged; one shared wrapper serves every repository on that host and halts for all of them on a mismatch. The wrapper must not carry a fallback for an older runtime.
 - **Test scenarios:**
   - Wrapper test asserts `--input auto` is passed when no explicit input is configured.
   - Wrapper test asserts a stop after two consecutive `upload-stalled` attempts read from the decision.
