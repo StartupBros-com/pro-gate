@@ -1035,6 +1035,20 @@ const MIXED_MARKER = 'pg-run-Test-Case-1234567890-43';
   check('cross-bound canonical scratch still records the sighting the conviction erased',
     crossBoundResult.observed.includes(MARKER),
     `observed=${JSON.stringify(crossBoundResult.observed)} memos=${JSON.stringify(crossBoundResult.memos)}`);
+
+  // #163 r3 P0: the blacklist governs what may be COLLECTED, never whether a conversation exists.
+  // A URL blacklisted earlier in this marker's life that now renders our exact marker is proof the
+  // conversation is there; skipping it for the sighting too would hide it from every mechanism at
+  // once and let the reservation retire as never-conversed. Seed the blacklist for this marker's
+  // own URL, then render our marker at it.
+  const shadowed = await mockCdp(`run marker: ${MARKER}\nstill drafting`, [], {});
+  const shadowedResult = await runScratchSalvage([MARKER, '3'], shadowed.port, (home) => {
+    fs.writeFileSync(path.join(home, 'salvage-nonmatching.txt'), `${MARKER}\thttps://chatgpt.com/c/mock-conversation\n`);
+  });
+  check('a blacklisted URL rendering our exact marker is still recorded as a sighting (#163 r3 P0)',
+    shadowedResult.observed.includes(MARKER),
+    `observed=${JSON.stringify(shadowedResult.observed)} status=${shadowedResult.status}`);
+  shadowed.stop();
   check('cross-bound canonical scratch closes only scratch',
     crossBound.closed.includes('scratch1') && !crossBound.closed.includes('tab1'), `closed=${crossBound.closed}`);
   crossBound.stop();

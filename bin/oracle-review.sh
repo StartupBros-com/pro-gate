@@ -3437,6 +3437,9 @@ find "$(pg_salvage_class_dir)" -maxdepth 1 -type f -mmin +20160 -delete 2>/dev/n
 # #163: the observation sidecar is the memo's positive counterpart, so it expires with the memo
 # rather than outliving the recovery window it protects.
 find "$(pg_conversation_observed_dir)" -maxdepth 1 -type f -mmin +20160 -delete 2>/dev/null || true
+# Plant the provenance stamp here, on a write-capable path, rather than on first read: --status and
+# the advisory decision query must stay read-only. Idempotent, so it only ever writes once per host.
+pg_conversation_observed_since_init 2>/dev/null || true
 # Canonical title memos serve the same late-harvest lifecycle as URL memos. Sequence counters
 # remain exempt below because they prevent server-side title reuse across idle windows.
 find "$(pg_conversation_title_dir)" -maxdepth 1 -type f -mmin +20160 -delete 2>/dev/null || true

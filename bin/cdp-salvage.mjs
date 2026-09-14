@@ -377,7 +377,16 @@ function noteObserved(m, why) {
     const dir = path.join(PG_HOME, 'conversation-observed');
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, m), `${why}\t${Math.floor(Date.now() / 1000)}\n`, { flag: 'wx' });
-  } catch {}                              // already recorded, or unwritable: both are non-fatal
+  } catch (e) {
+    // EEXIST is the ordinary case: already recorded, nothing to do. Anything else means a sighting
+    // happened and could NOT be written down, which is the one failure this record cannot absorb —
+    // a later pass has no way to tell it from never having seen anything. It cannot be repaired
+    // here (the same full disk or lost permission would swallow any repair), so it is at least
+    // said out loud instead of vanishing into a bare catch.
+    if (e?.code !== 'EEXIST') {
+      console.error(`sighting-unrecorded: saw "${m}" but could not write its observation record (${e?.code ?? e}) — a later pass may read this attempt as never-conversed`);
+    }
+  }
 }
 
 function rememberUrl(m, url) {
@@ -1484,9 +1493,18 @@ while (Date.now() < deadline) {
   //
   // hasExactMarker, never foldedIncludes: this record is permanent and releases capacity, so a
   // substring of another run's marker must never be able to write it (gate r3 P2).
+  //
+  // The blacklist is deliberately NOT consulted here. It governs what may be COLLECTED: a URL lands
+  // on it because a capture from it failed provenance, and every later scan skips it so a rejected
+  // conversation cannot be replayed. But an exact-marker hit on a blacklisted URL is not more
+  // foreign content — it is proof that a conversation carrying THIS run's marker exists at that
+  // address right now. Sharing the collection filter here would let a URL blacklisted earlier in
+  // this marker's life permanently hide its own conversation from every sighting mechanism at once,
+  // and the reservation would then be retired as never-conversed. lib/pro-gate-lib.sh makes the
+  // same call for the same reason, refusing to gate the predicate on salvage-nonmatching.txt.
   for (const { tab, text } of reads) {
-    if (!text || text.trim() === '' || nonMatching.has(tab.url)) continue;
-    if (hasExactMarker(text, marker)) noteObserved(marker, 'rendered');
+    if (!text || text.trim() === '') continue;
+    if (hasExactMarker(text, marker)) noteObserved(marker, nonMatching.has(tab.url) ? 'rendered-blacklisted' : 'rendered');
   }
   // #162: the modal is account-wide, so decide ownership over the WHOLE scan, never on the first
   // tab in list order (the same order-independence onOurConversation documents): a foreign or

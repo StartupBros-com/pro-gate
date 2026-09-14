@@ -1626,19 +1626,26 @@ pg_conversation_observed_dir() { printf '%s\n' "${PRO_GATE_CONVERSATION_OBSERVED
 # and this gate stops mattering. Deliberately a SIBLING of the sidecar directory, not a file inside
 # it: the 14-day sweep empties that directory, and a stamp swept away would silently become "now".
 pg_conversation_observed_since_file() { printf '%s\n' "${PRO_GATE_CONVERSATION_OBSERVED_SINCE:-$(pg_conversation_observed_dir).since}"; }
-pg_conversation_observed_since() { # -> epoch, creating the stamp on first read
-  local f now stamp
+pg_conversation_observed_since() { # -> epoch; READ ONLY, fails when the stamp is absent
+  local f stamp
   f="$(pg_conversation_observed_since_file)"
-  if [ -s "$f" ]; then
-    stamp="$(head -n1 "$f" 2>/dev/null | tr -dc '0-9')"
-    [ -n "$stamp" ] || return 1
-    printf '%s\n' "$stamp"
-    return 0
-  fi
+  [ -s "$f" ] || return 1
+  stamp="$(head -n1 "$f" 2>/dev/null | tr -dc '0-9')"
+  [ -n "$stamp" ] || return 1
+  printf '%s\n' "$stamp"
+}
+# Planting the stamp is a WRITE, so it happens on write-capable paths only. --status and the
+# advisory review-decision query are documented read-only — "never borrow the regular engine's
+# housekeeping … or binding/publication writes" — and creating this file on first read would have
+# made a diagnostic command mutate PRO_GATE_HOME. A missing stamp therefore means "cannot prove
+# provenance", which holds the reservation, rather than silently minting an answer.
+pg_conversation_observed_since_init() { # idempotent; safe to call on every write-capable run
+  local f now
+  f="$(pg_conversation_observed_since_file)"
+  [ ! -s "$f" ] || return 0
   now="$(date +%s)"
   case "$now" in ''|*[!0-9]*) return 1;; esac
-  printf '%s\n' "$now" > "$f.tmp.$$" 2>/dev/null && mv -f "$f.tmp.$$" "$f" 2>/dev/null || return 1
-  printf '%s\n' "$now"
+  printf '%s\n' "$now" > "$f.tmp.$$" 2>/dev/null && mv -f "$f.tmp.$$" "$f" 2>/dev/null
 }
 pg_conversation_observed() { # marker -> rc 0 when a conversation carrying this marker was ever seen
   local marker="$1"
