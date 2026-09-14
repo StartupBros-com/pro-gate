@@ -832,6 +832,14 @@ ns_retained_check 'never-sent: no classification at all is not an absence proof'
 # is the only survivor, and it alone must stand the release down.
 ns_plant observed absent observed
 ns_retained_check 'never-sent: a recorded sighting holds the reservation when every other trace is gone (#163 r1 P1)' 'plant=observed'
+# #163 gate r2 P2: the operator-facing text must agree with the decision the predicate just made.
+# This state is exactly where they used to disagree — no memo, so the old branch read "none ever
+# has" and promised release without the TTL, while the reservation was in fact being retained.
+PRO_GATE_HOME="$NS_PLANT_HOME" bash "$ENGINE" --status "$NS_PLANT_MARKER" >"$TDIR/ns-observed-status.out" 2>/dev/null
+check 'never-sent: --status does not promise early release for an observed-only attempt (#163 r2 P2)' \
+  "$(! grep -q 'WITHOUT waiting out the TTL' "$TDIR/ns-observed-status.out" \
+     && grep -q 'no longer on file' "$TDIR/ns-observed-status.out"; echo $?)" \
+  "$(cat "$TDIR/ns-observed-status.out")"
 
 # #163 gate r1 P2. --out is reusable across rounds, so a preserved capture is evidence only for the
 # attempt that wrote it. Its own capture still retains; another attempt's no longer blocks it.

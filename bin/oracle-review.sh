@@ -1346,10 +1346,18 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
               # wait out six hours for evidence that could not arrive. Cross-bound and unbindable
               # captures are handled by the branches above, so inside this arm an empty $r_url is
               # exactly the never-sent class.
-              if [ -z "$r_url" ]; then
-                ST_HINT="in-progress reservation $m: no conversation carried this marker on the latest pass, and none ever has — no conversation URL was remembered for it at any point (${r_age:-?}s old, ${r_miss:-0} confirmed miss(es), ${r_ttl_left:-?}s until the TTL is satisfied). This is the never-sent class, so it releases on confirmed misses alone, WITHOUT waiting out the TTL; its round stays charged. Collect it for FREE to add the next confirmed miss: $r_cmd"
-              else
+              # #163 gate r2 P2: ask the release predicate itself, never the memo alone. A sighting
+              # can outlive the URL that proved it — an owned-throttle observation or a cross-bound
+              # conviction leaves the observation sidecar as the only surviving evidence — and in
+              # that state pg_attempt_never_conversed correctly keeps the dual gate while this
+              # branch used to promise release without the TTL. Operator-facing text that
+              # contradicts the actual decision is worse than no hint at all.
+              if pg_attempt_never_conversed "$m" "$r_out"; then
+                ST_HINT="in-progress reservation $m: no conversation carried this marker on the latest pass, and none ever has — nothing this engine recorded shows a conversation for it at any point (${r_age:-?}s old, ${r_miss:-0} confirmed miss(es), ${r_ttl_left:-?}s until the TTL is satisfied). This is the never-sent class, so it releases on confirmed misses alone, WITHOUT waiting out the TTL; its round stays charged. Collect it for FREE to add the next confirmed miss: $r_cmd"
+              elif [ -n "$r_url" ]; then
                 ST_HINT="in-progress reservation $m: no conversation carried this marker on the latest pass, but one was remembered for it earlier ($r_url) (${r_age:-?}s old, ${r_miss:-0} confirmed miss(es), ${r_ttl_left:-?}s until the TTL is satisfied); because that conversation exists, it releases only after the TTL and the miss threshold are both met; collect it for FREE to re-check: $r_cmd"
+              else
+                ST_HINT="in-progress reservation $m: no conversation carried this marker on the latest pass, but one was seen for it earlier and its address is no longer on file (${r_age:-?}s old, ${r_miss:-0} confirmed miss(es), ${r_ttl_left:-?}s until the TTL is satisfied); because that conversation existed, it releases only after the TTL and the miss threshold are both met; collect it for FREE to re-check: $r_cmd"
               fi ;;
             cross-bound)
               ST_HINT="in-progress reservation $m: the latest probe found only another run's completed answer where this conversation was expected (${r_age:-?}s old, ${r_miss:-0} confirmed miss(es), ${r_ttl_left:-?}s until the TTL is satisfied). Do NOT delete state or set PRO_GATE_REQUIRE_NONCE=0; run the harvest so the conviction is recorded: $r_cmd" ;;

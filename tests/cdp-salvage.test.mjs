@@ -1000,12 +1000,22 @@ const MIXED_MARKER = 'pg-run-Test-Case-1234567890-43';
   check('throttled canonical scratch writes cooldown and closes only scratch',
     /canonical scratch/.test(throttleResult.cooldown ?? '') && throttled.closed.includes('scratch1') && !throttled.closed.includes('tab1'),
     `cooldown=${throttleResult.cooldown} closed=${throttled.closed}`);
-  // No sighting is recorded here, deliberately: this render shows throttle copy and never proves
-  // the page carries our marker. The owned-throttle case that does prove it is asserted in the
-  // throttle-modal fixture further down (#163 r1 P1).
-  check('throttled canonical scratch records no sighting it did not prove',
-    throttleResult.observed.length === 0, `observed=${JSON.stringify(throttleResult.observed)}`);
+  // #163 gate r2 P1: the TAB here carries our marker; only the scratch revalidation renders
+  // throttle copy. The sighting is therefore proven before that exit, and must be recorded even
+  // though this path never reaches a memo write.
+  check('throttled canonical scratch keeps the sighting its tab already proved',
+    throttleResult.observed.includes(MARKER), `observed=${JSON.stringify(throttleResult.observed)}`);
   throttled.stop();
+
+  // The reviewer's exact regression: no memo at all, an owned readable source, a throttled
+  // scratch. Before the r2 fix this left no record anywhere — no memo, no inconclusive source —
+  // so later absent probes could retire a conversation this scan had demonstrably seen.
+  const throttledNoMemo = await mockCdp(source, [], { renderText: () => throttle });
+  const noMemoResult = await runScratchSalvage([MARKER, '3'], throttledNoMemo.port);
+  check('owned tab with a throttled scratch and no memo still records the sighting (#163 r2 P1)',
+    noMemoResult.observed.includes(MARKER) && noMemoResult.memos.length === 0,
+    `observed=${JSON.stringify(noMemoResult.observed)} memos=${JSON.stringify(noMemoResult.memos)} status=${noMemoResult.status}`);
+  throttledNoMemo.stop();
 
   const foreignAnswer = [
     `run marker: ${MARKER}`,

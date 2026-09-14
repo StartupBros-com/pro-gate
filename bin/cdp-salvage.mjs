@@ -1510,6 +1510,13 @@ while (Date.now() < deadline) {
       if (tab.url === knownUrl && FOREIGN_MARKER_RE.test(text)) memoStale = true;
       continue;
     }
+    // #163 gate r2 P1: the sighting is proven HERE — this text carries our exact marker — and must
+    // be recorded before anything downstream can exit first. Canonical scratch revalidation below
+    // can trip a throttle interstitial that leaves through tripThrottleEvidence, skipping both the
+    // memo write and the inconclusive-source record; with no earlier memo the attempt then looked
+    // like one that never reached a conversation. Recording at the match, not at URL promotion,
+    // is what makes that unreachable.
+    noteObserved(marker, 'rendered');
     const evidence = classifyEvidence(text, infrastructureError);
     if (evidence.kind === 'cross-bound') {
       rejectCrossBound(tab.url, evidence.foreignMarker, 'tab');
@@ -1621,6 +1628,9 @@ while (Date.now() < deadline) {
       }
       continue;
     }
+    // Same proof, same rule as the open-tab scan above (#163 gate r2 P1): this re-render carries
+    // our marker, so the sighting is recorded before any later classification can exit first.
+    noteObserved(marker, 're-rendered');
     const evidence = onOurConversation(tab.url, classifyEvidence(text));
     if (evidence.kind === 'cross-bound') {
       rejectCrossBound(tab.url, evidence.foreignMarker, 're-rendered');
