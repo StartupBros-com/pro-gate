@@ -1669,20 +1669,44 @@ pg_conversation_observed_since_init() { # idempotent; safe to call on every writ
   rm -f "$tmp" 2>/dev/null
   [ -s "$f" ]
 }
+# #163 gate r7 P1: `[ -e ... ]` is false for a missing file AND for one we were not permitted to
+# look at, and this predicate negates that result into permission to release. A sidecar directory at
+# mode 000 therefore read as "confirmed absence" for evidence that was sitting right there. Absence
+# is only evidence when the absence could actually be established, so answer three states and let
+# the caller retain on the third rather than collapsing it into "not found".
+#   rc 0 = present, 1 = confirmed absent, 2 = cannot tell
+pg_sidecar_state() { # dir marker
+  local dir="$1" marker="$2" parent
+  [ -e "$dir/$marker" ] && return 0
+  if [ -d "$dir" ]; then
+    # Listing needs both: -r to read names, -x to stat entries. Missing either makes -e above
+    # meaningless rather than negative.
+    { [ -r "$dir" ] && [ -x "$dir" ]; } || return 2
+    return 1
+  fi
+  # No directory is only "nothing was ever written here" if we could see that for ourselves.
+  parent="${dir%/*}"; [ -n "$parent" ] || parent=/
+  { [ -d "$parent" ] && [ -r "$parent" ] && [ -x "$parent" ]; } || return 2
+  return 1
+}
 pg_conversation_observed() { # marker -> rc 0 when a conversation carrying this marker was ever seen
   local marker="$1"
   pg_reservation_marker_ok "$marker" || return 1
-  [ -e "$(pg_conversation_observed_dir)/$marker" ]
+  pg_sidecar_state "$(pg_conversation_observed_dir)" "$marker"
 }
 
 pg_attempt_never_conversed() { # marker [out-path]
   local marker="$1" out="${2:-}" class ub prov since minted
   pg_reservation_marker_ok "$marker" || return 1
-  [ ! -e "$PRO_GATE_HOME/conversation-urls/$marker" ] || return 1
-  [ ! -e "$PRO_GATE_HOME/crossbound/$marker" ] || return 1
+  # All three evidence paths use the same tri-state rule (#163 gate r7 P1): only a CONFIRMED
+  # absence (rc 1) may pass. Present (0) retains, and so does "cannot tell" (2) -- an unreadable
+  # directory is not evidence that nothing is in it, and these three are the only records standing
+  # between a live conversation and a released slot.
+  pg_sidecar_state "$PRO_GATE_HOME/conversation-urls" "$marker"; [ $? -eq 1 ] || return 1
+  pg_sidecar_state "$PRO_GATE_HOME/crossbound" "$marker"; [ $? -eq 1 ] || return 1
   # A sighting outlives both records above; the monotonic observation sidecar is the one that
   # cannot be manufactured away by a conviction, an eviction, or a memo prune.
-  ! pg_conversation_observed "$marker" || return 1
+  pg_conversation_observed "$marker"; [ $? -eq 1 ] || return 1
   # #163 gate r3 P1: an absent sidecar only means "never observed" for an attempt that existed
   # while sightings were being recorded. An older attempt has none because the record did not
   # exist, not because nothing was seen — and a pre-upgrade probe could have convicted its
@@ -1780,6 +1804,20 @@ pg_reservation_note_miss() {
     term_kind=recovery-exhausted; term_proof=bounded-recovery-exhausted
   elif [ "$misses" -ge "$miss_limit" ] && pg_attempt_never_conversed "$marker" "$out"; then
     term_kind=never-conversed; term_proof=bounded-absence-never-conversed
+  fi
+  # #163 gate r7 P1: the never-conversed proof above was computed from state sampled before the CDP
+  # probe returned, and the reservation guard does not serialize a collector's sighting write. A
+  # collector can therefore start after the earlier claim check and commit positive evidence while
+  # this function is still deciding. Re-establish the proof immediately before publication, and
+  # stand down if a collector now holds this marker's claim.
+  #
+  # This NARROWS the window; it does not close it. Closing it requires reconciliation to HOLD the
+  # same per-marker collection claim across probe and settlement instead of sampling it, which
+  # changes locking semantics shared with the collector and reaches beyond this issue.
+  if [ "$term_kind" = never-conversed ]; then
+    if pg_harvest_claimed "$marker" || ! pg_attempt_never_conversed "$marker" "$out"; then
+      term_kind=""; term_proof=""
+    fi
   fi
   if [ -n "$term_kind" ]; then
     # The miss threshold is terminal only when durable run-meta can bind the proof to one charged

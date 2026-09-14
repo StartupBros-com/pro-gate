@@ -810,6 +810,19 @@ ns_plant() { # suffix salvage-class plant-kind -> sets NS_VERDICT / NS_PLANT_HOM
     # "cannot prove provenance" exactly as absent does, but unlike absent it makes the initializer's
     # `ln` fail, so a racing or slow initializer cannot hand the authority back.
     revoked)    : > "$home/conversation-observed.since" ;;
+    # #163 gate r7 P1: the sighting is present but the directory cannot be read. `[ -e ]` is false
+    # for that exactly as it is for a missing file, and the old predicate negated it into permission
+    # to release — discarding the one surviving trace after a memo eviction or a probe-only
+    # cross-bind conviction.
+    observed-locked)
+                mkdir -p "$home/conversation-observed"
+                printf 'cross-bound\t1700000064\n' > "$home/conversation-observed/$marker"
+                chmod 000 "$home/conversation-observed" ;;
+    # Same rule on the memo path: an unreadable conversation-urls is not proof of no memo.
+    memo-locked)
+                mkdir -p "$home/conversation-urls"
+                printf 'https://chatgpt.com/c/6a959c8f-c95c-83ea-81b8-85a3ea5d6cbc\n' > "$home/conversation-urls/$marker"
+                chmod 000 "$home/conversation-urls" ;;
     noclass)    rm -f "$home/salvage-class/$marker" ;;
     none)       : ;;
   esac
@@ -889,6 +902,20 @@ check 'never-sent: an initializer still plants a first stamp on a host with none
      PRO_GATE_HOME="$NS_PLANT_HOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_conversation_observed_since_init" >/dev/null 2>&1; \
      [ -s "$NS_PLANT_HOME/conversation-observed.since" ]; echo $?)" \
   "bytes=$(wc -c < "$NS_PLANT_HOME/conversation-observed.since" 2>/dev/null)"
+
+# #163 gate r7 P1: absence is evidence only when the absence could be established. Permission bits
+# do not constrain root, so these two would pass for the wrong reason in a root container -- skip
+# rather than record a vacuous pass.
+if [ "$(id -u)" -ne 0 ]; then
+  ns_plant observed-locked absent observed-locked
+  ns_retained_check 'never-sent: an unreadable observation directory retains rather than releasing (#199 r7 P1)' 'plant=observed-locked'
+  chmod 755 "$NS_PLANT_HOME/conversation-observed" 2>/dev/null || true
+  ns_plant memo-locked absent memo-locked
+  ns_retained_check 'never-sent: an unreadable conversation-urls directory retains rather than releasing (#199 r7 P1)' 'plant=memo-locked'
+  chmod 755 "$NS_PLANT_HOME/conversation-urls" 2>/dev/null || true
+else
+  echo 'ok - never-sent: unreadable-directory checks skipped (running as root, permission bits do not apply)'
+fi
 
 ns_plant unboundother absent unbound-other
 check 'never-sent: another attempt capture at the same --out no longer blocks this release (#163 r1 P2)' \
