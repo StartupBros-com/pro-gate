@@ -1651,12 +1651,23 @@ pg_conversation_observed_since() { # -> epoch; READ ONLY, fails when the stamp i
 # made a diagnostic command mutate PRO_GATE_HOME. A missing stamp therefore means "cannot prove
 # provenance", which holds the reservation, rather than silently minting an answer.
 pg_conversation_observed_since_init() { # idempotent; safe to call on every write-capable run
-  local f now
+  local f now tmp
   f="$(pg_conversation_observed_since_file)"
   [ ! -s "$f" ] || return 0
   now="$(date +%s)"
   case "$now" in ''|*[!0-9]*) return 1;; esac
-  printf '%s\n' "$now" > "$f.tmp.$$" 2>/dev/null && mv -f "$f.tmp.$$" "$f" 2>/dev/null
+  tmp="$f.tmp.$$"
+  printf '%s\n' "$now" > "$tmp" 2>/dev/null || return 1
+  # `ln`, never `mv -f` (#199 gate r6 P1). A hard link FAILS when the target exists, and that is the
+  # whole point: initialization and revocation are not serialized, so a slow initializer can prepare
+  # an epoch, pause, and wake up after another process has already stamped and then revoked. `mv -f`
+  # would publish that stale epoch over the revocation and restore authority for a sighting that was
+  # never recorded. An EARLIER stamp is the unsafe direction -- it makes MORE attempts look eligible.
+  # Combined with revocation leaving an EMPTY file rather than removing it, the target exists from
+  # the first stamp onward, so a revoked host stays revoked: this `ln` can never win again.
+  ln "$tmp" "$f" 2>/dev/null
+  rm -f "$tmp" 2>/dev/null
+  [ -s "$f" ]
 }
 pg_conversation_observed() { # marker -> rc 0 when a conversation carrying this marker was ever seen
   local marker="$1"

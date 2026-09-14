@@ -517,7 +517,10 @@ function runSalvage(args, port, seed, extraEnv = {}) {
       // discarding the memo, so tests assert on its presence, not on the memo's.
       // #199 r5 P2: read it back from wherever PRO_GATE_CONVERSATION_OBSERVED_DIR points, so a
       // writer that ignored the override cannot pass by writing to the default location.
-      const observedDir = (extraEnv.PRO_GATE_CONVERSATION_OBSERVED_DIR ?? path.join(home, 'conversation-observed'))
+      // `||` mirrors the shell's ${VAR:-default} and the writer's own fallback. Using `??` here
+      // would resolve an exported EMPTY override to "" while the code resolved it to the default,
+      // so the assertion would measure the harness rather than the writer (#199 r6 P2).
+      const observedDir = (extraEnv.PRO_GATE_CONVERSATION_OBSERVED_DIR || path.join(home, 'conversation-observed'))
         .replace(/^PG_HOME\//, `${home}/`);
       const observed = (() => {
         try { return fs.readdirSync(observedDir); } catch { return []; }
@@ -532,7 +535,7 @@ function runSalvage(args, port, seed, extraEnv = {}) {
       // The stamp is a sibling of the directory, so it survives that directory being unwritable;
       // its absence afterwards is the proof the failure was failed closed rather than narrated.
       const observedSince = (() => {
-        const f = extraEnv.PRO_GATE_CONVERSATION_OBSERVED_SINCE?.replace(/^PG_HOME\//, `${home}/`) ?? `${observedDir}.since`;
+        const f = (extraEnv.PRO_GATE_CONVERSATION_OBSERVED_SINCE || `${observedDir}.since`).replace(/^PG_HOME\//, `${home}/`);
         try { return fs.readFileSync(f, 'utf8'); } catch { return null; }
       })();
       fs.rmSync(home, { recursive: true, force: true });
@@ -1096,10 +1099,27 @@ const MIXED_MARKER = 'pg-run-Test-Case-1234567890-43';
     fs.writeFileSync(path.join(home, 'conversation-observed'), 'not a directory\n');
     fs.writeFileSync(path.join(home, 'conversation-observed.since'), '1700000000\n');
   });
+  // The stamp is TRUNCATED, not removed (#199 r6 P1): empty reads as "cannot prove provenance" to
+  // the predicate exactly as absent does, but unlike absent it blocks a later initializer's `ln`,
+  // so the revocation cannot be undone by a racing or slow initializer.
   check('an unrecordable sighting revokes the provenance stamp instead of only warning (#199 r5 P1)',
-    unwritableResult.observedSince === null && /revoked the early-release provenance stamp/.test(unwritableResult.stderr ?? ''),
+    unwritableResult.observedSince === '' && /revoked the early-release provenance stamp/.test(unwritableResult.stderr ?? ''),
     `since=${JSON.stringify(unwritableResult.observedSince)} stderr=${(unwritableResult.stderr ?? '').slice(0, 200)}`);
   unwritableCdp.stop();
+
+  // #199 r5/r6 P2: an EXPORTED EMPTY override. The shell resolves ${VAR:-default} to the default
+  // and trusts the default stamp, so the writer must land there too. Under `??` it kept the empty
+  // string, wrote nothing, and then "revoked" a relative .since that never existed — reporting a
+  // successful revocation while the stamp the shell actually reads stayed valid. The sighting
+  // landing in the default location is what proves the two sides agree.
+  const emptyCdp = await mockCdp(`run marker: ${MARKER}\nstill drafting`, [], {});
+  const emptyResult = await runScratchSalvage([MARKER, '3'], emptyCdp.port, (home) => {
+    fs.writeFileSync(path.join(home, 'conversation-observed.since'), '1700000000\n');
+  }, { PRO_GATE_CONVERSATION_OBSERVED_DIR: '', PRO_GATE_CONVERSATION_OBSERVED_SINCE: '' });
+  check('an exported empty observation override falls back exactly as the shell does (#199 r6 P2)',
+    emptyResult.observedDefault.includes(MARKER) && emptyResult.observedSince !== null,
+    `default=${JSON.stringify(emptyResult.observedDefault)} since=${JSON.stringify(emptyResult.observedSince)}`);
+  emptyCdp.stop();
   check('cross-bound canonical scratch closes only scratch',
     crossBound.closed.includes('scratch1') && !crossBound.closed.includes('tab1'), `closed=${crossBound.closed}`);
   crossBound.stop();

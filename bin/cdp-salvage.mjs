@@ -175,8 +175,16 @@ const PENDING_DIR = path.join(PG_HOME, 'pending');
 // and the writer used to hardcode the default, so with an override set every sighting landed
 // somewhere the release predicate never looked and a seen conversation still read as never
 // conversed (#199 gate r5 P2). One resolution rule, mirrored on both sides of the language seam.
-const OBSERVED_DIR = process.env.PRO_GATE_CONVERSATION_OBSERVED_DIR ?? path.join(PG_HOME, 'conversation-observed');
-const OBSERVED_SINCE_FILE = process.env.PRO_GATE_CONVERSATION_OBSERVED_SINCE ?? `${OBSERVED_DIR}.since`;
+// `||`, NOT `??`, and the difference is load-bearing (#199 gate r6 P2). The shell resolves these
+// with ${VAR:-default}, which falls back on an exported EMPTY string; `??` falls back only on
+// null/undefined and would keep the empty one. With PRO_GATE_CONVERSATION_OBSERVED_DIR="" the shell
+// would trust the default stamp while this file tried mkdirSync("") and then "revoked" a relative
+// .since path that does not exist -- reporting a successful revocation while the stamp the shell
+// actually reads stayed valid. Equal fallback semantics on both sides of the seam is the invariant.
+// (PG_HOME, COOLDOWN_FILE and COMPLETED_DIR above still use `??`; pre-existing and out of scope
+// here, but the same divergence would apply to any of them the shell reads with :- .)
+const OBSERVED_DIR = process.env.PRO_GATE_CONVERSATION_OBSERVED_DIR || path.join(PG_HOME, 'conversation-observed');
+const OBSERVED_SINCE_FILE = process.env.PRO_GATE_CONVERSATION_OBSERVED_SINCE || `${OBSERVED_DIR}.since`;
 const MEMO_KEEP = 200;                  // newest N memos retained; older ones are pruned on write
 const MARKER_SAFE_RE = /^pg-run-[A-Za-z0-9.-]+$/;
 // #167: the marker is EXTRACTED case-insensitively everywhere but used to be COMPARED
@@ -407,12 +415,19 @@ function noteObserved(m, why) {
 // write-capable run re-plants it. An earlier comment here claimed no repair was possible because
 // the same disk would swallow it; that over-generalised from a full disk to every failure mode.
 function revokeEarlyRelease(m, cause) {
+  // TRUNCATE, never unlink (#199 gate r6 P1). Removing the file lets the next initializer -- or a
+  // slow one that prepared its epoch before this revocation -- create it again and hand back the
+  // authority we just took away. An empty file is indistinguishable from a missing one to
+  // pg_conversation_observed_since (it requires a non-empty stamp, so both mean "cannot prove
+  // provenance", which holds), but it is very different to pg_conversation_observed_since_init:
+  // its `ln` fails because the target exists. So a revoked host stays revoked until an operator
+  // removes the empty stamp, which is the fail-closed direction and is stated in the warning below.
   let revoked = false;
-  try { fs.unlinkSync(OBSERVED_SINCE_FILE); revoked = true; }
-  catch (e) { if (e?.code === 'ENOENT') revoked = true; }
+  try { fs.writeFileSync(OBSERVED_SINCE_FILE, ''); revoked = true; }
+  catch { revoked = false; }
   const why = cause?.code ?? cause;
   if (revoked) {
-    console.error(`sighting-unrecorded: saw "${m}" but could not write its observation record (${why}); revoked the early-release provenance stamp, so attempts spanning this gap stay held`);
+    console.error(`sighting-unrecorded: saw "${m}" but could not write its observation record (${why}); revoked the early-release provenance stamp, so attempts stay held until an operator removes the empty stamp at ${OBSERVED_SINCE_FILE}`);
   } else {
     console.error(`sighting-unrecorded: saw "${m}" but could not write its observation record (${why}) AND could not revoke the early-release provenance stamp — an attempt seen here may still be read as never-conversed`);
   }

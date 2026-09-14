@@ -802,9 +802,14 @@ ns_plant() { # suffix salvage-class plant-kind -> sets NS_VERDICT / NS_PLANT_HOM
     # The attempt predates sighting recording: its missing sidecar proves nothing, so the dual
     # gate stands even though every other absence check passes.
     inherited)  printf '1700000065\n' > "$home/conversation-observed.since" ;;
-    # No stamp at all. It is created on read as "now", which puts every existing attempt on the
-    # pre-recording side — unreadable provenance holds rather than releases.
+    # No stamp at all. Reading it is READ ONLY (--status and the advisory query must not mutate
+    # PRO_GATE_HOME), so a missing stamp means "cannot prove provenance", which holds rather than
+    # releases; only a write-capable run plants one.
     nostamp)    rm -f "$home/conversation-observed.since" ;;
+    # #199 gate r6 P1: a revocation TRUNCATES the stamp rather than removing it. Empty reads as
+    # "cannot prove provenance" exactly as absent does, but unlike absent it makes the initializer's
+    # `ln` fail, so a racing or slow initializer cannot hand the authority back.
+    revoked)    : > "$home/conversation-observed.since" ;;
     noclass)    rm -f "$home/salvage-class/$marker" ;;
     none)       : ;;
   esac
@@ -865,6 +870,25 @@ ns_plant inherited absent inherited
 ns_retained_check 'never-sent: an attempt minted before sighting recording began is never released (#163 r3 P1)' 'plant=inherited'
 ns_plant nostamp absent nostamp
 ns_retained_check 'never-sent: an absent provenance stamp holds rather than releases' 'plant=nostamp'
+
+# #199 gate r6 P1. Initialization and revocation are not serialized: a slow initializer can prepare
+# an epoch, pause, and wake after another process has stamped and then revoked. When revocation
+# removed the file and init published with `mv -f`, that stale epoch restored authority for a
+# sighting that was never recorded. Revocation now truncates and init links, so the revoked state
+# is a file that exists and is empty — held by the predicate, and unwinnable by a later `ln`.
+ns_plant revoked absent revoked
+ns_retained_check 'never-sent: a revoked (empty) provenance stamp holds the reservation (#199 r6 P1)' 'plant=revoked'
+check 'never-sent: an initializer cannot re-plant a revoked stamp (#199 r6 P1)' \
+  "$(PRO_GATE_HOME="$NS_PLANT_HOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_conversation_observed_since_init" >/dev/null 2>&1; \
+     [ -f "$NS_PLANT_HOME/conversation-observed.since" ] && [ ! -s "$NS_PLANT_HOME/conversation-observed.since" ]; echo $?)" \
+  "bytes=$(wc -c < "$NS_PLANT_HOME/conversation-observed.since" 2>/dev/null)"
+# The same initializer MUST still work on a host that has never stamped, or the gate would hold
+# every attempt forever and the feature would be inert rather than conservative.
+check 'never-sent: an initializer still plants a first stamp on a host with none (#199 r6 P1)' \
+  "$(rm -f "$NS_PLANT_HOME/conversation-observed.since"; \
+     PRO_GATE_HOME="$NS_PLANT_HOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_conversation_observed_since_init" >/dev/null 2>&1; \
+     [ -s "$NS_PLANT_HOME/conversation-observed.since" ]; echo $?)" \
+  "bytes=$(wc -c < "$NS_PLANT_HOME/conversation-observed.since" 2>/dev/null)"
 
 ns_plant unboundother absent unbound-other
 check 'never-sent: another attempt capture at the same --out no longer blocks this release (#163 r1 P2)' \
