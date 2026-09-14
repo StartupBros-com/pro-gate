@@ -7198,6 +7198,81 @@ check 'gate #148 r8 P0: a live owner survives a transient start-time-token read 
   "$([ "$GUARD_TOKFAIL_RC" -ne 0 ] && [ -d "$GUARD_TOKFAIL_DIR" ] && [ -e "$GUARD_TOKFAIL_DIR/owner.$$" ]; echo $?)" \
   "rc=$GUARD_TOKFAIL_RC dir=$([ -d "$GUARD_TOKFAIL_DIR" ] && echo yes || echo NO) marker=$([ -e "$GUARD_TOKFAIL_DIR/owner.$$" ] && echo yes || echo GONE)"
 
+# issue #177: pg_harvest_claimed's no-flock branch and st_inflight (bin/oracle-review.sh) read
+# the SAME owner-pid + process-identity-token shape pg_dirlock_reclaim_dead does above, but
+# compared a possibly-EMPTY recomputed token directly against the stored one: a transient
+# pg_pid_token failure for a perfectly live pid produced an empty string that compared unequal
+# to a valid stored token, so a live holder read as dead. Both now share pg_pid_recycled, the
+# rule extracted from pg_dirlock_reclaim_dead's r8 P0 fix above. Force the no-flock/mkdir-
+# fallback branch (on Linux `pg_have flock` is true and neither function would otherwise reach
+# it); st_inflight has no BASH_SOURCE guard and cannot be sourced, so extract its exact bytes
+# and eval them, same technique as the issue's own repro.
+ISSUE177_HOME="$TDIR/home-issue177"; mkdir -p "$ISSUE177_HOME/harvest-locks"
+ISSUE177_MARKER="pg-run-issue177-probe"
+ISSUE177_FD="$ISSUE177_HOME/harvest-locks/$ISSUE177_MARKER.d"
+
+# (positive) pg_harvest_claimed: live holder (this test process), correct stored token, but the
+# recomputation FAILS -- must still report HELD (0), not FREE (1).
+mkdir -p "$ISSUE177_FD"
+printf '%s\n' "$$" > "$ISSUE177_FD/pid"
+pg_pid_token "$$" > "$ISSUE177_FD/token"
+(
+  pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
+  pg_pid_token() { return 1; }
+  PRO_GATE_HARVEST_LOCK_DIR="$ISSUE177_HOME/harvest-locks" pg_harvest_claimed "$ISSUE177_MARKER"
+); ISSUE177_HC_POS_RC=$?
+check '#177: pg_harvest_claimed (no-flock) -- live holder survives a failing token recompute' \
+  "$([ "$ISSUE177_HC_POS_RC" -eq 0 ]; echo $?)" "rc=$ISSUE177_HC_POS_RC"
+rm -rf "$ISSUE177_FD"
+
+# (planted negative) same shape, but a readable, DIFFERENT token (recycled pid) -- must still
+# report FREE (1); no stubbing here, the real recompute succeeds and differs. This does not by
+# itself prove anything about the flock branch, which never reads a token at all.
+mkdir -p "$ISSUE177_FD"
+printf '%s\n' "$$" > "$ISSUE177_FD/pid"
+printf 'not-the-token-of-this-process\n' > "$ISSUE177_FD/token"
+(
+  pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
+  PRO_GATE_HARVEST_LOCK_DIR="$ISSUE177_HOME/harvest-locks" pg_harvest_claimed "$ISSUE177_MARKER"
+); ISSUE177_HC_NEG_RC=$?
+check '#177: pg_harvest_claimed (no-flock) -- recycled pid (readable, different token) still reads FREE (planted negative)' \
+  "$([ "$ISSUE177_HC_NEG_RC" -eq 1 ]; echo $?)" "rc=$ISSUE177_HC_NEG_RC"
+rm -rf "$ISSUE177_FD"
+
+# st_inflight: identical shape, mkdir-fallback branch selected by the lockfile being a
+# directory (no pg_have involved).
+ISSUE177_ST_DEF="$(sed -n '/^  st_inflight() {/,/^  }/p' "$ENGINE")"
+ISSUE177_ST_LOCKFILE="$TDIR/issue177-oracle.lock"
+ISSUE177_ST_LFD="${ISSUE177_ST_LOCKFILE}.pr-issue177.d"
+
+# (positive) live holder, correct stored token, recomputation FAILS -- must report IN-FLIGHT (0).
+mkdir -p "$ISSUE177_ST_LFD"
+printf '%s\n' "$$" > "$ISSUE177_ST_LFD/pid"
+pg_pid_token "$$" > "$ISSUE177_ST_LFD/token"
+(
+  ST_LOCKFILE="$ISSUE177_ST_LOCKFILE"
+  pg_pid_token() { return 1; }
+  eval "$ISSUE177_ST_DEF"
+  st_inflight issue177
+); ISSUE177_SI_POS_RC=$?
+check '#177: st_inflight (mkdir-fallback) -- live holder survives a failing token recompute' \
+  "$([ "$ISSUE177_SI_POS_RC" -eq 0 ]; echo $?)" \
+  "rc=$ISSUE177_SI_POS_RC def_extracted=$([ -n "$ISSUE177_ST_DEF" ] && echo yes || echo NO)"
+rm -rf "$ISSUE177_ST_LFD"
+
+# (planted negative) readable, DIFFERENT token (recycled pid) -- must still report NOT in flight.
+mkdir -p "$ISSUE177_ST_LFD"
+printf '%s\n' "$$" > "$ISSUE177_ST_LFD/pid"
+printf 'not-the-token-of-this-process\n' > "$ISSUE177_ST_LFD/token"
+(
+  ST_LOCKFILE="$ISSUE177_ST_LOCKFILE"
+  eval "$ISSUE177_ST_DEF"
+  st_inflight issue177
+); ISSUE177_SI_NEG_RC=$?
+check '#177: st_inflight (mkdir-fallback) -- recycled pid (readable, different token) still reads NOT in flight (planted negative)' \
+  "$([ "$ISSUE177_SI_NEG_RC" -eq 1 ]; echo $?)" "rc=$ISSUE177_SI_NEG_RC"
+rm -rf "$ISSUE177_ST_LFD"
+
 # gate #148 r5 P1: the no-BASHPID fallback must name the shell that actually holds the guard.
 # Two contenders, flock disabled AND BASHPID unset — the exact bash 3.2 path, and the only path
 # that uses the fallback at all. When the fallback published an already-exited pid (an `||` inside
@@ -7605,6 +7680,32 @@ printf '%s\n' 'CHOICE: keep | Keep compatibility | Existing users need no migrat
 CHOICE_PARSED="$(pg_review_decision_named_choices "$CHOICE_ART" 2>/dev/null)"; CHOICE_PARSE_RC=$?
 check 'well-formed NEEDS-DISCUSSION artifact yields bounded machine choice outcomes' \
   "$([ "$CHOICE_PARSE_RC" -eq 0 ] && jq -e 'length==2 and .[0].id=="keep" and .[1].id=="replace"' <<<"$CHOICE_PARSED" >/dev/null 2>&1; echo $?)" "$CHOICE_PARSED"
+# #201: the shape a real completed review actually returned — a blank line between the last CHOICE
+# and the VERDICT line. The prompt asks for the choices "immediately before" the verdict, and a
+# model that separates them with an empty line has still obeyed it. Rejecting that emptied the
+# outcomes and left the reducer at invalid-named-choice with no path forward, on a paid round.
+# Reproduced from the artifact of the blocked review (mathfleet #310), ids and text aside.
+{ printf '%s\n' 'P0: none' 'P1: none' ''; \
+  printf '%s\n' 'CHOICE: authoritative-diff | Supply the authoritative pr.diff | Exact coverage cannot be established from the GitHub diff alone.'; \
+  printf '%s\n' 'CHOICE: github-head | Accept the inspected GitHub head as authoritative | The available diff was reviewed; no in-scope defects were identified.'; \
+  printf '%s\n' ''; \
+  printf '%s\n' 'VERDICT: NEEDS-DISCUSSION — missing authoritative attachment prevents exact approval.'; } > "$CHOICE_ART"
+CHOICE_BLANK_PARSED="$(pg_review_decision_named_choices "$CHOICE_ART" 2>/dev/null)"; CHOICE_BLANK_RC=$?
+check '#201: a blank line between the last CHOICE and the VERDICT still yields both outcomes' \
+  "$([ "$CHOICE_BLANK_RC" -eq 0 ] && jq -e 'length==2 and .[0].id=="authoritative-diff" and .[1].id=="github-head"' <<<"$CHOICE_BLANK_PARSED" >/dev/null 2>&1; echo $?)" \
+  "rc=$CHOICE_BLANK_RC parsed=$CHOICE_BLANK_PARSED"
+# Blank lines are tolerated because they carry no grammar; a line with content after the block is
+# still a second block and still ends the parse. Both directions are asserted, so the tolerance
+# cannot silently widen into accepting prose.
+printf '%s\n' 'CHOICE: keep | Keep compatibility | Existing users need no migration.' '' 'and then some prose about the choice' | choice_artifact
+pg_review_decision_named_choices "$CHOICE_ART" >/dev/null 2>&1; CHOICE_PROSE_RC=$?
+check '#201: prose after the choice block still stops closed, blank lines notwithstanding' \
+  "$([ "$CHOICE_PROSE_RC" -ne 0 ]; echo $?)" "rc=$CHOICE_PROSE_RC"
+printf '%s\n' 'CHOICE: keep | Keep compatibility | Existing users need no migration.' '   ' 'CHOICE: replace | Replace API | Users migrate to the new contract.' | choice_artifact
+CHOICE_INNER_PARSED="$(pg_review_decision_named_choices "$CHOICE_ART" 2>/dev/null)"; CHOICE_INNER_RC=$?
+check '#201: a whitespace-only line between two CHOICE lines keeps both' \
+  "$([ "$CHOICE_INNER_RC" -eq 0 ] && jq -e 'length==2' <<<"$CHOICE_INNER_PARSED" >/dev/null 2>&1; echo $?)" \
+  "rc=$CHOICE_INNER_RC parsed=$CHOICE_INNER_PARSED"
 CHOICE_SHELL_SENTINEL="$TDIR/choice-shell-sentinel"
 printf '%s\n' "CHOICE: keep | Keep \$(touch $CHOICE_SHELL_SENTINEL) | Treat this as printable data only." 'CHOICE: replace | Replace | Migrate safely.' | choice_artifact
 CHOICE_SHELL_PARSED="$(pg_review_decision_named_choices "$CHOICE_ART" 2>/dev/null)"; CHOICE_SHELL_RC=$?

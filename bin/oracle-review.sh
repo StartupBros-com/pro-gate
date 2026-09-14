@@ -1203,8 +1203,11 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
       kill -0 "$opid" 2>/dev/null || return 1
       # Token-verify when the lock recorded one: a recycled pid must not report a long-dead
       # holder as RUNNING (gate #61 r2 P1). Token-less locks (legacy) keep the pid-only check.
+      # pg_pid_recycled fails closed (still in flight) on a failed recompute -- issue #177: the
+      # old inline comparison read an empty recompute as "token differs", so a live same-change
+      # review reported as not running, inviting a duplicate paid Pro run.
       otok="$(cat "${lf}.d/token" 2>/dev/null || true)"
-      [ -z "$otok" ] || [ "$(pg_pid_token "$opid" 2>/dev/null || true)" = "$otok" ] || return 1
+      pg_pid_recycled "$opid" "$otok" && return 1
       return 0
     fi
     [ -e "$lf" ] || return 1
