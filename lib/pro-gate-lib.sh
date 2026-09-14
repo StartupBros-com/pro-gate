@@ -3068,6 +3068,14 @@ pg_review_decision_named_choices() { # review artifact -> canonical outcomes JSO
       continue
     fi
     if [[ "$line" != CHOICE:* ]]; then
+      # #201: a whitespace-only line carries no grammar, so it can never be the start of a second
+      # block — and the engine's own prompt asks for the choice lines "immediately before the final
+      # VERDICT line", which a model satisfies while still separating them with an empty line. That
+      # is ordinary formatting, not an uncooperative answer, and rejecting it stranded a completed
+      # NEEDS-DISCUSSION review: the outcomes came back empty and the reducer reduced to
+      # invalid-named-choice with no path forward for the operator, on a round already paid for.
+      # Content after the block still ends the parse, exactly as before.
+      if [ -z "${line//[[:space:]]/}" ]; then continue; fi
       # Choice lines form one terminal block; prose after that block is not a machine grammar.
       [ "$choices_started" = false ] || return 1
       continue
