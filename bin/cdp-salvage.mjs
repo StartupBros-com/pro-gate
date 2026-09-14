@@ -365,6 +365,21 @@ process.on('exit', () => {
   flushCrossBind(marker);
 });
 
+// #163 gate r1 P1: the positive, monotonic record that a conversation carrying this marker was
+// seen at least once. The memo cannot carry that fact — a cross-bound conviction discards it and
+// blacklists the URL without persisting anything (a probe returns before flushCrossBind), the
+// owned-throttle path sees a live conversation before it remembers one, and MEMO_KEEP prunes old
+// memos on write. Create-only and never removed here, so no later eviction can make an observed
+// attempt read as never-conversed; the engine sweeps it with the other marker sidecars.
+function noteObserved(m, why) {
+  if (!m || !MARKER_SAFE_RE.test(m)) return;
+  try {
+    const dir = path.join(PG_HOME, 'conversation-observed');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, m), `${why}\t${Math.floor(Date.now() / 1000)}\n`, { flag: 'wx' });
+  } catch {}                              // already recorded, or unwritable: both are non-fatal
+}
+
 function rememberUrl(m, url) {
   const f = memoPath(m);
   if (!f) return;
@@ -377,6 +392,7 @@ function rememberUrl(m, url) {
     }
     return;
   }
+  noteObserved(m, 'remembered');        // before the no-churn return: the sighting still happened
   if (recallUrl(m) === url) return;     // already known: no churn, no prune
   try {
     fs.mkdirSync(URL_MEMO_DIR, { recursive: true });
@@ -433,6 +449,9 @@ function tripThrottle(where) {
 // every caller backs off through the cooldown written here. Outside probe the existing exit 5
 // applies unchanged: cooldown written, do NOT resubmit, harvest again after the pause.
 function tripThrottleOverConversation(url, where) {
+  // This path is reached only for a conversation rendering this run's EXACT marker, and it reports
+  // that liveness before any memo is written — so record the sighting here too (#163 r1 P1).
+  noteObserved(marker, 'owned-throttled');
   recordThrottle(where);
   if (!probe) process.exit(5);
   console.error(`live conversation: ${url}`);
@@ -1417,6 +1436,9 @@ function rejectForeign(url, source) {
 }
 
 function rejectCrossBound(url, foreignMarker, source) {
+  // The page rendered THIS run's marker, so a conversation for it demonstrably existed — record
+  // that before discarding the URL, which is what otherwise erases the only trace (#163 r1 P1).
+  noteObserved(marker, 'cross-bound');
   discardForeignUrl(url);
   noteCrossBind(marker, url, foreignMarker);
   console.error(`${source} ${url} carries our marker but ANOTHER run's completed answer (${foreignMarker}) — not ours; ignoring it`);

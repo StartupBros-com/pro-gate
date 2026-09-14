@@ -1608,17 +1608,47 @@ pg_reservation_remove() { # marker
 # <url>" for any FOREIGN page this marker's scan rendered and rejected, and #163 was filed on a box
 # holding eight leaked `pro-gate review:` tabs from other PRs — gating on it would make this fix
 # inert in precisely the incident it exists for.
+# #163 gate r1 P1: a missing memo is not proof a conversation was never observed. Two shipped paths
+# destroy the memo while leaving no other trace. A reconciliation --probe that finds a cross-bound
+# page calls rejectCrossBound, which discards the memo and blacklists the URL, while the exit hook
+# above it returns before flushCrossBind for a probe that proved no ownership — so no crossbound/
+# sidecar is ever written, and every later scan skips the blacklisted URL and reports `absent`. The
+# owned-throttle path likewise reports a demonstrably live conversation before remembering its URL.
+# Either way the absence checks below would pass for a conversation that existed. This sidecar is
+# the positive record those paths lacked: written once by the salvage helper at every sighting,
+# never removed while recovery is unresolved (memo pruning and URL eviction cannot touch it), and
+# swept on the same 14-day hygiene as the other marker sidecars.
+pg_conversation_observed_dir() { printf '%s\n' "${PRO_GATE_CONVERSATION_OBSERVED_DIR:-$PRO_GATE_HOME/conversation-observed}"; }
+pg_conversation_observed() { # marker -> rc 0 when a conversation carrying this marker was ever seen
+  local marker="$1"
+  pg_reservation_marker_ok "$marker" || return 1
+  [ -e "$(pg_conversation_observed_dir)/$marker" ]
+}
+
 pg_attempt_never_conversed() { # marker [out-path]
-  local marker="$1" out="${2:-}" class ub
+  local marker="$1" out="${2:-}" class ub prov
   pg_reservation_marker_ok "$marker" || return 1
   [ ! -e "$PRO_GATE_HOME/conversation-urls/$marker" ] || return 1
   [ ! -e "$PRO_GATE_HOME/crossbound/$marker" ] || return 1
+  # A sighting outlives both records above; the monotonic observation sidecar is the one that
+  # cannot be manufactured away by a conviction, an eviction, or a memo prune.
+  ! pg_conversation_observed "$marker" || return 1
   if [ -n "$out" ]; then
     # `if` rather than `[ … ] && return 1`: an unmatched glob would leave the whole loop with
     # status 1, which under the engine's `set -e` would abort the caller instead of falling
     # through to the classification read.
     for ub in "$out".unbound.*; do
-      if [ -e "$ub" ]; then return 1; fi
+      # #163 gate r1 P2: the glob is scoped to an OUTPUT PATH, which a later round may legitimately
+      # reuse, so a preserved capture proves only that SOME attempt wrote one there. The sibling
+      # provenance file names the attempt that did. A capture naming another marker is not this
+      # attempt's evidence; one with no provenance (legacy, or a failed provenance write) stays
+      # fail-closed exactly as before, since it cannot be attributed either way.
+      case "$ub" in *.marker) continue;; esac
+      [ -e "$ub" ] || continue
+      prov=""
+      [ -f "$ub.marker" ] && prov="$(head -n1 "$ub.marker" 2>/dev/null | tr -d '\r\n')"
+      if [ -n "$prov" ] && [ "$prov" != "$marker" ]; then continue; fi
+      return 1
     done
   fi
   class="$(pg_salvage_class_read "$marker" 2>/dev/null || true)"

@@ -508,10 +508,15 @@ function runSalvage(args, port, seed, extraEnv = {}) {
             .map((f) => read(path.join('crossbound', f)) ?? '').join('');
         } catch { return ''; }
       })();
+      // #163 r1 P1: the monotonic sighting record. It is the only trace that survives a conviction
+      // discarding the memo, so tests assert on its presence, not on the memo's.
+      const observed = (() => {
+        try { return fs.readdirSync(path.join(home, 'conversation-observed')); } catch { return []; }
+      })();
       fs.rmSync(home, { recursive: true, force: true });
       resolve({
         status, stdout, stderr, elapsedMs: Date.now() - startedAt,
-        memoUrl: memoUrl?.trim() ?? null, memos, blacklist, cooldown, crossbound, crossboundBody,
+        memoUrl: memoUrl?.trim() ?? null, memos, blacklist, cooldown, crossbound, crossboundBody, observed,
       });
     });
   });
@@ -995,6 +1000,11 @@ const MIXED_MARKER = 'pg-run-Test-Case-1234567890-43';
   check('throttled canonical scratch writes cooldown and closes only scratch',
     /canonical scratch/.test(throttleResult.cooldown ?? '') && throttled.closed.includes('scratch1') && !throttled.closed.includes('tab1'),
     `cooldown=${throttleResult.cooldown} closed=${throttled.closed}`);
+  // No sighting is recorded here, deliberately: this render shows throttle copy and never proves
+  // the page carries our marker. The owned-throttle case that does prove it is asserted in the
+  // throttle-modal fixture further down (#163 r1 P1).
+  check('throttled canonical scratch records no sighting it did not prove',
+    throttleResult.observed.length === 0, `observed=${JSON.stringify(throttleResult.observed)}`);
   throttled.stop();
 
   const foreignAnswer = [
@@ -1010,6 +1020,11 @@ const MIXED_MARKER = 'pg-run-Test-Case-1234567890-43';
   check('cross-bound canonical scratch forgets and blacklists the stale canonical memo',
     crossBoundResult.memos.length === 0 && /mock-conversation/.test(crossBoundResult.blacklist ?? ''),
     `memos=${JSON.stringify(crossBoundResult.memos)} blacklist=${crossBoundResult.blacklist}`);
+  // #163 r1 P1: the conviction above erases the memo and blacklists the URL, so every later scan
+  // reports `absent`. The sighting record is what keeps that from reading as "never conversed".
+  check('cross-bound canonical scratch still records the sighting the conviction erased',
+    crossBoundResult.observed.includes(MARKER),
+    `observed=${JSON.stringify(crossBoundResult.observed)} memos=${JSON.stringify(crossBoundResult.memos)}`);
   check('cross-bound canonical scratch closes only scratch',
     crossBound.closed.includes('scratch1') && !crossBound.closed.includes('tab1'), `closed=${crossBound.closed}`);
   crossBound.stop();
@@ -3380,6 +3395,12 @@ const FOREIGN_ANSWER = (m) => [
   check('probe under the throttle modal opens no scratch render against the limited account',
     probed.created.length === 0 && !probed.closed.includes('tab1'),
     `created=${JSON.stringify(probed.created)} closed=${probed.closed}`);
+  // #163 r1 P1: this page demonstrably carries our marker, and the path reports that liveness and
+  // exits before any memo is written. Without a recorded sighting, losing this tab would leave a
+  // still-recoverable attempt looking like one that never reached a conversation at all.
+  check('probe under the throttle modal records the sighting before any memo exists',
+    r.observed.includes(MARKER) && r.memos.length === 0,
+    `observed=${JSON.stringify(r.observed)} memos=${JSON.stringify(r.memos)}`);
   probed.stop();
 
   const harvested = await mockCdp(conversation, [], { throttleModal: modal });

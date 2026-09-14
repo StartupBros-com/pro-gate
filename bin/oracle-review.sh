@@ -2713,6 +2713,10 @@ if [ -n "$HARVEST_MARKER" ]; then
       pg_finish 3
     fi
     case "$aside" in "$WORK"/*) PG_KEEP_FINAL=1;; esac
+    # #163 gate r1 P2: name the attempt this capture belongs to. The aside path is derived from
+    # --out, which a later round may legitimately reuse, so the file alone cannot say whose
+    # evidence it is; without this, one round's preserved capture blocks the next round's release.
+    printf '%s\n' "$RUN_MARKER" > "$aside.marker" 2>/dev/null || true
     res_key="${RUN_MARKER#pg-run-}"; res_key="${res_key%-*-*}"
     # Retain an existing reservation byte-for-byte for rejected ownership. A missing record
     # still needs the ordinary exit-9 recovery protection, using this same charged attempt.
@@ -3422,6 +3426,9 @@ find "$PRO_GATE_HOME/conversation-urls" -maxdepth 1 -type f -mmin +20160 -delete
 find "$PRO_GATE_HOME/crossbound" -maxdepth 1 -type f -mmin +20160 -delete 2>/dev/null || true
 # v0.42 (#109): salvage classification sidecars ride the same horizon as the memos they describe.
 find "$(pg_salvage_class_dir)" -maxdepth 1 -type f -mmin +20160 -delete 2>/dev/null || true
+# #163: the observation sidecar is the memo's positive counterpart, so it expires with the memo
+# rather than outliving the recovery window it protects.
+find "$(pg_conversation_observed_dir)" -maxdepth 1 -type f -mmin +20160 -delete 2>/dev/null || true
 # Canonical title memos serve the same late-harvest lifecycle as URL memos. Sequence counters
 # remain exempt below because they prevent server-side title reuse across idle windows.
 find "$(pg_conversation_title_dir)" -maxdepth 1 -type f -mmin +20160 -delete 2>/dev/null || true
@@ -4335,6 +4342,8 @@ if [ -n "$FINAL_SNAP" ]; then
       PG_PRESERVE_STATE=1; PG_KEEP_FINAL=1; PG_FINAL_SRC="$FINAL_SNAP"
       echo "ERROR: rejected evidence retained at $FINAL_SNAP; could not write $OUT.unbound.$$." >&2
     fi
+    # Same provenance as the harvest path above (#163 gate r1 P2).
+    printf '%s\n' "$RUN_MARKER" > "$OUT.unbound.$$.marker" 2>/dev/null || true
     case "$OUT.unbound.$$" in "$WORK"/*) PG_KEEP_FINAL=1;; esac
     FINAL_SNAP=""
     SALVAGE_RAN=1; SALVAGE_PRESERVE=1

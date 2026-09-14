@@ -779,6 +779,19 @@ ns_plant() { # suffix salvage-class plant-kind -> sets NS_VERDICT / NS_PLANT_HOM
     crossbound) mkdir -p "$home/crossbound"
                 printf '2026-01-01T00:00:00Z\thttps://chatgpt.com/c/x\tpg-run-other-9-1-1\n' > "$home/crossbound/$marker" ;;
     unbound)    : > "$out.unbound.4242" ;;
+    # #163 gate r1 P1: the sighting record two shipped paths leave behind when the memo itself is
+    # gone — a probe that convicts a cross-bound page (memo discarded, URL blacklisted, conviction
+    # never persisted) and the owned-throttle path that reports a live conversation before
+    # remembering it. Both look exactly like "absent" to every later scan.
+    observed)   mkdir -p "$home/conversation-observed"
+                printf 'cross-bound\t1700000064\n' > "$home/conversation-observed/$marker" ;;
+    # #163 gate r1 P2: an unbindable capture is evidence only for the attempt that wrote it.
+    unbound-mine)
+                : > "$out.unbound.4242"
+                printf '%s\n' "$marker" > "$out.unbound.4242.marker" ;;
+    unbound-other)
+                : > "$out.unbound.4242"
+                printf 'pg-run-acme-other-99-1700000099-99\n' > "$out.unbound.4242.marker" ;;
     noclass)    rm -f "$home/salvage-class/$marker" ;;
     none)       : ;;
   esac
@@ -812,6 +825,23 @@ ns_plant unbound absent unbound
 ns_retained_check 'never-sent: an unbindable capture keeps the reservation held (bytes came from a conversation)' 'plant=unbound'
 ns_plant noclass absent noclass
 ns_retained_check 'never-sent: no classification at all is not an absence proof' 'plant=noclass'
+
+# #163 gate r1 P1. The memo, the crossbound sidecar and the capture can all be gone while the
+# conversation demonstrably existed: rejectCrossBound discards the memo and blacklists the URL, and
+# a probe returns before flushCrossBind, so every later scan reports `absent`. The sighting record
+# is the only survivor, and it alone must stand the release down.
+ns_plant observed absent observed
+ns_retained_check 'never-sent: a recorded sighting holds the reservation when every other trace is gone (#163 r1 P1)' 'plant=observed'
+
+# #163 gate r1 P2. --out is reusable across rounds, so a preserved capture is evidence only for the
+# attempt that wrote it. Its own capture still retains; another attempt's no longer blocks it.
+ns_plant unboundmine absent unbound-mine
+ns_retained_check 'never-sent: this attempt own unbindable capture still holds the reservation' 'plant=unbound-mine'
+ns_plant unboundother absent unbound-other
+check 'never-sent: another attempt capture at the same --out no longer blocks this release (#163 r1 P2)' \
+  "$([ "$NS_VERDICT" = released ] && [ ! -e "$NS_PLANT_HOME/in-progress/$NS_PLANT_MARKER" ] \
+     && jq -e '.terminal_kind=="never-conversed"' "$NS_PLANT_HOME/attempt-dispositions/$NS_PLANT_MARKER" >/dev/null 2>&1; echo $?)" \
+  "verdict=$NS_VERDICT disposition=$(cat "$NS_PLANT_HOME/attempt-dispositions/$NS_PLANT_MARKER" 2>/dev/null)"
 
 # The other seven allowlisted classes all describe a page that exists, or absence of evidence
 # rather than evidence of absence. None of them may reach the new branch.
