@@ -921,6 +921,10 @@ check 'never-sent: the disposition enum accepts exactly the new pair and rejects
 NS_HINT_HOME="$TDIR/home-ns-hint"; NS_HINT_KEY=acme-nshint-67
 NS_HINT_MARKER='pg-run-acme-nshint-67-1700000067-67'
 mkdir -p "$NS_HINT_HOME/in-progress" "$NS_HINT_HOME/rounds" "$NS_HINT_HOME/salvage-class" "$NS_HINT_HOME/conversation-urls"
+# Sighting recording began before this attempt was minted (#163 gate r3 P1). Without the stamp the
+# provenance gate would hold the reservation and status would correctly say so, which is a
+# different case — the one the `inherited` plant covers — not the memo-less case under test here.
+printf '1700000000\n' > "$NS_HINT_HOME/conversation-observed.since"
 printf '%s\t%s/nshint.md\t%s\t1\t1\t\t1700000067\n' "$NS_HINT_KEY" "$TDIR" "$(date +%s)" > "$NS_HINT_HOME/in-progress/$NS_HINT_MARKER"
 printf 'absent\t%s\n' "$(date +%s)" > "$NS_HINT_HOME/salvage-class/$NS_HINT_MARKER"
 PRO_GATE_HOME="$NS_HINT_HOME" bash "$ENGINE" --status "$NS_HINT_MARKER" >"$TDIR/ns-hint-nomemo.out" 2>/dev/null
