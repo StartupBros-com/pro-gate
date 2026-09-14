@@ -4372,6 +4372,10 @@ if [ -n "$FINAL_SNAP" ] \
   # never accept. PRO_GATE_REQUIRE_NONCE=0 restores best-effort acceptance.
   echo "[oracle-review] captured a complete review that cannot be bound to this run (no run-marker echo); NOT accepting it. Preserving for --harvest; inspect $OUT.unbound.$$ (PRO_GATE_REQUIRE_NONCE=0 accepts best-effort)." >&2
   mv "$FINAL_SNAP" "$OUT.unbound.$$" 2>/dev/null || rm -f "$FINAL_SNAP"
+  # #163 gate r3 P2: the nonce-less path preserves a capture the same way the two branches above
+  # do, so it owes the same provenance. Without it this capture is attributed to the output path
+  # rather than to the attempt, and a later round reusing --out inherits the block.
+  printf '%s\n' "$RUN_MARKER" > "$OUT.unbound.$$.marker" 2>/dev/null || true
   FINAL_SNAP=""
   rm -f "$CAPTURE_OUT" 2>/dev/null
   SALVAGE_RAN=1; SALVAGE_PRESERVE=1

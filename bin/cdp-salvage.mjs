@@ -392,7 +392,6 @@ function rememberUrl(m, url) {
     }
     return;
   }
-  noteObserved(m, 'remembered');        // before the no-churn return: the sighting still happened
   if (recallUrl(m) === url) return;     // already known: no churn, no prune
   try {
     fs.mkdirSync(URL_MEMO_DIR, { recursive: true });
@@ -449,9 +448,6 @@ function tripThrottle(where) {
 // every caller backs off through the cooldown written here. Outside probe the existing exit 5
 // applies unchanged: cooldown written, do NOT resubmit, harvest again after the pause.
 function tripThrottleOverConversation(url, where) {
-  // This path is reached only for a conversation rendering this run's EXACT marker, and it reports
-  // that liveness before any memo is written — so record the sighting here too (#163 r1 P1).
-  noteObserved(marker, 'owned-throttled');
   recordThrottle(where);
   if (!probe) process.exit(5);
   console.error(`live conversation: ${url}`);
@@ -1436,9 +1432,6 @@ function rejectForeign(url, source) {
 }
 
 function rejectCrossBound(url, foreignMarker, source) {
-  // The page rendered THIS run's marker, so a conversation for it demonstrably existed — record
-  // that before discarding the URL, which is what otherwise erases the only trace (#163 r1 P1).
-  noteObserved(marker, 'cross-bound');
   discardForeignUrl(url);
   noteCrossBind(marker, url, foreignMarker);
   console.error(`${source} ${url} carries our marker but ANOTHER run's completed answer (${foreignMarker}) — not ours; ignoring it`);
@@ -1483,6 +1476,18 @@ while (Date.now() < deadline) {
     ]);
     return { tab, text, infrastructureError, throttleModal };
   }));
+  // #163 gate r3: record every sighting in this batch BEFORE anything can exit. The modal branch
+  // immediately below ends the whole scan through tripThrottleEvidence whenever ANY tab carries
+  // the limiter's modal — including a foreign one listed alongside ours — and the per-tab loop has
+  // its own early exits. A conversation this scan demonstrably read could otherwise leave no trace
+  // at all, and a later absence would then read as "never conversed".
+  //
+  // hasExactMarker, never foldedIncludes: this record is permanent and releases capacity, so a
+  // substring of another run's marker must never be able to write it (gate r3 P2).
+  for (const { tab, text } of reads) {
+    if (!text || text.trim() === '' || nonMatching.has(tab.url)) continue;
+    if (hasExactMarker(text, marker)) noteObserved(marker, 'rendered');
+  }
   // #162: the modal is account-wide, so decide ownership over the WHOLE scan, never on the first
   // tab in list order (the same order-independence onOurConversation documents): a foreign or
   // blacklisted tab listed ahead of ours must not hide the proof that our conversation exists.
@@ -1510,13 +1515,6 @@ while (Date.now() < deadline) {
       if (tab.url === knownUrl && FOREIGN_MARKER_RE.test(text)) memoStale = true;
       continue;
     }
-    // #163 gate r2 P1: the sighting is proven HERE — this text carries our exact marker — and must
-    // be recorded before anything downstream can exit first. Canonical scratch revalidation below
-    // can trip a throttle interstitial that leaves through tripThrottleEvidence, skipping both the
-    // memo write and the inconclusive-source record; with no earlier memo the attempt then looked
-    // like one that never reached a conversation. Recording at the match, not at URL promotion,
-    // is what makes that unreachable.
-    noteObserved(marker, 'rendered');
     const evidence = classifyEvidence(text, infrastructureError);
     if (evidence.kind === 'cross-bound') {
       rejectCrossBound(tab.url, evidence.foreignMarker, 'tab');
@@ -1628,9 +1626,9 @@ while (Date.now() < deadline) {
       }
       continue;
     }
-    // Same proof, same rule as the open-tab scan above (#163 gate r2 P1): this re-render carries
-    // our marker, so the sighting is recorded before any later classification can exit first.
-    noteObserved(marker, 're-rendered');
+    // A fresh render is a real page load, so an exact match here is a sighting just like the
+    // open-tab scan's, recorded before any classification below can exit first (#163 gate r3).
+    if (hasExactMarker(text, marker)) noteObserved(marker, 're-rendered');
     const evidence = onOurConversation(tab.url, classifyEvidence(text));
     if (evidence.kind === 'cross-bound') {
       rejectCrossBound(tab.url, evidence.foreignMarker, 're-rendered');
@@ -1664,6 +1662,9 @@ while (Date.now() < deadline) {
     console.error(`no open tab carries "${marker}" — re-rendering the remembered conversation ${seedUrl} (${seededRenders}/${MAX_SEEDED_RENDERS})...`);
     const { text, evidence: renderEvidence } = await freshRenderText(seedUrl, port, deadline);
     if (text) {
+      // The remembered conversation re-rendered and carries our marker: a sighting with no open
+      // tab at all, recorded before the branches below can exit (#163 gate r3).
+      if (hasExactMarker(text, marker)) noteObserved(marker, 'remembered-render');
       const evidence = renderEvidence ?? classifyEvidence(text);
       if (evidence.kind === 'throttle') tripThrottleEvidence(seedUrl, evidence, `remembered render ${seedUrl}`);
       if (evidence.kind === 'cross-bound') {

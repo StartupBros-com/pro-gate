@@ -703,6 +703,9 @@ NS_HOME="$TDIR/home-never-sent"; NS_KEY=acme-nosend-63
 NS_MARKER='pg-run-acme-nosend-63-1700000063-63'; NS_EPOCH=1700000063
 NS_OUT="$TDIR/nosend.md"
 mkdir -p "$NS_HOME/in-progress" "$NS_HOME/run-meta" "$NS_HOME/rounds" "$NS_HOME/review-input-bindings"
+# Sighting recording began before this attempt was minted (#163 gate r3 P1), so a missing sidecar
+# here means the scan genuinely saw nothing rather than that nothing was being recorded.
+printf '1700000000\n' > "$NS_HOME/conversation-observed.since"
 printf '%s\n' "$NS_EPOCH" > "$NS_HOME/rounds/$NS_KEY"
 printf 'github.com\tacme\tnosend\t%s\t63\t%s\t%s\n' "$NS_KEY" "$NS_OUT" "$NS_EPOCH" > "$NS_HOME/run-meta/$NS_MARKER"
 NS_CREATED="$(date +%s)"
@@ -773,6 +776,10 @@ ns_plant() { # suffix salvage-class plant-kind -> sets NS_VERDICT / NS_PLANT_HOM
   printf 'github.com\tacme\tns%s\t%s\t64\t%s\t1700000064\n' "$suffix" "$key" "$out" > "$home/run-meta/$marker"
   printf '%s\t%s\t%s\t0\t1\t\t1700000064\n' "$key" "$out" "$(date +%s)" > "$home/in-progress/$marker"
   printf '%s\t%s\n' "$class" "$(date +%s)" > "$home/salvage-class/$marker"
+  # #163 gate r3 P1: sighting recording began before this attempt was minted, which is what makes
+  # a missing sidecar mean "never observed" rather than "we were not recording yet". The plants
+  # below can overwrite it to put the attempt on the other side of that line.
+  printf '1700000000\n' > "$home/conversation-observed.since"
   case "$plant" in
     memo)       mkdir -p "$home/conversation-urls"
                 printf 'https://chatgpt.com/c/6a959c8f-c95c-83ea-81b8-85a3ea5d6cbc\n' > "$home/conversation-urls/$marker" ;;
@@ -792,6 +799,12 @@ ns_plant() { # suffix salvage-class plant-kind -> sets NS_VERDICT / NS_PLANT_HOM
     unbound-other)
                 : > "$out.unbound.4242"
                 printf 'pg-run-acme-other-99-1700000099-99\n' > "$out.unbound.4242.marker" ;;
+    # The attempt predates sighting recording: its missing sidecar proves nothing, so the dual
+    # gate stands even though every other absence check passes.
+    inherited)  printf '1700000065\n' > "$home/conversation-observed.since" ;;
+    # No stamp at all. It is created on read as "now", which puts every existing attempt on the
+    # pre-recording side — unreadable provenance holds rather than releases.
+    nostamp)    rm -f "$home/conversation-observed.since" ;;
     noclass)    rm -f "$home/salvage-class/$marker" ;;
     none)       : ;;
   esac
@@ -845,6 +858,14 @@ check 'never-sent: --status does not promise early release for an observed-only 
 # attempt that wrote it. Its own capture still retains; another attempt's no longer blocks it.
 ns_plant unboundmine absent unbound-mine
 ns_retained_check 'never-sent: this attempt own unbindable capture still holds the reservation' 'plant=unbound-mine'
+# #163 gate r3 P1, the provenance gate. An attempt minted before recording began has no sidecar
+# because the record did not exist, which is not evidence that nothing was seen — and a pre-upgrade
+# conviction could have erased its memo without persisting anything. Both shapes must hold.
+ns_plant inherited absent inherited
+ns_retained_check 'never-sent: an attempt minted before sighting recording began is never released (#163 r3 P1)' 'plant=inherited'
+ns_plant nostamp absent nostamp
+ns_retained_check 'never-sent: an absent provenance stamp holds rather than releases' 'plant=nostamp'
+
 ns_plant unboundother absent unbound-other
 check 'never-sent: another attempt capture at the same --out no longer blocks this release (#163 r1 P2)' \
   "$([ "$NS_VERDICT" = released ] && [ ! -e "$NS_PLANT_HOME/in-progress/$NS_PLANT_MARKER" ] \
@@ -863,6 +884,7 @@ done
 NS_TTL_HOME="$TDIR/home-ns-ttl"; NS_TTL_KEY=acme-nsttl-65
 NS_TTL_MARKER='pg-run-acme-nsttl-65-1700000065-65'
 mkdir -p "$NS_TTL_HOME/in-progress" "$NS_TTL_HOME/run-meta" "$NS_TTL_HOME/rounds" "$NS_TTL_HOME/salvage-class"
+printf '1700000000\n' > "$NS_TTL_HOME/conversation-observed.since"
 printf '1700000065\n' > "$NS_TTL_HOME/rounds/$NS_TTL_KEY"
 printf 'github.com\tacme\tnsttl\t%s\t65\t/tmp/nsttl.md\t1700000065\n' "$NS_TTL_KEY" > "$NS_TTL_HOME/run-meta/$NS_TTL_MARKER"
 printf '%s\t/tmp/nsttl.md\t%s\t0\t1\t\t1700000065\n' "$NS_TTL_KEY" "$(( $(date +%s) - 30000 ))" > "$NS_TTL_HOME/in-progress/$NS_TTL_MARKER"

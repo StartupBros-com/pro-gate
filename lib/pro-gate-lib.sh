@@ -1619,6 +1619,27 @@ pg_reservation_remove() { # marker
 # never removed while recovery is unresolved (memo pruning and URL eviction cannot touch it), and
 # swept on the same 14-day hygiene as the other marker sidecars.
 pg_conversation_observed_dir() { printf '%s\n' "${PRO_GATE_CONVERSATION_OBSERVED_DIR:-$PRO_GATE_HOME/conversation-observed}"; }
+# #163 gate r3 P1: the epoch at which sighting recording began on this host. A sidecar that did not
+# exist yesterday cannot speak for yesterday's attempts, so the early release must never reason
+# about a period when nothing was recorded. Created on first read and never rewritten, which makes
+# an upgrade exclude every attempt already in flight; one reservation TTL later nothing predates it
+# and this gate stops mattering. Deliberately a SIBLING of the sidecar directory, not a file inside
+# it: the 14-day sweep empties that directory, and a stamp swept away would silently become "now".
+pg_conversation_observed_since_file() { printf '%s\n' "${PRO_GATE_CONVERSATION_OBSERVED_SINCE:-$(pg_conversation_observed_dir).since}"; }
+pg_conversation_observed_since() { # -> epoch, creating the stamp on first read
+  local f now stamp
+  f="$(pg_conversation_observed_since_file)"
+  if [ -s "$f" ]; then
+    stamp="$(head -n1 "$f" 2>/dev/null | tr -dc '0-9')"
+    [ -n "$stamp" ] || return 1
+    printf '%s\n' "$stamp"
+    return 0
+  fi
+  now="$(date +%s)"
+  case "$now" in ''|*[!0-9]*) return 1;; esac
+  printf '%s\n' "$now" > "$f.tmp.$$" 2>/dev/null && mv -f "$f.tmp.$$" "$f" 2>/dev/null || return 1
+  printf '%s\n' "$now"
+}
 pg_conversation_observed() { # marker -> rc 0 when a conversation carrying this marker was ever seen
   local marker="$1"
   pg_reservation_marker_ok "$marker" || return 1
@@ -1626,13 +1647,24 @@ pg_conversation_observed() { # marker -> rc 0 when a conversation carrying this 
 }
 
 pg_attempt_never_conversed() { # marker [out-path]
-  local marker="$1" out="${2:-}" class ub prov
+  local marker="$1" out="${2:-}" class ub prov since minted
   pg_reservation_marker_ok "$marker" || return 1
   [ ! -e "$PRO_GATE_HOME/conversation-urls/$marker" ] || return 1
   [ ! -e "$PRO_GATE_HOME/crossbound/$marker" ] || return 1
   # A sighting outlives both records above; the monotonic observation sidecar is the one that
   # cannot be manufactured away by a conviction, an eviction, or a memo prune.
   ! pg_conversation_observed "$marker" || return 1
+  # #163 gate r3 P1: an absent sidecar only means "never observed" for an attempt that existed
+  # while sightings were being recorded. An older attempt has none because the record did not
+  # exist, not because nothing was seen — and a pre-upgrade probe could have convicted its
+  # conversation, discarded the memo and blacklisted the URL while persisting no conviction at all,
+  # leaving it indistinguishable from a never-sent attempt. Compare the marker's own minting epoch
+  # against the stamp; an unreadable stamp or an unparseable marker is "cannot tell", which holds.
+  since="$(pg_conversation_observed_since 2>/dev/null || true)"
+  case "$since" in ''|*[!0-9]*) return 1;; esac
+  minted="$(pg_marker_epoch "$marker" 2>/dev/null || true)"
+  case "$minted" in ''|*[!0-9]*) return 1;; esac
+  [ "$minted" -ge "$since" ] || return 1
   if [ -n "$out" ]; then
     # `if` rather than `[ … ] && return 1`: an unmatched glob would leave the whole loop with
     # status 1, which under the engine's `set -e` would abort the caller instead of falling
