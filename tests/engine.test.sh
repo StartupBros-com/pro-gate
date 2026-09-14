@@ -688,6 +688,194 @@ check 'placeholder drain never announces or records a refund' \
 check 'the real-id reservation is untouched by the placeholder drain' \
   "$([ -f "$DRAIN_HOME/in-progress/$REAL_MARKER" ] && [ ! -e "$DRAIN_HOME/attempt-dispositions/$REAL_MARKER" ]; echo $?)" "$(ls "$DRAIN_HOME/in-progress" 2>/dev/null | tr '\n' ' ')"
 
+# v0.49 (#163): the never-sent class. A run whose prompt never reached a conversation is the ONE
+# attempt that can never produce one, so the TTL half of the dual gate buys no evidence while its
+# shared slot stays held — four such attempts held every slot on the reporting box at once and no
+# session could start a round anywhere. Bounded confirmed absences alone now retire it, but ONLY
+# when nothing this engine ever recorded shows a conversation for the marker.
+#
+# That last clause is the #109 authority boundary and every planted case below defends it: a
+# conversation that EXISTS and has merely become untraceable keeps the full TTL-plus-misses gate.
+# The mock is still serving a page with no run marker at all, so this drives the REAL chain —
+# pg_reservation_reconcile -> cdp-salvage.mjs --probe -> `evidence-kind: absent` -> note_miss.
+echo '# v0.49 (#163): a never-sent attempt releases its slot on confirmed misses alone'
+NS_HOME="$TDIR/home-never-sent"; NS_KEY=acme-nosend-63
+NS_MARKER='pg-run-acme-nosend-63-1700000063-63'; NS_EPOCH=1700000063
+NS_OUT="$TDIR/nosend.md"
+mkdir -p "$NS_HOME/in-progress" "$NS_HOME/run-meta" "$NS_HOME/rounds" "$NS_HOME/review-input-bindings"
+printf '%s\n' "$NS_EPOCH" > "$NS_HOME/rounds/$NS_KEY"
+printf 'github.com\tacme\tnosend\t%s\t63\t%s\t%s\n' "$NS_KEY" "$NS_OUT" "$NS_EPOCH" > "$NS_HOME/run-meta/$NS_MARKER"
+NS_CREATED="$(date +%s)"
+printf '%s\t%s\t%s\t0\t1\t\t%s\n' "$NS_KEY" "$NS_OUT" "$NS_CREATED" "$NS_EPOCH" > "$NS_HOME/in-progress/$NS_MARKER"
+# A plausible input binding: only the not-submitted REFUND path may unlink one, so its survival is
+# the direct evidence that this release did not quietly become a refund.
+printf '{"marker":"%s"}\n' "$NS_MARKER" > "$NS_HOME/review-input-bindings/$NS_MARKER"
+ns_probe() {
+  PRO_GATE_HOME="$NS_HOME" PRO_GATE_RESERVATION_MISSES=3 PRO_GATE_RECONCILE_INTERVAL=0 \
+    bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_reconcile '$HERE/../bin/cdp-salvage.mjs' '$PORT'" >"$TDIR/nosend.log" 2>&1
+}
+ns_probe
+check 'never-sent: the first live probe classifies absent, counts one miss, and remembers no URL' \
+  "$([ ! -e "$NS_HOME/conversation-urls/$NS_MARKER" ] \
+     && awk -F'\t' 'NR==1{exit !($1=="absent")}' "$NS_HOME/salvage-class/$NS_MARKER" 2>/dev/null \
+     && awk -F'\t' 'NR==1{exit !($4==1)}' "$NS_HOME/in-progress/$NS_MARKER"; echo $?)" \
+  "class=$(cat "$NS_HOME/salvage-class/$NS_MARKER" 2>/dev/null) record=$(cat "$NS_HOME/in-progress/$NS_MARKER" 2>/dev/null) log=$(tail -3 "$TDIR/nosend.log")"
+ns_probe
+check 'never-sent: two confirmed absences still hold the reservation and its slot' \
+  "$([ -f "$NS_HOME/in-progress/$NS_MARKER" ] && [ ! -e "$NS_HOME/attempt-dispositions/$NS_MARKER" ] \
+     && awk -F'\t' 'NR==1{exit !($4==2)}' "$NS_HOME/in-progress/$NS_MARKER"; echo $?)" \
+  "record=$(cat "$NS_HOME/in-progress/$NS_MARKER" 2>/dev/null) log=$(tail -3 "$TDIR/nosend.log")"
+ns_probe
+NS_ELAPSED=$(( $(date +%s) - NS_CREATED ))
+check 'never-sent: the third confirmed absence releases the reservation far inside the 6h TTL' \
+  "$([ ! -e "$NS_HOME/in-progress/$NS_MARKER" ] && [ "$NS_ELAPSED" -lt 600 ]; echo $?)" \
+  "age=${NS_ELAPSED}s of a 21600s default TTL; record=$(cat "$NS_HOME/in-progress/$NS_MARKER" 2>/dev/null) log=$(tail -3 "$TDIR/nosend.log")"
+check 'never-sent: the disposition names the never-conversed class and its bounded-absence proof' \
+  "$(jq -e --arg m "$NS_MARKER" '.marker==$m and .terminal_kind=="never-conversed" and .proof_kind=="bounded-absence-never-conversed" and .charged_spend_epoch==1700000063' "$NS_HOME/attempt-dispositions/$NS_MARKER" >/dev/null 2>&1; echo $?)" \
+  "disposition=$(cat "$NS_HOME/attempt-dispositions/$NS_MARKER" 2>/dev/null)"
+check 'never-sent: the charged round, its input binding, and silence about refunds all survive' \
+  "$(grep -qx "$NS_EPOCH" "$NS_HOME/rounds/$NS_KEY" && [ -f "$NS_HOME/review-input-bindings/$NS_MARKER" ] \
+     && ! grep -qi refund "$TDIR/nosend.log"; echo $?)" \
+  "rounds=$(cat "$NS_HOME/rounds/$NS_KEY" 2>/dev/null) binding=$(ls "$NS_HOME/review-input-bindings" 2>/dev/null) log=$(tail -5 "$TDIR/nosend.log")"
+check 'never-sent: the released reservation stops consuming its account slot' \
+  "$([ "$(PRO_GATE_HOME="$NS_HOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_slot_plan 1" | cut -d'|' -f3)" = 1 ]; echo $?)" \
+  "plan=$(PRO_GATE_HOME="$NS_HOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_slot_plan 1")"
+NS_SNAPSHOT="$(PRO_GATE_HOME="$NS_HOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_attempt_snapshot github.com acme nosend 63 '$NS_KEY'")"
+check 'never-sent: the canonical snapshot is terminal, fresh-eligible, and not recoverable' \
+  "$(jq -e '.source=="disposition" and .state=="never-conversed" and .fresh_eligible and (.recoverable|not) and .terminal.proof_kind=="bounded-absence-never-conversed"' <<<"$NS_SNAPSHOT" >/dev/null 2>&1; echo $?)" \
+  "$NS_SNAPSHOT"
+PRO_GATE_HOME="$NS_HOME" bash "$ENGINE" --status "$NS_MARKER" >"$TDIR/ns-status.out" 2>"$TDIR/ns-status.err"
+check 'never-sent: --status explains the class and says the slot is free' \
+  "$(grep -q 'never produced a conversation' "$TDIR/ns-status.out" && grep -q 'slot is free' "$TDIR/ns-status.out"; echo $?)" \
+  "$(cat "$TDIR/ns-status.out")"
+if command -v jq >/dev/null 2>&1; then
+  PRO_GATE_HOME="$NS_HOME" bash "$ENGINE" --status "$NS_MARKER" --json >"$TDIR/ns-status.json" 2>/dev/null
+  check 'never-sent: --status --json holds no capacity for the released marker' \
+    "$(jq -e --arg m "$NS_MARKER" '[.reservations[]? | select(.marker==$m and .holds_capacity)] | length == 0' "$TDIR/ns-status.json" >/dev/null 2>&1; echo $?)" \
+    "$(jq -c '.reservations' "$TDIR/ns-status.json" 2>/dev/null)"
+fi
+
+# One fixture, many plants. Each case builds a never-sent-shaped home, plants at most ONE piece of
+# conversation evidence, and drives the SAME entry point production uses. Everything is created
+# NOW, so the TTL half of the old dual gate can never be what decides the outcome — a release here
+# can only have come from the new branch, and a retention here can only be the new branch standing
+# down. Five passes, not three: the incident's reservations were reported "retained 10/3", so a
+# guard that merely DELAYED release would still fail these.
+echo '# v0.49 (#163): one planted piece of conversation evidence stands the new branch down'
+ns_plant() { # suffix salvage-class plant-kind -> sets NS_VERDICT / NS_PLANT_HOME / NS_PLANT_MARKER
+  # Called as a plain command, never in $( ): it publishes globals, and a command substitution
+  # would run it in a subshell where those assignments die with the subshell.
+  local suffix="$1" class="$2" plant="$3" home key marker out
+  home="$TDIR/home-ns-$suffix"; key="acme-ns$suffix-64"
+  marker="pg-run-acme-ns$suffix-64-1700000064-64"; out="$TDIR/ns-$suffix.md"
+  mkdir -p "$home/in-progress" "$home/run-meta" "$home/rounds" "$home/salvage-class"
+  printf '1700000064\n' > "$home/rounds/$key"
+  printf 'github.com\tacme\tns%s\t%s\t64\t%s\t1700000064\n' "$suffix" "$key" "$out" > "$home/run-meta/$marker"
+  printf '%s\t%s\t%s\t0\t1\t\t1700000064\n' "$key" "$out" "$(date +%s)" > "$home/in-progress/$marker"
+  printf '%s\t%s\n' "$class" "$(date +%s)" > "$home/salvage-class/$marker"
+  case "$plant" in
+    memo)       mkdir -p "$home/conversation-urls"
+                printf 'https://chatgpt.com/c/6a959c8f-c95c-83ea-81b8-85a3ea5d6cbc\n' > "$home/conversation-urls/$marker" ;;
+    crossbound) mkdir -p "$home/crossbound"
+                printf '2026-01-01T00:00:00Z\thttps://chatgpt.com/c/x\tpg-run-other-9-1-1\n' > "$home/crossbound/$marker" ;;
+    unbound)    : > "$out.unbound.4242" ;;
+    noclass)    rm -f "$home/salvage-class/$marker" ;;
+    none)       : ;;
+  esac
+  NS_PLANT_HOME="$home"; NS_PLANT_MARKER="$marker"; NS_PLANT_KEY="$key"; NS_VERDICT=""
+  for _ in 1 2 3 4 5; do
+    NS_VERDICT="$(PRO_GATE_HOME="$home" PRO_GATE_RESERVATION_MISSES=3 PRO_GATE_RECONCILE_INTERVAL=0 \
+      bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_note_miss '$marker'")"
+  done
+}
+ns_retained_check() { # name detail-prefix
+  check "$1" \
+    "$([ "$NS_VERDICT" != released ] && [ -f "$NS_PLANT_HOME/in-progress/$NS_PLANT_MARKER" ] \
+       && [ ! -e "$NS_PLANT_HOME/attempt-dispositions/$NS_PLANT_MARKER" ] \
+       && [ "$(PRO_GATE_HOME="$NS_PLANT_HOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_slot_plan 1" | cut -d'|' -f3)" = 0 ]; echo $?)" \
+    "${2:-} verdict=$NS_VERDICT record=$(cat "$NS_PLANT_HOME/in-progress/$NS_PLANT_MARKER" 2>/dev/null) disposition=$(cat "$NS_PLANT_HOME/attempt-dispositions/$NS_PLANT_MARKER" 2>/dev/null)"
+}
+
+ns_plant clean absent none
+check 'never-sent control: absent with no conversation evidence releases at the miss limit' \
+  "$([ "$NS_VERDICT" = released ] && [ ! -e "$NS_PLANT_HOME/in-progress/$NS_PLANT_MARKER" ] \
+     && jq -e '.terminal_kind=="never-conversed"' "$NS_PLANT_HOME/attempt-dispositions/$NS_PLANT_MARKER" >/dev/null 2>&1; echo $?)" \
+  "verdict=$NS_VERDICT disposition=$(cat "$NS_PLANT_HOME/attempt-dispositions/$NS_PLANT_MARKER" 2>/dev/null)"
+
+# The #109 boundary itself: a conversation WAS remembered for this marker, so it exists and this
+# rule must never touch it, no matter how far past the miss limit the streak runs.
+ns_plant memo absent memo
+ns_retained_check 'never-sent: a remembered conversation URL keeps the reservation held past the miss limit (#109 boundary)' 'plant=memo'
+ns_plant crossbound absent crossbound
+ns_retained_check 'never-sent: a cross-bind conviction keeps the reservation held (its conversation exists)' 'plant=crossbound'
+ns_plant unbound absent unbound
+ns_retained_check 'never-sent: an unbindable capture keeps the reservation held (bytes came from a conversation)' 'plant=unbound'
+ns_plant noclass absent noclass
+ns_retained_check 'never-sent: no classification at all is not an absence proof' 'plant=noclass'
+
+# The other seven allowlisted classes all describe a page that exists, or absence of evidence
+# rather than evidence of absence. None of them may reach the new branch.
+for NS_CLASS in owned-incomplete inconclusive browser-down cross-bound throttle terminal terminal-infrastructure; do
+  ns_plant "$(printf '%s' "$NS_CLASS" | tr -d -- -)" "$NS_CLASS" none
+  ns_retained_check "never-sent: salvage class $NS_CLASS never triggers the early release" "class=$NS_CLASS"
+done
+
+# Precedence: an attempt that is BOTH past the TTL and never-conversed keeps the older, broader
+# kind. The new branch is strictly additive — it may only fire where the old code retained.
+NS_TTL_HOME="$TDIR/home-ns-ttl"; NS_TTL_KEY=acme-nsttl-65
+NS_TTL_MARKER='pg-run-acme-nsttl-65-1700000065-65'
+mkdir -p "$NS_TTL_HOME/in-progress" "$NS_TTL_HOME/run-meta" "$NS_TTL_HOME/rounds" "$NS_TTL_HOME/salvage-class"
+printf '1700000065\n' > "$NS_TTL_HOME/rounds/$NS_TTL_KEY"
+printf 'github.com\tacme\tnsttl\t%s\t65\t/tmp/nsttl.md\t1700000065\n' "$NS_TTL_KEY" > "$NS_TTL_HOME/run-meta/$NS_TTL_MARKER"
+printf '%s\t/tmp/nsttl.md\t%s\t0\t1\t\t1700000065\n' "$NS_TTL_KEY" "$(( $(date +%s) - 30000 ))" > "$NS_TTL_HOME/in-progress/$NS_TTL_MARKER"
+printf 'absent\t%s\n' "$(date +%s)" > "$NS_TTL_HOME/salvage-class/$NS_TTL_MARKER"
+for _ in 1 2 3; do
+  NS_TTL_VERDICT="$(PRO_GATE_HOME="$NS_TTL_HOME" PRO_GATE_RESERVATION_MISSES=3 PRO_GATE_RECONCILE_INTERVAL=0 \
+    bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_note_miss '$NS_TTL_MARKER'")"
+done
+check 'never-sent: past the TTL the older recovery-exhausted kind still wins (new branch is additive only)' \
+  "$([ "$NS_TTL_VERDICT" = released ] \
+     && jq -e '.terminal_kind=="recovery-exhausted" and .proof_kind=="bounded-recovery-exhausted"' "$NS_TTL_HOME/attempt-dispositions/$NS_TTL_MARKER" >/dev/null 2>&1; echo $?)" \
+  "verdict=$NS_TTL_VERDICT disposition=$(cat "$NS_TTL_HOME/attempt-dispositions/$NS_TTL_MARKER" 2>/dev/null)"
+
+# The disposition vocabulary stays a CLOSED enum of exact pairs. A kind that crossed proofs with
+# another kind would let a future caller file a never-sent release under not-submitted, which is
+# the string the refund path switches on.
+NS_ENUM_HOME="$TDIR/home-ns-enum"; mkdir -p "$NS_ENUM_HOME"
+ns_enum_write() { # marker-suffix kind proof -> rc
+  PRO_GATE_HOME="$NS_ENUM_HOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_attempt_disposition_write github.com acme nsenum 66 acme-nsenum-66 'pg-run-acme-nsenum-66-1700000066-$1' 1700000066 '$2' '$3'" >/dev/null 2>&1
+}
+ns_enum_write 01 never-conversed bounded-absence-never-conversed; NS_ENUM_OK=$?
+ns_enum_write 02 never-conversed bounded-recovery-exhausted; NS_ENUM_X1=$?
+ns_enum_write 03 recovery-exhausted bounded-absence-never-conversed; NS_ENUM_X2=$?
+ns_enum_write 04 not-submitted bounded-absence-never-conversed; NS_ENUM_X3=$?
+ns_enum_write 05 never-sent bounded-absence-never-conversed; NS_ENUM_X4=$?
+check 'never-sent: the disposition enum accepts exactly the new pair and rejects every crossing of it' \
+  "$([ "$NS_ENUM_OK" -eq 0 ] && [ "$NS_ENUM_X1" -ne 0 ] && [ "$NS_ENUM_X2" -ne 0 ] \
+     && [ "$NS_ENUM_X3" -ne 0 ] && [ "$NS_ENUM_X4" -ne 0 ]; echo $?)" \
+  "accepted=$NS_ENUM_OK crossed=$NS_ENUM_X1/$NS_ENUM_X2/$NS_ENUM_X3 bogus-kind=$NS_ENUM_X4 written=$(ls "$NS_ENUM_HOME/attempt-dispositions" 2>/dev/null | tr '\n' ' ')"
+
+# --status wording: the `absent` hint told operators to wait out the TTL, which for a never-sent
+# attempt is advice to wait six hours for evidence that cannot arrive. It must now say which of
+# the two release paths applies, and the memo is what decides that.
+NS_HINT_HOME="$TDIR/home-ns-hint"; NS_HINT_KEY=acme-nshint-67
+NS_HINT_MARKER='pg-run-acme-nshint-67-1700000067-67'
+mkdir -p "$NS_HINT_HOME/in-progress" "$NS_HINT_HOME/rounds" "$NS_HINT_HOME/salvage-class" "$NS_HINT_HOME/conversation-urls"
+printf '%s\t%s/nshint.md\t%s\t1\t1\t\t1700000067\n' "$NS_HINT_KEY" "$TDIR" "$(date +%s)" > "$NS_HINT_HOME/in-progress/$NS_HINT_MARKER"
+printf 'absent\t%s\n' "$(date +%s)" > "$NS_HINT_HOME/salvage-class/$NS_HINT_MARKER"
+PRO_GATE_HOME="$NS_HINT_HOME" bash "$ENGINE" --status "$NS_HINT_MARKER" >"$TDIR/ns-hint-nomemo.out" 2>/dev/null
+check 'never-sent: --status tells a memo-less absent reservation it releases without the TTL' \
+  "$(grep -q 'none ever has' "$TDIR/ns-hint-nomemo.out" \
+     && grep -q 'WITHOUT waiting out the TTL' "$TDIR/ns-hint-nomemo.out" \
+     && ! grep -q 'releases only after the TTL' "$TDIR/ns-hint-nomemo.out"; echo $?)" \
+  "$(cat "$TDIR/ns-hint-nomemo.out")"
+printf 'https://chatgpt.com/c/6a959c8f-c95c-83ea-81b8-85a3ea5d6cbc\n' > "$NS_HINT_HOME/conversation-urls/$NS_HINT_MARKER"
+PRO_GATE_HOME="$NS_HINT_HOME" bash "$ENGINE" --status "$NS_HINT_MARKER" >"$TDIR/ns-hint-memo.out" 2>/dev/null
+check 'never-sent: --status keeps the dual-gate wording once a conversation was remembered' \
+  "$(grep -q 'releases only after the TTL' "$TDIR/ns-hint-memo.out" \
+     && ! grep -q 'WITHOUT waiting out the TTL' "$TDIR/ns-hint-memo.out"; echo $?)" \
+  "$(cat "$TDIR/ns-hint-memo.out")"
+
 INFRA_HOME="$TDIR/home-probe-infrastructure"; INFRA_KEY=acme-infra-97
 INFRA_MARKER='pg-run-acme-infra-97-1700000009-97'; INFRA_EPOCH=1700000009
 mkdir -p "$INFRA_HOME/in-progress" "$INFRA_HOME/run-meta" "$INFRA_HOME/rounds"

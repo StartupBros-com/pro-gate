@@ -1339,7 +1339,18 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
             browser-down)
               ST_HINT="in-progress reservation $m: the browser was unreachable on the latest pass (${r_age:-?}s old, ${r_miss:-0} confirmed miss(es), ${r_ttl_left:-?}s until the TTL is satisfied); check that Chrome and the CDP port are up, then collect it for FREE: $r_cmd" ;;
             absent)
-              ST_HINT="in-progress reservation $m: no conversation carried this marker on the latest pass (${r_age:-?}s old, ${r_miss:-0} confirmed miss(es), ${r_ttl_left:-?}s until the TTL is satisfied); it releases only after the TTL and the miss threshold are both met; collect it for FREE to re-check: $r_cmd" ;;
+              # #163: an `absent` reservation now has TWO release paths, and which one applies is
+              # decided by whether a conversation was EVER remembered for this marker — the same
+              # memo pg_attempt_never_conversed reads, already loaded here as $r_url. Saying "only
+              # after the TTL" for a never-sent attempt was the sentence that told operators to
+              # wait out six hours for evidence that could not arrive. Cross-bound and unbindable
+              # captures are handled by the branches above, so inside this arm an empty $r_url is
+              # exactly the never-sent class.
+              if [ -z "$r_url" ]; then
+                ST_HINT="in-progress reservation $m: no conversation carried this marker on the latest pass, and none ever has — no conversation URL was remembered for it at any point (${r_age:-?}s old, ${r_miss:-0} confirmed miss(es), ${r_ttl_left:-?}s until the TTL is satisfied). This is the never-sent class, so it releases on confirmed misses alone, WITHOUT waiting out the TTL; its round stays charged. Collect it for FREE to add the next confirmed miss: $r_cmd"
+              else
+                ST_HINT="in-progress reservation $m: no conversation carried this marker on the latest pass, but one was remembered for it earlier ($r_url) (${r_age:-?}s old, ${r_miss:-0} confirmed miss(es), ${r_ttl_left:-?}s until the TTL is satisfied); because that conversation exists, it releases only after the TTL and the miss threshold are both met; collect it for FREE to re-check: $r_cmd"
+              fi ;;
             cross-bound)
               ST_HINT="in-progress reservation $m: the latest probe found only another run's completed answer where this conversation was expected (${r_age:-?}s old, ${r_miss:-0} confirmed miss(es), ${r_ttl_left:-?}s until the TTL is satisfied). Do NOT delete state or set PRO_GATE_REQUIRE_NONCE=0; run the harvest so the conviction is recorded: $r_cmd" ;;
             throttle)
@@ -1565,6 +1576,10 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
           ST_ATTEMPT_HINT="terminal attempt cleanup is pending for $st_marker — re-run the same typed pro-gate request; cleanup finishes before any new charge"
         elif [ "$st_terminal" = not-submitted ]; then
           ST_ATTEMPT_HINT="the prior attempt was proven not submitted and its round was refunded — a fresh typed pro-gate review is eligible"
+        elif [ "$st_terminal" = never-conversed ]; then
+          # #163: the bare kind name would leave an operator hunting for a conversation that never
+          # existed, and would not say the thing that matters — the slot is back.
+          ST_ATTEMPT_HINT="the prior attempt never produced a conversation (none was ever remembered for $st_marker) and was released on bounded confirmed absences without waiting out the TTL; its shared review slot is free and its round stays charged — a fresh typed pro-gate review is eligible"
         else
           ST_ATTEMPT_HINT="the prior attempt ended $st_terminal; its round remains charged but no review is recoverable — a fresh typed pro-gate review is eligible"
         fi
@@ -2930,6 +2945,20 @@ if [ -n "$HARVEST_MARKER" ]; then
          if [ -n "$PRIOR_OUT" ]; then
            echo "ERROR: this review was already collected (ledger row exists) but cannot be returned automatically: the prior output ($PRIOR_OUT) is gone, unreadable, digest-mismatched, or carries no verifiable digest (pre-v0.28 row). Not a loss — recover it MANUALLY from that path, the PR comment/audit trail, or the ChatGPT conversation; do NOT spend a fresh slot for it." >&2
            pg_status failed "already collected; prior output unavailable or unverifiable ($PRIOR_OUT) — manual recovery, do NOT respend"
+           pg_finish 6
+         fi
+         # #163: the miss limit can now retire a reservation two ways, and they are not the same
+         # news. Read which one fired from the disposition the release just published, rather than
+         # re-deriving the predicate here — one authority, and it is pg_attempt_never_conversed's.
+         # "review lost" is the wrong sentence for a send that never produced a conversation: the
+         # operator has nothing to recover and nothing to look for, and the thing they DO need to
+         # know is that the shared slot is free again.
+         HARVEST_DISPOSITION="$(pg_attempt_disposition_read "$RUN_MARKER" 2>/dev/null || true)"
+         HARVEST_TERMINAL=""
+         [ -z "$HARVEST_DISPOSITION" ] || HARVEST_TERMINAL="$(jq -r '.terminal_kind // ""' <<<"$HARVEST_DISPOSITION" 2>/dev/null || true)"
+         if [ "$HARVEST_TERMINAL" = never-conversed ]; then
+           echo "ERROR: no conversation ever carried marker ${RUN_MARKER} — not on this pass, and not on any earlier one: no conversation URL was ever remembered for it. The prompt never reached a conversation, so there is nothing to recover and nothing to look for. Recovery is over: the reservation is released and its shared review slot is free, the round stays charged (no refund is claimed, because nothing proved the send was never dispatched), and a fresh typed review is eligible." >&2
+           pg_status failed "never-sent attempt: no conversation ever carried this marker; released after bounded confirmed absences; round retained"
            pg_finish 6
          fi
          echo "ERROR: no conversation matches marker ${RUN_MARKER} after repeated confirmed misses, and no collected copy is ledgered (review lost, or collected by an engine <v0.27 that ledgered no marker)." >&2

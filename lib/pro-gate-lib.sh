@@ -749,6 +749,21 @@ pg_run_meta_find_unresolved() { pg_run_meta_find_latest "$1" "$2" "$3" "$4" unre
 
 pg_attempt_disposition_dir() { printf '%s\n' "${PRO_GATE_ATTEMPT_DISPOSITION_DIR:-$PRO_GATE_HOME/attempt-dispositions}"; }
 
+# The closed (terminal_kind, proof_kind) vocabulary. Exactly four pairs, each a DIFFERENT proof:
+#
+#   not-submitted    / proven-no-submit                  Oracle proved Send was never dispatched.
+#   submitted-terminal / exact-owned-infrastructure-terminal  our conversation ended in an error.
+#   recovery-exhausted / bounded-recovery-exhausted      TTL elapsed AND bounded misses confirmed.
+#   never-conversed  / bounded-absence-never-conversed   #163: bounded misses confirmed and NO
+#                                                       conversation ever carried this marker.
+#
+# terminal_kind is NOT a free label: `not-submitted` is the exact string
+# pg_attempt_disposition_cleanup, pg_attempt_disposition_cleanup_pending and
+# pg_attempt_terminal_transition switch on to REFUND the charged round (pg_round_unrecord_epoch
+# plus the input-binding unlink). #163's class is defined by the pre-send probe being UNABLE to
+# prove no-submit, so filing it under not-submitted would refund a round nothing proved unspent.
+# Any future kind that must keep its charge has to stay out of that string, exactly as
+# never-conversed does.
 pg_attempt_disposition_validate() { # canonical JSON [expected marker]
   local json="${1-}" marker="${2:-}" canonical
   canonical="$(printf '%s' "$json" | jq -cS . 2>/dev/null)" || return 1
@@ -759,11 +774,12 @@ pg_attempt_disposition_validate() { # canonical JSON [expected marker]
     ($d.round_key|type=="string" and test("^[A-Za-z0-9.-]+$")) and ($d.marker|startswith("pg-run-" + $d.round_key + "-")) and
     ($d.charged_spend_epoch|type=="number" and floor==. and .>0) and
     ($d.observed_at|type=="number" and floor==. and .>=$d.charged_spend_epoch) and
-    ($d.terminal_kind|IN("not-submitted","submitted-terminal","recovery-exhausted")) and
-    ($d.proof_kind|IN("proven-no-submit","exact-owned-infrastructure-terminal","bounded-recovery-exhausted")) and
+    ($d.terminal_kind|IN("not-submitted","submitted-terminal","recovery-exhausted","never-conversed")) and
+    ($d.proof_kind|IN("proven-no-submit","exact-owned-infrastructure-terminal","bounded-recovery-exhausted","bounded-absence-never-conversed")) and
     (($d.terminal_kind=="not-submitted" and $d.proof_kind=="proven-no-submit") or
      ($d.terminal_kind=="submitted-terminal" and $d.proof_kind=="exact-owned-infrastructure-terminal") or
-     ($d.terminal_kind=="recovery-exhausted" and $d.proof_kind=="bounded-recovery-exhausted")) and
+     ($d.terminal_kind=="recovery-exhausted" and $d.proof_kind=="bounded-recovery-exhausted") or
+     ($d.terminal_kind=="never-conversed" and $d.proof_kind=="bounded-absence-never-conversed")) and
     ($d.repository|keys)==["host","owner","repo"] and
     ($d.repository.host|test("^[A-Za-z0-9.-]+$")) and ($d.repository.owner|test("^[A-Za-z0-9._-]+$")) and ($d.repository.repo|test("^[A-Za-z0-9._-]+$")) and
     ($d.target|keys)==["kind","pr"] and $d.target.kind=="pull-request" and ($d.target.pr|type=="number" and floor==. and .>0) and
@@ -1562,11 +1578,60 @@ pg_reservation_remove() { # marker
   pg_reservation_guard_release
 }
 
+# pg_attempt_never_conversed <marker> [out-path]: 0 only when NOTHING this engine has ever
+# recorded shows a conversation carrying this marker — #163's never-sent class.
+#
+# This predicate is the whole authority boundary between #163 and #109, so read the distinction
+# before touching it. #109 is "a conversation EXISTS but has become untraceable", and no
+# production terminaliser may be based on age, TTL, repeated no-VERDICT, or an absent spinner for
+# such a conversation. #163 is different in KIND: an attempt with no conversation AT ALL. Every
+# check below is therefore a POSITIVE trace that a conversation existed, and any one of them
+# present fails the predicate closed:
+#
+#   1. conversation-urls/<marker>. cdp-salvage.mjs rememberUrl() writes this memo on EVERY
+#      positive marker match, in every mode — --probe, the run's own watchdog, the pre-retry
+#      probe, --harvest, full salvage — so it accumulates over the marker's WHOLE life, not this
+#      pass. Its absence is therefore "no probe, ever, found a conversation for this marker",
+#      which is exactly the fact that defines the class. It also subsumes the pre-send probe's
+#      negative branch: pg_attempt_provably_unsubmitted refuses on this same memo.
+#   2. crossbound/<marker>. A page that carried OUR marker under ANOTHER run's completed answer;
+#      that conversation demonstrably exists. A conviction blacklists its URL, so LATER scans skip
+#      it and classify `absent` while the sidecar survives (#170). Without this check that
+#      survivor would read as never-conversed on the next pass.
+#   3. <out>.unbound.*. A capture that carried this marker but could not be bound to this run —
+#      again, bytes extracted from a real conversation. --status already treats it as evidence.
+#   4. salvage-class/<marker> must say `absent`: the CDP title probe found NO tab for the marker
+#      on the latest pass. `inconclusive` and `browser-down` are absence of EVIDENCE, not evidence
+#      of absence, and must never reach here; the other five kinds all describe a page that exists.
+#
+# Deliberately NOT consulted: salvage-nonmatching.txt. Its entries are written as "<our marker>\t
+# <url>" for any FOREIGN page this marker's scan rendered and rejected, and #163 was filed on a box
+# holding eight leaked `pro-gate review:` tabs from other PRs — gating on it would make this fix
+# inert in precisely the incident it exists for.
+pg_attempt_never_conversed() { # marker [out-path]
+  local marker="$1" out="${2:-}" class ub
+  pg_reservation_marker_ok "$marker" || return 1
+  [ ! -e "$PRO_GATE_HOME/conversation-urls/$marker" ] || return 1
+  [ ! -e "$PRO_GATE_HOME/crossbound/$marker" ] || return 1
+  if [ -n "$out" ]; then
+    # `if` rather than `[ … ] && return 1`: an unmatched glob would leave the whole loop with
+    # status 1, which under the engine's `set -e` would abort the caller instead of falling
+    # through to the classification read.
+    for ub in "$out".unbound.*; do
+      if [ -e "$ub" ]; then return 1; fi
+    done
+  fi
+  class="$(pg_salvage_class_read "$marker" 2>/dev/null || true)"
+  [ -n "$class" ] || return 1
+  [ "${class%%$'\t'*}" = absent ] || return 1
+  return 0
+}
+
 # pg_reservation_note_miss <marker>: one confirmed-absent observation. Echoes "released" when
 # the miss limit is reached (reservation removed) or "retained miss/limit" otherwise. Shared by
 # reconciliation and the harvest not-found path so both apply the same fail-closed policy.
 pg_reservation_note_miss() {
-  local marker="$1" dir f pr out created misses slot model spend miss_limit ttl now age
+  local marker="$1" dir f pr out created misses slot model spend miss_limit ttl now age term_kind term_proof
   miss_limit="${PRO_GATE_RESERVATION_MISSES:-3}"
   case "$miss_limit" in ''|*[!0-9]*) miss_limit=3;; esac
   [ "$miss_limit" -ge 2 ] 2>/dev/null || miss_limit=2
@@ -1604,10 +1669,31 @@ pg_reservation_note_miss() {
   ttl="${PRO_GATE_RESERVATION_TTL:-21600}"; case "$ttl" in ''|*[!0-9]*) ttl=21600;; esac
   now="$(date +%s)"; age=$(( now - created )); [ "$age" -lt 0 ] && age=0
   misses=$(( misses + 1 ))
+  # TWO terminal conditions, and the order is load-bearing: the pre-existing dual gate is tried
+  # FIRST, so the #163 branch can only ever fire where the old code RETAINED. Nothing that used to
+  # release changes kind, wording, or timing.
+  #
+  #  (1) v0.37's dual gate — bounded confirmed misses AND the full reservation TTL. The general
+  #      case: a conversation may exist and simply be unreachable, so time is part of the proof.
+  #  (2) #163 — the same bounded confirmed misses with NO TTL wait, allowed only when
+  #      pg_attempt_never_conversed can show no conversation ever carried this marker. That
+  #      attempt is the one attempt that can never produce a conversation, so another 6h of
+  #      waiting buys no evidence while its shared slot stays held; on the reporting box four of
+  #      them held every slot at once and no session could start a round anywhere. The proof lives
+  #      in that predicate, never here — this function only decides what to do with it.
+  #
+  # Both keep the charge. Neither touches refund: that is pg_fresh_dispatch_refund's positive
+  # no-submit predicate, a different mechanism this path has never entered and must not learn to.
+  term_kind=""; term_proof=""
   if [ "$misses" -ge "$miss_limit" ] && [ "$created" -gt 0 ] && [ "$age" -ge "$ttl" ]; then
+    term_kind=recovery-exhausted; term_proof=bounded-recovery-exhausted
+  elif [ "$misses" -ge "$miss_limit" ] && pg_attempt_never_conversed "$marker" "$out"; then
+    term_kind=never-conversed; term_proof=bounded-absence-never-conversed
+  fi
+  if [ -n "$term_kind" ]; then
     # The miss threshold is terminal only when durable run-meta can bind the proof to one charged
     # attempt. Publish disposition BEFORE releasing the reservation so no fresh caller sees a gap.
-    if pg_attempt_terminal_from_meta "$marker" recovery-exhausted bounded-recovery-exhausted; then
+    if pg_attempt_terminal_from_meta "$marker" "$term_kind" "$term_proof"; then
       rm -f "$f" "$(pg_manifest_dir)/$marker" "$(pg_manifest_dir)/$marker.nonce" 2>/dev/null
       pg_reservation_guard_release
       pg_attempt_reconcile_terminal "$marker" 2>/dev/null || true
