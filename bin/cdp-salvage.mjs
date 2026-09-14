@@ -568,8 +568,19 @@ async function tabText(tab) {
     ')';
   const result = await evaluateTab(tab, expression);
   if (!result.ok) return null;
-  if (typeof result.value === 'string') return result.value;
+  // #163: every page read in this helper passes through here, so this is where a sighting is
+  // recorded — once, at the single producer, never at the consumers. Four gate rounds each found
+  // one more consumer that exited before its own recording line (a scratch throttle, a scan-wide
+  // modal over a foreign tab, a throttled dead-tab re-render), because "record it at each place
+  // that reads text" has as many holes as it has callers. A caller cannot outrun this: it does not
+  // have the text until this function returns. Recording more often than strictly needed is the
+  // safe direction — a sighting only ever HOLDS a reservation, never releases one.
+  if (typeof result.value === 'string') {
+    if (hasExactMarker(result.value, marker)) noteObserved(marker, 'read');
+    return result.value;
+  }
   if (typeof result.value?.text !== 'string') return null;
+  if (hasExactMarker(result.value.text, marker)) noteObserved(marker, 'read');
   if (result.value.promptAt === 0) scopedResponses.add(result.value.text);
   return result.value.text;
 }
@@ -1493,19 +1504,9 @@ while (Date.now() < deadline) {
   //
   // hasExactMarker, never foldedIncludes: this record is permanent and releases capacity, so a
   // substring of another run's marker must never be able to write it (gate r3 P2).
-  //
-  // The blacklist is deliberately NOT consulted here. It governs what may be COLLECTED: a URL lands
-  // on it because a capture from it failed provenance, and every later scan skips it so a rejected
-  // conversation cannot be replayed. But an exact-marker hit on a blacklisted URL is not more
-  // foreign content — it is proof that a conversation carrying THIS run's marker exists at that
-  // address right now. Sharing the collection filter here would let a URL blacklisted earlier in
-  // this marker's life permanently hide its own conversation from every sighting mechanism at once,
-  // and the reservation would then be retired as never-conversed. lib/pro-gate-lib.sh makes the
-  // same call for the same reason, refusing to gate the predicate on salvage-nonmatching.txt.
-  for (const { tab, text } of reads) {
-    if (!text || text.trim() === '') continue;
-    if (hasExactMarker(text, marker)) noteObserved(marker, nonMatching.has(tab.url) ? 'rendered-blacklisted' : 'rendered');
-  }
+  // Sightings for this batch were recorded by tabText itself as each read returned, before any
+  // branch below — including the blacklist skips, which govern what may be COLLECTED and never
+  // whether a conversation exists.
   // #162: the modal is account-wide, so decide ownership over the WHOLE scan, never on the first
   // tab in list order (the same order-independence onOurConversation documents): a foreign or
   // blacklisted tab listed ahead of ours must not hide the proof that our conversation exists.
@@ -1644,9 +1645,8 @@ while (Date.now() < deadline) {
       }
       continue;
     }
-    // A fresh render is a real page load, so an exact match here is a sighting just like the
-    // open-tab scan's, recorded before any classification below can exit first (#163 gate r3).
-    if (hasExactMarker(text, marker)) noteObserved(marker, 're-rendered');
+    // The sighting for this render was already recorded by tabText inside freshRenderText, before
+    // the throttle branch above could exit (#163).
     const evidence = onOurConversation(tab.url, classifyEvidence(text));
     if (evidence.kind === 'cross-bound') {
       rejectCrossBound(tab.url, evidence.foreignMarker, 're-rendered');
@@ -1680,9 +1680,7 @@ while (Date.now() < deadline) {
     console.error(`no open tab carries "${marker}" — re-rendering the remembered conversation ${seedUrl} (${seededRenders}/${MAX_SEEDED_RENDERS})...`);
     const { text, evidence: renderEvidence } = await freshRenderText(seedUrl, port, deadline);
     if (text) {
-      // The remembered conversation re-rendered and carries our marker: a sighting with no open
-      // tab at all, recorded before the branches below can exit (#163 gate r3).
-      if (hasExactMarker(text, marker)) noteObserved(marker, 'remembered-render');
+      // The sighting for this render was already recorded by tabText inside freshRenderText (#163).
       const evidence = renderEvidence ?? classifyEvidence(text);
       if (evidence.kind === 'throttle') tripThrottleEvidence(seedUrl, evidence, `remembered render ${seedUrl}`);
       if (evidence.kind === 'cross-bound') {
