@@ -469,7 +469,12 @@ function runSalvage(args, port, seed, extraEnv = {}) {
   return new Promise((resolve) => {
     const startedAt = Date.now();
     const expandedArgs = args.map((arg) => arg.replace(/^PG_HOME\//, `${home}/`));
-    const childEnv = { ...process.env, PRO_GATE_HOME: home, ...extraEnv };
+    // Env values get the same PG_HOME/ expansion as args. Without it a test pointing an override
+    // at "PG_HOME/elsewhere" would hand the child a path relative to the CWD while the assertions
+    // read an absolute one, and the mismatch would look like a writer bug.
+    const expandHome = (v) => (typeof v === 'string' ? v.replace(/^PG_HOME\//, `${home}/`) : v);
+    const childEnv = { ...process.env, PRO_GATE_HOME: home };
+    for (const [name, value] of Object.entries(extraEnv)) childEnv[name] = expandHome(value);
     // Explicit undefined removes an inherited environment key for boundary tests. It lets a test
     // prove the child has no test mode at all instead of merely replacing it with another string.
     for (const [name, value] of Object.entries(childEnv)) {
@@ -508,10 +513,36 @@ function runSalvage(args, port, seed, extraEnv = {}) {
             .map((f) => read(path.join('crossbound', f)) ?? '').join('');
         } catch { return ''; }
       })();
+      // #163 r1 P1: the monotonic sighting record. It is the only trace that survives a conviction
+      // discarding the memo, so tests assert on its presence, not on the memo's.
+      // #199 r5 P2: read it back from wherever PRO_GATE_CONVERSATION_OBSERVED_DIR points, so a
+      // writer that ignored the override cannot pass by writing to the default location.
+      // `||` mirrors the shell's ${VAR:-default} and the writer's own fallback. Using `??` here
+      // would resolve an exported EMPTY override to "" while the code resolved it to the default,
+      // so the assertion would measure the harness rather than the writer (#199 r6 P2).
+      const observedDir = (extraEnv.PRO_GATE_CONVERSATION_OBSERVED_DIR || path.join(home, 'conversation-observed'))
+        .replace(/^PG_HOME\//, `${home}/`);
+      const observed = (() => {
+        try { return fs.readdirSync(observedDir); } catch { return []; }
+      })();
+      // #199 r5 P2: what landed in the DEFAULT location regardless of the override. A writer that
+      // hardcodes the default makes this non-empty while `observed` stays empty — the exact split
+      // the gate found, and invisible to a test that only ever looks in one place.
+      const observedDefault = (() => {
+        try { return fs.readdirSync(path.join(home, 'conversation-observed')); } catch { return []; }
+      })();
+      // #199 r5 P1: an unwritable sidecar must REVOKE early-release authority, not merely warn.
+      // The stamp is a sibling of the directory, so it survives that directory being unwritable;
+      // its absence afterwards is the proof the failure was failed closed rather than narrated.
+      const observedSince = (() => {
+        const f = (extraEnv.PRO_GATE_CONVERSATION_OBSERVED_SINCE || `${observedDir}.since`).replace(/^PG_HOME\//, `${home}/`);
+        try { return fs.readFileSync(f, 'utf8'); } catch { return null; }
+      })();
       fs.rmSync(home, { recursive: true, force: true });
       resolve({
         status, stdout, stderr, elapsedMs: Date.now() - startedAt,
         memoUrl: memoUrl?.trim() ?? null, memos, blacklist, cooldown, crossbound, crossboundBody,
+        observed, observedDefault, observedSince,
       });
     });
   });
@@ -995,7 +1026,22 @@ const MIXED_MARKER = 'pg-run-Test-Case-1234567890-43';
   check('throttled canonical scratch writes cooldown and closes only scratch',
     /canonical scratch/.test(throttleResult.cooldown ?? '') && throttled.closed.includes('scratch1') && !throttled.closed.includes('tab1'),
     `cooldown=${throttleResult.cooldown} closed=${throttled.closed}`);
+  // #163 gate r2 P1: the TAB here carries our marker; only the scratch revalidation renders
+  // throttle copy. The sighting is therefore proven before that exit, and must be recorded even
+  // though this path never reaches a memo write.
+  check('throttled canonical scratch keeps the sighting its tab already proved',
+    throttleResult.observed.includes(MARKER), `observed=${JSON.stringify(throttleResult.observed)}`);
   throttled.stop();
+
+  // The reviewer's exact regression: no memo at all, an owned readable source, a throttled
+  // scratch. Before the r2 fix this left no record anywhere — no memo, no inconclusive source —
+  // so later absent probes could retire a conversation this scan had demonstrably seen.
+  const throttledNoMemo = await mockCdp(source, [], { renderText: () => throttle });
+  const noMemoResult = await runScratchSalvage([MARKER, '3'], throttledNoMemo.port);
+  check('owned tab with a throttled scratch and no memo still records the sighting (#163 r2 P1)',
+    noMemoResult.observed.includes(MARKER) && noMemoResult.memos.length === 0,
+    `observed=${JSON.stringify(noMemoResult.observed)} memos=${JSON.stringify(noMemoResult.memos)} status=${noMemoResult.status}`);
+  throttledNoMemo.stop();
 
   const foreignAnswer = [
     `run marker: ${MARKER}`,
@@ -1010,6 +1056,70 @@ const MIXED_MARKER = 'pg-run-Test-Case-1234567890-43';
   check('cross-bound canonical scratch forgets and blacklists the stale canonical memo',
     crossBoundResult.memos.length === 0 && /mock-conversation/.test(crossBoundResult.blacklist ?? ''),
     `memos=${JSON.stringify(crossBoundResult.memos)} blacklist=${crossBoundResult.blacklist}`);
+  // #163 r1 P1: the conviction above erases the memo and blacklists the URL, so every later scan
+  // reports `absent`. The sighting record is what keeps that from reading as "never conversed".
+  check('cross-bound canonical scratch still records the sighting the conviction erased',
+    crossBoundResult.observed.includes(MARKER),
+    `observed=${JSON.stringify(crossBoundResult.observed)} memos=${JSON.stringify(crossBoundResult.memos)}`);
+
+  // #163 r3 P0: the blacklist governs what may be COLLECTED, never whether a conversation exists.
+  // A URL blacklisted earlier in this marker's life that now renders our exact marker is proof the
+  // conversation is there; skipping it for the sighting too would hide it from every mechanism at
+  // once and let the reservation retire as never-conversed. Seed the blacklist for this marker's
+  // own URL, then render our marker at it.
+  const shadowed = await mockCdp(`run marker: ${MARKER}\nstill drafting`, [], {});
+  const shadowedResult = await runScratchSalvage([MARKER, '3'], shadowed.port, (home) => {
+    fs.writeFileSync(path.join(home, 'salvage-nonmatching.txt'), `${MARKER}\thttps://chatgpt.com/c/mock-conversation\n`);
+  });
+  check('a blacklisted URL rendering our exact marker is still recorded as a sighting (#163 r3 P0)',
+    shadowedResult.observed.includes(MARKER),
+    `observed=${JSON.stringify(shadowedResult.observed)} status=${shadowedResult.status}`);
+  shadowed.stop();
+
+  // #199 r5 P2: pg_conversation_observed_dir honours PRO_GATE_CONVERSATION_OBSERVED_DIR, and both
+  // the provenance stamp and the release predicate read whatever it names. A writer that hardcodes
+  // the default puts every sighting somewhere the predicate never looks, so a conversation we
+  // demonstrably saw still reads as never-conversed. Requiring the DEFAULT to stay empty is the
+  // half that matters: without it a writer ignoring the override passes by writing to both.
+  const overrideCdp = await mockCdp(`run marker: ${MARKER}\nstill drafting`, [], {});
+  const overrideResult = await runScratchSalvage([MARKER, '3'], overrideCdp.port, undefined,
+    { PRO_GATE_CONVERSATION_OBSERVED_DIR: 'PG_HOME/observed-elsewhere' });
+  check('the sighting follows PRO_GATE_CONVERSATION_OBSERVED_DIR (#199 r5 P2)',
+    overrideResult.observed.includes(MARKER) && overrideResult.observedDefault.length === 0,
+    `override=${JSON.stringify(overrideResult.observed)} default=${JSON.stringify(overrideResult.observedDefault)}`);
+  overrideCdp.stop();
+
+  // #199 r5 P1: a sighting that cannot be written must REVOKE early-release authority, not merely
+  // warn about its loss — a warning leaves the provenance stamp valid, so the next absent probe
+  // retires an attempt whose conversation we had already seen. Make the sidecar path unwritable by
+  // planting a FILE where the directory belongs (mkdir then fails with ENOTDIR/EEXIST), seed a
+  // stamp, and require the stamp to be gone afterwards. A missing stamp holds every attempt.
+  const unwritableCdp = await mockCdp(`run marker: ${MARKER}\nstill drafting`, [], {});
+  const unwritableResult = await runScratchSalvage([MARKER, '3'], unwritableCdp.port, (home) => {
+    fs.writeFileSync(path.join(home, 'conversation-observed'), 'not a directory\n');
+    fs.writeFileSync(path.join(home, 'conversation-observed.since'), '1700000000\n');
+  });
+  // The stamp is TRUNCATED, not removed (#199 r6 P1): empty reads as "cannot prove provenance" to
+  // the predicate exactly as absent does, but unlike absent it blocks a later initializer's `ln`,
+  // so the revocation cannot be undone by a racing or slow initializer.
+  check('an unrecordable sighting revokes the provenance stamp instead of only warning (#199 r5 P1)',
+    unwritableResult.observedSince === '' && /revoked the early-release provenance stamp/.test(unwritableResult.stderr ?? ''),
+    `since=${JSON.stringify(unwritableResult.observedSince)} stderr=${(unwritableResult.stderr ?? '').slice(0, 200)}`);
+  unwritableCdp.stop();
+
+  // #199 r5/r6 P2: an EXPORTED EMPTY override. The shell resolves ${VAR:-default} to the default
+  // and trusts the default stamp, so the writer must land there too. Under `??` it kept the empty
+  // string, wrote nothing, and then "revoked" a relative .since that never existed — reporting a
+  // successful revocation while the stamp the shell actually reads stayed valid. The sighting
+  // landing in the default location is what proves the two sides agree.
+  const emptyCdp = await mockCdp(`run marker: ${MARKER}\nstill drafting`, [], {});
+  const emptyResult = await runScratchSalvage([MARKER, '3'], emptyCdp.port, (home) => {
+    fs.writeFileSync(path.join(home, 'conversation-observed.since'), '1700000000\n');
+  }, { PRO_GATE_CONVERSATION_OBSERVED_DIR: '', PRO_GATE_CONVERSATION_OBSERVED_SINCE: '' });
+  check('an exported empty observation override falls back exactly as the shell does (#199 r6 P2)',
+    emptyResult.observedDefault.includes(MARKER) && emptyResult.observedSince !== null,
+    `default=${JSON.stringify(emptyResult.observedDefault)} since=${JSON.stringify(emptyResult.observedSince)}`);
+  emptyCdp.stop();
   check('cross-bound canonical scratch closes only scratch',
     crossBound.closed.includes('scratch1') && !crossBound.closed.includes('tab1'), `closed=${crossBound.closed}`);
   crossBound.stop();
@@ -3380,6 +3490,12 @@ const FOREIGN_ANSWER = (m) => [
   check('probe under the throttle modal opens no scratch render against the limited account',
     probed.created.length === 0 && !probed.closed.includes('tab1'),
     `created=${JSON.stringify(probed.created)} closed=${probed.closed}`);
+  // #163 r1 P1: this page demonstrably carries our marker, and the path reports that liveness and
+  // exits before any memo is written. Without a recorded sighting, losing this tab would leave a
+  // still-recoverable attempt looking like one that never reached a conversation at all.
+  check('probe under the throttle modal records the sighting before any memo exists',
+    r.observed.includes(MARKER) && r.memos.length === 0,
+    `observed=${JSON.stringify(r.observed)} memos=${JSON.stringify(r.memos)}`);
   probed.stop();
 
   const harvested = await mockCdp(conversation, [], { throttleModal: modal });

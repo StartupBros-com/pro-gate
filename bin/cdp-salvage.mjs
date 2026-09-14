@@ -170,6 +170,21 @@ const URL_MEMO_DIR = path.join(PG_HOME, 'conversation-urls');
 const TITLE_MEMO_DIR = path.join(PG_HOME, 'conversation-titles');
 const COMPLETED_DIR = process.env.PRO_GATE_COMPLETED_DIR ?? path.join(PG_HOME, 'completed');
 const PENDING_DIR = path.join(PG_HOME, 'pending');
+// These two MUST resolve exactly as pg_conversation_observed_dir and
+// pg_conversation_observed_since_file do in lib/pro-gate-lib.sh. The shell honours the overrides
+// and the writer used to hardcode the default, so with an override set every sighting landed
+// somewhere the release predicate never looked and a seen conversation still read as never
+// conversed (#199 gate r5 P2). One resolution rule, mirrored on both sides of the language seam.
+// `||`, NOT `??`, and the difference is load-bearing (#199 gate r6 P2). The shell resolves these
+// with ${VAR:-default}, which falls back on an exported EMPTY string; `??` falls back only on
+// null/undefined and would keep the empty one. With PRO_GATE_CONVERSATION_OBSERVED_DIR="" the shell
+// would trust the default stamp while this file tried mkdirSync("") and then "revoked" a relative
+// .since path that does not exist -- reporting a successful revocation while the stamp the shell
+// actually reads stayed valid. Equal fallback semantics on both sides of the seam is the invariant.
+// (PG_HOME, COOLDOWN_FILE and COMPLETED_DIR above still use `??`; pre-existing and out of scope
+// here, but the same divergence would apply to any of them the shell reads with :- .)
+const OBSERVED_DIR = process.env.PRO_GATE_CONVERSATION_OBSERVED_DIR || path.join(PG_HOME, 'conversation-observed');
+const OBSERVED_SINCE_FILE = process.env.PRO_GATE_CONVERSATION_OBSERVED_SINCE || `${OBSERVED_DIR}.since`;
 const MEMO_KEEP = 200;                  // newest N memos retained; older ones are pruned on write
 const MARKER_SAFE_RE = /^pg-run-[A-Za-z0-9.-]+$/;
 // #167: the marker is EXTRACTED case-insensitively everywhere but used to be COMPARED
@@ -365,6 +380,59 @@ process.on('exit', () => {
   flushCrossBind(marker);
 });
 
+// #163 gate r1 P1: the positive, monotonic record that a conversation carrying this marker was
+// seen at least once. The memo cannot carry that fact — a cross-bound conviction discards it and
+// blacklists the URL without persisting anything (a probe returns before flushCrossBind), the
+// owned-throttle path sees a live conversation before it remembers one, and MEMO_KEEP prunes old
+// memos on write. Create-only and never removed here, so no later eviction can make an observed
+// attempt read as never-conversed; the engine sweeps it with the other marker sidecars.
+function noteObserved(m, why) {
+  if (!m || !MARKER_SAFE_RE.test(m)) return;
+  // mkdir and write are kept apart deliberately. `mkdirSync(..., {recursive:true})` is silent when
+  // the directory already exists, so it only throws on a genuine problem — but one of those is
+  // EEXIST when the path is a FILE, and folding the two calls into one catch would let that read
+  // as the write's "already recorded" and return as though a sighting had been stored.
+  try {
+    fs.mkdirSync(OBSERVED_DIR, { recursive: true });
+  } catch (e) {
+    revokeEarlyRelease(m, e);
+    return;
+  }
+  try {
+    fs.writeFileSync(path.join(OBSERVED_DIR, m), `${why}\t${Math.floor(Date.now() / 1000)}\n`, { flag: 'wx' });
+  } catch (e) {
+    if (e?.code === 'EEXIST') return;   // ordinary: this sighting is already recorded
+    revokeEarlyRelease(m, e);
+  }
+}
+
+// A sighting happened and could NOT be written down. Saying so out loud is not enough: the early
+// release reads a missing sidecar as "never conversed", so a warning alone lets a conversation we
+// demonstrably saw be retired as if it never existed (#199 gate r5 P1). Revoke the authority
+// instead of narrating its loss. The provenance stamp is a SIBLING of the sidecar directory, so the
+// case that actually occurs — conversation-observed/ alone unwritable, the rest of PRO_GATE_HOME
+// fine — can still be failed closed, and a missing stamp holds every attempt until a later
+// write-capable run re-plants it. An earlier comment here claimed no repair was possible because
+// the same disk would swallow it; that over-generalised from a full disk to every failure mode.
+function revokeEarlyRelease(m, cause) {
+  // TRUNCATE, never unlink (#199 gate r6 P1). Removing the file lets the next initializer -- or a
+  // slow one that prepared its epoch before this revocation -- create it again and hand back the
+  // authority we just took away. An empty file is indistinguishable from a missing one to
+  // pg_conversation_observed_since (it requires a non-empty stamp, so both mean "cannot prove
+  // provenance", which holds), but it is very different to pg_conversation_observed_since_init:
+  // its `ln` fails because the target exists. So a revoked host stays revoked until an operator
+  // removes the empty stamp, which is the fail-closed direction and is stated in the warning below.
+  let revoked = false;
+  try { fs.writeFileSync(OBSERVED_SINCE_FILE, ''); revoked = true; }
+  catch { revoked = false; }
+  const why = cause?.code ?? cause;
+  if (revoked) {
+    console.error(`sighting-unrecorded: saw "${m}" but could not write its observation record (${why}); revoked the early-release provenance stamp, so attempts stay held until an operator removes the empty stamp at ${OBSERVED_SINCE_FILE}`);
+  } else {
+    console.error(`sighting-unrecorded: saw "${m}" but could not write its observation record (${why}) AND could not revoke the early-release provenance stamp — an attempt seen here may still be read as never-conversed`);
+  }
+}
+
 function rememberUrl(m, url) {
   const f = memoPath(m);
   if (!f) return;
@@ -544,8 +612,19 @@ async function tabText(tab) {
     ')';
   const result = await evaluateTab(tab, expression);
   if (!result.ok) return null;
-  if (typeof result.value === 'string') return result.value;
+  // #163: every page read in this helper passes through here, so this is where a sighting is
+  // recorded — once, at the single producer, never at the consumers. Four gate rounds each found
+  // one more consumer that exited before its own recording line (a scratch throttle, a scan-wide
+  // modal over a foreign tab, a throttled dead-tab re-render), because "record it at each place
+  // that reads text" has as many holes as it has callers. A caller cannot outrun this: it does not
+  // have the text until this function returns. Recording more often than strictly needed is the
+  // safe direction — a sighting only ever HOLDS a reservation, never releases one.
+  if (typeof result.value === 'string') {
+    if (hasExactMarker(result.value, marker)) noteObserved(marker, 'read');
+    return result.value;
+  }
   if (typeof result.value?.text !== 'string') return null;
+  if (hasExactMarker(result.value.text, marker)) noteObserved(marker, 'read');
   if (result.value.promptAt === 0) scopedResponses.add(result.value.text);
   return result.value.text;
 }
@@ -1461,6 +1540,17 @@ while (Date.now() < deadline) {
     ]);
     return { tab, text, infrastructureError, throttleModal };
   }));
+  // #163 gate r3: record every sighting in this batch BEFORE anything can exit. The modal branch
+  // immediately below ends the whole scan through tripThrottleEvidence whenever ANY tab carries
+  // the limiter's modal — including a foreign one listed alongside ours — and the per-tab loop has
+  // its own early exits. A conversation this scan demonstrably read could otherwise leave no trace
+  // at all, and a later absence would then read as "never conversed".
+  //
+  // hasExactMarker, never foldedIncludes: this record is permanent and releases capacity, so a
+  // substring of another run's marker must never be able to write it (gate r3 P2).
+  // Sightings for this batch were recorded by tabText itself as each read returned, before any
+  // branch below — including the blacklist skips, which govern what may be COLLECTED and never
+  // whether a conversation exists.
   // #162: the modal is account-wide, so decide ownership over the WHOLE scan, never on the first
   // tab in list order (the same order-independence onOurConversation documents): a foreign or
   // blacklisted tab listed ahead of ours must not hide the proof that our conversation exists.
@@ -1599,6 +1689,8 @@ while (Date.now() < deadline) {
       }
       continue;
     }
+    // The sighting for this render was already recorded by tabText inside freshRenderText, before
+    // the throttle branch above could exit (#163).
     const evidence = onOurConversation(tab.url, classifyEvidence(text));
     if (evidence.kind === 'cross-bound') {
       rejectCrossBound(tab.url, evidence.foreignMarker, 're-rendered');
@@ -1632,6 +1724,7 @@ while (Date.now() < deadline) {
     console.error(`no open tab carries "${marker}" — re-rendering the remembered conversation ${seedUrl} (${seededRenders}/${MAX_SEEDED_RENDERS})...`);
     const { text, evidence: renderEvidence } = await freshRenderText(seedUrl, port, deadline);
     if (text) {
+      // The sighting for this render was already recorded by tabText inside freshRenderText (#163).
       const evidence = renderEvidence ?? classifyEvidence(text);
       if (evidence.kind === 'throttle') tripThrottleEvidence(seedUrl, evidence, `remembered render ${seedUrl}`);
       if (evidence.kind === 'cross-bound') {

@@ -769,6 +769,21 @@ pg_run_meta_find_unresolved() { pg_run_meta_find_latest "$1" "$2" "$3" "$4" unre
 
 pg_attempt_disposition_dir() { printf '%s\n' "${PRO_GATE_ATTEMPT_DISPOSITION_DIR:-$PRO_GATE_HOME/attempt-dispositions}"; }
 
+# The closed (terminal_kind, proof_kind) vocabulary. Exactly four pairs, each a DIFFERENT proof:
+#
+#   not-submitted    / proven-no-submit                  Oracle proved Send was never dispatched.
+#   submitted-terminal / exact-owned-infrastructure-terminal  our conversation ended in an error.
+#   recovery-exhausted / bounded-recovery-exhausted      TTL elapsed AND bounded misses confirmed.
+#   never-conversed  / bounded-absence-never-conversed   #163: bounded misses confirmed and NO
+#                                                       conversation ever carried this marker.
+#
+# terminal_kind is NOT a free label: `not-submitted` is the exact string
+# pg_attempt_disposition_cleanup, pg_attempt_disposition_cleanup_pending and
+# pg_attempt_terminal_transition switch on to REFUND the charged round (pg_round_unrecord_epoch
+# plus the input-binding unlink). #163's class is defined by the pre-send probe being UNABLE to
+# prove no-submit, so filing it under not-submitted would refund a round nothing proved unspent.
+# Any future kind that must keep its charge has to stay out of that string, exactly as
+# never-conversed does.
 pg_attempt_disposition_validate() { # canonical JSON [expected marker]
   local json="${1-}" marker="${2:-}" canonical
   canonical="$(printf '%s' "$json" | jq -cS . 2>/dev/null)" || return 1
@@ -779,11 +794,12 @@ pg_attempt_disposition_validate() { # canonical JSON [expected marker]
     ($d.round_key|type=="string" and test("^[A-Za-z0-9.-]+$")) and ($d.marker|startswith("pg-run-" + $d.round_key + "-")) and
     ($d.charged_spend_epoch|type=="number" and floor==. and .>0) and
     ($d.observed_at|type=="number" and floor==. and .>=$d.charged_spend_epoch) and
-    ($d.terminal_kind|IN("not-submitted","submitted-terminal","recovery-exhausted")) and
-    ($d.proof_kind|IN("proven-no-submit","exact-owned-infrastructure-terminal","bounded-recovery-exhausted")) and
+    ($d.terminal_kind|IN("not-submitted","submitted-terminal","recovery-exhausted","never-conversed")) and
+    ($d.proof_kind|IN("proven-no-submit","exact-owned-infrastructure-terminal","bounded-recovery-exhausted","bounded-absence-never-conversed")) and
     (($d.terminal_kind=="not-submitted" and $d.proof_kind=="proven-no-submit") or
      ($d.terminal_kind=="submitted-terminal" and $d.proof_kind=="exact-owned-infrastructure-terminal") or
-     ($d.terminal_kind=="recovery-exhausted" and $d.proof_kind=="bounded-recovery-exhausted")) and
+     ($d.terminal_kind=="recovery-exhausted" and $d.proof_kind=="bounded-recovery-exhausted") or
+     ($d.terminal_kind=="never-conversed" and $d.proof_kind=="bounded-absence-never-conversed")) and
     ($d.repository|keys)==["host","owner","repo"] and
     ($d.repository.host|test("^[A-Za-z0-9.-]+$")) and ($d.repository.owner|test("^[A-Za-z0-9._-]+$")) and ($d.repository.repo|test("^[A-Za-z0-9._-]+$")) and
     ($d.target|keys)==["kind","pr"] and $d.target.kind=="pull-request" and ($d.target.pr|type=="number" and floor==. and .>0) and
@@ -1573,11 +1589,176 @@ pg_reservation_remove() { # marker
   pg_reservation_guard_release
 }
 
+# pg_attempt_never_conversed <marker> [out-path]: 0 only when NOTHING this engine has ever
+# recorded shows a conversation carrying this marker — #163's never-sent class.
+#
+# This predicate is the whole authority boundary between #163 and #109, so read the distinction
+# before touching it. #109 is "a conversation EXISTS but has become untraceable", and no
+# production terminaliser may be based on age, TTL, repeated no-VERDICT, or an absent spinner for
+# such a conversation. #163 is different in KIND: an attempt with no conversation AT ALL. Every
+# check below is therefore a POSITIVE trace that a conversation existed, and any one of them
+# present fails the predicate closed:
+#
+#   1. conversation-urls/<marker>. cdp-salvage.mjs rememberUrl() writes this memo on EVERY
+#      positive marker match, in every mode — --probe, the run's own watchdog, the pre-retry
+#      probe, --harvest, full salvage — so it accumulates over the marker's WHOLE life, not this
+#      pass. Its absence is therefore "no probe, ever, found a conversation for this marker",
+#      which is exactly the fact that defines the class. It also subsumes the pre-send probe's
+#      negative branch: pg_attempt_provably_unsubmitted refuses on this same memo.
+#   2. crossbound/<marker>. A page that carried OUR marker under ANOTHER run's completed answer;
+#      that conversation demonstrably exists. A conviction blacklists its URL, so LATER scans skip
+#      it and classify `absent` while the sidecar survives (#170). Without this check that
+#      survivor would read as never-conversed on the next pass.
+#   3. <out>.unbound.*. A capture that carried this marker but could not be bound to this run —
+#      again, bytes extracted from a real conversation. --status already treats it as evidence.
+#   4. salvage-class/<marker> must say `absent`: the CDP title probe found NO tab for the marker
+#      on the latest pass. `inconclusive` and `browser-down` are absence of EVIDENCE, not evidence
+#      of absence, and must never reach here; the other five kinds all describe a page that exists.
+#
+# Deliberately NOT consulted: salvage-nonmatching.txt. Its entries are written as "<our marker>\t
+# <url>" for any FOREIGN page this marker's scan rendered and rejected, and #163 was filed on a box
+# holding eight leaked `pro-gate review:` tabs from other PRs — gating on it would make this fix
+# inert in precisely the incident it exists for.
+# #163 gate r1 P1: a missing memo is not proof a conversation was never observed. Two shipped paths
+# destroy the memo while leaving no other trace. A reconciliation --probe that finds a cross-bound
+# page calls rejectCrossBound, which discards the memo and blacklists the URL, while the exit hook
+# above it returns before flushCrossBind for a probe that proved no ownership — so no crossbound/
+# sidecar is ever written, and every later scan skips the blacklisted URL and reports `absent`. The
+# owned-throttle path likewise reports a demonstrably live conversation before remembering its URL.
+# Either way the absence checks below would pass for a conversation that existed. This sidecar is
+# the positive record those paths lacked: written once by the salvage helper at every sighting,
+# never removed while recovery is unresolved (memo pruning and URL eviction cannot touch it), and
+# swept on the same 14-day hygiene as the other marker sidecars.
+pg_conversation_observed_dir() { printf '%s\n' "${PRO_GATE_CONVERSATION_OBSERVED_DIR:-$PRO_GATE_HOME/conversation-observed}"; }
+# #163 gate r3 P1: the epoch at which sighting recording began on this host. A sidecar that did not
+# exist yesterday cannot speak for yesterday's attempts, so the early release must never reason
+# about a period when nothing was recorded. Created on first read and never rewritten, which makes
+# an upgrade exclude every attempt already in flight; one reservation TTL later nothing predates it
+# and this gate stops mattering. Deliberately a SIBLING of the sidecar directory, not a file inside
+# it: the 14-day sweep empties that directory, and a stamp swept away would silently become "now".
+pg_conversation_observed_since_file() { printf '%s\n' "${PRO_GATE_CONVERSATION_OBSERVED_SINCE:-$(pg_conversation_observed_dir).since}"; }
+pg_conversation_observed_since() { # -> epoch; READ ONLY, fails when the stamp is absent
+  local f stamp
+  f="$(pg_conversation_observed_since_file)"
+  [ -s "$f" ] || return 1
+  stamp="$(head -n1 "$f" 2>/dev/null | tr -dc '0-9')"
+  [ -n "$stamp" ] || return 1
+  printf '%s\n' "$stamp"
+}
+# Planting the stamp is a WRITE, so it happens on write-capable paths only. --status and the
+# advisory review-decision query are documented read-only — "never borrow the regular engine's
+# housekeeping … or binding/publication writes" — and creating this file on first read would have
+# made a diagnostic command mutate PRO_GATE_HOME. A missing stamp therefore means "cannot prove
+# provenance", which holds the reservation, rather than silently minting an answer.
+pg_conversation_observed_since_init() { # idempotent; safe to call on every write-capable run
+  local f now tmp
+  f="$(pg_conversation_observed_since_file)"
+  [ ! -s "$f" ] || return 0
+  now="$(date +%s)"
+  case "$now" in ''|*[!0-9]*) return 1;; esac
+  tmp="$f.tmp.$$"
+  printf '%s\n' "$now" > "$tmp" 2>/dev/null || return 1
+  # `ln`, never `mv -f` (#199 gate r6 P1). A hard link FAILS when the target exists, and that is the
+  # whole point: initialization and revocation are not serialized, so a slow initializer can prepare
+  # an epoch, pause, and wake up after another process has already stamped and then revoked. `mv -f`
+  # would publish that stale epoch over the revocation and restore authority for a sighting that was
+  # never recorded. An EARLIER stamp is the unsafe direction -- it makes MORE attempts look eligible.
+  # Combined with revocation leaving an EMPTY file rather than removing it, the target exists from
+  # the first stamp onward, so a revoked host stays revoked: this `ln` can never win again.
+  ln "$tmp" "$f" 2>/dev/null
+  rm -f "$tmp" 2>/dev/null
+  [ -s "$f" ]
+}
+# #163 gate r7 P1: `[ -e ... ]` is false for a missing file AND for one we were not permitted to
+# look at, and this predicate negates that result into permission to release. A sidecar directory at
+# mode 000 therefore read as "confirmed absence" for evidence that was sitting right there. Absence
+# is only evidence when the absence could actually be established, so answer three states and let
+# the caller retain on the third rather than collapsing it into "not found".
+#   rc 0 = present, 1 = confirmed absent, 2 = cannot tell
+pg_sidecar_state() { # dir marker
+  local dir="$1" marker="$2" parent
+  [ -e "$dir/$marker" ] && return 0
+  if [ -d "$dir" ]; then
+    # Listing needs both: -r to read names, -x to stat entries. Missing either makes -e above
+    # meaningless rather than negative.
+    { [ -r "$dir" ] && [ -x "$dir" ]; } || return 2
+    return 1
+  fi
+  # No directory is only "nothing was ever written here" if we could see that for ourselves.
+  parent="${dir%/*}"; [ -n "$parent" ] || parent=/
+  { [ -d "$parent" ] && [ -r "$parent" ] && [ -x "$parent" ]; } || return 2
+  return 1
+}
+pg_conversation_observed() { # marker -> rc 0 when a conversation carrying this marker was ever seen
+  local marker="$1"
+  pg_reservation_marker_ok "$marker" || return 1
+  pg_sidecar_state "$(pg_conversation_observed_dir)" "$marker"
+}
+
+pg_attempt_never_conversed() { # marker [out-path]
+  local marker="$1" out="${2:-}" class ub prov since minted out_dir
+  pg_reservation_marker_ok "$marker" || return 1
+  # All three evidence paths use the same tri-state rule (#163 gate r7 P1): only a CONFIRMED
+  # absence (rc 1) may pass. Present (0) retains, and so does "cannot tell" (2) -- an unreadable
+  # directory is not evidence that nothing is in it, and these three are the only records standing
+  # between a live conversation and a released slot.
+  pg_sidecar_state "$PRO_GATE_HOME/conversation-urls" "$marker"; [ $? -eq 1 ] || return 1
+  pg_sidecar_state "$PRO_GATE_HOME/crossbound" "$marker"; [ $? -eq 1 ] || return 1
+  # A sighting outlives both records above; the monotonic observation sidecar is the one that
+  # cannot be manufactured away by a conviction, an eviction, or a memo prune.
+  pg_conversation_observed "$marker"; [ $? -eq 1 ] || return 1
+  # #163 gate r3 P1: an absent sidecar only means "never observed" for an attempt that existed
+  # while sightings were being recorded. An older attempt has none because the record did not
+  # exist, not because nothing was seen — and a pre-upgrade probe could have convicted its
+  # conversation, discarded the memo and blacklisted the URL while persisting no conviction at all,
+  # leaving it indistinguishable from a never-sent attempt. Compare the marker's own minting epoch
+  # against the stamp; an unreadable stamp or an unparseable marker is "cannot tell", which holds.
+  since="$(pg_conversation_observed_since 2>/dev/null || true)"
+  case "$since" in ''|*[!0-9]*) return 1;; esac
+  minted="$(pg_marker_epoch "$marker" 2>/dev/null || true)"
+  case "$minted" in ''|*[!0-9]*) return 1;; esac
+  # STRICTLY greater, not -ge (#163 gate r9 P2). Both sides are whole-second epochs, so an attempt
+  # minted in the same second the stamp was planted may have been minted just BEFORE recording
+  # began: equality cannot distinguish the two, and it is precisely the upgrade boundary this gate
+  # exists to protect. One second of extra conservatism costs a single attempt one TTL; admitting
+  # the wrong side of it can terminalize a conversation that was seen and never recorded.
+  [ "$minted" -gt "$since" ] || return 1
+  if [ -n "$out" ]; then
+    # #163 gate r8 P1: a glob that could not be expanded is not evidence that nothing matched. When
+    # the output directory cannot be listed or searched, Bash leaves "$out".unbound.* unexpanded,
+    # every [ -e ] below fails, and a preserved capture naming this very attempt reads as absent --
+    # the same absent-versus-unreadable conflation the three sidecar paths above now refuse. Fail
+    # closed here too, so the rule holds for every evidence path this predicate consults.
+    out_dir="${out%/*}"; [ "$out_dir" != "$out" ] || out_dir=.
+    { [ -d "$out_dir" ] && [ -r "$out_dir" ] && [ -x "$out_dir" ]; } || return 1
+    # `if` rather than `[ … ] && return 1`: an unmatched glob would leave the whole loop with
+    # status 1, which under the engine's `set -e` would abort the caller instead of falling
+    # through to the classification read.
+    for ub in "$out".unbound.*; do
+      # #163 gate r1 P2: the glob is scoped to an OUTPUT PATH, which a later round may legitimately
+      # reuse, so a preserved capture proves only that SOME attempt wrote one there. The sibling
+      # provenance file names the attempt that did. A capture naming another marker is not this
+      # attempt's evidence; one with no provenance (legacy, or a failed provenance write) stays
+      # fail-closed exactly as before, since it cannot be attributed either way.
+      case "$ub" in *.marker) continue;; esac
+      [ -e "$ub" ] || continue
+      prov=""
+      [ -f "$ub.marker" ] && prov="$(head -n1 "$ub.marker" 2>/dev/null | tr -d '\r\n')"
+      if [ -n "$prov" ] && [ "$prov" != "$marker" ]; then continue; fi
+      return 1
+    done
+  fi
+  class="$(pg_salvage_class_read "$marker" 2>/dev/null || true)"
+  [ -n "$class" ] || return 1
+  [ "${class%%$'\t'*}" = absent ] || return 1
+  return 0
+}
+
 # pg_reservation_note_miss <marker>: one confirmed-absent observation. Echoes "released" when
 # the miss limit is reached (reservation removed) or "retained miss/limit" otherwise. Shared by
 # reconciliation and the harvest not-found path so both apply the same fail-closed policy.
 pg_reservation_note_miss() {
-  local marker="$1" dir f pr out created misses slot model spend miss_limit ttl now age
+  local marker="$1" dir f pr out created misses slot model spend miss_limit ttl now age term_kind term_proof
   miss_limit="${PRO_GATE_RESERVATION_MISSES:-3}"
   case "$miss_limit" in ''|*[!0-9]*) miss_limit=3;; esac
   [ "$miss_limit" -ge 2 ] 2>/dev/null || miss_limit=2
@@ -1615,10 +1796,51 @@ pg_reservation_note_miss() {
   ttl="${PRO_GATE_RESERVATION_TTL:-21600}"; case "$ttl" in ''|*[!0-9]*) ttl=21600;; esac
   now="$(date +%s)"; age=$(( now - created )); [ "$age" -lt 0 ] && age=0
   misses=$(( misses + 1 ))
+  # TWO terminal conditions, and the order is load-bearing: the pre-existing dual gate is tried
+  # FIRST, so the #163 branch can only ever fire where the old code RETAINED. Nothing that used to
+  # release changes kind, wording, or timing.
+  #
+  #  (1) v0.37's dual gate — bounded confirmed misses AND the full reservation TTL. The general
+  #      case: a conversation may exist and simply be unreachable, so time is part of the proof.
+  #  (2) #163 — the same bounded confirmed misses with NO TTL wait, allowed only when
+  #      pg_attempt_never_conversed can show no conversation ever carried this marker. That
+  #      attempt is the one attempt that can never produce a conversation, so another 6h of
+  #      waiting buys no evidence while its shared slot stays held; on the reporting box four of
+  #      them held every slot at once and no session could start a round anywhere. The proof lives
+  #      in that predicate, never here — this function only decides what to do with it.
+  #
+  # Both keep the charge. Neither touches refund: that is pg_fresh_dispatch_refund's positive
+  # no-submit predicate, a different mechanism this path has never entered and must not learn to.
+  term_kind=""; term_proof=""
   if [ "$misses" -ge "$miss_limit" ] && [ "$created" -gt 0 ] && [ "$age" -ge "$ttl" ]; then
+    term_kind=recovery-exhausted; term_proof=bounded-recovery-exhausted
+  elif [ "$misses" -ge "$miss_limit" ] && pg_attempt_never_conversed "$marker" "$out"; then
+    term_kind=never-conversed; term_proof=bounded-absence-never-conversed
+  fi
+  # #163 gate r7 P1: the never-conversed proof above was computed from state sampled before the CDP
+  # probe returned, and the reservation guard does not serialize a collector's sighting write. A
+  # collector can therefore start after the earlier claim check and commit positive evidence while
+  # this function is still deciding. Re-establish the proof immediately before publication, and
+  # stand down if a collector now holds this marker's claim.
+  #
+  # This NARROWS the window; it does not close it. Closing it requires reconciliation to HOLD the
+  # same per-marker collection claim across probe and settlement instead of sampling it, which
+  # changes locking semantics shared with the collector and reaches beyond this issue.
+  # NOTE (#163 gate r8 P1): an earlier version of this block also vetoed on pg_harvest_claimed.
+  # That was wrong and is deliberately gone. `--harvest` acquires HARVEST_LOCK and still holds it
+  # when it calls this function on exit code 4, so pg_harvest_claimed saw the CALLER'S OWN claim and
+  # cleared term_kind every time -- making the harvest-only recovery flow, which is the documented
+  # path this issue is about, never able to perform the release at all. A veto that cannot
+  # distinguish another collector's claim from its own is not a safety check, it is an off switch.
+  # Re-establishing the proof itself is kept: it is cheap and it does catch evidence committed since
+  # the probe.
+  if [ "$term_kind" = never-conversed ] && ! pg_attempt_never_conversed "$marker" "$out"; then
+    term_kind=""; term_proof=""
+  fi
+  if [ -n "$term_kind" ]; then
     # The miss threshold is terminal only when durable run-meta can bind the proof to one charged
     # attempt. Publish disposition BEFORE releasing the reservation so no fresh caller sees a gap.
-    if pg_attempt_terminal_from_meta "$marker" recovery-exhausted bounded-recovery-exhausted; then
+    if pg_attempt_terminal_from_meta "$marker" "$term_kind" "$term_proof"; then
       rm -f "$f" "$(pg_manifest_dir)/$marker" "$(pg_manifest_dir)/$marker.nonce" 2>/dev/null
       pg_reservation_guard_release
       pg_attempt_reconcile_terminal "$marker" 2>/dev/null || true

@@ -327,7 +327,7 @@ diagnosis; ordinary callers should use `/pro-gate recover` instead.
 | 3 | Oracle/browser/CDP failure; run state kept | no |
 | 4 | Repo not found | no |
 | 5 | Diff fetch failed | no |
-| 6 | No usable current review. Check `detail`/`attempt`: recoverable work must be harvested; `not-submitted` was refunded; `submitted-terminal`, `recovery-exhausted`, or `superseded` remains charged but permits a fresh typed decision | maybe |
+| 6 | No usable current review. Check `detail`/`attempt`: recoverable work must be harvested; `not-submitted` was refunded; `submitted-terminal`, `recovery-exhausted`, `never-conversed`, or `superseded` remains charged but permits a fresh typed decision | maybe |
 | 7 | Per-change lock timeout (another run holds this change) | no |
 | 8 | Deferred: box unfit, low memory, or throttle cooldown (including ChatGPT's rate-limit modal over a live conversation); retry later | no |
 | 9 | In-progress: the model was still generating and the tab stays open. `--harvest` by marker; never submit a new review for it | yes |
@@ -451,8 +451,9 @@ it is deliberately neither archived nor closed.
 ### Exit 6 (`no usable review`)
 
 Read `--status --json` before acting. A canonical `attempt` reports one truth: active/recoverable
-work must be collected; `not-submitted` was positively proven and refunded; `submitted-terminal`
-or `recovery-exhausted` retains its charge but no longer owns recovery; `superseded` retains its
+work must be collected; `not-submitted` was positively proven and refunded; `submitted-terminal`,
+`recovery-exhausted` or `never-conversed` retains its charge but no longer owns recovery;
+`superseded` retains its
 charge and optional audit harvest but owns neither capacity nor the current head. Those settled states
 let changed/current evidence receive a fresh typed decision. Unknown post-click fate stays recoverable.
 Each unresolved reservation also carries `classification` (what the latest collection pass concluded:
@@ -460,6 +461,10 @@ Each unresolved reservation also carries `classification` (what the latest colle
 `terminal-infrastructure`), `classified_at`, and `ttl_remaining_secs`, so a parked run and a genuinely
 generating one no longer read alike. A remembered conversation URL whose id is not a real conversation
 id (a `WEB:<uuid>` placeholder) is revoked on read and the pass rescans; nothing is terminalized from age alone.
+An attempt classified `absent` for which no conversation URL was EVER remembered is the never-sent
+class: it releases its shared slot on confirmed misses alone, without waiting out the TTL, and is
+recorded `never-conversed` with its round still charged. An attempt whose conversation was ever
+remembered, convicted cross-bound, or captured unbindably is not that class and keeps the dual gate.
 Never delete state, quarantine files, or use a force flag as diagnosis. On a low-memory box, free
 memory before retrying.
 
