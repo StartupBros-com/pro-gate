@@ -802,6 +802,10 @@ ns_plant() { # suffix salvage-class plant-kind -> sets NS_VERDICT / NS_PLANT_HOM
     # The attempt predates sighting recording: its missing sidecar proves nothing, so the dual
     # gate stands even though every other absence check passes.
     inherited)  printf '1700000065\n' > "$home/conversation-observed.since" ;;
+    # #163 gate r9 P2: minted == since exactly. Both are whole-second epochs, so nothing orders the
+    # mint against the stamp within that second — the attempt may have been minted just before
+    # recording began, which is the pre-recording side of the very boundary this gate protects.
+    equalstamp) printf '1700000064\n' > "$home/conversation-observed.since" ;;
     # No stamp at all. Reading it is READ ONLY (--status and the advisory query must not mutate
     # PRO_GATE_HOME), so a missing stamp means "cannot prove provenance", which holds rather than
     # releases; only a write-capable run plants one.
@@ -881,6 +885,8 @@ ns_retained_check 'never-sent: this attempt own unbindable capture still holds t
 # conviction could have erased its memo without persisting anything. Both shapes must hold.
 ns_plant inherited absent inherited
 ns_retained_check 'never-sent: an attempt minted before sighting recording began is never released (#163 r3 P1)' 'plant=inherited'
+ns_plant equalstamp absent equalstamp
+ns_retained_check 'never-sent: an attempt minted in the SAME SECOND as the stamp is never released (#199 r9 P2)' 'plant=equalstamp'
 ns_plant nostamp absent nostamp
 ns_retained_check 'never-sent: an absent provenance stamp holds rather than releases' 'plant=nostamp'
 

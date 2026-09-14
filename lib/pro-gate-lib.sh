@@ -1717,7 +1717,12 @@ pg_attempt_never_conversed() { # marker [out-path]
   case "$since" in ''|*[!0-9]*) return 1;; esac
   minted="$(pg_marker_epoch "$marker" 2>/dev/null || true)"
   case "$minted" in ''|*[!0-9]*) return 1;; esac
-  [ "$minted" -ge "$since" ] || return 1
+  # STRICTLY greater, not -ge (#163 gate r9 P2). Both sides are whole-second epochs, so an attempt
+  # minted in the same second the stamp was planted may have been minted just BEFORE recording
+  # began: equality cannot distinguish the two, and it is precisely the upgrade boundary this gate
+  # exists to protect. One second of extra conservatism costs a single attempt one TTL; admitting
+  # the wrong side of it can terminalize a conversation that was seen and never recorded.
+  [ "$minted" -gt "$since" ] || return 1
   if [ -n "$out" ]; then
     # #163 gate r8 P1: a glob that could not be expanded is not evidence that nothing matched. When
     # the output directory cannot be listed or searched, Bash leaves "$out".unbound.* unexpanded,
