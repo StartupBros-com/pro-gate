@@ -7428,6 +7428,32 @@ printf '%s\n' 'CHOICE: keep | Keep compatibility | Existing users need no migrat
 CHOICE_PARSED="$(pg_review_decision_named_choices "$CHOICE_ART" 2>/dev/null)"; CHOICE_PARSE_RC=$?
 check 'well-formed NEEDS-DISCUSSION artifact yields bounded machine choice outcomes' \
   "$([ "$CHOICE_PARSE_RC" -eq 0 ] && jq -e 'length==2 and .[0].id=="keep" and .[1].id=="replace"' <<<"$CHOICE_PARSED" >/dev/null 2>&1; echo $?)" "$CHOICE_PARSED"
+# #201: the shape a real completed review actually returned — a blank line between the last CHOICE
+# and the VERDICT line. The prompt asks for the choices "immediately before" the verdict, and a
+# model that separates them with an empty line has still obeyed it. Rejecting that emptied the
+# outcomes and left the reducer at invalid-named-choice with no path forward, on a paid round.
+# Reproduced from the artifact of the blocked review (mathfleet #310), ids and text aside.
+{ printf '%s\n' 'P0: none' 'P1: none' ''; \
+  printf '%s\n' 'CHOICE: authoritative-diff | Supply the authoritative pr.diff | Exact coverage cannot be established from the GitHub diff alone.'; \
+  printf '%s\n' 'CHOICE: github-head | Accept the inspected GitHub head as authoritative | The available diff was reviewed; no in-scope defects were identified.'; \
+  printf '%s\n' ''; \
+  printf '%s\n' 'VERDICT: NEEDS-DISCUSSION — missing authoritative attachment prevents exact approval.'; } > "$CHOICE_ART"
+CHOICE_BLANK_PARSED="$(pg_review_decision_named_choices "$CHOICE_ART" 2>/dev/null)"; CHOICE_BLANK_RC=$?
+check '#201: a blank line between the last CHOICE and the VERDICT still yields both outcomes' \
+  "$([ "$CHOICE_BLANK_RC" -eq 0 ] && jq -e 'length==2 and .[0].id=="authoritative-diff" and .[1].id=="github-head"' <<<"$CHOICE_BLANK_PARSED" >/dev/null 2>&1; echo $?)" \
+  "rc=$CHOICE_BLANK_RC parsed=$CHOICE_BLANK_PARSED"
+# Blank lines are tolerated because they carry no grammar; a line with content after the block is
+# still a second block and still ends the parse. Both directions are asserted, so the tolerance
+# cannot silently widen into accepting prose.
+printf '%s\n' 'CHOICE: keep | Keep compatibility | Existing users need no migration.' '' 'and then some prose about the choice' | choice_artifact
+pg_review_decision_named_choices "$CHOICE_ART" >/dev/null 2>&1; CHOICE_PROSE_RC=$?
+check '#201: prose after the choice block still stops closed, blank lines notwithstanding' \
+  "$([ "$CHOICE_PROSE_RC" -ne 0 ]; echo $?)" "rc=$CHOICE_PROSE_RC"
+printf '%s\n' 'CHOICE: keep | Keep compatibility | Existing users need no migration.' '   ' 'CHOICE: replace | Replace API | Users migrate to the new contract.' | choice_artifact
+CHOICE_INNER_PARSED="$(pg_review_decision_named_choices "$CHOICE_ART" 2>/dev/null)"; CHOICE_INNER_RC=$?
+check '#201: a whitespace-only line between two CHOICE lines keeps both' \
+  "$([ "$CHOICE_INNER_RC" -eq 0 ] && jq -e 'length==2' <<<"$CHOICE_INNER_PARSED" >/dev/null 2>&1; echo $?)" \
+  "rc=$CHOICE_INNER_RC parsed=$CHOICE_INNER_PARSED"
 CHOICE_SHELL_SENTINEL="$TDIR/choice-shell-sentinel"
 printf '%s\n' "CHOICE: keep | Keep \$(touch $CHOICE_SHELL_SENTINEL) | Treat this as printable data only." 'CHOICE: replace | Replace | Migrate safely.' | choice_artifact
 CHOICE_SHELL_PARSED="$(pg_review_decision_named_choices "$CHOICE_ART" 2>/dev/null)"; CHOICE_SHELL_RC=$?

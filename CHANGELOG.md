@@ -19,6 +19,7 @@ Conventions in this file:
 
 | Version | Date | Artifact | Theme |
 |---|---|---|---|
+| v0.50.0 | 2026-09-14 | Pending release | A blank line between the last CHOICE and the VERDICT no longer empties a NEEDS-DISCUSSION review's outcomes: whitespace carries no grammar, so choices already paid for stay reachable, while content after the block still ends the parse |
 | v0.49.0 | 2026-09-13 | Pending release | Liveness must be positively disproved, never inferred from a failed measurement: pg_harvest_claimed's and st_inflight's no-flock/mkdir-fallback branches now share pg_dirlock_reclaim_dead's fail-closed token-recompute rule, so a transient read failure for a live holder no longer reads as dead |
 | v0.48.0 | 2026-09-12 | Pending release | A rate-limit modal over a live review conversation is a typed throttled state that engages the account cooldown, instead of reading as still-generating; the remaining cooldown is a normalized fact the daemon and callers can wait on |
 | v0.47.0 | 2026-09-12 | Pending release | A remembered conversation URL must look like a conversation id, checked on write and on read, so a synthetic placeholder can no longer park a run on a slot forever; --status names the stall class and the TTL remaining |
