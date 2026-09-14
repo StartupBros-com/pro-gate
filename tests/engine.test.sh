@@ -913,9 +913,51 @@ if [ "$(id -u)" -ne 0 ]; then
   ns_plant memo-locked absent memo-locked
   ns_retained_check 'never-sent: an unreadable conversation-urls directory retains rather than releasing (#199 r7 P1)' 'plant=memo-locked'
   chmod 755 "$NS_PLANT_HOME/conversation-urls" 2>/dev/null || true
+
+  # #163 gate r8 P1: the same rule on the OUTPUT path. An unreadable output directory leaves
+  # "$out".unbound.* unexpanded, so a preserved capture naming this very attempt read as absent.
+  NS_OD="$TDIR/ns-outdir"; NS_OD_MARKER='pg-run-acme-nsod-64-1700000064-64'
+  mkdir -p "$NS_OD"
+  : > "$NS_OD/ns.md.unbound.4242"
+  printf '%s\n' "$NS_OD_MARKER" > "$NS_OD/ns.md.unbound.4242.marker"
+  ns_plant outdir absent none
+  cp "$NS_PLANT_HOME/run-meta/$NS_PLANT_MARKER" "$NS_PLANT_HOME/run-meta/$NS_OD_MARKER" 2>/dev/null || true
+  chmod 000 "$NS_OD"
+  check 'never-sent: an unreadable output directory hides no capture from the predicate (#199 r8 P1)' \
+    "$(PRO_GATE_HOME="$NS_PLANT_HOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_attempt_never_conversed '$NS_PLANT_MARKER' '$NS_OD/ns.md'" >/dev/null 2>&1; [ $? -ne 0 ]; echo $?)" \
+    "outdir=$NS_OD"
+  chmod 755 "$NS_OD" 2>/dev/null || true
 else
   echo 'ok - never-sent: unreadable-directory checks skipped (running as root, permission bits do not apply)'
 fi
+
+# #163 gate r8 P1, and this one guards a regression THIS branch introduced. `--harvest` acquires
+# HARVEST_LOCK and still holds it when it calls pg_reservation_note_miss on exit code 4, so a
+# blanket pg_harvest_claimed veto saw the caller's OWN claim and cleared the terminal kind every
+# time -- the documented harvest-only recovery flow could never perform the release this issue is
+# about. Reaching the miss limit while a claim is held must still release.
+NS_HL_HOME="$TDIR/home-ns-harvestlock"; NS_HL_KEY='acme-nshl-64'
+NS_HL_MARKER='pg-run-acme-nshl-64-1700000064-64'; NS_HL_OUT="$TDIR/ns-hl.md"
+mkdir -p "$NS_HL_HOME/in-progress" "$NS_HL_HOME/run-meta" "$NS_HL_HOME/rounds" \
+         "$NS_HL_HOME/salvage-class" "$NS_HL_HOME/harvest-locks"
+printf '1700000000\n' > "$NS_HL_HOME/conversation-observed.since"
+printf '1700000064\n' > "$NS_HL_HOME/rounds/$NS_HL_KEY"
+printf 'github.com\tacme\tnshl\t%s\t64\t%s\t1700000064\n' "$NS_HL_KEY" "$NS_HL_OUT" > "$NS_HL_HOME/run-meta/$NS_HL_MARKER"
+printf '%s\t%s\t%s\t0\t1\t\t1700000064\n' "$NS_HL_KEY" "$NS_HL_OUT" "$(date +%s)" > "$NS_HL_HOME/in-progress/$NS_HL_MARKER"
+printf 'absent\t1700000100\n' > "$NS_HL_HOME/salvage-class/$NS_HL_MARKER"
+: > "$NS_HL_HOME/harvest-locks/$NS_HL_MARKER"
+flock "$NS_HL_HOME/harvest-locks/$NS_HL_MARKER" -c 'sleep 25' &
+NS_HL_LOCKPID=$!
+sleep 1
+NS_HL_VERDICT=""
+for _ in 1 2 3 4 5; do
+  NS_HL_VERDICT="$(PRO_GATE_HOME="$NS_HL_HOME" PRO_GATE_RESERVATION_MISSES=3 PRO_GATE_RECONCILE_INTERVAL=0 \
+    bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_note_miss '$NS_HL_MARKER'" 2>/dev/null)"
+done
+kill "$NS_HL_LOCKPID" 2>/dev/null; wait "$NS_HL_LOCKPID" 2>/dev/null
+check 'never-sent: a harvest holding its own collection claim still releases at the miss limit (#199 r8 P1)' \
+  "$([ "$NS_HL_VERDICT" = released ] && [ ! -e "$NS_HL_HOME/in-progress/$NS_HL_MARKER" ]; echo $?)" \
+  "verdict=$NS_HL_VERDICT record=$(cat "$NS_HL_HOME/in-progress/$NS_HL_MARKER" 2>/dev/null)"
 
 ns_plant unboundother absent unbound-other
 check 'never-sent: another attempt capture at the same --out no longer blocks this release (#163 r1 P2)' \

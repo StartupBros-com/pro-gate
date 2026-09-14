@@ -1696,7 +1696,7 @@ pg_conversation_observed() { # marker -> rc 0 when a conversation carrying this 
 }
 
 pg_attempt_never_conversed() { # marker [out-path]
-  local marker="$1" out="${2:-}" class ub prov since minted
+  local marker="$1" out="${2:-}" class ub prov since minted out_dir
   pg_reservation_marker_ok "$marker" || return 1
   # All three evidence paths use the same tri-state rule (#163 gate r7 P1): only a CONFIRMED
   # absence (rc 1) may pass. Present (0) retains, and so does "cannot tell" (2) -- an unreadable
@@ -1719,6 +1719,13 @@ pg_attempt_never_conversed() { # marker [out-path]
   case "$minted" in ''|*[!0-9]*) return 1;; esac
   [ "$minted" -ge "$since" ] || return 1
   if [ -n "$out" ]; then
+    # #163 gate r8 P1: a glob that could not be expanded is not evidence that nothing matched. When
+    # the output directory cannot be listed or searched, Bash leaves "$out".unbound.* unexpanded,
+    # every [ -e ] below fails, and a preserved capture naming this very attempt reads as absent --
+    # the same absent-versus-unreadable conflation the three sidecar paths above now refuse. Fail
+    # closed here too, so the rule holds for every evidence path this predicate consults.
+    out_dir="${out%/*}"; [ "$out_dir" != "$out" ] || out_dir=.
+    { [ -d "$out_dir" ] && [ -r "$out_dir" ] && [ -x "$out_dir" ]; } || return 1
     # `if` rather than `[ … ] && return 1`: an unmatched glob would leave the whole loop with
     # status 1, which under the engine's `set -e` would abort the caller instead of falling
     # through to the classification read.
@@ -1814,10 +1821,16 @@ pg_reservation_note_miss() {
   # This NARROWS the window; it does not close it. Closing it requires reconciliation to HOLD the
   # same per-marker collection claim across probe and settlement instead of sampling it, which
   # changes locking semantics shared with the collector and reaches beyond this issue.
-  if [ "$term_kind" = never-conversed ]; then
-    if pg_harvest_claimed "$marker" || ! pg_attempt_never_conversed "$marker" "$out"; then
-      term_kind=""; term_proof=""
-    fi
+  # NOTE (#163 gate r8 P1): an earlier version of this block also vetoed on pg_harvest_claimed.
+  # That was wrong and is deliberately gone. `--harvest` acquires HARVEST_LOCK and still holds it
+  # when it calls this function on exit code 4, so pg_harvest_claimed saw the CALLER'S OWN claim and
+  # cleared term_kind every time -- making the harvest-only recovery flow, which is the documented
+  # path this issue is about, never able to perform the release at all. A veto that cannot
+  # distinguish another collector's claim from its own is not a safety check, it is an off switch.
+  # Re-establishing the proof itself is kept: it is cheap and it does catch evidence committed since
+  # the probe.
+  if [ "$term_kind" = never-conversed ] && ! pg_attempt_never_conversed "$marker" "$out"; then
+    term_kind=""; term_proof=""
   fi
   if [ -n "$term_kind" ]; then
     # The miss threshold is terminal only when durable run-meta can bind the proof to one charged
