@@ -283,6 +283,26 @@ pg_pid_token() {
   printf '%s' "$st"
 }
 
+# pg_pid_recycled <pid> <stored-token>: 0 ONLY when it is positively PROVEN that <pid> has been
+# recycled -- the process now holding that pid is not the one that wrote <stored-token>. 1 in
+# every other case, including the two "cannot tell" cases, which must fail closed toward "still
+# the original holder" rather than toward "recycled": an unreadable/empty stored token (nothing
+# to compare against) and a failed recomputation of <pid>'s CURRENT token (a /proc read or `ps`
+# fork can fail transiently for a perfectly live pid). Treating either failure as proof of
+# recycling is the defect issue #177 named in pg_harvest_claimed's and st_inflight's own copies
+# of this comparison: an empty recomputed token compared unequal to a valid stored one, so a
+# live, correctly-identified holder read as dead. Liveness must be positively DISPROVED, never
+# inferred from a failed measurement (gate #148 r8 P0, applied here to every reader of this
+# shape: pg_dirlock_reclaim_dead, pg_harvest_claimed's no-flock branch, and st_inflight in
+# bin/oracle-review.sh).
+pg_pid_recycled() {
+  local pid="$1" tok="$2" cur
+  [ -n "$tok" ] || return 1
+  cur="$(pg_pid_token "$pid" 2>/dev/null || true)"
+  [ -n "$cur" ] || return 1
+  [ "$tok" != "$cur" ]
+}
+
 pg_lock() {
   local lockfile="$1" wait_s="${2:-2400}"
   if pg_have flock; then
@@ -1208,7 +1228,7 @@ pg_dirlock_owner_count() {
 #
 # Returns 0 when the directory is gone, 1 when it is held or too young to judge.
 pg_dirlock_reclaim_dead() {
-  local lockdir="$1" f pid tok cur had_marker=0 grace age
+  local lockdir="$1" f pid tok had_marker=0 grace age
   [ -d "$lockdir" ] || return 1
   for f in "$lockdir"/owner.*; do
     [ -e "$f" ] || continue
@@ -1217,17 +1237,11 @@ pg_dirlock_reclaim_dead() {
     case "$pid" in ''|*[!0-9]*) rm -f "$f" 2>/dev/null; continue;; esac
     if kill -0 "$pid" 2>/dev/null; then
       tok="$(head -c 64 "$f" 2>/dev/null | tr -d '\n')"
-      # An unreadable or tokenless marker cannot be disproved: fail closed and leave it held.
-      [ -n "$tok" ] || return 1
-      # The RECOMPUTED token must fail closed on exactly the same terms as the stored one. Reading
-      # it can fail transiently for a perfectly live pid -- a /proc read or a `ps` fork under
-      # memory pressure -- and an empty result then compares unequal to a valid stored token,
-      # falling through to unlink a LIVE owner's marker and letting a reclaimer take a guard whose
-      # holder is still inside it. Liveness must be positively DISPROVED before removal, never
-      # inferred from a failed measurement.
-      cur="$(pg_pid_token "$pid" 2>/dev/null || true)"
-      [ -n "$cur" ] || return 1
-      [ "$tok" = "$cur" ] && return 1
+      # pg_pid_recycled fails closed (held) on an unreadable/tokenless marker or a recomputation
+      # that fails transiently for a perfectly live pid (a /proc read or a `ps` fork under memory
+      # pressure) -- either failure must never be read as proof the holder is dead. Liveness must
+      # be positively DISPROVED before removal, never inferred from a failed measurement.
+      pg_pid_recycled "$pid" "$tok" || return 1
     fi
     rm -f "$f" 2>/dev/null
   done
@@ -1257,12 +1271,9 @@ pg_dirlock_reclaim_dead() {
         if kill -0 "$pid" 2>/dev/null; then
           tok="$(head -c 64 "$lockdir/token" 2>/dev/null | tr -d '\n')"
           # A tokenless lock is legacy: a live pid is the whole claim, so it holds.
-          [ -n "$tok" ] || return 1
-          # Same rule as above -- the recomputed token must fail closed too, or a transient
-          # read makes a live holder look dead and hands its lock to a reclaimer.
-          cur="$(pg_pid_token "$pid" 2>/dev/null || true)"
-          [ -n "$cur" ] || return 1
-          [ "$tok" = "$cur" ] && return 1
+          # pg_pid_recycled fails closed the same way for a transient recompute failure -- a
+          # merely-unlucky read must never hand a live holder's lock to a reclaimer.
+          pg_pid_recycled "$pid" "$tok" || return 1
         fi
         rm -f "$lockdir/pid" "$lockdir/token" 2>/dev/null
         ;;
@@ -1898,9 +1909,10 @@ pg_harvest_claimed() {
   case "$opid" in ''|*[!0-9]*) return 1;; esac        # torn/missing owner record: not a claim
   kill -0 "$opid" 2>/dev/null || return 1             # dead holder: stale directory
   otok="$(cat "$f.d/token" 2>/dev/null || true)"
-  if [ -n "$otok" ] && [ "$otok" != "$(pg_pid_token "$opid" 2>/dev/null)" ]; then
-    return 1                                          # pid reused by an unrelated process
-  fi
+  # pg_pid_recycled fails closed (not recycled -> still held) when otok is empty/unreadable or
+  # the recomputation fails transiently -- issue #177: comparing a failed recompute's empty
+  # output directly against otok made a live, correctly-identified holder read as dead.
+  pg_pid_recycled "$opid" "$otok" && return 1         # pid reused by an unrelated process
   return 0
 }
 
