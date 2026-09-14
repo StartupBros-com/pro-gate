@@ -170,6 +170,13 @@ const URL_MEMO_DIR = path.join(PG_HOME, 'conversation-urls');
 const TITLE_MEMO_DIR = path.join(PG_HOME, 'conversation-titles');
 const COMPLETED_DIR = process.env.PRO_GATE_COMPLETED_DIR ?? path.join(PG_HOME, 'completed');
 const PENDING_DIR = path.join(PG_HOME, 'pending');
+// These two MUST resolve exactly as pg_conversation_observed_dir and
+// pg_conversation_observed_since_file do in lib/pro-gate-lib.sh. The shell honours the overrides
+// and the writer used to hardcode the default, so with an override set every sighting landed
+// somewhere the release predicate never looked and a seen conversation still read as never
+// conversed (#199 gate r5 P2). One resolution rule, mirrored on both sides of the language seam.
+const OBSERVED_DIR = process.env.PRO_GATE_CONVERSATION_OBSERVED_DIR ?? path.join(PG_HOME, 'conversation-observed');
+const OBSERVED_SINCE_FILE = process.env.PRO_GATE_CONVERSATION_OBSERVED_SINCE ?? `${OBSERVED_DIR}.since`;
 const MEMO_KEEP = 200;                  // newest N memos retained; older ones are pruned on write
 const MARKER_SAFE_RE = /^pg-run-[A-Za-z0-9.-]+$/;
 // #167: the marker is EXTRACTED case-insensitively everywhere but used to be COMPARED
@@ -373,19 +380,41 @@ process.on('exit', () => {
 // attempt read as never-conversed; the engine sweeps it with the other marker sidecars.
 function noteObserved(m, why) {
   if (!m || !MARKER_SAFE_RE.test(m)) return;
+  // mkdir and write are kept apart deliberately. `mkdirSync(..., {recursive:true})` is silent when
+  // the directory already exists, so it only throws on a genuine problem — but one of those is
+  // EEXIST when the path is a FILE, and folding the two calls into one catch would let that read
+  // as the write's "already recorded" and return as though a sighting had been stored.
   try {
-    const dir = path.join(PG_HOME, 'conversation-observed');
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, m), `${why}\t${Math.floor(Date.now() / 1000)}\n`, { flag: 'wx' });
+    fs.mkdirSync(OBSERVED_DIR, { recursive: true });
   } catch (e) {
-    // EEXIST is the ordinary case: already recorded, nothing to do. Anything else means a sighting
-    // happened and could NOT be written down, which is the one failure this record cannot absorb —
-    // a later pass has no way to tell it from never having seen anything. It cannot be repaired
-    // here (the same full disk or lost permission would swallow any repair), so it is at least
-    // said out loud instead of vanishing into a bare catch.
-    if (e?.code !== 'EEXIST') {
-      console.error(`sighting-unrecorded: saw "${m}" but could not write its observation record (${e?.code ?? e}) — a later pass may read this attempt as never-conversed`);
-    }
+    revokeEarlyRelease(m, e);
+    return;
+  }
+  try {
+    fs.writeFileSync(path.join(OBSERVED_DIR, m), `${why}\t${Math.floor(Date.now() / 1000)}\n`, { flag: 'wx' });
+  } catch (e) {
+    if (e?.code === 'EEXIST') return;   // ordinary: this sighting is already recorded
+    revokeEarlyRelease(m, e);
+  }
+}
+
+// A sighting happened and could NOT be written down. Saying so out loud is not enough: the early
+// release reads a missing sidecar as "never conversed", so a warning alone lets a conversation we
+// demonstrably saw be retired as if it never existed (#199 gate r5 P1). Revoke the authority
+// instead of narrating its loss. The provenance stamp is a SIBLING of the sidecar directory, so the
+// case that actually occurs — conversation-observed/ alone unwritable, the rest of PRO_GATE_HOME
+// fine — can still be failed closed, and a missing stamp holds every attempt until a later
+// write-capable run re-plants it. An earlier comment here claimed no repair was possible because
+// the same disk would swallow it; that over-generalised from a full disk to every failure mode.
+function revokeEarlyRelease(m, cause) {
+  let revoked = false;
+  try { fs.unlinkSync(OBSERVED_SINCE_FILE); revoked = true; }
+  catch (e) { if (e?.code === 'ENOENT') revoked = true; }
+  const why = cause?.code ?? cause;
+  if (revoked) {
+    console.error(`sighting-unrecorded: saw "${m}" but could not write its observation record (${why}); revoked the early-release provenance stamp, so attempts spanning this gap stay held`);
+  } else {
+    console.error(`sighting-unrecorded: saw "${m}" but could not write its observation record (${why}) AND could not revoke the early-release provenance stamp — an attempt seen here may still be read as never-conversed`);
   }
 }
 

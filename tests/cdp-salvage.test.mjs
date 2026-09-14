@@ -469,7 +469,12 @@ function runSalvage(args, port, seed, extraEnv = {}) {
   return new Promise((resolve) => {
     const startedAt = Date.now();
     const expandedArgs = args.map((arg) => arg.replace(/^PG_HOME\//, `${home}/`));
-    const childEnv = { ...process.env, PRO_GATE_HOME: home, ...extraEnv };
+    // Env values get the same PG_HOME/ expansion as args. Without it a test pointing an override
+    // at "PG_HOME/elsewhere" would hand the child a path relative to the CWD while the assertions
+    // read an absolute one, and the mismatch would look like a writer bug.
+    const expandHome = (v) => (typeof v === 'string' ? v.replace(/^PG_HOME\//, `${home}/`) : v);
+    const childEnv = { ...process.env, PRO_GATE_HOME: home };
+    for (const [name, value] of Object.entries(extraEnv)) childEnv[name] = expandHome(value);
     // Explicit undefined removes an inherited environment key for boundary tests. It lets a test
     // prove the child has no test mode at all instead of merely replacing it with another string.
     for (const [name, value] of Object.entries(childEnv)) {
@@ -510,13 +515,31 @@ function runSalvage(args, port, seed, extraEnv = {}) {
       })();
       // #163 r1 P1: the monotonic sighting record. It is the only trace that survives a conviction
       // discarding the memo, so tests assert on its presence, not on the memo's.
+      // #199 r5 P2: read it back from wherever PRO_GATE_CONVERSATION_OBSERVED_DIR points, so a
+      // writer that ignored the override cannot pass by writing to the default location.
+      const observedDir = (extraEnv.PRO_GATE_CONVERSATION_OBSERVED_DIR ?? path.join(home, 'conversation-observed'))
+        .replace(/^PG_HOME\//, `${home}/`);
       const observed = (() => {
+        try { return fs.readdirSync(observedDir); } catch { return []; }
+      })();
+      // #199 r5 P2: what landed in the DEFAULT location regardless of the override. A writer that
+      // hardcodes the default makes this non-empty while `observed` stays empty — the exact split
+      // the gate found, and invisible to a test that only ever looks in one place.
+      const observedDefault = (() => {
         try { return fs.readdirSync(path.join(home, 'conversation-observed')); } catch { return []; }
+      })();
+      // #199 r5 P1: an unwritable sidecar must REVOKE early-release authority, not merely warn.
+      // The stamp is a sibling of the directory, so it survives that directory being unwritable;
+      // its absence afterwards is the proof the failure was failed closed rather than narrated.
+      const observedSince = (() => {
+        const f = extraEnv.PRO_GATE_CONVERSATION_OBSERVED_SINCE?.replace(/^PG_HOME\//, `${home}/`) ?? `${observedDir}.since`;
+        try { return fs.readFileSync(f, 'utf8'); } catch { return null; }
       })();
       fs.rmSync(home, { recursive: true, force: true });
       resolve({
         status, stdout, stderr, elapsedMs: Date.now() - startedAt,
-        memoUrl: memoUrl?.trim() ?? null, memos, blacklist, cooldown, crossbound, crossboundBody, observed,
+        memoUrl: memoUrl?.trim() ?? null, memos, blacklist, cooldown, crossbound, crossboundBody,
+        observed, observedDefault, observedSince,
       });
     });
   });
@@ -1049,6 +1072,34 @@ const MIXED_MARKER = 'pg-run-Test-Case-1234567890-43';
     shadowedResult.observed.includes(MARKER),
     `observed=${JSON.stringify(shadowedResult.observed)} status=${shadowedResult.status}`);
   shadowed.stop();
+
+  // #199 r5 P2: pg_conversation_observed_dir honours PRO_GATE_CONVERSATION_OBSERVED_DIR, and both
+  // the provenance stamp and the release predicate read whatever it names. A writer that hardcodes
+  // the default puts every sighting somewhere the predicate never looks, so a conversation we
+  // demonstrably saw still reads as never-conversed. Requiring the DEFAULT to stay empty is the
+  // half that matters: without it a writer ignoring the override passes by writing to both.
+  const overrideCdp = await mockCdp(`run marker: ${MARKER}\nstill drafting`, [], {});
+  const overrideResult = await runScratchSalvage([MARKER, '3'], overrideCdp.port, undefined,
+    { PRO_GATE_CONVERSATION_OBSERVED_DIR: 'PG_HOME/observed-elsewhere' });
+  check('the sighting follows PRO_GATE_CONVERSATION_OBSERVED_DIR (#199 r5 P2)',
+    overrideResult.observed.includes(MARKER) && overrideResult.observedDefault.length === 0,
+    `override=${JSON.stringify(overrideResult.observed)} default=${JSON.stringify(overrideResult.observedDefault)}`);
+  overrideCdp.stop();
+
+  // #199 r5 P1: a sighting that cannot be written must REVOKE early-release authority, not merely
+  // warn about its loss — a warning leaves the provenance stamp valid, so the next absent probe
+  // retires an attempt whose conversation we had already seen. Make the sidecar path unwritable by
+  // planting a FILE where the directory belongs (mkdir then fails with ENOTDIR/EEXIST), seed a
+  // stamp, and require the stamp to be gone afterwards. A missing stamp holds every attempt.
+  const unwritableCdp = await mockCdp(`run marker: ${MARKER}\nstill drafting`, [], {});
+  const unwritableResult = await runScratchSalvage([MARKER, '3'], unwritableCdp.port, (home) => {
+    fs.writeFileSync(path.join(home, 'conversation-observed'), 'not a directory\n');
+    fs.writeFileSync(path.join(home, 'conversation-observed.since'), '1700000000\n');
+  });
+  check('an unrecordable sighting revokes the provenance stamp instead of only warning (#199 r5 P1)',
+    unwritableResult.observedSince === null && /revoked the early-release provenance stamp/.test(unwritableResult.stderr ?? ''),
+    `since=${JSON.stringify(unwritableResult.observedSince)} stderr=${(unwritableResult.stderr ?? '').slice(0, 200)}`);
+  unwritableCdp.stop();
   check('cross-bound canonical scratch closes only scratch',
     crossBound.closed.includes('scratch1') && !crossBound.closed.includes('tab1'), `closed=${crossBound.closed}`);
   crossBound.stop();
