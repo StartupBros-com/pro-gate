@@ -398,6 +398,24 @@ check 'bundle-only policy rejection creates no output or status sidecar' "$(! fi
 check 'bundle-only policy rejection creates no Oracle call' "$([ ! -s "$POLICY_SENTINEL" ]; echo $?)" "$(cat "$POLICY_SENTINEL")"
 check 'bundle-only policy rejection creates no browser/mock call' "$([ ! -s "$TDIR/mock.log" ]; echo $?)" "$(cat "$TDIR/mock.log")"
 
+# An invalid Oracle delivery flag would otherwise be rejected only after the engine charged a
+# round. Use a valid input policy and check refusal before any state, output, Oracle or CDP work.
+PRO_GATE_BROWSER_ATTACHMENTS=invalid-policy run_engine_policy bundle-only --diff "$TDIR/policy.diff" --repo "$TDIR" --out "$TDIR/policy-attachments-invalid.md" --timeout 5s
+check 'invalid attachment policy rejects a fresh review before dispatch (#145)' \
+  "$([ "$RC" -eq 2 ] && grep -Fq 'PRO_GATE_BROWSER_ATTACHMENTS must be auto, never, or always' "$TDIR/stderr"; echo $?)" \
+  "rc=$RC $(cat "$TDIR/stderr")"
+PRO_GATE_BROWSER_ATTACHMENTS=invalid-policy run_engine_policy bundle-only --review-decision --json --pr 77 --repo "$TDIR"
+check 'invalid attachment policy rejects a review query before resolution (#145)' \
+  "$([ "$RC" -eq 2 ] && grep -Fq 'PRO_GATE_BROWSER_ATTACHMENTS must be auto, never, or always' "$TDIR/stderr"; echo $?)" \
+  "rc=$RC $(cat "$TDIR/stderr")"
+PRO_GATE_BROWSER_ATTACHMENTS=invalid-policy run_engine_policy bundle-only --review-decision-effect "$TDIR/no-decision.json" --pr 77 --repo "$TDIR"
+check 'invalid attachment policy rejects a review effect before resolution (#145)' \
+  "$([ "$RC" -eq 2 ] && grep -Fq 'PRO_GATE_BROWSER_ATTACHMENTS must be auto, never, or always' "$TDIR/stderr"; echo $?)" \
+  "rc=$RC $(cat "$TDIR/stderr")"
+check 'invalid attachment policy creates no state, output, or external call (#145)' \
+  "$([ ! -e "$TDIR/policy-home" ] && [ ! -s "$POLICY_SENTINEL" ] && [ ! -s "$TDIR/mock.log" ] && ! find "$TDIR" -maxdepth 1 -name 'policy-*.md*' | grep -q .; echo $?)" \
+  "state/output/browser activity occurred"
+
 # Omitted input follows the engine policy, while explicit bundle remains valid under the safe default.
 # A preflight invocation proves the normalized mode reaches the real fresh-review path.
 PG_TEST_ORACLE_SENTINEL="$POLICY_SENTINEL"; PG_TEST_ORACLE_COMPLETE=1
@@ -427,22 +445,22 @@ unset PG_TEST_ORACLE_SENTINEL PG_TEST_ORACLE_COMPLETE PG_TEST_PROMPT_CAPTURE
 
 # Lifecycle-only modes remain usable under an invalid policy: the engine reaches their normal
 # handler instead of rejecting an unrelated historical inspection or recovery action.
-PRO_GATE_INPUT_POLICY=invalid-policy PRO_GATE_HOME="$TDIR/policy-lifecycle" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+PRO_GATE_INPUT_POLICY=invalid-policy PRO_GATE_BROWSER_ATTACHMENTS=invalid-policy PRO_GATE_HOME="$TDIR/policy-lifecycle" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
   PRO_GATE_SELF_HEAL=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" \
   bash "$ENGINE" --status --json >"$TDIR/stdout" 2>"$TDIR/stderr"
 RC=$?
-check 'status remains usable with invalid input policy' "$([ "$RC" -eq 0 ] && ! grep -Fq 'PRO_GATE_INPUT_POLICY' "$TDIR/stderr"; echo $?)" "rc=$RC $(cat "$TDIR/stderr")"
-PRO_GATE_INPUT_POLICY=invalid-policy PRO_GATE_HOME="$TDIR/policy-lifecycle" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+check 'status remains usable with invalid input and attachment policies' "$([ "$RC" -eq 0 ] && ! grep -Eq 'PRO_GATE_(INPUT_POLICY|BROWSER_ATTACHMENTS)' "$TDIR/stderr"; echo $?)" "rc=$RC $(cat "$TDIR/stderr")"
+PRO_GATE_INPUT_POLICY=invalid-policy PRO_GATE_BROWSER_ATTACHMENTS=invalid-policy PRO_GATE_HOME="$TDIR/policy-lifecycle" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
   PRO_GATE_SELF_HEAL=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" \
   bash "$ENGINE" --recover 'pg-run-policy-77-1700000000-1' --repo "$TDIR" --out "$TDIR/policy-recover.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
 RC=$?
-check 'exact recover remains usable with invalid input policy' "$([ "$RC" -ne 2 ] && ! grep -Fq 'PRO_GATE_INPUT_POLICY' "$TDIR/stderr"; echo $?)" "rc=$RC $(cat "$TDIR/stderr")"
+check 'exact recover remains usable with invalid input and attachment policies' "$([ "$RC" -ne 2 ] && ! grep -Eq 'PRO_GATE_(INPUT_POLICY|BROWSER_ATTACHMENTS)' "$TDIR/stderr"; echo $?)" "rc=$RC $(cat "$TDIR/stderr")"
 printf 'still thinking, run marker: pg-run-policy-77-1700000000-1\n' > "$TDIR/tab.txt"
-PRO_GATE_INPUT_POLICY=invalid-policy PRO_GATE_HOME="$TDIR/policy-lifecycle" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+PRO_GATE_INPUT_POLICY=invalid-policy PRO_GATE_BROWSER_ATTACHMENTS=invalid-policy PRO_GATE_HOME="$TDIR/policy-lifecycle" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
   PRO_GATE_SELF_HEAL=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" \
   bash "$ENGINE" --harvest 'pg-run-policy-77-1700000000-1' --out "$TDIR/policy-harvest.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
 RC=$?
-check 'harvest remains usable with invalid input policy' "$([ "$RC" -ne 2 ] && ! grep -Fq 'PRO_GATE_INPUT_POLICY' "$TDIR/stderr"; echo $?)" "rc=$RC $(cat "$TDIR/stderr")"
+check 'harvest remains usable with invalid input and attachment policies' "$([ "$RC" -ne 2 ] && ! grep -Eq 'PRO_GATE_(INPUT_POLICY|BROWSER_ATTACHMENTS)' "$TDIR/stderr"; echo $?)" "rc=$RC $(cat "$TDIR/stderr")"
 for lifecycle_mode in status recover harvest; do
   case "$lifecycle_mode" in
     status) lifecycle_args=(--status --json --input bundle) ;;
@@ -1129,6 +1147,9 @@ EV_ULTRA='[browser] Model selection evidence: requested=gpt-5.5-pro; resolved=GP
 cat > "$TDIR/bin/oracle-evidence" <<'FAKE_EV'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${PG_TEST_ARGV_FILE:-/dev/null}"
+if [ -n "${PG_TEST_ARGV_FILE:-}" ]; then
+  printf '%s\0' "$@" > "$PG_TEST_ARGV_FILE.args"
+fi
 out=""
 while [ $# -gt 0 ]; do case "$1" in --write-output) out="$2"; shift 2;; *) shift;; esac; done
 [ -n "${PG_TEST_EVIDENCE:-}" ] && printf '%s\n' "$PG_TEST_EVIDENCE"
@@ -1157,6 +1178,45 @@ check 'PRO_GATE_MODEL_STRATEGY=select passes select' "$(grep -q -- '--browser-mo
 check 'select still passes -m requested hint' "$(grep -q -- '-m gpt-5.6' "$TDIR/argv-sel.txt"; echo $?)" "argv=$(head -1 "$TDIR/argv-sel.txt")"
 freshrun "$TDIR/home-u1c" "$TDIR/argv-archive.txt" "$EV_PRO" "$TDIR/o-u1c.md" current always
 check 'explicit PRO_GATE_BROWSER_ARCHIVE passes through unchanged' "$(grep -q -- '--browser-archive always' "$TDIR/argv-archive.txt"; echo $?)" "argv=$(head -1 "$TDIR/argv-archive.txt")"
+
+# #145: capture token boundaries as well as the legacy display argv. A single argument containing
+# "--browser-attachments never" must not look equivalent to the required two-argument pair.
+attachment_policy_is() { # NUL-delimited argv file, expected policy
+  local file="$1" expected="$2" arg next=0 count=0
+  while IFS= read -r -d '' arg; do
+    if [ "$next" -eq 1 ]; then
+      [ "$arg" = "$expected" ] || return 1
+      next=0
+    elif [ "$arg" = --browser-attachments ]; then
+      count=$((count + 1)); next=1
+    fi
+  done < "$file"
+  [ "$count" -eq 1 ] && [ "$next" -eq 0 ]
+}
+printf '%s\0' '--browser-attachments never' > "$TDIR/argv-attach-malformed.args"
+check 'attachment argv assertions reject a collapsed option/value token (#145)' \
+  "$(attachment_policy_is "$TDIR/argv-attach-malformed.args" never; [ $? -ne 0 ]; echo $?)"
+printf '%s\0' --browser-attachments never --browser-attachments never > "$TDIR/argv-attach-duplicate.args"
+check 'attachment argv assertions reject duplicate policy options (#145)' \
+  "$(attachment_policy_is "$TDIR/argv-attach-duplicate.args" never; [ $? -ne 0 ]; echo $?)"
+
+# These fixtures prove forwarding to Oracle, not delivery to a live browser/model.
+freshrun "$TDIR/home-u1d" "$TDIR/argv-attach-default.txt" "$EV_PRO" "$TDIR/o-u1d.md"
+check 'the engine passes --browser-attachments auto by default (#145)' \
+  "$([ "$RC" -eq 0 ] && attachment_policy_is "$TDIR/argv-attach-default.txt.args" auto; echo $?)" \
+  "rc=$RC argv=$(head -1 "$TDIR/argv-attach-default.txt")"
+PRO_GATE_BROWSER_ATTACHMENTS=never freshrun "$TDIR/home-u1e" "$TDIR/argv-attach-never.txt" "$EV_PRO" "$TDIR/o-u1e.md"
+check 'PRO_GATE_BROWSER_ATTACHMENTS=never replaces the default rather than appending (#145)' \
+  "$([ "$RC" -eq 0 ] && attachment_policy_is "$TDIR/argv-attach-never.txt.args" never; echo $?)" \
+  "rc=$RC argv=$(head -1 "$TDIR/argv-attach-never.txt")"
+PRO_GATE_BROWSER_ATTACHMENTS=always freshrun "$TDIR/home-attach-always" "$TDIR/argv-attach-always.txt" "$EV_PRO" "$TDIR/o-attach-always.md"
+check 'PRO_GATE_BROWSER_ATTACHMENTS=always preserves explicit upload delivery (#145)' \
+  "$([ "$RC" -eq 0 ] && attachment_policy_is "$TDIR/argv-attach-always.txt.args" always; echo $?)" \
+  "rc=$RC argv=$(head -1 "$TDIR/argv-attach-always.txt")"
+PRO_GATE_BROWSER_ATTACHMENTS= freshrun "$TDIR/home-attach-empty" "$TDIR/argv-attach-empty.txt" "$EV_PRO" "$TDIR/o-attach-empty.md"
+check 'an empty PRO_GATE_BROWSER_ATTACHMENTS uses auto (#145)' \
+  "$([ "$RC" -eq 0 ] && attachment_policy_is "$TDIR/argv-attach-empty.txt.args" auto; echo $?)" \
+  "rc=$RC argv=$(head -1 "$TDIR/argv-attach-empty.txt")"
 
 # Fallback: a `select` run whose requested model is not selectable (oracle emits "... in the model
 # switcher") must auto-fall-back to `current` and still produce a review, not fail the whole run
