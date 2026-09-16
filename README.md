@@ -378,6 +378,7 @@ remain an operator trust boundary.
 | `PRO_GATE_CHAT_ARCHIVE` | `1` | Archive through ChatGPT's rendered UI only after marker-addressed durable exit-0 success |
 | `PRO_GATE_KEEP_TABS` | `0` | Exact value `1` permits rename but suppresses both server archive and local tab close |
 | `PRO_GATE_BROWSER_ARCHIVE` | `never` | Passed unchanged to Oracle; `auto`/`always` can archive before pro-gate validates durable recovery state |
+| `PRO_GATE_BROWSER_ATTACHMENTS` | `auto` | Oracle file-delivery policy: `auto` uses Oracle's inline/upload selection, `never` keeps supported text files inline, and `always` uploads. Empty/unset uses `auto`; review input policy is unchanged. |
 
 ### Conversation lifecycle
 

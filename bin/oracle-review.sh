@@ -234,6 +234,14 @@ if [ -n "$BRIEF_FILE" ]; then
   fi
 fi
 if [ "$STATUS_REQUESTED" != 1 ] && [ "$RECOVER_REQUESTED" != 1 ] && [ "$HARVEST_REQUESTED" != 1 ]; then
+  # Reject a typo before charging a round or creating recovery state. Lifecycle-only commands do
+  # not submit files, so a broken fresh-review setting must not prevent existing-run recovery.
+  case "${PRO_GATE_BROWSER_ATTACHMENTS:-auto}" in
+    auto|never|always) ;;
+    *)
+      echo "ERROR: PRO_GATE_BROWSER_ATTACHMENTS must be auto, never, or always (got '${PRO_GATE_BROWSER_ATTACHMENTS}')" >&2
+      exit 2 ;;
+  esac
   case "${PRO_GATE_INPUT_POLICY:-bundle-only}" in
     bundle-only)
       case "$INPUT" in
@@ -3298,6 +3306,9 @@ ENGINE_ARGS=(-e browser)
 # leave the tab intact so probe/salvage can always find it, then let the marker-owned organizer
 # archive/close only after durable validation in pg_finish. Override with PRO_GATE_BROWSER_ARCHIVE.
 ENGINE_ARGS+=(--browser-archive "${PRO_GATE_BROWSER_ARCHIVE:-never}")
+# Keep Oracle's automatic delivery by default. `never` opts text bundles into inline delivery
+# past its upload cutoff; `always` forces uploads. Pass the configured policy through unchanged.
+ENGINE_ARGS+=(--browser-attachments "${PRO_GATE_BROWSER_ATTACHMENTS:-auto}")
 
 # --- Bound concurrent Pro review runs against the single ChatGPT account ---
 # DEFAULT IS SERIALIZED (1). The 2026-07-03 throttle incident showed one account under
