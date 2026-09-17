@@ -865,6 +865,17 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
   # Extract the validated bound head from any proof shape: pr-merged:<head>, pr-closed:<head>,
   # head-moved:<bound>:<current>. Field 2 is the bound head in all three.
   recover_superseded_head() { printf '%s' "${1#*:}" | cut -d: -f1; }
+  # #206: a superseded round exits directly and never reaches pg_finish's organizer close, so
+  # its conversation tab leaks (--remote-chrome only; reattach.ts:105 leaves the tab open by
+  # design). Best-effort: never block or alter the exit-6 supersession outcome on a close failure.
+  recover_close_tab() {  # marker -> best-effort close of any owned /c/ tab once this round is proven terminal
+    local marker="$1"
+    [ "$MODE" = remote-chrome ] || return 0
+    [ "${PRO_GATE_KEEP_TABS:-0}" = 1 ] && return 0
+    command -v node >/dev/null 2>&1 || return 0
+    timeout 30 node "$SELF/cdp-salvage.mjs" --close "$marker" 25 "${ORACLE_BROWSER_PORT:-9222}" >/dev/null 2>/dev/null
+    return 0
+  }
   REC_SELECTED=""; REC_SELECTED_OUT=""; REC_QUERY_NUM=""; REC_HOST=""; REC_OWNER=""; REC_REPO_NAME=""
   case "$RECOVER_QUERY" in
     pg-run-*)
@@ -1069,6 +1080,7 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
   # but release shared capacity before any browser probe. Missing or malformed proof stays fail-closed.
   REC_RES_STATE="$(pg_reservation_state "$REC_SELECTED" 2>/dev/null || true)"
   if [ "$REC_RES_STATE" = superseded ]; then
+    recover_close_tab "$REC_SELECTED"
     echo "Review superseded" >&2
     exit 6
   fi
@@ -1086,6 +1098,7 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
       --arg marker "$REC_SELECTED" --arg proof "$REC_SUPERSEDED_PROOF" \
       '{ts:$ts,outcome:"superseded",marker:$marker,proof:$proof,holds_capacity:false,charge_retained:true}' 2>/dev/null || true)"
     pg_ledger_append "$REC_SUPERSEDED_EVENT"
+    recover_close_tab "$REC_SELECTED"
     echo "Review superseded" >&2
     exit 6
   fi
