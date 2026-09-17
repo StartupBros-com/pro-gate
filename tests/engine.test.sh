@@ -620,6 +620,62 @@ check 'connector-enabled explicit connector uses connector directive without bun
   "rc=$RC calls=$(cat "$POLICY_SENTINEL") prompt=$(cat "$POLICY_PROMPT")"
 unset PG_TEST_ORACLE_SENTINEL PG_TEST_ORACLE_COMPLETE PG_TEST_PROMPT_CAPTURE
 
+# #150: the classic `--pr N` fetch path (no --diff) installs a charged input binding regardless
+# of INPUT. FILE_ARGS only attaches the fetched endpoint patch for INPUT=bundle|both, so an
+# INPUT=connector classic run must never earn a "full-pr" binding (that would claim the model
+# reviewed diff bytes it was never sent). It still needs a properly-labeled "connector" binding
+# installed: recover_superseded_reason()/pg_reservation_supersede require
+# pg_review_input_binding_read to return a binding before a stuck reservation can be superseded.
+# pg_augment_path() (lib/pro-gate-lib.sh) rebuilds PATH with the real system dirs ahead of
+# whatever the caller prepended, so a `gh` shim must live under $HOME/.local/bin (the one
+# directory pg_augment_path puts first) rather than on a plain PATH-prepended directory.
+CONN150_REPO="$TDIR/conn150-repo"
+mkdir -p "$CONN150_REPO"
+git -C "$CONN150_REPO" init -q
+git -C "$CONN150_REPO" config user.email test@example.invalid
+git -C "$CONN150_REPO" config user.name 'Engine Test'
+printf 'base\n' > "$CONN150_REPO/f.txt"
+git -C "$CONN150_REPO" add f.txt && git -C "$CONN150_REPO" commit -qm conn150-base
+printf 'head\n' > "$CONN150_REPO/f.txt"
+git -C "$CONN150_REPO" add f.txt && git -C "$CONN150_REPO" commit -qm conn150-head
+git -C "$CONN150_REPO" remote add origin https://github.com/acme/conn150.git
+mkdir -p "$TDIR/user/.local/bin"
+cat > "$TDIR/user/.local/bin/gh" <<'CONN150_GH'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "pr diff") printf 'diff --git a/f.txt b/f.txt\nindex aaaaaaa..bbbbbbb 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-base\n+head\n' ;;
+  "pr view") printf 'https://github.com/acme/conn150/pull/%s\n' "$3" ;;
+  *) exit 1 ;;
+esac
+CONN150_GH
+chmod +x "$TDIR/user/.local/bin/gh"
+conn150_run() { # home input pr out
+  env HOME="$TDIR/user" PRO_GATE_HOME="$1" PRO_GATE_INPUT_POLICY=connector-enabled \
+    ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 \
+    PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 PRO_GATE_MAX_ROUNDS_PER_PR=1 \
+    PRO_GATE_LOCK_WAIT=2 PRO_GATE_TIMEOUT_GRACE=0 PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_ORACLE_COMPLETE=1 NODE_OPTIONS= \
+    bash "$ENGINE" --pr "$3" --repo "$CONN150_REPO" --input "$2" --out "$4" --timeout 10s \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+  RC=$?
+}
+conn150_run "$TDIR/home-conn150-connector" connector 91 "$TDIR/conn150-connector.md"
+CONN150_CONNECTOR_BINDING_FILE="$(find "$TDIR/home-conn150-connector/review-input-bindings" -mindepth 1 -maxdepth 1 -type f -name 'pg-run-*' -print -quit 2>/dev/null)"
+CONN150_CONNECTOR_BINDING="$([ -n "$CONN150_CONNECTOR_BINDING_FILE" ] && cat "$CONN150_CONNECTOR_BINDING_FILE" || true)"
+check '#150 classic --pr --input connector (no --diff) installs a connector-mode binding, not full-pr, for bytes the model never received' \
+  "$([ "$RC" -eq 0 ] && [ -n "$CONN150_CONNECTOR_BINDING" ] \
+     && jq -e '.evidence.mode=="connector" and .evidence.proof.commit_target==.target.head_oid and .evidence.proof.endpoint_digest==null and .evidence.proof.raw_diff_digest==null and .evidence.proof.repository_target=="github.com/acme/conn150"' \
+       <<<"$CONN150_CONNECTOR_BINDING" >/dev/null 2>&1; echo $?)" \
+  "rc=$RC binding_file=$CONN150_CONNECTOR_BINDING_FILE binding=$CONN150_CONNECTOR_BINDING stderr=$(cat "$TDIR/stderr")"
+conn150_run "$TDIR/home-conn150-bundle" bundle 92 "$TDIR/conn150-bundle.md"
+CONN150_BUNDLE_BINDING_FILE="$(find "$TDIR/home-conn150-bundle/review-input-bindings" -mindepth 1 -maxdepth 1 -type f -name 'pg-run-*' -print -quit 2>/dev/null)"
+CONN150_BUNDLE_BINDING="$([ -n "$CONN150_BUNDLE_BINDING_FILE" ] && cat "$CONN150_BUNDLE_BINDING_FILE" || true)"
+check '#150 planted negative: the neighbouring classic --input bundle run still installs full-pr proof with real digests' \
+  "$([ "$RC" -eq 0 ] && [ -n "$CONN150_BUNDLE_BINDING" ] \
+     && jq -e '.evidence.mode=="full-pr" and (.evidence.proof.endpoint_digest|test("^[0-9a-f]{64}$")) and (.evidence.proof.raw_patch_digest|test("^[0-9a-f]{64}$")) and (.evidence.proof.base_oid|test("^[0-9a-f]{40}$"))' \
+       <<<"$CONN150_BUNDLE_BINDING" >/dev/null 2>&1; echo $?)" \
+  "rc=$RC binding_file=$CONN150_BUNDLE_BINDING_FILE binding=$CONN150_BUNDLE_BINDING stderr=$(cat "$TDIR/stderr")"
+
 # Lifecycle-only modes remain usable under an invalid policy: the engine reaches their normal
 # handler instead of rejecting an unrelated historical inspection or recovery action.
 PRO_GATE_INPUT_POLICY=invalid-policy PRO_GATE_BROWSER_ATTACHMENTS=invalid-policy PRO_GATE_HOME="$TDIR/policy-lifecycle" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \

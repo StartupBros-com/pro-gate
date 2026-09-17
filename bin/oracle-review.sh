@@ -1962,13 +1962,32 @@ pg_active_clear() {  # $1 = exit code
 }
 pg_install_full_pr_input_binding() { # marker; only endpoint-fetched full PRs gain automatic applicability
   local marker="$1" binding
-  [ "${PG_FULL_PR_PROVEN:-0}" = 1 ] || return 0  # caller-supplied/scoped/bare patches remain bounded
   [ -n "${RUN_SPEND_EPOCH:-}" ] && [ -n "${PG_META_HOST:-}${PG_META_OWNER:-}${PG_META_REPO:-}" ] || return 1
-  binding="$(jq -cnS --arg cd "$(pg_review_decision_contract_digest)" --arg marker "$marker" \
-    --arg host "$PG_META_HOST" --arg owner "$PG_META_OWNER" --arg repo "$PG_META_REPO" --argjson pr "$PR_NUM" \
-    --arg base "$PG_FULL_PR_BASE" --arg head "$PG_FULL_PR_HEAD" --arg endpoint "$PG_FULL_PR_ENDPOINT_DIGEST" --arg raw "$PG_FULL_PR_RAW_DIGEST" \
-    --argjson epoch "$RUN_SPEND_EPOCH" \
-    '{charged_spend_epoch:$epoch,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("full-pr:"+$base+":"+$head),mode:"full-pr",proof:{base_oid:$base,endpoint_digest:$endpoint,head_oid:$head,raw_patch_digest:$raw}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:$host,owner:$owner,repo:$repo},target:{head_oid:$head,kind:"pull-request",pr:$pr}}')" || return 1
+  case "$INPUT" in
+    bundle|both)
+      [ "${PG_FULL_PR_PROVEN:-0}" = 1 ] || return 0  # caller-supplied/scoped/bare patches remain bounded
+      binding="$(jq -cnS --arg cd "$(pg_review_decision_contract_digest)" --arg marker "$marker" \
+        --arg host "$PG_META_HOST" --arg owner "$PG_META_OWNER" --arg repo "$PG_META_REPO" --argjson pr "$PR_NUM" \
+        --arg base "$PG_FULL_PR_BASE" --arg head "$PG_FULL_PR_HEAD" --arg endpoint "$PG_FULL_PR_ENDPOINT_DIGEST" --arg raw "$PG_FULL_PR_RAW_DIGEST" \
+        --argjson epoch "$RUN_SPEND_EPOCH" \
+        '{charged_spend_epoch:$epoch,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("full-pr:"+$base+":"+$head),mode:"full-pr",proof:{base_oid:$base,endpoint_digest:$endpoint,head_oid:$head,raw_patch_digest:$raw}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:$host,owner:$owner,repo:$repo},target:{head_oid:$head,kind:"pull-request",pr:$pr}}')" || return 1
+      ;;
+    connector)
+      # #150: FILE_ARGS attaches the fetched endpoint patch only for INPUT=bundle|both — a
+      # connector run never sends those bytes to the model, so it must never earn full-pr
+      # proof (that would claim the model reviewed diff bytes it was never given). It still
+      # needs SOME binding installed here: recover_superseded_reason()/pg_reservation_supersede
+      # require pg_review_input_binding_read to return a binding before a stuck reservation can
+      # be superseded (#159 gate r1 P1). Mirror the connector shape
+      # pg_review_decision_prospective_input_binding already emits for INPUT=connector.
+      [ -n "${PG_FULL_PR_HEAD:-}" ] || return 1
+      binding="$(jq -cnS --arg cd "$(pg_review_decision_contract_digest)" --arg marker "$marker" \
+        --arg host "$PG_META_HOST" --arg owner "$PG_META_OWNER" --arg repo "$PG_META_REPO" --argjson pr "$PR_NUM" \
+        --arg head "$PG_FULL_PR_HEAD" --argjson epoch "$RUN_SPEND_EPOCH" \
+        '{charged_spend_epoch:$epoch,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("connector:"+$host+"/"+$owner+"/"+$repo+":"+$head),mode:"connector",proof:{commit_target:$head,endpoint_digest:null,raw_diff_digest:null,repository_target:($host+"/"+$owner+"/"+$repo)}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:$host,owner:$owner,repo:$repo},target:{head_oid:$head,kind:"pull-request",pr:$pr}}')" || return 1
+      ;;
+    *) return 0 ;;
+  esac
   pg_review_input_binding_write "$marker" "$binding"
 }
 
