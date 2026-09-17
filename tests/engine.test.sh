@@ -7898,6 +7898,26 @@ CHOICE_SELECTED_RC=$?; CHOICE_STATE_AFTER="$(find "$CHOICE_HOME" -mindepth 1 -ma
 check 'exact canonical selection returns the existing non-authorizing named-choice fixer handoff without mutation' \
   "$([ "$CHOICE_SELECTED_RC" -eq 0 ] && jq -e '.action=="fix-review-findings" and .reason=="named-product-choice-selected" and .facts.named_choice.selected_id=="keep"' "$TDIR/choice-selected.json" >/dev/null 2>&1 && [ "$CHOICE_STATE_BEFORE" = "$CHOICE_STATE_AFTER" ]; echo $?)" \
   "rc=$CHOICE_SELECTED_RC output=$(cat "$TDIR/choice-selected.json")"
+# #203: `jq ... > sel.json` naturally leaves a single trailing newline. That is still exactly one
+# canonical JSON value and must be accepted identically to the byte-exact canonical file above; a
+# second trailing newline is not tolerated and still stops closed at invalid-named-choice.
+jq -cnS --arg id keep --arg snap "$CHOICE_SNAPSHOT" '{selected_id:$id,snapshot_digest:$snap}' > "$TDIR/choice-selection-lf.json"
+CHOICE_LF_STATE_BEFORE="$(find "$CHOICE_HOME" -mindepth 1 -maxdepth 2 -printf '%P\n' | sort)"
+env PRO_GATE_HOME="$CHOICE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+  bash "$ENGINE" --review-decision --json --review-choice-selection "$TDIR/choice-selection-lf.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
+  >"$TDIR/choice-selected-lf.json" 2>"$TDIR/choice-selected-lf.err"
+CHOICE_LF_RC=$?; CHOICE_LF_STATE_AFTER="$(find "$CHOICE_HOME" -mindepth 1 -maxdepth 2 -printf '%P\n' | sort)"
+check "#203: a selection file with one trailing newline (jq's natural redirect output) is accepted like the canonical one" \
+  "$([ "$CHOICE_LF_RC" -eq 0 ] && jq -e '.action=="fix-review-findings" and .reason=="named-product-choice-selected" and .facts.named_choice.selected_id=="keep"' "$TDIR/choice-selected-lf.json" >/dev/null 2>&1 && [ "$CHOICE_LF_STATE_BEFORE" = "$CHOICE_LF_STATE_AFTER" ]; echo $?)" \
+  "rc=$CHOICE_LF_RC output=$(cat "$TDIR/choice-selected-lf.json") stderr=$(cat "$TDIR/choice-selected-lf.err")"
+printf '%s\n\n' "$(jq -cnS --arg id keep --arg snap "$CHOICE_SNAPSHOT" '{selected_id:$id,snapshot_digest:$snap}')" > "$TDIR/choice-selection-2lf.json"
+env PRO_GATE_HOME="$CHOICE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+  bash "$ENGINE" --review-decision --json --review-choice-selection "$TDIR/choice-selection-2lf.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
+  >"$TDIR/choice-selected-2lf.json" 2>"$TDIR/choice-selected-2lf.err"
+CHOICE_2LF_RC=$?
+check '#203: a selection file with two trailing newlines still stops closed at invalid-named-choice' \
+  "$([ "$CHOICE_2LF_RC" -eq 0 ] && jq -e '.action=="stop-without-new-review" and (.action!="run-granted-review")' "$TDIR/choice-selected-2lf.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$CHOICE_2LF_RC output=$(cat "$TDIR/choice-selected-2lf.json") stderr=$(cat "$TDIR/choice-selected-2lf.err")"
 for choice_selection_case in malformed unknown stale oversized symlink; do
   rm -f "$TDIR/choice-bad.json"
   case "$choice_selection_case" in

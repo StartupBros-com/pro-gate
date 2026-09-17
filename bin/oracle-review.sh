@@ -418,15 +418,24 @@ pg_review_decision_prospective_input_binding() { # repo pr host owner name head 
 # Selection is input to an advisory reduction, never a durable authorization record. Canonical
 # bytes make a copied selection deterministic and prevent trailing prose from becoming a channel.
 pg_review_decision_choice_selection_read() { # file -> canonical {selected_id,snapshot_digest}
-  local f="$1" json canonical
+  local f="$1" raw canonical
   [ -f "$f" ] && [ ! -L "$f" ] || return 1
   [ "$(wc -c < "$f" 2>/dev/null | tr -d ' ')" -le 65536 ] || return 1
-  json="$(cat "$f" 2>/dev/null)" || return 1
-  canonical="$(pg_review_json_canonical "$json")" || return 1
-  [ "$(wc -c < "$f" 2>/dev/null | tr -d ' ')" = "${#canonical}" ] || return 1
+  raw="$(cat "$f" 2>/dev/null; printf x)" || return 1
+  raw="${raw%x}"
+  canonical="$(pg_review_json_canonical "$raw")" || return 1
+  if [ "$raw" = "$canonical" ] || [ "$raw" = "${canonical}"$'\n' ]; then
+    :
+  else
+    echo '[oracle-review] review-choice-selection: file is not byte-canonical JSON (at most one trailing newline is tolerated)' >&2
+    return 1
+  fi
   jq -e 'keys == ["selected_id","snapshot_digest"] and
     (.selected_id|type=="string" and length>0 and length<=256 and test("^[A-Za-z0-9._:/+-]+$")) and
-    (.snapshot_digest|type=="string" and test("^[0-9a-f]{64}$"))' <<<"$canonical" >/dev/null 2>&1 || return 1
+    (.snapshot_digest|type=="string" and test("^[0-9a-f]{64}$"))' <<<"$canonical" >/dev/null 2>&1 || {
+    echo '[oracle-review] review-choice-selection: JSON does not match the required {selected_id,snapshot_digest} shape' >&2
+    return 1
+  }
   printf '%s' "$canonical"
 }
 
@@ -620,7 +629,7 @@ pg_review_decision_cli() {
   # deliberately empty the outcomes so the reducer emits its existing closed invalid-choice stop.
   if [ -n "$REVIEW_CHOICE_SELECTION_FILE" ]; then
     selection_supplied=true
-    selection="$(pg_review_decision_choice_selection_read "$REVIEW_CHOICE_SELECTION_FILE" 2>/dev/null || true)"
+    selection="$(pg_review_decision_choice_selection_read "$REVIEW_CHOICE_SELECTION_FILE" || true)"
     if [ "$current_verdict" = NEEDS-DISCUSSION ] && [ -n "$selection" ] \
        && [ "$(jq 'length' <<<"$choice_outcomes")" -ge 2 ] \
        && jq -e --arg id "$(jq -r .selected_id <<<"$selection")" 'any(.[]; .id==$id)' <<<"$choice_outcomes" >/dev/null 2>&1; then
