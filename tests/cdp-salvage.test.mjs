@@ -3561,6 +3561,23 @@ const FOREIGN_ANSWER = (m) => [
     (fourth.throttleSeen ?? '').split('\n').some((line) => line.startsWith(`${secondForeignUrl}\t`)),
     `throttleSeen=${fourth.throttleSeen}`);
   cdp1c.stop();
+
+  // (5) A stale, already-charged tab listed FIRST must not hide a genuinely new foreign modal
+  // listed behind it: the whole-scan fallback walks the unowned hits in list order, the dedupe
+  // gate skips the stale one (still named on stderr), and the new tab is the one charged.
+  const thirdForeignUrl = 'https://chatgpt.com/c/third-stale-conversation';
+  const thirdForeignText = `${modal}\nrun marker: pg-run-other-3333333333-3\n${reasoning}`;
+  const cdp1d = await mockCdp(foreign, [{ id: 'other3', url: thirdForeignUrl }],
+    { tabText: (url) => (url === thirdForeignUrl ? thirdForeignText : undefined), throttleModal: () => modal });
+  const fifth = await runSalvageInHome(home1, [MARKER, '3'], cdp1d.port);
+  check('#208 (5) a stale tab listed first does not hide a new unowned modal behind it: throttle exit (5)',
+    fifth.status === 5, `status=${fifth.status} stderr=${fifth.stderr?.slice(0, 300)}`);
+  check('#208 (5) the new tab behind the stale one is the tab charged in the cooldown',
+    (fifth.cooldown ?? '').includes(thirdForeignUrl), `cooldown=${fifth.cooldown}`);
+  check('#208 (5) the stale tab listed first is still named as ignored on stderr',
+    /stale throttle modal on unowned tab https:\/\/chatgpt\.com\/c\/mock-conversation already charged/.test(fifth.stderr || ''),
+    `stderr=${fifth.stderr?.slice(0, 300)}`);
+  cdp1d.stop();
   fs.rmSync(home1, { recursive: true, force: true });
 
   // (3) Planted negative: an OWNED sighting (this run's exact marker under the modal) re-arms the

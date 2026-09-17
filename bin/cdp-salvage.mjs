@@ -1546,12 +1546,24 @@ while (Date.now() < deadline) {
   const modalHits = reads.filter(({ text, throttleModal }) => throttleModal && text && text.trim() !== '');
   if (modalHits.length > 0) {
     const ownedHit = modalHits.find(({ tab, text }) => !nonMatching.has(tab.url) && hasExactMarker(text, marker));
-    const hit = ownedHit ?? modalHits[0];
-    tripThrottleEvidence(
-      hit.tab.url,
-      { kind: 'throttle', reason: 'modal', owned: !!ownedHit, hashText: hit.throttleModal },
-      `modal over tab ${hit.tab.url}`,
-    );
+    if (ownedHit) {
+      tripThrottleEvidence(
+        ownedHit.tab.url,
+        { kind: 'throttle', reason: 'modal', owned: true, hashText: ownedHit.throttleModal },
+        `modal over tab ${ownedHit.tab.url}`,
+      );
+    } else {
+      // #208: a stale repeat listed first must not hide a genuinely new foreign modal behind it.
+      // Walk the unowned hits in list order; the dedupe gate skips each already-charged sighting
+      // and the first admitted one trips the cooldown (exit 5), which ends the walk.
+      for (const hit of modalHits) {
+        tripThrottleEvidence(
+          hit.tab.url,
+          { kind: 'throttle', reason: 'modal', owned: false, hashText: hit.throttleModal },
+          `modal over tab ${hit.tab.url}`,
+        );
+      }
+    }
   }
   for (const { tab, text, infrastructureError } of reads) {
     if (text === null || text.trim() === '') { deadTabs.push(tab); continue; }
