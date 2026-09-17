@@ -3288,7 +3288,7 @@ if [ -n "$CONFIRM_FILE" ]; then
     && FILES+=("$WORK/prior-review.md") \
     || { echo "ERROR: could not stage --confirm file: $CONFIRM_FILE" >&2; pg_status failed "confirm file unreadable"; pg_finish 2; }
 fi
-FILE_ARGS=(); for f in "${FILES[@]:-}"; do [ -n "$f" ] && FILE_ARGS+=(--file "$f"); done
+FILE_ARGS=(); for f in ${FILES[@]+"${FILES[@]}"}; do [ -n "$f" ] && FILE_ARGS+=(--file "$f"); done
 
 # Route through a connector-bound ChatGPT Project when configured (pre-binds GitHub).
 URL_ARGS=()
@@ -3784,7 +3784,7 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
         "$ORACLE_BIN" "${ENGINE_ARGS[@]}" -m "$MODEL" \
         --browser-model-strategy "$strategy" ${force_args[0]:+"${force_args[@]}"} \
         --slug "$SLUG_BASE" \
-        "${URL_ARGS[@]}" "${FILE_ARGS[@]}" \
+        ${URL_ARGS[@]+"${URL_ARGS[@]}"} ${FILE_ARGS[@]+"${FILE_ARGS[@]}"} \
         -p "$(cat "$PROMPT_FILE")" \
         --no-notify --timeout "$TIMEOUT" \
         --write-output "$CAPTURE_OUT" 2>&1 &

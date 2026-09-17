@@ -2817,6 +2817,32 @@ check 'confirm pass consumes a round (budget-accounted)' "$([ -f "$RHOME/rounds/
 run_engine --confirm /nonexistent-prior.md --pr 102 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$RHOME/o-cbad.md" --timeout 5s
 check 'missing --confirm file is a usage error (exit 2)' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC"
 
+echo '# #176 (remaining sites): every possibly-empty array expansion in oracle-review.sh (the'
+echo '# ENGINE -- FILE_ARGS is built from the --confirm-staged FILES array above) is guarded against'
+echo '# the bash <4.4 (stock macOS /bin/bash 3.2) "unbound variable" crash on a bare "${arr[@]}"'
+echo '# expansion of a zero-element array under set -u. daemon.sh already carries this fix and its'
+echo '# own structural sweep lives in tests/daemon-current-head-completion.test.sh; this is the same'
+echo '# sweep for oracle-review.sh.'
+echo '#'
+echo '# What this DOES verify, executed on this host (bash 5.2, no bash 3.2 binary available here):'
+echo '#   a file-wide structural sweep: every "[@]" array expansion in oracle-review.sh is either the'
+echo '#   ${arr[@]+"${arr[@]}"} guard idiom, the pre-existing ${arr[0]:+"${arr[@]}"} index-guard idiom'
+echo '#   (force_args -- unrelated to #176, left untouched), or one of the explicit never-empty-by-'
+echo '#   name allowlist: ENGINE_ARGS and organizer_args (both seeded with a mandatory first element'
+echo '#   before use) and the bash builtin PIPESTATUS (populated with at least one element by bash'
+echo '#   itself once a foreground pipeline has run, never a user-declared possibly-empty array).'
+echo '# What this does NOT verify: an actual bash 3.2 reproduction -- none is available in this'
+echo '# environment; see daemon-current-head-completion.test.sh for the guard-idiom probe that'
+echo '# non-regression-tests the idiom itself on this host bash.'
+ENGINE_UNGUARDED="$(sed -E \
+  -e 's/\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\+"\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\}"\}//g' \
+  -e 's/\$\{[A-Za-z_][A-Za-z0-9_]*\[[0-9]+\]:\+"\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\}"\}//g' \
+  "$ENGINE" \
+  | grep -noE '\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\}' \
+  | grep -vE ':\$\{(ENGINE_ARGS|organizer_args|PIPESTATUS)\[@\]\}$' || true)"
+check 'every "[@]" array expansion in oracle-review.sh outside the never-empty allowlist (ENGINE_ARGS, organizer_args, PIPESTATUS) is guarded' "$([ -z "$ENGINE_UNGUARDED" ]; echo $?)" "unguarded: $ENGINE_UNGUARDED"
+check 'no ${arr[@]:-} single-spurious-empty-arg anti-idiom remains in oracle-review.sh' "$([ "$(grep -c '\[@\]:-' "$ENGINE")" -eq 0 ]; echo $?)" "count=$(grep -c '\[@\]:-' "$ENGINE")"
+
 # v0.39: --brief swaps the TASK BODY only; the contract footer stays engine-owned. The whole
 # return path is review-shaped — pg_is_review accepts a capture only when it carries a [Pn]
 # marker AND one of exactly three verdict tokens, and cdp-salvage bounds extraction at the

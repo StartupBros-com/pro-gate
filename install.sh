@@ -168,8 +168,8 @@ else
     BASE="${PRO_GATE_RELEASE_BASE_URL:-https://github.com/$OWNER/$REPO_NAME/releases/download/v$REQUESTED_VERSION}"
     ARCHIVE="$TMP/pro-gate-runtime-$REQUESTED_VERSION.tar.gz"
     CHECKSUM_FILE="$TMP/pro-gate-runtime-$REQUESTED_VERSION.tar.gz.sha256"
-    curl -fsSL "${PROXY_ARGS[@]}" "$BASE/pro-gate-runtime-$REQUESTED_VERSION.tar.gz" -o "$ARCHIVE"
-    curl -fsSL "${PROXY_ARGS[@]}" "$BASE/pro-gate-runtime-$REQUESTED_VERSION.tar.gz.sha256" -o "$CHECKSUM_FILE"
+    curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$BASE/pro-gate-runtime-$REQUESTED_VERSION.tar.gz" -o "$ARCHIVE"
+    curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$BASE/pro-gate-runtime-$REQUESTED_VERSION.tar.gz.sha256" -o "$CHECKSUM_FILE"
   fi
   [ -f "$ARCHIVE" ] || { echo "release archive not found: $ARCHIVE" >&2; exit 1; }
   [ -n "$CHECKSUM_FILE" ] && [ -f "$CHECKSUM_FILE" ] || { echo "checksum file is required" >&2; exit 1; }

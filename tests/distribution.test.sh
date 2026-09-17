@@ -11,6 +11,21 @@ export PRO_GATE_SERVICE_MANAGER=none
 check "plugin owns one skill" test "$(find "$ROOT/skills" -name SKILL.md -type f | wc -l)" -eq 1
 check "plugin owns one agent" test "$(find "$ROOT/agents" -name oracle-reviewer.md -type f | wc -l)" -eq 1
 
+# #176 (remaining sites): every possibly-empty array expansion in install.sh is guarded against the
+# bash <4.4 (stock macOS /bin/bash 3.2) "unbound variable" crash on a bare "${arr[@]}" expansion of
+# a zero-element array under set -u -- PROXY_ARGS is empty unless HTTPS_PROXY/HTTP_PROXY is set.
+# Same sweep as tests/daemon-current-head-completion.test.sh (daemon.sh) and the ENGINE sweep in
+# tests/engine.test.sh (oracle-review.sh); install.sh has no never-empty-by-name allowlist entries.
+# What this does NOT verify: an actual bash 3.2 reproduction -- none is available in this
+# environment; see daemon-current-head-completion.test.sh for the guard-idiom probe that
+# non-regression-tests the idiom itself on this host bash.
+INSTALL_UNGUARDED="$(sed -E 's/\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\+"\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\}"\}//g' "$ROOT/install.sh" \
+  | grep -noE '\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\}' || true)"
+[ -n "$INSTALL_UNGUARDED" ] && echo "install.sh unguarded [@] sites: $INSTALL_UNGUARDED"
+check "every \"[@]\" array expansion in install.sh is wrapped in the guard idiom" test -z "$INSTALL_UNGUARDED"
+INSTALL_DASH_DEFAULT="$(grep -c '\[@\]:-' "$ROOT/install.sh")"
+check "no \${arr[@]:-} single-spurious-empty-arg anti-idiom remains in install.sh" test "$INSTALL_DASH_DEFAULT" -eq 0
+
 OUT="$TDIR/dist"
 RELEASE_TAG="v$VERSION" bash "$ROOT/scripts/package-runtime.sh" "$OUT" >/dev/null
 ARCHIVE="$OUT/pro-gate-runtime-$VERSION.tar.gz"
