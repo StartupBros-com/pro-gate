@@ -100,8 +100,8 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/pro-gate-install.XXXXXX")"
 trap cleanup EXIT
 
 sha256() {
-  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
-  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1
+  if command -v sha256sum >/dev/null 2>&1; then { sha256sum < "$1" | cut -d' ' -f1; } 2>/dev/null
+  elif command -v shasum >/dev/null 2>&1; then { shasum -a 256 < "$1" | cut -d' ' -f1; } 2>/dev/null
   else echo "SHA256 tool required" >&2; return 1
   fi
 }

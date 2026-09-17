@@ -17,6 +17,28 @@ ARCHIVE="$OUT/pro-gate-runtime-$VERSION.tar.gz"
 CHECKSUM="$ARCHIVE.sha256"
 check "package creates archive" test -s "$ARCHIVE"
 check "package creates checksum" test -s "$CHECKSUM"
+
+# #172: install.sh's standalone sha256() must hash through stdin, like pg_sha256 (#168),
+# so an archive path containing a backslash does not get its digest corrupted by
+# sha256sum/shasum framing-and-escaping the printed filename.
+ESC_DIR="$TDIR/esc-src"; mkdir -p "$ESC_DIR"
+ESC="$ESC_DIR/pro-gate-runtime-$VERSION"'\'"-esc.tar.gz"
+cp "$ARCHIVE" "$ESC"
+{ sha256sum < "$ESC" | cut -d' ' -f1; } 2>/dev/null > "$ESC.sha256"
+ESC_HOME="$TDIR/esc-home"; ESC_RUNTIME="$TDIR/esc-runtime"
+mkdir -p "$ESC_HOME"
+HOME="$ESC_HOME" PRO_GATE_HOME="$ESC_RUNTIME" \
+  bash "$ROOT/install.sh" --version "$VERSION" --archive "$ESC" --checksum "$ESC.sha256" >"$TDIR/esc.log" 2>&1
+check "install succeeds for archive path containing a backslash" test "$(cat "$ESC_RUNTIME/VERSION" 2>/dev/null)" = "$VERSION"
+
+ESC_BAD_RUNTIME="$TDIR/esc-bad-runtime"
+printf '%s\n' "0000000000000000000000000000000000000000000000000000000000000000" > "$ESC.wrong.sha256"
+if HOME="$ESC_HOME" PRO_GATE_HOME="$ESC_BAD_RUNTIME" \
+  bash "$ROOT/install.sh" --version "$VERSION" --archive "$ESC" --checksum "$ESC.wrong.sha256" >"$TDIR/esc-wrong.log" 2>&1; then
+  echo "FAIL - install rejects wrong checksum for backslash-path archive"; FAILS=$((FAILS + 1))
+else echo "ok - install rejects wrong checksum for backslash-path archive"; fi
+check "no VERSION installed after checksum mismatch on backslash-path archive" test ! -e "$ESC_BAD_RUNTIME/VERSION"
+
 LIST="$TDIR/archive.list"; tar -tzf "$ARCHIVE" > "$LIST"
 check "runtime package excludes skill" sh -c "! grep -q '/skills/' '$LIST'"
 check "runtime package excludes agent" sh -c "! grep -q '/agents/' '$LIST'"
