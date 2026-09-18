@@ -418,15 +418,31 @@ pg_review_decision_prospective_input_binding() { # repo pr host owner name head 
 # Selection is input to an advisory reduction, never a durable authorization record. Canonical
 # bytes make a copied selection deterministic and prevent trailing prose from becoming a channel.
 pg_review_decision_choice_selection_read() { # file -> canonical {selected_id,snapshot_digest}
-  local f="$1" json canonical
+  local f="$1" raw canonical
   [ -f "$f" ] && [ ! -L "$f" ] || return 1
   [ "$(wc -c < "$f" 2>/dev/null | tr -d ' ')" -le 65536 ] || return 1
-  json="$(cat "$f" 2>/dev/null)" || return 1
-  canonical="$(pg_review_json_canonical "$json")" || return 1
-  [ "$(wc -c < "$f" 2>/dev/null | tr -d ' ')" = "${#canonical}" ] || return 1
+  raw="$(cat "$f" 2>/dev/null; printf x)" || return 1
+  raw="${raw%x}"
+  canonical="$(pg_review_json_canonical "$raw")" || return 1
+  # #203 gate r3 P2: decide byte-canonical acceptance against the file's ACTUAL bytes on disk
+  # (via cmp), never against `raw` above — bash command substitution silently DROPS every NUL
+  # byte from captured output, so a canonical selection followed by a NUL, or a selected_id/
+  # snapshot_digest with an embedded NUL, used to make `raw` compare equal to `canonical` even
+  # though the file's real bytes differ from it. cmp reads $f directly and sees every byte,
+  # including NULs, so any such file is now rejected. Process substitution is fine — this file is
+  # bash, not POSIX sh. One-trailing-LF is still tolerated, same as before.
+  if cmp -s "$f" <(printf '%s' "$canonical") || cmp -s "$f" <(printf '%s\n' "$canonical"); then
+    :
+  else
+    echo '[oracle-review] review-choice-selection: file is not byte-canonical JSON (at most one trailing newline is tolerated)' >&2
+    return 1
+  fi
   jq -e 'keys == ["selected_id","snapshot_digest"] and
     (.selected_id|type=="string" and length>0 and length<=256 and test("^[A-Za-z0-9._:/+-]+$")) and
-    (.snapshot_digest|type=="string" and test("^[0-9a-f]{64}$"))' <<<"$canonical" >/dev/null 2>&1 || return 1
+    (.snapshot_digest|type=="string" and test("^[0-9a-f]{64}$"))' <<<"$canonical" >/dev/null 2>&1 || {
+    echo '[oracle-review] review-choice-selection: JSON does not match the required {selected_id,snapshot_digest} shape' >&2
+    return 1
+  }
   printf '%s' "$canonical"
 }
 
@@ -620,7 +636,7 @@ pg_review_decision_cli() {
   # deliberately empty the outcomes so the reducer emits its existing closed invalid-choice stop.
   if [ -n "$REVIEW_CHOICE_SELECTION_FILE" ]; then
     selection_supplied=true
-    selection="$(pg_review_decision_choice_selection_read "$REVIEW_CHOICE_SELECTION_FILE" 2>/dev/null || true)"
+    selection="$(pg_review_decision_choice_selection_read "$REVIEW_CHOICE_SELECTION_FILE" || true)"
     if [ "$current_verdict" = NEEDS-DISCUSSION ] && [ -n "$selection" ] \
        && [ "$(jq 'length' <<<"$choice_outcomes")" -ge 2 ] \
        && jq -e --arg id "$(jq -r .selected_id <<<"$selection")" 'any(.[]; .id==$id)' <<<"$choice_outcomes" >/dev/null 2>&1; then
@@ -808,6 +824,17 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
   # Extract the validated bound head from any proof shape: pr-merged:<head>, pr-closed:<head>,
   # head-moved:<bound>:<current>. Field 2 is the bound head in all three.
   recover_superseded_head() { printf '%s' "${1#*:}" | cut -d: -f1; }
+  # #206: a superseded round exits directly and never reaches pg_finish's organizer close, so
+  # its conversation tab leaks (--remote-chrome only; reattach.ts:105 leaves the tab open by
+  # design). Best-effort: never block or alter the exit-6 supersession outcome on a close failure.
+  recover_close_tab() {  # marker -> best-effort close of any owned /c/ tab once this round is proven terminal
+    local marker="$1"
+    [ "$MODE" = remote-chrome ] || return 0
+    [ "${PRO_GATE_KEEP_TABS:-0}" = 1 ] && return 0
+    command -v node >/dev/null 2>&1 || return 0
+    timeout 30 node "$SELF/cdp-salvage.mjs" --close "$marker" 25 "${ORACLE_BROWSER_PORT:-9222}" >/dev/null 2>/dev/null
+    return 0
+  }
   REC_SELECTED=""; REC_SELECTED_OUT=""; REC_QUERY_NUM=""; REC_HOST=""; REC_OWNER=""; REC_REPO_NAME=""
   case "$RECOVER_QUERY" in
     pg-run-*)
@@ -1012,6 +1039,7 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
   # but release shared capacity before any browser probe. Missing or malformed proof stays fail-closed.
   REC_RES_STATE="$(pg_reservation_state "$REC_SELECTED" 2>/dev/null || true)"
   if [ "$REC_RES_STATE" = superseded ]; then
+    recover_close_tab "$REC_SELECTED"
     echo "Review superseded" >&2
     exit 6
   fi
@@ -1029,6 +1057,7 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
       --arg marker "$REC_SELECTED" --arg proof "$REC_SUPERSEDED_PROOF" \
       '{ts:$ts,outcome:"superseded",marker:$marker,proof:$proof,holds_capacity:false,charge_retained:true}' 2>/dev/null || true)"
     pg_ledger_append "$REC_SUPERSEDED_EVENT"
+    recover_close_tab "$REC_SELECTED"
     echo "Review superseded" >&2
     exit 6
   fi
@@ -1953,13 +1982,35 @@ pg_active_clear() {  # $1 = exit code
 }
 pg_install_full_pr_input_binding() { # marker; only endpoint-fetched full PRs gain automatic applicability
   local marker="$1" binding
+  # Order matters: a caller-supplied, scoped or bare patch (PG_FULL_PR_PROVEN=0) earns no binding
+  # and must return 0 BEFORE the metadata guard below, or every --diff run without PR metadata
+  # aborts as a fatal install failure (caught by the release suite when #150 first moved this).
   [ "${PG_FULL_PR_PROVEN:-0}" = 1 ] || return 0  # caller-supplied/scoped/bare patches remain bounded
   [ -n "${RUN_SPEND_EPOCH:-}" ] && [ -n "${PG_META_HOST:-}${PG_META_OWNER:-}${PG_META_REPO:-}" ] || return 1
-  binding="$(jq -cnS --arg cd "$(pg_review_decision_contract_digest)" --arg marker "$marker" \
-    --arg host "$PG_META_HOST" --arg owner "$PG_META_OWNER" --arg repo "$PG_META_REPO" --argjson pr "$PR_NUM" \
-    --arg base "$PG_FULL_PR_BASE" --arg head "$PG_FULL_PR_HEAD" --arg endpoint "$PG_FULL_PR_ENDPOINT_DIGEST" --arg raw "$PG_FULL_PR_RAW_DIGEST" \
-    --argjson epoch "$RUN_SPEND_EPOCH" \
-    '{charged_spend_epoch:$epoch,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("full-pr:"+$base+":"+$head),mode:"full-pr",proof:{base_oid:$base,endpoint_digest:$endpoint,head_oid:$head,raw_patch_digest:$raw}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:$host,owner:$owner,repo:$repo},target:{head_oid:$head,kind:"pull-request",pr:$pr}}')" || return 1
+  case "$INPUT" in
+    bundle|both)
+      binding="$(jq -cnS --arg cd "$(pg_review_decision_contract_digest)" --arg marker "$marker" \
+        --arg host "$PG_META_HOST" --arg owner "$PG_META_OWNER" --arg repo "$PG_META_REPO" --argjson pr "$PR_NUM" \
+        --arg base "$PG_FULL_PR_BASE" --arg head "$PG_FULL_PR_HEAD" --arg endpoint "$PG_FULL_PR_ENDPOINT_DIGEST" --arg raw "$PG_FULL_PR_RAW_DIGEST" \
+        --argjson epoch "$RUN_SPEND_EPOCH" \
+        '{charged_spend_epoch:$epoch,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("full-pr:"+$base+":"+$head),mode:"full-pr",proof:{base_oid:$base,endpoint_digest:$endpoint,head_oid:$head,raw_patch_digest:$raw}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:$host,owner:$owner,repo:$repo},target:{head_oid:$head,kind:"pull-request",pr:$pr}}')" || return 1
+      ;;
+    connector)
+      # #150: FILE_ARGS attaches the fetched endpoint patch only for INPUT=bundle|both — a
+      # connector run never sends those bytes to the model, so it must never earn full-pr
+      # proof (that would claim the model reviewed diff bytes it was never given). It still
+      # needs SOME binding installed here: recover_superseded_reason()/pg_reservation_supersede
+      # require pg_review_input_binding_read to return a binding before a stuck reservation can
+      # be superseded (#159 gate r1 P1). Mirror the connector shape
+      # pg_review_decision_prospective_input_binding already emits for INPUT=connector.
+      [ -n "${PG_FULL_PR_HEAD:-}" ] || return 1
+      binding="$(jq -cnS --arg cd "$(pg_review_decision_contract_digest)" --arg marker "$marker" \
+        --arg host "$PG_META_HOST" --arg owner "$PG_META_OWNER" --arg repo "$PG_META_REPO" --argjson pr "$PR_NUM" \
+        --arg head "$PG_FULL_PR_HEAD" --argjson epoch "$RUN_SPEND_EPOCH" \
+        '{charged_spend_epoch:$epoch,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("connector:"+$host+"/"+$owner+"/"+$repo+":"+$head),mode:"connector",proof:{commit_target:$head,endpoint_digest:null,raw_diff_digest:null,repository_target:($host+"/"+$owner+"/"+$repo)}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:$host,owner:$owner,repo:$repo},target:{head_oid:$head,kind:"pull-request",pr:$pr}}')" || return 1
+      ;;
+    *) return 0 ;;
+  esac
   pg_review_input_binding_write "$marker" "$binding"
 }
 
@@ -3288,7 +3339,7 @@ if [ -n "$CONFIRM_FILE" ]; then
     && FILES+=("$WORK/prior-review.md") \
     || { echo "ERROR: could not stage --confirm file: $CONFIRM_FILE" >&2; pg_status failed "confirm file unreadable"; pg_finish 2; }
 fi
-FILE_ARGS=(); for f in "${FILES[@]:-}"; do [ -n "$f" ] && FILE_ARGS+=(--file "$f"); done
+FILE_ARGS=(); for f in ${FILES[@]+"${FILES[@]}"}; do [ -n "$f" ] && FILE_ARGS+=(--file "$f"); done
 
 # Route through a connector-bound ChatGPT Project when configured (pre-binds GitHub).
 URL_ARGS=()
@@ -3626,43 +3677,108 @@ pg_status waiting-slot "effective ${EFF_CONC} / ceiling ${MAX_CONC}"
 SLOT_DEADLINE=$(( $(date +%s) + SLOT_WAIT ))
 SLOT_OK=0
 SLOT_HELD=""
+SLOT_GUARD_BLOCKED=0
+# gate #187 r1 P2: SLOT_GUARD_BLOCKED describes the LAST slice only — it drives the 5-minute
+# in-wait note, which is a per-slice statement. The terminal report needs a statement about the
+# WHOLE wait, so the newest occupancy reading latches here and is never cleared.
+SLOT_CAPACITY_EVER_READ=0
+SLOT_READ_SUMMARY=""
 while :; do
   EFF_CONC="$(pg_ramp_level "$MAX_CONC")"
   # Durable reservations occupy real account capacity even though their wrapper process has
   # exited. Slot-tagged reservations EXCLUDE their exact slot from acquisition (shrinking the
   # scan range instead overbooked capacity when a lower-numbered slot freed: dogfood review
   # P1); legacy/out-of-range reservations shrink the range.
-  if ! pg_reservation_guard_acquire; then sleep 3; continue; fi
-  SLOT_PLAN="$(pg_reservation_slot_plan "$EFF_CONC")"
-  SCAN_MAX="${SLOT_PLAN%%|*}"
-  SCAN_EXCLUDE="$(printf '%s' "$SLOT_PLAN" | cut -d'|' -f2)"
-  # Gate on the plan's AVAILABLE count (field 3), never on the scan bound: a bound of 1 whose
-  # only slot is excluded is an EMPTY set, and gating on the bound spent every wait slice
-  # calling pg_lock_n against an impossible plan while reporting "all slots busy" (#82).
-  SCAN_AVAIL="$(printf '%s' "$SLOT_PLAN" | cut -d'|' -f3)"
-  # Nonblocking while holding the short handoff guard: waiting here would prevent an active
-  # run from writing its reservation before releasing its process slot (writer waits 10s).
-  # One immediate scan gives an atomic plan+acquire decision; the outer loop releases the
-  # guard and retries.
-  if [ "${SCAN_AVAIL:-0}" -gt 0 ] 2>/dev/null && pg_lock_n "$LOCKFILE" "$SCAN_MAX" 0 "$SCAN_EXCLUDE"; then
-    # Keep the acquired process slot, release only the short reservation handoff guard.
-    SLOT_HELD="$PG_SLOT_ACQUIRED"
-    pg_reservation_guard_release; SLOT_OK=1; break
-  fi
-  pg_reservation_guard_release
-  # Name what actually holds capacity. An operator staring at a free-looking account and an idle
-  # browser cannot tell "another review is generating" from "a finished review was never
-  # collected" — and only the second is theirs to fix, for free (#82).
-  if [ "${SCAN_AVAIL:-0}" -le 0 ] 2>/dev/null \
-     && { [ -z "${SLOT_BLOCK_LOGGED:-}" ] || [ $(( $(date +%s) - ${SLOT_BLOCK_LOGGED:-0} )) -ge 300 ]; }; then
-    SLOT_BLOCK_LOGGED="$(date +%s)"
-    pg_report_capacity_holders "$EFF_CONC"
+  #
+  # #179: EVERY path that ends an iteration must reach the ONE deadline boundary at the bottom.
+  # A failed guard acquisition used to `sleep 3; continue`, and `continue` jumps over that
+  # check — so any guard this run could not acquire for the whole wait (an unwritable lock
+  # path, sustained flock contention, a no-flock guard whose reclaim keeps losing the mkdir)
+  # turned a bounded slot wait into an unbounded one: SLOT_WAIT stopped meaning anything and
+  # the run neither timed out nor progressed. The guard still gates planning and acquisition,
+  # exactly as before: without it this iteration has read NO capacity state, so it books
+  # nothing and only waits.
+  if pg_reservation_guard_acquire; then
+    SLOT_GUARD_BLOCKED=0
+    SLOT_PLAN="$(pg_reservation_slot_plan "$EFF_CONC")"
+    SCAN_MAX="${SLOT_PLAN%%|*}"
+    SCAN_EXCLUDE="$(printf '%s' "$SLOT_PLAN" | cut -d'|' -f2)"
+    # Gate on the plan's AVAILABLE count (field 3), never on the scan bound: a bound of 1 whose
+    # only slot is excluded is an EMPTY set, and gating on the bound spent every wait slice
+    # calling pg_lock_n against an impossible plan while reporting "all slots busy" (#82).
+    SCAN_AVAIL="$(printf '%s' "$SLOT_PLAN" | cut -d'|' -f3)"
+    # Nonblocking while holding the short handoff guard: waiting here would prevent an active
+    # run from writing its reservation before releasing its process slot (writer waits 10s).
+    # One immediate scan gives an atomic plan+acquire decision; the outer loop releases the
+    # guard and retries.
+    if [ "${SCAN_AVAIL:-0}" -gt 0 ] 2>/dev/null && pg_lock_n "$LOCKFILE" "$SCAN_MAX" 0 "$SCAN_EXCLUDE"; then
+      # Keep the acquired process slot, release only the short reservation handoff guard.
+      SLOT_HELD="$PG_SLOT_ACQUIRED"
+      pg_reservation_guard_release; SLOT_OK=1; break
+    fi
+    pg_reservation_guard_release
+    # gate #187 r1 P2: this slice held the guard, read the plan and won no slot, so it is a
+    # COMPLETE occupancy reading — latch it. Latch the sentence and not just the fact, for two
+    # reasons: EFF_CONC is re-read at the top of every iteration including guard-blocked ones, so
+    # a count taken at expiry can describe a level this reading never saw; and only here is the
+    # KIND of occupancy known, which is the difference between capacity an operator can free for
+    # free and capacity they can only wait out (#82). A later slice that loses the guard leaves
+    # this the newest thing the run knows, and the expiry below reports exactly that.
+    SLOT_CAPACITY_EVER_READ=1
+    if [ "${SCAN_AVAIL:-0}" -gt 0 ] 2>/dev/null; then
+      SLOT_READ_SUMMARY="all ${EFF_CONC} review slots were busy with running reviews"
+    else
+      SLOT_READ_SUMMARY="0 of ${EFF_CONC} effective slots were free, with capacity held by uncollected review(s) rather than running ones"
+    fi
+    # Name what actually holds capacity. An operator staring at a free-looking account and an idle
+    # browser cannot tell "another review is generating" from "a finished review was never
+    # collected" — and only the second is theirs to fix, for free (#82).
+    if [ "${SCAN_AVAIL:-0}" -le 0 ] 2>/dev/null \
+       && { [ -z "${SLOT_BLOCK_LOGGED:-}" ] || [ $(( $(date +%s) - ${SLOT_BLOCK_LOGGED:-0} )) -ge 300 ]; }; then
+      SLOT_BLOCK_LOGGED="$(date +%s)"
+      pg_report_capacity_holders "$EFF_CONC"
+    fi
+  else
+    # No capacity reading this slice. Say so on the same 5-minute cadence as the capacity report
+    # above: a wait that is silent for an hour and then reports "all slots busy" sends an operator
+    # to look at an account that was never the problem.
+    SLOT_GUARD_BLOCKED=1
+    if [ -z "${SLOT_GUARD_LOGGED:-}" ] || [ $(( $(date +%s) - ${SLOT_GUARD_LOGGED:-0} )) -ge 300 ]; then
+      SLOT_GUARD_LOGGED="$(date +%s)"
+      echo "[oracle-review] the reservation handoff guard ($(pg_reservation_lock)) could not be acquired; account capacity is unreadable this slice, so no slot is planned or taken. Waiting out the remaining slot budget." >&2
+    fi
   fi
   if [ "$(date +%s)" -ge "$SLOT_DEADLINE" ]; then break; fi
   sleep 3
 done
 if [ "$SLOT_OK" != 1 ]; then
-  if [ "$(pg_reservation_holding_count 2>/dev/null || echo 0)" -gt 0 ] 2>/dev/null; then
+  # Report the state the wait actually ended in. A wait that NEVER got as far as reading capacity
+  # cannot claim "0 of N effective slots free" or "all N busy": both are claims about slot occupancy
+  # this run never measured. pg_reservation_holding_count would still answer — it scans the
+  # reservation directory unguarded — but it would be answering a question that is not why this run
+  # gave up. Name the lock instead: that is the part an operator can act on (#179).
+  #
+  # gate #187 r1 P2: the test is the latch, NOT the last slice. A wait that read busy capacity for
+  # an hour and then lost the guard on its final slice ends with SLOT_GUARD_BLOCKED=1, and keying
+  # off that alone told the operator capacity "was never read" and skipped the running/uncollected
+  # diagnosis that is the actual answer. Both conditions still hold together, so this branch only
+  # ever narrows: it is reached exactly when every slice failed to read occupancy.
+  if [ "${SLOT_GUARD_BLOCKED:-0}" = 1 ] && [ "${SLOT_CAPACITY_EVER_READ:-0}" != 1 ]; then
+    echo "ERROR: timed out after ${SLOT_WAIT}s — the reservation handoff guard ($(pg_reservation_lock)) was still unacquirable; account capacity was never read, so no slot was planned or taken and no review was submitted." >&2
+    # Do NOT send the operator after a stale guard directory: pg_reservation_guard_acquire runs
+    # pg_dirlock_reclaim_dead on every attempt, so a directory left by a dead process is already
+    # reclaimed inside this same wait, thousands of times over on a default budget. Name only what
+    # can still be true once the whole budget has elapsed.
+    echo "  This is a lock-path problem, not a busy account. A guard left behind by a dead process is reclaimed automatically inside this same wait, so what remains after a full budget is a ${PRO_GATE_HOME} that cannot be written (mkdir and flock must both succeed there), or a live process that is genuinely still holding the guard." >&2
+  elif [ "${SLOT_GUARD_BLOCKED:-0}" = 1 ]; then
+    # Read capacity, then lost the guard before the deadline. The two branches below re-derive
+    # their answer from a scan taken AT expiry; this wait cannot, because the guard it needs to
+    # take one is exactly what it could not get. So report the reading it does have, say when it
+    # was taken, and let the holder report — which scans the reservation directory unguarded and
+    # prints nothing when nothing is held — add whatever is still true right now (gate #187 r1 P2).
+    echo "ERROR: timed out after ${SLOT_WAIT}s — when this run last read account capacity, ${SLOT_READ_SUMMARY}; the reservation handoff guard ($(pg_reservation_lock)) was unacquirable again when the wait expired, so nothing newer could be read and no review was submitted." >&2
+    pg_report_capacity_holders "$EFF_CONC"
+  elif [ "$(pg_reservation_holding_count 2>/dev/null || echo 0)" -gt 0 ] 2>/dev/null; then
     echo "ERROR: timed out after ${SLOT_WAIT}s — 0 of ${EFF_CONC} effective slots free; capacity is held by uncollected review(s), not by running ones." >&2
     pg_report_capacity_holders "$EFF_CONC"
   else
@@ -3719,7 +3835,7 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
         "$ORACLE_BIN" "${ENGINE_ARGS[@]}" -m "$MODEL" \
         --browser-model-strategy "$strategy" ${force_args[0]:+"${force_args[@]}"} \
         --slug "$SLUG_BASE" \
-        "${URL_ARGS[@]}" "${FILE_ARGS[@]}" \
+        ${URL_ARGS[@]+"${URL_ARGS[@]}"} ${FILE_ARGS[@]+"${FILE_ARGS[@]}"} \
         -p "$(cat "$PROMPT_FILE")" \
         --no-notify --timeout "$TIMEOUT" \
         --write-output "$CAPTURE_OUT" 2>&1 &

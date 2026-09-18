@@ -11,12 +11,49 @@ export PRO_GATE_SERVICE_MANAGER=none
 check "plugin owns one skill" test "$(find "$ROOT/skills" -name SKILL.md -type f | wc -l)" -eq 1
 check "plugin owns one agent" test "$(find "$ROOT/agents" -name oracle-reviewer.md -type f | wc -l)" -eq 1
 
+# #176 (remaining sites): every possibly-empty array expansion in install.sh is guarded against the
+# bash <4.4 (stock macOS /bin/bash 3.2) "unbound variable" crash on a bare "${arr[@]}" expansion of
+# a zero-element array under set -u -- PROXY_ARGS is empty unless HTTPS_PROXY/HTTP_PROXY is set.
+# Same sweep as tests/daemon-current-head-completion.test.sh (daemon.sh) and the ENGINE sweep in
+# tests/engine.test.sh (oracle-review.sh); install.sh has no never-empty-by-name allowlist entries.
+# What this does NOT verify: an actual bash 3.2 reproduction -- none is available in this
+# environment; see daemon-current-head-completion.test.sh for the guard-idiom probe that
+# non-regression-tests the idiom itself on this host bash.
+INSTALL_UNGUARDED="$(sed -E 's/\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\+"\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\}"\}//g' "$ROOT/install.sh" \
+  | grep -noE '\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\}' || true)"
+[ -n "$INSTALL_UNGUARDED" ] && echo "install.sh unguarded [@] sites: $INSTALL_UNGUARDED"
+check "every \"[@]\" array expansion in install.sh is wrapped in the guard idiom" test -z "$INSTALL_UNGUARDED"
+INSTALL_DASH_DEFAULT="$(grep -c '\[@\]:-' "$ROOT/install.sh")"
+check "no \${arr[@]:-} single-spurious-empty-arg anti-idiom remains in install.sh" test "$INSTALL_DASH_DEFAULT" -eq 0
+
 OUT="$TDIR/dist"
 RELEASE_TAG="v$VERSION" bash "$ROOT/scripts/package-runtime.sh" "$OUT" >/dev/null
 ARCHIVE="$OUT/pro-gate-runtime-$VERSION.tar.gz"
 CHECKSUM="$ARCHIVE.sha256"
 check "package creates archive" test -s "$ARCHIVE"
 check "package creates checksum" test -s "$CHECKSUM"
+
+# #172: install.sh's standalone sha256() must hash through stdin, like pg_sha256 (#168),
+# so an archive path containing a backslash does not get its digest corrupted by
+# sha256sum/shasum framing-and-escaping the printed filename.
+ESC_DIR="$TDIR/esc-src"; mkdir -p "$ESC_DIR"
+ESC="$ESC_DIR/pro-gate-runtime-$VERSION"'\'"-esc.tar.gz"
+cp "$ARCHIVE" "$ESC"
+{ sha256sum < "$ESC" | cut -d' ' -f1; } 2>/dev/null > "$ESC.sha256"
+ESC_HOME="$TDIR/esc-home"; ESC_RUNTIME="$TDIR/esc-runtime"
+mkdir -p "$ESC_HOME"
+HOME="$ESC_HOME" PRO_GATE_HOME="$ESC_RUNTIME" \
+  bash "$ROOT/install.sh" --version "$VERSION" --archive "$ESC" --checksum "$ESC.sha256" >"$TDIR/esc.log" 2>&1
+check "install succeeds for archive path containing a backslash" test "$(cat "$ESC_RUNTIME/VERSION" 2>/dev/null)" = "$VERSION"
+
+ESC_BAD_RUNTIME="$TDIR/esc-bad-runtime"
+printf '%s\n' "0000000000000000000000000000000000000000000000000000000000000000" > "$ESC.wrong.sha256"
+if HOME="$ESC_HOME" PRO_GATE_HOME="$ESC_BAD_RUNTIME" \
+  bash "$ROOT/install.sh" --version "$VERSION" --archive "$ESC" --checksum "$ESC.wrong.sha256" >"$TDIR/esc-wrong.log" 2>&1; then
+  echo "FAIL - install rejects wrong checksum for backslash-path archive"; FAILS=$((FAILS + 1))
+else echo "ok - install rejects wrong checksum for backslash-path archive"; fi
+check "no VERSION installed after checksum mismatch on backslash-path archive" test ! -e "$ESC_BAD_RUNTIME/VERSION"
+
 LIST="$TDIR/archive.list"; tar -tzf "$ARCHIVE" > "$LIST"
 check "runtime package excludes skill" sh -c "! grep -q '/skills/' '$LIST'"
 check "runtime package excludes agent" sh -c "! grep -q '/agents/' '$LIST'"

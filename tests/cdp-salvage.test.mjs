@@ -517,6 +517,56 @@ function runSalvage(args, port, seed, extraEnv = {}) {
   });
 }
 
+// #208: a repeat-sighting test needs the SAME PRO_GATE_HOME across two salvage invocations, so the
+// second run's throttle-seen dedupe can see what the first run recorded — runSalvage's per-call
+// mkdtempSync-then-rmSync home cannot express that. This runs the same child machinery against a
+// caller-supplied home and leaves it (and any files inside it, e.g. throttle.cooldown's mtime) in
+// place afterward; the caller owns cleanup via fs.rmSync.
+function runSalvageInHome(home, args, port, extraEnv = {}) {
+  return new Promise((resolve) => {
+    const startedAt = Date.now();
+    const expandedArgs = args.map((arg) => arg.replace(/^PG_HOME\//, `${home}/`));
+    const childEnv = { ...process.env, PRO_GATE_HOME: home, ...extraEnv };
+    for (const [name, value] of Object.entries(childEnv)) {
+      if (value === undefined) delete childEnv[name];
+    }
+    const child = spawn(process.execPath, [SALVAGE, ...expandedArgs, String(port)], {
+      env: childEnv,
+    });
+    let stdout = '', stderr = '';
+    child.stdout.on('data', (d) => { stdout += d; });
+    child.stderr.on('data', (d) => { stderr += d; });
+    const killer = setTimeout(() => child.kill('SIGKILL'), Number(extraEnv.PRO_GATE_TEST_CHILD_TIMEOUT_MS ?? 90_000));
+    child.on('close', (status) => {
+      clearTimeout(killer);
+      const read = (rel) => { try { return fs.readFileSync(path.join(home, rel), 'utf8'); } catch { return null; } };
+      resolve({
+        status, stdout, stderr, elapsedMs: Date.now() - startedAt,
+        cooldown: read('throttle.cooldown'),
+      });
+    });
+  });
+}
+
+// #208 gate r2 P2: production replaced the single throttle.cooldown.seen FILE (loaded once per
+// invocation and rewritten wholesale — the exact shared-mutable-state race #208 gate r2 P2
+// closes) with one record file per (url, hash) fingerprint in a DIRECTORY, created via
+// fs.writeFileSync(path, '', { flag: 'wx' }) so a concurrent writer can never clobber another's
+// sighting. These three helpers mirror throttleSeenRecordPath/throttleAlreadyCharged/
+// recordThrottleSeen in bin/cdp-salvage.mjs byte-for-byte (same hash-of-url-and-hash key), so
+// tests read and seed the SAME on-disk shape production does, not a second test-only format.
+const throttleSeenDir = (home) => path.join(home, 'throttle.cooldown.seen.d');
+const throttleSeenRecordPath = (home, url, text) => {
+  const hash = createHash('sha256').update(text ?? '').digest('hex');
+  const key = createHash('sha256').update(`${url}\n${hash}`).digest('hex');
+  return path.join(throttleSeenDir(home), key);
+};
+const throttleSeenHas = (home, url, text) => fs.existsSync(throttleSeenRecordPath(home, url, text));
+const seedThrottleSeen = (home, url, text) => {
+  fs.mkdirSync(throttleSeenDir(home), { recursive: true });
+  fs.writeFileSync(throttleSeenRecordPath(home, url, text), '', { flag: 'wx' });
+};
+
 // Deliberately opt in only scratch fixtures that need it: hydration/order checks, hung-close
 // cleanup, and static decisive 3s canonical revalidations. The latter have no required first/second
 // state transition; their old 2.5s sample left only 500ms of scheduler slack before the assertion.
@@ -3465,6 +3515,796 @@ const FOREIGN_ANSWER = (m) => [
     scratchModal.created.length === 1 && scratchModal.closed.includes(scratchModal.created[0].id),
     `created=${JSON.stringify(scratchModal.created)} closed=${scratchModal.closed}`);
   scratchModal.stop();
+}
+
+{ // #208: an abandoned throttle modal on an UNOWNED tab (another run's stale, hours-old
+  // conversation) is account-wide throttle evidence, but nothing ever closes that tab or clears
+  // its modal — so a caller that waits out `seconds_remaining` and retries has the sweep re-detect
+  // the exact same stale sighting and rewrite throttle.cooldown again, forever (observed: 3
+  // attempts / 1h45m, pushbot PR #3225). A sidecar (throttle.cooldown.seen) fingerprints (tab url,
+  // sha256 of modal/page text) pairs a scan has already charged, so a repeat of the SAME stale
+  // sighting is ignored instead of re-arming the timer. Planted negative: an OWNED sighting (this
+  // run's exact marker under the modal) must keep re-arming unconditionally every time — #162's
+  // existing contract — never routed through this dedupe at all.
+  const modal = "Too many requests. You're making requests too quickly. We've temporarily limited access to your conversations to protect your data. Please wait a few minutes before trying again.";
+  const reasoning = Array.from({ length: 120 }, (_, i) =>
+    `Reviewed concurrency risks in module ${i}: lock ordering, retry budgets, and reservation TTL handling.`).join('\n');
+  const foreign = `${modal}\nrun marker: pg-run-other-1111111111-1\n${reasoning}`;
+  const oldMtime = (p) => { const t = new Date(Date.now() - 3_600_000); fs.utimesSync(p, t, t); };
+
+  // (1) First unowned modal sighting: cooldown written, exit 5, tab recorded in the seen sidecar.
+  const home1 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const cdp1a = await mockCdp(foreign, [], { throttleModal: modal });
+  const first = await runSalvageInHome(home1, [MARKER, '3'], cdp1a.port);
+  check('#208 (1) first unowned throttle modal sighting takes the throttle exit (5)', first.status === 5,
+    `status=${first.status} stderr=${first.stderr?.slice(0, 200)}`);
+  check('#208 (1) first unowned throttle modal sighting writes the cooldown naming the modal',
+    /modal over tab/.test(first.cooldown ?? ''), `cooldown=${first.cooldown}`);
+  check('#208 (1) first unowned throttle modal sighting records the tab in the seen sidecar',
+    throttleSeenHas(home1, 'https://chatgpt.com/c/mock-conversation', modal),
+    `throttleSeen=${fs.existsSync(throttleSeenDir(home1)) ? fs.readdirSync(throttleSeenDir(home1)) : null}`);
+  cdp1a.stop();
+
+  // (2) A retry that finds the exact same stale tab (same url, same modal text) must not rewrite
+  // the cooldown: the sentinel mtime (artificially aged so any rewrite is unmistakable) survives,
+  // the run does not take the throttle exit, and stderr names the stale tab it ignored.
+  const cooldownPath1 = path.join(home1, 'throttle.cooldown');
+  oldMtime(cooldownPath1);
+  const mtimeBefore1 = fs.statSync(cooldownPath1).mtimeMs;
+  const cdp1b = await mockCdp(foreign, [], { throttleModal: modal });
+  const second = await runSalvageInHome(home1, [MARKER, '3'], cdp1b.port);
+  const mtimeAfter1 = fs.statSync(cooldownPath1).mtimeMs;
+  check('#208 (2) a repeat sighting of the same stale tab does not rewrite the cooldown file',
+    mtimeAfter1 === mtimeBefore1, `before=${mtimeBefore1} after=${mtimeAfter1}`);
+  check('#208 (2) a repeat sighting of the same stale tab does not take the throttle exit',
+    second.status !== 5, `status=${second.status}`);
+  check('#208 (2) a repeat sighting of the same stale tab names the stale tab on stderr',
+    /stale throttle modal on unowned tab https:\/\/chatgpt\.com\/c\/mock-conversation already charged/.test(second.stderr || ''),
+    `stderr=${second.stderr?.slice(0, 300)}`);
+  cdp1b.stop();
+
+  // (4) A genuinely new unowned sighting — a DIFFERENT tab carrying the same modal text — is not
+  // suppressed by (2)'s dedupe: the cooldown is rewritten and the tab is charged, because the seen
+  // key is (url, hash), not the hash alone.
+  const secondForeignUrl = 'https://chatgpt.com/c/another-stale-conversation';
+  const secondForeignText = `${modal}\nrun marker: pg-run-other-2222222222-2\n${reasoning}`;
+  const cdp1c = await mockCdp('__NO_TABS__', [{ id: 'other2', url: secondForeignUrl }],
+    { tabText: () => secondForeignText, throttleModal: () => modal });
+  const fourth = await runSalvageInHome(home1, [MARKER, '3'], cdp1c.port);
+  check('#208 (4) a new unowned modal on a different tab takes the throttle exit (5)', fourth.status === 5,
+    `status=${fourth.status} stderr=${fourth.stderr?.slice(0, 200)}`);
+  check('#208 (4) a new unowned modal on a different tab rewrites the cooldown naming that tab',
+    (fourth.cooldown ?? '').includes(secondForeignUrl), `cooldown=${fourth.cooldown}`);
+  check('#208 (4) a new unowned modal on a different tab is added to the seen sidecar',
+    throttleSeenHas(home1, secondForeignUrl, modal),
+    `throttleSeen=${fs.existsSync(throttleSeenDir(home1)) ? fs.readdirSync(throttleSeenDir(home1)) : null}`);
+  cdp1c.stop();
+
+  // (5) A stale, already-charged tab listed FIRST must not hide a genuinely new foreign modal
+  // listed behind it: the whole-scan fallback walks the unowned hits in list order, the dedupe
+  // gate skips the stale one (still named on stderr), and the new tab is the one charged.
+  const thirdForeignUrl = 'https://chatgpt.com/c/third-stale-conversation';
+  const thirdForeignText = `${modal}\nrun marker: pg-run-other-3333333333-3\n${reasoning}`;
+  const cdp1d = await mockCdp(foreign, [{ id: 'other3', url: thirdForeignUrl }],
+    { tabText: (url) => (url === thirdForeignUrl ? thirdForeignText : undefined), throttleModal: () => modal });
+  const fifth = await runSalvageInHome(home1, [MARKER, '3'], cdp1d.port);
+  check('#208 (5) a stale tab listed first does not hide a new unowned modal behind it: throttle exit (5)',
+    fifth.status === 5, `status=${fifth.status} stderr=${fifth.stderr?.slice(0, 300)}`);
+  check('#208 (5) the new tab behind the stale one is the tab charged in the cooldown',
+    (fifth.cooldown ?? '').includes(thirdForeignUrl), `cooldown=${fifth.cooldown}`);
+  check('#208 (5) the stale tab listed first is still named as ignored on stderr',
+    /stale throttle modal on unowned tab https:\/\/chatgpt\.com\/c\/mock-conversation already charged/.test(fifth.stderr || ''),
+    `stderr=${fifth.stderr?.slice(0, 300)}`);
+  cdp1d.stop();
+  fs.rmSync(home1, { recursive: true, force: true });
+
+  // (3) Planted negative: an OWNED sighting (this run's exact marker under the modal) re-arms the
+  // cooldown unconditionally on EVERY repeat — #162's existing contract — never deduped like an
+  // unowned sighting. Same stale-mtime technique as (2), opposite expected outcome.
+  const owned = `${modal}\nrun marker: ${MARKER}\n${reasoning}\nReviewed concurrency risks`;
+  const home3 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const cdp3a = await mockCdp(owned, [], { throttleModal: modal });
+  const owned1 = await runSalvageInHome(home3, ['--probe', MARKER, '3'], cdp3a.port);
+  check('#208 (3) planted negative: first owned modal sighting writes the cooldown',
+    /modal over tab/.test(owned1.cooldown ?? ''), `cooldown=${owned1.cooldown}`);
+  cdp3a.stop();
+  const cooldownPath3 = path.join(home3, 'throttle.cooldown');
+  oldMtime(cooldownPath3);
+  const mtimeBefore3 = fs.statSync(cooldownPath3).mtimeMs;
+  const cdp3b = await mockCdp(owned, [], { throttleModal: modal });
+  const owned2 = await runSalvageInHome(home3, ['--probe', MARKER, '3'], cdp3b.port);
+  const mtimeAfter3 = fs.statSync(cooldownPath3).mtimeMs;
+  check('#208 (3) planted negative: an owned throttle modal re-arms the cooldown on every repeat (never deduped)',
+    mtimeAfter3 > mtimeBefore3, `before=${mtimeBefore3} after=${mtimeAfter3}`);
+  check('#208 (3) owned repeat still reports the closed throttled state, never generating',
+    owned2.status === 0 && /^probe-state: throttled$/m.test(owned2.stderr || ''), `status=${owned2.status} stderr=${owned2.stderr?.slice(0, 200)}`);
+  cdp3b.stop();
+  fs.rmSync(home3, { recursive: true, force: true });
+
+  // Also exercise the per-tab isThrottlePage trip site (site 2, distinct from the whole-scan modal
+  // fallback exercised above): a short marker-less interstitial page, with no modal element at
+  // all, must be deduped the same way on a repeat.
+  const home5 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const cdp5a = await mockCdp(modal);
+  const site2First = await runSalvageInHome(home5, [MARKER, '3'], cdp5a.port);
+  check('#208 (site 2: isThrottlePage) first unowned interstitial sighting takes the throttle exit',
+    site2First.status === 5 && /tab https:\/\/chatgpt\.com\/c\/mock-conversation/.test(site2First.cooldown ?? ''),
+    `status=${site2First.status} cooldown=${site2First.cooldown}`);
+  cdp5a.stop();
+  const cooldownPath5 = path.join(home5, 'throttle.cooldown');
+  oldMtime(cooldownPath5);
+  const mtimeBefore5 = fs.statSync(cooldownPath5).mtimeMs;
+  const cdp5b = await mockCdp(modal);
+  const site2Second = await runSalvageInHome(home5, [MARKER, '3'], cdp5b.port);
+  const mtimeAfter5 = fs.statSync(cooldownPath5).mtimeMs;
+  check('#208 (site 2: isThrottlePage) a repeat interstitial sighting on the same tab does not rewrite the cooldown',
+    mtimeAfter5 === mtimeBefore5, `before=${mtimeBefore5} after=${mtimeAfter5}`);
+  check('#208 (site 2: isThrottlePage) a repeat interstitial sighting does not take the throttle exit',
+    site2Second.status !== 5, `status=${site2Second.status}`);
+  cdp5b.stop();
+  fs.rmSync(home5, { recursive: true, force: true });
+}
+
+{ // #208 gate r1 P1 regression: a marker-less stale tab whose WHOLE PAGE TEXT satisfies
+  // isThrottlePage while it ALSO carries a distinct throttle modal used to fingerprint under TWO
+  // different hashes depending on which trip site reached it first — the whole-scan modal
+  // fallback always hashed the modal text, but the (pre-fix) per-tab isThrottlePage check hashed
+  // the raw page text instead. The seen sidecar recognized only the MOST RECENT of the two
+  // hashes for a URL (replace, not append), so the tab kept "newly" tripping every other
+  // invocation forever — the exact livelock #208 was supposed to end. Fixed by (a) hashing the
+  // modal text everywhere a modal is present (including this classifier branch and the per-tab
+  // site), (b) never re-classifying a modal-bearing tab through the per-tab interstitial check
+  // (the whole-scan block already decided it), and (c) a bounded multi-hash-per-URL sidecar as a
+  // second line of defense.
+  const modalText = "You're making requests too quickly. Temporarily limited access to your conversations.";
+  const pageText = `ChatGPT\nAccount limits\n${modalText}\nPlease try again shortly.\n`;
+  const oldMtime = (p) => { const t = new Date(Date.now() - 3_600_000); fs.utimesSync(p, t, t); };
+
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+
+  // Run 1: first sighting of this stale tab takes the throttle exit and writes the cooldown.
+  const cdpA = await mockCdp(pageText, [], { throttleModal: modalText });
+  const first = await runSalvageInHome(home, [MARKER, '3'], cdpA.port);
+  check('#208 P1 (1) first sighting of a marker-less modal+interstitial page takes the throttle exit (5)',
+    first.status === 5, `status=${first.status} stderr=${first.stderr?.slice(0, 300)}`);
+  cdpA.stop();
+
+  // Run 2: the SAME stale tab, completely unchanged — sentinel mtime aged so any rewrite is
+  // unmistakable. On the pre-fix script this is where the second fingerprint (raw page text)
+  // trips as "new" and rewrites the cooldown (RED).
+  const cooldownPath = path.join(home, 'throttle.cooldown');
+  oldMtime(cooldownPath);
+  const mtimeBefore2 = fs.statSync(cooldownPath).mtimeMs;
+  const cdpB = await mockCdp(pageText, [], { throttleModal: modalText });
+  const second = await runSalvageInHome(home, [MARKER, '3'], cdpB.port);
+  const mtimeAfter2 = fs.statSync(cooldownPath).mtimeMs;
+  check('#208 P1 (2) an unchanged stale tab does not rewrite the cooldown on the next pass',
+    mtimeAfter2 === mtimeBefore2, `before=${mtimeBefore2} after=${mtimeAfter2}`);
+  check('#208 P1 (2) an unchanged stale tab does not take the throttle exit on the next pass',
+    second.status !== 5, `status=${second.status}`);
+  cdpB.stop();
+
+  // Run 3: same stale tab again. The pre-fix bug alternated hash sites every OTHER pass, so a
+  // single repeat could get lucky; a third pass confirms convergence, not alternation.
+  oldMtime(cooldownPath);
+  const mtimeBefore3 = fs.statSync(cooldownPath).mtimeMs;
+  const cdpC = await mockCdp(pageText, [], { throttleModal: modalText });
+  const third = await runSalvageInHome(home, [MARKER, '3'], cdpC.port);
+  const mtimeAfter3 = fs.statSync(cooldownPath).mtimeMs;
+  check('#208 P1 (3) a third pass over the same unchanged stale tab still does not rewrite the cooldown',
+    mtimeAfter3 === mtimeBefore3, `before=${mtimeBefore3} after=${mtimeAfter3}`);
+  check('#208 P1 (3) a third pass over the same unchanged stale tab still does not take the throttle exit',
+    third.status !== 5, `status=${third.status}`);
+  cdpC.stop();
+  fs.rmSync(home, { recursive: true, force: true });
+
+  // Planted negative: an OWNED tab of the same shape (marker present, modal present) must keep
+  // re-arming the cooldown on EVERY pass — #162's existing contract, never routed through this
+  // dedupe at all. A marker anywhere in the text also makes isThrottlePage(text) false (it
+  // requires no run marker, ours or foreign), so this exercises the modal branch, not the
+  // interstitial branch above — the two must not be conflated.
+  const ownedText = `ChatGPT\nAccount limits\n${modalText}\nrun marker: ${MARKER}\nPlease try again shortly.\n`;
+  const homeOwned = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const cdpOwnedA = await mockCdp(ownedText, [], { throttleModal: modalText });
+  const ownedFirst = await runSalvageInHome(homeOwned, ['--probe', MARKER, '3'], cdpOwnedA.port);
+  check('#208 P1 planted negative: first owned sighting writes the cooldown',
+    /modal over tab/.test(ownedFirst.cooldown ?? ''), `cooldown=${ownedFirst.cooldown}`);
+  cdpOwnedA.stop();
+  const cooldownPathOwned = path.join(homeOwned, 'throttle.cooldown');
+  oldMtime(cooldownPathOwned);
+  const mtimeBeforeOwned = fs.statSync(cooldownPathOwned).mtimeMs;
+  const cdpOwnedB = await mockCdp(ownedText, [], { throttleModal: modalText });
+  const ownedSecond = await runSalvageInHome(homeOwned, ['--probe', MARKER, '3'], cdpOwnedB.port);
+  const mtimeAfterOwned = fs.statSync(cooldownPathOwned).mtimeMs;
+  check('#208 P1 planted negative: an owned tab of the same shape re-arms the cooldown on every repeat',
+    mtimeAfterOwned > mtimeBeforeOwned, `before=${mtimeBeforeOwned} after=${mtimeAfterOwned}`);
+  check('#208 P1 planted negative: owned repeat still reports the closed throttled state',
+    ownedSecond.status === 0 && /^probe-state: throttled$/m.test(ownedSecond.stderr || ''),
+    `status=${ownedSecond.status} stderr=${ownedSecond.stderr?.slice(0, 200)}`);
+  cdpOwnedB.stop();
+  fs.rmSync(homeOwned, { recursive: true, force: true });
+}
+
+{ // #208 gate r1 P1 (item 3): the same modal-preferred-fingerprint fix in classifyEvidence's
+  // interstitial branch (~1376) is reachable through the existing remembered-URL scratch-render
+  // recovery path — a THIRD trip site, distinct from the two exercised above. Run 1 sees the tab
+  // OPEN (whole-scan modal fallback trips on the modal hash and remembers the URL). Run 2 sees
+  // the SAME tab CLOSED, so the v0.25 remembered-conversation recovery scratch-renders that URL
+  // and reaches classifyEvidence's interstitial branch instead — a genuinely different site than
+  // run 1's, for the SAME unchanged conversation. Pre-fix that branch hashed the raw page text,
+  // disagreeing with run 1's modal-text hash, so it read as "new" and re-tripped (the same
+  // two-site alternation #208 was supposed to end, just through this pair of sites instead of
+  // the whole-scan-fallback/per-tab pair covered above).
+  const modalText3 = "You're making requests too quickly. Temporarily limited access to your conversations.";
+  const pageText3 = `ChatGPT\nAccount limits\n${modalText3}\nA scratch render of the remembered conversation.\n`;
+  const canonicalUrl3 = 'https://chatgpt.com/c/mock-conversation';
+  const oldMtime3 = (p) => { const t = new Date(Date.now() - 3_600_000); fs.utimesSync(p, t, t); };
+
+  const home3 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedMemo(MARKER, canonicalUrl3)(home3);
+
+  // Run 1: the tab is OPEN — trips via the whole-scan modal fallback (site 1), hashing the modal
+  // text. This site already hashed the modal text both before and after the fix; it is not the
+  // regression, it is what establishes the "already charged" fingerprint run 2 must agree with.
+  const cdpS1 = await mockCdp(pageText3, [], { throttleModal: modalText3 });
+  const scratchFirst = await runSalvageInHome(home3, [MARKER, '3'], cdpS1.port);
+  check('#208 P1 (classifier/scratch) run 1: the open tab takes the throttle exit (5) via the whole-scan modal fallback',
+    scratchFirst.status === 5, `status=${scratchFirst.status} stderr=${scratchFirst.stderr?.slice(0, 300)}`);
+  cdpS1.stop();
+
+  // Run 2: the SAME tab is now CLOSED (__NO_TABS__) but the memo still remembers its URL, so the
+  // remembered-conversation recovery scratch-renders it — reaching classifyEvidence's
+  // interstitial branch (site 3) for the identical unchanged page.
+  const cooldownPath3 = path.join(home3, 'throttle.cooldown');
+  oldMtime3(cooldownPath3);
+  const mtimeBeforeS = fs.statSync(cooldownPath3).mtimeMs;
+  const cdpS2 = await mockCdp('__NO_TABS__', [], {
+    renderText: () => pageText3,
+    throttleModal: (id) => (id.startsWith('scratch') ? modalText3 : null),
+  });
+  const scratchSecond = await runSalvageInHome(home3, [MARKER, '3'], cdpS2.port, SCRATCH_SAMPLE_TEST_ENV);
+  const mtimeAfterS = fs.statSync(cooldownPath3).mtimeMs;
+  check('#208 P1 (classifier/scratch) run 2: the remembered-URL re-render of the same unchanged page does not rewrite the cooldown',
+    mtimeAfterS === mtimeBeforeS, `before=${mtimeBeforeS} after=${mtimeAfterS}`);
+  check('#208 P1 (classifier/scratch) run 2: the remembered-URL re-render of the same unchanged page does not take the throttle exit',
+    scratchSecond.status !== 5, `status=${scratchSecond.status}`);
+  cdpS2.stop();
+  fs.rmSync(home3, { recursive: true, force: true });
+}
+
+{ // #208 gate r1 P2 regression: --organize checked only throttleHits[0]. With an already-charged
+  // unowned tab listed FIRST and a genuinely new unowned modal listed behind it, tripThrottleUnowned
+  // returned false for the first hit and the block exited without ever examining the second, so
+  // --organize proceeded toward scratch navigation/rename/archive without updating the cooldown.
+  // Fixed by walking ALL unowned hits in list order, mirroring the main loop's whole-scan walk.
+  const title = 'pro-gate review: PR #208 organizer P2 [pro-gate]';
+  const staleUrl = 'https://chatgpt.com/c/mock-conversation';    // primary tab, listed FIRST
+  const newUrl = 'https://chatgpt.com/c/organizer-new-throttle'; // extra tab, listed SECOND
+  const staleModal = "You're making requests too quickly. Temporarily limited access to your conversations.";
+  const newModal = staleModal; // same account-wide copy; the dedupe key is (url, hash), not hash alone
+  const staleText = 'ChatGPT interstitial (stale tab)';
+  const newText = 'ChatGPT interstitial (new tab)';
+
+  // A stale unowned sighting was already charged by an earlier organizer scan.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedOrganizer(MARKER, title)(home);
+  seedThrottleSeen(home, staleUrl, staleModal);
+
+  const cdp = await mockCdp(staleText, [{ id: 'new1', url: newUrl }], {
+    tabText: (url) => (url === newUrl ? newText : undefined),
+    throttleModal: (id) => (id === 'new1' ? newModal : staleModal),
+  });
+  const r = await runSalvageInHome(home, ['--organize', MARKER, '5'], cdp.port);
+  check('#208 P2 organizer: a new unowned modal behind an already-charged stale one still reports reason=throttle',
+    /reason=throttle/.test(r.stdout), `stdout=${r.stdout} stderr=${r.stderr?.slice(0, 300)}`);
+  check('#208 P2 organizer: the already-charged stale tab listed first is still named as ignored on stderr',
+    r.stderr?.includes(`stale throttle modal on unowned tab ${staleUrl} already charged`),
+    `stderr=${r.stderr?.slice(0, 400)}`);
+  check('#208 P2 organizer: the new tab behind the stale one is newly recorded in the seen sidecar',
+    throttleSeenHas(home, newUrl, newModal),
+    `throttleSeen=${fs.existsSync(throttleSeenDir(home)) ? fs.readdirSync(throttleSeenDir(home)) : null}`);
+  check('#208 P2 organizer: no rename/archive mutation happened',
+    cdp.ui.events.length === 0, `events=${JSON.stringify(cdp.ui.events)}`);
+  cdp.stop();
+  fs.rmSync(home, { recursive: true, force: true });
+
+  // Planted negative: with BOTH sightings already charged, no unowned hit is newly admitted, so
+  // the organizer falls through as though no modal were present — no reason=throttle, no cooldown.
+  const home2 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedOrganizer(MARKER, title)(home2);
+  seedThrottleSeen(home2, staleUrl, staleModal);
+  seedThrottleSeen(home2, newUrl, newModal);
+  const cdp2 = await mockCdp(staleText, [{ id: 'new1', url: newUrl }], {
+    tabText: (url) => (url === newUrl ? newText : undefined),
+    throttleModal: (id) => (id === 'new1' ? newModal : staleModal),
+  });
+  const r2 = await runSalvageInHome(home2, ['--organize', MARKER, '5'], cdp2.port);
+  // #208 gate r2 P1: this scenario is now the organizer's "absence-like conclusion" case the P1
+  // fix explicitly targets ("Apply the same rule to the organizer's throttled-but-ignored case if
+  // it can reach an absence-like conclusion"). Neither staleModal nor newModal carries any run
+  // marker (ours or foreign), so both are non-foreign unowned throttle sightings; with no
+  // recovery URL at all (seedOrganizer was called with no memo url), the organizer must now
+  // report the inconclusive throttle reason rather than silently falling through as if nothing
+  // were seen — even though every sighting this scan found was already charged and no NEW cooldown
+  // is written. Pre-fix, this same scenario asserted the opposite (no reason=throttle); that
+  // assertion is intentionally flipped here to match the mandated behavior change, not weakened.
+  check('#208 gate r2 P1 organizer: with every sighting already charged and no recovery URL, the organizer still reports the inconclusive throttle reason',
+    /reason=throttle/.test(r2.stdout), `stdout=${r2.stdout}`);
+  check('#208 gate r2 P1 organizer: with every sighting already charged, no NEW cooldown is written',
+    r2.cooldown === null, `cooldown=${r2.cooldown}`);
+  cdp2.stop();
+  fs.rmSync(home2, { recursive: true, force: true });
+
+  // Genuinely fresh planted negative: an organizer scan with NO throttle involvement at all (no
+  // modal, no interstitial, nothing already charged) must not report reason=throttle and must not
+  // write a cooldown — preserving honest planted-negative coverage for the "nothing happened" case
+  // now that the previous scenario's truth value has correctly flipped to reason=throttle.
+  const home2b = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedOrganizer(MARKER, title)(home2b);
+  const cdp2b = await mockCdp('__NO_TABS__');
+  const r2b = await runSalvageInHome(home2b, ['--organize', MARKER, '5'], cdp2b.port);
+  check('#208 gate r2 P1 organizer planted negative: with no throttle involvement at all, the organizer does not report reason=throttle',
+    !/reason=throttle/.test(r2b.stdout) && /reason=owned-target-not-found/.test(r2b.stdout),
+    `stdout=${r2b.stdout} stderr=${r2b.stderr?.slice(0, 300)}`);
+  check('#208 gate r2 P1 organizer planted negative: with no throttle involvement at all, no cooldown is written',
+    r2b.cooldown === null, `cooldown=${r2b.cooldown}`);
+  cdp2b.stop();
+  fs.rmSync(home2b, { recursive: true, force: true });
+}
+
+{ // #208 gate r2 P1 (main scan): a markerless throttle INTERSTITIAL (no modal element — the bare
+  // isThrottlePage check) on an unowned tab must not let a repeat, already-charged sighting fall
+  // through to a confirmed-absent exit 4 — that wrongly spends a paid review's finite
+  // recovery-miss budget on nothing but the account limiter. A repeat sighting of the SAME
+  // markerless tab must retreat to exit 7 (inconclusive), name why on stderr, and must NOT
+  // rewrite the cooldown (cooldown dedup is a rate-limit decision, not an ownership one).
+  const interstitialUrl = 'https://chatgpt.com/c/mock-interstitial-tab';
+  const interstitialText = "You're making requests too quickly. Please wait a few minutes before trying again.";
+  const oldMtimeI = (p) => { const t = new Date(Date.now() - 3_600_000); fs.utimesSync(p, t, t); };
+
+  const homeI = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const cdpI1 = await mockCdp('__NO_TABS__', [{ id: 'interstitial1', url: interstitialUrl }], {
+    tabText: () => interstitialText,
+  });
+  const firstI = await runSalvageInHome(homeI, [MARKER, '3'], cdpI1.port);
+  check('#208 gate r2 P1 interstitial: first unowned interstitial sighting takes the throttle exit (5)',
+    firstI.status === 5, `status=${firstI.status} stderr=${firstI.stderr?.slice(0, 200)}`);
+  check('#208 gate r2 P1 interstitial: first sighting records the tab in the seen sidecar',
+    throttleSeenHas(homeI, interstitialUrl, interstitialText),
+    `dir=${fs.existsSync(throttleSeenDir(homeI)) ? fs.readdirSync(throttleSeenDir(homeI)) : null}`);
+  cdpI1.stop();
+
+  const cooldownPathI = path.join(homeI, 'throttle.cooldown');
+  oldMtimeI(cooldownPathI);
+  const mtimeBeforeI = fs.statSync(cooldownPathI).mtimeMs;
+  const cdpI2 = await mockCdp('__NO_TABS__', [{ id: 'interstitial1', url: interstitialUrl }], {
+    tabText: () => interstitialText,
+  });
+  const secondI = await runSalvageInHome(homeI, [MARKER, '3'], cdpI2.port);
+  const mtimeAfterI = fs.statSync(cooldownPathI).mtimeMs;
+  check('#208 gate r2 P1 interstitial: a repeat sighting of the same interstitial does not exit confirmed-absent (4)',
+    secondI.status === 7, `status=${secondI.status} stderr=${secondI.stderr?.slice(0, 300)}`);
+  check('#208 gate r2 P1 interstitial: a repeat sighting reports evidence-kind: inconclusive, naming the throttle surface',
+    /evidence-kind: inconclusive/.test(secondI.stderr || '') &&
+      /inconclusive: an unowned throttle surface was observed this scan/.test(secondI.stderr || ''),
+    `stderr=${secondI.stderr?.slice(0, 400)}`);
+  check('#208 gate r2 P1 interstitial: a repeat sighting does not rewrite the cooldown',
+    mtimeAfterI === mtimeBeforeI, `before=${mtimeBeforeI} after=${mtimeAfterI}`);
+  cdpI2.stop();
+  fs.rmSync(homeI, { recursive: true, force: true });
+
+  // Planted negative: the SAME two-invocation shape, but the page underneath carries ANOTHER
+  // run's exact marker — positively someone else's conversation, not merely "not proven to
+  // belong to us". That is the one case the P1 rule allows to be disregarded when deciding
+  // absence: a repeat sighting of it must still correctly reach the confirmed-absent exit 4.
+  const foreignInterstitialUrl = 'https://chatgpt.com/c/mock-foreign-interstitial-tab';
+  const reasoningFiller = Array.from({ length: 120 }, (_, i) =>
+    `Reviewed concurrency risks in module ${i}: lock ordering, retry budgets, and reservation TTL handling.`).join('\n');
+  const foreignModalText = "Too many requests. You're making requests too quickly. We've temporarily limited access to your conversations to protect your data.";
+  const foreignPageText = `${foreignModalText}\nrun marker: pg-run-other-9999999999-9\n${reasoningFiller}`;
+
+  const homeF = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const cdpF1 = await mockCdp('__NO_TABS__', [{ id: 'foreignint1', url: foreignInterstitialUrl }], {
+    tabText: () => foreignPageText,
+    throttleModal: () => foreignModalText,
+  });
+  const firstF = await runSalvageInHome(homeF, [MARKER, '3'], cdpF1.port);
+  check('#208 gate r2 P1 planted negative: first foreign-marked modal sighting takes the throttle exit (5)',
+    firstF.status === 5, `status=${firstF.status} stderr=${firstF.stderr?.slice(0, 200)}`);
+  cdpF1.stop();
+
+  const cdpF2 = await mockCdp('__NO_TABS__', [{ id: 'foreignint1', url: foreignInterstitialUrl }], {
+    tabText: () => foreignPageText,
+    throttleModal: () => foreignModalText,
+  });
+  const secondF = await runSalvageInHome(homeF, [MARKER, '3'], cdpF2.port);
+  check('#208 gate r2 P1 planted negative: a repeat sighting of a POSITIVELY FOREIGN modal still reaches confirmed-absent (4), not inconclusive',
+    secondF.status === 4, `status=${secondF.status} stderr=${secondF.stderr?.slice(0, 400)}`);
+  check('#208 gate r2 P1 planted negative: the repeat foreign sighting is not reported as inconclusive',
+    !/evidence-kind: inconclusive/.test(secondF.stderr || ''), `stderr=${secondF.stderr?.slice(0, 400)}`);
+  cdpF2.stop();
+  fs.rmSync(homeF, { recursive: true, force: true });
+}
+
+{ // #208 gate r2 P1 (organizer variant): "Apply the same rule to the organizer's
+  // throttled-but-ignored case if it can reach an absence-like conclusion." A single unowned,
+  // markerless throttle sighting with NO recovery URL at all (no memo, no open owned tab) charges
+  // the cooldown and reports reason=throttle on its first scan — already-working #162/#208
+  // behavior. A SECOND organizer scan of the exact same tab (nothing ever clears the
+  // interstitial) finds the sighting already charged and must not silently fall through to
+  // reason=owned-target-not-found, an absence-like conclusion that wrongly implies nothing was
+  // ever seen: it must keep reporting the inconclusive reason=throttle framing, without writing a
+  // NEW cooldown.
+  const title = 'pro-gate review: PR #208 organizer P1 [pro-gate]';
+  const orgInterstitialUrl = 'https://chatgpt.com/c/mock-organizer-interstitial';
+  const orgInterstitialText = "You're making requests too quickly. Please wait a few minutes before trying again.";
+  const oldMtimeOP1 = (p) => { const t = new Date(Date.now() - 3_600_000); fs.utimesSync(p, t, t); };
+
+  const homeOP1 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedOrganizer(MARKER, title)(homeOP1); // no memo url -> no recovery path at all
+
+  const cdpOP1a = await mockCdp('__NO_TABS__', [{ id: 'orgint1', url: orgInterstitialUrl }], {
+    tabText: () => orgInterstitialText,
+  });
+  const orgFirst = await runSalvageInHome(homeOP1, ['--organize', MARKER, '5'], cdpOP1a.port);
+  check('#208 gate r2 P1 organizer: first unowned interstitial sighting reports reason=throttle',
+    /reason=throttle/.test(orgFirst.stdout), `stdout=${orgFirst.stdout} stderr=${orgFirst.stderr?.slice(0, 300)}`);
+  check('#208 gate r2 P1 organizer: first sighting writes the cooldown',
+    orgFirst.cooldown !== null, `cooldown=${orgFirst.cooldown}`);
+  cdpOP1a.stop();
+
+  const cooldownPathOP1 = path.join(homeOP1, 'throttle.cooldown');
+  oldMtimeOP1(cooldownPathOP1);
+  const mtimeBeforeOP1 = fs.statSync(cooldownPathOP1).mtimeMs;
+  const cdpOP1b = await mockCdp('__NO_TABS__', [{ id: 'orgint1', url: orgInterstitialUrl }], {
+    tabText: () => orgInterstitialText,
+  });
+  const orgSecond = await runSalvageInHome(homeOP1, ['--organize', MARKER, '5'], cdpOP1b.port);
+  const mtimeAfterOP1 = fs.statSync(cooldownPathOP1).mtimeMs;
+  check('#208 gate r2 P1 organizer: a repeat sighting with no recovery URL still reports reason=throttle, not owned-target-not-found',
+    /reason=throttle/.test(orgSecond.stdout), `stdout=${orgSecond.stdout} stderr=${orgSecond.stderr?.slice(0, 300)}`);
+  check('#208 gate r2 P1 organizer: a repeat sighting does not rewrite the cooldown',
+    mtimeAfterOP1 === mtimeBeforeOP1, `before=${mtimeBeforeOP1} after=${mtimeAfterOP1}`);
+  cdpOP1b.stop();
+  fs.rmSync(homeOP1, { recursive: true, force: true });
+}
+
+{ // #208 gate r2 P2 (store level): concurrent scans (probe+harvest, or two overlapping probes)
+  // used to overwrite each other's remembered throttle sightings because the OLD sidecar
+  // (throttle.cooldown.seen) was loaded ONCE per invocation and rewritten WHOLESALE — a second
+  // writer's own load-then-mutate-then-rewrite could always land after the first's and silently
+  // drop whichever sighting lost the race. The fix replaces that single file with one
+  // independently-created record file per (url, hash) fingerprint
+  // (fs.writeFileSync(..., {flag:'wx'})), so two writers can never clobber each other and there
+  // is no shared in-memory snapshot to go stale. This proves the guarantee at the store level: a
+  // record written DIRECTLY (standing in for a concurrent writer) survives a REAL invocation's
+  // own in-flight charge untouched, and a later invocation recognizes that directly-written
+  // record as already charged instead of re-admitting it.
+  const recordAUrl = 'https://chatgpt.com/c/mock-race-record-a';
+  const recordAText = "You're making requests too quickly. [race fixture A]";
+  const recordCUrl = 'https://chatgpt.com/c/mock-race-record-c';
+  const recordCText = "You're making requests too quickly. [race fixture C]";
+  const recordBUrl = 'https://chatgpt.com/c/mock-race-record-b';
+  const recordBText = "You're making requests too quickly. [race fixture B]";
+
+  const homeRace = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  // A stands in for a fingerprint an earlier or sibling scan already charged.
+  seedThrottleSeen(homeRace, recordAUrl, recordAText);
+
+  // A REAL invocation admits B for a genuinely new sighting. Started but not yet awaited, so the
+  // synchronous injection of C below lands while B's scan is still in flight, mirroring a second
+  // concurrent writer racing the first.
+  const cdpRace = await mockCdp('__NO_TABS__', [{ id: 'race-b', url: recordBUrl }], {
+    tabText: () => recordBText,
+  });
+  const bPromise = runSalvageInHome(homeRace, [MARKER, '3'], cdpRace.port);
+  // A DIFFERENT writer's record, injected synchronously while B's scan is in flight.
+  seedThrottleSeen(homeRace, recordCUrl, recordCText);
+  const bResult = await bPromise;
+  cdpRace.stop();
+
+  check('#208 gate r2 P2 store: the real invocation admits its own new sighting (exit 5)',
+    bResult.status === 5, `status=${bResult.status} stderr=${bResult.stderr?.slice(0, 200)}`);
+  check('#208 gate r2 P2 store: A (seeded before the in-flight scan) survives untouched',
+    throttleSeenHas(homeRace, recordAUrl, recordAText),
+    `dir=${fs.existsSync(throttleSeenDir(homeRace)) ? fs.readdirSync(throttleSeenDir(homeRace)) : null}`);
+  check("#208 gate r2 P2 store: B (the in-flight scan's own new sighting) is durably recorded",
+    throttleSeenHas(homeRace, recordBUrl, recordBText),
+    `dir=${fs.existsSync(throttleSeenDir(homeRace)) ? fs.readdirSync(throttleSeenDir(homeRace)) : null}`);
+  check("#208 gate r2 P2 store: C (a concurrent writer's record injected mid-flight) is not clobbered by the in-flight scan's own write",
+    throttleSeenHas(homeRace, recordCUrl, recordCText),
+    `dir=${fs.existsSync(throttleSeenDir(homeRace)) ? fs.readdirSync(throttleSeenDir(homeRace)) : null}`);
+
+  // Planted "no re-charge" check: a follow-up invocation whose only tab carries C's EXACT
+  // fingerprint must recognize it as already charged and must not re-admit it (no throttle exit,
+  // no cooldown rewrite) — proving the read side recognizes a record written by any writer, not
+  // only ones this same process created.
+  const cooldownPathRace = path.join(homeRace, 'throttle.cooldown');
+  const oldMtimeRace = (p) => { const t = new Date(Date.now() - 3_600_000); fs.utimesSync(p, t, t); };
+  oldMtimeRace(cooldownPathRace);
+  const mtimeBeforeRace = fs.statSync(cooldownPathRace).mtimeMs;
+  const cdpFollowup = await mockCdp('__NO_TABS__', [{ id: 'race-c', url: recordCUrl }], {
+    tabText: () => recordCText,
+  });
+  const followup = await runSalvageInHome(homeRace, [MARKER, '3'], cdpFollowup.port);
+  const mtimeAfterRace = fs.statSync(cooldownPathRace).mtimeMs;
+  check("#208 gate r2 P2 store planted negative: a follow-up scan of C's exact fingerprint is not re-admitted",
+    followup.status !== 5, `status=${followup.status}`);
+  check("#208 gate r2 P2 store planted negative: a follow-up scan of C's exact fingerprint does not rewrite the cooldown",
+    mtimeAfterRace === mtimeBeforeRace, `before=${mtimeBeforeRace} after=${mtimeAfterRace}`);
+  cdpFollowup.stop();
+  fs.rmSync(homeRace, { recursive: true, force: true });
+}
+
+{ // #208 gate r2 P2 (batch, main scan): one already-open BATCH of >=2 distinct new unowned
+  // throttle modal sightings in a SINGLE scan must record every one of their fingerprints before
+  // exiting, not merely the first — the old whole-scan walk called process.exit(5) on the FIRST
+  // newly-admitted hit, so hit #2 was never charged and a later invocation re-admitted it as
+  // though it had never been seen (one already-observed batch cost N separate cooldowns, one
+  // newly-discovered tab at a time, instead of the ONE this single scan should have charged).
+  const batchUrlTwo = 'https://chatgpt.com/c/mock-batch-tab-two';
+  const batchModalOne = "You're making requests too quickly. [batch fixture one]";
+  const batchModalTwo = "You're making requests too quickly. [batch fixture two]";
+  const batchTextOne = `${batchModalOne}\nAccount limits.`;
+  const batchTextTwo = `${batchModalTwo}\nAccount limits.`;
+
+  const homeBatch = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const cdpBatch = await mockCdp(batchTextOne, [{ id: 'batch-two', url: batchUrlTwo }], {
+    tabText: (url) => (url === batchUrlTwo ? batchTextTwo : batchTextOne),
+    throttleModal: (id) => (id === 'batch-two' ? batchModalTwo : batchModalOne),
+  });
+  const batchFirst = await runSalvageInHome(homeBatch, [MARKER, '3'], cdpBatch.port);
+  check('#208 gate r2 P2 batch (main scan): the batch takes the throttle exit (5)',
+    batchFirst.status === 5, `status=${batchFirst.status} stderr=${batchFirst.stderr?.slice(0, 200)}`);
+  check('#208 gate r2 P2 batch (main scan): the FIRST tab in the batch is recorded in the seen sidecar',
+    throttleSeenHas(homeBatch, 'https://chatgpt.com/c/mock-conversation', batchModalOne),
+    `dir=${fs.existsSync(throttleSeenDir(homeBatch)) ? fs.readdirSync(throttleSeenDir(homeBatch)) : null}`);
+  check('#208 gate r2 P2 batch (main scan): the SECOND tab in the same batch is ALSO recorded, not left for a later invocation to rediscover',
+    throttleSeenHas(homeBatch, batchUrlTwo, batchModalTwo),
+    `dir=${fs.existsSync(throttleSeenDir(homeBatch)) ? fs.readdirSync(throttleSeenDir(homeBatch)) : null}`);
+  cdpBatch.stop();
+
+  // Follow-up scan of JUST the second tab (still open, same modal) — the definitive proof: if
+  // the batch's second hit was durably recorded during the FIRST scan (this fix), this repeat is
+  // recognized as already charged and does not re-admit it as though it had never been seen.
+  const cooldownPathBatch = path.join(homeBatch, 'throttle.cooldown');
+  const oldMtimeBatch = (p) => { const t = new Date(Date.now() - 3_600_000); fs.utimesSync(p, t, t); };
+  oldMtimeBatch(cooldownPathBatch);
+  const mtimeBeforeBatch = fs.statSync(cooldownPathBatch).mtimeMs;
+  const cdpBatchFollowup = await mockCdp('__NO_TABS__', [{ id: 'batch-two', url: batchUrlTwo }], {
+    tabText: () => batchTextTwo,
+    throttleModal: () => batchModalTwo,
+  });
+  const batchFollowup = await runSalvageInHome(homeBatch, [MARKER, '3'], cdpBatchFollowup.port);
+  const mtimeAfterBatch = fs.statSync(cooldownPathBatch).mtimeMs;
+  check("#208 gate r2 P2 batch (main scan): the batch's SECOND hit, recorded in the SAME first scan, is not re-admitted by a later scan",
+    batchFollowup.status !== 5, `status=${batchFollowup.status}`);
+  check('#208 gate r2 P2 batch (main scan): the follow-up scan of the second hit does not rewrite the cooldown',
+    mtimeAfterBatch === mtimeBeforeBatch, `before=${mtimeBeforeBatch} after=${mtimeAfterBatch}`);
+  cdpBatchFollowup.stop();
+  fs.rmSync(homeBatch, { recursive: true, force: true });
+}
+
+{ // #208 gate r2 P2 (batch, organizer variant): the same fix, applied to the organizer's
+  // throttleHits walk — a batch of >=2 distinct new unowned sightings in one organizer scan must
+  // record all of them before returning, not merely the first.
+  const title = 'pro-gate review: PR #208 organizer P2 batch [pro-gate]';
+  const orgBatchUrlTwo = 'https://chatgpt.com/c/mock-organizer-batch-two';
+  const orgBatchTextOne = "You're making requests too quickly. [organizer batch fixture one]";
+  const orgBatchTextTwo = "You're making requests too quickly. [organizer batch fixture two]";
+
+  const homeOrgBatch = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedOrganizer(MARKER, title)(homeOrgBatch);
+  const cdpOrgBatch = await mockCdp(orgBatchTextOne, [
+    { id: 'org-batch-two', url: orgBatchUrlTwo },
+  ], {
+    tabText: (url) => (url === orgBatchUrlTwo ? orgBatchTextTwo : orgBatchTextOne),
+  });
+  const orgBatchFirst = await runSalvageInHome(homeOrgBatch, ['--organize', MARKER, '5'], cdpOrgBatch.port);
+  check('#208 gate r2 P2 batch (organizer): the batch reports reason=throttle',
+    /reason=throttle/.test(orgBatchFirst.stdout), `stdout=${orgBatchFirst.stdout} stderr=${orgBatchFirst.stderr?.slice(0, 300)}`);
+  cdpOrgBatch.stop();
+
+  // Follow-up organizer scan of JUST the second tab: the definitive proof it was durably
+  // recorded during the first (batched) scan, not left for this scan to rediscover as new. The
+  // r2 P1 fix now makes reason=throttle appear on an ignored-but-inconclusive repeat too, so the
+  // discriminator here is the cooldown mtime and the "already charged" stderr line, not the
+  // reason field.
+  const cooldownPathOrgBatch = path.join(homeOrgBatch, 'throttle.cooldown');
+  const oldMtimeOrgBatch = (p) => { const t = new Date(Date.now() - 3_600_000); fs.utimesSync(p, t, t); };
+  oldMtimeOrgBatch(cooldownPathOrgBatch);
+  const mtimeBeforeOrgBatch = fs.statSync(cooldownPathOrgBatch).mtimeMs;
+  const cdpOrgBatchFollowup = await mockCdp('__NO_TABS__', [{ id: 'org-batch-two', url: orgBatchUrlTwo }], {
+    tabText: () => orgBatchTextTwo,
+  });
+  const orgBatchFollowup = await runSalvageInHome(homeOrgBatch, ['--organize', MARKER, '5'], cdpOrgBatchFollowup.port);
+  const mtimeAfterOrgBatch = fs.statSync(cooldownPathOrgBatch).mtimeMs;
+  check("#208 gate r2 P2 batch (organizer): the batch's SECOND hit, recorded in the SAME first scan, does not rewrite the cooldown on a later scan",
+    mtimeAfterOrgBatch === mtimeBeforeOrgBatch, `before=${mtimeBeforeOrgBatch} after=${mtimeAfterOrgBatch}`);
+  check('#208 gate r2 P2 batch (organizer): the follow-up scan names the second tab as already charged, not freshly charged',
+    orgBatchFollowup.stderr?.includes(`stale throttle modal on unowned tab ${orgBatchUrlTwo} already charged`),
+    `stderr=${orgBatchFollowup.stderr?.slice(0, 400)}`);
+  cdpOrgBatchFollowup.stop();
+  fs.rmSync(homeOrgBatch, { recursive: true, force: true });
+}
+
+{ // #208 gate r3 P2 (finding 1a): TWO markerless interstitials (no modal element on either tab)
+  // in the SAME scan must cost exactly one cooldown, batched together, not one cooldown per tab
+  // across separate invocations. Pre-fix, only the whole-scan MODAL fallback batched; a
+  // marker-less interstitial was still tripped one at a time by the per-tab loop, which called
+  // process.exit(5) on the FIRST hit — so the second tab's fingerprint was never even reached,
+  // let alone recorded, in the same scan.
+  const interstitialUrlOne = 'https://chatgpt.com/c/mock-interstitial-batch-one';
+  const interstitialUrlTwo = 'https://chatgpt.com/c/mock-interstitial-batch-two';
+  const interstitialTextOne = "You're making requests too quickly. [r3 interstitial batch one]";
+  const interstitialTextTwo = "You're making requests too quickly. [r3 interstitial batch two]";
+  const oldMtimeR3a = (p) => { const t = new Date(Date.now() - 3_600_000); fs.utimesSync(p, t, t); };
+
+  const homeR3a = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const cdpR3aFirst = await mockCdp('__NO_TABS__', [
+    { id: 'interstitial-one', url: interstitialUrlOne },
+    { id: 'interstitial-two', url: interstitialUrlTwo },
+  ], {
+    tabText: (url) => (url === interstitialUrlTwo ? interstitialTextTwo : interstitialTextOne),
+  });
+  const r3aFirst = await runSalvageInHome(homeR3a, [MARKER, '3'], cdpR3aFirst.port);
+  check('#208 gate r3 P2 (1a) a batch of two unowned interstitials takes the throttle exit (5)',
+    r3aFirst.status === 5, `status=${r3aFirst.status} stderr=${r3aFirst.stderr?.slice(0, 200)}`);
+  check('#208 gate r3 P2 (1a) the FIRST interstitial in the batch is recorded in the seen sidecar',
+    throttleSeenHas(homeR3a, interstitialUrlOne, interstitialTextOne),
+    `dir=${fs.existsSync(throttleSeenDir(homeR3a)) ? fs.readdirSync(throttleSeenDir(homeR3a)) : null}`);
+  check('#208 gate r3 P2 (1a) the SECOND interstitial in the SAME scan is ALSO recorded, not left for a later invocation to rediscover',
+    throttleSeenHas(homeR3a, interstitialUrlTwo, interstitialTextTwo),
+    `dir=${fs.existsSync(throttleSeenDir(homeR3a)) ? fs.readdirSync(throttleSeenDir(homeR3a)) : null}`);
+  cdpR3aFirst.stop();
+
+  // Follow-up scan of BOTH tabs, unchanged: the definitive proof. If the second tab's
+  // fingerprint was durably recorded during the FIRST scan (this fix), this repeat recognizes
+  // both as already charged and writes no second cooldown.
+  const cooldownPathR3a = path.join(homeR3a, 'throttle.cooldown');
+  oldMtimeR3a(cooldownPathR3a);
+  const mtimeBeforeR3a = fs.statSync(cooldownPathR3a).mtimeMs;
+  const cdpR3aSecond = await mockCdp('__NO_TABS__', [
+    { id: 'interstitial-one', url: interstitialUrlOne },
+    { id: 'interstitial-two', url: interstitialUrlTwo },
+  ], {
+    tabText: (url) => (url === interstitialUrlTwo ? interstitialTextTwo : interstitialTextOne),
+  });
+  const r3aSecond = await runSalvageInHome(homeR3a, [MARKER, '3'], cdpR3aSecond.port);
+  const mtimeAfterR3a = fs.statSync(cooldownPathR3a).mtimeMs;
+  check('#208 gate r3 P2 (1a) a follow-up scan of both unchanged interstitials does not take the throttle exit',
+    r3aSecond.status !== 5, `status=${r3aSecond.status}`);
+  check('#208 gate r3 P2 (1a) a follow-up scan of both unchanged interstitials does not rewrite the cooldown',
+    mtimeAfterR3a === mtimeBeforeR3a, `before=${mtimeBeforeR3a} after=${mtimeAfterR3a}`);
+  cdpR3aSecond.stop();
+  fs.rmSync(homeR3a, { recursive: true, force: true });
+}
+
+{ // #208 gate r3 P2 (finding 1b): a MIXED batch — one modal hit and one marker-less interstitial
+  // hit on a DIFFERENT tab, both new in the same scan — must also cost exactly one cooldown.
+  // Pre-fix, the modal hit alone tripped the whole-scan modal fallback and called
+  // process.exit(5) immediately, so the per-tab loop (where the interstitial hit was tripped)
+  // never even ran in that same process: the interstitial's fingerprint was never recorded,
+  // costing its own separate cooldown on the very next invocation.
+  const mixedModalUrl = 'https://chatgpt.com/c/mock-mixed-modal';
+  const mixedInterstitialUrl = 'https://chatgpt.com/c/mock-mixed-interstitial';
+  const mixedModalText = "You're making requests too quickly. [r3 mixed modal]";
+  const mixedInterstitialText = "You're making requests too quickly. [r3 mixed interstitial]";
+  const oldMtimeR3b = (p) => { const t = new Date(Date.now() - 3_600_000); fs.utimesSync(p, t, t); };
+
+  const homeR3b = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const cdpR3bFirst = await mockCdp('__NO_TABS__', [
+    { id: 'mixed-modal', url: mixedModalUrl },
+    { id: 'mixed-interstitial', url: mixedInterstitialUrl },
+  ], {
+    tabText: (url) => (url === mixedInterstitialUrl ? mixedInterstitialText : mixedModalText),
+    throttleModal: (id) => (id === 'mixed-modal' ? mixedModalText : null),
+  });
+  const r3bFirst = await runSalvageInHome(homeR3b, [MARKER, '3'], cdpR3bFirst.port);
+  check('#208 gate r3 P2 (1b) a mixed modal+interstitial batch takes the throttle exit (5)',
+    r3bFirst.status === 5, `status=${r3bFirst.status} stderr=${r3bFirst.stderr?.slice(0, 200)}`);
+  check('#208 gate r3 P2 (1b) the modal hit is recorded in the seen sidecar (fingerprint = modal text)',
+    throttleSeenHas(homeR3b, mixedModalUrl, mixedModalText),
+    `dir=${fs.existsSync(throttleSeenDir(homeR3b)) ? fs.readdirSync(throttleSeenDir(homeR3b)) : null}`);
+  check('#208 gate r3 P2 (1b) the interstitial hit on the OTHER tab is ALSO recorded in the SAME scan (fingerprint = page text)',
+    throttleSeenHas(homeR3b, mixedInterstitialUrl, mixedInterstitialText),
+    `dir=${fs.existsSync(throttleSeenDir(homeR3b)) ? fs.readdirSync(throttleSeenDir(homeR3b)) : null}`);
+  cdpR3bFirst.stop();
+
+  const cooldownPathR3b = path.join(homeR3b, 'throttle.cooldown');
+  oldMtimeR3b(cooldownPathR3b);
+  const mtimeBeforeR3b = fs.statSync(cooldownPathR3b).mtimeMs;
+  const cdpR3bSecond = await mockCdp('__NO_TABS__', [
+    { id: 'mixed-modal', url: mixedModalUrl },
+    { id: 'mixed-interstitial', url: mixedInterstitialUrl },
+  ], {
+    tabText: (url) => (url === mixedInterstitialUrl ? mixedInterstitialText : mixedModalText),
+    throttleModal: (id) => (id === 'mixed-modal' ? mixedModalText : null),
+  });
+  const r3bSecond = await runSalvageInHome(homeR3b, [MARKER, '3'], cdpR3bSecond.port);
+  const mtimeAfterR3b = fs.statSync(cooldownPathR3b).mtimeMs;
+  check('#208 gate r3 P2 (1b) a follow-up scan of the same unchanged mixed batch does not take the throttle exit',
+    r3bSecond.status !== 5, `status=${r3bSecond.status}`);
+  check('#208 gate r3 P2 (1b) a follow-up scan of the same unchanged mixed batch does not rewrite the cooldown',
+    mtimeAfterR3b === mtimeBeforeR3b, `before=${mtimeBeforeR3b} after=${mtimeAfterR3b}`);
+  cdpR3bSecond.stop();
+  fs.rmSync(homeR3b, { recursive: true, force: true });
+}
+
+{ // #208 gate r3 P2 (finding 2a): PRO_GATE_THROTTLE_SEEN_MAX must actually change the enforced
+  // cap. Pre-fix the constant is a hardcoded 512, so setting the env var has NO effect at all —
+  // this only shows up once the on-disk count exceeds whichever cap really governs, so seed
+  // three unrelated dummy fingerprints (below the true default of 512, but above an override of
+  // 2) and fire the prune via one unrelated trigger hit. Pre-fix: all three dummies survive
+  // (3 is nowhere near the hardcoded 512). Post-fix with the override honored: cap=2 trims the
+  // three down to two survivors.
+  const homeOverride = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const overrideDummyUrl = (i) => `https://chatgpt.com/c/mock-cap-override-dummy-${i}`;
+  const overrideDummyText = (i) => `dummy filler text ${i} unrelated to this scan`;
+  for (let i = 0; i < 3; i += 1) seedThrottleSeen(homeOverride, overrideDummyUrl(i), overrideDummyText(i));
+  const overrideTriggerUrl = 'https://chatgpt.com/c/mock-cap-override-trigger';
+  const overrideTriggerText = "You're making requests too quickly. [r3 cap-override trigger]";
+  const cdpOverride = await mockCdp('__NO_TABS__', [{ id: 'override-trigger', url: overrideTriggerUrl }], {
+    tabText: () => overrideTriggerText, throttleModal: () => overrideTriggerText,
+  });
+  await runSalvageInHome(homeOverride, [MARKER, '3'], cdpOverride.port, { PRO_GATE_THROTTLE_SEEN_MAX: '2' });
+  cdpOverride.stop();
+  const overrideSurvivors = [0, 1, 2].filter((i) => throttleSeenHas(homeOverride, overrideDummyUrl(i), overrideDummyText(i))).length;
+  check('#208 gate r3 P2 (2a) PRO_GATE_THROTTLE_SEEN_MAX=2 trims three unrelated fingerprints down to two survivors',
+    overrideSurvivors === 2,
+    `survivors=${overrideSurvivors} dir=${fs.existsSync(throttleSeenDir(homeOverride)) ? fs.readdirSync(throttleSeenDir(homeOverride)) : null}`);
+  fs.rmSync(homeOverride, { recursive: true, force: true });
+}
+
+{ // #208 gate r3 P2 (finding 2b): the capacity trim must never evict a fingerprint the CURRENT
+  // scan itself is about to check, even at the true DEFAULT cap of 512 (no override involved).
+  // Simulate "this exact three-tab batch was already charged in an earlier scan" by seeding
+  // their three records directly with an older mtime, then pad the sidecar with 510 unrelated,
+  // NEWER-mtime filler records so the total (513) exceeds 512 by exactly one. When this
+  // unchanged batch is rescanned: pre-fix, the prune (no notion of "currently observed") evicts
+  // the globally oldest record — one of THIS batch's own three, because the 510 filler records
+  // are all newer — the evicted tab then reads as newly-charged and the batch wrongly re-trips
+  // the throttle exit (5) for a completely unchanged set of stale tabs. Post-fix, all three
+  // batch fingerprints are protected before the prune ever runs, so only the 510 (below-cap)
+  // filler records are eligible, nothing is evicted, and the unchanged batch costs no new charge.
+  const homeDefault = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const defCapUrlOne = 'https://chatgpt.com/c/mock-cap512-one';
+  const defCapUrlTwo = 'https://chatgpt.com/c/mock-cap512-two';
+  const defCapUrlThree = 'https://chatgpt.com/c/mock-cap512-three';
+  const defCapModalText = "You're making requests too quickly. [r3 cap-512 fixture]";
+  const defBatch = [
+    [defCapUrlOne, defCapModalText],
+    [defCapUrlTwo, defCapModalText],
+    [defCapUrlThree, defCapModalText],
+  ];
+  const oldBatchMtime = new Date(Date.now() - 600_000); // 10 minutes ago: "already charged earlier"
+  for (const [url, text] of defBatch) {
+    seedThrottleSeen(homeDefault, url, text);
+    const p = throttleSeenRecordPath(homeDefault, url, text);
+    fs.utimesSync(p, oldBatchMtime, oldBatchMtime);
+  }
+  // 510 unrelated filler records, seeded with the default (fresh, "now") mtime — newer than the
+  // batch above — pushing the sidecar to 513 total (512 default cap + 1).
+  for (let i = 0; i < 510; i += 1) {
+    seedThrottleSeen(homeDefault, `https://chatgpt.com/c/mock-cap512-filler-${i}`, `filler text ${i}`);
+  }
+  const batchMtimesBefore = defBatch.map(([url, text]) => fs.statSync(throttleSeenRecordPath(homeDefault, url, text)).mtimeMs);
+
+  const cdpDefault = await mockCdp('__NO_TABS__', [
+    { id: 'cap512-one', url: defCapUrlOne },
+    { id: 'cap512-two', url: defCapUrlTwo },
+    { id: 'cap512-three', url: defCapUrlThree },
+  ], { tabText: () => defCapModalText, throttleModal: () => defCapModalText });
+  const rescan = await runSalvageInHome(homeDefault, [MARKER, '3'], cdpDefault.port);
+  cdpDefault.stop();
+  const batchMtimesAfter = defBatch.map(([url, text]) => fs.statSync(throttleSeenRecordPath(homeDefault, url, text)).mtimeMs);
+
+  check('#208 gate r3 P2 (2b) rescanning the same unchanged three-tab batch above the default cap does not take the throttle exit',
+    rescan.status !== 5, `status=${rescan.status} stderr=${rescan.stderr?.slice(0, 300)}`);
+  check('#208 gate r3 P2 (2b) none of the three batch fingerprints were evicted-and-recreated (mtimes unchanged)',
+    batchMtimesBefore.every((t, i) => t === batchMtimesAfter[i]),
+    `before=${JSON.stringify(batchMtimesBefore)} after=${JSON.stringify(batchMtimesAfter)}`);
+  fs.rmSync(homeDefault, { recursive: true, force: true });
 }
 
 // v0.42 (#109): a synthetic placeholder such as https://chatgpt.com/c/WEB:<uuid> once passed the
