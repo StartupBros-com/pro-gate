@@ -832,6 +832,15 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
     [ "$MODE" = remote-chrome ] || return 0
     [ "${PRO_GATE_KEEP_TABS:-0}" = 1 ] && return 0
     command -v node >/dev/null 2>&1 || return 0
+    # #206 gate r7 P2: a run can be superseded before the delayed early organizer ever memoizes
+    # its conversation URL (disabled, failed, or simply not yet reached). Closing that tab blind
+    # would leave NEITHER an open tab NOR a conversation-urls/<marker> memo, so a later
+    # marker-addressed --harvest would have no handle at all -- breaking the superseded-but-
+    # still-collectable contract (an audit harvest of a paid review). Require a remembered,
+    # shape-valid URL (pg_conversation_url_read, mirroring cdp-salvage.mjs's own recallUrl /
+    # CONVERSATION_URL_RE) before ever asking to close; leave the tab open -- the same
+    # pre-#206 behavior -- when the memo is absent or invalid.
+    [ -n "$(pg_conversation_url_read "$marker" 2>/dev/null)" ] || return 0
     timeout 30 node "$SELF/cdp-salvage.mjs" --close "$marker" 25 "${ORACLE_BROWSER_PORT:-9222}" >/dev/null 2>/dev/null
     return 0
   }
