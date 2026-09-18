@@ -505,11 +505,20 @@ function throttleAlreadyCharged(url, hash) {
 // throttleAlreadyCharged and reaching here — the exact race #208 gate r2 P2 closes. Either way
 // the record exists once this returns (best-effort on mkdir/write failure, same as every other
 // sidecar write in this file).
-function recordThrottleSeen(url, hash) {
+function recordThrottleSeen(url, hash) {  // -> true when THIS call may charge the sighting
   try {
     fs.mkdirSync(THROTTLE_SEEN_DIR, { recursive: true });
     fs.writeFileSync(throttleSeenRecordPath(url, hash), '', { flag: 'wx' });
-  } catch {}
+    return true;
+  } catch (err) {
+    // EEXIST: another invocation won the race for this exact fingerprint between the caller's
+    // pre-check and this write, and it is the one charging the cooldown — this call must treat
+    // the sighting as already charged (local skeptic on gate r2: two racers both returning
+    // "new" would each write a cooldown). Any OTHER failure keeps the best-effort rule every
+    // sidecar write in this file follows: charge anyway, so a sidecar problem can never silence
+    // a real throttle.
+    return err?.code !== 'EEXIST';
+  }
 }
 // #208 gate r2 P1: true once ANY throttle surface not proven to belong to another run (no
 // FOREIGN exact marker readable in its text) was observed this invocation — set inside
@@ -538,14 +547,16 @@ let inconclusiveThrottleWhere = null;
 function tripThrottleUnowned(url, text, where, foreign = false) {
   const hash = throttleTextHash(text);
   if (!foreign) {
+    // Name the FIRST surface that made this scan inconclusive; later hits keep the flag set.
+    if (!inconclusiveThrottleSeen) inconclusiveThrottleWhere = where;
     inconclusiveThrottleSeen = true;
-    inconclusiveThrottleWhere = where;
   }
-  if (throttleAlreadyCharged(url, hash)) {
+  // The pre-check answers the common case cheaply; the 'wx' create is the authority for the
+  // race window after it (exactly one of two simultaneous racers wins and charges).
+  if (throttleAlreadyCharged(url, hash) || !recordThrottleSeen(url, hash)) {
     console.error(`stale throttle modal on unowned tab ${url} already charged; ignoring (${where})`);
     return false;
   }
-  recordThrottleSeen(url, hash);
   return true;
 }
 // #208 gate r2 P2: charge EVERY genuinely new sighting in `hits` (not merely the first) before
