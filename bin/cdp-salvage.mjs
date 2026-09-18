@@ -1597,10 +1597,10 @@ while (Date.now() < deadline) {
     // check for the SAME tab would fingerprint it a second way (whole page text, not the modal
     // text) and the two fingerprints would alternate the cooldown forever instead of converging.
     // isThrottlePage requires no run marker at all (ours or foreign), so a hit here is always
-    // unowned — route it through the dedupe gate (#208) before charging another cooldown.
-    // throttleModal ?? text keeps this fingerprint in lockstep with every other unowned trip
-    // site even in the case this branch never actually sees a modal-bearing tab.
-    if (!throttleModal && isThrottlePage(text) && tripThrottleUnowned(tab.url, throttleModal ?? text, `tab ${tab.url}`)) tripThrottle(`tab ${tab.url}`);
+    // unowned — route it through the dedupe gate (#208) before charging another cooldown. The
+    // fingerprint is the page text BY CONSTRUCTION: the !throttleModal guard means no modal text
+    // exists for this tab, so this is the same value every other unowned trip site would use.
+    if (!throttleModal && isThrottlePage(text) && tripThrottleUnowned(tab.url, text, `tab ${tab.url}`)) tripThrottle(`tab ${tab.url}`);
     // v0.28 (gate #54 r2): honor the per-marker blacklist for OPEN tabs too, not only
     // re-renders. The engine appends here when a capture from this URL failed the provenance
     // check — even a marker-bearing tab must be skipped then, or every later harvest replays
