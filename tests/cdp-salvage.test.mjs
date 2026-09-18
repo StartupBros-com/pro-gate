@@ -4128,6 +4128,185 @@ const FOREIGN_ANSWER = (m) => [
   fs.rmSync(homeOrgBatch, { recursive: true, force: true });
 }
 
+{ // #208 gate r3 P2 (finding 1a): TWO markerless interstitials (no modal element on either tab)
+  // in the SAME scan must cost exactly one cooldown, batched together, not one cooldown per tab
+  // across separate invocations. Pre-fix, only the whole-scan MODAL fallback batched; a
+  // marker-less interstitial was still tripped one at a time by the per-tab loop, which called
+  // process.exit(5) on the FIRST hit — so the second tab's fingerprint was never even reached,
+  // let alone recorded, in the same scan.
+  const interstitialUrlOne = 'https://chatgpt.com/c/mock-interstitial-batch-one';
+  const interstitialUrlTwo = 'https://chatgpt.com/c/mock-interstitial-batch-two';
+  const interstitialTextOne = "You're making requests too quickly. [r3 interstitial batch one]";
+  const interstitialTextTwo = "You're making requests too quickly. [r3 interstitial batch two]";
+  const oldMtimeR3a = (p) => { const t = new Date(Date.now() - 3_600_000); fs.utimesSync(p, t, t); };
+
+  const homeR3a = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const cdpR3aFirst = await mockCdp('__NO_TABS__', [
+    { id: 'interstitial-one', url: interstitialUrlOne },
+    { id: 'interstitial-two', url: interstitialUrlTwo },
+  ], {
+    tabText: (url) => (url === interstitialUrlTwo ? interstitialTextTwo : interstitialTextOne),
+  });
+  const r3aFirst = await runSalvageInHome(homeR3a, [MARKER, '3'], cdpR3aFirst.port);
+  check('#208 gate r3 P2 (1a) a batch of two unowned interstitials takes the throttle exit (5)',
+    r3aFirst.status === 5, `status=${r3aFirst.status} stderr=${r3aFirst.stderr?.slice(0, 200)}`);
+  check('#208 gate r3 P2 (1a) the FIRST interstitial in the batch is recorded in the seen sidecar',
+    throttleSeenHas(homeR3a, interstitialUrlOne, interstitialTextOne),
+    `dir=${fs.existsSync(throttleSeenDir(homeR3a)) ? fs.readdirSync(throttleSeenDir(homeR3a)) : null}`);
+  check('#208 gate r3 P2 (1a) the SECOND interstitial in the SAME scan is ALSO recorded, not left for a later invocation to rediscover',
+    throttleSeenHas(homeR3a, interstitialUrlTwo, interstitialTextTwo),
+    `dir=${fs.existsSync(throttleSeenDir(homeR3a)) ? fs.readdirSync(throttleSeenDir(homeR3a)) : null}`);
+  cdpR3aFirst.stop();
+
+  // Follow-up scan of BOTH tabs, unchanged: the definitive proof. If the second tab's
+  // fingerprint was durably recorded during the FIRST scan (this fix), this repeat recognizes
+  // both as already charged and writes no second cooldown.
+  const cooldownPathR3a = path.join(homeR3a, 'throttle.cooldown');
+  oldMtimeR3a(cooldownPathR3a);
+  const mtimeBeforeR3a = fs.statSync(cooldownPathR3a).mtimeMs;
+  const cdpR3aSecond = await mockCdp('__NO_TABS__', [
+    { id: 'interstitial-one', url: interstitialUrlOne },
+    { id: 'interstitial-two', url: interstitialUrlTwo },
+  ], {
+    tabText: (url) => (url === interstitialUrlTwo ? interstitialTextTwo : interstitialTextOne),
+  });
+  const r3aSecond = await runSalvageInHome(homeR3a, [MARKER, '3'], cdpR3aSecond.port);
+  const mtimeAfterR3a = fs.statSync(cooldownPathR3a).mtimeMs;
+  check('#208 gate r3 P2 (1a) a follow-up scan of both unchanged interstitials does not take the throttle exit',
+    r3aSecond.status !== 5, `status=${r3aSecond.status}`);
+  check('#208 gate r3 P2 (1a) a follow-up scan of both unchanged interstitials does not rewrite the cooldown',
+    mtimeAfterR3a === mtimeBeforeR3a, `before=${mtimeBeforeR3a} after=${mtimeAfterR3a}`);
+  cdpR3aSecond.stop();
+  fs.rmSync(homeR3a, { recursive: true, force: true });
+}
+
+{ // #208 gate r3 P2 (finding 1b): a MIXED batch — one modal hit and one marker-less interstitial
+  // hit on a DIFFERENT tab, both new in the same scan — must also cost exactly one cooldown.
+  // Pre-fix, the modal hit alone tripped the whole-scan modal fallback and called
+  // process.exit(5) immediately, so the per-tab loop (where the interstitial hit was tripped)
+  // never even ran in that same process: the interstitial's fingerprint was never recorded,
+  // costing its own separate cooldown on the very next invocation.
+  const mixedModalUrl = 'https://chatgpt.com/c/mock-mixed-modal';
+  const mixedInterstitialUrl = 'https://chatgpt.com/c/mock-mixed-interstitial';
+  const mixedModalText = "You're making requests too quickly. [r3 mixed modal]";
+  const mixedInterstitialText = "You're making requests too quickly. [r3 mixed interstitial]";
+  const oldMtimeR3b = (p) => { const t = new Date(Date.now() - 3_600_000); fs.utimesSync(p, t, t); };
+
+  const homeR3b = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const cdpR3bFirst = await mockCdp('__NO_TABS__', [
+    { id: 'mixed-modal', url: mixedModalUrl },
+    { id: 'mixed-interstitial', url: mixedInterstitialUrl },
+  ], {
+    tabText: (url) => (url === mixedInterstitialUrl ? mixedInterstitialText : mixedModalText),
+    throttleModal: (id) => (id === 'mixed-modal' ? mixedModalText : null),
+  });
+  const r3bFirst = await runSalvageInHome(homeR3b, [MARKER, '3'], cdpR3bFirst.port);
+  check('#208 gate r3 P2 (1b) a mixed modal+interstitial batch takes the throttle exit (5)',
+    r3bFirst.status === 5, `status=${r3bFirst.status} stderr=${r3bFirst.stderr?.slice(0, 200)}`);
+  check('#208 gate r3 P2 (1b) the modal hit is recorded in the seen sidecar (fingerprint = modal text)',
+    throttleSeenHas(homeR3b, mixedModalUrl, mixedModalText),
+    `dir=${fs.existsSync(throttleSeenDir(homeR3b)) ? fs.readdirSync(throttleSeenDir(homeR3b)) : null}`);
+  check('#208 gate r3 P2 (1b) the interstitial hit on the OTHER tab is ALSO recorded in the SAME scan (fingerprint = page text)',
+    throttleSeenHas(homeR3b, mixedInterstitialUrl, mixedInterstitialText),
+    `dir=${fs.existsSync(throttleSeenDir(homeR3b)) ? fs.readdirSync(throttleSeenDir(homeR3b)) : null}`);
+  cdpR3bFirst.stop();
+
+  const cooldownPathR3b = path.join(homeR3b, 'throttle.cooldown');
+  oldMtimeR3b(cooldownPathR3b);
+  const mtimeBeforeR3b = fs.statSync(cooldownPathR3b).mtimeMs;
+  const cdpR3bSecond = await mockCdp('__NO_TABS__', [
+    { id: 'mixed-modal', url: mixedModalUrl },
+    { id: 'mixed-interstitial', url: mixedInterstitialUrl },
+  ], {
+    tabText: (url) => (url === mixedInterstitialUrl ? mixedInterstitialText : mixedModalText),
+    throttleModal: (id) => (id === 'mixed-modal' ? mixedModalText : null),
+  });
+  const r3bSecond = await runSalvageInHome(homeR3b, [MARKER, '3'], cdpR3bSecond.port);
+  const mtimeAfterR3b = fs.statSync(cooldownPathR3b).mtimeMs;
+  check('#208 gate r3 P2 (1b) a follow-up scan of the same unchanged mixed batch does not take the throttle exit',
+    r3bSecond.status !== 5, `status=${r3bSecond.status}`);
+  check('#208 gate r3 P2 (1b) a follow-up scan of the same unchanged mixed batch does not rewrite the cooldown',
+    mtimeAfterR3b === mtimeBeforeR3b, `before=${mtimeBeforeR3b} after=${mtimeAfterR3b}`);
+  cdpR3bSecond.stop();
+  fs.rmSync(homeR3b, { recursive: true, force: true });
+}
+
+{ // #208 gate r3 P2 (finding 2a): PRO_GATE_THROTTLE_SEEN_MAX must actually change the enforced
+  // cap. Pre-fix the constant is a hardcoded 512, so setting the env var has NO effect at all —
+  // this only shows up once the on-disk count exceeds whichever cap really governs, so seed
+  // three unrelated dummy fingerprints (below the true default of 512, but above an override of
+  // 2) and fire the prune via one unrelated trigger hit. Pre-fix: all three dummies survive
+  // (3 is nowhere near the hardcoded 512). Post-fix with the override honored: cap=2 trims the
+  // three down to two survivors.
+  const homeOverride = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const overrideDummyUrl = (i) => `https://chatgpt.com/c/mock-cap-override-dummy-${i}`;
+  const overrideDummyText = (i) => `dummy filler text ${i} unrelated to this scan`;
+  for (let i = 0; i < 3; i += 1) seedThrottleSeen(homeOverride, overrideDummyUrl(i), overrideDummyText(i));
+  const overrideTriggerUrl = 'https://chatgpt.com/c/mock-cap-override-trigger';
+  const overrideTriggerText = "You're making requests too quickly. [r3 cap-override trigger]";
+  const cdpOverride = await mockCdp('__NO_TABS__', [{ id: 'override-trigger', url: overrideTriggerUrl }], {
+    tabText: () => overrideTriggerText, throttleModal: () => overrideTriggerText,
+  });
+  await runSalvageInHome(homeOverride, [MARKER, '3'], cdpOverride.port, { PRO_GATE_THROTTLE_SEEN_MAX: '2' });
+  cdpOverride.stop();
+  const overrideSurvivors = [0, 1, 2].filter((i) => throttleSeenHas(homeOverride, overrideDummyUrl(i), overrideDummyText(i))).length;
+  check('#208 gate r3 P2 (2a) PRO_GATE_THROTTLE_SEEN_MAX=2 trims three unrelated fingerprints down to two survivors',
+    overrideSurvivors === 2,
+    `survivors=${overrideSurvivors} dir=${fs.existsSync(throttleSeenDir(homeOverride)) ? fs.readdirSync(throttleSeenDir(homeOverride)) : null}`);
+  fs.rmSync(homeOverride, { recursive: true, force: true });
+}
+
+{ // #208 gate r3 P2 (finding 2b): the capacity trim must never evict a fingerprint the CURRENT
+  // scan itself is about to check, even at the true DEFAULT cap of 512 (no override involved).
+  // Simulate "this exact three-tab batch was already charged in an earlier scan" by seeding
+  // their three records directly with an older mtime, then pad the sidecar with 510 unrelated,
+  // NEWER-mtime filler records so the total (513) exceeds 512 by exactly one. When this
+  // unchanged batch is rescanned: pre-fix, the prune (no notion of "currently observed") evicts
+  // the globally oldest record — one of THIS batch's own three, because the 510 filler records
+  // are all newer — the evicted tab then reads as newly-charged and the batch wrongly re-trips
+  // the throttle exit (5) for a completely unchanged set of stale tabs. Post-fix, all three
+  // batch fingerprints are protected before the prune ever runs, so only the 510 (below-cap)
+  // filler records are eligible, nothing is evicted, and the unchanged batch costs no new charge.
+  const homeDefault = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const defCapUrlOne = 'https://chatgpt.com/c/mock-cap512-one';
+  const defCapUrlTwo = 'https://chatgpt.com/c/mock-cap512-two';
+  const defCapUrlThree = 'https://chatgpt.com/c/mock-cap512-three';
+  const defCapModalText = "You're making requests too quickly. [r3 cap-512 fixture]";
+  const defBatch = [
+    [defCapUrlOne, defCapModalText],
+    [defCapUrlTwo, defCapModalText],
+    [defCapUrlThree, defCapModalText],
+  ];
+  const oldBatchMtime = new Date(Date.now() - 600_000); // 10 minutes ago: "already charged earlier"
+  for (const [url, text] of defBatch) {
+    seedThrottleSeen(homeDefault, url, text);
+    const p = throttleSeenRecordPath(homeDefault, url, text);
+    fs.utimesSync(p, oldBatchMtime, oldBatchMtime);
+  }
+  // 510 unrelated filler records, seeded with the default (fresh, "now") mtime — newer than the
+  // batch above — pushing the sidecar to 513 total (512 default cap + 1).
+  for (let i = 0; i < 510; i += 1) {
+    seedThrottleSeen(homeDefault, `https://chatgpt.com/c/mock-cap512-filler-${i}`, `filler text ${i}`);
+  }
+  const batchMtimesBefore = defBatch.map(([url, text]) => fs.statSync(throttleSeenRecordPath(homeDefault, url, text)).mtimeMs);
+
+  const cdpDefault = await mockCdp('__NO_TABS__', [
+    { id: 'cap512-one', url: defCapUrlOne },
+    { id: 'cap512-two', url: defCapUrlTwo },
+    { id: 'cap512-three', url: defCapUrlThree },
+  ], { tabText: () => defCapModalText, throttleModal: () => defCapModalText });
+  const rescan = await runSalvageInHome(homeDefault, [MARKER, '3'], cdpDefault.port);
+  cdpDefault.stop();
+  const batchMtimesAfter = defBatch.map(([url, text]) => fs.statSync(throttleSeenRecordPath(homeDefault, url, text)).mtimeMs);
+
+  check('#208 gate r3 P2 (2b) rescanning the same unchanged three-tab batch above the default cap does not take the throttle exit',
+    rescan.status !== 5, `status=${rescan.status} stderr=${rescan.stderr?.slice(0, 300)}`);
+  check('#208 gate r3 P2 (2b) none of the three batch fingerprints were evicted-and-recreated (mtimes unchanged)',
+    batchMtimesBefore.every((t, i) => t === batchMtimesAfter[i]),
+    `before=${JSON.stringify(batchMtimesBefore)} after=${JSON.stringify(batchMtimesAfter)}`);
+  fs.rmSync(homeDefault, { recursive: true, force: true });
+}
+
 // v0.42 (#109): a synthetic placeholder such as https://chatgpt.com/c/WEB:<uuid> once passed the
 // prefix-only memo check, was remembered as authoritative, and parked its run forever: the page
 // behind it carries no marker, so every later pass was inconclusive and never counted a miss.

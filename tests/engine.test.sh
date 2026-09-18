@@ -8032,6 +8032,27 @@ CHOICE_2LF_RC=$?
 check '#203: a selection file with two trailing newlines still stops closed at invalid-named-choice' \
   "$([ "$CHOICE_2LF_RC" -eq 0 ] && jq -e '.action=="stop-without-new-review" and (.action!="run-granted-review")' "$TDIR/choice-selected-2lf.json" >/dev/null 2>&1; echo $?)" \
   "rc=$CHOICE_2LF_RC output=$(cat "$TDIR/choice-selected-2lf.json") stderr=$(cat "$TDIR/choice-selected-2lf.err")"
+# #203 gate r3 P2: bash command substitution silently DROPS NUL bytes, so the pre-fix
+# raw-string comparison let a canonical selection followed by a NUL, or a selected_id carrying
+# an embedded NUL, compare equal to the canonicalized (NUL-stripped) value and pass as though the
+# file held nothing but canonical bytes. Both must now stop closed just like the two-trailing-
+# newline case above; the byte-canonical decision is against the file's actual on-disk bytes.
+printf '%s\x00' "$(jq -cnS --arg id keep --arg snap "$CHOICE_SNAPSHOT" '{selected_id:$id,snapshot_digest:$snap}')" > "$TDIR/choice-selection-trailing-nul.json"
+env PRO_GATE_HOME="$CHOICE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+  bash "$ENGINE" --review-decision --json --review-choice-selection "$TDIR/choice-selection-trailing-nul.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
+  >"$TDIR/choice-selected-trailing-nul.json" 2>"$TDIR/choice-selected-trailing-nul.err"
+CHOICE_TRAILING_NUL_RC=$?
+check '#203 gate r3 P2: a selection file with a trailing NUL byte stops closed at invalid-named-choice' \
+  "$([ "$CHOICE_TRAILING_NUL_RC" -eq 0 ] && jq -e '.action=="stop-without-new-review" and (.action!="run-granted-review")' "$TDIR/choice-selected-trailing-nul.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$CHOICE_TRAILING_NUL_RC output=$(cat "$TDIR/choice-selected-trailing-nul.json") stderr=$(cat "$TDIR/choice-selected-trailing-nul.err")"
+printf '{"selected_id":"ke\x00ep","snapshot_digest":"%s"}' "$CHOICE_SNAPSHOT" > "$TDIR/choice-selection-embedded-nul.json"
+env PRO_GATE_HOME="$CHOICE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+  bash "$ENGINE" --review-decision --json --review-choice-selection "$TDIR/choice-selection-embedded-nul.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
+  >"$TDIR/choice-selected-embedded-nul.json" 2>"$TDIR/choice-selected-embedded-nul.err"
+CHOICE_EMBEDDED_NUL_RC=$?
+check '#203 gate r3 P2: a selected_id with an embedded NUL byte stops closed at invalid-named-choice' \
+  "$([ "$CHOICE_EMBEDDED_NUL_RC" -eq 0 ] && jq -e '.action=="stop-without-new-review" and (.action!="run-granted-review")' "$TDIR/choice-selected-embedded-nul.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$CHOICE_EMBEDDED_NUL_RC output=$(cat "$TDIR/choice-selected-embedded-nul.json") stderr=$(cat "$TDIR/choice-selected-embedded-nul.err")"
 for choice_selection_case in malformed unknown stale oversized symlink; do
   rm -f "$TDIR/choice-bad.json"
   case "$choice_selection_case" in

@@ -184,7 +184,9 @@ const THROTTLE_SEEN_DIR = process.env.PRO_GATE_THROTTLE_SEEN_DIR || path.join(PG
 // the TTL window — otherwise a long-lived box accumulates one file per distinct stale (url,
 // hash) pair forever. `||` matches the same env-override convention as above.
 const THROTTLE_SEEN_TTL_MS = Number(process.env.PRO_GATE_THROTTLE_SEEN_TTL) || 7 * 24 * 60 * 60 * 1000;
-const THROTTLE_SEEN_MAX = 512;
+// #208 gate r3 P2: overridable so a test can shrink the cap without waiting for 512 distinct
+// tabs. `||` matches the same env-override convention as above.
+const THROTTLE_SEEN_MAX = Number(process.env.PRO_GATE_THROTTLE_SEEN_MAX) || 512;
 
 // --- conversation-URL memory (v0.25) -------------------------------------------------
 // One file per run marker holding the conversation URL we PROVED carries it. This is the
@@ -462,21 +464,33 @@ function throttleTextHash(text) {
 // (not the raw url/hash, which could collide with path separators or exceed filename limits) so
 // two concurrent writers computing the SAME fingerprint always agree on the SAME path — that
 // agreement, not a lock, is what makes the 'wx'-flag create in recordThrottleSeen race-safe.
+function throttleSeenKey(url, hash) {
+  return createHash('sha256').update(`${url}\n${hash}`).digest('hex');
+}
 function throttleSeenRecordPath(url, hash) {
-  const key = createHash('sha256').update(`${url}\n${hash}`).digest('hex');
-  return path.join(THROTTLE_SEEN_DIR, key);
+  return path.join(THROTTLE_SEEN_DIR, throttleSeenKey(url, hash));
 }
 // Runs once per invocation, on first touch of the sidecar: deletes records older than
 // THROTTLE_SEEN_TTL_MS, then — even inside the TTL window — trims the survivor count down to
 // THROTTLE_SEEN_MAX, oldest mtime first. Best-effort: a failure here (races with another
 // process's own prune, permissions, ENOENT) never blocks charging or reading a record.
+// #208 gate r3 P2: `protectedKeys` (record-file basenames the CURRENT scan already knows it is
+// about to check — computed by the caller BEFORE this prune runs) are never evicted, by capacity
+// OR by TTL. Without this, a fingerprint that is still visible every single scan could be the
+// one the capacity trim picks (oldest mtime first) — evicted, then immediately rediscovered as
+// "new" by the same scan's own throttleAlreadyCharged check and recreated with a fresh mtime, so
+// a persistent batch above THROTTLE_SEEN_MAX charges a fresh cooldown on every invocation
+// forever instead of exactly once. A protected fingerprint can still exceed the nominal cap on
+// disk; that is the correct trade — the cap is only ever enforced against records this scan does
+// NOT need.
 let throttleSeenPruned = false;
-function pruneThrottleSeen() {
+function pruneThrottleSeen(protectedKeys = new Set()) {
   let names;
   try { names = fs.readdirSync(THROTTLE_SEEN_DIR); } catch { return; }
   const now = Date.now();
   const stats = [];
   for (const name of names) {
+    if (protectedKeys.has(name)) continue;
     const recordPath = path.join(THROTTLE_SEEN_DIR, name);
     let mtimeMs;
     try { ({ mtimeMs } = fs.statSync(recordPath)); } catch { continue; }
@@ -496,8 +510,8 @@ function pruneThrottleSeen() {
 // "Already charged" is now a plain existence check on the record file, not a load-then-scan of
 // an in-memory snapshot — there is no snapshot to go stale, so two processes checking/creating
 // records for the SAME or DIFFERENT fingerprints can never clobber one another (#208 gate r2 P2).
-function throttleAlreadyCharged(url, hash) {
-  if (!throttleSeenPruned) { throttleSeenPruned = true; pruneThrottleSeen(); }
+function throttleAlreadyCharged(url, hash, protectedKeys) {
+  if (!throttleSeenPruned) { throttleSeenPruned = true; pruneThrottleSeen(protectedKeys); }
   return fs.existsSync(throttleSeenRecordPath(url, hash));
 }
 // Creates the record with the 'wx' flag: this throws EEXIST (caught, ignored) if another
@@ -544,16 +558,21 @@ let inconclusiveThrottleWhere = null;
 // recordThrottle/exit and treat the tab as though it carried no modal at all. Returns true for a
 // genuinely new sighting, after recording it so a later trip (this scan or the next invocation)
 // recognizes it too.
-function tripThrottleUnowned(url, text, where, foreign = false) {
+// `protectedKeys` (default: just this call's own fingerprint) is forwarded to
+// throttleAlreadyCharged's one-time prune so it never evicts a fingerprint the CURRENT scan
+// still needs (#208 gate r3 P2) — a batch call passes the whole batch's keys so all of them
+// survive the same prune, not just whichever happens to be checked first.
+function tripThrottleUnowned(url, text, where, foreign = false, protectedKeys = null) {
   const hash = throttleTextHash(text);
   if (!foreign) {
     // Name the FIRST surface that made this scan inconclusive; later hits keep the flag set.
     if (!inconclusiveThrottleSeen) inconclusiveThrottleWhere = where;
     inconclusiveThrottleSeen = true;
   }
+  const keys = protectedKeys ?? new Set([throttleSeenKey(url, hash)]);
   // The pre-check answers the common case cheaply; the 'wx' create is the authority for the
   // race window after it (exactly one of two simultaneous racers wins and charges).
-  if (throttleAlreadyCharged(url, hash) || !recordThrottleSeen(url, hash)) {
+  if (throttleAlreadyCharged(url, hash, keys) || !recordThrottleSeen(url, hash)) {
     console.error(`stale throttle modal on unowned tab ${url} already charged; ignoring (${where})`);
     return false;
   }
@@ -569,10 +588,14 @@ function tripThrottleUnowned(url, text, where, foreign = false) {
 // organizer instead returns a result object). Returns the first newly admitted hit's `where`
 // (recordThrottle's message then names the same specific tab a single-shot trip site would have
 // named), or null when every hit in the batch was already charged.
+// #208 gate r3 P2: compute every hit's fingerprint key BEFORE any of them is checked, so the
+// one-time prune this batch triggers (see pruneThrottleSeen) protects the WHOLE batch, not just
+// whichever hit happens to be first in list order.
 function tripThrottleUnownedBatch(hits) {
+  const protectedKeys = new Set(hits.map(({ url, text }) => throttleSeenKey(url, throttleTextHash(text))));
   let firstNewWhere = null;
   for (const { url, text, foreign, where } of hits) {
-    if (tripThrottleUnowned(url, text, where, foreign) && firstNewWhere === null) firstNewWhere = where;
+    if (tripThrottleUnowned(url, text, where, foreign, protectedKeys) && firstNewWhere === null) firstNewWhere = where;
   }
   return firstNewWhere;
 }
@@ -1677,11 +1700,19 @@ while (Date.now() < deadline) {
   // #162: the modal is account-wide, so decide ownership over the WHOLE scan, never on the first
   // tab in list order (the same order-independence onOurConversation documents): a foreign or
   // blacklisted tab listed ahead of ours must not hide the proof that our conversation exists.
-  // Only a non-blacklisted page rendering our EXACT marker proves that; any other modal hit is
-  // proof of the limiter alone.
-  const modalHits = reads.filter(({ text, throttleModal }) => throttleModal && text && text.trim() !== '');
-  if (modalHits.length > 0) {
-    const ownedHit = modalHits.find(({ tab, text }) => !nonMatching.has(tab.url) && hasExactMarker(text, marker));
+  // Only a non-blacklisted page rendering our EXACT marker proves that; any other modal or
+  // marker-less-interstitial hit is proof of the limiter alone.
+  // #208 gate r3 P2: ONE whole-scan batch covers every unowned throttle sighting this scan sees —
+  // modal hits AND marker-less interstitial hits on tabs without a modal. The old split (modal
+  // hits batched here, interstitials tripped one at a time in the per-tab loop below) meant N
+  // unchanged interstitial tabs in a single scan cost N separate cooldown windows: the per-tab
+  // loop recorded the FIRST sighting and exited immediately, leaving this same scan's remaining
+  // sightings unrecorded for the next invocation to rediscover one at a time.
+  const throttleHits = reads.filter(({ text, throttleModal }) => (
+    (throttleModal && text && text.trim() !== '') || (!throttleModal && isThrottlePage(text))
+  ));
+  if (throttleHits.length > 0) {
+    const ownedHit = throttleHits.find(({ tab, text }) => !nonMatching.has(tab.url) && hasExactMarker(text, marker));
     if (ownedHit) {
       tripThrottleEvidence(
         ownedHit.tab.url,
@@ -1689,32 +1720,32 @@ while (Date.now() < deadline) {
         `modal over tab ${ownedHit.tab.url}`,
       );
     } else {
-      // #208 gate r2 P2: a stale repeat listed first must not hide a genuinely new foreign modal
-      // behind it, AND one already-open batch of stale modals must cost this scan exactly one
-      // cooldown — not one per invocation as the old per-hit walk exited on the FIRST newly
-      // admitted hit, leaving every hit behind it un-recorded for the next invocation to
-      // rediscover one at a time. Charge every hit in list order first, then exit once.
-      const firstNewWhere = tripThrottleUnownedBatch(modalHits.map((hit) => ({
+      // #208 gate r2 P2 / r3 P2: a stale repeat listed first must not hide a genuinely new
+      // foreign modal or interstitial behind it, AND one already-open batch of stale sightings
+      // must cost this scan exactly one cooldown — not one per invocation as the old per-hit walk
+      // exited on the FIRST newly admitted hit, leaving every hit behind it un-recorded for the
+      // next invocation to rediscover one at a time. Charge every hit in list order first, then
+      // exit once. Fingerprint is throttleModal ?? text — the same rule every other unowned trip
+      // site in this file follows (isThrottlePage's own construction means an interstitial hit
+      // never has a throttleModal or a foreign marker, so `text` and `foreign: false` fall out
+      // naturally for those hits).
+      const firstNewWhere = tripThrottleUnownedBatch(throttleHits.map((hit) => ({
         url: hit.tab.url,
-        text: hit.throttleModal,
+        text: hit.throttleModal ?? hit.text,
         foreign: !!hit.text && FOREIGN_MARKER_RE.test(hit.text),
-        where: `modal over tab ${hit.tab.url}`,
+        where: hit.throttleModal ? `modal over tab ${hit.tab.url}` : `tab ${hit.tab.url}`,
       })));
       if (firstNewWhere !== null) tripThrottle(firstNewWhere);
     }
   }
-  for (const { tab, text, infrastructureError, throttleModal } of reads) {
+  for (const { tab, text, infrastructureError } of reads) {
     if (text === null || text.trim() === '') { deadTabs.push(tab); continue; }
-    // #208 gate r1 P1: a tab carrying a throttleModal was already walked by the whole-scan modal
-    // block above (tripped as owned/first-admitted-unowned, or ignored as an already-charged
-    // stale repeat) — do not classify it again here as a marker-less interstitial. Reaching this
-    // check for the SAME tab would fingerprint it a second way (whole page text, not the modal
-    // text) and the two fingerprints would alternate the cooldown forever instead of converging.
-    // isThrottlePage requires no run marker at all (ours or foreign), so a hit here is always
-    // unowned — route it through the dedupe gate (#208) before charging another cooldown. The
-    // fingerprint is the page text BY CONSTRUCTION: the !throttleModal guard means no modal text
-    // exists for this tab, so this is the same value every other unowned trip site would use.
-    if (!throttleModal && isThrottlePage(text) && tripThrottleUnowned(tab.url, text, `tab ${tab.url}`)) tripThrottle(`tab ${tab.url}`);
+    // #208 gate r1 P1 / r3 P2: every modal AND marker-less-interstitial throttle sighting in this
+    // scan was already walked by the whole-scan batch above (tripped as owned, charged as the
+    // first newly-admitted unowned hit, or ignored as an already-charged stale repeat) — a
+    // marker-less interstitial no longer needs (or gets) its own per-tab trip here; the batch
+    // subsumes it. Reaching this loop for a throttle tab a second time would fingerprint it
+    // again and risk alternating the cooldown instead of converging.
     // v0.28 (gate #54 r2): honor the per-marker blacklist for OPEN tabs too, not only
     // re-renders. The engine appends here when a capture from this URL failed the provenance
     // check — even a marker-bearing tab must be skipped then, or every later harvest replays

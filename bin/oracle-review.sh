@@ -424,7 +424,14 @@ pg_review_decision_choice_selection_read() { # file -> canonical {selected_id,sn
   raw="$(cat "$f" 2>/dev/null; printf x)" || return 1
   raw="${raw%x}"
   canonical="$(pg_review_json_canonical "$raw")" || return 1
-  if [ "$raw" = "$canonical" ] || [ "$raw" = "${canonical}"$'\n' ]; then
+  # #203 gate r3 P2: decide byte-canonical acceptance against the file's ACTUAL bytes on disk
+  # (via cmp), never against `raw` above — bash command substitution silently DROPS every NUL
+  # byte from captured output, so a canonical selection followed by a NUL, or a selected_id/
+  # snapshot_digest with an embedded NUL, used to make `raw` compare equal to `canonical` even
+  # though the file's real bytes differ from it. cmp reads $f directly and sees every byte,
+  # including NULs, so any such file is now rejected. Process substitution is fine — this file is
+  # bash, not POSIX sh. One-trailing-LF is still tolerated, same as before.
+  if cmp -s "$f" <(printf '%s' "$canonical") || cmp -s "$f" <(printf '%s\n' "$canonical"); then
     :
   else
     echo '[oracle-review] review-choice-selection: file is not byte-canonical JSON (at most one trailing newline is tolerated)' >&2
