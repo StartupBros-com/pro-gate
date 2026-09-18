@@ -181,6 +181,13 @@ const TITLE_MEMO_DIR = path.join(PG_HOME, 'conversation-titles');
 const COMPLETED_DIR = process.env.PRO_GATE_COMPLETED_DIR ?? path.join(PG_HOME, 'completed');
 const PENDING_DIR = path.join(PG_HOME, 'pending');
 const MEMO_KEEP = 200;                  // newest N memos retained; older ones are pruned on write
+// #208 gate r1 P1: a stale unowned tab can legitimately fingerprint under TWO different hashes
+// across invocations (modal text vs. whole-page text) when a marker-less interstitial also
+// carries a throttle modal — the two trip sites used to disagree on which text to hash. Keeping
+// a short bounded history per URL, instead of replacing the single remembered hash, means
+// "already charged" recognizes EITHER fingerprint for the same stale tab even if a residual
+// two-fingerprint case ever slips past the modal-preferred-everywhere fix below.
+const THROTTLE_SEEN_PER_URL_MAX = 4;    // bounded hash history kept per URL in the seen sidecar
 const MARKER_SAFE_RE = /^pg-run-[A-Za-z0-9.-]+$/;
 // #167: the marker is EXTRACTED case-insensitively everywhere but used to be COMPARED
 // case-sensitively, so a model that lowercased its own echo — markers legitimately carry
@@ -473,7 +480,13 @@ function tripThrottleUnowned(url, text, where) {
     console.error(`stale throttle modal on unowned tab ${url} already charged; ignoring (${where})`);
     return false;
   }
-  throttleSeenThisScan = [...throttleSeenThisScan.filter((entry) => entry.url !== url), { url, hash }];
+  // Append, don't replace: "already charged" for this URL means ANY of its recently recorded
+  // hashes matches (checked above), not only the most recent one. Bounded to
+  // THROTTLE_SEEN_PER_URL_MAX so the sidecar cannot grow unbounded for one repeatedly-alternating
+  // URL — oldest hash for that URL drops first.
+  const forUrl = [...throttleSeenThisScan.filter((entry) => entry.url === url), { url, hash }];
+  while (forUrl.length > THROTTLE_SEEN_PER_URL_MAX) forUrl.shift();
+  throttleSeenThisScan = [...throttleSeenThisScan.filter((entry) => entry.url !== url), ...forUrl];
   writeThrottleSeen(throttleSeenThisScan);
   return true;
 }
@@ -1172,11 +1185,19 @@ async function organizeConversation() {
     }
     // Unowned: route through the same dedupe gate (#208) every other unowned trip uses, or a
     // stale foreign tab left open re-arms the account cooldown on every later organizer scan.
-    const hit = throttleHits[0];
-    if (tripThrottleUnowned(hit.tab.url, hit.throttleModal ?? hit.text, 'organizer scan')) {
-      recordThrottle('organizer scan');
-      return { ...result, reason: 'throttle' };
+    // #208 gate r1 P2: walk ALL unowned hits in list order, mirroring the main loop's whole-scan
+    // walk (checking only throttleHits[0] let an already-charged stale tab listed first hide a
+    // genuinely new unowned modal listed behind it, so --organize would proceed to scratch
+    // navigation/rename/archive without ever updating the cooldown). Each skipped repeat still
+    // logs "ignoring" via tripThrottleUnowned itself.
+    for (const hit of throttleHits) {
+      if (tripThrottleUnowned(hit.tab.url, hit.throttleModal ?? hit.text, 'organizer scan')) {
+        recordThrottle('organizer scan');
+        return { ...result, reason: 'throttle' };
+      }
     }
+    // No unowned hit was newly admitted — every sighting this scan found was already charged.
+    // Fall through as though no modal/interstitial were present at all.
   }
 
   const candidatesByUrl = new Map();
@@ -1356,8 +1377,11 @@ function classifyEvidence(text, structuredError = null, throttleModal = null) {
   if (!text || !text.trim()) return { kind: 'inconclusive', reason: 'empty-text' };
   // hashText (#208) is what an unowned trip fingerprints to recognize a repeat sighting of the
   // SAME stale tab: the modal's own short text when one is present (stable across re-renders),
-  // else the interstitial page text itself.
-  if (isThrottlePage(text)) return { kind: 'throttle', reason: 'interstitial', owned: false, hashText: text };
+  // else the interstitial page text itself. #208 gate r1 P1: prefer throttleModal here too — a
+  // marker-less page can satisfy isThrottlePage on its whole-page text AND carry a modal; hashing
+  // the page text here while every other site hashes the modal text let the SAME stale tab
+  // alternate between two fingerprints forever, rewriting the cooldown on every other pass.
+  if (isThrottlePage(text)) return { kind: 'throttle', reason: 'interstitial', owned: false, hashText: throttleModal ?? text };
   // #162: the modal is account state painted over whatever conversation rendered. `owned` says
   // whether THIS run's exact marker is on the page beneath it (existence proof for --probe).
   if (throttleModal) {
@@ -1565,11 +1589,18 @@ while (Date.now() < deadline) {
       }
     }
   }
-  for (const { tab, text, infrastructureError } of reads) {
+  for (const { tab, text, infrastructureError, throttleModal } of reads) {
     if (text === null || text.trim() === '') { deadTabs.push(tab); continue; }
+    // #208 gate r1 P1: a tab carrying a throttleModal was already walked by the whole-scan modal
+    // block above (tripped as owned/first-admitted-unowned, or ignored as an already-charged
+    // stale repeat) — do not classify it again here as a marker-less interstitial. Reaching this
+    // check for the SAME tab would fingerprint it a second way (whole page text, not the modal
+    // text) and the two fingerprints would alternate the cooldown forever instead of converging.
     // isThrottlePage requires no run marker at all (ours or foreign), so a hit here is always
     // unowned — route it through the dedupe gate (#208) before charging another cooldown.
-    if (isThrottlePage(text) && tripThrottleUnowned(tab.url, text, `tab ${tab.url}`)) tripThrottle(`tab ${tab.url}`);
+    // throttleModal ?? text keeps this fingerprint in lockstep with every other unowned trip
+    // site even in the case this branch never actually sees a modal-bearing tab.
+    if (!throttleModal && isThrottlePage(text) && tripThrottleUnowned(tab.url, throttleModal ?? text, `tab ${tab.url}`)) tripThrottle(`tab ${tab.url}`);
     // v0.28 (gate #54 r2): honor the per-marker blacklist for OPEN tabs too, not only
     // re-renders. The engine appends here when a capture from this URL failed the provenance
     // check — even a marker-bearing tab must be skipped then, or every later harvest replays
