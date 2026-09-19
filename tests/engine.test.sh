@@ -5987,6 +5987,22 @@ UNKNOWN_OUT="$(rd_reduce "$UNKNOWN_FACTS")"
 check 'unknown decision contract stops closed' \
   "$(jq -e '.action == "stop-without-new-review" and .reason == "unknown-contract"' <<<"$UNKNOWN_OUT" >/dev/null 2>&1; echo $?)" "$UNKNOWN_OUT"
 
+# #214 (gate r2 P1): the binding-record compatibility list only widens what
+# pg_review_*_binding_validate will read; it must never widen the decision/effect envelope's own
+# contract identity check. A decision envelope carrying a predecessor contract digest — one of the
+# exact digests now in PG_REVIEW_DECISION_COMPATIBLE_CONTRACT_DIGESTS — is still rejected here.
+PG214_PRED_A='bf36fdb5f8625e917be0539ca014fec518649d1160584846aca1cb9149533abb'
+PG214_PRED_B='7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee'
+PG214_UNKNOWN_CD='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+check 'the compiled binding-record compatibility list is exactly the two predecessor contract digests' \
+  "$(jq -ne --arg a "$PG214_PRED_A" --arg b "$PG214_PRED_B" --argjson got "$(pg_review_decision_compatible_contract_digests_json)" \
+      '$got == ([$a,$b]|sort)' >/dev/null 2>&1; echo $?)" \
+  "$(pg_review_decision_compatible_contract_digests_json)"
+PG214_ENV_PRED_FACTS="$(rd_facts '{}')"; PG214_ENV_PRED_FACTS="$(jq -cS --arg cd "$PG214_PRED_A" '.contract.contract_digest=$cd' <<<"$PG214_ENV_PRED_FACTS")"
+PG214_ENV_PRED_OUT="$(rd_reduce "$PG214_ENV_PRED_FACTS")"
+check '#214: a decision envelope carrying a predecessor contract digest is still rejected as unknown-contract' \
+  "$(jq -e '.action == "stop-without-new-review" and .reason == "unknown-contract"' <<<"$PG214_ENV_PRED_OUT" >/dev/null 2>&1; echo $?)" "$PG214_ENV_PRED_OUT"
+
 LEGACY_COLLECT='{"completed_results":[{"applicable":false,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bindable":true,"binding_valid":false,"canonical_identity":"legacy-a","charged_spend_epoch":1700000100,"collected":false,"evidence_mode":"none","legacy":true,"marker":"pg-run-legacy-1983-1700000100-1","provenance_valid":false,"verdict":"SHIP"}]}'
 LEGACY_COLLECT_OUT="$(rd_reduce "$(rd_facts "$LEGACY_COLLECT")")"
 check 'legacy completed artifact remains collectable' \
@@ -6108,6 +6124,82 @@ check 'result binding is the only marker-bound sibling and validates input/artif
   "$([ "$RESULT_RC" -eq 0 ] && [ "$RESULT_READ" = "$RESULT_BINDING" ] \
      && [ "$(find "$BIND_HOME" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort | tr '\n' ' ')" = 'review-input-bindings review-result-bindings ' ]; echo $?)" \
   "rc=$RESULT_RC dirs=$(find "$BIND_HOME" -mindepth 1 -maxdepth 1 -type d -printf '%f ' 2>/dev/null)"
+
+# #214 (gate r2 P1): a v0.53.0 contract bump changes PG_REVIEW_DECISION_CONTRACT_DIGEST, but every
+# binding record written by a runtime carrying a predecessor digest must remain readable — its own
+# record_type/record_version shape rules already proved it, and the contract changes since were
+# additive only. PG214_PRED_A/PG214_PRED_B are derived from the already-validated INPUT_BINDING /
+# RESULT_BINDING above so the hex proof fields can never be mistyped.
+PG214_BIND_HOME="$TDIR/home-pg214-bindings"
+PG214_INPUT_MARKER='pg-run-acme-widgets-1983-1700000701-1'
+PG214_INPUT_BINDING="$(jq -cS --arg cd "$PG214_PRED_A" --arg marker "$PG214_INPUT_MARKER" \
+  '.contract_digest=$cd | .marker=$marker | .charged_spend_epoch=1700000701' <<<"$INPUT_BINDING")"
+pg_review_input_binding_validate "$PG214_INPUT_BINDING" "$PG214_INPUT_MARKER"; PG214_INPUT_VALIDATE_RC=$?
+PRO_GATE_HOME="$PG214_BIND_HOME" pg_review_input_binding_write "$PG214_INPUT_MARKER" "$PG214_INPUT_BINDING"; PG214_INPUT_WRITE_RC=$?
+PG214_INPUT_READ="$(PRO_GATE_HOME="$PG214_BIND_HOME" pg_review_input_binding_read "$PG214_INPUT_MARKER")"
+PG214_INPUT_DIGEST="$(PRO_GATE_HOME="$PG214_BIND_HOME" pg_review_input_binding_digest "$PG214_INPUT_MARKER")"
+PG214_INPUT_SHA="$(pg_review_sha256_text "$PG214_INPUT_BINDING")"
+check '#214 (a): an input binding whose contract_digest is a compiled predecessor digest (bf36fdb5...) validates, writes, and reads back byte-identical' \
+  "$([ "$PG214_INPUT_VALIDATE_RC" -eq 0 ] && [ "$PG214_INPUT_WRITE_RC" -eq 0 ] && [ "$PG214_INPUT_READ" = "$PG214_INPUT_BINDING" ] \
+     && [ -n "$PG214_INPUT_DIGEST" ] && [ "$PG214_INPUT_DIGEST" = "$PG214_INPUT_SHA" ]; echo $?)" \
+  "validate_rc=$PG214_INPUT_VALIDATE_RC write_rc=$PG214_INPUT_WRITE_RC read=$PG214_INPUT_READ digest=$PG214_INPUT_DIGEST sha=$PG214_INPUT_SHA binding=$PG214_INPUT_BINDING"
+
+PG214_RESULT_MARKER='pg-run-acme-widgets-1983-1700000702-1'
+PG214_RESULT_BINDING="$(jq -cS --arg cd "$PG214_PRED_B" --arg marker "$PG214_RESULT_MARKER" --arg ib "$(pg_review_sha256_text "$PG214_INPUT_BINDING")" \
+  '.contract_digest=$cd | .marker=$marker | .input_binding_identity=$marker | .input_binding_digest=$ib | .artifact.path=("completed/"+$marker)' <<<"$RESULT_BINDING")"
+pg_review_result_binding_validate "$PG214_RESULT_BINDING" "$PG214_RESULT_MARKER"; PG214_RESULT_VALIDATE_RC=$?
+PRO_GATE_HOME="$PG214_BIND_HOME" pg_review_result_binding_write "$PG214_RESULT_MARKER" "$PG214_RESULT_BINDING"; PG214_RESULT_WRITE_RC=$?
+PG214_RESULT_READ="$(PRO_GATE_HOME="$PG214_BIND_HOME" pg_review_result_binding_read "$PG214_RESULT_MARKER")"
+check '#214 (b): a result binding whose contract_digest is a compiled predecessor digest (7f5ece9b...) validates, writes, and reads back byte-identical' \
+  "$([ "$PG214_RESULT_VALIDATE_RC" -eq 0 ] && [ "$PG214_RESULT_WRITE_RC" -eq 0 ] && [ "$PG214_RESULT_READ" = "$PG214_RESULT_BINDING" ]; echo $?)" \
+  "validate_rc=$PG214_RESULT_VALIDATE_RC write_rc=$PG214_RESULT_WRITE_RC read=$PG214_RESULT_READ binding=$PG214_RESULT_BINDING"
+
+PG214_UNKNOWN_INPUT="$(jq -cS --arg cd "$PG214_UNKNOWN_CD" '.contract_digest=$cd' <<<"$INPUT_BINDING")"
+PG214_UNKNOWN_RESULT="$(jq -cS --arg cd "$PG214_UNKNOWN_CD" '.contract_digest=$cd' <<<"$RESULT_BINDING")"
+pg_review_input_binding_validate "$PG214_UNKNOWN_INPUT" 'pg-run-acme-widgets-1983-1700000700-1'; PG214_UNKNOWN_INPUT_RC=$?
+pg_review_result_binding_validate "$PG214_UNKNOWN_RESULT" 'pg-run-acme-widgets-1983-1700000700-1'; PG214_UNKNOWN_RESULT_RC=$?
+check '#214 (c): a binding with an unknown contract_digest is still rejected by both validators' \
+  "$([ "$PG214_UNKNOWN_INPUT_RC" -ne 0 ] && [ "$PG214_UNKNOWN_RESULT_RC" -ne 0 ]; echo $?)" \
+  "input_rc=$PG214_UNKNOWN_INPUT_RC result_rc=$PG214_UNKNOWN_RESULT_RC"
+
+# #214 (e): upgrade regression, completed review. An unchanged head whose full-pr input binding
+# AND SHIP result binding were both written by the PREDECESSOR runtime (predecessor contract
+# digest on both sibling records) must still be recognized by the real CLI query as an already
+# -completed, merge-eligible review -- reused via allow-existing-merge-workflow -- rather than
+# granting ANOTHER paid round because the old bindings silently failed to read back.
+PG214_E_REPO="$TDIR/pg214-upgrade-repo"
+mkdir -p "$PG214_E_REPO"
+git -C "$PG214_E_REPO" init -q
+git -C "$PG214_E_REPO" config user.email test@example.invalid
+git -C "$PG214_E_REPO" config user.name 'Engine Test'
+printf 'one\n' > "$PG214_E_REPO/file.txt"
+git -C "$PG214_E_REPO" add file.txt && git -C "$PG214_E_REPO" commit -qm initial
+printf 'two\n' > "$PG214_E_REPO/file.txt"
+git -C "$PG214_E_REPO" add file.txt && git -C "$PG214_E_REPO" commit -qm second
+git -C "$PG214_E_REPO" remote add origin https://github.com/acme/upgrade-e2e.git
+PG214_E_HEAD="$(git -C "$PG214_E_REPO" rev-parse HEAD)"
+PG214_E_BASE="$(git -C "$PG214_E_REPO" rev-parse HEAD^)"
+git -C "$PG214_E_REPO" diff "$PG214_E_BASE" "$PG214_E_HEAD" > "$TDIR/pg214-e.patch"
+PG214_E_DIGEST="$(pg_sha256 "$TDIR/pg214-e.patch")"
+PG214_E_HOME="$TDIR/home-pg214-upgrade-review"
+PG214_E_MARKER='pg-run-acme-upgrade-e2e-91-1700020000-1'
+mkdir -p "$PG214_E_HOME/completed"
+printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — upgrade regression fixture.' > "$PG214_E_HOME/completed/$PG214_E_MARKER"
+PG214_E_ARTIFACT_DIGEST="$(pg_sha256 "$PG214_E_HOME/completed/$PG214_E_MARKER")"
+PG214_E_INPUT_BINDING="$(jq -cnS --arg cd "$PG214_PRED_A" --arg marker "$PG214_E_MARKER" --arg base "$PG214_E_BASE" --arg head "$PG214_E_HEAD" --arg digest "$PG214_E_DIGEST" \
+  '{charged_spend_epoch:1700020000,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("full-pr:"+$base+":"+$head),mode:"full-pr",proof:{base_oid:$base,endpoint_digest:$digest,head_oid:$head,raw_patch_digest:$digest}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:"github.com",owner:"acme",repo:"upgrade-e2e"},target:{head_oid:$head,kind:"pull-request",pr:91}}')"
+PRO_GATE_HOME="$PG214_E_HOME" pg_review_input_binding_write "$PG214_E_MARKER" "$PG214_E_INPUT_BINDING"
+PG214_E_INPUT_DIGEST="$(pg_review_sha256_text "$PG214_E_INPUT_BINDING")"
+PG214_E_RESULT_BINDING="$(jq -cnS --arg cd "$PG214_PRED_B" --arg marker "$PG214_E_MARKER" --arg ib "$PG214_E_INPUT_DIGEST" --arg base "$PG214_E_BASE" --arg head "$PG214_E_HEAD" --arg digest "$PG214_E_DIGEST" --arg artifact "$PG214_E_ARTIFACT_DIGEST" \
+  '{accepted_epoch:1700020001,artifact:{digest:$artifact,path:("completed/"+$marker)},contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,input_binding_digest:$ib,input_binding_identity:$marker,marker:$marker,named_choice:null,provenance:{outcome:"accepted",validated_epoch:1700020001},record_type:"review-result-binding/v1",record_version:1,ship_proof:{base_oid:$base,diff_digest:$digest,head_oid:$head},verdict:"SHIP"}')"
+PRO_GATE_HOME="$PG214_E_HOME" pg_review_result_binding_write "$PG214_E_MARKER" "$PG214_E_RESULT_BINDING"
+env PRO_GATE_HOME="$PG214_E_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/pg214-e.patch" \
+  bash "$ENGINE" --review-decision --json --repo "$PG214_E_REPO" --pr 91 --diff "$TDIR/pg214-e.patch" --input bundle \
+  >"$TDIR/pg214-e.json" 2>"$TDIR/pg214-e.err"
+PG214_E_RC=$?
+check '#214 (e): an unchanged head whose input+result bindings both carry a predecessor contract digest reduces directly to allow-existing-merge-workflow, no new round granted' \
+  "$([ "$PG214_E_RC" -eq 0 ] && jq -e '.action=="allow-existing-merge-workflow" and .reason=="current-ship-is-merge-eligible"' "$TDIR/pg214-e.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$PG214_E_RC output=$(cat "$TDIR/pg214-e.json") stderr=$(cat "$TDIR/pg214-e.err")"
 
 # U2: the typed resolution surface is advisory and strictly read-only. It must normalize a
 # canonical local PR target and bare supplied diff without starting the existing engine path.
@@ -6807,6 +6899,24 @@ check 'a capacity-holding reservation outranks an older audit-only superseded ma
   "$(jq -e --arg marker "$SUPER_LIVE_MARKER" '.marker==$marker and .source=="reservation" and .state=="recoverable" and .recoverable and (.fresh_eligible|not)' <<<"$SUPER_LIVE_SNAPSHOT" >/dev/null 2>&1; echo $?)" \
   "$SUPER_LIVE_SNAPSHOT"
 rm -f "$SUPER_HEAD_HOME/in-progress/$SUPER_LIVE_MARKER" "$SUPER_HEAD_HOME/run-meta/$SUPER_LIVE_MARKER"
+
+# #214 (f): upgrade regression, live reservation. A generating reservation's input binding, once
+# rewritten in place to carry a PREDECESSOR contract digest -- exactly what a binding a pre-v0.53.0
+# runtime wrote looks like on disk today -- must still be read by pg_reservation_supersede /
+# recover_superseded_reason() when the bound PR head moves, and atomically transition to
+# superseded, not silently lose the binding it needs to prove the move.
+PG214_F_HOME="$TDIR/home-pg214-upgrade-live"
+PG214_F_MARKER='pg-run-acme-fresh-77-1700020100-1'
+super_seed "$PG214_F_HOME" "$PG214_F_MARKER" 1700020100 "$FRESH_BASE"
+super_replace_binding "$PG214_F_HOME" "$PG214_F_MARKER" ".contract_digest=\"$PG214_PRED_A\""
+PG214_F_BINDING_CD="$(jq -r .contract_digest <<<"$(PRO_GATE_HOME="$PG214_F_HOME" pg_review_input_binding_read "$PG214_F_MARKER")")"
+: > "$SUPER_GH_CALLS"; : > "$TDIR/recover-oracle-sentinel"
+super_recover "$PG214_F_HOME" "$PG214_F_MARKER" ok OPEN "$FRESH_HEAD"
+check '#214 (f): a live reservation whose input binding carries a predecessor contract digest still recovers superseded when the bound head moves' \
+  "$([ "$PG214_F_BINDING_CD" = "$PG214_PRED_A" ] && [ "$RC" -eq 6 ] && grep -qx 'Review superseded' "$TDIR/super.stderr" \
+     && grep -qF 'pr view 77 --repo github.com/acme/fresh --json state,headRefOid' "$SUPER_GH_CALLS" \
+     && [ "$(awk -F'\t' 'NR==1{print $NF}' "$PG214_F_HOME/in-progress/$PG214_F_MARKER")" = superseded ]; echo $?)" \
+  "binding_cd=$PG214_F_BINDING_CD rc=$RC state=$(cat "$PG214_F_HOME/in-progress/$PG214_F_MARKER") stderr=$(cat "$TDIR/super.stderr")"
 
 # #161: a caller-supplied --diff reservation's binding has no full-pr shaped proof to borrow, so
 # recover_superseded_reason()/pg_reservation_supersede must accept its own "caller-patch" shape

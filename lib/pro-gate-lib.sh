@@ -3201,10 +3201,23 @@ PG_REVIEW_DECISION_CONTRACT_VERSION=1
 PG_REVIEW_DECISION_CONTRACT_DIGEST='5fcd19c12600061af6d90ed9cb980dd7067cff199c374910639003eec4caf5c3'
 PG_REVIEW_DECISION_CORPUS_DIGEST='c7e8b55a5ebbf190a0bda93ae7367820cd3f9ffb8092a4998ff58bb0513aadc6'
 
+# Binding-record compatibility only (#214, gate r2 P1). review-input-binding/v1 and
+# review-result-binding/v1 records are validated by their own record_type/record_version shape
+# rules, not the decision/effect envelope's contract identity check. Every contract change since
+# the digests below was additive (new reasons for #147/#174, new governor/result fields), so the
+# proof rules those already-written records carry still hold under the current runtime — only the
+# CURRENT digest below is ever written into a fresh binding. When a future bump changes a proof
+# rule (not just adds a reason or fact), drop the affected predecessor digest here so its bindings
+# stop being trusted, rather than widening the rule that reads them.
+PG_REVIEW_DECISION_COMPATIBLE_CONTRACT_DIGESTS='bf36fdb5f8625e917be0539ca014fec518649d1160584846aca1cb9149533abb 7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee'
+
 pg_review_decision_contract_id() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_ID"; }
 pg_review_decision_contract_version() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_VERSION"; }
 pg_review_decision_contract_digest() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_DIGEST"; }
 pg_review_decision_corpus_digest() { printf '%s\n' "$PG_REVIEW_DECISION_CORPUS_DIGEST"; }
+pg_review_decision_compatible_contract_digests_json() { # sorted JSON array of readable predecessor binding-record digests
+  jq -cnS --arg digests "$PG_REVIEW_DECISION_COMPATIBLE_CONTRACT_DIGESTS" '$digests | split(" ") | map(select(length > 0)) | sort'
+}
 
 # Compatibility metadata only: reducers continue to use the compiled constants above.
 pg_review_decision_identity_json() {
@@ -3624,14 +3637,16 @@ pg_review_input_binding_validate() { # canonical record JSON [expected marker]
   local json="${1-}" marker="${2:-}" canonical
   canonical="$(pg_review_json_canonical "$json")" || return 1
   jq -e --arg marker "$marker" --arg cid "$PG_REVIEW_DECISION_CONTRACT_ID" \
-    --argjson cv "$PG_REVIEW_DECISION_CONTRACT_VERSION" --arg cd "$PG_REVIEW_DECISION_CONTRACT_DIGEST" '
+    --argjson cv "$PG_REVIEW_DECISION_CONTRACT_VERSION" --arg cd "$PG_REVIEW_DECISION_CONTRACT_DIGEST" \
+    --argjson compat "$(pg_review_decision_compatible_contract_digests_json)" '
     def keys_are($x): keys == ($x|sort);
     def hex: type=="string" and test("^[0-9a-f]{64}$");
     def oid: type=="string" and test("^[0-9a-f]{40}([0-9a-f]{24})?$");
     ([.. | strings | (length>1024 or test("[\u0000-\u001f\u007f]"))] | any | not)
     and keys_are(["charged_spend_epoch","contract_digest","contract_id","contract_version","evidence","marker","record_type","record_version","repository","target"])
     and .record_type=="review-input-binding/v1" and .record_version==1
-    and .contract_id==$cid and .contract_version==$cv and .contract_digest==$cd
+    and .contract_id==$cid and .contract_version==$cv
+    and (.contract_digest==$cd or (.contract_digest|IN($compat[])))
     and (.marker|test("^pg-run-[A-Za-z0-9.-]+$")) and ($marker=="" or .marker==$marker)
     and (.charged_spend_epoch|type=="number" and floor==. and .>0)
     and (.repository|keys_are(["host","owner","repo"]))
@@ -3667,14 +3682,16 @@ pg_review_result_binding_validate() { # canonical record JSON [expected marker]
   local json="${1-}" marker="${2:-}" canonical
   canonical="$(pg_review_json_canonical "$json")" || return 1
   jq -e --arg marker "$marker" --arg cid "$PG_REVIEW_DECISION_CONTRACT_ID" \
-    --argjson cv "$PG_REVIEW_DECISION_CONTRACT_VERSION" --arg cd "$PG_REVIEW_DECISION_CONTRACT_DIGEST" '
+    --argjson cv "$PG_REVIEW_DECISION_CONTRACT_VERSION" --arg cd "$PG_REVIEW_DECISION_CONTRACT_DIGEST" \
+    --argjson compat "$(pg_review_decision_compatible_contract_digests_json)" '
     def keys_are($x): keys == ($x|sort);
     def hex: type=="string" and test("^[0-9a-f]{64}$");
     def oid: type=="string" and test("^[0-9a-f]{40}([0-9a-f]{24})?$");
     ([.. | strings | (length>1024 or test("[\u0000-\u001f\u007f]"))] | any | not)
     and keys_are(["accepted_epoch","artifact","contract_digest","contract_id","contract_version","input_binding_digest","input_binding_identity","marker","named_choice","provenance","record_type","record_version","ship_proof","verdict"])
     and .record_type=="review-result-binding/v1" and .record_version==1
-    and .contract_id==$cid and .contract_version==$cv and .contract_digest==$cd
+    and .contract_id==$cid and .contract_version==$cv
+    and (.contract_digest==$cd or (.contract_digest|IN($compat[])))
     and (.marker|test("^pg-run-[A-Za-z0-9.-]+$")) and ($marker=="" or .marker==$marker)
     and (.accepted_epoch|type=="number" and floor==. and .>0)
     and (.input_binding_digest|hex) and .input_binding_identity==.marker
