@@ -802,6 +802,29 @@ check '#161 gate r1 P1: recover does not falsely supersede when only the local c
   "$([ "$DIVERGE161_RRC" -eq 9 ] && [ "$DIVERGE161_STATE_AFTER" = generating ] && [ -z "$DIVERGE161_FALSE_SUPERSEDE_ENTRY" ]; echo $?)" \
   "rc=$DIVERGE161_RRC state_after=$DIVERGE161_STATE_AFTER false_supersede_ledger_entry=${DIVERGE161_FALSE_SUPERSEDE_ENTRY:-<none>} gh_calls=$(tr '\n' ';' < "$DIVERGE161_GH_CALLS" 2>/dev/null) stderr=$(cat "$TDIR/diverge161-recover-stderr")"
 
+
+# gate r1 P1 (#161, v0.53.0): a caller-patch run whose PR came in as a URL needs no gh to resolve
+# PG_META_*, so it reaches the caller-patch installer even when no gh binary exists. That
+# installer's head fetch is best-effort by contract: with gh unavailable it must install NO
+# binding and let the run continue, never abort the engine after the charge. Before the fix,
+# `local cp_head` stayed unassigned on that path and the regex test tripped set -u.
+CPMISS_HOME="$TDIR/home-cpmiss"
+env HOME="$TDIR/user" PRO_GATE_HOME="$CPMISS_HOME" PRO_GATE_INPUT_POLICY=connector-enabled \
+  ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 \
+  PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 PRO_GATE_MAX_ROUNDS_PER_PR=1 \
+  PRO_GATE_LOCK_WAIT=2 PRO_GATE_TIMEOUT_GRACE=0 PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_ORACLE_COMPLETE=1 NODE_OPTIONS= \
+  PRO_GATE_GH_BIN="$TDIR/bin/no-such-gh-binary" \
+  bash "$ENGINE" --pr https://github.com/acme/conn150/pull/96 --repo "$CONN150_REPO" --diff "$TDIR/conn150-caller.diff" --input bundle --out "$TDIR/cpmiss-out.md" --timeout 10s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+CPMISS_RC=$?
+CPMISS_BINDINGS="$(find "$CPMISS_HOME/review-input-bindings" -mindepth 1 -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ')"
+check '#161 gate r1 P1: a missing gh binary leaves a caller-patch run bounded and submitted, never aborted after the charge' \
+  "$([ "$CPMISS_RC" -eq 0 ] && [ -s "$TDIR/cpmiss-out.md" ] && ! grep -q 'unbound variable' "$TDIR/stderr"; echo $?)" \
+  "rc=$CPMISS_RC out_bytes=$(wc -c < "$TDIR/cpmiss-out.md" 2>/dev/null) stderr=$(tail -3 "$TDIR/stderr")"
+check '#161 gate r1 P1: with no gh available the run installs no binding at all (best-effort, never a guessed one)' \
+  "$([ "$CPMISS_BINDINGS" = 0 ]; echo $?)" "bindings=$CPMISS_BINDINGS"
+
 # Lifecycle-only modes remain usable under an invalid policy: the engine reaches their normal
 # handler instead of rejecting an unrelated historical inspection or recovery action.
 PRO_GATE_INPUT_POLICY=invalid-policy PRO_GATE_BROWSER_ATTACHMENTS=invalid-policy PRO_GATE_HOME="$TDIR/policy-lifecycle" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
@@ -1983,6 +2006,14 @@ genforce() { local key="$1"; shift; gguard "$key" PRO_GATE_ROUND_GUARD=1 "$@"; }
 gscore() { # $1=key -> "earned<TAB>streak<TAB>elapsed_secs<TAB>scored" from pg_round_score
   env PRO_GATE_HOME="$GHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_score '$1'; printf '%s\t%s\t%s\t%s\n' \"\$PG_ROUND_EARNED\" \"\$PG_ROUND_STREAK\" \"\$PG_ROUND_ELAPSED_SECS\" \"\$PG_ROUND_SCORED\""
 }
+# gate r1 P2 (#174, v0.53.0): the facts builder bounds the exported arrow to the latest 32 counts
+# while the counters still score the whole in-window history. 33 strictly shrinking rounds are
+# legitimate in advisory mode (streak 0); their arrow must serialize as 32 entries, not 33.
+gseed arrow33 40 39 38 37 36 35 34 33 32 31 30 29 28 27 26 25 24 23 22 21 20 19 18 17 16 15 14 13 12 11 10 9 8
+ARROW33_GOV="$(env PRO_GATE_HOME="$GHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_governor_facts_json arrow33 true")"
+check '#174 gate r1 P2: governor facts bound the exported arrow to the latest 32 counts' \
+  "$(jq -e '(.arrow|length)==32 and .scored==33 and .arrow[0]==39 and .arrow[-1]==8 and .streak==0 and .earned==32' <<<"$ARROW33_GOV" >/dev/null 2>&1; echo $?)" \
+  "$ARROW33_GOV"
 # No explicit policy: count, grant, and trajectory are advisory and never ration a safe review.
 gseed nohist 3
 GOUT="$(gguard nohist)"; GRC=$?
@@ -5978,6 +6009,20 @@ rd_expect_stop 'unresolved completed-result identity tie stops closed' \
 
 # #147: an uncollected result whose evidence mode can never carry merge proof is unrepairable. The
 # reducer must say so in a closed reason that names the mode and marker, never re-issue collect.
+# gate r1 P2 (#174, v0.53.0): the reducer's normalized-input guard refuses any array longer than
+# 32 before it considers completed results or recovery. A 32-count arrow must still reduce to a
+# grant; a 33-count arrow is refused as unsafe-normalized-input -- the planted negative that
+# proves the builder's bound is load-bearing rather than cosmetic.
+ARROW32_PATCH="$(jq -cn '{governor:{arrow:[range(32)|40-.],continue_override:false,earned:31,grant:8,granted:true,policy_mode:"advisory",scored:32,streak:0}}')"
+ARROW32_OUT="$(rd_reduce "$(rd_facts "$ARROW32_PATCH")")"
+check '#174 gate r1 P2: a 32-count arrow still reduces to a round grant' \
+  "$(jq -e '.action=="run-granted-review" and .reason=="round-granted-for-changed-input"' <<<"$ARROW32_OUT" >/dev/null 2>&1; echo $?)" \
+  "$ARROW32_OUT"
+ARROW33_PATCH="$(jq -cn '{governor:{arrow:[range(33)|40-.],continue_override:false,earned:32,grant:8,granted:true,policy_mode:"advisory",scored:33,streak:0}}')"
+ARROW33_OUT="$(rd_reduce "$(rd_facts "$ARROW33_PATCH")")"
+check '#174 gate r1 P2 planted negative: a 33-count arrow is refused as unsafe-normalized-input, which is why the builder bounds it' \
+  "$(jq -e '.action=="stop-without-new-review" and .reason=="unsafe-normalized-input"' <<<"$ARROW33_OUT" >/dev/null 2>&1; echo $?)" \
+  "$ARROW33_OUT"
 NOT_BINDABLE_PATCH='{"completed_results":[{"applicable":true,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bindable":false,"binding_valid":false,"canonical_identity":"pg-run-acme-widgets-1983-1700000350-1","charged_spend_epoch":1700000350,"collected":false,"evidence_mode":"connector","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000350-1","provenance_valid":false,"verdict":"NONE"}]}'
 NOT_BINDABLE_OUT="$(rd_reduce "$(rd_facts "$NOT_BINDABLE_PATCH")")"
 check 'uncollected result that can never bind stops typed with its mode and marker, never collects' \

@@ -2023,7 +2023,11 @@ pg_install_full_pr_input_binding() { # marker; only endpoint-fetched full PRs ga
   if [ "${PG_FULL_PR_PROVEN:-0}" != 1 ]; then
     if [ "$DIFF_IS_CALLER_SUPPLIED" = 1 ] && [ -n "${RUN_SPEND_EPOCH:-}" ] \
        && [ -n "${PG_META_HOST:-}${PG_META_OWNER:-}${PG_META_REPO:-}" ] && [ -n "$PR_NUM" ]; then
-      local cp_head cp_gh_bin cp_timeout_bin cp_payload
+      # gate r1 P1 (v0.53.0): every local here is initialised. The engine runs under set -u, and
+      # a `local cp_head` left unassigned when gh or timeout is unavailable made the regex test
+      # below abort the whole run as an unbound variable -- AFTER the round was charged and
+      # BEFORE anything was submitted. The `|| true` on the caller cannot catch a shell exit.
+      local cp_head='' cp_gh_bin='' cp_timeout_bin='' cp_payload=''
       # gate r1 P1: target.head_oid must be the PR's GitHub-reported head, never the caller's
       # local checkout state — `git -C "$REPO" rev-parse HEAD` can diverge from the real pushed
       # head (a stale or ahead-of-PR clone), and recover_superseded_reason later trusts this value

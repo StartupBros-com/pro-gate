@@ -2730,7 +2730,13 @@ pg_round_governor_facts_json() {
   if [ -z "$PG_ROUND_ARROW" ]; then
     arrow_json='[]'
   else
-    arrow_json="$(printf '%s' "$PG_ROUND_ARROW" | jq -R -c 'split("→") | map(tonumber)' 2>/dev/null)"
+    # gate r1 P2 (v0.53.0): export only the latest 32 counts. pg_review_decision_reduce refuses
+    # any normalized-input array longer than 32 as unsafe-normalized-input before it looks at
+    # completed results or recovery, so an unbounded arrow (advisory mode permits any number of
+    # shrinking rounds) would make every decision for that change fail -- including collecting a
+    # finished SHIP. The counters (scored/earned/streak) keep the full in-window history; only the
+    # serialized trajectory is bounded.
+    arrow_json="$(printf '%s' "$PG_ROUND_ARROW" | jq -R -c 'split("→") | map(tonumber) | .[-32:]' 2>/dev/null)"
     case "$arrow_json" in ''|null) arrow_json='[]';; esac
   fi
   pg_round_continue_override && continue_override=true
