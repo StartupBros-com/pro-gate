@@ -662,35 +662,6 @@ pg_reservation_marker_ok() {
   esac
 }
 
-# pg_conversation_url_ok <url>: the shape a remembered conversation URL must have. Deliberately
-# kept in step with cdp-salvage.mjs's CONVERSATION_URL_RE (v0.42 #109) -- the same two-language
-# duplication THROTTLE_RE already accepts there, for the same reason: a shell caller needs its
-# own boolean test rather than a subprocess round trip for every memo read. A synthetic
-# placeholder such as https://chatgpt.com/c/WEB:<uuid> must fail this exactly like it fails the
-# Node copy: the segment after /c/ is one path component of letters, digits, and dashes only,
-# optionally followed by a query or fragment.
-pg_conversation_url_ok() {
-  local url="${1:-}" id
-  case "$url" in
-    https://chatgpt.com/c/*) id="${url#https://chatgpt.com/c/}"; id="${id%%[\?\#]*}";;
-    *) return 1;;
-  esac
-  case "$id" in ''|*[!A-Za-z0-9-]*) return 1;; *) return 0;; esac
-}
-
-# pg_conversation_url_read <marker>: the remembered conversation URL for <marker> (written by
-# cdp-salvage.mjs's rememberUrl on every positive match) when its memo exists and passes
-# pg_conversation_url_ok, else empty. Bounded like every other memo consumer (head -c 300) --
-# the memo is one line.
-pg_conversation_url_read() {
-  local marker="${1:-}" f url
-  pg_reservation_marker_ok "$marker" || return 0
-  f="$PRO_GATE_HOME/conversation-urls/$marker"
-  [ -f "$f" ] && [ ! -L "$f" ] || return 0
-  url="$(head -c 300 "$f" 2>/dev/null | tr -d '\n')"
-  pg_conversation_url_ok "$url" && printf '%s\n' "$url"
-}
-
 # Recovery identity must retain the canonical host/owner/repo triple. ROUND_KEY's historic
 # owner-repo slug is deliberately NOT reversible: a-b/c and a/b-c both become a-b-c.
 pg_run_meta_dir() { echo "${PRO_GATE_RUN_META_DIR:-$PRO_GATE_HOME/run-meta}"; }

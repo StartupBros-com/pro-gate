@@ -6612,25 +6612,15 @@ check 'supersession retains the charged round and durable proof event' \
 # detection (site 2, exercised separately below with its own marker) -- this time against a real
 # mock CDP server standing in for --remote-chrome, rather than the unreachable :65530 the checks
 # above use by design.
-#
-# gate r7 P2: closing blind could strand a superseded round with NEITHER an open tab NOR a
-# conversation-urls memo when the delayed early organizer never ran (disabled, failed, or simply
-# not yet reached) -- breaking the superseded-but-still-collectable contract (an audit harvest of
-# a paid review). recover_close_tab() now REQUIRES a remembered, shape-valid conversation URL
-# memo before it will ask cdp-salvage.mjs to close anything, so the two positive cases below seed
-# one; the negative case right after them proves the memo-less tab is left open AND still
-# harvestable.
 SUPER_CLOSE_TAB_SOURCE="$TDIR/superseded-close-tab.txt"
 printf 'run marker: %s\nA finished Pro review conversation.\n' "$SUPER_HEAD_MARKER" > "$SUPER_CLOSE_TAB_SOURCE"
 SUPER_CLOSE_TAB_STATE="$TDIR/superseded-close-tab-state.json"
 printf '{"title":null,"archived":false,"events":[]}\n' > "$SUPER_CLOSE_TAB_STATE"
-mkdir -p "$SUPER_HEAD_HOME/conversation-urls"
-printf 'https://chatgpt.com/c/mock-conversation\n' > "$SUPER_HEAD_HOME/conversation-urls/$SUPER_HEAD_MARKER"
 start_mock "$SUPER_CLOSE_TAB_SOURCE" "$SUPER_CLOSE_TAB_STATE"
 env -u PRO_GATE_KEEP_TABS PRO_GATE_HOME="$SUPER_HEAD_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_SELF_HEAL=0 NODE_OPTIONS= \
   bash "$ENGINE" --recover "$SUPER_HEAD_MARKER" --timeout 1s >"$TDIR/super-close.stdout" 2>"$TDIR/super-close.stderr"
 SUPER_CLOSE_RC=$?
-check '#206 already-superseded recovery with a remembered URL closes its owned conversation tab' \
+check '#206 already-superseded recovery best-effort closes its owned conversation tab' \
   "$([ "$SUPER_CLOSE_RC" -eq 6 ] \
      && [ "$(cat "$TDIR/super-close.stderr")" = 'Review superseded' ] \
      && [ "$(jq -r '(.closed // []) | map(select(. == "tab1")) | length' "$SUPER_CLOSE_TAB_STATE")" = 1 ]; echo $?)" \
@@ -6650,42 +6640,6 @@ check '#206 PRO_GATE_KEEP_TABS=1 leaves the superseded conversation tab open' \
      && [ "$(jq -r '(.closed // []) | map(select(. == "tab1")) | length' "$SUPER_CLOSE_TAB_STATE_KEEP")" = 0 ]; echo $?)" \
   "rc=$SUPER_CLOSE_KEEP_RC stderr=$(cat "$TDIR/super-close-keep.stderr") state=$(cat "$SUPER_CLOSE_TAB_STATE_KEEP")"
 
-# gate r7 P2 planted negative: the SAME already-superseded site, but with NO conversation-urls
-# memo for this marker. The fix must leave the owned tab OPEN (never call --close blind) so a
-# later marker-addressed --harvest still has a handle -- RED on 837189d: it closes the tab there,
-# and a following --harvest then reports the conversation gone instead of still generating.
-SUPER_CLOSE_NOMEMO_HOME="$TDIR/home-superseded-close-tab-nomemo"
-SUPER_CLOSE_NOMEMO_MARKER='pg-run-acme-fresh-77-1700014300-1'
-mkdir -p "$SUPER_CLOSE_NOMEMO_HOME/in-progress"
-printf '%s\t%s\t%s\t0\t1\tGPT-X\t%s\tsuperseded\n' "$SUPER_KEY" "$TDIR/superseded-nomemo-audit.md" "$(date +%s)" 1700014300 > "$SUPER_CLOSE_NOMEMO_HOME/in-progress/$SUPER_CLOSE_NOMEMO_MARKER"
-SUPER_CLOSE_NOMEMO_SOURCE="$TDIR/superseded-close-tab-nomemo.txt"
-printf 'run marker: %s\nA finished Pro review conversation.\n' "$SUPER_CLOSE_NOMEMO_MARKER" > "$SUPER_CLOSE_NOMEMO_SOURCE"
-SUPER_CLOSE_NOMEMO_STATE="$TDIR/superseded-close-tab-nomemo-state.json"
-printf '{"title":null,"archived":false,"events":[]}\n' > "$SUPER_CLOSE_NOMEMO_STATE"
-start_mock "$SUPER_CLOSE_NOMEMO_SOURCE" "$SUPER_CLOSE_NOMEMO_STATE"
-env -u PRO_GATE_KEEP_TABS PRO_GATE_HOME="$SUPER_CLOSE_NOMEMO_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_SELF_HEAL=0 NODE_OPTIONS= \
-  bash "$ENGINE" --recover "$SUPER_CLOSE_NOMEMO_MARKER" --timeout 1s >"$TDIR/super-close-nomemo.stdout" 2>"$TDIR/super-close-nomemo.stderr"
-SUPER_CLOSE_NOMEMO_RC=$?
-check '#206 gate r7 P2: memo-less superseded recovery leaves its owned conversation tab open' \
-  "$([ "$SUPER_CLOSE_NOMEMO_RC" -eq 6 ] \
-     && [ "$(cat "$TDIR/super-close-nomemo.stderr")" = 'Review superseded' ] \
-     && [ "$(jq -r '(.closed // []) | map(select(. == "tab1")) | length' "$SUPER_CLOSE_NOMEMO_STATE")" = 0 ]; echo $?)" \
-  "rc=$SUPER_CLOSE_NOMEMO_RC stderr=$(cat "$TDIR/super-close-nomemo.stderr") state=$(cat "$SUPER_CLOSE_NOMEMO_STATE")"
-
-# The point of leaving it open: a marker-addressed --harvest immediately after cleanup must still
-# find and read the SAME conversation instead of reporting it gone (the superseded-but-still-
-# collectable contract -- audit harvest of a paid review). No VERDICT in the fixture, so success
-# here is exit 9 "still generating" with the conversation actually matched, not "not found".
-env -u PRO_GATE_KEEP_TABS PRO_GATE_HOME="$SUPER_CLOSE_NOMEMO_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_SELF_HEAL=0 NODE_OPTIONS= \
-  bash "$ENGINE" --harvest "$SUPER_CLOSE_NOMEMO_MARKER" --out "$TDIR/super-close-nomemo-harvest.md" --timeout 1s \
-  >"$TDIR/super-close-nomemo-harvest.stdout" 2>"$TDIR/super-close-nomemo-harvest.stderr"
-SUPER_CLOSE_NOMEMO_HARVEST_RC=$?
-check '#206 gate r7 P2: harvest after memo-less cleanup still reads the (still open) tab' \
-  "$([ "$SUPER_CLOSE_NOMEMO_HARVEST_RC" -eq 9 ] \
-     && grep -qF 'still-generating: https://chatgpt.com/c/mock-conversation' "$TDIR/super-close-nomemo-harvest.stderr" \
-     && [ "$(phase_of "$TDIR/super-close-nomemo-harvest.md.status")" = in-progress ]; echo $?)" \
-  "rc=$SUPER_CLOSE_NOMEMO_HARVEST_RC stderr=$(cat "$TDIR/super-close-nomemo-harvest.stderr") status=$(cat "$TDIR/super-close-nomemo-harvest.md.status" 2>/dev/null)"
-
 # Site 2: the fresh GH-proof-based supersession path (recover_superseded_reason, a *different*
 # reservation that is NOT already state=superseded on disk) must also close its owned tab.
 SUPER_CLOSE2_HOME="$TDIR/home-superseded-close-tab2"
@@ -6695,16 +6649,13 @@ SUPER_CLOSE2_SOURCE="$TDIR/superseded-close-tab2.txt"
 printf 'run marker: %s\nA finished Pro review conversation.\n' "$SUPER_CLOSE2_MARKER" > "$SUPER_CLOSE2_SOURCE"
 SUPER_CLOSE2_STATE="$TDIR/superseded-close-tab2-state.json"
 printf '{"title":null,"archived":false,"events":[]}\n' > "$SUPER_CLOSE2_STATE"
-# gate r7 P2: same memo requirement as site 1 above -- seed it so this positive case still closes.
-mkdir -p "$SUPER_CLOSE2_HOME/conversation-urls"
-printf 'https://chatgpt.com/c/mock-conversation\n' > "$SUPER_CLOSE2_HOME/conversation-urls/$SUPER_CLOSE2_MARKER"
 start_mock "$SUPER_CLOSE2_SOURCE" "$SUPER_CLOSE2_STATE"
 : > "$SUPER_GH_CALLS"
 env -u PRO_GATE_KEEP_TABS PRO_GATE_HOME="$SUPER_CLOSE2_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_SELF_HEAL=0 \
   PRO_GATE_GH_BIN="$SUPER_GH" PG_TEST_GH_CALLS="$SUPER_GH_CALLS" PG_TEST_GH_MODE=ok PG_TEST_GH_STATE=OPEN PG_TEST_GH_HEAD="$FRESH_HEAD" NODE_OPTIONS= \
   bash "$ENGINE" --recover "$SUPER_CLOSE2_MARKER" --timeout 1s >"$TDIR/super-close2.stdout" 2>"$TDIR/super-close2.stderr"
 SUPER_CLOSE2_RC=$?
-check '#206 fresh GH-proof (head-moved) supersession with a remembered URL closes its owned conversation tab' \
+check '#206 fresh GH-proof (head-moved) supersession closes its owned conversation tab' \
   "$([ "$SUPER_CLOSE2_RC" -eq 6 ] \
      && [ "$(cat "$TDIR/super-close2.stderr")" = 'Review superseded' ] \
      && [ "$(jq -r '(.closed // []) | map(select(. == "tab1")) | length' "$SUPER_CLOSE2_STATE")" = 1 ]; echo $?)" \
