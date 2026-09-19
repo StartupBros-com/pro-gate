@@ -252,6 +252,9 @@ if memreason="$(pg_mem_headroom_ok)"; then
   if memnote="$(pg_mem_pressure_note)"; then W "memory tight: ${memnote} — the engine still runs, but a long review may be unstable; free memory (close apps/tabs) for best results";
   else P "memory headroom ok for a review ($(pg_mem_status))"; fi
 else W "memory pressure: ${memreason} — the engine will DEFER the slot (no quota spent); free memory and retry"; fi
+# #212 step 2: cgroup-scoped browser memory sentinel, separate from the host-wide check above.
+if browser_mem_reason="$(pg_browser_mem_pressure)"; then P "browser memory pressure: none"
+else W "browser memory pressure: ${browser_mem_reason}"; fi
 
 # config
 [ -n "${PRO_REVIEW_OWNERS:-}" ] && P "PRO_REVIEW_OWNERS='${PRO_REVIEW_OWNERS}'" || W "PRO_REVIEW_OWNERS unset (daemon needs it; interactive /pro-gate does not)"

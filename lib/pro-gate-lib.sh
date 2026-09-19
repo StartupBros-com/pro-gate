@@ -507,6 +507,123 @@ pg_browser_restarted_midrun() {
   echo "$up"
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# #212 step 2: cgroup-scoped browser memory sentinel. pg_mem_headroom_ok above is host-wide
+# (free -m) and cannot see a cgroup MemoryHigh/MemoryMax throttle while host RAM is idle — the
+# exact failure mode measured on PR #209 rounds 4-5 (2026-09-18: VmHWM 7.63 GiB, cgroup 8.42/8.59
+# GB). daemon/run-oracle-chrome.sh has no functions and top-level side effects (set -euo
+# pipefail), so all decision logic lives here (source-safe) and the daemon only backgrounds the
+# loop.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# pg_cgroup_mem_pct <cgroup-dir>: echoes memory.current as an integer percent of the effective
+# memory limit in a cgroup v2 directory -- memory.high, or memory.max when memory.high is the
+# literal "max". Echoes nothing and returns 0 (fail-open) when the directory or either file is
+# missing/unreadable/non-numeric, or neither file names a limit (both "max", or the resolved
+# limit is 0) -- never divides by zero, never errors.
+pg_cgroup_mem_pct() {
+  local dir="$1" cur high lim
+  [ -n "$dir" ] && [ -d "$dir" ] || return 0
+  cur="$(cat "$dir/memory.current" 2>/dev/null)" || return 0
+  case "$cur" in ''|*[!0-9]*) return 0 ;; esac
+  high="$(cat "$dir/memory.high" 2>/dev/null)" || return 0
+  if [ "$high" = max ]; then
+    lim="$(cat "$dir/memory.max" 2>/dev/null)" || return 0
+    [ "$lim" = max ] && return 0
+  else
+    lim="$high"
+  fi
+  case "$lim" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$lim" -gt 0 ] 2>/dev/null || return 0
+  echo $(( cur * 100 / lim ))
+  return 0
+}
+
+# pg_browser_cgroup_dir: echoes this process's cgroup v2 directory under /sys/fs/cgroup, or the
+# PRO_GATE_CGROUP_PATH override (tests). Echoes nothing on a v1 host (/proc/self/cgroup has more
+# than the single unified "0::/path" line) or any parse failure -- fail-open, the sampler simply
+# never arms.
+pg_browser_cgroup_dir() {
+  [ -n "${PRO_GATE_CGROUP_PATH:-}" ] && { echo "$PRO_GATE_CGROUP_PATH"; return 0; }
+  [ -r /proc/self/cgroup ] || return 0
+  local n line path
+  n="$(wc -l < /proc/self/cgroup 2>/dev/null)"
+  case "$n" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$n" -eq 1 ] || return 0
+  line="$(cat /proc/self/cgroup 2>/dev/null)"
+  case "$line" in
+    0::/*) path="${line#0::}" ;;
+    *) return 0 ;;
+  esac
+  echo "/sys/fs/cgroup${path}"
+}
+
+# pg_browser_mem_sampler_tick <cgroup-dir>: one sample. Reads pg_cgroup_mem_pct, keeps a
+# consecutive-high-sample counter in $PRO_GATE_HOME/.browser-mem-streak, and atomically writes
+# (tmp + mv) $PRO_GATE_HOME/browser.memory-pressure ("<pct> <epoch>", one line) once TWO
+# consecutive samples are at/above PRO_GATE_BROWSER_MEM_PRESSURE_PCT (default 85). A sample below
+# the threshold (or no pct available -- fail-open) resets the counter and removes the sentinel.
+# No-op (returns 0) when PRO_GATE_HOME is unset. Never errors.
+pg_browser_mem_sampler_tick() {
+  local cgroup_dir="$1" home sentinel state threshold pct streak
+  home="${PRO_GATE_HOME:-}"
+  [ -n "$home" ] || return 0
+  sentinel="$home/browser.memory-pressure"
+  state="$home/.browser-mem-streak"
+  threshold="${PRO_GATE_BROWSER_MEM_PRESSURE_PCT:-85}"
+  case "$threshold" in ''|*[!0-9]*) threshold=85 ;; esac
+  pct="$(pg_cgroup_mem_pct "$cgroup_dir" 2>/dev/null)"
+  streak="$(cat "$state" 2>/dev/null)"
+  case "$streak" in ''|*[!0-9]*) streak=0 ;; esac
+  if [ -n "$pct" ] && [ "$pct" -ge "$threshold" ] 2>/dev/null; then
+    streak=$(( streak + 1 ))
+    if [ "$streak" -ge 2 ]; then
+      { printf '%s %s\n' "$pct" "$(date +%s)" > "$sentinel.tmp.$$" && mv -f "$sentinel.tmp.$$" "$sentinel"; } 2>/dev/null || true
+    fi
+  else
+    streak=0
+    rm -f "$sentinel" 2>/dev/null || true
+  fi
+  { printf '%s' "$streak" > "$state.tmp.$$" && mv -f "$state.tmp.$$" "$state"; } 2>/dev/null || true
+  return 0
+}
+
+# pg_browser_mem_sampler_loop <cgroup-dir>: runs pg_browser_mem_sampler_tick every
+# PRO_GATE_BROWSER_MEM_SAMPLE_SECS seconds (default 5), forever, in the caller's process -- meant
+# to be backgrounded (`pg_browser_mem_sampler_loop & PID=$!`) by daemon/run-oracle-chrome.sh for
+# the life of the browser. Exits quietly on any error; never propagates a failure to the caller
+# (that script runs under set -e and must not die because a sample failed).
+pg_browser_mem_sampler_loop() {
+  local cgroup_dir="$1" secs
+  secs="${PRO_GATE_BROWSER_MEM_SAMPLE_SECS:-5}"
+  case "$secs" in ''|*[!0-9]*) secs=5 ;; esac
+  [ "$secs" -ge 1 ] 2>/dev/null || secs=5
+  while :; do
+    pg_browser_mem_sampler_tick "$cgroup_dir" 2>/dev/null || true
+    sleep "$secs" 2>/dev/null || return 0
+  done
+}
+
+# pg_browser_mem_pressure: 1 + a one-line typed reason on stdout when the sampler above has a
+# fresh browser.memory-pressure sentinel (mtime within PRO_GATE_BROWSER_MEM_PRESSURE_TTL seconds,
+# default 60) -- i.e. the browser's own cgroup has been at/above the pressure threshold for two
+# consecutive samples recently. Returns 0 silently (no output) when the sentinel is missing or
+# stale. Mirrors pg_mem_headroom_ok's return convention (0 = fine, 1 + reason = block) and
+# pg_cooldown_remaining_secs' mtime-age idiom (lib:526).
+pg_browser_mem_pressure() {
+  local sentinel ttl mt age pct
+  sentinel="${PRO_GATE_HOME:-}/browser.memory-pressure"
+  [ -n "${PRO_GATE_HOME:-}" ] && [ -f "$sentinel" ] || return 0
+  ttl="${PRO_GATE_BROWSER_MEM_PRESSURE_TTL:-60}"
+  case "$ttl" in ''|*[!0-9]*) ttl=60 ;; esac
+  mt="$(stat -c %Y "$sentinel" 2>/dev/null || stat -f %m "$sentinel" 2>/dev/null || echo 0)"
+  age=$(( $(date +%s) - mt ))
+  [ "$age" -ge 0 ] && [ "$age" -lt "$ttl" ] || return 0
+  pct="$(awk '{print $1}' "$sentinel" 2>/dev/null)"
+  echo "browser cgroup memory at ${pct:-?}% for 2+ consecutive samples (sentinel ${age}s old) — deferring the slot, no quota spent"
+  return 1
+}
+
 # pg_cooldown_active: 0 + a one-line reason on stdout while the account back-off cooldown is
 # live (v0.18: written by cdp-salvage on the "requests too quickly / temporarily limited"
 # throttle interstitial, and by oracle-review.sh on a Cloudflare anti-bot challenge).
@@ -551,6 +668,7 @@ pg_health_gate() {
     fi
   fi
   if ! reason="$(pg_mem_headroom_ok)"; then echo "$reason"; return 1; fi
+  if ! reason="$(pg_browser_mem_pressure)"; then echo "$reason"; return 1; fi
   return 0
 }
 

@@ -8185,4 +8185,60 @@ else
   echo 'ok - Turkish-locale fold case skipped (localedef unavailable, or grep -i is already locale-independent on this host)'
 fi
 
+# #212 step 2: cgroup-scoped browser memory sentinel. pg_mem_headroom_ok (host-wide free -m) can't
+# see a cgroup MemoryHigh/MemoryMax throttle while host RAM is idle -- PR #209 rounds 4-5 measured
+# exactly that (VmHWM 7.63 GiB, cgroup 8.42/8.59 GB). All decision logic lives in lib.sh, source-safe.
+echo '# pg_cgroup_mem_pct: percent of memory.current over the effective limit, fail-open on any gap'
+MEM_DIR="$TDIR/mem-sentinel"; mkdir -p "$MEM_DIR/fix-normal" "$MEM_DIR/fix-high-max" "$MEM_DIR/fix-no-limit" "$MEM_DIR/fix-missing-current"
+printf '850\n' > "$MEM_DIR/fix-normal/memory.current"; printf '1000\n' > "$MEM_DIR/fix-normal/memory.high"; printf '2000\n' > "$MEM_DIR/fix-normal/memory.max"
+printf '500\n' > "$MEM_DIR/fix-high-max/memory.current"; printf 'max\n' > "$MEM_DIR/fix-high-max/memory.high"; printf '1000\n' > "$MEM_DIR/fix-high-max/memory.max"
+printf '500\n' > "$MEM_DIR/fix-no-limit/memory.current"; printf 'max\n' > "$MEM_DIR/fix-no-limit/memory.high"; printf 'max\n' > "$MEM_DIR/fix-no-limit/memory.max"
+printf '500\n' > "$MEM_DIR/fix-missing-current/memory.high"; printf 'max\n' > "$MEM_DIR/fix-missing-current/memory.max"
+PCT_NORMAL="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_cgroup_mem_pct '$MEM_DIR/fix-normal'")"
+check 'pg_cgroup_mem_pct: current 850 over high 1000 -> 85' "$([ "$PCT_NORMAL" = 85 ]; echo $?)" "got=[$PCT_NORMAL]"
+PCT_HIGHMAX="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_cgroup_mem_pct '$MEM_DIR/fix-high-max'")"
+check 'pg_cgroup_mem_pct: high=max falls back to max -> 50' "$([ "$PCT_HIGHMAX" = 50 ]; echo $?)" "got=[$PCT_HIGHMAX]"
+PCT_NOLIMIT="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_cgroup_mem_pct '$MEM_DIR/fix-no-limit'")"
+check 'pg_cgroup_mem_pct: high=max and max=max -> empty (no limit, fail-open)' "$([ -z "$PCT_NOLIMIT" ]; echo $?)" "got=[$PCT_NOLIMIT]"
+PCT_MISSING="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_cgroup_mem_pct '$MEM_DIR/fix-missing-current'")"
+check 'pg_cgroup_mem_pct: missing memory.current -> empty (fail-open)' "$([ -z "$PCT_MISSING" ]; echo $?)" "got=[$PCT_MISSING]"
+
+echo '# pg_browser_mem_sampler_tick: sentinel arms on the 2nd consecutive high sample, not the 1st'
+MEM_HOME1="$TDIR/mem-sentinel/home-arm"; mkdir -p "$MEM_HOME1"
+PRO_GATE_HOME="$MEM_HOME1" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_browser_mem_sampler_tick '$MEM_DIR/fix-normal'"
+check 'sampler tick: a single high sample does not arm the sentinel' "$([ ! -f "$MEM_HOME1/browser.memory-pressure" ]; echo $?)" "$([ -f "$MEM_HOME1/browser.memory-pressure" ] && cat "$MEM_HOME1/browser.memory-pressure")"
+PRO_GATE_HOME="$MEM_HOME1" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_browser_mem_sampler_tick '$MEM_DIR/fix-normal'"
+check 'sampler tick: two consecutive high samples arm the sentinel' "$([ -f "$MEM_HOME1/browser.memory-pressure" ]; echo $?)" "sentinel missing"
+check 'sampler tick: sentinel content is "<pct> <epoch>"' "$(awk 'NF==2 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/{exit 0} {exit 1}' "$MEM_HOME1/browser.memory-pressure"; echo $?)" "$(cat "$MEM_HOME1/browser.memory-pressure")"
+
+echo '# pg_browser_mem_sampler_tick planted negative: one high sample then one low sample never arms'
+MEM_HOME2="$TDIR/mem-sentinel/home-noarm"; mkdir -p "$MEM_HOME2"
+PRO_GATE_HOME="$MEM_HOME2" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_browser_mem_sampler_tick '$MEM_DIR/fix-normal'"
+PRO_GATE_HOME="$MEM_HOME2" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_browser_mem_sampler_tick '$MEM_DIR/fix-high-max'"
+check 'sampler tick: high then low leaves no sentinel (planted negative)' "$([ ! -f "$MEM_HOME2/browser.memory-pressure" ]; echo $?)" "$([ -f "$MEM_HOME2/browser.memory-pressure" ] && cat "$MEM_HOME2/browser.memory-pressure")"
+
+echo '# pg_health_gate: a fresh browser-memory sentinel defers the slot; a stale one does not'
+MEM_HOME3="$TDIR/mem-sentinel/home-gate"; mkdir -p "$MEM_HOME3"
+printf '92 %s\n' "$(date +%s)" > "$MEM_HOME3/browser.memory-pressure"
+MEM_GATE_FRESH="$(PRO_GATE_HOME="$MEM_HOME3" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_health_gate")"
+MEM_GATE_FRESH_RC=$?
+check 'pg_health_gate: fresh browser-memory sentinel returns 1' "$([ "$MEM_GATE_FRESH_RC" -eq 1 ]; echo $?)" "rc=$MEM_GATE_FRESH_RC out=[$MEM_GATE_FRESH]"
+check 'pg_health_gate: reason names the percent, sentinel age, and no-spend deferral' \
+  "$(case "$MEM_GATE_FRESH" in *'92%'*'sentinel '*'s old'*'no quota spent'*) echo 0;; *) echo 1;; esac)" "$MEM_GATE_FRESH"
+touch -d '@0' "$MEM_HOME3/browser.memory-pressure"
+MEM_GATE_STALE="$(PRO_GATE_HOME="$MEM_HOME3" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_health_gate")"
+MEM_GATE_STALE_RC=$?
+check 'pg_health_gate: stale (mtime beyond TTL) browser-memory sentinel does not block' "$([ "$MEM_GATE_STALE_RC" -eq 0 ]; echo $?)" "rc=$MEM_GATE_STALE_RC out=[$MEM_GATE_STALE]"
+
+echo '# doctor: prints the browser-memory pressure P/W line beside the host-memory line'
+MEM_HOME4="$TDIR/mem-sentinel/home-doctor-fresh"; mkdir -p "$MEM_HOME4"
+printf '90 %s\n' "$(date +%s)" > "$MEM_HOME4/browser.memory-pressure"
+DOCTOR_MEM_FRESH="$(PRO_GATE_HOME="$MEM_HOME4" PRO_GATE_BROWSER_MODE=native PRO_GATE_SERVICE_MANAGER=none bash "$HERE/../bin/pro-gate-doctor.sh" 2>&1 || true)"
+check 'doctor: fresh sentinel prints the browser memory pressure warning line' \
+  "$(printf '%s' "$DOCTOR_MEM_FRESH" | grep -qF 'browser memory pressure: browser cgroup memory at 90%'; echo $?)" "$DOCTOR_MEM_FRESH"
+MEM_HOME5="$TDIR/mem-sentinel/home-doctor-clear"; mkdir -p "$MEM_HOME5"
+DOCTOR_MEM_CLEAR="$(PRO_GATE_HOME="$MEM_HOME5" PRO_GATE_BROWSER_MODE=native PRO_GATE_SERVICE_MANAGER=none bash "$HERE/../bin/pro-gate-doctor.sh" 2>&1 || true)"
+check 'doctor: no sentinel prints "browser memory pressure: none"' \
+  "$(printf '%s' "$DOCTOR_MEM_CLEAR" | grep -qF 'browser memory pressure: none'; echo $?)" "$DOCTOR_MEM_CLEAR"
+
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }
