@@ -8217,16 +8217,55 @@ PRO_GATE_HOME="$MEM_HOME2" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_browser
 PRO_GATE_HOME="$MEM_HOME2" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_browser_mem_sampler_tick '$MEM_DIR/fix-high-max'"
 check 'sampler tick: high then low leaves no sentinel (planted negative)' "$([ ! -f "$MEM_HOME2/browser.memory-pressure" ]; echo $?)" "$([ -f "$MEM_HOME2/browser.memory-pressure" ] && cat "$MEM_HOME2/browser.memory-pressure")"
 
+echo '# pg_browser_mem_sampler_tick discriminator: a THIRD (high) tick after the high-then-low pair'
+echo '# must not skip straight to armed -- proves the low sample RESETS the streak to 0, not just'
+echo '# skips the increment (a no-op variant would reach 2 here and wrongly arm) (review finding P2 #1)'
+PRO_GATE_HOME="$MEM_HOME2" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_browser_mem_sampler_tick '$MEM_DIR/fix-normal'"
+check 'sampler tick: high-low-high (3 ticks) still does not arm -- low sample resets, not a no-op' \
+  "$([ ! -f "$MEM_HOME2/browser.memory-pressure" ]; echo $?)" "$([ -f "$MEM_HOME2/browser.memory-pressure" ] && cat "$MEM_HOME2/browser.memory-pressure")"
+
+echo '# pg_browser_mem_sampler_loop: a leftover streak from a prior (e.g. crashed) invocation must not'
+echo '# carry into a fresh loop start -- it clears .browser-mem-streak/browser.memory-pressure before'
+echo '# its first tick, and killing its PID must not orphan its in-flight sleep (review findings P1 #1, P2 #2)'
+MEM_HOME6="$TDIR/mem-sentinel/home-restart"; mkdir -p "$MEM_HOME6"
+PRO_GATE_HOME="$MEM_HOME6" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_browser_mem_sampler_tick '$MEM_DIR/fix-normal'"
+check 'restart fixture: one high tick from the "prior run" leaves streak=1, no sentinel' \
+  "$([ "$(cat "$MEM_HOME6/.browser-mem-streak" 2>/dev/null)" = 1 ] && [ ! -f "$MEM_HOME6/browser.memory-pressure" ]; echo $?)" "streak=$(cat "$MEM_HOME6/.browser-mem-streak" 2>/dev/null)"
+PRO_GATE_HOME="$MEM_HOME6" PRO_GATE_BROWSER_MEM_SAMPLE_SECS=1000 bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_browser_mem_sampler_loop '$MEM_DIR/fix-normal'" &
+LOOP_PID_RESTART=$!
+sleep 0.5
+# Capture the sleep child's OWN pid before killing the loop -- once the loop (its parent) is
+# killed, the orphaned sleep is reparented away, so `pgrep -P <loop-pid>` would find nothing
+# AFTER the kill regardless of whether the orphan is still running. Track the specific pid instead.
+LOOP_SLEEP_PID="$(pgrep -P "$LOOP_PID_RESTART" 2>/dev/null | head -1)"
+kill "$LOOP_PID_RESTART" 2>/dev/null
+timeout 3 wait "$LOOP_PID_RESTART" 2>/dev/null
+sleep 0.3
+LOOP_SLEEP_SURVIVED=1
+[ -n "$LOOP_SLEEP_PID" ] && ! kill -0 "$LOOP_SLEEP_PID" 2>/dev/null && LOOP_SLEEP_SURVIVED=0
+[ -z "$LOOP_SLEEP_PID" ] && LOOP_SLEEP_SURVIVED=2
+check 'fresh loop invocation: leftover streak does not arm the sentinel on its first tick' \
+  "$([ ! -f "$MEM_HOME6/browser.memory-pressure" ]; echo $?)" "$([ -f "$MEM_HOME6/browser.memory-pressure" ] && cat "$MEM_HOME6/browser.memory-pressure")"
+check 'fresh loop invocation: streak after first tick is 1 (reset then incremented once), not 2+' \
+  "$([ "$(cat "$MEM_HOME6/.browser-mem-streak" 2>/dev/null)" = 1 ]; echo $?)" "streak=$(cat "$MEM_HOME6/.browser-mem-streak" 2>/dev/null)"
+check 'sampler loop: killing its PID leaves no orphaned sleep child behind' \
+  "$([ "$LOOP_SLEEP_SURVIVED" -eq 0 ]; echo $?)" "sleep_pid=$LOOP_SLEEP_PID survived_flag=$LOOP_SLEEP_SURVIVED (0=reaped,1=orphan survived,2=never observed)"
+
 echo '# pg_health_gate: a fresh browser-memory sentinel defers the slot; a stale one does not'
+# Isolated from live Chrome CDP/systemd state, matching the doctor tests below and every other
+# pg_health_gate-touching test in this file: without this, the remote-chrome branch runs first
+# (lib:663) and on a host/CI runner with no live CDP session on the port it fails for the wrong
+# reason (and attempts a real `sudo -n systemctl start oracle-chrome` self-heal) instead of
+# reaching the new pg_browser_mem_pressure check at all (review finding P1, gate round 2).
 MEM_HOME3="$TDIR/mem-sentinel/home-gate"; mkdir -p "$MEM_HOME3"
 printf '92 %s\n' "$(date +%s)" > "$MEM_HOME3/browser.memory-pressure"
-MEM_GATE_FRESH="$(PRO_GATE_HOME="$MEM_HOME3" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_health_gate")"
+MEM_GATE_FRESH="$(PRO_GATE_HOME="$MEM_HOME3" PRO_GATE_BROWSER_MODE=native PRO_GATE_SERVICE_MANAGER=none bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_health_gate")"
 MEM_GATE_FRESH_RC=$?
 check 'pg_health_gate: fresh browser-memory sentinel returns 1' "$([ "$MEM_GATE_FRESH_RC" -eq 1 ]; echo $?)" "rc=$MEM_GATE_FRESH_RC out=[$MEM_GATE_FRESH]"
 check 'pg_health_gate: reason names the percent, sentinel age, and no-spend deferral' \
   "$(case "$MEM_GATE_FRESH" in *'92%'*'sentinel '*'s old'*'no quota spent'*) echo 0;; *) echo 1;; esac)" "$MEM_GATE_FRESH"
 touch -d '@0' "$MEM_HOME3/browser.memory-pressure"
-MEM_GATE_STALE="$(PRO_GATE_HOME="$MEM_HOME3" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_health_gate")"
+MEM_GATE_STALE="$(PRO_GATE_HOME="$MEM_HOME3" PRO_GATE_BROWSER_MODE=native PRO_GATE_SERVICE_MANAGER=none bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_health_gate")"
 MEM_GATE_STALE_RC=$?
 check 'pg_health_gate: stale (mtime beyond TTL) browser-memory sentinel does not block' "$([ "$MEM_GATE_STALE_RC" -eq 0 ]; echo $?)" "rc=$MEM_GATE_STALE_RC out=[$MEM_GATE_STALE]"
 

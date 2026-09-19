@@ -591,16 +591,28 @@ pg_browser_mem_sampler_tick() {
 # pg_browser_mem_sampler_loop <cgroup-dir>: runs pg_browser_mem_sampler_tick every
 # PRO_GATE_BROWSER_MEM_SAMPLE_SECS seconds (default 5), forever, in the caller's process -- meant
 # to be backgrounded (`pg_browser_mem_sampler_loop & PID=$!`) by daemon/run-oracle-chrome.sh for
-# the life of the browser. Exits quietly on any error; never propagates a failure to the caller
-# (that script runs under set -e and must not die because a sample failed).
+# the life of the browser. Clears any leftover .browser-mem-streak/browser.memory-pressure from a
+# prior invocation before its first tick, so a restarted daemon (crash/deploy/manual restart)
+# always starts its 2-consecutive-sample count from zero rather than combining a leftover streak
+# with one fresh sample (review finding P1 #1). Backgrounds each sleep so a TERM/INT received
+# between samples kills the sleep immediately instead of leaving it as an orphan (review finding
+# P2 #2). Exits quietly on any error; never propagates a failure to the caller (that script runs
+# under set -e and must not die because a sample failed).
 pg_browser_mem_sampler_loop() {
-  local cgroup_dir="$1" secs
+  local cgroup_dir="$1" secs home sleep_pid
   secs="${PRO_GATE_BROWSER_MEM_SAMPLE_SECS:-5}"
   case "$secs" in ''|*[!0-9]*) secs=5 ;; esac
   [ "$secs" -ge 1 ] 2>/dev/null || secs=5
+  home="${PRO_GATE_HOME:-}"
+  if [ -n "$home" ]; then
+    rm -f "$home/.browser-mem-streak" "$home/browser.memory-pressure" 2>/dev/null || true
+  fi
+  trap '[ -n "${sleep_pid:-}" ] && kill "$sleep_pid" 2>/dev/null; exit 0' TERM INT
   while :; do
     pg_browser_mem_sampler_tick "$cgroup_dir" 2>/dev/null || true
-    sleep "$secs" 2>/dev/null || return 0
+    sleep "$secs" 2>/dev/null &
+    sleep_pid=$!
+    wait "$sleep_pid" 2>/dev/null || return 0
   done
 }
 
