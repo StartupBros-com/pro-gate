@@ -283,6 +283,26 @@ pg_pid_token() {
   printf '%s' "$st"
 }
 
+# pg_pid_recycled <pid> <stored-token>: 0 ONLY when it is positively PROVEN that <pid> has been
+# recycled -- the process now holding that pid is not the one that wrote <stored-token>. 1 in
+# every other case, including the two "cannot tell" cases, which must fail closed toward "still
+# the original holder" rather than toward "recycled": an unreadable/empty stored token (nothing
+# to compare against) and a failed recomputation of <pid>'s CURRENT token (a /proc read or `ps`
+# fork can fail transiently for a perfectly live pid). Treating either failure as proof of
+# recycling is the defect issue #177 named in pg_harvest_claimed's and st_inflight's own copies
+# of this comparison: an empty recomputed token compared unequal to a valid stored one, so a
+# live, correctly-identified holder read as dead. Liveness must be positively DISPROVED, never
+# inferred from a failed measurement (gate #148 r8 P0, applied here to every reader of this
+# shape: pg_dirlock_reclaim_dead, pg_harvest_claimed's no-flock branch, and st_inflight in
+# bin/oracle-review.sh).
+pg_pid_recycled() {
+  local pid="$1" tok="$2" cur
+  [ -n "$tok" ] || return 1
+  cur="$(pg_pid_token "$pid" 2>/dev/null || true)"
+  [ -n "$cur" ] || return 1
+  [ "$tok" != "$cur" ]
+}
+
 pg_lock() {
   local lockfile="$1" wait_s="${2:-2400}"
   if pg_have flock; then
@@ -294,8 +314,35 @@ pg_lock() {
     fi
     return 0   # unwritable lock path -> proceed unlocked (preserves prior behavior)
   fi
-  local lockdir="${lockfile}.d" start
+  local lockdir="${lockfile}.d" start spins=0 max_spins
   start=$(date +%s)
+  # A successful reclaim is not a wait: it retries mkdir at once, spending neither the sleep below
+  # nor the wait bound beside it. That is progress only while it is finite, so the reclaim path
+  # carries its own bound, exactly as pg_reservation_guard_acquire's does and for the same reason
+  # (#189). Without one, sustained reclaim-success with mkdir still failing -- the pathological
+  # alternation of dead owners, another process re-creating this pathname between our reclaim and
+  # our mkdir -- retried forever at 100% CPU and never honoured wait_s at all.
+  #
+  # The counter is the ONLY bound on that path, deliberately, and an elapsed check does NOT belong
+  # beside it: it would throw away a reclaim that had just succeeded, and the free lock with it.
+  # A directory orphaned between its mkdir and its owner record is reclaimable only once it has
+  # sat unmarked for PRO_GATE_DIRLOCK_ORPHAN_GRACE (default 5s), which a waiter reaches one sleep
+  # AFTER a stock 5s budget has already run out -- so the reclaim that recovers a crashed run is
+  # routinely the late one. It acquired the lock before this change and it must keep acquiring it;
+  # crash recovery is the case this whole branch exists for. Reproduced at the shipped 5s/5s
+  # defaults during review, with a regression test beside the spin test.
+  #
+  # Sized off wait_s but computed from a SANITIZED copy, never by overwriting wait_s: the value
+  # arrives from operator env knobs (PRO_GATE_CHANGE_LOCK_WAIT and friends) and is handed to
+  # `flock -w` above, so it must keep behaving exactly as it does today. `10#` forces base ten --
+  # a zero-padded budget like `08` is not a valid OCTAL literal, and bash aborts the whole function
+  # on that arithmetic error, refusing even an uncontended lock. The digit clamp keeps an absurd
+  # budget from overflowing int64 into a NEGATIVE bound, which would compare true on the first
+  # reclaim and refuse a lock whose owner is provably dead. Both were caught in review, both are
+  # regressions this bound would otherwise have introduced, and both have their own test.
+  max_spins="$wait_s"; case "$max_spins" in ''|*[!0-9]*) max_spins=2400;; esac
+  [ "${#max_spins}" -le 9 ] || max_spins=2400
+  max_spins=$(( 10#$max_spins * 100 + 100 ))
   while ! mkdir "$lockdir" 2>/dev/null; do
     # The old inline reclaim read the owner pid, and on a dead one rm -rf'd the directory and
     # retried. Three things were wrong with it and all three are the reclaimer's job now:
@@ -304,7 +351,10 @@ pg_lock() {
     # on the line below was never read back, so a recycled pid read as the original owner.
     # Racing this is safe -- reclaiming is not the mutual exclusion, mkdir is, and the loser
     # of that simply comes round again.
-    if ! pg_dirlock_reclaim_dead "$lockdir" 2>/dev/null; then
+    if pg_dirlock_reclaim_dead "$lockdir" 2>/dev/null; then
+      spins=$(( spins + 1 ))
+      [ "$spins" -ge "$max_spins" ] && return 1
+    else
       [ $(( $(date +%s) - start )) -ge "$wait_s" ] && return 1
       sleep 2
     fi
@@ -464,16 +514,24 @@ pg_browser_restarted_midrun() {
 # file expires by mtime, no cleanup needed. GNU stat || BSD stat. Checked alone by --harvest
 # (which spends nothing, so box-fitness gates don't apply) and inside pg_health_gate.
 pg_cooldown_active() {
+  local cdf left
+  cdf="${PRO_GATE_COOLDOWN_FILE:-$PRO_GATE_HOME/throttle.cooldown}"
+  left="$(pg_cooldown_remaining_secs)"
+  [ "$left" -gt 0 ] 2>/dev/null || return 1
+  echo "ChatGPT account back-off cooldown active (${left}s left; throttle/cloudflare; rm $cdf to override)"
+}
+# pg_cooldown_remaining_secs: whole seconds left on that cooldown, 0 when none is active. The
+# typed review decision carries this number (#162) so a wrapper can wait it out instead of
+# re-querying blindly; pg_cooldown_active derives its one-line reason from the same clock.
+pg_cooldown_remaining_secs() {
   local cdf cds mt age
   cdf="${PRO_GATE_COOLDOWN_FILE:-$PRO_GATE_HOME/throttle.cooldown}"
   cds="${PRO_GATE_THROTTLE_COOLDOWN:-900}"
-  [ -f "$cdf" ] || return 1
+  case "$cds" in ''|*[!0-9]*) cds=900;; esac
+  [ -f "$cdf" ] || { echo 0; return 0; }
   mt="$(stat -c %Y "$cdf" 2>/dev/null || stat -f %m "$cdf" 2>/dev/null || echo 0)"
   age=$(( $(date +%s) - mt ))
-  if [ "$age" -ge 0 ] && [ "$age" -lt "$cds" ]; then
-    echo "ChatGPT account back-off cooldown active ($(( cds - age ))s left; throttle/cloudflare; rm $cdf to override)"; return 0
-  fi
-  return 1
+  if [ "$age" -ge 0 ] && [ "$age" -lt "$cds" ]; then echo $(( cds - age )); else echo 0; fi
 }
 
 # pg_health_gate: call right before spending a Pro review slot (and before each retry).
@@ -533,6 +591,46 @@ pg_reservation_dir() { echo "${PRO_GATE_RESERVATION_DIR:-$PRO_GATE_HOME/in-progr
 # reservation: slot planning counted it, and reconciliation probed it and rewrote it as a miss
 # record, destroying the manifest (gate #54 P1).
 pg_manifest_dir() { echo "${PRO_GATE_MANIFEST_DIR:-$PRO_GATE_HOME/manifests}"; }
+# v0.42 (#109): per-marker record of what the salvage helper concluded on its LATEST pass, so
+# --status can name a stall (owned-incomplete, inconclusive, browser-down, absent, cross-bound,
+# throttle, terminal, terminal-infrastructure) instead of one word for every unresolved
+# attempt. A sidecar directory, not a reservation column: the record's tab-separated column count
+# is fragile (the per-field reads above exist because `read` collapses empty columns). The kind is
+# the closed vocabulary the helper prints as `evidence-kind: <kind>`; anything else is dropped.
+# pg_salvage_class_ok is the single allowlist gating both the writer and the reader, so a
+# malformed or unrecognized sidecar can never be read back as a valid classification.
+# Swept with the same 14-day hygiene as conversation memos. Observation only — nothing reads this
+# to decide release, refund, or admission.
+pg_salvage_class_dir() { printf '%s\n' "${PRO_GATE_SALVAGE_CLASS_DIR:-$PRO_GATE_HOME/salvage-class}"; }
+pg_salvage_class_ok() { # kind
+  case "$1" in
+    owned-incomplete|inconclusive|browser-down|absent|cross-bound|throttle|terminal|terminal-infrastructure) return 0;;
+    *) return 1;;
+  esac
+}
+pg_salvage_class_write() { # marker kind
+  local marker="$1" kind="$2" dir tmp
+  pg_reservation_marker_ok "$marker" || return 1
+  pg_salvage_class_ok "$kind" || return 1
+  dir="$(pg_salvage_class_dir)"; mkdir -p "$dir" 2>/dev/null || return 1
+  tmp="$dir/$marker.tmp.$$"
+  printf '%s\t%s\n' "$kind" "$(date +%s)" > "$tmp" 2>/dev/null && mv -f "$tmp" "$dir/$marker" 2>/dev/null
+}
+pg_salvage_class_read() { # marker -> "kind<TAB>epoch" (empty and rc 1 when absent or malformed)
+  local marker="$1" f line kind epoch
+  pg_reservation_marker_ok "$marker" || return 1
+  f="$(pg_salvage_class_dir)/$marker"; [ -s "$f" ] || return 1
+  line="$(head -n1 "$f" 2>/dev/null | awk -F'\t' 'NF==2 {print $1 "\t" $2}')"
+  [ -n "$line" ] || return 1
+  kind="${line%%$'\t'*}"
+  epoch="${line#*$'\t'}"
+  pg_salvage_class_ok "$kind" || return 1
+  case "$epoch" in
+    ''|*[!0-9]*) return 1;;
+  esac
+  printf '%s\t%s\n' "$kind" "$epoch"
+}
+
 pg_reservation_lock() { echo "${PRO_GATE_RESERVATION_LOCK:-$PRO_GATE_HOME/in-progress.lock}"; }
 # The collection wait every operator-facing hint prints. It lives here, not in the engine, because
 # the library prints hints too (pg_report_capacity_holders): v0.41 sized the engine's hints but
@@ -1160,7 +1258,7 @@ pg_dirlock_owner_count() {
 #
 # Returns 0 when the directory is gone, 1 when it is held or too young to judge.
 pg_dirlock_reclaim_dead() {
-  local lockdir="$1" f pid tok cur had_marker=0 grace age
+  local lockdir="$1" f pid tok had_marker=0 grace age
   [ -d "$lockdir" ] || return 1
   for f in "$lockdir"/owner.*; do
     [ -e "$f" ] || continue
@@ -1169,17 +1267,11 @@ pg_dirlock_reclaim_dead() {
     case "$pid" in ''|*[!0-9]*) rm -f "$f" 2>/dev/null; continue;; esac
     if kill -0 "$pid" 2>/dev/null; then
       tok="$(head -c 64 "$f" 2>/dev/null | tr -d '\n')"
-      # An unreadable or tokenless marker cannot be disproved: fail closed and leave it held.
-      [ -n "$tok" ] || return 1
-      # The RECOMPUTED token must fail closed on exactly the same terms as the stored one. Reading
-      # it can fail transiently for a perfectly live pid -- a /proc read or a `ps` fork under
-      # memory pressure -- and an empty result then compares unequal to a valid stored token,
-      # falling through to unlink a LIVE owner's marker and letting a reclaimer take a guard whose
-      # holder is still inside it. Liveness must be positively DISPROVED before removal, never
-      # inferred from a failed measurement.
-      cur="$(pg_pid_token "$pid" 2>/dev/null || true)"
-      [ -n "$cur" ] || return 1
-      [ "$tok" = "$cur" ] && return 1
+      # pg_pid_recycled fails closed (held) on an unreadable/tokenless marker or a recomputation
+      # that fails transiently for a perfectly live pid (a /proc read or a `ps` fork under memory
+      # pressure) -- either failure must never be read as proof the holder is dead. Liveness must
+      # be positively DISPROVED before removal, never inferred from a failed measurement.
+      pg_pid_recycled "$pid" "$tok" || return 1
     fi
     rm -f "$f" 2>/dev/null
   done
@@ -1209,12 +1301,9 @@ pg_dirlock_reclaim_dead() {
         if kill -0 "$pid" 2>/dev/null; then
           tok="$(head -c 64 "$lockdir/token" 2>/dev/null | tr -d '\n')"
           # A tokenless lock is legacy: a live pid is the whole claim, so it holds.
-          [ -n "$tok" ] || return 1
-          # Same rule as above -- the recomputed token must fail closed too, or a transient
-          # read makes a live holder look dead and hands its lock to a reclaimer.
-          cur="$(pg_pid_token "$pid" 2>/dev/null || true)"
-          [ -n "$cur" ] || return 1
-          [ "$tok" = "$cur" ] && return 1
+          # pg_pid_recycled fails closed the same way for a transient recompute failure -- a
+          # merely-unlucky read must never hand a live holder's lock to a reclaimer.
+          pg_pid_recycled "$pid" "$tok" || return 1
         fi
         rm -f "$lockdir/pid" "$lockdir/token" 2>/dev/null
         ;;
@@ -1850,18 +1939,23 @@ pg_harvest_claimed() {
   case "$opid" in ''|*[!0-9]*) return 1;; esac        # torn/missing owner record: not a claim
   kill -0 "$opid" 2>/dev/null || return 1             # dead holder: stale directory
   otok="$(cat "$f.d/token" 2>/dev/null || true)"
-  if [ -n "$otok" ] && [ "$otok" != "$(pg_pid_token "$opid" 2>/dev/null)" ]; then
-    return 1                                          # pid reused by an unrelated process
-  fi
+  # pg_pid_recycled fails closed (not recycled -> still held) when otok is empty/unreadable or
+  # the recomputation fails transiently -- issue #177: comparing a failed recompute's empty
+  # output directly against otok made a live, correctly-identified holder read as dead.
+  pg_pid_recycled "$opid" "$otok" && return 1         # pid reused by an unrelated process
   return 0
 }
 
 # pg_reservation_reconcile <salvage-script> <port>: drop reservations older than TTL or only
 # after N consecutive confirmed-absent probes. A single 10s miss is NOT proof of loss: suspended
 # renderers, hydration delays, and temporary marker-read failures caused false releases in review.
-# Live (0) resets misses; throttle (5) and other errors keep state fail-closed.
+# Live (0) resets misses; throttle (5) and other errors keep state fail-closed. A live probe that
+# reports `probe-state: throttled` (#162: the limiter's modal over this run's conversation) is
+# neither progress nor absence: the record is retained with its miss streak untouched, and
+# because every probe is a page load against the throttled account, no further marker is probed
+# while the cooldown that probe wrote is active. TTL-only sweeps never rendered and still run.
 pg_reservation_reconcile() {
-  local salvage="$1" port="$2" dir ttl miss_limit interval now f marker pr out created misses slot model spend age mt rc probe_out
+  local salvage="$1" port="$2" dir ttl miss_limit interval now f marker pr out created misses slot model spend age mt rc probe_out cooldown_noted=0
   dir="$(pg_reservation_dir)"; [ -d "$dir" ] || return 0
   ttl="${PRO_GATE_RESERVATION_TTL:-21600}"; miss_limit="${PRO_GATE_RESERVATION_MISSES:-3}"
   interval="${PRO_GATE_RECONCILE_INTERVAL:-60}"; now="$(date +%s)"
@@ -1898,6 +1992,13 @@ pg_reservation_reconcile() {
     # TTL-only mode: harvest performs its own observation. It never releases on elapsed time alone;
     # misses remain explicit proof and are counted by that caller when its capture is absent.
     [ "${PG_RES_TTL_ONLY:-0}" = 1 ] && continue
+    # Checked per marker, not once per sweep: the throttle can first surface on this sweep's own
+    # probe of an earlier marker, and every later render would deepen the block.
+    if pg_cooldown_active >/dev/null 2>&1; then
+      [ "$cooldown_noted" = 1 ] || echo "[pro-gate] reservation probes skipped: $(pg_cooldown_active) — records retained, misses unchanged" >&2
+      cooldown_noted=1
+      continue
+    fi
     # Rate-limit probes per marker by file mtime: N concurrent fresh runs must not turn one
     # real absence window into N miss increments, and back-to-back reconciles should not spam
     # conversation probes. Writes/updates touch mtime, so consecutive misses are spaced by at
@@ -1905,6 +2006,8 @@ pg_reservation_reconcile() {
     mt="$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)"
     [ "$(( now - mt ))" -lt "$interval" ] 2>/dev/null && continue
     rc=2; probe_out="$(node "$salvage" --probe "$marker" 10 "$port" 2>&1 >/dev/null)"; rc=$?
+    # v0.42 (#109): remember what this probe concluded, for --status. Observation only.
+    pg_salvage_class_write "$marker" "$(printf '%s' "$probe_out" | sed -n 's/^evidence-kind: //p' | tail -1)" 2>/dev/null || true
     case "$rc" in
       0)
         # A found conversation is not automatically an OCCUPIED one. ChatGPT keeps conversations
@@ -1925,6 +2028,11 @@ pg_reservation_reconcile() {
           else
             echo "[pro-gate] terminal infrastructure proof for $marker could not be persisted safely — reservation retained" >&2
           fi
+        elif printf '%s' "$probe_out" | grep -q '^probe-state: throttled$'; then
+          # The conversation exists under the "Too many requests" modal: not absence (no miss),
+          # not progress (no reset). The probe wrote the cooldown; the check above skips the rest
+          # of this sweep, pg_health_gate pauses fresh spends, and --harvest defers until it clears.
+          echo "[pro-gate] reservation $marker is throttled — ChatGPT's rate-limit modal covers its conversation; retained with misses unchanged, cooldown engaged" >&2
         else
           [ "$misses" -eq 0 ] || {
             pg_reservation_guard_acquire || continue
@@ -2612,6 +2720,15 @@ pg_trim_file() {
 # foreign or stale conversation's answer. The engine strips the token before returning output.
 # ─────────────────────────────────────────────────────────────────────────────
 # pg_capture_nonce_ok <file> <marker>: the terminal authoritative verdict must echo this run.
+# Case-SENSITIVE on purpose, and the asymmetry with the browser side is the point (#166/#167).
+# This is an ACCEPTANCE predicate: rc 0 publishes the capture as this run's review. A false
+# positive here ships a possibly-foreign answer, so it fails closed and a case-only echo drift
+# stays nonce-less -- the run retries, costing liveness, never correctness. The browser-side
+# ownership checks in cdp-salvage.mjs are CONVICTION predicates: a false positive there
+# blacklists the conversation and discards a finished review permanently, so those fold case.
+# Fail closed where a wrong accept publishes; fail open where a wrong refusal destroys evidence.
+# #166 locked this direction with a test ("mis-cased own echo remains unbound without becoming a
+# foreign claim"); do not fold this comparison without retiring that test on the record.
 pg_capture_nonce_ok() {
   local f="$1" marker="$2"
   [ -s "$f" ] || return 1
@@ -2623,8 +2740,17 @@ pg_strip_nonce() {
   [ -s "$f" ] || return 0
   # Fixed-string removal via awk (the marker is regex-safe by charset, but the parentheses
   # around it are not; index/substr avoids regex entirely).
-  awk -v tok="(run marker: $marker)" '{
-    i = index($0, tok)
+  # The LOOKUP is case-folded and the SLICE is not (#167). This does NOT mirror
+  # pg_capture_nonce_ok, which stays case-sensitive by design; it mirrors cdp-salvage.mjs's
+  # stripMarkerEcho, because finalizerOwnership compares its stripped bytes against the bytes
+  # stripped here. One folding and the other not is a result-mismatch on a valid review. tolower() applies only to the search operands, so every other byte
+  # on the line is published exactly as the model wrote it. Same LC_ALL=C reasoning as
+  # pg_capture_nonce_ok: gawk's tolower() is locale-sensitive, and the C locale keeps
+  # index()/substr()/length() on one consistent byte basis.
+  LC_ALL=C awk -v tok="(run marker: $marker)" '
+  BEGIN { lower_tok = tolower(tok) }
+  {
+    i = index(tolower($0), lower_tok)
     if (i > 0) { $0 = substr($0, 1, i - 1) substr($0, i + length(tok)) ; sub(/[ \t]+$/, "") }
     print
   }' "$f" > "$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null
@@ -2899,8 +3025,8 @@ pg_completed_lookup() {  # <marker> <out>: place the artifact at <out>; rc 0 on 
 # ─────────────────────────────────────────────────────────────────────────────
 PG_REVIEW_DECISION_CONTRACT_ID='review-decision/v1'
 PG_REVIEW_DECISION_CONTRACT_VERSION=1
-PG_REVIEW_DECISION_CONTRACT_DIGEST='7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee'
-PG_REVIEW_DECISION_CORPUS_DIGEST='2a1e347e4c15766ab9c530074ae75aead7397349f5e13328c40183ced8b70b69'
+PG_REVIEW_DECISION_CONTRACT_DIGEST='bf36fdb5f8625e917be0539ca014fec518649d1160584846aca1cb9149533abb'
+PG_REVIEW_DECISION_CORPUS_DIGEST='60b4059115dd0651de8b209775f0783b3095f432842c036f618308a307b01358'
 
 pg_review_decision_contract_id() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_ID"; }
 pg_review_decision_contract_version() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_VERSION"; }
@@ -2972,6 +3098,14 @@ pg_review_decision_named_choices() { # review artifact -> canonical outcomes JSO
       continue
     fi
     if [[ "$line" != CHOICE:* ]]; then
+      # #201: a whitespace-only line carries no grammar, so it can never be the start of a second
+      # block — and the engine's own prompt asks for the choice lines "immediately before the final
+      # VERDICT line", which a model satisfies while still separating them with an empty line. That
+      # is ordinary formatting, not an uncooperative answer, and rejecting it stranded a completed
+      # NEEDS-DISCUSSION review: the outcomes came back empty and the reducer reduced to
+      # invalid-named-choice with no path forward for the operator, on a round already paid for.
+      # Content after the block still ends the parse, exactly as before.
+      if [ -z "${line//[[:space:]]/}" ]; then continue; fi
       # Choice lines form one terminal block; prose after that block is not a machine grammar.
       [ "$choices_started" = false ] || return 1
       continue
@@ -3107,8 +3241,10 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
       and (.canonical_identity|ident and length>0) and (.charged_spend_epoch|type=="number" and floor==.)
       and (.collected|type=="boolean") and (.legacy|type=="boolean") and (.marker|marker and length>0)
       and (.provenance_valid|type=="boolean") and (.verdict|IN("SHIP","FIX-FIRST","NEEDS-DISCUSSION","NONE"));
-    (keys_are(["active_index","completed_results","contract","evidence","governor","input","named_choice","observation","prior_review","reservation","target","transport"]))
+    (keys_are(["active_index","completed_results","contract","cooldown","evidence","governor","input","named_choice","observation","prior_review","reservation","target","transport"]))
     and (.contract|keys_are(["contract_digest","contract_id","contract_version","corpus_digest"]))
+    and (.cooldown|keys_are(["active","seconds_remaining"])) and (.cooldown.active|type=="boolean")
+    and (.cooldown.seconds_remaining|type=="number" and floor==. and .>=0)
     and (.active_index|keys_are(["binding_valid","charged_spend_epoch","marker","state"]))
     and (.active_index.binding_valid|type=="boolean") and (.active_index.charged_spend_epoch|type=="number" and floor==.)
     and (.active_index.marker|marker)
@@ -3244,6 +3380,12 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
   fi
   if [ "$(jq -r .governor.granted <<<"$canonical")" != true ]; then
     pg_review_decision_emit stop-without-new-review round-governor-denied "$canonical" "$snapshot"; return
+  fi
+  # The account back-off cooldown (#162) gates only a FRESH spend: collection, recovery, fixes,
+  # evidence preparation, and merge handoff above spend nothing and stay reachable during it.
+  # facts.cooldown.seconds_remaining tells the wrapper how long to wait before re-querying.
+  if [ "$(jq -r .cooldown.active <<<"$canonical")" = true ]; then
+    pg_review_decision_emit stop-without-new-review account-cooldown-active "$canonical" "$snapshot"; return
   fi
   if [ "$(jq -r .evidence.state <<<"$canonical")" = matching ]; then
     pg_review_decision_emit run-granted-review round-granted-for-changed-input "$canonical" "$snapshot"; return

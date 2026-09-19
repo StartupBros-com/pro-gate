@@ -47,6 +47,10 @@
 //   harvest AND --probe, so reservation reconciliation inherits it too) re-render that URL in a
 //   scratch tab when no open tab matches. A remembered URL is authoritative for its marker: it
 //   is exempt from the foreign-marker blacklist and from the per-URL render cap.
+//   v0.42 (#109): authority is conditional on the memo's conversation id passing the shape gate
+//   below (CONVERSATION_URL_RE), checked when a URL is remembered AND every time one is read. A
+//   memo that fails is revoked on read with the same claim-and-verify as a foreign memo, so the
+//   pass rescans candidates instead of re-rendering a placeholder page forever.
 //
 // Usage: cdp-salvage.mjs [--probe] <pr-marker> [timeout-secs] [cdp-port]
 //   pr-marker    substring identifying the right conversation (e.g. the PR
@@ -56,11 +60,15 @@
 //                matching the marker EXISTS (no VERDICT wait). Used by the
 //                engine's no-think watchdog to distinguish "dead submission,
 //                safe to retry" from "live run, retry would double-spend".
-//                Also prints `probe-state: complete|generating|terminal-infrastructure` on stderr so the
-//                reservation reconciler can release the account slot of a review
-//                that has finished but has not been collected yet (#82). This is
+//                Also prints `probe-state: complete|generating|terminal-infrastructure|throttled`
+//                on stderr so the reservation reconciler can release the account slot of a
+//                review that has finished but has not been collected yet (#82). This is
 //                an additive LINE, never a new exit code: callers above key on
 //                rc 0 meaning "live", and a new code would fall through them.
+//                `throttled` (#162): the conversation renders this run's marker UNDER
+//                ChatGPT's "Too many requests" modal. It exists (rc 0: a retry would
+//                double-spend) but is not progressing; the cooldown file is written, the
+//                reconciler leaves the miss streak untouched, and callers back off.
 // Exit: 0 = review printed (probe: tab found); 4 = scanned successfully, nothing matched;
 //       2 = usage error;
 //       3 = timeout but a conversation matching the marker IS live with no VERDICT yet (the
@@ -86,7 +94,9 @@ import {
   buildArchiveConversationExpression,
   buildCancelOrganizerMutationExpression,
   buildRenameConversationExpression,
+  buildThrottleModalExpression,
   ORGANIZER_MUTATION_LEASE_MS,
+  THROTTLE_RE,
   readReviewText,
   reviewTextContext,
 } from './cdp-organizer-expressions.mjs';
@@ -162,16 +172,64 @@ const COMPLETED_DIR = process.env.PRO_GATE_COMPLETED_DIR ?? path.join(PG_HOME, '
 const PENDING_DIR = path.join(PG_HOME, 'pending');
 const MEMO_KEEP = 200;                  // newest N memos retained; older ones are pruned on write
 const MARKER_SAFE_RE = /^pg-run-[A-Za-z0-9.-]+$/;
+// #167: the marker is EXTRACTED case-insensitively everywhere but used to be COMPARED
+// case-sensitively, so a model that lowercased its own echo — markers legitimately carry
+// un-lowercased repo text, e.g. pg-run-StartupBros-com-pro-gate-166-... — read as another run
+// and got its own finished answer convicted cross-bound. Two genuinely different runs cannot
+// differ only in letter case: a marker ends in "-<launch epoch>-<pid>" and one process has one
+// of each, so folding case cannot mask another run's claim.
+//
+// ASCII-only and arithmetic ON PURPOSE. toLowerCase() is NOT length-preserving ('İ' folds
+// to two code units) and is not what the engine's shell side can cheaply agree with; every
+// marker position in this file is compared against other positions in the SAME string
+// (verdict.at, promptMarkerAt, lastMarkerAt, foreignAt, every text.slice boundary), so a fold
+// that shifted indices would silently corrupt ownership adjudication. A +32 fold over [A-Z]
+// leaves every other code unit — and therefore every index — exactly where it was.
+const asciiFold = (value) => String(value ?? '').replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
+const foldedIncludes = (text, wanted) => asciiFold(text).includes(asciiFold(wanted));
+// Marker identity. Null/empty on either side is NOT a match: an absent echo is "unproven", never
+// "ours" (organizerOwnership and finalizerOwnership both depend on that distinction).
+const sameMarker = (a, b) => !!a && !!b && asciiFold(a) === asciiFold(b);
+// v0.42 (#109): the shape a remembered conversation URL must have. A synthetic placeholder such as
+// https://chatgpt.com/c/WEB:<uuid> passed the old prefix-only check, was remembered as
+// authoritative, and rendered a page with no marker on every later pass — an inconclusive result
+// the engine deliberately never counts as a miss — so its run held a ChatGPT slot for days. The
+// boundary enforced here: the segment after /c/ is one path segment of letters, digits, and
+// dashes, optionally followed by a query or fragment. Every real id observed on the operator's box
+// (36-char hex-and-dash, 196 of 196) passes; the placeholder's colon fails, including one whose
+// body after the prefix is a well-formed UUID, because the whole segment is anchored. This is a
+// shape gate like MARKER_SAFE_RE, not proof the conversation exists; a stricter hex-and-dash
+// shape is deferred until test fixtures stop using named ids such as mock-conversation.
+const CONVERSATION_URL_RE = /^https:\/\/chatgpt\.com\/c\/[A-Za-z0-9-]+(?:[?#].*)?$/;
+const conversationUrlOk = (url) => CONVERSATION_URL_RE.test(url || '');
 const memoPath = (m) => (MARKER_SAFE_RE.test(m) ? path.join(URL_MEMO_DIR, m) : null);
 const titleMemoPath = (m) => (MARKER_SAFE_RE.test(m) ? path.join(TITLE_MEMO_DIR, m) : null);
 
 function recallUrl(m) {
   const f = memoPath(m);
   if (!f) return null;
-  try {
-    const url = fs.readFileSync(f, 'utf8').trim();
-    return /^https:\/\/chatgpt\.com\/c\//.test(url) ? url : null;
-  } catch { return null; }
+  let url = '';
+  try { url = fs.readFileSync(f, 'utf8').trim(); } catch { return null; }
+  if (conversationUrlOk(url)) return url;
+  if (!url) return null;
+  // v0.42 (#109): a memo whose id fails the shape gate is revoked HERE, on read, so this very pass
+  // rescans candidates instead of trusting it. Claim-and-verify (forgetUrl), never a plain unlink:
+  // a concurrently republished genuine memo survives and is used instead. This is memo hygiene,
+  // not termination — the pass still has to find or miss the conversation on its own evidence.
+  const survivor = forgetUrl(m, url);
+  console.error(`memo-revoked: the remembered conversation for "${m}" is not a conversation id (${url}); rescanning candidates`);
+  if (survivor && conversationUrlOk(survivor)) return survivor;
+  // v0.42 review finding #2: forgetUrl only restores a genuine memo republished DURING its
+  // claim rename (the file existed as `f` again by the time forgetUrl read `claim`). A memo
+  // republished in the window between that rename and the unlink of `claim` lands back at `f`
+  // unheld and unseen by forgetUrl, so re-read `f` once more here to close it before giving up.
+  let value = '';
+  try { value = fs.readFileSync(f, 'utf8').trim(); } catch { return null; }
+  if (conversationUrlOk(value)) {
+    console.error(`memo-republished: a genuine conversation for "${m}" was published while the placeholder was being revoked; using ${value}`);
+    return value;
+  }
+  return null;
 }
 
 function recallTitle(m) {
@@ -309,7 +367,16 @@ process.on('exit', () => {
 
 function rememberUrl(m, url) {
   const f = memoPath(m);
-  if (!f || !/^https:\/\/chatgpt\.com\/c\//.test(url || '')) return;
+  if (!f) return;
+  if (!conversationUrlOk(url)) {
+    // v0.42 (#109): a /c/ URL whose id fails the shape gate is the placeholder class; say so once
+    // rather than silently dropping it. Non-conversation URLs (the root page, a login wall) stay
+    // silent exactly as before.
+    if (/^https:\/\/chatgpt\.com\/c\//.test(url || '')) {
+      console.error(`memo-rejected: not remembering ${url} for "${m}": its conversation id is not letters, digits, and dashes`);
+    }
+    return;
+  }
   if (recallUrl(m) === url) return;     // already known: no churn, no prune
   try {
     fs.mkdirSync(URL_MEMO_DIR, { recursive: true });
@@ -329,12 +396,15 @@ function rememberUrl(m, url) {
     }
   } catch {}
 }
-// The interstitial's two distinctive sentences. Deliberately NOT a generic
-// /rate.?limit/ — review findings routinely discuss rate limits.
-const THROTTLE_RE = /making requests too quickly|temporarily limited access to your conversations/i;
+// THROTTLE_RE (the limiter's two distinctive sentences) is shared with the in-page modal
+// evaluator in cdp-organizer-expressions.mjs so both surfaces recognize the same copy.
 // Any pro-gate run marker. On a page that does NOT carry our own marker, a hit here is positive
 // evidence the page rendered a DIFFERENT run's conversation (vs. merely not having loaded yet).
-const FOREIGN_MARKER_RE = /pg-run-[A-Za-z0-9.-]+/;
+// Case-insensitive in lockstep with the ownership checks that gate it (#167): every caller asks
+// "is this ours?" first, and that question is now answered under asciiFold. Were this pattern
+// stricter than its gate, an UPPERCASED self-echo would newly read as foreign and blacklist the
+// run's own conversation — the exact conviction this issue exists to stop, in the other direction.
+const FOREIGN_MARKER_RE = /pg-run-[A-Za-z0-9.-]+/i;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -342,7 +412,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // marker at all (ours or foreign — real conversations can QUOTE the phrase,
 // e.g. a review of this very engine), and is short like an error page.
 function isThrottlePage(text) {
-  return !!text && text.length < 5000 && !/pg-run-[A-Za-z0-9.-]+/.test(text) && THROTTLE_RE.test(text);
+  return !!text && text.length < 5000 && !FOREIGN_MARKER_RE.test(text) && THROTTLE_RE.test(text);
 }
 function recordThrottle(where) {
   try {
@@ -353,7 +423,27 @@ function recordThrottle(where) {
 }
 function tripThrottle(where) {
   recordThrottle(where);
+  console.error('evidence-kind: throttle');
   process.exit(5);
+}
+// #162: the limiter's MODAL over a conversation that renders this run's EXACT marker. The
+// conversation demonstrably exists — probe rc 0 keeps meaning "live; a retry would double-spend"
+// — but the account is throttled, so probe reports the closed state `throttled` instead of
+// `generating`: the reconciler neither resets the miss streak nor treats it as progress, and
+// every caller backs off through the cooldown written here. Outside probe the existing exit 5
+// applies unchanged: cooldown written, do NOT resubmit, harvest again after the pause.
+function tripThrottleOverConversation(url, where) {
+  recordThrottle(where);
+  if (!probe) process.exit(5);
+  console.error(`live conversation: ${url}`);
+  console.error('probe-state: throttled');
+  process.exit(0);
+}
+// Route throttle evidence from any surface: owned (modal over our marker) proves existence,
+// anything else (interstitial, modal over a foreign or blacklisted page) proves only the limiter.
+function tripThrottleEvidence(url, evidence, where) {
+  if (evidence.owned) tripThrottleOverConversation(url, where);
+  tripThrottle(where);
 }
 
 let evaluateRequestId = 0;
@@ -480,6 +570,14 @@ async function tabTerminalInfrastructure(tab) {
   })()`;
   const result = await evaluateTab(tab, expression);
   return result.ok && TERMINAL_INFRA_LINES.has(result.value) ? result.value : null;
+}
+
+// #162: the "Too many requests" modal over a rendered conversation, read as an ELEMENT rather
+// than from whole-page text (see buildThrottleModalExpression). Returns the bounded dialog text
+// or null; the shared THROTTLE_RE recheck keeps an unexpected evaluator value from counting.
+async function tabThrottleModal(tab) {
+  const result = await evaluateTab(tab, buildThrottleModalExpression());
+  return result.ok && typeof result.value === 'string' && THROTTLE_RE.test(result.value) ? result.value : null;
 }
 
 async function closeTab(id) {
@@ -665,7 +763,10 @@ async function freshRenderText(url, port, outerDeadline, waitForDecisiveEvidence
       // A scratch target may redirect, be reused, or be replaced underneath us. Its DOM is
       // evidence only for the canonical URL requested above, never merely for a matching target id.
       if (live.url !== url) return { text: null, reason: 'target-url-drift' };
-      const sample = await tabText(live);
+      // #162: a scratch render against a limited account can paint the modal over the
+      // conversation it just loaded. Read the element alongside the text (one bail, not two)
+      // before any marker test below can call that page "ours and still generating".
+      const [sample, throttleModal] = await Promise.all([tabText(live), tabThrottleModal(live)]);
       if (!sample) continue;
       text = sample;
       // Return only on DECISIVE evidence, never on "looks long enough".
@@ -681,14 +782,19 @@ async function freshRenderText(url, port, outerDeadline, waitForDecisiveEvidence
         // A readable source can be a stale snapshot, so this one revalidation must not spend its
         // only scratch navigation on the prompt marker ChatGPT hydrates before the answer. Reuse
         // the shared classifier: marker-only text remains owned-incomplete through the deadline.
-        evidence = classifyEvidence(sample);
+        evidence = classifyEvidence(sample, null, throttleModal);
         if (['terminal', 'terminal-infrastructure', 'foreign', 'cross-bound', 'throttle'].includes(evidence.kind)) {
           return { text, reason: `${evidence.kind}-evidence`, evidence };
         }
       } else {
+        // Throttle first: the modal sits OVER a marker-bearing page, so a marker test taken
+        // first would report a limited account as an ordinary hydrated conversation.
+        if (isThrottlePage(sample) || throttleModal) {
+          evidence = classifyEvidence(sample, null, throttleModal);
+          return { text, reason: 'throttle', evidence }; // interstitial or modal — done
+        }
         if (hasExactMarker(sample, marker)) return { text, reason: 'marker-found' }; // ours — done
         if (FOREIGN_MARKER_RE.test(sample)) return { text, reason: 'foreign-marker' }; // provably another run's — done
-        if (isThrottlePage(sample)) return { text, reason: 'throttle' }; // interstitial — done
       }
       // Anything else (shell, pre-hydration, login wall, or a marker-only stale-source render)
       // is NOT an answer: keep sampling and return the last text at the render deadline.
@@ -732,14 +838,19 @@ function emitOrganizerResult({ source = 'none', renameStatus = 'skipped', archiv
 }
 
 const isRunMarkerChar = (char) => /[A-Za-z0-9.-]/.test(char ?? '');
+// "Exact" here means TOKEN-EXACT — the whole marker, bounded by non-marker characters — not
+// byte-exact. Letter case is folded (#167); asciiFold is length-preserving, so every index
+// returned still points into the caller's original `text`.
 function lastExactMarkerAt(text, wanted) {
+  const haystack = asciiFold(text);
+  const needle = asciiFold(wanted);
   let found = -1;
   let from = 0;
-  while (from <= text.length - wanted.length) {
-    const at = text.indexOf(wanted, from);
+  while (from <= haystack.length - needle.length) {
+    const at = haystack.indexOf(needle, from);
     if (at < 0) break;
-    const before = at > 0 ? text[at - 1] : '';
-    const after = text[at + wanted.length] ?? '';
+    const before = at > 0 ? haystack[at - 1] : '';
+    const after = haystack[at + needle.length] ?? '';
     if (!isRunMarkerChar(before) && !isRunMarkerChar(after)) found = at;
     from = at + 1;
   }
@@ -748,7 +859,7 @@ function lastExactMarkerAt(text, wanted) {
 const hasExactMarker = (text, wanted) => !!text && lastExactMarkerAt(text, wanted) >= 0;
 function lastExactRunMarkerAt(text) {
   let found = -1;
-  for (const match of text.matchAll(/pg-run-[A-Za-z0-9.-]+/g)) {
+  for (const match of text.matchAll(/pg-run-[A-Za-z0-9.-]+/gi)) {
     const at = match.index;
     const before = at > 0 ? text[at - 1] : '';
     const after = text[at + match[0].length] ?? '';
@@ -764,14 +875,16 @@ function ownedVerdict(text) {
 // Mutation authority is intentionally stricter than salvage extraction. The engine may capture a
 // nonce-less completed answer and adjudicate it as retryable, but the organizer must not mutate that
 // page: once a verdict follows this run's prompt, only an exact marker echo proves it is our answer.
+// "Exact" is token-exact, not case-exact (#167): an absent or genuinely different marker still
+// refuses, but this run's own lowercased self-echo is this run's answer.
 // Any exact run marker AFTER `from` that is not ours. A conversation two runs wrote to is not
 // this run's to rename, archive or close: the other run may still be collecting from it.
 function foreignRunMarkerAfter(text, from) {
   const tail = text.slice(from);
-  for (const match of tail.matchAll(/pg-run-[A-Za-z0-9.-]+/g)) {
+  for (const match of tail.matchAll(/pg-run-[A-Za-z0-9.-]+/gi)) {
     const at = match.index;
     if (isRunMarkerChar(at > 0 ? tail[at - 1] : '') || isRunMarkerChar(tail[at + match[0].length] ?? '')) continue;
-    if (match[0] !== marker) return match[0];
+    if (!sameMarker(match[0], marker)) return match[0];
   }
   return null;
 }
@@ -782,7 +895,7 @@ function organizerOwnership(text) {
   const verdict = ownedVerdict(text);
   if (!verdict) return { owned: true, reason: 'live' };
   const answerMarker = verdict.line.match(/\(run marker:\s*(pg-run-[A-Za-z0-9.-]+)\s*\)/i)?.[1] ?? null;
-  if (answerMarker === marker) {
+  if (sameMarker(answerMarker, marker)) {
     // A later prompt may still be generating in this shared conversation.
     const shared = foreignRunMarkerAfter(text, verdict.at + verdict.line.length);
     if (shared) return { owned: false, reason: 'shared-conversation', foreignMarker: shared };
@@ -798,10 +911,15 @@ function normalizeReviewBytes(value) {
   return String(value ?? '').replace(/\r\n?/g, '\n').replace(/\n$/, '');
 }
 
+// Locate the token case-insensitively, but slice the ORIGINAL line (#167): the fold is only a
+// lookup key, never the published bytes. Must stay in step with pg_strip_nonce and with the twin
+// inside cdp-organizer-expressions.mjs — the finalizer compares this output against the bytes the
+// engine already stripped, so one of the three folding and the others not is a result-mismatch.
 function stripMarkerEcho(value) {
   const token = `(run marker: ${marker})`;
+  const foldedToken = asciiFold(token);
   return String(value ?? '').split('\n').map((line) => {
-    const at = line.indexOf(token);
+    const at = asciiFold(line).indexOf(foldedToken);
     if (at < 0) return line;
     return `${line.slice(0, at)}${line.slice(at + token.length)}`.replace(/[ \t]+$/, '');
   }).join('\n');
@@ -820,7 +938,7 @@ function finalizerOwnership(text) {
   }
   const answerMarker = verdict.line.match(/\(run marker:\s*(pg-run-[A-Za-z0-9.-]+)\s*\)/i)?.[1] ?? null;
   if (!answerMarker) return { owned: false, reason: 'answer-marker-missing' };
-  if (answerMarker !== marker) {
+  if (!sameMarker(answerMarker, marker)) {
     return { owned: false, reason: 'cross-bound', foreignMarker: answerMarker };
   }
   const review = extractReview(text);
@@ -860,9 +978,10 @@ async function openOrganizerScratch(url) {
       } catch { return { target, reason: 'cdp-list-failed' }; }
       if (!live) return { target, reason: 'memo-tab-disappeared' };
       if (live.url !== url) return { target: live, reason: 'memo-url-drift' };
-      const text = await tabText(live);
+      const [text, throttleModal] = await Promise.all([tabText(live), tabThrottleModal(live)]);
       if (!text) continue;
-      if (isThrottlePage(text)) return { target: live, reason: 'throttle' };
+      // #162: the modal is throttle evidence too; organizer traffic must stop on either form.
+      if (isThrottlePage(text) || throttleModal) return { target: live, reason: 'throttle' };
       if (hasExactMarker(text, marker)) {
         const ownership = mutationOwnership(text);
         return ownership.owned
@@ -979,8 +1098,11 @@ async function organizeConversation() {
       .filter((tab) => tab.type === 'page' && /^https:\/\/chatgpt\.com\/c\//.test(tab.url || ''));
   } catch { return { ...result, reason: 'cdp-list-failed' }; }
 
-  const reads = await Promise.all(tabs.map(async (tab) => ({ tab, text: await tabText(tab) })));
-  if (reads.some(({ text }) => isThrottlePage(text))) {
+  const reads = await Promise.all(tabs.map(async (tab) => {
+    const [text, throttleModal] = await Promise.all([tabText(tab), tabThrottleModal(tab)]);
+    return { tab, text, throttleModal };
+  }));
+  if (reads.some(({ text, throttleModal }) => isThrottlePage(text) || throttleModal)) {
     recordThrottle('organizer scan');
     return { ...result, reason: 'throttle' };
   }
@@ -1158,9 +1280,12 @@ function terminalInfrastructureAfterPrompt(text, structuredError = null) {
   return lines.includes(structuredError) ? structuredError : null;
 }
 
-function classifyEvidence(text, structuredError = null) {
+function classifyEvidence(text, structuredError = null, throttleModal = null) {
   if (!text || !text.trim()) return { kind: 'inconclusive', reason: 'empty-text' };
-  if (isThrottlePage(text)) return { kind: 'throttle' };
+  if (isThrottlePage(text)) return { kind: 'throttle', reason: 'interstitial', owned: false };
+  // #162: the modal is account state painted over whatever conversation rendered. `owned` says
+  // whether THIS run's exact marker is on the page beneath it (existence proof for --probe).
+  if (throttleModal) return { kind: 'throttle', reason: 'modal', owned: hasExactMarker(text, marker) };
   if (!hasExactMarker(text, marker)) {
     return FOREIGN_MARKER_RE.test(text)
       ? { kind: 'foreign' }
@@ -1180,25 +1305,25 @@ function classifyEvidence(text, structuredError = null) {
   // The marker echoed in the terminal line is not a later prompt. A separate exact marker after
   // that line is, and proves this otherwise-owned verdict belongs to an older turn in the same chat.
   const newerPromptMarker = verdict && hasExactMarker(text.slice(verdict.at + verdict.line.length), marker);
-  // A retry reuses this run's exact marker, so a stale SAME-marker verdict (answerMarker ===
-  // marker) passes every other check here (owned, non-foreign, well-formed) AND the shell's
+  // A retry reuses this run's exact marker, so a stale SAME-marker verdict (one this run's own
+  // marker binds) passes every other check here (owned, non-foreign, well-formed) AND the shell's
   // nonce check downstream — it would otherwise satisfy `kind: 'terminal'` while the newer
   // prompt it precedes is still generating, and the harvest path below emits on `kind` alone
   // (unlike --probe, which also gates on probeComplete), so that stale verdict would be reported
   // as THIS run's result and retire the reservation early. Fall back to owned-incomplete so every
   // caller (readable-tab match, scratch revalidation, remembered-URL render, freshRenderText's
   // decisive-evidence wait) keeps sampling instead of treating scrollback as a live answer.
-  // Gated on answerMarker === marker: a verdict carrying a DIFFERENT marker ahead of our prompt
-  // (#68 gate P1's reused-conversation scrollback) already fails the shell's nonce check on its
+  // Gated on sameMarker: a verdict carrying a DIFFERENT marker ahead of our prompt (#68 gate
+  // P1's reused-conversation scrollback) already fails the shell's nonce check on its
   // own — that case must stay 'terminal' so the engine can adjudicate it, not be swallowed here.
-  if (newerPromptMarker && answerMarker === marker) return { kind: 'owned-incomplete', reason: 'stale-terminal' };
+  if (newerPromptMarker && sameMarker(answerMarker, marker)) return { kind: 'owned-incomplete', reason: 'stale-terminal' };
   return {
     kind: 'terminal',
     review,
     // newerPromptMarker can still be true here for a foreign answerMarker (scrollback case
     // above); the `&& !newerPromptMarker` term stays as a guard against that combination
     // ever being reported probe-complete, even though only --probe reads this field.
-    probeComplete: promptMarkerAt >= 0 && answerMarker === marker && !newerPromptMarker && !mixedAnswer(text),
+    probeComplete: promptMarkerAt >= 0 && sameMarker(answerMarker, marker) && !newerPromptMarker && !mixedAnswer(text),
     // Old foreign scrollback is retryable; the extracted review cannot carry this chronology.
     precedesPrompt: !!newerPromptMarker,
   };
@@ -1232,6 +1357,7 @@ function rememberInconclusiveReadableSource(url) {
 function emitEvidence(url, evidence) {
   if (probe) {
     console.error(`live conversation: ${url}`);
+    console.error(`evidence-kind: ${evidence.kind}`);
     // rc 0 proves the conversation exists. Completeness is intentionally stricter than harvest
     // extraction: the terminal verdict must answer the latest exact prompt and echo this marker.
     const probeState = evidence.kind === 'terminal-infrastructure'
@@ -1241,12 +1367,14 @@ function emitEvidence(url, evidence) {
     process.exit(0);
   }
   if (evidence.kind === 'terminal-infrastructure') {
+    console.error('evidence-kind: terminal-infrastructure');
     console.error(`terminal-infrastructure: ${evidence.reason}`);
     process.exit(10);
   }
   if (evidence.kind === 'terminal') {
     // v0.28 (gate #54 r5): name the EXACT source of this capture so the engine can blacklist
     // precisely on a provenance rejection — reading the shared memo afterwards races probes.
+    console.error('evidence-kind: terminal');
     console.error(`matched-url ${url}`);
     // Chronology the engine cannot see: this block predates the prompt below it (#166 gate r3 P1).
     if (evidence.precedesPrompt) console.error('answer-chronology precedes-prompt');
@@ -1325,11 +1453,25 @@ while (Date.now() < deadline) {
   stillGeneratingUrl = null;
   lastMatchWasSeeded = false;
   const deadTabs = [];
-  const reads = await Promise.all(tabs.map(async (tab) => ({
-    tab,
-    text: await tabText(tab),
-    infrastructureError: await tabTerminalInfrastructure(tab),
-  })));
+  // The three reads per tab are independent; run them concurrently so a suspended renderer
+  // costs one evaluate bail per tab, not three, inside probe's fixed budget.
+  const reads = await Promise.all(tabs.map(async (tab) => {
+    const [text, infrastructureError, throttleModal] = await Promise.all([
+      tabText(tab), tabTerminalInfrastructure(tab), tabThrottleModal(tab),
+    ]);
+    return { tab, text, infrastructureError, throttleModal };
+  }));
+  // #162: the modal is account-wide, so decide ownership over the WHOLE scan, never on the first
+  // tab in list order (the same order-independence onOurConversation documents): a foreign or
+  // blacklisted tab listed ahead of ours must not hide the proof that our conversation exists.
+  // Only a non-blacklisted page rendering our EXACT marker proves that; any other modal hit is
+  // proof of the limiter alone.
+  const modalHits = reads.filter(({ text, throttleModal }) => throttleModal && text && text.trim() !== '');
+  if (modalHits.length > 0) {
+    const ownedHit = modalHits.find(({ tab, text }) => !nonMatching.has(tab.url) && hasExactMarker(text, marker));
+    const hit = ownedHit ?? modalHits[0];
+    tripThrottleEvidence(hit.tab.url, { kind: 'throttle', reason: 'modal', owned: !!ownedHit }, `modal over tab ${hit.tab.url}`);
+  }
   for (const { tab, text, infrastructureError } of reads) {
     if (text === null || text.trim() === '') { deadTabs.push(tab); continue; }
     if (isThrottlePage(text)) tripThrottle(`tab ${tab.url}`);
@@ -1338,7 +1480,7 @@ while (Date.now() < deadline) {
     // check — even a marker-bearing tab must be skipped then, or every later harvest replays
     // the same rejected conversation and starves the real one.
     if (nonMatching.has(tab.url)) continue;
-    if (!text.includes(marker)) {
+    if (!foldedIncludes(text, marker)) {
       // The remembered URL is open and rendered ANOTHER run's conversation: the memo is stale
       // (recycled URL, or it was never ours). This is the second way to prove staleness — the
       // first is a seeded render below — and without it an open-but-foreign remembered URL is
@@ -1376,7 +1518,7 @@ while (Date.now() < deadline) {
         + `conversation (${revalidateUrl}) — spending the one canonical revalidation there instead`);
     }
     const fresh = await revalidateReadableStaleSource(revalidateUrl);
-    if (fresh?.kind === 'throttle') tripThrottle(`canonical scratch ${revalidateUrl}`);
+    if (fresh?.kind === 'throttle') tripThrottleEvidence(revalidateUrl, fresh, `canonical scratch ${revalidateUrl}`);
     if (fresh?.kind === 'cross-bound') {
       rejectCrossBound(revalidateUrl, fresh.foreignMarker, 'canonical scratch');
       // Only null the signal when the rejected URL IS the tab we were scanning: a rejected
@@ -1435,10 +1577,10 @@ while (Date.now() < deadline) {
     nextRenderAt.set(tab.url, Date.now() + RENDER_INTERVAL_MS);
     renders += 1;
     console.error(`tab unreadable (renderer dead?): ${tab.url} — re-rendering in a scratch tab...`);
-    const { text } = await freshRenderText(tab.url, port, deadline);
+    const { text, evidence: renderEvidence } = await freshRenderText(tab.url, port, deadline);
     if (!text) continue;
-    if (isThrottlePage(text)) tripThrottle(`fresh render ${tab.url}`);
-    if (!text.includes(marker)) {
+    if (renderEvidence?.kind === 'throttle') tripThrottleEvidence(tab.url, renderEvidence, `fresh render ${tab.url}`);
+    if (!foldedIncludes(text, marker)) {
       // Blacklist ONLY on positive evidence: the page carries someone
       // ELSE's run marker, proving it rendered a different review's
       // conversation. Shell/login/error pages and pre-hydration renders can
@@ -1488,10 +1630,10 @@ while (Date.now() < deadline) {
     nextRenderAt.set(seedUrl, Date.now() + RENDER_INTERVAL_MS);
     seededRenders += 1;
     console.error(`no open tab carries "${marker}" — re-rendering the remembered conversation ${seedUrl} (${seededRenders}/${MAX_SEEDED_RENDERS})...`);
-    const { text } = await freshRenderText(seedUrl, port, deadline);
+    const { text, evidence: renderEvidence } = await freshRenderText(seedUrl, port, deadline);
     if (text) {
-      const evidence = classifyEvidence(text);
-      if (evidence.kind === 'throttle') tripThrottle(`remembered render ${seedUrl}`);
+      const evidence = renderEvidence ?? classifyEvidence(text);
+      if (evidence.kind === 'throttle') tripThrottleEvidence(seedUrl, evidence, `remembered render ${seedUrl}`);
       if (evidence.kind === 'cross-bound') {
         // The memo itself is cross-bound. Evict it with claim-and-verify, but preserve a
         // concurrently republished survivor as the only possible genuine recovery handle.
@@ -1533,7 +1675,7 @@ if (!probe && stillGeneratingUrl && !lastMatchWasSeeded) {
     const tabs = (await (await fetch(`http://127.0.0.1:${port}/json`)).json())
       .filter((t) => t.type === 'page' && /chatgpt\.com\/c\//.test(t.url || ''));
     const reads = await Promise.all(tabs.map(async (tab) => ({ tab, text: await tabText(tab) })));
-    const live = reads.find(({ text }) => text && text.includes(marker));
+    const live = reads.find(({ text }) => text && foldedIncludes(text, marker));
     stillGeneratingUrl = live?.tab?.url ?? null;
   } catch {
     // CDP outage is inconclusive: retain the last positive signal, fail-closed against respending.
@@ -1549,6 +1691,7 @@ if (!probe && liveUrl) {
   // tab lets the caller harvest later instead of respending.
   console.error(`still-generating: ${liveUrl} matches "${marker}" but has no VERDICT after ${timeoutSecs}s`
     + `${stillGeneratingUrl ? ': tab left open' : ' (proven server-side; no tab needed)'}; harvest later (oracle-review.sh --harvest '${marker}')`);
+  console.error('evidence-kind: owned-incomplete');
   process.exit(3);
 }
 if (!lastListOk) {
@@ -1557,6 +1700,7 @@ if (!lastListOk) {
   // lost, re-run justified") must not advance on it. Distinct code, so callers keep the
   // reservation and retry instead.
   console.error(`inconclusive: the last CDP tab list failed (${listFailures} consecutive) within ${timeoutSecs}s — browser down or restarting; NOT evidence the conversation is gone`);
+  console.error('evidence-kind: browser-down');
   process.exit(7);
 }
 if (knownUrl && !memoStale) {
@@ -1566,8 +1710,14 @@ if (knownUrl && !memoStale) {
   // into a confirmed absence: three of those releases a live reservation and permits a
   // double-spending resubmit (gate P1). Stay inconclusive; the reservation TTL bounds it.
   console.error(`inconclusive: remembered conversation ${knownUrl} re-rendered ${seededRenders}x without a decisive result in ${timeoutSecs}s — NOT evidence it is gone`);
+  console.error('evidence-kind: inconclusive');
   process.exit(7);
 }
 console.error(`timeout: no ${probe ? 'conversation tab' : 'completed review'} matching "${marker}" after ${timeoutSecs}s`
   + (memoStale ? ' (the remembered conversation belongs to another run; memo was stale)' : ''));
+// v0.42 (#109): one closed-vocabulary line naming what this pass concluded, printed at every exit
+// (see the other `evidence-kind:` sites). The engine records it per marker so --status can name a
+// stall instead of calling every unresolved attempt "generating". A conviction without a proven
+// owner is cross-bound; every other timeout here is a confirmed absence for this marker.
+console.error(`evidence-kind: ${crossBindHits.size > 0 && !ownershipProven ? 'cross-bound' : 'absent'}`);
 process.exit(4);

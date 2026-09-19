@@ -105,8 +105,9 @@ July 2026). The Pro model spends that long reasoning; the engine is built around
   that review targets an old head or merged/closed PR, it remains charged and optionally
   collectable but stops occupying capacity.
 - **Fail closed, recover explicitly.** A plugin/runtime version skew blocks the run.
-  Captures must echo the run's nonce. Unverifiable results are surfaced for manual
-  recovery, never guessed at.
+  Captures must echo the run's nonce — the whole token, bounded, though letter case may drift,
+  since a nonce ends in the minting run's launch time and pid and so cannot collide with another
+  run's on case alone. Unverifiable results are surfaced for manual recovery, never guessed at.
 - **Clean up only after durable success.** Remote-browser conversations get an exact,
   marker-owned title. Server archive and local tab close happen only after the validated
   review is readable from marker-addressed durable storage; failed and in-progress runs stay
@@ -302,6 +303,11 @@ transition only after immutable identity and charge agree. For pre-v0.31 empty s
 immutable binding and canonical run metadata are revalidated under the reservation lock before the
 proven charge is filled; marker mint time is not charge evidence. Other missing or mismatched proof
 remains fail-closed.
+When ChatGPT's "Too many requests" modal covers the conversation, the probe reports it as
+`throttled` rather than generating: the reservation keeps its miss count, the account cooldown
+engages, reservation probes pause until it clears, and `--harvest` defers with exit 8 instead of
+waiting out its window. A typed query during that cooldown returns `stop-without-new-review` /
+`account-cooldown-active` with the seconds remaining in `facts.cooldown`.
 Missing or malformed binding/GitHub proof leaves the review generating. Its plain states
 are **Review ready**, **Checking for completed review**, **Still working**, **Review superseded**,
 **No review remains**, and **Browser needs attention**. `Review superseded` means old-head or closed-PR
@@ -322,8 +328,8 @@ diagnosis; ordinary callers should use `/pro-gate recover` instead.
 | 4 | Repo not found | no |
 | 5 | Diff fetch failed | no |
 | 6 | No usable current review. Check `detail`/`attempt`: recoverable work must be harvested; `not-submitted` was refunded; `submitted-terminal`, `recovery-exhausted`, or `superseded` remains charged but permits a fresh typed decision | maybe |
-| 7 | Per-change lock timeout (another run holds this change) | no |
-| 8 | Deferred: box unfit, low memory, or throttle cooldown; retry later | no |
+| 7 | A wait for exclusive access expired: another run holds this change, every account slot is busy, or the reservation handoff guard could not be acquired. stderr names which, and no review is submitted in any of the three | no |
+| 8 | Deferred: box unfit, low memory, or throttle cooldown (including ChatGPT's rate-limit modal over a live conversation); retry later | no |
 | 9 | In-progress: the model was still generating and the tab stays open. `--harvest` by marker; never submit a new review for it | yes |
 | 11 | Oversized diff, past `PRO_GATE_DIFF_HARD_MAX` (default 25,000 lines): scope the payload | no |
 | 12 | An explicitly enabled round policy denied this change. Default unset configuration is advisory; inspect `--status` for policy source | no |
@@ -372,6 +378,7 @@ remain an operator trust boundary.
 | `PRO_GATE_CHAT_ARCHIVE` | `1` | Archive through ChatGPT's rendered UI only after marker-addressed durable exit-0 success |
 | `PRO_GATE_KEEP_TABS` | `0` | Exact value `1` permits rename but suppresses both server archive and local tab close |
 | `PRO_GATE_BROWSER_ARCHIVE` | `never` | Passed unchanged to Oracle; `auto`/`always` can archive before pro-gate validates durable recovery state |
+| `PRO_GATE_BROWSER_ATTACHMENTS` | `auto` | Oracle file-delivery policy: `auto` uses Oracle's inline/upload selection, `never` keeps supported text files inline, and `always` uploads. Empty/unset uses `auto`; review input policy is unchanged. |
 
 ### Conversation lifecycle
 
@@ -449,6 +456,11 @@ work must be collected; `not-submitted` was positively proven and refunded; `sub
 or `recovery-exhausted` retains its charge but no longer owns recovery; `superseded` retains its
 charge and optional audit harvest but owns neither capacity nor the current head. Those settled states
 let changed/current evidence receive a fresh typed decision. Unknown post-click fate stays recoverable.
+Each unresolved reservation also carries `classification` (what the latest collection pass concluded:
+`owned-incomplete`, `inconclusive`, `browser-down`, `absent`, `cross-bound`, `throttle`, `terminal`,
+`terminal-infrastructure`), `classified_at`, and `ttl_remaining_secs`, so a parked run and a genuinely
+generating one no longer read alike. A remembered conversation URL whose id is not a real conversation
+id (a `WEB:<uuid>` placeholder) is revoked on read and the pass rescans; nothing is terminalized from age alone.
 Never delete state, quarantine files, or use a force flag as diagnosis. On a low-memory box, free
 memory before retrying.
 

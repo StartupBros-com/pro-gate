@@ -163,6 +163,10 @@ server.on('upgrade', (req, socket) => {
     let value = text;
     if (expression.includes('pro-gate:terminal-infrastructure')) {
       value = readState().infrastructureError ?? null;
+    } else if (expression.includes('pro-gate:throttle-modal')) {
+      // #162: the modal is an ELEMENT read, distinct from the page text: without an explicit
+      // fixture value the evaluator must see no dialog, never the body text.
+      value = readState().throttleModal ?? null;
     } else if (expression.includes('pro-gate-organizer:rename')) {
       const state = readState();
       const expected = expectedTitleFromExpression(expression);

@@ -42,15 +42,45 @@ The proof is external to the attempt's own execution: it comes from the reposito
 
 Collection or reconciliation of one canonically identified attempt without a new submission. Ambiguous ownership fails closed rather than selecting a plausible conversation or spending again.
 
+### Acceptance Predicate / Conviction Predicate
+
+The two classes of answer to "is this captured answer ours?", distinguished by what being wrong costs rather than by what they compare.
+
+An **acceptance** predicate publishes a capture as this run's review, so a false positive presents a possibly-foreign answer as authoritative; it fails closed, and a near-miss costs a retry. A **conviction** predicate declares a conversation to be another run's, so a false positive blacklists it, discards the memo locating it, and destroys a finished answer the account already paid for; it fails open.
+
+The same identifier can therefore be compared at different strictness in the two classes without inconsistency. Treating them as one question and picking a single global strictness is wrong in one direction by construction.
+
+What the acceptance predicate concluded about a published artifact is its **ownership**: `exact` (the authoritative verdict line named this run's marker) or `nonce-less` (an artifact accepted under the pre-marker rules). A capture carrying a foreign authoritative claim has no ownership because it is never published.
+
+### Conversation Memo
+
+The conversation URL remembered for a marker so later passes can find the same conversation without rescanning. A memo is authoritative only while its conversation id has the shape of a real conversation id; a memo that fails that check, or that proves to carry foreign content, is revoked so the next pass rescans every candidate. A blank render of a real-id memo is a transient, not a miss, and does not revoke it.
+
+### Salvage classification
+
+What the latest salvage pass concluded about a reservation's conversation: `owned-incomplete` (the model was still writing), `inconclusive` (rendered without a decisive result), `browser-down` (the browser was unreachable), `absent` (no conversation carried the marker), `cross-bound` (another run's completed answer was found instead), `throttle` (ChatGPT throttled the account), `terminal` (a completed answer was seen), or `terminal-infrastructure` (the conversation ended in a terminal infrastructure state). Status surfaces it as `classification`; it is observation only — never a release, a refund, or an admission input.
+
+### Submit-Failure Class
+
+Why a Review Attempt's prompt never reached ChatGPT, when it did not: `upload-stalled` (the composer accepted the attachment but it never finished uploading), `send-unconfirmed` (the prompt did not appear in the conversation before the send timeout), `cloudflare-challenge` (the account met a challenge page before submission), `other` (an error oracle recorded before the prompt was confirmed submitted that matches none of those), or `none` (the prompt was confirmed submitted, or no error was recorded). It is classified once from oracle's own transcript lines and the engine's salvage flags at the moment a round is refunded or preserved, and it is observation only: it never decides whether a charge is refunded, which the Terminal Disposition's proof owns.
+
 ## Review authority
 
 ### Review Decision
 
 The engine-issued typed continuation chosen from normalized lifecycle, evidence, and policy facts. Callers execute this decision; they do not infer actions from verdict prose, exit codes, status messages, or local round history.
 
+### Round Convergence
+
+Whether successive charged rounds on one change are settling. The round governor scores each round by its open P0 plus P1 count and keeps a churn streak: the count of consecutive rounds that failed to shrink it. A streak of two is the convergence signal; it produces the typed stop `rounds-not-converging`, which is report-only and reversible by the operator, and it never alters the numeric round grant's own policy. Convergence is judged from the round history the engine writes, never from re-reading review text.
+
 ### Input Policy
 
 The deployment-level rule that controls whether Pro-Gate supplies only the reviewed bundle or may request connector-capable delivery. It governs Pro-Gate's request surface, not permissions independently granted to the browser identity.
+
+### Account Cooldown
+
+The engine-wide back-off that follows any proof that ChatGPT is rate-limiting the review account: the short interstitial page, the "Too many requests" modal painted over a live conversation, or a Cloudflare challenge. While it runs, no fresh review is submitted, reservation probes and organizer traffic stay off the account, harvest defers, and the Review Decision reports `account-cooldown-active` with the seconds remaining instead of a grant. A probe that finds a conversation under the modal reports `throttled`: the conversation exists, is not progressing, and is not evidence of absence.
 
 ### Brief
 
@@ -67,3 +97,4 @@ The engine appends its own output contract after a brief, so a brief chooses the
 - Applicability is an input to the Review Decision, not a synonym for completion.
 - Input Policy constrains evidence delivery before a Review Attempt can be submitted.
 - A Brief redirects what a Review Attempt asks; it never widens who may act on the answer.
+- An Account Cooldown pauses fresh spend and browser traffic; it neither releases a Reservation nor advances its miss count.

@@ -19,6 +19,14 @@ Conventions in this file:
 
 | Version | Date | Artifact | Theme |
 |---|---|---|---|
+| v0.52.0 | 2026-09-18 | Pending release | Operational hardening round: the account-slot wait (#179) and `pg_lock`'s no-flock reclaim spin (#189) are bounded; a selection file with one trailing newline is accepted (#203); a connector-only classic run installs a connector binding, never a full-pr proof (#150); `install.sh` hashes through stdin (#172); remaining bare empty-array expansions guarded for bash 3.2 (#176) |
+| v0.51.0 | 2026-09-15 | Pending release | Expose Oracle file-delivery policy: text bundles can opt into inline delivery with `PRO_GATE_BROWSER_ATTACHMENTS=never`, while automatic delivery remains the default |
+| v0.50.0 | 2026-09-14 | Pending release | A blank line between the last CHOICE and the VERDICT no longer empties a NEEDS-DISCUSSION review's outcomes: whitespace carries no grammar, so choices already paid for stay reachable, while content after the block still ends the parse |
+| v0.49.0 | 2026-09-13 | Pending release | Liveness must be positively disproved, never inferred from a failed measurement: pg_harvest_claimed's and st_inflight's no-flock/mkdir-fallback branches now share pg_dirlock_reclaim_dead's fail-closed token-recompute rule, so a transient read failure for a live holder no longer reads as dead |
+| v0.48.0 | 2026-09-12 | Pending release | A rate-limit modal over a live review conversation is a typed throttled state that engages the account cooldown, instead of reading as still-generating; the remaining cooldown is a normalized fact the daemon and callers can wait on |
+| v0.47.0 | 2026-09-12 | Pending release | A remembered conversation URL must look like a conversation id, checked on write and on read, so a synthetic placeholder can no longer park a run on a slot forever; --status names the stall class and the TTL remaining |
+| v0.46.0 | 2026-09-11 | Pending release | Run-marker binding folds ASCII case: a lowercased self-echo binds instead of convicting the run's own conversation |
+| v0.45.0 | 2026-09-11 | Pending release | Only a finished review completes a revision; checks must settle before a review starts; exhausted retries are visible instead of counting as done |
 | v0.44.1 | 2026-09-10 | Pending release | An empty lock-owner record no longer counts as a marker, so a winner between creating its owner file and writing into it keeps the orphan grace that protects it from a concurrent reclaimer |
 | v0.44.0 | 2026-09-10 | Pending release | One hardened dirlock reclaimer for every no-flock lock: a recycled pid no longer reads as the original owner, two reclaimers cannot both enter, and a release never takes a replacement |
 | v0.43.0 | 2026-09-09 | Pending release | No-flock reservation guard self-heal: a directory left by a killed process is reclaimed, a live owner is never reclaimed, and liveness must be positively disproved rather than inferred from a failed measurement |

@@ -23,6 +23,7 @@ import {
   buildArchiveConversationExpression,
   buildCancelOrganizerMutationExpression,
   buildRenameConversationExpression,
+  buildThrottleModalExpression,
   ORGANIZER_MUTATION_LEASE_MS,
 } from '../bin/cdp-organizer-expressions.mjs';
 import {
@@ -317,12 +318,20 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
       // without it every listed tab serves the same text, which cannot express "one tab is
       // ours and another is foreign" — the shape #68's ordering regression needs.
       if (extra && opts.tabText) value = opts.tabText(extra.url, extra.id) ?? value;
-      if (scratch && opts.renderText) {
+      const expression = request.params?.expression ?? '';
+      // A scratch "sample" is one DOM text read. The salvage also evaluates element probes
+      // (terminal-infrastructure, throttle-modal) against the same target each poll; those are
+      // answered by sentinel below and must not advance the ordered sample count fixtures assert.
+      // #162: gate on the page-text read itself. This predicate was `=== 'document.body.innerText'`
+      // when it was written; tabText has since moved to the pro-gate:review-text expression, which
+      // made the gate dead — renderText stopped firing at all and every scratch fixture served the
+      // listed tab's body instead of its own. Match what tabText actually sends, so adding a new
+      // element probe still cannot advance the count.
+      if (scratch && opts.renderText && expression.includes('pro-gate:review-text')) {
         const n = (pollsByTab.get(id) ?? 0) + 1;
         pollsByTab.set(id, n);
         value = opts.renderText(scratch.url, n);
       }
-      const expression = request.params?.expression ?? '';
       let delayMs = 0;
       let armMutation = null;
       let applyMutation = null;
@@ -330,6 +339,12 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
         value = runInNewContext(expression, { document: opts.document });
       } else if (expression.includes('pro-gate:terminal-infrastructure')) {
         value = opts.infrastructureError ?? null;
+      } else if (expression.includes('pro-gate:throttle-modal')) {
+        // #162: an ELEMENT read distinct from the page text. With no fixture value the evaluator
+        // sees no dialog — never the body — so quoted throttle copy cannot leak into a match.
+        value = typeof opts.throttleModal === 'function'
+          ? (opts.throttleModal(id, scratch?.url ?? extra?.url ?? 'https://chatgpt.com/c/mock-conversation') ?? null)
+          : (opts.throttleModal ?? null);
       } else if (expression.includes('pro-gate-organizer:rename')) {
         const expected = expectedTitleFromExpression(expression);
         const token = mutationTokenFromExpression(expression);
@@ -561,6 +576,11 @@ const completedReview = (marker, summary = 'owned') => [
   'P3: none',
   `VERDICT: SHIP — ${summary}. (run marker: ${marker})`,
 ].join('\n');
+// #167: mirrors bin/cdp-salvage.mjs's asciiFold. The engine's pg_strip_nonce and the browser-side
+// stripMarkerEcho both remove the echo case-insensitively, so this test-side reimplementation must
+// too — otherwise a lowercased-echo fixture would produce durable bytes the finalizer's own strip
+// disagrees with, and the fixture would fail as result-mismatch for a reason that is not the code.
+const testAsciiFold = (value) => String(value ?? '').replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
 const durableReview = (review, marker) => {
   const lines = review.split('\n');
   let verdict = -1;
@@ -572,8 +592,12 @@ const durableReview = (review, marker) => {
     if (/^\s*[*_>#-]*\s*(P0\s*[:\-]|P0\b|\[P[0-3]\])/i.test(lines[i].trim())) start = i;
   }
   if (start < 0) start = Math.max(0, verdict - 120);
-  return lines.slice(start, verdict + 1).join('\n')
-    .replace(`(run marker: ${marker})`, '')
+  const token = `(run marker: ${marker})`;
+  const foldedToken = testAsciiFold(token);
+  return lines.slice(start, verdict + 1).map((line) => {
+    const at = testAsciiFold(line).indexOf(foldedToken);
+    return at < 0 ? line : `${line.slice(0, at)}${line.slice(at + token.length)}`;
+  }).join('\n')
     .replace(/[ \t]+$/gm, '')
     .trim();
 };
@@ -598,6 +622,10 @@ function hasConsecutiveSamples(samples, minimum) {
 }
 
 const MARKER = 'pg-run-test-1234567890-42';
+// #167: a marker embeds ROUND_KEY, which preserves letter case from owner/repo text
+// ("pg-run-StartupBros-com-pro-gate-166-..."). Fixtures that vary the ECHO's case need a marker
+// whose case can actually vary — MARKER is already all-lowercase and cannot express the bug.
+const MIXED_MARKER = 'pg-run-Test-Case-1234567890-43';
 
 { // Direct poll-parser boundary coverage (bin/cdp-test-timing.mjs), called in-process — no spawn. Every
   // one of these is real production input shape: an unset/empty/malformed
@@ -715,6 +743,8 @@ const MARKER = 'pg-run-test-1234567890-42';
       `status=${r.status} stderr=${r.stderr?.slice(0, 240)}`);
     check(`terminal UI names bounded outcome: ${message}`,
       r.stderr?.includes(`terminal-infrastructure: ${message}`), r.stderr);
+    check(`terminal UI names its conclusion as terminal-infrastructure: ${message}`,
+      /^evidence-kind: terminal-infrastructure$/m.test(r.stderr ?? ''), r.stderr);
     check(`terminal UI leaves source tab for caller cleanup: ${message}`, !cdp.closed.includes('tab1'),
       `closed=${cdp.closed}`);
     cdp.stop();
@@ -960,6 +990,8 @@ const MARKER = 'pg-run-test-1234567890-42';
   const throttleResult = await runScratchSalvage([MARKER, '3'], throttled.port, seedMemo(MARKER, canonicalUrl));
   check('throttled canonical scratch takes the existing throttle exit', throttleResult.status === 5,
     `status=${throttleResult.status} stderr=${throttleResult.stderr}`);
+  check('throttled canonical scratch names its conclusion as throttle',
+    /^evidence-kind: throttle$/m.test(throttleResult.stderr ?? ''), `stderr=${throttleResult.stderr}`);
   check('throttled canonical scratch writes cooldown and closes only scratch',
     /canonical scratch/.test(throttleResult.cooldown ?? '') && throttled.closed.includes('scratch1') && !throttled.closed.includes('tab1'),
     `cooldown=${throttleResult.cooldown} closed=${throttled.closed}`);
@@ -1022,6 +1054,8 @@ const MARKER = 'pg-run-test-1234567890-42';
   check('a terminal render of A is emitted and attributed to A', terminalResult.status === 0 &&
     /^matched-url https:\/\/chatgpt\.com\/c\/known-conversation-a$/m.test(terminalResult.stderr ?? ''),
     `status=${terminalResult.status} stderr=${terminalResult.stderr?.slice(0, 300)}`);
+  check('a terminal render of A names its conclusion as terminal',
+    /^evidence-kind: terminal$/m.test(terminalResult.stderr ?? ''), `stderr=${terminalResult.stderr?.slice(0, 300)}`);
   check('the emitted review body is A\'s, not B\'s',
     terminalResult.stdout.trim() === terminalReviewA.split('\n').slice(1).join('\n'),
     `stdout=${terminalResult.stdout?.slice(0, 300)}`);
@@ -1957,6 +1991,8 @@ const FOREIGN_ANSWER = (m) => [
   check('cross-bound memo exits 4 (decisive), not 7/3', r.status === 4, `status=${r.status} stderr=${r.stderr?.slice(-300)}`);
   check('cross-bound memo is reported as another run\'s answer',
     /ANOTHER run's completed answer/.test(r.stderr ?? ''), `stderr=${r.stderr?.slice(-400)}`);
+  check('cross-bound memo names its conclusion as cross-bound',
+    /^evidence-kind: cross-bound$/m.test(r.stderr ?? ''), `stderr=${r.stderr?.slice(-400)}`);
   check('the poisoned memo file is deleted', (r.memos ?? []).length === 0, `memos=${JSON.stringify(r.memos)}`);
   check('no foreign review text is emitted on stdout',
     !/VERDICT/.test(r.stdout ?? ''), `stdout=${r.stdout?.slice(0, 200)}`);
@@ -2076,6 +2112,124 @@ const FOREIGN_ANSWER = (m) => [
   cdp.stop();
 }
 
+{ // #167: the marker was EXTRACTED case-insensitively but COMPARED case-sensitively, so a model
+  // that lowercased its own echo read as a different run: the conversation was blacklisted, its
+  // memo discarded, and this run's finished, PAID answer became unrecoverable. Both directions of
+  // case drift are pinned — a model can shout as easily as it can whisper.
+  //
+  // The fold is safe because two genuinely different runs cannot differ ONLY in letter case: a
+  // marker ends in "-<launch epoch>-<pid>" and one process has exactly one of each. The refusal
+  // half of that argument is pinned immediately below, including a sibling run that folds to
+  // nearly the same string and must still be refused.
+  const answerWithEcho = (echo) => [
+    `run marker: ${MIXED_MARKER}`,
+    '',
+    '[P1] lib/thing.sh:3 — a real finding',
+    'P2: none',
+    'P3: none',
+    `VERDICT: FIX-FIRST — ours. (run marker: ${echo})`,
+  ].join('\n');
+
+  for (const [label, echo] of [
+    ['a lowercased', MIXED_MARKER.toLowerCase()],
+    ['an uppercased', MIXED_MARKER.toUpperCase()],
+  ]) {
+    const cdp = await mockCdp(answerWithEcho(echo));
+    const r = await runSalvage([MIXED_MARKER, '20'], cdp.port);
+    check(`${label} self-echo binds positively rather than convicting (exit 0)`, r.status === 0,
+      `status=${r.status} stderr=${r.stderr?.slice(-400)}`);
+    check(`${label} self-echo's review reaches stdout`, /VERDICT: FIX-FIRST/.test(r.stdout ?? ''),
+      `stdout=${r.stdout?.slice(0, 200)}`);
+    check(`${label} self-echo is never convicted cross-bound or blacklisted`,
+      (r.crossbound ?? 0) === 0 && (r.blacklist ?? '') === '',
+      `crossbound=${r.crossbound} blacklist=${r.blacklist}`);
+    cdp.stop();
+  }
+
+  // NON-NEGOTIABLE: case is the only thing the fold may ignore. A marker for another repo, and a
+  // SIBLING run of this same round that differs only in its pid, must both still be refused.
+  for (const [label, foreign] of [
+    ['a foreign marker', 'pg-run-other-repo-42-1111111111-9'],
+    ['an uppercased foreign marker', 'PG-RUN-OTHER-REPO-42-1111111111-9'],
+    ['a sibling run of the same round', 'pg-run-test-case-1234567890-44'],
+  ]) {
+    const cdp = await mockCdp(answerWithEcho(foreign));
+    const r = await runSalvage([MIXED_MARKER, '3'], cdp.port);
+    check(`${label} is still refused, never emitted as ours`,
+      r.status !== 0 && !/VERDICT/.test(r.stdout ?? ''),
+      `status=${r.status} stdout=${r.stdout?.slice(0, 200)}`);
+    check(`${label} is still convicted as a cross-bind`, r.crossbound > 0,
+      `crossbound=${r.crossbound} stderr=${r.stderr?.slice(-300)}`);
+    cdp.stop();
+  }
+}
+
+{ // #167: --close matches the tab by marker too. A conversation whose rendered text carries only
+  // a case-drifted occurrence used to be left open, leaking a /c/ tab per run.
+  const cdp = await mockCdp(
+    `run marker: ${MIXED_MARKER.toLowerCase()}\nVERDICT: SHIP — ours. (run marker: ${MIXED_MARKER.toLowerCase()})`,
+  );
+  const r = await runSalvage(['--close', MIXED_MARKER, '10'], cdp.port);
+  check('--close closes a conversation tab whose marker differs only in case',
+    r.status === 0 && cdp.closed.includes('tab1'), `status=${r.status} closed=${cdp.closed}`);
+  cdp.stop();
+}
+
+{ // #169 gate r1 P2: the fold above corrects the COMPARISON; it does not retract a conviction an
+  // older pro-gate already reached. That conviction persisted "<marker>\t<url>" to
+  // salvage-nonmatching.txt and deleted conversation-urls/<marker> — and both tab scans consult
+  // the blacklist BEFORE the folded comparison, while the remembered-URL branch has no memo left.
+  // So an already-convicted run stays unreachable after the upgrade, which is why v0.45.0's notes
+  // document a per-run correction instead of promising that a harvest heals it.
+  //
+  // These three checks ARE that paragraph's proof. If the first goes red because salvage recovers
+  // unaided, the release note is what changes; if either of the others goes red, the documented
+  // procedure no longer works and the note is wrong.
+  const CONVICTED_URL = 'https://chatgpt.com/c/mock-conversation';
+  const convicted = [
+    `run marker: ${MIXED_MARKER}`,
+    'P0: none',
+    'P1: none',
+    'P2: none',
+    'P3: none',
+    `VERDICT: SHIP — ours. (run marker: ${MIXED_MARKER.toLowerCase()})`,
+  ].join('\n');
+  // Another run's conviction, left in place throughout: the documented correction removes ONE
+  // line, and the recoveries below must succeed without touching anybody else's.
+  const strangersLine = 'pg-run-other-repo-42-1111111111-9\thttps://chatgpt.com/c/someone-else\n';
+  const writeBlacklist = (lines) => (home) =>
+    fs.writeFileSync(path.join(home, 'salvage-nonmatching.txt'), lines);
+
+  const stuck = await mockCdp(convicted);
+  const stuckResult = await runSalvage([MIXED_MARKER, '3'], stuck.port,
+    writeBlacklist(`${strangersLine}${MIXED_MARKER}\t${CONVICTED_URL}\n`));
+  check('a pre-upgrade cross-bind conviction still hides a case-drifted self-echo after the fold fix',
+    stuckResult.status !== 0 && !/VERDICT/.test(stuckResult.stdout ?? ''),
+    `status=${stuckResult.status} stdout=${stuckResult.stdout?.slice(0, 200)}`);
+  stuck.stop();
+
+  // Documented step 3, tab still open: dropping that one line is what lets the scan classify the
+  // conversation at all, and the fold then binds it.
+  const openTab = await mockCdp(convicted);
+  const openResult = await runSalvage([MIXED_MARKER, '20'], openTab.port, writeBlacklist(strangersLine));
+  check("dropping only that run's blacklist line recovers the review from an open tab",
+    openResult.status === 0 && /VERDICT: SHIP/.test(openResult.stdout ?? ''),
+    `status=${openResult.status} stderr=${openResult.stderr?.slice(-300)}`);
+  openTab.stop();
+
+  // ...and with no tab left, the restored memo is the only handle there is — which is why the
+  // documented correction rewrites conversation-urls/<marker> as well as dropping the line.
+  const noTab = await mockCdp('__NO_TABS__', [], { renderText: () => convicted });
+  const noTabResult = await runSalvage([MIXED_MARKER, '30'], noTab.port, (home) => {
+    writeBlacklist(strangersLine)(home);
+    seedMemo(MIXED_MARKER, CONVICTED_URL)(home);
+  });
+  check('restoring the URL memo recovers the review once no tab carries it',
+    noTabResult.status === 0 && /VERDICT: SHIP/.test(noTabResult.stdout ?? ''),
+    `status=${noTabResult.status} stderr=${noTabResult.stderr?.slice(-300)}`);
+  noTab.stop();
+}
+
 { // A still-generating conversation (our marker, NO completed verdict yet) must remain
   // "live", not be mistaken for a cross-bind: the foreign check only fires on a COMPLETE answer.
   // Its canonical scratch revalidation deliberately keeps sampling owned-incomplete evidence to
@@ -2091,6 +2245,8 @@ const FOREIGN_ANSWER = (m) => [
   });
   const r = await runFastCdpDeadlineSalvage([MARKER, '3'], cdp.port);
   check('still-generating stays exit 3 under the new check', r.status === 3, `status=${r.status} stderr=${r.stderr?.slice(-300)}`);
+  check('still-generating names its conclusion as owned-incomplete',
+    /^evidence-kind: owned-incomplete$/m.test(r.stderr ?? ''), `stderr=${r.stderr?.slice(-300)}`);
   check('still-generating samples owned-incomplete scratch state repeatedly and in order',
     hasConsecutiveSamples(samples, 5) && cdp.scratchJsonListCalls >= 5,
     `samples=${samples} scratchLists=${cdp.scratchJsonListCalls}`);
@@ -2306,6 +2462,8 @@ const FOREIGN_ANSWER = (m) => [
   const r = await runSalvage([MARKER, '3'], deadPort);
   check('CDP down exits 7 (inconclusive), not 4', r.status === 7, `status=${r.status} stderr=${r.stderr?.slice(0, 200)}`);
   check('inconclusive names the cause', /inconclusive/.test(r.stderr ?? ''), `stderr=${r.stderr?.slice(0, 200)}`);
+  check('CDP down names its conclusion as browser-down',
+    /^evidence-kind: browser-down$/m.test(r.stderr ?? ''), `stderr=${r.stderr?.slice(0, 200)}`);
 }
 
 { // nothing matches the marker -> exit 4 (foreign conversation left alone)
@@ -2610,6 +2768,58 @@ const FOREIGN_ANSWER = (m) => [
     cdp.closed.length === 1 && cdp.closed[0] === 'tab1',
     `closed=${cdp.closed}`);
   cdp.stop();
+}
+
+{ // #167, mutation authority. organizerOwnership/finalizerOwnership are deliberately stricter
+  // than salvage extraction, and their "exact marker echo" rule used to mean case-exact: a
+  // lowercased self-echo returned cross-bound, so the run's own conversation was never renamed,
+  // archived or closed. "Exact" now means token-exact, not case-exact.
+  //
+  // The finalizer case doubles as the strip contract's only end-to-end pin. Its accepted bytes
+  // come from the ENGINE, whose pg_strip_nonce removed the echo case-insensitively; the browser
+  // side must fold identically or the byte comparison lands on result-mismatch instead of ok.
+  const title = 'pro-gate review: PR #167 r1 [pro-gate]';
+  const lowerEcho = completedReview(MIXED_MARKER.toLowerCase(), 'case-drifted echo');
+  const organizeCdp = await mockCdp(`run marker: ${MIXED_MARKER}\n${lowerEcho}`);
+  const organizeResult = await runSalvage(
+    ['--organize', MIXED_MARKER, '5'],
+    organizeCdp.port,
+    seedOrganizer(MIXED_MARKER, title),
+  );
+  check('organizer grants rename authority on a lowercased self-echo',
+    /rename=renamed/.test(organizeResult.stdout) && /reason=ok/.test(organizeResult.stdout),
+    `stdout=${organizeResult.stdout}`);
+  check('organizer applies the exact title for a lowercased self-echo',
+    organizeCdp.ui.title === title, `title=${organizeCdp.ui.title}`);
+  organizeCdp.stop();
+
+  const finalizeTitle = 'pro-gate review: PR #167 r2 [pro-gate]';
+  const finalizeCdp = await mockCdp(`run marker: ${MIXED_MARKER}\n${lowerEcho}`);
+  const finalizeResult = await runSalvage(
+    finalizerArgs(MIXED_MARKER),
+    finalizeCdp.port,
+    seedOrganizer(MIXED_MARKER, finalizeTitle, null, durableReview(lowerEcho, MIXED_MARKER)),
+  );
+  check('finalizer accepts a lowercased self-echo and agrees with the engine-stripped bytes',
+    /rename=renamed archive=archived close=closed reason=ok/.test(finalizeResult.stdout),
+    `stdout=${finalizeResult.stdout}`);
+  finalizeCdp.stop();
+
+  // And still refuses a genuinely foreign echo, whatever its case: /i widens EXTRACTION, never
+  // acceptance. Without this, an over-broad fold could grant mutation authority over another
+  // run's live conversation.
+  const foreignTitle = 'pro-gate review: PR #167 r3 [pro-gate]';
+  const foreignEcho = completedReview('PG-RUN-OTHER-REPO-42-1111111111-9', 'not ours');
+  const foreignCdp = await mockCdp(`run marker: ${MIXED_MARKER}\n${foreignEcho}`);
+  const foreignResult = await runSalvage(
+    ['--organize', MIXED_MARKER, '5'],
+    foreignCdp.port,
+    seedOrganizer(MIXED_MARKER, foreignTitle),
+  );
+  check('organizer still refuses an uppercased FOREIGN echo',
+    /reason=cross-bound/.test(foreignResult.stdout) && foreignCdp.ui.events.length === 0,
+    `stdout=${foreignResult.stdout} events=${JSON.stringify(foreignCdp.ui.events)}`);
+  foreignCdp.stop();
 }
 
 {
@@ -3061,8 +3271,25 @@ const FOREIGN_ANSWER = (m) => [
       /expectedFinalReview === null[\s\S]*verdictAt > ownMarkerAt/.test(renameExpression));
   check('browser-side finalization rejects any newer exact run marker',
     /lastExactRunMarkerAt/.test(renameExpression) &&
-      /matchAll\(\/pg-run-\[A-Za-z0-9.-\]\+\/g\)/.test(renameExpression) &&
+      /matchAll\(\/pg-run-\[A-Za-z0-9.-\]\+\/gi\)/.test(renameExpression) &&
       /target-newer-run-marker/.test(renameExpression));
+  // #167: the browser-side ownership check is a textual TWIN of cdp-salvage.mjs's, inlined into
+  // a String.raw template because the page cannot import. A fix applied to one copy and not the
+  // other is invisible at runtime until the organizer silently refuses to rename a conversation
+  // whose only fault is that the model lowercased its own echo. Assert the fold is present here
+  // AND that no bare case-sensitive comparison survives in the emitted source.
+  check('browser-side marker identity is ASCII-case-folded, not byte-exact',
+    /const asciiFold = /.test(renameExpression) &&
+      /const sameMarker = /.test(renameExpression) &&
+      /sameMarker\(answerMarker, expectedMarker\)/.test(renameExpression) &&
+      !/answerMarker !== expectedMarker/.test(renameExpression));
+  check('browser-side marker search folds the haystack, keeping indexes into the original text',
+    /const haystack = asciiFold\(text\)/.test(renameExpression) &&
+      /const needle = asciiFold\(wanted\)/.test(renameExpression) &&
+      !/text\.indexOf\(wanted, from\)/.test(renameExpression));
+  check('browser-side marker-echo strip folds the lookup but slices the original line',
+    /asciiFold\(line\)\.indexOf\(asciiFold\(token\)\)/.test(renameExpression) &&
+      !/const at = line\.indexOf\(token\)/.test(renameExpression));
   check('archive expression excludes destructive and reverse actions',
     /label\.includes\('delete'\)/.test(archiveExpression) &&
       /label\.includes\('unarchive'\)/.test(archiveExpression) &&
@@ -3100,6 +3327,228 @@ const FOREIGN_ANSWER = (m) => [
       r.crossbound === 0, `crossbound=${r.crossbound} stderr=${r.stderr?.slice(0, 300)}`);
     cdp.stop();
   }
+}
+
+{ // #162: the throttle-modal page expression itself, executed against a minimal DOM stand-in. The
+  // mock browsers answer this expression by sentinel, so this is the only place its element
+  // scoping (dialog-only, marker-free, visible, bounded) is actually exercised.
+  const expression = buildThrottleModalExpression();
+  const modal = "Too many requests. You're making requests too quickly. We've temporarily limited access to your conversations to protect your data. Please wait a few minutes before trying again.";
+  const node = (text, { rects = 1 } = {}) => ({
+    innerText: text, textContent: text, getClientRects: () => Array.from({ length: rects }),
+  });
+  const evaluate = (dialogs) => new Function('document', `return ${expression};`)({ querySelectorAll: () => dialogs });
+  check('modal expression carries the mock sentinel', expression.includes('pro-gate:throttle-modal'));
+  check('modal expression reads the throttle copy from a visible dialog', evaluate([node(modal)]) === modal,
+    `got=${evaluate([node(modal)])}`);
+  check('modal expression sees no dialog on a page that only quotes the copy in its body', evaluate([]) === null);
+  check('modal expression ignores a dialog that renders a run marker',
+    evaluate([node(`${modal}\nrun marker: ${MARKER}`)]) === null);
+  check('modal expression ignores a hidden dialog', evaluate([node(modal, { rects: 0 })]) === null);
+  check('modal expression ignores an unrelated dialog', evaluate([node('Rename conversation\nSave')]) === null);
+  check('modal expression ignores an oversized dialog', evaluate([node(`${modal}\n${'x'.repeat(2100)}`)]) === null);
+  check('modal expression picks the throttle dialog among several',
+    evaluate([node('Share link'), node(modal), node('Archive?')]) === modal);
+  // The caller re-runs THROTTLE_RE over the returned value: a match that sits past any fixed
+  // prefix must survive the round trip whole, or the modal goes undetected again.
+  const latePhrase = `${'Before you continue, please read this notice. '.repeat(8)}${modal}`;
+  check('modal expression returns the whole dialog text so a late match survives the caller recheck',
+    latePhrase.length > 300 && latePhrase.length < 2000 && evaluate([node(latePhrase)]) === latePhrase,
+    `length=${latePhrase.length}`);
+}
+
+{ // #162: ChatGPT's "Too many requests" modal shown OVER a real review conversation. The page is
+  // long (far past the interstitial guard's 5,000 characters) and carries this run's marker, so
+  // whole-page text shape can never call it a throttle; before this fix --probe read it as
+  // `generating` for six hours (PR #148, 2026-09-05) and --harvest exited 9 at its deadline.
+  const modal = "Too many requests. You're making requests too quickly. We've temporarily limited access to your conversations to protect your data. Please wait a few minutes before trying again.";
+  const reasoning = Array.from({ length: 120 }, (_, i) =>
+    `Reviewed concurrency risks in module ${i}: lock ordering, retry budgets, and reservation TTL handling.`).join('\n');
+  const conversation = `${modal}\nrun marker: ${MARKER}\n${reasoning}\nReviewed concurrency risks`;
+  check('modal fixture is longer than the interstitial guard and carries the marker',
+    conversation.length > 5000 && conversation.includes(MARKER), `length=${conversation.length}`);
+
+  const probed = await mockCdp(conversation, [], { throttleModal: modal });
+  const r = await runSalvage(['--probe', MARKER, '3'], probed.port);
+  check('probe under the throttle modal stays live (exit 0: a retry would double-spend)', r.status === 0,
+    `status=${r.status} stderr=${r.stderr?.slice(0, 300)}`);
+  check('probe under the throttle modal reports the closed throttled state, never generating',
+    /^probe-state: throttled$/m.test(r.stderr || '') && !/^probe-state: generating$/m.test(r.stderr || ''),
+    `stderr=${r.stderr?.slice(0, 300)}`);
+  check('probe under the throttle modal writes the account cooldown naming the modal',
+    /modal over tab/.test(r.cooldown ?? ''), `cooldown=${r.cooldown}`);
+  check('probe under the throttle modal opens no scratch render against the limited account',
+    probed.created.length === 0 && !probed.closed.includes('tab1'),
+    `created=${JSON.stringify(probed.created)} closed=${probed.closed}`);
+  probed.stop();
+
+  const harvested = await mockCdp(conversation, [], { throttleModal: modal });
+  const h = await runSalvage([MARKER, '3'], harvested.port);
+  check('salvage under the throttle modal takes the existing throttle exit (5) and keeps the tab',
+    h.status === 5 && !harvested.closed.includes('tab1') && /modal over tab/.test(h.cooldown ?? ''),
+    `status=${h.status} closed=${harvested.closed} cooldown=${h.cooldown}`);
+  check('salvage under the throttle modal prints no review', h.stdout === '', `stdout=${h.stdout}`);
+  harvested.stop();
+
+  // Planted negative: the same page shape with NO dialog element — the review merely quotes the
+  // limiter's copy. Text shape alone would flag it; element detection must not.
+  const quoting = `run marker: ${MARKER}\n${reasoning}\nThe engine's guard matches "You're making requests too quickly" and `
+    + '"temporarily limited access to your conversations"; both phrases appear here as review text.';
+  const quoted = await mockCdp(quoting);
+  const q = await runSalvage(['--probe', MARKER, '3'], quoted.port);
+  check('quoted throttle copy without a dialog still probes as generating with no cooldown',
+    q.status === 0 && /^probe-state: generating$/m.test(q.stderr || '') && q.cooldown === null,
+    `status=${q.status} cooldown=${q.cooldown} stderr=${q.stderr?.slice(0, 300)}`);
+  quoted.stop();
+  const finished = await mockCdp(`${quoting}\nP1: none\nVERDICT: SHIP — quotes the limiter copy. (run marker: ${MARKER})`);
+  const d = await runSalvage([MARKER, '3'], finished.port);
+  check('quoted throttle copy inside a finished review is still extracted (exit 0, no cooldown)',
+    d.status === 0 && /VERDICT: SHIP/.test(d.stdout) && d.cooldown === null,
+    `status=${d.status} cooldown=${d.cooldown} stdout=${d.stdout.slice(0, 120)}`);
+  finished.stop();
+
+  // The original interstitial guard's own false-positive case: a SHORT marker-less page quoting
+  // the copy is the interstitial, and a long marker-bearing page quoting it is not.
+  const shortQuote = `The guard matches "temporarily limited access to your conversations".`;
+  check('interstitial guard still treats a short marker-less page with the copy as the interstitial',
+    shortQuote.length < 5000 && !/pg-run-/.test(shortQuote));
+  const interstitial = await mockCdp(shortQuote);
+  const i = await runSalvage(['--probe', MARKER, '3'], interstitial.port);
+  check('short marker-less page with the copy keeps the existing interstitial exit (5)',
+    i.status === 5 && /tab /.test(i.cooldown ?? ''), `status=${i.status} cooldown=${i.cooldown}`);
+  interstitial.stop();
+
+  // The modal over ANOTHER run's conversation proves the limiter, not our conversation's
+  // existence: probe must not answer "live" for a page that renders a foreign marker.
+  const foreign = `${modal}\nrun marker: pg-run-other-1111111111-1\n${reasoning}`;
+  const foreignCdp = await mockCdp(foreign, [], { throttleModal: modal });
+  const f = await runSalvage(['--probe', MARKER, '3'], foreignCdp.port);
+  check("probe: modal over another run's conversation proves only the limiter (exit 5, cooldown written)",
+    f.status === 5 && /modal over tab/.test(f.cooldown ?? '') && !/^probe-state:/m.test(f.stderr || ''),
+    `status=${f.status} cooldown=${f.cooldown} stderr=${f.stderr?.slice(0, 200)}`);
+  foreignCdp.stop();
+
+  // The modal is account-wide, so with several tabs open it covers all of them. Ownership must be
+  // decided over the whole scan: a foreign conversation listed FIRST must not hide the proof that
+  // the second tab renders this run's marker.
+  const ownUrl = 'https://chatgpt.com/c/ours-under-the-modal';
+  const twoTabs = await mockCdp(`${modal}\nrun marker: pg-run-other-1111111111-1\n${reasoning}`,
+    [{ id: 'ours', url: ownUrl }],
+    { tabText: (url, id) => (id === 'ours' ? conversation : null), throttleModal: () => modal });
+  const two = await runSalvage(['--probe', MARKER, '3'], twoTabs.port);
+  check('probe: a foreign tab listed ahead of ours under the same modal still proves our conversation (live, throttled)',
+    two.status === 0 && /^probe-state: throttled$/m.test(two.stderr || '') && two.stderr.includes(`live conversation: ${ownUrl}`),
+    `status=${two.status} stderr=${two.stderr?.slice(0, 300)}`);
+  check('two-tab modal names the owned tab in the cooldown', (two.cooldown ?? '').includes(ownUrl), `cooldown=${two.cooldown}`);
+  twoTabs.stop();
+  const twoTabsBlacklisted = await mockCdp(`${modal}\nrun marker: pg-run-other-1111111111-1\n${reasoning}`,
+    [{ id: 'ours', url: ownUrl }],
+    { tabText: (url, id) => (id === 'ours' ? conversation : null), throttleModal: () => modal });
+  const seedBlacklist = (home) => fs.writeFileSync(path.join(home, 'salvage-nonmatching.txt'), `${MARKER}\t${ownUrl}\n`);
+  const blk = await runSalvage(['--probe', MARKER, '3'], twoTabsBlacklisted.port, seedBlacklist);
+  check('probe: a blacklisted marker-bearing tab under the modal proves only the limiter (exit 5)',
+    blk.status === 5 && !/^probe-state:/m.test(blk.stderr || ''), `status=${blk.status} stderr=${blk.stderr?.slice(0, 200)}`);
+  twoTabsBlacklisted.stop();
+
+  // A remembered conversation re-rendered in a scratch tab can come up under the modal too:
+  // the render must stop on the element, not fall through to "marker found, still generating".
+  const canonicalUrl = 'https://chatgpt.com/c/mock-conversation';
+  const scratchModal = await mockCdp('__NO_TABS__', [], {
+    renderText: () => conversation,
+    throttleModal: (id) => (id.startsWith('scratch') ? modal : null),
+  });
+  const sr = await runScratchSalvage(['--probe', MARKER, '3'], scratchModal.port, seedMemo(MARKER, canonicalUrl));
+  check('remembered render under the throttle modal probes as live but throttled',
+    sr.status === 0 && /^probe-state: throttled$/m.test(sr.stderr || '') && /remembered render/.test(sr.cooldown ?? ''),
+    `status=${sr.status} cooldown=${sr.cooldown} stderr=${sr.stderr?.slice(0, 300)}`);
+  check('remembered render under the throttle modal closes its scratch tab',
+    scratchModal.created.length === 1 && scratchModal.closed.includes(scratchModal.created[0].id),
+    `created=${JSON.stringify(scratchModal.created)} closed=${scratchModal.closed}`);
+  scratchModal.stop();
+}
+
+// v0.42 (#109): a synthetic placeholder such as https://chatgpt.com/c/WEB:<uuid> once passed the
+// prefix-only memo check, was remembered as authoritative, and parked its run forever: the page
+// behind it carries no marker, so every later pass was inconclusive and never counted a miss.
+// The memo's conversation id must now be one path segment of letters, digits, and dashes, checked
+// when a URL is remembered AND every time one is read.
+const PLACEHOLDER_URLS = [
+  'https://chatgpt.com/c/WEB:57cc5403-ad61-4ccd-af90-ad28a539081e',
+  // A well-formed UUID after the prefix must still fail: the check anchors the whole segment.
+  'https://chatgpt.com/c/WEB:b385e15b-9c62-4dca-bec7-0be2f579c0f3',
+];
+const REAL_ID_URL = 'https://chatgpt.com/c/6a959c8f-c95c-83ea-81b8-85a3ea5d6cbc';
+
+{ // AE1: write time — a placeholder-URL tab that carries our marker is NEVER remembered.
+  const placeholder = PLACEHOLDER_URLS[0];
+  const cdp = await mockCdp('__NO_TABS__', [{ id: 'ph1', type: 'page', url: placeholder }], {
+    tabText: () => `run marker: ${MARKER}\nthinking hard, no verdict yet`,
+  });
+  const r = await runFastPollSalvage([MARKER, '3'], cdp.port);
+  check('placeholder tab still counts as our still-generating conversation (exit 3)', r.status === 3, `status=${r.status} stderr=${r.stderr?.slice(-300)}`);
+  check('placeholder URL is not remembered as a memo', r.memos.length === 0, `memos=${r.memos} memo=${r.memoUrl}`);
+  check('rejection names the marker and the offending id',
+    (r.stderr || '').includes('memo-rejected') && (r.stderr || '').includes(MARKER) && (r.stderr || '').includes('WEB:57cc5403'),
+    `stderr=${r.stderr?.slice(-400)}`);
+  cdp.stop();
+}
+
+{ // AE5: write time — a real conversation id is remembered exactly as before.
+  const cdp = await mockCdp('__NO_TABS__', [{ id: 'real1', type: 'page', url: REAL_ID_URL }], {
+    tabText: () => `run marker: ${MARKER}\nthinking hard, no verdict yet`,
+  });
+  const r = await runFastPollSalvage([MARKER, '3'], cdp.port);
+  check('real-id tab is remembered', r.memoUrl === REAL_ID_URL, `memo=${r.memoUrl} status=${r.status}`);
+  check('real-id memo has no rejection line', !/memo-rejected/.test(r.stderr || ''), `stderr=${r.stderr?.slice(-300)}`);
+  cdp.stop();
+}
+
+for (const placeholder of PLACEHOLDER_URLS) {
+  // AE2 (first pass): read time — a seeded placeholder memo is revoked in the SAME pass, the
+  // pass rescans, and with no candidate carrying the marker it exits confirmed-absent (4), not
+  // inconclusive (7). Before the fix the remembered render never rendered the marker and the
+  // pass parked at exit 7 forever, never counting a miss.
+  const cdp = await mockCdp('an unrelated page with no run marker at all');
+  const r = await runFastPollSalvage([MARKER, '3'], cdp.port, seedMemo(MARKER, placeholder));
+  const id = placeholder.split('/c/')[1];
+  check(`placeholder memo ${id.slice(0, 12)} is revoked on read`, r.memos.length === 0, `memos=${r.memos} memo=${r.memoUrl}`);
+  check(`revocation names the marker and id (${id.slice(0, 12)})`,
+    (r.stderr || '').includes('memo-revoked') && (r.stderr || '').includes(MARKER) && (r.stderr || '').includes(id),
+    `stderr=${r.stderr?.slice(-400)}`);
+  check(`same pass reaches confirmed-absent after revoking ${id.slice(0, 12)}`, r.status === 4, `status=${r.status} stderr=${r.stderr?.slice(-300)}`);
+  check(`revocation pass names its conclusion as absent (${id.slice(0, 12)})`, /^evidence-kind: absent$/m.test(r.stderr || ''), `stderr=${r.stderr?.slice(-300)}`);
+  cdp.stop();
+}
+
+{ // AE2 with a genuine candidate elsewhere: the placeholder is revoked and the pass binds the
+  // genuine conversation instead of parking on the placeholder.
+  const cdp = await mockCdp(`run marker: ${MARKER}\nthinking hard, no verdict yet`);
+  const r = await runFastPollSalvage([MARKER, '3'], cdp.port, seedMemo(MARKER, PLACEHOLDER_URLS[0]));
+  check('placeholder revoked when a genuine candidate exists', /memo-revoked/.test(r.stderr || ''), `stderr=${r.stderr?.slice(-300)}`);
+  check('genuine candidate is bound and remembered', r.memoUrl === 'https://chatgpt.com/c/mock-conversation', `memo=${r.memoUrl}`);
+  check('genuine still-generating candidate keeps exit 3', r.status === 3, `status=${r.status}`);
+  cdp.stop();
+}
+
+{ // AE3: a real-id memo whose page renders WITHOUT the marker stays inconclusive and is kept:
+  // a blank render is a transient, never a miss, and never a revocation.
+  const cdp = await mockCdp('an unrelated page with no run marker at all');
+  const r = await runFastPollSalvage([MARKER, '3'], cdp.port, seedMemo(MARKER, REAL_ID_URL));
+  check('real-id blank render stays inconclusive (exit 7)', r.status === 7, `status=${r.status} stderr=${r.stderr?.slice(-300)}`);
+  check('real-id memo is kept', r.memoUrl === REAL_ID_URL, `memo=${r.memoUrl}`);
+  check('real-id memo is not revoked', !/memo-revoked/.test(r.stderr || ''), `stderr=${r.stderr?.slice(-300)}`);
+  check('blank render names its conclusion as inconclusive', /^evidence-kind: inconclusive$/m.test(r.stderr || ''), `stderr=${r.stderr?.slice(-300)}`);
+  cdp.stop();
+}
+
+{ // The organize step reads the memo too, so it revokes a placeholder as well.
+  const cdp = await mockCdp(`run marker: ${MARKER}\nstill thinking`);
+  const r = await runSalvage(['--organize', MARKER, '5'], cdp.port, seedOrganizer(MARKER, 'pro-gate review: PR #42 r1', PLACEHOLDER_URLS[0]));
+  // The organize step then re-remembers the genuine conversation it found, so the memo is
+  // replaced, not merely removed: what must never survive is the placeholder.
+  check('organize revokes a placeholder memo', r.memoUrl !== PLACEHOLDER_URLS[0], `memos=${r.memos} memo=${r.memoUrl} status=${r.status}`);
+  check('organize names the revoked id', /memo-revoked/.test(r.stderr || ''), `stderr=${r.stderr?.slice(-300)}`);
+  cdp.stop();
 }
 
 { // #170 on the same early-exit paths: the flush now has to DISTINGUISH. Unsupported stale
