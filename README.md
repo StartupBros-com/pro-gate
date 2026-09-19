@@ -445,7 +445,8 @@ semantics. Native mode keeps the prompt's title hint and does not run remote-CDP
   Independent of that policy mode, a change whose open-P0/P1 trajectory has not shrunk for 2
   consecutive re-reviews gets a typed `stop-without-new-review` / `rounds-not-converging` decision
   in place of a new round grant or a fix dispatch — this is a churn signal, not a budget one, so it
-  fires even in advisory mode. `PRO_GATE_ROUNDS_CONTINUE=1` lets one more round through anyway; the
+  fires even in advisory mode. A clean round (zero open P0/P1) ends the chain, so successive clean
+  reviews of new heads never accumulate a streak. `PRO_GATE_ROUNDS_CONTINUE=1` lets one more round through anyway; the
   daemon and the wrapper's loop both end a run on any `stop-without-new-review` reason the same way.
 - **Merge authority**: the daemon never merges directly; it stops after pushing fixes and
   commenting. The surrounding agent may arm squash auto-merge only after local verification,

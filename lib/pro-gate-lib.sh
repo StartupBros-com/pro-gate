@@ -2658,7 +2658,14 @@ pg_round_score() {
         PG_ROUND_ELAPSED_SECS=$(( PG_ROUND_ELAPSED_SECS + dur ))
         PG_ROUND_SCORED=$(( PG_ROUND_SCORED + 1 ))
         open=$(( p0 + p1 ))
-        if [ -n "$prev" ]; then
+        if [ "$open" -eq 0 ]; then
+          # gate r5 P2 (v0.53.0): a clean round converges the chain. Zero cannot shrink further,
+          # so zero-to-zero is not churn -- three clean SHIPs on successive heads inside the
+          # window must not leave a streak that stops the next fresh review. A shrink INTO zero
+          # still earns a round like any other shrink.
+          if [ -n "$prev" ] && [ "$prev" -gt 0 ]; then PG_ROUND_EARNED=$(( PG_ROUND_EARNED + 1 )); fi
+          PG_ROUND_STREAK=0
+        elif [ -n "$prev" ]; then
           if [ "$open" -lt "$prev" ]; then PG_ROUND_EARNED=$(( PG_ROUND_EARNED + 1 )); PG_ROUND_STREAK=0
           else PG_ROUND_STREAK=$(( PG_ROUND_STREAK + 1 )); fi
         fi

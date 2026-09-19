@@ -2014,6 +2014,23 @@ ARROW33_GOV="$(env PRO_GATE_HOME="$GHOME" bash -c ". '$HERE/../lib/pro-gate-lib.
 check '#174 gate r1 P2: governor facts bound the exported arrow to the latest 32 counts' \
   "$(jq -e '(.arrow|length)==32 and .scored==33 and .arrow[0]==39 and .arrow[-1]==8 and .streak==0 and .earned==32' <<<"$ARROW33_GOV" >/dev/null 2>&1; echo $?)" \
   "$ARROW33_GOV"
+# gate r5 P2 (#174, v0.53.0): a clean round ends the chain. Three clean SHIPs on successive heads
+# (0,0,0) must score streak 0, not 2; a positive flat trajectory (1,1,1) still scores streak 2; a
+# shrink into zero earns; positive churn after a clean round still accumulates.
+ghist clean3 0 0 0
+GS_CLEAN3="$(gscore clean3)"
+check 'gate r5 P2: three clean rounds score streak 0 (zero-to-zero is not churn)' "$([ "$(printf '%s' "$GS_CLEAN3" | cut -f2)" = 0 ] && [ "$(printf '%s' "$GS_CLEAN3" | cut -f4)" = 3 ]; echo $?)" "earned/streak/elapsed/scored=$GS_CLEAN3"
+ghist flatpos 1 1 1
+GS_FLATPOS="$(gscore flatpos)"
+check 'gate r5 P2 pin: a positive flat trajectory (1,1,1) still scores streak 2' "$([ "$(printf '%s' "$GS_FLATPOS" | cut -f2)" = 2 ]; echo $?)" "earned/streak/elapsed/scored=$GS_FLATPOS"
+ghist tozero 2 0 0
+GS_TOZERO="$(gscore tozero)"
+check 'gate r5 P2: a shrink into zero earns one round and leaves streak 0' "$([ "$(printf '%s' "$GS_TOZERO" | cut -f1)" = 1 ] && [ "$(printf '%s' "$GS_TOZERO" | cut -f2)" = 0 ]; echo $?)" "earned/streak/elapsed/scored=$GS_TOZERO"
+ghist afterclean 0 1 1
+GS_AFTERCLEAN="$(gscore afterclean)"
+check 'gate r5 P2: positive churn after a clean round still reaches streak 2' "$([ "$(printf '%s' "$GS_AFTERCLEAN" | cut -f2)" = 2 ]; echo $?)" "earned/streak/elapsed/scored=$GS_AFTERCLEAN"
+CLEAN3_GOV="$(env PRO_GATE_HOME="$GHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_governor_facts_json clean3 true")"
+check 'gate r5 P2: the governor facts for three clean rounds carry arrow [0,0,0] with streak 0' "$(jq -e '.arrow==[0,0,0] and .streak==0 and .scored==3' <<<"$CLEAN3_GOV" >/dev/null 2>&1; echo $?)" "$CLEAN3_GOV"
 # No explicit policy: count, grant, and trajectory are advisory and never ration a safe review.
 gseed nohist 3
 GOUT="$(gguard nohist)"; GRC=$?
@@ -6039,6 +6056,11 @@ ARROW33_OUT="$(rd_reduce "$(rd_facts "$ARROW33_PATCH")")"
 check '#174 gate r1 P2 planted negative: a 33-count arrow is refused as unsafe-normalized-input, which is why the builder bounds it' \
   "$(jq -e '.action=="stop-without-new-review" and .reason=="unsafe-normalized-input"' <<<"$ARROW33_OUT" >/dev/null 2>&1; echo $?)" \
   "$ARROW33_OUT"
+# gate r5 P2: after three clean rounds the next fresh-head query is granted, never stopped as churn.
+CLEAN3_PATCH="$(jq -cn '{governor:{arrow:[0,0,0],continue_override:false,earned:0,grant:3,granted:true,policy_mode:"advisory",scored:3,streak:0}}')"
+CLEAN3_OUT="$(rd_reduce "$(rd_facts "$CLEAN3_PATCH")")"
+check 'gate r5 P2: a fresh-head query after three clean rounds reduces to a round grant' \
+  "$(jq -e '.action=="run-granted-review" and .reason=="round-granted-for-changed-input"' <<<"$CLEAN3_OUT" >/dev/null 2>&1; echo $?)" "$CLEAN3_OUT"
 NOT_BINDABLE_PATCH='{"completed_results":[{"applicable":true,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bindable":false,"binding_valid":false,"canonical_identity":"pg-run-acme-widgets-1983-1700000350-1","charged_spend_epoch":1700000350,"collected":false,"evidence_mode":"connector","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000350-1","provenance_valid":false,"verdict":"NONE"}]}'
 NOT_BINDABLE_OUT="$(rd_reduce "$(rd_facts "$NOT_BINDABLE_PATCH")")"
 check 'uncollected result that can never bind stops typed with its mode and marker, never collects' \
