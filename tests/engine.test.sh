@@ -8517,6 +8517,22 @@ check 'pg_cgroup_mem_pct: high=max and max=max -> empty (no limit, fail-open)' "
 PCT_MISSING="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_cgroup_mem_pct '$MEM_DIR/fix-missing-current'")"
 check 'pg_cgroup_mem_pct: missing memory.current -> empty (fail-open)' "$([ -z "$PCT_MISSING" ]; echo $?)" "got=[$PCT_MISSING]"
 
+# gate r2 P2 (v0.53.0): the effective limit is the smaller finite positive of memory.high and
+# memory.max. A finite memory.high ABOVE memory.max (an operator MemoryHigh drop-in over the
+# shipped MemoryMax) must not hide the hard line: 3500 over max 4000 is 87, not 43 against high.
+mkdir -p "$MEM_DIR/fix-high-above-max" "$MEM_DIR/fix-max-above-high"
+printf '3500\n' > "$MEM_DIR/fix-high-above-max/memory.current"; printf '8000\n' > "$MEM_DIR/fix-high-above-max/memory.high"; printf '4000\n' > "$MEM_DIR/fix-high-above-max/memory.max"
+printf '3500\n' > "$MEM_DIR/fix-max-above-high/memory.current"; printf '4000\n' > "$MEM_DIR/fix-max-above-high/memory.high"; printf '8000\n' > "$MEM_DIR/fix-max-above-high/memory.max"
+PCT_HIGH_ABOVE_MAX="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_cgroup_mem_pct '$MEM_DIR/fix-high-above-max'")"
+check 'pg_cgroup_mem_pct gate r2 P2: a finite high above max reports against max (3500/4000 -> 87)' "$([ "$PCT_HIGH_ABOVE_MAX" = 87 ]; echo $?)" "got=[$PCT_HIGH_ABOVE_MAX]"
+PCT_MAX_ABOVE_HIGH="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_cgroup_mem_pct '$MEM_DIR/fix-max-above-high'")"
+check 'pg_cgroup_mem_pct gate r2 P2: a finite max above high reports against high (3500/4000 -> 87)' "$([ "$PCT_MAX_ABOVE_HIGH" = 87 ]; echo $?)" "got=[$PCT_MAX_ABOVE_HIGH]"
+MEM_HOME_R2="$TDIR/mem-sentinel/home-r2"; mkdir -p "$MEM_HOME_R2"
+PRO_GATE_HOME="$MEM_HOME_R2" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_browser_mem_sampler_tick '$MEM_DIR/fix-high-above-max'"
+PRO_GATE_HOME="$MEM_HOME_R2" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_browser_mem_sampler_tick '$MEM_DIR/fix-high-above-max'"
+check 'sampler tick gate r2 P2: two samples at 87% of a lower memory.max arm the sentinel despite a higher memory.high' \
+  "$([ -f "$MEM_HOME_R2/browser.memory-pressure" ]; echo $?)" "$(ls "$MEM_HOME_R2" 2>/dev/null | tr '\n' ' ')"
+
 echo '# pg_browser_mem_sampler_tick: sentinel arms on the 2nd consecutive high sample, not the 1st'
 MEM_HOME1="$TDIR/mem-sentinel/home-arm"; mkdir -p "$MEM_HOME1"
 PRO_GATE_HOME="$MEM_HOME1" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_browser_mem_sampler_tick '$MEM_DIR/fix-normal'"

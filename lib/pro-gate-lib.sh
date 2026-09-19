@@ -517,24 +517,26 @@ pg_browser_restarted_midrun() {
 # ─────────────────────────────────────────────────────────────────────────────
 
 # pg_cgroup_mem_pct <cgroup-dir>: echoes memory.current as an integer percent of the effective
-# memory limit in a cgroup v2 directory -- memory.high, or memory.max when memory.high is the
-# literal "max". Echoes nothing and returns 0 (fail-open) when the directory or either file is
-# missing/unreadable/non-numeric, or neither file names a limit (both "max", or the resolved
-# limit is 0) -- never divides by zero, never errors.
+# memory limit in a cgroup v2 directory. The effective limit is the SMALLER finite positive value
+# of memory.high and memory.max (gate r2 P2, v0.53.0): memory.max is enforced on its own -- it is
+# where the kernel OOM-kills -- so an operator MemoryHigh drop-in above the shipped MemoryMax must
+# not hide the hard line (current 3.5 GiB, high 8 GiB, max 4 GiB is 87% of what can kill, not
+# 43%). The literal "max" (or a missing/unreadable file) means that file names no limit. Echoes
+# nothing and returns 0 (fail-open) when the directory or memory.current is missing/non-numeric,
+# or neither file names a positive limit -- never divides by zero, never errors.
 pg_cgroup_mem_pct() {
-  local dir="$1" cur high lim
+  local dir="$1" cur high max lim='' v
   [ -n "$dir" ] && [ -d "$dir" ] || return 0
   cur="$(cat "$dir/memory.current" 2>/dev/null)" || return 0
   case "$cur" in ''|*[!0-9]*) return 0 ;; esac
-  high="$(cat "$dir/memory.high" 2>/dev/null)" || return 0
-  if [ "$high" = max ]; then
-    lim="$(cat "$dir/memory.max" 2>/dev/null)" || return 0
-    [ "$lim" = max ] && return 0
-  else
-    lim="$high"
-  fi
-  case "$lim" in ''|*[!0-9]*) return 0 ;; esac
-  [ "$lim" -gt 0 ] 2>/dev/null || return 0
+  high="$(cat "$dir/memory.high" 2>/dev/null || echo max)"
+  max="$(cat "$dir/memory.max" 2>/dev/null || echo max)"
+  for v in "$high" "$max"; do
+    case "$v" in ''|*[!0-9]*) continue ;; esac
+    [ "$v" -gt 0 ] 2>/dev/null || continue
+    if [ -z "$lim" ] || [ "$v" -lt "$lim" ]; then lim="$v"; fi
+  done
+  [ -n "$lim" ] || return 0
   echo $(( cur * 100 / lim ))
   return 0
 }
