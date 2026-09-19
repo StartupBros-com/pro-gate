@@ -72,7 +72,7 @@ The engine-issued typed continuation chosen from normalized lifecycle, evidence,
 
 ### Round Convergence
 
-Whether successive charged rounds on one change are settling. The round governor scores each round by its open P0 plus P1 count and keeps a churn streak: the count of consecutive rounds that failed to shrink it. A streak of two is the convergence signal; it produces the typed stop `rounds-not-converging`, which is report-only and reversible by the operator, and it never alters the numeric round grant's own policy. Convergence is judged from the round history the engine writes, never from re-reading review text.
+Whether successive charged rounds on one change are settling. The round governor scores each round by its open P0 plus P1 count and keeps a churn streak: the count of consecutive rounds that failed to shrink it. A streak of two is the convergence signal; it produces the typed stop `rounds-not-converging`, which is report-only and reversible by the operator via the stateless one-invocation `PRO_GATE_ROUNDS_CONTINUE=1` override, and it never alters the numeric round grant's own policy. Convergence is judged from the round history the engine writes, never from re-reading review text.
 
 ### Input Policy
 

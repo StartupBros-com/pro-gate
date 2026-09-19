@@ -27,10 +27,12 @@ case "$CDP_READY_TIMEOUT" in ''|*[!0-9]*) echo "ERROR: invalid CDP ready timeout
 [ "$CDP_READY_TIMEOUT" -ge 1 ] \
   || { echo "ERROR: invalid CDP ready timeout: $CDP_READY_TIMEOUT" >&2; exit 1; }
 
-XVFB_PID=""; CHROME_PID=""
+XVFB_PID=""; CHROME_PID=""; SAMPLER_PID=""
 cleanup() {
+  [ -n "$SAMPLER_PID" ] && kill "$SAMPLER_PID" 2>/dev/null || true
   [ -n "$CHROME_PID" ] && kill "$CHROME_PID" 2>/dev/null || true
   [ -n "$XVFB_PID" ] && kill "$XVFB_PID" 2>/dev/null || true
+  [ -n "$SAMPLER_PID" ] && wait "$SAMPLER_PID" 2>/dev/null || true
   [ -n "$CHROME_PID" ] && wait "$CHROME_PID" 2>/dev/null || true
   [ -n "$XVFB_PID" ] && wait "$XVFB_PID" 2>/dev/null || true
 }
@@ -110,5 +112,14 @@ for ((attempt = 0; attempt < CDP_READY_TIMEOUT; attempt++)); do
 done
 [ "$CDP_READY" -eq 1 ] \
   || { echo "ERROR: CDP did not become ready on 127.0.0.1:${PORT} within ${CDP_READY_TIMEOUT}s" >&2; exit 1; }
+
+# #212 step 2: cgroup-scoped memory sentinel, backgrounded for the life of the browser. Decision
+# logic lives in lib.sh (this script has no functions of its own); guarded so a sampler failure
+# can never take this script down under set -e.
+if type pg_browser_mem_sampler_loop >/dev/null 2>&1; then
+  CGROUP_DIR="$(pg_browser_cgroup_dir 2>/dev/null || true)"
+  (pg_browser_mem_sampler_loop "$CGROUP_DIR" 2>/dev/null || true) &
+  SAMPLER_PID=$!
+fi
 
 wait "$CHROME_PID"

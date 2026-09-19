@@ -45,11 +45,11 @@ validate_contract_and_corpus() { # contract corpus
     (.base_facts | keys | sort) == ["active_index","completed_results","cooldown","evidence","governor","input","named_choice","observation","prior_review","reservation","target","transport"] and
     .base_facts.transport == "review-decision/v1" and
     ([.. | objects | keys[] | select(. == "status" or . == "next_action")] | length == 0) and
-    (.cases | length == 9) and
+    (.cases | length == 14) and
     ([.cases[].expected.action] | unique | sort) == ([$contract[0].action_effects[].action] | sort) and
     ([.cases[] | select(.expected.action != .expected.effect)] | length == 0) and
     ([.cases[] | select(.expected.execution_class == "named-product-choice") | .expected.action] == ["ask-named-product-choice"]) and
-    ([.cases[] | select(.expected.execution_class != "named-product-choice") | .expected.action] | length == 8) and
+    ([.cases[] | select(.expected.execution_class != "named-product-choice") | .expected.action] | length == 13) and
     any(.cases[]; .expected.reason == "account-cooldown-active" and .patch.cooldown.active == true) and
     (.base_facts.cooldown == {active:false,seconds_remaining:0})
   ' "$corpus" >/dev/null || return 1
@@ -194,6 +194,72 @@ check 'library validator rejects an envelope whose outer action was swapped for 
 check 'library validator rejects a blocking-wait next_action injected into the facts' "$([ "$INJECTED_OK" = 1 ]; printf '%s' "$?")" "$ENVELOPE_DETAIL"
 check 'library validator rejects a foreign contract digest' "$([ "$DIGEST_OK" = 1 ]; printf '%s' "$?")" "$ENVELOPE_DETAIL"
 check 'library validator refuses a symlinked decision file' "$([ "$SYMLINK_OK" = 1 ]; printf '%s' "$?")"
+
+# #147: `bindable` is a closed-schema field on every completed_results row, not decoration. Strip it
+# from a genuine envelope's facts and the reducer either rejects the now-malformed facts outright or
+# recomputes a different byte-for-byte decision -- either way the validator must reject the on-disk
+# envelope, since it no longer matches re-running the reducer over its own (now-tampered) facts.
+# Restoring the field must accept again, proving the earlier rejection was this field and not noise.
+BINDABLE_CASE_INDEX="$(jq '[.cases[].name] | index("collect current completed result")' "$CORPUS")"
+corpus_envelope "$BINDABLE_CASE_INDEX" "$TMP/bindable-envelope.json"
+jq -c 'del(.facts.completed_results[0].bindable)' "$TMP/bindable-envelope.json" > "$TMP/bindable-removed.json"
+check 'envelope with bindable stripped from a completed_results row is rejected as undefined' \
+  "$(envelope_rejects "$TMP/bindable-removed.json"; printf '%s' "$?")" \
+  "$(cat "$TMP/bindable-removed.json")"
+jq -c '.facts.completed_results[0].bindable=true' "$TMP/bindable-removed.json" > "$TMP/bindable-restored.json"
+check 'the same envelope with bindable restored validates again' \
+  "$(pg_review_decision_envelope_valid "$TMP/bindable-restored.json" >/dev/null 2>&1; printf '%s' "$?")" \
+  "$(cat "$TMP/bindable-restored.json")"
+# #174: the governor shape validator's keys_are(...) allowlist is exact, so a fact object missing
+# a required trajectory key (here: governor.arrow, deleted after the corpus merge) must never
+# silently pass through as a grant or any other action -- it is undefined-state, closed.
+UNDEFINED_ARROW_FACTS="$(jq -cS --arg cd "$CONTRACT_DIGEST" --arg xd "$CORPUS_DIGEST" '
+  .base_facts | .contract={contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,corpus_digest:$xd} |
+  del(.governor.arrow)' "$CORPUS")"
+UNDEFINED_ARROW_DECISION="$(pg_review_decision_reduce "$UNDEFINED_ARROW_FACTS")"
+check 'a governor object missing the arrow key is rejected as undefined-state, not silently granted' \
+  "$(jq -e '.action=="stop-without-new-review" and .reason=="undefined-state"' <<<"$UNDEFINED_ARROW_DECISION" >/dev/null 2>&1; printf '%s' "$?")" \
+  "$UNDEFINED_ARROW_DECISION"
+
+# gate #174-review P1: a selected named choice reduces to the identical fix-review-findings/
+# agent-task action a FIX-FIRST verdict does, so it is the same "fix dispatch" the churn brake
+# was built to replace -- but only the FIX-FIRST site (lib/pro-gate-lib.sh) got the streak guard.
+# Without it, a chain that phrases its repeated finding as a NEEDS-DISCUSSION policy question,
+# once the operator answers it, still buys an unbounded run of further paid rounds. This cannot be
+# a corpus.json fixture case: pg_review_decision_choice_snapshot hashes the ENTIRE canonical facts
+# object, including .contract.corpus_digest -- which is corpus.json's OWN file digest -- so a
+# snapshot baked into a case would have to equal a hash of a file containing that very value, a
+# fixed point sha256 does not yield by construction. Both the real engine and this check resolve
+# it the only way that works: compute the digest at run time from the exact facts under test,
+# mirroring the corpus's own base_facts/contract shape (same technique as UNDEFINED_ARROW above).
+choice_facts() { # governor-json -> canonical facts with that governor, a NEEDS-DISCUSSION prior,
+                  # and an unselected two-outcome named choice
+  jq -cS --arg cd "$CONTRACT_DIGEST" --arg xd "$CORPUS_DIGEST" --argjson gov "$1" '
+    .base_facts | .contract={contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,corpus_digest:$xd} |
+    .governor=$gov |
+    .prior_review={applicable:true,binding_valid:true,code_identity:"input-current",evidence_identity:"evidence-current",legacy:false,marker:"pg-run-acme-widgets-1983-1700000010-10",provenance_valid:true,verdict:"NEEDS-DISCUSSION"} |
+    .named_choice={outcomes:[{consequence:"keep the API compatible",id:"compat",label:"Preserve compatibility"},{consequence:"adopt the smaller new API",id:"break",label:"Accept the break"}],selected_id:null,snapshot_digest:""}' "$CORPUS"
+}
+select_choice() { # unselected-facts-json -> the same facts with a valid, freshness-checked selection
+  local unselected="$1" digest
+  digest="$(pg_review_decision_choice_snapshot "$unselected")"
+  jq -cS --arg d "$digest" '.named_choice.selected_id="compat" | .named_choice.snapshot_digest=$d' <<<"$unselected"
+}
+CHURN_CHOICE_FACTS="$(select_choice "$(choice_facts '{"arrow":[1,1,1],"continue_override":false,"earned":0,"grant":3,"granted":true,"policy_mode":"advisory","scored":3,"streak":2}')")"
+CHURN_CHOICE_DECISION="$(pg_review_decision_reduce "$CHURN_CHOICE_FACTS")"
+check 'a churning streak stops a NEEDS-DISCUSSION named-choice-selected fix dispatch too, not just FIX-FIRST' \
+  "$(jq -e '.action=="stop-without-new-review" and .reason=="rounds-not-converging"' <<<"$CHURN_CHOICE_DECISION" >/dev/null 2>&1; printf '%s' "$?")" \
+  "$CHURN_CHOICE_DECISION"
+CONTINUE_CHOICE_FACTS="$(select_choice "$(choice_facts '{"arrow":[1,1,1],"continue_override":true,"earned":0,"grant":3,"granted":true,"policy_mode":"advisory","scored":3,"streak":2}')")"
+CONTINUE_CHOICE_DECISION="$(pg_review_decision_reduce "$CONTINUE_CHOICE_FACTS")"
+check 'PRO_GATE_ROUNDS_CONTINUE=1 still lets an already-selected named choice dispatch despite the streak' \
+  "$(jq -e '.action=="fix-review-findings" and .reason=="named-product-choice-selected"' <<<"$CONTINUE_CHOICE_DECISION" >/dev/null 2>&1; printf '%s' "$?")" \
+  "$CONTINUE_CHOICE_DECISION"
+NOSTREAK_CHOICE_FACTS="$(select_choice "$(choice_facts '{"arrow":[],"continue_override":false,"earned":0,"grant":3,"granted":true,"policy_mode":"advisory","scored":0,"streak":0}')")"
+NOSTREAK_CHOICE_DECISION="$(pg_review_decision_reduce "$NOSTREAK_CHOICE_FACTS")"
+check 'a selected named choice dispatches normally when the streak has not reached two (regression)' \
+  "$(jq -e '.action=="fix-review-findings" and .reason=="named-product-choice-selected"' <<<"$NOSTREAK_CHOICE_DECISION" >/dev/null 2>&1; printf '%s' "$?")" \
+  "$NOSTREAK_CHOICE_DECISION"
 
 # gate #148 r8 P1: a prose consumer must NOT pin the wait at all. The engine treats any --timeout
 # it receives as final (bin/oracle-review.sh: `if [ -z "$TIMEOUT" ]`), so a skill or relay that

@@ -507,6 +507,137 @@ pg_browser_restarted_midrun() {
   echo "$up"
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# #212 step 2: cgroup-scoped browser memory sentinel. pg_mem_headroom_ok above is host-wide
+# (free -m) and cannot see a cgroup MemoryHigh/MemoryMax throttle while host RAM is idle — the
+# exact failure mode measured on PR #209 rounds 4-5 (2026-09-18: VmHWM 7.63 GiB, cgroup 8.42/8.59
+# GB). daemon/run-oracle-chrome.sh has no functions and top-level side effects (set -euo
+# pipefail), so all decision logic lives here (source-safe) and the daemon only backgrounds the
+# loop.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# pg_cgroup_mem_pct <cgroup-dir>: echoes memory.current as an integer percent of the effective
+# memory limit in a cgroup v2 directory. The effective limit is the SMALLER finite positive value
+# of memory.high and memory.max (gate r2 P2, v0.53.0): memory.max is enforced on its own -- it is
+# where the kernel OOM-kills -- so an operator MemoryHigh drop-in above the shipped MemoryMax must
+# not hide the hard line (current 3.5 GiB, high 8 GiB, max 4 GiB is 87% of what can kill, not
+# 43%). The literal "max" (or a missing/unreadable file) means that file names no limit. Echoes
+# nothing and returns 0 (fail-open) when the directory or memory.current is missing/non-numeric,
+# or neither file names a positive limit -- never divides by zero, never errors.
+pg_cgroup_mem_pct() {
+  local dir="$1" cur high max lim='' v
+  [ -n "$dir" ] && [ -d "$dir" ] || return 0
+  cur="$(cat "$dir/memory.current" 2>/dev/null)" || return 0
+  case "$cur" in ''|*[!0-9]*) return 0 ;; esac
+  high="$(cat "$dir/memory.high" 2>/dev/null || echo max)"
+  max="$(cat "$dir/memory.max" 2>/dev/null || echo max)"
+  for v in "$high" "$max"; do
+    case "$v" in ''|*[!0-9]*) continue ;; esac
+    [ "$v" -gt 0 ] 2>/dev/null || continue
+    if [ -z "$lim" ] || [ "$v" -lt "$lim" ]; then lim="$v"; fi
+  done
+  [ -n "$lim" ] || return 0
+  echo $(( cur * 100 / lim ))
+  return 0
+}
+
+# pg_browser_cgroup_dir: echoes this process's cgroup v2 directory under /sys/fs/cgroup, or the
+# PRO_GATE_CGROUP_PATH override (tests). Echoes nothing on a v1 host (/proc/self/cgroup has more
+# than the single unified "0::/path" line) or any parse failure -- fail-open, the sampler simply
+# never arms.
+pg_browser_cgroup_dir() {
+  [ -n "${PRO_GATE_CGROUP_PATH:-}" ] && { echo "$PRO_GATE_CGROUP_PATH"; return 0; }
+  [ -r /proc/self/cgroup ] || return 0
+  local n line path
+  n="$(wc -l < /proc/self/cgroup 2>/dev/null)"
+  case "$n" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$n" -eq 1 ] || return 0
+  line="$(cat /proc/self/cgroup 2>/dev/null)"
+  case "$line" in
+    0::/*) path="${line#0::}" ;;
+    *) return 0 ;;
+  esac
+  echo "/sys/fs/cgroup${path}"
+}
+
+# pg_browser_mem_sampler_tick <cgroup-dir>: one sample. Reads pg_cgroup_mem_pct, keeps a
+# consecutive-high-sample counter in $PRO_GATE_HOME/.browser-mem-streak, and atomically writes
+# (tmp + mv) $PRO_GATE_HOME/browser.memory-pressure ("<pct> <epoch>", one line) once TWO
+# consecutive samples are at/above PRO_GATE_BROWSER_MEM_PRESSURE_PCT (default 85). A sample below
+# the threshold (or no pct available -- fail-open) resets the counter and removes the sentinel.
+# No-op (returns 0) when PRO_GATE_HOME is unset. Never errors.
+pg_browser_mem_sampler_tick() {
+  local cgroup_dir="$1" home sentinel state threshold pct streak
+  home="${PRO_GATE_HOME:-}"
+  [ -n "$home" ] || return 0
+  sentinel="$home/browser.memory-pressure"
+  state="$home/.browser-mem-streak"
+  threshold="${PRO_GATE_BROWSER_MEM_PRESSURE_PCT:-85}"
+  case "$threshold" in ''|*[!0-9]*) threshold=85 ;; esac
+  pct="$(pg_cgroup_mem_pct "$cgroup_dir" 2>/dev/null)"
+  streak="$(cat "$state" 2>/dev/null)"
+  case "$streak" in ''|*[!0-9]*) streak=0 ;; esac
+  if [ -n "$pct" ] && [ "$pct" -ge "$threshold" ] 2>/dev/null; then
+    streak=$(( streak + 1 ))
+    if [ "$streak" -ge 2 ]; then
+      { printf '%s %s\n' "$pct" "$(date +%s)" > "$sentinel.tmp.$$" && mv -f "$sentinel.tmp.$$" "$sentinel"; } 2>/dev/null || true
+    fi
+  else
+    streak=0
+    rm -f "$sentinel" 2>/dev/null || true
+  fi
+  { printf '%s' "$streak" > "$state.tmp.$$" && mv -f "$state.tmp.$$" "$state"; } 2>/dev/null || true
+  return 0
+}
+
+# pg_browser_mem_sampler_loop <cgroup-dir>: runs pg_browser_mem_sampler_tick every
+# PRO_GATE_BROWSER_MEM_SAMPLE_SECS seconds (default 5), forever, in the caller's process -- meant
+# to be backgrounded (`pg_browser_mem_sampler_loop & PID=$!`) by daemon/run-oracle-chrome.sh for
+# the life of the browser. Clears any leftover .browser-mem-streak/browser.memory-pressure from a
+# prior invocation before its first tick, so a restarted daemon (crash/deploy/manual restart)
+# always starts its 2-consecutive-sample count from zero rather than combining a leftover streak
+# with one fresh sample (review finding P1 #1). Backgrounds each sleep so a TERM/INT received
+# between samples kills the sleep immediately instead of leaving it as an orphan (review finding
+# P2 #2). Exits quietly on any error; never propagates a failure to the caller (that script runs
+# under set -e and must not die because a sample failed).
+pg_browser_mem_sampler_loop() {
+  local cgroup_dir="$1" secs home sleep_pid
+  secs="${PRO_GATE_BROWSER_MEM_SAMPLE_SECS:-5}"
+  case "$secs" in ''|*[!0-9]*) secs=5 ;; esac
+  [ "$secs" -ge 1 ] 2>/dev/null || secs=5
+  home="${PRO_GATE_HOME:-}"
+  if [ -n "$home" ]; then
+    rm -f "$home/.browser-mem-streak" "$home/browser.memory-pressure" 2>/dev/null || true
+  fi
+  trap '[ -n "${sleep_pid:-}" ] && kill "$sleep_pid" 2>/dev/null; exit 0' TERM INT
+  while :; do
+    pg_browser_mem_sampler_tick "$cgroup_dir" 2>/dev/null || true
+    sleep "$secs" 2>/dev/null &
+    sleep_pid=$!
+    wait "$sleep_pid" 2>/dev/null || return 0
+  done
+}
+
+# pg_browser_mem_pressure: 1 + a one-line typed reason on stdout when the sampler above has a
+# fresh browser.memory-pressure sentinel (mtime within PRO_GATE_BROWSER_MEM_PRESSURE_TTL seconds,
+# default 60) -- i.e. the browser's own cgroup has been at/above the pressure threshold for two
+# consecutive samples recently. Returns 0 silently (no output) when the sentinel is missing or
+# stale. Mirrors pg_mem_headroom_ok's return convention (0 = fine, 1 + reason = block) and
+# pg_cooldown_remaining_secs' mtime-age idiom (lib:526).
+pg_browser_mem_pressure() {
+  local sentinel ttl mt age pct
+  sentinel="${PRO_GATE_HOME:-}/browser.memory-pressure"
+  [ -n "${PRO_GATE_HOME:-}" ] && [ -f "$sentinel" ] || return 0
+  ttl="${PRO_GATE_BROWSER_MEM_PRESSURE_TTL:-60}"
+  case "$ttl" in ''|*[!0-9]*) ttl=60 ;; esac
+  mt="$(stat -c %Y "$sentinel" 2>/dev/null || stat -f %m "$sentinel" 2>/dev/null || echo 0)"
+  age=$(( $(date +%s) - mt ))
+  [ "$age" -ge 0 ] && [ "$age" -lt "$ttl" ] || return 0
+  pct="$(awk '{print $1}' "$sentinel" 2>/dev/null)"
+  echo "browser cgroup memory at ${pct:-?}% for 2+ consecutive samples (sentinel ${age}s old) — deferring the slot, no quota spent"
+  return 1
+}
+
 # pg_cooldown_active: 0 + a one-line reason on stdout while the account back-off cooldown is
 # live (v0.18: written by cdp-salvage on the "requests too quickly / temporarily limited"
 # throttle interstitial, and by oracle-review.sh on a Cloudflare anti-bot challenge).
@@ -551,6 +682,7 @@ pg_health_gate() {
     fi
   fi
   if ! reason="$(pg_mem_headroom_ok)"; then echo "$reason"; return 1; fi
+  if ! reason="$(pg_browser_mem_pressure)"; then echo "$reason"; return 1; fi
   return 0
 }
 
@@ -2576,6 +2708,47 @@ pg_round_guard() {  # $1 = key. 0 = proceed; 1 + a one-line reason on stdout = e
   return 0
 }
 
+# pg_round_continue_override: true when PRO_GATE_ROUNDS_CONTINUE=1 grants THIS query a one-shot
+# pass through the review-decision reducer's rounds-not-converging stop (#174 R2). Read fresh on
+# every call, never written to disk and never remembered past this process — the same stateless,
+# one-invocation idiom as PRO_GATE_FORCE_ROUND (see pg_round_guard above). The reducer itself
+# stays a pure function of its facts (daemon.sh replays pg_review_decision_envelope_valid against
+# a saved decision in a process that never carries this env), so the override is resolved HERE,
+# at facts-build time, and threaded into governor.continue_override rather than re-read later.
+pg_round_continue_override() { [ "${PRO_GATE_ROUNDS_CONTINUE:-0}" = 1 ]; }
+
+# pg_round_governor_facts_json <key> <granted:true|false>: single-line JSON governor object
+# {arrow,continue_override,earned,grant,granted,policy_mode,scored,streak} for the
+# review-decision/v1 facts builders (#174 R5/R6). Every trajectory value is read straight from
+# pg_round_score's own globals and pg_round_policy_mode's own accessor for <key> — no review text
+# is parsed and no value is duplicated as a second jq literal. <granted> is the boolean the caller
+# already resolved via pg_round_guard; this function does not recompute it. Must be called
+# IN-SHELL by callers that also need pg_round_score's globals afterward, same as pg_round_score
+# itself (a command-substitution subshell would drop them silently).
+pg_round_governor_facts_json() {
+  local key="$1" granted="$2" arrow_json policy_mode continue_override=false
+  pg_round_score "$key"
+  policy_mode="$(pg_round_policy_mode "$key")"
+  if [ -z "$PG_ROUND_ARROW" ]; then
+    arrow_json='[]'
+  else
+    # gate r1 P2 (v0.53.0): export only the latest 32 counts. pg_review_decision_reduce refuses
+    # any normalized-input array longer than 32 as unsafe-normalized-input before it looks at
+    # completed results or recovery, so an unbounded arrow (advisory mode permits any number of
+    # shrinking rounds) would make every decision for that change fail -- including collecting a
+    # finished SHIP. The counters (scored/earned/streak) keep the full in-window history; only the
+    # serialized trajectory is bounded.
+    arrow_json="$(printf '%s' "$PG_ROUND_ARROW" | jq -R -c 'split("→") | map(tonumber) | .[-32:]' 2>/dev/null)"
+    case "$arrow_json" in ''|null) arrow_json='[]';; esac
+  fi
+  pg_round_continue_override && continue_override=true
+  jq -cn --argjson granted "$granted" --argjson scored "$PG_ROUND_SCORED" --argjson arrow "$arrow_json" \
+    --argjson earned "$PG_ROUND_EARNED" --argjson streak "$PG_ROUND_STREAK" --argjson grant "$PG_ROUND_GRANT" \
+    --arg policy_mode "$policy_mode" --argjson continue_override "$continue_override" '
+    {arrow:$arrow,continue_override:$continue_override,earned:$earned,grant:$grant,granted:$granted,
+     policy_mode:$policy_mode,scored:$scored,streak:$streak}'
+}
+
 # pg_filter_diff <in> <out>: strip diff sections for noise paths (lockfiles, generated,
 # vendored, minified, snapshots) so the Pro model spends its thinking budget on real code and
 # its review window stays short. Writes the filtered unified diff to <out>; prints each
@@ -3025,13 +3198,29 @@ pg_completed_lookup() {  # <marker> <out>: place the artifact at <out>; rc 0 on 
 # ─────────────────────────────────────────────────────────────────────────────
 PG_REVIEW_DECISION_CONTRACT_ID='review-decision/v1'
 PG_REVIEW_DECISION_CONTRACT_VERSION=1
-PG_REVIEW_DECISION_CONTRACT_DIGEST='bf36fdb5f8625e917be0539ca014fec518649d1160584846aca1cb9149533abb'
-PG_REVIEW_DECISION_CORPUS_DIGEST='60b4059115dd0651de8b209775f0783b3095f432842c036f618308a307b01358'
+PG_REVIEW_DECISION_CONTRACT_DIGEST='5fcd19c12600061af6d90ed9cb980dd7067cff199c374910639003eec4caf5c3'
+PG_REVIEW_DECISION_CORPUS_DIGEST='c7e8b55a5ebbf190a0bda93ae7367820cd3f9ffb8092a4998ff58bb0513aadc6'
+
+# Binding-record compatibility only (#214, gate r2 P1). review-input-binding/v1 and
+# review-result-binding/v1 records are validated by their own record_type/record_version shape
+# rules, not the decision/effect envelope's contract identity check. Every contract change since
+# the digests below was additive (new reasons for #147/#174, new governor/result fields), so the
+# proof rules those already-written records carry still hold under the current runtime — only the
+# CURRENT digest below is ever written into a fresh binding. When a future bump changes a proof
+# rule (not just adds a reason or fact), drop the affected predecessor digest here so its bindings
+# stop being trusted, rather than widening the rule that reads them.
+# Writers share these validators with readers: every production write site passes the CURRENT digest
+# (pg_review_decision_contract_digest), so this list only widens what can be READ back, never what a
+# fresh record may claim. Keep it that way when adding a writer.
+PG_REVIEW_DECISION_COMPATIBLE_CONTRACT_DIGESTS='bf36fdb5f8625e917be0539ca014fec518649d1160584846aca1cb9149533abb 7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee'
 
 pg_review_decision_contract_id() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_ID"; }
 pg_review_decision_contract_version() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_VERSION"; }
 pg_review_decision_contract_digest() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_DIGEST"; }
 pg_review_decision_corpus_digest() { printf '%s\n' "$PG_REVIEW_DECISION_CORPUS_DIGEST"; }
+pg_review_decision_compatible_contract_digests_json() { # sorted JSON array of readable predecessor binding-record digests
+  jq -cnS --arg digests "$PG_REVIEW_DECISION_COMPATIBLE_CONTRACT_DIGESTS" '$digests | split(" ") | map(select(length > 0)) | sort'
+}
 
 # Compatibility metadata only: reducers continue to use the compiled constants above.
 pg_review_decision_identity_json() {
@@ -3196,7 +3385,7 @@ pg_review_decision_envelope_valid() { # decision-file
 
 pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read stdin
   local supplied canonical snapshot unsafe valid reason selected selected_ref selected_count
-  local action prior prior_applicable verdict choice_snapshot
+  local action prior prior_applicable verdict choice_snapshot rounds_not_converging
   pg_have jq || return 1
   if [ "$#" -gt 0 ]; then supplied="$1"; else supplied="$(cat)"; fi
   canonical="$(pg_review_json_canonical "$supplied")" || return 1
@@ -3236,10 +3425,11 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
     def hex: type=="string" and test("^[0-9a-f]{64}$");
     def oid: type=="string" and test("^[0-9a-f]{40}([0-9a-f]{24})?$");
     def result:
-      keys_are(["applicable","artifact_digest","binding_valid","canonical_identity","charged_spend_epoch","collected","legacy","marker","provenance_valid","verdict"])
-      and (.applicable|type=="boolean") and (.artifact_digest|hex) and (.binding_valid|type=="boolean")
+      keys_are(["applicable","artifact_digest","bindable","binding_valid","canonical_identity","charged_spend_epoch","collected","evidence_mode","legacy","marker","provenance_valid","verdict"])
+      and (.applicable|type=="boolean") and (.artifact_digest|hex) and (.bindable|type=="boolean") and (.binding_valid|type=="boolean")
       and (.canonical_identity|ident and length>0) and (.charged_spend_epoch|type=="number" and floor==.)
-      and (.collected|type=="boolean") and (.legacy|type=="boolean") and (.marker|marker and length>0)
+      and (.collected|type=="boolean") and (.evidence_mode|IN("full-pr","scoped-delta","connector","caller-patch","none"))
+      and (.legacy|type=="boolean") and (.marker|marker and length>0)
       and (.provenance_valid|type=="boolean") and (.verdict|IN("SHIP","FIX-FIRST","NEEDS-DISCUSSION","NONE"));
     (keys_are(["active_index","completed_results","contract","cooldown","evidence","governor","input","named_choice","observation","prior_review","reservation","target","transport"]))
     and (.contract|keys_are(["contract_digest","contract_id","contract_version","corpus_digest"]))
@@ -3252,7 +3442,12 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
     and (.completed_results|type=="array" and all(.[];result))
     and (.evidence|keys_are(["identity","safe_to_prepare","state"])) and (.evidence.identity|ident)
     and (.evidence.safe_to_prepare|type=="boolean") and (.evidence.state|IN("matching","missing","unsafe","invalid","undefined"))
-    and (.governor|keys_are(["granted"])) and (.governor.granted|type=="boolean")
+    and (.governor|keys_are(["arrow","continue_override","earned","grant","granted","policy_mode","scored","streak"]))
+    and (.governor.granted|type=="boolean") and (.governor.continue_override|type=="boolean")
+    and (.governor.scored|type=="number" and floor==. and .>=0) and (.governor.earned|type=="number" and floor==. and .>=0)
+    and (.governor.streak|type=="number" and floor==. and .>=0) and (.governor.grant|type=="number" and floor==. and .>=0)
+    and (.governor.policy_mode|IN("advisory","enforced","lockdown","off"))
+    and (.governor.arrow|type=="array" and all(.[]; type=="number" and floor==. and .>=0))
     and (.input|keys_are(["binding_valid","identity","proven"])) and (.input.binding_valid|type=="boolean")
     and (.input.identity|ident) and (.input.proven|type=="boolean")
     and (.named_choice|keys_are(["outcomes","selected_id","snapshot_digest"]))
@@ -3281,6 +3476,17 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
     pg_review_decision_reject undefined-state "$snapshot"; return
   fi
 
+  # #174 R1/R4: the churn streak stop is independent of the numeric round grant and its policy
+  # mode (advisory|enforced|lockdown|off) — it fires with no policy setting present, so it is
+  # computed once here from governor.streak alone, never from governor.granted. A stateless
+  # PRO_GATE_ROUNDS_CONTINUE=1 override is resolved by the facts builder into
+  # governor.continue_override (R2); the reducer stays a pure function of the facts it was given.
+  rounds_not_converging=no
+  if [ "$(jq -r '.governor.streak' <<<"$canonical")" -ge 2 ] \
+     && [ "$(jq -r '.governor.continue_override' <<<"$canonical")" != true ]; then
+    rounds_not_converging=yes
+  fi
+
   # Existing completed work wins. Selection is newest charged epoch, then canonical identity;
   # duplicate rows still tied on both fields are unresolved and stop closed.
   selected="$(jq -cS '[.completed_results[] | select(.applicable or .legacy)] | sort_by(.charged_spend_epoch,.canonical_identity) | last // empty' <<<"$canonical")"
@@ -3291,6 +3497,12 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
     fi
     selected_ref="$(jq -r .canonical_identity <<<"$selected")"
     if [ "$(jq -r .collected <<<"$selected")" = false ]; then
+      # An uncollected result whose evidence mode can never carry merge proof (a connector SHIP,
+      # #147) is unrepairable, not transient: re-issuing collect would loop forever. Stop typed,
+      # with the mode and marker in the facts, and never route it to merge eligibility.
+      if [ "$(jq -r .bindable <<<"$selected")" = false ]; then
+        pg_review_decision_emit stop-without-new-review result-not-bindable-for-mode "$canonical" "$snapshot" "$selected_ref"; return
+      fi
       pg_review_decision_emit collect-existing-result completed-result-awaits-collection "$canonical" "$snapshot" "$selected_ref"; return
     fi
   fi
@@ -3352,6 +3564,13 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
     selected_ref="$(jq -r '.canonical_identity // .marker // ""' <<<"$prior")"
     case "$verdict" in
       FIX-FIRST)
+        # #174 R1: the churn stop preempts a fix dispatch, not just a fresh round grant — this is
+        # the site the FIX-FIRST branch would otherwise return from BEFORE the later
+        # round-governor-denied check is ever reached (AE1: a prior FIX-FIRST round is exactly
+        # how a chain that keeps churning gets here).
+        if [ "$rounds_not_converging" = yes ]; then
+          pg_review_decision_emit stop-without-new-review rounds-not-converging "$canonical" "$snapshot" "$selected_ref"; return
+        fi
         pg_review_decision_emit fix-review-findings review-findings-require-fix "$canonical" "$snapshot" "$selected_ref"; return ;;
       SHIP)
         pg_review_decision_emit allow-existing-merge-workflow current-ship-is-merge-eligible "$canonical" "$snapshot" "$selected_ref"; return ;;
@@ -3369,6 +3588,18 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
         if [ "$(jq -r .named_choice.snapshot_digest <<<"$canonical")" != "$choice_snapshot" ]; then
           pg_review_decision_emit stop-without-new-review stale-named-choice "$canonical" "$snapshot" "$selected_ref"; return
         fi
+        # gate #174-review P1: a selected named choice dispatches a fix round exactly like a
+        # FIX-FIRST verdict does (same fix-review-findings/agent-task action) -- so it is the same
+        # "fix dispatch" R1 and every consumer doc (README/SKILL/oracle-reviewer) promise the churn
+        # stop replaces, unqualified by verdict type. Without this guard a churning chain that
+        # happens to phrase its repeated finding as a NEEDS-DISCUSSION choice, once answered, still
+        # buys an unbounded run of further paid rounds the brake exists to stop. The override
+        # (rounds_not_converging already folds in governor.continue_override, R2) lets an operator
+        # who has just made the decision proceed exactly as PRO_GATE_ROUNDS_CONTINUE=1 does for the
+        # FIX-FIRST arm above -- it does not invent a second override idiom.
+        if [ "$rounds_not_converging" = yes ]; then
+          pg_review_decision_emit stop-without-new-review rounds-not-converging "$canonical" "$snapshot" "$selected_ref"; return
+        fi
         pg_review_decision_emit fix-review-findings named-product-choice-selected "$canonical" "$snapshot" "$selected_ref"; return ;;
     esac
   fi
@@ -3377,6 +3608,13 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
       .prior_review.code_identity==.input.identity and .prior_review.evidence_identity==.evidence.identity' \
       <<<"$canonical" >/dev/null 2>&1; then
     pg_review_decision_emit stop-without-new-review identical-code-and-evidence "$canonical" "$snapshot"; return
+  fi
+  # #174 R1: same churn stop as the FIX-FIRST arm above, covering the OTHER half of "in place of
+  # a new round grant or a fix dispatch" — a fresh grant attempt (no applicable prior review, or
+  # one with no recognized verdict) on a change whose streak already reached two. Unreachable for
+  # SHIP/NEEDS-DISCUSSION, whose own branches above already returned (AE7 stays unaffected).
+  if [ "$rounds_not_converging" = yes ]; then
+    pg_review_decision_emit stop-without-new-review rounds-not-converging "$canonical" "$snapshot"; return
   fi
   if [ "$(jq -r .governor.granted <<<"$canonical")" != true ]; then
     pg_review_decision_emit stop-without-new-review round-governor-denied "$canonical" "$snapshot"; return
@@ -3402,14 +3640,16 @@ pg_review_input_binding_validate() { # canonical record JSON [expected marker]
   local json="${1-}" marker="${2:-}" canonical
   canonical="$(pg_review_json_canonical "$json")" || return 1
   jq -e --arg marker "$marker" --arg cid "$PG_REVIEW_DECISION_CONTRACT_ID" \
-    --argjson cv "$PG_REVIEW_DECISION_CONTRACT_VERSION" --arg cd "$PG_REVIEW_DECISION_CONTRACT_DIGEST" '
+    --argjson cv "$PG_REVIEW_DECISION_CONTRACT_VERSION" --arg cd "$PG_REVIEW_DECISION_CONTRACT_DIGEST" \
+    --argjson compat "$(pg_review_decision_compatible_contract_digests_json)" '
     def keys_are($x): keys == ($x|sort);
     def hex: type=="string" and test("^[0-9a-f]{64}$");
     def oid: type=="string" and test("^[0-9a-f]{40}([0-9a-f]{24})?$");
     ([.. | strings | (length>1024 or test("[\u0000-\u001f\u007f]"))] | any | not)
     and keys_are(["charged_spend_epoch","contract_digest","contract_id","contract_version","evidence","marker","record_type","record_version","repository","target"])
     and .record_type=="review-input-binding/v1" and .record_version==1
-    and .contract_id==$cid and .contract_version==$cv and .contract_digest==$cd
+    and .contract_id==$cid and .contract_version==$cv
+    and (.contract_digest==$cd or (.contract_digest|IN($compat[])))
     and (.marker|test("^pg-run-[A-Za-z0-9.-]+$")) and ($marker=="" or .marker==$marker)
     and (.charged_spend_epoch|type=="number" and floor==. and .>0)
     and (.repository|keys_are(["host","owner","repo"]))
@@ -3417,7 +3657,7 @@ pg_review_input_binding_validate() { # canonical record JSON [expected marker]
     and (.target|keys_are(["head_oid","kind","pr"])) and .target.kind=="pull-request"
     and (.target.pr|type=="number" and floor==. and .>0) and (.target.head_oid|oid)
     and (.evidence|keys_are(["identity","mode","proof"])) and (.evidence.identity|type=="string" and test("^[A-Za-z0-9._:/+-]+$") and length<=256)
-    and (.evidence.mode|IN("full-pr","scoped-delta","connector"))
+    and (.evidence.mode|IN("full-pr","scoped-delta","connector","caller-patch"))
     and (if .evidence.mode=="full-pr" then
       (.evidence.proof|keys_are(["base_oid","endpoint_digest","head_oid","raw_patch_digest"]))
       and (.evidence.proof.base_oid|oid) and (.evidence.proof.head_oid|oid) and .evidence.proof.head_oid==.target.head_oid
@@ -3429,6 +3669,10 @@ pg_review_input_binding_validate() { # canonical record JSON [expected marker]
       and (.evidence.proof.lineage_identity|type=="string" and length>0 and length<=256)
       and (.evidence.proof.scope_algorithm|type=="string" and length>0 and length<=64)
     else
+      # connector and caller-patch share a shape: target proven exactly the same way, endpoint/raw
+      # digests nullable. connector never sent the diff bytes to the model at all; caller-patch
+      # sent bytes the caller supplied but the engine never independently fetched or proved them
+      # against the endpoint, so neither mode earns full-pr non-null digests (#161).
       (.evidence.proof|keys_are(["commit_target","endpoint_digest","raw_diff_digest","repository_target"]))
       and (.evidence.proof.commit_target|oid) and .evidence.proof.commit_target==.target.head_oid
       and (.evidence.proof.repository_target|type=="string" and length>0 and length<=256)
@@ -3441,14 +3685,16 @@ pg_review_result_binding_validate() { # canonical record JSON [expected marker]
   local json="${1-}" marker="${2:-}" canonical
   canonical="$(pg_review_json_canonical "$json")" || return 1
   jq -e --arg marker "$marker" --arg cid "$PG_REVIEW_DECISION_CONTRACT_ID" \
-    --argjson cv "$PG_REVIEW_DECISION_CONTRACT_VERSION" --arg cd "$PG_REVIEW_DECISION_CONTRACT_DIGEST" '
+    --argjson cv "$PG_REVIEW_DECISION_CONTRACT_VERSION" --arg cd "$PG_REVIEW_DECISION_CONTRACT_DIGEST" \
+    --argjson compat "$(pg_review_decision_compatible_contract_digests_json)" '
     def keys_are($x): keys == ($x|sort);
     def hex: type=="string" and test("^[0-9a-f]{64}$");
     def oid: type=="string" and test("^[0-9a-f]{40}([0-9a-f]{24})?$");
     ([.. | strings | (length>1024 or test("[\u0000-\u001f\u007f]"))] | any | not)
     and keys_are(["accepted_epoch","artifact","contract_digest","contract_id","contract_version","input_binding_digest","input_binding_identity","marker","named_choice","provenance","record_type","record_version","ship_proof","verdict"])
     and .record_type=="review-result-binding/v1" and .record_version==1
-    and .contract_id==$cid and .contract_version==$cv and .contract_digest==$cd
+    and .contract_id==$cid and .contract_version==$cv
+    and (.contract_digest==$cd or (.contract_digest|IN($compat[])))
     and (.marker|test("^pg-run-[A-Za-z0-9.-]+$")) and ($marker=="" or .marker==$marker)
     and (.accepted_epoch|type=="number" and floor==. and .>0)
     and (.input_binding_digest|hex) and .input_binding_identity==.marker

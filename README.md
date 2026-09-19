@@ -298,7 +298,9 @@ that original charged attempt's reservation and applies the existing TTL plus sp
 miss proof in the same no-spend invocation. Before browser recovery, an immutable input binding plus
 GitHub `MERGED`/`CLOSED` state or a different current head can move the reservation to `superseded`:
 the charge, marker, URL, and optional audit harvest remain, while capacity and current-head ownership
-are released. Historical reservations keyed as literal `diff` are canonicalized during that exact
+are released. A classic `--pr` run reviewed against a caller-supplied `--diff` installs the same
+kind of target-only binding and is reclaimable the same way once its bound head moves. Historical
+reservations keyed as literal `diff` are canonicalized during that exact
 transition only after immutable identity and charge agree. For pre-v0.31 empty spend fields, exact
 immutable binding and canonical run metadata are revalidated under the reservation lock before the
 proven charge is filled; marker mint time is not charge evidence. Other missing or mismatched proof
@@ -352,6 +354,12 @@ Bundle-only prevents Pro-Gate from requesting connector delivery but cannot atte
 external ChatGPT browser connector grants. Known connector-bound browser or project permissions
 remain an operator trust boundary.
 
+Connector delivery can drive fix rounds but never attests an allow. Merge eligibility binds the
+bytes the engine delivered, and a connector observation carries no such proof, so a
+connector-delivered `SHIP` reduces to `stop-without-new-review` with reason
+`result-not-bindable-for-mode` (the facts name the mode and marker) rather than a merge handoff or
+an endless collect. Use `bundle` or `both` for the final round.
+
 | Variable | Default | What it controls |
 |---|---|---|
 | `PRO_GATE_INPUT_POLICY` | `bundle-only` | `bundle-only` permits only bundled review input; `connector-enabled` opts into connector-capable input |
@@ -363,11 +371,16 @@ remain an operator trust boundary.
 | `PRO_GATE_ROUNDS_CEILING` | `8` advisory | Computed trajectory ceiling; explicitly setting it enables enforcement |
 | `PRO_GATE_MAX_ROUNDS_PER_PR` | *(unset)* | Explicit legacy flat-cap enforcement (`0` = lockdown) |
 | `PRO_GATE_ROUNDS_WINDOW` | `24h` | The rolling telemetry/enforcement window |
+| `PRO_GATE_ROUNDS_CONTINUE` | *(unset)* | Set `1` to let ONE query/effect proceed past a `rounds-not-converging` stop (review-decision/v1) despite the churn streak; stateless, same one-invocation idiom as `PRO_GATE_FORCE_ROUND`, and independent of `PRO_GATE_ROUND_GUARD`'s advisory/enforced/lockdown mode |
 | `PRO_GATE_MAX_DIFF_LINES` | `6000` | Above this a run proceeds but usually lands in-progress → harvest |
 | `PRO_GATE_DIFF_HARD_MAX` | `25000` | Above this the engine refuses (exit 11, no spend) |
 | `PRO_GATE_MAX_CONCURRENCY` | `1` | Ceiling for parallel Pro chats; a ramp governor earns up to it on clean streaks |
 | `PRO_GATE_RESERVATION_TTL` | `21600` | Minimum age before confirmed exact-marker misses may exhaust recovery; elapsed time alone never releases it |
 | `PRO_GATE_DIRLOCK_ORPHAN_GRACE` | `5` | No-flock platforms only: seconds an unmarked guard directory must sit before a reclaimer may remove it |
+| `PRO_GATE_BROWSER_MEM_PRESSURE_PCT` | `85` | Percent of the browser cgroup's effective limit (the smaller finite of `memory.high` and `memory.max`; `max` means unlimited) at which two consecutive samples arm the pressure sentinel and the health gate defers a slot with no spend |
+| `PRO_GATE_BROWSER_MEM_SAMPLE_SECS` | `5` | Seconds between browser cgroup samples |
+| `PRO_GATE_BROWSER_MEM_PRESSURE_TTL` | `60` | Seconds a pressure sentinel stays fresh; a stale or absent sentinel never defers a slot |
+| `PRO_GATE_CGROUP_PATH` | *(read from `/proc/self/cgroup`)* | Browser cgroup directory to sample; absent, unreadable or unlimited (`max`) files mean no pressure, never a refusal |
 | `PRO_GATE_TIMEOUT` | `60m` | Default `--timeout` for a fresh review, sized to the ledger's p90 review time; an explicit `--timeout` wins |
 | `PRO_GATE_LOCK_WAIT` | `3900` | How long a queued review waits for an account capacity slot before giving up |
 | `PRO_GATE_CHANGE_LOCK_WAIT` | *(derived)* | Wait for the same-change guard; defaults to the holder's whole guarded lifetime (`15710` at stock settings) |
@@ -429,6 +442,11 @@ semantics. Native mode keeps the prompt's title hint and does not run remote-CDP
   open-P0/P1 trajectory, churn, and elapsed time remain visible advice, but default unset
   configuration does not ration unobservable ChatGPT subscription capacity. Operators who need
   hard automation containment can explicitly enable the trajectory governor, flat cap, or lockdown.
+  Independent of that policy mode, a change whose open-P0/P1 trajectory has not shrunk for 2
+  consecutive re-reviews gets a typed `stop-without-new-review` / `rounds-not-converging` decision
+  in place of a new round grant or a fix dispatch — this is a churn signal, not a budget one, so it
+  fires even in advisory mode. `PRO_GATE_ROUNDS_CONTINUE=1` lets one more round through anyway; the
+  daemon and the wrapper's loop both end a run on any `stop-without-new-review` reason the same way.
 - **Merge authority**: the daemon never merges directly; it stops after pushing fixes and
   commenting. The surrounding agent may arm squash auto-merge only after local verification,
   adversarial review, and required exact-head CI are green.

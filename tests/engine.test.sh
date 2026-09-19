@@ -644,7 +644,16 @@ cat > "$TDIR/user/.local/bin/gh" <<'CONN150_GH'
 #!/usr/bin/env bash
 case "$1 $2" in
   "pr diff") printf 'diff --git a/f.txt b/f.txt\nindex aaaaaaa..bbbbbbb 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-base\n+head\n' ;;
-  "pr view") printf 'https://github.com/acme/conn150/pull/%s\n' "$3" ;;
+  "pr view")
+    # gate r1 P1 (#161): the caller-patch installer now fetches the PR's real head via
+    # `gh pr view ... --json headRefOid` instead of trusting local git state -- respond to that
+    # shape distinctly from the plain `--json url -q .url` lookup this stub already answers.
+    if printf '%s\n' "$*" | grep -q -- 'headRefOid'; then
+      printf '{"state":"OPEN","headRefOid":"%s"}\n' "${PG_TEST_CONN150_HEAD:?PG_TEST_CONN150_HEAD unset}"
+    else
+      printf 'https://github.com/acme/conn150/pull/%s\n' "$3"
+    fi
+    ;;
   *) exit 1 ;;
 esac
 CONN150_GH
@@ -675,6 +684,146 @@ check '#150 planted negative: the neighbouring classic --input bundle run still 
      && jq -e '.evidence.mode=="full-pr" and (.evidence.proof.endpoint_digest|test("^[0-9a-f]{64}$")) and (.evidence.proof.raw_patch_digest|test("^[0-9a-f]{64}$")) and (.evidence.proof.base_oid|test("^[0-9a-f]{40}$"))' \
        <<<"$CONN150_BUNDLE_BINDING" >/dev/null 2>&1; echo $?)" \
   "rc=$RC binding_file=$CONN150_BUNDLE_BINDING_FILE binding=$CONN150_BUNDLE_BINDING stderr=$(cat "$TDIR/stderr")"
+
+# #161: a caller-supplied --diff against the same classic `--pr N` run never earns full-pr proof
+# (the engine never independently fetched/hashed those bytes), but it still installs a
+# target-only "caller-patch" binding -- mirroring the connector shape above -- so a stuck
+# reservation later has something for recover_superseded_reason()/pg_reservation_supersede to
+# read. Reuses CONN150_REPO's already-committed base/head commits and gh stub.
+git -C "$CONN150_REPO" diff HEAD~1 HEAD > "$TDIR/conn150-caller.diff"
+CONN150_HEAD="$(git -C "$CONN150_REPO" rev-parse HEAD)"
+conn150_caller_run() { # home pr out
+  env HOME="$TDIR/user" PRO_GATE_HOME="$1" PRO_GATE_INPUT_POLICY=connector-enabled \
+    ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 \
+    PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 PRO_GATE_MAX_ROUNDS_PER_PR=1 \
+    PRO_GATE_LOCK_WAIT=2 PRO_GATE_TIMEOUT_GRACE=0 PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_ORACLE_COMPLETE=1 NODE_OPTIONS= \
+    PG_TEST_CONN150_HEAD="$CONN150_HEAD" \
+    bash "$ENGINE" --pr "$2" --repo "$CONN150_REPO" --diff "$TDIR/conn150-caller.diff" --input bundle --out "$3" --timeout 10s \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+  RC=$?
+}
+conn150_caller_run "$TDIR/home-conn150-callerpatch" 93 "$TDIR/conn150-callerpatch.md"
+CONN150_CALLERPATCH_BINDING_FILE="$(find "$TDIR/home-conn150-callerpatch/review-input-bindings" -mindepth 1 -maxdepth 1 -type f -name 'pg-run-*' -print -quit 2>/dev/null)"
+CONN150_CALLERPATCH_BINDING="$([ -n "$CONN150_CALLERPATCH_BINDING_FILE" ] && cat "$CONN150_CALLERPATCH_BINDING_FILE" || true)"
+check '#161 classic --pr --diff (caller-supplied) installs a caller-patch binding with a proven target and null digests' \
+  "$([ "$RC" -eq 0 ] && [ -n "$CONN150_CALLERPATCH_BINDING" ] \
+     && jq -e '.evidence.mode=="caller-patch" and .evidence.proof.commit_target==.target.head_oid and .evidence.proof.endpoint_digest==null and .evidence.proof.raw_diff_digest==null and .evidence.proof.repository_target=="github.com/acme/conn150" and .target.pr==93' \
+       <<<"$CONN150_CALLERPATCH_BINDING" >/dev/null 2>&1; echo $?)" \
+  "rc=$RC binding_file=$CONN150_CALLERPATCH_BINDING_FILE binding=$CONN150_CALLERPATCH_BINDING stderr=$(cat "$TDIR/stderr")"
+
+# gate r1 P1 (#161): target.head_oid must be the PR's GitHub-reported head, never the caller's
+# local checkout state. A --diff run's $REPO checkout can be stale relative to the PR's real
+# pushed head (README's "review a local diff" usage never requires the clone to be synced to the
+# PR's exact head) -- if the installer trusted local git state, recover_superseded_reason() would
+# later compare that stale value against the true current head and falsely declare the PR head
+# "moved", superseding a reservation that was never actually stuck for that reason and writing a
+# false head-moved provenance entry into ledger.jsonl. DIVERGE161_REPO is deliberately left
+# checked out at the stale base commit while the stubbed `gh` reports the true (unmoved) head.
+DIVERGE161_REPO="$TDIR/diverge161-repo"
+mkdir -p "$DIVERGE161_REPO"
+git -C "$DIVERGE161_REPO" init -q
+git -C "$DIVERGE161_REPO" config user.email test@example.invalid
+git -C "$DIVERGE161_REPO" config user.name 'Engine Test'
+printf 'base\n' > "$DIVERGE161_REPO/f.txt"
+git -C "$DIVERGE161_REPO" add f.txt && git -C "$DIVERGE161_REPO" commit -qm diverge161-base
+DIVERGE161_BASE="$(git -C "$DIVERGE161_REPO" rev-parse HEAD)"
+printf 'head\n' > "$DIVERGE161_REPO/f.txt"
+git -C "$DIVERGE161_REPO" add f.txt && git -C "$DIVERGE161_REPO" commit -qm diverge161-head
+DIVERGE161_HEAD="$(git -C "$DIVERGE161_REPO" rev-parse HEAD)"
+git -C "$DIVERGE161_REPO" remote add origin https://github.com/acme/diverge161.git
+git -C "$DIVERGE161_REPO" diff "$DIVERGE161_BASE" "$DIVERGE161_HEAD" > "$TDIR/diverge161.diff"
+git -C "$DIVERGE161_REPO" checkout -q "$DIVERGE161_BASE"
+mkdir -p "$TDIR/bin"
+DIVERGE161_GH="$TDIR/bin/gh-diverge161"
+DIVERGE161_GH_CALLS="$TDIR/diverge161-gh.calls"
+cat > "$DIVERGE161_GH" <<'DIVERGE161_GH_STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${PG_TEST_GH_CALLS:?}"
+case "$1 $2" in
+  "pr view")
+    if printf '%s\n' "$*" | grep -q -- 'headRefOid'; then
+      printf '{"state":"OPEN","headRefOid":"%s"}\n' "${PG_TEST_GH_HEAD:?}"
+    else
+      printf 'https://github.com/acme/diverge161/pull/%s\n' "$3"
+    fi
+    ;;
+  *) exit 1 ;;
+esac
+DIVERGE161_GH_STUB
+chmod +x "$DIVERGE161_GH"
+DIVERGE161_HOME="$TDIR/home-diverge161"
+: > "$DIVERGE161_GH_CALLS"
+env HOME="$TDIR/user" PRO_GATE_HOME="$DIVERGE161_HOME" PRO_GATE_INPUT_POLICY=connector-enabled \
+  ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 \
+  PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 PRO_GATE_MAX_ROUNDS_PER_PR=1 \
+  PRO_GATE_LOCK_WAIT=2 PRO_GATE_TIMEOUT_GRACE=0 PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_ORACLE_COMPLETE=1 NODE_OPTIONS= \
+  PRO_GATE_GH_BIN="$DIVERGE161_GH" PG_TEST_GH_CALLS="$DIVERGE161_GH_CALLS" PG_TEST_GH_HEAD="$DIVERGE161_HEAD" \
+  bash "$ENGINE" --pr 94 --repo "$DIVERGE161_REPO" --diff "$TDIR/diverge161.diff" --input bundle --out "$TDIR/diverge161-out.md" --timeout 10s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+DIVERGE161_RC=$?
+DIVERGE161_BINDING_FILE="$(find "$DIVERGE161_HOME/review-input-bindings" -mindepth 1 -maxdepth 1 -type f -name 'pg-run-*' -print -quit 2>/dev/null)"
+DIVERGE161_BINDING="$([ -n "$DIVERGE161_BINDING_FILE" ] && cat "$DIVERGE161_BINDING_FILE" || true)"
+DIVERGE161_MARKER="$(basename "${DIVERGE161_BINDING_FILE:-}" 2>/dev/null)"
+check '#161 gate r1 P1: caller-patch binding records the GitHub-reported head, not a stale local checkout' \
+  "$([ "$DIVERGE161_RC" -eq 0 ] && [ -n "$DIVERGE161_BINDING" ] \
+     && jq -e --arg head "$DIVERGE161_HEAD" --arg base "$DIVERGE161_BASE" \
+       '.evidence.mode=="caller-patch" and .target.head_oid==$head and .target.head_oid!=$base and .evidence.proof.commit_target==$head' \
+       <<<"$DIVERGE161_BINDING" >/dev/null 2>&1; echo $?)" \
+  "rc=$DIVERGE161_RC binding_file=$DIVERGE161_BINDING_FILE binding=$DIVERGE161_BINDING base=$DIVERGE161_BASE head=$DIVERGE161_HEAD stderr=$(cat "$TDIR/stderr")"
+check '#161 gate r1 P1: install fetched the PR head from GitHub rather than trusting local git state' \
+  "$(grep -qF -- 'pr view 94 --repo github.com/acme/diverge161 --json headRefOid' "$DIVERGE161_GH_CALLS" 2>/dev/null; echo $?)" \
+  "gh_calls=$(tr '\n' ';' < "$DIVERGE161_GH_CALLS" 2>/dev/null)"
+# Consequence check: since the bound head is now the true GitHub head, recovering while that head
+# is genuinely unmoved must NOT supersede -- reproducing the exact false-positive scenario named
+# by the finding (stale local checkout, unmoved real PR head) and proving it no longer fires.
+# A synchronously-completed ci-fixture marker goes straight from charge to completed/, never
+# through in-progress/ -- removing the completed artifact routes --recover through
+# pg_reservation_restore_from_meta() (lib/pro-gate-lib.sh:1561), which recreates in-progress/
+# itself with state "generating" from run-meta, giving the "still generating" shape this check
+# needs with no manual state-file forging.
+DIVERGE161_IPF="$DIVERGE161_HOME/in-progress/$DIVERGE161_MARKER"
+DIVERGE161_LEDGER_BEFORE="$(wc -l < "$DIVERGE161_HOME/ledger.jsonl" 2>/dev/null || echo 0)"
+rm -f "$DIVERGE161_HOME/completed/$DIVERGE161_MARKER" 2>/dev/null
+: > "$DIVERGE161_GH_CALLS"
+env HOME="$TDIR/user" PRO_GATE_HOME="$DIVERGE161_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PRO_GATE_TEST_MODE=ci-fixture NODE_OPTIONS= \
+  PRO_GATE_GH_BIN="$DIVERGE161_GH" PG_TEST_GH_CALLS="$DIVERGE161_GH_CALLS" PG_TEST_GH_HEAD="$DIVERGE161_HEAD" \
+  bash "$ENGINE" --recover "$DIVERGE161_MARKER" --repo "$DIVERGE161_REPO" --out "$TDIR/diverge161-recover-out.md" --timeout 10s \
+  >"$TDIR/diverge161-recover-stdout" 2>"$TDIR/diverge161-recover-stderr"
+DIVERGE161_RRC=$?
+DIVERGE161_STATE_AFTER="$(awk -F'\t' 'NR==1{print $8}' "$DIVERGE161_IPF" 2>/dev/null)"
+DIVERGE161_FALSE_SUPERSEDE_ENTRY="$(tail -n "+$((DIVERGE161_LEDGER_BEFORE + 1))" "$DIVERGE161_HOME/ledger.jsonl" 2>/dev/null | grep -F "\"marker\":\"$DIVERGE161_MARKER\"" | grep -F '"outcome":"superseded"')"
+# rc 9 ("Still working", documented at bin/oracle-review.sh:54) is the correct non-superseded
+# terminal state for a review that is genuinely still generating; rc 6 ("Review superseded") is
+# the bug this check guards against.
+check '#161 gate r1 P1: recover does not falsely supersede when only the local checkout was stale and the real PR head never moved' \
+  "$([ "$DIVERGE161_RRC" -eq 9 ] && [ "$DIVERGE161_STATE_AFTER" = generating ] && [ -z "$DIVERGE161_FALSE_SUPERSEDE_ENTRY" ]; echo $?)" \
+  "rc=$DIVERGE161_RRC state_after=$DIVERGE161_STATE_AFTER false_supersede_ledger_entry=${DIVERGE161_FALSE_SUPERSEDE_ENTRY:-<none>} gh_calls=$(tr '\n' ';' < "$DIVERGE161_GH_CALLS" 2>/dev/null) stderr=$(cat "$TDIR/diverge161-recover-stderr")"
+
+
+# gate r1 P1 (#161, v0.53.0): a caller-patch run whose PR came in as a URL needs no gh to resolve
+# PG_META_*, so it reaches the caller-patch installer even when no gh binary exists. That
+# installer's head fetch is best-effort by contract: with gh unavailable it must install NO
+# binding and let the run continue, never abort the engine after the charge. Before the fix,
+# `local cp_head` stayed unassigned on that path and the regex test tripped set -u.
+CPMISS_HOME="$TDIR/home-cpmiss"
+env HOME="$TDIR/user" PRO_GATE_HOME="$CPMISS_HOME" PRO_GATE_INPUT_POLICY=connector-enabled \
+  ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 \
+  PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 PRO_GATE_MAX_ROUNDS_PER_PR=1 \
+  PRO_GATE_LOCK_WAIT=2 PRO_GATE_TIMEOUT_GRACE=0 PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_ORACLE_COMPLETE=1 NODE_OPTIONS= \
+  PRO_GATE_GH_BIN="$TDIR/bin/no-such-gh-binary" \
+  bash "$ENGINE" --pr https://github.com/acme/conn150/pull/96 --repo "$CONN150_REPO" --diff "$TDIR/conn150-caller.diff" --input bundle --out "$TDIR/cpmiss-out.md" --timeout 10s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+CPMISS_RC=$?
+CPMISS_BINDINGS="$(find "$CPMISS_HOME/review-input-bindings" -mindepth 1 -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ')"
+check '#161 gate r1 P1: a missing gh binary leaves a caller-patch run bounded and submitted, never aborted after the charge' \
+  "$([ "$CPMISS_RC" -eq 0 ] && [ -s "$TDIR/cpmiss-out.md" ] && ! grep -q 'unbound variable' "$TDIR/stderr"; echo $?)" \
+  "rc=$CPMISS_RC out_bytes=$(wc -c < "$TDIR/cpmiss-out.md" 2>/dev/null) stderr=$(tail -3 "$TDIR/stderr")"
+check '#161 gate r1 P1: with no gh available the run installs no binding at all (best-effort, never a guessed one)' \
+  "$([ "$CPMISS_BINDINGS" = 0 ]; echo $?)" "bindings=$CPMISS_BINDINGS"
 
 # Lifecycle-only modes remain usable under an invalid policy: the engine reaches their normal
 # handler instead of rejecting an unrelated historical inspection or recovery action.
@@ -1857,6 +2006,14 @@ genforce() { local key="$1"; shift; gguard "$key" PRO_GATE_ROUND_GUARD=1 "$@"; }
 gscore() { # $1=key -> "earned<TAB>streak<TAB>elapsed_secs<TAB>scored" from pg_round_score
   env PRO_GATE_HOME="$GHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_score '$1'; printf '%s\t%s\t%s\t%s\n' \"\$PG_ROUND_EARNED\" \"\$PG_ROUND_STREAK\" \"\$PG_ROUND_ELAPSED_SECS\" \"\$PG_ROUND_SCORED\""
 }
+# gate r1 P2 (#174, v0.53.0): the facts builder bounds the exported arrow to the latest 32 counts
+# while the counters still score the whole in-window history. 33 strictly shrinking rounds are
+# legitimate in advisory mode (streak 0); their arrow must serialize as 32 entries, not 33.
+ghist arrow33 40 39 38 37 36 35 34 33 32 31 30 29 28 27 26 25 24 23 22 21 20 19 18 17 16 15 14 13 12 11 10 9 8
+ARROW33_GOV="$(env PRO_GATE_HOME="$GHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_governor_facts_json arrow33 true")"
+check '#174 gate r1 P2: governor facts bound the exported arrow to the latest 32 counts' \
+  "$(jq -e '(.arrow|length)==32 and .scored==33 and .arrow[0]==39 and .arrow[-1]==8 and .streak==0 and .earned==32' <<<"$ARROW33_GOV" >/dev/null 2>&1; echo $?)" \
+  "$ARROW33_GOV"
 # No explicit policy: count, grant, and trajectory are advisory and never ration a safe review.
 gseed nohist 3
 GOUT="$(gguard nohist)"; GRC=$?
@@ -5830,7 +5987,23 @@ UNKNOWN_OUT="$(rd_reduce "$UNKNOWN_FACTS")"
 check 'unknown decision contract stops closed' \
   "$(jq -e '.action == "stop-without-new-review" and .reason == "unknown-contract"' <<<"$UNKNOWN_OUT" >/dev/null 2>&1; echo $?)" "$UNKNOWN_OUT"
 
-LEGACY_COLLECT='{"completed_results":[{"applicable":false,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binding_valid":false,"canonical_identity":"legacy-a","charged_spend_epoch":1700000100,"collected":false,"legacy":true,"marker":"pg-run-legacy-1983-1700000100-1","provenance_valid":false,"verdict":"SHIP"}]}'
+# #214 (gate r2 P1): the binding-record compatibility list only widens what
+# pg_review_*_binding_validate will read; it must never widen the decision/effect envelope's own
+# contract identity check. A decision envelope carrying a predecessor contract digest — one of the
+# exact digests now in PG_REVIEW_DECISION_COMPATIBLE_CONTRACT_DIGESTS — is still rejected here.
+PG214_PRED_A='bf36fdb5f8625e917be0539ca014fec518649d1160584846aca1cb9149533abb'
+PG214_PRED_B='7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee'
+PG214_UNKNOWN_CD='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+check 'the compiled binding-record compatibility list is exactly the two predecessor contract digests' \
+  "$(jq -ne --arg a "$PG214_PRED_A" --arg b "$PG214_PRED_B" --argjson got "$(pg_review_decision_compatible_contract_digests_json)" \
+      '$got == ([$a,$b]|sort)' >/dev/null 2>&1; echo $?)" \
+  "$(pg_review_decision_compatible_contract_digests_json)"
+PG214_ENV_PRED_FACTS="$(rd_facts '{}')"; PG214_ENV_PRED_FACTS="$(jq -cS --arg cd "$PG214_PRED_A" '.contract.contract_digest=$cd' <<<"$PG214_ENV_PRED_FACTS")"
+PG214_ENV_PRED_OUT="$(rd_reduce "$PG214_ENV_PRED_FACTS")"
+check '#214: a decision envelope carrying a predecessor contract digest is still rejected as unknown-contract' \
+  "$(jq -e '.action == "stop-without-new-review" and .reason == "unknown-contract"' <<<"$PG214_ENV_PRED_OUT" >/dev/null 2>&1; echo $?)" "$PG214_ENV_PRED_OUT"
+
+LEGACY_COLLECT='{"completed_results":[{"applicable":false,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bindable":true,"binding_valid":false,"canonical_identity":"legacy-a","charged_spend_epoch":1700000100,"collected":false,"evidence_mode":"none","legacy":true,"marker":"pg-run-legacy-1983-1700000100-1","provenance_valid":false,"verdict":"SHIP"}]}'
 LEGACY_COLLECT_OUT="$(rd_reduce "$(rd_facts "$LEGACY_COLLECT")")"
 check 'legacy completed artifact remains collectable' \
   "$(jq -e '.action == "collect-existing-result"' <<<"$LEGACY_COLLECT_OUT" >/dev/null 2>&1; echo $?)" "$LEGACY_COLLECT_OUT"
@@ -5841,14 +6014,41 @@ check 'legacy completed artifact remains collectable' \
 # (`selected`), which forces prior_applicable=true regardless of that entry's own `applicable` field --
 # see LEGACY_COLLECT above for the `collected:false` sibling of this same real shape.
 rd_expect_stop 'legacy SHIP cannot authorize merge eligibility or paid continuation' \
-  '{"completed_results":[{"applicable":false,"artifact_digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","binding_valid":false,"canonical_identity":"legacy-ship","charged_spend_epoch":1700000090,"collected":true,"legacy":true,"marker":"pg-run-legacy-1983-1700000090-1","provenance_valid":false,"verdict":"SHIP"}]}' 'legacy-not-authoritative'
+  '{"completed_results":[{"applicable":false,"artifact_digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","bindable":true,"binding_valid":false,"canonical_identity":"legacy-ship","charged_spend_epoch":1700000090,"collected":true,"evidence_mode":"none","legacy":true,"marker":"pg-run-legacy-1983-1700000090-1","provenance_valid":false,"verdict":"SHIP"}]}' 'legacy-not-authoritative'
 
-SELECT_PATCH='{"completed_results":[{"applicable":true,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binding_valid":true,"canonical_identity":"result-a","charged_spend_epoch":1700000200,"collected":false,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000200-1","provenance_valid":true,"verdict":"SHIP"},{"applicable":true,"artifact_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","binding_valid":true,"canonical_identity":"result-b","charged_spend_epoch":1700000201,"collected":false,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000201-2","provenance_valid":true,"verdict":"FIX-FIRST"}]}'
+SELECT_PATCH='{"completed_results":[{"applicable":true,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bindable":true,"binding_valid":true,"canonical_identity":"result-a","charged_spend_epoch":1700000200,"collected":false,"evidence_mode":"full-pr","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000200-1","provenance_valid":true,"verdict":"SHIP"},{"applicable":true,"artifact_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","bindable":true,"binding_valid":true,"canonical_identity":"result-b","charged_spend_epoch":1700000201,"collected":false,"evidence_mode":"full-pr","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000201-2","provenance_valid":true,"verdict":"FIX-FIRST"}]}'
 SELECT_OUT="$(rd_reduce "$(rd_facts "$SELECT_PATCH")")"
 check 'newest charged completed result and canonical identity are selected' \
   "$(jq -e '.action == "collect-existing-result" and .effect_request.applicable_ref == "result-b"' <<<"$SELECT_OUT" >/dev/null 2>&1; echo $?)" "$SELECT_OUT"
 rd_expect_stop 'unresolved completed-result identity tie stops closed' \
-  '{"completed_results":[{"applicable":true,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binding_valid":true,"canonical_identity":"same","charged_spend_epoch":1700000300,"collected":false,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000300-1","provenance_valid":true,"verdict":"SHIP"},{"applicable":true,"artifact_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","binding_valid":true,"canonical_identity":"same","charged_spend_epoch":1700000300,"collected":false,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000300-2","provenance_valid":true,"verdict":"SHIP"}]}' 'completed-result-tie'
+  '{"completed_results":[{"applicable":true,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bindable":true,"binding_valid":true,"canonical_identity":"same","charged_spend_epoch":1700000300,"collected":false,"evidence_mode":"full-pr","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000300-1","provenance_valid":true,"verdict":"SHIP"},{"applicable":true,"artifact_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","bindable":true,"binding_valid":true,"canonical_identity":"same","charged_spend_epoch":1700000300,"collected":false,"evidence_mode":"full-pr","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000300-2","provenance_valid":true,"verdict":"SHIP"}]}' 'completed-result-tie'
+
+# #147: an uncollected result whose evidence mode can never carry merge proof is unrepairable. The
+# reducer must say so in a closed reason that names the mode and marker, never re-issue collect.
+# gate r1 P2 (#174, v0.53.0): the reducer's normalized-input guard refuses any array longer than
+# 32 before it considers completed results or recovery. A 32-count arrow must still reduce to a
+# grant; a 33-count arrow is refused as unsafe-normalized-input -- the planted negative that
+# proves the builder's bound is load-bearing rather than cosmetic.
+ARROW32_PATCH="$(jq -cn '{governor:{arrow:[range(32)|40-.],continue_override:false,earned:31,grant:8,granted:true,policy_mode:"advisory",scored:32,streak:0}}')"
+ARROW32_OUT="$(rd_reduce "$(rd_facts "$ARROW32_PATCH")")"
+check '#174 gate r1 P2: a 32-count arrow still reduces to a round grant' \
+  "$(jq -e '.action=="run-granted-review" and .reason=="round-granted-for-changed-input"' <<<"$ARROW32_OUT" >/dev/null 2>&1; echo $?)" \
+  "$ARROW32_OUT"
+ARROW33_PATCH="$(jq -cn '{governor:{arrow:[range(33)|40-.],continue_override:false,earned:32,grant:8,granted:true,policy_mode:"advisory",scored:33,streak:0}}')"
+ARROW33_OUT="$(rd_reduce "$(rd_facts "$ARROW33_PATCH")")"
+check '#174 gate r1 P2 planted negative: a 33-count arrow is refused as unsafe-normalized-input, which is why the builder bounds it' \
+  "$(jq -e '.action=="stop-without-new-review" and .reason=="unsafe-normalized-input"' <<<"$ARROW33_OUT" >/dev/null 2>&1; echo $?)" \
+  "$ARROW33_OUT"
+NOT_BINDABLE_PATCH='{"completed_results":[{"applicable":true,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bindable":false,"binding_valid":false,"canonical_identity":"pg-run-acme-widgets-1983-1700000350-1","charged_spend_epoch":1700000350,"collected":false,"evidence_mode":"connector","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000350-1","provenance_valid":false,"verdict":"NONE"}]}'
+NOT_BINDABLE_OUT="$(rd_reduce "$(rd_facts "$NOT_BINDABLE_PATCH")")"
+check 'uncollected result that can never bind stops typed with its mode and marker, never collects' \
+  "$(jq -e '.action == "stop-without-new-review" and .reason == "result-not-bindable-for-mode" and .effect_request.execution_class == "report-only" and .effect_request.applicable_ref == "pg-run-acme-widgets-1983-1700000350-1" and .facts.completed_results[0].evidence_mode == "connector" and .facts.completed_results[0].marker == "pg-run-acme-widgets-1983-1700000350-1"' <<<"$NOT_BINDABLE_OUT" >/dev/null 2>&1; echo $?)" "$NOT_BINDABLE_OUT"
+check 'result-not-bindable-for-mode is enumerated by the frozen contract' \
+  "$(jq -e '.reasons | index("result-not-bindable-for-mode") != null' "$RD_CONTRACT" >/dev/null 2>&1; echo $?)"
+BINDABLE_PATCH="$(jq -c '.completed_results[0].bindable=true' <<<"$NOT_BINDABLE_PATCH")"
+BINDABLE_OUT="$(rd_reduce "$(rd_facts "$BINDABLE_PATCH")")"
+check 'the same uncollected result marked bindable still collects' \
+  "$(jq -e '.action == "collect-existing-result" and .reason == "completed-result-awaits-collection"' <<<"$BINDABLE_OUT" >/dev/null 2>&1; echo $?)" "$BINDABLE_OUT"
 
 rd_expect_stop 'identical verified code and evidence cannot authorize another review' \
   '{"prior_review":{"applicable":false,"binding_valid":true,"code_identity":"input-current","evidence_identity":"evidence-current","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000400-1","provenance_valid":true,"verdict":"NONE"}}' 'identical-code-and-evidence'
@@ -5862,7 +6062,7 @@ check 'cooldown decision carries the seconds remaining for the wrapper to wait' 
   "$(jq -e '.facts.cooldown.seconds_remaining == 120 and .facts.cooldown.active == true' <<<"$COOLDOWN_OUT" >/dev/null 2>&1; echo $?)" "$COOLDOWN_OUT"
 rd_expect_stop 'governor denial outranks the cooldown (waiting it out would not help)' \
   '{"cooldown":{"active":true,"seconds_remaining":120},"governor":{"granted":false}}' 'round-governor-denied'
-COOLDOWN_COLLECT_OUT="$(rd_reduce "$(rd_facts '{"cooldown":{"active":true,"seconds_remaining":120},"completed_results":[{"applicable":true,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binding_valid":true,"canonical_identity":"result-cool","charged_spend_epoch":1700000900,"collected":false,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000900-1","provenance_valid":true,"verdict":"SHIP"}]}')")"
+COOLDOWN_COLLECT_OUT="$(rd_reduce "$(rd_facts '{"cooldown":{"active":true,"seconds_remaining":120},"completed_results":[{"applicable":true,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bindable":true,"binding_valid":true,"canonical_identity":"result-cool","charged_spend_epoch":1700000900,"collected":false,"evidence_mode":"full-pr","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000900-1","provenance_valid":true,"verdict":"SHIP"}]}')")"
 check 'account cooldown never blocks collecting an existing result' \
   "$(jq -e '.action == "collect-existing-result"' <<<"$COOLDOWN_COLLECT_OUT" >/dev/null 2>&1; echo $?)" "$COOLDOWN_COLLECT_OUT"
 COOLDOWN_FIX_OUT="$(rd_reduce "$(rd_facts '{"cooldown":{"active":true,"seconds_remaining":120},"prior_review":{"applicable":true,"binding_valid":true,"code_identity":"input-current","evidence_identity":"evidence-current","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000901-1","provenance_valid":true,"verdict":"FIX-FIRST"}}')")"
@@ -5924,6 +6124,82 @@ check 'result binding is the only marker-bound sibling and validates input/artif
   "$([ "$RESULT_RC" -eq 0 ] && [ "$RESULT_READ" = "$RESULT_BINDING" ] \
      && [ "$(find "$BIND_HOME" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort | tr '\n' ' ')" = 'review-input-bindings review-result-bindings ' ]; echo $?)" \
   "rc=$RESULT_RC dirs=$(find "$BIND_HOME" -mindepth 1 -maxdepth 1 -type d -printf '%f ' 2>/dev/null)"
+
+# #214 (gate r2 P1): a v0.53.0 contract bump changes PG_REVIEW_DECISION_CONTRACT_DIGEST, but every
+# binding record written by a runtime carrying a predecessor digest must remain readable — its own
+# record_type/record_version shape rules already proved it, and the contract changes since were
+# additive only. PG214_PRED_A/PG214_PRED_B are derived from the already-validated INPUT_BINDING /
+# RESULT_BINDING above so the hex proof fields can never be mistyped.
+PG214_BIND_HOME="$TDIR/home-pg214-bindings"
+PG214_INPUT_MARKER='pg-run-acme-widgets-1983-1700000701-1'
+PG214_INPUT_BINDING="$(jq -cS --arg cd "$PG214_PRED_A" --arg marker "$PG214_INPUT_MARKER" \
+  '.contract_digest=$cd | .marker=$marker | .charged_spend_epoch=1700000701' <<<"$INPUT_BINDING")"
+pg_review_input_binding_validate "$PG214_INPUT_BINDING" "$PG214_INPUT_MARKER"; PG214_INPUT_VALIDATE_RC=$?
+PRO_GATE_HOME="$PG214_BIND_HOME" pg_review_input_binding_write "$PG214_INPUT_MARKER" "$PG214_INPUT_BINDING"; PG214_INPUT_WRITE_RC=$?
+PG214_INPUT_READ="$(PRO_GATE_HOME="$PG214_BIND_HOME" pg_review_input_binding_read "$PG214_INPUT_MARKER")"
+PG214_INPUT_DIGEST="$(PRO_GATE_HOME="$PG214_BIND_HOME" pg_review_input_binding_digest "$PG214_INPUT_MARKER")"
+PG214_INPUT_SHA="$(pg_review_sha256_text "$PG214_INPUT_BINDING")"
+check '#214 (a): an input binding whose contract_digest is a compiled predecessor digest (bf36fdb5...) validates, writes, and reads back byte-identical' \
+  "$([ "$PG214_INPUT_VALIDATE_RC" -eq 0 ] && [ "$PG214_INPUT_WRITE_RC" -eq 0 ] && [ "$PG214_INPUT_READ" = "$PG214_INPUT_BINDING" ] \
+     && [ -n "$PG214_INPUT_DIGEST" ] && [ "$PG214_INPUT_DIGEST" = "$PG214_INPUT_SHA" ]; echo $?)" \
+  "validate_rc=$PG214_INPUT_VALIDATE_RC write_rc=$PG214_INPUT_WRITE_RC read=$PG214_INPUT_READ digest=$PG214_INPUT_DIGEST sha=$PG214_INPUT_SHA binding=$PG214_INPUT_BINDING"
+
+PG214_RESULT_MARKER='pg-run-acme-widgets-1983-1700000702-1'
+PG214_RESULT_BINDING="$(jq -cS --arg cd "$PG214_PRED_B" --arg marker "$PG214_RESULT_MARKER" --arg ib "$(pg_review_sha256_text "$PG214_INPUT_BINDING")" \
+  '.contract_digest=$cd | .marker=$marker | .input_binding_identity=$marker | .input_binding_digest=$ib | .artifact.path=("completed/"+$marker)' <<<"$RESULT_BINDING")"
+pg_review_result_binding_validate "$PG214_RESULT_BINDING" "$PG214_RESULT_MARKER"; PG214_RESULT_VALIDATE_RC=$?
+PRO_GATE_HOME="$PG214_BIND_HOME" pg_review_result_binding_write "$PG214_RESULT_MARKER" "$PG214_RESULT_BINDING"; PG214_RESULT_WRITE_RC=$?
+PG214_RESULT_READ="$(PRO_GATE_HOME="$PG214_BIND_HOME" pg_review_result_binding_read "$PG214_RESULT_MARKER")"
+check '#214 (b): a result binding whose contract_digest is a compiled predecessor digest (7f5ece9b...) validates, writes, and reads back byte-identical' \
+  "$([ "$PG214_RESULT_VALIDATE_RC" -eq 0 ] && [ "$PG214_RESULT_WRITE_RC" -eq 0 ] && [ "$PG214_RESULT_READ" = "$PG214_RESULT_BINDING" ]; echo $?)" \
+  "validate_rc=$PG214_RESULT_VALIDATE_RC write_rc=$PG214_RESULT_WRITE_RC read=$PG214_RESULT_READ binding=$PG214_RESULT_BINDING"
+
+PG214_UNKNOWN_INPUT="$(jq -cS --arg cd "$PG214_UNKNOWN_CD" '.contract_digest=$cd' <<<"$INPUT_BINDING")"
+PG214_UNKNOWN_RESULT="$(jq -cS --arg cd "$PG214_UNKNOWN_CD" '.contract_digest=$cd' <<<"$RESULT_BINDING")"
+pg_review_input_binding_validate "$PG214_UNKNOWN_INPUT" 'pg-run-acme-widgets-1983-1700000700-1'; PG214_UNKNOWN_INPUT_RC=$?
+pg_review_result_binding_validate "$PG214_UNKNOWN_RESULT" 'pg-run-acme-widgets-1983-1700000700-1'; PG214_UNKNOWN_RESULT_RC=$?
+check '#214 (c): a binding with an unknown contract_digest is still rejected by both validators' \
+  "$([ "$PG214_UNKNOWN_INPUT_RC" -ne 0 ] && [ "$PG214_UNKNOWN_RESULT_RC" -ne 0 ]; echo $?)" \
+  "input_rc=$PG214_UNKNOWN_INPUT_RC result_rc=$PG214_UNKNOWN_RESULT_RC"
+
+# #214 (e): upgrade regression, completed review. An unchanged head whose full-pr input binding
+# AND SHIP result binding were both written by the PREDECESSOR runtime (predecessor contract
+# digest on both sibling records) must still be recognized by the real CLI query as an already
+# -completed, merge-eligible review -- reused via allow-existing-merge-workflow -- rather than
+# granting ANOTHER paid round because the old bindings silently failed to read back.
+PG214_E_REPO="$TDIR/pg214-upgrade-repo"
+mkdir -p "$PG214_E_REPO"
+git -C "$PG214_E_REPO" init -q
+git -C "$PG214_E_REPO" config user.email test@example.invalid
+git -C "$PG214_E_REPO" config user.name 'Engine Test'
+printf 'one\n' > "$PG214_E_REPO/file.txt"
+git -C "$PG214_E_REPO" add file.txt && git -C "$PG214_E_REPO" commit -qm initial
+printf 'two\n' > "$PG214_E_REPO/file.txt"
+git -C "$PG214_E_REPO" add file.txt && git -C "$PG214_E_REPO" commit -qm second
+git -C "$PG214_E_REPO" remote add origin https://github.com/acme/upgrade-e2e.git
+PG214_E_HEAD="$(git -C "$PG214_E_REPO" rev-parse HEAD)"
+PG214_E_BASE="$(git -C "$PG214_E_REPO" rev-parse HEAD^)"
+git -C "$PG214_E_REPO" diff "$PG214_E_BASE" "$PG214_E_HEAD" > "$TDIR/pg214-e.patch"
+PG214_E_DIGEST="$(pg_sha256 "$TDIR/pg214-e.patch")"
+PG214_E_HOME="$TDIR/home-pg214-upgrade-review"
+PG214_E_MARKER='pg-run-acme-upgrade-e2e-91-1700020000-1'
+mkdir -p "$PG214_E_HOME/completed"
+printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — upgrade regression fixture.' > "$PG214_E_HOME/completed/$PG214_E_MARKER"
+PG214_E_ARTIFACT_DIGEST="$(pg_sha256 "$PG214_E_HOME/completed/$PG214_E_MARKER")"
+PG214_E_INPUT_BINDING="$(jq -cnS --arg cd "$PG214_PRED_A" --arg marker "$PG214_E_MARKER" --arg base "$PG214_E_BASE" --arg head "$PG214_E_HEAD" --arg digest "$PG214_E_DIGEST" \
+  '{charged_spend_epoch:1700020000,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("full-pr:"+$base+":"+$head),mode:"full-pr",proof:{base_oid:$base,endpoint_digest:$digest,head_oid:$head,raw_patch_digest:$digest}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:"github.com",owner:"acme",repo:"upgrade-e2e"},target:{head_oid:$head,kind:"pull-request",pr:91}}')"
+PRO_GATE_HOME="$PG214_E_HOME" pg_review_input_binding_write "$PG214_E_MARKER" "$PG214_E_INPUT_BINDING"
+PG214_E_INPUT_DIGEST="$(pg_review_sha256_text "$PG214_E_INPUT_BINDING")"
+PG214_E_RESULT_BINDING="$(jq -cnS --arg cd "$PG214_PRED_B" --arg marker "$PG214_E_MARKER" --arg ib "$PG214_E_INPUT_DIGEST" --arg base "$PG214_E_BASE" --arg head "$PG214_E_HEAD" --arg digest "$PG214_E_DIGEST" --arg artifact "$PG214_E_ARTIFACT_DIGEST" \
+  '{accepted_epoch:1700020001,artifact:{digest:$artifact,path:("completed/"+$marker)},contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,input_binding_digest:$ib,input_binding_identity:$marker,marker:$marker,named_choice:null,provenance:{outcome:"accepted",validated_epoch:1700020001},record_type:"review-result-binding/v1",record_version:1,ship_proof:{base_oid:$base,diff_digest:$digest,head_oid:$head},verdict:"SHIP"}')"
+PRO_GATE_HOME="$PG214_E_HOME" pg_review_result_binding_write "$PG214_E_MARKER" "$PG214_E_RESULT_BINDING"
+env PRO_GATE_HOME="$PG214_E_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/pg214-e.patch" \
+  bash "$ENGINE" --review-decision --json --repo "$PG214_E_REPO" --pr 91 --diff "$TDIR/pg214-e.patch" --input bundle \
+  >"$TDIR/pg214-e.json" 2>"$TDIR/pg214-e.err"
+PG214_E_RC=$?
+check '#214 (e): an unchanged head whose input+result bindings both carry a predecessor contract digest reduces directly to allow-existing-merge-workflow, no new round granted' \
+  "$([ "$PG214_E_RC" -eq 0 ] && jq -e '.action=="allow-existing-merge-workflow" and .reason=="current-ship-is-merge-eligible"' "$TDIR/pg214-e.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$PG214_E_RC output=$(cat "$TDIR/pg214-e.json") stderr=$(cat "$TDIR/pg214-e.err")"
 
 # U2: the typed resolution surface is advisory and strictly read-only. It must normalize a
 # canonical local PR target and bare supplied diff without starting the existing engine path.
@@ -6623,6 +6899,67 @@ check 'a capacity-holding reservation outranks an older audit-only superseded ma
   "$(jq -e --arg marker "$SUPER_LIVE_MARKER" '.marker==$marker and .source=="reservation" and .state=="recoverable" and .recoverable and (.fresh_eligible|not)' <<<"$SUPER_LIVE_SNAPSHOT" >/dev/null 2>&1; echo $?)" \
   "$SUPER_LIVE_SNAPSHOT"
 rm -f "$SUPER_HEAD_HOME/in-progress/$SUPER_LIVE_MARKER" "$SUPER_HEAD_HOME/run-meta/$SUPER_LIVE_MARKER"
+
+# #214 (f): upgrade regression, live reservation. A generating reservation's input binding, once
+# rewritten in place to carry a PREDECESSOR contract digest -- exactly what a binding a pre-v0.53.0
+# runtime wrote looks like on disk today -- must still be read by pg_reservation_supersede /
+# recover_superseded_reason() when the bound PR head moves, and atomically transition to
+# superseded, not silently lose the binding it needs to prove the move.
+PG214_F_HOME="$TDIR/home-pg214-upgrade-live"
+PG214_F_MARKER='pg-run-acme-fresh-77-1700020100-1'
+super_seed "$PG214_F_HOME" "$PG214_F_MARKER" 1700020100 "$FRESH_BASE"
+super_replace_binding "$PG214_F_HOME" "$PG214_F_MARKER" ".contract_digest=\"$PG214_PRED_A\""
+PG214_F_BINDING_CD="$(jq -r .contract_digest <<<"$(PRO_GATE_HOME="$PG214_F_HOME" pg_review_input_binding_read "$PG214_F_MARKER")")"
+: > "$SUPER_GH_CALLS"; : > "$TDIR/recover-oracle-sentinel"
+super_recover "$PG214_F_HOME" "$PG214_F_MARKER" ok OPEN "$FRESH_HEAD"
+check '#214 (f): a live reservation whose input binding carries a predecessor contract digest still recovers superseded when the bound head moves' \
+  "$([ "$PG214_F_BINDING_CD" = "$PG214_PRED_A" ] && [ "$RC" -eq 6 ] && grep -qx 'Review superseded' "$TDIR/super.stderr" \
+     && grep -qF 'pr view 77 --repo github.com/acme/fresh --json state,headRefOid' "$SUPER_GH_CALLS" \
+     && [ "$(awk -F'\t' 'NR==1{print $NF}' "$PG214_F_HOME/in-progress/$PG214_F_MARKER")" = superseded ]; echo $?)" \
+  "binding_cd=$PG214_F_BINDING_CD rc=$RC state=$(cat "$PG214_F_HOME/in-progress/$PG214_F_MARKER") stderr=$(cat "$TDIR/super.stderr")"
+
+# #161: a caller-supplied --diff reservation's binding has no full-pr shaped proof to borrow, so
+# recover_superseded_reason()/pg_reservation_supersede must accept its own "caller-patch" shape
+# too -- exercised at the --recover CLI exit-6 path, not only the pg_reservation_supersede library
+# call SUPER_HEAD_* above already covers.
+echo '# #161: exact recovery proof-supersedes a caller-patch-mode reservation too'
+CALLERPATCH_BINDING_TEMPLATE="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg host github.com --arg owner acme --arg repo fresh --arg head "$FRESH_BASE" \
+  '{charged_spend_epoch:1700014150,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("caller-patch:"+$host+"/"+$owner+"/"+$repo+":"+$head),mode:"caller-patch",proof:{commit_target:$head,endpoint_digest:null,raw_diff_digest:null,repository_target:($host+"/"+$owner+"/"+$repo)}},marker:"placeholder",record_type:"review-input-binding/v1",record_version:1,repository:{host:$host,owner:$owner,repo:$repo},target:{head_oid:$head,kind:"pull-request",pr:77}}')"
+super_seed_callerpatch() { # home marker epoch bound-head
+  local home="$1" marker="$2" epoch="$3" bound_head="$4" binding
+  mkdir -p "$home/in-progress" "$home/run-meta" "$home/rounds"
+  printf '%s\n' "$epoch" > "$home/rounds/$SUPER_KEY"
+  printf 'github.com\tacme\tfresh\t%s\t77\t%s\t%s\n' "$SUPER_KEY" "$TDIR/superseded-audit.md" "$epoch" > "$home/run-meta/$marker"
+  printf '%s\t%s\t%s\t0\t1\tGPT-X\t%s\tgenerating\n' "$SUPER_KEY" "$TDIR/superseded-audit.md" "$(date +%s)" "$epoch" > "$home/in-progress/$marker"
+  binding="$(jq -cS --arg marker "$marker" --arg head "$bound_head" --argjson epoch "$epoch" \
+    '.marker=$marker | .charged_spend_epoch=$epoch | .target.head_oid=$head | .evidence.proof.commit_target=$head | .evidence.identity=("caller-patch:"+.repository.host+"/"+.repository.owner+"/"+.repository.repo+":"+$head)' <<<"$CALLERPATCH_BINDING_TEMPLATE")"
+  PRO_GATE_HOME="$home" pg_review_input_binding_write "$marker" "$binding"
+}
+CALLERPATCH_HEAD_HOME="$TDIR/home-callerpatch-head"
+CALLERPATCH_HEAD_MARKER='pg-run-acme-fresh-77-1700014150-1'
+super_seed_callerpatch "$CALLERPATCH_HEAD_HOME" "$CALLERPATCH_HEAD_MARKER" 1700014150 "$FRESH_BASE"
+: > "$SUPER_GH_CALLS"; : > "$TDIR/recover-oracle-sentinel"
+super_recover "$CALLERPATCH_HEAD_HOME" "$CALLERPATCH_HEAD_MARKER" ok OPEN "$FRESH_HEAD"
+check '#161 exact recovery proof-supersedes a caller-patch reservation after the bound head moves' \
+  "$([ "$RC" -eq 6 ] && grep -qx 'Review superseded' "$TDIR/super.stderr" \
+     && grep -qF 'pr view 77 --repo github.com/acme/fresh --json state,headRefOid' "$SUPER_GH_CALLS" \
+     && [ "$(awk -F'\t' 'NR==1{print $8}' "$CALLERPATCH_HEAD_HOME/in-progress/$CALLERPATCH_HEAD_MARKER")" = superseded ] \
+     && [ ! -s "$TDIR/recover-oracle-sentinel" ]; echo $?)" \
+  "rc=$RC state=$(cat "$CALLERPATCH_HEAD_HOME/in-progress/$CALLERPATCH_HEAD_MARKER") stderr=$(cat "$TDIR/super.stderr")"
+check '#161 supersession ledger proof records the exact head move for a caller-patch binding' \
+  "$(jq -e --arg marker "$CALLERPATCH_HEAD_MARKER" --arg old "$FRESH_BASE" --arg new "$FRESH_HEAD" \
+       'select(.outcome=="superseded" and .marker==$marker and .charge_retained and (.holds_capacity|not) and .proof==("head-moved:"+$old+":"+$new))' \
+       "$CALLERPATCH_HEAD_HOME/ledger.jsonl" >/dev/null 2>&1; echo $?)" \
+  "ledger=$(cat "$CALLERPATCH_HEAD_HOME/ledger.jsonl" 2>/dev/null)"
+CALLERPATCH_SAME_HOME="$TDIR/home-callerpatch-same-head"
+CALLERPATCH_SAME_MARKER='pg-run-acme-fresh-77-1700014151-2'
+super_seed_callerpatch "$CALLERPATCH_SAME_HOME" "$CALLERPATCH_SAME_MARKER" 1700014151 "$FRESH_BASE"
+: > "$SUPER_GH_CALLS"; : > "$TDIR/recover-oracle-sentinel"
+super_recover "$CALLERPATCH_SAME_HOME" "$CALLERPATCH_SAME_MARKER" ok OPEN "$FRESH_BASE"
+check '#161 planted negative: an unmoved head does not supersede a caller-patch reservation' \
+  "$([ "$RC" -eq 3 ] \
+     && [ "$(awk -F'\t' 'NR==1{print $8}' "$CALLERPATCH_SAME_HOME/in-progress/$CALLERPATCH_SAME_MARKER")" = generating ]; echo $?)" \
+  "rc=$RC state=$(cat "$CALLERPATCH_SAME_HOME/in-progress/$CALLERPATCH_SAME_MARKER") stderr=$(cat "$TDIR/super.stderr")"
 
 # Every generic mutation seam is monotonic: a still-rendering optional harvest may refresh output,
 # state, or miss bookkeeping, but none can turn obsolete work back into account occupancy.
@@ -7841,12 +8178,12 @@ check 'stale run-granted advisory re-reduces a moved head without charge or Orac
 # selection case did not cover. These remain pure snapshots: race/restart fixture setup belongs
 # to U2's guarded-effect tests above.
 echo '# U3: review-decision precedence and recovery-state conformance'
-SAME_EPOCH_ORDER_PATCH='{"completed_results":[{"applicable":true,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binding_valid":true,"canonical_identity":"canonical-a","charged_spend_epoch":1700000900,"collected":false,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000900-1","provenance_valid":true,"verdict":"SHIP"},{"applicable":true,"artifact_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","binding_valid":true,"canonical_identity":"canonical-z","charged_spend_epoch":1700000900,"collected":false,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000900-2","provenance_valid":true,"verdict":"FIX-FIRST"}]}'
+SAME_EPOCH_ORDER_PATCH='{"completed_results":[{"applicable":true,"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bindable":true,"binding_valid":true,"canonical_identity":"canonical-a","charged_spend_epoch":1700000900,"collected":false,"evidence_mode":"full-pr","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000900-1","provenance_valid":true,"verdict":"SHIP"},{"applicable":true,"artifact_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","bindable":true,"binding_valid":true,"canonical_identity":"canonical-z","charged_spend_epoch":1700000900,"collected":false,"evidence_mode":"full-pr","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000900-2","provenance_valid":true,"verdict":"FIX-FIRST"}]}'
 SAME_EPOCH_ORDER_OUT="$(rd_reduce "$(rd_facts "$SAME_EPOCH_ORDER_PATCH")")"
 check 'same charged epoch deterministically selects canonical identity before collection' \
   "$(jq -e '.action == "collect-existing-result" and .effect_request.applicable_ref == "canonical-z"' <<<"$SAME_EPOCH_ORDER_OUT" >/dev/null 2>&1; echo $?)" "$SAME_EPOCH_ORDER_OUT"
 
-COMPLETED_BEATS_ACTIVE_PATCH='{"active_index":{"binding_valid":true,"charged_spend_epoch":1700000902,"marker":"pg-run-acme-widgets-1983-1700000902-2","state":"charged"},"completed_results":[{"applicable":true,"artifact_digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","binding_valid":true,"canonical_identity":"completed-first","charged_spend_epoch":1700000901,"collected":false,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000901-1","provenance_valid":true,"verdict":"SHIP"}]}'
+COMPLETED_BEATS_ACTIVE_PATCH='{"active_index":{"binding_valid":true,"charged_spend_epoch":1700000902,"marker":"pg-run-acme-widgets-1983-1700000902-2","state":"charged"},"completed_results":[{"applicable":true,"artifact_digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","bindable":true,"binding_valid":true,"canonical_identity":"completed-first","charged_spend_epoch":1700000901,"collected":false,"evidence_mode":"full-pr","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000901-1","provenance_valid":true,"verdict":"SHIP"}]}'
 COMPLETED_BEATS_ACTIVE_OUT="$(rd_reduce "$(rd_facts "$COMPLETED_BEATS_ACTIVE_PATCH")")"
 check 'uncollected current result wins over newer active work without a fresh review' \
   "$(jq -e '.action == "collect-existing-result" and .effect_request.applicable_ref == "completed-first"' <<<"$COMPLETED_BEATS_ACTIVE_OUT" >/dev/null 2>&1; echo $?)" "$COMPLETED_BEATS_ACTIVE_OUT"
@@ -8106,6 +8443,23 @@ check 'connector SHIP never becomes merge eligibility' \
   "$([ "$CONNECTOR_SHIP_RC" -eq 0 ] && jq -e '.action!="allow-existing-merge-workflow"' "$TDIR/connector-ship.json" >/dev/null 2>&1; echo $?)" \
   "rc=$CONNECTOR_SHIP_RC output=$(cat "$TDIR/connector-ship.json")"
 
+# #161: the same fail-closed pin, for the new caller-patch evidence.mode -- pg_extract merge
+# handoff (bin/oracle-review.sh mode case) only earns a ship_digest for full-pr/scoped-delta;
+# caller-patch falls into its `*) continue` default exactly like connector, never reaching
+# allow-existing-merge-workflow, without any code change needed for this item.
+CALLERPATCH_SHIP_HOME="$TDIR/home-callerpatch-ship"; CALLERPATCH_SHIP_MARKER='pg-run-acme-widgets-1983-1700018003-4'
+CALLERPATCH_SHIP_INPUT="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg marker "$CALLERPATCH_SHIP_MARKER" --arg head "$PROOF_HEAD" \
+  '{charged_spend_epoch:1700018003,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("caller-patch:github.com/acme/widgets:"+$head),mode:"caller-patch",proof:{commit_target:$head,endpoint_digest:null,raw_diff_digest:null,repository_target:"github.com/acme/widgets"}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:"github.com",owner:"acme",repo:"widgets"},target:{head_oid:$head,kind:"pull-request",pr:1983}}')"
+mkdir -p "$CALLERPATCH_SHIP_HOME/completed"; printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — caller-patch observation.' > "$CALLERPATCH_SHIP_HOME/completed/$CALLERPATCH_SHIP_MARKER"
+CALLERPATCH_INPUT_DIGEST="$(printf '%s' "$CALLERPATCH_SHIP_INPUT" | sha256sum | awk '{print $1}')"; CALLERPATCH_ART_DIGEST="$(sha256sum "$CALLERPATCH_SHIP_HOME/completed/$CALLERPATCH_SHIP_MARKER" | awk '{print $1}')"
+CALLERPATCH_SHIP_RESULT="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg marker "$CALLERPATCH_SHIP_MARKER" --arg ib "$CALLERPATCH_INPUT_DIGEST" --arg digest "$CALLERPATCH_ART_DIGEST" --arg base "$PROOF_BASE" --arg head "$PROOF_HEAD" --arg raw "$SCOPED_RAW_DIGEST" '{accepted_epoch:1700018004,artifact:{digest:$digest,path:("completed/"+$marker)},contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,input_binding_digest:$ib,input_binding_identity:$marker,marker:$marker,named_choice:null,provenance:{outcome:"accepted",validated_epoch:1700018004},record_type:"review-result-binding/v1",record_version:1,ship_proof:{base_oid:$base,diff_digest:$raw,head_oid:$head},verdict:"SHIP"}')"
+PRO_GATE_HOME="$CALLERPATCH_SHIP_HOME" pg_review_input_binding_write "$CALLERPATCH_SHIP_MARKER" "$CALLERPATCH_SHIP_INPUT"; PRO_GATE_HOME="$CALLERPATCH_SHIP_HOME" pg_review_result_binding_write "$CALLERPATCH_SHIP_MARKER" "$CALLERPATCH_SHIP_RESULT"
+env PRO_GATE_HOME="$CALLERPATCH_SHIP_HOME" PRO_GATE_RUN_LOGS=0 bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --input bundle >"$TDIR/callerpatch-ship.json" 2>"$TDIR/callerpatch-ship.err"
+CALLERPATCH_SHIP_RC=$?
+check '#161 caller-patch SHIP never becomes merge eligibility' \
+  "$([ "$CALLERPATCH_SHIP_RC" -eq 0 ] && jq -e '.action!="allow-existing-merge-workflow"' "$TDIR/callerpatch-ship.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$CALLERPATCH_SHIP_RC output=$(cat "$TDIR/callerpatch-ship.json")"
+
 # pending/ deliberately has no result-binding store. Even exact-current connector bytes therefore
 # remain uncollected recovery data and cannot inherit the completed SHIP handoff route.
 CONNECTOR_PENDING_HOME="$TDIR/home-connector-pending"; CONNECTOR_PENDING_MARKER='pg-run-acme-widgets-1983-1700018002-3'
@@ -8119,6 +8473,76 @@ CONNECTOR_PENDING_RC=$?
 check 'exact pending connector SHIP is collect-only and never merge eligible' \
   "$([ "$CONNECTOR_PENDING_RC" -eq 0 ] && jq -e '.action=="collect-existing-result" and .action!="allow-existing-merge-workflow"' "$TDIR/connector-pending.json" >/dev/null 2>&1; echo $?)" \
   "rc=$CONNECTOR_PENDING_RC output=$(cat "$TDIR/connector-pending.json") stderr=$(cat "$TDIR/connector-pending.err")"
+
+# #147: a connector-delivered SHIP that reached completed/ can never be bound (no merge proof exists
+# for that mode), so the typed answer is a closed stop naming the mode and marker, not an endless
+# collect-existing-result. A FIX-FIRST connector result still binds (null proof) and routes to the
+# fixer, and a full-pr SHIP still repairs to the merge handoff. Every row below is built at the
+# repository's current head so each case is exact rather than a vacuous non-match.
+echo '# #147: unrepairable completed results stop typed instead of collecting forever'
+NB_HEAD="$(git -C "$DECISION_REPO" rev-parse HEAD)"
+NB_BASE="$(git -C "$DECISION_REPO" rev-parse HEAD^)"
+nb_connector_binding() { # marker epoch
+  jq -cS --arg marker "$1" --argjson epoch "$2" --arg head "$NB_HEAD" '.marker=$marker | .charged_spend_epoch=$epoch | .target.head_oid=$head | .evidence.identity=("connector:github.com/acme/widgets:" + $head) | .evidence.proof.commit_target=$head' <<<"$PC_CONNECTOR"
+}
+# (a) connector SHIP in completed/ with no result binding: typed stop, never collect, never merge.
+NB_SHIP_HOME="$TDIR/home-not-bindable-ship"; NB_SHIP_MARKER='pg-run-acme-widgets-1983-1700019000-1'
+mkdir -p "$NB_SHIP_HOME/completed"
+printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — connector observation.' > "$NB_SHIP_HOME/completed/$NB_SHIP_MARKER"
+NB_SHIP_BINDING="$(nb_connector_binding "$NB_SHIP_MARKER" 1700019000)"
+PRO_GATE_HOME="$NB_SHIP_HOME" pg_review_input_binding_write "$NB_SHIP_MARKER" "$NB_SHIP_BINDING"
+env PRO_GATE_HOME="$NB_SHIP_HOME" PRO_GATE_RUN_LOGS=0 bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --input connector >"$TDIR/nb-ship.json" 2>"$TDIR/nb-ship.err"
+NB_SHIP_RC=$?
+check 'connector SHIP in completed/ reduces to a typed stop with reason result-not-bindable-for-mode' \
+  "$([ "$NB_SHIP_RC" -eq 0 ] && jq -e '.action=="stop-without-new-review" and .reason=="result-not-bindable-for-mode" and .effect_request.execution_class=="report-only"' "$TDIR/nb-ship.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$NB_SHIP_RC output=$(cat "$TDIR/nb-ship.json") stderr=$(cat "$TDIR/nb-ship.err")"
+check 'typed stop carries the connector mode and the exact marker in its facts' \
+  "$(jq -e --arg marker "$NB_SHIP_MARKER" '.effect_request.applicable_ref==$marker and (.facts.completed_results|length==1) and .facts.completed_results[0].marker==$marker and .facts.completed_results[0].evidence_mode=="connector" and .facts.completed_results[0].bindable==false and .facts.completed_results[0].collected==false' "$TDIR/nb-ship.json" >/dev/null 2>&1; echo $?)" \
+  "output=$(cat "$TDIR/nb-ship.json")"
+# Replaying the stop as an effect is inert: no binding is repaired, nothing is written, no drift.
+NB_SHIP_STATE_BEFORE="$(find "$NB_SHIP_HOME" -mindepth 1 -printf '%P\n' | sort)"
+env PRO_GATE_HOME="$NB_SHIP_HOME" PRO_GATE_RUN_LOGS=0 bash "$ENGINE" --review-decision --review-decision-effect "$TDIR/nb-ship.json" --repo "$DECISION_REPO" --pr 1983 --input connector >"$TDIR/nb-ship-effect.json" 2>"$TDIR/nb-ship-effect.err"
+NB_SHIP_EFFECT_RC=$?
+NB_SHIP_STATE_AFTER="$(find "$NB_SHIP_HOME" -mindepth 1 -printf '%P\n' | sort)"
+check 'connector SHIP stop never repairs a result binding or becomes merge eligibility' \
+  "$([ "$NB_SHIP_EFFECT_RC" -eq 0 ] && [ "$NB_SHIP_STATE_AFTER" = "$NB_SHIP_STATE_BEFORE" ] && [ ! -e "$NB_SHIP_HOME/review-result-bindings/$NB_SHIP_MARKER" ] && jq -e '.action=="stop-without-new-review" and .reason=="result-not-bindable-for-mode"' "$TDIR/nb-ship-effect.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$NB_SHIP_EFFECT_RC output=$(cat "$TDIR/nb-ship-effect.json") stderr=$(cat "$TDIR/nb-ship-effect.err")"
+# (b) connector FIX-FIRST in completed/ is bindable: collect, repair with a null proof, then fix.
+NB_FIX_HOME="$TDIR/home-not-bindable-fix"; NB_FIX_MARKER='pg-run-acme-widgets-1983-1700019001-2'
+mkdir -p "$NB_FIX_HOME/completed"
+printf '%s\n' '[P1] a.sh:1 — fixture finding' 'P2: none' 'VERDICT: FIX-FIRST — connector observation.' > "$NB_FIX_HOME/completed/$NB_FIX_MARKER"
+NB_FIX_BINDING="$(nb_connector_binding "$NB_FIX_MARKER" 1700019001)"
+PRO_GATE_HOME="$NB_FIX_HOME" pg_review_input_binding_write "$NB_FIX_MARKER" "$NB_FIX_BINDING"
+env PRO_GATE_HOME="$NB_FIX_HOME" PRO_GATE_RUN_LOGS=0 bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --input connector >"$TDIR/nb-fix-collect.json" 2>"$TDIR/nb-fix-collect.err"
+NB_FIX_COLLECT_RC=$?
+check 'connector FIX-FIRST in completed/ is still collectable and marked bindable' \
+  "$([ "$NB_FIX_COLLECT_RC" -eq 0 ] && jq -e '.action=="collect-existing-result" and .reason=="completed-result-awaits-collection" and .facts.completed_results[0].bindable==true and .facts.completed_results[0].evidence_mode=="connector"' "$TDIR/nb-fix-collect.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$NB_FIX_COLLECT_RC output=$(cat "$TDIR/nb-fix-collect.json") stderr=$(cat "$TDIR/nb-fix-collect.err")"
+env PRO_GATE_HOME="$NB_FIX_HOME" PRO_GATE_RUN_LOGS=0 bash "$ENGINE" --review-decision --review-decision-effect "$TDIR/nb-fix-collect.json" --repo "$DECISION_REPO" --pr 1983 --input connector >"$TDIR/nb-fix-repair.json" 2>"$TDIR/nb-fix-repair.err"
+env PRO_GATE_HOME="$NB_FIX_HOME" PRO_GATE_RUN_LOGS=0 bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --input connector >"$TDIR/nb-fix-current.json" 2>"$TDIR/nb-fix-current.err"
+NB_FIX_CURRENT_RC=$?
+check 'repaired connector FIX-FIRST reduces to fix-review-findings' \
+  "$([ "$NB_FIX_CURRENT_RC" -eq 0 ] && [ -f "$NB_FIX_HOME/review-result-bindings/$NB_FIX_MARKER" ] && jq -e '.action=="fix-review-findings" and .reason=="review-findings-require-fix" and .facts.completed_results[0].collected==true and .facts.completed_results[0].evidence_mode=="connector"' "$TDIR/nb-fix-current.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$NB_FIX_CURRENT_RC repair=$(cat "$TDIR/nb-fix-repair.json") current=$(cat "$TDIR/nb-fix-current.json") stderr=$(cat "$TDIR/nb-fix-current.err")"
+# (c) full-pr SHIP in completed/ keeps its collect -> repair -> merge-handoff path unchanged.
+NB_FULL_HOME="$TDIR/home-not-bindable-full"; NB_FULL_MARKER='pg-run-acme-widgets-1983-1700019002-3'
+git -C "$DECISION_REPO" diff "$NB_BASE" "$NB_HEAD" > "$TDIR/nb-full.patch"
+NB_FULL_DIGEST="$(sha256sum "$TDIR/nb-full.patch" | awk '{print $1}')"
+NB_FULL_BINDING="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg marker "$NB_FULL_MARKER" --arg base "$NB_BASE" --arg head "$NB_HEAD" --arg digest "$NB_FULL_DIGEST" '{charged_spend_epoch:1700019002,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("full-pr:"+$base+":"+$head),mode:"full-pr",proof:{base_oid:$base,endpoint_digest:$digest,head_oid:$head,raw_patch_digest:$digest}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:"github.com",owner:"acme",repo:"widgets"},target:{head_oid:$head,kind:"pull-request",pr:1983}}')"
+mkdir -p "$NB_FULL_HOME/completed"
+printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — full endpoint reviewed.' > "$NB_FULL_HOME/completed/$NB_FULL_MARKER"
+PRO_GATE_HOME="$NB_FULL_HOME" pg_review_input_binding_write "$NB_FULL_MARKER" "$NB_FULL_BINDING"
+env PRO_GATE_HOME="$NB_FULL_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/nb-full.patch" bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/nb-full.patch" --input bundle >"$TDIR/nb-full-collect.json" 2>"$TDIR/nb-full-collect.err"
+NB_FULL_COLLECT_RC=$?
+check 'full-pr SHIP in completed/ is collectable and marked bindable' \
+  "$([ "$NB_FULL_COLLECT_RC" -eq 0 ] && jq -e '.action=="collect-existing-result" and .facts.completed_results[0].bindable==true and .facts.completed_results[0].evidence_mode=="full-pr"' "$TDIR/nb-full-collect.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$NB_FULL_COLLECT_RC output=$(cat "$TDIR/nb-full-collect.json") stderr=$(cat "$TDIR/nb-full-collect.err")"
+env PRO_GATE_HOME="$NB_FULL_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/nb-full.patch" bash "$ENGINE" --review-decision --review-decision-effect "$TDIR/nb-full-collect.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/nb-full.patch" --input bundle >"$TDIR/nb-full-repair.json" 2>"$TDIR/nb-full-repair.err"
+env PRO_GATE_HOME="$NB_FULL_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/nb-full.patch" bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/nb-full.patch" --input bundle >"$TDIR/nb-full-current.json" 2>"$TDIR/nb-full-current.err"
+NB_FULL_CURRENT_RC=$?
+check 'repaired full-pr SHIP still reduces to allow-existing-merge-workflow' \
+  "$([ "$NB_FULL_CURRENT_RC" -eq 0 ] && jq -e '.action=="allow-existing-merge-workflow" and .reason=="current-ship-is-merge-eligible"' "$TDIR/nb-full-current.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$NB_FULL_CURRENT_RC repair=$(cat "$TDIR/nb-full-repair.json") current=$(cat "$TDIR/nb-full-current.json") stderr=$(cat "$TDIR/nb-full-current.err")"
 
 # U2 (#167): the run-marker echo is EXTRACTED case-insensitively but COMPARED case-sensitively.
 # This release folds case in the browser-side CONVICTION predicates only (cdp-salvage.mjs), where a
@@ -8184,5 +8608,116 @@ if command -v localedef >/dev/null 2>&1 \
 else
   echo 'ok - Turkish-locale fold case skipped (localedef unavailable, or grep -i is already locale-independent on this host)'
 fi
+
+# #212 step 2: cgroup-scoped browser memory sentinel. pg_mem_headroom_ok (host-wide free -m) can't
+# see a cgroup MemoryHigh/MemoryMax throttle while host RAM is idle -- PR #209 rounds 4-5 measured
+# exactly that (VmHWM 7.63 GiB, cgroup 8.42/8.59 GB). All decision logic lives in lib.sh, source-safe.
+echo '# pg_cgroup_mem_pct: percent of memory.current over the effective limit, fail-open on any gap'
+MEM_DIR="$TDIR/mem-sentinel"; mkdir -p "$MEM_DIR/fix-normal" "$MEM_DIR/fix-high-max" "$MEM_DIR/fix-no-limit" "$MEM_DIR/fix-missing-current"
+printf '850\n' > "$MEM_DIR/fix-normal/memory.current"; printf '1000\n' > "$MEM_DIR/fix-normal/memory.high"; printf '2000\n' > "$MEM_DIR/fix-normal/memory.max"
+printf '500\n' > "$MEM_DIR/fix-high-max/memory.current"; printf 'max\n' > "$MEM_DIR/fix-high-max/memory.high"; printf '1000\n' > "$MEM_DIR/fix-high-max/memory.max"
+printf '500\n' > "$MEM_DIR/fix-no-limit/memory.current"; printf 'max\n' > "$MEM_DIR/fix-no-limit/memory.high"; printf 'max\n' > "$MEM_DIR/fix-no-limit/memory.max"
+printf '500\n' > "$MEM_DIR/fix-missing-current/memory.high"; printf 'max\n' > "$MEM_DIR/fix-missing-current/memory.max"
+PCT_NORMAL="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_cgroup_mem_pct '$MEM_DIR/fix-normal'")"
+check 'pg_cgroup_mem_pct: current 850 over high 1000 -> 85' "$([ "$PCT_NORMAL" = 85 ]; echo $?)" "got=[$PCT_NORMAL]"
+PCT_HIGHMAX="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_cgroup_mem_pct '$MEM_DIR/fix-high-max'")"
+check 'pg_cgroup_mem_pct: high=max falls back to max -> 50' "$([ "$PCT_HIGHMAX" = 50 ]; echo $?)" "got=[$PCT_HIGHMAX]"
+PCT_NOLIMIT="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_cgroup_mem_pct '$MEM_DIR/fix-no-limit'")"
+check 'pg_cgroup_mem_pct: high=max and max=max -> empty (no limit, fail-open)' "$([ -z "$PCT_NOLIMIT" ]; echo $?)" "got=[$PCT_NOLIMIT]"
+PCT_MISSING="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_cgroup_mem_pct '$MEM_DIR/fix-missing-current'")"
+check 'pg_cgroup_mem_pct: missing memory.current -> empty (fail-open)' "$([ -z "$PCT_MISSING" ]; echo $?)" "got=[$PCT_MISSING]"
+
+# gate r2 P2 (v0.53.0): the effective limit is the smaller finite positive of memory.high and
+# memory.max. A finite memory.high ABOVE memory.max (an operator MemoryHigh drop-in over the
+# shipped MemoryMax) must not hide the hard line: 3500 over max 4000 is 87, not 43 against high.
+mkdir -p "$MEM_DIR/fix-high-above-max" "$MEM_DIR/fix-max-above-high"
+printf '3500\n' > "$MEM_DIR/fix-high-above-max/memory.current"; printf '8000\n' > "$MEM_DIR/fix-high-above-max/memory.high"; printf '4000\n' > "$MEM_DIR/fix-high-above-max/memory.max"
+printf '3500\n' > "$MEM_DIR/fix-max-above-high/memory.current"; printf '4000\n' > "$MEM_DIR/fix-max-above-high/memory.high"; printf '8000\n' > "$MEM_DIR/fix-max-above-high/memory.max"
+PCT_HIGH_ABOVE_MAX="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_cgroup_mem_pct '$MEM_DIR/fix-high-above-max'")"
+check 'pg_cgroup_mem_pct gate r2 P2: a finite high above max reports against max (3500/4000 -> 87)' "$([ "$PCT_HIGH_ABOVE_MAX" = 87 ]; echo $?)" "got=[$PCT_HIGH_ABOVE_MAX]"
+PCT_MAX_ABOVE_HIGH="$(bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_cgroup_mem_pct '$MEM_DIR/fix-max-above-high'")"
+check 'pg_cgroup_mem_pct gate r2 P2: a finite max above high reports against high (3500/4000 -> 87)' "$([ "$PCT_MAX_ABOVE_HIGH" = 87 ]; echo $?)" "got=[$PCT_MAX_ABOVE_HIGH]"
+MEM_HOME_R2="$TDIR/mem-sentinel/home-r2"; mkdir -p "$MEM_HOME_R2"
+PRO_GATE_HOME="$MEM_HOME_R2" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_browser_mem_sampler_tick '$MEM_DIR/fix-high-above-max'"
+PRO_GATE_HOME="$MEM_HOME_R2" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_browser_mem_sampler_tick '$MEM_DIR/fix-high-above-max'"
+check 'sampler tick gate r2 P2: two samples at 87% of a lower memory.max arm the sentinel despite a higher memory.high' \
+  "$([ -f "$MEM_HOME_R2/browser.memory-pressure" ]; echo $?)" "$(ls "$MEM_HOME_R2" 2>/dev/null | tr '\n' ' ')"
+
+echo '# pg_browser_mem_sampler_tick: sentinel arms on the 2nd consecutive high sample, not the 1st'
+MEM_HOME1="$TDIR/mem-sentinel/home-arm"; mkdir -p "$MEM_HOME1"
+PRO_GATE_HOME="$MEM_HOME1" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_browser_mem_sampler_tick '$MEM_DIR/fix-normal'"
+check 'sampler tick: a single high sample does not arm the sentinel' "$([ ! -f "$MEM_HOME1/browser.memory-pressure" ]; echo $?)" "$([ -f "$MEM_HOME1/browser.memory-pressure" ] && cat "$MEM_HOME1/browser.memory-pressure")"
+PRO_GATE_HOME="$MEM_HOME1" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_browser_mem_sampler_tick '$MEM_DIR/fix-normal'"
+check 'sampler tick: two consecutive high samples arm the sentinel' "$([ -f "$MEM_HOME1/browser.memory-pressure" ]; echo $?)" "sentinel missing"
+check 'sampler tick: sentinel content is "<pct> <epoch>"' "$(awk 'NF==2 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/{exit 0} {exit 1}' "$MEM_HOME1/browser.memory-pressure"; echo $?)" "$(cat "$MEM_HOME1/browser.memory-pressure")"
+
+echo '# pg_browser_mem_sampler_tick planted negative: one high sample then one low sample never arms'
+MEM_HOME2="$TDIR/mem-sentinel/home-noarm"; mkdir -p "$MEM_HOME2"
+PRO_GATE_HOME="$MEM_HOME2" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_browser_mem_sampler_tick '$MEM_DIR/fix-normal'"
+PRO_GATE_HOME="$MEM_HOME2" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_browser_mem_sampler_tick '$MEM_DIR/fix-high-max'"
+check 'sampler tick: high then low leaves no sentinel (planted negative)' "$([ ! -f "$MEM_HOME2/browser.memory-pressure" ]; echo $?)" "$([ -f "$MEM_HOME2/browser.memory-pressure" ] && cat "$MEM_HOME2/browser.memory-pressure")"
+
+echo '# pg_browser_mem_sampler_tick discriminator: a THIRD (high) tick after the high-then-low pair'
+echo '# must not skip straight to armed -- proves the low sample RESETS the streak to 0, not just'
+echo '# skips the increment (a no-op variant would reach 2 here and wrongly arm) (review finding P2 #1)'
+PRO_GATE_HOME="$MEM_HOME2" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_browser_mem_sampler_tick '$MEM_DIR/fix-normal'"
+check 'sampler tick: high-low-high (3 ticks) still does not arm -- low sample resets, not a no-op' \
+  "$([ ! -f "$MEM_HOME2/browser.memory-pressure" ]; echo $?)" "$([ -f "$MEM_HOME2/browser.memory-pressure" ] && cat "$MEM_HOME2/browser.memory-pressure")"
+
+echo '# pg_browser_mem_sampler_loop: a leftover streak from a prior (e.g. crashed) invocation must not'
+echo '# carry into a fresh loop start -- it clears .browser-mem-streak/browser.memory-pressure before'
+echo '# its first tick, and killing its PID must not orphan its in-flight sleep (review findings P1 #1, P2 #2)'
+MEM_HOME6="$TDIR/mem-sentinel/home-restart"; mkdir -p "$MEM_HOME6"
+PRO_GATE_HOME="$MEM_HOME6" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_browser_mem_sampler_tick '$MEM_DIR/fix-normal'"
+check 'restart fixture: one high tick from the "prior run" leaves streak=1, no sentinel' \
+  "$([ "$(cat "$MEM_HOME6/.browser-mem-streak" 2>/dev/null)" = 1 ] && [ ! -f "$MEM_HOME6/browser.memory-pressure" ]; echo $?)" "streak=$(cat "$MEM_HOME6/.browser-mem-streak" 2>/dev/null)"
+PRO_GATE_HOME="$MEM_HOME6" PRO_GATE_BROWSER_MEM_SAMPLE_SECS=1000 bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_browser_mem_sampler_loop '$MEM_DIR/fix-normal'" &
+LOOP_PID_RESTART=$!
+sleep 0.5
+# Capture the sleep child's OWN pid before killing the loop -- once the loop (its parent) is
+# killed, the orphaned sleep is reparented away, so `pgrep -P <loop-pid>` would find nothing
+# AFTER the kill regardless of whether the orphan is still running. Track the specific pid instead.
+LOOP_SLEEP_PID="$(pgrep -P "$LOOP_PID_RESTART" 2>/dev/null | head -1)"
+kill "$LOOP_PID_RESTART" 2>/dev/null
+timeout 3 wait "$LOOP_PID_RESTART" 2>/dev/null
+sleep 0.3
+LOOP_SLEEP_SURVIVED=1
+[ -n "$LOOP_SLEEP_PID" ] && ! kill -0 "$LOOP_SLEEP_PID" 2>/dev/null && LOOP_SLEEP_SURVIVED=0
+[ -z "$LOOP_SLEEP_PID" ] && LOOP_SLEEP_SURVIVED=2
+check 'fresh loop invocation: leftover streak does not arm the sentinel on its first tick' \
+  "$([ ! -f "$MEM_HOME6/browser.memory-pressure" ]; echo $?)" "$([ -f "$MEM_HOME6/browser.memory-pressure" ] && cat "$MEM_HOME6/browser.memory-pressure")"
+check 'fresh loop invocation: streak after first tick is 1 (reset then incremented once), not 2+' \
+  "$([ "$(cat "$MEM_HOME6/.browser-mem-streak" 2>/dev/null)" = 1 ]; echo $?)" "streak=$(cat "$MEM_HOME6/.browser-mem-streak" 2>/dev/null)"
+check 'sampler loop: killing its PID leaves no orphaned sleep child behind' \
+  "$([ "$LOOP_SLEEP_SURVIVED" -eq 0 ]; echo $?)" "sleep_pid=$LOOP_SLEEP_PID survived_flag=$LOOP_SLEEP_SURVIVED (0=reaped,1=orphan survived,2=never observed)"
+
+echo '# pg_health_gate: a fresh browser-memory sentinel defers the slot; a stale one does not'
+# Isolated from live Chrome CDP/systemd state, matching the doctor tests below and every other
+# pg_health_gate-touching test in this file: without this, the remote-chrome branch runs first
+# (lib:663) and on a host/CI runner with no live CDP session on the port it fails for the wrong
+# reason (and attempts a real `sudo -n systemctl start oracle-chrome` self-heal) instead of
+# reaching the new pg_browser_mem_pressure check at all (review finding P1, gate round 2).
+MEM_HOME3="$TDIR/mem-sentinel/home-gate"; mkdir -p "$MEM_HOME3"
+printf '92 %s\n' "$(date +%s)" > "$MEM_HOME3/browser.memory-pressure"
+MEM_GATE_FRESH="$(PRO_GATE_HOME="$MEM_HOME3" PRO_GATE_BROWSER_MODE=native PRO_GATE_SERVICE_MANAGER=none bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_health_gate")"
+MEM_GATE_FRESH_RC=$?
+check 'pg_health_gate: fresh browser-memory sentinel returns 1' "$([ "$MEM_GATE_FRESH_RC" -eq 1 ]; echo $?)" "rc=$MEM_GATE_FRESH_RC out=[$MEM_GATE_FRESH]"
+check 'pg_health_gate: reason names the percent, sentinel age, and no-spend deferral' \
+  "$(case "$MEM_GATE_FRESH" in *'92%'*'sentinel '*'s old'*'no quota spent'*) echo 0;; *) echo 1;; esac)" "$MEM_GATE_FRESH"
+touch -d '@0' "$MEM_HOME3/browser.memory-pressure"
+MEM_GATE_STALE="$(PRO_GATE_HOME="$MEM_HOME3" PRO_GATE_BROWSER_MODE=native PRO_GATE_SERVICE_MANAGER=none bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_health_gate")"
+MEM_GATE_STALE_RC=$?
+check 'pg_health_gate: stale (mtime beyond TTL) browser-memory sentinel does not block' "$([ "$MEM_GATE_STALE_RC" -eq 0 ]; echo $?)" "rc=$MEM_GATE_STALE_RC out=[$MEM_GATE_STALE]"
+
+echo '# doctor: prints the browser-memory pressure P/W line beside the host-memory line'
+MEM_HOME4="$TDIR/mem-sentinel/home-doctor-fresh"; mkdir -p "$MEM_HOME4"
+printf '90 %s\n' "$(date +%s)" > "$MEM_HOME4/browser.memory-pressure"
+DOCTOR_MEM_FRESH="$(PRO_GATE_HOME="$MEM_HOME4" PRO_GATE_BROWSER_MODE=native PRO_GATE_SERVICE_MANAGER=none bash "$HERE/../bin/pro-gate-doctor.sh" 2>&1 || true)"
+check 'doctor: fresh sentinel prints the browser memory pressure warning line' \
+  "$(printf '%s' "$DOCTOR_MEM_FRESH" | grep -qF 'browser memory pressure: browser cgroup memory at 90%'; echo $?)" "$DOCTOR_MEM_FRESH"
+MEM_HOME5="$TDIR/mem-sentinel/home-doctor-clear"; mkdir -p "$MEM_HOME5"
+DOCTOR_MEM_CLEAR="$(PRO_GATE_HOME="$MEM_HOME5" PRO_GATE_BROWSER_MODE=native PRO_GATE_SERVICE_MANAGER=none bash "$HERE/../bin/pro-gate-doctor.sh" 2>&1 || true)"
+check 'doctor: no sentinel prints "browser memory pressure: none"' \
+  "$(printf '%s' "$DOCTOR_MEM_CLEAR" | grep -qF 'browser memory pressure: none'; echo $?)" "$DOCTOR_MEM_CLEAR"
 
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }
