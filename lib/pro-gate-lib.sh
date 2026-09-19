@@ -635,7 +635,10 @@ pg_browser_mem_sampler_heartbeat() {
 # pg_browser_mem_sampler_state: one line on stdout and rc 0 when the sampler's heartbeat is fresh
 # (within four sample intervals, at least 20s) and its pid is alive: "live (pid N, last sample Ns
 # ago)". Otherwise rc 1 with "absent", "stale (...)" or "dead (...)". Read by the doctor; the
-# health gate deliberately does NOT consult it (a missing sampler must stay fail-open).
+# health gate deliberately does NOT consult it (a missing sampler must stay fail-open). Known
+# limit: a loop killed with SIGKILL leaves its last stamp, and if the kernel recycles that pid
+# for an unrelated process inside the freshness window (20 s by default) the reader says live
+# for the rest of that window; the next doctor run corrects it.
 pg_browser_mem_sampler_state() {
   local f="${PRO_GATE_HOME:-}/browser.memory-sampler" secs win mt age pid
   [ -n "${PRO_GATE_HOME:-}" ] && [ -f "$f" ] || { echo absent; return 1; }

@@ -8720,7 +8720,10 @@ DOCTOR_SAMPLER_LIVE="$(PRO_GATE_HOME="$MEM_HOME7" PRO_GATE_BROWSER_MODE=native P
 check 'gate r3 P2 doctor: a live sampler prints the live line' "$(printf '%s' "$DOCTOR_SAMPLER_LIVE" | grep -q 'browser memory sampler: live (pid'; echo $?)" "$(printf '%s' "$DOCTOR_SAMPLER_LIVE" | grep 'browser memory sampler')"
 rm -f "$MEM_HOME7/browser.memory-sampler"
 DOCTOR_SAMPLER_NONE="$(PRO_GATE_HOME="$MEM_HOME7" PRO_GATE_BROWSER_MODE=native PRO_GATE_SERVICE_MANAGER=none bash "$HERE/../bin/pro-gate-doctor.sh" 2>&1 || true)"
-check 'gate r3 P2 doctor: no sampler with no service manager is reported inactive, not as a warning' "$(printf '%s' "$DOCTOR_SAMPLER_NONE" | grep -q 'browser memory sampler: not running (absent; the browser is not managed'; echo $?)" "$(printf '%s' "$DOCTOR_SAMPLER_NONE" | grep 'browser memory sampler')"
+check 'gate r3 P2 doctor: no sampler with no service manager is reported inactive, not as a warning' "$(printf '%s' "$DOCTOR_SAMPLER_NONE" | grep -q 'browser memory sampler: not running (absent; no pro-gate browser service'; echo $?)" "$(printf '%s' "$DOCTOR_SAMPLER_NONE" | grep 'browser memory sampler')"
+# launchd ships no oracle-chrome unit, so a macOS host must never be told to restart one (review P1).
+DOCTOR_SAMPLER_LAUNCHD="$(PRO_GATE_HOME="$MEM_HOME7" PRO_GATE_BROWSER_MODE=native PRO_GATE_SERVICE_MANAGER=launchd bash "$HERE/../bin/pro-gate-doctor.sh" 2>&1 || true)"
+check 'gate r3 P2 doctor: no sampler under launchd is reported inactive and never told to restart a systemd unit' "$(printf '%s' "$DOCTOR_SAMPLER_LAUNCHD" | grep -q 'browser memory sampler: not running (absent; no pro-gate browser service' && ! printf '%s' "$DOCTOR_SAMPLER_LAUNCHD" | grep -q 'restart oracle-chrome.service'; echo $?)" "$(printf '%s' "$DOCTOR_SAMPLER_LAUNCHD" | grep 'browser memory sampler')"
 DOCTOR_SAMPLER_SYSTEMD="$(PRO_GATE_HOME="$MEM_HOME7" PRO_GATE_BROWSER_MODE=native PRO_GATE_SERVICE_MANAGER=systemd bash "$HERE/../bin/pro-gate-doctor.sh" 2>&1 || true)"
 check 'gate r3 P2 doctor: no sampler under systemd warns and names the oracle-chrome.service restart' "$(printf '%s' "$DOCTOR_SAMPLER_SYSTEMD" | grep -q 'browser memory sampler: not running (absent) .* restart oracle-chrome.service'; echo $?)" "$(printf '%s' "$DOCTOR_SAMPLER_SYSTEMD" | grep 'browser memory sampler')"
 

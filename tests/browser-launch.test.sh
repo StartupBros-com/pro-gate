@@ -121,6 +121,26 @@ else
   pass 'wrapper cleans up Xvfb after Chrome exits'
 fi
 
+# gate r3 P2 (review P1): the wrapper must actually background the sampler loop when the runtime lib
+# defines it, pass it the cgroup directory, and stop it on cleanup. Every earlier case stubs a lib
+# WITHOUT the function, so deleting the dispatch block used to pass this whole file. Here the lib
+# stub defines the loop as a marker-writing sleeper, the preflight sees no listener (no SS_LISTENER)
+# so it proceeds, and the readiness probe succeeds (CURL_STATUS=0) so the dispatch is reached.
+SAMPLER="$TDIR/sampler"
+make_fixture "$SAMPLER"
+cat >> "$SAMPLER/runtime/lib.sh" <<'SAMPLER_LIB'
+pg_browser_cgroup_dir() { printf '%s\n' "$SAMPLER_CGROUP"; }
+pg_browser_mem_sampler_loop() { printf '%s %s\n' "$BASHPID" "$1" > "$SAMPLER_MARKER_FILE"; trap 'exit 0' TERM INT; while :; do sleep 1; done; }
+SAMPLER_LIB
+HOME="$SAMPLER/home" PRO_GATE_HOME="$SAMPLER/runtime" ORACLE_DISPLAY="$TEST_DISPLAY" PATH="$SAMPLER/bin:/usr/bin:/bin" \
+  CURL_STATUS=0 CHROME_SLEEP=2 XVFB_PID_FILE="$SAMPLER/xvfb.pid" CHROME_ARGS_FILE="$SAMPLER/chrome.args" \
+  SAMPLER_MARKER_FILE="$SAMPLER/sampler.marker" SAMPLER_CGROUP="/sys/fs/cgroup/fixture-slice" \
+  bash "$ROOT/daemon/run-oracle-chrome.sh" >"$SAMPLER/ok.log" 2>&1
+check 'wrapper starts the memory sampler loop when the runtime defines it' test -s "$SAMPLER/sampler.marker"
+check 'wrapper hands the sampler its cgroup directory' grep -q -- ' /sys/fs/cgroup/fixture-slice$' "$SAMPLER/sampler.marker"
+SAMPLER_LOOP_PID="$(cut -d' ' -f1 "$SAMPLER/sampler.marker" 2>/dev/null)"
+check 'wrapper cleanup stops the sampler loop after Chrome exits' sh -c '[ -n "$1" ] && ! kill -0 "$1" 2>/dev/null' sh "$SAMPLER_LOOP_PID"
+
 [ "$FAILS" -eq 0 ] && { echo 'ALL PASS'; exit 0; }
 printf '%s FAILURES\n' "$FAILS" >&2
 exit 1

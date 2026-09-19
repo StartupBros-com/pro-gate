@@ -258,8 +258,8 @@ else W "browser memory pressure: ${browser_mem_reason}"; fi
 # gate r3 P2: "no pressure" is only meaningful while the sampler runs. It starts with the browser
 # wrapper, and an upgrade never restarts a running browser, so say so where the operator looks.
 if sampler_state="$(pg_browser_mem_sampler_state)"; then P "browser memory sampler: ${sampler_state}"
-elif [ "$SVC" = none ]; then P "browser memory sampler: not running (${sampler_state}; the browser is not managed by pro-gate's service, so the cgroup sentinel is inactive)"
-else W "browser memory sampler: not running (${sampler_state}) — the sentinel starts with the browser wrapper and an upgrade does not restart a running browser; once --status shows no review in flight, restart oracle-chrome.service to activate it"; fi
+elif [ "$SVC" = systemd ]; then W "browser memory sampler: not running (${sampler_state}) — the sentinel starts with the browser wrapper and an upgrade does not restart a running browser; once --status shows no review in flight, start or restart oracle-chrome.service to activate it"
+else P "browser memory sampler: not running (${sampler_state}; no pro-gate browser service on this platform, so the cgroup sentinel is inactive)"; fi
 
 # config
 [ -n "${PRO_REVIEW_OWNERS:-}" ] && P "PRO_REVIEW_OWNERS='${PRO_REVIEW_OWNERS}'" || W "PRO_REVIEW_OWNERS unset (daemon needs it; interactive /pro-gate does not)"
