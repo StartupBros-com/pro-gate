@@ -2009,7 +2009,7 @@ gscore() { # $1=key -> "earned<TAB>streak<TAB>elapsed_secs<TAB>scored" from pg_r
 # gate r1 P2 (#174, v0.53.0): the facts builder bounds the exported arrow to the latest 32 counts
 # while the counters still score the whole in-window history. 33 strictly shrinking rounds are
 # legitimate in advisory mode (streak 0); their arrow must serialize as 32 entries, not 33.
-gseed arrow33 40 39 38 37 36 35 34 33 32 31 30 29 28 27 26 25 24 23 22 21 20 19 18 17 16 15 14 13 12 11 10 9 8
+ghist arrow33 40 39 38 37 36 35 34 33 32 31 30 29 28 27 26 25 24 23 22 21 20 19 18 17 16 15 14 13 12 11 10 9 8
 ARROW33_GOV="$(env PRO_GATE_HOME="$GHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_governor_facts_json arrow33 true")"
 check '#174 gate r1 P2: governor facts bound the exported arrow to the latest 32 counts' \
   "$(jq -e '(.arrow|length)==32 and .scored==33 and .arrow[0]==39 and .arrow[-1]==8 and .streak==0 and .earned==32' <<<"$ARROW33_GOV" >/dev/null 2>&1; echo $?)" \
