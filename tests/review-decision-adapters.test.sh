@@ -45,11 +45,11 @@ validate_contract_and_corpus() { # contract corpus
     (.base_facts | keys | sort) == ["active_index","completed_results","cooldown","evidence","governor","input","named_choice","observation","prior_review","reservation","target","transport"] and
     .base_facts.transport == "review-decision/v1" and
     ([.. | objects | keys[] | select(. == "status" or . == "next_action")] | length == 0) and
-    (.cases | length == 9) and
+    (.cases | length == 14) and
     ([.cases[].expected.action] | unique | sort) == ([$contract[0].action_effects[].action] | sort) and
     ([.cases[] | select(.expected.action != .expected.effect)] | length == 0) and
     ([.cases[] | select(.expected.execution_class == "named-product-choice") | .expected.action] == ["ask-named-product-choice"]) and
-    ([.cases[] | select(.expected.execution_class != "named-product-choice") | .expected.action] | length == 8) and
+    ([.cases[] | select(.expected.execution_class != "named-product-choice") | .expected.action] | length == 13) and
     any(.cases[]; .expected.reason == "account-cooldown-active" and .patch.cooldown.active == true) and
     (.base_facts.cooldown == {active:false,seconds_remaining:0})
   ' "$corpus" >/dev/null || return 1
@@ -210,6 +210,16 @@ jq -c '.facts.completed_results[0].bindable=true' "$TMP/bindable-removed.json" >
 check 'the same envelope with bindable restored validates again' \
   "$(pg_review_decision_envelope_valid "$TMP/bindable-restored.json" >/dev/null 2>&1; printf '%s' "$?")" \
   "$(cat "$TMP/bindable-restored.json")"
+# #174: the governor shape validator's keys_are(...) allowlist is exact, so a fact object missing
+# a required trajectory key (here: governor.arrow, deleted after the corpus merge) must never
+# silently pass through as a grant or any other action -- it is undefined-state, closed.
+UNDEFINED_ARROW_FACTS="$(jq -cS --arg cd "$CONTRACT_DIGEST" --arg xd "$CORPUS_DIGEST" '
+  .base_facts | .contract={contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,corpus_digest:$xd} |
+  del(.governor.arrow)' "$CORPUS")"
+UNDEFINED_ARROW_DECISION="$(pg_review_decision_reduce "$UNDEFINED_ARROW_FACTS")"
+check 'a governor object missing the arrow key is rejected as undefined-state, not silently granted' \
+  "$(jq -e '.action=="stop-without-new-review" and .reason=="undefined-state"' <<<"$UNDEFINED_ARROW_DECISION" >/dev/null 2>&1; printf '%s' "$?")" \
+  "$UNDEFINED_ARROW_DECISION"
 
 # gate #148 r8 P1: a prose consumer must NOT pin the wait at all. The engine treats any --timeout
 # it receives as final (bin/oracle-review.sh: `if [ -z "$TIMEOUT" ]`), so a skill or relay that

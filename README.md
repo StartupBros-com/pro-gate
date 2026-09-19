@@ -371,6 +371,7 @@ an endless collect. Use `bundle` or `both` for the final round.
 | `PRO_GATE_ROUNDS_CEILING` | `8` advisory | Computed trajectory ceiling; explicitly setting it enables enforcement |
 | `PRO_GATE_MAX_ROUNDS_PER_PR` | *(unset)* | Explicit legacy flat-cap enforcement (`0` = lockdown) |
 | `PRO_GATE_ROUNDS_WINDOW` | `24h` | The rolling telemetry/enforcement window |
+| `PRO_GATE_ROUNDS_CONTINUE` | *(unset)* | Set `1` to let ONE query/effect proceed past a `rounds-not-converging` stop (review-decision/v1) despite the churn streak; stateless, same one-invocation idiom as `PRO_GATE_FORCE_ROUND`, and independent of `PRO_GATE_ROUND_GUARD`'s advisory/enforced/lockdown mode |
 | `PRO_GATE_MAX_DIFF_LINES` | `6000` | Above this a run proceeds but usually lands in-progress → harvest |
 | `PRO_GATE_DIFF_HARD_MAX` | `25000` | Above this the engine refuses (exit 11, no spend) |
 | `PRO_GATE_MAX_CONCURRENCY` | `1` | Ceiling for parallel Pro chats; a ramp governor earns up to it on clean streaks |
@@ -437,6 +438,11 @@ semantics. Native mode keeps the prompt's title hint and does not run remote-CDP
   open-P0/P1 trajectory, churn, and elapsed time remain visible advice, but default unset
   configuration does not ration unobservable ChatGPT subscription capacity. Operators who need
   hard automation containment can explicitly enable the trajectory governor, flat cap, or lockdown.
+  Independent of that policy mode, a change whose open-P0/P1 trajectory has not shrunk for 2
+  consecutive re-reviews gets a typed `stop-without-new-review` / `rounds-not-converging` decision
+  in place of a new round grant or a fix dispatch — this is a churn signal, not a budget one, so it
+  fires even in advisory mode. `PRO_GATE_ROUNDS_CONTINUE=1` lets one more round through anyway; the
+  daemon and the wrapper's loop both end a run on any `stop-without-new-review` reason the same way.
 - **Merge authority**: the daemon never merges directly; it stops after pushing fixes and
   commenting. The surrounding agent may arm squash auto-merge only after local verification,
   adversarial review, and required exact-head CI are green.

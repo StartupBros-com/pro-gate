@@ -2706,6 +2706,41 @@ pg_round_guard() {  # $1 = key. 0 = proceed; 1 + a one-line reason on stdout = e
   return 0
 }
 
+# pg_round_continue_override: true when PRO_GATE_ROUNDS_CONTINUE=1 grants THIS query a one-shot
+# pass through the review-decision reducer's rounds-not-converging stop (#174 R2). Read fresh on
+# every call, never written to disk and never remembered past this process — the same stateless,
+# one-invocation idiom as PRO_GATE_FORCE_ROUND (see pg_round_guard above). The reducer itself
+# stays a pure function of its facts (daemon.sh replays pg_review_decision_envelope_valid against
+# a saved decision in a process that never carries this env), so the override is resolved HERE,
+# at facts-build time, and threaded into governor.continue_override rather than re-read later.
+pg_round_continue_override() { [ "${PRO_GATE_ROUNDS_CONTINUE:-0}" = 1 ]; }
+
+# pg_round_governor_facts_json <key> <granted:true|false>: single-line JSON governor object
+# {arrow,continue_override,earned,grant,granted,policy_mode,scored,streak} for the
+# review-decision/v1 facts builders (#174 R5/R6). Every trajectory value is read straight from
+# pg_round_score's own globals and pg_round_policy_mode's own accessor for <key> — no review text
+# is parsed and no value is duplicated as a second jq literal. <granted> is the boolean the caller
+# already resolved via pg_round_guard; this function does not recompute it. Must be called
+# IN-SHELL by callers that also need pg_round_score's globals afterward, same as pg_round_score
+# itself (a command-substitution subshell would drop them silently).
+pg_round_governor_facts_json() {
+  local key="$1" granted="$2" arrow_json policy_mode continue_override=false
+  pg_round_score "$key"
+  policy_mode="$(pg_round_policy_mode "$key")"
+  if [ -z "$PG_ROUND_ARROW" ]; then
+    arrow_json='[]'
+  else
+    arrow_json="$(printf '%s' "$PG_ROUND_ARROW" | jq -R -c 'split("→") | map(tonumber)' 2>/dev/null)"
+    case "$arrow_json" in ''|null) arrow_json='[]';; esac
+  fi
+  pg_round_continue_override && continue_override=true
+  jq -cn --argjson granted "$granted" --argjson scored "$PG_ROUND_SCORED" --argjson arrow "$arrow_json" \
+    --argjson earned "$PG_ROUND_EARNED" --argjson streak "$PG_ROUND_STREAK" --argjson grant "$PG_ROUND_GRANT" \
+    --arg policy_mode "$policy_mode" --argjson continue_override "$continue_override" '
+    {arrow:$arrow,continue_override:$continue_override,earned:$earned,grant:$grant,granted:$granted,
+     policy_mode:$policy_mode,scored:$scored,streak:$streak}'
+}
+
 # pg_filter_diff <in> <out>: strip diff sections for noise paths (lockfiles, generated,
 # vendored, minified, snapshots) so the Pro model spends its thinking budget on real code and
 # its review window stays short. Writes the filtered unified diff to <out>; prints each
@@ -3155,8 +3190,8 @@ pg_completed_lookup() {  # <marker> <out>: place the artifact at <out>; rc 0 on 
 # ─────────────────────────────────────────────────────────────────────────────
 PG_REVIEW_DECISION_CONTRACT_ID='review-decision/v1'
 PG_REVIEW_DECISION_CONTRACT_VERSION=1
-PG_REVIEW_DECISION_CONTRACT_DIGEST='7a057926a42d4df0de94db856e3637c3b71e114672038d583d7513f7396fe911'
-PG_REVIEW_DECISION_CORPUS_DIGEST='e7e85192681887b97924b594ca8ab544b9f9e54cd758d339571dc638190d80e2'
+PG_REVIEW_DECISION_CONTRACT_DIGEST='5fcd19c12600061af6d90ed9cb980dd7067cff199c374910639003eec4caf5c3'
+PG_REVIEW_DECISION_CORPUS_DIGEST='c7e8b55a5ebbf190a0bda93ae7367820cd3f9ffb8092a4998ff58bb0513aadc6'
 
 pg_review_decision_contract_id() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_ID"; }
 pg_review_decision_contract_version() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_VERSION"; }
@@ -3326,7 +3361,7 @@ pg_review_decision_envelope_valid() { # decision-file
 
 pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read stdin
   local supplied canonical snapshot unsafe valid reason selected selected_ref selected_count
-  local action prior prior_applicable verdict choice_snapshot
+  local action prior prior_applicable verdict choice_snapshot rounds_not_converging
   pg_have jq || return 1
   if [ "$#" -gt 0 ]; then supplied="$1"; else supplied="$(cat)"; fi
   canonical="$(pg_review_json_canonical "$supplied")" || return 1
@@ -3383,7 +3418,12 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
     and (.completed_results|type=="array" and all(.[];result))
     and (.evidence|keys_are(["identity","safe_to_prepare","state"])) and (.evidence.identity|ident)
     and (.evidence.safe_to_prepare|type=="boolean") and (.evidence.state|IN("matching","missing","unsafe","invalid","undefined"))
-    and (.governor|keys_are(["granted"])) and (.governor.granted|type=="boolean")
+    and (.governor|keys_are(["arrow","continue_override","earned","grant","granted","policy_mode","scored","streak"]))
+    and (.governor.granted|type=="boolean") and (.governor.continue_override|type=="boolean")
+    and (.governor.scored|type=="number" and floor==. and .>=0) and (.governor.earned|type=="number" and floor==. and .>=0)
+    and (.governor.streak|type=="number" and floor==. and .>=0) and (.governor.grant|type=="number" and floor==. and .>=0)
+    and (.governor.policy_mode|IN("advisory","enforced","lockdown","off"))
+    and (.governor.arrow|type=="array" and all(.[]; type=="number" and floor==. and .>=0))
     and (.input|keys_are(["binding_valid","identity","proven"])) and (.input.binding_valid|type=="boolean")
     and (.input.identity|ident) and (.input.proven|type=="boolean")
     and (.named_choice|keys_are(["outcomes","selected_id","snapshot_digest"]))
@@ -3410,6 +3450,17 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
     and (.transport=="review-decision/v1")' 2>/dev/null)" || valid=false
   if [ "$valid" != true ]; then
     pg_review_decision_reject undefined-state "$snapshot"; return
+  fi
+
+  # #174 R1/R4: the churn streak stop is independent of the numeric round grant and its policy
+  # mode (advisory|enforced|lockdown|off) — it fires with no policy setting present, so it is
+  # computed once here from governor.streak alone, never from governor.granted. A stateless
+  # PRO_GATE_ROUNDS_CONTINUE=1 override is resolved by the facts builder into
+  # governor.continue_override (R2); the reducer stays a pure function of the facts it was given.
+  rounds_not_converging=no
+  if [ "$(jq -r '.governor.streak' <<<"$canonical")" -ge 2 ] \
+     && [ "$(jq -r '.governor.continue_override' <<<"$canonical")" != true ]; then
+    rounds_not_converging=yes
   fi
 
   # Existing completed work wins. Selection is newest charged epoch, then canonical identity;
@@ -3489,6 +3540,13 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
     selected_ref="$(jq -r '.canonical_identity // .marker // ""' <<<"$prior")"
     case "$verdict" in
       FIX-FIRST)
+        # #174 R1: the churn stop preempts a fix dispatch, not just a fresh round grant — this is
+        # the site the FIX-FIRST branch would otherwise return from BEFORE the later
+        # round-governor-denied check is ever reached (AE1: a prior FIX-FIRST round is exactly
+        # how a chain that keeps churning gets here).
+        if [ "$rounds_not_converging" = yes ]; then
+          pg_review_decision_emit stop-without-new-review rounds-not-converging "$canonical" "$snapshot" "$selected_ref"; return
+        fi
         pg_review_decision_emit fix-review-findings review-findings-require-fix "$canonical" "$snapshot" "$selected_ref"; return ;;
       SHIP)
         pg_review_decision_emit allow-existing-merge-workflow current-ship-is-merge-eligible "$canonical" "$snapshot" "$selected_ref"; return ;;
@@ -3514,6 +3572,13 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
       .prior_review.code_identity==.input.identity and .prior_review.evidence_identity==.evidence.identity' \
       <<<"$canonical" >/dev/null 2>&1; then
     pg_review_decision_emit stop-without-new-review identical-code-and-evidence "$canonical" "$snapshot"; return
+  fi
+  # #174 R1: same churn stop as the FIX-FIRST arm above, covering the OTHER half of "in place of
+  # a new round grant or a fix dispatch" — a fresh grant attempt (no applicable prior review, or
+  # one with no recognized verdict) on a change whose streak already reached two. Unreachable for
+  # SHIP/NEEDS-DISCUSSION, whose own branches above already returned (AE7 stays unaffected).
+  if [ "$rounds_not_converging" = yes ]; then
+    pg_review_decision_emit stop-without-new-review rounds-not-converging "$canonical" "$snapshot"; return
   fi
   if [ "$(jq -r .governor.granted <<<"$canonical")" != true ]; then
     pg_review_decision_emit stop-without-new-review round-governor-denied "$canonical" "$snapshot"; return
