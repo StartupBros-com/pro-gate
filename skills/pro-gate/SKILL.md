@@ -142,7 +142,8 @@ Dispatch a replacement action instead of the stale one. Never translate collecti
 Recovery never launches a fresh review. Relay exactly one plain state: **Review ready**,
 **Checking for completed review**, **Still working**, **Review superseded**, **No review remains**,
 or **Browser needs attention**. `Review superseded` means immutable old-head or merged/closed PR
-proof released capacity while retaining the charge and optional audit harvest. `No review remains`
+proof released capacity while retaining the charge and optional audit harvest — a classic `--pr` run
+reviewed against a caller-supplied `--diff` is reclaimable the same way. `No review remains`
 means terminal proof released recovery ownership. In either case, re-query the typed decision instead
 of deleting state or forcing a round. Missing binding/GitHub proof remains fail-closed. A historical
 literal-`diff` reservation key is canonicalized only inside that exact proof-backed transition; a

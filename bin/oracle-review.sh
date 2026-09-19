@@ -1969,10 +1969,31 @@ pg_active_clear() {  # $1 = exit code
 }
 pg_install_full_pr_input_binding() { # marker; only endpoint-fetched full PRs gain automatic applicability
   local marker="$1" binding
-  # Order matters: a caller-supplied, scoped or bare patch (PG_FULL_PR_PROVEN=0) earns no binding
-  # and must return 0 BEFORE the metadata guard below, or every --diff run without PR metadata
-  # aborts as a fatal install failure (caught by the release suite when #150 first moved this).
-  [ "${PG_FULL_PR_PROVEN:-0}" = 1 ] || return 0  # caller-supplied/scoped/bare patches remain bounded
+  # Order matters: a caller-supplied, scoped or bare patch (PG_FULL_PR_PROVEN=0) earns no full-pr
+  # binding and must return 0 BEFORE the metadata guard below, or every --diff run without PR
+  # metadata aborts as a fatal install failure (caught by the release suite when #150 first moved
+  # this). #161: a caller-supplied --diff against a classic `--pr N` run can still install a
+  # target-only "caller-patch" binding (mirrors the connector case below, minus the endpoint/raw
+  # digests the model was never proven to have received) so a stuck reservation later has
+  # something for recover_superseded_reason()/pg_reservation_supersede to read. This is strictly
+  # best-effort: any missing piece (metadata, resolvable head) falls back to 0, never 1 — a
+  # caller-patch binding is a nice-to-have for later reclaim, not a submission requirement, and
+  # returning 1 here would repeat #150's ee3aaa5 regression for every such run.
+  if [ "${PG_FULL_PR_PROVEN:-0}" != 1 ]; then
+    if [ "$DIFF_IS_CALLER_SUPPLIED" = 1 ] && [ -n "${RUN_SPEND_EPOCH:-}" ] \
+       && [ -n "${PG_META_HOST:-}${PG_META_OWNER:-}${PG_META_REPO:-}" ] && [ -n "$PR_NUM" ]; then
+      local cp_head
+      cp_head="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || true)"
+      if [[ "$cp_head" =~ ^[0-9a-f]{40,64}$ ]]; then
+        binding="$(jq -cnS --arg cd "$(pg_review_decision_contract_digest)" --arg marker "$marker" \
+          --arg host "$PG_META_HOST" --arg owner "$PG_META_OWNER" --arg repo "$PG_META_REPO" --argjson pr "$PR_NUM" \
+          --arg head "$cp_head" --argjson epoch "$RUN_SPEND_EPOCH" \
+          '{charged_spend_epoch:$epoch,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("caller-patch:"+$host+"/"+$owner+"/"+$repo+":"+$head),mode:"caller-patch",proof:{commit_target:$head,endpoint_digest:null,raw_diff_digest:null,repository_target:($host+"/"+$owner+"/"+$repo)}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:$host,owner:$owner,repo:$repo},target:{head_oid:$head,kind:"pull-request",pr:$pr}}')" \
+          && pg_review_input_binding_write "$marker" "$binding"
+      fi
+    fi
+    return 0  # caller-supplied/scoped/bare patches remain bounded regardless of the attempt above
+  fi
   [ -n "${RUN_SPEND_EPOCH:-}" ] && [ -n "${PG_META_HOST:-}${PG_META_OWNER:-}${PG_META_REPO:-}" ] || return 1
   case "$INPUT" in
     bundle|both)

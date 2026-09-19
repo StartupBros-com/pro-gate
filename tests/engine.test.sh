@@ -676,6 +676,31 @@ check '#150 planted negative: the neighbouring classic --input bundle run still 
        <<<"$CONN150_BUNDLE_BINDING" >/dev/null 2>&1; echo $?)" \
   "rc=$RC binding_file=$CONN150_BUNDLE_BINDING_FILE binding=$CONN150_BUNDLE_BINDING stderr=$(cat "$TDIR/stderr")"
 
+# #161: a caller-supplied --diff against the same classic `--pr N` run never earns full-pr proof
+# (the engine never independently fetched/hashed those bytes), but it still installs a
+# target-only "caller-patch" binding -- mirroring the connector shape above -- so a stuck
+# reservation later has something for recover_superseded_reason()/pg_reservation_supersede to
+# read. Reuses CONN150_REPO's already-committed base/head commits and gh stub.
+git -C "$CONN150_REPO" diff HEAD~1 HEAD > "$TDIR/conn150-caller.diff"
+conn150_caller_run() { # home pr out
+  env HOME="$TDIR/user" PRO_GATE_HOME="$1" PRO_GATE_INPUT_POLICY=connector-enabled \
+    ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 \
+    PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 PRO_GATE_MAX_ROUNDS_PER_PR=1 \
+    PRO_GATE_LOCK_WAIT=2 PRO_GATE_TIMEOUT_GRACE=0 PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_ORACLE_COMPLETE=1 NODE_OPTIONS= \
+    bash "$ENGINE" --pr "$2" --repo "$CONN150_REPO" --diff "$TDIR/conn150-caller.diff" --input bundle --out "$3" --timeout 10s \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+  RC=$?
+}
+conn150_caller_run "$TDIR/home-conn150-callerpatch" 93 "$TDIR/conn150-callerpatch.md"
+CONN150_CALLERPATCH_BINDING_FILE="$(find "$TDIR/home-conn150-callerpatch/review-input-bindings" -mindepth 1 -maxdepth 1 -type f -name 'pg-run-*' -print -quit 2>/dev/null)"
+CONN150_CALLERPATCH_BINDING="$([ -n "$CONN150_CALLERPATCH_BINDING_FILE" ] && cat "$CONN150_CALLERPATCH_BINDING_FILE" || true)"
+check '#161 classic --pr --diff (caller-supplied) installs a caller-patch binding with a proven target and null digests' \
+  "$([ "$RC" -eq 0 ] && [ -n "$CONN150_CALLERPATCH_BINDING" ] \
+     && jq -e '.evidence.mode=="caller-patch" and .evidence.proof.commit_target==.target.head_oid and .evidence.proof.endpoint_digest==null and .evidence.proof.raw_diff_digest==null and .evidence.proof.repository_target=="github.com/acme/conn150" and .target.pr==93' \
+       <<<"$CONN150_CALLERPATCH_BINDING" >/dev/null 2>&1; echo $?)" \
+  "rc=$RC binding_file=$CONN150_CALLERPATCH_BINDING_FILE binding=$CONN150_CALLERPATCH_BINDING stderr=$(cat "$TDIR/stderr")"
+
 # Lifecycle-only modes remain usable under an invalid policy: the engine reaches their normal
 # handler instead of rejecting an unrelated historical inspection or recovery action.
 PRO_GATE_INPUT_POLICY=invalid-policy PRO_GATE_BROWSER_ATTACHMENTS=invalid-policy PRO_GATE_HOME="$TDIR/policy-lifecycle" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
@@ -6624,6 +6649,49 @@ check 'a capacity-holding reservation outranks an older audit-only superseded ma
   "$SUPER_LIVE_SNAPSHOT"
 rm -f "$SUPER_HEAD_HOME/in-progress/$SUPER_LIVE_MARKER" "$SUPER_HEAD_HOME/run-meta/$SUPER_LIVE_MARKER"
 
+# #161: a caller-supplied --diff reservation's binding has no full-pr shaped proof to borrow, so
+# recover_superseded_reason()/pg_reservation_supersede must accept its own "caller-patch" shape
+# too -- exercised at the --recover CLI exit-6 path, not only the pg_reservation_supersede library
+# call SUPER_HEAD_* above already covers.
+echo '# #161: exact recovery proof-supersedes a caller-patch-mode reservation too'
+CALLERPATCH_BINDING_TEMPLATE="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg host github.com --arg owner acme --arg repo fresh --arg head "$FRESH_BASE" \
+  '{charged_spend_epoch:1700014150,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("caller-patch:"+$host+"/"+$owner+"/"+$repo+":"+$head),mode:"caller-patch",proof:{commit_target:$head,endpoint_digest:null,raw_diff_digest:null,repository_target:($host+"/"+$owner+"/"+$repo)}},marker:"placeholder",record_type:"review-input-binding/v1",record_version:1,repository:{host:$host,owner:$owner,repo:$repo},target:{head_oid:$head,kind:"pull-request",pr:77}}')"
+super_seed_callerpatch() { # home marker epoch bound-head
+  local home="$1" marker="$2" epoch="$3" bound_head="$4" binding
+  mkdir -p "$home/in-progress" "$home/run-meta" "$home/rounds"
+  printf '%s\n' "$epoch" > "$home/rounds/$SUPER_KEY"
+  printf 'github.com\tacme\tfresh\t%s\t77\t%s\t%s\n' "$SUPER_KEY" "$TDIR/superseded-audit.md" "$epoch" > "$home/run-meta/$marker"
+  printf '%s\t%s\t%s\t0\t1\tGPT-X\t%s\tgenerating\n' "$SUPER_KEY" "$TDIR/superseded-audit.md" "$(date +%s)" "$epoch" > "$home/in-progress/$marker"
+  binding="$(jq -cS --arg marker "$marker" --arg head "$bound_head" --argjson epoch "$epoch" \
+    '.marker=$marker | .charged_spend_epoch=$epoch | .target.head_oid=$head | .evidence.proof.commit_target=$head | .evidence.identity=("caller-patch:"+.repository.host+"/"+.repository.owner+"/"+.repository.repo+":"+$head)' <<<"$CALLERPATCH_BINDING_TEMPLATE")"
+  PRO_GATE_HOME="$home" pg_review_input_binding_write "$marker" "$binding"
+}
+CALLERPATCH_HEAD_HOME="$TDIR/home-callerpatch-head"
+CALLERPATCH_HEAD_MARKER='pg-run-acme-fresh-77-1700014150-1'
+super_seed_callerpatch "$CALLERPATCH_HEAD_HOME" "$CALLERPATCH_HEAD_MARKER" 1700014150 "$FRESH_BASE"
+: > "$SUPER_GH_CALLS"; : > "$TDIR/recover-oracle-sentinel"
+super_recover "$CALLERPATCH_HEAD_HOME" "$CALLERPATCH_HEAD_MARKER" ok OPEN "$FRESH_HEAD"
+check '#161 exact recovery proof-supersedes a caller-patch reservation after the bound head moves' \
+  "$([ "$RC" -eq 6 ] && grep -qx 'Review superseded' "$TDIR/super.stderr" \
+     && grep -qF 'pr view 77 --repo github.com/acme/fresh --json state,headRefOid' "$SUPER_GH_CALLS" \
+     && [ "$(awk -F'\t' 'NR==1{print $8}' "$CALLERPATCH_HEAD_HOME/in-progress/$CALLERPATCH_HEAD_MARKER")" = superseded ] \
+     && [ ! -s "$TDIR/recover-oracle-sentinel" ]; echo $?)" \
+  "rc=$RC state=$(cat "$CALLERPATCH_HEAD_HOME/in-progress/$CALLERPATCH_HEAD_MARKER") stderr=$(cat "$TDIR/super.stderr")"
+check '#161 supersession ledger proof records the exact head move for a caller-patch binding' \
+  "$(jq -e --arg marker "$CALLERPATCH_HEAD_MARKER" --arg old "$FRESH_BASE" --arg new "$FRESH_HEAD" \
+       'select(.outcome=="superseded" and .marker==$marker and .charge_retained and (.holds_capacity|not) and .proof==("head-moved:"+$old+":"+$new))' \
+       "$CALLERPATCH_HEAD_HOME/ledger.jsonl" >/dev/null 2>&1; echo $?)" \
+  "ledger=$(cat "$CALLERPATCH_HEAD_HOME/ledger.jsonl" 2>/dev/null)"
+CALLERPATCH_SAME_HOME="$TDIR/home-callerpatch-same-head"
+CALLERPATCH_SAME_MARKER='pg-run-acme-fresh-77-1700014151-2'
+super_seed_callerpatch "$CALLERPATCH_SAME_HOME" "$CALLERPATCH_SAME_MARKER" 1700014151 "$FRESH_BASE"
+: > "$SUPER_GH_CALLS"; : > "$TDIR/recover-oracle-sentinel"
+super_recover "$CALLERPATCH_SAME_HOME" "$CALLERPATCH_SAME_MARKER" ok OPEN "$FRESH_BASE"
+check '#161 planted negative: an unmoved head does not supersede a caller-patch reservation' \
+  "$([ "$RC" -eq 3 ] \
+     && [ "$(awk -F'\t' 'NR==1{print $8}' "$CALLERPATCH_SAME_HOME/in-progress/$CALLERPATCH_SAME_MARKER")" = generating ]; echo $?)" \
+  "rc=$RC state=$(cat "$CALLERPATCH_SAME_HOME/in-progress/$CALLERPATCH_SAME_MARKER") stderr=$(cat "$TDIR/super.stderr")"
+
 # Every generic mutation seam is monotonic: a still-rendering optional harvest may refresh output,
 # state, or miss bookkeeping, but none can turn obsolete work back into account occupancy.
 PRO_GATE_HOME="$SUPER_HEAD_HOME" pg_reservation_write "$SUPER_HEAD_MARKER" "$SUPER_KEY" "$TDIR/superseded-refreshed.md" 1 GPT-Y 1700014100
@@ -8105,6 +8173,23 @@ CONNECTOR_SHIP_RC=$?
 check 'connector SHIP never becomes merge eligibility' \
   "$([ "$CONNECTOR_SHIP_RC" -eq 0 ] && jq -e '.action!="allow-existing-merge-workflow"' "$TDIR/connector-ship.json" >/dev/null 2>&1; echo $?)" \
   "rc=$CONNECTOR_SHIP_RC output=$(cat "$TDIR/connector-ship.json")"
+
+# #161: the same fail-closed pin, for the new caller-patch evidence.mode -- pg_extract merge
+# handoff (bin/oracle-review.sh mode case) only earns a ship_digest for full-pr/scoped-delta;
+# caller-patch falls into its `*) continue` default exactly like connector, never reaching
+# allow-existing-merge-workflow, without any code change needed for this item.
+CALLERPATCH_SHIP_HOME="$TDIR/home-callerpatch-ship"; CALLERPATCH_SHIP_MARKER='pg-run-acme-widgets-1983-1700018003-4'
+CALLERPATCH_SHIP_INPUT="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg marker "$CALLERPATCH_SHIP_MARKER" --arg head "$PROOF_HEAD" \
+  '{charged_spend_epoch:1700018003,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("caller-patch:github.com/acme/widgets:"+$head),mode:"caller-patch",proof:{commit_target:$head,endpoint_digest:null,raw_diff_digest:null,repository_target:"github.com/acme/widgets"}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:"github.com",owner:"acme",repo:"widgets"},target:{head_oid:$head,kind:"pull-request",pr:1983}}')"
+mkdir -p "$CALLERPATCH_SHIP_HOME/completed"; printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — caller-patch observation.' > "$CALLERPATCH_SHIP_HOME/completed/$CALLERPATCH_SHIP_MARKER"
+CALLERPATCH_INPUT_DIGEST="$(printf '%s' "$CALLERPATCH_SHIP_INPUT" | sha256sum | awk '{print $1}')"; CALLERPATCH_ART_DIGEST="$(sha256sum "$CALLERPATCH_SHIP_HOME/completed/$CALLERPATCH_SHIP_MARKER" | awk '{print $1}')"
+CALLERPATCH_SHIP_RESULT="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg marker "$CALLERPATCH_SHIP_MARKER" --arg ib "$CALLERPATCH_INPUT_DIGEST" --arg digest "$CALLERPATCH_ART_DIGEST" --arg base "$PROOF_BASE" --arg head "$PROOF_HEAD" --arg raw "$SCOPED_RAW_DIGEST" '{accepted_epoch:1700018004,artifact:{digest:$digest,path:("completed/"+$marker)},contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,input_binding_digest:$ib,input_binding_identity:$marker,marker:$marker,named_choice:null,provenance:{outcome:"accepted",validated_epoch:1700018004},record_type:"review-result-binding/v1",record_version:1,ship_proof:{base_oid:$base,diff_digest:$raw,head_oid:$head},verdict:"SHIP"}')"
+PRO_GATE_HOME="$CALLERPATCH_SHIP_HOME" pg_review_input_binding_write "$CALLERPATCH_SHIP_MARKER" "$CALLERPATCH_SHIP_INPUT"; PRO_GATE_HOME="$CALLERPATCH_SHIP_HOME" pg_review_result_binding_write "$CALLERPATCH_SHIP_MARKER" "$CALLERPATCH_SHIP_RESULT"
+env PRO_GATE_HOME="$CALLERPATCH_SHIP_HOME" PRO_GATE_RUN_LOGS=0 bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --input bundle >"$TDIR/callerpatch-ship.json" 2>"$TDIR/callerpatch-ship.err"
+CALLERPATCH_SHIP_RC=$?
+check '#161 caller-patch SHIP never becomes merge eligibility' \
+  "$([ "$CALLERPATCH_SHIP_RC" -eq 0 ] && jq -e '.action!="allow-existing-merge-workflow"' "$TDIR/callerpatch-ship.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$CALLERPATCH_SHIP_RC output=$(cat "$TDIR/callerpatch-ship.json")"
 
 # pending/ deliberately has no result-binding store. Even exact-current connector bytes therefore
 # remain uncollected recovery data and cannot inherit the completed SHIP handoff route.

@@ -3547,7 +3547,7 @@ pg_review_input_binding_validate() { # canonical record JSON [expected marker]
     and (.target|keys_are(["head_oid","kind","pr"])) and .target.kind=="pull-request"
     and (.target.pr|type=="number" and floor==. and .>0) and (.target.head_oid|oid)
     and (.evidence|keys_are(["identity","mode","proof"])) and (.evidence.identity|type=="string" and test("^[A-Za-z0-9._:/+-]+$") and length<=256)
-    and (.evidence.mode|IN("full-pr","scoped-delta","connector"))
+    and (.evidence.mode|IN("full-pr","scoped-delta","connector","caller-patch"))
     and (if .evidence.mode=="full-pr" then
       (.evidence.proof|keys_are(["base_oid","endpoint_digest","head_oid","raw_patch_digest"]))
       and (.evidence.proof.base_oid|oid) and (.evidence.proof.head_oid|oid) and .evidence.proof.head_oid==.target.head_oid
@@ -3559,6 +3559,10 @@ pg_review_input_binding_validate() { # canonical record JSON [expected marker]
       and (.evidence.proof.lineage_identity|type=="string" and length>0 and length<=256)
       and (.evidence.proof.scope_algorithm|type=="string" and length>0 and length<=64)
     else
+      # connector and caller-patch share a shape: target proven exactly the same way, endpoint/raw
+      # digests nullable. connector never sent the diff bytes to the model at all; caller-patch
+      # sent bytes the caller supplied but the engine never independently fetched or proved them
+      # against the endpoint, so neither mode earns full-pr non-null digests (#161).
       (.evidence.proof|keys_are(["commit_target","endpoint_digest","raw_diff_digest","repository_target"]))
       and (.evidence.proof.commit_target|oid) and .evidence.proof.commit_target==.target.head_oid
       and (.evidence.proof.repository_target|type=="string" and length>0 and length<=256)

@@ -298,7 +298,9 @@ that original charged attempt's reservation and applies the existing TTL plus sp
 miss proof in the same no-spend invocation. Before browser recovery, an immutable input binding plus
 GitHub `MERGED`/`CLOSED` state or a different current head can move the reservation to `superseded`:
 the charge, marker, URL, and optional audit harvest remain, while capacity and current-head ownership
-are released. Historical reservations keyed as literal `diff` are canonicalized during that exact
+are released. A classic `--pr` run reviewed against a caller-supplied `--diff` installs the same
+kind of target-only binding and is reclaimable the same way once its bound head moves. Historical
+reservations keyed as literal `diff` are canonicalized during that exact
 transition only after immutable identity and charge agree. For pre-v0.31 empty spend fields, exact
 immutable binding and canonical run metadata are revalidated under the reservation lock before the
 proven charge is filled; marker mint time is not charge evidence. Other missing or mismatched proof
