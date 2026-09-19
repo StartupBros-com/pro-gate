@@ -252,6 +252,14 @@ if memreason="$(pg_mem_headroom_ok)"; then
   if memnote="$(pg_mem_pressure_note)"; then W "memory tight: ${memnote} — the engine still runs, but a long review may be unstable; free memory (close apps/tabs) for best results";
   else P "memory headroom ok for a review ($(pg_mem_status))"; fi
 else W "memory pressure: ${memreason} — the engine will DEFER the slot (no quota spent); free memory and retry"; fi
+# #212 step 2: cgroup-scoped browser memory sentinel, separate from the host-wide check above.
+if browser_mem_reason="$(pg_browser_mem_pressure)"; then P "browser memory pressure: none"
+else W "browser memory pressure: ${browser_mem_reason}"; fi
+# gate r3 P2: "no pressure" is only meaningful while the sampler runs. It starts with the browser
+# wrapper, and an upgrade never restarts a running browser, so say so where the operator looks.
+if sampler_state="$(pg_browser_mem_sampler_state)"; then P "browser memory sampler: ${sampler_state}"
+elif [ "$SVC" = systemd ]; then W "browser memory sampler: not running (${sampler_state}) — the sentinel starts with the browser wrapper and an upgrade does not restart a running browser; once --status shows no review in flight, start or restart oracle-chrome.service to activate it"
+else P "browser memory sampler: not running (${sampler_state}; no pro-gate browser service on this platform, so the cgroup sentinel is inactive)"; fi
 
 # config
 [ -n "${PRO_REVIEW_OWNERS:-}" ] && P "PRO_REVIEW_OWNERS='${PRO_REVIEW_OWNERS}'" || W "PRO_REVIEW_OWNERS unset (daemon needs it; interactive /pro-gate does not)"

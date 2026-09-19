@@ -14,6 +14,8 @@ RestartSec=5
 KillMode=control-group
 TimeoutStopSec=20
 LimitNOFILE=65535
+MemoryMax=70%
+OOMPolicy=continue
 
 [Install]
 WantedBy=multi-user.target

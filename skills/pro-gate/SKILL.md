@@ -54,7 +54,9 @@ The installer owns runtime files only; this plugin owns the skill and relay.
 
 Resolve the canonical repository and PR. The engine owns input policy: omit `--input` when the
 caller did not explicitly supply `INPUT`, so its safe default or configured connector opt-in decides
-delivery. An explicit `bundle|both|connector` selection is passed through unchanged. Reuse the exact
+delivery. An explicit `bundle|both|connector` selection is passed through unchanged. Connector
+delivery can drive fix rounds but never attests an allow: a connector-delivered SHIP stops typed with
+reason `result-not-bindable-for-mode`, so use `bundle` or `both` for the final round. Reuse the exact
 input arguments for the query and effect so proof paths cannot drift:
 
 ```bash
@@ -93,7 +95,7 @@ update path above. A saved decision is advisory, not authority.
 | `runtime-guarded-effect` | `run-granted-review` | Re-enter with `--review-decision-effect`, adding `--out` and letting the engine size the wait; the runtime rechecks before charge and submission. |
 | `agent-task` | `fix-review-findings` | Verify normalized current findings, fix them, run applicable checks, then re-query at the changed head. |
 | `agent-task` | `prepare-matching-review-evidence` | Prepare the requested raw/reviewed evidence without changing code, append its proof inputs above, then re-query. |
-| `report-only` | `stop-without-new-review` | Report the normalized reason and preserve branch work; do not infer a retry. `account-cooldown-active` is the one stop a caller may wait out: ChatGPT is rate-limiting the account, `.facts.cooldown.seconds_remaining` says for how long, and only re-querying after at least that long can change the answer. |
+| `report-only` | `stop-without-new-review` | Report the normalized reason and preserve branch work; do not infer a retry. `account-cooldown-active` is the one stop a caller may wait out: ChatGPT is rate-limiting the account, `.facts.cooldown.seconds_remaining` says for how long, and only re-querying after at least that long can change the answer. `rounds-not-converging` fires when the open-P0/P1 trajectory (`.facts.governor.arrow`) has not shrunk for 2 consecutive re-reviews, in place of a new round grant or a fix dispatch — independent of round-policy mode. `PRO_GATE_ROUNDS_CONTINUE=1` lets one more round through anyway. |
 | `report-only` | `allow-existing-merge-workflow` | Re-query immediately before handing off to the existing merge workflow; pro-gate has no merge authority. |
 | `named-product-choice` | `ask-named-product-choice` | Ask only the validated named outcomes and consequences supplied by the decision. |
 
@@ -142,7 +144,8 @@ Dispatch a replacement action instead of the stale one. Never translate collecti
 Recovery never launches a fresh review. Relay exactly one plain state: **Review ready**,
 **Checking for completed review**, **Still working**, **Review superseded**, **No review remains**,
 or **Browser needs attention**. `Review superseded` means immutable old-head or merged/closed PR
-proof released capacity while retaining the charge and optional audit harvest. `No review remains`
+proof released capacity while retaining the charge and optional audit harvest — a classic `--pr` run
+reviewed against a caller-supplied `--diff` is reclaimable the same way. `No review remains`
 means terminal proof released recovery ownership. In either case, re-query the typed decision instead
 of deleting state or forcing a round. Missing binding/GitHub proof remains fail-closed. A historical
 literal-`diff` reservation key is canonicalized only inside that exact proof-backed transition; a

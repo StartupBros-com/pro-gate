@@ -289,8 +289,38 @@ fi
 # the regular engine's housekeeping, browser preflight, locks, reconciliation, status sidecars,
 # slots, round recording, or binding/publication writes: the answer is advisory until an effect
 # boundary assembles the same facts again. The U1 reducer remains the sole policy authority.
+# Merge-eligibility proof exists only for evidence the engine delivered byte-for-byte. A connector
+# observation can drive a fix round but never attests an allow (#147, decision b): callers switch to
+# bundle or both for the final round. This predicate is the one source of that rule for the repair
+# effect and for the normalized facts the reducer consumes. `caller-patch` (#161) is a distinct
+# input-binding mode with no merge proof either; it stays out of the bindable allowlist by default.
+pg_review_decision_ship_mode_bindable() { # evidence-mode
+  case "$1" in full-pr|scoped-delta) return 0 ;; *) return 1 ;; esac
+}
+pg_review_decision_result_mode() { # input-binding-json -> closed evidence-mode label for normalized facts
+  case "$(jq -r '.evidence.mode // ""' <<<"$1" 2>/dev/null)" in
+    full-pr) printf 'full-pr' ;; scoped-delta) printf 'scoped-delta' ;; connector) printf 'connector' ;;
+    caller-patch) printf 'caller-patch' ;; *) printf 'none' ;;
+  esac
+}
+# Whether a collect effect could ever bind this exact artifact. Only a completed/ SHIP in a mode
+# without merge proof is permanently unrepairable; pending/ bytes remain collect-only recovery data,
+# and every other verdict binds with a null proof. The reducer turns false into a typed stop so a
+# caller can tell an unrepairable result from a transient one instead of collecting forever.
+pg_review_decision_result_bindable() { # artifact-path input-binding-json -> prints true|false
+  local artifact="$1" input="$2"
+  case "$artifact" in
+    "$(pg_completed_dir)"/*)
+      if [ "$(pg_extract_verdict "$artifact")" = SHIP ] \
+         && ! pg_review_decision_ship_mode_bindable "$(jq -r '.evidence.mode // ""' <<<"$input" 2>/dev/null)"; then
+        printf 'false'; return 0
+      fi ;;
+  esac
+  printf 'true'
+}
+
 pg_review_decision_repair_result_binding() { # marker input-binding-json
-  local marker="$1" input="$2" artifact verdict input_digest accepted epoch base head proof result lock
+  local marker="$1" input="$2" artifact verdict input_digest accepted epoch base head proof result lock mode
   pg_reservation_marker_ok "$marker" || return 1
   artifact="$(pg_completed_dir)/$marker"
   [ -f "$artifact" ] && [ ! -L "$artifact" ] && pg_is_review "$artifact" || return 1
@@ -303,7 +333,9 @@ pg_review_decision_repair_result_binding() { # marker input-binding-json
   accepted="$(date +%s)"
   proof=null
   if [ "$verdict" = SHIP ]; then
-    case "$(jq -r .evidence.mode <<<"$input")" in
+    mode="$(jq -r .evidence.mode <<<"$input")"
+    pg_review_decision_ship_mode_bindable "$mode" || return 1
+    case "$mode" in
       full-pr)
         base="$(jq -r .evidence.proof.base_oid <<<"$input")"; head="$(jq -r .evidence.proof.head_oid <<<"$input")"
         proof="$(jq -cnS --arg base "$base" --arg head "$head" --arg digest "$(jq -r .evidence.proof.raw_patch_digest <<<"$input")" '{base_oid:$base,diff_digest:$digest,head_oid:$head}')" || return 1 ;;
@@ -452,7 +484,7 @@ pg_review_decision_cli() {
   local input_marker="" input_record="" input_digest="" f marker candidate candidate_relation desired_relation exact=false active_marker="" active_state=none
   local endpoint reviewed manifest confirmation endpoint_digest reviewed_digest manifest_digest confirmation_digest lineage mode ship_digest
   local reservation_marker="" reservation_state=none governor_granted=false cooldown_left=0 completed='[]' prior_candidates='[]' prior_review result artifact artifact_digest canonical
-  local facts decision effect_ok=false prospective exact_inputs='[]' choice_candidates='[]' choice_outcomes='[]' choice_selected="" choice_snapshot="" selection="" selection_supplied=false current_verdict=NONE current_canonical="" effect_input attempt_snapshot attempt_source parsed_verdict stored_verdict
+  local facts governor_facts decision effect_ok=false prospective exact_inputs='[]' choice_candidates='[]' choice_outcomes='[]' choice_selected="" choice_snapshot="" selection="" selection_supplied=false current_verdict=NONE current_canonical="" effect_input attempt_snapshot attempt_source parsed_verdict stored_verdict
 
   pg_have jq || { echo 'ERROR: review-decision/v1 requires jq' >&2; return 2; }
   repo="${REPO:-$(pwd)}"
@@ -543,7 +575,8 @@ pg_review_decision_cli() {
     if [ -n "$artifact" ] && [ -n "$(pg_capture_foreign_echo "$artifact" "$marker")" ]; then
       completed="$(jq -cS --arg marker "$marker" --arg artifact "$(pg_sha256 "$artifact")" \
         --argjson epoch "$(jq -r .charged_spend_epoch <<<"$candidate")" \
-        '. + [{applicable:true,artifact_digest:$artifact,binding_valid:true,canonical_identity:$marker,charged_spend_epoch:$epoch,collected:true,legacy:false,marker:$marker,provenance_valid:false,verdict:"NONE"}]' <<<"$completed")"
+        --arg mode "$(pg_review_decision_result_mode "$candidate")" --argjson bindable "$(pg_review_decision_result_bindable "$artifact" "$candidate")" \
+        '. + [{applicable:true,artifact_digest:$artifact,bindable:$bindable,binding_valid:true,canonical_identity:$marker,charged_spend_epoch:$epoch,collected:true,evidence_mode:$mode,legacy:false,marker:$marker,provenance_valid:false,verdict:"NONE"}]' <<<"$completed")"
       continue
     fi
 
@@ -554,7 +587,8 @@ pg_review_decision_cli() {
       if [ "$exact" = true ] && [ -n "$artifact" ]; then
         artifact_digest="$(pg_sha256 "$artifact" 2>/dev/null || true)"
         [ -n "$artifact_digest" ] && completed="$(jq -cS --arg marker "$marker" --arg artifact "$artifact_digest" --argjson epoch "$(jq -r .charged_spend_epoch <<<"$candidate")" \
-          '. + [{applicable:true,artifact_digest:$artifact,binding_valid:false,canonical_identity:$marker,charged_spend_epoch:$epoch,collected:false,legacy:false,marker:$marker,provenance_valid:false,verdict:"NONE"}]' <<<"$completed")"
+          --arg mode "$(pg_review_decision_result_mode "$candidate")" --argjson bindable "$(pg_review_decision_result_bindable "$artifact" "$candidate")" \
+          '. + [{applicable:true,artifact_digest:$artifact,bindable:$bindable,binding_valid:false,canonical_identity:$marker,charged_spend_epoch:$epoch,collected:false,evidence_mode:$mode,legacy:false,marker:$marker,provenance_valid:false,verdict:"NONE"}]' <<<"$completed")"
       fi
       continue
     fi
@@ -573,7 +607,8 @@ pg_review_decision_cli() {
       if [ "$exact" = true ]; then
         completed="$(jq -cS --arg marker "$marker" --arg artifact "$artifact_digest" \
           --argjson epoch "$(jq -r .charged_spend_epoch <<<"$candidate")" \
-          '. + [{applicable:true,artifact_digest:$artifact,binding_valid:true,canonical_identity:$marker,charged_spend_epoch:$epoch,collected:true,legacy:false,marker:$marker,provenance_valid:false,verdict:"NONE"}]' <<<"$completed")"
+          --arg mode "$(pg_review_decision_result_mode "$candidate")" --argjson bindable "$(pg_review_decision_result_bindable "$artifact" "$candidate")" \
+          '. + [{applicable:true,artifact_digest:$artifact,bindable:$bindable,binding_valid:true,canonical_identity:$marker,charged_spend_epoch:$epoch,collected:true,evidence_mode:$mode,legacy:false,marker:$marker,provenance_valid:false,verdict:"NONE"}]' <<<"$completed")"
       fi
       continue
     fi
@@ -602,7 +637,8 @@ pg_review_decision_cli() {
       fi
       completed="$(jq -cS --arg marker "$marker" --arg canonical "$canonical" --arg artifact "$artifact_digest" \
         --argjson epoch "$(jq -r .charged_spend_epoch <<<"$candidate")" --arg verdict "$(jq -r .verdict <<<"$result")" \
-        '. + [{applicable:true,artifact_digest:$artifact,binding_valid:true,canonical_identity:$canonical,charged_spend_epoch:$epoch,collected:true,legacy:false,marker:$marker,provenance_valid:true,verdict:$verdict}]' <<<"$completed")"
+        --arg mode "$(pg_review_decision_result_mode "$candidate")" \
+        '. + [{applicable:true,artifact_digest:$artifact,bindable:true,binding_valid:true,canonical_identity:$canonical,charged_spend_epoch:$epoch,collected:true,evidence_mode:$mode,legacy:false,marker:$marker,provenance_valid:true,verdict:$verdict}]' <<<"$completed")"
       if [ "$(jq -r .verdict <<<"$result")" = NEEDS-DISCUSSION ]; then
         choice_outcomes="$(pg_review_decision_named_choices "$artifact" 2>/dev/null || true)"
         [ -n "$choice_outcomes" ] || choice_outcomes='[]'
@@ -679,6 +715,11 @@ pg_review_decision_cli() {
     fi
   fi
   if pg_round_guard "$round_key" >/dev/null 2>&1; then governor_granted=true; fi
+  # #174 R5/R6: the governor's own trajectory (scored/arrow/earned/streak/grant/policy_mode) and
+  # the stateless PRO_GATE_ROUNDS_CONTINUE override, read fresh in the same shell so this call's
+  # globals aren't dropped by a subshell, beside the $governor_granted this caller already
+  # resolved via pg_round_guard above.
+  governor_facts="$(pg_round_governor_facts_json "$round_key" "$governor_granted")" || return 2
   # #162: the account back-off cooldown is a normalized fact, so a wrapper learns how long to
   # wait from the closed decision instead of retrying a query that pg_health_gate would refuse.
   cooldown_left="$(pg_cooldown_remaining_secs)"; case "$cooldown_left" in ''|*[!0-9]*) cooldown_left=0;; esac
@@ -686,13 +727,13 @@ pg_review_decision_cli() {
   facts="$(jq -cnS --arg h "$host" --arg o "$owner" --arg r "$repo_name" --arg head "$head" --argjson pr "$pr_num" \
     --arg identity "$input_identity" --arg evidence "$evidence_identity" --arg state "$evidence_state" \
     --arg marker "$active_marker" --arg astate "$active_state" --arg reservation "$reservation_marker" --arg rstate "$reservation_state" \
-    --argjson input_proven "$input_proven" --argjson input_binding "$input_binding_valid" --argjson granted "$governor_granted" \
+    --argjson input_proven "$input_proven" --argjson input_binding "$input_binding_valid" --argjson governor "$governor_facts" \
     --argjson cooldown_left "$cooldown_left" \
     --argjson completed "$completed" --argjson prior "$prior_review" --argjson choices "$choice_outcomes" --arg choice "$choice_selected" --arg choice_snap "$choice_snapshot" --arg cd "$(pg_review_decision_contract_digest)" --arg xd "$(pg_review_decision_corpus_digest)" '
     {active_index:{binding_valid:$input_binding,charged_spend_epoch:0,marker:$marker,state:$astate},completed_results:$completed,
      contract:{contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,corpus_digest:$xd},
      cooldown:{active:($cooldown_left > 0),seconds_remaining:$cooldown_left},
-     evidence:{identity:$evidence,safe_to_prepare:true,state:$state},governor:{granted:$granted},
+     evidence:{identity:$evidence,safe_to_prepare:true,state:$state},governor:$governor,
      input:{binding_valid:$input_binding,identity:$identity,proven:$input_proven},named_choice:{outcomes:$choices,selected_id:(if $choice=="" then null else $choice end),snapshot_digest:$choice_snap},
      observation:{kind:"idle"},prior_review:$prior,
      reservation:{binding_valid:false,legacy:false,marker:$reservation,state:$rstate},target:{head_oid:$head,host:$h,owner:$o,pr:$pr,repo:$r},transport:"review-decision/v1"}')" || return 2
@@ -1969,10 +2010,49 @@ pg_active_clear() {  # $1 = exit code
 }
 pg_install_full_pr_input_binding() { # marker; only endpoint-fetched full PRs gain automatic applicability
   local marker="$1" binding
-  # Order matters: a caller-supplied, scoped or bare patch (PG_FULL_PR_PROVEN=0) earns no binding
-  # and must return 0 BEFORE the metadata guard below, or every --diff run without PR metadata
-  # aborts as a fatal install failure (caught by the release suite when #150 first moved this).
-  [ "${PG_FULL_PR_PROVEN:-0}" = 1 ] || return 0  # caller-supplied/scoped/bare patches remain bounded
+  # Order matters: a caller-supplied, scoped or bare patch (PG_FULL_PR_PROVEN=0) earns no full-pr
+  # binding and must return 0 BEFORE the metadata guard below, or every --diff run without PR
+  # metadata aborts as a fatal install failure (caught by the release suite when #150 first moved
+  # this). #161: a caller-supplied --diff against a classic `--pr N` run can still install a
+  # target-only "caller-patch" binding (mirrors the connector case below, minus the endpoint/raw
+  # digests the model was never proven to have received) so a stuck reservation later has
+  # something for recover_superseded_reason()/pg_reservation_supersede to read. This is strictly
+  # best-effort: any missing piece (metadata, resolvable head) falls back to 0, never 1 — a
+  # caller-patch binding is a nice-to-have for later reclaim, not a submission requirement, and
+  # returning 1 here would repeat #150's ee3aaa5 regression for every such run.
+  if [ "${PG_FULL_PR_PROVEN:-0}" != 1 ]; then
+    if [ "$DIFF_IS_CALLER_SUPPLIED" = 1 ] && [ -n "${RUN_SPEND_EPOCH:-}" ] \
+       && [ -n "${PG_META_HOST:-}${PG_META_OWNER:-}${PG_META_REPO:-}" ] && [ -n "$PR_NUM" ]; then
+      # gate r1 P1 (v0.53.0): every local here is initialised. The engine runs under set -u, and
+      # a `local cp_head` left unassigned when gh or timeout is unavailable made the regex test
+      # below abort the whole run as an unbound variable -- AFTER the round was charged and
+      # BEFORE anything was submitted. The `|| true` on the caller cannot catch a shell exit.
+      local cp_head='' cp_gh_bin='' cp_timeout_bin='' cp_payload=''
+      # gate r1 P1: target.head_oid must be the PR's GitHub-reported head, never the caller's
+      # local checkout state — `git -C "$REPO" rev-parse HEAD` can diverge from the real pushed
+      # head (a stale or ahead-of-PR clone), and recover_superseded_reason later trusts this value
+      # as bound_head verbatim, comparing it against a fresh `gh pr view --json headRefOid` to
+      # decide whether the PR moved. A local-checkout mismatch would falsely "prove" head-moved
+      # and supersede a reservation whose real PR head never changed. Fetch authoritatively here,
+      # exactly like recover_superseded_reason does (bin/oracle-review.sh:~806-809); any failure
+      # (gh missing, timeout, malformed JSON) falls back to no binding at all — best-effort, same
+      # as every other branch in this function.
+      cp_gh_bin="${PRO_GATE_GH_BIN:-gh}"; cp_timeout_bin="${PRO_GATE_TIMEOUT_BIN:-timeout}"
+      if command -v "$cp_gh_bin" >/dev/null 2>&1 && command -v "$cp_timeout_bin" >/dev/null 2>&1; then
+        cp_payload="$("$cp_timeout_bin" -k 1s 10s "$cp_gh_bin" pr view "$PR_NUM" \
+          --repo "${PG_META_HOST}/${PG_META_OWNER}/${PG_META_REPO}" --json headRefOid 2>/dev/null || true)"
+        cp_head="$(jq -r '.headRefOid // ""' <<<"$cp_payload" 2>/dev/null)"
+      fi
+      if [[ "$cp_head" =~ ^[0-9a-f]{40,64}$ ]]; then
+        binding="$(jq -cnS --arg cd "$(pg_review_decision_contract_digest)" --arg marker "$marker" \
+          --arg host "$PG_META_HOST" --arg owner "$PG_META_OWNER" --arg repo "$PG_META_REPO" --argjson pr "$PR_NUM" \
+          --arg head "$cp_head" --argjson epoch "$RUN_SPEND_EPOCH" \
+          '{charged_spend_epoch:$epoch,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("caller-patch:"+$host+"/"+$owner+"/"+$repo+":"+$head),mode:"caller-patch",proof:{commit_target:$head,endpoint_digest:null,raw_diff_digest:null,repository_target:($host+"/"+$owner+"/"+$repo)}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:$host,owner:$owner,repo:$repo},target:{head_oid:$head,kind:"pull-request",pr:$pr}}')" \
+          && pg_review_input_binding_write "$marker" "$binding"
+      fi
+    fi
+    return 0  # caller-supplied/scoped/bare patches remain bounded regardless of the attempt above
+  fi
   [ -n "${RUN_SPEND_EPOCH:-}" ] && [ -n "${PG_META_HOST:-}${PG_META_OWNER:-}${PG_META_REPO:-}" ] || return 1
   case "$INPUT" in
     bundle|both)
@@ -2006,7 +2086,7 @@ pg_install_full_pr_input_binding() { # marker; only endpoint-fetched full PRs ga
 # authorities; it neither creates an action token nor a second ledger or lock.
 pg_fresh_dispatch_recheck() { # sets PG_FRESH_DECISION/PG_FRESH_ACTION
   local template="$REVIEW_DECISION_INPUT_TEMPLATE" marker="" state=none epoch=0 f rec m astate="" completed='[]' attempt_snapshot attempt_source
-  local input_ok=false input_digest evidence identity head base active_marker="" reservation="" granted=false cooldown_left=0 facts
+  local input_ok=false input_digest evidence identity head base active_marker="" reservation="" granted=false cooldown_left=0 facts governor_facts
   local template_relation="" candidate="" candidate_relation="" artifact="" artifact_digest=""
   [ -n "$template" ] || return 1
   input_digest="$(pg_review_sha256_text "$template" 2>/dev/null || true)"
@@ -2044,7 +2124,8 @@ pg_fresh_dispatch_recheck() { # sets PG_FRESH_DECISION/PG_FRESH_ACTION
       artifact_digest="$(pg_sha256 "$artifact" 2>/dev/null || true)"
       [ -n "$artifact_digest" ] || continue
       completed="$(jq -cS --arg marker "$m" --arg digest "$artifact_digest" --argjson charged "$(jq -r .charged_spend_epoch <<<"$candidate")" \
-        '. + [{applicable:true,artifact_digest:$digest,binding_valid:false,canonical_identity:$marker,charged_spend_epoch:$charged,collected:false,legacy:false,marker:$marker,provenance_valid:false,verdict:"NONE"}]' <<<"$completed")"
+        --arg mode "$(pg_review_decision_result_mode "$candidate")" --argjson bindable "$(pg_review_decision_result_bindable "$artifact" "$candidate")" \
+        '. + [{applicable:true,artifact_digest:$digest,bindable:$bindable,binding_valid:false,canonical_identity:$marker,charged_spend_epoch:$charged,collected:false,evidence_mode:$mode,legacy:false,marker:$marker,provenance_valid:false,verdict:"NONE"}]' <<<"$completed")"
     done < <(find "$(pg_review_input_binding_dir)" -mindepth 1 -maxdepth 1 -type f -name "pg-run-$ROUND_KEY-*" -printf '%f\n' 2>/dev/null | LC_ALL=C sort)
   fi
   attempt_snapshot="$(pg_attempt_snapshot "$PG_META_HOST" "$PG_META_OWNER" "$PG_META_REPO" "$PR_NUM" "$ROUND_KEY" "${RUN_MARKER:-}" 2>/dev/null || true)"
@@ -2062,11 +2143,12 @@ pg_fresh_dispatch_recheck() { # sets PG_FRESH_DECISION/PG_FRESH_ACTION
     else reservation="$active_marker"; active_marker=""; astate=none; fi
   fi
   pg_round_guard "$ROUND_KEY" >/dev/null 2>&1 && granted=true
+  governor_facts="$(pg_round_governor_facts_json "$ROUND_KEY" "$granted")" || return 1
   cooldown_left="$(pg_cooldown_remaining_secs)"; case "$cooldown_left" in ''|*[!0-9]*) cooldown_left=0;; esac
   facts="$(jq -cnS --arg h "$PG_META_HOST" --arg o "$PG_META_OWNER" --arg r "$PG_META_REPO" --arg head "$head" --argjson p "$PR_NUM" \
     --arg identity "$identity" --arg evidence "$evidence" --arg marker "$active_marker" --arg astate "${astate:-none}" --arg reservation "$reservation" \
-    --argjson valid "$input_ok" --argjson granted "$granted" --argjson cooldown_left "$cooldown_left" --argjson completed "$completed" --arg cd "$(pg_review_decision_contract_digest)" --arg xd "$(pg_review_decision_corpus_digest)" \
-    '{active_index:{binding_valid:$valid,charged_spend_epoch:0,marker:$marker,state:$astate},completed_results:$completed,contract:{contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,corpus_digest:$xd},cooldown:{active:($cooldown_left > 0),seconds_remaining:$cooldown_left},evidence:{identity:$evidence,safe_to_prepare:true,state:(if $valid then "matching" else "missing" end)},governor:{granted:$granted},input:{binding_valid:$valid,identity:$identity,proven:$valid},named_choice:{outcomes:[],selected_id:null,snapshot_digest:""},observation:{kind:"idle"},prior_review:{applicable:false,binding_valid:false,code_identity:"",evidence_identity:"",legacy:false,marker:"",provenance_valid:false,verdict:"NONE"},reservation:{binding_valid:false,legacy:false,marker:$reservation,state:(if $reservation=="" then "none" else "live" end)},target:{head_oid:$head,host:$h,owner:$o,pr:$p,repo:$r},transport:"review-decision/v1"}')" || return 1
+    --argjson valid "$input_ok" --argjson governor "$governor_facts" --argjson cooldown_left "$cooldown_left" --argjson completed "$completed" --arg cd "$(pg_review_decision_contract_digest)" --arg xd "$(pg_review_decision_corpus_digest)" \
+    '{active_index:{binding_valid:$valid,charged_spend_epoch:0,marker:$marker,state:$astate},completed_results:$completed,contract:{contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,corpus_digest:$xd},cooldown:{active:($cooldown_left > 0),seconds_remaining:$cooldown_left},evidence:{identity:$evidence,safe_to_prepare:true,state:(if $valid then "matching" else "missing" end)},governor:$governor,input:{binding_valid:$valid,identity:$identity,proven:$valid},named_choice:{outcomes:[],selected_id:null,snapshot_digest:""},observation:{kind:"idle"},prior_review:{applicable:false,binding_valid:false,code_identity:"",evidence_identity:"",legacy:false,marker:"",provenance_valid:false,verdict:"NONE"},reservation:{binding_valid:false,legacy:false,marker:$reservation,state:(if $reservation=="" then "none" else "live" end)},target:{head_oid:$head,host:$h,owner:$o,pr:$p,repo:$r},transport:"review-decision/v1"}')" || return 1
   PG_FRESH_DECISION="$(pg_review_decision_reduce "$facts")" || return 1
   PG_FRESH_ACTION="$(jq -r .action <<<"$PG_FRESH_DECISION")"
   [ "$PG_FRESH_ACTION" = run-granted-review ]
@@ -3017,7 +3099,15 @@ if [ -n "$PR_NUM" ]; then
 fi
 [ -n "$REPO" ] || REPO="$(pwd)"
 cd "$REPO" || { echo "ERROR: repo dir not found: $REPO" >&2; pg_status failed "repo dir not found"; pg_finish 4; }
-[ -n "$PR_URL" ] || PR_URL="$(gh pr view "$PR_NUM" --json url -q .url 2>/dev/null || echo "")"
+# gate r1 P1 (#161) follow-on: honor PRO_GATE_GH_BIN here too, like recover_superseded_reason
+# (line ~806) and pg_install_full_pr_input_binding already do. Every value derived below
+# (REPO_SLUG, PR_KEY, PG_META_HOST/OWNER/REPO) starts from PR_URL; resolving it through the
+# unconditional system `gh` while the rest of the file honors an operator- or test-supplied
+# override binary would let this one call silently answer from a different GitHub identity
+# than every other lookup in the run, corrupting PG_META_* for anything downstream that trusts it.
+[ -n "$PR_URL" ] || { pr_url_gh_bin="${PRO_GATE_GH_BIN:-gh}";
+  command -v "$pr_url_gh_bin" >/dev/null 2>&1 \
+    && PR_URL="$("$pr_url_gh_bin" pr view "$PR_NUM" --json url -q .url 2>/dev/null || echo "")"; }
 
 # PR_KEY: repo-scoped identity for locks, reservations, and markers. PR numbers repeat across
 # repositories; keying on the bare number let an in-progress repo-A#77 redirect a repo-B#77 gate
@@ -3299,6 +3389,7 @@ OUTPUT FORMAT — output ONLY findings, nothing else, each exactly:
 
 where Pn is one of: P0 (critical / blocker / data-loss / security), P1 (major bug), P2 (minor), P3 (nit).
 Group by severity, P0 first. If a severity has no findings, write "Pn: none".
+If a finding's real fix is a policy the repo owner must decide (pick one of several valid approaches, not a code defect with one correct fix), raise it as NEEDS-DISCUSSION with CHOICE lines, never as FIX-FIRST — a policy choice is not something a coding agent can resolve on its own.
 If and only if your verdict is NEEDS-DISCUSSION, emit 2-8 choice lines immediately before the final VERDICT line, each exactly: CHOICE: <safe-id> | <label> | <consequence>. Use a unique safe-id containing only letters, digits, dot, underscore, colon, slash, plus, or hyphen; label is 1-120 printable characters and consequence is 1-240 printable characters. Do not emit CHOICE lines for SHIP or FIX-FIRST. Do not add fields or extra pipes.
 End with one final line:  VERDICT: SHIP | FIX-FIRST | NEEDS-DISCUSSION  — <=15 word reason.
 EOF
