@@ -377,7 +377,7 @@ an endless collect. Use `bundle` or `both` for the final round.
 | `PRO_GATE_MAX_CONCURRENCY` | `1` | Ceiling for parallel Pro chats; a ramp governor earns up to it on clean streaks |
 | `PRO_GATE_RESERVATION_TTL` | `21600` | Minimum age before confirmed exact-marker misses may exhaust recovery; elapsed time alone never releases it |
 | `PRO_GATE_DIRLOCK_ORPHAN_GRACE` | `5` | No-flock platforms only: seconds an unmarked guard directory must sit before a reclaimer may remove it |
-| `PRO_GATE_BROWSER_MEM_PRESSURE_PCT` | `85` | Percent of the browser cgroup's effective limit (`memory.high`, else `memory.max`) at which two consecutive samples arm the pressure sentinel and the health gate defers a slot with no spend |
+| `PRO_GATE_BROWSER_MEM_PRESSURE_PCT` | `85` | Percent of the browser cgroup's effective limit (the smaller finite of `memory.high` and `memory.max`; `max` means unlimited) at which two consecutive samples arm the pressure sentinel and the health gate defers a slot with no spend |
 | `PRO_GATE_BROWSER_MEM_SAMPLE_SECS` | `5` | Seconds between browser cgroup samples |
 | `PRO_GATE_BROWSER_MEM_PRESSURE_TTL` | `60` | Seconds a pressure sentinel stays fresh; a stale or absent sentinel never defers a slot |
 | `PRO_GATE_CGROUP_PATH` | *(read from `/proc/self/cgroup`)* | Browser cgroup directory to sample; absent, unreadable or unlimited (`max`) files mean no pressure, never a refusal |

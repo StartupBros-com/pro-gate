@@ -3209,6 +3209,9 @@ PG_REVIEW_DECISION_CORPUS_DIGEST='c7e8b55a5ebbf190a0bda93ae7367820cd3f9ffb8092a4
 # CURRENT digest below is ever written into a fresh binding. When a future bump changes a proof
 # rule (not just adds a reason or fact), drop the affected predecessor digest here so its bindings
 # stop being trusted, rather than widening the rule that reads them.
+# Writers share these validators with readers: every production write site passes the CURRENT digest
+# (pg_review_decision_contract_digest), so this list only widens what can be READ back, never what a
+# fresh record may claim. Keep it that way when adding a writer.
 PG_REVIEW_DECISION_COMPATIBLE_CONTRACT_DIGESTS='bf36fdb5f8625e917be0539ca014fec518649d1160584846aca1cb9149533abb 7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee'
 
 pg_review_decision_contract_id() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_ID"; }
