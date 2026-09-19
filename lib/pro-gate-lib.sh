@@ -630,7 +630,10 @@ pg_browser_mem_sampler_heartbeat() {
   # gate r4 P2: the wrapper launches the loop as "( ... ) &", where $$ is still the WRAPPER's pid,
   # so a stamp of $$ made the reader monitor the wrapper and call a SIGKILLed sampler "live" for
   # the whole freshness window. BASHPID is the subshell's own pid (bash >= 4; $$ is the fallback
-  # on a bash 3.2 host, where the wrapper never runs anyway).
+  # on a bash 3.2 host, where the wrapper never runs anyway). Contrast the reservation guard's
+  # owner record, which refuses to guess on a shell without BASHPID because every shell reaches
+  # it; this stamp has exactly one caller, the Linux-only browser wrapper, so the fallback is
+  # unreachable rather than dangerous.
   local self="${BASHPID:-$$}"
   f="$home/browser.memory-sampler"; tmp="$f.tmp.$self"
   { printf '%s %s\n' "$self" "$(date +%s)" > "$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null; } || rm -f "$tmp" 2>/dev/null
