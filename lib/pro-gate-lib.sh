@@ -609,13 +609,46 @@ pg_browser_mem_sampler_loop() {
   if [ -n "$home" ]; then
     rm -f "$home/.browser-mem-streak" "$home/browser.memory-pressure" 2>/dev/null || true
   fi
-  trap '[ -n "${sleep_pid:-}" ] && kill "$sleep_pid" 2>/dev/null; exit 0' TERM INT
+  trap '[ -n "${sleep_pid:-}" ] && kill "$sleep_pid" 2>/dev/null; [ -n "$home" ] && rm -f "$home/browser.memory-sampler" 2>/dev/null; exit 0' TERM INT
   while :; do
     pg_browser_mem_sampler_tick "$cgroup_dir" 2>/dev/null || true
+    pg_browser_mem_sampler_heartbeat 2>/dev/null || true
     sleep "$secs" 2>/dev/null &
     sleep_pid=$!
     wait "$sleep_pid" 2>/dev/null || return 0
   done
+}
+
+# pg_browser_mem_sampler_heartbeat: the loop above stamps $PRO_GATE_HOME/browser.memory-sampler
+# ("<pid> <epoch>", tmp + mv) after every sample and removes it when it exits on TERM/INT, so
+# "no pressure" can be told apart from "no sampler" (gate r3 P2, v0.53.0): an upgrade replaces the
+# browser wrapper on disk but never restarts a running browser, so the sampler only starts with
+# the next oracle-chrome.service start. Best-effort, never errors.
+pg_browser_mem_sampler_heartbeat() {
+  local home="${PRO_GATE_HOME:-}" f tmp
+  [ -n "$home" ] && [ -d "$home" ] || return 0
+  f="$home/browser.memory-sampler"; tmp="$f.tmp.$$"
+  { printf '%s %s\n' "$$" "$(date +%s)" > "$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null; } || rm -f "$tmp" 2>/dev/null
+  return 0
+}
+
+# pg_browser_mem_sampler_state: one line on stdout and rc 0 when the sampler's heartbeat is fresh
+# (within four sample intervals, at least 20s) and its pid is alive: "live (pid N, last sample Ns
+# ago)". Otherwise rc 1 with "absent", "stale (...)" or "dead (...)". Read by the doctor; the
+# health gate deliberately does NOT consult it (a missing sampler must stay fail-open).
+pg_browser_mem_sampler_state() {
+  local f="${PRO_GATE_HOME:-}/browser.memory-sampler" secs win mt age pid
+  [ -n "${PRO_GATE_HOME:-}" ] && [ -f "$f" ] || { echo absent; return 1; }
+  secs="${PRO_GATE_BROWSER_MEM_SAMPLE_SECS:-5}"; case "$secs" in ''|*[!0-9]*) secs=5 ;; esac
+  win=$(( secs * 4 )); [ "$win" -ge 20 ] || win=20
+  mt="$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)"
+  age=$(( $(date +%s) - mt ))
+  pid="$(awk '{print $1}' "$f" 2>/dev/null)"
+  if [ "$age" -lt 0 ] || [ "$age" -ge "$win" ]; then echo "stale (last sample ${age}s ago, pid ${pid:-?})"; return 1; fi
+  case "$pid" in ''|*[!0-9]*) echo "stale (unreadable pid, last sample ${age}s ago)"; return 1 ;; esac
+  if ! kill -0 "$pid" 2>/dev/null; then echo "dead (pid ${pid} exited, last sample ${age}s ago)"; return 1; fi
+  echo "live (pid ${pid}, last sample ${age}s ago)"
+  return 0
 }
 
 # pg_browser_mem_pressure: 1 + a one-line typed reason on stdout when the sampler above has a

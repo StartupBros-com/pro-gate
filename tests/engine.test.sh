@@ -8677,10 +8677,14 @@ sleep 0.5
 # Capture the sleep child's OWN pid before killing the loop -- once the loop (its parent) is
 # killed, the orphaned sleep is reparented away, so `pgrep -P <loop-pid>` would find nothing
 # AFTER the kill regardless of whether the orphan is still running. Track the specific pid instead.
+# gate r3 P2: while the loop runs it stamps a heartbeat naming its own pid; the state reader calls it live.
+LOOP_HB="$(cat "$MEM_HOME6/browser.memory-sampler" 2>/dev/null)"
+LOOP_STATE="$(PRO_GATE_HOME="$MEM_HOME6" PRO_GATE_BROWSER_MEM_SAMPLE_SECS=1000 bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_browser_mem_sampler_state")"; LOOP_STATE_RC=$?
 LOOP_SLEEP_PID="$(pgrep -P "$LOOP_PID_RESTART" 2>/dev/null | head -1)"
 kill "$LOOP_PID_RESTART" 2>/dev/null
 timeout 3 wait "$LOOP_PID_RESTART" 2>/dev/null
 sleep 0.3
+LOOP_HB_AFTER=absent; [ -f "$MEM_HOME6/browser.memory-sampler" ] && LOOP_HB_AFTER=present
 LOOP_SLEEP_SURVIVED=1
 [ -n "$LOOP_SLEEP_PID" ] && ! kill -0 "$LOOP_SLEEP_PID" 2>/dev/null && LOOP_SLEEP_SURVIVED=0
 [ -z "$LOOP_SLEEP_PID" ] && LOOP_SLEEP_SURVIVED=2
@@ -8690,6 +8694,35 @@ check 'fresh loop invocation: streak after first tick is 1 (reset then increment
   "$([ "$(cat "$MEM_HOME6/.browser-mem-streak" 2>/dev/null)" = 1 ]; echo $?)" "streak=$(cat "$MEM_HOME6/.browser-mem-streak" 2>/dev/null)"
 check 'sampler loop: killing its PID leaves no orphaned sleep child behind' \
   "$([ "$LOOP_SLEEP_SURVIVED" -eq 0 ]; echo $?)" "sleep_pid=$LOOP_SLEEP_PID survived_flag=$LOOP_SLEEP_SURVIVED (0=reaped,1=orphan survived,2=never observed)"
+check 'gate r3 P2: a running sampler loop stamps a heartbeat naming its own pid' \
+  "$([ "${LOOP_HB%% *}" = "$LOOP_PID_RESTART" ]; echo $?)" "heartbeat=[$LOOP_HB] loop_pid=$LOOP_PID_RESTART"
+check 'gate r3 P2: the state reader reports a running sampler as live' \
+  "$([ "$LOOP_STATE_RC" -eq 0 ] && printf '%s' "$LOOP_STATE" | grep -q '^live (pid '; echo $?)" "rc=$LOOP_STATE_RC state=[$LOOP_STATE]"
+check 'gate r3 P2: a stopped sampler removes its heartbeat' \
+  "$([ "$LOOP_HB_AFTER" = absent ]; echo $?)" "after_kill=$LOOP_HB_AFTER"
+# State reader on its own: absent, stale (old mtime), dead (fresh mtime, exited pid), live (this shell's pid).
+MEM_HOME7="$TDIR/mem-sentinel/home-state"; mkdir -p "$MEM_HOME7"
+STATE_ABSENT="$(PRO_GATE_HOME="$MEM_HOME7" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_browser_mem_sampler_state")"; STATE_ABSENT_RC=$?
+check 'gate r3 P2: no heartbeat reads as absent (rc 1)' "$([ "$STATE_ABSENT_RC" -eq 1 ] && [ "$STATE_ABSENT" = absent ]; echo $?)" "rc=$STATE_ABSENT_RC out=[$STATE_ABSENT]"
+printf '%s %s\n' "$$" "$(date +%s)" > "$MEM_HOME7/browser.memory-sampler"; touch -d '-1 hour' "$MEM_HOME7/browser.memory-sampler"
+STATE_STALE="$(PRO_GATE_HOME="$MEM_HOME7" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_browser_mem_sampler_state")"; STATE_STALE_RC=$?
+check 'gate r3 P2: an hour-old heartbeat reads as stale (rc 1)' "$([ "$STATE_STALE_RC" -eq 1 ] && printf '%s' "$STATE_STALE" | grep -q '^stale'; echo $?)" "rc=$STATE_STALE_RC out=[$STATE_STALE]"
+printf '%s %s\n' 4194304 "$(date +%s)" > "$MEM_HOME7/browser.memory-sampler"
+STATE_DEAD="$(PRO_GATE_HOME="$MEM_HOME7" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_browser_mem_sampler_state")"; STATE_DEAD_RC=$?
+check 'gate r3 P2: a fresh heartbeat from an exited pid reads as dead (rc 1)' "$([ "$STATE_DEAD_RC" -eq 1 ] && printf '%s' "$STATE_DEAD" | grep -q '^dead'; echo $?)" "rc=$STATE_DEAD_RC out=[$STATE_DEAD]"
+printf '%s %s\n' "$$" "$(date +%s)" > "$MEM_HOME7/browser.memory-sampler"
+STATE_LIVE="$(PRO_GATE_HOME="$MEM_HOME7" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_browser_mem_sampler_state")"; STATE_LIVE_RC=$?
+check 'gate r3 P2: a fresh heartbeat from a live pid reads as live (rc 0)' "$([ "$STATE_LIVE_RC" -eq 0 ] && printf '%s' "$STATE_LIVE" | grep -q '^live'; echo $?)" "rc=$STATE_LIVE_RC out=[$STATE_LIVE]"
+# Doctor: live -> P line; not running under no service manager -> P (inactive, expected); not running
+# under systemd -> W naming the restart. PRO_GATE_SERVICE_MANAGER=systemd only makes the doctor run a
+# read-only systemctl is-active probe for a unit CI does not have; nothing is started.
+DOCTOR_SAMPLER_LIVE="$(PRO_GATE_HOME="$MEM_HOME7" PRO_GATE_BROWSER_MODE=native PRO_GATE_SERVICE_MANAGER=none bash "$HERE/../bin/pro-gate-doctor.sh" 2>&1 || true)"
+check 'gate r3 P2 doctor: a live sampler prints the live line' "$(printf '%s' "$DOCTOR_SAMPLER_LIVE" | grep -q 'browser memory sampler: live (pid'; echo $?)" "$(printf '%s' "$DOCTOR_SAMPLER_LIVE" | grep 'browser memory sampler')"
+rm -f "$MEM_HOME7/browser.memory-sampler"
+DOCTOR_SAMPLER_NONE="$(PRO_GATE_HOME="$MEM_HOME7" PRO_GATE_BROWSER_MODE=native PRO_GATE_SERVICE_MANAGER=none bash "$HERE/../bin/pro-gate-doctor.sh" 2>&1 || true)"
+check 'gate r3 P2 doctor: no sampler with no service manager is reported inactive, not as a warning' "$(printf '%s' "$DOCTOR_SAMPLER_NONE" | grep -q 'browser memory sampler: not running (absent; the browser is not managed'; echo $?)" "$(printf '%s' "$DOCTOR_SAMPLER_NONE" | grep 'browser memory sampler')"
+DOCTOR_SAMPLER_SYSTEMD="$(PRO_GATE_HOME="$MEM_HOME7" PRO_GATE_BROWSER_MODE=native PRO_GATE_SERVICE_MANAGER=systemd bash "$HERE/../bin/pro-gate-doctor.sh" 2>&1 || true)"
+check 'gate r3 P2 doctor: no sampler under systemd warns and names the oracle-chrome.service restart' "$(printf '%s' "$DOCTOR_SAMPLER_SYSTEMD" | grep -q 'browser memory sampler: not running (absent) .* restart oracle-chrome.service'; echo $?)" "$(printf '%s' "$DOCTOR_SAMPLER_SYSTEMD" | grep 'browser memory sampler')"
 
 echo '# pg_health_gate: a fresh browser-memory sentinel defers the slot; a stale one does not'
 # Isolated from live Chrome CDP/systemd state, matching the doctor tests below and every other
