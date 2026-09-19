@@ -627,8 +627,13 @@ pg_browser_mem_sampler_loop() {
 pg_browser_mem_sampler_heartbeat() {
   local home="${PRO_GATE_HOME:-}" f tmp
   [ -n "$home" ] && [ -d "$home" ] || return 0
-  f="$home/browser.memory-sampler"; tmp="$f.tmp.$$"
-  { printf '%s %s\n' "$$" "$(date +%s)" > "$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null; } || rm -f "$tmp" 2>/dev/null
+  # gate r4 P2: the wrapper launches the loop as "( ... ) &", where $$ is still the WRAPPER's pid,
+  # so a stamp of $$ made the reader monitor the wrapper and call a SIGKILLed sampler "live" for
+  # the whole freshness window. BASHPID is the subshell's own pid (bash >= 4; $$ is the fallback
+  # on a bash 3.2 host, where the wrapper never runs anyway).
+  local self="${BASHPID:-$$}"
+  f="$home/browser.memory-sampler"; tmp="$f.tmp.$self"
+  { printf '%s %s\n' "$self" "$(date +%s)" > "$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null; } || rm -f "$tmp" 2>/dev/null
   return 0
 }
 

@@ -8698,6 +8698,15 @@ check 'gate r3 P2: a running sampler loop stamps a heartbeat naming its own pid'
   "$([ "${LOOP_HB%% *}" = "$LOOP_PID_RESTART" ]; echo $?)" "heartbeat=[$LOOP_HB] loop_pid=$LOOP_PID_RESTART"
 check 'gate r3 P2: the state reader reports a running sampler as live' \
   "$([ "$LOOP_STATE_RC" -eq 0 ] && printf '%s' "$LOOP_STATE" | grep -q '^live (pid '; echo $?)" "rc=$LOOP_STATE_RC state=[$LOOP_STATE]"
+# gate r4 P2: launched the way the wrapper launches it -- "( loop ) &" from a live parent -- the
+# heartbeat must name the SUBSHELL. SIGKILL only the sampler (no trap, stamp left behind) while the
+# parent lives on: the reader must say dead, not live-because-the-parent-is-alive.
+MEM_HOME8="$TDIR/mem-sentinel/home-subshell"; mkdir -p "$MEM_HOME8"
+SUBSHELL_OUT="$(PRO_GATE_HOME="$MEM_HOME8" PRO_GATE_BROWSER_MEM_SAMPLE_SECS=1000 bash -c '. "$0"; (pg_browser_mem_sampler_loop "$1" 2>/dev/null || true) & sp=$!; sleep 0.6; hb="$(cat "$PRO_GATE_HOME/browser.memory-sampler" 2>/dev/null)"; kill -9 "$sp" 2>/dev/null; wait "$sp" 2>/dev/null; st="$(pg_browser_mem_sampler_state)"; rc=$?; printf "parent=%s sampler=%s heartbeat=[%s] state=[%s] rc=%s\n" "$$" "$sp" "$hb" "$st" "$rc"' "$HERE/../lib/pro-gate-lib.sh" "$MEM_DIR/fix-normal")"
+check 'gate r4 P2: a sampler launched as a background subshell stamps its own pid, not the parent wrapper' \
+  "$(printf '%s' "$SUBSHELL_OUT" | awk '{split($1,p,"=");split($2,s,"=");split($3,h,"[[\\]=]"); exit !(h[2]==s[2] && h[2]!=p[2])}'; echo $?)" "$SUBSHELL_OUT"
+check 'gate r4 P2: after SIGKILL of only the sampler the reader says dead while the parent is still alive' \
+  "$(printf '%s' "$SUBSHELL_OUT" | grep -q 'state=\[dead (pid'; echo $?)" "$SUBSHELL_OUT"
 check 'gate r3 P2: a stopped sampler removes its heartbeat' \
   "$([ "$LOOP_HB_AFTER" = absent ]; echo $?)" "after_kill=$LOOP_HB_AFTER"
 # State reader on its own: absent, stale (old mtime), dead (fresh mtime, exited pid), live (this shell's pid).
