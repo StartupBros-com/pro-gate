@@ -482,7 +482,7 @@ echo '# and the unchanged head was re-cloned and reprocessed on every poll forev
 # over it, /tmp/pgtest1/run.sh in the working session -- not a hand-built envelope): an exact-current,
 # provenance-validated SHIP candidate with an EMPTY prior_review, matching what oracle-review.sh's
 # "exact" branch installs.
-SHIP_PATCH='{"completed_results":[{"applicable":true,"artifact_digest":"0000000000000000000000000000000000000000000000000000000000000000","binding_valid":true,"canonical_identity":"input-current","charged_spend_epoch":1700000004,"collected":true,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000004-4","provenance_valid":true,"verdict":"SHIP"}]}'
+SHIP_PATCH='{"completed_results":[{"applicable":true,"artifact_digest":"0000000000000000000000000000000000000000000000000000000000000000","bindable":true,"binding_valid":true,"canonical_identity":"input-current","charged_spend_epoch":1700000004,"collected":true,"evidence_mode":"full-pr","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000004-4","provenance_valid":true,"verdict":"SHIP"}]}'
 SHIP_DECISION="$HOME_D/ship-first-success.json"
 typed_decision_patch "$SHIP_PATCH" "$SHIP_DECISION"
 check 'sanity: the first-success completed_results patch reduces to allow-existing-merge-workflow/current-ship-is-merge-eligible' "$([ "$(jq -r .action "$SHIP_DECISION")" = allow-existing-merge-workflow ] && [ "$(jq -r .reason "$SHIP_DECISION")" = current-ship-is-merge-eligible ]; echo $?)" "action=$(jq -r .action "$SHIP_DECISION") reason=$(jq -r .reason "$SHIP_DECISION")"
@@ -497,13 +497,13 @@ check 'a first successful SHIP review (completed_results, empty prior_review) co
 
 echo '# #184 finding 1 (round 5): the negative -- a FIX-FIRST or NEEDS-DISCUSSION decision at the SAME head must NOT complete'
 
-FIXFIRST_PATCH='{"completed_results":[{"applicable":true,"artifact_digest":"0000000000000000000000000000000000000000000000000000000000000000","binding_valid":true,"canonical_identity":"input-current","charged_spend_epoch":1700000004,"collected":true,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000004-4","provenance_valid":true,"verdict":"FIX-FIRST"}]}'
+FIXFIRST_PATCH='{"completed_results":[{"applicable":true,"artifact_digest":"0000000000000000000000000000000000000000000000000000000000000000","bindable":true,"binding_valid":true,"canonical_identity":"input-current","charged_spend_epoch":1700000004,"collected":true,"evidence_mode":"full-pr","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000004-4","provenance_valid":true,"verdict":"FIX-FIRST"}]}'
 FIXFIRST_DECISION="$HOME_D/fixfirst-first-success.json"
 typed_decision_patch "$FIXFIRST_PATCH" "$FIXFIRST_DECISION"
 check 'sanity: the FIX-FIRST completed_results patch reduces to fix-review-findings/review-findings-require-fix' "$([ "$(jq -r .action "$FIXFIRST_DECISION")" = fix-review-findings ] && [ "$(jq -r .reason "$FIXFIRST_DECISION")" = review-findings-require-fix ]; echo $?)" "action=$(jq -r .action "$FIXFIRST_DECISION") reason=$(jq -r .reason "$FIXFIRST_DECISION")"
 check 'the completion-proof helper rejects a FIX-FIRST decision at the same head' "$(! daemon_decision_completes_current_head "$FIXFIRST_DECISION"; echo $?)"
 
-NEEDSDISC_PATCH='{"completed_results":[{"applicable":true,"artifact_digest":"0000000000000000000000000000000000000000000000000000000000000000","binding_valid":true,"canonical_identity":"input-current","charged_spend_epoch":1700000004,"collected":true,"legacy":false,"marker":"pg-run-acme-widgets-1983-1700000004-4","provenance_valid":true,"verdict":"NEEDS-DISCUSSION"}]}'
+NEEDSDISC_PATCH='{"completed_results":[{"applicable":true,"artifact_digest":"0000000000000000000000000000000000000000000000000000000000000000","bindable":true,"binding_valid":true,"canonical_identity":"input-current","charged_spend_epoch":1700000004,"collected":true,"evidence_mode":"full-pr","legacy":false,"marker":"pg-run-acme-widgets-1983-1700000004-4","provenance_valid":true,"verdict":"NEEDS-DISCUSSION"}]}'
 NEEDSDISC_DECISION="$HOME_D/needsdisc-first-success.json"
 typed_decision_patch "$NEEDSDISC_PATCH" "$NEEDSDISC_DECISION"
 check 'sanity: the NEEDS-DISCUSSION completed_results patch (no named-choice outcomes) reduces to a non-completion stop reason' "$([ "$(jq -r .action "$NEEDSDISC_DECISION")" = stop-without-new-review ] && [ "$(jq -r .reason "$NEEDSDISC_DECISION")" != identical-code-and-evidence ]; echo $?)" "action=$(jq -r .action "$NEEDSDISC_DECISION") reason=$(jq -r .reason "$NEEDSDISC_DECISION")"

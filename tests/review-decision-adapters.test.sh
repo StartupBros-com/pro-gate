@@ -195,6 +195,22 @@ check 'library validator rejects a blocking-wait next_action injected into the f
 check 'library validator rejects a foreign contract digest' "$([ "$DIGEST_OK" = 1 ]; printf '%s' "$?")" "$ENVELOPE_DETAIL"
 check 'library validator refuses a symlinked decision file' "$([ "$SYMLINK_OK" = 1 ]; printf '%s' "$?")"
 
+# #147: `bindable` is a closed-schema field on every completed_results row, not decoration. Strip it
+# from a genuine envelope's facts and the reducer either rejects the now-malformed facts outright or
+# recomputes a different byte-for-byte decision -- either way the validator must reject the on-disk
+# envelope, since it no longer matches re-running the reducer over its own (now-tampered) facts.
+# Restoring the field must accept again, proving the earlier rejection was this field and not noise.
+BINDABLE_CASE_INDEX="$(jq '[.cases[].name] | index("collect current completed result")' "$CORPUS")"
+corpus_envelope "$BINDABLE_CASE_INDEX" "$TMP/bindable-envelope.json"
+jq -c 'del(.facts.completed_results[0].bindable)' "$TMP/bindable-envelope.json" > "$TMP/bindable-removed.json"
+check 'envelope with bindable stripped from a completed_results row is rejected as undefined' \
+  "$(envelope_rejects "$TMP/bindable-removed.json"; printf '%s' "$?")" \
+  "$(cat "$TMP/bindable-removed.json")"
+jq -c '.facts.completed_results[0].bindable=true' "$TMP/bindable-removed.json" > "$TMP/bindable-restored.json"
+check 'the same envelope with bindable restored validates again' \
+  "$(pg_review_decision_envelope_valid "$TMP/bindable-restored.json" >/dev/null 2>&1; printf '%s' "$?")" \
+  "$(cat "$TMP/bindable-restored.json")"
+
 # gate #148 r8 P1: a prose consumer must NOT pin the wait at all. The engine treats any --timeout
 # it receives as final (bin/oracle-review.sh: `if [ -z "$TIMEOUT" ]`), so a skill or relay that
 # hardcodes one makes PRO_GATE_TIMEOUT and PRO_GATE_HARVEST_TIMEOUT unreachable on the path most

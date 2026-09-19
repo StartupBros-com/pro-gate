@@ -3155,8 +3155,8 @@ pg_completed_lookup() {  # <marker> <out>: place the artifact at <out>; rc 0 on 
 # ─────────────────────────────────────────────────────────────────────────────
 PG_REVIEW_DECISION_CONTRACT_ID='review-decision/v1'
 PG_REVIEW_DECISION_CONTRACT_VERSION=1
-PG_REVIEW_DECISION_CONTRACT_DIGEST='bf36fdb5f8625e917be0539ca014fec518649d1160584846aca1cb9149533abb'
-PG_REVIEW_DECISION_CORPUS_DIGEST='60b4059115dd0651de8b209775f0783b3095f432842c036f618308a307b01358'
+PG_REVIEW_DECISION_CONTRACT_DIGEST='7a057926a42d4df0de94db856e3637c3b71e114672038d583d7513f7396fe911'
+PG_REVIEW_DECISION_CORPUS_DIGEST='e7e85192681887b97924b594ca8ab544b9f9e54cd758d339571dc638190d80e2'
 
 pg_review_decision_contract_id() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_ID"; }
 pg_review_decision_contract_version() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_VERSION"; }
@@ -3366,10 +3366,11 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
     def hex: type=="string" and test("^[0-9a-f]{64}$");
     def oid: type=="string" and test("^[0-9a-f]{40}([0-9a-f]{24})?$");
     def result:
-      keys_are(["applicable","artifact_digest","binding_valid","canonical_identity","charged_spend_epoch","collected","legacy","marker","provenance_valid","verdict"])
-      and (.applicable|type=="boolean") and (.artifact_digest|hex) and (.binding_valid|type=="boolean")
+      keys_are(["applicable","artifact_digest","bindable","binding_valid","canonical_identity","charged_spend_epoch","collected","evidence_mode","legacy","marker","provenance_valid","verdict"])
+      and (.applicable|type=="boolean") and (.artifact_digest|hex) and (.bindable|type=="boolean") and (.binding_valid|type=="boolean")
       and (.canonical_identity|ident and length>0) and (.charged_spend_epoch|type=="number" and floor==.)
-      and (.collected|type=="boolean") and (.legacy|type=="boolean") and (.marker|marker and length>0)
+      and (.collected|type=="boolean") and (.evidence_mode|IN("full-pr","scoped-delta","connector","caller-patch","none"))
+      and (.legacy|type=="boolean") and (.marker|marker and length>0)
       and (.provenance_valid|type=="boolean") and (.verdict|IN("SHIP","FIX-FIRST","NEEDS-DISCUSSION","NONE"));
     (keys_are(["active_index","completed_results","contract","cooldown","evidence","governor","input","named_choice","observation","prior_review","reservation","target","transport"]))
     and (.contract|keys_are(["contract_digest","contract_id","contract_version","corpus_digest"]))
@@ -3421,6 +3422,12 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
     fi
     selected_ref="$(jq -r .canonical_identity <<<"$selected")"
     if [ "$(jq -r .collected <<<"$selected")" = false ]; then
+      # An uncollected result whose evidence mode can never carry merge proof (a connector SHIP,
+      # #147) is unrepairable, not transient: re-issuing collect would loop forever. Stop typed,
+      # with the mode and marker in the facts, and never route it to merge eligibility.
+      if [ "$(jq -r .bindable <<<"$selected")" = false ]; then
+        pg_review_decision_emit stop-without-new-review result-not-bindable-for-mode "$canonical" "$snapshot" "$selected_ref"; return
+      fi
       pg_review_decision_emit collect-existing-result completed-result-awaits-collection "$canonical" "$snapshot" "$selected_ref"; return
     fi
   fi
