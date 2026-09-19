@@ -2023,8 +2023,22 @@ pg_install_full_pr_input_binding() { # marker; only endpoint-fetched full PRs ga
   if [ "${PG_FULL_PR_PROVEN:-0}" != 1 ]; then
     if [ "$DIFF_IS_CALLER_SUPPLIED" = 1 ] && [ -n "${RUN_SPEND_EPOCH:-}" ] \
        && [ -n "${PG_META_HOST:-}${PG_META_OWNER:-}${PG_META_REPO:-}" ] && [ -n "$PR_NUM" ]; then
-      local cp_head
-      cp_head="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || true)"
+      local cp_head cp_gh_bin cp_timeout_bin cp_payload
+      # gate r1 P1: target.head_oid must be the PR's GitHub-reported head, never the caller's
+      # local checkout state — `git -C "$REPO" rev-parse HEAD` can diverge from the real pushed
+      # head (a stale or ahead-of-PR clone), and recover_superseded_reason later trusts this value
+      # as bound_head verbatim, comparing it against a fresh `gh pr view --json headRefOid` to
+      # decide whether the PR moved. A local-checkout mismatch would falsely "prove" head-moved
+      # and supersede a reservation whose real PR head never changed. Fetch authoritatively here,
+      # exactly like recover_superseded_reason does (bin/oracle-review.sh:~806-809); any failure
+      # (gh missing, timeout, malformed JSON) falls back to no binding at all — best-effort, same
+      # as every other branch in this function.
+      cp_gh_bin="${PRO_GATE_GH_BIN:-gh}"; cp_timeout_bin="${PRO_GATE_TIMEOUT_BIN:-timeout}"
+      if command -v "$cp_gh_bin" >/dev/null 2>&1 && command -v "$cp_timeout_bin" >/dev/null 2>&1; then
+        cp_payload="$("$cp_timeout_bin" -k 1s 10s "$cp_gh_bin" pr view "$PR_NUM" \
+          --repo "${PG_META_HOST}/${PG_META_OWNER}/${PG_META_REPO}" --json headRefOid 2>/dev/null || true)"
+        cp_head="$(jq -r '.headRefOid // ""' <<<"$cp_payload" 2>/dev/null)"
+      fi
       if [[ "$cp_head" =~ ^[0-9a-f]{40,64}$ ]]; then
         binding="$(jq -cnS --arg cd "$(pg_review_decision_contract_digest)" --arg marker "$marker" \
           --arg host "$PG_META_HOST" --arg owner "$PG_META_OWNER" --arg repo "$PG_META_REPO" --argjson pr "$PR_NUM" \
@@ -3081,7 +3095,15 @@ if [ -n "$PR_NUM" ]; then
 fi
 [ -n "$REPO" ] || REPO="$(pwd)"
 cd "$REPO" || { echo "ERROR: repo dir not found: $REPO" >&2; pg_status failed "repo dir not found"; pg_finish 4; }
-[ -n "$PR_URL" ] || PR_URL="$(gh pr view "$PR_NUM" --json url -q .url 2>/dev/null || echo "")"
+# gate r1 P1 (#161) follow-on: honor PRO_GATE_GH_BIN here too, like recover_superseded_reason
+# (line ~806) and pg_install_full_pr_input_binding already do. Every value derived below
+# (REPO_SLUG, PR_KEY, PG_META_HOST/OWNER/REPO) starts from PR_URL; resolving it through the
+# unconditional system `gh` while the rest of the file honors an operator- or test-supplied
+# override binary would let this one call silently answer from a different GitHub identity
+# than every other lookup in the run, corrupting PG_META_* for anything downstream that trusts it.
+[ -n "$PR_URL" ] || { pr_url_gh_bin="${PRO_GATE_GH_BIN:-gh}";
+  command -v "$pr_url_gh_bin" >/dev/null 2>&1 \
+    && PR_URL="$("$pr_url_gh_bin" pr view "$PR_NUM" --json url -q .url 2>/dev/null || echo "")"; }
 
 # PR_KEY: repo-scoped identity for locks, reservations, and markers. PR numbers repeat across
 # repositories; keying on the bare number let an in-progress repo-A#77 redirect a repo-B#77 gate

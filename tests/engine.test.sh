@@ -644,7 +644,16 @@ cat > "$TDIR/user/.local/bin/gh" <<'CONN150_GH'
 #!/usr/bin/env bash
 case "$1 $2" in
   "pr diff") printf 'diff --git a/f.txt b/f.txt\nindex aaaaaaa..bbbbbbb 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-base\n+head\n' ;;
-  "pr view") printf 'https://github.com/acme/conn150/pull/%s\n' "$3" ;;
+  "pr view")
+    # gate r1 P1 (#161): the caller-patch installer now fetches the PR's real head via
+    # `gh pr view ... --json headRefOid` instead of trusting local git state -- respond to that
+    # shape distinctly from the plain `--json url -q .url` lookup this stub already answers.
+    if printf '%s\n' "$*" | grep -q -- 'headRefOid'; then
+      printf '{"state":"OPEN","headRefOid":"%s"}\n' "${PG_TEST_CONN150_HEAD:?PG_TEST_CONN150_HEAD unset}"
+    else
+      printf 'https://github.com/acme/conn150/pull/%s\n' "$3"
+    fi
+    ;;
   *) exit 1 ;;
 esac
 CONN150_GH
@@ -682,12 +691,14 @@ check '#150 planted negative: the neighbouring classic --input bundle run still 
 # reservation later has something for recover_superseded_reason()/pg_reservation_supersede to
 # read. Reuses CONN150_REPO's already-committed base/head commits and gh stub.
 git -C "$CONN150_REPO" diff HEAD~1 HEAD > "$TDIR/conn150-caller.diff"
+CONN150_HEAD="$(git -C "$CONN150_REPO" rev-parse HEAD)"
 conn150_caller_run() { # home pr out
   env HOME="$TDIR/user" PRO_GATE_HOME="$1" PRO_GATE_INPUT_POLICY=connector-enabled \
     ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 \
     PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 PRO_GATE_MAX_ROUNDS_PER_PR=1 \
     PRO_GATE_LOCK_WAIT=2 PRO_GATE_TIMEOUT_GRACE=0 PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 \
     PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_ORACLE_COMPLETE=1 NODE_OPTIONS= \
+    PG_TEST_CONN150_HEAD="$CONN150_HEAD" \
     bash "$ENGINE" --pr "$2" --repo "$CONN150_REPO" --diff "$TDIR/conn150-caller.diff" --input bundle --out "$3" --timeout 10s \
     >"$TDIR/stdout" 2>"$TDIR/stderr"
   RC=$?
@@ -700,6 +711,96 @@ check '#161 classic --pr --diff (caller-supplied) installs a caller-patch bindin
      && jq -e '.evidence.mode=="caller-patch" and .evidence.proof.commit_target==.target.head_oid and .evidence.proof.endpoint_digest==null and .evidence.proof.raw_diff_digest==null and .evidence.proof.repository_target=="github.com/acme/conn150" and .target.pr==93' \
        <<<"$CONN150_CALLERPATCH_BINDING" >/dev/null 2>&1; echo $?)" \
   "rc=$RC binding_file=$CONN150_CALLERPATCH_BINDING_FILE binding=$CONN150_CALLERPATCH_BINDING stderr=$(cat "$TDIR/stderr")"
+
+# gate r1 P1 (#161): target.head_oid must be the PR's GitHub-reported head, never the caller's
+# local checkout state. A --diff run's $REPO checkout can be stale relative to the PR's real
+# pushed head (README's "review a local diff" usage never requires the clone to be synced to the
+# PR's exact head) -- if the installer trusted local git state, recover_superseded_reason() would
+# later compare that stale value against the true current head and falsely declare the PR head
+# "moved", superseding a reservation that was never actually stuck for that reason and writing a
+# false head-moved provenance entry into ledger.jsonl. DIVERGE161_REPO is deliberately left
+# checked out at the stale base commit while the stubbed `gh` reports the true (unmoved) head.
+DIVERGE161_REPO="$TDIR/diverge161-repo"
+mkdir -p "$DIVERGE161_REPO"
+git -C "$DIVERGE161_REPO" init -q
+git -C "$DIVERGE161_REPO" config user.email test@example.invalid
+git -C "$DIVERGE161_REPO" config user.name 'Engine Test'
+printf 'base\n' > "$DIVERGE161_REPO/f.txt"
+git -C "$DIVERGE161_REPO" add f.txt && git -C "$DIVERGE161_REPO" commit -qm diverge161-base
+DIVERGE161_BASE="$(git -C "$DIVERGE161_REPO" rev-parse HEAD)"
+printf 'head\n' > "$DIVERGE161_REPO/f.txt"
+git -C "$DIVERGE161_REPO" add f.txt && git -C "$DIVERGE161_REPO" commit -qm diverge161-head
+DIVERGE161_HEAD="$(git -C "$DIVERGE161_REPO" rev-parse HEAD)"
+git -C "$DIVERGE161_REPO" remote add origin https://github.com/acme/diverge161.git
+git -C "$DIVERGE161_REPO" diff "$DIVERGE161_BASE" "$DIVERGE161_HEAD" > "$TDIR/diverge161.diff"
+git -C "$DIVERGE161_REPO" checkout -q "$DIVERGE161_BASE"
+mkdir -p "$TDIR/bin"
+DIVERGE161_GH="$TDIR/bin/gh-diverge161"
+DIVERGE161_GH_CALLS="$TDIR/diverge161-gh.calls"
+cat > "$DIVERGE161_GH" <<'DIVERGE161_GH_STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${PG_TEST_GH_CALLS:?}"
+case "$1 $2" in
+  "pr view")
+    if printf '%s\n' "$*" | grep -q -- 'headRefOid'; then
+      printf '{"state":"OPEN","headRefOid":"%s"}\n' "${PG_TEST_GH_HEAD:?}"
+    else
+      printf 'https://github.com/acme/diverge161/pull/%s\n' "$3"
+    fi
+    ;;
+  *) exit 1 ;;
+esac
+DIVERGE161_GH_STUB
+chmod +x "$DIVERGE161_GH"
+DIVERGE161_HOME="$TDIR/home-diverge161"
+: > "$DIVERGE161_GH_CALLS"
+env HOME="$TDIR/user" PRO_GATE_HOME="$DIVERGE161_HOME" PRO_GATE_INPUT_POLICY=connector-enabled \
+  ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 \
+  PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 PRO_GATE_MAX_ROUNDS_PER_PR=1 \
+  PRO_GATE_LOCK_WAIT=2 PRO_GATE_TIMEOUT_GRACE=0 PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_ORACLE_COMPLETE=1 NODE_OPTIONS= \
+  PRO_GATE_GH_BIN="$DIVERGE161_GH" PG_TEST_GH_CALLS="$DIVERGE161_GH_CALLS" PG_TEST_GH_HEAD="$DIVERGE161_HEAD" \
+  bash "$ENGINE" --pr 94 --repo "$DIVERGE161_REPO" --diff "$TDIR/diverge161.diff" --input bundle --out "$TDIR/diverge161-out.md" --timeout 10s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+DIVERGE161_RC=$?
+DIVERGE161_BINDING_FILE="$(find "$DIVERGE161_HOME/review-input-bindings" -mindepth 1 -maxdepth 1 -type f -name 'pg-run-*' -print -quit 2>/dev/null)"
+DIVERGE161_BINDING="$([ -n "$DIVERGE161_BINDING_FILE" ] && cat "$DIVERGE161_BINDING_FILE" || true)"
+DIVERGE161_MARKER="$(basename "${DIVERGE161_BINDING_FILE:-}" 2>/dev/null)"
+check '#161 gate r1 P1: caller-patch binding records the GitHub-reported head, not a stale local checkout' \
+  "$([ "$DIVERGE161_RC" -eq 0 ] && [ -n "$DIVERGE161_BINDING" ] \
+     && jq -e --arg head "$DIVERGE161_HEAD" --arg base "$DIVERGE161_BASE" \
+       '.evidence.mode=="caller-patch" and .target.head_oid==$head and .target.head_oid!=$base and .evidence.proof.commit_target==$head' \
+       <<<"$DIVERGE161_BINDING" >/dev/null 2>&1; echo $?)" \
+  "rc=$DIVERGE161_RC binding_file=$DIVERGE161_BINDING_FILE binding=$DIVERGE161_BINDING base=$DIVERGE161_BASE head=$DIVERGE161_HEAD stderr=$(cat "$TDIR/stderr")"
+check '#161 gate r1 P1: install fetched the PR head from GitHub rather than trusting local git state' \
+  "$(grep -qF -- 'pr view 94 --repo github.com/acme/diverge161 --json headRefOid' "$DIVERGE161_GH_CALLS" 2>/dev/null; echo $?)" \
+  "gh_calls=$(tr '\n' ';' < "$DIVERGE161_GH_CALLS" 2>/dev/null)"
+# Consequence check: since the bound head is now the true GitHub head, recovering while that head
+# is genuinely unmoved must NOT supersede -- reproducing the exact false-positive scenario named
+# by the finding (stale local checkout, unmoved real PR head) and proving it no longer fires.
+# A synchronously-completed ci-fixture marker goes straight from charge to completed/, never
+# through in-progress/ -- removing the completed artifact routes --recover through
+# pg_reservation_restore_from_meta() (lib/pro-gate-lib.sh:1561), which recreates in-progress/
+# itself with state "generating" from run-meta, giving the "still generating" shape this check
+# needs with no manual state-file forging.
+DIVERGE161_IPF="$DIVERGE161_HOME/in-progress/$DIVERGE161_MARKER"
+DIVERGE161_LEDGER_BEFORE="$(wc -l < "$DIVERGE161_HOME/ledger.jsonl" 2>/dev/null || echo 0)"
+rm -f "$DIVERGE161_HOME/completed/$DIVERGE161_MARKER" 2>/dev/null
+: > "$DIVERGE161_GH_CALLS"
+env HOME="$TDIR/user" PRO_GATE_HOME="$DIVERGE161_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PRO_GATE_TEST_MODE=ci-fixture NODE_OPTIONS= \
+  PRO_GATE_GH_BIN="$DIVERGE161_GH" PG_TEST_GH_CALLS="$DIVERGE161_GH_CALLS" PG_TEST_GH_HEAD="$DIVERGE161_HEAD" \
+  bash "$ENGINE" --recover "$DIVERGE161_MARKER" --repo "$DIVERGE161_REPO" --out "$TDIR/diverge161-recover-out.md" --timeout 10s \
+  >"$TDIR/diverge161-recover-stdout" 2>"$TDIR/diverge161-recover-stderr"
+DIVERGE161_RRC=$?
+DIVERGE161_STATE_AFTER="$(awk -F'\t' 'NR==1{print $8}' "$DIVERGE161_IPF" 2>/dev/null)"
+DIVERGE161_FALSE_SUPERSEDE_ENTRY="$(tail -n "+$((DIVERGE161_LEDGER_BEFORE + 1))" "$DIVERGE161_HOME/ledger.jsonl" 2>/dev/null | grep -F "\"marker\":\"$DIVERGE161_MARKER\"" | grep -F '"outcome":"superseded"')"
+# rc 9 ("Still working", documented at bin/oracle-review.sh:54) is the correct non-superseded
+# terminal state for a review that is genuinely still generating; rc 6 ("Review superseded") is
+# the bug this check guards against.
+check '#161 gate r1 P1: recover does not falsely supersede when only the local checkout was stale and the real PR head never moved' \
+  "$([ "$DIVERGE161_RRC" -eq 9 ] && [ "$DIVERGE161_STATE_AFTER" = generating ] && [ -z "$DIVERGE161_FALSE_SUPERSEDE_ENTRY" ]; echo $?)" \
+  "rc=$DIVERGE161_RRC state_after=$DIVERGE161_STATE_AFTER false_supersede_ledger_entry=${DIVERGE161_FALSE_SUPERSEDE_ENTRY:-<none>} gh_calls=$(tr '\n' ';' < "$DIVERGE161_GH_CALLS" 2>/dev/null) stderr=$(cat "$TDIR/diverge161-recover-stderr")"
 
 # Lifecycle-only modes remain usable under an invalid policy: the engine reaches their normal
 # handler instead of rejecting an unrelated historical inspection or recovery action.
