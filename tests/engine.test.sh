@@ -108,6 +108,54 @@ exec "$REAL_TIMEOUT" "\$@"
 TIMEOUT_LOG
 chmod +x "$TIMEOUT_LOG_BIN"
 
+# One flock recorder for every case that needs to observe a wait budget or refuse a specific lock.
+# It records each `flock -w <secs> <fd>` call as "<secs>\t<resolved path>" and then either refuses
+# the call or execs the real flock:
+#   PG_TEST_FAIL_CHANGE_LOCK=1        refuses the per-change lock  (*.pr-*)
+#   PG_TEST_FAIL_RESERVATION_GUARD=1  refuses the reservation handoff guard (*/in-progress.lock,
+#                                     lib pg_reservation_lock)
+#   PG_TEST_FAIL_GUARD_AFTER_SLOT_SCAN=<file>
+#                                     records every nonblocking slot scan to <file> and refuses the
+#                                     reservation handoff guard from the first one onward. A slot
+#                                     scan is pg_lock_n's `flock -n` probe, which the engine only
+#                                     reaches while HOLDING the guard, so it is direct proof that
+#                                     account capacity was read. Ordering, not wall-clock timing,
+#                                     is what makes the resulting "read, then guard-blocked" wait
+#                                     deterministic.
+# All three default off, so installing the shim alone changes nothing. The fd is resolved through
+# /proc/self/fd because bash hands the descriptor down by inheritance, not by name — that works
+# for pg_lock's fixed fd 9 and for the guard's {var}-allocated fd alike.
+install_flock_shim() { # $1 = bin directory to install into
+  local dir="$1" real
+  real="$(command -v flock)"
+  mkdir -p "$dir"
+  cat > "$dir/flock" <<SHIM_FLOCK
+#!/usr/bin/env bash
+if [ "\${1:-}" = -n ] && [ -n "\${PG_TEST_FAIL_GUARD_AFTER_SLOT_SCAN:-}" ]; then
+  scan_target="\$(readlink "/proc/\$\$/fd/\${2:-}" 2>/dev/null || true)"
+  case "\$scan_target" in
+    *oracle.lock.slot*) printf '%s\n' "\$scan_target" >> "\$PG_TEST_FAIL_GUARD_AFTER_SLOT_SCAN" ;;
+  esac
+fi
+if [ "\${1:-}" = -w ]; then
+  wait_s="\${2:-}"
+  fd="\${3:-}"
+  target="\$(readlink "/proc/\$\$/fd/\$fd" 2>/dev/null || true)"
+  printf '%s\t%s\n' "\$wait_s" "\$target" >> "\${PG_TEST_FLOCK_LOG:?}"
+  case "\$target" in
+    *.pr-*) [ "\${PG_TEST_FAIL_CHANGE_LOCK:-0}" = 1 ] && exit 1 ;;
+    */in-progress.lock)
+      [ "\${PG_TEST_FAIL_RESERVATION_GUARD:-0}" = 1 ] && exit 1
+      [ -n "\${PG_TEST_FAIL_GUARD_AFTER_SLOT_SCAN:-}" ] \
+        && [ -s "\$PG_TEST_FAIL_GUARD_AFTER_SLOT_SCAN" ] && exit 1
+      ;;
+  esac
+fi
+exec "$real" "\$@"
+SHIM_FLOCK
+  chmod +x "$dir/flock"
+}
+
 # gate #148 r1 P2 change-lock-wait-budget: the per-change guard is acquired before the account
 # slot, so its default must cover both the slot queue and the effective review hard cap. Exercise
 # the real engine path with a flock recorder that refuses only the per-change lock immediately;
@@ -119,22 +167,8 @@ run_change_lock_wait_budget_tests() {
   local wait_user="$TDIR/wait-sizing-user" wait_bin="$TDIR/wait-sizing-user/.local/bin" wait_path wait_real_flock
   local wait_diff="$TDIR/wait-sizing.diff" wait_log="$TDIR/wait-sizing-flock.log"
   local wait_home wait_observed wait_slot_fd wait_slot_holder_pid wait_holder_pid wait_waiter_pid wait_holder_rc wait_waiter_rc
-  mkdir -p "$wait_bin"
   wait_real_flock="$(command -v flock)"
-  cat > "$wait_bin/flock" <<WAIT_FLOCK
-#!/usr/bin/env bash
-if [ "\${1:-}" = -w ]; then
-  wait_s="\${2:-}"
-  fd="\${3:-}"
-  target="\$(readlink "/proc/\$\$/fd/\$fd" 2>/dev/null || true)"
-  printf '%s\t%s\n' "\$wait_s" "\$target" >> "\${PG_TEST_FLOCK_LOG:?}"
-  case "\$target" in
-    *.pr-*) [ "\${PG_TEST_FAIL_CHANGE_LOCK:-0}" = 1 ] && exit 1 ;;
-  esac
-fi
-exec "$wait_real_flock" "\$@"
-WAIT_FLOCK
-  chmod +x "$wait_bin/flock"
+  install_flock_shim "$wait_bin"
   wait_path="$wait_bin:$PATH"
   printf 'diff --git a/wait b/wait\n--- a/wait\n+++ b/wait\n@@ -0,0 +1 @@\n+wait\n' > "$wait_diff"
   printf 'foreign idle tab\n' > "$TDIR/wait-sizing-tab.txt"
@@ -364,6 +398,149 @@ if [ "${PG_TEST_ONLY:-}" = change-lock-wait-budget ]; then
   [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }
 fi
 
+# #179 slot-guard-bound: the account-slot loop takes the reservation handoff guard before it may
+# read capacity, and a run that can never take that guard must still respect SLOT_WAIT. The bug
+# was control flow, not budget: the guard-failure path did `sleep 3; continue`, and `continue`
+# jumps over the deadline check at the bottom of the loop, so the wait never expired. These cases
+# refuse only the guard's own flock and pin the whole contract — the run ends, it ends at exit 7
+# with the slot-timeout status, it names the guard instead of blaming a busy account, and it never
+# reaches Oracle. Each engine invocation is wrapped in a real timeout so an unbounded loop fails
+# the assertion instead of hanging the suite.
+run_slot_guard_bound_tests() {
+  local guard_user="$TDIR/slot-guard-user" guard_bin="$TDIR/slot-guard-user/.local/bin" guard_path
+  local guard_diff="$TDIR/slot-guard.diff" guard_log="$TDIR/slot-guard-flock.log"
+  local guard_home guard_sentinel guard_attempts guard_started guard_elapsed guard_scan_mark
+  install_flock_shim "$guard_bin"
+  guard_path="$guard_bin:$PATH"
+  printf 'diff --git a/guard b/guard\n--- a/guard\n+++ b/guard\n@@ -0,0 +1 @@\n+guard\n' > "$guard_diff"
+  printf 'foreign idle tab\n' > "$TDIR/slot-guard-tab.txt"
+  start_mock "$TDIR/slot-guard-tab.txt"
+  guard_sentinel="$TDIR/slot-guard-oracle.calls"
+
+  # An already-expired budget (PRO_GATE_LOCK_WAIT=0) must be honoured on the guard-failure path
+  # exactly as it is when the guard is held and no slot is free. Pre-fix this returned 124.
+  guard_home="$TDIR/home-slot-guard-expired"; mkdir -p "$guard_home"
+  : > "$guard_log"; : > "$guard_sentinel"
+  guard_started="$(date +%s)"
+  env HOME="$guard_user" PRO_GATE_HOME="$guard_home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+    PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
+    PRO_GATE_LOCK_WAIT=0 PRO_GATE_TIMEOUT=23s PRO_GATE_TIMEOUT_GRACE=5 \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_ORACLE_SENTINEL="$guard_sentinel" \
+    PG_TEST_FLOCK_LOG="$guard_log" PG_TEST_FAIL_RESERVATION_GUARD=1 PATH="$guard_path" NODE_OPTIONS= \
+    "$REAL_TIMEOUT" 120s bash "$ENGINE" --diff "$guard_diff" --repo "$TDIR" --out "$guard_home/review.md" \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+  RC=$?
+  guard_elapsed=$(( $(date +%s) - guard_started ))
+  check '#179 slot-guard-bound: an unacquirable guard still expires the slot wait (exit 7, no hang)' \
+    "$([ "$RC" -eq 7 ] && [ "$guard_elapsed" -lt 120 ]; echo $?)" \
+    "rc=$RC (124 = still unbounded) elapsed=${guard_elapsed}s stderr=$(tail -5 "$TDIR/stderr")"
+  check '#179 slot-guard-bound: guard-blocked expiry reports the slot-timeout status' \
+    "$([ "$(phase_of "$guard_home/review.md.status")" = failed ] \
+       && grep -qF '"detail":"slot timeout"' "$guard_home/review.md.status"; echo $?)" \
+    "$(cat "$guard_home/review.md.status" 2>/dev/null)"
+  check '#179 slot-guard-bound: no Oracle invocation, so no Pro slot is spent' \
+    "$([ ! -s "$guard_sentinel" ]; echo $?)" \
+    "sentinel=$(cat "$guard_sentinel" 2>/dev/null)"
+  check '#179 slot-guard-bound: the expiry names the guard instead of blaming a busy account' \
+    "$(grep -Fq 'reservation handoff guard' "$TDIR/stderr" \
+       && ! grep -Fq 'review slots are busy with running reviews' "$TDIR/stderr"; echo $?)" \
+    "stderr=$(tail -5 "$TDIR/stderr")"
+
+  # A short but non-zero budget proves the loop really waits and then STOPS: the guard is retried
+  # across several slices (each `sleep 3`) and the run still ends inside its own budget. Counting
+  # guard attempts is what separates "bounded" from "expired before it ever looped".
+  # The budget is 13s rather than the 7s that would already demonstrate this, so the asserted floor
+  # of 3 attempts keeps real margin: 13s yields 6 observed attempts on an idle box and still clears
+  # 3 if every slice takes four times as long on a loaded runner. A floor one attempt below the
+  # expected count is a flake waiting for a slow CI runner.
+  guard_home="$TDIR/home-slot-guard-short"; mkdir -p "$guard_home"
+  : > "$guard_log"; : > "$guard_sentinel"
+  guard_started="$(date +%s)"
+  env HOME="$guard_user" PRO_GATE_HOME="$guard_home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+    PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
+    PRO_GATE_LOCK_WAIT=13 PRO_GATE_TIMEOUT=23s PRO_GATE_TIMEOUT_GRACE=5 \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_ORACLE_SENTINEL="$guard_sentinel" \
+    PG_TEST_FLOCK_LOG="$guard_log" PG_TEST_FAIL_RESERVATION_GUARD=1 PATH="$guard_path" NODE_OPTIONS= \
+    "$REAL_TIMEOUT" 120s bash "$ENGINE" --diff "$guard_diff" --repo "$TDIR" --out "$guard_home/review.md" \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+  RC=$?
+  guard_elapsed=$(( $(date +%s) - guard_started ))
+  guard_attempts="$(grep -c '/in-progress\.lock$' "$guard_log" 2>/dev/null || echo 0)"
+  check '#179 slot-guard-bound: a short budget retries the guard across slices and still expires' \
+    "$([ "$RC" -eq 7 ] && [ "$guard_elapsed" -lt 120 ] && [ "${guard_attempts:-0}" -ge 3 ] \
+       && [ ! -s "$guard_sentinel" ] && grep -Fq 'timed out after 13s' "$TDIR/stderr"; echo $?)" \
+    "rc=$RC elapsed=${guard_elapsed}s guard_attempts=$guard_attempts sentinel=$(cat "$guard_sentinel" 2>/dev/null) stderr=$(tail -5 "$TDIR/stderr")"
+
+  # The guard is still load-bearing: with it available and the only slot held, the run takes the
+  # OTHER exit — "all slots busy" — and still never calls Oracle. This is the control that proves
+  # the bound above did not come from skipping the guard or the capacity read.
+  local guard_slot_fd
+  guard_home="$TDIR/home-slot-guard-control"; mkdir -p "$guard_home"
+  : > "$guard_log"; : > "$guard_sentinel"
+  exec {guard_slot_fd}>>"$guard_home/oracle.lock.slot1"; "$(command -v flock)" -n "$guard_slot_fd"
+  env HOME="$guard_user" PRO_GATE_HOME="$guard_home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+    PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
+    PRO_GATE_LOCK_WAIT=0 PRO_GATE_TIMEOUT=23s PRO_GATE_TIMEOUT_GRACE=5 \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_ORACLE_SENTINEL="$guard_sentinel" \
+    PG_TEST_FLOCK_LOG="$guard_log" PATH="$guard_path" NODE_OPTIONS= \
+    "$REAL_TIMEOUT" 120s bash "$ENGINE" --diff "$guard_diff" --repo "$TDIR" --out "$guard_home/review.md" \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+  RC=$?
+  eval "exec ${guard_slot_fd}>&-"
+  check '#179 slot-guard-bound: an available guard still reports a busy account, not a guard fault' \
+    "$([ "$RC" -eq 7 ] && grep -Fq 'all 1 review slots are busy' "$TDIR/stderr" \
+       && ! grep -Fq 'reservation handoff guard' "$TDIR/stderr" && [ ! -s "$guard_sentinel" ]; echo $?)" \
+    "rc=$RC sentinel=$(cat "$guard_sentinel" 2>/dev/null) stderr=$(tail -5 "$TDIR/stderr")"
+
+  # gate #187 r1 P2 mixed-wait-diagnosis: the two cases above are pure — the guard is refused for
+  # the WHOLE wait, or never. The real defect lives in between. SLOT_GUARD_BLOCKED records only the
+  # last slice, so a wait that read busy capacity and then lost the guard as the deadline passed
+  # claimed capacity "was never read" and skipped the running/uncollected diagnosis entirely,
+  # sending the operator to a lock path that was not the reason it gave up.
+  #
+  # The shim refuses the guard from the first slot scan onward, and a slot scan can only happen
+  # under a HELD guard: slice 1 therefore always reads occupancy and every later slice is
+  # guard-blocked. The mixed shape comes from that ordering, not from racing a clock — the only
+  # timing assumption left is that slice 1 finishes inside the 13s budget, which is why the scan
+  # and guard-attempt floors below are asserted: a runner slow enough to break that assumption
+  # fails on a floor and says so, instead of failing on the message and reading as a regression.
+  # The only slot is held by a live flock, so the reading is "busy with running reviews" — and the
+  # expiry must report THAT, in the past tense it was actually observed in, not a present-tense
+  # claim about a deadline at which this run could read nothing.
+  guard_scan_mark="$TDIR/slot-guard-scan.mark"
+  guard_home="$TDIR/home-slot-guard-mixed"; mkdir -p "$guard_home"
+  : > "$guard_log"; : > "$guard_sentinel"; : > "$guard_scan_mark"
+  guard_started="$(date +%s)"
+  exec {guard_slot_fd}>>"$guard_home/oracle.lock.slot1"; "$(command -v flock)" -n "$guard_slot_fd"
+  env HOME="$guard_user" PRO_GATE_HOME="$guard_home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+    PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
+    PRO_GATE_LOCK_WAIT=13 PRO_GATE_TIMEOUT=23s PRO_GATE_TIMEOUT_GRACE=5 \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_ORACLE_SENTINEL="$guard_sentinel" \
+    PG_TEST_FLOCK_LOG="$guard_log" PG_TEST_FAIL_GUARD_AFTER_SLOT_SCAN="$guard_scan_mark" \
+    PATH="$guard_path" NODE_OPTIONS= \
+    "$REAL_TIMEOUT" 120s bash "$ENGINE" --diff "$guard_diff" --repo "$TDIR" --out "$guard_home/review.md" \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+  RC=$?
+  guard_elapsed=$(( $(date +%s) - guard_started ))
+  eval "exec ${guard_slot_fd}>&-"
+  check '#187 r1 P2 mixed-wait-diagnosis: a final-slice guard miss still reports the capacity the wait read' \
+    "$([ "$RC" -eq 7 ] && [ "$guard_elapsed" -lt 120 ] \
+       && [ "$(wc -l < "$guard_scan_mark")" -ge 1 ] \
+       && [ "$(grep -c '/in-progress\.lock$' "$guard_log")" -ge 2 ] \
+       && grep -Fq 'when this run last read account capacity, all 1 review slots were busy with running reviews' "$TDIR/stderr" \
+       && grep -Fq 'unacquirable again when the wait expired' "$TDIR/stderr" \
+       && grep -Fq 'account capacity is unreadable this slice' "$TDIR/stderr" \
+       && ! grep -Fq 'account capacity was never read' "$TDIR/stderr" \
+       && ! grep -Fq 'review slots are busy with running reviews' "$TDIR/stderr" \
+       && [ ! -s "$guard_sentinel" ]; echo $?)" \
+    "rc=$RC elapsed=${guard_elapsed}s scans=$(wc -l < "$guard_scan_mark" 2>/dev/null) guard_attempts=$(grep -c '/in-progress\.lock$' "$guard_log" 2>/dev/null) sentinel=$(cat "$guard_sentinel" 2>/dev/null) stderr=$(tail -6 "$TDIR/stderr")"
+}
+
+run_slot_guard_bound_tests
+if [ "${PG_TEST_ONLY:-}" = slot-guard-bound ]; then
+  [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }
+fi
+
 echo '# hard-ceiling refusal (exit 11): only diffs past PRO_GATE_DIFF_HARD_MAX are refused'
 printf 'still thinking, run marker: %s\n' "$MARKER" > "$TDIR/tab.txt"
 ORGANIZER_STATE="$TDIR/organizer-state.json"
@@ -442,6 +619,62 @@ check 'connector-enabled explicit connector uses connector directive without bun
   "$([ "$RC" -ne 2 ] && ! grep -Fq -- "--file $TDIR/policy.diff" "$POLICY_SENTINEL" && grep -Fq '@GitHub' "$POLICY_PROMPT"; echo $?)" \
   "rc=$RC calls=$(cat "$POLICY_SENTINEL") prompt=$(cat "$POLICY_PROMPT")"
 unset PG_TEST_ORACLE_SENTINEL PG_TEST_ORACLE_COMPLETE PG_TEST_PROMPT_CAPTURE
+
+# #150: the classic `--pr N` fetch path (no --diff) installs a charged input binding regardless
+# of INPUT. FILE_ARGS only attaches the fetched endpoint patch for INPUT=bundle|both, so an
+# INPUT=connector classic run must never earn a "full-pr" binding (that would claim the model
+# reviewed diff bytes it was never sent). It still needs a properly-labeled "connector" binding
+# installed: recover_superseded_reason()/pg_reservation_supersede require
+# pg_review_input_binding_read to return a binding before a stuck reservation can be superseded.
+# pg_augment_path() (lib/pro-gate-lib.sh) rebuilds PATH with the real system dirs ahead of
+# whatever the caller prepended, so a `gh` shim must live under $HOME/.local/bin (the one
+# directory pg_augment_path puts first) rather than on a plain PATH-prepended directory.
+CONN150_REPO="$TDIR/conn150-repo"
+mkdir -p "$CONN150_REPO"
+git -C "$CONN150_REPO" init -q
+git -C "$CONN150_REPO" config user.email test@example.invalid
+git -C "$CONN150_REPO" config user.name 'Engine Test'
+printf 'base\n' > "$CONN150_REPO/f.txt"
+git -C "$CONN150_REPO" add f.txt && git -C "$CONN150_REPO" commit -qm conn150-base
+printf 'head\n' > "$CONN150_REPO/f.txt"
+git -C "$CONN150_REPO" add f.txt && git -C "$CONN150_REPO" commit -qm conn150-head
+git -C "$CONN150_REPO" remote add origin https://github.com/acme/conn150.git
+mkdir -p "$TDIR/user/.local/bin"
+cat > "$TDIR/user/.local/bin/gh" <<'CONN150_GH'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "pr diff") printf 'diff --git a/f.txt b/f.txt\nindex aaaaaaa..bbbbbbb 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-base\n+head\n' ;;
+  "pr view") printf 'https://github.com/acme/conn150/pull/%s\n' "$3" ;;
+  *) exit 1 ;;
+esac
+CONN150_GH
+chmod +x "$TDIR/user/.local/bin/gh"
+conn150_run() { # home input pr out
+  env HOME="$TDIR/user" PRO_GATE_HOME="$1" PRO_GATE_INPUT_POLICY=connector-enabled \
+    ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 \
+    PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 PRO_GATE_MAX_ROUNDS_PER_PR=1 \
+    PRO_GATE_LOCK_WAIT=2 PRO_GATE_TIMEOUT_GRACE=0 PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_ORACLE_COMPLETE=1 NODE_OPTIONS= \
+    bash "$ENGINE" --pr "$3" --repo "$CONN150_REPO" --input "$2" --out "$4" --timeout 10s \
+    >"$TDIR/stdout" 2>"$TDIR/stderr"
+  RC=$?
+}
+conn150_run "$TDIR/home-conn150-connector" connector 91 "$TDIR/conn150-connector.md"
+CONN150_CONNECTOR_BINDING_FILE="$(find "$TDIR/home-conn150-connector/review-input-bindings" -mindepth 1 -maxdepth 1 -type f -name 'pg-run-*' -print -quit 2>/dev/null)"
+CONN150_CONNECTOR_BINDING="$([ -n "$CONN150_CONNECTOR_BINDING_FILE" ] && cat "$CONN150_CONNECTOR_BINDING_FILE" || true)"
+check '#150 classic --pr --input connector (no --diff) installs a connector-mode binding, not full-pr, for bytes the model never received' \
+  "$([ "$RC" -eq 0 ] && [ -n "$CONN150_CONNECTOR_BINDING" ] \
+     && jq -e '.evidence.mode=="connector" and .evidence.proof.commit_target==.target.head_oid and .evidence.proof.endpoint_digest==null and .evidence.proof.raw_diff_digest==null and .evidence.proof.repository_target=="github.com/acme/conn150"' \
+       <<<"$CONN150_CONNECTOR_BINDING" >/dev/null 2>&1; echo $?)" \
+  "rc=$RC binding_file=$CONN150_CONNECTOR_BINDING_FILE binding=$CONN150_CONNECTOR_BINDING stderr=$(cat "$TDIR/stderr")"
+conn150_run "$TDIR/home-conn150-bundle" bundle 92 "$TDIR/conn150-bundle.md"
+CONN150_BUNDLE_BINDING_FILE="$(find "$TDIR/home-conn150-bundle/review-input-bindings" -mindepth 1 -maxdepth 1 -type f -name 'pg-run-*' -print -quit 2>/dev/null)"
+CONN150_BUNDLE_BINDING="$([ -n "$CONN150_BUNDLE_BINDING_FILE" ] && cat "$CONN150_BUNDLE_BINDING_FILE" || true)"
+check '#150 planted negative: the neighbouring classic --input bundle run still installs full-pr proof with real digests' \
+  "$([ "$RC" -eq 0 ] && [ -n "$CONN150_BUNDLE_BINDING" ] \
+     && jq -e '.evidence.mode=="full-pr" and (.evidence.proof.endpoint_digest|test("^[0-9a-f]{64}$")) and (.evidence.proof.raw_patch_digest|test("^[0-9a-f]{64}$")) and (.evidence.proof.base_oid|test("^[0-9a-f]{40}$"))' \
+       <<<"$CONN150_BUNDLE_BINDING" >/dev/null 2>&1; echo $?)" \
+  "rc=$RC binding_file=$CONN150_BUNDLE_BINDING_FILE binding=$CONN150_BUNDLE_BINDING stderr=$(cat "$TDIR/stderr")"
 
 # Lifecycle-only modes remain usable under an invalid policy: the engine reaches their normal
 # handler instead of rejecting an unrelated historical inspection or recovery action.
@@ -2639,6 +2872,32 @@ check 'confirm attaches prior-review.md' "$(grep -q 'prior-review.md' "$TDIR/arg
 check 'confirm pass consumes a round (budget-accounted)' "$([ -f "$RHOME/rounds/$(printf '%s-102' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')" ]; echo $?)" "rounds dir: $(ls "$RHOME/rounds" 2>/dev/null)"
 run_engine --confirm /nonexistent-prior.md --pr 102 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$RHOME/o-cbad.md" --timeout 5s
 check 'missing --confirm file is a usage error (exit 2)' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC"
+
+echo '# #176 (remaining sites): every possibly-empty array expansion in oracle-review.sh (the'
+echo '# ENGINE -- FILE_ARGS is built from the --confirm-staged FILES array above) is guarded against'
+echo '# the bash <4.4 (stock macOS /bin/bash 3.2) "unbound variable" crash on a bare "${arr[@]}"'
+echo '# expansion of a zero-element array under set -u. daemon.sh already carries this fix and its'
+echo '# own structural sweep lives in tests/daemon-current-head-completion.test.sh; this is the same'
+echo '# sweep for oracle-review.sh.'
+echo '#'
+echo '# What this DOES verify, executed on this host (bash 5.2, no bash 3.2 binary available here):'
+echo '#   a file-wide structural sweep: every "[@]" array expansion in oracle-review.sh is either the'
+echo '#   ${arr[@]+"${arr[@]}"} guard idiom, the pre-existing ${arr[0]:+"${arr[@]}"} index-guard idiom'
+echo '#   (force_args -- unrelated to #176, left untouched), or one of the explicit never-empty-by-'
+echo '#   name allowlist: ENGINE_ARGS and organizer_args (both seeded with a mandatory first element'
+echo '#   before use) and the bash builtin PIPESTATUS (populated with at least one element by bash'
+echo '#   itself once a foreground pipeline has run, never a user-declared possibly-empty array).'
+echo '# What this does NOT verify: an actual bash 3.2 reproduction -- none is available in this'
+echo '# environment; see daemon-current-head-completion.test.sh for the guard-idiom probe that'
+echo '# non-regression-tests the idiom itself on this host bash.'
+ENGINE_UNGUARDED="$(sed -E \
+  -e 's/\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\+"\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\}"\}//g' \
+  -e 's/\$\{[A-Za-z_][A-Za-z0-9_]*\[[0-9]+\]:\+"\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\}"\}//g' \
+  "$ENGINE" \
+  | grep -noE '\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\}' \
+  | grep -vE ':\$\{(ENGINE_ARGS|organizer_args|PIPESTATUS)\[@\]\}$' || true)"
+check 'every "[@]" array expansion in oracle-review.sh outside the never-empty allowlist (ENGINE_ARGS, organizer_args, PIPESTATUS) is guarded' "$([ -z "$ENGINE_UNGUARDED" ]; echo $?)" "unguarded: $ENGINE_UNGUARDED"
+check 'no ${arr[@]:-} single-spurious-empty-arg anti-idiom remains in oracle-review.sh' "$([ "$(grep -c '\[@\]:-' "$ENGINE")" -eq 0 ]; echo $?)" "count=$(grep -c '\[@\]:-' "$ENGINE")"
 
 # v0.39: --brief swaps the TASK BODY only; the contract footer stays engine-owned. The whole
 # return path is review-shaped — pg_is_review accepts a capture only when it carries a [Pn]
@@ -6344,6 +6603,113 @@ check 'supersession retains the charged round and durable proof event' \
        'select(.outcome=="superseded" and .marker==$marker and .charge_retained and (.holds_capacity|not) and .proof==("head-moved:"+$old+":"+$new))' \
        "$SUPER_HEAD_HOME/ledger.jsonl" >/dev/null 2>&1; echo $?)" \
   "rounds=$(cat "$SUPER_HEAD_HOME/rounds/$SUPER_KEY") ledger=$(cat "$SUPER_HEAD_HOME/ledger.jsonl" 2>/dev/null)"
+
+# #206: a superseded round used to exit straight to "Review superseded" without ever reaching
+# pg_finish's organizer close, leaking one ChatGPT conversation tab per superseded round (the
+# daemon calls --recover every cycle). --recover now best-effort closes any owned tab immediately
+# before that exit, at BOTH supersession sites: the already-superseded-on-disk check above (site
+# 1, reused here since $SUPER_HEAD_MARKER is already state=superseded) and the fresh GH-proof
+# detection (site 2, exercised separately below with its own marker) -- this time against a real
+# mock CDP server standing in for --remote-chrome, rather than the unreachable :65530 the checks
+# above use by design.
+#
+# gate r7 P2: closing blind could strand a superseded round with NEITHER an open tab NOR a
+# conversation-urls memo when the delayed early organizer never ran (disabled, failed, or simply
+# not yet reached) -- breaking the superseded-but-still-collectable contract (an audit harvest of
+# a paid review). recover_close_tab() now REQUIRES a remembered, shape-valid conversation URL
+# memo before it will ask cdp-salvage.mjs to close anything, so the two positive cases below seed
+# one; the negative case right after them proves the memo-less tab is left open AND still
+# harvestable.
+SUPER_CLOSE_TAB_SOURCE="$TDIR/superseded-close-tab.txt"
+printf 'run marker: %s\nA finished Pro review conversation.\n' "$SUPER_HEAD_MARKER" > "$SUPER_CLOSE_TAB_SOURCE"
+SUPER_CLOSE_TAB_STATE="$TDIR/superseded-close-tab-state.json"
+printf '{"title":null,"archived":false,"events":[]}\n' > "$SUPER_CLOSE_TAB_STATE"
+mkdir -p "$SUPER_HEAD_HOME/conversation-urls"
+printf 'https://chatgpt.com/c/mock-conversation\n' > "$SUPER_HEAD_HOME/conversation-urls/$SUPER_HEAD_MARKER"
+start_mock "$SUPER_CLOSE_TAB_SOURCE" "$SUPER_CLOSE_TAB_STATE"
+env -u PRO_GATE_KEEP_TABS PRO_GATE_HOME="$SUPER_HEAD_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_SELF_HEAL=0 NODE_OPTIONS= \
+  bash "$ENGINE" --recover "$SUPER_HEAD_MARKER" --timeout 1s >"$TDIR/super-close.stdout" 2>"$TDIR/super-close.stderr"
+SUPER_CLOSE_RC=$?
+check '#206 already-superseded recovery with a remembered URL closes its owned conversation tab' \
+  "$([ "$SUPER_CLOSE_RC" -eq 6 ] \
+     && [ "$(cat "$TDIR/super-close.stderr")" = 'Review superseded' ] \
+     && [ "$(jq -r '(.closed // []) | map(select(. == "tab1")) | length' "$SUPER_CLOSE_TAB_STATE")" = 1 ]; echo $?)" \
+  "rc=$SUPER_CLOSE_RC stderr=$(cat "$TDIR/super-close.stderr") state=$(cat "$SUPER_CLOSE_TAB_STATE")"
+
+# Planted negative: the pre-existing PRO_GATE_KEEP_TABS=1 hatch (already used by the durable
+# finalize path, oracle-review.sh:2405) must suppress this close exactly like every other site.
+SUPER_CLOSE_TAB_STATE_KEEP="$TDIR/superseded-close-tab-state-keep.json"
+printf '{"title":null,"archived":false,"events":[]}\n' > "$SUPER_CLOSE_TAB_STATE_KEEP"
+start_mock "$SUPER_CLOSE_TAB_SOURCE" "$SUPER_CLOSE_TAB_STATE_KEEP"
+env PRO_GATE_HOME="$SUPER_HEAD_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_SELF_HEAL=0 PRO_GATE_KEEP_TABS=1 NODE_OPTIONS= \
+  bash "$ENGINE" --recover "$SUPER_HEAD_MARKER" --timeout 1s >"$TDIR/super-close-keep.stdout" 2>"$TDIR/super-close-keep.stderr"
+SUPER_CLOSE_KEEP_RC=$?
+check '#206 PRO_GATE_KEEP_TABS=1 leaves the superseded conversation tab open' \
+  "$([ "$SUPER_CLOSE_KEEP_RC" -eq 6 ] \
+     && [ "$(cat "$TDIR/super-close-keep.stderr")" = 'Review superseded' ] \
+     && [ "$(jq -r '(.closed // []) | map(select(. == "tab1")) | length' "$SUPER_CLOSE_TAB_STATE_KEEP")" = 0 ]; echo $?)" \
+  "rc=$SUPER_CLOSE_KEEP_RC stderr=$(cat "$TDIR/super-close-keep.stderr") state=$(cat "$SUPER_CLOSE_TAB_STATE_KEEP")"
+
+# gate r7 P2 planted negative: the SAME already-superseded site, but with NO conversation-urls
+# memo for this marker. The fix must leave the owned tab OPEN (never call --close blind) so a
+# later marker-addressed --harvest still has a handle -- RED on 837189d: it closes the tab there,
+# and a following --harvest then reports the conversation gone instead of still generating.
+SUPER_CLOSE_NOMEMO_HOME="$TDIR/home-superseded-close-tab-nomemo"
+SUPER_CLOSE_NOMEMO_MARKER='pg-run-acme-fresh-77-1700014300-1'
+mkdir -p "$SUPER_CLOSE_NOMEMO_HOME/in-progress"
+printf '%s\t%s\t%s\t0\t1\tGPT-X\t%s\tsuperseded\n' "$SUPER_KEY" "$TDIR/superseded-nomemo-audit.md" "$(date +%s)" 1700014300 > "$SUPER_CLOSE_NOMEMO_HOME/in-progress/$SUPER_CLOSE_NOMEMO_MARKER"
+SUPER_CLOSE_NOMEMO_SOURCE="$TDIR/superseded-close-tab-nomemo.txt"
+printf 'run marker: %s\nA finished Pro review conversation.\n' "$SUPER_CLOSE_NOMEMO_MARKER" > "$SUPER_CLOSE_NOMEMO_SOURCE"
+SUPER_CLOSE_NOMEMO_STATE="$TDIR/superseded-close-tab-nomemo-state.json"
+printf '{"title":null,"archived":false,"events":[]}\n' > "$SUPER_CLOSE_NOMEMO_STATE"
+start_mock "$SUPER_CLOSE_NOMEMO_SOURCE" "$SUPER_CLOSE_NOMEMO_STATE"
+env -u PRO_GATE_KEEP_TABS PRO_GATE_HOME="$SUPER_CLOSE_NOMEMO_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_SELF_HEAL=0 NODE_OPTIONS= \
+  bash "$ENGINE" --recover "$SUPER_CLOSE_NOMEMO_MARKER" --timeout 1s >"$TDIR/super-close-nomemo.stdout" 2>"$TDIR/super-close-nomemo.stderr"
+SUPER_CLOSE_NOMEMO_RC=$?
+check '#206 gate r7 P2: memo-less superseded recovery leaves its owned conversation tab open' \
+  "$([ "$SUPER_CLOSE_NOMEMO_RC" -eq 6 ] \
+     && [ "$(cat "$TDIR/super-close-nomemo.stderr")" = 'Review superseded' ] \
+     && [ "$(jq -r '(.closed // []) | map(select(. == "tab1")) | length' "$SUPER_CLOSE_NOMEMO_STATE")" = 0 ]; echo $?)" \
+  "rc=$SUPER_CLOSE_NOMEMO_RC stderr=$(cat "$TDIR/super-close-nomemo.stderr") state=$(cat "$SUPER_CLOSE_NOMEMO_STATE")"
+
+# The point of leaving it open: a marker-addressed --harvest immediately after cleanup must still
+# find and read the SAME conversation instead of reporting it gone (the superseded-but-still-
+# collectable contract -- audit harvest of a paid review). No VERDICT in the fixture, so success
+# here is exit 9 "still generating" with the conversation actually matched, not "not found".
+env -u PRO_GATE_KEEP_TABS PRO_GATE_HOME="$SUPER_CLOSE_NOMEMO_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_SELF_HEAL=0 NODE_OPTIONS= \
+  bash "$ENGINE" --harvest "$SUPER_CLOSE_NOMEMO_MARKER" --out "$TDIR/super-close-nomemo-harvest.md" --timeout 1s \
+  >"$TDIR/super-close-nomemo-harvest.stdout" 2>"$TDIR/super-close-nomemo-harvest.stderr"
+SUPER_CLOSE_NOMEMO_HARVEST_RC=$?
+check '#206 gate r7 P2: harvest after memo-less cleanup still reads the (still open) tab' \
+  "$([ "$SUPER_CLOSE_NOMEMO_HARVEST_RC" -eq 9 ] \
+     && grep -qF 'still-generating: https://chatgpt.com/c/mock-conversation' "$TDIR/super-close-nomemo-harvest.stderr" \
+     && [ "$(phase_of "$TDIR/super-close-nomemo-harvest.md.status")" = in-progress ]; echo $?)" \
+  "rc=$SUPER_CLOSE_NOMEMO_HARVEST_RC stderr=$(cat "$TDIR/super-close-nomemo-harvest.stderr") status=$(cat "$TDIR/super-close-nomemo-harvest.md.status" 2>/dev/null)"
+
+# Site 2: the fresh GH-proof-based supersession path (recover_superseded_reason, a *different*
+# reservation that is NOT already state=superseded on disk) must also close its owned tab.
+SUPER_CLOSE2_HOME="$TDIR/home-superseded-close-tab2"
+SUPER_CLOSE2_MARKER='pg-run-acme-fresh-77-1700014200-1'
+super_seed "$SUPER_CLOSE2_HOME" "$SUPER_CLOSE2_MARKER" 1700014200 "$FRESH_BASE"
+SUPER_CLOSE2_SOURCE="$TDIR/superseded-close-tab2.txt"
+printf 'run marker: %s\nA finished Pro review conversation.\n' "$SUPER_CLOSE2_MARKER" > "$SUPER_CLOSE2_SOURCE"
+SUPER_CLOSE2_STATE="$TDIR/superseded-close-tab2-state.json"
+printf '{"title":null,"archived":false,"events":[]}\n' > "$SUPER_CLOSE2_STATE"
+# gate r7 P2: same memo requirement as site 1 above -- seed it so this positive case still closes.
+mkdir -p "$SUPER_CLOSE2_HOME/conversation-urls"
+printf 'https://chatgpt.com/c/mock-conversation\n' > "$SUPER_CLOSE2_HOME/conversation-urls/$SUPER_CLOSE2_MARKER"
+start_mock "$SUPER_CLOSE2_SOURCE" "$SUPER_CLOSE2_STATE"
+: > "$SUPER_GH_CALLS"
+env -u PRO_GATE_KEEP_TABS PRO_GATE_HOME="$SUPER_CLOSE2_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_GH_BIN="$SUPER_GH" PG_TEST_GH_CALLS="$SUPER_GH_CALLS" PG_TEST_GH_MODE=ok PG_TEST_GH_STATE=OPEN PG_TEST_GH_HEAD="$FRESH_HEAD" NODE_OPTIONS= \
+  bash "$ENGINE" --recover "$SUPER_CLOSE2_MARKER" --timeout 1s >"$TDIR/super-close2.stdout" 2>"$TDIR/super-close2.stderr"
+SUPER_CLOSE2_RC=$?
+check '#206 fresh GH-proof (head-moved) supersession with a remembered URL closes its owned conversation tab' \
+  "$([ "$SUPER_CLOSE2_RC" -eq 6 ] \
+     && [ "$(cat "$TDIR/super-close2.stderr")" = 'Review superseded' ] \
+     && [ "$(jq -r '(.closed // []) | map(select(. == "tab1")) | length' "$SUPER_CLOSE2_STATE")" = 1 ]; echo $?)" \
+  "rc=$SUPER_CLOSE2_RC stderr=$(cat "$TDIR/super-close2.stderr") state=$(cat "$SUPER_CLOSE2_STATE")"
+
 SUPER_SNAPSHOT="$(PRO_GATE_HOME="$SUPER_HEAD_HOME" pg_attempt_snapshot github.com acme fresh 77 "$SUPER_KEY")"
 SUPER_PLAN="$(PRO_GATE_HOME="$SUPER_HEAD_HOME" pg_reservation_slot_plan 1)"
 check 'superseded snapshot is fresh-eligible and holds zero capacity while remaining collectable' \
@@ -6988,6 +7354,136 @@ DL_ENTERED="$(grep -c '^enter$' "$DL_RACE_LOG" 2>/dev/null || echo 0)"
 check '#155: two reclaimers of one dead owner never both enter the lock' \
   "$([ "$DL_ENTERED" -le 1 ]; echo $?)" "entered=$DL_ENTERED"
 
+# ── #189: pg_lock's reclaim-success path carries its own bound ────────────────
+# A successful reclaim skips no-flock pg_lock's wait bound AND its sleep -- both lived in the same
+# `if !` body -- so the loop retried mkdir immediately. Finite reclaim-success is progress;
+# SUSTAINED reclaim-success with mkdir still failing was a 100% CPU spin that never honoured
+# wait_s, the same shape pg_reservation_guard_acquire fixed with its own spin counter.
+# The stub IS that pathological alternation, deterministically rather than raced: every call
+# really does reclaim (the dead owner's directory is removed and rc is 0) and another dead owner
+# really does take the pathname back before pg_lock's next mkdir. The outer coreutils timeout is
+# what turns a regression into a fast failure instead of a hung suite: without the fix this call
+# never returns (verified at HEAD: 2506 reclaim retries in 10s against a wait_s of 2).
+LOCKSPIN_HOME="$TDIR/home-lock-spin"; mkdir -p "$LOCKSPIN_HOME/change.lock.d"
+printf '%s\n' 999999 > "$LOCKSPIN_HOME/change.lock.d/pid"   # occupied, so the first mkdir fails
+LOCKSPIN_LOG="$LOCKSPIN_HOME/reclaims"; : > "$LOCKSPIN_LOG"
+LOCKSPIN_START=$(date +%s)
+/usr/bin/timeout 20 bash -c '
+  . "$1"
+  # SPINLOG, not "$3": inside a function the positional parameters are the FUNCTION s own, so a
+  # stub reading $3 logs nothing and the count below silently reads as "never reclaimed".
+  SPINLOG="$3"
+  pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
+  pg_dirlock_reclaim_dead() {
+    [ -d "$1" ] || return 1
+    rm -f "$1/pid" "$1/token" 2>/dev/null
+    rmdir "$1" 2>/dev/null || return 1                       # a real reclaim: the owner is gone
+    mkdir "$1" 2>/dev/null && printf "%s\n" 999999 > "$1/pid"  # another dead owner takes it back
+    echo x >> "$SPINLOG"
+    return 0
+  }
+  pg_lock "$2" 1
+' _ "$HERE/../lib/pro-gate-lib.sh" "$LOCKSPIN_HOME/change.lock" "$LOCKSPIN_LOG"
+LOCKSPIN_RC=$?
+LOCKSPIN_ELAPSED=$(( $(date +%s) - LOCKSPIN_START ))
+# awk, not `grep -c . || echo 0`: grep exits 1 on an empty file, so that idiom prints ITS zero AND
+# the fallback zero, and every later numeric test errors on the two-line value.
+LOCKSPIN_TRIES="$(awk 'END{print NR}' "$LOCKSPIN_LOG" 2>/dev/null)"
+case "$LOCKSPIN_TRIES" in ''|*[!0-9]*) LOCKSPIN_TRIES=0;; esac
+check '#189: pg_lock gives up on a lock whose reclaim keeps succeeding instead of spinning forever' \
+  "$([ "$LOCKSPIN_RC" -eq 1 ] && [ "$LOCKSPIN_ELAPSED" -lt 15 ]; echo $?)" \
+  "rc=$LOCKSPIN_RC (124=timed out, i.e. spun) elapsed=${LOCKSPIN_ELAPSED}s reclaims=$LOCKSPIN_TRIES"
+# ...and it ended because the reclaim-success path ran out of retries, not because it never took
+# that path: each logged line is one reclaim that reported success while mkdir still failed.
+check '#189: the bounded loop really did keep taking the reclaim-success path' \
+  "$([ "$LOCKSPIN_TRIES" -ge 2 ] && [ "$LOCKSPIN_TRIES" -le 1000 ]; echo $?)" \
+  "reclaims=$LOCKSPIN_TRIES (wait_s=1 bounds it at 1*100+100 retries)"
+
+# The bound must not cost pg_lock its crash recovery: ONE reclaim of a genuinely dead owner is
+# still followed by a successful mkdir, and the winner still records the pid/token shape that
+# st_inflight and pg_harvest_claimed read outside this function (#189 keeps that shape as it is).
+LOCKREC_HOME="$TDIR/home-lock-reclaim"; mkdir -p "$LOCKREC_HOME/change.lock.d"
+sleep 0 & LOCKREC_DEAD=$!; wait "$LOCKREC_DEAD"     # a pid that has certainly exited
+printf '%s\n' "$LOCKREC_DEAD" > "$LOCKREC_HOME/change.lock.d/pid"
+pg_pid_token "$LOCKREC_DEAD" > "$LOCKREC_HOME/change.lock.d/token" 2>/dev/null \
+  || : > "$LOCKREC_HOME/change.lock.d/token"
+LOCKREC_OUT="$(/usr/bin/timeout 20 bash -c '
+  . "$1"
+  pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
+  pg_lock "$2" 5 || { printf "rc=1"; exit 0; }
+  printf "rc=0 self=%s pid=%s token=%s" "$$" \
+    "$(cat "$2.d/pid" 2>/dev/null)" "$([ -s "$2.d/token" ] && echo present || echo EMPTY)"
+' _ "$HERE/../lib/pro-gate-lib.sh" "$LOCKREC_HOME/change.lock" 2>/dev/null)"
+LOCKREC_SELF="$(printf '%s' "$LOCKREC_OUT" | sed -nE 's/.*self=([0-9]+).*/\1/p')"
+LOCKREC_PID="$(printf '%s' "$LOCKREC_OUT" | sed -nE 's/.*pid=([0-9]+).*/\1/p')"
+check '#189: a single reclaim of a dead owner still acquires, and records pid+token as before' \
+  "$(printf '%s' "$LOCKREC_OUT" | grep -q '^rc=0 ' \
+     && [ -n "$LOCKREC_SELF" ] && [ "$LOCKREC_SELF" = "$LOCKREC_PID" ] \
+     && printf '%s' "$LOCKREC_OUT" | grep -q 'token=present'; echo $?)" \
+  "out=${LOCKREC_OUT:-<empty>}"
+
+# ...and a LIVE owner is still waited out for the full budget rather than refused early: the spin
+# counter bounds the reclaim path only, and that path is never taken against a live holder.
+LOCKLIVE_HOME="$TDIR/home-lock-live"; mkdir -p "$LOCKLIVE_HOME/change.lock.d"
+printf '%s\n' "$$" > "$LOCKLIVE_HOME/change.lock.d/pid"
+pg_pid_token "$$" > "$LOCKLIVE_HOME/change.lock.d/token"
+LOCKLIVE_START=$(date +%s)
+/usr/bin/timeout 30 bash -c '
+  . "$1"
+  pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
+  pg_lock "$2" 2
+' _ "$HERE/../lib/pro-gate-lib.sh" "$LOCKLIVE_HOME/change.lock"
+LOCKLIVE_RC=$?
+LOCKLIVE_ELAPSED=$(( $(date +%s) - LOCKLIVE_START ))
+check '#189: a live owner is still waited out for the whole wait bound, then refused' \
+  "$([ "$LOCKLIVE_RC" -eq 1 ] && [ "$LOCKLIVE_ELAPSED" -ge 2 ] && [ "$LOCKLIVE_ELAPSED" -lt 20 ] \
+     && [ -e "$LOCKLIVE_HOME/change.lock.d/pid" ]; echo $?)" \
+  "rc=$LOCKLIVE_RC elapsed=${LOCKLIVE_ELAPSED}s"
+
+# gate r1: the reclaim path must carry NO elapsed check beside its counter. A directory orphaned
+# between its mkdir and its owner record is reclaimable only once it has sat unmarked for the
+# orphan grace, so the reclaim that recovers a crashed run is routinely the LATE one -- at the
+# shipped defaults (5s budget, 5s grace) the waiter reaches it one sleep after its own budget has
+# run out. An elapsed check there discarded that reclaim and returned 1, refusing a lock this
+# process had itself just freed; crash recovery is the case the whole branch exists for. The
+# fixture compresses the shipped 5s/5s into 1s/2s: same ordering, two seconds instead of six.
+LOCKLATE_HOME="$TDIR/home-lock-late"; mkdir -p "$LOCKLATE_HOME/change.lock.d"   # unmarked orphan
+LOCKLATE_START=$(date +%s)
+LOCKLATE_OUT="$(/usr/bin/timeout 30 bash -c '
+  . "$1"
+  pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
+  PRO_GATE_DIRLOCK_ORPHAN_GRACE=2 pg_lock "$2" 1
+  printf "rc=%s" "$?"
+' _ "$HERE/../lib/pro-gate-lib.sh" "$LOCKLATE_HOME/change.lock")"
+LOCKLATE_ELAPSED=$(( $(date +%s) - LOCKLATE_START ))
+check '#189: a reclaim that only becomes possible after the budget still takes the lock' \
+  "$([ "$LOCKLATE_OUT" = "rc=0" ] && [ "$LOCKLATE_ELAPSED" -lt 20 ]; echo $?)" \
+  "out=${LOCKLATE_OUT:-<empty>} elapsed=${LOCKLATE_ELAPSED}s"
+
+# gate r1: a wait budget an operator can legally write must not change what pg_lock DOES. Two
+# values a naive `$(( wait_s * 100 + 100 ))` mishandles: a leading zero is OCTAL to bash, and "08"
+# is not even valid octal -- that arithmetic error aborts the whole function, so pg_lock refused
+# locks that were free; and a budget near the int64 ceiling overflows to a NEGATIVE bound, which
+# compares true on the first reclaim and refuses a lock whose owner is provably dead. Both are
+# regressions the spin bound introduced, and both are invisible unless the assertion is that the
+# lock is still ACQUIRED. stderr is asserted empty: the arithmetic error was loud as well as fatal.
+for LOCKARG_WAIT in 08 92233720368547758; do
+  LOCKARG_HOME="$TDIR/home-lock-arg-$LOCKARG_WAIT"; mkdir -p "$LOCKARG_HOME/change.lock.d"
+  sleep 0 & LOCKARG_DEAD=$!; wait "$LOCKARG_DEAD"          # a pid that has certainly exited
+  printf '%s\n' "$LOCKARG_DEAD" > "$LOCKARG_HOME/change.lock.d/pid"
+  pg_pid_token "$LOCKARG_DEAD" > "$LOCKARG_HOME/change.lock.d/token" 2>/dev/null \
+    || : > "$LOCKARG_HOME/change.lock.d/token"
+  LOCKARG_OUT="$(/usr/bin/timeout 30 bash -c '
+    . "$1"
+    pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
+    pg_lock "$2" "$3"
+    printf "rc=%s" "$?"
+  ' _ "$HERE/../lib/pro-gate-lib.sh" "$LOCKARG_HOME/change.lock" "$LOCKARG_WAIT" 2>"$LOCKARG_HOME/err")"
+  check "#189: a wait budget of $LOCKARG_WAIT still reclaims a dead owner and acquires" \
+    "$([ "$LOCKARG_OUT" = "rc=0" ] && [ ! -s "$LOCKARG_HOME/err" ]; echo $?)" \
+    "out=${LOCKARG_OUT:-<empty>} err=$(tr '\n' ';' < "$LOCKARG_HOME/err" | cut -c1-160)"
+done
+
 # gate #148 r8 P0: liveness must be positively DISPROVED, never inferred from a failed measurement.
 # Recomputing the owner's start-time token can fail transiently for a perfectly live pid (a /proc
 # read or a `ps` fork under memory pressure). An empty result then compares unequal to a valid
@@ -7565,6 +8061,47 @@ CHOICE_SELECTED_RC=$?; CHOICE_STATE_AFTER="$(find "$CHOICE_HOME" -mindepth 1 -ma
 check 'exact canonical selection returns the existing non-authorizing named-choice fixer handoff without mutation' \
   "$([ "$CHOICE_SELECTED_RC" -eq 0 ] && jq -e '.action=="fix-review-findings" and .reason=="named-product-choice-selected" and .facts.named_choice.selected_id=="keep"' "$TDIR/choice-selected.json" >/dev/null 2>&1 && [ "$CHOICE_STATE_BEFORE" = "$CHOICE_STATE_AFTER" ]; echo $?)" \
   "rc=$CHOICE_SELECTED_RC output=$(cat "$TDIR/choice-selected.json")"
+# #203: `jq ... > sel.json` naturally leaves a single trailing newline. That is still exactly one
+# canonical JSON value and must be accepted identically to the byte-exact canonical file above; a
+# second trailing newline is not tolerated and still stops closed at invalid-named-choice.
+jq -cnS --arg id keep --arg snap "$CHOICE_SNAPSHOT" '{selected_id:$id,snapshot_digest:$snap}' > "$TDIR/choice-selection-lf.json"
+CHOICE_LF_STATE_BEFORE="$(find "$CHOICE_HOME" -mindepth 1 -maxdepth 2 -printf '%P\n' | sort)"
+env PRO_GATE_HOME="$CHOICE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+  bash "$ENGINE" --review-decision --json --review-choice-selection "$TDIR/choice-selection-lf.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
+  >"$TDIR/choice-selected-lf.json" 2>"$TDIR/choice-selected-lf.err"
+CHOICE_LF_RC=$?; CHOICE_LF_STATE_AFTER="$(find "$CHOICE_HOME" -mindepth 1 -maxdepth 2 -printf '%P\n' | sort)"
+check "#203: a selection file with one trailing newline (jq's natural redirect output) is accepted like the canonical one" \
+  "$([ "$CHOICE_LF_RC" -eq 0 ] && jq -e '.action=="fix-review-findings" and .reason=="named-product-choice-selected" and .facts.named_choice.selected_id=="keep"' "$TDIR/choice-selected-lf.json" >/dev/null 2>&1 && [ "$CHOICE_LF_STATE_BEFORE" = "$CHOICE_LF_STATE_AFTER" ]; echo $?)" \
+  "rc=$CHOICE_LF_RC output=$(cat "$TDIR/choice-selected-lf.json") stderr=$(cat "$TDIR/choice-selected-lf.err")"
+printf '%s\n\n' "$(jq -cnS --arg id keep --arg snap "$CHOICE_SNAPSHOT" '{selected_id:$id,snapshot_digest:$snap}')" > "$TDIR/choice-selection-2lf.json"
+env PRO_GATE_HOME="$CHOICE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+  bash "$ENGINE" --review-decision --json --review-choice-selection "$TDIR/choice-selection-2lf.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
+  >"$TDIR/choice-selected-2lf.json" 2>"$TDIR/choice-selected-2lf.err"
+CHOICE_2LF_RC=$?
+check '#203: a selection file with two trailing newlines still stops closed at invalid-named-choice' \
+  "$([ "$CHOICE_2LF_RC" -eq 0 ] && jq -e '.action=="stop-without-new-review" and (.action!="run-granted-review")' "$TDIR/choice-selected-2lf.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$CHOICE_2LF_RC output=$(cat "$TDIR/choice-selected-2lf.json") stderr=$(cat "$TDIR/choice-selected-2lf.err")"
+# #203 gate r3 P2: bash command substitution silently DROPS NUL bytes, so the pre-fix
+# raw-string comparison let a canonical selection followed by a NUL, or a selected_id carrying
+# an embedded NUL, compare equal to the canonicalized (NUL-stripped) value and pass as though the
+# file held nothing but canonical bytes. Both must now stop closed just like the two-trailing-
+# newline case above; the byte-canonical decision is against the file's actual on-disk bytes.
+printf '%s\x00' "$(jq -cnS --arg id keep --arg snap "$CHOICE_SNAPSHOT" '{selected_id:$id,snapshot_digest:$snap}')" > "$TDIR/choice-selection-trailing-nul.json"
+env PRO_GATE_HOME="$CHOICE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+  bash "$ENGINE" --review-decision --json --review-choice-selection "$TDIR/choice-selection-trailing-nul.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
+  >"$TDIR/choice-selected-trailing-nul.json" 2>"$TDIR/choice-selected-trailing-nul.err"
+CHOICE_TRAILING_NUL_RC=$?
+check '#203 gate r3 P2: a selection file with a trailing NUL byte stops closed at invalid-named-choice' \
+  "$([ "$CHOICE_TRAILING_NUL_RC" -eq 0 ] && jq -e '.action=="stop-without-new-review" and (.action!="run-granted-review")' "$TDIR/choice-selected-trailing-nul.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$CHOICE_TRAILING_NUL_RC output=$(cat "$TDIR/choice-selected-trailing-nul.json") stderr=$(cat "$TDIR/choice-selected-trailing-nul.err")"
+printf '{"selected_id":"ke\x00ep","snapshot_digest":"%s"}' "$CHOICE_SNAPSHOT" > "$TDIR/choice-selection-embedded-nul.json"
+env PRO_GATE_HOME="$CHOICE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+  bash "$ENGINE" --review-decision --json --review-choice-selection "$TDIR/choice-selection-embedded-nul.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
+  >"$TDIR/choice-selected-embedded-nul.json" 2>"$TDIR/choice-selected-embedded-nul.err"
+CHOICE_EMBEDDED_NUL_RC=$?
+check '#203 gate r3 P2: a selected_id with an embedded NUL byte stops closed at invalid-named-choice' \
+  "$([ "$CHOICE_EMBEDDED_NUL_RC" -eq 0 ] && jq -e '.action=="stop-without-new-review" and (.action!="run-granted-review")' "$TDIR/choice-selected-embedded-nul.json" >/dev/null 2>&1; echo $?)" \
+  "rc=$CHOICE_EMBEDDED_NUL_RC output=$(cat "$TDIR/choice-selected-embedded-nul.json") stderr=$(cat "$TDIR/choice-selected-embedded-nul.err")"
 for choice_selection_case in malformed unknown stale oversized symlink; do
   rm -f "$TDIR/choice-bad.json"
   case "$choice_selection_case" in

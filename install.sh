@@ -100,8 +100,8 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/pro-gate-install.XXXXXX")"
 trap cleanup EXIT
 
 sha256() {
-  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
-  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1
+  if command -v sha256sum >/dev/null 2>&1; then { sha256sum < "$1" | cut -d' ' -f1; } 2>/dev/null
+  elif command -v shasum >/dev/null 2>&1; then { shasum -a 256 < "$1" | cut -d' ' -f1; } 2>/dev/null
   else echo "SHA256 tool required" >&2; return 1
   fi
 }
@@ -168,8 +168,8 @@ else
     BASE="${PRO_GATE_RELEASE_BASE_URL:-https://github.com/$OWNER/$REPO_NAME/releases/download/v$REQUESTED_VERSION}"
     ARCHIVE="$TMP/pro-gate-runtime-$REQUESTED_VERSION.tar.gz"
     CHECKSUM_FILE="$TMP/pro-gate-runtime-$REQUESTED_VERSION.tar.gz.sha256"
-    curl -fsSL "${PROXY_ARGS[@]}" "$BASE/pro-gate-runtime-$REQUESTED_VERSION.tar.gz" -o "$ARCHIVE"
-    curl -fsSL "${PROXY_ARGS[@]}" "$BASE/pro-gate-runtime-$REQUESTED_VERSION.tar.gz.sha256" -o "$CHECKSUM_FILE"
+    curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$BASE/pro-gate-runtime-$REQUESTED_VERSION.tar.gz" -o "$ARCHIVE"
+    curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$BASE/pro-gate-runtime-$REQUESTED_VERSION.tar.gz.sha256" -o "$CHECKSUM_FILE"
   fi
   [ -f "$ARCHIVE" ] || { echo "release archive not found: $ARCHIVE" >&2; exit 1; }
   [ -n "$CHECKSUM_FILE" ] && [ -f "$CHECKSUM_FILE" ] || { echo "checksum file is required" >&2; exit 1; }
