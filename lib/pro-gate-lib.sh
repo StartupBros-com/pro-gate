@@ -3564,6 +3564,18 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
         if [ "$(jq -r .named_choice.snapshot_digest <<<"$canonical")" != "$choice_snapshot" ]; then
           pg_review_decision_emit stop-without-new-review stale-named-choice "$canonical" "$snapshot" "$selected_ref"; return
         fi
+        # gate #174-review P1: a selected named choice dispatches a fix round exactly like a
+        # FIX-FIRST verdict does (same fix-review-findings/agent-task action) -- so it is the same
+        # "fix dispatch" R1 and every consumer doc (README/SKILL/oracle-reviewer) promise the churn
+        # stop replaces, unqualified by verdict type. Without this guard a churning chain that
+        # happens to phrase its repeated finding as a NEEDS-DISCUSSION choice, once answered, still
+        # buys an unbounded run of further paid rounds the brake exists to stop. The override
+        # (rounds_not_converging already folds in governor.continue_override, R2) lets an operator
+        # who has just made the decision proceed exactly as PRO_GATE_ROUNDS_CONTINUE=1 does for the
+        # FIX-FIRST arm above -- it does not invent a second override idiom.
+        if [ "$rounds_not_converging" = yes ]; then
+          pg_review_decision_emit stop-without-new-review rounds-not-converging "$canonical" "$snapshot" "$selected_ref"; return
+        fi
         pg_review_decision_emit fix-review-findings named-product-choice-selected "$canonical" "$snapshot" "$selected_ref"; return ;;
     esac
   fi

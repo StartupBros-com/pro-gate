@@ -221,6 +221,46 @@ check 'a governor object missing the arrow key is rejected as undefined-state, n
   "$(jq -e '.action=="stop-without-new-review" and .reason=="undefined-state"' <<<"$UNDEFINED_ARROW_DECISION" >/dev/null 2>&1; printf '%s' "$?")" \
   "$UNDEFINED_ARROW_DECISION"
 
+# gate #174-review P1: a selected named choice reduces to the identical fix-review-findings/
+# agent-task action a FIX-FIRST verdict does, so it is the same "fix dispatch" the churn brake
+# was built to replace -- but only the FIX-FIRST site (lib/pro-gate-lib.sh) got the streak guard.
+# Without it, a chain that phrases its repeated finding as a NEEDS-DISCUSSION policy question,
+# once the operator answers it, still buys an unbounded run of further paid rounds. This cannot be
+# a corpus.json fixture case: pg_review_decision_choice_snapshot hashes the ENTIRE canonical facts
+# object, including .contract.corpus_digest -- which is corpus.json's OWN file digest -- so a
+# snapshot baked into a case would have to equal a hash of a file containing that very value, a
+# fixed point sha256 does not yield by construction. Both the real engine and this check resolve
+# it the only way that works: compute the digest at run time from the exact facts under test,
+# mirroring the corpus's own base_facts/contract shape (same technique as UNDEFINED_ARROW above).
+choice_facts() { # governor-json -> canonical facts with that governor, a NEEDS-DISCUSSION prior,
+                  # and an unselected two-outcome named choice
+  jq -cS --arg cd "$CONTRACT_DIGEST" --arg xd "$CORPUS_DIGEST" --argjson gov "$1" '
+    .base_facts | .contract={contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,corpus_digest:$xd} |
+    .governor=$gov |
+    .prior_review={applicable:true,binding_valid:true,code_identity:"input-current",evidence_identity:"evidence-current",legacy:false,marker:"pg-run-acme-widgets-1983-1700000010-10",provenance_valid:true,verdict:"NEEDS-DISCUSSION"} |
+    .named_choice={outcomes:[{consequence:"keep the API compatible",id:"compat",label:"Preserve compatibility"},{consequence:"adopt the smaller new API",id:"break",label:"Accept the break"}],selected_id:null,snapshot_digest:""}' "$CORPUS"
+}
+select_choice() { # unselected-facts-json -> the same facts with a valid, freshness-checked selection
+  local unselected="$1" digest
+  digest="$(pg_review_decision_choice_snapshot "$unselected")"
+  jq -cS --arg d "$digest" '.named_choice.selected_id="compat" | .named_choice.snapshot_digest=$d' <<<"$unselected"
+}
+CHURN_CHOICE_FACTS="$(select_choice "$(choice_facts '{"arrow":[1,1,1],"continue_override":false,"earned":0,"grant":3,"granted":true,"policy_mode":"advisory","scored":3,"streak":2}')")"
+CHURN_CHOICE_DECISION="$(pg_review_decision_reduce "$CHURN_CHOICE_FACTS")"
+check 'a churning streak stops a NEEDS-DISCUSSION named-choice-selected fix dispatch too, not just FIX-FIRST' \
+  "$(jq -e '.action=="stop-without-new-review" and .reason=="rounds-not-converging"' <<<"$CHURN_CHOICE_DECISION" >/dev/null 2>&1; printf '%s' "$?")" \
+  "$CHURN_CHOICE_DECISION"
+CONTINUE_CHOICE_FACTS="$(select_choice "$(choice_facts '{"arrow":[1,1,1],"continue_override":true,"earned":0,"grant":3,"granted":true,"policy_mode":"advisory","scored":3,"streak":2}')")"
+CONTINUE_CHOICE_DECISION="$(pg_review_decision_reduce "$CONTINUE_CHOICE_FACTS")"
+check 'PRO_GATE_ROUNDS_CONTINUE=1 still lets an already-selected named choice dispatch despite the streak' \
+  "$(jq -e '.action=="fix-review-findings" and .reason=="named-product-choice-selected"' <<<"$CONTINUE_CHOICE_DECISION" >/dev/null 2>&1; printf '%s' "$?")" \
+  "$CONTINUE_CHOICE_DECISION"
+NOSTREAK_CHOICE_FACTS="$(select_choice "$(choice_facts '{"arrow":[],"continue_override":false,"earned":0,"grant":3,"granted":true,"policy_mode":"advisory","scored":0,"streak":0}')")"
+NOSTREAK_CHOICE_DECISION="$(pg_review_decision_reduce "$NOSTREAK_CHOICE_FACTS")"
+check 'a selected named choice dispatches normally when the streak has not reached two (regression)' \
+  "$(jq -e '.action=="fix-review-findings" and .reason=="named-product-choice-selected"' <<<"$NOSTREAK_CHOICE_DECISION" >/dev/null 2>&1; printf '%s' "$?")" \
+  "$NOSTREAK_CHOICE_DECISION"
+
 # gate #148 r8 P1: a prose consumer must NOT pin the wait at all. The engine treats any --timeout
 # it receives as final (bin/oracle-review.sh: `if [ -z "$TIMEOUT" ]`), so a skill or relay that
 # hardcodes one makes PRO_GATE_TIMEOUT and PRO_GATE_HARVEST_TIMEOUT unreachable on the path most
