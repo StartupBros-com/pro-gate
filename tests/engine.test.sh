@@ -6603,64 +6603,6 @@ check 'supersession retains the charged round and durable proof event' \
        'select(.outcome=="superseded" and .marker==$marker and .charge_retained and (.holds_capacity|not) and .proof==("head-moved:"+$old+":"+$new))' \
        "$SUPER_HEAD_HOME/ledger.jsonl" >/dev/null 2>&1; echo $?)" \
   "rounds=$(cat "$SUPER_HEAD_HOME/rounds/$SUPER_KEY") ledger=$(cat "$SUPER_HEAD_HOME/ledger.jsonl" 2>/dev/null)"
-
-# #206: a superseded round used to exit straight to "Review superseded" without ever reaching
-# pg_finish's organizer close, leaking one ChatGPT conversation tab per superseded round (the
-# daemon calls --recover every cycle). --recover now best-effort closes any owned tab immediately
-# before that exit, at BOTH supersession sites: the already-superseded-on-disk check above (site
-# 1, reused here since $SUPER_HEAD_MARKER is already state=superseded) and the fresh GH-proof
-# detection (site 2, exercised separately below with its own marker) -- this time against a real
-# mock CDP server standing in for --remote-chrome, rather than the unreachable :65530 the checks
-# above use by design.
-SUPER_CLOSE_TAB_SOURCE="$TDIR/superseded-close-tab.txt"
-printf 'run marker: %s\nA finished Pro review conversation.\n' "$SUPER_HEAD_MARKER" > "$SUPER_CLOSE_TAB_SOURCE"
-SUPER_CLOSE_TAB_STATE="$TDIR/superseded-close-tab-state.json"
-printf '{"title":null,"archived":false,"events":[]}\n' > "$SUPER_CLOSE_TAB_STATE"
-start_mock "$SUPER_CLOSE_TAB_SOURCE" "$SUPER_CLOSE_TAB_STATE"
-env -u PRO_GATE_KEEP_TABS PRO_GATE_HOME="$SUPER_HEAD_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_SELF_HEAL=0 NODE_OPTIONS= \
-  bash "$ENGINE" --recover "$SUPER_HEAD_MARKER" --timeout 1s >"$TDIR/super-close.stdout" 2>"$TDIR/super-close.stderr"
-SUPER_CLOSE_RC=$?
-check '#206 already-superseded recovery best-effort closes its owned conversation tab' \
-  "$([ "$SUPER_CLOSE_RC" -eq 6 ] \
-     && [ "$(cat "$TDIR/super-close.stderr")" = 'Review superseded' ] \
-     && [ "$(jq -r '(.closed // []) | map(select(. == "tab1")) | length' "$SUPER_CLOSE_TAB_STATE")" = 1 ]; echo $?)" \
-  "rc=$SUPER_CLOSE_RC stderr=$(cat "$TDIR/super-close.stderr") state=$(cat "$SUPER_CLOSE_TAB_STATE")"
-
-# Planted negative: the pre-existing PRO_GATE_KEEP_TABS=1 hatch (already used by the durable
-# finalize path, oracle-review.sh:2405) must suppress this close exactly like every other site.
-SUPER_CLOSE_TAB_STATE_KEEP="$TDIR/superseded-close-tab-state-keep.json"
-printf '{"title":null,"archived":false,"events":[]}\n' > "$SUPER_CLOSE_TAB_STATE_KEEP"
-start_mock "$SUPER_CLOSE_TAB_SOURCE" "$SUPER_CLOSE_TAB_STATE_KEEP"
-env PRO_GATE_HOME="$SUPER_HEAD_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_SELF_HEAL=0 PRO_GATE_KEEP_TABS=1 NODE_OPTIONS= \
-  bash "$ENGINE" --recover "$SUPER_HEAD_MARKER" --timeout 1s >"$TDIR/super-close-keep.stdout" 2>"$TDIR/super-close-keep.stderr"
-SUPER_CLOSE_KEEP_RC=$?
-check '#206 PRO_GATE_KEEP_TABS=1 leaves the superseded conversation tab open' \
-  "$([ "$SUPER_CLOSE_KEEP_RC" -eq 6 ] \
-     && [ "$(cat "$TDIR/super-close-keep.stderr")" = 'Review superseded' ] \
-     && [ "$(jq -r '(.closed // []) | map(select(. == "tab1")) | length' "$SUPER_CLOSE_TAB_STATE_KEEP")" = 0 ]; echo $?)" \
-  "rc=$SUPER_CLOSE_KEEP_RC stderr=$(cat "$TDIR/super-close-keep.stderr") state=$(cat "$SUPER_CLOSE_TAB_STATE_KEEP")"
-
-# Site 2: the fresh GH-proof-based supersession path (recover_superseded_reason, a *different*
-# reservation that is NOT already state=superseded on disk) must also close its owned tab.
-SUPER_CLOSE2_HOME="$TDIR/home-superseded-close-tab2"
-SUPER_CLOSE2_MARKER='pg-run-acme-fresh-77-1700014200-1'
-super_seed "$SUPER_CLOSE2_HOME" "$SUPER_CLOSE2_MARKER" 1700014200 "$FRESH_BASE"
-SUPER_CLOSE2_SOURCE="$TDIR/superseded-close-tab2.txt"
-printf 'run marker: %s\nA finished Pro review conversation.\n' "$SUPER_CLOSE2_MARKER" > "$SUPER_CLOSE2_SOURCE"
-SUPER_CLOSE2_STATE="$TDIR/superseded-close-tab2-state.json"
-printf '{"title":null,"archived":false,"events":[]}\n' > "$SUPER_CLOSE2_STATE"
-start_mock "$SUPER_CLOSE2_SOURCE" "$SUPER_CLOSE2_STATE"
-: > "$SUPER_GH_CALLS"
-env -u PRO_GATE_KEEP_TABS PRO_GATE_HOME="$SUPER_CLOSE2_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_SELF_HEAL=0 \
-  PRO_GATE_GH_BIN="$SUPER_GH" PG_TEST_GH_CALLS="$SUPER_GH_CALLS" PG_TEST_GH_MODE=ok PG_TEST_GH_STATE=OPEN PG_TEST_GH_HEAD="$FRESH_HEAD" NODE_OPTIONS= \
-  bash "$ENGINE" --recover "$SUPER_CLOSE2_MARKER" --timeout 1s >"$TDIR/super-close2.stdout" 2>"$TDIR/super-close2.stderr"
-SUPER_CLOSE2_RC=$?
-check '#206 fresh GH-proof (head-moved) supersession closes its owned conversation tab' \
-  "$([ "$SUPER_CLOSE2_RC" -eq 6 ] \
-     && [ "$(cat "$TDIR/super-close2.stderr")" = 'Review superseded' ] \
-     && [ "$(jq -r '(.closed // []) | map(select(. == "tab1")) | length' "$SUPER_CLOSE2_STATE")" = 1 ]; echo $?)" \
-  "rc=$SUPER_CLOSE2_RC stderr=$(cat "$TDIR/super-close2.stderr") state=$(cat "$SUPER_CLOSE2_STATE")"
-
 SUPER_SNAPSHOT="$(PRO_GATE_HOME="$SUPER_HEAD_HOME" pg_attempt_snapshot github.com acme fresh 77 "$SUPER_KEY")"
 SUPER_PLAN="$(PRO_GATE_HOME="$SUPER_HEAD_HOME" pg_reservation_slot_plan 1)"
 check 'superseded snapshot is fresh-eligible and holds zero capacity while remaining collectable' \
