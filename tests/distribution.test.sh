@@ -338,6 +338,35 @@ HOME="$TDIR/service-home" PRO_GATE_HOME="$TDIR/service-runtime" PRO_GATE_CONSENT
 check "daemon install independently enables Chrome" grep -q 'systemctl enable --now oracle-chrome.service' "$SVC_LOG"
 check "daemon install enables daemon service" grep -q 'systemctl enable --now pro-review-daemon.service' "$SVC_LOG"
 
+# #212 step 3: oracle-chrome.service.tmpl ships MemoryMax=70% + OOMPolicy=continue and
+# deliberately omits MemoryHigh (upstream's own recommended primary control) because #212's
+# gate-round measurements show MemoryHigh's throttle wedges Chrome (renderer VmHWM 7.63 GiB,
+# main process parked in state D). Same render-then-assert idiom as
+# tests/autoupdate.test.sh:190-194 (three-token sed pass-through -- these lines have no
+# @PLACEHOLDER@ of their own).
+CHROME_TMPL="$ROOT/daemon/oracle-chrome.service.tmpl"
+CHROME_RENDERED="$(sed -e "s#@PRO_GATE_HOME@#/custom/rt-home#g" -e "s#@HOME@#/h#g" -e "s#@USER@#u#g" "$CHROME_TMPL")"
+check "oracle-chrome.service renders MemoryMax=70%" \
+  bash -c 'printf "%s" "$1" | grep -qF "MemoryMax=70%"' _ "$CHROME_RENDERED"
+check "oracle-chrome.service renders OOMPolicy=continue" \
+  bash -c 'printf "%s" "$1" | grep -qF "OOMPolicy=continue"' _ "$CHROME_RENDERED"
+check "oracle-chrome.service renders with NO MemoryHigh" \
+  bash -c '! printf "%s" "$1" | grep -qF "MemoryHigh"' _ "$CHROME_RENDERED"
+
+# Planted negative: prove the "no MemoryHigh" assertion above can actually fail. Render a
+# scratch copy of the SAME template with a MemoryHigh line appended and re-run the identical
+# assertion against it -- it must flip red, or the check above is a tautology.
+CHROME_PLANT_DIR="$TDIR/oracle-chrome-plant"; mkdir -p "$CHROME_PLANT_DIR"
+cp "$CHROME_TMPL" "$CHROME_PLANT_DIR/oracle-chrome.service.tmpl"
+printf 'MemoryHigh=4G\n' >> "$CHROME_PLANT_DIR/oracle-chrome.service.tmpl"
+CHROME_PLANTED_RENDERED="$(sed -e "s#@PRO_GATE_HOME@#/custom/rt-home#g" -e "s#@HOME@#/h#g" -e "s#@USER@#u#g" "$CHROME_PLANT_DIR/oracle-chrome.service.tmpl")"
+if bash -c '! printf "%s" "$1" | grep -qF "MemoryHigh"' _ "$CHROME_PLANTED_RENDERED"; then
+  echo "FAIL - oracle-chrome.service planted-negative: no-MemoryHigh check should fail on a template with MemoryHigh but it passed"
+  FAILS=$((FAILS + 1))
+else
+  echo "ok - oracle-chrome.service planted-negative: no-MemoryHigh check correctly fails when MemoryHigh is present"
+fi
+
 MAC_BIN="$TDIR/mac-bin"; MAC_LOG="$TDIR/mac.log"; mkdir -p "$MAC_BIN"
 printf '#!/usr/bin/env bash\nprintf "Darwin\\n"\n' > "$MAC_BIN/uname"
 printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$MAC_LOG"\n' > "$MAC_BIN/launchctl"
