@@ -865,54 +865,6 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
   # Extract the validated bound head from any proof shape: pr-merged:<head>, pr-closed:<head>,
   # head-moved:<bound>:<current>. Field 2 is the bound head in all three.
   recover_superseded_head() { printf '%s' "${1#*:}" | cut -d: -f1; }
-  # #206: a superseded round exits directly and never reaches pg_finish's organizer close, so
-  # its conversation tab leaks (--remote-chrome only; reattach.ts:105 leaves the tab open by
-  # design). Best-effort: never block or alter the exit-6 supersession outcome on a close failure.
-  recover_close_tab() {  # marker -> best-effort close of any owned /c/ tab once this round is proven terminal
-    local marker="$1" close_url
-    [ "$MODE" = remote-chrome ] || return 0
-    [ "${PRO_GATE_KEEP_TABS:-0}" = 1 ] && return 0
-    command -v node >/dev/null 2>&1 || return 0
-    # #206 gate r7 P2: a run can be superseded before the delayed early organizer ever memoizes
-    # its conversation URL (disabled, failed, or simply not yet reached). Closing that tab blind
-    # would leave NEITHER an open tab NOR a conversation-urls/<marker> memo, so a later
-    # marker-addressed --harvest would have no handle at all -- breaking the superseded-but-
-    # still-collectable contract (an audit harvest of a paid review). Require a remembered,
-    # shape-valid URL (pg_conversation_url_read, mirroring cdp-salvage.mjs's own recallUrl /
-    # CONVERSATION_URL_RE) before ever asking to close; leave the tab open -- the same
-    # pre-#206 behavior -- when the memo is absent or invalid.
-    close_url="$(pg_conversation_url_read "$marker" 2>/dev/null)"
-    [ -n "$close_url" ] || return 0
-    # #216 gate r2 P2: PIN BEFORE CLOSING, never after. The memo is the live round's churnable
-    # handle -- every positive match republishes it -- so the moment this close lands, a later
-    # publisher (an incomplete harvest's rename-only organizer, a probe that matches a retry
-    # sibling) can rename ITS url over the one conversation that no longer has a tab. Nothing
-    # serializes that publisher against pg_reservation_supersede, so a reservation-state check
-    # inside the publisher can be read-then-overtaken. The pin sidesteps the race instead of
-    # trying to win it: it is written here, before the tab can disappear, and EVERY reader
-    # (pg_conversation_url_read, cdp-salvage.mjs's recallUrl) prefers it over the memo. A
-    # publisher that checked before this write may still overwrite the memo; the pinned
-    # conversation stays reachable regardless.
-    # A pin that cannot be written means an unwritable/hostile home. Refuse the close rather than
-    # produce the one state this whole path exists to prevent: no tab AND no durable handle.
-    # Best-effort in the #206 sense throughout -- it never blocks or alters the exit-6 outcome.
-    if ! pg_conversation_pin_write "$marker" "$close_url" 2>/dev/null; then
-      echo "recover_close_tab: could not pin $close_url for $marker; leaving its conversation tab open" >&2
-      return 0
-    fi
-    # #206 gate r8 P2: an unscoped --close used to close every tab owned by this marker, which
-    # can strand a retry-created sibling conversation that shares it. Scope the close to exactly
-    # the durable handle this round already validated.
-    timeout 30 node "$SELF/cdp-salvage.mjs" --close --url "$close_url" "$marker" 25 "${ORACLE_BROWSER_PORT:-9222}" >/dev/null 2>/dev/null
-    # Best-effort verification only: never blocks or alters the exit-6 supersession outcome, and
-    # PRO_GATE_KEEP_TABS=1 above already skipped this entirely. A missing memo after a scoped
-    # close is unexpected (--close never touches conversation-urls/) but worth naming. Read the
-    # MEMO specifically (#216 gate r2 P2): pg_conversation_url_read now answers with the pin this
-    # function just wrote, which would make the check vacuously true and silence a real loss.
-    [ -n "$(pg_conversation_memo_read "$marker" 2>/dev/null)" ] \
-      || echo "recover_close_tab: conversation-urls memo for $marker is gone after close" >&2
-    return 0
-  }
   REC_SELECTED=""; REC_SELECTED_OUT=""; REC_QUERY_NUM=""; REC_HOST=""; REC_OWNER=""; REC_REPO_NAME=""
   case "$RECOVER_QUERY" in
     pg-run-*)
@@ -1117,7 +1069,6 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
   # but release shared capacity before any browser probe. Missing or malformed proof stays fail-closed.
   REC_RES_STATE="$(pg_reservation_state "$REC_SELECTED" 2>/dev/null || true)"
   if [ "$REC_RES_STATE" = superseded ]; then
-    recover_close_tab "$REC_SELECTED"
     echo "Review superseded" >&2
     exit 6
   fi
@@ -1135,7 +1086,6 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
       --arg marker "$REC_SELECTED" --arg proof "$REC_SUPERSEDED_PROOF" \
       '{ts:$ts,outcome:"superseded",marker:$marker,proof:$proof,holds_capacity:false,charge_retained:true}' 2>/dev/null || true)"
     pg_ledger_append "$REC_SUPERSEDED_EVENT"
-    recover_close_tab "$REC_SELECTED"
     echo "Review superseded" >&2
     exit 6
   fi
@@ -3587,17 +3537,6 @@ find "$PRO_GATE_HOME/conversation-urls" -maxdepth 1 -type f -mmin +20160 -print 
   | while IFS= read -r _pg_memo; do
       [ -e "$_pg_res_dir/$(basename "$_pg_memo")" ] && continue
       rm -f "$_pg_memo" 2>/dev/null || true
-    done
-# #216 gate r2 P2: conversation PINS get the memo's protection, not the memo's ordinary clock.
-# A pin outranks the memo for every reader, so sweeping a live one on mtime alone would be
-# strictly worse than sweeping a memo: the round would lose the handle to a conversation whose
-# tab was deliberately closed. pg_reservation_remove already drops each pin with its reservation,
-# so anything reaching this sweep is an ORPHAN (a crash between those two unlinks) -- collected
-# on the same 14-day horizon, and never while its reservation still exists.
-find "$PRO_GATE_HOME/conversation-pins" -maxdepth 1 -type f -mmin +20160 -print 2>/dev/null \
-  | while IFS= read -r _pg_pin; do
-      [ -e "$_pg_res_dir/$(basename "$_pg_pin")" ] && continue
-      rm -f "$_pg_pin" 2>/dev/null || true
     done
 # #170: cross-bind sidecars are on the SAME 14-day clock, for the same reason. They used to
 # self-clear — any later salvage unlinked one whose scan found nothing — but that "cleanup" was

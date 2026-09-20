@@ -309,15 +309,6 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
       let request;
       try { request = JSON.parse(payload); } catch { return; }
       requests.push(request);
-      // #216 gate r2 P2: a synchronous seam INSIDE the child's scan. It fires on every
-      // Runtime.evaluate before the response is written, so a fixture can mutate PRO_GATE_HOME
-      // mid-pass. That is the only way to express "the close side published its pin while this
-      // publisher was already in flight" without instrumenting cdp-salvage.mjs itself.
-      opts.onEvaluate?.({
-        id,
-        url: scratch?.url ?? extra?.url ?? 'https://chatgpt.com/c/mock-conversation',
-        expression: request.params?.expression ?? '',
-      });
       let value = tabText;
       if (id === 'tab1' && opts.primaryText) {
         primaryPolls += 1;
@@ -498,13 +489,6 @@ function runSalvage(args, port, seed, extraEnv = {}) {
         try { return fs.readdirSync(path.join(home, 'conversation-urls')); } catch { return []; }
       })();
       const memoUrl = memos.length ? read(path.join('conversation-urls', memos[0])) : null;
-      // #216 gate r2 P2: the conversation PIN lives in its own directory (never counted by, or
-      // evicted with, the memo cap), so read it back separately -- "what did this run leave as
-      // the recovery handle?" is now a two-file question.
-      const pins = (() => {
-        try { return fs.readdirSync(path.join(home, 'conversation-pins')); } catch { return []; }
-      })();
-      const pinUrl = pins.length ? read(path.join('conversation-pins', pins[0])) : null;
       const blacklist = read('salvage-nonmatching.txt');
       const cooldown = read('throttle.cooldown');
       // #68: convictions recorded for --status to read back (one line per cross-bind hit).
@@ -528,7 +512,6 @@ function runSalvage(args, port, seed, extraEnv = {}) {
       resolve({
         status, stdout, stderr, elapsedMs: Date.now() - startedAt,
         memoUrl: memoUrl?.trim() ?? null, memos, blacklist, cooldown, crossbound, crossboundBody,
-        pins, pinUrl: pinUrl?.trim() ?? null,
       });
     });
   });
@@ -3626,8 +3609,8 @@ for (const placeholder of PLACEHOLDER_URLS) {
 
 { // #216 local verify r3 P3: --close's --url gate was prefix-only (/^https:\/\/chatgpt\.com\/c\//),
   // looser than CONVERSATION_URL_RE -- the predicate every OTHER consumer of a conversation URL
-  // is held to (rememberUrl/recallUrl here, and the shell's pg_conversation_url_ok, which is what
-  // recover_close_tab validates the memo with before passing it in). So a value the memo layer
+  // is held to (rememberUrl/recallUrl here, which is what
+  // a shell caller validates a memo with before passing it in). So a value the memo layer
   // would have revoked as a placeholder -- https://chatgpt.com/c/WEB:<uuid> is the #109 shape --
   // still passed the flag check and became the close SCOPE: conversationIdFromUrl returned
   // "WEB:1234", no tab could ever match it, and --close exited 0 announcing "closed 0
@@ -3794,7 +3777,7 @@ for (const placeholder of PLACEHOLDER_URLS) {
   // skipped URL narrowing entirely. A marker owning two conversations (a memoized one and a retry
   // sibling) therefore had BOTH closed by a caller that believed it had scoped the close to one:
   // the exact blast radius #206 finding A removed, reachable whenever a caller's scope expression
-  // evaluates to nothing (an empty pg_conversation_url_read, an unset shell variable). The flag's
+  // evaluates to nothing (an empty memo read, an unset shell variable). The flag's
   // PRESENCE is now what selects scoped behavior, and a present-but-unusable value is refused
   // before any browser access. Unscoped close stays reachable by omitting --url, which the
   // '--close without --url still closes every owned tab' check above holds unchanged.
@@ -3872,307 +3855,6 @@ for (const placeholder of PLACEHOLDER_URLS) {
       && r.memos.length === 201,
     `memos.length=${r.memos.length} evicted0=${memoSet.has(unprotected[0])} kept1=${memoSet.has(unprotected[1])}`);
   cdp.stop();
-}
-
-{ // #216 gate r1 P2 (paid review, finding at bin/oracle-review.sh:889): reservation protection
-  // stops a retained memo being DELETED; nothing stopped it being OVERWRITTEN, and #206 finding
-  // A's scoped close made that the loss that matters. With owned conversations A and B and a memo
-  // naming A, supersession cleanup closes A and leaves B; the next pass that publishes a memo --
-  // classically an incomplete harvest's rename-only organizer, for which B is now the sole open
-  // candidate -- republishes B over A, and the paid review sitting at the CLOSED conversation A
-  // becomes undiscoverable through marker-addressed recovery. rememberUrl() now refuses that one
-  // replacement: a retained superseded reservation's existing memo is kept, and the sibling loses
-  // nothing, because an OPEN conversation is found by every tab scan on its own.
-  const PIN_MARKER = 'pg-run-memo-pin-1700099700-1';
-  const URL_A = 'https://chatgpt.com/c/pinned-conversation-a';   // the closed, memoized review
-  const URL_B = 'https://chatgpt.com/c/mock-conversation';       // mockCdp's tab1: the open sibling
-  const ownedIncomplete = `run marker: ${PIN_MARKER}\nStill thinking about the diff...`;
-  const ownedTerminal = [
-    `run marker: ${PIN_MARKER}`, 'P1: none', 'P2: none', 'P3: none',
-    `VERDICT: SHIP — sibling answer. (run marker: ${PIN_MARKER})`,
-  ].join('\n');
-  // A reservation record is one TSV line whose last field is the lifecycle state, exactly as
-  // pg_reservation_supersede writes it (see super_seed in tests/engine.test.sh).
-  const seedPinned = ({ memo = URL_A, state = null, title = null } = {}) => (home) => {
-    if (memo) {
-      fs.mkdirSync(path.join(home, 'conversation-urls'), { recursive: true });
-      fs.writeFileSync(path.join(home, 'conversation-urls', PIN_MARKER), `${memo}\n`);
-    }
-    if (state) {
-      fs.mkdirSync(path.join(home, 'in-progress'), { recursive: true });
-      fs.writeFileSync(path.join(home, 'in-progress', PIN_MARKER),
-        `pin-77\t${path.join(home, 'pin-audit.md')}\t1700099700\t0\t1\tGPT-X\t1700099700\t${state}\n`);
-    }
-    if (title) {
-      fs.mkdirSync(path.join(home, 'conversation-titles'), { recursive: true });
-      fs.writeFileSync(path.join(home, 'conversation-titles', PIN_MARKER), `${title}\n`);
-    }
-  };
-
-  { // The finding's own path: the rename-only organizer, with A's tab gone and B the sole
-    // candidate. The rename it performs is the proof it reached the republication point.
-    const cdp = await mockCdp(ownedIncomplete, [], { ui: { title: null, archived: false, events: [] } });
-    const r = await runSalvage(['--organize', PIN_MARKER, '5'], cdp.port,
-      seedPinned({ state: 'superseded', title: 'pro-gate review: PR #216 r1 [pin]' }));
-    check('#216 gate r1 P2: the rename-only organizer does not replace a retained superseded reservation\'s memo',
-      r.memoUrl === URL_A && r.memos.length === 1,
-      `memoUrl=${r.memoUrl} memos=${JSON.stringify(r.memos)} stdout=${r.stdout?.slice(-200)}`);
-    check('#216 gate r1 P2: the refusal names both the kept memo and the URL it would not publish',
-      (r.stderr ?? '').includes(`memo-pinned: keeping ${URL_A} for "${PIN_MARKER}"`)
-        && (r.stderr ?? '').includes(`not replacing with ${URL_B}`),
-      `stderr=${r.stderr?.slice(-400)}`);
-    check('#216 gate r1 P2: pinning the memo does not stop the organizer mutating the open sibling',
-      /organizer source=open/.test(r.stdout ?? '') && cdp.ui.events.some((e) => e.action === 'rename'),
-      `stdout=${r.stdout?.slice(-200)} events=${JSON.stringify(cdp.ui.events)}`);
-    cdp.stop();
-  }
-  { // Control: a GENERATING reservation is a live round whose organizer may still legitimately
-    // refresh the memo. Without this, "never replace when a reservation exists" would pass too.
-    const cdp = await mockCdp(ownedIncomplete, [], { ui: { title: null, archived: false, events: [] } });
-    const r = await runSalvage(['--organize', PIN_MARKER, '5'], cdp.port,
-      seedPinned({ state: 'generating', title: 'pro-gate review: PR #216 r1 [pin]' }));
-    check('#216 gate r1 P2 control: a generating reservation still lets the organizer refresh the memo',
-      r.memoUrl === URL_B && !(r.stderr ?? '').includes('memo-pinned:'),
-      `memoUrl=${r.memoUrl} stderr=${r.stderr?.slice(-300)}`);
-    cdp.stop();
-  }
-  { // Control: no reservation record at all -- unchanged pre-#216 behavior.
-    const cdp = await mockCdp(ownedIncomplete, [], { ui: { title: null, archived: false, events: [] } });
-    const r = await runSalvage(['--organize', PIN_MARKER, '5'], cdp.port,
-      seedPinned({ title: 'pro-gate review: PR #216 r1 [pin]' }));
-    check('#216 gate r1 P2 control: with no reservation record the organizer refreshes the memo',
-      r.memoUrl === URL_B && !(r.stderr ?? '').includes('memo-pinned:'),
-      `memoUrl=${r.memoUrl} stderr=${r.stderr?.slice(-300)}`);
-    cdp.stop();
-  }
-  { // The other publisher: onOurConversation(), reached by an ordinary salvage that positively
-    // matches the sibling's tab. Same refusal, and the capture still succeeds -- the pin governs
-    // the recovery handle, never the review this pass extracted.
-    const cdp = await mockCdp(ownedTerminal);
-    const r = await runSalvage([PIN_MARKER, '10'], cdp.port, seedPinned({ state: 'superseded' }));
-    check('#216 gate r1 P2: a positive match on the open sibling does not replace the retained memo either',
-      r.status === 0 && r.memoUrl === URL_A
-        && (r.stderr ?? '').includes(`memo-pinned: keeping ${URL_A}`),
-      `status=${r.status} memoUrl=${r.memoUrl} stderr=${r.stderr?.slice(-400)}`);
-    cdp.stop();
-  }
-  { // Boundary: the pin keeps an EXISTING handle, it does not forbid a first one. A superseded
-    // round that never memoized a URL (the memo-less case #206 gate r7 P2 leaves its tab open
-    // for) must still be able to publish its first memo, or that run loses recovery entirely.
-    const cdp = await mockCdp(ownedTerminal);
-    const r = await runSalvage([PIN_MARKER, '10'], cdp.port, seedPinned({ memo: null, state: 'superseded' }));
-    check('#216 gate r1 P2 boundary: a superseded reservation with NO memo still publishes its first one',
-      r.status === 0 && r.memoUrl === URL_B && !(r.stderr ?? '').includes('memo-pinned:'),
-      `status=${r.status} memoUrl=${r.memoUrl} stderr=${r.stderr?.slice(-300)}`);
-    cdp.stop();
-  }
-}
-
-{ // #216 gate r2 P2 (paid review, findings at bin/cdp-salvage.mjs:460 and bin/oracle-review.sh:889).
-  //
-  // FINDING 1 -- the memo pin could be bypassed by a publisher racing supersession. The r1 guard
-  // keyed on the RESERVATION STATE, which nothing serializes against pg_reservation_supersede: a
-  // concurrent harvest/probe could read memo A and state `generating`, pause, resume after
-  // recovery had committed `superseded` and CLOSED A, and then rename B over the memo on the
-  // strength of its own stale read. The replacement is not a lock but a durable value written by
-  // the closer BEFORE the close -- conversation-pins/<marker> -- which every reader prefers. A
-  // publisher may still win the memo; it cannot change what readers prefer, so the closed,
-  // PAID conversation stays reachable either way.
-  //
-  // FINDING 2 -- with A closed, an unbound retry sibling B blocks A's recovery permanently. The
-  // scan emits B (terminal, no marker echo), the engine refuses it for the missing echo and
-  // returns exit 9 WITHOUT blacklisting it (#54 gate r6 P1 deliberately refuses to condemn a
-  // nonce-less capture), and with no title memo the exit-9 organizer performs no browser recovery
-  // either -- so every later harvest repeats B and never opens A. The fix is preference, not
-  // condemnation: a pinned conversation that is not a listed tab is rendered BEFORE an
-  // unbindable terminal is emitted, and only replaces it when it carries the echo the engine
-  // actually requires.
-  const PIN2 = 'pg-run-pin-file-1700099800-1';
-  const PIN2_A = 'https://chatgpt.com/c/pinned-closed-a';    // closed by recover_close_tab
-  const PIN2_B = 'https://chatgpt.com/c/mock-conversation';  // mockCdp's tab1: the retry sibling
-  const boundTerminal = (where) => [
-    `run marker: ${PIN2}`,
-    `[P1] src/pin.mjs:1 — ${where}`,
-    'P2: none', 'P3: none',
-    `VERDICT: SHIP — ${where}. (run marker: ${PIN2})`,
-  ].join('\n');
-  // Terminal, owned (the marker is in its prompt), but with NO echo on the VERDICT line -- what
-  // pg_capture_nonce_ok refuses and what therefore cannot end a scan usefully.
-  const unboundTerminal = (where) => [
-    `run marker: ${PIN2}`,
-    `[P1] src/pin.mjs:1 — ${where}`,
-    'P2: none', 'P3: none',
-    `VERDICT: SHIP — ${where}.`,
-  ].join('\n');
-  const bodyOf = (text) => text.split('\n').slice(1).join('\n');
-  const seedPinState = ({ memo = null, pin = null, state = null } = {}) => (home) => {
-    if (memo) {
-      fs.mkdirSync(path.join(home, 'conversation-urls'), { recursive: true });
-      fs.writeFileSync(path.join(home, 'conversation-urls', PIN2), `${memo}\n`);
-    }
-    if (pin) {
-      fs.mkdirSync(path.join(home, 'conversation-pins'), { recursive: true });
-      fs.writeFileSync(path.join(home, 'conversation-pins', PIN2), `${pin}\n`);
-    }
-    if (state) {
-      fs.mkdirSync(path.join(home, 'in-progress'), { recursive: true });
-      fs.writeFileSync(path.join(home, 'in-progress', PIN2),
-        `pin2-77\t${path.join(home, 'pin2-audit.md')}\t1700099800\t0\t1\tGPT-X\t1700099800\t${state}\n`);
-    }
-  };
-
-  { // The pin alone holds the memo. State is deliberately `generating` -- the r1 check cannot
-    // fire here, so anything that survives is the pin's doing and nothing else's.
-    const cdp = await mockCdp(boundTerminal('sibling B'));
-    const r = await runSalvage([PIN2, '10'], cdp.port,
-      seedPinState({ memo: PIN2_A, pin: PIN2_A, state: 'generating' }));
-    check('#216 gate r2 P2: a pin holds the memo on its own, with the reservation still reading generating',
-      r.status === 0 && r.memoUrl === PIN2_A && r.pinUrl === PIN2_A && cdp.created.length === 0
-        && (r.stderr ?? '').includes(
-          `memo-pinned: keeping ${PIN2_A} for "${PIN2}" (pinned closed conversation); not replacing with ${PIN2_B}`),
-      `status=${r.status} memoUrl=${r.memoUrl} pinUrl=${r.pinUrl} created=${JSON.stringify(cdp.created)} stderr=${r.stderr?.slice(-400)}`);
-    check('#216 gate r2 P2: the pin governs the handle, never the review this pass extracted',
-      r.stdout.trim() === bodyOf(boundTerminal('sibling B')),
-      `stdout=${r.stdout?.slice(-300)}`);
-    cdp.stop();
-  }
-  { // Control for the check above: with NO pin, the same generating round republishes B exactly
-    // as it always did. Without this, "the memo survived" could be inertia rather than the pin.
-    const cdp = await mockCdp(boundTerminal('sibling B'));
-    const r = await runSalvage([PIN2, '10'], cdp.port, seedPinState({ memo: PIN2_A, state: 'generating' }));
-    check('#216 gate r2 P2 control: with no pin a generating round still republishes the memo',
-      r.status === 0 && r.memoUrl === PIN2_B && r.pins.length === 0
-        && !(r.stderr ?? '').includes('memo-pinned:'),
-      `status=${r.status} memoUrl=${r.memoUrl} pins=${JSON.stringify(r.pins)} stderr=${r.stderr?.slice(-300)}`);
-    cdp.stop();
-  }
-  { // The race's SURVIVING window, stated as state on disk: a publisher that checked before the
-    // pin existed has already renamed B over the memo. Reader preference is what makes that
-    // harmless -- with no tab anywhere, recovery must still open A, not the memo's B.
-    const pinnedA = boundTerminal('the pinned conversation A');
-    const cdp = await mockCdp('__NO_TABS__', [], {
-      renderText: (url) => (url === PIN2_A ? pinnedA : 'run marker: pg-run-other-9999999999-9\nWRONG URL RENDERED'),
-    });
-    const r = await runScratchSalvage([PIN2, '6'], cdp.port, seedPinState({ memo: PIN2_B, pin: PIN2_A }));
-    check('#216 gate r2 P2: a memo already overwritten with B still recovers the pinned conversation A',
-      r.status === 0 && cdp.created.length === 1 && cdp.created[0]?.url === PIN2_A
-        && (r.stderr ?? '').includes(`matched-url ${PIN2_A}`)
-        && r.stdout.trim() === bodyOf(pinnedA),
-      `status=${r.status} created=${JSON.stringify(cdp.created)} stdout=${r.stdout?.slice(-200)} stderr=${r.stderr?.slice(-400)}`);
-    cdp.stop();
-  }
-  { // The shell half of the same preference. pg_conversation_url_read answers with the pin;
-    // pg_conversation_memo_read still answers with the memo alone, which is what
-    // recover_close_tab's post-close warning needs in order not to become vacuous.
-    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-pin-shell-'));
-    fs.mkdirSync(path.join(home, 'conversation-urls'), { recursive: true });
-    fs.mkdirSync(path.join(home, 'conversation-pins'), { recursive: true });
-    fs.writeFileSync(path.join(home, 'conversation-urls', PIN2), `${PIN2_B}\n`);
-    fs.writeFileSync(path.join(home, 'conversation-pins', PIN2), `${PIN2_A}\n`);
-    const shellRead = (fn) => {
-      const result = spawnSync('bash', ['-c', '. "$1"; "$2" "$3"', 'pin-reader-fixture', LIBRARY, fn, PIN2],
-        { env: { ...process.env, PRO_GATE_HOME: home }, encoding: 'utf8' });
-      return (result.stdout ?? '').trim();
-    };
-    const handle = shellRead('pg_conversation_url_read');
-    const memoOnly = shellRead('pg_conversation_memo_read');
-    // A pin that fails the shared shape gate is not a handle: fall back, never answer nothing.
-    fs.writeFileSync(path.join(home, 'conversation-pins', PIN2), 'https://chatgpt.com/c/WEB:1234\n');
-    const malformed = shellRead('pg_conversation_url_read');
-    fs.rmSync(path.join(home, 'conversation-pins', PIN2), { force: true });
-    const absent = shellRead('pg_conversation_url_read');
-    fs.rmSync(home, { recursive: true, force: true });
-    check('#216 gate r2 P2: pg_conversation_url_read prefers the pin while pg_conversation_memo_read still reads the memo',
-      handle === PIN2_A && memoOnly === PIN2_B, `handle=${handle} memoOnly=${memoOnly}`);
-    check('#216 gate r2 P2: a malformed or absent pin falls back to the memo, never to nothing',
-      malformed === PIN2_B && absent === PIN2_B, `malformed=${malformed} absent=${absent}`);
-  }
-  { // Finding 1's live shape: the close side publishes the pin WHILE this publisher is already
-    // mid-scan (onEvaluate fires synchronously inside the child's DOM read, before the
-    // classification and rememberUrl that follow it). The in-flight publisher must honour it.
-    let pinHome = null;
-    let pinWrites = 0;
-    const cdp = await mockCdp(boundTerminal('sibling B'), [], {
-      onEvaluate: ({ id, expression }) => {
-        if (pinWrites || id !== 'tab1' || !pinHome || !expression.includes('pro-gate:review-text')) return;
-        pinWrites += 1;
-        fs.mkdirSync(path.join(pinHome, 'conversation-pins'), { recursive: true });
-        fs.writeFileSync(path.join(pinHome, 'conversation-pins', PIN2), `${PIN2_A}\n`);
-      },
-    });
-    const r = await runSalvage([PIN2, '10'], cdp.port, (home) => {
-      pinHome = home;
-      seedPinState({ memo: PIN2_A, state: 'generating' })(home);
-    });
-    check('#216 gate r2 P2: a pin published mid-scan still governs the publisher already in flight',
-      pinWrites === 1 && r.status === 0 && r.pinUrl === PIN2_A && r.memoUrl === PIN2_A
-        && (r.stderr ?? '').includes(`memo-pinned: keeping ${PIN2_A}`),
-      `pinWrites=${pinWrites} status=${r.status} pinUrl=${r.pinUrl} memoUrl=${r.memoUrl} stderr=${r.stderr?.slice(-400)}`);
-    cdp.stop();
-  }
-  { // FINDING 2, the reviewer's own sequence: A complete and signed but closed (pinned), B open
-    // with a terminal verdict and no echo. Pre-fix the scan emits B and the engine's rejection
-    // loops forever; now the pinned conversation is rendered first and A is what comes back.
-    const pinnedA = boundTerminal('the pinned conversation A');
-    const cdp = await mockCdp(unboundTerminal('retry sibling B'), [], {
-      renderText: (url) => (url === PIN2_A ? pinnedA : 'run marker: pg-run-other-9999999999-9\nWRONG URL RENDERED'),
-    });
-    const r = await runScratchSalvage([PIN2, '8'], cdp.port,
-      seedPinState({ memo: PIN2_A, pin: PIN2_A, state: 'superseded' }));
-    check('#216 gate r2 P2: an unbindable terminal sibling no longer ends the scan while a pinned conversation exists',
-      r.status === 0 && cdp.created.length === 1 && cdp.created[0]?.url === PIN2_A
-        && (r.stderr ?? '').includes(`rendering the pinned conversation ${PIN2_A}`)
-        && (r.stderr ?? '').includes(`matched-url ${PIN2_A}`)
-        && r.stdout.trim() === bodyOf(pinnedA),
-      `status=${r.status} created=${JSON.stringify(cdp.created)} stdout=${r.stdout?.slice(-200)} stderr=${r.stderr?.slice(-500)}`);
-    cdp.stop();
-  }
-  { // Control: the SAME sibling with no pin is emitted exactly as before -- no scratch render,
-    // no detour. This is the pre-fix behaviour, and it is what the pin (not the memo) changes:
-    // the memo alone still names A here.
-    const cdp = await mockCdp(unboundTerminal('retry sibling B'), [], {
-      renderText: () => boundTerminal('the pinned conversation A'),
-    });
-    const r = await runScratchSalvage([PIN2, '8'], cdp.port,
-      seedPinState({ memo: PIN2_A, state: 'superseded' }));
-    check('#216 gate r2 P2 control: with no pin the unbindable sibling is still emitted unchanged',
-      r.status === 0 && cdp.created.length === 0
-        && !(r.stderr ?? '').includes('rendering the pinned conversation')
-        && r.stdout.trim() === bodyOf(unboundTerminal('retry sibling B')),
-      `status=${r.status} created=${JSON.stringify(cdp.created)} stdout=${r.stdout?.slice(-200)}`);
-    cdp.stop();
-  }
-  { // Control: the detour prefers the pin only when the pin carries what the candidate lacks. A
-    // pinned conversation that is ALSO unbound must not be substituted -- that would swap one
-    // engine rejection for another while claiming a different source.
-    const cdp = await mockCdp(unboundTerminal('retry sibling B'), [], {
-      renderText: (url) => (url === PIN2_A ? unboundTerminal('pinned but unsigned A') : 'nothing here'),
-    });
-    const r = await runScratchSalvage([PIN2, '8'], cdp.port,
-      seedPinState({ memo: PIN2_A, pin: PIN2_A, state: 'superseded' }));
-    check('#216 gate r2 P2: an equally unbindable pinned conversation falls through to the open sibling',
-      r.status === 0 && cdp.created.length === 1
-        && (r.stderr ?? '').includes(`rendering the pinned conversation ${PIN2_A}`)
-        && r.stdout.trim() === bodyOf(unboundTerminal('retry sibling B')),
-      `status=${r.status} created=${JSON.stringify(cdp.created)} stdout=${r.stdout?.slice(-200)} stderr=${r.stderr?.slice(-400)}`);
-    cdp.stop();
-  }
-  { // A pin every reader prefers and nothing can retire would wedge recovery forever. Positive
-    // proof of foreignness -- the same bar that already evicts a memo -- revokes it.
-    const crossBound = [
-      `run marker: ${PIN2}`,
-      '[P1] foreign/source.mjs:1 — another run',
-      'VERDICT: FIX-FIRST — not ours. (run marker: pg-run-other-repo-42-1111111111-9)',
-    ].join('\n');
-    const cdp = await mockCdp('__NO_TABS__', [], { renderText: () => crossBound });
-    const r = await runScratchSalvage([PIN2, '6'], cdp.port, seedPinState({ memo: PIN2_A, pin: PIN2_A }));
-    check('#216 gate r2 P2: a pinned conversation proven cross-bound is revoked, not preferred forever',
-      r.pins.length === 0 && r.memos.length === 0
-        && (r.stderr ?? '').includes(`pin-revoked: ${PIN2_A}`)
-        && (r.blacklist ?? '').includes(PIN2_A),
-      `pins=${JSON.stringify(r.pins)} memos=${JSON.stringify(r.memos)} blacklist=${r.blacklist} stderr=${r.stderr?.slice(-400)}`);
-    cdp.stop();
-  }
 }
 
 process.exit(failures === 0 ? 0 : 1);

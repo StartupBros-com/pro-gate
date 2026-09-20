@@ -4,14 +4,9 @@
 // the tab's debugger WebSocket, /json/new (scratch tabs, so the salvage's remembered-URL
 // recovery can reach a decisive answer the way a real browser does), and /json/close.
 // Prints the chosen port on stdout.
-// Usage: node tests/mock-cdp.mjs <source-text-file> [organizer-state-file] [scratch-text-file] [scratch-canonical-url] [second-tab-url] [second-tab-text-file]
+// Usage: node tests/mock-cdp.mjs <source-text-file> [organizer-state-file] [scratch-text-file] [scratch-canonical-url]
 // Optional scratch content is served only when the requested URL equals the canonical URL,
 // preventing a wrong URL from producing a plausible recovery artifact.
-// #216 gate r1 P2: the optional fifth argument adds ONE more listed conversation tab (id tab2) at
-// that URL, serving the same body as the primary. One marker can legitimately own two
-// conversations — a memoized one and a retry sibling — and no fixture could express that before,
-// so nothing could distinguish "closed the one conversation we hold a handle for" from "closed
-// everything owned", nor watch what a later pass does to the memo once one of the two is gone.
 // State records created/closed browser targets independently from organizer events.
 import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
@@ -23,12 +18,6 @@ const stateFile = process.argv[3] || null;
 const scratchTextFile = process.argv[4] || null;
 const PRIMARY_URL = 'https://chatgpt.com/c/mock-conversation';
 const scratchCanonicalUrl = process.argv[5] || PRIMARY_URL;
-const secondTabUrl = process.argv[6] || null;
-// #216 gate r2 P2: the optional SIXTH argument gives that second tab its own body. Until now it
-// served the primary's text, so no fixture could express the shape the finding names -- a
-// complete, correctly signed conversation A alongside a retry sibling B whose terminal verdict
-// carries no marker echo. Absent, tab2 keeps serving the primary's text exactly as before.
-const secondTabTextFile = process.argv[7] || null;
 const WS_MAGIC = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
 function wsTextFrame(payload) {
@@ -98,9 +87,6 @@ function textForTarget(id) {
     if (scratch.get(id) !== scratchCanonicalUrl) return 'Mock scratch URL mismatch: no conversation content.';
     try { return fs.readFileSync(scratchTextFile, 'utf8'); } catch { return ''; }
   }
-  if (id === 'tab2' && secondTabTextFile) {
-    try { return fs.readFileSync(secondTabTextFile, 'utf8'); } catch { return ''; }
-  }
   try { return fs.readFileSync(textFile, 'utf8'); } catch { return ''; }
 }
 
@@ -114,7 +100,6 @@ const scratch = new Map();   // id -> url, for tabs opened via /json/new
 let scratchSeq = 0;
 let primaryClosed = false;
 let primaryClosedText = null;
-let secondClosed = false;
 
 const server = createServer((req, res) => {
   if (req.url === '/json/version') { res.end(JSON.stringify({ Browser: 'MockChrome/1.0' })); return; }
@@ -145,19 +130,11 @@ const server = createServer((req, res) => {
     const extras = [...scratch].map(([id, url]) => ({
       id, type: 'page', url, webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/${id}`,
     }));
-    // __NO_TABS__ means "this browser lists no conversation tab at all", so it hides the optional
-    // second tab exactly as it hides the primary; only an explicit close hides one on its own.
-    const second = secondTabUrl && !secondClosed && current !== '__NO_TABS__'
-      ? [{
-        id: 'tab2', type: 'page', url: secondTabUrl,
-        webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/tab2`,
-      }]
-      : [];
-    if (current === '__NO_TABS__' || primaryClosed) { res.end(JSON.stringify([...second, ...extras])); return; }
+    if (current === '__NO_TABS__' || primaryClosed) { res.end(JSON.stringify(extras)); return; }
     res.end(JSON.stringify([{
       id: 'tab1', type: 'page', url: PRIMARY_URL,
       webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/tab1`,
-    }, ...second, ...extras]));
+    }, ...extras]));
     return;
   }
   if (req.url?.startsWith('/json/close/')) {
@@ -165,8 +142,6 @@ const server = createServer((req, res) => {
     if (id === 'tab1') {
       primaryClosed = true;
       try { primaryClosedText = fs.readFileSync(textFile, 'utf8'); } catch { primaryClosedText = null; }
-    } else if (id === 'tab2') {
-      secondClosed = true;
     } else {
       scratch.delete(id);
     }
