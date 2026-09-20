@@ -333,6 +333,9 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
         value = opts.renderText(scratch.url, n);
       }
       let delayMs = 0;
+      // #215 skeptic r2 D1: set to a message when this ONE evaluate must answer with a CDP error
+      // frame instead of a value, so a fixture can reproduce a failed read without a 5s bail.
+      let evaluateError = null;
       let armMutation = null;
       let applyMutation = null;
       if (expression.includes('pro-gate:review-text') && opts.document) {
@@ -340,6 +343,18 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
       } else if (expression.includes('pro-gate:terminal-infrastructure')) {
         value = opts.infrastructureError ?? null;
       } else if (expression.includes('pro-gate:throttle-modal')) {
+        // #215 skeptic r2 D1: a dialog read can FAIL as well as come back empty — an evaluate
+        // timeout, a websocket error, a detached target, a dialog momentarily not laid out.
+        // Production cannot tell those apart from "no dialog" unless the failure is carried out of
+        // tabThrottleModal, so a fixture must be able to produce one SELECTIVELY (per tab, per
+        // invocation). opts.throttleModalFails (true, or (id, url) => boolean) makes this one
+        // evaluate answer with a CDP error frame — exactly the shape evaluateTab turns into
+        // { ok: false, reason: 'evaluate-failed' } — so the fixture stays deterministic and never
+        // waits out the 5s bail.
+        const modalReadFails = typeof opts.throttleModalFails === 'function'
+          ? opts.throttleModalFails(id, scratch?.url ?? extra?.url ?? 'https://chatgpt.com/c/mock-conversation') === true
+          : opts.throttleModalFails === true;
+        if (modalReadFails) evaluateError = 'mock: throttle-modal evaluate failed';
         // #162: an ELEMENT read distinct from the page text. With no fixture value the evaluator
         // sees no dialog — never the body — so quoted throttle copy cannot leak into a match.
         value = typeof opts.throttleModal === 'function'
@@ -405,10 +420,9 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
       const response = () => {
         if (armLate) armMutation();
         applyMutation?.();
-        socket.write(wsTextFrame(JSON.stringify({
-          id: request.id,
-          result: { result: { value } },
-        })));
+        socket.write(wsTextFrame(JSON.stringify(evaluateError
+          ? { id: request.id, error: { message: evaluateError } }
+          : { id: request.id, result: { result: { value } } })));
         // Pass 7's later-outage fixture may stop only after the child consumed the successful
         // outer list enough to issue the listed primary tab's DOM poll. Scheduling after the
         // response is written preserves that successful-read-before-outage ordering.
@@ -4915,5 +4929,374 @@ for (const placeholder of PLACEHOLDER_URLS) {
     cdp.stop();
   }
 }
+
+// =================================================================================================
+// #215 skeptic r2: four defects two independent local skeptics found in the retire-on-healthy
+// change (commit 4e1fb0d), plus the test-only gap D5 they found in its own coverage.
+// =================================================================================================
+const ageCooldown215 = (p) => { const t = new Date(Date.now() - 3_600_000); fs.utimesSync(p, t, t); };
+
+{ // #215 skeptic r2 D1 (P2) (bin/cdp-salvage.mjs tabThrottleModal / scanThrottleHealth): a FAILED
+  // dialog read counted as positive proof of health. tabThrottleModal returned null both for "no
+  // dialog" and for EVERY read failure (evaluate timeout, websocket error, detached target, a
+  // dialog momentarily not laid out), and isThrottlePage can never fire on a marker-bearing
+  // conversation page (it rejects any text carrying a pg-run marker at all). So a single flaky
+  // evaluate over a still-throttled stale tab made scanThrottleHealth count that URL healthy,
+  // retire its charged fingerprint, and re-arm a fresh 900s account cooldown on the next scan —
+  // the exact #208 livelock, reached through read flakiness rather than a real new episode.
+  // Both halves are covered: (a) the body still carries the limiter copy, (b) it does not and the
+  // failed read is the only signal. Neither may retire anything.
+  const d1Url = 'https://chatgpt.com/c/mock-215-d1-unreadable-modal';
+  const d1Modal = "You're making requests too quickly. [#215 skeptic r2 D1 fixture]";
+  const d1Foreign = 'pg-run-another-run-215d1';
+  const d1ThrottledText = `ChatGPT\n${d1Foreign}\n${d1Modal}\nAnother run's conversation beneath the modal.\n`;
+  const d1HealthyText = `ChatGPT\n${d1Foreign}\nAnother run's conversation, fully rendered, no limiter in sight.\n`;
+
+  // (a) The limiter is still on screen AND still in the body text; only the dialog read fails.
+  const homeD1a = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const cdpD1a1 = await mockCdp('__NO_TABS__', [{ id: 'd1tab', url: d1Url }], {
+    tabText: () => d1ThrottledText,
+    throttleModal: () => d1Modal,
+  });
+  const rD1a1 = await runSalvageInHome(homeD1a, [MARKER, '3'], cdpD1a1.port);
+  cdpD1a1.stop();
+  check('#215 skeptic r2 D1a (1) the first sighting of the unowned modal takes the throttle exit and charges its fingerprint',
+    rD1a1.status === 5 && throttleSeenHas(homeD1a, d1Url, d1Modal),
+    `status=${rD1a1.status} stderr=${rD1a1.stderr?.slice(-300)}`);
+  const cooldownD1a = path.join(homeD1a, 'throttle.cooldown');
+  ageCooldown215(cooldownD1a);
+  const mtimeD1a2Before = fs.statSync(cooldownD1a).mtimeMs;
+  const cdpD1a2 = await mockCdp('__NO_TABS__', [{ id: 'd1tab', url: d1Url }], {
+    tabText: () => d1ThrottledText,
+    throttleModal: () => d1Modal,
+    throttleModalFails: () => true,   // the dialog IS there; this scan simply could not read it
+  });
+  const rD1a2 = await runSalvageInHome(homeD1a, [MARKER, '3'], cdpD1a2.port);
+  cdpD1a2.stop();
+  const mtimeD1a2After = fs.statSync(cooldownD1a).mtimeMs;
+  check('#215 skeptic r2 D1a (2) a tab whose modal read FAILED is never counted healthy, so its charged fingerprint survives',
+    throttleSeenHas(homeD1a, d1Url, d1Modal),
+    `status=${rD1a2.status} dir=${fs.existsSync(throttleSeenDir(homeD1a)) ? fs.readdirSync(throttleSeenDir(homeD1a)) : null}`);
+  check('#215 skeptic r2 D1a (2) the failed-read scan writes no cooldown of its own',
+    mtimeD1a2After === mtimeD1a2Before, `before=${mtimeD1a2Before} after=${mtimeD1a2After}`);
+  ageCooldown215(cooldownD1a);
+  const mtimeD1a3Before = fs.statSync(cooldownD1a).mtimeMs;
+  const cdpD1a3 = await mockCdp('__NO_TABS__', [{ id: 'd1tab', url: d1Url }], {
+    tabText: () => d1ThrottledText,
+    throttleModal: () => d1Modal,
+  });
+  const rD1a3 = await runSalvageInHome(homeD1a, [MARKER, '3'], cdpD1a3.port);
+  cdpD1a3.stop();
+  const mtimeD1a3After = fs.statSync(cooldownD1a).mtimeMs;
+  check('#215 skeptic r2 D1a (3) the unchanged stale modal does NOT re-arm the account cooldown after a failed read',
+    mtimeD1a3After === mtimeD1a3Before && rD1a3.status !== 5,
+    `before=${mtimeD1a3Before} after=${mtimeD1a3After} status=${rD1a3.status}`);
+  fs.rmSync(homeD1a, { recursive: true, force: true });
+
+  // (b) The body carries NO limiter copy, so THROTTLE_RE cannot rescue this case: the failed
+  // dialog read is the only signal there is, and "unknown" must not be laundered into "healthy".
+  const homeD1b = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const cdpD1b1 = await mockCdp('__NO_TABS__', [{ id: 'd1tab', url: d1Url }], {
+    tabText: () => d1ThrottledText,
+    throttleModal: () => d1Modal,
+  });
+  const rD1b1 = await runSalvageInHome(homeD1b, [MARKER, '3'], cdpD1b1.port);
+  cdpD1b1.stop();
+  check('#215 skeptic r2 D1b (1) the first sighting of the unowned modal charges its fingerprint',
+    rD1b1.status === 5 && throttleSeenHas(homeD1b, d1Url, d1Modal),
+    `status=${rD1b1.status} stderr=${rD1b1.stderr?.slice(-300)}`);
+  const cooldownD1b = path.join(homeD1b, 'throttle.cooldown');
+  ageCooldown215(cooldownD1b);
+  const mtimeD1b2Before = fs.statSync(cooldownD1b).mtimeMs;
+  const cdpD1b2 = await mockCdp('__NO_TABS__', [{ id: 'd1tab', url: d1Url }], {
+    tabText: () => d1HealthyText,
+    throttleModalFails: () => true,
+  });
+  const rD1b2 = await runSalvageInHome(homeD1b, [MARKER, '3'], cdpD1b2.port);
+  cdpD1b2.stop();
+  const mtimeD1b2After = fs.statSync(cooldownD1b).mtimeMs;
+  check('#215 skeptic r2 D1b (2) readable body text plus an UNREADABLE dialog is unknown, not healthy: the fingerprint survives',
+    throttleSeenHas(homeD1b, d1Url, d1Modal),
+    `status=${rD1b2.status} dir=${fs.existsSync(throttleSeenDir(homeD1b)) ? fs.readdirSync(throttleSeenDir(homeD1b)) : null}`);
+  check('#215 skeptic r2 D1b (2) the unknown-dialog scan writes no cooldown of its own',
+    mtimeD1b2After === mtimeD1b2Before, `before=${mtimeD1b2Before} after=${mtimeD1b2After}`);
+  ageCooldown215(cooldownD1b);
+  const mtimeD1b3Before = fs.statSync(cooldownD1b).mtimeMs;
+  const cdpD1b3 = await mockCdp('__NO_TABS__', [{ id: 'd1tab', url: d1Url }], {
+    tabText: () => d1ThrottledText,
+    throttleModal: () => d1Modal,
+  });
+  const rD1b3 = await runSalvageInHome(homeD1b, [MARKER, '3'], cdpD1b3.port);
+  cdpD1b3.stop();
+  const mtimeD1b3After = fs.statSync(cooldownD1b).mtimeMs;
+  check('#215 skeptic r2 D1b (3) the same modal after an unknown-dialog scan does NOT re-arm the account cooldown',
+    mtimeD1b3After === mtimeD1b3Before && rD1b3.status !== 5,
+    `before=${mtimeD1b3Before} after=${mtimeD1b3After} status=${rD1b3.status}`);
+  fs.rmSync(homeD1b, { recursive: true, force: true });
+
+  // (c) Control for the SAME machinery in the other direction: a genuinely healthy scan — dialog
+  // read SUCCEEDED and returned no dialog — still retires, so the D1 guard did not simply
+  // disable retire-on-healthy. (This is the r2 fix's own headline behaviour, re-asserted here
+  // against the same fixture the two failed-read cases use.)
+  const homeD1c = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const cdpD1c1 = await mockCdp('__NO_TABS__', [{ id: 'd1tab', url: d1Url }], {
+    tabText: () => d1ThrottledText,
+    throttleModal: () => d1Modal,
+  });
+  const rD1c1 = await runSalvageInHome(homeD1c, [MARKER, '3'], cdpD1c1.port);
+  cdpD1c1.stop();
+  const cdpD1c2 = await mockCdp('__NO_TABS__', [{ id: 'd1tab', url: d1Url }], {
+    tabText: () => d1HealthyText,
+  });
+  await runSalvageInHome(homeD1c, [MARKER, '3'], cdpD1c2.port);
+  cdpD1c2.stop();
+  check('#215 skeptic r2 D1c control: a SUCCESSFUL dialog read that finds no dialog still retires the fingerprint',
+    rD1c1.status === 5 && !throttleSeenHas(homeD1c, d1Url, d1Modal),
+    `first=${rD1c1.status} dir=${fs.existsSync(throttleSeenDir(homeD1c)) ? fs.readdirSync(throttleSeenDir(homeD1c)) : null}`);
+  fs.rmSync(homeD1c, { recursive: true, force: true });
+}
+
+{ // #215 skeptic r2 D2 (P3) (bin/cdp-salvage.mjs scanThrottleHealth vs. the main scan's hit
+  // filter): the two deliberately DISAGREE about one shape — a tab whose dialog read succeeded
+  // but whose text read came back empty. The hit filter refuses to charge it (a modal with no
+  // readable page beneath it cannot be attributed), while the health pass counts it as a throttle
+  // surface and blocks retire for that URL. This check pins that divergence down as intended
+  // behaviour: under-retire is the safe direction, so the record must survive.
+  const d2Url = 'https://chatgpt.com/c/mock-215-d2-modal-without-text';
+  const d2Modal = "You're making requests too quickly. [#215 skeptic r2 D2 fixture]";
+  const d2Foreign = 'pg-run-another-run-215d2';
+  const d2ThrottledText = `ChatGPT\n${d2Foreign}\n${d2Modal}\nAnother run's conversation beneath the modal.\n`;
+  const d2HealthyText = `ChatGPT\n${d2Foreign}\nAnother run's conversation, fully rendered, no limiter in sight.\n`;
+  const homeD2 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const cdpD2a = await mockCdp('__NO_TABS__', [{ id: 'd2tab', url: d2Url }], {
+    tabText: () => d2ThrottledText,
+    throttleModal: () => d2Modal,
+  });
+  const rD2a = await runSalvageInHome(homeD2, [MARKER, '3'], cdpD2a.port);
+  cdpD2a.stop();
+  check('#215 skeptic r2 D2 (1) the sighting is charged before the mixed scan',
+    rD2a.status === 5 && throttleSeenHas(homeD2, d2Url, d2Modal), `status=${rD2a.status}`);
+  const cooldownD2 = path.join(homeD2, 'throttle.cooldown');
+  ageCooldown215(cooldownD2);
+  const mtimeD2Before = fs.statSync(cooldownD2).mtimeMs;
+  const cdpD2b = await mockCdp('__NO_TABS__', [
+    { id: 'd2modal', url: d2Url },
+    { id: 'd2healthy', url: d2Url },
+  ], {
+    tabText: (url, id) => (id === 'd2modal' ? '' : d2HealthyText),
+    throttleModal: (id) => (id === 'd2modal' ? d2Modal : null),
+  });
+  const rD2b = await runSalvageInHome(homeD2, [MARKER, '3'], cdpD2b.port);
+  cdpD2b.stop();
+  const mtimeD2After = fs.statSync(cooldownD2).mtimeMs;
+  check('#215 skeptic r2 D2 (2) a successful dialog read over an EMPTY text read still blocks retire for that URL',
+    throttleSeenHas(homeD2, d2Url, d2Modal),
+    `status=${rD2b.status} dir=${fs.existsSync(throttleSeenDir(homeD2)) ? fs.readdirSync(throttleSeenDir(homeD2)) : null}`);
+  check('#215 skeptic r2 D2 (2) that same shape is still not a charged hit (no new cooldown)',
+    mtimeD2After === mtimeD2Before, `before=${mtimeD2Before} after=${mtimeD2After}`);
+  fs.rmSync(homeD2, { recursive: true, force: true });
+}
+
+{ // #215 skeptic r2 D3 (P3) (organizer memo-recovery scratch path): with a remembered URL and no
+  // open tab, the scratch render is the ONLY observation the organizer ever makes — and scratch
+  // renders were excluded from retire by design. So throttle -> healthy -> throttle charged only
+  // the first cooldown: invocation 3 reported reason=throttle again with NO fresh cooldown, and
+  // the engine's mtime-based clock (pg_cooldown_remaining_secs, 900s) reported nothing left while
+  // the limiter was live. Fixed by retiring exactly the ONE rendered URL's records when that
+  // render reaches a DECISIVE non-throttle outcome with a successful text read.
+  const d3Url = 'https://chatgpt.com/c/mock-215-d3-organizer-memo';
+  const d3Modal = "You're making requests too quickly. [#215 skeptic r2 D3 organizer fixture]";
+  const d3Foreign = 'pg-run-another-run-215d3org';
+  const d3ThrottledText = `ChatGPT\n${d3Foreign}\n${d3Modal}\nAnother run's conversation beneath the modal.\n`;
+  const d3HealthyText = `ChatGPT\n${d3Foreign}\nAnother run's conversation, fully rendered, no limiter in sight.\n`;
+  const d3Title = 'pro-gate review: PR #215 skeptic r2 D3 [pro-gate]';
+  const homeD3 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedOrganizer(MARKER, d3Title, d3Url)(homeD3);
+
+  const cdpD3a = await mockCdp('__NO_TABS__', [], {
+    renderText: () => d3ThrottledText,
+    throttleModal: () => d3Modal,
+  });
+  const rD3a = await runSalvageInHome(homeD3, ['--organize', MARKER, '5'], cdpD3a.port, SCRATCH_SAMPLE_TEST_ENV);
+  cdpD3a.stop();
+  check('#215 skeptic r2 D3 (organizer 1) a throttled memo render reports reason=throttle and charges its fingerprint',
+    /reason=throttle/.test(rD3a.stdout) && throttleSeenHas(homeD3, d3Url, d3Modal),
+    `stdout=${rD3a.stdout} stderr=${rD3a.stderr?.slice(-300)}`);
+  const cooldownD3 = path.join(homeD3, 'throttle.cooldown');
+  ageCooldown215(cooldownD3);
+  const mtimeD3bBefore = fs.statSync(cooldownD3).mtimeMs;
+  const cdpD3b = await mockCdp('__NO_TABS__', [], {
+    renderText: () => d3HealthyText,
+  });
+  const rD3b = await runSalvageInHome(homeD3, ['--organize', MARKER, '5'], cdpD3b.port, SCRATCH_SAMPLE_TEST_ENV);
+  cdpD3b.stop();
+  const mtimeD3bAfter = fs.statSync(cooldownD3).mtimeMs;
+  check("#215 skeptic r2 D3 (organizer 2) a DECISIVE healthy memo render retires that one URL's charged fingerprint",
+    !throttleSeenHas(homeD3, d3Url, d3Modal),
+    `stdout=${rD3b.stdout} dir=${fs.existsSync(throttleSeenDir(homeD3)) ? fs.readdirSync(throttleSeenDir(homeD3)) : null}`);
+  check('#215 skeptic r2 D3 (organizer 2) the healthy memo render writes no cooldown of its own',
+    mtimeD3bAfter === mtimeD3bBefore && !/reason=throttle/.test(rD3b.stdout),
+    `before=${mtimeD3bBefore} after=${mtimeD3bAfter} stdout=${rD3b.stdout}`);
+  ageCooldown215(cooldownD3);
+  const mtimeD3cBefore = fs.statSync(cooldownD3).mtimeMs;
+  const cdpD3c = await mockCdp('__NO_TABS__', [], {
+    renderText: () => d3ThrottledText,
+    throttleModal: () => d3Modal,
+  });
+  const rD3c = await runSalvageInHome(homeD3, ['--organize', MARKER, '5'], cdpD3c.port, SCRATCH_SAMPLE_TEST_ENV);
+  cdpD3c.stop();
+  const mtimeD3cAfter = fs.statSync(cooldownD3).mtimeMs;
+  check('#215 skeptic r2 D3 (organizer 3) the returning limiter reports reason=throttle AND writes a NEW cooldown',
+    /reason=throttle/.test(rD3c.stdout) && mtimeD3cAfter > mtimeD3cBefore,
+    `stdout=${rD3c.stdout} before=${mtimeD3cBefore} after=${mtimeD3cAfter}`);
+  fs.rmSync(homeD3, { recursive: true, force: true });
+}
+
+{ // #215 skeptic r2 D3 (P3), main scan: the same three-invocation sequence through the OTHER
+  // memo-recovery path — the remembered-URL seeded render, which likewise never retired.
+  const d3mUrl = 'https://chatgpt.com/c/mock-215-d3-main-memo';
+  const d3mModal = "You're making requests too quickly. [#215 skeptic r2 D3 main fixture]";
+  const d3mForeign = 'pg-run-another-run-215d3main';
+  const d3mThrottledText = `ChatGPT\n${d3mForeign}\n${d3mModal}\nAnother run's conversation beneath the modal.\n`;
+  const d3mOursText = `ChatGPT\nrun marker: ${MARKER}\nstill thinking, no verdict yet\n`;
+  const homeD3m = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedMemo(MARKER, d3mUrl)(homeD3m);
+
+  const cdpD3ma = await mockCdp('__NO_TABS__', [], {
+    renderText: () => d3mThrottledText,
+    throttleModal: () => d3mModal,
+  });
+  const rD3ma = await runSalvageInHome(homeD3m, [MARKER, '3'], cdpD3ma.port, SCRATCH_SAMPLE_TEST_ENV);
+  cdpD3ma.stop();
+  check('#215 skeptic r2 D3 (main 1) a throttled remembered render takes the throttle exit and charges its fingerprint',
+    rD3ma.status === 5 && throttleSeenHas(homeD3m, d3mUrl, d3mModal),
+    `status=${rD3ma.status} stderr=${rD3ma.stderr?.slice(-300)}`);
+  const cooldownD3m = path.join(homeD3m, 'throttle.cooldown');
+  ageCooldown215(cooldownD3m);
+  const mtimeD3mbBefore = fs.statSync(cooldownD3m).mtimeMs;
+  const cdpD3mb = await mockCdp('__NO_TABS__', [], {
+    renderText: () => d3mOursText,
+  });
+  const rD3mb = await runSalvageInHome(homeD3m, [MARKER, '3'], cdpD3mb.port, SCRATCH_SAMPLE_TEST_ENV);
+  cdpD3mb.stop();
+  const mtimeD3mbAfter = fs.statSync(cooldownD3m).mtimeMs;
+  check("#215 skeptic r2 D3 (main 2) a DECISIVE healthy remembered render retires that one URL's charged fingerprint",
+    !throttleSeenHas(homeD3m, d3mUrl, d3mModal),
+    `status=${rD3mb.status} dir=${fs.existsSync(throttleSeenDir(homeD3m)) ? fs.readdirSync(throttleSeenDir(homeD3m)) : null}`);
+  check('#215 skeptic r2 D3 (main 2) that healthy render still reports the conversation live (exit 3) and writes no cooldown',
+    rD3mb.status === 3 && mtimeD3mbAfter === mtimeD3mbBefore,
+    `status=${rD3mb.status} before=${mtimeD3mbBefore} after=${mtimeD3mbAfter}`);
+  ageCooldown215(cooldownD3m);
+  const mtimeD3mcBefore = fs.statSync(cooldownD3m).mtimeMs;
+  const cdpD3mc = await mockCdp('__NO_TABS__', [], {
+    renderText: () => d3mThrottledText,
+    throttleModal: () => d3mModal,
+  });
+  const rD3mc = await runSalvageInHome(homeD3m, [MARKER, '3'], cdpD3mc.port, SCRATCH_SAMPLE_TEST_ENV);
+  cdpD3mc.stop();
+  const mtimeD3mcAfter = fs.statSync(cooldownD3m).mtimeMs;
+  check('#215 skeptic r2 D3 (main 3) the returning limiter takes the throttle exit (5) AND writes a NEW cooldown',
+    rD3mc.status === 5 && mtimeD3mcAfter > mtimeD3mcBefore,
+    `status=${rD3mc.status} before=${mtimeD3mcBefore} after=${mtimeD3mcAfter} stderr=${rD3mc.stderr?.slice(-300)}`);
+  fs.rmSync(homeD3m, { recursive: true, force: true });
+}
+
+{ // #215 skeptic r2 D4 (P3) (bin/cdp-salvage.mjs recordThrottleSeen): the record's create and its
+  // content write were ONE writeFileSync, and the path joined the rollback list only after both
+  // succeeded. A content-write failure after the create (ENOSPC is the real-world one) therefore
+  // left an EMPTY file behind that the rollback could not remove and that — being empty — is
+  // exempt from retire-on-healthy, suppressing that fingerprint for the whole 7-day TTL while the
+  // catch still returned "charge me". Fixed by splitting create (openSync 'wx', still the sole
+  // race arbiter) from the content write and pushing the path BETWEEN them.
+  //
+  // (a) No deterministic way exists in this harness to fail an fs.writeSync to an already-open fd
+  // on a normal filesystem (a read-only mount needs privileges; a directory at the path is EEXIST
+  // on the create, not a write failure; RLIMIT_FSIZE would kill the child by SIGXFSZ and break
+  // every other write it makes). So the ORDER itself is asserted against the shipped source —
+  // weaker than an execution proof, and labelled as such.
+  const d4Source = fs.readFileSync(SALVAGE, 'utf8');
+  const d4Start = d4Source.indexOf('function recordThrottleSeen(');
+  const d4Body = d4Start < 0 ? '' : d4Source.slice(d4Start, d4Source.indexOf('\nfunction ', d4Start + 1));
+  const d4OpenAt = d4Body.indexOf("fs.openSync(recordPath, 'wx')");
+  const d4PushAt = d4Body.indexOf('pendingThrottleSeenRecords.push(recordPath)');
+  const d4WriteAt = d4Body.indexOf('fs.writeSync(');
+  check('#215 skeptic r2 D4 (a, source order) recordThrottleSeen creates the record, then rollback-tracks it, then writes its content',
+    d4OpenAt >= 0 && d4PushAt > d4OpenAt && d4WriteAt > d4PushAt,
+    `open=${d4OpenAt} push=${d4PushAt} write=${d4WriteAt}`);
+  check('#215 skeptic r2 D4 (a, source order) no single writeFileSync both creates and fills the record',
+    d4Body.length > 0 && !/fs\.writeFileSync\(\s*recordPath/.test(d4Body),
+    `body=${d4Body.slice(0, 200)}`);
+
+  // (b) Execution control for the rollback the reordering protects: when the COOLDOWN write
+  // itself fails (its path is a directory -> EISDIR), the provisional record must be removed, so
+  // the sighting stays re-chargeable instead of silently suppressed with no cooldown behind it.
+  const d4Url = 'https://chatgpt.com/c/mock-215-d4-rollback';
+  const d4Modal = "You're making requests too quickly. [#215 skeptic r2 D4 fixture]";
+  const d4Foreign = 'pg-run-another-run-215d4';
+  const d4Text = `ChatGPT\n${d4Foreign}\n${d4Modal}\nAnother run's conversation beneath the modal.\n`;
+  const homeD4 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  fs.mkdirSync(path.join(homeD4, 'throttle.cooldown'), { recursive: true });
+  const cdpD4 = await mockCdp('__NO_TABS__', [{ id: 'd4tab', url: d4Url }], {
+    tabText: () => d4Text,
+    throttleModal: () => d4Modal,
+  });
+  const rD4 = await runSalvageInHome(homeD4, [MARKER, '3'], cdpD4.port);
+  cdpD4.stop();
+  check('#215 skeptic r2 D4 (b) a failed cooldown write rolls the provisional record back and says so',
+    !throttleSeenHas(homeD4, d4Url, d4Modal) && /could not be written/.test(rD4.stderr ?? ''),
+    `status=${rD4.status} dir=${fs.existsSync(throttleSeenDir(homeD4)) ? fs.readdirSync(throttleSeenDir(homeD4)) : null} stderr=${rD4.stderr?.slice(-300)}`);
+  check('#215 skeptic r2 D4 (b) the sighting still takes the throttle exit (5) even though the cooldown write failed',
+    rD4.status === 5, `status=${rD4.status} stderr=${rD4.stderr?.slice(-300)}`);
+  fs.rmSync(homeD4, { recursive: true, force: true });
+}
+
+{ // #215 skeptic r2 D5 (P3, coverage): scanThrottleHealth has TWO guards on the same-scan clause,
+  // and every existing fixture holds exactly ONE fingerprint per URL — where both guards are the
+  // same guard and neither is proven to do anything on its own. This fixture separates them: URL
+  // X holds TWO charged fingerprints (two distinct modal texts) and the scan under test sees only
+  // ONE of them under a dialog. The unobserved record is in NO protectedKeys set this scan builds,
+  // so only the URL-level "throttled anywhere this scan -> not healthy" exclusion can save it.
+  const d5Url = 'https://chatgpt.com/c/mock-215-d5-two-fingerprints';
+  const d5ModalA = "You're making requests too quickly. [#215 skeptic r2 D5 fixture A]";
+  const d5ModalB = "You're making requests too quickly. [#215 skeptic r2 D5 fixture B]";
+  const d5Foreign = 'pg-run-another-run-215d5';
+  const d5TextA = `ChatGPT\n${d5Foreign}\n${d5ModalA}\nAnother run's conversation beneath modal A.\n`;
+  const d5TextB = `ChatGPT\n${d5Foreign}\n${d5ModalB}\nAnother run's conversation beneath modal B.\n`;
+  const d5HealthyText = `ChatGPT\n${d5Foreign}\nAnother run's conversation, fully rendered, no limiter in sight.\n`;
+  const homeD5 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const cdpD5a = await mockCdp('__NO_TABS__', [
+    { id: 'd5a', url: d5Url },
+    { id: 'd5b', url: d5Url },
+  ], {
+    tabText: (url, id) => (id === 'd5a' ? d5TextA : d5TextB),
+    throttleModal: (id) => (id === 'd5a' ? d5ModalA : d5ModalB),
+  });
+  const rD5a = await runSalvageInHome(homeD5, [MARKER, '3'], cdpD5a.port);
+  cdpD5a.stop();
+  check('#215 skeptic r2 D5 (1) one scan charges BOTH fingerprints at that URL and exits 5 once',
+    rD5a.status === 5 && throttleSeenHas(homeD5, d5Url, d5ModalA) && throttleSeenHas(homeD5, d5Url, d5ModalB),
+    `status=${rD5a.status} dir=${fs.existsSync(throttleSeenDir(homeD5)) ? fs.readdirSync(throttleSeenDir(homeD5)) : null}`);
+  const cooldownD5 = path.join(homeD5, 'throttle.cooldown');
+  ageCooldown215(cooldownD5);
+  const mtimeD5Before = fs.statSync(cooldownD5).mtimeMs;
+  const cdpD5b = await mockCdp('__NO_TABS__', [
+    { id: 'd5a', url: d5Url },
+    { id: 'd5b', url: d5Url },
+  ], {
+    tabText: (url, id) => (id === 'd5a' ? d5TextA : d5HealthyText),
+    throttleModal: (id) => (id === 'd5a' ? d5ModalA : null),
+  });
+  const rD5b = await runSalvageInHome(homeD5, [MARKER, '3'], cdpD5b.port);
+  cdpD5b.stop();
+  const mtimeD5After = fs.statSync(cooldownD5).mtimeMs;
+  check('#215 skeptic r2 D5 (2) a fingerprint this scan never observed is saved by the URL-level exclusion alone',
+    throttleSeenHas(homeD5, d5Url, d5ModalB),
+    `status=${rD5b.status} dir=${fs.existsSync(throttleSeenDir(homeD5)) ? fs.readdirSync(throttleSeenDir(homeD5)) : null}`);
+  check('#215 skeptic r2 D5 (2) the fingerprint this scan IS observing survives too, and no second cooldown is charged',
+    throttleSeenHas(homeD5, d5Url, d5ModalA) && mtimeD5After === mtimeD5Before,
+    `before=${mtimeD5Before} after=${mtimeD5After}`);
+  fs.rmSync(homeD5, { recursive: true, force: true });
+}
+
 
 process.exit(failures === 0 ? 0 : 1);
