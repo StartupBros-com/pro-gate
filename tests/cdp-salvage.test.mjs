@@ -3607,6 +3607,67 @@ for (const placeholder of PLACEHOLDER_URLS) {
   }
 }
 
+{ // #216 local verify r3 P3: --close's --url gate was prefix-only (/^https:\/\/chatgpt\.com\/c\//),
+  // looser than CONVERSATION_URL_RE -- the predicate every OTHER consumer of a conversation URL
+  // is held to (rememberUrl/recallUrl here, and the shell's pg_conversation_url_ok, which is what
+  // recover_close_tab validates the memo with before passing it in). So a value the memo layer
+  // would have revoked as a placeholder -- https://chatgpt.com/c/WEB:<uuid> is the #109 shape --
+  // still passed the flag check and became the close SCOPE: conversationIdFromUrl returned
+  // "WEB:1234", no tab could ever match it, and --close exited 0 announcing "closed 0
+  // conversation tab(s)". A caller reading that success could not tell "nothing was owned" from
+  // "the scope was nonsense". The flag now uses conversationUrlOk itself, so a non-conforming
+  // value is a usage error (exit 2, one line, naming the value) instead of a silent no-op. The
+  // conforming control is '--close --url closes only the tab at that conversation id' above.
+  const ownedText = [
+    `run marker: ${MARKER}`,
+    'P1: none', 'P2: none', 'P3: none',
+    `VERDICT: SHIP — ours. (run marker: ${MARKER})`,
+  ].join('\n');
+  const rejected = [
+    ['placeholder id', 'https://chatgpt.com/c/WEB:1234'],
+    ['empty id', 'https://chatgpt.com/c/'],
+    ['extra path segment', 'https://chatgpt.com/c/mock-conversation/extra'],
+    // Already rejected by the prefix-only check, so this pair is the control: tightening the
+    // gate must not change what a wrong HOST does, only what a wrong conversation ID does.
+    ['non-chatgpt host', 'https://chatgpt.example.com/c/mock-conversation'],
+  ];
+  for (const [label, url] of rejected) {
+    const cdp = await mockCdp(ownedText);
+    const r = await runSalvage(['--close', '--url', url, MARKER, '10'], cdp.port);
+    check(`#216 r3 P3 --url shape: ${label} exits 2 and closes nothing`,
+      r.status === 2 && cdp.closed.length === 0,
+      `status=${r.status} closed=${JSON.stringify(cdp.closed)} stderr=${r.stderr?.slice(-300)}`);
+    check(`#216 r3 P3 --url shape: ${label} is refused by one usage line`,
+      (r.stderr ?? '').trim().split('\n').length === 1 && /^usage:/.test((r.stderr ?? '').trim()),
+      `stderr=${JSON.stringify(r.stderr)}`);
+    cdp.stop();
+  }
+  { // The refusal names the value it refused: a bare "usage: ..." cannot tell an operator WHICH
+    // of a --close invocation's arguments was wrong. Asserted together with the usage prefix, or
+    // the pre-fix no-op line ("closed 0 conversation tab(s) ... at <url>") would satisfy it too.
+    const cdp = await mockCdp(ownedText);
+    const r = await runSalvage(['--close', '--url', 'https://chatgpt.com/c/WEB:1234', MARKER, '10'], cdp.port);
+    check('#216 r3 P3 --url shape: the usage line names the rejected value',
+      /^usage:/.test((r.stderr ?? '').trim()) && (r.stderr ?? '').includes('https://chatgpt.com/c/WEB:1234'),
+      `stderr=${JSON.stringify(r.stderr)}`);
+    cdp.stop();
+  }
+  { // CONVERSATION_URL_RE accepts a query or fragment after the id, so the flag must too:
+    // tightening this gate must not start rejecting a URL the memo layer would hand it.
+    const URL_B = 'https://chatgpt.com/c/mock-conversation-b';
+    const cdp = await mockCdp(ownedText, [{ id: 'tabB', type: 'page', url: URL_B }],
+      { tabText: () => ownedText });
+    const r = await runSalvage(
+      ['--close', '--url', 'https://chatgpt.com/c/mock-conversation?model=gpt-5', MARKER, '10'],
+      cdp.port,
+    );
+    check('#216 r3 P3 --url shape: a conforming id carrying a query still scopes the close',
+      r.status === 0 && cdp.closed.includes('tab1') && !cdp.closed.includes('tabB'),
+      `status=${r.status} closed=${JSON.stringify(cdp.closed)} stderr=${r.stderr?.slice(-300)}`);
+    cdp.stop();
+  }
+}
+
 { // #206 gate r8 P2 finding B: rememberUrl()'s MEMO_KEEP eviction used to prune the oldest
   // memos with no regard for whether the marker's reservation was still retained (states
   // generating or superseded) -- so a memo that is a superseded run's ONLY recovery handle

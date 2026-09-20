@@ -7074,6 +7074,84 @@ check '#206 gate r8 P2 finding A: recover_close_tab forwards the remembered URL 
      && grep -qF -- "--close --url $CLOSE_SCOPE_URL $CLOSE_SCOPE_MARKER" "$CLOSE_ARGV_LOG"; echo $?)" \
   "rc=$CLOSE_SCOPE_RC stderr=$(cat "$TDIR/close-scope.stderr") argvlog=$(cat "$CLOSE_ARGV_LOG" 2>/dev/null)"
 
+# #216 local verify r3 P3 (engine level): recover_close_tab's post-close verification -- the one
+# stderr line it prints when the conversation-urls memo it just handed to `--close --url` is gone
+# afterwards -- had no regression at all, so nothing held the warning's text, its marker, or its
+# strict best-effort contract (it must NOT alter the exit-6 supersession outcome, and must not
+# leak onto stdout). --close never touches conversation-urls/, so the only way to observe the
+# line is to make a stand-in salvage delete the memo; same scratch-bin idiom as finding A above
+# (the engine resolves cdp-salvage.mjs beside itself via $SELF), with a stub that removes
+# $PRO_GATE_HOME/conversation-urls/<marker> on --close and exits 0.
+MEMOGONE_DIR="$TDIR/enginewrap-memo-gone"
+mkdir -p "$MEMOGONE_DIR"
+cp -r "$HERE/../bin" "$MEMOGONE_DIR/bin"
+cp -r "$HERE/../lib" "$MEMOGONE_DIR/lib"
+MEMOGONE_ARGV_LOG="$TDIR/memo-gone-argv.log"
+cat > "$MEMOGONE_DIR/bin/cdp-salvage.mjs" <<'STUB'
+#!/usr/bin/env node
+import fs from 'node:fs';
+import path from 'node:path';
+const args = process.argv.slice(2);
+const log = process.env.PG_TEST_CLOSE_ARGV_LOG;
+if (log) fs.appendFileSync(log, args.join(' ') + '\n');
+if (args[0] === '--close') {
+  const rest = args[1] === '--url' ? args.slice(3) : args.slice(1);
+  const marker = rest[0];
+  const home = process.env.PRO_GATE_HOME;
+  if (marker && home) fs.rmSync(path.join(home, 'conversation-urls', marker), { force: true });
+}
+process.exit(0);
+STUB
+
+MEMOGONE_HOME="$TDIR/home-memo-gone"
+MEMOGONE_MARKER='pg-run-acme-fresh-77-1700014500-1'
+MEMOGONE_URL='https://chatgpt.com/c/mock-conversation-memo-gone'
+mkdir -p "$MEMOGONE_HOME/in-progress" "$MEMOGONE_HOME/conversation-urls"
+printf '%s\t%s\t%s\t0\t1\tGPT-X\t%s\tsuperseded\n' "$SUPER_KEY" "$TDIR/memo-gone-audit.md" "$(date +%s)" 1700014500 \
+  > "$MEMOGONE_HOME/in-progress/$MEMOGONE_MARKER"
+printf '%s\n' "$MEMOGONE_URL" > "$MEMOGONE_HOME/conversation-urls/$MEMOGONE_MARKER"
+
+env -u PRO_GATE_KEEP_TABS PRO_GATE_HOME="$MEMOGONE_HOME" ORACLE_BROWSER_PORT=1 PRO_GATE_SELF_HEAL=0 \
+  PG_TEST_CLOSE_ARGV_LOG="$MEMOGONE_ARGV_LOG" NODE_OPTIONS= \
+  bash "$MEMOGONE_DIR/bin/oracle-review.sh" --recover "$MEMOGONE_MARKER" --timeout 1s \
+  >"$TDIR/memo-gone.stdout" 2>"$TDIR/memo-gone.stderr"
+MEMOGONE_RC=$?
+check '#216 r3 P3 memo-gone warning: a memo lost during the scoped close is named on stderr without changing the exit-6 outcome' \
+  "$([ "$MEMOGONE_RC" -eq 6 ] \
+     && [ ! -s "$TDIR/memo-gone.stdout" ] \
+     && [ ! -e "$MEMOGONE_HOME/conversation-urls/$MEMOGONE_MARKER" ] \
+     && grep -qxF "recover_close_tab: conversation-urls memo for $MEMOGONE_MARKER is gone after close" "$TDIR/memo-gone.stderr" \
+     && grep -qx 'Review superseded' "$TDIR/memo-gone.stderr" \
+     && [ "$(wc -l < "$TDIR/memo-gone.stderr")" -eq 2 ]; echo $?)" \
+  "rc=$MEMOGONE_RC stdout=$(cat "$TDIR/memo-gone.stdout") stderr=$(cat "$TDIR/memo-gone.stderr") argvlog=$(cat "$MEMOGONE_ARGV_LOG" 2>/dev/null)"
+
+# Planted negative for the same line: when the memo SURVIVES the close (the real cdp-salvage's
+# behavior -- it never writes conversation-urls/), the warning must not fire at all. Without this,
+# a warning that printed unconditionally would still satisfy the positive above.
+MEMOKEPT_HOME="$TDIR/home-memo-kept"
+MEMOKEPT_MARKER='pg-run-acme-fresh-77-1700014600-1'
+mkdir -p "$MEMOKEPT_HOME/in-progress" "$MEMOKEPT_HOME/conversation-urls"
+printf '%s\t%s\t%s\t0\t1\tGPT-X\t%s\tsuperseded\n' "$SUPER_KEY" "$TDIR/memo-kept-audit.md" "$(date +%s)" 1700014600 \
+  > "$MEMOKEPT_HOME/in-progress/$MEMOKEPT_MARKER"
+printf '%s\n' "$MEMOGONE_URL" > "$MEMOKEPT_HOME/conversation-urls/$MEMOKEPT_MARKER"
+MEMOKEPT_DIR="$TDIR/enginewrap-memo-kept"
+mkdir -p "$MEMOKEPT_DIR"
+cp -r "$HERE/../bin" "$MEMOKEPT_DIR/bin"
+cp -r "$HERE/../lib" "$MEMOKEPT_DIR/lib"
+cat > "$MEMOKEPT_DIR/bin/cdp-salvage.mjs" <<'STUB'
+#!/usr/bin/env node
+process.exit(0);
+STUB
+env -u PRO_GATE_KEEP_TABS PRO_GATE_HOME="$MEMOKEPT_HOME" ORACLE_BROWSER_PORT=1 PRO_GATE_SELF_HEAL=0 NODE_OPTIONS= \
+  bash "$MEMOKEPT_DIR/bin/oracle-review.sh" --recover "$MEMOKEPT_MARKER" --timeout 1s \
+  >"$TDIR/memo-kept.stdout" 2>"$TDIR/memo-kept.stderr"
+MEMOKEPT_RC=$?
+check '#216 r3 P3 memo-gone warning: a surviving memo is not warned about' \
+  "$([ "$MEMOKEPT_RC" -eq 6 ] \
+     && [ "$(cat "$TDIR/memo-kept.stderr")" = 'Review superseded' ] \
+     && [ "$(cat "$MEMOKEPT_HOME/conversation-urls/$MEMOKEPT_MARKER")" = "$MEMOGONE_URL" ]; echo $?)" \
+  "rc=$MEMOKEPT_RC stderr=$(cat "$TDIR/memo-kept.stderr") memo=$(cat "$MEMOKEPT_HOME/conversation-urls/$MEMOKEPT_MARKER" 2>/dev/null)"
+
 SUPER_SNAPSHOT="$(PRO_GATE_HOME="$SUPER_HEAD_HOME" pg_attempt_snapshot github.com acme fresh 77 "$SUPER_KEY")"
 SUPER_PLAN="$(PRO_GATE_HOME="$SUPER_HEAD_HOME" pg_reservation_slot_plan 1)"
 check 'superseded snapshot is fresh-eligible and holds zero capacity while remaining collectable' \

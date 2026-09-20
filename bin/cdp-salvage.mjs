@@ -105,6 +105,21 @@ import {
   parseTestRenderSampleMs,
 } from './cdp-test-timing.mjs';
 
+// v0.42 (#109): the shape a remembered conversation URL must have. A synthetic placeholder such as
+// https://chatgpt.com/c/WEB:<uuid> passed the old prefix-only check, was remembered as
+// authoritative, and rendered a page with no marker on every later pass — an inconclusive result
+// the engine deliberately never counts as a miss — so its run held a ChatGPT slot for days. The
+// boundary enforced here: the segment after /c/ is one path segment of letters, digits, and
+// dashes, optionally followed by a query or fragment. Every real id observed on the operator's box
+// (36-char hex-and-dash, 196 of 196) passes; the placeholder's colon fails, including one whose
+// body after the prefix is a well-formed UUID, because the whole segment is anchored. This is a
+// shape gate like MARKER_SAFE_RE, not proof the conversation exists; a stricter hex-and-dash
+// shape is deferred until test fixtures stop using named ids such as mock-conversation.
+// Declared HERE, above the argument parser, because `--close --url` is held to the same
+// predicate (#216 local verify r3 P3) — see the closeUrl check below.
+const CONVERSATION_URL_RE = /^https:\/\/chatgpt\.com\/c\/[A-Za-z0-9-]+(?:[?#].*)?$/;
+const conversationUrlOk = (url) => CONVERSATION_URL_RE.test(url || '');
+
 const usage = () => {
   console.error('usage: cdp-salvage.mjs [--probe|--close [--url <url>]|--sweep-root|--organize [--finalize --result-file <path>] [--accepted-url <url>] [--archive] [--no-rename]] <pr-marker|-> [timeout-secs] [cdp-port]');
   process.exit(2);
@@ -145,7 +160,18 @@ if (mode !== 'close' && closeUrl) usage();
 if (archive && !finalize) usage();
 if (finalize !== !!resultFile || (acceptedUrl && !finalize)) usage();
 if (acceptedUrl && !/^https:\/\/chatgpt\.com\/c\//.test(acceptedUrl)) usage();
-if (closeUrl && !/^https:\/\/chatgpt\.com\/c\//.test(closeUrl)) usage();
+// #216 local verify r3 P3: --url is a close SCOPE (conversationIdFromUrl below reads the id out
+// of it), and it reaches this script from the conversation-urls memo layer, which only ever
+// emits a URL that passed conversationUrlOk / the shell's pg_conversation_url_ok. A prefix-only
+// check here was looser than that source: a #109-shaped placeholder such as
+// https://chatgpt.com/c/WEB:<uuid> — or an empty/multi-segment id — was accepted as a scope no
+// open tab could ever match, so --close exited 0 reporting "closed 0 conversation tab(s)" and
+// the caller could not tell a nonsense scope from an honest "nothing owned". Same predicate,
+// and a named refusal rather than the bare usage line, because only one argument is at fault.
+if (closeUrl && !conversationUrlOk(closeUrl)) {
+  console.error(`usage: --url must be a conversation URL like https://chatgpt.com/c/<id>, got: ${closeUrl}`);
+  process.exit(2);
+}
 const probe = mode === 'probe';
 const close = mode === 'close';
 const sweepRoot = mode === 'sweep-root';
@@ -199,18 +225,8 @@ const foldedIncludes = (text, wanted) => asciiFold(text).includes(asciiFold(want
 // Marker identity. Null/empty on either side is NOT a match: an absent echo is "unproven", never
 // "ours" (organizerOwnership and finalizerOwnership both depend on that distinction).
 const sameMarker = (a, b) => !!a && !!b && asciiFold(a) === asciiFold(b);
-// v0.42 (#109): the shape a remembered conversation URL must have. A synthetic placeholder such as
-// https://chatgpt.com/c/WEB:<uuid> passed the old prefix-only check, was remembered as
-// authoritative, and rendered a page with no marker on every later pass — an inconclusive result
-// the engine deliberately never counts as a miss — so its run held a ChatGPT slot for days. The
-// boundary enforced here: the segment after /c/ is one path segment of letters, digits, and
-// dashes, optionally followed by a query or fragment. Every real id observed on the operator's box
-// (36-char hex-and-dash, 196 of 196) passes; the placeholder's colon fails, including one whose
-// body after the prefix is a well-formed UUID, because the whole segment is anchored. This is a
-// shape gate like MARKER_SAFE_RE, not proof the conversation exists; a stricter hex-and-dash
-// shape is deferred until test fixtures stop using named ids such as mock-conversation.
-const CONVERSATION_URL_RE = /^https:\/\/chatgpt\.com\/c\/[A-Za-z0-9-]+(?:[?#].*)?$/;
-const conversationUrlOk = (url) => CONVERSATION_URL_RE.test(url || '');
+// CONVERSATION_URL_RE / conversationUrlOk (the memo shape gate) are defined above the argument
+// parser, which holds `--close --url` to that same predicate.
 const memoPath = (m) => (MARKER_SAFE_RE.test(m) ? path.join(URL_MEMO_DIR, m) : null);
 const titleMemoPath = (m) => (MARKER_SAFE_RE.test(m) ? path.join(TITLE_MEMO_DIR, m) : null);
 
