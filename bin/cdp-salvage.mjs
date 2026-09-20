@@ -490,15 +490,22 @@ function throttleSeenRecordPath(url, hash) {
 // THROTTLE_SEEN_TTL_MS, then — even inside the TTL window — trims the survivor count down to
 // THROTTLE_SEEN_MAX, oldest mtime first. Best-effort: a failure here (races with another
 // process's own prune, permissions, ENOENT) never blocks charging or reading a record.
-// #208 gate r3 P2: `protectedKeys` (record-file basenames the CURRENT scan already knows it is
-// about to check — computed by the caller BEFORE this prune runs) are never evicted, by capacity
-// OR by TTL. Without this, a fingerprint that is still visible every single scan could be the
-// one the capacity trim picks (oldest mtime first) — evicted, then immediately rediscovered as
-// "new" by the same scan's own throttleAlreadyCharged check and recreated with a fresh mtime, so
-// a persistent batch above THROTTLE_SEEN_MAX charges a fresh cooldown on every invocation
-// forever instead of exactly once. A protected fingerprint can still exceed the nominal cap on
-// disk; that is the correct trade — the cap is only ever enforced against records this scan does
-// NOT need.
+// The two evictions answer to different rules, and the ORDER below is the rule:
+//   * TTL is the SUPPRESSION HORIZON and applies to EVERYTHING — every record, whether or not
+//     the current scan is looking at it. It is checked FIRST, before any protection, so an
+//     expired record is always unlinked. An unchanged stale tab therefore re-arms the cooldown
+//     at most once per THROTTLE_SEEN_TTL, never "once and then never again": suppression is
+//     bounded by the horizon, not permanent (#208, #215 gate r6, choice bounded-dedupe).
+//   * Capacity protection is SCAN-SCOPED. `protectedKeys` (record-file basenames the CURRENT
+//     scan already knows it is about to check — computed by the caller BEFORE this prune runs)
+//     are exempt from the CAPACITY trim only, never from the TTL above. Without that exemption
+//     (#208 gate r3 P2) a fingerprint still visible on every single scan could be the one the
+//     capacity trim picks (oldest mtime first) — evicted, then immediately rediscovered as
+//     "new" by the same scan's own throttleAlreadyCharged check and recreated with a fresh
+//     mtime, so a persistent batch above THROTTLE_SEEN_MAX charges a fresh cooldown on every
+//     invocation forever instead of once per horizon. A protected fingerprint can still exceed
+//     the nominal cap on disk; that is the correct trade — the cap is only ever enforced
+//     against records this scan does NOT need.
 let throttleSeenPruned = false;
 function pruneThrottleSeen(protectedKeys = new Set()) {
   let names;
@@ -506,14 +513,20 @@ function pruneThrottleSeen(protectedKeys = new Set()) {
   const now = Date.now();
   const stats = [];
   for (const name of names) {
-    if (protectedKeys.has(name)) continue;
     const recordPath = path.join(THROTTLE_SEEN_DIR, name);
     let mtimeMs;
     try { ({ mtimeMs } = fs.statSync(recordPath)); } catch { continue; }
+    // TTL first, protection second: an expired record is unlinked even when this scan is
+    // currently observing its fingerprint — that sighting then re-arms once, and the fresh
+    // record it writes suppresses the same tab for another full horizon.
     if (now - mtimeMs > THROTTLE_SEEN_TTL_MS) {
       try { fs.unlinkSync(recordPath); } catch {}
       continue;
     }
+    // Unexpired AND observed by this scan: exempt from the capacity trim, and deliberately not
+    // counted toward the survivor total either (the cap governs only records this scan can
+    // afford to lose).
+    if (protectedKeys.has(name)) continue;
     stats.push({ name, mtimeMs });
   }
   if (stats.length > THROTTLE_SEEN_MAX) {
@@ -580,9 +593,12 @@ let inconclusiveThrottleWhere = null;
 // genuinely new sighting, after recording it so a later trip (this scan or the next invocation)
 // recognizes it too.
 // `protectedKeys` (default: just this call's own fingerprint) is forwarded to
-// throttleAlreadyCharged's one-time prune so it never evicts a fingerprint the CURRENT scan
-// still needs (#208 gate r3 P2) — a batch call passes the whole batch's keys so all of them
-// survive the same prune, not just whichever happens to be checked first.
+// throttleAlreadyCharged's one-time prune so the CAPACITY trim never evicts a fingerprint the
+// CURRENT scan still needs (#208 gate r3 P2) — a batch call passes the whole batch's keys so all
+// of them survive the same trim, not just whichever happens to be checked first. Protection is
+// capacity-only: an entry past THROTTLE_SEEN_TTL_MS is expired regardless (#215 gate r6), so a
+// stale tab nobody closes re-arms the cooldown once per horizon rather than being suppressed
+// forever.
 function tripThrottleUnowned(url, text, where, foreign = false, protectedKeys = null) {
   const hash = throttleTextHash(text);
   if (!foreign) {

@@ -4614,6 +4614,112 @@ const FOREIGN_ANSWER = (m) => [
   fs.rmSync(homeOrgForeign215, { recursive: true, force: true });
 }
 
+{ // #215 gate r6 P2 (bin/cdp-salvage.mjs pruneThrottleSeen, choice `bounded-dedupe`): the seen
+  // record's TTL is the SUPPRESSION HORIZON and has to apply to a fingerprint the current scan is
+  // observing exactly as it does to one nobody is observing. Pre-fix the prune skipped every
+  // protectedKeys entry BEFORE the TTL check, so a record the scan protects could never expire:
+  // a stale tab nobody closes re-protected its own record on every invocation and was suppressed
+  // forever rather than for THROTTLE_SEEN_TTL, and an orphan record left by a killed writer could
+  // do the same. The reviewer named two outcomes — `bounded-dedupe` (expire on the horizon even
+  // when observed; an unchanged stale tab re-arms at most once per horizon) and leaving the
+  // suppression unbounded — and bounded-dedupe is what is implemented here.
+  // (a) and (b) are the regression. (c) and (d) are controls that the other two rules did NOT
+  // move: capacity protection is still scan-scoped (#208 gate r3 P2), and an aged record this
+  // scan never observes still expires. Both controls hold pre-fix, and so does (b) — a pre-fix
+  // (a) charges nothing, so (b)'s "no second cooldown" is vacuously true there. (a) is the only
+  // one of the four that separates the two worlds, by construction.
+  const modalTextR6 = "You're making requests too quickly. [#215 gate r6 bounded-dedupe fixture]";
+  const pageTextR6 = `ChatGPT\nAccount limits\n${modalTextR6}\nPlease try again shortly.\n`;
+  const primaryUrlR6 = 'https://chatgpt.com/c/mock-conversation';   // the mock's own primary tab
+  const EIGHT_DAYS_MS_R6 = 8 * 24 * 60 * 60 * 1000;   // past the 7-day THROTTLE_SEEN_TTL default
+  const ageRecordR6 = (p, ms) => { const t = new Date(Date.now() - ms); fs.utimesSync(p, t, t); };
+  // Tolerant of a MISSING cooldown: the pre-fix (a) writes none, and a throwing statSync here
+  // would abort the whole test file instead of failing one check.
+  const cooldownMtimeR6 = (p) => { try { return fs.statSync(p).mtimeMs; } catch { return null; } };
+  const ageCooldownR6 = (p) => { try { const t = new Date(Date.now() - 3_600_000); fs.utimesSync(p, t, t); } catch {} };
+  const recordMtimeR6 = (p) => { try { return fs.statSync(p).mtimeMs; } catch { return null; } };
+  const seenDirListR6 = (home) => (fs.existsSync(throttleSeenDir(home)) ? fs.readdirSync(throttleSeenDir(home)).length : null);
+
+  // (a) an unowned stale modal whose record is EIGHT days old: the horizon has passed, so this
+  // unchanged tab re-arms — exit 5, a cooldown, and a freshly recreated record.
+  const homeR6 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedThrottleSeen(homeR6, primaryUrlR6, modalTextR6);
+  const recordPathR6 = throttleSeenRecordPath(homeR6, primaryUrlR6, modalTextR6);
+  ageRecordR6(recordPathR6, EIGHT_DAYS_MS_R6);
+  const recordMtimeBeforeR6a = recordMtimeR6(recordPathR6);
+  const cdpR6a = await mockCdp(pageTextR6, [], { throttleModal: modalTextR6 });
+  const r6a = await runSalvageInHome(homeR6, [MARKER, '3'], cdpR6a.port);
+  cdpR6a.stop();
+  const recordMtimeAfterR6a = recordMtimeR6(recordPathR6);
+  check('#215 gate r6 bounded-dedupe (a) an unowned stale modal whose seen record is eight days old takes the throttle exit again (5)',
+    r6a.status === 5, `status=${r6a.status} stderr=${r6a.stderr?.slice(-400)}`);
+  check('#215 gate r6 bounded-dedupe (a) the re-armed sighting writes a cooldown',
+    /^\d{4}-\d{2}-\d{2}T/.test(r6a.cooldown ?? ''), `cooldown=${r6a.cooldown}`);
+  check('#215 gate r6 bounded-dedupe (a) the expired record is recreated fresh, restarting the horizon',
+    recordMtimeAfterR6a !== null && recordMtimeAfterR6a > recordMtimeBeforeR6a + 60_000,
+    `before=${recordMtimeBeforeR6a} after=${recordMtimeAfterR6a} records=${seenDirListR6(homeR6)}`);
+
+  // (b) the very next scan, record now fresh: suppressed again, so the re-arm costs exactly one
+  // cooldown per horizon and not one per scan. Cooldown mtime is aged first so any rewrite shows.
+  const cooldownPathR6 = path.join(homeR6, 'throttle.cooldown');
+  ageCooldownR6(cooldownPathR6);
+  const cooldownBeforeR6b = cooldownMtimeR6(cooldownPathR6);
+  const cdpR6b = await mockCdp(pageTextR6, [], { throttleModal: modalTextR6 });
+  const r6b = await runSalvageInHome(homeR6, [MARKER, '3'], cdpR6b.port);
+  cdpR6b.stop();
+  const cooldownAfterR6b = cooldownMtimeR6(cooldownPathR6);
+  check('#215 gate r6 bounded-dedupe (b) the scan right after the re-arm does not take the throttle exit',
+    r6b.status !== 5, `status=${r6b.status} stderr=${r6b.stderr?.slice(-300)}`);
+  check('#215 gate r6 bounded-dedupe (b) the scan right after the re-arm writes no second cooldown',
+    cooldownAfterR6b === cooldownBeforeR6b, `before=${cooldownBeforeR6b} after=${cooldownAfterR6b}`);
+  check('#215 gate r6 bounded-dedupe (b) the suppressed repeat still names the sighting as already charged',
+    /already charged/.test(r6b.stderr || ''), `stderr=${r6b.stderr?.slice(-300)}`);
+  fs.rmSync(homeR6, { recursive: true, force: true });
+
+  // (c) control (#208 gate r3 P2 must survive): a FRESH observed record is still exempt from the
+  // CAPACITY trim. It is seeded with the oldest mtime on disk — the exact record the trim picks
+  // first — and the directory is pushed over an overridden cap of one. It must survive untouched
+  // and charge nothing, while the unprotected fillers are cut to the cap (proof the trim ran).
+  const homeCapR6 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedThrottleSeen(homeCapR6, primaryUrlR6, modalTextR6);
+  const capRecordPathR6 = throttleSeenRecordPath(homeCapR6, primaryUrlR6, modalTextR6);
+  ageRecordR6(capRecordPathR6, 600_000);   // 10 minutes: well inside the TTL, oldest on disk
+  const capMtimeBeforeR6 = recordMtimeR6(capRecordPathR6);
+  const capFillerUrlR6 = (i) => `https://chatgpt.com/c/mock-r6-cap-filler-${i}`;
+  const capFillerTextR6 = (i) => `unrelated filler text ${i}`;
+  for (let i = 0; i < 2; i += 1) seedThrottleSeen(homeCapR6, capFillerUrlR6(i), capFillerTextR6(i));
+  const cdpR6c = await mockCdp(pageTextR6, [], { throttleModal: modalTextR6 });
+  const r6c = await runSalvageInHome(homeCapR6, [MARKER, '3'], cdpR6c.port, { PRO_GATE_THROTTLE_SEEN_MAX: '1' });
+  cdpR6c.stop();
+  const capMtimeAfterR6 = recordMtimeR6(capRecordPathR6);
+  const capFillerSurvivorsR6 = [0, 1].filter((i) => throttleSeenHas(homeCapR6, capFillerUrlR6(i), capFillerTextR6(i))).length;
+  check('#215 gate r6 bounded-dedupe (c) control: an unexpired observed fingerprint survives a capacity trim at PRO_GATE_THROTTLE_SEEN_MAX=1, mtime untouched',
+    capMtimeAfterR6 !== null && capMtimeAfterR6 === capMtimeBeforeR6,
+    `before=${capMtimeBeforeR6} after=${capMtimeAfterR6} records=${seenDirListR6(homeCapR6)}`);
+  check('#215 gate r6 bounded-dedupe (c) control: the capacity trim really ran — the unprotected fillers are cut to the cap',
+    capFillerSurvivorsR6 === 1, `survivors=${capFillerSurvivorsR6} records=${seenDirListR6(homeCapR6)}`);
+  check('#215 gate r6 bounded-dedupe (c) control: the protected fingerprint charges no new cooldown',
+    r6c.cooldown === null && r6c.status !== 5, `status=${r6c.status} cooldown=${r6c.cooldown}`);
+  fs.rmSync(homeCapR6, { recursive: true, force: true });
+
+  // (d) control (pre-existing behaviour): an aged record this scan does NOT observe is expired by
+  // the same prune, fired here by an unrelated, genuinely new throttle sighting.
+  const homeUnobsR6 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const unobservedUrlR6 = 'https://chatgpt.com/c/mock-r6-unobserved';
+  const unobservedTextR6 = 'an old sighting from a tab that is no longer open';
+  seedThrottleSeen(homeUnobsR6, unobservedUrlR6, unobservedTextR6);
+  ageRecordR6(throttleSeenRecordPath(homeUnobsR6, unobservedUrlR6, unobservedTextR6), EIGHT_DAYS_MS_R6);
+  const cdpR6d = await mockCdp(pageTextR6, [], { throttleModal: modalTextR6 });
+  const r6d = await runSalvageInHome(homeUnobsR6, [MARKER, '3'], cdpR6d.port);
+  cdpR6d.stop();
+  check('#215 gate r6 bounded-dedupe (d) control: a record aged past the TTL that this scan never observes is still expired',
+    !throttleSeenHas(homeUnobsR6, unobservedUrlR6, unobservedTextR6), `records=${seenDirListR6(homeUnobsR6)}`);
+  check('#215 gate r6 bounded-dedupe (d) control: the unrelated trigger sighting is charged and recorded',
+    r6d.status === 5 && throttleSeenHas(homeUnobsR6, primaryUrlR6, modalTextR6),
+    `status=${r6d.status} cooldown=${r6d.cooldown} records=${seenDirListR6(homeUnobsR6)}`);
+  fs.rmSync(homeUnobsR6, { recursive: true, force: true });
+}
+
 // v0.42 (#109): a synthetic placeholder such as https://chatgpt.com/c/WEB:<uuid> once passed the
 // prefix-only memo check, was remembered as authoritative, and parked its run forever: the page
 // behind it carries no marker, so every later pass was inconclusive and never counted a miss.
