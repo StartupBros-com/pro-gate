@@ -4614,6 +4614,200 @@ const FOREIGN_ANSWER = (m) => [
   fs.rmSync(homeOrgForeign215, { recursive: true, force: true });
 }
 
+{ // #215 gate r2 P2 (bin/cdp-salvage.mjs:531 throttleAlreadyCharged): a NEW throttle episode on a
+  // recovered tab was suppressed as an old stale modal. Once an unowned (url, modal) pair was
+  // charged, nothing ever invalidated its fingerprint — a later scan could observe that same
+  // conversation fully rendered with no throttle at all, and if throttling returned with the same
+  // modal text at that URL the existence check swallowed it. The sequence
+  // throttled -> healthy -> throttled therefore wrote only the FIRST cooldown, and TTL could not
+  // bound it (pruneThrottleSeen protects the fingerprint the current scan is observing, however
+  // old its record). With another run's marker beneath the modal and no owned conversation found,
+  // the returning episode then fell through to the confirmed-absent exit 4 while the account was
+  // actively limited — the engine left without a fresh cooldown. Fixed by retiring a URL's
+  // fingerprints as soon as a scan positively observes that URL healthy; uninterrupted stale
+  // sightings still deduplicate, and a URL that is healthy AND throttled in the same scan is not
+  // healthy at all.
+  const r2Url = 'https://chatgpt.com/c/mock-215-r2-returning-modal';
+  const r2Modal = "You're making requests too quickly. [#215 gate r2 P2 fixture]";
+  const r2Foreign = 'pg-run-another-run-215r2';
+  const r2ThrottledText = `ChatGPT\n${r2Foreign}\n${r2Modal}\nAnother run's conversation beneath the modal.\n`;
+  const r2HealthyText = `ChatGPT\n${r2Foreign}\nAnother run's conversation, fully rendered, no limiter in sight.\n`;
+  // An old-format record: every build before this fix wrote an EMPTY record file, so its URL can
+  // never be recovered from it. It must be attributable to no URL at all — retired only by TTL.
+  const r2LegacyModal = "You're making requests too quickly. [#215 gate r2 P2 old-format record]";
+  const oldMtime215r2 = (p) => { const t = new Date(Date.now() - 3_600_000); fs.utimesSync(p, t, t); };
+
+  const home215r2 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedThrottleSeen(home215r2, r2Url, r2LegacyModal);   // written empty, exactly as old builds wrote it
+
+  // (a1) First sighting of this modal on an unowned tab carrying ANOTHER run's marker: charged.
+  const cdp215r2a = await mockCdp('__NO_TABS__', [{ id: 'r2tab', url: r2Url }], {
+    tabText: () => r2ThrottledText,
+    throttleModal: () => r2Modal,
+  });
+  const r215r2a = await runSalvageInHome(home215r2, [MARKER, '3'], cdp215r2a.port);
+  cdp215r2a.stop();
+  check('#215 gate r2 P2 (a1) the first sighting of an unowned modal takes the throttle exit (5)',
+    r215r2a.status === 5, `status=${r215r2a.status} stderr=${r215r2a.stderr?.slice(-400)}`);
+  check('#215 gate r2 P2 (a1) the first sighting records its (url, modal) fingerprint',
+    throttleSeenHas(home215r2, r2Url, r2Modal),
+    `dir=${fs.existsSync(throttleSeenDir(home215r2)) ? fs.readdirSync(throttleSeenDir(home215r2)) : null}`);
+
+  // (a2) The SAME tab at the SAME URL, now fully rendered with no throttle surface anywhere: the
+  // episode this scan observes is over, so its fingerprint must not go on suppressing the next one.
+  const cooldownPath215r2 = path.join(home215r2, 'throttle.cooldown');
+  oldMtime215r2(cooldownPath215r2);
+  const mtimeBefore215r2b = fs.statSync(cooldownPath215r2).mtimeMs;
+  const cdp215r2b = await mockCdp('__NO_TABS__', [{ id: 'r2tab', url: r2Url }], {
+    tabText: () => r2HealthyText,
+  });
+  const r215r2b = await runSalvageInHome(home215r2, [MARKER, '3'], cdp215r2b.port);
+  cdp215r2b.stop();
+  const mtimeAfter215r2b = fs.statSync(cooldownPath215r2).mtimeMs;
+  check('#215 gate r2 P2 (a2) a healthy observation of that URL takes no throttle exit',
+    r215r2b.status !== 5, `status=${r215r2b.status} stderr=${r215r2b.stderr?.slice(-400)}`);
+  check('#215 gate r2 P2 (a2) a healthy observation of that URL does not write a cooldown of its own',
+    mtimeAfter215r2b === mtimeBefore215r2b, `before=${mtimeBefore215r2b} after=${mtimeAfter215r2b}`);
+  check("#215 gate r2 P2 (a2) a healthy observation retires that URL's charged fingerprint",
+    !throttleSeenHas(home215r2, r2Url, r2Modal),
+    `dir=${fs.existsSync(throttleSeenDir(home215r2)) ? fs.readdirSync(throttleSeenDir(home215r2)) : null}`);
+  check('#215 gate r2 P2 (d) an old-format EMPTY record for the same URL is never retired by a healthy observation',
+    throttleSeenHas(home215r2, r2Url, r2LegacyModal),
+    `dir=${fs.existsSync(throttleSeenDir(home215r2)) ? fs.readdirSync(throttleSeenDir(home215r2)) : null}`);
+
+  // (a3) The same modal text returns at the same URL after that healthy observation. This is a
+  // NEW episode of the limiter, not a stale repeat of the first: it must charge its own cooldown
+  // and take the throttle exit, never the confirmed-absent exit 4 the finding describes.
+  oldMtime215r2(cooldownPath215r2);
+  const cooldownBefore215r2c = fs.readFileSync(cooldownPath215r2, 'utf8');
+  const mtimeBefore215r2c = fs.statSync(cooldownPath215r2).mtimeMs;
+  const cdp215r2c = await mockCdp('__NO_TABS__', [{ id: 'r2tab', url: r2Url }], {
+    tabText: () => r2ThrottledText,
+    throttleModal: () => r2Modal,
+  });
+  const r215r2c = await runSalvageInHome(home215r2, [MARKER, '3'], cdp215r2c.port);
+  cdp215r2c.stop();
+  const mtimeAfter215r2c = fs.statSync(cooldownPath215r2).mtimeMs;
+  check('#215 gate r2 P2 (a3) a modal returning after a healthy observation takes the throttle exit (5), not confirmed-absent (4)',
+    r215r2c.status === 5, `status=${r215r2c.status} stderr=${r215r2c.stderr?.slice(-400)}`);
+  check('#215 gate r2 P2 (a3) the returning episode writes a NEW cooldown',
+    mtimeAfter215r2c > mtimeBefore215r2c && r215r2c.cooldown !== cooldownBefore215r2c,
+    `before=${mtimeBefore215r2c}/${cooldownBefore215r2c?.trim()} after=${mtimeAfter215r2c}/${r215r2c.cooldown?.trim()}`);
+  fs.rmSync(home215r2, { recursive: true, force: true });
+
+  // (b) Control — deduplication of UNINTERRUPTED stale sightings is unchanged: with no healthy
+  // observation in between, the second scan of the same unchanged modal is still suppressed and
+  // its record still stands. This is the behaviour the retire pass must not weaken.
+  const homeCtl215r2 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const cdpCtl215r2a = await mockCdp('__NO_TABS__', [{ id: 'r2tab', url: r2Url }], {
+    tabText: () => r2ThrottledText,
+    throttleModal: () => r2Modal,
+  });
+  const rCtl215r2a = await runSalvageInHome(homeCtl215r2, [MARKER, '3'], cdpCtl215r2a.port);
+  cdpCtl215r2a.stop();
+  check('#215 gate r2 P2 (b) control: the first of two uninterrupted stale sightings takes the throttle exit (5)',
+    rCtl215r2a.status === 5, `status=${rCtl215r2a.status} stderr=${rCtl215r2a.stderr?.slice(-400)}`);
+  const cooldownPathCtl215r2 = path.join(homeCtl215r2, 'throttle.cooldown');
+  oldMtime215r2(cooldownPathCtl215r2);
+  const mtimeBeforeCtl215r2 = fs.statSync(cooldownPathCtl215r2).mtimeMs;
+  const cdpCtl215r2b = await mockCdp('__NO_TABS__', [{ id: 'r2tab', url: r2Url }], {
+    tabText: () => r2ThrottledText,
+    throttleModal: () => r2Modal,
+  });
+  const rCtl215r2b = await runSalvageInHome(homeCtl215r2, [MARKER, '3'], cdpCtl215r2b.port);
+  cdpCtl215r2b.stop();
+  const mtimeAfterCtl215r2 = fs.statSync(cooldownPathCtl215r2).mtimeMs;
+  check('#215 gate r2 P2 (b) control: an uninterrupted repeat of the same modal is still suppressed (no throttle exit)',
+    rCtl215r2b.status !== 5, `status=${rCtl215r2b.status}`);
+  check('#215 gate r2 P2 (b) control: an uninterrupted repeat still does not rewrite the cooldown',
+    mtimeAfterCtl215r2 === mtimeBeforeCtl215r2, `before=${mtimeBeforeCtl215r2} after=${mtimeAfterCtl215r2}`);
+  check('#215 gate r2 P2 (b) control: the suppressed repeat leaves its fingerprint record in place',
+    throttleSeenHas(homeCtl215r2, r2Url, r2Modal),
+    `dir=${fs.existsSync(throttleSeenDir(homeCtl215r2)) ? fs.readdirSync(throttleSeenDir(homeCtl215r2)) : null}`);
+  fs.rmSync(homeCtl215r2, { recursive: true, force: true });
+
+  // (c) Same-scan exclusion: one healthy tab and one throttled tab at the SAME URL in ONE scan.
+  // A conversation that is throttled right now is not healthy, whatever a sibling tab renders, so
+  // the record this very scan is checking must survive — retiring it here would re-admit the
+  // sighting the dedupe just suppressed and charge a second cooldown for one unchanged episode.
+  const homeSame215r2 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const cdpSame215r2a = await mockCdp('__NO_TABS__', [{ id: 'r2tab', url: r2Url }], {
+    tabText: () => r2ThrottledText,
+    throttleModal: () => r2Modal,
+  });
+  const rSame215r2a = await runSalvageInHome(homeSame215r2, [MARKER, '3'], cdpSame215r2a.port);
+  cdpSame215r2a.stop();
+  check('#215 gate r2 P2 (c) same-scan: the sighting is charged once before the mixed scan',
+    rSame215r2a.status === 5 && throttleSeenHas(homeSame215r2, r2Url, r2Modal),
+    `status=${rSame215r2a.status}`);
+  const cooldownPathSame215r2 = path.join(homeSame215r2, 'throttle.cooldown');
+  oldMtime215r2(cooldownPathSame215r2);
+  const mtimeBeforeSame215r2 = fs.statSync(cooldownPathSame215r2).mtimeMs;
+  const cdpSame215r2b = await mockCdp('__NO_TABS__', [
+    { id: 'r2same-healthy', url: r2Url },
+    { id: 'r2same-modal', url: r2Url },
+  ], {
+    tabText: (url, id) => (id === 'r2same-modal' ? r2ThrottledText : r2HealthyText),
+    throttleModal: (id) => (id === 'r2same-modal' ? r2Modal : null),
+  });
+  const rSame215r2b = await runSalvageInHome(homeSame215r2, [MARKER, '3'], cdpSame215r2b.port);
+  cdpSame215r2b.stop();
+  const mtimeAfterSame215r2 = fs.statSync(cooldownPathSame215r2).mtimeMs;
+  check('#215 gate r2 P2 (c) same-scan: a URL healthy on one tab and throttled on another in the SAME scan takes no throttle exit',
+    rSame215r2b.status !== 5, `status=${rSame215r2b.status} stderr=${rSame215r2b.stderr?.slice(-400)}`);
+  check('#215 gate r2 P2 (c) same-scan: that scan does not rewrite the cooldown',
+    mtimeAfterSame215r2 === mtimeBeforeSame215r2, `before=${mtimeBeforeSame215r2} after=${mtimeAfterSame215r2}`);
+  check('#215 gate r2 P2 (c) same-scan: the fingerprint that scan is still observing is NOT retired',
+    throttleSeenHas(homeSame215r2, r2Url, r2Modal),
+    `dir=${fs.existsSync(throttleSeenDir(homeSame215r2)) ? fs.readdirSync(throttleSeenDir(homeSame215r2)) : null}`);
+  fs.rmSync(homeSame215r2, { recursive: true, force: true });
+
+  // Organizer variant of (a): the organizer builds the same listed-tab reads/throttleHits pair and
+  // shares the same dedupe store, so the same three-state sequence must reach the same answer —
+  // pre-fix its returning episode reported no throttle at all and left the cooldown untouched.
+  const orgTitle215r2 = 'pro-gate review: PR #215 gate r2 P2 [pro-gate]';
+  const homeOrg215r2 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedOrganizer(MARKER, orgTitle215r2)(homeOrg215r2);   // no memo url -> no scratch recovery path
+  const cdpOrg215r2a = await mockCdp('__NO_TABS__', [{ id: 'r2tab', url: r2Url }], {
+    tabText: () => r2ThrottledText,
+    throttleModal: () => r2Modal,
+  });
+  const rOrg215r2a = await runSalvageInHome(homeOrg215r2, ['--organize', MARKER, '5'], cdpOrg215r2a.port);
+  cdpOrg215r2a.stop();
+  check('#215 gate r2 P2 (organizer a1) the first sighting reports reason=throttle and records its fingerprint',
+    /reason=throttle/.test(rOrg215r2a.stdout) && throttleSeenHas(homeOrg215r2, r2Url, r2Modal),
+    `stdout=${rOrg215r2a.stdout} stderr=${rOrg215r2a.stderr?.slice(-300)}`);
+  const cooldownPathOrg215r2 = path.join(homeOrg215r2, 'throttle.cooldown');
+  oldMtime215r2(cooldownPathOrg215r2);
+  const mtimeBeforeOrg215r2b = fs.statSync(cooldownPathOrg215r2).mtimeMs;
+  const cdpOrg215r2b = await mockCdp('__NO_TABS__', [{ id: 'r2tab', url: r2Url }], {
+    tabText: () => r2HealthyText,
+  });
+  const rOrg215r2b = await runSalvageInHome(homeOrg215r2, ['--organize', MARKER, '5'], cdpOrg215r2b.port);
+  cdpOrg215r2b.stop();
+  const mtimeAfterOrg215r2b = fs.statSync(cooldownPathOrg215r2).mtimeMs;
+  check('#215 gate r2 P2 (organizer a2) a healthy organizer scan does not write a cooldown of its own',
+    mtimeAfterOrg215r2b === mtimeBeforeOrg215r2b && !/reason=throttle/.test(rOrg215r2b.stdout),
+    `before=${mtimeBeforeOrg215r2b} after=${mtimeAfterOrg215r2b} stdout=${rOrg215r2b.stdout}`);
+  check("#215 gate r2 P2 (organizer a2) a healthy organizer scan retires that URL's charged fingerprint",
+    !throttleSeenHas(homeOrg215r2, r2Url, r2Modal),
+    `dir=${fs.existsSync(throttleSeenDir(homeOrg215r2)) ? fs.readdirSync(throttleSeenDir(homeOrg215r2)) : null}`);
+  oldMtime215r2(cooldownPathOrg215r2);
+  const mtimeBeforeOrg215r2c = fs.statSync(cooldownPathOrg215r2).mtimeMs;
+  const cdpOrg215r2c = await mockCdp('__NO_TABS__', [{ id: 'r2tab', url: r2Url }], {
+    tabText: () => r2ThrottledText,
+    throttleModal: () => r2Modal,
+  });
+  const rOrg215r2c = await runSalvageInHome(homeOrg215r2, ['--organize', MARKER, '5'], cdpOrg215r2c.port);
+  cdpOrg215r2c.stop();
+  const mtimeAfterOrg215r2c = fs.statSync(cooldownPathOrg215r2).mtimeMs;
+  check('#215 gate r2 P2 (organizer a3) a modal returning after a healthy organizer scan reports reason=throttle again',
+    /reason=throttle/.test(rOrg215r2c.stdout), `stdout=${rOrg215r2c.stdout} stderr=${rOrg215r2c.stderr?.slice(-300)}`);
+  check('#215 gate r2 P2 (organizer a3) the returning organizer episode writes a NEW cooldown',
+    mtimeAfterOrg215r2c > mtimeBeforeOrg215r2c, `before=${mtimeBeforeOrg215r2c} after=${mtimeAfterOrg215r2c}`);
+  fs.rmSync(homeOrg215r2, { recursive: true, force: true });
+}
+
 // v0.42 (#109): a synthetic placeholder such as https://chatgpt.com/c/WEB:<uuid> once passed the
 // prefix-only memo check, was remembered as authoritative, and parked its run forever: the page
 // behind it carries no marker, so every later pass was inconclusive and never counted a miss.

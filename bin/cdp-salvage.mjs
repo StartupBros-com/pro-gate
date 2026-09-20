@@ -523,6 +523,62 @@ function pruneThrottleSeen(protectedKeys = new Set()) {
       .forEach(({ name }) => { try { fs.unlinkSync(path.join(THROTTLE_SEEN_DIR, name)); } catch {} });
   }
 }
+// #215 gate r2 P2: a throttle modal that comes BACK after the same conversation was observed
+// rendering normally is a NEW episode, not the stale repeat this dedupe exists to suppress. A
+// record only ever meant "this (url, hash) was charged once", and nothing invalidated it, so the
+// sequence throttled -> healthy -> throttled wrote exactly ONE cooldown: the returning modal
+// hashes identically and the existence check in throttleAlreadyCharged swallows it. With another
+// run's marker under that modal and no owned conversation found, the scan then falls through to
+// the confirmed-absent exit 4 while the account is actively limited — the engine left without a
+// fresh cooldown on a live rate limit. TTL cannot bound it either: pruneThrottleSeen deliberately
+// protects the fingerprint the current scan is observing, however old its record is.
+// So retire a URL's fingerprints the moment a scan positively observes that URL healthy (see
+// scanThrottleHealth). An UNINTERRUPTED run of stale sightings still deduplicates exactly as
+// before, because a URL throttled anywhere in a scan is never healthy in that same scan.
+// Records written by builds before this change are EMPTY: attributable to no URL, so this pass
+// never retires one — only TTL/capacity pruning can. Best-effort like every other sidecar write
+// here; a failure leaves the record in place, which is the safe direction (one suppressed
+// repeat, never a double-charged cooldown).
+function retireThrottleSeenForHealthyUrls(healthyUrls, protectedKeys = new Set()) {
+  if (!healthyUrls || healthyUrls.size === 0) return;
+  let names;
+  try { names = fs.readdirSync(THROTTLE_SEEN_DIR); } catch { return; }
+  for (const name of names) {
+    if (protectedKeys.has(name)) continue;                           // a fingerprint THIS scan is about to check
+    const recordPath = path.join(THROTTLE_SEEN_DIR, name);
+    if (pendingThrottleSeenRecords.includes(recordPath)) continue;   // created moments ago, cooldown not yet published
+    let storedUrl;
+    try { storedUrl = fs.readFileSync(recordPath, 'utf8').trim(); } catch { continue; }
+    if (!storedUrl || !healthyUrls.has(storedUrl)) continue;
+    try { fs.unlinkSync(recordPath); } catch {}
+  }
+}
+// The health half of that rule, shared by the main scan and the organizer scan so both read ONE
+// definition. A URL is healthy in a scan when at least one LISTED tab at it was read with
+// non-empty text that is not a throttle sighting, AND no tab at it showed a throttle surface
+// (modal or interstitial) in the same scan. That second clause is what keeps a URL that is both
+// healthy and throttled right now out of the retire set, so a scan can never retire a record it
+// is itself about to charge or check. Scratch re-renders are deliberately not counted: those are
+// a recovery probe of one remembered URL, not an observation of what the browser is showing.
+// The protectedKeys set carries the same (url, modal-or-page-text) fingerprints every unowned trip
+// site hashes, as a second and independent guard on that clause.
+function scanThrottleHealth(reads) {
+  const healthyUrls = new Set();
+  const throttledUrls = new Set();
+  const protectedKeys = new Set();
+  for (const { tab, text, throttleModal } of reads) {
+    const url = tab?.url;
+    if (!url) continue;
+    if (throttleModal || isThrottlePage(text)) {
+      throttledUrls.add(url);
+      protectedKeys.add(throttleSeenKey(url, throttleTextHash(throttleModal ?? text)));
+      continue;
+    }
+    if (text && text.trim() !== '') healthyUrls.add(url);
+  }
+  for (const url of throttledUrls) healthyUrls.delete(url);
+  return { healthyUrls, protectedKeys };
+}
 // "Already charged" is now a plain existence check on the record file, not a load-then-scan of
 // an in-memory snapshot — there is no snapshot to go stale, so two processes checking/creating
 // records for the SAME or DIFFERENT fingerprints can never clobber one another (#208 gate r2 P2).
@@ -539,7 +595,13 @@ function recordThrottleSeen(url, hash) {  // -> true when THIS call may charge t
   try {
     fs.mkdirSync(THROTTLE_SEEN_DIR, { recursive: true });
     const recordPath = throttleSeenRecordPath(url, hash);
-    fs.writeFileSync(recordPath, '', { flag: 'wx' });
+    // #215 gate r2 P2: the record's CONTENT is the URL it was charged for. The filename is a
+    // hash of (url, text-hash) and cannot be reversed, so without this a record could never be
+    // attributed back to a conversation and retireThrottleSeenForHealthyUrls below would need a
+    // second index to maintain (and to keep consistent through every crash and race this
+    // directory's whole design exists to survive). Records written by earlier builds are empty;
+    // that is handled there, not here.
+    fs.writeFileSync(recordPath, `${url}\n`, { flag: 'wx' });
     // #208 gate r6 P2: this record is provisional — the 'wx' create still has to win the race
     // BEFORE the cooldown it gates is attempted (it remains the sole race arbiter), but it must
     // not outlive a failed publish. recordThrottle rolls it back if that write fails.
@@ -1318,6 +1380,11 @@ async function organizeConversation() {
     const [text, throttleModal] = await Promise.all([tabText(tab), tabThrottleModal(tab)]);
     return { tab, text, throttleModal };
   }));
+  // #215 gate r2 P2: the organizer builds the same listed-tab reads/throttleHits pair as the main
+  // scan and shares its dedupe store, so it retires on a healthy observation identically and for
+  // the same reason — before its own batch below decides "already charged".
+  const scanHealth = scanThrottleHealth(reads);
+  retireThrottleSeenForHealthyUrls(scanHealth.healthyUrls, scanHealth.protectedKeys);
   const throttleHits = reads.filter(({ text, throttleModal }) => isThrottlePage(text) || throttleModal);
   if (throttleHits.length > 0) {
     // #162 semantics preserved: an OWNED sighting (this run's exact marker under the modal)
@@ -1749,6 +1816,13 @@ while (Date.now() < deadline) {
     ]);
     return { tab, text, infrastructureError, throttleModal };
   }));
+  // #215 gate r2 P2: retire the fingerprints of every URL this scan positively observed healthy
+  // BEFORE the batch below decides "already charged" — a modal that returned after an EARLIER
+  // scan saw that conversation rendering normally is a new episode and must charge its own
+  // cooldown. A URL that is healthy and throttled in the SAME scan is excluded by
+  // scanThrottleHealth, so this never retires a record this scan still needs.
+  const scanHealth = scanThrottleHealth(reads);
+  retireThrottleSeenForHealthyUrls(scanHealth.healthyUrls, scanHealth.protectedKeys);
   // #162: the modal is account-wide, so decide ownership over the WHOLE scan, never on the first
   // tab in list order (the same order-independence onOurConversation documents): a foreign or
   // blacklisted tab listed ahead of ours must not hide the proof that our conversation exists.
