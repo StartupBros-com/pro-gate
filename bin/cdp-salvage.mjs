@@ -86,7 +86,7 @@
 //            exists to harvest; the caller keeps the charge but releases recovery ownership.
 // Requires Node >= 21 (global WebSocket); the box runs Node 24.
 
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -499,13 +499,51 @@ function throttleSeenRecordPath(url, hash) {
 // forever instead of exactly once. A protected fingerprint can still exceed the nominal cap on
 // disk; that is the correct trade — the cap is only ever enforced against records this scan does
 // NOT need.
+// #215 skeptic r3 D2/D3: the infix retireThrottleSeenRecord below names its temp with. A temp is
+// NEVER a record: it is a record mid-removal, and every walk of this directory has to say so.
+const THROTTLE_RETIRE_INFIX = '.retire.';
 let throttleSeenPruned = false;
 function pruneThrottleSeen(protectedKeys = new Set()) {
   let names;
   try { names = fs.readdirSync(THROTTLE_SEEN_DIR); } catch { return; }
+  // #215 skeptic r3 D2: a retire renames the record to `<name>.retire.<pid>` BEFORE deciding what
+  // it took (see retireThrottleSeenRecord), so there is a window in which the record exists only
+  // under that temp name. A kill, an OOM, a power loss or a failed link-back inside that window
+  // used to free the record's name forever: "already charged" is an exact-name existsSync, so the
+  // next scan read the unchanged modal as new and charged a SECOND account cooldown — the #208
+  // livelock, reached through an abort. This is the one pass that already walks this directory
+  // once per invocation, so it is where an orphan is reclaimed: a temp whose base name is free IS
+  // the record and is linked back under it; a temp whose base name is taken is redundant (the
+  // record sitting there already carries the same "charged" meaning) and is dropped. A link
+  // failure other than EEXIST leaves the temp alone for the next invocation to retry, exactly as
+  // D1 leaves it — losing the only copy is the one outcome that costs a cooldown.
+  // Racing a LIVE retire can only adopt a record back that the retire was legitimately removing:
+  // one suppressed repeat, never a double-charged cooldown, which is the safe direction this file
+  // takes everywhere. protectedKeys is deliberately not consulted — adoption never deletes a
+  // record, and the fingerprint a scan is about to check is exactly the one worth reclaiming.
+  const adopted = [];
+  const records = [];
+  for (const name of names) {
+    const at = name.indexOf(THROTTLE_RETIRE_INFIX);
+    if (at < 0) { records.push(name); continue; }
+    const tempPath = path.join(THROTTLE_SEEN_DIR, name);
+    const base = name.slice(0, at);
+    if (base) {
+      const basePath = path.join(THROTTLE_SEEN_DIR, base);
+      if (!fs.existsSync(basePath)) {
+        try { fs.linkSync(tempPath, basePath); adopted.push(base); }
+        catch (err) { if (err?.code !== 'EEXIST') continue; }   // keep the temp: it is still the record
+      }
+    }
+    try { fs.unlinkSync(tempPath); } catch {}
+  }
   const now = Date.now();
   const stats = [];
-  for (const name of names) {
+  // #215 skeptic r3 D3: temps are gone or adopted by now and never appear here, so the capacity
+  // trim can no longer evict a LIVE record (oldest mtime first) to stay under the cap while
+  // keeping an orphan that gates nothing. An adopted record carries the temp's mtime, so the TTL
+  // below still reaches an aged one in this same pass.
+  for (const name of [...records, ...adopted]) {
     if (protectedKeys.has(name)) continue;
     const recordPath = path.join(THROTTLE_SEEN_DIR, name);
     let mtimeMs;
@@ -549,18 +587,41 @@ function pruneThrottleSeen(protectedKeys = new Set()) {
 // and the next scan charged the unchanged modal all over again — the #208 livelock, reached
 // through a delayed healthy scan rather than a read failure. Neither protectedKeys nor
 // pendingThrottleSeenRecords can help: both describe THIS process, and B is another one.
-// A record is only ever created ('wx', never rewritten), so its identity is its (ino, mtimeMs).
-// snapshotThrottleSeenGenerations is taken BEFORE an observation starts reading, and only a
-// record still carrying the generation that snapshot saw may be retired; anything created or
-// replaced afterwards lies outside what the observation covers and survives.
+// A record is only ever created ('wx', never rewritten), so a record's identity is whatever
+// distinguishes one create at a name from the next one. snapshotThrottleSeenGenerations is taken
+// BEFORE an observation starts reading, and only a record still carrying the generation that
+// snapshot saw may be retired; anything created or replaced afterwards lies outside what the
+// observation covers and survives.
+//
+// #215 skeptic r3 D4: that identity is NOT (ino, mtimeMs). The mtime resolution reachable here is
+// coarse (4 ms, measured on the host this ships from) and ext4 hands a freed inode straight back
+// to the next create in the same directory — so another process deleting a record and creating
+// its replacement inside one tick presents the EXACT pair the snapshot saw, and the retire deletes
+// a record it knows nothing about, which is the very delete this guard exists to prevent. So every
+// record carries a random nonce on a second content line, written once at creation beside the URL
+// (recordThrottleSeen), and the identity is (ino, mtimeMs, nonce). Records written before this
+// change have no nonce line: they read as '' on both sides, which is exactly the (ino, mtimeMs)
+// behaviour they had before — an unchanged one is still retired — while any replacement THIS build
+// writes carries a nonce and so can never be mistaken for one of them.
+function readThrottleSeenRecord(recordPath) {   // -> { url, nonce }, or null when unreadable
+  let raw;
+  try { raw = fs.readFileSync(recordPath, 'utf8'); } catch { return null; }
+  const lines = raw.split('\n');
+  return { url: (lines[0] ?? '').trim(), nonce: (lines[1] ?? '').trim() };
+}
 function snapshotThrottleSeenGenerations() {
   const generations = new Map();
   let names;
   try { names = fs.readdirSync(THROTTLE_SEEN_DIR); } catch { return generations; }   // no directory yet: nothing observed
   for (const name of names) {
+    if (name.includes(THROTTLE_RETIRE_INFIX)) continue;   // a retire temp is not a record (r3 D2)
     try {
-      const { ino, mtimeMs } = fs.statSync(path.join(THROTTLE_SEEN_DIR, name));
-      generations.set(name, { ino, mtimeMs });
+      const recordPath = path.join(THROTTLE_SEEN_DIR, name);
+      const { ino, mtimeMs } = fs.statSync(recordPath);
+      // One extra small read per record per observation, over a directory capped at
+      // THROTTLE_SEEN_MAX (512) tiny files — and only on a scan that is about to issue CDP
+      // evaluates over every open tab anyway.
+      generations.set(name, { ino, mtimeMs, nonce: readThrottleSeenRecord(recordPath)?.nonce ?? '' });
     } catch {}   // vanished between readdir and stat: not this observation's to retire
   }
   return generations;
@@ -570,23 +631,43 @@ function snapshotThrottleSeenGenerations() {
 // unlink. So take the name away atomically FIRST (rename to a sibling temp only this process can
 // name), then decide what was taken. From that instant the 'wx' create in recordThrottleSeen
 // sees the name free and whatever it writes there is safe from everything below.
+//
+// #215 skeptic r3 D5: an ACCEPTED residual of taking the name away first. Between the rename and
+// the link-back the record is invisible at its name, so a THIRD process checking
+// throttleAlreadyCharged in that window reads the fingerprint as new and can charge one duplicate
+// cooldown. The window is a rename, a stat and a read wide, and it is strictly narrower than what
+// it replaced: before this guard the retire unlinked the record unconditionally, leaving the name
+// free until some later scan recharged it. One duplicate charge in a microsecond-wide window is
+// the price of never deleting another process's newer record; closing it needs a lock over the
+// whole directory, which is the shared mutable state this design deliberately has none of.
 function retireThrottleSeenRecord(recordPath, name, observed) {
-  const tempPath = path.join(THROTTLE_SEEN_DIR, `${name}.retire.${process.pid}`);
+  const tempPath = path.join(THROTTLE_SEEN_DIR, `${name}${THROTTLE_RETIRE_INFIX}${process.pid}`);
   // ENOENT: another retire got there first. Any other failure leaves the record in place, which
   // is the safe direction (one suppressed repeat, never a double-charged cooldown).
   try { fs.renameSync(recordPath, tempPath); } catch { return; }
   let current;
   try { current = fs.statSync(tempPath); } catch { return; }
-  if (current.ino === observed.ino && current.mtimeMs === observed.mtimeMs) {
+  const nonce = readThrottleSeenRecord(tempPath)?.nonce ?? '';
+  if (current.ino === observed.ino && current.mtimeMs === observed.mtimeMs
+      && nonce === (observed.nonce ?? '')) {
     try { fs.unlinkSync(tempPath); } catch {}   // exactly the generation this observation covered
     return;
   }
   // Someone replaced the record between the snapshot and the rename, so this is a NEWER record
   // whose cooldown this observation says nothing about: put it back under its name. linkSync,
-  // never renameSync — a record created at that name in the meantime must not be clobbered; and
-  // if the name is taken (EEXIST), the record now sitting there already carries the same
-  // "charged" meaning, so the temp is simply dropped.
-  try { fs.linkSync(tempPath, recordPath); } catch {}
+  // never renameSync — a record created at that name in the meantime must not be clobbered.
+  try {
+    fs.linkSync(tempPath, recordPath);
+  } catch (err) {
+    // #215 skeptic r3 D1: the two failures are NOT the same and must not share a handler. EEXIST
+    // means the name is taken by a record that already carries the same "charged" meaning, so the
+    // temp is redundant and is dropped below. Anything else (ENOSPC, EDQUOT, EIO, EPERM) means the
+    // link did not happen and this temp is the ONLY copy of that newer record — unlinking it here
+    // destroyed exactly what this branch exists to preserve, and the next scan then charged the
+    // unchanged modal a second cooldown. Leave it: pruneThrottleSeen adopts it back under its name
+    // on the next invocation, and the TTL still bounds it if nothing ever does.
+    if (err?.code !== 'EEXIST') return;
+  }
   try { fs.unlinkSync(tempPath); } catch {}
 }
 function retireThrottleSeenForHealthyUrls(healthyUrls, protectedKeys = new Set(), generations = null) {
@@ -597,14 +678,17 @@ function retireThrottleSeenForHealthyUrls(healthyUrls, protectedKeys = new Set()
   let names;
   try { names = fs.readdirSync(THROTTLE_SEEN_DIR); } catch { return; }
   for (const name of names) {
+    if (name.includes(THROTTLE_RETIRE_INFIX)) continue;              // a retire temp is not a record (r3 D2)
     if (protectedKeys.has(name)) continue;                           // a fingerprint THIS scan is about to check
     const observed = generations.get(name);
     if (!observed) continue;                                         // created after this observation started
     const recordPath = path.join(THROTTLE_SEEN_DIR, name);
     if (pendingThrottleSeenRecords.includes(recordPath)) continue;   // created moments ago, cooldown not yet published
-    let storedUrl;
-    try { storedUrl = fs.readFileSync(recordPath, 'utf8').trim(); } catch { continue; }
-    if (!storedUrl || !healthyUrls.has(storedUrl)) continue;
+    // Records carry the URL on their first line and (since r3 D4) a nonce on their second, so the
+    // whole file is no longer the URL: parse it. An empty record (written by builds before the
+    // URL line existed) is attributable to no URL and is still never retired here.
+    const stored = readThrottleSeenRecord(recordPath);
+    if (!stored?.url || !healthyUrls.has(stored.url)) continue;
     retireThrottleSeenRecord(recordPath, name, observed);
   }
 }
@@ -746,9 +830,14 @@ function recordThrottleSeen(url, hash) {  // -> true when THIS call may charge t
     // recordThrottle rolls it back if that write fails, and (since #215 skeptic r2 D4) if this
     // call's own content write fails too.
     pendingThrottleSeenRecords.push(recordPath);
+    // #215 skeptic r3 D4: a random nonce on the SECOND line, so two creates at one name are
+    // distinguishable even when the filesystem hands the replacement the freed inode inside the
+    // mtime's resolution — see snapshotThrottleSeenGenerations. Written in the same call as the
+    // URL: a record that exists without its nonce is a record two generations of which can be
+    // confused, so it must never be reachable as a separate failure.
     // writeFileSync loops on short writes; the bare writeSync it replaces did not, so it could
     // strand a TRUNCATED record as easily as an empty one (#215 skeptic r2c B).
-    fs.writeFileSync(fd, `${url}\n`);
+    fs.writeFileSync(fd, `${url}\n${randomBytes(16).toString('hex')}\n`);
     return true;
   } catch (err) {
     // #215 skeptic r2c B: the create WON (fd is set) but the content write failed — the record
@@ -2270,6 +2359,14 @@ while (Date.now() < deadline) {
       // retires that ONE URL's records. Reached only when the throttle trip above did NOT exit
       // (an already-charged repeat), and 'throttle' is not a decisive-healthy reason either way.
       // #215 skeptic r2c A: decisive AND readable-as-healthy — see freshRenderText's retireSafe.
+      // #215 skeptic r3 D6: the throttledUrls/unknownUrls veto can never FIRE here. This seeded
+      // render only runs when no listed tab carries seedUrl (the `!tabs.some(...)` guard above,
+      // the same exact-string equality both sets are keyed by), so seedUrl is in neither set by
+      // construction. They are passed anyway because the veto is a property of the function, not
+      // of one call site, and because that guard is not this argument's to depend on: the veto
+      // binds on the ORGANIZER path, where a listed tab at the remembered URL can exist and be
+      // unreadable while the memo render of the same URL comes back healthy (the #215 gate r3 P2
+      // (5) fixture is exactly that shape).
       retireThrottleSeenForHealthyRender(seedUrl,
         DECISIVE_HEALTHY_RENDER_REASONS.has(renderReason) && renderRetireSafe === true,
         scanHealth.throttledUrls, scanHealth.unknownUrls, renderGenerations);

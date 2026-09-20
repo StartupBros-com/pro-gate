@@ -5775,4 +5775,305 @@ const ageCooldown215 = (p) => { const t = new Date(Date.now() - 3_600_000); fs.u
   fs.rmSync(homeV3, { recursive: true, force: true });
 }
 
+
+// --- #215 skeptic r3 (bin/cdp-salvage.mjs throttle-modal dedupe store) -------------------------
+// Shared fixture helpers for the findings below.
+const r3Names = (home) => (fs.existsSync(throttleSeenDir(home)) ? fs.readdirSync(throttleSeenDir(home)) : []);
+const r3Temps = (home) => r3Names(home).filter((n) => n.includes('.retire.'));
+// A whole-second stamp: fs.utimesSync with an integer number of seconds writes nsec 0, so mtimeMs
+// is that integer times 1000 exactly and a fixture can reproduce or avoid an EXACT mtimeMs.
+const r3Stamp = (secondsAgo) => Math.floor(Date.now() / 1000) - secondsAgo;
+const r3Text = (foreign, modal) => `ChatGPT\n${foreign}\n${modal}\nAnother run's conversation beneath the modal.\n`;
+// Two generations of ONE record's bytes, both written by the build under test: charge the
+// fingerprint, take what landed on disk, delete it, charge it again, take that too. A fixture that
+// has to stage a record REPLACED mid-scan must stage the replacement in the format production
+// actually writes — this change adds a nonce line to it, and a fixture that hard-codes either the
+// old or the new shape silently stops driving the code it means to (a two-line record is
+// attributable to no URL in the pre-fix tree, so its retire is never even attempted there).
+async function r3Generations(url, modal, foreign) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-gen-'));
+  const recordPath = throttleSeenRecordPath(home, url, modal);
+  const generations = [];
+  for (let i = 0; i < 2; i += 1) {
+    const cdp = await mockCdp('__NO_TABS__', [{ id: 'gentab', url }], {
+      tabText: () => r3Text(foreign, modal),
+      throttleModal: () => modal,
+    });
+    await runSalvageInHome(home, [MARKER, '3'], cdp.port);
+    cdp.stop();
+    generations.push(fs.existsSync(recordPath) ? fs.readFileSync(recordPath) : null);
+    try { fs.unlinkSync(recordPath); } catch {}
+  }
+  fs.rmSync(home, { recursive: true, force: true });
+  return generations;
+}
+
+{ // #215 skeptic r3 D1 (bin/cdp-salvage.mjs retireThrottleSeenRecord): the link-back that exists to
+  // PRESERVE a newer record destroyed it whenever the link itself failed. The retire renames the
+  // record to a sibling temp first (so a concurrent create at the name is serialized), then, on a
+  // generation mismatch, links the temp back under its name and unlinks the temp. That unlink ran
+  // unconditionally: `try { fs.linkSync(...) } catch {}` swallowed ENOSPC, EDQUOT, EIO and EPERM
+  // exactly as it swallowed the benign EEXIST, and the next line deleted the ONLY remaining copy of
+  // a record whose cooldown this observation says nothing about. The record is gone, the next scan
+  // reads the unchanged modal as new, and it charges a second account cooldown — the #208 livelock
+  // the guard was added to close, reached through a full disk instead of through a race.
+  // Fixed by distinguishing the two outcomes: EEXIST means the name already carries a record with
+  // the same "charged" meaning, so the temp is redundant and dropped; any other failure means the
+  // link did NOT happen and the temp IS the record, so it stays on disk for pruneThrottleSeen to
+  // adopt back under its name (D2/D3) and for the TTL to bound.
+  //
+  // Forceable the same way #215 skeptic r2c B forces its ENOSPC: a --import preload failing exactly
+  // one fs call in the child. Here that is fs.linkSync for a destination inside the dedupe
+  // directory, which leaves the only other link in the file (forgetUrl's memo claim) alone.
+  const LINK_ENOSPC_PRELOAD = [
+    "import fs from 'node:fs';",
+    'const realLinkSync = fs.linkSync;',
+    'fs.linkSync = function (existingPath, newPath, ...rest) {',
+    "  if (String(newPath).includes('throttle.cooldown.seen.d')) {",
+    "    const err = new Error('mock: no space left on device'); err.code = 'ENOSPC'; throw err;",
+    '  }',
+    '  return realLinkSync.call(fs, existingPath, newPath, ...rest);',
+    '};',
+    '',
+  ].join('\n');
+  const d1Dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-enospc-link-'));
+  const d1Preload = path.join(d1Dir, 'fail-record-link.mjs');
+  fs.writeFileSync(d1Preload, LINK_ENOSPC_PRELOAD);
+  const d1Env = {
+    NODE_OPTIONS: [process.env.NODE_OPTIONS, `--import ${pathToFileURL(d1Preload).href}`].filter(Boolean).join(' '),
+  };
+
+  const d1Url = 'https://chatgpt.com/c/mock-215-r3-d1-linkback-fails';
+  const d1Modal = "You're making requests too quickly. [#215 skeptic r3 D1 fixture]";
+  const d1Foreign = 'pg-run-another-run-215r3d1';
+  const d1HealthyText = `ChatGPT\n${d1Foreign}\nAnother run's conversation, fully rendered, no limiter in sight.\n`;
+  const d1Title = 'pro-gate review: PR #215 skeptic r3 D1 [pro-gate]';
+  const [d1Observed, d1Newer] = await r3Generations(d1Url, d1Modal, d1Foreign);
+
+  const homeD1 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedOrganizer(MARKER, d1Title)(homeD1);             // no memo url -> no scratch recovery path
+  const d1RecordPath = throttleSeenRecordPath(homeD1, d1Url, d1Modal);
+  fs.mkdirSync(throttleSeenDir(homeD1), { recursive: true });
+  fs.writeFileSync(d1RecordPath, d1Observed, { flag: 'wx' });
+  // Age the observed generation a full minute, well past this filesystem's 4 ms mtime resolution,
+  // so the replacement below is a mismatch however the identity is computed: this fixture is about
+  // what the retire does with a mismatch, not about how it detects one.
+  fs.utimesSync(d1RecordPath, r3Stamp(60), r3Stamp(60));
+  let d1Replaced = false;
+  const cdpD1a = await mockCdp('__NO_TABS__', [{ id: 'd1tab', url: d1Url }], {
+    tabText: () => d1HealthyText,
+    onEvaluate: (id, expression) => {
+      if (d1Replaced || id !== 'd1tab' || !expression.includes('pro-gate:review-text')) return;
+      d1Replaced = true;
+      // Another process charges a FRESH cooldown for this URL inside the scan's read window: the
+      // record it observed is gone and a newer one holds the name.
+      fs.unlinkSync(d1RecordPath);
+      fs.writeFileSync(d1RecordPath, d1Newer, { flag: 'wx' });
+    },
+  });
+  const rD1a = await runSalvageInHome(homeD1, ['--organize', MARKER, '5'], cdpD1a.port, d1Env);
+  cdpD1a.stop();
+  check('#215 skeptic r3 D1 (1) a link-back that cannot be written leaves the newer record on disk instead of destroying it',
+    d1Replaced && !!d1Observed && !!d1Newer
+      && (throttleSeenHas(homeD1, d1Url, d1Modal) || r3Temps(homeD1).length === 1),
+    `replaced=${d1Replaced} staged=${!!d1Observed && !!d1Newer} dir=${JSON.stringify(r3Names(homeD1))} stdout=${rD1a.stdout}`);
+  // The consequence the finding names: the record survives as a reclaimable temp, so the very next
+  // invocation still recognizes that unchanged modal and charges no second account cooldown.
+  const cdpD1b = await mockCdp('__NO_TABS__', [{ id: 'd1tab', url: d1Url }], {
+    tabText: () => r3Text(d1Foreign, d1Modal),
+    throttleModal: () => d1Modal,
+  });
+  const rD1b = await runSalvageInHome(homeD1, [MARKER, '3'], cdpD1b.port);
+  cdpD1b.stop();
+  check('#215 skeptic r3 D1 (2) the preserved record is reclaimed on the next invocation, so the unchanged modal charges no second cooldown',
+    rD1b.cooldown === null && rD1b.status !== 5 && throttleSeenHas(homeD1, d1Url, d1Modal),
+    `status=${rD1b.status} cooldown=${JSON.stringify(rD1b.cooldown)} dir=${JSON.stringify(r3Names(homeD1))} stderr=${rD1b.stderr?.slice(-300)}`);
+  fs.rmSync(homeD1, { recursive: true, force: true });
+  fs.rmSync(d1Dir, { recursive: true, force: true });
+}
+
+{ // #215 skeptic r3 D2/D3 (bin/cdp-salvage.mjs pruneThrottleSeen): the retire's rename-first design
+  // has a window in which the record exists ONLY as `<name>.retire.<pid>` — and nothing ever
+  // reclaimed one left behind there. A kill, an OOM, a power loss or (before D1 above) a failed
+  // link-back between the rename and the link-back therefore freed the name permanently:
+  // throttleAlreadyCharged is an exact-name existsSync, so the next scan read that fingerprint as
+  // new and charged a second account cooldown for an unchanged modal. Worse, pruneThrottleSeen
+  // counted those temps as records: a directory at THROTTLE_SEEN_MAX could evict a LIVE record
+  // (oldest mtime first) while keeping an orphan that gates nothing at all.
+  // Fixed in the one place that already walks this directory once per invocation: prune first
+  // adopts every `*.retire.*` temp whose base name is free (link it back, then drop the temp) and
+  // drops the rest, and counts none of them toward capacity. The generation snapshot and the retire
+  // loop skip those names too, so a temp is never mistaken for a record.
+  const d2Url = 'https://chatgpt.com/c/mock-215-r3-d2-orphaned-temp';
+  const d2Modal = "You're making requests too quickly. [#215 skeptic r3 D2 fixture]";
+  const d2Foreign = 'pg-run-another-run-215r3d2';
+  const d2ThrottledText = r3Text(d2Foreign, d2Modal);
+
+  // (1) The abort itself: a temp whose base name is free is the record, and it comes back.
+  const homeD2a = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  fs.mkdirSync(throttleSeenDir(homeD2a), { recursive: true });
+  fs.writeFileSync(`${throttleSeenRecordPath(homeD2a, d2Url, d2Modal)}.retire.987654`, `${d2Url}\n`);
+  const cdpD2a = await mockCdp('__NO_TABS__', [{ id: 'd2tab', url: d2Url }], {
+    tabText: () => d2ThrottledText,
+    throttleModal: () => d2Modal,
+  });
+  const rD2a = await runSalvageInHome(homeD2a, [MARKER, '3'], cdpD2a.port);
+  cdpD2a.stop();
+  check('#215 skeptic r3 D2 (1) an orphaned retire temp whose base name is free is adopted, and its fingerprint reads charged again',
+    rD2a.cooldown === null && rD2a.status !== 5
+      && throttleSeenHas(homeD2a, d2Url, d2Modal) && r3Temps(homeD2a).length === 0,
+    `status=${rD2a.status} cooldown=${JSON.stringify(rD2a.cooldown)} dir=${JSON.stringify(r3Names(homeD2a))} stderr=${rD2a.stderr?.slice(-300)}`);
+  fs.rmSync(homeD2a, { recursive: true, force: true });
+
+  // (2) The other direction: the name was retaken while the temp sat there, so the record now at
+  // that name already carries the same "charged" meaning and the temp is redundant — dropped, not
+  // accumulated until the TTL happens to reach it.
+  const homeD2b = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedThrottleSeenCurrent(homeD2b, d2Url, d2Modal);
+  fs.writeFileSync(`${throttleSeenRecordPath(homeD2b, d2Url, d2Modal)}.retire.987654`, `${d2Url}\n`);
+  const cdpD2b = await mockCdp('__NO_TABS__', [{ id: 'd2tab', url: d2Url }], {
+    tabText: () => d2ThrottledText,
+    throttleModal: () => d2Modal,
+  });
+  const rD2b = await runSalvageInHome(homeD2b, [MARKER, '3'], cdpD2b.port);
+  cdpD2b.stop();
+  check('#215 skeptic r3 D2 (2) an orphaned retire temp whose base name is taken is dropped, not left to accumulate',
+    r3Temps(homeD2b).length === 0 && throttleSeenHas(homeD2b, d2Url, d2Modal),
+    `status=${rD2b.status} dir=${JSON.stringify(r3Names(homeD2b))} stderr=${rD2b.stderr?.slice(-300)}`);
+  fs.rmSync(homeD2b, { recursive: true, force: true });
+
+  // (3) D3: a temp must never be COUNTED. With the cap at one record, an orphan beside a live
+  // record made the capacity trim evict the LIVE one (older mtime first) and keep the orphan — a
+  // record that still gates a cooldown deleted in favour of a file that gates nothing.
+  const d3Url = 'https://chatgpt.com/c/mock-215-r3-d3-capacity';
+  const d3Modal = "You're making requests too quickly. [#215 skeptic r3 D3 fixture]";
+  const d3Foreign = 'pg-run-another-run-215r3d3';
+  const d3LiveUrl = 'https://chatgpt.com/c/mock-215-r3-d3-live-elsewhere';
+  const d3LiveModal = "You're making requests too quickly. [#215 skeptic r3 D3 live record]";
+  const homeD3 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  // The live record belongs to a URL this scan never observes, so it is not protectedKeys-exempt
+  // from the capacity trim — the only shape in which that trim can reach a live record at all.
+  seedThrottleSeenCurrent(homeD3, d3LiveUrl, d3LiveModal);
+  const d3LiveRecord = throttleSeenRecordPath(homeD3, d3LiveUrl, d3LiveModal);
+  fs.utimesSync(d3LiveRecord, r3Stamp(3600), r3Stamp(3600));        // oldest -> the trim's first pick
+  fs.writeFileSync(`${d3LiveRecord}.retire.987654`, `${d3LiveUrl}\n`);   // its base name is taken
+  const cdpD3 = await mockCdp('__NO_TABS__', [{ id: 'd3tab', url: d3Url }], {
+    tabText: () => r3Text(d3Foreign, d3Modal),
+    throttleModal: () => d3Modal,
+  });
+  const rD3 = await runSalvageInHome(homeD3, [MARKER, '3'], cdpD3.port,
+    { PRO_GATE_THROTTLE_SEEN_MAX: '1' });
+  cdpD3.stop();
+  check('#215 skeptic r3 D3 with THROTTLE_SEEN_MAX=1 a retire temp never counts toward capacity and evicts a live record',
+    throttleSeenHas(homeD3, d3LiveUrl, d3LiveModal) && r3Temps(homeD3).length === 0,
+    `status=${rD3.status} dir=${JSON.stringify(r3Names(homeD3))} stderr=${rD3.stderr?.slice(-300)}`);
+  fs.rmSync(homeD3, { recursive: true, force: true });
+}
+
+{ // #215 skeptic r3 D4 (bin/cdp-salvage.mjs snapshotThrottleSeenGenerations): (ino, mtimeMs) is not
+  // a generation. The mtime resolution reachable here is 4 ms, and ext4 hands a freed inode
+  // straight back to the next create in the same directory — so another process deleting a record
+  // and creating its replacement inside a single tick presents the EXACT pair the snapshot saw. The
+  // retire then reads its own older observation as still current and deletes a record it knows
+  // nothing about, which is precisely the delete the generation guard exists to prevent.
+  // Fixed by writing a random nonce on a second content line at creation and comparing that too. A
+  // record written before this change has no nonce line and compares as '' on both sides — exactly
+  // the (ino, mtimeMs) behaviour it had before, so an unchanged one is still retired — while every
+  // replacement this build writes carries one and can therefore never be confused with it. That is
+  // the pairing this fixture stages, and it is also the state every live box is in the first time
+  // it runs this build.
+  const d4Url = 'https://chatgpt.com/c/mock-215-r3-d4-same-ino-same-mtime';
+  const d4Modal = "You're making requests too quickly. [#215 skeptic r3 D4 fixture]";
+  const d4Foreign = 'pg-run-another-run-215r3d4';
+  const d4HealthyText = `ChatGPT\n${d4Foreign}\nAnother run's conversation, fully rendered, no limiter in sight.\n`;
+  const d4Title = 'pro-gate review: PR #215 skeptic r3 D4 [pro-gate]';
+  const [d4Observed, d4Newer] = await r3Generations(d4Url, d4Modal, d4Foreign);
+  const homeD4 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedOrganizer(MARKER, d4Title)(homeD4);
+  const d4RecordPath = throttleSeenRecordPath(homeD4, d4Url, d4Modal);
+  fs.mkdirSync(throttleSeenDir(homeD4), { recursive: true });
+  fs.writeFileSync(d4RecordPath, d4Observed, { flag: 'wx' });
+  const d4Stamp = r3Stamp(60);
+  fs.utimesSync(d4RecordPath, d4Stamp, d4Stamp);
+  const d4ObservedStat = fs.statSync(d4RecordPath);
+  let d4Replaced = false;
+  let d4Collided = false;
+  let d4Attempts = 0;
+  let d4ReplacedStat = null;
+  const cdpD4 = await mockCdp('__NO_TABS__', [{ id: 'd4tab', url: d4Url }], {
+    tabText: () => d4HealthyText,
+    onEvaluate: (id, expression) => {
+      if (d4Replaced || id !== 'd4tab' || !expression.includes('pro-gate:review-text')) return;
+      d4Replaced = true;
+      // Force the collision the finding turns on: recreate the record until the create lands back
+      // on the freed inode, then stamp the observed mtime onto it. ext4 reuses that inode on the
+      // first attempt in practice; the bound only keeps a filesystem that does not from spinning.
+      do {
+        try { fs.unlinkSync(d4RecordPath); } catch {}
+        fs.writeFileSync(d4RecordPath, d4Newer, { flag: 'wx' });
+        fs.utimesSync(d4RecordPath, d4Stamp, d4Stamp);
+        d4Attempts += 1;
+        d4ReplacedStat = fs.statSync(d4RecordPath);
+        d4Collided = d4ReplacedStat.ino === d4ObservedStat.ino;
+      } while (!d4Collided && d4Attempts < 25);
+    },
+  });
+  const rD4 = await runSalvageInHome(homeD4, ['--organize', MARKER, '5'], cdpD4.port);
+  cdpD4.stop();
+  // Stated as its own check, because the finding is only REACHED when the two generations are
+  // genuinely indistinguishable by (ino, mtimeMs). If this one ever goes red, the check below it
+  // proves nothing — rather than passing vacuously on a filesystem that never reused the inode.
+  check('#215 skeptic r3 D4 (precondition) the recreated record reused the freed inode and carries the observed mtime',
+    d4Replaced && d4Collided && d4ReplacedStat?.mtimeMs === d4ObservedStat.mtimeMs,
+    `replaced=${d4Replaced} collided=${d4Collided} attempts=${d4Attempts} ino=${d4ObservedStat.ino} mtime=${d4ObservedStat.mtimeMs}`);
+  const d4Survivor = throttleSeenHas(homeD4, d4Url, d4Modal) ? fs.readFileSync(d4RecordPath) : null;
+  check('#215 skeptic r3 D4 a record replaced behind an identical (ino, mtime) survives on the strength of its nonce',
+    !!d4Newer && !!d4Survivor && d4Survivor.equals(d4Newer) && r3Temps(homeD4).length === 0,
+    `dir=${JSON.stringify(r3Names(homeD4))} survivor=${JSON.stringify(d4Survivor?.toString())} newer=${JSON.stringify(d4Newer?.toString())} stdout=${rD4.stdout}`);
+  fs.rmSync(homeD4, { recursive: true, force: true });
+}
+
+{ // #215 skeptic r3 D7 (bin/cdp-salvage.mjs retireThrottleSeenRecord): coverage for the branch every
+  // check above leans on and none of them drives on its own terms — a generation mismatch whose
+  // link-back SUCCEEDS. #215 gate r3 P2 (1) proves a record created after the snapshot survives, but
+  // that record is absent from the snapshot and so is never renamed at all; this drives a record
+  // that IS in the snapshot, is renamed to the temp, and is then put back because the generation
+  // under its name changed. The replacement must end up under its own name, as itself, with no temp
+  // left behind. D1 above is this same interleave with the link-back broken, so its surviving temp
+  // is the positive evidence that this fixture reaches the branch rather than skipping the retire.
+  const d7Url = 'https://chatgpt.com/c/mock-215-r3-d7-mismatch-restores';
+  const d7Modal = "You're making requests too quickly. [#215 skeptic r3 D7 fixture]";
+  const d7Foreign = 'pg-run-another-run-215r3d7';
+  const d7HealthyText = `ChatGPT\n${d7Foreign}\nAnother run's conversation, fully rendered, no limiter in sight.\n`;
+  const d7Title = 'pro-gate review: PR #215 skeptic r3 D7 [pro-gate]';
+  const [d7Observed, d7Newer] = await r3Generations(d7Url, d7Modal, d7Foreign);
+  const homeD7 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedOrganizer(MARKER, d7Title)(homeD7);
+  const d7RecordPath = throttleSeenRecordPath(homeD7, d7Url, d7Modal);
+  fs.mkdirSync(throttleSeenDir(homeD7), { recursive: true });
+  fs.writeFileSync(d7RecordPath, d7Observed, { flag: 'wx' });
+  // A minute of separation, far past the 4 ms mtime resolution this filesystem actually offers, so
+  // the replacement is a mismatch by mtime alone as well as by nonce.
+  const d7Stamp = r3Stamp(60);
+  fs.utimesSync(d7RecordPath, d7Stamp, d7Stamp);
+  let d7Replaced = false;
+  const cdpD7 = await mockCdp('__NO_TABS__', [{ id: 'd7tab', url: d7Url }], {
+    tabText: () => d7HealthyText,
+    onEvaluate: (id, expression) => {
+      if (d7Replaced || id !== 'd7tab' || !expression.includes('pro-gate:review-text')) return;
+      d7Replaced = true;
+      fs.unlinkSync(d7RecordPath);
+      fs.writeFileSync(d7RecordPath, d7Newer, { flag: 'wx' });
+    },
+  });
+  const rD7 = await runSalvageInHome(homeD7, ['--organize', MARKER, '5'], cdpD7.port);
+  cdpD7.stop();
+  const d7Survivor = throttleSeenHas(homeD7, d7Url, d7Modal) ? fs.statSync(d7RecordPath) : null;
+  check('#215 skeptic r3 D7 a mismatched generation is restored under its own name, leaving no retire temp behind',
+    d7Replaced && !!d7Survivor && d7Survivor.mtimeMs > d7Stamp * 1000 && r3Temps(homeD7).length === 0,
+    `replaced=${d7Replaced} dir=${JSON.stringify(r3Names(homeD7))} mtime=${d7Survivor?.mtimeMs} stamp=${d7Stamp * 1000} stdout=${rD7.stdout}`);
+  fs.rmSync(homeD7, { recursive: true, force: true });
+}
+
+
 process.exit(failures === 0 ? 0 : 1);
