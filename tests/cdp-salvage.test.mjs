@@ -5077,4 +5077,151 @@ for (const placeholder of PLACEHOLDER_URLS) {
   }
 }
 
+{ // #206 gate r8 P2 finding B: rememberUrl()'s MEMO_KEEP eviction used to prune the oldest
+  // memos with no regard for whether the marker's reservation was still retained (states
+  // generating or superseded) -- so a memo that is a superseded run's ONLY recovery handle
+  // could be evicted purely because 200 other memos happen to be newer. Eviction must protect
+  // any memo whose marker still has a reservation file, and the cap must apply only to the
+  // unprotected remainder.
+  const seedMemoCohort = (entries) => (home) => { // entries: oldest-first [{marker, protectedMarker}]
+    const dir = path.join(home, 'conversation-urls');
+    fs.mkdirSync(dir, { recursive: true });
+    const resDir = path.join(home, 'in-progress');
+    entries.forEach(({ marker: m, protectedMarker }, i) => {
+      const f = path.join(dir, m);
+      fs.writeFileSync(f, 'https://chatgpt.com/c/seed-placeholder\n');
+      const t = new Date(1700099000000 + i * 1000);
+      fs.utimesSync(f, t, t);
+      if (protectedMarker) {
+        fs.mkdirSync(resDir, { recursive: true });
+        fs.writeFileSync(path.join(resDir, m), 'seed-reservation\n');
+      }
+    });
+  };
+  const newAnswer = (m) => [
+    `run marker: ${m}`, 'P1: none', 'P2: none', 'P3: none',
+    `VERDICT: SHIP — ours. (run marker: ${m})`,
+  ].join('\n');
+
+  {
+    // MEMO_KEEP+1 pre-seeded (1 protected, oldest of all, + 200 unprotected), then one more
+    // rememberUrl publication for a brand-new marker. Unprotected count goes 200 -> 201, so
+    // exactly one eviction happens; it must take the oldest UNPROTECTED memo, never the
+    // protected one, even though the protected one is chronologically the very oldest.
+    const PROTECTED = 'pg-run-memo-cap-protected-1700099000-1';
+    const unprotected = Array.from({ length: 200 }, (_, i) => `pg-run-memo-cap-u-${i}-1700099000-1`);
+    const cohort = [{ marker: PROTECTED, protectedMarker: true }, ...unprotected.map((m) => ({ marker: m }))];
+    const NEW_MARKER = 'pg-run-memo-cap-new-1700099500-9';
+    const cdp = await mockCdp(newAnswer(NEW_MARKER));
+    const r = await runSalvage([NEW_MARKER, '20'], cdp.port, seedMemoCohort(cohort));
+    const memoSet = new Set(r.memos);
+    check('finding B: a protected marker survives MEMO_KEEP eviction even though it is the oldest memo',
+      memoSet.has(PROTECTED), `memos.length=${r.memos.length} stderr=${r.stderr?.slice(-300)}`);
+    check('finding B: the oldest UNPROTECTED memo is the one evicted, its neighbor and the new memo survive',
+      !memoSet.has(unprotected[0]) && memoSet.has(unprotected[1]) && memoSet.has(NEW_MARKER),
+      `memos.length=${r.memos.length} evicted0=${memoSet.has(unprotected[0])} kept1=${memoSet.has(unprotected[1])} new=${memoSet.has(NEW_MARKER)}`);
+    check('finding B: total memo count is MEMO_KEEP+1 (1 protected + 200 unprotected) after the one eviction',
+      r.memos.length === 201, `memos.length=${r.memos.length}`);
+    cdp.stop();
+  }
+  {
+    // Boundary: exactly MEMO_KEEP (200) unprotected entries after the new write evicts nothing,
+    // even though the directory total (201) exceeds MEMO_KEEP once the protected entry is
+    // counted -- protected entries never count toward the cap.
+    const PROTECTED = 'pg-run-memo-cap-protected-b-1700099000-1';
+    const unprotected = Array.from({ length: 199 }, (_, i) => `pg-run-memo-cap-ub-${i}-1700099000-1`);
+    const cohort = [{ marker: PROTECTED, protectedMarker: true }, ...unprotected.map((m) => ({ marker: m }))];
+    const NEW_MARKER = 'pg-run-memo-cap-newb-1700099500-9';
+    const cdp = await mockCdp(newAnswer(NEW_MARKER));
+    const r = await runSalvage([NEW_MARKER, '20'], cdp.port, seedMemoCohort(cohort));
+    const memoSet = new Set(r.memos);
+    check('finding B boundary: exactly MEMO_KEEP unprotected entries evicts nothing',
+      memoSet.has(PROTECTED) && unprotected.every((m) => memoSet.has(m)) && memoSet.has(NEW_MARKER)
+        && r.memos.length === 201,
+      `memos.length=${r.memos.length} stderr=${r.stderr?.slice(-300)}`);
+    cdp.stop();
+  }
+}
+
+{ // #216 gate r1 P2: RESERVATION_DIR must honor PRO_GATE_RESERVATION_DIR the same way
+  // lib/pro-gate-lib.sh's pg_reservation_dir() does (its sibling constants COMPLETED_DIR and
+  // COOLDOWN_FILE already read `process.env.PRO_GATE_X ?? path.join(PG_HOME, ...)`). When an
+  // operator or test relocates reservations via that override, a hardcoded PG_HOME/in-progress
+  // check never finds the real reservation file, every memo reads as unprotected, and finding
+  // B's eviction bug reappears under that configuration.
+  const customResDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-resdir-override-'));
+  const seedMemoCohortCustomResDir = (entries) => (home) => { // reservation files go in customResDir, not home
+    const dir = path.join(home, 'conversation-urls');
+    fs.mkdirSync(dir, { recursive: true });
+    entries.forEach(({ marker: m, protectedMarker }, i) => {
+      const f = path.join(dir, m);
+      fs.writeFileSync(f, 'https://chatgpt.com/c/seed-placeholder\n');
+      const t = new Date(1700099000000 + i * 1000);
+      fs.utimesSync(f, t, t);
+      if (protectedMarker) fs.writeFileSync(path.join(customResDir, m), 'seed-reservation\n');
+    });
+  };
+  const newAnswer = (m) => [
+    `run marker: ${m}`, 'P1: none', 'P2: none', 'P3: none',
+    `VERDICT: SHIP — ours. (run marker: ${m})`,
+  ].join('\n');
+
+  const PROTECTED = 'pg-run-resdir-protected-1700099000-1';
+  const unprotected = Array.from({ length: 200 }, (_, i) => `pg-run-resdir-u-${i}-1700099000-1`);
+  const cohort = [{ marker: PROTECTED, protectedMarker: true }, ...unprotected.map((m) => ({ marker: m }))];
+  const NEW_MARKER = 'pg-run-resdir-new-1700099500-9';
+  const cdp = await mockCdp(newAnswer(NEW_MARKER));
+  const r = await runSalvage([NEW_MARKER, '20'], cdp.port, seedMemoCohortCustomResDir(cohort),
+    { PRO_GATE_RESERVATION_DIR: customResDir });
+  const memoSet = new Set(r.memos);
+  check('PRO_GATE_RESERVATION_DIR override: a protected marker under the relocated reservation dir survives MEMO_KEEP eviction',
+    memoSet.has(PROTECTED), `memos.length=${r.memos.length} stderr=${r.stderr?.slice(-300)}`);
+  cdp.stop();
+  fs.rmSync(customResDir, { recursive: true, force: true });
+}
+
+{ // #216 gate r1 P2 (paid review, finding at bin/cdp-salvage.mjs:207): an EMPTY
+  // PRO_GATE_RESERVATION_DIR disabled retained-memo protection outright. The shell's
+  // pg_reservation_dir() is "${PRO_GATE_RESERVATION_DIR:-$PRO_GATE_HOME/in-progress}", which
+  // falls back on empty as well as unset; JavaScript's `??` did not, so RESERVATION_DIR stayed
+  // '', path.join('', marker) resolved against the process's working directory, every existsSync
+  // missed, and every retained reservation read as unprotected -- finding B's eviction bug, back
+  // under one configuration. The control for this is the non-empty override check above.
+  const seedMemoCohortHomeReservations = (entries) => (home) => {
+    const dir = path.join(home, 'conversation-urls');
+    fs.mkdirSync(dir, { recursive: true });
+    const resDir = path.join(home, 'in-progress');
+    entries.forEach(({ marker: m, protectedMarker }, i) => {
+      const f = path.join(dir, m);
+      fs.writeFileSync(f, 'https://chatgpt.com/c/seed-placeholder\n');
+      const t = new Date(1700099000000 + i * 1000);
+      fs.utimesSync(f, t, t);
+      if (protectedMarker) {
+        fs.mkdirSync(resDir, { recursive: true });
+        fs.writeFileSync(path.join(resDir, m), 'seed-reservation\n');
+      }
+    });
+  };
+  const newAnswer = (m) => [
+    `run marker: ${m}`, 'P1: none', 'P2: none', 'P3: none',
+    `VERDICT: SHIP — ours. (run marker: ${m})`,
+  ].join('\n');
+
+  const PROTECTED = 'pg-run-resdir-empty-protected-1700099000-1';
+  const unprotected = Array.from({ length: 200 }, (_, i) => `pg-run-resdir-empty-u-${i}-1700099000-1`);
+  const cohort = [{ marker: PROTECTED, protectedMarker: true }, ...unprotected.map((m) => ({ marker: m }))];
+  const NEW_MARKER = 'pg-run-resdir-empty-new-1700099500-9';
+  const cdp = await mockCdp(newAnswer(NEW_MARKER));
+  const r = await runSalvage([NEW_MARKER, '20'], cdp.port, seedMemoCohortHomeReservations(cohort),
+    { PRO_GATE_RESERVATION_DIR: '' });
+  const memoSet = new Set(r.memos);
+  check("#216 gate r1 P2: an EMPTY PRO_GATE_RESERVATION_DIR falls back to PRO_GATE_HOME/in-progress like the shell, so a protected marker still survives eviction",
+    memoSet.has(PROTECTED), `memos.length=${r.memos.length} stderr=${r.stderr?.slice(-300)}`);
+  check("#216 gate r1 P2: the empty override still evicts the oldest UNPROTECTED memo",
+    !memoSet.has(unprotected[0]) && memoSet.has(unprotected[1]) && memoSet.has(NEW_MARKER)
+      && r.memos.length === 201,
+    `memos.length=${r.memos.length} evicted0=${memoSet.has(unprotected[0])} kept1=${memoSet.has(unprotected[1])}`);
+  cdp.stop();
+}
+
 process.exit(failures === 0 ? 0 : 1);

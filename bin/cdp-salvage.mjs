@@ -158,10 +158,19 @@ const RENDER_SAMPLE_MS = TEST_TIMING_ENABLED
   ? (parseTestRenderSampleMs(process.env.PRO_GATE_TEST_RENDER_SAMPLE_MS) ?? 2_500)
   : 2_500;
 
-const PG_HOME = process.env.PRO_GATE_HOME ?? path.join(os.homedir(), '.pro-review-daemon');
+// #216 gate r1 P2: every PRO_GATE_* path override this file reads has a shell twin spelled
+// "${VAR:-<default>}" (pro-gate-lib.sh: PRO_GATE_HOME line 6, pg_cooldown_active,
+// pg_completed_dir, pg_reservation_dir), and that form falls back on EMPTY as well as on unset.
+// `??` did not: an empty override survived as the path, so path.join('', name) resolved relative
+// to the process's working directory and the two languages silently disagreed about where the
+// state lives. For RESERVATION_DIR that disagreement was a live defect -- every existsSync missed,
+// so every retained reservation read as unprotected and finding B's memo eviction came back under
+// that one configuration. One rule for all of them rather than a guard at each reader.
+const envPath = (name, ...fallback) => process.env[name] || path.join(...fallback);
+const PG_HOME = envPath('PRO_GATE_HOME', os.homedir(), '.pro-review-daemon');
 const BLACKLIST_FILE = path.join(PG_HOME, 'salvage-nonmatching.txt');
 // honor the same override pg_health_gate reads, or a detected throttle would never defer runs
-const COOLDOWN_FILE = process.env.PRO_GATE_COOLDOWN_FILE ?? path.join(PG_HOME, 'throttle.cooldown');
+const COOLDOWN_FILE = envPath('PRO_GATE_COOLDOWN_FILE', PG_HOME, 'throttle.cooldown');
 // #208: an abandoned modal on an UNOWNED tab (another run's stale conversation) is account-wide
 // throttle evidence just like our own, but nothing ever closes that tab or clears its modal — so
 // a caller that waits out seconds_remaining and retries has the sweep re-detect the exact same
@@ -194,9 +203,13 @@ const THROTTLE_SEEN_MAX = Number(process.env.PRO_GATE_THROTTLE_SEEN_MAX) || 512;
 // match (probe included) and read before we ever conclude "not found".
 const URL_MEMO_DIR = path.join(PG_HOME, 'conversation-urls');
 const TITLE_MEMO_DIR = path.join(PG_HOME, 'conversation-titles');
-const COMPLETED_DIR = process.env.PRO_GATE_COMPLETED_DIR ?? path.join(PG_HOME, 'completed');
+const COMPLETED_DIR = envPath('PRO_GATE_COMPLETED_DIR', PG_HOME, 'completed');
 const PENDING_DIR = path.join(PG_HOME, 'pending');
-const MEMO_KEEP = 200;                  // newest N memos retained; older ones are pruned on write
+// #206 gate r8 P2 finding B: a marker's reservation record (the shell lib's pg_reservation_dir,
+// states include generating and superseded) is the proof its memo is still someone's only
+// recovery handle. rememberUrl()'s eviction below reads this by existence only.
+const RESERVATION_DIR = envPath('PRO_GATE_RESERVATION_DIR', PG_HOME, 'in-progress');
+const MEMO_KEEP = 200;                  // newest N unprotected memos retained; older ones are pruned on write
 // #208 gate r1 P1: a stale unowned tab can legitimately fingerprint under TWO different hashes
 // across invocations (modal text vs. whole-page text) when a marker-less interstitial also
 // carries a throttle modal — the two trip sites used to disagree on which text to hash. Every
@@ -422,11 +435,23 @@ function rememberUrl(m, url) {
     fs.renameSync(tmp, f);
     const entries = fs.readdirSync(URL_MEMO_DIR);
     if (entries.length > MEMO_KEEP) {
-      entries
+      // #206 gate r8 P2 finding B: a memo whose marker still has a retained reservation
+      // (in-progress/<marker>) is a durable recovery handle for a superseded-but-uncollected
+      // run, not churn -- evicting it on a later publication's write could leave that run with
+      // NEITHER an open tab (a `--close` of the marker can have taken it) NOR a memo. The cap
+      // applies only to UNPROTECTED entries; protected entries never count toward it and are
+      // never removed. A missing in-progress/ directory protects nothing (fail-open to the
+      // pre-existing behavior). One existsSync per candidate, and only because the cap is
+      // already known to be exceeded.
+      const unprotected = entries
+        .filter((n) => { try { return !fs.existsSync(path.join(RESERVATION_DIR, n)); } catch { return true; } })
         .map((n) => { try { return { n, t: fs.statSync(path.join(URL_MEMO_DIR, n)).mtimeMs }; } catch { return { n, t: 0 }; } })
-        .sort((a, b) => b.t - a.t)
-        .slice(MEMO_KEEP)
-        .forEach(({ n }) => { try { fs.unlinkSync(path.join(URL_MEMO_DIR, n)); } catch {} });
+        .sort((a, b) => b.t - a.t);
+      if (unprotected.length > MEMO_KEEP) {
+        unprotected
+          .slice(MEMO_KEEP)
+          .forEach(({ n }) => { try { fs.unlinkSync(path.join(URL_MEMO_DIR, n)); } catch {} });
+      }
     }
   } catch {}
 }
