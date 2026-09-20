@@ -3524,7 +3524,20 @@ pg_attempt_disposition_sweep
 # #50 item 4: conversation-urls memos get the same time-based hygiene as every other state
 # dir. 14 days dwarfs every recovery window (reservation TTL 6h; pending/ holds real bytes)
 # while still covering late manual recovery of a weeks-old run.
-find "$PRO_GATE_HOME/conversation-urls" -maxdepth 1 -type f -mmin +20160 -delete 2>/dev/null || true
+# #206 gate r2 follow-up P2: an unconditional sweep here deleted a retained-but-uncollected
+# reservation's memo on mtime alone -- pg_reservation_reconcile() explicitly retains a
+# superseded reservation forever (its memo is the ONLY durable handle for an optional
+# --harvest), and nothing else on this clock ever frees that record, so a memo swept out from
+# under it can never be recalled again. Mirror the protection rememberUrl()'s MEMO_KEEP
+# eviction already gives the same memo class: skip deleting one whose marker still has an
+# in-progress/ reservation file, whatever its state. A missing in-progress/ directory protects
+# nothing (fail-open to the pre-existing sweep).
+_pg_res_dir="$(pg_reservation_dir)"
+find "$PRO_GATE_HOME/conversation-urls" -maxdepth 1 -type f -mmin +20160 -print 2>/dev/null \
+  | while IFS= read -r _pg_memo; do
+      [ -e "$_pg_res_dir/$(basename "$_pg_memo")" ] && continue
+      rm -f "$_pg_memo" 2>/dev/null || true
+    done
 # #170: cross-bind sidecars are on the SAME 14-day clock, for the same reason. They used to
 # self-clear — any later salvage unlinked one whose scan found nothing — but that "cleanup" was
 # the bug: a blacklisted marker's URLs are skipped before they can be re-classified, so the
