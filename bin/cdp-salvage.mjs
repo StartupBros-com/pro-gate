@@ -448,12 +448,28 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function isThrottlePage(text) {
   return !!text && text.length < 5000 && !FOREIGN_MARKER_RE.test(text) && THROTTLE_RE.test(text);
 }
-function recordThrottle(where) {
+// #208 gate r6 P2: fingerprint records recordThrottleSeen creates below are provisional until the
+// cooldown they gate actually lands — tracked here so a failed or interrupted write can be rolled
+// back instead of leaving a "seen" record with no cooldown behind it, which would suppress that
+// sighting forever. Always drained by the very next recordThrottle call: every charging site in
+// this file is synchronous between creating a record and publishing the cooldown it gates.
+let pendingThrottleSeenRecords = [];
+function recordThrottle(where) {  // -> true when the cooldown was actually written
   try {
     fs.mkdirSync(PG_HOME, { recursive: true });
     fs.writeFileSync(COOLDOWN_FILE, `${new Date().toISOString()} ${where}\n`);
-  } catch {}
+  } catch {
+    // The sighting is real even though the write failed; do not claim otherwise on stderr, and do
+    // not let a record already committed by recordThrottleSeen outlive this failure — roll back
+    // every fingerprint this charge provisionally created so it stays re-chargeable on a later
+    // scan instead of silently suppressed by a "seen" record with no cooldown behind it.
+    for (const recordPath of pendingThrottleSeenRecords.splice(0)) { try { fs.unlinkSync(recordPath); } catch {} }
+    console.error(`ChatGPT throttle interstitial detected (${where}) but the cooldown could not be written to ${COOLDOWN_FILE} — leaving the sighting re-chargeable, NOT suppressed.`);
+    return false;
+  }
+  pendingThrottleSeenRecords.length = 0;
   console.error(`ChatGPT throttle interstitial detected (${where}) — cooldown written to ${COOLDOWN_FILE}. Back off; do NOT resubmit.`);
+  return true;
 }
 // #208: sha256 of the modal/page text, not the raw text — the sidecar never persists scraped
 // conversation content to disk, only a fingerprint of it.
@@ -522,7 +538,12 @@ function throttleAlreadyCharged(url, hash, protectedKeys) {
 function recordThrottleSeen(url, hash) {  // -> true when THIS call may charge the sighting
   try {
     fs.mkdirSync(THROTTLE_SEEN_DIR, { recursive: true });
-    fs.writeFileSync(throttleSeenRecordPath(url, hash), '', { flag: 'wx' });
+    const recordPath = throttleSeenRecordPath(url, hash);
+    fs.writeFileSync(recordPath, '', { flag: 'wx' });
+    // #208 gate r6 P2: this record is provisional — the 'wx' create still has to win the race
+    // BEFORE the cooldown it gates is attempted (it remains the sole race arbiter), but it must
+    // not outlive a failed publish. recordThrottle rolls it back if that write fails.
+    pendingThrottleSeenRecords.push(recordPath);
     return true;
   } catch (err) {
     // EEXIST: another invocation won the race for this exact fingerprint between the caller's
@@ -1162,7 +1183,21 @@ async function openOrganizerScratch(url) {
       const [text, throttleModal] = await Promise.all([tabText(live), tabThrottleModal(live)]);
       if (!text) continue;
       // #162: the modal is throttle evidence too; organizer traffic must stop on either form.
-      if (isThrottlePage(text) || throttleModal) return { target: live, reason: 'throttle' };
+      // #208 gate r6 P2: carry back enough for the caller to apply the same unowned gate every
+      // other throttle trip site in this file uses — an interstitial can never be owned
+      // (isThrottlePage's own construction excludes any marker at all, ours or foreign); a
+      // modal's underlying page can still carry this run's exact marker beneath it.
+      if (isThrottlePage(text) || throttleModal) {
+        const owned = !!throttleModal && hasExactMarker(text, marker);
+        return {
+          target: live,
+          reason: 'throttle',
+          throttleUrl: url,
+          throttleHashText: throttleModal ?? text,
+          throttleOwned: owned,
+          throttleForeign: !owned && FOREIGN_MARKER_RE.test(text),
+        };
+      }
       if (hasExactMarker(text, marker)) {
         const ownership = mutationOwnership(text);
         return ownership.owned
@@ -1373,7 +1408,16 @@ async function organizeConversation() {
     if (nonMatching.has(recoveryUrl)) return { ...result, reason: 'provenance-rejected' };
     const scratch = await openOrganizerScratch(recoveryUrl);
     if (!scratch.text || !scratch.target) {
-      if (scratch.reason === 'throttle') recordThrottle('organizer scratch');
+      // #208 gate r6 P2: an OWNED sighting (our own marker under the modal) still always
+      // re-arms unconditionally; an unowned one routes through the same central gate every
+      // other unowned trip in this file uses, so an already-charged repeat surfaced through
+      // scratch recovery cannot re-arm the cooldown.
+      if (scratch.reason === 'throttle') {
+        if (scratch.throttleOwned
+            || tripThrottleUnowned(scratch.throttleUrl, scratch.throttleHashText, 'organizer scratch', scratch.throttleForeign)) {
+          recordThrottle('organizer scratch');
+        }
+      }
       if (scratch.target?.id) await closeTab(scratch.target.id);
       return { ...result, reason: scratch.reason };
     }
@@ -1919,9 +1963,14 @@ while (Date.now() < deadline) {
           if (probe) emitEvidence(seedUrl, owned);
           console.error(`remembered conversation recovered (${seedUrl}) but no VERDICT yet; waiting...`);
         }
-      } else if (evidence.kind === 'foreign') {
+      } else if (evidence.kind === 'foreign' || (evidence.kind === 'throttle' && evidence.foreign)) {
         // Decisive the other way: the memo points at ANOTHER run's conversation (stale or
-        // corrupt). Only this justifies treating the remembered handle as worthless.
+        // corrupt) — proven either directly (kind: 'foreign') or, #208 gate r6 P1, by a
+        // throttle modal painted over that other run's marker (kind: 'throttle', foreign:
+        // true). tripThrottleEvidence above already decided whether this sighting re-arms
+        // the cooldown (new) or was ignored as an already-charged repeat; either way it is
+        // still positive proof the memo is stale, and a markerless repeat (foreign: false)
+        // must NOT land here — that stays inconclusive below instead.
         memoStale = true;
         console.error(`remembered conversation ${seedUrl} carries a DIFFERENT run's marker — stale memo, ignoring it`);
       } else {

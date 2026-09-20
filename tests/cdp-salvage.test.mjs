@@ -4307,6 +4307,155 @@ const FOREIGN_ANSWER = (m) => [
   fs.rmSync(homeDefault, { recursive: true, force: true });
 }
 
+{ // #209 gate r6 P1 (bin/cdp-salvage.mjs:626, finding 1): a CLOSED remembered URL's scratch
+  // render shows ANOTHER run's marker beneath an ALREADY-RECORDED modal — classifyEvidence
+  // returns { kind: 'throttle', foreign: true }. tripThrottleEvidence's early return (already
+  // charged; no NEW cooldown, no exit(5)) is correct, but the remembered-render caller only ever
+  // routed `kind: 'foreign'` into the stale-memo branch, so this positive foreign evidence never
+  // marked the memo stale: knownUrl stayed the same dead foreign URL forever, and every LATER
+  // probe re-rendered it and hit the generic "inconclusive, re-rendered Nx" exit (7) instead of
+  // ever converging on confirmed-absent (4).
+  const modalText1 = "You're making requests too quickly. [r6 P1 remembered-render fixture]";
+  const foreignPageText1 = `ChatGPT\npg-run-another-run-777\n${modalText1}\nAnother run's conversation beneath the modal.\n`;
+  const seedUrl1 = 'https://chatgpt.com/c/mock-remembered-foreign-r6';
+
+  const home1 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedMemo(MARKER, seedUrl1)(home1);
+  // The (url, modal-text) fingerprint is already charged by an earlier scan — this is what
+  // forces tripThrottleUnowned's early return at bin/cdp-salvage.mjs:626 instead of a fresh
+  // exit(5); the bug is what happens to the evidence object AFTER that early return.
+  seedThrottleSeen(home1, seedUrl1, modalText1);
+
+  const cdp1 = await mockCdp('__NO_TABS__', [], {
+    renderText: () => foreignPageText1,
+    throttleModal: () => modalText1,
+  });
+  const r1 = await runSalvageInHome(home1, [MARKER, '3'], cdp1.port, SCRATCH_SAMPLE_TEST_ENV);
+  cdp1.stop();
+  check('#209 gate r6 P1 (1) an already-recorded foreign modal beneath the remembered URL does not take the throttle exit',
+    r1.status !== 5, `status=${r1.status}`);
+  check('#209 gate r6 P1 (1) an already-recorded foreign modal beneath the remembered URL reaches confirmed-absent, not stuck inconclusive',
+    r1.status === 4, `status=${r1.status} stderr=${r1.stderr?.slice(-400)}`);
+  check('#209 gate r6 P1 (1) the memo is reported stale on stderr',
+    /stale memo/.test(r1.stderr || ''), `stderr=${r1.stderr?.slice(-400)}`);
+  fs.rmSync(home1, { recursive: true, force: true });
+
+  // Planted negative: the same already-recorded-modal shape but MARKERLESS (no run marker, ours
+  // or foreign, anywhere on the underlying page) must stay inconclusive (7) as before — a bare
+  // repeat interstitial is rate-limit noise, not positive proof the memo belongs to someone else.
+  const modalText1b = "You're making requests too quickly. [r6 P1 markerless remembered-render fixture]";
+  const markerlessPageText1 = `ChatGPT\n${modalText1b}\nNo run marker anywhere on this page.\n`;
+  const seedUrl1b = 'https://chatgpt.com/c/mock-remembered-markerless-r6';
+
+  const home1b = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedMemo(MARKER, seedUrl1b)(home1b);
+  seedThrottleSeen(home1b, seedUrl1b, modalText1b);
+
+  const cdp1b = await mockCdp('__NO_TABS__', [], {
+    renderText: () => markerlessPageText1,
+    throttleModal: () => modalText1b,
+  });
+  const r1b = await runSalvageInHome(home1b, [MARKER, '3'], cdp1b.port, SCRATCH_SAMPLE_TEST_ENV);
+  cdp1b.stop();
+  check('#209 gate r6 P1 planted negative: an already-recorded MARKERLESS modal stays inconclusive (7), not confirmed-absent',
+    r1b.status === 7, `status=${r1b.status} stderr=${r1b.stderr?.slice(-400)}`);
+  check('#209 gate r6 P1 planted negative: the memo is NOT reported stale',
+    !/stale memo/.test(r1b.stderr || ''), `stderr=${r1b.stderr?.slice(-400)}`);
+  fs.rmSync(home1b, { recursive: true, force: true });
+}
+
+{ // #209 gate r6 P2 (bin/cdp-salvage.mjs:1309, finding 2): openOrganizerScratch's throttle
+  // return used to carry no ownership information at all, so the caller called
+  // recordThrottle('organizer scratch') UNCONDITIONALLY whenever a scratch render hit any
+  // throttle surface — an already-charged, unowned sighting recovered through scratch could
+  // re-arm the cooldown every single scan. Fixed by carrying the scratch result's url,
+  // fingerprint text and ownership back and applying the same central unowned gate every other
+  // throttle trip site in this file already uses.
+  const title2 = 'pro-gate review: PR #208 organizer scratch r6 [pro-gate]';
+  const recoveryUrl2 = 'https://chatgpt.com/c/organizer-scratch-r6';
+  const scratchModalText2 = "You're making requests too quickly. [r6 P2 organizer scratch fixture]";
+
+  // (a) Unowned: the scratch render's underlying page carries ANOTHER run's marker, and this
+  // exact (url, modal-text) fingerprint was already charged by an earlier scan.
+  const homeA = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedOrganizer(MARKER, title2, recoveryUrl2)(homeA);
+  seedThrottleSeen(homeA, recoveryUrl2, scratchModalText2);
+  const foreignScratchText2 = `ChatGPT\npg-run-someone-elses-run-999\n${scratchModalText2}\nAnother run's conversation.\n`;
+  const cdpA = await mockCdp('__NO_TABS__', [], {
+    renderText: () => foreignScratchText2,
+    throttleModal: () => scratchModalText2,
+  });
+  const rA = await runSalvageInHome(homeA, ['--organize', MARKER, '5'], cdpA.port);
+  cdpA.stop();
+  check('#209 gate r6 P2 (2) organizer scratch: an unowned already-charged sighting still reports reason=throttle',
+    /reason=throttle/.test(rA.stdout), `stdout=${rA.stdout} stderr=${rA.stderr?.slice(0, 400)}`);
+  check('#209 gate r6 P2 (2) organizer scratch: an unowned already-charged sighting does NOT re-arm the cooldown',
+    rA.cooldown === null, `cooldown=${rA.cooldown}`);
+  fs.rmSync(homeA, { recursive: true, force: true });
+
+  // (b) Owned: the scratch render's underlying page carries THIS run's own marker beneath the
+  // modal — always re-arms unconditionally, even though nothing was ever pre-charged.
+  const ownedScratchText2 = `ChatGPT\nrun marker: ${MARKER}\n${scratchModalText2}\nOur own conversation.\n`;
+  const homeB = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedOrganizer(MARKER, title2, recoveryUrl2)(homeB);
+  const cdpB = await mockCdp('__NO_TABS__', [], {
+    renderText: () => ownedScratchText2,
+    throttleModal: () => scratchModalText2,
+  });
+  const rB = await runSalvageInHome(homeB, ['--organize', MARKER, '5'], cdpB.port);
+  cdpB.stop();
+  check('#209 gate r6 P2 (2) organizer scratch: an owned sighting still reports reason=throttle',
+    /reason=throttle/.test(rB.stdout), `stdout=${rB.stdout} stderr=${rB.stderr?.slice(0, 400)}`);
+  check('#209 gate r6 P2 (2) organizer scratch: an owned sighting always re-arms the cooldown',
+    rB.cooldown !== null && /organizer scratch/.test(rB.cooldown), `cooldown=${rB.cooldown}`);
+  fs.rmSync(homeB, { recursive: true, force: true });
+}
+
+{ // #209 gate r6 P2 (bin/cdp-salvage.mjs:525, finding 3): the fingerprint record was committed
+  // (recordThrottleSeen's 'wx' create) before the cooldown was ever attempted (recordThrottle).
+  // A failed or interrupted cooldown write left that record behind with no cooldown to show for
+  // it, silently suppressing the sighting forever. Force the write to fail deterministically
+  // (independent of uid/permissions) by pointing PRO_GATE_COOLDOWN_FILE at a path that already
+  // exists as a DIRECTORY — fs.writeFileSync on it always throws EISDIR — at a path distinct
+  // from the real default cooldown file, so a later unblocked scan can still write it for real.
+  const staleUrl3 = 'https://chatgpt.com/c/mock-cooldown-write-fail';
+  const modalText3 = "You're making requests too quickly. [r6 P2 cooldown-write-fail fixture]";
+  const home3 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const blockedCooldownPath = path.join(home3, 'blocked-cooldown-r6');
+  fs.mkdirSync(blockedCooldownPath, { recursive: true });
+
+  const cdp3a = await mockCdp('__NO_TABS__', [{ id: 'fail1', url: staleUrl3 }], {
+    tabText: () => modalText3,
+    throttleModal: () => modalText3,
+  });
+  const rFirst = await runSalvageInHome(home3, [MARKER, '3'], cdp3a.port,
+    { PRO_GATE_COOLDOWN_FILE: blockedCooldownPath });
+  cdp3a.stop();
+  check('#209 gate r6 P2 (3) a genuinely new unowned sighting still takes the throttle exit even when the cooldown write fails',
+    rFirst.status === 5, `status=${rFirst.status} stderr=${rFirst.stderr?.slice(-400)}`);
+  check('#209 gate r6 P2 (3) a failed cooldown write is reported on stderr, not claimed as a success',
+    /could not be written/.test(rFirst.stderr || '') && !/cooldown written to/.test(rFirst.stderr || ''),
+    `stderr=${rFirst.stderr?.slice(-500)}`);
+  check('#209 gate r6 P2 (3) the fingerprint record is rolled back, not left behind, after the failed write',
+    !throttleSeenHas(home3, staleUrl3, modalText3),
+    `throttleSeen=${fs.existsSync(throttleSeenDir(home3)) ? fs.readdirSync(throttleSeenDir(home3)) : null}`);
+
+  // Second scan of the SAME unchanged tab, this time with the real cooldown path unblocked: the
+  // sighting must be re-chargeable (not permanently suppressed by an orphaned "seen" record),
+  // and this time the write actually succeeds.
+  const cdp3b = await mockCdp('__NO_TABS__', [{ id: 'fail1', url: staleUrl3 }], {
+    tabText: () => modalText3,
+    throttleModal: () => modalText3,
+  });
+  const rSecond = await runSalvageInHome(home3, [MARKER, '3'], cdp3b.port);
+  cdp3b.stop();
+  check('#209 gate r6 P2 (3) the same unchanged sighting is re-chargeable on a later scan instead of suppressed forever',
+    rSecond.status === 5, `status=${rSecond.status} stderr=${rSecond.stderr?.slice(-400)}`);
+  check('#209 gate r6 P2 (3) the later, unblocked scan actually writes the real cooldown file',
+    rSecond.cooldown !== null && /modal over tab/.test(rSecond.cooldown), `cooldown=${rSecond.cooldown}`);
+  fs.rmSync(home3, { recursive: true, force: true });
+}
+
 // v0.42 (#109): a synthetic placeholder such as https://chatgpt.com/c/WEB:<uuid> once passed the
 // prefix-only memo check, was remembered as authoritative, and parked its run forever: the page
 // behind it carries no marker, so every later pass was inconclusive and never counted a miss.
