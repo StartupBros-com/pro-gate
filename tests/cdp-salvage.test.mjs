@@ -6076,4 +6076,208 @@ async function r3Generations(url, modal, foreign) {
 }
 
 
+// --- #215 gate r4 P2 (paid review, round 4) ---------------------------------------------------
+// Three findings against the throttle-modal dedupe store, all the same shape: a charged
+// fingerprint was dropped — or adopted too late to be dropped — on evidence that never proved the
+// conversation had recovered, so the limiter's next appearance charged a SECOND account cooldown
+// for one unchanged episode. That is the #208 livelock these records exist to prevent.
+{ // (1) bin/cdp-salvage.mjs scanThrottleHealth: a LOADING or LOGIN shell is not health evidence.
+  // A successful text read returning `ChatGPT\nLoading…` (or a login wall) beside a successful
+  // dialog read that finds no dialog satisfied "healthy": non-empty text, no modal. The scan then
+  // retired that URL's charged fingerprints with nothing having rendered — and during a reload or
+  // an incomplete hydration the same limiter reappears immediately afterwards and charges another
+  // cooldown. Fixed by requiring the same readiness the memo renders already require before a URL
+  // may enter healthyUrls (isRenderedConversation: a run marker is on the page); loading, login
+  // and error shells are unknown, exactly as an unreadable tab is.
+  const p1Foreign = 'pg-run-another-run-215r4p1';
+  const p1Shells = [
+    ['loading', 'ChatGPT\nLoading…\n'],
+    ['login', 'ChatGPT\nLog in\nSign up\nLog in to continue.\n'],
+  ];
+  for (const [p1Label, p1ShellText] of p1Shells) {
+    const p1Url = `https://chatgpt.com/c/mock-215-r4-p1-${p1Label}-shell`;
+    const p1Modal = `You're making requests too quickly. [#215 gate r4 P2 (1) ${p1Label} fixture]`;
+    const p1Throttled = r3Text(p1Foreign, p1Modal);
+    const homeP1 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+
+    const cdpP1a = await mockCdp('__NO_TABS__', [{ id: 'r4p1tab', url: p1Url }], {
+      tabText: () => p1Throttled,
+      throttleModal: () => p1Modal,
+    });
+    const rP1a = await runSalvageInHome(homeP1, [MARKER, '3'], cdpP1a.port);
+    cdpP1a.stop();
+    check(`#215 gate r4 P2 (1) [${p1Label}] the first sighting of the unowned modal charges its fingerprint`,
+      rP1a.status === 5 && throttleSeenHas(homeP1, p1Url, p1Modal),
+      `status=${rP1a.status} dir=${JSON.stringify(r3Names(homeP1))} stderr=${rP1a.stderr?.slice(-300)}`);
+
+    // The shell itself: the text read SUCCEEDS and returns the shell, the dialog read SUCCEEDS and
+    // finds nothing. Both reads are healthy-looking; neither says the conversation came back.
+    const cooldownP1 = path.join(homeP1, 'throttle.cooldown');
+    ageCooldown215(cooldownP1);
+    const mtimeP1BeforeShell = fs.statSync(cooldownP1).mtimeMs;
+    const cdpP1b = await mockCdp('__NO_TABS__', [{ id: 'r4p1tab', url: p1Url }], {
+      tabText: () => p1ShellText,
+    });
+    const rP1b = await runSalvageInHome(homeP1, [MARKER, '3'], cdpP1b.port);
+    cdpP1b.stop();
+    const mtimeP1AfterShell = fs.statSync(cooldownP1).mtimeMs;
+    check(`#215 gate r4 P2 (1) [${p1Label}] a ${p1Label} shell is not proof the conversation recovered: the charged fingerprint survives`,
+      throttleSeenHas(homeP1, p1Url, p1Modal),
+      `status=${rP1b.status} dir=${JSON.stringify(r3Names(homeP1))} stderr=${rP1b.stderr?.slice(-300)}`);
+    check(`#215 gate r4 P2 (1) [${p1Label}] the ${p1Label}-shell scan writes no cooldown of its own`,
+      mtimeP1AfterShell === mtimeP1BeforeShell,
+      `before=${mtimeP1BeforeShell} after=${mtimeP1AfterShell}`);
+
+    // The consequence the finding names: the identical modal a moment later is the SAME episode.
+    const mtimeP1BeforeReturn = fs.statSync(cooldownP1).mtimeMs;
+    const cdpP1c = await mockCdp('__NO_TABS__', [{ id: 'r4p1tab', url: p1Url }], {
+      tabText: () => p1Throttled,
+      throttleModal: () => p1Modal,
+    });
+    const rP1c = await runSalvageInHome(homeP1, [MARKER, '3'], cdpP1c.port);
+    cdpP1c.stop();
+    const mtimeP1AfterReturn = fs.statSync(cooldownP1).mtimeMs;
+    check(`#215 gate r4 P2 (1) [${p1Label}] the identical modal after a ${p1Label} shell charges no second cooldown`,
+      rP1c.status !== 5 && mtimeP1AfterReturn === mtimeP1BeforeReturn,
+      `status=${rP1c.status} before=${mtimeP1BeforeReturn} after=${mtimeP1AfterReturn} stderr=${rP1c.stderr?.slice(-300)}`);
+    fs.rmSync(homeP1, { recursive: true, force: true });
+  }
+
+  // Control, the other direction: a RENDERED conversation (another run's marker with its message
+  // text beneath it, no limiter anywhere) is still health evidence and still retires. Without this
+  // the fix could have been written as "never retire" and every check above would still pass.
+  const p1CtlUrl = 'https://chatgpt.com/c/mock-215-r4-p1-rendered-control';
+  const p1CtlModal = "You're making requests too quickly. [#215 gate r4 P2 (1) control fixture]";
+  const p1CtlRendered = `ChatGPT\n${p1Foreign}\nAnother run's conversation, fully rendered, no limiter in sight.\n`;
+  const homeP1Ctl = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const cdpP1Ctl1 = await mockCdp('__NO_TABS__', [{ id: 'r4p1ctl', url: p1CtlUrl }], {
+    tabText: () => r3Text(p1Foreign, p1CtlModal),
+    throttleModal: () => p1CtlModal,
+  });
+  const rP1Ctl1 = await runSalvageInHome(homeP1Ctl, [MARKER, '3'], cdpP1Ctl1.port);
+  cdpP1Ctl1.stop();
+  const cdpP1Ctl2 = await mockCdp('__NO_TABS__', [{ id: 'r4p1ctl', url: p1CtlUrl }], {
+    tabText: () => p1CtlRendered,
+  });
+  const rP1Ctl2 = await runSalvageInHome(homeP1Ctl, [MARKER, '3'], cdpP1Ctl2.port);
+  cdpP1Ctl2.stop();
+  check('#215 gate r4 P2 (1) control: a rendered conversation with no limiter over it still retires that URL\'s fingerprint',
+    rP1Ctl1.status === 5 && !throttleSeenHas(homeP1Ctl, p1CtlUrl, p1CtlModal),
+    `first=${rP1Ctl1.status} second=${rP1Ctl2.status} dir=${JSON.stringify(r3Names(homeP1Ctl))}`);
+  fs.rmSync(homeP1Ctl, { recursive: true, force: true });
+}
+
+{ // (2) bin/cdp-salvage.mjs tripThrottleUnownedBatch / pruneThrottleSeen: eviction protection was
+  // rebuilt at the charge site from the CHARGEABLE hits alone. A tab whose dialog read SUCCEEDS
+  // while its text read FAILS is a throttle surface for health purposes (skeptic r2 D2 pins that
+  // divergence as intended) and is deliberately excluded from the charge batch — so its
+  // fingerprint reached the one-shot prune unprotected. Another tab's already-charged interstitial
+  // triggers that prune, the TTL evicts the still-visible modal's record, and the moment the first
+  // tab's text becomes readable again the unchanged modal charges a second cooldown. Fixed by
+  // protecting every fingerprint any observation in this invocation actually saw, not just the
+  // ones it could charge.
+  const p2UrlA = 'https://chatgpt.com/c/mock-215-r4-p2-unreadable-text';
+  const p2UrlB = 'https://chatgpt.com/c/mock-215-r4-p2-prune-trigger';
+  const p2Modal = "You're making requests too quickly. [#215 gate r4 P2 (2) fixture]";
+  const p2Foreign = 'pg-run-another-run-215r4p2';
+  const p2TextA = r3Text(p2Foreign, p2Modal);
+  const p2TextB = "You're making requests too quickly. [#215 gate r4 P2 (2) prune trigger]";
+  const homeP2 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  // A's record was charged over a week ago: inside the TTL window nothing is evictable at all and
+  // the finding cannot be reached.
+  seedThrottleSeenCurrent(homeP2, p2UrlA, p2Modal);
+  const p2RecordA = throttleSeenRecordPath(homeP2, p2UrlA, p2Modal);
+  const p2Aged = r3Stamp(8 * 24 * 60 * 60);
+  fs.utimesSync(p2RecordA, p2Aged, p2Aged);
+  // B is an ordinary already-charged interstitial. Its only job is to reach throttleAlreadyCharged
+  // and fire this invocation's one-shot prune without charging anything itself.
+  seedThrottleSeenCurrent(homeP2, p2UrlB, p2TextB);
+
+  const cdpP2a = await mockCdp('__NO_TABS__', [
+    { id: 'r4p2-a', url: p2UrlA },
+    { id: 'r4p2-b', url: p2UrlB },
+  ], {
+    tabText: (url, id) => (id === 'r4p2-b' ? p2TextB : p2TextA),
+    tabTextFails: (id) => id === 'r4p2-a',
+    throttleModal: (id) => (id === 'r4p2-a' ? p2Modal : null),
+  });
+  const rP2a = await runSalvageInHome(homeP2, [MARKER, '3'], cdpP2a.port);
+  cdpP2a.stop();
+  check('#215 gate r4 P2 (2) (precondition) the prune-triggering tab is already charged and charges nothing of its own',
+    rP2a.status !== 5 && rP2a.cooldown === null,
+    `status=${rP2a.status} cooldown=${JSON.stringify(rP2a.cooldown)} stderr=${rP2a.stderr?.slice(-300)}`);
+  check('#215 gate r4 P2 (2) an observed modal whose text read failed survives the prune another tab triggers',
+    throttleSeenHas(homeP2, p2UrlA, p2Modal),
+    `dir=${JSON.stringify(r3Names(homeP2))} stderr=${rP2a.stderr?.slice(-300)}`);
+
+  // The consequence: with that tab readable again the modal is unchanged and already charged, so
+  // it must not re-arm the account cooldown.
+  const cdpP2b = await mockCdp('__NO_TABS__', [{ id: 'r4p2-a', url: p2UrlA }], {
+    tabText: () => p2TextA,
+    throttleModal: () => p2Modal,
+  });
+  const rP2b = await runSalvageInHome(homeP2, [MARKER, '3'], cdpP2b.port);
+  cdpP2b.stop();
+  check('#215 gate r4 P2 (2) once that tab reads again the unchanged modal charges no new cooldown',
+    rP2b.status !== 5 && rP2b.cooldown === null,
+    `status=${rP2b.status} cooldown=${JSON.stringify(rP2b.cooldown)} dir=${JSON.stringify(r3Names(homeP2))}`);
+  fs.rmSync(homeP2, { recursive: true, force: true });
+}
+
+{ // (3) bin/cdp-salvage.mjs adoptThrottleSeenOrphans: an orphaned `<key>.retire.<pid>` temp was
+  // reclaimed only by the one-shot TTL/capacity prune, and a decisively HEALTHY scan never calls
+  // it — the generation snapshot and the retire loop both skip temps, so the observation that
+  // proved the conversation had recovered left the old charge intact under its temporary name.
+  // The scan that met the NEXT throttle episode then adopted it just in time to report that new
+  // episode as already charged, and no cooldown was written for a live limiter. Fixed by running
+  // adoption as its own pass at the start of every scan and every memo render, before the
+  // generation snapshot is taken.
+  const p3Url = 'https://chatgpt.com/c/mock-215-r4-p3-orphan-then-healthy';
+  const p3Modal = "You're making requests too quickly. [#215 gate r4 P2 (3) fixture]";
+  const p3Foreign = 'pg-run-another-run-215r4p3';
+  const p3Rendered = `ChatGPT\n${p3Foreign}\nAnother run's conversation, fully rendered, no limiter in sight.\n`;
+  const homeP3 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  fs.mkdirSync(throttleSeenDir(homeP3), { recursive: true });
+  fs.writeFileSync(`${throttleSeenRecordPath(homeP3, p3Url, p3Modal)}.retire.987654`, `${p3Url}\n`);
+  const cdpP3a = await mockCdp('__NO_TABS__', [{ id: 'r4p3tab', url: p3Url }], {
+    tabText: () => p3Rendered,
+  });
+  const rP3a = await runSalvageInHome(homeP3, [MARKER, '3'], cdpP3a.port);
+  cdpP3a.stop();
+  check('#215 gate r4 P2 (3) a healthy-only scan adopts an orphaned retire temp and retires it with the rest',
+    !throttleSeenHas(homeP3, p3Url, p3Modal) && r3Temps(homeP3).length === 0,
+    `status=${rP3a.status} dir=${JSON.stringify(r3Names(homeP3))} stderr=${rP3a.stderr?.slice(-300)}`);
+  check('#215 gate r4 P2 (3) that healthy-only scan writes no cooldown of its own',
+    rP3a.cooldown === null, `status=${rP3a.status} cooldown=${JSON.stringify(rP3a.cooldown)}`);
+  const cdpP3b = await mockCdp('__NO_TABS__', [{ id: 'r4p3tab', url: p3Url }], {
+    tabText: () => r3Text(p3Foreign, p3Modal),
+    throttleModal: () => p3Modal,
+  });
+  const rP3b = await runSalvageInHome(homeP3, [MARKER, '3'], cdpP3b.port);
+  cdpP3b.stop();
+  check('#215 gate r4 P2 (3) throttling returning after that observed recovery charges a NEW cooldown',
+    rP3b.status === 5 && (rP3b.cooldown ?? '').length > 0,
+    `status=${rP3b.status} cooldown=${JSON.stringify(rP3b.cooldown)} stderr=${rP3b.stderr?.slice(-300)}`);
+  fs.rmSync(homeP3, { recursive: true, force: true });
+
+  // Control: the same orphan, but this scan still finds the modal. Adoption must RECLAIM the
+  // record rather than drop it, so the unchanged modal is still recognized and charges nothing —
+  // the D2 guarantee, now reached one pass earlier.
+  const homeP3Ctl = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  fs.mkdirSync(throttleSeenDir(homeP3Ctl), { recursive: true });
+  fs.writeFileSync(`${throttleSeenRecordPath(homeP3Ctl, p3Url, p3Modal)}.retire.987654`, `${p3Url}\n`);
+  const cdpP3c = await mockCdp('__NO_TABS__', [{ id: 'r4p3tab', url: p3Url }], {
+    tabText: () => r3Text(p3Foreign, p3Modal),
+    throttleModal: () => p3Modal,
+  });
+  const rP3c = await runSalvageInHome(homeP3Ctl, [MARKER, '3'], cdpP3c.port);
+  cdpP3c.stop();
+  check('#215 gate r4 P2 (3) control: an orphan adopted by a still-throttled scan suppresses the repeat',
+    rP3c.status !== 5 && rP3c.cooldown === null
+      && throttleSeenHas(homeP3Ctl, p3Url, p3Modal) && r3Temps(homeP3Ctl).length === 0,
+    `status=${rP3c.status} cooldown=${JSON.stringify(rP3c.cooldown)} dir=${JSON.stringify(r3Names(homeP3Ctl))}`);
+  fs.rmSync(homeP3Ctl, { recursive: true, force: true });
+}
+
+
 process.exit(failures === 0 ? 0 : 1);

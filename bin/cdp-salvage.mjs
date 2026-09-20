@@ -448,6 +448,29 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function isThrottlePage(text) {
   return !!text && text.length < 5000 && !FOREIGN_MARKER_RE.test(text) && THROTTLE_RE.test(text);
 }
+// #215 gate r4 P2 (1): "a conversation actually rendered here" — the ONE readiness test the
+// throttle dedupe's health side and both memo renders share, so the two cannot drift apart.
+// chatgpt.com answers a conversation URL with a SHELL long before it answers with the
+// conversation: `ChatGPT\nLoading…` during a reload, a login wall after a session expires, an
+// error page, or the history sidebar alone all come back as perfectly good non-empty text with no
+// limiter dialog over them. scanThrottleHealth used to count any non-empty text as health, so one
+// of those shells retired the charged fingerprints of a conversation nobody had observed recover
+// — and the same limiter reappearing a moment later then charged a SECOND cooldown for one
+// unchanged episode: the #208 livelock, reached through a reload instead of a read failure.
+// The test is exactly the one freshRenderText and openOrganizerScratch already reach their
+// DECISIVE reasons by (marker-found, foreign-marker, ok, stale-memo): a pro-gate run marker is on
+// the page. FOREIGN_MARKER_RE matches ANY run marker, this run's included (#215 gate r1 P1), so
+// this reads "some pro-gate conversation rendered here" — the only rendered conversation content
+// this engine can recognize with certainty from page text alone, and the same evidence
+// readReviewText's turn scoping recognizes structurally when it finds the marker's user turn.
+// Deliberate trade: a conversation carrying no run marker at all (one of the operator's own chats,
+// left open at a URL that once showed the limiter) is never counted as health evidence, so its
+// fingerprints are retired by the TTL alone. That is under-retire, the safe direction this file
+// takes everywhere — it can suppress a repeat sighting, never re-arm a live 900s account cooldown,
+// which is the failure this whole file exists to avoid.
+function isRenderedConversation(text) {
+  return !!text && text.trim() !== '' && FOREIGN_MARKER_RE.test(text);
+}
 // #208 gate r6 P2: fingerprint records recordThrottleSeen creates below are provisional until the
 // cooldown they gate actually lands — tracked here so a failed or interrupted write can be rolled
 // back instead of leaving a "seen" record with no cooldown behind it, which would suppress that
@@ -502,49 +525,84 @@ function throttleSeenRecordPath(url, hash) {
 // #215 skeptic r3 D2/D3: the infix retireThrottleSeenRecord below names its temp with. A temp is
 // NEVER a record: it is a record mid-removal, and every walk of this directory has to say so.
 const THROTTLE_RETIRE_INFIX = '.retire.';
-let throttleSeenPruned = false;
-function pruneThrottleSeen(protectedKeys = new Set()) {
+// #215 gate r4 P2 (2): every throttle-surface fingerprint an observation in THIS invocation has
+// actually seen. scanThrottleHealth fills it as it classifies each listed tab; the prune below
+// honours it on top of whatever its caller passes.
+// Eviction protection used to be rebuilt at each charge site from that site's CHARGEABLE hits
+// alone — and the health pass deliberately recognizes MORE throttle surfaces than the charge path
+// does: a tab whose dialog read succeeded but whose text read failed or came back empty is a
+// throttle surface for health purposes and is excluded from the charge batch (skeptic r2 D2), so
+// its fingerprint reached the prune unprotected. Any other tab's charge then fired the one-shot
+// prune, the TTL or the capacity trim evicted that still-visible modal's record, and the moment
+// its text became readable again the unchanged modal charged a second cooldown.
+// Accumulated here rather than threaded through the two scan call sites on purpose: the main scan
+// is a polling LOOP and the prune fires on whichever iteration first finds a chargeable hit, so an
+// EARLIER iteration's observations have to survive it too — and the trip sites that never see a
+// scanHealth at all (the organizer's scratch render, every tripThrottleEvidence caller) are then
+// covered by the same set instead of by another argument each of them has to remember to pass.
+const observedThrottleSeenKeys = new Set();
+// #215 skeptic r3 D2: a retire renames the record to `<name>.retire.<pid>` BEFORE deciding what
+// it took (see retireThrottleSeenRecord), so there is a window in which the record exists only
+// under that temp name. A kill, an OOM, a power loss or a failed link-back inside that window
+// used to free the record's name forever: "already charged" is an exact-name existsSync, so the
+// next scan read the unchanged modal as new and charged a SECOND account cooldown — the #208
+// livelock, reached through an abort. So an orphan is reclaimed here: a temp whose base name is
+// free IS the record and is linked back under it; a temp whose base name is taken is redundant
+// (the record sitting there already carries the same "charged" meaning) and is dropped. A link
+// failure other than EEXIST leaves the temp alone for the next invocation to retry, exactly as
+// D1 leaves it — losing the only copy is the one outcome that costs a cooldown.
+// Racing a LIVE retire can only adopt a record back that the retire was legitimately removing:
+// one suppressed repeat, never a double-charged cooldown, which is the safe direction this file
+// takes everywhere. There is no protectedKeys argument — adoption never deletes a record, and the
+// fingerprint a scan is about to check is exactly the one worth reclaiming.
+//
+// #215 gate r4 P2 (3): its own pass, run at the start of every scan and every memo render (see
+// beginThrottleObservation) rather than riding the one-shot TTL/capacity prune. Inside that prune
+// it was only ever reached by an invocation that CHARGED something: a decisively healthy scan
+// never calls it, and both the generation snapshot and the healthy-retirement loop skip temps, so
+// an orphan survived the very observation that proved the conversation had recovered — and was
+// adopted only later, by the scan that met the NEXT episode, which then read that new episode as
+// already charged and left a live limiter with no cooldown. Cheap enough to run unconditionally:
+// one readdir, and nothing but a temp is ever touched.
+function adoptThrottleSeenOrphans() {
   let names;
   try { names = fs.readdirSync(THROTTLE_SEEN_DIR); } catch { return; }
-  // #215 skeptic r3 D2: a retire renames the record to `<name>.retire.<pid>` BEFORE deciding what
-  // it took (see retireThrottleSeenRecord), so there is a window in which the record exists only
-  // under that temp name. A kill, an OOM, a power loss or a failed link-back inside that window
-  // used to free the record's name forever: "already charged" is an exact-name existsSync, so the
-  // next scan read the unchanged modal as new and charged a SECOND account cooldown — the #208
-  // livelock, reached through an abort. This is the one pass that already walks this directory
-  // once per invocation, so it is where an orphan is reclaimed: a temp whose base name is free IS
-  // the record and is linked back under it; a temp whose base name is taken is redundant (the
-  // record sitting there already carries the same "charged" meaning) and is dropped. A link
-  // failure other than EEXIST leaves the temp alone for the next invocation to retry, exactly as
-  // D1 leaves it — losing the only copy is the one outcome that costs a cooldown.
-  // Racing a LIVE retire can only adopt a record back that the retire was legitimately removing:
-  // one suppressed repeat, never a double-charged cooldown, which is the safe direction this file
-  // takes everywhere. protectedKeys is deliberately not consulted — adoption never deletes a
-  // record, and the fingerprint a scan is about to check is exactly the one worth reclaiming.
-  const adopted = [];
-  const records = [];
   for (const name of names) {
     const at = name.indexOf(THROTTLE_RETIRE_INFIX);
-    if (at < 0) { records.push(name); continue; }
+    if (at < 0) continue;
     const tempPath = path.join(THROTTLE_SEEN_DIR, name);
     const base = name.slice(0, at);
     if (base) {
       const basePath = path.join(THROTTLE_SEEN_DIR, base);
       if (!fs.existsSync(basePath)) {
-        try { fs.linkSync(tempPath, basePath); adopted.push(base); }
+        try { fs.linkSync(tempPath, basePath); }
         catch (err) { if (err?.code !== 'EEXIST') continue; }   // keep the temp: it is still the record
       }
     }
     try { fs.unlinkSync(tempPath); } catch {}
   }
+}
+let throttleSeenPruned = false;
+function pruneThrottleSeen(protectedKeys = new Set()) {
+  // Every scan and every memo render adopts before it looks (beginThrottleObservation), but a
+  // charge can be reached by a path that made no such observation, and D2's guarantee — an
+  // interrupted retire never frees a record's name for good — must not depend on which path got
+  // here. Adoption is idempotent and touches only temps, so repeating it costs one readdir.
+  adoptThrottleSeenOrphans();
+  let names;
+  try { names = fs.readdirSync(THROTTLE_SEEN_DIR); } catch { return; }
   const now = Date.now();
   const stats = [];
-  // #215 skeptic r3 D3: temps are gone or adopted by now and never appear here, so the capacity
-  // trim can no longer evict a LIVE record (oldest mtime first) to stay under the cap while
-  // keeping an orphan that gates nothing. An adopted record carries the temp's mtime, so the TTL
-  // below still reaches an aged one in this same pass.
-  for (const name of [...records, ...adopted]) {
-    if (protectedKeys.has(name)) continue;
+  // #215 skeptic r3 D3: a temp is NOT a record and is never counted — otherwise the capacity trim
+  // could evict a LIVE record (oldest mtime first) to stay under the cap while keeping an orphan
+  // that gates nothing. Adoption above has already linked back every temp whose base name was
+  // free, and an adopted record carries the temp's mtime, so the TTL below still reaches an aged
+  // one in this same pass.
+  for (const name of names) {
+    if (name.includes(THROTTLE_RETIRE_INFIX)) continue;
+    // #215 gate r4 P2 (2): the caller's own keys AND every fingerprint this invocation has
+    // observed anywhere. Eviction protection is never derived from chargeable hits alone.
+    if (protectedKeys.has(name) || observedThrottleSeenKeys.has(name)) continue;
     const recordPath = path.join(THROTTLE_SEEN_DIR, name);
     let mtimeMs;
     try { ({ mtimeMs } = fs.statSync(recordPath)); } catch { continue; }
@@ -608,6 +666,15 @@ function readThrottleSeenRecord(recordPath) {   // -> { url, nonce }, or null wh
   try { raw = fs.readFileSync(recordPath, 'utf8'); } catch { return null; }
   const lines = raw.split('\n');
   return { url: (lines[0] ?? '').trim(), nonce: (lines[1] ?? '').trim() };
+}
+// #215 gate r4 P2 (3): the single entry point for an observation — adopt orphans, THEN snapshot.
+// Order is the whole point: a record adopted after the snapshot is absent from it, so the retire
+// this observation is about to perform would skip it and leave the old charge on disk to suppress
+// the NEXT episode. Every scan and every memo render calls this instead of snapshotting directly,
+// so a future observation site cannot forget the adoption half.
+function beginThrottleObservation() {
+  adoptThrottleSeenOrphans();
+  return snapshotThrottleSeenGenerations();
 }
 function snapshotThrottleSeenGenerations() {
   const generations = new Map();
@@ -696,10 +763,11 @@ function retireThrottleSeenForHealthyUrls(healthyUrls, protectedKeys = new Set()
 // definition. Every LISTED tab falls into exactly one of three states for its URL:
 //   throttled — a dialog read that SUCCEEDED and found the limiter's copy, or body text still
 //               carrying that copy (THROTTLE_RE, the same regex isThrottlePage tests);
-//   unknown   — the dialog read FAILED, or the text read failed or came back empty: evidence of
-//               nothing, in either direction;
-//   healthy   — the dialog read succeeded and found no dialog, and the text read returned
-//               non-empty text with no limiter copy in it.
+//   unknown   — the dialog read FAILED, or the text read failed, came back empty, or came back a
+//               page that is not a rendered conversation (a loading shell, a login wall, an error
+//               page): evidence of nothing, in either direction;
+//   healthy   — the dialog read succeeded and found no dialog, and the text read returned a
+//               RENDERED CONVERSATION (isRenderedConversation) with no limiter copy in it.
 // A URL is healthy in a scan when at least one tab at it is healthy AND no tab at it is throttled
 // AND no tab at it is unknown. The throttled clause keeps a URL that is both healthy and
 // throttled right now out of the retire set, so a scan can never retire a record it is itself
@@ -748,7 +816,13 @@ function scanThrottleHealth(reads) {
     if (!url) continue;
     if (throttleModal || THROTTLE_RE.test(text ?? '')) {
       throttledUrls.add(url);
-      protectedKeys.add(throttleSeenKey(url, throttleTextHash(throttleModal ?? text)));
+      const observedKey = throttleSeenKey(url, throttleTextHash(throttleModal ?? text));
+      protectedKeys.add(observedKey);
+      // #215 gate r4 P2 (2): and remember it for EVERY prune this invocation may still run, not
+      // only the one this scan's own charge batch happens to trigger. This branch is reached by
+      // tabs the charge path filters out (a readable dialog over an unreadable page), which are
+      // exactly the fingerprints that used to reach the prune unprotected.
+      observedThrottleSeenKeys.add(observedKey);
       continue;
     }
     // unknown: proof of neither throttle nor health — a failed dialog read, or a text read that
@@ -758,7 +832,13 @@ function scanThrottleHealth(reads) {
     // was still on screen in the tab nobody could read — and the next scan that CAN read it
     // charges the unchanged modal a second cooldown. A url one tab could not be read at is not a
     // url this scan proved healthy, so it leaves the retire set exactly as a throttled one does.
-    if (!throttleModalOk || !text || text.trim() === '') { unknownUrls.add(url); continue; }
+    // #215 gate r4 P2 (1): and a successful text read is not health either unless what came back
+    // is a RENDERED CONVERSATION. `ChatGPT\nLoading…`, a login wall and an error page are all
+    // non-empty text with no dialog over them, and treating one as proof the conversation
+    // recovered retired a charged fingerprint on the strength of a page that never rendered — the
+    // limiter then reappears on the reload and charges a second cooldown for the same episode.
+    // Unknown, exactly as an unreadable tab is: this scan proved nothing about that URL.
+    if (!throttleModalOk || !isRenderedConversation(text)) { unknownUrls.add(url); continue; }
     healthyUrls.add(url);
   }
   for (const url of throttledUrls) healthyUrls.delete(url);
@@ -1333,8 +1413,14 @@ async function freshRenderText(url, port, outerDeadline, waitForDecisiveEvidence
           evidence = classifyEvidence(sample, null, throttleModal);
           return { text, reason: 'throttle', evidence }; // interstitial or modal — done
         }
-        if (hasExactMarker(sample, marker)) return { text, reason: 'marker-found', retireSafe }; // ours — done
-        if (FOREIGN_MARKER_RE.test(sample)) return { text, reason: 'foreign-marker', retireSafe }; // provably another run's — done
+        // #215 gate r4 P2 (1): one shared readiness test with the listed-tab health pass. These
+        // two branches ARE isRenderedConversation's disjuncts — only the reason differs — so the
+        // render path and scanThrottleHealth can never disagree about what "it rendered" means.
+        if (isRenderedConversation(sample)) {
+          return hasExactMarker(sample, marker)
+            ? { text, reason: 'marker-found', retireSafe }       // ours — done
+            : { text, reason: 'foreign-marker', retireSafe };    // provably another run's — done
+        }
       }
       // Anything else (shell, pre-hydration, login wall, or a marker-only stale-source render)
       // is NOT an answer: keep sampling and return the last text at the render deadline.
@@ -1546,13 +1632,15 @@ async function openOrganizerScratch(url) {
       // or provably another run's. Only these three branches set it; a login wall, an
       // unhydrated render, a drifted target or any CDP failure decides nothing and must not
       // retire a fingerprint. The caller retires that one URL's records with it.
-      if (hasExactMarker(text, marker)) {
+      // #215 gate r4 P2 (1): the same shared readiness test the listed-tab health pass uses —
+      // these branches ARE isRenderedConversation's disjuncts, and only the reason differs.
+      if (isRenderedConversation(text)) {
+        if (!hasExactMarker(text, marker)) return { target: live, reason: 'stale-memo', healthyUrl: url, retireSafe };
         const ownership = mutationOwnership(text);
         return ownership.owned
           ? { target: live, text, reason: 'ok', healthyUrl: url, retireSafe }
           : { target: live, reason: ownership.reason, healthyUrl: url, retireSafe };
       }
-      if (FOREIGN_MARKER_RE.test(text)) return { target: live, reason: 'stale-memo', healthyUrl: url, retireSafe };
       if (/\b(log in|sign up)\b/i.test(text) && text.length < 10_000) sawLogin = true;
     }
     return { target, reason: sawLogin ? 'login-wall' : 'memo-not-hydrated' };
@@ -1665,7 +1753,7 @@ async function organizeConversation() {
   // #215 gate r3 P2: the record generations this scan's observation covers, snapshotted before it
   // reads a single tab — a record another process creates while these reads are in flight is
   // newer than anything concluded below and must survive the retire.
-  const scanGenerations = snapshotThrottleSeenGenerations();
+  const scanGenerations = beginThrottleObservation();
   const reads = await Promise.all(tabs.map(async (tab) => {
     const [text, modalRead] = await Promise.all([tabText(tab), tabThrottleModalRead(tab)]);
     // #215 skeptic r2 D1: carry whether the dialog READ succeeded, not only what it found, so
@@ -1774,7 +1862,7 @@ async function organizeConversation() {
     }
     if (nonMatching.has(recoveryUrl)) return { ...result, reason: 'provenance-rejected' };
     // #215 gate r3 P2: this render's own generation snapshot, taken before it is opened.
-    const renderGenerations = snapshotThrottleSeenGenerations();
+    const renderGenerations = beginThrottleObservation();
     const scratch = await openOrganizerScratch(recoveryUrl);
     // #215 skeptic r2 D3: a decisive healthy memo render retires exactly the URL it rendered (see
     // retireThrottleSeenForHealthyRender), so a recovered-then-limited-again conversation charges
@@ -2113,7 +2201,7 @@ while (Date.now() < deadline) {
   // costs one evaluate bail per tab, not three, inside probe's fixed budget.
   // #215 gate r3 P2: the record generations this scan's observation covers, snapshotted before it
   // reads a single tab — see retireThrottleSeenForHealthyUrls.
-  const scanGenerations = snapshotThrottleSeenGenerations();
+  const scanGenerations = beginThrottleObservation();
   const reads = await Promise.all(tabs.map(async (tab) => {
     const [text, infrastructureError, modalRead] = await Promise.all([
       tabText(tab), tabTerminalInfrastructure(tab), tabThrottleModalRead(tab),
@@ -2348,7 +2436,7 @@ while (Date.now() < deadline) {
     seededRenders += 1;
     console.error(`no open tab carries "${marker}" — re-rendering the remembered conversation ${seedUrl} (${seededRenders}/${MAX_SEEDED_RENDERS})...`);
     // #215 gate r3 P2: this render's own generation snapshot, taken before it is opened.
-    const renderGenerations = snapshotThrottleSeenGenerations();
+    const renderGenerations = beginThrottleObservation();
     const { text, evidence: renderEvidence, reason: renderReason, retireSafe: renderRetireSafe } =
       await freshRenderText(seedUrl, port, deadline);
     if (text) {
