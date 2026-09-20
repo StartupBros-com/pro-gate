@@ -178,7 +178,7 @@ const PENDING_DIR = path.join(PG_HOME, 'pending');
 // #206 gate r8 P2 finding B: a marker's reservation record (the shell lib's pg_reservation_dir,
 // states include generating and superseded) is the proof its memo is still someone's only
 // recovery handle. rememberUrl()'s eviction below reads this by existence only.
-const RESERVATION_DIR = path.join(PG_HOME, 'in-progress');
+const RESERVATION_DIR = process.env.PRO_GATE_RESERVATION_DIR ?? path.join(PG_HOME, 'in-progress');
 const MEMO_KEEP = 200;                  // newest N unprotected memos retained; older ones are pruned on write
 const MARKER_SAFE_RE = /^pg-run-[A-Za-z0-9.-]+$/;
 // #167: the marker is EXTRACTED case-insensitively everywhere but used to be COMPARED

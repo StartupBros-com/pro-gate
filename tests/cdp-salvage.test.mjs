@@ -3673,4 +3673,41 @@ for (const placeholder of PLACEHOLDER_URLS) {
   }
 }
 
+{ // #216 gate r1 P2: RESERVATION_DIR must honor PRO_GATE_RESERVATION_DIR the same way
+  // lib/pro-gate-lib.sh's pg_reservation_dir() does (its sibling constants COMPLETED_DIR and
+  // COOLDOWN_FILE already read `process.env.PRO_GATE_X ?? path.join(PG_HOME, ...)`). When an
+  // operator or test relocates reservations via that override, a hardcoded PG_HOME/in-progress
+  // check never finds the real reservation file, every memo reads as unprotected, and finding
+  // B's eviction bug reappears under that configuration.
+  const customResDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-resdir-override-'));
+  const seedMemoCohortCustomResDir = (entries) => (home) => { // reservation files go in customResDir, not home
+    const dir = path.join(home, 'conversation-urls');
+    fs.mkdirSync(dir, { recursive: true });
+    entries.forEach(({ marker: m, protectedMarker }, i) => {
+      const f = path.join(dir, m);
+      fs.writeFileSync(f, 'https://chatgpt.com/c/seed-placeholder\n');
+      const t = new Date(1700099000000 + i * 1000);
+      fs.utimesSync(f, t, t);
+      if (protectedMarker) fs.writeFileSync(path.join(customResDir, m), 'seed-reservation\n');
+    });
+  };
+  const newAnswer = (m) => [
+    `run marker: ${m}`, 'P1: none', 'P2: none', 'P3: none',
+    `VERDICT: SHIP — ours. (run marker: ${m})`,
+  ].join('\n');
+
+  const PROTECTED = 'pg-run-resdir-protected-1700099000-1';
+  const unprotected = Array.from({ length: 200 }, (_, i) => `pg-run-resdir-u-${i}-1700099000-1`);
+  const cohort = [{ marker: PROTECTED, protectedMarker: true }, ...unprotected.map((m) => ({ marker: m }))];
+  const NEW_MARKER = 'pg-run-resdir-new-1700099500-9';
+  const cdp = await mockCdp(newAnswer(NEW_MARKER));
+  const r = await runSalvage([NEW_MARKER, '20'], cdp.port, seedMemoCohortCustomResDir(cohort),
+    { PRO_GATE_RESERVATION_DIR: customResDir });
+  const memoSet = new Set(r.memos);
+  check('PRO_GATE_RESERVATION_DIR override: a protected marker under the relocated reservation dir survives MEMO_KEEP eviction',
+    memoSet.has(PROTECTED), `memos.length=${r.memos.length} stderr=${r.stderr?.slice(-300)}`);
+  cdp.stop();
+  fs.rmSync(customResDir, { recursive: true, force: true });
+}
+
 process.exit(failures === 0 ? 0 : 1);
