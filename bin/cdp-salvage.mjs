@@ -611,6 +611,35 @@ async function tabText(tab) {
   return result.value.text;
 }
 
+// #216 gate r4 P2: a scoped `--close --url` decides about a MUTABLE target. The /json listing
+// that selected a tab is a snapshot; between that snapshot and the ownership read the tab can
+// navigate to a retry conversation which -- being the same run's retry -- carries the same
+// marker, so ownership still passes and the close takes a DIFFERENT conversation down while
+// reporting success "at" the URL the caller scoped to. Authorization therefore has to be bound to
+// the page as it is at MUTATION time: one evaluate returns location.href and the review text from
+// the same moment, so the id the scope check reads and the text the ownership check reads can
+// never come from two different pages. Best-effort by construction -- an unreadable page yields
+// null, which the caller must treat as a mismatch and never as a match.
+async function tabUrlAndText(tab) {
+  const expression =
+    '/* pro-gate:close-guard */ (function () {' +
+    ' var href = (typeof location === "object" && location !== null && typeof location.href === "string")' +
+    ' ? location.href : null;' +
+    ' var review = (' + readReviewText.toString() + ')(document, ' + JSON.stringify(marker) + ');' +
+    ' return { href: href, review: review };' +
+    '})()';
+  const result = await evaluateTab(tab, expression);
+  if (!result.ok || !result.value || typeof result.value !== 'object') return null;
+  const { href, review } = result.value;
+  if (typeof href !== 'string' || !href) return null;
+  // Same bookkeeping tabText does: a text read that located this run's prompt is scope-anchored,
+  // and responseClaims needs that to classify the answer the same way either reader would.
+  if (typeof review === 'string') return { href, text: review };
+  if (typeof review?.text !== 'string') return null;
+  if (review.promptAt === 0) scopedResponses.add(review.text);
+  return { href, text: review.text };
+}
+
 async function tabTerminalInfrastructure(tab) {
   const expression = `(() => {
     /* pro-gate:terminal-infrastructure */
@@ -1312,12 +1341,27 @@ if (close) {
   // validation above answered. Reading closeUrl's truthiness here a second time is what let an
   // explicitly empty value fall through to the unscoped branch; by this point urlFlagSeen implies
   // a conversationUrlOk value, so the two can never disagree again.
+  const scopedId = urlFlagSeen ? conversationIdFromUrl(closeUrl) : null;
   if (urlFlagSeen) {
-    const targetId = conversationIdFromUrl(closeUrl);
-    tabs = tabs.filter((t) => conversationIdFromUrl(t.url) === targetId);
+    tabs = tabs.filter((t) => conversationIdFromUrl(t.url) === scopedId);
   }
   let closed = 0;
   for (const tab of tabs) {
+    // #216 gate r4 P2: the listing above answered "which tab was at this conversation", which is
+    // a fact about the past. A scoped close re-asks it of the LIVE page immediately before the
+    // mutation, in the SAME evaluate that reads ownership, and refuses on anything but a match --
+    // including a read that fails, since an unreadable page cannot prove it is still the one the
+    // caller scoped to. The unscoped close below is deliberately unchanged: with no --url there is
+    // no conversation id to drift away from, and marker ownership alone is what authorizes it.
+    if (urlFlagSeen) {
+      const live = await tabUrlAndText(tab);
+      if (!live || conversationIdFromUrl(live.href) !== scopedId) {
+        console.error(`cdp-salvage --close: tab ${tab.id} navigated away from ${closeUrl} (now ${live?.href ?? 'unreadable'}); left open`);
+        continue;
+      }
+      if (organizerOwnership(live.text).owned) { await closeTab(tab.id); closed += 1; }
+      continue;
+    }
     const text = await tabText(tab);
     if (text && organizerOwnership(text).owned) { await closeTab(tab.id); closed += 1; }
   }
