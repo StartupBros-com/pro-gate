@@ -623,7 +623,11 @@ function scanThrottleHealth(reads) {
 // reaches a DECISIVE non-throttle outcome with a successful text read is positive evidence about
 // exactly ONE conversation, so it retires exactly that ONE URL's records and can never touch
 // another's. Timeouts, empty reads and inconclusive hydration are not decisive and retire
-// nothing. `throttledUrls` is this scan's listed-tab throttle set: a URL some open tab showed the
+// nothing. #215 skeptic r2c A: neither does a render whose DIALOG read failed, nor one whose page
+// still carries the limiter copy — both arrive here with decisive=false (the callers' retireSafe),
+// because "I could not look" and "the copy is still on the page" are not evidence of health, and
+// laundering either one into health re-arms a live account cooldown on the very next scan.
+// `throttledUrls` is this scan's listed-tab throttle set: a URL some open tab showed the
 // limiter on in this same scan is never retired on a scratch render's say-so.
 const DECISIVE_HEALTHY_RENDER_REASONS = new Set(['marker-found', 'foreign-marker']);
 function retireThrottleSeenForHealthyRender(url, decisive, throttledUrls = null) {
@@ -645,9 +649,11 @@ function throttleAlreadyCharged(url, hash, protectedKeys) {
 // sidecar write in this file).
 function recordThrottleSeen(url, hash) {  // -> true when THIS call may charge the sighting
   let fd = null;
+  // Hoisted out of the try (it only hashes) so the catch below can unlink the exact path the
+  // 'wx' create won — #215 skeptic r2c B.
+  const recordPath = throttleSeenRecordPath(url, hash);
   try {
     fs.mkdirSync(THROTTLE_SEEN_DIR, { recursive: true });
-    const recordPath = throttleSeenRecordPath(url, hash);
     // #215 gate r2 P2: the record's CONTENT is the URL it was charged for. The filename is a
     // hash of (url, text-hash) and cannot be reversed, so without this a record could never be
     // attributed back to a conversation and retireThrottleSeenForHealthyUrls below would need a
@@ -666,9 +672,24 @@ function recordThrottleSeen(url, hash) {  // -> true when THIS call may charge t
     // recordThrottle rolls it back if that write fails, and (since #215 skeptic r2 D4) if this
     // call's own content write fails too.
     pendingThrottleSeenRecords.push(recordPath);
-    fs.writeSync(fd, `${url}\n`);
+    // writeFileSync loops on short writes; the bare writeSync it replaces did not, so it could
+    // strand a TRUNCATED record as easily as an empty one (#215 skeptic r2c B).
+    fs.writeFileSync(fd, `${url}\n`);
     return true;
   } catch (err) {
+    // #215 skeptic r2c B: the create WON (fd is set) but the content write failed — the record
+    // exists and is empty. Registering it for rollback is not enough: recordThrottle only drains
+    // that list when the COOLDOWN write fails, and the overwhelmingly likely next step is a
+    // cooldown write that SUCCEEDS and clears the list, leaving a zero-byte record behind.
+    // Empty means attributable to no URL, so retire-on-healthy can never remove it, and
+    // pruneThrottleSeen protects it whenever the fingerprint is observed: a 7-day silent
+    // suppression of a live limiter. So remove it here, and still return true — charging is the
+    // safe direction (two racers each writing a cooldown only over-backs-off).
+    if (fd !== null) {
+      const pendingAt = pendingThrottleSeenRecords.lastIndexOf(recordPath);
+      if (pendingAt >= 0) pendingThrottleSeenRecords.splice(pendingAt, 1);
+      try { fs.unlinkSync(recordPath); } catch {}
+    }
     // EEXIST: another invocation won the race for this exact fingerprint between the caller's
     // pre-check and this write, and it is the one charging the cooldown — this call must treat
     // the sighting as already charged (local skeptic on gate r2: two racers both returning
@@ -905,8 +926,12 @@ async function tabTerminalInfrastructure(tab) {
 // #215 skeptic r2 D1: `ok` says whether the READ itself succeeded, which is a different question
 // from what it found. A failed evaluate (timeout, websocket error, detached target, a dialog
 // momentarily not laid out) is not evidence the dialog is absent, and scanThrottleHealth must not
-// read it as one — see the three-state classification there. Every caller that only needs the
-// dialog text keeps using tabThrottleModal below, unchanged.
+// read it as one — see the three-state classification there.
+// #215 skeptic r2c A: the two memo-recovery renders were the last callers of the thin
+// tabThrottleModal wrapper below, for the same reason — they may RETIRE a charged fingerprint,
+// and null-for-both cannot tell a healthy page from an unreadable one. The wrapper is kept as
+// the read for any future caller that genuinely only wants the dialog text; it currently has
+// none.
 async function tabThrottleModalRead(tab) {
   const result = await evaluateTab(tab, buildThrottleModalExpression());
   const modal = result.ok && typeof result.value === 'string' && THROTTLE_RE.test(result.value)
@@ -1104,9 +1129,23 @@ async function freshRenderText(url, port, outerDeadline, waitForDecisiveEvidence
       // #162: a scratch render against a limited account can paint the modal over the
       // conversation it just loaded. Read the element alongside the text (one bail, not two)
       // before any marker test below can call that page "ours and still generating".
-      const [sample, throttleModal] = await Promise.all([tabText(live), tabThrottleModal(live)]);
+      // #215 skeptic r2c A: read the dialog through tabThrottleModalRead, not the thin wrapper.
+      // This render is one of only two observations allowed to RETIRE a charged fingerprint (see
+      // retireThrottleSeenForHealthyRender), and the thin wrapper answers null both for "no dialog"
+      // and for a read that FAILED — so one flaky evaluate over a still-limited conversation used
+      // to reach a decisive non-throttle reason, retire that URL's record, and let the next scan
+      // re-arm a fresh account cooldown on an unchanged limiter. Same for a page whose body still
+      // carries the limiter copy, which isThrottlePage cannot see under a run marker.
+      const [sample, modalRead] = await Promise.all([tabText(live), tabThrottleModalRead(live)]);
+      const throttleModal = modalRead.modal;
       if (!sample) continue;
       text = sample;
+      // Permission to RETIRE, and nothing else: the CHARGE branches below still test
+      // isThrottlePage || modal, so a conversation that merely QUOTES the limiter copy (a review
+      // of this very engine does) still never charges a cooldown — it only stops being counted as
+      // proof of health. Under-retire suppresses at most a repeat sighting; over-retire re-arms a
+      // live 900s account cooldown, which is the failure this whole file exists to avoid.
+      const retireSafe = modalRead.ok && !THROTTLE_RE.test(sample);
       // Return only on DECISIVE evidence, never on "looks long enough".
       //
       // The old gate returned as soon as innerText passed 200 chars, but innerText covers the
@@ -1131,8 +1170,8 @@ async function freshRenderText(url, port, outerDeadline, waitForDecisiveEvidence
           evidence = classifyEvidence(sample, null, throttleModal);
           return { text, reason: 'throttle', evidence }; // interstitial or modal — done
         }
-        if (hasExactMarker(sample, marker)) return { text, reason: 'marker-found' }; // ours — done
-        if (FOREIGN_MARKER_RE.test(sample)) return { text, reason: 'foreign-marker' }; // provably another run's — done
+        if (hasExactMarker(sample, marker)) return { text, reason: 'marker-found', retireSafe }; // ours — done
+        if (FOREIGN_MARKER_RE.test(sample)) return { text, reason: 'foreign-marker', retireSafe }; // provably another run's — done
       }
       // Anything else (shell, pre-hydration, login wall, or a marker-only stale-source render)
       // is NOT an answer: keep sampling and return the last text at the render deadline.
@@ -1316,8 +1355,13 @@ async function openOrganizerScratch(url) {
       } catch { return { target, reason: 'cdp-list-failed' }; }
       if (!live) return { target, reason: 'memo-tab-disappeared' };
       if (live.url !== url) return { target: live, reason: 'memo-url-drift' };
-      const [text, throttleModal] = await Promise.all([tabText(live), tabThrottleModal(live)]);
+      const [text, modalRead] = await Promise.all([tabText(live), tabThrottleModalRead(live)]);
+      const throttleModal = modalRead.modal;
       if (!text) continue;
+      // #215 skeptic r2c A: exactly the freshRenderText rule, for the organizer's half of the same
+      // memo-recovery path — permission to RETIRE only, never to charge. A dialog read that FAILED,
+      // or a page whose body still carries the limiter copy, decides nothing about health.
+      const retireSafe = modalRead.ok && !THROTTLE_RE.test(text);
       // #162: the modal is throttle evidence too; organizer traffic must stop on either form.
       // #208 gate r6 P2: carry back enough for the caller to apply the same unowned gate every
       // other throttle trip site in this file uses — an interstitial can never be owned
@@ -1342,10 +1386,10 @@ async function openOrganizerScratch(url) {
       if (hasExactMarker(text, marker)) {
         const ownership = mutationOwnership(text);
         return ownership.owned
-          ? { target: live, text, reason: 'ok', healthyUrl: url }
-          : { target: live, reason: ownership.reason, healthyUrl: url };
+          ? { target: live, text, reason: 'ok', healthyUrl: url, retireSafe }
+          : { target: live, reason: ownership.reason, healthyUrl: url, retireSafe };
       }
-      if (FOREIGN_MARKER_RE.test(text)) return { target: live, reason: 'stale-memo', healthyUrl: url };
+      if (FOREIGN_MARKER_RE.test(text)) return { target: live, reason: 'stale-memo', healthyUrl: url, retireSafe };
       if (/\b(log in|sign up)\b/i.test(text) && text.length < 10_000) sawLogin = true;
     }
     return { target, reason: sawLogin ? 'login-wall' : 'memo-not-hydrated' };
@@ -1566,7 +1610,9 @@ async function organizeConversation() {
     // #215 skeptic r2 D3: a decisive healthy memo render retires exactly the URL it rendered (see
     // retireThrottleSeenForHealthyRender), so a recovered-then-limited-again conversation charges
     // a fresh cooldown instead of reporting throttle with an expired clock behind it.
-    retireThrottleSeenForHealthyRender(scratch.healthyUrl, true, scanHealth.throttledUrls);
+    // #215 skeptic r2c A: healthyUrl already means DECISIVE; retireSafe is the second half of the
+    // same question — was the observation readable enough to be evidence of health at all.
+    retireThrottleSeenForHealthyRender(scratch.healthyUrl, scratch.retireSafe === true, scanHealth.throttledUrls);
     if (!scratch.text || !scratch.target) {
       // #208 gate r6 P2: an OWNED sighting (our own marker under the modal) still always
       // re-arms unconditionally; an unowned one routes through the same central gate every
@@ -2128,7 +2174,8 @@ while (Date.now() < deadline) {
     nextRenderAt.set(seedUrl, Date.now() + RENDER_INTERVAL_MS);
     seededRenders += 1;
     console.error(`no open tab carries "${marker}" — re-rendering the remembered conversation ${seedUrl} (${seededRenders}/${MAX_SEEDED_RENDERS})...`);
-    const { text, evidence: renderEvidence, reason: renderReason } = await freshRenderText(seedUrl, port, deadline);
+    const { text, evidence: renderEvidence, reason: renderReason, retireSafe: renderRetireSafe } =
+      await freshRenderText(seedUrl, port, deadline);
     if (text) {
       const evidence = renderEvidence ?? classifyEvidence(text);
       if (evidence.kind === 'throttle') tripThrottleEvidence(seedUrl, evidence, `remembered render ${seedUrl}`);
@@ -2136,7 +2183,9 @@ while (Date.now() < deadline) {
       // observation of a conversation that has no tab at all, so a decisive non-throttle render
       // retires that ONE URL's records. Reached only when the throttle trip above did NOT exit
       // (an already-charged repeat), and 'throttle' is not a decisive-healthy reason either way.
-      retireThrottleSeenForHealthyRender(seedUrl, DECISIVE_HEALTHY_RENDER_REASONS.has(renderReason), scanHealth.throttledUrls);
+      // #215 skeptic r2c A: decisive AND readable-as-healthy — see freshRenderText's retireSafe.
+      retireThrottleSeenForHealthyRender(seedUrl,
+        DECISIVE_HEALTHY_RENDER_REASONS.has(renderReason) && renderRetireSafe === true, scanHealth.throttledUrls);
       if (evidence.kind === 'cross-bound') {
         // The memo itself is cross-bound. Evict it with claim-and-verify, but preserve a
         // concurrently republished survivor as the only possible genuine recovery handle.
