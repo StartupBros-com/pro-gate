@@ -4886,6 +4886,17 @@ printf '2026-01-01T00:00:00.000Z\thttps://chatgpt.com/c/old\tpg-run-someone-else
 printf '2026-01-01T00:00:00.000Z\thttps://chatgpt.com/c/new\tpg-run-someone-else\n' > "$SWHOME/crossbound/pg-run-new-1700000000-1"
 touch -d '20 days ago' "$SWHOME/crossbound/pg-run-old-1600000000-1" 2>/dev/null \
   || touch -t "$(date -v-20d +%Y%m%d%H%M 2>/dev/null || echo 202601010000)" "$SWHOME/crossbound/pg-run-old-1600000000-1"
+# gate r2 follow-up P2: a 14-day-old memo whose reservation is STILL RETAINED (superseded,
+# uncollected -- in-progress/<marker> exists) must survive this sweep exactly like
+# rememberUrl()'s MEMO_KEEP eviction already protects it, because pg_reservation_reconcile()
+# retains a superseded reservation forever and this memo is its only durable recovery handle.
+mkdir -p "$SWHOME/in-progress"
+SWEEP_RETAINED_MARKER='pg-run-old-retained-1600000000-2'
+printf 'acme-widgets-424\t%s\t1600000000\t0\t1\tGPT-X\t5\tsuperseded\n' "$TDIR/retained-audit.md" \
+  > "$SWHOME/in-progress/$SWEEP_RETAINED_MARKER"
+printf 'https://chatgpt.com/c/old-retained' > "$SWHOME/conversation-urls/$SWEEP_RETAINED_MARKER"
+touch -d '20 days ago' "$SWHOME/conversation-urls/$SWEEP_RETAINED_MARKER" 2>/dev/null \
+  || touch -t "$(date -v-20d +%Y%m%d%H%M 2>/dev/null || echo 202601010000)" "$SWHOME/conversation-urls/$SWEEP_RETAINED_MARKER"
 printf 'foreign idle tab\n' > "$TDIR/tab.txt"
 start_mock "$TDIR/tab.txt"
 env PRO_GATE_HOME="$SWHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
@@ -4897,6 +4908,22 @@ check 'old memo swept' "$([ ! -f "$SWHOME/conversation-urls/pg-run-old-160000000
 check 'fresh memo kept' "$([ -f "$SWHOME/conversation-urls/pg-run-new-1700000000-1" ]; echo $?)" "missing"
 check 'old cross-bind sidecar swept (#170)' "$([ ! -f "$SWHOME/crossbound/pg-run-old-1600000000-1" ]; echo $?)" "still present"
 check 'fresh cross-bind sidecar kept (#170)' "$([ -f "$SWHOME/crossbound/pg-run-new-1700000000-1" ]; echo $?)" "missing"
+check 'old memo of a retained superseded reservation survives the sweep (gate r2 follow-up P2)' \
+  "$([ -f "$SWHOME/conversation-urls/$SWEEP_RETAINED_MARKER" ]; echo $?)" \
+  "memos=$(ls "$SWHOME/conversation-urls" 2>/dev/null | tr '\n' ' ')"
+# Boundary: once the reservation is collected (in-progress/<marker> removed), the same
+# still-old memo is no longer protected and the next sweep clears it -- proving this is a
+# reservation-scoped protection, not a blanket exemption that would defeat the 14-day sweep.
+rm -f "$SWHOME/in-progress/$SWEEP_RETAINED_MARKER"
+start_mock "$TDIR/tab.txt"
+env PRO_GATE_HOME="$SWHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_MAX_RETRIES=0 PG_TEST_PROMPT_DUMP="$TDIR/prompt-sweep2.txt" \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-dump" NODE_OPTIONS= \
+  bash "$ENGINE" --pr 909 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$TDIR/o-sweep2.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+check 'memo is swept once its reservation is collected (in-progress/ removed)' \
+  "$([ ! -f "$SWHOME/conversation-urls/$SWEEP_RETAINED_MARKER" ]; echo $?)" \
+  "memos=$(ls "$SWHOME/conversation-urls" 2>/dev/null | tr '\n' ' ')"
 
 echo '# v0.30 (#50 item 5): native-mode hard-max clamp is announced, not silent'
 # The NOTE fires before the oversized refusal, so the fast exit-11 path exercises it.
