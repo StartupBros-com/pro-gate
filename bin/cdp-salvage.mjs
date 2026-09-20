@@ -486,6 +486,50 @@ function throttleSeenKey(url, hash) {
 function throttleSeenRecordPath(url, hash) {
   return path.join(THROTTLE_SEEN_DIR, throttleSeenKey(url, hash));
 }
+// #215 gate r7 P2: the mark a rename-aside temp created by removeThrottleSeenGeneration carries.
+// A record basename is bare sha256 hex (throttleSeenKey), so a name carrying this mark can only
+// be a temp — every place that reads this directory AS RECORDS skips it. throttleAlreadyCharged
+// is unaffected by construction: it asks for one exact record path, which a temp can never be.
+const THROTTLE_SEEN_EXPIRE_MARK = '.expire.';
+function throttleSeenIsTemp(name) { return name.includes(THROTTLE_SEEN_EXPIRE_MARK); }
+// #215 gate r7 P2: delete ONLY the record generation that was actually checked — `expected` is
+// the { ino, mtimeMs } of the very stat that decided this record should go. A plain unlink cannot
+// express that. Between one scan's stat and its unlink, another scan can expire the same record,
+// create its REPLACEMENT with the 'wx' arbiter and publish the cooldown that replacement gates;
+// the first scan's unlink would then delete a fresh, committed fingerprint it never looked at —
+// and, pruning a fingerprint outside its own observed batch, it never recreates one — so the very
+// next unchanged sighting charges a second cooldown inside the same horizon. Instead:
+//   1. renameSync the record aside to a sibling temp. Rename is atomic and frees the NAME, so a
+//      concurrent 'wx' create racing us lands a NEW record at that name instead of being
+//      clobbered, and no reader ever sees a half-deleted record.
+//   2. stat the temp: identical (ino, mtimeMs) means it IS the generation we checked -> unlink it.
+//   3. otherwise the record was replaced between our stat and our rename -> link it back under
+//      its own name. EEXIST means a newer record already holds the name (the replacement, or a
+//      third writer's) — drop the temp and leave that record alone.
+// A link failure that is NOT EEXIST leaves the temp in place: never destroy a record that could
+// not be restored. That, and a crash between the rename and the restore, is the one residual —
+// deliberate, and in the safe direction. It leaves at most ONE orphan temp per (record, pid), and
+// an orphan temp is a LOST record: the fingerprint it held stops suppressing, so the next
+// unchanged sighting costs at most one EXTRA cooldown inside the horizon, the same bounded re-arm
+// `bounded-dedupe` already accepts (#215 gate r6). It can never cause extra SUPPRESSION — a temp
+// is not a record, so it can never make a real sighting read as already charged — and
+// pruneThrottleSeen ages orphan temps out on the same TTL rather than letting them pile up.
+function removeThrottleSeenGeneration(name, expected) {  // -> true when that generation was deleted
+  const recordPath = path.join(THROTTLE_SEEN_DIR, name);
+  const tempPath = path.join(THROTTLE_SEEN_DIR, `${name}${THROTTLE_SEEN_EXPIRE_MARK}${process.pid}`);
+  // ENOENT here means another pruner already took this record; nothing of ours to delete.
+  try { fs.renameSync(recordPath, tempPath); } catch { return false; }
+  let actual;
+  try { actual = fs.statSync(tempPath); } catch { return false; }
+  if (actual.ino === expected.ino && actual.mtimeMs === expected.mtimeMs) {
+    try { fs.unlinkSync(tempPath); } catch {}
+    return true;
+  }
+  try { fs.linkSync(tempPath, recordPath); }
+  catch (err) { if (err?.code !== 'EEXIST') return false; }   // unrestorable: keep the temp, lose nothing else
+  try { fs.unlinkSync(tempPath); } catch {}
+  return false;
+}
 // Runs once per invocation, on first touch of the sidecar: deletes records older than
 // THROTTLE_SEEN_TTL_MS, then — even inside the TTL window — trims the survivor count down to
 // THROTTLE_SEEN_MAX, oldest mtime first. Best-effort: a failure here (races with another
@@ -493,7 +537,7 @@ function throttleSeenRecordPath(url, hash) {
 // The two evictions answer to different rules, and the ORDER below is the rule:
 //   * TTL is the SUPPRESSION HORIZON and applies to EVERYTHING — every record, whether or not
 //     the current scan is looking at it. It is checked FIRST, before any protection, so an
-//     expired record is always unlinked. An unchanged stale tab therefore re-arms the cooldown
+//     expired record is always deleted. An unchanged stale tab therefore re-arms the cooldown
 //     at most once per THROTTLE_SEEN_TTL, never "once and then never again": suppression is
 //     bounded by the horizon, not permanent (#208, #215 gate r6, choice bounded-dedupe).
 //   * Capacity protection is SCAN-SCOPED. `protectedKeys` (record-file basenames the CURRENT
@@ -506,6 +550,9 @@ function throttleSeenRecordPath(url, hash) {
 //     invocation forever instead of once per horizon. A protected fingerprint can still exceed
 //     the nominal cap on disk; that is the correct trade — the cap is only ever enforced
 //     against records this scan does NOT need.
+// #215 gate r7 P2: BOTH evictions delete through removeThrottleSeenGeneration, carrying the exact
+// (ino, mtimeMs) of the stat that condemned the record — a concurrent scan's freshly committed
+// replacement is never deleted by a decision taken about the generation it replaced.
 let throttleSeenPruned = false;
 function pruneThrottleSeen(protectedKeys = new Set()) {
   let names;
@@ -514,26 +561,36 @@ function pruneThrottleSeen(protectedKeys = new Set()) {
   const stats = [];
   for (const name of names) {
     const recordPath = path.join(THROTTLE_SEEN_DIR, name);
-    let mtimeMs;
-    try { ({ mtimeMs } = fs.statSync(recordPath)); } catch { continue; }
-    // TTL first, protection second: an expired record is unlinked even when this scan is
+    let stat;
+    try { stat = fs.statSync(recordPath); } catch { continue; }
+    const expired = now - stat.mtimeMs > THROTTLE_SEEN_TTL_MS;
+    // A rename-aside temp is NOT a record: it suppresses nothing, so it is never protected and
+    // never counted toward the cap — only aged out, so an orphan left by a writer that died
+    // mid-swap cannot accumulate (see removeThrottleSeenGeneration). A rename preserves mtime, so
+    // a temp inherits its record's age and expires no later than one horizon after that record
+    // was written, never restarting the clock.
+    if (throttleSeenIsTemp(name)) {
+      if (expired) { try { fs.unlinkSync(recordPath); } catch {} }
+      continue;
+    }
+    // TTL first, protection second: an expired record is deleted even when this scan is
     // currently observing its fingerprint — that sighting then re-arms once, and the fresh
     // record it writes suppresses the same tab for another full horizon.
-    if (now - mtimeMs > THROTTLE_SEEN_TTL_MS) {
-      try { fs.unlinkSync(recordPath); } catch {}
+    if (expired) {
+      removeThrottleSeenGeneration(name, stat);
       continue;
     }
     // Unexpired AND observed by this scan: exempt from the capacity trim, and deliberately not
     // counted toward the survivor total either (the cap governs only records this scan can
     // afford to lose).
     if (protectedKeys.has(name)) continue;
-    stats.push({ name, mtimeMs });
+    stats.push({ name, ino: stat.ino, mtimeMs: stat.mtimeMs });
   }
   if (stats.length > THROTTLE_SEEN_MAX) {
     stats
       .sort((a, b) => a.mtimeMs - b.mtimeMs)
       .slice(0, stats.length - THROTTLE_SEEN_MAX)
-      .forEach(({ name }) => { try { fs.unlinkSync(path.join(THROTTLE_SEEN_DIR, name)); } catch {} });
+      .forEach(({ name, ino, mtimeMs }) => removeThrottleSeenGeneration(name, { ino, mtimeMs }));
   }
 }
 // "Already charged" is now a plain existence check on the record file, not a load-then-scan of

@@ -309,6 +309,11 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
       let request;
       try { request = JSON.parse(payload); } catch { return; }
       requests.push(request);
+      // #215 gate r7 P2: a synchronous window INSIDE the child's scan. The hook runs before this
+      // evaluate is answered, so anything it does to PRO_GATE_HOME is on disk strictly before the
+      // child can act on the response — the only way a test can model another writer touching the
+      // sidecar mid-scan without a second salvage process.
+      opts.onEvaluate?.(id, request.params?.expression ?? '');
       let value = tabText;
       if (id === 'tab1' && opts.primaryText) {
         primaryPolls += 1;
@@ -4718,6 +4723,250 @@ const FOREIGN_ANSWER = (m) => [
     r6d.status === 5 && throttleSeenHas(homeUnobsR6, primaryUrlR6, modalTextR6),
     `status=${r6d.status} cooldown=${r6d.cooldown} records=${seenDirListR6(homeUnobsR6)}`);
   fs.rmSync(homeUnobsR6, { recursive: true, force: true });
+}
+
+{ // #215 gate r7 P2 (bin/cdp-salvage.mjs pruneThrottleSeen / removeThrottleSeenGeneration):
+  // expiration and the capacity trim must delete ONLY the record generation they actually
+  // stat'd. Pre-fix both deleted BY NAME: scan A could stat an expired record, scan B could
+  // expire that same record, create its replacement with the 'wx' arbiter and publish the
+  // cooldown that replacement gates — and A's unlink then destroyed B's fresh, committed
+  // fingerprint. Pruning a fingerprint outside its own observed batch, A never recreates it, so
+  // the next unchanged sighting charges a SECOND cooldown inside the same horizon.
+  //
+  // (h*) drive the production functions directly. The interleaving window lives INSIDE
+  // pruneThrottleSeen — between its stat and its delete — and no mock CDP fixture can reach it.
+  // bin/cdp-salvage.mjs is a CLI script with no exports, so the functions are sliced out of the
+  // file BY NAME and evaluated verbatim in a vm context whose fs, path and THROTTLE_SEEN_*
+  // constants this test controls; the interleaving is injected through that fs, at the exact
+  // moment the pruner stats the record it is about to condemn. Nothing here is reimplemented: a
+  // slice that no longer exists surfaces as a null function and a failing check, never as a
+  // quietly different pruner.
+  // (c*) then cover the same sidecar end-to-end through real salvage children.
+  const salvageLinesR7 = fs.readFileSync(SALVAGE, 'utf8').split('\n');
+  const sliceTopLevelR7 = (name) => {
+    const start = salvageLinesR7.findIndex((line) => (
+      line.startsWith(`function ${name}(`) || line.startsWith(`const ${name} = `)
+    ));
+    if (start < 0) return null;
+    // A single-line const, or a function whose whole body is on its declaration line, IS the
+    // slice; anything else runs to the first column-zero '}', which closes a top-level function.
+    if (salvageLinesR7[start].startsWith('const ') || salvageLinesR7[start].trimEnd().endsWith('}')) {
+      return salvageLinesR7[start];
+    }
+    const end = salvageLinesR7.findIndex((line, i) => i > start && line === '}');
+    return end < 0 ? null : salvageLinesR7.slice(start, end + 1).join('\n');
+  };
+  const PRUNER_PARTS_R7 = ['THROTTLE_SEEN_EXPIRE_MARK', 'throttleSeenIsTemp',
+    'removeThrottleSeenGeneration', 'pruneThrottleSeen'];
+  const buildPrunerR7 = (dir, { ttlMs = 7 * 24 * 60 * 60 * 1000, max = 512, fsImpl = fs } = {}) => {
+    const source = PRUNER_PARTS_R7.map(sliceTopLevelR7).filter((part) => part !== null).join('\n');
+    const expose = '({ prune: typeof pruneThrottleSeen === "function" ? pruneThrottleSeen : null,'
+      + ' removeGeneration: typeof removeThrottleSeenGeneration === "function" ? removeThrottleSeenGeneration : null })';
+    return runInNewContext(`${source}\n${expose}`, {
+      fs: fsImpl, path, process,
+      THROTTLE_SEEN_DIR: dir, THROTTLE_SEEN_TTL_MS: ttlMs, THROTTLE_SEEN_MAX: max,
+    });
+  };
+  const EIGHT_DAYS_R7 = 8 * 24 * 60 * 60 * 1000;   // past the 7-day THROTTLE_SEEN_TTL default
+  const seenDirR7 = () => fs.mkdtempSync(path.join(os.tmpdir(), 'pg-r7-seen-'));
+  // Record basenames are sha256 hex in production (throttleSeenKey); these are shaped the same so
+  // the temp-vs-record predicate is exercised against realistic names.
+  const keyR7 = (label) => createHash('sha256').update(`#215 gate r7 ${label}`).digest('hex');
+  const seedRecordR7 = (dir, name, ageMs = 0) => {
+    const p = path.join(dir, name);
+    fs.writeFileSync(p, '', { flag: 'wx' });
+    if (ageMs > 0) { const t = new Date(Date.now() - ageMs); fs.utimesSync(p, t, t); }
+    return p;
+  };
+  const ageRecordR7 = (p, ms) => { const t = new Date(Date.now() - ms); fs.utimesSync(p, t, t); };
+  const inoR7 = (p) => { try { return fs.statSync(p).ino; } catch { return null; } };
+  const mtimeR7 = (p) => { try { return fs.statSync(p).mtimeMs; } catch { return null; } };
+  const listR7 = (dir) => { try { return fs.readdirSync(dir); } catch { return []; } };
+  const tempsR7 = (dir) => listR7(dir).filter((n) => n.includes('.expire.'));
+  // The interleaving itself: the instant the pruner stats the record it is about to condemn,
+  // another scan expires that generation and commits its REPLACEMENT through the same 'wx'
+  // arbiter production uses. One shot — the finding describes a single interleaving, and a
+  // repeating one would say nothing more. The replacement's mtime is `now` while every condemned
+  // record below is seeded minutes or days old, so the two generations can never read as equal.
+  const replaceOnStatR7 = (target, out) => {
+    let fired = false;
+    const proxy = Object.create(fs);
+    proxy.statSync = (p, ...rest) => {
+      const stat = fs.statSync(p, ...rest);
+      if (!fired && p === target) {
+        fired = true;
+        try { fs.unlinkSync(target); } catch {}
+        fs.writeFileSync(target, '', { flag: 'wx' });
+        out.ino = fs.statSync(target).ino;
+      }
+      return stat;
+    };
+    return proxy;
+  };
+
+  // (h1) EXPIRATION path, the finding's exact sequence. Pre-fix the pruner unlinked by name and
+  // destroyed the replacement it never looked at.
+  const dirH1 = seenDirR7();
+  const pathH1 = seedRecordR7(dirH1, keyR7('h1 expired'), EIGHT_DAYS_R7);
+  const replacedH1 = { ino: null };
+  buildPrunerR7(dirH1, { fsImpl: replaceOnStatR7(pathH1, replacedH1) }).prune?.(new Set());
+  check("#215 gate r7 P2 (h1) expiration: a replacement committed between the pruner's stat and its delete survives, and it is the REPLACEMENT that survives",
+    replacedH1.ino !== null && inoR7(pathH1) === replacedH1.ino,
+    `replacementIno=${replacedH1.ino} onDiskIno=${inoR7(pathH1)} dir=${JSON.stringify(listR7(dirH1))}`);
+  check('#215 gate r7 P2 (h1) expiration: declining to delete leaves no orphan temp behind',
+    tempsR7(dirH1).length === 0, `dir=${JSON.stringify(listR7(dirH1))}`);
+  fs.rmSync(dirH1, { recursive: true, force: true });
+
+  // (h2) CAPACITY path: the same protection, on the other eviction. The trim's oldest-first
+  // candidate is replaced during the stat pass, after its mtime was read and before it is cut.
+  const dirH2 = seenDirR7();
+  const pathOldH2 = seedRecordR7(dirH2, keyR7('h2 oldest'), 600_000);
+  const nameMidH2 = keyR7('h2 mid');
+  const nameNewH2 = keyR7('h2 newest');
+  seedRecordR7(dirH2, nameMidH2, 300_000);
+  seedRecordR7(dirH2, nameNewH2, 60_000);
+  const replacedH2 = { ino: null };
+  buildPrunerR7(dirH2, { max: 2, fsImpl: replaceOnStatR7(pathOldH2, replacedH2) }).prune?.(new Set());
+  check("#215 gate r7 P2 (h2) capacity: a replacement committed between the trim's stat and its delete survives the trim",
+    replacedH2.ino !== null && inoR7(pathOldH2) === replacedH2.ino,
+    `replacementIno=${replacedH2.ino} onDiskIno=${inoR7(pathOldH2)} dir=${JSON.stringify(listR7(dirH2))}`);
+  check('#215 gate r7 P2 (h2) capacity: the records the trim did not condemn are untouched, and no orphan temp is left',
+    fs.existsSync(path.join(dirH2, nameMidH2)) && fs.existsSync(path.join(dirH2, nameNewH2)) && tempsR7(dirH2).length === 0,
+    `dir=${JSON.stringify(listR7(dirH2))}`);
+  fs.rmSync(dirH2, { recursive: true, force: true });
+
+  // (h3) control: with nothing interleaving, the checked generation IS still deleted — the fix
+  // must not buy safety by declining to expire anything.
+  const dirH3 = seenDirR7();
+  const nameExpiredH3 = keyR7('h3 expired');
+  const nameLiveH3 = keyR7('h3 live');
+  seedRecordR7(dirH3, nameExpiredH3, EIGHT_DAYS_R7);
+  seedRecordR7(dirH3, nameLiveH3, 60_000);
+  buildPrunerR7(dirH3).prune?.(new Set());
+  check('#215 gate r7 P2 (h3) control: an expired record whose generation did not change is still deleted, the unexpired one survives, and no temp is left',
+    !fs.existsSync(path.join(dirH3, nameExpiredH3)) && fs.existsSync(path.join(dirH3, nameLiveH3)) && tempsR7(dirH3).length === 0,
+    `dir=${JSON.stringify(listR7(dirH3))}`);
+  fs.rmSync(dirH3, { recursive: true, force: true });
+
+  // (h4) control: the capacity trim still evicts oldest-first when nothing interleaves.
+  const dirH4 = seenDirR7();
+  const nameOldH4 = keyR7('h4 oldest');
+  const nameMidH4 = keyR7('h4 mid');
+  const nameNewH4 = keyR7('h4 newest');
+  seedRecordR7(dirH4, nameOldH4, 600_000);
+  seedRecordR7(dirH4, nameMidH4, 300_000);
+  seedRecordR7(dirH4, nameNewH4, 60_000);
+  buildPrunerR7(dirH4, { max: 2 }).prune?.(new Set());
+  check('#215 gate r7 P2 (h4) control: with no interleaving the capacity trim still cuts the oldest unprotected record down to the cap, leaving no temp',
+    !fs.existsSync(path.join(dirH4, nameOldH4)) && fs.existsSync(path.join(dirH4, nameMidH4))
+      && fs.existsSync(path.join(dirH4, nameNewH4)) && tempsR7(dirH4).length === 0,
+    `dir=${JSON.stringify(listR7(dirH4))}`);
+  fs.rmSync(dirH4, { recursive: true, force: true });
+
+  // (h5) the residual's cleanup: a temp left behind by a writer that died mid-swap ages out on
+  // the same horizon, so an orphan can never accumulate.
+  const dirH5 = seenDirR7();
+  const nameLiveH5 = keyR7('h5 live');
+  const nameTempH5 = `${keyR7('h5 orphan')}.expire.424242`;
+  seedRecordR7(dirH5, nameTempH5, EIGHT_DAYS_R7);
+  seedRecordR7(dirH5, nameLiveH5, 60_000);
+  buildPrunerR7(dirH5).prune?.(new Set());
+  check('#215 gate r7 P2 (h5) an orphan .expire. temp older than the TTL is deleted, and a live record beside it is untouched',
+    !fs.existsSync(path.join(dirH5, nameTempH5)) && fs.existsSync(path.join(dirH5, nameLiveH5)),
+    `dir=${JSON.stringify(listR7(dirH5))}`);
+  fs.rmSync(dirH5, { recursive: true, force: true });
+
+  // (h6) a temp is NOT a record: it suppresses nothing, so it must never occupy a capacity slot
+  // (which would evict a real fingerprint in its place) and the trim must never pick it.
+  const dirH6 = seenDirR7();
+  const nameTempH6 = `${keyR7('h6 orphan')}.expire.424243`;
+  const nameMidH6 = keyR7('h6 mid');
+  const nameNewH6 = keyR7('h6 newest');
+  seedRecordR7(dirH6, nameTempH6, 600_000);   // oldest on disk: the trim's first pick if counted
+  seedRecordR7(dirH6, nameMidH6, 300_000);
+  seedRecordR7(dirH6, nameNewH6, 60_000);
+  buildPrunerR7(dirH6, { max: 2 }).prune?.(new Set());
+  check('#215 gate r7 P2 (h6) an unexpired .expire. temp is never counted toward capacity, so the trim does not fire and does not pick it',
+    fs.existsSync(path.join(dirH6, nameTempH6)),
+    `dir=${JSON.stringify(listR7(dirH6))}`);
+  check('#215 gate r7 P2 (h6) both real records survive a cap of two',
+    fs.existsSync(path.join(dirH6, nameMidH6)) && fs.existsSync(path.join(dirH6, nameNewH6)),
+    `dir=${JSON.stringify(listR7(dirH6))}`);
+  fs.rmSync(dirH6, { recursive: true, force: true });
+
+  // --- end-to-end through real salvage children -------------------------------------------
+  const modalTriggerR7 = "You're making requests too quickly. [#215 gate r7 trigger]";
+  const modalConcurrentR7 = "You're making requests too quickly. [#215 gate r7 concurrent writer]";
+  const pageR7 = (modal) => `ChatGPT\nAccount limits\n${modal}\nPlease try again shortly.\n`;
+  const primaryUrlR7 = 'https://chatgpt.com/c/mock-conversation';   // the mock's own primary tab
+
+  // (c1) control, the e1a2195 behaviour: an expired record the scan IS observing still expires
+  // and re-charges exactly once, and the swap leaves no temp behind.
+  const homeC1 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedThrottleSeen(homeC1, primaryUrlR7, modalTriggerR7);
+  const recordC1 = throttleSeenRecordPath(homeC1, primaryUrlR7, modalTriggerR7);
+  ageRecordR7(recordC1, EIGHT_DAYS_R7);
+  const mtimeBeforeC1 = mtimeR7(recordC1);
+  const cdpC1 = await mockCdp(pageR7(modalTriggerR7), [], { throttleModal: modalTriggerR7 });
+  const rC1 = await runSalvageInHome(homeC1, [MARKER, '3'], cdpC1.port);
+  cdpC1.stop();
+  const mtimeAfterC1 = mtimeR7(recordC1);
+  check('#215 gate r7 P2 (c1) control: an expired record this scan observes still expires and re-charges once (exit 5 + cooldown)',
+    rC1.status === 5 && /^\d{4}-\d{2}-\d{2}T/.test(rC1.cooldown ?? ''),
+    `status=${rC1.status} cooldown=${rC1.cooldown} stderr=${rC1.stderr?.slice(-300)}`);
+  check('#215 gate r7 P2 (c1) control: the expired record is replaced by a fresh one, restarting the horizon',
+    mtimeAfterC1 !== null && mtimeBeforeC1 !== null && mtimeAfterC1 > mtimeBeforeC1 + 60_000,
+    `before=${mtimeBeforeC1} after=${mtimeAfterC1} dir=${JSON.stringify(listR7(throttleSeenDir(homeC1)))}`);
+  check('#215 gate r7 P2 (c1) control: a completed expiration leaves no temp in the sidecar directory',
+    tempsR7(throttleSeenDir(homeC1)).length === 0, `dir=${JSON.stringify(listR7(throttleSeenDir(homeC1)))}`);
+  fs.rmSync(homeC1, { recursive: true, force: true });
+
+  // (c2) the same shape as (h1) but across real processes: another writer replaces an expired
+  // record DURING the child's scan, for a fingerprint that child never observes. The replacement
+  // must survive the scan's prune and must suppress the next sighting of it.
+  const homeC2 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedThrottleSeen(homeC2, primaryUrlR7, modalConcurrentR7);
+  const recordC2 = throttleSeenRecordPath(homeC2, primaryUrlR7, modalConcurrentR7);
+  ageRecordR7(recordC2, EIGHT_DAYS_R7);
+  // An aged record nobody replaces: its deletion is this test's proof that the child's prune ran
+  // at all, and `existedAtReplace` below proves it ran AFTER the replacement landed. Without both
+  // the survival check could pass vacuously on a prune that never looked.
+  const unobservedUrlC2 = 'https://chatgpt.com/c/mock-r7-unobserved';
+  const unobservedTextC2 = 'an old sighting from a tab nobody replaced';
+  seedThrottleSeen(homeC2, unobservedUrlC2, unobservedTextC2);
+  ageRecordR7(throttleSeenRecordPath(homeC2, unobservedUrlC2, unobservedTextC2), EIGHT_DAYS_R7);
+  const concurrentC2 = { existedAtReplace: null, ino: null };
+  const cdpC2 = await mockCdp(pageR7(modalTriggerR7), [], {
+    throttleModal: modalTriggerR7,
+    onEvaluate: (id, expression) => {
+      if (concurrentC2.ino !== null || !expression.includes('pro-gate:review-text')) return;
+      concurrentC2.existedAtReplace = fs.existsSync(recordC2);
+      try { fs.unlinkSync(recordC2); } catch {}
+      fs.writeFileSync(recordC2, '', { flag: 'wx' });
+      concurrentC2.ino = fs.statSync(recordC2).ino;
+    },
+  });
+  const rC2 = await runSalvageInHome(homeC2, [MARKER, '3'], cdpC2.port);
+  cdpC2.stop();
+  check("#215 gate r7 P2 (c2) ordering proof: the replacement landed while the record was still the expired one, and this scan's prune demonstrably ran",
+    concurrentC2.existedAtReplace === true && !throttleSeenHas(homeC2, unobservedUrlC2, unobservedTextC2),
+    `existedAtReplace=${concurrentC2.existedAtReplace} dir=${JSON.stringify(listR7(throttleSeenDir(homeC2)))}`);
+  check("#215 gate r7 P2 (c2) a concurrent writer's replacement for a fingerprint this scan never observes survives the scan's prune",
+    concurrentC2.ino !== null && inoR7(recordC2) === concurrentC2.ino,
+    `replacementIno=${concurrentC2.ino} onDiskIno=${inoR7(recordC2)} dir=${JSON.stringify(listR7(throttleSeenDir(homeC2)))}`);
+  check('#215 gate r7 P2 (c2) the scan still charges its own genuinely new sighting (exit 5 + cooldown)',
+    rC2.status === 5 && /^\d{4}-\d{2}-\d{2}T/.test(rC2.cooldown ?? ''),
+    `status=${rC2.status} cooldown=${rC2.cooldown} stderr=${rC2.stderr?.slice(-300)}`);
+  const cooldownPathC2 = path.join(homeC2, 'throttle.cooldown');
+  ageRecordR7(cooldownPathC2, 3_600_000);
+  const cooldownBeforeC2 = mtimeR7(cooldownPathC2);
+  const cdpC2b = await mockCdp(pageR7(modalConcurrentR7), [], { throttleModal: modalConcurrentR7 });
+  const rC2b = await runSalvageInHome(homeC2, [MARKER, '3'], cdpC2b.port);
+  cdpC2b.stop();
+  check('#215 gate r7 P2 (c2) the next sighting of the replaced fingerprint is suppressed, not re-charged',
+    rC2b.status !== 5 && mtimeR7(cooldownPathC2) === cooldownBeforeC2 && /already charged/.test(rC2b.stderr || ''),
+    `status=${rC2b.status} before=${cooldownBeforeC2} after=${mtimeR7(cooldownPathC2)} stderr=${rC2b.stderr?.slice(-300)}`);
+  fs.rmSync(homeC2, { recursive: true, force: true });
 }
 
 // v0.42 (#109): a synthetic placeholder such as https://chatgpt.com/c/WEB:<uuid> once passed the
