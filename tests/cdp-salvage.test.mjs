@@ -3771,4 +3771,184 @@ for (const placeholder of PLACEHOLDER_URLS) {
   fs.rmSync(customResDir, { recursive: true, force: true });
 }
 
+{ // #216 gate r1 P2 (paid review, finding at bin/cdp-salvage.mjs:171): an explicitly EMPTY --url
+  // scope silently became an UNSCOPED close. `--close --url ''` passed the shape gate because the
+  // gate tested the VALUE's truthiness, and then the close filter -- the same truthiness test --
+  // skipped URL narrowing entirely. A marker owning two conversations (a memoized one and a retry
+  // sibling) therefore had BOTH closed by a caller that believed it had scoped the close to one:
+  // the exact blast radius #206 finding A removed, reachable whenever a caller's scope expression
+  // evaluates to nothing (an empty pg_conversation_url_read, an unset shell variable). The flag's
+  // PRESENCE is now what selects scoped behavior, and a present-but-unusable value is refused
+  // before any browser access. Unscoped close stays reachable by omitting --url, which the
+  // '--close without --url still closes every owned tab' check above holds unchanged.
+  const ownedText = [
+    `run marker: ${MARKER}`,
+    'P1: none', 'P2: none', 'P3: none',
+    `VERDICT: SHIP — ours. (run marker: ${MARKER})`,
+  ].join('\n');
+  const URL_B = 'https://chatgpt.com/c/mock-conversation-b';
+  {
+    const cdp = await mockCdp(ownedText, [{ id: 'tabB', type: 'page', url: URL_B }],
+      { tabText: () => ownedText });
+    const r = await runSalvage(['--close', '--url', '', MARKER, '10'], cdp.port);
+    check("#216 gate r1 P2: --close --url '' closes NEITHER owned conversation and exits 2",
+      r.status === 2 && cdp.closed.length === 0,
+      `status=${r.status} closed=${JSON.stringify(cdp.closed)} stderr=${r.stderr?.slice(-300)}`);
+    check("#216 gate r1 P2: the empty --url refusal is one usage line that names the empty value",
+      (r.stderr ?? '').trim().split('\n').length === 1
+        && /^usage:/.test((r.stderr ?? '').trim())
+        && (r.stderr ?? '').includes('(empty)'),
+      `stderr=${JSON.stringify(r.stderr)}`);
+    cdp.stop();
+  }
+  {
+    // Outside --close the flag was already a usage error for every non-empty value; an empty one
+    // slipped through the same truthiness test and was silently ignored, so the run proceeded.
+    const cdp = await mockCdp(ownedText);
+    const r = await runSalvage(['--probe', '--url', '', MARKER, '10'], cdp.port);
+    check("#216 gate r1 P2: --url '' outside --close is a usage error, not an ignored flag",
+      r.status === 2 && cdp.closed.length === 0 && /^usage:/.test((r.stderr ?? '').trim()),
+      `status=${r.status} closed=${JSON.stringify(cdp.closed)} stderr=${r.stderr?.slice(-300)}`);
+    cdp.stop();
+  }
+}
+
+{ // #216 gate r1 P2 (paid review, finding at bin/cdp-salvage.mjs:207): an EMPTY
+  // PRO_GATE_RESERVATION_DIR disabled retained-memo protection outright. The shell's
+  // pg_reservation_dir() is "${PRO_GATE_RESERVATION_DIR:-$PRO_GATE_HOME/in-progress}", which
+  // falls back on empty as well as unset; JavaScript's `??` did not, so RESERVATION_DIR stayed
+  // '', path.join('', marker) resolved against the process's working directory, every existsSync
+  // missed, and every retained reservation read as unprotected -- finding B's eviction bug, back
+  // under one configuration. The control for this is the non-empty override check above.
+  const seedMemoCohortHomeReservations = (entries) => (home) => {
+    const dir = path.join(home, 'conversation-urls');
+    fs.mkdirSync(dir, { recursive: true });
+    const resDir = path.join(home, 'in-progress');
+    entries.forEach(({ marker: m, protectedMarker }, i) => {
+      const f = path.join(dir, m);
+      fs.writeFileSync(f, 'https://chatgpt.com/c/seed-placeholder\n');
+      const t = new Date(1700099000000 + i * 1000);
+      fs.utimesSync(f, t, t);
+      if (protectedMarker) {
+        fs.mkdirSync(resDir, { recursive: true });
+        fs.writeFileSync(path.join(resDir, m), 'seed-reservation\n');
+      }
+    });
+  };
+  const newAnswer = (m) => [
+    `run marker: ${m}`, 'P1: none', 'P2: none', 'P3: none',
+    `VERDICT: SHIP — ours. (run marker: ${m})`,
+  ].join('\n');
+
+  const PROTECTED = 'pg-run-resdir-empty-protected-1700099000-1';
+  const unprotected = Array.from({ length: 200 }, (_, i) => `pg-run-resdir-empty-u-${i}-1700099000-1`);
+  const cohort = [{ marker: PROTECTED, protectedMarker: true }, ...unprotected.map((m) => ({ marker: m }))];
+  const NEW_MARKER = 'pg-run-resdir-empty-new-1700099500-9';
+  const cdp = await mockCdp(newAnswer(NEW_MARKER));
+  const r = await runSalvage([NEW_MARKER, '20'], cdp.port, seedMemoCohortHomeReservations(cohort),
+    { PRO_GATE_RESERVATION_DIR: '' });
+  const memoSet = new Set(r.memos);
+  check("#216 gate r1 P2: an EMPTY PRO_GATE_RESERVATION_DIR falls back to PRO_GATE_HOME/in-progress like the shell, so a protected marker still survives eviction",
+    memoSet.has(PROTECTED), `memos.length=${r.memos.length} stderr=${r.stderr?.slice(-300)}`);
+  check("#216 gate r1 P2: the empty override still evicts the oldest UNPROTECTED memo",
+    !memoSet.has(unprotected[0]) && memoSet.has(unprotected[1]) && memoSet.has(NEW_MARKER)
+      && r.memos.length === 201,
+    `memos.length=${r.memos.length} evicted0=${memoSet.has(unprotected[0])} kept1=${memoSet.has(unprotected[1])}`);
+  cdp.stop();
+}
+
+{ // #216 gate r1 P2 (paid review, finding at bin/oracle-review.sh:889): reservation protection
+  // stops a retained memo being DELETED; nothing stopped it being OVERWRITTEN, and #206 finding
+  // A's scoped close made that the loss that matters. With owned conversations A and B and a memo
+  // naming A, supersession cleanup closes A and leaves B; the next pass that publishes a memo --
+  // classically an incomplete harvest's rename-only organizer, for which B is now the sole open
+  // candidate -- republishes B over A, and the paid review sitting at the CLOSED conversation A
+  // becomes undiscoverable through marker-addressed recovery. rememberUrl() now refuses that one
+  // replacement: a retained superseded reservation's existing memo is kept, and the sibling loses
+  // nothing, because an OPEN conversation is found by every tab scan on its own.
+  const PIN_MARKER = 'pg-run-memo-pin-1700099700-1';
+  const URL_A = 'https://chatgpt.com/c/pinned-conversation-a';   // the closed, memoized review
+  const URL_B = 'https://chatgpt.com/c/mock-conversation';       // mockCdp's tab1: the open sibling
+  const ownedIncomplete = `run marker: ${PIN_MARKER}\nStill thinking about the diff...`;
+  const ownedTerminal = [
+    `run marker: ${PIN_MARKER}`, 'P1: none', 'P2: none', 'P3: none',
+    `VERDICT: SHIP — sibling answer. (run marker: ${PIN_MARKER})`,
+  ].join('\n');
+  // A reservation record is one TSV line whose last field is the lifecycle state, exactly as
+  // pg_reservation_supersede writes it (see super_seed in tests/engine.test.sh).
+  const seedPinned = ({ memo = URL_A, state = null, title = null } = {}) => (home) => {
+    if (memo) {
+      fs.mkdirSync(path.join(home, 'conversation-urls'), { recursive: true });
+      fs.writeFileSync(path.join(home, 'conversation-urls', PIN_MARKER), `${memo}\n`);
+    }
+    if (state) {
+      fs.mkdirSync(path.join(home, 'in-progress'), { recursive: true });
+      fs.writeFileSync(path.join(home, 'in-progress', PIN_MARKER),
+        `pin-77\t${path.join(home, 'pin-audit.md')}\t1700099700\t0\t1\tGPT-X\t1700099700\t${state}\n`);
+    }
+    if (title) {
+      fs.mkdirSync(path.join(home, 'conversation-titles'), { recursive: true });
+      fs.writeFileSync(path.join(home, 'conversation-titles', PIN_MARKER), `${title}\n`);
+    }
+  };
+
+  { // The finding's own path: the rename-only organizer, with A's tab gone and B the sole
+    // candidate. The rename it performs is the proof it reached the republication point.
+    const cdp = await mockCdp(ownedIncomplete, [], { ui: { title: null, archived: false, events: [] } });
+    const r = await runSalvage(['--organize', PIN_MARKER, '5'], cdp.port,
+      seedPinned({ state: 'superseded', title: 'pro-gate review: PR #216 r1 [pin]' }));
+    check('#216 gate r1 P2: the rename-only organizer does not replace a retained superseded reservation\'s memo',
+      r.memoUrl === URL_A && r.memos.length === 1,
+      `memoUrl=${r.memoUrl} memos=${JSON.stringify(r.memos)} stdout=${r.stdout?.slice(-200)}`);
+    check('#216 gate r1 P2: the refusal names both the kept memo and the URL it would not publish',
+      (r.stderr ?? '').includes(`memo-pinned: keeping ${URL_A} for "${PIN_MARKER}"`)
+        && (r.stderr ?? '').includes(`not replacing with ${URL_B}`),
+      `stderr=${r.stderr?.slice(-400)}`);
+    check('#216 gate r1 P2: pinning the memo does not stop the organizer mutating the open sibling',
+      /organizer source=open/.test(r.stdout ?? '') && cdp.ui.events.some((e) => e.action === 'rename'),
+      `stdout=${r.stdout?.slice(-200)} events=${JSON.stringify(cdp.ui.events)}`);
+    cdp.stop();
+  }
+  { // Control: a GENERATING reservation is a live round whose organizer may still legitimately
+    // refresh the memo. Without this, "never replace when a reservation exists" would pass too.
+    const cdp = await mockCdp(ownedIncomplete, [], { ui: { title: null, archived: false, events: [] } });
+    const r = await runSalvage(['--organize', PIN_MARKER, '5'], cdp.port,
+      seedPinned({ state: 'generating', title: 'pro-gate review: PR #216 r1 [pin]' }));
+    check('#216 gate r1 P2 control: a generating reservation still lets the organizer refresh the memo',
+      r.memoUrl === URL_B && !(r.stderr ?? '').includes('memo-pinned:'),
+      `memoUrl=${r.memoUrl} stderr=${r.stderr?.slice(-300)}`);
+    cdp.stop();
+  }
+  { // Control: no reservation record at all -- unchanged pre-#216 behavior.
+    const cdp = await mockCdp(ownedIncomplete, [], { ui: { title: null, archived: false, events: [] } });
+    const r = await runSalvage(['--organize', PIN_MARKER, '5'], cdp.port,
+      seedPinned({ title: 'pro-gate review: PR #216 r1 [pin]' }));
+    check('#216 gate r1 P2 control: with no reservation record the organizer refreshes the memo',
+      r.memoUrl === URL_B && !(r.stderr ?? '').includes('memo-pinned:'),
+      `memoUrl=${r.memoUrl} stderr=${r.stderr?.slice(-300)}`);
+    cdp.stop();
+  }
+  { // The other publisher: onOurConversation(), reached by an ordinary salvage that positively
+    // matches the sibling's tab. Same refusal, and the capture still succeeds -- the pin governs
+    // the recovery handle, never the review this pass extracted.
+    const cdp = await mockCdp(ownedTerminal);
+    const r = await runSalvage([PIN_MARKER, '10'], cdp.port, seedPinned({ state: 'superseded' }));
+    check('#216 gate r1 P2: a positive match on the open sibling does not replace the retained memo either',
+      r.status === 0 && r.memoUrl === URL_A
+        && (r.stderr ?? '').includes(`memo-pinned: keeping ${URL_A}`),
+      `status=${r.status} memoUrl=${r.memoUrl} stderr=${r.stderr?.slice(-400)}`);
+    cdp.stop();
+  }
+  { // Boundary: the pin keeps an EXISTING handle, it does not forbid a first one. A superseded
+    // round that never memoized a URL (the memo-less case #206 gate r7 P2 leaves its tab open
+    // for) must still be able to publish its first memo, or that run loses recovery entirely.
+    const cdp = await mockCdp(ownedTerminal);
+    const r = await runSalvage([PIN_MARKER, '10'], cdp.port, seedPinned({ memo: null, state: 'superseded' }));
+    check('#216 gate r1 P2 boundary: a superseded reservation with NO memo still publishes its first one',
+      r.status === 0 && r.memoUrl === URL_B && !(r.stderr ?? '').includes('memo-pinned:'),
+      `status=${r.status} memoUrl=${r.memoUrl} stderr=${r.stderr?.slice(-300)}`);
+    cdp.stop();
+  }
+}
+
 process.exit(failures === 0 ? 0 : 1);

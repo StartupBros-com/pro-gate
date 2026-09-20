@@ -132,6 +132,14 @@ let rename = true;
 let resultFile = null;
 let acceptedUrl = null;
 let closeUrl = null;
+// #216 gate r1 P2: whether --url was SUPPLIED, tracked apart from its value. A falsy-value check
+// cannot tell "flag omitted" from "flag given an empty value", and the two must not mean the same
+// thing: the first is the documented unscoped close, the second is a caller whose scope
+// expression produced nothing (an empty pg_conversation_url_read, an unset shell variable). Under
+// the old truthiness test `--close --url '' <marker>` passed validation AND then skipped the URL
+// filter, so a marker owning two conversations had BOTH closed -- the exact unscoped blast radius
+// #206 finding A exists to prevent, reachable by accident.
+let urlFlagSeen = false;
 for (;;) {
   const arg = argv[0];
   if (!arg?.startsWith('--')) break;
@@ -146,6 +154,7 @@ for (;;) {
   } else if (arg === '--accepted-url') {
     acceptedUrl = argv.shift() ?? null;
   } else if (arg === '--url') {
+    urlFlagSeen = true;
     closeUrl = argv.shift() ?? null;
   } else if (arg === '--archive') {
     archive = true;
@@ -156,7 +165,7 @@ for (;;) {
   }
 }
 if (mode !== 'organize' && (finalize || archive || !rename || resultFile || acceptedUrl)) usage();
-if (mode !== 'close' && closeUrl) usage();
+if (mode !== 'close' && urlFlagSeen) usage();
 if (archive && !finalize) usage();
 if (finalize !== !!resultFile || (acceptedUrl && !finalize)) usage();
 if (acceptedUrl && !/^https:\/\/chatgpt\.com\/c\//.test(acceptedUrl)) usage();
@@ -168,8 +177,14 @@ if (acceptedUrl && !/^https:\/\/chatgpt\.com\/c\//.test(acceptedUrl)) usage();
 // open tab could ever match, so --close exited 0 reporting "closed 0 conversation tab(s)" and
 // the caller could not tell a nonsense scope from an honest "nothing owned". Same predicate,
 // and a named refusal rather than the bare usage line, because only one argument is at fault.
-if (closeUrl && !conversationUrlOk(closeUrl)) {
-  console.error(`usage: --url must be a conversation URL like https://chatgpt.com/c/<id>, got: ${closeUrl}`);
+// #216 gate r1 P2: gated on the FLAG, not on its value. `--url ''` used to slip past this check
+// (empty is falsy) and then past the close filter below, silently widening the close to every
+// owned conversation; a missing value (`--close --url` with nothing after it) did the same. Both
+// are now refused here, before any browser access, so an unscoped close is reachable only by
+// omitting --url entirely.
+if (urlFlagSeen && !conversationUrlOk(closeUrl)) {
+  const shown = closeUrl === null ? '(no value)' : closeUrl === '' ? '(empty)' : closeUrl;
+  console.error(`usage: --url must be a conversation URL like https://chatgpt.com/c/<id>, got: ${shown}`);
   process.exit(2);
 }
 const probe = mode === 'probe';
@@ -188,10 +203,19 @@ const RENDER_SAMPLE_MS = TEST_TIMING_ENABLED
   ? (parseTestRenderSampleMs(process.env.PRO_GATE_TEST_RENDER_SAMPLE_MS) ?? 2_500)
   : 2_500;
 
-const PG_HOME = process.env.PRO_GATE_HOME ?? path.join(os.homedir(), '.pro-review-daemon');
+// #216 gate r1 P2: every PRO_GATE_* path override this file reads has a shell twin spelled
+// "${VAR:-<default>}" (pro-gate-lib.sh: PRO_GATE_HOME line 6, pg_cooldown_active,
+// pg_completed_dir, pg_reservation_dir), and that form falls back on EMPTY as well as on unset.
+// `??` did not: an empty override survived as the path, so path.join('', name) resolved relative
+// to the process's working directory and the two languages silently disagreed about where the
+// state lives. For RESERVATION_DIR that disagreement was a live defect -- every existsSync missed,
+// so every retained reservation read as unprotected and finding B's memo eviction came back under
+// that one configuration. One rule for all of them rather than a guard at each reader.
+const envPath = (name, ...fallback) => process.env[name] || path.join(...fallback);
+const PG_HOME = envPath('PRO_GATE_HOME', os.homedir(), '.pro-review-daemon');
 const BLACKLIST_FILE = path.join(PG_HOME, 'salvage-nonmatching.txt');
 // honor the same override pg_health_gate reads, or a detected throttle would never defer runs
-const COOLDOWN_FILE = process.env.PRO_GATE_COOLDOWN_FILE ?? path.join(PG_HOME, 'throttle.cooldown');
+const COOLDOWN_FILE = envPath('PRO_GATE_COOLDOWN_FILE', PG_HOME, 'throttle.cooldown');
 
 // --- conversation-URL memory (v0.25) -------------------------------------------------
 // One file per run marker holding the conversation URL we PROVED carries it. This is the
@@ -199,12 +223,12 @@ const COOLDOWN_FILE = process.env.PRO_GATE_COOLDOWN_FILE ?? path.join(PG_HOME, '
 // match (probe included) and read before we ever conclude "not found".
 const URL_MEMO_DIR = path.join(PG_HOME, 'conversation-urls');
 const TITLE_MEMO_DIR = path.join(PG_HOME, 'conversation-titles');
-const COMPLETED_DIR = process.env.PRO_GATE_COMPLETED_DIR ?? path.join(PG_HOME, 'completed');
+const COMPLETED_DIR = envPath('PRO_GATE_COMPLETED_DIR', PG_HOME, 'completed');
 const PENDING_DIR = path.join(PG_HOME, 'pending');
 // #206 gate r8 P2 finding B: a marker's reservation record (the shell lib's pg_reservation_dir,
 // states include generating and superseded) is the proof its memo is still someone's only
 // recovery handle. rememberUrl()'s eviction below reads this by existence only.
-const RESERVATION_DIR = process.env.PRO_GATE_RESERVATION_DIR ?? path.join(PG_HOME, 'in-progress');
+const RESERVATION_DIR = envPath('PRO_GATE_RESERVATION_DIR', PG_HOME, 'in-progress');
 const MEMO_KEEP = 200;                  // newest N unprotected memos retained; older ones are pruned on write
 const MARKER_SAFE_RE = /^pg-run-[A-Za-z0-9.-]+$/;
 // #167: the marker is EXTRACTED case-insensitively everywhere but used to be COMPARED
@@ -229,6 +253,21 @@ const sameMarker = (a, b) => !!a && !!b && asciiFold(a) === asciiFold(b);
 // parser, which holds `--close --url` to that same predicate.
 const memoPath = (m) => (MARKER_SAFE_RE.test(m) ? path.join(URL_MEMO_DIR, m) : null);
 const titleMemoPath = (m) => (MARKER_SAFE_RE.test(m) ? path.join(TITLE_MEMO_DIR, m) : null);
+
+// #216 gate r1 P2: this marker's reservation lifecycle state, or null when there is no readable
+// record. The record is one TSV line whose LAST field is the state (field 8 of the canonical
+// 8-field record -- the same field the shell's pg_reservation_state reads with
+// awk -F'\t' 'NR==1{print $8}'). Any absent, unreadable, or differently shaped record answers
+// null and changes no behavior, which is the fail-open direction: the caller below only ever
+// WITHHOLDS a write on a positive `superseded`.
+function reservationState(m) {
+  if (!MARKER_SAFE_RE.test(m)) return null;
+  let first = '';
+  try { first = fs.readFileSync(path.join(RESERVATION_DIR, m), 'utf8').split('\n')[0]; } catch { return null; }
+  if (!first) return null;
+  const fields = first.split('\t');
+  return fields[fields.length - 1].trim() || null;
+}
 
 function recallUrl(m) {
   const f = memoPath(m);
@@ -402,7 +441,25 @@ function rememberUrl(m, url) {
     }
     return;
   }
-  if (recallUrl(m) === url) return;     // already known: no churn, no prune
+  const existing = recallUrl(m);
+  if (existing === url) return;     // already known: no churn, no prune
+  // #216 gate r1 P2: a RETAINED SUPERSEDED reservation's memo is never replaced, only kept.
+  // Reservation protection (the eviction guard below, and the engine's 14-day memo sweep) stops
+  // a retained memo being DELETED; it does nothing about it being OVERWRITTEN, and overwriting
+  // is the likelier loss. #206 finding A closed the superseded round's tab, scoped to exactly
+  // the URL this memo names, so the memo is now the ONLY handle to that conversation. A later
+  // pass that finds a sibling -- a retry conversation sharing the marker -- would publish the
+  // sibling here and make the closed, PAID review undiscoverable through marker-addressed
+  // recovery. The classic shape is an incomplete harvest reaching pg_finish 9's rename-only
+  // organizer: with the memo's own tab closed, the sibling is the sole open candidate, so the
+  // organizer selects it and republishes. Refusing costs nothing, because the sibling is still
+  // OPEN and every scan finds it on its own; the closed conversation has no such second path.
+  // A `generating` reservation is deliberately unaffected: that round is live and its organizer
+  // may still legitimately refresh the memo.
+  if (existing && reservationState(m) === 'superseded') {
+    console.error(`memo-pinned: keeping ${existing} for "${m}" (retained superseded reservation); not replacing with ${url}`);
+    return;
+  }
   try {
     fs.mkdirSync(URL_MEMO_DIR, { recursive: true });
     // Atomic publish (gate #54 r7): an in-place writeFileSync truncates first, so the shell's
@@ -1284,7 +1341,11 @@ if (close) {
     tabs = (await (await fetch(`http://127.0.0.1:${port}/json`)).json())
       .filter((t) => t.type === 'page' && /chatgpt\.com\/c\//.test(t.url || ''));
   } catch { process.exit(0); }
-  if (closeUrl) {
+  // #216 gate r1 P2: the scope question is "was --url supplied?", the same question the
+  // validation above answered. Reading closeUrl's truthiness here a second time is what let an
+  // explicitly empty value fall through to the unscoped branch; by this point urlFlagSeen implies
+  // a conversationUrlOk value, so the two can never disagree again.
+  if (urlFlagSeen) {
     const targetId = conversationIdFromUrl(closeUrl);
     tabs = tabs.filter((t) => conversationIdFromUrl(t.url) === targetId);
   }
@@ -1293,7 +1354,7 @@ if (close) {
     const text = await tabText(tab);
     if (text && organizerOwnership(text).owned) { await closeTab(tab.id); closed += 1; }
   }
-  console.error(`cdp-salvage --close: closed ${closed} conversation tab(s) matching "${marker}"${closeUrl ? ` at ${closeUrl}` : ''}`);
+  console.error(`cdp-salvage --close: closed ${closed} conversation tab(s) matching "${marker}"${urlFlagSeen ? ` at ${closeUrl}` : ''}`);
   process.exit(0);
 }
 

@@ -53,9 +53,9 @@ exit 99
 FAKE_PREFLIGHT
 chmod +x "$TDIR/bin/oracle-preflight"
 
-start_mock() { # $1 = source text; optional $2 = organizer/browser state; optional $3 = scratch text; optional $4 = scratch canonical URL
+start_mock() { # $1 = source text; optional $2 = organizer/browser state; optional $3 = scratch text; optional $4 = scratch canonical URL; optional $5 = second owned tab URL
   [ -n "${MOCK_PID:-}" ] && kill "$MOCK_PID" 2>/dev/null
-  node "$HERE/mock-cdp.mjs" "$1" "${2:-}" "${3:-}" "${4:-}" > "$TDIR/port" 2>"$TDIR/mock.log" &
+  node "$HERE/mock-cdp.mjs" "$1" "${2:-}" "${3:-}" "${4:-}" "${5:-}" > "$TDIR/port" 2>"$TDIR/mock.log" &
   MOCK_PID=$!
   # A cold CI runner has taken >5s to get node to its first write here, and an empty PORT is
   # SILENT: every following test then points the engine at the default 9222, gets "CDP not
@@ -7151,6 +7151,89 @@ check '#216 r3 P3 memo-gone warning: a surviving memo is not warned about' \
      && [ "$(cat "$TDIR/memo-kept.stderr")" = 'Review superseded' ] \
      && [ "$(cat "$MEMOKEPT_HOME/conversation-urls/$MEMOKEPT_MARKER")" = "$MEMOGONE_URL" ]; echo $?)" \
   "rc=$MEMOKEPT_RC stderr=$(cat "$TDIR/memo-kept.stderr") memo=$(cat "$MEMOKEPT_HOME/conversation-urls/$MEMOKEPT_MARKER" 2>/dev/null)"
+
+# #216 gate r1 P2 (engine level): reservation protection keeps a retained superseded memo from
+# being DELETED (the MEMO_KEEP eviction and the 14-day sweep); nothing kept it from being
+# REPLACED, and after #206 finding A scoped the supersession close to exactly the URL that memo
+# names, replacement is the loss that matters. Full shape, against a real mock CDP browser
+# presenting the two conversations one marker can own:
+#   1. conversations A (memoized, mock tab1) and B (the retry sibling, mock tab2) are both open
+#      and both owned; --recover supersedes and closes ONLY A.
+#   2. an incomplete --harvest then reaches pg_finish 9's rename-only organizer, for which B is
+#      now the sole open candidate -- the republication point. Pre-fix it publishes B over A.
+#   3. a later --harvest, with no tab left open, must still reach A through the remembered URL.
+# Step 3 is the consequence the finding names: with the memo overwritten, marker-addressed
+# recovery opens the wrong conversation and the PAID review at A is undiscoverable.
+PIN_HOME="$TDIR/home-memo-pin"
+PIN_MARKER='pg-run-acme-fresh-77-1700014700-1'
+PIN_URL_A='https://chatgpt.com/c/mock-conversation'             # mock tab1: the memoized review
+PIN_URL_B='https://chatgpt.com/c/mock-conversation-retry-b'     # mock tab2: the retry sibling
+PIN_SENTINEL="$TDIR/memo-pin-oracle-invocations"
+mkdir -p "$PIN_HOME/in-progress" "$PIN_HOME/conversation-urls" "$PIN_HOME/conversation-titles"
+printf '%s\t%s\t%s\t0\t1\tGPT-X\t%s\tsuperseded\n' "$SUPER_KEY" "$TDIR/memo-pin-audit.md" "$(date +%s)" 1700014700 \
+  > "$PIN_HOME/in-progress/$PIN_MARKER"
+printf '%s\n' "$PIN_URL_A" > "$PIN_HOME/conversation-urls/$PIN_MARKER"
+printf 'pro-gate review: PR #216 r1 [memo-pin]\n' > "$PIN_HOME/conversation-titles/$PIN_MARKER"
+PIN_SOURCE="$TDIR/memo-pin-source.txt"
+printf 'run marker: %s\nStill thinking about the diff.\n' "$PIN_MARKER" > "$PIN_SOURCE"
+PIN_STATE="$TDIR/memo-pin-state.json"
+printf '{"title":null,"archived":false,"events":[]}\n' > "$PIN_STATE"
+: > "$PIN_SENTINEL"
+start_mock "$PIN_SOURCE" "$PIN_STATE" "" "" "$PIN_URL_B"
+env -u PRO_GATE_KEEP_TABS PRO_GATE_HOME="$PIN_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_SELF_HEAL=0 NODE_OPTIONS= \
+  bash "$ENGINE" --recover "$PIN_MARKER" --timeout 1s >"$TDIR/memo-pin-recover.stdout" 2>"$TDIR/memo-pin-recover.stderr"
+PIN_RECOVER_RC=$?
+check '#216 gate r1 P2: supersession cleanup closes only the memoized conversation and leaves the retry sibling open' \
+  "$([ "$PIN_RECOVER_RC" -eq 6 ] \
+     && grep -qx 'Review superseded' "$TDIR/memo-pin-recover.stderr" \
+     && [ "$(jq -r '(.closed // []) | map(select(. == "tab1")) | length' "$PIN_STATE")" = 1 ] \
+     && [ "$(jq -r '(.closed // []) | map(select(. == "tab2")) | length' "$PIN_STATE")" = 0 ]; echo $?)" \
+  "rc=$PIN_RECOVER_RC stderr=$(cat "$TDIR/memo-pin-recover.stderr") state=$(cat "$PIN_STATE")"
+
+env -u PRO_GATE_KEEP_TABS PRO_GATE_HOME="$PIN_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-stale-sentinel" \
+  PG_TEST_ORACLE_SENTINEL="$PIN_SENTINEL" NODE_OPTIONS= \
+  bash "$ENGINE" --harvest "$PIN_MARKER" --out "$TDIR/memo-pin-harvest.md" --timeout 5s \
+  >"$TDIR/memo-pin-harvest.stdout" 2>"$TDIR/memo-pin-harvest.stderr"
+PIN_HARVEST_RC=$?
+check '#216 gate r1 P2: the incomplete harvest does reach the rename-only organizer, which mutates the sibling B' \
+  "$([ "$PIN_HARVEST_RC" -eq 9 ] && [ ! -s "$PIN_SENTINEL" ] \
+     && [ "$(jq -r '[.events[]? | select(.action == "rename") | .tab] | join(",")' "$PIN_STATE")" = tab2 ]; echo $?)" \
+  "rc=$PIN_HARVEST_RC state=$(cat "$PIN_STATE") organizer=$(grep -F 'organizer ' "$TDIR/memo-pin-harvest.stderr" | tail -1)"
+check '#216 gate r1 P2: that organizer does NOT republish the sibling over the retained memo' \
+  "$([ "$(cat "$PIN_HOME/conversation-urls/$PIN_MARKER" 2>/dev/null)" = "$PIN_URL_A" ]; echo $?)" \
+  "memo=$(cat "$PIN_HOME/conversation-urls/$PIN_MARKER" 2>/dev/null) expected=$PIN_URL_A"
+
+# Step 3: no conversation tab is open at all, so the remembered URL is the only handle left. The
+# mock serves its completed scratch render ONLY for the canonical URL it was given, so a memo
+# naming B (the pre-fix outcome) opens the wrong conversation and cannot reach this review.
+PIN_SCRATCH="$TDIR/memo-pin-scratch.txt"
+cat > "$PIN_SCRATCH" <<PIN_SCRATCH_TEXT
+run marker: $PIN_MARKER
+[P1] src/memo-pin.mjs:1 — recovered through the preserved memo
+P2: none
+VERDICT: SHIP — pinned recovery complete. (run marker: $PIN_MARKER)
+PIN_SCRATCH_TEXT
+cat > "$TDIR/memo-pin-expected.md" <<'PIN_EXPECTED_TEXT'
+[P1] src/memo-pin.mjs:1 — recovered through the preserved memo
+P2: none
+VERDICT: SHIP — pinned recovery complete.
+PIN_EXPECTED_TEXT
+PIN_STATE2="$TDIR/memo-pin-state2.json"
+printf '{"title":null,"archived":false,"events":[]}\n' > "$PIN_STATE2"
+printf '__NO_TABS__' > "$PIN_SOURCE"
+: > "$PIN_SENTINEL"
+start_mock "$PIN_SOURCE" "$PIN_STATE2" "$PIN_SCRATCH" "$PIN_URL_A" "$PIN_URL_B"
+env -u PRO_GATE_KEEP_TABS PRO_GATE_HOME="$PIN_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-stale-sentinel" \
+  PG_TEST_ORACLE_SENTINEL="$PIN_SENTINEL" NODE_OPTIONS= \
+  bash "$ENGINE" --harvest "$PIN_MARKER" --out "$TDIR/memo-pin-late.md" --timeout 10s \
+  >"$TDIR/memo-pin-late.stdout" 2>"$TDIR/memo-pin-late.stderr"
+PIN_LATE_RC=$?
+check '#216 gate r1 P2: the preserved memo still recovers the CLOSED conversation A in a later harvest' \
+  "$([ "$PIN_LATE_RC" -eq 0 ] && cmp -s "$TDIR/memo-pin-late.md" "$TDIR/memo-pin-expected.md" \
+     && [ "$(jq -r '.created[0].url' "$PIN_STATE2")" = "$PIN_URL_A" ] && [ ! -s "$PIN_SENTINEL" ]; echo $?)" \
+  "rc=$PIN_LATE_RC out=$(cat "$TDIR/memo-pin-late.md" 2>/dev/null) state=$(cat "$PIN_STATE2") stderr=$(tail -3 "$TDIR/memo-pin-late.stderr")"
 
 SUPER_SNAPSHOT="$(PRO_GATE_HOME="$SUPER_HEAD_HOME" pg_attempt_snapshot github.com acme fresh 77 "$SUPER_KEY")"
 SUPER_PLAN="$(PRO_GATE_HOME="$SUPER_HEAD_HOME" pg_reservation_slot_plan 1)"
