@@ -7008,6 +7008,45 @@ check '#206 fresh GH-proof (head-moved) supersession with a remembered URL close
      && [ "$(jq -r '(.closed // []) | map(select(. == "tab1")) | length' "$SUPER_CLOSE2_STATE")" = 1 ]; echo $?)" \
   "rc=$SUPER_CLOSE2_RC stderr=$(cat "$TDIR/super-close2.stderr") state=$(cat "$SUPER_CLOSE2_STATE")"
 
+# #206 gate r8 P2 finding A (engine level): recover_close_tab must forward the remembered URL to
+# cdp-salvage.mjs as `--close --url <url>`, not a bare `--close`, so the salvage script can scope the
+# close to the one conversation the memo names. $ENGINE is fixed at file-load time from
+# PG_TEST_ENGINE, so a per-test stand-in engine can't be swapped in through that variable; instead
+# build a scratch copy of bin/ + lib/ next to the real ones (the engine resolves cdp-salvage.mjs
+# beside itself via $SELF) and overwrite the copy's cdp-salvage.mjs with a stub that just logs its
+# argv, then invoke that scratch engine directly.
+ENGWRAP_DIR="$TDIR/enginewrap-close-scope"
+mkdir -p "$ENGWRAP_DIR"
+cp -r "$HERE/../bin" "$ENGWRAP_DIR/bin"
+cp -r "$HERE/../lib" "$ENGWRAP_DIR/lib"
+CLOSE_ARGV_LOG="$TDIR/close-argv.log"
+cat > "$ENGWRAP_DIR/bin/cdp-salvage.mjs" <<'STUB'
+#!/usr/bin/env node
+import fs from 'node:fs';
+const log = process.env.PG_TEST_CLOSE_ARGV_LOG;
+if (log) fs.appendFileSync(log, process.argv.slice(2).join(' ') + '\n');
+process.exit(0);
+STUB
+
+CLOSE_SCOPE_HOME="$TDIR/home-close-scope"
+CLOSE_SCOPE_MARKER='pg-run-acme-fresh-77-1700014400-1'
+CLOSE_SCOPE_URL='https://chatgpt.com/c/mock-conversation-scope-a'
+mkdir -p "$CLOSE_SCOPE_HOME/in-progress" "$CLOSE_SCOPE_HOME/conversation-urls"
+printf '%s\t%s\t%s\t0\t1\tGPT-X\t%s\tsuperseded\n' "$SUPER_KEY" "$TDIR/close-scope-audit.md" "$(date +%s)" 1700014400 \
+  > "$CLOSE_SCOPE_HOME/in-progress/$CLOSE_SCOPE_MARKER"
+printf '%s\n' "$CLOSE_SCOPE_URL" > "$CLOSE_SCOPE_HOME/conversation-urls/$CLOSE_SCOPE_MARKER"
+
+env -u PRO_GATE_KEEP_TABS PRO_GATE_HOME="$CLOSE_SCOPE_HOME" ORACLE_BROWSER_PORT=1 PRO_GATE_SELF_HEAL=0 \
+  PG_TEST_CLOSE_ARGV_LOG="$CLOSE_ARGV_LOG" NODE_OPTIONS= \
+  bash "$ENGWRAP_DIR/bin/oracle-review.sh" --recover "$CLOSE_SCOPE_MARKER" --timeout 1s \
+  >"$TDIR/close-scope.stdout" 2>"$TDIR/close-scope.stderr"
+CLOSE_SCOPE_RC=$?
+check '#206 gate r8 P2 finding A: recover_close_tab forwards the remembered URL to --close --url' \
+  "$([ "$CLOSE_SCOPE_RC" -eq 6 ] \
+     && [ "$(cat "$TDIR/close-scope.stderr")" = 'Review superseded' ] \
+     && grep -qF -- "--close --url $CLOSE_SCOPE_URL $CLOSE_SCOPE_MARKER" "$CLOSE_ARGV_LOG"; echo $?)" \
+  "rc=$CLOSE_SCOPE_RC stderr=$(cat "$TDIR/close-scope.stderr") argvlog=$(cat "$CLOSE_ARGV_LOG" 2>/dev/null)"
+
 SUPER_SNAPSHOT="$(PRO_GATE_HOME="$SUPER_HEAD_HOME" pg_attempt_snapshot github.com acme fresh 77 "$SUPER_KEY")"
 SUPER_PLAN="$(PRO_GATE_HOME="$SUPER_HEAD_HOME" pg_reservation_slot_plan 1)"
 check 'superseded snapshot is fresh-eligible and holds zero capacity while remaining collectable' \

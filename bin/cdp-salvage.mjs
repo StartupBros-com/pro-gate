@@ -106,7 +106,7 @@ import {
 } from './cdp-test-timing.mjs';
 
 const usage = () => {
-  console.error('usage: cdp-salvage.mjs [--probe|--close|--sweep-root|--organize [--finalize --result-file <path>] [--accepted-url <url>] [--archive] [--no-rename]] <pr-marker|-> [timeout-secs] [cdp-port]');
+  console.error('usage: cdp-salvage.mjs [--probe|--close [--url <url>]|--sweep-root|--organize [--finalize --result-file <path>] [--accepted-url <url>] [--archive] [--no-rename]] <pr-marker|-> [timeout-secs] [cdp-port]');
   process.exit(2);
 };
 const argv = process.argv.slice(2);
@@ -116,6 +116,7 @@ let archive = false;
 let rename = true;
 let resultFile = null;
 let acceptedUrl = null;
+let closeUrl = null;
 for (;;) {
   const arg = argv[0];
   if (!arg?.startsWith('--')) break;
@@ -129,6 +130,8 @@ for (;;) {
     resultFile = argv.shift() ?? null;
   } else if (arg === '--accepted-url') {
     acceptedUrl = argv.shift() ?? null;
+  } else if (arg === '--url') {
+    closeUrl = argv.shift() ?? null;
   } else if (arg === '--archive') {
     archive = true;
   } else if (arg === '--no-rename') {
@@ -138,9 +141,11 @@ for (;;) {
   }
 }
 if (mode !== 'organize' && (finalize || archive || !rename || resultFile || acceptedUrl)) usage();
+if (mode !== 'close' && closeUrl) usage();
 if (archive && !finalize) usage();
 if (finalize !== !!resultFile || (acceptedUrl && !finalize)) usage();
 if (acceptedUrl && !/^https:\/\/chatgpt\.com\/c\//.test(acceptedUrl)) usage();
+if (closeUrl && !/^https:\/\/chatgpt\.com\/c\//.test(closeUrl)) usage();
 const probe = mode === 'probe';
 const close = mode === 'close';
 const sweepRoot = mode === 'sweep-root';
@@ -170,7 +175,11 @@ const URL_MEMO_DIR = path.join(PG_HOME, 'conversation-urls');
 const TITLE_MEMO_DIR = path.join(PG_HOME, 'conversation-titles');
 const COMPLETED_DIR = process.env.PRO_GATE_COMPLETED_DIR ?? path.join(PG_HOME, 'completed');
 const PENDING_DIR = path.join(PG_HOME, 'pending');
-const MEMO_KEEP = 200;                  // newest N memos retained; older ones are pruned on write
+// #206 gate r8 P2 finding B: a marker's reservation record (the shell lib's pg_reservation_dir,
+// states include generating and superseded) is the proof its memo is still someone's only
+// recovery handle. rememberUrl()'s eviction below reads this by existence only.
+const RESERVATION_DIR = path.join(PG_HOME, 'in-progress');
+const MEMO_KEEP = 200;                  // newest N unprotected memos retained; older ones are pruned on write
 const MARKER_SAFE_RE = /^pg-run-[A-Za-z0-9.-]+$/;
 // #167: the marker is EXTRACTED case-insensitively everywhere but used to be COMPARED
 // case-sensitively, so a model that lowercased its own echo — markers legitimately carry
@@ -388,11 +397,23 @@ function rememberUrl(m, url) {
     fs.renameSync(tmp, f);
     const entries = fs.readdirSync(URL_MEMO_DIR);
     if (entries.length > MEMO_KEEP) {
-      entries
+      // #206 gate r8 P2 finding B: a memo whose marker still has a retained reservation
+      // (in-progress/<marker>) is a durable recovery handle for a superseded-but-uncollected
+      // run, not churn -- evicting it on a later publication's write could leave that run with
+      // NEITHER an open tab (finding A's --close --url already closed it) NOR a memo. The cap
+      // applies only to UNPROTECTED entries; protected entries never count toward it and are
+      // never removed. A missing in-progress/ directory protects nothing (fail-open to the
+      // pre-existing behavior). One existsSync per candidate, and only because the cap is
+      // already known to be exceeded.
+      const unprotected = entries
+        .filter((n) => { try { return !fs.existsSync(path.join(RESERVATION_DIR, n)); } catch { return true; } })
         .map((n) => { try { return { n, t: fs.statSync(path.join(URL_MEMO_DIR, n)).mtimeMs }; } catch { return { n, t: 0 }; } })
-        .sort((a, b) => b.t - a.t)
-        .slice(MEMO_KEEP)
-        .forEach(({ n }) => { try { fs.unlinkSync(path.join(URL_MEMO_DIR, n)); } catch {} });
+        .sort((a, b) => b.t - a.t);
+      if (unprotected.length > MEMO_KEEP) {
+        unprotected
+          .slice(MEMO_KEEP)
+          .forEach(({ n }) => { try { fs.unlinkSync(path.join(URL_MEMO_DIR, n)); } catch {} });
+      }
     }
   } catch {}
 }
@@ -1230,18 +1251,33 @@ async function organizeConversation() {
   return result;
 }
 
+// #206 gate r8 P2 finding A: --close used to close EVERY tab owned by the marker, not only the
+// one the caller validated a durable handle for. A retry-created conversation shares the same
+// marker as its predecessor, so an unscoped close of "everything owned" could take the finished
+// review down with the abandoned retry. --url narrows the candidate set to the one conversation
+// id (the path segment after /c/, ignoring query and fragment) before ownership is even checked.
+const conversationIdFromUrl = (url) => {
+  const prefix = 'https://chatgpt.com/c/';
+  if (!url || !url.startsWith(prefix)) return null;
+  return url.slice(prefix.length).split(/[?#]/)[0];
+};
+
 if (close) {
   let tabs = [];
   try {
     tabs = (await (await fetch(`http://127.0.0.1:${port}/json`)).json())
       .filter((t) => t.type === 'page' && /chatgpt\.com\/c\//.test(t.url || ''));
   } catch { process.exit(0); }
+  if (closeUrl) {
+    const targetId = conversationIdFromUrl(closeUrl);
+    tabs = tabs.filter((t) => conversationIdFromUrl(t.url) === targetId);
+  }
   let closed = 0;
   for (const tab of tabs) {
     const text = await tabText(tab);
     if (text && organizerOwnership(text).owned) { await closeTab(tab.id); closed += 1; }
   }
-  console.error(`cdp-salvage --close: closed ${closed} conversation tab(s) matching "${marker}"`);
+  console.error(`cdp-salvage --close: closed ${closed} conversation tab(s) matching "${marker}"${closeUrl ? ` at ${closeUrl}` : ''}`);
   process.exit(0);
 }
 

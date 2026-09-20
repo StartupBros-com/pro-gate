@@ -3575,4 +3575,102 @@ for (const placeholder of PLACEHOLDER_URLS) {
   }
 }
 
+{ // #206 gate r8 P2 finding A: --close used to close EVERY tab owned by the marker, not only
+  // the one the caller validated a durable handle for. A retry-created conversation shares its
+  // predecessor's marker, so an unscoped close of "everything owned" could take a finished
+  // review down along with an abandoned retry, and the finished review becomes undiscoverable.
+  // --url narrows the candidate set to the one conversation id before ownership is even checked.
+  const ownedText = [
+    `run marker: ${MARKER}`,
+    'P1: none', 'P2: none', 'P3: none',
+    `VERDICT: SHIP — ours. (run marker: ${MARKER})`,
+  ].join('\n');
+  const URL_A = 'https://chatgpt.com/c/mock-conversation'; // tab1's fixed URL in mockCdp
+  const URL_B = 'https://chatgpt.com/c/mock-conversation-b';
+  const bothOwned = () => ownedText; // both tab1 and tabB render the same owned answer
+
+  {
+    const cdp = await mockCdp(ownedText, [{ id: 'tabB', type: 'page', url: URL_B }], { tabText: bothOwned });
+    const r = await runSalvage(['--close', '--url', URL_A, MARKER, '10'], cdp.port);
+    check('--close --url closes only the tab at that conversation id',
+      r.status === 0 && cdp.closed.includes('tab1') && !cdp.closed.includes('tabB'),
+      `status=${r.status} closed=${JSON.stringify(cdp.closed)} stderr=${r.stderr?.slice(-300)}`);
+    cdp.stop();
+  }
+  {
+    const cdp = await mockCdp(ownedText, [{ id: 'tabB', type: 'page', url: URL_B }], { tabText: bothOwned });
+    const r = await runSalvage(['--close', MARKER, '10'], cdp.port);
+    check('--close without --url still closes every owned tab (unchanged behavior)',
+      r.status === 0 && cdp.closed.includes('tab1') && cdp.closed.includes('tabB'),
+      `status=${r.status} closed=${JSON.stringify(cdp.closed)} stderr=${r.stderr?.slice(-300)}`);
+    cdp.stop();
+  }
+}
+
+{ // #206 gate r8 P2 finding B: rememberUrl()'s MEMO_KEEP eviction used to prune the oldest
+  // memos with no regard for whether the marker's reservation was still retained (states
+  // generating or superseded) -- so a memo that is a superseded run's ONLY recovery handle
+  // could be evicted purely because 200 other memos happen to be newer. Eviction must protect
+  // any memo whose marker still has a reservation file, and the cap must apply only to the
+  // unprotected remainder.
+  const seedMemoCohort = (entries) => (home) => { // entries: oldest-first [{marker, protectedMarker}]
+    const dir = path.join(home, 'conversation-urls');
+    fs.mkdirSync(dir, { recursive: true });
+    const resDir = path.join(home, 'in-progress');
+    entries.forEach(({ marker: m, protectedMarker }, i) => {
+      const f = path.join(dir, m);
+      fs.writeFileSync(f, 'https://chatgpt.com/c/seed-placeholder\n');
+      const t = new Date(1700099000000 + i * 1000);
+      fs.utimesSync(f, t, t);
+      if (protectedMarker) {
+        fs.mkdirSync(resDir, { recursive: true });
+        fs.writeFileSync(path.join(resDir, m), 'seed-reservation\n');
+      }
+    });
+  };
+  const newAnswer = (m) => [
+    `run marker: ${m}`, 'P1: none', 'P2: none', 'P3: none',
+    `VERDICT: SHIP — ours. (run marker: ${m})`,
+  ].join('\n');
+
+  {
+    // MEMO_KEEP+1 pre-seeded (1 protected, oldest of all, + 200 unprotected), then one more
+    // rememberUrl publication for a brand-new marker. Unprotected count goes 200 -> 201, so
+    // exactly one eviction happens; it must take the oldest UNPROTECTED memo, never the
+    // protected one, even though the protected one is chronologically the very oldest.
+    const PROTECTED = 'pg-run-memo-cap-protected-1700099000-1';
+    const unprotected = Array.from({ length: 200 }, (_, i) => `pg-run-memo-cap-u-${i}-1700099000-1`);
+    const cohort = [{ marker: PROTECTED, protectedMarker: true }, ...unprotected.map((m) => ({ marker: m }))];
+    const NEW_MARKER = 'pg-run-memo-cap-new-1700099500-9';
+    const cdp = await mockCdp(newAnswer(NEW_MARKER));
+    const r = await runSalvage([NEW_MARKER, '20'], cdp.port, seedMemoCohort(cohort));
+    const memoSet = new Set(r.memos);
+    check('finding B: a protected marker survives MEMO_KEEP eviction even though it is the oldest memo',
+      memoSet.has(PROTECTED), `memos.length=${r.memos.length} stderr=${r.stderr?.slice(-300)}`);
+    check('finding B: the oldest UNPROTECTED memo is the one evicted, its neighbor and the new memo survive',
+      !memoSet.has(unprotected[0]) && memoSet.has(unprotected[1]) && memoSet.has(NEW_MARKER),
+      `memos.length=${r.memos.length} evicted0=${memoSet.has(unprotected[0])} kept1=${memoSet.has(unprotected[1])} new=${memoSet.has(NEW_MARKER)}`);
+    check('finding B: total memo count is MEMO_KEEP+1 (1 protected + 200 unprotected) after the one eviction',
+      r.memos.length === 201, `memos.length=${r.memos.length}`);
+    cdp.stop();
+  }
+  {
+    // Boundary: exactly MEMO_KEEP (200) unprotected entries after the new write evicts nothing,
+    // even though the directory total (201) exceeds MEMO_KEEP once the protected entry is
+    // counted -- protected entries never count toward the cap.
+    const PROTECTED = 'pg-run-memo-cap-protected-b-1700099000-1';
+    const unprotected = Array.from({ length: 199 }, (_, i) => `pg-run-memo-cap-ub-${i}-1700099000-1`);
+    const cohort = [{ marker: PROTECTED, protectedMarker: true }, ...unprotected.map((m) => ({ marker: m }))];
+    const NEW_MARKER = 'pg-run-memo-cap-newb-1700099500-9';
+    const cdp = await mockCdp(newAnswer(NEW_MARKER));
+    const r = await runSalvage([NEW_MARKER, '20'], cdp.port, seedMemoCohort(cohort));
+    const memoSet = new Set(r.memos);
+    check('finding B boundary: exactly MEMO_KEEP unprotected entries evicts nothing',
+      memoSet.has(PROTECTED) && unprotected.every((m) => memoSet.has(m)) && memoSet.has(NEW_MARKER)
+        && r.memos.length === 201,
+      `memos.length=${r.memos.length} stderr=${r.stderr?.slice(-300)}`);
+    cdp.stop();
+  }
+}
+
 process.exit(failures === 0 ? 0 : 1);

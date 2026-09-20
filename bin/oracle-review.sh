@@ -869,7 +869,7 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
   # its conversation tab leaks (--remote-chrome only; reattach.ts:105 leaves the tab open by
   # design). Best-effort: never block or alter the exit-6 supersession outcome on a close failure.
   recover_close_tab() {  # marker -> best-effort close of any owned /c/ tab once this round is proven terminal
-    local marker="$1"
+    local marker="$1" close_url
     [ "$MODE" = remote-chrome ] || return 0
     [ "${PRO_GATE_KEEP_TABS:-0}" = 1 ] && return 0
     command -v node >/dev/null 2>&1 || return 0
@@ -881,8 +881,17 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
     # shape-valid URL (pg_conversation_url_read, mirroring cdp-salvage.mjs's own recallUrl /
     # CONVERSATION_URL_RE) before ever asking to close; leave the tab open -- the same
     # pre-#206 behavior -- when the memo is absent or invalid.
-    [ -n "$(pg_conversation_url_read "$marker" 2>/dev/null)" ] || return 0
-    timeout 30 node "$SELF/cdp-salvage.mjs" --close "$marker" 25 "${ORACLE_BROWSER_PORT:-9222}" >/dev/null 2>/dev/null
+    close_url="$(pg_conversation_url_read "$marker" 2>/dev/null)"
+    [ -n "$close_url" ] || return 0
+    # #206 gate r8 P2: an unscoped --close used to close every tab owned by this marker, which
+    # can strand a retry-created sibling conversation that shares it. Scope the close to exactly
+    # the durable handle this round already validated.
+    timeout 30 node "$SELF/cdp-salvage.mjs" --close --url "$close_url" "$marker" 25 "${ORACLE_BROWSER_PORT:-9222}" >/dev/null 2>/dev/null
+    # Best-effort verification only: never blocks or alters the exit-6 supersession outcome, and
+    # PRO_GATE_KEEP_TABS=1 above already skipped this entirely. A missing memo after a scoped
+    # close is unexpected (--close never touches conversation-urls/) but worth naming.
+    [ -n "$(pg_conversation_url_read "$marker" 2>/dev/null)" ] \
+      || echo "recover_close_tab: conversation-urls memo for $marker is gone after close" >&2
     return 0
   }
   REC_SELECTED=""; REC_SELECTED_OUT=""; REC_QUERY_NUM=""; REC_HOST=""; REC_OWNER=""; REC_REPO_NAME=""
