@@ -854,17 +854,98 @@ pg_conversation_url_ok() {
   case "$id" in ''|*[!A-Za-z0-9-]*) return 1;; *) return 0;; esac
 }
 
-# pg_conversation_url_read <marker>: the remembered conversation URL for <marker> (written by
+# pg_conversation_memo_read <marker>: the remembered conversation URL for <marker> (written by
 # cdp-salvage.mjs's rememberUrl on every positive match) when its memo exists and passes
 # pg_conversation_url_ok, else empty. Bounded like every other memo consumer (head -c 300) --
-# the memo is one line.
-pg_conversation_url_read() {
+# the memo is one line. This reads the MEMO ALONE, for the one caller that specifically means
+# "the churnable memo" (recover_close_tab's post-close verification). Anything asking "what is
+# this marker's conversation handle?" must use pg_conversation_url_read below, which prefers
+# the pin.
+pg_conversation_memo_read() {
   local marker="${1:-}" f url
   pg_reservation_marker_ok "$marker" || return 0
   f="$PRO_GATE_HOME/conversation-urls/$marker"
   [ -f "$f" ] && [ ! -L "$f" ] || return 0
   url="$(head -c 300 "$f" 2>/dev/null | tr -d '\n')"
   pg_conversation_url_ok "$url" && printf '%s\n' "$url"
+}
+
+# --- #216 gate r2 P2: the conversation pin ------------------------------------------------
+# A memo is a LIVE round's churnable handle: every positive match republishes it, and that is
+# correct while the round is still generating. A CLOSED conversation has no such second path --
+# #206 finding A closes the superseded round's tab, scoped to exactly the URL the engine
+# validated, so from that moment the recorded URL is the only way back to a PAID review.
+#
+# The pin is that record, and it is deliberately a SEPARATE per-marker file rather than a flag
+# on the memo:
+#   * it never counts toward (and is never evicted by) rememberUrl()'s MEMO_KEEP cap, which
+#     bounds conversation-urls/ alone;
+#   * it is written by the closer BEFORE the close is requested, so it exists for every reader
+#     from the instant the conversation stops being reachable as a tab;
+#   * it is a value, not a lock. #216 gate r2's first finding is that a publisher which reads the
+#     reservation state, pauses, and resumes after supersession commits can still rename its own
+#     URL over the memo, because nothing serializes that check against pg_reservation_supersede.
+#     Serializing them would need one guard held across a bash engine's supersede AND a Node
+#     child's whole publish. Preferring the pin on READ needs no serialization at all: a
+#     publisher that checked before the pin existed may indeed overwrite the memo, but every
+#     reader prefers the pin, so the closed conversation stays reachable anyway. The only window
+#     the pin cannot cover is a publisher that both checks AND renames before the pin is written
+#     -- which is strictly before the close is even requested, so nothing was closed and nothing
+#     is lost there either.
+# Lifecycle: written by recover_close_tab, dropped by pg_reservation_remove (collection or any
+# other terminal disposition), and revoked by cdp-salvage.mjs's discardForeignUrl when the
+# pinned conversation is POSITIVELY proven foreign. A missing pins dir fails open everywhere.
+pg_conversation_pin_dir() { echo "$PRO_GATE_HOME/conversation-pins"; }
+
+# pg_conversation_pin_read <marker>: the pinned (closed) conversation URL, or empty. Same shape
+# gate and 300-byte bound as the memo reader -- a pin that fails pg_conversation_url_ok is not a
+# handle, so it is ignored rather than trusted.
+pg_conversation_pin_read() {
+  local marker="${1:-}" f url
+  pg_reservation_marker_ok "$marker" || return 0
+  f="$(pg_conversation_pin_dir)/$marker"
+  [ -f "$f" ] && [ ! -L "$f" ] || return 0
+  url="$(head -c 300 "$f" 2>/dev/null | tr -d '\n')"
+  pg_conversation_url_ok "$url" && printf '%s\n' "$url"
+}
+
+# pg_conversation_pin_write <marker> <url>: publish the pin atomically (tmp + rename), exactly
+# like pg_conversation_title_write and cdp-salvage.mjs's rememberUrl -- a reader never sees a
+# half-written handle. rc 1 on a rejected marker/URL or an unwritable home; its one caller treats
+# that as "do not close", because closing without a pin is the loss this record exists to stop.
+pg_conversation_pin_write() {  # <marker> <url>
+  local marker="${1:-}" url="${2:-}" dir f tmp
+  pg_reservation_marker_ok "$marker" || return 1
+  pg_conversation_url_ok "$url" || return 1
+  dir="$(pg_conversation_pin_dir)"; f="$dir/$marker"; tmp="$f.tmp.$$"
+  mkdir -p "$dir" 2>/dev/null || return 1
+  if printf '%s\n' "$url" > "$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$tmp" 2>/dev/null
+  return 1
+}
+
+# pg_conversation_pin_remove <marker>: the pin dies with its reservation (see
+# pg_reservation_remove). Idempotent and silent on a missing pin or a missing dir.
+pg_conversation_pin_remove() {  # <marker>
+  local marker="${1:-}"
+  pg_reservation_marker_ok "$marker" || return 0
+  rm -f "$(pg_conversation_pin_dir)/$marker" 2>/dev/null || true
+  return 0
+}
+
+# pg_conversation_url_read <marker>: this marker's conversation handle -- the pin when one exists
+# and is shape-valid, else the memo. Mirrored by cdp-salvage.mjs's recallUrl(), which applies the
+# same preference for the same reason: the pinned conversation has been CLOSED, so a memo naming
+# anything else names a conversation that is still OPEN and still found by every ordinary tab
+# scan, while the pinned one is reachable through this record alone.
+pg_conversation_url_read() {
+  local marker="${1:-}" pin
+  pg_reservation_marker_ok "$marker" || return 0
+  pin="$(pg_conversation_pin_read "$marker")"
+  if [ -n "$pin" ]; then printf '%s\n' "$pin"; return 0; fi
+  pg_conversation_memo_read "$marker"
 }
 
 # Recovery identity must retain the canonical host/owner/repo triple. ROUND_KEY's historic
@@ -1804,7 +1885,14 @@ pg_reservation_remove() { # marker
   dir="$(pg_reservation_dir)"; pg_reservation_guard_acquire || return 1
   # v0.28: the manifest sidecar (the change's file list for provenance checks) lives and dies
   # with its reservation.
-  rm -f "$dir/$marker" "$(pg_manifest_dir)/$marker" "$(pg_manifest_dir)/$marker.nonce" 2>/dev/null
+  # #216 gate r2 P2: so does the conversation pin. The pin is a recovery handle for a round that
+  # still exists; once the reservation is gone the round has been collected (or otherwise
+  # terminally disposed) and there is nothing left to recover, so leaving the pin behind would
+  # only make a stale URL outrank a future memo for a recycled marker. Deleting it here also
+  # keeps the pin OFF the 14-day memo clock: a pin can only outlive its reservation by crashing
+  # between these two unlinks, which the sweep then collects.
+  rm -f "$dir/$marker" "$(pg_manifest_dir)/$marker" "$(pg_manifest_dir)/$marker.nonce" \
+    "$(pg_conversation_pin_dir)/$marker" 2>/dev/null
   pg_reservation_guard_release
 }
 

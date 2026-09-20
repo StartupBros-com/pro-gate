@@ -53,9 +53,9 @@ exit 99
 FAKE_PREFLIGHT
 chmod +x "$TDIR/bin/oracle-preflight"
 
-start_mock() { # $1 = source text; optional $2 = organizer/browser state; optional $3 = scratch text; optional $4 = scratch canonical URL; optional $5 = second owned tab URL
+start_mock() { # $1 = source text; optional $2 = organizer/browser state; optional $3 = scratch text; optional $4 = scratch canonical URL; optional $5 = second owned tab URL; optional $6 = second tab's own text (#216 gate r2 P2)
   [ -n "${MOCK_PID:-}" ] && kill "$MOCK_PID" 2>/dev/null
-  node "$HERE/mock-cdp.mjs" "$1" "${2:-}" "${3:-}" "${4:-}" "${5:-}" > "$TDIR/port" 2>"$TDIR/mock.log" &
+  node "$HERE/mock-cdp.mjs" "$1" "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" > "$TDIR/port" 2>"$TDIR/mock.log" &
   MOCK_PID=$!
   # A cold CI runner has taken >5s to get node to its first write here, and an empty PORT is
   # SILENT: every following test then points the engine at the default 9222, gets "CDP not
@@ -4897,6 +4897,16 @@ printf 'acme-widgets-424\t%s\t1600000000\t0\t1\tGPT-X\t5\tsuperseded\n' "$TDIR/r
 printf 'https://chatgpt.com/c/old-retained' > "$SWHOME/conversation-urls/$SWEEP_RETAINED_MARKER"
 touch -d '20 days ago' "$SWHOME/conversation-urls/$SWEEP_RETAINED_MARKER" 2>/dev/null \
   || touch -t "$(date -v-20d +%Y%m%d%H%M 2>/dev/null || echo 202601010000)" "$SWHOME/conversation-urls/$SWEEP_RETAINED_MARKER"
+# #216 gate r2 P2: conversation PINS ride the same clock and the same reservation protection. A
+# pin outranks the memo for every reader, so sweeping a live one would be strictly worse than
+# sweeping a memo -- it strands a conversation whose tab was deliberately closed.
+# pg_reservation_remove drops each pin with its reservation, so only ORPHANS should ever age out.
+mkdir -p "$SWHOME/conversation-pins"
+printf 'https://chatgpt.com/c/old-pin' > "$SWHOME/conversation-pins/pg-run-old-1600000000-1"
+printf 'https://chatgpt.com/c/new-pin' > "$SWHOME/conversation-pins/pg-run-new-1700000000-1"
+printf 'https://chatgpt.com/c/old-retained-pin' > "$SWHOME/conversation-pins/$SWEEP_RETAINED_MARKER"
+touch -d '20 days ago' "$SWHOME/conversation-pins/pg-run-old-1600000000-1" "$SWHOME/conversation-pins/$SWEEP_RETAINED_MARKER" 2>/dev/null \
+  || touch -t "$(date -v-20d +%Y%m%d%H%M 2>/dev/null || echo 202601010000)" "$SWHOME/conversation-pins/pg-run-old-1600000000-1" "$SWHOME/conversation-pins/$SWEEP_RETAINED_MARKER"
 printf 'foreign idle tab\n' > "$TDIR/tab.txt"
 start_mock "$TDIR/tab.txt"
 env PRO_GATE_HOME="$SWHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
@@ -4911,6 +4921,13 @@ check 'fresh cross-bind sidecar kept (#170)' "$([ -f "$SWHOME/crossbound/pg-run-
 check 'old memo of a retained superseded reservation survives the sweep (gate r2 follow-up P2)' \
   "$([ -f "$SWHOME/conversation-urls/$SWEEP_RETAINED_MARKER" ]; echo $?)" \
   "memos=$(ls "$SWHOME/conversation-urls" 2>/dev/null | tr '\n' ' ')"
+check '#216 gate r2 P2: an ORPHANED old conversation pin is swept, a fresh one is kept' \
+  "$([ ! -f "$SWHOME/conversation-pins/pg-run-old-1600000000-1" ] \
+     && [ -f "$SWHOME/conversation-pins/pg-run-new-1700000000-1" ]; echo $?)" \
+  "pins=$(ls "$SWHOME/conversation-pins" 2>/dev/null | tr '\n' ' ')"
+check '#216 gate r2 P2: an old pin whose reservation is still retained survives the sweep' \
+  "$([ -f "$SWHOME/conversation-pins/$SWEEP_RETAINED_MARKER" ]; echo $?)" \
+  "pins=$(ls "$SWHOME/conversation-pins" 2>/dev/null | tr '\n' ' ')"
 # Boundary: once the reservation is collected (in-progress/<marker> removed), the same
 # still-old memo is no longer protected and the next sweep clears it -- proving this is a
 # reservation-scoped protection, not a blanket exemption that would defeat the 14-day sweep.
@@ -4924,6 +4941,10 @@ env PRO_GATE_HOME="$SWHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PR
 check 'memo is swept once its reservation is collected (in-progress/ removed)' \
   "$([ ! -f "$SWHOME/conversation-urls/$SWEEP_RETAINED_MARKER" ]; echo $?)" \
   "memos=$(ls "$SWHOME/conversation-urls" 2>/dev/null | tr '\n' ' ')"
+check '#216 gate r2 P2: the pin is swept on the same boundary, proving reservation-scoped protection rather than an exempt directory' \
+  "$([ ! -f "$SWHOME/conversation-pins/$SWEEP_RETAINED_MARKER" ] \
+     && [ -f "$SWHOME/conversation-pins/pg-run-new-1700000000-1" ]; echo $?)" \
+  "pins=$(ls "$SWHOME/conversation-pins" 2>/dev/null | tr '\n' ' ')"
 
 echo '# v0.30 (#50 item 5): native-mode hard-max clamp is announced, not silent'
 # The NOTE fires before the oversized refusal, so the fast exit-11 path exercises it.
@@ -7234,6 +7255,152 @@ check '#216 gate r1 P2: the preserved memo still recovers the CLOSED conversatio
   "$([ "$PIN_LATE_RC" -eq 0 ] && cmp -s "$TDIR/memo-pin-late.md" "$TDIR/memo-pin-expected.md" \
      && [ "$(jq -r '.created[0].url' "$PIN_STATE2")" = "$PIN_URL_A" ] && [ ! -s "$PIN_SENTINEL" ]; echo $?)" \
   "rc=$PIN_LATE_RC out=$(cat "$TDIR/memo-pin-late.md" 2>/dev/null) state=$(cat "$PIN_STATE2") stderr=$(tail -3 "$TDIR/memo-pin-late.stderr")"
+
+# #216 gate r2 P2 (engine level), finding at bin/oracle-review.sh:889 -- second half: closing the
+# memoized conversation lets an UNBOUND retry sibling block its recovery, permanently. The
+# reviewer's own sequence, end to end against the mock browser:
+#   A = mock tab1 at $PIN2_URL_A -- the COMPLETE, correctly SIGNED review (the paid one);
+#   B = mock tab2 at $PIN2_URL_B -- a retry sibling with a terminal verdict and NO marker echo;
+#   and deliberately NO conversation-titles memo, so the exit-9 organizer has no browser recovery
+#   of its own to paper over the gap.
+# --recover supersedes, PINS A's URL, and closes only A. The --harvest that follows must come
+# back with A. Pre-fix the salvage emits B, the engine refuses it for the missing echo (exit 9)
+# without blacklisting it (#54 gate r6 P1 refuses to condemn a nonce-less capture), and every
+# later harvest repeats B -- the loop never terminates.
+PIN2_HOME="$TDIR/home-pin-file"
+PIN2_MARKER='pg-run-acme-fresh-77-1700014800-1'
+PIN2_URL_A='https://chatgpt.com/c/mock-conversation'             # mock tab1: complete and signed
+PIN2_URL_B='https://chatgpt.com/c/mock-conversation-unsigned-b'  # mock tab2: terminal, unsigned
+PIN2_SENTINEL="$TDIR/pin-file-oracle-invocations"
+mkdir -p "$PIN2_HOME/in-progress" "$PIN2_HOME/conversation-urls"
+printf '%s\t%s\t%s\t0\t1\tGPT-X\t%s\tsuperseded\n' "$SUPER_KEY" "$TDIR/pin-file-audit.md" "$(date +%s)" 1700014800 \
+  > "$PIN2_HOME/in-progress/$PIN2_MARKER"
+printf '%s\n' "$PIN2_URL_A" > "$PIN2_HOME/conversation-urls/$PIN2_MARKER"
+PIN2_SOURCE_A="$TDIR/pin-file-source-a.txt"
+cat > "$PIN2_SOURCE_A" <<PIN2_A_TEXT
+run marker: $PIN2_MARKER
+[P1] src/pin-file.mjs:1 — the complete, signed review at conversation A
+P2: none
+VERDICT: SHIP — pinned recovery complete. (run marker: $PIN2_MARKER)
+PIN2_A_TEXT
+PIN2_SOURCE_B="$TDIR/pin-file-source-b.txt"
+cat > "$PIN2_SOURCE_B" <<PIN2_B_TEXT
+run marker: $PIN2_MARKER
+[P1] src/pin-file.mjs:9 — the retry sibling, never signed
+P2: none
+VERDICT: SHIP — sibling B carries no run-marker echo.
+PIN2_B_TEXT
+cat > "$TDIR/pin-file-expected.md" <<'PIN2_EXPECTED'
+[P1] src/pin-file.mjs:1 — the complete, signed review at conversation A
+P2: none
+VERDICT: SHIP — pinned recovery complete.
+PIN2_EXPECTED
+PIN2_STATE="$TDIR/pin-file-state.json"
+printf '{"title":null,"archived":false,"events":[]}\n' > "$PIN2_STATE"
+: > "$PIN2_SENTINEL"
+# One mock for both invocations: the close must still be in effect when the harvest runs, which
+# is the whole point. The sixth argument (new in this change) gives tab2 its own unsigned body.
+start_mock "$PIN2_SOURCE_A" "$PIN2_STATE" "$PIN2_SOURCE_A" "$PIN2_URL_A" "$PIN2_URL_B" "$PIN2_SOURCE_B"
+env -u PRO_GATE_KEEP_TABS PRO_GATE_HOME="$PIN2_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_SELF_HEAL=0 NODE_OPTIONS= \
+  bash "$ENGINE" --recover "$PIN2_MARKER" --timeout 1s >"$TDIR/pin-file-recover.stdout" 2>"$TDIR/pin-file-recover.stderr"
+PIN2_RECOVER_RC=$?
+check '#216 gate r2 P2: supersession cleanup pins the closed conversation and still closes only it' \
+  "$([ "$PIN2_RECOVER_RC" -eq 6 ] \
+     && grep -qx 'Review superseded' "$TDIR/pin-file-recover.stderr" \
+     && [ "$(cat "$PIN2_HOME/conversation-pins/$PIN2_MARKER" 2>/dev/null)" = "$PIN2_URL_A" ] \
+     && [ "$(jq -r '(.closed // []) | map(select(. == "tab1")) | length' "$PIN2_STATE")" = 1 ] \
+     && [ "$(jq -r '(.closed // []) | map(select(. == "tab2")) | length' "$PIN2_STATE")" = 0 ]; echo $?)" \
+  "rc=$PIN2_RECOVER_RC pin=$(cat "$PIN2_HOME/conversation-pins/$PIN2_MARKER" 2>/dev/null) stderr=$(cat "$TDIR/pin-file-recover.stderr") state=$(cat "$PIN2_STATE")"
+
+env -u PRO_GATE_KEEP_TABS PRO_GATE_HOME="$PIN2_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
+  PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-stale-sentinel" \
+  PG_TEST_ORACLE_SENTINEL="$PIN2_SENTINEL" NODE_OPTIONS= \
+  bash "$ENGINE" --harvest "$PIN2_MARKER" --out "$TDIR/pin-file-harvest.md" --timeout 15s \
+  >"$TDIR/pin-file-harvest.stdout" 2>"$TDIR/pin-file-harvest.stderr"
+PIN2_HARVEST_RC=$?
+check '#216 gate r2 P2: the harvest after the scoped close retrieves A instead of looping on the unsigned sibling B' \
+  "$([ "$PIN2_HARVEST_RC" -eq 0 ] && cmp -s "$TDIR/pin-file-harvest.md" "$TDIR/pin-file-expected.md" \
+     && [ ! -s "$PIN2_SENTINEL" ] \
+     && [ "$(jq -r '[.created[]? | .url] | unique | join(",")' "$PIN2_STATE")" = "$PIN2_URL_A" ]; echo $?)" \
+  "rc=$PIN2_HARVEST_RC out=$(cat "$TDIR/pin-file-harvest.md" 2>/dev/null) state=$(cat "$PIN2_STATE") stderr=$(tail -5 "$TDIR/pin-file-harvest.stderr")"
+# Lifecycle, through the real collection path: pg_persist_result retires the reservation on a
+# durable write, and the pin dies with it. Nothing else on this clock would ever free it.
+check '#216 gate r2 P2: collecting the review removes the pin along with its reservation' \
+  "$([ ! -e "$PIN2_HOME/conversation-pins/$PIN2_MARKER" ] \
+     && [ ! -e "$PIN2_HOME/in-progress/$PIN2_MARKER" ]; echo $?)" \
+  "pins=$(ls "$PIN2_HOME/conversation-pins" 2>/dev/null | tr '\n' ' ') reservations=$(ls "$PIN2_HOME/in-progress" 2>/dev/null | tr '\n' ' ')"
+
+# ORDER, not merely presence: the pin must exist on disk BEFORE --close is asked for, because a
+# pin written afterwards leaves a window in which the conversation has neither a tab nor a
+# durable handle. Same scratch-bin idiom as finding A's argv check above (the engine resolves
+# cdp-salvage.mjs beside itself via $SELF); the stand-in salvage records what it could see.
+PINORDER_DIR="$TDIR/enginewrap-pin-order"
+mkdir -p "$PINORDER_DIR"
+cp -r "$HERE/../bin" "$PINORDER_DIR/bin"
+cp -r "$HERE/../lib" "$PINORDER_DIR/lib"
+cat > "$PINORDER_DIR/bin/cdp-salvage.mjs" <<'STUB'
+#!/usr/bin/env node
+import fs from 'node:fs';
+import path from 'node:path';
+const args = process.argv.slice(2);
+const log = process.env.PG_TEST_PIN_ORDER_LOG;
+if (args[0] === '--close' && log) {
+  const rest = args[1] === '--url' ? args.slice(3) : args.slice(1);
+  const marker = rest[0];
+  let pin = '(none)';
+  try {
+    pin = fs.readFileSync(path.join(process.env.PRO_GATE_HOME, 'conversation-pins', marker), 'utf8').trim();
+  } catch {}
+  fs.appendFileSync(log, `close-saw-pin ${pin}\n`);
+}
+process.exit(0);
+STUB
+
+PINORDER_LOG="$TDIR/pin-order.log"
+PINORDER_HOME="$TDIR/home-pin-order"
+PINORDER_MARKER='pg-run-acme-fresh-77-1700014900-1'
+PINORDER_URL='https://chatgpt.com/c/mock-conversation-pin-order'
+mkdir -p "$PINORDER_HOME/in-progress" "$PINORDER_HOME/conversation-urls"
+printf '%s\t%s\t%s\t0\t1\tGPT-X\t%s\tsuperseded\n' "$SUPER_KEY" "$TDIR/pin-order-audit.md" "$(date +%s)" 1700014900 \
+  > "$PINORDER_HOME/in-progress/$PINORDER_MARKER"
+printf '%s\n' "$PINORDER_URL" > "$PINORDER_HOME/conversation-urls/$PINORDER_MARKER"
+env -u PRO_GATE_KEEP_TABS PRO_GATE_HOME="$PINORDER_HOME" ORACLE_BROWSER_PORT=1 PRO_GATE_SELF_HEAL=0 \
+  PG_TEST_PIN_ORDER_LOG="$PINORDER_LOG" NODE_OPTIONS= \
+  bash "$PINORDER_DIR/bin/oracle-review.sh" --recover "$PINORDER_MARKER" --timeout 1s \
+  >"$TDIR/pin-order.stdout" 2>"$TDIR/pin-order.stderr"
+PINORDER_RC=$?
+check '#216 gate r2 P2: the pin is already on disk when the scoped close is requested' \
+  "$([ "$PINORDER_RC" -eq 6 ] \
+     && grep -qxF "close-saw-pin $PINORDER_URL" "$PINORDER_LOG" \
+     && [ "$(cat "$PINORDER_HOME/conversation-pins/$PINORDER_MARKER" 2>/dev/null)" = "$PINORDER_URL" ]; echo $?)" \
+  "rc=$PINORDER_RC log=$(cat "$PINORDER_LOG" 2>/dev/null) stderr=$(cat "$TDIR/pin-order.stderr")"
+
+# Planted negative for the same order: when the pin CANNOT be written, no close may be requested
+# at all. An unwritable pins location is modelled by putting a regular FILE where the directory
+# has to be, so pg_conversation_pin_write's mkdir -p fails. The exit-6 supersession outcome is
+# unchanged -- this is best-effort cleanup, never a gate on the verdict.
+PINFAIL_LOG="$TDIR/pin-fail.log"
+PINFAIL_HOME="$TDIR/home-pin-write-fails"
+PINFAIL_MARKER='pg-run-acme-fresh-77-1700014910-1'
+PINFAIL_URL='https://chatgpt.com/c/mock-conversation-pin-fail'
+mkdir -p "$PINFAIL_HOME/in-progress" "$PINFAIL_HOME/conversation-urls"
+printf '%s\t%s\t%s\t0\t1\tGPT-X\t%s\tsuperseded\n' "$SUPER_KEY" "$TDIR/pin-fail-audit.md" "$(date +%s)" 1700014910 \
+  > "$PINFAIL_HOME/in-progress/$PINFAIL_MARKER"
+printf '%s\n' "$PINFAIL_URL" > "$PINFAIL_HOME/conversation-urls/$PINFAIL_MARKER"
+: > "$PINFAIL_HOME/conversation-pins"
+env -u PRO_GATE_KEEP_TABS PRO_GATE_HOME="$PINFAIL_HOME" ORACLE_BROWSER_PORT=1 PRO_GATE_SELF_HEAL=0 \
+  PG_TEST_PIN_ORDER_LOG="$PINFAIL_LOG" NODE_OPTIONS= \
+  bash "$PINORDER_DIR/bin/oracle-review.sh" --recover "$PINFAIL_MARKER" --timeout 1s \
+  >"$TDIR/pin-fail.stdout" 2>"$TDIR/pin-fail.stderr"
+PINFAIL_RC=$?
+check '#216 gate r2 P2: an unwritable pin refuses the close, keeps the memo, and leaves exit 6 alone' \
+  "$([ "$PINFAIL_RC" -eq 6 ] \
+     && [ ! -s "$TDIR/pin-fail.stdout" ] \
+     && [ ! -e "$PINFAIL_LOG" ] \
+     && grep -qxF "recover_close_tab: could not pin $PINFAIL_URL for $PINFAIL_MARKER; leaving its conversation tab open" "$TDIR/pin-fail.stderr" \
+     && grep -qx 'Review superseded' "$TDIR/pin-fail.stderr" \
+     && [ "$(cat "$PINFAIL_HOME/conversation-urls/$PINFAIL_MARKER")" = "$PINFAIL_URL" ]; echo $?)" \
+  "rc=$PINFAIL_RC stdout=$(cat "$TDIR/pin-fail.stdout") stderr=$(cat "$TDIR/pin-fail.stderr") log=$(cat "$PINFAIL_LOG" 2>/dev/null)"
 
 SUPER_SNAPSHOT="$(PRO_GATE_HOME="$SUPER_HEAD_HOME" pg_attempt_snapshot github.com acme fresh 77 "$SUPER_KEY")"
 SUPER_PLAN="$(PRO_GATE_HOME="$SUPER_HEAD_HOME" pg_reservation_slot_plan 1)"

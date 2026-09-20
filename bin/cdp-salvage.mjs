@@ -222,6 +222,13 @@ const COOLDOWN_FILE = envPath('PRO_GATE_COOLDOWN_FILE', PG_HOME, 'throttle.coold
 // engine's only handle on a conversation whose tab is gone, so it is written on every positive
 // match (probe included) and read before we ever conclude "not found".
 const URL_MEMO_DIR = path.join(PG_HOME, 'conversation-urls');
+// #216 gate r2 P2: the conversation PIN -- one file per marker holding the URL the engine closed
+// (oracle-review.sh's recover_close_tab writes it immediately BEFORE asking for that close). A
+// separate directory on purpose: it must never count toward, or be evicted by, the MEMO_KEEP cap
+// that bounds conversation-urls/ alone, and its lifetime is the reservation's, not the memo's.
+// Kept in step with lib/pro-gate-lib.sh's pg_conversation_pin_* family, which carries the full
+// rationale for preferring it on READ rather than serializing publication against supersession.
+const URL_PIN_DIR = path.join(PG_HOME, 'conversation-pins');
 const TITLE_MEMO_DIR = path.join(PG_HOME, 'conversation-titles');
 const COMPLETED_DIR = envPath('PRO_GATE_COMPLETED_DIR', PG_HOME, 'completed');
 const PENDING_DIR = path.join(PG_HOME, 'pending');
@@ -252,7 +259,32 @@ const sameMarker = (a, b) => !!a && !!b && asciiFold(a) === asciiFold(b);
 // CONVERSATION_URL_RE / conversationUrlOk (the memo shape gate) are defined above the argument
 // parser, which holds `--close --url` to that same predicate.
 const memoPath = (m) => (MARKER_SAFE_RE.test(m) ? path.join(URL_MEMO_DIR, m) : null);
+const pinPath = (m) => (MARKER_SAFE_RE.test(m) ? path.join(URL_PIN_DIR, m) : null);
 const titleMemoPath = (m) => (MARKER_SAFE_RE.test(m) ? path.join(TITLE_MEMO_DIR, m) : null);
+
+// #216 gate r2 P2: the pinned (closed) conversation for this marker, or null. Same shape gate as
+// the memo (conversationUrlOk) and the same fail-open posture as reservationState(): an absent
+// pins directory, an unreadable file, or a malformed URL all answer null and change nothing.
+// Mirrors pg_conversation_pin_read in lib/pro-gate-lib.sh.
+function recallPin(m) {
+  const f = pinPath(m);
+  if (!f) return null;
+  let url = '';
+  try { url = fs.readFileSync(f, 'utf8').trim(); } catch { return null; }
+  return conversationUrlOk(url) ? url : null;
+}
+
+// Revoke a pin, but ONLY the exact URL the caller proved foreign -- never a pin that has since
+// been rewritten for a different conversation. Without this, a pin every reader prefers and
+// nothing can retire would wedge recovery permanently: recallUrl would keep handing back a URL
+// the scan already convicted, burning one seeded render per invocation forever. Positive
+// foreignness is the same proof that already evicts a memo (discardForeignUrl -> forgetUrl).
+function forgetPin(m, url) {
+  const f = pinPath(m);
+  if (!f || recallPin(m) !== url) return;
+  try { fs.unlinkSync(f); } catch {}
+  console.error(`pin-revoked: ${url} was pinned for "${m}" but is provably not this run's conversation`);
+}
 
 // #216 gate r1 P2: this marker's reservation lifecycle state, or null when there is no readable
 // record. The record is one TSV line whose LAST field is the state (field 8 of the canonical
@@ -270,6 +302,13 @@ function reservationState(m) {
 }
 
 function recallUrl(m) {
+  // #216 gate r2 P2: the pin outranks the memo. The pinned conversation has been CLOSED, so this
+  // record is its only handle; a memo naming anything else names a conversation that is still
+  // OPEN and that every ordinary tab scan finds on its own. Same preference as the shell's
+  // pg_conversation_url_read. This also makes the pin sufficient on its own against a racing
+  // publisher: the publisher may win the memo, but it cannot change what readers prefer.
+  const pinned = recallPin(m);
+  if (pinned) return pinned;
   const f = memoPath(m);
   if (!f) return null;
   let url = '';
@@ -443,6 +482,20 @@ function rememberUrl(m, url) {
   }
   const existing = recallUrl(m);
   if (existing === url) return;     // already known: no churn, no prune
+  // #216 gate r2 P2: the PIN is the guard, and it is sufficient on its own. The reservation-state
+  // check below reads a state that can change under it -- a publisher can read `generating`,
+  // pause, and resume after pg_reservation_supersede has committed -- and nothing serializes
+  // those two. The pin does not need to win that race: it is written before the close, it is
+  // preferred by every reader, and a publisher that overwrites the memo anyway (because it
+  // checked before the pin existed) therefore takes nothing away. A publisher that both checks
+  // AND renames before the pin is written is earlier still -- before anything was closed.
+  // Deliberately keyed on the pin, not on reservation state: the pin records an accomplished
+  // CLOSE, which is the fact that makes this memo irreplaceable.
+  const pinned = recallPin(m);
+  if (pinned && pinned !== url) {
+    console.error(`memo-pinned: keeping ${pinned} for "${m}" (pinned closed conversation); not replacing with ${url}`);
+    return;
+  }
   // #216 gate r1 P2: a RETAINED SUPERSEDED reservation's memo is never replaced, only kept.
   // Reservation protection (the eviction guard below, and the engine's 14-day memo sweep) stops
   // a retained memo being DELETED; it does nothing about it being OVERWRITTEN, and overwriting
@@ -456,6 +509,11 @@ function rememberUrl(m, url) {
   // OPEN and every scan finds it on its own; the closed conversation has no such second path.
   // A `generating` reservation is deliberately unaffected: that round is live and its organizer
   // may still legitimately refresh the memo.
+  // #216 gate r2 P2 keeps this behind the pin rather than replacing it with the pin, because it
+  // still covers a case no pin can: a superseded round whose close never happened at all
+  // (PRO_GATE_KEEP_TABS=1, an unreachable browser, a MODE that is not remote-chrome). There the
+  // conversation is still open, no pin is written, and this check is the only thing holding the
+  // memo. Where a pin DOES exist the branch above has already returned, so the two never argue.
   if (existing && reservationState(m) === 'superseded') {
     console.error(`memo-pinned: keeping ${existing} for "${m}" (retained superseded reservation); not replacing with ${url}`);
     return;
@@ -1433,6 +1491,13 @@ function classifyEvidence(text, structuredError = null, throttleModal = null) {
   return {
     kind: 'terminal',
     review,
+    // #216 gate r2 P2: does the terminal verdict line carry THIS run's marker echo? That is the
+    // single fact the engine's acceptance predicate (pg_capture_nonce_ok) turns on, so it is the
+    // fact preferPinnedTerminal() needs to know whether emitting this capture would end the scan
+    // in an engine rejection. Deliberately narrower than probeComplete, which also demands a
+    // prompt marker above the verdict and an unmixed answer: this is "would the shell bind it?",
+    // nothing more.
+    markerEchoed: sameMarker(answerMarker, marker),
     // newerPromptMarker can still be true here for a foreign answerMarker (scrollback case
     // above); the `&& !newerPromptMarker` term stays as a guard against that combination
     // ever being reported probe-complete, even though only --probe reads this field.
@@ -1514,6 +1579,69 @@ async function revalidateReadableStaleSource(url) {
   return rendered.evidence ?? classifyEvidence(rendered.text);
 }
 
+// #216 gate r2 P2 (paid review, finding at bin/oracle-review.sh:889, second half): closing the
+// memoized conversation lets an UNBOUND retry sibling block its recovery, permanently.
+//
+// The shape: conversation A is complete and correctly signed, its URL is the pin, and #206
+// finding A closed its tab. Sibling B -- a retry conversation sharing this marker -- is still
+// open and carries a terminal verdict WITHOUT the marker echo. The scan reaches B first (it is a
+// listed tab; the remembered-URL branch runs only after every tab has been classified), sees
+// kind 'terminal', and emits it at exit 0. The engine then refuses it for the missing echo and
+// returns exit 9 WITHOUT blacklisting B -- deliberately, since #54 gate r6 P1: under
+// REQUIRE_NONCE a nonce-less capture may be an older verdict sitting above a prompt that is
+// still generating this run's real answer, and condemning that URL would throw the answer away.
+// With no title memo the exit-9 organizer performs no browser recovery either, so every later
+// harvest repeats B and A is never opened. The loop does not terminate.
+//
+// The fix is preference, not condemnation: when a pin exists and its conversation is not a
+// listed tab, render it BEFORE emitting an open owned tab whose verdict cannot bind. Nothing is
+// blacklisted, so #54 r6 P1's still-generating sibling keeps every path it had; the pinned
+// conversation simply gets looked at first, and only replaces the emit when it actually carries
+// the echo the engine requires. A pin exists only for a round whose tab was deliberately closed,
+// so this costs one seeded render for exactly the population it was built for, and nothing for
+// every other run.
+async function preferPinnedTerminal(candidateUrl, evidence, tabs) {
+  // Only a terminal emit ends the scan, and only a MISSING echo makes that emit a dead end.
+  if (evidence.kind !== 'terminal' || evidence.markerEchoed) return;
+  const pinned = recallPin(marker);
+  if (!pinned || pinned === candidateUrl) return;
+  // Already convicted: the blacklist is honoured here exactly as the open-tab and re-render
+  // loops honour it, so a pin proven foreign earlier is never re-rendered.
+  if (nonMatching.has(pinned)) return;
+  // Its own tab is listed: the ordinary scan reaches it on its own (and may already have), so
+  // spending a seeded render on it would be duplicate work, not recovery.
+  if (tabs.some((t) => t.url === pinned)) return;
+  if (Date.now() >= deadline || seededRenders >= MAX_SEEDED_RENDERS) return;
+  if (Date.now() < (nextRenderAt.get(pinned) ?? 0)) return;
+  nextRenderAt.set(pinned, Date.now() + RENDER_INTERVAL_MS);
+  seededRenders += 1;
+  console.error(`open conversation ${candidateUrl} has a terminal verdict that does not echo "${marker}" — `
+    + `rendering the pinned conversation ${pinned} first (${seededRenders}/${MAX_SEEDED_RENDERS})...`);
+  const { text, reason, evidence: renderEvidence } = await freshRenderText(pinned, port, deadline, true);
+  if (!text) {
+    // Absence of fresh evidence, never proof against the pin: leave it, leave the memo, and let
+    // the caller emit the unbound candidate exactly as it would have before.
+    console.error(`pinned conversation render was inconclusive (${reason}); emitting the open conversation instead`);
+    return;
+  }
+  const pinnedEvidence = renderEvidence ?? classifyEvidence(text);
+  if (pinnedEvidence.kind === 'throttle') tripThrottleEvidence(pinned, pinnedEvidence, `pinned render ${pinned}`);
+  if (pinnedEvidence.kind === 'cross-bound') {
+    rejectCrossBound(pinned, pinnedEvidence.foreignMarker, 'pinned conversation');
+    return;
+  }
+  if (pinnedEvidence.kind === 'foreign') {
+    rejectForeign(pinned, 'pinned conversation');
+    return;
+  }
+  // Prefer the pin ONLY when it carries what the candidate lacks. A pinned conversation that is
+  // itself unbound, still generating, or merely unhydrated would swap one engine rejection for
+  // another (or turn a retryable exit 9 into a terminal exit 10), so it falls through instead.
+  if (pinnedEvidence.kind !== 'terminal' || !pinnedEvidence.markerEchoed) return;
+  onOurConversation(pinned, pinnedEvidence);
+  emitEvidence(pinned, pinnedEvidence);
+}
+
 function discardForeignUrl(url) {
   if (url === knownUrl) {
     ourUrls.delete(url);
@@ -1521,6 +1649,13 @@ function discardForeignUrl(url) {
     knownUrl = survivor;
     memoStale = !survivor;
   }
+  // #216 gate r2 P2: a pin is preferred by every reader and is removed by nothing else on this
+  // side, so a pinned URL that has now been POSITIVELY proven foreign (another run's marker, or
+  // our marker over another run's completed answer) has to be revoked here or recovery stays
+  // wedged on it forever. Exactly the same evidence bar the memo eviction above uses -- an
+  // inconclusive, unhydrated or unreachable render never reaches this function. After the
+  // revocation the memo (if any) becomes the handle again, which is the correct fallback.
+  forgetPin(marker, url);
   blacklist(url);
 }
 
@@ -1607,6 +1742,10 @@ while (Date.now() < deadline) {
       continue;
     }
     if (evidence.kind === 'terminal' || evidence.kind === 'terminal-infrastructure') {
+      // #216 gate r2 P2: a terminal verdict that does not echo this marker cannot be accepted by
+      // the engine, so emitting it ends the scan in a rejection. When this run has a pinned
+      // (closed) conversation, look there first — it is the handle no tab scan can reach.
+      await preferPinnedTerminal(tab.url, evidence, tabs);
       onOurConversation(tab.url, evidence);
       emitEvidence(tab.url, evidence);
     }
@@ -1717,7 +1856,12 @@ while (Date.now() < deadline) {
       rejectCrossBound(tab.url, evidence.foreignMarker, 're-rendered');
       continue;
     }
-    if (evidence.kind === 'terminal' || evidence.kind === 'terminal-infrastructure') emitEvidence(tab.url, evidence);
+    if (evidence.kind === 'terminal' || evidence.kind === 'terminal-infrastructure') {
+      // Same detour as the readable-tab loop above: a dead tab re-rendered into an unbindable
+      // terminal verdict is the same dead end, so a pinned closed conversation is tried first.
+      await preferPinnedTerminal(tab.url, evidence, tabs);
+      emitEvidence(tab.url, evidence);
+    }
     if (evidence.kind !== 'owned-incomplete') continue;
     stillGeneratingUrl = tab.url;
     lastMatchWasSeeded = false;

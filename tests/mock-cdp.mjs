@@ -4,7 +4,7 @@
 // the tab's debugger WebSocket, /json/new (scratch tabs, so the salvage's remembered-URL
 // recovery can reach a decisive answer the way a real browser does), and /json/close.
 // Prints the chosen port on stdout.
-// Usage: node tests/mock-cdp.mjs <source-text-file> [organizer-state-file] [scratch-text-file] [scratch-canonical-url] [second-tab-url]
+// Usage: node tests/mock-cdp.mjs <source-text-file> [organizer-state-file] [scratch-text-file] [scratch-canonical-url] [second-tab-url] [second-tab-text-file]
 // Optional scratch content is served only when the requested URL equals the canonical URL,
 // preventing a wrong URL from producing a plausible recovery artifact.
 // #216 gate r1 P2: the optional fifth argument adds ONE more listed conversation tab (id tab2) at
@@ -24,6 +24,11 @@ const scratchTextFile = process.argv[4] || null;
 const PRIMARY_URL = 'https://chatgpt.com/c/mock-conversation';
 const scratchCanonicalUrl = process.argv[5] || PRIMARY_URL;
 const secondTabUrl = process.argv[6] || null;
+// #216 gate r2 P2: the optional SIXTH argument gives that second tab its own body. Until now it
+// served the primary's text, so no fixture could express the shape the finding names -- a
+// complete, correctly signed conversation A alongside a retry sibling B whose terminal verdict
+// carries no marker echo. Absent, tab2 keeps serving the primary's text exactly as before.
+const secondTabTextFile = process.argv[7] || null;
 const WS_MAGIC = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
 function wsTextFrame(payload) {
@@ -92,6 +97,9 @@ function textForTarget(id) {
     // binds its body to the recovery candidate; mismatch must remain inconclusive/foreign.
     if (scratch.get(id) !== scratchCanonicalUrl) return 'Mock scratch URL mismatch: no conversation content.';
     try { return fs.readFileSync(scratchTextFile, 'utf8'); } catch { return ''; }
+  }
+  if (id === 'tab2' && secondTabTextFile) {
+    try { return fs.readFileSync(secondTabTextFile, 'utf8'); } catch { return ''; }
   }
   try { return fs.readFileSync(textFile, 'utf8'); } catch { return ''; }
 }
