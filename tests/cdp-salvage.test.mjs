@@ -13,7 +13,7 @@
 import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
@@ -5222,6 +5222,229 @@ for (const placeholder of PLACEHOLDER_URLS) {
       && r.memos.length === 201,
     `memos.length=${r.memos.length} evicted0=${memoSet.has(unprotected[0])} kept1=${memoSet.has(unprotected[1])}`);
   cdp.stop();
+}
+
+{ // #215 gate r8 P2 (bin/cdp-salvage.mjs throttleAlreadyCharged / throttleSeenFreshTemp): admission
+  // treats a FRESH rename-aside temp for the same fingerprint as already charged. Pre-fix,
+  // admission asked only "does the plain record exist?" — during the window INSIDE
+  // removeThrottleSeenGeneration between its rename-aside (which frees the plain name) and its
+  // link-back (which restores whichever generation the temp turns out to hold), a concurrent
+  // scan's existence check saw nothing, its 'wx' create succeeded, and it published a SECOND
+  // cooldown for the identical sighting the first scan was mid-prune on — the round-8 finding. A
+  // fresh temp (mtime within THROTTLE_SEEN_TEMP_GRACE_MS) is the on-disk signature of that exact
+  // window, so admission now defers to the next scan instead of re-charging. (A1)/(A2) drive this
+  // end-to-end; (A3) reaches the window itself at the function level, the same technique #215 gate
+  // r7 P2's (h*) tests use.
+  const modalTextA1 = "You're making requests too quickly. [#215 gate r8 P2 fixture]";
+  const pageTextA1 = `ChatGPT\nAccount limits\n${modalTextA1}\nPlease try again shortly.\n`;
+  const primaryUrlA1 = 'https://chatgpt.com/c/mock-conversation';   // the mock's own primary tab
+  // 90s: long past the 30s grace, short enough for A2's 2-minute-old temp to be reaped by this
+  // scan's own one-shot prune (production's default THROTTLE_SEEN_TTL is 7 days).
+  const SHORT_TTL_R8 = { PRO_GATE_THROTTLE_SEEN_TTL: '90000' };
+
+  // (A1) a FRESH temp (renamed aside moments ago, mtime "now"): the sighting must be treated as
+  // already charged — no new record, no cooldown — and the temp itself is left in place, exactly
+  // as production would leave it for the in-progress prune that owns it.
+  const homeA1 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedThrottleSeen(homeA1, primaryUrlA1, modalTextA1);
+  const recordPathA1 = throttleSeenRecordPath(homeA1, primaryUrlA1, modalTextA1);
+  const tempPathA1 = `${recordPathA1}.expire.99999`;
+  fs.renameSync(recordPathA1, tempPathA1);
+  const cdpA1 = await mockCdp(pageTextA1, [], { throttleModal: modalTextA1 });
+  const rA1 = await runSalvageInHome(homeA1, [MARKER, '3'], cdpA1.port, SHORT_TTL_R8);
+  cdpA1.stop();
+  check('#215 gate r8 P2 (A1) a fresh expire temp for the same fingerprint is treated as already charged, not re-charged',
+    rA1.status !== 5, `status=${rA1.status} stderr=${rA1.stderr?.slice(-400)}`);
+  check('#215 gate r8 P2 (A1) no cooldown is written for a sighting deferred by a fresh temp',
+    rA1.cooldown === null, `cooldown=${rA1.cooldown}`);
+  check('#215 gate r8 P2 (A1) stderr names the sighting as already charged',
+    /already charged/.test(rA1.stderr || ''), `stderr=${rA1.stderr?.slice(-400)}`);
+  check('#215 gate r8 P2 (A1) no plain record is recreated while the temp is still fresh',
+    !throttleSeenHas(homeA1, primaryUrlA1, modalTextA1),
+    `dir=${JSON.stringify(fs.existsSync(throttleSeenDir(homeA1)) ? fs.readdirSync(throttleSeenDir(homeA1)) : [])}`);
+  fs.rmSync(homeA1, { recursive: true, force: true });
+
+  // (A2) control: the SAME shape, but the temp is 2 minutes old — past both the 30s grace and
+  // this scan's shortened 90s TTL. Admission must not defer (the window it is protecting against
+  // is long closed): the sighting charges normally, and that scan's own one-shot prune reaps the
+  // stale temp as an ordinary TTL-expired orphan (#215 gate r7 P2 (h5) behaviour).
+  const homeA2 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedThrottleSeen(homeA2, primaryUrlA1, modalTextA1);
+  const recordPathA2 = throttleSeenRecordPath(homeA2, primaryUrlA1, modalTextA1);
+  const tempPathA2 = `${recordPathA2}.expire.99999`;
+  fs.renameSync(recordPathA2, tempPathA2);
+  const agedAtA2 = new Date(Date.now() - 120_000);
+  fs.utimesSync(tempPathA2, agedAtA2, agedAtA2);
+  const cdpA2 = await mockCdp(pageTextA1, [], { throttleModal: modalTextA1 });
+  const rA2 = await runSalvageInHome(homeA2, [MARKER, '3'], cdpA2.port, SHORT_TTL_R8);
+  cdpA2.stop();
+  check('#215 gate r8 P2 (A2) control: a temp aged past the grace and TTL charges the sighting normally (exit 5 + cooldown)',
+    rA2.status === 5 && /^\d{4}-\d{2}-\d{2}T/.test(rA2.cooldown ?? ''),
+    `status=${rA2.status} cooldown=${rA2.cooldown} stderr=${rA2.stderr?.slice(-400)}`);
+  check("#215 gate r8 P2 (A2) control: the aged temp is reaped by that scan's own prune",
+    !fs.existsSync(tempPathA2), `exists=${fs.existsSync(tempPathA2)}`);
+  fs.rmSync(homeA2, { recursive: true, force: true });
+
+  // (A3) function level: bin/cdp-salvage.mjs is a CLI script with no exports, so the functions
+  // are sliced out BY NAME and evaluated verbatim in a vm context this test controls — the same
+  // technique #215 gate r7 P2's (h*) tests use, extended here to reenter throttleAlreadyCharged
+  // from inside removeThrottleSeenGeneration's own link-back attempt. A slice that no longer
+  // exists surfaces as a null function and a failing check, never as a quietly different pruner.
+  const salvageLinesR8 = fs.readFileSync(SALVAGE, 'utf8').split('\n');
+  const sliceTopLevelR8 = (name) => {
+    const start = salvageLinesR8.findIndex((line) => (
+      line.startsWith(`function ${name}(`) || line.startsWith(`const ${name} = `)
+    ));
+    if (start < 0) return null;
+    if (salvageLinesR8[start].startsWith('const ') || salvageLinesR8[start].trimEnd().endsWith('}')) {
+      return salvageLinesR8[start];
+    }
+    const end = salvageLinesR8.findIndex((line, i) => i > start && line === '}');
+    return end < 0 ? null : salvageLinesR8.slice(start, end + 1).join('\n');
+  };
+  const PARTS_R8 = ['THROTTLE_SEEN_EXPIRE_MARK', 'throttleSeenIsTemp', 'removeThrottleSeenGeneration',
+    'THROTTLE_SEEN_TEMP_GRACE_MS', 'throttleSeenKey', 'throttleSeenRecordPath', 'throttleSeenFreshTemp',
+    'throttleAlreadyCharged'];
+  // throttleSeenPruned is injected directly as a sandbox global (true: skip the one-shot prune
+  // inside throttleAlreadyCharged, isolating the assertion to throttleSeenFreshTemp) — the same
+  // pattern THROTTLE_SEEN_DIR/TTL_MS/MAX already use, not a slice of the module's own `let`.
+  const buildAdmissionR8 = (dir, { fsImpl = fs } = {}) => {
+    const source = PARTS_R8.map(sliceTopLevelR8).filter((part) => part !== null).join('\n');
+    const expose = '({ removeGeneration: typeof removeThrottleSeenGeneration === "function" ? removeThrottleSeenGeneration : null,'
+      + ' charged: typeof throttleAlreadyCharged === "function" ? throttleAlreadyCharged : null })';
+    return runInNewContext(`${source}\n${expose}`, {
+      fs: fsImpl, path, process, createHash, THROTTLE_SEEN_DIR: dir, throttleSeenPruned: true,
+    });
+  };
+
+  const dirA3 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-r8-admission-'));
+  const urlA3 = 'https://chatgpt.com/c/mock-r8-interleave';
+  const textA3 = 'a throttle sighting the round-8 interleaving targets';
+  const hashA3 = createHash('sha256').update(textA3).digest('hex');
+  const keyA3 = createHash('sha256').update(`${urlA3}\n${hashA3}`).digest('hex');
+  const recordPathA3 = path.join(dirA3, keyA3);
+  fs.writeFileSync(recordPathA3, '', { flag: 'wx' });
+
+  const reentrantA3 = { existedDuringWindow: null, charged: null };
+  const proxyA3 = Object.create(fs);
+  proxyA3.linkSync = (existingPath, newPath, ...rest) => {
+    if (newPath === recordPathA3 && reentrantA3.charged === null) {
+      // The exact round-8 window: the plain record name is currently free (removeThrottleSeenGeneration
+      // already renamed it aside) and has not yet been restored by the link-back this call is about
+      // to perform. `admission` below is a FRESH vm instance — a stand-in for a concurrent scan's
+      // own process, reading the SAME on-disk directory this call is operating on.
+      reentrantA3.existedDuringWindow = fs.existsSync(recordPathA3);
+      const admission = buildAdmissionR8(dirA3);
+      reentrantA3.charged = admission.charged?.(urlA3, hashA3, new Set());
+    }
+    return fs.linkSync(existingPath, newPath, ...rest);
+  };
+  const removerA3 = buildAdmissionR8(dirA3, { fsImpl: proxyA3 });
+  // A deliberately mismatched `expected` forces the exact branch that attempts a link-back — the
+  // same branch #215 gate r7 P2's (h1)/(h2) exercise via a genuine replacement; here it isolates
+  // just the window's effect on throttleAlreadyCharged, which r7 never called at all.
+  removerA3.removeGeneration?.(keyA3, { ino: -1, mtimeMs: -1 });
+
+  check('#215 gate r8 P2 (A3) the round-8 window: mid-removeThrottleSeenGeneration, before its link-back, the plain record does not exist',
+    reentrantA3.existedDuringWindow === false, `existedDuringWindow=${reentrantA3.existedDuringWindow}`);
+  check('#215 gate r8 P2 (A3) a reentrant throttleAlreadyCharged for the identical fingerprint, called in that exact window, returns true (deferred, not re-chargeable)',
+    reentrantA3.charged === true, `charged=${reentrantA3.charged}`);
+  fs.rmSync(dirA3, { recursive: true, force: true });
+}
+
+{ // #215 forgetUrl link-back (bin/cdp-salvage.mjs forgetUrl): on ANY link-back failure other than
+  // EEXIST, the claim holding the only remaining copy of a genuinely republished memo must survive
+  // on disk. Pre-fix, forgetUrl's `try { fs.linkSync(claim, f); survivor = held; } catch {}`
+  // swallowed ENOSPC, EDQUOT, EIO and EPERM exactly like it swallowed the benign EEXIST, and the
+  // unconditional `fs.unlinkSync(claim)` right after destroyed the memo it had just proven was
+  // genuine — the same defect class 8db5970 closed for the throttle-seen sidecar's own link-back,
+  // here in the conversation-URL memo's.
+  const memoDirB = 'conversation-urls';
+  const linkFaultPreloadB = (code, message) => [
+    "import fs from 'node:fs';",
+    'const realLinkSync = fs.linkSync;',
+    'fs.linkSync = function (existingPath, newPath, ...rest) {',
+    `  if (String(newPath).includes('${memoDirB}')) {`,
+    `    const err = new Error(${JSON.stringify(message)}); err.code = ${JSON.stringify(code)}; throw err;`,
+    '  }',
+    '  return realLinkSync.call(fs, existingPath, newPath, ...rest);',
+    '};',
+    '',
+  ].join('\n');
+  // Forceable the same way #215 skeptic r3 D1 forces its own ENOSPC on the throttle-seen sidecar's
+  // link-back: a --import preload failing exactly one fs call in the child, here fs.linkSync for a
+  // destination inside conversation-urls, leaving the sidecar's own link (a different directory)
+  // alone.
+  const buildLinkFaultEnvB = (code, message) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-link-fault-'));
+    const preload = path.join(dir, 'fail-memo-link.mjs');
+    fs.writeFileSync(preload, linkFaultPreloadB(code, message));
+    return {
+      dir,
+      env: { NODE_OPTIONS: [process.env.NODE_OPTIONS, `--import ${pathToFileURL(preload).href}`].filter(Boolean).join(' ') },
+    };
+  };
+
+  const staleUrlB = 'https://chatgpt.com/c/mock-conversation';                  // knownUrl: what forgetUrl is asked to forget
+  const republishedUrlB = 'https://chatgpt.com/c/mock-215-r8-republished-memo'; // held: what forgetUrl claims off disk
+  const sourceB = `run marker: ${MARKER}\nstale readable source`;               // U1's own readable-stale-source fixture
+  const foreignAnswerB = 'run marker: pg-run-other-repo-42-1111111111-9\nVERDICT: SHIP — foreign.';
+  const memoPathB = (home) => path.join(home, memoDirB, MARKER);
+
+  // (positive) ENOSPC on the link-back: the claim must survive, holding the republished bytes.
+  const faultB1 = buildLinkFaultEnvB('ENOSPC', 'mock: no space left on device');
+  const homeB1 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedMemo(MARKER, staleUrlB)(homeB1);
+  let republishedB1 = false;
+  const cdpB1 = await mockCdp(sourceB, [], {
+    renderText: () => {
+      // Fires on the scratch's first read — well after recallUrl already captured staleUrlB into
+      // knownUrl at process start, and well before classifyEvidence(foreignAnswerB) later drives
+      // rejectForeign -> forgetUrl. A genuine second writer republishing a DIFFERENT, real memo
+      // while this scan is mid-flight looks exactly like this on disk.
+      if (!republishedB1) { republishedB1 = true; fs.writeFileSync(memoPathB(homeB1), `${republishedUrlB}\n`); }
+      return foreignAnswerB;
+    },
+  });
+  const rB1 = await runSalvageInHome(homeB1, [MARKER, '3'], cdpB1.port, { ...SCRATCH_SAMPLE_TEST_ENV, ...faultB1.env });
+  cdpB1.stop();
+  const claimFilesB1 = fs.readdirSync(path.join(homeB1, memoDirB)).filter((n) => n.includes('.rej.'));
+  check('#215 forgetUrl link-back (ENOSPC) republished before the reject fires',
+    republishedB1, `republished=${republishedB1}`);
+  check('#215 forgetUrl link-back (ENOSPC) a link-back that cannot be written leaves the claim on disk instead of destroying it',
+    claimFilesB1.length === 1,
+    `status=${rB1.status} dir=${JSON.stringify(fs.readdirSync(path.join(homeB1, memoDirB)))} stderr=${rB1.stderr?.slice(-400)}`);
+  check('#215 forgetUrl link-back (ENOSPC) the surviving claim holds the republished memo, not the discarded stale one',
+    claimFilesB1.length === 1 && fs.readFileSync(path.join(homeB1, memoDirB, claimFilesB1[0]), 'utf8').trim() === republishedUrlB,
+    `claim=${claimFilesB1[0]} contents=${claimFilesB1.length === 1 ? fs.readFileSync(path.join(homeB1, memoDirB, claimFilesB1[0]), 'utf8') : null}`);
+  fs.rmSync(homeB1, { recursive: true, force: true });
+  fs.rmSync(faultB1.dir, { recursive: true, force: true });
+
+  // (control) EEXIST on the same link-back: unchanged behaviour — the redundant claim is still
+  // dropped, exactly as it was before this fix and exactly as the throttle-seen sidecar's own
+  // EEXIST branch still is.
+  const faultB2 = buildLinkFaultEnvB('EEXIST', 'mock: file already exists');
+  const homeB2 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedMemo(MARKER, staleUrlB)(homeB2);
+  let republishedB2 = false;
+  const cdpB2 = await mockCdp(sourceB, [], {
+    renderText: () => {
+      if (!republishedB2) { republishedB2 = true; fs.writeFileSync(memoPathB(homeB2), `${republishedUrlB}\n`); }
+      return foreignAnswerB;
+    },
+  });
+  const rB2 = await runSalvageInHome(homeB2, [MARKER, '3'], cdpB2.port, { ...SCRATCH_SAMPLE_TEST_ENV, ...faultB2.env });
+  cdpB2.stop();
+  const claimFilesB2 = fs.existsSync(path.join(homeB2, memoDirB))
+    ? fs.readdirSync(path.join(homeB2, memoDirB)).filter((n) => n.includes('.rej.'))
+    : [];
+  check('#215 forgetUrl link-back (EEXIST) control: republished before the reject fires',
+    republishedB2, `republished=${republishedB2}`);
+  check('#215 forgetUrl link-back (EEXIST) control: an EEXIST link-back still drops the redundant claim',
+    claimFilesB2.length === 0,
+    `status=${rB2.status} dir=${JSON.stringify(fs.existsSync(path.join(homeB2, memoDirB)) ? fs.readdirSync(path.join(homeB2, memoDirB)) : [])} stderr=${rB2.stderr?.slice(-400)}`);
+  fs.rmSync(homeB2, { recursive: true, force: true });
+  fs.rmSync(faultB2.dir, { recursive: true, force: true });
 }
 
 process.exit(failures === 0 ? 0 : 1);

@@ -307,10 +307,20 @@ function forgetUrl(m, url) {
   let held = '';
   try { held = fs.readFileSync(claim, 'utf8').trim(); } catch {}
   let survivor = null;
+  let unlinkClaim = true;
   if (held && held !== url) {
-    try { fs.linkSync(claim, f); survivor = held; } catch {}  // genuine memo republished: put it back
+    try {
+      fs.linkSync(claim, f); survivor = held;  // genuine memo republished: put it back
+    } catch (err) {
+      // #215 gate r8 P2 (same class as 8db5970's link-back fix): EEXIST means a newer record
+      // already holds `f`, so `claim` is a stale duplicate — safe to drop. Any OTHER failure
+      // (ENOSPC, EDQUOT, EIO, EPERM, ...) means the link did NOT happen, so `claim` is still the
+      // ONLY copy of a memo just proved genuine; unlinking it here would destroy it with no
+      // survivor recorded anywhere. Leave it on disk for a later pass to find instead.
+      if (err?.code !== 'EEXIST') unlinkClaim = false;
+    }
   }
-  try { fs.unlinkSync(claim); } catch {}
+  if (unlinkClaim) { try { fs.unlinkSync(claim); } catch {} }
   return survivor;
 }
 
@@ -513,8 +523,9 @@ function throttleSeenRecordPath(url, hash) {
 }
 // #215 gate r7 P2: the mark a rename-aside temp created by removeThrottleSeenGeneration carries.
 // A record basename is bare sha256 hex (throttleSeenKey), so a name carrying this mark can only
-// be a temp — every place that reads this directory AS RECORDS skips it. throttleAlreadyCharged
-// is unaffected by construction: it asks for one exact record path, which a temp can never be.
+// be a temp — every place that reads this directory AS RECORDS skips it. throttleAlreadyCharged's
+// exact-path existence check can never MATCH a temp's name by construction, but #215 gate r8 P2
+// below gives admission a separate, deliberate lookup for a FRESH one (throttleSeenFreshTemp).
 const THROTTLE_SEEN_EXPIRE_MARK = '.expire.';
 function throttleSeenIsTemp(name) { return name.includes(THROTTLE_SEEN_EXPIRE_MARK); }
 // #215 gate r7 P2: delete ONLY the record generation that was actually checked — `expected` is
@@ -618,12 +629,42 @@ function pruneThrottleSeen(protectedKeys = new Set()) {
       .forEach(({ name, ino, mtimeMs }) => removeThrottleSeenGeneration(name, { ino, mtimeMs }));
   }
 }
+// #215 gate r8 P2: how long a rename-aside temp is treated as "someone else's record, mid-prune"
+// rather than an aged orphan. Must comfortably exceed the time a rename+stat+link-back takes
+// (microseconds to a few syscalls) and comfortably undercut THROTTLE_SEEN_TTL_MS, so it can never
+// be mistaken for the suppression horizon itself. Not env-overridable — unlike the TTL/MAX knobs
+// above, no test needs to shrink an in-process race window, only to age a temp past it.
+const THROTTLE_SEEN_TEMP_GRACE_MS = 30_000;
+// #215 gate r8 P2: removeThrottleSeenGeneration's rename-aside frees the plain record name BEFORE
+// its link-back restores whichever generation the temp turns out to hold (#215 gate r7 P2's own
+// residual, named where that function is defined). A plain existsSync check during that window
+// sees nothing, so a concurrent scan's 'wx' create wins and charges a SECOND cooldown for the
+// identical sighting the first scan is mid-prune on — the round-8 finding. A temp is evidence a
+// record existed a moment ago IF its mtime is still fresh (rename preserves mtime, so a genuinely
+// aged temp — TTL-expired, orphaned, or simply old — reads old here too, same as it always did);
+// admission treats only a fresh one as "already charged", deferring the sighting to the very next
+// scan rather than re-charging it. One readdirSync per admission call: THROTTLE_SEEN_DIR is
+// capped near THROTTLE_SEEN_MAX (~512) entries and a scan makes only a handful of these calls.
+function throttleSeenFreshTemp(url, hash) {
+  const tempPrefix = `${throttleSeenKey(url, hash)}${THROTTLE_SEEN_EXPIRE_MARK}`;
+  let names;
+  try { names = fs.readdirSync(THROTTLE_SEEN_DIR); } catch { return false; }   // missing dir: nothing fresh
+  const now = Date.now();
+  return names.some((name) => {
+    if (!name.startsWith(tempPrefix)) return false;
+    let stat;
+    try { stat = fs.statSync(path.join(THROTTLE_SEEN_DIR, name)); } catch { return false; }
+    return now - stat.mtimeMs <= THROTTLE_SEEN_TEMP_GRACE_MS;
+  });
+}
 // "Already charged" is now a plain existence check on the record file, not a load-then-scan of
 // an in-memory snapshot — there is no snapshot to go stale, so two processes checking/creating
 // records for the SAME or DIFFERENT fingerprints can never clobber one another (#208 gate r2 P2).
+// #215 gate r8 P2: the record check alone is not enough — see throttleSeenFreshTemp above.
 function throttleAlreadyCharged(url, hash, protectedKeys) {
   if (!throttleSeenPruned) { throttleSeenPruned = true; pruneThrottleSeen(protectedKeys); }
-  return fs.existsSync(throttleSeenRecordPath(url, hash));
+  if (fs.existsSync(throttleSeenRecordPath(url, hash))) return true;
+  return throttleSeenFreshTemp(url, hash);
 }
 // Creates the record with the 'wx' flag: this throws EEXIST (caught, ignored) if another
 // process already created the SAME fingerprint's file between this call's caller checking
