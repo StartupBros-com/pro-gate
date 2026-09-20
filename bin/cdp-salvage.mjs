@@ -1338,7 +1338,15 @@ async function organizeConversation() {
     const firstNewWhere = tripThrottleUnownedBatch(throttleHits.map((hit) => ({
       url: hit.tab.url,
       text: hit.throttleModal ?? hit.text,
-      foreign: !!hit.text && FOREIGN_MARKER_RE.test(hit.text),
+      // #215 gate r1 P1: FOREIGN_MARKER_RE matches ANY pg-run marker, THIS run's included, so a
+      // BLACKLISTED tab bearing our own marker used to read as another run's conversation — the
+      // one classification allowed to skip inconclusiveThrottleSeen — and dropped the scan into
+      // confirmed-absent exit 4 on nothing but a rate limit. Ask "is this ours?" first, exactly as
+      // classifyEvidence's reference predicate does (`foreign: !owned && FOREIGN_MARKER_RE...`).
+      // Blacklisted URLs remain excluded from POSITIVE ownership by ownedHit above; this decides
+      // only whether the surface is proven to be SOMEONE ELSE'S, the sole basis for disregarding
+      // a throttle sighting when deciding absence.
+      foreign: !!hit.text && !hasExactMarker(hit.text, marker) && FOREIGN_MARKER_RE.test(hit.text),
       where: 'organizer scan',
     })));
     if (firstNewWhere !== null) {
@@ -1776,7 +1784,15 @@ while (Date.now() < deadline) {
       const firstNewWhere = tripThrottleUnownedBatch(throttleHits.map((hit) => ({
         url: hit.tab.url,
         text: hit.throttleModal ?? hit.text,
-        foreign: !!hit.text && FOREIGN_MARKER_RE.test(hit.text),
+        // #215 gate r1 P1: FOREIGN_MARKER_RE matches ANY pg-run marker, THIS run's included, so a
+        // BLACKLISTED tab bearing our own marker used to read as another run's conversation — the
+        // one classification allowed to skip inconclusiveThrottleSeen — and dropped the scan into
+        // confirmed-absent exit 4 on nothing but a rate limit. Ask "is this ours?" first, exactly as
+        // classifyEvidence's reference predicate does (`foreign: !owned && FOREIGN_MARKER_RE...`).
+        // Blacklisted URLs remain excluded from POSITIVE ownership by ownedHit above; this decides
+        // only whether the surface is proven to be SOMEONE ELSE'S, the sole basis for disregarding
+        // a throttle sighting when deciding absence.
+        foreign: !!hit.text && !hasExactMarker(hit.text, marker) && FOREIGN_MARKER_RE.test(hit.text),
         where: hit.throttleModal ? `modal over tab ${hit.tab.url}` : `tab ${hit.tab.url}`,
       })));
       if (firstNewWhere !== null) tripThrottle(firstNewWhere);

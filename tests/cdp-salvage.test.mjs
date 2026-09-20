@@ -4511,6 +4511,109 @@ const FOREIGN_ANSWER = (m) => [
   fs.rmSync(home3, { recursive: true, force: true });
 }
 
+{ // #215 gate r1 P1 (bin/cdp-salvage.mjs:1779 main scan, :1341 organizer): a BLACKLISTED tab
+  // whose page carries THIS run's own exact marker beneath the throttle modal was misclassified
+  // as FOREIGN throttle evidence. `ownedHit` correctly excludes blacklisted URLs from positive
+  // ownership, but the batch mapping immediately after it asked only
+  // `FOREIGN_MARKER_RE.test(hit.text)` — and that pattern matches ANY pg-run marker, this run's
+  // included. The hit therefore reached tripThrottleUnownedBatch with `foreign: true`, the one
+  // case allowed to skip setting inconclusiveThrottleSeen. With the sighting already charged (so
+  // no fresh exit 5) and the tab loop skipping the blacklisted URL, the scan fell all the way
+  // through to the confirmed-absent exit 4 — spending a paid review's finite recovery-miss budget
+  // on a limiter that never supplied ANOTHER run's marker, the exact distinction the #208 absence
+  // guard exists to preserve. classifyEvidence already held the reference predicate
+  // (`foreign: !owned && FOREIGN_MARKER_RE.test(text)`); both batch mappings now match it, while
+  // keeping blacklisted URLs excluded from positive ownership.
+  const blSelfUrl = 'https://chatgpt.com/c/mock-blacklisted-self-marked-215';
+  const blForeignUrl = 'https://chatgpt.com/c/mock-blacklisted-foreign-215';
+  const modalText215 = "You're making requests too quickly. [#215 gate r1 P1 fixture]";
+  const selfMarkedPage215 = `ChatGPT\nrun marker: ${MARKER}\n${modalText215}\nOur own conversation beneath the modal.\n`;
+  const foreignMarkedPage215 = `ChatGPT\npg-run-another-run-215\n${modalText215}\nAnother run's conversation beneath the modal.\n`;
+  // Blacklisted (the per-marker nonMatching list) AND already charged: the two preconditions the
+  // finding names. Nothing else is seeded — no memo, no second candidate — so the only way out of
+  // the scan is the absence-vs-inconclusive decision this test is about.
+  const seedBlacklistedCharged215 = (home, url) => {
+    fs.writeFileSync(path.join(home, 'salvage-nonmatching.txt'), `${MARKER}\t${url}\n`);
+    seedThrottleSeen(home, url, modalText215);
+  };
+
+  const homeSelf215 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedBlacklistedCharged215(homeSelf215, blSelfUrl);
+  const cdpSelf215 = await mockCdp('__NO_TABS__', [{ id: 'bl215', url: blSelfUrl }], {
+    tabText: () => selfMarkedPage215,
+    throttleModal: () => modalText215,
+  });
+  const rSelf215 = await runSalvageInHome(homeSelf215, ['--probe', MARKER, '3'], cdpSelf215.port);
+  cdpSelf215.stop();
+  check("#215 gate r1 P1 main scan: a blacklisted tab carrying THIS run's own marker under an already-charged modal stays inconclusive (7), not confirmed-absent (4)",
+    rSelf215.status === 7, `status=${rSelf215.status} stderr=${rSelf215.stderr?.slice(-500)}`);
+  check('#215 gate r1 P1 main scan: the repeat probe names the unowned throttle surface as its reason',
+    /^evidence-kind: inconclusive$/m.test(rSelf215.stderr || '')
+      && /inconclusive: an unowned throttle surface was observed this scan/.test(rSelf215.stderr || ''),
+    `stderr=${rSelf215.stderr?.slice(-500)}`);
+  check('#215 gate r1 P1 main scan: the already-charged sighting neither writes nor rewrites the cooldown',
+    rSelf215.cooldown === null, `cooldown=${rSelf215.cooldown}`);
+  check('#215 gate r1 P1 main scan: the blacklisted self-marked tab is never reported as positive ownership',
+    !/live conversation:/.test(rSelf215.stderr || '') && !/probe-state:/.test(rSelf215.stderr || ''),
+    `stderr=${rSelf215.stderr?.slice(-500)}`);
+  fs.rmSync(homeSelf215, { recursive: true, force: true });
+
+  // Planted negative: the SAME blacklisted, already-charged shape, but the page beneath the modal
+  // carries a genuinely OTHER run's marker. That is positively someone else's conversation — the
+  // one case #208 gate r2 P1 allows to be disregarded when deciding absence — so it must keep
+  // today's behaviour and still reach the confirmed-absent exit 4.
+  const homeForeign215 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedBlacklistedCharged215(homeForeign215, blForeignUrl);
+  const cdpForeign215 = await mockCdp('__NO_TABS__', [{ id: 'bl215f', url: blForeignUrl }], {
+    tabText: () => foreignMarkedPage215,
+    throttleModal: () => modalText215,
+  });
+  const rForeign215 = await runSalvageInHome(homeForeign215, ['--probe', MARKER, '3'], cdpForeign215.port);
+  cdpForeign215.stop();
+  check("#215 gate r1 P1 planted negative: a blacklisted tab carrying ANOTHER run's marker is still foreign evidence and reaches confirmed-absent (4)",
+    rForeign215.status === 4, `status=${rForeign215.status} stderr=${rForeign215.stderr?.slice(-500)}`);
+  check('#215 gate r1 P1 planted negative: the repeat foreign sighting is not reported as inconclusive',
+    !/evidence-kind: inconclusive/.test(rForeign215.stderr || ''), `stderr=${rForeign215.stderr?.slice(-500)}`);
+  check('#215 gate r1 P1 planted negative: the already-charged foreign sighting does not write the cooldown',
+    rForeign215.cooldown === null, `cooldown=${rForeign215.cooldown}`);
+  fs.rmSync(homeForeign215, { recursive: true, force: true });
+
+  // Organizer variant: the same misclassification lived in the organizer's own batch mapping.
+  // With the sighting already charged, no memo and no other candidate, the organizer used to fall
+  // through to reason=provenance-rejected — an absence-like conclusion — instead of the
+  // inconclusive reason=throttle framing #208 gate r2 P1 installed for exactly this case.
+  const orgTitle215 = 'pro-gate review: PR #215 gate r1 P1 [pro-gate]';
+  const homeOrgSelf215 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedOrganizer(MARKER, orgTitle215)(homeOrgSelf215); // no memo url -> no recovery path at all
+  seedBlacklistedCharged215(homeOrgSelf215, blSelfUrl);
+  const cdpOrgSelf215 = await mockCdp('__NO_TABS__', [{ id: 'bl215', url: blSelfUrl }], {
+    tabText: () => selfMarkedPage215,
+    throttleModal: () => modalText215,
+  });
+  const rOrgSelf215 = await runSalvageInHome(homeOrgSelf215, ['--organize', MARKER, '5'], cdpOrgSelf215.port);
+  cdpOrgSelf215.stop();
+  check("#215 gate r1 P1 organizer: a blacklisted tab carrying THIS run's own marker under an already-charged modal reports reason=throttle, not an absence-like provenance rejection",
+    /reason=throttle/.test(rOrgSelf215.stdout), `stdout=${rOrgSelf215.stdout} stderr=${rOrgSelf215.stderr?.slice(-400)}`);
+  check('#215 gate r1 P1 organizer: the already-charged sighting neither writes nor rewrites the cooldown',
+    rOrgSelf215.cooldown === null, `cooldown=${rOrgSelf215.cooldown}`);
+  fs.rmSync(homeOrgSelf215, { recursive: true, force: true });
+
+  const homeOrgForeign215 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedOrganizer(MARKER, orgTitle215)(homeOrgForeign215);
+  seedBlacklistedCharged215(homeOrgForeign215, blForeignUrl);
+  const cdpOrgForeign215 = await mockCdp('__NO_TABS__', [{ id: 'bl215f', url: blForeignUrl }], {
+    tabText: () => foreignMarkedPage215,
+    throttleModal: () => modalText215,
+  });
+  const rOrgForeign215 = await runSalvageInHome(homeOrgForeign215, ['--organize', MARKER, '5'], cdpOrgForeign215.port);
+  cdpOrgForeign215.stop();
+  check("#215 gate r1 P1 organizer planted negative: a blacklisted tab carrying ANOTHER run's marker is still foreign evidence, so the organizer does not report reason=throttle",
+    !/reason=throttle/.test(rOrgForeign215.stdout), `stdout=${rOrgForeign215.stdout} stderr=${rOrgForeign215.stderr?.slice(-400)}`);
+  check('#215 gate r1 P1 organizer planted negative: the already-charged foreign sighting does not write the cooldown',
+    rOrgForeign215.cooldown === null, `cooldown=${rOrgForeign215.cooldown}`);
+  fs.rmSync(homeOrgForeign215, { recursive: true, force: true });
+}
+
 // v0.42 (#109): a synthetic placeholder such as https://chatgpt.com/c/WEB:<uuid> once passed the
 // prefix-only memo check, was remembered as authoritative, and parked its run forever: the page
 // behind it carries no marker, so every later pass was inconclusive and never counted a miss.
