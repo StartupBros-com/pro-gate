@@ -105,23 +105,8 @@ import {
   parseTestRenderSampleMs,
 } from './cdp-test-timing.mjs';
 
-// v0.42 (#109): the shape a remembered conversation URL must have. A synthetic placeholder such as
-// https://chatgpt.com/c/WEB:<uuid> passed the old prefix-only check, was remembered as
-// authoritative, and rendered a page with no marker on every later pass — an inconclusive result
-// the engine deliberately never counts as a miss — so its run held a ChatGPT slot for days. The
-// boundary enforced here: the segment after /c/ is one path segment of letters, digits, and
-// dashes, optionally followed by a query or fragment. Every real id observed on the operator's box
-// (36-char hex-and-dash, 196 of 196) passes; the placeholder's colon fails, including one whose
-// body after the prefix is a well-formed UUID, because the whole segment is anchored. This is a
-// shape gate like MARKER_SAFE_RE, not proof the conversation exists; a stricter hex-and-dash
-// shape is deferred until test fixtures stop using named ids such as mock-conversation.
-// Declared HERE, above the argument parser, because `--close --url` is held to the same
-// predicate (#216 local verify r3 P3) — see the closeUrl check below.
-const CONVERSATION_URL_RE = /^https:\/\/chatgpt\.com\/c\/[A-Za-z0-9-]+(?:[?#].*)?$/;
-const conversationUrlOk = (url) => CONVERSATION_URL_RE.test(url || '');
-
 const usage = () => {
-  console.error('usage: cdp-salvage.mjs [--probe|--close [--url <url>]|--sweep-root|--organize [--finalize --result-file <path>] [--accepted-url <url>] [--archive] [--no-rename]] <pr-marker|-> [timeout-secs] [cdp-port]');
+  console.error('usage: cdp-salvage.mjs [--probe|--close|--sweep-root|--organize [--finalize --result-file <path>] [--accepted-url <url>] [--archive] [--no-rename]] <pr-marker|-> [timeout-secs] [cdp-port]');
   process.exit(2);
 };
 const argv = process.argv.slice(2);
@@ -131,15 +116,6 @@ let archive = false;
 let rename = true;
 let resultFile = null;
 let acceptedUrl = null;
-let closeUrl = null;
-// #216 gate r1 P2: whether --url was SUPPLIED, tracked apart from its value. A falsy-value check
-// cannot tell "flag omitted" from "flag given an empty value", and the two must not mean the same
-// thing: the first is the documented unscoped close, the second is a caller whose scope
-// expression produced nothing (an empty memo read, an unset shell variable). Under
-// the old truthiness test `--close --url '' <marker>` passed validation AND then skipped the URL
-// filter, so a marker owning two conversations had BOTH closed -- the exact unscoped blast radius
-// #206 finding A exists to prevent, reachable by accident.
-let urlFlagSeen = false;
 for (;;) {
   const arg = argv[0];
   if (!arg?.startsWith('--')) break;
@@ -153,9 +129,6 @@ for (;;) {
     resultFile = argv.shift() ?? null;
   } else if (arg === '--accepted-url') {
     acceptedUrl = argv.shift() ?? null;
-  } else if (arg === '--url') {
-    urlFlagSeen = true;
-    closeUrl = argv.shift() ?? null;
   } else if (arg === '--archive') {
     archive = true;
   } else if (arg === '--no-rename') {
@@ -165,28 +138,9 @@ for (;;) {
   }
 }
 if (mode !== 'organize' && (finalize || archive || !rename || resultFile || acceptedUrl)) usage();
-if (mode !== 'close' && urlFlagSeen) usage();
 if (archive && !finalize) usage();
 if (finalize !== !!resultFile || (acceptedUrl && !finalize)) usage();
 if (acceptedUrl && !/^https:\/\/chatgpt\.com\/c\//.test(acceptedUrl)) usage();
-// #216 local verify r3 P3: --url is a close SCOPE (conversationIdFromUrl below reads the id out
-// of it), and it reaches this script from the conversation-urls memo layer, which only ever
-// emits a URL that passed conversationUrlOk. A prefix-only
-// check here was looser than that source: a #109-shaped placeholder such as
-// https://chatgpt.com/c/WEB:<uuid> — or an empty/multi-segment id — was accepted as a scope no
-// open tab could ever match, so --close exited 0 reporting "closed 0 conversation tab(s)" and
-// the caller could not tell a nonsense scope from an honest "nothing owned". Same predicate,
-// and a named refusal rather than the bare usage line, because only one argument is at fault.
-// #216 gate r1 P2: gated on the FLAG, not on its value. `--url ''` used to slip past this check
-// (empty is falsy) and then past the close filter below, silently widening the close to every
-// owned conversation; a missing value (`--close --url` with nothing after it) did the same. Both
-// are now refused here, before any browser access, so an unscoped close is reachable only by
-// omitting --url entirely.
-if (urlFlagSeen && !conversationUrlOk(closeUrl)) {
-  const shown = closeUrl === null ? '(no value)' : closeUrl === '' ? '(empty)' : closeUrl;
-  console.error(`usage: --url must be a conversation URL like https://chatgpt.com/c/<id>, got: ${shown}`);
-  process.exit(2);
-}
 const probe = mode === 'probe';
 const close = mode === 'close';
 const sweepRoot = mode === 'sweep-root';
@@ -249,8 +203,18 @@ const foldedIncludes = (text, wanted) => asciiFold(text).includes(asciiFold(want
 // Marker identity. Null/empty on either side is NOT a match: an absent echo is "unproven", never
 // "ours" (organizerOwnership and finalizerOwnership both depend on that distinction).
 const sameMarker = (a, b) => !!a && !!b && asciiFold(a) === asciiFold(b);
-// CONVERSATION_URL_RE / conversationUrlOk (the memo shape gate) are defined above the argument
-// parser, which holds `--close --url` to that same predicate.
+// v0.42 (#109): the shape a remembered conversation URL must have. A synthetic placeholder such as
+// https://chatgpt.com/c/WEB:<uuid> passed the old prefix-only check, was remembered as
+// authoritative, and rendered a page with no marker on every later pass — an inconclusive result
+// the engine deliberately never counts as a miss — so its run held a ChatGPT slot for days. The
+// boundary enforced here: the segment after /c/ is one path segment of letters, digits, and
+// dashes, optionally followed by a query or fragment. Every real id observed on the operator's box
+// (36-char hex-and-dash, 196 of 196) passes; the placeholder's colon fails, including one whose
+// body after the prefix is a well-formed UUID, because the whole segment is anchored. This is a
+// shape gate like MARKER_SAFE_RE, not proof the conversation exists; a stricter hex-and-dash
+// shape is deferred until test fixtures stop using named ids such as mock-conversation.
+const CONVERSATION_URL_RE = /^https:\/\/chatgpt\.com\/c\/[A-Za-z0-9-]+(?:[?#].*)?$/;
+const conversationUrlOk = (url) => CONVERSATION_URL_RE.test(url || '');
 const memoPath = (m) => (MARKER_SAFE_RE.test(m) ? path.join(URL_MEMO_DIR, m) : null);
 const titleMemoPath = (m) => (MARKER_SAFE_RE.test(m) ? path.join(TITLE_MEMO_DIR, m) : null);
 
@@ -440,7 +404,7 @@ function rememberUrl(m, url) {
       // #206 gate r8 P2 finding B: a memo whose marker still has a retained reservation
       // (in-progress/<marker>) is a durable recovery handle for a superseded-but-uncollected
       // run, not churn -- evicting it on a later publication's write could leave that run with
-      // NEITHER an open tab (a scoped `--close --url` can have taken it) NOR a memo. The cap
+      // NEITHER an open tab (a `--close` of the marker can have taken it) NOR a memo. The cap
       // applies only to UNPROTECTED entries; protected entries never count toward it and are
       // never removed. A missing in-progress/ directory protects nothing (fail-open to the
       // pre-existing behavior). One existsSync per candidate, and only because the cap is
@@ -609,35 +573,6 @@ async function tabText(tab) {
   if (typeof result.value?.text !== 'string') return null;
   if (result.value.promptAt === 0) scopedResponses.add(result.value.text);
   return result.value.text;
-}
-
-// #216 gate r4 P2: a scoped `--close --url` decides about a MUTABLE target. The /json listing
-// that selected a tab is a snapshot; between that snapshot and the ownership read the tab can
-// navigate to a retry conversation which -- being the same run's retry -- carries the same
-// marker, so ownership still passes and the close takes a DIFFERENT conversation down while
-// reporting success "at" the URL the caller scoped to. Authorization therefore has to be bound to
-// the page as it is at MUTATION time: one evaluate returns location.href and the review text from
-// the same moment, so the id the scope check reads and the text the ownership check reads can
-// never come from two different pages. Best-effort by construction -- an unreadable page yields
-// null, which the caller must treat as a mismatch and never as a match.
-async function tabUrlAndText(tab) {
-  const expression =
-    '/* pro-gate:close-guard */ (function () {' +
-    ' var href = (typeof location === "object" && location !== null && typeof location.href === "string")' +
-    ' ? location.href : null;' +
-    ' var review = (' + readReviewText.toString() + ')(document, ' + JSON.stringify(marker) + ');' +
-    ' return { href: href, review: review };' +
-    '})()';
-  const result = await evaluateTab(tab, expression);
-  if (!result.ok || !result.value || typeof result.value !== 'object') return null;
-  const { href, review } = result.value;
-  if (typeof href !== 'string' || !href) return null;
-  // Same bookkeeping tabText does: a text read that located this run's prompt is scope-anchored,
-  // and responseClaims needs that to classify the answer the same way either reader would.
-  if (typeof review === 'string') return { href, text: review };
-  if (typeof review?.text !== 'string') return null;
-  if (review.promptAt === 0) scopedResponses.add(review.text);
-  return { href, text: review.text };
 }
 
 async function tabTerminalInfrastructure(tab) {
@@ -1320,52 +1255,18 @@ async function organizeConversation() {
   return result;
 }
 
-// #206 gate r8 P2 finding A: --close used to close EVERY tab owned by the marker, not only the
-// one the caller validated a durable handle for. A retry-created conversation shares the same
-// marker as its predecessor, so an unscoped close of "everything owned" could take the finished
-// review down with the abandoned retry. --url narrows the candidate set to the one conversation
-// id (the path segment after /c/, ignoring query and fragment) before ownership is even checked.
-const conversationIdFromUrl = (url) => {
-  const prefix = 'https://chatgpt.com/c/';
-  if (!url || !url.startsWith(prefix)) return null;
-  return url.slice(prefix.length).split(/[?#]/)[0];
-};
-
 if (close) {
   let tabs = [];
   try {
     tabs = (await (await fetch(`http://127.0.0.1:${port}/json`)).json())
       .filter((t) => t.type === 'page' && /chatgpt\.com\/c\//.test(t.url || ''));
   } catch { process.exit(0); }
-  // #216 gate r1 P2: the scope question is "was --url supplied?", the same question the
-  // validation above answered. Reading closeUrl's truthiness here a second time is what let an
-  // explicitly empty value fall through to the unscoped branch; by this point urlFlagSeen implies
-  // a conversationUrlOk value, so the two can never disagree again.
-  const scopedId = urlFlagSeen ? conversationIdFromUrl(closeUrl) : null;
-  if (urlFlagSeen) {
-    tabs = tabs.filter((t) => conversationIdFromUrl(t.url) === scopedId);
-  }
   let closed = 0;
   for (const tab of tabs) {
-    // #216 gate r4 P2: the listing above answered "which tab was at this conversation", which is
-    // a fact about the past. A scoped close re-asks it of the LIVE page immediately before the
-    // mutation, in the SAME evaluate that reads ownership, and refuses on anything but a match --
-    // including a read that fails, since an unreadable page cannot prove it is still the one the
-    // caller scoped to. The unscoped close below is deliberately unchanged: with no --url there is
-    // no conversation id to drift away from, and marker ownership alone is what authorizes it.
-    if (urlFlagSeen) {
-      const live = await tabUrlAndText(tab);
-      if (!live || conversationIdFromUrl(live.href) !== scopedId) {
-        console.error(`cdp-salvage --close: tab ${tab.id} navigated away from ${closeUrl} (now ${live?.href ?? 'unreadable'}); left open`);
-        continue;
-      }
-      if (organizerOwnership(live.text).owned) { await closeTab(tab.id); closed += 1; }
-      continue;
-    }
     const text = await tabText(tab);
     if (text && organizerOwnership(text).owned) { await closeTab(tab.id); closed += 1; }
   }
-  console.error(`cdp-salvage --close: closed ${closed} conversation tab(s) matching "${marker}"${urlFlagSeen ? ` at ${closeUrl}` : ''}`);
+  console.error(`cdp-salvage --close: closed ${closed} conversation tab(s) matching "${marker}"`);
   process.exit(0);
 }
 

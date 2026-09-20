@@ -188,14 +188,6 @@ const mutationExpiresAtFromExpression = (expression) => expressionJsonValue(expr
 // markup on the first poll and the conversation itself only later.
 function mockCdp(initialText, extraTabs = [], opts = {}) {
   let tabText = initialText;
-  // #216 gate r4 P2: a listed tab's URL is MUTABLE, and the window between the /json listing and
-  // the evaluate that authorizes a close is exactly where a real tab navigates. liveUrls holds
-  // each tab's CURRENT url; opts.navigateTo (tab id -> url) moves a tab there when its first
-  // evaluate arrives, so a fixture can express "the target the listing picked is now a different
-  // conversation" without any second, separately-timed hook.
-  const PRIMARY_URL = 'https://chatgpt.com/c/mock-conversation';
-  const liveUrls = new Map();
-  const navigatedTabs = new Set();
   const closed = [];
   const created = [];              // scratch tabs opened via /json/new
   const pollsByTab = new Map();    // scratch tab id -> how many times its DOM has been read
@@ -260,14 +252,11 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
       // gets one, so opts.tabText can give listed tabs distinct bodies. Without this an extra
       // tab is unreadable and silently becomes a "dead tab" — which is what tab-hygiene tests
       // (sweep-root, foreign-tab-left-open) rely on, so only fill it in when tabText is used.
-      const extras = extraTabs.filter((t) => !closed.includes(t.id)).map((t) => {
-        // Only a tab that actually navigated is rewritten, so every fixture that relies on extras
-        // being listed VERBATIM (sweep-root, foreign-tab-left-open) is untouched.
-        const at = liveUrls.has(t.id) ? { ...t, url: liveUrls.get(t.id) } : t;
-        return opts.tabText && !t.webSocketDebuggerUrl
-          ? { type: 'page', ...at, webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/${t.id}` }
-          : at;
-      });
+      const extras = extraTabs.filter((t) => !closed.includes(t.id)).map((t) => (
+        opts.tabText && !t.webSocketDebuggerUrl
+          ? { type: 'page', ...t, webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/${t.id}` }
+          : t
+      ));
       if (opts.failScratchList && scratchOpen) {
         res.statusCode = 503; res.end('scratch list unavailable'); return;
       }
@@ -283,7 +272,7 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
       const listed = tabText === '__NO_TABS__' || closed.includes('tab1')
         ? [...extras, ...scratch]
         : [{
-          id: 'tab1', type: 'page', url: liveUrls.get('tab1') ?? PRIMARY_URL,
+          id: 'tab1', type: 'page', url: 'https://chatgpt.com/c/mock-conversation',
           webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/tab1`,
         }, ...extras, ...scratch];
       res.end(JSON.stringify(listed));
@@ -320,22 +309,6 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
       let request;
       try { request = JSON.parse(payload); } catch { return; }
       requests.push(request);
-      const expression = request.params?.expression ?? '';
-      // #216 gate r4 P2: apply this tab's pending navigation BEFORE answering its first evaluate,
-      // so a guard that re-reads location.href sees the page the tab really is on by then.
-      if (opts.navigateTo?.[id] && !navigatedTabs.has(id)) {
-        navigatedTabs.add(id);
-        liveUrls.set(id, opts.navigateTo[id]);
-      }
-      // opts.evaluateFails(id, expression) models an evaluate that ERRORS (a suspended or crashed
-      // renderer) rather than one that returns an odd value -- how a live read really fails.
-      if (opts.evaluateFails?.(id, expression)) {
-        socket.write(wsTextFrame(JSON.stringify({
-          id: request.id,
-          error: { code: -32000, message: 'mock evaluate failure' },
-        })));
-        return;
-      }
       let value = tabText;
       if (id === 'tab1' && opts.primaryText) {
         primaryPolls += 1;
@@ -345,6 +318,7 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
       // without it every listed tab serves the same text, which cannot express "one tab is
       // ours and another is foreign" — the shape #68's ordering regression needs.
       if (extra && opts.tabText) value = opts.tabText(extra.url, extra.id) ?? value;
+      const expression = request.params?.expression ?? '';
       // A scratch "sample" is one DOM text read. The salvage also evaluates element probes
       // (terminal-infrastructure, throttle-modal) against the same target each poll; those are
       // answered by sentinel below and must not advance the ordered sample count fixtures assert.
@@ -424,17 +398,6 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
           if (mutationTokens.get(id) === token) mutationTokens.delete(id);
         }
         value = ui.cancelUnconfirmed ? false : true;
-      }
-      // #216 gate r4 P2: the scoped close's guard asks for the tab's LIVE url and its review text
-      // in ONE evaluate. Serve the url the tab is at now, wrapped around whatever body the
-      // branches above already resolved, so url and text provably come from the same moment.
-      if (expression.includes('pro-gate:close-guard')) {
-        const href = liveUrls.get(id) ?? scratch?.url ?? extra?.url ?? PRIMARY_URL;
-        // A DOM fixture drives this read exactly as it drives the review-text one; location is
-        // supplied so the guard's own href branch is what the fixture exercises.
-        value = opts.document
-          ? runInNewContext(expression, { document: opts.document, location: { href } })
-          : { href, review: value };
       }
       const armLate = ui.armMutationAfterDelay && armMutation;
       const primaryDomPoll = id === 'tab1' && request.method === 'Runtime.evaluate' &&
@@ -3612,169 +3575,6 @@ for (const placeholder of PLACEHOLDER_URLS) {
   }
 }
 
-{ // #206 gate r8 P2 finding A: --close used to close EVERY tab owned by the marker, not only
-  // the one the caller validated a durable handle for. A retry-created conversation shares its
-  // predecessor's marker, so an unscoped close of "everything owned" could take a finished
-  // review down along with an abandoned retry, and the finished review becomes undiscoverable.
-  // --url narrows the candidate set to the one conversation id before ownership is even checked.
-  const ownedText = [
-    `run marker: ${MARKER}`,
-    'P1: none', 'P2: none', 'P3: none',
-    `VERDICT: SHIP — ours. (run marker: ${MARKER})`,
-  ].join('\n');
-  const URL_A = 'https://chatgpt.com/c/mock-conversation'; // tab1's fixed URL in mockCdp
-  const URL_B = 'https://chatgpt.com/c/mock-conversation-b';
-  const bothOwned = () => ownedText; // both tab1 and tabB render the same owned answer
-
-  {
-    const cdp = await mockCdp(ownedText, [{ id: 'tabB', type: 'page', url: URL_B }], { tabText: bothOwned });
-    const r = await runSalvage(['--close', '--url', URL_A, MARKER, '10'], cdp.port);
-    check('--close --url closes only the tab at that conversation id',
-      r.status === 0 && cdp.closed.includes('tab1') && !cdp.closed.includes('tabB'),
-      `status=${r.status} closed=${JSON.stringify(cdp.closed)} stderr=${r.stderr?.slice(-300)}`);
-    cdp.stop();
-  }
-  {
-    const cdp = await mockCdp(ownedText, [{ id: 'tabB', type: 'page', url: URL_B }], { tabText: bothOwned });
-    const r = await runSalvage(['--close', MARKER, '10'], cdp.port);
-    check('--close without --url still closes every owned tab (unchanged behavior)',
-      r.status === 0 && cdp.closed.includes('tab1') && cdp.closed.includes('tabB'),
-      `status=${r.status} closed=${JSON.stringify(cdp.closed)} stderr=${r.stderr?.slice(-300)}`);
-    cdp.stop();
-  }
-}
-
-{ // #216 gate r4 P2 (paid review, finding at bin/cdp-salvage.mjs:1317): a scoped close trusted a
-  // STALE URL snapshot. `--url A` filtered the /json listing, but the ownership read and the close
-  // then ran against the mutable tab TARGET. If that target navigated to retry conversation B in
-  // between, B passed ownership (a retry of the same run carries the same marker) and closeTab
-  // took B down while the run reported success "at A" -- the #206 blast radius back, this time
-  // through time rather than through scope. The close is now authorized by the LIVE conversation
-  // id and the ownership text read in ONE evaluate immediately before the mutation, and a read
-  // that fails is a mismatch, never a match.
-  const ownedText = [
-    `run marker: ${MARKER}`,
-    'P1: none', 'P2: none', 'P3: none',
-    `VERDICT: SHIP — ours. (run marker: ${MARKER})`,
-  ].join('\n');
-  const URL_A = 'https://chatgpt.com/c/mock-conversation'; // tab1's listed URL in mockCdp
-  const URL_B = 'https://chatgpt.com/c/mock-conversation-b';
-  const bothOwned = () => ownedText;   // A and B render the SAME owned answer: same marker, same run
-
-  {
-    // (a) The target listed at A is already at B by the time its guard evaluate runs. Nothing may
-    // be closed -- not B (it is not the scope) and not A (this tab is no longer showing it).
-    const cdp = await mockCdp(ownedText, [{ id: 'tabB', type: 'page', url: URL_B }],
-      { tabText: bothOwned, navigateTo: { tab1: URL_B } });
-    const r = await runSalvage(['--close', '--url', URL_A, MARKER, '10'], cdp.port);
-    const drift = (r.stderr ?? '').includes(`tab tab1 navigated away from ${URL_A} (now ${URL_B})`);
-    check('#216 gate r4 P2: a target that navigates from A to same-marker B is left open and named on stderr',
-      r.status === 0 && cdp.closed.length === 0 && drift && /left open/.test(r.stderr ?? ''),
-      `status=${r.status} closed=${JSON.stringify(cdp.closed)} drift=${drift} stderr=${r.stderr?.slice(-300)}`);
-    cdp.stop();
-  }
-  {
-    // (b) Control for (a): the SAME fixture with no navigation still closes A and leaves B open,
-    // so the refusal above is caused by the drift and not by the guard refusing everything. The
-    // pre-existing '--close --url closes only the tab at that conversation id' check above is this
-    // same control on the same fixture shape; it is repeated here so the trio reads as one unit.
-    const cdp = await mockCdp(ownedText, [{ id: 'tabB', type: 'page', url: URL_B }],
-      { tabText: bothOwned });
-    const r = await runSalvage(['--close', '--url', URL_A, MARKER, '10'], cdp.port);
-    check('#216 gate r4 P2 control: a target that stays at A is closed and B is left open',
-      r.status === 0 && cdp.closed.includes('tab1') && !cdp.closed.includes('tabB'),
-      `status=${r.status} closed=${JSON.stringify(cdp.closed)} stderr=${r.stderr?.slice(-300)}`);
-    cdp.stop();
-  }
-  {
-    // (c) The live read itself fails. "Could not read the page" is not "the page is still A", so
-    // the tab stays open; closing on a failed read would be the stale-snapshot bug with an extra
-    // step. The stale listing here still says A, which is exactly what must not be trusted.
-    const cdp = await mockCdp(ownedText, [{ id: 'tabB', type: 'page', url: URL_B }], {
-      tabText: bothOwned,
-      evaluateFails: (id, expression) => id === 'tab1' && expression.includes('pro-gate:close-guard'),
-    });
-    const r = await runSalvage(['--close', '--url', URL_A, MARKER, '10'], cdp.port);
-    check('#216 gate r4 P2: a failed live-URL read leaves the tab open and is reported as drift',
-      r.status === 0 && cdp.closed.length === 0
-        && (r.stderr ?? '').includes(`tab tab1 navigated away from ${URL_A} (now unreadable)`),
-      `status=${r.status} closed=${JSON.stringify(cdp.closed)} stderr=${r.stderr?.slice(-300)}`);
-    cdp.stop();
-  }
-  {
-    // The guard is SCOPED-ONLY. Without --url there is no conversation id to drift away from, so
-    // the same navigation must not start sparing tabs an unscoped close has always taken.
-    const cdp = await mockCdp(ownedText, [{ id: 'tabB', type: 'page', url: URL_B }],
-      { tabText: bothOwned, navigateTo: { tab1: URL_B } });
-    const r = await runSalvage(['--close', MARKER, '10'], cdp.port);
-    check('#216 gate r4 P2: an unscoped --close is unaffected by the same navigation',
-      r.status === 0 && cdp.closed.includes('tab1') && cdp.closed.includes('tabB'),
-      `status=${r.status} closed=${JSON.stringify(cdp.closed)} stderr=${r.stderr?.slice(-300)}`);
-    cdp.stop();
-  }
-}
-
-{ // #216 local verify r3 P3: --close's --url gate was prefix-only (/^https:\/\/chatgpt\.com\/c\//),
-  // looser than CONVERSATION_URL_RE -- the predicate every OTHER consumer of a conversation URL
-  // is held to (rememberUrl/recallUrl here, which is what
-  // a shell caller validates a memo with before passing it in). So a value the memo layer
-  // would have revoked as a placeholder -- https://chatgpt.com/c/WEB:<uuid> is the #109 shape --
-  // still passed the flag check and became the close SCOPE: conversationIdFromUrl returned
-  // "WEB:1234", no tab could ever match it, and --close exited 0 announcing "closed 0
-  // conversation tab(s)". A caller reading that success could not tell "nothing was owned" from
-  // "the scope was nonsense". The flag now uses conversationUrlOk itself, so a non-conforming
-  // value is a usage error (exit 2, one line, naming the value) instead of a silent no-op. The
-  // conforming control is '--close --url closes only the tab at that conversation id' above.
-  const ownedText = [
-    `run marker: ${MARKER}`,
-    'P1: none', 'P2: none', 'P3: none',
-    `VERDICT: SHIP — ours. (run marker: ${MARKER})`,
-  ].join('\n');
-  const rejected = [
-    ['placeholder id', 'https://chatgpt.com/c/WEB:1234'],
-    ['empty id', 'https://chatgpt.com/c/'],
-    ['extra path segment', 'https://chatgpt.com/c/mock-conversation/extra'],
-    // Already rejected by the prefix-only check, so this pair is the control: tightening the
-    // gate must not change what a wrong HOST does, only what a wrong conversation ID does.
-    ['non-chatgpt host', 'https://chatgpt.example.com/c/mock-conversation'],
-  ];
-  for (const [label, url] of rejected) {
-    const cdp = await mockCdp(ownedText);
-    const r = await runSalvage(['--close', '--url', url, MARKER, '10'], cdp.port);
-    check(`#216 r3 P3 --url shape: ${label} exits 2 and closes nothing`,
-      r.status === 2 && cdp.closed.length === 0,
-      `status=${r.status} closed=${JSON.stringify(cdp.closed)} stderr=${r.stderr?.slice(-300)}`);
-    check(`#216 r3 P3 --url shape: ${label} is refused by one usage line`,
-      (r.stderr ?? '').trim().split('\n').length === 1 && /^usage:/.test((r.stderr ?? '').trim()),
-      `stderr=${JSON.stringify(r.stderr)}`);
-    cdp.stop();
-  }
-  { // The refusal names the value it refused: a bare "usage: ..." cannot tell an operator WHICH
-    // of a --close invocation's arguments was wrong. Asserted together with the usage prefix, or
-    // the pre-fix no-op line ("closed 0 conversation tab(s) ... at <url>") would satisfy it too.
-    const cdp = await mockCdp(ownedText);
-    const r = await runSalvage(['--close', '--url', 'https://chatgpt.com/c/WEB:1234', MARKER, '10'], cdp.port);
-    check('#216 r3 P3 --url shape: the usage line names the rejected value',
-      /^usage:/.test((r.stderr ?? '').trim()) && (r.stderr ?? '').includes('https://chatgpt.com/c/WEB:1234'),
-      `stderr=${JSON.stringify(r.stderr)}`);
-    cdp.stop();
-  }
-  { // CONVERSATION_URL_RE accepts a query or fragment after the id, so the flag must too:
-    // tightening this gate must not start rejecting a URL the memo layer would hand it.
-    const URL_B = 'https://chatgpt.com/c/mock-conversation-b';
-    const cdp = await mockCdp(ownedText, [{ id: 'tabB', type: 'page', url: URL_B }],
-      { tabText: () => ownedText });
-    const r = await runSalvage(
-      ['--close', '--url', 'https://chatgpt.com/c/mock-conversation?model=gpt-5', MARKER, '10'],
-      cdp.port,
-    );
-    check('#216 r3 P3 --url shape: a conforming id carrying a query still scopes the close',
-      r.status === 0 && cdp.closed.includes('tab1') && !cdp.closed.includes('tabB'),
-      `status=${r.status} closed=${JSON.stringify(cdp.closed)} stderr=${r.stderr?.slice(-300)}`);
-    cdp.stop();
-  }
-}
-
 { // #206 gate r8 P2 finding B: rememberUrl()'s MEMO_KEEP eviction used to prune the oldest
   // memos with no regard for whether the marker's reservation was still retained (states
   // generating or superseded) -- so a memo that is a superseded run's ONLY recovery handle
@@ -3876,48 +3676,6 @@ for (const placeholder of PLACEHOLDER_URLS) {
     memoSet.has(PROTECTED), `memos.length=${r.memos.length} stderr=${r.stderr?.slice(-300)}`);
   cdp.stop();
   fs.rmSync(customResDir, { recursive: true, force: true });
-}
-
-{ // #216 gate r1 P2 (paid review, finding at bin/cdp-salvage.mjs:171): an explicitly EMPTY --url
-  // scope silently became an UNSCOPED close. `--close --url ''` passed the shape gate because the
-  // gate tested the VALUE's truthiness, and then the close filter -- the same truthiness test --
-  // skipped URL narrowing entirely. A marker owning two conversations (a memoized one and a retry
-  // sibling) therefore had BOTH closed by a caller that believed it had scoped the close to one:
-  // the exact blast radius #206 finding A removed, reachable whenever a caller's scope expression
-  // evaluates to nothing (an empty memo read, an unset shell variable). The flag's
-  // PRESENCE is now what selects scoped behavior, and a present-but-unusable value is refused
-  // before any browser access. Unscoped close stays reachable by omitting --url, which the
-  // '--close without --url still closes every owned tab' check above holds unchanged.
-  const ownedText = [
-    `run marker: ${MARKER}`,
-    'P1: none', 'P2: none', 'P3: none',
-    `VERDICT: SHIP — ours. (run marker: ${MARKER})`,
-  ].join('\n');
-  const URL_B = 'https://chatgpt.com/c/mock-conversation-b';
-  {
-    const cdp = await mockCdp(ownedText, [{ id: 'tabB', type: 'page', url: URL_B }],
-      { tabText: () => ownedText });
-    const r = await runSalvage(['--close', '--url', '', MARKER, '10'], cdp.port);
-    check("#216 gate r1 P2: --close --url '' closes NEITHER owned conversation and exits 2",
-      r.status === 2 && cdp.closed.length === 0,
-      `status=${r.status} closed=${JSON.stringify(cdp.closed)} stderr=${r.stderr?.slice(-300)}`);
-    check("#216 gate r1 P2: the empty --url refusal is one usage line that names the empty value",
-      (r.stderr ?? '').trim().split('\n').length === 1
-        && /^usage:/.test((r.stderr ?? '').trim())
-        && (r.stderr ?? '').includes('(empty)'),
-      `stderr=${JSON.stringify(r.stderr)}`);
-    cdp.stop();
-  }
-  {
-    // Outside --close the flag was already a usage error for every non-empty value; an empty one
-    // slipped through the same truthiness test and was silently ignored, so the run proceeded.
-    const cdp = await mockCdp(ownedText);
-    const r = await runSalvage(['--probe', '--url', '', MARKER, '10'], cdp.port);
-    check("#216 gate r1 P2: --url '' outside --close is a usage error, not an ignored flag",
-      r.status === 2 && cdp.closed.length === 0 && /^usage:/.test((r.stderr ?? '').trim()),
-      `status=${r.status} closed=${JSON.stringify(cdp.closed)} stderr=${r.stderr?.slice(-300)}`);
-    cdp.stop();
-  }
 }
 
 { // #216 gate r1 P2 (paid review, finding at bin/cdp-salvage.mjs:207): an EMPTY
