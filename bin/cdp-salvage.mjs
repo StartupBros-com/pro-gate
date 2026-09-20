@@ -539,18 +539,73 @@ function pruneThrottleSeen(protectedKeys = new Set()) {
 // never retires one — only TTL/capacity pruning can. Best-effort like every other sidecar write
 // here; a failure leaves the record in place, which is the safe direction (one suppressed
 // repeat, never a double-charged cooldown).
-function retireThrottleSeenForHealthyUrls(healthyUrls, protectedKeys = new Set()) {
+//
+// #215 gate r3 P2: a retire may only remove the record GENERATION the observation behind it
+// actually covered. A health observation takes time — a scan reads every listed tab, a memo
+// render waits for a page to hydrate — and nothing in this directory is process-local. Scan A
+// could read URL U as healthy, then block on another tab's evaluate; in that window process B
+// observes U throttled, creates U's fingerprint and publishes the cooldown it gates. A's
+// unconditional unlink then deleted B's NEWER record on the strength of A's OLDER observation,
+// and the next scan charged the unchanged modal all over again — the #208 livelock, reached
+// through a delayed healthy scan rather than a read failure. Neither protectedKeys nor
+// pendingThrottleSeenRecords can help: both describe THIS process, and B is another one.
+// A record is only ever created ('wx', never rewritten), so its identity is its (ino, mtimeMs).
+// snapshotThrottleSeenGenerations is taken BEFORE an observation starts reading, and only a
+// record still carrying the generation that snapshot saw may be retired; anything created or
+// replaced afterwards lies outside what the observation covers and survives.
+function snapshotThrottleSeenGenerations() {
+  const generations = new Map();
+  let names;
+  try { names = fs.readdirSync(THROTTLE_SEEN_DIR); } catch { return generations; }   // no directory yet: nothing observed
+  for (const name of names) {
+    try {
+      const { ino, mtimeMs } = fs.statSync(path.join(THROTTLE_SEEN_DIR, name));
+      generations.set(name, { ino, mtimeMs });
+    } catch {}   // vanished between readdir and stat: not this observation's to retire
+  }
+  return generations;
+}
+// Removing the record must also be serialized with a concurrent create at the SAME name, or the
+// generation check is merely a narrower race: B can replace the record between the check and the
+// unlink. So take the name away atomically FIRST (rename to a sibling temp only this process can
+// name), then decide what was taken. From that instant the 'wx' create in recordThrottleSeen
+// sees the name free and whatever it writes there is safe from everything below.
+function retireThrottleSeenRecord(recordPath, name, observed) {
+  const tempPath = path.join(THROTTLE_SEEN_DIR, `${name}.retire.${process.pid}`);
+  // ENOENT: another retire got there first. Any other failure leaves the record in place, which
+  // is the safe direction (one suppressed repeat, never a double-charged cooldown).
+  try { fs.renameSync(recordPath, tempPath); } catch { return; }
+  let current;
+  try { current = fs.statSync(tempPath); } catch { return; }
+  if (current.ino === observed.ino && current.mtimeMs === observed.mtimeMs) {
+    try { fs.unlinkSync(tempPath); } catch {}   // exactly the generation this observation covered
+    return;
+  }
+  // Someone replaced the record between the snapshot and the rename, so this is a NEWER record
+  // whose cooldown this observation says nothing about: put it back under its name. linkSync,
+  // never renameSync — a record created at that name in the meantime must not be clobbered; and
+  // if the name is taken (EEXIST), the record now sitting there already carries the same
+  // "charged" meaning, so the temp is simply dropped.
+  try { fs.linkSync(tempPath, recordPath); } catch {}
+  try { fs.unlinkSync(tempPath); } catch {}
+}
+function retireThrottleSeenForHealthyUrls(healthyUrls, protectedKeys = new Set(), generations = null) {
   if (!healthyUrls || healthyUrls.size === 0) return;
+  // No snapshot means no observation window to bound this retire to, so it retires nothing:
+  // under-retire is the safe direction everywhere in this file, and every caller passes one.
+  if (!(generations instanceof Map)) return;
   let names;
   try { names = fs.readdirSync(THROTTLE_SEEN_DIR); } catch { return; }
   for (const name of names) {
     if (protectedKeys.has(name)) continue;                           // a fingerprint THIS scan is about to check
+    const observed = generations.get(name);
+    if (!observed) continue;                                         // created after this observation started
     const recordPath = path.join(THROTTLE_SEEN_DIR, name);
     if (pendingThrottleSeenRecords.includes(recordPath)) continue;   // created moments ago, cooldown not yet published
     let storedUrl;
     try { storedUrl = fs.readFileSync(recordPath, 'utf8').trim(); } catch { continue; }
     if (!storedUrl || !healthyUrls.has(storedUrl)) continue;
-    try { fs.unlinkSync(recordPath); } catch {}
+    retireThrottleSeenRecord(recordPath, name, observed);
   }
 }
 // The health half of that rule, shared by the main scan and the organizer scan so both read ONE
@@ -558,12 +613,15 @@ function retireThrottleSeenForHealthyUrls(healthyUrls, protectedKeys = new Set()
 //   throttled — a dialog read that SUCCEEDED and found the limiter's copy, or body text still
 //               carrying that copy (THROTTLE_RE, the same regex isThrottlePage tests);
 //   unknown   — the dialog read FAILED, or the text read failed or came back empty: evidence of
-//               nothing, so the tab is simply not counted either way;
+//               nothing, in either direction;
 //   healthy   — the dialog read succeeded and found no dialog, and the text read returned
 //               non-empty text with no limiter copy in it.
-// A URL is healthy in a scan when at least one tab at it is healthy AND no tab at it is
-// throttled. That second clause keeps a URL that is both healthy and throttled right now out of
-// the retire set, so a scan can never retire a record it is itself about to charge or check.
+// A URL is healthy in a scan when at least one tab at it is healthy AND no tab at it is throttled
+// AND no tab at it is unknown. The throttled clause keeps a URL that is both healthy and
+// throttled right now out of the retire set, so a scan can never retire a record it is itself
+// about to charge or check. The unknown clause (#215 gate r3 P2) keeps a healthy tab from
+// speaking for a SIBLING instance of the same URL that nobody could read — which may still be
+// holding the charged modal, ready to charge a second cooldown the moment it answers again.
 //
 // #215 skeptic r2 D1: "unknown" used to be indistinguishable from "healthy" for the dialog,
 // because tabThrottleModal returned null for a failed read (evaluate timeout, websocket error,
@@ -599,6 +657,7 @@ function retireThrottleSeenForHealthyUrls(healthyUrls, protectedKeys = new Set()
 function scanThrottleHealth(reads) {
   const healthyUrls = new Set();
   const throttledUrls = new Set();
+  const unknownUrls = new Set();
   const protectedKeys = new Set();
   for (const { tab, text, throttleModal, throttleModalOk = true } of reads) {
     const url = tab?.url;
@@ -608,11 +667,19 @@ function scanThrottleHealth(reads) {
       protectedKeys.add(throttleSeenKey(url, throttleTextHash(throttleModal ?? text)));
       continue;
     }
-    if (!throttleModalOk) continue;   // unknown: proof of neither throttle nor health
-    if (text && text.trim() !== '') healthyUrls.add(url);
+    // unknown: proof of neither throttle nor health — a failed dialog read, or a text read that
+    // failed (null) or came back empty. #215 gate r3 P2: collected, not merely skipped. Two tabs
+    // can sit at ONE url; with a healthy sibling beside an unreadable instance, skipping the
+    // unreadable one let the sibling speak for the whole url and retire a fingerprint whose modal
+    // was still on screen in the tab nobody could read — and the next scan that CAN read it
+    // charges the unchanged modal a second cooldown. A url one tab could not be read at is not a
+    // url this scan proved healthy, so it leaves the retire set exactly as a throttled one does.
+    if (!throttleModalOk || !text || text.trim() === '') { unknownUrls.add(url); continue; }
+    healthyUrls.add(url);
   }
   for (const url of throttledUrls) healthyUrls.delete(url);
-  return { healthyUrls, throttledUrls, protectedKeys };
+  for (const url of unknownUrls) healthyUrls.delete(url);
+  return { healthyUrls, throttledUrls, unknownUrls, protectedKeys };
 }
 // #215 skeptic r2 D3: the memo-recovery renders (the organizer's scratch open, and the main
 // scan's seeded re-render of the remembered URL) are the ONLY observation an invocation makes
@@ -630,10 +697,17 @@ function scanThrottleHealth(reads) {
 // `throttledUrls` is this scan's listed-tab throttle set: a URL some open tab showed the
 // limiter on in this same scan is never retired on a scratch render's say-so.
 const DECISIVE_HEALTHY_RENDER_REASONS = new Set(['marker-found', 'foreign-marker']);
-function retireThrottleSeenForHealthyRender(url, decisive, throttledUrls = null) {
+// #215 gate r3 P2: `unknownUrls` is the other half of that listed-tab veto. A url some listed tab
+// could not be read at this scan is not a url a render may retire on its own say-so either: the
+// render proves one conversation is healthy NOW, while the unreadable tab may still be holding
+// the very modal whose fingerprint would be retired. `generations` is the caller's snapshot,
+// taken before the render was opened — a render can take tens of seconds, which is exactly the
+// window another process needs to charge a fresh cooldown.
+function retireThrottleSeenForHealthyRender(url, decisive, throttledUrls = null, unknownUrls = null, generations = null) {
   if (!url || !decisive) return;
   if (throttledUrls?.has(url)) return;
-  retireThrottleSeenForHealthyUrls(new Set([url]));
+  if (unknownUrls?.has(url)) return;
+  retireThrottleSeenForHealthyUrls(new Set([url]), new Set(), generations);
 }
 // "Already charged" is now a plain existence check on the record file, not a load-then-scan of
 // an in-memory snapshot — there is no snapshot to go stale, so two processes checking/creating
@@ -1499,6 +1573,10 @@ async function organizeConversation() {
       .filter((tab) => tab.type === 'page' && /^https:\/\/chatgpt\.com\/c\//.test(tab.url || ''));
   } catch { return { ...result, reason: 'cdp-list-failed' }; }
 
+  // #215 gate r3 P2: the record generations this scan's observation covers, snapshotted before it
+  // reads a single tab — a record another process creates while these reads are in flight is
+  // newer than anything concluded below and must survive the retire.
+  const scanGenerations = snapshotThrottleSeenGenerations();
   const reads = await Promise.all(tabs.map(async (tab) => {
     const [text, modalRead] = await Promise.all([tabText(tab), tabThrottleModalRead(tab)]);
     // #215 skeptic r2 D1: carry whether the dialog READ succeeded, not only what it found, so
@@ -1509,7 +1587,7 @@ async function organizeConversation() {
   // scan and shares its dedupe store, so it retires on a healthy observation identically and for
   // the same reason — before its own batch below decides "already charged".
   const scanHealth = scanThrottleHealth(reads);
-  retireThrottleSeenForHealthyUrls(scanHealth.healthyUrls, scanHealth.protectedKeys);
+  retireThrottleSeenForHealthyUrls(scanHealth.healthyUrls, scanHealth.protectedKeys, scanGenerations);
   const throttleHits = reads.filter(({ text, throttleModal }) => isThrottlePage(text) || throttleModal);
   if (throttleHits.length > 0) {
     // #162 semantics preserved: an OWNED sighting (this run's exact marker under the modal)
@@ -1606,13 +1684,16 @@ async function organizeConversation() {
       return { ...result, reason: rejectionReason };
     }
     if (nonMatching.has(recoveryUrl)) return { ...result, reason: 'provenance-rejected' };
+    // #215 gate r3 P2: this render's own generation snapshot, taken before it is opened.
+    const renderGenerations = snapshotThrottleSeenGenerations();
     const scratch = await openOrganizerScratch(recoveryUrl);
     // #215 skeptic r2 D3: a decisive healthy memo render retires exactly the URL it rendered (see
     // retireThrottleSeenForHealthyRender), so a recovered-then-limited-again conversation charges
     // a fresh cooldown instead of reporting throttle with an expired clock behind it.
     // #215 skeptic r2c A: healthyUrl already means DECISIVE; retireSafe is the second half of the
     // same question — was the observation readable enough to be evidence of health at all.
-    retireThrottleSeenForHealthyRender(scratch.healthyUrl, scratch.retireSafe === true, scanHealth.throttledUrls);
+    retireThrottleSeenForHealthyRender(scratch.healthyUrl, scratch.retireSafe === true,
+      scanHealth.throttledUrls, scanHealth.unknownUrls, renderGenerations);
     if (!scratch.text || !scratch.target) {
       // #208 gate r6 P2: an OWNED sighting (our own marker under the modal) still always
       // re-arms unconditionally; an unowned one routes through the same central gate every
@@ -1941,6 +2022,9 @@ while (Date.now() < deadline) {
   const deadTabs = [];
   // The three reads per tab are independent; run them concurrently so a suspended renderer
   // costs one evaluate bail per tab, not three, inside probe's fixed budget.
+  // #215 gate r3 P2: the record generations this scan's observation covers, snapshotted before it
+  // reads a single tab — see retireThrottleSeenForHealthyUrls.
+  const scanGenerations = snapshotThrottleSeenGenerations();
   const reads = await Promise.all(tabs.map(async (tab) => {
     const [text, infrastructureError, modalRead] = await Promise.all([
       tabText(tab), tabTerminalInfrastructure(tab), tabThrottleModalRead(tab),
@@ -1955,7 +2039,7 @@ while (Date.now() < deadline) {
   // cooldown. A URL that is healthy and throttled in the SAME scan is excluded by
   // scanThrottleHealth, so this never retires a record this scan still needs.
   const scanHealth = scanThrottleHealth(reads);
-  retireThrottleSeenForHealthyUrls(scanHealth.healthyUrls, scanHealth.protectedKeys);
+  retireThrottleSeenForHealthyUrls(scanHealth.healthyUrls, scanHealth.protectedKeys, scanGenerations);
   // #162: the modal is account-wide, so decide ownership over the WHOLE scan, never on the first
   // tab in list order (the same order-independence onOurConversation documents): a foreign or
   // blacklisted tab listed ahead of ours must not hide the proof that our conversation exists.
@@ -2174,6 +2258,8 @@ while (Date.now() < deadline) {
     nextRenderAt.set(seedUrl, Date.now() + RENDER_INTERVAL_MS);
     seededRenders += 1;
     console.error(`no open tab carries "${marker}" — re-rendering the remembered conversation ${seedUrl} (${seededRenders}/${MAX_SEEDED_RENDERS})...`);
+    // #215 gate r3 P2: this render's own generation snapshot, taken before it is opened.
+    const renderGenerations = snapshotThrottleSeenGenerations();
     const { text, evidence: renderEvidence, reason: renderReason, retireSafe: renderRetireSafe } =
       await freshRenderText(seedUrl, port, deadline);
     if (text) {
@@ -2185,7 +2271,8 @@ while (Date.now() < deadline) {
       // (an already-charged repeat), and 'throttle' is not a decisive-healthy reason either way.
       // #215 skeptic r2c A: decisive AND readable-as-healthy — see freshRenderText's retireSafe.
       retireThrottleSeenForHealthyRender(seedUrl,
-        DECISIVE_HEALTHY_RENDER_REASONS.has(renderReason) && renderRetireSafe === true, scanHealth.throttledUrls);
+        DECISIVE_HEALTHY_RENDER_REASONS.has(renderReason) && renderRetireSafe === true,
+        scanHealth.throttledUrls, scanHealth.unknownUrls, renderGenerations);
       if (evidence.kind === 'cross-bound') {
         // The memo itself is cross-bound. Evict it with claim-and-verify, but preserve a
         // concurrently republished survivor as the only possible genuine recovery handle.

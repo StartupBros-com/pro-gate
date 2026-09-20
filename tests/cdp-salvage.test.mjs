@@ -338,6 +338,18 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
       let evaluateError = null;
       let armMutation = null;
       let applyMutation = null;
+      // #215 gate r3 P2: the TEXT read can fail outright too, and tabText answers null for an
+      // evaluate error — a different shape from empty text, and the one the "healthy sibling vs.
+      // unreadable duplicate" finding turns on, where BOTH of a tab's reads fail. opts.tabTextFails
+      // (true, or (id, url) => boolean) makes this one review-text evaluate answer with a CDP error
+      // frame, exactly as opts.throttleModalFails does for the dialog read, so the fixture stays
+      // deterministic and never waits out the 5s bail.
+      if (expression.includes('pro-gate:review-text')) {
+        const textReadFails = typeof opts.tabTextFails === 'function'
+          ? opts.tabTextFails(id, scratch?.url ?? extra?.url ?? 'https://chatgpt.com/c/mock-conversation') === true
+          : opts.tabTextFails === true;
+        if (textReadFails) evaluateError = 'mock: review-text evaluate failed';
+      }
       if (expression.includes('pro-gate:review-text') && opts.document) {
         value = runInNewContext(expression, { document: opts.document });
       } else if (expression.includes('pro-gate:terminal-infrastructure')) {
@@ -440,6 +452,11 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
         }
       };
       if (armMutation && !armLate) armMutation();
+      // #215 gate r3 P2: a synchronous side-effect hook fired just BEFORE this evaluate is
+      // answered. The child cannot progress past this read until the response frame below is
+      // written, so a fixture can land ANOTHER process's write inside a scan that is already
+      // mid-observation — the interleaving the record-generation guard exists to survive.
+      opts.onEvaluate?.(id, expression);
       if (delayMs > 0) setTimeout(response, delayMs);
       else response();
     }));
@@ -579,6 +596,13 @@ const throttleSeenHas = (home, url, text) => fs.existsSync(throttleSeenRecordPat
 const seedThrottleSeen = (home, url, text) => {
   fs.mkdirSync(throttleSeenDir(home), { recursive: true });
   fs.writeFileSync(throttleSeenRecordPath(home, url, text), '', { flag: 'wx' });
+};
+// #215 gate r3 P2: seed a record in the CURRENT on-disk format — its content is the URL it was
+// charged for, exactly as recordThrottleSeen writes it. seedThrottleSeen above deliberately
+// writes the old EMPTY format, which retire-on-healthy can never attribute to a URL at all.
+const seedThrottleSeenCurrent = (home, url, text) => {
+  fs.mkdirSync(throttleSeenDir(home), { recursive: true });
+  fs.writeFileSync(throttleSeenRecordPath(home, url, text), `${url}\n`, { flag: 'wx' });
 };
 
 // Deliberately opt in only scratch fixtures that need it: hydration/order checks, hung-close
@@ -5548,5 +5572,207 @@ const ageCooldown215 = (p) => { const t = new Date(Date.now() - 3_600_000); fs.u
     `body=${r2cBody.slice(0, 200)}`);
 }
 
+
+{ // #215 gate r3 P2 (bin/cdp-salvage.mjs retireThrottleSeenForHealthyUrls): a DELAYED healthy scan
+  // deleted a NEWER cooldown's fingerprint. A scan reads every listed tab before it retires
+  // anything, so scan A could read URL U as healthy and then sit waiting on another tab's
+  // evaluate. In that window process B observes U throttled, creates U's fingerprint and
+  // publishes the cooldown it gates; when A finally reached its unconditional unlink it deleted
+  // B's record on the strength of A's older observation. Neither protectedKeys nor
+  // pendingThrottleSeenRecords could stop it — both describe A's own process. The next scan then
+  // charged the unchanged modal all over again and extended the account cooldown: the #208
+  // livelock, through cross-process timing instead of a read failure. Fixed by snapshotting each
+  // record's (ino, mtimeMs) BEFORE the observation starts reading and retiring only the
+  // generation that snapshot saw, with the removal itself serialized through an atomic rename.
+  const g3Url = 'https://chatgpt.com/c/mock-215-r3-interleaved-retire';
+  const g3Modal = "You're making requests too quickly. [#215 gate r3 P2 interleave fixture]";
+  const g3Foreign = 'pg-run-another-run-215r3';
+  const g3ThrottledText = `ChatGPT\n${g3Foreign}\n${g3Modal}\nAnother run's conversation beneath the modal.\n`;
+  const g3HealthyText = `ChatGPT\n${g3Foreign}\nAnother run's conversation, fully rendered, no limiter in sight.\n`;
+  const g3Title = 'pro-gate review: PR #215 gate r3 P2 [pro-gate]';
+
+  // (1) The interleaving itself. The organizer makes exactly ONE scan pass, so the window is
+  // unambiguous. opts.onEvaluate fires the instant the child's tab read reaches the mock — which
+  // is AFTER that scan's generation snapshot (taken before any read is issued) and BEFORE its
+  // retire (which cannot run until this response is written). That is process B's create and
+  // cooldown publish, landed inside A's observation, from a genuinely different process.
+  const homeG3a = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedOrganizer(MARKER, g3Title)(homeG3a);   // no memo url -> no scratch recovery path
+  let g3Interleaved = false;
+  const cdpG3a = await mockCdp('__NO_TABS__', [{ id: 'g3tab', url: g3Url }], {
+    tabText: () => g3HealthyText,
+    onEvaluate: (id, expression) => {
+      if (g3Interleaved || id !== 'g3tab' || !expression.includes('pro-gate:review-text')) return;
+      g3Interleaved = true;
+      seedThrottleSeenCurrent(homeG3a, g3Url, g3Modal);
+      fs.writeFileSync(path.join(homeG3a, 'throttle.cooldown'),
+        `${new Date().toISOString()} interleaved writer\n`);
+    },
+  });
+  const rG3a = await runSalvageInHome(homeG3a, ['--organize', MARKER, '5'], cdpG3a.port);
+  cdpG3a.stop();
+  check("#215 gate r3 P2 (1) a record created after a scan began reading survives that scan's retire",
+    g3Interleaved && throttleSeenHas(homeG3a, g3Url, g3Modal),
+    `interleaved=${g3Interleaved} stdout=${rG3a.stdout} dir=${fs.existsSync(throttleSeenDir(homeG3a)) ? fs.readdirSync(throttleSeenDir(homeG3a)) : null}`);
+  // The consequence the finding names: with that record gone, the very next scan of the SAME
+  // unchanged modal charges a second cooldown and extends the account's back-off.
+  const cooldownG3a = path.join(homeG3a, 'throttle.cooldown');
+  ageCooldown215(cooldownG3a);
+  const mtimeG3cBefore = fs.statSync(cooldownG3a).mtimeMs;
+  const cdpG3c = await mockCdp('__NO_TABS__', [{ id: 'g3tab', url: g3Url }], {
+    tabText: () => g3ThrottledText,
+    throttleModal: () => g3Modal,
+  });
+  const rG3c = await runSalvageInHome(homeG3a, [MARKER, '3'], cdpG3c.port);
+  cdpG3c.stop();
+  const mtimeG3cAfter = fs.statSync(cooldownG3a).mtimeMs;
+  check('#215 gate r3 P2 (1) the unchanged modal behind that surviving record charges no second cooldown',
+    mtimeG3cAfter === mtimeG3cBefore && rG3c.status !== 5,
+    `before=${mtimeG3cBefore} after=${mtimeG3cAfter} status=${rG3c.status} stderr=${rG3c.stderr?.slice(-300)}`);
+  fs.rmSync(homeG3a, { recursive: true, force: true });
+
+  // (2) Control, the other direction: a record already on disk when the scan STARTS carries the
+  // generation that scan observed, so a healthy observation still retires it. Without this the
+  // guard above could have been written as "never retire" and check (1) would still pass.
+  const homeG3b = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedOrganizer(MARKER, g3Title)(homeG3b);
+  seedThrottleSeenCurrent(homeG3b, g3Url, g3Modal);
+  const cdpG3b = await mockCdp('__NO_TABS__', [{ id: 'g3tab', url: g3Url }], {
+    tabText: () => g3HealthyText,
+  });
+  const rG3b = await runSalvageInHome(homeG3b, ['--organize', MARKER, '5'], cdpG3b.port);
+  cdpG3b.stop();
+  check('#215 gate r3 P2 (2) control: a record whose generation the scan DID observe is still retired',
+    !throttleSeenHas(homeG3b, g3Url, g3Modal),
+    `stdout=${rG3b.stdout} dir=${fs.existsSync(throttleSeenDir(homeG3b)) ? fs.readdirSync(throttleSeenDir(homeG3b)) : null}`);
+  fs.rmSync(homeG3b, { recursive: true, force: true });
+}
+
+{ // #215 gate r3 P2 (bin/cdp-salvage.mjs scanThrottleHealth): an UNREADABLE duplicate tab let a
+  // healthy sibling retire a still-present stale modal. Two tabs can sit at one URL: one rendering
+  // normally, one holding the modal this dedupe already charged. While both are readable the
+  // record correctly survives (the throttled tab puts its URL in throttledUrls). But when the
+  // throttled tab's text AND dialog evaluations both fail, that tab was simply skipped — proof of
+  // nothing, counted as nothing — while the healthy sibling still put the URL in healthyUrls and
+  // retired the fingerprint. As soon as the unreadable tab became readable again its UNCHANGED
+  // modal charged a second account cooldown. Fixed by collecting those tabs as unknownUrls and
+  // excluding them from retire exactly as throttled URLs are: a healthy sibling must never
+  // override an instance of the same URL nobody could read.
+  const u3Url = 'https://chatgpt.com/c/mock-215-r3-unreadable-duplicate';
+  const u3Modal = "You're making requests too quickly. [#215 gate r3 P2 duplicate fixture]";
+  const u3Foreign = 'pg-run-another-run-215r3dup';
+  const u3ThrottledText = `ChatGPT\n${u3Foreign}\n${u3Modal}\nAnother run's conversation beneath the modal.\n`;
+  const u3HealthyText = `ChatGPT\n${u3Foreign}\nAnother run's conversation, fully rendered, no limiter in sight.\n`;
+
+  const homeU3 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const cdpU3a = await mockCdp('__NO_TABS__', [{ id: 'u3modal', url: u3Url }], {
+    tabText: () => u3ThrottledText,
+    throttleModal: () => u3Modal,
+  });
+  const rU3a = await runSalvageInHome(homeU3, [MARKER, '3'], cdpU3a.port);
+  cdpU3a.stop();
+  check('#215 gate r3 P2 (3) the stale modal is charged once before the mixed scan',
+    rU3a.status === 5 && throttleSeenHas(homeU3, u3Url, u3Modal),
+    `status=${rU3a.status} stderr=${rU3a.stderr?.slice(-300)}`);
+  const cooldownU3 = path.join(homeU3, 'throttle.cooldown');
+  ageCooldown215(cooldownU3);
+  const mtimeU3bBefore = fs.statSync(cooldownU3).mtimeMs;
+  const cdpU3b = await mockCdp('__NO_TABS__', [
+    { id: 'u3modal', url: u3Url },
+    { id: 'u3healthy', url: u3Url },
+  ], {
+    tabText: (url, id) => (id === 'u3modal' ? u3ThrottledText : u3HealthyText),
+    tabTextFails: (id) => id === 'u3modal',           // the modal tab answers neither read...
+    throttleModal: (id) => (id === 'u3modal' ? u3Modal : null),
+    throttleModalFails: (id) => id === 'u3modal',     // ...while the limiter is still on screen
+  });
+  const rU3b = await runSalvageInHome(homeU3, [MARKER, '3'], cdpU3b.port);
+  cdpU3b.stop();
+  const mtimeU3bAfter = fs.statSync(cooldownU3).mtimeMs;
+  check('#215 gate r3 P2 (3) a healthy sibling never retires a URL another tab could not be read at',
+    throttleSeenHas(homeU3, u3Url, u3Modal),
+    `status=${rU3b.status} dir=${fs.existsSync(throttleSeenDir(homeU3)) ? fs.readdirSync(throttleSeenDir(homeU3)) : null}`);
+  check('#215 gate r3 P2 (3) the healthy-plus-unreadable scan writes no cooldown of its own',
+    mtimeU3bAfter === mtimeU3bBefore, `before=${mtimeU3bBefore} after=${mtimeU3bAfter}`);
+  ageCooldown215(cooldownU3);
+  const mtimeU3cBefore = fs.statSync(cooldownU3).mtimeMs;
+  const cdpU3c = await mockCdp('__NO_TABS__', [{ id: 'u3modal', url: u3Url }], {
+    tabText: () => u3ThrottledText,
+    throttleModal: () => u3Modal,
+  });
+  const rU3c = await runSalvageInHome(homeU3, [MARKER, '3'], cdpU3c.port);
+  cdpU3c.stop();
+  const mtimeU3cAfter = fs.statSync(cooldownU3).mtimeMs;
+  check('#215 gate r3 P2 (3) the recovered unchanged modal does NOT re-arm the account cooldown',
+    mtimeU3cAfter === mtimeU3cBefore && rU3c.status !== 5,
+    `before=${mtimeU3cBefore} after=${mtimeU3cAfter} status=${rU3c.status} stderr=${rU3c.stderr?.slice(-300)}`);
+  fs.rmSync(homeU3, { recursive: true, force: true });
+
+  // (4) Control: two READABLE tabs at the same URL, both healthy, still retire the fingerprint.
+  // The veto is on unreadable instances, not on duplicate tabs.
+  const homeU3d = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const cdpU3d1 = await mockCdp('__NO_TABS__', [{ id: 'u3modal', url: u3Url }], {
+    tabText: () => u3ThrottledText,
+    throttleModal: () => u3Modal,
+  });
+  const rU3d1 = await runSalvageInHome(homeU3d, [MARKER, '3'], cdpU3d1.port);
+  cdpU3d1.stop();
+  const cdpU3d2 = await mockCdp('__NO_TABS__', [
+    { id: 'u3one', url: u3Url },
+    { id: 'u3two', url: u3Url },
+  ], {
+    tabText: () => u3HealthyText,
+  });
+  const rU3d2 = await runSalvageInHome(homeU3d, [MARKER, '3'], cdpU3d2.port);
+  cdpU3d2.stop();
+  check('#215 gate r3 P2 (4) control: two readable healthy tabs at one URL still retire its fingerprint',
+    rU3d1.status === 5 && !throttleSeenHas(homeU3d, u3Url, u3Modal),
+    `first=${rU3d1.status} second=${rU3d2.status} dir=${fs.existsSync(throttleSeenDir(homeU3d)) ? fs.readdirSync(throttleSeenDir(homeU3d)) : null}`);
+  fs.rmSync(homeU3d, { recursive: true, force: true });
+}
+
+{ // #215 gate r3 P2 (bin/cdp-salvage.mjs retireThrottleSeenForHealthyRender): the same veto on the
+  // RENDER path. A memo render proves one conversation is healthy right now; it says nothing
+  // about a listed tab at that URL whose reads this scan could not answer, and that tab may still
+  // be holding the very modal whose fingerprint the render would retire. throttledUrls already
+  // blocked the render on a listed tab that PROVED the limiter; unknownUrls is the other half —
+  // "could not look" is not "nothing there" here either.
+  const v3Url = 'https://chatgpt.com/c/mock-215-r3-render-vs-unreadable-tab';
+  const v3Modal = "You're making requests too quickly. [#215 gate r3 P2 render fixture]";
+  const v3Foreign = 'pg-run-another-run-215r3render';
+  const v3ThrottledText = `ChatGPT\n${v3Foreign}\n${v3Modal}\nAnother run's conversation beneath the modal.\n`;
+  const v3HealthyText = `ChatGPT\n${v3Foreign}\nAnother run's conversation, fully rendered, no limiter in sight.\n`;
+  const v3Title = 'pro-gate review: PR #215 gate r3 P2 render [pro-gate]';
+  const homeV3 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedOrganizer(MARKER, v3Title, v3Url)(homeV3);
+  const cdpV3a = await mockCdp('__NO_TABS__', [], {
+    renderText: () => v3ThrottledText,
+    throttleModal: () => v3Modal,
+  });
+  const rV3a = await runSalvageInHome(homeV3, ['--organize', MARKER, '5'], cdpV3a.port, SCRATCH_SAMPLE_TEST_ENV);
+  cdpV3a.stop();
+  check('#215 gate r3 P2 (5) the throttled memo render charges its fingerprint',
+    /reason=throttle/.test(rV3a.stdout) && throttleSeenHas(homeV3, v3Url, v3Modal),
+    `stdout=${rV3a.stdout} stderr=${rV3a.stderr?.slice(-300)}`);
+  const cooldownV3 = path.join(homeV3, 'throttle.cooldown');
+  ageCooldown215(cooldownV3);
+  const mtimeV3bBefore = fs.statSync(cooldownV3).mtimeMs;
+  const cdpV3b = await mockCdp('__NO_TABS__', [{ id: 'v3tab', url: v3Url }], {
+    tabText: () => v3ThrottledText,
+    tabTextFails: (id) => id === 'v3tab',
+    throttleModal: (id) => (id === 'v3tab' ? v3Modal : null),
+    throttleModalFails: (id) => id === 'v3tab',
+    renderText: () => v3HealthyText,          // the memo render itself is decisively healthy
+  });
+  const rV3b = await runSalvageInHome(homeV3, ['--organize', MARKER, '5'], cdpV3b.port, SCRATCH_SAMPLE_TEST_ENV);
+  cdpV3b.stop();
+  const mtimeV3bAfter = fs.statSync(cooldownV3).mtimeMs;
+  check('#215 gate r3 P2 (5) a listed tab nobody could read blocks a decisive render retire of that URL',
+    throttleSeenHas(homeV3, v3Url, v3Modal),
+    `stdout=${rV3b.stdout} dir=${fs.existsSync(throttleSeenDir(homeV3)) ? fs.readdirSync(throttleSeenDir(homeV3)) : null}`);
+  check('#215 gate r3 P2 (5) that blocked scan writes no cooldown of its own',
+    mtimeV3bAfter === mtimeV3bBefore, `before=${mtimeV3bBefore} after=${mtimeV3bAfter}`);
+  fs.rmSync(homeV3, { recursive: true, force: true });
+}
 
 process.exit(failures === 0 ? 0 : 1);
