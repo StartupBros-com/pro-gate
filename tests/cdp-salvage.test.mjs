@@ -4364,6 +4364,61 @@ const FOREIGN_ANSWER = (m) => [
   fs.rmSync(home1b, { recursive: true, force: true });
 }
 
+{ // Round-1 fixer verification (P1): the #209 gate r6 P1 fix above only widened the
+  // REMEMBERED-RENDER caller's foreign-memo gate. The CANONICAL-SCRATCH-REVALIDATION caller (the
+  // one-shot revalidation the scan spends on knownUrl when an owned-incomplete DUPLICATE tab is
+  // also open, bin/cdp-salvage.mjs ~1855) has the IDENTICAL gap: a scratch render of knownUrl
+  // that lands `{kind: 'throttle', foreign: true}` is just as decisive as `kind: 'foreign'`
+  // proof the memo is stale, but this sibling site only ever matched `fresh?.kind === 'foreign'`.
+  // Before the fix, tripThrottleEvidence's already-charged early return correctly skipped a
+  // fresh cooldown, but the code right after it never routed the evidence into rejectForeign, so
+  // the memo kept pointing at the condemned URL forever — permanently wasting the scan's one-shot
+  // canonical revalidation on it every later invocation instead of ever forgetting it.
+  const knownUrlSib = 'https://chatgpt.com/c/known-conversation-r6p1-sibling';
+  const duplicateTabSib = `run marker: ${MARKER}\nduplicate retry tab, still reasoning (r6 P1 sibling)...`;
+  const modalTextSib = "You're making requests too quickly. [r6 P1 sibling fixture]";
+  const foreignPageTextSib = `ChatGPT\npg-run-another-run-r6sib\n${modalTextSib}\nAnother run's conversation beneath the modal.\n`;
+
+  const seedSib = (home) => {
+    seedMemo(MARKER, knownUrlSib)(home);
+    // Already charged by an earlier scan — forces tripThrottleEvidence's early return (no fresh
+    // exit(5)) so the test isolates what happens to the evidence AFTER that return, exactly as
+    // the sibling #209 gate r6 P1 fixture above does.
+    seedThrottleSeen(home, knownUrlSib, modalTextSib);
+  };
+  const cdpSib = await mockCdp(duplicateTabSib, [], {
+    renderText: (url) => (url === knownUrlSib ? foreignPageTextSib : duplicateTabSib),
+    throttleModal: (id) => (id.startsWith('scratch') ? modalTextSib : null),
+  });
+  const rSib = await runScratchSalvage([MARKER, '3'], cdpSib.port, seedSib);
+  cdpSib.stop();
+  check('canonical-scratch sibling (1): an already-recorded foreign modal beneath the remembered URL does not take a fresh throttle exit',
+    rSib.status !== 5, `status=${rSib.status}`);
+  check('canonical-scratch sibling (1): the stale memo is forgotten, not left pointing at the condemned URL forever',
+    rSib.memos.length === 0, `memos=${JSON.stringify(rSib.memos)} memoUrl=${rSib.memoUrl}`);
+  check('canonical-scratch sibling (1): the condemned URL is blacklisted',
+    (rSib.blacklist ?? '').includes(knownUrlSib), `blacklist=${rSib.blacklist}`);
+  check('canonical-scratch sibling (1): stderr names canonical scratch as the source of the rejection',
+    /canonical scratch .*carries a DIFFERENT run's marker/.test(rSib.stderr || ''), `stderr=${rSib.stderr?.slice(-400)}`);
+
+  // Planted negative: the same already-recorded-modal shape but MARKERLESS (no run marker at
+  // all, ours or foreign) must leave the memo untouched — a bare repeat interstitial is
+  // rate-limit noise, not positive proof the memo belongs to someone else (design invariant:
+  // markerless repeats stay inconclusive).
+  const markerlessPageTextSib = `ChatGPT\n${modalTextSib}\nNo run marker anywhere on this page.\n`;
+  const cdpSibNeg = await mockCdp(duplicateTabSib, [], {
+    renderText: (url) => (url === knownUrlSib ? markerlessPageTextSib : duplicateTabSib),
+    throttleModal: (id) => (id.startsWith('scratch') ? modalTextSib : null),
+  });
+  const rSibNeg = await runScratchSalvage([MARKER, '3'], cdpSibNeg.port, seedSib);
+  cdpSibNeg.stop();
+  check('canonical-scratch sibling planted negative: a MARKERLESS repeat leaves the memo untouched',
+    rSibNeg.memos.length === 1 && rSibNeg.memoUrl === knownUrlSib,
+    `memos=${JSON.stringify(rSibNeg.memos)} memoUrl=${rSibNeg.memoUrl}`);
+  check('canonical-scratch sibling planted negative: no DIFFERENT-run-marker rejection is reported',
+    !/carries a DIFFERENT run's marker/.test(rSibNeg.stderr || ''), `stderr=${rSibNeg.stderr?.slice(-400)}`);
+}
+
 { // #209 gate r6 P2 (bin/cdp-salvage.mjs:1309, finding 2): openOrganizerScratch's throttle
   // return used to carry no ownership information at all, so the caller called
   // recordThrottle('organizer scratch') UNCONDITIONALLY whenever a scratch render hit any

@@ -1852,7 +1852,13 @@ while (Date.now() < deadline) {
       }
       continue;
     }
-    if (fresh?.kind === 'foreign') {
+    if (fresh?.kind === 'foreign' || (fresh?.kind === 'throttle' && fresh.foreign)) {
+      // #208 gate r6 P1 sibling: proven either directly (kind: 'foreign') or, same as the
+      // remembered-render caller above, by a throttle modal painted over ANOTHER run's marker
+      // (kind: 'throttle', foreign: true). tripThrottleEvidence already decided above whether
+      // this sighting re-arms the cooldown; either way it is still positive proof the canonical
+      // URL is stale, and a markerless repeat (foreign: false) must NOT land here — that stays
+      // inconclusive below instead.
       rejectForeign(revalidateUrl, 'canonical scratch');
       if (revalidateUrl === tab.url) {
         stillGeneratingUrl = null;
