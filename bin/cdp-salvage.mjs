@@ -87,6 +87,7 @@
 // Requires Node >= 21 (global WebSocket); the box runs Node 24.
 
 import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -516,113 +517,81 @@ function throttleSeenRecordPath(url, hash) {
 // be a temp — every place that reads this directory AS RECORDS skips it.
 const THROTTLE_SEEN_EXPIRE_MARK = '.expire.';
 function throttleSeenIsTemp(name) { return name.includes(THROTTLE_SEEN_EXPIRE_MARK); }
-// #215 gate r9 P2: withThrottleSeenLock's per-fingerprint mutex directory. A record basename is
-// bare sha256 hex and a temp always carries THROTTLE_SEEN_EXPIRE_MARK, so neither can end in
-// '.lock' — every place that reads this directory AS a record or a temp must skip these too, or
-// a rename/unlink meant for a record would instead corrupt a live mutex out from under whichever
-// process currently holds it.
-function throttleSeenIsLock(name) { return name.endsWith('.lock'); }
-// #215 gate r9 P2: mkdirSync is this file's one atomic, race-proof create primitive (same reason
-// recordThrottleSeen uses the 'wx' flag on a plain file) so it doubles as a per-fingerprint lock:
-// EEXIST means contended, rmdirSync releases. STALE_MS bounds how long a lock is trusted as
-// "someone else's in-flight critical section" before being treated as an orphan left by a holder
-// that died mid-section (crash, kill -9) and reclaimed; WAIT_MS bounds how long a genuinely live
-// holder is waited out before this call gives up and proceeds WITHOUT the lock — every sidecar
-// path in this file is fail-open, and a lock is not exempt: losing the lock narrows a race
-// window, it must never turn into a hang.
-const THROTTLE_SEEN_LOCK_STALE_MS = 5_000;
+// #215 gate r10 P2: withThrottleSeenLock's per-fingerprint mutex FILE. A record basename is bare
+// sha256 hex and a temp always carries THROTTLE_SEEN_EXPIRE_MARK, so neither can end in '.lockf'
+// — every place that reads this directory AS a record or a temp must skip these too. Lock files
+// are tiny (created empty, never written) and bounded in number by the count of distinct
+// fingerprints this box has ever seen, so pruneThrottleSeen never deletes them — there is nothing
+// to reclaim (see withThrottleSeenLock below) and nothing to age out.
+function throttleSeenIsLockFile(name) { return name.endsWith('.lockf'); }
+// #215 gate r10 P2 (paid-review round 10 [P2] bin/cdp-salvage.mjs:591): the round-9 pathname lock
+// (mkdirSync as a mutex, reclaimed by mtime + a liveness-checked owner token) still let two
+// reclaimers observe the SAME dead lock and both act on it — a delayed reclaimer's rename could
+// land on a WINNER's freshly re-created live lock instead of failing with ENOENT, so the delayed
+// reclaimer deleted a live lock and entered the protected section concurrently with its winner
+// (and pruneThrottleSeen's own lock-reap repeated the same check-then-rename race). No amount of
+// fencing on a pathname primitive closes that: the fix is to stop reclaiming pathnames at all and
+// hand the mutex to the kernel via flock(2) on a stable, never-unlinked file.
+//   - The lock file is '<name>.lockf' inside THROTTLE_SEEN_DIR, opened once with fs.openSync(path,
+//     'a') — created if missing, never written, never unlinked (there is nothing to reclaim: an
+//     open file description lock is automatically released by the kernel when the holding process
+//     exits or is killed, crashed or not — so "stale lock" is not a state that can exist here).
+//   - The util-linux `flock` binary is spawned with that fd INHERITED as its fd 3
+//     (`stdio: ['ignore', 'ignore', 'pipe', fd]`) and told to take an exclusive lock on fd 3 and
+//     exit (`flock -x -w <secs> 3`). The exclusive lock lives on the OPEN FILE DESCRIPTION, which
+//     this process still holds after the child exits — so the lock stays held by THIS process
+//     until fs.closeSync(fd) releases it. That close, in a `finally`, is the only release path.
+//   - Exit 0: acquired. Exit 1 (the `-w` timeout): contended past the wait budget — fail open
+//     (every sidecar path in this file is fail-open) with the same stderr line round 9 printed,
+//     still running fn without the lock. A spawn failure (ENOENT — no flock binary, e.g. macOS)
+//     fails open too, but warns only ONCE per process: unlike contention, a missing binary is a
+//     fixed fact about this host, not a fact about this one fingerprint, so repeating it on every
+//     prune/claim call would just be noise.
 const THROTTLE_SEEN_LOCK_WAIT_MS = 250;
-// #215 gate r9 verify (independent-verifier P1): elapsed mtime alone cannot tell "the holder died
-// mid-section" from "the holder is still running a slow section" — reclaiming the latter lets two
-// processes run the SAME fingerprint's critical section at once, silently (no stderr line at
-// all), which is exactly the double-charge/lost-write class #215 exists to close, now via the
-// lock meant to prevent it instead of the gap it replaced. Every acquisition (fresh or reclaimed)
-// records its own pid+nonce inside the lock directory immediately after mkdirSync succeeds; a
-// stale-looking lock is reclaimed only once its recorded owner is verifiably NOT alive
-// (process.kill(pid, 0) throwing anything other than EPERM — EPERM means the pid exists under
-// another user, still alive). A missing/unreadable owner file — the lock predates this fix, or
-// this call raced the narrow window between ITS OWN mkdirSync and its owner-file write — is
-// treated as unverifiable and still reclaimable on mtime alone, same as before this fix: the
-// fencing token can only ever narrow the race, never turn a lock into something that can hang.
-function throttleSeenLockOwnerPath(lockPath) { return path.join(lockPath, 'owner'); }
-function throttleSeenLockOwnerAlive(lockPath) {
-  let token;
-  try { token = fs.readFileSync(throttleSeenLockOwnerPath(lockPath), 'utf8'); } catch { return false; }
-  const pid = Number(String(token).split(':')[0]);
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try { process.kill(pid, 0); return true; }          // no throw: pid exists, same user -> alive
-  catch (err) { return err?.code === 'EPERM'; }        // EPERM: exists, different user -> alive
-}
+const THROTTLE_SEEN_LOCK_WAIT_SECS = (THROTTLE_SEEN_LOCK_WAIT_MS / 1000).toFixed(3);
+let throttleSeenFlockMissingWarned = false;
 function withThrottleSeenLock(name, fn) {
   try { fs.mkdirSync(THROTTLE_SEEN_DIR, { recursive: true }); } catch {}
-  const lockPath = path.join(THROTTLE_SEEN_DIR, `${name}.lock`);
-  let acquired = false;
-  let ownerToken = null;
-  const claimOwnership = () => {
-    // Written in the same synchronous turn as the mkdirSync that just succeeded — no other JS in
-    // THIS process runs in between, so no caller in this process can ever observe the lock
-    // directory without also seeing this token; only a genuinely concurrent OS process racing the
-    // two syscalls can, and that narrow window is exactly the "unverifiable, fall back to mtime"
-    // case documented above.
-    ownerToken = `${process.pid}:${Math.random().toString(36).slice(2)}`;
-    try { fs.writeFileSync(throttleSeenLockOwnerPath(lockPath), ownerToken); } catch {}
-  };
+  const lockPath = path.join(THROTTLE_SEEN_DIR, `${name}.lockf`);
+  let fd = null;
   try {
-    fs.mkdirSync(lockPath);
-    acquired = true;
-    claimOwnership();
-  } catch (err) {
-    if (err?.code !== 'EEXIST') {
+    try {
+      fd = fs.openSync(lockPath, 'a');
+    } catch (err) {
       // Not contention (ENOSPC, EPERM, missing parent, ...): fail open like every other sidecar
       // write in this file rather than block a claim or a prune on a filesystem problem.
-      console.error(`throttle-seen lock unavailable for ${name} (${err?.code ?? err}); proceeding without it (fail-open)`);
-    } else {
-      let stat;
-      try { stat = fs.statSync(lockPath); } catch { stat = null; }
-      if (stat && Date.now() - stat.mtimeMs > THROTTLE_SEEN_LOCK_STALE_MS && !throttleSeenLockOwnerAlive(lockPath)) {
-        // Reclaim ATOMICALLY: rename the dead lock aside first, so of two reclaimers that both
-        // judged the same dead lock only the one whose rename succeeds removes it and re-creates
-        // the lock; the loser's rename throws ENOENT and it falls through to the wait loop against
-        // the winner's fresh lock. Removing in place would let the loser delete a lock the winner
-        // had just re-created between the loser's liveness check and its removal (the #155 shape).
-        // The aside keeps the `.lock` suffix so the prune classifies it as a lock, never a record.
-        const aside = `${lockPath}.dead.${process.pid}.lock`;
-        let renamed = false;
-        try { fs.renameSync(lockPath, aside); renamed = true; } catch {}
-        if (renamed) {
-          try { fs.rmSync(aside, { recursive: true, force: true }); } catch {}
-          try { fs.mkdirSync(lockPath); acquired = true; claimOwnership(); } catch {}
-        }
+      console.error(`throttle-seen lock file unavailable for ${name} (${err?.code ?? err}); proceeding without it (fail-open)`);
+    }
+    if (fd !== null) {
+      let result;
+      try {
+        result = spawnSync('flock', ['-x', '-w', THROTTLE_SEEN_LOCK_WAIT_SECS, '3'], {
+          stdio: ['ignore', 'ignore', 'pipe', fd],
+        });
+      } catch (err) {
+        result = { error: err };
       }
-      if (!acquired) {
-        // Atomics.wait on a private SharedArrayBuffer is the only synchronous sleep Node offers
-        // — a same-process setTimeout cannot help here because this call must not return control
-        // to the event loop mid-wait (the caller is a synchronous fs sequence, not an async one).
-        const sync = new Int32Array(new SharedArrayBuffer(4));
-        const deadline = Date.now() + THROTTLE_SEEN_LOCK_WAIT_MS;
-        while (!acquired && Date.now() < deadline) {
-          Atomics.wait(sync, 0, 0, 5);
-          try { fs.mkdirSync(lockPath); acquired = true; claimOwnership(); } catch {}
+      if (result.error) {
+        // ENOENT (no flock binary on this host, e.g. macOS) or any other spawn failure: a fixed
+        // fact about this host, not about this one fingerprint, so warn once per process rather
+        // than on every prune/claim call for the rest of the run.
+        if (!throttleSeenFlockMissingWarned) {
+          throttleSeenFlockMissingWarned = true;
+          console.error(`flock binary unavailable (${result.error?.code ?? result.error}); proceeding without a throttle-seen lock for the rest of this process (fail-open)`);
         }
-      }
-      if (!acquired) {
+      } else if (result.status !== 0) {
+        // status 1 (the -w timeout) or a signal (status null): contended past the wait budget.
         console.error(`throttle-seen lock contended past ${THROTTLE_SEEN_LOCK_WAIT_MS}ms for ${name}; proceeding without it (fail-open)`);
       }
+      // status === 0: acquired. The exclusive flock now lives on the open file description `fd`
+      // refers to, held by THIS process regardless of the flock child having already exited.
     }
-  }
-  try {
     return fn();
   } finally {
-    // #215 gate r9 verify: re-check ownership before releasing — if the token on disk no longer
-    // matches what THIS call wrote, someone else has since reclaimed this lock instance as
-    // orphaned (the call above judged its predecessor dead); removing it here would evict a
-    // live, legitimate holder rather than release this call's own lock (the three-way chain the
-    // same finding named).
-    if (acquired) {
-      let current = null;
-      try { current = fs.readFileSync(throttleSeenLockOwnerPath(lockPath), 'utf8'); } catch {}
-      if (current === ownerToken) { try { fs.rmSync(lockPath, { recursive: true, force: true }); } catch {} }
-    }
+    // This IS the release: closing every fd this process holds on the file drops the flock the
+    // kernel associated with that open file description. Never unlink lockPath here — it stays on
+    // disk for the next claim on this fingerprint to open and lock again.
+    if (fd !== null) { try { fs.closeSync(fd); } catch {} }
   }
 }
 // #215 gate r7 P2: delete ONLY the record generation that was actually checked — `expected` is
@@ -686,7 +655,7 @@ function removeThrottleSeenGeneration(name, expected) {  // -> true when that ge
 //     are exempt from the CAPACITY trim only, never from the TTL above. Without that exemption
 //     (#208 gate r3 P2) a fingerprint still visible on every single scan could be the one the
 //     capacity trim picks (oldest mtime first) — evicted, then immediately rediscovered as
-//     "new" by the same scan's own throttleAlreadyCharged check and recreated with a fresh
+//     "new" by the same scan's own admission check and recreated with a fresh
 //     mtime, so a persistent batch above THROTTLE_SEEN_MAX charges a fresh cooldown on every
 //     invocation forever instead of once per horizon. A protected fingerprint can still exceed
 //     the nominal cap on disk; that is the correct trade — the cap is only ever enforced
@@ -705,30 +674,13 @@ function pruneThrottleSeen(protectedKeys = new Set()) {
     let stat;
     try { stat = fs.statSync(recordPath); } catch { continue; }
     const expired = now - stat.mtimeMs > THROTTLE_SEEN_TTL_MS;
-    // #215 gate r9 P2: a lock dir is neither a record nor a temp — it is transient mutex state
-    // withThrottleSeenLock itself removes on release. An aged one means its holder died without
-    // releasing (crash, kill -9); reap it here on the same TTL horizon as everything else in this
-    // directory so an orphaned lock cannot wedge every future claim on this fingerprint forever
-    // (fail-open only bounds the WAIT for a live holder — nothing else in withThrottleSeenLock
-    // ever removes another process's lock short of the stale-reclaim check on the NEXT contended
-    // caller, so a fingerprint nobody else touches would otherwise never get its orphan cleared).
-    // #215 gate r9 verify (independent-verifier P1): the same positive liveness check
-    // withThrottleSeenLock's own reclaim uses — an aged-but-genuinely-live holder's lock must
-    // survive the PRUNE path too, not just the reclaim-on-contention path, or this sweep becomes
-    // the second way to steal a live lock. It may also now contain an 'owner' file, so removal
-    // must be recursive (a plain rmdirSync on that non-empty directory would fail and silently
-    // leave the orphan behind forever).
-    if (throttleSeenIsLock(name)) {
-      if (expired && !throttleSeenLockOwnerAlive(recordPath)) {
-        // Same atomic rename-aside as withThrottleSeenLock's reclaim: a reclaimer may have
-        // re-created a live lock at this path between the liveness check above and the removal.
-        const aside = `${recordPath}.dead.${process.pid}.lock`;
-        let renamed = false;
-        try { fs.renameSync(recordPath, aside); renamed = true; } catch {}
-        if (renamed) { try { fs.rmSync(aside, { recursive: true, force: true }); } catch {} }
-      }
-      continue;
-    }
+    // #215 gate r10 P2: a '.lockf' file is the OS-managed mutex withThrottleSeenLock opens and
+    // flocks — never a record, never a temp, and never reclaimed or reaped here. There is no
+    // stale-lock state to detect any more (a crashed holder's flock is released by the kernel the
+    // instant the process dies, not left for a sweep to notice), so unlike the round-9 lock dirs
+    // this file is simply skipped, forever: it is tiny (created empty, never written) and bounded
+    // in count by the number of distinct fingerprints this box has ever seen.
+    if (throttleSeenIsLockFile(name)) continue;
     // A rename-aside temp is NOT a record: it suppresses nothing, so it is never protected and
     // never counted toward the cap — only aged out, so an orphan left by a writer that died
     // mid-swap cannot accumulate (see removeThrottleSeenGeneration). A rename preserves mtime, so
@@ -758,21 +710,14 @@ function pruneThrottleSeen(protectedKeys = new Set()) {
       .forEach(({ name, ino, mtimeMs }) => removeThrottleSeenGeneration(name, { ino, mtimeMs }));
   }
 }
-// "Already charged" is a plain existence check on the record file, not a load-then-scan of an
-// in-memory snapshot — there is no snapshot to go stale. #215 gate r9 P2: the round-8 window this
-// used to need throttleSeenFreshTemp for (a concurrent prune's rename-aside briefly hiding a live
-// record from this existence check) is now closed by claimThrottleSeen taking removeThrottleSeen
-// Generation's own lock before making this check, so the two can never interleave — the caller
-// no longer needs a second, fuzzy "was there recently a temp for this fingerprint" heuristic.
-function throttleAlreadyCharged(url, hash) {
-  return fs.existsSync(throttleSeenRecordPath(url, hash));
-}
-// Creates the record with the 'wx' flag: this throws EEXIST (caught, ignored) if another
-// process already created the SAME fingerprint's file between this call's caller checking
-// throttleAlreadyCharged and reaching here — the exact race #208 gate r2 P2 closes. Either way
-// the record exists once this returns (best-effort on mkdir/write failure, same as every other
-// sidecar write in this file).
-function recordThrottleSeen(url, hash) {  // -> true when THIS call may charge the sighting
+// Creates the record with the 'wx' flag: this throws (caught, ignored) if the record still
+// exists when this runs — claimThrottleSeen below is the only caller, and it only reaches this
+// create after establishing the record is either absent or expired, so an EEXIST here means a
+// best-effort unlink of an expired record failed (an unwritable directory), not a live
+// fingerprint someone else just charged (that race is closed by claimThrottleSeen's lock, not by
+// this flag — the flag remains belt-and-suspenders). Either way the record exists once this
+// returns (best-effort on mkdir/write failure, same as every other sidecar write in this file).
+function recordThrottleSeen(url, hash) {
   try {
     fs.mkdirSync(THROTTLE_SEEN_DIR, { recursive: true });
     const recordPath = throttleSeenRecordPath(url, hash);
@@ -781,32 +726,35 @@ function recordThrottleSeen(url, hash) {  // -> true when THIS call may charge t
     // BEFORE the cooldown it gates is attempted (it remains the sole race arbiter), but it must
     // not outlive a failed publish. recordThrottle rolls it back if that write fails.
     pendingThrottleSeenRecords.push(recordPath);
-    return true;
-  } catch (err) {
-    // EEXIST: another invocation won the race for this exact fingerprint between the caller's
-    // pre-check and this write, and it is the one charging the cooldown — this call must treat
-    // the sighting as already charged (local skeptic on gate r2: two racers both returning
-    // "new" would each write a cooldown). Any OTHER failure keeps the best-effort rule every
-    // sidecar write in this file follows: charge anyway, so a sidecar problem can never silence
-    // a real throttle.
-    return err?.code !== 'EEXIST';
-  }
+  } catch {}
 }
-// #215 gate r9 P2: admission (throttleAlreadyCharged's existence check) and creation
-// (recordThrottleSeen's 'wx' create) as ONE unit under this fingerprint's lock — the same lock
-// removeThrottleSeenGeneration takes, so a concurrent prune's rename-verify-restore sequence for
-// this exact fingerprint can never interleave with this check-then-create. The one-shot prune
-// itself stays OUTSIDE the lock (it walks every fingerprint's lock in turn via
-// removeThrottleSeenGeneration, so running it while already holding one fingerprint's lock would
-// self-deadlock) and runs BEFORE, same trigger as the old throttleAlreadyCharged had. Returns
-// 'charged' only when THIS call created a new record — identical to the pre-lock contract
-// (`throttleAlreadyCharged(...) || !recordThrottleSeen(...)`) every caller below is rewritten
-// against.
+// #215 gate r10 P2 (paid-review round 10 [P2] bin/cdp-salvage.mjs:768): admission used to be a
+// PLAIN EXISTENCE check — ANY record, however old, read as "already charged", even one
+// pruneThrottleSeen already tried and failed to remove (a readable seen directory that is not
+// WRITABLE: removeThrottleSeenGeneration's rename/unlink best-effort-fails and leaves the
+// expired record in place, but existence-only admission still returned true for it). An
+// eight-day-old fingerprint could then suppress a real throttle sighting on every invocation,
+// forever, without ever publishing the cooldown it was supposed to keep re-arming inside the
+// horizon — the opposite of fail-open.
+// Admission now checks the record's OWN AGE under this fingerprint's lock, not just its
+// existence: an unexpired record is still "already" (unchanged from before). An EXPIRED record
+// is never "already" — it is unlinked (best-effort) and the sighting proceeds to the 'wx' create
+// exactly as if no record existed at all. If that create still fails (the unlink failed) this
+// call returns 'charged' anyway: a sidecar problem must never silence a real throttle, so an
+// unwritable sidecar disables dedupe entirely — deliberately, not a residual bug — rather than
+// suppress a live throttle sighting with no cooldown behind it.
 function claimThrottleSeen(url, hash, protectedKeys) {
   if (!throttleSeenPruned) { throttleSeenPruned = true; pruneThrottleSeen(protectedKeys); }
   return withThrottleSeenLock(throttleSeenKey(url, hash), () => {
-    if (throttleAlreadyCharged(url, hash)) return 'already';
-    return recordThrottleSeen(url, hash) ? 'charged' : 'already';
+    const recordPath = throttleSeenRecordPath(url, hash);
+    let stat = null;
+    try { stat = fs.statSync(recordPath); } catch {}
+    if (stat) {
+      if (Date.now() - stat.mtimeMs <= THROTTLE_SEEN_TTL_MS) return 'already';
+      try { fs.unlinkSync(recordPath); } catch {}   // best-effort; a failure here still charges below
+    }
+    recordThrottleSeen(url, hash);
+    return 'charged';
   });
 }
 // #208 gate r2 P1: true once ANY throttle surface not proven to belong to another run (no
@@ -834,7 +782,7 @@ let inconclusiveThrottleWhere = null;
 // genuinely new sighting, after recording it so a later trip (this scan or the next invocation)
 // recognizes it too.
 // `protectedKeys` (default: just this call's own fingerprint) is forwarded to
-// throttleAlreadyCharged's one-time prune so the CAPACITY trim never evicts a fingerprint the
+// claimThrottleSeen's one-time prune so the CAPACITY trim never evicts a fingerprint the
 // CURRENT scan still needs (#208 gate r3 P2) — a batch call passes the whole batch's keys so all
 // of them survive the same trim, not just whichever happens to be checked first. Protection is
 // capacity-only: an entry past THROTTLE_SEEN_TTL_MS is expired regardless (#215 gate r6), so a
@@ -848,9 +796,9 @@ function tripThrottleUnowned(url, text, where, foreign = false, protectedKeys = 
     inconclusiveThrottleSeen = true;
   }
   const keys = protectedKeys ?? new Set([throttleSeenKey(url, hash)]);
-  // #215 gate r9 P2: claimThrottleSeen holds this fingerprint's lock across the existence check
-  // AND the 'wx' create — the 'wx' flag remains the race's ultimate arbiter (unchanged), the lock
-  // only narrows the window a concurrent prune could interleave in.
+  // #215 gate r9/r10 P2: claimThrottleSeen holds this fingerprint's OS lock across the age check
+  // AND the 'wx' create — the 'wx' flag remains a belt-and-suspenders arbiter, the lock is what
+  // now excludes a concurrent prune or claim on this exact fingerprint from interleaving at all.
   if (claimThrottleSeen(url, hash, keys) !== 'charged') {
     console.error(`stale throttle modal on unowned tab ${url} already charged; ignoring (${where})`);
     return false;

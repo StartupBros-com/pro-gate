@@ -557,7 +557,7 @@ function runSalvageInHome(home, args, port, extraEnv = {}) {
 // invocation and rewritten wholesale — the exact shared-mutable-state race #208 gate r2 P2
 // closes) with one record file per (url, hash) fingerprint in a DIRECTORY, created via
 // fs.writeFileSync(path, '', { flag: 'wx' }) so a concurrent writer can never clobber another's
-// sighting. These three helpers mirror throttleSeenRecordPath/throttleAlreadyCharged/
+// sighting. These three helpers mirror throttleSeenRecordPath/claimThrottleSeen/
 // recordThrottleSeen in bin/cdp-salvage.mjs byte-for-byte (same hash-of-url-and-hash key), so
 // tests read and seed the SAME on-disk shape production does, not a second test-only format.
 const throttleSeenDir = (home) => path.join(home, 'throttle.cooldown.seen.d');
@@ -4756,15 +4756,30 @@ const FOREIGN_ANSWER = (m) => [
     const end = salvageLinesR7.findIndex((line, i) => i > start && line === '}');
     return end < 0 ? null : salvageLinesR7.slice(start, end + 1).join('\n');
   };
-  const PRUNER_PARTS_R7 = ['THROTTLE_SEEN_EXPIRE_MARK', 'throttleSeenIsTemp', 'throttleSeenIsLock',
-    'THROTTLE_SEEN_LOCK_STALE_MS', 'THROTTLE_SEEN_LOCK_WAIT_MS', 'withThrottleSeenLock',
+  // #215 gate r10 P2: withThrottleSeenLock is now an flock(2) advisory lock (see the r10 block
+  // below), so its slice references the free variable `spawnSync` — the vm context must inject
+  // it here too, or every h*/c* test below throws an uncaught ReferenceError the instant it
+  // touches a locked path, not a clean check FAIL.
+  const PRUNER_PARTS_R7 = ['THROTTLE_SEEN_EXPIRE_MARK', 'throttleSeenIsTemp', 'throttleSeenIsLockFile',
+    'THROTTLE_SEEN_LOCK_WAIT_MS', 'THROTTLE_SEEN_LOCK_WAIT_SECS', 'withThrottleSeenLock',
     'removeThrottleSeenGeneration', 'pruneThrottleSeen'];
+  // #215 gate r10 P2: the red-before-green pairing tree runs this SAME test file against the
+  // pre-r10 (mkdir-lock) production source, whose withThrottleSeenLock/pruneThrottleSeen bodies
+  // still call these OLD helpers by name. Slicing is by-name and by-body-text, not by behavior —
+  // a parts list naming only the CURRENT (flock) helpers leaves those old identifiers unresolved
+  // free variables the instant old code runs, crashing the whole process with a ReferenceError
+  // instead of failing the one check that touched it. These names exist ONLY in the pre-r10
+  // source (slice-null and filtered out of the join when absent, i.e. against current source),
+  // so they are kept in a separate list rather than folded into PRUNER_PARTS_R7 above.
+  const PRUNER_COMPAT_PARTS_R7 = ['throttleSeenIsLock', 'THROTTLE_SEEN_LOCK_STALE_MS',
+    'throttleSeenLockOwnerPath', 'throttleSeenLockOwnerAlive'];
   const buildPrunerR7 = (dir, { ttlMs = 7 * 24 * 60 * 60 * 1000, max = 512, fsImpl = fs } = {}) => {
-    const source = PRUNER_PARTS_R7.map(sliceTopLevelR7).filter((part) => part !== null).join('\n');
+    const source = [...PRUNER_PARTS_R7, ...PRUNER_COMPAT_PARTS_R7]
+      .map(sliceTopLevelR7).filter((part) => part !== null).join('\n');
     const expose = '({ prune: typeof pruneThrottleSeen === "function" ? pruneThrottleSeen : null,'
       + ' removeGeneration: typeof removeThrottleSeenGeneration === "function" ? removeThrottleSeenGeneration : null })';
     return runInNewContext(`${source}\n${expose}`, {
-      fs: fsImpl, path, process,
+      fs: fsImpl, path, process, spawnSync,
       THROTTLE_SEEN_DIR: dir, THROTTLE_SEEN_TTL_MS: ttlMs, THROTTLE_SEEN_MAX: max,
     });
   };
@@ -5225,7 +5240,7 @@ for (const placeholder of PLACEHOLDER_URLS) {
   cdp.stop();
 }
 
-{ // #215 gate r8 P2 (bin/cdp-salvage.mjs throttleAlreadyCharged): admission is a plain existence
+{ // #215 gate r8 P2 (bin/cdp-salvage.mjs claimThrottleSeen): admission is a plain existence
   // check on the record path — #215 gate r9 P2 replaced the round-8 fresh-temp heuristic
   // (throttleSeenFreshTemp) with claimThrottleSeen taking removeThrottleSeenGeneration's own
   // per-fingerprint lock across the existence-check-then-create, closing the round-8 window
@@ -5330,353 +5345,348 @@ for (const placeholder of PLACEHOLDER_URLS) {
   fs.rmSync(homeP1c, { recursive: true, force: true });
 }
 
-{ // #215 gate r9 P2 (bin/cdp-salvage.mjs claimThrottleSeen / withThrottleSeenLock): admission
-  // (the existence check) and creation (the 'wx' record write) must run as ONE unit per
-  // fingerprint, or a concurrent prune's rename-verify-restore for that SAME fingerprint can
-  // interleave between them — the round-9 finding named in claimThrottleSeen's own comment. A
-  // per-fingerprint mkdirSync lock closes the window; it must reclaim a genuinely orphaned lock
-  // (a holder that died mid-section), wait out a live one only up to its budget and then fail
-  // open (every sidecar path in this file is fail-open), and never be mistaken for a record or a
-  // temp by the prune that reaps everything else in this directory.
+{ // #215 gate r10 P2 (bin/cdp-salvage.mjs withThrottleSeenLock / claimThrottleSeen): paid-review
+  // round 10 found two ways the round-9 fix still broke down.
+  //   [P2] bin/cdp-salvage.mjs:591 — the round-9 mkdirSync lock reclaimed a "stale" pathname by
+  //   stat -> rmdirSync -> mkdirSync with no fencing: two reclaimers could both validate the SAME
+  //   dead lock, and a delayed reclaimer's rename-aside could land on the WINNER's freshly
+  //   re-created LIVE lock instead of failing ENOENT, deleting it and entering the protected
+  //   section concurrently with the winner. pruneThrottleSeen's own lock-reap repeated the same
+  //   check-then-rename race. Fixed by abandoning pathname reclamation entirely: the lock is now
+  //   an OS-managed flock(2) advisory lock on a STABLE, NEVER-UNLINKED '<fingerprint>.lockf' file,
+  //   taken by spawning the util-linux `flock` binary against an INHERITED file descriptor
+  //   (fs.openSync(path, 'a') -> spawnSync('flock', ['-x', '-w', secs, '3'], { stdio: [..., fd] })
+  //   ) — the exclusive lock lives on the open file description this process holds, so it is
+  //   released ONLY by fs.closeSync(fd) in a finally, and a crashed holder's lock is released by
+  //   the KERNEL the instant the process dies. There is no "stale lock" state left to detect, so
+  //   no reclaim, no owner token, no liveness check, and no lock-reap branch in pruneThrottleSeen
+  //   remain — see (c) below for the property this buys that a pathname lock structurally cannot
+  //   provide. This deletes round 9's (iii) stale-lock-reclaim, (iii-b) losing-reclaimer, and (iv)
+  //   lock-reap checks (their mechanism is gone) and the entire separate '#215 gate r9 verify'
+  //   process pair (its whole premise — mtime staleness plus a liveness-checked owner token — no
+  //   longer exists; (c) below supersedes it with the actual property that matters: a SIGKILLed
+  //   holder's lock is released instantly, not after a stale-detection window).
+  //   [P2] bin/cdp-salvage.mjs:768 — admission was a PLAIN EXISTENCE check: pruneThrottleSeen's
+  //   removal of an expired record is best-effort (a readable-but-unwritable seen directory makes
+  //   its rename/unlink fail silently), but existence-only admission still read that untouched
+  //   expired record as "already charged" — an eight-day-old fingerprint could suppress a REAL
+  //   throttle sighting on every invocation forever, without ever publishing the cooldown it was
+  //   supposed to keep re-arming, the opposite of fail-open. Fixed: claimThrottleSeen now stats
+  //   the record's own AGE under the fingerprint's lock; an expired record is unlinked
+  //   (best-effort) and the sighting proceeds to the 'wx' create as though nothing existed. If
+  //   that create still fails (the unlink failed) admission returns 'charged' anyway — a sidecar
+  //   problem must never silence a real throttle, so an unwritable sidecar disables dedupe
+  //   entirely rather than suppress a live sighting with no cooldown behind it. See (a) below.
   //
-  // (iii)/(iv)/baseline drive claimThrottleSeen/pruneThrottleSeen directly via the same
-  // vm-evaluated-slice technique '#215 gate r7 P2' established (see its comment above for why: a
-  // CLI script with no exports, sliced BY NAME — a missing slice surfaces as a null function and
-  // a failing check, never a quietly different implementation). (i)/(ii) need a real spawned
-  // process and a stderr assertion, which the vm harness cannot make observable (console.error
-  // inside runInNewContext prints nothing the host process can see) — those go through real
-  // salvage children instead, exactly like the r7 (c2) end-to-end pair.
-  const salvageLinesR9 = fs.readFileSync(SALVAGE, 'utf8').split('\n');
-  const sliceTopLevelR9 = (name) => {
-    const start = salvageLinesR9.findIndex((line) => (
+  // baseline/(i)/(ii) are round 9's own checks, kept and re-targeted at the flock mechanism
+  // (baseline and the vm-slice harness are otherwise unchanged; (i)/(ii) still need a real
+  // spawned child and a stderr assertion the single-threaded vm harness cannot make observable).
+  // (a)-(d) are new. Same vm-evaluated-slice technique '#215 gate r7 P2' established: bin/cdp-
+  // salvage.mjs is a CLI script with no exports, so functions are sliced out BY NAME and
+  // evaluated verbatim in a sandboxed context — a missing slice surfaces as a null function and a
+  // failing check, never a quietly different implementation.
+  const salvageLinesR10 = fs.readFileSync(SALVAGE, 'utf8').split('\n');
+  const sliceTopLevelR10 = (name) => {
+    const start = salvageLinesR10.findIndex((line) => (
       line.startsWith(`function ${name}(`) || line.startsWith(`const ${name} = `)
     ));
     if (start < 0) return null;
-    if (salvageLinesR9[start].startsWith('const ') || salvageLinesR9[start].trimEnd().endsWith('}')) {
-      return salvageLinesR9[start];
+    if (salvageLinesR10[start].startsWith('const ') || salvageLinesR10[start].trimEnd().endsWith('}')) {
+      return salvageLinesR10[start];
     }
-    const end = salvageLinesR9.findIndex((line, i) => i > start && line === '}');
-    return end < 0 ? null : salvageLinesR9.slice(start, end + 1).join('\n');
+    const end = salvageLinesR10.findIndex((line, i) => i > start && line === '}');
+    return end < 0 ? null : salvageLinesR10.slice(start, end + 1).join('\n');
   };
-  const CLAIM_PARTS_R9 = ['THROTTLE_SEEN_EXPIRE_MARK', 'throttleSeenIsTemp', 'throttleSeenIsLock',
-    'THROTTLE_SEEN_LOCK_STALE_MS', 'THROTTLE_SEEN_LOCK_WAIT_MS',
-    'throttleSeenLockOwnerPath', 'throttleSeenLockOwnerAlive', 'withThrottleSeenLock',
+  const CLAIM_PARTS_R10 = ['THROTTLE_SEEN_EXPIRE_MARK', 'throttleSeenIsTemp', 'throttleSeenIsLockFile',
+    'THROTTLE_SEEN_LOCK_WAIT_MS', 'THROTTLE_SEEN_LOCK_WAIT_SECS', 'withThrottleSeenLock',
     'removeThrottleSeenGeneration', 'pruneThrottleSeen', 'throttleSeenKey', 'throttleSeenRecordPath',
-    'throttleAlreadyCharged', 'recordThrottleSeen', 'claimThrottleSeen'];
-  const buildClaimR9 = (dir, { ttlMs = 7 * 24 * 60 * 60 * 1000, max = 512, fsImpl = fs } = {}) => {
-    const source = CLAIM_PARTS_R9.map(sliceTopLevelR9).filter((part) => part !== null).join('\n');
+    'recordThrottleSeen', 'claimThrottleSeen'];
+  // #215 gate r10 P2: same cross-version reason as PRUNER_COMPAT_PARTS_R7 above — the pre-r10
+  // production source's withThrottleSeenLock/pruneThrottleSeen bodies call these OLD mkdir-lock
+  // helpers by name, and its claimThrottleSeen body still calls the separate throttleAlreadyCharged
+  // existence check decision 2 folded inline here. Kept out of CLAIM_PARTS_R10 (and its "no silent
+  // no-op" gate below) because they are absent — correctly — from the current source.
+  const CLAIM_COMPAT_PARTS_R10 = ['throttleSeenIsLock', 'THROTTLE_SEEN_LOCK_STALE_MS',
+    'throttleSeenLockOwnerPath', 'throttleSeenLockOwnerAlive', 'throttleAlreadyCharged'];
+  check('#215 gate r10 P2 setup: every named claim/lock part was found in bin/cdp-salvage.mjs (no silent no-op slice)',
+    CLAIM_PARTS_R10.every((name) => sliceTopLevelR10(name) !== null),
+    `missing=${JSON.stringify(CLAIM_PARTS_R10.filter((name) => sliceTopLevelR10(name) === null))}`);
+  const buildClaimR10 = (dir, { ttlMs = 7 * 24 * 60 * 60 * 1000, max = 512, fsImpl = fs } = {}) => {
+    const source = [...CLAIM_PARTS_R10, ...CLAIM_COMPAT_PARTS_R10]
+      .map(sliceTopLevelR10).filter((part) => part !== null).join('\n');
     const expose = '({ claim: typeof claimThrottleSeen === "function" ? claimThrottleSeen : null,'
       + ' prune: typeof pruneThrottleSeen === "function" ? pruneThrottleSeen : null,'
       + ' withLock: typeof withThrottleSeenLock === "function" ? withThrottleSeenLock : null })';
     return runInNewContext(`${source}\n${expose}`, {
-      fs: fsImpl, path, process, createHash,
+      fs: fsImpl, path, process, createHash, spawnSync,
       THROTTLE_SEEN_DIR: dir, THROTTLE_SEEN_TTL_MS: ttlMs, THROTTLE_SEEN_MAX: max,
       pendingThrottleSeenRecords: [], throttleSeenPruned: false,
     });
   };
-  const seenDirR9 = () => fs.mkdtempSync(path.join(os.tmpdir(), 'pg-r9-seen-'));
-  const keyR9 = (label) => createHash('sha256').update(`#215 gate r9 ${label}`).digest('hex');
-  const hashR9 = (label) => createHash('sha256').update(`#215 gate r9 text ${label}`).digest('hex');
-  const recordPathR9 = (dir, url, hash) => path.join(dir, createHash('sha256').update(`${url}\n${hash}`).digest('hex'));
-  const EIGHT_DAYS_R9 = 8 * 24 * 60 * 60 * 1000;
+  const seenDirR10 = () => fs.mkdtempSync(path.join(os.tmpdir(), 'pg-r10-seen-'));
+  const keyR10 = (label) => createHash('sha256').update(`#215 gate r10 ${label}`).digest('hex');
+  const hashR10 = (label) => createHash('sha256').update(`#215 gate r10 text ${label}`).digest('hex');
+  const EIGHT_DAYS_R10 = 8 * 24 * 60 * 60 * 1000;
 
   // baseline planted negative: with no contention, the first claim on a fingerprint charges it,
   // the second (identical url/hash) sees the record it just created and returns 'already'.
-  const dirBaseR9 = seenDirR9();
-  const urlBaseR9 = 'https://chatgpt.com/c/mock-r9-base';
-  const hashBaseR9 = hashR9('baseline');
-  const harnessBaseR9 = buildClaimR9(dirBaseR9);
-  const firstBaseR9 = harnessBaseR9.claim?.(urlBaseR9, hashBaseR9, new Set());
-  const secondBaseR9 = harnessBaseR9.claim?.(urlBaseR9, hashBaseR9, new Set());
-  check('#215 gate r9 P2 baseline: with no contention claimThrottleSeen charges once then reports already',
-    firstBaseR9 === 'charged' && secondBaseR9 === 'already',
-    `first=${firstBaseR9} second=${secondBaseR9}`);
-  fs.rmSync(dirBaseR9, { recursive: true, force: true });
+  const dirBaseR10 = seenDirR10();
+  const urlBaseR10 = 'https://chatgpt.com/c/mock-r10-base';
+  const hashBaseR10 = hashR10('baseline');
+  const harnessBaseR10 = buildClaimR10(dirBaseR10);
+  const firstBaseR10 = harnessBaseR10.claim?.(urlBaseR10, hashBaseR10, new Set());
+  const secondBaseR10 = harnessBaseR10.claim?.(urlBaseR10, hashBaseR10, new Set());
+  check('#215 gate r10 P2 baseline: with no contention claimThrottleSeen charges once then reports already',
+    firstBaseR10 === 'charged' && secondBaseR10 === 'already',
+    `first=${firstBaseR10} second=${secondBaseR10}`);
+  fs.rmSync(dirBaseR10, { recursive: true, force: true });
 
-  // (iii) a stale lock dir (mtime 10s old, past the 5s THROTTLE_SEEN_LOCK_STALE_MS) is a holder
-  // that died mid-section, not live contention: it is reclaimed and the claim proceeds.
-  const dirIiiR9 = seenDirR9();
-  const urlIiiR9 = 'https://chatgpt.com/c/mock-r9-iii';
-  const hashIiiR9 = hashR9('iii');
-  const recordIiiR9 = recordPathR9(dirIiiR9, urlIiiR9, hashIiiR9);
-  const lockIiiR9 = `${recordIiiR9}.lock`;
-  fs.mkdirSync(lockIiiR9);
-  const staleAtR9 = new Date(Date.now() - 10_000);
-  fs.utimesSync(lockIiiR9, staleAtR9, staleAtR9);
-  const resultIiiR9 = buildClaimR9(dirIiiR9).claim?.(urlIiiR9, hashIiiR9, new Set());
-  check('#215 gate r9 P2 (iii) a stale lock dir is reclaimed and the claim proceeds',
-    resultIiiR9 === 'charged', `result=${resultIiiR9}`);
-  check('#215 gate r9 P2 (iii) the record now exists and the stale lock is gone',
-    fs.existsSync(recordIiiR9) && !fs.existsSync(lockIiiR9),
-    `dir=${JSON.stringify(fs.readdirSync(dirIiiR9))}`);
-  fs.rmSync(dirIiiR9, { recursive: true, force: true });
+  // --- end-to-end through real salvage children: (i)/(ii) need a stderr assertion, which the vm
+  // harness cannot make observable ----------------------------------------------------------
+  const modalTriggerR10i = "You're making requests too quickly. [#215 gate r10 (i) trigger]";
+  const pageR10i = `ChatGPT\nAccount limits\n${modalTriggerR10i}\nPlease try again shortly.\n`;
+  const primaryUrlR10 = 'https://chatgpt.com/c/mock-conversation';   // the mock's own primary tab
 
-  // (iii-b) two reclaimers judging the same dead lock: the reclaim must be atomic (rename aside,
-  // then remove), so the one whose rename LOSES removes nothing and never re-creates the lock —
-  // it falls through to the wait loop against the winner's fresh lock and, when that stays held
-  // past the wait budget here, fails open. Simulated by an fs whose renameSync of a lock path
-  // throws ENOENT (the winner already moved it). Pre-fix the loser rmSync'd the path in place,
-  // which is exactly how it could delete a lock the winner had just re-created.
-  const dirIiibR9 = seenDirR9();
-  const urlIiibR9 = 'https://chatgpt.com/c/mock-r9-iii-b';
-  const hashIiibR9 = hashR9('iii-b');
-  const recordIiibR9 = recordPathR9(dirIiibR9, urlIiibR9, hashIiibR9);
-  const lockIiibR9 = `${recordIiibR9}.lock`;
-  fs.mkdirSync(lockIiibR9);
-  fs.utimesSync(lockIiibR9, staleAtR9, staleAtR9);
-  let loserRenamesR9 = 0;
-  const fsLoserR9 = {
-    ...fs,
-    renameSync: (from, to) => {
-      if (String(from).endsWith('.lock')) {
-        loserRenamesR9 += 1;
-        const err = new Error('ENOENT: simulated — another reclaimer renamed the dead lock aside first');
-        err.code = 'ENOENT';
-        throw err;
-      }
-      return fs.renameSync(from, to);
-    },
-  };
-  const resultIiibR9 = buildClaimR9(dirIiibR9, { fsImpl: fsLoserR9 }).claim?.(urlIiibR9, hashIiibR9, new Set());
-  const afterIiibR9 = fs.readdirSync(dirIiibR9);
-  check('#215 gate r9 P2 (iii-b) a reclaimer that loses the rename removes nothing: the lock it judged dead is still on disk',
-    loserRenamesR9 >= 1 && afterIiibR9.includes(path.basename(lockIiibR9)) && !afterIiibR9.some((n) => n.includes('.dead.')),
-    `renames=${loserRenamesR9} result=${resultIiibR9} dir=${JSON.stringify(afterIiibR9)}`);
-  check('#215 gate r9 P2 (iii-b) the losing reclaimer still charges exactly once through the fail-open path',
-    resultIiibR9 === 'charged' && fs.existsSync(recordIiibR9),
-    `result=${resultIiibR9} record=${fs.existsSync(recordIiibR9)}`);
-  fs.rmSync(dirIiibR9, { recursive: true, force: true });
-
-  // (iv) lock dirs are never counted as records or temps, and an aged one is reaped by the prune
-  // — cleanly (rmdirSync), never by the record/temp rename-aside path, which corrupts a directory
-  // it cannot unlink (EISDIR) instead of removing it: pre-fix that leaves a `<name>.expire.<pid>`
-  // orphan on disk under the ORIGINAL lock's name prefix, not a clean removal.
-  const dirIvR9 = seenDirR9();
-  const nameLiveIvR9 = keyR9('iv live');
-  fs.writeFileSync(path.join(dirIvR9, nameLiveIvR9), '', { flag: 'wx' });
-  const liveAtR9 = new Date(Date.now() - 60_000);
-  fs.utimesSync(path.join(dirIvR9, nameLiveIvR9), liveAtR9, liveAtR9);
-  const nameFreshLockIvR9 = `${keyR9('iv fresh-lock')}.lock`;
-  fs.mkdirSync(path.join(dirIvR9, nameFreshLockIvR9));
-  const nameAgedLockIvR9 = `${keyR9('iv aged-lock')}.lock`;
-  const pathAgedLockIvR9 = path.join(dirIvR9, nameAgedLockIvR9);
-  fs.mkdirSync(pathAgedLockIvR9);
-  const agedAtR9 = new Date(Date.now() - EIGHT_DAYS_R9);
-  fs.utimesSync(pathAgedLockIvR9, agedAtR9, agedAtR9);
-  buildClaimR9(dirIvR9).prune?.(new Set());
-  const afterIvR9 = fs.readdirSync(dirIvR9);
-  check('#215 gate r9 P2 (iv) the aged lock is cleanly reaped, not renamed aside into a corrupted orphan',
-    !afterIvR9.some((n) => n === nameAgedLockIvR9 || n.startsWith(`${nameAgedLockIvR9}.`)),
-    `dir=${JSON.stringify(afterIvR9)}`);
-  check('#215 gate r9 P2 (iv) a fresh (unexpired) lock and the real record both survive the same prune',
-    afterIvR9.includes(nameFreshLockIvR9) && afterIvR9.includes(nameLiveIvR9),
-    `dir=${JSON.stringify(afterIvR9)}`);
-  fs.rmSync(dirIvR9, { recursive: true, force: true });
-
-  // --- end-to-end through real salvage children: (i) and (ii) need a stderr assertion, which the
-  // vm harness cannot make observable ---------------------------------------------------------
-  const modalTriggerR9i = "You're making requests too quickly. [#215 gate r9 (i) trigger]";
-  const pageR9i = `ChatGPT\nAccount limits\n${modalTriggerR9i}\nPlease try again shortly.\n`;
-  const primaryUrlR9 = 'https://chatgpt.com/c/mock-conversation';   // the mock's own primary tab
-
-  // (i) the round-9 interleaving itself: another holder ACQUIRES the fingerprint's lock first and
-  // only creates the record (then releases) after a delay — mid-critical-section, exactly like a
-  // concurrent claimThrottleSeen call between its own existence check and its 'wx' create. The
-  // record must NOT exist yet the instant the lock is taken: that is what makes this fixture
-  // discriminating. Without the lock (pre-fix), the child's existence check runs immediately,
-  // finds nothing (the other holder hasn't written the record yet), and its own 'wx' create wins
-  // the race and charges a SECOND, wrongful cooldown before the other holder ever gets there —
-  // exactly the round-9 finding. With the lock, the contended claim must wait, then OBSERVE the
-  // record the other holder committed — 'already' — never publish a second cooldown for the
-  // identical sighting.
-  const homeIR9 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
-  const recordIR9 = throttleSeenRecordPath(homeIR9, primaryUrlR9, modalTriggerR9i);
-  const lockIR9 = `${recordIR9}.lock`;
-  let firedIR9 = false;
-  const cdpIR9 = await mockCdp(pageR9i, [], {
-    throttleModal: modalTriggerR9i,
+  // (i) the round-9/10 interleaving itself, now against the flock lock: another holder ACQUIRES
+  // the fingerprint's '.lockf' first (spawnSync flock -x on an fd inherited from fs.openSync, the
+  // exact production mechanism) and only creates the record — then releases via fs.closeSync —
+  // after a delay, mid-critical-section, exactly like a concurrent claimThrottleSeen call between
+  // its own admission check and its 'wx' create. A contended claim must wait for the release, then
+  // OBSERVE the record the other holder committed — 'already' — never publish a second cooldown
+  // for the identical sighting.
+  const homeIR10 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const recordIR10 = throttleSeenRecordPath(homeIR10, primaryUrlR10, modalTriggerR10i);
+  const lockIR10 = `${recordIR10}.lockf`;
+  let firedIR10 = false;
+  const cdpIR10 = await mockCdp(pageR10i, [], {
+    throttleModal: modalTriggerR10i,
     onEvaluate: (id, expression) => {
-      if (firedIR9 || !expression.includes('pro-gate:review-text')) return;
-      firedIR9 = true;
-      fs.mkdirSync(throttleSeenDir(homeIR9), { recursive: true });
-      fs.mkdirSync(lockIR9);   // "holder A" acquires the lock; the record does not exist yet
+      if (firedIR10 || !expression.includes('pro-gate:review-text')) return;
+      firedIR10 = true;
+      fs.mkdirSync(throttleSeenDir(homeIR10), { recursive: true });
+      const fdIR10 = fs.openSync(lockIR10, 'a');
+      spawnSync('flock', ['-x', '-w', '0.25', '3'], { stdio: ['ignore', 'ignore', 'pipe', fdIR10] });   // "holder A" acquires
       setTimeout(() => {
         // the record is only created now, mid-critical-section, well within the 250ms wait
         // budget — a racing pre-fix caller that never waited would already be gone by this point
-        try { fs.writeFileSync(recordIR9, '', { flag: 'wx' }); } catch {}   // may already lose the race pre-fix
-        try { fs.rmdirSync(lockIR9); } catch {}   // release, mirroring withThrottleSeenLock's finally
+        try { fs.writeFileSync(recordIR10, '', { flag: 'wx' }); } catch {}   // may already lose the race pre-fix
+        fs.closeSync(fdIR10);   // release: mirrors withThrottleSeenLock's finally
       }, 60);
     },
   });
-  const rIR9 = await runSalvageInHome(homeIR9, [MARKER, '3'], cdpIR9.port);
-  cdpIR9.stop();
-  check('#215 gate r9 P2 (i) a lock contended by another holder is waited out, not raced past (no second exit-5/cooldown)',
-    rIR9.status !== 5 && rIR9.cooldown === null,
-    `status=${rIR9.status} cooldown=${rIR9.cooldown} stderr=${rIR9.stderr?.slice(-400)}`);
-  check('#215 gate r9 P2 (i) the child observes the already-committed record once the lock releases',
-    /already charged/.test(rIR9.stderr || ''), `stderr=${rIR9.stderr?.slice(-400)}`);
-  const recordsAfterIR9 = fs.readdirSync(throttleSeenDir(homeIR9)).filter((n) => !n.endsWith('.lock'));
-  check("#215 gate r9 P2 (i) exactly one record exists afterward — the other holder's, charged exactly once",
-    recordsAfterIR9.length === 1, `records=${JSON.stringify(recordsAfterIR9)}`);
-  fs.rmSync(homeIR9, { recursive: true, force: true });
+  const rIR10 = await runSalvageInHome(homeIR10, [MARKER, '3'], cdpIR10.port);
+  cdpIR10.stop();
+  check('#215 gate r10 P2 (i) a lockf contended by another holder is waited out, not raced past (no second exit-5/cooldown)',
+    rIR10.status !== 5 && rIR10.cooldown === null,
+    `status=${rIR10.status} cooldown=${rIR10.cooldown} stderr=${rIR10.stderr?.slice(-400)}`);
+  check('#215 gate r10 P2 (i) the child observes the already-committed record once the lockf releases',
+    /already charged/.test(rIR10.stderr || ''), `stderr=${rIR10.stderr?.slice(-400)}`);
+  const recordsAfterIR10 = fs.readdirSync(throttleSeenDir(homeIR10)).filter((n) => !n.endsWith('.lockf'));
+  check("#215 gate r10 P2 (i) exactly one record exists afterward — the other holder's, charged exactly once",
+    recordsAfterIR10.length === 1, `records=${JSON.stringify(recordsAfterIR10)}`);
+  fs.rmSync(homeIR10, { recursive: true, force: true });
 
-  // (ii) a lock held past the wait budget (the holder never releases within this test) fails
+  // (ii) a lockf held past the wait budget (the holder never releases within this test) fails
   // open with the documented stderr line and still charges the sighting exactly once.
-  const modalTriggerR9ii = "You're making requests too quickly. [#215 gate r9 (ii) trigger]";
-  const pageR9ii = `ChatGPT\nAccount limits\n${modalTriggerR9ii}\nPlease try again shortly.\n`;
-  const homeIiR9 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
-  const recordIiR9 = throttleSeenRecordPath(homeIiR9, primaryUrlR9, modalTriggerR9ii);
-  const lockIiR9 = `${recordIiR9}.lock`;
-  let firedIiR9 = false;
-  const cdpIiR9 = await mockCdp(pageR9ii, [], {
-    throttleModal: modalTriggerR9ii,
+  const modalTriggerR10ii = "You're making requests too quickly. [#215 gate r10 (ii) trigger]";
+  const pageR10ii = `ChatGPT\nAccount limits\n${modalTriggerR10ii}\nPlease try again shortly.\n`;
+  const homeIiR10 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const recordIiR10 = throttleSeenRecordPath(homeIiR10, primaryUrlR10, modalTriggerR10ii);
+  const lockIiR10 = `${recordIiR10}.lockf`;
+  let firedIiR10 = false;
+  let fdIiR10 = null;
+  const cdpIiR10 = await mockCdp(pageR10ii, [], {
+    throttleModal: modalTriggerR10ii,
     onEvaluate: (id, expression) => {
-      if (firedIiR9 || !expression.includes('pro-gate:review-text')) return;
-      firedIiR9 = true;
-      fs.mkdirSync(throttleSeenDir(homeIiR9), { recursive: true });
-      fs.mkdirSync(lockIiR9);   // held for the rest of this test — never released
+      if (firedIiR10 || !expression.includes('pro-gate:review-text')) return;
+      firedIiR10 = true;
+      fs.mkdirSync(throttleSeenDir(homeIiR10), { recursive: true });
+      fdIiR10 = fs.openSync(lockIiR10, 'a');
+      spawnSync('flock', ['-x', '-w', '0.25', '3'], { stdio: ['ignore', 'ignore', 'pipe', fdIiR10] });   // held for the rest of this test — never released
     },
   });
-  const rIiR9 = await runSalvageInHome(homeIiR9, [MARKER, '3'], cdpIiR9.port);
-  cdpIiR9.stop();
-  const expectedFailOpenMsgR9 = new RegExp('throttle-seen lock contended past 250ms for [0-9a-f]{64}; '
+  const rIiR10 = await runSalvageInHome(homeIiR10, [MARKER, '3'], cdpIiR10.port);
+  cdpIiR10.stop();
+  const expectedFailOpenMsgR10 = new RegExp('throttle-seen lock contended past 250ms for [0-9a-f]{64}; '
     + 'proceeding without it \\(fail-open\\)');
-  check('#215 gate r9 P2 (ii) a lock held past the wait budget fails open and still charges (exit 5 + cooldown)',
-    rIiR9.status === 5 && /^\d{4}-\d{2}-\d{2}T/.test(rIiR9.cooldown ?? ''),
-    `status=${rIiR9.status} cooldown=${rIiR9.cooldown} stderr=${rIiR9.stderr?.slice(-500)}`);
-  check('#215 gate r9 P2 (ii) the fail-open line names the contended fingerprint',
-    expectedFailOpenMsgR9.test(rIiR9.stderr || ''), `stderr=${rIiR9.stderr?.slice(-500)}`);
-  const recordsAfterIiR9 = fs.readdirSync(throttleSeenDir(homeIiR9)).filter((n) => !n.endsWith('.lock'));
-  check('#215 gate r9 P2 (ii) exactly one record exists afterward — charged exactly once, not twice',
-    recordsAfterIiR9.length === 1, `records=${JSON.stringify(recordsAfterIiR9)}`);
-  fs.rmSync(lockIiR9, { recursive: true, force: true });
-  fs.rmSync(homeIiR9, { recursive: true, force: true });
-}
+  check('#215 gate r10 P2 (ii) a lockf held past the wait budget fails open and still charges (exit 5 + cooldown)',
+    rIiR10.status === 5 && /^\d{4}-\d{2}-\d{2}T/.test(rIiR10.cooldown ?? ''),
+    `status=${rIiR10.status} cooldown=${rIiR10.cooldown} stderr=${rIiR10.stderr?.slice(-500)}`);
+  check('#215 gate r10 P2 (ii) the fail-open line names the contended fingerprint',
+    expectedFailOpenMsgR10.test(rIiR10.stderr || ''), `stderr=${rIiR10.stderr?.slice(-500)}`);
+  const recordsAfterIiR10 = fs.readdirSync(throttleSeenDir(homeIiR10)).filter((n) => !n.endsWith('.lockf'));
+  check('#215 gate r10 P2 (ii) exactly one record exists afterward — charged exactly once, not twice',
+    recordsAfterIiR10.length === 1, `records=${JSON.stringify(recordsAfterIiR10)}`);
+  if (fdIiR10 !== null) { try { fs.closeSync(fdIiR10); } catch {} }
+  fs.rmSync(homeIiR10, { recursive: true, force: true });
 
-{ // #215 gate r9 verify (independent-verifier P1, bin/cdp-salvage.mjs withThrottleSeenLock): the
-  // paid-review round-9 P1 finding — reclaim is stat -> rmdirSync -> mkdirSync with no fencing
-  // and no positive check that the current holder is actually dead, so a holder whose critical
-  // section merely runs longer than THROTTLE_SEEN_LOCK_STALE_MS gets its lock silently stolen by
-  // a contender, and both run the SAME fingerprint's protected section at once. This can only be
-  // demonstrated with a genuinely separate OS process holding the lock (a single-threaded vm
-  // evaluation cannot represent "still alive, still running" for a different pid) — two REAL node
-  // children share one THROTTLE_SEEN_DIR: HOLDER acquires immediately and sleeps well past
-  // STALE_MS (5s) inside its critical section; CONTENDER starts once the lock is already older
-  // than STALE_MS but HOLDER has not released. Pre-fix, CONTENDER's mkdirSync-after-rmdirSync
-  // succeeds on its very first attempt (no wait, no stderr line) and its own release then removes
-  // the directory HOLDER still believes it owns — observable as the lock (and HOLDER's original
-  // owner token) vanishing mid-HOLD and CONTENDER never printing the contended/fail-open line.
-  // Post-fix, CONTENDER finds HOLDER's recorded pid alive, declines to reclaim, waits out its
-  // budget, and fails open loudly instead — HOLDER's own lock directory and original owner token
-  // must survive, untouched, for the entire time HOLDER holds it.
-  const driverDirR9v = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-r9-verify-'));
-  const salvageLinesR9v = fs.readFileSync(SALVAGE, 'utf8').split('\n');
-  const sliceTopLevelR9v = (name) => {
-    const start = salvageLinesR9v.findIndex((line) => (
-      line.startsWith(`function ${name}(`) || line.startsWith(`const ${name} = `)
-    ));
-    if (start < 0) return null;
-    if (salvageLinesR9v[start].startsWith('const ') || salvageLinesR9v[start].trimEnd().endsWith('}')) {
-      return salvageLinesR9v[start];
+  // (a) failed-expiry admission (paid-review round 10 [P2] bin/cdp-salvage.mjs:768): an expired
+  // record pruneThrottleSeen could not remove (a readable-but-unwritable seen directory: the
+  // lockf itself is pre-created writable BEFORE the chmod so opening it still succeeds, but the
+  // record's own rename/unlink inside removeThrottleSeenGeneration fails EACCES and the record is
+  // left in place, untouched) must never still read as "already charged" — the sighting must be
+  // charged (exit 5, cooldown written), not silently suppressed with nothing to show for it.
+  if (process.getuid && process.getuid() === 0) {
+    console.log('ok - skipped: running as root');
+  } else {
+    const modalTriggerR10a = "You're making requests too quickly. [#215 gate r10 (a) trigger]";
+    const pageR10a = `ChatGPT\nAccount limits\n${modalTriggerR10a}\nPlease try again shortly.\n`;
+    const homeR10a = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+    seedThrottleSeen(homeR10a, primaryUrlR10, modalTriggerR10a);
+    const recordR10a = throttleSeenRecordPath(homeR10a, primaryUrlR10, modalTriggerR10a);
+    const agedAtR10a = new Date(Date.now() - EIGHT_DAYS_R10);
+    fs.utimesSync(recordR10a, agedAtR10a, agedAtR10a);
+    const seenDirPathR10a = throttleSeenDir(homeR10a);
+    // pre-create the fingerprint's lockf (normal permissions) so fs.openSync on an EXISTING file
+    // still succeeds once the directory itself loses write permission below.
+    fs.writeFileSync(`${recordR10a}.lockf`, '');
+    fs.chmodSync(seenDirPathR10a, 0o555);
+    let rR10a;
+    try {
+      const cdpR10a = await mockCdp(pageR10a, [], { throttleModal: modalTriggerR10a });
+      rR10a = await runSalvageInHome(homeR10a, [MARKER, '3'], cdpR10a.port);
+      cdpR10a.stop();
+    } finally {
+      fs.chmodSync(seenDirPathR10a, 0o755);
     }
-    const end = salvageLinesR9v.findIndex((line, i) => i > start && line === '}');
-    return end < 0 ? null : salvageLinesR9v.slice(start, end + 1).join('\n');
-  };
-  const LOCK_PARTS_R9V = ['THROTTLE_SEEN_LOCK_STALE_MS', 'THROTTLE_SEEN_LOCK_WAIT_MS',
-    'throttleSeenLockOwnerPath', 'throttleSeenLockOwnerAlive', 'withThrottleSeenLock'];
-  const extractedLockSrcR9v = LOCK_PARTS_R9V.map(sliceTopLevelR9v).filter((p) => p !== null).join('\n\n');
-  check('#215 gate r9 verify setup: every named lock part was found in bin/cdp-salvage.mjs (no silent no-op slice)',
-    LOCK_PARTS_R9V.every((name) => sliceTopLevelR9v(name) !== null),
-    `missing=${JSON.stringify(LOCK_PARTS_R9V.filter((name) => sliceTopLevelR9v(name) === null))}`);
-  const driverPathR9v = path.join(driverDirR9v, 'lock-driver.mjs');
-  const driverSrcR9v = [
+    check('#215 gate r10 P2 (a) an expired record pruning could not remove is charged, not suppressed (exit 5 + cooldown)',
+      rR10a.status === 5 && /^\d{4}-\d{2}-\d{2}T/.test(rR10a.cooldown ?? ''),
+      `status=${rR10a.status} cooldown=${rR10a.cooldown} stderr=${rR10a.stderr?.slice(-400)}`);
+    check('#215 gate r10 P2 (a) stderr never claims the sighting was already charged',
+      !/already charged/.test(rR10a.stderr || ''), `stderr=${rR10a.stderr?.slice(-400)}`);
+    fs.rmSync(homeR10a, { recursive: true, force: true });
+
+    // planted negative: the SAME aged record in a WRITABLE dir is unlinked and re-created — the
+    // expiry re-arms it (charged once), and the FRESH record it writes then suppresses the very
+    // next sighting, proving the age check (not the chmod) is what made the positive above charge.
+    const modalTriggerR10aNeg = "You're making requests too quickly. [#215 gate r10 (a) negative]";
+    const pageR10aNeg = `ChatGPT\nAccount limits\n${modalTriggerR10aNeg}\nPlease try again shortly.\n`;
+    const homeR10aNeg = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+    seedThrottleSeen(homeR10aNeg, primaryUrlR10, modalTriggerR10aNeg);
+    fs.utimesSync(throttleSeenRecordPath(homeR10aNeg, primaryUrlR10, modalTriggerR10aNeg), agedAtR10a, agedAtR10a);
+    const cdpR10aNeg1 = await mockCdp(pageR10aNeg, [], { throttleModal: modalTriggerR10aNeg });
+    const rR10aNeg1 = await runSalvageInHome(homeR10aNeg, [MARKER, '3'], cdpR10aNeg1.port);
+    cdpR10aNeg1.stop();
+    check('#215 gate r10 P2 (a) planted negative: the same aged record in a writable dir is charged once (exit 5 + cooldown)',
+      rR10aNeg1.status === 5 && /^\d{4}-\d{2}-\d{2}T/.test(rR10aNeg1.cooldown ?? ''),
+      `status=${rR10aNeg1.status} cooldown=${rR10aNeg1.cooldown}`);
+    const cdpR10aNeg2 = await mockCdp(pageR10aNeg, [], { throttleModal: modalTriggerR10aNeg });
+    const rR10aNeg2 = await runSalvageInHome(homeR10aNeg, [MARKER, '3'], cdpR10aNeg2.port);
+    cdpR10aNeg2.stop();
+    check('#215 gate r10 P2 (a) planted negative: the fresh record suppresses the next sighting (already charged, no second cooldown)',
+      rR10aNeg2.status !== 5 && rR10aNeg2.cooldown === rR10aNeg1.cooldown && /already charged/.test(rR10aNeg2.stderr || ''),
+      `status=${rR10aNeg2.status} cooldownBefore=${rR10aNeg1.cooldown} cooldownAfter=${rR10aNeg2.cooldown} stderr=${rR10aNeg2.stderr?.slice(-400)}`);
+    fs.rmSync(homeR10aNeg, { recursive: true, force: true });
+  }
+
+  // (b) lock files are never counted toward capacity and never deleted by the prune: seed 3
+  // '.lockf' files alongside 2 real records with PRO_GATE_THROTTLE_SEEN_MAX=1 — exactly one
+  // record is trimmed, and all three seeded lock files remain untouched. (The trim itself takes
+  // the trimmed record's OWN fingerprint lock to remove it, which — like any other claim —
+  // creates THAT fingerprint's own lockf if it did not already have one; that is expected and
+  // does not disturb the three unrelated ones seeded here.)
+  const dirR10b = seenDirR10();
+  const lockNamesR10b = ['b lock one', 'b lock two', 'b lock three'].map((label) => `${keyR10(label)}.lockf`);
+  lockNamesR10b.forEach((name) => fs.writeFileSync(path.join(dirR10b, name), ''));
+  const nameOldR10b = keyR10('b oldest');
+  const nameNewR10b = keyR10('b newest');
+  const pathOldR10b = path.join(dirR10b, nameOldR10b);
+  const pathNewR10b = path.join(dirR10b, nameNewR10b);
+  fs.writeFileSync(pathOldR10b, '', { flag: 'wx' });
+  fs.utimesSync(pathOldR10b, new Date(Date.now() - 600_000), new Date(Date.now() - 600_000));
+  fs.writeFileSync(pathNewR10b, '', { flag: 'wx' });
+  fs.utimesSync(pathNewR10b, new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
+  buildClaimR10(dirR10b, { max: 1 }).prune?.(new Set());
+  const afterR10b = fs.readdirSync(dirR10b);
+  check('#215 gate r10 P2 (b) the capacity trim cuts the oldest unprotected record down to the cap',
+    !afterR10b.includes(nameOldR10b) && afterR10b.includes(nameNewR10b),
+    `dir=${JSON.stringify(afterR10b)}`);
+  check('#215 gate r10 P2 (b) all three seeded lock files survive the trim untouched, and are never counted toward capacity',
+    lockNamesR10b.every((name) => afterR10b.includes(name)),
+    `dir=${JSON.stringify(afterR10b)}`);
+  fs.rmSync(dirR10b, { recursive: true, force: true });
+
+  // (c) a crashed holder releases the lock — the property a pathname mutex could never provide
+  // (round 9's mkdir lock needed THROTTLE_SEEN_LOCK_STALE_MS plus a liveness-checked owner token,
+  // and even then two reclaimers could race the same dead lock; see the deleted (iii)/(iii-b)/(iv)
+  // checks and the '#215 gate r9 verify' process pair this test replaces). A holder process is
+  // SIGKILLed mid-hold via the production withThrottleSeenLock itself (sliced verbatim into a
+  // driver script, not reimplemented); the very next claim on the SAME fingerprint, made through
+  // the SAME production function, must proceed near-instantly — no 250ms wait.
+  const dirR10c = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-r10-crash-'));
+  const nameR10c = createHash('sha256').update('#215 gate r10 (c) fingerprint').digest('hex');
+  const readyPathR10c = path.join(dirR10c, 'ready');
+  const LOCK_PARTS_R10C = ['THROTTLE_SEEN_LOCK_WAIT_MS', 'THROTTLE_SEEN_LOCK_WAIT_SECS', 'withThrottleSeenLock'];
+  // Same cross-version reason as CLAIM_COMPAT_PARTS_R10 above: kept out of the "no silent no-op"
+  // gate below (that gate deliberately still fails against pre-r10 source, which lacks
+  // THROTTLE_SEEN_LOCK_WAIT_SECS entirely) but included in the driver script's own source so the
+  // OLD withThrottleSeenLock body, if that is what gets sliced in, has every name IT needs too.
+  const LOCK_COMPAT_PARTS_R10C = ['throttleSeenIsLock', 'THROTTLE_SEEN_LOCK_STALE_MS',
+    'throttleSeenLockOwnerPath', 'throttleSeenLockOwnerAlive'];
+  const extractedLockSrcR10c = [...LOCK_PARTS_R10C, ...LOCK_COMPAT_PARTS_R10C]
+    .map(sliceTopLevelR10).filter((p) => p !== null).join('\n\n');
+  check('#215 gate r10 P2 (c) setup: every named lock part was found in bin/cdp-salvage.mjs (no silent no-op slice)',
+    LOCK_PARTS_R10C.every((name) => sliceTopLevelR10(name) !== null),
+    `missing=${JSON.stringify(LOCK_PARTS_R10C.filter((name) => sliceTopLevelR10(name) === null))}`);
+  const holderSrcR10c = [
     "import fs from 'node:fs';",
     "import path from 'node:path';",
-    "import { execSync } from 'node:child_process';",
-    'const THROTTLE_SEEN_DIR = process.env.R9V_LOCK_DIR;',
-    extractedLockSrcR9v,
-    'const NAME = process.env.R9V_FP_NAME;',
-    "const HOLD_MS = Number(process.env.R9V_HOLD_MS || '0');",
-    'const LOG = process.env.R9V_ACTIVITY_LOG;',
-    'function logLine(s) { fs.appendFileSync(LOG, `${s}\\n`); }',
-    'withThrottleSeenLock(NAME, () => {',
-    '  logLine(`ENTER ${process.pid} ${Date.now()}`);',
-    '  if (HOLD_MS > 0) execSync(`sleep ${(HOLD_MS / 1000).toFixed(3)}`);',
-    '  logLine(`EXIT ${process.pid} ${Date.now()}`);',
+    "import { spawnSync, execSync } from 'node:child_process';",
+    `const THROTTLE_SEEN_DIR = ${JSON.stringify(dirR10c)};`,
+    extractedLockSrcR10c,
+    `withThrottleSeenLock(${JSON.stringify(nameR10c)}, () => {`,
+    `  fs.writeFileSync(${JSON.stringify(readyPathR10c)}, 'ready');`,
+    "  execSync('sleep 30');",   // held inside the lock until SIGKILLed
     '});',
   ].join('\n');
-  fs.writeFileSync(driverPathR9v, driverSrcR9v);
-  const lockDirR9v = path.join(driverDirR9v, 'seen');
-  const activityLogR9v = path.join(driverDirR9v, 'activity.log');
-  fs.writeFileSync(activityLogR9v, '');
-  const fpNameR9v = createHash('sha256').update('#215 gate r9 verify fingerprint').digest('hex');
-  const spawnDriverR9v = (holdMs) => new Promise((resolve) => {
-    const child = spawn(process.execPath, [driverPathR9v], {
-      env: {
-        ...process.env,
-        R9V_LOCK_DIR: lockDirR9v,
-        R9V_FP_NAME: fpNameR9v,
-        R9V_HOLD_MS: String(holdMs),
-        R9V_ACTIVITY_LOG: activityLogR9v,
-      },
-    });
-    let stderr = '';
-    child.stderr.on('data', (d) => { stderr += d; });
-    child.on('close', () => resolve({ stderr }));
-  });
-  const sleepR9v = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
-  const waitForFileR9v = async (filePath, timeoutMs) => {
+  const holderPathR10c = path.join(dirR10c, 'holder.mjs');
+  fs.writeFileSync(holderPathR10c, holderSrcR10c);
+  const holderR10c = spawn(process.execPath, [holderPathR10c]);
+  const sleepR10c = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+  const waitForFileR10c = async (filePath, timeoutMs) => {
     const deadline = Date.now() + timeoutMs;
-    while (!fs.existsSync(filePath) && Date.now() < deadline) { await sleepR9v(20); }
+    while (!fs.existsSync(filePath) && Date.now() < deadline) { await sleepR10c(20); }
     return fs.existsSync(filePath);
   };
+  const holderReadyR10c = await waitForFileR10c(readyPathR10c, 3_000);
+  check('#215 gate r10 P2 (c) setup: the holder process acquired the flock and is holding it',
+    holderReadyR10c, `ready=${holderReadyR10c}`);
+  holderR10c.kill('SIGKILL');
+  await new Promise((resolve) => { holderR10c.on('close', resolve); });
+  const harnessR10c = buildClaimR10(dirR10c);
+  const startR10c = Date.now();
+  harnessR10c.withLock?.(nameR10c, () => {});
+  const elapsedR10c = Date.now() - startR10c;
+  check('#215 gate r10 P2 (c) the very next claim on the same fingerprint proceeds near-instantly after a SIGKILL, not after the 250ms wait budget',
+    holderReadyR10c && elapsedR10c < 100, `elapsedMs=${elapsedR10c}`);
+  fs.rmSync(dirR10c, { recursive: true, force: true });
 
-  const HOLD_MS_R9V = 7_000;   // comfortably past THROTTLE_SEEN_LOCK_STALE_MS (5s)
-  const holderPromiseR9v = spawnDriverR9v(HOLD_MS_R9V);
-  const lockPathR9v = `${path.join(lockDirR9v, fpNameR9v)}.lock`;
-  const ownerPathR9v = path.join(lockPathR9v, 'owner');
-  // Poll (not a fixed sleep) for HOLDER to actually acquire and write its owner token — robust
-  // to slow process/ESM startup on a loaded machine.
-  const holderReadyR9v = await waitForFileR9v(ownerPathR9v, 3_000);
-  check('#215 gate r9 verify setup: HOLDER acquired the lock and wrote its owner token',
-    holderReadyR9v, `ready=${holderReadyR9v}`);
-  // Guarded: a broken/missing lock implementation (e.g. the pre-fix tree, where none of
-  // LOCK_PARTS_R9V resolve and HOLDER's driver throws before ever writing this file) must FAIL
-  // this and every later check cleanly, not crash the whole suite on an unguarded read.
-  const holderTokenR9v = holderReadyR9v ? fs.readFileSync(ownerPathR9v, 'utf8') : null;
-  // CONTENDER starts once the lock is already older than THROTTLE_SEEN_LOCK_STALE_MS (5s) but
-  // well before HOLDER's own hold ends, leaving margin on both sides.
-  await sleepR9v(5_300);
-  const contenderResultR9v = await spawnDriverR9v(0);
-  // Read HOLDER's lock state BEFORE HOLDER itself releases: a stolen-and-already-released lock
-  // would be gone or hold a DIFFERENT token by now.
-  const survivedR9v = fs.existsSync(ownerPathR9v);
-  const survivingTokenR9v = survivedR9v ? fs.readFileSync(ownerPathR9v, 'utf8') : null;
-  await holderPromiseR9v;   // let HOLDER finish and release cleanly before the next test/cleanup
-
-  check("#215 gate r9 verify: HOLDER's lock directory is not destroyed while HOLDER still holds it",
-    survivedR9v, `exists=${survivedR9v}`);
-  check("#215 gate r9 verify: HOLDER's original owner token is unchanged — CONTENDER never reclaimed it",
-    holderReadyR9v && survivingTokenR9v !== null && survivingTokenR9v === holderTokenR9v,
-    `holder=${holderTokenR9v} surviving=${survivingTokenR9v}`);
-  check('#215 gate r9 verify: CONTENDER printed the contended/fail-open line instead of silently reclaiming',
-    new RegExp(`throttle-seen lock contended past 250ms for ${fpNameR9v}; proceeding without it \\(fail-open\\)`)
-      .test(contenderResultR9v.stderr),
-    `stderr=${contenderResultR9v.stderr}`);
-  const activityR9v = fs.readFileSync(activityLogR9v, 'utf8').trim().split('\n').filter(Boolean);
-  check('#215 gate r9 verify: activity log recorded both ENTER/EXIT pairs (both drivers actually ran)',
-    activityR9v.length === 4, `log=${JSON.stringify(activityR9v)}`);
-
-  // Planted negative: with no contention at all, a fresh lock acquires cleanly, writes an owner
-  // token, and releases cleanly on its own — the ownership fencing must not turn the ordinary
-  // uncontended path into a false failure.
-  const uncontendedResultR9v = await spawnDriverR9v(0);
-  check('#215 gate r9 verify planted negative: an uncontended acquire prints no contention line',
-    !/contended/.test(uncontendedResultR9v.stderr), `stderr=${uncontendedResultR9v.stderr}`);
-  check('#215 gate r9 verify planted negative: the lock directory is cleaned up after an uncontended release',
-    !fs.existsSync(lockPathR9v), `exists=${fs.existsSync(lockPathR9v)}`);
-
-  fs.rmSync(driverDirR9v, { recursive: true, force: true });
+  // (d) a missing flock binary fails open (paid-review round 10's own documented compatibility
+  // case — e.g. macOS has no `flock`): a claim proceeds and still charges rather than blocking, and
+  // the one-line note prints ONCE per process even though this run makes TWO separate
+  // withThrottleSeenLock calls (pruneThrottleSeen's removal of an unrelated expired record, then
+  // claimThrottleSeen's own admission) — a missing binary is a fixed fact about the host, not
+  // about one fingerprint, so it must not repeat on every lock attempt.
+  const modalTriggerR10d = "You're making requests too quickly. [#215 gate r10 (d) trigger]";
+  const pageR10d = `ChatGPT\nAccount limits\n${modalTriggerR10d}\nPlease try again shortly.\n`;
+  const homeR10d = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const unrelatedUrlR10d = 'https://chatgpt.com/c/mock-r10d-unrelated';
+  const unrelatedTextR10d = 'an old sighting from a tab nobody replaced [#215 gate r10 (d)]';
+  seedThrottleSeen(homeR10d, unrelatedUrlR10d, unrelatedTextR10d);
+  const agedAtR10d = new Date(Date.now() - EIGHT_DAYS_R10);
+  fs.utimesSync(throttleSeenRecordPath(homeR10d, unrelatedUrlR10d, unrelatedTextR10d), agedAtR10d, agedAtR10d);
+  const emptyPathDirR10d = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-r10-empty-path-'));
+  const cdpR10d = await mockCdp(pageR10d, [], { throttleModal: modalTriggerR10d });
+  const rR10d = await runSalvageInHome(homeR10d, [MARKER, '3'], cdpR10d.port, { PATH: emptyPathDirR10d });
+  cdpR10d.stop();
+  check('#215 gate r10 P2 (d) a missing flock binary fails open and still charges once (exit 5 + cooldown)',
+    rR10d.status === 5 && /^\d{4}-\d{2}-\d{2}T/.test(rR10d.cooldown ?? ''),
+    `status=${rR10d.status} cooldown=${rR10d.cooldown} stderr=${rR10d.stderr?.slice(-400)}`);
+  const missingLinesR10d = (rR10d.stderr || '').split('\n').filter((l) => l.includes('flock binary unavailable'));
+  check('#215 gate r10 P2 (d) the missing-binary note prints exactly once despite two lock attempts (prune + admission)',
+    missingLinesR10d.length === 1, `lines=${JSON.stringify(missingLinesR10d)} stderr=${rR10d.stderr?.slice(-600)}`);
+  fs.rmSync(homeR10d, { recursive: true, force: true });
+  fs.rmSync(emptyPathDirR10d, { recursive: true, force: true });
 }
 
 process.exit(failures === 0 ? 0 : 1);
