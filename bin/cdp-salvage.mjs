@@ -783,7 +783,14 @@ function claimThrottleSeen(url, hash, protectedKeys) {
     let expiredUnlinkFailed = false;
     if (stat) {
       if (Date.now() - stat.mtimeMs <= THROTTLE_SEEN_TTL_MS) return 'already';
-      try { fs.unlinkSync(recordPath); } catch { expiredUnlinkFailed = true; }
+      // #215 gate r12 P2 (paid-review round 12 [P2] bin/cdp-salvage.mjs:786): ENOENT here is NOT a
+      // failed expiry — it means another writer already removed the expired record (the fail-open
+      // window: this record crossed its TTL between the one-time prune and this claim's lock wait,
+      // and a concurrent claim expired it first). Counting it as a failed unlink let this caller
+      // override a lost 'wx' create below and publish a duplicate cooldown for a sighting the other
+      // writer had just charged. Only a record that is still THERE after a failed unlink (EACCES,
+      // EPERM, EROFS, ...) is the fail-open case decision 2 describes.
+      try { fs.unlinkSync(recordPath); } catch (err) { if (err?.code !== 'ENOENT') expiredUnlinkFailed = true; }
     }
     if (recordThrottleSeen(url, hash)) return 'charged';
     return expiredUnlinkFailed ? 'charged' : 'already';

@@ -5936,4 +5936,136 @@ for (const placeholder of PLACEHOLDER_URLS) {
     'source text');
 }
 
+// #215 gate r12 P2 (paid-review round 12 [P2] bin/cdp-salvage.mjs:786): on the fail-open path a
+// record can cross its TTL between the one-time prune and admission; if another writer expires
+// it first (our unlink gets ENOENT) and creates its replacement before our 'wx' create, the
+// ENOENT was counted as a FAILED expiry, so the lost create was overridden to 'charged' and the
+// sighting's cooldown was published twice. Same vm-sliced harness and the same deterministic
+// injection style as the r10 verify block: the proxy lets our unlink really remove the record,
+// throws ENOENT as though the other writer got there first, and — in a finally, so the throw
+// still propagates — plants that writer's replacement before control returns to our create.
+{
+  const salvageLinesR12 = fs.readFileSync(SALVAGE, 'utf8').split('\n');
+  const sliceTopLevelR12 = (name) => {
+    const start = salvageLinesR12.findIndex((line) => (
+      line.startsWith(`function ${name}(`) || line.startsWith(`const ${name} = `)
+    ));
+    if (start < 0) return null;
+    if (salvageLinesR12[start].startsWith('const ') || salvageLinesR12[start].trimEnd().endsWith('}')) {
+      return salvageLinesR12[start];
+    }
+    const end = salvageLinesR12.findIndex((line, i) => i > start && line === '}');
+    return end < 0 ? null : salvageLinesR12.slice(start, end + 1).join('\n');
+  };
+  const CLAIM_PARTS_R12 = ['THROTTLE_SEEN_EXPIRE_MARK', 'throttleSeenIsTemp', 'throttleSeenIsLockFile',
+    'THROTTLE_SEEN_LOCK_SLOTS', 'throttleSeenLockSlot',
+    'THROTTLE_SEEN_LOCK_WAIT_MS', 'THROTTLE_SEEN_LOCK_WAIT_SECS', 'withThrottleSeenLock',
+    'removeThrottleSeenGeneration', 'pruneThrottleSeen', 'throttleSeenKey', 'throttleSeenRecordPath',
+    'recordThrottleSeen', 'claimThrottleSeen'];
+  check('#215 gate r12 P2 setup: every named part was found in bin/cdp-salvage.mjs (no silent no-op slice)',
+    CLAIM_PARTS_R12.every((name) => sliceTopLevelR12(name) !== null),
+    `missing=${JSON.stringify(CLAIM_PARTS_R12.filter((name) => sliceTopLevelR12(name) === null))}`);
+  // throttleSeenPruned is injected TRUE: the one-time prune already ran this invocation, which is
+  // exactly how a record comes to cross its TTL between that prune and this claim.
+  const buildClaimR12 = (dir, fsImpl) => {
+    const source = CLAIM_PARTS_R12.map(sliceTopLevelR12).filter((part) => part !== null).join('\n');
+    const expose = '({ claim: typeof claimThrottleSeen === "function" ? claimThrottleSeen : null })';
+    return runInNewContext(`${source}\n${expose}`, {
+      fs: fsImpl, path, process, createHash, spawnSync,
+      console: { error: () => {} },
+      THROTTLE_SEEN_DIR: dir, THROTTLE_SEEN_TTL_MS: 7 * 24 * 60 * 60 * 1000, THROTTLE_SEEN_MAX: 512,
+      pendingThrottleSeenRecords: [], throttleSeenPruned: true,
+    });
+  };
+  const seenDirR12 = () => fs.mkdtempSync(path.join(os.tmpdir(), 'pg-r12-enoent-'));
+  const recordPathR12 = (dir, url, hash) => path.join(
+    dir, createHash('sha256').update(`${url}\n${hash}`).digest('hex'),
+  );
+  const EIGHT_DAYS_R12 = 8 * 24 * 60 * 60 * 1000;
+  const seedExpiredR12 = (target) => {
+    fs.writeFileSync(target, '', { flag: 'wx' });
+    const aged = new Date(Date.now() - EIGHT_DAYS_R12);
+    fs.utimesSync(target, aged, aged);
+  };
+  // Fires once, on the FIRST unlinkSync for `target` (claimThrottleSeen's own expiry unlink):
+  // the record really goes, the caller sees ENOENT (the other writer expired it first), and the
+  // other writer's fresh replacement is planted before control returns to our 'wx' create.
+  const enoentThenRacerR12 = (target) => {
+    let fired = false;
+    const proxy = Object.create(fs);
+    proxy.unlinkSync = (p, ...rest) => {
+      if (fired || p !== target) return fs.unlinkSync(p, ...rest);
+      fired = true;
+      fs.unlinkSync(p);
+      try {
+        const err = new Error(`ENOENT: no such file or directory, unlink '${p}'`);
+        err.code = 'ENOENT';
+        throw err;
+      } finally {
+        fs.writeFileSync(target, '', { flag: 'wx' });   // the racer's replacement, fresh mtime
+      }
+    };
+    return proxy;
+  };
+  // Fires once, on the FIRST unlinkSync for `target`: the record stays in place and the caller
+  // sees EACCES — a genuine deletion failure, decision 2's fail-open case, which must still charge.
+  const eaccesLeavesRecordR12 = (target) => {
+    let fired = false;
+    const proxy = Object.create(fs);
+    proxy.unlinkSync = (p, ...rest) => {
+      if (fired || p !== target) return fs.unlinkSync(p, ...rest);
+      fired = true;
+      const err = new Error(`EACCES: permission denied, unlink '${p}'`);
+      err.code = 'EACCES';
+      throw err;
+    };
+    return proxy;
+  };
+
+  // Positive: the other writer wins — our create loses with EEXIST, and since our own unlink
+  // removed nothing, that EEXIST is the other writer's charge, never ours: 'already'.
+  const dirRaceR12 = seenDirR12();
+  const urlRaceR12 = 'https://chatgpt.com/c/mock-r12-enoent-race';
+  const hashRaceR12 = createHash('sha256').update('#215 gate r12 race text').digest('hex');
+  const targetRaceR12 = recordPathR12(dirRaceR12, urlRaceR12, hashRaceR12);
+  seedExpiredR12(targetRaceR12);
+  const resultRaceR12 = buildClaimR12(dirRaceR12, enoentThenRacerR12(targetRaceR12))
+    .claim?.(urlRaceR12, hashRaceR12, new Set());
+  check("#215 gate r12 P2: an ENOENT on the expiry unlink followed by a lost 'wx' create reports 'already', never 'charged'",
+    resultRaceR12 === 'already', `result=${resultRaceR12}`);
+  const afterRaceR12 = fs.readdirSync(dirRaceR12).filter((n) => !n.endsWith('.lockf'));
+  check("#215 gate r12 P2: exactly one record exists afterward — the other writer's fresh replacement, untouched",
+    afterRaceR12.length === 1 && Date.now() - fs.statSync(targetRaceR12).mtimeMs < 60_000,
+    `records=${JSON.stringify(afterRaceR12)} ageMs=${Date.now() - fs.statSync(targetRaceR12).mtimeMs}`);
+  fs.rmSync(dirRaceR12, { recursive: true, force: true });
+
+  // Planted negative 1: a genuine deletion failure (EACCES, record still there) keeps decision 2's
+  // fail-open: the create loses to the stale file we could not remove, and the sighting is still
+  // charged — the fix narrows the override to ENOENT, it does not remove it.
+  const dirEaccesR12 = seenDirR12();
+  const urlEaccesR12 = 'https://chatgpt.com/c/mock-r12-eacces';
+  const hashEaccesR12 = createHash('sha256').update('#215 gate r12 eacces text').digest('hex');
+  const targetEaccesR12 = recordPathR12(dirEaccesR12, urlEaccesR12, hashEaccesR12);
+  seedExpiredR12(targetEaccesR12);
+  const resultEaccesR12 = buildClaimR12(dirEaccesR12, eaccesLeavesRecordR12(targetEaccesR12))
+    .claim?.(urlEaccesR12, hashEaccesR12, new Set());
+  check("#215 gate r12 P2 planted negative: an expired record a real unlink failure leaves in place is still charged (fail-open kept)",
+    resultEaccesR12 === 'charged', `result=${resultEaccesR12}`);
+  fs.rmSync(dirEaccesR12, { recursive: true, force: true });
+
+  // Planted negative 2: an ordinary expiry with no racer — our unlink succeeds and our create wins:
+  // 'charged', exactly as before the fix.
+  const dirPlainR12 = seenDirR12();
+  const urlPlainR12 = 'https://chatgpt.com/c/mock-r12-plain';
+  const hashPlainR12 = createHash('sha256').update('#215 gate r12 plain text').digest('hex');
+  const targetPlainR12 = recordPathR12(dirPlainR12, urlPlainR12, hashPlainR12);
+  seedExpiredR12(targetPlainR12);
+  const resultPlainR12 = buildClaimR12(dirPlainR12, fs).claim?.(urlPlainR12, hashPlainR12, new Set());
+  check("#215 gate r12 P2 planted negative: an uncontested expiry still re-arms the sighting ('charged') and leaves one fresh record",
+    resultPlainR12 === 'charged' && fs.readdirSync(dirPlainR12).filter((n) => !n.endsWith('.lockf')).length === 1
+      && Date.now() - fs.statSync(targetPlainR12).mtimeMs < 60_000,
+    `result=${resultPlainR12} entries=${JSON.stringify(fs.readdirSync(dirPlainR12))}`);
+  fs.rmSync(dirPlainR12, { recursive: true, force: true });
+}
+
 process.exit(failures === 0 ? 0 : 1);
