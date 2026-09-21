@@ -309,7 +309,11 @@ When ChatGPT's "Too many requests" modal covers the conversation, the probe repo
 `throttled` rather than generating: the reservation keeps its miss count, the account cooldown
 engages, reservation probes pause until it clears, and `--harvest` defers with exit 8 instead of
 waiting out its window. A typed query during that cooldown returns `stop-without-new-review` /
-`account-cooldown-active` with the seconds remaining in `facts.cooldown`.
+`account-cooldown-active` with the seconds remaining in `facts.cooldown`. A modal that is not
+this run's own is charged once per conversation-and-text fingerprint per seven days
+(`PRO_GATE_THROTTLE_SEEN_TTL`, records under `throttle.cooldown.seen.d/`), so a stale notice
+left on an abandoned tab cannot re-arm the cooldown on every attempt; a modal over the run's
+own conversation always re-arms it.
 Missing or malformed binding/GitHub proof leaves the review generating. Its plain states
 are **Review ready**, **Checking for completed review**, **Still working**, **Review superseded**,
 **No review remains**, and **Browser needs attention**. `Review superseded` means old-head or closed-PR
