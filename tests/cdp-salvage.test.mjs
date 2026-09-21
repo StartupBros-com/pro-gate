@@ -5689,4 +5689,100 @@ for (const placeholder of PLACEHOLDER_URLS) {
   fs.rmSync(emptyPathDirR10d, { recursive: true, force: true });
 }
 
+{ // #215 gate r10 verify (independent-verifier P2, post-2d37d35): claimThrottleSeen discarded
+  // recordThrottleSeen's wx-create outcome and unconditionally returned 'charged'. Two callers
+  // racing the SAME brand-new fingerprint while the per-fingerprint flock is fail-open (a missing
+  // flock binary, or genuine contention past the 250ms wait budget) both pass claimThrottleSeen's
+  // null-stat check, both call recordThrottleSeen — only one 'wx' create actually wins, the other
+  // throws EEXIST and is silently swallowed by the try/catch — but the return value was discarded,
+  // so BOTH calls returned 'charged': each caller believes it alone owns the sighting and both
+  // write/publish a cooldown, the exact double-charge this lock architecture exists to prevent.
+  // be2271f (before round 10) got this right — `return recordThrottleSeen(url, hash) ? 'charged' :
+  // 'already';` — and three in-file comments (recordThrottleSeen's own docstring, and twice in
+  // claimThrottleSeen/tripThrottleUnowned) still describe the 'wx' flag as the "sole race arbiter"
+  // / "belt-and-suspenders arbiter" even though 2d37d35's rewrite stopped consulting it.
+  // Reproduced deterministically (no real multi-process race needed, and without disturbing round
+  // 10's own age-aware-admission fail-open path — see the planted negative below) by injecting the
+  // TOCTOU window directly: an fsImpl.statSync proxy lets claimThrottleSeen's own existence check
+  // run for real (a legitimate ENOENT — nothing on disk yet), then, standing in for a concurrent
+  // racer's recordThrottleSeen winning the SAME instant, creates the record via the identical 'wx'
+  // flag production uses. claimThrottleSeen then proceeds to ITS OWN recordThrottleSeen call, whose
+  // 'wx' create must now lose (EEXIST): correct code reports 'already', the bug reports 'charged'.
+  const salvageLinesR10V = fs.readFileSync(SALVAGE, 'utf8').split('\n');
+  const sliceTopLevelR10V = (name) => {
+    const start = salvageLinesR10V.findIndex((line) => (
+      line.startsWith(`function ${name}(`) || line.startsWith(`const ${name} = `)
+    ));
+    if (start < 0) return null;
+    if (salvageLinesR10V[start].startsWith('const ') || salvageLinesR10V[start].trimEnd().endsWith('}')) {
+      return salvageLinesR10V[start];
+    }
+    const end = salvageLinesR10V.findIndex((line, i) => i > start && line === '}');
+    return end < 0 ? null : salvageLinesR10V.slice(start, end + 1).join('\n');
+  };
+  const CLAIM_PARTS_R10V = ['THROTTLE_SEEN_EXPIRE_MARK', 'throttleSeenIsTemp', 'throttleSeenIsLockFile',
+    'THROTTLE_SEEN_LOCK_WAIT_MS', 'THROTTLE_SEEN_LOCK_WAIT_SECS', 'withThrottleSeenLock',
+    'removeThrottleSeenGeneration', 'pruneThrottleSeen', 'throttleSeenKey', 'throttleSeenRecordPath',
+    'recordThrottleSeen', 'claimThrottleSeen'];
+  check('#215 gate r10 verify setup: every named claim/lock part was found in bin/cdp-salvage.mjs (no silent no-op slice)',
+    CLAIM_PARTS_R10V.every((name) => sliceTopLevelR10V(name) !== null),
+    `missing=${JSON.stringify(CLAIM_PARTS_R10V.filter((name) => sliceTopLevelR10V(name) === null))}`);
+  const buildClaimR10V = (dir, fsImpl) => {
+    const source = CLAIM_PARTS_R10V.map(sliceTopLevelR10V).filter((part) => part !== null).join('\n');
+    const expose = '({ claim: typeof claimThrottleSeen === "function" ? claimThrottleSeen : null })';
+    return runInNewContext(`${source}\n${expose}`, {
+      fs: fsImpl, path, process, createHash, spawnSync,
+      THROTTLE_SEEN_DIR: dir, THROTTLE_SEEN_TTL_MS: 7 * 24 * 60 * 60 * 1000, THROTTLE_SEEN_MAX: 512,
+      pendingThrottleSeenRecords: [], throttleSeenPruned: false,
+    });
+  };
+  // Fires once, on the FIRST statSync for `target` (claimThrottleSeen's own admission check):
+  // lets the real, legitimate ENOENT happen, then — in a finally, so the throw still propagates —
+  // creates the record on real disk via the same 'wx' flag production uses, simulating a racer's
+  // recordThrottleSeen winning the identical fingerprint in that exact instant.
+  const raceOnFirstStatR10V = (target) => {
+    let fired = false;
+    const proxy = Object.create(fs);
+    proxy.statSync = (p, ...rest) => {
+      if (fired || p !== target) return fs.statSync(p, ...rest);
+      fired = true;
+      try {
+        return fs.statSync(p, ...rest);
+      } finally {
+        try { fs.writeFileSync(target, '', { flag: 'wx' }); } catch {}
+      }
+    };
+    return proxy;
+  };
+  const seenDirR10V = () => fs.mkdtempSync(path.join(os.tmpdir(), 'pg-r10-verify-'));
+  const recordPathR10V = (dir, url, hash) => path.join(
+    dir, createHash('sha256').update(`${url}\n${hash}`).digest('hex'),
+  );
+
+  // Positive: the race fires — claimThrottleSeen's own 'wx' create must lose, so it must report
+  // 'already', never 'charged'.
+  const dirRaceV = seenDirR10V();
+  const urlRaceV = 'https://chatgpt.com/c/mock-r10-verify-race';
+  const hashRaceV = createHash('sha256').update('#215 gate r10 verify race text').digest('hex');
+  const targetRaceV = recordPathR10V(dirRaceV, urlRaceV, hashRaceV);
+  const resultRaceV = buildClaimR10V(dirRaceV, raceOnFirstStatR10V(targetRaceV))
+    .claim?.(urlRaceV, hashRaceV, new Set());
+  check("#215 gate r10 verify: a racer's already-won 'wx' create is honored — claimThrottleSeen reports 'already', not 'charged'",
+    resultRaceV === 'already', `result=${resultRaceV}`);
+  check('#215 gate r10 verify: exactly one record exists afterward (the racer\'s own, untouched)',
+    fs.readdirSync(dirRaceV).filter((n) => !n.endsWith('.lockf')).length === 1,
+    `dir=${JSON.stringify(fs.readdirSync(dirRaceV))}`);
+  fs.rmSync(dirRaceV, { recursive: true, force: true });
+
+  // Planted negative: identical setup, no injected race — the ordinary uncontended path must still
+  // report 'charged', proving the fix does not just make every claim report 'already'.
+  const dirPlainV = seenDirR10V();
+  const urlPlainV = 'https://chatgpt.com/c/mock-r10-verify-plain';
+  const hashPlainV = createHash('sha256').update('#215 gate r10 verify plain text').digest('hex');
+  const resultPlainV = buildClaimR10V(dirPlainV, fs).claim?.(urlPlainV, hashPlainV, new Set());
+  check("#215 gate r10 verify planted negative: an uncontended claim on a fresh fingerprint still reports 'charged'",
+    resultPlainV === 'charged', `result=${resultPlainV}`);
+  fs.rmSync(dirPlainV, { recursive: true, force: true });
+}
+
 process.exit(failures === 0 ? 0 : 1);

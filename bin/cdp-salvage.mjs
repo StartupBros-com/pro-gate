@@ -710,14 +710,17 @@ function pruneThrottleSeen(protectedKeys = new Set()) {
       .forEach(({ name, ino, mtimeMs }) => removeThrottleSeenGeneration(name, { ino, mtimeMs }));
   }
 }
-// Creates the record with the 'wx' flag: this throws (caught, ignored) if the record still
-// exists when this runs — claimThrottleSeen below is the only caller, and it only reaches this
-// create after establishing the record is either absent or expired, so an EEXIST here means a
-// best-effort unlink of an expired record failed (an unwritable directory), not a live
-// fingerprint someone else just charged (that race is closed by claimThrottleSeen's lock, not by
-// this flag — the flag remains belt-and-suspenders). Either way the record exists once this
-// returns (best-effort on mkdir/write failure, same as every other sidecar write in this file).
-function recordThrottleSeen(url, hash) {
+// Creates the record with the 'wx' flag and reports whether THIS call's create actually won it.
+// claimThrottleSeen below is the only caller, and it only reaches this create after establishing
+// the record is either absent or expired, so an EEXIST here means one of two things: a live
+// fingerprint someone else just charged in the fail-open window (the per-fingerprint flock was
+// contended past budget or the binary is missing — the lock closes this race when it is HELD, not
+// via this flag alone), or a best-effort unlink of an expired record that failed (an unwritable
+// directory). claimThrottleSeen tells those two apart itself (#215 gate r10 verify); this function
+// only ever reports whether ITS OWN write is the one that landed. Any OTHER failure (ENOSPC, a
+// missing parent that mkdirSync also could not create, ...) keeps the fail-open rule every sidecar
+// write in this file follows: report a win so a sidecar problem can never silence a real throttle.
+function recordThrottleSeen(url, hash) {  // -> true when THIS call's 'wx' create actually won
   try {
     fs.mkdirSync(THROTTLE_SEEN_DIR, { recursive: true });
     const recordPath = throttleSeenRecordPath(url, hash);
@@ -726,7 +729,10 @@ function recordThrottleSeen(url, hash) {
     // BEFORE the cooldown it gates is attempted (it remains the sole race arbiter), but it must
     // not outlive a failed publish. recordThrottle rolls it back if that write fails.
     pendingThrottleSeenRecords.push(recordPath);
-  } catch {}
+    return true;
+  } catch (err) {
+    return err?.code !== 'EEXIST';
+  }
 }
 // #215 gate r10 P2 (paid-review round 10 [P2] bin/cdp-salvage.mjs:768): admission used to be a
 // PLAIN EXISTENCE check — ANY record, however old, read as "already charged", even one
@@ -739,22 +745,32 @@ function recordThrottleSeen(url, hash) {
 // Admission now checks the record's OWN AGE under this fingerprint's lock, not just its
 // existence: an unexpired record is still "already" (unchanged from before). An EXPIRED record
 // is never "already" — it is unlinked (best-effort) and the sighting proceeds to the 'wx' create
-// exactly as if no record existed at all. If that create still fails (the unlink failed) this
-// call returns 'charged' anyway: a sidecar problem must never silence a real throttle, so an
-// unwritable sidecar disables dedupe entirely — deliberately, not a residual bug — rather than
-// suppress a live throttle sighting with no cooldown behind it.
+// exactly as if no record existed at all. If that create still fails with EEXIST AFTER our own
+// unlink attempt failed, the stale file we could not remove is almost certainly the reason the
+// create lost, so this still returns 'charged': a sidecar problem must never silence a real
+// throttle, so an unwritable sidecar disables dedupe entirely — deliberately, not a residual bug
+// — rather than suppress a live throttle sighting with no cooldown behind it.
+// #215 gate r10 verify (independent-verifier P2): that fail-open case is the ONLY one allowed to
+// override recordThrottleSeen's own report. When admission saw no record at all (or one it
+// successfully unlinked) and the 'wx' create still lost, that EEXIST means a concurrent claim on
+// this EXACT fingerprint — reachable only while the per-fingerprint flock is fail-open itself
+// (contended past budget, or the binary missing) — won the race in the instant between our stat
+// and our own create; recordThrottleSeen's return is what tells "someone else already holds this
+// sighting" (already) apart from "our own write is the one that landed" (charged), restoring the
+// 'wx' flag as the arbiter be2271f established and this file's own comments still describe.
 function claimThrottleSeen(url, hash, protectedKeys) {
   if (!throttleSeenPruned) { throttleSeenPruned = true; pruneThrottleSeen(protectedKeys); }
   return withThrottleSeenLock(throttleSeenKey(url, hash), () => {
     const recordPath = throttleSeenRecordPath(url, hash);
     let stat = null;
     try { stat = fs.statSync(recordPath); } catch {}
+    let expiredUnlinkFailed = false;
     if (stat) {
       if (Date.now() - stat.mtimeMs <= THROTTLE_SEEN_TTL_MS) return 'already';
-      try { fs.unlinkSync(recordPath); } catch {}   // best-effort; a failure here still charges below
+      try { fs.unlinkSync(recordPath); } catch { expiredUnlinkFailed = true; }
     }
-    recordThrottleSeen(url, hash);
-    return 'charged';
+    if (recordThrottleSeen(url, hash)) return 'charged';
+    return expiredUnlinkFailed ? 'charged' : 'already';
   });
 }
 // #208 gate r2 P1: true once ANY throttle surface not proven to belong to another run (no
