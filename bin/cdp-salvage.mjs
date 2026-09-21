@@ -517,13 +517,27 @@ function throttleSeenRecordPath(url, hash) {
 // be a temp — every place that reads this directory AS RECORDS skips it.
 const THROTTLE_SEEN_EXPIRE_MARK = '.expire.';
 function throttleSeenIsTemp(name) { return name.includes(THROTTLE_SEEN_EXPIRE_MARK); }
-// #215 gate r10 P2: withThrottleSeenLock's per-fingerprint mutex FILE. A record basename is bare
-// sha256 hex and a temp always carries THROTTLE_SEEN_EXPIRE_MARK, so neither can end in '.lockf'
-// — every place that reads this directory AS a record or a temp must skip these too. Lock files
-// are tiny (created empty, never written) and bounded in number by the count of distinct
-// fingerprints this box has ever seen, so pruneThrottleSeen never deletes them — there is nothing
-// to reclaim (see withThrottleSeenLock below) and nothing to age out.
+// #215 gate r10 P2: withThrottleSeenLock's mutex FILES. A record basename is bare sha256 hex and a
+// temp always carries THROTTLE_SEEN_EXPIRE_MARK, so neither can end in '.lockf' — every place that
+// reads this directory AS a record or a temp must skip these too. pruneThrottleSeen never deletes
+// them: there is nothing to reclaim (see withThrottleSeenLock below) and nothing to age out.
 function throttleSeenIsLockFile(name) { return name.endsWith('.lockf'); }
+// #215 gate r11 P2 (paid-review round 11 [P2] bin/cdp-salvage.mjs:683): one lock file PER
+// FINGERPRINT was exempt from both the TTL and the capacity cap, so the sidecar kept one inode per
+// fingerprint this box had ever seen and every prune stat'ed all of them, forever. Fingerprints
+// now map onto a FIXED pool of lock files: the last 32 bits of the fingerprint's sha256 hex modulo
+// THROTTLE_SEEN_LOCK_SLOTS. The mapping is the same for admission (claimThrottleSeen) and removal
+// (removeThrottleSeenGeneration) because both go through withThrottleSeenLock with the same
+// fingerprint name, so one fingerprint is still serialized against itself; two fingerprints that
+// share a slot merely serialize against each other for the microseconds a critical section lasts
+// (no lock in this file is ever held while taking another, so shared slots cannot deadlock). A
+// name that is not hex (never produced here) lands in slot 0 — still correct, just more shared.
+const THROTTLE_SEEN_LOCK_SLOTS = 64;
+function throttleSeenLockSlot(name) {  // -> 'lock-NN.lockf': the same slot for the same name, always
+  const n = parseInt(name.slice(-8), 16);
+  const slot = Number.isNaN(n) ? 0 : n % THROTTLE_SEEN_LOCK_SLOTS;
+  return `lock-${String(slot).padStart(2, '0')}.lockf`;
+}
 // #215 gate r10 P2 (paid-review round 10 [P2] bin/cdp-salvage.mjs:591): the round-9 pathname lock
 // (mkdirSync as a mutex, reclaimed by mtime + a liveness-checked owner token) still let two
 // reclaimers observe the SAME dead lock and both act on it — a delayed reclaimer's rename could
@@ -532,8 +546,9 @@ function throttleSeenIsLockFile(name) { return name.endsWith('.lockf'); }
 // (and pruneThrottleSeen's own lock-reap repeated the same check-then-rename race). No amount of
 // fencing on a pathname primitive closes that: the fix is to stop reclaiming pathnames at all and
 // hand the mutex to the kernel via flock(2) on a stable, never-unlinked file.
-//   - The lock file is '<name>.lockf' inside THROTTLE_SEEN_DIR, opened once with fs.openSync(path,
-//     'a') — created if missing, never written, never unlinked (there is nothing to reclaim: an
+//   - The lock file is throttleSeenLockSlot(name) inside THROTTLE_SEEN_DIR (#215 gate r11 P2: a
+//     fixed pool, not one file per fingerprint), opened once with fs.openSync(path, 'a') —
+//     created if missing, never written, never unlinked (there is nothing to reclaim: an
 //     open file description lock is automatically released by the kernel when the holding process
 //     exits or is killed, crashed or not — so "stale lock" is not a state that can exist here).
 //   - The util-linux `flock` binary is spawned with that fd INHERITED as its fd 3
@@ -552,7 +567,7 @@ const THROTTLE_SEEN_LOCK_WAIT_SECS = (THROTTLE_SEEN_LOCK_WAIT_MS / 1000).toFixed
 let throttleSeenFlockMissingWarned = false;
 function withThrottleSeenLock(name, fn) {
   try { fs.mkdirSync(THROTTLE_SEEN_DIR, { recursive: true }); } catch {}
-  const lockPath = path.join(THROTTLE_SEEN_DIR, `${name}.lockf`);
+  const lockPath = path.join(THROTTLE_SEEN_DIR, throttleSeenLockSlot(name));
   let fd = null;
   try {
     try {
@@ -670,17 +685,18 @@ function pruneThrottleSeen(protectedKeys = new Set()) {
   const now = Date.now();
   const stats = [];
   for (const name of names) {
-    const recordPath = path.join(THROTTLE_SEEN_DIR, name);
-    let stat;
-    try { stat = fs.statSync(recordPath); } catch { continue; }
-    const expired = now - stat.mtimeMs > THROTTLE_SEEN_TTL_MS;
     // #215 gate r10 P2: a '.lockf' file is the OS-managed mutex withThrottleSeenLock opens and
     // flocks — never a record, never a temp, and never reclaimed or reaped here. There is no
     // stale-lock state to detect any more (a crashed holder's flock is released by the kernel the
     // instant the process dies, not left for a sweep to notice), so unlike the round-9 lock dirs
-    // this file is simply skipped, forever: it is tiny (created empty, never written) and bounded
-    // in count by the number of distinct fingerprints this box has ever seen.
+    // this file is simply skipped, forever — and (#215 gate r11 P2) skipped by NAME, before the
+    // stat: the pool is fixed at THROTTLE_SEEN_LOCK_SLOTS files, so a prune's work is bounded by
+    // the records it holds, never by lifetime fingerprint history.
     if (throttleSeenIsLockFile(name)) continue;
+    const recordPath = path.join(THROTTLE_SEEN_DIR, name);
+    let stat;
+    try { stat = fs.statSync(recordPath); } catch { continue; }
+    const expired = now - stat.mtimeMs > THROTTLE_SEEN_TTL_MS;
     // A rename-aside temp is NOT a record: it suppresses nothing, so it is never protected and
     // never counted toward the cap — only aged out, so an orphan left by a writer that died
     // mid-swap cannot accumulate (see removeThrottleSeenGeneration). A rename preserves mtime, so

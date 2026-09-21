@@ -571,6 +571,18 @@ const seedThrottleSeen = (home, url, text) => {
   fs.mkdirSync(throttleSeenDir(home), { recursive: true });
   fs.writeFileSync(throttleSeenRecordPath(home, url, text), '', { flag: 'wx' });
 };
+// #215 gate r11 P2: the lock SLOT a fingerprint's admission and removal both take — mirrors
+// throttleSeenLockSlot in bin/cdp-salvage.mjs (last 32 bits of the record key's sha256 hex modulo
+// a fixed pool of 64), so a test that holds "the fingerprint's lock" holds the file production
+// really contends on. The '#215 gate r11 P2 (b)' check proves that by behaviour, not by name.
+const THROTTLE_SEEN_LOCK_SLOTS_T = 64;
+const throttleSeenLockSlotName = (key) => {
+  const n = parseInt(key.slice(-8), 16);
+  return `lock-${String(Number.isNaN(n) ? 0 : n % THROTTLE_SEEN_LOCK_SLOTS_T).padStart(2, '0')}.lockf`;
+};
+const throttleSeenLockSlotPath = (home, url, text) => path.join(
+  throttleSeenDir(home), throttleSeenLockSlotName(path.basename(throttleSeenRecordPath(home, url, text))),
+);
 
 // Deliberately opt in only scratch fixtures that need it: hydration/order checks, hung-close
 // cleanup, and static decisive 3s canonical revalidations. The latter have no required first/second
@@ -4761,6 +4773,7 @@ const FOREIGN_ANSWER = (m) => [
   // it here too, or every h*/c* test below throws an uncaught ReferenceError the instant it
   // touches a locked path, not a clean check FAIL.
   const PRUNER_PARTS_R7 = ['THROTTLE_SEEN_EXPIRE_MARK', 'throttleSeenIsTemp', 'throttleSeenIsLockFile',
+    'THROTTLE_SEEN_LOCK_SLOTS', 'throttleSeenLockSlot',
     'THROTTLE_SEEN_LOCK_WAIT_MS', 'THROTTLE_SEEN_LOCK_WAIT_SECS', 'withThrottleSeenLock',
     'removeThrottleSeenGeneration', 'pruneThrottleSeen'];
   // #215 gate r10 P2: the red-before-green pairing tree runs this SAME test file against the
@@ -5398,6 +5411,7 @@ for (const placeholder of PLACEHOLDER_URLS) {
     return end < 0 ? null : salvageLinesR10.slice(start, end + 1).join('\n');
   };
   const CLAIM_PARTS_R10 = ['THROTTLE_SEEN_EXPIRE_MARK', 'throttleSeenIsTemp', 'throttleSeenIsLockFile',
+    'THROTTLE_SEEN_LOCK_SLOTS', 'throttleSeenLockSlot',
     'THROTTLE_SEEN_LOCK_WAIT_MS', 'THROTTLE_SEEN_LOCK_WAIT_SECS', 'withThrottleSeenLock',
     'removeThrottleSeenGeneration', 'pruneThrottleSeen', 'throttleSeenKey', 'throttleSeenRecordPath',
     'recordThrottleSeen', 'claimThrottleSeen'];
@@ -5456,7 +5470,7 @@ for (const placeholder of PLACEHOLDER_URLS) {
   // for the identical sighting.
   const homeIR10 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
   const recordIR10 = throttleSeenRecordPath(homeIR10, primaryUrlR10, modalTriggerR10i);
-  const lockIR10 = `${recordIR10}.lockf`;
+  const lockIR10 = throttleSeenLockSlotPath(homeIR10, primaryUrlR10, modalTriggerR10i);   // #215 gate r11 P2: the fingerprint's slot
   let firedIR10 = false;
   const cdpIR10 = await mockCdp(pageR10i, [], {
     throttleModal: modalTriggerR10i,
@@ -5492,7 +5506,7 @@ for (const placeholder of PLACEHOLDER_URLS) {
   const pageR10ii = `ChatGPT\nAccount limits\n${modalTriggerR10ii}\nPlease try again shortly.\n`;
   const homeIiR10 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
   const recordIiR10 = throttleSeenRecordPath(homeIiR10, primaryUrlR10, modalTriggerR10ii);
-  const lockIiR10 = `${recordIiR10}.lockf`;
+  const lockIiR10 = throttleSeenLockSlotPath(homeIiR10, primaryUrlR10, modalTriggerR10ii);   // #215 gate r11 P2: the fingerprint's slot
   let firedIiR10 = false;
   let fdIiR10 = null;
   const cdpIiR10 = await mockCdp(pageR10ii, [], {
@@ -5537,9 +5551,9 @@ for (const placeholder of PLACEHOLDER_URLS) {
     const agedAtR10a = new Date(Date.now() - EIGHT_DAYS_R10);
     fs.utimesSync(recordR10a, agedAtR10a, agedAtR10a);
     const seenDirPathR10a = throttleSeenDir(homeR10a);
-    // pre-create the fingerprint's lockf (normal permissions) so fs.openSync on an EXISTING file
-    // still succeeds once the directory itself loses write permission below.
-    fs.writeFileSync(`${recordR10a}.lockf`, '');
+    // pre-create the fingerprint's lock slot (normal permissions) so fs.openSync on an EXISTING
+    // file still succeeds once the directory itself loses write permission below.
+    fs.writeFileSync(throttleSeenLockSlotPath(homeR10a, primaryUrlR10, modalTriggerR10a), '');
     fs.chmodSync(seenDirPathR10a, 0o555);
     let rR10a;
     try {
@@ -5616,7 +5630,8 @@ for (const placeholder of PLACEHOLDER_URLS) {
   const dirR10c = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-r10-crash-'));
   const nameR10c = createHash('sha256').update('#215 gate r10 (c) fingerprint').digest('hex');
   const readyPathR10c = path.join(dirR10c, 'ready');
-  const LOCK_PARTS_R10C = ['THROTTLE_SEEN_LOCK_WAIT_MS', 'THROTTLE_SEEN_LOCK_WAIT_SECS', 'withThrottleSeenLock'];
+  const LOCK_PARTS_R10C = ['THROTTLE_SEEN_LOCK_SLOTS', 'throttleSeenLockSlot',
+    'THROTTLE_SEEN_LOCK_WAIT_MS', 'THROTTLE_SEEN_LOCK_WAIT_SECS', 'withThrottleSeenLock'];
   // Same cross-version reason as CLAIM_COMPAT_PARTS_R10 above: kept out of the "no silent no-op"
   // gate below (that gate deliberately still fails against pre-r10 source, which lacks
   // THROTTLE_SEEN_LOCK_WAIT_SECS entirely) but included in the driver script's own source so the
@@ -5721,6 +5736,7 @@ for (const placeholder of PLACEHOLDER_URLS) {
     return end < 0 ? null : salvageLinesR10V.slice(start, end + 1).join('\n');
   };
   const CLAIM_PARTS_R10V = ['THROTTLE_SEEN_EXPIRE_MARK', 'throttleSeenIsTemp', 'throttleSeenIsLockFile',
+    'THROTTLE_SEEN_LOCK_SLOTS', 'throttleSeenLockSlot',
     'THROTTLE_SEEN_LOCK_WAIT_MS', 'THROTTLE_SEEN_LOCK_WAIT_SECS', 'withThrottleSeenLock',
     'removeThrottleSeenGeneration', 'pruneThrottleSeen', 'throttleSeenKey', 'throttleSeenRecordPath',
     'recordThrottleSeen', 'claimThrottleSeen'];
@@ -5783,6 +5799,141 @@ for (const placeholder of PLACEHOLDER_URLS) {
   check("#215 gate r10 verify planted negative: an uncontended claim on a fresh fingerprint still reports 'charged'",
     resultPlainV === 'charged', `result=${resultPlainV}`);
   fs.rmSync(dirPlainV, { recursive: true, force: true });
+}
+
+// #215 gate r11 P2 (paid-review round 11 [P2] bin/cdp-salvage.mjs:683): lock files were one per
+// fingerprint and exempt from every retention bound, so lifetime fingerprint churn grew the
+// sidecar's inode count and every prune's stat work without limit. Fingerprints now share a FIXED
+// pool of THROTTLE_SEEN_LOCK_SLOTS lock files through the same mapping for admission and removal.
+// Same vm-sliced-by-name harness as the r10 blocks above, with a console stub so the contended
+// fail-open line (console.error in production) is observable instead of a ReferenceError.
+{
+  const salvageSrcR11 = fs.readFileSync(SALVAGE, 'utf8');
+  const salvageLinesR11 = salvageSrcR11.split('\n');
+  const sliceTopLevelR11 = (name) => {
+    const start = salvageLinesR11.findIndex((line) => (
+      line.startsWith(`function ${name}(`) || line.startsWith(`const ${name} = `)
+    ));
+    if (start < 0) return null;
+    if (salvageLinesR11[start].startsWith('const ') || salvageLinesR11[start].trimEnd().endsWith('}')) {
+      return salvageLinesR11[start];
+    }
+    const end = salvageLinesR11.findIndex((line, i) => i > start && line === '}');
+    return end < 0 ? null : salvageLinesR11.slice(start, end + 1).join('\n');
+  };
+  const CLAIM_PARTS_R11 = ['THROTTLE_SEEN_EXPIRE_MARK', 'throttleSeenIsTemp', 'throttleSeenIsLockFile',
+    'THROTTLE_SEEN_LOCK_SLOTS', 'throttleSeenLockSlot',
+    'THROTTLE_SEEN_LOCK_WAIT_MS', 'THROTTLE_SEEN_LOCK_WAIT_SECS', 'withThrottleSeenLock',
+    'removeThrottleSeenGeneration', 'pruneThrottleSeen', 'throttleSeenKey', 'throttleSeenRecordPath',
+    'recordThrottleSeen', 'claimThrottleSeen'];
+  check('#215 gate r11 P2 setup: every named part was found in bin/cdp-salvage.mjs (no silent no-op slice)',
+    CLAIM_PARTS_R11.every((name) => sliceTopLevelR11(name) !== null),
+    `missing=${JSON.stringify(CLAIM_PARTS_R11.filter((name) => sliceTopLevelR11(name) === null))}`);
+  const errsR11 = [];
+  const buildR11 = (dir, { fsImpl = fs } = {}) => {
+    const source = CLAIM_PARTS_R11.map(sliceTopLevelR11).filter((part) => part !== null).join('\n');
+    const expose = '({ claim: typeof claimThrottleSeen === "function" ? claimThrottleSeen : null,'
+      + ' prune: typeof pruneThrottleSeen === "function" ? pruneThrottleSeen : null,'
+      + ' withLock: typeof withThrottleSeenLock === "function" ? withThrottleSeenLock : null })';
+    return runInNewContext(`${source}\n${expose}`, {
+      fs: fsImpl, path, process, createHash, spawnSync,
+      console: { error: (message) => errsR11.push(String(message)) },
+      THROTTLE_SEEN_DIR: dir, THROTTLE_SEEN_TTL_MS: 7 * 24 * 60 * 60 * 1000, THROTTLE_SEEN_MAX: 512,
+      pendingThrottleSeenRecords: [], throttleSeenPruned: false,
+    });
+  };
+  const isLockfR11 = (name) => name.endsWith('.lockf');
+  const isPoolSlotR11 = (name) => /^lock-\d{2}\.lockf$/.test(name);
+
+  // (a) churn: many distinct fingerprints, then expire them all. The records come and go; the
+  // lock files never exceed the pool, and a prune never stats one (skipped by name first).
+  const dirA = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-r11-churn-'));
+  const N_R11 = 200;
+  const harnessA = buildR11(dirA);
+  let chargedA = 0;
+  for (let i = 0; i < N_R11; i++) {
+    const url = `https://chatgpt.com/c/r11-churn-${i}`;
+    const hash = createHash('sha256').update(`#215 gate r11 churn text ${i}`).digest('hex');
+    if (harnessA.claim?.(url, hash, new Set()) === 'charged') chargedA++;
+  }
+  const lockfA = fs.readdirSync(dirA).filter(isLockfR11);
+  const recordsA = fs.readdirSync(dirA).filter((n) => !isLockfR11(n));
+  check(`#215 gate r11 P2 (a) ${N_R11} distinct fingerprints each charge once and leave one record each`,
+    chargedA === N_R11 && recordsA.length === N_R11, `charged=${chargedA} records=${recordsA.length}`);
+  check(`#215 gate r11 P2 (a) lock files stay within the fixed pool (<= ${THROTTLE_SEEN_LOCK_SLOTS_T}) after ${N_R11} distinct fingerprints`,
+    lockfA.length <= THROTTLE_SEEN_LOCK_SLOTS_T && lockfA.every(isPoolSlotR11),
+    `lockf=${lockfA.length} sample=${JSON.stringify(lockfA.slice(0, 3))}`);
+  const agedA = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
+  recordsA.forEach((n) => fs.utimesSync(path.join(dirA, n), agedA, agedA));
+  let lockfStatsA = 0;
+  const countingFsA = Object.create(fs);
+  countingFsA.statSync = (p, ...rest) => {
+    if (isLockfR11(String(p))) lockfStatsA++;
+    return fs.statSync(p, ...rest);
+  };
+  buildR11(dirA, { fsImpl: countingFsA }).prune?.(new Set());
+  const afterA = fs.readdirSync(dirA);
+  check('#215 gate r11 P2 (a) expiring every record leaves zero records and a lock-file count still within the pool',
+    afterA.filter((n) => !isLockfR11(n)).length === 0 && afterA.filter(isLockfR11).length <= THROTTLE_SEEN_LOCK_SLOTS_T,
+    `entries=${afterA.length} records=${afterA.filter((n) => !isLockfR11(n)).length} lockf=${afterA.filter(isLockfR11).length}`);
+  check('#215 gate r11 P2 (a) the prune never stats a lock file (skipped by name, before the stat)',
+    lockfStatsA === 0, `lockfStats=${lockfStatsA}`);
+  fs.rmSync(dirA, { recursive: true, force: true });
+
+  // (b) two fingerprints that share a slot serialize on the SAME file. Hold fingerprint A's slot
+  // exactly the way production does (fs.openSync + spawnSync flock -x on the inherited fd; a
+  // second open file description in the same process conflicts under flock(2)), then take the
+  // lock for fingerprint B through the production withThrottleSeenLock: it must contend — wait
+  // the full budget, then fail open naming B — which never happened while B had a private lock
+  // file. Planted negative: fingerprint C, in another slot, is not delayed at all meanwhile.
+  const dirB = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-r11-slot-'));
+  const keyR11 = (label) => createHash('sha256').update(`#215 gate r11 ${label}`).digest('hex');
+  const nameA = keyR11('slot a');
+  let nameB = null;
+  let nameC = null;
+  for (let i = 0; i < 4096 && (nameB === null || nameC === null); i++) {
+    const cand = keyR11(`slot probe ${i}`);
+    if (throttleSeenLockSlotName(cand) === throttleSeenLockSlotName(nameA)) { if (nameB === null) nameB = cand; }
+    else if (nameC === null) nameC = cand;
+  }
+  check("#215 gate r11 P2 (b) setup: found a fingerprint sharing A's slot and one in another slot",
+    nameB !== null && nameC !== null, `b=${nameB} c=${nameC}`);
+  const harnessB = buildR11(dirB);
+  const slotPathB = path.join(dirB, throttleSeenLockSlotName(nameA));
+  const fdHoldB = fs.openSync(slotPathB, 'a');
+  const holdB = spawnSync('flock', ['-x', '-w', '0.25', '3'], { stdio: ['ignore', 'ignore', 'pipe', fdHoldB] });
+  check("#215 gate r11 P2 (b) setup: this process holds A's slot", holdB.status === 0,
+    `status=${holdB.status} err=${holdB.error?.code}`);
+  errsR11.length = 0;
+  const t0B = Date.now();
+  let ranB = false;
+  harnessB.withLock?.(nameB, () => { ranB = true; });
+  const elapsedB = Date.now() - t0B;
+  check("#215 gate r11 P2 (b) a fingerprint sharing A's slot contends on A's lock file: waits the budget, then fails open naming itself",
+    ranB && elapsedB >= 230 && errsR11.some((m) => m.includes(`contended past 250ms for ${nameB}`)),
+    `ran=${ranB} elapsed=${elapsedB}ms errs=${JSON.stringify(errsR11)}`);
+  errsR11.length = 0;
+  const t0C = Date.now();
+  let ranC = false;
+  harnessB.withLock?.(nameC, () => { ranC = true; });
+  const elapsedC = Date.now() - t0C;
+  check("#215 gate r11 P2 (b) planted negative: a fingerprint in another slot is not delayed while A's slot is held",
+    ranC && elapsedC < 150 && errsR11.length === 0, `ran=${ranC} elapsed=${elapsedC}ms errs=${JSON.stringify(errsR11)}`);
+  fs.closeSync(fdHoldB);
+  const lockfB = fs.readdirSync(dirB).filter(isLockfR11);
+  check('#215 gate r11 P2 (b) B and C created no lock file of their own: only pool slots exist',
+    lockfB.every(isPoolSlotR11) && lockfB.length <= 2, `lockf=${JSON.stringify(lockfB)}`);
+  fs.rmSync(dirB, { recursive: true, force: true });
+
+  // (c) the mapping is the same for admission and removal: both reach withThrottleSeenLock with
+  // the fingerprint's record name, and withThrottleSeenLock resolves that name through the slot
+  // function. A source-text check, deliberately narrow: it pins the two call sites and the one
+  // resolution line the (b) behaviour above depends on.
+  check('#215 gate r11 P2 (c) admission and removal take the lock through the same function, resolved through the slot pool',
+    /function removeThrottleSeenGeneration\([^\n]*\n\s+return withThrottleSeenLock\(name, /.test(salvageSrcR11)
+      && /withThrottleSeenLock\(throttleSeenKey\(url, hash\), /.test(salvageSrcR11)
+      && salvageSrcR11.includes('const lockPath = path.join(THROTTLE_SEEN_DIR, throttleSeenLockSlot(name));'),
+    'source text');
 }
 
 process.exit(failures === 0 ? 0 : 1);
