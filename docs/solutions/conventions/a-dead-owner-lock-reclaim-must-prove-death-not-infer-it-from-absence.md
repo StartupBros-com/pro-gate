@@ -2,7 +2,7 @@
 title: "A dead-owner lock reclaim must prove death, not infer it from absence"
 module: "pro-gate"
 date: "2026-09-08"
-last_updated: "2026-09-10"
+last_updated: "2026-09-21"
 category: "conventions"
 problem_type: "design_pattern"
 component: "development_workflow"
@@ -83,9 +83,12 @@ found. This doc is the four rules that sequence converged on, each one a rule a 
 directory-lock implementation should check itself against before it ships, not after a round finds
 it missing.
 
-The two siblings this guard was modeled on, `pg_lock` (`lib/pro-gate-lib.sh:286-309`) and
-`pg_lock_n` (`lib/pro-gate-lib.sh:316-361`), are live in the current tree and still carry two of the
-four defects described below -- tracked separately as #152/#155.
+The two siblings this guard was modeled on, `pg_lock` and `pg_lock_n`, carried two of the four
+defects described below when this was first written (tracked as #152/#155). Since v0.44.0 (PR #183)
+both reclaim through the same hardened helper, `pg_dirlock_reclaim_dead` (`lib/pro-gate-lib.sh:354`,
+`lib/pro-gate-lib.sh:412`), and write the start-time token beside the pid
+(`lib/pro-gate-lib.sh:363`, `lib/pro-gate-lib.sh:406`); issue #152 closed as completed on 2026-09-10
+and PR #155 closed unmerged, superseded by #183.
 
 ## Guidance
 
@@ -356,15 +359,20 @@ being fixed.
 - Implementing or reviewing **any** directory-based (mkdir-spinlock) lock with dead-owner
   reclamation -- not just this guard. Check the design against all four rules before it ships, not
   after a round finds one missing.
-- Specifically: `pg_lock` (`lib/pro-gate-lib.sh:286-309`) and `pg_lock_n`
-  (`lib/pro-gate-lib.sh:316-361`) in this same file, in the current tree, still fail rule 3 and by
-  extension the identity half of rule 1. Both write a start-time token beside the owner pid
-  (`pg_pid_token "$$" > "$lockdir/token"`, lines 306 and 349) but **never read it back** on
-  reclaim -- their dead-owner check is bare `kill -0` on the stored pid alone
-  (`lib/pro-gate-lib.sh:301`, `lib/pro-gate-lib.sh:355`), and their reclaim is an unscoped
-  `rm -rf "$lockdir"` rather than an exact-name unlink plus `rmdir`. This is tracked as #152/#155
-  (open at time of writing); the fix described there deliberately reuses the hardened helper this
-  doc describes rather than shipping a second, divergent implementation.
+- Historical instance, now fixed: `pg_lock` and `pg_lock_n` in this same file once failed rule 3
+  and by extension the identity half of rule 1. Both wrote a start-time token beside the owner pid
+  but **never read it back** on reclaim -- their dead-owner check was bare `kill -0` on the stored
+  pid alone, and their reclaim was an unscoped `rm -rf "$lockdir"` rather than an exact-name unlink
+  plus `rmdir`. That was tracked as #152/#155; the fix landed in v0.44.0 (PR #183) by moving both
+  onto the hardened helper this doc describes, `pg_dirlock_reclaim_dead` (`lib/pro-gate-lib.sh:354`,
+  `lib/pro-gate-lib.sh:412`), rather than shipping a second, divergent implementation. Issue #152
+  closed as completed on 2026-09-10; PR #155 closed unmerged, superseded by #183.
+- The four rules are necessary, not sufficient, for a lock that must tolerate two concurrent
+  reclaimers. PR #215 round 10 found that a reclaimer satisfying rules 1, 3 and 4 (mtime grace plus a
+  liveness-checked owner token) still lets two reclaimers prove the same death and act on it, because
+  the reclaim action is itself a pathname operation: the delayed reclaimer's rename lands on the
+  winner's freshly re-created live lock. The resolution in that subsystem was to stop reclaiming
+  pathnames at all; see the sibling doc under Related.
 - Any place a "single definition" helper is introduced for one time-out/threshold knob: check
   whether a sibling knob of the same kind still has a raw-literal default at other call sites, and
   whether the test guarding the new helper actually scans every file that could carry the drift
@@ -402,3 +410,8 @@ is the four rules, which hold regardless of where that change eventually lands.
   this episode supplies.
 - [Separate review lifecycle, applicability, capacity, and input trust](./separate-review-lifecycle-applicability-capacity-and-input-trust.md)
   — the decision layer above this guard, for orientation when working in the same subsystem.
+- [A pathname lock's reclaim cannot be fenced; lock a stable file's open descriptor instead](./a-pathname-locks-reclaim-cannot-be-fenced-lock-a-stable-files-open-descriptor-instead.md)
+  — the sequel finding from PR #215 round 10: a reclaimer that satisfies these four rules can still
+  race a second reclaimer at the pathname level, and the throttle-seen sidecar's answer was an
+  advisory `flock(2)` on a stable, never-unlinked file with no reclaim state at all. Read it before
+  adding a fifth rule here.
