@@ -307,20 +307,10 @@ function forgetUrl(m, url) {
   let held = '';
   try { held = fs.readFileSync(claim, 'utf8').trim(); } catch {}
   let survivor = null;
-  let unlinkClaim = true;
   if (held && held !== url) {
-    try {
-      fs.linkSync(claim, f); survivor = held;  // genuine memo republished: put it back
-    } catch (err) {
-      // #215 gate r8 P2 (same class as 8db5970's link-back fix): EEXIST means a newer record
-      // already holds `f`, so `claim` is a stale duplicate — safe to drop. Any OTHER failure
-      // (ENOSPC, EDQUOT, EIO, EPERM, ...) means the link did NOT happen, so `claim` is still the
-      // ONLY copy of a memo just proved genuine; unlinking it here would destroy it with no
-      // survivor recorded anywhere. Leave it on disk for a later pass to find instead.
-      if (err?.code !== 'EEXIST') unlinkClaim = false;
-    }
+    try { fs.linkSync(claim, f); survivor = held; } catch {}  // genuine memo republished: put it back
   }
-  if (unlinkClaim) { try { fs.unlinkSync(claim); } catch {} }
+  try { fs.unlinkSync(claim); } catch {}
   return survivor;
 }
 
@@ -523,11 +513,107 @@ function throttleSeenRecordPath(url, hash) {
 }
 // #215 gate r7 P2: the mark a rename-aside temp created by removeThrottleSeenGeneration carries.
 // A record basename is bare sha256 hex (throttleSeenKey), so a name carrying this mark can only
-// be a temp — every place that reads this directory AS RECORDS skips it. throttleAlreadyCharged's
-// exact-path existence check can never MATCH a temp's name by construction, but #215 gate r8 P2
-// below gives admission a separate, deliberate lookup for a FRESH one (throttleSeenFreshTemp).
+// be a temp — every place that reads this directory AS RECORDS skips it.
 const THROTTLE_SEEN_EXPIRE_MARK = '.expire.';
 function throttleSeenIsTemp(name) { return name.includes(THROTTLE_SEEN_EXPIRE_MARK); }
+// #215 gate r9 P2: withThrottleSeenLock's per-fingerprint mutex directory. A record basename is
+// bare sha256 hex and a temp always carries THROTTLE_SEEN_EXPIRE_MARK, so neither can end in
+// '.lock' — every place that reads this directory AS a record or a temp must skip these too, or
+// a rename/unlink meant for a record would instead corrupt a live mutex out from under whichever
+// process currently holds it.
+function throttleSeenIsLock(name) { return name.endsWith('.lock'); }
+// #215 gate r9 P2: mkdirSync is this file's one atomic, race-proof create primitive (same reason
+// recordThrottleSeen uses the 'wx' flag on a plain file) so it doubles as a per-fingerprint lock:
+// EEXIST means contended, rmdirSync releases. STALE_MS bounds how long a lock is trusted as
+// "someone else's in-flight critical section" before being treated as an orphan left by a holder
+// that died mid-section (crash, kill -9) and reclaimed; WAIT_MS bounds how long a genuinely live
+// holder is waited out before this call gives up and proceeds WITHOUT the lock — every sidecar
+// path in this file is fail-open, and a lock is not exempt: losing the lock narrows a race
+// window, it must never turn into a hang.
+const THROTTLE_SEEN_LOCK_STALE_MS = 5_000;
+const THROTTLE_SEEN_LOCK_WAIT_MS = 250;
+// #215 gate r9 verify (independent-verifier P1): elapsed mtime alone cannot tell "the holder died
+// mid-section" from "the holder is still running a slow section" — reclaiming the latter lets two
+// processes run the SAME fingerprint's critical section at once, silently (no stderr line at
+// all), which is exactly the double-charge/lost-write class #215 exists to close, now via the
+// lock meant to prevent it instead of the gap it replaced. Every acquisition (fresh or reclaimed)
+// records its own pid+nonce inside the lock directory immediately after mkdirSync succeeds; a
+// stale-looking lock is reclaimed only once its recorded owner is verifiably NOT alive
+// (process.kill(pid, 0) throwing anything other than EPERM — EPERM means the pid exists under
+// another user, still alive). A missing/unreadable owner file — the lock predates this fix, or
+// this call raced the narrow window between ITS OWN mkdirSync and its owner-file write — is
+// treated as unverifiable and still reclaimable on mtime alone, same as before this fix: the
+// fencing token can only ever narrow the race, never turn a lock into something that can hang.
+function throttleSeenLockOwnerPath(lockPath) { return path.join(lockPath, 'owner'); }
+function throttleSeenLockOwnerAlive(lockPath) {
+  let token;
+  try { token = fs.readFileSync(throttleSeenLockOwnerPath(lockPath), 'utf8'); } catch { return false; }
+  const pid = Number(String(token).split(':')[0]);
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; }          // no throw: pid exists, same user -> alive
+  catch (err) { return err?.code === 'EPERM'; }        // EPERM: exists, different user -> alive
+}
+function withThrottleSeenLock(name, fn) {
+  try { fs.mkdirSync(THROTTLE_SEEN_DIR, { recursive: true }); } catch {}
+  const lockPath = path.join(THROTTLE_SEEN_DIR, `${name}.lock`);
+  let acquired = false;
+  let ownerToken = null;
+  const claimOwnership = () => {
+    // Written in the same synchronous turn as the mkdirSync that just succeeded — no other JS in
+    // THIS process runs in between, so no caller in this process can ever observe the lock
+    // directory without also seeing this token; only a genuinely concurrent OS process racing the
+    // two syscalls can, and that narrow window is exactly the "unverifiable, fall back to mtime"
+    // case documented above.
+    ownerToken = `${process.pid}:${Math.random().toString(36).slice(2)}`;
+    try { fs.writeFileSync(throttleSeenLockOwnerPath(lockPath), ownerToken); } catch {}
+  };
+  try {
+    fs.mkdirSync(lockPath);
+    acquired = true;
+    claimOwnership();
+  } catch (err) {
+    if (err?.code !== 'EEXIST') {
+      // Not contention (ENOSPC, EPERM, missing parent, ...): fail open like every other sidecar
+      // write in this file rather than block a claim or a prune on a filesystem problem.
+      console.error(`throttle-seen lock unavailable for ${name} (${err?.code ?? err}); proceeding without it (fail-open)`);
+    } else {
+      let stat;
+      try { stat = fs.statSync(lockPath); } catch { stat = null; }
+      if (stat && Date.now() - stat.mtimeMs > THROTTLE_SEEN_LOCK_STALE_MS && !throttleSeenLockOwnerAlive(lockPath)) {
+        try { fs.rmSync(lockPath, { recursive: true, force: true }); } catch {}
+        try { fs.mkdirSync(lockPath); acquired = true; claimOwnership(); } catch {}
+      }
+      if (!acquired) {
+        // Atomics.wait on a private SharedArrayBuffer is the only synchronous sleep Node offers
+        // — a same-process setTimeout cannot help here because this call must not return control
+        // to the event loop mid-wait (the caller is a synchronous fs sequence, not an async one).
+        const sync = new Int32Array(new SharedArrayBuffer(4));
+        const deadline = Date.now() + THROTTLE_SEEN_LOCK_WAIT_MS;
+        while (!acquired && Date.now() < deadline) {
+          Atomics.wait(sync, 0, 0, 5);
+          try { fs.mkdirSync(lockPath); acquired = true; claimOwnership(); } catch {}
+        }
+      }
+      if (!acquired) {
+        console.error(`throttle-seen lock contended past ${THROTTLE_SEEN_LOCK_WAIT_MS}ms for ${name}; proceeding without it (fail-open)`);
+      }
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    // #215 gate r9 verify: re-check ownership before releasing — if the token on disk no longer
+    // matches what THIS call wrote, someone else has since reclaimed this lock instance as
+    // orphaned (the call above judged its predecessor dead); removing it here would evict a
+    // live, legitimate holder rather than release this call's own lock (the three-way chain the
+    // same finding named).
+    if (acquired) {
+      let current = null;
+      try { current = fs.readFileSync(throttleSeenLockOwnerPath(lockPath), 'utf8'); } catch {}
+      if (current === ownerToken) { try { fs.rmSync(lockPath, { recursive: true, force: true }); } catch {} }
+    }
+  }
+}
 // #215 gate r7 P2: delete ONLY the record generation that was actually checked — `expected` is
 // the { ino, mtimeMs } of the very stat that decided this record should go. A plain unlink cannot
 // express that. Between one scan's stat and its unlink, another scan can expire the same record,
@@ -550,21 +636,29 @@ function throttleSeenIsTemp(name) { return name.includes(THROTTLE_SEEN_EXPIRE_MA
 // `bounded-dedupe` already accepts (#215 gate r6). It can never cause extra SUPPRESSION — a temp
 // is not a record, so it can never make a real sighting read as already charged — and
 // pruneThrottleSeen ages orphan temps out on the same TTL rather than letting them pile up.
+// #215 gate r9 P2: the whole rename-verify-restore sequence runs under this fingerprint's lock,
+// so it can never interleave with a concurrent claimThrottleSeen's existence-check-then-create
+// for the SAME fingerprint (the round-9 finding: an admitter that read "no record" right before
+// this rename, then created one right after, would otherwise have its fresh record silently
+// renamed aside and — on a generation mismatch below — restored under the ORIGINAL (ino,
+// mtimeMs), losing the admitter's write with no trace).
 function removeThrottleSeenGeneration(name, expected) {  // -> true when that generation was deleted
-  const recordPath = path.join(THROTTLE_SEEN_DIR, name);
-  const tempPath = path.join(THROTTLE_SEEN_DIR, `${name}${THROTTLE_SEEN_EXPIRE_MARK}${process.pid}`);
-  // ENOENT here means another pruner already took this record; nothing of ours to delete.
-  try { fs.renameSync(recordPath, tempPath); } catch { return false; }
-  let actual;
-  try { actual = fs.statSync(tempPath); } catch { return false; }
-  if (actual.ino === expected.ino && actual.mtimeMs === expected.mtimeMs) {
+  return withThrottleSeenLock(name, () => {
+    const recordPath = path.join(THROTTLE_SEEN_DIR, name);
+    const tempPath = path.join(THROTTLE_SEEN_DIR, `${name}${THROTTLE_SEEN_EXPIRE_MARK}${process.pid}`);
+    // ENOENT here means another pruner already took this record; nothing of ours to delete.
+    try { fs.renameSync(recordPath, tempPath); } catch { return false; }
+    let actual;
+    try { actual = fs.statSync(tempPath); } catch { return false; }
+    if (actual.ino === expected.ino && actual.mtimeMs === expected.mtimeMs) {
+      try { fs.unlinkSync(tempPath); } catch {}
+      return true;
+    }
+    try { fs.linkSync(tempPath, recordPath); }
+    catch (err) { if (err?.code !== 'EEXIST') return false; }   // unrestorable: keep the temp, lose nothing else
     try { fs.unlinkSync(tempPath); } catch {}
-    return true;
-  }
-  try { fs.linkSync(tempPath, recordPath); }
-  catch (err) { if (err?.code !== 'EEXIST') return false; }   // unrestorable: keep the temp, lose nothing else
-  try { fs.unlinkSync(tempPath); } catch {}
-  return false;
+    return false;
+  });
 }
 // Runs once per invocation, on first touch of the sidecar: deletes records older than
 // THROTTLE_SEEN_TTL_MS, then — even inside the TTL window — trims the survivor count down to
@@ -600,6 +694,25 @@ function pruneThrottleSeen(protectedKeys = new Set()) {
     let stat;
     try { stat = fs.statSync(recordPath); } catch { continue; }
     const expired = now - stat.mtimeMs > THROTTLE_SEEN_TTL_MS;
+    // #215 gate r9 P2: a lock dir is neither a record nor a temp — it is transient mutex state
+    // withThrottleSeenLock itself removes on release. An aged one means its holder died without
+    // releasing (crash, kill -9); reap it here on the same TTL horizon as everything else in this
+    // directory so an orphaned lock cannot wedge every future claim on this fingerprint forever
+    // (fail-open only bounds the WAIT for a live holder — nothing else in withThrottleSeenLock
+    // ever removes another process's lock short of the stale-reclaim check on the NEXT contended
+    // caller, so a fingerprint nobody else touches would otherwise never get its orphan cleared).
+    // #215 gate r9 verify (independent-verifier P1): the same positive liveness check
+    // withThrottleSeenLock's own reclaim uses — an aged-but-genuinely-live holder's lock must
+    // survive the PRUNE path too, not just the reclaim-on-contention path, or this sweep becomes
+    // the second way to steal a live lock. It may also now contain an 'owner' file, so removal
+    // must be recursive (a plain rmdirSync on that non-empty directory would fail and silently
+    // leave the orphan behind forever).
+    if (throttleSeenIsLock(name)) {
+      if (expired && !throttleSeenLockOwnerAlive(recordPath)) {
+        try { fs.rmSync(recordPath, { recursive: true, force: true }); } catch {}
+      }
+      continue;
+    }
     // A rename-aside temp is NOT a record: it suppresses nothing, so it is never protected and
     // never counted toward the cap — only aged out, so an orphan left by a writer that died
     // mid-swap cannot accumulate (see removeThrottleSeenGeneration). A rename preserves mtime, so
@@ -629,42 +742,14 @@ function pruneThrottleSeen(protectedKeys = new Set()) {
       .forEach(({ name, ino, mtimeMs }) => removeThrottleSeenGeneration(name, { ino, mtimeMs }));
   }
 }
-// #215 gate r8 P2: how long a rename-aside temp is treated as "someone else's record, mid-prune"
-// rather than an aged orphan. Must comfortably exceed the time a rename+stat+link-back takes
-// (microseconds to a few syscalls) and comfortably undercut THROTTLE_SEEN_TTL_MS, so it can never
-// be mistaken for the suppression horizon itself. Not env-overridable — unlike the TTL/MAX knobs
-// above, no test needs to shrink an in-process race window, only to age a temp past it.
-const THROTTLE_SEEN_TEMP_GRACE_MS = 30_000;
-// #215 gate r8 P2: removeThrottleSeenGeneration's rename-aside frees the plain record name BEFORE
-// its link-back restores whichever generation the temp turns out to hold (#215 gate r7 P2's own
-// residual, named where that function is defined). A plain existsSync check during that window
-// sees nothing, so a concurrent scan's 'wx' create wins and charges a SECOND cooldown for the
-// identical sighting the first scan is mid-prune on — the round-8 finding. A temp is evidence a
-// record existed a moment ago IF its mtime is still fresh (rename preserves mtime, so a genuinely
-// aged temp — TTL-expired, orphaned, or simply old — reads old here too, same as it always did);
-// admission treats only a fresh one as "already charged", deferring the sighting to the very next
-// scan rather than re-charging it. One readdirSync per admission call: THROTTLE_SEEN_DIR is
-// capped near THROTTLE_SEEN_MAX (~512) entries and a scan makes only a handful of these calls.
-function throttleSeenFreshTemp(url, hash) {
-  const tempPrefix = `${throttleSeenKey(url, hash)}${THROTTLE_SEEN_EXPIRE_MARK}`;
-  let names;
-  try { names = fs.readdirSync(THROTTLE_SEEN_DIR); } catch { return false; }   // missing dir: nothing fresh
-  const now = Date.now();
-  return names.some((name) => {
-    if (!name.startsWith(tempPrefix)) return false;
-    let stat;
-    try { stat = fs.statSync(path.join(THROTTLE_SEEN_DIR, name)); } catch { return false; }
-    return now - stat.mtimeMs <= THROTTLE_SEEN_TEMP_GRACE_MS;
-  });
-}
-// "Already charged" is now a plain existence check on the record file, not a load-then-scan of
-// an in-memory snapshot — there is no snapshot to go stale, so two processes checking/creating
-// records for the SAME or DIFFERENT fingerprints can never clobber one another (#208 gate r2 P2).
-// #215 gate r8 P2: the record check alone is not enough — see throttleSeenFreshTemp above.
-function throttleAlreadyCharged(url, hash, protectedKeys) {
-  if (!throttleSeenPruned) { throttleSeenPruned = true; pruneThrottleSeen(protectedKeys); }
-  if (fs.existsSync(throttleSeenRecordPath(url, hash))) return true;
-  return throttleSeenFreshTemp(url, hash);
+// "Already charged" is a plain existence check on the record file, not a load-then-scan of an
+// in-memory snapshot — there is no snapshot to go stale. #215 gate r9 P2: the round-8 window this
+// used to need throttleSeenFreshTemp for (a concurrent prune's rename-aside briefly hiding a live
+// record from this existence check) is now closed by claimThrottleSeen taking removeThrottleSeen
+// Generation's own lock before making this check, so the two can never interleave — the caller
+// no longer needs a second, fuzzy "was there recently a temp for this fingerprint" heuristic.
+function throttleAlreadyCharged(url, hash) {
+  return fs.existsSync(throttleSeenRecordPath(url, hash));
 }
 // Creates the record with the 'wx' flag: this throws EEXIST (caught, ignored) if another
 // process already created the SAME fingerprint's file between this call's caller checking
@@ -690,6 +775,23 @@ function recordThrottleSeen(url, hash) {  // -> true when THIS call may charge t
     // a real throttle.
     return err?.code !== 'EEXIST';
   }
+}
+// #215 gate r9 P2: admission (throttleAlreadyCharged's existence check) and creation
+// (recordThrottleSeen's 'wx' create) as ONE unit under this fingerprint's lock — the same lock
+// removeThrottleSeenGeneration takes, so a concurrent prune's rename-verify-restore sequence for
+// this exact fingerprint can never interleave with this check-then-create. The one-shot prune
+// itself stays OUTSIDE the lock (it walks every fingerprint's lock in turn via
+// removeThrottleSeenGeneration, so running it while already holding one fingerprint's lock would
+// self-deadlock) and runs BEFORE, same trigger as the old throttleAlreadyCharged had. Returns
+// 'charged' only when THIS call created a new record — identical to the pre-lock contract
+// (`throttleAlreadyCharged(...) || !recordThrottleSeen(...)`) every caller below is rewritten
+// against.
+function claimThrottleSeen(url, hash, protectedKeys) {
+  if (!throttleSeenPruned) { throttleSeenPruned = true; pruneThrottleSeen(protectedKeys); }
+  return withThrottleSeenLock(throttleSeenKey(url, hash), () => {
+    if (throttleAlreadyCharged(url, hash)) return 'already';
+    return recordThrottleSeen(url, hash) ? 'charged' : 'already';
+  });
 }
 // #208 gate r2 P1: true once ANY throttle surface not proven to belong to another run (no
 // FOREIGN exact marker readable in its text) was observed this invocation — set inside
@@ -730,9 +832,10 @@ function tripThrottleUnowned(url, text, where, foreign = false, protectedKeys = 
     inconclusiveThrottleSeen = true;
   }
   const keys = protectedKeys ?? new Set([throttleSeenKey(url, hash)]);
-  // The pre-check answers the common case cheaply; the 'wx' create is the authority for the
-  // race window after it (exactly one of two simultaneous racers wins and charges).
-  if (throttleAlreadyCharged(url, hash, keys) || !recordThrottleSeen(url, hash)) {
+  // #215 gate r9 P2: claimThrottleSeen holds this fingerprint's lock across the existence check
+  // AND the 'wx' create — the 'wx' flag remains the race's ultimate arbiter (unchanged), the lock
+  // only narrows the window a concurrent prune could interleave in.
+  if (claimThrottleSeen(url, hash, keys) !== 'charged') {
     console.error(`stale throttle modal on unowned tab ${url} already charged; ignoring (${where})`);
     return false;
   }
@@ -1989,6 +2092,13 @@ while (Date.now() < deadline) {
     }
     const fresh = await revalidateReadableStaleSource(revalidateUrl);
     if (fresh?.kind === 'throttle') tripThrottleEvidence(revalidateUrl, fresh, `canonical scratch ${revalidateUrl}`);
+    // #215 gate r9 P1: tripThrottleEvidence only RETURNS past an owned or newly-charged throttle
+    // by exiting the process first (tripThrottleOverConversation / tripThrottle). The only way
+    // execution reaches here with kind 'throttle' is an already-charged, non-foreign sighting —
+    // proof the canonical URL is still this run's readable source, same as the plain
+    // 'inconclusive' case below, so it must retain the same recovery handle instead of falling
+    // through unrecorded and forcing the next invocation to rely on a since-closed tab.
+    if (fresh?.kind === 'throttle' && !fresh.foreign) rememberInconclusiveReadableSource(revalidateUrl);
     if (fresh?.kind === 'cross-bound') {
       rejectCrossBound(revalidateUrl, fresh.foreignMarker, 'canonical scratch');
       // Only null the signal when the rejected URL IS the tab we were scanning: a rejected
