@@ -86,6 +86,8 @@
 //            exists to harvest; the caller keeps the charge but releases recovery ownership.
 // Requires Node >= 21 (global WebSocket); the box runs Node 24.
 
+import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -170,6 +172,31 @@ const PG_HOME = envPath('PRO_GATE_HOME', os.homedir(), '.pro-review-daemon');
 const BLACKLIST_FILE = path.join(PG_HOME, 'salvage-nonmatching.txt');
 // honor the same override pg_health_gate reads, or a detected throttle would never defer runs
 const COOLDOWN_FILE = envPath('PRO_GATE_COOLDOWN_FILE', PG_HOME, 'throttle.cooldown');
+// #208: an abandoned modal on an UNOWNED tab (another run's stale conversation) is account-wide
+// throttle evidence just like our own, but nothing ever closes that tab or clears its modal — so
+// a caller that waits out seconds_remaining and retries has the sweep re-detect the exact same
+// stale sighting and rewrite COOLDOWN_FILE again, forever (observed 3 attempts / 1h45m, pushbot
+// PR #3225). This sidecar remembers which (tab, page/modal-text) pairs already charged a
+// cooldown so a repeat of the SAME stale tab is ignored instead of re-arming the timer.
+// #208 gate r2 P2: one record file per (url, hash) fingerprint in this DIRECTORY, not a single
+// file loaded once and rewritten wholesale. Two scans of the same invocation window (probe +
+// harvest, or two overlapping probes) each used to load the sidecar once at first use and
+// rewrite it wholesale on every new sighting — a second process's load-then-mutate-then-rewrite
+// could always land after the first's, silently dropping whichever sighting lost the race. A
+// directory of independently created files removes the shared mutable state entirely: each
+// record is created with the 'wx' flag (openThrottleSeenRecord below), which fails if the file
+// already exists, so no writer can ever clobber another's record and "already charged" is a
+// plain existence check. `||` (not `??`) matches this repo's env-override convention (bash reads
+// `${VAR:-default}`, so an exported-but-empty override falls back too, same as here).
+const THROTTLE_SEEN_DIR = process.env.PRO_GATE_THROTTLE_SEEN_DIR || path.join(PG_HOME, 'throttle.cooldown.seen.d');
+// Records older than this are pruned (best-effort) the first time this invocation touches the
+// directory, and the survivors are capped to THROTTLE_SEEN_MAX (oldest mtime first) even inside
+// the TTL window — otherwise a long-lived box accumulates one file per distinct stale (url,
+// hash) pair forever. `||` matches the same env-override convention as above.
+const THROTTLE_SEEN_TTL_MS = Number(process.env.PRO_GATE_THROTTLE_SEEN_TTL) || 7 * 24 * 60 * 60 * 1000;
+// #208 gate r3 P2: overridable so a test can shrink the cap without waiting for 512 distinct
+// tabs. `||` matches the same env-override convention as above.
+const THROTTLE_SEEN_MAX = Number(process.env.PRO_GATE_THROTTLE_SEEN_MAX) || 512;
 
 // --- conversation-URL memory (v0.25) -------------------------------------------------
 // One file per run marker holding the conversation URL we PROVED carries it. This is the
@@ -184,6 +211,14 @@ const PENDING_DIR = path.join(PG_HOME, 'pending');
 // recovery handle. rememberUrl()'s eviction below reads this by existence only.
 const RESERVATION_DIR = envPath('PRO_GATE_RESERVATION_DIR', PG_HOME, 'in-progress');
 const MEMO_KEEP = 200;                  // newest N unprotected memos retained; older ones are pruned on write
+// #208 gate r1 P1: a stale unowned tab can legitimately fingerprint under TWO different hashes
+// across invocations (modal text vs. whole-page text) when a marker-less interstitial also
+// carries a throttle modal — the two trip sites used to disagree on which text to hash. Every
+// trip site now consistently prefers the modal text when one is present (classifyEvidence and
+// every direct caller below), and #208 gate r2 P2's one-file-per-(url, hash) sidecar (see
+// THROTTLE_SEEN_DIR above) keeps every distinct fingerprint ever seen for a URL rather than a
+// short bounded history of them, so "already charged" recognizes either fingerprint without a
+// per-URL cap here at all.
 const MARKER_SAFE_RE = /^pg-run-[A-Za-z0-9.-]+$/;
 // #167: the marker is EXTRACTED case-insensitively everywhere but used to be COMPARED
 // case-sensitively, so a model that lowercased its own echo — markers legitimately carry
@@ -439,12 +474,396 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function isThrottlePage(text) {
   return !!text && text.length < 5000 && !FOREIGN_MARKER_RE.test(text) && THROTTLE_RE.test(text);
 }
-function recordThrottle(where) {
+// #208 gate r6 P2: fingerprint records recordThrottleSeen creates below are provisional until the
+// cooldown they gate actually lands — tracked here so a failed or interrupted write can be rolled
+// back instead of leaving a "seen" record with no cooldown behind it, which would suppress that
+// sighting forever. Always drained by the very next recordThrottle call: every charging site in
+// this file is synchronous between creating a record and publishing the cooldown it gates.
+let pendingThrottleSeenRecords = [];
+function recordThrottle(where) {  // -> true when the cooldown was actually written
   try {
     fs.mkdirSync(PG_HOME, { recursive: true });
     fs.writeFileSync(COOLDOWN_FILE, `${new Date().toISOString()} ${where}\n`);
-  } catch {}
+  } catch {
+    // The sighting is real even though the write failed; do not claim otherwise on stderr, and do
+    // not let a record already committed by recordThrottleSeen outlive this failure — roll back
+    // every fingerprint this charge provisionally created so it stays re-chargeable on a later
+    // scan instead of silently suppressed by a "seen" record with no cooldown behind it.
+    for (const recordPath of pendingThrottleSeenRecords.splice(0)) { try { fs.unlinkSync(recordPath); } catch {} }
+    console.error(`ChatGPT throttle interstitial detected (${where}) but the cooldown could not be written to ${COOLDOWN_FILE} — leaving the sighting re-chargeable, NOT suppressed.`);
+    return false;
+  }
+  pendingThrottleSeenRecords.length = 0;
   console.error(`ChatGPT throttle interstitial detected (${where}) — cooldown written to ${COOLDOWN_FILE}. Back off; do NOT resubmit.`);
+  return true;
+}
+// #208: sha256 of the modal/page text, not the raw text — the sidecar never persists scraped
+// conversation content to disk, only a fingerprint of it.
+function throttleTextHash(text) {
+  return createHash('sha256').update(text ?? '').digest('hex');
+}
+// #208 gate r2 P2: the record file for one (url, hash) fingerprint. Named by hashing the pair
+// (not the raw url/hash, which could collide with path separators or exceed filename limits) so
+// two concurrent writers computing the SAME fingerprint always agree on the SAME path — that
+// agreement, not a lock, is what makes the 'wx'-flag create in recordThrottleSeen race-safe.
+function throttleSeenKey(url, hash) {
+  return createHash('sha256').update(`${url}\n${hash}`).digest('hex');
+}
+function throttleSeenRecordPath(url, hash) {
+  return path.join(THROTTLE_SEEN_DIR, throttleSeenKey(url, hash));
+}
+// #215 gate r7 P2: the mark a rename-aside temp created by removeThrottleSeenGeneration carries.
+// A record basename is bare sha256 hex (throttleSeenKey), so a name carrying this mark can only
+// be a temp — every place that reads this directory AS RECORDS skips it.
+const THROTTLE_SEEN_EXPIRE_MARK = '.expire.';
+function throttleSeenIsTemp(name) { return name.includes(THROTTLE_SEEN_EXPIRE_MARK); }
+// #215 gate r10 P2: withThrottleSeenLock's mutex FILES. A record basename is bare sha256 hex and a
+// temp always carries THROTTLE_SEEN_EXPIRE_MARK, so neither can end in '.lockf' — every place that
+// reads this directory AS a record or a temp must skip these too. pruneThrottleSeen never deletes
+// them: there is nothing to reclaim (see withThrottleSeenLock below) and nothing to age out.
+function throttleSeenIsLockFile(name) { return name.endsWith('.lockf'); }
+// #215 gate r11 P2 (paid-review round 11 [P2] bin/cdp-salvage.mjs:683): one lock file PER
+// FINGERPRINT was exempt from both the TTL and the capacity cap, so the sidecar kept one inode per
+// fingerprint this box had ever seen and every prune stat'ed all of them, forever. Fingerprints
+// now map onto a FIXED pool of lock files: the last 32 bits of the fingerprint's sha256 hex modulo
+// THROTTLE_SEEN_LOCK_SLOTS. The mapping is the same for admission (claimThrottleSeen) and removal
+// (removeThrottleSeenGeneration) because both go through withThrottleSeenLock with the same
+// fingerprint name, so one fingerprint is still serialized against itself; two fingerprints that
+// share a slot merely serialize against each other for the microseconds a critical section lasts
+// (no lock in this file is ever held while taking another, so shared slots cannot deadlock). A
+// name that is not hex (never produced here) lands in slot 0 — still correct, just more shared.
+const THROTTLE_SEEN_LOCK_SLOTS = 64;
+function throttleSeenLockSlot(name) {  // -> 'lock-NN.lockf': the same slot for the same name, always
+  const n = parseInt(name.slice(-8), 16);
+  const slot = Number.isNaN(n) ? 0 : n % THROTTLE_SEEN_LOCK_SLOTS;
+  return `lock-${String(slot).padStart(2, '0')}.lockf`;
+}
+// #215 gate r10 P2 (paid-review round 10 [P2] bin/cdp-salvage.mjs:591): the round-9 pathname lock
+// (mkdirSync as a mutex, reclaimed by mtime + a liveness-checked owner token) still let two
+// reclaimers observe the SAME dead lock and both act on it — a delayed reclaimer's rename could
+// land on a WINNER's freshly re-created live lock instead of failing with ENOENT, so the delayed
+// reclaimer deleted a live lock and entered the protected section concurrently with its winner
+// (and pruneThrottleSeen's own lock-reap repeated the same check-then-rename race). No amount of
+// fencing on a pathname primitive closes that: the fix is to stop reclaiming pathnames at all and
+// hand the mutex to the kernel via flock(2) on a stable, never-unlinked file.
+//   - The lock file is throttleSeenLockSlot(name) inside THROTTLE_SEEN_DIR (#215 gate r11 P2: a
+//     fixed pool, not one file per fingerprint), opened once with fs.openSync(path, 'a') —
+//     created if missing, never written, never unlinked (there is nothing to reclaim: an
+//     open file description lock is automatically released by the kernel when the holding process
+//     exits or is killed, crashed or not — so "stale lock" is not a state that can exist here).
+//   - The util-linux `flock` binary is spawned with that fd INHERITED as its fd 3
+//     (`stdio: ['ignore', 'ignore', 'pipe', fd]`) and told to take an exclusive lock on fd 3 and
+//     exit (`flock -x -w <secs> 3`). The exclusive lock lives on the OPEN FILE DESCRIPTION, which
+//     this process still holds after the child exits — so the lock stays held by THIS process
+//     until fs.closeSync(fd) releases it. That close, in a `finally`, is the only release path.
+//   - Exit 0: acquired. Exit 1 (the `-w` timeout): contended past the wait budget — fail open
+//     (every sidecar path in this file is fail-open) with the same stderr line round 9 printed,
+//     still running fn without the lock. A spawn failure (ENOENT — no flock binary, e.g. macOS)
+//     fails open too, but warns only ONCE per process: unlike contention, a missing binary is a
+//     fixed fact about this host, not a fact about this one fingerprint, so repeating it on every
+//     prune/claim call would just be noise.
+const THROTTLE_SEEN_LOCK_WAIT_MS = 250;
+const THROTTLE_SEEN_LOCK_WAIT_SECS = (THROTTLE_SEEN_LOCK_WAIT_MS / 1000).toFixed(3);
+let throttleSeenFlockMissingWarned = false;
+function withThrottleSeenLock(name, fn) {
+  try { fs.mkdirSync(THROTTLE_SEEN_DIR, { recursive: true }); } catch {}
+  const lockPath = path.join(THROTTLE_SEEN_DIR, throttleSeenLockSlot(name));
+  let fd = null;
+  try {
+    try {
+      fd = fs.openSync(lockPath, 'a');
+    } catch (err) {
+      // Not contention (ENOSPC, EPERM, missing parent, ...): fail open like every other sidecar
+      // write in this file rather than block a claim or a prune on a filesystem problem.
+      console.error(`throttle-seen lock file unavailable for ${name} (${err?.code ?? err}); proceeding without it (fail-open)`);
+    }
+    if (fd !== null) {
+      let result;
+      try {
+        result = spawnSync('flock', ['-x', '-w', THROTTLE_SEEN_LOCK_WAIT_SECS, '3'], {
+          stdio: ['ignore', 'ignore', 'pipe', fd],
+        });
+      } catch (err) {
+        result = { error: err };
+      }
+      if (result.error) {
+        // ENOENT (no flock binary on this host, e.g. macOS) or any other spawn failure: a fixed
+        // fact about this host, not about this one fingerprint, so warn once per process rather
+        // than on every prune/claim call for the rest of the run.
+        if (!throttleSeenFlockMissingWarned) {
+          throttleSeenFlockMissingWarned = true;
+          console.error(`flock binary unavailable (${result.error?.code ?? result.error}); proceeding without a throttle-seen lock for the rest of this process (fail-open)`);
+        }
+      } else if (result.status !== 0) {
+        // status 1 (the -w timeout) or a signal (status null): contended past the wait budget.
+        console.error(`throttle-seen lock contended past ${THROTTLE_SEEN_LOCK_WAIT_MS}ms for ${name}; proceeding without it (fail-open)`);
+      }
+      // status === 0: acquired. The exclusive flock now lives on the open file description `fd`
+      // refers to, held by THIS process regardless of the flock child having already exited.
+    }
+    return fn();
+  } finally {
+    // This IS the release: closing every fd this process holds on the file drops the flock the
+    // kernel associated with that open file description. Never unlink lockPath here — it stays on
+    // disk for the next claim on this fingerprint to open and lock again.
+    if (fd !== null) { try { fs.closeSync(fd); } catch {} }
+  }
+}
+// #215 gate r7 P2: delete ONLY the record generation that was actually checked — `expected` is
+// the { ino, mtimeMs } of the very stat that decided this record should go. A plain unlink cannot
+// express that. Between one scan's stat and its unlink, another scan can expire the same record,
+// create its REPLACEMENT with the 'wx' arbiter and publish the cooldown that replacement gates;
+// the first scan's unlink would then delete a fresh, committed fingerprint it never looked at —
+// and, pruning a fingerprint outside its own observed batch, it never recreates one — so the very
+// next unchanged sighting charges a second cooldown inside the same horizon. Instead:
+//   1. renameSync the record aside to a sibling temp. Rename is atomic and frees the NAME, so a
+//      concurrent 'wx' create racing us lands a NEW record at that name instead of being
+//      clobbered, and no reader ever sees a half-deleted record.
+//   2. stat the temp: identical (ino, mtimeMs) means it IS the generation we checked -> unlink it.
+//   3. otherwise the record was replaced between our stat and our rename -> link it back under
+//      its own name. EEXIST means a newer record already holds the name (the replacement, or a
+//      third writer's) — drop the temp and leave that record alone.
+// A link failure that is NOT EEXIST leaves the temp in place: never destroy a record that could
+// not be restored. That, and a crash between the rename and the restore, is the one residual —
+// deliberate, and in the safe direction. It leaves at most ONE orphan temp per (record, pid), and
+// an orphan temp is a LOST record: the fingerprint it held stops suppressing, so the next
+// unchanged sighting costs at most one EXTRA cooldown inside the horizon, the same bounded re-arm
+// `bounded-dedupe` already accepts (#215 gate r6). It can never cause extra SUPPRESSION — a temp
+// is not a record, so it can never make a real sighting read as already charged — and
+// pruneThrottleSeen ages orphan temps out on the same TTL rather than letting them pile up.
+// #215 gate r9 P2: the whole rename-verify-restore sequence runs under this fingerprint's lock,
+// so it can never interleave with a concurrent claimThrottleSeen's existence-check-then-create
+// for the SAME fingerprint (the round-9 finding: an admitter that read "no record" right before
+// this rename, then created one right after, would otherwise have its fresh record silently
+// renamed aside and — on a generation mismatch below — restored under the ORIGINAL (ino,
+// mtimeMs), losing the admitter's write with no trace).
+function removeThrottleSeenGeneration(name, expected) {  // -> true when that generation was deleted
+  return withThrottleSeenLock(name, () => {
+    const recordPath = path.join(THROTTLE_SEEN_DIR, name);
+    const tempPath = path.join(THROTTLE_SEEN_DIR, `${name}${THROTTLE_SEEN_EXPIRE_MARK}${process.pid}`);
+    // ENOENT here means another pruner already took this record; nothing of ours to delete.
+    try { fs.renameSync(recordPath, tempPath); } catch { return false; }
+    let actual;
+    try { actual = fs.statSync(tempPath); } catch { return false; }
+    if (actual.ino === expected.ino && actual.mtimeMs === expected.mtimeMs) {
+      try { fs.unlinkSync(tempPath); } catch {}
+      return true;
+    }
+    try { fs.linkSync(tempPath, recordPath); }
+    catch (err) { if (err?.code !== 'EEXIST') return false; }   // unrestorable: keep the temp, lose nothing else
+    try { fs.unlinkSync(tempPath); } catch {}
+    return false;
+  });
+}
+// Runs once per invocation, on first touch of the sidecar: deletes records older than
+// THROTTLE_SEEN_TTL_MS, then — even inside the TTL window — trims the survivor count down to
+// THROTTLE_SEEN_MAX, oldest mtime first. Best-effort: a failure here (races with another
+// process's own prune, permissions, ENOENT) never blocks charging or reading a record.
+// The two evictions answer to different rules, and the ORDER below is the rule:
+//   * TTL is the SUPPRESSION HORIZON and applies to EVERYTHING — every record, whether or not
+//     the current scan is looking at it. It is checked FIRST, before any protection, so an
+//     expired record is always deleted. An unchanged stale tab therefore re-arms the cooldown
+//     at most once per THROTTLE_SEEN_TTL, never "once and then never again": suppression is
+//     bounded by the horizon, not permanent (#208, #215 gate r6, choice bounded-dedupe).
+//   * Capacity protection is SCAN-SCOPED. `protectedKeys` (record-file basenames the CURRENT
+//     scan already knows it is about to check — computed by the caller BEFORE this prune runs)
+//     are exempt from the CAPACITY trim only, never from the TTL above. Without that exemption
+//     (#208 gate r3 P2) a fingerprint still visible on every single scan could be the one the
+//     capacity trim picks (oldest mtime first) — evicted, then immediately rediscovered as
+//     "new" by the same scan's own admission check and recreated with a fresh
+//     mtime, so a persistent batch above THROTTLE_SEEN_MAX charges a fresh cooldown on every
+//     invocation forever instead of once per horizon. A protected fingerprint can still exceed
+//     the nominal cap on disk; that is the correct trade — the cap is only ever enforced
+//     against records this scan does NOT need.
+// #215 gate r7 P2: BOTH evictions delete through removeThrottleSeenGeneration, carrying the exact
+// (ino, mtimeMs) of the stat that condemned the record — a concurrent scan's freshly committed
+// replacement is never deleted by a decision taken about the generation it replaced.
+let throttleSeenPruned = false;
+function pruneThrottleSeen(protectedKeys = new Set()) {
+  let names;
+  try { names = fs.readdirSync(THROTTLE_SEEN_DIR); } catch { return; }
+  const now = Date.now();
+  const stats = [];
+  for (const name of names) {
+    // #215 gate r10 P2: a '.lockf' file is the OS-managed mutex withThrottleSeenLock opens and
+    // flocks — never a record, never a temp, and never reclaimed or reaped here. There is no
+    // stale-lock state to detect any more (a crashed holder's flock is released by the kernel the
+    // instant the process dies, not left for a sweep to notice), so unlike the round-9 lock dirs
+    // this file is simply skipped, forever — and (#215 gate r11 P2) skipped by NAME, before the
+    // stat: the pool is fixed at THROTTLE_SEEN_LOCK_SLOTS files, so a prune's work is bounded by
+    // the records it holds, never by lifetime fingerprint history.
+    if (throttleSeenIsLockFile(name)) continue;
+    const recordPath = path.join(THROTTLE_SEEN_DIR, name);
+    let stat;
+    try { stat = fs.statSync(recordPath); } catch { continue; }
+    const expired = now - stat.mtimeMs > THROTTLE_SEEN_TTL_MS;
+    // A rename-aside temp is NOT a record: it suppresses nothing, so it is never protected and
+    // never counted toward the cap — only aged out, so an orphan left by a writer that died
+    // mid-swap cannot accumulate (see removeThrottleSeenGeneration). A rename preserves mtime, so
+    // a temp inherits its record's age and expires no later than one horizon after that record
+    // was written, never restarting the clock.
+    if (throttleSeenIsTemp(name)) {
+      if (expired) { try { fs.unlinkSync(recordPath); } catch {} }
+      continue;
+    }
+    // TTL first, protection second: an expired record is deleted even when this scan is
+    // currently observing its fingerprint — that sighting then re-arms once, and the fresh
+    // record it writes suppresses the same tab for another full horizon.
+    if (expired) {
+      removeThrottleSeenGeneration(name, stat);
+      continue;
+    }
+    // Unexpired AND observed by this scan: exempt from the capacity trim, and deliberately not
+    // counted toward the survivor total either (the cap governs only records this scan can
+    // afford to lose).
+    if (protectedKeys.has(name)) continue;
+    stats.push({ name, ino: stat.ino, mtimeMs: stat.mtimeMs });
+  }
+  if (stats.length > THROTTLE_SEEN_MAX) {
+    stats
+      .sort((a, b) => a.mtimeMs - b.mtimeMs)
+      .slice(0, stats.length - THROTTLE_SEEN_MAX)
+      .forEach(({ name, ino, mtimeMs }) => removeThrottleSeenGeneration(name, { ino, mtimeMs }));
+  }
+}
+// Creates the record with the 'wx' flag and reports whether THIS call's create actually won it.
+// claimThrottleSeen below is the only caller, and it only reaches this create after establishing
+// the record is either absent or expired, so an EEXIST here means one of two things: a live
+// fingerprint someone else just charged in the fail-open window (the per-fingerprint flock was
+// contended past budget or the binary is missing — the lock closes this race when it is HELD, not
+// via this flag alone), or a best-effort unlink of an expired record that failed (an unwritable
+// directory). claimThrottleSeen tells those two apart itself (#215 gate r10 verify); this function
+// only ever reports whether ITS OWN write is the one that landed. Any OTHER failure (ENOSPC, a
+// missing parent that mkdirSync also could not create, ...) keeps the fail-open rule every sidecar
+// write in this file follows: report a win so a sidecar problem can never silence a real throttle.
+function recordThrottleSeen(url, hash) {  // -> true when THIS call's 'wx' create actually won
+  try {
+    fs.mkdirSync(THROTTLE_SEEN_DIR, { recursive: true });
+    const recordPath = throttleSeenRecordPath(url, hash);
+    fs.writeFileSync(recordPath, '', { flag: 'wx' });
+    // #208 gate r6 P2: this record is provisional — the 'wx' create still has to win the race
+    // BEFORE the cooldown it gates is attempted (it remains the sole race arbiter), but it must
+    // not outlive a failed publish. recordThrottle rolls it back if that write fails.
+    pendingThrottleSeenRecords.push(recordPath);
+    return true;
+  } catch (err) {
+    return err?.code !== 'EEXIST';
+  }
+}
+// #215 gate r10 P2 (paid-review round 10 [P2] bin/cdp-salvage.mjs:768): admission used to be a
+// PLAIN EXISTENCE check — ANY record, however old, read as "already charged", even one
+// pruneThrottleSeen already tried and failed to remove (a readable seen directory that is not
+// WRITABLE: removeThrottleSeenGeneration's rename/unlink best-effort-fails and leaves the
+// expired record in place, but existence-only admission still returned true for it). An
+// eight-day-old fingerprint could then suppress a real throttle sighting on every invocation,
+// forever, without ever publishing the cooldown it was supposed to keep re-arming inside the
+// horizon — the opposite of fail-open.
+// Admission now checks the record's OWN AGE under this fingerprint's lock, not just its
+// existence: an unexpired record is still "already" (unchanged from before). An EXPIRED record
+// is never "already" — it is unlinked (best-effort) and the sighting proceeds to the 'wx' create
+// exactly as if no record existed at all. If that create still fails with EEXIST AFTER our own
+// unlink attempt failed, the stale file we could not remove is almost certainly the reason the
+// create lost, so this still returns 'charged': a sidecar problem must never silence a real
+// throttle, so an unwritable sidecar disables dedupe entirely — deliberately, not a residual bug
+// — rather than suppress a live throttle sighting with no cooldown behind it.
+// #215 gate r10 verify (independent-verifier P2): that fail-open case is the ONLY one allowed to
+// override recordThrottleSeen's own report. When admission saw no record at all (or one it
+// successfully unlinked) and the 'wx' create still lost, that EEXIST means a concurrent claim on
+// this EXACT fingerprint — reachable only while the per-fingerprint flock is fail-open itself
+// (contended past budget, or the binary missing) — won the race in the instant between our stat
+// and our own create; recordThrottleSeen's return is what tells "someone else already holds this
+// sighting" (already) apart from "our own write is the one that landed" (charged), restoring the
+// 'wx' flag as the arbiter be2271f established and this file's own comments still describe.
+function claimThrottleSeen(url, hash, protectedKeys) {
+  if (!throttleSeenPruned) { throttleSeenPruned = true; pruneThrottleSeen(protectedKeys); }
+  return withThrottleSeenLock(throttleSeenKey(url, hash), () => {
+    const recordPath = throttleSeenRecordPath(url, hash);
+    let stat = null;
+    try { stat = fs.statSync(recordPath); } catch {}
+    let expiredUnlinkFailed = false;
+    if (stat) {
+      if (Date.now() - stat.mtimeMs <= THROTTLE_SEEN_TTL_MS) return 'already';
+      // #215 gate r12 P2 (paid-review round 12 [P2] bin/cdp-salvage.mjs:786): ENOENT here is NOT a
+      // failed expiry — it means another writer already removed the expired record (the fail-open
+      // window: this record crossed its TTL between the one-time prune and this claim's lock wait,
+      // and a concurrent claim expired it first). Counting it as a failed unlink let this caller
+      // override a lost 'wx' create below and publish a duplicate cooldown for a sighting the other
+      // writer had just charged. Only a record that is still THERE after a failed unlink (EACCES,
+      // EPERM, EROFS, ...) is the fail-open case decision 2 describes.
+      try { fs.unlinkSync(recordPath); } catch (err) { if (err?.code !== 'ENOENT') expiredUnlinkFailed = true; }
+    }
+    if (recordThrottleSeen(url, hash)) return 'charged';
+    return expiredUnlinkFailed ? 'charged' : 'already';
+  });
+}
+// #208 gate r2 P1: true once ANY throttle surface not proven to belong to another run (no
+// FOREIGN exact marker readable in its text) was observed this invocation — set inside
+// tripThrottleUnowned below, the one shared gate every unowned throttle trip already routes
+// through, regardless of whether that sighting turned out to be charged (genuinely new) or
+// ignored (already charged earlier). Consulted only once, at the very end of the scan: a
+// throttle surface that is not POSITIVELY someone else's conversation is inconclusive evidence,
+// never proof "marker" is gone, so it must not let the scan fall through to a confirmed-absent
+// exit 4 — that wrongly spends a paid review's finite recovery-miss budget on a rate limit.
+let inconclusiveThrottleSeen = false;
+let inconclusiveThrottleWhere = null;
+// #208: the CENTRAL gate every UNOWNED throttle trip routes through — the whole-scan modal
+// fallback, the per-tab interstitial check in the probe/harvest reads loop, and the organizer
+// scan's direct throttle check all call this before charging a cooldown. OWNED sightings (this
+// run's exact marker under the modal) never call it: #162's contract is that those re-arm
+// unconditionally every time, because they are this run's own positive existence proof.
+// `foreign` (default false — the common case: a markerless interstitial can never be foreign by
+// isThrottlePage's own construction) is true only when the caller already proved the page under
+// the surface carries ANOTHER run's exact marker; that is the ONLY case allowed to skip setting
+// inconclusiveThrottleSeen, per the r2 P1 rule above.
+// Returns false — and charges no NEW record — when (url, hash-of-text) was already charged by an
+// earlier unowned trip (this scan or a prior invocation's): the caller must skip
+// recordThrottle/exit and treat the tab as though it carried no modal at all. Returns true for a
+// genuinely new sighting, after recording it so a later trip (this scan or the next invocation)
+// recognizes it too.
+// `protectedKeys` (default: just this call's own fingerprint) is forwarded to
+// claimThrottleSeen's one-time prune so the CAPACITY trim never evicts a fingerprint the
+// CURRENT scan still needs (#208 gate r3 P2) — a batch call passes the whole batch's keys so all
+// of them survive the same trim, not just whichever happens to be checked first. Protection is
+// capacity-only: an entry past THROTTLE_SEEN_TTL_MS is expired regardless (#215 gate r6), so a
+// stale tab nobody closes re-arms the cooldown once per horizon rather than being suppressed
+// forever.
+function tripThrottleUnowned(url, text, where, foreign = false, protectedKeys = null) {
+  const hash = throttleTextHash(text);
+  if (!foreign) {
+    // Name the FIRST surface that made this scan inconclusive; later hits keep the flag set.
+    if (!inconclusiveThrottleSeen) inconclusiveThrottleWhere = where;
+    inconclusiveThrottleSeen = true;
+  }
+  const keys = protectedKeys ?? new Set([throttleSeenKey(url, hash)]);
+  // #215 gate r9/r10 P2: claimThrottleSeen holds this fingerprint's OS lock across the age check
+  // AND the 'wx' create — the 'wx' flag remains a belt-and-suspenders arbiter, the lock is what
+  // now excludes a concurrent prune or claim on this exact fingerprint from interleaving at all.
+  if (claimThrottleSeen(url, hash, keys) !== 'charged') {
+    console.error(`stale throttle modal on unowned tab ${url} already charged; ignoring (${where})`);
+    return false;
+  }
+  return true;
+}
+// #208 gate r2 P2: charge EVERY genuinely new sighting in `hits` (not merely the first) before
+// the caller writes its single cooldown. `hits` is [{ url, text, foreign, where }]. The old
+// per-hit walk stopped at the first newly admitted sighting and exited immediately, so one
+// already-open batch of N stale tabs cost N separate invocations' worth of cooldowns — one
+// newly-discovered tab at a time — instead of the one cooldown this single scan, which saw every
+// hit in the batch at once, should have charged. This helper only decides and records which
+// hits were new; exiting or returning is left to the caller (the main scan exits 5, the
+// organizer instead returns a result object). Returns the first newly admitted hit's `where`
+// (recordThrottle's message then names the same specific tab a single-shot trip site would have
+// named), or null when every hit in the batch was already charged.
+// #208 gate r3 P2: compute every hit's fingerprint key BEFORE any of them is checked, so the
+// one-time prune this batch triggers (see pruneThrottleSeen) protects the WHOLE batch, not just
+// whichever hit happens to be first in list order.
+function tripThrottleUnownedBatch(hits) {
+  const protectedKeys = new Set(hits.map(({ url, text }) => throttleSeenKey(url, throttleTextHash(text))));
+  let firstNewWhere = null;
+  for (const { url, text, foreign, where } of hits) {
+    if (tripThrottleUnowned(url, text, where, foreign, protectedKeys) && firstNewWhere === null) firstNewWhere = where;
+  }
+  return firstNewWhere;
 }
 function tripThrottle(where) {
   recordThrottle(where);
@@ -465,9 +884,12 @@ function tripThrottleOverConversation(url, where) {
   process.exit(0);
 }
 // Route throttle evidence from any surface: owned (modal over our marker) proves existence,
-// anything else (interstitial, modal over a foreign or blacklisted page) proves only the limiter.
+// anything else (interstitial, modal over a foreign or blacklisted page) proves only the limiter
+// — and only when tripThrottleUnowned confirms it is not a stale repeat of a sighting already
+// charged (#208).
 function tripThrottleEvidence(url, evidence, where) {
   if (evidence.owned) tripThrottleOverConversation(url, where);
+  if (!tripThrottleUnowned(url, evidence.hashText, where, evidence.foreign)) return;
   tripThrottle(where);
 }
 
@@ -1006,7 +1428,21 @@ async function openOrganizerScratch(url) {
       const [text, throttleModal] = await Promise.all([tabText(live), tabThrottleModal(live)]);
       if (!text) continue;
       // #162: the modal is throttle evidence too; organizer traffic must stop on either form.
-      if (isThrottlePage(text) || throttleModal) return { target: live, reason: 'throttle' };
+      // #208 gate r6 P2: carry back enough for the caller to apply the same unowned gate every
+      // other throttle trip site in this file uses — an interstitial can never be owned
+      // (isThrottlePage's own construction excludes any marker at all, ours or foreign); a
+      // modal's underlying page can still carry this run's exact marker beneath it.
+      if (isThrottlePage(text) || throttleModal) {
+        const owned = !!throttleModal && hasExactMarker(text, marker);
+        return {
+          target: live,
+          reason: 'throttle',
+          throttleUrl: url,
+          throttleHashText: throttleModal ?? text,
+          throttleOwned: owned,
+          throttleForeign: !owned && FOREIGN_MARKER_RE.test(text),
+        };
+      }
       if (hasExactMarker(text, marker)) {
         const ownership = mutationOwnership(text);
         return ownership.owned
@@ -1127,9 +1563,43 @@ async function organizeConversation() {
     const [text, throttleModal] = await Promise.all([tabText(tab), tabThrottleModal(tab)]);
     return { tab, text, throttleModal };
   }));
-  if (reads.some(({ text, throttleModal }) => isThrottlePage(text) || throttleModal)) {
-    recordThrottle('organizer scan');
-    return { ...result, reason: 'throttle' };
+  const throttleHits = reads.filter(({ text, throttleModal }) => isThrottlePage(text) || throttleModal);
+  if (throttleHits.length > 0) {
+    // #162 semantics preserved: an OWNED sighting (this run's exact marker under the modal)
+    // always re-arms, decided over the whole scan so a foreign tab listed first cannot hide it.
+    const ownedHit = throttleHits.find(({ tab, text }) => !nonMatching.has(tab.url) && hasExactMarker(text, marker));
+    if (ownedHit) {
+      recordThrottle('organizer scan');
+      return { ...result, reason: 'throttle' };
+    }
+    // Unowned: route through the same dedupe gate (#208) every other unowned trip uses, or a
+    // stale foreign tab left open re-arms the account cooldown on every later organizer scan.
+    // #208 gate r2 P2: charge EVERY unowned hit in list order first, then write exactly one
+    // cooldown — mirroring the main loop's whole-scan walk. The old per-hit walk returned on the
+    // first newly admitted hit, leaving the rest of a batch un-recorded for the next organizer
+    // scan to rediscover one stale tab at a time (checking only throttleHits[0] had the same bug
+    // one layer up: an already-charged stale tab listed first hid a genuinely new unowned modal
+    // listed behind it). Each skipped repeat still logs "ignoring" via tripThrottleUnowned itself.
+    const firstNewWhere = tripThrottleUnownedBatch(throttleHits.map((hit) => ({
+      url: hit.tab.url,
+      text: hit.throttleModal ?? hit.text,
+      // #215 gate r1 P1: FOREIGN_MARKER_RE matches ANY pg-run marker, THIS run's included, so a
+      // BLACKLISTED tab bearing our own marker used to read as another run's conversation — the
+      // one classification allowed to skip inconclusiveThrottleSeen — and dropped the scan into
+      // confirmed-absent exit 4 on nothing but a rate limit. Ask "is this ours?" first, exactly as
+      // classifyEvidence's reference predicate does (`foreign: !owned && FOREIGN_MARKER_RE...`).
+      // Blacklisted URLs remain excluded from POSITIVE ownership by ownedHit above; this decides
+      // only whether the surface is proven to be SOMEONE ELSE'S, the sole basis for disregarding
+      // a throttle sighting when deciding absence.
+      foreign: !!hit.text && !hasExactMarker(hit.text, marker) && FOREIGN_MARKER_RE.test(hit.text),
+      where: 'organizer scan',
+    })));
+    if (firstNewWhere !== null) {
+      recordThrottle(firstNewWhere);
+      return { ...result, reason: 'throttle' };
+    }
+    // No unowned hit was newly admitted — every sighting this scan found was already charged.
+    // Fall through as though no modal/interstitial were present at all.
   }
 
   const candidatesByUrl = new Map();
@@ -1174,11 +1644,33 @@ async function organizeConversation() {
     source = 'open';
   } else {
     const recoveryUrl = acceptedUrl ?? (candidateUrls.length === 0 ? rememberedUrl : null);
-    if (!recoveryUrl) return { ...result, reason: rejectionReason };
+    if (!recoveryUrl) {
+      // #208 gate r2 P1: this scan found no owned target anywhere (no open owned tab, no usable
+      // remembered URL) — the organizer's analog of the main scan's confirmed-absent exit 4. If
+      // an unowned throttle surface not proven foreign was also observed this scan (the walk
+      // above charged or ignored it), that surface is the reason nothing owned was found and it
+      // is NOT proof "marker" is gone — report inconclusive throttle instead, same as the main
+      // scan, without rewriting the cooldown (tripThrottleUnowned already decided that).
+      if (inconclusiveThrottleSeen) {
+        console.error(`inconclusive: an unowned throttle surface was observed this scan (${inconclusiveThrottleWhere}) `
+          + `and not proven to belong to another run — NOT evidence "${marker}" is gone`);
+        return { ...result, reason: 'throttle' };
+      }
+      return { ...result, reason: rejectionReason };
+    }
     if (nonMatching.has(recoveryUrl)) return { ...result, reason: 'provenance-rejected' };
     const scratch = await openOrganizerScratch(recoveryUrl);
     if (!scratch.text || !scratch.target) {
-      if (scratch.reason === 'throttle') recordThrottle('organizer scratch');
+      // #208 gate r6 P2: an OWNED sighting (our own marker under the modal) still always
+      // re-arms unconditionally; an unowned one routes through the same central gate every
+      // other unowned trip in this file uses, so an already-charged repeat surfaced through
+      // scratch recovery cannot re-arm the cooldown.
+      if (scratch.reason === 'throttle') {
+        if (scratch.throttleOwned
+            || tripThrottleUnowned(scratch.throttleUrl, scratch.throttleHashText, 'organizer scratch', scratch.throttleForeign)) {
+          recordThrottle('organizer scratch');
+        }
+      }
       if (scratch.target?.id) await closeTab(scratch.target.id);
       return { ...result, reason: scratch.reason };
     }
@@ -1307,10 +1799,26 @@ function terminalInfrastructureAfterPrompt(text, structuredError = null) {
 
 function classifyEvidence(text, structuredError = null, throttleModal = null) {
   if (!text || !text.trim()) return { kind: 'inconclusive', reason: 'empty-text' };
-  if (isThrottlePage(text)) return { kind: 'throttle', reason: 'interstitial', owned: false };
+  // hashText (#208) is what an unowned trip fingerprints to recognize a repeat sighting of the
+  // SAME stale tab: the modal's own short text when one is present (stable across re-renders),
+  // else the interstitial page text itself. #208 gate r1 P1: prefer throttleModal here too — a
+  // marker-less page can satisfy isThrottlePage on its whole-page text AND carry a modal; hashing
+  // the page text here while every other site hashes the modal text let the SAME stale tab
+  // alternate between two fingerprints forever, rewriting the cooldown on every other pass.
+  // #208 gate r2 P1: `foreign` says whether this surface is POSITIVELY someone else's — the only
+  // basis on which a throttle sighting may be disregarded when deciding absence (exit 4). An
+  // interstitial is never foreign BY CONSTRUCTION (isThrottlePage already requires no run marker
+  // at all, ours or another's); a modal's underlying page can still carry a foreign marker even
+  // though the modal itself carries none.
+  if (isThrottlePage(text)) {
+    return { kind: 'throttle', reason: 'interstitial', owned: false, foreign: false, hashText: throttleModal ?? text };
+  }
   // #162: the modal is account state painted over whatever conversation rendered. `owned` says
   // whether THIS run's exact marker is on the page beneath it (existence proof for --probe).
-  if (throttleModal) return { kind: 'throttle', reason: 'modal', owned: hasExactMarker(text, marker) };
+  if (throttleModal) {
+    const owned = hasExactMarker(text, marker);
+    return { kind: 'throttle', reason: 'modal', owned, foreign: !owned && FOREIGN_MARKER_RE.test(text), hashText: throttleModal };
+  }
   if (!hasExactMarker(text, marker)) {
     return FOREIGN_MARKER_RE.test(text)
       ? { kind: 'foreign' }
@@ -1489,17 +1997,60 @@ while (Date.now() < deadline) {
   // #162: the modal is account-wide, so decide ownership over the WHOLE scan, never on the first
   // tab in list order (the same order-independence onOurConversation documents): a foreign or
   // blacklisted tab listed ahead of ours must not hide the proof that our conversation exists.
-  // Only a non-blacklisted page rendering our EXACT marker proves that; any other modal hit is
-  // proof of the limiter alone.
-  const modalHits = reads.filter(({ text, throttleModal }) => throttleModal && text && text.trim() !== '');
-  if (modalHits.length > 0) {
-    const ownedHit = modalHits.find(({ tab, text }) => !nonMatching.has(tab.url) && hasExactMarker(text, marker));
-    const hit = ownedHit ?? modalHits[0];
-    tripThrottleEvidence(hit.tab.url, { kind: 'throttle', reason: 'modal', owned: !!ownedHit }, `modal over tab ${hit.tab.url}`);
+  // Only a non-blacklisted page rendering our EXACT marker proves that; any other modal or
+  // marker-less-interstitial hit is proof of the limiter alone.
+  // #208 gate r3 P2: ONE whole-scan batch covers every unowned throttle sighting this scan sees —
+  // modal hits AND marker-less interstitial hits on tabs without a modal. The old split (modal
+  // hits batched here, interstitials tripped one at a time in the per-tab loop below) meant N
+  // unchanged interstitial tabs in a single scan cost N separate cooldown windows: the per-tab
+  // loop recorded the FIRST sighting and exited immediately, leaving this same scan's remaining
+  // sightings unrecorded for the next invocation to rediscover one at a time.
+  const throttleHits = reads.filter(({ text, throttleModal }) => (
+    (throttleModal && text && text.trim() !== '') || (!throttleModal && isThrottlePage(text))
+  ));
+  if (throttleHits.length > 0) {
+    const ownedHit = throttleHits.find(({ tab, text }) => !nonMatching.has(tab.url) && hasExactMarker(text, marker));
+    if (ownedHit) {
+      tripThrottleEvidence(
+        ownedHit.tab.url,
+        { kind: 'throttle', reason: 'modal', owned: true, foreign: false, hashText: ownedHit.throttleModal },
+        `modal over tab ${ownedHit.tab.url}`,
+      );
+    } else {
+      // #208 gate r2 P2 / r3 P2: a stale repeat listed first must not hide a genuinely new
+      // foreign modal or interstitial behind it, AND one already-open batch of stale sightings
+      // must cost this scan exactly one cooldown — not one per invocation as the old per-hit walk
+      // exited on the FIRST newly admitted hit, leaving every hit behind it un-recorded for the
+      // next invocation to rediscover one at a time. Charge every hit in list order first, then
+      // exit once. Fingerprint is throttleModal ?? text — the same rule every other unowned trip
+      // site in this file follows (isThrottlePage's own construction means an interstitial hit
+      // never has a throttleModal or a foreign marker, so `text` and `foreign: false` fall out
+      // naturally for those hits).
+      const firstNewWhere = tripThrottleUnownedBatch(throttleHits.map((hit) => ({
+        url: hit.tab.url,
+        text: hit.throttleModal ?? hit.text,
+        // #215 gate r1 P1: FOREIGN_MARKER_RE matches ANY pg-run marker, THIS run's included, so a
+        // BLACKLISTED tab bearing our own marker used to read as another run's conversation — the
+        // one classification allowed to skip inconclusiveThrottleSeen — and dropped the scan into
+        // confirmed-absent exit 4 on nothing but a rate limit. Ask "is this ours?" first, exactly as
+        // classifyEvidence's reference predicate does (`foreign: !owned && FOREIGN_MARKER_RE...`).
+        // Blacklisted URLs remain excluded from POSITIVE ownership by ownedHit above; this decides
+        // only whether the surface is proven to be SOMEONE ELSE'S, the sole basis for disregarding
+        // a throttle sighting when deciding absence.
+        foreign: !!hit.text && !hasExactMarker(hit.text, marker) && FOREIGN_MARKER_RE.test(hit.text),
+        where: hit.throttleModal ? `modal over tab ${hit.tab.url}` : `tab ${hit.tab.url}`,
+      })));
+      if (firstNewWhere !== null) tripThrottle(firstNewWhere);
+    }
   }
   for (const { tab, text, infrastructureError } of reads) {
     if (text === null || text.trim() === '') { deadTabs.push(tab); continue; }
-    if (isThrottlePage(text)) tripThrottle(`tab ${tab.url}`);
+    // #208 gate r1 P1 / r3 P2: every modal AND marker-less-interstitial throttle sighting in this
+    // scan was already walked by the whole-scan batch above (tripped as owned, charged as the
+    // first newly-admitted unowned hit, or ignored as an already-charged stale repeat) — a
+    // marker-less interstitial no longer needs (or gets) its own per-tab trip here; the batch
+    // subsumes it. Reaching this loop for a throttle tab a second time would fingerprint it
+    // again and risk alternating the cooldown instead of converging.
     // v0.28 (gate #54 r2): honor the per-marker blacklist for OPEN tabs too, not only
     // re-renders. The engine appends here when a capture from this URL failed the provenance
     // check — even a marker-bearing tab must be skipped then, or every later harvest replays
@@ -1544,6 +2095,13 @@ while (Date.now() < deadline) {
     }
     const fresh = await revalidateReadableStaleSource(revalidateUrl);
     if (fresh?.kind === 'throttle') tripThrottleEvidence(revalidateUrl, fresh, `canonical scratch ${revalidateUrl}`);
+    // #215 gate r9 P1: tripThrottleEvidence only RETURNS past an owned or newly-charged throttle
+    // by exiting the process first (tripThrottleOverConversation / tripThrottle). The only way
+    // execution reaches here with kind 'throttle' is an already-charged, non-foreign sighting —
+    // proof the canonical URL is still this run's readable source, same as the plain
+    // 'inconclusive' case below, so it must retain the same recovery handle instead of falling
+    // through unrecorded and forcing the next invocation to rely on a since-closed tab.
+    if (fresh?.kind === 'throttle' && !fresh.foreign) rememberInconclusiveReadableSource(revalidateUrl);
     if (fresh?.kind === 'cross-bound') {
       rejectCrossBound(revalidateUrl, fresh.foreignMarker, 'canonical scratch');
       // Only null the signal when the rejected URL IS the tab we were scanning: a rejected
@@ -1562,7 +2120,13 @@ while (Date.now() < deadline) {
       }
       continue;
     }
-    if (fresh?.kind === 'foreign') {
+    if (fresh?.kind === 'foreign' || (fresh?.kind === 'throttle' && fresh.foreign)) {
+      // #208 gate r6 P1 sibling: proven either directly (kind: 'foreign') or, same as the
+      // remembered-render caller above, by a throttle modal painted over ANOTHER run's marker
+      // (kind: 'throttle', foreign: true). tripThrottleEvidence already decided above whether
+      // this sighting re-arms the cooldown; either way it is still positive proof the canonical
+      // URL is stale, and a markerless repeat (foreign: false) must NOT land here — that stays
+      // inconclusive below instead.
       rejectForeign(revalidateUrl, 'canonical scratch');
       if (revalidateUrl === tab.url) {
         stillGeneratingUrl = null;
@@ -1673,9 +2237,14 @@ while (Date.now() < deadline) {
           if (probe) emitEvidence(seedUrl, owned);
           console.error(`remembered conversation recovered (${seedUrl}) but no VERDICT yet; waiting...`);
         }
-      } else if (evidence.kind === 'foreign') {
+      } else if (evidence.kind === 'foreign' || (evidence.kind === 'throttle' && evidence.foreign)) {
         // Decisive the other way: the memo points at ANOTHER run's conversation (stale or
-        // corrupt). Only this justifies treating the remembered handle as worthless.
+        // corrupt) — proven either directly (kind: 'foreign') or, #208 gate r6 P1, by a
+        // throttle modal painted over that other run's marker (kind: 'throttle', foreign:
+        // true). tripThrottleEvidence above already decided whether this sighting re-arms
+        // the cooldown (new) or was ignored as an already-charged repeat; either way it is
+        // still positive proof the memo is stale, and a markerless repeat (foreign: false)
+        // must NOT land here — that stays inconclusive below instead.
         memoStale = true;
         console.error(`remembered conversation ${seedUrl} carries a DIFFERENT run's marker — stale memo, ignoring it`);
       } else {
@@ -1735,6 +2304,21 @@ if (knownUrl && !memoStale) {
   // into a confirmed absence: three of those releases a live reservation and permits a
   // double-spending resubmit (gate P1). Stay inconclusive; the reservation TTL bounds it.
   console.error(`inconclusive: remembered conversation ${knownUrl} re-rendered ${seededRenders}x without a decisive result in ${timeoutSecs}s — NOT evidence it is gone`);
+  console.error('evidence-kind: inconclusive');
+  process.exit(7);
+}
+if (inconclusiveThrottleSeen) {
+  // #208 gate r2 P1: a throttle surface (modal or interstitial) was observed this invocation —
+  // charged as a genuinely new sighting or ignored as an already-charged repeat, either way — and
+  // never proven to belong to another run (no FOREIGN exact marker was readable in its text).
+  // Cooldown dedup ("already charged, ignore it") is a RATE-LIMIT decision, not an OWNERSHIP one;
+  // conflating them used to let a repeat sighting of the SAME markerless tab fall all the way
+  // through to the confirmed-absent exit 4 below, silently spending a paid review's finite
+  // recovery-miss budget on nothing but the account limiter. Only a POSITIVELY foreign sighting
+  // may be disregarded when deciding absence — this one wasn't, so stay inconclusive and do NOT
+  // rewrite the cooldown here (tripThrottleUnowned already decided charge vs. ignore).
+  console.error(`inconclusive: an unowned throttle surface was observed this scan (${inconclusiveThrottleWhere}) `
+    + `and not proven to belong to another run — NOT evidence "${marker}" is gone`);
   console.error('evidence-kind: inconclusive');
   process.exit(7);
 }

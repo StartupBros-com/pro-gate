@@ -13,7 +13,7 @@
 import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
@@ -309,6 +309,11 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
       let request;
       try { request = JSON.parse(payload); } catch { return; }
       requests.push(request);
+      // #215 gate r7 P2: a synchronous window INSIDE the child's scan. The hook runs before this
+      // evaluate is answered, so anything it does to PRO_GATE_HOME is on disk strictly before the
+      // child can act on the response — the only way a test can model another writer touching the
+      // sidecar mid-scan without a second salvage process.
+      opts.onEvaluate?.(id, request.params?.expression ?? '');
       let value = tabText;
       if (id === 'tab1' && opts.primaryText) {
         primaryPolls += 1;
@@ -516,6 +521,68 @@ function runSalvage(args, port, seed, extraEnv = {}) {
     });
   });
 }
+
+// #208: a repeat-sighting test needs the SAME PRO_GATE_HOME across two salvage invocations, so the
+// second run's throttle-seen dedupe can see what the first run recorded — runSalvage's per-call
+// mkdtempSync-then-rmSync home cannot express that. This runs the same child machinery against a
+// caller-supplied home and leaves it (and any files inside it, e.g. throttle.cooldown's mtime) in
+// place afterward; the caller owns cleanup via fs.rmSync.
+function runSalvageInHome(home, args, port, extraEnv = {}) {
+  return new Promise((resolve) => {
+    const startedAt = Date.now();
+    const expandedArgs = args.map((arg) => arg.replace(/^PG_HOME\//, `${home}/`));
+    const childEnv = { ...process.env, PRO_GATE_HOME: home, ...extraEnv };
+    for (const [name, value] of Object.entries(childEnv)) {
+      if (value === undefined) delete childEnv[name];
+    }
+    const child = spawn(process.execPath, [SALVAGE, ...expandedArgs, String(port)], {
+      env: childEnv,
+    });
+    let stdout = '', stderr = '';
+    child.stdout.on('data', (d) => { stdout += d; });
+    child.stderr.on('data', (d) => { stderr += d; });
+    const killer = setTimeout(() => child.kill('SIGKILL'), Number(extraEnv.PRO_GATE_TEST_CHILD_TIMEOUT_MS ?? 90_000));
+    child.on('close', (status) => {
+      clearTimeout(killer);
+      const read = (rel) => { try { return fs.readFileSync(path.join(home, rel), 'utf8'); } catch { return null; } };
+      resolve({
+        status, stdout, stderr, elapsedMs: Date.now() - startedAt,
+        cooldown: read('throttle.cooldown'),
+      });
+    });
+  });
+}
+
+// #208 gate r2 P2: production replaced the single throttle.cooldown.seen FILE (loaded once per
+// invocation and rewritten wholesale — the exact shared-mutable-state race #208 gate r2 P2
+// closes) with one record file per (url, hash) fingerprint in a DIRECTORY, created via
+// fs.writeFileSync(path, '', { flag: 'wx' }) so a concurrent writer can never clobber another's
+// sighting. These three helpers mirror throttleSeenRecordPath/claimThrottleSeen/
+// recordThrottleSeen in bin/cdp-salvage.mjs byte-for-byte (same hash-of-url-and-hash key), so
+// tests read and seed the SAME on-disk shape production does, not a second test-only format.
+const throttleSeenDir = (home) => path.join(home, 'throttle.cooldown.seen.d');
+const throttleSeenRecordPath = (home, url, text) => {
+  const hash = createHash('sha256').update(text ?? '').digest('hex');
+  const key = createHash('sha256').update(`${url}\n${hash}`).digest('hex');
+  return path.join(throttleSeenDir(home), key);
+};
+const throttleSeenHas = (home, url, text) => fs.existsSync(throttleSeenRecordPath(home, url, text));
+const seedThrottleSeen = (home, url, text) => {
+  fs.mkdirSync(throttleSeenDir(home), { recursive: true });
+  fs.writeFileSync(throttleSeenRecordPath(home, url, text), '', { flag: 'wx' });
+};
+// #215 gate r11 P2: the lock SLOT a fingerprint's admission and removal both take — mirrors
+// throttleSeenLockSlot in bin/cdp-salvage.mjs (last 32 bits of the record key's sha256 hex modulo
+// a fixed pool of 64), so a test that holds "the fingerprint's lock" holds the file production
+// really contends on. The '#215 gate r11 P2 (b)' check proves that by behaviour, not by name.
+const THROTTLE_SEEN_LOCK_SLOTS_T = 64;
+const throttleSeenLockSlotName = (key) => {
+  const n = parseInt(key.slice(-8), 16);
+  return `lock-${String(Number.isNaN(n) ? 0 : n % THROTTLE_SEEN_LOCK_SLOTS_T).padStart(2, '0')}.lockf`;
+};
+const throttleSeenLockSlotPath = (home, url, text) => path.join(
+  throttleSeenDir(home), throttleSeenLockSlotName(path.basename(throttleSeenRecordPath(home, url, text))),
+);
 
 // Deliberately opt in only scratch fixtures that need it: hydration/order checks, hung-close
 // cleanup, and static decisive 3s canonical revalidations. The latter have no required first/second
@@ -3467,6 +3534,1470 @@ const FOREIGN_ANSWER = (m) => [
   scratchModal.stop();
 }
 
+{ // #208: an abandoned throttle modal on an UNOWNED tab (another run's stale, hours-old
+  // conversation) is account-wide throttle evidence, but nothing ever closes that tab or clears
+  // its modal — so a caller that waits out `seconds_remaining` and retries has the sweep re-detect
+  // the exact same stale sighting and rewrite throttle.cooldown again, forever (observed: 3
+  // attempts / 1h45m, pushbot PR #3225). A sidecar (throttle.cooldown.seen) fingerprints (tab url,
+  // sha256 of modal/page text) pairs a scan has already charged, so a repeat of the SAME stale
+  // sighting is ignored instead of re-arming the timer. Planted negative: an OWNED sighting (this
+  // run's exact marker under the modal) must keep re-arming unconditionally every time — #162's
+  // existing contract — never routed through this dedupe at all.
+  const modal = "Too many requests. You're making requests too quickly. We've temporarily limited access to your conversations to protect your data. Please wait a few minutes before trying again.";
+  const reasoning = Array.from({ length: 120 }, (_, i) =>
+    `Reviewed concurrency risks in module ${i}: lock ordering, retry budgets, and reservation TTL handling.`).join('\n');
+  const foreign = `${modal}\nrun marker: pg-run-other-1111111111-1\n${reasoning}`;
+  const oldMtime = (p) => { const t = new Date(Date.now() - 3_600_000); fs.utimesSync(p, t, t); };
+
+  // (1) First unowned modal sighting: cooldown written, exit 5, tab recorded in the seen sidecar.
+  const home1 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const cdp1a = await mockCdp(foreign, [], { throttleModal: modal });
+  const first = await runSalvageInHome(home1, [MARKER, '3'], cdp1a.port);
+  check('#208 (1) first unowned throttle modal sighting takes the throttle exit (5)', first.status === 5,
+    `status=${first.status} stderr=${first.stderr?.slice(0, 200)}`);
+  check('#208 (1) first unowned throttle modal sighting writes the cooldown naming the modal',
+    /modal over tab/.test(first.cooldown ?? ''), `cooldown=${first.cooldown}`);
+  check('#208 (1) first unowned throttle modal sighting records the tab in the seen sidecar',
+    throttleSeenHas(home1, 'https://chatgpt.com/c/mock-conversation', modal),
+    `throttleSeen=${fs.existsSync(throttleSeenDir(home1)) ? fs.readdirSync(throttleSeenDir(home1)) : null}`);
+  cdp1a.stop();
+
+  // (2) A retry that finds the exact same stale tab (same url, same modal text) must not rewrite
+  // the cooldown: the sentinel mtime (artificially aged so any rewrite is unmistakable) survives,
+  // the run does not take the throttle exit, and stderr names the stale tab it ignored.
+  const cooldownPath1 = path.join(home1, 'throttle.cooldown');
+  oldMtime(cooldownPath1);
+  const mtimeBefore1 = fs.statSync(cooldownPath1).mtimeMs;
+  const cdp1b = await mockCdp(foreign, [], { throttleModal: modal });
+  const second = await runSalvageInHome(home1, [MARKER, '3'], cdp1b.port);
+  const mtimeAfter1 = fs.statSync(cooldownPath1).mtimeMs;
+  check('#208 (2) a repeat sighting of the same stale tab does not rewrite the cooldown file',
+    mtimeAfter1 === mtimeBefore1, `before=${mtimeBefore1} after=${mtimeAfter1}`);
+  check('#208 (2) a repeat sighting of the same stale tab does not take the throttle exit',
+    second.status !== 5, `status=${second.status}`);
+  check('#208 (2) a repeat sighting of the same stale tab names the stale tab on stderr',
+    /stale throttle modal on unowned tab https:\/\/chatgpt\.com\/c\/mock-conversation already charged/.test(second.stderr || ''),
+    `stderr=${second.stderr?.slice(0, 300)}`);
+  cdp1b.stop();
+
+  // (4) A genuinely new unowned sighting — a DIFFERENT tab carrying the same modal text — is not
+  // suppressed by (2)'s dedupe: the cooldown is rewritten and the tab is charged, because the seen
+  // key is (url, hash), not the hash alone.
+  const secondForeignUrl = 'https://chatgpt.com/c/another-stale-conversation';
+  const secondForeignText = `${modal}\nrun marker: pg-run-other-2222222222-2\n${reasoning}`;
+  const cdp1c = await mockCdp('__NO_TABS__', [{ id: 'other2', url: secondForeignUrl }],
+    { tabText: () => secondForeignText, throttleModal: () => modal });
+  const fourth = await runSalvageInHome(home1, [MARKER, '3'], cdp1c.port);
+  check('#208 (4) a new unowned modal on a different tab takes the throttle exit (5)', fourth.status === 5,
+    `status=${fourth.status} stderr=${fourth.stderr?.slice(0, 200)}`);
+  check('#208 (4) a new unowned modal on a different tab rewrites the cooldown naming that tab',
+    (fourth.cooldown ?? '').includes(secondForeignUrl), `cooldown=${fourth.cooldown}`);
+  check('#208 (4) a new unowned modal on a different tab is added to the seen sidecar',
+    throttleSeenHas(home1, secondForeignUrl, modal),
+    `throttleSeen=${fs.existsSync(throttleSeenDir(home1)) ? fs.readdirSync(throttleSeenDir(home1)) : null}`);
+  cdp1c.stop();
+
+  // (5) A stale, already-charged tab listed FIRST must not hide a genuinely new foreign modal
+  // listed behind it: the whole-scan fallback walks the unowned hits in list order, the dedupe
+  // gate skips the stale one (still named on stderr), and the new tab is the one charged.
+  const thirdForeignUrl = 'https://chatgpt.com/c/third-stale-conversation';
+  const thirdForeignText = `${modal}\nrun marker: pg-run-other-3333333333-3\n${reasoning}`;
+  const cdp1d = await mockCdp(foreign, [{ id: 'other3', url: thirdForeignUrl }],
+    { tabText: (url) => (url === thirdForeignUrl ? thirdForeignText : undefined), throttleModal: () => modal });
+  const fifth = await runSalvageInHome(home1, [MARKER, '3'], cdp1d.port);
+  check('#208 (5) a stale tab listed first does not hide a new unowned modal behind it: throttle exit (5)',
+    fifth.status === 5, `status=${fifth.status} stderr=${fifth.stderr?.slice(0, 300)}`);
+  check('#208 (5) the new tab behind the stale one is the tab charged in the cooldown',
+    (fifth.cooldown ?? '').includes(thirdForeignUrl), `cooldown=${fifth.cooldown}`);
+  check('#208 (5) the stale tab listed first is still named as ignored on stderr',
+    /stale throttle modal on unowned tab https:\/\/chatgpt\.com\/c\/mock-conversation already charged/.test(fifth.stderr || ''),
+    `stderr=${fifth.stderr?.slice(0, 300)}`);
+  cdp1d.stop();
+  fs.rmSync(home1, { recursive: true, force: true });
+
+  // (3) Planted negative: an OWNED sighting (this run's exact marker under the modal) re-arms the
+  // cooldown unconditionally on EVERY repeat — #162's existing contract — never deduped like an
+  // unowned sighting. Same stale-mtime technique as (2), opposite expected outcome.
+  const owned = `${modal}\nrun marker: ${MARKER}\n${reasoning}\nReviewed concurrency risks`;
+  const home3 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const cdp3a = await mockCdp(owned, [], { throttleModal: modal });
+  const owned1 = await runSalvageInHome(home3, ['--probe', MARKER, '3'], cdp3a.port);
+  check('#208 (3) planted negative: first owned modal sighting writes the cooldown',
+    /modal over tab/.test(owned1.cooldown ?? ''), `cooldown=${owned1.cooldown}`);
+  cdp3a.stop();
+  const cooldownPath3 = path.join(home3, 'throttle.cooldown');
+  oldMtime(cooldownPath3);
+  const mtimeBefore3 = fs.statSync(cooldownPath3).mtimeMs;
+  const cdp3b = await mockCdp(owned, [], { throttleModal: modal });
+  const owned2 = await runSalvageInHome(home3, ['--probe', MARKER, '3'], cdp3b.port);
+  const mtimeAfter3 = fs.statSync(cooldownPath3).mtimeMs;
+  check('#208 (3) planted negative: an owned throttle modal re-arms the cooldown on every repeat (never deduped)',
+    mtimeAfter3 > mtimeBefore3, `before=${mtimeBefore3} after=${mtimeAfter3}`);
+  check('#208 (3) owned repeat still reports the closed throttled state, never generating',
+    owned2.status === 0 && /^probe-state: throttled$/m.test(owned2.stderr || ''), `status=${owned2.status} stderr=${owned2.stderr?.slice(0, 200)}`);
+  cdp3b.stop();
+  fs.rmSync(home3, { recursive: true, force: true });
+
+  // Also exercise the per-tab isThrottlePage trip site (site 2, distinct from the whole-scan modal
+  // fallback exercised above): a short marker-less interstitial page, with no modal element at
+  // all, must be deduped the same way on a repeat.
+  const home5 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const cdp5a = await mockCdp(modal);
+  const site2First = await runSalvageInHome(home5, [MARKER, '3'], cdp5a.port);
+  check('#208 (site 2: isThrottlePage) first unowned interstitial sighting takes the throttle exit',
+    site2First.status === 5 && /tab https:\/\/chatgpt\.com\/c\/mock-conversation/.test(site2First.cooldown ?? ''),
+    `status=${site2First.status} cooldown=${site2First.cooldown}`);
+  cdp5a.stop();
+  const cooldownPath5 = path.join(home5, 'throttle.cooldown');
+  oldMtime(cooldownPath5);
+  const mtimeBefore5 = fs.statSync(cooldownPath5).mtimeMs;
+  const cdp5b = await mockCdp(modal);
+  const site2Second = await runSalvageInHome(home5, [MARKER, '3'], cdp5b.port);
+  const mtimeAfter5 = fs.statSync(cooldownPath5).mtimeMs;
+  check('#208 (site 2: isThrottlePage) a repeat interstitial sighting on the same tab does not rewrite the cooldown',
+    mtimeAfter5 === mtimeBefore5, `before=${mtimeBefore5} after=${mtimeAfter5}`);
+  check('#208 (site 2: isThrottlePage) a repeat interstitial sighting does not take the throttle exit',
+    site2Second.status !== 5, `status=${site2Second.status}`);
+  cdp5b.stop();
+  fs.rmSync(home5, { recursive: true, force: true });
+}
+
+{ // #208 gate r1 P1 regression: a marker-less stale tab whose WHOLE PAGE TEXT satisfies
+  // isThrottlePage while it ALSO carries a distinct throttle modal used to fingerprint under TWO
+  // different hashes depending on which trip site reached it first — the whole-scan modal
+  // fallback always hashed the modal text, but the (pre-fix) per-tab isThrottlePage check hashed
+  // the raw page text instead. The seen sidecar recognized only the MOST RECENT of the two
+  // hashes for a URL (replace, not append), so the tab kept "newly" tripping every other
+  // invocation forever — the exact livelock #208 was supposed to end. Fixed by (a) hashing the
+  // modal text everywhere a modal is present (including this classifier branch and the per-tab
+  // site), (b) never re-classifying a modal-bearing tab through the per-tab interstitial check
+  // (the whole-scan block already decided it), and (c) a bounded multi-hash-per-URL sidecar as a
+  // second line of defense.
+  const modalText = "You're making requests too quickly. Temporarily limited access to your conversations.";
+  const pageText = `ChatGPT\nAccount limits\n${modalText}\nPlease try again shortly.\n`;
+  const oldMtime = (p) => { const t = new Date(Date.now() - 3_600_000); fs.utimesSync(p, t, t); };
+
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+
+  // Run 1: first sighting of this stale tab takes the throttle exit and writes the cooldown.
+  const cdpA = await mockCdp(pageText, [], { throttleModal: modalText });
+  const first = await runSalvageInHome(home, [MARKER, '3'], cdpA.port);
+  check('#208 P1 (1) first sighting of a marker-less modal+interstitial page takes the throttle exit (5)',
+    first.status === 5, `status=${first.status} stderr=${first.stderr?.slice(0, 300)}`);
+  cdpA.stop();
+
+  // Run 2: the SAME stale tab, completely unchanged — sentinel mtime aged so any rewrite is
+  // unmistakable. On the pre-fix script this is where the second fingerprint (raw page text)
+  // trips as "new" and rewrites the cooldown (RED).
+  const cooldownPath = path.join(home, 'throttle.cooldown');
+  oldMtime(cooldownPath);
+  const mtimeBefore2 = fs.statSync(cooldownPath).mtimeMs;
+  const cdpB = await mockCdp(pageText, [], { throttleModal: modalText });
+  const second = await runSalvageInHome(home, [MARKER, '3'], cdpB.port);
+  const mtimeAfter2 = fs.statSync(cooldownPath).mtimeMs;
+  check('#208 P1 (2) an unchanged stale tab does not rewrite the cooldown on the next pass',
+    mtimeAfter2 === mtimeBefore2, `before=${mtimeBefore2} after=${mtimeAfter2}`);
+  check('#208 P1 (2) an unchanged stale tab does not take the throttle exit on the next pass',
+    second.status !== 5, `status=${second.status}`);
+  cdpB.stop();
+
+  // Run 3: same stale tab again. The pre-fix bug alternated hash sites every OTHER pass, so a
+  // single repeat could get lucky; a third pass confirms convergence, not alternation.
+  oldMtime(cooldownPath);
+  const mtimeBefore3 = fs.statSync(cooldownPath).mtimeMs;
+  const cdpC = await mockCdp(pageText, [], { throttleModal: modalText });
+  const third = await runSalvageInHome(home, [MARKER, '3'], cdpC.port);
+  const mtimeAfter3 = fs.statSync(cooldownPath).mtimeMs;
+  check('#208 P1 (3) a third pass over the same unchanged stale tab still does not rewrite the cooldown',
+    mtimeAfter3 === mtimeBefore3, `before=${mtimeBefore3} after=${mtimeAfter3}`);
+  check('#208 P1 (3) a third pass over the same unchanged stale tab still does not take the throttle exit',
+    third.status !== 5, `status=${third.status}`);
+  cdpC.stop();
+  fs.rmSync(home, { recursive: true, force: true });
+
+  // Planted negative: an OWNED tab of the same shape (marker present, modal present) must keep
+  // re-arming the cooldown on EVERY pass — #162's existing contract, never routed through this
+  // dedupe at all. A marker anywhere in the text also makes isThrottlePage(text) false (it
+  // requires no run marker, ours or foreign), so this exercises the modal branch, not the
+  // interstitial branch above — the two must not be conflated.
+  const ownedText = `ChatGPT\nAccount limits\n${modalText}\nrun marker: ${MARKER}\nPlease try again shortly.\n`;
+  const homeOwned = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const cdpOwnedA = await mockCdp(ownedText, [], { throttleModal: modalText });
+  const ownedFirst = await runSalvageInHome(homeOwned, ['--probe', MARKER, '3'], cdpOwnedA.port);
+  check('#208 P1 planted negative: first owned sighting writes the cooldown',
+    /modal over tab/.test(ownedFirst.cooldown ?? ''), `cooldown=${ownedFirst.cooldown}`);
+  cdpOwnedA.stop();
+  const cooldownPathOwned = path.join(homeOwned, 'throttle.cooldown');
+  oldMtime(cooldownPathOwned);
+  const mtimeBeforeOwned = fs.statSync(cooldownPathOwned).mtimeMs;
+  const cdpOwnedB = await mockCdp(ownedText, [], { throttleModal: modalText });
+  const ownedSecond = await runSalvageInHome(homeOwned, ['--probe', MARKER, '3'], cdpOwnedB.port);
+  const mtimeAfterOwned = fs.statSync(cooldownPathOwned).mtimeMs;
+  check('#208 P1 planted negative: an owned tab of the same shape re-arms the cooldown on every repeat',
+    mtimeAfterOwned > mtimeBeforeOwned, `before=${mtimeBeforeOwned} after=${mtimeAfterOwned}`);
+  check('#208 P1 planted negative: owned repeat still reports the closed throttled state',
+    ownedSecond.status === 0 && /^probe-state: throttled$/m.test(ownedSecond.stderr || ''),
+    `status=${ownedSecond.status} stderr=${ownedSecond.stderr?.slice(0, 200)}`);
+  cdpOwnedB.stop();
+  fs.rmSync(homeOwned, { recursive: true, force: true });
+}
+
+{ // #208 gate r1 P1 (item 3): the same modal-preferred-fingerprint fix in classifyEvidence's
+  // interstitial branch (~1376) is reachable through the existing remembered-URL scratch-render
+  // recovery path — a THIRD trip site, distinct from the two exercised above. Run 1 sees the tab
+  // OPEN (whole-scan modal fallback trips on the modal hash and remembers the URL). Run 2 sees
+  // the SAME tab CLOSED, so the v0.25 remembered-conversation recovery scratch-renders that URL
+  // and reaches classifyEvidence's interstitial branch instead — a genuinely different site than
+  // run 1's, for the SAME unchanged conversation. Pre-fix that branch hashed the raw page text,
+  // disagreeing with run 1's modal-text hash, so it read as "new" and re-tripped (the same
+  // two-site alternation #208 was supposed to end, just through this pair of sites instead of
+  // the whole-scan-fallback/per-tab pair covered above).
+  const modalText3 = "You're making requests too quickly. Temporarily limited access to your conversations.";
+  const pageText3 = `ChatGPT\nAccount limits\n${modalText3}\nA scratch render of the remembered conversation.\n`;
+  const canonicalUrl3 = 'https://chatgpt.com/c/mock-conversation';
+  const oldMtime3 = (p) => { const t = new Date(Date.now() - 3_600_000); fs.utimesSync(p, t, t); };
+
+  const home3 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedMemo(MARKER, canonicalUrl3)(home3);
+
+  // Run 1: the tab is OPEN — trips via the whole-scan modal fallback (site 1), hashing the modal
+  // text. This site already hashed the modal text both before and after the fix; it is not the
+  // regression, it is what establishes the "already charged" fingerprint run 2 must agree with.
+  const cdpS1 = await mockCdp(pageText3, [], { throttleModal: modalText3 });
+  const scratchFirst = await runSalvageInHome(home3, [MARKER, '3'], cdpS1.port);
+  check('#208 P1 (classifier/scratch) run 1: the open tab takes the throttle exit (5) via the whole-scan modal fallback',
+    scratchFirst.status === 5, `status=${scratchFirst.status} stderr=${scratchFirst.stderr?.slice(0, 300)}`);
+  cdpS1.stop();
+
+  // Run 2: the SAME tab is now CLOSED (__NO_TABS__) but the memo still remembers its URL, so the
+  // remembered-conversation recovery scratch-renders it — reaching classifyEvidence's
+  // interstitial branch (site 3) for the identical unchanged page.
+  const cooldownPath3 = path.join(home3, 'throttle.cooldown');
+  oldMtime3(cooldownPath3);
+  const mtimeBeforeS = fs.statSync(cooldownPath3).mtimeMs;
+  const cdpS2 = await mockCdp('__NO_TABS__', [], {
+    renderText: () => pageText3,
+    throttleModal: (id) => (id.startsWith('scratch') ? modalText3 : null),
+  });
+  const scratchSecond = await runSalvageInHome(home3, [MARKER, '3'], cdpS2.port, SCRATCH_SAMPLE_TEST_ENV);
+  const mtimeAfterS = fs.statSync(cooldownPath3).mtimeMs;
+  check('#208 P1 (classifier/scratch) run 2: the remembered-URL re-render of the same unchanged page does not rewrite the cooldown',
+    mtimeAfterS === mtimeBeforeS, `before=${mtimeBeforeS} after=${mtimeAfterS}`);
+  check('#208 P1 (classifier/scratch) run 2: the remembered-URL re-render of the same unchanged page does not take the throttle exit',
+    scratchSecond.status !== 5, `status=${scratchSecond.status}`);
+  cdpS2.stop();
+  fs.rmSync(home3, { recursive: true, force: true });
+}
+
+{ // #208 gate r1 P2 regression: --organize checked only throttleHits[0]. With an already-charged
+  // unowned tab listed FIRST and a genuinely new unowned modal listed behind it, tripThrottleUnowned
+  // returned false for the first hit and the block exited without ever examining the second, so
+  // --organize proceeded toward scratch navigation/rename/archive without updating the cooldown.
+  // Fixed by walking ALL unowned hits in list order, mirroring the main loop's whole-scan walk.
+  const title = 'pro-gate review: PR #208 organizer P2 [pro-gate]';
+  const staleUrl = 'https://chatgpt.com/c/mock-conversation';    // primary tab, listed FIRST
+  const newUrl = 'https://chatgpt.com/c/organizer-new-throttle'; // extra tab, listed SECOND
+  const staleModal = "You're making requests too quickly. Temporarily limited access to your conversations.";
+  const newModal = staleModal; // same account-wide copy; the dedupe key is (url, hash), not hash alone
+  const staleText = 'ChatGPT interstitial (stale tab)';
+  const newText = 'ChatGPT interstitial (new tab)';
+
+  // A stale unowned sighting was already charged by an earlier organizer scan.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedOrganizer(MARKER, title)(home);
+  seedThrottleSeen(home, staleUrl, staleModal);
+
+  const cdp = await mockCdp(staleText, [{ id: 'new1', url: newUrl }], {
+    tabText: (url) => (url === newUrl ? newText : undefined),
+    throttleModal: (id) => (id === 'new1' ? newModal : staleModal),
+  });
+  const r = await runSalvageInHome(home, ['--organize', MARKER, '5'], cdp.port);
+  check('#208 P2 organizer: a new unowned modal behind an already-charged stale one still reports reason=throttle',
+    /reason=throttle/.test(r.stdout), `stdout=${r.stdout} stderr=${r.stderr?.slice(0, 300)}`);
+  check('#208 P2 organizer: the already-charged stale tab listed first is still named as ignored on stderr',
+    r.stderr?.includes(`stale throttle modal on unowned tab ${staleUrl} already charged`),
+    `stderr=${r.stderr?.slice(0, 400)}`);
+  check('#208 P2 organizer: the new tab behind the stale one is newly recorded in the seen sidecar',
+    throttleSeenHas(home, newUrl, newModal),
+    `throttleSeen=${fs.existsSync(throttleSeenDir(home)) ? fs.readdirSync(throttleSeenDir(home)) : null}`);
+  check('#208 P2 organizer: no rename/archive mutation happened',
+    cdp.ui.events.length === 0, `events=${JSON.stringify(cdp.ui.events)}`);
+  cdp.stop();
+  fs.rmSync(home, { recursive: true, force: true });
+
+  // Planted negative: with BOTH sightings already charged, no unowned hit is newly admitted, so
+  // the organizer falls through as though no modal were present — no reason=throttle, no cooldown.
+  const home2 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedOrganizer(MARKER, title)(home2);
+  seedThrottleSeen(home2, staleUrl, staleModal);
+  seedThrottleSeen(home2, newUrl, newModal);
+  const cdp2 = await mockCdp(staleText, [{ id: 'new1', url: newUrl }], {
+    tabText: (url) => (url === newUrl ? newText : undefined),
+    throttleModal: (id) => (id === 'new1' ? newModal : staleModal),
+  });
+  const r2 = await runSalvageInHome(home2, ['--organize', MARKER, '5'], cdp2.port);
+  // #208 gate r2 P1: this scenario is now the organizer's "absence-like conclusion" case the P1
+  // fix explicitly targets ("Apply the same rule to the organizer's throttled-but-ignored case if
+  // it can reach an absence-like conclusion"). Neither staleModal nor newModal carries any run
+  // marker (ours or foreign), so both are non-foreign unowned throttle sightings; with no
+  // recovery URL at all (seedOrganizer was called with no memo url), the organizer must now
+  // report the inconclusive throttle reason rather than silently falling through as if nothing
+  // were seen — even though every sighting this scan found was already charged and no NEW cooldown
+  // is written. Pre-fix, this same scenario asserted the opposite (no reason=throttle); that
+  // assertion is intentionally flipped here to match the mandated behavior change, not weakened.
+  check('#208 gate r2 P1 organizer: with every sighting already charged and no recovery URL, the organizer still reports the inconclusive throttle reason',
+    /reason=throttle/.test(r2.stdout), `stdout=${r2.stdout}`);
+  check('#208 gate r2 P1 organizer: with every sighting already charged, no NEW cooldown is written',
+    r2.cooldown === null, `cooldown=${r2.cooldown}`);
+  cdp2.stop();
+  fs.rmSync(home2, { recursive: true, force: true });
+
+  // Genuinely fresh planted negative: an organizer scan with NO throttle involvement at all (no
+  // modal, no interstitial, nothing already charged) must not report reason=throttle and must not
+  // write a cooldown — preserving honest planted-negative coverage for the "nothing happened" case
+  // now that the previous scenario's truth value has correctly flipped to reason=throttle.
+  const home2b = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedOrganizer(MARKER, title)(home2b);
+  const cdp2b = await mockCdp('__NO_TABS__');
+  const r2b = await runSalvageInHome(home2b, ['--organize', MARKER, '5'], cdp2b.port);
+  check('#208 gate r2 P1 organizer planted negative: with no throttle involvement at all, the organizer does not report reason=throttle',
+    !/reason=throttle/.test(r2b.stdout) && /reason=owned-target-not-found/.test(r2b.stdout),
+    `stdout=${r2b.stdout} stderr=${r2b.stderr?.slice(0, 300)}`);
+  check('#208 gate r2 P1 organizer planted negative: with no throttle involvement at all, no cooldown is written',
+    r2b.cooldown === null, `cooldown=${r2b.cooldown}`);
+  cdp2b.stop();
+  fs.rmSync(home2b, { recursive: true, force: true });
+}
+
+{ // #208 gate r2 P1 (main scan): a markerless throttle INTERSTITIAL (no modal element — the bare
+  // isThrottlePage check) on an unowned tab must not let a repeat, already-charged sighting fall
+  // through to a confirmed-absent exit 4 — that wrongly spends a paid review's finite
+  // recovery-miss budget on nothing but the account limiter. A repeat sighting of the SAME
+  // markerless tab must retreat to exit 7 (inconclusive), name why on stderr, and must NOT
+  // rewrite the cooldown (cooldown dedup is a rate-limit decision, not an ownership one).
+  const interstitialUrl = 'https://chatgpt.com/c/mock-interstitial-tab';
+  const interstitialText = "You're making requests too quickly. Please wait a few minutes before trying again.";
+  const oldMtimeI = (p) => { const t = new Date(Date.now() - 3_600_000); fs.utimesSync(p, t, t); };
+
+  const homeI = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const cdpI1 = await mockCdp('__NO_TABS__', [{ id: 'interstitial1', url: interstitialUrl }], {
+    tabText: () => interstitialText,
+  });
+  const firstI = await runSalvageInHome(homeI, [MARKER, '3'], cdpI1.port);
+  check('#208 gate r2 P1 interstitial: first unowned interstitial sighting takes the throttle exit (5)',
+    firstI.status === 5, `status=${firstI.status} stderr=${firstI.stderr?.slice(0, 200)}`);
+  check('#208 gate r2 P1 interstitial: first sighting records the tab in the seen sidecar',
+    throttleSeenHas(homeI, interstitialUrl, interstitialText),
+    `dir=${fs.existsSync(throttleSeenDir(homeI)) ? fs.readdirSync(throttleSeenDir(homeI)) : null}`);
+  cdpI1.stop();
+
+  const cooldownPathI = path.join(homeI, 'throttle.cooldown');
+  oldMtimeI(cooldownPathI);
+  const mtimeBeforeI = fs.statSync(cooldownPathI).mtimeMs;
+  const cdpI2 = await mockCdp('__NO_TABS__', [{ id: 'interstitial1', url: interstitialUrl }], {
+    tabText: () => interstitialText,
+  });
+  const secondI = await runSalvageInHome(homeI, [MARKER, '3'], cdpI2.port);
+  const mtimeAfterI = fs.statSync(cooldownPathI).mtimeMs;
+  check('#208 gate r2 P1 interstitial: a repeat sighting of the same interstitial does not exit confirmed-absent (4)',
+    secondI.status === 7, `status=${secondI.status} stderr=${secondI.stderr?.slice(0, 300)}`);
+  check('#208 gate r2 P1 interstitial: a repeat sighting reports evidence-kind: inconclusive, naming the throttle surface',
+    /evidence-kind: inconclusive/.test(secondI.stderr || '') &&
+      /inconclusive: an unowned throttle surface was observed this scan/.test(secondI.stderr || ''),
+    `stderr=${secondI.stderr?.slice(0, 400)}`);
+  check('#208 gate r2 P1 interstitial: a repeat sighting does not rewrite the cooldown',
+    mtimeAfterI === mtimeBeforeI, `before=${mtimeBeforeI} after=${mtimeAfterI}`);
+  cdpI2.stop();
+  fs.rmSync(homeI, { recursive: true, force: true });
+
+  // Planted negative: the SAME two-invocation shape, but the page underneath carries ANOTHER
+  // run's exact marker — positively someone else's conversation, not merely "not proven to
+  // belong to us". That is the one case the P1 rule allows to be disregarded when deciding
+  // absence: a repeat sighting of it must still correctly reach the confirmed-absent exit 4.
+  const foreignInterstitialUrl = 'https://chatgpt.com/c/mock-foreign-interstitial-tab';
+  const reasoningFiller = Array.from({ length: 120 }, (_, i) =>
+    `Reviewed concurrency risks in module ${i}: lock ordering, retry budgets, and reservation TTL handling.`).join('\n');
+  const foreignModalText = "Too many requests. You're making requests too quickly. We've temporarily limited access to your conversations to protect your data.";
+  const foreignPageText = `${foreignModalText}\nrun marker: pg-run-other-9999999999-9\n${reasoningFiller}`;
+
+  const homeF = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const cdpF1 = await mockCdp('__NO_TABS__', [{ id: 'foreignint1', url: foreignInterstitialUrl }], {
+    tabText: () => foreignPageText,
+    throttleModal: () => foreignModalText,
+  });
+  const firstF = await runSalvageInHome(homeF, [MARKER, '3'], cdpF1.port);
+  check('#208 gate r2 P1 planted negative: first foreign-marked modal sighting takes the throttle exit (5)',
+    firstF.status === 5, `status=${firstF.status} stderr=${firstF.stderr?.slice(0, 200)}`);
+  cdpF1.stop();
+
+  const cdpF2 = await mockCdp('__NO_TABS__', [{ id: 'foreignint1', url: foreignInterstitialUrl }], {
+    tabText: () => foreignPageText,
+    throttleModal: () => foreignModalText,
+  });
+  const secondF = await runSalvageInHome(homeF, [MARKER, '3'], cdpF2.port);
+  check('#208 gate r2 P1 planted negative: a repeat sighting of a POSITIVELY FOREIGN modal still reaches confirmed-absent (4), not inconclusive',
+    secondF.status === 4, `status=${secondF.status} stderr=${secondF.stderr?.slice(0, 400)}`);
+  check('#208 gate r2 P1 planted negative: the repeat foreign sighting is not reported as inconclusive',
+    !/evidence-kind: inconclusive/.test(secondF.stderr || ''), `stderr=${secondF.stderr?.slice(0, 400)}`);
+  cdpF2.stop();
+  fs.rmSync(homeF, { recursive: true, force: true });
+}
+
+{ // #208 gate r2 P1 (organizer variant): "Apply the same rule to the organizer's
+  // throttled-but-ignored case if it can reach an absence-like conclusion." A single unowned,
+  // markerless throttle sighting with NO recovery URL at all (no memo, no open owned tab) charges
+  // the cooldown and reports reason=throttle on its first scan — already-working #162/#208
+  // behavior. A SECOND organizer scan of the exact same tab (nothing ever clears the
+  // interstitial) finds the sighting already charged and must not silently fall through to
+  // reason=owned-target-not-found, an absence-like conclusion that wrongly implies nothing was
+  // ever seen: it must keep reporting the inconclusive reason=throttle framing, without writing a
+  // NEW cooldown.
+  const title = 'pro-gate review: PR #208 organizer P1 [pro-gate]';
+  const orgInterstitialUrl = 'https://chatgpt.com/c/mock-organizer-interstitial';
+  const orgInterstitialText = "You're making requests too quickly. Please wait a few minutes before trying again.";
+  const oldMtimeOP1 = (p) => { const t = new Date(Date.now() - 3_600_000); fs.utimesSync(p, t, t); };
+
+  const homeOP1 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedOrganizer(MARKER, title)(homeOP1); // no memo url -> no recovery path at all
+
+  const cdpOP1a = await mockCdp('__NO_TABS__', [{ id: 'orgint1', url: orgInterstitialUrl }], {
+    tabText: () => orgInterstitialText,
+  });
+  const orgFirst = await runSalvageInHome(homeOP1, ['--organize', MARKER, '5'], cdpOP1a.port);
+  check('#208 gate r2 P1 organizer: first unowned interstitial sighting reports reason=throttle',
+    /reason=throttle/.test(orgFirst.stdout), `stdout=${orgFirst.stdout} stderr=${orgFirst.stderr?.slice(0, 300)}`);
+  check('#208 gate r2 P1 organizer: first sighting writes the cooldown',
+    orgFirst.cooldown !== null, `cooldown=${orgFirst.cooldown}`);
+  cdpOP1a.stop();
+
+  const cooldownPathOP1 = path.join(homeOP1, 'throttle.cooldown');
+  oldMtimeOP1(cooldownPathOP1);
+  const mtimeBeforeOP1 = fs.statSync(cooldownPathOP1).mtimeMs;
+  const cdpOP1b = await mockCdp('__NO_TABS__', [{ id: 'orgint1', url: orgInterstitialUrl }], {
+    tabText: () => orgInterstitialText,
+  });
+  const orgSecond = await runSalvageInHome(homeOP1, ['--organize', MARKER, '5'], cdpOP1b.port);
+  const mtimeAfterOP1 = fs.statSync(cooldownPathOP1).mtimeMs;
+  check('#208 gate r2 P1 organizer: a repeat sighting with no recovery URL still reports reason=throttle, not owned-target-not-found',
+    /reason=throttle/.test(orgSecond.stdout), `stdout=${orgSecond.stdout} stderr=${orgSecond.stderr?.slice(0, 300)}`);
+  check('#208 gate r2 P1 organizer: a repeat sighting does not rewrite the cooldown',
+    mtimeAfterOP1 === mtimeBeforeOP1, `before=${mtimeBeforeOP1} after=${mtimeAfterOP1}`);
+  cdpOP1b.stop();
+  fs.rmSync(homeOP1, { recursive: true, force: true });
+}
+
+{ // #208 gate r2 P2 (store level): concurrent scans (probe+harvest, or two overlapping probes)
+  // used to overwrite each other's remembered throttle sightings because the OLD sidecar
+  // (throttle.cooldown.seen) was loaded ONCE per invocation and rewritten WHOLESALE — a second
+  // writer's own load-then-mutate-then-rewrite could always land after the first's and silently
+  // drop whichever sighting lost the race. The fix replaces that single file with one
+  // independently-created record file per (url, hash) fingerprint
+  // (fs.writeFileSync(..., {flag:'wx'})), so two writers can never clobber each other and there
+  // is no shared in-memory snapshot to go stale. This proves the guarantee at the store level: a
+  // record written DIRECTLY (standing in for a concurrent writer) survives a REAL invocation's
+  // own in-flight charge untouched, and a later invocation recognizes that directly-written
+  // record as already charged instead of re-admitting it.
+  const recordAUrl = 'https://chatgpt.com/c/mock-race-record-a';
+  const recordAText = "You're making requests too quickly. [race fixture A]";
+  const recordCUrl = 'https://chatgpt.com/c/mock-race-record-c';
+  const recordCText = "You're making requests too quickly. [race fixture C]";
+  const recordBUrl = 'https://chatgpt.com/c/mock-race-record-b';
+  const recordBText = "You're making requests too quickly. [race fixture B]";
+
+  const homeRace = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  // A stands in for a fingerprint an earlier or sibling scan already charged.
+  seedThrottleSeen(homeRace, recordAUrl, recordAText);
+
+  // A REAL invocation admits B for a genuinely new sighting. Started but not yet awaited, so the
+  // synchronous injection of C below lands while B's scan is still in flight, mirroring a second
+  // concurrent writer racing the first.
+  const cdpRace = await mockCdp('__NO_TABS__', [{ id: 'race-b', url: recordBUrl }], {
+    tabText: () => recordBText,
+  });
+  const bPromise = runSalvageInHome(homeRace, [MARKER, '3'], cdpRace.port);
+  // A DIFFERENT writer's record, injected synchronously while B's scan is in flight.
+  seedThrottleSeen(homeRace, recordCUrl, recordCText);
+  const bResult = await bPromise;
+  cdpRace.stop();
+
+  check('#208 gate r2 P2 store: the real invocation admits its own new sighting (exit 5)',
+    bResult.status === 5, `status=${bResult.status} stderr=${bResult.stderr?.slice(0, 200)}`);
+  check('#208 gate r2 P2 store: A (seeded before the in-flight scan) survives untouched',
+    throttleSeenHas(homeRace, recordAUrl, recordAText),
+    `dir=${fs.existsSync(throttleSeenDir(homeRace)) ? fs.readdirSync(throttleSeenDir(homeRace)) : null}`);
+  check("#208 gate r2 P2 store: B (the in-flight scan's own new sighting) is durably recorded",
+    throttleSeenHas(homeRace, recordBUrl, recordBText),
+    `dir=${fs.existsSync(throttleSeenDir(homeRace)) ? fs.readdirSync(throttleSeenDir(homeRace)) : null}`);
+  check("#208 gate r2 P2 store: C (a concurrent writer's record injected mid-flight) is not clobbered by the in-flight scan's own write",
+    throttleSeenHas(homeRace, recordCUrl, recordCText),
+    `dir=${fs.existsSync(throttleSeenDir(homeRace)) ? fs.readdirSync(throttleSeenDir(homeRace)) : null}`);
+
+  // Planted "no re-charge" check: a follow-up invocation whose only tab carries C's EXACT
+  // fingerprint must recognize it as already charged and must not re-admit it (no throttle exit,
+  // no cooldown rewrite) — proving the read side recognizes a record written by any writer, not
+  // only ones this same process created.
+  const cooldownPathRace = path.join(homeRace, 'throttle.cooldown');
+  const oldMtimeRace = (p) => { const t = new Date(Date.now() - 3_600_000); fs.utimesSync(p, t, t); };
+  oldMtimeRace(cooldownPathRace);
+  const mtimeBeforeRace = fs.statSync(cooldownPathRace).mtimeMs;
+  const cdpFollowup = await mockCdp('__NO_TABS__', [{ id: 'race-c', url: recordCUrl }], {
+    tabText: () => recordCText,
+  });
+  const followup = await runSalvageInHome(homeRace, [MARKER, '3'], cdpFollowup.port);
+  const mtimeAfterRace = fs.statSync(cooldownPathRace).mtimeMs;
+  check("#208 gate r2 P2 store planted negative: a follow-up scan of C's exact fingerprint is not re-admitted",
+    followup.status !== 5, `status=${followup.status}`);
+  check("#208 gate r2 P2 store planted negative: a follow-up scan of C's exact fingerprint does not rewrite the cooldown",
+    mtimeAfterRace === mtimeBeforeRace, `before=${mtimeBeforeRace} after=${mtimeAfterRace}`);
+  cdpFollowup.stop();
+  fs.rmSync(homeRace, { recursive: true, force: true });
+}
+
+{ // #208 gate r2 P2 (batch, main scan): one already-open BATCH of >=2 distinct new unowned
+  // throttle modal sightings in a SINGLE scan must record every one of their fingerprints before
+  // exiting, not merely the first — the old whole-scan walk called process.exit(5) on the FIRST
+  // newly-admitted hit, so hit #2 was never charged and a later invocation re-admitted it as
+  // though it had never been seen (one already-observed batch cost N separate cooldowns, one
+  // newly-discovered tab at a time, instead of the ONE this single scan should have charged).
+  const batchUrlTwo = 'https://chatgpt.com/c/mock-batch-tab-two';
+  const batchModalOne = "You're making requests too quickly. [batch fixture one]";
+  const batchModalTwo = "You're making requests too quickly. [batch fixture two]";
+  const batchTextOne = `${batchModalOne}\nAccount limits.`;
+  const batchTextTwo = `${batchModalTwo}\nAccount limits.`;
+
+  const homeBatch = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const cdpBatch = await mockCdp(batchTextOne, [{ id: 'batch-two', url: batchUrlTwo }], {
+    tabText: (url) => (url === batchUrlTwo ? batchTextTwo : batchTextOne),
+    throttleModal: (id) => (id === 'batch-two' ? batchModalTwo : batchModalOne),
+  });
+  const batchFirst = await runSalvageInHome(homeBatch, [MARKER, '3'], cdpBatch.port);
+  check('#208 gate r2 P2 batch (main scan): the batch takes the throttle exit (5)',
+    batchFirst.status === 5, `status=${batchFirst.status} stderr=${batchFirst.stderr?.slice(0, 200)}`);
+  check('#208 gate r2 P2 batch (main scan): the FIRST tab in the batch is recorded in the seen sidecar',
+    throttleSeenHas(homeBatch, 'https://chatgpt.com/c/mock-conversation', batchModalOne),
+    `dir=${fs.existsSync(throttleSeenDir(homeBatch)) ? fs.readdirSync(throttleSeenDir(homeBatch)) : null}`);
+  check('#208 gate r2 P2 batch (main scan): the SECOND tab in the same batch is ALSO recorded, not left for a later invocation to rediscover',
+    throttleSeenHas(homeBatch, batchUrlTwo, batchModalTwo),
+    `dir=${fs.existsSync(throttleSeenDir(homeBatch)) ? fs.readdirSync(throttleSeenDir(homeBatch)) : null}`);
+  cdpBatch.stop();
+
+  // Follow-up scan of JUST the second tab (still open, same modal) — the definitive proof: if
+  // the batch's second hit was durably recorded during the FIRST scan (this fix), this repeat is
+  // recognized as already charged and does not re-admit it as though it had never been seen.
+  const cooldownPathBatch = path.join(homeBatch, 'throttle.cooldown');
+  const oldMtimeBatch = (p) => { const t = new Date(Date.now() - 3_600_000); fs.utimesSync(p, t, t); };
+  oldMtimeBatch(cooldownPathBatch);
+  const mtimeBeforeBatch = fs.statSync(cooldownPathBatch).mtimeMs;
+  const cdpBatchFollowup = await mockCdp('__NO_TABS__', [{ id: 'batch-two', url: batchUrlTwo }], {
+    tabText: () => batchTextTwo,
+    throttleModal: () => batchModalTwo,
+  });
+  const batchFollowup = await runSalvageInHome(homeBatch, [MARKER, '3'], cdpBatchFollowup.port);
+  const mtimeAfterBatch = fs.statSync(cooldownPathBatch).mtimeMs;
+  check("#208 gate r2 P2 batch (main scan): the batch's SECOND hit, recorded in the SAME first scan, is not re-admitted by a later scan",
+    batchFollowup.status !== 5, `status=${batchFollowup.status}`);
+  check('#208 gate r2 P2 batch (main scan): the follow-up scan of the second hit does not rewrite the cooldown',
+    mtimeAfterBatch === mtimeBeforeBatch, `before=${mtimeBeforeBatch} after=${mtimeAfterBatch}`);
+  cdpBatchFollowup.stop();
+  fs.rmSync(homeBatch, { recursive: true, force: true });
+}
+
+{ // #208 gate r2 P2 (batch, organizer variant): the same fix, applied to the organizer's
+  // throttleHits walk — a batch of >=2 distinct new unowned sightings in one organizer scan must
+  // record all of them before returning, not merely the first.
+  const title = 'pro-gate review: PR #208 organizer P2 batch [pro-gate]';
+  const orgBatchUrlTwo = 'https://chatgpt.com/c/mock-organizer-batch-two';
+  const orgBatchTextOne = "You're making requests too quickly. [organizer batch fixture one]";
+  const orgBatchTextTwo = "You're making requests too quickly. [organizer batch fixture two]";
+
+  const homeOrgBatch = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedOrganizer(MARKER, title)(homeOrgBatch);
+  const cdpOrgBatch = await mockCdp(orgBatchTextOne, [
+    { id: 'org-batch-two', url: orgBatchUrlTwo },
+  ], {
+    tabText: (url) => (url === orgBatchUrlTwo ? orgBatchTextTwo : orgBatchTextOne),
+  });
+  const orgBatchFirst = await runSalvageInHome(homeOrgBatch, ['--organize', MARKER, '5'], cdpOrgBatch.port);
+  check('#208 gate r2 P2 batch (organizer): the batch reports reason=throttle',
+    /reason=throttle/.test(orgBatchFirst.stdout), `stdout=${orgBatchFirst.stdout} stderr=${orgBatchFirst.stderr?.slice(0, 300)}`);
+  cdpOrgBatch.stop();
+
+  // Follow-up organizer scan of JUST the second tab: the definitive proof it was durably
+  // recorded during the first (batched) scan, not left for this scan to rediscover as new. The
+  // r2 P1 fix now makes reason=throttle appear on an ignored-but-inconclusive repeat too, so the
+  // discriminator here is the cooldown mtime and the "already charged" stderr line, not the
+  // reason field.
+  const cooldownPathOrgBatch = path.join(homeOrgBatch, 'throttle.cooldown');
+  const oldMtimeOrgBatch = (p) => { const t = new Date(Date.now() - 3_600_000); fs.utimesSync(p, t, t); };
+  oldMtimeOrgBatch(cooldownPathOrgBatch);
+  const mtimeBeforeOrgBatch = fs.statSync(cooldownPathOrgBatch).mtimeMs;
+  const cdpOrgBatchFollowup = await mockCdp('__NO_TABS__', [{ id: 'org-batch-two', url: orgBatchUrlTwo }], {
+    tabText: () => orgBatchTextTwo,
+  });
+  const orgBatchFollowup = await runSalvageInHome(homeOrgBatch, ['--organize', MARKER, '5'], cdpOrgBatchFollowup.port);
+  const mtimeAfterOrgBatch = fs.statSync(cooldownPathOrgBatch).mtimeMs;
+  check("#208 gate r2 P2 batch (organizer): the batch's SECOND hit, recorded in the SAME first scan, does not rewrite the cooldown on a later scan",
+    mtimeAfterOrgBatch === mtimeBeforeOrgBatch, `before=${mtimeBeforeOrgBatch} after=${mtimeAfterOrgBatch}`);
+  check('#208 gate r2 P2 batch (organizer): the follow-up scan names the second tab as already charged, not freshly charged',
+    orgBatchFollowup.stderr?.includes(`stale throttle modal on unowned tab ${orgBatchUrlTwo} already charged`),
+    `stderr=${orgBatchFollowup.stderr?.slice(0, 400)}`);
+  cdpOrgBatchFollowup.stop();
+  fs.rmSync(homeOrgBatch, { recursive: true, force: true });
+}
+
+{ // #208 gate r3 P2 (finding 1a): TWO markerless interstitials (no modal element on either tab)
+  // in the SAME scan must cost exactly one cooldown, batched together, not one cooldown per tab
+  // across separate invocations. Pre-fix, only the whole-scan MODAL fallback batched; a
+  // marker-less interstitial was still tripped one at a time by the per-tab loop, which called
+  // process.exit(5) on the FIRST hit — so the second tab's fingerprint was never even reached,
+  // let alone recorded, in the same scan.
+  const interstitialUrlOne = 'https://chatgpt.com/c/mock-interstitial-batch-one';
+  const interstitialUrlTwo = 'https://chatgpt.com/c/mock-interstitial-batch-two';
+  const interstitialTextOne = "You're making requests too quickly. [r3 interstitial batch one]";
+  const interstitialTextTwo = "You're making requests too quickly. [r3 interstitial batch two]";
+  const oldMtimeR3a = (p) => { const t = new Date(Date.now() - 3_600_000); fs.utimesSync(p, t, t); };
+
+  const homeR3a = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const cdpR3aFirst = await mockCdp('__NO_TABS__', [
+    { id: 'interstitial-one', url: interstitialUrlOne },
+    { id: 'interstitial-two', url: interstitialUrlTwo },
+  ], {
+    tabText: (url) => (url === interstitialUrlTwo ? interstitialTextTwo : interstitialTextOne),
+  });
+  const r3aFirst = await runSalvageInHome(homeR3a, [MARKER, '3'], cdpR3aFirst.port);
+  check('#208 gate r3 P2 (1a) a batch of two unowned interstitials takes the throttle exit (5)',
+    r3aFirst.status === 5, `status=${r3aFirst.status} stderr=${r3aFirst.stderr?.slice(0, 200)}`);
+  check('#208 gate r3 P2 (1a) the FIRST interstitial in the batch is recorded in the seen sidecar',
+    throttleSeenHas(homeR3a, interstitialUrlOne, interstitialTextOne),
+    `dir=${fs.existsSync(throttleSeenDir(homeR3a)) ? fs.readdirSync(throttleSeenDir(homeR3a)) : null}`);
+  check('#208 gate r3 P2 (1a) the SECOND interstitial in the SAME scan is ALSO recorded, not left for a later invocation to rediscover',
+    throttleSeenHas(homeR3a, interstitialUrlTwo, interstitialTextTwo),
+    `dir=${fs.existsSync(throttleSeenDir(homeR3a)) ? fs.readdirSync(throttleSeenDir(homeR3a)) : null}`);
+  cdpR3aFirst.stop();
+
+  // Follow-up scan of BOTH tabs, unchanged: the definitive proof. If the second tab's
+  // fingerprint was durably recorded during the FIRST scan (this fix), this repeat recognizes
+  // both as already charged and writes no second cooldown.
+  const cooldownPathR3a = path.join(homeR3a, 'throttle.cooldown');
+  oldMtimeR3a(cooldownPathR3a);
+  const mtimeBeforeR3a = fs.statSync(cooldownPathR3a).mtimeMs;
+  const cdpR3aSecond = await mockCdp('__NO_TABS__', [
+    { id: 'interstitial-one', url: interstitialUrlOne },
+    { id: 'interstitial-two', url: interstitialUrlTwo },
+  ], {
+    tabText: (url) => (url === interstitialUrlTwo ? interstitialTextTwo : interstitialTextOne),
+  });
+  const r3aSecond = await runSalvageInHome(homeR3a, [MARKER, '3'], cdpR3aSecond.port);
+  const mtimeAfterR3a = fs.statSync(cooldownPathR3a).mtimeMs;
+  check('#208 gate r3 P2 (1a) a follow-up scan of both unchanged interstitials does not take the throttle exit',
+    r3aSecond.status !== 5, `status=${r3aSecond.status}`);
+  check('#208 gate r3 P2 (1a) a follow-up scan of both unchanged interstitials does not rewrite the cooldown',
+    mtimeAfterR3a === mtimeBeforeR3a, `before=${mtimeBeforeR3a} after=${mtimeAfterR3a}`);
+  cdpR3aSecond.stop();
+  fs.rmSync(homeR3a, { recursive: true, force: true });
+}
+
+{ // #208 gate r3 P2 (finding 1b): a MIXED batch — one modal hit and one marker-less interstitial
+  // hit on a DIFFERENT tab, both new in the same scan — must also cost exactly one cooldown.
+  // Pre-fix, the modal hit alone tripped the whole-scan modal fallback and called
+  // process.exit(5) immediately, so the per-tab loop (where the interstitial hit was tripped)
+  // never even ran in that same process: the interstitial's fingerprint was never recorded,
+  // costing its own separate cooldown on the very next invocation.
+  const mixedModalUrl = 'https://chatgpt.com/c/mock-mixed-modal';
+  const mixedInterstitialUrl = 'https://chatgpt.com/c/mock-mixed-interstitial';
+  const mixedModalText = "You're making requests too quickly. [r3 mixed modal]";
+  const mixedInterstitialText = "You're making requests too quickly. [r3 mixed interstitial]";
+  const oldMtimeR3b = (p) => { const t = new Date(Date.now() - 3_600_000); fs.utimesSync(p, t, t); };
+
+  const homeR3b = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const cdpR3bFirst = await mockCdp('__NO_TABS__', [
+    { id: 'mixed-modal', url: mixedModalUrl },
+    { id: 'mixed-interstitial', url: mixedInterstitialUrl },
+  ], {
+    tabText: (url) => (url === mixedInterstitialUrl ? mixedInterstitialText : mixedModalText),
+    throttleModal: (id) => (id === 'mixed-modal' ? mixedModalText : null),
+  });
+  const r3bFirst = await runSalvageInHome(homeR3b, [MARKER, '3'], cdpR3bFirst.port);
+  check('#208 gate r3 P2 (1b) a mixed modal+interstitial batch takes the throttle exit (5)',
+    r3bFirst.status === 5, `status=${r3bFirst.status} stderr=${r3bFirst.stderr?.slice(0, 200)}`);
+  check('#208 gate r3 P2 (1b) the modal hit is recorded in the seen sidecar (fingerprint = modal text)',
+    throttleSeenHas(homeR3b, mixedModalUrl, mixedModalText),
+    `dir=${fs.existsSync(throttleSeenDir(homeR3b)) ? fs.readdirSync(throttleSeenDir(homeR3b)) : null}`);
+  check('#208 gate r3 P2 (1b) the interstitial hit on the OTHER tab is ALSO recorded in the SAME scan (fingerprint = page text)',
+    throttleSeenHas(homeR3b, mixedInterstitialUrl, mixedInterstitialText),
+    `dir=${fs.existsSync(throttleSeenDir(homeR3b)) ? fs.readdirSync(throttleSeenDir(homeR3b)) : null}`);
+  cdpR3bFirst.stop();
+
+  const cooldownPathR3b = path.join(homeR3b, 'throttle.cooldown');
+  oldMtimeR3b(cooldownPathR3b);
+  const mtimeBeforeR3b = fs.statSync(cooldownPathR3b).mtimeMs;
+  const cdpR3bSecond = await mockCdp('__NO_TABS__', [
+    { id: 'mixed-modal', url: mixedModalUrl },
+    { id: 'mixed-interstitial', url: mixedInterstitialUrl },
+  ], {
+    tabText: (url) => (url === mixedInterstitialUrl ? mixedInterstitialText : mixedModalText),
+    throttleModal: (id) => (id === 'mixed-modal' ? mixedModalText : null),
+  });
+  const r3bSecond = await runSalvageInHome(homeR3b, [MARKER, '3'], cdpR3bSecond.port);
+  const mtimeAfterR3b = fs.statSync(cooldownPathR3b).mtimeMs;
+  check('#208 gate r3 P2 (1b) a follow-up scan of the same unchanged mixed batch does not take the throttle exit',
+    r3bSecond.status !== 5, `status=${r3bSecond.status}`);
+  check('#208 gate r3 P2 (1b) a follow-up scan of the same unchanged mixed batch does not rewrite the cooldown',
+    mtimeAfterR3b === mtimeBeforeR3b, `before=${mtimeBeforeR3b} after=${mtimeAfterR3b}`);
+  cdpR3bSecond.stop();
+  fs.rmSync(homeR3b, { recursive: true, force: true });
+}
+
+{ // #208 gate r3 P2 (finding 2a): PRO_GATE_THROTTLE_SEEN_MAX must actually change the enforced
+  // cap. Pre-fix the constant is a hardcoded 512, so setting the env var has NO effect at all —
+  // this only shows up once the on-disk count exceeds whichever cap really governs, so seed
+  // three unrelated dummy fingerprints (below the true default of 512, but above an override of
+  // 2) and fire the prune via one unrelated trigger hit. Pre-fix: all three dummies survive
+  // (3 is nowhere near the hardcoded 512). Post-fix with the override honored: cap=2 trims the
+  // three down to two survivors.
+  const homeOverride = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const overrideDummyUrl = (i) => `https://chatgpt.com/c/mock-cap-override-dummy-${i}`;
+  const overrideDummyText = (i) => `dummy filler text ${i} unrelated to this scan`;
+  for (let i = 0; i < 3; i += 1) seedThrottleSeen(homeOverride, overrideDummyUrl(i), overrideDummyText(i));
+  const overrideTriggerUrl = 'https://chatgpt.com/c/mock-cap-override-trigger';
+  const overrideTriggerText = "You're making requests too quickly. [r3 cap-override trigger]";
+  const cdpOverride = await mockCdp('__NO_TABS__', [{ id: 'override-trigger', url: overrideTriggerUrl }], {
+    tabText: () => overrideTriggerText, throttleModal: () => overrideTriggerText,
+  });
+  await runSalvageInHome(homeOverride, [MARKER, '3'], cdpOverride.port, { PRO_GATE_THROTTLE_SEEN_MAX: '2' });
+  cdpOverride.stop();
+  const overrideSurvivors = [0, 1, 2].filter((i) => throttleSeenHas(homeOverride, overrideDummyUrl(i), overrideDummyText(i))).length;
+  check('#208 gate r3 P2 (2a) PRO_GATE_THROTTLE_SEEN_MAX=2 trims three unrelated fingerprints down to two survivors',
+    overrideSurvivors === 2,
+    `survivors=${overrideSurvivors} dir=${fs.existsSync(throttleSeenDir(homeOverride)) ? fs.readdirSync(throttleSeenDir(homeOverride)) : null}`);
+  fs.rmSync(homeOverride, { recursive: true, force: true });
+}
+
+{ // #208 gate r3 P2 (finding 2b): the capacity trim must never evict a fingerprint the CURRENT
+  // scan itself is about to check, even at the true DEFAULT cap of 512 (no override involved).
+  // Simulate "this exact three-tab batch was already charged in an earlier scan" by seeding
+  // their three records directly with an older mtime, then pad the sidecar with 510 unrelated,
+  // NEWER-mtime filler records so the total (513) exceeds 512 by exactly one. When this
+  // unchanged batch is rescanned: pre-fix, the prune (no notion of "currently observed") evicts
+  // the globally oldest record — one of THIS batch's own three, because the 510 filler records
+  // are all newer — the evicted tab then reads as newly-charged and the batch wrongly re-trips
+  // the throttle exit (5) for a completely unchanged set of stale tabs. Post-fix, all three
+  // batch fingerprints are protected before the prune ever runs, so only the 510 (below-cap)
+  // filler records are eligible, nothing is evicted, and the unchanged batch costs no new charge.
+  const homeDefault = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const defCapUrlOne = 'https://chatgpt.com/c/mock-cap512-one';
+  const defCapUrlTwo = 'https://chatgpt.com/c/mock-cap512-two';
+  const defCapUrlThree = 'https://chatgpt.com/c/mock-cap512-three';
+  const defCapModalText = "You're making requests too quickly. [r3 cap-512 fixture]";
+  const defBatch = [
+    [defCapUrlOne, defCapModalText],
+    [defCapUrlTwo, defCapModalText],
+    [defCapUrlThree, defCapModalText],
+  ];
+  const oldBatchMtime = new Date(Date.now() - 600_000); // 10 minutes ago: "already charged earlier"
+  for (const [url, text] of defBatch) {
+    seedThrottleSeen(homeDefault, url, text);
+    const p = throttleSeenRecordPath(homeDefault, url, text);
+    fs.utimesSync(p, oldBatchMtime, oldBatchMtime);
+  }
+  // 510 unrelated filler records, seeded with the default (fresh, "now") mtime — newer than the
+  // batch above — pushing the sidecar to 513 total (512 default cap + 1).
+  for (let i = 0; i < 510; i += 1) {
+    seedThrottleSeen(homeDefault, `https://chatgpt.com/c/mock-cap512-filler-${i}`, `filler text ${i}`);
+  }
+  const batchMtimesBefore = defBatch.map(([url, text]) => fs.statSync(throttleSeenRecordPath(homeDefault, url, text)).mtimeMs);
+
+  const cdpDefault = await mockCdp('__NO_TABS__', [
+    { id: 'cap512-one', url: defCapUrlOne },
+    { id: 'cap512-two', url: defCapUrlTwo },
+    { id: 'cap512-three', url: defCapUrlThree },
+  ], { tabText: () => defCapModalText, throttleModal: () => defCapModalText });
+  const rescan = await runSalvageInHome(homeDefault, [MARKER, '3'], cdpDefault.port);
+  cdpDefault.stop();
+  const batchMtimesAfter = defBatch.map(([url, text]) => fs.statSync(throttleSeenRecordPath(homeDefault, url, text)).mtimeMs);
+
+  check('#208 gate r3 P2 (2b) rescanning the same unchanged three-tab batch above the default cap does not take the throttle exit',
+    rescan.status !== 5, `status=${rescan.status} stderr=${rescan.stderr?.slice(0, 300)}`);
+  check('#208 gate r3 P2 (2b) none of the three batch fingerprints were evicted-and-recreated (mtimes unchanged)',
+    batchMtimesBefore.every((t, i) => t === batchMtimesAfter[i]),
+    `before=${JSON.stringify(batchMtimesBefore)} after=${JSON.stringify(batchMtimesAfter)}`);
+  fs.rmSync(homeDefault, { recursive: true, force: true });
+}
+
+{ // #209 gate r6 P1 (bin/cdp-salvage.mjs:626, finding 1): a CLOSED remembered URL's scratch
+  // render shows ANOTHER run's marker beneath an ALREADY-RECORDED modal — classifyEvidence
+  // returns { kind: 'throttle', foreign: true }. tripThrottleEvidence's early return (already
+  // charged; no NEW cooldown, no exit(5)) is correct, but the remembered-render caller only ever
+  // routed `kind: 'foreign'` into the stale-memo branch, so this positive foreign evidence never
+  // marked the memo stale: knownUrl stayed the same dead foreign URL forever, and every LATER
+  // probe re-rendered it and hit the generic "inconclusive, re-rendered Nx" exit (7) instead of
+  // ever converging on confirmed-absent (4).
+  const modalText1 = "You're making requests too quickly. [r6 P1 remembered-render fixture]";
+  const foreignPageText1 = `ChatGPT\npg-run-another-run-777\n${modalText1}\nAnother run's conversation beneath the modal.\n`;
+  const seedUrl1 = 'https://chatgpt.com/c/mock-remembered-foreign-r6';
+
+  const home1 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedMemo(MARKER, seedUrl1)(home1);
+  // The (url, modal-text) fingerprint is already charged by an earlier scan — this is what
+  // forces tripThrottleUnowned's early return at bin/cdp-salvage.mjs:626 instead of a fresh
+  // exit(5); the bug is what happens to the evidence object AFTER that early return.
+  seedThrottleSeen(home1, seedUrl1, modalText1);
+
+  const cdp1 = await mockCdp('__NO_TABS__', [], {
+    renderText: () => foreignPageText1,
+    throttleModal: () => modalText1,
+  });
+  const r1 = await runSalvageInHome(home1, [MARKER, '3'], cdp1.port, SCRATCH_SAMPLE_TEST_ENV);
+  cdp1.stop();
+  check('#209 gate r6 P1 (1) an already-recorded foreign modal beneath the remembered URL does not take the throttle exit',
+    r1.status !== 5, `status=${r1.status}`);
+  check('#209 gate r6 P1 (1) an already-recorded foreign modal beneath the remembered URL reaches confirmed-absent, not stuck inconclusive',
+    r1.status === 4, `status=${r1.status} stderr=${r1.stderr?.slice(-400)}`);
+  check('#209 gate r6 P1 (1) the memo is reported stale on stderr',
+    /stale memo/.test(r1.stderr || ''), `stderr=${r1.stderr?.slice(-400)}`);
+  fs.rmSync(home1, { recursive: true, force: true });
+
+  // Planted negative: the same already-recorded-modal shape but MARKERLESS (no run marker, ours
+  // or foreign, anywhere on the underlying page) must stay inconclusive (7) as before — a bare
+  // repeat interstitial is rate-limit noise, not positive proof the memo belongs to someone else.
+  const modalText1b = "You're making requests too quickly. [r6 P1 markerless remembered-render fixture]";
+  const markerlessPageText1 = `ChatGPT\n${modalText1b}\nNo run marker anywhere on this page.\n`;
+  const seedUrl1b = 'https://chatgpt.com/c/mock-remembered-markerless-r6';
+
+  const home1b = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedMemo(MARKER, seedUrl1b)(home1b);
+  seedThrottleSeen(home1b, seedUrl1b, modalText1b);
+
+  const cdp1b = await mockCdp('__NO_TABS__', [], {
+    renderText: () => markerlessPageText1,
+    throttleModal: () => modalText1b,
+  });
+  const r1b = await runSalvageInHome(home1b, [MARKER, '3'], cdp1b.port, SCRATCH_SAMPLE_TEST_ENV);
+  cdp1b.stop();
+  check('#209 gate r6 P1 planted negative: an already-recorded MARKERLESS modal stays inconclusive (7), not confirmed-absent',
+    r1b.status === 7, `status=${r1b.status} stderr=${r1b.stderr?.slice(-400)}`);
+  check('#209 gate r6 P1 planted negative: the memo is NOT reported stale',
+    !/stale memo/.test(r1b.stderr || ''), `stderr=${r1b.stderr?.slice(-400)}`);
+  fs.rmSync(home1b, { recursive: true, force: true });
+}
+
+{ // Round-1 fixer verification (P1): the #209 gate r6 P1 fix above only widened the
+  // REMEMBERED-RENDER caller's foreign-memo gate. The CANONICAL-SCRATCH-REVALIDATION caller (the
+  // one-shot revalidation the scan spends on knownUrl when an owned-incomplete DUPLICATE tab is
+  // also open, bin/cdp-salvage.mjs ~1855) has the IDENTICAL gap: a scratch render of knownUrl
+  // that lands `{kind: 'throttle', foreign: true}` is just as decisive as `kind: 'foreign'`
+  // proof the memo is stale, but this sibling site only ever matched `fresh?.kind === 'foreign'`.
+  // Before the fix, tripThrottleEvidence's already-charged early return correctly skipped a
+  // fresh cooldown, but the code right after it never routed the evidence into rejectForeign, so
+  // the memo kept pointing at the condemned URL forever — permanently wasting the scan's one-shot
+  // canonical revalidation on it every later invocation instead of ever forgetting it.
+  const knownUrlSib = 'https://chatgpt.com/c/known-conversation-r6p1-sibling';
+  const duplicateTabSib = `run marker: ${MARKER}\nduplicate retry tab, still reasoning (r6 P1 sibling)...`;
+  const modalTextSib = "You're making requests too quickly. [r6 P1 sibling fixture]";
+  const foreignPageTextSib = `ChatGPT\npg-run-another-run-r6sib\n${modalTextSib}\nAnother run's conversation beneath the modal.\n`;
+
+  const seedSib = (home) => {
+    seedMemo(MARKER, knownUrlSib)(home);
+    // Already charged by an earlier scan — forces tripThrottleEvidence's early return (no fresh
+    // exit(5)) so the test isolates what happens to the evidence AFTER that return, exactly as
+    // the sibling #209 gate r6 P1 fixture above does.
+    seedThrottleSeen(home, knownUrlSib, modalTextSib);
+  };
+  const cdpSib = await mockCdp(duplicateTabSib, [], {
+    renderText: (url) => (url === knownUrlSib ? foreignPageTextSib : duplicateTabSib),
+    throttleModal: (id) => (id.startsWith('scratch') ? modalTextSib : null),
+  });
+  const rSib = await runScratchSalvage([MARKER, '3'], cdpSib.port, seedSib);
+  cdpSib.stop();
+  check('canonical-scratch sibling (1): an already-recorded foreign modal beneath the remembered URL does not take a fresh throttle exit',
+    rSib.status !== 5, `status=${rSib.status}`);
+  check('canonical-scratch sibling (1): the stale memo is forgotten, not left pointing at the condemned URL forever',
+    rSib.memos.length === 0, `memos=${JSON.stringify(rSib.memos)} memoUrl=${rSib.memoUrl}`);
+  check('canonical-scratch sibling (1): the condemned URL is blacklisted',
+    (rSib.blacklist ?? '').includes(knownUrlSib), `blacklist=${rSib.blacklist}`);
+  check('canonical-scratch sibling (1): stderr names canonical scratch as the source of the rejection',
+    /canonical scratch .*carries a DIFFERENT run's marker/.test(rSib.stderr || ''), `stderr=${rSib.stderr?.slice(-400)}`);
+
+  // Planted negative: the same already-recorded-modal shape but MARKERLESS (no run marker at
+  // all, ours or foreign) must leave the memo untouched — a bare repeat interstitial is
+  // rate-limit noise, not positive proof the memo belongs to someone else (design invariant:
+  // markerless repeats stay inconclusive).
+  const markerlessPageTextSib = `ChatGPT\n${modalTextSib}\nNo run marker anywhere on this page.\n`;
+  const cdpSibNeg = await mockCdp(duplicateTabSib, [], {
+    renderText: (url) => (url === knownUrlSib ? markerlessPageTextSib : duplicateTabSib),
+    throttleModal: (id) => (id.startsWith('scratch') ? modalTextSib : null),
+  });
+  const rSibNeg = await runScratchSalvage([MARKER, '3'], cdpSibNeg.port, seedSib);
+  cdpSibNeg.stop();
+  check('canonical-scratch sibling planted negative: a MARKERLESS repeat leaves the memo untouched',
+    rSibNeg.memos.length === 1 && rSibNeg.memoUrl === knownUrlSib,
+    `memos=${JSON.stringify(rSibNeg.memos)} memoUrl=${rSibNeg.memoUrl}`);
+  check('canonical-scratch sibling planted negative: no DIFFERENT-run-marker rejection is reported',
+    !/carries a DIFFERENT run's marker/.test(rSibNeg.stderr || ''), `stderr=${rSibNeg.stderr?.slice(-400)}`);
+}
+
+{ // #209 gate r6 P2 (bin/cdp-salvage.mjs:1309, finding 2): openOrganizerScratch's throttle
+  // return used to carry no ownership information at all, so the caller called
+  // recordThrottle('organizer scratch') UNCONDITIONALLY whenever a scratch render hit any
+  // throttle surface — an already-charged, unowned sighting recovered through scratch could
+  // re-arm the cooldown every single scan. Fixed by carrying the scratch result's url,
+  // fingerprint text and ownership back and applying the same central unowned gate every other
+  // throttle trip site in this file already uses.
+  const title2 = 'pro-gate review: PR #208 organizer scratch r6 [pro-gate]';
+  const recoveryUrl2 = 'https://chatgpt.com/c/organizer-scratch-r6';
+  const scratchModalText2 = "You're making requests too quickly. [r6 P2 organizer scratch fixture]";
+
+  // (a) Unowned: the scratch render's underlying page carries ANOTHER run's marker, and this
+  // exact (url, modal-text) fingerprint was already charged by an earlier scan.
+  const homeA = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedOrganizer(MARKER, title2, recoveryUrl2)(homeA);
+  seedThrottleSeen(homeA, recoveryUrl2, scratchModalText2);
+  const foreignScratchText2 = `ChatGPT\npg-run-someone-elses-run-999\n${scratchModalText2}\nAnother run's conversation.\n`;
+  const cdpA = await mockCdp('__NO_TABS__', [], {
+    renderText: () => foreignScratchText2,
+    throttleModal: () => scratchModalText2,
+  });
+  const rA = await runSalvageInHome(homeA, ['--organize', MARKER, '5'], cdpA.port);
+  cdpA.stop();
+  check('#209 gate r6 P2 (2) organizer scratch: an unowned already-charged sighting still reports reason=throttle',
+    /reason=throttle/.test(rA.stdout), `stdout=${rA.stdout} stderr=${rA.stderr?.slice(0, 400)}`);
+  check('#209 gate r6 P2 (2) organizer scratch: an unowned already-charged sighting does NOT re-arm the cooldown',
+    rA.cooldown === null, `cooldown=${rA.cooldown}`);
+  fs.rmSync(homeA, { recursive: true, force: true });
+
+  // (b) Owned: the scratch render's underlying page carries THIS run's own marker beneath the
+  // modal — always re-arms unconditionally, even though nothing was ever pre-charged.
+  const ownedScratchText2 = `ChatGPT\nrun marker: ${MARKER}\n${scratchModalText2}\nOur own conversation.\n`;
+  const homeB = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedOrganizer(MARKER, title2, recoveryUrl2)(homeB);
+  const cdpB = await mockCdp('__NO_TABS__', [], {
+    renderText: () => ownedScratchText2,
+    throttleModal: () => scratchModalText2,
+  });
+  const rB = await runSalvageInHome(homeB, ['--organize', MARKER, '5'], cdpB.port);
+  cdpB.stop();
+  check('#209 gate r6 P2 (2) organizer scratch: an owned sighting still reports reason=throttle',
+    /reason=throttle/.test(rB.stdout), `stdout=${rB.stdout} stderr=${rB.stderr?.slice(0, 400)}`);
+  check('#209 gate r6 P2 (2) organizer scratch: an owned sighting always re-arms the cooldown',
+    rB.cooldown !== null && /organizer scratch/.test(rB.cooldown), `cooldown=${rB.cooldown}`);
+  fs.rmSync(homeB, { recursive: true, force: true });
+}
+
+{ // #209 gate r6 P2 (bin/cdp-salvage.mjs:525, finding 3): the fingerprint record was committed
+  // (recordThrottleSeen's 'wx' create) before the cooldown was ever attempted (recordThrottle).
+  // A failed or interrupted cooldown write left that record behind with no cooldown to show for
+  // it, silently suppressing the sighting forever. Force the write to fail deterministically
+  // (independent of uid/permissions) by pointing PRO_GATE_COOLDOWN_FILE at a path that already
+  // exists as a DIRECTORY — fs.writeFileSync on it always throws EISDIR — at a path distinct
+  // from the real default cooldown file, so a later unblocked scan can still write it for real.
+  const staleUrl3 = 'https://chatgpt.com/c/mock-cooldown-write-fail';
+  const modalText3 = "You're making requests too quickly. [r6 P2 cooldown-write-fail fixture]";
+  const home3 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const blockedCooldownPath = path.join(home3, 'blocked-cooldown-r6');
+  fs.mkdirSync(blockedCooldownPath, { recursive: true });
+
+  const cdp3a = await mockCdp('__NO_TABS__', [{ id: 'fail1', url: staleUrl3 }], {
+    tabText: () => modalText3,
+    throttleModal: () => modalText3,
+  });
+  const rFirst = await runSalvageInHome(home3, [MARKER, '3'], cdp3a.port,
+    { PRO_GATE_COOLDOWN_FILE: blockedCooldownPath });
+  cdp3a.stop();
+  check('#209 gate r6 P2 (3) a genuinely new unowned sighting still takes the throttle exit even when the cooldown write fails',
+    rFirst.status === 5, `status=${rFirst.status} stderr=${rFirst.stderr?.slice(-400)}`);
+  check('#209 gate r6 P2 (3) a failed cooldown write is reported on stderr, not claimed as a success',
+    /could not be written/.test(rFirst.stderr || '') && !/cooldown written to/.test(rFirst.stderr || ''),
+    `stderr=${rFirst.stderr?.slice(-500)}`);
+  check('#209 gate r6 P2 (3) the fingerprint record is rolled back, not left behind, after the failed write',
+    !throttleSeenHas(home3, staleUrl3, modalText3),
+    `throttleSeen=${fs.existsSync(throttleSeenDir(home3)) ? fs.readdirSync(throttleSeenDir(home3)) : null}`);
+
+  // Second scan of the SAME unchanged tab, this time with the real cooldown path unblocked: the
+  // sighting must be re-chargeable (not permanently suppressed by an orphaned "seen" record),
+  // and this time the write actually succeeds.
+  const cdp3b = await mockCdp('__NO_TABS__', [{ id: 'fail1', url: staleUrl3 }], {
+    tabText: () => modalText3,
+    throttleModal: () => modalText3,
+  });
+  const rSecond = await runSalvageInHome(home3, [MARKER, '3'], cdp3b.port);
+  cdp3b.stop();
+  check('#209 gate r6 P2 (3) the same unchanged sighting is re-chargeable on a later scan instead of suppressed forever',
+    rSecond.status === 5, `status=${rSecond.status} stderr=${rSecond.stderr?.slice(-400)}`);
+  check('#209 gate r6 P2 (3) the later, unblocked scan actually writes the real cooldown file',
+    rSecond.cooldown !== null && /modal over tab/.test(rSecond.cooldown), `cooldown=${rSecond.cooldown}`);
+  fs.rmSync(home3, { recursive: true, force: true });
+}
+
+{ // #215 gate r1 P1 (bin/cdp-salvage.mjs:1779 main scan, :1341 organizer): a BLACKLISTED tab
+  // whose page carries THIS run's own exact marker beneath the throttle modal was misclassified
+  // as FOREIGN throttle evidence. `ownedHit` correctly excludes blacklisted URLs from positive
+  // ownership, but the batch mapping immediately after it asked only
+  // `FOREIGN_MARKER_RE.test(hit.text)` — and that pattern matches ANY pg-run marker, this run's
+  // included. The hit therefore reached tripThrottleUnownedBatch with `foreign: true`, the one
+  // case allowed to skip setting inconclusiveThrottleSeen. With the sighting already charged (so
+  // no fresh exit 5) and the tab loop skipping the blacklisted URL, the scan fell all the way
+  // through to the confirmed-absent exit 4 — spending a paid review's finite recovery-miss budget
+  // on a limiter that never supplied ANOTHER run's marker, the exact distinction the #208 absence
+  // guard exists to preserve. classifyEvidence already held the reference predicate
+  // (`foreign: !owned && FOREIGN_MARKER_RE.test(text)`); both batch mappings now match it, while
+  // keeping blacklisted URLs excluded from positive ownership.
+  const blSelfUrl = 'https://chatgpt.com/c/mock-blacklisted-self-marked-215';
+  const blForeignUrl = 'https://chatgpt.com/c/mock-blacklisted-foreign-215';
+  const modalText215 = "You're making requests too quickly. [#215 gate r1 P1 fixture]";
+  const selfMarkedPage215 = `ChatGPT\nrun marker: ${MARKER}\n${modalText215}\nOur own conversation beneath the modal.\n`;
+  const foreignMarkedPage215 = `ChatGPT\npg-run-another-run-215\n${modalText215}\nAnother run's conversation beneath the modal.\n`;
+  // Blacklisted (the per-marker nonMatching list) AND already charged: the two preconditions the
+  // finding names. Nothing else is seeded — no memo, no second candidate — so the only way out of
+  // the scan is the absence-vs-inconclusive decision this test is about.
+  const seedBlacklistedCharged215 = (home, url) => {
+    fs.writeFileSync(path.join(home, 'salvage-nonmatching.txt'), `${MARKER}\t${url}\n`);
+    seedThrottleSeen(home, url, modalText215);
+  };
+
+  const homeSelf215 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedBlacklistedCharged215(homeSelf215, blSelfUrl);
+  const cdpSelf215 = await mockCdp('__NO_TABS__', [{ id: 'bl215', url: blSelfUrl }], {
+    tabText: () => selfMarkedPage215,
+    throttleModal: () => modalText215,
+  });
+  const rSelf215 = await runSalvageInHome(homeSelf215, ['--probe', MARKER, '3'], cdpSelf215.port);
+  cdpSelf215.stop();
+  check("#215 gate r1 P1 main scan: a blacklisted tab carrying THIS run's own marker under an already-charged modal stays inconclusive (7), not confirmed-absent (4)",
+    rSelf215.status === 7, `status=${rSelf215.status} stderr=${rSelf215.stderr?.slice(-500)}`);
+  check('#215 gate r1 P1 main scan: the repeat probe names the unowned throttle surface as its reason',
+    /^evidence-kind: inconclusive$/m.test(rSelf215.stderr || '')
+      && /inconclusive: an unowned throttle surface was observed this scan/.test(rSelf215.stderr || ''),
+    `stderr=${rSelf215.stderr?.slice(-500)}`);
+  check('#215 gate r1 P1 main scan: the already-charged sighting neither writes nor rewrites the cooldown',
+    rSelf215.cooldown === null, `cooldown=${rSelf215.cooldown}`);
+  check('#215 gate r1 P1 main scan: the blacklisted self-marked tab is never reported as positive ownership',
+    !/live conversation:/.test(rSelf215.stderr || '') && !/probe-state:/.test(rSelf215.stderr || ''),
+    `stderr=${rSelf215.stderr?.slice(-500)}`);
+  fs.rmSync(homeSelf215, { recursive: true, force: true });
+
+  // Planted negative: the SAME blacklisted, already-charged shape, but the page beneath the modal
+  // carries a genuinely OTHER run's marker. That is positively someone else's conversation — the
+  // one case #208 gate r2 P1 allows to be disregarded when deciding absence — so it must keep
+  // today's behaviour and still reach the confirmed-absent exit 4.
+  const homeForeign215 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedBlacklistedCharged215(homeForeign215, blForeignUrl);
+  const cdpForeign215 = await mockCdp('__NO_TABS__', [{ id: 'bl215f', url: blForeignUrl }], {
+    tabText: () => foreignMarkedPage215,
+    throttleModal: () => modalText215,
+  });
+  const rForeign215 = await runSalvageInHome(homeForeign215, ['--probe', MARKER, '3'], cdpForeign215.port);
+  cdpForeign215.stop();
+  check("#215 gate r1 P1 planted negative: a blacklisted tab carrying ANOTHER run's marker is still foreign evidence and reaches confirmed-absent (4)",
+    rForeign215.status === 4, `status=${rForeign215.status} stderr=${rForeign215.stderr?.slice(-500)}`);
+  check('#215 gate r1 P1 planted negative: the repeat foreign sighting is not reported as inconclusive',
+    !/evidence-kind: inconclusive/.test(rForeign215.stderr || ''), `stderr=${rForeign215.stderr?.slice(-500)}`);
+  check('#215 gate r1 P1 planted negative: the already-charged foreign sighting does not write the cooldown',
+    rForeign215.cooldown === null, `cooldown=${rForeign215.cooldown}`);
+  fs.rmSync(homeForeign215, { recursive: true, force: true });
+
+  // Organizer variant: the same misclassification lived in the organizer's own batch mapping.
+  // With the sighting already charged, no memo and no other candidate, the organizer used to fall
+  // through to reason=provenance-rejected — an absence-like conclusion — instead of the
+  // inconclusive reason=throttle framing #208 gate r2 P1 installed for exactly this case.
+  const orgTitle215 = 'pro-gate review: PR #215 gate r1 P1 [pro-gate]';
+  const homeOrgSelf215 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedOrganizer(MARKER, orgTitle215)(homeOrgSelf215); // no memo url -> no recovery path at all
+  seedBlacklistedCharged215(homeOrgSelf215, blSelfUrl);
+  const cdpOrgSelf215 = await mockCdp('__NO_TABS__', [{ id: 'bl215', url: blSelfUrl }], {
+    tabText: () => selfMarkedPage215,
+    throttleModal: () => modalText215,
+  });
+  const rOrgSelf215 = await runSalvageInHome(homeOrgSelf215, ['--organize', MARKER, '5'], cdpOrgSelf215.port);
+  cdpOrgSelf215.stop();
+  check("#215 gate r1 P1 organizer: a blacklisted tab carrying THIS run's own marker under an already-charged modal reports reason=throttle, not an absence-like provenance rejection",
+    /reason=throttle/.test(rOrgSelf215.stdout), `stdout=${rOrgSelf215.stdout} stderr=${rOrgSelf215.stderr?.slice(-400)}`);
+  check('#215 gate r1 P1 organizer: the already-charged sighting neither writes nor rewrites the cooldown',
+    rOrgSelf215.cooldown === null, `cooldown=${rOrgSelf215.cooldown}`);
+  fs.rmSync(homeOrgSelf215, { recursive: true, force: true });
+
+  const homeOrgForeign215 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedOrganizer(MARKER, orgTitle215)(homeOrgForeign215);
+  seedBlacklistedCharged215(homeOrgForeign215, blForeignUrl);
+  const cdpOrgForeign215 = await mockCdp('__NO_TABS__', [{ id: 'bl215f', url: blForeignUrl }], {
+    tabText: () => foreignMarkedPage215,
+    throttleModal: () => modalText215,
+  });
+  const rOrgForeign215 = await runSalvageInHome(homeOrgForeign215, ['--organize', MARKER, '5'], cdpOrgForeign215.port);
+  cdpOrgForeign215.stop();
+  check("#215 gate r1 P1 organizer planted negative: a blacklisted tab carrying ANOTHER run's marker is still foreign evidence, so the organizer does not report reason=throttle",
+    !/reason=throttle/.test(rOrgForeign215.stdout), `stdout=${rOrgForeign215.stdout} stderr=${rOrgForeign215.stderr?.slice(-400)}`);
+  check('#215 gate r1 P1 organizer planted negative: the already-charged foreign sighting does not write the cooldown',
+    rOrgForeign215.cooldown === null, `cooldown=${rOrgForeign215.cooldown}`);
+  fs.rmSync(homeOrgForeign215, { recursive: true, force: true });
+}
+
+{ // #215 gate r6 P2 (bin/cdp-salvage.mjs pruneThrottleSeen, choice `bounded-dedupe`): the seen
+  // record's TTL is the SUPPRESSION HORIZON and has to apply to a fingerprint the current scan is
+  // observing exactly as it does to one nobody is observing. Pre-fix the prune skipped every
+  // protectedKeys entry BEFORE the TTL check, so a record the scan protects could never expire:
+  // a stale tab nobody closes re-protected its own record on every invocation and was suppressed
+  // forever rather than for THROTTLE_SEEN_TTL, and an orphan record left by a killed writer could
+  // do the same. The reviewer named two outcomes — `bounded-dedupe` (expire on the horizon even
+  // when observed; an unchanged stale tab re-arms at most once per horizon) and leaving the
+  // suppression unbounded — and bounded-dedupe is what is implemented here.
+  // (a) and (b) are the regression. (c) and (d) are controls that the other two rules did NOT
+  // move: capacity protection is still scan-scoped (#208 gate r3 P2), and an aged record this
+  // scan never observes still expires. Both controls hold pre-fix, and so does (b) — a pre-fix
+  // (a) charges nothing, so (b)'s "no second cooldown" is vacuously true there. (a) is the only
+  // one of the four that separates the two worlds, by construction.
+  const modalTextR6 = "You're making requests too quickly. [#215 gate r6 bounded-dedupe fixture]";
+  const pageTextR6 = `ChatGPT\nAccount limits\n${modalTextR6}\nPlease try again shortly.\n`;
+  const primaryUrlR6 = 'https://chatgpt.com/c/mock-conversation';   // the mock's own primary tab
+  const EIGHT_DAYS_MS_R6 = 8 * 24 * 60 * 60 * 1000;   // past the 7-day THROTTLE_SEEN_TTL default
+  const ageRecordR6 = (p, ms) => { const t = new Date(Date.now() - ms); fs.utimesSync(p, t, t); };
+  // Tolerant of a MISSING cooldown: the pre-fix (a) writes none, and a throwing statSync here
+  // would abort the whole test file instead of failing one check.
+  const cooldownMtimeR6 = (p) => { try { return fs.statSync(p).mtimeMs; } catch { return null; } };
+  const ageCooldownR6 = (p) => { try { const t = new Date(Date.now() - 3_600_000); fs.utimesSync(p, t, t); } catch {} };
+  const recordMtimeR6 = (p) => { try { return fs.statSync(p).mtimeMs; } catch { return null; } };
+  const seenDirListR6 = (home) => (fs.existsSync(throttleSeenDir(home)) ? fs.readdirSync(throttleSeenDir(home)).length : null);
+
+  // (a) an unowned stale modal whose record is EIGHT days old: the horizon has passed, so this
+  // unchanged tab re-arms — exit 5, a cooldown, and a freshly recreated record.
+  const homeR6 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedThrottleSeen(homeR6, primaryUrlR6, modalTextR6);
+  const recordPathR6 = throttleSeenRecordPath(homeR6, primaryUrlR6, modalTextR6);
+  ageRecordR6(recordPathR6, EIGHT_DAYS_MS_R6);
+  const recordMtimeBeforeR6a = recordMtimeR6(recordPathR6);
+  const cdpR6a = await mockCdp(pageTextR6, [], { throttleModal: modalTextR6 });
+  const r6a = await runSalvageInHome(homeR6, [MARKER, '3'], cdpR6a.port);
+  cdpR6a.stop();
+  const recordMtimeAfterR6a = recordMtimeR6(recordPathR6);
+  check('#215 gate r6 bounded-dedupe (a) an unowned stale modal whose seen record is eight days old takes the throttle exit again (5)',
+    r6a.status === 5, `status=${r6a.status} stderr=${r6a.stderr?.slice(-400)}`);
+  check('#215 gate r6 bounded-dedupe (a) the re-armed sighting writes a cooldown',
+    /^\d{4}-\d{2}-\d{2}T/.test(r6a.cooldown ?? ''), `cooldown=${r6a.cooldown}`);
+  check('#215 gate r6 bounded-dedupe (a) the expired record is recreated fresh, restarting the horizon',
+    recordMtimeAfterR6a !== null && recordMtimeAfterR6a > recordMtimeBeforeR6a + 60_000,
+    `before=${recordMtimeBeforeR6a} after=${recordMtimeAfterR6a} records=${seenDirListR6(homeR6)}`);
+
+  // (b) the very next scan, record now fresh: suppressed again, so the re-arm costs exactly one
+  // cooldown per horizon and not one per scan. Cooldown mtime is aged first so any rewrite shows.
+  const cooldownPathR6 = path.join(homeR6, 'throttle.cooldown');
+  ageCooldownR6(cooldownPathR6);
+  const cooldownBeforeR6b = cooldownMtimeR6(cooldownPathR6);
+  const cdpR6b = await mockCdp(pageTextR6, [], { throttleModal: modalTextR6 });
+  const r6b = await runSalvageInHome(homeR6, [MARKER, '3'], cdpR6b.port);
+  cdpR6b.stop();
+  const cooldownAfterR6b = cooldownMtimeR6(cooldownPathR6);
+  check('#215 gate r6 bounded-dedupe (b) the scan right after the re-arm does not take the throttle exit',
+    r6b.status !== 5, `status=${r6b.status} stderr=${r6b.stderr?.slice(-300)}`);
+  check('#215 gate r6 bounded-dedupe (b) the scan right after the re-arm writes no second cooldown',
+    cooldownAfterR6b === cooldownBeforeR6b, `before=${cooldownBeforeR6b} after=${cooldownAfterR6b}`);
+  check('#215 gate r6 bounded-dedupe (b) the suppressed repeat still names the sighting as already charged',
+    /already charged/.test(r6b.stderr || ''), `stderr=${r6b.stderr?.slice(-300)}`);
+  fs.rmSync(homeR6, { recursive: true, force: true });
+
+  // (c) control (#208 gate r3 P2 must survive): a FRESH observed record is still exempt from the
+  // CAPACITY trim. It is seeded with the oldest mtime on disk — the exact record the trim picks
+  // first — and the directory is pushed over an overridden cap of one. It must survive untouched
+  // and charge nothing, while the unprotected fillers are cut to the cap (proof the trim ran).
+  const homeCapR6 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedThrottleSeen(homeCapR6, primaryUrlR6, modalTextR6);
+  const capRecordPathR6 = throttleSeenRecordPath(homeCapR6, primaryUrlR6, modalTextR6);
+  ageRecordR6(capRecordPathR6, 600_000);   // 10 minutes: well inside the TTL, oldest on disk
+  const capMtimeBeforeR6 = recordMtimeR6(capRecordPathR6);
+  const capFillerUrlR6 = (i) => `https://chatgpt.com/c/mock-r6-cap-filler-${i}`;
+  const capFillerTextR6 = (i) => `unrelated filler text ${i}`;
+  for (let i = 0; i < 2; i += 1) seedThrottleSeen(homeCapR6, capFillerUrlR6(i), capFillerTextR6(i));
+  const cdpR6c = await mockCdp(pageTextR6, [], { throttleModal: modalTextR6 });
+  const r6c = await runSalvageInHome(homeCapR6, [MARKER, '3'], cdpR6c.port, { PRO_GATE_THROTTLE_SEEN_MAX: '1' });
+  cdpR6c.stop();
+  const capMtimeAfterR6 = recordMtimeR6(capRecordPathR6);
+  const capFillerSurvivorsR6 = [0, 1].filter((i) => throttleSeenHas(homeCapR6, capFillerUrlR6(i), capFillerTextR6(i))).length;
+  check('#215 gate r6 bounded-dedupe (c) control: an unexpired observed fingerprint survives a capacity trim at PRO_GATE_THROTTLE_SEEN_MAX=1, mtime untouched',
+    capMtimeAfterR6 !== null && capMtimeAfterR6 === capMtimeBeforeR6,
+    `before=${capMtimeBeforeR6} after=${capMtimeAfterR6} records=${seenDirListR6(homeCapR6)}`);
+  check('#215 gate r6 bounded-dedupe (c) control: the capacity trim really ran — the unprotected fillers are cut to the cap',
+    capFillerSurvivorsR6 === 1, `survivors=${capFillerSurvivorsR6} records=${seenDirListR6(homeCapR6)}`);
+  check('#215 gate r6 bounded-dedupe (c) control: the protected fingerprint charges no new cooldown',
+    r6c.cooldown === null && r6c.status !== 5, `status=${r6c.status} cooldown=${r6c.cooldown}`);
+  fs.rmSync(homeCapR6, { recursive: true, force: true });
+
+  // (d) control (pre-existing behaviour): an aged record this scan does NOT observe is expired by
+  // the same prune, fired here by an unrelated, genuinely new throttle sighting.
+  const homeUnobsR6 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const unobservedUrlR6 = 'https://chatgpt.com/c/mock-r6-unobserved';
+  const unobservedTextR6 = 'an old sighting from a tab that is no longer open';
+  seedThrottleSeen(homeUnobsR6, unobservedUrlR6, unobservedTextR6);
+  ageRecordR6(throttleSeenRecordPath(homeUnobsR6, unobservedUrlR6, unobservedTextR6), EIGHT_DAYS_MS_R6);
+  const cdpR6d = await mockCdp(pageTextR6, [], { throttleModal: modalTextR6 });
+  const r6d = await runSalvageInHome(homeUnobsR6, [MARKER, '3'], cdpR6d.port);
+  cdpR6d.stop();
+  check('#215 gate r6 bounded-dedupe (d) control: a record aged past the TTL that this scan never observes is still expired',
+    !throttleSeenHas(homeUnobsR6, unobservedUrlR6, unobservedTextR6), `records=${seenDirListR6(homeUnobsR6)}`);
+  check('#215 gate r6 bounded-dedupe (d) control: the unrelated trigger sighting is charged and recorded',
+    r6d.status === 5 && throttleSeenHas(homeUnobsR6, primaryUrlR6, modalTextR6),
+    `status=${r6d.status} cooldown=${r6d.cooldown} records=${seenDirListR6(homeUnobsR6)}`);
+  fs.rmSync(homeUnobsR6, { recursive: true, force: true });
+}
+
+{ // #215 gate r7 P2 (bin/cdp-salvage.mjs pruneThrottleSeen / removeThrottleSeenGeneration):
+  // expiration and the capacity trim must delete ONLY the record generation they actually
+  // stat'd. Pre-fix both deleted BY NAME: scan A could stat an expired record, scan B could
+  // expire that same record, create its replacement with the 'wx' arbiter and publish the
+  // cooldown that replacement gates — and A's unlink then destroyed B's fresh, committed
+  // fingerprint. Pruning a fingerprint outside its own observed batch, A never recreates it, so
+  // the next unchanged sighting charges a SECOND cooldown inside the same horizon.
+  //
+  // (h*) drive the production functions directly. The interleaving window lives INSIDE
+  // pruneThrottleSeen — between its stat and its delete — and no mock CDP fixture can reach it.
+  // bin/cdp-salvage.mjs is a CLI script with no exports, so the functions are sliced out of the
+  // file BY NAME and evaluated verbatim in a vm context whose fs, path and THROTTLE_SEEN_*
+  // constants this test controls; the interleaving is injected through that fs, at the exact
+  // moment the pruner stats the record it is about to condemn. Nothing here is reimplemented: a
+  // slice that no longer exists surfaces as a null function and a failing check, never as a
+  // quietly different pruner.
+  // (c*) then cover the same sidecar end-to-end through real salvage children.
+  const salvageLinesR7 = fs.readFileSync(SALVAGE, 'utf8').split('\n');
+  const sliceTopLevelR7 = (name) => {
+    const start = salvageLinesR7.findIndex((line) => (
+      line.startsWith(`function ${name}(`) || line.startsWith(`const ${name} = `)
+    ));
+    if (start < 0) return null;
+    // A single-line const, or a function whose whole body is on its declaration line, IS the
+    // slice; anything else runs to the first column-zero '}', which closes a top-level function.
+    if (salvageLinesR7[start].startsWith('const ') || salvageLinesR7[start].trimEnd().endsWith('}')) {
+      return salvageLinesR7[start];
+    }
+    const end = salvageLinesR7.findIndex((line, i) => i > start && line === '}');
+    return end < 0 ? null : salvageLinesR7.slice(start, end + 1).join('\n');
+  };
+  // #215 gate r10 P2: withThrottleSeenLock is now an flock(2) advisory lock (see the r10 block
+  // below), so its slice references the free variable `spawnSync` — the vm context must inject
+  // it here too, or every h*/c* test below throws an uncaught ReferenceError the instant it
+  // touches a locked path, not a clean check FAIL.
+  const PRUNER_PARTS_R7 = ['THROTTLE_SEEN_EXPIRE_MARK', 'throttleSeenIsTemp', 'throttleSeenIsLockFile',
+    'THROTTLE_SEEN_LOCK_SLOTS', 'throttleSeenLockSlot',
+    'THROTTLE_SEEN_LOCK_WAIT_MS', 'THROTTLE_SEEN_LOCK_WAIT_SECS', 'withThrottleSeenLock',
+    'removeThrottleSeenGeneration', 'pruneThrottleSeen'];
+  // #215 gate r10 P2: the red-before-green pairing tree runs this SAME test file against the
+  // pre-r10 (mkdir-lock) production source, whose withThrottleSeenLock/pruneThrottleSeen bodies
+  // still call these OLD helpers by name. Slicing is by-name and by-body-text, not by behavior —
+  // a parts list naming only the CURRENT (flock) helpers leaves those old identifiers unresolved
+  // free variables the instant old code runs, crashing the whole process with a ReferenceError
+  // instead of failing the one check that touched it. These names exist ONLY in the pre-r10
+  // source (slice-null and filtered out of the join when absent, i.e. against current source),
+  // so they are kept in a separate list rather than folded into PRUNER_PARTS_R7 above.
+  const PRUNER_COMPAT_PARTS_R7 = ['throttleSeenIsLock', 'THROTTLE_SEEN_LOCK_STALE_MS',
+    'throttleSeenLockOwnerPath', 'throttleSeenLockOwnerAlive'];
+  const buildPrunerR7 = (dir, { ttlMs = 7 * 24 * 60 * 60 * 1000, max = 512, fsImpl = fs } = {}) => {
+    const source = [...PRUNER_PARTS_R7, ...PRUNER_COMPAT_PARTS_R7]
+      .map(sliceTopLevelR7).filter((part) => part !== null).join('\n');
+    const expose = '({ prune: typeof pruneThrottleSeen === "function" ? pruneThrottleSeen : null,'
+      + ' removeGeneration: typeof removeThrottleSeenGeneration === "function" ? removeThrottleSeenGeneration : null })';
+    return runInNewContext(`${source}\n${expose}`, {
+      fs: fsImpl, path, process, spawnSync,
+      THROTTLE_SEEN_DIR: dir, THROTTLE_SEEN_TTL_MS: ttlMs, THROTTLE_SEEN_MAX: max,
+    });
+  };
+  const EIGHT_DAYS_R7 = 8 * 24 * 60 * 60 * 1000;   // past the 7-day THROTTLE_SEEN_TTL default
+  const seenDirR7 = () => fs.mkdtempSync(path.join(os.tmpdir(), 'pg-r7-seen-'));
+  // Record basenames are sha256 hex in production (throttleSeenKey); these are shaped the same so
+  // the temp-vs-record predicate is exercised against realistic names.
+  const keyR7 = (label) => createHash('sha256').update(`#215 gate r7 ${label}`).digest('hex');
+  const seedRecordR7 = (dir, name, ageMs = 0) => {
+    const p = path.join(dir, name);
+    fs.writeFileSync(p, '', { flag: 'wx' });
+    if (ageMs > 0) { const t = new Date(Date.now() - ageMs); fs.utimesSync(p, t, t); }
+    return p;
+  };
+  const ageRecordR7 = (p, ms) => { const t = new Date(Date.now() - ms); fs.utimesSync(p, t, t); };
+  const inoR7 = (p) => { try { return fs.statSync(p).ino; } catch { return null; } };
+  const mtimeR7 = (p) => { try { return fs.statSync(p).mtimeMs; } catch { return null; } };
+  const listR7 = (dir) => { try { return fs.readdirSync(dir); } catch { return []; } };
+  const tempsR7 = (dir) => listR7(dir).filter((n) => n.includes('.expire.'));
+  // The interleaving itself: the instant the pruner stats the record it is about to condemn,
+  // another scan expires that generation and commits its REPLACEMENT through the same 'wx'
+  // arbiter production uses. One shot — the finding describes a single interleaving, and a
+  // repeating one would say nothing more. The replacement's mtime is `now` while every condemned
+  // record below is seeded minutes or days old, so the two generations can never read as equal.
+  const replaceOnStatR7 = (target, out) => {
+    let fired = false;
+    const proxy = Object.create(fs);
+    proxy.statSync = (p, ...rest) => {
+      const stat = fs.statSync(p, ...rest);
+      if (!fired && p === target) {
+        fired = true;
+        try { fs.unlinkSync(target); } catch {}
+        fs.writeFileSync(target, '', { flag: 'wx' });
+        out.ino = fs.statSync(target).ino;
+      }
+      return stat;
+    };
+    return proxy;
+  };
+
+  // (h1) EXPIRATION path, the finding's exact sequence. Pre-fix the pruner unlinked by name and
+  // destroyed the replacement it never looked at.
+  const dirH1 = seenDirR7();
+  const pathH1 = seedRecordR7(dirH1, keyR7('h1 expired'), EIGHT_DAYS_R7);
+  const replacedH1 = { ino: null };
+  buildPrunerR7(dirH1, { fsImpl: replaceOnStatR7(pathH1, replacedH1) }).prune?.(new Set());
+  check("#215 gate r7 P2 (h1) expiration: a replacement committed between the pruner's stat and its delete survives, and it is the REPLACEMENT that survives",
+    replacedH1.ino !== null && inoR7(pathH1) === replacedH1.ino,
+    `replacementIno=${replacedH1.ino} onDiskIno=${inoR7(pathH1)} dir=${JSON.stringify(listR7(dirH1))}`);
+  check('#215 gate r7 P2 (h1) expiration: declining to delete leaves no orphan temp behind',
+    tempsR7(dirH1).length === 0, `dir=${JSON.stringify(listR7(dirH1))}`);
+  fs.rmSync(dirH1, { recursive: true, force: true });
+
+  // (h2) CAPACITY path: the same protection, on the other eviction. The trim's oldest-first
+  // candidate is replaced during the stat pass, after its mtime was read and before it is cut.
+  const dirH2 = seenDirR7();
+  const pathOldH2 = seedRecordR7(dirH2, keyR7('h2 oldest'), 600_000);
+  const nameMidH2 = keyR7('h2 mid');
+  const nameNewH2 = keyR7('h2 newest');
+  seedRecordR7(dirH2, nameMidH2, 300_000);
+  seedRecordR7(dirH2, nameNewH2, 60_000);
+  const replacedH2 = { ino: null };
+  buildPrunerR7(dirH2, { max: 2, fsImpl: replaceOnStatR7(pathOldH2, replacedH2) }).prune?.(new Set());
+  check("#215 gate r7 P2 (h2) capacity: a replacement committed between the trim's stat and its delete survives the trim",
+    replacedH2.ino !== null && inoR7(pathOldH2) === replacedH2.ino,
+    `replacementIno=${replacedH2.ino} onDiskIno=${inoR7(pathOldH2)} dir=${JSON.stringify(listR7(dirH2))}`);
+  check('#215 gate r7 P2 (h2) capacity: the records the trim did not condemn are untouched, and no orphan temp is left',
+    fs.existsSync(path.join(dirH2, nameMidH2)) && fs.existsSync(path.join(dirH2, nameNewH2)) && tempsR7(dirH2).length === 0,
+    `dir=${JSON.stringify(listR7(dirH2))}`);
+  fs.rmSync(dirH2, { recursive: true, force: true });
+
+  // (h3) control: with nothing interleaving, the checked generation IS still deleted — the fix
+  // must not buy safety by declining to expire anything.
+  const dirH3 = seenDirR7();
+  const nameExpiredH3 = keyR7('h3 expired');
+  const nameLiveH3 = keyR7('h3 live');
+  seedRecordR7(dirH3, nameExpiredH3, EIGHT_DAYS_R7);
+  seedRecordR7(dirH3, nameLiveH3, 60_000);
+  buildPrunerR7(dirH3).prune?.(new Set());
+  check('#215 gate r7 P2 (h3) control: an expired record whose generation did not change is still deleted, the unexpired one survives, and no temp is left',
+    !fs.existsSync(path.join(dirH3, nameExpiredH3)) && fs.existsSync(path.join(dirH3, nameLiveH3)) && tempsR7(dirH3).length === 0,
+    `dir=${JSON.stringify(listR7(dirH3))}`);
+  fs.rmSync(dirH3, { recursive: true, force: true });
+
+  // (h4) control: the capacity trim still evicts oldest-first when nothing interleaves.
+  const dirH4 = seenDirR7();
+  const nameOldH4 = keyR7('h4 oldest');
+  const nameMidH4 = keyR7('h4 mid');
+  const nameNewH4 = keyR7('h4 newest');
+  seedRecordR7(dirH4, nameOldH4, 600_000);
+  seedRecordR7(dirH4, nameMidH4, 300_000);
+  seedRecordR7(dirH4, nameNewH4, 60_000);
+  buildPrunerR7(dirH4, { max: 2 }).prune?.(new Set());
+  check('#215 gate r7 P2 (h4) control: with no interleaving the capacity trim still cuts the oldest unprotected record down to the cap, leaving no temp',
+    !fs.existsSync(path.join(dirH4, nameOldH4)) && fs.existsSync(path.join(dirH4, nameMidH4))
+      && fs.existsSync(path.join(dirH4, nameNewH4)) && tempsR7(dirH4).length === 0,
+    `dir=${JSON.stringify(listR7(dirH4))}`);
+  fs.rmSync(dirH4, { recursive: true, force: true });
+
+  // (h5) the residual's cleanup: a temp left behind by a writer that died mid-swap ages out on
+  // the same horizon, so an orphan can never accumulate.
+  const dirH5 = seenDirR7();
+  const nameLiveH5 = keyR7('h5 live');
+  const nameTempH5 = `${keyR7('h5 orphan')}.expire.424242`;
+  seedRecordR7(dirH5, nameTempH5, EIGHT_DAYS_R7);
+  seedRecordR7(dirH5, nameLiveH5, 60_000);
+  buildPrunerR7(dirH5).prune?.(new Set());
+  check('#215 gate r7 P2 (h5) an orphan .expire. temp older than the TTL is deleted, and a live record beside it is untouched',
+    !fs.existsSync(path.join(dirH5, nameTempH5)) && fs.existsSync(path.join(dirH5, nameLiveH5)),
+    `dir=${JSON.stringify(listR7(dirH5))}`);
+  fs.rmSync(dirH5, { recursive: true, force: true });
+
+  // (h6) a temp is NOT a record: it suppresses nothing, so it must never occupy a capacity slot
+  // (which would evict a real fingerprint in its place) and the trim must never pick it.
+  const dirH6 = seenDirR7();
+  const nameTempH6 = `${keyR7('h6 orphan')}.expire.424243`;
+  const nameMidH6 = keyR7('h6 mid');
+  const nameNewH6 = keyR7('h6 newest');
+  seedRecordR7(dirH6, nameTempH6, 600_000);   // oldest on disk: the trim's first pick if counted
+  seedRecordR7(dirH6, nameMidH6, 300_000);
+  seedRecordR7(dirH6, nameNewH6, 60_000);
+  buildPrunerR7(dirH6, { max: 2 }).prune?.(new Set());
+  check('#215 gate r7 P2 (h6) an unexpired .expire. temp is never counted toward capacity, so the trim does not fire and does not pick it',
+    fs.existsSync(path.join(dirH6, nameTempH6)),
+    `dir=${JSON.stringify(listR7(dirH6))}`);
+  check('#215 gate r7 P2 (h6) both real records survive a cap of two',
+    fs.existsSync(path.join(dirH6, nameMidH6)) && fs.existsSync(path.join(dirH6, nameNewH6)),
+    `dir=${JSON.stringify(listR7(dirH6))}`);
+  fs.rmSync(dirH6, { recursive: true, force: true });
+
+  // --- end-to-end through real salvage children -------------------------------------------
+  const modalTriggerR7 = "You're making requests too quickly. [#215 gate r7 trigger]";
+  const modalConcurrentR7 = "You're making requests too quickly. [#215 gate r7 concurrent writer]";
+  const pageR7 = (modal) => `ChatGPT\nAccount limits\n${modal}\nPlease try again shortly.\n`;
+  const primaryUrlR7 = 'https://chatgpt.com/c/mock-conversation';   // the mock's own primary tab
+
+  // (c1) control, the e1a2195 behaviour: an expired record the scan IS observing still expires
+  // and re-charges exactly once, and the swap leaves no temp behind.
+  const homeC1 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedThrottleSeen(homeC1, primaryUrlR7, modalTriggerR7);
+  const recordC1 = throttleSeenRecordPath(homeC1, primaryUrlR7, modalTriggerR7);
+  ageRecordR7(recordC1, EIGHT_DAYS_R7);
+  const mtimeBeforeC1 = mtimeR7(recordC1);
+  const cdpC1 = await mockCdp(pageR7(modalTriggerR7), [], { throttleModal: modalTriggerR7 });
+  const rC1 = await runSalvageInHome(homeC1, [MARKER, '3'], cdpC1.port);
+  cdpC1.stop();
+  const mtimeAfterC1 = mtimeR7(recordC1);
+  check('#215 gate r7 P2 (c1) control: an expired record this scan observes still expires and re-charges once (exit 5 + cooldown)',
+    rC1.status === 5 && /^\d{4}-\d{2}-\d{2}T/.test(rC1.cooldown ?? ''),
+    `status=${rC1.status} cooldown=${rC1.cooldown} stderr=${rC1.stderr?.slice(-300)}`);
+  check('#215 gate r7 P2 (c1) control: the expired record is replaced by a fresh one, restarting the horizon',
+    mtimeAfterC1 !== null && mtimeBeforeC1 !== null && mtimeAfterC1 > mtimeBeforeC1 + 60_000,
+    `before=${mtimeBeforeC1} after=${mtimeAfterC1} dir=${JSON.stringify(listR7(throttleSeenDir(homeC1)))}`);
+  check('#215 gate r7 P2 (c1) control: a completed expiration leaves no temp in the sidecar directory',
+    tempsR7(throttleSeenDir(homeC1)).length === 0, `dir=${JSON.stringify(listR7(throttleSeenDir(homeC1)))}`);
+  fs.rmSync(homeC1, { recursive: true, force: true });
+
+  // (c2) the same shape as (h1) but across real processes: another writer replaces an expired
+  // record DURING the child's scan, for a fingerprint that child never observes. The replacement
+  // must survive the scan's prune and must suppress the next sighting of it.
+  const homeC2 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedThrottleSeen(homeC2, primaryUrlR7, modalConcurrentR7);
+  const recordC2 = throttleSeenRecordPath(homeC2, primaryUrlR7, modalConcurrentR7);
+  ageRecordR7(recordC2, EIGHT_DAYS_R7);
+  // An aged record nobody replaces: its deletion is this test's proof that the child's prune ran
+  // at all, and `existedAtReplace` below proves it ran AFTER the replacement landed. Without both
+  // the survival check could pass vacuously on a prune that never looked.
+  const unobservedUrlC2 = 'https://chatgpt.com/c/mock-r7-unobserved';
+  const unobservedTextC2 = 'an old sighting from a tab nobody replaced';
+  seedThrottleSeen(homeC2, unobservedUrlC2, unobservedTextC2);
+  ageRecordR7(throttleSeenRecordPath(homeC2, unobservedUrlC2, unobservedTextC2), EIGHT_DAYS_R7);
+  const concurrentC2 = { existedAtReplace: null, ino: null };
+  const cdpC2 = await mockCdp(pageR7(modalTriggerR7), [], {
+    throttleModal: modalTriggerR7,
+    onEvaluate: (id, expression) => {
+      if (concurrentC2.ino !== null || !expression.includes('pro-gate:review-text')) return;
+      concurrentC2.existedAtReplace = fs.existsSync(recordC2);
+      try { fs.unlinkSync(recordC2); } catch {}
+      fs.writeFileSync(recordC2, '', { flag: 'wx' });
+      concurrentC2.ino = fs.statSync(recordC2).ino;
+    },
+  });
+  const rC2 = await runSalvageInHome(homeC2, [MARKER, '3'], cdpC2.port);
+  cdpC2.stop();
+  check("#215 gate r7 P2 (c2) ordering proof: the replacement landed while the record was still the expired one, and this scan's prune demonstrably ran",
+    concurrentC2.existedAtReplace === true && !throttleSeenHas(homeC2, unobservedUrlC2, unobservedTextC2),
+    `existedAtReplace=${concurrentC2.existedAtReplace} dir=${JSON.stringify(listR7(throttleSeenDir(homeC2)))}`);
+  check("#215 gate r7 P2 (c2) a concurrent writer's replacement for a fingerprint this scan never observes survives the scan's prune",
+    concurrentC2.ino !== null && inoR7(recordC2) === concurrentC2.ino,
+    `replacementIno=${concurrentC2.ino} onDiskIno=${inoR7(recordC2)} dir=${JSON.stringify(listR7(throttleSeenDir(homeC2)))}`);
+  check('#215 gate r7 P2 (c2) the scan still charges its own genuinely new sighting (exit 5 + cooldown)',
+    rC2.status === 5 && /^\d{4}-\d{2}-\d{2}T/.test(rC2.cooldown ?? ''),
+    `status=${rC2.status} cooldown=${rC2.cooldown} stderr=${rC2.stderr?.slice(-300)}`);
+  const cooldownPathC2 = path.join(homeC2, 'throttle.cooldown');
+  ageRecordR7(cooldownPathC2, 3_600_000);
+  const cooldownBeforeC2 = mtimeR7(cooldownPathC2);
+  const cdpC2b = await mockCdp(pageR7(modalConcurrentR7), [], { throttleModal: modalConcurrentR7 });
+  const rC2b = await runSalvageInHome(homeC2, [MARKER, '3'], cdpC2b.port);
+  cdpC2b.stop();
+  check('#215 gate r7 P2 (c2) the next sighting of the replaced fingerprint is suppressed, not re-charged',
+    rC2b.status !== 5 && mtimeR7(cooldownPathC2) === cooldownBeforeC2 && /already charged/.test(rC2b.stderr || ''),
+    `status=${rC2b.status} before=${cooldownBeforeC2} after=${mtimeR7(cooldownPathC2)} stderr=${rC2b.stderr?.slice(-300)}`);
+  fs.rmSync(homeC2, { recursive: true, force: true });
+}
+
 // v0.42 (#109): a synthetic placeholder such as https://chatgpt.com/c/WEB:<uuid> once passed the
 // prefix-only memo check, was remembered as authoritative, and parked its run forever: the page
 // behind it carries no marker, so every later pass was inconclusive and never counted a miss.
@@ -3720,6 +5251,821 @@ for (const placeholder of PLACEHOLDER_URLS) {
       && r.memos.length === 201,
     `memos.length=${r.memos.length} evicted0=${memoSet.has(unprotected[0])} kept1=${memoSet.has(unprotected[1])}`);
   cdp.stop();
+}
+
+{ // #215 gate r8 P2 (bin/cdp-salvage.mjs claimThrottleSeen): admission is a plain existence
+  // check on the record path — #215 gate r9 P2 replaced the round-8 fresh-temp heuristic
+  // (throttleSeenFreshTemp) with claimThrottleSeen taking removeThrottleSeenGeneration's own
+  // per-fingerprint lock across the existence-check-then-create, closing the round-8 window
+  // directly instead of papering over it with a second, fuzzy on-disk signal. What remains
+  // worth checking here: a rename-aside temp left over from an interrupted prune (crash,
+  // ENOSPC, ...) is orphaned residue, not a record — admission must never treat it as a charge,
+  // and it must age out through the ordinary TTL prune like any other temp, whether it is fresh
+  // or old.
+  const modalTextA1 = "You're making requests too quickly. [#215 gate r8 P2 fixture]";
+  const pageTextA1 = `ChatGPT\nAccount limits\n${modalTextA1}\nPlease try again shortly.\n`;
+  const primaryUrlA1 = 'https://chatgpt.com/c/mock-conversation';   // the mock's own primary tab
+  // 90s: short enough for a 2-minute-old temp to be reaped by this scan's own one-shot prune
+  // (production's default THROTTLE_SEEN_TTL is 7 days).
+  const SHORT_TTL_R8 = { PRO_GATE_THROTTLE_SEEN_TTL: '90000' };
+
+  // (A2) control: an orphan .expire. temp for this fingerprint, 2 minutes old — past this scan's
+  // shortened 90s TTL. Admission never looks at temps at all (existence check only), so the
+  // sighting charges normally, and that scan's own one-shot prune reaps the stale temp as an
+  // ordinary TTL-expired orphan (#215 gate r7 P2 (h5) behaviour).
+  const homeA2 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedThrottleSeen(homeA2, primaryUrlA1, modalTextA1);
+  const recordPathA2 = throttleSeenRecordPath(homeA2, primaryUrlA1, modalTextA1);
+  const tempPathA2 = `${recordPathA2}.expire.99999`;
+  fs.renameSync(recordPathA2, tempPathA2);
+  const agedAtA2 = new Date(Date.now() - 120_000);
+  fs.utimesSync(tempPathA2, agedAtA2, agedAtA2);
+  const cdpA2 = await mockCdp(pageTextA1, [], { throttleModal: modalTextA1 });
+  const rA2 = await runSalvageInHome(homeA2, [MARKER, '3'], cdpA2.port, SHORT_TTL_R8);
+  cdpA2.stop();
+  check('#215 gate r8 P2 (A2) control: a temp aged past the grace and TTL charges the sighting normally (exit 5 + cooldown)',
+    rA2.status === 5 && /^\d{4}-\d{2}-\d{2}T/.test(rA2.cooldown ?? ''),
+    `status=${rA2.status} cooldown=${rA2.cooldown} stderr=${rA2.stderr?.slice(-400)}`);
+  check("#215 gate r8 P2 (A2) control: the aged temp is reaped by that scan's own prune",
+    !fs.existsSync(tempPathA2), `exists=${fs.existsSync(tempPathA2)}`);
+  fs.rmSync(homeA2, { recursive: true, force: true });
+}
+
+{ // #215 gate r9 P1 (bin/cdp-salvage.mjs main scan loop, owned-incomplete canonical revalidation):
+  // tripThrottleEvidence only RETURNS past a throttle sighting by falling through — never by
+  // exiting the process — when that sighting was UNOWNED and ALREADY CHARGED (a repeat of a
+  // fingerprint this or an earlier invocation already recorded). Before this fix, execution
+  // reaching that point never remembered the canonical URL it had just proven readable: the very
+  // next scan (this run's own retry, or the engine's next --harvest poll) had no tab AND no memo,
+  // so recovery had to rely on the tab still being open rather than the URL this scan had just
+  // demonstrated was readable. The fix routes that case through the same
+  // rememberInconclusiveReadableSource the plain 'inconclusive' branch already uses.
+  const ownedIncompleteTextP1 = `ChatGPT\nrun marker: ${MARKER}\nStill reasoning, no verdict yet...\n`;
+  // Full THROTTLE_RE-matching interstitial (isThrottlePage), reused verbatim from the #208 gate
+  // r1 P1 (classifier/scratch) fixture above: no modal option needed for the positive case, so
+  // hashText === the raw text (classifyEvidence's interstitial branch: `throttleModal ?? text`).
+  const staleThrottleTextP1 = "You're making requests too quickly. Temporarily limited access to your conversations.";
+  const canonicalUrlP1 = 'https://chatgpt.com/c/mock-conversation';   // the mock's own primary tab
+
+  // Run 1: no prior memo. The primary tab is owned-incomplete (our marker, no VERDICT), so the
+  // scan spends its one canonical revalidation on tab.url itself — and this fingerprint is
+  // pre-seeded as already charged, so tripThrottleUnowned ignores it without exiting.
+  const homeP1 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedThrottleSeen(homeP1, canonicalUrlP1, staleThrottleTextP1);
+  const cdpP1a = await mockCdp(ownedIncompleteTextP1, [], { renderText: () => staleThrottleTextP1 });
+  const rP1a = await runSalvageInHome(homeP1, ['--probe', MARKER, '3'], cdpP1a.port, SCRATCH_SAMPLE_TEST_ENV);
+  cdpP1a.stop();
+  check('#215 gate r9 P1 run 1: an already-charged non-foreign canonical throttle does not stop the probe from reporting generating',
+    rP1a.status === 0 && /^probe-state: generating$/m.test(rP1a.stderr ?? ''),
+    `status=${rP1a.status} stderr=${rP1a.stderr?.slice(-400)}`);
+  const memoPathP1 = path.join(homeP1, 'conversation-urls', MARKER);
+  check('#215 gate r9 P1 run 1: the canonical URL is remembered despite the throttle sighting being ignored, not newly charged',
+    fs.existsSync(memoPathP1) && fs.readFileSync(memoPathP1, 'utf8').trim() === canonicalUrlP1,
+    `memo=${fs.existsSync(memoPathP1) ? fs.readFileSync(memoPathP1, 'utf8').trim() : null}`);
+
+  // Run 2: the SAME home, the tab now gone (mock lists no tab at all). Recovery must use the
+  // remembered URL from run 1, not confirmed absence.
+  const terminalReviewP1 = [
+    `run marker: ${MARKER}`,
+    '[P1] src/known.mjs:1 — recovered via the remembered URL',
+    'P2: none',
+    `VERDICT: FIX-FIRST — recovered, not absent. (run marker: ${MARKER})`,
+  ].join('\n');
+  const cdpP1b = await mockCdp('__NO_TABS__', [], { renderText: () => terminalReviewP1 });
+  const rP1b = await runSalvageInHome(homeP1, [MARKER, '3'], cdpP1b.port, SCRATCH_SAMPLE_TEST_ENV);
+  cdpP1b.stop();
+  check('#215 gate r9 P1 run 2: the tab is gone but the remembered URL recovers the finished review',
+    rP1b.status === 0 && /VERDICT: FIX-FIRST — recovered, not absent\./.test(rP1b.stdout),
+    `status=${rP1b.status} stdout=${rP1b.stdout?.slice(0, 300)} stderr=${rP1b.stderr?.slice(-300)}`);
+  fs.rmSync(homeP1, { recursive: true, force: true });
+
+  // Planted negative: the identical scenario, but the canonical scratch throttle is POSITIVELY
+  // foreign (another run's exact marker under the modal). That case keeps today's behaviour — no
+  // memo is ever written from a foreign surface, charged or not.
+  const foreignMarkerP1 = 'pg-run-other-9999999999-9';
+  const foreignPageTextP1 = `ChatGPT\nrun marker: ${foreignMarkerP1}\n${staleThrottleTextP1}\nPlease try again shortly.\n`;
+  const homeP1c = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  seedThrottleSeen(homeP1c, canonicalUrlP1, staleThrottleTextP1);
+  const cdpP1c = await mockCdp(ownedIncompleteTextP1, [], {
+    renderText: () => foreignPageTextP1,
+    throttleModal: (id) => (id.startsWith('scratch') ? staleThrottleTextP1 : null),
+  });
+  const rP1c = await runSalvageInHome(homeP1c, ['--probe', MARKER, '3'], cdpP1c.port, SCRATCH_SAMPLE_TEST_ENV);
+  cdpP1c.stop();
+  check('#215 gate r9 P1 planted negative: a POSITIVELY foreign canonical throttle writes no memo',
+    !fs.existsSync(path.join(homeP1c, 'conversation-urls', MARKER)),
+    `status=${rP1c.status} stderr=${rP1c.stderr?.slice(-400)}`);
+  fs.rmSync(homeP1c, { recursive: true, force: true });
+}
+
+{ // #215 gate r10 P2 (bin/cdp-salvage.mjs withThrottleSeenLock / claimThrottleSeen): paid-review
+  // round 10 found two ways the round-9 fix still broke down.
+  //   [P2] bin/cdp-salvage.mjs:591 — the round-9 mkdirSync lock reclaimed a "stale" pathname by
+  //   stat -> rmdirSync -> mkdirSync with no fencing: two reclaimers could both validate the SAME
+  //   dead lock, and a delayed reclaimer's rename-aside could land on the WINNER's freshly
+  //   re-created LIVE lock instead of failing ENOENT, deleting it and entering the protected
+  //   section concurrently with the winner. pruneThrottleSeen's own lock-reap repeated the same
+  //   check-then-rename race. Fixed by abandoning pathname reclamation entirely: the lock is now
+  //   an OS-managed flock(2) advisory lock on a STABLE, NEVER-UNLINKED '<fingerprint>.lockf' file,
+  //   taken by spawning the util-linux `flock` binary against an INHERITED file descriptor
+  //   (fs.openSync(path, 'a') -> spawnSync('flock', ['-x', '-w', secs, '3'], { stdio: [..., fd] })
+  //   ) — the exclusive lock lives on the open file description this process holds, so it is
+  //   released ONLY by fs.closeSync(fd) in a finally, and a crashed holder's lock is released by
+  //   the KERNEL the instant the process dies. There is no "stale lock" state left to detect, so
+  //   no reclaim, no owner token, no liveness check, and no lock-reap branch in pruneThrottleSeen
+  //   remain — see (c) below for the property this buys that a pathname lock structurally cannot
+  //   provide. This deletes round 9's (iii) stale-lock-reclaim, (iii-b) losing-reclaimer, and (iv)
+  //   lock-reap checks (their mechanism is gone) and the entire separate '#215 gate r9 verify'
+  //   process pair (its whole premise — mtime staleness plus a liveness-checked owner token — no
+  //   longer exists; (c) below supersedes it with the actual property that matters: a SIGKILLed
+  //   holder's lock is released instantly, not after a stale-detection window).
+  //   [P2] bin/cdp-salvage.mjs:768 — admission was a PLAIN EXISTENCE check: pruneThrottleSeen's
+  //   removal of an expired record is best-effort (a readable-but-unwritable seen directory makes
+  //   its rename/unlink fail silently), but existence-only admission still read that untouched
+  //   expired record as "already charged" — an eight-day-old fingerprint could suppress a REAL
+  //   throttle sighting on every invocation forever, without ever publishing the cooldown it was
+  //   supposed to keep re-arming, the opposite of fail-open. Fixed: claimThrottleSeen now stats
+  //   the record's own AGE under the fingerprint's lock; an expired record is unlinked
+  //   (best-effort) and the sighting proceeds to the 'wx' create as though nothing existed. If
+  //   that create still fails (the unlink failed) admission returns 'charged' anyway — a sidecar
+  //   problem must never silence a real throttle, so an unwritable sidecar disables dedupe
+  //   entirely rather than suppress a live sighting with no cooldown behind it. See (a) below.
+  //
+  // baseline/(i)/(ii) are round 9's own checks, kept and re-targeted at the flock mechanism
+  // (baseline and the vm-slice harness are otherwise unchanged; (i)/(ii) still need a real
+  // spawned child and a stderr assertion the single-threaded vm harness cannot make observable).
+  // (a)-(d) are new. Same vm-evaluated-slice technique '#215 gate r7 P2' established: bin/cdp-
+  // salvage.mjs is a CLI script with no exports, so functions are sliced out BY NAME and
+  // evaluated verbatim in a sandboxed context — a missing slice surfaces as a null function and a
+  // failing check, never a quietly different implementation.
+  const salvageLinesR10 = fs.readFileSync(SALVAGE, 'utf8').split('\n');
+  const sliceTopLevelR10 = (name) => {
+    const start = salvageLinesR10.findIndex((line) => (
+      line.startsWith(`function ${name}(`) || line.startsWith(`const ${name} = `)
+    ));
+    if (start < 0) return null;
+    if (salvageLinesR10[start].startsWith('const ') || salvageLinesR10[start].trimEnd().endsWith('}')) {
+      return salvageLinesR10[start];
+    }
+    const end = salvageLinesR10.findIndex((line, i) => i > start && line === '}');
+    return end < 0 ? null : salvageLinesR10.slice(start, end + 1).join('\n');
+  };
+  const CLAIM_PARTS_R10 = ['THROTTLE_SEEN_EXPIRE_MARK', 'throttleSeenIsTemp', 'throttleSeenIsLockFile',
+    'THROTTLE_SEEN_LOCK_SLOTS', 'throttleSeenLockSlot',
+    'THROTTLE_SEEN_LOCK_WAIT_MS', 'THROTTLE_SEEN_LOCK_WAIT_SECS', 'withThrottleSeenLock',
+    'removeThrottleSeenGeneration', 'pruneThrottleSeen', 'throttleSeenKey', 'throttleSeenRecordPath',
+    'recordThrottleSeen', 'claimThrottleSeen'];
+  // #215 gate r10 P2: same cross-version reason as PRUNER_COMPAT_PARTS_R7 above — the pre-r10
+  // production source's withThrottleSeenLock/pruneThrottleSeen bodies call these OLD mkdir-lock
+  // helpers by name, and its claimThrottleSeen body still calls the separate throttleAlreadyCharged
+  // existence check decision 2 folded inline here. Kept out of CLAIM_PARTS_R10 (and its "no silent
+  // no-op" gate below) because they are absent — correctly — from the current source.
+  const CLAIM_COMPAT_PARTS_R10 = ['throttleSeenIsLock', 'THROTTLE_SEEN_LOCK_STALE_MS',
+    'throttleSeenLockOwnerPath', 'throttleSeenLockOwnerAlive', 'throttleAlreadyCharged'];
+  check('#215 gate r10 P2 setup: every named claim/lock part was found in bin/cdp-salvage.mjs (no silent no-op slice)',
+    CLAIM_PARTS_R10.every((name) => sliceTopLevelR10(name) !== null),
+    `missing=${JSON.stringify(CLAIM_PARTS_R10.filter((name) => sliceTopLevelR10(name) === null))}`);
+  const buildClaimR10 = (dir, { ttlMs = 7 * 24 * 60 * 60 * 1000, max = 512, fsImpl = fs } = {}) => {
+    const source = [...CLAIM_PARTS_R10, ...CLAIM_COMPAT_PARTS_R10]
+      .map(sliceTopLevelR10).filter((part) => part !== null).join('\n');
+    const expose = '({ claim: typeof claimThrottleSeen === "function" ? claimThrottleSeen : null,'
+      + ' prune: typeof pruneThrottleSeen === "function" ? pruneThrottleSeen : null,'
+      + ' withLock: typeof withThrottleSeenLock === "function" ? withThrottleSeenLock : null })';
+    return runInNewContext(`${source}\n${expose}`, {
+      fs: fsImpl, path, process, createHash, spawnSync,
+      THROTTLE_SEEN_DIR: dir, THROTTLE_SEEN_TTL_MS: ttlMs, THROTTLE_SEEN_MAX: max,
+      pendingThrottleSeenRecords: [], throttleSeenPruned: false,
+    });
+  };
+  const seenDirR10 = () => fs.mkdtempSync(path.join(os.tmpdir(), 'pg-r10-seen-'));
+  const keyR10 = (label) => createHash('sha256').update(`#215 gate r10 ${label}`).digest('hex');
+  const hashR10 = (label) => createHash('sha256').update(`#215 gate r10 text ${label}`).digest('hex');
+  const EIGHT_DAYS_R10 = 8 * 24 * 60 * 60 * 1000;
+
+  // baseline planted negative: with no contention, the first claim on a fingerprint charges it,
+  // the second (identical url/hash) sees the record it just created and returns 'already'.
+  const dirBaseR10 = seenDirR10();
+  const urlBaseR10 = 'https://chatgpt.com/c/mock-r10-base';
+  const hashBaseR10 = hashR10('baseline');
+  const harnessBaseR10 = buildClaimR10(dirBaseR10);
+  const firstBaseR10 = harnessBaseR10.claim?.(urlBaseR10, hashBaseR10, new Set());
+  const secondBaseR10 = harnessBaseR10.claim?.(urlBaseR10, hashBaseR10, new Set());
+  check('#215 gate r10 P2 baseline: with no contention claimThrottleSeen charges once then reports already',
+    firstBaseR10 === 'charged' && secondBaseR10 === 'already',
+    `first=${firstBaseR10} second=${secondBaseR10}`);
+  fs.rmSync(dirBaseR10, { recursive: true, force: true });
+
+  // --- end-to-end through real salvage children: (i)/(ii) need a stderr assertion, which the vm
+  // harness cannot make observable ----------------------------------------------------------
+  const modalTriggerR10i = "You're making requests too quickly. [#215 gate r10 (i) trigger]";
+  const pageR10i = `ChatGPT\nAccount limits\n${modalTriggerR10i}\nPlease try again shortly.\n`;
+  const primaryUrlR10 = 'https://chatgpt.com/c/mock-conversation';   // the mock's own primary tab
+
+  // (i) the round-9/10 interleaving itself, now against the flock lock: another holder ACQUIRES
+  // the fingerprint's '.lockf' first (spawnSync flock -x on an fd inherited from fs.openSync, the
+  // exact production mechanism) and only creates the record — then releases via fs.closeSync —
+  // after a delay, mid-critical-section, exactly like a concurrent claimThrottleSeen call between
+  // its own admission check and its 'wx' create. A contended claim must wait for the release, then
+  // OBSERVE the record the other holder committed — 'already' — never publish a second cooldown
+  // for the identical sighting.
+  const homeIR10 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const recordIR10 = throttleSeenRecordPath(homeIR10, primaryUrlR10, modalTriggerR10i);
+  const lockIR10 = throttleSeenLockSlotPath(homeIR10, primaryUrlR10, modalTriggerR10i);   // #215 gate r11 P2: the fingerprint's slot
+  let firedIR10 = false;
+  const cdpIR10 = await mockCdp(pageR10i, [], {
+    throttleModal: modalTriggerR10i,
+    onEvaluate: (id, expression) => {
+      if (firedIR10 || !expression.includes('pro-gate:review-text')) return;
+      firedIR10 = true;
+      fs.mkdirSync(throttleSeenDir(homeIR10), { recursive: true });
+      const fdIR10 = fs.openSync(lockIR10, 'a');
+      spawnSync('flock', ['-x', '-w', '0.25', '3'], { stdio: ['ignore', 'ignore', 'pipe', fdIR10] });   // "holder A" acquires
+      setTimeout(() => {
+        // the record is only created now, mid-critical-section, well within the 250ms wait
+        // budget — a racing pre-fix caller that never waited would already be gone by this point
+        try { fs.writeFileSync(recordIR10, '', { flag: 'wx' }); } catch {}   // may already lose the race pre-fix
+        fs.closeSync(fdIR10);   // release: mirrors withThrottleSeenLock's finally
+      }, 60);
+    },
+  });
+  const rIR10 = await runSalvageInHome(homeIR10, [MARKER, '3'], cdpIR10.port);
+  cdpIR10.stop();
+  check('#215 gate r10 P2 (i) a lockf contended by another holder is waited out, not raced past (no second exit-5/cooldown)',
+    rIR10.status !== 5 && rIR10.cooldown === null,
+    `status=${rIR10.status} cooldown=${rIR10.cooldown} stderr=${rIR10.stderr?.slice(-400)}`);
+  check('#215 gate r10 P2 (i) the child observes the already-committed record once the lockf releases',
+    /already charged/.test(rIR10.stderr || ''), `stderr=${rIR10.stderr?.slice(-400)}`);
+  const recordsAfterIR10 = fs.readdirSync(throttleSeenDir(homeIR10)).filter((n) => !n.endsWith('.lockf'));
+  check("#215 gate r10 P2 (i) exactly one record exists afterward — the other holder's, charged exactly once",
+    recordsAfterIR10.length === 1, `records=${JSON.stringify(recordsAfterIR10)}`);
+  fs.rmSync(homeIR10, { recursive: true, force: true });
+
+  // (ii) a lockf held past the wait budget (the holder never releases within this test) fails
+  // open with the documented stderr line and still charges the sighting exactly once.
+  const modalTriggerR10ii = "You're making requests too quickly. [#215 gate r10 (ii) trigger]";
+  const pageR10ii = `ChatGPT\nAccount limits\n${modalTriggerR10ii}\nPlease try again shortly.\n`;
+  const homeIiR10 = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const recordIiR10 = throttleSeenRecordPath(homeIiR10, primaryUrlR10, modalTriggerR10ii);
+  const lockIiR10 = throttleSeenLockSlotPath(homeIiR10, primaryUrlR10, modalTriggerR10ii);   // #215 gate r11 P2: the fingerprint's slot
+  let firedIiR10 = false;
+  let fdIiR10 = null;
+  const cdpIiR10 = await mockCdp(pageR10ii, [], {
+    throttleModal: modalTriggerR10ii,
+    onEvaluate: (id, expression) => {
+      if (firedIiR10 || !expression.includes('pro-gate:review-text')) return;
+      firedIiR10 = true;
+      fs.mkdirSync(throttleSeenDir(homeIiR10), { recursive: true });
+      fdIiR10 = fs.openSync(lockIiR10, 'a');
+      spawnSync('flock', ['-x', '-w', '0.25', '3'], { stdio: ['ignore', 'ignore', 'pipe', fdIiR10] });   // held for the rest of this test — never released
+    },
+  });
+  const rIiR10 = await runSalvageInHome(homeIiR10, [MARKER, '3'], cdpIiR10.port);
+  cdpIiR10.stop();
+  const expectedFailOpenMsgR10 = new RegExp('throttle-seen lock contended past 250ms for [0-9a-f]{64}; '
+    + 'proceeding without it \\(fail-open\\)');
+  check('#215 gate r10 P2 (ii) a lockf held past the wait budget fails open and still charges (exit 5 + cooldown)',
+    rIiR10.status === 5 && /^\d{4}-\d{2}-\d{2}T/.test(rIiR10.cooldown ?? ''),
+    `status=${rIiR10.status} cooldown=${rIiR10.cooldown} stderr=${rIiR10.stderr?.slice(-500)}`);
+  check('#215 gate r10 P2 (ii) the fail-open line names the contended fingerprint',
+    expectedFailOpenMsgR10.test(rIiR10.stderr || ''), `stderr=${rIiR10.stderr?.slice(-500)}`);
+  const recordsAfterIiR10 = fs.readdirSync(throttleSeenDir(homeIiR10)).filter((n) => !n.endsWith('.lockf'));
+  check('#215 gate r10 P2 (ii) exactly one record exists afterward — charged exactly once, not twice',
+    recordsAfterIiR10.length === 1, `records=${JSON.stringify(recordsAfterIiR10)}`);
+  if (fdIiR10 !== null) { try { fs.closeSync(fdIiR10); } catch {} }
+  fs.rmSync(homeIiR10, { recursive: true, force: true });
+
+  // (a) failed-expiry admission (paid-review round 10 [P2] bin/cdp-salvage.mjs:768): an expired
+  // record pruneThrottleSeen could not remove (a readable-but-unwritable seen directory: the
+  // lockf itself is pre-created writable BEFORE the chmod so opening it still succeeds, but the
+  // record's own rename/unlink inside removeThrottleSeenGeneration fails EACCES and the record is
+  // left in place, untouched) must never still read as "already charged" — the sighting must be
+  // charged (exit 5, cooldown written), not silently suppressed with nothing to show for it.
+  if (process.getuid && process.getuid() === 0) {
+    console.log('ok - skipped: running as root');
+  } else {
+    const modalTriggerR10a = "You're making requests too quickly. [#215 gate r10 (a) trigger]";
+    const pageR10a = `ChatGPT\nAccount limits\n${modalTriggerR10a}\nPlease try again shortly.\n`;
+    const homeR10a = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+    seedThrottleSeen(homeR10a, primaryUrlR10, modalTriggerR10a);
+    const recordR10a = throttleSeenRecordPath(homeR10a, primaryUrlR10, modalTriggerR10a);
+    const agedAtR10a = new Date(Date.now() - EIGHT_DAYS_R10);
+    fs.utimesSync(recordR10a, agedAtR10a, agedAtR10a);
+    const seenDirPathR10a = throttleSeenDir(homeR10a);
+    // pre-create the fingerprint's lock slot (normal permissions) so fs.openSync on an EXISTING
+    // file still succeeds once the directory itself loses write permission below.
+    fs.writeFileSync(throttleSeenLockSlotPath(homeR10a, primaryUrlR10, modalTriggerR10a), '');
+    fs.chmodSync(seenDirPathR10a, 0o555);
+    let rR10a;
+    try {
+      const cdpR10a = await mockCdp(pageR10a, [], { throttleModal: modalTriggerR10a });
+      rR10a = await runSalvageInHome(homeR10a, [MARKER, '3'], cdpR10a.port);
+      cdpR10a.stop();
+    } finally {
+      fs.chmodSync(seenDirPathR10a, 0o755);
+    }
+    check('#215 gate r10 P2 (a) an expired record pruning could not remove is charged, not suppressed (exit 5 + cooldown)',
+      rR10a.status === 5 && /^\d{4}-\d{2}-\d{2}T/.test(rR10a.cooldown ?? ''),
+      `status=${rR10a.status} cooldown=${rR10a.cooldown} stderr=${rR10a.stderr?.slice(-400)}`);
+    check('#215 gate r10 P2 (a) stderr never claims the sighting was already charged',
+      !/already charged/.test(rR10a.stderr || ''), `stderr=${rR10a.stderr?.slice(-400)}`);
+    fs.rmSync(homeR10a, { recursive: true, force: true });
+
+    // planted negative: the SAME aged record in a WRITABLE dir is unlinked and re-created — the
+    // expiry re-arms it (charged once), and the FRESH record it writes then suppresses the very
+    // next sighting, proving the age check (not the chmod) is what made the positive above charge.
+    const modalTriggerR10aNeg = "You're making requests too quickly. [#215 gate r10 (a) negative]";
+    const pageR10aNeg = `ChatGPT\nAccount limits\n${modalTriggerR10aNeg}\nPlease try again shortly.\n`;
+    const homeR10aNeg = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+    seedThrottleSeen(homeR10aNeg, primaryUrlR10, modalTriggerR10aNeg);
+    fs.utimesSync(throttleSeenRecordPath(homeR10aNeg, primaryUrlR10, modalTriggerR10aNeg), agedAtR10a, agedAtR10a);
+    const cdpR10aNeg1 = await mockCdp(pageR10aNeg, [], { throttleModal: modalTriggerR10aNeg });
+    const rR10aNeg1 = await runSalvageInHome(homeR10aNeg, [MARKER, '3'], cdpR10aNeg1.port);
+    cdpR10aNeg1.stop();
+    check('#215 gate r10 P2 (a) planted negative: the same aged record in a writable dir is charged once (exit 5 + cooldown)',
+      rR10aNeg1.status === 5 && /^\d{4}-\d{2}-\d{2}T/.test(rR10aNeg1.cooldown ?? ''),
+      `status=${rR10aNeg1.status} cooldown=${rR10aNeg1.cooldown}`);
+    const cdpR10aNeg2 = await mockCdp(pageR10aNeg, [], { throttleModal: modalTriggerR10aNeg });
+    const rR10aNeg2 = await runSalvageInHome(homeR10aNeg, [MARKER, '3'], cdpR10aNeg2.port);
+    cdpR10aNeg2.stop();
+    check('#215 gate r10 P2 (a) planted negative: the fresh record suppresses the next sighting (already charged, no second cooldown)',
+      rR10aNeg2.status !== 5 && rR10aNeg2.cooldown === rR10aNeg1.cooldown && /already charged/.test(rR10aNeg2.stderr || ''),
+      `status=${rR10aNeg2.status} cooldownBefore=${rR10aNeg1.cooldown} cooldownAfter=${rR10aNeg2.cooldown} stderr=${rR10aNeg2.stderr?.slice(-400)}`);
+    fs.rmSync(homeR10aNeg, { recursive: true, force: true });
+  }
+
+  // (b) lock files are never counted toward capacity and never deleted by the prune: seed 3
+  // '.lockf' files alongside 2 real records with PRO_GATE_THROTTLE_SEEN_MAX=1 — exactly one
+  // record is trimmed, and all three seeded lock files remain untouched. (The trim itself takes
+  // the trimmed record's OWN fingerprint lock to remove it, which — like any other claim —
+  // creates THAT fingerprint's own lockf if it did not already have one; that is expected and
+  // does not disturb the three unrelated ones seeded here.)
+  const dirR10b = seenDirR10();
+  const lockNamesR10b = ['b lock one', 'b lock two', 'b lock three'].map((label) => `${keyR10(label)}.lockf`);
+  lockNamesR10b.forEach((name) => fs.writeFileSync(path.join(dirR10b, name), ''));
+  const nameOldR10b = keyR10('b oldest');
+  const nameNewR10b = keyR10('b newest');
+  const pathOldR10b = path.join(dirR10b, nameOldR10b);
+  const pathNewR10b = path.join(dirR10b, nameNewR10b);
+  fs.writeFileSync(pathOldR10b, '', { flag: 'wx' });
+  fs.utimesSync(pathOldR10b, new Date(Date.now() - 600_000), new Date(Date.now() - 600_000));
+  fs.writeFileSync(pathNewR10b, '', { flag: 'wx' });
+  fs.utimesSync(pathNewR10b, new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
+  buildClaimR10(dirR10b, { max: 1 }).prune?.(new Set());
+  const afterR10b = fs.readdirSync(dirR10b);
+  check('#215 gate r10 P2 (b) the capacity trim cuts the oldest unprotected record down to the cap',
+    !afterR10b.includes(nameOldR10b) && afterR10b.includes(nameNewR10b),
+    `dir=${JSON.stringify(afterR10b)}`);
+  check('#215 gate r10 P2 (b) all three seeded lock files survive the trim untouched, and are never counted toward capacity',
+    lockNamesR10b.every((name) => afterR10b.includes(name)),
+    `dir=${JSON.stringify(afterR10b)}`);
+  fs.rmSync(dirR10b, { recursive: true, force: true });
+
+  // (c) a crashed holder releases the lock — the property a pathname mutex could never provide
+  // (round 9's mkdir lock needed THROTTLE_SEEN_LOCK_STALE_MS plus a liveness-checked owner token,
+  // and even then two reclaimers could race the same dead lock; see the deleted (iii)/(iii-b)/(iv)
+  // checks and the '#215 gate r9 verify' process pair this test replaces). A holder process is
+  // SIGKILLed mid-hold via the production withThrottleSeenLock itself (sliced verbatim into a
+  // driver script, not reimplemented); the very next claim on the SAME fingerprint, made through
+  // the SAME production function, must proceed near-instantly — no 250ms wait.
+  const dirR10c = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-r10-crash-'));
+  const nameR10c = createHash('sha256').update('#215 gate r10 (c) fingerprint').digest('hex');
+  const readyPathR10c = path.join(dirR10c, 'ready');
+  const LOCK_PARTS_R10C = ['THROTTLE_SEEN_LOCK_SLOTS', 'throttleSeenLockSlot',
+    'THROTTLE_SEEN_LOCK_WAIT_MS', 'THROTTLE_SEEN_LOCK_WAIT_SECS', 'withThrottleSeenLock'];
+  // Same cross-version reason as CLAIM_COMPAT_PARTS_R10 above: kept out of the "no silent no-op"
+  // gate below (that gate deliberately still fails against pre-r10 source, which lacks
+  // THROTTLE_SEEN_LOCK_WAIT_SECS entirely) but included in the driver script's own source so the
+  // OLD withThrottleSeenLock body, if that is what gets sliced in, has every name IT needs too.
+  const LOCK_COMPAT_PARTS_R10C = ['throttleSeenIsLock', 'THROTTLE_SEEN_LOCK_STALE_MS',
+    'throttleSeenLockOwnerPath', 'throttleSeenLockOwnerAlive'];
+  const extractedLockSrcR10c = [...LOCK_PARTS_R10C, ...LOCK_COMPAT_PARTS_R10C]
+    .map(sliceTopLevelR10).filter((p) => p !== null).join('\n\n');
+  check('#215 gate r10 P2 (c) setup: every named lock part was found in bin/cdp-salvage.mjs (no silent no-op slice)',
+    LOCK_PARTS_R10C.every((name) => sliceTopLevelR10(name) !== null),
+    `missing=${JSON.stringify(LOCK_PARTS_R10C.filter((name) => sliceTopLevelR10(name) === null))}`);
+  const holderSrcR10c = [
+    "import fs from 'node:fs';",
+    "import path from 'node:path';",
+    "import { spawnSync, execSync } from 'node:child_process';",
+    `const THROTTLE_SEEN_DIR = ${JSON.stringify(dirR10c)};`,
+    extractedLockSrcR10c,
+    `withThrottleSeenLock(${JSON.stringify(nameR10c)}, () => {`,
+    `  fs.writeFileSync(${JSON.stringify(readyPathR10c)}, 'ready');`,
+    "  execSync('sleep 30');",   // held inside the lock until SIGKILLed
+    '});',
+  ].join('\n');
+  const holderPathR10c = path.join(dirR10c, 'holder.mjs');
+  fs.writeFileSync(holderPathR10c, holderSrcR10c);
+  const holderR10c = spawn(process.execPath, [holderPathR10c]);
+  const sleepR10c = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+  const waitForFileR10c = async (filePath, timeoutMs) => {
+    const deadline = Date.now() + timeoutMs;
+    while (!fs.existsSync(filePath) && Date.now() < deadline) { await sleepR10c(20); }
+    return fs.existsSync(filePath);
+  };
+  const holderReadyR10c = await waitForFileR10c(readyPathR10c, 3_000);
+  check('#215 gate r10 P2 (c) setup: the holder process acquired the flock and is holding it',
+    holderReadyR10c, `ready=${holderReadyR10c}`);
+  holderR10c.kill('SIGKILL');
+  await new Promise((resolve) => { holderR10c.on('close', resolve); });
+  const harnessR10c = buildClaimR10(dirR10c);
+  const startR10c = Date.now();
+  harnessR10c.withLock?.(nameR10c, () => {});
+  const elapsedR10c = Date.now() - startR10c;
+  check('#215 gate r10 P2 (c) the very next claim on the same fingerprint proceeds near-instantly after a SIGKILL, not after the 250ms wait budget',
+    holderReadyR10c && elapsedR10c < 100, `elapsedMs=${elapsedR10c}`);
+  fs.rmSync(dirR10c, { recursive: true, force: true });
+
+  // (d) a missing flock binary fails open (paid-review round 10's own documented compatibility
+  // case — e.g. macOS has no `flock`): a claim proceeds and still charges rather than blocking, and
+  // the one-line note prints ONCE per process even though this run makes TWO separate
+  // withThrottleSeenLock calls (pruneThrottleSeen's removal of an unrelated expired record, then
+  // claimThrottleSeen's own admission) — a missing binary is a fixed fact about the host, not
+  // about one fingerprint, so it must not repeat on every lock attempt.
+  const modalTriggerR10d = "You're making requests too quickly. [#215 gate r10 (d) trigger]";
+  const pageR10d = `ChatGPT\nAccount limits\n${modalTriggerR10d}\nPlease try again shortly.\n`;
+  const homeR10d = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-salvage-test-'));
+  const unrelatedUrlR10d = 'https://chatgpt.com/c/mock-r10d-unrelated';
+  const unrelatedTextR10d = 'an old sighting from a tab nobody replaced [#215 gate r10 (d)]';
+  seedThrottleSeen(homeR10d, unrelatedUrlR10d, unrelatedTextR10d);
+  const agedAtR10d = new Date(Date.now() - EIGHT_DAYS_R10);
+  fs.utimesSync(throttleSeenRecordPath(homeR10d, unrelatedUrlR10d, unrelatedTextR10d), agedAtR10d, agedAtR10d);
+  const emptyPathDirR10d = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-r10-empty-path-'));
+  const cdpR10d = await mockCdp(pageR10d, [], { throttleModal: modalTriggerR10d });
+  const rR10d = await runSalvageInHome(homeR10d, [MARKER, '3'], cdpR10d.port, { PATH: emptyPathDirR10d });
+  cdpR10d.stop();
+  check('#215 gate r10 P2 (d) a missing flock binary fails open and still charges once (exit 5 + cooldown)',
+    rR10d.status === 5 && /^\d{4}-\d{2}-\d{2}T/.test(rR10d.cooldown ?? ''),
+    `status=${rR10d.status} cooldown=${rR10d.cooldown} stderr=${rR10d.stderr?.slice(-400)}`);
+  const missingLinesR10d = (rR10d.stderr || '').split('\n').filter((l) => l.includes('flock binary unavailable'));
+  check('#215 gate r10 P2 (d) the missing-binary note prints exactly once despite two lock attempts (prune + admission)',
+    missingLinesR10d.length === 1, `lines=${JSON.stringify(missingLinesR10d)} stderr=${rR10d.stderr?.slice(-600)}`);
+  fs.rmSync(homeR10d, { recursive: true, force: true });
+  fs.rmSync(emptyPathDirR10d, { recursive: true, force: true });
+}
+
+{ // #215 gate r10 verify (independent-verifier P2, post-2d37d35): claimThrottleSeen discarded
+  // recordThrottleSeen's wx-create outcome and unconditionally returned 'charged'. Two callers
+  // racing the SAME brand-new fingerprint while the per-fingerprint flock is fail-open (a missing
+  // flock binary, or genuine contention past the 250ms wait budget) both pass claimThrottleSeen's
+  // null-stat check, both call recordThrottleSeen — only one 'wx' create actually wins, the other
+  // throws EEXIST and is silently swallowed by the try/catch — but the return value was discarded,
+  // so BOTH calls returned 'charged': each caller believes it alone owns the sighting and both
+  // write/publish a cooldown, the exact double-charge this lock architecture exists to prevent.
+  // be2271f (before round 10) got this right — `return recordThrottleSeen(url, hash) ? 'charged' :
+  // 'already';` — and three in-file comments (recordThrottleSeen's own docstring, and twice in
+  // claimThrottleSeen/tripThrottleUnowned) still describe the 'wx' flag as the "sole race arbiter"
+  // / "belt-and-suspenders arbiter" even though 2d37d35's rewrite stopped consulting it.
+  // Reproduced deterministically (no real multi-process race needed, and without disturbing round
+  // 10's own age-aware-admission fail-open path — see the planted negative below) by injecting the
+  // TOCTOU window directly: an fsImpl.statSync proxy lets claimThrottleSeen's own existence check
+  // run for real (a legitimate ENOENT — nothing on disk yet), then, standing in for a concurrent
+  // racer's recordThrottleSeen winning the SAME instant, creates the record via the identical 'wx'
+  // flag production uses. claimThrottleSeen then proceeds to ITS OWN recordThrottleSeen call, whose
+  // 'wx' create must now lose (EEXIST): correct code reports 'already', the bug reports 'charged'.
+  const salvageLinesR10V = fs.readFileSync(SALVAGE, 'utf8').split('\n');
+  const sliceTopLevelR10V = (name) => {
+    const start = salvageLinesR10V.findIndex((line) => (
+      line.startsWith(`function ${name}(`) || line.startsWith(`const ${name} = `)
+    ));
+    if (start < 0) return null;
+    if (salvageLinesR10V[start].startsWith('const ') || salvageLinesR10V[start].trimEnd().endsWith('}')) {
+      return salvageLinesR10V[start];
+    }
+    const end = salvageLinesR10V.findIndex((line, i) => i > start && line === '}');
+    return end < 0 ? null : salvageLinesR10V.slice(start, end + 1).join('\n');
+  };
+  const CLAIM_PARTS_R10V = ['THROTTLE_SEEN_EXPIRE_MARK', 'throttleSeenIsTemp', 'throttleSeenIsLockFile',
+    'THROTTLE_SEEN_LOCK_SLOTS', 'throttleSeenLockSlot',
+    'THROTTLE_SEEN_LOCK_WAIT_MS', 'THROTTLE_SEEN_LOCK_WAIT_SECS', 'withThrottleSeenLock',
+    'removeThrottleSeenGeneration', 'pruneThrottleSeen', 'throttleSeenKey', 'throttleSeenRecordPath',
+    'recordThrottleSeen', 'claimThrottleSeen'];
+  check('#215 gate r10 verify setup: every named claim/lock part was found in bin/cdp-salvage.mjs (no silent no-op slice)',
+    CLAIM_PARTS_R10V.every((name) => sliceTopLevelR10V(name) !== null),
+    `missing=${JSON.stringify(CLAIM_PARTS_R10V.filter((name) => sliceTopLevelR10V(name) === null))}`);
+  const buildClaimR10V = (dir, fsImpl) => {
+    const source = CLAIM_PARTS_R10V.map(sliceTopLevelR10V).filter((part) => part !== null).join('\n');
+    const expose = '({ claim: typeof claimThrottleSeen === "function" ? claimThrottleSeen : null })';
+    return runInNewContext(`${source}\n${expose}`, {
+      fs: fsImpl, path, process, createHash, spawnSync,
+      THROTTLE_SEEN_DIR: dir, THROTTLE_SEEN_TTL_MS: 7 * 24 * 60 * 60 * 1000, THROTTLE_SEEN_MAX: 512,
+      pendingThrottleSeenRecords: [], throttleSeenPruned: false,
+    });
+  };
+  // Fires once, on the FIRST statSync for `target` (claimThrottleSeen's own admission check):
+  // lets the real, legitimate ENOENT happen, then — in a finally, so the throw still propagates —
+  // creates the record on real disk via the same 'wx' flag production uses, simulating a racer's
+  // recordThrottleSeen winning the identical fingerprint in that exact instant.
+  const raceOnFirstStatR10V = (target) => {
+    let fired = false;
+    const proxy = Object.create(fs);
+    proxy.statSync = (p, ...rest) => {
+      if (fired || p !== target) return fs.statSync(p, ...rest);
+      fired = true;
+      try {
+        return fs.statSync(p, ...rest);
+      } finally {
+        try { fs.writeFileSync(target, '', { flag: 'wx' }); } catch {}
+      }
+    };
+    return proxy;
+  };
+  const seenDirR10V = () => fs.mkdtempSync(path.join(os.tmpdir(), 'pg-r10-verify-'));
+  const recordPathR10V = (dir, url, hash) => path.join(
+    dir, createHash('sha256').update(`${url}\n${hash}`).digest('hex'),
+  );
+
+  // Positive: the race fires — claimThrottleSeen's own 'wx' create must lose, so it must report
+  // 'already', never 'charged'.
+  const dirRaceV = seenDirR10V();
+  const urlRaceV = 'https://chatgpt.com/c/mock-r10-verify-race';
+  const hashRaceV = createHash('sha256').update('#215 gate r10 verify race text').digest('hex');
+  const targetRaceV = recordPathR10V(dirRaceV, urlRaceV, hashRaceV);
+  const resultRaceV = buildClaimR10V(dirRaceV, raceOnFirstStatR10V(targetRaceV))
+    .claim?.(urlRaceV, hashRaceV, new Set());
+  check("#215 gate r10 verify: a racer's already-won 'wx' create is honored — claimThrottleSeen reports 'already', not 'charged'",
+    resultRaceV === 'already', `result=${resultRaceV}`);
+  check('#215 gate r10 verify: exactly one record exists afterward (the racer\'s own, untouched)',
+    fs.readdirSync(dirRaceV).filter((n) => !n.endsWith('.lockf')).length === 1,
+    `dir=${JSON.stringify(fs.readdirSync(dirRaceV))}`);
+  fs.rmSync(dirRaceV, { recursive: true, force: true });
+
+  // Planted negative: identical setup, no injected race — the ordinary uncontended path must still
+  // report 'charged', proving the fix does not just make every claim report 'already'.
+  const dirPlainV = seenDirR10V();
+  const urlPlainV = 'https://chatgpt.com/c/mock-r10-verify-plain';
+  const hashPlainV = createHash('sha256').update('#215 gate r10 verify plain text').digest('hex');
+  const resultPlainV = buildClaimR10V(dirPlainV, fs).claim?.(urlPlainV, hashPlainV, new Set());
+  check("#215 gate r10 verify planted negative: an uncontended claim on a fresh fingerprint still reports 'charged'",
+    resultPlainV === 'charged', `result=${resultPlainV}`);
+  fs.rmSync(dirPlainV, { recursive: true, force: true });
+}
+
+// #215 gate r11 P2 (paid-review round 11 [P2] bin/cdp-salvage.mjs:683): lock files were one per
+// fingerprint and exempt from every retention bound, so lifetime fingerprint churn grew the
+// sidecar's inode count and every prune's stat work without limit. Fingerprints now share a FIXED
+// pool of THROTTLE_SEEN_LOCK_SLOTS lock files through the same mapping for admission and removal.
+// Same vm-sliced-by-name harness as the r10 blocks above, with a console stub so the contended
+// fail-open line (console.error in production) is observable instead of a ReferenceError.
+{
+  const salvageSrcR11 = fs.readFileSync(SALVAGE, 'utf8');
+  const salvageLinesR11 = salvageSrcR11.split('\n');
+  const sliceTopLevelR11 = (name) => {
+    const start = salvageLinesR11.findIndex((line) => (
+      line.startsWith(`function ${name}(`) || line.startsWith(`const ${name} = `)
+    ));
+    if (start < 0) return null;
+    if (salvageLinesR11[start].startsWith('const ') || salvageLinesR11[start].trimEnd().endsWith('}')) {
+      return salvageLinesR11[start];
+    }
+    const end = salvageLinesR11.findIndex((line, i) => i > start && line === '}');
+    return end < 0 ? null : salvageLinesR11.slice(start, end + 1).join('\n');
+  };
+  const CLAIM_PARTS_R11 = ['THROTTLE_SEEN_EXPIRE_MARK', 'throttleSeenIsTemp', 'throttleSeenIsLockFile',
+    'THROTTLE_SEEN_LOCK_SLOTS', 'throttleSeenLockSlot',
+    'THROTTLE_SEEN_LOCK_WAIT_MS', 'THROTTLE_SEEN_LOCK_WAIT_SECS', 'withThrottleSeenLock',
+    'removeThrottleSeenGeneration', 'pruneThrottleSeen', 'throttleSeenKey', 'throttleSeenRecordPath',
+    'recordThrottleSeen', 'claimThrottleSeen'];
+  check('#215 gate r11 P2 setup: every named part was found in bin/cdp-salvage.mjs (no silent no-op slice)',
+    CLAIM_PARTS_R11.every((name) => sliceTopLevelR11(name) !== null),
+    `missing=${JSON.stringify(CLAIM_PARTS_R11.filter((name) => sliceTopLevelR11(name) === null))}`);
+  const errsR11 = [];
+  const buildR11 = (dir, { fsImpl = fs } = {}) => {
+    const source = CLAIM_PARTS_R11.map(sliceTopLevelR11).filter((part) => part !== null).join('\n');
+    const expose = '({ claim: typeof claimThrottleSeen === "function" ? claimThrottleSeen : null,'
+      + ' prune: typeof pruneThrottleSeen === "function" ? pruneThrottleSeen : null,'
+      + ' withLock: typeof withThrottleSeenLock === "function" ? withThrottleSeenLock : null })';
+    return runInNewContext(`${source}\n${expose}`, {
+      fs: fsImpl, path, process, createHash, spawnSync,
+      console: { error: (message) => errsR11.push(String(message)) },
+      THROTTLE_SEEN_DIR: dir, THROTTLE_SEEN_TTL_MS: 7 * 24 * 60 * 60 * 1000, THROTTLE_SEEN_MAX: 512,
+      pendingThrottleSeenRecords: [], throttleSeenPruned: false,
+    });
+  };
+  const isLockfR11 = (name) => name.endsWith('.lockf');
+  const isPoolSlotR11 = (name) => /^lock-\d{2}\.lockf$/.test(name);
+
+  // (a) churn: many distinct fingerprints, then expire them all. The records come and go; the
+  // lock files never exceed the pool, and a prune never stats one (skipped by name first).
+  const dirA = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-r11-churn-'));
+  const N_R11 = 200;
+  const harnessA = buildR11(dirA);
+  let chargedA = 0;
+  for (let i = 0; i < N_R11; i++) {
+    const url = `https://chatgpt.com/c/r11-churn-${i}`;
+    const hash = createHash('sha256').update(`#215 gate r11 churn text ${i}`).digest('hex');
+    if (harnessA.claim?.(url, hash, new Set()) === 'charged') chargedA++;
+  }
+  const lockfA = fs.readdirSync(dirA).filter(isLockfR11);
+  const recordsA = fs.readdirSync(dirA).filter((n) => !isLockfR11(n));
+  check(`#215 gate r11 P2 (a) ${N_R11} distinct fingerprints each charge once and leave one record each`,
+    chargedA === N_R11 && recordsA.length === N_R11, `charged=${chargedA} records=${recordsA.length}`);
+  check(`#215 gate r11 P2 (a) lock files stay within the fixed pool (<= ${THROTTLE_SEEN_LOCK_SLOTS_T}) after ${N_R11} distinct fingerprints`,
+    lockfA.length <= THROTTLE_SEEN_LOCK_SLOTS_T && lockfA.every(isPoolSlotR11),
+    `lockf=${lockfA.length} sample=${JSON.stringify(lockfA.slice(0, 3))}`);
+  const agedA = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
+  recordsA.forEach((n) => fs.utimesSync(path.join(dirA, n), agedA, agedA));
+  let lockfStatsA = 0;
+  const countingFsA = Object.create(fs);
+  countingFsA.statSync = (p, ...rest) => {
+    if (isLockfR11(String(p))) lockfStatsA++;
+    return fs.statSync(p, ...rest);
+  };
+  buildR11(dirA, { fsImpl: countingFsA }).prune?.(new Set());
+  const afterA = fs.readdirSync(dirA);
+  check('#215 gate r11 P2 (a) expiring every record leaves zero records and a lock-file count still within the pool',
+    afterA.filter((n) => !isLockfR11(n)).length === 0 && afterA.filter(isLockfR11).length <= THROTTLE_SEEN_LOCK_SLOTS_T,
+    `entries=${afterA.length} records=${afterA.filter((n) => !isLockfR11(n)).length} lockf=${afterA.filter(isLockfR11).length}`);
+  check('#215 gate r11 P2 (a) the prune never stats a lock file (skipped by name, before the stat)',
+    lockfStatsA === 0, `lockfStats=${lockfStatsA}`);
+  fs.rmSync(dirA, { recursive: true, force: true });
+
+  // (b) two fingerprints that share a slot serialize on the SAME file. Hold fingerprint A's slot
+  // exactly the way production does (fs.openSync + spawnSync flock -x on the inherited fd; a
+  // second open file description in the same process conflicts under flock(2)), then take the
+  // lock for fingerprint B through the production withThrottleSeenLock: it must contend — wait
+  // the full budget, then fail open naming B — which never happened while B had a private lock
+  // file. Planted negative: fingerprint C, in another slot, is not delayed at all meanwhile.
+  const dirB = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-r11-slot-'));
+  const keyR11 = (label) => createHash('sha256').update(`#215 gate r11 ${label}`).digest('hex');
+  const nameA = keyR11('slot a');
+  let nameB = null;
+  let nameC = null;
+  for (let i = 0; i < 4096 && (nameB === null || nameC === null); i++) {
+    const cand = keyR11(`slot probe ${i}`);
+    if (throttleSeenLockSlotName(cand) === throttleSeenLockSlotName(nameA)) { if (nameB === null) nameB = cand; }
+    else if (nameC === null) nameC = cand;
+  }
+  check("#215 gate r11 P2 (b) setup: found a fingerprint sharing A's slot and one in another slot",
+    nameB !== null && nameC !== null, `b=${nameB} c=${nameC}`);
+  const harnessB = buildR11(dirB);
+  const slotPathB = path.join(dirB, throttleSeenLockSlotName(nameA));
+  const fdHoldB = fs.openSync(slotPathB, 'a');
+  const holdB = spawnSync('flock', ['-x', '-w', '0.25', '3'], { stdio: ['ignore', 'ignore', 'pipe', fdHoldB] });
+  check("#215 gate r11 P2 (b) setup: this process holds A's slot", holdB.status === 0,
+    `status=${holdB.status} err=${holdB.error?.code}`);
+  errsR11.length = 0;
+  const t0B = Date.now();
+  let ranB = false;
+  harnessB.withLock?.(nameB, () => { ranB = true; });
+  const elapsedB = Date.now() - t0B;
+  check("#215 gate r11 P2 (b) a fingerprint sharing A's slot contends on A's lock file: waits the budget, then fails open naming itself",
+    ranB && elapsedB >= 230 && errsR11.some((m) => m.includes(`contended past 250ms for ${nameB}`)),
+    `ran=${ranB} elapsed=${elapsedB}ms errs=${JSON.stringify(errsR11)}`);
+  errsR11.length = 0;
+  const t0C = Date.now();
+  let ranC = false;
+  harnessB.withLock?.(nameC, () => { ranC = true; });
+  const elapsedC = Date.now() - t0C;
+  check("#215 gate r11 P2 (b) planted negative: a fingerprint in another slot is not delayed while A's slot is held",
+    ranC && elapsedC < 150 && errsR11.length === 0, `ran=${ranC} elapsed=${elapsedC}ms errs=${JSON.stringify(errsR11)}`);
+  fs.closeSync(fdHoldB);
+  const lockfB = fs.readdirSync(dirB).filter(isLockfR11);
+  check('#215 gate r11 P2 (b) B and C created no lock file of their own: only pool slots exist',
+    lockfB.every(isPoolSlotR11) && lockfB.length <= 2, `lockf=${JSON.stringify(lockfB)}`);
+  fs.rmSync(dirB, { recursive: true, force: true });
+
+  // (c) the mapping is the same for admission and removal: both reach withThrottleSeenLock with
+  // the fingerprint's record name, and withThrottleSeenLock resolves that name through the slot
+  // function. A source-text check, deliberately narrow: it pins the two call sites and the one
+  // resolution line the (b) behaviour above depends on.
+  check('#215 gate r11 P2 (c) admission and removal take the lock through the same function, resolved through the slot pool',
+    /function removeThrottleSeenGeneration\([^\n]*\n\s+return withThrottleSeenLock\(name, /.test(salvageSrcR11)
+      && /withThrottleSeenLock\(throttleSeenKey\(url, hash\), /.test(salvageSrcR11)
+      && salvageSrcR11.includes('const lockPath = path.join(THROTTLE_SEEN_DIR, throttleSeenLockSlot(name));'),
+    'source text');
+}
+
+// #215 gate r12 P2 (paid-review round 12 [P2] bin/cdp-salvage.mjs:786): on the fail-open path a
+// record can cross its TTL between the one-time prune and admission; if another writer expires
+// it first (our unlink gets ENOENT) and creates its replacement before our 'wx' create, the
+// ENOENT was counted as a FAILED expiry, so the lost create was overridden to 'charged' and the
+// sighting's cooldown was published twice. Same vm-sliced harness and the same deterministic
+// injection style as the r10 verify block: the proxy lets our unlink really remove the record,
+// throws ENOENT as though the other writer got there first, and — in a finally, so the throw
+// still propagates — plants that writer's replacement before control returns to our create.
+{
+  const salvageLinesR12 = fs.readFileSync(SALVAGE, 'utf8').split('\n');
+  const sliceTopLevelR12 = (name) => {
+    const start = salvageLinesR12.findIndex((line) => (
+      line.startsWith(`function ${name}(`) || line.startsWith(`const ${name} = `)
+    ));
+    if (start < 0) return null;
+    if (salvageLinesR12[start].startsWith('const ') || salvageLinesR12[start].trimEnd().endsWith('}')) {
+      return salvageLinesR12[start];
+    }
+    const end = salvageLinesR12.findIndex((line, i) => i > start && line === '}');
+    return end < 0 ? null : salvageLinesR12.slice(start, end + 1).join('\n');
+  };
+  const CLAIM_PARTS_R12 = ['THROTTLE_SEEN_EXPIRE_MARK', 'throttleSeenIsTemp', 'throttleSeenIsLockFile',
+    'THROTTLE_SEEN_LOCK_SLOTS', 'throttleSeenLockSlot',
+    'THROTTLE_SEEN_LOCK_WAIT_MS', 'THROTTLE_SEEN_LOCK_WAIT_SECS', 'withThrottleSeenLock',
+    'removeThrottleSeenGeneration', 'pruneThrottleSeen', 'throttleSeenKey', 'throttleSeenRecordPath',
+    'recordThrottleSeen', 'claimThrottleSeen'];
+  check('#215 gate r12 P2 setup: every named part was found in bin/cdp-salvage.mjs (no silent no-op slice)',
+    CLAIM_PARTS_R12.every((name) => sliceTopLevelR12(name) !== null),
+    `missing=${JSON.stringify(CLAIM_PARTS_R12.filter((name) => sliceTopLevelR12(name) === null))}`);
+  // throttleSeenPruned is injected TRUE: the one-time prune already ran this invocation, which is
+  // exactly how a record comes to cross its TTL between that prune and this claim.
+  const buildClaimR12 = (dir, fsImpl) => {
+    const source = CLAIM_PARTS_R12.map(sliceTopLevelR12).filter((part) => part !== null).join('\n');
+    const expose = '({ claim: typeof claimThrottleSeen === "function" ? claimThrottleSeen : null })';
+    return runInNewContext(`${source}\n${expose}`, {
+      fs: fsImpl, path, process, createHash, spawnSync,
+      console: { error: () => {} },
+      THROTTLE_SEEN_DIR: dir, THROTTLE_SEEN_TTL_MS: 7 * 24 * 60 * 60 * 1000, THROTTLE_SEEN_MAX: 512,
+      pendingThrottleSeenRecords: [], throttleSeenPruned: true,
+    });
+  };
+  const seenDirR12 = () => fs.mkdtempSync(path.join(os.tmpdir(), 'pg-r12-enoent-'));
+  const recordPathR12 = (dir, url, hash) => path.join(
+    dir, createHash('sha256').update(`${url}\n${hash}`).digest('hex'),
+  );
+  const EIGHT_DAYS_R12 = 8 * 24 * 60 * 60 * 1000;
+  const seedExpiredR12 = (target) => {
+    fs.writeFileSync(target, '', { flag: 'wx' });
+    const aged = new Date(Date.now() - EIGHT_DAYS_R12);
+    fs.utimesSync(target, aged, aged);
+  };
+  // Fires once, on the FIRST unlinkSync for `target` (claimThrottleSeen's own expiry unlink):
+  // the record really goes, the caller sees ENOENT (the other writer expired it first), and the
+  // other writer's fresh replacement is planted before control returns to our 'wx' create.
+  const enoentThenRacerR12 = (target) => {
+    let fired = false;
+    const proxy = Object.create(fs);
+    proxy.unlinkSync = (p, ...rest) => {
+      if (fired || p !== target) return fs.unlinkSync(p, ...rest);
+      fired = true;
+      fs.unlinkSync(p);
+      try {
+        const err = new Error(`ENOENT: no such file or directory, unlink '${p}'`);
+        err.code = 'ENOENT';
+        throw err;
+      } finally {
+        fs.writeFileSync(target, '', { flag: 'wx' });   // the racer's replacement, fresh mtime
+      }
+    };
+    return proxy;
+  };
+  // Fires once, on the FIRST unlinkSync for `target`: the record stays in place and the caller
+  // sees EACCES — a genuine deletion failure, decision 2's fail-open case, which must still charge.
+  const eaccesLeavesRecordR12 = (target) => {
+    let fired = false;
+    const proxy = Object.create(fs);
+    proxy.unlinkSync = (p, ...rest) => {
+      if (fired || p !== target) return fs.unlinkSync(p, ...rest);
+      fired = true;
+      const err = new Error(`EACCES: permission denied, unlink '${p}'`);
+      err.code = 'EACCES';
+      throw err;
+    };
+    return proxy;
+  };
+
+  // Positive: the other writer wins — our create loses with EEXIST, and since our own unlink
+  // removed nothing, that EEXIST is the other writer's charge, never ours: 'already'.
+  const dirRaceR12 = seenDirR12();
+  const urlRaceR12 = 'https://chatgpt.com/c/mock-r12-enoent-race';
+  const hashRaceR12 = createHash('sha256').update('#215 gate r12 race text').digest('hex');
+  const targetRaceR12 = recordPathR12(dirRaceR12, urlRaceR12, hashRaceR12);
+  seedExpiredR12(targetRaceR12);
+  const resultRaceR12 = buildClaimR12(dirRaceR12, enoentThenRacerR12(targetRaceR12))
+    .claim?.(urlRaceR12, hashRaceR12, new Set());
+  check("#215 gate r12 P2: an ENOENT on the expiry unlink followed by a lost 'wx' create reports 'already', never 'charged'",
+    resultRaceR12 === 'already', `result=${resultRaceR12}`);
+  const afterRaceR12 = fs.readdirSync(dirRaceR12).filter((n) => !n.endsWith('.lockf'));
+  check("#215 gate r12 P2: exactly one record exists afterward — the other writer's fresh replacement, untouched",
+    afterRaceR12.length === 1 && Date.now() - fs.statSync(targetRaceR12).mtimeMs < 60_000,
+    `records=${JSON.stringify(afterRaceR12)} ageMs=${Date.now() - fs.statSync(targetRaceR12).mtimeMs}`);
+  fs.rmSync(dirRaceR12, { recursive: true, force: true });
+
+  // Planted negative 1: a genuine deletion failure (EACCES, record still there) keeps decision 2's
+  // fail-open: the create loses to the stale file we could not remove, and the sighting is still
+  // charged — the fix narrows the override to ENOENT, it does not remove it.
+  const dirEaccesR12 = seenDirR12();
+  const urlEaccesR12 = 'https://chatgpt.com/c/mock-r12-eacces';
+  const hashEaccesR12 = createHash('sha256').update('#215 gate r12 eacces text').digest('hex');
+  const targetEaccesR12 = recordPathR12(dirEaccesR12, urlEaccesR12, hashEaccesR12);
+  seedExpiredR12(targetEaccesR12);
+  const resultEaccesR12 = buildClaimR12(dirEaccesR12, eaccesLeavesRecordR12(targetEaccesR12))
+    .claim?.(urlEaccesR12, hashEaccesR12, new Set());
+  check("#215 gate r12 P2 planted negative: an expired record a real unlink failure leaves in place is still charged (fail-open kept)",
+    resultEaccesR12 === 'charged', `result=${resultEaccesR12}`);
+  fs.rmSync(dirEaccesR12, { recursive: true, force: true });
+
+  // Planted negative 2: an ordinary expiry with no racer — our unlink succeeds and our create wins:
+  // 'charged', exactly as before the fix.
+  const dirPlainR12 = seenDirR12();
+  const urlPlainR12 = 'https://chatgpt.com/c/mock-r12-plain';
+  const hashPlainR12 = createHash('sha256').update('#215 gate r12 plain text').digest('hex');
+  const targetPlainR12 = recordPathR12(dirPlainR12, urlPlainR12, hashPlainR12);
+  seedExpiredR12(targetPlainR12);
+  const resultPlainR12 = buildClaimR12(dirPlainR12, fs).claim?.(urlPlainR12, hashPlainR12, new Set());
+  check("#215 gate r12 P2 planted negative: an uncontested expiry still re-arms the sighting ('charged') and leaves one fresh record",
+    resultPlainR12 === 'charged' && fs.readdirSync(dirPlainR12).filter((n) => !n.endsWith('.lockf')).length === 1
+      && Date.now() - fs.statSync(targetPlainR12).mtimeMs < 60_000,
+    `result=${resultPlainR12} entries=${JSON.stringify(fs.readdirSync(dirPlainR12))}`);
+  fs.rmSync(dirPlainR12, { recursive: true, force: true });
 }
 
 process.exit(failures === 0 ? 0 : 1);
