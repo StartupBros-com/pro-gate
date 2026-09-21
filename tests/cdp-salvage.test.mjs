@@ -5411,6 +5411,42 @@ for (const placeholder of PLACEHOLDER_URLS) {
     `dir=${JSON.stringify(fs.readdirSync(dirIiiR9))}`);
   fs.rmSync(dirIiiR9, { recursive: true, force: true });
 
+  // (iii-b) two reclaimers judging the same dead lock: the reclaim must be atomic (rename aside,
+  // then remove), so the one whose rename LOSES removes nothing and never re-creates the lock —
+  // it falls through to the wait loop against the winner's fresh lock and, when that stays held
+  // past the wait budget here, fails open. Simulated by an fs whose renameSync of a lock path
+  // throws ENOENT (the winner already moved it). Pre-fix the loser rmSync'd the path in place,
+  // which is exactly how it could delete a lock the winner had just re-created.
+  const dirIiibR9 = seenDirR9();
+  const urlIiibR9 = 'https://chatgpt.com/c/mock-r9-iii-b';
+  const hashIiibR9 = hashR9('iii-b');
+  const recordIiibR9 = recordPathR9(dirIiibR9, urlIiibR9, hashIiibR9);
+  const lockIiibR9 = `${recordIiibR9}.lock`;
+  fs.mkdirSync(lockIiibR9);
+  fs.utimesSync(lockIiibR9, staleAtR9, staleAtR9);
+  let loserRenamesR9 = 0;
+  const fsLoserR9 = {
+    ...fs,
+    renameSync: (from, to) => {
+      if (String(from).endsWith('.lock')) {
+        loserRenamesR9 += 1;
+        const err = new Error('ENOENT: simulated — another reclaimer renamed the dead lock aside first');
+        err.code = 'ENOENT';
+        throw err;
+      }
+      return fs.renameSync(from, to);
+    },
+  };
+  const resultIiibR9 = buildClaimR9(dirIiibR9, { fsImpl: fsLoserR9 }).claim?.(urlIiibR9, hashIiibR9, new Set());
+  const afterIiibR9 = fs.readdirSync(dirIiibR9);
+  check('#215 gate r9 P2 (iii-b) a reclaimer that loses the rename removes nothing: the lock it judged dead is still on disk',
+    loserRenamesR9 >= 1 && afterIiibR9.includes(path.basename(lockIiibR9)) && !afterIiibR9.some((n) => n.includes('.dead.')),
+    `renames=${loserRenamesR9} result=${resultIiibR9} dir=${JSON.stringify(afterIiibR9)}`);
+  check('#215 gate r9 P2 (iii-b) the losing reclaimer still charges exactly once through the fail-open path',
+    resultIiibR9 === 'charged' && fs.existsSync(recordIiibR9),
+    `result=${resultIiibR9} record=${fs.existsSync(recordIiibR9)}`);
+  fs.rmSync(dirIiibR9, { recursive: true, force: true });
+
   // (iv) lock dirs are never counted as records or temps, and an aged one is reaped by the prune
   // — cleanly (rmdirSync), never by the record/temp rename-aside path, which corrupts a directory
   // it cannot unlink (EISDIR) instead of removing it: pre-fix that leaves a `<name>.expire.<pid>`

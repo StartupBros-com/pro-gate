@@ -580,8 +580,19 @@ function withThrottleSeenLock(name, fn) {
       let stat;
       try { stat = fs.statSync(lockPath); } catch { stat = null; }
       if (stat && Date.now() - stat.mtimeMs > THROTTLE_SEEN_LOCK_STALE_MS && !throttleSeenLockOwnerAlive(lockPath)) {
-        try { fs.rmSync(lockPath, { recursive: true, force: true }); } catch {}
-        try { fs.mkdirSync(lockPath); acquired = true; claimOwnership(); } catch {}
+        // Reclaim ATOMICALLY: rename the dead lock aside first, so of two reclaimers that both
+        // judged the same dead lock only the one whose rename succeeds removes it and re-creates
+        // the lock; the loser's rename throws ENOENT and it falls through to the wait loop against
+        // the winner's fresh lock. Removing in place would let the loser delete a lock the winner
+        // had just re-created between the loser's liveness check and its removal (the #155 shape).
+        // The aside keeps the `.lock` suffix so the prune classifies it as a lock, never a record.
+        const aside = `${lockPath}.dead.${process.pid}.lock`;
+        let renamed = false;
+        try { fs.renameSync(lockPath, aside); renamed = true; } catch {}
+        if (renamed) {
+          try { fs.rmSync(aside, { recursive: true, force: true }); } catch {}
+          try { fs.mkdirSync(lockPath); acquired = true; claimOwnership(); } catch {}
+        }
       }
       if (!acquired) {
         // Atomics.wait on a private SharedArrayBuffer is the only synchronous sleep Node offers
@@ -709,7 +720,12 @@ function pruneThrottleSeen(protectedKeys = new Set()) {
     // leave the orphan behind forever).
     if (throttleSeenIsLock(name)) {
       if (expired && !throttleSeenLockOwnerAlive(recordPath)) {
-        try { fs.rmSync(recordPath, { recursive: true, force: true }); } catch {}
+        // Same atomic rename-aside as withThrottleSeenLock's reclaim: a reclaimer may have
+        // re-created a live lock at this path between the liveness check above and the removal.
+        const aside = `${recordPath}.dead.${process.pid}.lock`;
+        let renamed = false;
+        try { fs.renameSync(recordPath, aside); renamed = true; } catch {}
+        if (renamed) { try { fs.rmSync(aside, { recursive: true, force: true }); } catch {} }
       }
       continue;
     }
