@@ -554,10 +554,12 @@ that only exists once the release does:
 1. `auto-release.yml` pushes the tag; `release.yml` re-tests, packages and uploads
    checksummed assets, then leaves the release a **draft** and prints the repin tuple
    (plugin, version, sha, releaseId, releaseTag).
-2. Open that repin PR against `StartupBros-com/hov-marketplace` and merge it. The card is
-   updated by a reviewed PR and never by a push from CI — a standing credential able to
-   write the distribution manifest is the one whose compromise reaches every installed
-   client.
+2. Merge the repin PR against `StartupBros-com/hov-marketplace`. Its hourly **Repin
+   reconcile** workflow opens that PR once the draft's assets are complete; dispatch the
+   workflow with `only_plugin=pro-gate` instead of waiting for the tick, and merge once both
+   required checks pass. The card is updated by a reviewed PR and never by a push from CI —
+   a standing credential able to write the distribution manifest is the one whose
+   compromise reaches every installed client.
 3. Run the **Publish staged release** workflow (or `gh release edit vX.Y.Z --draft=false`).
    It re-reads the live card and refuses unless the card names exactly this release, so a
    mistimed run cannot publish something undistributed.
