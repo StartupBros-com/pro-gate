@@ -74,6 +74,8 @@ The engine-issued typed continuation chosen from normalized lifecycle, evidence,
 
 Whether successive charged rounds on one change are settling. The round governor scores each round by its open P0 plus P1 count and keeps a churn streak: the count of consecutive rounds that failed to shrink it. A streak of two is the convergence signal; it produces the typed stop `rounds-not-converging`, which is report-only and reversible by the operator via the stateless one-invocation `PRO_GATE_ROUNDS_CONTINUE=1` override, and it never alters the numeric round grant's own policy. Convergence is judged from the round history the engine writes, never from re-reading review text.
 
+A round whose findings are all below the blocking severities scores zero, exactly like a clean round, so a chain of such rounds never raises the streak and is never reported as non-converging; the governor bounds blocking-severity churn only.
+
 ### Input Policy
 
 The deployment-level rule that controls whether Pro-Gate supplies only the reviewed bundle or may request connector-capable delivery. It governs Pro-Gate's request surface, not permissions independently granted to the browser identity.
@@ -81,6 +83,18 @@ The deployment-level rule that controls whether Pro-Gate supplies only the revie
 ### Account Cooldown
 
 The engine-wide back-off that follows any proof that ChatGPT is rate-limiting the review account: the short interstitial page, the "Too many requests" modal painted over a live conversation, or a Cloudflare challenge. While it runs, no fresh review is submitted, reservation probes and organizer traffic stay off the account, harvest defers, and the Review Decision reports `account-cooldown-active` with the seconds remaining instead of a grant. A probe that finds a conversation under the modal reports `throttled`: the conversation exists, is not progressing, and is not evidence of absence.
+
+### Throttle Sighting
+
+An observation of a rate-limit surface, the "Too many requests" modal or the short interstitial, over a conversation tab during a salvage scan. A sighting is owned when the conversation under the surface carries this run's own marker, foreign when it provably carries another run's marker, and unowned otherwise.
+
+An owned sighting always re-arms the Account Cooldown, because it is this run's own positive proof that its conversation exists. An unowned sighting re-arms it only through its Seen Record. A sighting not proven foreign leaves the scan inconclusive rather than confirmed absent, so a rate limit never spends a recovery miss.
+
+### Seen Record
+
+The memory that an unowned Throttle Sighting with a given fingerprint, its conversation URL together with the surface's text, has already charged the Account Cooldown inside the current suppression horizon. While a fingerprint's record is live, further unowned sightings of it are ignored; when it expires, the next sighting charges once more and starts a new horizon, so a stale surface nobody closes re-arms the cooldown once per horizon rather than forever.
+
+A whole scan charges at most one cooldown, however many sightings it batches. Records are bounded by age and by count, but a record for a fingerprint the current scan is still observing is never evicted for capacity, only for age.
 
 ### Brief
 
@@ -98,3 +112,4 @@ The engine appends its own output contract after a brief, so a brief chooses the
 - Input Policy constrains evidence delivery before a Review Attempt can be submitted.
 - A Brief redirects what a Review Attempt asks; it never widens who may act on the answer.
 - An Account Cooldown pauses fresh spend and browser traffic; it neither releases a Reservation nor advances its miss count.
+- A Seen Record bounds how often an unowned Throttle Sighting can re-arm the Account Cooldown; an owned sighting always re-arms it.
