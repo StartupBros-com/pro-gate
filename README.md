@@ -250,7 +250,31 @@ oracle-review.sh --recover <PR|URL|marker> [--repo <dir>] [--out <file>] [--time
 oracle-review.sh --harvest <run-marker> --out <file>              # expert/degradation collection of an exit-9 run
 oracle-review.sh --status [<pr|url|marker>] [--json]              # expert diagnostics: read-only rediscovery,
                                                                   # machine-readable with --json
+oracle-review.sh --prepare-review-evidence <new-dir> --pr <url|number> [--repo <dir>]
+                                                                  # prepare PR proof; no review or charge
 ```
+
+For typed bundle/scoped decisions, prepare evidence with the runtime rather than deriving the PR
+base from the feature branch's upstream. `--prepare-review-evidence` writes `endpoint.patch` and
+`pr-evidence.json` into a **new** directory and prints their absolute paths as JSON. It checks GitHub
+metadata before and after fetching the PR patch, and requires local HEAD to match the PR head. A
+retarget, base-tip movement, or head change during preparation fails without submitting a review.
+The snapshot records the GitHub base **tip and ref**, not a locally inferred three-dot merge-base;
+the patch format is GitHub's PR patch (`gh pr diff --patch`). Shallow and fork checkouts need no local
+copy of the base commit when the canonical PR URL identifies the target repository.
+
+Pass the resulting files as `PRO_GATE_REVIEW_ENDPOINT_PATCH` and `PRO_GATE_REVIEW_PR_EVIDENCE`, with
+`--diff` naming the reviewed payload. Full-PR review normally uses `endpoint.patch` for that payload;
+scoped review retains its separate payload, filtering manifest, and prior-review confirmation.
+Keep those same inputs across query/effect. Advisory queries remain file-only; guarded effects check
+GitHub again before a charge or result-binding repair. A query is not a live GitHub freshness check:
+prepare current evidence again before the final merge-workflow handoff. Pro-gate never merges.
+
+Older full/scoped bindings remain readable for exact-attempt recovery, but lack authoritative PR
+metadata. At the same head they cannot grant current merge eligibility or automatically buy a
+replacement review. Do not rewrite those immutable records to bypass the stop. Custom typed callers
+must adopt the preparation command and both proof paths before upgrading; a raw patch alone now
+returns `prepare-matching-review-evidence` rather than claiming a proven PR relation.
 
 `--brief` replaces the built-in reviewer persona with a task body you supply, so a Pro slot can be
 spent on an analysis the engine does not otherwise ship — an architecture critique, a migration-risk

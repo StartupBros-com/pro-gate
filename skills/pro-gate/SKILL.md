@@ -69,6 +69,7 @@ QUERY_ARGS=(--review-decision --json --pr "$PR" --repo "$REPO" "${INPUT_ARGS[@]}
 # After prepare-matching-review-evidence, append the exact applicable proof inputs:
 # QUERY_ARGS+=(--diff "$REVIEWED_DIFF")
 # export PRO_GATE_REVIEW_ENDPOINT_PATCH="$RAW_ENDPOINT_PATCH"
+# export PRO_GATE_REVIEW_PR_EVIDENCE="$PR_EVIDENCE"
 # export PRO_GATE_REVIEW_FILTER_MANIFEST="$FILTER_MANIFEST"   # scoped delta only
 # QUERY_ARGS+=(--confirm "$PRIOR_REVIEW")                     # scoped delta only
 
@@ -86,6 +87,27 @@ jq -e --arg id "$CONTRACT_ID" --argjson version "$CONTRACT_VERSION" \
 Contract/corpus identity must match the promoted adapter. Any validation failure stops through the
 update path above. A saved decision is advisory, not authority.
 
+For `prepare-matching-review-evidence`, use the runtime's no-spend preparer rather than deriving
+PR base from the feature branch's upstream or assembling metadata independently:
+
+```bash
+EVIDENCE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/pro-gate-evidence.XXXXXX")"
+"$PG" --prepare-review-evidence "$EVIDENCE_ROOT/current" --pr "$PR" --repo "$REPO" \
+  > "$EVIDENCE_ROOT/paths.json" || exit 1
+RAW_ENDPOINT_PATCH="$EVIDENCE_ROOT/current/endpoint.patch"
+PR_EVIDENCE="$EVIDENCE_ROOT/current/pr-evidence.json"
+REVIEWED_DIFF="$RAW_ENDPOINT_PATCH" # full PR; scoped review keeps its separate payload and lineage
+export PRO_GATE_REVIEW_ENDPOINT_PATCH="$RAW_ENDPOINT_PATCH"
+export PRO_GATE_REVIEW_PR_EVIDENCE="$PR_EVIDENCE"
+QUERY_ARGS+=(--diff "$REVIEWED_DIFF")
+```
+
+Stop on preparation failure; do not continue with partial files. Preparation checks PR metadata
+before and after fetching the patch. The query reads only the prepared files; the guarded effect
+rechecks GitHub before charge. Keep both proof paths unchanged across query/effect and retain them
+for recovery. A same-head historical binding without authoritative PR metadata remains readable for
+recovery but cannot authorize a merge or an automatic replacement review; never rewrite that record.
+
 ## 3. Dispatch the closed action
 
 | Execution class | Action | Adapter behavior |
@@ -96,7 +118,7 @@ update path above. A saved decision is advisory, not authority.
 | `agent-task` | `fix-review-findings` | Verify normalized current findings, fix them, run applicable checks, then re-query at the changed head. |
 | `agent-task` | `prepare-matching-review-evidence` | Prepare the requested raw/reviewed evidence without changing code, append its proof inputs above, then re-query. |
 | `report-only` | `stop-without-new-review` | Report the normalized reason and preserve branch work; do not infer a retry. `account-cooldown-active` is the one stop a caller may wait out: ChatGPT is rate-limiting the account, `.facts.cooldown.seconds_remaining` says for how long, and only re-querying after at least that long can change the answer. `rounds-not-converging` fires when the open-P0/P1 trajectory (`.facts.governor.arrow`) has not shrunk for 2 consecutive re-reviews, in place of a new round grant or a fix dispatch — independent of round-policy mode. `PRO_GATE_ROUNDS_CONTINUE=1` lets one more round through anyway. |
-| `report-only` | `allow-existing-merge-workflow` | Re-query immediately before handing off to the existing merge workflow; pro-gate has no merge authority. |
+| `report-only` | `allow-existing-merge-workflow` | Prepare current PR evidence in a new directory and re-query with it immediately before handoff; a cached query is not a GitHub freshness check. Pro-gate has no merge authority. |
 | `named-product-choice` | `ask-named-product-choice` | Ask only the validated named outcomes and consequences supplied by the decision. |
 
 Every compatible safe runtime effect and agent task proceeds without routine confirmation. For a

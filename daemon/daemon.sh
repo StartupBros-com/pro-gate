@@ -166,7 +166,7 @@ daemon_run_review_worker(){ # saved run-granted-review decision-file
   # env-assignment prefix into the SAME recycled-format call as the rest of the argv would
   # re-prefix "PRO_GATE_REVIEW_ENDPOINT_PATCH=" onto later argv tokens too.
   local endpoint_prefix=""
-  [ -n "${DD_EVIDENCE_FILE:-}" ] && printf -v endpoint_prefix 'PRO_GATE_REVIEW_ENDPOINT_PATCH=%q ' "$DD_EVIDENCE_FILE"
+  [ -n "${DD_EVIDENCE_FILE:-}" ] && printf -v endpoint_prefix 'PRO_GATE_REVIEW_ENDPOINT_PATCH=%q PRO_GATE_REVIEW_PR_EVIDENCE=%q ' "$DD_EVIDENCE_FILE" "$DD_EVIDENCE_FILE.pr-evidence.json"
   printf -v command_text '%q ' "$DD_ENGINE" --review-decision --review-decision-effect "$decision" --pr "$DD_NUM" --repo "$DD_WORKTREE" ${DD_INPUT_ARGS[@]+"${DD_INPUT_ARGS[@]}"} ${DD_EVIDENCE_ARGS[@]+"${DD_EVIDENCE_ARGS[@]}"} --out "$DD_LOG.review" ${review_timeout[@]+"${review_timeout[@]}"}
   command_text="${endpoint_prefix}${command_text}"
   prompt="First action: execute this exact argv-quoted guarded runtime effect; it rechecks the saved review-decision/v1 before any charge or submission:
@@ -188,7 +188,7 @@ daemon_run_agent_task(){ # saved decision-file validated action
   # #184 finding 1 (round 6): see daemon_run_review_worker above for why the env-assignment prefix
   # is built via a separate printf call rather than folded into the recycled-format one.
   local reentry_prefix=""
-  [ -n "${DD_EVIDENCE_FILE:-}" ] && printf -v reentry_prefix 'PRO_GATE_REVIEW_ENDPOINT_PATCH=%q ' "$DD_EVIDENCE_FILE"
+  [ -n "${DD_EVIDENCE_FILE:-}" ] && printf -v reentry_prefix 'PRO_GATE_REVIEW_ENDPOINT_PATCH=%q PRO_GATE_REVIEW_PR_EVIDENCE=%q ' "$DD_EVIDENCE_FILE" "$DD_EVIDENCE_FILE.pr-evidence.json"
   printf -v reentry '%q ' "$DD_ENGINE" --review-decision --json --pr "$DD_NUM" --repo "$DD_WORKTREE" ${DD_INPUT_ARGS[@]+"${DD_INPUT_ARGS[@]}"} ${DD_EVIDENCE_ARGS[@]+"${DD_EVIDENCE_ARGS[@]}"}
   reentry="${reentry_prefix}${reentry}"
   prompt="Control-safe typed action: $action.
@@ -209,7 +209,7 @@ When a valid typed decision makes it safe, finish the existing headless auto-fix
 daemon_handle_review_worker_failure(){ # worker-rc; fresh typed decision decides whether wrapper failure budget waits
   local worker_rc="$1" fresh action
   fresh="$DD_LOG.decision-after-run.json"
-  if ! PRO_GATE_REVIEW_ENDPOINT_PATCH="${DD_EVIDENCE_FILE:-}" "$DD_ENGINE" --review-decision --json --pr "$DD_NUM" --repo "$DD_WORKTREE" ${DD_INPUT_ARGS[@]+"${DD_INPUT_ARGS[@]}"} ${DD_EVIDENCE_ARGS[@]+"${DD_EVIDENCE_ARGS[@]}"} >"$fresh" 2>>"$DD_LOG"; then
+  if ! PRO_GATE_REVIEW_PR_EVIDENCE="${DD_EVIDENCE_FILE:+$DD_EVIDENCE_FILE.pr-evidence.json}" PRO_GATE_REVIEW_ENDPOINT_PATCH="${DD_EVIDENCE_FILE:-}" "$DD_ENGINE" --review-decision --json --pr "$DD_NUM" --repo "$DD_WORKTREE" ${DD_INPUT_ARGS[@]+"${DD_INPUT_ARGS[@]}"} ${DD_EVIDENCE_ARGS[@]+"${DD_EVIDENCE_ARGS[@]}"} >"$fresh" 2>>"$DD_LOG"; then
     note_fail "$DD_NWO" "$DD_NUM" "$DD_SHA" "$DD_LOG" "runtime-selected review worker rc=$worker_rc; replacement query failed"
     return 1
   fi
@@ -246,7 +246,7 @@ daemon_dispatch_decision(){ # decision-file [redirect-depth]
       return $? ;;
     runtime-guarded-effect/collect-existing-result|runtime-guarded-effect/recover-existing-review)
       fresh="$DD_LOG.decision-effect-$depth.json"
-      if ! PRO_GATE_REVIEW_ENDPOINT_PATCH="${DD_EVIDENCE_FILE:-}" "$DD_ENGINE" --review-decision --review-decision-effect "$decision" --pr "$DD_NUM" --repo "$DD_WORKTREE" ${DD_INPUT_ARGS[@]+"${DD_INPUT_ARGS[@]}"} ${DD_EVIDENCE_ARGS[@]+"${DD_EVIDENCE_ARGS[@]}"} >"$fresh" 2>>"$DD_LOG"; then
+      if ! PRO_GATE_REVIEW_PR_EVIDENCE="${DD_EVIDENCE_FILE:+$DD_EVIDENCE_FILE.pr-evidence.json}" PRO_GATE_REVIEW_ENDPOINT_PATCH="${DD_EVIDENCE_FILE:-}" "$DD_ENGINE" --review-decision --review-decision-effect "$decision" --pr "$DD_NUM" --repo "$DD_WORKTREE" ${DD_INPUT_ARGS[@]+"${DD_INPUT_ARGS[@]}"} ${DD_EVIDENCE_ARGS[@]+"${DD_EVIDENCE_ARGS[@]}"} >"$fresh" 2>>"$DD_LOG"; then
         daemon_defer_decision "runtime effect recheck failed"
         return 2
       fi
@@ -592,8 +592,8 @@ already_done(){ grep -qF "$(printf '%s\t%s\t%s' "$1" "$2" "$3")" "$STATE"; }
 # a completion one.
 DAEMON_PROOF_CURRENT_HEAD="current-head-decision"
 DAEMON_PROOF_LEGACY_EVIDENCE="legacy-durable-evidence"
-daemon_mark_state_proven(){ # nwo num sha proof_tag [base_oid]
-  local nwo="$1" num="$2" sha="$3" proof="$4" base_oid="${5:-}"
+daemon_mark_state_proven(){ # nwo num sha proof_tag [base_oid] [base_ref]
+  local nwo="$1" num="$2" sha="$3" proof="$4" base_oid="${5:-}" base_ref="${6:-}"
   case "$proof" in
     "$DAEMON_PROOF_CURRENT_HEAD"|"$DAEMON_PROOF_LEGACY_EVIDENCE") : ;;
     *)
@@ -601,7 +601,7 @@ daemon_mark_state_proven(){ # nwo num sha proof_tag [base_oid]
       return 1
       ;;
   esac
-  printf '%s\t%s\t%s\t%s\n' "$nwo" "$num" "$sha" "$base_oid" >> "$STATE"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$nwo" "$num" "$sha" "$base_oid" "$base_ref" >> "$STATE"
 }
 # #184 finding 2 (round 8): looks up the base_oid recorded for a $STATE row, if any. Echoes empty
 # (and returns 1) when the row is missing entirely OR when it exists but recorded no base (a
@@ -640,9 +640,17 @@ daemon_invalidate_state(){ # nwo num sha
 #     observed mismatch.
 #   - a genuine mismatch invalidates the row (removes it from $STATE, not merely ignores it) so a
 #     real re-review can re-prove it cleanly and already_done stays a simple, honest membership test.
-daemon_head_still_complete(){ # nwo num sha current_base -> rc 0 = still valid, skip; rc 1 = not proven (never was, or just invalidated)
-  local nwo="$1" num="$2" sha="$3" base="$4" recorded
+daemon_head_still_complete(){ # nwo num sha current_base [base_ref] -> rc 0 = still valid, skip
+  local nwo="$1" num="$2" sha="$3" base="$4" base_ref="${5:-}" recorded recorded_ref
   already_done "$nwo" "$num" "$sha" || return 1
+  # A retarget can leave the OID unchanged. Older rows lack this identity and
+  # must be re-evaluated once the poll supplies it; input/result records stay immutable.
+  recorded_ref="$(awk -F'\t' -v nwo="$nwo" -v num="$num" -v sha="$sha" '$1==nwo && $2==num && $3==sha { print $5 }' "$STATE")"
+  if [ -n "$base_ref" ] && [ "$recorded_ref" != "$base_ref" ]; then
+    daemon_note "  · $nwo#$num @ ${sha:0:8} PR base ref changed or was not recorded — re-evaluating completion"
+    daemon_invalidate_state "$nwo" "$num" "$sha"
+    return 1
+  fi
   recorded="$(daemon_state_base "$nwo" "$num" "$sha")" || return 0
   [ -z "$recorded" ] && return 0
   [ -z "$base" ] && return 0
@@ -703,7 +711,7 @@ daemon_clear_ci_empty_block(){ # nwo num sha
   daemon_clear_block_reason "$1" "$2" "$3" "ci-empty-cap-exhausted" \
     "CI now resolved (settled, or repo configured as running no CI) — clearing its prior empty-rollup block (any agent-task block on this sha is untouched)"
 }
-mark_processed_heads(){ # nwo num reviewed-sha [base_oid]
+mark_processed_heads(){ # nwo num reviewed-sha [base_oid] [base_ref]
   # #184b: mark ONLY the SHA a valid typed decision proved was reviewed (daemon_decision_target_matches
   # already checked it against the decision's head_oid before dispatch). Do not also look up and mark
   # whatever SHA `gh pr view` reports now -- a worker self-push and an external push both produce a
@@ -715,12 +723,14 @@ mark_processed_heads(){ # nwo num reviewed-sha [base_oid]
   # same) can be detected by daemon_head_still_complete and this row invalidated, rather than reused
   # against an obsolete diff forever. See daemon_evidence_identity for the base being folded into the
   # persisted-evidence key too.
-  local nwo="$1" num="$2" sha="$3" base_oid="${4:-}"
-  daemon_mark_state_proven "$nwo" "$num" "$sha" "$DAEMON_PROOF_CURRENT_HEAD" "$base_oid"
+  local nwo="$1" num="$2" sha="$3" base_oid="${4:-}" base_ref="${5:-}"
+  daemon_mark_state_proven "$nwo" "$num" "$sha" "$DAEMON_PROOF_CURRENT_HEAD" "$base_oid" "$base_ref"
   # #184 finding 1 (round 6): once a head is durably completed it is never re-processed (already_done
   # short-circuits the main loop below), so its persisted evidence file will never be read again --
   # remove it now rather than waiting for a later push to prune it via daemon_prune_stale_evidence.
-  rm -f "$(daemon_evidence_file "$nwo" "$num" "$sha" "$base_oid")" 2>/dev/null
+  local evidence_file
+  evidence_file="$(daemon_evidence_file "$nwo" "$num" "$sha" "$base_oid")"
+  rm -f "$evidence_file" "$evidence_file.pr-evidence.json" 2>/dev/null
 }
 
 # #184 finding 1 (round 6): daemon_decision queries never supplied --diff/PRO_GATE_REVIEW_ENDPOINT_PATCH,
@@ -799,7 +809,7 @@ daemon_prune_stale_evidence(){ # nwo num keep_sha [base_oid]
   for f in "$REVIEW_EVIDENCE_DIR/$base-"*.diff; do
     [ -e "$f" ] || continue
     [ "$f" = "$keepfile" ] && continue
-    rm -f "$f" 2>/dev/null
+    rm -f "$f" "$f.pr-evidence.json" 2>/dev/null
   done
 }
 
@@ -823,7 +833,7 @@ daemon_sweep_orphaned_evidence(){ # active-keep-file (one absolute evidence path
     mtime="$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo "$now")"
     age=$(( now - mtime ))
     [ "$age" -ge "$EVIDENCE_ORPHAN_TTL" ] || continue
-    rm -f "$f" 2>/dev/null && daemon_note "  · pruning orphaned review evidence $(basename "$f") (untracked for ${age}s, no longer in the active PR set)"
+    rm -f "$f" "$f.pr-evidence.json" 2>/dev/null && daemon_note "  · pruning orphaned review evidence $(basename "$f") (untracked for ${age}s, no longer in the active PR set)"
   done
 }
 
@@ -833,24 +843,27 @@ daemon_sweep_orphaned_evidence(){ # active-keep-file (one absolute evidence path
 # decision query then runs WITHOUT --diff/PRO_GATE_REVIEW_ENDPOINT_PATCH, same as before this fix,
 # so a genuinely unreachable diff still degrades to the honest prepare-matching-review-evidence
 # answer instead of silently faking completion.
-daemon_prepare_review_evidence(){ # nwo num sha base_oid worktree log
-  local nwo="$1" num="$2" sha="$3" base_oid="$4" wt="$5" lg="$6" f tmp
+daemon_prepare_review_evidence(){ # nwo num sha base_oid worktree log [base_ref]
+  local nwo="$1" num="$2" sha="$3" base_oid="$4" wt="$5" lg="$6" base_ref="${7:-}" f tmp evidence
   f="$(daemon_evidence_file "$nwo" "$num" "$sha" "$base_oid")"
   daemon_prune_stale_evidence "$nwo" "$num" "$sha" "$base_oid"
-  if [ -s "$f" ]; then
+  if evidence="$(pg_pr_evidence_read "$f.pr-evidence.json" "$f" "$wt" "$DAEMON_HOST" "${nwo%%/*}" "${nwo#*/}" "$num" 2>>"$lg")" \
+     && jq -e --arg head "$sha" --arg base "$base_oid" --arg ref "$base_ref" \
+       '.metadata.target.head_oid==$head and ($base=="" or .metadata.target.base_oid==$base) and ($ref=="" or .metadata.target.base_ref==$ref)' <<<"$evidence" >/dev/null; then
     printf '%s' "$f"; return 0
   fi
-  tmp="$f.tmp.$$"
-  # #184 finding 4 (round 8, P2 SECURITY): explicit chmod 600, not just the process-wide `umask 077`
-  # set at the top of this file -- umask only governs newly created paths, so an upgrade over an
-  # already-running deploy (REVIEW_EVIDENCE_DIR created before this fix, under the old looser umask)
-  # would otherwise leave pre-existing files at their old mode forever, and this is the exact file
-  # class the finding named (persisted raw PR diffs -- private-repository source).
-  if ( cd "$wt" && gh pr diff "$num" --patch ) >"$tmp" 2>>"$lg" && [ -s "$tmp" ]; then
-    chmod 600 "$tmp" 2>/dev/null
-    mv -f "$tmp" "$f" 2>/dev/null && { chmod 600 "$f" 2>/dev/null; printf '%s' "$f"; return 0; }
+  tmp="$(mktemp -d "$REVIEW_EVIDENCE_DIR/.prepare.XXXXXX")" || return 1
+  if pg_prepare_pr_evidence "$wt" "$DAEMON_HOST" "${nwo%%/*}" "${nwo#*/}" "$num" "$tmp/evidence" >>"$lg" 2>&1 \
+     && jq -e --arg head "$sha" --arg base "$base_oid" --arg ref "$base_ref" \
+       '.metadata.target.head_oid==$head and ($base=="" or .metadata.target.base_oid==$base) and ($ref=="" or .metadata.target.base_ref==$ref)' "$tmp/evidence/pr-evidence.json" >/dev/null \
+     && mv -f "$tmp/evidence/endpoint.patch" "$f" \
+     && mv -f "$tmp/evidence/pr-evidence.json" "$f.pr-evidence.json"; then
+    chmod 600 "$f" "$f.pr-evidence.json"
+    rmdir "$tmp/evidence" "$tmp" 2>/dev/null || true
+    printf '%s' "$f"; return 0
   fi
-  rm -f "$tmp" 2>/dev/null
+  rm -f "$tmp/evidence/endpoint.patch" "$tmp/evidence/pr-evidence.json" 2>/dev/null
+  rmdir "$tmp/evidence" "$tmp" 2>/dev/null || true
   return 1
 }
 
@@ -1233,7 +1246,7 @@ process_pr(){
   # persisted-evidence keying and the completion-proof row so a later base change never reuses
   # evidence or a completion proof formed against an obsolete diff. See daemon_evidence_identity and
   # daemon_mark_state_proven.
-  local nwo="$1" num="$2" sha="$3" branch="$4" url="$5" base="${6:-}"
+  local nwo="$1" num="$2" sha="$3" branch="$4" url="$5" base="${6:-}" base_ref="${7:-}"
   local slug="${nwo//\//-}-${num}"
 
   # #184a: gate dispatch on the current head's CI state before doing ANY work for it (clone,
@@ -1294,13 +1307,13 @@ process_pr(){
   # honest degradation (the query then runs unevidenced, same as before this fix) rather than a
   # hard failure of process_pr.
   local evidence_file evidence_args=()
-  evidence_file="$(daemon_prepare_review_evidence "$nwo" "$num" "$sha" "$base" "$wt" "$lg")" || evidence_file=""
+  evidence_file="$(daemon_prepare_review_evidence "$nwo" "$num" "$sha" "$base" "$wt" "$lg" "$base_ref")" || evidence_file=""
   [ -n "$evidence_file" ] && evidence_args=(--diff "$evidence_file")
 
   # Resolve and validate the runtime's one action before any review worker can start. The decision
   # is advisory; the matching effect re-reduces under runtime protections at execution time.
   local decision="$lg.decision" engine="${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh"
-  if ! PRO_GATE_REVIEW_ENDPOINT_PATCH="$evidence_file" "$engine" --review-decision --json --pr "$num" --repo "$wt" ${DD_INPUT_ARGS[@]+"${DD_INPUT_ARGS[@]}"} ${evidence_args[@]+"${evidence_args[@]}"} >"$decision" 2>>"$lg" \
+  if ! PRO_GATE_REVIEW_PR_EVIDENCE="${evidence_file:+$evidence_file.pr-evidence.json}" PRO_GATE_REVIEW_ENDPOINT_PATCH="$evidence_file" "$engine" --review-decision --json --pr "$num" --repo "$wt" ${DD_INPUT_ARGS[@]+"${DD_INPUT_ARGS[@]}"} ${evidence_args[@]+"${evidence_args[@]}"} >"$decision" 2>>"$lg" \
       || ! daemon_decision_valid "$decision" || ! daemon_decision_target_matches "$decision" "$nwo" "$num" "$sha"; then
     git -C "$repodir" worktree remove --force "$wt" 2>/dev/null || true
     daemon_defer_decision "missing, malformed, stale, unknown, or corpus-mismatched envelope"
@@ -1361,7 +1374,7 @@ process_pr(){
         log "  · $nwo#$num @ ${sha:0:8} agent task rc=$rc (capability unavailable; nothing launched); not counted toward any cap, head stays retryable"
       fi
     elif [ "$terminal_completed" = 1 ] && [ "$rc" -eq 0 ]; then
-      mark_processed_heads "$nwo" "$num" "$sha" "$base"
+      mark_processed_heads "$nwo" "$num" "$sha" "$base" "$base_ref"
       log "  ✓ terminal decision completed $nwo#$num @ ${sha:0:8}"
     fi
     return "$rc"
@@ -1388,7 +1401,7 @@ process_pr(){
   # of process_pr -- $sha (and therefore the evidence file) is unchanged for the whole call, even
   # though the worker may have pushed a new (unreviewed) commit; see daemon_prepare_review_evidence.
   local redecision="$lg.redecision"
-  if PRO_GATE_REVIEW_ENDPOINT_PATCH="$evidence_file" "$engine" --review-decision --json --pr "$num" --repo "$wt" ${DD_INPUT_ARGS[@]+"${DD_INPUT_ARGS[@]}"} ${evidence_args[@]+"${evidence_args[@]}"} >"$redecision" 2>>"$lg" \
+  if PRO_GATE_REVIEW_PR_EVIDENCE="${evidence_file:+$evidence_file.pr-evidence.json}" PRO_GATE_REVIEW_ENDPOINT_PATCH="$evidence_file" "$engine" --review-decision --json --pr "$num" --repo "$wt" ${DD_INPUT_ARGS[@]+"${DD_INPUT_ARGS[@]}"} ${evidence_args[@]+"${evidence_args[@]}"} >"$redecision" 2>>"$lg" \
       && daemon_decision_valid "$redecision" \
       && daemon_decision_target_matches "$redecision" "$nwo" "$num" "$sha"; then
     if daemon_decision_completes_current_head "$redecision"; then
@@ -1396,7 +1409,7 @@ process_pr(){
       # Mark only the SHA this decision proved was reviewed (#184b). The worker may still push an
       # implementation after the runtime-selected review, but that produces an unreviewed head; the
       # runtime's own review-decision is the dedupe authority for it on the next cycle.
-      mark_processed_heads "$nwo" "$num" "$sha" "$base"
+      mark_processed_heads "$nwo" "$num" "$sha" "$base" "$base_ref"
       log "  ✓ runtime-selected review worker completed $nwo#$num @ ${sha:0:8} (re-resolved decision attests current-head completion)"
       return 0
     fi
@@ -1470,14 +1483,15 @@ while true; do
       # #184 finding 2 (round 8): baseRefOid is fetched every poll, right alongside the head, and
       # threaded into both the evidence key and the completion revalidation below -- a base-branch
       # advance or PR retarget is then observable the very next cycle, not only at proof time.
-      meta=$(gh pr view "$num" -R "$nwo" --json headRefOid,headRefName,baseRefOid 2>/dev/null)
+      meta=$(gh pr view "$num" -R "$nwo" --json headRefOid,headRefName,baseRefOid,baseRefName 2>/dev/null)
       sha=$(echo "$meta" | jq -r '.headRefOid // empty'); branch=$(echo "$meta" | jq -r '.headRefName // empty')
       base=$(echo "$meta" | jq -r '.baseRefOid // empty')
+      base_ref=$(echo "$meta" | jq -r '.baseRefName // empty')
       [ -z "$sha" ] && continue
       printf '%s\n' "$(daemon_evidence_file "$nwo" "$num" "$sha" "$base")" >> "$ACTIVE_EVIDENCE_KEEP" 2>/dev/null
-      daemon_head_still_complete "$nwo" "$num" "$sha" "$base" && continue
+      daemon_head_still_complete "$nwo" "$num" "$sha" "$base" "$base_ref" && continue
       found=1
-      process_pr "$nwo" "$num" "$sha" "$branch" "$url" "$base"
+      process_pr "$nwo" "$num" "$sha" "$branch" "$url" "$base" "$base_ref"
       [ -f "$PAUSE" ] || [ "$DECISION_DEFERRED" = 1 ] && break
     done < <(echo "$prs" | jq -r '.[] | [.repository.nameWithOwner, (.number|tostring), .url] | @tsv')
     [ "$DECISION_DEFERRED" = 1 ] && break

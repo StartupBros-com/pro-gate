@@ -128,7 +128,7 @@ pg_out_guard_acquire() {
 
 PR=""; REPO=""; DIFF_FILE=""; DIFF_IS_CALLER_SUPPLIED=0; INPUT=""; INPUT_SUPPLIED=0; OUT=""; TIMEOUT=""; EXTRA_GLOB=""; HARVEST_MARKER=""; HARVEST_REQUESTED=0; CONFIRM_FILE=""; BRIEF_FILE=""
 STATUS_REQUESTED=0; STATUS_QUERY=""; AS_JSON=0; RECOVER_REQUESTED=0; RECOVER_QUERY=""
-REVIEW_DECISION_REQUESTED=0; REVIEW_DECISION_EFFECT_FILE=""; REVIEW_CHOICE_SELECTION_FILE=""
+REVIEW_DECISION_REQUESTED=0; REVIEW_DECISION_EFFECT_FILE=""; REVIEW_CHOICE_SELECTION_FILE=""; PREPARE_EVIDENCE_DIR=""
 while [ $# -gt 0 ]; do
   # gate #91 P2 (:65): every flag below except --status takes a REQUIRED second argument via raw
   # "$2"/"${2:-}" + "shift 2". With no errexit, a flag left trailing (no operand) hit one of two
@@ -140,7 +140,7 @@ while [ $# -gt 0 ]; do
   # symptoms with a clean usage error. --status is excluded: its second argument is deliberately
   # optional (its own branch below already handles "missing").
   case "$1" in
-    --pr|--repo|--diff|--input|--out|--timeout|--extra-files|--confirm|--brief|--harvest|--recover|--review-decision-effect|--review-choice-selection)
+    --pr|--repo|--diff|--input|--out|--timeout|--extra-files|--confirm|--brief|--harvest|--recover|--review-decision-effect|--review-choice-selection|--prepare-review-evidence)
       [ $# -ge 2 ] || { echo "ERROR: $1 requires a value" >&2; exit 2; };;
   esac
   case "$1" in
@@ -158,6 +158,9 @@ while [ $# -gt 0 ]; do
     --review-decision) REVIEW_DECISION_REQUESTED=1; shift;;
     --review-decision-effect) REVIEW_DECISION_REQUESTED=1; REVIEW_DECISION_EFFECT_FILE="$2"; shift 2;;
     --review-choice-selection) REVIEW_CHOICE_SELECTION_FILE="$2"; shift 2;;
+    --prepare-review-evidence)
+      [ -n "$2" ] || { echo 'ERROR: --prepare-review-evidence requires a new output directory' >&2; exit 2; }
+      PREPARE_EVIDENCE_DIR="$2"; shift 2;;
     # --status takes an OPTIONAL query (a following --flag or nothing means "all state").
     --status) STATUS_REQUESTED=1
       case "${2:-}" in ''|--*) shift 1;; *) STATUS_QUERY="$2"; shift 2;; esac;;
@@ -165,6 +168,23 @@ while [ $# -gt 0 ]; do
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
+
+# Explicit preparation is a no-spend effect, separate from the file-only query.
+if [ -n "$PREPARE_EVIDENCE_DIR" ]; then
+  if [ -z "$PR" ] || [ "$REVIEW_DECISION_REQUESTED$STATUS_REQUESTED$RECOVER_REQUESTED$HARVEST_REQUESTED$INPUT_SUPPLIED$AS_JSON" != 000000 ] \
+     || [ -n "$OUT$DIFF_FILE$CONFIRM_FILE$BRIEF_FILE$EXTRA_GLOB$REVIEW_CHOICE_SELECTION_FILE$TIMEOUT" ]; then
+    echo 'ERROR: evidence preparation accepts only --pr, --repo and --prepare-review-evidence' >&2; exit 2
+  fi
+  REPO="${REPO:-$(pwd)}"
+  case "$PR" in
+    http*://*/pull/*) prep_target="${PR%/}"; prep_number="${prep_target##*/}" ;;
+    *) prep_target="$(git -C "$REPO" remote get-url origin)"; prep_number="$PR" ;;
+  esac
+  prep_identity="$(pg_repo_identity_from_url "$prep_target")" || { echo 'ERROR: cannot identify PR repository' >&2; exit 2; }
+  IFS=$'\t' read -r prep_host prep_owner prep_repo <<<"$prep_identity"
+  pg_prepare_pr_evidence "$REPO" "$prep_host" "$prep_owner" "$prep_repo" "$prep_number" "$PREPARE_EVIDENCE_DIR"
+  exit $?
+fi
 
 # Wait sizing (v0.41): one --timeout governs both the fresh oracle wait and every harvest pass.
 # The ledger (2026-08-17..09-05, clean outcomes, seconds after acquiring a slot) put the median
@@ -362,12 +382,20 @@ pg_review_decision_repair_result_binding() { # marker input-binding-json
 # Scoped review deliberately hashes its raw endpoint and reviewed payload independently.
 pg_review_decision_input_proof_current() { # binding repo pr host owner name head base
   local binding="$1" repo="$2" pr="$3" host="$4" owner="$5" name="$6" head="$7" base="$8"
-  local mode endpoint reviewed manifest confirmation raw_digest reviewed_digest manifest_digest confirmation_digest lineage
+  local mode endpoint reviewed manifest confirmation raw_digest reviewed_digest manifest_digest confirmation_digest lineage pr_evidence metadata_digest
   pg_review_input_binding_validate "$binding" "$(jq -r '.marker // ""' <<<"$binding" 2>/dev/null)" || return 1
   jq -e --arg h "$host" --arg o "$owner" --arg r "$name" --argjson p "$pr" --arg head "$head" \
     '.repository.host==$h and .repository.owner==$o and .repository.repo==$r and .target.pr==$p and .target.head_oid==$head' \
     <<<"$binding" >/dev/null 2>&1 || return 1
   mode="$(jq -r .evidence.mode <<<"$binding")"
+  case "$mode" in full-pr|scoped-delta)
+    pr_evidence="$(pg_pr_evidence_read "${PRO_GATE_REVIEW_PR_EVIDENCE:-}" "${PRO_GATE_REVIEW_ENDPOINT_PATCH:-}" \
+      "$repo" "$host" "$owner" "$name" "$pr")" || return 1
+    metadata_digest="$(pg_review_sha256_text "$(jq -cS .metadata <<<"$pr_evidence")")" || return 1
+    jq -e --arg digest "$metadata_digest" '.evidence.proof.pr_metadata_digest==$digest' <<<"$binding" >/dev/null || return 1
+    [ "$base" = "$(jq -r .metadata.target.base_oid <<<"$pr_evidence")" ] || return 1
+    ;;
+  esac
   reviewed="${REVIEW_DECISION_REVIEWED_DIFF_FILE:-${DIFF_FILE:-}}"
   case "$mode" in
     connector)
@@ -415,6 +443,12 @@ pg_review_decision_input_proof_current() { # binding repo pr host owner name hea
 pg_review_decision_prospective_input_binding() { # repo pr host owner name head base round-key
   local repo="$1" pr="$2" host="$3" owner="$4" name="$5" head="$6" base="$7" round_key="$8"
   local marker="pg-run-prospective-${round_key}" endpoint reviewed manifest confirmation raw_digest reviewed_digest manifest_digest confirmation_digest lineage binding
+  local pr_evidence="" metadata_digest=""
+  if [ "$INPUT" = bundle ] || [ "$INPUT" = both ]; then
+    pr_evidence="$(pg_pr_evidence_read "${PRO_GATE_REVIEW_PR_EVIDENCE:-}" "${PRO_GATE_REVIEW_ENDPOINT_PATCH:-}" \
+      "$repo" "$host" "$owner" "$name" "$pr")" || return 1
+    metadata_digest="$(pg_review_sha256_text "$(jq -cS .metadata <<<"$pr_evidence")")" || return 1
+  fi
   reviewed="${REVIEW_DECISION_REVIEWED_DIFF_FILE:-${DIFF_FILE:-}}"
   binding=""
   if { [ "$INPUT" = bundle ] || [ "$INPUT" = both ]; } && [ -n "${PRO_GATE_REVIEW_FILTER_MANIFEST:-}" ] && [ -n "${CONFIRM_FILE:-}" ]; then
@@ -442,6 +476,9 @@ pg_review_decision_prospective_input_binding() { # repo pr host owner name head 
   # relation, never a fallback when bundle proof is absent.
   if [ -z "$binding" ] && [ "$INPUT" = connector ]; then
     binding="$(jq -cnS --arg cd "$(pg_review_decision_contract_digest)" --arg marker "$marker" --arg host "$host" --arg owner "$owner" --arg repo "$name" --argjson pr "$pr" --arg head "$head" '{charged_spend_epoch:1,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("connector:"+$host+"/"+$owner+"/"+$repo+":"+$head),mode:"connector",proof:{commit_target:$head,endpoint_digest:null,raw_diff_digest:null,repository_target:($host+"/"+$owner+"/"+$repo)}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:$host,owner:$owner,repo:$repo},target:{head_oid:$head,kind:"pull-request",pr:$pr}}')"
+  fi
+  if [ -n "$binding" ] && [ -n "$metadata_digest" ]; then
+    binding="$(jq -cS --arg digest "$metadata_digest" '.evidence.proof.pr_metadata_digest=$digest' <<<"$binding")" || return 1
   fi
   [ -n "$binding" ] && pg_review_decision_input_proof_current "$binding" "$repo" "$pr" "$host" "$owner" "$name" "$head" "$base" || return 1
   printf '%s' "$binding"
@@ -485,6 +522,7 @@ pg_review_decision_cli() {
   local endpoint reviewed manifest confirmation endpoint_digest reviewed_digest manifest_digest confirmation_digest lineage mode ship_digest
   local reservation_marker="" reservation_state=none governor_granted=false cooldown_left=0 completed='[]' prior_candidates='[]' prior_review result artifact artifact_digest canonical
   local facts governor_facts decision effect_ok=false prospective exact_inputs='[]' choice_candidates='[]' choice_outcomes='[]' choice_selected="" choice_snapshot="" selection="" selection_supplied=false current_verdict=NONE current_canonical="" effect_input attempt_snapshot attempt_source parsed_verdict stored_verdict
+  local pr_evidence="" legacy_pr_identity=false
 
   pg_have jq || { echo 'ERROR: review-decision/v1 requires jq' >&2; return 2; }
   repo="${REPO:-$(pwd)}"
@@ -510,8 +548,9 @@ pg_review_decision_cli() {
   IFS=$'\t' read -r host owner repo_name <<< "$ident"
   head="$(git -C "$repo" rev-parse HEAD 2>/dev/null || true)"
   case "$head" in *[!0-9a-f]*|'') echo 'ERROR: review-decision cannot prove the current head' >&2; return 2;; esac
-  base="$(git -C "$repo" merge-base HEAD '@{upstream}' 2>/dev/null || git -C "$repo" rev-parse HEAD^ 2>/dev/null || true)"
-  case "$base" in *[!0-9a-f]*|'') base="";; esac
+  pr_evidence="$(pg_pr_evidence_read "${PRO_GATE_REVIEW_PR_EVIDENCE:-}" "${PRO_GATE_REVIEW_ENDPOINT_PATCH:-}" \
+    "$repo" "$host" "$owner" "$repo_name" "$pr_num" 2>/dev/null || true)"
+  base="$(jq -r '.metadata.target.base_oid // empty' <<<"$pr_evidence" 2>/dev/null || true)"
   if [ -n "$DIFF_FILE" ]; then
     [ -f "$DIFF_FILE" ] && [ ! -L "$DIFF_FILE" ] || { echo 'ERROR: review-decision diff must be a regular file' >&2; return 2; }
     raw_digest="$(pg_sha256 "$DIFF_FILE")"
@@ -552,6 +591,10 @@ pg_review_decision_cli() {
     jq -e --arg h "$host" --arg o "$owner" --arg r "$repo_name" --argjson p "$pr_num" --arg head "$head" \
       '.repository.host==$h and .repository.owner==$o and .repository.repo==$r and .target.pr==$p and .target.head_oid==$head' \
       <<<"$candidate" >/dev/null 2>&1 || continue
+    if jq -e '(.evidence.mode=="full-pr" or .evidence.mode=="scoped-delta") and
+      (.evidence.proof|has("pr_metadata_digest")|not)' <<<"$candidate" >/dev/null; then
+      legacy_pr_identity=true
+    fi
     candidate_relation="$(jq -cS '{repository,target,evidence}' <<<"$candidate")"
     exact=false
     if [ -n "$desired_relation" ] && [ "$candidate_relation" = "$desired_relation" ] \
@@ -658,6 +701,11 @@ pg_review_decision_cli() {
   if [ "$(jq 'length' <<<"$exact_inputs")" -gt 0 ]; then
     input_marker="$(jq -r 'sort_by(.binding.charged_spend_epoch,.marker) | last.marker' <<<"$exact_inputs")"
     input_record="$(jq -cS 'sort_by(.binding.charged_spend_epoch,.marker) | last.binding' <<<"$exact_inputs")"
+  elif [ "$legacy_pr_identity" = true ]; then
+    # A metadata correction is not permission to buy a second review of this head.
+    # Keep old records readable for recovery, but neither allow nor automatically
+    # respend against a relation whose PR base was never proven.
+    input_binding_valid=false
   fi
   [ -z "$input_record" ] || input_digest="$(pg_review_sha256_text "$input_record")"
   current_canonical="$(jq -r 'sort_by(.charged_spend_epoch,.canonical_identity) | last.canonical_identity // ""' <<<"$completed")"
@@ -769,7 +817,8 @@ pg_review_decision_cli() {
       effect_input="$(pg_review_input_binding_read "$effect_marker" 2>/dev/null || true)"
       if [ -n "$effect_input" ] \
          && [ "$(jq -cS '{repository,target,evidence}' <<<"$effect_input" 2>/dev/null || true)" = "$desired_relation" ] \
-         && pg_review_decision_input_proof_current "$effect_input" "$repo" "$pr_num" "$host" "$owner" "$repo_name" "$head" "$base"; then
+         && pg_review_decision_input_proof_current "$effect_input" "$repo" "$pr_num" "$host" "$owner" "$repo_name" "$head" "$base" \
+         && { [ "$(jq -r .evidence.mode <<<"$effect_input")" = connector ] || pg_pr_evidence_current "$pr_evidence"; }; then
         pg_review_decision_repair_result_binding "$effect_marker" "$effect_input" || true
       fi
     elif [ "$effect_ok" = true ] && [ "$(jq -r .action <<<"$decision")" = run-granted-review ]; then
@@ -2078,6 +2127,11 @@ pg_install_full_pr_input_binding() { # marker; only endpoint-fetched full PRs ga
       ;;
     *) return 0 ;;
   esac
+  if [ "$INPUT" = bundle ] || [ "$INPUT" = both ]; then
+    local metadata_digest
+    metadata_digest="$(pg_review_sha256_text "$(jq -cS .metadata <<<"$PG_FULL_PR_EVIDENCE")")" || return 1
+    binding="$(jq -cS --arg digest "$metadata_digest" '.evidence.proof.pr_metadata_digest=$digest' <<<"$binding")" || return 1
+  fi
   pg_review_input_binding_write "$marker" "$binding"
 }
 
@@ -2087,14 +2141,17 @@ pg_install_full_pr_input_binding() { # marker; only endpoint-fetched full PRs ga
 pg_fresh_dispatch_recheck() { # sets PG_FRESH_DECISION/PG_FRESH_ACTION
   local template="$REVIEW_DECISION_INPUT_TEMPLATE" marker="" state=none epoch=0 f rec m astate="" completed='[]' attempt_snapshot attempt_source
   local input_ok=false input_digest evidence identity head base active_marker="" reservation="" granted=false cooldown_left=0 facts governor_facts
-  local template_relation="" candidate="" candidate_relation="" artifact="" artifact_digest=""
+  local template_relation="" candidate="" candidate_relation="" artifact="" artifact_digest="" pr_evidence=""
   [ -n "$template" ] || return 1
   input_digest="$(pg_review_sha256_text "$template" 2>/dev/null || true)"
   head="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || true)"
-  base="$(git -C "$REPO" merge-base HEAD '@{upstream}' 2>/dev/null || git -C "$REPO" rev-parse HEAD^ 2>/dev/null || true)"
+  pr_evidence="$(pg_pr_evidence_read "${PRO_GATE_REVIEW_PR_EVIDENCE:-}" "${PRO_GATE_REVIEW_ENDPOINT_PATCH:-}" \
+    "$REPO" "$PG_META_HOST" "$PG_META_OWNER" "$PG_META_REPO" "$PR_NUM" 2>/dev/null || true)"
+  base="$(jq -r '.metadata.target.base_oid // empty' <<<"$pr_evidence" 2>/dev/null || true)"
   # Reassemble every evidence byte relation at each dispatch boundary. In particular, scoped
   # raw endpoint, reviewed payload, manifest, and confirmation remain four separate inputs.
-  if pg_review_decision_input_proof_current "$template" "$REPO" "$PR_NUM" "$PG_META_HOST" "$PG_META_OWNER" "$PG_META_REPO" "$head" "$base"; then
+  if pg_review_decision_input_proof_current "$template" "$REPO" "$PR_NUM" "$PG_META_HOST" "$PG_META_OWNER" "$PG_META_REPO" "$head" "$base" \
+     && { [ "$(jq -r .evidence.mode <<<"$template")" = connector ] || pg_pr_evidence_current "$pr_evidence"; }; then
     input_ok=true
     template_relation="$(jq -cS '{repository,target,evidence}' <<<"$template" 2>/dev/null || true)"
   fi
@@ -3155,28 +3212,27 @@ else
   ROUND_KEY="$(printf '%.120s%s-diff' "${REPO_SLUG}-${ROUND_BRANCH}" "${ROUND_SUM:+-$ROUND_SUM}" | tr -c 'A-Za-z0-9.\n-' '-')"
 fi
 
-if [ -z "$DIFF_FILE" ]; then
-  DIFF_FILE="$WORK/pr.diff"
-  gh pr diff "$PR_NUM" --patch > "$DIFF_FILE" 2>"$WORK/diff.err" || {
-    echo "ERROR: gh pr diff $PR_NUM failed in $REPO: $(cat "$WORK/diff.err")" >&2; pg_status failed "gh pr diff failed"; pg_finish 5; }
-fi
-
-# An engine-fetched endpoint patch is the only normal path that earns full-PR proof. A caller
-# patch may still be reviewed/recovered, but it is deliberately bare until scoped lineage is
-# independently assembled; filtering below never changes these retained raw endpoint bytes.
 PG_FULL_PR_PROVEN=0
-if [ "$DIFF_IS_CALLER_SUPPLIED" = 0 ] && [ -n "$PR_NUM" ] \
-   && [ -n "${PG_META_HOST:-}${PG_META_OWNER:-}${PG_META_REPO:-}" ] \
-   && [[ "$PR_NUM" =~ ^[0-9]+$ ]]; then
-  PG_FULL_PR_HEAD="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || true)"
-  PG_FULL_PR_BASE="$(git -C "$REPO" merge-base HEAD '@{upstream}' 2>/dev/null || git -C "$REPO" rev-parse HEAD^ 2>/dev/null || true)"
-  PG_FULL_PR_ENDPOINT_DIGEST="$(pg_sha256 "$DIFF_FILE")"
-  PG_FULL_PR_RAW_DIGEST="$PG_FULL_PR_ENDPOINT_DIGEST"
-  if [[ "$PG_FULL_PR_HEAD" =~ ^[0-9a-f]{40,64}$ ]] && [[ "$PG_FULL_PR_BASE" =~ ^[0-9a-f]{40,64}$ ]] \
-     && [[ "$PG_FULL_PR_ENDPOINT_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then
-    PG_FULL_PR_PROVEN=1
+PG_FULL_PR_EVIDENCE=""
+if [ -z "$DIFF_FILE" ]; then
+  if ! pg_prepare_pr_evidence "$REPO" "$PG_META_HOST" "$PG_META_OWNER" "$PG_META_REPO" "$PR_NUM" "$WORK/pr-evidence" \
+       > "$WORK/prepared-evidence.json"; then
+    pg_status failed "could not prepare stable PR evidence; no review submitted"
+    pg_finish 5
   fi
+  DIFF_FILE="$WORK/pr-evidence/endpoint.patch"
+  PG_FULL_PR_EVIDENCE="$(pg_pr_evidence_read "$WORK/pr-evidence/pr-evidence.json" "$DIFF_FILE" \
+    "$REPO" "$PG_META_HOST" "$PG_META_OWNER" "$PG_META_REPO" "$PR_NUM")" || {
+    pg_status failed "prepared PR evidence is invalid; no review submitted"; pg_finish 5;
+  }
+  PG_FULL_PR_HEAD="$(jq -r .metadata.target.head_oid <<<"$PG_FULL_PR_EVIDENCE")"
+  PG_FULL_PR_BASE="$(jq -r .metadata.target.base_oid <<<"$PG_FULL_PR_EVIDENCE")"
+  PG_FULL_PR_ENDPOINT_DIGEST="$(jq -r .endpoint_digest <<<"$PG_FULL_PR_EVIDENCE")"
+  PG_FULL_PR_RAW_DIGEST="$PG_FULL_PR_ENDPOINT_DIGEST"
+  PG_FULL_PR_PROVEN=1
 fi
+# Caller patches retain their existing non-full-PR path. Diff hygiene below never
+# changes the raw endpoint bytes whose metadata was observed on both sides of fetch.
 
 # --- diff hygiene: drop lockfiles/generated/vendored from the review payload so the Pro model
 # spends its (finite, disconnect-exposed) thinking window on real code, not lockfile churn. ---
@@ -3881,6 +3937,11 @@ fi
 # Slot acquisition is not submission authority. A completed/recoverable predecessor, moved
 # target/evidence, or governor change that arrived in the slot wait must win before charging.
 [ "${REVIEW_DECISION_EXECUTE:-0}" != 1 ] || pg_fresh_dispatch_require_run post-slot-pre-charge
+if [ "${PG_FULL_PR_PROVEN:-0}" = 1 ] && ! pg_pr_evidence_current "$PG_FULL_PR_EVIDENCE"; then
+  echo 'ERROR: prepared PR head/base is no longer current; no review submitted' >&2
+  pg_status failed "PR evidence changed before charge"
+  pg_finish 5
+fi
 
 # ledger-timing-split (R1/R3): the run leaves the queue HERE — a slot is held, not yet
 # generating. One site, hit exactly once per invocation (retries below reuse this same slot).
