@@ -269,6 +269,11 @@ Pass the resulting files as `PRO_GATE_REVIEW_ENDPOINT_PATCH` and `PRO_GATE_REVIE
 `--diff` naming the reviewed payload. Full-PR proof requires byte-identical endpoint and reviewed
 payloads; scoped review retains its separate payload, filtering manifest, and prior-review
 confirmation. Missing scoped inputs never turn a partial payload into full-PR authority.
+Proof-bound full/scoped runs retain those exact payload bytes through submission: automatic diff
+hygiene does not remove generated or lockfile changes after preparation. Consequently a classic
+`--pr` bundle review now includes the complete comparison. `PRO_GATE_DIFF_FILTER` still controls
+ordinary caller-patch and brief reviews, which do not earn full-PR proof. To narrow a bound review,
+provide explicit scoped evidence; the existing size limits apply to the payload actually sent.
 Keep those same inputs across query/effect. Advisory queries remain file-only; guarded effects check
 GitHub again before a charge or result-binding repair. A query is not a live GitHub freshness check:
 prepare current evidence again before the final merge-workflow handoff. Pro-gate never merges.

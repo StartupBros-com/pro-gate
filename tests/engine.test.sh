@@ -35,11 +35,17 @@ cat > "$TDIR/bin/oracle-preflight" <<'FAKE_PREFLIGHT'
 #!/usr/bin/env bash
 if [ -n "${PG_TEST_ORACLE_SENTINEL:-}" ]; then printf '%s\n' "$*" >> "$PG_TEST_ORACLE_SENTINEL"; fi
 if [ "${PG_TEST_ORACLE_COMPLETE:-0}" = 1 ]; then
-  prompt=""; output=""
+  prompt=""; output=""; captured=0
   while [ $# -gt 0 ]; do
     case "$1" in
       -p) prompt="$2"; shift 2 ;;
       --write-output) output="$2"; shift 2 ;;
+      --file)
+        if [ -n "${PG_TEST_PAYLOAD_CAPTURE:-}" ] && [ "$captured" = 0 ]; then
+          cp "$2" "$PG_TEST_PAYLOAD_CAPTURE" || exit 99
+          captured=1
+        fi
+        shift 2 ;;
       *) shift ;;
     esac
   done
@@ -405,13 +411,15 @@ run_pr_evidence_identity_tests() {
   git -C "$repo" config user.email 'fixture@example.invalid'
   printf 'base\n' > "$repo/proof.txt"
   printf 'base\n' > "$repo/other.txt"
-  git -C "$repo" add proof.txt other.txt && git -C "$repo" commit -qm base
+  printf '{"version":1}\n' > "$repo/package-lock.json"
+  git -C "$repo" add proof.txt other.txt package-lock.json && git -C "$repo" commit -qm base
   base="$(git -C "$repo" rev-parse HEAD)"
   git -C "$repo" checkout -qb feature
   printf 'intermediate\n' > "$repo/proof.txt"
   git -C "$repo" commit -qam intermediate
   printf 'reviewed\n' > "$repo/proof.txt"
   printf 'also needs review\n' > "$repo/other.txt"
+  printf '{"version":2}\n' > "$repo/package-lock.json"
   git -C "$repo" commit -qam reviewed
   head="$(git -C "$repo" rev-parse HEAD)"
   git -C "$repo" remote add origin https://github.com/acme/widgets.git
@@ -472,7 +480,7 @@ PR_EVIDENCE_GH
       PRO_GATE_BROWSER_MODE=native PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_EARLY_PROBE_SECS=0 \
       PRO_GATE_MAX_RETRIES=0 PRO_GATE_INPUT_POLICY=bundle-only PRO_GATE_TEST_MODE=ci-fixture \
       PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" \
-      PG_TEST_ORACLE_COMPLETE=1 PG_TEST_ORACLE_SENTINEL="$root/oracle-$tracking.calls" NODE_OPTIONS= \
+      PG_TEST_ORACLE_COMPLETE=1 PG_TEST_ORACLE_SENTINEL="$root/oracle-$tracking.calls" PG_TEST_PAYLOAD_CAPTURE="$root/payload-$tracking.diff" NODE_OPTIONS= \
       bash "$ENGINE" --pr https://github.com/acme/widgets/pull/221 --repo "$repo" --out "$home/review.md" --timeout 10s \
       > "$root/$tracking.out" 2> "$root/$tracking.err"
     rc=$?
@@ -482,6 +490,22 @@ PR_EVIDENCE_GH
       "$([ "$rc" -eq 0 ] && jq -e --arg base "$base" --arg head "$head" \
         '.evidence.mode=="full-pr" and .evidence.proof.base_oid==$base and .target.head_oid==$head' "$binding" >/dev/null; echo $?)" \
       "rc=$rc marker=$marker binding=$(cat "$binding" 2>/dev/null) stderr=$(tail -3 "$root/$tracking.err")"
+    check "classic $tracking full-PR binding describes the actual Oracle payload, including changed lockfiles" \
+      "$(cmp -s "$root/payload-$tracking.diff" "$root/endpoint.patch" && jq -e --arg actual "$(sha256sum "$root/payload-$tracking.diff" | cut -d' ' -f1)" '.evidence.proof.raw_patch_digest==$actual' "$binding" >/dev/null; echo $?)" \
+      "binding=$(cat "$binding" 2>/dev/null) delivered=$(cat "$root/payload-$tracking.diff")"
+  done
+
+  for change in 0 1; do
+    home="$root/caller-filter-$change-home"
+    PRO_GATE_DIFF_FILTER="$change" PG_TEST_PAYLOAD_CAPTURE="$root/caller-filter-$change.diff" \
+      pr_identity_engine --diff "$root/endpoint.patch" --out "$root/caller-filter-$change.md" --timeout 10s \
+      > "$root/caller-filter-$change.out" 2> "$root/caller-filter-$change.err"
+    rc=$?
+    marker="$(jq -r .marker "$root/caller-filter-$change.md.status")"
+    check "unbound caller-patch reviews retain PRO_GATE_DIFF_FILTER=$change without gaining full-PR proof" \
+      "$([ "$rc" -eq 0 ] && [ -s "$root/caller-filter-$change.diff" ] && jq -e '.evidence.mode=="caller-patch"' "$home/review-input-bindings/$marker" >/dev/null && \
+        { if [ "$change" = 0 ]; then cmp -s "$root/caller-filter-$change.diff" "$root/endpoint.patch"; else ! grep -qF 'b/package-lock.json' "$root/caller-filter-$change.diff"; fi; }; echo $?)" \
+      "rc=$rc stderr=$(tail -4 "$root/caller-filter-$change.err")"
   done
 
   home="$root/stale-endpoint-home"
@@ -568,7 +592,7 @@ PR_EVIDENCE_GH
   cp "$root/pr.stable.json" "$root/pr.json"
 
   PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
-    pr_identity_engine --review-decision-effect "$root/query.json" --diff "$prep/endpoint.patch" --out "$root/current.md" --timeout 10s \
+    PG_TEST_PAYLOAD_CAPTURE="$root/current-payload.diff" pr_identity_engine --review-decision-effect "$root/query.json" --diff "$prep/endpoint.patch" --out "$root/current.md" --timeout 10s \
     > "$root/current.out" 2> "$root/current.err"
   rc=$?
   marker="$(jq -r '.marker // empty' "$root/current.md.status" 2>/dev/null)"
@@ -577,6 +601,9 @@ PR_EVIDENCE_GH
       '.evidence.proof.base_oid==$base and .target.head_oid==$head and (.evidence.proof.pr_metadata_digest|test("^[0-9a-f]{64}$"))' \
       "$home/review-input-bindings/$marker" >/dev/null; echo $?)" \
     "rc=$rc marker=$marker stderr=$(tail -4 "$root/current.err")"
+  check 'typed full-PR effect sends the exact prepared payload instead of silently filtering it' \
+    "$(cmp -s "$root/current-payload.diff" "$prep/endpoint.patch"; echo $?)" \
+    "delivered=$(cat "$root/current-payload.diff")"
   PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
     pr_identity_engine --review-decision --json --diff "$prep/endpoint.patch" > "$root/completed.json" 2> "$root/completed.err"
   action="$(jq -r .action "$root/completed.json")"
@@ -627,9 +654,9 @@ PR_EVIDENCE_GH
   mv "$root/pr.next" "$root/pr.json"
 
   repo="$root/repo"; home="$root/scoped-home"
-  printf 'proof.txt\n' > "$root/scope.txt"
+  printf 'proof.txt\npackage-lock.json\n' > "$root/scope.txt"
   printf 'P0: none\nP1: none\nVERDICT: SHIP - prior review.\n' > "$root/confirmation.md"
-  git -C "$repo" diff "$base" "$head" -- proof.txt > "$root/reviewed-scope.patch"
+  git -C "$repo" diff "$base" "$head" -- proof.txt package-lock.json > "$root/reviewed-scope.patch"
   for change in manifest confirmation both; do
     home="$root/partial-$change-home"
     case "$change" in
@@ -660,7 +687,7 @@ PR_EVIDENCE_GH
     "$([ "$rc" -eq 0 ] && jq -e '.action=="run-granted-review"' "$root/scoped.json" >/dev/null; echo $?)" \
     "rc=$rc decision=$(cat "$root/scoped.json") stderr=$(cat "$root/scoped.err")"
   PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
-    PRO_GATE_REVIEW_FILTER_MANIFEST="$root/scope.txt" pr_identity_engine --review-decision-effect "$root/scoped.json" \
+    PRO_GATE_REVIEW_FILTER_MANIFEST="$root/scope.txt" PG_TEST_PAYLOAD_CAPTURE="$root/scoped-payload.diff" pr_identity_engine --review-decision-effect "$root/scoped.json" \
     --diff "$root/reviewed-scope.patch" --confirm "$root/confirmation.md" --out "$root/scoped.md" --timeout 10s \
     > "$root/scoped-effect.out" 2> "$root/scoped-effect.err"
   rc=$?
@@ -671,6 +698,9 @@ PR_EVIDENCE_GH
        .evidence.proof.raw_digest!=.evidence.proof.reviewed_payload_digest and
        (.evidence.proof.pr_metadata_digest|test("^[0-9a-f]{64}$"))' "$home/review-input-bindings/$marker" >/dev/null; echo $?)" \
     "rc=$rc marker=$marker stderr=$(tail -4 "$root/scoped-effect.err")"
+  check 'typed scoped effect sends its exact reviewed payload, including explicitly selected lockfiles' \
+    "$(cmp -s "$root/scoped-payload.diff" "$root/reviewed-scope.patch" && jq -e --arg actual "$(sha256sum "$root/scoped-payload.diff" | cut -d' ' -f1)" '.evidence.proof.reviewed_payload_digest==$actual' "$home/review-input-bindings/$marker" >/dev/null; echo $?)" \
+    "delivered=$(cat "$root/scoped-payload.diff")"
 
   # A legacy record remains readable but its missing PR metadata must not turn a
   # schema upgrade into an automatic replacement spend at the same code head.

@@ -3248,8 +3248,15 @@ if [ -s "$DIFF_FILE" ] && [ "${PRO_GATE_DIFF_FILTER:-1}" = 1 ]; then
     # (the "[: 0\n0: integer expression expected" noise on every run). Default only when empty.
     NEX="$(grep -c . "$WORK/excluded.txt" 2>/dev/null)"; [ -n "$NEX" ] || NEX=0
     if [ "$NEX" -gt 0 ] 2>/dev/null; then
-      echo "[oracle-review] diff hygiene: excluded ${NEX} noise file(s) from the payload: $(paste -sd', ' "$WORK/excluded.txt" 2>/dev/null | cut -c1-200)" >&2
-      DIFF_FILE="$FILTERED"
+      # Bound full/scoped evidence names the exact payload, not a pre-filter
+      # ancestor of it. Ordinary caller patches keep their configured hygiene.
+      if { [ "$PG_FULL_PR_PROVEN" = 1 ] && [ "$INPUT" != connector ]; } \
+         || jq -e '.evidence.mode | IN("full-pr","scoped-delta")' <<<"${REVIEW_DECISION_INPUT_TEMPLATE:-null}" >/dev/null 2>&1; then
+        echo "[oracle-review] diff hygiene: retaining ${NEX} noise file(s) to preserve proof-bound payload bytes; use explicit scoped evidence to narrow the review" >&2
+      else
+        echo "[oracle-review] diff hygiene: excluded ${NEX} noise file(s) from the payload: $(paste -sd', ' "$WORK/excluded.txt" 2>/dev/null | cut -c1-200)" >&2
+        DIFF_FILE="$FILTERED"
+      fi
     fi
   fi
 fi
