@@ -110,7 +110,7 @@ printf '#!/usr/bin/env bash\ncase " $* " in\n  *" --review-decision-effect "*|*"
 chmod +x "$ENGINE"
 
 # gh() answers the #184a CI-readiness query (statusCheckRollup) and, since round 6 (#184 finding
-# 1), the evidence-persistence fetch daemon_prepare_review_evidence makes (gh pr diff --patch).
+# 1), the immutable base/head comparison fetch daemon_prepare_review_evidence makes.
 # GH_DIFF_RC lets individual checks simulate a fetch failure (no evidence ever gets persisted,
 # reproducing the pre-fix daemon which never even tried). GH_DIFF_CALLS_FILE counts real fetch
 # attempts so a test can prove the fetch actually happened (not just that a cached file already
@@ -144,9 +144,10 @@ gh(){
         return 0 ;;
     esac
   fi
-  if [ "${1:-}" = pr ] && [ "${2:-}" = diff ]; then
+  if [ "${1:-}" = api ]; then
+    [ "$2" = "repos/${nwo:-$NWO}/compare/${base_oid:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}...${sha:-$SHA}" ] || return 1
     case " $* " in
-      *' --patch '*)
+      *' -H Accept:application/vnd.github.diff '*)
         printf 'x\n' >> "$GH_DIFF_CALLS_FILE"
         [ "${GH_DIFF_RC:-0}" -eq 0 ] && printf '%s\n' "$GH_DIFF"
         return "${GH_DIFF_RC:-0}" ;;
@@ -356,9 +357,10 @@ gh(){
         return 0 ;;
     esac
   fi
-  if [ "${1:-}" = pr ] && [ "${2:-}" = diff ]; then
+  if [ "${1:-}" = api ]; then
+    [ "$2" = "repos/${nwo:-$NWO}/compare/${base_oid:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}...${sha:-$SHA}" ] || return 1
     case " $* " in
-      *' --patch '*)
+      *' -H Accept:application/vnd.github.diff '*)
         printf 'x\n' >> "$GH_DIFF_CALLS_FILE"
         [ "${GH_DIFF_RC:-0}" -eq 0 ] && printf '%s\n' "$GH_DIFF"
         return "${GH_DIFF_RC:-0}" ;;

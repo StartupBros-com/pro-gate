@@ -257,15 +257,18 @@ oracle-review.sh --prepare-review-evidence <new-dir> --pr <url|number> [--repo <
 For typed bundle/scoped decisions, prepare evidence with the runtime rather than deriving the PR
 base from the feature branch's upstream. `--prepare-review-evidence` writes `endpoint.patch` and
 `pr-evidence.json` into a **new** directory and prints their absolute paths as JSON. It checks GitHub
-metadata before and after fetching the PR patch, and requires local HEAD to match the PR head. A
-retarget, base-tip movement, or head change during preparation fails without submitting a review.
-The snapshot records the GitHub base **tip and ref**, not a locally inferred three-dot merge-base;
-the patch format is GitHub's PR patch (`gh pr diff --patch`). Shallow and fork checkouts need no local
-copy of the base commit when the canonical PR URL identifies the target repository.
+metadata before and after fetching the comparison, and requires local HEAD to match the PR head.
+The diff is fetched from GitHub's compare API using the **exact base and head commit IDs**, not the
+mutable PR diff endpoint, which can lag a push even when PR metadata is already current. A retarget,
+base-tip movement, or head change during preparation fails without submitting a review. The snapshot
+records the GitHub base **tip and ref**, not a locally inferred merge-base; its format is
+`github-compare-diff`, addressed as `BASE_OID...HEAD_OID`. Shallow and fork checkouts need no local
+copy of the base commit when the PR URL identifies the target repository.
 
 Pass the resulting files as `PRO_GATE_REVIEW_ENDPOINT_PATCH` and `PRO_GATE_REVIEW_PR_EVIDENCE`, with
-`--diff` naming the reviewed payload. Full-PR review normally uses `endpoint.patch` for that payload;
-scoped review retains its separate payload, filtering manifest, and prior-review confirmation.
+`--diff` naming the reviewed payload. Full-PR proof requires byte-identical endpoint and reviewed
+payloads; scoped review retains its separate payload, filtering manifest, and prior-review
+confirmation. Missing scoped inputs never turn a partial payload into full-PR authority.
 Keep those same inputs across query/effect. Advisory queries remain file-only; guarded effects check
 GitHub again before a charge or result-binding repair. A query is not a live GitHub freshness check:
 prepare current evidence again before the final merge-workflow handoff. Pro-gate never merges.

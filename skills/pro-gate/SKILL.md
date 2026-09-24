@@ -103,7 +103,9 @@ QUERY_ARGS+=(--diff "$REVIEWED_DIFF")
 ```
 
 Stop on preparation failure; do not continue with partial files. Preparation checks PR metadata
-before and after fetching the patch. The query reads only the prepared files; the guarded effect
+before and after fetching a comparison addressed by immutable base/head commit IDs. Full-PR proof
+requires identical endpoint/reviewed bytes; a partial payload requires all scoped inputs and never
+falls back to full-PR authority. The query reads only the prepared files; the guarded effect
 rechecks GitHub before charge. Keep both proof paths unchanged across query/effect and retain them
 for recovery. A same-head historical binding without authoritative PR metadata remains readable for
 recovery but cannot authorize a merge or an automatic replacement review; never rewrite that record.

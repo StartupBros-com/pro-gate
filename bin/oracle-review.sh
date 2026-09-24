@@ -412,6 +412,9 @@ pg_review_decision_input_proof_current() { # binding repo pr host owner name hea
         && [ "$(wc -c < "$reviewed" 2>/dev/null | tr -d ' ')" -le 26214400 ] || return 1
       raw_digest="$(pg_sha256 "$reviewed" 2>/dev/null || true)"
       endpoint="$(pg_sha256 "$endpoint" 2>/dev/null || true)"
+      # Full-PR authority requires the full prepared payload. A partial payload
+      # needs its scoped manifest/confirmation; it cannot fall back to full-pr.
+      [ -n "$raw_digest" ] && [ "$raw_digest" = "$endpoint" ] || return 1
       jq -e --arg base "$base" --arg head "$head" --arg raw "$raw_digest" --arg endpoint "$endpoint" \
         '.evidence.proof.base_oid==$base and .evidence.proof.head_oid==$head and .evidence.proof.raw_patch_digest==$raw and .evidence.proof.endpoint_digest==$endpoint' \
         <<<"$binding" >/dev/null 2>&1 ;;

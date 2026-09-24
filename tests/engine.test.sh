@@ -404,26 +404,38 @@ run_pr_evidence_identity_tests() {
   git -C "$repo" config user.name 'Evidence fixture'
   git -C "$repo" config user.email 'fixture@example.invalid'
   printf 'base\n' > "$repo/proof.txt"
-  git -C "$repo" add proof.txt && git -C "$repo" commit -qm base
+  printf 'base\n' > "$repo/other.txt"
+  git -C "$repo" add proof.txt other.txt && git -C "$repo" commit -qm base
   base="$(git -C "$repo" rev-parse HEAD)"
   git -C "$repo" checkout -qb feature
   printf 'intermediate\n' > "$repo/proof.txt"
   git -C "$repo" commit -qam intermediate
   printf 'reviewed\n' > "$repo/proof.txt"
+  printf 'also needs review\n' > "$repo/other.txt"
   git -C "$repo" commit -qam reviewed
   head="$(git -C "$repo" rev-parse HEAD)"
   git -C "$repo" remote add origin https://github.com/acme/widgets.git
   git -C "$repo" update-ref refs/remotes/origin/main "$base"
   git -C "$repo" update-ref refs/remotes/origin/feature "$head"
   git -C "$repo" diff "$base" "$head" > "$root/endpoint.patch"
+  git -C "$repo" diff "$base" HEAD^ > "$root/stale-pr.patch"
   jq -cn --arg base "$base" --arg head "$head" \
     '{number:221,url:"https://github.com/acme/widgets/pull/221",state:"OPEN",baseRefName:"main",baseRefOid:$base,headRefOid:$head}' > "$root/pr.json"
   cat > "$root/user/.local/bin/gh" <<'PR_EVIDENCE_GH'
 #!/usr/bin/env bash
 [ -z "${PG_PR_TEST_GH_CALLS:-}" ] || printf '%s\n' "$*" >> "$PG_PR_TEST_GH_CALLS"
 case "$1 $2" in
-  'pr diff')
-    cat "$PG_PR_TEST_PATCH"
+  'pr diff'|'api repos/'*)
+    if [ "$1" = api ]; then
+      expected="repos/acme/widgets/compare/$(jq -r .baseRefOid "$PG_PR_TEST_METADATA")...$(jq -r .headRefOid "$PG_PR_TEST_METADATA")"
+      [ "$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')" = "$expected" ] || exit 99
+      case " $* " in *' --hostname github.com -H Accept:application/vnd.github.diff '*) ;; *) exit 99 ;; esac
+      cat "$PG_PR_TEST_PATCH"
+    elif [ "${PG_PR_TEST_STALE:-0}" = 1 ]; then
+      cat "$PG_PR_TEST_STALE_PATCH"
+    else
+      cat "$PG_PR_TEST_PATCH"
+    fi
     [ "${PG_PR_TEST_PATCH_FAIL:-0}" != 1 ] || exit 1
     if [ "${PG_PR_TEST_RETARGET:-0}" = 1 ]; then
       jq '.baseRefName="release"' "$PG_PR_TEST_METADATA" > "$PG_PR_TEST_METADATA.next"
@@ -442,13 +454,13 @@ PR_EVIDENCE_GH
   start_mock "$root/tab.txt"
   pr_identity_engine() {
     env HOME="$root/user" PATH="$root/user/.local/bin:$PATH" PRO_GATE_HOME="$home" \
-      PRO_GATE_GH_BIN="$root/user/.local/bin/gh" PG_PR_TEST_METADATA="$root/pr.json" PG_PR_TEST_PATCH="$root/endpoint.patch" \
+      PRO_GATE_GH_BIN="$root/user/.local/bin/gh" PG_PR_TEST_METADATA="$root/pr.json" PG_PR_TEST_PATCH="$root/endpoint.patch" PG_PR_TEST_STALE_PATCH="$root/stale-pr.patch" \
       PG_PR_TEST_GH_CALLS="$root/gh.calls" PRO_GATE_BROWSER_MODE=native PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 \
       PRO_GATE_EARLY_PROBE_SECS=0 PRO_GATE_MAX_RETRIES=0 PRO_GATE_INPUT_POLICY=bundle-only \
       PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 \
       PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_ORACLE_COMPLETE=1 \
       PG_TEST_ORACLE_SENTINEL="$home.oracle.calls" NODE_OPTIONS= \
-      bash "$ENGINE" --pr https://github.com/acme/widgets/pull/221 --repo "$repo" "$@"
+      bash "$ENGINE" --pr "${PG_PR_TEST_PR:-https://github.com/acme/widgets/pull/221}" --repo "$repo" "$@"
   }
   for tracking in main feature none; do
     if [ "$tracking" = none ]; then git -C "$repo" branch --unset-upstream feature
@@ -456,7 +468,7 @@ PR_EVIDENCE_GH
     home="$root/home-$tracking"
     mkdir -p "$home"
     env HOME="$root/user" PATH="$root/user/.local/bin:$PATH" PRO_GATE_HOME="$home" \
-      PRO_GATE_GH_BIN="$root/user/.local/bin/gh" PG_PR_TEST_METADATA="$root/pr.json" PG_PR_TEST_PATCH="$root/endpoint.patch" \
+      PRO_GATE_GH_BIN="$root/user/.local/bin/gh" PG_PR_TEST_METADATA="$root/pr.json" PG_PR_TEST_PATCH="$root/endpoint.patch" PG_PR_TEST_STALE_PATCH="$root/stale-pr.patch" \
       PRO_GATE_BROWSER_MODE=native PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_EARLY_PROBE_SECS=0 \
       PRO_GATE_MAX_RETRIES=0 PRO_GATE_INPUT_POLICY=bundle-only PRO_GATE_TEST_MODE=ci-fixture \
       PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" \
@@ -471,6 +483,31 @@ PR_EVIDENCE_GH
         '.evidence.mode=="full-pr" and .evidence.proof.base_oid==$base and .target.head_oid==$head' "$binding" >/dev/null; echo $?)" \
       "rc=$rc marker=$marker binding=$(cat "$binding" 2>/dev/null) stderr=$(tail -3 "$root/$tracking.err")"
   done
+
+  home="$root/stale-endpoint-home"
+  PG_PR_TEST_STALE=1 pr_identity_engine --prepare-review-evidence "$root/stale-endpoint-proof" \
+    > "$root/stale-endpoint.out" 2> "$root/stale-endpoint.err"
+  rc=$?
+  check 'stable new-head metadata with a lagging PR diff still prepares the exact current comparison bytes' \
+    "$([ "$rc" -eq 0 ] && cmp -s "$root/stale-endpoint-proof/endpoint.patch" "$root/endpoint.patch" && \
+      [ ! -e "$home" ] && [ ! -e "$home.oracle.calls" ]; echo $?)" \
+    "rc=$rc stderr=$(cat "$root/stale-endpoint.err")"
+
+  home="$root/case-alias-home"
+  PG_PR_TEST_PR=https://github.com/ACME/Widgets/pull/221 pr_identity_engine --prepare-review-evidence "$root/case-url-proof" \
+    > "$root/case-url.out" 2> "$root/case-url.err"
+  rc=$?
+  check 'a case-insensitive PR URL alias is accepted without renaming the caller binding identity' \
+    "$([ "$rc" -eq 0 ] && jq -e '.metadata.repository.owner=="ACME" and .metadata.repository.repo=="Widgets"' "$root/case-url-proof/pr-evidence.json" >/dev/null; echo $?)" \
+    "rc=$rc stderr=$(cat "$root/case-url.err")"
+  git -C "$repo" remote set-url origin https://github.com/ACME/Widgets.git
+  PG_PR_TEST_PR=221 pr_identity_engine --prepare-review-evidence "$root/case-origin-proof" \
+    > "$root/case-origin.out" 2> "$root/case-origin.err"
+  rc=$?
+  check 'a case-insensitive origin alias is accepted for a numeric PR target' \
+    "$([ "$rc" -eq 0 ] && cmp -s "$root/case-origin-proof/endpoint.patch" "$root/endpoint.patch"; echo $?)" \
+    "rc=$rc stderr=$(cat "$root/case-origin.err")"
+  git -C "$repo" remote set-url origin https://github.com/acme/widgets.git
 
   home="$root/partial-fetch-home"
   PG_PR_TEST_PATCH_FAIL=1 pr_identity_engine --out "$root/partial-fetch.md" --timeout 10s \
@@ -592,8 +629,29 @@ PR_EVIDENCE_GH
   repo="$root/repo"; home="$root/scoped-home"
   printf 'proof.txt\n' > "$root/scope.txt"
   printf 'P0: none\nP1: none\nVERDICT: SHIP - prior review.\n' > "$root/confirmation.md"
-  cp "$prep/endpoint.patch" "$root/reviewed-scope.patch"
-  printf '\n' >> "$root/reviewed-scope.patch"
+  git -C "$repo" diff "$base" "$head" -- proof.txt > "$root/reviewed-scope.patch"
+  for change in manifest confirmation both; do
+    home="$root/partial-$change-home"
+    case "$change" in
+      manifest)
+        PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+          pr_identity_engine --review-decision --json --diff "$root/reviewed-scope.patch" --confirm "$root/confirmation.md" \
+          > "$root/partial-$change.json" 2> "$root/partial-$change.err" ;;
+      confirmation)
+        PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$root/scope.txt" \
+          pr_identity_engine --review-decision --json --diff "$root/reviewed-scope.patch" \
+          > "$root/partial-$change.json" 2> "$root/partial-$change.err" ;;
+      both)
+        PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+          pr_identity_engine --review-decision --json --diff "$root/reviewed-scope.patch" \
+          > "$root/partial-$change.json" 2> "$root/partial-$change.err" ;;
+    esac
+    rc=$?
+    check "partial payload missing $change cannot fall back to full-PR review authority" \
+      "$([ "$rc" -eq 0 ] && jq -e '.action=="prepare-matching-review-evidence"' "$root/partial-$change.json" >/dev/null && [ ! -e "$home" ]; echo $?)" \
+      "rc=$rc decision=$(cat "$root/partial-$change.json") stderr=$(cat "$root/partial-$change.err")"
+  done
+  home="$root/scoped-home"
   PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
     PRO_GATE_REVIEW_FILTER_MANIFEST="$root/scope.txt" pr_identity_engine --review-decision --json \
     --diff "$root/reviewed-scope.patch" --confirm "$root/confirmation.md" > "$root/scoped.json" 2> "$root/scoped.err"
@@ -891,7 +949,8 @@ mkdir -p "$TDIR/user/.local/bin"
 cat > "$TDIR/user/.local/bin/gh" <<'CONN150_GH'
 #!/usr/bin/env bash
 case "$1 $2" in
-  "pr diff") printf 'diff --git a/f.txt b/f.txt\nindex aaaaaaa..bbbbbbb 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-base\n+head\n' ;;
+  "api repos/acme/conn150/compare/$PG_TEST_CONN150_BASE...$PG_TEST_CONN150_HEAD")
+    printf 'diff --git a/f.txt b/f.txt\nindex aaaaaaa..bbbbbbb 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-base\n+head\n' ;;
   "pr view")
     # gate r1 P1 (#161): the caller-patch installer now fetches the PR's real head via
     # `gh pr view ... --json headRefOid` instead of trusting local git state -- respond to that
@@ -6246,7 +6305,7 @@ fixture_pr_evidence() { # endpoint repo-name pr base head -> metadata digest
   metadata="$(jq -cnS --arg name "$name" --argjson pr "$pr" --arg base "$base" --arg head "$head" \
     '{repository:{host:"github.com",owner:"acme",repo:$name},target:{pr:$pr,base_ref:"main",base_oid:$base,head_oid:$head}}')"
   jq -cnS --argjson metadata "$metadata" --arg digest "$(pg_sha256 "$endpoint")" \
-    '{record_type:"review-pr-evidence/v1",record_version:1,patch_format:"github-pr-patch",metadata:$metadata,endpoint_digest:$digest}' \
+    '{record_type:"review-pr-evidence/v1",record_version:1,patch_format:"github-compare-diff",metadata:$metadata,endpoint_digest:$digest}' \
     > "$endpoint.pr-evidence.json"
   jq -cnS --argjson m "$metadata" \
     '{number:$m.target.pr,url:("https://github.com/acme/"+$m.repository.repo+"/pull/"+($m.target.pr|tostring)),state:"OPEN",baseRefName:$m.target.base_ref,baseRefOid:$m.target.base_oid,headRefOid:$m.target.head_oid}' \
@@ -8400,6 +8459,7 @@ check 'old-head completed bytes do not suppress the current fresh dispatch' \
 
 fresh_reset_state
 printf 'changed endpoint evidence\n' >> "$TDIR/fresh-endpoint.patch"
+cp "$TDIR/fresh-endpoint.patch" "$TDIR/fresh-effect.patch"
 fixture_pr_evidence "$TDIR/fresh-endpoint.patch" fresh 77 "$FRESH_BASE" "$FRESH_HEAD" >/dev/null
 FRESH_ADVISORY="$(fresh_query)"; printf '%s\n' "$FRESH_ADVISORY" > "$TDIR/fresh-advisory.json"
 mkdir -p "$FRESH_HOME/completed"

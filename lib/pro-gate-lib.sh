@@ -899,7 +899,7 @@ pg_pr_metadata_fetch() { # host owner repo pr -> canonical identity, bounded and
   [ "${#raw}" -le 65536 ] || return 1
   metadata="$(jq -ceS --arg host "$host" --arg owner "$owner" --arg repo "$repo" --argjson pr "$pr" '
     select(.number==$pr and .state=="OPEN" and
-      .url==("https://"+$host+"/"+$owner+"/"+$repo+"/pull/"+($pr|tostring))) |
+      (.url|ascii_downcase)==(("https://"+$host+"/"+$owner+"/"+$repo+"/pull/"+($pr|tostring))|ascii_downcase)) |
     {repository:{host:$host,owner:$owner,repo:$repo},
      target:{pr:$pr,base_ref:.baseRefName,base_oid:.baseRefOid,head_oid:.headRefOid}}
   ' <<<"$raw")" || return 1
@@ -915,7 +915,7 @@ pg_pr_evidence_read() { # snapshot endpoint repo host owner name pr -> validated
   evidence="$(jq -ceS '
     select(keys==["endpoint_digest","metadata","patch_format","record_type","record_version"] and
       .record_type=="review-pr-evidence/v1" and .record_version==1 and
-      .patch_format=="github-pr-patch" and
+      .patch_format=="github-compare-diff" and
       (.endpoint_digest|type=="string" and test("^[0-9a-f]{64}$")))
   ' "$file")" || return 1
   metadata="$(jq -cS .metadata <<<"$evidence")" || return 1
@@ -938,7 +938,7 @@ pg_pr_evidence_current() { # validated snapshot -> authoritative pre-effect chec
 
 pg_prepare_pr_evidence() ( # repo host owner name pr new-output-directory
   set -euo pipefail
-  local repo="$1" host="$2" owner="$3" name="$4" pr="$5" dest="$6" before after head tmp digest
+  local repo="$1" host="$2" owner="$3" name="$4" pr="$5" dest="$6" before after base head tmp digest
   local gh_bin="${PRO_GATE_GH_BIN:-gh}" timeout_bin="${PRO_GATE_TIMEOUT_BIN:-timeout}"
   [ ! -e "$dest" ] && [ ! -L "$dest" ] || { echo 'ERROR: evidence output directory must be new' >&2; exit 2; }
   # Callers use this helper in conditionals, where Bash suppresses errexit even
@@ -954,7 +954,11 @@ pg_prepare_pr_evidence() ( # repo host owner name pr new-output-directory
   tmp="$(mktemp -d "${dest}.prepare.XXXXXX")" || exit 2
   trap 'rm -f "$tmp/endpoint.patch" "$tmp/pr-evidence.json"; rmdir "$tmp" 2>/dev/null || true' EXIT
   chmod 700 "$tmp" || exit 2
-  "$timeout_bin" -k 1s 30s "$gh_bin" pr diff "$pr" --repo "$host/$owner/$name" --patch > "$tmp/endpoint.patch" || {
+  # The mutable PR diff endpoint can lag a push while PR metadata is already
+  # current. Address the comparison by immutable commit IDs instead (#221).
+  base="$(jq -r .target.base_oid <<<"$before")" || exit 2
+  "$timeout_bin" -k 1s 30s "$gh_bin" api "repos/$owner/$name/compare/$base...$head" \
+    --hostname "$host" -H 'Accept:application/vnd.github.diff' > "$tmp/endpoint.patch" || {
     echo 'ERROR: PR patch fetch failed; no review submitted' >&2; exit 2;
   }
   [ -s "$tmp/endpoint.patch" ] && [ "$(wc -c < "$tmp/endpoint.patch")" -le 26214400 ] || {
@@ -966,7 +970,7 @@ pg_prepare_pr_evidence() ( # repo host owner name pr new-output-directory
   }
   digest="$(pg_sha256 "$tmp/endpoint.patch")" || exit 2
   jq -cnS --argjson metadata "$before" --arg digest "$digest" \
-    '{record_type:"review-pr-evidence/v1",record_version:1,patch_format:"github-pr-patch",metadata:$metadata,endpoint_digest:$digest}' \
+    '{record_type:"review-pr-evidence/v1",record_version:1,patch_format:"github-compare-diff",metadata:$metadata,endpoint_digest:$digest}' \
     > "$tmp/pr-evidence.json" || exit 2
   chmod 600 "$tmp/endpoint.patch" "$tmp/pr-evidence.json" || exit 2
   # mkdir owns publication; a concurrent preparer cannot overwrite a completed pair.

@@ -93,8 +93,8 @@ Dispatch all eight closed actions:
   caller's coding agent; this relay does not edit.
 - `agent-task` / `prepare-matching-review-evidence`: return the requested proof shape to the caller.
   The caller uses `"$PG" --prepare-review-evidence <new-directory> --pr "$PR" --repo "$REPO"`,
-  which writes `endpoint.patch` and `pr-evidence.json` after stable GitHub metadata checks, without
-  charging or submitting. Re-query with the endpoint as `--diff`/`PRO_GATE_REVIEW_ENDPOINT_PATCH`
+  which writes `endpoint.patch` and `pr-evidence.json` from an immutable base/head-addressed GitHub
+  comparison with stable metadata checks, without charging or submitting. Re-query with the endpoint as `--diff`/`PRO_GATE_REVIEW_ENDPOINT_PATCH`
   and the snapshot as `PRO_GATE_REVIEW_PR_EVIDENCE`; scoped evidence keeps its separate payload,
   manifest and confirmation. Never infer PR base from the feature upstream, continue after failed
   preparation, or rewrite a historical binding to make it current.
