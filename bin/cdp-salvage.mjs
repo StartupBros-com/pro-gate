@@ -1027,8 +1027,66 @@ async function tabThrottleModal(tab) {
   return result.ok && typeof result.value === 'string' && THROTTLE_RE.test(result.value) ? result.value : null;
 }
 
+// Native fetch has no deadline of its own, so every CDP request carries one (#224; the scratch
+// render and organizer scratch came first). The deadline covers the part that can genuinely hang
+// forever: waiting for headers from a peer that accepted the connection and never answers (the
+// hangScratch*/hangOuterList/hangClose fixtures). Body consumption is a TWO-STAGE bound instead of
+// sharing that same signal to its end: once headers land, the response — and any CDP target it
+// names — is real, already-created server-side state, so a deadline landing mid-JSON-parse must
+// not lose the only reference to it. Headers-received swaps the caller's (possibly near-zero)
+// remaining budget for a small independent grace window to let `consume` finish.
+// These sit above the first top-level mode block (--sweep-root) because it runs during module
+// evaluation, before any const declared further down is initialized.
+const CONSUME_GRACE_MS = 2_000;
+// Requests that deliberately run AFTER the invocation deadline cannot inherit it: cleanup closes
+// (a stranded tab does the most damage exactly when the budget is spent), the organizer's re-lists
+// inside the engine's post-scan mutation windows (oracle-review.sh helper_min_s), and the exit-3
+// revalidation. Each gets a small fixed budget of its own, so it still runs but cannot hang.
+const CLOSE_REQUEST_MS = 2_000;
+const LATE_LIST_MS = 5_000;
+async function fetchBeforeDeadline(url, options, requestDeadline, consume = null) {
+  const remaining = requestDeadline - Date.now();
+  if (remaining <= 0) throw new Error('caller-deadline-expired');
+  const controller = new AbortController();
+  let timeout = setTimeout(() => controller.abort(), remaining);
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    if (!consume) return response;
+    // Headers arrived: replace the caller's-deadline timer with the fixed grace window so a
+    // slow-but-arriving body still completes and callers can capture the target it names.
+    clearTimeout(timeout);
+    timeout = setTimeout(() => controller.abort(), CONSUME_GRACE_MS);
+    return await consume(response);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchJsonBeforeDeadline(url, options, requestDeadline) {
+  return await fetchBeforeDeadline(url, options, requestDeadline, async (response) => (
+    // Parse only a successful body. A pre-v111 Chrome answering PUT /json/new (or any other
+    // non-2xx CDP response) with a plain-text or empty error body used to get parsed
+    // unconditionally here, so response.json() threw before the caller ever got to inspect
+    // response.ok — turning the documented PUT-to-GET fallback into an immediate
+    // scratch-open-failed/memo-open-failed instead. Callers branch on response.ok themselves;
+    // handing them value: null on failure keeps that branch reachable without a parse throw.
+    response.ok ? { response, value: await response.json() } : { response, value: null }
+  ));
+}
+
+// One bounded CDP target listing. A non-2xx or non-array body is a FAILED listing, thrown so each
+// caller keeps its own inconclusive handling; it is never an empty (confirmed-absent) one.
+async function listTargets(requestDeadline) {
+  const { value } = await fetchJsonBeforeDeadline(`http://127.0.0.1:${port}/json`, {}, requestDeadline);
+  if (!Array.isArray(value)) throw new Error('cdp-list-failed');
+  return value;
+}
+
+// True only when Chrome confirmed the close; an unanswered or failed close is never reported closed.
 async function closeTab(id) {
-  try { return (await fetch(`http://127.0.0.1:${port}/json/close/${id}`)).ok; } catch { return false; }
+  try {
+    return (await fetchBeforeDeadline(`http://127.0.0.1:${port}/json/close/${id}`, {}, Date.now() + CLOSE_REQUEST_MS)).ok;
+  } catch { return false; }
 }
 
 // --sweep-root: close idle chatgpt.com ROOT tabs (no /c/ path). A run killed before it submits
@@ -1040,7 +1098,7 @@ async function closeTab(id) {
 if (sweepRoot) {
   let tabs = [];
   try {
-    tabs = (await (await fetch(`http://127.0.0.1:${port}/json`)).json()).filter((t) => t.type === 'page');
+    tabs = (await listTargets(deadline)).filter((t) => t.type === 'page');
   } catch { process.exit(0); }
   const isRoot = (t) => /^https:\/\/chatgpt\.com\/?(\?.*)?$/.test(t.url || '');
   const roots = tabs.filter(isRoot);
@@ -1048,7 +1106,7 @@ if (sweepRoot) {
   // Keep one tab alive when root tabs are all Chrome has left.
   const closable = keepers >= 1 ? roots : roots.slice(1);
   let closed = 0;
-  for (const tab of closable) { await closeTab(tab.id); closed += 1; }
+  for (const tab of closable) if (await closeTab(tab.id)) closed += 1;
   console.error(`cdp-salvage --sweep-root: closed ${closed} idle root tab(s); ${tabs.length - closed} tab(s) remain`);
   process.exit(0);
 }
@@ -1143,45 +1201,6 @@ function blacklist(url) {
   } catch {}
 }
 
-// A fresh render runs inside a watchdog/probe deadline. Native fetch has no deadline of its
-// own, so every scratch CDP request carries the caller's remaining budget for the part that can
-// genuinely hang forever: waiting for headers from a peer that never answers at all (the
-// hangScratchOpen/hangScratchList case). Body consumption is a TWO-STAGE bound instead of
-// sharing that same signal to its end: once headers land, the response — and any CDP target it
-// names — is real, already-created server-side state, so a deadline landing mid-JSON-parse must
-// not lose the only reference to it. Headers-received swaps the caller's (possibly near-zero)
-// remaining budget for a small independent grace window to let `consume` finish.
-const CONSUME_GRACE_MS = 2_000;
-async function fetchBeforeDeadline(url, options, requestDeadline, consume = null) {
-  const remaining = requestDeadline - Date.now();
-  if (remaining <= 0) throw new Error('caller-deadline-expired');
-  const controller = new AbortController();
-  let timeout = setTimeout(() => controller.abort(), remaining);
-  try {
-    const response = await fetch(url, { ...options, signal: controller.signal });
-    if (!consume) return response;
-    // Headers arrived: replace the caller's-deadline timer with the fixed grace window so a
-    // slow-but-arriving body still completes and callers can capture the target it names.
-    clearTimeout(timeout);
-    timeout = setTimeout(() => controller.abort(), CONSUME_GRACE_MS);
-    return await consume(response);
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function fetchJsonBeforeDeadline(url, options, requestDeadline) {
-  return await fetchBeforeDeadline(url, options, requestDeadline, async (response) => (
-    // Parse only a successful body. A pre-v111 Chrome answering PUT /json/new (or any other
-    // non-2xx CDP response) with a plain-text or empty error body used to get parsed
-    // unconditionally here, so response.json() threw before the caller ever got to inspect
-    // response.ok — turning the documented PUT-to-GET fallback into an immediate
-    // scratch-open-failed/memo-open-failed instead. Callers branch on response.ok themselves;
-    // handing them value: null on failure keeps that branch reachable without a parse throw.
-    response.ok ? { response, value: await response.json() } : { response, value: null }
-  ));
-}
-
 async function freshRenderText(url, port, outerDeadline, waitForDecisiveEvidence = false) {
   let target = null;
   try {
@@ -1256,9 +1275,7 @@ async function freshRenderText(url, port, outerDeadline, waitForDecisiveEvidence
     // later /json list against it can itself hang forever). So this gets a small FIXED budget of
     // its own, independent of outerDeadline, rather than inheriting whatever (possibly zero or
     // negative) time the caller has left. Still best-effort (the try/catch stays).
-    if (target?.id) {
-      try { await fetchBeforeDeadline(`http://127.0.0.1:${port}/json/close/${target.id}`, {}, Date.now() + 2000); } catch {}
-    }
+    if (target?.id) await closeTab(target.id);
   }
 }
 
@@ -1472,11 +1489,11 @@ function organizerUiStatus(result, action) {
 async function validateOrganizerTarget(target, expectedUrl) {
   let tabs;
   try {
-    tabs = await (await fetch(`http://127.0.0.1:${port}/json`)).json();
+    tabs = await listTargets(Date.now() + LATE_LIST_MS);
   } catch {
     return { ok: false, reason: 'cdp-list-failed', tab: null };
   }
-  const live = Array.isArray(tabs) ? tabs.find((tab) => tab.id === target?.id) : null;
+  const live = tabs.find((tab) => tab.id === target?.id) ?? null;
   if (!live) return { ok: false, reason: 'target-disappeared', tab: null };
   if (live.url !== expectedUrl) return { ok: false, reason: 'target-url-drift', tab: live };
   const text = await tabText(live);
@@ -1488,11 +1505,10 @@ async function validateOrganizerTarget(target, expectedUrl) {
 async function closeOwnedOrganizerTabs(expectedUrl, authorizedTargetId, allowTargetUrlDrift) {
   let tabs;
   try {
-    tabs = await (await fetch(`http://127.0.0.1:${port}/json`)).json();
+    tabs = await listTargets(Date.now() + LATE_LIST_MS);
   } catch {
     return { status: 'failed', reason: 'cdp-list-failed' };
   }
-  if (!Array.isArray(tabs)) return { status: 'failed', reason: 'cdp-list-failed' };
   const selected = tabs.find((tab) => tab.id === authorizedTargetId) ?? null;
   if (!selected) return { status: 'failed', reason: 'target-disappeared' };
   const sameUrl = tabs.filter((tab) => tab.type === 'page' && tab.url === expectedUrl);
@@ -1555,7 +1571,7 @@ async function organizeConversation() {
   const title = recallTitle(marker);
   let tabs;
   try {
-    tabs = (await (await fetch(`http://127.0.0.1:${port}/json`)).json())
+    tabs = (await listTargets(deadline))
       .filter((tab) => tab.type === 'page' && /^https:\/\/chatgpt\.com\/c\//.test(tab.url || ''));
   } catch { return { ...result, reason: 'cdp-list-failed' }; }
 
@@ -1750,13 +1766,13 @@ async function organizeConversation() {
 if (close) {
   let tabs = [];
   try {
-    tabs = (await (await fetch(`http://127.0.0.1:${port}/json`)).json())
+    tabs = (await listTargets(deadline))
       .filter((t) => t.type === 'page' && /chatgpt\.com\/c\//.test(t.url || ''));
   } catch { process.exit(0); }
   let closed = 0;
   for (const tab of tabs) {
     const text = await tabText(tab);
-    if (text && organizerOwnership(text).owned) { await closeTab(tab.id); closed += 1; }
+    if (text && organizerOwnership(text).owned && await closeTab(tab.id)) closed += 1;
   }
   console.error(`cdp-salvage --close: closed ${closed} conversation tab(s) matching "${marker}"`);
   process.exit(0);
@@ -1966,7 +1982,7 @@ let lastMatchWasSeeded = false;  // that sighting came from the remembered URL, 
 while (Date.now() < deadline) {
   let tabs = [];
   try {
-    tabs = (await (await fetch(`http://127.0.0.1:${port}/json`)).json())
+    tabs = (await listTargets(deadline))
       .filter((t) => t.type === 'page' && /chatgpt\.com\/c\//.test(t.url || ''));
     listFailures = 0;
     lastListOk = true;
@@ -1977,7 +1993,8 @@ while (Date.now() < deadline) {
     listFailures += 1;
     lastListOk = false;
     console.error(`CDP list failed (${listFailures}x): ${e.message} — retrying until deadline`);
-    await sleep(Math.min(5_000 * listFailures, 30_000));
+    // #224: the backoff never outlasts the deadline (its first 5s step used to overrun a 3s probe).
+    await sleep(Math.min(5_000 * listFailures, 30_000, Math.max(0, deadline - Date.now())));
     continue;
   }
   // Exit 3 means the matching conversation exists NOW, not merely that we saw it sometime
@@ -2266,7 +2283,8 @@ if (!probe && stillGeneratingUrl && !lastMatchWasSeeded) {
   // conversation has no tab BY DEFINITION, so a tab scan would "disprove" a sighting we just
   // made against server-side state and downgrade a live run to a miss.
   try {
-    const tabs = (await (await fetch(`http://127.0.0.1:${port}/json`)).json())
+    // Past the deadline by construction, so it gets the fixed late-list budget (#224).
+    const tabs = (await listTargets(Date.now() + LATE_LIST_MS))
       .filter((t) => t.type === 'page' && /chatgpt\.com\/c\//.test(t.url || ''));
     const reads = await Promise.all(tabs.map(async (tab) => ({ tab, text: await tabText(tab) })));
     const live = reads.find(({ text }) => text && foldedIncludes(text, marker));

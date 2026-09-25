@@ -202,6 +202,7 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
   let primaryDomPolls = 0;
   let jsonListCalls = 0;   // All /json hits, retained for pass 5's production-vs-fast contrast.
   let successfulJsonListCalls = 0;
+  let outerListsAnswered = 0;   // #224: counts every answered outer list, unlike the opt-in tallies below.
   let outerJsonListCalls = 0;   // Lists made when no disposable scratch target is open.
   let scratchJsonListCalls = 0; // Lists that observe an open scratch target during its render.
   const jsonListEvents = [];
@@ -246,6 +247,13 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
       const scratchOpen = created.some((t) => !closed.includes(t.id));
       const listSource = scratchOpen ? 'scratch' : 'outer';
       if (opts.hangScratchList && scratchOpen) return;
+      // #224: the OUTER list (no scratch target open) serves the main salvage/probe scan, the
+      // organizer scan and re-lists, --close, --sweep-root and the exit-3 revalidation.
+      // hangOuterList: true never answers one; a number N answers N and then never answers again.
+      // failOuterList answers every one with a non-JSON 503.
+      if (!scratchOpen && opts.hangOuterList !== undefined
+          && outerListsAnswered >= (opts.hangOuterList === true ? 0 : opts.hangOuterList)) return;
+      if (!scratchOpen && opts.failOuterList) { res.statusCode = 503; res.end('list unavailable'); return; }
       const port = server.address().port;
       res.setHeader('content-type', 'application/json');
       // Extras are listed verbatim EXCEPT that a caller-supplied tab with no debugger URL
@@ -269,13 +277,17 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
           ...(override ?? {}),
         }];
       });
-      const listed = tabText === '__NO_TABS__' || closed.includes('tab1')
+      // #224: dropPrimaryAfter N lists tab1 in the first N answered outer lists only, modelling a
+      // conversation tab that vanishes between the last in-window scan and the exit-3 revalidation.
+      const primaryDropped = opts.dropPrimaryAfter !== undefined && outerListsAnswered >= opts.dropPrimaryAfter;
+      const listed = tabText === '__NO_TABS__' || closed.includes('tab1') || primaryDropped
         ? [...extras, ...scratch]
         : [{
           id: 'tab1', type: 'page', url: 'https://chatgpt.com/c/mock-conversation',
           webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/tab1`,
         }, ...extras, ...scratch];
       res.end(JSON.stringify(listed));
+      if (!scratchOpen) outerListsAnswered += 1;
       // Only shortened deadline fixtures opt into these diagnostic events. Ordinary fixtures keep
       // the original mock's hot request path and only retain jsonListCalls for pass 5's contrast.
       if (trackCdpDeadlineEvents) {
@@ -293,6 +305,8 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
     if (req.url?.startsWith('/json/close/')) {
       closed.push(req.url.split('/').pop());
       if (opts.hangScratchClose && req.url.split('/').pop().startsWith('scratch')) return;
+      // #224: any close is recorded as attempted, then never answered.
+      if (opts.hangClose) return;
       res.end('ok');
       return;
     }
@@ -446,6 +460,7 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
     get jsonListCalls() { return jsonListCalls; },
     get successfulJsonListCalls() { return successfulJsonListCalls; },
     get outerJsonListCalls() { return outerJsonListCalls; },
+    get outerListsAnswered() { return outerListsAnswered; },
     get scratchJsonListCalls() { return scratchJsonListCalls; },
     get primaryDomPolls() { return primaryDomPolls; },
     get jsonListEvents() { return jsonListEvents.map((event) => ({ ...event, tabIds: [...event.tabIds] })); },
@@ -1790,6 +1805,130 @@ const MIXED_MARKER = 'pg-run-Test-Case-1234567890-43';
       `httpRequests=${cdp.httpRequests.join(',')}`);
     cdp.stop();
   }
+}
+
+// ── #224: every OUTER CDP request is bounded too. Before #224 these were bare fetch() calls, so a
+// DevTools endpoint that accepted the connection and never answered was ended only by the
+// wrapper's SIGKILL: no JS cleanup, no evidence-kind line. Each check below would hang until its
+// PRO_GATE_TEST_CHILD_TIMEOUT_MS fallback on the pre-#224 source.
+{ // The main salvage/probe scan hanging from its first list is a browser-down pass, ended at the
+  // caller's deadline: absence of evidence, never a confirmed absence.
+  const source = `run marker: ${MARKER}\nstill reasoning`;
+  for (const [label, args] of [['normal', [MARKER, '3']], ['probe', ['--probe', MARKER, '3']]]) {
+    const cdp = await mockCdp(source, [], { hangOuterList: true });
+    const r = await runSalvage(args, cdp.port, null, { PRO_GATE_TEST_CHILD_TIMEOUT_MS: '6000' });
+    check(`${label} hung tab list ends as browser-down within its deadline`,
+      r.status === 7 && /evidence-kind: browser-down/.test(r.stderr) && r.elapsedMs < 5_500,
+      `status=${r.status} elapsed=${r.elapsedMs}ms stderr=${r.stderr}`);
+    check(`${label} hung tab list closes nothing and records nothing`,
+      cdp.closed.length === 0 && r.memoUrl === null && r.blacklist === null && r.crossbound === 0,
+      `closed=${cdp.closed} memo=${r.memoUrl} blacklist=${r.blacklist} crossbound=${r.crossbound}`);
+    cdp.stop();
+  }
+}
+
+{ // A failing list backs off before retrying, but never past the deadline: the backoff's first
+  // step is 5s, which overran a 3s deadline by 2s when it was unclamped.
+  const cdp = await mockCdp(`run marker: ${MARKER}\nstill reasoning`, [], { failOuterList: true });
+  const r = await runSalvage([MARKER, '3'], cdp.port, null, { PRO_GATE_TEST_CHILD_TIMEOUT_MS: '9000' });
+  check('a failing tab list retries only until the deadline',
+    r.status === 7 && /evidence-kind: browser-down/.test(r.stderr) && r.elapsedMs < 4_500,
+    `status=${r.status} elapsed=${r.elapsedMs}ms stderr=${r.stderr}`);
+  cdp.stop();
+}
+
+{ // The exit-3 revalidation runs AFTER the deadline by design, so it cannot inherit it. A list
+  // that hangs there gets a fixed budget, then the last positive sighting stands: exit 3, which
+  // keeps the reservation (fail-closed against a respend).
+  const text = `run marker: ${MARKER}\nno memo yet, still reasoning...`;
+  const cdp = await mockCdp(text, [], { hangOuterList: 1, renderText: () => text });
+  const r = await runScratchSalvage([MARKER, '3'], cdp.port, null, { PRO_GATE_TEST_CHILD_TIMEOUT_MS: '14000' });
+  check('a revalidation whose tab list hangs keeps the still-generating result within its fixed budget',
+    r.status === 3 && /evidence-kind: owned-incomplete/.test(r.stderr) && r.elapsedMs < 11_000,
+    `status=${r.status} elapsed=${r.elapsedMs}ms stderr=${r.stderr}`);
+  check('a hung revalidation list leaves the owned tab open', !cdp.closed.includes('tab1'), `closed=${cdp.closed}`);
+  cdp.stop();
+}
+
+{ // Its planted counterpart: the fixed budget is what lets the revalidation RUN at all. Bound by the
+  // spent deadline instead, it would throw before sending anything, and a tab that vanished after
+  // the last in-window scan would still be reported as still-generating (exit 3). The production
+  // 20s poll leaves exactly one in-window scan against a 3s deadline, so a second answered outer
+  // list is the revalidation itself.
+  const text = `run marker: ${MARKER}\nno memo yet, still reasoning...`;
+  const cdp = await mockCdp(text, [], { dropPrimaryAfter: 1, renderText: () => text });
+  const r = await runScratchSalvage([MARKER, '3'], cdp.port, null, { PRO_GATE_TEST_CHILD_TIMEOUT_MS: '14000' });
+  check('the exit-3 revalidation runs past the deadline and drops a tab that vanished',
+    cdp.outerListsAnswered === 2 && r.status !== null && r.status !== 3 && !/still-generating/.test(r.stderr),
+    `outerLists=${cdp.outerListsAnswered} status=${r.status} stderr=${r.stderr}`);
+  cdp.stop();
+}
+
+{ // --sweep-root and --close list first; a list with no reply ends at their deadline.
+  for (const args of [['--sweep-root', '-', '3'], ['--close', MARKER, '3']]) {
+    const cdp = await mockCdp(`run marker: ${MARKER}\nVERDICT: SHIP — ours. (run marker: ${MARKER})`, [
+      { id: 'root1', type: 'page', url: 'https://chatgpt.com/' },
+    ], { hangOuterList: true });
+    const r = await runSalvage(args, cdp.port, null, { PRO_GATE_TEST_CHILD_TIMEOUT_MS: '6000' });
+    check(`${args[0]} with a hung tab list exits 0 within its deadline and closes nothing`,
+      r.status === 0 && r.elapsedMs < 5_500 && cdp.closed.length === 0,
+      `status=${r.status} elapsed=${r.elapsedMs}ms closed=${cdp.closed} stderr=${r.stderr}`);
+    cdp.stop();
+  }
+}
+
+{ // A close that never answers is a FAILED close: it is attempted, it cannot hang the process, and
+  // it is never counted or reported as closed.
+  const roots = [
+    { id: 'root1', type: 'page', url: 'https://chatgpt.com/' },
+    { id: 'root2', type: 'page', url: 'https://chatgpt.com/' },
+  ];
+  const sweep = await mockCdp(`run marker: ${MARKER}\nstill thinking`, roots, { hangClose: true });
+  const r = await runSalvage(['--sweep-root', '-', '10'], sweep.port, null, { PRO_GATE_TEST_CHILD_TIMEOUT_MS: '12000' });
+  check('sweep-root attempts every hung close, returns, and counts none of them',
+    r.status === 0 && r.elapsedMs < 8_000
+      && sweep.closed.includes('root1') && sweep.closed.includes('root2')
+      && /closed 0 idle root tab\(s\)/.test(r.stderr),
+    `status=${r.status} elapsed=${r.elapsedMs}ms closed=${sweep.closed} stderr=${r.stderr}`);
+  sweep.stop();
+
+  const owned = await mockCdp(`run marker: ${MARKER}\nVERDICT: SHIP — ours. (run marker: ${MARKER})`, [], { hangClose: true });
+  const c = await runSalvage(['--close', MARKER, '10'], owned.port, null, { PRO_GATE_TEST_CHILD_TIMEOUT_MS: '12000' });
+  check('--close attempts the owned tab, returns, and does not count a close it could not confirm',
+    c.status === 0 && c.elapsedMs < 8_000 && owned.closed.includes('tab1')
+      && /closed 0 conversation tab\(s\)/.test(c.stderr),
+    `status=${c.status} elapsed=${c.elapsedMs}ms closed=${owned.closed} stderr=${c.stderr}`);
+  owned.stop();
+}
+
+{ // The organizer's scan is bounded by its scan window. Its re-lists run after that window, inside
+  // the engine's mutation budget (oracle-review.sh helper_min_s), so they get a fixed budget of
+  // their own. Either hanging fails the pass as cdp-list-failed with no mutation and no close.
+  const title = 'pro-gate review: PR #71 r224 [pro-gate]';
+  for (const [label, hangOuterList] of [['scan', true], ['re-list', 1]]) {
+    const cdp = await mockCdp(`run marker: ${MARKER}\nstill generating`, [], { hangOuterList });
+    const r = await runSalvage(['--organize', MARKER, '3'], cdp.port, seedOrganizer(MARKER, title), {
+      PRO_GATE_TEST_CHILD_TIMEOUT_MS: '12000',
+    });
+    check(`organizer ${label} hang ends as cdp-list-failed before its watchdog`,
+      r.status === 0 && /reason=cdp-list-failed$/.test(r.stdout.trim()) && r.elapsedMs < 9_000,
+      `status=${r.status} elapsed=${r.elapsedMs}ms stdout=${r.stdout} stderr=${r.stderr}`);
+    check(`organizer ${label} hang mutates and closes nothing`,
+      cdp.ui.events.length === 0 && cdp.closed.length === 0,
+      `events=${JSON.stringify(cdp.ui.events)} closed=${cdp.closed}`);
+    cdp.stop();
+  }
+
+  const accepted = completedReview(MARKER);
+  const cdp = await mockCdp(`run marker: ${MARKER}\n${accepted}`, [], { hangClose: true });
+  const r = await runSalvage(finalizerArgs(MARKER), cdp.port,
+    seedOrganizer(MARKER, 'pro-gate review: PR #71 r224b [pro-gate]', null, durableReview(accepted, MARKER)),
+    { PRO_GATE_TEST_CHILD_TIMEOUT_MS: '12000' });
+  check('finalizer reports a close that never answers as failed, not closed',
+    /archive=archived close=failed reason=close-failed$/.test(r.stdout.trim()) && r.elapsedMs < 9_000
+      && cdp.closed.includes('tab1'),
+    `elapsed=${r.elapsedMs}ms stdout=${r.stdout} closed=${cdp.closed}`);
+  cdp.stop();
 }
 
 { // completed review: marker + Pn block + VERDICT -> exit 0, review on stdout, tab LEFT OPEN
