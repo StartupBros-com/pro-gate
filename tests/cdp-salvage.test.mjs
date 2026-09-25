@@ -277,7 +277,10 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
           ...(override ?? {}),
         }];
       });
-      const listed = tabText === '__NO_TABS__' || closed.includes('tab1')
+      // #224: dropPrimaryAfter N lists tab1 in the first N answered outer lists only, modelling a
+      // conversation tab that vanishes between the last in-window scan and the exit-3 revalidation.
+      const primaryDropped = opts.dropPrimaryAfter !== undefined && outerListsAnswered >= opts.dropPrimaryAfter;
+      const listed = tabText === '__NO_TABS__' || closed.includes('tab1') || primaryDropped
         ? [...extras, ...scratch]
         : [{
           id: 'tab1', type: 'page', url: 'https://chatgpt.com/c/mock-conversation',
@@ -457,6 +460,7 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
     get jsonListCalls() { return jsonListCalls; },
     get successfulJsonListCalls() { return successfulJsonListCalls; },
     get outerJsonListCalls() { return outerJsonListCalls; },
+    get outerListsAnswered() { return outerListsAnswered; },
     get scratchJsonListCalls() { return scratchJsonListCalls; },
     get primaryDomPolls() { return primaryDomPolls; },
     get jsonListEvents() { return jsonListEvents.map((event) => ({ ...event, tabIds: [...event.tabIds] })); },
@@ -1843,6 +1847,20 @@ const MIXED_MARKER = 'pg-run-Test-Case-1234567890-43';
     r.status === 3 && /evidence-kind: owned-incomplete/.test(r.stderr) && r.elapsedMs < 11_000,
     `status=${r.status} elapsed=${r.elapsedMs}ms stderr=${r.stderr}`);
   check('a hung revalidation list leaves the owned tab open', !cdp.closed.includes('tab1'), `closed=${cdp.closed}`);
+  cdp.stop();
+}
+
+{ // Its planted counterpart: the fixed budget is what lets the revalidation RUN at all. Bound by the
+  // spent deadline instead, it would throw before sending anything, and a tab that vanished after
+  // the last in-window scan would still be reported as still-generating (exit 3). The production
+  // 20s poll leaves exactly one in-window scan against a 3s deadline, so a second answered outer
+  // list is the revalidation itself.
+  const text = `run marker: ${MARKER}\nno memo yet, still reasoning...`;
+  const cdp = await mockCdp(text, [], { dropPrimaryAfter: 1, renderText: () => text });
+  const r = await runScratchSalvage([MARKER, '3'], cdp.port, null, { PRO_GATE_TEST_CHILD_TIMEOUT_MS: '14000' });
+  check('the exit-3 revalidation runs past the deadline and drops a tab that vanished',
+    cdp.outerListsAnswered === 2 && r.status !== null && r.status !== 3 && !/still-generating/.test(r.stderr),
+    `outerLists=${cdp.outerListsAnswered} status=${r.status} stderr=${r.stderr}`);
   cdp.stop();
 }
 
