@@ -871,6 +871,133 @@ pg_repo_identity_from_url() { # GitHub/Git remote URL -> host<TAB>owner<TAB>repo
   pg_canonical_repo_ok "$host" "$owner" "$repo" || return 1
   printf '%s\t%s\t%s\n' "$host" "$owner" "$repo"
 }
+# PR identity comes from GitHub, not the feature branch's tracking ref (#221).
+# Keep metadata acquisition separate from file-only advisory proof reads.
+pg_pr_metadata_validate() { # canonical metadata host owner repo pr
+  local json="$1" host="$2" owner="$3" repo="$4" pr="$5"
+  pg_canonical_repo_ok "$host" "$owner" "$repo" || return 1
+  pr="$(pg_pr_number_normalize "$pr")" || return 1
+  jq -e --arg host "$host" --arg owner "$owner" --arg repo "$repo" --argjson pr "$pr" '
+    def oid: type=="string" and test("^[0-9a-f]{40}([0-9a-f]{24})?$");
+    keys==["repository","target"] and
+    .repository=={host:$host,owner:$owner,repo:$repo} and
+    (.target|keys)==["base_oid","base_ref","head_oid","pr"] and
+    .target.pr==$pr and (.target.base_oid|oid) and (.target.head_oid|oid) and
+    (.target.base_ref|type=="string" and length>0 and length<=255 and
+      (test("[\u0000- \u007f]")|not))
+  ' <<<"$json" >/dev/null 2>&1
+}
+
+pg_pr_metadata_fetch() { # host owner repo pr -> canonical identity, bounded and read-only
+  local host="$1" owner="$2" repo="$3" pr="$4" raw metadata
+  local gh_bin="${PRO_GATE_GH_BIN:-gh}" timeout_bin="${PRO_GATE_TIMEOUT_BIN:-timeout}"
+  pg_canonical_repo_ok "$host" "$owner" "$repo" || return 1
+  pr="$(pg_pr_number_normalize "$pr")" || return 1
+  command -v "$gh_bin" >/dev/null 2>&1 && command -v "$timeout_bin" >/dev/null 2>&1 || return 1
+  raw="$("$timeout_bin" -k 1s 10s "$gh_bin" pr view "$pr" --repo "$host/$owner/$repo" \
+    --json number,url,state,baseRefName,baseRefOid,headRefOid)" || return 1
+  [ "${#raw}" -le 65536 ] || return 1
+  metadata="$(jq -ceS --arg host "$host" --arg owner "$owner" --arg repo "$repo" --argjson pr "$pr" '
+    select(.number==$pr and .state=="OPEN" and
+      (.url|ascii_downcase)==(("https://"+$host+"/"+$owner+"/"+$repo+"/pull/"+($pr|tostring))|ascii_downcase)) |
+    {repository:{host:$host,owner:$owner,repo:$repo},
+     target:{pr:$pr,base_ref:.baseRefName,base_oid:.baseRefOid,head_oid:.headRefOid}}
+  ' <<<"$raw")" || return 1
+  pg_pr_metadata_validate "$metadata" "$host" "$owner" "$repo" "$pr" || return 1
+  printf '%s' "$metadata"
+}
+
+pg_pr_evidence_read() { # snapshot endpoint repo host owner name pr -> validated snapshot
+  local file="$1" endpoint="$2" repo="$3" host="$4" owner="$5" name="$6" pr="$7"
+  local evidence metadata digest head
+  [ -f "$file" ] && [ ! -L "$file" ] && [ "$(wc -c < "$file")" -le 65536 ] || return 1
+  [ -f "$endpoint" ] && [ ! -L "$endpoint" ] && [ "$(wc -c < "$endpoint")" -le 26214400 ] || return 1
+  evidence="$(jq -ceS '
+    select(keys==["endpoint_digest","metadata","patch_format","record_type","record_version"] and
+      .record_type=="review-pr-evidence/v1" and .record_version==1 and
+      .patch_format=="github-compare-diff" and
+      (.endpoint_digest|type=="string" and test("^[0-9a-f]{64}$")))
+  ' "$file")" || return 1
+  metadata="$(jq -cS .metadata <<<"$evidence")" || return 1
+  pg_pr_metadata_validate "$metadata" "$host" "$owner" "$name" "$pr" || return 1
+  head="$(git -C "$repo" rev-parse HEAD)" || return 1
+  digest="$(pg_sha256 "$endpoint")" || return 1
+  jq -e --arg head "$head" --arg digest "$digest" \
+    '.metadata.target.head_oid==$head and .endpoint_digest==$digest' <<<"$evidence" >/dev/null || return 1
+  printf '%s' "$evidence"
+}
+
+pg_pr_evidence_current() { # validated snapshot -> authoritative pre-effect check
+  local evidence="$1" metadata current host owner repo pr
+  metadata="$(jq -cS .metadata <<<"$evidence")" || return 1
+  host="$(jq -r .repository.host <<<"$metadata")"; owner="$(jq -r .repository.owner <<<"$metadata")"
+  repo="$(jq -r .repository.repo <<<"$metadata")"; pr="$(jq -r .target.pr <<<"$metadata")"
+  current="$(pg_pr_metadata_fetch "$host" "$owner" "$repo" "$pr")" || return 1
+  [ "$current" = "$metadata" ]
+}
+
+# The one canonicalization shared by every binding writer and verifier: a drift
+# between them would let a binding silently stop proving its PR identity.
+pg_pr_evidence_metadata_digest() { # validated snapshot -> pr_metadata_digest
+  local metadata
+  metadata="$(jq -ceS '.metadata|objects' <<<"$1")" || return 1
+  pg_review_sha256_text "$metadata"
+}
+
+pg_prepare_pr_evidence() ( # repo host owner name pr new-output-directory
+  set -euo pipefail
+  local repo="$1" host="$2" owner="$3" name="$4" pr="$5" dest="$6" before after base head tmp digest
+  local gh_bin="${PRO_GATE_GH_BIN:-gh}" timeout_bin="${PRO_GATE_TIMEOUT_BIN:-timeout}" claimed=false published=false
+  [ ! -e "$dest" ] && [ ! -L "$dest" ] || { echo 'ERROR: evidence output directory must be new' >&2; exit 2; }
+  # Callers use this helper in conditionals, where Bash suppresses errexit even
+  # in a subshell. Every fallible preparation/publication step must stop explicitly.
+  head="$(git -C "$repo" rev-parse HEAD)" || exit 2
+  before="$(pg_pr_metadata_fetch "$host" "$owner" "$name" "$pr")" || {
+    echo 'ERROR: cannot establish current PR metadata; no review submitted' >&2; exit 2;
+  }
+  jq -e --arg head "$head" '.target.head_oid==$head' <<<"$before" >/dev/null || {
+    echo 'ERROR: local HEAD is not the current PR head; no review submitted' >&2; exit 2;
+  }
+  mkdir -p "$(dirname "$dest")" || exit 2
+  tmp="$(mktemp -d "${dest}.prepare.XXXXXX")" || exit 2
+  # A claimed but unpublished destination is released on any exit, including a
+  # caught signal, so a failed publish never blocks the next attempt at that path.
+  trap 'rm -f "$tmp/endpoint.patch" "$tmp/pr-evidence.json"; rmdir "$tmp" 2>/dev/null || true
+    if [ "$claimed" = true ] && [ "$published" != true ]; then
+      rm -f "$dest/endpoint.patch" "$dest/pr-evidence.json"; rmdir "$dest" 2>/dev/null || true
+    fi' EXIT
+  chmod 700 "$tmp" || exit 2
+  # The mutable PR diff endpoint can lag a push while PR metadata is already
+  # current. Address the comparison by immutable commit IDs instead (#221).
+  base="$(jq -r .target.base_oid <<<"$before")" || exit 2
+  "$timeout_bin" -k 1s 30s "$gh_bin" api "repos/$owner/$name/compare/$base...$head" \
+    --hostname "$host" -H 'Accept:application/vnd.github.diff' > "$tmp/endpoint.patch" || {
+    echo 'ERROR: PR patch fetch failed; no review submitted' >&2; exit 2;
+  }
+  [ -s "$tmp/endpoint.patch" ] && [ "$(wc -c < "$tmp/endpoint.patch")" -le 26214400 ] || {
+    echo 'ERROR: PR patch is empty or exceeds the evidence limit' >&2; exit 2;
+  }
+  after="$(pg_pr_metadata_fetch "$host" "$owner" "$name" "$pr")" || exit 2
+  [ "$before" = "$after" ] && [ "$head" = "$(git -C "$repo" rev-parse HEAD)" ] || {
+    echo 'ERROR: PR head/base changed while preparing evidence; no review submitted' >&2; exit 2;
+  }
+  digest="$(pg_sha256 "$tmp/endpoint.patch")" || exit 2
+  jq -cnS --argjson metadata "$before" --arg digest "$digest" \
+    '{record_type:"review-pr-evidence/v1",record_version:1,patch_format:"github-compare-diff",metadata:$metadata,endpoint_digest:$digest}' \
+    > "$tmp/pr-evidence.json" || exit 2
+  chmod 600 "$tmp/endpoint.patch" "$tmp/pr-evidence.json" || exit 2
+  # mkdir owns publication; a concurrent preparer cannot overwrite a completed pair.
+  mkdir "$dest" || exit 2
+  claimed=true
+  chmod 700 "$dest" || exit 2
+  mv "$tmp/endpoint.patch" "$dest/endpoint.patch" || exit 2
+  mv "$tmp/pr-evidence.json" "$dest/pr-evidence.json" || exit 2
+  dest="$(cd "$dest" && pwd -P)" || exit 2
+  jq -cnS --arg endpoint "$dest/endpoint.patch" --arg snapshot "$dest/pr-evidence.json" \
+    '{endpoint_patch:$endpoint,pr_evidence:$snapshot}' || exit 2
+  published=true
+)
+
 # A compact, marker-addressed sidecar survives reservation retirement and completion:
 # host<TAB>owner<TAB>repo<TAB>round_key<TAB>pr<TAB>out<TAB>charged_spend_epoch
 # charged_spend_epoch is REQUIRED (no caller may write an uncharged/empty-spend record): the
@@ -3710,11 +3837,13 @@ pg_review_input_binding_validate() { # canonical record JSON [expected marker]
     and (.evidence|keys_are(["identity","mode","proof"])) and (.evidence.identity|type=="string" and test("^[A-Za-z0-9._:/+-]+$") and length<=256)
     and (.evidence.mode|IN("full-pr","scoped-delta","connector","caller-patch"))
     and (if .evidence.mode=="full-pr" then
-      (.evidence.proof|keys_are(["base_oid","endpoint_digest","head_oid","raw_patch_digest"]))
+      (.evidence.proof|keys_are(["base_oid","endpoint_digest","head_oid","raw_patch_digest"]) or
+        (keys_are(["base_oid","endpoint_digest","head_oid","pr_metadata_digest","raw_patch_digest"]) and (.pr_metadata_digest|hex)))
       and (.evidence.proof.base_oid|oid) and (.evidence.proof.head_oid|oid) and .evidence.proof.head_oid==.target.head_oid
       and (.evidence.proof.endpoint_digest|hex) and (.evidence.proof.raw_patch_digest|hex)
     elif .evidence.mode=="scoped-delta" then
-      (.evidence.proof|keys_are(["base_oid","end_oid","filtering_manifest_digest","lineage_identity","raw_digest","reviewed_payload_digest","scope_algorithm"]))
+      (.evidence.proof|keys_are(["base_oid","end_oid","filtering_manifest_digest","lineage_identity","raw_digest","reviewed_payload_digest","scope_algorithm"]) or
+        (keys_are(["base_oid","end_oid","filtering_manifest_digest","lineage_identity","pr_metadata_digest","raw_digest","reviewed_payload_digest","scope_algorithm"]) and (.pr_metadata_digest|hex)))
       and (.evidence.proof.base_oid|oid) and (.evidence.proof.end_oid|oid) and .evidence.proof.end_oid==.target.head_oid
       and (.evidence.proof.filtering_manifest_digest|hex) and (.evidence.proof.raw_digest|hex) and (.evidence.proof.reviewed_payload_digest|hex)
       and (.evidence.proof.lineage_identity|type=="string" and length>0 and length<=256)

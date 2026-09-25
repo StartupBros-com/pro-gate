@@ -35,11 +35,17 @@ cat > "$TDIR/bin/oracle-preflight" <<'FAKE_PREFLIGHT'
 #!/usr/bin/env bash
 if [ -n "${PG_TEST_ORACLE_SENTINEL:-}" ]; then printf '%s\n' "$*" >> "$PG_TEST_ORACLE_SENTINEL"; fi
 if [ "${PG_TEST_ORACLE_COMPLETE:-0}" = 1 ]; then
-  prompt=""; output=""
+  prompt=""; output=""; captured=0
   while [ $# -gt 0 ]; do
     case "$1" in
       -p) prompt="$2"; shift 2 ;;
       --write-output) output="$2"; shift 2 ;;
+      --file)
+        if [ -n "${PG_TEST_PAYLOAD_CAPTURE:-}" ] && [ "$captured" = 0 ]; then
+          cp "$2" "$PG_TEST_PAYLOAD_CAPTURE" || exit 99
+          captured=1
+        fi
+        shift 2 ;;
       *) shift ;;
     esac
   done
@@ -393,6 +399,424 @@ run_change_lock_wait_budget_tests() {
     "holder_rc=$wait_holder_rc waiter_rc=$wait_waiter_rc oracle_calls=$(grep -c -- '--browser-model-strategy' "$TDIR/wait-sizing-oracle.calls") holder=$(tail -4 "$TDIR/wait-sizing-holder.err") waiter=$(tail -5 "$TDIR/wait-sizing-waiter.err")"
 }
 
+# #221: a feature branch normally tracks itself, not the PR's target branch.
+# Exercise the public classic review path with real Git history and an isolated
+# GitHub/Oracle fixture; a successful capture must retain the actual PR base.
+run_pr_evidence_identity_tests() {
+  local root="$TDIR/pr-evidence" repo base head tracking home rc marker binding prep calls action change dest want
+  root="$TDIR/pr-evidence"; repo="$root/repo"
+  mkdir -p "$repo" "$root/user/.local/bin"
+  git -C "$repo" init -q -b main
+  git -C "$repo" config user.name 'Evidence fixture'
+  git -C "$repo" config user.email 'fixture@example.invalid'
+  printf 'base\n' > "$repo/proof.txt"
+  printf 'base\n' > "$repo/other.txt"
+  printf '{"version":1}\n' > "$repo/package-lock.json"
+  git -C "$repo" add proof.txt other.txt package-lock.json && git -C "$repo" commit -qm base
+  base="$(git -C "$repo" rev-parse HEAD)"
+  git -C "$repo" checkout -qb feature
+  printf 'intermediate\n' > "$repo/proof.txt"
+  git -C "$repo" commit -qam intermediate
+  printf 'reviewed\n' > "$repo/proof.txt"
+  printf 'also needs review\n' > "$repo/other.txt"
+  printf '{"version":2}\n' > "$repo/package-lock.json"
+  git -C "$repo" commit -qam reviewed
+  head="$(git -C "$repo" rev-parse HEAD)"
+  git -C "$repo" remote add origin https://github.com/acme/widgets.git
+  git -C "$repo" update-ref refs/remotes/origin/main "$base"
+  git -C "$repo" update-ref refs/remotes/origin/feature "$head"
+  git -C "$repo" diff "$base" "$head" > "$root/endpoint.patch"
+  git -C "$repo" diff "$base" HEAD^ > "$root/stale-pr.patch"
+  jq -cn --arg base "$base" --arg head "$head" \
+    '{number:221,url:"https://github.com/acme/widgets/pull/221",state:"OPEN",baseRefName:"main",baseRefOid:$base,headRefOid:$head}' > "$root/pr.json"
+  cat > "$root/user/.local/bin/gh" <<'PR_EVIDENCE_GH'
+#!/usr/bin/env bash
+[ -z "${PG_PR_TEST_GH_CALLS:-}" ] || printf '%s\n' "$*" >> "$PG_PR_TEST_GH_CALLS"
+case "$1 $2" in
+  'pr diff'|'api repos/'*)
+    if [ "$1" = api ]; then
+      expected="repos/acme/widgets/compare/$(jq -r .baseRefOid "$PG_PR_TEST_METADATA")...$(jq -r .headRefOid "$PG_PR_TEST_METADATA")"
+      [ "$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')" = "$expected" ] || exit 99
+      case " $* " in *' --hostname github.com -H Accept:application/vnd.github.diff '*) ;; *) exit 99 ;; esac
+      [ "${PG_PR_TEST_EMPTY:-0}" = 1 ] || cat "$PG_PR_TEST_PATCH"
+    elif [ "${PG_PR_TEST_STALE:-0}" = 1 ]; then
+      cat "$PG_PR_TEST_STALE_PATCH"
+    else
+      cat "$PG_PR_TEST_PATCH"
+    fi
+    [ "${PG_PR_TEST_PATCH_FAIL:-0}" != 1 ] || exit 1
+    if [ "${PG_PR_TEST_RETARGET:-0}" = 1 ]; then
+      jq '.baseRefName="release"' "$PG_PR_TEST_METADATA" > "$PG_PR_TEST_METADATA.next"
+      mv "$PG_PR_TEST_METADATA.next" "$PG_PR_TEST_METADATA"
+    fi ;;
+  'pr view')
+    case " $* " in
+      *' -q .url '*) printf '%s\n' https://github.com/acme/widgets/pull/221 ;;
+      *) cat "$PG_PR_TEST_METADATA" ;;
+    esac ;;
+  *) printf 'unexpected GitHub fixture call: %s\n' "$*" >&2; exit 99 ;;
+esac
+PR_EVIDENCE_GH
+  chmod +x "$root/user/.local/bin/gh"
+  printf 'foreign idle tab\n' > "$root/tab.txt"
+  start_mock "$root/tab.txt"
+  pr_identity_engine() {
+    env HOME="$root/user" PATH="$root/user/.local/bin:$PATH" PRO_GATE_HOME="$home" \
+      PRO_GATE_GH_BIN="$root/user/.local/bin/gh" PG_PR_TEST_METADATA="$root/pr.json" PG_PR_TEST_PATCH="$root/endpoint.patch" PG_PR_TEST_STALE_PATCH="$root/stale-pr.patch" \
+      PG_PR_TEST_GH_CALLS="$root/gh.calls" PRO_GATE_BROWSER_MODE=native PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 \
+      PRO_GATE_EARLY_PROBE_SECS=0 PRO_GATE_MAX_RETRIES=0 PRO_GATE_INPUT_POLICY=bundle-only \
+      PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 \
+      PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_ORACLE_COMPLETE=1 \
+      PG_TEST_ORACLE_SENTINEL="$home.oracle.calls" NODE_OPTIONS= \
+      bash "$ENGINE" --pr "${PG_PR_TEST_PR:-https://github.com/acme/widgets/pull/221}" --repo "${PG_PR_TEST_REPO_ARG:-$repo}" "$@"
+  }
+  for tracking in main feature none; do
+    if [ "$tracking" = none ]; then git -C "$repo" branch --unset-upstream feature
+    else git -C "$repo" branch --set-upstream-to="origin/$tracking" feature >/dev/null; fi
+    home="$root/home-$tracking"
+    mkdir -p "$home"
+    env HOME="$root/user" PATH="$root/user/.local/bin:$PATH" PRO_GATE_HOME="$home" \
+      PRO_GATE_GH_BIN="$root/user/.local/bin/gh" PG_PR_TEST_METADATA="$root/pr.json" PG_PR_TEST_PATCH="$root/endpoint.patch" PG_PR_TEST_STALE_PATCH="$root/stale-pr.patch" \
+      PRO_GATE_BROWSER_MODE=native PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_EARLY_PROBE_SECS=0 \
+      PRO_GATE_MAX_RETRIES=0 PRO_GATE_INPUT_POLICY=bundle-only PRO_GATE_TEST_MODE=ci-fixture \
+      PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" \
+      PG_TEST_ORACLE_COMPLETE=1 PG_TEST_ORACLE_SENTINEL="$root/oracle-$tracking.calls" PG_TEST_PAYLOAD_CAPTURE="$root/payload-$tracking.diff" NODE_OPTIONS= \
+      bash "$ENGINE" --pr https://github.com/acme/widgets/pull/221 --repo "$repo" --out "$home/review.md" --timeout 10s \
+      > "$root/$tracking.out" 2> "$root/$tracking.err"
+    rc=$?
+    marker="$(jq -r '.marker // empty' "$home/review.md.status" 2>/dev/null)"
+    binding="$home/review-input-bindings/$marker"
+    check "PR evidence ($tracking upstream): successful review records the real PR base, not tracking/HEAD^" \
+      "$([ "$rc" -eq 0 ] && jq -e --arg base "$base" --arg head "$head" \
+        '.evidence.mode=="full-pr" and .evidence.proof.base_oid==$base and .target.head_oid==$head' "$binding" >/dev/null; echo $?)" \
+      "rc=$rc marker=$marker binding=$(cat "$binding" 2>/dev/null) stderr=$(tail -3 "$root/$tracking.err")"
+    check "classic $tracking full-PR binding describes the actual Oracle payload, including changed lockfiles" \
+      "$(cmp -s "$root/payload-$tracking.diff" "$root/endpoint.patch" && jq -e --arg actual "$(sha256sum "$root/payload-$tracking.diff" | cut -d' ' -f1)" '.evidence.proof.raw_patch_digest==$actual' "$binding" >/dev/null; echo $?)" \
+      "binding=$(cat "$binding" 2>/dev/null) delivered=$(cat "$root/payload-$tracking.diff")"
+  done
+
+  # #222 gate r1 P2: the engine cds into --repo before it prepares evidence, so a
+  # relative --repo given from the checkout's parent must still name that checkout.
+  home="$root/relative-classic-home"
+  ( cd "$root" && PG_PR_TEST_REPO_ARG=repo pr_identity_engine --out "$root/relative-classic.md" --timeout 10s ) \
+    > "$root/relative-classic.out" 2> "$root/relative-classic.err"
+  rc=$?
+  marker="$(jq -r '.marker // empty' "$root/relative-classic.md.status" 2>/dev/null)"
+  check 'a classic review given a relative --repo from its parent directory binds the real PR evidence' \
+    "$([ "$rc" -eq 0 ] && [ -s "$home.oracle.calls" ] && jq -e --arg base "$base" --arg head "$head" \
+      '.evidence.mode=="full-pr" and .evidence.proof.base_oid==$base and .target.head_oid==$head' \
+      "$home/review-input-bindings/$marker" >/dev/null; echo $?)" \
+    "rc=$rc marker=$marker stderr=$(tail -4 "$root/relative-classic.err")"
+
+  for change in 0 1; do
+    home="$root/caller-filter-$change-home"
+    PRO_GATE_DIFF_FILTER="$change" PG_TEST_PAYLOAD_CAPTURE="$root/caller-filter-$change.diff" \
+      pr_identity_engine --diff "$root/endpoint.patch" --out "$root/caller-filter-$change.md" --timeout 10s \
+      > "$root/caller-filter-$change.out" 2> "$root/caller-filter-$change.err"
+    rc=$?
+    marker="$(jq -r .marker "$root/caller-filter-$change.md.status")"
+    check "unbound caller-patch reviews retain PRO_GATE_DIFF_FILTER=$change without gaining full-PR proof" \
+      "$([ "$rc" -eq 0 ] && [ -s "$root/caller-filter-$change.diff" ] && jq -e '.evidence.mode=="caller-patch"' "$home/review-input-bindings/$marker" >/dev/null && \
+        { if [ "$change" = 0 ]; then cmp -s "$root/caller-filter-$change.diff" "$root/endpoint.patch"; else ! grep -qF 'b/package-lock.json' "$root/caller-filter-$change.diff"; fi; }; echo $?)" \
+      "rc=$rc stderr=$(tail -4 "$root/caller-filter-$change.err")"
+  done
+
+  home="$root/stale-endpoint-home"
+  PG_PR_TEST_STALE=1 pr_identity_engine --prepare-review-evidence "$root/stale-endpoint-proof" \
+    > "$root/stale-endpoint.out" 2> "$root/stale-endpoint.err"
+  rc=$?
+  check 'stable new-head metadata with a lagging PR diff still prepares the exact current comparison bytes' \
+    "$([ "$rc" -eq 0 ] && cmp -s "$root/stale-endpoint-proof/endpoint.patch" "$root/endpoint.patch" && \
+      [ ! -e "$home" ] && [ ! -e "$home.oracle.calls" ]; echo $?)" \
+    "rc=$rc stderr=$(cat "$root/stale-endpoint.err")"
+
+  home="$root/case-alias-home"
+  PG_PR_TEST_PR=https://github.com/ACME/Widgets/pull/221 pr_identity_engine --prepare-review-evidence "$root/case-url-proof" \
+    > "$root/case-url.out" 2> "$root/case-url.err"
+  rc=$?
+  check 'a case-insensitive PR URL alias is accepted without renaming the caller binding identity' \
+    "$([ "$rc" -eq 0 ] && jq -e '.metadata.repository.owner=="ACME" and .metadata.repository.repo=="Widgets"' "$root/case-url-proof/pr-evidence.json" >/dev/null; echo $?)" \
+    "rc=$rc stderr=$(cat "$root/case-url.err")"
+  git -C "$repo" remote set-url origin https://github.com/ACME/Widgets.git
+  PG_PR_TEST_PR=221 pr_identity_engine --prepare-review-evidence "$root/case-origin-proof" \
+    > "$root/case-origin.out" 2> "$root/case-origin.err"
+  rc=$?
+  check 'a case-insensitive origin alias is accepted for a numeric PR target' \
+    "$([ "$rc" -eq 0 ] && cmp -s "$root/case-origin-proof/endpoint.patch" "$root/endpoint.patch"; echo $?)" \
+    "rc=$rc stderr=$(cat "$root/case-origin.err")"
+  git -C "$repo" remote set-url origin https://github.com/acme/widgets.git
+
+  home="$root/partial-fetch-home"
+  PG_PR_TEST_PATCH_FAIL=1 pr_identity_engine --out "$root/partial-fetch.md" --timeout 10s \
+    > "$root/partial-fetch.out" 2> "$root/partial-fetch.err"
+  rc=$?
+  check 'classic conditional preparation rejects a failed fetch even when it returned nonempty patch bytes' \
+    "$([ "$rc" -eq 5 ] && [ ! -e "$home/rounds/acme-widgets-221" ] && [ ! -e "$home.oracle.calls" ]; echo $?)" \
+    "rc=$rc stderr=$(tail -5 "$root/partial-fetch.err")"
+
+  home="$root/preparation-home"; prep="$root/prepared"
+  pr_identity_engine --prepare-review-evidence "$prep" > "$root/prepared.json" 2> "$root/prepared.err"
+  rc=$?
+  check 'PR preparation captures stable metadata and patch without runtime state or Oracle' \
+    "$([ "$rc" -eq 0 ] && [ ! -e "$home" ] && [ ! -e "$home.oracle.calls" ] && \
+      jq -e --arg base "$base" --arg head "$head" \
+      '.metadata.target.base_oid==$base and .metadata.target.head_oid==$head' "$prep/pr-evidence.json" >/dev/null && \
+      cmp -s "$prep/endpoint.patch" "$root/endpoint.patch"; echo $?)" \
+    "rc=$rc stderr=$(cat "$root/prepared.err")"
+  calls="$(wc -l < "$root/gh.calls")"
+  home="$root/query-home"
+  PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+    pr_identity_engine --review-decision --json --diff "$prep/endpoint.patch" > "$root/query.json" 2> "$root/query.err"
+  rc=$?
+  check 'typed query uses PR snapshot even when feature tracks itself, with no network or durable writes' \
+    "$([ "$rc" -eq 0 ] && jq -e '.action=="run-granted-review" and .facts.input.proven' "$root/query.json" >/dev/null && \
+      [ "$calls" = "$(wc -l < "$root/gh.calls")" ] && [ ! -e "$home" ]; echo $?)" \
+    "rc=$rc decision=$(cat "$root/query.json") stderr=$(cat "$root/query.err")"
+
+  jq '.baseRefName="release"' "$root/pr.json" > "$root/pr.next"
+  mv "$root/pr.next" "$root/pr.json"
+  PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+    pr_identity_engine --review-decision-effect "$root/query.json" --diff "$prep/endpoint.patch" --out "$root/stale.md" --timeout 10s \
+    > "$root/stale.out" 2> "$root/stale.err"
+  rc=$?
+  check 'guarded effect refuses a same-OID PR retarget before charge and submission' \
+    "$([ "$rc" -ne 0 ] && [ ! -e "$home/rounds/acme-widgets-221" ] && [ ! -e "$home.oracle.calls" ]; echo $?)" \
+    "rc=$rc stderr=$(tail -4 "$root/stale.err")"
+  jq '.baseRefName="main"' "$root/pr.json" > "$root/pr.next"
+  mv "$root/pr.next" "$root/pr.json"
+
+  cp "$root/pr.json" "$root/pr.stable.json"
+  for change in base-tip head closed target malformed; do
+    case "$change" in
+      base-tip) jq --arg base "$(git -C "$repo" rev-parse HEAD^)" '.baseRefOid=$base' "$root/pr.stable.json" > "$root/pr.json" ;;
+      head) jq --arg head "$base" '.headRefOid=$head' "$root/pr.stable.json" > "$root/pr.json" ;;
+      closed) jq '.state="CLOSED"' "$root/pr.stable.json" > "$root/pr.json" ;;
+      target) jq '.number=222 | .url="https://github.com/acme/widgets/pull/222"' "$root/pr.stable.json" > "$root/pr.json" ;;
+      malformed) printf 'not JSON\n' > "$root/pr.json" ;;
+    esac
+    PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+      pr_identity_engine --review-decision-effect "$root/query.json" --diff "$prep/endpoint.patch" --out "$root/$change.md" --timeout 10s \
+      > "$root/$change.out" 2> "$root/$change.err"
+    rc=$?
+    check "guarded effect refuses $change metadata before charge or submission" \
+      "$([ "$rc" -ne 0 ] && [ ! -e "$home/rounds/acme-widgets-221" ] && [ ! -e "$home.oracle.calls" ]; echo $?)" \
+      "rc=$rc stderr=$(tail -4 "$root/$change.err")"
+  done
+  cp "$root/pr.stable.json" "$root/pr.json"
+
+  PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+    PG_TEST_PAYLOAD_CAPTURE="$root/current-payload.diff" pr_identity_engine --review-decision-effect "$root/query.json" --diff "$prep/endpoint.patch" --out "$root/current.md" --timeout 10s \
+    > "$root/current.out" 2> "$root/current.err"
+  rc=$?
+  marker="$(jq -r '.marker // empty' "$root/current.md.status" 2>/dev/null)"
+  check 'unchanged prepared evidence still submits and records the correct metadata-bound identity' \
+    "$([ "$rc" -eq 0 ] && [ -s "$home.oracle.calls" ] && jq -e --arg base "$base" --arg head "$head" \
+      '.evidence.proof.base_oid==$base and .target.head_oid==$head and (.evidence.proof.pr_metadata_digest|test("^[0-9a-f]{64}$"))' \
+      "$home/review-input-bindings/$marker" >/dev/null; echo $?)" \
+    "rc=$rc marker=$marker stderr=$(tail -4 "$root/current.err")"
+  check 'typed full-PR effect sends the exact prepared payload instead of silently filtering it' \
+    "$(cmp -s "$root/current-payload.diff" "$prep/endpoint.patch"; echo $?)" \
+    "delivered=$(cat "$root/current-payload.diff")"
+  PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+    pr_identity_engine --review-decision --json --diff "$prep/endpoint.patch" > "$root/completed.json" 2> "$root/completed.err"
+  action="$(jq -r .action "$root/completed.json")"
+  if [ "$action" = collect-existing-result ]; then
+    PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+      pr_identity_engine --review-decision-effect "$root/completed.json" --diff "$prep/endpoint.patch" \
+      > "$root/collected.json" 2> "$root/collected.err"
+    PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+      pr_identity_engine --review-decision --json --diff "$prep/endpoint.patch" > "$root/completed.json" 2> "$root/completed.err"
+  fi
+  check 'correct metadata-bound completed review reaches the existing allow path' \
+    "$(jq -e '.action=="allow-existing-merge-workflow"' "$root/completed.json" >/dev/null; echo $?)" \
+    "decision=$(cat "$root/completed.json") stderr=$(cat "$root/completed.err")"
+
+  # The typed effect rechecks the same relation after that cd, before any charge.
+  home="$root/relative-effect-home"
+  ( cd "$root" && PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+      PG_PR_TEST_REPO_ARG=repo pr_identity_engine --review-decision --json --diff "$prep/endpoint.patch" ) \
+    > "$root/relative-query.json" 2> "$root/relative-query.err"
+  ( cd "$root" && PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+      PG_PR_TEST_REPO_ARG=repo pr_identity_engine --review-decision-effect "$root/relative-query.json" --diff "$prep/endpoint.patch" \
+      --out "$root/relative-effect.md" --timeout 10s ) > "$root/relative-effect.out" 2> "$root/relative-effect.err"
+  rc=$?
+  marker="$(jq -r '.marker // empty' "$root/relative-effect.md.status" 2>/dev/null)"
+  check 'a typed full-PR effect given a relative --repo passes its pre-charge recheck and binds the real PR evidence' \
+    "$([ "$rc" -eq 0 ] && jq -e '.action=="run-granted-review"' "$root/relative-query.json" >/dev/null && [ -s "$home.oracle.calls" ] && \
+      jq -e --arg base "$base" --arg head "$head" \
+      '.evidence.proof.base_oid==$base and .target.head_oid==$head and (.evidence.proof.pr_metadata_digest|test("^[0-9a-f]{64}$"))' \
+      "$home/review-input-bindings/$marker" >/dev/null; echo $?)" \
+    "rc=$rc query=$(jq -c '{action,reason}' "$root/relative-query.json" 2>/dev/null) marker=$marker stderr=$(tail -4 "$root/relative-effect.err")"
+
+  home="$root/race-home"
+  PG_PR_TEST_RETARGET=1 pr_identity_engine --prepare-review-evidence "$root/raced" > "$root/raced.out" 2> "$root/raced.err"
+  rc=$?
+  check 'preparation refuses PR retarget between metadata reads without publishing a snapshot' \
+    "$([ "$rc" -ne 0 ] && [ ! -e "$root/raced/pr-evidence.json" ] && [ ! -e "$home" ]; echo $?)" \
+    "rc=$rc stderr=$(cat "$root/raced.err")"
+
+  home="$root/nonmain-home"
+  pr_identity_engine --prepare-review-evidence "$root/nonmain" > "$root/nonmain.out" 2> "$root/nonmain.err"
+  rc=$?
+  check 'a stable non-main target is supported without a local tracking ref' \
+    "$([ "$rc" -eq 0 ] && jq -e '.metadata.target.base_ref=="release"' "$root/nonmain/pr-evidence.json" >/dev/null; echo $?)" \
+    "rc=$rc stderr=$(cat "$root/nonmain.err")"
+
+  git clone -q --depth 1 --branch feature "file://$repo" "$root/shallow"
+  repo="$root/shallow"; home="$root/shallow-home"
+  git -C "$repo" remote set-url origin https://github.com/contributor/widgets.git
+  pr_identity_engine --prepare-review-evidence "$root/shallow-proof" > "$root/shallow.out" 2> "$root/shallow.err"
+  rc=$?
+  check 'shallow fork checkout uses authoritative PR metadata without inventing HEAD^' \
+    "$([ "$rc" -eq 0 ] && ! git -C "$repo" cat-file -e "$base" 2>/dev/null && jq -e --arg base "$base" \
+      '.metadata.target.base_oid==$base and .metadata.repository.owner=="acme"' "$root/shallow-proof/pr-evidence.json" >/dev/null; echo $?)" \
+    "rc=$rc stderr=$(cat "$root/shallow.err")"
+
+  jq '.headRefOid="ffffffffffffffffffffffffffffffffffffffff"' "$root/pr.json" > "$root/pr.next"
+  mv "$root/pr.next" "$root/pr.json"
+  home="$root/moved-head-home"
+  pr_identity_engine --prepare-review-evidence "$root/moved-head" > "$root/moved-head.out" 2> "$root/moved-head.err"
+  rc=$?
+  check 'local and remote head mismatch refuses preparation without runtime state' \
+    "$([ "$rc" -ne 0 ] && [ ! -e "$root/moved-head/pr-evidence.json" ] && [ ! -e "$home" ]; echo $?)" \
+    "rc=$rc stderr=$(cat "$root/moved-head.err")"
+  jq --arg head "$head" '.headRefOid=$head | .baseRefName="main"' "$root/pr.json" > "$root/pr.next"
+  mv "$root/pr.next" "$root/pr.json"
+
+  # An occupied destination is refused before any GitHub read and keeps its bytes.
+  repo="$root/repo"
+  ln -s "$root/missing-proof-target" "$root/dangling-proof"
+  cp "$prep/endpoint.patch" "$root/occupied-endpoint.before"
+  cp "$prep/pr-evidence.json" "$root/occupied-evidence.before"
+  for change in completed dangling; do
+    home="$root/$change-dest-home"
+    case "$change" in completed) dest="$prep" ;; dangling) dest="$root/dangling-proof" ;; esac
+    calls="$(wc -l < "$root/gh.calls")"
+    pr_identity_engine --prepare-review-evidence "$dest" > "$root/$change-dest.out" 2> "$root/$change-dest.err"
+    rc=$?
+    check "preparation refuses a $change destination before any GitHub read or write" \
+      "$([ "$rc" -eq 2 ] && grep -qF 'evidence output directory must be new' "$root/$change-dest.err" && \
+        [ ! -s "$root/$change-dest.out" ] && [ "$calls" = "$(wc -l < "$root/gh.calls")" ] && [ ! -e "$home" ] && \
+        ! compgen -G "$dest.prepare.*" >/dev/null && [ -L "$root/dangling-proof" ] && [ ! -e "$root/missing-proof-target" ] && \
+        cmp -s "$prep/endpoint.patch" "$root/occupied-endpoint.before" && cmp -s "$prep/pr-evidence.json" "$root/occupied-evidence.before"; echo $?)" \
+      "rc=$rc stderr=$(cat "$root/$change-dest.err")"
+  done
+
+  home="$root/empty-compare-home"; dest="$root/empty-compare"
+  PG_PR_TEST_EMPTY=1 pr_identity_engine --prepare-review-evidence "$dest" > "$root/empty-compare.out" 2> "$root/empty-compare.err"
+  rc=$?
+  check 'an empty compare response is refused without publishing or leaving scratch' \
+    "$([ "$rc" -eq 2 ] && grep -qF 'PR patch is empty or exceeds the evidence limit' "$root/empty-compare.err" && \
+      [ ! -e "$dest" ] && ! compgen -G "$dest.prepare.*" >/dev/null && [ ! -e "$home" ]; echo $?)" \
+    "rc=$rc stderr=$(cat "$root/empty-compare.err")"
+
+  # A publish that fails or is killed after claiming its destination releases it,
+  # so the same path is retryable rather than blocked by a half-written pair.
+  cat > "$root/user/.local/bin/mv" <<'PR_EVIDENCE_MV'
+#!/usr/bin/env bash
+case "${PG_PR_TEST_MV_FAIL:-}:${*: -1}" in
+  exit:*/pr-evidence.json) exit 1 ;;
+  term:*/pr-evidence.json) kill -TERM "$PPID"; exit 1 ;;
+esac
+exec /bin/mv "$@"
+PR_EVIDENCE_MV
+  chmod +x "$root/user/.local/bin/mv"
+  for change in exit term; do
+    home="$root/unwind-$change-home"; dest="$root/unwind-$change"
+    case "$change" in exit) want=2 ;; term) want=143 ;; esac
+    PG_PR_TEST_MV_FAIL="$change" pr_identity_engine --prepare-review-evidence "$dest" \
+      > "$root/unwind-$change.out" 2> "$root/unwind-$change.err"
+    rc=$?
+    check "a publish $change after claiming the destination releases it" \
+      "$([ "$rc" -eq "$want" ] && [ ! -s "$root/unwind-$change.out" ] && [ ! -e "$dest" ] && [ ! -L "$dest" ] && \
+        ! compgen -G "$dest.prepare.*" >/dev/null && [ ! -e "$home" ]; echo $?)" \
+      "rc=$rc entries=$(ls -a "$dest" 2>&1) stderr=$(cat "$root/unwind-$change.err")"
+    pr_identity_engine --prepare-review-evidence "$dest" > "$root/unwind-$change-retry.json" 2> "$root/unwind-$change-retry.err"
+    rc=$?
+    check "a retry at the released $change destination publishes the pair and reports its paths" \
+      "$([ "$rc" -eq 0 ] && cmp -s "$dest/endpoint.patch" "$root/endpoint.patch" && \
+        jq -e --arg head "$head" '.metadata.target.head_oid==$head' "$dest/pr-evidence.json" >/dev/null && \
+        jq -e --arg dir "$(cd "$dest" 2>/dev/null && pwd -P)" \
+          '.endpoint_patch==($dir+"/endpoint.patch") and .pr_evidence==($dir+"/pr-evidence.json")' \
+          "$root/unwind-$change-retry.json" >/dev/null; echo $?)" \
+      "rc=$rc out=$(cat "$root/unwind-$change-retry.json") stderr=$(cat "$root/unwind-$change-retry.err")"
+  done
+  rm -f "$root/user/.local/bin/mv"
+
+  repo="$root/repo"; home="$root/scoped-home"
+  printf 'proof.txt\npackage-lock.json\n' > "$root/scope.txt"
+  printf 'P0: none\nP1: none\nVERDICT: SHIP - prior review.\n' > "$root/confirmation.md"
+  git -C "$repo" diff "$base" "$head" -- proof.txt package-lock.json > "$root/reviewed-scope.patch"
+  for change in manifest confirmation both; do
+    home="$root/partial-$change-home"
+    case "$change" in
+      manifest)
+        PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+          pr_identity_engine --review-decision --json --diff "$root/reviewed-scope.patch" --confirm "$root/confirmation.md" \
+          > "$root/partial-$change.json" 2> "$root/partial-$change.err" ;;
+      confirmation)
+        PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$root/scope.txt" \
+          pr_identity_engine --review-decision --json --diff "$root/reviewed-scope.patch" \
+          > "$root/partial-$change.json" 2> "$root/partial-$change.err" ;;
+      both)
+        PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+          pr_identity_engine --review-decision --json --diff "$root/reviewed-scope.patch" \
+          > "$root/partial-$change.json" 2> "$root/partial-$change.err" ;;
+    esac
+    rc=$?
+    check "partial payload missing $change cannot fall back to full-PR review authority" \
+      "$([ "$rc" -eq 0 ] && jq -e '.action=="prepare-matching-review-evidence"' "$root/partial-$change.json" >/dev/null && [ ! -e "$home" ]; echo $?)" \
+      "rc=$rc decision=$(cat "$root/partial-$change.json") stderr=$(cat "$root/partial-$change.err")"
+  done
+  home="$root/scoped-home"
+  PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+    PRO_GATE_REVIEW_FILTER_MANIFEST="$root/scope.txt" pr_identity_engine --review-decision --json \
+    --diff "$root/reviewed-scope.patch" --confirm "$root/confirmation.md" > "$root/scoped.json" 2> "$root/scoped.err"
+  rc=$?
+  check 'scoped evidence uses the same metadata while keeping distinct payload and lineage' \
+    "$([ "$rc" -eq 0 ] && jq -e '.action=="run-granted-review"' "$root/scoped.json" >/dev/null; echo $?)" \
+    "rc=$rc decision=$(cat "$root/scoped.json") stderr=$(cat "$root/scoped.err")"
+  PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+    PRO_GATE_REVIEW_FILTER_MANIFEST="$root/scope.txt" PG_TEST_PAYLOAD_CAPTURE="$root/scoped-payload.diff" pr_identity_engine --review-decision-effect "$root/scoped.json" \
+    --diff "$root/reviewed-scope.patch" --confirm "$root/confirmation.md" --out "$root/scoped.md" --timeout 10s \
+    > "$root/scoped-effect.out" 2> "$root/scoped-effect.err"
+  rc=$?
+  marker="$(jq -r '.marker // empty' "$root/scoped.md.status" 2>/dev/null)"
+  check 'scoped effect binds the real base and separate raw/reviewed digests' \
+    "$([ "$rc" -eq 0 ] && jq -e --arg base "$base" \
+      '.evidence.mode=="scoped-delta" and .evidence.proof.base_oid==$base and
+       .evidence.proof.raw_digest!=.evidence.proof.reviewed_payload_digest and
+       (.evidence.proof.pr_metadata_digest|test("^[0-9a-f]{64}$"))' "$home/review-input-bindings/$marker" >/dev/null; echo $?)" \
+    "rc=$rc marker=$marker stderr=$(tail -4 "$root/scoped-effect.err")"
+  check 'typed scoped effect sends its exact reviewed payload, including explicitly selected lockfiles' \
+    "$(cmp -s "$root/scoped-payload.diff" "$root/reviewed-scope.patch" && jq -e --arg actual "$(sha256sum "$root/scoped-payload.diff" | cut -d' ' -f1)" '.evidence.proof.reviewed_payload_digest==$actual' "$home/review-input-bindings/$marker" >/dev/null; echo $?)" \
+    "delivered=$(cat "$root/scoped-payload.diff")"
+
+  # A legacy record remains readable but its missing PR metadata must not turn a
+  # schema upgrade into an automatic replacement spend at the same code head.
+  repo="$root/repo"; home="$root/home-main"
+  marker="$(jq -r .marker "$home/review.md.status")"
+  binding="$home/review-input-bindings/$marker"
+  jq -cS 'del(.evidence.proof.pr_metadata_digest)' "$binding" | tr -d '\n' > "$binding.legacy"
+  mv "$binding.legacy" "$binding"
+  PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+    pr_identity_engine --review-decision --json --diff "$prep/endpoint.patch" > "$root/legacy.json" 2> "$root/legacy.err"
+  check 'same-head legacy proof cannot authorize merge or automatically buy a replacement review' \
+    "$(jq -e '.action=="stop-without-new-review" and .reason=="invalid-binding"' "$root/legacy.json" >/dev/null; echo $?)" \
+    "decision=$(cat "$root/legacy.json") stderr=$(cat "$root/legacy.err")"
+  env HOME="$root/user" PRO_GATE_HOME="$home" PRO_GATE_BROWSER_MODE=native PRO_GATE_SELF_HEAL=0 \
+    bash "$ENGINE" --recover "$marker" --repo "$repo" --out "$root/legacy-recovered.md" \
+    > "$root/legacy-recover.out" 2> "$root/legacy-recover.err"
+  rc=$?
+  check 'the same legacy review remains recoverable from durable bytes without a new submission' \
+    "$([ "$rc" -eq 0 ] && cmp -s "$root/legacy-recovered.md" "$home/review.md"; echo $?)" \
+    "rc=$rc stderr=$(cat "$root/legacy-recover.err")"
+}
+run_pr_evidence_identity_tests
+if [ "${PG_TEST_ONLY:-}" = pr-evidence-identity ]; then
+  [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }
+fi
+
 run_change_lock_wait_budget_tests
 if [ "${PG_TEST_ONLY:-}" = change-lock-wait-budget ]; then
   [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }
@@ -639,16 +1063,22 @@ git -C "$CONN150_REPO" add f.txt && git -C "$CONN150_REPO" commit -qm conn150-ba
 printf 'head\n' > "$CONN150_REPO/f.txt"
 git -C "$CONN150_REPO" add f.txt && git -C "$CONN150_REPO" commit -qm conn150-head
 git -C "$CONN150_REPO" remote add origin https://github.com/acme/conn150.git
+CONN150_BASE="$(git -C "$CONN150_REPO" rev-parse HEAD^)"
+CONN150_HEAD="$(git -C "$CONN150_REPO" rev-parse HEAD)"
 mkdir -p "$TDIR/user/.local/bin"
 cat > "$TDIR/user/.local/bin/gh" <<'CONN150_GH'
 #!/usr/bin/env bash
 case "$1 $2" in
-  "pr diff") printf 'diff --git a/f.txt b/f.txt\nindex aaaaaaa..bbbbbbb 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-base\n+head\n' ;;
+  "api repos/acme/conn150/compare/$PG_TEST_CONN150_BASE...$PG_TEST_CONN150_HEAD")
+    printf 'diff --git a/f.txt b/f.txt\nindex aaaaaaa..bbbbbbb 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-base\n+head\n' ;;
   "pr view")
     # gate r1 P1 (#161): the caller-patch installer now fetches the PR's real head via
     # `gh pr view ... --json headRefOid` instead of trusting local git state -- respond to that
     # shape distinctly from the plain `--json url -q .url` lookup this stub already answers.
-    if printf '%s\n' "$*" | grep -q -- 'headRefOid'; then
+    if printf '%s\n' "$*" | grep -q -- 'baseRefName'; then
+      jq -cn --argjson pr "$3" --arg base "$PG_TEST_CONN150_BASE" --arg head "$PG_TEST_CONN150_HEAD" \
+        '{number:$pr,url:("https://github.com/acme/conn150/pull/"+($pr|tostring)),state:"OPEN",baseRefName:"main",baseRefOid:$base,headRefOid:$head}'
+    elif printf '%s\n' "$*" | grep -q -- 'headRefOid'; then
       printf '{"state":"OPEN","headRefOid":"%s"}\n' "${PG_TEST_CONN150_HEAD:?PG_TEST_CONN150_HEAD unset}"
     else
       printf 'https://github.com/acme/conn150/pull/%s\n' "$3"
@@ -664,6 +1094,7 @@ conn150_run() { # home input pr out
     PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 PRO_GATE_MAX_ROUNDS_PER_PR=1 \
     PRO_GATE_LOCK_WAIT=2 PRO_GATE_TIMEOUT_GRACE=0 PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 \
     PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_ORACLE_COMPLETE=1 NODE_OPTIONS= \
+    PG_TEST_CONN150_BASE="$CONN150_BASE" PG_TEST_CONN150_HEAD="$CONN150_HEAD" \
     bash "$ENGINE" --pr "$3" --repo "$CONN150_REPO" --input "$2" --out "$4" --timeout 10s \
     >"$TDIR/stdout" 2>"$TDIR/stderr"
   RC=$?
@@ -5986,6 +6417,31 @@ rd_facts() { # canonical merge of the corpus base and one patch, with runtime co
 }
 rd_reduce() { pg_review_decision_reduce "$1"; }
 
+# Explicit PR fixtures for the existing decision/binding cases below. The remote
+# metadata file is separate from the prepared snapshot so freshness can diverge.
+# Transport preparation itself is exercised through the public CLI in #221 above.
+fixture_pr_evidence() { # endpoint repo-name pr base head -> metadata digest
+  local endpoint="$1" name="$2" pr="$3" base="$4" head="$5" metadata
+  metadata="$(jq -cnS --arg name "$name" --argjson pr "$pr" --arg base "$base" --arg head "$head" \
+    '{repository:{host:"github.com",owner:"acme",repo:$name},target:{pr:$pr,base_ref:"main",base_oid:$base,head_oid:$head}}')"
+  jq -cnS --argjson metadata "$metadata" --arg digest "$(pg_sha256 "$endpoint")" \
+    '{record_type:"review-pr-evidence/v1",record_version:1,patch_format:"github-compare-diff",metadata:$metadata,endpoint_digest:$digest}' \
+    > "$endpoint.pr-evidence.json"
+  jq -cnS --argjson m "$metadata" \
+    '{number:$m.target.pr,url:("https://github.com/acme/"+$m.repository.repo+"/pull/"+($m.target.pr|tostring)),state:"OPEN",baseRefName:$m.target.base_ref,baseRefOid:$m.target.base_oid,headRefOid:$m.target.head_oid}' \
+    > "$endpoint.metadata.json"
+  pg_review_sha256_text "$metadata"
+}
+cat > "$TDIR/evidence-gh" <<'EVIDENCE_GH'
+#!/usr/bin/env bash
+[ "$1 $2" = 'pr view' ] || exit 99
+# Keep the existing fresh-dispatch fixtures' remote-URL fallback (including the
+# historical .git round key), but answer authoritative metadata independently.
+case " $* " in *' -q .url '*) exit 1 ;; esac
+cat "${PRO_GATE_REVIEW_PR_EVIDENCE%.pr-evidence.json}.metadata.json"
+EVIDENCE_GH
+chmod +x "$TDIR/evidence-gh"
+
 check 'contract fixture is byte-canonical JSON with no trailing newline' \
   "$([ "$(jq -cS . "$RD_CONTRACT")" = "$(cat "$RD_CONTRACT")" ] && [ "$(tail -c 1 "$RD_CONTRACT" | od -An -tuC | tr -d ' ')" != 10 ]; echo $?)" \
   "tail=$(tail -c 1 "$RD_CONTRACT" | od -An -tuC)"
@@ -6211,11 +6667,10 @@ check '#214 (c): a binding with an unknown contract_digest is still rejected by 
   "$([ "$PG214_UNKNOWN_INPUT_RC" -ne 0 ] && [ "$PG214_UNKNOWN_RESULT_RC" -ne 0 ]; echo $?)" \
   "input_rc=$PG214_UNKNOWN_INPUT_RC result_rc=$PG214_UNKNOWN_RESULT_RC"
 
-# #214 (e): upgrade regression, completed review. An unchanged head whose full-pr input binding
-# AND SHIP result binding were both written by the PREDECESSOR runtime (predecessor contract
-# digest on both sibling records) must still be recognized by the real CLI query as an already
-# -completed, merge-eligible review -- reused via allow-existing-merge-workflow -- rather than
-# granting ANOTHER paid round because the old bindings silently failed to read back.
+# #214 (e) + #221: predecessor records must remain readable without buying another
+# review. Unlike an additive contract-digest change, missing authoritative PR
+# metadata no longer proves current merge eligibility. Preserve the old records
+# byte-for-byte and assert the no-spend stop with otherwise-current evidence.
 PG214_E_REPO="$TDIR/pg214-upgrade-repo"
 mkdir -p "$PG214_E_REPO"
 git -C "$PG214_E_REPO" init -q
@@ -6242,12 +6697,20 @@ PG214_E_INPUT_DIGEST="$(pg_review_sha256_text "$PG214_E_INPUT_BINDING")"
 PG214_E_RESULT_BINDING="$(jq -cnS --arg cd "$PG214_PRED_B" --arg marker "$PG214_E_MARKER" --arg ib "$PG214_E_INPUT_DIGEST" --arg base "$PG214_E_BASE" --arg head "$PG214_E_HEAD" --arg digest "$PG214_E_DIGEST" --arg artifact "$PG214_E_ARTIFACT_DIGEST" \
   '{accepted_epoch:1700020001,artifact:{digest:$artifact,path:("completed/"+$marker)},contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,input_binding_digest:$ib,input_binding_identity:$marker,marker:$marker,named_choice:null,provenance:{outcome:"accepted",validated_epoch:1700020001},record_type:"review-result-binding/v1",record_version:1,ship_proof:{base_oid:$base,diff_digest:$digest,head_oid:$head},verdict:"SHIP"}')"
 PRO_GATE_HOME="$PG214_E_HOME" pg_review_result_binding_write "$PG214_E_MARKER" "$PG214_E_RESULT_BINDING"
-env PRO_GATE_HOME="$PG214_E_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/pg214-e.patch" \
+fixture_pr_evidence "$TDIR/pg214-e.patch" upgrade-e2e 91 "$PG214_E_BASE" "$PG214_E_HEAD" >/dev/null
+cp "$PG214_E_HOME/review-input-bindings/$PG214_E_MARKER" "$TDIR/pg214-input.before"
+cp "$PG214_E_HOME/review-result-bindings/$PG214_E_MARKER" "$TDIR/pg214-result.before"
+env PRO_GATE_HOME="$PG214_E_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/pg214-e.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/pg214-e.patch" \
   bash "$ENGINE" --review-decision --json --repo "$PG214_E_REPO" --pr 91 --diff "$TDIR/pg214-e.patch" --input bundle \
   >"$TDIR/pg214-e.json" 2>"$TDIR/pg214-e.err"
 PG214_E_RC=$?
-check '#214 (e): an unchanged head whose input+result bindings both carry a predecessor contract digest reduces directly to allow-existing-merge-workflow, no new round granted' \
-  "$([ "$PG214_E_RC" -eq 0 ] && jq -e '.action=="allow-existing-merge-workflow" and .reason=="current-ship-is-merge-eligible"' "$TDIR/pg214-e.json" >/dev/null 2>&1; echo $?)" \
+check '#214 (e) / #221: predecessor bindings lacking PR metadata remain readable and unchanged, without current allow or a replacement spend' \
+  "$([ "$PG214_E_RC" -eq 0 ] && jq -e '.action=="stop-without-new-review" and .reason=="invalid-binding"' "$TDIR/pg214-e.json" >/dev/null 2>&1 \
+     && [ "$(PRO_GATE_HOME="$PG214_E_HOME" pg_review_input_binding_read "$PG214_E_MARKER")" = "$PG214_E_INPUT_BINDING" ] \
+     && [ "$(PRO_GATE_HOME="$PG214_E_HOME" pg_review_result_binding_read "$PG214_E_MARKER")" = "$PG214_E_RESULT_BINDING" ] \
+     && cmp -s "$PG214_E_HOME/review-input-bindings/$PG214_E_MARKER" "$TDIR/pg214-input.before" \
+     && cmp -s "$PG214_E_HOME/review-result-bindings/$PG214_E_MARKER" "$TDIR/pg214-result.before" \
+     && [ ! -d "$PG214_E_HOME/rounds" ]; echo $?)" \
   "rc=$PG214_E_RC output=$(cat "$TDIR/pg214-e.json") stderr=$(cat "$TDIR/pg214-e.err")"
 
 # U2: the typed resolution surface is advisory and strictly read-only. It must normalize a
@@ -6357,8 +6820,10 @@ PROOF_ENDPOINT_DIGEST="$(sha256sum "$TDIR/proof-endpoint.patch" | awk '{print $1
 PROOF_RAW_DIGEST="$(sha256sum "$TDIR/proof-raw.patch" | awk '{print $1}')"
 FULL_MARKER='pg-run-acme-widgets-1983-1700013000-1'
 FULL_BINDING="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg base "$PROOF_BASE" --arg head "$PROOF_HEAD" --arg endpoint "$PROOF_ENDPOINT_DIGEST" --arg raw "$PROOF_RAW_DIGEST" '{charged_spend_epoch:1700013000,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("full-pr:"+$base+":"+$head),mode:"full-pr",proof:{base_oid:$base,endpoint_digest:$endpoint,head_oid:$head,raw_patch_digest:$raw}},marker:"pg-run-acme-widgets-1983-1700013000-1",record_type:"review-input-binding/v1",record_version:1,repository:{host:"github.com",owner:"acme",repo:"widgets"},target:{head_oid:$head,kind:"pull-request",pr:1983}}')"
+PROOF_METADATA_DIGEST="$(fixture_pr_evidence "$TDIR/proof-endpoint.patch" widgets 1983 "$PROOF_BASE" "$PROOF_HEAD")"
+FULL_BINDING="$(jq -cS --arg digest "$PROOF_METADATA_DIGEST" '.evidence.proof.pr_metadata_digest=$digest' <<<"$FULL_BINDING")"
 PRO_GATE_HOME="$DECISION_HOME" pg_review_input_binding_write "$FULL_MARKER" "$FULL_BINDING"
-env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/proof-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
   bash "$ENGINE" --review-decision --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
   >"$TDIR/full-proof.json" 2>"$TDIR/full-proof.err"
 FULL_PROOF_RC=$?
@@ -6366,24 +6831,25 @@ check 'full-PR proof requires current base head endpoint and raw patch digests' 
   "$([ "$FULL_PROOF_RC" -eq 0 ] && jq -e '.action == "run-granted-review" and .facts.input.proven and (.facts.evidence.identity | startswith("relation:"))' "$TDIR/full-proof.json" >/dev/null 2>&1; echo $?)" \
   "rc=$FULL_PROOF_RC output=$(cat "$TDIR/full-proof.json") stderr=$(cat "$TDIR/full-proof.err")"
 printf 'altered endpoint bytes\n' >> "$TDIR/proof-endpoint.patch"
-env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/proof-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
   bash "$ENGINE" --review-decision --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
   >"$TDIR/full-proof-moved.json" 2>"$TDIR/full-proof-moved.err"
 FULL_MOVED_RC=$?
-check 'changed full-PR endpoint bytes create a new cold-start advisory, not a stale binding match' \
-  "$([ "$FULL_MOVED_RC" -eq 0 ] && jq -e '.action == "run-granted-review" and (.facts.evidence.identity | startswith("relation:"))' "$TDIR/full-proof-moved.json" >/dev/null 2>&1; echo $?)" \
+check 'changed endpoint bytes without a matching PR snapshot require preparation, not a grant or stale binding match' \
+  "$([ "$FULL_MOVED_RC" -eq 0 ] && jq -e '.action == "prepare-matching-review-evidence"' "$TDIR/full-proof-moved.json" >/dev/null 2>&1; echo $?)" \
   "rc=$FULL_MOVED_RC output=$(cat "$TDIR/full-proof-moved.json") stderr=$(cat "$TDIR/full-proof-moved.err")"
 
 printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — prior review accepted' > "$TDIR/scoped-confirmation.md"
 printf 'proof.txt\n' > "$TDIR/scoped-manifest"
 cp "$TDIR/proof-raw.patch" "$TDIR/scoped-raw-endpoint.patch"
 printf 'unreviewed endpoint context\n' >> "$TDIR/scoped-raw-endpoint.patch"
+fixture_pr_evidence "$TDIR/scoped-raw-endpoint.patch" widgets 1983 "$PROOF_BASE" "$PROOF_HEAD" >/dev/null
 SCOPED_RAW_DIGEST="$(sha256sum "$TDIR/scoped-raw-endpoint.patch" | awk '{print $1}')"
 SCOPED_MANIFEST_DIGEST="$(sha256sum "$TDIR/scoped-manifest" | awk '{print $1}')"
 SCOPED_CONFIRM_DIGEST="$(sha256sum "$TDIR/scoped-confirmation.md" | awk '{print $1}')"
 SCOPED_MARKER='pg-run-acme-widgets-1983-1700013001-2'
 SCOPED_BINDING="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg base "$PROOF_BASE" --arg head "$PROOF_HEAD" --arg raw "$SCOPED_RAW_DIGEST" --arg reviewed "$PROOF_RAW_DIGEST" --arg manifest "$SCOPED_MANIFEST_DIGEST" --arg lineage "confirmation:$SCOPED_CONFIRM_DIGEST" '{charged_spend_epoch:1700013001,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("scoped-delta:"+$base+":"+$head+":"+$reviewed),mode:"scoped-delta",proof:{base_oid:$base,end_oid:$head,filtering_manifest_digest:$manifest,lineage_identity:$lineage,raw_digest:$raw,reviewed_payload_digest:$reviewed,scope_algorithm:"unified-diff-v1"}},marker:"pg-run-acme-widgets-1983-1700013001-2",record_type:"review-input-binding/v1",record_version:1,repository:{host:"github.com",owner:"acme",repo:"widgets"},target:{head_oid:$head,kind:"pull-request",pr:1983}}')"
-env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/scoped-raw-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
   bash "$ENGINE" --review-decision --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
   >"$TDIR/scoped-proof.json" 2>"$TDIR/scoped-proof.err"
 SCOPED_PROOF_RC=$?
@@ -6391,7 +6857,7 @@ check 'cold-start scoped delta binds distinct raw/reviewed payload bytes and lin
   "$([ "$SCOPED_PROOF_RC" -eq 0 ] && jq -e '(.action == "run-granted-review") and (.facts.evidence.identity | startswith("relation:"))' "$TDIR/scoped-proof.json" >/dev/null 2>&1; echo $?)" \
   "rc=$SCOPED_PROOF_RC output=$(cat "$TDIR/scoped-proof.json") stderr=$(cat "$TDIR/scoped-proof.err")"
 printf 'different scope\n' > "$TDIR/scoped-manifest"
-env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/scoped-raw-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
   bash "$ENGINE" --review-decision --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
   >"$TDIR/scoped-proof-stale.json" 2>"$TDIR/scoped-proof-stale.err"
 SCOPED_STALE_RC=$?
@@ -6408,13 +6874,15 @@ for scoped_stale in manifest confirmation raw; do
     raw) printf 'changed raw endpoint bytes\n' >> "$TDIR/scoped-raw-endpoint.patch" ;;
   esac
   SCOPED_STATE_BEFORE="$(find "$DECISION_HOME" -mindepth 1 -maxdepth 2 -printf '%P\n' | sort)"
-  env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+  env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/scoped-raw-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
     bash "$ENGINE" --review-decision --review-decision-effect "$TDIR/scoped-proof.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
     >"$TDIR/scoped-$scoped_stale-effect.json" 2>"$TDIR/scoped-$scoped_stale-effect.err"
   SCOPED_EFFECT_RC=$?
   SCOPED_STATE_AFTER="$(find "$DECISION_HOME" -mindepth 1 -maxdepth 2 -printf '%P\n' | sort)"
+  SCOPED_STALE_ACTION=run-granted-review
+  [ "$scoped_stale" != raw ] || SCOPED_STALE_ACTION=prepare-matching-review-evidence
   check "stale scoped $scoped_stale bytes suppress saved-effect dispatch" \
-    "$( [ "$SCOPED_EFFECT_RC" -eq 0 ] && jq -e '.action == "run-granted-review"' "$TDIR/scoped-$scoped_stale-effect.json" >/dev/null 2>&1 && ! cmp -s "$TDIR/scoped-proof.json" "$TDIR/scoped-$scoped_stale-effect.json" && [ "$SCOPED_STATE_BEFORE" = "$SCOPED_STATE_AFTER" ]; echo $?)" \
+    "$( [ "$SCOPED_EFFECT_RC" -eq 0 ] && jq -e --arg action "$SCOPED_STALE_ACTION" '.action == $action' "$TDIR/scoped-$scoped_stale-effect.json" >/dev/null 2>&1 && ! cmp -s "$TDIR/scoped-proof.json" "$TDIR/scoped-$scoped_stale-effect.json" && [ "$SCOPED_STATE_BEFORE" = "$SCOPED_STATE_AFTER" ]; echo $?)" \
     "rc=$SCOPED_EFFECT_RC output=$(cat "$TDIR/scoped-$scoped_stale-effect.json") stderr=$(cat "$TDIR/scoped-$scoped_stale-effect.err")"
   printf 'proof.txt\n' > "$TDIR/scoped-manifest"
   printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — prior review accepted' > "$TDIR/scoped-confirmation.md"
@@ -6432,14 +6900,14 @@ printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — canonical review accepted
 FULL_REPAIR_NEW_MARKER='pg-run-acme-widgets-1983-1700013002-9'
 FULL_REPAIR_NEW_BINDING="$(jq -cS --arg marker "$FULL_REPAIR_NEW_MARKER" '.marker=$marker | .charged_spend_epoch=1700013002' <<<"$FULL_BINDING")"
 PRO_GATE_HOME="$DECISION_HOME" pg_review_input_binding_write "$FULL_REPAIR_NEW_MARKER" "$FULL_REPAIR_NEW_BINDING"
-env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/proof-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
   bash "$ENGINE" --review-decision --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
   >"$TDIR/repair-before.json" 2>"$TDIR/repair-before.err"
 REPAIR_BEFORE_RC=$?
 check 'canonical SHIP without result binding is collect-only, never merge eligible' \
   "$([ "$REPAIR_BEFORE_RC" -eq 0 ] && jq -e --arg marker "$FULL_MARKER" '.action == "collect-existing-result" and .effect_request.applicable_ref == $marker and .action != "allow-existing-merge-workflow"' "$TDIR/repair-before.json" >/dev/null 2>&1; echo $?)" \
   "rc=$REPAIR_BEFORE_RC output=$(cat "$TDIR/repair-before.json") stderr=$(cat "$TDIR/repair-before.err")"
-env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/proof-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
   bash "$ENGINE" --review-decision --review-decision-effect "$TDIR/repair-before.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
   >"$TDIR/repair-effect.json" 2>"$TDIR/repair-effect.err"
 REPAIR_EFFECT_RC=$?
@@ -6448,7 +6916,7 @@ check 'matching collect effect repairs one validated marker-bound result binding
   "$([ "$REPAIR_EFFECT_RC" -eq 0 ] && jq -e --arg marker "$FULL_MARKER" '.marker == $marker and .verdict == "SHIP"' <<<"$REPAIR_BINDING" >/dev/null 2>&1; echo $?)" \
   "rc=$REPAIR_EFFECT_RC binding=$REPAIR_BINDING output=$(cat "$TDIR/repair-effect.json") stderr=$(cat "$TDIR/repair-effect.err")"
 REPAIR_BINDING_DIGEST="$(printf '%s' "$REPAIR_BINDING" | sha256sum | awk '{print $1}')"
-env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/proof-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
   bash "$ENGINE" --review-decision --review-decision-effect "$TDIR/repair-before.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
   >"$TDIR/repair-replay.json" 2>"$TDIR/repair-replay.err"
 REPAIR_REPLAY_RC=$?
@@ -6492,11 +6960,11 @@ for STORED_VERDICT in SHIP FIX-FIRST NEEDS-DISCUSSION; do
     PRO_GATE_HOME="$MISMATCH_HOME" pg_review_result_binding_write "$MISMATCH_MARKER" "$MISMATCH_RESULT"
     cp "$MISMATCH_HOME/completed/$MISMATCH_MARKER" "$MISMATCH_HOME/artifact.before"
     cp "$MISMATCH_HOME/review-result-bindings/$MISMATCH_MARKER" "$MISMATCH_HOME/binding.before"
-    env PRO_GATE_HOME="$MISMATCH_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+    env PRO_GATE_HOME="$MISMATCH_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/proof-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
       bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
       >"$TDIR/verdict-mismatch-$MISMATCH_CASE-query.json" 2>"$TDIR/verdict-mismatch-$MISMATCH_CASE-query.err"
     MISMATCH_QUERY_RC=$?
-    env PRO_GATE_HOME="$MISMATCH_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+    env PRO_GATE_HOME="$MISMATCH_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/proof-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
       bash "$ENGINE" --review-decision --review-decision-effect "$TDIR/verdict-mismatch-$MISMATCH_CASE-query.json" --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
       >"$TDIR/verdict-mismatch-$MISMATCH_CASE-effect.json" 2>"$TDIR/verdict-mismatch-$MISMATCH_CASE-effect.err"
     MISMATCH_EFFECT_RC=$?
@@ -6523,7 +6991,7 @@ PRO_GATE_HOME="$PRIOR_MISMATCH_HOME" pg_review_input_binding_write "$PRIOR_MISMA
 printf 'P0: none\nP1: none\nVERDICT: FIX-FIRST — stale prior result. (run marker: %s)\n' "$PRIOR_MISMATCH_MARKER" > "$PRIOR_MISMATCH_HOME/completed/$PRIOR_MISMATCH_MARKER"
 PRIOR_MISMATCH_RESULT="$(mismatch_result "$PRIOR_MISMATCH_MARKER" "$PRIOR_MISMATCH_INPUT" SHIP "$PRIOR_MISMATCH_HOME/completed/$PRIOR_MISMATCH_MARKER")"
 PRO_GATE_HOME="$PRIOR_MISMATCH_HOME" pg_review_result_binding_write "$PRIOR_MISMATCH_MARKER" "$PRIOR_MISMATCH_RESULT"
-env PRO_GATE_HOME="$PRIOR_MISMATCH_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+env PRO_GATE_HOME="$PRIOR_MISMATCH_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/proof-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
   bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
   >"$TDIR/prior-verdict-mismatch.json" 2>"$TDIR/prior-verdict-mismatch.err"
 PRIOR_MISMATCH_RC=$?
@@ -6537,20 +7005,20 @@ check 'a verdict-mismatched prior candidate is not admitted as review history' \
 MIGRATION_ARCHIVE="$MIGRATION_HOME/review-result-bindings-archive"
 mkdir -p "$MIGRATION_ARCHIVE"
 mv "$MIGRATION_HOME/review-result-bindings/$MIGRATION_MARKER" "$MIGRATION_ARCHIVE/$MIGRATION_MARKER"
-env PRO_GATE_HOME="$MIGRATION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+env PRO_GATE_HOME="$MIGRATION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/proof-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
   bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
   >"$TDIR/verdict-migration-collect.json" 2>"$TDIR/verdict-migration-collect.err"
 MIGRATION_COLLECT_RC=$?
-env PRO_GATE_HOME="$MIGRATION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+env PRO_GATE_HOME="$MIGRATION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/proof-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
   bash "$ENGINE" --review-decision --review-decision-effect "$TDIR/verdict-migration-collect.json" --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
   >"$TDIR/verdict-migration-effect.json" 2>"$TDIR/verdict-migration-effect.err"
 MIGRATION_EFFECT_RC=$?
 MIGRATION_REPAIRED="$(PRO_GATE_HOME="$MIGRATION_HOME" pg_review_result_binding_read "$MIGRATION_MARKER" 2>/dev/null || true)"
 MIGRATION_REPAIRED_DIGEST="$(PRO_GATE_HOME="$MIGRATION_HOME" pg_review_result_binding_digest "$MIGRATION_MARKER" 2>/dev/null || true)"
-env PRO_GATE_HOME="$MIGRATION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+env PRO_GATE_HOME="$MIGRATION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/proof-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
   bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
   >"$TDIR/verdict-migration-replay-a.json" 2>"$TDIR/verdict-migration-replay-a.err"
-env PRO_GATE_HOME="$MIGRATION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+env PRO_GATE_HOME="$MIGRATION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/proof-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
   bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
   >"$TDIR/verdict-migration-replay-b.json" 2>"$TDIR/verdict-migration-replay-b.err"
 check 'archival plus normal collect repairs a mismatched legacy binding without losing evidence' \
@@ -6580,7 +7048,7 @@ for DECISION_MIXED_ORDER in foreign-first foreign-last; do
   } > "$DECISION_HOME/completed/$FULL_MARKER"
   MIXED_DECISION_DIGEST="$(sha256sum "$DECISION_HOME/completed/$FULL_MARKER" | awk '{print $1}')"
   jq -cS --arg digest "$MIXED_DECISION_DIGEST" '.artifact.digest=$digest' "$TDIR/ownership-clean-binding" > "$MIXED_RESULT_FILE"
-  env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+  env PRO_GATE_HOME="$DECISION_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/proof-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
     bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
     >"$TDIR/mixed-decision.json" 2>"$TDIR/mixed-decision.err"
   RC=$?
@@ -6607,14 +7075,14 @@ cp "$REFERENCE_HOME/completed/$REFERENCE_MARKER" "$REFERENCE_HOME/artifact.befor
 check 'adjacent quoted and fenced SHIP examples do not override owned FIX-FIRST extraction' \
   "$([ "$(pg_extract_verdict "$REFERENCE_HOME/completed/$REFERENCE_MARKER")" = FIX-FIRST ]; echo $?)" \
   "$(cat "$REFERENCE_HOME/completed/$REFERENCE_MARKER")"
-env PRO_GATE_HOME="$REFERENCE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+env PRO_GATE_HOME="$REFERENCE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/proof-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
   bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
   >"$TDIR/reference-before.json" 2>"$TDIR/reference-before.err"
 REFERENCE_RC=$?
 check 'owned FIX-FIRST with old SHIP references is eligible for normal artifact collection' \
   "$([ "$REFERENCE_RC" -eq 0 ] && jq -e '.action=="collect-existing-result"' "$TDIR/reference-before.json" >/dev/null; echo $?)" \
   "rc=$REFERENCE_RC $(cat "$TDIR/reference-before.json" "$TDIR/reference-before.err")"
-env PRO_GATE_HOME="$REFERENCE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
+env PRO_GATE_HOME="$REFERENCE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/proof-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
   bash "$ENGINE" --review-decision --review-decision-effect "$TDIR/reference-before.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --input bundle \
   >"$TDIR/reference-effect.json" 2>"$TDIR/reference-effect.err"
 REFERENCE_RC=$?
@@ -6631,6 +7099,7 @@ PC_CONNECTOR_MARKER='pg-run-acme-widgets-1983-1700015000-1'
 PC_SCOPED_MARKER='pg-run-acme-widgets-1983-1700015001-2'
 PC_CONNECTOR="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg head "$PROOF_HEAD" '{charged_spend_epoch:1700015000,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("connector:github.com/acme/widgets:"+$head),mode:"connector",proof:{commit_target:$head,endpoint_digest:null,raw_diff_digest:null,repository_target:"github.com/acme/widgets"}},marker:"pg-run-acme-widgets-1983-1700015000-1",record_type:"review-input-binding/v1",record_version:1,repository:{host:"github.com",owner:"acme",repo:"widgets"},target:{head_oid:$head,kind:"pull-request",pr:1983}}')"
 PC_SCOPED="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg base "$PROOF_BASE" --arg head "$PROOF_HEAD" --arg raw "$SCOPED_RAW_DIGEST" --arg reviewed "$PROOF_RAW_DIGEST" --arg manifest "$SCOPED_MANIFEST_DIGEST" --arg lineage "confirmation:$SCOPED_CONFIRM_DIGEST" '{charged_spend_epoch:1700015001,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("scoped-delta:"+$base+":"+$head+":"+$reviewed),mode:"scoped-delta",proof:{base_oid:$base,end_oid:$head,filtering_manifest_digest:$manifest,lineage_identity:$lineage,raw_digest:$raw,reviewed_payload_digest:$reviewed,scope_algorithm:"unified-diff-v1"}},marker:"pg-run-acme-widgets-1983-1700015001-2",record_type:"review-input-binding/v1",record_version:1,repository:{host:"github.com",owner:"acme",repo:"widgets"},target:{head_oid:$head,kind:"pull-request",pr:1983}}')"
+PC_SCOPED="$(jq -cS --arg digest "$PROOF_METADATA_DIGEST" '.evidence.proof.pr_metadata_digest=$digest' <<<"$PC_SCOPED")"
 precedence_result() { # marker input verdict accepted artifact
   local marker="$1" input="$2" verdict="$3" accepted="$4" artifact="$5" digest input_digest proof
   input_digest="$(printf '%s' "$input" | sha256sum | awk '{print $1}')"
@@ -6654,7 +7123,7 @@ check 'default both prepares bundle evidence instead of selecting a current conn
   "$([ "$PC_NO_BUNDLE_RC" -eq 0 ] && jq -e '.action == "prepare-matching-review-evidence" and .facts.completed_results == []' "$TDIR/precedence-no-bundle.json" >/dev/null 2>&1; echo $?)" \
   "rc=$PC_NO_BUNDLE_RC output=$(cat "$TDIR/precedence-no-bundle.json") stderr=$(cat "$TDIR/precedence-no-bundle.err")"
 
-env PRO_GATE_HOME="$PRECEDENCE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+env PRO_GATE_HOME="$PRECEDENCE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/scoped-raw-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
   bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input both \
   >"$TDIR/precedence-scoped-grant.json" 2>"$TDIR/precedence-scoped-grant.err"
 PC_SCOPED_GRANT_RC=$?
@@ -6671,7 +7140,7 @@ PRO_GATE_HOME="$PRECEDENCE_HOME" pg_review_input_binding_write "$PC_SCOPED_MARKE
 PC_SCOPED_REPLAY_MARKER='pg-run-acme-widgets-1983-1700015002-3'
 PC_SCOPED_REPLAY="$(jq -cS --arg marker "$PC_SCOPED_REPLAY_MARKER" '.marker=$marker | .charged_spend_epoch=1700015002' <<<"$PC_SCOPED")"
 PRO_GATE_HOME="$PRECEDENCE_HOME" pg_review_input_binding_write "$PC_SCOPED_REPLAY_MARKER" "$PC_SCOPED_REPLAY"
-env PRO_GATE_HOME="$PRECEDENCE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+env PRO_GATE_HOME="$PRECEDENCE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/scoped-raw-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
   bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input both \
   >"$TDIR/precedence-identity.json" 2>"$TDIR/precedence-identity.err"
 PC_IDENTITY_RC=$?
@@ -6680,7 +7149,7 @@ check 'current code identity is stable across equivalent marker and charged-epoc
   "rc=$PC_IDENTITY_RC output=$(cat "$TDIR/precedence-identity.json")"
 PC_SCOPED_RESULT="$(precedence_result "$PC_SCOPED_MARKER" "$PC_SCOPED" FIX-FIRST 1700015998 "$PRECEDENCE_HOME/completed/$PC_SCOPED_MARKER")"
 PRO_GATE_HOME="$PRECEDENCE_HOME" pg_review_result_binding_write "$PC_SCOPED_MARKER" "$PC_SCOPED_RESULT"
-env PRO_GATE_HOME="$PRECEDENCE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+env PRO_GATE_HOME="$PRECEDENCE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/scoped-raw-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
   bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input both \
   >"$TDIR/precedence-repeat.json" 2>"$TDIR/precedence-repeat.err"
 PC_REPEAT_RC=$?
@@ -6691,7 +7160,7 @@ check 'repeated scoped evidence with its completed result cannot grant another r
 # Changed scoped evidence retains the previous same-code result as non-applicable progress, not a
 # terminal FIX-FIRST route.
 printf 'changed scope\n' > "$TDIR/precedence-manifest"
-env PRO_GATE_HOME="$PRECEDENCE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/precedence-manifest" \
+env PRO_GATE_HOME="$PRECEDENCE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/scoped-raw-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/precedence-manifest" \
   bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input both \
   >"$TDIR/precedence-changed.json" 2>"$TDIR/precedence-changed.err"
 PC_CHANGED_RC=$?
@@ -6714,7 +7183,7 @@ PC_ORDER_Z_RESULT="$(precedence_result "$PC_ORDER_Z_MARKER" "$PC_ORDER_Z" FIX-FI
 PRO_GATE_HOME="$PC_ORDER_HOME" pg_review_result_binding_write "$PC_ORDER_A_MARKER" "$PC_ORDER_A_RESULT"
 PRO_GATE_HOME="$PC_ORDER_HOME" pg_review_result_binding_write "$PC_ORDER_Z_MARKER" "$PC_ORDER_Z_RESULT"
 PC_ORDER_Z_DIGEST="$(PRO_GATE_HOME="$PC_ORDER_HOME" pg_review_result_binding_digest "$PC_ORDER_Z_MARKER")"
-env PRO_GATE_HOME="$PC_ORDER_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+env PRO_GATE_HOME="$PC_ORDER_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/scoped-raw-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
   bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input both \
   >"$TDIR/precedence-order.json" 2>"$TDIR/precedence-order.err"
 PC_ORDER_RC=$?
@@ -6745,6 +7214,8 @@ FRESH_DIGEST="$(sha256sum "$TDIR/fresh-effect.patch" | awk '{print $1}')"
 FRESH_KEY='acme-fresh.git-77'
 FRESH_TEMPLATE='pg-run-acme-fresh.git-77-1700014000-1'
 FRESH_BINDING="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg base "$FRESH_BASE" --arg head "$FRESH_HEAD" --arg digest "$FRESH_DIGEST" --arg marker "$FRESH_TEMPLATE" '{charged_spend_epoch:1700014000,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("full-pr:"+$base+":"+$head),mode:"full-pr",proof:{base_oid:$base,endpoint_digest:$digest,head_oid:$head,raw_patch_digest:$digest}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:"github.com",owner:"acme",repo:"fresh"},target:{head_oid:$head,kind:"pull-request",pr:77}}')"
+FRESH_METADATA_DIGEST="$(fixture_pr_evidence "$TDIR/fresh-endpoint.patch" fresh 77 "$FRESH_BASE" "$FRESH_HEAD")"
+FRESH_BINDING="$(jq -cS --arg digest "$FRESH_METADATA_DIGEST" '.evidence.proof.pr_metadata_digest=$digest' <<<"$FRESH_BINDING")"
 mkdir -p "$TDIR/fresh-bin"
 cat > "$TDIR/fresh-bin/oracle" <<'FRESH_ORACLE'
 #!/usr/bin/env bash
@@ -6762,12 +7233,12 @@ fresh_reset_state() {
 }
 fresh_query() {
   local target="${1:-77}"
-  env PRO_GATE_HOME="$FRESH_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/fresh-endpoint.patch" \
+  env PRO_GATE_HOME="$FRESH_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/fresh-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/fresh-endpoint.patch" \
     bash "$ENGINE" --review-decision --repo "$FRESH_REPO" --pr "$target" --diff "$TDIR/fresh-effect.patch" --input bundle
 }
 fresh_effect() {
   local target="${3:-77}"
-  env PATH="$TDIR/fresh-bin:$PATH" PRO_GATE_HOME="$FRESH_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/fresh-endpoint.patch" \
+  env PATH="$TDIR/fresh-bin:$PATH" PRO_GATE_HOME="$FRESH_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/fresh-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/fresh-endpoint.patch" \
     ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_ORACLE_BIN="$TDIR/fresh-bin/oracle" \
     PG_TEST_FRESH_HOME="$FRESH_HOME" PG_TEST_FRESH_ORACLE="$TDIR/fresh-oracle.calls" PRO_GATE_EARLY_PROBE_SECS=0 \
     bash "$ENGINE" --review-decision --review-decision-effect "$1" --repo "$FRESH_REPO" --pr "$target" --diff "$TDIR/fresh-effect.patch" --input bundle --out "$2" --timeout 5s \
@@ -7032,7 +7503,7 @@ check 'status reports superseded as non-recoverable non-capacity despite stale s
 mkdir -p "$SUPER_HEAD_HOME/active"
 printf '%s\t%s\t99999999\t%s\tremote-chrome\ttoken\tsubmitted\t1700014100\n' \
   "$SUPER_HEAD_MARKER" "$TDIR/superseded-refreshed.md" "$(date +%s)" > "$SUPER_HEAD_HOME/active/$SUPER_KEY"
-env PRO_GATE_HOME="$SUPER_HEAD_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/fresh-endpoint.patch" \
+env PRO_GATE_HOME="$SUPER_HEAD_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/fresh-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/fresh-endpoint.patch" \
   bash "$ENGINE" --review-decision --json --repo "$FRESH_REPO" --pr 77 --diff "$TDIR/fresh-effect.patch" --input bundle \
   > "$TDIR/superseded-decision.json" 2> "$TDIR/superseded-decision.err"
 SUPER_DECISION_RC=$?
@@ -8108,6 +8579,8 @@ check 'old-head completed bytes do not suppress the current fresh dispatch' \
 
 fresh_reset_state
 printf 'changed endpoint evidence\n' >> "$TDIR/fresh-endpoint.patch"
+cp "$TDIR/fresh-endpoint.patch" "$TDIR/fresh-effect.patch"
+fixture_pr_evidence "$TDIR/fresh-endpoint.patch" fresh 77 "$FRESH_BASE" "$FRESH_HEAD" >/dev/null
 FRESH_ADVISORY="$(fresh_query)"; printf '%s\n' "$FRESH_ADVISORY" > "$TDIR/fresh-advisory.json"
 mkdir -p "$FRESH_HOME/completed"
 PRO_GATE_HOME="$FRESH_HOME" pg_review_input_binding_write "$FRESH_TEMPLATE" "$FRESH_BINDING"
@@ -8119,6 +8592,7 @@ check 'changed-evidence completed bytes do not suppress the current fresh dispat
   "rc=$FRESH_RC stdout=$(cat "$TDIR/fresh.stdout") stderr=$(cat "$TDIR/fresh.stderr")"
 git -C "$FRESH_REPO" diff "$FRESH_BASE" "$FRESH_HEAD" > "$TDIR/fresh-effect.patch"
 cp "$TDIR/fresh-effect.patch" "$TDIR/fresh-endpoint.patch"
+fixture_pr_evidence "$TDIR/fresh-endpoint.patch" fresh 77 "$FRESH_BASE" "$FRESH_HEAD" >/dev/null
 
 # A historical terminal artifact resolves only its own charged marker. It stays inapplicable to
 # the current relation, but its permanent run-meta sidecar must not turn it back into unknown-fate.
@@ -8320,7 +8794,7 @@ CHOICE_ART_DIGEST="$(sha256sum "$CHOICE_HOME/completed/$CHOICE_MARKER" | awk '{p
 CHOICE_RESULT="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg marker "$CHOICE_MARKER" --arg ib "$CHOICE_INPUT_DIGEST" --arg digest "$CHOICE_ART_DIGEST" '{accepted_epoch:1700017001,artifact:{digest:$digest,path:("completed/"+$marker)},contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,input_binding_digest:$ib,input_binding_identity:$marker,marker:$marker,named_choice:null,provenance:{outcome:"accepted",validated_epoch:1700017001},record_type:"review-result-binding/v1",record_version:1,ship_proof:null,verdict:"NEEDS-DISCUSSION"}')"
 PRO_GATE_HOME="$CHOICE_HOME" pg_review_input_binding_write "$CHOICE_MARKER" "$CHOICE_BINDING"
 PRO_GATE_HOME="$CHOICE_HOME" pg_review_result_binding_write "$CHOICE_MARKER" "$CHOICE_RESULT"
-env PRO_GATE_HOME="$CHOICE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+env PRO_GATE_HOME="$CHOICE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/scoped-raw-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
   bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
   >"$TDIR/choice-ask.json" 2>"$TDIR/choice-ask.err"
 CHOICE_ASK_RC=$?
@@ -8333,7 +8807,7 @@ check 'initial named-choice effect snapshot is the reducer choice context' \
   "snapshot=$CHOICE_SNAPSHOT"
 printf '%s' "$(jq -cnS --arg id keep --arg snap "$CHOICE_SNAPSHOT" '{selected_id:$id,snapshot_digest:$snap}')" > "$TDIR/choice-selection.json"
 CHOICE_STATE_BEFORE="$(find "$CHOICE_HOME" -mindepth 1 -maxdepth 2 -printf '%P\n' | sort)"
-env PRO_GATE_HOME="$CHOICE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+env PRO_GATE_HOME="$CHOICE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/scoped-raw-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
   bash "$ENGINE" --review-decision --json --review-choice-selection "$TDIR/choice-selection.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
   >"$TDIR/choice-selected.json" 2>"$TDIR/choice-selected.err"
 CHOICE_SELECTED_RC=$?; CHOICE_STATE_AFTER="$(find "$CHOICE_HOME" -mindepth 1 -maxdepth 2 -printf '%P\n' | sort)"
@@ -8345,7 +8819,7 @@ check 'exact canonical selection returns the existing non-authorizing named-choi
 # second trailing newline is not tolerated and still stops closed at invalid-named-choice.
 jq -cnS --arg id keep --arg snap "$CHOICE_SNAPSHOT" '{selected_id:$id,snapshot_digest:$snap}' > "$TDIR/choice-selection-lf.json"
 CHOICE_LF_STATE_BEFORE="$(find "$CHOICE_HOME" -mindepth 1 -maxdepth 2 -printf '%P\n' | sort)"
-env PRO_GATE_HOME="$CHOICE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+env PRO_GATE_HOME="$CHOICE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/scoped-raw-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
   bash "$ENGINE" --review-decision --json --review-choice-selection "$TDIR/choice-selection-lf.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
   >"$TDIR/choice-selected-lf.json" 2>"$TDIR/choice-selected-lf.err"
 CHOICE_LF_RC=$?; CHOICE_LF_STATE_AFTER="$(find "$CHOICE_HOME" -mindepth 1 -maxdepth 2 -printf '%P\n' | sort)"
@@ -8353,7 +8827,7 @@ check "#203: a selection file with one trailing newline (jq's natural redirect o
   "$([ "$CHOICE_LF_RC" -eq 0 ] && jq -e '.action=="fix-review-findings" and .reason=="named-product-choice-selected" and .facts.named_choice.selected_id=="keep"' "$TDIR/choice-selected-lf.json" >/dev/null 2>&1 && [ "$CHOICE_LF_STATE_BEFORE" = "$CHOICE_LF_STATE_AFTER" ]; echo $?)" \
   "rc=$CHOICE_LF_RC output=$(cat "$TDIR/choice-selected-lf.json") stderr=$(cat "$TDIR/choice-selected-lf.err")"
 printf '%s\n\n' "$(jq -cnS --arg id keep --arg snap "$CHOICE_SNAPSHOT" '{selected_id:$id,snapshot_digest:$snap}')" > "$TDIR/choice-selection-2lf.json"
-env PRO_GATE_HOME="$CHOICE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+env PRO_GATE_HOME="$CHOICE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/scoped-raw-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
   bash "$ENGINE" --review-decision --json --review-choice-selection "$TDIR/choice-selection-2lf.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
   >"$TDIR/choice-selected-2lf.json" 2>"$TDIR/choice-selected-2lf.err"
 CHOICE_2LF_RC=$?
@@ -8366,7 +8840,7 @@ check '#203: a selection file with two trailing newlines still stops closed at i
 # file held nothing but canonical bytes. Both must now stop closed just like the two-trailing-
 # newline case above; the byte-canonical decision is against the file's actual on-disk bytes.
 printf '%s\x00' "$(jq -cnS --arg id keep --arg snap "$CHOICE_SNAPSHOT" '{selected_id:$id,snapshot_digest:$snap}')" > "$TDIR/choice-selection-trailing-nul.json"
-env PRO_GATE_HOME="$CHOICE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+env PRO_GATE_HOME="$CHOICE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/scoped-raw-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
   bash "$ENGINE" --review-decision --json --review-choice-selection "$TDIR/choice-selection-trailing-nul.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
   >"$TDIR/choice-selected-trailing-nul.json" 2>"$TDIR/choice-selected-trailing-nul.err"
 CHOICE_TRAILING_NUL_RC=$?
@@ -8374,7 +8848,7 @@ check '#203 gate r3 P2: a selection file with a trailing NUL byte stops closed a
   "$([ "$CHOICE_TRAILING_NUL_RC" -eq 0 ] && jq -e '.action=="stop-without-new-review" and (.action!="run-granted-review")' "$TDIR/choice-selected-trailing-nul.json" >/dev/null 2>&1; echo $?)" \
   "rc=$CHOICE_TRAILING_NUL_RC output=$(cat "$TDIR/choice-selected-trailing-nul.json") stderr=$(cat "$TDIR/choice-selected-trailing-nul.err")"
 printf '{"selected_id":"ke\x00ep","snapshot_digest":"%s"}' "$CHOICE_SNAPSHOT" > "$TDIR/choice-selection-embedded-nul.json"
-env PRO_GATE_HOME="$CHOICE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+env PRO_GATE_HOME="$CHOICE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/scoped-raw-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
   bash "$ENGINE" --review-decision --json --review-choice-selection "$TDIR/choice-selection-embedded-nul.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
   >"$TDIR/choice-selected-embedded-nul.json" 2>"$TDIR/choice-selected-embedded-nul.err"
 CHOICE_EMBEDDED_NUL_RC=$?
@@ -8390,7 +8864,7 @@ for choice_selection_case in malformed unknown stale oversized symlink; do
     oversized) python3 -c 'print("x" * 65537, end="")' > "$TDIR/choice-bad.json" ;;
     symlink) ln -s "$TDIR/choice-selection.json" "$TDIR/choice-bad.json" ;;
   esac
-  env PRO_GATE_HOME="$CHOICE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+  env PRO_GATE_HOME="$CHOICE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/scoped-raw-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
     bash "$ENGINE" --review-decision --json --review-choice-selection "$TDIR/choice-bad.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
     >"$TDIR/choice-$choice_selection_case.json" 2>"$TDIR/choice-$choice_selection_case.err"
   CHOICE_BAD_RC=$?
@@ -8401,7 +8875,7 @@ done
 # Moving endpoint evidence invalidates the saved choice context; no previously selected outcome
 # is carried across to the newly reduced relation.
 printf 'moved endpoint\n' >> "$TDIR/scoped-raw-endpoint.patch"
-env PRO_GATE_HOME="$CHOICE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+env PRO_GATE_HOME="$CHOICE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/scoped-raw-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
   bash "$ENGINE" --review-decision --json --review-choice-selection "$TDIR/choice-selection.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
   >"$TDIR/choice-evidence-moved.json" 2>"$TDIR/choice-evidence-moved.err"
 CHOICE_MOVED_RC=$?
@@ -8418,14 +8892,14 @@ SCOPED_SHIP_INPUT="$(jq -cS --arg marker "$SCOPED_SHIP_MARKER" '.marker=$marker 
 mkdir -p "$SCOPED_SHIP_HOME/completed"
 printf '%s\n' 'P0: none' 'P1: none' 'P2: none' 'P3: none' 'VERDICT: SHIP — scoped endpoint reviewed.' > "$SCOPED_SHIP_HOME/completed/$SCOPED_SHIP_MARKER"
 PRO_GATE_HOME="$SCOPED_SHIP_HOME" pg_review_input_binding_write "$SCOPED_SHIP_MARKER" "$SCOPED_SHIP_INPUT"
-env PRO_GATE_HOME="$SCOPED_SHIP_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+env PRO_GATE_HOME="$SCOPED_SHIP_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/scoped-raw-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
   bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
   >"$TDIR/scoped-ship-collect.json" 2>"$TDIR/scoped-ship-collect.err"
 SCOPED_COLLECT_RC=$?
-env PRO_GATE_HOME="$SCOPED_SHIP_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+env PRO_GATE_HOME="$SCOPED_SHIP_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/scoped-raw-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
   bash "$ENGINE" --review-decision --review-decision-effect "$TDIR/scoped-ship-collect.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
   >"$TDIR/scoped-ship-repair.json" 2>"$TDIR/scoped-ship-repair.err"
-env PRO_GATE_HOME="$SCOPED_SHIP_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+env PRO_GATE_HOME="$SCOPED_SHIP_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/scoped-raw-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
   bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
   >"$TDIR/scoped-ship-current.json" 2>"$TDIR/scoped-ship-current.err"
 SCOPED_CURRENT_RC=$?
@@ -8439,22 +8913,30 @@ for scoped_move in raw reviewed manifest confirmation; do
     manifest) printf 'different manifest\n' >> "$TDIR/scoped-manifest" ;;
     confirmation) printf '%s\n' 'P0: none' 'P1: none' 'P2: changed confirmation' 'P3: none' 'VERDICT: SHIP — changed.' > "$TDIR/scoped-confirmation.md" ;;
   esac
-  env PRO_GATE_HOME="$SCOPED_SHIP_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+  env PRO_GATE_HOME="$SCOPED_SHIP_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/scoped-raw-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
     bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
     >"$TDIR/scoped-ship-$scoped_move.json" 2>"$TDIR/scoped-ship-$scoped_move.err"
   SCOPED_MOVE_RC=$?
   check "scoped SHIP with moved $scoped_move cannot reach merge handoff" \
     "$([ "$SCOPED_MOVE_RC" -eq 0 ] && jq -e '.action!="allow-existing-merge-workflow"' "$TDIR/scoped-ship-$scoped_move.json" >/dev/null 2>&1; echo $?)" \
     "rc=$SCOPED_MOVE_RC output=$(cat "$TDIR/scoped-ship-$scoped_move.json")"
-  cp "$TDIR/proof-raw.patch" "$TDIR/scoped-raw-endpoint.patch"; printf 'unreviewed endpoint context\n' >> "$TDIR/scoped-raw-endpoint.patch"
   git -C "$DECISION_REPO" diff "$PROOF_BASE" "$PROOF_HEAD" > "$TDIR/proof-raw.patch"
+  cp "$TDIR/proof-raw.patch" "$TDIR/scoped-raw-endpoint.patch"; printf 'unreviewed endpoint context\n' >> "$TDIR/scoped-raw-endpoint.patch"
   printf 'proof.txt\n' > "$TDIR/scoped-manifest"
   printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — prior review accepted' > "$TDIR/scoped-confirmation.md"
 done
-# Base movement is independently fail-closed even while the reviewed head stays fixed.
+# Changing feature tracking is not PR retargeting. The actual PR snapshot, not
+# that local ref, must invalidate a same-head SHIP when the remote base moves.
 git -C "$DECISION_REPO" branch scoped-base-alt "${PROOF_BASE}^"
 git -C "$DECISION_REPO" branch --set-upstream-to=scoped-base-alt >/dev/null 2>&1
-env PRO_GATE_HOME="$SCOPED_SHIP_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+env PRO_GATE_HOME="$SCOPED_SHIP_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/scoped-raw-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+  bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
+  >"$TDIR/scoped-ship-tracking.json" 2>"$TDIR/scoped-ship-tracking.err"
+check 'feature tracking changes do not invalidate an unchanged authoritative scoped SHIP' \
+  "$(jq -e '.action=="allow-existing-merge-workflow"' "$TDIR/scoped-ship-tracking.json" >/dev/null; echo $?)" \
+  "$(cat "$TDIR/scoped-ship-tracking.json" "$TDIR/scoped-ship-tracking.err")"
+fixture_pr_evidence "$TDIR/scoped-raw-endpoint.patch" widgets 1983 "$(git -C "$DECISION_REPO" rev-parse scoped-base-alt)" "$PROOF_HEAD" >/dev/null
+env PRO_GATE_HOME="$SCOPED_SHIP_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/scoped-raw-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
   bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
   >"$TDIR/scoped-ship-base.json" 2>"$TDIR/scoped-ship-base.err"
 SCOPED_BASE_RC=$?
@@ -8466,14 +8948,14 @@ git -C "$DECISION_REPO" branch --unset-upstream
 # saved exact selection must become a fresh safe replacement, never a fixer or another review.
 printf 'head moved after choice\n' > "$DECISION_REPO/proof.txt"
 git -C "$DECISION_REPO" add proof.txt && git -C "$DECISION_REPO" commit -qm choice-head-moved
-env PRO_GATE_HOME="$CHOICE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+env PRO_GATE_HOME="$CHOICE_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/scoped-raw-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
   bash "$ENGINE" --review-decision --json --review-choice-selection "$TDIR/choice-selection.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
   >"$TDIR/choice-head-moved.json" 2>"$TDIR/choice-head-moved.err"
 CHOICE_HEAD_MOVED_RC=$?
 check 'moved head invalidates a named selection without granting review or merge' \
   "$([ "$CHOICE_HEAD_MOVED_RC" -eq 0 ] && jq -e '.action!="fix-review-findings" and .action!="run-granted-review" and .action!="allow-existing-merge-workflow"' "$TDIR/choice-head-moved.json" >/dev/null 2>&1; echo $?)" \
   "rc=$CHOICE_HEAD_MOVED_RC output=$(cat "$TDIR/choice-head-moved.json")"
-env PRO_GATE_HOME="$SCOPED_SHIP_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
+env PRO_GATE_HOME="$SCOPED_SHIP_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/scoped-raw-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
   bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
   >"$TDIR/scoped-ship-head.json" 2>"$TDIR/scoped-ship-head.err"
 SCOPED_HEAD_RC=$?
@@ -8578,16 +9060,18 @@ NB_FULL_HOME="$TDIR/home-not-bindable-full"; NB_FULL_MARKER='pg-run-acme-widgets
 git -C "$DECISION_REPO" diff "$NB_BASE" "$NB_HEAD" > "$TDIR/nb-full.patch"
 NB_FULL_DIGEST="$(sha256sum "$TDIR/nb-full.patch" | awk '{print $1}')"
 NB_FULL_BINDING="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg marker "$NB_FULL_MARKER" --arg base "$NB_BASE" --arg head "$NB_HEAD" --arg digest "$NB_FULL_DIGEST" '{charged_spend_epoch:1700019002,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("full-pr:"+$base+":"+$head),mode:"full-pr",proof:{base_oid:$base,endpoint_digest:$digest,head_oid:$head,raw_patch_digest:$digest}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:"github.com",owner:"acme",repo:"widgets"},target:{head_oid:$head,kind:"pull-request",pr:1983}}')"
+NB_METADATA_DIGEST="$(fixture_pr_evidence "$TDIR/nb-full.patch" widgets 1983 "$NB_BASE" "$NB_HEAD")"
+NB_FULL_BINDING="$(jq -cS --arg digest "$NB_METADATA_DIGEST" '.evidence.proof.pr_metadata_digest=$digest' <<<"$NB_FULL_BINDING")"
 mkdir -p "$NB_FULL_HOME/completed"
 printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — full endpoint reviewed.' > "$NB_FULL_HOME/completed/$NB_FULL_MARKER"
 PRO_GATE_HOME="$NB_FULL_HOME" pg_review_input_binding_write "$NB_FULL_MARKER" "$NB_FULL_BINDING"
-env PRO_GATE_HOME="$NB_FULL_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/nb-full.patch" bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/nb-full.patch" --input bundle >"$TDIR/nb-full-collect.json" 2>"$TDIR/nb-full-collect.err"
+env PRO_GATE_HOME="$NB_FULL_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/nb-full.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/nb-full.patch" bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/nb-full.patch" --input bundle >"$TDIR/nb-full-collect.json" 2>"$TDIR/nb-full-collect.err"
 NB_FULL_COLLECT_RC=$?
 check 'full-pr SHIP in completed/ is collectable and marked bindable' \
   "$([ "$NB_FULL_COLLECT_RC" -eq 0 ] && jq -e '.action=="collect-existing-result" and .facts.completed_results[0].bindable==true and .facts.completed_results[0].evidence_mode=="full-pr"' "$TDIR/nb-full-collect.json" >/dev/null 2>&1; echo $?)" \
   "rc=$NB_FULL_COLLECT_RC output=$(cat "$TDIR/nb-full-collect.json") stderr=$(cat "$TDIR/nb-full-collect.err")"
-env PRO_GATE_HOME="$NB_FULL_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/nb-full.patch" bash "$ENGINE" --review-decision --review-decision-effect "$TDIR/nb-full-collect.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/nb-full.patch" --input bundle >"$TDIR/nb-full-repair.json" 2>"$TDIR/nb-full-repair.err"
-env PRO_GATE_HOME="$NB_FULL_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/nb-full.patch" bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/nb-full.patch" --input bundle >"$TDIR/nb-full-current.json" 2>"$TDIR/nb-full-current.err"
+env PRO_GATE_HOME="$NB_FULL_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/nb-full.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/nb-full.patch" bash "$ENGINE" --review-decision --review-decision-effect "$TDIR/nb-full-collect.json" --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/nb-full.patch" --input bundle >"$TDIR/nb-full-repair.json" 2>"$TDIR/nb-full-repair.err"
+env PRO_GATE_HOME="$NB_FULL_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/nb-full.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/nb-full.patch" bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/nb-full.patch" --input bundle >"$TDIR/nb-full-current.json" 2>"$TDIR/nb-full-current.err"
 NB_FULL_CURRENT_RC=$?
 check 'repaired full-pr SHIP still reduces to allow-existing-merge-workflow' \
   "$([ "$NB_FULL_CURRENT_RC" -eq 0 ] && jq -e '.action=="allow-existing-merge-workflow" and .reason=="current-ship-is-merge-eligible"' "$TDIR/nb-full-current.json" >/dev/null 2>&1; echo $?)" \

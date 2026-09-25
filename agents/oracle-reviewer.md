@@ -68,8 +68,8 @@ INPUT_ARGS=()
 [ -n "${INPUT:-}" ] && INPUT_ARGS=(--input "$INPUT")
 QUERY_ARGS=(--review-decision --json --pr "$PR" --repo "$REPO" "${INPUT_ARGS[@]}")
 # If present: QUERY_ARGS+=(--diff "$REVIEWED_DIFF" [--confirm "$PRIOR_REVIEW"])
-# Full/scoped proof paths use PRO_GATE_REVIEW_ENDPOINT_PATCH and, for scoped input,
-# PRO_GATE_REVIEW_FILTER_MANIFEST.
+# Full/scoped proof paths use PRO_GATE_REVIEW_ENDPOINT_PATCH and PRO_GATE_REVIEW_PR_EVIDENCE;
+# scoped input also uses PRO_GATE_REVIEW_FILTER_MANIFEST.
 "$PG" "${QUERY_ARGS[@]}" > "$DECISION"
 jq -e --arg id "$CONTRACT_ID" --argjson version "$CONTRACT_VERSION" \
   --arg digest "$CONTRACT_DIGEST" --arg corpus "$CORPUS_DIGEST" '
@@ -91,16 +91,22 @@ Dispatch all eight closed actions:
   let the engine size the wait; the runtime rechecks before charge and browser submission.
 - `agent-task` / `fix-review-findings`: return normalized findings non-authoritatively to the
   caller's coding agent; this relay does not edit.
-- `agent-task` / `prepare-matching-review-evidence`: return the requested proof shape to the caller,
-  then re-query after preparation without changing code.
+- `agent-task` / `prepare-matching-review-evidence`: return the requested proof shape to the caller.
+  The caller uses `"$PG" --prepare-review-evidence <new-directory> --pr "$PR" --repo "$REPO"`,
+  which writes `endpoint.patch` and `pr-evidence.json` from an immutable base/head-addressed GitHub
+  comparison with stable metadata checks, without charging or submitting. Re-query with the endpoint as `--diff`/`PRO_GATE_REVIEW_ENDPOINT_PATCH`
+  and the snapshot as `PRO_GATE_REVIEW_PR_EVIDENCE`; scoped evidence keeps its separate payload,
+  manifest and confirmation. Never infer PR base from the feature upstream, continue after failed
+  preparation, or rewrite a historical binding to make it current.
 - `report-only` / `stop-without-new-review`: relay the normalized reason with no retry inference.
   For `account-cooldown-active`, also relay `.facts.cooldown.seconds_remaining`: ChatGPT is
   rate-limiting the account, and re-querying before that many seconds have passed cannot change
   the answer. For `rounds-not-converging`, the open-P0/P1 trajectory (`.facts.governor.arrow`) has
   not shrunk for 2 consecutive re-reviews; this replaces a new round grant or a fix dispatch and
   fires regardless of round-policy mode. `PRO_GATE_ROUNDS_CONTINUE=1` lets one more round through.
-- `report-only` / `allow-existing-merge-workflow`: re-query immediately before handoff; the relay
-  has no merge authority.
+- `report-only` / `allow-existing-merge-workflow`: prepare current PR evidence in a new directory
+  and re-query with it immediately before handoff; cached evidence is not a GitHub freshness check.
+  Keep scoped payload/lineage separate. The relay has no merge authority.
 - `named-product-choice` / `ask-named-product-choice`: ask only the validated named outcomes and
   consequences.
 

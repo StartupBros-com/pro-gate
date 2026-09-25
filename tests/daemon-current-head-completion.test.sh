@@ -94,8 +94,15 @@ REPO_DIR="$HOME_D/repo"; mkdir -p "$REPO_DIR/.git"
 find_repo(){ printf '%s\n' "$REPO_DIR"; }
 git(){
   if [ "${1:-}" = -C ] && [ "${3:-}" = worktree ] && [ "${4:-}" = add ]; then mkdir -p "$6"; fi
+  if [ "${1:-}" = -C ] && [ "${3:-}" = rev-parse ] && [ "${4:-}" = HEAD ]; then printf '%s\n' "${sha:-$SHA}"; fi
   return 0
 }
+# Preserve this suite's process-boundary doubles through the bounded acquisition
+# helper. Real timeout and Git behavior are exercised in engine.test.sh; invoking
+# system timeout here would escape the gh() fixture and contact real GitHub.
+daemon_test_timeout(){ shift 3; "$@"; }
+PRO_GATE_TIMEOUT_BIN=daemon_test_timeout
+PRO_GATE_GH_BIN=gh
 runtime_gate(){ return 0; }
 
 ENGINE="$HOME_D/oracle-review.sh"
@@ -103,7 +110,7 @@ printf '#!/usr/bin/env bash\ncase " $* " in\n  *" --review-decision-effect "*|*"
 chmod +x "$ENGINE"
 
 # gh() answers the #184a CI-readiness query (statusCheckRollup) and, since round 6 (#184 finding
-# 1), the evidence-persistence fetch daemon_prepare_review_evidence makes (gh pr diff --patch).
+# 1), the immutable base/head comparison fetch daemon_prepare_review_evidence makes.
 # GH_DIFF_RC lets individual checks simulate a fetch failure (no evidence ever gets persisted,
 # reproducing the pre-fix daemon which never even tried). GH_DIFF_CALLS_FILE counts real fetch
 # attempts so a test can prove the fetch actually happened (not just that a cached file already
@@ -130,11 +137,17 @@ gh(){
   if [ "${1:-}" = pr ] && [ "${2:-}" = view ]; then
     case " $* " in
       *' --json statusCheckRollup '*) printf '%s\n' "$GH_ROLLUP"; return 0 ;;
+      *' --json number,url,state,baseRefName,baseRefOid,headRefOid '*)
+        jq -cn --arg host "$DAEMON_HOST" --arg nwo "${nwo:-$NWO}" --argjson pr "$3" \
+          --arg head "${sha:-$SHA}" --arg base "${base_oid:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" --arg ref "${GH_BASE_REF:-main}" \
+          '{number:$pr,url:("https://"+$host+"/"+$nwo+"/pull/"+($pr|tostring)),state:"OPEN",baseRefName:$ref,baseRefOid:$base,headRefOid:$head}'
+        return 0 ;;
     esac
   fi
-  if [ "${1:-}" = pr ] && [ "${2:-}" = diff ]; then
+  if [ "${1:-}" = api ]; then
+    [ "$2" = "repos/${nwo:-$NWO}/compare/${base_oid:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}...${sha:-$SHA}" ] || return 1
     case " $* " in
-      *' --patch '*)
+      *' -H Accept:application/vnd.github.diff '*)
         printf 'x\n' >> "$GH_DIFF_CALLS_FILE"
         [ "${GH_DIFF_RC:-0}" -eq 0 ] && printf '%s\n' "$GH_DIFF"
         return "${GH_DIFF_RC:-0}" ;;
@@ -337,11 +350,17 @@ gh(){
   if [ "${1:-}" = pr ] && [ "${2:-}" = view ]; then
     case " $* " in
       *' --json statusCheckRollup '*) printf '%s\n' "$GH_ROLLUP"; return 0 ;;
+      *' --json number,url,state,baseRefName,baseRefOid,headRefOid '*)
+        jq -cn --arg host "$DAEMON_HOST" --arg nwo "${nwo:-$NWO}" --argjson pr "$3" \
+          --arg head "${sha:-$SHA}" --arg base "${base_oid:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" --arg ref "${GH_BASE_REF:-main}" \
+          '{number:$pr,url:("https://"+$host+"/"+$nwo+"/pull/"+($pr|tostring)),state:"OPEN",baseRefName:$ref,baseRefOid:$base,headRefOid:$head}'
+        return 0 ;;
     esac
   fi
-  if [ "${1:-}" = pr ] && [ "${2:-}" = diff ]; then
+  if [ "${1:-}" = api ]; then
+    [ "$2" = "repos/${nwo:-$NWO}/compare/${base_oid:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}...${sha:-$SHA}" ] || return 1
     case " $* " in
-      *' --patch '*)
+      *' -H Accept:application/vnd.github.diff '*)
         printf 'x\n' >> "$GH_DIFF_CALLS_FILE"
         [ "${GH_DIFF_RC:-0}" -eq 0 ] && printf '%s\n' "$GH_DIFF"
         return "${GH_DIFF_RC:-0}" ;;
@@ -861,7 +880,7 @@ case " $* " in
   *" --review-decision-effect "*|*" --review-decision "*)
     case " $* " in
       *" --diff "*)
-        if [ -n "${PRO_GATE_REVIEW_ENDPOINT_PATCH:-}" ]; then cat "$MOCK_FRESH"; else cat "$NOEVID_DECISION"; fi ;;
+        if [ -n "${PRO_GATE_REVIEW_ENDPOINT_PATCH:-}" ] && [ -s "${PRO_GATE_REVIEW_PR_EVIDENCE:-}" ]; then cat "$MOCK_FRESH"; else cat "$NOEVID_DECISION"; fi ;;
       *) cat "$NOEVID_DECISION" ;;
     esac
     ;;
@@ -873,7 +892,7 @@ export NOEVID_DECISION
 
 echo '# finding 1 RED: evidence fetch unavailable -- the daemon can never resolve a completing decision for this head, only prepare-matching-review-evidence, bounded only by the pre-existing agent-task no-progress cap, never completed'
 reset_state
-rm -f "$REVIEW_EVIDENCE_DIR"/*.diff 2>/dev/null
+rm -f "$REVIEW_EVIDENCE_DIR"/*.diff "$REVIEW_EVIDENCE_DIR"/*.diff.pr-evidence.json 2>/dev/null
 GH_DIFF_RC=1   # simulate gh pr diff failing -- no evidence is ever persisted, matching a daemon that never wires evidence in at all
 AGENT_RUNS_NOEVID=0
 daemon_run_agent_task(){ AGENT_RUNS_NOEVID=$((AGENT_RUNS_NOEVID + 1)); return 0; }
@@ -891,7 +910,7 @@ check 'the evidence directory stayed empty for this head the whole time (fetch n
 
 echo '# finding 1 GREEN: evidence fetch available -- the daemon persists it outside the worktree, passes it into the query, and the SAME head resolves to completion instead of relaunching'
 reset_state
-rm -f "$REVIEW_EVIDENCE_DIR"/*.diff 2>/dev/null
+rm -f "$REVIEW_EVIDENCE_DIR"/*.diff "$REVIEW_EVIDENCE_DIR"/*.diff.pr-evidence.json 2>/dev/null
 GH_DIFF_RC=0
 : > "$GH_DIFF_CALLS_FILE"
 GREEN_DECISION="$HOME_D/green-complete.json"
@@ -904,7 +923,7 @@ check 'completion cleans up the now-unneeded persisted evidence file for this ex
 
 echo '# finding 1: superseding a head (new push, new sha) prunes its now-stale persisted evidence rather than accumulating unboundedly'
 reset_state
-rm -f "$REVIEW_EVIDENCE_DIR"/*.diff 2>/dev/null
+rm -f "$REVIEW_EVIDENCE_DIR"/*.diff "$REVIEW_EVIDENCE_DIR"/*.diff.pr-evidence.json 2>/dev/null
 daemon_run_agent_task(){ return 2; }   # capability-unavailable; a deliberate no-op so this section only exercises evidence bookkeeping
 MOCK_FRESH="$NOEVID_DECISION" process_pr "$NWO" "$NUM" "$SHA" "$BRANCH" "$URL" >/dev/null
 check 'evidence for the current sha now exists on disk' "$([ -s "$(daemon_evidence_file "$NWO" "$NUM" "$SHA")" ]; echo $?)" "$(ls "$REVIEW_EVIDENCE_DIR" 2>/dev/null)"
@@ -916,7 +935,7 @@ check 'the new shas own evidence file now exists in its place' "$([ -s "$(daemon
 echo '# #184 finding 3 (round 6): a review worker that exits 0 but never actually submits (the re-resolved decision still requests the SAME unstarted run-granted-review) is bounded by its own no-progress cap, escalating to blocked.tsv, never the completion ledger; genuine progress toward a different outcome is never penalised'
 
 reset_state
-rm -f "$REVIEW_EVIDENCE_DIR"/*.diff 2>/dev/null
+rm -f "$REVIEW_EVIDENCE_DIR"/*.diff "$REVIEW_EVIDENCE_DIR"/*.diff.pr-evidence.json 2>/dev/null
 GH_DIFF_RC=0
 NOPROG_RUN_DECISION="$HOME_D/noprog-run.json"; typed_decision "$(decision_for_action run-granted-review)" "$NOPROG_RUN_DECISION"
 daemon_run_review_worker(){ return 0; }   # exits 0 but never actually submitted -- MOCK_FRESH stays the SAME unstarted run-granted-review decision on re-resolution
@@ -947,7 +966,7 @@ check 'a further poll on the no-progress-blocked head never relaunches the revie
 
 echo '# finding 3: genuine progress toward a DIFFERENT outcome (collect-existing-result) is never charged against the no-progress cap, however many times it is driven past the cap'
 reset_state
-rm -f "$REVIEW_EVIDENCE_DIR"/*.diff 2>/dev/null
+rm -f "$REVIEW_EVIDENCE_DIR"/*.diff "$REVIEW_EVIDENCE_DIR"/*.diff.pr-evidence.json 2>/dev/null
 COLLECT_DECISION="$HOME_D/progress-collect.json"; typed_decision "$(decision_for_action collect-existing-result)" "$COLLECT_DECISION"
 check 'sanity: the progress fixture is runtime-guarded-effect/collect-existing-result' "$([ "$(jq -r .action "$COLLECT_DECISION")" = collect-existing-result ]; echo $?)" "$(jq -r .action "$COLLECT_DECISION")"
 daemon_run_review_worker(){ MOCK_FRESH="$COLLECT_DECISION"; return 0; }
@@ -1020,7 +1039,7 @@ check 'a different sha under the same (owner,repo,pr) still produces a different
 
 echo '# end-to-end: the two colliding repos never share persisted evidence bytes through process_pr'
 reset_state
-rm -f "$REVIEW_EVIDENCE_DIR"/*.diff 2>/dev/null
+rm -f "$REVIEW_EVIDENCE_DIR"/*.diff "$REVIEW_EVIDENCE_DIR"/*.diff.pr-evidence.json 2>/dev/null
 daemon_run_agent_task(){ return 2; }
 GH_DIFF='diff --git a/a b/a
 index e69de29..d00491fd7 100644
@@ -1041,7 +1060,7 @@ MOCK_FRESH="$NOEVID_DECISION" process_pr "$NWO_B" 1 "$SHA" "$BRANCH" "$URL" >/de
 check 'both colliding repos persisted their own evidence file (2 files on disk, not 1 clobbered)' "$([ "$(ls "$REVIEW_EVIDENCE_DIR"/*.diff 2>/dev/null | wc -l)" -eq 2 ]; echo $?)" "$(ls "$REVIEW_EVIDENCE_DIR")"
 check "repo A's evidence file was never overwritten by repo B's fetch" "$(grep -qF '+A' "$(daemon_evidence_file "$NWO_A" 1 "$SHA")"; echo $?)" "$(cat "$(daemon_evidence_file "$NWO_A" 1 "$SHA")" 2>/dev/null)"
 check "repo B's evidence file was never overwritten by repo A's fetch" "$(grep -qF '+B' "$(daemon_evidence_file "$NWO_B" 1 "$SHA")"; echo $?)" "$(cat "$(daemon_evidence_file "$NWO_B" 1 "$SHA")" 2>/dev/null)"
-rm -f "$REVIEW_EVIDENCE_DIR"/*.diff 2>/dev/null
+rm -f "$REVIEW_EVIDENCE_DIR"/*.diff "$REVIEW_EVIDENCE_DIR"/*.diff.pr-evidence.json 2>/dev/null
 GH_DIFF='diff --git a/x b/x
 index e69de29..d00491fd7e5bb6fa28c517a0bb32b8b506539d4d 100644
 --- a/x
@@ -1053,7 +1072,7 @@ index e69de29..d00491fd7e5bb6fa28c517a0bb32b8b506539d4d 100644
 echo '# #184 finding 4 (round 7, P2): daemon_sweep_orphaned_evidence prunes evidence for a PR that has'
 echo '# left the watched set (a conservative TTL, never a same-poll "unseen this cycle" eviction),'
 echo '# and leaves anything still in the active set or still within the TTL alone.'
-rm -f "$REVIEW_EVIDENCE_DIR"/*.diff 2>/dev/null
+rm -f "$REVIEW_EVIDENCE_DIR"/*.diff "$REVIEW_EVIDENCE_DIR"/*.diff.pr-evidence.json 2>/dev/null
 ACTIVE_FILE="$(daemon_evidence_file "$NWO" "$NUM" "$SHA")"
 ORPHAN_OLD_FILE="$(daemon_evidence_file acme/other-repo 42 "$SHA")"
 ORPHAN_FRESH_FILE="$(daemon_evidence_file acme/yet-another 43 "$SHA")"
@@ -1075,7 +1094,7 @@ echo '# finding 4: the main loop wires the sweep in -- a PR still actively polle
 echo '# even though its own evidence file mtime may be old (freshness alone never protects it; only'
 echo '# active-set membership does), and a PR no longer observed at all eventually gets swept.'
 reset_state
-rm -f "$REVIEW_EVIDENCE_DIR"/*.diff 2>/dev/null
+rm -f "$REVIEW_EVIDENCE_DIR"/*.diff "$REVIEW_EVIDENCE_DIR"/*.diff.pr-evidence.json 2>/dev/null
 STILL_ACTIVE_OLD="$(daemon_evidence_file "$NWO" "$NUM" "$SHA")"
 printf 'still-active-but-old\n' > "$STILL_ACTIVE_OLD"
 touch -d "@$OLD_TS" "$STILL_ACTIVE_OLD" 2>/dev/null || true
@@ -1124,7 +1143,7 @@ echo '# #184 finding 2 (round 8): persisted completion proof AND persisted evide
 echo '# PR BASE, not just the head sha -- a base-branch advance or PR retarget changes the actual diff'
 echo '# while the head sha stays put, so both must be invalidated/re-keyed rather than reused stale.'
 reset_state
-rm -f "$REVIEW_EVIDENCE_DIR"/*.diff 2>/dev/null
+rm -f "$REVIEW_EVIDENCE_DIR"/*.diff "$REVIEW_EVIDENCE_DIR"/*.diff.pr-evidence.json 2>/dev/null
 F2_SHA=3333333333333333333333333333333333333333
 BASE_A=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 BASE_B=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
@@ -1145,6 +1164,26 @@ mark_processed_heads "$NWO" "$NUM" "$F2_SHA" "$BASE_A"
 check 'a missing CURRENT base (transient gh gap) is also trusted, never invalidated on our own missing data' "$(daemon_head_still_complete "$NWO" "$NUM" "$F2_SHA" "" && already_done "$NWO" "$NUM" "$F2_SHA"; echo $?)"
 reset_state
 
+echo '# #221: same-OID retargets invalidate completion and prepared evidence too'
+mark_processed_heads "$NWO" "$NUM" "$F2_SHA" "$BASE_A" main
+check 'an unchanged base ref and tip retain current completion' \
+  "$(daemon_head_still_complete "$NWO" "$NUM" "$F2_SHA" "$BASE_A" main; echo $?)"
+check 'same-OID retarget invalidates completion without touching immutable review records' \
+  "$(! daemon_head_still_complete "$NWO" "$NUM" "$F2_SHA" "$BASE_A" release && ! already_done "$NWO" "$NUM" "$F2_SHA"; echo $?)"
+mark_processed_heads "$NWO" "$NUM" "$F2_SHA" "$BASE_A"
+check 'a predecessor completion row lacking base ref is re-evaluated when authoritative ref is known' \
+  "$(! daemon_head_still_complete "$NWO" "$NUM" "$F2_SHA" "$BASE_A" main && ! already_done "$NWO" "$NUM" "$F2_SHA"; echo $?)"
+RETARGET_WT="$HOME_D/retarget-wt"; mkdir -p "$RETARGET_WT"
+RETARGET_EVID="$(daemon_prepare_review_evidence "$NWO" "$NUM" "$F2_SHA" "$BASE_A" "$RETARGET_WT" "$LOG_FILE" main)"
+RETARGET_CALLS="$(gh_diff_calls)"
+RETARGET_SAME="$(daemon_prepare_review_evidence "$NWO" "$NUM" "$F2_SHA" "$BASE_A" "$RETARGET_WT" "$LOG_FILE" main)"
+check 'unchanged authoritative target reuses the prepared evidence without fetching its patch again' \
+  "$([ -n "$RETARGET_EVID" ] && [ "$RETARGET_SAME" = "$RETARGET_EVID" ] && [ "$(gh_diff_calls)" = "$RETARGET_CALLS" ]; echo $?)"
+RETARGET_NEW="$(GH_BASE_REF=release daemon_prepare_review_evidence "$NWO" "$NUM" "$F2_SHA" "$BASE_A" "$RETARGET_WT" "$LOG_FILE" release)"
+check 'same-OID retarget replaces the cache with evidence bound to the new base ref' \
+  "$([ -n "$RETARGET_NEW" ] && [ "$(gh_diff_calls)" -eq "$((RETARGET_CALLS + 1))" ] && jq -e '.metadata.target.base_ref=="release"' "$RETARGET_NEW.pr-evidence.json" >/dev/null; echo $?)"
+reset_state
+
 echo '# the injective evidence key extends to the base identity too: same (nwo,num,sha) under two'
 echo '# different bases must never resolve to the same on-disk path.'
 EVID_BASE_A="$(daemon_evidence_file "$NWO" "$NUM" "$F2_SHA" "$BASE_A")"
@@ -1157,7 +1196,7 @@ check 'sanity: the evidence path is deterministic for a repeated (nwo,num,sha,ba
 echo '# end-to-end (main-loop pattern): daemon_head_still_complete gating process_pr means a base'
 echo '# change actually causes a refetch of the new diff, never a reuse of the stale cached bytes.'
 reset_state
-rm -f "$REVIEW_EVIDENCE_DIR"/*.diff 2>/dev/null
+rm -f "$REVIEW_EVIDENCE_DIR"/*.diff "$REVIEW_EVIDENCE_DIR"/*.diff.pr-evidence.json 2>/dev/null
 GH_DIFF_RC=0
 GH_DIFF='diff --git a/newbase b/newbase
 index e69de29..d00491fd7 100644
@@ -1178,7 +1217,7 @@ fi
 check 'main-loop pattern: a base change re-enters process_pr for the same head sha' "$([ "$LOOP_B_REDISPATCHED" -eq 1 ]; echo $?)"
 NEWBASE_EVID="$(daemon_evidence_file "$NWO" "$NUM" "$F2_SHA" "$BASE_B")"
 check 'the refetched evidence under the new base reflects the NEW diff bytes, not the stale cached ones' "$(grep -qF '+NEWBASE' "$NEWBASE_EVID" 2>/dev/null; echo $?)" "$(cat "$NEWBASE_EVID" 2>/dev/null)"
-rm -f "$REVIEW_EVIDENCE_DIR"/*.diff 2>/dev/null
+rm -f "$REVIEW_EVIDENCE_DIR"/*.diff "$REVIEW_EVIDENCE_DIR"/*.diff.pr-evidence.json 2>/dev/null
 reset_state
 
 echo '# #184 finding 4 (round 8, P2 SECURITY): daemon state -- and specifically persisted, raw PR'
@@ -1195,7 +1234,7 @@ for LEDGER_F in "$STATE" "$STATE_LEGACY" "$QUARANTINE" "$FAILS" "$CIDEFER" "$CIE
 done
 check 'every ledger file (processed-v2/processed/quarantine/failcount/ci-defer/ci-empty-rollup/agent-task-attempts/agent-task-failures/blocked/review-worker-no-progress) is 0600' "$([ "$LEDGER_MODE_FAIL" -eq 0 ]; echo $?)"
 
-rm -f "$REVIEW_EVIDENCE_DIR"/*.diff 2>/dev/null
+rm -f "$REVIEW_EVIDENCE_DIR"/*.diff "$REVIEW_EVIDENCE_DIR"/*.diff.pr-evidence.json 2>/dev/null
 F4_SHA=5555555555555555555555555555555555555555
 F4_WT="$HOME_D/f4-wt"; mkdir -p "$F4_WT"
 F4_LOG="$HOME_D/f4.log"; : > "$F4_LOG"
