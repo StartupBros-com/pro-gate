@@ -3159,6 +3159,10 @@ if [ -n "$PR_NUM" ]; then
 fi
 [ -n "$REPO" ] || REPO="$(pwd)"
 cd "$REPO" || { echo "ERROR: repo dir not found: $REPO" >&2; pg_status failed "repo dir not found"; pg_finish 4; }
+# #222 gate r1 P2: every later `git -C "$REPO"` (evidence preparation, the snapshot read, the
+# pre-charge recheck) runs from inside the checkout, where a relative --repo would name a
+# directory below it. Absolute paths are kept byte for byte, so their round keys never move.
+case "$REPO" in /*) ;; *) REPO="$(pwd)" ;; esac
 # gate r1 P1 (#161) follow-on: honor PRO_GATE_GH_BIN here too, like recover_superseded_reason
 # (line ~806) and pg_install_full_pr_input_binding already do. Every value derived below
 # (REPO_SLUG, PR_KEY, PG_META_HOST/OWNER/REPO) starts from PR_URL; resolving it through the

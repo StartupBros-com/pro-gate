@@ -468,7 +468,7 @@ PR_EVIDENCE_GH
       PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 \
       PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_ORACLE_COMPLETE=1 \
       PG_TEST_ORACLE_SENTINEL="$home.oracle.calls" NODE_OPTIONS= \
-      bash "$ENGINE" --pr "${PG_PR_TEST_PR:-https://github.com/acme/widgets/pull/221}" --repo "$repo" "$@"
+      bash "$ENGINE" --pr "${PG_PR_TEST_PR:-https://github.com/acme/widgets/pull/221}" --repo "${PG_PR_TEST_REPO_ARG:-$repo}" "$@"
   }
   for tracking in main feature none; do
     if [ "$tracking" = none ]; then git -C "$repo" branch --unset-upstream feature
@@ -494,6 +494,19 @@ PR_EVIDENCE_GH
       "$(cmp -s "$root/payload-$tracking.diff" "$root/endpoint.patch" && jq -e --arg actual "$(sha256sum "$root/payload-$tracking.diff" | cut -d' ' -f1)" '.evidence.proof.raw_patch_digest==$actual' "$binding" >/dev/null; echo $?)" \
       "binding=$(cat "$binding" 2>/dev/null) delivered=$(cat "$root/payload-$tracking.diff")"
   done
+
+  # #222 gate r1 P2: the engine cds into --repo before it prepares evidence, so a
+  # relative --repo given from the checkout's parent must still name that checkout.
+  home="$root/relative-classic-home"
+  ( cd "$root" && PG_PR_TEST_REPO_ARG=repo pr_identity_engine --out "$root/relative-classic.md" --timeout 10s ) \
+    > "$root/relative-classic.out" 2> "$root/relative-classic.err"
+  rc=$?
+  marker="$(jq -r '.marker // empty' "$root/relative-classic.md.status" 2>/dev/null)"
+  check 'a classic review given a relative --repo from its parent directory binds the real PR evidence' \
+    "$([ "$rc" -eq 0 ] && [ -s "$home.oracle.calls" ] && jq -e --arg base "$base" --arg head "$head" \
+      '.evidence.mode=="full-pr" and .evidence.proof.base_oid==$base and .target.head_oid==$head' \
+      "$home/review-input-bindings/$marker" >/dev/null; echo $?)" \
+    "rc=$rc marker=$marker stderr=$(tail -4 "$root/relative-classic.err")"
 
   for change in 0 1; do
     home="$root/caller-filter-$change-home"
@@ -617,6 +630,23 @@ PR_EVIDENCE_GH
   check 'correct metadata-bound completed review reaches the existing allow path' \
     "$(jq -e '.action=="allow-existing-merge-workflow"' "$root/completed.json" >/dev/null; echo $?)" \
     "decision=$(cat "$root/completed.json") stderr=$(cat "$root/completed.err")"
+
+  # The typed effect rechecks the same relation after that cd, before any charge.
+  home="$root/relative-effect-home"
+  ( cd "$root" && PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+      PG_PR_TEST_REPO_ARG=repo pr_identity_engine --review-decision --json --diff "$prep/endpoint.patch" ) \
+    > "$root/relative-query.json" 2> "$root/relative-query.err"
+  ( cd "$root" && PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+      PG_PR_TEST_REPO_ARG=repo pr_identity_engine --review-decision-effect "$root/relative-query.json" --diff "$prep/endpoint.patch" \
+      --out "$root/relative-effect.md" --timeout 10s ) > "$root/relative-effect.out" 2> "$root/relative-effect.err"
+  rc=$?
+  marker="$(jq -r '.marker // empty' "$root/relative-effect.md.status" 2>/dev/null)"
+  check 'a typed full-PR effect given a relative --repo passes its pre-charge recheck and binds the real PR evidence' \
+    "$([ "$rc" -eq 0 ] && jq -e '.action=="run-granted-review"' "$root/relative-query.json" >/dev/null && [ -s "$home.oracle.calls" ] && \
+      jq -e --arg base "$base" --arg head "$head" \
+      '.evidence.proof.base_oid==$base and .target.head_oid==$head and (.evidence.proof.pr_metadata_digest|test("^[0-9a-f]{64}$"))' \
+      "$home/review-input-bindings/$marker" >/dev/null; echo $?)" \
+    "rc=$rc query=$(jq -c '{action,reason}' "$root/relative-query.json" 2>/dev/null) marker=$marker stderr=$(tail -4 "$root/relative-effect.err")"
 
   home="$root/race-home"
   PG_PR_TEST_RETARGET=1 pr_identity_engine --prepare-review-evidence "$root/raced" > "$root/raced.out" 2> "$root/raced.err"
