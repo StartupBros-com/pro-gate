@@ -391,7 +391,7 @@ pg_review_decision_input_proof_current() { # binding repo pr host owner name hea
   case "$mode" in full-pr|scoped-delta)
     pr_evidence="$(pg_pr_evidence_read "${PRO_GATE_REVIEW_PR_EVIDENCE:-}" "${PRO_GATE_REVIEW_ENDPOINT_PATCH:-}" \
       "$repo" "$host" "$owner" "$name" "$pr")" || return 1
-    metadata_digest="$(pg_review_sha256_text "$(jq -cS .metadata <<<"$pr_evidence")")" || return 1
+    metadata_digest="$(pg_pr_evidence_metadata_digest "$pr_evidence")" || return 1
     jq -e --arg digest "$metadata_digest" '.evidence.proof.pr_metadata_digest==$digest' <<<"$binding" >/dev/null || return 1
     [ "$base" = "$(jq -r .metadata.target.base_oid <<<"$pr_evidence")" ] || return 1
     ;;
@@ -450,7 +450,7 @@ pg_review_decision_prospective_input_binding() { # repo pr host owner name head 
   if [ "$INPUT" = bundle ] || [ "$INPUT" = both ]; then
     pr_evidence="$(pg_pr_evidence_read "${PRO_GATE_REVIEW_PR_EVIDENCE:-}" "${PRO_GATE_REVIEW_ENDPOINT_PATCH:-}" \
       "$repo" "$host" "$owner" "$name" "$pr")" || return 1
-    metadata_digest="$(pg_review_sha256_text "$(jq -cS .metadata <<<"$pr_evidence")")" || return 1
+    metadata_digest="$(pg_pr_evidence_metadata_digest "$pr_evidence")" || return 1
   fi
   reviewed="${REVIEW_DECISION_REVIEWED_DIFF_FILE:-${DIFF_FILE:-}}"
   binding=""
@@ -2132,7 +2132,7 @@ pg_install_full_pr_input_binding() { # marker; only endpoint-fetched full PRs ga
   esac
   if [ "$INPUT" = bundle ] || [ "$INPUT" = both ]; then
     local metadata_digest
-    metadata_digest="$(pg_review_sha256_text "$(jq -cS .metadata <<<"$PG_FULL_PR_EVIDENCE")")" || return 1
+    metadata_digest="$(pg_pr_evidence_metadata_digest "$PG_FULL_PR_EVIDENCE")" || return 1
     binding="$(jq -cS --arg digest "$metadata_digest" '.evidence.proof.pr_metadata_digest=$digest' <<<"$binding")" || return 1
   fi
   pg_review_input_binding_write "$marker" "$binding"

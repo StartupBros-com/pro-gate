@@ -936,10 +936,18 @@ pg_pr_evidence_current() { # validated snapshot -> authoritative pre-effect chec
   [ "$current" = "$metadata" ]
 }
 
+# The one canonicalization shared by every binding writer and verifier: a drift
+# between them would let a binding silently stop proving its PR identity.
+pg_pr_evidence_metadata_digest() { # validated snapshot -> pr_metadata_digest
+  local metadata
+  metadata="$(jq -ceS '.metadata|objects' <<<"$1")" || return 1
+  pg_review_sha256_text "$metadata"
+}
+
 pg_prepare_pr_evidence() ( # repo host owner name pr new-output-directory
   set -euo pipefail
   local repo="$1" host="$2" owner="$3" name="$4" pr="$5" dest="$6" before after base head tmp digest
-  local gh_bin="${PRO_GATE_GH_BIN:-gh}" timeout_bin="${PRO_GATE_TIMEOUT_BIN:-timeout}"
+  local gh_bin="${PRO_GATE_GH_BIN:-gh}" timeout_bin="${PRO_GATE_TIMEOUT_BIN:-timeout}" claimed=false published=false
   [ ! -e "$dest" ] && [ ! -L "$dest" ] || { echo 'ERROR: evidence output directory must be new' >&2; exit 2; }
   # Callers use this helper in conditionals, where Bash suppresses errexit even
   # in a subshell. Every fallible preparation/publication step must stop explicitly.
@@ -952,7 +960,12 @@ pg_prepare_pr_evidence() ( # repo host owner name pr new-output-directory
   }
   mkdir -p "$(dirname "$dest")" || exit 2
   tmp="$(mktemp -d "${dest}.prepare.XXXXXX")" || exit 2
-  trap 'rm -f "$tmp/endpoint.patch" "$tmp/pr-evidence.json"; rmdir "$tmp" 2>/dev/null || true' EXIT
+  # A claimed but unpublished destination is released on any exit, including a
+  # caught signal, so a failed publish never blocks the next attempt at that path.
+  trap 'rm -f "$tmp/endpoint.patch" "$tmp/pr-evidence.json"; rmdir "$tmp" 2>/dev/null || true
+    if [ "$claimed" = true ] && [ "$published" != true ]; then
+      rm -f "$dest/endpoint.patch" "$dest/pr-evidence.json"; rmdir "$dest" 2>/dev/null || true
+    fi' EXIT
   chmod 700 "$tmp" || exit 2
   # The mutable PR diff endpoint can lag a push while PR metadata is already
   # current. Address the comparison by immutable commit IDs instead (#221).
@@ -975,12 +988,14 @@ pg_prepare_pr_evidence() ( # repo host owner name pr new-output-directory
   chmod 600 "$tmp/endpoint.patch" "$tmp/pr-evidence.json" || exit 2
   # mkdir owns publication; a concurrent preparer cannot overwrite a completed pair.
   mkdir "$dest" || exit 2
+  claimed=true
   chmod 700 "$dest" || exit 2
   mv "$tmp/endpoint.patch" "$dest/endpoint.patch" || exit 2
   mv "$tmp/pr-evidence.json" "$dest/pr-evidence.json" || exit 2
   dest="$(cd "$dest" && pwd -P)" || exit 2
   jq -cnS --arg endpoint "$dest/endpoint.patch" --arg snapshot "$dest/pr-evidence.json" \
-    '{endpoint_patch:$endpoint,pr_evidence:$snapshot}'
+    '{endpoint_patch:$endpoint,pr_evidence:$snapshot}' || exit 2
+  published=true
 )
 
 # A compact, marker-addressed sidecar survives reservation retirement and completion:

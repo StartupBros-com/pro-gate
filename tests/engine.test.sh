@@ -403,7 +403,7 @@ run_change_lock_wait_budget_tests() {
 # Exercise the public classic review path with real Git history and an isolated
 # GitHub/Oracle fixture; a successful capture must retain the actual PR base.
 run_pr_evidence_identity_tests() {
-  local root="$TDIR/pr-evidence" repo base head tracking home rc marker binding prep calls action change
+  local root="$TDIR/pr-evidence" repo base head tracking home rc marker binding prep calls action change dest want
   root="$TDIR/pr-evidence"; repo="$root/repo"
   mkdir -p "$repo" "$root/user/.local/bin"
   git -C "$repo" init -q -b main
@@ -438,7 +438,7 @@ case "$1 $2" in
       expected="repos/acme/widgets/compare/$(jq -r .baseRefOid "$PG_PR_TEST_METADATA")...$(jq -r .headRefOid "$PG_PR_TEST_METADATA")"
       [ "$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')" = "$expected" ] || exit 99
       case " $* " in *' --hostname github.com -H Accept:application/vnd.github.diff '*) ;; *) exit 99 ;; esac
-      cat "$PG_PR_TEST_PATCH"
+      [ "${PG_PR_TEST_EMPTY:-0}" = 1 ] || cat "$PG_PR_TEST_PATCH"
     elif [ "${PG_PR_TEST_STALE:-0}" = 1 ]; then
       cat "$PG_PR_TEST_STALE_PATCH"
     else
@@ -652,6 +652,66 @@ PR_EVIDENCE_GH
     "rc=$rc stderr=$(cat "$root/moved-head.err")"
   jq --arg head "$head" '.headRefOid=$head | .baseRefName="main"' "$root/pr.json" > "$root/pr.next"
   mv "$root/pr.next" "$root/pr.json"
+
+  # An occupied destination is refused before any GitHub read and keeps its bytes.
+  repo="$root/repo"
+  ln -s "$root/missing-proof-target" "$root/dangling-proof"
+  cp "$prep/endpoint.patch" "$root/occupied-endpoint.before"
+  cp "$prep/pr-evidence.json" "$root/occupied-evidence.before"
+  for change in completed dangling; do
+    home="$root/$change-dest-home"
+    case "$change" in completed) dest="$prep" ;; dangling) dest="$root/dangling-proof" ;; esac
+    calls="$(wc -l < "$root/gh.calls")"
+    pr_identity_engine --prepare-review-evidence "$dest" > "$root/$change-dest.out" 2> "$root/$change-dest.err"
+    rc=$?
+    check "preparation refuses a $change destination before any GitHub read or write" \
+      "$([ "$rc" -eq 2 ] && grep -qF 'evidence output directory must be new' "$root/$change-dest.err" && \
+        [ ! -s "$root/$change-dest.out" ] && [ "$calls" = "$(wc -l < "$root/gh.calls")" ] && [ ! -e "$home" ] && \
+        ! compgen -G "$dest.prepare.*" >/dev/null && [ -L "$root/dangling-proof" ] && [ ! -e "$root/missing-proof-target" ] && \
+        cmp -s "$prep/endpoint.patch" "$root/occupied-endpoint.before" && cmp -s "$prep/pr-evidence.json" "$root/occupied-evidence.before"; echo $?)" \
+      "rc=$rc stderr=$(cat "$root/$change-dest.err")"
+  done
+
+  home="$root/empty-compare-home"; dest="$root/empty-compare"
+  PG_PR_TEST_EMPTY=1 pr_identity_engine --prepare-review-evidence "$dest" > "$root/empty-compare.out" 2> "$root/empty-compare.err"
+  rc=$?
+  check 'an empty compare response is refused without publishing or leaving scratch' \
+    "$([ "$rc" -eq 2 ] && grep -qF 'PR patch is empty or exceeds the evidence limit' "$root/empty-compare.err" && \
+      [ ! -e "$dest" ] && ! compgen -G "$dest.prepare.*" >/dev/null && [ ! -e "$home" ]; echo $?)" \
+    "rc=$rc stderr=$(cat "$root/empty-compare.err")"
+
+  # A publish that fails or is killed after claiming its destination releases it,
+  # so the same path is retryable rather than blocked by a half-written pair.
+  cat > "$root/user/.local/bin/mv" <<'PR_EVIDENCE_MV'
+#!/usr/bin/env bash
+case "${PG_PR_TEST_MV_FAIL:-}:${*: -1}" in
+  exit:*/pr-evidence.json) exit 1 ;;
+  term:*/pr-evidence.json) kill -TERM "$PPID"; exit 1 ;;
+esac
+exec /bin/mv "$@"
+PR_EVIDENCE_MV
+  chmod +x "$root/user/.local/bin/mv"
+  for change in exit term; do
+    home="$root/unwind-$change-home"; dest="$root/unwind-$change"
+    case "$change" in exit) want=2 ;; term) want=143 ;; esac
+    PG_PR_TEST_MV_FAIL="$change" pr_identity_engine --prepare-review-evidence "$dest" \
+      > "$root/unwind-$change.out" 2> "$root/unwind-$change.err"
+    rc=$?
+    check "a publish $change after claiming the destination releases it" \
+      "$([ "$rc" -eq "$want" ] && [ ! -s "$root/unwind-$change.out" ] && [ ! -e "$dest" ] && [ ! -L "$dest" ] && \
+        ! compgen -G "$dest.prepare.*" >/dev/null && [ ! -e "$home" ]; echo $?)" \
+      "rc=$rc entries=$(ls -a "$dest" 2>&1) stderr=$(cat "$root/unwind-$change.err")"
+    pr_identity_engine --prepare-review-evidence "$dest" > "$root/unwind-$change-retry.json" 2> "$root/unwind-$change-retry.err"
+    rc=$?
+    check "a retry at the released $change destination publishes the pair and reports its paths" \
+      "$([ "$rc" -eq 0 ] && cmp -s "$dest/endpoint.patch" "$root/endpoint.patch" && \
+        jq -e --arg head "$head" '.metadata.target.head_oid==$head' "$dest/pr-evidence.json" >/dev/null && \
+        jq -e --arg dir "$(cd "$dest" 2>/dev/null && pwd -P)" \
+          '.endpoint_patch==($dir+"/endpoint.patch") and .pr_evidence==($dir+"/pr-evidence.json")' \
+          "$root/unwind-$change-retry.json" >/dev/null; echo $?)" \
+      "rc=$rc out=$(cat "$root/unwind-$change-retry.json") stderr=$(cat "$root/unwind-$change-retry.err")"
+  done
+  rm -f "$root/user/.local/bin/mv"
 
   repo="$root/repo"; home="$root/scoped-home"
   printf 'proof.txt\npackage-lock.json\n' > "$root/scope.txt"
