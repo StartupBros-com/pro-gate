@@ -106,7 +106,8 @@ Stop on preparation failure; do not continue with partial files. Preparation che
 before and after fetching a comparison addressed by immutable base/head commit IDs. Full-PR proof
 requires identical endpoint/reviewed bytes; a partial payload requires all scoped inputs and never
 falls back to full-PR authority. Bound payloads are sent without a second automatic generated-file
-filter; use explicit scoped evidence to omit files, rather than relying on post-preparation hygiene.
+filter. Only a scoped delta review, which confirms an earlier full review, can omit files; a first
+review covers every change, and the existing size limits apply to that payload.
 The query reads only the prepared files; the guarded effect
 rechecks GitHub before charge. Keep both proof paths unchanged across query/effect and retain them
 for recovery. A same-head historical binding without authoritative PR metadata remains readable for

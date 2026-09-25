@@ -272,8 +272,10 @@ confirmation. Missing scoped inputs never turn a partial payload into full-PR au
 Proof-bound full/scoped runs retain those exact payload bytes through submission: automatic diff
 hygiene does not remove generated or lockfile changes after preparation. Consequently a classic
 `--pr` bundle review now includes the complete comparison. `PRO_GATE_DIFF_FILTER` still controls
-ordinary caller-patch and brief reviews, which do not earn full-PR proof. To narrow a bound review,
-provide explicit scoped evidence; the existing size limits apply to the payload actually sent.
+ordinary caller-patch and brief reviews, which do not earn full-PR proof. The existing size limits
+apply to the payload actually sent. Only a scoped delta review, which confirms an earlier full review,
+can omit files through its manifest; a first review covers every change, so a PR whose generated
+changes push it past the hard line limit must be split or run with a raised limit.
 Keep those same inputs across query/effect. Advisory queries remain file-only; guarded effects check
 GitHub again before a charge or result-binding repair. A query is not a live GitHub freshness check:
 prepare current evidence again before the final merge-workflow handoff. Pro-gate never merges.
