@@ -210,6 +210,13 @@ const PENDING_DIR = path.join(PG_HOME, 'pending');
 // states include generating and superseded) is the proof its memo is still someone's only
 // recovery handle. rememberUrl()'s eviction below reads this by existence only.
 const RESERVATION_DIR = envPath('PRO_GATE_RESERVATION_DIR', PG_HOME, 'in-progress');
+// The shell's pg_review_input_binding_dir. A pre-v0.55 full-PR or scoped binding (no PR metadata
+// proof) makes its round's memo a review record the runtime still refuses to replace
+// (pg_review_input_binding_legacy_reviewed), so that memo keeps the 14-day sweep as its horizon
+// rather than the count cap below. No new legacy binding is ever written, so this class only shrinks.
+const INPUT_BINDING_DIR = envPath('PRO_GATE_REVIEW_INPUT_BINDING_DIR', PG_HOME, 'review-input-bindings');
+// Where forgetUrl() claims such a memo as a receipt instead of deleting it; see legacyReceiptPath().
+const LEGACY_RECEIPT_DIR = path.join(PG_HOME, 'legacy-review-receipts');
 const MEMO_KEEP = 200;                  // newest N unprotected memos retained; older ones are pruned on write
 // #208 gate r1 P1: a stale unowned tab can legitimately fingerprint under TWO different hashes
 // across invocations (modal text vs. whole-page text) when a marker-less interstitial also
@@ -300,10 +307,28 @@ function recallTitle(m) {
 // than declaring absence (#68 gate r3 P1): restoring the file but then clearing knownUrl left
 // this invocation blind to a recovery handle that exists on disk, and its exit 4 could supply
 // the final miss that retires the reservation.
+// A legacy round's memo can be its only review record (legacyReviewBinding), and a probe never
+// flushes the cross-bind sidecar that would otherwise stand in for it. So forgetUrl() claims
+// such a memo by renaming it straight into a receipt of its own in LEGACY_RECEIPT_DIR, which only
+// the runtime's replacement-spend refusal reads (pg_run_left_review_record). The claimed inode,
+// with its mtime, is exactly what the receipt keeps (the 14-day sweep expires it on the memo's
+// clock); there is no moment when neither exists; and no revocation ever replaces another's
+// receipt (pro-gate #227 rounds 3-5). Mirrors the shell's pg_legacy_review_receipt_path.
+// Returns the receipt path, null for a marker without a legacy binding, or false when a legacy
+// memo cannot be receipted, in which case the caller keeps the memo.
+let legacyReceiptSeq = 0;
+function legacyReceiptPath(m) {
+  if (!legacyReviewBinding(m)) return null;
+  try { fs.mkdirSync(LEGACY_RECEIPT_DIR, { recursive: true }); } catch { return false; }
+  return path.join(LEGACY_RECEIPT_DIR, `${m}.${process.pid}.${Date.now()}.${++legacyReceiptSeq}`);
+}
+
 function forgetUrl(m, url) {
   const f = memoPath(m);
   if (!f) return null;
-  const claim = `${f}.rej.${process.pid}`;
+  const receipt = legacyReceiptPath(m);
+  if (receipt === false) return null;
+  const claim = receipt ?? `${f}.rej.${process.pid}`;
   try { fs.renameSync(f, claim); } catch { return null; }   // nothing to claim: someone else won
   let held = '';
   try { held = fs.readFileSync(claim, 'utf8').trim(); } catch {}
@@ -311,7 +336,9 @@ function forgetUrl(m, url) {
   if (held && held !== url) {
     try { fs.linkSync(claim, f); survivor = held; } catch {}  // genuine memo republished: put it back
   }
-  try { fs.unlinkSync(claim); } catch {}
+  // A legacy receipt stays even once a memo is back: that memo can be an older generation another
+  // revoker restored, and only the 14-day sweep expires a receipt (pro-gate #227 round 6).
+  if (!receipt) { try { fs.unlinkSync(claim); } catch {} }
   return survivor;
 }
 
@@ -361,10 +388,13 @@ function markerHasBlacklistEntry(m) {
 function flushCrossBind(m) {
   const dir = path.join(PG_HOME, 'crossbound');
   const f = path.join(dir, m);
+  // A legacy round's sidecar can be its only review record (legacyReviewBinding), so nothing
+  // here clears one; like its receipts, only the 14-day sweep does (pro-gate #227 round 7).
+  const legacy = legacyReviewBinding(m);
   // Positive ownership is the ONLY proof a conviction went stale, so it is the only thing that
   // clears the sidecar unconditionally.
   if (ownershipProven) {
-    try { fs.unlinkSync(f); } catch {}
+    if (!legacy) { try { fs.unlinkSync(f); } catch {} }
     return;
   }
   if (crossBindHits.size === 0) {
@@ -380,7 +410,7 @@ function flushCrossBind(m) {
     // deleted conversation-urls/<marker> in the same breath.
     // Clear only when this marker has no blacklist entry that could have produced the emptiness.
     // --close/--sweep-root keep clearing an otherwise-unsupported stale conviction (#76).
-    if (!markerHasBlacklistEntry(m)) { try { fs.unlinkSync(f); } catch {} }
+    if (!legacy && !markerHasBlacklistEntry(m)) { try { fs.unlinkSync(f); } catch {} }
     return;
   }
   try {
@@ -413,6 +443,16 @@ process.on('exit', () => {
   flushCrossBind(marker);
 });
 
+function legacyReviewBinding(m) {
+  try {
+    const { evidence } = JSON.parse(fs.readFileSync(path.join(INPUT_BINDING_DIR, m), 'utf8'));
+    const proof = evidence?.proof;
+    return (evidence?.mode === 'full-pr' || evidence?.mode === 'scoped-delta')
+      && proof !== null && typeof proof === 'object' && !Array.isArray(proof)
+      && !Object.hasOwn(proof, 'pr_metadata_digest');
+  } catch { return false; }
+}
+
 function rememberUrl(m, url) {
   const f = memoPath(m);
   if (!f) return;
@@ -443,9 +483,10 @@ function rememberUrl(m, url) {
       // applies only to UNPROTECTED entries; protected entries never count toward it and are
       // never removed. A missing in-progress/ directory protects nothing (fail-open to the
       // pre-existing behavior). One existsSync per candidate, and only because the cap is
-      // already known to be exceeded.
+      // already known to be exceeded. A legacy binding's memo is protected the same way
+      // (INPUT_BINDING_DIR above); the 14-day sweep still expires it.
       const unprotected = entries
-        .filter((n) => { try { return !fs.existsSync(path.join(RESERVATION_DIR, n)); } catch { return true; } })
+        .filter((n) => { try { return !fs.existsSync(path.join(RESERVATION_DIR, n)) && !legacyReviewBinding(n); } catch { return true; } })
         .map((n) => { try { return { n, t: fs.statSync(path.join(URL_MEMO_DIR, n)).mtimeMs }; } catch { return { n, t: 0 }; } })
         .sort((a, b) => b.t - a.t);
       if (unprotected.length > MEMO_KEEP) {
@@ -1044,6 +1085,10 @@ const CONSUME_GRACE_MS = 2_000;
 // revalidation. Each gets a small fixed budget of its own, so it still runs but cannot hang.
 const CLOSE_REQUEST_MS = 2_000;
 const LATE_LIST_MS = 5_000;
+// The main scan's listing is bounded by the deadline, but one it starts just before the deadline
+// still gets this floor: the last poll sleep ends at the deadline, and a timer firing a hair early
+// otherwise starts a listing with ~1ms of budget whose abort reads as a failed list (browser-down).
+const MIN_LIST_MS = 1_000;
 async function fetchBeforeDeadline(url, options, requestDeadline, consume = null) {
   const remaining = requestDeadline - Date.now();
   if (remaining <= 0) throw new Error('caller-deadline-expired');
@@ -1982,7 +2027,7 @@ let lastMatchWasSeeded = false;  // that sighting came from the remembered URL, 
 while (Date.now() < deadline) {
   let tabs = [];
   try {
-    tabs = (await listTargets(deadline))
+    tabs = (await listTargets(Math.max(deadline, Date.now() + MIN_LIST_MS)))
       .filter((t) => t.type === 'page' && /chatgpt\.com\/c\//.test(t.url || ''));
     listFailures = 0;
     lastListOk = true;
