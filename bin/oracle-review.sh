@@ -594,8 +594,12 @@ pg_review_decision_cli() {
     jq -e --arg h "$host" --arg o "$owner" --arg r "$repo_name" --argjson p "$pr_num" --arg head "$head" \
       '.repository.host==$h and .repository.owner==$o and .repository.repo==$r and .target.pr==$p and .target.head_oid==$head' \
       <<<"$candidate" >/dev/null 2>&1 || continue
+    # Only a legacy round that left a review behind makes a new round a replacement spend. A
+    # charged round with no bytes, result, or conversation reviewed nothing (pushbot #3755), so it
+    # must not strand its head; its charge still counts against the round budget.
     if jq -e '(.evidence.mode=="full-pr" or .evidence.mode=="scoped-delta") and
-      (.evidence.proof|has("pr_metadata_digest")|not)' <<<"$candidate" >/dev/null; then
+      (.evidence.proof|has("pr_metadata_digest")|not)' <<<"$candidate" >/dev/null \
+       && pg_run_left_review_record "$marker"; then
       legacy_pr_identity=true
     fi
     candidate_relation="$(jq -cS '{repository,target,evidence}' <<<"$candidate")"

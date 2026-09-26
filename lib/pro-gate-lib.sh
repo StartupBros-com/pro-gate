@@ -3814,6 +3814,16 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
 pg_review_input_binding_dir() { printf '%s\n' "${PRO_GATE_REVIEW_INPUT_BINDING_DIR:-$PRO_GATE_HOME/review-input-bindings}"; }
 pg_review_result_binding_dir() { printf '%s\n' "${PRO_GATE_REVIEW_RESULT_BINDING_DIR:-$PRO_GATE_HOME/review-result-bindings}"; }
 
+# Whether a run left anything that is, or may still become, its review: captured or pending
+# bytes, a recovered copy, a result binding, or a remembered conversation (including one later
+# convicted as cross-bound). Any record counts, so an unreadable or partial one fails closed.
+pg_run_left_review_record() { # marker
+  local marker="$1"
+  [ -e "$(pg_completed_dir)/$marker" ] || [ -e "$PRO_GATE_HOME/pending/$marker" ] \
+    || [ -e "$PRO_GATE_HOME/recovered/$marker.md" ] || [ -e "$(pg_review_result_binding_dir)/$marker" ] \
+    || [ -e "$PRO_GATE_HOME/conversation-urls/$marker" ] || [ -e "$PRO_GATE_HOME/crossbound/$marker" ]
+}
+
 pg_review_input_binding_validate() { # canonical record JSON [expected marker]
   local json="${1-}" marker="${2:-}" canonical
   canonical="$(pg_review_json_canonical "$json")" || return 1

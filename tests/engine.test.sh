@@ -811,6 +811,53 @@ PR_EVIDENCE_MV
   check 'the same legacy review remains recoverable from durable bytes without a new submission' \
     "$([ "$rc" -eq 0 ] && cmp -s "$root/legacy-recovered.md" "$home/review.md"; echo $?)" \
     "rc=$rc stderr=$(cat "$root/legacy-recover.err")"
+
+  # A legacy round that left no review behind is not a review to replace (pushbot #3755:
+  # charged, then Chrome was lost before any conversation existed; its binding recorded base=head).
+  # It must not strand its head: the next query grants a real metadata-bound review. The same
+  # binding with a remembered conversation still stops, because that conversation may hold one.
+  local residue legacy_binding="$binding"
+  for residue in none conversation; do
+    home="$root/legacy-$residue-home"
+    mkdir -p "$home/review-input-bindings"
+    jq -cS --arg head "$head" '.evidence.proof.base_oid=$head' "$legacy_binding" | tr -d '\n' > "$home/review-input-bindings/$marker"
+    if [ "$residue" = conversation ]; then
+      mkdir -p "$home/conversation-urls"
+      printf 'https://chatgpt.com/c/legacy-%s\n' "$marker" > "$home/conversation-urls/$marker"
+    fi
+    PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+      pr_identity_engine --review-decision --json --diff "$prep/endpoint.patch" > "$root/legacy-$residue.json" 2> "$root/legacy-$residue.err"
+  done
+  check 'a same-head legacy round with a remembered conversation still cannot buy a replacement review' \
+    "$(jq -e '.action=="stop-without-new-review" and .reason=="invalid-binding"' "$root/legacy-conversation.json" >/dev/null; echo $?)" \
+    "decision=$(cat "$root/legacy-conversation.json") stderr=$(cat "$root/legacy-conversation.err")"
+  check 'a same-head legacy round that left no review does not strand its head' \
+    "$(jq -e '.action=="run-granted-review"' "$root/legacy-none.json" >/dev/null; echo $?)" \
+    "decision=$(cat "$root/legacy-none.json") stderr=$(cat "$root/legacy-none.err")"
+  home="$root/legacy-none-home"
+  PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+    pr_identity_engine --review-decision-effect "$root/legacy-none.json" --diff "$prep/endpoint.patch" \
+    --out "$root/legacy-none.md" --timeout 10s > "$root/legacy-none-effect.out" 2> "$root/legacy-none-effect.err"
+  rc=$?
+  want="$(jq -r '.marker // empty' "$root/legacy-none.md.status" 2>/dev/null)"
+  check 'the granted review submits and binds the real PR base with metadata proof' \
+    "$([ "$rc" -eq 0 ] && [ -s "$home.oracle.calls" ] && [ -n "$want" ] && [ "$want" != "$marker" ] && \
+      jq -e --arg base "$base" --arg head "$head" \
+      '.evidence.proof.base_oid==$base and .target.head_oid==$head and (.evidence.proof.pr_metadata_digest|test("^[0-9a-f]{64}$"))' \
+      "$home/review-input-bindings/$want" >/dev/null; echo $?)" \
+    "rc=$rc marker=$want stderr=$(tail -4 "$root/legacy-none-effect.err")"
+  PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+    pr_identity_engine --review-decision --json --diff "$prep/endpoint.patch" > "$root/legacy-none-after.json" 2> "$root/legacy-none-after.err"
+  if [ "$(jq -r .action "$root/legacy-none-after.json")" = collect-existing-result ]; then
+    PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+      pr_identity_engine --review-decision-effect "$root/legacy-none-after.json" --diff "$prep/endpoint.patch" \
+      > "$root/legacy-none-collected.json" 2> "$root/legacy-none-collected.err"
+    PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+      pr_identity_engine --review-decision --json --diff "$prep/endpoint.patch" > "$root/legacy-none-after.json" 2> "$root/legacy-none-after.err"
+  fi
+  check 'after that review the formerly stranded head reaches the existing allow path' \
+    "$(jq -e '.action=="allow-existing-merge-workflow"' "$root/legacy-none-after.json" >/dev/null; echo $?)" \
+    "decision=$(cat "$root/legacy-none-after.json") stderr=$(cat "$root/legacy-none-after.err")"
 }
 run_pr_evidence_identity_tests
 if [ "${PG_TEST_ONLY:-}" = pr-evidence-identity ]; then
