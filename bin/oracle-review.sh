@@ -1095,17 +1095,25 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
     exit 0
   fi
 
-  REC_DISPOSITION="$(pg_attempt_disposition_read "$REC_SELECTED" 2>/dev/null || true)"
-  if [ -n "$REC_DISPOSITION" ]; then
-    REC_TERMINAL_KEY="$(jq -r .round_key <<<"$REC_DISPOSITION")"
-    if ! pg_lock "${PRO_GATE_LOCKFILE:-$PRO_GATE_HOME/oracle.lock}.pr-${REC_TERMINAL_KEY}" "${PRO_GATE_RECOVER_LOCK_WAIT:-30}"; then
+  # A terminal attempt disposition means no review remains: reconcile it under the change lock and
+  # say so. Returns 1 only when there is no disposition. It runs before any browser work, and again
+  # after a harvest that ended without a review, because that harvest may itself have proved the
+  # conversation gone and written the disposition; its exit status alone cannot tell that apart
+  # from browser trouble (#228).
+  rec_release_terminal() {
+    local disposition key
+    disposition="$(pg_attempt_disposition_read "$REC_SELECTED" 2>/dev/null || true)"
+    [ -n "$disposition" ] || return 1
+    key="$(jq -r .round_key <<<"$disposition")"
+    if ! pg_lock "${PRO_GATE_LOCKFILE:-$PRO_GATE_HOME/oracle.lock}.pr-${key}" "${PRO_GATE_RECOVER_LOCK_WAIT:-30}"; then
       echo "Checking for completed review" >&2; exit 7
     fi
     pg_attempt_reconcile_terminal "$REC_SELECTED" \
       || { echo "Browser needs attention" >&2; exit 3; }
     echo "No review remains" >&2
     exit 6
-  fi
+  }
+  rec_release_terminal || true
 
   # v0.37.1 upgrade compatibility: pre-disposition releases can leave canonical charged run-meta
   # after their reservation disappeared. Restore only that marker's original recovery ownership;
@@ -1212,7 +1220,7 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
       0) echo "Review ready" >&2;;
       8|7) echo "Checking for completed review" >&2;;
       9) echo "Still working" >&2;;
-      *) echo "Browser needs attention" >&2;;
+      *) rec_release_terminal || echo "Browser needs attention" >&2;;
     esac
     exit "$REC_HARVEST_RC"
   fi
@@ -1269,7 +1277,8 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
       ;;
     8|7) echo "Checking for completed review" >&2;;
     9) echo "Still working" >&2;;
-    *) echo "Browser needs attention" >&2;;
+    *) rm -f "$REC_HV_OUT" "$REC_HV_ERR" "$REC_HV_BODY" 2>/dev/null
+       rec_release_terminal || echo "Browser needs attention" >&2;;
   esac
   rm -f "$REC_HV_OUT" "$REC_HV_ERR" "$REC_HV_BODY" 2>/dev/null
   exit "$REC_HARVEST_RC"
