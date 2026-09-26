@@ -388,10 +388,13 @@ function markerHasBlacklistEntry(m) {
 function flushCrossBind(m) {
   const dir = path.join(PG_HOME, 'crossbound');
   const f = path.join(dir, m);
+  // A legacy round's sidecar can be its only review record (legacyReviewBinding), so nothing
+  // here clears one; like its receipts, only the 14-day sweep does (pro-gate #227 round 7).
+  const legacy = legacyReviewBinding(m);
   // Positive ownership is the ONLY proof a conviction went stale, so it is the only thing that
   // clears the sidecar unconditionally.
   if (ownershipProven) {
-    try { fs.unlinkSync(f); } catch {}
+    if (!legacy) { try { fs.unlinkSync(f); } catch {} }
     return;
   }
   if (crossBindHits.size === 0) {
@@ -407,7 +410,7 @@ function flushCrossBind(m) {
     // deleted conversation-urls/<marker> in the same breath.
     // Clear only when this marker has no blacklist entry that could have produced the emptiness.
     // --close/--sweep-root keep clearing an otherwise-unsupported stale conviction (#76).
-    if (!markerHasBlacklistEntry(m)) { try { fs.unlinkSync(f); } catch {} }
+    if (!legacy && !markerHasBlacklistEntry(m)) { try { fs.unlinkSync(f); } catch {} }
     return;
   }
   try {

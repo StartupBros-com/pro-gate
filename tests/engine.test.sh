@@ -970,28 +970,35 @@ OLDER_RESTORE_FIRST
       "home=$(find "$home" -printf '%P@%TT ' 2>/dev/null) newest=$newest decision=$(jq -c '{action,reason}' "$root/legacy-receipt-$scenario.json" 2>/dev/null) stderr=$(tail -3 "$root/legacy-receipt-$scenario.err" 2>/dev/null)"
   done
 
-  # Pro-gate #227 round 5: promotion writes completed/<marker> and then removes pending/<marker>.
-  # A DEBUG trap promotes the bytes just before the record scan looks at pending/, so a scan that
-  # checked completed/ first finds neither although review bytes existed throughout.
-  home="$root/legacy-promotion-home"
-  mkdir -p "$home/pending" "$home/completed"
-  cp "$root/home-main/review.md" "$home/pending/$marker"
-  cat > "$root/promote-at-scan.sh" <<'PROMOTE_AT_SCAN'
+  # Pro-gate #227 rounds 5 and 7: a writer that moves a review record publishes the destination
+  # and then removes the source (promotion: pending/ -> completed/; proven ownership:
+  # crossbound/ -> conversation-urls/). A DEBUG trap performs that handoff just before the
+  # record scan checks the source, so a scan that checked the destination first finds neither
+  # although a record existed throughout.
+  cat > "$root/handoff-at-scan.sh" <<'HANDOFF_AT_SCAN'
 #!/usr/bin/env bash
-# args: lib home marker. Scans for a review record while pending bytes are promoted to
-# completed/ just before the scan's pending/ check runs.
+# args: lib home marker source-dir destination-dir. Scans for a review record while the
+# record is handed from source to destination just before the scan's source check runs.
 set -T
 . "$1"
 export PRO_GATE_HOME="$2"
-PROMOTE_FROM="$2/pending/$3" PROMOTE_TO="$(pg_completed_dir)/$3" PROMOTE_PAT='*/pending/*'
-trap 'case "$BASH_COMMAND" in $PROMOTE_PAT) [ ! -e "$PROMOTE_FROM" ] || command mv "$PROMOTE_FROM" "$PROMOTE_TO" ;; esac' DEBUG
+HANDOFF_FROM="$2/$4/$3" HANDOFF_TO="$2/$5/$3" HANDOFF_PAT="*/$4/*"
+mkdir -p "$2/$5"
+trap 'case "$BASH_COMMAND" in $HANDOFF_PAT) if [ -e "$HANDOFF_FROM" ]; then command cp -p "$HANDOFF_FROM" "$HANDOFF_TO"; command rm -f "$HANDOFF_FROM"; fi ;; esac' DEBUG
 pg_run_left_review_record "$3"
-PROMOTE_AT_SCAN
-  bash "$root/promote-at-scan.sh" "$HERE/../lib/pro-gate-lib.sh" "$home" "$marker" 2> "$root/legacy-promotion.err"
-  rc=$?
-  check 'a review record promoted from pending/ to completed/ during the scan is still seen' \
-    "$([ "$rc" -eq 0 ] && [ -e "$home/completed/$marker" ] && [ ! -e "$home/pending/$marker" ]; echo $?)" \
-    "rc=$rc home=$(find "$home" -type f -printf '%P ' 2>/dev/null) stderr=$(tail -3 "$root/legacy-promotion.err")"
+HANDOFF_AT_SCAN
+  local handoff from to
+  for handoff in pending:completed crossbound:conversation-urls; do
+    from="${handoff%%:*}"; to="${handoff#*:}"
+    home="$root/legacy-handoff-$from-home"
+    mkdir -p "$home/$from"
+    printf 'https://chatgpt.com/c/legacy-%s\n' "$marker" > "$home/$from/$marker"
+    bash "$root/handoff-at-scan.sh" "$HERE/../lib/pro-gate-lib.sh" "$home" "$marker" "$from" "$to" 2> "$root/legacy-handoff-$from.err"
+    rc=$?
+    check "a review record handed from $from/ to $to/ during the scan is still seen" \
+      "$([ "$rc" -eq 0 ] && [ -e "$home/$to/$marker" ] && [ ! -e "$home/$from/$marker" ]; echo $?)" \
+      "rc=$rc home=$(find "$home" -type f -printf '%P ' 2>/dev/null) stderr=$(tail -3 "$root/legacy-handoff-$from.err")"
+  done
   check 'a same-head legacy round that left no review does not strand its head' \
     "$(jq -e '.action=="run-granted-review"' "$root/legacy-none.json" >/dev/null; echo $?)" \
     "decision=$(cat "$root/legacy-none.json") stderr=$(cat "$root/legacy-none.err")"

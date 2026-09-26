@@ -3831,13 +3831,15 @@ pg_review_result_binding_dir() { printf '%s\n' "${PRO_GATE_REVIEW_RESULT_BINDING
 # rememberUrl()'s count cap exempts a legacy round's memo, and a revocation moves it into a
 # legacy-review-receipts/<marker>.* receipt on its own clock, so nothing expires it sooner.
 # Markers end in -<epoch>-<pid>, so that pattern never matches another marker's receipts.
-# pending/ is checked before completed/ because promotion writes completed/ and then removes
-# pending/: a promotion landing between the two checks is then still seen (#227 round 5).
+# Every writer that moves a record publishes the destination before removing the source
+# (pending/ -> completed/, crossbound/ -> conversation-urls/ on proven ownership, memo ->
+# receipt), so each source is checked before its destination: a move landing between two
+# checks is still seen (#227 rounds 5 and 7).
 pg_run_left_review_record() { # marker
   local marker="$1"
   [ -e "$PRO_GATE_HOME/pending/$marker" ] || [ -e "$(pg_completed_dir)/$marker" ] \
     || [ -e "$PRO_GATE_HOME/recovered/$marker.md" ] || [ -e "$(pg_review_result_binding_dir)/$marker" ] \
-    || [ -e "$PRO_GATE_HOME/conversation-urls/$marker" ] || [ -e "$PRO_GATE_HOME/crossbound/$marker" ] \
+    || [ -e "$PRO_GATE_HOME/crossbound/$marker" ] || [ -e "$PRO_GATE_HOME/conversation-urls/$marker" ] \
     || compgen -G "$PRO_GATE_HOME/legacy-review-receipts/$marker.*" >/dev/null
 }
 

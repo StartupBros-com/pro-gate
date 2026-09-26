@@ -5534,6 +5534,38 @@ for (const placeholder of PLACEHOLDER_URLS) {
     `memos=${JSON.stringify(unwritable.memos)} memo=${unwritable.memoUrl} stderr=${unwritable.stderr?.slice(-300)}`);
 }
 
+{ // pro-gate #227 round 7: a legacy round's crossbound/ sidecar can be its only review record, so
+  // the exit flush never clears it, neither on an empty scan without a blacklist entry (--close)
+  // nor on proven ownership; only the 14-day sweep does. A metadata-proven binding's stale
+  // conviction is still cleared, exactly as #76 asserts for an unbound marker.
+  const sidecar = '2026-01-01T00:00:00.000Z\thttps://chatgpt.com/c/other\tpg-run-someone-else-1111111111-9\n';
+  const seedSidecar = (evidence) => (home) => {
+    fs.mkdirSync(path.join(home, 'crossbound'), { recursive: true });
+    fs.writeFileSync(path.join(home, 'crossbound', MARKER), sidecar);
+    fs.mkdirSync(path.join(home, 'review-input-bindings'), { recursive: true });
+    fs.writeFileSync(path.join(home, 'review-input-bindings', MARKER), JSON.stringify({ marker: MARKER, evidence }));
+  };
+  const legacyEvidence = { mode: 'full-pr', proof: { base_oid: 'a'.repeat(40) } };
+  const currentEvidence = { mode: 'full-pr', proof: { base_oid: 'a'.repeat(40), pr_metadata_digest: 'c'.repeat(64) } };
+  const owned = [`run marker: ${MARKER}`, 'P1: none', 'P2: none', 'P3: none', `VERDICT: SHIP — ours. (run marker: ${MARKER})`].join('\n');
+  const run = async (args, evidence) => {
+    const cdp = await mockCdp(owned, [{ id: 'root1', type: 'page', url: 'https://chatgpt.com/' }]);
+    const r = await runSalvage(args, cdp.port, seedSidecar(evidence));
+    cdp.stop();
+    return r;
+  };
+  const closeLegacy = await run(['--close', MARKER, '10'], legacyEvidence);
+  check('#227 r7 P2: --close keeps a legacy round\'s cross-bound sidecar',
+    closeLegacy.crossboundBody === sidecar, `crossbound=${JSON.stringify(closeLegacy.crossboundBody)} stderr=${closeLegacy.stderr?.slice(0, 300)}`);
+  const ownedLegacy = await run([MARKER, '10'], legacyEvidence);
+  check('#227 r7 P2: proven ownership keeps a legacy round\'s cross-bound sidecar',
+    ownedLegacy.status === 0 && ownedLegacy.memos.length === 1 && ownedLegacy.crossboundBody === sidecar,
+    `status=${ownedLegacy.status} memos=${JSON.stringify(ownedLegacy.memos)} crossbound=${JSON.stringify(ownedLegacy.crossboundBody)}`);
+  const closeCurrent = await run(['--close', MARKER, '10'], currentEvidence);
+  check('#227 r7 P2: --close still clears a metadata-proven binding\'s stale conviction',
+    closeCurrent.crossbound === 0, `crossbound=${closeCurrent.crossbound}`);
+}
+
 { // #215 gate r8 P2 (bin/cdp-salvage.mjs claimThrottleSeen): admission is a plain existence
   // check on the record path — #215 gate r9 P2 replaced the round-8 fresh-temp heuristic
   // (throttleSeenFreshTemp) with claimThrottleSeen taking removeThrottleSeenGeneration's own
