@@ -822,7 +822,7 @@ PR_EVIDENCE_MV
   # binding with any one kind of review record still stops, because that record is, or may
   # still become, the review. One fixture per record kind, so dropping any check fails here.
   local residue legacy_binding="$binding"
-  for residue in none completed pending recovered result-binding conversation crossbound; do
+  for residue in none completed pending recovered result-binding conversation crossbound receipt; do
     home="$root/legacy-$residue-home"
     mkdir -p "$home/review-input-bindings"
     jq -cS --arg head "$head" '.evidence.proof.base_oid=$head' "$legacy_binding" | tr -d '\n' > "$home/review-input-bindings/$marker"
@@ -836,14 +836,50 @@ PR_EVIDENCE_MV
       crossbound)
         mkdir -p "$home/crossbound"
         printf '2026-01-01T00:00:00.000Z\thttps://chatgpt.com/c/legacy-%s\tpg-run-other-repo-42-1111111111-9\n' "$marker" > "$home/crossbound/$marker" ;;
+      receipt)
+        mkdir -p "$home/legacy-review-receipts"
+        printf 'https://chatgpt.com/c/legacy-%s\n' "$marker" > "$home/legacy-review-receipts/$marker" ;;
     esac
     PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
       pr_identity_engine --review-decision --json --diff "$prep/endpoint.patch" > "$root/legacy-$residue.json" 2> "$root/legacy-$residue.err"
   done
-  for residue in completed pending recovered result-binding conversation crossbound; do
+  for residue in completed pending recovered result-binding conversation crossbound receipt; do
     check "a same-head legacy round that left a $residue record still cannot buy a replacement review" \
       "$(jq -e '.action=="stop-without-new-review" and .reason=="invalid-binding"' "$root/legacy-$residue.json" >/dev/null; echo $?)" \
       "decision=$(cat "$root/legacy-$residue.json") stderr=$(cat "$root/legacy-$residue.err")"
+  done
+
+  # Revoking a legacy round's only memo must not reopen a paid replacement before its 14 days
+  # (pro-gate #227 round 3 P2). Both revocation paths run for real here: a probe that convicts the
+  # remembered conversation as cross-bound (the mock's one tab carries our prompt and another run's
+  # answer), and the shell's provenance rejection. Each keeps the memo as a receipt with its mtime.
+  local revoke memo_url=https://chatgpt.com/c/mock-conversation
+  printf 'pro-gate review: PR #999 r1 [other-repo]\nrun marker: %s\n\n[P1] apps/other/thing.ts:12 - something in ANOTHER change\nP2: none\nP3: none\nVERDICT: FIX-FIRST - not ours. (run marker: pg-run-other-repo-42-1111111111-9)\n' \
+    "$marker" > "$root/crossbound-tab.txt"
+  for revoke in probe provenance; do
+    home="$root/legacy-revoke-$revoke-home"
+    mkdir -p "$home/review-input-bindings" "$home/conversation-urls"
+    jq -cS --arg head "$head" '.evidence.proof.base_oid=$head' "$legacy_binding" | tr -d '\n' > "$home/review-input-bindings/$marker"
+    printf '%s\n' "$memo_url" > "$home/conversation-urls/$marker"
+    touch -d '2026-01-02 03:04:05' "$home/conversation-urls/$marker"
+    case "$revoke" in
+      probe)
+        cp "$root/tab.txt" "$root/tab.before"; cp "$root/crossbound-tab.txt" "$root/tab.txt"
+        PRO_GATE_HOME="$home" node "$HERE/../bin/cdp-salvage.mjs" --probe "$marker" 3 "$PORT" \
+          > "$root/legacy-revoke-probe.out" 2> "$root/legacy-revoke-probe.err"
+        cp "$root/tab.before" "$root/tab.txt" ;;
+      provenance)
+        PRO_GATE_HOME="$home" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_provenance_reject '$marker' '$memo_url'" \
+          > "$root/legacy-revoke-provenance.out" 2> "$root/legacy-revoke-provenance.err" ;;
+    esac
+    PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+      pr_identity_engine --review-decision --json --diff "$prep/endpoint.patch" > "$root/legacy-revoke-$revoke.json" 2> "$root/legacy-revoke-$revoke.err.query"
+    check "a legacy round's memo revoked by $revoke survives as a receipt, so its head still cannot buy a replacement review" \
+      "$([ ! -e "$home/conversation-urls/$marker" ] && [ ! -e "$home/crossbound/$marker" ] && \
+        [ "$(tr -d '\n' 2>/dev/null < "$home/legacy-review-receipts/$marker")" = "$memo_url" ] && \
+        [ "$(date -r "$home/legacy-review-receipts/$marker" +%s 2>/dev/null)" = "$(date -d '2026-01-02 03:04:05' +%s)" ] && \
+        jq -e '.action=="stop-without-new-review" and .reason=="invalid-binding"' "$root/legacy-revoke-$revoke.json" >/dev/null; echo $?)" \
+      "home=$(find "$home" -type f -printf '%P ' 2>/dev/null) decision=$(jq -c '{action,reason}' "$root/legacy-revoke-$revoke.json" 2>/dev/null) stderr=$(tail -3 "$root/legacy-revoke-$revoke.err" 2>/dev/null)"
   done
   check 'a same-head legacy round that left no review does not strand its head' \
     "$(jq -e '.action=="run-granted-review"' "$root/legacy-none.json" >/dev/null; echo $?)" \

@@ -3628,6 +3628,9 @@ find "$PRO_GATE_HOME/conversation-urls" -maxdepth 1 -type f -mmin +20160 -print 
 # it stands in for (the conviction deleted conversation-urls/<marker>), so the two records expire
 # together instead of one outliving the other — the same disagreement #170 was about.
 find "$PRO_GATE_HOME/crossbound" -maxdepth 1 -type f -mmin +20160 -delete 2>/dev/null || true
+# A revoked legacy memo's receipt (pg_legacy_review_receipt_keep) keeps the memo's own mtime, so
+# this is the same 14-day horizon the memo had. Only the legacy replacement-spend refusal reads it.
+find "$PRO_GATE_HOME/legacy-review-receipts" -maxdepth 1 -type f -mmin +20160 -delete 2>/dev/null || true
 # v0.42 (#109): salvage classification sidecars ride the same horizon as the memos they describe.
 find "$(pg_salvage_class_dir)" -maxdepth 1 -type f -mmin +20160 -delete 2>/dev/null || true
 # Canonical title memos serve the same late-harvest lifecycle as URL memos. Sequence counters

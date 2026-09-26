@@ -532,10 +532,19 @@ function runSalvage(args, port, seed, extraEnv = {}) {
             .map((f) => read(path.join('crossbound', f)) ?? '').join('');
         } catch { return ''; }
       })();
+      // pro-gate #227 round 3: a revoked legacy memo is kept here for the runtime's refusal.
+      const receipts = (() => {
+        try {
+          return fs.readdirSync(path.join(home, 'legacy-review-receipts')).map((n) => {
+            const p = path.join(home, 'legacy-review-receipts', n);
+            return { name: n, body: fs.readFileSync(p, 'utf8'), mtimeMs: fs.statSync(p).mtimeMs };
+          });
+        } catch { return []; }
+      })();
       fs.rmSync(home, { recursive: true, force: true });
       resolve({
         status, stdout, stderr, elapsedMs: Date.now() - startedAt,
-        memoUrl: memoUrl?.trim() ?? null, memos, blacklist, cooldown, crossbound, crossboundBody,
+        memoUrl: memoUrl?.trim() ?? null, memos, blacklist, cooldown, crossbound, crossboundBody, receipts,
       });
     });
   });
@@ -5452,6 +5461,38 @@ for (const placeholder of PLACEHOLDER_URLS) {
       && memoSet.has(plain[0]) && memoSet.has(NEW_MARKER) && r.memos.length === 202,
     `memos.length=${r.memos.length} connector=${memoSet.has('pg-run-memo-legacy-connector-1700099000-1')} current=${memoSet.has('pg-run-memo-current-full-1700099000-1')}`);
   cdp.stop();
+}
+
+{ // pro-gate #227 round 3 P2: a probe that convicts a legacy round's remembered conversation as
+  // cross-bound revokes the memo but, by design, records no crossbound/ sidecar. The memo was
+  // that round's review record, so it must survive as a receipt on its own 14-day clock; a
+  // metadata-proven binding's memo is revoked exactly as before.
+  const rememberedUrl = 'https://chatgpt.com/c/crossbound-legacy';
+  const seededAt = new Date(1700099000000);
+  const seed = (evidence) => (home) => {
+    seedMemo(MARKER, rememberedUrl)(home);
+    fs.utimesSync(path.join(home, 'conversation-urls', MARKER), seededAt, seededAt);
+    fs.mkdirSync(path.join(home, 'review-input-bindings'), { recursive: true });
+    fs.writeFileSync(path.join(home, 'review-input-bindings', MARKER), JSON.stringify({ marker: MARKER, evidence }));
+  };
+  const probeCrossBound = async (evidence) => {
+    const cdp = await mockCdp('__NO_TABS__', [], { renderText: () => FOREIGN_ANSWER(MARKER) });
+    const r = await runScratchSalvage(['--probe', MARKER, '3'], cdp.port, seed(evidence));
+    cdp.stop();
+    return r;
+  };
+  const legacy = await probeCrossBound({ mode: 'full-pr', proof: { base_oid: 'a'.repeat(40) } });
+  check('#227 r3 P2: the probe convicts the legacy memo as cross-bound, revokes it and records no sidecar',
+    /ANOTHER run's completed answer/.test(legacy.stderr ?? '') && legacy.memos.length === 0 && legacy.crossbound === 0,
+    `memos=${JSON.stringify(legacy.memos)} crossbound=${legacy.crossbound} stderr=${legacy.stderr?.slice(-300)}`);
+  check('#227 r3 P2: the revoked legacy memo survives as a receipt with its URL and original mtime',
+    legacy.receipts.length === 1 && legacy.receipts[0].name === MARKER
+      && legacy.receipts[0].body.trim() === rememberedUrl && legacy.receipts[0].mtimeMs === seededAt.getTime(),
+    `receipts=${JSON.stringify(legacy.receipts)}`);
+  const current = await probeCrossBound({ mode: 'full-pr', proof: { base_oid: 'a'.repeat(40), pr_metadata_digest: 'c'.repeat(64) } });
+  check('#227 r3 P2: a metadata-proven binding\'s revoked memo leaves no receipt',
+    /ANOTHER run's completed answer/.test(current.stderr ?? '') && current.memos.length === 0 && current.receipts.length === 0,
+    `memos=${JSON.stringify(current.memos)} receipts=${JSON.stringify(current.receipts)}`);
 }
 
 { // #215 gate r8 P2 (bin/cdp-salvage.mjs claimThrottleSeen): admission is a plain existence

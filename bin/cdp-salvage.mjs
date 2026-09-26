@@ -215,6 +215,8 @@ const RESERVATION_DIR = envPath('PRO_GATE_RESERVATION_DIR', PG_HOME, 'in-progres
 // (pg_review_input_binding_legacy_reviewed), so that memo keeps the 14-day sweep as its horizon
 // rather than the count cap below. No new legacy binding is ever written, so this class only shrinks.
 const INPUT_BINDING_DIR = envPath('PRO_GATE_REVIEW_INPUT_BINDING_DIR', PG_HOME, 'review-input-bindings');
+// Where forgetUrl() keeps such a memo instead of deleting it; see there.
+const LEGACY_RECEIPT_DIR = path.join(PG_HOME, 'legacy-review-receipts');
 const MEMO_KEEP = 200;                  // newest N unprotected memos retained; older ones are pruned on write
 // #208 gate r1 P1: a stale unowned tab can legitimately fingerprint under TWO different hashes
 // across invocations (modal text vs. whole-page text) when a marker-less interstitial also
@@ -315,6 +317,13 @@ function forgetUrl(m, url) {
   let survivor = null;
   if (held && held !== url) {
     try { fs.linkSync(claim, f); survivor = held; } catch {}  // genuine memo republished: put it back
+  }
+  // A legacy round's memo can be its only review record (legacyReviewBinding), and a probe never
+  // flushes the cross-bind sidecar that would otherwise stand in for it. Keep it as a receipt that
+  // only the runtime's replacement-spend refusal reads; rename keeps its mtime, so the 14-day
+  // sweep expires the receipt exactly when the memo would have expired (pro-gate #227 round 3).
+  if (!survivor && legacyReviewBinding(m)) {
+    try { fs.mkdirSync(LEGACY_RECEIPT_DIR, { recursive: true }); fs.renameSync(claim, path.join(LEGACY_RECEIPT_DIR, m)); } catch {}
   }
   try { fs.unlinkSync(claim); } catch {}
   return survivor;

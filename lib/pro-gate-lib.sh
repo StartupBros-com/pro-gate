@@ -3032,7 +3032,7 @@ pg_provenance_reject() {  # <marker> [matched-url]
     snap="$(head -c 300 "$claim" 2>/dev/null | tr -d '\n')"
     [ -n "$url" ] || url="$snap"
     if [ "$snap" = "$url" ] || [ -z "$snap" ]; then
-      rm -f "$claim" 2>/dev/null
+      pg_legacy_review_receipt_keep "$m" "$claim" || rm -f "$claim" 2>/dev/null
     else
       # Restore via hard link — link(2) FAILS atomically when the memo already exists, so a
       # genuine URL the Node writer republished between our claim and this restore is never
@@ -3820,22 +3820,40 @@ pg_review_result_binding_dir() { printf '%s\n' "${PRO_GATE_REVIEW_RESULT_BINDING
 # Bytes and bindings are never swept. Conversation and cross-bound memos expire with pg_finish's
 # 14-day sweep, the horizon after which pro-gate treats any uncollected conversation as abandoned;
 # a round whose only record was such a memo is then treated like one that left nothing.
-# rememberUrl()'s count cap exempts a legacy round's memo, so nothing expires it sooner.
+# rememberUrl()'s count cap exempts a legacy round's memo, and a revoked one survives as a
+# legacy-review-receipts/ entry on the memo's own clock, so nothing expires it sooner.
 pg_run_left_review_record() { # marker
   local marker="$1"
   [ -e "$(pg_completed_dir)/$marker" ] || [ -e "$PRO_GATE_HOME/pending/$marker" ] \
     || [ -e "$PRO_GATE_HOME/recovered/$marker.md" ] || [ -e "$(pg_review_result_binding_dir)/$marker" ] \
-    || [ -e "$PRO_GATE_HOME/conversation-urls/$marker" ] || [ -e "$PRO_GATE_HOME/crossbound/$marker" ]
+    || [ -e "$PRO_GATE_HOME/conversation-urls/$marker" ] || [ -e "$PRO_GATE_HOME/crossbound/$marker" ] \
+    || [ -e "$PRO_GATE_HOME/legacy-review-receipts/$marker" ]
 }
 
-# A pre-v0.55 full-PR or scoped binding never proved its PR base, so a new round at its head
-# would buy a replacement for that round's review; that stays refused while the round left a
-# review record. The query and every guarded dispatch recheck share this one predicate, because
-# its answer can change after a grant: a late --harvest can find or publish that record.
-pg_review_input_binding_legacy_reviewed() { # binding-json marker
+# A pre-v0.55 full-PR or scoped binding never proved its PR base (no PR metadata proof).
+# cdp-salvage.mjs legacyReviewBinding() is the same predicate.
+pg_review_input_binding_is_legacy() { # binding-json
   jq -e '(.evidence.mode=="full-pr" or .evidence.mode=="scoped-delta") and
-    (.evidence.proof|has("pr_metadata_digest")|not)' <<<"$1" >/dev/null \
-    && pg_run_left_review_record "$2"
+    (.evidence.proof|has("pr_metadata_digest")|not)' <<<"$1" >/dev/null
+}
+
+# A new round at a legacy binding's head would buy a replacement for that round's review; that
+# stays refused while the round left a review record. The query and every guarded dispatch
+# recheck share this one predicate, because its answer can change after a grant: a late
+# --harvest can find or publish that record.
+pg_review_input_binding_legacy_reviewed() { # binding-json marker
+  pg_review_input_binding_is_legacy "$1" && pg_run_left_review_record "$2"
+}
+
+# A legacy round's memo can be its only review record, so revoking it keeps a receipt instead
+# (mv keeps the memo's mtime, and the 14-day sweep expires the receipt on that clock). Mirrors
+# cdp-salvage.mjs forgetUrl(). Returns 1, leaving the claim in place, when the marker has none.
+pg_legacy_review_receipt_keep() { # marker claimed-memo
+  local binding
+  binding="$(pg_review_input_binding_read "$1" 2>/dev/null)" || return 1
+  pg_review_input_binding_is_legacy "$binding" || return 1
+  mkdir -p "$PRO_GATE_HOME/legacy-review-receipts" 2>/dev/null \
+    && mv -f "$2" "$PRO_GATE_HOME/legacy-review-receipts/$1" 2>/dev/null
 }
 
 pg_review_input_binding_validate() { # canonical record JSON [expected marker]
