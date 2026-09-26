@@ -5412,6 +5412,48 @@ for (const placeholder of PLACEHOLDER_URLS) {
   cdp.stop();
 }
 
+{ // pro-gate #227 round 2 P2: a pre-v0.55 full-PR or scoped round's memo can be the only record
+  // that its review exists, and the runtime refuses to buy a replacement at that head while it
+  // does. The count cap used to evict it as soon as 200 newer memos arrived, well inside the
+  // documented 14-day horizon. Only bindings without PR metadata proof in those two modes are
+  // protected; a connector binding and a current metadata-proven binding still count.
+  const bindings = {
+    'pg-run-memo-legacy-full-1700099000-1': { mode: 'full-pr', proof: { base_oid: 'a'.repeat(40) } },
+    'pg-run-memo-legacy-scoped-1700099000-1': { mode: 'scoped-delta', proof: { base_oid: 'a'.repeat(40) } },
+    'pg-run-memo-legacy-connector-1700099000-1': { mode: 'connector', proof: { commit_target: 'b'.repeat(40) } },
+    'pg-run-memo-current-full-1700099000-1': { mode: 'full-pr', proof: { base_oid: 'a'.repeat(40), pr_metadata_digest: 'c'.repeat(64) } },
+  };
+  const plain = Array.from({ length: 199 }, (_, i) => `pg-run-memo-legacy-u-${i}-1700099000-1`);
+  const seed = (home) => { // oldest-first: the four bound memos, then 199 plain ones
+    const dir = path.join(home, 'conversation-urls');
+    const bindingDir = path.join(home, 'review-input-bindings');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.mkdirSync(bindingDir, { recursive: true });
+    [...Object.keys(bindings), ...plain].forEach((m, i) => {
+      const f = path.join(dir, m);
+      fs.writeFileSync(f, 'https://chatgpt.com/c/seed-placeholder\n');
+      const t = new Date(1700099000000 + i * 1000);
+      fs.utimesSync(f, t, t);
+      if (bindings[m]) fs.writeFileSync(path.join(bindingDir, m), JSON.stringify({ marker: m, evidence: bindings[m] }));
+    });
+  };
+  const NEW_MARKER = 'pg-run-memo-legacy-new-1700099500-9';
+  const cdp = await mockCdp([
+    `run marker: ${NEW_MARKER}`, 'P1: none', 'P2: none', 'P3: none',
+    `VERDICT: SHIP — ours. (run marker: ${NEW_MARKER})`,
+  ].join('\n'));
+  const r = await runSalvage([NEW_MARKER, '20'], cdp.port, seed);
+  const memoSet = new Set(r.memos);
+  check('#227 r2 P2: full-PR and scoped legacy memos survive the count cap even though they are the oldest',
+    memoSet.has('pg-run-memo-legacy-full-1700099000-1') && memoSet.has('pg-run-memo-legacy-scoped-1700099000-1'),
+    `memos.length=${r.memos.length} stderr=${r.stderr?.slice(-300)}`);
+  check('#227 r2 P2: connector and metadata-proven memos stay unprotected and are the two evicted',
+    !memoSet.has('pg-run-memo-legacy-connector-1700099000-1') && !memoSet.has('pg-run-memo-current-full-1700099000-1')
+      && memoSet.has(plain[0]) && memoSet.has(NEW_MARKER) && r.memos.length === 202,
+    `memos.length=${r.memos.length} connector=${memoSet.has('pg-run-memo-legacy-connector-1700099000-1')} current=${memoSet.has('pg-run-memo-current-full-1700099000-1')}`);
+  cdp.stop();
+}
+
 { // #215 gate r8 P2 (bin/cdp-salvage.mjs claimThrottleSeen): admission is a plain existence
   // check on the record path — #215 gate r9 P2 replaced the round-8 fresh-temp heuristic
   // (throttleSeenFreshTemp) with claimThrottleSeen taking removeThrottleSeenGeneration's own

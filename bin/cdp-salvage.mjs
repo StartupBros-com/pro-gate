@@ -210,6 +210,11 @@ const PENDING_DIR = path.join(PG_HOME, 'pending');
 // states include generating and superseded) is the proof its memo is still someone's only
 // recovery handle. rememberUrl()'s eviction below reads this by existence only.
 const RESERVATION_DIR = envPath('PRO_GATE_RESERVATION_DIR', PG_HOME, 'in-progress');
+// The shell's pg_review_input_binding_dir. A pre-v0.55 full-PR or scoped binding (no PR metadata
+// proof) makes its round's memo a review record the runtime still refuses to replace
+// (pg_review_input_binding_legacy_reviewed), so that memo keeps the 14-day sweep as its horizon
+// rather than the count cap below. No new legacy binding is ever written, so this class only shrinks.
+const INPUT_BINDING_DIR = envPath('PRO_GATE_REVIEW_INPUT_BINDING_DIR', PG_HOME, 'review-input-bindings');
 const MEMO_KEEP = 200;                  // newest N unprotected memos retained; older ones are pruned on write
 // #208 gate r1 P1: a stale unowned tab can legitimately fingerprint under TWO different hashes
 // across invocations (modal text vs. whole-page text) when a marker-less interstitial also
@@ -413,6 +418,16 @@ process.on('exit', () => {
   flushCrossBind(marker);
 });
 
+function legacyReviewBinding(m) {
+  try {
+    const { evidence } = JSON.parse(fs.readFileSync(path.join(INPUT_BINDING_DIR, m), 'utf8'));
+    const proof = evidence?.proof;
+    return (evidence?.mode === 'full-pr' || evidence?.mode === 'scoped-delta')
+      && proof !== null && typeof proof === 'object' && !Array.isArray(proof)
+      && !Object.hasOwn(proof, 'pr_metadata_digest');
+  } catch { return false; }
+}
+
 function rememberUrl(m, url) {
   const f = memoPath(m);
   if (!f) return;
@@ -443,9 +458,10 @@ function rememberUrl(m, url) {
       // applies only to UNPROTECTED entries; protected entries never count toward it and are
       // never removed. A missing in-progress/ directory protects nothing (fail-open to the
       // pre-existing behavior). One existsSync per candidate, and only because the cap is
-      // already known to be exceeded.
+      // already known to be exceeded. A legacy binding's memo is protected the same way
+      // (INPUT_BINDING_DIR above); the 14-day sweep still expires it.
       const unprotected = entries
-        .filter((n) => { try { return !fs.existsSync(path.join(RESERVATION_DIR, n)); } catch { return true; } })
+        .filter((n) => { try { return !fs.existsSync(path.join(RESERVATION_DIR, n)) && !legacyReviewBinding(n); } catch { return true; } })
         .map((n) => { try { return { n, t: fs.statSync(path.join(URL_MEMO_DIR, n)).mtimeMs }; } catch { return { n, t: 0 }; } })
         .sort((a, b) => b.t - a.t);
       if (unprotected.length > MEMO_KEEP) {
