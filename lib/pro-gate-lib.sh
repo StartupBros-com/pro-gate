@@ -3820,11 +3820,22 @@ pg_review_result_binding_dir() { printf '%s\n' "${PRO_GATE_REVIEW_RESULT_BINDING
 # Bytes and bindings are never swept. Conversation and cross-bound memos expire with pg_finish's
 # 14-day sweep, the horizon after which pro-gate treats any uncollected conversation as abandoned;
 # a round whose only record was such a memo is then treated like one that left nothing.
+# rememberUrl()'s count cap exempts a legacy round's memo, so nothing expires it sooner.
 pg_run_left_review_record() { # marker
   local marker="$1"
   [ -e "$(pg_completed_dir)/$marker" ] || [ -e "$PRO_GATE_HOME/pending/$marker" ] \
     || [ -e "$PRO_GATE_HOME/recovered/$marker.md" ] || [ -e "$(pg_review_result_binding_dir)/$marker" ] \
     || [ -e "$PRO_GATE_HOME/conversation-urls/$marker" ] || [ -e "$PRO_GATE_HOME/crossbound/$marker" ]
+}
+
+# A pre-v0.55 full-PR or scoped binding never proved its PR base, so a new round at its head
+# would buy a replacement for that round's review; that stays refused while the round left a
+# review record. The query and every guarded dispatch recheck share this one predicate, because
+# its answer can change after a grant: a late --harvest can find or publish that record.
+pg_review_input_binding_legacy_reviewed() { # binding-json marker
+  jq -e '(.evidence.mode=="full-pr" or .evidence.mode=="scoped-delta") and
+    (.evidence.proof|has("pr_metadata_digest")|not)' <<<"$1" >/dev/null \
+    && pg_run_left_review_record "$2"
 }
 
 pg_review_input_binding_validate() { # canonical record JSON [expected marker]

@@ -450,6 +450,10 @@ case "$1 $2" in
       mv "$PG_PR_TEST_METADATA.next" "$PG_PR_TEST_METADATA"
     fi ;;
   'pr view')
+    # One-shot: stands in for a concurrent writer acting between an effect's reduction and its rechecks.
+    if [ -n "${PG_PR_TEST_PLANT_DST:-}" ] && [ ! -e "$PG_PR_TEST_PLANT_DST" ]; then
+      mkdir -p "${PG_PR_TEST_PLANT_DST%/*}" && cp "$PG_PR_TEST_PLANT_SRC" "$PG_PR_TEST_PLANT_DST"
+    fi
     case " $* " in
       *' -q .url '*) printf '%s\n' https://github.com/acme/widgets/pull/221 ;;
       *) cat "$PG_PR_TEST_METADATA" ;;
@@ -844,6 +848,29 @@ PR_EVIDENCE_MV
   check 'a same-head legacy round that left no review does not strand its head' \
     "$(jq -e '.action=="run-granted-review"' "$root/legacy-none.json" >/dev/null; echo $?)" \
     "decision=$(cat "$root/legacy-none.json") stderr=$(cat "$root/legacy-none.err")"
+
+  # The guarded dispatch re-reads that refusal, because a late --harvest can find the legacy
+  # round's conversation after the grant (pro-gate #227 round 2 P1). The GitHub stub plants the
+  # memo on the effect's first metadata read, after its own initial reduction, so only a
+  # dispatch recheck can see it.
+  home="$root/legacy-late-home"
+  mkdir -p "$home/review-input-bindings"
+  jq -cS --arg head "$head" '.evidence.proof.base_oid=$head' "$legacy_binding" | tr -d '\n' > "$home/review-input-bindings/$marker"
+  printf 'https://chatgpt.com/c/legacy-late-%s\n' "$marker" > "$root/legacy-late.memo"
+  PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+    pr_identity_engine --review-decision --json --diff "$prep/endpoint.patch" > "$root/legacy-late.json" 2> "$root/legacy-late.err"
+  PG_PR_TEST_PLANT_SRC="$root/legacy-late.memo" PG_PR_TEST_PLANT_DST="$home/conversation-urls/$marker" \
+    PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+    pr_identity_engine --review-decision-effect "$root/legacy-late.json" --diff "$prep/endpoint.patch" \
+    --out "$root/legacy-late.md" --timeout 10s > "$root/legacy-late-effect.out" 2> "$root/legacy-late-effect.err"
+  rc=$?
+  check 'a legacy review record that appears after the grant stops the dispatch before any charge or submission' \
+    "$([ "$rc" -ne 0 ] && jq -e '.action=="run-granted-review"' "$root/legacy-late.json" >/dev/null && \
+      [ -e "$home/conversation-urls/$marker" ] && \
+      grep -qF 'fresh dispatch superseded at pre-lock: stop-without-new-review/invalid-binding' "$root/legacy-late-effect.err" && \
+      [ ! -e "$home.oracle.calls" ] && [ ! -e "$home/rounds/acme-widgets-221" ]; echo $?)" \
+    "rc=$rc decision=$(jq -c '{action,reason}' "$root/legacy-late.json" 2>/dev/null) stderr=$(tail -4 "$root/legacy-late-effect.err")"
+
   home="$root/legacy-none-home"
   PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
     pr_identity_engine --review-decision-effect "$root/legacy-none.json" --diff "$prep/endpoint.patch" \
@@ -868,6 +895,24 @@ PR_EVIDENCE_MV
   check 'after that review the formerly stranded head reaches the existing allow path' \
     "$(jq -e '.action=="allow-existing-merge-workflow"' "$root/legacy-none-after.json" >/dev/null; echo $?)" \
     "decision=$(cat "$root/legacy-none-after.json") stderr=$(cat "$root/legacy-none-after.err")"
+
+  # The recheck agrees with the query that an exact-current relation outranks legacy history
+  # (a charged metadata-proven round that left nothing, beside a legacy round that left a memo),
+  # so a grant is never refused at dispatch only to be granted again by the next query.
+  home="$root/legacy-exact-home"
+  mkdir -p "$home/review-input-bindings" "$home/conversation-urls"
+  jq -cS --arg head "$head" '.evidence.proof.base_oid=$head' "$legacy_binding" | tr -d '\n' > "$home/review-input-bindings/$marker"
+  printf 'https://chatgpt.com/c/legacy-exact-%s\n' "$marker" > "$home/conversation-urls/$marker"
+  cp "$root/legacy-none-home/review-input-bindings/$want" "$home/review-input-bindings/$want"
+  PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+    pr_identity_engine --review-decision --json --diff "$prep/endpoint.patch" > "$root/legacy-exact.json" 2> "$root/legacy-exact.err"
+  PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+    pr_identity_engine --review-decision-effect "$root/legacy-exact.json" --diff "$prep/endpoint.patch" \
+    --out "$root/legacy-exact.md" --timeout 10s > "$root/legacy-exact-effect.out" 2> "$root/legacy-exact-effect.err"
+  rc=$?
+  check 'the dispatch recheck lets an exact-current relation outrank legacy history, as the query does' \
+    "$([ "$rc" -eq 0 ] && jq -e '.action=="run-granted-review"' "$root/legacy-exact.json" >/dev/null && [ -s "$home.oracle.calls" ]; echo $?)" \
+    "rc=$rc decision=$(jq -c '{action,reason}' "$root/legacy-exact.json" 2>/dev/null) stderr=$(tail -4 "$root/legacy-exact-effect.err")"
 }
 run_pr_evidence_identity_tests
 if [ "${PG_TEST_ONLY:-}" = pr-evidence-identity ]; then
