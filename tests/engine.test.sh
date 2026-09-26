@@ -450,6 +450,10 @@ case "$1 $2" in
       mv "$PG_PR_TEST_METADATA.next" "$PG_PR_TEST_METADATA"
     fi ;;
   'pr view')
+    # One-shot: stands in for a concurrent writer acting between an effect's reduction and its rechecks.
+    if [ -n "${PG_PR_TEST_PLANT_DST:-}" ] && [ ! -e "$PG_PR_TEST_PLANT_DST" ]; then
+      mkdir -p "${PG_PR_TEST_PLANT_DST%/*}" && cp "$PG_PR_TEST_PLANT_SRC" "$PG_PR_TEST_PLANT_DST"
+    fi
     case " $* " in
       *' -q .url '*) printf '%s\n' https://github.com/acme/widgets/pull/221 ;;
       *) cat "$PG_PR_TEST_METADATA" ;;
@@ -811,6 +815,258 @@ PR_EVIDENCE_MV
   check 'the same legacy review remains recoverable from durable bytes without a new submission' \
     "$([ "$rc" -eq 0 ] && cmp -s "$root/legacy-recovered.md" "$home/review.md"; echo $?)" \
     "rc=$rc stderr=$(cat "$root/legacy-recover.err")"
+
+  # A legacy round that left no review behind is not a review to replace (pushbot #3755:
+  # charged, then Chrome was lost before any conversation existed; its binding recorded base=head).
+  # It must not strand its head: the next query grants a real metadata-bound review. The same
+  # binding with any one kind of review record still stops, because that record is, or may
+  # still become, the review. One fixture per record kind, so dropping any check fails here.
+  local residue legacy_binding="$binding"
+  for residue in none completed pending recovered result-binding conversation crossbound receipt; do
+    home="$root/legacy-$residue-home"
+    mkdir -p "$home/review-input-bindings"
+    jq -cS --arg head "$head" '.evidence.proof.base_oid=$head' "$legacy_binding" | tr -d '\n' > "$home/review-input-bindings/$marker"
+    case "$residue" in
+      completed|pending) mkdir -p "$home/$residue"; cp "$root/home-main/review.md" "$home/$residue/$marker" ;;
+      recovered) mkdir -p "$home/recovered"; cp "$root/home-main/review.md" "$home/recovered/$marker.md" ;;
+      result-binding) mkdir -p "$home/review-result-bindings"; printf '{}' > "$home/review-result-bindings/$marker" ;;
+      conversation)
+        mkdir -p "$home/conversation-urls"
+        printf 'https://chatgpt.com/c/legacy-%s\n' "$marker" > "$home/conversation-urls/$marker" ;;
+      crossbound)
+        mkdir -p "$home/crossbound"
+        printf '2026-01-01T00:00:00.000Z\thttps://chatgpt.com/c/legacy-%s\tpg-run-other-repo-42-1111111111-9\n' "$marker" > "$home/crossbound/$marker" ;;
+      receipt)
+        mkdir -p "$home/legacy-review-receipts"
+        printf 'https://chatgpt.com/c/legacy-%s\n' "$marker" > "$home/legacy-review-receipts/$marker.1.1.1" ;;
+    esac
+    PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+      pr_identity_engine --review-decision --json --diff "$prep/endpoint.patch" > "$root/legacy-$residue.json" 2> "$root/legacy-$residue.err"
+  done
+  for residue in completed pending recovered result-binding conversation crossbound receipt; do
+    check "a same-head legacy round that left a $residue record still cannot buy a replacement review" \
+      "$(jq -e '.action=="stop-without-new-review" and .reason=="invalid-binding"' "$root/legacy-$residue.json" >/dev/null; echo $?)" \
+      "decision=$(cat "$root/legacy-$residue.json") stderr=$(cat "$root/legacy-$residue.err")"
+  done
+
+  # Revoking a legacy round's only memo must not reopen a paid replacement before its 14 days
+  # (pro-gate #227 round 3 P2). Both revocation paths run for real here: a probe that convicts the
+  # remembered conversation as cross-bound (the mock's one tab carries our prompt and another run's
+  # answer), and the shell's provenance rejection. Each keeps the memo as a receipt with its mtime.
+  local revoke receipt memo_url=https://chatgpt.com/c/mock-conversation
+  printf 'pro-gate review: PR #999 r1 [other-repo]\nrun marker: %s\n\n[P1] apps/other/thing.ts:12 - something in ANOTHER change\nP2: none\nP3: none\nVERDICT: FIX-FIRST - not ours. (run marker: pg-run-other-repo-42-1111111111-9)\n' \
+    "$marker" > "$root/crossbound-tab.txt"
+  for revoke in probe provenance; do
+    home="$root/legacy-revoke-$revoke-home"
+    mkdir -p "$home/review-input-bindings" "$home/conversation-urls"
+    jq -cS --arg head "$head" '.evidence.proof.base_oid=$head' "$legacy_binding" | tr -d '\n' > "$home/review-input-bindings/$marker"
+    printf '%s\n' "$memo_url" > "$home/conversation-urls/$marker"
+    touch -d '2026-01-02 03:04:05' "$home/conversation-urls/$marker"
+    case "$revoke" in
+      probe)
+        cp "$root/tab.txt" "$root/tab.before"; cp "$root/crossbound-tab.txt" "$root/tab.txt"
+        PRO_GATE_HOME="$home" node "$HERE/../bin/cdp-salvage.mjs" --probe "$marker" 3 "$PORT" \
+          > "$root/legacy-revoke-probe.out" 2> "$root/legacy-revoke-probe.err"
+        cp "$root/tab.before" "$root/tab.txt" ;;
+      provenance)
+        PRO_GATE_HOME="$home" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_provenance_reject '$marker' '$memo_url'" \
+          > "$root/legacy-revoke-provenance.out" 2> "$root/legacy-revoke-provenance.err" ;;
+    esac
+    PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+      pr_identity_engine --review-decision --json --diff "$prep/endpoint.patch" > "$root/legacy-revoke-$revoke.json" 2> "$root/legacy-revoke-$revoke.err.query"
+    receipt="$(find "$home/legacy-review-receipts" -maxdepth 1 -type f -name "$marker*" 2>/dev/null | head -1)"
+    check "a legacy round's memo revoked by $revoke survives as a receipt, so its head still cannot buy a replacement review" \
+      "$([ ! -e "$home/conversation-urls/$marker" ] && [ ! -e "$home/crossbound/$marker" ] && [ -n "$receipt" ] && \
+        [ "$(tr -d '\n' < "$receipt")" = "$memo_url" ] && \
+        [ "$(date -r "$receipt" +%s)" = "$(date -d '2026-01-02 03:04:05' +%s)" ] && \
+        jq -e '.action=="stop-without-new-review" and .reason=="invalid-binding"' "$root/legacy-revoke-$revoke.json" >/dev/null; echo $?)" \
+      "home=$(find "$home" -type f -printf '%P ' 2>/dev/null) decision=$(jq -c '{action,reason}' "$root/legacy-revoke-$revoke.json" 2>/dev/null) stderr=$(tail -3 "$root/legacy-revoke-$revoke.err" 2>/dev/null)"
+  done
+
+  # Pro-gate #227 rounds 4 and 5, on the shell revocation path. (1) A revoker killed right after
+  # it claims the memo (the mv stub completes the claim, then kills its caller) must leave a
+  # receipt. (2) A revoker holding an older memo that finishes last must not replace the newer
+  # generation's receipt, whose 14-day clock would regress. (3) A legacy memo whose receipt
+  # cannot be published is kept, not discarded. (4) A newer memo generation published at the
+  # moment of the claim (a DEBUG trap republishes it just before the claiming mv) is the one
+  # receipted, not an older inode linked a step earlier.
+  local scenario newest
+  mkdir -p "$root/crash-bin"
+  cat > "$root/crash-bin/mv" <<'CRASH_AFTER_CLAIM_MV'
+#!/usr/bin/env bash
+/bin/mv "$@"; rc=$?
+case "$1" in */conversation-urls/*) kill -KILL "$PPID" ;; esac
+exit "$rc"
+CRASH_AFTER_CLAIM_MV
+  chmod +x "$root/crash-bin/mv"
+  cat > "$root/republish-at-claim.sh" <<'REPUBLISH_AT_CLAIM'
+#!/usr/bin/env bash
+# args: lib home marker url. Runs pg_provenance_reject while a fresher memo generation with the
+# same URL is published just before the command that claims the memo.
+set -T
+. "$1"
+export PRO_GATE_HOME="$2"
+REPUBLISH_MEMO="$2/conversation-urls/$3" REPUBLISH_URL="$4" REPUBLISH_DONE="$2/republish.done" REPUBLISH_PAT='mv "$memo"*'
+trap 'case "$BASH_COMMAND" in $REPUBLISH_PAT) if [ ! -e "$REPUBLISH_DONE" ]; then : > "$REPUBLISH_DONE"; printf "%s\n" "$REPUBLISH_URL" > "$REPUBLISH_MEMO.tmp"; touch -d "2026-01-10 00:00:00" "$REPUBLISH_MEMO.tmp"; command mv "$REPUBLISH_MEMO.tmp" "$REPUBLISH_MEMO"; fi ;; esac' DEBUG
+pg_provenance_reject "$3" "$4"
+REPUBLISH_AT_CLAIM
+  cat > "$root/older-restore-first.sh" <<'OLDER_RESTORE_FIRST'
+#!/usr/bin/env bash
+# args: lib home marker memo-url rejected-url. Runs pg_provenance_reject for a capture from
+# another URL while an overlapping revoker restores an older memo generation just before this
+# revoker's own restoring link, which then fails because a memo exists.
+set -T
+. "$1"
+export PRO_GATE_HOME="$2"
+OLDER_MEMO="$2/conversation-urls/$3" OLDER_URL="$4" OLDER_DONE="$2/older-restore.done" OLDER_PAT='ln "$claim" "$memo"*'
+trap 'case "$BASH_COMMAND" in $OLDER_PAT) if [ ! -e "$OLDER_DONE" ]; then : > "$OLDER_DONE"; printf "%s\n" "$OLDER_URL" > "$OLDER_MEMO.tmp"; touch -d "2025-12-28 00:00:00" "$OLDER_MEMO.tmp"; command mv "$OLDER_MEMO.tmp" "$OLDER_MEMO"; fi ;; esac' DEBUG
+pg_provenance_reject "$3" "$5"
+OLDER_RESTORE_FIRST
+  for scenario in crash older-last unwritable republish different old-first; do
+    home="$root/legacy-receipt-$scenario-home"
+    mkdir -p "$home/review-input-bindings" "$home/conversation-urls"
+    jq -cS --arg head "$head" '.evidence.proof.base_oid=$head' "$legacy_binding" | tr -d '\n' > "$home/review-input-bindings/$marker"
+    printf '%s\n' "$memo_url" > "$home/conversation-urls/$marker"
+    touch -d '2026-01-10 00:00:00' "$home/conversation-urls/$marker"
+    case "$scenario" in
+      crash) # the subshell absorbs the shell's "Killed" report for the simulated crash
+        ( PATH="$root/crash-bin:$PATH" PRO_GATE_HOME="$home" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_provenance_reject '$marker' '$memo_url'" \
+          > "$root/legacy-receipt-$scenario.out" 2> "$root/legacy-receipt-$scenario.err"; : ) 2>/dev/null ;;
+      older-last)
+        PRO_GATE_HOME="$home" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_provenance_reject '$marker' '$memo_url'" \
+          > "$root/legacy-receipt-$scenario.out" 2> "$root/legacy-receipt-$scenario.err"
+        printf '%s\n' "$memo_url" > "$home/conversation-urls/$marker"
+        touch -d '2025-12-28 00:00:00' "$home/conversation-urls/$marker"
+        PRO_GATE_HOME="$home" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_provenance_reject '$marker' '$memo_url'" \
+          >> "$root/legacy-receipt-$scenario.out" 2>> "$root/legacy-receipt-$scenario.err" ;;
+      unwritable)
+        printf 'not a directory\n' > "$home/legacy-review-receipts"
+        PRO_GATE_HOME="$home" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_provenance_reject '$marker' '$memo_url'" \
+          > "$root/legacy-receipt-$scenario.out" 2> "$root/legacy-receipt-$scenario.err" ;;
+      republish)
+        touch -d '2025-12-28 00:00:00' "$home/conversation-urls/$marker"
+        bash "$root/republish-at-claim.sh" "$HERE/../lib/pro-gate-lib.sh" "$home" "$marker" "$memo_url" \
+          > "$root/legacy-receipt-$scenario.out" 2> "$root/legacy-receipt-$scenario.err" ;;
+      different) # the rejected capture came from another URL, so the claimed memo goes back
+        PRO_GATE_HOME="$home" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_provenance_reject '$marker' 'https://chatgpt.com/c/some-other-conversation'" \
+          > "$root/legacy-receipt-$scenario.out" 2> "$root/legacy-receipt-$scenario.err" ;;
+      old-first)
+        bash "$root/older-restore-first.sh" "$HERE/../lib/pro-gate-lib.sh" "$home" "$marker" "$memo_url" 'https://chatgpt.com/c/some-other-conversation' \
+          > "$root/legacy-receipt-$scenario.out" 2> "$root/legacy-receipt-$scenario.err" ;;
+    esac
+    PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+      pr_identity_engine --review-decision --json --diff "$prep/endpoint.patch" > "$root/legacy-receipt-$scenario.json" 2> "$root/legacy-receipt-$scenario.err.query"
+    newest="$(find "$home/legacy-review-receipts" -maxdepth 1 -type f -name "$marker*" -printf '%T@\n' 2>/dev/null | cut -d. -f1 | sort -n | tail -1)"
+    case "$scenario" in
+      crash) receipt="$([ ! -e "$home/conversation-urls/$marker" ] && [ "$newest" = "$(date -d '2026-01-10 00:00:00' +%s)" ]; echo $?)" ;;
+      older-last|republish|old-first) receipt="$([ "$newest" = "$(date -d '2026-01-10 00:00:00' +%s)" ]; echo $?)" ;;
+      unwritable) receipt="$([ "$(tr -d '\n' 2>/dev/null < "$home/conversation-urls/$marker")" = "$memo_url" ]; echo $?)" ;;
+      different) receipt="$([ "$(tr -d '\n' 2>/dev/null < "$home/conversation-urls/$marker")" = "$memo_url" ] && \
+        [ "$(date -r "$home/conversation-urls/$marker" +%s)" = "$(date -d '2026-01-10 00:00:00' +%s)" ] && \
+        [ "$newest" = "$(date -d '2026-01-10 00:00:00' +%s)" ]; echo $?)" ;;
+    esac
+    check "a legacy memo's receipt holds on the shell path when $scenario, so its head still cannot buy a replacement review" \
+      "$([ "$receipt" = 0 ] && jq -e '.action=="stop-without-new-review" and .reason=="invalid-binding"' "$root/legacy-receipt-$scenario.json" >/dev/null; echo $?)" \
+      "home=$(find "$home" -printf '%P@%TT ' 2>/dev/null) newest=$newest decision=$(jq -c '{action,reason}' "$root/legacy-receipt-$scenario.json" 2>/dev/null) stderr=$(tail -3 "$root/legacy-receipt-$scenario.err" 2>/dev/null)"
+  done
+
+  # Pro-gate #227 rounds 5 and 7: a writer that moves a review record publishes the destination
+  # and then removes the source (promotion: pending/ -> completed/; proven ownership:
+  # crossbound/ -> conversation-urls/). A DEBUG trap performs that handoff just before the
+  # record scan checks the source, so a scan that checked the destination first finds neither
+  # although a record existed throughout.
+  cat > "$root/handoff-at-scan.sh" <<'HANDOFF_AT_SCAN'
+#!/usr/bin/env bash
+# args: lib home marker source-dir destination-dir. Scans for a review record while the
+# record is handed from source to destination just before the scan's source check runs.
+set -T
+. "$1"
+export PRO_GATE_HOME="$2"
+HANDOFF_FROM="$2/$4/$3" HANDOFF_TO="$2/$5/$3" HANDOFF_PAT="*/$4/*"
+mkdir -p "$2/$5"
+trap 'case "$BASH_COMMAND" in $HANDOFF_PAT) if [ -e "$HANDOFF_FROM" ]; then command cp -p "$HANDOFF_FROM" "$HANDOFF_TO"; command rm -f "$HANDOFF_FROM"; fi ;; esac' DEBUG
+pg_run_left_review_record "$3"
+HANDOFF_AT_SCAN
+  local handoff from to
+  for handoff in pending:completed crossbound:conversation-urls; do
+    from="${handoff%%:*}"; to="${handoff#*:}"
+    home="$root/legacy-handoff-$from-home"
+    mkdir -p "$home/$from"
+    printf 'https://chatgpt.com/c/legacy-%s\n' "$marker" > "$home/$from/$marker"
+    bash "$root/handoff-at-scan.sh" "$HERE/../lib/pro-gate-lib.sh" "$home" "$marker" "$from" "$to" 2> "$root/legacy-handoff-$from.err"
+    rc=$?
+    check "a review record handed from $from/ to $to/ during the scan is still seen" \
+      "$([ "$rc" -eq 0 ] && [ -e "$home/$to/$marker" ] && [ ! -e "$home/$from/$marker" ]; echo $?)" \
+      "rc=$rc home=$(find "$home" -type f -printf '%P ' 2>/dev/null) stderr=$(tail -3 "$root/legacy-handoff-$from.err")"
+  done
+  check 'a same-head legacy round that left no review does not strand its head' \
+    "$(jq -e '.action=="run-granted-review"' "$root/legacy-none.json" >/dev/null; echo $?)" \
+    "decision=$(cat "$root/legacy-none.json") stderr=$(cat "$root/legacy-none.err")"
+
+  # The guarded dispatch re-reads that refusal, because a late --harvest can find the legacy
+  # round's conversation after the grant (pro-gate #227 round 2 P1). The GitHub stub plants the
+  # memo on the effect's first metadata read, after its own initial reduction, so only a
+  # dispatch recheck can see it.
+  home="$root/legacy-late-home"
+  mkdir -p "$home/review-input-bindings"
+  jq -cS --arg head "$head" '.evidence.proof.base_oid=$head' "$legacy_binding" | tr -d '\n' > "$home/review-input-bindings/$marker"
+  printf 'https://chatgpt.com/c/legacy-late-%s\n' "$marker" > "$root/legacy-late.memo"
+  PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+    pr_identity_engine --review-decision --json --diff "$prep/endpoint.patch" > "$root/legacy-late.json" 2> "$root/legacy-late.err"
+  PG_PR_TEST_PLANT_SRC="$root/legacy-late.memo" PG_PR_TEST_PLANT_DST="$home/conversation-urls/$marker" \
+    PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+    pr_identity_engine --review-decision-effect "$root/legacy-late.json" --diff "$prep/endpoint.patch" \
+    --out "$root/legacy-late.md" --timeout 10s > "$root/legacy-late-effect.out" 2> "$root/legacy-late-effect.err"
+  rc=$?
+  check 'a legacy review record that appears after the grant stops the dispatch before any charge or submission' \
+    "$([ "$rc" -ne 0 ] && jq -e '.action=="run-granted-review"' "$root/legacy-late.json" >/dev/null && \
+      [ -e "$home/conversation-urls/$marker" ] && \
+      grep -qF 'fresh dispatch superseded at pre-lock: stop-without-new-review/invalid-binding' "$root/legacy-late-effect.err" && \
+      [ ! -e "$home.oracle.calls" ] && [ ! -e "$home/rounds/acme-widgets-221" ]; echo $?)" \
+    "rc=$rc decision=$(jq -c '{action,reason}' "$root/legacy-late.json" 2>/dev/null) stderr=$(tail -4 "$root/legacy-late-effect.err")"
+
+  home="$root/legacy-none-home"
+  PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+    pr_identity_engine --review-decision-effect "$root/legacy-none.json" --diff "$prep/endpoint.patch" \
+    --out "$root/legacy-none.md" --timeout 10s > "$root/legacy-none-effect.out" 2> "$root/legacy-none-effect.err"
+  rc=$?
+  want="$(jq -r '.marker // empty' "$root/legacy-none.md.status" 2>/dev/null)"
+  check 'the granted review submits and binds the real PR base with metadata proof' \
+    "$([ "$rc" -eq 0 ] && [ -s "$home.oracle.calls" ] && [ -n "$want" ] && [ "$want" != "$marker" ] && \
+      jq -e --arg base "$base" --arg head "$head" \
+      '.evidence.proof.base_oid==$base and .target.head_oid==$head and (.evidence.proof.pr_metadata_digest|test("^[0-9a-f]{64}$"))' \
+      "$home/review-input-bindings/$want" >/dev/null; echo $?)" \
+    "rc=$rc marker=$want stderr=$(tail -4 "$root/legacy-none-effect.err")"
+  PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+    pr_identity_engine --review-decision --json --diff "$prep/endpoint.patch" > "$root/legacy-none-after.json" 2> "$root/legacy-none-after.err"
+  if [ "$(jq -r .action "$root/legacy-none-after.json")" = collect-existing-result ]; then
+    PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+      pr_identity_engine --review-decision-effect "$root/legacy-none-after.json" --diff "$prep/endpoint.patch" \
+      > "$root/legacy-none-collected.json" 2> "$root/legacy-none-collected.err"
+    PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+      pr_identity_engine --review-decision --json --diff "$prep/endpoint.patch" > "$root/legacy-none-after.json" 2> "$root/legacy-none-after.err"
+  fi
+  check 'after that review the formerly stranded head reaches the existing allow path' \
+    "$(jq -e '.action=="allow-existing-merge-workflow"' "$root/legacy-none-after.json" >/dev/null; echo $?)" \
+    "decision=$(cat "$root/legacy-none-after.json") stderr=$(cat "$root/legacy-none-after.err")"
+
+  # The recheck agrees with the query that an exact-current relation outranks legacy history
+  # (a charged metadata-proven round that left nothing, beside a legacy round that left a memo),
+  # so a grant is never refused at dispatch only to be granted again by the next query.
+  home="$root/legacy-exact-home"
+  mkdir -p "$home/review-input-bindings" "$home/conversation-urls"
+  jq -cS --arg head "$head" '.evidence.proof.base_oid=$head' "$legacy_binding" | tr -d '\n' > "$home/review-input-bindings/$marker"
+  printf 'https://chatgpt.com/c/legacy-exact-%s\n' "$marker" > "$home/conversation-urls/$marker"
+  cp "$root/legacy-none-home/review-input-bindings/$want" "$home/review-input-bindings/$want"
+  PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+    pr_identity_engine --review-decision --json --diff "$prep/endpoint.patch" > "$root/legacy-exact.json" 2> "$root/legacy-exact.err"
+  PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+    pr_identity_engine --review-decision-effect "$root/legacy-exact.json" --diff "$prep/endpoint.patch" \
+    --out "$root/legacy-exact.md" --timeout 10s > "$root/legacy-exact-effect.out" 2> "$root/legacy-exact-effect.err"
+  rc=$?
+  check 'the dispatch recheck lets an exact-current relation outrank legacy history, as the query does' \
+    "$([ "$rc" -eq 0 ] && jq -e '.action=="run-granted-review"' "$root/legacy-exact.json" >/dev/null && [ -s "$home.oracle.calls" ]; echo $?)" \
+    "rc=$rc decision=$(jq -c '{action,reason}' "$root/legacy-exact.json" 2>/dev/null) stderr=$(tail -4 "$root/legacy-exact-effect.err")"
 }
 run_pr_evidence_identity_tests
 if [ "${PG_TEST_ONLY:-}" = pr-evidence-identity ]; then

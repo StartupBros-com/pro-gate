@@ -594,8 +594,10 @@ pg_review_decision_cli() {
     jq -e --arg h "$host" --arg o "$owner" --arg r "$repo_name" --argjson p "$pr_num" --arg head "$head" \
       '.repository.host==$h and .repository.owner==$o and .repository.repo==$r and .target.pr==$p and .target.head_oid==$head' \
       <<<"$candidate" >/dev/null 2>&1 || continue
-    if jq -e '(.evidence.mode=="full-pr" or .evidence.mode=="scoped-delta") and
-      (.evidence.proof|has("pr_metadata_digest")|not)' <<<"$candidate" >/dev/null; then
+    # Only a legacy round that left a review behind makes a new round a replacement spend. A
+    # charged round with no bytes, result, or conversation reviewed nothing (pushbot #3755), so it
+    # must not strand its head; its charge still counts against the round budget.
+    if pg_review_input_binding_legacy_reviewed "$candidate" "$marker"; then
       legacy_pr_identity=true
     fi
     candidate_relation="$(jq -cS '{repository,target,evidence}' <<<"$candidate")"
@@ -2145,6 +2147,7 @@ pg_fresh_dispatch_recheck() { # sets PG_FRESH_DECISION/PG_FRESH_ACTION
   local template="$REVIEW_DECISION_INPUT_TEMPLATE" marker="" state=none epoch=0 f rec m astate="" completed='[]' attempt_snapshot attempt_source
   local input_ok=false input_digest evidence identity head base active_marker="" reservation="" granted=false cooldown_left=0 facts governor_facts
   local template_relation="" candidate="" candidate_relation="" artifact="" artifact_digest="" pr_evidence=""
+  local input_binding legacy_reviewed=false exact_seen=false
   [ -n "$template" ] || return 1
   input_digest="$(pg_review_sha256_text "$template" 2>/dev/null || true)"
   head="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || true)"
@@ -2173,9 +2176,13 @@ pg_fresh_dispatch_recheck() { # sets PG_FRESH_DECISION/PG_FRESH_ACTION
       jq -e --arg h "$PG_META_HOST" --arg o "$PG_META_OWNER" --arg r "$PG_META_REPO" --argjson p "$PR_NUM" --arg head "$head" \
         '.repository.host==$h and .repository.owner==$o and .repository.repo==$r and .target.pr==$p and .target.head_oid==$head' \
         <<<"$candidate" >/dev/null 2>&1 || continue
+      # The query's legacy refusal, re-read here: a late --harvest can find or publish a legacy
+      # round's review between the grant and this boundary (pro-gate #227 round 2 P1).
+      if pg_review_input_binding_legacy_reviewed "$candidate" "$m"; then legacy_reviewed=true; fi
       candidate_relation="$(jq -cS '{repository,target,evidence}' <<<"$candidate" 2>/dev/null || true)"
       [ "$candidate_relation" = "$template_relation" ] \
         && pg_review_decision_input_proof_current "$candidate" "$REPO" "$PR_NUM" "$PG_META_HOST" "$PG_META_OWNER" "$PG_META_REPO" "$head" "$base" || continue
+      exact_seen=true
       artifact="$(pg_completed_dir)/$m"
       if ! { [ -f "$artifact" ] && [ ! -L "$artifact" ] && pg_is_review "$artifact"; }; then
         artifact="$PRO_GATE_HOME/pending/$m"
@@ -2188,6 +2195,10 @@ pg_fresh_dispatch_recheck() { # sets PG_FRESH_DECISION/PG_FRESH_ACTION
         '. + [{applicable:true,artifact_digest:$digest,bindable:$bindable,binding_valid:false,canonical_identity:$marker,charged_spend_epoch:$charged,collected:false,evidence_mode:$mode,legacy:false,marker:$marker,provenance_valid:false,verdict:"NONE"}]' <<<"$completed")"
     done < <(find "$(pg_review_input_binding_dir)" -mindepth 1 -maxdepth 1 -type f -name "pg-run-$ROUND_KEY-*" -printf '%f\n' 2>/dev/null | LC_ALL=C sort)
   fi
+  # Same facts as the query: an exact-current relation outranks legacy history; otherwise the
+  # input binding is invalid while the evidence itself stays proven and matching.
+  input_binding="$input_ok"
+  if [ "$legacy_reviewed" = true ] && [ "$exact_seen" = false ]; then input_binding=false; fi
   attempt_snapshot="$(pg_attempt_snapshot "$PG_META_HOST" "$PG_META_OWNER" "$PG_META_REPO" "$PR_NUM" "$ROUND_KEY" "${RUN_MARKER:-}" 2>/dev/null || true)"
   [ -n "$attempt_snapshot" ] || return 1
   attempt_source="$(jq -r .source <<<"$attempt_snapshot")"
@@ -2207,8 +2218,8 @@ pg_fresh_dispatch_recheck() { # sets PG_FRESH_DECISION/PG_FRESH_ACTION
   cooldown_left="$(pg_cooldown_remaining_secs)"; case "$cooldown_left" in ''|*[!0-9]*) cooldown_left=0;; esac
   facts="$(jq -cnS --arg h "$PG_META_HOST" --arg o "$PG_META_OWNER" --arg r "$PG_META_REPO" --arg head "$head" --argjson p "$PR_NUM" \
     --arg identity "$identity" --arg evidence "$evidence" --arg marker "$active_marker" --arg astate "${astate:-none}" --arg reservation "$reservation" \
-    --argjson valid "$input_ok" --argjson governor "$governor_facts" --argjson cooldown_left "$cooldown_left" --argjson completed "$completed" --arg cd "$(pg_review_decision_contract_digest)" --arg xd "$(pg_review_decision_corpus_digest)" \
-    '{active_index:{binding_valid:$valid,charged_spend_epoch:0,marker:$marker,state:$astate},completed_results:$completed,contract:{contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,corpus_digest:$xd},cooldown:{active:($cooldown_left > 0),seconds_remaining:$cooldown_left},evidence:{identity:$evidence,safe_to_prepare:true,state:(if $valid then "matching" else "missing" end)},governor:$governor,input:{binding_valid:$valid,identity:$identity,proven:$valid},named_choice:{outcomes:[],selected_id:null,snapshot_digest:""},observation:{kind:"idle"},prior_review:{applicable:false,binding_valid:false,code_identity:"",evidence_identity:"",legacy:false,marker:"",provenance_valid:false,verdict:"NONE"},reservation:{binding_valid:false,legacy:false,marker:$reservation,state:(if $reservation=="" then "none" else "live" end)},target:{head_oid:$head,host:$h,owner:$o,pr:$p,repo:$r},transport:"review-decision/v1"}')" || return 1
+    --argjson valid "$input_ok" --argjson input_binding "$input_binding" --argjson governor "$governor_facts" --argjson cooldown_left "$cooldown_left" --argjson completed "$completed" --arg cd "$(pg_review_decision_contract_digest)" --arg xd "$(pg_review_decision_corpus_digest)" \
+    '{active_index:{binding_valid:$input_binding,charged_spend_epoch:0,marker:$marker,state:$astate},completed_results:$completed,contract:{contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,corpus_digest:$xd},cooldown:{active:($cooldown_left > 0),seconds_remaining:$cooldown_left},evidence:{identity:$evidence,safe_to_prepare:true,state:(if $valid then "matching" else "missing" end)},governor:$governor,input:{binding_valid:$input_binding,identity:$identity,proven:$valid},named_choice:{outcomes:[],selected_id:null,snapshot_digest:""},observation:{kind:"idle"},prior_review:{applicable:false,binding_valid:false,code_identity:"",evidence_identity:"",legacy:false,marker:"",provenance_valid:false,verdict:"NONE"},reservation:{binding_valid:false,legacy:false,marker:$reservation,state:(if $reservation=="" then "none" else "live" end)},target:{head_oid:$head,host:$h,owner:$o,pr:$p,repo:$r},transport:"review-decision/v1"}')" || return 1
   PG_FRESH_DECISION="$(pg_review_decision_reduce "$facts")" || return 1
   PG_FRESH_ACTION="$(jq -r .action <<<"$PG_FRESH_DECISION")"
   [ "$PG_FRESH_ACTION" = run-granted-review ]
@@ -3617,6 +3628,10 @@ find "$PRO_GATE_HOME/conversation-urls" -maxdepth 1 -type f -mmin +20160 -print 
 # it stands in for (the conviction deleted conversation-urls/<marker>), so the two records expire
 # together instead of one outliving the other — the same disagreement #170 was about.
 find "$PRO_GATE_HOME/crossbound" -maxdepth 1 -type f -mmin +20160 -delete 2>/dev/null || true
+# A revoked legacy memo's receipt (pg_legacy_review_receipt_path) is the memo itself, renamed
+# with its mtime, so this is the same 14-day horizon the memo had. Only the legacy
+# replacement-spend refusal reads it.
+find "$PRO_GATE_HOME/legacy-review-receipts" -maxdepth 1 -type f -mmin +20160 -delete 2>/dev/null || true
 # v0.42 (#109): salvage classification sidecars ride the same horizon as the memos they describe.
 find "$(pg_salvage_class_dir)" -maxdepth 1 -type f -mmin +20160 -delete 2>/dev/null || true
 # Canonical title memos serve the same late-harvest lifecycle as URL memos. Sequence counters
