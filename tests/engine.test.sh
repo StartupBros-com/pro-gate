@@ -5583,6 +5583,50 @@ check 'legacy run-meta recovery terminalizes in one no-spend invocation after bo
      && [ -s "$LEGACY_HOME/rounds/$LEGACY_KEY" ] && jq -e '.terminal_kind=="recovery-exhausted"' "$LEGACY_HOME/attempt-dispositions/$LEGACY_MARKER" >/dev/null 2>&1; echo $?)" \
   "rc=$RC stderr=$(cat "$TDIR/recover.stderr") disposition=$(cat "$LEGACY_HOME/attempt-dispositions/$LEGACY_MARKER" 2>/dev/null)"
 
+# #228: a reservation that is still LIVE past its TTL skips the restored-reservation probes above
+# and goes straight to a harvest. When that harvest reaches the confirmed-miss limit it writes the
+# recovery-exhausted disposition, releases the reservation and exits 6, the same status browser
+# trouble returns. The relay must report what happened, not blame the browser.
+LIVE_EXPIRED_HOME="$TDIR/home-live-expired"; LIVE_EXPIRED_KEY=acme-widgets-45
+LIVE_EXPIRED_MARKER='pg-run-acme-widgets-45-1700001002-15'; LIVE_EXPIRED_EPOCH=1700001002
+mkdir -p "$LIVE_EXPIRED_HOME/run-meta" "$LIVE_EXPIRED_HOME/rounds" "$LIVE_EXPIRED_HOME/in-progress"
+printf '%s\n' "$LIVE_EXPIRED_EPOCH" > "$LIVE_EXPIRED_HOME/rounds/$LIVE_EXPIRED_KEY"
+printf 'github.com\tacme\twidgets\t%s\t45\t%s\t%s\n' "$LIVE_EXPIRED_KEY" "$TDIR/live-expired.md" "$LIVE_EXPIRED_EPOCH" \
+  > "$LIVE_EXPIRED_HOME/run-meta/$LIVE_EXPIRED_MARKER"
+printf '%s\t%s\t%s\t1\t\t\t%s\n' "$LIVE_EXPIRED_KEY" "$TDIR/live-expired.md" "$(( $(date +%s) - 30000 ))" "$LIVE_EXPIRED_EPOCH" \
+  > "$LIVE_EXPIRED_HOME/in-progress/$LIVE_EXPIRED_MARKER"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"; start_mock "$TDIR/tab.txt"
+: > "$TDIR/recover-oracle-sentinel"
+env PRO_GATE_HOME="$LIVE_EXPIRED_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RESERVATION_MISSES=2 PRO_GATE_RECONCILE_INTERVAL=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-recover-sentinel" \
+  PG_TEST_RECOVER_ORACLE_SENTINEL="$TDIR/recover-oracle-sentinel" NODE_OPTIONS= \
+  bash "$ENGINE" --recover "$LIVE_EXPIRED_MARKER" --timeout 4s >"$TDIR/recover.stdout" 2>"$TDIR/recover.stderr"
+RC=$?
+check '#228: a live expired reservation whose harvest proves the review gone reports "No review remains"' \
+  "$([ "$RC" -eq 6 ] && grep -qx 'No review remains' "$TDIR/recover.stderr" && ! grep -qx 'Browser needs attention' "$TDIR/recover.stderr" \
+     && [ ! -s "$TDIR/recover-oracle-sentinel" ] && [ ! -e "$LIVE_EXPIRED_HOME/in-progress/$LIVE_EXPIRED_MARKER" ] \
+     && jq -e '.terminal_kind=="recovery-exhausted"' "$LIVE_EXPIRED_HOME/attempt-dispositions/$LIVE_EXPIRED_MARKER" >/dev/null 2>&1; echo $?)" \
+  "rc=$RC stderr=$(cat "$TDIR/recover.stderr") disposition=$(cat "$LIVE_EXPIRED_HOME/attempt-dispositions/$LIVE_EXPIRED_MARKER" 2>/dev/null)"
+
+# The control: a harvest that fails for browser reasons (no CDP endpoint at all) writes no
+# disposition, so the relay still asks for the browser, and the reservation is kept.
+LIVE_DOWN_HOME="$TDIR/home-live-down"
+mkdir -p "$LIVE_DOWN_HOME/run-meta" "$LIVE_DOWN_HOME/rounds" "$LIVE_DOWN_HOME/in-progress"
+cp "$LIVE_EXPIRED_HOME/rounds/$LIVE_EXPIRED_KEY" "$LIVE_DOWN_HOME/rounds/$LIVE_EXPIRED_KEY"
+printf 'github.com\tacme\twidgets\t%s\t45\t%s\t%s\n' "$LIVE_EXPIRED_KEY" "$TDIR/live-down.md" "$LIVE_EXPIRED_EPOCH" \
+  > "$LIVE_DOWN_HOME/run-meta/$LIVE_EXPIRED_MARKER"
+printf '%s\t%s\t%s\t1\t\t\t%s\n' "$LIVE_EXPIRED_KEY" "$TDIR/live-down.md" "$(( $(date +%s) - 30000 ))" "$LIVE_EXPIRED_EPOCH" \
+  > "$LIVE_DOWN_HOME/in-progress/$LIVE_EXPIRED_MARKER"
+env PRO_GATE_HOME="$LIVE_DOWN_HOME" ORACLE_BROWSER_PORT=1 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RESERVATION_MISSES=2 PRO_GATE_RECONCILE_INTERVAL=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-recover-sentinel" \
+  PG_TEST_RECOVER_ORACLE_SENTINEL="$TDIR/recover-oracle-sentinel" NODE_OPTIONS= \
+  bash "$ENGINE" --recover "$LIVE_EXPIRED_MARKER" --timeout 4s >"$TDIR/recover.stdout" 2>"$TDIR/recover.stderr"
+RC=$?
+check '#228 control: a harvest that cannot reach the browser still reports "Browser needs attention" and keeps the reservation' \
+  "$([ "$RC" -ne 0 ] && grep -qx 'Browser needs attention' "$TDIR/recover.stderr" && ! grep -qx 'No review remains' "$TDIR/recover.stderr" \
+     && [ -f "$LIVE_DOWN_HOME/in-progress/$LIVE_EXPIRED_MARKER" ] && [ ! -e "$LIVE_DOWN_HOME/attempt-dispositions/$LIVE_EXPIRED_MARKER" ]; echo $?)" \
+  "rc=$RC stderr=$(cat "$TDIR/recover.stderr")"
+
 LEGACY_FUTURE_HOME="$TDIR/home-legacy-future"; LEGACY_FUTURE_KEY=acme-widgets-44
 LEGACY_FUTURE_MARKER='pg-run-acme-widgets-44-9999999999-14'; LEGACY_FUTURE_EPOCH=9999999999
 mkdir -p "$LEGACY_FUTURE_HOME/run-meta"
