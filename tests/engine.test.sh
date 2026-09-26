@@ -815,22 +815,32 @@ PR_EVIDENCE_MV
   # A legacy round that left no review behind is not a review to replace (pushbot #3755:
   # charged, then Chrome was lost before any conversation existed; its binding recorded base=head).
   # It must not strand its head: the next query grants a real metadata-bound review. The same
-  # binding with a remembered conversation still stops, because that conversation may hold one.
+  # binding with any one kind of review record still stops, because that record is, or may
+  # still become, the review. One fixture per record kind, so dropping any check fails here.
   local residue legacy_binding="$binding"
-  for residue in none conversation; do
+  for residue in none completed pending recovered result-binding conversation crossbound; do
     home="$root/legacy-$residue-home"
     mkdir -p "$home/review-input-bindings"
     jq -cS --arg head "$head" '.evidence.proof.base_oid=$head' "$legacy_binding" | tr -d '\n' > "$home/review-input-bindings/$marker"
-    if [ "$residue" = conversation ]; then
-      mkdir -p "$home/conversation-urls"
-      printf 'https://chatgpt.com/c/legacy-%s\n' "$marker" > "$home/conversation-urls/$marker"
-    fi
+    case "$residue" in
+      completed|pending) mkdir -p "$home/$residue"; cp "$root/home-main/review.md" "$home/$residue/$marker" ;;
+      recovered) mkdir -p "$home/recovered"; cp "$root/home-main/review.md" "$home/recovered/$marker.md" ;;
+      result-binding) mkdir -p "$home/review-result-bindings"; printf '{}' > "$home/review-result-bindings/$marker" ;;
+      conversation)
+        mkdir -p "$home/conversation-urls"
+        printf 'https://chatgpt.com/c/legacy-%s\n' "$marker" > "$home/conversation-urls/$marker" ;;
+      crossbound)
+        mkdir -p "$home/crossbound"
+        printf '2026-01-01T00:00:00.000Z\thttps://chatgpt.com/c/legacy-%s\tpg-run-other-repo-42-1111111111-9\n' "$marker" > "$home/crossbound/$marker" ;;
+    esac
     PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
       pr_identity_engine --review-decision --json --diff "$prep/endpoint.patch" > "$root/legacy-$residue.json" 2> "$root/legacy-$residue.err"
   done
-  check 'a same-head legacy round with a remembered conversation still cannot buy a replacement review' \
-    "$(jq -e '.action=="stop-without-new-review" and .reason=="invalid-binding"' "$root/legacy-conversation.json" >/dev/null; echo $?)" \
-    "decision=$(cat "$root/legacy-conversation.json") stderr=$(cat "$root/legacy-conversation.err")"
+  for residue in completed pending recovered result-binding conversation crossbound; do
+    check "a same-head legacy round that left a $residue record still cannot buy a replacement review" \
+      "$(jq -e '.action=="stop-without-new-review" and .reason=="invalid-binding"' "$root/legacy-$residue.json" >/dev/null; echo $?)" \
+      "decision=$(cat "$root/legacy-$residue.json") stderr=$(cat "$root/legacy-$residue.err")"
+  done
   check 'a same-head legacy round that left no review does not strand its head' \
     "$(jq -e '.action=="run-granted-review"' "$root/legacy-none.json" >/dev/null; echo $?)" \
     "decision=$(cat "$root/legacy-none.json") stderr=$(cat "$root/legacy-none.err")"

@@ -3817,6 +3817,9 @@ pg_review_result_binding_dir() { printf '%s\n' "${PRO_GATE_REVIEW_RESULT_BINDING
 # Whether a run left anything that is, or may still become, its review: captured or pending
 # bytes, a recovered copy, a result binding, or a remembered conversation (including one later
 # convicted as cross-bound). Any record counts, so an unreadable or partial one fails closed.
+# Bytes and bindings are never swept. Conversation and cross-bound memos expire with pg_finish's
+# 14-day sweep, the horizon after which pro-gate treats any uncollected conversation as abandoned;
+# a round whose only record was such a memo is then treated like one that left nothing.
 pg_run_left_review_record() { # marker
   local marker="$1"
   [ -e "$(pg_completed_dir)/$marker" ] || [ -e "$PRO_GATE_HOME/pending/$marker" ] \
