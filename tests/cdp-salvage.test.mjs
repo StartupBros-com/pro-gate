@@ -286,7 +286,11 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
           id: 'tab1', type: 'page', url: 'https://chatgpt.com/c/mock-conversation',
           webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/tab1`,
         }, ...extras, ...scratch];
-      res.end(JSON.stringify(listed));
+      // outerListDelayMs answers each outer list only after that many ms, so a scan that starts
+      // close to its deadline still has its listing in flight when the deadline arrives.
+      const body = JSON.stringify(listed);
+      if (!scratchOpen && opts.outerListDelayMs) setTimeout(() => res.end(body), opts.outerListDelayMs);
+      else res.end(body);
       if (!scratchOpen) outerListsAnswered += 1;
       // Only shortened deadline fixtures opt into these diagnostic events. Ordinary fixtures keep
       // the original mock's hot request path and only retain jsonListCalls for pass 5's contrast.
@@ -528,10 +532,19 @@ function runSalvage(args, port, seed, extraEnv = {}) {
             .map((f) => read(path.join('crossbound', f)) ?? '').join('');
         } catch { return ''; }
       })();
+      // pro-gate #227 round 3: a revoked legacy memo is kept here for the runtime's refusal.
+      const receipts = (() => {
+        try {
+          return fs.readdirSync(path.join(home, 'legacy-review-receipts')).map((n) => {
+            const p = path.join(home, 'legacy-review-receipts', n);
+            return { name: n, body: fs.readFileSync(p, 'utf8'), mtimeMs: fs.statSync(p).mtimeMs };
+          });
+        } catch { return []; }
+      })();
       fs.rmSync(home, { recursive: true, force: true });
       resolve({
         status, stdout, stderr, elapsedMs: Date.now() - startedAt,
-        memoUrl: memoUrl?.trim() ?? null, memos, blacklist, cooldown, crossbound, crossboundBody,
+        memoUrl: memoUrl?.trim() ?? null, memos, blacklist, cooldown, crossbound, crossboundBody, receipts,
       });
     });
   });
@@ -1825,6 +1838,22 @@ const MIXED_MARKER = 'pg-run-Test-Case-1234567890-43';
       `closed=${cdp.closed} memo=${r.memoUrl} blacklist=${r.blacklist} crossbound=${r.crossbound}`);
     cdp.stop();
   }
+}
+
+{ // A listing the scan starts just before its deadline still gets to answer. The last poll sleep
+  // ends at the deadline, and a timer firing a hair early used to start one more listing with ~1ms
+  // of budget whose abort read as a failed list, turning a decisive exit into browser-down (CI on
+  // #227). Every outer list here takes 600ms and a 300ms poll starts the fourth scan ~300ms before
+  // the 3s deadline, so that listing is still in flight when the deadline arrives.
+  const cdp = await mockCdp('__NO_TABS__', [], { outerListDelayMs: 600 });
+  const r = await runSalvage([MARKER, '3'], cdp.port, null, {
+    PRO_GATE_TEST_MODE: 'ci-fixture', PRO_GATE_TEST_POLL_MS: '300', PRO_GATE_TEST_CHILD_TIMEOUT_MS: '9000',
+  });
+  check('a listing in flight at the deadline still answers, so the scan ends decisively',
+    r.status === 4 && /evidence-kind: absent/.test(r.stderr) && !/CDP list failed/.test(r.stderr)
+      && r.elapsedMs < 5_500,
+    `status=${r.status} elapsed=${r.elapsedMs}ms stderr=${r.stderr?.slice(-400)}`);
+  cdp.stop();
 }
 
 { // A failing list backs off before retrying, but never past the deadline: the backoff's first
@@ -5390,6 +5419,151 @@ for (const placeholder of PLACEHOLDER_URLS) {
       && r.memos.length === 201,
     `memos.length=${r.memos.length} evicted0=${memoSet.has(unprotected[0])} kept1=${memoSet.has(unprotected[1])}`);
   cdp.stop();
+}
+
+{ // pro-gate #227 round 2 P2: a pre-v0.55 full-PR or scoped round's memo can be the only record
+  // that its review exists, and the runtime refuses to buy a replacement at that head while it
+  // does. The count cap used to evict it as soon as 200 newer memos arrived, well inside the
+  // documented 14-day horizon. Only bindings without PR metadata proof in those two modes are
+  // protected; a connector binding and a current metadata-proven binding still count.
+  const bindings = {
+    'pg-run-memo-legacy-full-1700099000-1': { mode: 'full-pr', proof: { base_oid: 'a'.repeat(40) } },
+    'pg-run-memo-legacy-scoped-1700099000-1': { mode: 'scoped-delta', proof: { base_oid: 'a'.repeat(40) } },
+    'pg-run-memo-legacy-connector-1700099000-1': { mode: 'connector', proof: { commit_target: 'b'.repeat(40) } },
+    'pg-run-memo-current-full-1700099000-1': { mode: 'full-pr', proof: { base_oid: 'a'.repeat(40), pr_metadata_digest: 'c'.repeat(64) } },
+  };
+  const plain = Array.from({ length: 199 }, (_, i) => `pg-run-memo-legacy-u-${i}-1700099000-1`);
+  const seed = (home) => { // oldest-first: the four bound memos, then 199 plain ones
+    const dir = path.join(home, 'conversation-urls');
+    const bindingDir = path.join(home, 'review-input-bindings');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.mkdirSync(bindingDir, { recursive: true });
+    [...Object.keys(bindings), ...plain].forEach((m, i) => {
+      const f = path.join(dir, m);
+      fs.writeFileSync(f, 'https://chatgpt.com/c/seed-placeholder\n');
+      const t = new Date(1700099000000 + i * 1000);
+      fs.utimesSync(f, t, t);
+      if (bindings[m]) fs.writeFileSync(path.join(bindingDir, m), JSON.stringify({ marker: m, evidence: bindings[m] }));
+    });
+  };
+  const NEW_MARKER = 'pg-run-memo-legacy-new-1700099500-9';
+  const cdp = await mockCdp([
+    `run marker: ${NEW_MARKER}`, 'P1: none', 'P2: none', 'P3: none',
+    `VERDICT: SHIP — ours. (run marker: ${NEW_MARKER})`,
+  ].join('\n'));
+  const r = await runSalvage([NEW_MARKER, '20'], cdp.port, seed);
+  const memoSet = new Set(r.memos);
+  check('#227 r2 P2: full-PR and scoped legacy memos survive the count cap even though they are the oldest',
+    memoSet.has('pg-run-memo-legacy-full-1700099000-1') && memoSet.has('pg-run-memo-legacy-scoped-1700099000-1'),
+    `memos.length=${r.memos.length} stderr=${r.stderr?.slice(-300)}`);
+  check('#227 r2 P2: connector and metadata-proven memos stay unprotected and are the two evicted',
+    !memoSet.has('pg-run-memo-legacy-connector-1700099000-1') && !memoSet.has('pg-run-memo-current-full-1700099000-1')
+      && memoSet.has(plain[0]) && memoSet.has(NEW_MARKER) && r.memos.length === 202,
+    `memos.length=${r.memos.length} connector=${memoSet.has('pg-run-memo-legacy-connector-1700099000-1')} current=${memoSet.has('pg-run-memo-current-full-1700099000-1')}`);
+  cdp.stop();
+}
+
+{ // pro-gate #227 round 3 P2: a probe that convicts a legacy round's remembered conversation as
+  // cross-bound revokes the memo but, by design, records no crossbound/ sidecar. The memo was
+  // that round's review record, so it must survive as a receipt on its own 14-day clock; a
+  // metadata-proven binding's memo is revoked exactly as before.
+  const rememberedUrl = 'https://chatgpt.com/c/crossbound-legacy';
+  const seededAt = new Date(1700099000000);
+  const seed = (evidence) => (home) => {
+    seedMemo(MARKER, rememberedUrl)(home);
+    fs.utimesSync(path.join(home, 'conversation-urls', MARKER), seededAt, seededAt);
+    fs.mkdirSync(path.join(home, 'review-input-bindings'), { recursive: true });
+    fs.writeFileSync(path.join(home, 'review-input-bindings', MARKER), JSON.stringify({ marker: MARKER, evidence }));
+  };
+  const probeCrossBound = async (evidence) => {
+    const cdp = await mockCdp('__NO_TABS__', [], { renderText: () => FOREIGN_ANSWER(MARKER) });
+    const r = await runScratchSalvage(['--probe', MARKER, '3'], cdp.port, seed(evidence));
+    cdp.stop();
+    return r;
+  };
+  const legacy = await probeCrossBound({ mode: 'full-pr', proof: { base_oid: 'a'.repeat(40) } });
+  check('#227 r3 P2: the probe convicts the legacy memo as cross-bound, revokes it and records no sidecar',
+    /ANOTHER run's completed answer/.test(legacy.stderr ?? '') && legacy.memos.length === 0 && legacy.crossbound === 0,
+    `memos=${JSON.stringify(legacy.memos)} crossbound=${legacy.crossbound} stderr=${legacy.stderr?.slice(-300)}`);
+  check('#227 r3 P2: the revoked legacy memo survives as a receipt with its URL and original mtime',
+    legacy.receipts.length === 1 && legacy.receipts[0].name.startsWith(`${MARKER}.`)
+      && legacy.receipts[0].body.trim() === rememberedUrl && legacy.receipts[0].mtimeMs === seededAt.getTime(),
+    `receipts=${JSON.stringify(legacy.receipts)}`);
+  const current = await probeCrossBound({ mode: 'full-pr', proof: { base_oid: 'a'.repeat(40), pr_metadata_digest: 'c'.repeat(64) } });
+  check('#227 r3 P2: a metadata-proven binding\'s revoked memo leaves no receipt',
+    /ANOTHER run's completed answer/.test(current.stderr ?? '') && current.memos.length === 0 && current.receipts.length === 0,
+    `memos=${JSON.stringify(current.memos)} receipts=${JSON.stringify(current.receipts)}`);
+
+  // #227 round 4 P2: a revoker holding an older memo that finishes after a newer generation was
+  // receipted must not replace that receipt, or the 14-day clock regresses to the older memo's.
+  // The second probe's home carries the first probe's receipts, as a later revoker would find them.
+  const legacyEvidence = { mode: 'full-pr', proof: { base_oid: 'a'.repeat(40) } };
+  const olderAt = new Date(1700099000000 - 13 * 86400_000);
+  const olderLast = await (async () => {
+    const cdp = await mockCdp('__NO_TABS__', [], { renderText: () => FOREIGN_ANSWER(MARKER) });
+    const r = await runScratchSalvage(['--probe', MARKER, '3'], cdp.port, (home) => {
+      seed(legacyEvidence)(home);
+      fs.utimesSync(path.join(home, 'conversation-urls', MARKER), olderAt, olderAt);
+      fs.mkdirSync(path.join(home, 'legacy-review-receipts'), { recursive: true });
+      for (const { name, body, mtimeMs } of legacy.receipts) {
+        const p = path.join(home, 'legacy-review-receipts', name);
+        fs.writeFileSync(p, body);
+        fs.utimesSync(p, new Date(mtimeMs), new Date(mtimeMs));
+      }
+    });
+    cdp.stop();
+    return r;
+  })();
+  check('#227 r4 P2: an older revoker finishing last keeps the newer generation\'s receipt and clock',
+    olderLast.receipts.some((x) => x.mtimeMs === seededAt.getTime())
+      && olderLast.receipts.some((x) => x.mtimeMs === olderAt.getTime()),
+    `receipts=${JSON.stringify(olderLast.receipts)}`);
+
+  // #227 round 4 P2: when the receipt cannot be published, the legacy memo is kept, not discarded.
+  const unwritable = await (async () => {
+    const cdp = await mockCdp('__NO_TABS__', [], { renderText: () => FOREIGN_ANSWER(MARKER) });
+    const r = await runScratchSalvage(['--probe', MARKER, '3'], cdp.port, (home) => {
+      seed(legacyEvidence)(home);
+      fs.writeFileSync(path.join(home, 'legacy-review-receipts'), 'not a directory\n');
+    });
+    cdp.stop();
+    return r;
+  })();
+  check('#227 r4 P2: a legacy memo whose receipt cannot be published is kept',
+    /ANOTHER run's completed answer/.test(unwritable.stderr ?? '') && unwritable.memos.length === 1 && unwritable.memoUrl === rememberedUrl,
+    `memos=${JSON.stringify(unwritable.memos)} memo=${unwritable.memoUrl} stderr=${unwritable.stderr?.slice(-300)}`);
+}
+
+{ // pro-gate #227 round 7: a legacy round's crossbound/ sidecar can be its only review record, so
+  // the exit flush never clears it, neither on an empty scan without a blacklist entry (--close)
+  // nor on proven ownership; only the 14-day sweep does. A metadata-proven binding's stale
+  // conviction is still cleared, exactly as #76 asserts for an unbound marker.
+  const sidecar = '2026-01-01T00:00:00.000Z\thttps://chatgpt.com/c/other\tpg-run-someone-else-1111111111-9\n';
+  const seedSidecar = (evidence) => (home) => {
+    fs.mkdirSync(path.join(home, 'crossbound'), { recursive: true });
+    fs.writeFileSync(path.join(home, 'crossbound', MARKER), sidecar);
+    fs.mkdirSync(path.join(home, 'review-input-bindings'), { recursive: true });
+    fs.writeFileSync(path.join(home, 'review-input-bindings', MARKER), JSON.stringify({ marker: MARKER, evidence }));
+  };
+  const legacyEvidence = { mode: 'full-pr', proof: { base_oid: 'a'.repeat(40) } };
+  const currentEvidence = { mode: 'full-pr', proof: { base_oid: 'a'.repeat(40), pr_metadata_digest: 'c'.repeat(64) } };
+  const owned = [`run marker: ${MARKER}`, 'P1: none', 'P2: none', 'P3: none', `VERDICT: SHIP — ours. (run marker: ${MARKER})`].join('\n');
+  const run = async (args, evidence) => {
+    const cdp = await mockCdp(owned, [{ id: 'root1', type: 'page', url: 'https://chatgpt.com/' }]);
+    const r = await runSalvage(args, cdp.port, seedSidecar(evidence));
+    cdp.stop();
+    return r;
+  };
+  const closeLegacy = await run(['--close', MARKER, '10'], legacyEvidence);
+  check('#227 r7 P2: --close keeps a legacy round\'s cross-bound sidecar',
+    closeLegacy.crossboundBody === sidecar, `crossbound=${JSON.stringify(closeLegacy.crossboundBody)} stderr=${closeLegacy.stderr?.slice(0, 300)}`);
+  const ownedLegacy = await run([MARKER, '10'], legacyEvidence);
+  check('#227 r7 P2: proven ownership keeps a legacy round\'s cross-bound sidecar',
+    ownedLegacy.status === 0 && ownedLegacy.memos.length === 1 && ownedLegacy.crossboundBody === sidecar,
+    `status=${ownedLegacy.status} memos=${JSON.stringify(ownedLegacy.memos)} crossbound=${JSON.stringify(ownedLegacy.crossboundBody)}`);
+  const closeCurrent = await run(['--close', MARKER, '10'], currentEvidence);
+  check('#227 r7 P2: --close still clears a metadata-proven binding\'s stale conviction',
+    closeCurrent.crossbound === 0, `crossbound=${closeCurrent.crossbound}`);
 }
 
 { // #215 gate r8 P2 (bin/cdp-salvage.mjs claimThrottleSeen): admission is a plain existence
