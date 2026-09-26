@@ -883,21 +883,34 @@ PR_EVIDENCE_MV
       "home=$(find "$home" -type f -printf '%P ' 2>/dev/null) decision=$(jq -c '{action,reason}' "$root/legacy-revoke-$revoke.json" 2>/dev/null) stderr=$(tail -3 "$root/legacy-revoke-$revoke.err" 2>/dev/null)"
   done
 
-  # Pro-gate #227 round 4 P2s, on the shell revocation path. (1) A revoker killed right after it
-  # claims the memo (the mv stub completes the claim, then kills its caller) must already have
-  # published the receipt. (2) A revoker holding an older memo that finishes last must not
-  # replace the newer generation's receipt, whose 14-day clock would regress. (3) A legacy memo
-  # whose receipt cannot be published is kept, not discarded.
+  # Pro-gate #227 rounds 4 and 5, on the shell revocation path. (1) A revoker killed right after
+  # it claims the memo (the mv stub completes the claim, then kills its caller) must leave a
+  # receipt. (2) A revoker holding an older memo that finishes last must not replace the newer
+  # generation's receipt, whose 14-day clock would regress. (3) A legacy memo whose receipt
+  # cannot be published is kept, not discarded. (4) A newer memo generation published at the
+  # moment of the claim (a DEBUG trap republishes it just before the claiming mv) is the one
+  # receipted, not an older inode linked a step earlier.
   local scenario newest
   mkdir -p "$root/crash-bin"
   cat > "$root/crash-bin/mv" <<'CRASH_AFTER_CLAIM_MV'
 #!/usr/bin/env bash
 /bin/mv "$@"; rc=$?
-case "${*: -1}" in *.rej.*) kill -KILL "$PPID" ;; esac
+case "$1" in */conversation-urls/*) kill -KILL "$PPID" ;; esac
 exit "$rc"
 CRASH_AFTER_CLAIM_MV
   chmod +x "$root/crash-bin/mv"
-  for scenario in crash older-last unwritable; do
+  cat > "$root/republish-at-claim.sh" <<'REPUBLISH_AT_CLAIM'
+#!/usr/bin/env bash
+# args: lib home marker url. Runs pg_provenance_reject while a fresher memo generation with the
+# same URL is published just before the command that claims the memo.
+set -T
+. "$1"
+export PRO_GATE_HOME="$2"
+REPUBLISH_MEMO="$2/conversation-urls/$3" REPUBLISH_URL="$4" REPUBLISH_DONE="$2/republish.done" REPUBLISH_PAT='mv "$memo"*'
+trap 'case "$BASH_COMMAND" in $REPUBLISH_PAT) if [ ! -e "$REPUBLISH_DONE" ]; then : > "$REPUBLISH_DONE"; printf "%s\n" "$REPUBLISH_URL" > "$REPUBLISH_MEMO.tmp"; touch -d "2026-01-10 00:00:00" "$REPUBLISH_MEMO.tmp"; command mv "$REPUBLISH_MEMO.tmp" "$REPUBLISH_MEMO"; fi ;; esac' DEBUG
+pg_provenance_reject "$3" "$4"
+REPUBLISH_AT_CLAIM
+  for scenario in crash older-last unwritable republish different; do
     home="$root/legacy-receipt-$scenario-home"
     mkdir -p "$home/review-input-bindings" "$home/conversation-urls"
     jq -cS --arg head "$head" '.evidence.proof.base_oid=$head' "$legacy_binding" | tr -d '\n' > "$home/review-input-bindings/$marker"
@@ -918,19 +931,51 @@ CRASH_AFTER_CLAIM_MV
         printf 'not a directory\n' > "$home/legacy-review-receipts"
         PRO_GATE_HOME="$home" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_provenance_reject '$marker' '$memo_url'" \
           > "$root/legacy-receipt-$scenario.out" 2> "$root/legacy-receipt-$scenario.err" ;;
+      republish)
+        touch -d '2025-12-28 00:00:00' "$home/conversation-urls/$marker"
+        bash "$root/republish-at-claim.sh" "$HERE/../lib/pro-gate-lib.sh" "$home" "$marker" "$memo_url" \
+          > "$root/legacy-receipt-$scenario.out" 2> "$root/legacy-receipt-$scenario.err" ;;
+      different) # the rejected capture came from another URL, so the claimed memo goes back
+        PRO_GATE_HOME="$home" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_provenance_reject '$marker' 'https://chatgpt.com/c/some-other-conversation'" \
+          > "$root/legacy-receipt-$scenario.out" 2> "$root/legacy-receipt-$scenario.err" ;;
     esac
     PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
       pr_identity_engine --review-decision --json --diff "$prep/endpoint.patch" > "$root/legacy-receipt-$scenario.json" 2> "$root/legacy-receipt-$scenario.err.query"
     newest="$(find "$home/legacy-review-receipts" -maxdepth 1 -type f -name "$marker*" -printf '%T@\n' 2>/dev/null | cut -d. -f1 | sort -n | tail -1)"
     case "$scenario" in
       crash) receipt="$([ ! -e "$home/conversation-urls/$marker" ] && [ "$newest" = "$(date -d '2026-01-10 00:00:00' +%s)" ]; echo $?)" ;;
-      older-last) receipt="$([ "$newest" = "$(date -d '2026-01-10 00:00:00' +%s)" ]; echo $?)" ;;
+      older-last|republish) receipt="$([ "$newest" = "$(date -d '2026-01-10 00:00:00' +%s)" ]; echo $?)" ;;
       unwritable) receipt="$([ "$(tr -d '\n' 2>/dev/null < "$home/conversation-urls/$marker")" = "$memo_url" ]; echo $?)" ;;
+      different) receipt="$([ "$(tr -d '\n' 2>/dev/null < "$home/conversation-urls/$marker")" = "$memo_url" ] && \
+        [ "$(date -r "$home/conversation-urls/$marker" +%s)" = "$(date -d '2026-01-10 00:00:00' +%s)" ]; echo $?)" ;;
     esac
     check "a legacy memo's receipt holds on the shell path when $scenario, so its head still cannot buy a replacement review" \
       "$([ "$receipt" = 0 ] && jq -e '.action=="stop-without-new-review" and .reason=="invalid-binding"' "$root/legacy-receipt-$scenario.json" >/dev/null; echo $?)" \
       "home=$(find "$home" -printf '%P@%TT ' 2>/dev/null) newest=$newest decision=$(jq -c '{action,reason}' "$root/legacy-receipt-$scenario.json" 2>/dev/null) stderr=$(tail -3 "$root/legacy-receipt-$scenario.err" 2>/dev/null)"
   done
+
+  # Pro-gate #227 round 5: promotion writes completed/<marker> and then removes pending/<marker>.
+  # A DEBUG trap promotes the bytes just before the record scan looks at pending/, so a scan that
+  # checked completed/ first finds neither although review bytes existed throughout.
+  home="$root/legacy-promotion-home"
+  mkdir -p "$home/pending" "$home/completed"
+  cp "$root/home-main/review.md" "$home/pending/$marker"
+  cat > "$root/promote-at-scan.sh" <<'PROMOTE_AT_SCAN'
+#!/usr/bin/env bash
+# args: lib home marker. Scans for a review record while pending bytes are promoted to
+# completed/ just before the scan's pending/ check runs.
+set -T
+. "$1"
+export PRO_GATE_HOME="$2"
+PROMOTE_FROM="$2/pending/$3" PROMOTE_TO="$(pg_completed_dir)/$3" PROMOTE_PAT='*/pending/*'
+trap 'case "$BASH_COMMAND" in $PROMOTE_PAT) [ ! -e "$PROMOTE_FROM" ] || command mv "$PROMOTE_FROM" "$PROMOTE_TO" ;; esac' DEBUG
+pg_run_left_review_record "$3"
+PROMOTE_AT_SCAN
+  bash "$root/promote-at-scan.sh" "$HERE/../lib/pro-gate-lib.sh" "$home" "$marker" 2> "$root/legacy-promotion.err"
+  rc=$?
+  check 'a review record promoted from pending/ to completed/ during the scan is still seen' \
+    "$([ "$rc" -eq 0 ] && [ -e "$home/completed/$marker" ] && [ ! -e "$home/pending/$marker" ]; echo $?)" \
+    "rc=$rc home=$(find "$home" -type f -printf '%P ' 2>/dev/null) stderr=$(tail -3 "$root/legacy-promotion.err")"
   check 'a same-head legacy round that left no review does not strand its head' \
     "$(jq -e '.action=="run-granted-review"' "$root/legacy-none.json" >/dev/null; echo $?)" \
     "decision=$(cat "$root/legacy-none.json") stderr=$(cat "$root/legacy-none.err")"

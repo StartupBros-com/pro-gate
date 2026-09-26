@@ -3025,20 +3025,27 @@ pg_provenance_reject() {  # <marker> [matched-url]
   # renamed aside first, its content checked against the rejected URL, and restored when it
   # names a DIFFERENT (newer, possibly genuine) conversation — a read-append-remove sequence
   # left a window where a concurrently refreshed genuine memo was deleted by a stale compare.
-  local m="$1" url="${2:-}" memo claim snap
+  local m="$1" url="${2:-}" memo claim="" snap receipt=""
   memo="$PRO_GATE_HOME/conversation-urls/$m"
-  claim="$memo.rej.$$"
-  if pg_legacy_review_receipt_publish "$m" "$memo" && mv "$memo" "$claim" 2>/dev/null; then
+  # A legacy round's memo is claimed straight into its receipt (pg_legacy_review_receipt_path);
+  # when that receipt cannot exist, the memo is not claimed at all.
+  if receipt="$(pg_legacy_review_receipt_path "$m")"; then
+    claim="$receipt"
+  elif [ $? -eq 1 ]; then
+    receipt=""; claim="$memo.rej.$$"
+  fi
+  if [ -n "$claim" ] && mv "$memo" "$claim" 2>/dev/null; then
     snap="$(head -c 300 "$claim" 2>/dev/null | tr -d '\n')"
     [ -n "$url" ] || url="$snap"
     if [ "$snap" = "$url" ] || [ -z "$snap" ]; then
-      rm -f "$claim" 2>/dev/null
+      [ -n "$receipt" ] || rm -f "$claim" 2>/dev/null
     else
       # Restore via hard link — link(2) FAILS atomically when the memo already exists, so a
       # genuine URL the Node writer republished between our claim and this restore is never
       # overwritten (gate #54 r8: an existence check followed by mv raced exactly there).
       ln "$claim" "$memo" 2>/dev/null || true
-      rm -f "$claim" 2>/dev/null
+      # A receipt is dropped only once a memo is back in its place.
+      { [ -z "$receipt" ] || [ -e "$memo" ]; } && rm -f "$claim" 2>/dev/null
     fi
   fi
   [ -n "$url" ] || return 0
@@ -3820,12 +3827,14 @@ pg_review_result_binding_dir() { printf '%s\n' "${PRO_GATE_REVIEW_RESULT_BINDING
 # Bytes and bindings are never swept. Conversation and cross-bound memos expire with pg_finish's
 # 14-day sweep, the horizon after which pro-gate treats any uncollected conversation as abandoned;
 # a round whose only record was such a memo is then treated like one that left nothing.
-# rememberUrl()'s count cap exempts a legacy round's memo, and a revocation first publishes a
-# legacy-review-receipts/<marker>.* link on the memo's own clock, so nothing expires it sooner.
+# rememberUrl()'s count cap exempts a legacy round's memo, and a revocation moves it into a
+# legacy-review-receipts/<marker>.* receipt on its own clock, so nothing expires it sooner.
 # Markers end in -<epoch>-<pid>, so that pattern never matches another marker's receipts.
+# pending/ is checked before completed/ because promotion writes completed/ and then removes
+# pending/: a promotion landing between the two checks is then still seen (#227 round 5).
 pg_run_left_review_record() { # marker
   local marker="$1"
-  [ -e "$(pg_completed_dir)/$marker" ] || [ -e "$PRO_GATE_HOME/pending/$marker" ] \
+  [ -e "$PRO_GATE_HOME/pending/$marker" ] || [ -e "$(pg_completed_dir)/$marker" ] \
     || [ -e "$PRO_GATE_HOME/recovered/$marker.md" ] || [ -e "$(pg_review_result_binding_dir)/$marker" ] \
     || [ -e "$PRO_GATE_HOME/conversation-urls/$marker" ] || [ -e "$PRO_GATE_HOME/crossbound/$marker" ] \
     || compgen -G "$PRO_GATE_HOME/legacy-review-receipts/$marker.*" >/dev/null
@@ -3846,17 +3855,18 @@ pg_review_input_binding_legacy_reviewed() { # binding-json marker
   pg_review_input_binding_is_legacy "$1" && pg_run_left_review_record "$2"
 }
 
-# A legacy round's memo can be its only review record, so before a revocation claims it,
-# hard-link it in as a receipt: the receipt exists before the memo can disappear, shares its
-# inode and so its mtime (the 14-day sweep expires it on the memo's clock), and every revocation
-# adds its own name, so a delayed revoker never replaces a newer generation. Mirrors
-# cdp-salvage.mjs publishLegacyReceipt(). Returns 1 only when a legacy memo still exists but
-# could not be receipted, and the caller must then keep the memo.
-pg_legacy_review_receipt_publish() { # marker memo-path
+# A legacy round's memo can be its only review record, so a revocation claims it by renaming it
+# straight into a receipt of its own. The claimed inode, with its mtime, is exactly what the
+# receipt keeps (the 14-day sweep expires it on the memo's clock); there is no moment when
+# neither exists; and no revocation ever replaces another's receipt. Mirrors cdp-salvage.mjs
+# legacyReceiptPath(). Prints the receipt path; returns 1 for a marker without a legacy binding,
+# and 2 when a legacy memo cannot be receipted, in which case the caller keeps the memo.
+pg_legacy_review_receipt_path() { # marker
   local binding dir="$PRO_GATE_HOME/legacy-review-receipts"
-  binding="$(pg_review_input_binding_read "$1" 2>/dev/null)" || return 0
-  pg_review_input_binding_is_legacy "$binding" || return 0
-  { mkdir -p "$dir" && ln "$2" "$dir/$1.$$.$(date +%s).$RANDOM"; } 2>/dev/null || [ ! -e "$2" ]
+  binding="$(pg_review_input_binding_read "$1" 2>/dev/null)" || return 1
+  pg_review_input_binding_is_legacy "$binding" || return 1
+  mkdir -p "$dir" 2>/dev/null || return 2
+  printf '%s\n' "$dir/$1.$$.$(date +%s).$RANDOM"
 }
 
 pg_review_input_binding_validate() { # canonical record JSON [expected marker]

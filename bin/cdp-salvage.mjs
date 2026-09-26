@@ -215,7 +215,7 @@ const RESERVATION_DIR = envPath('PRO_GATE_RESERVATION_DIR', PG_HOME, 'in-progres
 // (pg_review_input_binding_legacy_reviewed), so that memo keeps the 14-day sweep as its horizon
 // rather than the count cap below. No new legacy binding is ever written, so this class only shrinks.
 const INPUT_BINDING_DIR = envPath('PRO_GATE_REVIEW_INPUT_BINDING_DIR', PG_HOME, 'review-input-bindings');
-// Where forgetUrl() publishes a receipt for such a memo before revoking it; see publishLegacyReceipt().
+// Where forgetUrl() claims such a memo as a receipt instead of deleting it; see legacyReceiptPath().
 const LEGACY_RECEIPT_DIR = path.join(PG_HOME, 'legacy-review-receipts');
 const MEMO_KEEP = 200;                  // newest N unprotected memos retained; older ones are pruned on write
 // #208 gate r1 P1: a stale unowned tab can legitimately fingerprint under TWO different hashes
@@ -308,28 +308,27 @@ function recallTitle(m) {
 // this invocation blind to a recovery handle that exists on disk, and its exit 4 could supply
 // the final miss that retires the reservation.
 // A legacy round's memo can be its only review record (legacyReviewBinding), and a probe never
-// flushes the cross-bind sidecar that would otherwise stand in for it. So before a revocation
-// claims that memo, hard-link it into LEGACY_RECEIPT_DIR, which only the runtime's
-// replacement-spend refusal reads (pg_run_left_review_record). The receipt exists before the
-// memo can disappear, shares the memo's inode and so its mtime (the 14-day sweep expires it on
-// the memo's own clock), and every revocation adds its own name, so a delayed revoker never
-// replaces a newer generation (pro-gate #227 rounds 3 and 4). Returns false when a legacy memo
-// still exists but could not be receipted: the caller must then keep the memo.
+// flushes the cross-bind sidecar that would otherwise stand in for it. So forgetUrl() claims
+// such a memo by renaming it straight into a receipt of its own in LEGACY_RECEIPT_DIR, which only
+// the runtime's replacement-spend refusal reads (pg_run_left_review_record). The claimed inode,
+// with its mtime, is exactly what the receipt keeps (the 14-day sweep expires it on the memo's
+// clock); there is no moment when neither exists; and no revocation ever replaces another's
+// receipt (pro-gate #227 rounds 3-5). Mirrors the shell's pg_legacy_review_receipt_path.
+// Returns the receipt path, null for a marker without a legacy binding, or false when a legacy
+// memo cannot be receipted, in which case the caller keeps the memo.
 let legacyReceiptSeq = 0;
-function publishLegacyReceipt(m, f) {
-  if (!legacyReviewBinding(m)) return true;
-  try {
-    fs.mkdirSync(LEGACY_RECEIPT_DIR, { recursive: true });
-    fs.linkSync(f, path.join(LEGACY_RECEIPT_DIR, `${m}.${process.pid}.${Date.now()}.${++legacyReceiptSeq}`));
-    return true;
-  } catch { return !fs.existsSync(f); }
+function legacyReceiptPath(m) {
+  if (!legacyReviewBinding(m)) return null;
+  try { fs.mkdirSync(LEGACY_RECEIPT_DIR, { recursive: true }); } catch { return false; }
+  return path.join(LEGACY_RECEIPT_DIR, `${m}.${process.pid}.${Date.now()}.${++legacyReceiptSeq}`);
 }
 
 function forgetUrl(m, url) {
   const f = memoPath(m);
   if (!f) return null;
-  if (!publishLegacyReceipt(m, f)) return null;
-  const claim = `${f}.rej.${process.pid}`;
+  const receipt = legacyReceiptPath(m);
+  if (receipt === false) return null;
+  const claim = receipt ?? `${f}.rej.${process.pid}`;
   try { fs.renameSync(f, claim); } catch { return null; }   // nothing to claim: someone else won
   let held = '';
   try { held = fs.readFileSync(claim, 'utf8').trim(); } catch {}
@@ -337,7 +336,8 @@ function forgetUrl(m, url) {
   if (held && held !== url) {
     try { fs.linkSync(claim, f); survivor = held; } catch {}  // genuine memo republished: put it back
   }
-  try { fs.unlinkSync(claim); } catch {}
+  // A receipt is dropped only once a memo is back in its place.
+  if (!receipt || (held && held !== url && fs.existsSync(f))) { try { fs.unlinkSync(claim); } catch {} }
   return survivor;
 }
 
