@@ -5486,13 +5486,52 @@ for (const placeholder of PLACEHOLDER_URLS) {
     /ANOTHER run's completed answer/.test(legacy.stderr ?? '') && legacy.memos.length === 0 && legacy.crossbound === 0,
     `memos=${JSON.stringify(legacy.memos)} crossbound=${legacy.crossbound} stderr=${legacy.stderr?.slice(-300)}`);
   check('#227 r3 P2: the revoked legacy memo survives as a receipt with its URL and original mtime',
-    legacy.receipts.length === 1 && legacy.receipts[0].name === MARKER
+    legacy.receipts.length === 1 && legacy.receipts[0].name.startsWith(`${MARKER}.`)
       && legacy.receipts[0].body.trim() === rememberedUrl && legacy.receipts[0].mtimeMs === seededAt.getTime(),
     `receipts=${JSON.stringify(legacy.receipts)}`);
   const current = await probeCrossBound({ mode: 'full-pr', proof: { base_oid: 'a'.repeat(40), pr_metadata_digest: 'c'.repeat(64) } });
   check('#227 r3 P2: a metadata-proven binding\'s revoked memo leaves no receipt',
     /ANOTHER run's completed answer/.test(current.stderr ?? '') && current.memos.length === 0 && current.receipts.length === 0,
     `memos=${JSON.stringify(current.memos)} receipts=${JSON.stringify(current.receipts)}`);
+
+  // #227 round 4 P2: a revoker holding an older memo that finishes after a newer generation was
+  // receipted must not replace that receipt, or the 14-day clock regresses to the older memo's.
+  // The second probe's home carries the first probe's receipts, as a later revoker would find them.
+  const legacyEvidence = { mode: 'full-pr', proof: { base_oid: 'a'.repeat(40) } };
+  const olderAt = new Date(1700099000000 - 13 * 86400_000);
+  const olderLast = await (async () => {
+    const cdp = await mockCdp('__NO_TABS__', [], { renderText: () => FOREIGN_ANSWER(MARKER) });
+    const r = await runScratchSalvage(['--probe', MARKER, '3'], cdp.port, (home) => {
+      seed(legacyEvidence)(home);
+      fs.utimesSync(path.join(home, 'conversation-urls', MARKER), olderAt, olderAt);
+      fs.mkdirSync(path.join(home, 'legacy-review-receipts'), { recursive: true });
+      for (const { name, body, mtimeMs } of legacy.receipts) {
+        const p = path.join(home, 'legacy-review-receipts', name);
+        fs.writeFileSync(p, body);
+        fs.utimesSync(p, new Date(mtimeMs), new Date(mtimeMs));
+      }
+    });
+    cdp.stop();
+    return r;
+  })();
+  check('#227 r4 P2: an older revoker finishing last keeps the newer generation\'s receipt and clock',
+    olderLast.receipts.some((x) => x.mtimeMs === seededAt.getTime())
+      && olderLast.receipts.some((x) => x.mtimeMs === olderAt.getTime()),
+    `receipts=${JSON.stringify(olderLast.receipts)}`);
+
+  // #227 round 4 P2: when the receipt cannot be published, the legacy memo is kept, not discarded.
+  const unwritable = await (async () => {
+    const cdp = await mockCdp('__NO_TABS__', [], { renderText: () => FOREIGN_ANSWER(MARKER) });
+    const r = await runScratchSalvage(['--probe', MARKER, '3'], cdp.port, (home) => {
+      seed(legacyEvidence)(home);
+      fs.writeFileSync(path.join(home, 'legacy-review-receipts'), 'not a directory\n');
+    });
+    cdp.stop();
+    return r;
+  })();
+  check('#227 r4 P2: a legacy memo whose receipt cannot be published is kept',
+    /ANOTHER run's completed answer/.test(unwritable.stderr ?? '') && unwritable.memos.length === 1 && unwritable.memoUrl === rememberedUrl,
+    `memos=${JSON.stringify(unwritable.memos)} memo=${unwritable.memoUrl} stderr=${unwritable.stderr?.slice(-300)}`);
 }
 
 { // #215 gate r8 P2 (bin/cdp-salvage.mjs claimThrottleSeen): admission is a plain existence

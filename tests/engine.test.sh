@@ -838,7 +838,7 @@ PR_EVIDENCE_MV
         printf '2026-01-01T00:00:00.000Z\thttps://chatgpt.com/c/legacy-%s\tpg-run-other-repo-42-1111111111-9\n' "$marker" > "$home/crossbound/$marker" ;;
       receipt)
         mkdir -p "$home/legacy-review-receipts"
-        printf 'https://chatgpt.com/c/legacy-%s\n' "$marker" > "$home/legacy-review-receipts/$marker" ;;
+        printf 'https://chatgpt.com/c/legacy-%s\n' "$marker" > "$home/legacy-review-receipts/$marker.1.1.1" ;;
     esac
     PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
       pr_identity_engine --review-decision --json --diff "$prep/endpoint.patch" > "$root/legacy-$residue.json" 2> "$root/legacy-$residue.err"
@@ -853,7 +853,7 @@ PR_EVIDENCE_MV
   # (pro-gate #227 round 3 P2). Both revocation paths run for real here: a probe that convicts the
   # remembered conversation as cross-bound (the mock's one tab carries our prompt and another run's
   # answer), and the shell's provenance rejection. Each keeps the memo as a receipt with its mtime.
-  local revoke memo_url=https://chatgpt.com/c/mock-conversation
+  local revoke receipt memo_url=https://chatgpt.com/c/mock-conversation
   printf 'pro-gate review: PR #999 r1 [other-repo]\nrun marker: %s\n\n[P1] apps/other/thing.ts:12 - something in ANOTHER change\nP2: none\nP3: none\nVERDICT: FIX-FIRST - not ours. (run marker: pg-run-other-repo-42-1111111111-9)\n' \
     "$marker" > "$root/crossbound-tab.txt"
   for revoke in probe provenance; do
@@ -874,12 +874,62 @@ PR_EVIDENCE_MV
     esac
     PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
       pr_identity_engine --review-decision --json --diff "$prep/endpoint.patch" > "$root/legacy-revoke-$revoke.json" 2> "$root/legacy-revoke-$revoke.err.query"
+    receipt="$(find "$home/legacy-review-receipts" -maxdepth 1 -type f -name "$marker*" 2>/dev/null | head -1)"
     check "a legacy round's memo revoked by $revoke survives as a receipt, so its head still cannot buy a replacement review" \
-      "$([ ! -e "$home/conversation-urls/$marker" ] && [ ! -e "$home/crossbound/$marker" ] && \
-        [ "$(tr -d '\n' 2>/dev/null < "$home/legacy-review-receipts/$marker")" = "$memo_url" ] && \
-        [ "$(date -r "$home/legacy-review-receipts/$marker" +%s 2>/dev/null)" = "$(date -d '2026-01-02 03:04:05' +%s)" ] && \
+      "$([ ! -e "$home/conversation-urls/$marker" ] && [ ! -e "$home/crossbound/$marker" ] && [ -n "$receipt" ] && \
+        [ "$(tr -d '\n' < "$receipt")" = "$memo_url" ] && \
+        [ "$(date -r "$receipt" +%s)" = "$(date -d '2026-01-02 03:04:05' +%s)" ] && \
         jq -e '.action=="stop-without-new-review" and .reason=="invalid-binding"' "$root/legacy-revoke-$revoke.json" >/dev/null; echo $?)" \
       "home=$(find "$home" -type f -printf '%P ' 2>/dev/null) decision=$(jq -c '{action,reason}' "$root/legacy-revoke-$revoke.json" 2>/dev/null) stderr=$(tail -3 "$root/legacy-revoke-$revoke.err" 2>/dev/null)"
+  done
+
+  # Pro-gate #227 round 4 P2s, on the shell revocation path. (1) A revoker killed right after it
+  # claims the memo (the mv stub completes the claim, then kills its caller) must already have
+  # published the receipt. (2) A revoker holding an older memo that finishes last must not
+  # replace the newer generation's receipt, whose 14-day clock would regress. (3) A legacy memo
+  # whose receipt cannot be published is kept, not discarded.
+  local scenario newest
+  mkdir -p "$root/crash-bin"
+  cat > "$root/crash-bin/mv" <<'CRASH_AFTER_CLAIM_MV'
+#!/usr/bin/env bash
+/bin/mv "$@"; rc=$?
+case "${*: -1}" in *.rej.*) kill -KILL "$PPID" ;; esac
+exit "$rc"
+CRASH_AFTER_CLAIM_MV
+  chmod +x "$root/crash-bin/mv"
+  for scenario in crash older-last unwritable; do
+    home="$root/legacy-receipt-$scenario-home"
+    mkdir -p "$home/review-input-bindings" "$home/conversation-urls"
+    jq -cS --arg head "$head" '.evidence.proof.base_oid=$head' "$legacy_binding" | tr -d '\n' > "$home/review-input-bindings/$marker"
+    printf '%s\n' "$memo_url" > "$home/conversation-urls/$marker"
+    touch -d '2026-01-10 00:00:00' "$home/conversation-urls/$marker"
+    case "$scenario" in
+      crash) # the subshell absorbs the shell's "Killed" report for the simulated crash
+        ( PATH="$root/crash-bin:$PATH" PRO_GATE_HOME="$home" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_provenance_reject '$marker' '$memo_url'" \
+          > "$root/legacy-receipt-$scenario.out" 2> "$root/legacy-receipt-$scenario.err"; : ) 2>/dev/null ;;
+      older-last)
+        PRO_GATE_HOME="$home" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_provenance_reject '$marker' '$memo_url'" \
+          > "$root/legacy-receipt-$scenario.out" 2> "$root/legacy-receipt-$scenario.err"
+        printf '%s\n' "$memo_url" > "$home/conversation-urls/$marker"
+        touch -d '2025-12-28 00:00:00' "$home/conversation-urls/$marker"
+        PRO_GATE_HOME="$home" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_provenance_reject '$marker' '$memo_url'" \
+          >> "$root/legacy-receipt-$scenario.out" 2>> "$root/legacy-receipt-$scenario.err" ;;
+      unwritable)
+        printf 'not a directory\n' > "$home/legacy-review-receipts"
+        PRO_GATE_HOME="$home" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_provenance_reject '$marker' '$memo_url'" \
+          > "$root/legacy-receipt-$scenario.out" 2> "$root/legacy-receipt-$scenario.err" ;;
+    esac
+    PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
+      pr_identity_engine --review-decision --json --diff "$prep/endpoint.patch" > "$root/legacy-receipt-$scenario.json" 2> "$root/legacy-receipt-$scenario.err.query"
+    newest="$(find "$home/legacy-review-receipts" -maxdepth 1 -type f -name "$marker*" -printf '%T@\n' 2>/dev/null | cut -d. -f1 | sort -n | tail -1)"
+    case "$scenario" in
+      crash) receipt="$([ ! -e "$home/conversation-urls/$marker" ] && [ "$newest" = "$(date -d '2026-01-10 00:00:00' +%s)" ]; echo $?)" ;;
+      older-last) receipt="$([ "$newest" = "$(date -d '2026-01-10 00:00:00' +%s)" ]; echo $?)" ;;
+      unwritable) receipt="$([ "$(tr -d '\n' 2>/dev/null < "$home/conversation-urls/$marker")" = "$memo_url" ]; echo $?)" ;;
+    esac
+    check "a legacy memo's receipt holds on the shell path when $scenario, so its head still cannot buy a replacement review" \
+      "$([ "$receipt" = 0 ] && jq -e '.action=="stop-without-new-review" and .reason=="invalid-binding"' "$root/legacy-receipt-$scenario.json" >/dev/null; echo $?)" \
+      "home=$(find "$home" -printf '%P@%TT ' 2>/dev/null) newest=$newest decision=$(jq -c '{action,reason}' "$root/legacy-receipt-$scenario.json" 2>/dev/null) stderr=$(tail -3 "$root/legacy-receipt-$scenario.err" 2>/dev/null)"
   done
   check 'a same-head legacy round that left no review does not strand its head' \
     "$(jq -e '.action=="run-granted-review"' "$root/legacy-none.json" >/dev/null; echo $?)" \
