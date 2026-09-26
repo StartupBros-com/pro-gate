@@ -1044,6 +1044,10 @@ const CONSUME_GRACE_MS = 2_000;
 // revalidation. Each gets a small fixed budget of its own, so it still runs but cannot hang.
 const CLOSE_REQUEST_MS = 2_000;
 const LATE_LIST_MS = 5_000;
+// The main scan's listing is bounded by the deadline, but one it starts just before the deadline
+// still gets this floor: the last poll sleep ends at the deadline, and a timer firing a hair early
+// otherwise starts a listing with ~1ms of budget whose abort reads as a failed list (browser-down).
+const MIN_LIST_MS = 1_000;
 async function fetchBeforeDeadline(url, options, requestDeadline, consume = null) {
   const remaining = requestDeadline - Date.now();
   if (remaining <= 0) throw new Error('caller-deadline-expired');
@@ -1982,7 +1986,7 @@ let lastMatchWasSeeded = false;  // that sighting came from the remembered URL, 
 while (Date.now() < deadline) {
   let tabs = [];
   try {
-    tabs = (await listTargets(deadline))
+    tabs = (await listTargets(Math.max(deadline, Date.now() + MIN_LIST_MS)))
       .filter((t) => t.type === 'page' && /chatgpt\.com\/c\//.test(t.url || ''));
     listFailures = 0;
     lastListOk = true;

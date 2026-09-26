@@ -286,7 +286,11 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
           id: 'tab1', type: 'page', url: 'https://chatgpt.com/c/mock-conversation',
           webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/tab1`,
         }, ...extras, ...scratch];
-      res.end(JSON.stringify(listed));
+      // outerListDelayMs answers each outer list only after that many ms, so a scan that starts
+      // close to its deadline still has its listing in flight when the deadline arrives.
+      const body = JSON.stringify(listed);
+      if (!scratchOpen && opts.outerListDelayMs) setTimeout(() => res.end(body), opts.outerListDelayMs);
+      else res.end(body);
       if (!scratchOpen) outerListsAnswered += 1;
       // Only shortened deadline fixtures opt into these diagnostic events. Ordinary fixtures keep
       // the original mock's hot request path and only retain jsonListCalls for pass 5's contrast.
@@ -1825,6 +1829,22 @@ const MIXED_MARKER = 'pg-run-Test-Case-1234567890-43';
       `closed=${cdp.closed} memo=${r.memoUrl} blacklist=${r.blacklist} crossbound=${r.crossbound}`);
     cdp.stop();
   }
+}
+
+{ // A listing the scan starts just before its deadline still gets to answer. The last poll sleep
+  // ends at the deadline, and a timer firing a hair early used to start one more listing with ~1ms
+  // of budget whose abort read as a failed list, turning a decisive exit into browser-down (CI on
+  // #227). Every outer list here takes 600ms and a 300ms poll starts the fourth scan ~300ms before
+  // the 3s deadline, so that listing is still in flight when the deadline arrives.
+  const cdp = await mockCdp('__NO_TABS__', [], { outerListDelayMs: 600 });
+  const r = await runSalvage([MARKER, '3'], cdp.port, null, {
+    PRO_GATE_TEST_MODE: 'ci-fixture', PRO_GATE_TEST_POLL_MS: '300', PRO_GATE_TEST_CHILD_TIMEOUT_MS: '9000',
+  });
+  check('a listing in flight at the deadline still answers, so the scan ends decisively',
+    r.status === 4 && /evidence-kind: absent/.test(r.stderr) && !/CDP list failed/.test(r.stderr)
+      && r.elapsedMs < 5_500,
+    `status=${r.status} elapsed=${r.elapsedMs}ms stderr=${r.stderr?.slice(-400)}`);
+  cdp.stop();
 }
 
 { // A failing list backs off before retrying, but never past the deadline: the backoff's first
