@@ -336,8 +336,9 @@ function forgetUrl(m, url) {
   if (held && held !== url) {
     try { fs.linkSync(claim, f); survivor = held; } catch {}  // genuine memo republished: put it back
   }
-  // A receipt is dropped only once a memo is back in its place.
-  if (!receipt || (held && held !== url && fs.existsSync(f))) { try { fs.unlinkSync(claim); } catch {} }
+  // A legacy receipt stays even once a memo is back: that memo can be an older generation another
+  // revoker restored, and only the 14-day sweep expires a receipt (pro-gate #227 round 6).
+  if (!receipt) { try { fs.unlinkSync(claim); } catch {} }
   return survivor;
 }
 

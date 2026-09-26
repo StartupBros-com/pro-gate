@@ -3044,8 +3044,9 @@ pg_provenance_reject() {  # <marker> [matched-url]
       # genuine URL the Node writer republished between our claim and this restore is never
       # overwritten (gate #54 r8: an existence check followed by mv raced exactly there).
       ln "$claim" "$memo" 2>/dev/null || true
-      # A receipt is dropped only once a memo is back in its place.
-      { [ -z "$receipt" ] || [ -e "$memo" ]; } && rm -f "$claim" 2>/dev/null
+      # A legacy receipt stays even once a memo is back: that memo can be an older generation
+      # another revoker restored, and only the 14-day sweep expires a receipt (#227 round 6).
+      [ -n "$receipt" ] || rm -f "$claim" 2>/dev/null
     fi
   fi
   [ -n "$url" ] || return 0

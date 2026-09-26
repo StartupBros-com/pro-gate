@@ -910,7 +910,19 @@ REPUBLISH_MEMO="$2/conversation-urls/$3" REPUBLISH_URL="$4" REPUBLISH_DONE="$2/r
 trap 'case "$BASH_COMMAND" in $REPUBLISH_PAT) if [ ! -e "$REPUBLISH_DONE" ]; then : > "$REPUBLISH_DONE"; printf "%s\n" "$REPUBLISH_URL" > "$REPUBLISH_MEMO.tmp"; touch -d "2026-01-10 00:00:00" "$REPUBLISH_MEMO.tmp"; command mv "$REPUBLISH_MEMO.tmp" "$REPUBLISH_MEMO"; fi ;; esac' DEBUG
 pg_provenance_reject "$3" "$4"
 REPUBLISH_AT_CLAIM
-  for scenario in crash older-last unwritable republish different; do
+  cat > "$root/older-restore-first.sh" <<'OLDER_RESTORE_FIRST'
+#!/usr/bin/env bash
+# args: lib home marker memo-url rejected-url. Runs pg_provenance_reject for a capture from
+# another URL while an overlapping revoker restores an older memo generation just before this
+# revoker's own restoring link, which then fails because a memo exists.
+set -T
+. "$1"
+export PRO_GATE_HOME="$2"
+OLDER_MEMO="$2/conversation-urls/$3" OLDER_URL="$4" OLDER_DONE="$2/older-restore.done" OLDER_PAT='ln "$claim" "$memo"*'
+trap 'case "$BASH_COMMAND" in $OLDER_PAT) if [ ! -e "$OLDER_DONE" ]; then : > "$OLDER_DONE"; printf "%s\n" "$OLDER_URL" > "$OLDER_MEMO.tmp"; touch -d "2025-12-28 00:00:00" "$OLDER_MEMO.tmp"; command mv "$OLDER_MEMO.tmp" "$OLDER_MEMO"; fi ;; esac' DEBUG
+pg_provenance_reject "$3" "$5"
+OLDER_RESTORE_FIRST
+  for scenario in crash older-last unwritable republish different old-first; do
     home="$root/legacy-receipt-$scenario-home"
     mkdir -p "$home/review-input-bindings" "$home/conversation-urls"
     jq -cS --arg head "$head" '.evidence.proof.base_oid=$head' "$legacy_binding" | tr -d '\n' > "$home/review-input-bindings/$marker"
@@ -938,16 +950,20 @@ REPUBLISH_AT_CLAIM
       different) # the rejected capture came from another URL, so the claimed memo goes back
         PRO_GATE_HOME="$home" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_provenance_reject '$marker' 'https://chatgpt.com/c/some-other-conversation'" \
           > "$root/legacy-receipt-$scenario.out" 2> "$root/legacy-receipt-$scenario.err" ;;
+      old-first)
+        bash "$root/older-restore-first.sh" "$HERE/../lib/pro-gate-lib.sh" "$home" "$marker" "$memo_url" 'https://chatgpt.com/c/some-other-conversation' \
+          > "$root/legacy-receipt-$scenario.out" 2> "$root/legacy-receipt-$scenario.err" ;;
     esac
     PRO_GATE_REVIEW_PR_EVIDENCE="$prep/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$prep/endpoint.patch" \
       pr_identity_engine --review-decision --json --diff "$prep/endpoint.patch" > "$root/legacy-receipt-$scenario.json" 2> "$root/legacy-receipt-$scenario.err.query"
     newest="$(find "$home/legacy-review-receipts" -maxdepth 1 -type f -name "$marker*" -printf '%T@\n' 2>/dev/null | cut -d. -f1 | sort -n | tail -1)"
     case "$scenario" in
       crash) receipt="$([ ! -e "$home/conversation-urls/$marker" ] && [ "$newest" = "$(date -d '2026-01-10 00:00:00' +%s)" ]; echo $?)" ;;
-      older-last|republish) receipt="$([ "$newest" = "$(date -d '2026-01-10 00:00:00' +%s)" ]; echo $?)" ;;
+      older-last|republish|old-first) receipt="$([ "$newest" = "$(date -d '2026-01-10 00:00:00' +%s)" ]; echo $?)" ;;
       unwritable) receipt="$([ "$(tr -d '\n' 2>/dev/null < "$home/conversation-urls/$marker")" = "$memo_url" ]; echo $?)" ;;
       different) receipt="$([ "$(tr -d '\n' 2>/dev/null < "$home/conversation-urls/$marker")" = "$memo_url" ] && \
-        [ "$(date -r "$home/conversation-urls/$marker" +%s)" = "$(date -d '2026-01-10 00:00:00' +%s)" ]; echo $?)" ;;
+        [ "$(date -r "$home/conversation-urls/$marker" +%s)" = "$(date -d '2026-01-10 00:00:00' +%s)" ] && \
+        [ "$newest" = "$(date -d '2026-01-10 00:00:00' +%s)" ]; echo $?)" ;;
     esac
     check "a legacy memo's receipt holds on the shell path when $scenario, so its head still cannot buy a replacement review" \
       "$([ "$receipt" = 0 ] && jq -e '.action=="stop-without-new-review" and .reason=="invalid-binding"' "$root/legacy-receipt-$scenario.json" >/dev/null; echo $?)" \
