@@ -9747,7 +9747,7 @@ slotwait_run() { # home lock-wait gh-state gh-head [gh-mode] [max-concurrency] [
     PRO_GATE_MAX_CONCURRENCY="${6:-1}" PRO_GATE_RAMP=0 PRO_GATE_LOCK_WAIT="$2" \
     PRO_GATE_RECONCILE_INTERVAL="${7:-3600}" PRO_GATE_GH_BIN="${8:-$SUPER_GH}" \
     PG_TEST_GH_CALLS="$SUPER_GH_CALLS" PG_TEST_GH_MODE="${5:-ok}" PG_TEST_GH_STATE="$3" PG_TEST_GH_HEAD="$4" \
-    PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 \
+    PRO_GATE_TEST_MODE=ci-fixture \
     PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-ok" NODE_OPTIONS= \
     bash "$ENGINE" --diff "$TDIR/small.diff" --repo "$TDIR" --out "$home/waiter.md" --timeout 5s \
     >"$TDIR/slotwait.stdout" 2>"$TDIR/slotwait.stderr"
