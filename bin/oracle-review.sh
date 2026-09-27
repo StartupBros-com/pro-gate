@@ -581,7 +581,7 @@ pg_review_decision_cli() {
     input_binding_valid=true; input_proven=true
     # The reducer sees the complete relation identity, not the human-facing evidence label: a
     # scoped manifest or confirmation change is changed evidence even when its label is stable.
-    evidence_identity="relation:$(pg_review_sha256_text "$desired_relation")"; evidence_state=matching
+    evidence_identity="$(pg_review_relation_identity "$prospective")"; evidence_state=matching
   else
     desired_relation=""
   fi
@@ -696,7 +696,7 @@ pg_review_decision_cli() {
       fi
     else
       prior_candidates="$(jq -cS --arg marker "$marker" --arg canonical "$canonical" --arg code "$code_identity" \
-        --arg evidence "relation:$(pg_review_sha256_text "$candidate_relation")" --argjson epoch "$(jq -r .charged_spend_epoch <<<"$candidate")" \
+        --arg evidence "$(pg_review_relation_identity "$candidate")" --argjson epoch "$(jq -r .charged_spend_epoch <<<"$candidate")" \
         --arg verdict "$(jq -r .verdict <<<"$result")" \
         '. + [{canonical_identity:$canonical,charged_spend_epoch:$epoch,code_identity:$code,evidence_identity:$evidence,marker:$marker,verdict:$verdict}]' <<<"$prior_candidates")"
     fi
@@ -2176,9 +2176,9 @@ pg_fresh_dispatch_recheck() { # sets PG_FRESH_DECISION/PG_FRESH_ACTION
   pg_round_guard "$ROUND_KEY" >/dev/null 2>&1 && granted=true
   governor_facts="$(pg_round_governor_facts_json "$ROUND_KEY" "$granted")" || return 1
   cooldown_left="$(pg_cooldown_remaining_secs)"; case "$cooldown_left" in ''|*[!0-9]*) cooldown_left=0;; esac
-  # #204: the query's own helper over the same relation identity (the template IS the query's
-  # current relation, so "relation:" + its digest equals the query's evidence identity).
-  delivery_relation=""; [ -z "$template_relation" ] || delivery_relation="relation:$(pg_review_sha256_text "$template_relation")"
+  # #204: the query's own helpers over the same relation identity (the template IS the query's
+  # current relation, so its identity equals the query's evidence identity).
+  delivery_relation=""; [ -z "$template_relation" ] || delivery_relation="$(pg_review_relation_identity "$template")"
   delivery_facts="$(pg_delivery_facts_json "$attempt_snapshot" "$delivery_relation" "$INPUT")" || return 1
   facts="$(jq -cnS --arg h "$PG_META_HOST" --arg o "$PG_META_OWNER" --arg r "$PG_META_REPO" --arg head "$head" --argjson p "$PR_NUM" \
     --arg identity "$identity" --arg evidence "$evidence" --arg marker "$active_marker" --arg astate "${astate:-none}" --arg reservation "$reservation" \
@@ -2217,13 +2217,16 @@ pg_install_effect_input_binding() { # clone the already-current validated relati
 # but is an account state with its own cooldown, not a delivery that a changed condition repairs.
 # Best effort: a missing record means the next query counts from zero, the behavior before it.
 pg_fresh_dispatch_record_undelivered() {
-  local relation
+  local relation oracle_id
   [ -n "${REVIEW_DECISION_INPUT_TEMPLATE:-}" ] && [ -n "${PR_NUM:-}" ] && [ -n "${PG_META_HOST:-}" ] \
     && [ -n "${PG_META_OWNER:-}" ] && [ -n "${PG_META_REPO:-}" ] || return 0
-  relation="$(jq -cS '{repository,target,evidence}' <<<"$REVIEW_DECISION_INPUT_TEMPLATE" 2>/dev/null || true)"
+  relation="$(pg_review_relation_identity "$REVIEW_DECISION_INPUT_TEMPLATE" || true)"
+  oracle_id="$(pg_oracle_identity)"
+  [ "$oracle_id" != unknown ] \
+    || echo "[oracle-review] Oracle's version could not be read, so this attempt's delivery condition records its build as unknown; a later query that can read it counts from zero (#204)." >&2
   if [ -z "$relation" ] || ! pg_delivery_condition_record "$PG_META_HOST" "$PG_META_OWNER" "$PG_META_REPO" "$PR_NUM" \
-       "$ROUND_KEY" "$RUN_MARKER" "$(pg_delivery_condition_digest "relation:$(pg_review_sha256_text "$relation")" \
-         "$INPUT" "${PRO_GATE_BROWSER_ATTACHMENTS:-auto}" "$(pg_oracle_identity)")" 2>/dev/null; then
+       "$ROUND_KEY" "$RUN_MARKER" "$(pg_delivery_condition_digest "$relation" \
+         "$INPUT" "${PRO_GATE_BROWSER_ATTACHMENTS:-auto}" "$oracle_id")" 2>/dev/null; then
     echo "[oracle-review] could not record this attempt's delivery condition; an unchanged repeat will not be stopped (#204)." >&2
   fi
 }

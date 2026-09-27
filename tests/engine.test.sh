@@ -7091,6 +7091,24 @@ check '#214 (b): a result binding whose contract_digest is a compiled predecesso
   "$([ "$PG214_RESULT_VALIDATE_RC" -eq 0 ] && [ "$PG214_RESULT_WRITE_RC" -eq 0 ] && [ "$PG214_RESULT_READ" = "$PG214_RESULT_BINDING" ]; echo $?)" \
   "validate_rc=$PG214_RESULT_VALIDATE_RC write_rc=$PG214_RESULT_WRITE_RC read=$PG214_RESULT_READ binding=$PG214_RESULT_BINDING"
 
+# #204 retired PG214_PRED_C, the digest every v0.54-v0.57 binding carries: those must stay readable.
+PG214_C_INPUT_MARKER='pg-run-acme-widgets-1983-1700000703-1'
+PG214_C_INPUT_BINDING="$(jq -cS --arg cd "$PG214_PRED_C" --arg marker "$PG214_C_INPUT_MARKER" \
+  '.contract_digest=$cd | .marker=$marker | .charged_spend_epoch=1700000703' <<<"$INPUT_BINDING")"
+pg_review_input_binding_validate "$PG214_C_INPUT_BINDING" "$PG214_C_INPUT_MARKER"; PG214_C_INPUT_VALIDATE_RC=$?
+PRO_GATE_HOME="$PG214_BIND_HOME" pg_review_input_binding_write "$PG214_C_INPUT_MARKER" "$PG214_C_INPUT_BINDING"; PG214_C_INPUT_WRITE_RC=$?
+PG214_C_INPUT_READ="$(PRO_GATE_HOME="$PG214_BIND_HOME" pg_review_input_binding_read "$PG214_C_INPUT_MARKER")"
+PG214_C_RESULT_MARKER='pg-run-acme-widgets-1983-1700000704-1'
+PG214_C_RESULT_BINDING="$(jq -cS --arg cd "$PG214_PRED_C" --arg marker "$PG214_C_RESULT_MARKER" --arg ib "$(pg_review_sha256_text "$PG214_C_INPUT_BINDING")" \
+  '.contract_digest=$cd | .marker=$marker | .input_binding_identity=$marker | .input_binding_digest=$ib | .artifact.path=("completed/"+$marker)' <<<"$RESULT_BINDING")"
+pg_review_result_binding_validate "$PG214_C_RESULT_BINDING" "$PG214_C_RESULT_MARKER"; PG214_C_RESULT_VALIDATE_RC=$?
+PRO_GATE_HOME="$PG214_BIND_HOME" pg_review_result_binding_write "$PG214_C_RESULT_MARKER" "$PG214_C_RESULT_BINDING"; PG214_C_RESULT_WRITE_RC=$?
+PG214_C_RESULT_READ="$(PRO_GATE_HOME="$PG214_BIND_HOME" pg_review_result_binding_read "$PG214_C_RESULT_MARKER")"
+check '#204: input and result bindings under the contract digest this release retires (5fcd19c1...) validate, write, and read back byte-identical' \
+  "$([ "$PG214_C_INPUT_VALIDATE_RC" -eq 0 ] && [ "$PG214_C_INPUT_WRITE_RC" -eq 0 ] && [ "$PG214_C_INPUT_READ" = "$PG214_C_INPUT_BINDING" ] \
+     && [ "$PG214_C_RESULT_VALIDATE_RC" -eq 0 ] && [ "$PG214_C_RESULT_WRITE_RC" -eq 0 ] && [ "$PG214_C_RESULT_READ" = "$PG214_C_RESULT_BINDING" ]; echo $?)" \
+  "input rc=$PG214_C_INPUT_VALIDATE_RC/$PG214_C_INPUT_WRITE_RC read=$PG214_C_INPUT_READ result rc=$PG214_C_RESULT_VALIDATE_RC/$PG214_C_RESULT_WRITE_RC read=$PG214_C_RESULT_READ"
+
 PG214_UNKNOWN_INPUT="$(jq -cS --arg cd "$PG214_UNKNOWN_CD" '.contract_digest=$cd' <<<"$INPUT_BINDING")"
 PG214_UNKNOWN_RESULT="$(jq -cS --arg cd "$PG214_UNKNOWN_CD" '.contract_digest=$cd' <<<"$RESULT_BINDING")"
 pg_review_input_binding_validate "$PG214_UNKNOWN_INPUT" 'pg-run-acme-widgets-1983-1700000700-1'; PG214_UNKNOWN_INPUT_RC=$?
@@ -7840,6 +7858,26 @@ check '#204: the dispatch recheck honours the same override, and the third no-se
   "$([ "$UNDELIVERED_RC" -eq 6 ] && [ "$(undelivered_attempts)" = 3 ] \
      && jq -e '.consecutive==3' <<<"$(PRO_GATE_HOME="$FRESH_HOME" pg_delivery_condition_read "$UNDELIVERED_M3" 2>/dev/null)" >/dev/null 2>&1; echo $?)" \
   "rc=$UNDELIVERED_RC attempts=$(undelivered_attempts) marker=$UNDELIVERED_M3 stderr=$(tail -6 "$TDIR/undelivered.stderr")"
+# A Cloudflare challenge refunds through the same disposition, but it is an account cooldown, not a
+# failed delivery: it records no delivery condition, so the count does not carry across it.
+cat > "$TDIR/fresh-bin/oracle-cf-typed" <<'CF_TYPED_ORACLE'
+#!/usr/bin/env bash
+echo 'Cloudflare anti-bot page detected'
+exit 1
+CF_TYPED_ORACLE
+chmod +x "$TDIR/fresh-bin/oracle-cf-typed"
+UNDELIVERED_CFQ="$(undelivered_query PRO_GATE_FORCE_ROUND=1)"; printf '%s\n' "$UNDELIVERED_CFQ" > "$TDIR/undelivered-cf-q.json"
+undelivered_effect "$TDIR/undelivered-cf-q.json" "$TDIR/undelivered-cf.md" PRO_GATE_FORCE_ROUND=1 PG_TEST_UNDELIVERED_DELEGATE="$TDIR/fresh-bin/oracle-cf-typed"
+UNDELIVERED_MCF="$(jq -r .marker "$TDIR/undelivered-cf.md.status" 2>/dev/null)"
+check '#204: a Cloudflare challenge refund (typed effect) writes its not-submitted disposition but no delivery condition' \
+  "$([ "$UNDELIVERED_RC" -eq 6 ] && [ -n "$UNDELIVERED_MCF" ] && [ "$UNDELIVERED_MCF" != "$UNDELIVERED_M3" ] \
+     && jq -e '.terminal_kind=="not-submitted"' "$FRESH_HOME/attempt-dispositions/$UNDELIVERED_MCF" >/dev/null 2>&1 \
+     && [ ! -e "$FRESH_HOME/delivery-conditions/$UNDELIVERED_MCF" ]; echo $?)" \
+  "rc=$UNDELIVERED_RC marker=$UNDELIVERED_MCF records=$(ls "$FRESH_HOME/delivery-conditions" 2>/dev/null | tr '\n' ' ') stderr=$(tail -4 "$TDIR/undelivered.stderr")"
+UNDELIVERED_AFTER_CF="$(undelivered_query)"
+check '#204: after a Cloudflare refund the next query counts no failed delivery (it stops for the cooldown instead)' \
+  "$(jq -e '.reason=="account-cooldown-active" and .facts.delivery=={failed_unchanged:0,override:false}' <<<"$UNDELIVERED_AFTER_CF" >/dev/null 2>&1; echo $?)" "$UNDELIVERED_AFTER_CF"
+rm -f "$FRESH_HOME/throttle.cooldown"
 
 # #204 library: the count is a chain over the attempt snapshot's own precedence, the facts builder
 # probes Oracle only when a record could match, and the record is write-once and swept with its
@@ -7903,6 +7941,25 @@ check '#204: the Oracle identity is its bounded, single-line --version, or unkno
      && [ "$(PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-version-fixture" PG_TEST_VERSION_TEXT='' pg_oracle_identity)" = unknown ] \
      && [ "$(PRO_GATE_ORACLE_BIN="$TDIR/no-such-oracle" pg_oracle_identity)" = unknown ] \
      && [ "$(PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-version-fixture" PG_TEST_VERSION_TEXT='v1 (a b)$\n' pg_oracle_identity)" = v1ab ]; echo $?)"
+cat > "$TDIR/bin/oracle-version-flaky" <<'ORACLE_VERSION_FLAKY'
+#!/usr/bin/env bash
+[ "${1:-}" = --version ] || exit 99
+[ -e "${PG_TEST_FLAKY_MARK:?}" ] || { : > "$PG_TEST_FLAKY_MARK"; exit 1; }
+printf '1.0\n'
+ORACLE_VERSION_FLAKY
+chmod +x "$TDIR/bin/oracle-version-flaky"
+rm -f "$TDIR/oracle-flaky-once"
+check '#204: one empty --version read is retried, so a slow start does not read as a different Oracle build' \
+  "$([ "$(PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-version-flaky" PG_TEST_FLAKY_MARK="$TDIR/oracle-flaky-once" pg_oracle_identity)" = 1.0 ]; echo $?)"
+DC_SNAP_BAD="$(jq -cn '{source:"disposition",state:"not-submitted",fresh_eligible:true,marker:"pg-run-acme-dc-5-1700020006-6"}')"
+DC_BAD_OUT="$(dc_facts "$DC_SNAP_BAD" relation:aaa 2>"$TDIR/dc-bad.stderr")"
+DC_UNKNOWN_OUT="$(dc_facts "$DC_SNAP_M2" relation:aaa PG_TEST_VERSION_TEXT= 2>"$TDIR/dc-unknown.stderr")"
+DC_CHANGED_OUT="$(dc_facts "$DC_SNAP_M2" relation:aaa PRO_GATE_BROWSER_ATTACHMENTS=never 2>"$TDIR/dc-changed.stderr")"
+check '#204: a zero count is not silent when a record cannot be read or Oracle cannot be read, and a real change stays quiet' \
+  "$([ "$DC_BAD_OUT" = '{"failed_unchanged":0,"override":false}' ] && grep -qF 'cannot be read; counting failed deliveries from zero' "$TDIR/dc-bad.stderr" \
+     && [ "$DC_UNKNOWN_OUT" = '{"failed_unchanged":0,"override":false}' ] && grep -qF "Oracle's version could not be read" "$TDIR/dc-unknown.stderr" \
+     && [ "$DC_CHANGED_OUT" = '{"failed_unchanged":0,"override":false}' ] && [ ! -s "$TDIR/dc-changed.stderr" ]; echo $?)" \
+  "bad=$DC_BAD_OUT/$(cat "$TDIR/dc-bad.stderr") unknown=$DC_UNKNOWN_OUT/$(cat "$TDIR/dc-unknown.stderr") changed=$DC_CHANGED_OUT/$(cat "$TDIR/dc-changed.stderr")"
 mkdir -p "$DC_HOME/delivery-conditions"
 printf 'x' > "$DC_HOME/delivery-conditions/pg-run-acme-dc-5-1700020007-7"
 touch -d '3 days ago' "$DC_HOME/delivery-conditions/pg-run-acme-dc-5-1700020007-7" "$DC_HOME/delivery-conditions/$DC_M5"

@@ -1241,16 +1241,21 @@ pg_delivery_condition_dir() { printf '%s\n' "${PRO_GATE_DELIVERY_CONDITION_DIR:-
 # pg_oracle_identity: the installed Oracle build as its own --version prints it. Upgrading or
 # re-pinning Oracle is the usual repair for a delivery failure, so a new build is a changed
 # condition. Bounded like pg_reattach_render, and "unknown" (never a guess) when the executable or
-# the timeout command is unavailable.
+# the timeout command is unavailable. An empty read is tried once more: the refund and the next
+# query each read the build, and one slow start under load reading as a different build would
+# silently restart the failed-delivery count.
 pg_oracle_identity() {
-  local oracle_bin="${PRO_GATE_ORACLE_BIN:-oracle}" timeout_bin="${PRO_GATE_TIMEOUT_BIN:-timeout}" v=""
+  local oracle_bin="${PRO_GATE_ORACLE_BIN:-oracle}" timeout_bin="${PRO_GATE_TIMEOUT_BIN:-timeout}" v="" tries=0
   if [[ "$oracle_bin" == */* ]]; then
     [ -x "$oracle_bin" ] || { printf 'unknown\n'; return 0; }
   else
     pg_have "$oracle_bin" || { printf 'unknown\n'; return 0; }
   fi
   if { [[ "$timeout_bin" == */* ]] && [ -x "$timeout_bin" ]; } || pg_have "$timeout_bin"; then
-    v="$("$timeout_bin" 5s "$oracle_bin" --version </dev/null 2>/dev/null | head -n 1 | tr -cd 'A-Za-z0-9._+-' | cut -c1-64)"
+    while [ -z "$v" ] && [ "$tries" -lt 2 ]; do
+      tries=$(( tries + 1 ))
+      v="$("$timeout_bin" 5s "$oracle_bin" --version </dev/null 2>/dev/null | head -n 1 | tr -cd 'A-Za-z0-9._+-' | cut -c1-64)"
+    done
   fi
   printf '%s\n' "${v:-unknown}"
 }
@@ -1329,16 +1334,27 @@ pg_delivery_condition_record() {
 # the current one; anything else (a newer sent attempt or review, no record, no current relation, a
 # changed condition) is zero. The Oracle build is probed only when a record could match, so an
 # ordinary query never runs Oracle. override resolves the operator's one-invocation
-# PRO_GATE_FORCE_ROUND=1 here so the reducer stays a pure function of its facts.
+# PRO_GATE_FORCE_ROUND=1 here so the reducer stays a pure function of its facts. Zero is the
+# fail-safe answer, but not a silent one: a record that exists yet cannot be read, or an Oracle
+# build that cannot be read now, says so on stderr.
 pg_delivery_facts_json() {
-  local snapshot="$1" relation="$2" input="$3" record n=0 override=false
+  local snapshot="$1" relation="$2" input="$3" marker record oracle_id n=0 override=false
   [ "${PRO_GATE_FORCE_ROUND:-0}" = 1 ] && override=true
   if [ -n "$relation" ] \
      && jq -e '.source=="disposition" and .state=="not-submitted" and .fresh_eligible==true' <<<"$snapshot" >/dev/null 2>&1; then
-    record="$(pg_delivery_condition_read "$(jq -r .marker <<<"$snapshot")" 2>/dev/null || true)"
-    if [ -n "$record" ] && [ "$(jq -r .condition_digest <<<"$record")" = \
-         "$(pg_delivery_condition_digest "$relation" "$input" "${PRO_GATE_BROWSER_ATTACHMENTS:-auto}" "$(pg_oracle_identity)")" ]; then
-      n="$(jq -r .consecutive <<<"$record")"
+    marker="$(jq -r .marker <<<"$snapshot")"
+    record="$(pg_delivery_condition_read "$marker" 2>/dev/null || true)"
+    if [ -n "$record" ]; then
+      oracle_id="$(pg_oracle_identity)"
+      if [ "$(jq -r .condition_digest <<<"$record")" = \
+           "$(pg_delivery_condition_digest "$relation" "$input" "${PRO_GATE_BROWSER_ATTACHMENTS:-auto}" "$oracle_id")" ]; then
+        n="$(jq -r .consecutive <<<"$record")"
+      elif [ "$oracle_id" = unknown ]; then
+        echo "[pro-gate] #204: Oracle's version could not be read, so the failed delivery recorded for $marker cannot be matched; counting from zero." >&2
+      fi
+    elif pg_reservation_marker_ok "$marker" \
+         && { [ -e "$(pg_delivery_condition_dir)/$marker" ] || [ -L "$(pg_delivery_condition_dir)/$marker" ]; }; then
+      echo "[pro-gate] #204: the delivery-condition record for $marker cannot be read; counting failed deliveries from zero." >&2
     fi
   fi
   jq -cnS --argjson n "$n" --argjson override "$override" '{failed_unchanged:$n,override:$override}'
@@ -3665,6 +3681,16 @@ pg_review_sha256_text() { # text: digest bytes exactly, without adding a newline
   elif pg_have openssl; then LC_ALL=C printf '%s' "$text" | openssl dgst -sha256 | awk '{print $NF}'
   else return 1
   fi
+}
+
+# pg_review_relation_identity binding-or-template-json -> "relation:<sha256>": the review's
+# complete relation identity (repository, target and evidence, canonicalized). The query's
+# evidence identity, the prior-review candidates, the dispatch recheck and the #204 delivery record
+# must all derive it here: a copy that drifts makes the query and the record disagree silently.
+pg_review_relation_identity() {
+  local relation
+  relation="$(jq -cS '{repository,target,evidence}' <<<"${1-}" 2>/dev/null)" && [ -n "$relation" ] || return 1
+  printf 'relation:%s\n' "$(pg_review_sha256_text "$relation")"
 }
 
 # A choice is fresh only for the prompt context that named it. The selected value and its proof
