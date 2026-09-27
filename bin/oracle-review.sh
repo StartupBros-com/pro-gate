@@ -3823,6 +3823,7 @@ case "$SLOT_SUPERSEDE_EVERY" in ''|*[!0-9]*) SLOT_SUPERSEDE_EVERY=60;; esac
 while :; do
   EFF_CONC="$(pg_ramp_level "$MAX_CONC")"
   SLOT_FREED=0
+  SLOT_SWEPT=0
   # Durable reservations occupy real account capacity even though their wrapper process has
   # exited. Slot-tagged reservations EXCLUDE their exact slot from acquisition (shrinking the
   # scan range instead overbooked capacity when a lower-numbered slot freed: dogfood review
@@ -3885,6 +3886,7 @@ while :; do
         SLOT_HOLDER="${SLOT_HOLDER_F##*/}"
         [ -f "$SLOT_HOLDER_F" ] && pg_reservation_marker_ok "$SLOT_HOLDER" || continue
         [ "$(pg_reservation_state "$SLOT_HOLDER" 2>/dev/null)" = generating ] || continue
+        SLOT_SWEPT=1
         if SLOT_HOLDER_PROOF="$(pg_reservation_supersede_proven "$SLOT_HOLDER")"; then
           echo "[oracle-review] released the account slot held by ${SLOT_HOLDER}: ${SLOT_HOLDER_PROOF}, so its review no longer applies (charge kept; still harvestable for audit)." >&2
           SLOT_FREED=1
@@ -3909,11 +3911,13 @@ while :; do
       echo "[oracle-review] the reservation handoff guard ($(pg_reservation_lock)) could not be acquired; account capacity is unreadable this slice, so no slot is planned or taken. Waiting out the remaining slot budget." >&2
     fi
   fi
-  # A slot this slice's own sweep just freed is tried at once, even at the deadline: the proof can
-  # take seconds, and giving up on capacity the run itself released would waste the release. That
-  # grace is bounded — the sweep starts nothing past the deadline, so only one such slice can follow.
-  if [ "$SLOT_FREED" != 1 ] && [ "$(date +%s)" -ge "$SLOT_DEADLINE" ]; then break; fi
-  [ "$SLOT_FREED" = 1 ] || sleep 3
+  # A slice whose sweep ran a proof gets one more look at capacity, at once, even at the deadline.
+  # The proof's GitHub read can take seconds, and capacity freed meanwhile — by this sweep or by
+  # another run finishing during the read — would otherwise be abandoned by a run that can use it.
+  # That grace is bounded: the sweep starts no proof past the deadline, so only one such slice can
+  # follow.
+  if [ "$SLOT_SWEPT" != 1 ] && [ "$(date +%s)" -ge "$SLOT_DEADLINE" ]; then break; fi
+  [ "$SLOT_FREED" = 1 ] || [ "$(date +%s)" -ge "$SLOT_DEADLINE" ] || sleep 3
 done
 if [ "$SLOT_OK" != 1 ]; then
   # Report the state the wait actually ended in. A wait that NEVER got as far as reading capacity

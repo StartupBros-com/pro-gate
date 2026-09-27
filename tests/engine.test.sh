@@ -9794,6 +9794,9 @@ check '#234 a slot wait supersedes a reservation bound to a head its open PR has
 
 # Planted negatives: a holder whose PR is still open at its bound head is a review that still
 # applies, and a GitHub read that fails proves nothing. Both stay held and the run times out.
+# Checks that count a sweep's read wait 3s, not 1s: the slot deadline counts whole seconds, so
+# a 1s wait can leave the first slice a few milliseconds, and a loaded runner then reaches the
+# sweep past its deadline and never makes the read (CI run 36312967186).
 SW_OPEN_HOME="$TDIR/home-slotwait-open"
 SW_OPEN_MARKER='pg-run-acme-fresh-77-1700014420-1'
 super_seed "$SW_OPEN_HOME" "$SW_OPEN_MARKER" 1700014420 "$FRESH_HEAD"
@@ -9805,7 +9808,7 @@ for SW_BYSTANDER in complete:1700014421 superseded:1700014422; do
   SW_BYSTANDER_REC="$(awk -v state="${SW_BYSTANDER%%:*}" 'BEGIN{FS=OFS="\t"} NR==1{$5=""; $8=state; print}' "$SW_BYSTANDER_F")"
   printf '%s\n' "$SW_BYSTANDER_REC" > "$SW_BYSTANDER_F"
 done
-slotwait_run "$SW_OPEN_HOME" 1 OPEN "$FRESH_HEAD"
+slotwait_run "$SW_OPEN_HOME" 3 OPEN "$FRESH_HEAD"
 check '#234 a holder whose PR is open at its bound head stays held, checked once per interval' \
   "$([ "$RC" -eq 7 ] && [ ! -s "$SW_OPEN_HOME/waiter.md" ] \
      && [ "$(slotwait_state "$SW_OPEN_HOME" "$SW_OPEN_MARKER")" = generating ] \
@@ -9820,7 +9823,7 @@ check '#234 the holder report points a still-held reservation at --recover' \
 SW_FAIL_HOME="$TDIR/home-slotwait-gh-fail"
 SW_FAIL_MARKER='pg-run-acme-fresh-77-1700014430-1'
 super_seed "$SW_FAIL_HOME" "$SW_FAIL_MARKER" 1700014430 "$FRESH_HEAD"
-slotwait_run "$SW_FAIL_HOME" 1 MERGED "$FRESH_HEAD" fail
+slotwait_run "$SW_FAIL_HOME" 3 MERGED "$FRESH_HEAD" fail
 check '#234 a holder whose GitHub state cannot be read stays held' \
   "$([ "$RC" -eq 7 ] && [ "$(slotwait_proof_calls)" = "$SW_GH_LINE" ] \
      && [ "$(slotwait_state "$SW_FAIL_HOME" "$SW_FAIL_MARKER")" = generating ] \
@@ -9867,23 +9870,50 @@ check '#234 a holder PR that merges mid-wait is released on the next sweep' \
   "$(slotwait_detail "$SW_LATER_HOME" "$SW_LATER_MARKER")"
 
 # The proof's GitHub read can take seconds. A sweep that starts before the deadline and frees a slot
-# after it still gets to take that slot: this gh answers MERGED only once the 1s wait has expired.
+# after it still gets to take that slot: this gh answers MERGED only once the 3s wait has expired.
 cat > "$TDIR/bin/gh-slow-merged" <<'GH_SLOW_MERGED'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${PG_TEST_GH_CALLS:?}"
 case " $* " in *' state,headRefOid '*) ;; *) exit 1 ;; esac
-sleep 2
+sleep 4
 jq -nc --arg head "${PG_TEST_GH_HEAD:-}" '{state:"MERGED",headRefOid:$head}'
 GH_SLOW_MERGED
 chmod +x "$TDIR/bin/gh-slow-merged"
 SW_SLOW_HOME="$TDIR/home-slotwait-slow-proof"
 SW_SLOW_MARKER='pg-run-acme-fresh-77-1700014455-1'
 super_seed "$SW_SLOW_HOME" "$SW_SLOW_MARKER" 1700014455 "$FRESH_HEAD"
-slotwait_run "$SW_SLOW_HOME" 1 MERGED "$FRESH_HEAD" ok 1 3600 "$TDIR/bin/gh-slow-merged"
+slotwait_run "$SW_SLOW_HOME" 3 MERGED "$FRESH_HEAD" ok 1 3600 "$TDIR/bin/gh-slow-merged"
 check '#234 a slot the sweep frees after the deadline is still taken, not abandoned' \
   "$([ "$RC" -eq 0 ] && [ "$(slotwait_proof_calls)" = "$SW_GH_LINE" ] \
      && [ "$(slotwait_state "$SW_SLOW_HOME" "$SW_SLOW_MARKER")" = superseded ]; echo $?)" \
   "$(slotwait_detail "$SW_SLOW_HOME" "$SW_SLOW_MARKER")"
+
+# A proof that frees nothing can still take the rest of the wait on its GitHub read. Capacity another
+# run frees during that read gets the same final look: a live review holds slot 2 of a two-slot
+# account and exits while this gh is answering, the holder on slot 1 stays open at its bound head,
+# and the waiter takes slot 2 although the deadline passed while the proof ran (Pro r1 P2).
+cat > "$TDIR/bin/gh-slow-open-releases" <<'GH_SLOW_OPEN_RELEASES'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${PG_TEST_GH_CALLS:?}"
+case " $* " in *' state,headRefOid '*) ;; *) exit 1 ;; esac
+kill "$(cat "$PG_TEST_GH_CALLS.holder")" 2>/dev/null
+sleep 4
+jq -nc --arg head "${PG_TEST_GH_HEAD:-}" '{state:"OPEN",headRefOid:$head}'
+GH_SLOW_OPEN_RELEASES
+chmod +x "$TDIR/bin/gh-slow-open-releases"
+SW_LIVE_HOME="$TDIR/home-slotwait-live-release"
+SW_LIVE_MARKER='pg-run-acme-fresh-77-1700014458-1'
+super_seed "$SW_LIVE_HOME" "$SW_LIVE_MARKER" 1700014458 "$FRESH_HEAD"
+bash -c 'exec 9>>"$1" && flock -n 9 && exec sleep 60' _ "$SW_LIVE_HOME/oracle.lock.slot2" &
+SW_LIVE_HOLDER=$!
+printf '%s\n' "$SW_LIVE_HOLDER" > "$SUPER_GH_CALLS.holder"
+for _ in $(seq 1 100); do flock -n "$SW_LIVE_HOME/oracle.lock.slot2" true 2>/dev/null || break; sleep 0.05; done
+slotwait_run "$SW_LIVE_HOME" 3 OPEN "$FRESH_HEAD" ok 2 3600 "$TDIR/bin/gh-slow-open-releases"
+kill "$SW_LIVE_HOLDER" 2>/dev/null; wait "$SW_LIVE_HOLDER" 2>/dev/null
+check '#234 a slot another run frees during an unsuccessful proof is still taken at the deadline' \
+  "$([ "$RC" -eq 0 ] && [ -s "$SW_LIVE_HOME/waiter.md" ] && [ "$(slotwait_proof_calls)" = "$SW_GH_LINE" ] \
+     && [ "$(slotwait_state "$SW_LIVE_HOME" "$SW_LIVE_MARKER")" = generating ]; echo $?)" \
+  "$(slotwait_detail "$SW_LIVE_HOME" "$SW_LIVE_MARKER")"
 
 # The #234 incident had two merged PRs' exited runs holding slots at once. One sweep releases every
 # holder it can prove, not only the first: a sweep that stopped at its first release would free one
