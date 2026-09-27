@@ -1113,10 +1113,10 @@ pg_attempt_disposition_validate() { # canonical JSON [expected marker]
     ($d.charged_spend_epoch|type=="number" and floor==. and .>0) and
     ($d.observed_at|type=="number" and floor==. and .>=$d.charged_spend_epoch) and
     ($d.terminal_kind|IN("not-submitted","submitted-terminal","recovery-exhausted")) and
-    ($d.proof_kind|IN("proven-no-submit","exact-owned-infrastructure-terminal","bounded-recovery-exhausted")) and
+    ($d.proof_kind|IN("proven-no-submit","exact-owned-infrastructure-terminal","bounded-recovery-exhausted","no-conversation-after-send")) and
     (($d.terminal_kind=="not-submitted" and $d.proof_kind=="proven-no-submit") or
      ($d.terminal_kind=="submitted-terminal" and $d.proof_kind=="exact-owned-infrastructure-terminal") or
-     ($d.terminal_kind=="recovery-exhausted" and $d.proof_kind=="bounded-recovery-exhausted")) and
+     ($d.terminal_kind=="recovery-exhausted" and ($d.proof_kind|IN("bounded-recovery-exhausted","no-conversation-after-send")))) and
     ($d.repository|keys)==["host","owner","repo"] and
     ($d.repository.host|test("^[A-Za-z0-9.-]+$")) and ($d.repository.owner|test("^[A-Za-z0-9._-]+$")) and ($d.repository.repo|test("^[A-Za-z0-9._-]+$")) and
     ($d.target|keys)==["kind","pr"] and $d.target.kind=="pull-request" and ($d.target.pr|type=="number" and floor==. and .>0) and

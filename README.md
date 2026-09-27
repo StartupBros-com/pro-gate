@@ -512,7 +512,10 @@ Read `--status --json` before acting. A canonical `attempt` reports one truth: a
 work must be collected; `not-submitted` was positively proven and refunded; `submitted-terminal`
 or `recovery-exhausted` retains its charge but no longer owns recovery; `superseded` retains its
 charge and optional audit harvest but owns neither capacity nor the current head. Those settled states
-let changed/current evidence receive a fresh typed decision. Unknown post-click fate stays recoverable.
+let changed/current evidence receive a fresh typed decision. Unknown post-click fate stays recoverable,
+with one exception: when Oracle's own exact-session record shows the send never reached a ChatGPT
+conversation and left the composer empty, and the final scan finds none, the attempt settles as `recovery-exhausted` (proof
+`no-conversation-after-send`, ledger reason `no-conversation`) and keeps its charge.
 Each unresolved reservation also carries `classification` (what the latest collection pass concluded:
 `owned-incomplete`, `inconclusive`, `browser-down`, `absent`, `cross-bound`, `throttle`, `terminal`,
 `terminal-infrastructure`), `classified_at`, and `ttl_remaining_secs`, so a parked run and a genuinely

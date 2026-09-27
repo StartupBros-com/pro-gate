@@ -3320,7 +3320,10 @@ check 'force-killed attempt never announces a refund' \
 # must suppress retries and retain the round regardless of metadata completeness or landing URL.
 cat > "$TDIR/bin/oracle-commit-timeout" <<'FAKE_COMMIT_TIMEOUT'
 #!/usr/bin/env bash
-[ "${1:-}" = session ] && exit 1
+if [ "${1:-}" = session ]; then
+  [ -z "${PG_TEST_SESSION_CALLS:-}" ] || printf 'session %s\n' "${2:-}" >> "$PG_TEST_SESSION_CALLS"
+  exit 1
+fi
 prompt=""; chatgpt_url=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -3335,8 +3338,11 @@ count=0
 [ -s "${PG_TEST_ATTEMPTS_FILE:?}" ] && count="$(cat "$PG_TEST_ATTEMPTS_FILE")"
 count=$((count + 1)); printf '%s\n' "$count" > "$PG_TEST_ATTEMPTS_FILE"
 slug="fake-prompt-commit-$count"
+# PG_TEST_COMMIT_MODE may name one mode per attempt, comma-separated; the last one repeats.
+mode="$(printf '%s\n' "${PG_TEST_COMMIT_MODE:-complete}" | cut -d, -f"$count")"
+[ -n "$mode" ] || mode="${PG_TEST_COMMIT_MODE##*,}"
 mkdir -p "${ORACLE_HOME_DIR:?}/sessions/$slug"
-submitted=true; [ "${PG_TEST_COMMIT_MODE:-complete}" != pre-submit ] || submitted=false
+submitted=true; [ "$mode" != pre-submit ] || submitted=false
 jq -n --arg id "$slug" --arg prompt "$prompt" --arg tabUrl "$tab_url" \
   --argjson promptLength "${#prompt}" --argjson submitted "$submitted" '
   {
@@ -3361,7 +3367,7 @@ jq -n --arg id "$slug" --arg prompt "$prompt" --arg tabUrl "$tab_url" \
           hasNewTurn: false,
           stopVisible: false,
           assistantVisible: false,
-          composerCleared: true,
+          composerCleared: false,
           inConversation: false,
           editorLength: 0,
           lastTurnLength: 0
@@ -3370,8 +3376,27 @@ jq -n --arg id "$slug" --arg prompt "$prompt" --arg tabUrl "$tab_url" \
     }
   }
 ' > "$ORACLE_HOME_DIR/sessions/$slug/meta.json"
-if [ "${PG_TEST_COMMIT_MODE:-complete}" = partial ]; then
-  jq 'del(.error.details.commitProbe.prefixMatched)' \
+mode_filter=""
+case "$mode" in
+  partial) mode_filter='del(.error.details.commitProbe.prefixMatched)' ;;
+  in-conversation) mode_filter='.error.details.commitProbe.inConversation = true' ;;
+  conversation-id) mode_filter='.browser.runtime.conversationId = "fake-conversation"' ;;
+  foreign-prompt) mode_filter='.options.prompt = "another run prompt"' ;;
+  editor-holds-prompt) mode_filter='.error.details.commitProbe.editorLength = .error.details.promptLength' ;;
+  no-editor-length) mode_filter='del(.error.details.commitProbe.editorLength)' ;;
+  no-tab-url) mode_filter='del(.browser.runtime.tabUrl)' ;;
+  blank-tab-url) mode_filter='.browser.runtime.tabUrl = ""' ;;
+  new-turn) mode_filter='.error.details.commitProbe.hasNewTurn = true' ;;
+  stop-visible) mode_filter='.error.details.commitProbe.stopVisible = true' ;;
+  assistant-visible) mode_filter='.error.details.commitProbe.assistantVisible = true' ;;
+  whitespace-tab-url) mode_filter='.browser.runtime.tabUrl = " \t "' ;;
+  malformed-submitted) mode_filter='.browser.runtime.promptSubmitted = false | .error.details.runtime.promptSubmitted = "true"' ;;
+  error-runtime) mode_filter='del(.browser.runtime) | .error.details.runtime = {promptSubmitted: true, tabUrl: "https://chatgpt.com/"}' ;;
+  error-runtime-conversation-id) mode_filter='.error.details.runtime.conversationId = "fake-conversation"' ;;
+  error-runtime-tab-on-conversation) mode_filter='.error.details.runtime.tabUrl = "https://chatgpt.com/c/fake-conversation"' ;;
+esac
+if [ -n "$mode_filter" ]; then
+  jq "$mode_filter" \
     "$ORACLE_HOME_DIR/sessions/$slug/meta.json" > "$ORACLE_HOME_DIR/sessions/$slug/meta.tmp"
   mv "$ORACLE_HOME_DIR/sessions/$slug/meta.tmp" "$ORACLE_HOME_DIR/sessions/$slug/meta.json"
 fi
@@ -3402,8 +3427,12 @@ check 'post-click timeout fails without a duplicate retry' \
   "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -4 "$TDIR/stderr")"
 check 'Project URL is forwarded unchanged to Oracle' \
   "$([ "$(cat "$PROOF_URL" 2>/dev/null)" = "$PROJECT_URL" ]; echo $?)" "url=$(cat "$PROOF_URL" 2>/dev/null)"
-check 'complete post-click metadata remains ambiguous and suppresses retry' \
-  "$(grep -q 'lifecycle evidence or incomplete log capture makes its fate ambiguous/spent' "$TDIR/stderr"; echo $?)" \
+# #230: this fixture never reached a conversation (project landing URL, inConversation=false), so
+# the retry stays suppressed and the round stays charged, but the salvage no longer buys the
+# live-review budget. The in-conversation and conversation-id planted negatives below keep the
+# ambiguous/spent message.
+check 'complete post-click metadata with no conversation suppresses retry' \
+  "$(grep -q "could not prove the prompt stayed unsubmitted, but Oracle's send produced no ChatGPT conversation" "$TDIR/stderr"; echo $?)" \
   "$(tail -8 "$TDIR/stderr")"
 check 'post-click timeout invokes Oracle exactly once' \
   "$([ "$(cat "$PROOF_ATTEMPTS")" = 1 ]; echo $?)" "attempts=$(cat "$PROOF_ATTEMPTS")"
@@ -3631,6 +3660,110 @@ check 'structured promptSubmitted=false proof refunds the round exactly once' \
 check 'structured pre-submit terminalization removes mutable recovery state' \
   "$([ ! -e "$PRESUBMIT_HOME/run-meta/$PRESUBMIT_MARKER" ] && [ ! -e "$PRESUBMIT_HOME/active/$RKEY_95" ]; echo $?)" \
   "run-meta=$(find "$PRESUBMIT_HOME/run-meta" -type f 2>/dev/null) active=$(find "$PRESUBMIT_HOME/active" -type f 2>/dev/null)"
+
+# #230: Send was clicked (promptSubmitted=true), but Oracle's commit check ended off any /c/
+# conversation and the final scan found none. The round stays charged; the futile reattach, the
+# live-review salvage budget and the 6h unknown-fate hold go away. pro-gate #227 rounds 1 and 8 were
+# this shape on 2026-09-26 (6h49m and 4h22m from charge to release).
+echo '# #230: a send that produced no ChatGPT conversation releases recovery, charge retained'
+NOCONV_REPO="$TDIR/noconv-repo"; git init -q "$NOCONV_REPO"; git -C "$NOCONV_REPO" remote add origin https://github.com/acme/noconv.git
+run_noconv() { # pr commit-mode tab-url -> NC_HOME NC_RC NC_MARKER NC_RKEY NC_ATTEMPTS NC_SESSIONS; stderr in $TDIR/stderr
+  # The fake Oracle exits at once and no case here tests watchdog timing, so a 1s watchdog poll
+  # replaces the 10s production poll that every attempt would otherwise sit out.
+  NC_HOME="$TDIR/home-noconv-$1"; NC_ORACLE="$TDIR/oracle-noconv-$1"
+  NC_ATTEMPTS="$TDIR/noconv-attempts-$1"; NC_SESSIONS="$TDIR/noconv-sessions-$1"; NC_RKEY="acme-noconv.git-$1"
+  mkdir -p "$NC_HOME" "$NC_ORACLE"; : > "$NC_ATTEMPTS"; : > "$NC_SESSIONS"
+  printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+  env PRO_GATE_HOME="$NC_HOME" ORACLE_HOME_DIR="$NC_ORACLE" ORACLE_BROWSER_PORT="$PORT" \
+    PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
+    PRO_GATE_MAX_RETRIES=1 PRO_GATE_RETRY_BACKOFF=0 PRO_GATE_REATTACH_TIMEOUT=1 PRO_GATE_TIMEOUT_GRACE=1 \
+    PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_PRE_RETRY_PROBE_SECS=1 PRO_GATE_SALVAGE_SECS=2 \
+    PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-commit-timeout" PG_TEST_ATTEMPTS_FILE="$NC_ATTEMPTS" \
+    PG_TEST_SESSION_CALLS="$NC_SESSIONS" PG_TEST_COMMIT_MODE="$2" PG_TEST_TAB_URL="$3" \
+    NODE_OPTIONS= bash "$ENGINE" --pr "$1" --repo "$NOCONV_REPO" --diff "$TDIR/small.diff" \
+    --out "$NC_HOME/o.md" --timeout 2s >"$TDIR/stdout" 2>"$TDIR/stderr"
+  NC_RC=$?
+  NC_MARKER="$(jq -r .marker "$NC_HOME/o.md.status" 2>/dev/null)"
+}
+run_noconv 96 complete https://chatgpt.com/
+NC_DISP="$NC_HOME/attempt-dispositions/$NC_MARKER"
+check '#230 no-conversation send exits 6 after exactly one Oracle attempt' \
+  "$([ "$NC_RC" -eq 6 ] && [ "$(cat "$NC_ATTEMPTS")" = 1 ]; echo $?)" \
+  "rc=$NC_RC attempts=$(cat "$NC_ATTEMPTS") $(tail -6 "$TDIR/stderr")"
+check '#230 no-conversation send skips the futile reattach' \
+  "$([ ! -s "$NC_SESSIONS" ] && grep -q 'skipping reattach: .*(no-conversation)' "$TDIR/stderr"; echo $?)" \
+  "sessions=$(cat "$NC_SESSIONS") $(grep -F reattach "$TDIR/stderr")"
+check '#230 no-conversation send keeps the normal salvage window, not the live-review budget' \
+  "$(grep -q "Oracle's send produced no ChatGPT conversation" "$TDIR/stderr" \
+     && grep -q 'last-resort CDP tab salvage (marker .*, up to 2s)' "$TDIR/stderr"; echo $?)" \
+  "$(grep -E 'pre-retry|last-resort' "$TDIR/stderr")"
+check '#230 no-conversation send writes a retained-charge terminal disposition' \
+  "$(jq -e '.terminal_kind=="recovery-exhausted" and .proof_kind=="no-conversation-after-send"' "$NC_DISP" >/dev/null 2>&1; echo $?)" \
+  "marker=$NC_MARKER disp=$(cat "$NC_DISP" 2>/dev/null) $(tail -4 "$TDIR/stderr")"
+check '#230 no-conversation send keeps its round charged' \
+  "$([ -s "$NC_HOME/rounds/$NC_RKEY" ] && ! grep -q 'refunding this round' "$TDIR/stderr"; echo $?)" \
+  "rounds=$(cat "$NC_HOME/rounds/$NC_RKEY" 2>/dev/null) $(tail -4 "$TDIR/stderr")"
+check '#230 no-conversation release removes the unknown-fate recovery state' \
+  "$([ -n "$NC_MARKER" ] && [ ! -e "$NC_HOME/run-meta/$NC_MARKER" ] && [ ! -e "$NC_HOME/active/$NC_RKEY" ] \
+     && [ ! -e "$NC_HOME/in-progress/$NC_MARKER" ]; echo $?)" \
+  "run-meta=$(find "$NC_HOME/run-meta" -type f 2>/dev/null) active=$(find "$NC_HOME/active" -type f 2>/dev/null) in-progress=$(find "$NC_HOME/in-progress" -type f 2>/dev/null)"
+NC_ROW="$(grep -F "\"out\":\"$NC_HOME/o.md\"" "$NC_HOME/ledger.jsonl" 2>/dev/null | tail -1)"
+check '#230 no-conversation ledger row carries reason=no-conversation' \
+  "$([ "$(printf '%s' "$NC_ROW" | jq -r '.reason // "MISSING"')" = no-conversation ]; echo $?)" "$NC_ROW"
+NC_SNAP="$(PRO_GATE_HOME="$NC_HOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_attempt_snapshot \"\$1\" \"\$2\" \"\$3\" 96 '$NC_RKEY'" _ \
+  "$(jq -r .repository.host "$NC_DISP" 2>/dev/null)" "$(jq -r .repository.owner "$NC_DISP" 2>/dev/null)" "$(jq -r .repository.repo "$NC_DISP" 2>/dev/null)")"
+check '#230 the attempt snapshot reads the released attempt as terminal, not recoverable' \
+  "$(jq -e '.state=="recovery-exhausted" and .recoverable==false' <<<"$NC_SNAP" >/dev/null 2>&1; echo $?)" "snap=$NC_SNAP"
+
+# The release reads every attempt in the run. A retried run (attempt 1 provably never sent, which is
+# what allowed the retry; attempt 2 a send with no conversation) releases on the two records
+# together, and Oracle's error.details.runtime copy of the runtime fields counts the same as
+# browser.runtime. Only a provably unsent attempt is ever retried, so every earlier record in a run
+# reads unsubmitted and the last one decides.
+for NC_CASE in '108 pre-submit,complete 2' '109 error-runtime 1'; do
+  read -r NC_PR NC_MODE NC_N <<<"$NC_CASE"
+  run_noconv "$NC_PR" "$NC_MODE" https://chatgpt.com/
+  check "#230 no-conversation release ($NC_MODE) after $NC_N Oracle attempt(s) keeps the charge" \
+    "$([ "$NC_RC" -eq 6 ] && [ "$(cat "$NC_ATTEMPTS")" = "$NC_N" ] && [ ! -s "$NC_SESSIONS" ] && [ -n "$NC_MARKER" ] \
+       && jq -e '.terminal_kind=="recovery-exhausted" and .proof_kind=="no-conversation-after-send"' \
+            "$NC_HOME/attempt-dispositions/$NC_MARKER" >/dev/null 2>&1 \
+       && [ -s "$NC_HOME/rounds/$NC_RKEY" ] && ! grep -q 'refunding this round' "$TDIR/stderr" \
+       && [ ! -e "$NC_HOME/run-meta/$NC_MARKER" ]; echo $?)" \
+    "rc=$NC_RC attempts=$(cat "$NC_ATTEMPTS") sessions=$(cat "$NC_SESSIONS") disp=$(cat "$NC_HOME/attempt-dispositions/$NC_MARKER" 2>/dev/null) $(grep -E 'reattach|pre-retry|last-resort' "$TDIR/stderr")"
+done
+# A retried run whose second send did reach a conversation keeps today's charged hold. The last
+# attempt gets no pre-retry probe, so the reattach, which reads that attempt's own record, must run.
+run_noconv 110 pre-submit,in-conversation https://chatgpt.com/
+check '#230 a retried run whose second send reached a conversation keeps the charged unknown-fate path' \
+  "$([ "$NC_RC" -eq 6 ] && [ "$(cat "$NC_ATTEMPTS")" = 2 ] && [ -s "$NC_SESSIONS" ] && [ -n "$NC_MARKER" ] \
+     && [ ! -e "$NC_HOME/attempt-dispositions/$NC_MARKER" ] \
+     && [ -s "$NC_HOME/rounds/$NC_RKEY" ] && [ -e "$NC_HOME/run-meta/$NC_MARKER" ]; echo $?)" \
+  "rc=$NC_RC attempts=$(cat "$NC_ATTEMPTS") sessions=$(cat "$NC_SESSIONS") disp=$(cat "$NC_HOME/attempt-dispositions/$NC_MARKER" 2>/dev/null) $(grep -E 'reattach|pre-retry|last-resort' "$TDIR/stderr")"
+
+# Planted negatives, one field each: any sign of a conversation (in either runtime location), a
+# prompt still in the editor (the #66 late-send shape), missing, blank or whitespace-only evidence, a
+# malformed promptSubmitted (which must not buy a --force retry either), or metadata not bound to
+# this run keeps today's charged unknown-fate path — reattach, the live-review salvage budget, and
+# no terminal disposition.
+for NC_CASE in '97 in-conversation https://chatgpt.com/' '98 complete https://chatgpt.com/c/fake-conversation' \
+               '99 conversation-id https://chatgpt.com/' '100 foreign-prompt https://chatgpt.com/' \
+               '101 editor-holds-prompt https://chatgpt.com/' '102 no-editor-length https://chatgpt.com/' \
+               '103 no-tab-url https://chatgpt.com/' '104 blank-tab-url https://chatgpt.com/' \
+               '105 new-turn https://chatgpt.com/' '106 stop-visible https://chatgpt.com/' \
+               '107 assistant-visible https://chatgpt.com/' '111 malformed-submitted,complete https://chatgpt.com/' \
+               '112 whitespace-tab-url https://chatgpt.com/' '113 error-runtime-conversation-id https://chatgpt.com/' \
+               '114 error-runtime-tab-on-conversation https://chatgpt.com/'; do
+  read -r NC_PR NC_MODE NC_TAB <<<"$NC_CASE"
+  run_noconv "$NC_PR" "$NC_MODE" "$NC_TAB"
+  check "#230 planted negative ($NC_MODE, $NC_TAB) keeps the charged unknown-fate path" \
+    "$([ "$NC_RC" -eq 6 ] && [ "$(cat "$NC_ATTEMPTS")" = 1 ] && [ -s "$NC_SESSIONS" ] \
+       && [ -n "$NC_MARKER" ] && [ ! -e "$NC_HOME/attempt-dispositions/$NC_MARKER" ] \
+       && [ -s "$NC_HOME/rounds/$NC_RKEY" ] && [ -e "$NC_HOME/run-meta/$NC_MARKER" ] \
+       && grep -q 'makes its fate ambiguous/spent' "$TDIR/stderr" \
+       && grep -q 'last-resort CDP tab salvage (marker .*, up to 3s)' "$TDIR/stderr"; echo $?)" \
+    "rc=$NC_RC attempts=$(cat "$NC_ATTEMPTS") sessions=$(cat "$NC_SESSIONS") disp=$(cat "$NC_HOME/attempt-dispositions/$NC_MARKER" 2>/dev/null) $(grep -E 'reattach|pre-retry|last-resort' "$TDIR/stderr")"
+done
 
 # #66 gate r2/r3 P1: the spend epoch is the one pg_round_record CHARGED at — not the
 # reservation's `created` field (written at exit-9 time, 35 min later on the live run that

@@ -2670,6 +2670,7 @@ pg_finish() {  # $1 exit code — settle organization, ramp, and ledger exactly 
       case "$fail_detail" in
         *"round refunded"*)          reason=refunded-unsubmitted ;;
         *"fate uncertain"*)          reason=fate-uncertain ;;
+        *"no ChatGPT conversation"*) reason=no-conversation ;;
         *)                           reason=salvage-empty ;;
       esac
     elif [ "${HARVEST:-0}" = 1 ]; then
@@ -4175,8 +4176,8 @@ LIVE_CONVERSATION=0
 THROTTLED=0
 CLOUDFLARE=0
 
-pg_oracle_prompt_submitted_state() { # verified transcript proof -> true|false from exact Oracle session metadata
-  local transcript="$1" proof="$2" session meta root state expected actual
+pg_oracle_attempt_meta() { # verified transcript proof -> exact Oracle session metadata for this run
+  local transcript="$1" proof="$2" session meta root expected actual
   [ -f "$transcript" ] && [ ! -L "$transcript" ] && [ -f "$proof" ] && [ ! -L "$proof" ] || return 1
   expected="$(tr -d '[:space:]' < "$proof" 2>/dev/null)"; actual="$(pg_sha256 "$transcript" 2>/dev/null || true)"
   [ -n "$expected" ] && [ "$actual" = "$expected" ] || return 1
@@ -4184,32 +4185,106 @@ pg_oracle_prompt_submitted_state() { # verified transcript proof -> true|false f
   case "$session" in ''|*[!A-Za-z0-9._-]*) return 1;; esac
   root="${ORACLE_HOME_DIR:-$HOME/.oracle}"; meta="$root/sessions/$session/meta.json"
   [ -f "$meta" ] && [ ! -L "$meta" ] && [ "$(wc -c < "$meta" 2>/dev/null)" -le 1048576 ] || return 1
-  state="$(jq -r --arg id "$session" --arg marker "$RUN_MARKER" '
-    select(.id==$id) | select(.options.prompt|type=="string" and contains($marker)) |
-    [.browser.runtime.promptSubmitted?,.error.details.runtime.promptSubmitted?]
-    | map(select(type=="boolean")) | unique | select(length==1) | .[0]
-  ' "$meta" 2>/dev/null)" || return 1
+  jq -ce --arg id "$session" --arg marker "$RUN_MARKER" '
+    select(.id==$id) | select(.options.prompt|type=="string" and contains($marker))
+  ' "$meta" 2>/dev/null
+}
+
+# The one reading of an attempt's promptSubmitted flag, shared by the refund bar and the #230
+# outcome below. Oracle may record it under browser.runtime, error.details.runtime, or both; the
+# flag is the single boolean every recorded value agrees on. A malformed (non-boolean) value or two
+# values that disagree leave it unknown. Dropping the odd one out would turn a send of unknown fate
+# into "unsubmitted", which authorizes a --force retry and a refund.
+PG_JQ_PROMPT_SUBMITTED='def prompt_submitted:
+  [.browser.runtime.promptSubmitted?,.error.details.runtime.promptSubmitted?]
+  | map(select(. != null)) | select(length > 0 and all(type == "boolean"))
+  | unique | select(length == 1) | .[0];'
+
+pg_oracle_prompt_submitted_state() { # verified transcript proof -> true|false from exact Oracle session metadata
+  local json state
+  json="$(pg_oracle_attempt_meta "$1" "$2")" || return 1
+  state="$(jq -r "$PG_JQ_PROMPT_SUBMITTED"' prompt_submitted' <<<"$json" 2>/dev/null)" || return 1
   case "$state" in true|false) printf '%s\n' "$state";; *) return 1;; esac
 }
 
-# pg_attempt_provably_unsubmitted <marker-scan-rc>: the ONE shared bar for a no-spend
-# retry/refund. A clean marker scan, no remembered URL, no throttle/live evidence, and a stable
-# browser remain mandatory. Every Oracle invocation must have a complete digest-verified transcript
-# bound to structured session metadata that says Send was never dispatched. Missing, conflicting,
-# or promptSubmitted=true metadata is ambiguous and therefore remains charged.
-pg_attempt_provably_unsubmitted() {
-  local scan_rc="${1:-}" i state
-  [ "$scan_rc" = 4 ] || return 1
+# pg_oracle_attempt_send_outcome <transcript> <proof>: what Oracle's own record of ONE attempt
+# proves about its send. `unsubmitted` means Send was never dispatched (the refund bar).
+# `no-conversation` means Send was clicked but, when Oracle's >=60s commit check gave up, the tab
+# was still off any /c/ conversation, no conversation id was ever recorded, and the composer was
+# empty. On 2026-09-26 the URL separated the two prompt-commit-timeout classes: 64 in-conversation
+# timeouts all later yielded a review, while the 65 that never reached a conversation yielded one
+# only once, from a late send of a prompt still whole in the composer (pro-gate #66, editor 25330).
+# A prompt left in the editor can still go out, so an empty editor is required too; all 10 such
+# timeouts since 2026-09-07 had one. The turn/stop/assistant flags read false in both classes, so
+# they are required only as contrary evidence. Missing fields, blank, whitespace-only or absent tab
+# URLs, a malformed or disputed promptSubmitted, and anything else fail.
+pg_oracle_attempt_send_outcome() {
+  local json
+  json="$(pg_oracle_attempt_meta "$1" "$2")" || return 1
+  jq -er "$PG_JQ_PROMPT_SUBMITTED"'
+    [prompt_submitted] as $submitted |
+    (.error.details.commitProbe? // {}) as $probe |
+    ([.browser.runtime.conversationId?,.error.details.runtime.conversationId?]
+      | map(select(. != null and . != ""))) as $conversation_ids |
+    ([.browser.runtime.tabUrl?,.error.details.runtime.tabUrl?]
+      | map(select(. != null))) as $tab_urls |
+    if $submitted == [false] then "unsubmitted"
+    elif $submitted == [true] and .status == "error"
+      and .error.details.code? == "prompt-commit-timeout"
+      and $probe.inConversation == false and $probe.hasNewTurn == false
+      and $probe.stopVisible == false and $probe.assistantVisible == false
+      and $probe.editorLength == 0
+      and ($conversation_ids | length) == 0
+      and ($tab_urls | length) > 0
+      and ($tab_urls | all(if type == "string" then (test("\\S") and (test("/c/") | not)) else false end))
+    then "no-conversation"
+    else empty end
+  ' <<<"$json" 2>/dev/null
+}
+
+# The clean-scan preconditions every attempt-level send proof shares: a clean marker scan, no
+# remembered URL, no throttle/live evidence, a stable browser, and at least one Oracle invocation.
+pg_attempt_clean_scan() { # <marker-scan-rc>
+  [ "${1:-}" = 4 ] || return 1
   [ "${LIVE_CONVERSATION:-0}" != 1 ] || return 1
   [ "${THROTTLED:-0}" != 1 ] || return 1
   [ ! -f "$PRO_GATE_HOME/conversation-urls/${RUN_MARKER}" ] || return 1
   ! pg_browser_restarted_midrun "$RUN_START" >/dev/null || return 1
-  [ "${#ORACLE_LOG_TRANSCRIPTS[@]}" -gt 0 ] || return 1
+  [ "${#ORACLE_LOG_TRANSCRIPTS[@]}" -gt 0 ]
+}
+
+# pg_attempt_provably_unsubmitted <marker-scan-rc>: the ONE shared bar for a no-spend
+# retry/refund. Besides the clean-scan preconditions, every Oracle invocation must have a complete
+# digest-verified transcript bound to structured session metadata that says Send was never
+# dispatched. Missing, malformed, conflicting, or promptSubmitted=true metadata is ambiguous and
+# therefore remains charged.
+pg_attempt_provably_unsubmitted() {
+  local scan_rc="${1:-}" i state
+  pg_attempt_clean_scan "$scan_rc" || return 1
   for i in "${!ORACLE_LOG_TRANSCRIPTS[@]}"; do
     state="$(pg_oracle_prompt_submitted_state "${ORACLE_LOG_TRANSCRIPTS[$i]}" "${ORACLE_LOG_PROOFS[$i]}" 2>/dev/null || true)"
     [ "$state" = false ] || return 1
   done
   return 0
+}
+
+# pg_attempt_no_conversation_after_send <marker-scan-rc>: the weaker bar for releasing capacity
+# while RETAINING the charge (#230). The same clean-scan preconditions hold, every invocation is
+# either proven unsubmitted or a no-conversation send, and at least one is the latter (all
+# unsubmitted is the refund above). It never authorizes a retry or a refund: a post-click timeout
+# stays charged, and only the six-hour hold on a conversation that never existed goes away.
+pg_attempt_no_conversation_after_send() {
+  local scan_rc="${1:-}" i outcome seen=0
+  pg_attempt_clean_scan "$scan_rc" || return 1
+  for i in "${!ORACLE_LOG_TRANSCRIPTS[@]}"; do
+    outcome="$(pg_oracle_attempt_send_outcome "${ORACLE_LOG_TRANSCRIPTS[$i]}" "${ORACLE_LOG_PROOFS[$i]}" 2>/dev/null || true)"
+    case "$outcome" in
+      unsubmitted) ;;
+      no-conversation) seen=1 ;;
+      *) return 1 ;;
+    esac
+  done
+  [ "$seen" = 1 ]
 }
 
 attempt=0
@@ -4418,15 +4493,26 @@ while :; do
   # which session this attempt got.
   SLUG="$(grep -oE 'oracle session [A-Za-z0-9._-]+' "$RUNLOG" 2>/dev/null | tail -1 | awk '{print $NF}')"
   [ -n "$SLUG" ] || SLUG="$SLUG_BASE"
-  echo "[oracle-review] no output — bounded salvage via reattach (session ${SLUG}, ${REATTACH_TIMEOUT}s)..." >&2
-  pg_status salvaging "reattach ${SLUG}"
-  if pg_reattach_render "$SLUG" "$CAPTURE_OUT" "$REATTACH_TIMEOUT"; then
-    REATTACHED=1   # v0.28: browser-matched capture — subject to the provenance choke below
-    CAPTURE_SOURCE=reattach   # gate #54 r3: reattach ALSO sets SALVAGED, so the memo-
-                              # invalidation guard must discriminate by source, not SALVAGED
-    echo "[oracle-review] salvaged a completed review via reattach." >&2
-    SALVAGED=1
-    break
+  # #230: when Oracle's own verified record of this attempt shows it never reached a conversation
+  # (Send never dispatched, or dispatched with no conversation to show for it), its session holds
+  # nothing for reattach to harvest. Skip that wait; the marker probe and the final CDP salvage
+  # below still look for a conversation that commits late.
+  LAST_SEND_OUTCOME="$(pg_oracle_attempt_send_outcome \
+    "${ORACLE_LOG_TRANSCRIPTS[${#ORACLE_LOG_TRANSCRIPTS[@]}-1]}" \
+    "${ORACLE_LOG_PROOFS[${#ORACLE_LOG_PROOFS[@]}-1]}" 2>/dev/null || true)"
+  if [ -n "$LAST_SEND_OUTCOME" ]; then
+    echo "[oracle-review] no output — skipping reattach: Oracle's session record shows no conversation to harvest (${LAST_SEND_OUTCOME})." >&2
+  else
+    echo "[oracle-review] no output — bounded salvage via reattach (session ${SLUG}, ${REATTACH_TIMEOUT}s)..." >&2
+    pg_status salvaging "reattach ${SLUG}"
+    if pg_reattach_render "$SLUG" "$CAPTURE_OUT" "$REATTACH_TIMEOUT"; then
+      REATTACHED=1   # v0.28: browser-matched capture — subject to the provenance choke below
+      CAPTURE_SOURCE=reattach   # gate #54 r3: reattach ALSO sets SALVAGED, so the memo-
+                                # invalidation guard must discriminate by source, not SALVAGED
+      echo "[oracle-review] salvaged a completed review via reattach." >&2
+      SALVAGED=1
+      break
+    fi
   fi
 
   attempt=$((attempt + 1))
@@ -4466,6 +4552,14 @@ while :; do
   # Oracle browser-lifecycle lines OR an incomplete/unverifiable lifecycle transcript mean a send
   # may have reached ChatGPT, so they suppress a duplicate retry regardless of commit metadata.
   if ! pg_attempt_provably_unsubmitted "$PRC"; then
+    # #230: a send that produced no conversation is still not provably unsent, so the retry stays
+    # suppressed — but nothing is known to be generating either, so it must not buy the live-review
+    # salvage budget (HARD_SECS, 62 min by default) that LIVE_CONVERSATION=1 grants.
+    if pg_attempt_no_conversation_after_send "$PRC"; then
+      echo "[oracle-review] pre-retry probe could not prove the prompt stayed unsubmitted, but Oracle's send produced no ChatGPT conversation (still off any conversation when its commit check gave up), so retry is suppressed and CDP salvage keeps its normal ${SALVAGE_WINDOW}s window." >&2
+      pg_status salvaging "send produced no conversation; retry suppressed"
+      break
+    fi
     echo "[oracle-review] pre-retry probe could not prove the prompt stayed unsubmitted; Oracle browser lifecycle evidence or incomplete log capture makes its fate ambiguous/spent, so retry is suppressed and CDP salvage gets the final chance." >&2
     LIVE_CONVERSATION=1
     pg_status live-detected "submission fate ambiguous/spent; retry suppressed"
@@ -4765,6 +4859,20 @@ else
     pg_fresh_dispatch_refund \
       || { echo "[oracle-review] charged marker state could not be proven for refund; preserving it for recovery." >&2; FAIL_DETAIL="submission fate uncertain; charged state preserved for recovery"; }
     [ "${FAIL_DETAIL:-}" = "submission fate uncertain; charged state preserved for recovery" ] || FAIL_DETAIL="submission never landed (send/upload failure before the prompt reached ChatGPT); round refunded, safe to retry"
+  elif [ "${SALVAGE_RAN:-0}" = 1 ] && [ -n "${PR_NUM:-}" ] && [ -n "${PG_META_HOST:-}" ] \
+       && [ -n "${PG_META_OWNER:-}" ] && [ -n "${PG_META_REPO:-}" ] \
+       && pg_attempt_no_conversation_after_send "${SALVAGE_RC:-0}"; then
+    # #230: Send was clicked, Oracle's commit check ended with no conversation, and the final scan
+    # found none either. That is not proof the prompt never reached ChatGPT, so the round stays
+    # charged. Without it the charged attempt stayed unknown-fate, and every later caller was sent to
+    # recover a conversation that never existed until the 6h reservation TTL ran out.
+    if pg_attempt_terminal_transition "$PG_META_HOST" "$PG_META_OWNER" "$PG_META_REPO" "$PR_NUM" \
+         "$ROUND_KEY" "$RUN_MARKER" "$RUN_SPEND_EPOCH" recovery-exhausted no-conversation-after-send; then
+      echo "[oracle-review] Oracle's send produced no ChatGPT conversation and the final scan found none: recovery released, round retained." >&2
+      FAIL_DETAIL="send produced no ChatGPT conversation; recovery released, round retained — safe to re-query for a fresh review"
+    else
+      echo "[oracle-review] the no-conversation outcome could not be persisted safely; charged state preserved for recovery." >&2
+    fi
   fi
   # Attribute the failure when the review browser restarted mid-run — almost always memory pressure
   # on a small box (Chrome's subprocesses get reclaimed, oracle-chrome restarts, the CDP tab is
