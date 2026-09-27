@@ -3364,7 +3364,7 @@ jq -n --arg id "$slug" --arg prompt "$prompt" --arg tabUrl "$tab_url" \
           hasNewTurn: false,
           stopVisible: false,
           assistantVisible: false,
-          composerCleared: true,
+          composerCleared: false,
           inConversation: false,
           editorLength: 0,
           lastTurnLength: 0
@@ -3379,6 +3379,13 @@ case "${PG_TEST_COMMIT_MODE:-complete}" in
   in-conversation) mode_filter='.error.details.commitProbe.inConversation = true' ;;
   conversation-id) mode_filter='.browser.runtime.conversationId = "fake-conversation"' ;;
   foreign-prompt) mode_filter='.options.prompt = "another run prompt"' ;;
+  editor-holds-prompt) mode_filter='.error.details.commitProbe.editorLength = .error.details.promptLength' ;;
+  no-editor-length) mode_filter='del(.error.details.commitProbe.editorLength)' ;;
+  no-tab-url) mode_filter='del(.browser.runtime.tabUrl)' ;;
+  blank-tab-url) mode_filter='.browser.runtime.tabUrl = ""' ;;
+  new-turn) mode_filter='.error.details.commitProbe.hasNewTurn = true' ;;
+  stop-visible) mode_filter='.error.details.commitProbe.stopVisible = true' ;;
+  assistant-visible) mode_filter='.error.details.commitProbe.assistantVisible = true' ;;
 esac
 if [ -n "$mode_filter" ]; then
   jq "$mode_filter" \
@@ -3698,10 +3705,15 @@ NC_SNAP="$(PRO_GATE_HOME="$NC_HOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; p
 check '#230 the attempt snapshot reads the released attempt as terminal, not recoverable' \
   "$(jq -e '.state=="recovery-exhausted" and .recoverable==false' <<<"$NC_SNAP" >/dev/null 2>&1; echo $?)" "snap=$NC_SNAP"
 
-# Planted negatives: any sign of a conversation, or metadata not bound to this run, keeps today's
+# Planted negatives, one field each: any sign of a conversation, a prompt still in the editor (the
+# #66 late-send shape), missing or blank evidence, or metadata not bound to this run keeps today's
 # charged unknown-fate path — reattach, the live-review salvage budget, and no terminal disposition.
 for NC_CASE in '97 in-conversation https://chatgpt.com/' '98 complete https://chatgpt.com/c/fake-conversation' \
-               '99 conversation-id https://chatgpt.com/' '100 foreign-prompt https://chatgpt.com/'; do
+               '99 conversation-id https://chatgpt.com/' '100 foreign-prompt https://chatgpt.com/' \
+               '101 editor-holds-prompt https://chatgpt.com/' '102 no-editor-length https://chatgpt.com/' \
+               '103 no-tab-url https://chatgpt.com/' '104 blank-tab-url https://chatgpt.com/' \
+               '105 new-turn https://chatgpt.com/' '106 stop-visible https://chatgpt.com/' \
+               '107 assistant-visible https://chatgpt.com/'; do
   read -r NC_PR NC_MODE NC_TAB <<<"$NC_CASE"
   run_noconv "$NC_PR" "$NC_MODE" "$NC_TAB"
   check "#230 planted negative ($NC_MODE, $NC_TAB) keeps the charged unknown-fate path" \

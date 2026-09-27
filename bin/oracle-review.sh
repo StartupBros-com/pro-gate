@@ -4203,11 +4203,14 @@ pg_oracle_prompt_submitted_state() { # verified transcript proof -> true|false f
 # pg_oracle_attempt_send_outcome <transcript> <proof>: what Oracle's own record of ONE attempt
 # proves about its send. `unsubmitted` means Send was never dispatched (the refund bar).
 # `no-conversation` means Send was clicked but, when Oracle's >=60s commit check gave up, the tab
-# was still off any /c/ conversation and no conversation id was ever recorded. On 2026-09-26 that
-# URL was the only fact separating the two prompt-commit-timeout classes: 64 in-conversation
+# was still off any /c/ conversation, no conversation id was ever recorded, and the composer was
+# empty. On 2026-09-26 the URL separated the two prompt-commit-timeout classes: 64 in-conversation
 # timeouts all later yielded a review, while the 65 that never reached a conversation yielded one
-# only when the composer still held the whole prompt (pro-gate #66). The turn/stop/assistant flags
-# read false in both classes, so they are required only as contrary evidence. Anything else fails.
+# only once, from a late send of a prompt still whole in the composer (pro-gate #66, editor 25330).
+# A prompt left in the editor can still go out, so an empty editor is required too; all 10 such
+# timeouts since 2026-09-07 had one. The turn/stop/assistant flags read false in both classes, so
+# they are required only as contrary evidence. Missing fields, blank or absent tab URLs, and
+# anything else fail.
 pg_oracle_attempt_send_outcome() {
   local json
   json="$(pg_oracle_attempt_meta "$1" "$2")" || return 1
@@ -4224,8 +4227,10 @@ pg_oracle_attempt_send_outcome() {
       and .error.details.code? == "prompt-commit-timeout"
       and $probe.inConversation == false and $probe.hasNewTurn == false
       and $probe.stopVisible == false and $probe.assistantVisible == false
+      and $probe.editorLength == 0
       and ($conversation_ids | length) == 0
-      and ($tab_urls | all(if type == "string" then (test("/c/") | not) else false end))
+      and ($tab_urls | length) > 0
+      and ($tab_urls | all(if type == "string" then (length > 0 and (test("/c/") | not)) else false end))
     then "no-conversation"
     else empty end
   ' <<<"$json" 2>/dev/null
