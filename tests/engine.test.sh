@@ -7912,6 +7912,25 @@ PRO_GATE_HOME="$DC_HOME" pg_delivery_condition_record github.com acme dc 5 "$DC_
 check '#204: a sent attempt between two no-sends breaks the run even when the condition matches' \
   "$(jq -e '.consecutive==1' <<<"$(PRO_GATE_HOME="$DC_HOME" pg_delivery_condition_read "$DC_M5")" >/dev/null 2>&1; echo $?)" \
   "$(PRO_GATE_HOME="$DC_HOME" pg_delivery_condition_read "$DC_M5" 2>&1)"
+# #204 gate r1: at refund time the current attempt owns the change's newest run-meta and a live
+# reservation. Excluding it must not hide an older attempt that was sent and later superseded.
+DC2_HOME="$TDIR/home-delivery-condition-sent"; mkdir -p "$DC2_HOME"
+DC2_KEY='acme-dc-6'
+DC2_A='pg-run-acme-dc-6-1700030001-1'; DC2_B='pg-run-acme-dc-6-1700030002-2'; DC2_C='pg-run-acme-dc-6-1700030003-3'
+PRO_GATE_HOME="$DC2_HOME" pg_attempt_disposition_write github.com acme dc 6 "$DC2_KEY" "$DC2_A" 1700030001 not-submitted proven-no-submit
+PRO_GATE_HOME="$DC2_HOME" pg_delivery_condition_write "$DC2_A" "$DC2_KEY" "$DC_D" 1
+PRO_GATE_HOME="$DC2_HOME" pg_run_meta_write "$DC2_B" github.com acme dc "$DC2_KEY" 6 "$TDIR/dc2-b.md" 1700030002
+PRO_GATE_HOME="$DC2_HOME" pg_reservation_write "$DC2_B" "$DC2_KEY" "$TDIR/dc2-b.md" 1 GPT-Y 1700030002
+PRO_GATE_HOME="$DC2_HOME" pg_reservation_set_state "$DC2_B" superseded
+PRO_GATE_HOME="$DC2_HOME" pg_run_meta_write "$DC2_C" github.com acme dc "$DC2_KEY" 6 "$TDIR/dc2-c.md" 1700030003
+PRO_GATE_HOME="$DC2_HOME" pg_reservation_write "$DC2_C" "$DC2_KEY" "$TDIR/dc2-c.md" 2 GPT-Y 1700030003
+DC2_SNAP="$(PRO_GATE_HOME="$DC2_HOME" pg_attempt_snapshot github.com acme dc 6 "$DC2_KEY" "$DC2_C" 2>/dev/null)"
+PRO_GATE_HOME="$DC2_HOME" pg_delivery_condition_record github.com acme dc 6 "$DC2_KEY" "$DC2_C" "$DC_D"
+check '#204: a sent attempt superseded between two no-sends breaks the run although the current attempt holds the newest records' \
+  "$(jq -e '.consecutive==1' <<<"$(PRO_GATE_HOME="$DC2_HOME" pg_delivery_condition_read "$DC2_C")" >/dev/null 2>&1; echo $?)" \
+  "record=$(PRO_GATE_HOME="$DC2_HOME" pg_delivery_condition_read "$DC2_C" 2>&1) snapshot=$DC2_SNAP"
+check '#204: the snapshot excluding the current attempt reads the superseded predecessor and stays fresh-eligible' \
+  "$(jq -e --arg m "$DC2_B" '.marker==$m and .state=="superseded" and .fresh_eligible==true' <<<"$DC2_SNAP" >/dev/null 2>&1; echo $?)" "$DC2_SNAP"
 check '#204: a record is write-once; a different count for the same marker is refused and changes nothing' \
   "$(! PRO_GATE_HOME="$DC_HOME" pg_delivery_condition_write "$DC_M2" "$DC_KEY" "$DC_D" 9 \
      && PRO_GATE_HOME="$DC_HOME" pg_delivery_condition_write "$DC_M2" "$DC_KEY" "$DC_D" 2 \

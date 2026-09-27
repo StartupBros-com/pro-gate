@@ -1078,8 +1078,8 @@ pg_run_meta_has_terminal_review() { # marker
   pg_attempt_artifact "$1" >/dev/null
 }
 
-pg_run_meta_find_latest() { # host owner repo pr terminal-filter -> newest exact marker
-  local want_host="$1" want_owner="$2" want_repo="$3" want_pr="$4" filter="${5:-any}"
+pg_run_meta_find_latest() { # host owner repo pr terminal-filter [exclude-marker] -> newest exact marker
+  local want_host="$1" want_owner="$2" want_repo="$3" want_pr="$4" filter="${5:-any}" exclude="${6:-}"
   local marker host owner repo key pr out spend best_marker="" best_spend="" terminal LC_ALL=C
   pg_canonical_repo_ok "$want_host" "$want_owner" "$want_repo" || return 1
   want_pr="$(pg_pr_number_normalize "$want_pr")" || return 1
@@ -1087,6 +1087,9 @@ pg_run_meta_find_latest() { # host owner repo pr terminal-filter -> newest exact
   while IFS=$'\t' read -r marker host owner repo key pr out spend; do
     [ "$host" = "$want_host" ] && [ "$owner" = "$want_owner" ] && [ "$repo" = "$want_repo" ] \
       && [ "$pr" = "$want_pr" ] || continue
+    # Skipped before selection, not after: the excluded marker is often the newest record, and
+    # discarding it once chosen would hide every older one (#204 gate r1).
+    [ -n "$exclude" ] && [ "$marker" = "$exclude" ] && continue
     terminal=false; pg_run_meta_has_terminal_review "$marker" && terminal=true
     case "$filter:$terminal" in review:false|unresolved:true) continue;; esac
     if [ -z "$best_spend" ] || [ "$spend" -gt "$best_spend" ] \
@@ -1522,7 +1525,9 @@ pg_attempt_snapshot() { # host owner repo pr round-key [exclude-marker] -> canon
   pr="$(pg_pr_number_normalize "$pr")" || return 1
   pg_round_key_ok "$key" || return 1
 
-  latest_review="$(pg_run_meta_find_latest "$host" "$owner" "$repo" "$pr" review 2>/dev/null || true)"
+  # An exclude marker reads the change as if that attempt did not exist: every lookup below skips it
+  # before choosing, so an older attempt it would otherwise shadow still counts.
+  latest_review="$(pg_run_meta_find_latest "$host" "$owner" "$repo" "$pr" review "$exclude" 2>/dev/null || true)"
   if [ -n "$latest_review" ]; then
     rec="$(pg_run_meta_read "$latest_review" 2>/dev/null || true)"
     [ -z "$rec" ] || IFS=$'\t' read -r _ _ _ _ _ _ latest_review_epoch <<<"$rec"
@@ -1548,7 +1553,7 @@ pg_attempt_snapshot() { # host owner repo pr round-key [exclude-marker] -> canon
       fi
     fi
     if [ "$ignore_disposition" = false ]; then
-      competing_marker="$(pg_reservation_find_pr "$key" 2>/dev/null || true)"
+      competing_marker="$(pg_reservation_find_pr "$key" "" "$exclude" 2>/dev/null || true)"
       if pg_reservation_marker_ok "$competing_marker" && [ "$competing_marker" != "$disposition_marker" ] && [ "$competing_marker" != "$exclude" ]; then
         competing_epoch="$(pg_reservation_read_spend "$competing_marker" 2>/dev/null || pg_marker_epoch "$competing_marker" 2>/dev/null || true)"
         case "$competing_epoch" in
@@ -1561,7 +1566,7 @@ pg_attempt_snapshot() { # host owner repo pr round-key [exclude-marker] -> canon
       if [ "$latest_review_epoch" -gt "$disposition_epoch" ] || { [ "$latest_review_epoch" = "$disposition_epoch" ] && [[ "$latest_review" > "$disposition_marker" ]]; }; then ignore_disposition=true; fi
     fi
     if [ "$ignore_disposition" = false ]; then
-      competing_marker="$(pg_run_meta_find_latest "$host" "$owner" "$repo" "$pr" unresolved 2>/dev/null || true)"
+      competing_marker="$(pg_run_meta_find_latest "$host" "$owner" "$repo" "$pr" unresolved "$exclude" 2>/dev/null || true)"
       if [ -n "$competing_marker" ] && [ "$competing_marker" != "$disposition_marker" ] && [ "$competing_marker" != "$exclude" ]; then
         rec="$(pg_run_meta_read "$competing_marker" 2>/dev/null || true)"
         [ -z "$rec" ] || IFS=$'\t' read -r _ _ _ _ _ _ competing_epoch <<<"$rec"
@@ -1607,8 +1612,8 @@ pg_attempt_snapshot() { # host owner repo pr round-key [exclude-marker] -> canon
   if [ -z "$marker" ]; then
     # Applicable work always outranks audit-only superseded records for the same change. Only fall
     # back to superseded when no capacity-holding reservation exists.
-    reservation="$(pg_reservation_find_pr "$key" 2>/dev/null || true)"
-    [ -n "$reservation" ] || reservation="$(pg_reservation_find_pr "$key" include-superseded 2>/dev/null || true)"
+    reservation="$(pg_reservation_find_pr "$key" "" "$exclude" 2>/dev/null || true)"
+    [ -n "$reservation" ] || reservation="$(pg_reservation_find_pr "$key" include-superseded "$exclude" 2>/dev/null || true)"
     if pg_reservation_marker_ok "$reservation" && [ "$reservation" != "$exclude" ]; then
       marker="$reservation"; source=reservation
       if [ "$(pg_reservation_state "$marker" 2>/dev/null || echo generating)" = superseded ]; then
@@ -1622,7 +1627,7 @@ pg_attempt_snapshot() { # host owner repo pr round-key [exclude-marker] -> canon
   fi
 
   if [ -z "$marker" ]; then
-    latest_unresolved="$(pg_run_meta_find_latest "$host" "$owner" "$repo" "$pr" unresolved 2>/dev/null || true)"
+    latest_unresolved="$(pg_run_meta_find_latest "$host" "$owner" "$repo" "$pr" unresolved "$exclude" 2>/dev/null || true)"
     if [ -n "$latest_unresolved" ] && [ "$latest_unresolved" != "$exclude" ]; then
       marker="$latest_unresolved"; source=run-meta; state=unknown-fate; recoverable=true; fresh=false
       rec="$(pg_run_meta_read "$marker" 2>/dev/null || true)"
@@ -2115,13 +2120,14 @@ pg_reservation_note_miss() {
   fi
 }
 
-pg_reservation_find_pr() { # pr-key [include-superseded] -> marker (oldest, best-effort)
-  local pr="$1" include="${2:-}" dir f found_pr state
+pg_reservation_find_pr() { # pr-key [include-superseded] [exclude-marker] -> marker (oldest, best-effort)
+  local pr="$1" include="${2:-}" exclude="${3:-}" dir f found_pr state
   [ -n "$pr" ] || return 1
   dir="$(pg_reservation_dir)"; [ -d "$dir" ] || return 1
   for f in "$dir"/*; do
     [ -f "$f" ] || continue
     pg_reservation_marker_ok "$(basename "$f")" || continue
+    [ -n "$exclude" ] && [ "$(basename "$f")" = "$exclude" ] && continue
     found_pr="$(awk -F'\t' 'NR==1{print $1}' "$f" 2>/dev/null)"
     state="$(awk -F'\t' 'NR==1{print $8}' "$f" 2>/dev/null)"
     [ "$state" = superseded ] && [ "$include" != include-superseded ] && continue
