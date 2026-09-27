@@ -11,6 +11,8 @@ execution: code
 
 # Typed Delivery, Ownership and Disposition Facts - Plan
 
+> **Superseded, 2026-09-27; kept for history.** This plan was never implemented. Its delivery estimator (Oracle 0.18 era) and its routing from payload size to the connector rest on premises that turned out wrong on Oracle 0.20.0 (see #175's 2026-09-14 comments). The current shape of the work is recorded on [#175](https://github.com/StartupBros-com/pro-gate/issues/175#issuecomment-5858508058). It covers runtime-observed transport and payload facts, result ownership and digest, and attempt disposition, and it follows #204's transport repair. Do not implement this file as written.
+
 ## Goal Capsule
 
 - **Objective:** A caller that drives pro-gate reads how a review was delivered, whose verdict an artifact carries, and how the last attempt ended from the typed decision, so no caller has to re-derive those facts from log text, exit codes, or the artifact's bytes, and the dotfiles wrapper shrinks back to orchestration.
