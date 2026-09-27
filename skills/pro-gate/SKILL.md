@@ -172,7 +172,10 @@ Recovery never launches a fresh review. Relay exactly one plain state: **Review 
 **Checking for completed review**, **Still working**, **Review superseded**, **No review remains**,
 or **Browser needs attention**. `Review superseded` means immutable old-head or merged/closed PR
 proof released capacity while retaining the charge and optional audit harvest — a classic `--pr` run
-reviewed against a caller-supplied `--diff` is reclaimable the same way. `No review remains`
+reviewed against a caller-supplied `--diff` is reclaimable the same way. A fresh run waiting for a
+slot applies the same proof to the reservations holding capacity, so a merged, closed or moved-on PR
+frees its slot without `recover` whenever GitHub can be read; a holder whose GitHub state could not
+be read stays held, and the wait's report names `--recover <marker>` for it. `No review remains`
 means terminal proof released recovery ownership. In either case, re-query the typed decision instead
 of deleting state or forcing a round. Missing binding/GitHub proof remains fail-closed. A historical
 literal-`diff` reservation key is canonicalized only inside that exact proof-backed transition; a

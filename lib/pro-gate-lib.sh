@@ -1910,7 +1910,7 @@ pg_reservation_remove() { # marker
 # the miss limit is reached (reservation removed) or "retained miss/limit" otherwise. Shared by
 # reconciliation and the harvest not-found path so both apply the same fail-closed policy.
 pg_reservation_note_miss() {
-  local marker="$1" dir f pr out created misses slot model spend miss_limit ttl now age
+  local marker="$1" dir f pr out created misses slot model spend state state_field miss_limit ttl now age
   miss_limit="${PRO_GATE_RESERVATION_MISSES:-3}"
   case "$miss_limit" in ''|*[!0-9]*) miss_limit=3;; esac
   [ "$miss_limit" -ge 2 ] 2>/dev/null || miss_limit=2
@@ -1932,10 +1932,13 @@ pg_reservation_note_miss() {
   if [ "$(( now - mt ))" -lt "$interval" ] 2>/dev/null; then
     pg_reservation_guard_release; echo "retained interval/$miss_limit"; return 0
   fi
-  # Per-field awk, and ALL SEVEN fields (#68 gate P1): `read` collapses consecutive tabs, and
+  # Per-field awk, and EVERY field (#68 gate P1): `read` collapses consecutive tabs, and
   # a 6-field rewrite silently erased the v0.31 spend epoch on the first confirmed miss —
   # which then forced a later harvest onto the marker-time fallback and corrupted round
-  # ordering. Every reservation mutation must round-trip the whole record.
+  # ordering. Every reservation mutation must round-trip the whole record, including the v0.33
+  # lifecycle state in field 8: dropping it turned a `complete` review — one that holds no
+  # capacity — back into account occupancy on its first confirmed miss (#236). A legacy record
+  # without the field keeps its seven-field shape.
   pr="$(awk -F'\t' 'NR==1{print $1}' "$f" 2>/dev/null)"
   out="$(awk -F'\t' 'NR==1{print $2}' "$f" 2>/dev/null)"
   created="$(awk -F'\t' 'NR==1{print $3}' "$f" 2>/dev/null)"
@@ -1943,27 +1946,24 @@ pg_reservation_note_miss() {
   slot="$(awk -F'\t' 'NR==1{print $5}' "$f" 2>/dev/null)"
   model="$(awk -F'\t' 'NR==1{print $6}' "$f" 2>/dev/null)"
   spend="$(awk -F'\t' 'NR==1{print $7}' "$f" 2>/dev/null)"
+  state="$(awk -F'\t' 'NR==1{print $8}' "$f" 2>/dev/null)"
+  state_field=""; [ -z "$state" ] || state_field="$(printf '\t%s' "$state")"
   case "$misses" in ''|*[!0-9]*) misses=0;; esac
   case "$created" in ''|*[!0-9]*) created=0;; esac
   ttl="${PRO_GATE_RESERVATION_TTL:-21600}"; case "$ttl" in ''|*[!0-9]*) ttl=21600;; esac
   now="$(date +%s)"; age=$(( now - created )); [ "$age" -lt 0 ] && age=0
   misses=$(( misses + 1 ))
-  if [ "$misses" -ge "$miss_limit" ] && [ "$created" -gt 0 ] && [ "$age" -ge "$ttl" ]; then
-    # The miss threshold is terminal only when durable run-meta can bind the proof to one charged
-    # attempt. Publish disposition BEFORE releasing the reservation so no fresh caller sees a gap.
-    if pg_attempt_terminal_from_meta "$marker" recovery-exhausted bounded-recovery-exhausted; then
-      rm -f "$f" "$(pg_manifest_dir)/$marker" "$(pg_manifest_dir)/$marker.nonce" 2>/dev/null
-      pg_reservation_guard_release
-      pg_attempt_reconcile_terminal "$marker" 2>/dev/null || true
-      echo released
-    else
-      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${pr:-diff}" "${out:-}" "${created:-0}" "$misses" "${slot:-}" "${model:-}" "${spend:-}" > "$f.tmp" 2>/dev/null \
-        && mv -f "$f.tmp" "$f"
-      pg_reservation_guard_release
-      echo "retained $misses/$miss_limit"
-    fi
+  # The miss threshold is terminal only when durable run-meta can bind the proof to one charged
+  # attempt. Publish disposition BEFORE releasing the reservation so no fresh caller sees a gap.
+  # Every other outcome shares the one rewrite below, so the record's fields cannot diverge by path.
+  if [ "$misses" -ge "$miss_limit" ] && [ "$created" -gt 0 ] && [ "$age" -ge "$ttl" ] \
+     && pg_attempt_terminal_from_meta "$marker" recovery-exhausted bounded-recovery-exhausted; then
+    rm -f "$f" "$(pg_manifest_dir)/$marker" "$(pg_manifest_dir)/$marker.nonce" 2>/dev/null
+    pg_reservation_guard_release
+    pg_attempt_reconcile_terminal "$marker" 2>/dev/null || true
+    echo released
   else
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${pr:-diff}" "${out:-}" "${created:-0}" "$misses" "${slot:-}" "${model:-}" "${spend:-}" > "$f.tmp" 2>/dev/null \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s%s\n' "${pr:-diff}" "${out:-}" "${created:-0}" "$misses" "${slot:-}" "${model:-}" "${spend:-}" "$state_field" > "$f.tmp" 2>/dev/null \
       && mv -f "$f.tmp" "$f"
     pg_reservation_guard_release
     echo "retained $misses/$miss_limit"
@@ -2103,6 +2103,78 @@ pg_reservation_supersede() {
   pg_reservation_guard_release; return "$rc"
 }
 
+# pg_reservation_superseded_proof <marker>: print the proof that this reservation's review no
+# longer applies — `pr-merged:<bound-head>`, `pr-closed:<bound-head>` or
+# `head-moved:<bound-head>:<current-head>` — or return 1. The immutable input binding, canonical
+# charged run-meta and the reservation record must all name the same exact attempt before GitHub is
+# asked anything; a valid-but-crossed sidecar must never let another repository/PR release this
+# marker. Missing, malformed or unavailable evidence of any kind returns 1 (fail closed). Reads
+# only: it takes no guard, so a caller never holds the reservation guard across this GitHub call.
+# Two callers: --recover on its one selected marker, and a slot wait that found no free slot (#234).
+pg_reservation_superseded_proof() {
+  local marker="$1" binding meta host owner repo pr bound_head binding_epoch mh mo mr mkey mpr mout mspend rkey rspend gh_bin timeout_bin payload state current_head
+  pg_reservation_marker_ok "$marker" || return 1
+  binding="$(pg_review_input_binding_read "$marker" 2>/dev/null || true)"; [ -n "$binding" ] || return 1
+  meta="$(pg_run_meta_read "$marker" 2>/dev/null || true)"; [ -n "$meta" ] || return 1
+  IFS=$'\t' read -r mh mo mr mkey mpr mout mspend <<<"$meta"
+  host="$(jq -r .repository.host <<<"$binding")"; owner="$(jq -r .repository.owner <<<"$binding")"
+  repo="$(jq -r .repository.repo <<<"$binding")"; pr="$(jq -r .target.pr <<<"$binding")"
+  bound_head="$(jq -r .target.head_oid <<<"$binding")"; binding_epoch="$(jq -r .charged_spend_epoch <<<"$binding")"
+  pg_canonical_repo_ok "$host" "$owner" "$repo" || return 1
+  case "$pr" in ''|*[!0-9]*) return 1;; esac
+  case "$bound_head" in ''|*[!0-9a-f]*) return 1;; esac
+  { [ "${#bound_head}" -eq 40 ] || [ "${#bound_head}" -eq 64 ]; } || return 1
+  [ "$host" = "$mh" ] && [ "$owner" = "$mo" ] && [ "$repo" = "$mr" ] \
+    && [ "$pr" = "$mpr" ] && [ "$binding_epoch" = "$mspend" ] || return 1
+  rkey="$(awk -F'\t' 'NR==1{print $1}' "$(pg_reservation_dir)/$marker" 2>/dev/null)"
+  rspend="$(awk -F'\t' 'NR==1{print $7}' "$(pg_reservation_dir)/$marker" 2>/dev/null)"
+  case "$rkey" in "$mkey"|diff) ;; *) return 1;; esac
+  if [ "$rspend" != "$mspend" ]; then
+    # Pre-v0.31 `diff` reservations have no spend field. Exact immutable binding + canonical
+    # run-meta already identify this marker's charge; queued runs legitimately mint the marker
+    # before that charge, so marker time is not a third equality proof.
+    [ "$rkey" = diff ] && [ -z "$rspend" ] || return 1
+  fi
+  gh_bin="${PRO_GATE_GH_BIN:-gh}"; command -v "$gh_bin" >/dev/null 2>&1 || return 1
+  timeout_bin="${PRO_GATE_TIMEOUT_BIN:-timeout}"
+  command -v "$timeout_bin" >/dev/null 2>&1 || return 1
+  payload="$("$timeout_bin" -k 1s 10s "$gh_bin" pr view "$pr" --repo "$host/$owner/$repo" --json state,headRefOid 2>/dev/null || true)"
+  state="$(jq -r '.state // ""' <<<"$payload" 2>/dev/null)"
+  current_head="$(jq -r '.headRefOid // ""' <<<"$payload" 2>/dev/null)"
+  # #134: every branch emits the bound head it validated against, so the caller can require the
+  # compare-and-swap to commit against that exact binding rather than whatever is on disk later.
+  case "$state" in
+    MERGED|CLOSED) printf 'pr-%s:%s\n' "$(printf '%s' "$state" | tr '[:upper:]' '[:lower:]')" "$bound_head"; return 0;;
+    OPEN) ;;
+    *) return 1;;
+  esac
+  case "$current_head" in ''|*[!0-9a-f]*) return 1;; esac
+  { [ "${#current_head}" -eq 40 ] || [ "${#current_head}" -eq 64 ]; } || return 1
+  [ "$current_head" = "$bound_head" ] && return 1
+  printf 'head-moved:%s:%s\n' "$bound_head" "$current_head"
+}
+
+# pg_reservation_supersede_proven <marker>: prove supersession, then commit it through
+# pg_reservation_supersede's compare-and-swap against the exact bound head GitHub was asked about
+# (#134), and record the ledger event. Prints the proof and returns 0 once the reservation holds no
+# capacity. Returns 1 when there is no proof (nothing changed) and 2 when proof existed but the
+# locked revalidation refused it. The charge, binding, run-meta and record all stay, so the review
+# remains harvestable for audit.
+pg_reservation_supersede_proven() {
+  local marker="$1" proof meta key spend head event
+  proof="$(pg_reservation_superseded_proof "$marker" 2>/dev/null || true)"
+  [ -n "$proof" ] || return 1
+  meta="$(pg_run_meta_read "$marker" 2>/dev/null || true)"
+  IFS=$'\t' read -r _ _ _ key _ _ spend <<<"$meta"
+  # Field 2 is the validated bound head in all three proof shapes.
+  head="${proof#*:}"; head="${head%%:*}"
+  pg_reservation_supersede "$marker" "$key" "$spend" "$head" || return 2
+  event="$(jq -nc --arg ts "$(date +%Y-%m-%dT%H:%M:%S%z)" --arg marker "$marker" --arg proof "$proof" \
+    '{ts:$ts,outcome:"superseded",marker:$marker,proof:$proof,holds_capacity:false,charge_retained:true}' 2>/dev/null || true)"
+  pg_ledger_append "$event"
+  printf '%s\n' "$proof"
+}
+
 pg_reservation_set_state() {
   local marker="$1" state="$2" dir f rc pr out created misses slot model spend current tmp
   case "$state" in generating|complete|superseded) ;; *) return 1;; esac
@@ -2179,6 +2251,11 @@ pg_report_capacity_holders() {
   done
   echo "  collect a finished one for FREE (no new spend, never re-run):" >&2
   echo "    oracle-review.sh --harvest <marker> --out <path> --timeout $(pg_harvest_hint_timeout)" >&2
+  # #234: a waiting run already releases holders whose PR merged, closed or moved its head, so one
+  # listed here is either still current or its GitHub state could not be read. The second case is
+  # the one an operator can finish by hand, with the same proof and the charge kept.
+  echo "  a holder whose PR has merged, closed or moved on is released while a run waits; if GitHub could not be read:" >&2
+  echo "    oracle-review.sh --recover <marker>" >&2
 }
 
 # pg_reservation_state <marker>: echo the lifecycle state (8th field) of a reservation —
@@ -2258,7 +2335,7 @@ pg_harvest_claimed() {
 # because every probe is a page load against the throttled account, no further marker is probed
 # while the cooldown that probe wrote is active. TTL-only sweeps never rendered and still run.
 pg_reservation_reconcile() {
-  local salvage="$1" port="$2" dir ttl miss_limit interval now f marker pr out created misses slot model spend age mt rc probe_out cooldown_noted=0
+  local salvage="$1" port="$2" dir ttl miss_limit interval now f marker pr out created misses slot model spend age mt rc probe_out live_state cooldown_noted=0
   dir="$(pg_reservation_dir)"; [ -d "$dir" ] || return 0
   ttl="${PRO_GATE_RESERVATION_TTL:-21600}"; miss_limit="${PRO_GATE_RESERVATION_MISSES:-3}"
   interval="${PRO_GATE_RECONCILE_INTERVAL:-60}"; now="$(date +%s)"
@@ -2341,8 +2418,17 @@ pg_reservation_reconcile() {
             pg_reservation_guard_acquire || continue
             # The harvest may have removed the file during the probe; rewriting would resurrect a
             # released reservation and block capacity until TTL, so re-check under the guard.
-            if [ -f "$f" ]; then
-              printf '%s\t%s\t%s\t0\t%s\t%s\t%s\t%s\n' "$pr" "$out" "$created" "${slot:-}" "${model:-}" "${spend:-}" "generating" > "$f.tmp" 2>/dev/null && mv -f "$f.tmp" "$f"
+            # The state is re-read here too: the skip at the top of this loop ran before a probe
+            # that can take 10s, and a supersession proven in that window (--recover, or another
+            # run's slot wait, #234) must not be turned back into account occupancy. The same holds
+            # for a completion another sweep proved in that window, and for one proven before it: a
+            # confirmed miss keeps `complete` (#236), and this rewrite only resets that miss count.
+            # `probe-state: generating` is everything short of a proven verdict, a still-hydrating
+            # page included, so it is not evidence that a finished review started generating again.
+            live_state="$(awk -F'\t' 'NR==1{print $8}' "$f" 2>/dev/null)"
+            if [ -f "$f" ] && [ "$live_state" != superseded ]; then
+              [ "$live_state" = complete ] || live_state=generating
+              printf '%s\t%s\t%s\t0\t%s\t%s\t%s\t%s\n' "$pr" "$out" "$created" "${slot:-}" "${model:-}" "${spend:-}" "$live_state" > "$f.tmp" 2>/dev/null && mv -f "$f.tmp" "$f"
             fi
             pg_reservation_guard_release
           }

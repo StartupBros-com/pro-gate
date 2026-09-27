@@ -1,7 +1,7 @@
 ---
 title: "Separate review lifecycle, applicability, capacity, and input trust"
 date: "2026-09-02"
-last_updated: "2026-09-09"
+last_updated: "2026-09-27"
 category: "conventions"
 module: "pro-gate"
 problem_type: "architecture_pattern"
@@ -74,7 +74,7 @@ audit/recovery pointers while releasing capacity and current applicability. It i
 does not accept review bytes.
 
 The head belongs in that list for the same reason the others do (#134). The decision is taken in
-`recover_superseded_reason` against a binding read before the GitHub query; without the head in the
+`pg_reservation_superseded_proof` against a binding read before the GitHub query; without the head in the
 compare-and-swap, the commit could land against a *different* binding substituted afterwards —
 reachable because `pg_attempt_disposition_cleanup` unlinked the binding outside the guard, and
 bindings are otherwise write-once. The failure it prevents is releasing a slot still held by
@@ -114,6 +114,8 @@ It is not. Supersession's proof is *external to the attempt's execution*: a move
 or CLOSED pull request, read from the repository host. The conversation's own state is not an input.
 So the remedy is to move the head for a legitimate reason and then recover that exact marker — the
 transition releases capacity, retains the charge, and keeps the attempt collectable for audit.
+Since v0.57.0 a run that finds no free slot also runs this proof on every reservation holding one
+(#234), so once the proof exists a waiting run releases the slot without anyone running `--recover`.
 
 Four constraints keep this honest, and the last two bound where it applies at all:
 

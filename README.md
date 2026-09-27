@@ -333,7 +333,11 @@ miss proof in the same no-spend invocation. Before browser recovery, an immutabl
 GitHub `MERGED`/`CLOSED` state or a different current head can move the reservation to `superseded`:
 the charge, marker, URL, and optional audit harvest remain, while capacity and current-head ownership
 are released. A classic `--pr` run reviewed against a caller-supplied `--diff` installs the same
-kind of target-only binding and is reclaimable the same way once its bound head moves. Historical
+kind of target-only binding and is reclaimable the same way once its bound head moves. A fresh run
+that finds no free slot runs this same proof and transition on the exited runs holding capacity,
+at most once per `PRO_GATE_RECONCILE_INTERVAL` and never while it holds the reservation guard, so
+a merged, closed or moved-on PR's reservation no longer waits for someone to run `--recover`. The
+slot-wait report still names `--recover` for a holder whose GitHub state could not be read. Historical
 reservations keyed as literal `diff` are canonicalized during that exact
 transition only after immutable identity and charge agree. For pre-v0.31 empty spend fields, exact
 immutable binding and canonical run metadata are revalidated under the reservation lock before the

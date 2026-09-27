@@ -873,52 +873,6 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
     exit 2
   }
   recover_marker_key() { local m="$1" k; k="${m#pg-run-}"; printf '%s\n' "${k%-*-*}"; }
-  recover_superseded_reason() { # marker -> proof-backed reason when PR closed/merged or head moved
-    local marker="$1" binding meta host owner repo pr bound_head binding_epoch mh mo mr mkey mpr mout mspend rkey rspend gh_bin timeout_bin payload state current_head
-    # The immutable binding and canonical charged run metadata must identify the same exact attempt.
-    # A valid-but-crossed sidecar must never let another repository/PR release this marker.
-    binding="$(pg_review_input_binding_read "$marker" 2>/dev/null || true)"; [ -n "$binding" ] || return 1
-    meta="$(pg_run_meta_read "$marker" 2>/dev/null || true)"; [ -n "$meta" ] || return 1
-    IFS=$'\t' read -r mh mo mr mkey mpr mout mspend <<<"$meta"
-    host="$(jq -r .repository.host <<<"$binding")"; owner="$(jq -r .repository.owner <<<"$binding")"
-    repo="$(jq -r .repository.repo <<<"$binding")"; pr="$(jq -r .target.pr <<<"$binding")"
-    bound_head="$(jq -r .target.head_oid <<<"$binding")"; binding_epoch="$(jq -r .charged_spend_epoch <<<"$binding")"
-    pg_canonical_repo_ok "$host" "$owner" "$repo" || return 1
-    case "$pr" in ''|*[!0-9]*) return 1;; esac
-    case "$bound_head" in ''|*[!0-9a-f]*) return 1;; esac
-    { [ "${#bound_head}" -eq 40 ] || [ "${#bound_head}" -eq 64 ]; } || return 1
-    [ "$host" = "$mh" ] && [ "$owner" = "$mo" ] && [ "$repo" = "$mr" ] \
-      && [ "$pr" = "$mpr" ] && [ "$binding_epoch" = "$mspend" ] || return 1
-    rkey="$(awk -F'\t' 'NR==1{print $1}' "$(pg_reservation_dir)/$marker" 2>/dev/null)"
-    rspend="$(awk -F'\t' 'NR==1{print $7}' "$(pg_reservation_dir)/$marker" 2>/dev/null)"
-    case "$rkey" in "$mkey"|diff) ;; *) return 1;; esac
-    if [ "$rspend" != "$mspend" ]; then
-      # Pre-v0.31 `diff` reservations have no spend field. Exact immutable binding + canonical
-      # run-meta already identify this marker's charge; queued runs legitimately mint the marker
-      # before that charge, so marker time is not a third equality proof.
-      [ "$rkey" = diff ] && [ -z "$rspend" ] || return 1
-    fi
-    gh_bin="${PRO_GATE_GH_BIN:-gh}"; command -v "$gh_bin" >/dev/null 2>&1 || return 1
-    timeout_bin="${PRO_GATE_TIMEOUT_BIN:-timeout}"
-    command -v "$timeout_bin" >/dev/null 2>&1 || return 1
-    payload="$("$timeout_bin" -k 1s 10s "$gh_bin" pr view "$pr" --repo "$host/$owner/$repo" --json state,headRefOid 2>/dev/null || true)"
-    state="$(jq -r '.state // ""' <<<"$payload" 2>/dev/null)"
-    current_head="$(jq -r '.headRefOid // ""' <<<"$payload" 2>/dev/null)"
-    # #134: every branch emits the bound head it validated against, so the caller can require the
-    # compare-and-swap to commit against that exact binding rather than whatever is on disk later.
-    case "$state" in
-      MERGED|CLOSED) printf 'pr-%s:%s\n' "$(printf '%s' "$state" | tr '[:upper:]' '[:lower:]')" "$bound_head"; return 0;;
-      OPEN) ;;
-      *) return 1;;
-    esac
-    case "$current_head" in ''|*[!0-9a-f]*) return 1;; esac
-    { [ "${#current_head}" -eq 40 ] || [ "${#current_head}" -eq 64 ]; } || return 1
-    [ "$current_head" = "$bound_head" ] && return 1
-    printf 'head-moved:%s:%s\n' "$bound_head" "$current_head"
-  }
-  # Extract the validated bound head from any proof shape: pr-merged:<head>, pr-closed:<head>,
-  # head-moved:<bound>:<current>. Field 2 is the bound head in all three.
-  recover_superseded_head() { printf '%s' "${1#*:}" | cut -d: -f1; }
   REC_SELECTED=""; REC_SELECTED_OUT=""; REC_QUERY_NUM=""; REC_HOST=""; REC_OWNER=""; REC_REPO_NAME=""
   case "$RECOVER_QUERY" in
     pg-run-*)
@@ -1134,23 +1088,15 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
     echo "Review superseded" >&2
     exit 6
   fi
-  REC_SUPERSEDED_PROOF="$(recover_superseded_reason "$REC_SELECTED" 2>/dev/null || true)"
-  if [ -n "$REC_SUPERSEDED_PROOF" ]; then
-    REC_SUPERSEDED_META="$(pg_run_meta_read "$REC_SELECTED" 2>/dev/null || true)"
-    IFS=$'\t' read -r _ _ _ REC_SUPERSEDED_KEY _ _ REC_SUPERSEDED_SPEND <<<"$REC_SUPERSEDED_META"
-    # #134: commit the transition against the exact binding GitHub was queried about, not whatever
-    # binding is on disk by the time the guard is taken.
-    REC_SUPERSEDED_HEAD="$(recover_superseded_head "$REC_SUPERSEDED_PROOF")"
-    pg_reservation_supersede "$REC_SELECTED" "$REC_SUPERSEDED_KEY" "$REC_SUPERSEDED_SPEND" \
-      "$REC_SUPERSEDED_HEAD" \
-      || { echo "Browser needs attention" >&2; exit 3; }
-    REC_SUPERSEDED_EVENT="$(jq -nc --arg ts "$(date +%Y-%m-%dT%H:%M:%S%z)" \
-      --arg marker "$REC_SELECTED" --arg proof "$REC_SUPERSEDED_PROOF" \
-      '{ts:$ts,outcome:"superseded",marker:$marker,proof:$proof,holds_capacity:false,charge_retained:true}' 2>/dev/null || true)"
-    pg_ledger_append "$REC_SUPERSEDED_EVENT"
-    echo "Review superseded" >&2
-    exit 6
-  fi
+  # pg_reservation_supersede_proven commits against the exact binding GitHub was queried about, not
+  # whatever binding is on disk by the time the guard is taken (#134). A slot wait that finds no free
+  # slot runs the same proof on the reservations blocking it (#234).
+  # stdout stays review bytes only: the helper's printed proof is already in the ledger event.
+  pg_reservation_supersede_proven "$REC_SELECTED" >/dev/null
+  case "$?" in
+    0) echo "Review superseded" >&2; exit 6 ;;
+    2) echo "Browser needs attention" >&2; exit 3 ;;
+  esac
 
   if [ "$REC_RESTORED" = 1 ] && [ "${PRO_GATE_HARVEST_TTL_SWEEP:-1}" = 1 ] \
      && [ "$(pg_reservation_expire_if_stale "$REC_SELECTED")" = stale ] \
@@ -2079,7 +2025,7 @@ pg_install_full_pr_input_binding() { # marker; only endpoint-fetched full PRs ga
   # this). #161: a caller-supplied --diff against a classic `--pr N` run can still install a
   # target-only "caller-patch" binding (mirrors the connector case below, minus the endpoint/raw
   # digests the model was never proven to have received) so a stuck reservation later has
-  # something for recover_superseded_reason()/pg_reservation_supersede to read. This is strictly
+  # something for pg_reservation_superseded_proof()/pg_reservation_supersede to read. This is strictly
   # best-effort: any missing piece (metadata, resolvable head) falls back to 0, never 1 — a
   # caller-patch binding is a nice-to-have for later reclaim, not a submission requirement, and
   # returning 1 here would repeat #150's ee3aaa5 regression for every such run.
@@ -2093,11 +2039,11 @@ pg_install_full_pr_input_binding() { # marker; only endpoint-fetched full PRs ga
       local cp_head='' cp_gh_bin='' cp_timeout_bin='' cp_payload=''
       # gate r1 P1: target.head_oid must be the PR's GitHub-reported head, never the caller's
       # local checkout state — `git -C "$REPO" rev-parse HEAD` can diverge from the real pushed
-      # head (a stale or ahead-of-PR clone), and recover_superseded_reason later trusts this value
+      # head (a stale or ahead-of-PR clone), and pg_reservation_superseded_proof later trusts this value
       # as bound_head verbatim, comparing it against a fresh `gh pr view --json headRefOid` to
       # decide whether the PR moved. A local-checkout mismatch would falsely "prove" head-moved
       # and supersede a reservation whose real PR head never changed. Fetch authoritatively here,
-      # exactly like recover_superseded_reason does (bin/oracle-review.sh:~806-809); any failure
+      # exactly like pg_reservation_superseded_proof does; any failure
       # (gh missing, timeout, malformed JSON) falls back to no binding at all — best-effort, same
       # as every other branch in this function.
       cp_gh_bin="${PRO_GATE_GH_BIN:-gh}"; cp_timeout_bin="${PRO_GATE_TIMEOUT_BIN:-timeout}"
@@ -2129,7 +2075,7 @@ pg_install_full_pr_input_binding() { # marker; only endpoint-fetched full PRs ga
       # #150: FILE_ARGS attaches the fetched endpoint patch only for INPUT=bundle|both — a
       # connector run never sends those bytes to the model, so it must never earn full-pr
       # proof (that would claim the model reviewed diff bytes it was never given). It still
-      # needs SOME binding installed here: recover_superseded_reason()/pg_reservation_supersede
+      # needs SOME binding installed here: pg_reservation_superseded_proof()/pg_reservation_supersede
       # require pg_review_input_binding_read to return a binding before a stuck reservation can
       # be superseded (#159 gate r1 P1). Mirror the connector shape
       # pg_review_decision_prospective_input_binding already emits for INPUT=connector.
@@ -3184,7 +3130,7 @@ cd "$REPO" || { echo "ERROR: repo dir not found: $REPO" >&2; pg_status failed "r
 # pre-charge recheck) runs from inside the checkout, where a relative --repo would name a
 # directory below it. Absolute paths are kept byte for byte, so their round keys never move.
 case "$REPO" in /*) ;; *) REPO="$(pwd)" ;; esac
-# gate r1 P1 (#161) follow-on: honor PRO_GATE_GH_BIN here too, like recover_superseded_reason
+# gate r1 P1 (#161) follow-on: honor PRO_GATE_GH_BIN here too, like pg_reservation_superseded_proof
 # (line ~806) and pg_install_full_pr_input_binding already do. Every value derived below
 # (REPO_SLUG, PR_KEY, PG_META_HOST/OWNER/REPO) starts from PR_URL; resolving it through the
 # unconditional system `gh` while the rest of the file honors an operator- or test-supplied
@@ -3869,8 +3815,15 @@ SLOT_GUARD_BLOCKED=0
 # WHOLE wait, so the newest occupancy reading latches here and is never cleared.
 SLOT_CAPACITY_EVER_READ=0
 SLOT_READ_SUMMARY=""
+# #234: when the last supersession sweep ran, and how often one may run. Same spacing as the
+# dispatch sweep's per-marker probes.
+SLOT_SUPERSEDE_AT=""
+SLOT_SUPERSEDE_EVERY="${PRO_GATE_RECONCILE_INTERVAL:-60}"
+case "$SLOT_SUPERSEDE_EVERY" in ''|*[!0-9]*) SLOT_SUPERSEDE_EVERY=60;; esac
 while :; do
   EFF_CONC="$(pg_ramp_level "$MAX_CONC")"
+  SLOT_FREED=0
+  SLOT_SWEPT=0
   # Durable reservations occupy real account capacity even though their wrapper process has
   # exited. Slot-tagged reservations EXCLUDE their exact slot from acquisition (shrinking the
   # scan range instead overbooked capacity when a lower-numbered slot freed: dogfood review
@@ -3916,10 +3869,34 @@ while :; do
     else
       SLOT_READ_SUMMARY="0 of ${EFF_CONC} effective slots were free, with capacity held by uncollected review(s) rather than running ones"
     fi
+    # #234: a reservation whose PR has merged, closed or moved its head still holds its slot until
+    # the supersession proof runs on it, and before this only --recover ran it: a merged PR's
+    # failed send could keep a slot for hours while this run queued behind it. Run the same proof
+    # and transition on every reservation still holding capacity. Holders are exited runs — a live
+    # review holds a process slot, not a reservation — so this never touches a running review.
+    # The GitHub read happens with the guard released; pg_reservation_supersede takes the guard for
+    # its own compare-and-swap. Unreadable or malformed evidence leaves a holder held. A run that
+    # gets a slot at once never reaches this, sweeps are spaced by PRO_GATE_RECONCILE_INTERVAL, and
+    # none starts past the deadline.
+    SLOT_NOW="$(date +%s)"
+    if [ -z "$SLOT_SUPERSEDE_AT" ] || [ $(( SLOT_NOW - SLOT_SUPERSEDE_AT )) -ge "$SLOT_SUPERSEDE_EVERY" ]; then
+      SLOT_SUPERSEDE_AT="$SLOT_NOW"
+      for SLOT_HOLDER_F in "$(pg_reservation_dir)"/*; do
+        [ "$(date +%s)" -lt "$SLOT_DEADLINE" ] || break
+        SLOT_HOLDER="${SLOT_HOLDER_F##*/}"
+        [ -f "$SLOT_HOLDER_F" ] && pg_reservation_marker_ok "$SLOT_HOLDER" || continue
+        [ "$(pg_reservation_state "$SLOT_HOLDER" 2>/dev/null)" = generating ] || continue
+        SLOT_SWEPT=1
+        if SLOT_HOLDER_PROOF="$(pg_reservation_supersede_proven "$SLOT_HOLDER")"; then
+          echo "[oracle-review] released the account slot held by ${SLOT_HOLDER}: ${SLOT_HOLDER_PROOF}, so its review no longer applies (charge kept; still harvestable for audit)." >&2
+          SLOT_FREED=1
+        fi
+      done
+    fi
     # Name what actually holds capacity. An operator staring at a free-looking account and an idle
     # browser cannot tell "another review is generating" from "a finished review was never
     # collected" — and only the second is theirs to fix, for free (#82).
-    if [ "${SCAN_AVAIL:-0}" -le 0 ] 2>/dev/null \
+    if [ "$SLOT_FREED" = 0 ] && [ "${SCAN_AVAIL:-0}" -le 0 ] 2>/dev/null \
        && { [ -z "${SLOT_BLOCK_LOGGED:-}" ] || [ $(( $(date +%s) - ${SLOT_BLOCK_LOGGED:-0} )) -ge 300 ]; }; then
       SLOT_BLOCK_LOGGED="$(date +%s)"
       pg_report_capacity_holders "$EFF_CONC"
@@ -3934,8 +3911,13 @@ while :; do
       echo "[oracle-review] the reservation handoff guard ($(pg_reservation_lock)) could not be acquired; account capacity is unreadable this slice, so no slot is planned or taken. Waiting out the remaining slot budget." >&2
     fi
   fi
-  if [ "$(date +%s)" -ge "$SLOT_DEADLINE" ]; then break; fi
-  sleep 3
+  # A slice whose sweep ran a proof gets one more look at capacity, at once, even at the deadline.
+  # The proof's GitHub read can take seconds, and capacity freed meanwhile — by this sweep or by
+  # another run finishing during the read — would otherwise be abandoned by a run that can use it.
+  # That grace is bounded: the sweep starts no proof past the deadline, so only one such slice can
+  # follow.
+  if [ "$SLOT_SWEPT" != 1 ] && [ "$(date +%s)" -ge "$SLOT_DEADLINE" ]; then break; fi
+  [ "$SLOT_FREED" = 1 ] || [ "$(date +%s)" -ge "$SLOT_DEADLINE" ] || sleep 3
 done
 if [ "$SLOT_OK" != 1 ]; then
   # Report the state the wait actually ended in. A wait that NEVER got as far as reading capacity
