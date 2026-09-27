@@ -3338,8 +3338,11 @@ count=0
 [ -s "${PG_TEST_ATTEMPTS_FILE:?}" ] && count="$(cat "$PG_TEST_ATTEMPTS_FILE")"
 count=$((count + 1)); printf '%s\n' "$count" > "$PG_TEST_ATTEMPTS_FILE"
 slug="fake-prompt-commit-$count"
+# PG_TEST_COMMIT_MODE may name one mode per attempt, comma-separated; the last one repeats.
+mode="$(printf '%s\n' "${PG_TEST_COMMIT_MODE:-complete}" | cut -d, -f"$count")"
+[ -n "$mode" ] || mode="${PG_TEST_COMMIT_MODE##*,}"
 mkdir -p "${ORACLE_HOME_DIR:?}/sessions/$slug"
-submitted=true; [ "${PG_TEST_COMMIT_MODE:-complete}" != pre-submit ] || submitted=false
+submitted=true; [ "$mode" != pre-submit ] || submitted=false
 jq -n --arg id "$slug" --arg prompt "$prompt" --arg tabUrl "$tab_url" \
   --argjson promptLength "${#prompt}" --argjson submitted "$submitted" '
   {
@@ -3374,7 +3377,7 @@ jq -n --arg id "$slug" --arg prompt "$prompt" --arg tabUrl "$tab_url" \
   }
 ' > "$ORACLE_HOME_DIR/sessions/$slug/meta.json"
 mode_filter=""
-case "${PG_TEST_COMMIT_MODE:-complete}" in
+case "$mode" in
   partial) mode_filter='del(.error.details.commitProbe.prefixMatched)' ;;
   in-conversation) mode_filter='.error.details.commitProbe.inConversation = true' ;;
   conversation-id) mode_filter='.browser.runtime.conversationId = "fake-conversation"' ;;
@@ -3386,6 +3389,11 @@ case "${PG_TEST_COMMIT_MODE:-complete}" in
   new-turn) mode_filter='.error.details.commitProbe.hasNewTurn = true' ;;
   stop-visible) mode_filter='.error.details.commitProbe.stopVisible = true' ;;
   assistant-visible) mode_filter='.error.details.commitProbe.assistantVisible = true' ;;
+  whitespace-tab-url) mode_filter='.browser.runtime.tabUrl = " \t "' ;;
+  malformed-submitted) mode_filter='.browser.runtime.promptSubmitted = false | .error.details.runtime.promptSubmitted = "true"' ;;
+  error-runtime) mode_filter='del(.browser.runtime) | .error.details.runtime = {promptSubmitted: true, tabUrl: "https://chatgpt.com/"}' ;;
+  error-runtime-conversation-id) mode_filter='.error.details.runtime.conversationId = "fake-conversation"' ;;
+  error-runtime-tab-on-conversation) mode_filter='.error.details.runtime.tabUrl = "https://chatgpt.com/c/fake-conversation"' ;;
 esac
 if [ -n "$mode_filter" ]; then
   jq "$mode_filter" \
@@ -3705,15 +3713,44 @@ NC_SNAP="$(PRO_GATE_HOME="$NC_HOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; p
 check '#230 the attempt snapshot reads the released attempt as terminal, not recoverable' \
   "$(jq -e '.state=="recovery-exhausted" and .recoverable==false' <<<"$NC_SNAP" >/dev/null 2>&1; echo $?)" "snap=$NC_SNAP"
 
-# Planted negatives, one field each: any sign of a conversation, a prompt still in the editor (the
-# #66 late-send shape), missing or blank evidence, or metadata not bound to this run keeps today's
-# charged unknown-fate path — reattach, the live-review salvage budget, and no terminal disposition.
+# The release reads every attempt in the run. A retried run (attempt 1 provably never sent, which is
+# what allowed the retry; attempt 2 a send with no conversation) releases on the two records
+# together, and Oracle's error.details.runtime copy of the runtime fields counts the same as
+# browser.runtime. Only a provably unsent attempt is ever retried, so every earlier record in a run
+# reads unsubmitted and the last one decides.
+for NC_CASE in '108 pre-submit,complete 2' '109 error-runtime 1'; do
+  read -r NC_PR NC_MODE NC_N <<<"$NC_CASE"
+  run_noconv "$NC_PR" "$NC_MODE" https://chatgpt.com/
+  check "#230 no-conversation release ($NC_MODE) after $NC_N Oracle attempt(s) keeps the charge" \
+    "$([ "$NC_RC" -eq 6 ] && [ "$(cat "$NC_ATTEMPTS")" = "$NC_N" ] && [ ! -s "$NC_SESSIONS" ] && [ -n "$NC_MARKER" ] \
+       && jq -e '.terminal_kind=="recovery-exhausted" and .proof_kind=="no-conversation-after-send"' \
+            "$NC_HOME/attempt-dispositions/$NC_MARKER" >/dev/null 2>&1 \
+       && [ -s "$NC_HOME/rounds/$NC_RKEY" ] && ! grep -q 'refunding this round' "$TDIR/stderr" \
+       && [ ! -e "$NC_HOME/run-meta/$NC_MARKER" ]; echo $?)" \
+    "rc=$NC_RC attempts=$(cat "$NC_ATTEMPTS") sessions=$(cat "$NC_SESSIONS") disp=$(cat "$NC_HOME/attempt-dispositions/$NC_MARKER" 2>/dev/null) $(grep -E 'reattach|pre-retry|last-resort' "$TDIR/stderr")"
+done
+# A retried run whose second send did reach a conversation keeps today's charged hold. The last
+# attempt gets no pre-retry probe, so the reattach, which reads that attempt's own record, must run.
+run_noconv 110 pre-submit,in-conversation https://chatgpt.com/
+check '#230 a retried run whose second send reached a conversation keeps the charged unknown-fate path' \
+  "$([ "$NC_RC" -eq 6 ] && [ "$(cat "$NC_ATTEMPTS")" = 2 ] && [ -s "$NC_SESSIONS" ] && [ -n "$NC_MARKER" ] \
+     && [ ! -e "$NC_HOME/attempt-dispositions/$NC_MARKER" ] \
+     && [ -s "$NC_HOME/rounds/$NC_RKEY" ] && [ -e "$NC_HOME/run-meta/$NC_MARKER" ]; echo $?)" \
+  "rc=$NC_RC attempts=$(cat "$NC_ATTEMPTS") sessions=$(cat "$NC_SESSIONS") disp=$(cat "$NC_HOME/attempt-dispositions/$NC_MARKER" 2>/dev/null) $(grep -E 'reattach|pre-retry|last-resort' "$TDIR/stderr")"
+
+# Planted negatives, one field each: any sign of a conversation (in either runtime location), a
+# prompt still in the editor (the #66 late-send shape), missing, blank or whitespace-only evidence, a
+# malformed promptSubmitted (which must not buy a --force retry either), or metadata not bound to
+# this run keeps today's charged unknown-fate path — reattach, the live-review salvage budget, and
+# no terminal disposition.
 for NC_CASE in '97 in-conversation https://chatgpt.com/' '98 complete https://chatgpt.com/c/fake-conversation' \
                '99 conversation-id https://chatgpt.com/' '100 foreign-prompt https://chatgpt.com/' \
                '101 editor-holds-prompt https://chatgpt.com/' '102 no-editor-length https://chatgpt.com/' \
                '103 no-tab-url https://chatgpt.com/' '104 blank-tab-url https://chatgpt.com/' \
                '105 new-turn https://chatgpt.com/' '106 stop-visible https://chatgpt.com/' \
-               '107 assistant-visible https://chatgpt.com/'; do
+               '107 assistant-visible https://chatgpt.com/' '111 malformed-submitted,complete https://chatgpt.com/' \
+               '112 whitespace-tab-url https://chatgpt.com/' '113 error-runtime-conversation-id https://chatgpt.com/' \
+               '114 error-runtime-tab-on-conversation https://chatgpt.com/'; do
   read -r NC_PR NC_MODE NC_TAB <<<"$NC_CASE"
   run_noconv "$NC_PR" "$NC_MODE" "$NC_TAB"
   check "#230 planted negative ($NC_MODE, $NC_TAB) keeps the charged unknown-fate path" \

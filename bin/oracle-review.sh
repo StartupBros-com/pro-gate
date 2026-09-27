@@ -4190,13 +4190,20 @@ pg_oracle_attempt_meta() { # verified transcript proof -> exact Oracle session m
   ' "$meta" 2>/dev/null
 }
 
+# The one reading of an attempt's promptSubmitted flag, shared by the refund bar and the #230
+# outcome below. Oracle may record it under browser.runtime, error.details.runtime, or both; the
+# flag is the single boolean every recorded value agrees on. A malformed (non-boolean) value or two
+# values that disagree leave it unknown. Dropping the odd one out would turn a send of unknown fate
+# into "unsubmitted", which authorizes a --force retry and a refund.
+PG_JQ_PROMPT_SUBMITTED='def prompt_submitted:
+  [.browser.runtime.promptSubmitted?,.error.details.runtime.promptSubmitted?]
+  | map(select(. != null)) | select(length > 0 and all(type == "boolean"))
+  | unique | select(length == 1) | .[0];'
+
 pg_oracle_prompt_submitted_state() { # verified transcript proof -> true|false from exact Oracle session metadata
   local json state
   json="$(pg_oracle_attempt_meta "$1" "$2")" || return 1
-  state="$(jq -r '
-    [.browser.runtime.promptSubmitted?,.error.details.runtime.promptSubmitted?]
-    | map(select(type=="boolean")) | unique | select(length==1) | .[0]
-  ' <<<"$json" 2>/dev/null)" || return 1
+  state="$(jq -r "$PG_JQ_PROMPT_SUBMITTED"' prompt_submitted' <<<"$json" 2>/dev/null)" || return 1
   case "$state" in true|false) printf '%s\n' "$state";; *) return 1;; esac
 }
 
@@ -4209,14 +4216,13 @@ pg_oracle_prompt_submitted_state() { # verified transcript proof -> true|false f
 # only once, from a late send of a prompt still whole in the composer (pro-gate #66, editor 25330).
 # A prompt left in the editor can still go out, so an empty editor is required too; all 10 such
 # timeouts since 2026-09-07 had one. The turn/stop/assistant flags read false in both classes, so
-# they are required only as contrary evidence. Missing fields, blank or absent tab URLs, and
-# anything else fail.
+# they are required only as contrary evidence. Missing fields, blank, whitespace-only or absent tab
+# URLs, a malformed or disputed promptSubmitted, and anything else fail.
 pg_oracle_attempt_send_outcome() {
   local json
   json="$(pg_oracle_attempt_meta "$1" "$2")" || return 1
-  jq -er '
-    ([.browser.runtime.promptSubmitted?,.error.details.runtime.promptSubmitted?]
-      | map(select(type=="boolean")) | unique) as $submitted |
+  jq -er "$PG_JQ_PROMPT_SUBMITTED"'
+    [prompt_submitted] as $submitted |
     (.error.details.commitProbe? // {}) as $probe |
     ([.browser.runtime.conversationId?,.error.details.runtime.conversationId?]
       | map(select(. != null and . != ""))) as $conversation_ids |
@@ -4230,7 +4236,7 @@ pg_oracle_attempt_send_outcome() {
       and $probe.editorLength == 0
       and ($conversation_ids | length) == 0
       and ($tab_urls | length) > 0
-      and ($tab_urls | all(if type == "string" then (length > 0 and (test("/c/") | not)) else false end))
+      and ($tab_urls | all(if type == "string" then (test("\\S") and (test("/c/") | not)) else false end))
     then "no-conversation"
     else empty end
   ' <<<"$json" 2>/dev/null
@@ -4250,8 +4256,8 @@ pg_attempt_clean_scan() { # <marker-scan-rc>
 # pg_attempt_provably_unsubmitted <marker-scan-rc>: the ONE shared bar for a no-spend
 # retry/refund. Besides the clean-scan preconditions, every Oracle invocation must have a complete
 # digest-verified transcript bound to structured session metadata that says Send was never
-# dispatched. Missing, conflicting, or promptSubmitted=true metadata is ambiguous and therefore
-# remains charged.
+# dispatched. Missing, malformed, conflicting, or promptSubmitted=true metadata is ambiguous and
+# therefore remains charged.
 pg_attempt_provably_unsubmitted() {
   local scan_rc="${1:-}" i state
   pg_attempt_clean_scan "$scan_rc" || return 1
