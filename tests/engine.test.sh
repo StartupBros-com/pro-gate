@@ -3668,6 +3668,8 @@ check 'structured pre-submit terminalization removes mutable recovery state' \
 echo '# #230: a send that produced no ChatGPT conversation releases recovery, charge retained'
 NOCONV_REPO="$TDIR/noconv-repo"; git init -q "$NOCONV_REPO"; git -C "$NOCONV_REPO" remote add origin https://github.com/acme/noconv.git
 run_noconv() { # pr commit-mode tab-url -> NC_HOME NC_RC NC_MARKER NC_RKEY NC_ATTEMPTS NC_SESSIONS; stderr in $TDIR/stderr
+  # The fake Oracle exits at once and no case here tests watchdog timing, so a 1s watchdog poll
+  # replaces the 10s production poll that every attempt would otherwise sit out.
   NC_HOME="$TDIR/home-noconv-$1"; NC_ORACLE="$TDIR/oracle-noconv-$1"
   NC_ATTEMPTS="$TDIR/noconv-attempts-$1"; NC_SESSIONS="$TDIR/noconv-sessions-$1"; NC_RKEY="acme-noconv.git-$1"
   mkdir -p "$NC_HOME" "$NC_ORACLE"; : > "$NC_ATTEMPTS"; : > "$NC_SESSIONS"
@@ -3676,10 +3678,11 @@ run_noconv() { # pr commit-mode tab-url -> NC_HOME NC_RC NC_MARKER NC_RKEY NC_AT
     PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
     PRO_GATE_MAX_RETRIES=1 PRO_GATE_RETRY_BACKOFF=0 PRO_GATE_REATTACH_TIMEOUT=1 PRO_GATE_TIMEOUT_GRACE=1 \
     PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_PRE_RETRY_PROBE_SECS=1 PRO_GATE_SALVAGE_SECS=2 \
+    PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 \
     PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-commit-timeout" PG_TEST_ATTEMPTS_FILE="$NC_ATTEMPTS" \
     PG_TEST_SESSION_CALLS="$NC_SESSIONS" PG_TEST_COMMIT_MODE="$2" PG_TEST_TAB_URL="$3" \
     NODE_OPTIONS= bash "$ENGINE" --pr "$1" --repo "$NOCONV_REPO" --diff "$TDIR/small.diff" \
-    --out "$NC_HOME/o.md" --timeout 5s >"$TDIR/stdout" 2>"$TDIR/stderr"
+    --out "$NC_HOME/o.md" --timeout 2s >"$TDIR/stdout" 2>"$TDIR/stderr"
   NC_RC=$?
   NC_MARKER="$(jq -r .marker "$NC_HOME/o.md.status" 2>/dev/null)"
 }
@@ -3758,7 +3761,7 @@ for NC_CASE in '97 in-conversation https://chatgpt.com/' '98 complete https://ch
        && [ -n "$NC_MARKER" ] && [ ! -e "$NC_HOME/attempt-dispositions/$NC_MARKER" ] \
        && [ -s "$NC_HOME/rounds/$NC_RKEY" ] && [ -e "$NC_HOME/run-meta/$NC_MARKER" ] \
        && grep -q 'makes its fate ambiguous/spent' "$TDIR/stderr" \
-       && grep -q 'last-resort CDP tab salvage (marker .*, up to 6s)' "$TDIR/stderr"; echo $?)" \
+       && grep -q 'last-resort CDP tab salvage (marker .*, up to 3s)' "$TDIR/stderr"; echo $?)" \
     "rc=$NC_RC attempts=$(cat "$NC_ATTEMPTS") sessions=$(cat "$NC_SESSIONS") disp=$(cat "$NC_HOME/attempt-dispositions/$NC_MARKER" 2>/dev/null) $(grep -E 'reattach|pre-retry|last-resort' "$TDIR/stderr")"
 done
 
