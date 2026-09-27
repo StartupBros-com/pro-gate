@@ -3977,7 +3977,7 @@ LAUNCH_EPOCH="$(date +%s)"
 
 run_oracle() {  # $1 = browser model strategy (select|current|ignore)
   local strategy="$1" job started size last_size last_change now last_line prc watchdog_sleep_secs
-  local watchdog_term_drain_secs watchdog_force_settle_secs
+  local watchdog_slept watchdog_term_drain_secs watchdog_force_settle_secs
   local transcript="$WORK/oracle.${#ORACLE_LOG_TRANSCRIPTS[@]}.log"
   local proof="$WORK/oracle.${#ORACLE_LOG_TRANSCRIPTS[@]}.sha256"
   local producer_file="${transcript%.log}.pid" producer drained
@@ -4036,7 +4036,17 @@ run_oracle() {  # $1 = browser model strategy (select|current|ignore)
   job=$!
   started=$SECONDS; last_size=-1; last_change=$SECONDS
   while kill -0 "$job" 2>/dev/null; do
-    sleep "$watchdog_sleep_secs"
+    # #233: wait out the interval in 1s steps and stop as soon as the job exits. A single `sleep`
+    # held a finished Oracle for up to the whole interval (10s in production) before capture and
+    # salvage could start. The stall and no-think checks below keep their per-interval cadence
+    # while the job lives, and never run for a job that has already exited: an Oracle that exited
+    # on its own returns its own status and keeps its proof, instead of being relabelled
+    # watchdog-killed by one last check on a dead job.
+    watchdog_slept=0
+    while [ "$watchdog_slept" -lt "$watchdog_sleep_secs" ] && kill -0 "$job" 2>/dev/null; do
+      sleep 1; watchdog_slept=$((watchdog_slept + 1))
+    done
+    kill -0 "$job" 2>/dev/null || break
     [ -s "$CAPTURE_OUT" ] && continue   # findings are landing — let the run finish undisturbed
     size=$(wc -c < "$RUNLOG" 2>/dev/null) || size=0
     if [ "$size" != "$last_size" ]; then last_size="$size"; last_change=$SECONDS; fi

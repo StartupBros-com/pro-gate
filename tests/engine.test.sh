@@ -372,7 +372,7 @@ run_change_lock_wait_budget_tests() {
   env HOME="$TDIR/user" PRO_GATE_HOME="$wait_home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
     PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
     PRO_GATE_MAX_ROUNDS_PER_PR=1 PRO_GATE_LOCK_WAIT=2 PRO_GATE_TIMEOUT_GRACE=0 \
-    PRO_GATE_BROWSER_MODE=native PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 \
+    PRO_GATE_BROWSER_MODE=native PRO_GATE_TEST_MODE=ci-fixture \
     PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_ORACLE_COMPLETE=1 \
     PG_TEST_ORACLE_SENTINEL="$TDIR/wait-sizing-oracle.calls" NODE_OPTIONS= \
     bash "$ENGINE" --diff "$wait_diff" --repo "$TDIR" --out "$wait_home/holder.md" --timeout 10s \
@@ -385,7 +385,7 @@ run_change_lock_wait_budget_tests() {
   env HOME="$TDIR/user" PRO_GATE_HOME="$wait_home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
     PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
     PRO_GATE_MAX_ROUNDS_PER_PR=1 PRO_GATE_LOCK_WAIT=2 PRO_GATE_TIMEOUT_GRACE=0 \
-    PRO_GATE_BROWSER_MODE=native PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 \
+    PRO_GATE_BROWSER_MODE=native PRO_GATE_TEST_MODE=ci-fixture \
     PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_ORACLE_COMPLETE=1 \
     PG_TEST_ORACLE_SENTINEL="$TDIR/wait-sizing-oracle.calls" NODE_OPTIONS= \
     bash "$ENGINE" --diff "$wait_diff" --repo "$TDIR" --out "$wait_home/waiter.md" --timeout 10s \
@@ -469,7 +469,7 @@ PR_EVIDENCE_GH
       PRO_GATE_GH_BIN="$root/user/.local/bin/gh" PG_PR_TEST_METADATA="$root/pr.json" PG_PR_TEST_PATCH="$root/endpoint.patch" PG_PR_TEST_STALE_PATCH="$root/stale-pr.patch" \
       PG_PR_TEST_GH_CALLS="$root/gh.calls" PRO_GATE_BROWSER_MODE=native PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 \
       PRO_GATE_EARLY_PROBE_SECS=0 PRO_GATE_MAX_RETRIES=0 PRO_GATE_INPUT_POLICY=bundle-only \
-      PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 \
+      PRO_GATE_TEST_MODE=ci-fixture \
       PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_ORACLE_COMPLETE=1 \
       PG_TEST_ORACLE_SENTINEL="$home.oracle.calls" NODE_OPTIONS= \
       bash "$ENGINE" --pr "${PG_PR_TEST_PR:-https://github.com/acme/widgets/pull/221}" --repo "${PG_PR_TEST_REPO_ARG:-$repo}" "$@"
@@ -483,7 +483,7 @@ PR_EVIDENCE_GH
       PRO_GATE_GH_BIN="$root/user/.local/bin/gh" PG_PR_TEST_METADATA="$root/pr.json" PG_PR_TEST_PATCH="$root/endpoint.patch" PG_PR_TEST_STALE_PATCH="$root/stale-pr.patch" \
       PRO_GATE_BROWSER_MODE=native PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_EARLY_PROBE_SECS=0 \
       PRO_GATE_MAX_RETRIES=0 PRO_GATE_INPUT_POLICY=bundle-only PRO_GATE_TEST_MODE=ci-fixture \
-      PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" \
+      PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" \
       PG_TEST_ORACLE_COMPLETE=1 PG_TEST_ORACLE_SENTINEL="$root/oracle-$tracking.calls" PG_TEST_PAYLOAD_CAPTURE="$root/payload-$tracking.diff" NODE_OPTIONS= \
       bash "$ENGINE" --pr https://github.com/acme/widgets/pull/221 --repo "$repo" --out "$home/review.md" --timeout 10s \
       > "$root/$tracking.out" 2> "$root/$tracking.err"
@@ -1348,7 +1348,7 @@ conn150_run() { # home input pr out
   env HOME="$TDIR/user" PRO_GATE_HOME="$1" PRO_GATE_INPUT_POLICY=connector-enabled \
     ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 \
     PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 PRO_GATE_MAX_ROUNDS_PER_PR=1 \
-    PRO_GATE_LOCK_WAIT=2 PRO_GATE_TIMEOUT_GRACE=0 PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 \
+    PRO_GATE_LOCK_WAIT=2 PRO_GATE_TIMEOUT_GRACE=0 PRO_GATE_TEST_MODE=ci-fixture \
     PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_ORACLE_COMPLETE=1 NODE_OPTIONS= \
     PG_TEST_CONN150_BASE="$CONN150_BASE" PG_TEST_CONN150_HEAD="$CONN150_HEAD" \
     bash "$ENGINE" --pr "$3" --repo "$CONN150_REPO" --input "$2" --out "$4" --timeout 10s \
@@ -1383,7 +1383,7 @@ conn150_caller_run() { # home pr out
   env HOME="$TDIR/user" PRO_GATE_HOME="$1" PRO_GATE_INPUT_POLICY=connector-enabled \
     ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 \
     PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 PRO_GATE_MAX_ROUNDS_PER_PR=1 \
-    PRO_GATE_LOCK_WAIT=2 PRO_GATE_TIMEOUT_GRACE=0 PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 \
+    PRO_GATE_LOCK_WAIT=2 PRO_GATE_TIMEOUT_GRACE=0 PRO_GATE_TEST_MODE=ci-fixture \
     PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_ORACLE_COMPLETE=1 NODE_OPTIONS= \
     PG_TEST_CONN150_HEAD="$CONN150_HEAD" \
     bash "$ENGINE" --pr "$2" --repo "$CONN150_REPO" --diff "$TDIR/conn150-caller.diff" --input bundle --out "$3" --timeout 10s \
@@ -1444,7 +1444,7 @@ DIVERGE161_HOME="$TDIR/home-diverge161"
 env HOME="$TDIR/user" PRO_GATE_HOME="$DIVERGE161_HOME" PRO_GATE_INPUT_POLICY=connector-enabled \
   ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 \
   PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 PRO_GATE_MAX_ROUNDS_PER_PR=1 \
-  PRO_GATE_LOCK_WAIT=2 PRO_GATE_TIMEOUT_GRACE=0 PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 \
+  PRO_GATE_LOCK_WAIT=2 PRO_GATE_TIMEOUT_GRACE=0 PRO_GATE_TEST_MODE=ci-fixture \
   PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_ORACLE_COMPLETE=1 NODE_OPTIONS= \
   PRO_GATE_GH_BIN="$DIVERGE161_GH" PG_TEST_GH_CALLS="$DIVERGE161_GH_CALLS" PG_TEST_GH_HEAD="$DIVERGE161_HEAD" \
   bash "$ENGINE" --pr 94 --repo "$DIVERGE161_REPO" --diff "$TDIR/diverge161.diff" --input bundle --out "$TDIR/diverge161-out.md" --timeout 10s \
@@ -1499,7 +1499,7 @@ CPMISS_HOME="$TDIR/home-cpmiss"
 env HOME="$TDIR/user" PRO_GATE_HOME="$CPMISS_HOME" PRO_GATE_INPUT_POLICY=connector-enabled \
   ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 \
   PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 PRO_GATE_MAX_ROUNDS_PER_PR=1 \
-  PRO_GATE_LOCK_WAIT=2 PRO_GATE_TIMEOUT_GRACE=0 PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 \
+  PRO_GATE_LOCK_WAIT=2 PRO_GATE_TIMEOUT_GRACE=0 PRO_GATE_TEST_MODE=ci-fixture \
   PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-preflight" PG_TEST_ORACLE_COMPLETE=1 NODE_OPTIONS= \
   PRO_GATE_GH_BIN="$TDIR/bin/no-such-gh-binary" \
   bash "$ENGINE" --pr https://github.com/acme/conn150/pull/96 --repo "$CONN150_REPO" --diff "$TDIR/conn150-caller.diff" --input bundle --out "$TDIR/cpmiss-out.md" --timeout 10s \
@@ -3668,8 +3668,6 @@ check 'structured pre-submit terminalization removes mutable recovery state' \
 echo '# #230: a send that produced no ChatGPT conversation releases recovery, charge retained'
 NOCONV_REPO="$TDIR/noconv-repo"; git init -q "$NOCONV_REPO"; git -C "$NOCONV_REPO" remote add origin https://github.com/acme/noconv.git
 run_noconv() { # pr commit-mode tab-url -> NC_HOME NC_RC NC_MARKER NC_RKEY NC_ATTEMPTS NC_SESSIONS; stderr in $TDIR/stderr
-  # The fake Oracle exits at once and no case here tests watchdog timing, so a 1s watchdog poll
-  # replaces the 10s production poll that every attempt would otherwise sit out.
   NC_HOME="$TDIR/home-noconv-$1"; NC_ORACLE="$TDIR/oracle-noconv-$1"
   NC_ATTEMPTS="$TDIR/noconv-attempts-$1"; NC_SESSIONS="$TDIR/noconv-sessions-$1"; NC_RKEY="acme-noconv.git-$1"
   mkdir -p "$NC_HOME" "$NC_ORACLE"; : > "$NC_ATTEMPTS"; : > "$NC_SESSIONS"
@@ -3678,7 +3676,6 @@ run_noconv() { # pr commit-mode tab-url -> NC_HOME NC_RC NC_MARKER NC_RKEY NC_AT
     PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
     PRO_GATE_MAX_RETRIES=1 PRO_GATE_RETRY_BACKOFF=0 PRO_GATE_REATTACH_TIMEOUT=1 PRO_GATE_TIMEOUT_GRACE=1 \
     PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_PRE_RETRY_PROBE_SECS=1 PRO_GATE_SALVAGE_SECS=2 \
-    PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 \
     PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-commit-timeout" PG_TEST_ATTEMPTS_FILE="$NC_ATTEMPTS" \
     PG_TEST_SESSION_CALLS="$NC_SESSIONS" PG_TEST_COMMIT_MODE="$2" PG_TEST_TAB_URL="$3" \
     NODE_OPTIONS= bash "$ENGINE" --pr "$1" --repo "$NOCONV_REPO" --diff "$TDIR/small.diff" \
@@ -9934,5 +9931,52 @@ check '#236 a legacy record with no lifecycle field keeps its seven-field shape'
   "$([ "$SW_MISS_LEGACY" = 'retained 1/3' ] \
      && awk -F'\t' 'NR==1{exit !(NF==7 && $4==1 && $7==1700014471)}' "$SW_MISS_HOME/in-progress/pg-run-miss-legacy-1700014471-1"; echo $?)" \
   "miss=$SW_MISS_LEGACY record=$(cat "$SW_MISS_HOME/in-progress/pg-run-miss-legacy-1700014471-1")"
+
+# #233: the watchdog slept its whole poll before it looked at Oracle again, so a finished Oracle was
+# held for up to 10s before capture could start. At the production poll (test knob unset) an Oracle
+# that exits at once must leave the slot phase in less than one poll; before the fix it could not
+# take less than the full 10s.
+echo '# #233: an Oracle that exits at once is not held for the rest of the watchdog poll'
+WD233_HOME="$TDIR/home-wd233"; mkdir -p "$WD233_HOME"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+start_mock "$TDIR/tab.txt"
+env -u PRO_GATE_TEST_MODE -u PRO_GATE_TEST_WATCHDOG_SLEEP_SECS PRO_GATE_HOME="$WD233_HOME" \
+  ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 \
+  PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-ok" NODE_OPTIONS= \
+  bash "$ENGINE" --diff "$TDIR/small.diff" --repo "$TDIR" --out "$WD233_HOME/o.md" --timeout 30s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+WD233_ROW="$(grep -F "\"out\":\"$WD233_HOME/o.md\"" "$WD233_HOME/ledger.jsonl" 2>/dev/null | tail -1)"
+WD233_POST="$(printf '%s' "$WD233_ROW" | jq -r '.post_slot_secs // "MISSING"' 2>/dev/null)"
+check '#233 an Oracle that exits at once still completes the run at the production poll' \
+  "$([ "$RC" -eq 0 ] && [ -s "$WD233_HOME/o.md" ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
+check '#233 that run leaves the slot phase in less than one 10s watchdog poll' \
+  "$(case "$WD233_POST" in ''|*[!0-9]*) echo 1;; *) [ "$WD233_POST" -lt 10 ]; echo $?;; esac)" \
+  "post_slot_secs=$WD233_POST row=$WD233_ROW"
+# The loop's other change: the stall and no-think checks never judge a job that has already exited.
+# Before, they ran once more after the sleep, so an Oracle that printed its "no thinking status
+# detected" line and then exited by itself was relabelled watchdog-killed and lost its transcript
+# proof. This case exercises the watchdog itself, so it keeps the 1s test poll.
+cat > "$TDIR/bin/oracle-nothink-exit" <<'FAKE_NOTHINK_EXIT'
+#!/usr/bin/env bash
+[ "${1:-}" = session ] && exit 1
+echo 'no thinking status detected'
+exit 1
+FAKE_NOTHINK_EXIT
+chmod +x "$TDIR/bin/oracle-nothink-exit"
+WD233X_HOME="$TDIR/home-wd233-exit"; mkdir -p "$WD233X_HOME"
+env PRO_GATE_HOME="$WD233X_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 PRO_GATE_NOTHINK_SECS=0 \
+  PRO_GATE_REATTACH_TIMEOUT=1 PRO_GATE_SALVAGE_SECS=2 PRO_GATE_TIMEOUT_GRACE=1 \
+  PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 \
+  PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-nothink-exit" NODE_OPTIONS= \
+  bash "$ENGINE" --diff "$TDIR/small.diff" --repo "$TDIR" --out "$WD233X_HOME/o.md" --timeout 5s \
+  >"$TDIR/stdout" 2>"$TDIR/stderr"
+RC=$?
+check '#233 control: the self-exiting Oracle ran and its output reached the log' \
+  "$(grep -qF '[oracle] no thinking status detected' "$TDIR/stderr"; echo $?)" "rc=$RC $(tail -4 "$TDIR/stderr")"
+check '#233 an Oracle that exited by itself is not relabelled watchdog-killed' \
+  "$(! grep -qF 'watchdog: ChatGPT never started thinking' "$TDIR/stderr"; echo $?)" \
+  "rc=$RC $(grep -F 'watchdog' "$TDIR/stderr" | tail -3)"
 
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }
