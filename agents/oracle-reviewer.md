@@ -104,6 +104,10 @@ Dispatch all eight closed actions:
   the answer. For `rounds-not-converging`, the open-P0/P1 trajectory (`.facts.governor.arrow`) has
   not shrunk for 2 consecutive re-reviews; this replaces a new round grant or a fix dispatch and
   fires regardless of round-policy mode. `PRO_GATE_ROUNDS_CONTINUE=1` lets one more round through.
+  For `delivery-failed-unchanged`, relay `.facts.delivery.failed_unchanged`: that many attempts in
+  a row were proven never sent under an unchanged evidence, input mode, attachment policy and
+  Oracle build. Waiting does not change it; a new head, a changed attachment policy or input mode,
+  a new Oracle build, or an operator's one-run `PRO_GATE_FORCE_ROUND=1` does.
 - `report-only` / `allow-existing-merge-workflow`: prepare current PR evidence in a new directory
   and re-query with it immediately before handoff; cached evidence is not a GitHub freshness check.
   Keep scoped payload/lineage separate. The relay has no merge authority.

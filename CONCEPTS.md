@@ -84,6 +84,10 @@ The deployment-level rule that controls whether Pro-Gate supplies only the revie
 
 The engine-wide back-off that follows any proof that ChatGPT is rate-limiting the review account: the short interstitial page, the "Too many requests" modal painted over a live conversation, or a Cloudflare challenge. While it runs, no fresh review is submitted, reservation probes and organizer traffic stay off the account, harvest defers, and the Review Decision reports `account-cooldown-active` with the seconds remaining instead of a grant. A probe that finds a conversation under the modal reports `throttled`: the conversation exists, is not progressing, and is not evidence of absence.
 
+### Delivery Condition
+
+The circumstances a fresh review's Send was attempted under: the exact evidence relation, the input mode, the attachment policy, and the installed Oracle build. When Oracle's own session record proves an attempt's Send was never dispatched, its refund records the condition and how many such attempts in a row it has produced for the change; a sent attempt, a review, or a different condition in between starts the count again. Two in a row produce the typed stop `delivery-failed-unchanged` in place of another grant, because the next identical attempt would fail the same way. A change to the condition, or the operator's one-invocation `PRO_GATE_FORCE_ROUND=1`, grants again. A Cloudflare challenge is an Account Cooldown, not a delivery failure, and is not counted.
+
 ### Throttle Sighting
 
 An observation of a rate-limit surface, the "Too many requests" modal or the short interstitial, over a conversation tab during a salvage scan. A sighting is owned when the conversation under the surface carries this run's own marker, foreign when it provably carries another run's marker, and unowned otherwise.

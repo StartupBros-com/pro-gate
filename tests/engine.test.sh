@@ -6923,10 +6923,12 @@ check 'unknown decision contract stops closed' \
 # exact digests now in PG_REVIEW_DECISION_COMPATIBLE_CONTRACT_DIGESTS — is still rejected here.
 PG214_PRED_A='bf36fdb5f8625e917be0539ca014fec518649d1160584846aca1cb9149533abb'
 PG214_PRED_B='7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee'
+# #204's additive delivery-failed-unchanged reason and facts.delivery key retired this digest.
+PG214_PRED_C='5fcd19c12600061af6d90ed9cb980dd7067cff199c374910639003eec4caf5c3'
 PG214_UNKNOWN_CD='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
-check 'the compiled binding-record compatibility list is exactly the two predecessor contract digests' \
-  "$(jq -ne --arg a "$PG214_PRED_A" --arg b "$PG214_PRED_B" --argjson got "$(pg_review_decision_compatible_contract_digests_json)" \
-      '$got == ([$a,$b]|sort)' >/dev/null 2>&1; echo $?)" \
+check 'the compiled binding-record compatibility list is exactly the three predecessor contract digests' \
+  "$(jq -ne --arg a "$PG214_PRED_A" --arg b "$PG214_PRED_B" --arg c "$PG214_PRED_C" --argjson got "$(pg_review_decision_compatible_contract_digests_json)" \
+      '$got == ([$a,$b,$c]|sort)' >/dev/null 2>&1; echo $?)" \
   "$(pg_review_decision_compatible_contract_digests_json)"
 PG214_ENV_PRED_FACTS="$(rd_facts '{}')"; PG214_ENV_PRED_FACTS="$(jq -cS --arg cd "$PG214_PRED_A" '.contract.contract_digest=$cd' <<<"$PG214_ENV_PRED_FACTS")"
 PG214_ENV_PRED_OUT="$(rd_reduce "$PG214_ENV_PRED_FACTS")"
@@ -7755,6 +7757,160 @@ fresh_effect "$TDIR/fresh-leading-zero.json" "$TDIR/fresh-leading-zero.md" 077
 check 'leading-zero recovery effect remains stable without a duplicate spend' \
   "$([ "$FRESH_RC" -eq 0 ] && [ "$(wc -l < "$FRESH_HOME/rounds/$FRESH_KEY")" -eq 1 ] && jq -e --arg marker "$FRESH_UNKNOWN_MARKER" '.action=="recover-existing-review" and .effect_request.applicable_ref==$marker' "$TDIR/fresh.stdout" >/dev/null 2>&1; echo $?)" \
   "rc=$FRESH_RC stdout=$(cat "$TDIR/fresh.stdout") stderr=$(cat "$TDIR/fresh.stderr")"
+
+# #204: a review-decision fresh effect whose Send is proven never dispatched is refunded, and the
+# next query used to grant the identical run again, so an undeliverable attachment repeated until
+# the caller's time budget ran out. The refund now records the delivery condition (relation, input
+# mode, attachment policy, Oracle build); two proven no-sends in a row under one condition stop
+# typed, and a changed condition or the operator's one-run override grants again.
+echo '# #204: an unchanged failed delivery stops instead of repeating'
+cat > "$TDIR/fresh-bin/oracle-undelivered" <<'UNDELIVERED_ORACLE'
+#!/usr/bin/env bash
+if [ "${1:-}" = --version ]; then printf '%s\n' "${PG_TEST_ORACLE_VERSION:-0.0.0-fixture}"; exit 0; fi
+exec "${PG_TEST_UNDELIVERED_DELEGATE:?}" "$@"
+UNDELIVERED_ORACLE
+chmod +x "$TDIR/fresh-bin/oracle-undelivered"
+UNDELIVERED_ORACLE_HOME="$TDIR/oracle-undelivered"
+undelivered_query() { # [VAR=value ...]
+  env PRO_GATE_HOME="$FRESH_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" \
+    PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/fresh-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/fresh-endpoint.patch" \
+    PRO_GATE_ORACLE_BIN="$TDIR/fresh-bin/oracle-undelivered" "$@" \
+    bash "$ENGINE" --review-decision --repo "$FRESH_REPO" --pr 77 --diff "$TDIR/fresh-effect.patch" --input bundle
+}
+undelivered_effect() { # decision-file out [VAR=value ...]
+  local decision="$1" out="$2"; shift 2
+  env PATH="$TDIR/fresh-bin:$PATH" PRO_GATE_HOME="$FRESH_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" \
+    PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/fresh-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/fresh-endpoint.patch" \
+    ORACLE_HOME_DIR="$UNDELIVERED_ORACLE_HOME" ORACLE_BROWSER_PORT="$PORT" \
+    PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
+    PRO_GATE_MAX_RETRIES=0 PRO_GATE_RETRY_BACKOFF=0 PRO_GATE_REATTACH_TIMEOUT=1 PRO_GATE_SALVAGE_SECS=2 PRO_GATE_EARLY_PROBE_SECS=0 \
+    PRO_GATE_ORACLE_BIN="$TDIR/fresh-bin/oracle-undelivered" PG_TEST_UNDELIVERED_DELEGATE="$TDIR/bin/oracle-commit-timeout" \
+    PG_TEST_ATTEMPTS_FILE="$TDIR/undelivered-attempts" PG_TEST_COMMIT_MODE=pre-submit NODE_OPTIONS= "$@" \
+    bash "$ENGINE" --review-decision --review-decision-effect "$decision" --repo "$FRESH_REPO" --pr 77 \
+      --diff "$TDIR/fresh-effect.patch" --input bundle --out "$out" --timeout 5s \
+    >"$TDIR/undelivered.stdout" 2>"$TDIR/undelivered.stderr"
+  UNDELIVERED_RC=$?
+}
+undelivered_attempts() { cat "$TDIR/undelivered-attempts" 2>/dev/null || echo 0; }
+fresh_reset_state
+rm -rf "$UNDELIVERED_ORACLE_HOME"; mkdir -p "$UNDELIVERED_ORACLE_HOME"; : > "$TDIR/undelivered-attempts"
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+start_mock "$TDIR/tab.txt" "$ORGANIZER_STATE"
+UNDELIVERED_Q1="$(undelivered_query)"; printf '%s\n' "$UNDELIVERED_Q1" > "$TDIR/undelivered-q1.json"
+check '#204: a change with no failed delivery is granted, and facts.delivery counts zero' \
+  "$(jq -e '.action=="run-granted-review" and .facts.delivery=={failed_unchanged:0,override:false}' <<<"$UNDELIVERED_Q1" >/dev/null 2>&1; echo $?)" "$UNDELIVERED_Q1"
+undelivered_effect "$TDIR/undelivered-q1.json" "$TDIR/undelivered-1.md"
+UNDELIVERED_M1="$(jq -r .marker "$TDIR/undelivered-1.md.status" 2>/dev/null)"
+UNDELIVERED_R1="$(PRO_GATE_HOME="$FRESH_HOME" pg_delivery_condition_read "$UNDELIVERED_M1" 2>/dev/null || true)"
+check '#204: a proven no-send effect is refunded and records its delivery condition as the first in a row' \
+  "$([ "$UNDELIVERED_RC" -eq 6 ] && [ "$(undelivered_attempts)" = 1 ] \
+     && jq -e '.terminal_kind=="not-submitted" and .proof_kind=="proven-no-submit"' "$FRESH_HOME/attempt-dispositions/$UNDELIVERED_M1" >/dev/null 2>&1 \
+     && jq -e --arg key "$FRESH_KEY" '.consecutive==1 and .round_key==$key' <<<"$UNDELIVERED_R1" >/dev/null 2>&1; echo $?)" \
+  "rc=$UNDELIVERED_RC attempts=$(undelivered_attempts) marker=$UNDELIVERED_M1 record=$UNDELIVERED_R1 stderr=$(tail -6 "$TDIR/undelivered.stderr")"
+UNDELIVERED_Q2="$(undelivered_query)"; printf '%s\n' "$UNDELIVERED_Q2" > "$TDIR/undelivered-q2.json"
+check '#204: one failed delivery still grants a fresh run, with the failure counted' \
+  "$(jq -e '.action=="run-granted-review" and .facts.delivery=={failed_unchanged:1,override:false}' <<<"$UNDELIVERED_Q2" >/dev/null 2>&1; echo $?)" "$UNDELIVERED_Q2"
+undelivered_effect "$TDIR/undelivered-q2.json" "$TDIR/undelivered-2.md"
+UNDELIVERED_M2="$(jq -r .marker "$TDIR/undelivered-2.md.status" 2>/dev/null)"
+UNDELIVERED_R2="$(PRO_GATE_HOME="$FRESH_HOME" pg_delivery_condition_read "$UNDELIVERED_M2" 2>/dev/null || true)"
+check '#204: a second proven no-send under the same condition records the second in a row' \
+  "$([ "$UNDELIVERED_RC" -eq 6 ] && [ "$UNDELIVERED_M2" != "$UNDELIVERED_M1" ] \
+     && jq -e --argjson first "$UNDELIVERED_R1" '.consecutive==2 and .condition_digest==$first.condition_digest' <<<"$UNDELIVERED_R2" >/dev/null 2>&1; echo $?)" \
+  "rc=$UNDELIVERED_RC marker=$UNDELIVERED_M2 record=$UNDELIVERED_R2 first=$UNDELIVERED_R1"
+UNDELIVERED_Q3="$(undelivered_query)"
+check '#204: two failed deliveries under an unchanged condition stop typed instead of granting a third run' \
+  "$(jq -e '.action=="stop-without-new-review" and .reason=="delivery-failed-unchanged" and .effect_request.execution_class=="report-only" and .facts.delivery=={failed_unchanged:2,override:false}' <<<"$UNDELIVERED_Q3" >/dev/null 2>&1; echo $?)" "$UNDELIVERED_Q3"
+undelivered_effect "$TDIR/undelivered-q2.json" "$TDIR/undelivered-stale.md"
+check '#204: a grant saved before the second failure is replaced by the stop, with no Oracle dispatch' \
+  "$([ "$UNDELIVERED_RC" -eq 0 ] && [ "$(undelivered_attempts)" = 2 ] \
+     && jq -e '.action=="stop-without-new-review" and .reason=="delivery-failed-unchanged"' "$TDIR/undelivered.stdout" >/dev/null 2>&1; echo $?)" \
+  "rc=$UNDELIVERED_RC attempts=$(undelivered_attempts) stdout=$(cat "$TDIR/undelivered.stdout") stderr=$(tail -4 "$TDIR/undelivered.stderr")"
+UNDELIVERED_NEVER="$(undelivered_query PRO_GATE_BROWSER_ATTACHMENTS=never)"
+check '#204: a changed attachment policy is a changed condition and grants again' \
+  "$(jq -e '.action=="run-granted-review" and .facts.delivery.failed_unchanged==0' <<<"$UNDELIVERED_NEVER" >/dev/null 2>&1; echo $?)" "$UNDELIVERED_NEVER"
+UNDELIVERED_BUILD="$(undelivered_query PG_TEST_ORACLE_VERSION=0.0.1-fixture)"
+check '#204: a different Oracle build is a changed condition and grants again' \
+  "$(jq -e '.action=="run-granted-review" and .facts.delivery.failed_unchanged==0' <<<"$UNDELIVERED_BUILD" >/dev/null 2>&1; echo $?)" "$UNDELIVERED_BUILD"
+UNDELIVERED_FORCE="$(undelivered_query PRO_GATE_FORCE_ROUND=1)"; printf '%s\n' "$UNDELIVERED_FORCE" > "$TDIR/undelivered-force.json"
+check '#204: the operator one-run override grants again and is carried in facts, not re-read by the reducer' \
+  "$(jq -e '.action=="run-granted-review" and .facts.delivery=={failed_unchanged:2,override:true}' <<<"$UNDELIVERED_FORCE" >/dev/null 2>&1; echo $?)" "$UNDELIVERED_FORCE"
+undelivered_effect "$TDIR/undelivered-force.json" "$TDIR/undelivered-3.md" PRO_GATE_FORCE_ROUND=1
+UNDELIVERED_M3="$(jq -r .marker "$TDIR/undelivered-3.md.status" 2>/dev/null)"
+check '#204: the dispatch recheck honours the same override, and the third no-send continues the count' \
+  "$([ "$UNDELIVERED_RC" -eq 6 ] && [ "$(undelivered_attempts)" = 3 ] \
+     && jq -e '.consecutive==3' <<<"$(PRO_GATE_HOME="$FRESH_HOME" pg_delivery_condition_read "$UNDELIVERED_M3" 2>/dev/null)" >/dev/null 2>&1; echo $?)" \
+  "rc=$UNDELIVERED_RC attempts=$(undelivered_attempts) marker=$UNDELIVERED_M3 stderr=$(tail -6 "$TDIR/undelivered.stderr")"
+
+# #204 library: the count is a chain over the attempt snapshot's own precedence, the facts builder
+# probes Oracle only when a record could match, and the record is write-once and swept with its
+# disposition.
+DC_HOME="$TDIR/home-delivery-condition"; mkdir -p "$DC_HOME"
+DC_KEY='acme-dc-5'
+DC_M1='pg-run-acme-dc-5-1700020001-1'; DC_M2='pg-run-acme-dc-5-1700020002-2'; DC_M3='pg-run-acme-dc-5-1700020003-3'
+DC_S4='pg-run-acme-dc-5-1700020004-4'; DC_M5='pg-run-acme-dc-5-1700020005-5'
+cat > "$TDIR/bin/oracle-version-fixture" <<'ORACLE_VERSION_FIXTURE'
+#!/usr/bin/env bash
+[ "${1:-}" = --version ] || { printf 'unexpected oracle invocation\n' >&2; exit 99; }
+printf '%b' "${PG_TEST_VERSION_TEXT-1.0\n}"
+ORACLE_VERSION_FIXTURE
+chmod +x "$TDIR/bin/oracle-version-fixture"
+DC_D="$(pg_delivery_condition_digest relation:aaa bundle auto 1.0)"
+DC_D2="$(pg_delivery_condition_digest relation:aaa bundle never 1.0)"
+check '#204: the delivery-condition digest changes with the attachment policy' \
+  "$([ -n "$DC_D" ] && [ "$DC_D" != "$DC_D2" ]; echo $?)" "d=$DC_D d2=$DC_D2"
+PRO_GATE_HOME="$DC_HOME" pg_attempt_disposition_write github.com acme dc 5 "$DC_KEY" "$DC_M1" 1700020001 not-submitted proven-no-submit
+PRO_GATE_HOME="$DC_HOME" pg_delivery_condition_write "$DC_M1" "$DC_KEY" "$DC_D" 1
+PRO_GATE_HOME="$DC_HOME" pg_delivery_condition_record github.com acme dc 5 "$DC_KEY" "$DC_M2" "$DC_D"
+check '#204: a proven no-send right after one under the same condition continues the count' \
+  "$(jq -e '.consecutive==2' <<<"$(PRO_GATE_HOME="$DC_HOME" pg_delivery_condition_read "$DC_M2")" >/dev/null 2>&1; echo $?)" \
+  "$(PRO_GATE_HOME="$DC_HOME" pg_delivery_condition_read "$DC_M2" 2>&1)"
+PRO_GATE_HOME="$DC_HOME" pg_attempt_disposition_write github.com acme dc 5 "$DC_KEY" "$DC_M2" 1700020002 not-submitted proven-no-submit
+PRO_GATE_HOME="$DC_HOME" pg_delivery_condition_record github.com acme dc 5 "$DC_KEY" "$DC_M3" "$DC_D2"
+check '#204: a proven no-send under a changed condition starts the count again' \
+  "$(jq -e '.consecutive==1' <<<"$(PRO_GATE_HOME="$DC_HOME" pg_delivery_condition_read "$DC_M3")" >/dev/null 2>&1; echo $?)" \
+  "$(PRO_GATE_HOME="$DC_HOME" pg_delivery_condition_read "$DC_M3" 2>&1)"
+PRO_GATE_HOME="$DC_HOME" pg_attempt_disposition_write github.com acme dc 5 "$DC_KEY" "$DC_S4" 1700020004 recovery-exhausted no-conversation-after-send
+PRO_GATE_HOME="$DC_HOME" pg_delivery_condition_record github.com acme dc 5 "$DC_KEY" "$DC_M5" "$DC_D"
+check '#204: a sent attempt between two no-sends breaks the run even when the condition matches' \
+  "$(jq -e '.consecutive==1' <<<"$(PRO_GATE_HOME="$DC_HOME" pg_delivery_condition_read "$DC_M5")" >/dev/null 2>&1; echo $?)" \
+  "$(PRO_GATE_HOME="$DC_HOME" pg_delivery_condition_read "$DC_M5" 2>&1)"
+check '#204: a record is write-once; a different count for the same marker is refused and changes nothing' \
+  "$(! PRO_GATE_HOME="$DC_HOME" pg_delivery_condition_write "$DC_M2" "$DC_KEY" "$DC_D" 9 \
+     && PRO_GATE_HOME="$DC_HOME" pg_delivery_condition_write "$DC_M2" "$DC_KEY" "$DC_D" 2 \
+     && jq -e '.consecutive==2' <<<"$(PRO_GATE_HOME="$DC_HOME" pg_delivery_condition_read "$DC_M2")" >/dev/null 2>&1; echo $?)"
+printf '{"condition_digest":"%s","consecutive":0,"marker":"pg-run-acme-dc-5-1700020006-6","record_type":"review-delivery-condition/v1","record_version":1,"round_key":"acme-dc-5"}' "$DC_D" \
+  > "$DC_HOME/delivery-conditions/pg-run-acme-dc-5-1700020006-6"
+check '#204: a malformed record (zero count) is not read' \
+  "$(! PRO_GATE_HOME="$DC_HOME" pg_delivery_condition_read pg-run-acme-dc-5-1700020006-6 >/dev/null 2>&1; echo $?)"
+DC_SNAP_M2="$(jq -cn --arg m "$DC_M2" '{source:"disposition",state:"not-submitted",fresh_eligible:true,marker:$m}')"
+dc_facts() { # snapshot relation [VAR=value ...]
+  local snap="$1" rel="$2"; shift 2
+  env PRO_GATE_HOME="$DC_HOME" PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-version-fixture" "$@" \
+    bash -c '. "$1"; pg_delivery_facts_json "$2" "$3" bundle' _ "$LIB" "$snap" "$rel"
+}
+check '#204: facts.delivery reports the newest no-send count when its condition still matches' \
+  "$([ "$(dc_facts "$DC_SNAP_M2" relation:aaa)" = '{"failed_unchanged":2,"override":false}' ]; echo $?)" "$(dc_facts "$DC_SNAP_M2" relation:aaa 2>&1)"
+check '#204: facts.delivery is zero under a changed attachment policy, a changed Oracle build, or no current relation' \
+  "$([ "$(dc_facts "$DC_SNAP_M2" relation:aaa PRO_GATE_BROWSER_ATTACHMENTS=never)" = '{"failed_unchanged":0,"override":false}' ] \
+     && [ "$(dc_facts "$DC_SNAP_M2" relation:aaa 'PG_TEST_VERSION_TEXT=2.0\n')" = '{"failed_unchanged":0,"override":false}' ] \
+     && [ "$(dc_facts "$DC_SNAP_M2" '')" = '{"failed_unchanged":0,"override":false}' ]; echo $?)"
+check '#204: facts.delivery is zero when the newest attempt is not a proven no-send' \
+  "$([ "$(dc_facts "$(jq -cn --arg m "$DC_M2" '{source:"artifact",state:"review-ready",fresh_eligible:false,marker:$m}')" relation:aaa)" = '{"failed_unchanged":0,"override":false}' ]; echo $?)"
+check '#204: PRO_GATE_FORCE_ROUND=1 is resolved into delivery.override' \
+  "$([ "$(dc_facts "$DC_SNAP_M2" relation:aaa PRO_GATE_FORCE_ROUND=1)" = '{"failed_unchanged":2,"override":true}' ]; echo $?)"
+check '#204: the Oracle identity is its bounded, single-line --version, or unknown when it cannot be read' \
+  "$([ "$(PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-version-fixture" PG_TEST_VERSION_TEXT='0.20.0-sb.4\nsecond line\n' pg_oracle_identity)" = 0.20.0-sb.4 ] \
+     && [ "$(PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-version-fixture" PG_TEST_VERSION_TEXT='' pg_oracle_identity)" = unknown ] \
+     && [ "$(PRO_GATE_ORACLE_BIN="$TDIR/no-such-oracle" pg_oracle_identity)" = unknown ] \
+     && [ "$(PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-version-fixture" PG_TEST_VERSION_TEXT='v1 (a b)$\n' pg_oracle_identity)" = v1ab ]; echo $?)"
+mkdir -p "$DC_HOME/delivery-conditions"
+printf 'x' > "$DC_HOME/delivery-conditions/pg-run-acme-dc-5-1700020007-7"
+touch -d '3 days ago' "$DC_HOME/delivery-conditions/pg-run-acme-dc-5-1700020007-7" "$DC_HOME/delivery-conditions/$DC_M5"
+PRO_GATE_HOME="$DC_HOME" pg_attempt_disposition_sweep
+check '#204: the sweep removes an old record with no disposition and keeps one beside its disposition' \
+  "$([ ! -e "$DC_HOME/delivery-conditions/pg-run-acme-dc-5-1700020007-7" ] && [ -e "$DC_HOME/delivery-conditions/$DC_M2" ] \
+     && [ ! -e "$DC_HOME/delivery-conditions/$DC_M5" ]; echo $?)" \
+  "left=$(find "$DC_HOME/delivery-conditions" -type f -printf '%f ' 2>/dev/null)"
 
 # A review bound to an older head, or to a PR GitHub proves merged/closed, is obsolete rather than
 # unsubmitted. Exact recovery moves only its reservation to the monotonic non-capacity state; the
