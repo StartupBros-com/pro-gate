@@ -151,7 +151,8 @@ contract/corpus mismatch, stop through the update path and never fall back to a 
 Recovery never launches a fresh review. Relay exactly one plain state: **Review ready**,
 **Checking for completed review**, **Still working**, **Review superseded**, **No review remains**,
 or **Browser needs attention**. `Review superseded` retains the charge and optional audit harvest but
-releases old-head/closed-PR capacity; `No review remains` is terminal no-review proof. Re-query the
+releases old-head/closed-PR capacity; a fresh run waiting for a slot applies the same proof itself.
+`No review remains` is terminal no-review proof. Re-query the
 typed decision after either state. Historical literal-`diff` keys migrate only inside exact
 proof-backed supersession; a pre-v0.31 empty spend is filled only after exact immutable binding and
 canonical run metadata are revalidated under the reservation lock. Marker mint time is not charge

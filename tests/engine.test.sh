@@ -1304,7 +1304,7 @@ unset PG_TEST_ORACLE_SENTINEL PG_TEST_ORACLE_COMPLETE PG_TEST_PROMPT_CAPTURE
 # of INPUT. FILE_ARGS only attaches the fetched endpoint patch for INPUT=bundle|both, so an
 # INPUT=connector classic run must never earn a "full-pr" binding (that would claim the model
 # reviewed diff bytes it was never sent). It still needs a properly-labeled "connector" binding
-# installed: recover_superseded_reason()/pg_reservation_supersede require
+# installed: pg_reservation_superseded_proof()/pg_reservation_supersede require
 # pg_review_input_binding_read to return a binding before a stuck reservation can be superseded.
 # pg_augment_path() (lib/pro-gate-lib.sh) rebuilds PATH with the real system dirs ahead of
 # whatever the caller prepended, so a `gh` shim must live under $HOME/.local/bin (the one
@@ -1375,7 +1375,7 @@ check '#150 planted negative: the neighbouring classic --input bundle run still 
 # #161: a caller-supplied --diff against the same classic `--pr N` run never earns full-pr proof
 # (the engine never independently fetched/hashed those bytes), but it still installs a
 # target-only "caller-patch" binding -- mirroring the connector shape above -- so a stuck
-# reservation later has something for recover_superseded_reason()/pg_reservation_supersede to
+# reservation later has something for pg_reservation_superseded_proof()/pg_reservation_supersede to
 # read. Reuses CONN150_REPO's already-committed base/head commits and gh stub.
 git -C "$CONN150_REPO" diff HEAD~1 HEAD > "$TDIR/conn150-caller.diff"
 CONN150_HEAD="$(git -C "$CONN150_REPO" rev-parse HEAD)"
@@ -1402,7 +1402,7 @@ check '#161 classic --pr --diff (caller-supplied) installs a caller-patch bindin
 # gate r1 P1 (#161): target.head_oid must be the PR's GitHub-reported head, never the caller's
 # local checkout state. A --diff run's $REPO checkout can be stale relative to the PR's real
 # pushed head (README's "review a local diff" usage never requires the clone to be synced to the
-# PR's exact head) -- if the installer trusted local git state, recover_superseded_reason() would
+# PR's exact head) -- if the installer trusted local git state, pg_reservation_superseded_proof() would
 # later compare that stale value against the true current head and falsely declare the PR head
 # "moved", superseding a reservation that was never actually stuck for that reason and writing a
 # false head-moved provenance entry into ledger.jsonl. DIVERGE161_REPO is deliberately left
@@ -7856,7 +7856,7 @@ rm -f "$SUPER_HEAD_HOME/in-progress/$SUPER_LIVE_MARKER" "$SUPER_HEAD_HOME/run-me
 # #214 (f): upgrade regression, live reservation. A generating reservation's input binding, once
 # rewritten in place to carry a PREDECESSOR contract digest -- exactly what a binding a pre-v0.53.0
 # runtime wrote looks like on disk today -- must still be read by pg_reservation_supersede /
-# recover_superseded_reason() when the bound PR head moves, and atomically transition to
+# pg_reservation_superseded_proof() when the bound PR head moves, and atomically transition to
 # superseded, not silently lose the binding it needs to prove the move.
 PG214_F_HOME="$TDIR/home-pg214-upgrade-live"
 PG214_F_MARKER='pg-run-acme-fresh-77-1700020100-1'
@@ -7872,7 +7872,7 @@ check '#214 (f): a live reservation whose input binding carries a predecessor co
   "binding_cd=$PG214_F_BINDING_CD rc=$RC state=$(cat "$PG214_F_HOME/in-progress/$PG214_F_MARKER") stderr=$(cat "$TDIR/super.stderr")"
 
 # #161: a caller-supplied --diff reservation's binding has no full-pr shaped proof to borrow, so
-# recover_superseded_reason()/pg_reservation_supersede must accept its own "caller-patch" shape
+# pg_reservation_superseded_proof()/pg_reservation_supersede must accept its own "caller-patch" shape
 # too -- exercised at the --recover CLI exit-6 path, not only the pg_reservation_supersede library
 # call SUPER_HEAD_* above already covers.
 echo '# #161: exact recovery proof-supersedes a caller-patch-mode reservation too'
@@ -9735,5 +9735,204 @@ MEM_HOME5="$TDIR/mem-sentinel/home-doctor-clear"; mkdir -p "$MEM_HOME5"
 DOCTOR_MEM_CLEAR="$(PRO_GATE_HOME="$MEM_HOME5" PRO_GATE_BROWSER_MODE=native PRO_GATE_SERVICE_MANAGER=none bash "$HERE/../bin/pro-gate-doctor.sh" 2>&1 || true)"
 check 'doctor: no sentinel prints "browser memory pressure: none"' \
   "$(printf '%s' "$DOCTOR_MEM_CLEAR" | grep -qF 'browser memory pressure: none'; echo $?)" "$DOCTOR_MEM_CLEAR"
+
+# #234: a fresh run queued for a slot runs the --recover supersession proof on the reservations
+# blocking it, so an exited run of a merged, closed or moved-on PR stops holding account capacity
+# without anyone running --recover. Reuses the v0.37.2 fixtures (super_seed, SUPER_GH): each holder
+# is a complete, eligible exited run on slot 1 of PR 77 in acme/fresh; the waiter is a --diff run.
+echo '# #234: a slot wait releases the reservations of merged, closed or moved-on PRs'
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"; start_mock "$TDIR/tab.txt"
+SW_GH_LINE='pr view 77 --repo github.com/acme/fresh --json state,headRefOid'
+slotwait_run() { # home lock-wait gh-state gh-head [gh-mode] [max-concurrency] [reconcile-interval] [gh-bin]
+  local home="$1"
+  : > "$SUPER_GH_CALLS"
+  env PRO_GATE_HOME="$home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+    PRO_GATE_MAX_CONCURRENCY="${6:-1}" PRO_GATE_RAMP=0 PRO_GATE_LOCK_WAIT="$2" \
+    PRO_GATE_RECONCILE_INTERVAL="${7:-3600}" PRO_GATE_GH_BIN="${8:-$SUPER_GH}" \
+    PG_TEST_GH_CALLS="$SUPER_GH_CALLS" PG_TEST_GH_MODE="${5:-ok}" PG_TEST_GH_STATE="$3" PG_TEST_GH_HEAD="$4" \
+    PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_WATCHDOG_SLEEP_SECS=1 \
+    PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-ok" NODE_OPTIONS= \
+    bash "$ENGINE" --diff "$TDIR/small.diff" --repo "$TDIR" --out "$home/waiter.md" --timeout 5s \
+    >"$TDIR/slotwait.stdout" 2>"$TDIR/slotwait.stderr"
+  RC=$?
+}
+slotwait_state() { awk -F'\t' 'NR==1{print $8}' "$1/in-progress/$2" 2>/dev/null; }
+# The supersession proof's own GitHub reads. The waiter's existing PR-URL lookup (`--json url`) is
+# about its own run, not the reservations blocking it, so it is not counted.
+slotwait_proof_calls() { grep -F -- '--json state,headRefOid' "$SUPER_GH_CALLS"; }
+slotwait_ledgered() { # home marker proof -> 0 when the ledger carries the exact --recover-shaped event
+  jq -c --arg marker "$2" --arg proof "$3" \
+    'select(.outcome=="superseded" and .marker==$marker and .proof==$proof and .charge_retained and (.holds_capacity|not))' \
+    "$1/ledger.jsonl" 2>/dev/null | grep -q .
+}
+slotwait_detail() { # home marker
+  printf 'rc=%s record=%s calls=[%s] stderr=%s' "$RC" "$(cat "$1/in-progress/$2" 2>/dev/null)" \
+    "$(cat "$SUPER_GH_CALLS")" "$(tail -6 "$TDIR/slotwait.stderr")"
+}
+
+SW_MERGED_HOME="$TDIR/home-slotwait-merged"
+SW_MERGED_MARKER='pg-run-acme-fresh-77-1700014400-1'
+super_seed "$SW_MERGED_HOME" "$SW_MERGED_MARKER" 1700014400 "$FRESH_HEAD"
+slotwait_run "$SW_MERGED_HOME" 20 MERGED "$FRESH_HEAD"
+check '#234 a slot wait blocked only by a merged PR reservation supersedes it and takes the slot in the same run' \
+  "$([ "$RC" -eq 0 ] && [ -s "$SW_MERGED_HOME/waiter.md" ] \
+     && [ "$(slotwait_state "$SW_MERGED_HOME" "$SW_MERGED_MARKER")" = superseded ] \
+     && [ "$(slotwait_proof_calls)" = "$SW_GH_LINE" ] \
+     && slotwait_ledgered "$SW_MERGED_HOME" "$SW_MERGED_MARKER" "pr-merged:$FRESH_HEAD" \
+     && grep -Fq "released the account slot held by $SW_MERGED_MARKER: pr-merged:$FRESH_HEAD" "$TDIR/slotwait.stderr"; echo $?)" \
+  "$(slotwait_detail "$SW_MERGED_HOME" "$SW_MERGED_MARKER")"
+check '#234 the superseded holder keeps its charge, run-meta and binding for an audit harvest' \
+  "$([ -f "$SW_MERGED_HOME/run-meta/$SW_MERGED_MARKER" ] && [ -f "$SW_MERGED_HOME/review-input-bindings/$SW_MERGED_MARKER" ] \
+     && [ "$(awk -F'\t' 'NR==1{print $1" "$7}' "$SW_MERGED_HOME/in-progress/$SW_MERGED_MARKER")" = "$SUPER_KEY 1700014400" ]; echo $?)" \
+  "$(slotwait_detail "$SW_MERGED_HOME" "$SW_MERGED_MARKER")"
+
+SW_MOVED_HOME="$TDIR/home-slotwait-moved"
+SW_MOVED_MARKER='pg-run-acme-fresh-77-1700014410-1'
+super_seed "$SW_MOVED_HOME" "$SW_MOVED_MARKER" 1700014410 "$FRESH_BASE"
+slotwait_run "$SW_MOVED_HOME" 20 OPEN "$FRESH_HEAD"
+check '#234 a slot wait supersedes a reservation bound to a head its open PR has moved past' \
+  "$([ "$RC" -eq 0 ] && [ "$(slotwait_state "$SW_MOVED_HOME" "$SW_MOVED_MARKER")" = superseded ] \
+     && slotwait_ledgered "$SW_MOVED_HOME" "$SW_MOVED_MARKER" "head-moved:$FRESH_BASE:$FRESH_HEAD"; echo $?)" \
+  "$(slotwait_detail "$SW_MOVED_HOME" "$SW_MOVED_MARKER")"
+
+# Planted negatives: a holder whose PR is still open at its bound head is a review that still
+# applies, and a GitHub read that fails proves nothing. Both stay held and the run times out.
+SW_OPEN_HOME="$TDIR/home-slotwait-open"
+SW_OPEN_MARKER='pg-run-acme-fresh-77-1700014420-1'
+super_seed "$SW_OPEN_HOME" "$SW_OPEN_MARKER" 1700014420 "$FRESH_HEAD"
+# Bystanders that hold no capacity — a complete review and an already-superseded one — are never
+# checked: exactly one proof read below belongs to the one generating holder.
+for SW_BYSTANDER in complete:1700014421 superseded:1700014422; do
+  super_seed "$SW_OPEN_HOME" "pg-run-acme-fresh-77-${SW_BYSTANDER#*:}-1" "${SW_BYSTANDER#*:}" "$FRESH_HEAD"
+  SW_BYSTANDER_F="$SW_OPEN_HOME/in-progress/pg-run-acme-fresh-77-${SW_BYSTANDER#*:}-1"
+  SW_BYSTANDER_REC="$(awk -v state="${SW_BYSTANDER%%:*}" 'BEGIN{FS=OFS="\t"} NR==1{$5=""; $8=state; print}' "$SW_BYSTANDER_F")"
+  printf '%s\n' "$SW_BYSTANDER_REC" > "$SW_BYSTANDER_F"
+done
+slotwait_run "$SW_OPEN_HOME" 1 OPEN "$FRESH_HEAD"
+check '#234 a holder whose PR is open at its bound head stays held, checked once per interval' \
+  "$([ "$RC" -eq 7 ] && [ ! -s "$SW_OPEN_HOME/waiter.md" ] \
+     && [ "$(slotwait_state "$SW_OPEN_HOME" "$SW_OPEN_MARKER")" = generating ] \
+     && [ "$(slotwait_proof_calls)" = "$SW_GH_LINE" ] \
+     && ! grep -Fq '"outcome":"superseded"' "$SW_OPEN_HOME/ledger.jsonl" 2>/dev/null; echo $?)" \
+  "$(slotwait_detail "$SW_OPEN_HOME" "$SW_OPEN_MARKER")"
+check '#234 the holder report points a still-held reservation at --recover' \
+  "$(grep -Fq "  $SW_OPEN_MARKER  [$SUPER_KEY] generating" "$TDIR/slotwait.stderr" \
+     && grep -Fq 'oracle-review.sh --recover <marker>' "$TDIR/slotwait.stderr"; echo $?)" \
+  "$(slotwait_detail "$SW_OPEN_HOME" "$SW_OPEN_MARKER")"
+
+SW_FAIL_HOME="$TDIR/home-slotwait-gh-fail"
+SW_FAIL_MARKER='pg-run-acme-fresh-77-1700014430-1'
+super_seed "$SW_FAIL_HOME" "$SW_FAIL_MARKER" 1700014430 "$FRESH_HEAD"
+slotwait_run "$SW_FAIL_HOME" 1 MERGED "$FRESH_HEAD" fail
+check '#234 a holder whose GitHub state cannot be read stays held' \
+  "$([ "$RC" -eq 7 ] && [ "$(slotwait_proof_calls)" = "$SW_GH_LINE" ] \
+     && [ "$(slotwait_state "$SW_FAIL_HOME" "$SW_FAIL_MARKER")" = generating ] \
+     && ! grep -Fq '"outcome":"superseded"' "$SW_FAIL_HOME/ledger.jsonl" 2>/dev/null; echo $?)" \
+  "$(slotwait_detail "$SW_FAIL_HOME" "$SW_FAIL_MARKER")"
+
+# A run that gets a slot at once, or that may not wait at all, asks GitHub nothing about other
+# PRs' reservations, even when one of them would prove superseded.
+SW_FREE_HOME="$TDIR/home-slotwait-free"
+SW_FREE_MARKER='pg-run-acme-fresh-77-1700014440-1'
+super_seed "$SW_FREE_HOME" "$SW_FREE_MARKER" 1700014440 "$FRESH_HEAD"
+slotwait_run "$SW_FREE_HOME" 20 MERGED "$FRESH_HEAD" ok 2
+check '#234 a run that gets a slot at once makes no GitHub call for other reservations' \
+  "$([ "$RC" -eq 0 ] && [ -z "$(slotwait_proof_calls)" ] \
+     && [ "$(slotwait_state "$SW_FREE_HOME" "$SW_FREE_MARKER")" = generating ]; echo $?)" \
+  "$(slotwait_detail "$SW_FREE_HOME" "$SW_FREE_MARKER")"
+SW_NOWAIT_HOME="$TDIR/home-slotwait-nowait"
+SW_NOWAIT_MARKER='pg-run-acme-fresh-77-1700014445-1'
+super_seed "$SW_NOWAIT_HOME" "$SW_NOWAIT_MARKER" 1700014445 "$FRESH_HEAD"
+slotwait_run "$SW_NOWAIT_HOME" 0 MERGED "$FRESH_HEAD"
+check '#234 a zero-length slot wait starts no supersession sweep' \
+  "$([ "$RC" -eq 7 ] && [ -z "$(slotwait_proof_calls)" ] \
+     && [ "$(slotwait_state "$SW_NOWAIT_HOME" "$SW_NOWAIT_MARKER")" = generating ]; echo $?)" \
+  "$(slotwait_detail "$SW_NOWAIT_HOME" "$SW_NOWAIT_MARKER")"
+
+# A holder's PR that merges while the run is already waiting is released on a later sweep. This gh
+# answers the proof's read OPEN at the bound head the first time and MERGED from the second.
+cat > "$TDIR/bin/gh-merges-later" <<'GH_MERGES_LATER'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${PG_TEST_GH_CALLS:?}"
+case " $* " in *' state,headRefOid '*) ;; *) exit 1 ;; esac
+state=OPEN; [ "$(grep -cF 'state,headRefOid' "$PG_TEST_GH_CALLS")" -ge 2 ] && state=MERGED
+jq -nc --arg state "$state" --arg head "${PG_TEST_GH_HEAD:-}" '{state:$state,headRefOid:$head}'
+GH_MERGES_LATER
+chmod +x "$TDIR/bin/gh-merges-later"
+SW_LATER_HOME="$TDIR/home-slotwait-merges-later"
+SW_LATER_MARKER='pg-run-acme-fresh-77-1700014450-1'
+super_seed "$SW_LATER_HOME" "$SW_LATER_MARKER" 1700014450 "$FRESH_HEAD"
+slotwait_run "$SW_LATER_HOME" 20 OPEN "$FRESH_HEAD" ok 1 0 "$TDIR/bin/gh-merges-later"
+check '#234 a holder PR that merges mid-wait is released on the next sweep' \
+  "$([ "$RC" -eq 0 ] && [ "$(slotwait_proof_calls | grep -cxF "$SW_GH_LINE")" -eq 2 ] \
+     && [ "$(slotwait_state "$SW_LATER_HOME" "$SW_LATER_MARKER")" = superseded ] \
+     && slotwait_ledgered "$SW_LATER_HOME" "$SW_LATER_MARKER" "pr-merged:$FRESH_HEAD"; echo $?)" \
+  "$(slotwait_detail "$SW_LATER_HOME" "$SW_LATER_MARKER")"
+
+# The proof's GitHub read can take seconds. A sweep that starts before the deadline and frees a slot
+# after it still gets to take that slot: this gh answers MERGED only once the 1s wait has expired.
+cat > "$TDIR/bin/gh-slow-merged" <<'GH_SLOW_MERGED'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${PG_TEST_GH_CALLS:?}"
+case " $* " in *' state,headRefOid '*) ;; *) exit 1 ;; esac
+sleep 2
+jq -nc --arg head "${PG_TEST_GH_HEAD:-}" '{state:"MERGED",headRefOid:$head}'
+GH_SLOW_MERGED
+chmod +x "$TDIR/bin/gh-slow-merged"
+SW_SLOW_HOME="$TDIR/home-slotwait-slow-proof"
+SW_SLOW_MARKER='pg-run-acme-fresh-77-1700014455-1'
+super_seed "$SW_SLOW_HOME" "$SW_SLOW_MARKER" 1700014455 "$FRESH_HEAD"
+slotwait_run "$SW_SLOW_HOME" 1 MERGED "$FRESH_HEAD" ok 1 3600 "$TDIR/bin/gh-slow-merged"
+check '#234 a slot the sweep frees after the deadline is still taken, not abandoned' \
+  "$([ "$RC" -eq 0 ] && [ "$(slotwait_proof_calls)" = "$SW_GH_LINE" ] \
+     && [ "$(slotwait_state "$SW_SLOW_HOME" "$SW_SLOW_MARKER")" = superseded ]; echo $?)" \
+  "$(slotwait_detail "$SW_SLOW_HOME" "$SW_SLOW_MARKER")"
+
+# The dispatch sweep's live-probe rewrite runs after a probe that can take 10s. A supersession
+# landing inside that probe must survive it. The fake salvage script performs the concurrent
+# supersession itself; the control run proves the rewrite branch is really reached.
+cat > "$TDIR/bin/salvage-race.mjs" <<'SALVAGE_RACE'
+import fs from 'node:fs';
+const f = process.env.PG_TEST_RACE_RESERVATION;
+if (process.env.PG_TEST_RACE_SUPERSEDE === '1') {
+  fs.writeFileSync(f, fs.readFileSync(f, 'utf8').replace(/\tgenerating\n$/, '\tsuperseded\n'));
+}
+SALVAGE_RACE
+slotwait_race() { # home marker supersede-during-probe
+  local f="$1/in-progress/$2" rec
+  super_seed "$1" "$2" 1700014460 "$FRESH_HEAD"
+  rec="$(awk 'BEGIN{FS=OFS="\t"} NR==1{$4=1; print}' "$f")"; printf '%s\n' "$rec" > "$f"
+  PRO_GATE_HOME="$1" PRO_GATE_RECONCILE_INTERVAL=0 PG_TEST_RACE_RESERVATION="$f" PG_TEST_RACE_SUPERSEDE="$3" \
+    pg_reservation_reconcile "$TDIR/bin/salvage-race.mjs" 65530 2>/dev/null
+}
+SW_RACE_CONTROL_HOME="$TDIR/home-reconcile-race-control"
+slotwait_race "$SW_RACE_CONTROL_HOME" 'pg-run-acme-fresh-77-1700014460-1' 0
+SW_RACE_HOME="$TDIR/home-reconcile-race"
+slotwait_race "$SW_RACE_HOME" 'pg-run-acme-fresh-77-1700014460-2' 1
+check '#234 control: a live probe resets the miss streak of a generating reservation' \
+  "$([ "$(awk -F'\t' 'NR==1{print $4" "$8}' "$SW_RACE_CONTROL_HOME/in-progress/pg-run-acme-fresh-77-1700014460-1")" = '0 generating' ]; echo $?)" \
+  "record=$(cat "$SW_RACE_CONTROL_HOME/in-progress/pg-run-acme-fresh-77-1700014460-1")"
+check '#234 a live probe that races a supersession cannot turn it back into account occupancy' \
+  "$([ "$(slotwait_state "$SW_RACE_HOME" 'pg-run-acme-fresh-77-1700014460-2')" = superseded ]; echo $?)" \
+  "record=$(cat "$SW_RACE_HOME/in-progress/pg-run-acme-fresh-77-1700014460-2")"
+
+# #236: a confirmed miss must round-trip the lifecycle state. A complete review holds no capacity
+# and must not start holding it again because its conversation stopped probing as present.
+SW_MISS_HOME="$TDIR/home-note-miss-state"; mkdir -p "$SW_MISS_HOME/in-progress"
+printf 'kC\t%s\t%s\t0\t1\tGPT-X\t1700014470\tcomplete\n' "$TDIR/o-complete.md" "$(date +%s)" \
+  > "$SW_MISS_HOME/in-progress/pg-run-miss-complete-1700014470-1"
+printf 'kL\t%s\t%s\t0\t1\tGPT-X\t1700014471\n' "$TDIR/o-legacy.md" "$(date +%s)" \
+  > "$SW_MISS_HOME/in-progress/pg-run-miss-legacy-1700014471-1"
+SW_MISS_COMPLETE="$(PRO_GATE_HOME="$SW_MISS_HOME" PRO_GATE_RECONCILE_INTERVAL=0 pg_reservation_note_miss pg-run-miss-complete-1700014470-1)"
+SW_MISS_LEGACY="$(PRO_GATE_HOME="$SW_MISS_HOME" PRO_GATE_RECONCILE_INTERVAL=0 pg_reservation_note_miss pg-run-miss-legacy-1700014471-1)"
+check '#236 a confirmed miss keeps a complete reservation complete and holding no capacity' \
+  "$([ "$SW_MISS_COMPLETE" = 'retained 1/3' ] \
+     && [ "$(awk -F'\t' 'NR==1{print $4" "$7" "$8}' "$SW_MISS_HOME/in-progress/pg-run-miss-complete-1700014470-1")" = '1 1700014470 complete' ] \
+     && [ "$(PRO_GATE_HOME="$SW_MISS_HOME" pg_reservation_state pg-run-miss-complete-1700014470-1)" = complete ]; echo $?)" \
+  "miss=$SW_MISS_COMPLETE record=$(cat "$SW_MISS_HOME/in-progress/pg-run-miss-complete-1700014470-1")"
+check '#236 a legacy record with no lifecycle field keeps its seven-field shape' \
+  "$([ "$SW_MISS_LEGACY" = 'retained 1/3' ] \
+     && awk -F'\t' 'NR==1{exit !(NF==7 && $4==1 && $7==1700014471)}' "$SW_MISS_HOME/in-progress/pg-run-miss-legacy-1700014471-1"; echo $?)" \
+  "miss=$SW_MISS_LEGACY record=$(cat "$SW_MISS_HOME/in-progress/pg-run-miss-legacy-1700014471-1")"
 
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }
