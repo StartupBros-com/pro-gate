@@ -1953,20 +1953,15 @@ pg_reservation_note_miss() {
   ttl="${PRO_GATE_RESERVATION_TTL:-21600}"; case "$ttl" in ''|*[!0-9]*) ttl=21600;; esac
   now="$(date +%s)"; age=$(( now - created )); [ "$age" -lt 0 ] && age=0
   misses=$(( misses + 1 ))
-  if [ "$misses" -ge "$miss_limit" ] && [ "$created" -gt 0 ] && [ "$age" -ge "$ttl" ]; then
-    # The miss threshold is terminal only when durable run-meta can bind the proof to one charged
-    # attempt. Publish disposition BEFORE releasing the reservation so no fresh caller sees a gap.
-    if pg_attempt_terminal_from_meta "$marker" recovery-exhausted bounded-recovery-exhausted; then
-      rm -f "$f" "$(pg_manifest_dir)/$marker" "$(pg_manifest_dir)/$marker.nonce" 2>/dev/null
-      pg_reservation_guard_release
-      pg_attempt_reconcile_terminal "$marker" 2>/dev/null || true
-      echo released
-    else
-      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s%s\n' "${pr:-diff}" "${out:-}" "${created:-0}" "$misses" "${slot:-}" "${model:-}" "${spend:-}" "$state_field" > "$f.tmp" 2>/dev/null \
-        && mv -f "$f.tmp" "$f"
-      pg_reservation_guard_release
-      echo "retained $misses/$miss_limit"
-    fi
+  # The miss threshold is terminal only when durable run-meta can bind the proof to one charged
+  # attempt. Publish disposition BEFORE releasing the reservation so no fresh caller sees a gap.
+  # Every other outcome shares the one rewrite below, so the record's fields cannot diverge by path.
+  if [ "$misses" -ge "$miss_limit" ] && [ "$created" -gt 0 ] && [ "$age" -ge "$ttl" ] \
+     && pg_attempt_terminal_from_meta "$marker" recovery-exhausted bounded-recovery-exhausted; then
+    rm -f "$f" "$(pg_manifest_dir)/$marker" "$(pg_manifest_dir)/$marker.nonce" 2>/dev/null
+    pg_reservation_guard_release
+    pg_attempt_reconcile_terminal "$marker" 2>/dev/null || true
+    echo released
   else
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s%s\n' "${pr:-diff}" "${out:-}" "${created:-0}" "$misses" "${slot:-}" "${model:-}" "${spend:-}" "$state_field" > "$f.tmp" 2>/dev/null \
       && mv -f "$f.tmp" "$f"

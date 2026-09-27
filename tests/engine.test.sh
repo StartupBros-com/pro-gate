@@ -9885,6 +9885,51 @@ check '#234 a slot the sweep frees after the deadline is still taken, not abando
      && [ "$(slotwait_state "$SW_SLOW_HOME" "$SW_SLOW_MARKER")" = superseded ]; echo $?)" \
   "$(slotwait_detail "$SW_SLOW_HOME" "$SW_SLOW_MARKER")"
 
+# The #234 incident had two merged PRs' exited runs holding slots at once. One sweep releases every
+# holder it can prove, not only the first: a sweep that stopped at its first release would free one
+# slot, let this run through, and leave the other merged PR holding capacity. The holders sit on
+# slots 1 and 2 of a two-slot account.
+SW_PAIR_HOME="$TDIR/home-slotwait-pair"
+SW_PAIR_A='pg-run-acme-fresh-77-1700014460-1'
+SW_PAIR_B='pg-run-acme-fresh-77-1700014461-1'
+super_seed "$SW_PAIR_HOME" "$SW_PAIR_A" 1700014460 "$FRESH_HEAD"
+super_seed "$SW_PAIR_HOME" "$SW_PAIR_B" 1700014461 "$FRESH_HEAD"
+SW_PAIR_REC="$(awk 'BEGIN{FS=OFS="\t"} NR==1{$5=2; print}' "$SW_PAIR_HOME/in-progress/$SW_PAIR_B")"
+printf '%s\n' "$SW_PAIR_REC" > "$SW_PAIR_HOME/in-progress/$SW_PAIR_B"
+slotwait_run "$SW_PAIR_HOME" 20 MERGED "$FRESH_HEAD" ok 2
+check '#234 one sweep releases every merged holder, not only the first' \
+  "$([ "$RC" -eq 0 ] && [ -s "$SW_PAIR_HOME/waiter.md" ] \
+     && [ "$(slotwait_proof_calls | grep -cxF "$SW_GH_LINE")" -eq 2 ] \
+     && [ "$(slotwait_state "$SW_PAIR_HOME" "$SW_PAIR_A")" = superseded ] \
+     && [ "$(slotwait_state "$SW_PAIR_HOME" "$SW_PAIR_B")" = superseded ] \
+     && slotwait_ledgered "$SW_PAIR_HOME" "$SW_PAIR_A" "pr-merged:$FRESH_HEAD" \
+     && slotwait_ledgered "$SW_PAIR_HOME" "$SW_PAIR_B" "pr-merged:$FRESH_HEAD"; echo $?)" \
+  "$(slotwait_detail "$SW_PAIR_HOME" "$SW_PAIR_A") second=$(cat "$SW_PAIR_HOME/in-progress/$SW_PAIR_B" 2>/dev/null)"
+
+# The sweep interval is wall-clock time, not a slice count. With a 5s interval and 3s wait slices
+# the second proof read belongs to the third slice: the second slice is too early. This gh answers
+# the first proof read OPEN at the bound head and later ones MERGED, and stamps each read's time.
+cat > "$TDIR/bin/gh-merges-later-timed" <<'GH_MERGES_LATER_TIMED'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${PG_TEST_GH_CALLS:?}"
+case " $* " in *' state,headRefOid '*) ;; *) exit 1 ;; esac
+date +%s >> "$PG_TEST_GH_CALLS.times"
+state=OPEN; [ "$(grep -cF 'state,headRefOid' "$PG_TEST_GH_CALLS")" -ge 2 ] && state=MERGED
+jq -nc --arg state "$state" --arg head "${PG_TEST_GH_HEAD:-}" '{state:$state,headRefOid:$head}'
+GH_MERGES_LATER_TIMED
+chmod +x "$TDIR/bin/gh-merges-later-timed"
+SW_TIMED_HOME="$TDIR/home-slotwait-interval"
+SW_TIMED_MARKER='pg-run-acme-fresh-77-1700014465-1'
+super_seed "$SW_TIMED_HOME" "$SW_TIMED_MARKER" 1700014465 "$FRESH_HEAD"
+: > "$SUPER_GH_CALLS.times"
+slotwait_run "$SW_TIMED_HOME" 20 OPEN "$FRESH_HEAD" ok 1 5 "$TDIR/bin/gh-merges-later-timed"
+SW_TIMED_GAP="$(awk 'NR==1{first=$1} NR==2{print $1 - first}' "$SUPER_GH_CALLS.times")"
+check '#234 a waiting run re-checks a held reservation once the interval has passed, not every slice' \
+  "$([ "$RC" -eq 0 ] && [ "$(slotwait_proof_calls | grep -cxF "$SW_GH_LINE")" -eq 2 ] \
+     && [ "${SW_TIMED_GAP:-0}" -ge 5 ] \
+     && [ "$(slotwait_state "$SW_TIMED_HOME" "$SW_TIMED_MARKER")" = superseded ]; echo $?)" \
+  "gap=${SW_TIMED_GAP:-none}s $(slotwait_detail "$SW_TIMED_HOME" "$SW_TIMED_MARKER")"
+
 # The dispatch sweep's live-probe rewrite runs after a probe that can take 10s. A supersession
 # landing inside that probe must survive it. The fake salvage script performs the concurrent
 # state write itself and prints no probe-state, the ambiguous live result that reaches the rewrite;
