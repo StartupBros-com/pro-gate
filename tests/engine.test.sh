@@ -9887,31 +9887,47 @@ check '#234 a slot the sweep frees after the deadline is still taken, not abando
 
 # The dispatch sweep's live-probe rewrite runs after a probe that can take 10s. A supersession
 # landing inside that probe must survive it. The fake salvage script performs the concurrent
-# supersession itself; the control run proves the rewrite branch is really reached.
+# state write itself and prints no probe-state, the ambiguous live result that reaches the rewrite;
+# the control run proves the rewrite branch is really reached.
 cat > "$TDIR/bin/salvage-race.mjs" <<'SALVAGE_RACE'
 import fs from 'node:fs';
 const f = process.env.PG_TEST_RACE_RESERVATION;
-if (process.env.PG_TEST_RACE_SUPERSEDE === '1') {
-  fs.writeFileSync(f, fs.readFileSync(f, 'utf8').replace(/\tgenerating\n$/, '\tsuperseded\n'));
+const to = process.env.PG_TEST_RACE_TO;
+if (to) {
+  fs.writeFileSync(f, fs.readFileSync(f, 'utf8').replace(/\t[a-z]+\n$/, `\t${to}\n`));
 }
 SALVAGE_RACE
-slotwait_race() { # home marker supersede-during-probe
+slotwait_race() { # home marker seeded-state state-written-during-probe
   local f="$1/in-progress/$2" rec
   super_seed "$1" "$2" 1700014460 "$FRESH_HEAD"
-  rec="$(awk 'BEGIN{FS=OFS="\t"} NR==1{$4=1; print}' "$f")"; printf '%s\n' "$rec" > "$f"
-  PRO_GATE_HOME="$1" PRO_GATE_RECONCILE_INTERVAL=0 PG_TEST_RACE_RESERVATION="$f" PG_TEST_RACE_SUPERSEDE="$3" \
+  rec="$(awk -v state="$3" 'BEGIN{FS=OFS="\t"} NR==1{$4=1; $8=state; print}' "$f")"; printf '%s\n' "$rec" > "$f"
+  PRO_GATE_HOME="$1" PRO_GATE_RECONCILE_INTERVAL=0 PG_TEST_RACE_RESERVATION="$f" PG_TEST_RACE_TO="$4" \
     pg_reservation_reconcile "$TDIR/bin/salvage-race.mjs" 65530 2>/dev/null
 }
 SW_RACE_CONTROL_HOME="$TDIR/home-reconcile-race-control"
-slotwait_race "$SW_RACE_CONTROL_HOME" 'pg-run-acme-fresh-77-1700014460-1' 0
+slotwait_race "$SW_RACE_CONTROL_HOME" 'pg-run-acme-fresh-77-1700014460-1' generating ''
 SW_RACE_HOME="$TDIR/home-reconcile-race"
-slotwait_race "$SW_RACE_HOME" 'pg-run-acme-fresh-77-1700014460-2' 1
+slotwait_race "$SW_RACE_HOME" 'pg-run-acme-fresh-77-1700014460-2' generating superseded
+# A proven completion is the same kind of release: one another sweep proves inside the probe, and
+# one proven earlier that has since taken a confirmed miss, which keeps `complete` (#236) and so
+# reaches this rewrite with a miss count to reset. An ambiguous probe resets the count only.
+SW_RACE_DONE_HOME="$TDIR/home-reconcile-race-complete"
+slotwait_race "$SW_RACE_DONE_HOME" 'pg-run-acme-fresh-77-1700014460-3' generating complete
+SW_MISSED_DONE_HOME="$TDIR/home-reconcile-complete-missed"
+slotwait_race "$SW_MISSED_DONE_HOME" 'pg-run-acme-fresh-77-1700014460-4' complete ''
 check '#234 control: a live probe resets the miss streak of a generating reservation' \
   "$([ "$(awk -F'\t' 'NR==1{print $4" "$8}' "$SW_RACE_CONTROL_HOME/in-progress/pg-run-acme-fresh-77-1700014460-1")" = '0 generating' ]; echo $?)" \
   "record=$(cat "$SW_RACE_CONTROL_HOME/in-progress/pg-run-acme-fresh-77-1700014460-1")"
 check '#234 a live probe that races a supersession cannot turn it back into account occupancy' \
   "$([ "$(slotwait_state "$SW_RACE_HOME" 'pg-run-acme-fresh-77-1700014460-2')" = superseded ]; echo $?)" \
   "record=$(cat "$SW_RACE_HOME/in-progress/pg-run-acme-fresh-77-1700014460-2")"
+check '#236 a live probe that races a proven completion cannot turn it back into account occupancy' \
+  "$([ "$(awk -F'\t' 'NR==1{print $4" "$8}' "$SW_RACE_DONE_HOME/in-progress/pg-run-acme-fresh-77-1700014460-3")" = '0 complete' ]; echo $?)" \
+  "record=$(cat "$SW_RACE_DONE_HOME/in-progress/pg-run-acme-fresh-77-1700014460-3")"
+check '#236 an ambiguous live probe resets a complete reservation miss streak without re-arming its slot' \
+  "$([ "$(awk -F'\t' 'NR==1{print $4" "$8}' "$SW_MISSED_DONE_HOME/in-progress/pg-run-acme-fresh-77-1700014460-4")" = '0 complete' ] \
+     && [ "$(PRO_GATE_HOME="$SW_MISSED_DONE_HOME" pg_reservation_holding_count)" = 0 ]; echo $?)" \
+  "record=$(cat "$SW_MISSED_DONE_HOME/in-progress/pg-run-acme-fresh-77-1700014460-4") holding=$(PRO_GATE_HOME="$SW_MISSED_DONE_HOME" pg_reservation_holding_count)"
 
 # #236: a confirmed miss must round-trip the lifecycle state. A complete review holds no capacity
 # and must not start holding it again because its conversation stopped probing as present.

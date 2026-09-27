@@ -2340,7 +2340,7 @@ pg_harvest_claimed() {
 # because every probe is a page load against the throttled account, no further marker is probed
 # while the cooldown that probe wrote is active. TTL-only sweeps never rendered and still run.
 pg_reservation_reconcile() {
-  local salvage="$1" port="$2" dir ttl miss_limit interval now f marker pr out created misses slot model spend age mt rc probe_out cooldown_noted=0
+  local salvage="$1" port="$2" dir ttl miss_limit interval now f marker pr out created misses slot model spend age mt rc probe_out live_state cooldown_noted=0
   dir="$(pg_reservation_dir)"; [ -d "$dir" ] || return 0
   ttl="${PRO_GATE_RESERVATION_TTL:-21600}"; miss_limit="${PRO_GATE_RESERVATION_MISSES:-3}"
   interval="${PRO_GATE_RECONCILE_INTERVAL:-60}"; now="$(date +%s)"
@@ -2425,9 +2425,15 @@ pg_reservation_reconcile() {
             # released reservation and block capacity until TTL, so re-check under the guard.
             # The state is re-read here too: the skip at the top of this loop ran before a probe
             # that can take 10s, and a supersession proven in that window (--recover, or another
-            # run's slot wait, #234) must not be turned back into account occupancy.
-            if [ -f "$f" ] && [ "$(awk -F'\t' 'NR==1{print $8}' "$f" 2>/dev/null)" != superseded ]; then
-              printf '%s\t%s\t%s\t0\t%s\t%s\t%s\t%s\n' "$pr" "$out" "$created" "${slot:-}" "${model:-}" "${spend:-}" "generating" > "$f.tmp" 2>/dev/null && mv -f "$f.tmp" "$f"
+            # run's slot wait, #234) must not be turned back into account occupancy. The same holds
+            # for a completion another sweep proved in that window, and for one proven before it: a
+            # confirmed miss keeps `complete` (#236), and this rewrite only resets that miss count.
+            # `probe-state: generating` is everything short of a proven verdict, a still-hydrating
+            # page included, so it is not evidence that a finished review started generating again.
+            live_state="$(awk -F'\t' 'NR==1{print $8}' "$f" 2>/dev/null)"
+            if [ -f "$f" ] && [ "$live_state" != superseded ]; then
+              [ "$live_state" = complete ] || live_state=generating
+              printf '%s\t%s\t%s\t0\t%s\t%s\t%s\t%s\n' "$pr" "$out" "$created" "${slot:-}" "${model:-}" "${spend:-}" "$live_state" > "$f.tmp" 2>/dev/null && mv -f "$f.tmp" "$f"
             fi
             pg_reservation_guard_release
           }
