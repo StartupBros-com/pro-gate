@@ -43,7 +43,7 @@ auto-merge, with required hosted CI on the exact head remaining the final author
 | Spend protection | Deferrals, oversized refusals, and round caps exit without spending a Pro slot; an interrupted run leaves a harvestable reservation instead of a wasted slot |
 | Crash recovery | `--status` rediscovers any run from a bare PR number; `--harvest` collects a review the model was still writing when your session died |
 | Verified provenance | Every run embeds a nonce the model echoes back on its verdict line; a capture that doesn't match the run is rejected, never silently accepted |
-| Bounded loops | The review, fix, re-review loop continues only while findings strictly shrink; the engine's trajectory governor grants 3 rounds per change per rolling 24 h, earns +1 per shrinking re-review up to a hard ceiling of 8, and cuts a non-converging loop early |
+| Round controls | Numeric grants are advisory by default: 3 rounds per change per rolling 24 h, +1 per shrinking re-review, up to 8; explicit settings enforce those limits. A separate churn stop covers positive P0/P1 counts that fail to shrink for two consecutive re-reviews; clean and P2/P3-only rounds do not accumulate churn |
 
 ### Quick example
 
@@ -105,9 +105,10 @@ July 2026). The Pro model spends that long reasoning; the engine is built around
   that review targets an old head or merged/closed PR, it remains charged and optionally
   collectable but stops occupying capacity.
 - **Fail closed, recover explicitly.** A plugin/runtime version skew blocks the run.
-  Captures must echo the run's nonce — the whole token, bounded, though letter case may drift,
-  since a nonce ends in the minting run's launch time and pid and so cannot collide with another
-  run's on case alone. Unverifiable results are surfaced for manual recovery, never guessed at.
+  Final acceptance requires the whole bounded nonce with exact, case-sensitive spelling.
+  Browser-side foreign-content conviction compares case-insensitively so a case-only near-match
+  remains unbound and recoverable instead of being blacklisted as foreign. Unverifiable results
+  are surfaced for manual recovery, never guessed at.
 - **Clean up only after durable success.** Remote-browser conversations get an exact,
   marker-owned title. Server archive and local tab close happen only after the validated
   review is readable from marker-addressed durable storage; failed and in-progress runs stay
@@ -353,13 +354,30 @@ this run's own is charged once per conversation-and-text fingerprint per seven d
 left on an abandoned tab cannot re-arm the cooldown on every attempt; a modal over the run's
 own conversation always re-arms it.
 When Oracle's own session record proves a fresh review's Send was never dispatched (an attachment
-that never registered, for example), the round is refunded and the attempt's delivery condition is
-recorded: the evidence relation, input mode, `PRO_GATE_BROWSER_ATTACHMENTS` and the installed
-Oracle build. After two such attempts in a row under one condition, the typed query returns
-`stop-without-new-review` / `delivery-failed-unchanged` (count in `facts.delivery`) instead of
-granting a third identical run. A new head, a changed attachment policy or input mode, or a new
-Oracle build grants again; so does one operator run with `PRO_GATE_FORCE_ROUND=1`. A Cloudflare
-challenge is an account cooldown, not a delivery failure, and is not counted.
+that never registered, for example), the required durable terminal disposition records the
+attempt-time evidence relation, input mode, `PRO_GATE_BROWSER_ATTACHMENTS` and Oracle build before
+refunding the round. It retains either a valid condition/count or an explicit unavailable state,
+even if the optional legacy delivery sidecar cannot be written. If the disposition cannot be
+published, charge and recovery ownership remain; interrupted cleanup can resume from the durable
+record. Cleanup retries use that immutable published count and condition, even if the caller's
+configuration has changed. Predecessor lookup excludes the current attempt before selecting
+history, and an intervening sent attempt (including one later superseded) breaks the no-send
+streak. Unknown-send attempts remain charged. These records prove no send, never delivery success.
+
+After two proven no-send attempts in a row under one known condition, the typed query returns
+`stop-without-new-review` / `delivery-failed-unchanged`. Unreadable history or an unknown current
+build instead produces `delivery-state-unavailable`, with `facts.delivery.failed_unchanged: null`.
+A proven change in relation, input, attachment policy, or a previously known Oracle build can
+permit a new grant, subject to the other guards. Learning a formerly unknown build alone is not
+proof of change. An operator's `PRO_GATE_FORCE_ROUND=1` can bypass the known repeated-failure
+count; it cannot bypass unavailable evidence. A Cloudflare challenge records a separate
+`not-applicable` delivery snapshot and remains governed by account cooldown.
+
+Existing v1 delivery sidecars and `PRO_GATE_DELIVERY_CONDITION_DIR` remain supported. A v1
+disposition with no sidecar is explicitly `legacy-untracked`, with a null count, and retains the
+legacy admission behavior. In v0.58 and earlier, a failed or missing sidecar write is
+indistinguishable from truly old untracked history or a Cloudflare refund. That absence cannot be
+reconstructed as proof of changed conditions; new no-send dispositions retain the uncertainty.
 Missing or malformed binding/GitHub proof leaves the review generating. Its plain states
 are **Review ready**, **Checking for completed review**, **Still working**, **Review superseded**,
 **No review remains**, and **Browser needs attention**. `Review superseded` means old-head or closed-PR
@@ -421,7 +439,7 @@ an endless collect. Use `bundle` or `both` for the final round.
 | `PRO_GATE_ROUNDS_CEILING` | `8` advisory | Computed trajectory ceiling; explicitly setting it enables enforcement |
 | `PRO_GATE_MAX_ROUNDS_PER_PR` | *(unset)* | Explicit legacy flat-cap enforcement (`0` = lockdown) |
 | `PRO_GATE_ROUNDS_WINDOW` | `24h` | The rolling telemetry/enforcement window |
-| `PRO_GATE_ROUNDS_CONTINUE` | *(unset)* | Set `1` to let ONE query/effect proceed past a `rounds-not-converging` stop (review-decision/v1) despite the churn streak; stateless, same one-invocation idiom as `PRO_GATE_FORCE_ROUND`, and independent of `PRO_GATE_ROUND_GUARD`'s advisory/enforced/lockdown mode |
+| `PRO_GATE_ROUNDS_CONTINUE` | *(unset)* | Set `1` for the configured invocation to bypass churn while preserving enforced numeric limits, including exhausted and zero budgets. Stateless: there is no durable one-use counter. Cooldown, provenance and ownership still apply |
 | `PRO_GATE_MAX_DIFF_LINES` | `6000` | Above this a run proceeds but usually lands in-progress → harvest |
 | `PRO_GATE_DIFF_HARD_MAX` | `25000` | Above this the engine refuses (exit 11, no spend) |
 | `PRO_GATE_MAX_CONCURRENCY` | `1` | Ceiling for parallel Pro chats; a ramp governor earns up to it on clean streaks |
@@ -496,8 +514,13 @@ semantics. Native mode keeps the prompt's title hint and does not run remote-CDP
   consecutive re-reviews gets a typed `stop-without-new-review` / `rounds-not-converging` decision
   in place of a new round grant or a fix dispatch — this is a churn signal, not a budget one, so it
   fires even in advisory mode. A clean round (zero open P0/P1) ends the chain, so successive clean
-  reviews of new heads never accumulate a streak. `PRO_GATE_ROUNDS_CONTINUE=1` lets one more round through anyway; the
-  daemon and the wrapper's loop both end a run on any `stop-without-new-review` reason the same way.
+  reviews of new heads never accumulate a streak. `PRO_GATE_ROUNDS_CONTINUE=1` bypasses churn for
+  the configured invocation, exposing the uncollapsed numeric grant without enlarging it. When
+  numeric enforcement is enabled, unused headroom is still required; exhausted, base-zero and
+  cap-zero budgets remain closed. The override is stateless, not a durable one-use allowance.
+  `PRO_GATE_FORCE_ROUND=1` alone does not bypass the separate churn stop. Both overrides are
+  operator-only: agents must never set, export or script them. The daemon and wrapper end a run
+  on any `stop-without-new-review` reason the same way.
 - **Merge authority**: the daemon never merges directly; it stops after pushing fixes and
   commenting. The surrounding agent may arm squash auto-merge only after local verification,
   adversarial review, and required exact-head CI are green.

@@ -283,18 +283,19 @@ typed_decision 0 "$TYPED_HOME/stale-original.json"; typed_decision 2 "$TYPED_HOM
 before_review="$REVIEW_WORKERS"
 MOCK_FRESH="$TYPED_HOME/stale-replacement.json" DD_ENGINE="$TYPED_ENGINE" DD_NWO=acme/widgets DD_NUM=1983 DD_SHA=1111111111111111111111111111111111111111 DD_WORKTREE="$TYPED_HOME" DD_LOG="$TYPED_LOG" daemon_dispatch_decision "$TYPED_HOME/stale-original.json"
 check 'stale runtime effect re-dispatches the fresh replacement action' "$([ "$REVIEW_WORKERS" -eq $((before_review + 1)) ]; echo $?)" "review=$REVIEW_WORKERS"
-# Malformed, incompatible, unknown, and stale target envelopes globally defer without effects.
+# Every rejected envelope fails closed; only a complete incompatible identity defers globally.
 for invalid in malformed corpus unknown stale; do
   typed_decision 2 "$TYPED_HOME/invalid-$invalid.json"
   case "$invalid" in
     malformed) printf '{not-json}\n' > "$TYPED_HOME/invalid-$invalid.json" ;;
-    corpus) jq '.contract.corpus_digest="bad"' "$TYPED_HOME/invalid-$invalid.json" > "$TYPED_HOME/invalid-$invalid.tmp" && mv "$TYPED_HOME/invalid-$invalid.tmp" "$TYPED_HOME/invalid-$invalid.json" ;;
+    corpus) jq '.contract.corpus_digest="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' "$TYPED_HOME/invalid-$invalid.json" > "$TYPED_HOME/invalid-$invalid.tmp" && mv "$TYPED_HOME/invalid-$invalid.tmp" "$TYPED_HOME/invalid-$invalid.json" ;;
     unknown) jq '.action="unknown-action" | .effect_request.action="unknown-action" | .effect_request.effect="unknown-action"' "$TYPED_HOME/invalid-$invalid.json" > "$TYPED_HOME/invalid-$invalid.tmp" && mv "$TYPED_HOME/invalid-$invalid.tmp" "$TYPED_HOME/invalid-$invalid.json" ;;
-    stale) jq '.effect_request.target.head_oid="2222222222222222222222222222222222222222" | .facts.target.head_oid="2222222222222222222222222222222222222222"' "$TYPED_HOME/invalid-$invalid.json" > "$TYPED_HOME/invalid-$invalid.tmp" && mv "$TYPED_HOME/invalid-$invalid.tmp" "$TYPED_HOME/invalid-$invalid.json" ;;
+    stale) facts="$(jq -c '.facts | .target.head_oid="2222222222222222222222222222222222222222"' "$TYPED_HOME/invalid-$invalid.json")"; pg_review_decision_reduce "$facts" > "$TYPED_HOME/invalid-$invalid.json" ;;
   esac
   DECISION_DEFERRED=0; RUNTIME_DEFERRED=0; before_review="$REVIEW_WORKERS"; before_agent="$AGENT_TASKS"; before_state="$(wc -c < "$TYPED_STATE")"; before_fails="$(wc -c < "$TYPED_FAILS")"
   MOCK_FRESH="$TYPED_HOME/invalid-$invalid.json" DD_ENGINE="$TYPED_ENGINE" DD_NWO=acme/widgets DD_NUM=1983 DD_SHA=1111111111111111111111111111111111111111 DD_WORKTREE="$TYPED_HOME" DD_LOG="$TYPED_LOG" daemon_dispatch_decision "$TYPED_HOME/invalid-$invalid.json"; rc=$?
-  check "$invalid decision globally defers with zero worker/SHA/failure-budget effects" "$([ "$rc" -eq 2 ] && [ "$DECISION_DEFERRED" = 1 ] && [ "$REVIEW_WORKERS" -eq "$before_review" ] && [ "$AGENT_TASKS" -eq "$before_agent" ] && [ "$(wc -c < "$TYPED_STATE")" = "$before_state" ] && [ "$(wc -c < "$TYPED_FAILS")" = "$before_fails" ]; echo $?)" "rc=$rc deferred=$DECISION_DEFERRED"
+  expected_deferred=0; [ "$invalid" != corpus ] || expected_deferred=1
+  check "$invalid decision defers at the correct scope with zero worker/SHA/failure-budget effects" "$([ "$rc" -eq 2 ] && [ "$DECISION_DEFERRED" = "$expected_deferred" ] && [ "$REVIEW_WORKERS" -eq "$before_review" ] && [ "$AGENT_TASKS" -eq "$before_agent" ] && [ "$(wc -c < "$TYPED_STATE")" = "$before_state" ] && [ "$(wc -c < "$TYPED_FAILS")" = "$before_fails" ]; echo $?)" "rc=$rc deferred=$DECISION_DEFERRED"
 done
 unset PRO_GATE_HOME
 
