@@ -5126,7 +5126,7 @@ check '--status surfaces the completed artifact' "$(grep -q 'collected artifacts
 echo '# v0.28: digest mismatch rejects an overwritten ledgered source'
 M10="pg-run-digest-2-1700000036-11"
 printf 'P0: none\n\nVERDICT: SHIP — overwritten bytes\n' > "$TDIR/overwritten-prior.md"
-check 'digest mismatch fixture contains a readable review before harvest' "$(pg_is_review "$TDIR/overwritten-prior.md"; echo $?)"
+check 'digest mismatch fixture contains a readable review before harvest' "$(. "$HERE/../lib/pro-gate-lib.sh"; pg_is_review "$TDIR/overwritten-prior.md"; echo $?)"
 printf '{"ts":"2026-01-07T00:00:00+0000","pr":"2","repo":"/tmp/x","exit":0,"outcome":"clean","secs":10,"attempts":0,"conc":0,"ceiling":1,"live":1,"salvaged":1,"diff_lines":4,"out":"%s","model":"m","marker":"%s","round_key":"digest-2","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}\n' "$TDIR/overwritten-prior.md" "$M10" >> "$TDIR/home/ledger.jsonl"
 run_engine --harvest "$M10" --out "$TDIR/o-digest.md" --timeout 5s
 check 'overwritten ledgered source rejected by digest (exit 6)' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
