@@ -68,6 +68,7 @@ function fixture(t, { legacy = false, hooks = {} } = {}) {
         process,
         randomUUID,
         createHash,
+        Buffer,
         ...dirs,
         BLACKLIST_FILE: blacklist,
         PG_HOME: home,
@@ -111,10 +112,7 @@ for (const legacy of [false, true]) {
       f.proxy.appendFileSync = () => {
         throw fail();
       };
-      f.proxy.readFileSync = (file, ...args) => {
-        if (String(file).includes(".rej.")) throw fail();
-        return fs.readFileSync(file, ...args);
-      };
+      f.proxy.readSync = () => { throw fail(); };
       f.api.discard(foreign);
       assert.equal(f.claims().length, 1);
       assert.equal(fs.readFileSync(f.claims()[0], "utf8"), held);
@@ -211,6 +209,7 @@ recaller="$6"; concurrent="$7"; canonical="$PRO_GATE_HOME/conversation-urls/$3";
 # Fail only the blacklist append, preserving earlier lines and leaving reads available.
 printf() { if [ "$1" = '%s\\t%s\\n' ]; then return 1; fi; builtin printf "$@"; }
 cat() { case "$1" in *.rej.*) return 1;; esac; command cat "$@"; }
+head() { local arg; for arg in "$@"; do case "$arg" in *.rej.*) return 1;; esac; done; command head "$@"; }
 mv() {
   command mv "$@" || return
   if [ "$concurrent" = true ] && [ "$1" = "$canonical" ]; then
@@ -315,10 +314,7 @@ for (const legacy of [false, true]) {
       const originalTime = new Date("2026-01-10T00:00:00Z");
       fs.utimesSync(f.memo, originalTime, originalTime);
       if (fault === "read")
-        f.proxy.readFileSync = (file, ...args) => {
-          if (String(file).includes(".rej.")) throw fail();
-          return fs.readFileSync(file, ...args);
-        };
+        f.proxy.readSync = () => { throw fail(); };
       else
         f.proxy.linkSync = () => {
           throw fail();
@@ -328,7 +324,7 @@ for (const legacy of [false, true]) {
       assert.equal(fs.readFileSync(f.claims()[0], "utf8"), genuine);
       assert.equal(fs.statSync(f.claims()[0]).mtimeMs, originalTime.getTime());
       assert.equal(f.api.unresolved(marker), true);
-      delete f.proxy.readFileSync;
+      delete f.proxy.readSync;
       delete f.proxy.linkSync;
       assert.equal(f.api.recall(marker), genuine);
       assert.equal(f.claims().length, 0);
@@ -368,16 +364,13 @@ test("convicted claim is never restored and legacy conviction retains a resolved
   for (const legacy of [false, true]) {
     const f = fixture(t, { legacy });
     fs.writeFileSync(f.memo, foreign);
-    f.proxy.readFileSync = (file, ...args) => {
-      if (String(file).includes(".rej.")) throw fail();
-      return fs.readFileSync(file, ...args);
-    };
+    f.proxy.readSync = () => { throw fail(); };
     f.api.forget(marker, foreign);
     fs.writeFileSync(
       f.blacklist,
       `${marker}\t${foreign}\npg-run-other-1-1\t${genuine}\n`,
     );
-    delete f.proxy.readFileSync;
+    delete f.proxy.readSync;
     assert.equal(f.api.recall(marker), null);
     assert.equal(fs.existsSync(f.memo), false);
     assert.equal(f.claims().length, 0);
@@ -424,13 +417,42 @@ test("blacklist read uncertainty never republishes a possibly convicted claim", 
   assert.equal(f.api.unresolved(marker), true);
 });
 
+test("a claim growing after metadata inspection stays bounded and unresolved", (t) => {
+  const f = fixture(t);
+  const claim = `${f.memo}.rej.growing`;
+  fs.writeFileSync(claim, genuine);
+  let grew = false;
+  f.proxy.fstatSync = (fd) => {
+    const before = fs.fstatSync(fd);
+    if (!grew) { grew = true; fs.appendFileSync(claim, "x".repeat(8192)); }
+    return before;
+  };
+  assert.equal(f.api.recall(marker), null);
+  assert.equal(f.api.unresolved(marker), true);
+  assert.equal(fs.existsSync(f.memo), false);
+  assert.equal(fs.statSync(claim).size, Buffer.byteLength(genuine) + 8192);
+});
+
+test("a claim swapped for a symlink while opening is never followed", (t) => {
+  const f = fixture(t);
+  const claim = `${f.memo}.rej.swapped`;
+  const target = path.join(f.home, "unrelated");
+  fs.writeFileSync(claim, genuine);
+  fs.writeFileSync(target, newer);
+  f.proxy.openSync = (file, ...args) => {
+    if (file === claim) { fs.unlinkSync(claim); fs.symlinkSync(target, claim); }
+    return fs.openSync(file, ...args);
+  };
+  assert.equal(f.api.recall(marker), null);
+  assert.equal(f.api.unresolved(marker), true);
+  assert.equal(fs.existsSync(f.memo), false);
+  assert.equal(fs.readFileSync(target, "utf8"), newer);
+});
+
 test("ordinary memo read EIO remains unresolved", (t) => {
   const f = fixture(t);
   fs.writeFileSync(f.memo, genuine);
-  f.proxy.readFileSync = (file, ...args) => {
-    if (file === f.memo) throw fail();
-    return fs.readFileSync(file, ...args);
-  };
+  f.proxy.readSync = () => { throw fail(); };
   assert.equal(f.api.recall(marker), null);
   assert.equal(f.api.unresolved(marker), true);
   assert.equal(fs.readFileSync(f.memo, "utf8"), genuine);
@@ -480,16 +502,36 @@ test("ordinary recall does not claim another canonical marker containing .rej.",
 async function noTabsChild(t, { kind, mode = "--probe" }) {
   const f = fixture(t);
   const faultPath = kind === "memo" ? f.memo : `${f.memo}.rej.seeded`;
-  fs.writeFileSync(faultPath, genuine);
+  const injectedRead = kind === "memo" || kind === "claim";
+  if (kind === "fifo") {
+    const made = spawnSync("mkfifo", [faultPath], { encoding: "utf8" });
+    assert.equal(made.status, 0, made.stderr);
+  } else if (kind === "symlink") {
+    const target = path.join(f.home, "alternate-bytes");
+    fs.writeFileSync(target, genuine);
+    fs.symlinkSync(target, faultPath);
+  } else if (kind === "oversized") {
+    fs.writeFileSync(faultPath, `${genuine}?${"x".repeat(4096)}`);
+  } else if (kind === "directory") {
+    fs.mkdirSync(faultPath);
+  } else fs.writeFileSync(faultPath, genuine);
+  const before = fs.lstatSync(faultPath);
   const preload = path.join(f.home, "fault.mjs");
   fs.writeFileSync(
     preload,
     `import fs from 'node:fs';
-const original = fs.readFileSync;
-fs.readFileSync = function(file, ...args) {
-  if (String(file) === process.env.PRO_GATE_TEST_MEMO_FAULT_PATH) throw Object.assign(new Error('injected EIO'), {code: 'EIO'});
-  return original.call(this, file, ...args);
-};\n`,
+const originalOpen = fs.openSync, originalRead = fs.readSync, originalClose = fs.closeSync;
+const faultFds = new Set();
+fs.openSync = function(file, ...args) {
+  const fd = originalOpen.call(this, file, ...args);
+  if (String(file) === process.env.PRO_GATE_TEST_MEMO_FAULT_PATH) faultFds.add(fd);
+  return fd;
+};
+fs.readSync = function(fd, ...args) {
+  if (faultFds.has(fd)) throw Object.assign(new Error('injected EIO'), {code: 'EIO'});
+  return originalRead.call(this, fd, ...args);
+};
+fs.closeSync = function(fd) { faultFds.delete(fd); return originalClose.call(this, fd); };\n`,
   );
   const server = createServer((_req, response) => {
     response.writeHead(200, { "content-type": "application/json" });
@@ -513,11 +555,11 @@ fs.readFileSync = function(file, ...args) {
         String(server.address().port),
       ],
       {
-        timeout: 60_000,
+        timeout: 5_000,
         env: {
           ...process.env,
           PRO_GATE_HOME: f.home,
-          PRO_GATE_TEST_MEMO_FAULT_PATH: faultPath,
+          PRO_GATE_TEST_MEMO_FAULT_PATH: injectedRead ? faultPath : "",
         },
       },
     );
@@ -535,9 +577,19 @@ fs.readFileSync = function(file, ...args) {
         code,
         stdout,
         stderr,
-        retained: fs.readFileSync(faultPath, "utf8"),
+        retained: injectedRead ? fs.readFileSync(faultPath, "utf8") : null,
+        unchanged: fs.lstatSync(faultPath).ino === before.ino && fs.lstatSync(faultPath).size === before.size,
       }),
     );
+  });
+}
+
+for (const kind of ["fifo", "symlink", "oversized", "directory"]) {
+  test(`actual empty CDP scan treats ${kind} claim as bounded uncertainty`, async (t) => {
+    const result = await noTabsChild(t, { kind });
+    assert.equal(result.code, 7, result.stderr);
+    assert.match(result.stderr, /evidence-kind: inconclusive/);
+    assert.equal(result.unchanged, true);
   });
 }
 

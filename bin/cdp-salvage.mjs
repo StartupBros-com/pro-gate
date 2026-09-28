@@ -261,6 +261,32 @@ const memoPath = (m) => (MARKER_SAFE_RE.test(m) ? path.join(URL_MEMO_DIR, m) : n
 const titleMemoPath = (m) => (MARKER_SAFE_RE.test(m) ? path.join(TITLE_MEMO_DIR, m) : null);
 const unresolvedMemos = new Set();
 
+// Recovery bytes are uncertain unless they can be read as a bounded regular file. Open
+// nonblocking and without following links so a damaged claim cannot stall before the deadline.
+function memoBytes(file) {
+  let fd;
+  try {
+    const before = fs.lstatSync(file);
+    if (!before.isFile() || before.isSymbolicLink() || before.size > 4096)
+      throw new Error('unreadable memo shape');
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0));
+    const held = fs.fstatSync(fd);
+    if (!held.isFile() || held.size > 4096 || held.dev !== before.dev || held.ino !== before.ino)
+      throw new Error('memo changed while opening');
+    const bytes = Buffer.alloc(4097);
+    let size = 0;
+    while (size < bytes.length) {
+      const count = fs.readSync(fd, bytes, size, bytes.length - size, null);
+      if (!count) break;
+      size += count;
+    }
+    if (size > 4096) throw new Error('oversized memo');
+    return bytes.subarray(0, size).toString('utf8');
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
 // The conviction travels atomically with the claimed inode, even if blacklist append fails.
 // Strip the LAST claim suffix: a repository/marker itself may contain ".rej.".
 function memoClaimMarker(name) {
@@ -294,7 +320,7 @@ function memoClaimRestored(claim, canonical) {
     const owned = fs.statSync(claim);
     return (
       (current.dev === owned.dev && current.ino === owned.ino) ||
-      fs.readFileSync(canonical, 'utf8') === fs.readFileSync(claim, 'utf8')
+      memoBytes(canonical) === memoBytes(claim)
     );
   } catch {
     return false;
@@ -360,7 +386,7 @@ function recoverMemoClaims(m) {
   for (const claim of claims) {
     let held;
     try {
-      held = fs.readFileSync(claim, 'utf8').trim();
+      held = memoBytes(claim).trim();
     } catch (error) {
       if (error.code !== 'ENOENT') unresolvedMemos.add(m);
       continue;
@@ -398,7 +424,7 @@ function recallUrl(m) {
   recoverMemoClaims(m);
   let url = '';
   try {
-    url = fs.readFileSync(f, 'utf8').trim();
+    url = memoBytes(f).trim();
   } catch (error) {
     if (error.code !== 'ENOENT') unresolvedMemos.add(m);
     return null;
@@ -420,7 +446,7 @@ function recallUrl(m) {
   // unheld and unseen by forgetUrl, so re-read `f` once more here to close it before giving up.
   let value = '';
   try {
-    value = fs.readFileSync(f, 'utf8').trim();
+    value = memoBytes(f).trim();
   } catch (error) {
     if (error.code !== 'ENOENT') unresolvedMemos.add(m);
     return null;
@@ -495,7 +521,7 @@ function forgetUrl(m, url) {
   }
   let held = '';
   try {
-    held = fs.readFileSync(claim, 'utf8').trim();
+    held = memoBytes(claim).trim();
   } catch {
     unresolvedMemos.add(m);
     return null;
@@ -520,7 +546,7 @@ function forgetUrl(m, url) {
   // Publication after the rename is a separate generation. Never overwrite it, and keep
   // using it in this invocation instead of reporting absence after a successful rejection.
   try {
-    const current = fs.readFileSync(f, 'utf8').trim();
+    const current = memoBytes(f).trim();
     return current !== url && conversationUrlOk(current) ? current : null;
   } catch (error) {
     if (error.code !== 'ENOENT') unresolvedMemos.add(m);

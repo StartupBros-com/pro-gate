@@ -159,6 +159,26 @@ check 'another canonical marker containing .rej. is not a pending claim' \
 printf '%s\n' "$GENUINE" > "$MEMO.rej.pending"
 check 'an actual claim still blocks absence beside a similarly named marker' "$(pg_memo_claim_pending "$MARKER"; echo $?)"
 
+seed interrupted-legacy legacy
+( mv() { exit 99; }; pg_provenance_reject "$MARKER" "$FOREIGN" )
+crash_rc=$?
+check 'crash before claim rename leaves no empty legacy evidence' \
+  "$([ "$crash_rc" = 99 ] && [ "$(cat "$MEMO")" = "$GENUINE" ] && [ "$(claim_count)" = 0 ] \
+    && [ "$(find "$PRO_GATE_HOME/legacy-review-receipts" -type f | wc -l)" -eq 0 ]; echo $?)"
+
+for shape in fifo symlink directory oversized; do
+  seed "special-$shape" current
+  special="$MEMO.rej.special"
+  case "$shape" in
+    fifo) mkfifo "$special";;
+    symlink) ln -s "$MEMO" "$special";;
+    directory) mkdir "$special";;
+    oversized) head -c 4097 /dev/zero > "$special";;
+  esac
+  check "shell memo reader rejects $shape without dropping its recovery path" \
+    "$(pg_memo_read "$special" >/dev/null; [ "$?" -ne 0 ] && [ -e "$special" ]; echo $?)"
+done
+
 # Extract the actual short engine predicate without executing the engine entry point.
 awk '/^pg_attempt_clean_scan\(\)/ {copy=1} copy {print} copy && /^}/ {exit}' "$ENGINE" > "$TDIR/clean-scan.sh"
 check 'actual engine clean-scan function was extracted' "$(grep -q '^pg_attempt_clean_scan()' "$TDIR/clean-scan.sh"; echo $?)"
@@ -199,6 +219,22 @@ pg_attempt_terminal_from_meta() { printf 'called\n' > "$TDIR/terminal-called"; r
 result="$(pg_reservation_note_miss "$MARKER")"
 check 'actual miss admission preserves reservation, miss count and charge with unresolved claim' \
   "$([ "$result" = 'retained unresolved-memo' ] && [ -f "$reservation" ] && [ "$(cat "$reservation")" = "$before" ] && [ ! -e "$TDIR/terminal-called" ]; echo $?)" "$result"
+
+mv "$MEMO.rej.pending" "$TDIR/held-claim"
+for store in conversation-urls legacy-review-receipts; do
+  ls() { [ "${2:-}" != "$PRO_GATE_HOME/$store" ] && command ls "$@"; }
+  result="$(pg_reservation_note_miss "$MARKER")"
+  unset -f ls
+  check "$store enumeration failure retains reservation and miss history" \
+    "$([ "$result" = 'retained unresolved-memo' ] && [ "$(cat "$reservation")" = "$before" ] \
+      && [ ! -e "$TDIR/terminal-called" ]; echo $?)"
+done
+# Exercise the actual non-root permission failure, not only an injected ls error.
+chmod 000 "$PRO_GATE_HOME/conversation-urls"
+pending_rc=0; pg_memo_claim_pending "$MARKER" || pending_rc=$?
+chmod 700 "$PRO_GATE_HOME/conversation-urls"
+check 'unreadable claim directory cannot be mistaken for absent claims' "$pending_rc"
+mv "$TDIR/held-claim" "$MEMO.rej.pending"
 
 # Execute the real memo/receipt sweep commands, bounded by stable neighbouring comments.
 awk '/^_pg_res_dir="\$\(pg_reservation_dir\)"/ {copy=1} /^# v0.42 \(#109\): salvage classification/ {copy=0} copy {print}' "$ENGINE" > "$TDIR/memo-sweep.sh"
