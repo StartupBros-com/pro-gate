@@ -1,4 +1,12 @@
 #!/usr/bin/env bash
+# shellcheck extended-analysis=false
+# The dataflow (control-flow graph) pass of ShellCheck is superlinear in file size. On this
+# file it needs over 6 GB and minutes (OOM-killed at a 6 GB cap; the whole-tree lint peaked
+# at 13.6 GB and pushed the host under Claude Code's background-shell reap line), against
+# 4 s and under 400 MB without it. At --severity=error the pass only contributes SC2218
+# (function used before its definition), so it is off for this file only. A comment line
+# must not begin with "# shellcheck" or it is read as a directive.
+# Measured 2026-09-28 with ShellCheck 0.11.0; see issue #244.
 # Engine-level regression tests for oracle-review.sh paths that need no ChatGPT account:
 #   - oversized-diff guard (exit 11, phase oversized, no slot spent)
 #   - --harvest against a still-generating conversation (exit 9, phase in-progress, tab kept)
