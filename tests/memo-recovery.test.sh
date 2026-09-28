@@ -279,5 +279,29 @@ touch -t 200001010000 "$PRO_GATE_HOME/legacy-review-receipts/$MARKER.rej.pending
 check 'legacy binding preserves unresolved recovery bytes without a reservation' \
   "$([ -f "$PRO_GATE_HOME/legacy-review-receipts/$MARKER.rej.pending" ]; echo $?)"
 
+# Without a blacklist line, the claim is the conviction's only durable record.
+seed unpublished-conviction current
+printf '%s\n' "$FOREIGN" > "$MEMO"
+printf() { if [ "$1" = '%s\t%s\n' ]; then return 1; fi; builtin printf "$@"; }
+pg_provenance_reject "$MARKER" "$FOREIGN"
+unset -f printf
+check 'a conviction whose blacklist append failed keeps its claim' \
+  "$([ "$(claim_count)" = 1 ] && [ "$(retained_body)" = "$FOREIGN" ] && [ ! -e "$MEMO" ] \
+    && pg_memo_claim_pending "$MARKER"; echo $?)"
+
+# 39-byte GitHub owner, 100-byte repository, 7-digit PR, epoch and 7-digit pid.
+seed long-marker current
+long="pg-run-$(printf '%39s' '' | tr ' ' o)-$(printf '%100s' '' | tr ' ' r)-9999999-1700000000-4194304"
+printf '%s\n' "$FOREIGN" > "$PRO_GATE_HOME/conversation-urls/$long"
+cat() { case "${1:-}" in *.rej.*) return 1;; esac; command cat "$@"; }
+head() { local arg; for arg in "$@"; do case "$arg" in *.rej.*) return 1;; esac; done; command head "$@"; }
+pg_provenance_reject "$long" "$FOREIGN"
+unset -f cat head
+long_claim="$(find "$PRO_GATE_HOME/conversation-urls" -maxdepth 1 -type f -name "$long.rej.*")"
+check 'the longest runtime marker is claimed within the filename limit' \
+  "$([ "${#long}" -eq 174 ] && [ -n "$long_claim" ] && [ "$(printf '%s' "${long_claim##*/}" | wc -c)" -le 255 ] \
+    && [ ! -e "$PRO_GATE_HOME/conversation-urls/$long" ] && [ "$(pg_memo_claim_marker "$long_claim")" = "$long" ] \
+    && pg_memo_claim_pending "$long"; echo $?)"
+
 if [ "$FAILURES" -gt 0 ]; then printf '%s memo recovery assertions failed\n' "$FAILURES" >&2; exit 1; fi
 printf 'ALL PASS: shell memo recovery\n'

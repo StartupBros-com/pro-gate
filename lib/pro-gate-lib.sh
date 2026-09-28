@@ -1381,19 +1381,22 @@ pg_delivery_snapshot_validate() { # one v2 disposition delivery value
 # merely because the strict disposition reader skipped it. This is a read-only uncertainty check
 # over the same per-change filenames. It never repairs, refunds, or removes any record.
 pg_delivery_history_unavailable() { # attempt snapshot -> 0 when potentially relevant bytes are uncertain
-  local snapshot="$1" key dir f marker marker_key json core epoch selected_epoch selected_marker
+  local snapshot="$1" key dir entries marker marker_key json core epoch selected_epoch selected_marker
   key="$(jq -r '.target.round_key // empty' <<<"$snapshot" 2>/dev/null)"
   [ -n "$key" ] || return 1
   pg_round_key_ok "$key" || return 0
   dir="$(pg_attempt_disposition_dir)"
   [ -e "$dir" ] || [ -L "$dir" ] || return 1
-  [ -d "$dir" ] && [ -x "$dir" ] && ls -A "$dir" >/dev/null 2>&1 || return 0
+  # Use the checked listing itself, not a second glob which could fail independently and skip
+  # a retained record. A listed candidate that cannot then be read stays uncertain.
+  [ -d "$dir" ] && [ -x "$dir" ] || return 0
+  entries="$(LC_ALL=C ls -A1 "$dir" 2>/dev/null)" || return 0
   selected_epoch="$(jq -r '.charged_spend_epoch // 0' <<<"$snapshot")"
   selected_marker="$(jq -r '.marker // empty' <<<"$snapshot")"
   case "$selected_epoch" in ''|*[!0-9]*) selected_epoch=0;; esac
-  for f in "$dir"/pg-run-"$key"-*; do
-    [ -e "$f" ] || [ -L "$f" ] || continue
-    marker="${f##*/}"; marker_key="${marker#pg-run-}"; marker_key="${marker_key%-*-*}"
+  while IFS= read -r marker; do
+    case "$marker" in "pg-run-$key-"*) ;; *) continue;; esac
+    marker_key="${marker#pg-run-}"; marker_key="${marker_key%-*-*}"
     [ "$marker_key" = "$key" ] || continue
     if ! json="$(pg_attempt_disposition_read "$marker" 2>/dev/null)"; then
       # A damaged delivery payload can still have valid target/charge metadata. Use that
@@ -1409,7 +1412,7 @@ pg_delivery_history_unavailable() { # attempt snapshot -> 0 when potentially rel
          || { [ "$selected_epoch" -eq "$epoch" ] && [[ "$selected_marker" > "$marker" ]]; }; then continue; fi
       return 0
     fi
-  done
+  done <<<"$entries"
   return 1
 }
 
@@ -3487,7 +3490,7 @@ pg_provenance_reject() {  # <marker> [matched-url]
   # renamed aside first, its content checked against the rejected URL, and restored when it
   # names a DIFFERENT (newer, possibly genuine) conversation — a read-append-remove sequence
   # left a window where a concurrently refreshed genuine memo was deleted by a stale compare.
-  local m="$1" url="${2:-}" memo claim="" snap receipt="" digest token
+  local m="$1" url="${2:-}" memo claim="" snap receipt="" digest token published=1
   pg_reservation_marker_ok "$m" || return 0
   memo="$PRO_GATE_HOME/conversation-urls/$m"
   # With no explicit conviction, establish the URL before claiming. A failed read leaves
@@ -3501,24 +3504,30 @@ pg_provenance_reject() {  # <marker> [matched-url]
   # A recall may discover the claim immediately after rename. Publish an explicit conviction
   # first so it cannot restore that rejected URL while this process is still inspecting it.
   if [ -n "$url" ]; then
-    { printf '%s\t%s\n' "$m" "$url" >> "$PRO_GATE_HOME/salvage-nonmatching.txt"; } 2>/dev/null || true
+    { printf '%s\t%s\n' "$m" "$url" >> "$PRO_GATE_HOME/salvage-nonmatching.txt"; } 2>/dev/null && published=0
   fi
   # A legacy round's memo is claimed straight into its receipt (pg_legacy_review_receipt_path);
   # when that receipt cannot exist, the memo is not claimed at all.
-  # Like the Node UUID claim, this name exists only once the memo inode lands. A mktemp
+  # Like the Node claim, this name exists only once the memo inode lands. A mktemp
   # placeholder in the receipt store would itself become false legacy-review evidence on crash.
-  token="$(LC_ALL=C od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')" || return 0
-  [[ "$token" =~ ^[0-9a-f]{32}$ ]] || return 0
+  # The suffix is bounded as in cdp-salvage.mjs memoClaimName: 38 bytes after a marker of at
+  # most 174 bytes stays under the common 255-byte filename limit.
+  token="$(LC_ALL=C od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')" || return 0
+  [[ "$token" =~ ^[0-9a-f]{16}$ ]] || return 0
   if receipt="$(pg_legacy_review_receipt_path "$m")"; then
-    claim="$PRO_GATE_HOME/legacy-review-receipts/$m.rej.$digest.$token"
+    claim="$PRO_GATE_HOME/legacy-review-receipts/$m.rej.${digest:0:16}.$token"
   elif [ $? -eq 1 ]; then
-    receipt=""; claim="$memo.rej.$digest.$token"
+    receipt=""; claim="$memo.rej.${digest:0:16}.$token"
   fi
   if [ -n "$claim" ] && [ ! -e "$claim" ] && [ ! -L "$claim" ] && mv "$memo" "$claim" 2>/dev/null; then
     if snap="$(pg_memo_read "$claim")"; then
       snap="${snap//$'\n'/}"
-      if [ "$snap" = "$url" ] || [ -z "$snap" ]; then
+      if [ -z "$snap" ] || { [ "$snap" = "$url" ] && [ "$published" -eq 0 ]; }; then
         pg_memo_claim_resolve "$claim" "$receipt"
+      elif [ "$snap" = "$url" ]; then
+        # Without a blacklist line, this claim is the conviction's only durable record.
+        # Ordinary recall publishes it before resolving the claim.
+        :
       elif { ln "$claim" "$memo" 2>/dev/null && [ "$claim" -ef "$memo" ]; } \
         || { [ -f "$memo" ] && [ ! -L "$memo" ] && { [ "$claim" -ef "$memo" ] || cmp -s "$claim" "$memo"; }; }; then
         # A hard link never overwrites a concurrent memo. Resolved legacy receipts remain

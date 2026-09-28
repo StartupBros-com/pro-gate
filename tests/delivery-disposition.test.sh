@@ -393,6 +393,21 @@ malformed_v2(){
   printf '{truncated' > "$(pg_attempt_disposition_dir)/$RUN_MARKER"
   expect_facts unavailable null
 }
+listed_history_access_lost(){
+  setup listed-access-lost && no_send && mutate_disposition 'del(.delivery)' || return 1
+  local dir condition terminal rc=0
+  dir="$(pg_attempt_disposition_dir)"
+  condition="$(pg_delivery_condition_json "$RELATION" "$INPUT" auto 1.0-fixture)" || return 1
+  # Access lost after the checked listing keeps the damaged record uncertain, never absent.
+  ls(){ command ls "$@" || return; [ "${2:-}" != "$dir" ] || chmod 000 "$dir"; }
+  expect_facts unavailable null || rc=1
+  chmod 700 "$dir"
+  terminal="$(pg_delivery_snapshot_json github.com acme delivery 77 "$ROUND_KEY" \
+    "pg-run-$ROUND_KEY-$((fixture_epoch + 99))-99" "$condition")" || rc=1
+  chmod 700 "$dir"
+  jq -e '.state=="unavailable" and .consecutive==null' <<<"$terminal" >/dev/null || rc=1
+  return "$rc"
+}
 single_json_and_binding(){
   setup single-json && charge && pg_fresh_dispatch_record_undelivered || return 1
   if pg_fresh_dispatch_refund "$PG_FRESH_DELIVERY_SNAPSHOT $PG_FRESH_DELIVERY_SNAPSHOT"; then return 1; fi
@@ -506,6 +521,7 @@ run_case 'v1 sidecars remain readable without treating unknown build as changed'
 run_case 'new Cloudflare is not a delivery failure and supersedes older damaged payloads' cloudflare_and_ordering
 run_case 'a newer sent terminal attempt supersedes an older damaged delivery payload' sent_breaks_history
 run_case 'missing, malformed and truncated v2 records never disappear into a fresh grant' malformed_v2
+run_case 'access lost after the checked listing keeps damaged history unavailable' listed_history_access_lost
 run_case 'multiple JSON snapshots are refused and previous contract bindings stay valid' single_json_and_binding
 run_case 'multiple legacy JSON records cannot hide corruption behind a final valid value' legacy_multiple_json
 run_case 'symlinked disposition cannot supply ordering evidence' symlink_disposition

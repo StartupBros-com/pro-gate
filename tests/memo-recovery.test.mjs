@@ -119,7 +119,11 @@ for (const legacy of [false, true]) {
       assert.equal(f.fresh().recall(marker), held === foreign ? null : genuine);
       assert.equal(f.claims().length, 0);
       assert.equal(fs.existsSync(f.memo), held !== foreign);
-      assert.equal(fs.readFileSync(f.blacklist, "utf8"), previous);
+      // Recovery publishes the conviction before removing its last record.
+      assert.equal(
+        fs.readFileSync(f.blacklist, "utf8"),
+        held === foreign ? `${previous}${marker}\t${foreign}\n` : previous,
+      );
       assert.equal(
         fs.readdirSync(f.dirs.LEGACY_RECEIPT_DIR).length,
         legacy ? 1 : 0,
@@ -255,7 +259,10 @@ pg_provenance_reject "$3" "$4"
         );
         assert.equal(f.claims().length, 0);
         assert.equal(fs.existsSync(f.memo), held !== foreign);
-        assert.equal(fs.readFileSync(f.blacklist, "utf8"), previous);
+        assert.equal(
+          fs.readFileSync(f.blacklist, "utf8"),
+          held === foreign ? `${previous}${marker}\t${foreign}\n` : previous,
+        );
         assert.equal(
           fs.readdirSync(f.dirs.LEGACY_RECEIPT_DIR).length,
           legacy ? 1 : 0,
@@ -264,6 +271,72 @@ pg_provenance_reject "$3" "$4"
     }
   }
 }
+
+const urlDigest = (url) => createHash("sha256").update(url).digest("hex");
+// Claims written before bounded names carried the full digest and a UUID.
+const oldClaim = (f, url) =>
+  path.join(f.dirs.URL_MEMO_DIR, `${marker}.rej.${urlDigest(url)}.${randomUUID()}`);
+
+test("a sibling's conviction blocks restoration and stays until the blacklist records it", (t) => {
+  const f = fixture(t);
+  // One interrupted revocation convicted another URL but claimed the replacement memo; a
+  // later one convicted that replacement. Neither conviction reached the blacklist.
+  const replacedClaim = oldClaim(f, foreign);
+  const convictingClaim = oldClaim(f, newer);
+  fs.writeFileSync(replacedClaim, newer);
+  fs.writeFileSync(convictingClaim, newer);
+  f.proxy.appendFileSync = () => {
+    throw fail();
+  };
+  assert.equal(f.api.recall(marker), null);
+  assert.equal(fs.existsSync(f.memo), false);
+  assert.deepEqual(f.claims().sort(), [replacedClaim, convictingClaim].sort());
+  assert.equal(f.api.unresolved(marker), true);
+  assert.equal(f.fresh().recall(marker), null);
+  assert.equal(fs.existsSync(f.memo), false);
+  assert.equal(f.claims().length, 0);
+  assert.equal(fs.readFileSync(f.blacklist, "utf8"), `${marker}\t${newer}\n`);
+});
+
+test("an unread sibling keeps a restored claim's unpublished conviction", (t) => {
+  const f = fixture(t);
+  // The restored claim names the URL its process convicted; the unread sibling may hold it.
+  const restoredClaim = oldClaim(f, foreign);
+  const unreadClaim = oldClaim(f, newer);
+  fs.writeFileSync(restoredClaim, genuine);
+  fs.writeFileSync(unreadClaim, foreign);
+  f.proxy.openSync = (file, ...rest) => {
+    if (file === unreadClaim) throw fail();
+    return fs.openSync(file, ...rest);
+  };
+  assert.equal(f.api.recall(marker), genuine);
+  assert.deepEqual(f.claims().sort(), [restoredClaim, unreadClaim].sort());
+  assert.equal(f.api.unresolved(marker), true);
+  assert.equal(f.fresh().recall(marker), genuine);
+  assert.equal(f.claims().length, 0);
+  assert.equal(fs.readFileSync(f.blacklist, "utf8"), `${marker}\t${foreign}\n`);
+});
+
+test("the longest runtime marker is claimed within the filename limit", (t) => {
+  const f = fixture(t);
+  // 39-byte GitHub owner, 100-byte repository, 7-digit PR, epoch and 7-digit pid.
+  const long = `pg-run-${"o".repeat(39)}-${"r".repeat(100)}-9999999-1700000000-4194304`;
+  assert.equal(long.length, 174);
+  const memo = path.join(f.dirs.URL_MEMO_DIR, long);
+  const longClaims = () =>
+    fs.readdirSync(f.dirs.URL_MEMO_DIR).filter((n) => n.startsWith(`${long}.rej.`));
+  fs.writeFileSync(memo, foreign);
+  f.proxy.readSync = () => {
+    throw fail();
+  };
+  assert.equal(f.api.forget(long, foreign), null);
+  assert.equal(fs.existsSync(memo), false);
+  assert.equal(longClaims().length, 1);
+  assert.ok(Buffer.byteLength(longClaims()[0]) <= 255);
+  assert.equal(f.fresh().recall(long), null);
+  assert.equal(longClaims().length, 0);
+  assert.equal(fs.readFileSync(f.blacklist, "utf8"), `${long}\t${foreign}\n`);
+});
 
 test("replacement before claim restores the actual newer inode", (t) => {
   const f = fixture(t);

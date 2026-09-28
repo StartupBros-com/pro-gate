@@ -302,15 +302,40 @@ function memoClaimMarker(name) {
   return match ? match[1] : name;
 }
 
-function memoClaimRejects(claim, url) {
-  const suffix = path
-    .basename(claim)
-    .slice(path.basename(claim).lastIndexOf('.rej.') + 5);
-  const digest = suffix.split('.')[0];
+// The longest marker (39-byte GitHub owner and 100-byte repository in the PR key) is 174
+// bytes; this 38-byte suffix keeps the claim under the common 255-byte filename limit.
+// Earlier claims carry the full 64-hex digest and a UUID, and both shapes remain readable.
+function memoClaimName(m, url) {
+  const digest = createHash('sha256').update(url).digest('hex').slice(0, 16);
+  return `${m}.rej.${digest}.${randomUUID().replaceAll('-', '').slice(0, 16)}`;
+}
+
+function memoClaimDigest(claim) {
+  const name = path.basename(claim);
+  const digest = name.slice(name.lastIndexOf('.rej.') + 5).split('.')[0];
+  return /^(?:[0-9a-f]{16}|[0-9a-f]{64})$/.test(digest) ? digest : null;
+}
+
+// A claim name records the URL its rejecting process convicted, whichever claim holds it.
+function memoClaimConvicts(claim, url) {
+  const digest = memoClaimDigest(claim);
   return (
-    /^[0-9a-f]{64}$/.test(digest) &&
-    digest === createHash('sha256').update(url).digest('hex')
+    digest !== null &&
+    createHash('sha256').update(url).digest('hex').startsWith(digest)
   );
+}
+
+// Until the blacklist records a conviction, a claim naming it is its only durable record.
+function memoRejectionPublished(m, url, rejected) {
+  if (!conversationUrlOk(url) || rejected.has(url)) return true;
+  try {
+    fs.appendFileSync(BLACKLIST_FILE, `${m}\t${url}\n`);
+    rejected.add(url);
+    return true;
+  } catch {
+    unresolvedMemos.add(m);
+    return false;
+  }
 }
 
 function memoClaimRestored(claim, canonical) {
@@ -383,34 +408,55 @@ function recoverMemoClaims(m) {
   if (!claims.length) return;
   const rejected = memoBlacklist(m);
   if (!rejected) return;
+  const held = new Map();
+  let unseen = false;
   for (const claim of claims) {
-    let held;
     try {
-      held = memoBytes(claim).trim();
+      held.set(claim, memoBytes(claim).trim());
     } catch (error) {
-      if (error.code !== 'ENOENT') unresolvedMemos.add(m);
-      continue;
+      if (error.code !== 'ENOENT') {
+        unresolvedMemos.add(m);
+        unseen = true;
+      }
     }
-    if (
-      !conversationUrlOk(held) ||
-      rejected.has(held) ||
-      memoClaimRejects(claim, held)
-    ) {
-      resolveMemoClaim(m, claim);
+  }
+  // Every claim's conviction applies to all of them, so processing order cannot restore a
+  // URL a sibling rejected. A claim is resolved only once its own conviction is durable: the
+  // blacklist holds every read URL it names, or none names it and no claim went unread.
+  const foreign = (url) =>
+    !conversationUrlOk(url) ||
+    rejected.has(url) ||
+    claims.some((claim) => memoClaimConvicts(claim, url));
+  const durable = (claim) => {
+    if (memoClaimDigest(claim) === null) return true;
+    const named = [...held.values()].filter((url) =>
+      memoClaimConvicts(claim, url),
+    );
+    return named.length
+      ? named.every((url) => !conversationUrlOk(url) || rejected.has(url))
+      : !unseen;
+  };
+  const settled = [];
+  for (const [claim, url] of held) {
+    if (foreign(url)) {
+      if (memoRejectionPublished(m, url, rejected)) settled.push(claim);
       continue;
     }
     try {
       fs.linkSync(claim, memoPath(m));
-      resolveMemoClaim(m, claim);
+      settled.push(claim);
     } catch (error) {
-      if (error.code === 'EEXIST' && memoClaimRestored(claim, memoPath(m))) {
-        resolveMemoClaim(m, claim);
-        continue;
-      }
       // EEXIST means a concurrent memo won, not that this alternate URL is foreign.
       // All other link failures are I/O uncertainty. Neither permits deleting the claim.
-      unresolvedMemos.add(m);
+      if (error.code === 'EEXIST' && memoClaimRestored(claim, memoPath(m)))
+        settled.push(claim);
+      else unresolvedMemos.add(m);
     }
+  }
+  // Resolve only after every publication above, so no claim's position decides durability.
+  for (const claim of settled) {
+    if (durable(claim)) resolveMemoClaim(m, claim);
+    else unresolvedMemos.add(m);
   }
 }
 
@@ -493,26 +539,25 @@ function recallTitle(m) {
 // receipt (pro-gate #227 rounds 3-5). Mirrors the shell's pg_legacy_review_receipt_path.
 // Returns the receipt path, null for a marker without a legacy binding, or false when a legacy
 // memo cannot be receipted, in which case the caller keeps the memo.
-function legacyReceiptPath(m, digest) {
+function legacyReceiptPath(m, url) {
   if (!legacyReviewBinding(m)) return null;
   try {
     fs.mkdirSync(LEGACY_RECEIPT_DIR, { recursive: true });
   } catch {
     return false;
   }
-  return path.join(LEGACY_RECEIPT_DIR, `${m}.rej.${digest}.${randomUUID()}`);
+  return path.join(LEGACY_RECEIPT_DIR, memoClaimName(m, url));
 }
 
 function forgetUrl(m, url) {
   const f = memoPath(m);
   if (!f) return null;
-  const digest = createHash('sha256').update(url).digest('hex');
-  const receipt = legacyReceiptPath(m, digest);
+  const receipt = legacyReceiptPath(m, url);
   if (receipt === false) {
     unresolvedMemos.add(m);
     return null;
   }
-  const claim = receipt ?? `${f}.rej.${digest}.${randomUUID()}`;
+  const claim = receipt ?? path.join(URL_MEMO_DIR, memoClaimName(m, url));
   try {
     fs.renameSync(f, claim);
   } catch (error) {
@@ -529,7 +574,7 @@ function forgetUrl(m, url) {
   const rejected = memoBlacklist(m);
   if (!rejected) return null;
   if (held === url || !conversationUrlOk(held) || rejected.has(held)) {
-    resolveMemoClaim(m, claim);
+    if (memoRejectionPublished(m, held, rejected)) resolveMemoClaim(m, claim);
   } else {
     try {
       fs.linkSync(claim, f);
