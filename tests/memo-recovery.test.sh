@@ -235,6 +235,14 @@ pending_rc=0; pg_memo_claim_pending "$MARKER" || pending_rc=$?
 chmod 700 "$PRO_GATE_HOME/conversation-urls"
 check 'unreadable claim directory cannot be mistaken for absent claims' "$pending_rc"
 mv "$TDIR/held-claim" "$MEMO.rej.pending"
+ls() {
+  command ls "$@" || return
+  if [ "${2:-}" = "$PRO_GATE_HOME/conversation-urls" ]; then chmod 000 "$2"; fi
+}
+pending_rc=0; pg_memo_claim_pending "$MARKER" || pending_rc=$?
+unset -f ls
+chmod 700 "$PRO_GATE_HOME/conversation-urls"
+check 'checked listing retains its claim when storage fails before a second enumeration' "$pending_rc"
 
 # Execute the real memo/receipt sweep commands, bounded by stable neighbouring comments.
 awk '/^_pg_res_dir="\$\(pg_reservation_dir\)"/ {copy=1} /^# v0.42 \(#109\): salvage classification/ {copy=0} copy {print}' "$ENGINE" > "$TDIR/memo-sweep.sh"
