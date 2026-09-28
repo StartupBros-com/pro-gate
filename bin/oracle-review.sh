@@ -525,6 +525,7 @@ pg_review_decision_cli() {
   local endpoint reviewed manifest confirmation endpoint_digest reviewed_digest manifest_digest confirmation_digest lineage mode ship_digest
   local reservation_marker="" reservation_state=none governor_granted=false cooldown_left=0 completed='[]' prior_candidates='[]' prior_review result artifact artifact_digest canonical
   local facts governor_facts decision effect_ok=false prospective exact_inputs='[]' choice_candidates='[]' choice_outcomes='[]' choice_selected="" choice_snapshot="" selection="" selection_supplied=false current_verdict=NONE current_canonical="" effect_input attempt_snapshot attempt_source parsed_verdict stored_verdict
+  local delivery_relation delivery_facts
   local pr_evidence="" legacy_pr_identity=false
 
   pg_have jq || { echo 'ERROR: review-decision/v1 requires jq' >&2; return 2; }
@@ -580,7 +581,7 @@ pg_review_decision_cli() {
     input_binding_valid=true; input_proven=true
     # The reducer sees the complete relation identity, not the human-facing evidence label: a
     # scoped manifest or confirmation change is changed evidence even when its label is stable.
-    evidence_identity="relation:$(pg_review_sha256_text "$desired_relation")"; evidence_state=matching
+    evidence_identity="$(pg_review_relation_identity "$prospective")"; evidence_state=matching
   else
     desired_relation=""
   fi
@@ -695,7 +696,7 @@ pg_review_decision_cli() {
       fi
     else
       prior_candidates="$(jq -cS --arg marker "$marker" --arg canonical "$canonical" --arg code "$code_identity" \
-        --arg evidence "relation:$(pg_review_sha256_text "$candidate_relation")" --argjson epoch "$(jq -r .charged_spend_epoch <<<"$candidate")" \
+        --arg evidence "$(pg_review_relation_identity "$candidate")" --argjson epoch "$(jq -r .charged_spend_epoch <<<"$candidate")" \
         --arg verdict "$(jq -r .verdict <<<"$result")" \
         '. + [{canonical_identity:$canonical,charged_spend_epoch:$epoch,code_identity:$code,evidence_identity:$evidence,marker:$marker,verdict:$verdict}]' <<<"$prior_candidates")"
     fi
@@ -776,16 +777,20 @@ pg_review_decision_cli() {
   # #162: the account back-off cooldown is a normalized fact, so a wrapper learns how long to
   # wait from the closed decision instead of retrying a query that pg_health_gate would refuse.
   cooldown_left="$(pg_cooldown_remaining_secs)"; case "$cooldown_left" in ''|*[!0-9]*) cooldown_left=0;; esac
+  # #204: how many proven no-send attempts in a row this exact relation, input mode, attachment
+  # policy and Oracle build have produced; the guarded recheck builds it with the same helper.
+  delivery_relation=""; [ "$evidence_state" != matching ] || delivery_relation="$evidence_identity"
+  delivery_facts="$(pg_delivery_facts_json "$attempt_snapshot" "$delivery_relation" "$INPUT")" || return 2
 
   facts="$(jq -cnS --arg h "$host" --arg o "$owner" --arg r "$repo_name" --arg head "$head" --argjson pr "$pr_num" \
     --arg identity "$input_identity" --arg evidence "$evidence_identity" --arg state "$evidence_state" \
     --arg marker "$active_marker" --arg astate "$active_state" --arg reservation "$reservation_marker" --arg rstate "$reservation_state" \
     --argjson input_proven "$input_proven" --argjson input_binding "$input_binding_valid" --argjson governor "$governor_facts" \
-    --argjson cooldown_left "$cooldown_left" \
+    --argjson cooldown_left "$cooldown_left" --argjson delivery "$delivery_facts" \
     --argjson completed "$completed" --argjson prior "$prior_review" --argjson choices "$choice_outcomes" --arg choice "$choice_selected" --arg choice_snap "$choice_snapshot" --arg cd "$(pg_review_decision_contract_digest)" --arg xd "$(pg_review_decision_corpus_digest)" '
     {active_index:{binding_valid:$input_binding,charged_spend_epoch:0,marker:$marker,state:$astate},completed_results:$completed,
      contract:{contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,corpus_digest:$xd},
-     cooldown:{active:($cooldown_left > 0),seconds_remaining:$cooldown_left},
+     cooldown:{active:($cooldown_left > 0),seconds_remaining:$cooldown_left},delivery:$delivery,
      evidence:{identity:$evidence,safe_to_prepare:true,state:$state},governor:$governor,
      input:{binding_valid:$input_binding,identity:$identity,proven:$input_proven},named_choice:{outcomes:$choices,selected_id:(if $choice=="" then null else $choice end),snapshot_digest:$choice_snap},
      observation:{kind:"idle"},prior_review:$prior,
@@ -2102,7 +2107,7 @@ pg_fresh_dispatch_recheck() { # sets PG_FRESH_DECISION/PG_FRESH_ACTION
   local template="$REVIEW_DECISION_INPUT_TEMPLATE" marker="" state=none epoch=0 f rec m astate="" completed='[]' attempt_snapshot attempt_source
   local input_ok=false input_digest evidence identity head base active_marker="" reservation="" granted=false cooldown_left=0 facts governor_facts
   local template_relation="" candidate="" candidate_relation="" artifact="" artifact_digest="" pr_evidence=""
-  local input_binding legacy_reviewed=false exact_seen=false
+  local input_binding legacy_reviewed=false exact_seen=false delivery_relation delivery_facts
   [ -n "$template" ] || return 1
   input_digest="$(pg_review_sha256_text "$template" 2>/dev/null || true)"
   head="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || true)"
@@ -2171,10 +2176,14 @@ pg_fresh_dispatch_recheck() { # sets PG_FRESH_DECISION/PG_FRESH_ACTION
   pg_round_guard "$ROUND_KEY" >/dev/null 2>&1 && granted=true
   governor_facts="$(pg_round_governor_facts_json "$ROUND_KEY" "$granted")" || return 1
   cooldown_left="$(pg_cooldown_remaining_secs)"; case "$cooldown_left" in ''|*[!0-9]*) cooldown_left=0;; esac
+  # #204: the query's own helpers over the same relation identity (the template IS the query's
+  # current relation, so its identity equals the query's evidence identity).
+  delivery_relation=""; [ -z "$template_relation" ] || delivery_relation="$(pg_review_relation_identity "$template")"
+  delivery_facts="$(pg_delivery_facts_json "$attempt_snapshot" "$delivery_relation" "$INPUT")" || return 1
   facts="$(jq -cnS --arg h "$PG_META_HOST" --arg o "$PG_META_OWNER" --arg r "$PG_META_REPO" --arg head "$head" --argjson p "$PR_NUM" \
     --arg identity "$identity" --arg evidence "$evidence" --arg marker "$active_marker" --arg astate "${astate:-none}" --arg reservation "$reservation" \
-    --argjson valid "$input_ok" --argjson input_binding "$input_binding" --argjson governor "$governor_facts" --argjson cooldown_left "$cooldown_left" --argjson completed "$completed" --arg cd "$(pg_review_decision_contract_digest)" --arg xd "$(pg_review_decision_corpus_digest)" \
-    '{active_index:{binding_valid:$input_binding,charged_spend_epoch:0,marker:$marker,state:$astate},completed_results:$completed,contract:{contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,corpus_digest:$xd},cooldown:{active:($cooldown_left > 0),seconds_remaining:$cooldown_left},evidence:{identity:$evidence,safe_to_prepare:true,state:(if $valid then "matching" else "missing" end)},governor:$governor,input:{binding_valid:$input_binding,identity:$identity,proven:$valid},named_choice:{outcomes:[],selected_id:null,snapshot_digest:""},observation:{kind:"idle"},prior_review:{applicable:false,binding_valid:false,code_identity:"",evidence_identity:"",legacy:false,marker:"",provenance_valid:false,verdict:"NONE"},reservation:{binding_valid:false,legacy:false,marker:$reservation,state:(if $reservation=="" then "none" else "live" end)},target:{head_oid:$head,host:$h,owner:$o,pr:$p,repo:$r},transport:"review-decision/v1"}')" || return 1
+    --argjson valid "$input_ok" --argjson input_binding "$input_binding" --argjson governor "$governor_facts" --argjson cooldown_left "$cooldown_left" --argjson delivery "$delivery_facts" --argjson completed "$completed" --arg cd "$(pg_review_decision_contract_digest)" --arg xd "$(pg_review_decision_corpus_digest)" \
+    '{active_index:{binding_valid:$input_binding,charged_spend_epoch:0,marker:$marker,state:$astate},completed_results:$completed,contract:{contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,corpus_digest:$xd},cooldown:{active:($cooldown_left > 0),seconds_remaining:$cooldown_left},delivery:$delivery,evidence:{identity:$evidence,safe_to_prepare:true,state:(if $valid then "matching" else "missing" end)},governor:$governor,input:{binding_valid:$input_binding,identity:$identity,proven:$valid},named_choice:{outcomes:[],selected_id:null,snapshot_digest:""},observation:{kind:"idle"},prior_review:{applicable:false,binding_valid:false,code_identity:"",evidence_identity:"",legacy:false,marker:"",provenance_valid:false,verdict:"NONE"},reservation:{binding_valid:false,legacy:false,marker:$reservation,state:(if $reservation=="" then "none" else "live" end)},target:{head_oid:$head,host:$h,owner:$o,pr:$p,repo:$r},transport:"review-decision/v1"}')" || return 1
   PG_FRESH_DECISION="$(pg_review_decision_reduce "$facts")" || return 1
   PG_FRESH_ACTION="$(jq -r .action <<<"$PG_FRESH_DECISION")"
   [ "$PG_FRESH_ACTION" = run-granted-review ]
@@ -2200,6 +2209,26 @@ pg_install_effect_input_binding() { # clone the already-current validated relati
   [ -n "${RUN_SPEND_EPOCH:-}" ] || return 1
   binding="$(jq -cS --arg marker "$RUN_MARKER" --argjson epoch "$RUN_SPEND_EPOCH" '.marker=$marker | .charged_spend_epoch=$epoch' <<<"$REVIEW_DECISION_INPUT_TEMPLATE")" || return 1
   pg_review_input_binding_write "$RUN_MARKER" "$binding"
+}
+# #204: before a proven no-send attempt's disposition exists, record the delivery condition it
+# failed under, so the next query can stop an unchanged repeat instead of granting it. Only a
+# review-decision effect carries the relation the query compares against, and only the
+# session-metadata no-send proof calls this: a Cloudflare challenge refunds through the same path
+# but is an account state with its own cooldown, not a delivery that a changed condition repairs.
+# Best effort: a missing record means the next query counts from zero, the behavior before it.
+pg_fresh_dispatch_record_undelivered() {
+  local relation oracle_id
+  [ -n "${REVIEW_DECISION_INPUT_TEMPLATE:-}" ] && [ -n "${PR_NUM:-}" ] && [ -n "${PG_META_HOST:-}" ] \
+    && [ -n "${PG_META_OWNER:-}" ] && [ -n "${PG_META_REPO:-}" ] || return 0
+  relation="$(pg_review_relation_identity "$REVIEW_DECISION_INPUT_TEMPLATE" || true)"
+  oracle_id="${PG_DISPATCH_ORACLE_ID:-$(pg_oracle_identity)}"
+  [ "$oracle_id" != unknown ] \
+    || echo "[oracle-review] Oracle's version could not be read, so this attempt's delivery condition records its build as unknown; a later query that can read it counts from zero (#204)." >&2
+  if [ -z "$relation" ] || ! pg_delivery_condition_record "$PG_META_HOST" "$PG_META_OWNER" "$PG_META_REPO" "$PR_NUM" \
+       "$ROUND_KEY" "$RUN_MARKER" "$(pg_delivery_condition_digest "$relation" \
+         "$INPUT" "${PRO_GATE_BROWSER_ATTACHMENTS:-auto}" "$oracle_id")" 2>/dev/null; then
+    echo "[oracle-review] could not record this attempt's delivery condition; an unchanged repeat will not be stopped (#204)." >&2
+  fi
 }
 pg_fresh_dispatch_refund() { # terminalize and refund only the current exact charged attempt
   [ -n "${RUN_SPEND_EPOCH:-}" ] || return 1
@@ -3958,6 +3987,10 @@ fi
 # Slot acquisition is not submission authority. A completed/recoverable predecessor, moved
 # target/evidence, or governor change that arrived in the slot wait must win before charging.
 [ "${REVIEW_DECISION_EXECUTE:-0}" != 1 ] || pg_fresh_dispatch_require_run post-slot-pre-charge
+# #204 gate r2: the Oracle build that will attempt this Send, read before it runs. A proven no-send
+# records this build, not whichever one is installed by the time the failed attempt finishes: an
+# upgrade made during that attempt is the repair, and must not inherit its failure.
+[ "${REVIEW_DECISION_EXECUTE:-0}" != 1 ] || PG_DISPATCH_ORACLE_ID="$(pg_oracle_identity)"
 if [ "${PG_FULL_PR_PROVEN:-0}" = 1 ] && ! pg_pr_evidence_current "$PG_FULL_PR_EVIDENCE"; then
   echo 'ERROR: prepared PR head/base is no longer current; no review submitted' >&2
   pg_status failed "PR evidence changed before charge"
@@ -4848,6 +4881,7 @@ else
   if [ "${SALVAGE_RAN:-0}" = 1 ] \
      && pg_attempt_provably_unsubmitted "${SALVAGE_RC:-0}"; then
     echo "[oracle-review] Oracle's exact session metadata proves Send was never dispatched (browser scanned clean, no URL memoized, browser stable): refunding this round; zero Pro quota was spent." >&2
+    pg_fresh_dispatch_record_undelivered
     pg_fresh_dispatch_refund \
       || { echo "[oracle-review] charged marker state could not be proven for refund; preserving it for recovery." >&2; FAIL_DETAIL="submission fate uncertain; charged state preserved for recovery"; }
     [ "${FAIL_DETAIL:-}" = "submission fate uncertain; charged state preserved for recovery" ] || FAIL_DETAIL="submission never landed (send/upload failure before the prompt reached ChatGPT); round refunded, safe to retry"

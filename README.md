@@ -352,6 +352,14 @@ this run's own is charged once per conversation-and-text fingerprint per seven d
 (`PRO_GATE_THROTTLE_SEEN_TTL`, records under `throttle.cooldown.seen.d/`), so a stale notice
 left on an abandoned tab cannot re-arm the cooldown on every attempt; a modal over the run's
 own conversation always re-arms it.
+When Oracle's own session record proves a fresh review's Send was never dispatched (an attachment
+that never registered, for example), the round is refunded and the attempt's delivery condition is
+recorded: the evidence relation, input mode, `PRO_GATE_BROWSER_ATTACHMENTS` and the installed
+Oracle build. After two such attempts in a row under one condition, the typed query returns
+`stop-without-new-review` / `delivery-failed-unchanged` (count in `facts.delivery`) instead of
+granting a third identical run. A new head, a changed attachment policy or input mode, or a new
+Oracle build grants again; so does one operator run with `PRO_GATE_FORCE_ROUND=1`. A Cloudflare
+challenge is an account cooldown, not a delivery failure, and is not counted.
 Missing or malformed binding/GitHub proof leaves the review generating. Its plain states
 are **Review ready**, **Checking for completed review**, **Still working**, **Review superseded**,
 **No review remains**, and **Browser needs attention**. `Review superseded` means old-head or closed-PR

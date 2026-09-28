@@ -37,21 +37,25 @@ validate_contract_and_corpus() { # contract corpus
     ([.action_effects[] | select(.action != .effect)] | length == 0) and
     ([.action_effects[] | select(.execution_class == "named-product-choice")] | length == 1) and
     ([.action_effects[] | select(.execution_class == "named-product-choice") | .action] == ["ask-named-product-choice"]) and
-    (.reasons | index("account-cooldown-active") != null)
+    (.reasons | index("account-cooldown-active") != null) and
+    (.reasons | index("delivery-failed-unchanged") != null)
   ' "$contract" >/dev/null || return 1
 
   jq -e --slurpfile contract "$contract" '
     .contract_id == $contract[0].contract_id and .corpus_version == 1 and
-    (.base_facts | keys | sort) == ["active_index","completed_results","cooldown","evidence","governor","input","named_choice","observation","prior_review","reservation","target","transport"] and
+    (.base_facts | keys | sort) == ["active_index","completed_results","cooldown","delivery","evidence","governor","input","named_choice","observation","prior_review","reservation","target","transport"] and
     .base_facts.transport == "review-decision/v1" and
     ([.. | objects | keys[] | select(. == "status" or . == "next_action")] | length == 0) and
-    (.cases | length == 14) and
+    (.cases | length == 17) and
     ([.cases[].expected.action] | unique | sort) == ([$contract[0].action_effects[].action] | sort) and
     ([.cases[] | select(.expected.action != .expected.effect)] | length == 0) and
     ([.cases[] | select(.expected.execution_class == "named-product-choice") | .expected.action] == ["ask-named-product-choice"]) and
-    ([.cases[] | select(.expected.execution_class != "named-product-choice") | .expected.action] | length == 13) and
+    ([.cases[] | select(.expected.execution_class != "named-product-choice") | .expected.action] | length == 16) and
     any(.cases[]; .expected.reason == "account-cooldown-active" and .patch.cooldown.active == true) and
-    (.base_facts.cooldown == {active:false,seconds_remaining:0})
+    (.base_facts.cooldown == {active:false,seconds_remaining:0}) and
+    (.base_facts.delivery == {failed_unchanged:0,override:false}) and
+    any(.cases[]; .expected.reason == "delivery-failed-unchanged" and .patch.delivery == {failed_unchanged:2,override:false}) and
+    any(.cases[]; .expected.action == "run-granted-review" and .patch.delivery == {failed_unchanged:1,override:false})
   ' "$corpus" >/dev/null || return 1
 
   while IFS=$'\t' read -r action effect class; do

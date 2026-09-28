@@ -1078,8 +1078,8 @@ pg_run_meta_has_terminal_review() { # marker
   pg_attempt_artifact "$1" >/dev/null
 }
 
-pg_run_meta_find_latest() { # host owner repo pr terminal-filter -> newest exact marker
-  local want_host="$1" want_owner="$2" want_repo="$3" want_pr="$4" filter="${5:-any}"
+pg_run_meta_find_latest() { # host owner repo pr terminal-filter [exclude-marker] -> newest exact marker
+  local want_host="$1" want_owner="$2" want_repo="$3" want_pr="$4" filter="${5:-any}" exclude="${6:-}"
   local marker host owner repo key pr out spend best_marker="" best_spend="" terminal LC_ALL=C
   pg_canonical_repo_ok "$want_host" "$want_owner" "$want_repo" || return 1
   want_pr="$(pg_pr_number_normalize "$want_pr")" || return 1
@@ -1087,6 +1087,9 @@ pg_run_meta_find_latest() { # host owner repo pr terminal-filter -> newest exact
   while IFS=$'\t' read -r marker host owner repo key pr out spend; do
     [ "$host" = "$want_host" ] && [ "$owner" = "$want_owner" ] && [ "$repo" = "$want_repo" ] \
       && [ "$pr" = "$want_pr" ] || continue
+    # Skipped before selection, not after: the excluded marker is often the newest record, and
+    # discarding it once chosen would hide every older one (#204 gate r1).
+    [ -n "$exclude" ] && [ "$marker" = "$exclude" ] && continue
     terminal=false; pg_run_meta_has_terminal_review "$marker" && terminal=true
     case "$filter:$terminal" in review:false|unresolved:true) continue;; esac
     if [ -z "$best_spend" ] || [ "$spend" -gt "$best_spend" ] \
@@ -1180,8 +1183,9 @@ pg_attempt_disposition_scan() { # one canonical disposition JSON object per line
 }
 
 pg_attempt_disposition_sweep() { # delete only old dispositions whose cleanup is complete
-  local dir now round_secs ttl retain f marker json mt age
-  dir="$(pg_attempt_disposition_dir)"; [ -d "$dir" ] || return 0
+  local dir cdir now round_secs ttl retain f marker json mt age
+  dir="$(pg_attempt_disposition_dir)"; cdir="$(pg_delivery_condition_dir)"
+  [ -d "$dir" ] || [ -d "$cdir" ] || return 0
   now="$(date +%s)"; round_secs="$(pg_round_window_secs)"; ttl="${PRO_GATE_RESERVATION_TTL:-21600}"
   case "$ttl" in ''|*[!0-9]*) ttl=21600;; esac
   retain="$round_secs"; [ "$ttl" -gt "$retain" ] && retain="$ttl"
@@ -1189,6 +1193,17 @@ pg_attempt_disposition_sweep() { # delete only old dispositions whose cleanup is
     [ -f "$f" ] && [ ! -L "$f" ] || continue
     marker="${f##*/}"; json="$(pg_attempt_disposition_read "$marker" 2>/dev/null || true)"; [ -n "$json" ] || continue
     pg_attempt_disposition_cleanup_pending "$json" && continue
+    mt="$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo "$now")"
+    case "$mt" in ''|*[!0-9]*) continue;; esac
+    age=$(( now - mt )); [ "$age" -ge "$retain" ] || continue
+    rm -f "$f" 2>/dev/null || true
+  done
+  # #204: a delivery-condition record is read only beside its marker's disposition. Once that
+  # disposition is gone (swept above, or never written because the refund failed), the record goes
+  # at the same age.
+  for f in "$cdir"/pg-run-*; do
+    [ -f "$f" ] || [ -L "$f" ] || continue
+    marker="${f##*/}"; [ -e "$dir/$marker" ] && continue
     mt="$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo "$now")"
     case "$mt" in ''|*[!0-9]*) continue;; esac
     age=$(( now - mt )); [ "$age" -ge "$retain" ] || continue
@@ -1213,6 +1228,139 @@ pg_attempt_disposition_find() { # host owner repo pr -> newest exact disposition
   done
   [ -n "$best" ] || return 1
   pg_attempt_disposition_read "$best"
+}
+
+# ── Delivery-condition records (#204) ──────────────────────────────────────────────────────────
+# A review-decision fresh effect whose Send was proven never dispatched refunds its round. Before
+# this record existed, the next query granted the identical run again, so an attachment that could
+# not be delivered was retried until the caller's own time budget ran out. The refund now leaves one
+# small write-once record beside the attempt's disposition: the digest of the condition it failed
+# under (evidence relation, input mode, attachment policy, Oracle build) and how many proven no-send
+# attempts in a row that same condition has produced. The disposition keeps its own exact-key
+# record at version 1; this sidecar is read only beside a not-submitted disposition and is swept
+# with it.
+pg_delivery_condition_dir() { printf '%s\n' "${PRO_GATE_DELIVERY_CONDITION_DIR:-$PRO_GATE_HOME/delivery-conditions}"; }
+
+# pg_oracle_identity: the installed Oracle build as its own --version prints it. Upgrading or
+# re-pinning Oracle is the usual repair for a delivery failure, so a new build is a changed
+# condition. Bounded like pg_reattach_render, and "unknown" (never a guess) when the executable or
+# the timeout command is unavailable. An empty read is tried once more: the refund and the next
+# query each read the build, and one slow start under load reading as a different build would
+# silently restart the failed-delivery count.
+pg_oracle_identity() {
+  local oracle_bin="${PRO_GATE_ORACLE_BIN:-oracle}" timeout_bin="${PRO_GATE_TIMEOUT_BIN:-timeout}" v="" tries=0
+  if [[ "$oracle_bin" == */* ]]; then
+    [ -x "$oracle_bin" ] || { printf 'unknown\n'; return 0; }
+  else
+    pg_have "$oracle_bin" || { printf 'unknown\n'; return 0; }
+  fi
+  if { [[ "$timeout_bin" == */* ]] && [ -x "$timeout_bin" ]; } || pg_have "$timeout_bin"; then
+    while [ -z "$v" ] && [ "$tries" -lt 2 ]; do
+      tries=$(( tries + 1 ))
+      v="$("$timeout_bin" 5s "$oracle_bin" --version </dev/null 2>/dev/null | head -n 1 | tr -cd 'A-Za-z0-9._+-' | cut -c1-64)"
+    done
+  fi
+  printf '%s\n' "${v:-unknown}"
+}
+
+pg_delivery_condition_digest() { # relation-identity input-mode attachment-policy oracle-identity
+  pg_review_sha256_text "$(jq -cnS --arg relation "$1" --arg input "$2" --arg attachments "$3" --arg oracle "$4" \
+    '{attachments:$attachments,input:$input,oracle:$oracle,relation:$relation}')"
+}
+
+pg_delivery_condition_validate() { # canonical JSON [expected marker]
+  local json="${1-}" marker="${2:-}" canonical
+  canonical="$(printf '%s' "$json" | jq -cS . 2>/dev/null)" || return 1
+  jq -e --arg marker "$marker" '. as $d |
+    ($d|keys) == ["condition_digest","consecutive","marker","record_type","record_version","round_key"] and
+    $d.record_type=="review-delivery-condition/v1" and $d.record_version==1 and
+    ($d.marker|type=="string" and test("^pg-run-[A-Za-z0-9.-]+$")) and ($marker=="" or $d.marker==$marker) and
+    ($d.round_key|type=="string" and test("^[A-Za-z0-9.-]+$")) and ($d.marker|startswith("pg-run-" + $d.round_key + "-")) and
+    ($d.condition_digest|type=="string" and test("^[0-9a-f]{64}$")) and
+    ($d.consecutive|type=="number" and floor==. and .>=1 and .<=1000)
+  ' <<<"$canonical" >/dev/null 2>&1 || return 1
+  printf '%s' "$canonical"
+}
+
+pg_delivery_condition_read() { # marker -> canonical record
+  local marker="$1" f
+  pg_reservation_marker_ok "$marker" || return 1
+  f="$(pg_delivery_condition_dir)/$marker"
+  [ -f "$f" ] && [ ! -L "$f" ] || return 1
+  [ "$(wc -c < "$f" 2>/dev/null | tr -d ' ')" -le 4096 ] || return 1
+  pg_delivery_condition_validate "$(cat "$f" 2>/dev/null)" "$marker"
+}
+
+pg_delivery_condition_write() { # marker round-key condition-digest consecutive; write-once
+  local marker="$1" key="$2" digest="$3" consecutive="$4" dir f tmp canonical rc=1
+  pg_reservation_marker_ok "$marker" || return 1
+  pg_round_key_ok "$key" || return 1
+  case "$consecutive" in ''|*[!0-9]*) return 1;; esac
+  canonical="$(jq -cnS --arg marker "$marker" --arg key "$key" --arg digest "$digest" --argjson n "$consecutive" \
+    '{condition_digest:$digest,consecutive:$n,marker:$marker,record_type:"review-delivery-condition/v1",record_version:1,round_key:$key}' 2>/dev/null)" || return 1
+  canonical="$(pg_delivery_condition_validate "$canonical" "$marker")" || return 1
+  dir="$(pg_delivery_condition_dir)"; mkdir -p "$dir" 2>/dev/null || return 1
+  f="$dir/$marker"; tmp="$dir/.$marker.tmp.$$"
+  if [ -e "$f" ] || [ -L "$f" ]; then
+    [ "$(pg_delivery_condition_read "$marker" 2>/dev/null || true)" = "$canonical" ]; return
+  fi
+  if printf '%s' "$canonical" > "$tmp" 2>/dev/null && ln "$tmp" "$f" 2>/dev/null; then
+    rc=0
+  elif [ -f "$f" ] && [ ! -L "$f" ] && cmp -s "$tmp" "$f" 2>/dev/null; then
+    rc=0
+  fi
+  rm -f "$tmp" 2>/dev/null
+  return "$rc"
+}
+
+# pg_delivery_condition_record host owner repo pr round-key marker condition-digest: called by the
+# refund of a proven no-send attempt BEFORE its disposition is written, so the attempt snapshot that
+# excludes this marker is exactly "the attempt before this one" for the change. The run continues
+# only when that attempt was itself a proven no-send under the same condition; a sent attempt, a
+# review, or a different condition in between starts the count again at one.
+pg_delivery_condition_record() {
+  local host="$1" owner="$2" repo="$3" pr="$4" key="$5" marker="$6" digest="$7" prev prev_record n=1
+  prev="$(pg_attempt_snapshot "$host" "$owner" "$repo" "$pr" "$key" "$marker" 2>/dev/null || true)"
+  if [ -n "$prev" ] && jq -e '.source=="disposition" and .state=="not-submitted"' <<<"$prev" >/dev/null 2>&1; then
+    prev_record="$(pg_delivery_condition_read "$(jq -r .marker <<<"$prev")" 2>/dev/null || true)"
+    if [ -n "$prev_record" ] && [ "$(jq -r .condition_digest <<<"$prev_record")" = "$digest" ]; then
+      n=$(( $(jq -r .consecutive <<<"$prev_record") + 1 ))
+      [ "$n" -le 1000 ] || n=1000
+    fi
+  fi
+  pg_delivery_condition_write "$marker" "$key" "$digest" "$n"
+}
+
+# pg_delivery_facts_json attempt-snapshot relation-identity input-mode: facts.delivery for BOTH the
+# advisory query and the guarded dispatch recheck. failed_unchanged counts the proven no-send
+# attempts in a row, ending at the newest attempt for this change, whose recorded condition equals
+# the current one; anything else (a newer sent attempt or review, no record, no current relation, a
+# changed condition) is zero. The Oracle build is probed only when a record could match, so an
+# ordinary query never runs Oracle. override resolves the operator's one-invocation
+# PRO_GATE_FORCE_ROUND=1 here so the reducer stays a pure function of its facts. Zero is the
+# fail-safe answer, but not a silent one: a record that exists yet cannot be read, or an Oracle
+# build that cannot be read now, says so on stderr.
+pg_delivery_facts_json() {
+  local snapshot="$1" relation="$2" input="$3" marker record oracle_id n=0 override=false
+  [ "${PRO_GATE_FORCE_ROUND:-0}" = 1 ] && override=true
+  if [ -n "$relation" ] \
+     && jq -e '.source=="disposition" and .state=="not-submitted" and .fresh_eligible==true' <<<"$snapshot" >/dev/null 2>&1; then
+    marker="$(jq -r .marker <<<"$snapshot")"
+    record="$(pg_delivery_condition_read "$marker" 2>/dev/null || true)"
+    if [ -n "$record" ]; then
+      oracle_id="$(pg_oracle_identity)"
+      if [ "$(jq -r .condition_digest <<<"$record")" = \
+           "$(pg_delivery_condition_digest "$relation" "$input" "${PRO_GATE_BROWSER_ATTACHMENTS:-auto}" "$oracle_id")" ]; then
+        n="$(jq -r .consecutive <<<"$record")"
+      elif [ "$oracle_id" = unknown ]; then
+        echo "[pro-gate] #204: Oracle's version could not be read, so the failed delivery recorded for $marker cannot be matched; counting from zero." >&2
+      fi
+    elif pg_reservation_marker_ok "$marker" \
+         && { [ -e "$(pg_delivery_condition_dir)/$marker" ] || [ -L "$(pg_delivery_condition_dir)/$marker" ]; }; then
+      echo "[pro-gate] #204: the delivery-condition record for $marker cannot be read; counting failed deliveries from zero." >&2
+    fi
+  fi
+  jq -cnS --argjson n "$n" --argjson override "$override" '{failed_unchanged:$n,override:$override}'
 }
 
 pg_round_has_epoch() { # round-key epoch
@@ -1377,7 +1525,9 @@ pg_attempt_snapshot() { # host owner repo pr round-key [exclude-marker] -> canon
   pr="$(pg_pr_number_normalize "$pr")" || return 1
   pg_round_key_ok "$key" || return 1
 
-  latest_review="$(pg_run_meta_find_latest "$host" "$owner" "$repo" "$pr" review 2>/dev/null || true)"
+  # An exclude marker reads the change as if that attempt did not exist: every lookup below skips it
+  # before choosing, so an older attempt it would otherwise shadow still counts.
+  latest_review="$(pg_run_meta_find_latest "$host" "$owner" "$repo" "$pr" review "$exclude" 2>/dev/null || true)"
   if [ -n "$latest_review" ]; then
     rec="$(pg_run_meta_read "$latest_review" 2>/dev/null || true)"
     [ -z "$rec" ] || IFS=$'\t' read -r _ _ _ _ _ _ latest_review_epoch <<<"$rec"
@@ -1403,7 +1553,7 @@ pg_attempt_snapshot() { # host owner repo pr round-key [exclude-marker] -> canon
       fi
     fi
     if [ "$ignore_disposition" = false ]; then
-      competing_marker="$(pg_reservation_find_pr "$key" 2>/dev/null || true)"
+      competing_marker="$(pg_reservation_find_pr "$key" "" "$exclude" 2>/dev/null || true)"
       if pg_reservation_marker_ok "$competing_marker" && [ "$competing_marker" != "$disposition_marker" ] && [ "$competing_marker" != "$exclude" ]; then
         competing_epoch="$(pg_reservation_read_spend "$competing_marker" 2>/dev/null || pg_marker_epoch "$competing_marker" 2>/dev/null || true)"
         case "$competing_epoch" in
@@ -1416,7 +1566,7 @@ pg_attempt_snapshot() { # host owner repo pr round-key [exclude-marker] -> canon
       if [ "$latest_review_epoch" -gt "$disposition_epoch" ] || { [ "$latest_review_epoch" = "$disposition_epoch" ] && [[ "$latest_review" > "$disposition_marker" ]]; }; then ignore_disposition=true; fi
     fi
     if [ "$ignore_disposition" = false ]; then
-      competing_marker="$(pg_run_meta_find_latest "$host" "$owner" "$repo" "$pr" unresolved 2>/dev/null || true)"
+      competing_marker="$(pg_run_meta_find_latest "$host" "$owner" "$repo" "$pr" unresolved "$exclude" 2>/dev/null || true)"
       if [ -n "$competing_marker" ] && [ "$competing_marker" != "$disposition_marker" ] && [ "$competing_marker" != "$exclude" ]; then
         rec="$(pg_run_meta_read "$competing_marker" 2>/dev/null || true)"
         [ -z "$rec" ] || IFS=$'\t' read -r _ _ _ _ _ _ competing_epoch <<<"$rec"
@@ -1462,8 +1612,8 @@ pg_attempt_snapshot() { # host owner repo pr round-key [exclude-marker] -> canon
   if [ -z "$marker" ]; then
     # Applicable work always outranks audit-only superseded records for the same change. Only fall
     # back to superseded when no capacity-holding reservation exists.
-    reservation="$(pg_reservation_find_pr "$key" 2>/dev/null || true)"
-    [ -n "$reservation" ] || reservation="$(pg_reservation_find_pr "$key" include-superseded 2>/dev/null || true)"
+    reservation="$(pg_reservation_find_pr "$key" "" "$exclude" 2>/dev/null || true)"
+    [ -n "$reservation" ] || reservation="$(pg_reservation_find_pr "$key" include-superseded "$exclude" 2>/dev/null || true)"
     if pg_reservation_marker_ok "$reservation" && [ "$reservation" != "$exclude" ]; then
       marker="$reservation"; source=reservation
       if [ "$(pg_reservation_state "$marker" 2>/dev/null || echo generating)" = superseded ]; then
@@ -1477,7 +1627,7 @@ pg_attempt_snapshot() { # host owner repo pr round-key [exclude-marker] -> canon
   fi
 
   if [ -z "$marker" ]; then
-    latest_unresolved="$(pg_run_meta_find_latest "$host" "$owner" "$repo" "$pr" unresolved 2>/dev/null || true)"
+    latest_unresolved="$(pg_run_meta_find_latest "$host" "$owner" "$repo" "$pr" unresolved "$exclude" 2>/dev/null || true)"
     if [ -n "$latest_unresolved" ] && [ "$latest_unresolved" != "$exclude" ]; then
       marker="$latest_unresolved"; source=run-meta; state=unknown-fate; recoverable=true; fresh=false
       rec="$(pg_run_meta_read "$marker" 2>/dev/null || true)"
@@ -1970,13 +2120,14 @@ pg_reservation_note_miss() {
   fi
 }
 
-pg_reservation_find_pr() { # pr-key [include-superseded] -> marker (oldest, best-effort)
-  local pr="$1" include="${2:-}" dir f found_pr state
+pg_reservation_find_pr() { # pr-key [include-superseded] [exclude-marker] -> marker (oldest, best-effort)
+  local pr="$1" include="${2:-}" exclude="${3:-}" dir f found_pr state
   [ -n "$pr" ] || return 1
   dir="$(pg_reservation_dir)"; [ -d "$dir" ] || return 1
   for f in "$dir"/*; do
     [ -f "$f" ] || continue
     pg_reservation_marker_ok "$(basename "$f")" || continue
+    [ -n "$exclude" ] && [ "$(basename "$f")" = "$exclude" ] && continue
     found_pr="$(awk -F'\t' 'NR==1{print $1}' "$f" 2>/dev/null)"
     state="$(awk -F'\t' 'NR==1{print $8}' "$f" 2>/dev/null)"
     [ "$state" = superseded ] && [ "$include" != include-superseded ] && continue
@@ -3470,21 +3621,21 @@ pg_completed_lookup() {  # <marker> <out>: place the artifact at <out>; rc 0 on 
 # ─────────────────────────────────────────────────────────────────────────────
 PG_REVIEW_DECISION_CONTRACT_ID='review-decision/v1'
 PG_REVIEW_DECISION_CONTRACT_VERSION=1
-PG_REVIEW_DECISION_CONTRACT_DIGEST='5fcd19c12600061af6d90ed9cb980dd7067cff199c374910639003eec4caf5c3'
-PG_REVIEW_DECISION_CORPUS_DIGEST='c7e8b55a5ebbf190a0bda93ae7367820cd3f9ffb8092a4998ff58bb0513aadc6'
+PG_REVIEW_DECISION_CONTRACT_DIGEST='6da6866bab4e95ad138cdc946fa1388be9c386bca7b592c3370c9f52e34b315f'
+PG_REVIEW_DECISION_CORPUS_DIGEST='409649c6c5ce000afd3b74da90daacc11ff72a2ab6789a7a3a0cf3e14a34d3e4'
 
 # Binding-record compatibility only (#214, gate r2 P1). review-input-binding/v1 and
 # review-result-binding/v1 records are validated by their own record_type/record_version shape
 # rules, not the decision/effect envelope's contract identity check. Every contract change since
-# the digests below was additive (new reasons for #147/#174, new governor/result fields), so the
-# proof rules those already-written records carry still hold under the current runtime — only the
+# the digests below was additive (new reasons for #147/#174/#204, new governor/result/delivery
+# fields), so the proof rules those already-written records carry still hold under the current runtime — only the
 # CURRENT digest below is ever written into a fresh binding. When a future bump changes a proof
 # rule (not just adds a reason or fact), drop the affected predecessor digest here so its bindings
 # stop being trusted, rather than widening the rule that reads them.
 # Writers share these validators with readers: every production write site passes the CURRENT digest
 # (pg_review_decision_contract_digest), so this list only widens what can be READ back, never what a
 # fresh record may claim. Keep it that way when adding a writer.
-PG_REVIEW_DECISION_COMPATIBLE_CONTRACT_DIGESTS='bf36fdb5f8625e917be0539ca014fec518649d1160584846aca1cb9149533abb 7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee'
+PG_REVIEW_DECISION_COMPATIBLE_CONTRACT_DIGESTS='bf36fdb5f8625e917be0539ca014fec518649d1160584846aca1cb9149533abb 7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee 5fcd19c12600061af6d90ed9cb980dd7067cff199c374910639003eec4caf5c3'
 
 pg_review_decision_contract_id() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_ID"; }
 pg_review_decision_contract_version() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_VERSION"; }
@@ -3536,6 +3687,16 @@ pg_review_sha256_text() { # text: digest bytes exactly, without adding a newline
   elif pg_have openssl; then LC_ALL=C printf '%s' "$text" | openssl dgst -sha256 | awk '{print $NF}'
   else return 1
   fi
+}
+
+# pg_review_relation_identity binding-or-template-json -> "relation:<sha256>": the review's
+# complete relation identity (repository, target and evidence, canonicalized). The query's
+# evidence identity, the prior-review candidates, the dispatch recheck and the #204 delivery record
+# must all derive it here: a copy that drifts makes the query and the record disagree silently.
+pg_review_relation_identity() {
+  local relation
+  relation="$(jq -cS '{repository,target,evidence}' <<<"${1-}" 2>/dev/null)" && [ -n "$relation" ] || return 1
+  printf 'relation:%s\n' "$(pg_review_sha256_text "$relation")"
 }
 
 # A choice is fresh only for the prompt context that named it. The selected value and its proof
@@ -3703,10 +3864,12 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
       and (.collected|type=="boolean") and (.evidence_mode|IN("full-pr","scoped-delta","connector","caller-patch","none"))
       and (.legacy|type=="boolean") and (.marker|marker and length>0)
       and (.provenance_valid|type=="boolean") and (.verdict|IN("SHIP","FIX-FIRST","NEEDS-DISCUSSION","NONE"));
-    (keys_are(["active_index","completed_results","contract","cooldown","evidence","governor","input","named_choice","observation","prior_review","reservation","target","transport"]))
+    (keys_are(["active_index","completed_results","contract","cooldown","delivery","evidence","governor","input","named_choice","observation","prior_review","reservation","target","transport"]))
     and (.contract|keys_are(["contract_digest","contract_id","contract_version","corpus_digest"]))
     and (.cooldown|keys_are(["active","seconds_remaining"])) and (.cooldown.active|type=="boolean")
     and (.cooldown.seconds_remaining|type=="number" and floor==. and .>=0)
+    and (.delivery|keys_are(["failed_unchanged","override"]))
+    and (.delivery.failed_unchanged|type=="number" and floor==. and .>=0 and .<=1000) and (.delivery.override|type=="boolean")
     and (.active_index|keys_are(["binding_valid","charged_spend_epoch","marker","state"]))
     and (.active_index.binding_valid|type=="boolean") and (.active_index.charged_spend_epoch|type=="number" and floor==.)
     and (.active_index.marker|marker)
@@ -3896,6 +4059,15 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
   # facts.cooldown.seconds_remaining tells the wrapper how long to wait before re-querying.
   if [ "$(jq -r .cooldown.active <<<"$canonical")" = true ]; then
     pg_review_decision_emit stop-without-new-review account-cooldown-active "$canonical" "$snapshot"; return
+  fi
+  # #204: a fresh grant is the one action that would repeat a delivery the runtime proved never
+  # reached ChatGPT. Two proven no-send attempts in a row under the same evidence relation, input
+  # mode, attachment policy and Oracle build stop here, typed, instead of being granted until the
+  # caller's time budget runs out. A change to any of those, or an operator's one-invocation
+  # PRO_GATE_FORCE_ROUND=1 (resolved into delivery.override by the facts builder), grants again.
+  if [ "$(jq -r .delivery.failed_unchanged <<<"$canonical")" -ge 2 ] \
+     && [ "$(jq -r .delivery.override <<<"$canonical")" != true ]; then
+    pg_review_decision_emit stop-without-new-review delivery-failed-unchanged "$canonical" "$snapshot"; return
   fi
   if [ "$(jq -r .evidence.state <<<"$canonical")" = matching ]; then
     pg_review_decision_emit run-granted-review round-granted-for-changed-input "$canonical" "$snapshot"; return
