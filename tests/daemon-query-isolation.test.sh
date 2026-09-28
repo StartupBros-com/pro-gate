@@ -47,13 +47,18 @@ while [ "$#" -gt 0 ]; do
 done
 printf '%s\t%s\n' "$pr" "$effect" >> "$ENGINE_CALLS"
 if [ "$effect" = 1 ]; then prefix=effect
-elif [ -s "$WORKER_CALLS" ] && [ "$pr" = 1983 ]; then prefix=after
+elif [ -f "$FIXTURES/recheck-pending" ] && [ "$pr" = 1983 ]; then
+  prefix=after; rm "$FIXTURES/recheck-pending"
 else prefix="$pr"; fi
 cat "$FIXTURES/$prefix.json"
 exit "$(cat "$FIXTURES/$prefix.rc")"
 ENGINE
 chmod +x "$PRO_GATE_HOME/oracle-review.sh"
-daemon_run_review_worker(){ printf '%s\n' "$DD_NUM" >> "$WORKER_CALLS"; return "${WORKER_RC:-0}"; }
+daemon_run_review_worker(){
+  printf '%s\n' "$DD_NUM" >> "$WORKER_CALLS"
+  : > "$FIXTURES/recheck-pending"
+  return "${WORKER_RC:-0}"
+}
 daemon_run_agent_task(){ printf 'unexpected agent\n' >> "$WORKER_CALLS"; return 1; }
 typed(){ # patch output
   local facts
@@ -77,6 +82,7 @@ jq '.contract.corpus_digest="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 cat "$TDIR/run.json" "$TDIR/incompatible.json" > "$TDIR/multiple-values.json"
 reset_case(){
   DECISION_DEFERRED=0; RUNTIME_DEFERRED=0; WORKER_RC=0
+  rm -f "$FIXTURES/recheck-pending"
   : > "$STATE"; : > "$FAILS"; : > "$BLOCKED"; : > "$REVIEWNOPROG"
   : > "$WORKER_CALLS"; : > "$ENGINE_CALLS"; : > "$TDIR/evidence-bases"
   cp "$TDIR/stop-a.json" "$FIXTURES/1983.json"
@@ -128,8 +134,11 @@ for stage in initial effect failed-worker successful-worker; do
     [ "$scenario" != empty ] || printf '2\n' > "$FIXTURES/$destination.rc"
     poll_pr 1983; rc=$?
     expected=0; [ "$scenario" != incompatible ] || expected=1
-    check "$stage/$scenario rejects without completion or failure charges at the correct scope" \
-      "$([ "$rc" -eq 2 ] && [ "$DECISION_DEFERRED" -eq "$expected" ] && [ ! -s "$STATE" ] && [ ! -s "$FAILS" ] && [ ! -s "$REVIEWNOPROG" ]; echo $?)" "rc=$rc deferred=$DECISION_DEFERRED"
+    expected_rc=2; expected_failures=0
+    if [ "$stage" = failed-worker ]; then expected_rc=1; expected_failures=1; fi
+    check "$stage/$scenario preserves rejection scope and charges only an actual failed worker" \
+      "$([ "$rc" -eq "$expected_rc" ] && [ "$DECISION_DEFERRED" -eq "$expected" ] && [ ! -s "$STATE" ] \
+        && [ "$(wc -l < "$FAILS")" -eq "$expected_failures" ] && [ ! -s "$REVIEWNOPROG" ]; echo $?)" "rc=$rc deferred=$DECISION_DEFERRED"
     if [ "$expected" -eq 1 ]; then
       before="$(wc -l < "$ENGINE_CALLS")"
       poll_pr 1984; rc=$?
@@ -141,6 +150,52 @@ for stage in initial effect failed-worker successful-worker; do
       check "$stage/$scenario preserves B admission" "$([ "$rc" -eq 0 ] && grep -q '^1984' "$ENGINE_CALLS"; echo $?)" "rc=$rc"
     fi
   done
+done
+
+# Failed launched workers remain bounded even when their follow-up observation is unavailable.
+# Initial query-only failures above remain uncharged, and valid recovery below still waits.
+MAX_FAILS=3
+for scenario in empty malformed moved-head; do
+  reset_case
+  WORKER_RC=1
+  cp "$TDIR/run.json" "$FIXTURES/1983.json"
+  cp "$TDIR/$scenario.json" "$FIXTURES/after.json"
+  [ "$scenario" != empty ] || printf '2\n' > "$FIXTURES/after.rc"
+  attempt=0
+  while [ "$attempt" -lt "$MAX_FAILS" ]; do
+    attempt=$((attempt + 1))
+    poll_pr 1983; rc=$?
+    check "$scenario failed worker $attempt is charged exactly once without global latch or completion" \
+      "$([ "$rc" -eq 1 ] && [ "$(wc -l < "$FAILS")" -eq "$attempt" ] \
+        && [ "$(wc -l < "$WORKER_CALLS")" -eq "$attempt" ] && [ "$DECISION_DEFERRED" -eq 0 ] && [ ! -s "$STATE" ]; echo $?)" "rc=$rc"
+  done
+  check "$scenario cap blocks only the failing exact head" \
+    "$(is_blocked acme/widgets 1983 "$SHA" && ! is_blocked acme/widgets 1984 "$SHA" \
+      && grep -q 'wrapper-orchestration-cap-exhausted:' "$BLOCKED"; echo $?)"
+  before="$(wc -l < "$ENGINE_CALLS")"
+  poll_pr 1983; rc=$?
+  check "$scenario capped worker is not queried or launched again" \
+    "$([ "$rc" -eq 2 ] && [ "$(wc -l < "$ENGINE_CALLS")" -eq "$before" ] \
+      && [ "$(wc -l < "$WORKER_CALLS")" -eq "$MAX_FAILS" ] && [ "$(wc -l < "$FAILS")" -eq "$MAX_FAILS" ]; echo $?)"
+  poll_pr 1984; rc=$?
+  check "$scenario capped PR leaves another PR processable" "$([ "$rc" -eq 0 ] && [ "$DECISION_DEFERRED" -eq 0 ]; echo $?)"
+  old_sha="$SHA"; SHA=3333333333333333333333333333333333333333
+  typed "{\"target\":{\"head_oid\":\"$SHA\"},\"governor\":{\"granted\":false}}" "$FIXTURES/1983.json"
+  poll_pr 1983; rc=$?
+  check "$scenario new head can be queried without clearing the old failure evidence" \
+    "$([ "$rc" -eq 0 ] && ! is_blocked acme/widgets 1983 "$SHA" && [ "$(wc -l < "$FAILS")" -eq "$MAX_FAILS" ]; echo $?)"
+  SHA="$old_sha"
+done
+
+reset_case
+WORKER_RC=1
+cp "$TDIR/run.json" "$FIXTURES/1983.json"
+cp "$TDIR/recover.json" "$FIXTURES/after.json"
+attempt=0
+while [ "$attempt" -lt 5 ]; do
+  attempt=$((attempt + 1)); poll_pr 1983; rc=$?
+  check "valid recovery after failed worker $attempt still defers wrapper budget" \
+    "$([ "$rc" -eq 2 ] && [ ! -s "$FAILS" ] && [ ! -s "$BLOCKED" ] && [ ! -s "$STATE" ]; echo $?)"
 done
 
 reset_case

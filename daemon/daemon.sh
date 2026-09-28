@@ -237,11 +237,15 @@ daemon_handle_review_worker_failure(){ # worker-rc; fresh typed decision decides
   fresh="$DD_LOG.decision-after-run.json"
   if ! PRO_GATE_REVIEW_PR_EVIDENCE="${DD_EVIDENCE_FILE:+$DD_EVIDENCE_FILE.pr-evidence.json}" PRO_GATE_REVIEW_ENDPOINT_PATCH="${DD_EVIDENCE_FILE:-}" "$DD_ENGINE" --review-decision --json --pr "$DD_NUM" --repo "$DD_WORKTREE" ${DD_INPUT_ARGS[@]+"${DD_INPUT_ARGS[@]}"} ${DD_EVIDENCE_ARGS[@]+"${DD_EVIDENCE_ARGS[@]}"} >"$fresh" 2>>"$DD_LOG"; then
     daemon_reject_decision "$fresh" "review worker rc=$worker_rc; replacement query failed"
-    return 2
+    # A query-only rejection is free; this path has already launched a failed worker.
+    # Only a valid recovery/collection decision below can defer its wrapper failure charge.
+    note_fail "$DD_NWO" "$DD_NUM" "$DD_SHA" "$DD_LOG" "runtime-selected review worker rc=$worker_rc; replacement query failed"
+    return 1
   fi
   if ! daemon_decision_valid "$fresh" || ! daemon_decision_target_matches "$fresh" "$DD_NWO" "$DD_NUM" "$DD_SHA"; then
     daemon_reject_decision "$fresh" "nonzero review worker returned an invalid or stale replacement envelope"
-    return 2
+    note_fail "$DD_NWO" "$DD_NUM" "$DD_SHA" "$DD_LOG" "runtime-selected review worker rc=$worker_rc; invalid or stale replacement envelope"
+    return 1
   fi
   action="$(daemon_decision_action "$fresh")"
   case "$action" in
