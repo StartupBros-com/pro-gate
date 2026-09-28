@@ -3429,13 +3429,32 @@ PG_EOF
 # A claim remains a recovery handle until its bytes were read and convicted or restored.
 # Check the canonical memo before claims at callers: renaming publishes the claim atomically.
 pg_memo_claim_pending() { # marker
-  local marker="$1" claim
+  local marker="$1" claim dir
   pg_reservation_marker_ok "$marker" || return 1
-  for claim in "$PRO_GATE_HOME/conversation-urls/$marker.rej."* "$PRO_GATE_HOME/legacy-review-receipts/$marker.rej."*; do
-    [ -e "$claim" ] || [ -L "$claim" ] || continue
-    [ "$(pg_memo_claim_marker "$claim")" = "$marker" ] && return 0
+  # A glob that cannot enumerate its directory is not proof of absence. In particular,
+  # recheck storage here even when the earlier browser scan completed before an I/O fault.
+  [ -d "$PRO_GATE_HOME" ] && [ -r "$PRO_GATE_HOME" ] && [ -x "$PRO_GATE_HOME" ] || return 0
+  for dir in "$PRO_GATE_HOME/conversation-urls" "$PRO_GATE_HOME/legacy-review-receipts"; do
+    [ -e "$dir" ] || [ -L "$dir" ] || continue
+    [ -d "$dir" ] && [ ! -L "$dir" ] && [ -r "$dir" ] && [ -x "$dir" ] \
+      && ls -A "$dir" >/dev/null 2>&1 || return 0
+    for claim in "$dir/$marker.rej."*; do
+      [ -e "$claim" ] || [ -L "$claim" ] || continue
+      [ "$(pg_memo_claim_marker "$claim")" = "$marker" ] && return 0
+    done
   done
   return 1
+}
+
+pg_memo_read() { # bounded regular memo bytes; uncertainty leaves the original path intact
+  local file="$1" size value LC_ALL=C
+  [ -f "$file" ] && [ ! -L "$file" ] || return 1
+  size="$(stat -c %s "$file" 2>/dev/null || stat -f %z "$file" 2>/dev/null)" || return 1
+  case "$size" in ''|*[!0-9]*) return 1;; esac
+  [ "$size" -le 4096 ] || return 1
+  value="$(head -c 4097 "$file" 2>/dev/null)" || return 1
+  [ "${#value}" -le 4096 ] || return 1
+  printf '%s' "$value"
 }
 
 pg_memo_claim_marker() { # filename -> original marker, including markers containing .rej.
@@ -3468,13 +3487,13 @@ pg_provenance_reject() {  # <marker> [matched-url]
   # renamed aside first, its content checked against the rejected URL, and restored when it
   # names a DIFFERENT (newer, possibly genuine) conversation — a read-append-remove sequence
   # left a window where a concurrently refreshed genuine memo was deleted by a stale compare.
-  local m="$1" url="${2:-}" memo claim="" snap receipt="" digest
+  local m="$1" url="${2:-}" memo claim="" snap receipt="" digest token
   pg_reservation_marker_ok "$m" || return 0
   memo="$PRO_GATE_HOME/conversation-urls/$m"
   # With no explicit conviction, establish the URL before claiming. A failed read leaves
   # the canonical bytes untouched; a replacement during claim remains distinguishable.
   if [ -z "$url" ]; then
-    url="$(cat "$memo" 2>/dev/null)" || return 0
+    url="$(pg_memo_read "$memo")" || return 0
     url="${url//$'\n'/}"
   fi
   digest="$(pg_review_sha256_text "$url")" || return 0
@@ -3486,13 +3505,17 @@ pg_provenance_reject() {  # <marker> [matched-url]
   fi
   # A legacy round's memo is claimed straight into its receipt (pg_legacy_review_receipt_path);
   # when that receipt cannot exist, the memo is not claimed at all.
+  # Like the Node UUID claim, this name exists only once the memo inode lands. A mktemp
+  # placeholder in the receipt store would itself become false legacy-review evidence on crash.
+  token="$(LC_ALL=C od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')" || return 0
+  [[ "$token" =~ ^[0-9a-f]{32}$ ]] || return 0
   if receipt="$(pg_legacy_review_receipt_path "$m")"; then
-    claim="$(mktemp "$PRO_GATE_HOME/legacy-review-receipts/$m.rej.$digest.XXXXXX" 2>/dev/null)" || claim=""
+    claim="$PRO_GATE_HOME/legacy-review-receipts/$m.rej.$digest.$token"
   elif [ $? -eq 1 ]; then
-    receipt=""; claim="$(mktemp "$memo.rej.$digest.XXXXXX" 2>/dev/null)" || claim=""
+    receipt=""; claim="$memo.rej.$digest.$token"
   fi
-  if [ -n "$claim" ] && mv "$memo" "$claim" 2>/dev/null; then
-    if snap="$(cat "$claim" 2>/dev/null)"; then
+  if [ -n "$claim" ] && [ ! -e "$claim" ] && [ ! -L "$claim" ] && mv "$memo" "$claim" 2>/dev/null; then
+    if snap="$(pg_memo_read "$claim")"; then
       snap="${snap//$'\n'/}"
       if [ "$snap" = "$url" ] || [ -z "$snap" ]; then
         pg_memo_claim_resolve "$claim" "$receipt"
@@ -3505,9 +3528,6 @@ pg_provenance_reject() {  # <marker> [matched-url]
       # EEXIST preserves the concurrent memo AND this alternate. Other link failures and
       # failed reads likewise leave a discoverable claim for the next ordinary salvage.
     fi
-  elif [ -n "$claim" ]; then
-    # Only our exclusively allocated empty placeholder exists when the rename failed.
-    rm -f "$claim" 2>/dev/null || true
   fi
   return 0
 }
