@@ -3429,19 +3429,19 @@ PG_EOF
 # A claim remains a recovery handle until its bytes were read and convicted or restored.
 # Check the canonical memo before claims at callers: renaming publishes the claim atomically.
 pg_memo_claim_pending() { # marker
-  local marker="$1" claim dir
+  local marker="$1" claim dir entries
   pg_reservation_marker_ok "$marker" || return 1
-  # A glob that cannot enumerate its directory is not proof of absence. In particular,
-  # recheck storage here even when the earlier browser scan completed before an I/O fault.
+  # Use the checked listing itself, not a second glob which could fail independently.
+  # Recheck storage even when the earlier browser scan completed before an I/O fault.
   [ -d "$PRO_GATE_HOME" ] && [ -r "$PRO_GATE_HOME" ] && [ -x "$PRO_GATE_HOME" ] || return 0
   for dir in "$PRO_GATE_HOME/conversation-urls" "$PRO_GATE_HOME/legacy-review-receipts"; do
     [ -e "$dir" ] || [ -L "$dir" ] || continue
-    [ -d "$dir" ] && [ ! -L "$dir" ] && [ -r "$dir" ] && [ -x "$dir" ] \
-      && ls -A "$dir" >/dev/null 2>&1 || return 0
-    for claim in "$dir/$marker.rej."*; do
-      [ -e "$claim" ] || [ -L "$claim" ] || continue
+    [ -d "$dir" ] && [ ! -L "$dir" ] && [ -r "$dir" ] && [ -x "$dir" ] || return 0
+    entries="$(LC_ALL=C ls -A1 "$dir" 2>/dev/null)" || return 0
+    while IFS= read -r claim; do
+      case "$claim" in "$marker.rej."*) ;; *) continue;; esac
       [ "$(pg_memo_claim_marker "$claim")" = "$marker" ] && return 0
-    done
+    done <<<"$entries"
   done
   return 1
 }
