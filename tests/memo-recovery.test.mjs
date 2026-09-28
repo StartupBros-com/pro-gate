@@ -395,6 +395,17 @@ for (const fault of ["blacklist read", "claim listing"]) {
   }
 }
 
+test("a claim directory path that is not a directory hides no claim", (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(f.memo, genuine);
+  fs.rmdirSync(f.dirs.LEGACY_RECEIPT_DIR);
+  fs.writeFileSync(f.dirs.LEGACY_RECEIPT_DIR, "not a directory\n");
+  assert.equal(f.api.recall(marker), genuine);
+  assert.equal(fs.readFileSync(f.memo, "utf8"), genuine);
+  // As before the listing check, the damaged storage still leaves absence unproven.
+  assert.equal(f.api.unresolved(marker), true);
+});
+
 test("an incomplete claim listing restores nothing an unlisted claim may convict", (t) => {
   const f = fixture(t);
   // The listed claim holds a URL that only the unlisted claim's name convicts.

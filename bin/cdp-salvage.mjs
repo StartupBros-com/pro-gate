@@ -354,7 +354,8 @@ function memoClaimRestored(claim, canonical) {
 
 // Claims contain the original inode, not a copy. Until a read and either conviction or
 // restoration succeeds, they are recovery handles and must participate in ordinary recall.
-// An incomplete listing may hide a claim, and with it a conviction.
+// An incomplete listing may hide a claim, and with it a conviction. A path that is not a
+// directory hides no claim, but like the shell's check it leaves absence unproven.
 function memoClaimListing(m) {
   if (!MARKER_SAFE_RE.test(m)) return { claims: [], complete: true };
   const claims = [];
@@ -368,7 +369,7 @@ function memoClaimListing(m) {
     } catch (error) {
       if (error.code !== 'ENOENT') {
         unresolvedMemos.add(m);
-        complete = false;
+        if (error.code !== 'ENOTDIR') complete = false;
       }
     }
   }
