@@ -365,6 +365,44 @@ for (const rejection of ["identical bytes", "hard link", "blacklist only", "unpu
   });
 }
 
+for (const append of ["published", "unpublished"]) {
+  test(`recovery keeps the rejection of a republished canonical URL: ${append}`, (t) => {
+    const f = fixture(t);
+    // The claim's name rejects the canonical URL, while its bytes hold one already blacklisted.
+    fs.writeFileSync(f.memo, foreign);
+    fs.writeFileSync(boundedClaim(f, foreign), newer);
+    fs.writeFileSync(f.blacklist, `${marker}\t${newer}\n`);
+    if (append === "unpublished")
+      f.proxy.appendFileSync = () => {
+        throw fail();
+      };
+    assert.equal(f.api.recall(marker), null);
+    assert.equal(fs.existsSync(f.memo), false);
+    if (append === "unpublished") {
+      assert.ok(f.claims().length > 0);
+      assert.equal(f.api.unresolved(marker), true);
+    }
+    assert.equal(f.fresh().recall(marker), null);
+    assert.equal(f.claims().length, 0);
+    assert.equal(
+      fs.readFileSync(f.blacklist, "utf8"),
+      `${marker}\t${newer}\n${marker}\t${foreign}\n`,
+    );
+  });
+}
+
+test("an unreadable canonical memo keeps a claim whose rejection no read bytes hold", (t) => {
+  const f = fixture(t);
+  const oversized = `${foreign}?${"x".repeat(4096)}`;
+  fs.writeFileSync(f.memo, oversized);
+  fs.writeFileSync(boundedClaim(f, foreign), newer);
+  fs.writeFileSync(f.blacklist, `${marker}\t${newer}\n`);
+  assert.equal(f.api.recall(marker), null);
+  assert.equal(fs.readFileSync(f.memo, "utf8"), oversized);
+  assert.equal(f.claims().length, 1);
+  assert.equal(f.api.unresolved(marker), true);
+});
+
 for (const fault of ["blacklist read", "claim listing"]) {
   for (const held of [foreign, genuine]) {
     test(`an unreadable ${fault} leaves a ${held === foreign ? "rejected" : "genuine"} memo untrusted and untouched`, (t) => {

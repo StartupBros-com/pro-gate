@@ -433,16 +433,15 @@ function recoverMemoClaims(m) {
   }
   // Every claim's conviction applies to all of them, so processing order cannot restore a
   // URL a sibling rejected. A claim is resolved only once its own conviction is durable: the
-  // blacklist holds every read URL it names, or none names it and no claim went unread.
+  // blacklist holds every URL it names that a claim or the canonical memo holds, or none does
+  // and nothing went unread.
   const foreign = (url) =>
     !conversationUrlOk(url) ||
     rejected.has(url) ||
     claims.some((claim) => memoClaimConvicts(claim, url));
   const durable = (claim) => {
     if (memoClaimDigest(claim) === null) return true;
-    const named = [...held.values()].filter((url) =>
-      memoClaimConvicts(claim, url),
-    );
+    const named = seen.filter((url) => memoClaimConvicts(claim, url));
     return named.length
       ? named.every((url) => !conversationUrlOk(url) || rejected.has(url))
       : !unseen;
@@ -462,6 +461,22 @@ function recoverMemoClaims(m) {
       if (error.code === 'EEXIST' && memoClaimRestored(claim, memoPath(m)))
         settled.push(claim);
       else unresolvedMemos.add(m);
+    }
+  }
+  // Another writer may have republished a URL a claim rejects. Resolving that claim would leave
+  // the canonical memo trusted, so the rejection is published first; an unreadable memo, like
+  // an unread claim, leaves a claim naming nothing it could see in place.
+  const seen = [...held.values()];
+  try {
+    const canonical = memoBytes(memoPath(m)).trim();
+    if (canonical && claims.some((claim) => memoClaimConvicts(claim, canonical))) {
+      memoRejectionPublished(m, canonical, rejected);
+      seen.push(canonical);
+    }
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      unresolvedMemos.add(m);
+      unseen = true;
     }
   }
   // Resolve only after every publication above, so no claim's position decides durability.
