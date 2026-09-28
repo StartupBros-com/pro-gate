@@ -1107,10 +1107,12 @@ pg_attempt_disposition_dir() { printf '%s\n' "${PRO_GATE_ATTEMPT_DISPOSITION_DIR
 
 pg_attempt_disposition_validate() { # canonical JSON [expected marker]
   local json="${1-}" marker="${2:-}" canonical
-  canonical="$(printf '%s' "$json" | jq -cS . 2>/dev/null)" || return 1
+  canonical="$(printf '%s' "$json" | jq -sceS 'if length==1 then .[0] else error("expected one disposition") end' 2>/dev/null)" || return 1
   jq -e --arg marker "$marker" '. as $d |
-    ($d|keys) == ["charged_spend_epoch","marker","observed_at","proof_kind","record_type","record_version","repository","round_key","target","terminal_kind"] and
-    $d.record_type=="review-attempt-disposition/v1" and $d.record_version==1 and
+    ((($d|keys) == ["charged_spend_epoch","marker","observed_at","proof_kind","record_type","record_version","repository","round_key","target","terminal_kind"] and
+      $d.record_type=="review-attempt-disposition/v1" and $d.record_version==1) or
+     (($d|keys) == ["charged_spend_epoch","delivery","marker","observed_at","proof_kind","record_type","record_version","repository","round_key","target","terminal_kind"] and
+      $d.record_type=="review-attempt-disposition/v2" and $d.record_version==2 and $d.terminal_kind=="not-submitted")) and
     ($d.marker|type=="string" and test("^pg-run-[A-Za-z0-9.-]+$")) and ($marker=="" or $d.marker==$marker) and
     ($d.round_key|type=="string" and test("^[A-Za-z0-9.-]+$")) and ($d.marker|startswith("pg-run-" + $d.round_key + "-")) and
     ($d.charged_spend_epoch|type=="number" and floor==. and .>0) and
@@ -1125,21 +1127,34 @@ pg_attempt_disposition_validate() { # canonical JSON [expected marker]
     ($d.target|keys)==["kind","pr"] and $d.target.kind=="pull-request" and ($d.target.pr|type=="number" and floor==. and .>0) and
     ($d.round_key|endswith("-" + ($d.target.pr|tostring)))
   ' <<<"$canonical" >/dev/null 2>&1 || return 1
+  if [ "$(jq -r .record_version <<<"$canonical")" = 2 ]; then
+    pg_delivery_snapshot_validate "$(jq -cS .delivery <<<"$canonical")" >/dev/null || return 1
+  fi
   printf '%s' "$canonical"
 }
 
-pg_attempt_disposition_read() { # marker -> canonical disposition
-  local marker="$1" f json
+pg_attempt_disposition_bytes() { # bounded regular-file read, also used for damaged payload inspection
+  local marker="$1" f json LC_ALL=C
   pg_reservation_marker_ok "$marker" || return 1
   f="$(pg_attempt_disposition_dir)/$marker"
   [ -f "$f" ] && [ ! -L "$f" ] || return 1
-  json="$(cat "$f" 2>/dev/null)" || return 1
+  # Bound the actual read, including growth after the file check. The sentinel preserves
+  # trailing newlines so the byte limit cannot be defeated by command substitution.
+  json="$(head -c 65537 "$f" 2>/dev/null && printf '.')" || return 1
+  json="${json%.}"
+  [ "${#json}" -le 65536 ] || return 1
+  printf '%s' "$json"
+}
+
+pg_attempt_disposition_read() { # marker -> canonical disposition
+  local marker="$1" json
+  json="$(pg_attempt_disposition_bytes "$marker")" || return 1
   pg_attempt_disposition_validate "$json" "$marker"
 }
 
-pg_attempt_disposition_write() { # host owner repo pr round-key marker charged-epoch terminal-kind proof-kind
+pg_attempt_disposition_write() { # host owner repo pr round-key marker charged-epoch terminal-kind proof-kind [delivery snapshot]
   local host="$1" owner="$2" repo="$3" pr="$4" key="$5" marker="$6" epoch="$7" kind="$8" proof="$9"
-  local dir f tmp canonical now rc=1
+  local delivery="${10:-}" dir f tmp canonical now rc=1
   pg_canonical_repo_ok "$host" "$owner" "$repo" || return 1
   pr="$(pg_pr_number_normalize "$pr")" || return 1
   pg_round_key_ok "$key" || return 1
@@ -1149,6 +1164,10 @@ pg_attempt_disposition_write() { # host owner repo pr round-key marker charged-e
   canonical="$(jq -cnS --arg host "$host" --arg owner "$owner" --arg repo "$repo" --argjson pr "$pr" \
     --arg key "$key" --arg marker "$marker" --argjson epoch "$epoch" --argjson now "$now" --arg kind "$kind" --arg proof "$proof" \
     '{charged_spend_epoch:$epoch,marker:$marker,observed_at:$now,proof_kind:$proof,record_type:"review-attempt-disposition/v1",record_version:1,repository:{host:$host,owner:$owner,repo:$repo},round_key:$key,target:{kind:"pull-request",pr:$pr},terminal_kind:$kind}')" || return 1
+  if [ -n "$delivery" ]; then
+    delivery="$(pg_delivery_snapshot_validate "$delivery")" || return 1
+    canonical="$(jq -cS --argjson delivery "$delivery" '.record_type="review-attempt-disposition/v2" | .record_version=2 | .delivery=$delivery' <<<"$canonical")" || return 1
+  fi
   canonical="$(pg_attempt_disposition_validate "$canonical" "$marker")" || return 1
   dir="$(pg_attempt_disposition_dir)"; mkdir -p "$dir" 2>/dev/null || return 1
   f="$dir/$marker"; tmp="$dir/.$marker.tmp.$$"
@@ -1159,7 +1178,8 @@ pg_attempt_disposition_write() { # host owner repo pr round-key marker charged-e
     if jq -e --argjson candidate "$canonical" '
       .charged_spend_epoch==$candidate.charged_spend_epoch and .marker==$candidate.marker and
       .proof_kind==$candidate.proof_kind and .repository==$candidate.repository and
-      .round_key==$candidate.round_key and .target==$candidate.target and .terminal_kind==$candidate.terminal_kind
+      .round_key==$candidate.round_key and .target==$candidate.target and .terminal_kind==$candidate.terminal_kind and
+      .record_version==$candidate.record_version and .delivery==$candidate.delivery
     ' <<<"$existing" >/dev/null 2>&1; then return 0; fi
     return 1
   fi
@@ -1211,14 +1231,15 @@ pg_attempt_disposition_sweep() { # delete only old dispositions whose cleanup is
   done
 }
 
-pg_attempt_disposition_find() { # host owner repo pr -> newest exact disposition
-  local host="$1" owner="$2" repo="$3" pr="$4" dir f marker json epoch best="" best_epoch="" LC_ALL=C
+pg_attempt_disposition_find() { # host owner repo pr [exclude-marker] -> newest exact disposition
+  local host="$1" owner="$2" repo="$3" pr="$4" exclude="${5:-}" dir f marker json epoch best="" best_epoch="" LC_ALL=C
   pg_canonical_repo_ok "$host" "$owner" "$repo" || return 1
   pr="$(pg_pr_number_normalize "$pr")" || return 1
   dir="$(pg_attempt_disposition_dir)"; [ -d "$dir" ] || return 1
   for f in "$dir"/pg-run-*; do
     [ -f "$f" ] && [ ! -L "$f" ] || continue
-    marker="${f##*/}"; json="$(pg_attempt_disposition_read "$marker" 2>/dev/null || true)"; [ -n "$json" ] || continue
+    marker="${f##*/}"; [ "$marker" != "$exclude" ] || continue
+    json="$(pg_attempt_disposition_read "$marker" 2>/dev/null || true)"; [ -n "$json" ] || continue
     jq -e --arg h "$host" --arg o "$owner" --arg r "$repo" --argjson p "$pr" \
       '.repository.host==$h and .repository.owner==$o and .repository.repo==$r and .target.pr==$p' <<<"$json" >/dev/null 2>&1 || continue
     epoch="$(jq -r .charged_spend_epoch <<<"$json")"
@@ -1231,14 +1252,9 @@ pg_attempt_disposition_find() { # host owner repo pr -> newest exact disposition
 }
 
 # ── Delivery-condition records (#204) ──────────────────────────────────────────────────────────
-# A review-decision fresh effect whose Send was proven never dispatched refunds its round. Before
-# this record existed, the next query granted the identical run again, so an attachment that could
-# not be delivered was retried until the caller's own time budget ran out. The refund now leaves one
-# small write-once record beside the attempt's disposition: the digest of the condition it failed
-# under (evidence relation, input mode, attachment policy, Oracle build) and how many proven no-send
-# attempts in a row that same condition has produced. The disposition keeps its own exact-key
-# record at version 1; this sidecar is read only beside a not-submitted disposition and is swept
-# with it.
+# Proven no-send refunds retain delivery evidence in the required v2 disposition. The v1
+# sidecar remains a compatibility mirror and reader; its failure cannot discard the evidence
+# that bounds a repeated failed delivery. Neither record claims successful delivery.
 pg_delivery_condition_dir() { printf '%s\n' "${PRO_GATE_DELIVERY_CONDITION_DIR:-$PRO_GATE_HOME/delivery-conditions}"; }
 
 # pg_oracle_identity: the installed Oracle build as its own --version prints it. Upgrading or
@@ -1248,7 +1264,7 @@ pg_delivery_condition_dir() { printf '%s\n' "${PRO_GATE_DELIVERY_CONDITION_DIR:-
 # query each read the build, and one slow start under load reading as a different build would
 # silently restart the failed-delivery count.
 pg_oracle_identity() {
-  local oracle_bin="${PRO_GATE_ORACLE_BIN:-oracle}" timeout_bin="${PRO_GATE_TIMEOUT_BIN:-timeout}" v="" tries=0
+  local oracle_bin="${PRO_GATE_ORACLE_BIN:-oracle}" timeout_bin="${PRO_GATE_TIMEOUT_BIN:-timeout}" v="" raw tries=0
   if [[ "$oracle_bin" == */* ]]; then
     [ -x "$oracle_bin" ] || { printf 'unknown\n'; return 0; }
   else
@@ -1257,7 +1273,10 @@ pg_oracle_identity() {
   if { [[ "$timeout_bin" == */* ]] && [ -x "$timeout_bin" ]; } || pg_have "$timeout_bin"; then
     while [ -z "$v" ] && [ "$tries" -lt 2 ]; do
       tries=$(( tries + 1 ))
-      v="$("$timeout_bin" 5s "$oracle_bin" --version </dev/null 2>/dev/null | head -n 1 | tr -cd 'A-Za-z0-9._+-' | cut -c1-64)"
+      # A failing probe may print a plausible version. Its stdout is not build evidence.
+      if raw="$(set -o pipefail; "$timeout_bin" 5s "$oracle_bin" --version </dev/null 2>/dev/null | head -c 4096)"; then
+        v="$(printf '%s\n' "$raw" | head -n 1 | tr -cd 'A-Za-z0-9._+-' | cut -c1-64)"
+      fi
     done
   fi
   printf '%s\n' "${v:-unknown}"
@@ -1270,7 +1289,7 @@ pg_delivery_condition_digest() { # relation-identity input-mode attachment-polic
 
 pg_delivery_condition_validate() { # canonical JSON [expected marker]
   local json="${1-}" marker="${2:-}" canonical
-  canonical="$(printf '%s' "$json" | jq -cS . 2>/dev/null)" || return 1
+  canonical="$(printf '%s' "$json" | jq -sceS 'if length==1 then .[0] else error("expected one delivery record") end' 2>/dev/null)" || return 1
   jq -e --arg marker "$marker" '. as $d |
     ($d|keys) == ["condition_digest","consecutive","marker","record_type","record_version","round_key"] and
     $d.record_type=="review-delivery-condition/v1" and $d.record_version==1 and
@@ -1283,12 +1302,13 @@ pg_delivery_condition_validate() { # canonical JSON [expected marker]
 }
 
 pg_delivery_condition_read() { # marker -> canonical record
-  local marker="$1" f
+  local marker="$1" f json
   pg_reservation_marker_ok "$marker" || return 1
   f="$(pg_delivery_condition_dir)/$marker"
   [ -f "$f" ] && [ ! -L "$f" ] || return 1
   [ "$(wc -c < "$f" 2>/dev/null | tr -d ' ')" -le 4096 ] || return 1
-  pg_delivery_condition_validate "$(cat "$f" 2>/dev/null)" "$marker"
+  json="$(cat "$f" 2>/dev/null)" || return 1
+  pg_delivery_condition_validate "$json" "$marker"
 }
 
 pg_delivery_condition_write() { # marker round-key condition-digest consecutive; write-once
@@ -1313,9 +1333,8 @@ pg_delivery_condition_write() { # marker round-key condition-digest consecutive;
   return "$rc"
 }
 
-# pg_delivery_condition_record host owner repo pr round-key marker condition-digest: called by the
-# refund of a proven no-send attempt BEFORE its disposition is written, so the attempt snapshot that
-# excludes this marker is exactly "the attempt before this one" for the change. The run continues
+# Legacy sidecar writer API. New refunds use pg_delivery_snapshot_json and mirror its known count
+# with pg_delivery_condition_write. Excluding this marker reads the attempt before it. The run continues
 # only when that attempt was itself a proven no-send under the same condition; a sent attempt, a
 # review, or a different condition in between starts the count again at one.
 pg_delivery_condition_record() {
@@ -1331,36 +1350,185 @@ pg_delivery_condition_record() {
   pg_delivery_condition_write "$marker" "$key" "$digest" "$n"
 }
 
-# pg_delivery_facts_json attempt-snapshot relation-identity input-mode: facts.delivery for BOTH the
-# advisory query and the guarded dispatch recheck. failed_unchanged counts the proven no-send
-# attempts in a row, ending at the newest attempt for this change, whose recorded condition equals
-# the current one; anything else (a newer sent attempt or review, no record, no current relation, a
-# changed condition) is zero. The Oracle build is probed only when a record could match, so an
-# ordinary query never runs Oracle. override resolves the operator's one-invocation
-# PRO_GATE_FORCE_ROUND=1 here so the reducer stays a pure function of its facts. Zero is the
-# fail-safe answer, but not a silent one: a record that exists yet cannot be read, or an Oracle
-# build that cannot be read now, says so on stderr.
-pg_delivery_facts_json() {
-  local snapshot="$1" relation="$2" input="$3" marker record oracle_id n=0 override=false
-  [ "${PRO_GATE_FORCE_ROUND:-0}" = 1 ] && override=true
-  if [ -n "$relation" ] \
-     && jq -e '.source=="disposition" and .state=="not-submitted" and .fresh_eligible==true' <<<"$snapshot" >/dev/null 2>&1; then
-    marker="$(jq -r .marker <<<"$snapshot")"
-    record="$(pg_delivery_condition_read "$marker" 2>/dev/null || true)"
-    if [ -n "$record" ]; then
-      oracle_id="$(pg_oracle_identity)"
-      if [ "$(jq -r .condition_digest <<<"$record")" = \
-           "$(pg_delivery_condition_digest "$relation" "$input" "${PRO_GATE_BROWSER_ATTACHMENTS:-auto}" "$oracle_id")" ]; then
-        n="$(jq -r .consecutive <<<"$record")"
-      elif [ "$oracle_id" = unknown ]; then
-        echo "[pro-gate] #204: Oracle's version could not be read, so the failed delivery recorded for $marker cannot be matched; counting from zero." >&2
-      fi
-    elif pg_reservation_marker_ok "$marker" \
-         && { [ -e "$(pg_delivery_condition_dir)/$marker" ] || [ -L "$(pg_delivery_condition_dir)/$marker" ]; }; then
-      echo "[pro-gate] #204: the delivery-condition record for $marker cannot be read; counting failed deliveries from zero." >&2
+# An unavailable snapshot still retains every known component. A later proven component change
+# can break the chain; learning an identity that was previously unknown cannot do so.
+pg_delivery_condition_json() { # relation input attachments oracle
+  jq -cnS --arg relation "$1" --arg input "$2" --arg attachments "$3" --arg oracle "$4" \
+    '{attachments:$attachments,input:$input,oracle:$oracle,relation:$relation}'
+}
+
+pg_delivery_snapshot_validate() { # one v2 disposition delivery value
+  local canonical
+  canonical="$(printf '%s' "${1-}" | jq -sceS 'if length==1 then .[0] else error("expected one snapshot") end' 2>/dev/null)" || return 1
+  jq -e '
+    if .state=="not-applicable" then keys==["state"] else
+      keys==["condition","consecutive","state"] and (.state|IN("known","unavailable")) and
+      (.condition|keys)==["attachments","input","oracle","relation"] and
+      (.condition.attachments|IN("auto","always","never","unknown")) and
+      (.condition.input|IN("bundle","both","connector","unknown")) and
+      (.condition.oracle|type=="string" and test("^[A-Za-z0-9._+-]{1,64}$")) and
+      (.condition.relation|type=="string" and (length==0 or test("^relation:[0-9a-f]{64}$"))) and
+      (if .state=="known" then
+        .condition.attachments!="unknown" and .condition.input!="unknown" and
+        .condition.oracle!="unknown" and .condition.relation!="" and
+        (.consecutive|type=="number" and floor==. and .>=1 and .<=1000)
+       else .consecutive==null end)
+    end' <<<"$canonical" >/dev/null 2>&1 || return 1
+  printf '%s' "$canonical"
+}
+
+# A malformed disposition cannot authorize cleanup, but it also cannot disappear from admission
+# merely because the strict disposition reader skipped it. This is a read-only uncertainty check
+# over the same per-change filenames. It never repairs, refunds, or removes any record.
+pg_delivery_history_unavailable() { # attempt snapshot -> 0 when potentially relevant bytes are uncertain
+  local snapshot="$1" key dir f marker marker_key json core epoch selected_epoch selected_marker
+  key="$(jq -r '.target.round_key // empty' <<<"$snapshot" 2>/dev/null)"
+  [ -n "$key" ] || return 1
+  pg_round_key_ok "$key" || return 0
+  dir="$(pg_attempt_disposition_dir)"
+  [ -e "$dir" ] || [ -L "$dir" ] || return 1
+  [ -d "$dir" ] && [ -x "$dir" ] && ls -A "$dir" >/dev/null 2>&1 || return 0
+  selected_epoch="$(jq -r '.charged_spend_epoch // 0' <<<"$snapshot")"
+  selected_marker="$(jq -r '.marker // empty' <<<"$snapshot")"
+  case "$selected_epoch" in ''|*[!0-9]*) selected_epoch=0;; esac
+  for f in "$dir"/pg-run-"$key"-*; do
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    marker="${f##*/}"; marker_key="${marker#pg-run-}"; marker_key="${marker_key%-*-*}"
+    [ "$marker_key" = "$key" ] || continue
+    if ! json="$(pg_attempt_disposition_read "$marker" 2>/dev/null)"; then
+      # A damaged delivery payload can still have valid target/charge metadata. Use that
+      # metadata ONLY to order it behind a newer authoritative attempt, never for cleanup.
+      # Unreadable/truncated outer metadata has no such proof: marker mint time is not charge.
+      json="$(pg_attempt_disposition_bytes "$marker")" || return 0
+      core="$(jq -sceS 'if length==1 and .[0].record_type=="review-attempt-disposition/v2" and .[0].record_version==2
+        then .[0] | del(.delivery) | .record_type="review-attempt-disposition/v1" | .record_version=1
+        else error("unavailable disposition core") end' <<<"$json" 2>/dev/null)" || return 0
+      core="$(pg_attempt_disposition_validate "$core" "$marker")" || return 0
+      epoch="$(jq -r .charged_spend_epoch <<<"$core")"
+      if [ "$selected_epoch" -gt "$epoch" ] \
+         || { [ "$selected_epoch" -eq "$epoch" ] && [[ "$selected_marker" > "$marker" ]]; }; then continue; fi
+      return 0
     fi
+  done
+  return 1
+}
+
+pg_delivery_state_emit() { # state count-or-null
+  jq -cnS --arg state "$1" --argjson n "$2" '{failed_unchanged:$n,state:$state}'
+}
+
+# Shared comparison for query, effect recheck, and terminal snapshot construction. The optional
+# Oracle argument is the already-captured attempt-time identity. Otherwise probe only when known
+# components have not already proven change. Ordinary unrelated queries never invoke Oracle.
+pg_delivery_state_json() { # attempt snapshot relation input attachments [attempt-time Oracle]
+  local snapshot="$1" relation="$2" input="$3" attachments="$4" oracle_id="${5:-}"
+  local marker disposition delivery record f old key dir
+  if ! jq -e 'type=="object" and (.source|IN("none","artifact","disposition","active","reservation","run-meta")) and
+      (.state|type=="string") and (.marker|type=="string") and (.fresh_eligible|type=="boolean")' \
+      <<<"$snapshot" >/dev/null 2>&1; then pg_delivery_state_emit unavailable null; return; fi
+  if pg_delivery_history_unavailable "$snapshot"; then pg_delivery_state_emit unavailable null; return; fi
+  if ! jq -e '.source=="disposition" and .state=="not-submitted" and .fresh_eligible==true' <<<"$snapshot" >/dev/null 2>&1; then
+    pg_delivery_state_emit known 0; return
   fi
-  jq -cnS --argjson n "$n" --argjson override "$override" '{failed_unchanged:$n,override:$override}'
+  marker="$(jq -r .marker <<<"$snapshot")"
+  disposition="$(jq -cS '.terminal // empty' <<<"$snapshot")"
+  if [ -n "$disposition" ]; then
+    disposition="$(pg_attempt_disposition_validate "$disposition" "$marker")" || { pg_delivery_state_emit unavailable null; return; }
+  elif ! disposition="$(pg_attempt_disposition_read "$marker" 2>/dev/null)"; then
+    # Minimal historical callers supplied only a marker; an existing unreadable disposition is
+    # still uncertainty. A missing one can only be interpreted through its legacy sidecar below.
+    f="$(pg_attempt_disposition_dir)/$marker"
+    if [ -e "$f" ] || [ -L "$f" ]; then pg_delivery_state_emit unavailable null; return; fi
+    disposition=""
+  fi
+  if [ -n "$disposition" ] && [ "$(jq -r .record_version <<<"$disposition")" = 2 ]; then
+    delivery="$(jq -cS .delivery <<<"$disposition")"
+    if [ "$(jq -r .state <<<"$delivery")" = not-applicable ]; then pg_delivery_state_emit known 0; return; fi
+    # Empty/unknown -> known is not evidence of change. Any independently known changed
+    # component is enough, even when another component or the previous count was unavailable.
+    if jq -e --arg relation "$relation" --arg input "$input" --arg attachments "$attachments" '
+      .condition as $c |
+      ($c.relation!="" and $relation!="" and $c.relation!=$relation) or
+      ($c.input!="unknown" and $input!="unknown" and $c.input!=$input) or
+      ($c.attachments!="unknown" and $attachments!="unknown" and $c.attachments!=$attachments)
+    ' <<<"$delivery" >/dev/null 2>&1; then pg_delivery_state_emit known 0; return; fi
+    [ -n "$relation" ] || { pg_delivery_state_emit unavailable null; return; }
+    [ -n "$oracle_id" ] || oracle_id="$(pg_oracle_identity)"
+    old="$(jq -r .condition.oracle <<<"$delivery")"
+    if [ "$old" != unknown ] && [ "$oracle_id" != unknown ] && [ "$old" != "$oracle_id" ]; then
+      pg_delivery_state_emit known 0; return
+    fi
+    if [ "$oracle_id" = unknown ] || [ "$old" = unknown ] || [ "$(jq -r .state <<<"$delivery")" != known ]; then
+      pg_delivery_state_emit unavailable null; return
+    fi
+    pg_delivery_state_emit known "$(jq -r .consecutive <<<"$delivery")"; return
+  fi
+
+  dir="$(pg_delivery_condition_dir)"
+  if { [ -e "$dir" ] || [ -L "$dir" ]; } \
+     && ! { [ -d "$dir" ] && [ -x "$dir" ] && ls -A "$dir" >/dev/null 2>&1; }; then
+    pg_delivery_state_emit unavailable null; return
+  fi
+  f="$dir/$marker"
+  if [ ! -e "$f" ] && [ ! -L "$f" ]; then
+    # v0.58 and older cannot distinguish pre-feature history, Cloudflare, and failed/missing
+    # sidecar publication. Keep this explicit compatibility exception, never call it a change.
+    pg_delivery_state_emit legacy-untracked null; return
+  fi
+  if ! record="$(pg_delivery_condition_read "$marker" 2>/dev/null)"; then
+    pg_delivery_state_emit unavailable null; return
+  fi
+  key="$(jq -r '.target.round_key // empty' <<<"$snapshot")"
+  if [ -n "$key" ] && [ "$(jq -r .round_key <<<"$record")" != "$key" ]; then
+    pg_delivery_state_emit unavailable null; return
+  fi
+  [ -n "$relation" ] || { pg_delivery_state_emit unavailable null; return; }
+  [ -n "$oracle_id" ] || oracle_id="$(pg_oracle_identity)"
+  if [ "$oracle_id" = unknown ]; then pg_delivery_state_emit unavailable null; return; fi
+  old="$(jq -r .condition_digest <<<"$record")"
+  if [ "$old" = "$(pg_delivery_condition_digest "$relation" "$input" "$attachments" "$oracle_id")" ]; then
+    pg_delivery_state_emit known "$(jq -r .consecutive <<<"$record")"
+  elif [ "$old" = "$(pg_delivery_condition_digest "$relation" "$input" "$attachments" unknown)" ]; then
+    pg_delivery_state_emit unavailable null
+  else
+    pg_delivery_state_emit known 0
+  fi
+}
+
+pg_delivery_snapshot_json() { # host owner repo pr key marker attempt-time condition JSON
+  local host="$1" owner="$2" repo="$3" pr="$4" key="$5" marker="$6" condition="$7"
+  local previous state n snapshot published
+  # Terminal publication fixes the count and attempt-time components. A cleanup replay must
+  # never count itself or replace that evidence with the caller's current configuration.
+  published="$(pg_attempt_disposition_read "$marker" 2>/dev/null || true)"
+  if [ -n "$published" ]; then
+    jq -e --arg h "$host" --arg o "$owner" --arg r "$repo" --arg p "$pr" --arg k "$key" '
+      .record_version==2 and .terminal_kind=="not-submitted" and .proof_kind=="proven-no-submit" and
+      .repository=={host:$h,owner:$o,repo:$r} and (.target.pr|tostring)==$p and .round_key==$k
+    ' <<<"$published" >/dev/null 2>&1 || return 1
+    jq -cS .delivery <<<"$published"; return
+  fi
+  snapshot="$(jq -cnS --argjson condition "$condition" '{condition:$condition,consecutive:null,state:"unavailable"}')" || return 1
+  snapshot="$(pg_delivery_snapshot_validate "$snapshot")" || return 1
+  previous="$(pg_attempt_snapshot "$host" "$owner" "$repo" "$pr" "$key" "$marker")" \
+    || { printf '%s' "$snapshot"; return 0; }
+  state="$(pg_delivery_state_json "$previous" "$(jq -r .relation <<<"$condition")" "$(jq -r .input <<<"$condition")" \
+    "$(jq -r .attachments <<<"$condition")" "$(jq -r .oracle <<<"$condition")")" \
+    || { printf '%s' "$snapshot"; return 0; }
+  if [ "$(jq -r .state <<<"$state")" = known ] && jq -e '.relation!="" and .input!="unknown" and .attachments!="unknown" and .oracle!="unknown"' <<<"$condition" >/dev/null; then
+    n=$(( $(jq -r .failed_unchanged <<<"$state") + 1 )); [ "$n" -le 1000 ] || n=1000
+    snapshot="$(jq -cS --argjson n "$n" '.state="known" | .consecutive=$n' <<<"$snapshot")" || return 1
+  fi
+  pg_delivery_snapshot_validate "$snapshot"
+}
+
+# Both public query and every effect recheck use this wrapper. FORCE can repeat a known failed
+# condition; it does not turn unavailable evidence into a known count.
+pg_delivery_facts_json() { # attempt snapshot relation input
+  local state override=false
+  [ "${PRO_GATE_FORCE_ROUND:-0}" = 1 ] && override=true
+  state="$(pg_delivery_state_json "$1" "$2" "$3" "${PRO_GATE_BROWSER_ATTACHMENTS:-auto}")" || return 1
+  jq -cS --argjson override "$override" '. + {override:$override}' <<<"$state"
 }
 
 pg_round_has_epoch() { # round-key epoch
@@ -1466,7 +1634,7 @@ pg_attempt_terminal_from_meta() { # marker terminal-kind proof-kind -> persist p
   pg_attempt_disposition_write "$host" "$owner" "$repo" "$pr" "$key" "$marker" "$epoch" "$kind" "$proof"
 }
 
-pg_attempt_terminal_transition() { # host owner repo pr key marker epoch kind proof
+pg_attempt_terminal_transition() { # host owner repo pr key marker epoch kind proof [delivery snapshot]
   local host="$1" owner="$2" repo="$3" pr="$4" key="$5" marker="$6" epoch="$7" kind="$8" proof="$9"
   local disposition meta active_file active_marker active_epoch latest="" binding normalized_pr
   normalized_pr="$(pg_pr_number_normalize "$pr")" || return 1
@@ -1490,7 +1658,7 @@ pg_attempt_terminal_transition() { # host owner repo pr key marker epoch kind pr
       if [ "${REVIEW_DECISION_EXECUTE:-0}" = 1 ]; then [ -n "$binding" ] || return 1; fi
       if [ -n "$binding" ]; then [ "$(jq -r .charged_spend_epoch <<<"$binding")" = "$epoch" ] || return 1; fi
     fi
-    pg_attempt_disposition_write "$host" "$owner" "$repo" "$pr" "$key" "$marker" "$epoch" "$kind" "$proof" || return 1
+    pg_attempt_disposition_write "$host" "$owner" "$repo" "$pr" "$key" "$marker" "$epoch" "$kind" "$proof" "${10:-}" || return 1
     disposition="$(pg_attempt_disposition_read "$marker" 2>/dev/null || true)"; [ -n "$disposition" ] || return 1
   fi
   pg_attempt_disposition_cleanup "$disposition"
@@ -1533,7 +1701,7 @@ pg_attempt_snapshot() { # host owner repo pr round-key [exclude-marker] -> canon
     [ -z "$rec" ] || IFS=$'\t' read -r _ _ _ _ _ _ latest_review_epoch <<<"$rec"
     case "$latest_review_epoch" in ''|*[!0-9]*) latest_review_epoch=0;; esac
   fi
-  disposition="$(pg_attempt_disposition_find "$host" "$owner" "$repo" "$pr" 2>/dev/null || true)"
+  disposition="$(pg_attempt_disposition_find "$host" "$owner" "$repo" "$pr" "$exclude" 2>/dev/null || true)"
   if [ -n "$disposition" ]; then
     disposition_marker="$(jq -r .marker <<<"$disposition")"; disposition_epoch="$(jq -r .charged_spend_epoch <<<"$disposition")"
     active_file="$(pg_active_dir)/$key"
@@ -1576,7 +1744,6 @@ pg_attempt_snapshot() { # host owner repo pr round-key [exclude-marker] -> canon
     fi
     if [ "$ignore_disposition" = true ]; then disposition=""; else
       marker="$disposition_marker"; epoch="$disposition_epoch"
-      if [ "$marker" = "$exclude" ]; then marker=""; disposition=""; else
       disposition_artifact="$(pg_attempt_artifact "$marker" 2>/dev/null || true)"
       if [ -n "$disposition_artifact" ]; then
         IFS=$'\t' read -r artifact_kind artifact_path <<<"$disposition_artifact"
@@ -1589,7 +1756,6 @@ pg_attempt_snapshot() { # host owner repo pr round-key [exclude-marker] -> canon
       rec="$(pg_run_meta_read "$marker" 2>/dev/null || true)"
       if [ -n "$rec" ]; then IFS=$'\t' read -r _ _ _ _ _ out _ <<<"$rec"; fi
     fi
-  fi
   fi
 
   if [ -z "$marker" ]; then
@@ -2068,6 +2234,9 @@ pg_reservation_note_miss() {
   dir="$(pg_reservation_dir)"; f="$dir/$marker"
   pg_reservation_guard_acquire || { echo "retained 0/$miss_limit"; return 0; }
   if [ ! -f "$f" ]; then pg_reservation_guard_release; echo released; return 0; fi
+  if pg_memo_claim_pending "$marker"; then
+    pg_reservation_guard_release; echo "retained unresolved-memo"; return 0
+  fi
   # Superseded work is intentionally retained for optional audit harvest and already holds no
   # capacity. Absence cannot improve that proof, so it must not rewrite or terminalize the record.
   if [ "$(awk -F'\t' 'NR==1{print $8}' "$f" 2>/dev/null)" = superseded ]; then
@@ -3044,7 +3213,9 @@ pg_round_score() {
   fi
   PG_ROUND_GRANT=$(( PG_ROUND_BASE + PG_ROUND_EARNED ))
   [ "$PG_ROUND_GRANT" -gt "$PG_ROUND_CEILING" ] && PG_ROUND_GRANT="$PG_ROUND_CEILING"
-  if [ "$PG_ROUND_STREAK" -ge 2 ]; then
+  # CONTINUE removes only the churn collapse. The original base + earned grant and its
+  # ceiling remain the single numeric authority for status, facts, and enforcement.
+  if [ "$PG_ROUND_STREAK" -ge 2 ] && ! pg_round_continue_override; then
     used="$(pg_round_count "$key")"
     [ "$used" -lt "$PG_ROUND_GRANT" ] && PG_ROUND_GRANT="$used"
   fi
@@ -3112,7 +3283,7 @@ pg_round_guard() {  # $1 = key. 0 = proceed; 1 + a one-line reason on stdout = e
     return 1
   fi
   used="$(pg_round_count "$key")"
-  if [ "$PG_ROUND_STREAK" -ge 2 ]; then
+  if [ "$PG_ROUND_STREAK" -ge 2 ] && ! pg_round_continue_override; then
     echo "review rounds stopped early for ${key}: the open-P0/P1 trajectory (${PG_ROUND_ARROW:-none}) has not shrunk for ${PG_ROUND_STREAK} consecutive re-reviews — this loop is churning, not converging (${used} slot-spending runs in the last ${PRO_GATE_ROUNDS_WINDOW:-24h})"
     return 1
   fi
@@ -3123,8 +3294,9 @@ pg_round_guard() {  # $1 = key. 0 = proceed; 1 + a one-line reason on stdout = e
   return 0
 }
 
-# pg_round_continue_override: true when PRO_GATE_ROUNDS_CONTINUE=1 grants THIS query a one-shot
-# pass through the review-decision reducer's rounds-not-converging stop (#174 R2). Read fresh on
+# pg_round_continue_override: true when PRO_GATE_ROUNDS_CONTINUE=1 bypasses the scorer/guard's
+# churn brake and reducer's rounds-not-converging stop for the configured invocation (#174 R2).
+# It never enlarges the uncollapsed numeric grant or bypasses exhaustion/lockdown. Read fresh on
 # every call, never written to disk and never remembered past this process — the same stateless,
 # one-invocation idiom as PRO_GATE_FORCE_ROUND (see pg_round_guard above). The reducer itself
 # stays a pure function of its facts (daemon.sh replays pg_review_decision_envelope_valid against
@@ -3254,6 +3426,40 @@ PG_EOF
 # deliberately bypassing cdp-salvage's own "never blacklist ourUrls" guard: marker match said
 # "ours", but the CONTENT proved the answer is not this change's review, which is the stronger
 # signal — and the memo is removed so the next pass rescans all candidates.
+# A claim remains a recovery handle until its bytes were read and convicted or restored.
+# Check the canonical memo before claims at callers: renaming publishes the claim atomically.
+pg_memo_claim_pending() { # marker
+  local marker="$1" claim
+  pg_reservation_marker_ok "$marker" || return 1
+  for claim in "$PRO_GATE_HOME/conversation-urls/$marker.rej."* "$PRO_GATE_HOME/legacy-review-receipts/$marker.rej."*; do
+    [ -e "$claim" ] || [ -L "$claim" ] || continue
+    [ "$(pg_memo_claim_marker "$claim")" = "$marker" ] && return 0
+  done
+  return 1
+}
+
+pg_memo_claim_marker() { # filename -> original marker, including markers containing .rej.
+  local name="${1##*/}" unique='\.rej\.([0-9a-f]{64}\.[A-Za-z0-9-]+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'
+  if [[ "$name" =~ ^pg-run-[A-Za-z0-9.-]+-[0-9]+-[0-9]+$ ]] && ! [[ "$name" =~ $unique ]]; then
+    printf '%s\n' "$name"; return
+  fi
+  if [[ "$name" =~ ^(pg-run-[A-Za-z0-9.-]+-[0-9]+-[0-9]+)\.rej\.[A-Za-z0-9.-]+$ ]]; then
+    name="${BASH_REMATCH[1]}"
+  fi
+  pg_reservation_marker_ok "$name" || return 1
+  printf '%s\n' "$name"
+}
+
+pg_memo_claim_resolve() { # claim legacy-receipt
+  local claim="$1" receipt="$2"
+  if [ -n "$receipt" ]; then
+    # The unique suffix survives; only the unresolved tag changes. Preserve original mtime.
+    mv "$claim" "${claim%.rej.*}.${claim##*.rej.}" 2>/dev/null || true
+  else
+    rm -f "$claim" 2>/dev/null || true
+  fi
+}
+
 pg_provenance_reject() {  # <marker> [matched-url]
   # Prefer the EXPLICIT matched URL the CDP child reported for this very capture: reading the
   # shared memo afterwards races concurrent probes/retries, which can re-learn the GENUINE
@@ -3262,32 +3468,47 @@ pg_provenance_reject() {  # <marker> [matched-url]
   # renamed aside first, its content checked against the rejected URL, and restored when it
   # names a DIFFERENT (newer, possibly genuine) conversation — a read-append-remove sequence
   # left a window where a concurrently refreshed genuine memo was deleted by a stale compare.
-  local m="$1" url="${2:-}" memo claim="" snap receipt=""
+  local m="$1" url="${2:-}" memo claim="" snap receipt="" digest
+  pg_reservation_marker_ok "$m" || return 0
   memo="$PRO_GATE_HOME/conversation-urls/$m"
+  # With no explicit conviction, establish the URL before claiming. A failed read leaves
+  # the canonical bytes untouched; a replacement during claim remains distinguishable.
+  if [ -z "$url" ]; then
+    url="$(cat "$memo" 2>/dev/null)" || return 0
+    url="${url//$'\n'/}"
+  fi
+  digest="$(pg_review_sha256_text "$url")" || return 0
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 0
+  # A recall may discover the claim immediately after rename. Publish an explicit conviction
+  # first so it cannot restore that rejected URL while this process is still inspecting it.
+  if [ -n "$url" ]; then
+    { printf '%s\t%s\n' "$m" "$url" >> "$PRO_GATE_HOME/salvage-nonmatching.txt"; } 2>/dev/null || true
+  fi
   # A legacy round's memo is claimed straight into its receipt (pg_legacy_review_receipt_path);
   # when that receipt cannot exist, the memo is not claimed at all.
   if receipt="$(pg_legacy_review_receipt_path "$m")"; then
-    claim="$receipt"
+    claim="$(mktemp "$PRO_GATE_HOME/legacy-review-receipts/$m.rej.$digest.XXXXXX" 2>/dev/null)" || claim=""
   elif [ $? -eq 1 ]; then
-    receipt=""; claim="$memo.rej.$$"
+    receipt=""; claim="$(mktemp "$memo.rej.$digest.XXXXXX" 2>/dev/null)" || claim=""
   fi
   if [ -n "$claim" ] && mv "$memo" "$claim" 2>/dev/null; then
-    snap="$(head -c 300 "$claim" 2>/dev/null | tr -d '\n')"
-    [ -n "$url" ] || url="$snap"
-    if [ "$snap" = "$url" ] || [ -z "$snap" ]; then
-      [ -n "$receipt" ] || rm -f "$claim" 2>/dev/null
-    else
-      # Restore via hard link — link(2) FAILS atomically when the memo already exists, so a
-      # genuine URL the Node writer republished between our claim and this restore is never
-      # overwritten (gate #54 r8: an existence check followed by mv raced exactly there).
-      ln "$claim" "$memo" 2>/dev/null || true
-      # A legacy receipt stays even once a memo is back: that memo can be an older generation
-      # another revoker restored, and only the 14-day sweep expires a receipt (#227 round 6).
-      [ -n "$receipt" ] || rm -f "$claim" 2>/dev/null
+    if snap="$(cat "$claim" 2>/dev/null)"; then
+      snap="${snap//$'\n'/}"
+      if [ "$snap" = "$url" ] || [ -z "$snap" ]; then
+        pg_memo_claim_resolve "$claim" "$receipt"
+      elif { ln "$claim" "$memo" 2>/dev/null && [ "$claim" -ef "$memo" ]; } \
+        || { [ -f "$memo" ] && [ ! -L "$memo" ] && { [ "$claim" -ef "$memo" ] || cmp -s "$claim" "$memo"; }; }; then
+        # A hard link never overwrites a concurrent memo. Resolved legacy receipts remain
+        # even after restoration, on the original memo's 14-day clock (#227 round 6).
+        pg_memo_claim_resolve "$claim" "$receipt"
+      fi
+      # EEXIST preserves the concurrent memo AND this alternate. Other link failures and
+      # failed reads likewise leave a discoverable claim for the next ordinary salvage.
     fi
+  elif [ -n "$claim" ]; then
+    # Only our exclusively allocated empty placeholder exists when the rename failed.
+    rm -f "$claim" 2>/dev/null || true
   fi
-  [ -n "$url" ] || return 0
-  { printf '%s\t%s\n' "$m" "$url" >> "$PRO_GATE_HOME/salvage-nonmatching.txt"; } 2>/dev/null || true
   return 0
 }
 
@@ -3621,8 +3842,8 @@ pg_completed_lookup() {  # <marker> <out>: place the artifact at <out>; rc 0 on 
 # ─────────────────────────────────────────────────────────────────────────────
 PG_REVIEW_DECISION_CONTRACT_ID='review-decision/v1'
 PG_REVIEW_DECISION_CONTRACT_VERSION=1
-PG_REVIEW_DECISION_CONTRACT_DIGEST='6da6866bab4e95ad138cdc946fa1388be9c386bca7b592c3370c9f52e34b315f'
-PG_REVIEW_DECISION_CORPUS_DIGEST='409649c6c5ce000afd3b74da90daacc11ff72a2ab6789a7a3a0cf3e14a34d3e4'
+PG_REVIEW_DECISION_CONTRACT_DIGEST='fa91787e3fbf3c0852c78f5269b2f670d84b86561be64d6edef4229bf46aee9b'
+PG_REVIEW_DECISION_CORPUS_DIGEST='32bc674aca33c10e60b808f6b7a483277d4f3edd6f1f94ed31a55189998e7ea2'
 
 # Binding-record compatibility only (#214, gate r2 P1). review-input-binding/v1 and
 # review-result-binding/v1 records are validated by their own record_type/record_version shape
@@ -3635,7 +3856,7 @@ PG_REVIEW_DECISION_CORPUS_DIGEST='409649c6c5ce000afd3b74da90daacc11ff72a2ab6789a
 # Writers share these validators with readers: every production write site passes the CURRENT digest
 # (pg_review_decision_contract_digest), so this list only widens what can be READ back, never what a
 # fresh record may claim. Keep it that way when adding a writer.
-PG_REVIEW_DECISION_COMPATIBLE_CONTRACT_DIGESTS='bf36fdb5f8625e917be0539ca014fec518649d1160584846aca1cb9149533abb 7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee 5fcd19c12600061af6d90ed9cb980dd7067cff199c374910639003eec4caf5c3'
+PG_REVIEW_DECISION_COMPATIBLE_CONTRACT_DIGESTS='bf36fdb5f8625e917be0539ca014fec518649d1160584846aca1cb9149533abb 7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee 5fcd19c12600061af6d90ed9cb980dd7067cff199c374910639003eec4caf5c3 6da6866bab4e95ad138cdc946fa1388be9c386bca7b592c3370c9f52e34b315f'
 
 pg_review_decision_contract_id() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_ID"; }
 pg_review_decision_contract_version() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_VERSION"; }
@@ -3868,8 +4089,10 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
     and (.contract|keys_are(["contract_digest","contract_id","contract_version","corpus_digest"]))
     and (.cooldown|keys_are(["active","seconds_remaining"])) and (.cooldown.active|type=="boolean")
     and (.cooldown.seconds_remaining|type=="number" and floor==. and .>=0)
-    and (.delivery|keys_are(["failed_unchanged","override"]))
-    and (.delivery.failed_unchanged|type=="number" and floor==. and .>=0 and .<=1000) and (.delivery.override|type=="boolean")
+    and (.delivery|keys_are(["failed_unchanged","override","state"]))
+    and (.delivery.state|IN("known","unavailable","legacy-untracked")) and (.delivery.override|type=="boolean")
+    and (if .delivery.state=="known" then (.delivery.failed_unchanged|type=="number" and floor==. and .>=0 and .<=1000)
+         else .delivery.failed_unchanged==null end)
     and (.active_index|keys_are(["binding_valid","charged_spend_epoch","marker","state"]))
     and (.active_index.binding_valid|type=="boolean") and (.active_index.charged_spend_epoch|type=="number" and floor==.)
     and (.active_index.marker|marker)
@@ -4065,7 +4288,13 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
   # mode, attachment policy and Oracle build stop here, typed, instead of being granted until the
   # caller's time budget runs out. A change to any of those, or an operator's one-invocation
   # PRO_GATE_FORCE_ROUND=1 (resolved into delivery.override by the facts builder), grants again.
-  if [ "$(jq -r .delivery.failed_unchanged <<<"$canonical")" -ge 2 ] \
+  # Unknown history/build is not an exhausted count or proof of changed conditions. FORCE
+  # bypasses only a known failed condition; it cannot manufacture missing evidence.
+  if [ "$(jq -r .delivery.state <<<"$canonical")" = unavailable ]; then
+    pg_review_decision_emit stop-without-new-review delivery-state-unavailable "$canonical" "$snapshot"; return
+  fi
+  if [ "$(jq -r .delivery.state <<<"$canonical")" = known ] \
+     && [ "$(jq -r .delivery.failed_unchanged <<<"$canonical")" -ge 2 ] \
      && [ "$(jq -r .delivery.override <<<"$canonical")" != true ]; then
     pg_review_decision_emit stop-without-new-review delivery-failed-unchanged "$canonical" "$snapshot"; return
   fi
@@ -4098,6 +4327,7 @@ pg_run_left_review_record() { # marker
   [ -e "$PRO_GATE_HOME/pending/$marker" ] || [ -e "$(pg_completed_dir)/$marker" ] \
     || [ -e "$PRO_GATE_HOME/recovered/$marker.md" ] || [ -e "$(pg_review_result_binding_dir)/$marker" ] \
     || [ -e "$PRO_GATE_HOME/crossbound/$marker" ] || [ -e "$PRO_GATE_HOME/conversation-urls/$marker" ] \
+    || pg_memo_claim_pending "$marker" \
     || compgen -G "$PRO_GATE_HOME/legacy-review-receipts/$marker.*" >/dev/null
 }
 
