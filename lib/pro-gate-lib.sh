@@ -3490,7 +3490,7 @@ pg_provenance_reject() {  # <marker> [matched-url]
   # renamed aside first, its content checked against the rejected URL, and restored when it
   # names a DIFFERENT (newer, possibly genuine) conversation — a read-append-remove sequence
   # left a window where a concurrently refreshed genuine memo was deleted by a stale compare.
-  local m="$1" url="${2:-}" memo claim="" snap receipt="" digest token published=1
+  local m="$1" url="${2:-}" memo claim="" snap receipt="" digest token published=1 settled
   pg_reservation_marker_ok "$m" || return 0
   memo="$PRO_GATE_HOME/conversation-urls/$m"
   # With no explicit conviction, establish the URL before claiming. A failed read leaves
@@ -3505,6 +3505,8 @@ pg_provenance_reject() {  # <marker> [matched-url]
   # first so it cannot restore that rejected URL while this process is still inspecting it.
   if [ -n "$url" ]; then
     { printf '%s\t%s\n' "$m" "$url" >> "$PRO_GATE_HOME/salvage-nonmatching.txt"; } 2>/dev/null && published=0
+  else
+    published=0 # an empty memo convicts nothing
   fi
   # A legacy round's memo is claimed straight into its receipt (pg_legacy_review_receipt_path);
   # when that receipt cannot exist, the memo is not claimed at all.
@@ -3522,20 +3524,23 @@ pg_provenance_reject() {  # <marker> [matched-url]
   if [ -n "$claim" ] && [ ! -e "$claim" ] && [ ! -L "$claim" ] && mv "$memo" "$claim" 2>/dev/null; then
     if snap="$(pg_memo_read "$claim")"; then
       snap="${snap//$'\n'/}"
-      if [ -z "$snap" ] || { [ "$snap" = "$url" ] && [ "$published" -eq 0 ]; }; then
-        pg_memo_claim_resolve "$claim" "$receipt"
-      elif [ "$snap" = "$url" ]; then
-        # Without a blacklist line, this claim is the conviction's only durable record.
-        # Ordinary recall publishes it before resolving the claim.
-        :
+      settled=1
+      if [ -z "$snap" ] || [ "$snap" = "$url" ]; then
+        settled=0
       elif { ln "$claim" "$memo" 2>/dev/null && [ "$claim" -ef "$memo" ]; } \
         || { [ -f "$memo" ] && [ ! -L "$memo" ] && { [ "$claim" -ef "$memo" ] || cmp -s "$claim" "$memo"; }; }; then
         # A hard link never overwrites a concurrent memo. Resolved legacy receipts remain
         # even after restoration, on the original memo's 14-day clock (#227 round 6).
-        pg_memo_claim_resolve "$claim" "$receipt"
+        settled=0
       fi
       # EEXIST preserves the concurrent memo AND this alternate. Other link failures and
       # failed reads likewise leave a discoverable claim for the next ordinary salvage.
+      # Without a blacklist line, the claim's name is the conviction's only durable record,
+      # whatever it holds: another claim may still hold the URL. Ordinary recall resolves it
+      # once the blacklist records the conviction or no claim can restore that URL.
+      if [ "$settled" -eq 0 ] && [ "$published" -eq 0 ]; then
+        pg_memo_claim_resolve "$claim" "$receipt"
+      fi
     fi
   fi
   return 0

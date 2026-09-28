@@ -288,6 +288,17 @@ unset -f printf
 check 'a conviction whose blacklist append failed keeps its claim' \
   "$([ "$(claim_count)" = 1 ] && [ "$(retained_body)" = "$FOREIGN" ] && [ ! -e "$MEMO" ] \
     && pg_memo_claim_pending "$MARKER"; echo $?)"
+# Whatever the claim holds, its name alone records that conviction; another claim may hold the URL.
+for held in genuine empty; do
+  seed "unpublished-$held" current
+  if [ "$held" = empty ]; then : > "$MEMO"; fi
+  printf() { if [ "$1" = '%s\t%s\n' ]; then return 1; fi; builtin printf "$@"; }
+  pg_provenance_reject "$MARKER" "$FOREIGN"
+  unset -f printf
+  check "a $held claim whose conviction append failed is kept after restoration" \
+    "$([ "$(claim_count)" = 1 ] && pg_memo_claim_pending "$MARKER" \
+      && if [ "$held" = empty ]; then [ ! -e "$MEMO" ]; else [ "$(cat "$MEMO")" = "$GENUINE" ] && [ "$(claims)" -ef "$MEMO" ]; fi; echo $?)"
+done
 
 # 39-byte GitHub owner, 100-byte repository, 7-digit PR, epoch and 7-digit pid.
 seed long-marker current

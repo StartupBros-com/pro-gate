@@ -338,6 +338,78 @@ test("the longest runtime marker is claimed within the filename limit", (t) => {
   assert.equal(fs.readFileSync(f.blacklist, "utf8"), `${long}\t${foreign}\n`);
 });
 
+const boundedClaim = (f, url) =>
+  path.join(f.dirs.URL_MEMO_DIR, `${marker}.rej.${urlDigest(url).slice(0, 16)}.${"0".repeat(16)}`);
+
+for (const rejection of ["identical bytes", "hard link", "blacklist only", "unpublished claim"]) {
+  test(`recall revokes a remembered URL its marker rejected: ${rejection}`, (t) => {
+    const f = fixture(t);
+    // A concurrent writer republished the URL an interrupted revocation had convicted.
+    fs.writeFileSync(f.memo, foreign);
+    if (rejection === "hard link") fs.linkSync(f.memo, boundedClaim(f, foreign));
+    else if (rejection === "blacklist only") fs.writeFileSync(f.blacklist, `${marker}\t${foreign}\n`);
+    else fs.writeFileSync(boundedClaim(f, foreign), foreign);
+    if (rejection === "unpublished claim")
+      f.proxy.appendFileSync = () => {
+        throw fail();
+      };
+    assert.equal(f.api.recall(marker), null);
+    assert.equal(fs.existsSync(f.memo), false);
+    if (rejection === "unpublished claim") {
+      assert.equal(f.claims().length, 2);
+      assert.equal(f.api.unresolved(marker), true);
+    }
+    assert.equal(f.fresh().recall(marker), null);
+    assert.equal(f.claims().length, 0);
+    assert.equal(fs.readFileSync(f.blacklist, "utf8"), `${marker}\t${foreign}\n`);
+  });
+}
+
+test("revoking a rejected memo preserves a different concurrent replacement", (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(f.memo, foreign);
+  fs.writeFileSync(f.blacklist, `${marker}\t${foreign}\n`);
+  f.proxy.renameSync = (from, to) => {
+    fs.renameSync(from, to);
+    if (from === f.memo) fs.writeFileSync(f.memo, genuine);
+  };
+  assert.equal(f.api.recall(marker), genuine);
+  assert.equal(fs.readFileSync(f.memo, "utf8"), genuine);
+  assert.equal(f.claims().length, 0);
+});
+
+test("a restoration keeps an unpublished conviction that a sibling claim still holds", (t) => {
+  const f = fixture(t);
+  // An earlier revocation of another URL claimed the now-rejected URL as its replacement.
+  const sibling = oldClaim(f, newer);
+  fs.writeFileSync(sibling, foreign);
+  fs.writeFileSync(f.memo, genuine);
+  f.proxy.appendFileSync = () => {
+    throw fail();
+  };
+  assert.equal(f.api.forget(marker, foreign), genuine);
+  assert.equal(fs.readFileSync(f.memo, "utf8"), genuine);
+  assert.ok(
+    f.claims().some((claim) => memoClaimNames(claim, foreign)),
+    "the claim naming the unpublished conviction survives restoration",
+  );
+  assert.equal(f.api.unresolved(marker), true);
+  delete f.proxy.appendFileSync;
+  assert.equal(f.api.forget(marker, genuine), null);
+  assert.equal(f.fresh().recall(marker), null);
+  assert.equal(fs.existsSync(f.memo), false);
+  assert.equal(f.claims().length, 0);
+  assert.deepEqual(
+    fs.readFileSync(f.blacklist, "utf8").split("\n").filter(Boolean).sort(),
+    [`${marker}\t${foreign}`, `${marker}\t${genuine}`].sort(),
+  );
+});
+
+function memoClaimNames(claim, url) {
+  const name = path.basename(claim);
+  return name.startsWith(`${marker}.rej.${urlDigest(url).slice(0, 16)}.`);
+}
+
 test("replacement before claim restores the actual newer inode", (t) => {
   const f = fixture(t);
   fs.writeFileSync(f.memo, foreign);
@@ -589,6 +661,19 @@ async function noTabsChild(t, { kind, mode = "--probe" }) {
     fs.mkdirSync(faultPath);
   } else fs.writeFileSync(faultPath, genuine);
   const before = fs.lstatSync(faultPath);
+  const result = await salvageChild(t, f, {
+    mode,
+    faultPath: injectedRead ? faultPath : "",
+  });
+  return {
+    ...result,
+    retained: injectedRead ? fs.readFileSync(faultPath, "utf8") : null,
+    unchanged: fs.lstatSync(faultPath).ino === before.ino && fs.lstatSync(faultPath).size === before.size,
+  };
+}
+
+// Runs the actual salvage entry point against a CDP endpoint listing `tabs`.
+async function salvageChild(t, f, { mode = "--probe", tabs = [], faultPath = "" } = {}) {
   const preload = path.join(f.home, "fault.mjs");
   fs.writeFileSync(
     preload,
@@ -608,7 +693,7 @@ fs.closeSync = function(fd) { faultFds.delete(fd); return originalClose.call(thi
   );
   const server = createServer((_req, response) => {
     response.writeHead(200, { "content-type": "application/json" });
-    response.end("[]");
+    response.end(JSON.stringify(tabs));
   });
   await new Promise((resolve, reject) => {
     server.once("error", reject);
@@ -632,7 +717,7 @@ fs.closeSync = function(fd) { faultFds.delete(fd); return originalClose.call(thi
         env: {
           ...process.env,
           PRO_GATE_HOME: f.home,
-          PRO_GATE_TEST_MEMO_FAULT_PATH: injectedRead ? faultPath : "",
+          PRO_GATE_TEST_MEMO_FAULT_PATH: faultPath,
         },
       },
     );
@@ -645,17 +730,24 @@ fs.closeSync = function(fd) { faultFds.delete(fd); return originalClose.call(thi
       stderr += chunk;
     });
     child.on("error", reject);
-    child.on("close", (code) =>
-      resolve({
-        code,
-        stdout,
-        stderr,
-        retained: injectedRead ? fs.readFileSync(faultPath, "utf8") : null,
-        unchanged: fs.lstatSync(faultPath).ino === before.ino && fs.lstatSync(faultPath).size === before.size,
-      }),
-    );
+    child.on("close", (code) => resolve({ code, stdout, stderr }));
   });
 }
+
+test("actual scan with the rejected conversation's tab open reports absence instead of holding the run", async (t) => {
+  const f = fixture(t);
+  // Recovery records this claim's conviction, but the same URL was republished as the memo.
+  fs.writeFileSync(f.memo, foreign);
+  fs.linkSync(f.memo, boundedClaim(f, foreign));
+  const result = await salvageChild(t, f, {
+    tabs: [{ type: "page", id: "rejected-tab", url: foreign }],
+  });
+  assert.equal(result.code, 4, result.stderr);
+  assert.match(result.stderr, /evidence-kind: absent/);
+  assert.equal(fs.existsSync(f.memo), false);
+  assert.equal(f.claims().length, 0);
+  assert.equal(fs.readFileSync(f.blacklist, "utf8"), `${marker}\t${foreign}\n`);
+});
 
 for (const kind of ["fifo", "symlink", "oversized", "directory"]) {
   test(`actual empty CDP scan treats ${kind} claim as bounded uncertainty`, async (t) => {

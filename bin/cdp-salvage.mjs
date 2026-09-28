@@ -464,6 +464,17 @@ function memoUnresolved(m) {
   return memoClaims(m).length > 0 || unresolvedMemos.has(m);
 }
 
+// A remembered URL is usable only while no record of this marker rejects it. Every scan skips a
+// blacklisted conversation, so trusting one held the run inconclusive instead of letting it
+// retire; a pending claim's name carries a conviction the blacklist may not hold yet.
+function memoTrusted(m, url) {
+  return (
+    conversationUrlOk(url) &&
+    !memoBlacklist(m)?.has(url) &&
+    !memoClaims(m).some((claim) => memoClaimConvicts(claim, url))
+  );
+}
+
 function recallUrl(m) {
   const f = memoPath(m);
   if (!f) return null;
@@ -475,17 +486,20 @@ function recallUrl(m) {
     if (error.code !== 'ENOENT') unresolvedMemos.add(m);
     return null;
   }
-  if (conversationUrlOk(url)) return url;
   if (!url) return null;
+  if (memoTrusted(m, url)) return url;
   // v0.42 (#109): a memo whose id fails the shape gate is revoked HERE, on read, so this very pass
   // rescans candidates instead of trusting it. Claim-and-verify (forgetUrl), never a plain unlink:
   // a concurrently republished genuine memo survives and is used instead. This is memo hygiene,
   // not termination — the pass still has to find or miss the conversation on its own evidence.
+  // A memo this marker rejected, republished after or during its revocation, goes the same way.
   const survivor = forgetUrl(m, url);
   console.error(
-    `memo-revoked: the remembered conversation for "${m}" is not a conversation id (${url}); rescanning candidates`,
+    conversationUrlOk(url)
+      ? `memo-revoked: the remembered conversation for "${m}" was rejected as another run's (${url}); rescanning candidates`
+      : `memo-revoked: the remembered conversation for "${m}" is not a conversation id (${url}); rescanning candidates`,
   );
-  if (survivor && conversationUrlOk(survivor)) return survivor;
+  if (survivor) return survivor;
   // v0.42 review finding #2: forgetUrl only restores a genuine memo republished DURING its
   // claim rename (the file existed as `f` again by the time forgetUrl read `claim`). A memo
   // republished in the window between that rename and the unlink of `claim` lands back at `f`
@@ -497,7 +511,7 @@ function recallUrl(m) {
     if (error.code !== 'ENOENT') unresolvedMemos.add(m);
     return null;
   }
-  if (conversationUrlOk(value)) {
+  if (memoTrusted(m, value)) {
     console.error(
       `memo-republished: a genuine conversation for "${m}" was published while the placeholder was being revoked; using ${value}`,
     );
@@ -564,35 +578,14 @@ function forgetUrl(m, url) {
     if (error.code !== 'ENOENT') unresolvedMemos.add(m);
     return null;
   }
-  let held = '';
-  try {
-    held = memoBytes(claim).trim();
-  } catch {
-    unresolvedMemos.add(m);
-    return null;
-  }
-  const rejected = memoBlacklist(m);
-  if (!rejected) return null;
-  if (held === url || !conversationUrlOk(held) || rejected.has(held)) {
-    if (memoRejectionPublished(m, held, rejected)) resolveMemoClaim(m, claim);
-  } else {
-    try {
-      fs.linkSync(claim, f);
-      resolveMemoClaim(m, claim);
-      return held;
-    } catch (error) {
-      if (error.code === 'EEXIST' && memoClaimRestored(claim, f)) {
-        resolveMemoClaim(m, claim);
-        return held;
-      }
-      unresolvedMemos.add(m);
-    }
-  }
+  // The claim's name now carries this conviction, so it is recovered like any sibling: its
+  // bytes are rejected or restored, and it is resolved only once no claim can restore the URL.
+  recoverMemoClaims(m);
   // Publication after the rename is a separate generation. Never overwrite it, and keep
   // using it in this invocation instead of reporting absence after a successful rejection.
   try {
     const current = memoBytes(f).trim();
-    return current !== url && conversationUrlOk(current) ? current : null;
+    return current !== url && memoTrusted(m, current) ? current : null;
   } catch (error) {
     if (error.code !== 'ENOENT') unresolvedMemos.add(m);
     return null;
