@@ -7878,6 +7878,38 @@ UNDELIVERED_AFTER_CF="$(undelivered_query)"
 check '#204: after a Cloudflare refund the next query counts no failed delivery (it stops for the cooldown instead)' \
   "$(jq -e '.reason=="account-cooldown-active" and .facts.delivery=={failed_unchanged:0,override:false}' <<<"$UNDELIVERED_AFTER_CF" >/dev/null 2>&1; echo $?)" "$UNDELIVERED_AFTER_CF"
 rm -f "$FRESH_HOME/throttle.cooldown"
+# #204 gate r2: Oracle upgraded while a failing attempt is still running. The no-send belongs to the
+# build that attempted Send, so the first failure of the replacement build is the first in a row.
+cat > "$TDIR/fresh-bin/oracle-upgrading" <<'UPGRADING_ORACLE'
+#!/usr/bin/env bash
+if [ "${1:-}" = --version ]; then
+  if [ -e "${PG_TEST_UPGRADE_FLAG:?}" ]; then printf '2.0.0-fixture\n'; else printf '%s\n' "${PG_TEST_ORACLE_VERSION:-0.0.0-fixture}"; fi
+  exit 0
+fi
+: > "$PG_TEST_UPGRADE_FLAG"
+exec "${PG_TEST_UNDELIVERED_DELEGATE:?}" "$@"
+UPGRADING_ORACLE
+chmod +x "$TDIR/fresh-bin/oracle-upgrading"
+rm -f "$TDIR/oracle-upgraded"
+UNDELIVERED_UQ="$(undelivered_query PRO_GATE_ORACLE_BIN="$TDIR/fresh-bin/oracle-upgrading" PG_TEST_UPGRADE_FLAG="$TDIR/oracle-upgraded")"
+printf '%s\n' "$UNDELIVERED_UQ" > "$TDIR/undelivered-uq.json"
+undelivered_effect "$TDIR/undelivered-uq.json" "$TDIR/undelivered-u1.md" \
+  PRO_GATE_ORACLE_BIN="$TDIR/fresh-bin/oracle-upgrading" PG_TEST_UPGRADE_FLAG="$TDIR/oracle-upgraded"
+UNDELIVERED_MU1="$(jq -r .marker "$TDIR/undelivered-u1.md.status" 2>/dev/null)"
+UNDELIVERED_UQ2="$(undelivered_query PRO_GATE_ORACLE_BIN="$TDIR/fresh-bin/oracle-upgrading" PG_TEST_UPGRADE_FLAG="$TDIR/oracle-upgraded")"
+printf '%s\n' "$UNDELIVERED_UQ2" > "$TDIR/undelivered-uq2.json"
+check '#204: a no-send whose Oracle was upgraded mid-attempt is recorded under the build that attempted Send' \
+  "$([ "$UNDELIVERED_RC" -eq 6 ] && [ -e "$TDIR/oracle-upgraded" ] \
+     && jq -e '.consecutive==1' <<<"$(PRO_GATE_HOME="$FRESH_HOME" pg_delivery_condition_read "$UNDELIVERED_MU1" 2>/dev/null)" >/dev/null 2>&1 \
+     && jq -e '.action=="run-granted-review" and .facts.delivery.failed_unchanged==0' <<<"$UNDELIVERED_UQ2" >/dev/null 2>&1; echo $?)" \
+  "rc=$UNDELIVERED_RC marker=$UNDELIVERED_MU1 query=$UNDELIVERED_UQ2 stderr=$(tail -4 "$TDIR/undelivered.stderr")"
+undelivered_effect "$TDIR/undelivered-uq2.json" "$TDIR/undelivered-u2.md" \
+  PRO_GATE_ORACLE_BIN="$TDIR/fresh-bin/oracle-upgrading" PG_TEST_UPGRADE_FLAG="$TDIR/oracle-upgraded"
+UNDELIVERED_MU2="$(jq -r .marker "$TDIR/undelivered-u2.md.status" 2>/dev/null)"
+check '#204: the first failure of the replacement Oracle build counts one, not two' \
+  "$([ "$UNDELIVERED_RC" -eq 6 ] && [ "$UNDELIVERED_MU2" != "$UNDELIVERED_MU1" ] \
+     && jq -e '.consecutive==1' <<<"$(PRO_GATE_HOME="$FRESH_HOME" pg_delivery_condition_read "$UNDELIVERED_MU2" 2>/dev/null)" >/dev/null 2>&1; echo $?)" \
+  "rc=$UNDELIVERED_RC marker=$UNDELIVERED_MU2 record=$(PRO_GATE_HOME="$FRESH_HOME" pg_delivery_condition_read "$UNDELIVERED_MU2" 2>&1)"
 
 # #204 library: the count is a chain over the attempt snapshot's own precedence, the facts builder
 # probes Oracle only when a record could match, and the record is write-once and swept with its

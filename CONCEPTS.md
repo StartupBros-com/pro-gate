@@ -86,7 +86,7 @@ The engine-wide back-off that follows any proof that ChatGPT is rate-limiting th
 
 ### Delivery Condition
 
-The circumstances a fresh review's Send was attempted under: the exact evidence relation, the input mode, the attachment policy, and the installed Oracle build. When Oracle's own session record proves an attempt's Send was never dispatched, its refund records the condition and how many such attempts in a row it has produced for the change; a sent attempt, a review, or a different condition in between starts the count again. Two in a row produce the typed stop `delivery-failed-unchanged` in place of another grant, because the next identical attempt would fail the same way. A change to the condition, or the operator's one-invocation `PRO_GATE_FORCE_ROUND=1`, grants again. A Cloudflare challenge is an Account Cooldown, not a delivery failure, and is not counted.
+The circumstances a fresh review's Send was attempted under: the exact evidence relation, the input mode, the attachment policy, and the Oracle build that attempted the Send. When Oracle's own session record proves an attempt's Send was never dispatched, its refund records the condition and how many such attempts in a row it has produced for the change; a sent attempt, a review, or a different condition in between starts the count again. Two in a row produce the typed stop `delivery-failed-unchanged` in place of another grant, because the next identical attempt would fail the same way. A change to the condition, or the operator's one-invocation `PRO_GATE_FORCE_ROUND=1`, grants again. A Cloudflare challenge is an Account Cooldown, not a delivery failure, and is not counted.
 
 ### Throttle Sighting
 

@@ -2221,7 +2221,7 @@ pg_fresh_dispatch_record_undelivered() {
   [ -n "${REVIEW_DECISION_INPUT_TEMPLATE:-}" ] && [ -n "${PR_NUM:-}" ] && [ -n "${PG_META_HOST:-}" ] \
     && [ -n "${PG_META_OWNER:-}" ] && [ -n "${PG_META_REPO:-}" ] || return 0
   relation="$(pg_review_relation_identity "$REVIEW_DECISION_INPUT_TEMPLATE" || true)"
-  oracle_id="$(pg_oracle_identity)"
+  oracle_id="${PG_DISPATCH_ORACLE_ID:-$(pg_oracle_identity)}"
   [ "$oracle_id" != unknown ] \
     || echo "[oracle-review] Oracle's version could not be read, so this attempt's delivery condition records its build as unknown; a later query that can read it counts from zero (#204)." >&2
   if [ -z "$relation" ] || ! pg_delivery_condition_record "$PG_META_HOST" "$PG_META_OWNER" "$PG_META_REPO" "$PR_NUM" \
@@ -3987,6 +3987,10 @@ fi
 # Slot acquisition is not submission authority. A completed/recoverable predecessor, moved
 # target/evidence, or governor change that arrived in the slot wait must win before charging.
 [ "${REVIEW_DECISION_EXECUTE:-0}" != 1 ] || pg_fresh_dispatch_require_run post-slot-pre-charge
+# #204 gate r2: the Oracle build that will attempt this Send, read before it runs. A proven no-send
+# records this build, not whichever one is installed by the time the failed attempt finishes: an
+# upgrade made during that attempt is the repair, and must not inherit its failure.
+[ "${REVIEW_DECISION_EXECUTE:-0}" != 1 ] || PG_DISPATCH_ORACLE_ID="$(pg_oracle_identity)"
 if [ "${PG_FULL_PR_PROVEN:-0}" = 1 ] && ! pg_pr_evidence_current "$PG_FULL_PR_EVIDENCE"; then
   echo 'ERROR: prepared PR head/base is no longer current; no review submitted' >&2
   pg_status failed "PR evidence changed before charge"
