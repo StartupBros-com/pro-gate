@@ -354,9 +354,11 @@ function memoClaimRestored(claim, canonical) {
 
 // Claims contain the original inode, not a copy. Until a read and either conviction or
 // restoration succeeds, they are recovery handles and must participate in ordinary recall.
-function memoClaims(m) {
-  if (!MARKER_SAFE_RE.test(m)) return [];
+// An incomplete listing may hide a claim, and with it a conviction.
+function memoClaimListing(m) {
+  if (!MARKER_SAFE_RE.test(m)) return { claims: [], complete: true };
   const claims = [];
+  let complete = true;
   for (const dir of [URL_MEMO_DIR, LEGACY_RECEIPT_DIR]) {
     try {
       for (const name of fs.readdirSync(dir)) {
@@ -364,10 +366,17 @@ function memoClaims(m) {
           claims.push(path.join(dir, name));
       }
     } catch (error) {
-      if (error.code !== 'ENOENT') unresolvedMemos.add(m);
+      if (error.code !== 'ENOENT') {
+        unresolvedMemos.add(m);
+        complete = false;
+      }
     }
   }
-  return claims;
+  return { claims, complete };
+}
+
+function memoClaims(m) {
+  return memoClaimListing(m).claims;
 }
 
 function memoBlacklist(m) {
@@ -404,8 +413,9 @@ function resolveMemoClaim(m, claim) {
 }
 
 function recoverMemoClaims(m) {
-  const claims = memoClaims(m);
-  if (!claims.length) return;
+  const { claims, complete } = memoClaimListing(m);
+  // Like an unreadable blacklist, a hidden claim could convict what a listed one would restore.
+  if (!complete || !claims.length) return;
   const rejected = memoBlacklist(m);
   if (!rejected) return;
   const held = new Map();
@@ -466,13 +476,15 @@ function memoUnresolved(m) {
 
 // A remembered URL is usable only while no record of this marker rejects it. Every scan skips a
 // blacklisted conversation, so trusting one held the run inconclusive instead of letting it
-// retire; a pending claim's name carries a conviction the blacklist may not hold yet.
-function memoTrusted(m, url) {
-  return (
-    conversationUrlOk(url) &&
-    !memoBlacklist(m)?.has(url) &&
-    !memoClaims(m).some((claim) => memoClaimConvicts(claim, url))
-  );
+// retire; a pending claim's name carries a conviction the blacklist may not hold yet. A record
+// that cannot be read may hold that rejection, so the URL is then uncertain, never trusted.
+function memoVerdict(m, url) {
+  if (!conversationUrlOk(url)) return 'rejected';
+  const rejected = memoBlacklist(m);
+  const { claims, complete } = memoClaimListing(m);
+  if (rejected?.has(url) || claims.some((claim) => memoClaimConvicts(claim, url)))
+    return 'rejected';
+  return rejected && complete ? 'trusted' : 'uncertain';
 }
 
 function recallUrl(m) {
@@ -487,7 +499,10 @@ function recallUrl(m) {
     return null;
   }
   if (!url) return null;
-  if (memoTrusted(m, url)) return url;
+  const verdict = memoVerdict(m, url);
+  if (verdict === 'trusted') return url;
+  // The unreadable record already marked the memo unresolved; leave its bytes where they are.
+  if (verdict === 'uncertain') return null;
   // v0.42 (#109): a memo whose id fails the shape gate is revoked HERE, on read, so this very pass
   // rescans candidates instead of trusting it. Claim-and-verify (forgetUrl), never a plain unlink:
   // a concurrently republished genuine memo survives and is used instead. This is memo hygiene,
@@ -511,7 +526,7 @@ function recallUrl(m) {
     if (error.code !== 'ENOENT') unresolvedMemos.add(m);
     return null;
   }
-  if (memoTrusted(m, value)) {
+  if (memoVerdict(m, value) === 'trusted') {
     console.error(
       `memo-republished: a genuine conversation for "${m}" was published while the placeholder was being revoked; using ${value}`,
     );
@@ -585,7 +600,7 @@ function forgetUrl(m, url) {
   // using it in this invocation instead of reporting absence after a successful rejection.
   try {
     const current = memoBytes(f).trim();
-    return current !== url && memoTrusted(m, current) ? current : null;
+    return current !== url && memoVerdict(m, current) === 'trusted' ? current : null;
   } catch (error) {
     if (error.code !== 'ENOENT') unresolvedMemos.add(m);
     return null;

@@ -365,6 +365,58 @@ for (const rejection of ["identical bytes", "hard link", "blacklist only", "unpu
   });
 }
 
+for (const fault of ["blacklist read", "claim listing"]) {
+  for (const held of [foreign, genuine]) {
+    test(`an unreadable ${fault} leaves a ${held === foreign ? "rejected" : "genuine"} memo untrusted and untouched`, (t) => {
+      const f = fixture(t);
+      fs.writeFileSync(f.memo, held);
+      // The rejection record exists but cannot be read.
+      if (fault === "blacklist read") {
+        fs.writeFileSync(f.blacklist, `${marker}\t${foreign}\n`);
+        f.proxy.readFileSync = (file, ...args) => {
+          if (file === f.blacklist) throw fail();
+          return fs.readFileSync(file, ...args);
+        };
+      } else {
+        fs.writeFileSync(boundedClaim(f, foreign), foreign);
+        f.proxy.readdirSync = (dir, ...args) => {
+          if (dir === f.dirs.URL_MEMO_DIR) throw fail();
+          return fs.readdirSync(dir, ...args);
+        };
+      }
+      assert.equal(f.api.recall(marker), null);
+      assert.equal(fs.readFileSync(f.memo, "utf8"), held);
+      assert.equal(f.api.unresolved(marker), true);
+      assert.equal(f.fresh().recall(marker), held === foreign ? null : genuine);
+      assert.equal(fs.existsSync(f.memo), held !== foreign);
+      assert.equal(f.claims().length, 0);
+      assert.equal(fs.readFileSync(f.blacklist, "utf8"), `${marker}\t${foreign}\n`);
+    });
+  }
+}
+
+test("an incomplete claim listing restores nothing an unlisted claim may convict", (t) => {
+  const f = fixture(t);
+  // The listed claim holds a URL that only the unlisted claim's name convicts.
+  const listed = path.join(
+    f.dirs.LEGACY_RECEIPT_DIR,
+    path.basename(oldClaim(f, newer)),
+  );
+  fs.writeFileSync(listed, foreign);
+  fs.writeFileSync(boundedClaim(f, foreign), newer);
+  f.proxy.readdirSync = (dir, ...args) => {
+    if (dir === f.dirs.URL_MEMO_DIR) throw fail();
+    return fs.readdirSync(dir, ...args);
+  };
+  assert.equal(f.api.recall(marker), null);
+  assert.equal(fs.existsSync(f.memo), false);
+  assert.equal(f.claims().length, 2);
+  assert.equal(f.fresh().recall(marker), null);
+  assert.equal(fs.existsSync(f.memo), false);
+  assert.equal(f.claims().length, 0);
+  assert.ok(fs.readFileSync(f.blacklist, "utf8").includes(`${marker}\t${foreign}\n`));
+});
+
 test("revoking a rejected memo preserves a different concurrent replacement", (t) => {
   const f = fixture(t);
   fs.writeFileSync(f.memo, foreign);
