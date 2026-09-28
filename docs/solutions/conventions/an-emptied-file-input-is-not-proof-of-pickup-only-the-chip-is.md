@@ -95,7 +95,7 @@ Evidence behind the rule, by class:
 
 All Oracle paths and commits here are in steipete/oracle at #521's head `2e55713c` unless another commit is named.
 
-The held-FileList drop has never been observed live. Only the fake and a proof page cover it (auto memory [claude]).
+The held-FileList drop, where no handler runs, did not occur in the 2026-09-27 instrumented transfers: all 8 emptied the input. Only the fake and a proof page cover it.
 
 ## Related
 
