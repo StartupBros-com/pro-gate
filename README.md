@@ -364,7 +364,8 @@ configuration has changed. Predecessor lookup excludes the current attempt befor
 history, and an intervening sent attempt (including one later superseded) breaks the no-send
 streak. Unknown-send attempts remain charged. These records prove no send, never delivery success.
 
-After two proven no-send attempts in a row under one known condition, the typed query returns
+After two failed deliveries in a row under one known condition (proven no-sends, or since v0.60.0
+sends that produced no ChatGPT conversation), the typed query returns
 `stop-without-new-review` / `delivery-failed-unchanged`. Unreadable history or an unknown current
 build instead produces `delivery-state-unavailable`, with `facts.delivery.failed_unchanged: null`.
 A proven change in relation, input, attachment policy, or a previously known Oracle build can

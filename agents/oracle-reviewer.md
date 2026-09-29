@@ -108,8 +108,8 @@ Dispatch all eight closed actions:
   exhaustion, zero budgets, cooldown, provenance and ownership remain guarded. The override is
   stateless, with no durable one-use counter. FORCE alone does not bypass churn.
   For `delivery-failed-unchanged`, relay `.facts.delivery.failed_unchanged`: that many attempts in
-  a row were proven never sent under an unchanged evidence, input mode, attachment policy and
-  known Oracle build. Waiting does not change it; a proven condition change or an operator's
+  a row failed to deliver (proven never sent, or sent with no ChatGPT conversation resulting)
+  under an unchanged evidence, input mode, attachment policy and known Oracle build. Waiting does not change it; a proven condition change or an operator's
   `PRO_GATE_FORCE_ROUND=1` can permit a new grant, subject to other guards. For
   `delivery-state-unavailable`, relay that history or identity is unavailable and the count is
   null. Unknown-to-known Oracle identity alone does not prove a build change, and FORCE cannot

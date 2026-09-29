@@ -86,8 +86,12 @@ bypasses this API entirely — that trust boundary is the single-user-owned stat
 
 Terminal dispositions are also proof records, not guesses. Their immutable payload binds repository,
 target, marker, round key, charged epoch, terminal kind, and proof kind
-(`lib/pro-gate-lib.sh:713-746`). Only positively proven non-submission can remove the recorded round;
-post-submission terminal outcomes retain the charge (`lib/pro-gate-lib.sh:849-881`).
+(`lib/pro-gate-lib.sh:713-746`). Only positively proven non-submission can remove the recorded round,
+plus one post-submission case since v0.60.0: a send that produced no ChatGPT conversation, when its
+attempt-time delivery evidence is known (pro-gate#246). That refund is bounded by the failed-delivery
+count instead of the round governor; with unknown evidence it keeps its charge. Every other
+post-submission terminal outcome retains the charge (`pg_attempt_disposition_refunds_round` in
+`lib/pro-gate-lib.sh`).
 
 ### Recover the exact attempt; never “try again” as diagnosis
 

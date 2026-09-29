@@ -133,7 +133,7 @@ no_conversation(){ charge && pg_fresh_dispatch_release_no_conversation; }
 assert_no_conversation_refunded(){ # expected consecutive failed deliveries
   [ "$PG_NO_CONVERSATION_REFUNDED" = 1 ] && ! pg_round_has_epoch "$ROUND_KEY" "$RUN_SPEND_EPOCH" \
     && [ ! -e "$(pg_run_meta_dir)/$RUN_MARKER" ] && [ ! -e "$(pg_reservation_dir)/$RUN_MARKER" ] \
-    && [ ! -e "$(pg_active_dir)/$ROUND_KEY" ] \
+    && [ ! -e "$(pg_active_dir)/$ROUND_KEY" ] && [ -e "$(pg_review_input_binding_dir)/$RUN_MARKER" ] \
     && jq -e --argjson n "$1" '.record_version==2 and .terminal_kind=="recovery-exhausted" and
          .proof_kind=="no-conversation-after-send" and .delivery.state=="known" and .delivery.consecutive==$n' \
          "$(pg_attempt_disposition_dir)/$RUN_MARKER" >/dev/null \
@@ -546,6 +546,10 @@ no_conversation_v2_requires_known_evidence(){
   unavailable="$(jq -cnS --argjson c "$PG_DISPATCH_DELIVERY_CONDITION" '{condition:$c,consecutive:null,state:"unavailable"}')" || return 1
   if pg_attempt_disposition_write github.com acme delivery 77 "$ROUND_KEY" "$RUN_MARKER" "$RUN_SPEND_EPOCH" \
        recovery-exhausted no-conversation-after-send "$unavailable"; then return 1; fi
+  # not-applicable is a valid delivery value (Cloudflare) that reads as known 0, so it would never stop a refunded repeat.
+  pg_delivery_snapshot_validate '{"state":"not-applicable"}' >/dev/null || return 1
+  if pg_attempt_disposition_write github.com acme delivery 77 "$ROUND_KEY" "$RUN_MARKER" "$RUN_SPEND_EPOCH" \
+       recovery-exhausted no-conversation-after-send '{"state":"not-applicable"}'; then return 1; fi
   if pg_attempt_disposition_write github.com acme delivery 77 "$ROUND_KEY" "$RUN_MARKER" "$RUN_SPEND_EPOCH" \
        recovery-exhausted bounded-recovery-exhausted "$known"; then return 1; fi
   if pg_attempt_disposition_write github.com acme delivery 77 "$ROUND_KEY" "$RUN_MARKER" "$RUN_SPEND_EPOCH" \
