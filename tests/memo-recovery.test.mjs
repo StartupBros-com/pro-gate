@@ -77,7 +77,6 @@ function fixture(t, { legacy = false, hooks = {} } = {}) {
         memoStale: false,
         ourUrls: new Set([foreign]),
         nonMatching: new Set(),
-        blacklistLines: [],
         MARKER_SAFE_RE: /^pg-run-[A-Za-z0-9.-]+$/,
         MEMO_KEEP: 200,
         console: { error() {} },
@@ -793,6 +792,29 @@ test("count pruning keeps a claim whose binding exists but cannot be read", (t) 
   assert.equal(fs.readFileSync(claim, "utf8"), genuine);
   assert.equal(fs.existsSync(unowned), false);
 });
+
+// Like the shell's binding reader, a symlinked binding is never followed: it exists but cannot be
+// read, so it protects, whether its target is missing or a binding that is not legacy.
+for (const target of ["missing", "current"]) {
+  test(`count pruning keeps a claim whose binding is a symlink to a ${target} binding`, (t) => {
+    const f = fixture(t);
+    const real = path.join(f.home, "binding-target");
+    if (target === "current")
+      fs.writeFileSync(real, JSON.stringify({ evidence: { mode: "full-pr", proof: { pr_metadata_digest: "a".repeat(64) } } }));
+    fs.symlinkSync(real, path.join(f.dirs.INPUT_BINDING_DIR, marker));
+    const claim = `${f.memo}.rej.old`;
+    const unowned = path.join(f.dirs.URL_MEMO_DIR, "pg-run-unowned-1700000000-2.rej.old");
+    for (const file of [claim, unowned]) {
+      fs.writeFileSync(file, genuine);
+      fs.utimesSync(file, new Date(0), new Date(0));
+    }
+    for (let i = 0; i < 205; i++)
+      fs.writeFileSync(path.join(f.dirs.URL_MEMO_DIR, `pg-run-count-${i}-1`), foreign);
+    f.api.remember("pg-run-new-count-1700000000-2", newer);
+    assert.equal(fs.readFileSync(claim, "utf8"), genuine);
+    assert.equal(fs.existsSync(unowned), false);
+  });
+}
 
 test("ordinary recall does not claim another canonical marker containing .rej.", (t) => {
   const f = fixture(t);

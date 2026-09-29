@@ -1119,6 +1119,22 @@ const MIXED_MARKER = 'pg-run-Test-Case-1234567890-43';
     foreignResult.memos.length === 0 && /mock-conversation/.test(foreignResult.blacklist ?? ''),
     `memos=${JSON.stringify(foreignResult.memos)} blacklist=${foreignResult.blacklist}`);
   foreignOnly.stop();
+
+  // v0.59.1: the blacklist is append-only for every writer. Claim fingerprints must outlive their
+  // claims, and the shell appends without a lock, so no rewrite may drop an earlier line.
+  const earlier = `pg-run-other-repo-42-1111111111-9\t${'a'.repeat(16)}\n` + Array.from({ length: 900 },
+    (_, i) => `pg-run-other-repo-${i}-1111111111-9\thttps://chatgpt.com/c/other-${i}\n`).join('');
+  const longList = await mockCdp(source, [], {
+    renderText: () => 'run marker: pg-run-other-repo-42-1111111111-9\nVERDICT: SHIP — foreign.',
+  });
+  const longResult = await runScratchSalvage([MARKER, '3'], longList.port, (home) => {
+    seedMemo(MARKER, canonicalUrl)(home);
+    fs.writeFileSync(path.join(home, 'salvage-nonmatching.txt'), earlier);
+  });
+  check('a conviction appended to a long blacklist keeps every earlier line',
+    longResult.blacklist?.startsWith(earlier) && longResult.blacklist.includes(`${MARKER}\t${canonicalUrl}\n`),
+    `status=${longResult.status} lines=${longResult.blacklist?.split('\n').length}`);
+  longList.stop();
 }
 
 { // P1: the one-shot canonical revalidation must be spent on the REMEMBERED conversation (A),
