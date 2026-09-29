@@ -1112,7 +1112,9 @@ pg_attempt_disposition_validate() { # canonical JSON [expected marker]
     ((($d|keys) == ["charged_spend_epoch","marker","observed_at","proof_kind","record_type","record_version","repository","round_key","target","terminal_kind"] and
       $d.record_type=="review-attempt-disposition/v1" and $d.record_version==1) or
      (($d|keys) == ["charged_spend_epoch","delivery","marker","observed_at","proof_kind","record_type","record_version","repository","round_key","target","terminal_kind"] and
-      $d.record_type=="review-attempt-disposition/v2" and $d.record_version==2 and $d.terminal_kind=="not-submitted")) and
+      $d.record_type=="review-attempt-disposition/v2" and $d.record_version==2 and
+      ($d.terminal_kind=="not-submitted" or
+       ($d.proof_kind=="no-conversation-after-send" and ($d.delivery|type=="object") and $d.delivery.state=="known")))) and
     ($d.marker|type=="string" and test("^pg-run-[A-Za-z0-9.-]+$")) and ($marker=="" or $d.marker==$marker) and
     ($d.round_key|type=="string" and test("^[A-Za-z0-9.-]+$")) and ($d.marker|startswith("pg-run-" + $d.round_key + "-")) and
     ($d.charged_spend_epoch|type=="number" and floor==. and .>0) and
@@ -1430,7 +1432,12 @@ pg_delivery_state_json() { # attempt snapshot relation input attachments [attemp
       (.state|type=="string") and (.marker|type=="string") and (.fresh_eligible|type=="boolean")' \
       <<<"$snapshot" >/dev/null 2>&1; then pg_delivery_state_emit unavailable null; return; fi
   if pg_delivery_history_unavailable "$snapshot"; then pg_delivery_state_emit unavailable null; return; fi
-  if ! jq -e '.source=="disposition" and .state=="not-submitted" and .fresh_eligible==true' <<<"$snapshot" >/dev/null 2>&1; then
+  # #246: a send that produced no ChatGPT conversation is a failed delivery too, but only its v2
+  # record (known evidence, round refunded) counts. A v1 one kept its round and still reads as 0.
+  if ! jq -e '.source=="disposition" and .fresh_eligible==true and
+      (.state=="not-submitted" or
+       (.state=="recovery-exhausted" and .terminal.record_version==2 and .terminal.proof_kind=="no-conversation-after-send"))' \
+      <<<"$snapshot" >/dev/null 2>&1; then
     pg_delivery_state_emit known 0; return
   fi
   marker="$(jq -r .marker <<<"$snapshot")"
@@ -1506,7 +1513,9 @@ pg_delivery_snapshot_json() { # host owner repo pr key marker attempt-time condi
   published="$(pg_attempt_disposition_read "$marker" 2>/dev/null || true)"
   if [ -n "$published" ]; then
     jq -e --arg h "$host" --arg o "$owner" --arg r "$repo" --arg p "$pr" --arg k "$key" '
-      .record_version==2 and .terminal_kind=="not-submitted" and .proof_kind=="proven-no-submit" and
+      .record_version==2 and
+      ((.terminal_kind=="not-submitted" and .proof_kind=="proven-no-submit") or
+       (.terminal_kind=="recovery-exhausted" and .proof_kind=="no-conversation-after-send")) and
       .repository=={host:$h,owner:$o,repo:$r} and (.target.pr|tostring)==$p and .round_key==$k
     ' <<<"$published" >/dev/null 2>&1 || return 1
     jq -cS .delivery <<<"$published"; return
@@ -1571,6 +1580,15 @@ pg_round_unrecord_epoch() { # round-key exact epoch; remove exactly one matching
   return "$rc"
 }
 
+# #246: which settled attempts give their charged round back. A proven no-submit always does. A
+# send that produced no ChatGPT conversation does only with a v2 record, which the validator admits
+# only with known delivery evidence: that record counts it toward delivery-failed-unchanged. Without
+# one, the retained round is the only bound on repeating the same failed send, so it stays charged.
+pg_attempt_disposition_refunds_round() { # canonical disposition
+  jq -e '.terminal_kind=="not-submitted" or (.record_version==2 and .proof_kind=="no-conversation-after-send")' \
+    <<<"$1" >/dev/null 2>&1
+}
+
 pg_attempt_disposition_cleanup_pending() { # canonical disposition
   local json="$1" marker key epoch kind active_file active_marker
   marker="$(jq -r .marker <<<"$json")"; key="$(jq -r .round_key <<<"$json")"
@@ -1582,8 +1600,10 @@ pg_attempt_disposition_cleanup_pending() { # canonical disposition
     IFS=$'\t' read -r active_marker _ < "$active_file" 2>/dev/null || true
     [ "$active_marker" = "$marker" ] && return 0
   fi
-  if [ "$kind" = not-submitted ]; then
+  if pg_attempt_disposition_refunds_round "$json"; then
     pg_round_has_epoch "$key" "$epoch" && return 0
+  fi
+  if [ "$kind" = not-submitted ]; then
     [ -f "$(pg_review_input_binding_dir)/$marker" ] && return 0
   fi
   return 1
@@ -1594,8 +1614,10 @@ pg_attempt_disposition_cleanup() { # canonical disposition; idempotent after pro
   json="$(pg_attempt_disposition_validate "$json")" || return 1
   marker="$(jq -r .marker <<<"$json")"; key="$(jq -r .round_key <<<"$json")"
   epoch="$(jq -r .charged_spend_epoch <<<"$json")"; kind="$(jq -r .terminal_kind <<<"$json")"
-  if [ "$kind" = not-submitted ]; then
+  if pg_attempt_disposition_refunds_round "$json"; then
     pg_round_unrecord_epoch "$key" "$epoch" || return 1
+  fi
+  if [ "$kind" = not-submitted ]; then
     # #134: this unlink was the reservation-adjacent mutation outside the guard on the supersession
     # path (pg_fresh_dispatch_refund's legacy no-PR branch has another, but nothing without a PR
     # number can reach pg_reservation_supersede). Bindings are otherwise write-once
@@ -4318,7 +4340,8 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
     pg_review_decision_emit stop-without-new-review account-cooldown-active "$canonical" "$snapshot"; return
   fi
   # #204: a fresh grant is the one action that would repeat a delivery the runtime proved never
-  # reached ChatGPT. Two proven no-send attempts in a row under the same evidence relation, input
+  # reached ChatGPT. Two failed deliveries in a row (proven no-send, or since #246 a send that
+  # produced no conversation and had its round refunded) under the same evidence relation, input
   # mode, attachment policy and Oracle build stop here, typed, instead of being granted until the
   # caller's time budget runs out. A change to any of those, or an operator's one-invocation
   # PRO_GATE_FORCE_ROUND=1 (resolved into delivery.override by the facts builder), grants again.

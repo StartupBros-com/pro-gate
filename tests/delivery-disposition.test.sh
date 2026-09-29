@@ -68,7 +68,7 @@ if [ "${1:-}" = --corrupt-sidecar-probe ]; then corrupt_sidecar_probe; exit "$?"
 extract_function(){
   awk -v name="$1" '$0 ~ "^" name "\\(\\)" { printing=1 } printing { print } printing && /^}/ { exit }' "$ROOT/bin/oracle-review.sh"
 }
-for function_name in pg_fresh_dispatch_capture_delivery_condition pg_fresh_dispatch_record_undelivered pg_fresh_dispatch_refund pg_fresh_dispatch_recheck pg_fresh_dispatch_require_run; do
+for function_name in pg_fresh_dispatch_capture_delivery_condition pg_fresh_dispatch_record_undelivered pg_fresh_dispatch_refund pg_fresh_dispatch_recheck pg_fresh_dispatch_require_run pg_fresh_dispatch_release_no_conversation pg_salvage_fail_reason; do
   function_source="$(extract_function "$function_name")"
   [ -n "$function_source" ] || { echo "missing engine function: $function_name" >&2; exit 2; }
   eval "$function_source"
@@ -127,6 +127,23 @@ mutate_disposition(){
 run_case(){
   if ( "$2" ); then printf 'ok - %s\n' "$1";
   else printf 'not ok - %s\n' "$1" >&2; FAILURES=$((FAILURES + 1)); fi
+}
+# #246: Send was clicked and produced no ChatGPT conversation; the engine settles the attempt here.
+no_conversation(){ charge && pg_fresh_dispatch_release_no_conversation; }
+assert_no_conversation_refunded(){ # expected consecutive failed deliveries
+  [ "$PG_NO_CONVERSATION_REFUNDED" = 1 ] && ! pg_round_has_epoch "$ROUND_KEY" "$RUN_SPEND_EPOCH" \
+    && [ ! -e "$(pg_run_meta_dir)/$RUN_MARKER" ] && [ ! -e "$(pg_reservation_dir)/$RUN_MARKER" ] \
+    && [ ! -e "$(pg_active_dir)/$ROUND_KEY" ] && [ -e "$(pg_review_input_binding_dir)/$RUN_MARKER" ] \
+    && jq -e --argjson n "$1" '.record_version==2 and .terminal_kind=="recovery-exhausted" and
+         .proof_kind=="no-conversation-after-send" and .delivery.state=="known" and .delivery.consecutive==$n' \
+         "$(pg_attempt_disposition_dir)/$RUN_MARKER" >/dev/null \
+    && [ "$(pg_salvage_fail_reason "$FAIL_DETAIL")" = no-conversation ]
+}
+decision_fixture(){ # the effect recheck's real query; only repository proof acquisition is replaced
+  REPO="$PRO_GATE_HOME/repository"; mkdir -p "$REPO"
+  git(){ printf '%s\n' "$fixture_head"; }
+  pg_pr_evidence_read(){ return 1; }
+  pg_review_decision_input_proof_current(){ return 0; }
 }
 
 known_chain(){
@@ -493,6 +510,92 @@ cooldown_boundary(){
     && grep -Fq 'stop-without-new-review/account-cooldown-active; no browser submission.' "$PRO_GATE_HOME/decision.err"
 }
 
+no_conversation_chain(){
+  setup no-conversation-chain && no_conversation && assert_no_conversation_refunded 1 && expect_facts known 1 || return 1
+  local before
+  before="$(disposition_digest)" || return 1
+  # Replaying the settled attempt republishes nothing and refunds nothing more.
+  pg_fresh_dispatch_release_no_conversation && assert_no_conversation_refunded 1 \
+    && assert_disposition_unchanged "$before" || return 1
+  no_conversation && assert_no_conversation_refunded 2 && expect_facts known 2 \
+    && [ ! -s "$(pg_rounds_dir)/$ROUND_KEY" ]
+}
+no_send_and_no_conversation_share_count(){
+  setup shared-count && no_send && assert_refunded && expect_facts known 1 || return 1
+  no_conversation && assert_no_conversation_refunded 2 || return 1
+  setup shared-count-reverse && no_conversation && assert_no_conversation_refunded 1 || return 1
+  no_send && assert_refunded && expect_facts known 2
+}
+no_conversation_unknown_build_keeps_round(){
+  setup no-conversation-unknown-build
+  fixture_version_rc=1
+  no_conversation || return 1
+  [ "$PG_NO_CONVERSATION_REFUNDED" = 0 ] && pg_round_has_epoch "$ROUND_KEY" "$RUN_SPEND_EPOCH" \
+    && [ ! -e "$(pg_run_meta_dir)/$RUN_MARKER" ] \
+    && jq -e '.record_version==1 and .terminal_kind=="recovery-exhausted" and .proof_kind=="no-conversation-after-send"' \
+         "$(pg_attempt_disposition_dir)/$RUN_MARKER" >/dev/null \
+    && [ "$(pg_salvage_fail_reason "$FAIL_DETAIL")" = no-conversation ] || return 1
+  # The retained round bounds this attempt; it must not become a delivery-state-unavailable stop.
+  fixture_version_rc=0
+  expect_facts known 0
+}
+no_conversation_v2_requires_known_evidence(){
+  setup v2-known-only && charge || return 1
+  local known unavailable
+  known="$(jq -cnS --argjson c "$PG_DISPATCH_DELIVERY_CONDITION" '{condition:$c,consecutive:1,state:"known"}')" || return 1
+  unavailable="$(jq -cnS --argjson c "$PG_DISPATCH_DELIVERY_CONDITION" '{condition:$c,consecutive:null,state:"unavailable"}')" || return 1
+  if pg_attempt_disposition_write github.com acme delivery 77 "$ROUND_KEY" "$RUN_MARKER" "$RUN_SPEND_EPOCH" \
+       recovery-exhausted no-conversation-after-send "$unavailable"; then return 1; fi
+  # not-applicable is a valid delivery value (Cloudflare) that reads as known 0, so it would never stop a refunded repeat.
+  pg_delivery_snapshot_validate '{"state":"not-applicable"}' >/dev/null || return 1
+  if pg_attempt_disposition_write github.com acme delivery 77 "$ROUND_KEY" "$RUN_MARKER" "$RUN_SPEND_EPOCH" \
+       recovery-exhausted no-conversation-after-send '{"state":"not-applicable"}'; then return 1; fi
+  if pg_attempt_disposition_write github.com acme delivery 77 "$ROUND_KEY" "$RUN_MARKER" "$RUN_SPEND_EPOCH" \
+       recovery-exhausted bounded-recovery-exhausted "$known"; then return 1; fi
+  if pg_attempt_disposition_write github.com acme delivery 77 "$ROUND_KEY" "$RUN_MARKER" "$RUN_SPEND_EPOCH" \
+       submitted-terminal exact-owned-infrastructure-terminal "$known"; then return 1; fi
+  [ ! -e "$(pg_attempt_disposition_dir)/$RUN_MARKER" ] && pg_round_has_epoch "$ROUND_KEY" "$RUN_SPEND_EPOCH"
+}
+no_conversation_cleanup_interruption(){
+  setup no-conversation-interrupted && charge || return 1
+  local saved before
+  saved="$(declare -f pg_round_unrecord_epoch)"
+  pg_round_unrecord_epoch(){ return 1; }
+  if pg_fresh_dispatch_release_no_conversation; then return 1; fi
+  pg_round_has_epoch "$ROUND_KEY" "$RUN_SPEND_EPOCH" \
+    && jq -e '.state=="cleanup-pending"' <<<"$(attempt_snapshot)" >/dev/null || return 1
+  before="$(disposition_digest)" || return 1
+  eval "$saved"
+  pg_fresh_dispatch_release_no_conversation && assert_no_conversation_refunded 1 \
+    && assert_disposition_unchanged "$before"
+}
+no_conversation_decisions(){
+  setup no-conversation-decisions && decision_fixture
+  PRO_GATE_ROUND_GUARD=1 PRO_GATE_ROUNDS_BASE=3
+  pg_fresh_dispatch_recheck || return 1
+  # The #246 shape: sends that produced no conversation, each under a changed condition, spend none
+  # of the enforced three-round cap, so the next query still grants a review.
+  local policy
+  for policy in auto never always; do
+    PRO_GATE_BROWSER_ATTACHMENTS="$policy"
+    no_conversation && assert_no_conversation_refunded 1 || return 1
+  done
+  RUN_MARKER=""
+  pg_fresh_dispatch_recheck || { printf 'unexpected decision: %s\n' "$PG_FRESH_DECISION"; return 1; }
+  # Two in a row under one unchanged condition stop typed instead of spending more.
+  no_conversation && assert_no_conversation_refunded 2 || return 1
+  RUN_MARKER=""
+  if pg_fresh_dispatch_recheck; then return 1; fi
+  jq -e '.action=="stop-without-new-review" and .reason=="delivery-failed-unchanged" and .facts.delivery.failed_unchanged==2' \
+    <<<"$PG_FRESH_DECISION" >/dev/null || { printf 'unexpected decision: %s\n' "$PG_FRESH_DECISION"; return 1; }
+}
+
+run_case 'no-conversation send with known evidence refunds its round and counts as a failed delivery' no_conversation_chain
+run_case 'proven no-sends and no-conversation sends share one failed-delivery count' no_send_and_no_conversation_share_count
+run_case 'no-conversation send with an unknown Oracle build keeps its round and no delivery stop' no_conversation_unknown_build_keeps_round
+run_case 'only a no-conversation send may carry delivery evidence past not-submitted, and only known' no_conversation_v2_requires_known_evidence
+run_case 'crash before the no-conversation refund reconciles without rewriting evidence' no_conversation_cleanup_interruption
+run_case 'no-conversation sends spend no enforced round; two unchanged stop typed' no_conversation_decisions
 run_case 'known no-send chain persists, refunds, and replays idempotently' known_chain
 run_case 'excluding a published current disposition exposes its predecessor' exclude_published_current
 run_case 'cleanup and recorder replay retain immutable published count and components' published_snapshot_replay

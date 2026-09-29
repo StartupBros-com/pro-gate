@@ -3670,9 +3670,11 @@ check 'structured pre-submit terminalization removes mutable recovery state' \
   "run-meta=$(find "$PRESUBMIT_HOME/run-meta" -type f 2>/dev/null) active=$(find "$PRESUBMIT_HOME/active" -type f 2>/dev/null)"
 
 # #230: Send was clicked (promptSubmitted=true), but Oracle's commit check ended off any /c/
-# conversation and the final scan found none. The round stays charged; the futile reattach, the
-# live-review salvage budget and the 6h unknown-fate hold go away. pro-gate #227 rounds 1 and 8 were
-# this shape on 2026-09-26 (6h49m and 4h22m from charge to release).
+# conversation and the final scan found none. The futile reattach, the live-review salvage budget and
+# the 6h unknown-fate hold go away. pro-gate #227 rounds 1 and 8 were this shape on 2026-09-26 (6h49m
+# and 4h22m from charge to release). These classic --pr --diff runs have no evidence relation, so no
+# known delivery evidence, and the round stays charged; the #246 refund with known evidence is covered
+# in tests/delivery-disposition.test.sh.
 echo '# #230: a send that produced no ChatGPT conversation releases recovery, charge retained'
 NOCONV_REPO="$TDIR/noconv-repo"; git init -q "$NOCONV_REPO"; git -C "$NOCONV_REPO" remote add origin https://github.com/acme/noconv.git
 run_noconv() { # pr commit-mode tab-url -> NC_HOME NC_RC NC_MARKER NC_RKEY NC_ATTEMPTS NC_SESSIONS; stderr in $TDIR/stderr
@@ -3706,7 +3708,7 @@ check '#230 no-conversation send keeps the normal salvage window, not the live-r
 check '#230 no-conversation send writes a retained-charge terminal disposition' \
   "$(jq -e '.terminal_kind=="recovery-exhausted" and .proof_kind=="no-conversation-after-send"' "$NC_DISP" >/dev/null 2>&1; echo $?)" \
   "marker=$NC_MARKER disp=$(cat "$NC_DISP" 2>/dev/null) $(tail -4 "$TDIR/stderr")"
-check '#230 no-conversation send keeps its round charged' \
+check '#230 no-conversation send without delivery evidence keeps its round charged' \
   "$([ -s "$NC_HOME/rounds/$NC_RKEY" ] && ! grep -q 'refunding this round' "$TDIR/stderr"; echo $?)" \
   "rounds=$(cat "$NC_HOME/rounds/$NC_RKEY" 2>/dev/null) $(tail -4 "$TDIR/stderr")"
 check '#230 no-conversation release removes the unknown-fate recovery state' \
@@ -7954,6 +7956,23 @@ PRO_GATE_HOME="$DC_HOME" pg_delivery_condition_record github.com acme dc 5 "$DC_
 check '#204: a sent attempt between two no-sends breaks the run even when the condition matches' \
   "$(jq -e '.consecutive==1' <<<"$(PRO_GATE_HOME="$DC_HOME" pg_delivery_condition_read "$DC_M5")" >/dev/null 2>&1; echo $?)" \
   "$(PRO_GATE_HOME="$DC_HOME" pg_delivery_condition_read "$DC_M5" 2>&1)"
+# #246: --status tells a no-conversation attempt that kept its round (v1) from one whose round was
+# refunded because it counted as a failed delivery (v2 with known evidence).
+NCS_EPOCH=$(( $(date +%s) - 100 )); NCS_KEY='acme-ncs-7'; NCS_M="pg-run-acme-ncs-7-$NCS_EPOCH-1"
+NCS_DELIVERY="$(jq -cn '{condition:{attachments:"auto",input:"bundle",oracle:"1.0",relation:("relation:" + ("a" * 64))},consecutive:1,state:"known"}')"
+for NCS_V in 1 2; do
+  NCS_HOME="$TDIR/home-noconv-status-$NCS_V"; mkdir -p "$NCS_HOME"
+  NCS_ARG=""; [ "$NCS_V" = 1 ] || NCS_ARG="$NCS_DELIVERY"
+  PRO_GATE_HOME="$NCS_HOME" pg_attempt_disposition_write github.com acme ncs 7 "$NCS_KEY" "$NCS_M" "$NCS_EPOCH" \
+    recovery-exhausted no-conversation-after-send "$NCS_ARG"
+  PRO_GATE_HOME="$NCS_HOME" bash "$ENGINE" --status 7 --json > "$TDIR/ncs-$NCS_V.json" 2>/dev/null
+done
+check '#246 --status: a no-conversation attempt that kept its round says it remains charged' \
+  "$(jq -e '.next_step|test("ended recovery-exhausted; its round remains charged")' "$TDIR/ncs-1.json" >/dev/null 2>&1; echo $?)" \
+  "$(jq -c .next_step "$TDIR/ncs-1.json" 2>&1)"
+check '#246 --status: a refunded no-conversation attempt says its round was refunded as a failed delivery' \
+  "$(jq -e '.next_step|test("round was refunded and it counts as a failed delivery")' "$TDIR/ncs-2.json" >/dev/null 2>&1; echo $?)" \
+  "$(jq -c .next_step "$TDIR/ncs-2.json" 2>&1)"
 # #204 gate r1: at refund time the current attempt owns the change's newest run-meta and a live
 # reservation. Excluding it must not hide an older attempt that was sent and later superseded.
 DC2_HOME="$TDIR/home-delivery-condition-sent"; mkdir -p "$DC2_HOME"

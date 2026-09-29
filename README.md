@@ -364,7 +364,8 @@ configuration has changed. Predecessor lookup excludes the current attempt befor
 history, and an intervening sent attempt (including one later superseded) breaks the no-send
 streak. Unknown-send attempts remain charged. These records prove no send, never delivery success.
 
-After two proven no-send attempts in a row under one known condition, the typed query returns
+After two failed deliveries in a row under one known condition (proven no-sends, or since v0.60.0
+sends that produced no ChatGPT conversation), the typed query returns
 `stop-without-new-review` / `delivery-failed-unchanged`. Unreadable history or an unknown current
 build instead produces `delivery-state-unavailable`, with `facts.delivery.failed_unchanged: null`.
 A proven change in relation, input, attachment policy, or a previously known Oracle build can
@@ -550,7 +551,9 @@ charge and optional audit harvest but owns neither capacity nor the current head
 let changed/current evidence receive a fresh typed decision. Unknown post-click fate stays recoverable,
 with one exception: when Oracle's own exact-session record shows the send never reached a ChatGPT
 conversation and left the composer empty, and the final scan finds none, the attempt settles as `recovery-exhausted` (proof
-`no-conversation-after-send`, ledger reason `no-conversation`) and keeps its charge.
+`no-conversation-after-send`, ledger reason `no-conversation`). Since v0.60.0 it counts as a failed delivery and its round is
+refunded, so two in a row under unchanged conditions stop typed with `delivery-failed-unchanged`; when its Oracle build or
+evidence relation is unknown it keeps its charge instead.
 Each unresolved reservation also carries `classification` (what the latest collection pass concluded:
 `owned-incomplete`, `inconclusive`, `browser-down`, `absent`, `cross-bound`, `throttle`, `terminal`,
 `terminal-infrastructure`), `classified_at`, and `ttl_remaining_secs`, so a parked run and a genuinely
