@@ -757,9 +757,13 @@ process.on('exit', () => {
 });
 
 // `unreadable` answers for a binding that exists but cannot be read or parsed: it may be legacy.
+// Like the shell's pg_review_binding_read, only a regular file is read; a symlink, dangling or
+// not, is a binding that cannot be read.
 function legacyReviewBinding(m, unreadable = false) {
   try {
-    const { evidence } = JSON.parse(fs.readFileSync(path.join(INPUT_BINDING_DIR, m), 'utf8'));
+    const file = path.join(INPUT_BINDING_DIR, m);
+    if (!fs.lstatSync(file).isFile()) return unreadable;
+    const { evidence } = JSON.parse(fs.readFileSync(file, 'utf8'));
     const proof = evidence?.proof;
     return (evidence?.mode === 'full-pr' || evidence?.mode === 'scoped-delta')
       && proof !== null && typeof proof === 'object' && !Array.isArray(proof)
@@ -1539,18 +1543,16 @@ if (knownUrl) ourUrls.add(knownUrl);
 // the run that observed it. Run A rendering run B's conversation permanently blacklisted B's
 // own URL, hiding B's finished review from B itself. Observed on a live box: a completed
 // review sat on the blacklist while its own run reported "conversation gone".
-// Lines are "<marker>\t<url>". Legacy bare-URL lines are ignored and dropped on the next
-// rewrite: they cannot be attributed to a marker, and honoring them would preserve exactly the
-// poisoning this fixes.
+// Lines are "<marker>\t<url>" or, for a resolved memo claim, "<marker>\t<fingerprint>". Legacy
+// bare-URL lines are ignored: they cannot be attributed to a marker, and honoring them would
+// preserve exactly the poisoning this fixes.
 const nonMatching = new Set();     // URLs proven foreign TO THIS MARKER
-const blacklistLines = [];         // retained lines (other markers' entries survive a rewrite)
 try {
   for (const raw of fs.readFileSync(BLACKLIST_FILE, 'utf8').split('\n')) {
     const line = raw.trim();
     if (!line) continue;
     const sep = line.indexOf('\t');
-    if (sep < 0) continue;         // legacy global entry: ignore (and do not carry it forward)
-    blacklistLines.push(line);
+    if (sep < 0) continue;         // legacy global entry: ignore
     if (line.slice(0, sep) === marker) nonMatching.add(line.slice(sep + 1));
   }
 } catch {}
@@ -1559,26 +1561,13 @@ function blacklist(url) {
   // the one entry that could make a real review permanently unreachable.
   if (ourUrls.has(url) || nonMatching.has(url)) return;
   nonMatching.add(url);
-  blacklistLines.push(`${marker}\t${url}`);
   try {
     fs.mkdirSync(PG_HOME, { recursive: true });
-    // APPEND-ONLY (gate #54 r14): the shell rejection path appends concurrently, and a
-    // whole-file rewrite from a stale in-memory snapshot could erase its freshly rejected
-    // entry — letting the rejected open tab replay. Compaction is opportunistic, under a
-    // lock both writers respect, and skipped on contention.
+    // APPEND-ONLY (gate #54 r14), and never trimmed or rewritten: the shell rejection path and
+    // other salvage children append without a shared lock, so a read→rename rewrite can drop a
+    // line appended in between, and a resolved claim's fingerprint line is then its only record
+    // (see the salvage-nonmatching.txt note in oracle-review.sh housekeeping).
     fs.appendFileSync(BLACKLIST_FILE, `${marker}\t${url}\n`);
-    if (blacklistLines.length > 800) {
-      const lockDir = `${BLACKLIST_FILE}.lock.d`;
-      try {
-        fs.mkdirSync(lockDir);
-        try {
-          const fresh = fs.readFileSync(BLACKLIST_FILE, 'utf8').split('\n').filter((l) => l.includes('\t'));
-          const tmp = `${BLACKLIST_FILE}.tmp.${process.pid}`;
-          fs.writeFileSync(tmp, fresh.slice(-500).join('\n') + '\n');
-          fs.renameSync(tmp, BLACKLIST_FILE);
-        } finally { try { fs.rmdirSync(lockDir); } catch {} }
-      } catch {}
-    }
   } catch {}
 }
 
