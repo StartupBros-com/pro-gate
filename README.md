@@ -550,7 +550,9 @@ charge and optional audit harvest but owns neither capacity nor the current head
 let changed/current evidence receive a fresh typed decision. Unknown post-click fate stays recoverable,
 with one exception: when Oracle's own exact-session record shows the send never reached a ChatGPT
 conversation and left the composer empty, and the final scan finds none, the attempt settles as `recovery-exhausted` (proof
-`no-conversation-after-send`, ledger reason `no-conversation`) and keeps its charge.
+`no-conversation-after-send`, ledger reason `no-conversation`). Since v0.60.0 it counts as a failed delivery and its round is
+refunded, so two in a row under unchanged conditions stop typed with `delivery-failed-unchanged`; when its Oracle build or
+evidence relation is unknown it keeps its charge instead.
 Each unresolved reservation also carries `classification` (what the latest collection pass concluded:
 `owned-incomplete`, `inconclusive`, `browser-down`, `absent`, `cross-bound`, `throttle`, `terminal`,
 `terminal-infrastructure`), `classified_at`, and `ttl_remaining_secs`, so a parked run and a genuinely

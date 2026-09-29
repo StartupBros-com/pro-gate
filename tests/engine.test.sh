@@ -3670,9 +3670,11 @@ check 'structured pre-submit terminalization removes mutable recovery state' \
   "run-meta=$(find "$PRESUBMIT_HOME/run-meta" -type f 2>/dev/null) active=$(find "$PRESUBMIT_HOME/active" -type f 2>/dev/null)"
 
 # #230: Send was clicked (promptSubmitted=true), but Oracle's commit check ended off any /c/
-# conversation and the final scan found none. The round stays charged; the futile reattach, the
-# live-review salvage budget and the 6h unknown-fate hold go away. pro-gate #227 rounds 1 and 8 were
-# this shape on 2026-09-26 (6h49m and 4h22m from charge to release).
+# conversation and the final scan found none. The futile reattach, the live-review salvage budget and
+# the 6h unknown-fate hold go away. pro-gate #227 rounds 1 and 8 were this shape on 2026-09-26 (6h49m
+# and 4h22m from charge to release). These classic --pr --diff runs have no evidence relation, so no
+# known delivery evidence, and the round stays charged; the #246 refund with known evidence is covered
+# in tests/delivery-disposition.test.sh.
 echo '# #230: a send that produced no ChatGPT conversation releases recovery, charge retained'
 NOCONV_REPO="$TDIR/noconv-repo"; git init -q "$NOCONV_REPO"; git -C "$NOCONV_REPO" remote add origin https://github.com/acme/noconv.git
 run_noconv() { # pr commit-mode tab-url -> NC_HOME NC_RC NC_MARKER NC_RKEY NC_ATTEMPTS NC_SESSIONS; stderr in $TDIR/stderr
@@ -3706,7 +3708,7 @@ check '#230 no-conversation send keeps the normal salvage window, not the live-r
 check '#230 no-conversation send writes a retained-charge terminal disposition' \
   "$(jq -e '.terminal_kind=="recovery-exhausted" and .proof_kind=="no-conversation-after-send"' "$NC_DISP" >/dev/null 2>&1; echo $?)" \
   "marker=$NC_MARKER disp=$(cat "$NC_DISP" 2>/dev/null) $(tail -4 "$TDIR/stderr")"
-check '#230 no-conversation send keeps its round charged' \
+check '#230 no-conversation send without delivery evidence keeps its round charged' \
   "$([ -s "$NC_HOME/rounds/$NC_RKEY" ] && ! grep -q 'refunding this round' "$TDIR/stderr"; echo $?)" \
   "rounds=$(cat "$NC_HOME/rounds/$NC_RKEY" 2>/dev/null) $(tail -4 "$TDIR/stderr")"
 check '#230 no-conversation release removes the unknown-fate recovery state' \

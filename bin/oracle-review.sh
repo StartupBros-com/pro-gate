@@ -2267,6 +2267,33 @@ pg_fresh_dispatch_refund() { # delivery snapshot; terminalize/refund only the ex
   PG_ACTIVE_WRITTEN=0
 }
 
+# #230/#246: settle the exact charged attempt whose send produced no ChatGPT conversation. It is a
+# failed delivery, so with known attempt-time evidence it is recorded like a proven no-send (v2,
+# counted toward delivery-failed-unchanged) and its round is refunded: two in a row under the same
+# evidence, input, attachments and Oracle build stop typed instead of spending the round cap. With
+# unavailable evidence nothing would bound a repeat, so it keeps the v1 record and its round.
+# PG_NO_CONVERSATION_REFUNDED says which happened, and FAIL_DETAIL is set to match; rc 1 changes
+# neither and leaves the charged attempt for recovery.
+pg_fresh_dispatch_release_no_conversation() {
+  local delivery=""
+  PG_NO_CONVERSATION_REFUNDED=0
+  [ -n "${RUN_SPEND_EPOCH:-}" ] || return 1
+  if pg_fresh_dispatch_record_undelivered \
+     && [ "$(jq -r .state <<<"${PG_FRESH_DELIVERY_SNAPSHOT:-}" 2>/dev/null)" = known ]; then
+    delivery="$PG_FRESH_DELIVERY_SNAPSHOT"
+  fi
+  pg_attempt_terminal_transition "$PG_META_HOST" "$PG_META_OWNER" "$PG_META_REPO" "$PR_NUM" \
+    "$ROUND_KEY" "$RUN_MARKER" "$RUN_SPEND_EPOCH" recovery-exhausted no-conversation-after-send "$delivery" || return 1
+  if [ -n "$delivery" ]; then
+    PG_NO_CONVERSATION_REFUNDED=1
+    echo "[oracle-review] Oracle's send produced no ChatGPT conversation and the final scan found none: recovery released, round refunded, counted as failed delivery $(jq -r .consecutive <<<"$delivery") under unchanged conditions." >&2
+    FAIL_DETAIL="send produced no ChatGPT conversation; recovery released, round refunded, counted as a failed delivery — safe to re-query the review decision"
+  else
+    echo "[oracle-review] Oracle's send produced no ChatGPT conversation and the final scan found none: recovery released, round retained (delivery evidence unavailable)." >&2
+    FAIL_DETAIL="send produced no ChatGPT conversation; recovery released, round retained — safe to re-query for a fresh review"
+  fi
+}
+
 pg_publish_out() {  # $1 = verified snapshot → atomically publish to $OUT; rc 0 only when
   # $OUT is a readable regular file afterwards (an existing directory or a failed rename is
   # a publication FAILURE, never silently "done" — gate #54 r9).
@@ -2522,6 +2549,17 @@ pg_organize_chat() {  # rename|finalize [early-lease] [diagnostic-log] [helper-s
   return 0
 }
 
+# #143: the closed ledger reason for a failed run whose salvage ran, from its FAIL_DETAIL.
+# no-conversation first: since #246 its detail can also say "round refunded".
+pg_salvage_fail_reason() { # fail detail
+  case "$1" in
+    *"no ChatGPT conversation"*) echo no-conversation ;;
+    *"round refunded"*)          echo refunded-unsubmitted ;;
+    *"fate uncertain"*)          echo fate-uncertain ;;
+    *)                           echo salvage-empty ;;
+  esac
+}
+
 pg_finish() {  # $1 exit code — settle organization, ramp, and ledger exactly once, then exit
   local rc="$1" outcome dur now pre_slot_secs post_slot_secs kind line model_label fsrc title_memo=""
   # Revoke every sleeping early organizer before anything at the terminal boundary can settle.
@@ -2663,12 +2701,7 @@ pg_finish() {  # $1 exit code — settle organization, ramp, and ledger exactly 
     elif [ "${SALVAGE_TERMINAL_INFRA:-0}" = 1 ]; then
       reason=infra-error
     elif [ "${SALVAGE_RAN:-0}" = 1 ]; then
-      case "$fail_detail" in
-        *"round refunded"*)          reason=refunded-unsubmitted ;;
-        *"fate uncertain"*)          reason=fate-uncertain ;;
-        *"no ChatGPT conversation"*) reason=no-conversation ;;
-        *)                           reason=salvage-empty ;;
-      esac
+      reason="$(pg_salvage_fail_reason "$fail_detail")"
     elif [ "${HARVEST:-0}" = 1 ]; then
       reason=harvest-failed
     elif [ -n "${RUN_MARKER:-}" ] && [ "${attempt:-0}" -gt 0 ]; then
@@ -4334,8 +4367,9 @@ pg_attempt_provably_unsubmitted() {
 # pg_attempt_no_conversation_after_send <marker-scan-rc>: the weaker bar for releasing capacity
 # while RETAINING the charge (#230). The same clean-scan preconditions hold, every invocation is
 # either proven unsubmitted or a no-conversation send, and at least one is the latter (all
-# unsubmitted is the refund above). It never authorizes a retry or a refund: a post-click timeout
-# stays charged, and only the six-hour hold on a conversation that never existed goes away.
+# unsubmitted is the refund above). It never authorizes a retry, and on its own it never authorizes
+# a refund: the round comes back only when the attempt is also counted as a failed delivery (#246,
+# pg_fresh_dispatch_release_no_conversation); otherwise only the six-hour hold goes away.
 pg_attempt_no_conversation_after_send() {
   local scan_rc="${1:-}" i outcome seen=0
   pg_attempt_clean_scan "$scan_rc" || return 1
@@ -4927,16 +4961,12 @@ else
        && [ -n "${PG_META_OWNER:-}" ] && [ -n "${PG_META_REPO:-}" ] \
        && pg_attempt_no_conversation_after_send "${SALVAGE_RC:-0}"; then
     # #230: Send was clicked, Oracle's commit check ended with no conversation, and the final scan
-    # found none either. That is not proof the prompt never reached ChatGPT, so the round stays
-    # charged. Without it the charged attempt stayed unknown-fate, and every later caller was sent to
-    # recover a conversation that never existed until the 6h reservation TTL ran out.
-    if pg_attempt_terminal_transition "$PG_META_HOST" "$PG_META_OWNER" "$PG_META_REPO" "$PR_NUM" \
-         "$ROUND_KEY" "$RUN_MARKER" "$RUN_SPEND_EPOCH" recovery-exhausted no-conversation-after-send; then
-      echo "[oracle-review] Oracle's send produced no ChatGPT conversation and the final scan found none: recovery released, round retained." >&2
-      FAIL_DETAIL="send produced no ChatGPT conversation; recovery released, round retained — safe to re-query for a fresh review"
-    else
-      echo "[oracle-review] the no-conversation outcome could not be persisted safely; charged state preserved for recovery." >&2
-    fi
+    # found none either. Without settling it the charged attempt stayed unknown-fate, and every later
+    # caller was sent to recover a conversation that never existed until the 6h reservation TTL ran
+    # out. #246: that is not proof the prompt never reached ChatGPT, so the round is refunded only when
+    # the attempt counts as a failed delivery (see pg_fresh_dispatch_release_no_conversation).
+    pg_fresh_dispatch_release_no_conversation \
+      || echo "[oracle-review] the no-conversation outcome could not be persisted safely; charged state preserved for recovery." >&2
   fi
   # Attribute the failure when the review browser restarted mid-run — almost always memory pressure
   # on a small box (Chrome's subprocesses get reclaimed, oracle-chrome restarts, the CDP tab is
