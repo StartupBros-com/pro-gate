@@ -1407,6 +1407,8 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
       # v0.33+ lifecycle state distinguishes capacity ownership from optional collectability.
       if [ "$r_life" = superseded ]; then
         [ -n "$ST_HINT" ] || ST_HINT="superseded old-head review holds no capacity and cannot authorize the current PR; optional audit harvest: $r_cmd"
+      elif pg_memo_claim_pending "$m"; then
+        ST_HINT="conversation recovery bytes for $m remain unresolved after a memo read or restore failure; reservation and charge are retained. Retry the FREE harvest: $r_cmd"
       elif [ "$r_crossbound" -gt 0 ] 2>/dev/null; then
         ST_HINT="STUCK (cross-bound): the conversation remembered for $m carries ANOTHER run's completed answer — see $PRO_GATE_HOME/crossbound/$m. Do NOT delete state or set PRO_GATE_REQUIRE_NONCE=0. The bad memo is discarded; bounded exact-marker misses will terminalize recovery while retaining the charged round."
       elif [ "$r_unbound" -gt 0 ]; then
@@ -1707,6 +1709,8 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
         if [ -n "$ST_LAST_MARKER" ] && [ -f "$ST_URLS_DIR/$ST_LAST_MARKER" ]; then
           ST_FAILED_URL="$(head -c 300 "$ST_URLS_DIR/$ST_LAST_MARKER" 2>/dev/null | tr -d '\n')"
           ST_HINT="last run FAILED but its conversation URL is remembered (${ST_FAILED_URL:-unknown}) — the review may exist server-side; try a FREE harvest before spending: $ST_ENGINE --harvest '$ST_LAST_MARKER' --out '$ST_LAST_OUT' --timeout ${HARVEST_HINT_TIMEOUT}"
+        elif [ -n "$ST_LAST_MARKER" ] && pg_memo_claim_pending "$ST_LAST_MARKER"; then
+          ST_HINT="last run has unresolved conversation recovery bytes; try a FREE harvest before spending: $ST_ENGINE --harvest '$ST_LAST_MARKER' --out '$ST_LAST_OUT' --timeout ${HARVEST_HINT_TIMEOUT}"
         else
           ST_HINT="last run ended 'failed' with no reservation held — a fresh run will SPEND a slot (round budget permitting)"
         fi;;
@@ -2191,7 +2195,7 @@ pg_fresh_dispatch_recheck() { # sets PG_FRESH_DECISION/PG_FRESH_ACTION
 pg_fresh_dispatch_require_run() { # boundary label; exits through existing status/finish path
   local boundary="$1" reason
   if pg_fresh_dispatch_recheck; then return 0; fi
-  reason="$(jq -r .reason <<<"${PG_FRESH_DECISION:-{}}" 2>/dev/null || echo recheck-failed)"
+  reason="$(jq -r .reason <<<"${PG_FRESH_DECISION:-null}" 2>/dev/null || echo recheck-failed)"
   echo "[oracle-review] review-decision fresh dispatch superseded at ${boundary}: ${PG_FRESH_ACTION:-stop-without-new-review}/${reason}; no browser submission." >&2
   # A replacement is data, not an authorization token. Emit it before the legacy status/exit so
   # callers can re-enter through the ordinary collect/recover/stop path without inferring action.
@@ -2210,31 +2214,48 @@ pg_install_effect_input_binding() { # clone the already-current validated relati
   binding="$(jq -cS --arg marker "$RUN_MARKER" --argjson epoch "$RUN_SPEND_EPOCH" '.marker=$marker | .charged_spend_epoch=$epoch' <<<"$REVIEW_DECISION_INPUT_TEMPLATE")" || return 1
   pg_review_input_binding_write "$RUN_MARKER" "$binding"
 }
-# #204: before a proven no-send attempt's disposition exists, record the delivery condition it
-# failed under, so the next query can stop an unchanged repeat instead of granting it. Only a
-# review-decision effect carries the relation the query compares against, and only the
-# session-metadata no-send proof calls this: a Cloudflare challenge refunds through the same path
-# but is an account state with its own cooldown, not a delivery that a changed condition repairs.
-# Best effort: a missing record means the next query counts from zero, the behavior before it.
+# Capture all condition components before charging, alongside the bounded Oracle build probe.
+# This is process memory, not a new admission record. An upgrade or input change during an
+# attempt must not be attributed to the failed attempt when it later terminalizes.
+pg_fresh_dispatch_capture_delivery_condition() {
+  local relation=""
+  PG_DISPATCH_ORACLE_ID="$(pg_oracle_identity)"
+  if [ -n "${REVIEW_DECISION_INPUT_TEMPLATE:-}" ] \
+     && pg_review_input_binding_validate "$REVIEW_DECISION_INPUT_TEMPLATE"; then
+    relation="$(pg_review_relation_identity "$REVIEW_DECISION_INPUT_TEMPLATE")" || relation=""
+  fi
+  PG_DISPATCH_DELIVERY_CONDITION="$(pg_delivery_condition_json "$relation" "${INPUT:-unknown}" \
+    "${PRO_GATE_BROWSER_ATTACHMENTS:-auto}" "$PG_DISPATCH_ORACLE_ID")" || return 1
+}
+
+# The required disposition owns this evidence; the old sidecar is only a compatibility mirror.
+# Failure to serialize the snapshot leaves it empty, so the canonical refund below refuses to
+# publish a v1 record that would silently lose the delivery condition.
 pg_fresh_dispatch_record_undelivered() {
-  local relation oracle_id
-  [ -n "${REVIEW_DECISION_INPUT_TEMPLATE:-}" ] && [ -n "${PR_NUM:-}" ] && [ -n "${PG_META_HOST:-}" ] \
-    && [ -n "${PG_META_OWNER:-}" ] && [ -n "${PG_META_REPO:-}" ] || return 0
-  relation="$(pg_review_relation_identity "$REVIEW_DECISION_INPUT_TEMPLATE" || true)"
-  oracle_id="${PG_DISPATCH_ORACLE_ID:-$(pg_oracle_identity)}"
-  [ "$oracle_id" != unknown ] \
-    || echo "[oracle-review] Oracle's version could not be read, so this attempt's delivery condition records its build as unknown; a later query that can read it counts from zero (#204)." >&2
-  if [ -z "$relation" ] || ! pg_delivery_condition_record "$PG_META_HOST" "$PG_META_OWNER" "$PG_META_REPO" "$PR_NUM" \
-       "$ROUND_KEY" "$RUN_MARKER" "$(pg_delivery_condition_digest "$relation" \
-         "$INPUT" "${PRO_GATE_BROWSER_ATTACHMENTS:-auto}" "$oracle_id")" 2>/dev/null; then
-    echo "[oracle-review] could not record this attempt's delivery condition; an unchanged repeat will not be stopped (#204)." >&2
+  local condition="${PG_DISPATCH_DELIVERY_CONDITION:-}" digest
+  PG_FRESH_DELIVERY_SNAPSHOT=""
+  [ -n "${PR_NUM:-}" ] && [ -n "${PG_META_HOST:-}" ] \
+    && [ -n "${PG_META_OWNER:-}" ] && [ -n "${PG_META_REPO:-}" ] || return 1
+  if [ -z "$condition" ]; then
+    condition="$(pg_delivery_condition_json "" "${INPUT:-unknown}" "${PRO_GATE_BROWSER_ATTACHMENTS:-auto}" unknown)" || return 1
+  fi
+  PG_FRESH_DELIVERY_SNAPSHOT="$(pg_delivery_snapshot_json "$PG_META_HOST" "$PG_META_OWNER" "$PG_META_REPO" "$PR_NUM" \
+    "$ROUND_KEY" "$RUN_MARKER" "$condition")" || return 1
+  if [ "$(jq -r .state <<<"$PG_FRESH_DELIVERY_SNAPSHOT")" = known ]; then
+    condition="$(jq -cS .condition <<<"$PG_FRESH_DELIVERY_SNAPSHOT")" || return 1
+    digest="$(pg_delivery_condition_digest "$(jq -r .relation <<<"$condition")" "$(jq -r .input <<<"$condition")" \
+      "$(jq -r .attachments <<<"$condition")" "$(jq -r .oracle <<<"$condition")")" || return 1
+    pg_delivery_condition_write "$RUN_MARKER" "$ROUND_KEY" "$digest" "$(jq -r .consecutive <<<"$PG_FRESH_DELIVERY_SNAPSHOT")" \
+      || echo '[oracle-review] legacy delivery sidecar could not be written; delivery evidence remains in the required terminal disposition.' >&2
   fi
 }
-pg_fresh_dispatch_refund() { # terminalize and refund only the current exact charged attempt
+pg_fresh_dispatch_refund() { # delivery snapshot; terminalize/refund only the exact charged attempt
+  local delivery="${1:-}"
   [ -n "${RUN_SPEND_EPOCH:-}" ] || return 1
   if [ -n "${PR_NUM:-}" ] && [ -n "${PG_META_HOST:-}" ] && [ -n "${PG_META_OWNER:-}" ] && [ -n "${PG_META_REPO:-}" ]; then
+    [ -n "$delivery" ] && pg_delivery_snapshot_validate "$delivery" >/dev/null || return 1
     pg_attempt_terminal_transition "$PG_META_HOST" "$PG_META_OWNER" "$PG_META_REPO" "$PR_NUM" \
-      "$ROUND_KEY" "$RUN_MARKER" "$RUN_SPEND_EPOCH" not-submitted proven-no-submit || return 1
+      "$ROUND_KEY" "$RUN_MARKER" "$RUN_SPEND_EPOCH" not-submitted proven-no-submit "$delivery" || return 1
     PG_ACTIVE_WRITTEN=0
     return 0
   fi
@@ -3601,7 +3622,11 @@ pg_attempt_disposition_sweep
 _pg_res_dir="$(pg_reservation_dir)"
 find "$PRO_GATE_HOME/conversation-urls" -maxdepth 1 -type f -mmin +20160 -print 2>/dev/null \
   | while IFS= read -r _pg_memo; do
-      [ -e "$_pg_res_dir/$(basename "$_pg_memo")" ] && continue
+      _pg_memo_marker="$(pg_memo_claim_marker "$_pg_memo")" || continue
+      [ -e "$_pg_res_dir/$_pg_memo_marker" ] && continue
+      if [ "${_pg_memo##*/}" != "$_pg_memo_marker" ]; then
+        pg_review_input_binding_may_be_legacy "$_pg_memo_marker" && continue
+      fi
       rm -f "$_pg_memo" 2>/dev/null || true
     done
 # #170: cross-bind sidecars are on the SAME 14-day clock, for the same reason. They used to
@@ -3614,9 +3639,21 @@ find "$PRO_GATE_HOME/conversation-urls" -maxdepth 1 -type f -mmin +20160 -print 
 # together instead of one outliving the other — the same disagreement #170 was about.
 find "$PRO_GATE_HOME/crossbound" -maxdepth 1 -type f -mmin +20160 -delete 2>/dev/null || true
 # A revoked legacy memo's receipt (pg_legacy_review_receipt_path) is the memo itself, renamed
-# with its mtime, so this is the same 14-day horizon the memo had. Only the legacy
-# replacement-spend refusal reads it.
-find "$PRO_GATE_HOME/legacy-review-receipts" -maxdepth 1 -type f -mmin +20160 -delete 2>/dev/null || true
+# with its mtime, so resolved receipts retain the same 14-day horizon for the legacy
+# replacement-spend refusal. An unresolved claim retains reservation protection by its
+# original marker or a legacy binding, including one that cannot be read; unowned claims and
+# resolved receipts keep the age horizon.
+find "$PRO_GATE_HOME/legacy-review-receipts" -maxdepth 1 -type f -mmin +20160 -print 2>/dev/null \
+  | while IFS= read -r _pg_receipt; do
+      case "$_pg_receipt" in *.rej.*)
+        _pg_memo_marker="$(pg_memo_claim_marker "$_pg_receipt")" || continue
+        if [ "${_pg_receipt##*/}" != "$_pg_memo_marker" ]; then
+          [ -e "$_pg_res_dir/$_pg_memo_marker" ] && continue
+          pg_review_input_binding_may_be_legacy "$_pg_memo_marker" && continue
+        fi;;
+      esac
+      rm -f "$_pg_receipt" 2>/dev/null || true
+    done
 # v0.42 (#109): salvage classification sidecars ride the same horizon as the memos they describe.
 find "$(pg_salvage_class_dir)" -maxdepth 1 -type f -mmin +20160 -delete 2>/dev/null || true
 # Canonical title memos serve the same late-harvest lifecycle as URL memos. Sequence counters
@@ -3990,7 +4027,7 @@ fi
 # #204 gate r2: the Oracle build that will attempt this Send, read before it runs. A proven no-send
 # records this build, not whichever one is installed by the time the failed attempt finishes: an
 # upgrade made during that attempt is the repair, and must not inherit its failure.
-[ "${REVIEW_DECISION_EXECUTE:-0}" != 1 ] || PG_DISPATCH_ORACLE_ID="$(pg_oracle_identity)"
+[ "${REVIEW_DECISION_EXECUTE:-0}" != 1 ] || pg_fresh_dispatch_capture_delivery_condition
 if [ "${PG_FULL_PR_PROVEN:-0}" = 1 ] && ! pg_pr_evidence_current "$PG_FULL_PR_EVIDENCE"; then
   echo 'ERROR: prepared PR head/base is no longer current; no review submitted' >&2
   pg_status failed "PR evidence changed before charge"
@@ -4273,7 +4310,8 @@ pg_attempt_clean_scan() { # <marker-scan-rc>
   [ "${1:-}" = 4 ] || return 1
   [ "${LIVE_CONVERSATION:-0}" != 1 ] || return 1
   [ "${THROTTLED:-0}" != 1 ] || return 1
-  [ ! -f "$PRO_GATE_HOME/conversation-urls/${RUN_MARKER}" ] || return 1
+  [ ! -e "$PRO_GATE_HOME/conversation-urls/${RUN_MARKER}" ] && [ ! -L "$PRO_GATE_HOME/conversation-urls/${RUN_MARKER}" ] || return 1
+  ! pg_memo_claim_pending "$RUN_MARKER" || return 1
   ! pg_browser_restarted_midrun "$RUN_START" >/dev/null || return 1
   [ "${#ORACLE_LOG_TRANSCRIPTS[@]}" -gt 0 ]
 }
@@ -4490,7 +4528,7 @@ while :; do
     # The challenge PROVES no prompt reached the model: refund this invocation's round so a
     # few challenge hits inside the window cannot exit-12-block a change that spent nothing
     # (dogfood gate round-2 P1). Unknown-fate paths (throttle, watchdogs) never refund.
-    pg_fresh_dispatch_refund \
+    pg_fresh_dispatch_refund '{"state":"not-applicable"}' \
       || echo "[oracle-review] charged marker state could not be proven for refund; preserving it for recovery." >&2
     pg_status cloudflare "anti-bot challenge; cooldown started"
     cdf="${PRO_GATE_COOLDOWN_FILE:-$PRO_GATE_HOME/throttle.cooldown}"
@@ -4882,9 +4920,9 @@ else
      && pg_attempt_provably_unsubmitted "${SALVAGE_RC:-0}"; then
     echo "[oracle-review] Oracle's exact session metadata proves Send was never dispatched (browser scanned clean, no URL memoized, browser stable): refunding this round; zero Pro quota was spent." >&2
     pg_fresh_dispatch_record_undelivered
-    pg_fresh_dispatch_refund \
+    pg_fresh_dispatch_refund "${PG_FRESH_DELIVERY_SNAPSHOT:-}" \
       || { echo "[oracle-review] charged marker state could not be proven for refund; preserving it for recovery." >&2; FAIL_DETAIL="submission fate uncertain; charged state preserved for recovery"; }
-    [ "${FAIL_DETAIL:-}" = "submission fate uncertain; charged state preserved for recovery" ] || FAIL_DETAIL="submission never landed (send/upload failure before the prompt reached ChatGPT); round refunded, safe to retry"
+    [ "${FAIL_DETAIL:-}" = "submission fate uncertain; charged state preserved for recovery" ] || FAIL_DETAIL="submission never landed (send/upload failure before the prompt reached ChatGPT); round refunded; re-query the review decision before retrying"
   elif [ "${SALVAGE_RAN:-0}" = 1 ] && [ -n "${PR_NUM:-}" ] && [ -n "${PG_META_HOST:-}" ] \
        && [ -n "${PG_META_OWNER:-}" ] && [ -n "${PG_META_REPO:-}" ] \
        && pg_attempt_no_conversation_after_send "${SALVAGE_RC:-0}"; then
@@ -4919,6 +4957,9 @@ else
       echo "    ${PRO_GATE_HOME:-\$HOME/.pro-review-daemon}/oracle-review.sh --harvest '${RUN_MARKER}' --out '${OUT}' --timeout ${HARVEST_HINT_TIMEOUT}" >&2
       echo "  Or inspect all state for this change first: ${PRO_GATE_HOME:-\$HOME/.pro-review-daemon}/oracle-review.sh --status '${PR_URL:-${PR_NUM:-}}'" >&2
       FAIL_DETAIL="review browser restarted mid-run (chrome up ${_svc_up}s); conversation URL remembered — recover FREE with --harvest '${RUN_MARKER}'"
+    elif [ -n "${RUN_MARKER:-}" ] && pg_memo_claim_pending "$RUN_MARKER"; then
+      echo "  Conversation recovery bytes are retained but unresolved. Retry FREE with --harvest '${RUN_MARKER}' after storage recovers." >&2
+      FAIL_DETAIL="review browser restarted mid-run; unresolved conversation memo retained — recover FREE with --harvest '${RUN_MARKER}'"
     else
       echo "  The slot was likely already spent and the review may still exist in ChatGPT, so do NOT immediately re-run. Free memory (close other apps / browser tabs) and try again." >&2
       FAIL_DETAIL="review browser restarted mid-run (chrome up ${_svc_up}s); likely out of memory"

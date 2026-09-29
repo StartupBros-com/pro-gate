@@ -50,11 +50,13 @@ An **acceptance** predicate publishes a capture as this run's review, so a false
 
 The same identifier can therefore be compared at different strictness in the two classes without inconsistency. Treating them as one question and picking a single global strictness is wrong in one direction by construction.
 
-What the acceptance predicate concluded about a published artifact is its **ownership**: `exact` (the authoritative verdict line named this run's marker) or `nonce-less` (an artifact accepted under the pre-marker rules). A capture carrying a foreign authoritative claim has no ownership because it is never published.
+What the acceptance predicate concluded about a published artifact is its **ownership**: `exact` (the authoritative verdict line named this run's marker) or `nonce-less` (an artifact accepted under the pre-marker rules). These are conceptual terms, not a persisted `ownership` field in binding records. A capture carrying a foreign authoritative claim has no ownership because it is never published. Final nonce acceptance is case-sensitive; browser-side foreign conviction folds case so a near-match is not destructively misclassified.
 
 ### Conversation Memo
 
 The conversation URL remembered for a marker so later passes can find the same conversation without rescanning. A memo is authoritative only while its conversation id has the shape of a real conversation id; a memo that fails that check, or that proves to carry foreign content, is revoked so the next pass rescans every candidate. A blank render of a real-id memo is a transient, not a miss, and does not revoke it.
+
+Revocation claims a unique generation before reading it, with a fingerprint of the rejected URL's digest in its bounded filename. That conviction applies to every claim for the marker, survives a failed blacklist append, and prevents ordinary recall from restoring rejected bytes; a claim naming it is kept until the blacklist records it: as the URL when the memo or a claim holds it, otherwise as the claim's fingerprint, so a copy another writer publishes later stays rejected. Recall never returns a memo that the blacklist or a pending claim rejects: it revokes that memo as it does a placeholder, while an unreadable blacklist or claim listing leaves the memo unresolved rather than trusted or recovered. An uncertain read or restore retains the claim as a recovery handle; recall preserves a different concurrent memo and resolves a duplicate once identical bytes or the same inode prove restoration. Unresolved claims prevent confirmed absence and retirement based on misses. Reservations and legacy bindings, including a binding that exists but cannot be read, protect their recovery claims from pruning; unowned claims follow the memo count cap and original 14-day age horizon. Resolved legacy receipts retain the original memo's 14-day clock.
 
 ### Salvage classification
 
@@ -62,7 +64,7 @@ What the latest salvage pass concluded about a reservation's conversation: `owne
 
 ### Submit-Failure Class
 
-Why a Review Attempt's prompt never reached ChatGPT, when it did not: `upload-stalled` (the composer accepted the attachment but it never finished uploading), `send-unconfirmed` (the prompt did not appear in the conversation before the send timeout), `cloudflare-challenge` (the account met a challenge page before submission), `other` (an error oracle recorded before the prompt was confirmed submitted that matches none of those), or `none` (the prompt was confirmed submitted, or no error was recorded). It is classified once from oracle's own transcript lines and the engine's salvage flags at the moment a round is refunded or preserved, and it is observation only: it never decides whether a charge is refunded, which the Terminal Disposition's proof owns.
+A planned taxonomy, not a currently emitted classifier: `upload-stalled` (an attachment never finished uploading), `send-unconfirmed` (the prompt did not appear before the send timeout), `cloudflare-challenge` (a challenge page preceded submission), `other`, or `none`. Current code does not persist this enum or classify it once from transcript prose. Refund authority comes from the Terminal Disposition's proven-no-submit evidence; delivery-condition snapshots record the circumstances of that no-send, and Cloudflare follows its separate Account Cooldown path.
 
 ## Review authority
 
@@ -72,7 +74,7 @@ The engine-issued typed continuation chosen from normalized lifecycle, evidence,
 
 ### Round Convergence
 
-Whether successive charged rounds on one change are settling. The round governor scores each round by its open P0 plus P1 count and keeps a churn streak: the count of consecutive rounds that failed to shrink it. A streak of two is the convergence signal; it produces the typed stop `rounds-not-converging`, which is report-only and reversible by the operator via the stateless one-invocation `PRO_GATE_ROUNDS_CONTINUE=1` override, and it never alters the numeric round grant's own policy. Convergence is judged from the round history the engine writes, never from re-reading review text.
+Whether successive charged rounds on one change are settling. The round governor scores each round by its open P0 plus P1 count and keeps a churn streak: the count of consecutive rounds that failed to shrink it. A streak of two produces the typed report-only stop `rounds-not-converging`, including in advisory mode. The operator's `PRO_GATE_ROUNDS_CONTINUE=1` removes the shared scorer/guard's churn collapse and the reducer's churn stop for the configured invocation. It exposes the uncollapsed numeric grant without enlarging it: enforced exhaustion and zero-budget lockdown still deny a fresh round. CONTINUE is stateless, with no durable one-use counter, and does not bypass cooldown, provenance or ownership. FORCE alone retains the reducer's separate churn stop. Convergence is judged from the round history the engine writes, never from re-reading review text.
 
 A round whose findings are all below the blocking severities scores zero, exactly like a clean round, so a chain of such rounds never raises the streak and is never reported as non-converging; the governor bounds blocking-severity churn only.
 
@@ -86,7 +88,11 @@ The engine-wide back-off that follows any proof that ChatGPT is rate-limiting th
 
 ### Delivery Condition
 
-The circumstances a fresh review's Send was attempted under: the exact evidence relation, the input mode, the attachment policy, and the Oracle build that attempted the Send. When Oracle's own session record proves an attempt's Send was never dispatched, its refund records the condition and how many such attempts in a row it has produced for the change; a sent attempt, a review, or a different condition in between starts the count again. Two in a row produce the typed stop `delivery-failed-unchanged` in place of another grant, because the next identical attempt would fail the same way. A change to the condition, or the operator's one-invocation `PRO_GATE_FORCE_ROUND=1`, grants again. A Cloudflare challenge is an Account Cooldown, not a delivery failure, and is not counted.
+The circumstances a fresh review's Send was attempted under: the exact evidence relation, input mode, attachment policy and Oracle build, captured before charge. When Oracle's session record proves Send was never dispatched, the required v2 Terminal Disposition retains those components and a known consecutive count or explicit unavailable state before refund/cleanup. The optional v1 sidecar is a compatibility mirror. Its failure cannot discard the new disposition's evidence or keep an otherwise proven no-send charged. Failure to publish the disposition itself preserves the existing conservative charge/ownership behavior. The snapshot records no-send proof, not an observed delivery success.
+
+Two consecutive known no-sends under unchanged conditions produce `delivery-failed-unchanged`. Unknown history or build identity instead produces `delivery-state-unavailable`, with a null count. A sent attempt or review breaks the chain, and a proven relation/input/policy/known-build change can permit a new grant. Unknown-to-known build identity alone is not a proven change. The operator's `PRO_GATE_FORCE_ROUND=1` can bypass a known repeated-failure count, but not unavailable evidence, churn, cooldown, provenance or ownership. New Cloudflare dispositions explicitly record `not-applicable` and remain Account Cooldown events.
+
+Existing v1 dispositions and delivery sidecars remain readable. A v1 disposition with no sidecar is explicitly `legacy-untracked` and retains legacy admission behavior, without claiming a zero count or a changed condition. v0.58 and earlier cannot distinguish a failed/missing sidecar publication from genuinely untracked history or a Cloudflare refund. New dispositions preserve that uncertainty when it affects their own no-send history.
 
 ### Throttle Sighting
 

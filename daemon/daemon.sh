@@ -39,7 +39,8 @@ daemon_decision_valid(){ # decision-file
 daemon_decision_target_matches(){ # decision-file nwo pr sha
   local decision="$1" nwo="$2" pr="$3" sha="$4" owner repo
   owner="${nwo%%/*}"; repo="${nwo#*/}"
-  jq -e --arg owner "$owner" --arg repo "$repo" --argjson pr "$pr" --arg sha "$sha" '
+  jq -e --arg host "$DAEMON_HOST" --arg owner "$owner" --arg repo "$repo" --argjson pr "$pr" --arg sha "$sha" '
+    .effect_request.target.host == $host and
     .effect_request.target.owner == $owner and .effect_request.target.repo == $repo and
     .effect_request.target.pr == $pr and .effect_request.target.head_oid == $sha
   ' "$decision" >/dev/null 2>&1
@@ -49,6 +50,31 @@ daemon_defer_decision(){ # reason
   DECISION_DEFERRED=1
   RUNTIME_DEFERRED=1
   daemon_note "typed review decision unavailable ($1); globally deferring PR processing until a compatible deploy reloads"
+}
+
+daemon_reject_decision(){ # decision-file reason; never infer deployment skew from missing output
+  local decision="$1" reason="$2" identity expected
+  # A failed query, malformed envelope, or moved PR is local to that observation. Only a
+  # complete typed identity can positively identify an incompatible producer and latch the
+  # daemon until reload. In particular, prose errors and malformed digest strings are not
+  # compatibility evidence. Runtime/consent readiness is independently checked by runtime_gate.
+  if [ -f "$decision" ] && [ ! -L "$decision" ] \
+      && [ "$(wc -c < "$decision" 2>/dev/null | tr -d ' ')" -le 65536 ]; then
+    identity="$(jq -cseS '
+      select(length == 1) | .[0].contract | select(type == "object") |
+      select(keys == ["contract_digest","contract_id","contract_version","corpus_digest"]) |
+      select((.contract_id | type == "string" and length > 0 and length <= 256 and test("^[A-Za-z0-9._/-]+$")) and
+        (.contract_version | type == "number" and floor == . and . > 0) and
+        (.contract_digest | type == "string" and test("^[0-9a-f]{64}$")) and
+        (.corpus_digest | type == "string" and test("^[0-9a-f]{64}$")))
+    ' "$decision" 2>/dev/null)" || identity=""
+    expected="$(pg_review_decision_identity_json)" || expected=""
+    if [ -n "$identity" ] && [ -n "$expected" ] && [ "$identity" != "$expected" ]; then
+      daemon_defer_decision "$reason; typed runtime identity mismatch"
+      return
+    fi
+  fi
+  daemon_note "typed review decision rejected ($reason); this PR remains retryable next poll"
 }
 
 daemon_decision_action(){ jq -r '.action' "$1"; }
@@ -210,12 +236,16 @@ daemon_handle_review_worker_failure(){ # worker-rc; fresh typed decision decides
   local worker_rc="$1" fresh action
   fresh="$DD_LOG.decision-after-run.json"
   if ! PRO_GATE_REVIEW_PR_EVIDENCE="${DD_EVIDENCE_FILE:+$DD_EVIDENCE_FILE.pr-evidence.json}" PRO_GATE_REVIEW_ENDPOINT_PATCH="${DD_EVIDENCE_FILE:-}" "$DD_ENGINE" --review-decision --json --pr "$DD_NUM" --repo "$DD_WORKTREE" ${DD_INPUT_ARGS[@]+"${DD_INPUT_ARGS[@]}"} ${DD_EVIDENCE_ARGS[@]+"${DD_EVIDENCE_ARGS[@]}"} >"$fresh" 2>>"$DD_LOG"; then
+    daemon_reject_decision "$fresh" "review worker rc=$worker_rc; replacement query failed"
+    # A query-only rejection is free; this path has already launched a failed worker.
+    # Only a valid recovery/collection decision below can defer its wrapper failure charge.
     note_fail "$DD_NWO" "$DD_NUM" "$DD_SHA" "$DD_LOG" "runtime-selected review worker rc=$worker_rc; replacement query failed"
     return 1
   fi
   if ! daemon_decision_valid "$fresh" || ! daemon_decision_target_matches "$fresh" "$DD_NWO" "$DD_NUM" "$DD_SHA"; then
-    daemon_defer_decision "nonzero review worker returned an incompatible replacement envelope"
-    return 2
+    daemon_reject_decision "$fresh" "nonzero review worker returned an invalid or stale replacement envelope"
+    note_fail "$DD_NWO" "$DD_NUM" "$DD_SHA" "$DD_LOG" "runtime-selected review worker rc=$worker_rc; invalid or stale replacement envelope"
+    return 1
   fi
   action="$(daemon_decision_action "$fresh")"
   case "$action" in
@@ -234,7 +264,7 @@ daemon_dispatch_decision(){ # decision-file [redirect-depth]
   DAEMON_DISPATCH_AGENT_TASK_RAN=0
   DAEMON_DISPATCH_TERMINAL_COMPLETED=0
   daemon_decision_valid "$decision" && daemon_decision_target_matches "$decision" "$DD_NWO" "$DD_NUM" "$DD_SHA" || {
-    daemon_defer_decision "missing, malformed, stale, unknown, or corpus-mismatched envelope"
+    daemon_reject_decision "$decision" "invalid or stale dispatch envelope"
     return 2
   }
   daemon_report_observation "$decision"
@@ -247,11 +277,11 @@ daemon_dispatch_decision(){ # decision-file [redirect-depth]
     runtime-guarded-effect/collect-existing-result|runtime-guarded-effect/recover-existing-review)
       fresh="$DD_LOG.decision-effect-$depth.json"
       if ! PRO_GATE_REVIEW_PR_EVIDENCE="${DD_EVIDENCE_FILE:+$DD_EVIDENCE_FILE.pr-evidence.json}" PRO_GATE_REVIEW_ENDPOINT_PATCH="${DD_EVIDENCE_FILE:-}" "$DD_ENGINE" --review-decision --review-decision-effect "$decision" --pr "$DD_NUM" --repo "$DD_WORKTREE" ${DD_INPUT_ARGS[@]+"${DD_INPUT_ARGS[@]}"} ${DD_EVIDENCE_ARGS[@]+"${DD_EVIDENCE_ARGS[@]}"} >"$fresh" 2>>"$DD_LOG"; then
-        daemon_defer_decision "runtime effect recheck failed"
+        daemon_reject_decision "$fresh" "runtime effect recheck failed"
         return 2
       fi
       if ! daemon_decision_valid "$fresh" || ! daemon_decision_target_matches "$fresh" "$DD_NWO" "$DD_NUM" "$DD_SHA"; then
-        daemon_defer_decision "runtime effect returned an incompatible replacement"
+        daemon_reject_decision "$fresh" "runtime effect returned an invalid or stale replacement"
         return 2
       fi
       fresh_action="$(daemon_decision_action "$fresh")"; fresh_ref="$(daemon_decision_ref "$fresh")"; ref="$(daemon_decision_ref "$decision")"
@@ -316,7 +346,7 @@ daemon_dispatch_decision(){ # decision-file [redirect-depth]
       daemon_note "  · $DD_NWO#$DD_NUM requires the runtime-validated named product choice; daemon defers without a review worker"
       return 0 ;;
     *)
-      daemon_defer_decision "incompatible execution class/action"
+      daemon_reject_decision "$decision" "incompatible execution class/action"
       return 2 ;;
   esac
 }
@@ -1316,7 +1346,7 @@ process_pr(){
   if ! PRO_GATE_REVIEW_PR_EVIDENCE="${evidence_file:+$evidence_file.pr-evidence.json}" PRO_GATE_REVIEW_ENDPOINT_PATCH="$evidence_file" "$engine" --review-decision --json --pr "$num" --repo "$wt" ${DD_INPUT_ARGS[@]+"${DD_INPUT_ARGS[@]}"} ${evidence_args[@]+"${evidence_args[@]}"} >"$decision" 2>>"$lg" \
       || ! daemon_decision_valid "$decision" || ! daemon_decision_target_matches "$decision" "$nwo" "$num" "$sha"; then
     git -C "$repodir" worktree remove --force "$wt" 2>/dev/null || true
-    daemon_defer_decision "missing, malformed, stale, unknown, or corpus-mismatched envelope"
+    daemon_reject_decision "$decision" "initial query failed or returned an invalid or stale envelope"
     return 2
   fi
 
@@ -1439,6 +1469,7 @@ process_pr(){
     return 2
   fi
   git -C "$repodir" worktree remove --force "$wt" 2>/dev/null || true
+  daemon_reject_decision "$redecision" "successful worker returned no valid current-target replacement"
   log "  · $nwo#$num @ ${sha:0:8} review worker exited 0 but the re-resolved decision could not be resolved/validated (query failure, invalid envelope, or the head has since moved) — not marking done; re-evaluated next cycle, no-progress cap untouched"
   return 2
 }

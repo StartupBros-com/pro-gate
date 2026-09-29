@@ -996,14 +996,23 @@ echo '# environment; the fix is verified structurally (idiom present at every si
 echo '# documented bash changelog behavior, NOT by an executed reproduction of the original crash.'
 DAEMON_SH="$HERE/../daemon/daemon.sh"
 # Strip every full guard-idiom occurrence ( ${name[@]+"${name[@]}"} ) out of the file text first,
-# then any "[@]" expansion still remaining on a CODE line (excluding the 2 explanatory comment
-# lines that spell the idiom out as prose, ~139/150 -- daemon.sh has grown since these line numbers
-# were first pinned; re-verify with the same sed|grep pipeline below whenever daemon.sh changes
-# enough to shift them again) is a genuine unguarded bare expansion.
-UNGUARDED_LINES="$(sed -E 's/\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\+"\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\}"\}//g' "$DAEMON_SH" \
-  | grep -noE '\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\}' \
-  | cut -d: -f1 | sort -un | grep -vxE '139|150' || true)"
+# then reject remaining expansions on code lines. Full-line comments are ignored by syntax,
+# not pinned line numbers; the inner and outer array names must match in a valid guard.
+unguarded_array_lines() {
+  sed -nE 's/^[[:space:]]*#.*$//; s/\$\{([A-Za-z_][A-Za-z0-9_]*)\[@\]\+"\$\{\1\[@\]\}"\}//g; /\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\}/=' "$1"
+}
+UNGUARDED_LINES="$(unguarded_array_lines "$DAEMON_SH")"
 check 'every "[@]" array expansion outside the explanatory comment block is wrapped in the ${arr[@]+"${arr[@]}"} guard idiom' "$([ -z "$UNGUARDED_LINES" ]; echo $?)" "unguarded lines: $UNGUARDED_LINES"
+cat > "$TDIR/array-scan-fixture.txt" <<'ARRAY_SCAN'
+# "${comment[@]}"
+  # "${indented[@]}"
+printf '%s\n' ${safe[@]+"${safe[@]}"}
+printf '%s\n' "${unsafe[@]}"
+printf '%s\n' ${outer[@]+"${different[@]}"}
+ARRAY_SCAN
+PLANTED_LINES="$(unguarded_array_lines "$TDIR/array-scan-fixture.txt")"
+check 'array scanner rejects planted bare and mismatched guards while ignoring comments' \
+  "$([ "$PLANTED_LINES" = $'4\n5' ]; echo $?)" "unguarded lines: $PLANTED_LINES"
 check 'sanity: at least the 7 known call sites (daemon_run_review_worker x4, its recover branch, and process_pr/daemon_dispatch_decision x2 more) still use the guard' "$([ "$(grep -c '\[@\]+"\${[A-Za-z_]*\[@\]}"}' "$DAEMON_SH")" -ge 7 ]; echo $?)" "count=$(grep -c '\[@\]+"\${[A-Za-z_]*\[@\]}"}' "$DAEMON_SH")"
 
 GUARD_PROBE="$TDIR/guard-probe.sh"

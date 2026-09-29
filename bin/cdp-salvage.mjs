@@ -86,7 +86,7 @@
 //            exists to harvest; the caller keeps the charge but releases recovery ownership.
 // Requires Node >= 21 (global WebSocket); the box runs Node 24.
 
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -259,29 +259,325 @@ const CONVERSATION_URL_RE = /^https:\/\/chatgpt\.com\/c\/[A-Za-z0-9-]+(?:[?#].*)
 const conversationUrlOk = (url) => CONVERSATION_URL_RE.test(url || '');
 const memoPath = (m) => (MARKER_SAFE_RE.test(m) ? path.join(URL_MEMO_DIR, m) : null);
 const titleMemoPath = (m) => (MARKER_SAFE_RE.test(m) ? path.join(TITLE_MEMO_DIR, m) : null);
+const unresolvedMemos = new Set();
+
+// Recovery bytes are uncertain unless they can be read as a bounded regular file. Open
+// nonblocking and without following links so a damaged claim cannot stall before the deadline.
+function memoBytes(file) {
+  let fd;
+  try {
+    const before = fs.lstatSync(file);
+    if (!before.isFile() || before.isSymbolicLink() || before.size > 4096)
+      throw new Error('unreadable memo shape');
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0));
+    const held = fs.fstatSync(fd);
+    if (!held.isFile() || held.size > 4096 || held.dev !== before.dev || held.ino !== before.ino)
+      throw new Error('memo changed while opening');
+    const bytes = Buffer.alloc(4097);
+    let size = 0;
+    while (size < bytes.length) {
+      const count = fs.readSync(fd, bytes, size, bytes.length - size, null);
+      if (!count) break;
+      size += count;
+    }
+    if (size > 4096) throw new Error('oversized memo');
+    return bytes.subarray(0, size).toString('utf8');
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+// The conviction travels atomically with the claimed inode, even if blacklist append fails.
+// Strip the LAST claim suffix: a repository/marker itself may contain ".rej.".
+function memoClaimMarker(name) {
+  // A canonical marker can itself contain an earlier "-epoch-pid.rej." substring.
+  // Prefer its full launch suffix unless an actual unique claim suffix proves otherwise.
+  const unique =
+    /\.rej\.(?:[0-9a-f]{64}\.[A-Za-z0-9-]+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
+  if (/^pg-run-[A-Za-z0-9.-]+-[0-9]+-[0-9]+$/.test(name) && !unique.test(name))
+    return name;
+  const match = name.match(
+    /^(pg-run-[A-Za-z0-9.-]+-[0-9]+-[0-9]+)\.rej\.[A-Za-z0-9.-]+$/,
+  );
+  return match ? match[1] : name;
+}
+
+// The longest marker (39-byte GitHub owner and 100-byte repository in the PR key) is 174
+// bytes; this 38-byte suffix keeps the claim under the common 255-byte filename limit.
+// Earlier claims carry the full 64-hex digest and a UUID, and both shapes remain readable.
+function memoClaimName(m, url) {
+  const digest = createHash('sha256').update(url).digest('hex').slice(0, 16);
+  return `${m}.rej.${digest}.${randomUUID().replaceAll('-', '').slice(0, 16)}`;
+}
+
+const MEMO_DIGEST_RE = /^(?:[0-9a-f]{16}|[0-9a-f]{64})$/;
+
+function memoClaimDigest(claim) {
+  const name = path.basename(claim);
+  const digest = name.slice(name.lastIndexOf('.rej.') + 5).split('.')[0];
+  return MEMO_DIGEST_RE.test(digest) ? digest : null;
+}
+
+// A claim name records the URL its rejecting process convicted, whichever claim holds it.
+function memoClaimConvicts(claim, url) {
+  const digest = memoClaimDigest(claim);
+  return (
+    digest !== null &&
+    createHash('sha256').update(url).digest('hex').startsWith(digest)
+  );
+}
+
+// A blacklist line holds a rejected URL or, when no record held that URL, the fingerprint of
+// the claim that convicted it. Older readers match no URL against a fingerprint line.
+function memoBlacklisted(rejected, url) {
+  if (rejected.has(url)) return true;
+  const digest = createHash('sha256').update(url).digest('hex');
+  return [...rejected].some((entry) => MEMO_DIGEST_RE.test(entry) && digest.startsWith(entry));
+}
+
+// Until the blacklist records a conviction, a claim naming it is its only durable record.
+function memoRejectionPublished(m, url, rejected) {
+  if (!conversationUrlOk(url) || rejected.has(url)) return true;
+  try {
+    fs.appendFileSync(BLACKLIST_FILE, `${m}\t${url}\n`);
+    rejected.add(url);
+    return true;
+  } catch {
+    unresolvedMemos.add(m);
+    return false;
+  }
+}
+
+// A claim whose convicted URL no readable record holds publishes its fingerprint instead:
+// another writer may publish that URL after any listing, and it must stay rejected.
+function memoConvictionPublished(m, claim, rejected) {
+  const digest = memoClaimDigest(claim);
+  const covered = (entry) =>
+    MEMO_DIGEST_RE.test(entry)
+      ? digest.startsWith(entry)
+      : createHash('sha256').update(entry).digest('hex').startsWith(digest);
+  if (digest === null || [...rejected].some(covered)) return true;
+  try {
+    fs.appendFileSync(BLACKLIST_FILE, `${m}\t${digest}\n`);
+    rejected.add(digest);
+    return true;
+  } catch {
+    unresolvedMemos.add(m);
+    return false;
+  }
+}
+
+function memoClaimRestored(claim, canonical) {
+  try {
+    const current = fs.lstatSync(canonical);
+    if (!current.isFile() || current.isSymbolicLink()) return false;
+    const owned = fs.statSync(claim);
+    return (
+      (current.dev === owned.dev && current.ino === owned.ino) ||
+      memoBytes(canonical) === memoBytes(claim)
+    );
+  } catch {
+    return false;
+  }
+}
+
+// Claims contain the original inode, not a copy. Until a read and either conviction or
+// restoration succeeds, they are recovery handles and must participate in ordinary recall.
+// An incomplete listing may hide a claim, and with it a conviction. A path that is not a
+// directory hides no claim, but like the shell's check it leaves absence unproven.
+function memoClaimListing(m) {
+  if (!MARKER_SAFE_RE.test(m)) return { claims: [], complete: true };
+  const claims = [];
+  let complete = true;
+  for (const dir of [URL_MEMO_DIR, LEGACY_RECEIPT_DIR]) {
+    try {
+      for (const name of fs.readdirSync(dir)) {
+        if (name.startsWith(`${m}.rej.`) && memoClaimMarker(name) === m)
+          claims.push(path.join(dir, name));
+      }
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        unresolvedMemos.add(m);
+        if (error.code !== 'ENOTDIR') complete = false;
+      }
+    }
+  }
+  return { claims, complete };
+}
+
+function memoClaims(m) {
+  return memoClaimListing(m).claims;
+}
+
+function memoBlacklist(m) {
+  try {
+    return new Set(
+      fs
+        .readFileSync(BLACKLIST_FILE, 'utf8')
+        .split('\n')
+        .filter((line) => line.startsWith(`${m}\t`))
+        .map((line) => line.slice(m.length + 1).trim()),
+    );
+  } catch (error) {
+    if (error.code === 'ENOENT') return new Set();
+    unresolvedMemos.add(m);
+    return null;
+  }
+}
+
+function resolveMemoClaim(m, claim) {
+  try {
+    if (path.dirname(claim) === LEGACY_RECEIPT_DIR) {
+      // Resolved legacy receipts keep their original inode and 14-day mtime horizon.
+      const split = claim.lastIndexOf('.rej.');
+      fs.renameSync(
+        claim,
+        `${claim.slice(0, split)}.${claim.slice(split + 5)}`,
+      );
+    } else {
+      fs.unlinkSync(claim);
+    }
+  } catch (error) {
+    if (error.code !== 'ENOENT') unresolvedMemos.add(m);
+  }
+}
+
+function recoverMemoClaims(m) {
+  const { claims, complete } = memoClaimListing(m);
+  // Like an unreadable blacklist, a hidden claim could convict what a listed one would restore.
+  if (!complete || !claims.length) return;
+  const rejected = memoBlacklist(m);
+  if (!rejected) return;
+  const held = new Map();
+  let unseen = false;
+  for (const claim of claims) {
+    try {
+      held.set(claim, memoBytes(claim).trim());
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        unresolvedMemos.add(m);
+        unseen = true;
+      }
+    }
+  }
+  // Every claim's conviction applies to all of them, so processing order cannot restore a
+  // URL a sibling rejected. A claim is resolved only once the blacklist records its own
+  // conviction: every URL it names that a claim or the canonical memo holds, or, when none
+  // does and nothing went unread, its fingerprint.
+  const foreign = (url) =>
+    !conversationUrlOk(url) ||
+    memoBlacklisted(rejected, url) ||
+    claims.some((claim) => memoClaimConvicts(claim, url));
+  const durable = (claim) => {
+    if (memoClaimDigest(claim) === null) return true;
+    const named = seen.filter((url) => memoClaimConvicts(claim, url));
+    return named.length
+      ? named.every((url) => !conversationUrlOk(url) || rejected.has(url))
+      : !unseen && memoConvictionPublished(m, claim, rejected);
+  };
+  const settled = [];
+  for (const [claim, url] of held) {
+    if (foreign(url)) {
+      if (memoRejectionPublished(m, url, rejected)) settled.push(claim);
+      continue;
+    }
+    try {
+      fs.linkSync(claim, memoPath(m));
+      settled.push(claim);
+    } catch (error) {
+      // EEXIST means a concurrent memo won, not that this alternate URL is foreign.
+      // All other link failures are I/O uncertainty. Neither permits deleting the claim.
+      if (error.code === 'EEXIST' && memoClaimRestored(claim, memoPath(m)))
+        settled.push(claim);
+      else unresolvedMemos.add(m);
+    }
+  }
+  // Another writer may have republished a URL a claim rejects. Resolving that claim would leave
+  // the canonical memo trusted, so the rejection is published first; an unreadable memo, like
+  // an unread claim, leaves a claim naming nothing it could see in place.
+  const seen = [...held.values()];
+  try {
+    const canonical = memoBytes(memoPath(m)).trim();
+    if (canonical && claims.some((claim) => memoClaimConvicts(claim, canonical))) {
+      memoRejectionPublished(m, canonical, rejected);
+      seen.push(canonical);
+    }
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      unresolvedMemos.add(m);
+      unseen = true;
+    }
+  }
+  // Resolve only after every publication above, so no claim's position decides durability.
+  for (const claim of settled) {
+    if (durable(claim)) resolveMemoClaim(m, claim);
+    else unresolvedMemos.add(m);
+  }
+}
+
+function memoUnresolved(m) {
+  return memoClaims(m).length > 0 || unresolvedMemos.has(m);
+}
+
+// A remembered URL is usable only while no record of this marker rejects it. Every scan skips a
+// blacklisted conversation, so trusting one held the run inconclusive instead of letting it
+// retire; a pending claim's name carries a conviction the blacklist may not hold yet. A record
+// that cannot be read may hold that rejection, so the URL is then uncertain, never trusted.
+function memoVerdict(m, url) {
+  if (!conversationUrlOk(url)) return 'rejected';
+  const rejected = memoBlacklist(m);
+  const { claims, complete } = memoClaimListing(m);
+  if (
+    (rejected && memoBlacklisted(rejected, url)) ||
+    claims.some((claim) => memoClaimConvicts(claim, url))
+  )
+    return 'rejected';
+  return rejected && complete ? 'trusted' : 'uncertain';
+}
 
 function recallUrl(m) {
   const f = memoPath(m);
   if (!f) return null;
+  recoverMemoClaims(m);
   let url = '';
-  try { url = fs.readFileSync(f, 'utf8').trim(); } catch { return null; }
-  if (conversationUrlOk(url)) return url;
+  try {
+    url = memoBytes(f).trim();
+  } catch (error) {
+    if (error.code !== 'ENOENT') unresolvedMemos.add(m);
+    return null;
+  }
   if (!url) return null;
+  const verdict = memoVerdict(m, url);
+  if (verdict === 'trusted') return url;
+  // The unreadable record already marked the memo unresolved; leave its bytes where they are.
+  if (verdict === 'uncertain') return null;
   // v0.42 (#109): a memo whose id fails the shape gate is revoked HERE, on read, so this very pass
   // rescans candidates instead of trusting it. Claim-and-verify (forgetUrl), never a plain unlink:
   // a concurrently republished genuine memo survives and is used instead. This is memo hygiene,
   // not termination — the pass still has to find or miss the conversation on its own evidence.
+  // A memo this marker rejected, republished after or during its revocation, goes the same way.
   const survivor = forgetUrl(m, url);
-  console.error(`memo-revoked: the remembered conversation for "${m}" is not a conversation id (${url}); rescanning candidates`);
-  if (survivor && conversationUrlOk(survivor)) return survivor;
+  console.error(
+    conversationUrlOk(url)
+      ? `memo-revoked: the remembered conversation for "${m}" was rejected as another run's (${url}); rescanning candidates`
+      : `memo-revoked: the remembered conversation for "${m}" is not a conversation id (${url}); rescanning candidates`,
+  );
+  if (survivor) return survivor;
   // v0.42 review finding #2: forgetUrl only restores a genuine memo republished DURING its
   // claim rename (the file existed as `f` again by the time forgetUrl read `claim`). A memo
   // republished in the window between that rename and the unlink of `claim` lands back at `f`
   // unheld and unseen by forgetUrl, so re-read `f` once more here to close it before giving up.
   let value = '';
-  try { value = fs.readFileSync(f, 'utf8').trim(); } catch { return null; }
-  if (conversationUrlOk(value)) {
-    console.error(`memo-republished: a genuine conversation for "${m}" was published while the placeholder was being revoked; using ${value}`);
+  try {
+    value = memoBytes(f).trim();
+  } catch (error) {
+    if (error.code !== 'ENOENT') unresolvedMemos.add(m);
+    return null;
+  }
+  if (memoVerdict(m, value) === 'trusted') {
+    console.error(
+      `memo-republished: a genuine conversation for "${m}" was published while the placeholder was being revoked; using ${value}`,
+    );
     return value;
   }
   return null;
@@ -292,8 +588,12 @@ function recallTitle(m) {
   if (!f) return null;
   try {
     const title = fs.readFileSync(f, 'utf8').replace(/\n$/, '');
-    return title && title.length <= 200 && !/[\r\n\0]/.test(title) ? title : null;
-  } catch { return null; }
+    return title && title.length <= 200 && !/[\r\n\0]/.test(title)
+      ? title
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 // #67: drop a memo proven to point at another run's conversation. CLAIM-and-verify, not
@@ -309,37 +609,50 @@ function recallTitle(m) {
 // the final miss that retires the reservation.
 // A legacy round's memo can be its only review record (legacyReviewBinding), and a probe never
 // flushes the cross-bind sidecar that would otherwise stand in for it. So forgetUrl() claims
-// such a memo by renaming it straight into a receipt of its own in LEGACY_RECEIPT_DIR, which only
-// the runtime's replacement-spend refusal reads (pg_run_left_review_record). The claimed inode,
+// such a memo by renaming it into an unresolved receipt in LEGACY_RECEIPT_DIR. Ordinary recall
+// recovers unresolved claims; resolved receipts serve the replacement-spend refusal. The claimed inode,
 // with its mtime, is exactly what the receipt keeps (the 14-day sweep expires it on the memo's
 // clock); there is no moment when neither exists; and no revocation ever replaces another's
 // receipt (pro-gate #227 rounds 3-5). Mirrors the shell's pg_legacy_review_receipt_path.
 // Returns the receipt path, null for a marker without a legacy binding, or false when a legacy
 // memo cannot be receipted, in which case the caller keeps the memo.
-let legacyReceiptSeq = 0;
-function legacyReceiptPath(m) {
+function legacyReceiptPath(m, url) {
   if (!legacyReviewBinding(m)) return null;
-  try { fs.mkdirSync(LEGACY_RECEIPT_DIR, { recursive: true }); } catch { return false; }
-  return path.join(LEGACY_RECEIPT_DIR, `${m}.${process.pid}.${Date.now()}.${++legacyReceiptSeq}`);
+  try {
+    fs.mkdirSync(LEGACY_RECEIPT_DIR, { recursive: true });
+  } catch {
+    return false;
+  }
+  return path.join(LEGACY_RECEIPT_DIR, memoClaimName(m, url));
 }
 
 function forgetUrl(m, url) {
   const f = memoPath(m);
   if (!f) return null;
-  const receipt = legacyReceiptPath(m);
-  if (receipt === false) return null;
-  const claim = receipt ?? `${f}.rej.${process.pid}`;
-  try { fs.renameSync(f, claim); } catch { return null; }   // nothing to claim: someone else won
-  let held = '';
-  try { held = fs.readFileSync(claim, 'utf8').trim(); } catch {}
-  let survivor = null;
-  if (held && held !== url) {
-    try { fs.linkSync(claim, f); survivor = held; } catch {}  // genuine memo republished: put it back
+  const receipt = legacyReceiptPath(m, url);
+  if (receipt === false) {
+    unresolvedMemos.add(m);
+    return null;
   }
-  // A legacy receipt stays even once a memo is back: that memo can be an older generation another
-  // revoker restored, and only the 14-day sweep expires a receipt (pro-gate #227 round 6).
-  if (!receipt) { try { fs.unlinkSync(claim); } catch {} }
-  return survivor;
+  const claim = receipt ?? path.join(URL_MEMO_DIR, memoClaimName(m, url));
+  try {
+    fs.renameSync(f, claim);
+  } catch (error) {
+    if (error.code !== 'ENOENT') unresolvedMemos.add(m);
+    return null;
+  }
+  // The claim's name now carries this conviction, so it is recovered like any sibling: its
+  // bytes are rejected or restored, and it is resolved only once the blacklist records the URL.
+  recoverMemoClaims(m);
+  // Publication after the rename is a separate generation. Never overwrite it, and keep
+  // using it in this invocation instead of reporting absence after a successful rejection.
+  try {
+    const current = memoBytes(f).trim();
+    return current !== url && memoVerdict(m, current) === 'trusted' ? current : null;
+  } catch (error) {
+    if (error.code !== 'ENOENT') unresolvedMemos.add(m);
+    return null;
+  }
 }
 
 // #68 gate r3 P2: cross-bind convictions are ACCUMULATED per candidate URL and only persisted
@@ -443,14 +756,15 @@ process.on('exit', () => {
   flushCrossBind(marker);
 });
 
-function legacyReviewBinding(m) {
+// `unreadable` answers for a binding that exists but cannot be read or parsed: it may be legacy.
+function legacyReviewBinding(m, unreadable = false) {
   try {
     const { evidence } = JSON.parse(fs.readFileSync(path.join(INPUT_BINDING_DIR, m), 'utf8'));
     const proof = evidence?.proof;
     return (evidence?.mode === 'full-pr' || evidence?.mode === 'scoped-delta')
       && proof !== null && typeof proof === 'object' && !Array.isArray(proof)
       && !Object.hasOwn(proof, 'pr_metadata_digest');
-  } catch { return false; }
+  } catch (error) { return error?.code !== 'ENOENT' && unreadable; }
 }
 
 function rememberUrl(m, url) {
@@ -461,11 +775,13 @@ function rememberUrl(m, url) {
     // rather than silently dropping it. Non-conversation URLs (the root page, a login wall) stay
     // silent exactly as before.
     if (/^https:\/\/chatgpt\.com\/c\//.test(url || '')) {
-      console.error(`memo-rejected: not remembering ${url} for "${m}": its conversation id is not letters, digits, and dashes`);
+      console.error(
+        `memo-rejected: not remembering ${url} for "${m}": its conversation id is not letters, digits, and dashes`,
+      );
     }
     return;
   }
-  if (recallUrl(m) === url) return;     // already known: no churn, no prune
+  if (recallUrl(m) === url) return; // already known: no churn, no prune
   try {
     fs.mkdirSync(URL_MEMO_DIR, { recursive: true });
     // Atomic publish (gate #54 r7): an in-place writeFileSync truncates first, so the shell's
@@ -484,15 +800,35 @@ function rememberUrl(m, url) {
       // never removed. A missing in-progress/ directory protects nothing (fail-open to the
       // pre-existing behavior). One existsSync per candidate, and only because the cap is
       // already known to be exceeded. A legacy binding's memo is protected the same way
-      // (INPUT_BINDING_DIR above); the 14-day sweep still expires it.
+      // (INPUT_BINDING_DIR above), as is one whose binding exists but cannot be read; canonical
+      // legacy memos retain their 14-day horizon, while unresolved claims keep ownership
+      // protection until resolved.
       const unprotected = entries
-        .filter((n) => { try { return !fs.existsSync(path.join(RESERVATION_DIR, n)) && !legacyReviewBinding(n); } catch { return true; } })
-        .map((n) => { try { return { n, t: fs.statSync(path.join(URL_MEMO_DIR, n)).mtimeMs }; } catch { return { n, t: 0 }; } })
+        .filter((n) => {
+          try {
+            const owner = memoClaimMarker(n);
+            return (
+              !fs.existsSync(path.join(RESERVATION_DIR, owner)) &&
+              !legacyReviewBinding(owner, true)
+            );
+          } catch {
+            return false;
+          }
+        })
+        .map((n) => {
+          try {
+            return { n, t: fs.statSync(path.join(URL_MEMO_DIR, n)).mtimeMs };
+          } catch {
+            return { n, t: 0 };
+          }
+        })
         .sort((a, b) => b.t - a.t);
       if (unprotected.length > MEMO_KEEP) {
-        unprotected
-          .slice(MEMO_KEEP)
-          .forEach(({ n }) => { try { fs.unlinkSync(path.join(URL_MEMO_DIR, n)); } catch {} });
+        unprotected.slice(MEMO_KEEP).forEach(({ n }) => {
+          try {
+            fs.unlinkSync(path.join(URL_MEMO_DIR, n));
+          } catch {}
+        });
       }
     }
   } catch {}
@@ -1706,6 +2042,7 @@ async function organizeConversation() {
   } else {
     const recoveryUrl = acceptedUrl ?? (candidateUrls.length === 0 ? rememberedUrl : null);
     if (!recoveryUrl) {
+      if (memoUnresolved(marker)) return { ...result, reason: 'memo-unresolved' };
       // #208 gate r2 P1: this scan found no owned target anywhere (no open owned tab, no usable
       // remembered URL) — the organizer's analog of the main scan's confirmed-absent exit 4. If
       // an unowned throttle surface not proven foreign was also observed this scan (the walk
@@ -1998,11 +2335,14 @@ async function revalidateReadableStaleSource(url) {
 function discardForeignUrl(url) {
   if (url === knownUrl) {
     ourUrls.delete(url);
+    // Publish conviction before exposing the claim to another process's ordinary recall.
+    blacklist(url);
     const survivor = forgetUrl(marker, url);
     knownUrl = survivor;
     memoStale = !survivor;
+  } else {
+    blacklist(url);
   }
-  blacklist(url);
 }
 
 function rejectForeign(url, source) {
@@ -2358,6 +2698,11 @@ if (!lastListOk) {
   // reservation and retry instead.
   console.error(`inconclusive: the last CDP tab list failed (${listFailures} consecutive) within ${timeoutSecs}s — browser down or restarting; NOT evidence the conversation is gone`);
   console.error('evidence-kind: browser-down');
+  process.exit(7);
+}
+if (memoUnresolved(marker)) {
+  console.error(`inconclusive: remembered conversation bytes for "${marker}" remain unresolved — NOT evidence it is gone`);
+  console.error('evidence-kind: inconclusive');
   process.exit(7);
 }
 if (knownUrl && !memoStale) {
