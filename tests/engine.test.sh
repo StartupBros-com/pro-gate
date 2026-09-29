@@ -7956,6 +7956,23 @@ PRO_GATE_HOME="$DC_HOME" pg_delivery_condition_record github.com acme dc 5 "$DC_
 check '#204: a sent attempt between two no-sends breaks the run even when the condition matches' \
   "$(jq -e '.consecutive==1' <<<"$(PRO_GATE_HOME="$DC_HOME" pg_delivery_condition_read "$DC_M5")" >/dev/null 2>&1; echo $?)" \
   "$(PRO_GATE_HOME="$DC_HOME" pg_delivery_condition_read "$DC_M5" 2>&1)"
+# #246: --status tells a no-conversation attempt that kept its round (v1) from one whose round was
+# refunded because it counted as a failed delivery (v2 with known evidence).
+NCS_EPOCH=$(( $(date +%s) - 100 )); NCS_KEY='acme-ncs-7'; NCS_M="pg-run-acme-ncs-7-$NCS_EPOCH-1"
+NCS_DELIVERY="$(jq -cn '{condition:{attachments:"auto",input:"bundle",oracle:"1.0",relation:("relation:" + ("a" * 64))},consecutive:1,state:"known"}')"
+for NCS_V in 1 2; do
+  NCS_HOME="$TDIR/home-noconv-status-$NCS_V"; mkdir -p "$NCS_HOME"
+  NCS_ARG=""; [ "$NCS_V" = 1 ] || NCS_ARG="$NCS_DELIVERY"
+  PRO_GATE_HOME="$NCS_HOME" pg_attempt_disposition_write github.com acme ncs 7 "$NCS_KEY" "$NCS_M" "$NCS_EPOCH" \
+    recovery-exhausted no-conversation-after-send "$NCS_ARG"
+  PRO_GATE_HOME="$NCS_HOME" bash "$ENGINE" --status 7 --json > "$TDIR/ncs-$NCS_V.json" 2>/dev/null
+done
+check '#246 --status: a no-conversation attempt that kept its round says it remains charged' \
+  "$(jq -e '.next_step|test("ended recovery-exhausted; its round remains charged")' "$TDIR/ncs-1.json" >/dev/null 2>&1; echo $?)" \
+  "$(jq -c .next_step "$TDIR/ncs-1.json" 2>&1)"
+check '#246 --status: a refunded no-conversation attempt says its round was refunded as a failed delivery' \
+  "$(jq -e '.next_step|test("round was refunded and it counts as a failed delivery")' "$TDIR/ncs-2.json" >/dev/null 2>&1; echo $?)" \
+  "$(jq -c .next_step "$TDIR/ncs-2.json" 2>&1)"
 # #204 gate r1: at refund time the current attempt owns the change's newest run-meta and a live
 # reservation. Excluding it must not hide an older attempt that was sent and later superseded.
 DC2_HOME="$TDIR/home-delivery-condition-sent"; mkdir -p "$DC2_HOME"

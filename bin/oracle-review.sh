@@ -1649,6 +1649,8 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
           ST_ATTEMPT_HINT="terminal attempt cleanup is pending for $st_marker — re-run the same typed pro-gate request; cleanup finishes before any new charge"
         elif [ "$st_terminal" = not-submitted ]; then
           ST_ATTEMPT_HINT="the prior attempt was proven not submitted and its round was refunded — a fresh typed pro-gate review is eligible"
+        elif pg_attempt_disposition_refunds_round "$(jq -cS .terminal <<<"$ST_ATTEMPT_JSON")"; then
+          ST_ATTEMPT_HINT="the prior attempt's send produced no ChatGPT conversation; its round was refunded and it counts as a failed delivery — re-query the typed pro-gate decision (two failed deliveries in a row under the same conditions stop it)"
         else
           ST_ATTEMPT_HINT="the prior attempt ended $st_terminal; its round remains charged but no review is recoverable — a fresh typed pro-gate review is eligible"
         fi
@@ -2286,7 +2288,7 @@ pg_fresh_dispatch_release_no_conversation() {
     "$ROUND_KEY" "$RUN_MARKER" "$RUN_SPEND_EPOCH" recovery-exhausted no-conversation-after-send "$delivery" || return 1
   if [ -n "$delivery" ]; then
     PG_NO_CONVERSATION_REFUNDED=1
-    echo "[oracle-review] Oracle's send produced no ChatGPT conversation and the final scan found none: recovery released, round refunded, counted as failed delivery $(jq -r .consecutive <<<"$delivery") under unchanged conditions." >&2
+    echo "[oracle-review] Oracle's send produced no ChatGPT conversation and the final scan found none: recovery released, round refunded, counted as failed delivery $(jq -r .consecutive <<<"$delivery") in a row under these conditions." >&2
     FAIL_DETAIL="send produced no ChatGPT conversation; recovery released, round refunded, counted as a failed delivery — safe to re-query the review decision"
   else
     echo "[oracle-review] Oracle's send produced no ChatGPT conversation and the final scan found none: recovery released, round retained (delivery evidence unavailable)." >&2
