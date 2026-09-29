@@ -3537,7 +3537,7 @@ pg_provenance_reject() {  # <marker> [matched-url]
       # failed reads likewise leave a discoverable claim for the next ordinary salvage.
       # Without a blacklist line, the claim's name is the conviction's only durable record,
       # whatever it holds: another claim may still hold the URL. Ordinary recall resolves it
-      # once the blacklist records the conviction or no claim can restore that URL.
+      # once the blacklist records the conviction, by URL or by the claim's fingerprint.
       if [ "$settled" -eq 0 ] && [ "$published" -eq 0 ]; then
         pg_memo_claim_resolve "$claim" "$receipt"
       fi
@@ -4370,6 +4370,18 @@ pg_run_left_review_record() { # marker
 pg_review_input_binding_is_legacy() { # binding-json
   jq -e '(.evidence.mode=="full-pr" or .evidence.mode=="scoped-delta") and
     (.evidence.proof|has("pr_metadata_digest")|not)' <<<"$1" >/dev/null
+}
+
+# Housekeeping expires a marker's unresolved claims only once no legacy binding can protect
+# them. A binding that exists but cannot be read or validated may be legacy, so it protects.
+pg_review_input_binding_may_be_legacy() { # marker
+  local dir binding
+  dir="$(pg_review_input_binding_dir)"
+  [ -e "$dir" ] || [ -L "$dir" ] || return 1
+  [ -d "$dir" ] && [ -x "$dir" ] || return 0
+  [ -e "$dir/$1" ] || [ -L "$dir/$1" ] || return 1
+  binding="$(pg_review_input_binding_read "$1" 2>/dev/null)" || return 0
+  pg_review_input_binding_is_legacy "$binding"
 }
 
 # A new round at a legacy binding's head would buy a replacement for that round's review; that

@@ -119,10 +119,11 @@ for (const legacy of [false, true]) {
       assert.equal(f.fresh().recall(marker), held === foreign ? null : genuine);
       assert.equal(f.claims().length, 0);
       assert.equal(fs.existsSync(f.memo), held !== foreign);
-      // Recovery publishes the conviction before removing its last record.
+      // Recovery publishes the conviction before removing its last record: the URL when a
+      // record holds it, otherwise the fingerprint the claim's name carries.
       assert.equal(
         fs.readFileSync(f.blacklist, "utf8"),
-        held === foreign ? `${previous}${marker}\t${foreign}\n` : previous,
+        `${previous}${marker}\t${held === foreign ? foreign : urlDigest(foreign).slice(0, 16)}\n`,
       );
       assert.equal(
         fs.readdirSync(f.dirs.LEGACY_RECEIPT_DIR).length,
@@ -261,7 +262,7 @@ pg_provenance_reject "$3" "$4"
         assert.equal(fs.existsSync(f.memo), held !== foreign);
         assert.equal(
           fs.readFileSync(f.blacklist, "utf8"),
-          held === foreign ? `${previous}${marker}\t${foreign}\n` : previous,
+          `${previous}${marker}\t${held === foreign ? foreign : urlDigest(foreign).slice(0, 16)}\n`,
         );
         assert.equal(
           fs.readdirSync(f.dirs.LEGACY_RECEIPT_DIR).length,
@@ -295,7 +296,11 @@ test("a sibling's conviction blocks restoration and stays until the blacklist re
   assert.equal(f.fresh().recall(marker), null);
   assert.equal(fs.existsSync(f.memo), false);
   assert.equal(f.claims().length, 0);
-  assert.equal(fs.readFileSync(f.blacklist, "utf8"), `${marker}\t${newer}\n`);
+  // No record holds the replaced claim's URL, so its fingerprint is what the blacklist keeps.
+  assert.equal(
+    fs.readFileSync(f.blacklist, "utf8"),
+    `${marker}\t${newer}\n${marker}\t${urlDigest(foreign)}\n`,
+  );
 });
 
 test("an unread sibling keeps a restored claim's unpublished conviction", (t) => {
@@ -314,7 +319,10 @@ test("an unread sibling keeps a restored claim's unpublished conviction", (t) =>
   assert.equal(f.api.unresolved(marker), true);
   assert.equal(f.fresh().recall(marker), genuine);
   assert.equal(f.claims().length, 0);
-  assert.equal(fs.readFileSync(f.blacklist, "utf8"), `${marker}\t${foreign}\n`);
+  assert.equal(
+    fs.readFileSync(f.blacklist, "utf8"),
+    `${marker}\t${foreign}\n${marker}\t${urlDigest(newer)}\n`,
+  );
 });
 
 test("the longest runtime marker is claimed within the filename limit", (t) => {
@@ -341,13 +349,16 @@ test("the longest runtime marker is claimed within the filename limit", (t) => {
 const boundedClaim = (f, url) =>
   path.join(f.dirs.URL_MEMO_DIR, `${marker}.rej.${urlDigest(url).slice(0, 16)}.${"0".repeat(16)}`);
 
-for (const rejection of ["identical bytes", "hard link", "blacklist only", "unpublished claim"]) {
+for (const rejection of ["identical bytes", "hard link", "blacklist only", "fingerprint only", "unpublished claim"]) {
   test(`recall revokes a remembered URL its marker rejected: ${rejection}`, (t) => {
     const f = fixture(t);
     // A concurrent writer republished the URL an interrupted revocation had convicted.
+    const fingerprint =
+      rejection === "fingerprint only" ? `${marker}\t${urlDigest(foreign).slice(0, 16)}\n` : "";
     fs.writeFileSync(f.memo, foreign);
     if (rejection === "hard link") fs.linkSync(f.memo, boundedClaim(f, foreign));
     else if (rejection === "blacklist only") fs.writeFileSync(f.blacklist, `${marker}\t${foreign}\n`);
+    else if (fingerprint) fs.writeFileSync(f.blacklist, fingerprint);
     else fs.writeFileSync(boundedClaim(f, foreign), foreign);
     if (rejection === "unpublished claim")
       f.proxy.appendFileSync = () => {
@@ -361,7 +372,7 @@ for (const rejection of ["identical bytes", "hard link", "blacklist only", "unpu
     }
     assert.equal(f.fresh().recall(marker), null);
     assert.equal(f.claims().length, 0);
-    assert.equal(fs.readFileSync(f.blacklist, "utf8"), `${marker}\t${foreign}\n`);
+    assert.equal(fs.readFileSync(f.blacklist, "utf8"), `${fingerprint}${marker}\t${foreign}\n`);
   });
 }
 
@@ -390,6 +401,35 @@ for (const append of ["published", "unpublished"]) {
     );
   });
 }
+
+test("a claim published after recovery's listing keeps the rejection a resolved claim named", (t) => {
+  const f = fixture(t);
+  // The listed claim rejects the canonical URL but holds one already blacklisted. After the
+  // listing, a revocation of another URL publishes its line, claims the canonical memo and stops.
+  const bystander = "https://chatgpt.com/c/bystander";
+  const late = path.join(
+    f.dirs.URL_MEMO_DIR,
+    `${marker}.rej.${urlDigest(bystander).slice(0, 16)}.${"1".repeat(16)}`,
+  );
+  fs.writeFileSync(f.memo, foreign);
+  fs.writeFileSync(boundedClaim(f, foreign), newer);
+  fs.writeFileSync(f.blacklist, `${marker}\t${newer}\n`);
+  let raced = false;
+  f.proxy.readdirSync = (dir, ...args) => {
+    const names = fs.readdirSync(dir, ...args);
+    if (!raced && dir === f.dirs.URL_MEMO_DIR) {
+      raced = true;
+      fs.appendFileSync(f.blacklist, `${marker}\t${bystander}\n`);
+      fs.renameSync(f.memo, late);
+    }
+    return names;
+  };
+  assert.equal(f.api.recall(marker), null);
+  assert.equal(f.fresh().recall(marker), null);
+  assert.equal(fs.existsSync(f.memo), false);
+  assert.equal(f.claims().length, 0);
+  assert.ok(fs.readFileSync(f.blacklist, "utf8").includes(`${marker}\t${foreign}\n`));
+});
 
 test("an unreadable canonical memo keeps a claim whose rejection no read bytes hold", (t) => {
   const f = fixture(t);
@@ -502,7 +542,7 @@ test("a restoration keeps an unpublished conviction that a sibling claim still h
   assert.equal(f.claims().length, 0);
   assert.deepEqual(
     fs.readFileSync(f.blacklist, "utf8").split("\n").filter(Boolean).sort(),
-    [`${marker}\t${foreign}`, `${marker}\t${genuine}`].sort(),
+    [`${marker}\t${foreign}`, `${marker}\t${genuine}`, `${marker}\t${urlDigest(newer)}`].sort(),
   );
 });
 
@@ -731,6 +771,26 @@ test("count pruning protects owned claims and canonical markers containing .rej.
   assert.equal(fs.readFileSync(claim, "utf8"), genuine);
   assert.equal(fs.readFileSync(canonical, "utf8"), genuine);
   assert.equal(fs.readFileSync(`${canonical}.rej.old`, "utf8"), genuine);
+  assert.equal(fs.existsSync(unowned), false);
+});
+
+test("count pruning keeps a claim whose binding exists but cannot be read", (t) => {
+  const f = fixture(t, { legacy: true });
+  const binding = path.join(f.dirs.INPUT_BINDING_DIR, marker);
+  const claim = `${f.memo}.rej.old`;
+  const unowned = path.join(f.dirs.URL_MEMO_DIR, "pg-run-unowned-1700000000-2.rej.old");
+  for (const file of [claim, unowned]) {
+    fs.writeFileSync(file, genuine);
+    fs.utimesSync(file, new Date(0), new Date(0));
+  }
+  for (let i = 0; i < 205; i++)
+    fs.writeFileSync(path.join(f.dirs.URL_MEMO_DIR, `pg-run-count-${i}-1`), foreign);
+  f.proxy.readFileSync = (file, ...args) => {
+    if (file === binding) throw fail();
+    return fs.readFileSync(file, ...args);
+  };
+  f.api.remember("pg-run-new-count-1700000000-2", newer);
+  assert.equal(fs.readFileSync(claim, "utf8"), genuine);
   assert.equal(fs.existsSync(unowned), false);
 });
 

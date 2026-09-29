@@ -3625,8 +3625,7 @@ find "$PRO_GATE_HOME/conversation-urls" -maxdepth 1 -type f -mmin +20160 -print 
       _pg_memo_marker="$(pg_memo_claim_marker "$_pg_memo")" || continue
       [ -e "$_pg_res_dir/$_pg_memo_marker" ] && continue
       if [ "${_pg_memo##*/}" != "$_pg_memo_marker" ]; then
-        _pg_memo_binding="$(pg_review_input_binding_read "$_pg_memo_marker" 2>/dev/null || true)"
-        [ -z "$_pg_memo_binding" ] || ! pg_review_input_binding_is_legacy "$_pg_memo_binding" || continue
+        pg_review_input_binding_may_be_legacy "$_pg_memo_marker" && continue
       fi
       rm -f "$_pg_memo" 2>/dev/null || true
     done
@@ -3642,15 +3641,15 @@ find "$PRO_GATE_HOME/crossbound" -maxdepth 1 -type f -mmin +20160 -delete 2>/dev
 # A revoked legacy memo's receipt (pg_legacy_review_receipt_path) is the memo itself, renamed
 # with its mtime, so resolved receipts retain the same 14-day horizon for the legacy
 # replacement-spend refusal. An unresolved claim retains reservation protection by its
-# original marker or a legacy binding; unowned claims and resolved receipts keep the age horizon.
+# original marker or a legacy binding, including one that cannot be read; unowned claims and
+# resolved receipts keep the age horizon.
 find "$PRO_GATE_HOME/legacy-review-receipts" -maxdepth 1 -type f -mmin +20160 -print 2>/dev/null \
   | while IFS= read -r _pg_receipt; do
       case "$_pg_receipt" in *.rej.*)
         _pg_memo_marker="$(pg_memo_claim_marker "$_pg_receipt")" || continue
         if [ "${_pg_receipt##*/}" != "$_pg_memo_marker" ]; then
           [ -e "$_pg_res_dir/$_pg_memo_marker" ] && continue
-          _pg_memo_binding="$(pg_review_input_binding_read "$_pg_memo_marker" 2>/dev/null || true)"
-          [ -z "$_pg_memo_binding" ] || ! pg_review_input_binding_is_legacy "$_pg_memo_binding" || continue
+          pg_review_input_binding_may_be_legacy "$_pg_memo_marker" && continue
         fi;;
       esac
       rm -f "$_pg_receipt" 2>/dev/null || true

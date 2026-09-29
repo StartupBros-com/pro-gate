@@ -278,6 +278,16 @@ touch -t 200001010000 "$PRO_GATE_HOME/legacy-review-receipts/$MARKER.rej.pending
 . "$TDIR/memo-sweep.sh"
 check 'legacy binding preserves unresolved recovery bytes without a reservation' \
   "$([ -f "$PRO_GATE_HOME/legacy-review-receipts/$MARKER.rej.pending" ]; echo $?)"
+# A binding that exists but cannot be read may be legacy, so neither sweep expires its claims.
+seed unreadable-binding-sweep legacy
+cp "$MEMO" "$MEMO.rej.pending"
+mv "$MEMO" "$PRO_GATE_HOME/legacy-review-receipts/$MARKER.rej.pending"
+touch -t 200001010000 "$MEMO.rej.pending" "$PRO_GATE_HOME/legacy-review-receipts/$MARKER.rej.pending"
+cat() { case "${1:-}" in */review-input-bindings/*) return 1;; esac; command cat "$@"; }
+. "$TDIR/memo-sweep.sh"
+unset -f cat
+check 'an unreadable binding preserves unresolved current and legacy claims' \
+  "$([ -f "$MEMO.rej.pending" ] && [ -f "$PRO_GATE_HOME/legacy-review-receipts/$MARKER.rej.pending" ]; echo $?)"
 
 # Without a blacklist line, the claim is the conviction's only durable record.
 seed unpublished-conviction current

@@ -310,10 +310,12 @@ function memoClaimName(m, url) {
   return `${m}.rej.${digest}.${randomUUID().replaceAll('-', '').slice(0, 16)}`;
 }
 
+const MEMO_DIGEST_RE = /^(?:[0-9a-f]{16}|[0-9a-f]{64})$/;
+
 function memoClaimDigest(claim) {
   const name = path.basename(claim);
   const digest = name.slice(name.lastIndexOf('.rej.') + 5).split('.')[0];
-  return /^(?:[0-9a-f]{16}|[0-9a-f]{64})$/.test(digest) ? digest : null;
+  return MEMO_DIGEST_RE.test(digest) ? digest : null;
 }
 
 // A claim name records the URL its rejecting process convicted, whichever claim holds it.
@@ -325,12 +327,39 @@ function memoClaimConvicts(claim, url) {
   );
 }
 
+// A blacklist line holds a rejected URL or, when no record held that URL, the fingerprint of
+// the claim that convicted it. Older readers match no URL against a fingerprint line.
+function memoBlacklisted(rejected, url) {
+  if (rejected.has(url)) return true;
+  const digest = createHash('sha256').update(url).digest('hex');
+  return [...rejected].some((entry) => MEMO_DIGEST_RE.test(entry) && digest.startsWith(entry));
+}
+
 // Until the blacklist records a conviction, a claim naming it is its only durable record.
 function memoRejectionPublished(m, url, rejected) {
   if (!conversationUrlOk(url) || rejected.has(url)) return true;
   try {
     fs.appendFileSync(BLACKLIST_FILE, `${m}\t${url}\n`);
     rejected.add(url);
+    return true;
+  } catch {
+    unresolvedMemos.add(m);
+    return false;
+  }
+}
+
+// A claim whose convicted URL no readable record holds publishes its fingerprint instead:
+// another writer may publish that URL after any listing, and it must stay rejected.
+function memoConvictionPublished(m, claim, rejected) {
+  const digest = memoClaimDigest(claim);
+  const covered = (entry) =>
+    MEMO_DIGEST_RE.test(entry)
+      ? digest.startsWith(entry)
+      : createHash('sha256').update(entry).digest('hex').startsWith(digest);
+  if (digest === null || [...rejected].some(covered)) return true;
+  try {
+    fs.appendFileSync(BLACKLIST_FILE, `${m}\t${digest}\n`);
+    rejected.add(digest);
     return true;
   } catch {
     unresolvedMemos.add(m);
@@ -432,19 +461,19 @@ function recoverMemoClaims(m) {
     }
   }
   // Every claim's conviction applies to all of them, so processing order cannot restore a
-  // URL a sibling rejected. A claim is resolved only once its own conviction is durable: the
-  // blacklist holds every URL it names that a claim or the canonical memo holds, or none does
-  // and nothing went unread.
+  // URL a sibling rejected. A claim is resolved only once the blacklist records its own
+  // conviction: every URL it names that a claim or the canonical memo holds, or, when none
+  // does and nothing went unread, its fingerprint.
   const foreign = (url) =>
     !conversationUrlOk(url) ||
-    rejected.has(url) ||
+    memoBlacklisted(rejected, url) ||
     claims.some((claim) => memoClaimConvicts(claim, url));
   const durable = (claim) => {
     if (memoClaimDigest(claim) === null) return true;
     const named = seen.filter((url) => memoClaimConvicts(claim, url));
     return named.length
       ? named.every((url) => !conversationUrlOk(url) || rejected.has(url))
-      : !unseen;
+      : !unseen && memoConvictionPublished(m, claim, rejected);
   };
   const settled = [];
   for (const [claim, url] of held) {
@@ -498,7 +527,10 @@ function memoVerdict(m, url) {
   if (!conversationUrlOk(url)) return 'rejected';
   const rejected = memoBlacklist(m);
   const { claims, complete } = memoClaimListing(m);
-  if (rejected?.has(url) || claims.some((claim) => memoClaimConvicts(claim, url)))
+  if (
+    (rejected && memoBlacklisted(rejected, url)) ||
+    claims.some((claim) => memoClaimConvicts(claim, url))
+  )
     return 'rejected';
   return rejected && complete ? 'trusted' : 'uncertain';
 }
@@ -610,7 +642,7 @@ function forgetUrl(m, url) {
     return null;
   }
   // The claim's name now carries this conviction, so it is recovered like any sibling: its
-  // bytes are rejected or restored, and it is resolved only once no claim can restore the URL.
+  // bytes are rejected or restored, and it is resolved only once the blacklist records the URL.
   recoverMemoClaims(m);
   // Publication after the rename is a separate generation. Never overwrite it, and keep
   // using it in this invocation instead of reporting absence after a successful rejection.
@@ -724,14 +756,15 @@ process.on('exit', () => {
   flushCrossBind(marker);
 });
 
-function legacyReviewBinding(m) {
+// `unreadable` answers for a binding that exists but cannot be read or parsed: it may be legacy.
+function legacyReviewBinding(m, unreadable = false) {
   try {
     const { evidence } = JSON.parse(fs.readFileSync(path.join(INPUT_BINDING_DIR, m), 'utf8'));
     const proof = evidence?.proof;
     return (evidence?.mode === 'full-pr' || evidence?.mode === 'scoped-delta')
       && proof !== null && typeof proof === 'object' && !Array.isArray(proof)
       && !Object.hasOwn(proof, 'pr_metadata_digest');
-  } catch { return false; }
+  } catch (error) { return error?.code !== 'ENOENT' && unreadable; }
 }
 
 function rememberUrl(m, url) {
@@ -767,15 +800,16 @@ function rememberUrl(m, url) {
       // never removed. A missing in-progress/ directory protects nothing (fail-open to the
       // pre-existing behavior). One existsSync per candidate, and only because the cap is
       // already known to be exceeded. A legacy binding's memo is protected the same way
-      // (INPUT_BINDING_DIR above); canonical legacy memos retain their 14-day horizon,
-      // while unresolved claims keep ownership protection until resolved.
+      // (INPUT_BINDING_DIR above), as is one whose binding exists but cannot be read; canonical
+      // legacy memos retain their 14-day horizon, while unresolved claims keep ownership
+      // protection until resolved.
       const unprotected = entries
         .filter((n) => {
           try {
             const owner = memoClaimMarker(n);
             return (
               !fs.existsSync(path.join(RESERVATION_DIR, owner)) &&
-              !legacyReviewBinding(owner)
+              !legacyReviewBinding(owner, true)
             );
           } catch {
             return false;
