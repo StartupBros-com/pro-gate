@@ -160,4 +160,97 @@ grep -q 'staged as a draft with complete assets' "$ROOT/.github/workflows/auto-r
   || fail 'auto-release must report a staged draft as expected, not incomplete'
 pass 'auto-release reports a staged draft as expected state'
 
+# #254: release.yml no longer reruns the suites; it requires the default-branch push CI run for the
+# tagged commit to have passed. Each fake `gh api` call returns the next scripted response.
+GATE="$ROOT/scripts/require-trusted-ci.sh"
+GATE_SHA=0123456789abcdef0123456789abcdef01234567
+mkdir -p "$TMP/gate-bin"
+cat > "$TMP/gate-bin/gh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$GATE_LOG"
+n=$(( $(wc -l < "$GATE_LOG") ))
+[ -f "$GATE_SEQ/$n.json" ] || n="$(ls "$GATE_SEQ" | sed -n 's/\.json$//p' | sort -n | tail -1)"
+cat "$GATE_SEQ/$n.json"
+exit "$(cat "$GATE_SEQ/$n.rc" 2>/dev/null || echo 0)"
+EOF
+chmod +x "$TMP/gate-bin/gh"
+gate_run_json() { # id status conclusion [event] [branch] [sha]
+  printf '{"id":%s,"status":"%s","conclusion":%s,"event":"%s","head_branch":"%s","head_sha":"%s","html_url":"https://example.test/runs/%s"}' \
+    "$1" "$2" "$3" "${4:-push}" "${5:-main}" "${6:-$GATE_SHA}" "$1"
+}
+gate_case() { # name, then one response per call: either a runs array body or "!fail"
+  local name="$1" i=0 body; shift
+  rm -rf "$TMP/gate-$name"; mkdir -p "$TMP/gate-$name/seq"; : > "$TMP/gate-$name/log"
+  for body in "$@"; do
+    i=$((i + 1))
+    if [ "$body" = '!fail' ]; then printf '{"message":"Server Error"}' > "$TMP/gate-$name/seq/$i.json"; echo 1 > "$TMP/gate-$name/seq/$i.rc"
+    else printf '{"total_count":0,"workflow_runs":[%s]}' "$body" > "$TMP/gate-$name/seq/$i.json"; fi
+  done
+}
+gate_exec() { # name [sha]; sets GATE_RC and GATE_OUT
+  GATE_OUT="$(PATH="$TMP/gate-bin:$PATH" GATE_LOG="$TMP/gate-$1/log" GATE_SEQ="$TMP/gate-$1/seq" \
+    PRO_GATE_RELEASE_CI_POLL_SECS=0 PRO_GATE_RELEASE_CI_FIND_SECS=0 PRO_GATE_RELEASE_CI_WAIT_SECS=5 \
+    "$GATE" owner/repo "${2:-$GATE_SHA}" main 2>&1)" && GATE_RC=0 || GATE_RC=$?
+}
+
+gate_case pass "$(gate_run_json 7 completed '"success"')"
+gate_exec pass
+[ "$GATE_RC" = 0 ] && grep -q 'CI passed' <<<"$GATE_OUT" || fail "release gate accepts a passed push run: rc=$GATE_RC $GATE_OUT"
+grep -qxF "api repos/owner/repo/actions/workflows/ci.yml/runs?head_sha=$GATE_SHA&event=push&branch=main&per_page=20" "$TMP/gate-pass/log" \
+  || fail "release gate must query push runs of ci.yml for the exact commit: $(cat "$TMP/gate-pass/log")"
+pass 'release gate accepts a passed push CI run for the exact commit'
+
+gate_case failed "$(gate_run_json 7 completed '"failure"')"
+gate_exec failed
+[ "$GATE_RC" = 1 ] && grep -q 'concluded failure' <<<"$GATE_OUT" || fail "release gate refuses a failed run: rc=$GATE_RC $GATE_OUT"
+pass 'release gate refuses a failed CI run'
+
+gate_case newest "$(gate_run_json 7 completed '"success"'),$(gate_run_json 9 completed '"cancelled"')"
+gate_exec newest
+[ "$GATE_RC" = 1 ] && grep -q 'concluded cancelled' <<<"$GATE_OUT" || fail "release gate reads the newest run: rc=$GATE_RC $GATE_OUT"
+pass 'release gate judges the newest run, not an older pass'
+
+gate_case waits "$(gate_run_json 7 in_progress null)" '!fail' "$(gate_run_json 7 completed '"success"')"
+gate_exec waits
+[ "$GATE_RC" = 0 ] && grep -q 'waiting for CI' <<<"$GATE_OUT" && [ "$(wc -l < "$TMP/gate-waits/log")" = 3 ] \
+  || fail "release gate waits through an in-progress run and a failed read: rc=$GATE_RC calls=$(wc -l < "$TMP/gate-waits/log") $GATE_OUT"
+pass 'release gate waits for an in-progress run and treats a failed read as no evidence'
+
+gate_case stuck "$(gate_run_json 7 in_progress null)"
+GATE_STUCK_START=$SECONDS
+PATH="$TMP/gate-bin:$PATH" GATE_LOG="$TMP/gate-stuck/log" GATE_SEQ="$TMP/gate-stuck/seq" \
+  PRO_GATE_RELEASE_CI_POLL_SECS=1 PRO_GATE_RELEASE_CI_FIND_SECS=0 PRO_GATE_RELEASE_CI_WAIT_SECS=2 \
+  "$GATE" owner/repo "$GATE_SHA" main > "$TMP/gate-stuck/out" 2>&1 && GATE_RC=0 || GATE_RC=$?
+[ "$GATE_RC" = 1 ] && grep -q 'still in_progress' "$TMP/gate-stuck/out" && [ $(( SECONDS - GATE_STUCK_START )) -lt 30 ] \
+  || fail "release gate stops at its wait deadline: rc=$GATE_RC $(cat "$TMP/gate-stuck/out")"
+pass 'release gate stops at its wait deadline instead of hanging'
+
+gate_case absent ''
+gate_exec absent
+[ "$GATE_RC" = 1 ] && grep -q 'no readable push CI run' <<<"$GATE_OUT" || fail "release gate refuses a commit without a run: rc=$GATE_RC $GATE_OUT"
+pass 'release gate refuses a commit that has no push CI run'
+
+# Planted negatives: a passing run that is not this commit's push run on the default branch.
+gate_case foreign "$(gate_run_json 3 completed '"success"' pull_request main),$(gate_run_json 4 completed '"success"' push other),$(gate_run_json 5 completed '"success"' push main fedcba9876543210fedcba9876543210fedcba98)"
+gate_exec foreign
+[ "$GATE_RC" = 1 ] && grep -q 'no readable push CI run' <<<"$GATE_OUT" || fail "release gate ignores PR, other-branch and other-commit runs: rc=$GATE_RC $GATE_OUT"
+pass 'release gate ignores a passing pull_request, other-branch or other-commit run'
+
+gate_exec pass 0123456
+[ "$GATE_RC" = 2 ] || fail "release gate requires a full commit id: rc=$GATE_RC $GATE_OUT"
+pass 'release gate requires a full commit id'
+
+# The gate runs in release.yml after the tag identity checks and before anything is packaged.
+REL_STEPS="$(yq '.jobs.release.steps[].name' "$ROOT/.github/workflows/release.yml")"
+gate_step="$(grep -nxF 'Require the default branch CI run to have passed this commit' <<<"$REL_STEPS" | cut -d: -f1)"
+tag_step="$(grep -nxF 'Require the tag to identify this full commit' <<<"$REL_STEPS" | cut -d: -f1)"
+pkg_step="$(grep -nxF 'Package exact runtime release' <<<"$REL_STEPS" | cut -d: -f1)"
+[ -n "$gate_step" ] && [ -n "$tag_step" ] && [ -n "$pkg_step" ] && [ "$tag_step" -lt "$gate_step" ] && [ "$gate_step" -lt "$pkg_step" ] \
+  || fail "release.yml must gate on CI between the tag checks and packaging: $REL_STEPS"
+[ "$(yq '.jobs.release.steps[] | select(.name == "Require the default branch CI run to have passed this commit") | .run' "$ROOT/.github/workflows/release.yml")" \
+  = 'scripts/require-trusted-ci.sh "$GITHUB_REPOSITORY" "$RELEASE_SHA" "$DEFAULT_BRANCH"' ] \
+  || fail 'release.yml must invoke the tested gate'
+[ "$(yq '.permissions.actions' "$ROOT/.github/workflows/release.yml")" = read ] || fail 'the gate needs actions: read'
+pass 'release.yml requires the passed CI run between the tag checks and packaging'
+
 echo 'ALL PASS'

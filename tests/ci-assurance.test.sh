@@ -7,9 +7,41 @@ trap 'rm -rf "$TDIR"' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 helper="$ROOT/scripts/validate-source.sh"
 workflow="$ROOT/.github/workflows/ci.yml"
-[ "$(yq '.jobs.check.steps[] | select(.name == "Validate data and shell files") | .run' "$workflow")" = 'bash scripts/validate-source.sh' ] || fail 'CI must invoke the tested validator'
-test_command="$(yq '.jobs.check.steps[] | select(.name == "Run tests") | .run' "$workflow" | sed -n '/^bash tests\/review-decision-adapters.test.sh$/p')"
+[ "$(yq '.jobs.tests.steps[] | select(.name == "Validate data and shell files") | .run' "$workflow")" = 'bash scripts/validate-source.sh' ] || fail 'CI must invoke the tested validator'
+[ "$(yq '.jobs.tests.steps[] | select(.name == "Run tests") | .run' "$workflow")" = '${{ matrix.tests }}' ] || fail 'each CI leg must run its own test list'
+test_command="$(yq '.jobs.tests.strategy.matrix.include[].tests' "$workflow" | sed -n '/^bash tests\/review-decision-adapters.test.sh$/p')"
 [ "$test_command" = 'bash tests/review-decision-adapters.test.sh' ] || fail 'trusted CI must invoke adapter conformance'
+
+# #254: the suites run as parallel legs. Splitting them must never drop or double a suite, so every
+# tests/*.test.sh and tests/*.test.mjs file must be invoked by exactly one leg, and nothing else.
+leg_coverage() { # workflow file; prints the problem and returns 1 on any gap
+  local wf="$1" invoked expected
+  invoked="$(yq '.jobs.tests.strategy.matrix.include[].tests' "$wf" | grep -v '^---$' | sed '/^$/d' | sort)"
+  expected="$(cd "$ROOT" && for f in tests/*.test.sh; do printf 'bash %s\n' "$f"; done
+              for f in tests/*.test.mjs; do printf 'node --test %s\n' "$f"; done | sort)"
+  [ "$invoked" = "$expected" ] && return 0
+  diff <(printf '%s\n' "$expected") <(printf '%s\n' "$invoked") >&2 || true
+  return 1
+}
+leg_coverage "$workflow" || fail 'every test file must run in exactly one CI leg'
+yq '(.jobs.tests.strategy.matrix.include[] | select(.leg == "rest") | .tests) |= sub("bash tests/round-continue.test.sh\n"; "")' \
+  "$workflow" > "$TDIR/ci-dropped.yml"
+if leg_coverage "$TDIR/ci-dropped.yml" 2>/dev/null; then fail 'planted dropped suite passed the leg coverage check'; fi
+yq '(.jobs.tests.strategy.matrix.include[] | select(.leg == "cdp-salvage") | .tests) += "bash tests/engine.test.sh\n"' \
+  "$workflow" > "$TDIR/ci-doubled.yml"
+if leg_coverage "$TDIR/ci-doubled.yml" 2>/dev/null; then fail 'planted doubled suite passed the leg coverage check'; fi
+echo 'ok - every test file runs in exactly one CI leg; a dropped or doubled suite is rejected'
+
+# The required context stays "trusted check" and passes only when every leg passed. Its guard is
+# the legs' fork guard behind always(), so a failed or cancelled leg still reports a failure.
+[ "$(yq '.jobs.check.name' "$workflow")" = 'trusted check' ] || fail 'the aggregator must report the required context'
+[ "$(yq '.jobs.check.needs' "$workflow")" = 'tests' ] || fail 'the aggregator must wait for every leg'
+[ "$(yq '.jobs.check.if' "$workflow")" = "always() && ($(yq '.jobs.tests.if' "$workflow"))" ] \
+  || fail 'the aggregator must run after failed legs and skip exactly where the legs skip'
+[ "$(yq '.jobs.check.steps[0].env.LEGS_RESULT' "$workflow")" = '${{ needs.tests.result }}' ] \
+  && yq '.jobs.check.steps[0].run' "$workflow" | grep -qx 'test "$LEGS_RESULT" = success' \
+  || fail 'the aggregator must fail unless the legs succeeded'
+echo 'ok - trusted check aggregates every leg and fails unless all of them passed'
 mkdir -p "$TDIR/data/nested space" "$TDIR/data/.git"
 bash "$helper" "$TDIR/data" || fail 'empty set'
 printf '{"ok":true}\n' > "$TDIR/data/nested space/good file.json"

@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 jobs:
   release:
@@ -37,12 +38,19 @@ jobs:
       - name: Validate shell syntax
         run: |
           while IFS= read -r file; do bash -n "$file"; done < <(find . -type f -name '*.sh' -print)
-      - name: Run tests
+      # The push to the default branch already ran every suite on this exact commit (ci.yml). Wait
+      # for that run and require it to have passed, rather than rerunning the slowest suites here
+      # for about 30 minutes (#254). Packaging never starts on a commit CI did not pass.
+      - name: Require the default branch CI run to have passed this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: scripts/require-trusted-ci.sh "$GITHUB_REPOSITORY" "$RELEASE_SHA" "$DEFAULT_BRANCH"
+      - name: Run release suites
         run: |
-          bash tests/engine.test.sh
           bash tests/daemon-reload.test.sh
           bash tests/autoupdate.test.sh
-          node --test tests/cdp-salvage.test.mjs
           bash tests/distribution.test.sh
           bash tests/release-train.test.sh
           bash tests/release-assets.test.sh

@@ -626,7 +626,8 @@ Merging a PR that bumps `VERSION` + `plugin.json` ships it, in two halves — th
 **staged first and published second**, because the marketplace card has to name a release id
 that only exists once the release does:
 
-1. `auto-release.yml` pushes the tag; `release.yml` re-tests, packages and uploads
+1. `auto-release.yml` pushes the tag; `release.yml` waits for the merge's own CI run on
+   `main` to pass for that exact commit, runs the release suites, packages and uploads
    checksummed assets, then leaves the release a **draft** and prints the repin tuple
    (plugin, version, sha, releaseId, releaseTag).
 2. Merge the repin PR against `StartupBros-com/hov-marketplace`. Its hourly **Repin

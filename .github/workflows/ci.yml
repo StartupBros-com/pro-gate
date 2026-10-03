@@ -9,20 +9,51 @@ permissions:
   contents: read
 
 jobs:
-  check:
-    name: trusted check
+  # The suites run as parallel legs, so the slowest leg sets the wall-clock instead of the sum of
+  # all of them (34 minutes serially, #254). Every tests/*.test.* file belongs to exactly one leg;
+  # tests/ci-assurance.test.sh enforces that. The `check` job below reports the one context the
+  # main ruleset requires, "trusted check".
+  tests:
+    name: tests (${{ matrix.leg }})
     if: github.event_name == 'push' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)
     runs-on: ubuntu-24.04
-    # The engine suite carries ~18 minutes of real watchdog/stall waits by design and has
-    # grown to 1777-1800s: the 30-minute cap started cancelling green runs whose tests had
-    # already ALL PASSed (run 32087692674). 45 restores headroom without masking a hang.
+    # The engine suite still carries real watchdog/stall waits by design; the 30-minute cap once
+    # cancelled green runs whose tests had already ALL PASSed (run 32087692674).
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: engine
+            tests: |
+              bash tests/engine.test.sh
+          - leg: cdp-salvage
+            tests: |
+              node --test tests/cdp-salvage.test.mjs
+          - leg: rest
+            tests: |
+              bash tests/ci-assurance.test.sh
+              bash tests/review-decision-adapters.test.sh
+              bash tests/daemon-reload.test.sh
+              bash tests/daemon-current-head-completion.test.sh
+              bash tests/daemon-query-isolation.test.sh
+              bash tests/memo-recovery.test.sh
+              bash tests/round-continue.test.sh
+              bash tests/delivery-disposition.test.sh
+              bash tests/autoupdate.test.sh
+              bash tests/resolve-identity.test.sh
+              bash tests/browser-launch.test.sh
+              node --test tests/memo-recovery.test.mjs
+              bash tests/distribution.test.sh
+              bash tests/release-train.test.sh
+              bash tests/release-assets.test.sh
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
       - name: Provision pinned CI tools
         run: ./scripts/provision-ci-tools.sh
       - name: Validate data and shell files
+        if: matrix.leg == 'rest'
         run: bash scripts/validate-source.sh
       # A version bump IS a release: require its customer copy here, where a human can still
       # fix it (#69 gate r2 P1). Blocking belongs on the PR, never on the release train — that
@@ -31,6 +62,7 @@ jobs:
       # publish-runtime-release.sh silently ships branch names, which is how v0.31.0 and
       # v0.31.1 announced "governor-rounds" and "memo-crossbind".
       - name: Require customer-ready notes for a version bump
+        if: matrix.leg == 'rest'
         run: |
           version="$(tr -d '[:space:]' < VERSION)"
           notes="docs/release-notes/v$version.md"
@@ -44,24 +76,22 @@ jobs:
           fi
           ./scripts/check-release-notes.sh "$notes"
       - name: Run tests
+        run: ${{ matrix.tests }}
+
+  # The required context. It fails unless every leg passed, including when a leg failed, timed
+  # out or was cancelled; on a fork PR both jobs are skipped exactly as the single job was.
+  check:
+    name: trusted check
+    needs: tests
+    if: always() && (github.event_name == 'push' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false))
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every test leg to pass
+        env:
+          LEGS_RESULT: ${{ needs.tests.result }}
         run: |
-          bash tests/ci-assurance.test.sh
-          bash tests/review-decision-adapters.test.sh
-          bash tests/engine.test.sh
-          bash tests/daemon-reload.test.sh
-          bash tests/daemon-current-head-completion.test.sh
-          bash tests/daemon-query-isolation.test.sh
-          bash tests/memo-recovery.test.sh
-          bash tests/round-continue.test.sh
-          bash tests/delivery-disposition.test.sh
-          bash tests/autoupdate.test.sh
-          bash tests/resolve-identity.test.sh
-          bash tests/browser-launch.test.sh
-          node --test tests/cdp-salvage.test.mjs
-          node --test tests/memo-recovery.test.mjs
-          bash tests/distribution.test.sh
-          bash tests/release-train.test.sh
-          bash tests/release-assets.test.sh
+          echo "test legs: $LEGS_RESULT"
+          test "$LEGS_RESULT" = success
 
   public-pr-check:
     name: public PR data check
