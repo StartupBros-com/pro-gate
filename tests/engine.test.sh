@@ -2860,7 +2860,7 @@ chmod +x "$TDIR/bin/oracle-dead"
 RKEY_91="$(printf '%s-91' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
 printf 'foreign idle tab\n' > "$TDIR/tab.txt"
 env PRO_GATE_HOME="$RHOME" ORACLE_HOME_DIR="$RHOME/oracle-dead" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
-  PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 PRO_GATE_STALL_SECS=30 \
+  PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 PRO_GATE_STALL_SECS=30 PRO_GATE_SALVAGE_SECS=2 \
   PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-dead" NODE_OPTIONS= \
   bash "$ENGINE" --pr 91 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$RHOME/o-refund.md" --timeout 5s \
   >"$TDIR/stdout" 2>"$TDIR/stderr"
@@ -2888,7 +2888,7 @@ chmod +x "$TDIR/bin/oracle-landed"
 RKEY_92="$(printf '%s-92' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
 printf 'foreign idle tab\n' > "$TDIR/tab.txt"
 env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
-  PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 PRO_GATE_STALL_SECS=30 \
+  PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 PRO_GATE_STALL_SECS=30 PRO_GATE_SALVAGE_SECS=2 \
   PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-landed" NODE_OPTIONS= \
   bash "$ENGINE" --pr 92 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$RHOME/o-landed.md" --timeout 5s \
   >"$TDIR/stdout" 2>"$TDIR/stderr"
@@ -2931,7 +2931,7 @@ chmod +x "$TDIR/bin/oracle-dead-placeholder"
 RKEY_93="$(printf '%s-93' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
 printf 'foreign idle tab\n' > "$TDIR/tab.txt"
 env PRO_GATE_HOME="$RHOME" ORACLE_HOME_DIR="$RHOME/oracle-dead-ph" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
-  PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 PRO_GATE_STALL_SECS=30 \
+  PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 PRO_GATE_STALL_SECS=30 PRO_GATE_SALVAGE_SECS=2 \
   PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-dead-placeholder" NODE_OPTIONS= \
   bash "$ENGINE" --pr 93 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$RHOME/o-refund-placeholder.md" --timeout 5s \
   >"$TDIR/stdout" 2>"$TDIR/stderr"
@@ -2968,7 +2968,7 @@ chmod +x "$TDIR/bin/oracle-landed-placeholder"
 RKEY_94="$(printf '%s-94' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
 printf 'foreign idle tab\n' > "$TDIR/tab.txt"
 env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
-  PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 PRO_GATE_STALL_SECS=30 \
+  PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 PRO_GATE_STALL_SECS=30 PRO_GATE_SALVAGE_SECS=2 \
   PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-landed-placeholder" NODE_OPTIONS= \
   bash "$ENGINE" --pr 94 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$RHOME/o-landed-placeholder.md" --timeout 5s \
   >"$TDIR/stdout" 2>"$TDIR/stderr"
@@ -3079,6 +3079,7 @@ printf 'foreign idle tab\n' > "$TDIR/tab.txt"
 env PRO_GATE_HOME="$CTL_HOME" ORACLE_HOME_DIR="$CTL_HOME/oracle" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
   PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
   PRO_GATE_MAX_RETRIES=1 PRO_GATE_RETRY_BACKOFF=0 PRO_GATE_REATTACH_TIMEOUT=1 \
+  PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_PRE_RETRY_PROBE_SECS=1 \
   PRO_GATE_SALVAGE_SECS=2 PRO_GATE_RUN_LOGS=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-quiet-fail" \
   PG_TEST_ATTEMPTS_FILE="$CTL_ATTEMPTS" NODE_OPTIONS= \
   bash "$ENGINE" --pr 920 --repo "$TDIR" --diff "$TDIR/small.diff" \
@@ -3195,6 +3196,7 @@ env PRO_GATE_HOME="$HARDCAP_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIM
   PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 \
   PRO_GATE_MAX_RETRIES=1 PRO_GATE_RETRY_BACKOFF=0 PRO_GATE_STALL_SECS=600 \
   PRO_GATE_NOTHINK_SECS=600 PRO_GATE_TIMEOUT_GRACE=1 PRO_GATE_REATTACH_TIMEOUT=1 \
+  PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_PRE_RETRY_PROBE_SECS=1 \
   PRO_GATE_SALVAGE_SECS=2 PRO_GATE_RUN_LOGS=0 PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-hardcap" \
   PG_TEST_ATTEMPTS_FILE="$HARDCAP_ATTEMPTS" NODE_OPTIONS= \
   bash "$ENGINE" --pr 926 --repo "$TDIR" --diff "$TDIR/small.diff" \
@@ -6094,6 +6096,9 @@ check 'concurrent miss calls increment at most once inside one reconcile interva
 
 # Marker-addressed recovery never follows a completed/pending symlink, even when its target contains
 # structurally valid review bytes. The lifecycle selector and exact recovery fast path must agree.
+# Recovery runs the restored-reservation TTL sweep (bin/oracle-review.sh:1106) before it reaches
+# this refusal, a 60s sleep plus a 10s probe on these stale run-meta fixtures, so the sweep is
+# switched off here; it has its own cases above.
 for REC_LINK_STORE in completed pending; do
   REC_LINK_HOME="$TDIR/home-recover-link-$REC_LINK_STORE"
   REC_LINK_MARKER="pg-run-acme-widgets-43-1700001001-${REC_LINK_STORE#?}"
@@ -6102,7 +6107,7 @@ for REC_LINK_STORE in completed pending; do
   printf '[P1] src/link.sh:1 - symlink target\n  Why: unrelated bytes\nP2: none\nP3: none\nVERDICT: SHIP - linked.\n' > "$REC_LINK_TARGET"
   ln -s "$REC_LINK_TARGET" "$REC_LINK_HOME/$REC_LINK_STORE/$REC_LINK_MARKER"
   printf 'github.com\tacme\twidgets\tacme-widgets-43\t43\t%s\t1700002001\n' "$TDIR/recover-link-out.md" > "$REC_LINK_HOME/run-meta/$REC_LINK_MARKER"
-  recover_run "$REC_LINK_HOME" --recover "$REC_LINK_MARKER" --timeout 1s
+  PRO_GATE_HARVEST_TTL_SWEEP=0 recover_run "$REC_LINK_HOME" --recover "$REC_LINK_MARKER" --timeout 1s
   check "recover exact marker refuses a $REC_LINK_STORE symlink instead of returning its target" \
     "$([ "$RC" -ne 0 ] && ! grep -qF 'symlink target' "$TDIR/recover.stdout" && ! grep -qF 'Review ready' "$TDIR/recover.stderr"; echo $?)" \
     "rc=$RC stdout=$(cat "$TDIR/recover.stdout") stderr=$(cat "$TDIR/recover.stderr")"
@@ -6479,6 +6484,10 @@ check 'fresh run with a relative --out records an absolute path in run-meta' \
   "$([ "$RC" -eq 0 ] && [ -n "$RECABS_MARKER" ] && [ "$RECABS_RECORDED" = "$RECABS_EXPECT" ]; echo $?)" \
   "rc=$RC marker=$RECABS_MARKER recorded=$RECABS_RECORDED expect=$RECABS_EXPECT"
 
+# These fixtures are run-meta only with decades-old spend epochs, so --recover restores a stale
+# reservation and would first run the TTL sweep (bin/oracle-review.sh:1106): a 60s reconcile sleep
+# plus a 10s probe that these output-path assertions never look at. The sweep has its own cases
+# above (legacy run-meta recovery, #228 control), so it is switched off here.
 # A hand-authored legacy/foreign record can still carry a bare relative OUT (or none at all
 # yet, from before this fix). Recovery must never treat it as an escape hatch into whatever
 # directory --recover happens to run from.
@@ -6488,7 +6497,7 @@ mkdir -p "$RECFALLBACK_HOME/run-meta"
 printf 'github.com\tacme\twidgets\tacme-widgets-802\t802\trelative-escape.md\t1700011800\n' \
   > "$RECFALLBACK_HOME/run-meta/$RECFALLBACK_MARKER"
 : > "$TDIR/recover-oracle-sentinel"
-( cd "$TDIR" && recover_run "$RECFALLBACK_HOME" --recover "$RECFALLBACK_MARKER" --timeout 1s )
+( cd "$TDIR" && PRO_GATE_HARVEST_TTL_SWEEP=0 recover_run "$RECFALLBACK_HOME" --recover "$RECFALLBACK_MARKER" --timeout 1s )
 check 'a recorded relative OUT does not publish outside PRO_GATE_HOME' \
   "$([ ! -e "$TDIR/relative-escape.md" ]; echo $?)" "escaped file: $(find "$TDIR" -maxdepth 1 -name 'relative-escape.md')"
 check 'a recorded relative OUT falls back to the recovered/ directory instead' \
@@ -6504,7 +6513,7 @@ RECDEADPARENT_GONE="$TDIR/gone-parent-$$"; mkdir -p "$RECDEADPARENT_GONE"; rmdir
 printf 'github.com\tacme\twidgets\tacme-widgets-803\t803\t%s/out.md\t1700012000\n' "$RECDEADPARENT_GONE" \
   > "$RECDEADPARENT_HOME/run-meta/$RECDEADPARENT_MARKER"
 : > "$TDIR/recover-oracle-sentinel"
-recover_run "$RECDEADPARENT_HOME" --recover "$RECDEADPARENT_MARKER" --timeout 1s
+PRO_GATE_HARVEST_TTL_SWEEP=0 recover_run "$RECDEADPARENT_HOME" --recover "$RECDEADPARENT_MARKER" --timeout 1s
 check 'a recorded absolute OUT with a dead parent falls back to the recovered/ directory instead of failing to establish an output path' \
   "$([ -d "$RECDEADPARENT_HOME/recovered" ]; echo $?)" \
   "recovered=$(ls "$RECDEADPARENT_HOME/recovered" 2>/dev/null) stderr=$(cat "$TDIR/recover.stderr")"
@@ -6526,6 +6535,7 @@ printf 'github.com\tacme\twidgets\tacme-widgets-804\t804\t%s\t1700012200\n' "$TD
 start_mock "$TDIR/recover-validout-tab.txt"
 : > "$TDIR/recover-oracle-sentinel"
 env PRO_GATE_HOME="$RECVALID_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_HARVEST_TTL_SWEEP=0 \
   PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-recover-sentinel" PG_TEST_RECOVER_ORACLE_SENTINEL="$TDIR/recover-oracle-sentinel" NODE_OPTIONS= \
   bash "$ENGINE" --recover "$RECVALID_MARKER" --timeout 5s \
   >"$TDIR/recover.stdout" 2>"$TDIR/recover.stderr"

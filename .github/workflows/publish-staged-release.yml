@@ -9,7 +9,7 @@ name: Publish staged release
 # a re-fire.
 #
 # Deliberately workflow_dispatch and not automatic: re-running release.yml would
-# re-run the whole ~30 minute suite to flip one flag, and auto-dispatching a
+# repackage and re-upload the assets to flip one flag, and auto-dispatching a
 # privileged publish from another repository is how release loops start. The
 # guard below re-reads the LIVE card, so a mistimed run cannot publish an
 # undistributed release.

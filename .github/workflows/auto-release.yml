@@ -4,8 +4,8 @@ name: Auto release on VERSION bump
 # with the RELEASE_PAT identity so the tag-push event triggers release.yml (GITHUB_TOKEN
 # events are suppressed by GitHub's recursion rule and would leave the chain dead). Bumping
 # VERSION (+ plugin.json) in a PR is therefore the SHIP signal; everything downstream keeps
-# its existing guards: release.yml re-runs the full test suite on the tagged commit, verifies
-# the tag is on the default branch, packages with checksums, and the release train validates
+# its existing guards: release.yml requires this same push's CI run to pass on the tagged commit,
+# verifies the tag is on the default branch, packages with checksums, and the release train validates
 # again before promoting the marketplace manifest.
 #
 # Without the RELEASE_PAT secret this workflow skips with a notice and the manual flow
