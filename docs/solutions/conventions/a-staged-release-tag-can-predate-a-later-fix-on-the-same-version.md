@@ -28,9 +28,10 @@ tags:
 
 `.github/workflows/auto-release.yml` tags any push to `main` whose `VERSION` (and
 `.claude-plugin/plugin.json`, which must match it) has no corresponding `vX.Y.Z` tag yet. The tag
-push triggers `.github/workflows/release.yml`, which reruns the full test battery on the tagged
-commit, packages the runtime, checksums it, and (per `scripts/publish-runtime-release.sh`'s
-draft-first design) stages a **draft** GitHub release rather than publishing immediately — publish
+push triggers `.github/workflows/release.yml`, which requires the tagged commit's own `main` push CI
+run, including its `trusted check` job, to have passed (until #254 it reran the engine and CDP
+suites itself), runs the release suites, packages the runtime, checksums it, and (per
+`scripts/publish-runtime-release.sh`'s draft-first design) stages a **draft** GitHub release rather than publishing immediately — publish
 is a separate, later step gated on the marketplace card naming the release.
 
 The tag-absent check is deliberate and documented in the workflow's own header: "the tag-absent

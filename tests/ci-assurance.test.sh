@@ -32,6 +32,28 @@ yq '(.jobs.tests.strategy.matrix.include[] | select(.leg == "cdp-salvage") | .te
 if leg_coverage "$TDIR/ci-doubled.yml" 2>/dev/null; then fail 'planted doubled suite passed the leg coverage check'; fi
 echo 'ok - every test file runs in exactly one CI leg; a dropped or doubled suite is rejected'
 
+# Source validation and the release-notes gate run once, in the rest leg. A renamed leg or a
+# mistyped condition would skip them on every leg while trusted check stays green.
+rest_steps() { # workflow file; returns 1 unless one rest leg exists and both steps run only there
+  local wf="$1" step
+  [ "$(yq '[.jobs.tests.strategy.matrix.include[] | select(.leg == "rest")] | length' "$wf")" = 1 ] || return 1
+  for step in 'Validate data and shell files' 'Require customer-ready notes for a version bump'; do
+    [ "$(step="$step" yq '.jobs.tests.steps[] | select(.name == strenv(step)) | .if' "$wf")" = "matrix.leg == 'rest'" ] || return 1
+  done
+}
+rest_steps "$workflow" || fail 'source validation and the release-notes gate must run in the rest leg'
+yq '(.jobs.tests.strategy.matrix.include[] | select(.leg == "rest") | .leg) = "misc"' "$workflow" > "$TDIR/ci-renamed.yml"
+if rest_steps "$TDIR/ci-renamed.yml"; then fail 'planted renamed rest leg passed the rest-step check'; fi
+bad="matrix.leg == 'misc'" yq '(.jobs.tests.steps[] | select(.name == "Require customer-ready notes for a version bump") | .if) = strenv(bad)' \
+  "$workflow" > "$TDIR/ci-misrouted.yml"
+if rest_steps "$TDIR/ci-misrouted.yml"; then fail 'planted misrouted release-notes step passed the rest-step check'; fi
+echo 'ok - source validation and the release-notes gate run in the rest leg; a renamed leg or misrouted step is rejected'
+
+# The legs run on every push and every same-repository PR; only fork PRs skip them. The release gate
+# trusts the push run, so a guard that skipped pushes would let an untested commit ship.
+[ "$(yq '.jobs.tests.if' "$workflow")" = "github.event_name == 'push' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)" ] \
+  || fail 'the legs must run on every push and every same-repository PR'
+
 # The required context stays "trusted check" and passes only when every leg passed. Its guard is
 # the legs' fork guard behind always(), so a failed or cancelled leg still reports a failure.
 [ "$(yq '.jobs.check.name' "$workflow")" = 'trusted check' ] || fail 'the aggregator must report the required context'

@@ -161,12 +161,19 @@ grep -q 'staged as a draft with complete assets' "$ROOT/.github/workflows/auto-r
 pass 'auto-release reports a staged draft as expected state'
 
 # #254: release.yml no longer reruns the suites; it requires the default-branch push CI run for the
-# tagged commit to have passed. Each fake `gh api` call returns the next scripted response.
+# tagged commit to have passed. Each fake `gh api` runs call returns the next scripted response; a
+# jobs call returns the case's jobs list (by default, a passed trusted check).
 GATE="$ROOT/scripts/require-trusted-ci.sh"
 GATE_SHA=0123456789abcdef0123456789abcdef01234567
 mkdir -p "$TMP/gate-bin"
 cat > "$TMP/gate-bin/gh" <<'EOF'
 #!/usr/bin/env bash
+case "$*" in
+  */jobs\?*)
+    printf '%s\n' "$*" >> "$GATE_LOG.jobs"
+    cat "$GATE_JOBS.json"
+    exit "$(cat "$GATE_JOBS.rc" 2>/dev/null || echo 0)" ;;
+esac
 printf '%s\n' "$*" >> "$GATE_LOG"
 n=$(( $(wc -l < "$GATE_LOG") ))
 [ -f "$GATE_SEQ/$n.json" ] || n="$(ls "$GATE_SEQ" | sed -n 's/\.json$//p' | sort -n | tail -1)"
@@ -178,18 +185,24 @@ gate_run_json() { # id status conclusion [event] [branch] [sha]
   printf '{"id":%s,"status":"%s","conclusion":%s,"event":"%s","head_branch":"%s","head_sha":"%s","html_url":"https://example.test/runs/%s"}' \
     "$1" "$2" "$3" "${4:-push}" "${5:-main}" "${6:-$GATE_SHA}" "$1"
 }
-gate_case() { # name, then one response per call: either a runs array body or "!fail"
+gate_case() { # name, then one response per call: a runs array body, "!fail", or "!garbage"
   local name="$1" i=0 body; shift
   rm -rf "$TMP/gate-$name"; mkdir -p "$TMP/gate-$name/seq"; : > "$TMP/gate-$name/log"
   for body in "$@"; do
     i=$((i + 1))
     if [ "$body" = '!fail' ]; then printf '{"message":"Server Error"}' > "$TMP/gate-$name/seq/$i.json"; echo 1 > "$TMP/gate-$name/seq/$i.rc"
+    elif [ "$body" = '!garbage' ]; then printf '<html>upstream error</html>' > "$TMP/gate-$name/seq/$i.json"
     else printf '{"total_count":0,"workflow_runs":[%s]}' "$body" > "$TMP/gate-$name/seq/$i.json"; fi
   done
+  gate_jobs "$name" '{"name":"tests (engine)","conclusion":"success"},{"name":"trusted check","conclusion":"success"}'
 }
-gate_exec() { # name [sha]; sets GATE_RC and GATE_OUT
-  GATE_OUT="$(PATH="$TMP/gate-bin:$PATH" GATE_LOG="$TMP/gate-$1/log" GATE_SEQ="$TMP/gate-$1/seq" \
-    PRO_GATE_RELEASE_CI_POLL_SECS=0 PRO_GATE_RELEASE_CI_FIND_SECS=0 PRO_GATE_RELEASE_CI_WAIT_SECS=5 \
+gate_jobs() { # name, jobs array body
+  printf '{"total_count":2,"jobs":[%s]}' "$2" > "$TMP/gate-$1/jobs.json"
+}
+gate_exec() { # name [sha]; sets GATE_RC and GATE_OUT. GATE_FIND_SECS/GATE_POLL_SECS/GATE_WAIT_SECS override.
+  GATE_OUT="$(PATH="$TMP/gate-bin:$PATH" GATE_LOG="$TMP/gate-$1/log" GATE_SEQ="$TMP/gate-$1/seq" GATE_JOBS="$TMP/gate-$1/jobs" \
+    PRO_GATE_RELEASE_CI_POLL_SECS="${GATE_POLL_SECS:-0}" PRO_GATE_RELEASE_CI_FIND_SECS="${GATE_FIND_SECS:-0}" \
+    PRO_GATE_RELEASE_CI_WAIT_SECS="${GATE_WAIT_SECS:-5}" \
     "$GATE" owner/repo "${2:-$GATE_SHA}" main 2>&1)" && GATE_RC=0 || GATE_RC=$?
 }
 
@@ -198,7 +211,30 @@ gate_exec pass
 [ "$GATE_RC" = 0 ] && grep -q 'CI passed' <<<"$GATE_OUT" || fail "release gate accepts a passed push run: rc=$GATE_RC $GATE_OUT"
 grep -qxF "api repos/owner/repo/actions/workflows/ci.yml/runs?head_sha=$GATE_SHA&event=push&branch=main&per_page=20" "$TMP/gate-pass/log" \
   || fail "release gate must query push runs of ci.yml for the exact commit: $(cat "$TMP/gate-pass/log")"
+grep -qxF 'api repos/owner/repo/actions/runs/7/jobs?per_page=100' "$TMP/gate-pass/log.jobs" \
+  || fail "release gate must read the passed run's own jobs: $(cat "$TMP/gate-pass/log.jobs" 2>&1)"
 pass 'release gate accepts a passed push CI run for the exact commit'
+
+# A run concludes success even when a job's `if:` skipped it, so the gate also requires the
+# required context itself: exactly one "trusted check" job in that run, and it passed.
+for GATE_CHECK in skipped failure missing; do
+  gate_case "check-$GATE_CHECK" "$(gate_run_json 7 completed '"success"')"
+  case "$GATE_CHECK" in
+    missing) gate_jobs "check-$GATE_CHECK" '{"name":"tests (engine)","conclusion":"skipped"}' ;;
+    *) gate_jobs "check-$GATE_CHECK" "{\"name\":\"trusted check\",\"conclusion\":\"$GATE_CHECK\"}" ;;
+  esac
+  gate_exec "check-$GATE_CHECK"
+  [ "$GATE_RC" = 1 ] && grep -q "trusted check job is $GATE_CHECK" <<<"$GATE_OUT" \
+    || fail "release gate refuses a passed run whose trusted check is $GATE_CHECK: rc=$GATE_RC $GATE_OUT"
+done
+pass 'release gate refuses a passed run whose trusted check was skipped, failed or is missing'
+
+gate_case jobs-unreadable "$(gate_run_json 7 completed '"success"')"
+echo 1 > "$TMP/gate-jobs-unreadable/jobs.rc"
+GATE_POLL_SECS=1 GATE_WAIT_SECS=2 gate_exec jobs-unreadable
+[ "$GATE_RC" = 1 ] && grep -q 'job list could not be read' <<<"$GATE_OUT" && [ "$(wc -l < "$TMP/gate-jobs-unreadable/log.jobs")" -ge 2 ] \
+  || fail "release gate keeps polling an unreadable job list until its deadline: rc=$GATE_RC $GATE_OUT"
+pass 'release gate treats an unreadable job list as no evidence and stops at its deadline'
 
 gate_case failed "$(gate_run_json 7 completed '"failure"')"
 gate_exec failed
@@ -215,6 +251,19 @@ gate_exec waits
 [ "$GATE_RC" = 0 ] && grep -q 'waiting for CI' <<<"$GATE_OUT" && [ "$(wc -l < "$TMP/gate-waits/log")" = 3 ] \
   || fail "release gate waits through an in-progress run and a failed read: rc=$GATE_RC calls=$(wc -l < "$TMP/gate-waits/log") $GATE_OUT"
 pass 'release gate waits for an in-progress run and treats a failed read as no evidence'
+
+gate_case malformed "$(gate_run_json 7 in_progress null)" '!garbage' "$(gate_run_json 7 completed '"success"')"
+gate_exec malformed
+[ "$GATE_RC" = 0 ] && [ "$(wc -l < "$TMP/gate-malformed/log")" = 3 ] \
+  || fail "release gate treats a malformed response as a failed read: rc=$GATE_RC calls=$(wc -l < "$TMP/gate-malformed/log") $GATE_OUT"
+pass 'release gate keeps polling past a malformed response'
+
+# auto-release tags the merge push, so release.yml can start before that push's CI run is listed.
+gate_case late '' "$(gate_run_json 7 in_progress null)" "$(gate_run_json 7 completed '"success"')"
+GATE_FIND_SECS=5 gate_exec late
+[ "$GATE_RC" = 0 ] && [ "$(wc -l < "$TMP/gate-late/log")" = 3 ] \
+  || fail "release gate waits within its find window for a run to appear: rc=$GATE_RC calls=$(wc -l < "$TMP/gate-late/log") $GATE_OUT"
+pass 'release gate waits within its find window for a run that appears late'
 
 gate_case stuck "$(gate_run_json 7 in_progress null)"
 GATE_STUCK_START=$SECONDS

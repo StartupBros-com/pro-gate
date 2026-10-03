@@ -6096,8 +6096,9 @@ check 'concurrent miss calls increment at most once inside one reconcile interva
 
 # Marker-addressed recovery never follows a completed/pending symlink, even when its target contains
 # structurally valid review bytes. The lifecycle selector and exact recovery fast path must agree.
-# The refusal happens on the fast path, before the TTL sweep, so the sweep (60s sleep + 10s probe
-# on these stale run-meta fixtures) is switched off; it has its own cases above.
+# Recovery runs the restored-reservation TTL sweep (bin/oracle-review.sh:1106) before it reaches
+# this refusal, a 60s sleep plus a 10s probe on these stale run-meta fixtures, so the sweep is
+# switched off here; it has its own cases above.
 for REC_LINK_STORE in completed pending; do
   REC_LINK_HOME="$TDIR/home-recover-link-$REC_LINK_STORE"
   REC_LINK_MARKER="pg-run-acme-widgets-43-1700001001-${REC_LINK_STORE#?}"
