@@ -2228,7 +2228,12 @@ if [ -n "${PG_TEST_ARGV_FILE:-}" ]; then
   printf '%s\0' "$@" > "$PG_TEST_ARGV_FILE.args"
 fi
 out=""
-while [ $# -gt 0 ]; do case "$1" in --write-output) out="$2"; shift 2;; *) shift;; esac; done
+while [ $# -gt 0 ]; do case "$1" in
+  --write-output) out="$2"; shift 2;;
+  # Optional: keep each attachment as delivered, so a test can compare its exact bytes.
+  --file) [ -z "${PG_TEST_ATTACH_DIR:-}" ] || cp "$2" "$PG_TEST_ATTACH_DIR/"; shift 2;;
+  *) shift;;
+esac; done
 [ -n "${PG_TEST_EVIDENCE:-}" ] && printf '%s\n' "$PG_TEST_EVIDENCE"
 printf '[P1] a.sh:1 - finding\n  Why: test\nP2: none\nP3: none\nVERDICT: SHIP - fixture.\n' > "$out"
 FAKE_EV
@@ -3856,13 +3861,16 @@ check 'harvest in round-test home exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC
 check 'harvest consumes no round' "$([ "$(ls "$RHOME/rounds" 2>/dev/null | wc -l)" -eq "$NROUND_FILES" ]; echo $?)" "rounds dir: $(ls "$RHOME/rounds" 2>/dev/null)"
 
 echo '# v0.22.1: --confirm mode (budget-accounted confirming pass)'
-printf 'P0: none\n[P1] x.sh:1 - prior finding\nP2: none\nP3: none\nVERDICT: FIX-FIRST - prior.\n' > "$TDIR/prior-review-src.md"
+# The prior review carries an actionable P2 beside its P1 (#252): a caller fixes P0/P1/P2, so a
+# P2 left unfixed must be rechecked, not dropped as neither "prior P0/P1" nor "genuinely new".
+printf 'P0: none\n[P1] x.sh:1 - prior finding\n[P2] y.sh:7 - prior minor defect\n  Why: real\n[P3] z.sh:2 - prior nit\nVERDICT: FIX-FIRST - prior.\n' > "$TDIR/prior-review-src.md"
 : > "$TDIR/argv-confirm.txt"
+mkdir -p "$TDIR/attach-confirm"
 printf 'foreign idle tab\n' > "$TDIR/tab.txt"
 env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
   PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
   PRO_GATE_ORACLE_BIN="$TDIR/bin/oracle-evidence" PG_TEST_ARGV_FILE="$TDIR/argv-confirm.txt" \
-  PG_TEST_EVIDENCE= NODE_OPTIONS= \
+  PG_TEST_ATTACH_DIR="$TDIR/attach-confirm" PG_TEST_EVIDENCE= NODE_OPTIONS= \
   bash "$ENGINE" --pr 102 --repo "$TDIR" --diff "$TDIR/small.diff" \
   --confirm "$TDIR/prior-review-src.md" --out "$RHOME/o-confirm.md" --timeout 5s \
   >"$TDIR/stdout" 2>"$TDIR/stderr"
@@ -3870,6 +3878,26 @@ RC=$?
 check 'confirm pass runs and exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -3 "$TDIR/stderr")"
 check 'confirm prompt carries the confirming instructions' "$(grep -q 'THIS IS A CONFIRMING PASS' "$TDIR/argv-confirm.txt"; echo $?)" "$(head -c 200 "$TDIR/argv-confirm.txt")"
 check 'confirm attaches prior-review.md' "$(grep -q 'prior-review.md' "$TDIR/argv-confirm.txt"; echo $?)" 'no prior-review.md in oracle argv'
+# The prompt Oracle actually received: the argument after -p in the recorded NUL-delimited argv.
+CONFIRM_PROMPT=""; CONFIRM_PREV=""
+while IFS= read -r -d '' CONFIRM_ARG; do
+  [ "$CONFIRM_PREV" = "-p" ] && { CONFIRM_PROMPT="$CONFIRM_ARG"; break; }
+  CONFIRM_PREV="$CONFIRM_ARG"
+done < "$TDIR/argv-confirm.txt.args"
+CONFIRM_LINE="$(printf '%s\n' "$CONFIRM_PROMPT" | grep -F 'THIS IS A CONFIRMING PASS')"
+# Everything the pass must do BEFORE it may report new findings.
+CONFIRM_RECHECK="${CONFIRM_LINE%%genuinely NEW*}"
+check 'confirm prompt orders the prior recheck before genuinely NEW findings' \
+  "$([ -n "$CONFIRM_LINE" ] && [ "$CONFIRM_RECHECK" != "$CONFIRM_LINE" ]; echo $?)" "line: $CONFIRM_LINE"
+for CONFIRM_SEV in P0 P1 P2; do
+  check "confirm prompt requires every prior $CONFIRM_SEV to be rechecked before new findings" \
+    "$(printf '%s' "$CONFIRM_RECHECK" | grep -qF "$CONFIRM_SEV"; echo $?)" "recheck: $CONFIRM_RECHECK"
+done
+check 'confirm recheck reports RESOLVED with the fix file:line, or STILL-PRESENT' \
+  "$(printf '%s' "$CONFIRM_RECHECK" | grep -F 'RESOLVED' | grep -F 'file:line' | grep -qF 'STILL-PRESENT'; echo $?)" "recheck: $CONFIRM_RECHECK"
+check 'confirm attachment is the complete prior review, P2 included' \
+  "$(cmp -s "$TDIR/prior-review-src.md" "$TDIR/attach-confirm/prior-review.md"; echo $?)" \
+  "attached: $(ls "$TDIR/attach-confirm" 2>/dev/null)"
 check 'confirm pass consumes a round (budget-accounted)' "$([ -f "$RHOME/rounds/$(printf '%s-102' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')" ]; echo $?)" "rounds dir: $(ls "$RHOME/rounds" 2>/dev/null)"
 run_engine --confirm /nonexistent-prior.md --pr 102 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$RHOME/o-cbad.md" --timeout 5s
 check 'missing --confirm file is a usage error (exit 2)' "$([ "$RC" -eq 2 ]; echo $?)" "rc=$RC"

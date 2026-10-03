@@ -19,7 +19,7 @@
 #       a separate repo+branch identity.
 #   oracle-review.sh --confirm <prior-review-file> ...
 #       Confirming pass (v0.22): attaches the prior review and instructs the model to verify
-#       EVERY prior P0/P1 as RESOLVED or STILL-PRESENT before reporting new findings. A
+#       EVERY prior P0/P1/P2 as RESOLVED or STILL-PRESENT before reporting new findings. A
 #       budget-accounted engine run like any other.
 #   oracle-review.sh --brief <task-file> --diff <patchfile> --repo <dir> ...
 #       Custom task body (v0.39): replaces the built-in reviewer persona with <task-file>, so
@@ -3497,7 +3497,7 @@ EOF
   if [ -n "$CONFIRM_FILE" ]; then
     cat <<'EOF'
 
-THIS IS A CONFIRMING PASS: this change was already reviewed once and fixes were applied. The previous review is attached as "prior-review.md". BEFORE anything else, verify EVERY P0 and P1 finding in that prior review against the CURRENT code and list each one as either RESOLVED (with the file:line of the fix) or STILL-PRESENT (report it again as a finding). Only then report genuinely NEW findings per the standard format. Do not re-litigate a prior finding whose fix is present but shaped differently than you would have chosen.
+THIS IS A CONFIRMING PASS: this change was already reviewed once and fixes were applied. The previous review is attached as "prior-review.md". BEFORE anything else, verify EVERY P0, P1 and P2 finding in that prior review against the CURRENT code and list each one as either RESOLVED (with the file:line of the fix) or STILL-PRESENT (report it again as a finding). Only then report genuinely NEW findings per the standard format. Do not re-litigate a prior finding whose fix is present but shaped differently than you would have chosen.
 EOF
   fi
   cat <<'EOF'
