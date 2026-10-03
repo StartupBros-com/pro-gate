@@ -243,7 +243,7 @@ oracle-review.sh --pr <url|number> [--repo <dir>] [--input both|bundle|connector
 oracle-review.sh --diff <patchfile> --repo <dir> [--pr <n>] ...   # review a local diff; pass --pr
                                                                   # too so budget/locks stay the PR's
 oracle-review.sh --confirm <prior-review-file> ...                # confirming pass: verify every prior
-                                                                  # P0/P1 RESOLVED or STILL-PRESENT first
+                                                                  # P0/P1/P2 RESOLVED or STILL-PRESENT first
 oracle-review.sh --brief <task-file> --diff <patch> --repo <dir>  # custom task body: spend the slot on an
                                                                   # analysis other than the default review
 oracle-review.sh --recover <PR|URL|marker> [--repo <dir>] [--out <file>] [--timeout <dur>]

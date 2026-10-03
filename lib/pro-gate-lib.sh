@@ -3083,7 +3083,7 @@ pg_round_note_severity() {
   [ -f "$dir/$key" ] || return 0
   [ -s "$out" ] || return 0
   # v0.28 (#52 item 3): count only OPEN findings. Confirming reviews are REQUIRED to carry
-  # every prior P0/P1 forward as a "[Pn] … RESOLVED …" verification block; grep-counting every
+  # every prior P0/P1/P2 forward as a "[Pn] … RESOLVED …" verification block; grep-counting every
   # severity tag reported resolved P0s as "OPEN P0" at round-cap time and prompted false
   # force-round escalations. The RESOLVED filter is case-SENSITIVE on purpose: reviews upcase
   # the verification token, while prose like "unresolved"/"Unresolved" must not exclude a line.
