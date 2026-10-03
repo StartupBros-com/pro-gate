@@ -45,6 +45,7 @@ jobs:
           ./scripts/check-release-notes.sh "$notes"
       - name: Run tests
         run: |
+          bash tests/trusted-data.test.sh
           bash tests/ci-assurance.test.sh
           bash tests/review-decision-adapters.test.sh
           bash tests/engine.test.sh
