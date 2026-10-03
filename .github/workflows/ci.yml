@@ -10,9 +10,10 @@ permissions:
 
 jobs:
   # The suites run as parallel legs, so the slowest leg sets the wall-clock instead of the sum of
-  # all of them (34 minutes serially, #254). Every tests/*.test.* file belongs to exactly one leg;
-  # tests/ci-assurance.test.sh enforces that. The `check` job below reports the one context the
-  # main ruleset requires, "trusted check".
+  # all of them (34 minutes serially, #254). Every tests/*.test.* file belongs to exactly one leg,
+  # except that a file declaring PG_TEST_SHARDS=N (the engine suite) runs as N legs, one per
+  # PG_TEST_SHARD value; tests/ci-assurance.test.sh enforces both. The `check` job below reports
+  # the one context the main ruleset requires, "trusted check".
   tests:
     name: tests (${{ matrix.leg }})
     if: github.event_name == 'push' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.fork == false)
@@ -24,9 +25,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - leg: engine
+          - leg: engine-1
             tests: |
-              bash tests/engine.test.sh
+              PG_TEST_SHARD=1 bash tests/engine.test.sh
+          - leg: engine-2
+            tests: |
+              PG_TEST_SHARD=2 bash tests/engine.test.sh
+          - leg: engine-3
+            tests: |
+              PG_TEST_SHARD=3 bash tests/engine.test.sh
           - leg: cdp-salvage
             tests: |
               node --test tests/cdp-salvage.test.mjs

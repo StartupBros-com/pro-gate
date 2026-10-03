@@ -14,11 +14,18 @@ test_command="$(yq '.jobs.tests.strategy.matrix.include[].tests' "$workflow" | s
 
 # #254: the suites run as parallel legs. Splitting them must never drop or double a suite, so every
 # tests/*.test.sh and tests/*.test.mjs file must be invoked by exactly one leg, and nothing else.
+# A file that declares PG_TEST_SHARDS=N is instead invoked once per shard, PG_TEST_SHARD=1..N.
 leg_coverage() { # workflow file; prints the problem and returns 1 on any gap
   local wf="$1" invoked expected
-  invoked="$(yq '.jobs.tests.strategy.matrix.include[].tests' "$wf" | grep -v '^---$' | sed '/^$/d' | sort)"
-  expected="$(cd "$ROOT" && for f in tests/*.test.sh; do printf 'bash %s\n' "$f"; done
-              for f in tests/*.test.mjs; do printf 'node --test %s\n' "$f"; done | sort)"
+  invoked="$(yq '.jobs.tests.strategy.matrix.include[].tests' "$wf" | grep -v '^---$' | sed '/^$/d' | LC_ALL=C sort)"
+  expected="$(cd "$ROOT" && {
+    for f in tests/*.test.sh; do
+      shards="$(sed -n 's/^PG_TEST_SHARDS=\([1-9][0-9]*\)$/\1/p' "$f")"
+      if [ -z "$shards" ]; then printf 'bash %s\n' "$f"; continue; fi
+      for k in $(seq 1 "$shards"); do printf 'PG_TEST_SHARD=%s bash %s\n' "$k" "$f"; done
+    done
+    for f in tests/*.test.mjs; do printf 'node --test %s\n' "$f"; done
+  } | LC_ALL=C sort)"
   [ "$invoked" = "$expected" ] && return 0
   diff <(printf '%s\n' "$expected") <(printf '%s\n' "$invoked") >&2 || true
   return 1
@@ -30,7 +37,24 @@ if leg_coverage "$TDIR/ci-dropped.yml" 2>/dev/null; then fail 'planted dropped s
 yq '(.jobs.tests.strategy.matrix.include[] | select(.leg == "cdp-salvage") | .tests) += "bash tests/engine.test.sh\n"' \
   "$workflow" > "$TDIR/ci-doubled.yml"
 if leg_coverage "$TDIR/ci-doubled.yml" 2>/dev/null; then fail 'planted doubled suite passed the leg coverage check'; fi
-echo 'ok - every test file runs in exactly one CI leg; a dropped or doubled suite is rejected'
+yq 'del(.jobs.tests.strategy.matrix.include[] | select(.leg == "engine-2"))' "$workflow" > "$TDIR/ci-shard-dropped.yml"
+if leg_coverage "$TDIR/ci-shard-dropped.yml" 2>/dev/null; then fail 'planted dropped engine shard passed the leg coverage check'; fi
+yq '(.jobs.tests.strategy.matrix.include[] | select(.leg == "engine-3") | .tests) = "PG_TEST_SHARD=1 bash tests/engine.test.sh\n"' \
+  "$workflow" > "$TDIR/ci-shard-doubled.yml"
+if leg_coverage "$TDIR/ci-shard-doubled.yml" 2>/dev/null; then fail 'planted doubled engine shard passed the leg coverage check'; fi
+echo 'ok - every test file runs in exactly one CI leg; a dropped or doubled suite or engine shard is rejected'
+
+# The engine suite's shard regions must be numbered 1..PG_TEST_SHARDS in file order, so one leg per
+# shard runs every region once, and an out-of-range shard must refuse instead of running nothing.
+engine_suite="$ROOT/tests/engine.test.sh"
+engine_shards="$(sed -n 's/^PG_TEST_SHARDS=\([1-9][0-9]*\)$/\1/p' "$engine_suite")"
+[ "$(sed -n 's/^if in_shard \([0-9][0-9]*\); then$/\1/p' "$engine_suite" | tr '\n' ' ')" = "$(seq -s ' ' 1 "$engine_shards") " ] \
+  || fail 'engine shard regions must be numbered 1..PG_TEST_SHARDS in file order'
+if PG_TEST_SHARD=$((engine_shards + 1)) bash "$engine_suite" > "$TDIR/shard-range.log" 2>&1; then
+  fail 'an out-of-range engine shard ran instead of refusing'
+fi
+grep -Fq 'PG_TEST_SHARD must be' "$TDIR/shard-range.log" || fail 'out-of-range engine shard refused for another reason'
+echo 'ok - engine shard regions are numbered 1..PG_TEST_SHARDS and an out-of-range shard refuses'
 
 # Source validation and the release-notes gate run once, in the rest leg. A renamed leg or a
 # mistyped condition would skip them on every leg while trusted check stays green.
