@@ -13,17 +13,30 @@
 #   - --harvest against a completed conversation (exit 0, phase done, review written)
 #   - --harvest with no matching conversation (exit 6, phase failed)
 # Uses tests/mock-cdp.mjs as the browser. Run: bash tests/engine.test.sh
+# CI runs it as PG_TEST_SHARDS parallel legs (#254): PG_TEST_SHARD=k runs the shared fixtures and
+# then only the `if in_shard k` region; unset, every region runs in order. CI runs a region alone,
+# so it may rely only on the shared fixtures and its own setup, never on state an earlier region
+# left behind. tests/ci-assurance.test.sh requires one CI leg per shard.
 set -uo pipefail
+PG_TEST_SHARDS=3
+if [ -n "${PG_TEST_SHARD:-}" ] && ! seq 1 "$PG_TEST_SHARDS" | grep -qxF -- "$PG_TEST_SHARD"; then
+  echo "FATAL - PG_TEST_SHARD must be empty or 1-$PG_TEST_SHARDS, got '$PG_TEST_SHARD'" >&2
+  exit 2
+fi
+in_shard() { [ -z "${PG_TEST_SHARD:-}" ] || [ "$PG_TEST_SHARD" = "$1" ]; }
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENGINE="${PG_TEST_ENGINE:-$HERE/../bin/oracle-review.sh}"
-FAILS=0
+FAILS=0 CHECKS=0
 check() { # name condition-result detail
+  CHECKS=$((CHECKS + 1))
   if [ "$2" = 0 ]; then echo "ok - $1"; else echo "FAIL - $1: ${3:-}"; FAILS=$((FAILS + 1)); fi
 }
 phase_of() { jq -r .phase "$1" 2>/dev/null || sed -nE 's/.*"phase":"([^"]+)".*/\1/p' "$1"; }
 
 TDIR="$(mktemp -d "${TMPDIR:-/tmp}/pg-engine-test.XXXXXX")"
-trap 'kill "${MOCK_PID:-0}" 2>/dev/null; rm -rf "$TDIR"' EXIT
+# Kill only a mock this run started: `kill 0` would signal the caller's whole process group, and a
+# run that exits before its first start_mock, such as a shard that selects no region, has none (#254).
+trap '[ -n "${MOCK_PID:-}" ] && kill "$MOCK_PID" 2>/dev/null; rm -rf "$TDIR"' EXIT
 mkdir -p "$TDIR/home" "$TDIR/bin" "$TDIR/user/.local/bin"
 
 # Self-hosted runners may export operator overrides. The fixture supplies every setting it needs,
@@ -1076,6 +1089,143 @@ HANDOFF_AT_SCAN
     "$([ "$rc" -eq 0 ] && jq -e '.action=="run-granted-review"' "$root/legacy-exact.json" >/dev/null && [ -s "$home.oracle.calls" ]; echo $?)" \
     "rc=$rc decision=$(jq -c '{action,reason}' "$root/legacy-exact.json" 2>/dev/null) stderr=$(tail -4 "$root/legacy-exact-effect.err")"
 }
+# Fixtures shared by every shard (#254). Each was first built by the test that needed it, but
+# later regions read it too, so it lives here, where a region running alone still has it.
+LIB="$HERE/../lib/pro-gate-lib.sh"
+FOREIGN164='pg-run-crossfeed-2619-1700000069-20' # another run's marker, for the #164 ownership cases
+seq 1 26000 | sed 's/^/+/' > "$TDIR/huge.diff"
+printf 'diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -0,0 +1 @@\n+small\n' > "$TDIR/small.diff"
+ORGANIZER_STATE="$TDIR/organizer-state.json"
+ORGANIZER_TITLE='pro-gate review: PR #77 r1 [engine-fixture]'
+printf '{"title":null,"archived":false,"events":[]}\n' > "$ORGANIZER_STATE"
+mkdir -p "$TDIR/home/conversation-titles"
+printf '%s\n' "$ORGANIZER_TITLE" > "$TDIR/home/conversation-titles/$MARKER"
+cat > "$TDIR/bin/oracle-ok" <<'FAKE_OK'
+#!/usr/bin/env bash
+out=""
+while [ $# -gt 0 ]; do case "$1" in --write-output) out="$2"; shift 2;; *) shift;; esac; done
+printf '[P1] a.sh:1 - finding\n  Why: test\nP2: none\nP3: none\nVERDICT: SHIP - fixture.\n' > "$out"
+FAKE_OK
+chmod +x "$TDIR/bin/oracle-ok"
+# A fake oracle that records its argv, optionally emits a "Model selection evidence:" line
+# ($PG_TEST_EVIDENCE, echoed to stdout -> $RUNLOG), and writes a complete review (fresh-success).
+cat > "$TDIR/bin/oracle-evidence" <<'FAKE_EV'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${PG_TEST_ARGV_FILE:-/dev/null}"
+if [ -n "${PG_TEST_ARGV_FILE:-}" ]; then
+  printf '%s\0' "$@" > "$PG_TEST_ARGV_FILE.args"
+fi
+out=""
+while [ $# -gt 0 ]; do case "$1" in
+  --write-output) out="$2"; shift 2;;
+  # Optional: keep each attachment as delivered, so a test can compare its exact bytes.
+  --file) [ -z "${PG_TEST_ATTACH_DIR:-}" ] || cp "$2" "$PG_TEST_ATTACH_DIR/"; shift 2;;
+  *) shift;;
+esac; done
+[ -n "${PG_TEST_EVIDENCE:-}" ] && printf '%s\n' "$PG_TEST_EVIDENCE"
+printf '[P1] a.sh:1 - finding\n  Why: test\nP2: none\nP3: none\nVERDICT: SHIP - fixture.\n' > "$out"
+FAKE_EV
+chmod +x "$TDIR/bin/oracle-evidence"
+cat > "$TDIR/prov-ours.md" <<'PO'
+P0: none
+
+[P1] src/real.sh:7 — real finding
+
+VERDICT: FIX-FIRST — ours
+PO
+cat > "$TDIR/bin/oracle-commit-timeout" <<'FAKE_COMMIT_TIMEOUT'
+#!/usr/bin/env bash
+if [ "${1:-}" = session ]; then
+  [ -z "${PG_TEST_SESSION_CALLS:-}" ] || printf 'session %s\n' "${2:-}" >> "$PG_TEST_SESSION_CALLS"
+  exit 1
+fi
+prompt=""; chatgpt_url=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p) prompt="$2"; shift 2 ;;
+    --chatgpt-url) chatgpt_url="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -z "${PG_TEST_CHATGPT_URL_FILE:-}" ] || printf '%s\n' "$chatgpt_url" > "$PG_TEST_CHATGPT_URL_FILE"
+tab_url="${PG_TEST_TAB_URL:-https://chatgpt.com/}"
+count=0
+[ -s "${PG_TEST_ATTEMPTS_FILE:?}" ] && count="$(cat "$PG_TEST_ATTEMPTS_FILE")"
+count=$((count + 1)); printf '%s\n' "$count" > "$PG_TEST_ATTEMPTS_FILE"
+slug="fake-prompt-commit-$count"
+# PG_TEST_COMMIT_MODE may name one mode per attempt, comma-separated; the last one repeats.
+mode="$(printf '%s\n' "${PG_TEST_COMMIT_MODE:-complete}" | cut -d, -f"$count")"
+[ -n "$mode" ] || mode="${PG_TEST_COMMIT_MODE##*,}"
+mkdir -p "${ORACLE_HOME_DIR:?}/sessions/$slug"
+submitted=true; [ "$mode" != pre-submit ] || submitted=false
+jq -n --arg id "$slug" --arg prompt "$prompt" --arg tabUrl "$tab_url" \
+  --argjson promptLength "${#prompt}" --argjson submitted "$submitted" '
+  {
+    id: $id,
+    status: "error",
+    mode: "browser",
+    options: {prompt: $prompt},
+    browser: {runtime: {promptSubmitted: $submitted, tabUrl: $tabUrl}},
+    error: {
+      category: "browser-automation",
+      details: {
+        stage: "submit-prompt",
+        code: "prompt-commit-timeout",
+        promptLength: $promptLength,
+        timeoutMs: 60000,
+        commitProbe: {
+          baseline: 0,
+          turnsCount: 0,
+          userMatched: false,
+          prefixMatched: false,
+          lastMatched: false,
+          hasNewTurn: false,
+          stopVisible: false,
+          assistantVisible: false,
+          composerCleared: false,
+          inConversation: false,
+          editorLength: 0,
+          lastTurnLength: 0
+        }
+      }
+    }
+  }
+' > "$ORACLE_HOME_DIR/sessions/$slug/meta.json"
+mode_filter=""
+case "$mode" in
+  partial) mode_filter='del(.error.details.commitProbe.prefixMatched)' ;;
+  in-conversation) mode_filter='.error.details.commitProbe.inConversation = true' ;;
+  conversation-id) mode_filter='.browser.runtime.conversationId = "fake-conversation"' ;;
+  foreign-prompt) mode_filter='.options.prompt = "another run prompt"' ;;
+  editor-holds-prompt) mode_filter='.error.details.commitProbe.editorLength = .error.details.promptLength' ;;
+  no-editor-length) mode_filter='del(.error.details.commitProbe.editorLength)' ;;
+  no-tab-url) mode_filter='del(.browser.runtime.tabUrl)' ;;
+  blank-tab-url) mode_filter='.browser.runtime.tabUrl = ""' ;;
+  new-turn) mode_filter='.error.details.commitProbe.hasNewTurn = true' ;;
+  stop-visible) mode_filter='.error.details.commitProbe.stopVisible = true' ;;
+  assistant-visible) mode_filter='.error.details.commitProbe.assistantVisible = true' ;;
+  whitespace-tab-url) mode_filter='.browser.runtime.tabUrl = " \t "' ;;
+  malformed-submitted) mode_filter='.browser.runtime.promptSubmitted = false | .error.details.runtime.promptSubmitted = "true"' ;;
+  error-runtime) mode_filter='del(.browser.runtime) | .error.details.runtime = {promptSubmitted: true, tabUrl: "https://chatgpt.com/"}' ;;
+  error-runtime-conversation-id) mode_filter='.error.details.runtime.conversationId = "fake-conversation"' ;;
+  error-runtime-tab-on-conversation) mode_filter='.error.details.runtime.tabUrl = "https://chatgpt.com/c/fake-conversation"' ;;
+esac
+if [ -n "$mode_filter" ]; then
+  jq "$mode_filter" \
+    "$ORACLE_HOME_DIR/sessions/$slug/meta.json" > "$ORACLE_HOME_DIR/sessions/$slug/meta.tmp"
+  mv "$ORACLE_HOME_DIR/sessions/$slug/meta.tmp" "$ORACLE_HOME_DIR/sessions/$slug/meta.json"
+fi
+printf 'Session: %s\n' "$slug"
+printf 'Reattach: oracle session %s\n' "$slug"
+printf 'Launching browser mode\nAcquired ChatGPT browser slot\n'
+printf 'ERROR: Prompt did not appear in conversation before timeout (send may have failed)\n'
+exit 1
+FAKE_COMMIT_TIMEOUT
+chmod +x "$TDIR/bin/oracle-commit-timeout"
+
+# Shard regions. Their bodies are deliberately left unindented, so the split does not
+# rewrite every line of the suite.
+if in_shard 1; then
 run_pr_evidence_identity_tests
 if [ "${PG_TEST_ONLY:-}" = pr-evidence-identity ]; then
   [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }
@@ -1231,11 +1381,6 @@ fi
 
 echo '# hard-ceiling refusal (exit 11): only diffs past PRO_GATE_DIFF_HARD_MAX are refused'
 printf 'still thinking, run marker: %s\n' "$MARKER" > "$TDIR/tab.txt"
-ORGANIZER_STATE="$TDIR/organizer-state.json"
-ORGANIZER_TITLE='pro-gate review: PR #77 r1 [engine-fixture]'
-printf '{"title":null,"archived":false,"events":[]}\n' > "$ORGANIZER_STATE"
-mkdir -p "$TDIR/home/conversation-titles"
-printf '%s\n' "$ORGANIZER_TITLE" > "$TDIR/home/conversation-titles/$MARKER"
 start_mock "$TDIR/tab.txt" "$ORGANIZER_STATE"
 
 # Input policy is resolved immediately after parsing. Rejections must precede every state or output
@@ -1553,7 +1698,6 @@ printf 'still thinking, run marker: %s\n' "$MARKER" > "$TDIR/tab.txt"
 start_mock "$TDIR/tab.txt" "$ORGANIZER_STATE"
 
 # > default hard ceiling (25000): still refused up front, no slot spent.
-seq 1 26000 | sed 's/^/+/' > "$TDIR/huge.diff"
 run_engine --diff "$TDIR/huge.diff" --repo "$TDIR" --out "$TDIR/o-big.md" --timeout 5m
 check 'past-hard-ceiling diff exits 11' "$([ "$RC" -eq 11 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
 check 'past-hard-ceiling status phase oversized' "$([ "$(phase_of "$TDIR/o-big.md.status")" = oversized ]; echo $?)" "$(cat "$TDIR/o-big.md.status" 2>/dev/null)"
@@ -1602,7 +1746,6 @@ check 'harvest records the salvage classification (owned-incomplete)' \
 # active. It redirects to harvest (exit 9) before acquiring/spending a slot. The reservation is
 # keyed by repo-scoped PR_KEY (repo slug + number), so seed it exactly as a fresh run computes
 # it for this checkout (no git remote here, so the slug falls back to the repo basename).
-printf 'diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -0,0 +1 @@\n+small\n' > "$TDIR/small.diff"
 PR_KEY_77="$(printf '%s-77' "$(basename "$TDIR")" | tr -c 'A-Za-z0-9.\n-' '-')"
 printf '%s\t%s\t%s\t0\t\n' "$PR_KEY_77" "$TDIR/o-h1.md" "$(date +%s)" > "$TDIR/home/in-progress/$MARKER"
 run_engine --pr 77 --repo "$TDIR" --diff "$TDIR/small.diff" --out "$TDIR/o-redirect.md" --timeout 5m
@@ -2086,13 +2229,6 @@ rm -rf "$TDIR/home2"
 
 echo '# slot exclusion prevents overbooking through a freed lower slot'
 mkdir -p "$TDIR/home3/in-progress" "$TDIR/bin"
-cat > "$TDIR/bin/oracle-ok" <<'FAKE_OK'
-#!/usr/bin/env bash
-out=""
-while [ $# -gt 0 ]; do case "$1" in --write-output) out="$2"; shift 2;; *) shift;; esac; done
-printf '[P1] a.sh:1 - finding\n  Why: test\nP2: none\nP3: none\nVERDICT: SHIP - fixture.\n' > "$out"
-FAKE_OK
-chmod +x "$TDIR/bin/oracle-ok"
 printf 'kA\toA\t%s\t0\t1\n' "$(date +%s)" > "$TDIR/home3/in-progress/pg-run-slotted-1700000003-44"
 exec {S2FD}>>"$TDIR/home3/oracle.lock.slot2"; flock -n "$S2FD"
 printf 'still thinking foreign\n' > "$TDIR/tab.txt"
@@ -2219,25 +2355,6 @@ EV_BENIGN='[browser] Model selection evidence: requested=Pro; resolved=(unavaila
 EV_WEAK='[browser] Model selection evidence: requested=gpt-5.5-pro; resolved=GPT-4o mini; status=ok; strategy=current; verified=yes.'
 EV_ULTRA='[browser] Model selection evidence: requested=gpt-5.5-pro; resolved=GPT-5.6 Sol Ultra; status=ok; strategy=current; verified=yes.'
 
-# A fake oracle that records its argv, optionally emits a "Model selection evidence:" line
-# ($PG_TEST_EVIDENCE, echoed to stdout -> $RUNLOG), and writes a complete review (fresh-success).
-cat > "$TDIR/bin/oracle-evidence" <<'FAKE_EV'
-#!/usr/bin/env bash
-printf '%s\n' "$*" >> "${PG_TEST_ARGV_FILE:-/dev/null}"
-if [ -n "${PG_TEST_ARGV_FILE:-}" ]; then
-  printf '%s\0' "$@" > "$PG_TEST_ARGV_FILE.args"
-fi
-out=""
-while [ $# -gt 0 ]; do case "$1" in
-  --write-output) out="$2"; shift 2;;
-  # Optional: keep each attachment as delivered, so a test can compare its exact bytes.
-  --file) [ -z "${PG_TEST_ATTACH_DIR:-}" ] || cp "$2" "$PG_TEST_ATTACH_DIR/"; shift 2;;
-  *) shift;;
-esac; done
-[ -n "${PG_TEST_EVIDENCE:-}" ] && printf '%s\n' "$PG_TEST_EVIDENCE"
-printf '[P1] a.sh:1 - finding\n  Why: test\nP2: none\nP3: none\nVERDICT: SHIP - fixture.\n' > "$out"
-FAKE_EV
-chmod +x "$TDIR/bin/oracle-evidence"
 
 freshrun() { # $1=home $2=argv-file $3=evidence $4=out [strategy] [legacy browser archive]
   rm -rf "$1"; mkdir -p "$1/in-progress"; : > "$2"; printf 'foreign idle tab\n' > "$TDIR/tab.txt"
@@ -2502,6 +2619,14 @@ run_engine --harvest "$MKW" --out "$TDIR/o-weakres.md" --timeout 30s
 check 'weak persisted model harvest exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
 check 'weak persisted model harvest names it' "$([ "$(model_of "$TDIR/o-weakres.md.status")" = 'GPT-4o mini' ]; echo $?)" "model=$(model_of "$TDIR/o-weakres.md.status")"
 check 'weak persisted model harvest WARNS (weak denylist)' "$(printf '%s' "$(warn_of "$TDIR/o-weakres.md.status")" | grep -q denylist; echo $?)" "warn=$(warn_of "$TDIR/o-weakres.md.status")"
+
+fi # in_shard 1
+
+if in_shard 2; then
+# Region 1 leaves the mock serving $TDIR/tab.txt with no organizer state; start it that way here
+# too, so region 2 sees the same browser whether or not region 1 ran.
+printf 'foreign idle tab\n' > "$TDIR/tab.txt"
+start_mock "$TDIR/tab.txt"
 
 echo '# v0.22: per-PR review round budget (exit 12, no spend)'
 RHOME="$TDIR/home-rounds"
@@ -3333,95 +3458,6 @@ check 'force-killed attempt never announces a refund' \
 # v0.32: Oracle 0.17+ stores prompt-commit state only after dispatching Send/Enter. Even a complete
 # all-negative DOM probe cannot prove ChatGPT rejected that request, so browser-lifecycle evidence
 # must suppress retries and retain the round regardless of metadata completeness or landing URL.
-cat > "$TDIR/bin/oracle-commit-timeout" <<'FAKE_COMMIT_TIMEOUT'
-#!/usr/bin/env bash
-if [ "${1:-}" = session ]; then
-  [ -z "${PG_TEST_SESSION_CALLS:-}" ] || printf 'session %s\n' "${2:-}" >> "$PG_TEST_SESSION_CALLS"
-  exit 1
-fi
-prompt=""; chatgpt_url=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -p) prompt="$2"; shift 2 ;;
-    --chatgpt-url) chatgpt_url="$2"; shift 2 ;;
-    *) shift ;;
-  esac
-done
-[ -z "${PG_TEST_CHATGPT_URL_FILE:-}" ] || printf '%s\n' "$chatgpt_url" > "$PG_TEST_CHATGPT_URL_FILE"
-tab_url="${PG_TEST_TAB_URL:-https://chatgpt.com/}"
-count=0
-[ -s "${PG_TEST_ATTEMPTS_FILE:?}" ] && count="$(cat "$PG_TEST_ATTEMPTS_FILE")"
-count=$((count + 1)); printf '%s\n' "$count" > "$PG_TEST_ATTEMPTS_FILE"
-slug="fake-prompt-commit-$count"
-# PG_TEST_COMMIT_MODE may name one mode per attempt, comma-separated; the last one repeats.
-mode="$(printf '%s\n' "${PG_TEST_COMMIT_MODE:-complete}" | cut -d, -f"$count")"
-[ -n "$mode" ] || mode="${PG_TEST_COMMIT_MODE##*,}"
-mkdir -p "${ORACLE_HOME_DIR:?}/sessions/$slug"
-submitted=true; [ "$mode" != pre-submit ] || submitted=false
-jq -n --arg id "$slug" --arg prompt "$prompt" --arg tabUrl "$tab_url" \
-  --argjson promptLength "${#prompt}" --argjson submitted "$submitted" '
-  {
-    id: $id,
-    status: "error",
-    mode: "browser",
-    options: {prompt: $prompt},
-    browser: {runtime: {promptSubmitted: $submitted, tabUrl: $tabUrl}},
-    error: {
-      category: "browser-automation",
-      details: {
-        stage: "submit-prompt",
-        code: "prompt-commit-timeout",
-        promptLength: $promptLength,
-        timeoutMs: 60000,
-        commitProbe: {
-          baseline: 0,
-          turnsCount: 0,
-          userMatched: false,
-          prefixMatched: false,
-          lastMatched: false,
-          hasNewTurn: false,
-          stopVisible: false,
-          assistantVisible: false,
-          composerCleared: false,
-          inConversation: false,
-          editorLength: 0,
-          lastTurnLength: 0
-        }
-      }
-    }
-  }
-' > "$ORACLE_HOME_DIR/sessions/$slug/meta.json"
-mode_filter=""
-case "$mode" in
-  partial) mode_filter='del(.error.details.commitProbe.prefixMatched)' ;;
-  in-conversation) mode_filter='.error.details.commitProbe.inConversation = true' ;;
-  conversation-id) mode_filter='.browser.runtime.conversationId = "fake-conversation"' ;;
-  foreign-prompt) mode_filter='.options.prompt = "another run prompt"' ;;
-  editor-holds-prompt) mode_filter='.error.details.commitProbe.editorLength = .error.details.promptLength' ;;
-  no-editor-length) mode_filter='del(.error.details.commitProbe.editorLength)' ;;
-  no-tab-url) mode_filter='del(.browser.runtime.tabUrl)' ;;
-  blank-tab-url) mode_filter='.browser.runtime.tabUrl = ""' ;;
-  new-turn) mode_filter='.error.details.commitProbe.hasNewTurn = true' ;;
-  stop-visible) mode_filter='.error.details.commitProbe.stopVisible = true' ;;
-  assistant-visible) mode_filter='.error.details.commitProbe.assistantVisible = true' ;;
-  whitespace-tab-url) mode_filter='.browser.runtime.tabUrl = " \t "' ;;
-  malformed-submitted) mode_filter='.browser.runtime.promptSubmitted = false | .error.details.runtime.promptSubmitted = "true"' ;;
-  error-runtime) mode_filter='del(.browser.runtime) | .error.details.runtime = {promptSubmitted: true, tabUrl: "https://chatgpt.com/"}' ;;
-  error-runtime-conversation-id) mode_filter='.error.details.runtime.conversationId = "fake-conversation"' ;;
-  error-runtime-tab-on-conversation) mode_filter='.error.details.runtime.tabUrl = "https://chatgpt.com/c/fake-conversation"' ;;
-esac
-if [ -n "$mode_filter" ]; then
-  jq "$mode_filter" \
-    "$ORACLE_HOME_DIR/sessions/$slug/meta.json" > "$ORACLE_HOME_DIR/sessions/$slug/meta.tmp"
-  mv "$ORACLE_HOME_DIR/sessions/$slug/meta.tmp" "$ORACLE_HOME_DIR/sessions/$slug/meta.json"
-fi
-printf 'Session: %s\n' "$slug"
-printf 'Reattach: oracle session %s\n' "$slug"
-printf 'Launching browser mode\nAcquired ChatGPT browser slot\n'
-printf 'ERROR: Prompt did not appear in conversation before timeout (send may have failed)\n'
-exit 1
-FAKE_COMMIT_TIMEOUT
-chmod +x "$TDIR/bin/oracle-commit-timeout"
 
 PROOF_HOME="$TDIR/home-prompt-proof"; PROOF_ORACLE="$TDIR/oracle-prompt-proof"
 PROOF_ATTEMPTS="$TDIR/prompt-proof-attempts"; PROOF_URL="$TDIR/prompt-proof-url"
@@ -4092,7 +4128,6 @@ PRO_GATE_HOME="$RHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_unrec
 check 'unrecord removes an emptied file' "$([ ! -f "$RHOME/rounds/unrec-key-1" ]; echo $?)" 'file survived'
 
 echo '# memory-pressure messaging helpers (low-memory robustness)'
-LIB="$HERE/../lib/pro-gate-lib.sh"
 # pg_mem_status: human snapshot naming free RAM (where free(1) exists, i.e. Linux CI)
 MSTAT="$(bash -c ". '$LIB'; pg_mem_status")"
 check 'pg_mem_status reports free RAM' "$(printf '%s' "$MSTAT" | grep -q 'free RAM'; echo $?)" "got: $MSTAT"
@@ -4531,13 +4566,6 @@ P0: none
 
 VERDICT: FIX-FIRST — ambiguous
 PS
-cat > "$TDIR/prov-ours.md" <<'PO'
-P0: none
-
-[P1] src/real.sh:7 — real finding
-
-VERDICT: FIX-FIRST — ours
-PO
 bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_review_matches_change '$TDIR/prov-foreign.md' '$TDIR/manifest.txt'"; RC=$?
 check 'provenance rejects zero-overlap citations' "$([ "$RC" -ne 0 ]; echo $?)" "rc=$RC"
 bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_review_matches_change '$TDIR/prov-ours.md' '$TDIR/manifest.txt'"; RC=$?
@@ -4562,8 +4590,8 @@ check 'provenance rejects basename-only twins' "$([ "$RC" -ne 0 ]; echo $?)" "rc
 
 echo '# v0.28: harvest provenance — foreign capture preserved, never returned as ours'
 M3="pg-run-provtest-9-1700000030-44"
+mkdir -p "$TDIR/home/in-progress" "$TDIR/home/manifests"
 printf '9\t%s\t%s\t0\t1\tGPT-X\n' "$TDIR/o-prov.md" "$(date +%s)" > "$TDIR/home/in-progress/$M3"
-mkdir -p "$TDIR/home/manifests"
 printf 'src/real.sh\n' > "$TDIR/home/manifests/$M3"
 cat > "$TDIR/tab.txt" <<TAB
 conversation for run marker: $M3
@@ -4662,7 +4690,6 @@ rm -f "$TDIR/home/in-progress/$M13" "$TDIR/home/manifests/$M13"
 
 # #164: ownership is validated on the full response before publication. Fixtures exercise both
 # collectors, immutable replay, and charge retention; they do not prove live ChatGPT behavior.
-FOREIGN164='pg-run-crossfeed-2619-1700000069-20'
 BIND_MARKER='pg-run-bindunit-1-1700000080-31'
 bind_case() { # <name> <expected-rc> <body>
   local name="$1" expected="$2" body="$3" actual
@@ -4963,6 +4990,12 @@ rm -f "$TDIR/home/throttle.cooldown"
 check 'artifact-first recovery exits 0 (even under cooldown, no ledger row)' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
 check 'artifact content returned verbatim' "$(cmp -s "$TDIR/o-artifact.md" "$TDIR/prov-ours.md"; echo $?)" "$(head -2 "$TDIR/o-artifact.md" 2>/dev/null)"
 check 'artifact retrieval under active cooldown never invokes organizer mode' "$(! grep -q -- '--organize' "$TDIR/node-args-artifact-cooldown.log"; echo $?)" "$(cat "$TDIR/node-args-artifact-cooldown.log")"
+# A cooldown that predates artifact-only recovery suppresses browser traffic, but it is not evidence
+# that this invocation hit a throttle. Preserve the existing clean ledger semantics.
+ARTIFACT_COOLDOWN_ROW="$(grep -F '"out":"'$TDIR'/o-artifact.md"' "$TDIR/home/ledger.jsonl" | tail -1)"
+check 'pre-existing cooldown does not relabel artifact recovery as throttle' \
+  "$([ "$(printf '%s' "$ARTIFACT_COOLDOWN_ROW" | jq -r .outcome 2>/dev/null)" = clean ]; echo $?)" \
+  "$ARTIFACT_COOLDOWN_ROW"
 
 # A peer can write the shared account cooldown while this process is queued behind the marker's
 # organizer lock. The cooldown check must happen again AFTER lock acquisition; otherwise this
@@ -5238,6 +5271,9 @@ M5="pg-run-lostcase-6-1700000032-66"
 run_engine --harvest "$M5" --out "$TDIR/o-lost.md" --timeout 5s
 check 'absent reservation without ledger row still exits 6' "$([ "$RC" -eq 6 ]; echo $?)" "rc=$RC $(tail -1 "$TDIR/stderr")"
 
+fi # in_shard 2
+
+if in_shard 3; then
 echo '# v0.28: early URL capture + change manifest on a fresh run'
 cat > "$TDIR/bin/oracle-early" <<EARLY
 #!/usr/bin/env bash
@@ -5469,13 +5505,6 @@ check 'organizer throttle applies exactly one ramp reset' \
       && grep -q 'throttle observed' "$TDIR/stderr" \
       && awk -F'\t' 'NR==1{exit !($1==1 && $2==0)}' "$THROTTLE_HOME/ramp.state"; echo $?)" \
   "state=$(cat "$THROTTLE_HOME/ramp.state" 2>/dev/null) ramp-log=$(grep '^\[pro-gate ramp\]' "$TDIR/stderr")"
-
-# A cooldown that predates artifact-only recovery suppresses browser traffic, but it is not evidence
-# that this invocation hit a throttle. Preserve the existing clean ledger semantics.
-ARTIFACT_COOLDOWN_ROW="$(grep -F '"out":"'$TDIR'/o-artifact.md"' "$TDIR/home/ledger.jsonl" | tail -1)"
-check 'pre-existing cooldown does not relabel artifact recovery as throttle' \
-  "$([ "$(printf '%s' "$ARTIFACT_COOLDOWN_ROW" | jq -r .outcome 2>/dev/null)" = clean ]; echo $?)" \
-  "$ARTIFACT_COOLDOWN_ROW"
 
 # Stock macOS lacks flock. Model a winner paused after mkdir but before metadata publication; a
 # contender must treat that empty directory as busy rather than deleting a live lock after one second.
@@ -8957,13 +8986,15 @@ check '#189: a live owner is still waited out for the whole wait bound, then ref
 # shipped defaults (5s budget, 5s grace) the waiter reaches it one sleep after its own budget has
 # run out. An elapsed check there discarded that reclaim and returned 1, refusing a lock this
 # process had itself just freed; crash recovery is the case the whole branch exists for. The
-# fixture compresses the shipped 5s/5s into 1s/2s: same ordering, two seconds instead of six.
+# fixture compresses the shipped 5s/5s into 2s/2s: same ordering, two seconds instead of six.
+# Not 1s/2s: pg_lock counts whole seconds, so a 1s budget that starts late in a second can be
+# spent by a slow first reclaim before any sleep, which failed this check under load (#254).
 LOCKLATE_HOME="$TDIR/home-lock-late"; mkdir -p "$LOCKLATE_HOME/change.lock.d"   # unmarked orphan
 LOCKLATE_START=$(date +%s)
 LOCKLATE_OUT="$(/usr/bin/timeout 30 bash -c '
   . "$1"
   pg_have() { [ "$1" = flock ] && return 1; command -v "$1" >/dev/null 2>&1; }
-  PRO_GATE_DIRLOCK_ORPHAN_GRACE=2 pg_lock "$2" 1
+  PRO_GATE_DIRLOCK_ORPHAN_GRACE=2 pg_lock "$2" 2
   printf "rc=%s" "$?"
 ' _ "$HERE/../lib/pro-gate-lib.sh" "$LOCKLATE_HOME/change.lock")"
 LOCKLATE_ELAPSED=$(( $(date +%s) - LOCKLATE_START ))
@@ -10235,16 +10266,20 @@ chmod +x "$TDIR/bin/gh-slow-open-releases"
 SW_LIVE_HOME="$TDIR/home-slotwait-live-release"
 SW_LIVE_MARKER='pg-run-acme-fresh-77-1700014458-1'
 super_seed "$SW_LIVE_HOME" "$SW_LIVE_MARKER" 1700014458 "$FRESH_HEAD"
-bash -c 'exec 9>>"$1" && flock -n 9 && exec sleep 60' _ "$SW_LIVE_HOME/oracle.lock.slot2" &
+# The holder waits for the lock: the readiness probe below holds it for an instant, and a holder that
+# failed fast in that instant exited and left slot 2 free, so the waiter never swept (#254).
+bash -c 'exec 9>>"$1" && flock -w 10 9 && exec sleep 60' _ "$SW_LIVE_HOME/oracle.lock.slot2" &
 SW_LIVE_HOLDER=$!
 printf '%s\n' "$SW_LIVE_HOLDER" > "$SUPER_GH_CALLS.holder"
 for _ in $(seq 1 100); do flock -n "$SW_LIVE_HOME/oracle.lock.slot2" true 2>/dev/null || break; sleep 0.05; done
+SW_LIVE_HELD=0; flock -n "$SW_LIVE_HOME/oracle.lock.slot2" true 2>/dev/null || SW_LIVE_HELD=1
 slotwait_run "$SW_LIVE_HOME" 3 OPEN "$FRESH_HEAD" ok 2 3600 "$TDIR/bin/gh-slow-open-releases"
 kill "$SW_LIVE_HOLDER" 2>/dev/null; wait "$SW_LIVE_HOLDER" 2>/dev/null
 check '#234 a slot another run frees during an unsuccessful proof is still taken at the deadline' \
-  "$([ "$RC" -eq 0 ] && [ -s "$SW_LIVE_HOME/waiter.md" ] && [ "$(slotwait_proof_calls)" = "$SW_GH_LINE" ] \
+  "$([ "$SW_LIVE_HELD" = 1 ] && [ "$RC" -eq 0 ] && [ -s "$SW_LIVE_HOME/waiter.md" ] \
+     && [ "$(slotwait_proof_calls)" = "$SW_GH_LINE" ] \
      && [ "$(slotwait_state "$SW_LIVE_HOME" "$SW_LIVE_MARKER")" = generating ]; echo $?)" \
-  "$(slotwait_detail "$SW_LIVE_HOME" "$SW_LIVE_MARKER")"
+  "slot2-held=$SW_LIVE_HELD $(slotwait_detail "$SW_LIVE_HOME" "$SW_LIVE_MARKER")"
 
 # The #234 incident had two merged PRs' exited runs holding slots at once. One sweep releases every
 # holder it can prove, not only the first: a sweep that stopped at its first release would free one
@@ -10401,4 +10436,7 @@ check '#233 an Oracle that exited by itself is not relabelled watchdog-killed' \
   "$(! grep -qF 'watchdog: ChatGPT never started thinking' "$TDIR/stderr"; echo $?)" \
   "rc=$RC $(grep -F 'watchdog' "$TDIR/stderr" | tail -3)"
 
+fi # in_shard 3
+
+[ "$CHECKS" -gt 0 ] || { echo "FATAL - no checks ran (PG_TEST_SHARD=${PG_TEST_SHARD:-unset})"; exit 1; }
 [ "$FAILS" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$FAILS FAILURES"; exit 1; }
