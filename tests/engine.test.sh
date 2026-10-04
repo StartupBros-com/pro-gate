@@ -19,7 +19,7 @@
 # left behind. tests/ci-assurance.test.sh requires one CI leg per shard.
 set -uo pipefail
 PG_TEST_SHARDS=3
-if [ -n "${PG_TEST_SHARD:-}" ] && ! seq 1 "$PG_TEST_SHARDS" | grep -qx -- "$PG_TEST_SHARD"; then
+if [ -n "${PG_TEST_SHARD:-}" ] && ! seq 1 "$PG_TEST_SHARDS" | grep -qxF -- "$PG_TEST_SHARD"; then
   echo "FATAL - PG_TEST_SHARD must be empty or 1-$PG_TEST_SHARDS, got '$PG_TEST_SHARD'" >&2
   exit 2
 fi

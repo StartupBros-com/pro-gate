@@ -44,17 +44,30 @@ yq '(.jobs.tests.strategy.matrix.include[] | select(.leg == "engine-3") | .tests
 if leg_coverage "$TDIR/ci-shard-doubled.yml" 2>/dev/null; then fail 'planted doubled engine shard passed the leg coverage check'; fi
 echo 'ok - every test file runs in exactly one CI leg; a dropped or doubled suite or engine shard is rejected'
 
-# The engine suite's shard regions must be numbered 1..PG_TEST_SHARDS in file order, so one leg per
-# shard runs every region once, and an out-of-range shard must refuse instead of running nothing.
+# The engine suite's shard regions must be numbered 1..PG_TEST_SHARDS in file order, and in_shard k
+# must select region k and no other, so one leg per shard runs every region once; an in_shard that
+# selected every region would keep coverage and silently undo the split. A shard outside
+# 1..PG_TEST_SHARDS, including a pattern such as `.`, must refuse instead of running nothing.
 engine_suite="$ROOT/tests/engine.test.sh"
 engine_shards="$(sed -n 's/^PG_TEST_SHARDS=\([1-9][0-9]*\)$/\1/p' "$engine_suite")"
 [ "$(sed -n 's/^if in_shard \([0-9][0-9]*\); then$/\1/p' "$engine_suite" | tr '\n' ' ')" = "$(seq -s ' ' 1 "$engine_shards") " ] \
   || fail 'engine shard regions must be numbered 1..PG_TEST_SHARDS in file order'
-if PG_TEST_SHARD=$((engine_shards + 1)) bash "$engine_suite" > "$TDIR/shard-range.log" 2>&1; then
-  fail 'an out-of-range engine shard ran instead of refusing'
-fi
-grep -Fq 'PG_TEST_SHARD must be' "$TDIR/shard-range.log" || fail 'out-of-range engine shard refused for another reason'
-echo 'ok - engine shard regions are numbered 1..PG_TEST_SHARDS and an out-of-range shard refuses'
+eval "$(sed -n '/^in_shard() {/p' "$engine_suite")"
+[ "$(type -t in_shard)" = function ] || fail 'the engine suite must define in_shard() on one line'
+for k in $(seq 1 "$engine_shards"); do
+  for region in $(seq 1 "$engine_shards"); do
+    selected=0; PG_TEST_SHARD="$k" in_shard "$region" && selected=1
+    [ "$selected" = "$([ "$k" = "$region" ] && echo 1 || echo 0)" ] || fail "PG_TEST_SHARD=$k: in_shard $region returned selected=$selected"
+  done
+  PG_TEST_SHARD='' in_shard "$k" || fail "an unsharded engine run skips region $k"
+done
+for shard in $((engine_shards + 1)) .; do
+  if PG_TEST_SHARD="$shard" bash "$engine_suite" > "$TDIR/shard-range.log" 2>&1; then
+    fail "engine shard '$shard' ran instead of refusing"
+  fi
+  grep -Fq 'PG_TEST_SHARD must be' "$TDIR/shard-range.log" || fail "engine shard '$shard' refused for another reason"
+done
+echo 'ok - engine shard regions are numbered 1..PG_TEST_SHARDS, each shard selects only its own, and an invalid shard refuses'
 
 # Source validation and the release-notes gate run once, in the rest leg. A renamed leg or a
 # mistyped condition would skip them on every leg while trusted check stays green.
