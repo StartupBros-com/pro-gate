@@ -2266,11 +2266,13 @@ function onOurConversation(url, evidence) {
 
 // A readable incomplete source has proved only that its prompt is visible: its terminal answer
 // can still be cross-bound. Preserve a pre-existing recovery handle through an inconclusive
-// scratch pass, but retain this source as a future handle when no prior handle exists.
+// scratch pass, but retain this source as a future handle when no prior handle exists and its
+// URL passes the same shape gate as the durable memo. Keep rememberUrl's rejection diagnostic.
 function rememberInconclusiveReadableSource(url) {
   if (knownUrl) return;
-  ourUrls.add(url);
   rememberUrl(marker, url);
+  if (!conversationUrlOk(url)) return;
+  ourUrls.add(url);
   knownUrl = url;
 }
 
