@@ -5189,6 +5189,7 @@ const FOREIGN_ANSWER = (m) => [
 // when a URL is remembered AND every time one is read.
 const PLACEHOLDER_URLS = [
   'https://chatgpt.com/c/WEB:57cc5403-ad61-4ccd-af90-ad28a539081e',
+  'https://chatgpt.com/c/local-chatgpt%3A21abeebd-1f6d-4f77-93f3-6a0e6c081082',
   // A well-formed UUID after the prefix must still fail: the check anchors the whole segment.
   'https://chatgpt.com/c/WEB:b385e15b-9c62-4dca-bec7-0be2f579c0f3',
 ];
@@ -5205,6 +5206,58 @@ const REAL_ID_URL = 'https://chatgpt.com/c/6a959c8f-c95c-83ea-81b8-85a3ea5d6cbc'
   check('rejection names the marker and the offending id',
     (r.stderr || '').includes('memo-rejected') && (r.stderr || '').includes(MARKER) && (r.stderr || '').includes('WEB:57cc5403'),
     `stderr=${r.stderr?.slice(-400)}`);
+  cdp.stop();
+}
+
+// #258: a readable placeholder may disappear after its canonical scratch redirects. The
+// rejected on-disk memo must not survive as an in-process recovery handle and turn a later
+// clean scan into inconclusive. Real conversation handles remain authoritative through drift.
+for (const { name, sourceUrl, priorUrl = null, absent } of [
+  { name: 'WEB placeholder', sourceUrl: PLACEHOLDER_URLS[0], absent: true },
+  { name: 'local-chatgpt placeholder', sourceUrl: PLACEHOLDER_URLS[1], absent: true },
+  { name: 'real-id source', sourceUrl: REAL_ID_URL, absent: false },
+  { name: 'placeholder with prior real-id memo', sourceUrl: PLACEHOLDER_URLS[1], priorUrl: REAL_ID_URL, absent: false },
+]) {
+  const sourceId = 'disappearing-source';
+  const sourceTabs = [{ id: sourceId, type: 'page', url: sourceUrl }];
+  const cdp = await mockCdp('__NO_TABS__', sourceTabs, {
+    trackCdpDeadlineEvents: true,
+    tabText: () => `run marker: ${MARKER}\nthinking hard, no verdict yet`,
+    scratchTarget: () => {
+      // Model an independently closed source only AFTER the child observed its prompt and
+      // started canonical revalidation. The mock's next outer list successfully shows no tabs.
+      sourceTabs.splice(0);
+      return { url: 'https://chatgpt.com/' };
+    },
+  });
+  const r = await runFastCdpDeadlineSalvage([MARKER, '3'], cdp.port,
+    priorUrl ? seedMemo(MARKER, priorUrl) : undefined);
+  check(`#258 ${name}: source observed, canonical drifted, then a clean empty scan answered`,
+    cdp.jsonListEvents.some((e) => e.source === 'outer' && e.tabIds.includes(sourceId))
+      && cdp.jsonListEvents.some((e) => e.source === 'outer' && e.tabIds.length === 0)
+      && /canonical scratch revalidation was inconclusive \(target-url-drift\)/.test(r.stderr || ''),
+    `events=${JSON.stringify(cdp.jsonListEvents)} stderr=${r.stderr}`);
+  check(`#258 ${name}: disappearance has the correct exit and evidence`,
+    r.status === (absent ? 4 : 7)
+      && new RegExp(`^evidence-kind: ${absent ? 'absent' : 'inconclusive'}$`, 'm').test(r.stderr || ''),
+    `status=${r.status} stderr=${r.stderr}`);
+  check(`#258 ${name}: only valid recovery handles are retained`,
+    absent ? r.memos.length === 0 && /memo-rejected/.test(r.stderr || '')
+      : r.memoUrl === (priorUrl || sourceUrl),
+    `memo=${r.memoUrl} stderr=${r.stderr}`);
+  check(`#258 ${name}: a rejected placeholder is never re-rendered as a remembered URL`,
+    absent ? cdp.created.length === 1 && !/re-rendering the remembered conversation/.test(r.stderr || '')
+      : cdp.created.every((t) => t.url === (priorUrl || sourceUrl)),
+    `created=${JSON.stringify(cdp.created)} stderr=${r.stderr}`);
+  check(`#258 ${name}: salvage closes only disposable scratch targets`,
+    !cdp.closed.includes(sourceId) && cdp.created.every((t) => cdp.closed.includes(t.id)),
+    `closed=${cdp.closed}`);
+  if (absent) {
+    const fresh = await runFastPollSalvage(['--probe', MARKER, '1'], cdp.port);
+    check(`#258 ${name}: same-process disappearance agrees with a fresh empty probe`,
+      r.status === fresh.status && fresh.status === 4 && /^evidence-kind: absent$/m.test(fresh.stderr || ''),
+      `same-process=${r.status} fresh=${fresh.status} stderr=${fresh.stderr}`);
+  }
   cdp.stop();
 }
 
