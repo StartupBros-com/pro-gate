@@ -1363,6 +1363,7 @@ async function evaluateMutation(tab, buildExpression) {
 }
 
 const scopedResponses = new Set();
+const assistantScopeProofs = new Map();
 async function tabText(tab) {
   const expression =
     '/* pro-gate:review-text */ (' +
@@ -1372,9 +1373,18 @@ async function tabText(tab) {
     ')';
   const result = await evaluateTab(tab, expression);
   if (!result.ok) return null;
-  if (typeof result.value === 'string') return result.value;
+  if (typeof result.value === 'string') {
+    assistantScopeProofs.set(result.value, false);
+    return result.value;
+  }
   if (typeof result.value?.text !== 'string') return null;
   if (result.value.promptAt === 0) scopedResponses.add(result.value.text);
+  // Tabs are read concurrently. Equal text must never inherit another target's DOM proof:
+  // one ambiguous or legacy observation disables prefix expansion for these bytes for the
+  // whole invocation, regardless of which read finishes last. Capture remains recoverable.
+  assistantScopeProofs.set(result.value.text,
+    assistantScopeProofs.get(result.value.text) !== false &&
+    result.value.promptAt === 0 && result.value.assistantTurnScoped === true);
   return result.value.text;
 }
 
@@ -1649,7 +1659,9 @@ async function freshRenderText(url, port, outerDeadline, waitForDecisiveEvidence
   }
 }
 
-const responseClaims = (text) => reviewTextContext(text, marker, scopedResponses.has(text) ? 0 : null);
+const responseClaims = (text) => reviewTextContext(
+  text, marker, scopedResponses.has(text) ? 0 : null, assistantScopeProofs.get(text) === true,
+);
 const mixedAnswer = (text) => responseClaims(text).mixed;
 const extractReview = (text) => responseClaims(text).review;
 
