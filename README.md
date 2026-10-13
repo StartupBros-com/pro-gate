@@ -208,6 +208,73 @@ continuation policy. An accepted historical SHIP is not a current SHIP; even app
 leaves CI and merge policy to the consumer. Synthetic CLI tests prove these runtime contracts,
 not live model quality, marketplace release/installation, or a live SHIP verdict.
 
+## Optional GitHub status integration
+
+The runtime includes `record-pro-gate-verdict.mjs`. From the PR checkout, record an accepted
+review at its exact revision, then check the recorded status:
+
+```bash
+node "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/record-pro-gate-verdict.mjs" \
+  --pr 1983 --verdict SHIP --reviewed-sha <full-sha> --evidence <review-url>
+node "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/record-pro-gate-verdict.mjs" \
+  --verify-for-merge --pr 1983
+```
+
+This adapter requires Node.js, authenticated `gh`, and the public facts command's local tools.
+It runs from either the repository's `bin/` directory or the installed runtime, resolving the
+public command beside itself. It needs no private repository, owner scripts, or browser access.
+
+Record flags are assertions, not evidence. The adapter calls the public facts command and
+requires accepted facts, `applicable: true`, the same repository/PR, matching candidate and
+reviewed revisions, and the asserted verdict. Only a current, choice-free `SHIP` can record
+`success`; accepted current `FIX-FIRST` and `NEEDS-DISCUSSION` record `failure`. Historical,
+missing, corrupt, ambiguous, mismatched, or choice-bearing SHIP evidence cannot record success.
+The evidence URL is the status link, not a substitute for accepted review evidence.
+`--input bundle|both|connector` forwards the existing public proof mode (default `bundle`).
+Accepted current connector progress can record a non-SHIP failure, never successful SHIP.
+
+For fresh proof, recording invokes the existing `--prepare-review-evidence` command separately
+from inspection. Its private temporary files are cleaned on completion or failure. You may
+instead supply an existing explicit `PRO_GATE_REVIEW_ENDPOINT_PATCH` /
+`PRO_GATE_REVIEW_PR_EVIDENCE` pair; the adapter snapshots that pair privately so metadata and
+public inspection certify the same bytes. Either way, the proof's target and base must match
+the live PR head, base repository/ref, and branch-tip SHA. A cached PR base snapshot that differs from
+the live tip is refused, not stamped as current. Head, base tip, and default branch are checked
+again before posting exactly one status at the reviewed SHA.
+
+Full-PR recording defaults the reviewed payload to the prepared endpoint patch. Scoped recording
+must preserve its own reviewed payload and confirmation; it never substitutes full-PR bytes:
+
+```bash
+PRO_GATE_REVIEW_FILTER_MANIFEST=/path/to/manifest \
+  node "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/record-pro-gate-verdict.mjs" \
+    --pr 1983 --verdict SHIP --reviewed-sha <full-sha> --evidence <review-url> \
+    --diff /path/to/reviewed.patch --confirm /path/to/prior-review.md
+```
+
+Verification requires a successful SHIP status on the current head, bound to the same base
+repository/ref and the current default branch. It accepts an unchanged base, or an advanced
+base whose changes do not overlap the PR's files; both sides of renames count. Missing or
+ambiguous status reads, retargets, overlapping changes, and movement during rechecks refuse.
+Exit 0 means a status was recorded (including an honest failure status), or an advisory check
+passed. Exit 1 means recording/verification failed. Neither mode grants merge permission,
+changes rulesets, readies a PR, or merges it. `--owner-state` is explicitly unsupported;
+owner exceptions and merge policy remain downstream.
+
+Downstream code can import `checkGitBaseAdvance(tree, originalBase, currentBase, head)` for the
+same local-object comparison without reading statuses, fetching, or granting an exception.
+`originalBase` accepts the recorded 12-character abbreviation or a full 40-character SHA;
+`currentBase` and `head` require full SHAs. It returns a promise of
+`{ok, unchanged, overlap, commitCount}` and rejects missing/ambiguous git objects.
+`checkBaseAdvance({...})` exposes that comparison with the same SHA inputs and injectable
+`getInterveningFiles`, `getPrChangedFiles`, and `getInterveningCommitCount` callbacks.
+The callbacks must include both rename paths. This is a shared comparison utility, not an
+owner-policy interface.
+
+Synthetic tests exercise public acceptance and the local installed adapter with fake GitHub
+requests. They do not prove live status posting, model review quality, a marketplace release,
+or merge authorization. Version-matched release and private-consumer migration remain separate.
+
 ## Requirements
 
 - A **ChatGPT Pro** account, signed into a browser the tool can drive
