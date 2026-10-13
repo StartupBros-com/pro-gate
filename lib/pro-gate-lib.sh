@@ -3989,6 +3989,7 @@ pg_review_decision_choice_snapshot() { # normalized facts JSON -> sha256
 # Parse the deliberately tiny choice grammar from a canonical review artifact. Decision callers
 # default to NEEDS-DISCUSSION; retained-facts readers supply their independently validated verdict.
 # Only schema-bounded JSON is returned, not owner-policy authority.
+# rc 0: valid alternatives; rc 2: no choice block; rc 1: malformed or unreadable.
 pg_review_decision_named_choices() { # review artifact [expected verdict] -> canonical outcomes JSON
   local f="$1" expected="${2:-NEEDS-DISCUSSION}" line id label consequence choices='[]' count=0 verdict_seen=false choices_started=false
   [ -f "$f" ] && [ ! -L "$f" ] && pg_is_review "$f" || return 1
@@ -4029,7 +4030,9 @@ pg_review_decision_named_choices() { # review artifact [expected verdict] -> can
     count=$((count + 1))
     [ "$count" -le 8 ] || return 1
   done < "$f"
-  [ "$verdict_seen" = true ] && [ "$count" -ge 2 ] || return 1
+  [ "$verdict_seen" = true ] || return 1
+  [ "$choices_started" = true ] || return 2
+  [ "$count" -ge 2 ] || return 1
   printf '%s' "$choices"
 }
 
@@ -4585,7 +4588,13 @@ pg_review_accepted_artifact_read() ( # marker [expected canonical input binding]
     fi
     counts="$(pg_review_open_severity "$snapshot")" || return 1
     IFS=$'\t' read -r p0 p1 <<<"$counts"
-    choices="$(pg_review_decision_named_choices "$snapshot" "$verdict")" || choices='[]'
+    if choices="$(pg_review_decision_named_choices "$snapshot" "$verdict")"; then
+      :
+    elif [ "$?" -eq 2 ]; then
+      choices='[]'
+    else
+      choices=null
+    fi
   fi
   # Refuse a source or binding replaced during interpretation. Canonical identity always hashes
   # the result we actually read, including supported predecessor contract identities.

@@ -2058,6 +2058,130 @@ test("current accepted connector progress records failure through the existing p
   );
 });
 
+for (const [label, mutate] of [
+  [
+    "prose after choices",
+    (artifact) =>
+      artifact.replace("VERDICT:", "Choose before merging.\nVERDICT:"),
+  ],
+  [
+    "duplicate choice IDs",
+    (artifact) => artifact.replace("CHOICE: break", "CHOICE: keep"),
+  ],
+  [
+    "one choice only",
+    (artifact) =>
+      artifact.replace("CHOICE: break | Replace | Use new API\n", ""),
+  ],
+  [
+    "malformed choice grammar",
+    (artifact) =>
+      artifact.replace(
+        "CHOICE: break | Replace | Use new API",
+        "CHOICE: break | Replace",
+      ),
+  ],
+]) {
+  test(`malformed retained choices stay unknown and cannot record SHIP: ${label}`, (t) => {
+    const f = cliFixture(t);
+    f.retain("SHIP", { choices: true });
+    const original = readFileSync(f.retainedPaths[0], "utf8");
+    const artifact = mutate(original);
+    assert.notEqual(artifact, original);
+    writeFileSync(f.retainedPaths[0], artifact);
+    const binding = JSON.parse(readFileSync(f.retainedPaths[2], "utf8"));
+    binding.artifact.digest = hashBytes(artifact);
+    writeFileSync(f.retainedPaths[2], canonical(binding));
+
+    const refused = f.invoke();
+    assert.equal(refused.status, 1, refused.stdout + refused.stderr);
+    assert.equal(
+      f.posts().length,
+      0,
+      "unknown choices must not become choice-free SHIP",
+    );
+    const inspected = spawnSync(
+      "/bin/bash",
+      [
+        join(ROOT, "bin/oracle-review.sh"),
+        "--review-facts",
+        "--repo",
+        f.checkout,
+        "--pr",
+        "1983",
+        "--json",
+      ],
+      { env: f.env, encoding: "utf8" },
+    );
+    assert.equal(inspected.status, 0, inspected.stdout + inspected.stderr);
+    const facts = JSON.parse(inspected.stdout);
+    assert.equal(facts.status, "accepted");
+    assert.equal(facts.review.artifact_digest, hashBytes(artifact));
+    assert.equal(facts.review.named_choices, null);
+
+    f.retain();
+    const restored = f.invoke();
+    assert.equal(restored.status, 0, restored.stdout + restored.stderr);
+    assert.equal(f.posts().length, 1);
+    assert.ok(f.posts()[0].includes("state=success"));
+  });
+}
+
+test("inspection skill checks the matching runtime without browser or network preflight", (t) => {
+  const f = cliFixture(t, true);
+  const skill = readFileSync(join(ROOT, "skills/pro-gate/SKILL.md"), "utf8");
+  const command = skill
+    .split("## Retained inspection only\n")[1]
+    .split("```bash\n")[1]
+    .split("\n```")[0];
+  const identity = JSON.parse(
+    readFileSync(join(ROOT, "skills/pro-gate/review-decision-v1.json"), "utf8"),
+  );
+  const version = readFileSync(join(ROOT, "VERSION"), "utf8");
+  const inspect = () =>
+    spawnSync("/bin/bash", [], {
+      input: command,
+      encoding: "utf8",
+      env: {
+        ...f.env,
+        REPO: f.checkout,
+        PR: "1983",
+        PG: join(f.state, "oracle-review.sh"),
+        PLUGIN_VERSION: version.trim(),
+        CONTRACT_ID: identity.contract_id,
+        CONTRACT_VERSION: String(identity.contract_version),
+        CONTRACT_DIGEST: identity.contract_digest,
+        CORPUS_DIGEST: identity.corpus_digest,
+      },
+    });
+  const matched = inspect();
+  assert.equal(matched.status, 0, matched.stdout + matched.stderr);
+  assert.equal(JSON.parse(matched.stdout).status, "accepted");
+  for (const mismatchedVersion of ["0.0.0", "99.0.0", ""]) {
+    writeFileSync(join(f.state, "VERSION"), mismatchedVersion);
+    const refused = inspect();
+    assert.equal(
+      refused.status,
+      1,
+      `must refuse runtime version ${mismatchedVersion}: ${refused.stdout}`,
+    );
+    assert.match(refused.stderr, /exact version-update path/);
+  }
+  writeFileSync(join(f.state, "VERSION"), version);
+  writeFileSync(
+    join(f.state, "review-decision-v1.json"),
+    canonical({ ...identity, corpus_digest: "0".repeat(64) }),
+  );
+  const mismatch = inspect();
+  assert.equal(mismatch.status, 1, mismatch.stdout + mismatch.stderr);
+  assert.match(mismatch.stderr, /exact version-update path/);
+  writeFileSync(join(f.state, "review-decision-v1.json"), canonical(identity));
+  const restored = inspect();
+  assert.equal(restored.status, 0, restored.stdout + restored.stderr);
+  assert.equal(JSON.parse(restored.stdout).status, "accepted");
+  assert.deepEqual(f.calls(), [], "inspection never invokes network preflight");
+});
+
 test("shared git helper refuses an absent checkout or unresolved unchanged-base objects", async (t) => {
   const f = cliFixture(t);
   await assert.rejects(

@@ -173,7 +173,7 @@ allow additional fields, and treat unavailable facts as unavailable, not zero.
 | `review.artifact_digest` | SHA-256 of the accepted artifact bytes |
 | `review.verdict` | `SHIP`, `FIX-FIRST`, or `NEEDS-DISCUSSION`; independent of applicability |
 | `review.named_choice` | Recorded result-binding choice, or `null`; not an owner-policy selection |
-| `review.named_choices` | Accepted artifact's valid named `{id, label, consequence}` alternatives for any verdict; empty when unavailable or absent |
+| `review.named_choices` | Accepted artifact's valid named `{id, label, consequence}` alternatives for any verdict; `[]` when absent, `null` when malformed or unavailable |
 | `review.open_p0` / `review.open_p1` | Open severity counts from the accepted artifact, not mutable round tuples |
 
 Selection discovers possibly relevant completions before acceptance validation, using existing

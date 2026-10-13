@@ -627,7 +627,7 @@ pg_review_decision_cli() {
         --arg mode "$(pg_review_decision_result_mode "$candidate")" \
         '. + [{applicable:true,artifact_digest:$artifact,bindable:true,binding_valid:true,canonical_identity:$canonical,charged_spend_epoch:$epoch,collected:true,evidence_mode:$mode,legacy:false,marker:$marker,provenance_valid:true,verdict:$verdict}]' <<<"$completed")"
       if [ "$(jq -r .verdict <<<"$result")" = NEEDS-DISCUSSION ]; then
-        choice_outcomes="$(jq -cS .named_choices <<<"$accepted")"
+        choice_outcomes="$(jq -cS '.named_choices // []' <<<"$accepted")"
         choice_candidates="$(jq -cS --arg canonical "$canonical" --argjson outcomes "$choice_outcomes" \
           '. + [{canonical_identity:$canonical,outcomes:$outcomes}]' <<<"$choice_candidates")"
       fi

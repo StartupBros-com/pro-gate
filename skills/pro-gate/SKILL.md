@@ -15,13 +15,22 @@ task. Observation is non-prompting and is not blocking-wait next_action.
 
 ## Retained inspection only
 
-When the caller asks to inspect retained review facts rather than continue a review, use the
-matching runtime directly and stop after reporting the facts. Skip the numbered review steps;
-browser/doctor preflight is unnecessary for this file-only path:
+When the caller asks to inspect retained review facts rather than continue a review, first run
+step 1's identity resolver through the `PG` assignment, but not the doctor. Check the installed
+version and identity below, then stop after reporting the facts. On mismatch, use step 1's exact
+version-update path; do not downgrade an ahead runtime. Skip the remaining numbered review
+steps: browser/doctor preflight is unnecessary for this file-only path.
 
 ```bash
-"${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" \
-  --review-facts --repo "$REPO" --pr "$PR" --json
+RUNTIME_HOME="${PRO_GATE_HOME:-$HOME/.pro-review-daemon}"
+[ -n "$PLUGIN_VERSION" ] && [ "$(tr -d '[:space:]' < "$RUNTIME_HOME/VERSION")" = "$PLUGIN_VERSION" ] \
+  || { echo "ERROR: runtime version mismatch; use the exact version-update path" >&2; exit 1; }
+jq -e --arg id "$CONTRACT_ID" --argjson version "$CONTRACT_VERSION" \
+  --arg digest "$CONTRACT_DIGEST" --arg corpus "$CORPUS_DIGEST" \
+  '. == {contract_id:$id,contract_version:$version,contract_digest:$digest,corpus_digest:$corpus}' \
+  "$RUNTIME_HOME/review-decision-v1.json" >/dev/null \
+  || { echo "ERROR: runtime identity mismatch; use the exact version-update path" >&2; exit 1; }
+"$PG" --review-facts --repo "$REPO" --pr "$PR" --json
 ```
 
 Require `schema: "review-facts/v1"`. `status: "accepted"` supplies `review` identity, artifact
