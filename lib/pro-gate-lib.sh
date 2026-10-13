@@ -3986,13 +3986,13 @@ pg_review_decision_choice_snapshot() { # normalized facts JSON -> sha256
   pg_review_sha256_text "$canonical"
 }
 
-# Parse the deliberately tiny NEEDS-DISCUSSION choice grammar from a canonical review artifact.
-# This is a data extractor, not a prose relay: it emits only schema-bounded JSON fields after the
-# complete artifact and terminal verdict are independently validated.
-pg_review_decision_named_choices() { # review artifact -> canonical outcomes JSON
-  local f="$1" line id label consequence choices='[]' count=0 verdict_seen=false choices_started=false
+# Parse the deliberately tiny choice grammar from a canonical review artifact. Decision callers
+# default to NEEDS-DISCUSSION; retained-facts readers supply their independently validated verdict.
+# Only schema-bounded JSON is returned, not owner-policy authority.
+pg_review_decision_named_choices() { # review artifact [expected verdict] -> canonical outcomes JSON
+  local f="$1" expected="${2:-NEEDS-DISCUSSION}" line id label consequence choices='[]' count=0 verdict_seen=false choices_started=false
   [ -f "$f" ] && [ ! -L "$f" ] && pg_is_review "$f" || return 1
-  [ "$(pg_extract_verdict "$f")" = NEEDS-DISCUSSION ] || return 1
+  [ "$(pg_extract_verdict "$f")" = "$expected" ] || return 1
   while IFS= read -r line || [ -n "$line" ]; do
     if [[ "$line" =~ ^[[:space:]]*[*_\>#-]*[[:space:]]*VERDICT[*_[:space:]]*: ]]; then
       verdict_seen=true
@@ -4553,7 +4553,7 @@ pg_review_result_binding_digest() { local r; r="$(pg_review_result_binding_read 
 # rc 0: accepted facts; rc 1: unavailable (no output); rc 2: verdict disagreement (diagnostic
 # facts only, never counts). The caller retains the decision reducer's distinct repair projection.
 pg_review_accepted_artifact_read() ( # marker [expected canonical input binding]
-  local marker="$1" expected="${2:-}" input result artifact snapshot digest canonical verdict stored choices='[]' counts p0 p1 text
+  local marker="$1" expected="${2:-}" input result artifact snapshot digest canonical verdict stored choices='[]' counts p0 p1 text retained
   pg_reservation_marker_ok "$marker" || return 1
   input="$(pg_review_input_binding_read "$marker")" || return 1
   [ -z "$expected" ] || [ "$input" = "$expected" ] || return 1
@@ -4576,11 +4576,16 @@ pg_review_accepted_artifact_read() ( # marker [expected canonical input binding]
   verdict="$(pg_extract_verdict "$snapshot")"
   canonical="$(pg_review_sha256_text "$result")"
   if [ "$stored" = "$verdict" ]; then
+    # Retained SHIP must have the relationships the real producer could bind. This is historical
+    # acceptance, independent of current checkout/proof and compatible with predecessor inputs.
+    if [ "$verdict" = SHIP ]; then
+      retained="$(jq -cnS --argjson input "$input" --argjson result "$result" '{input_binding:$input,result_binding:$result}')" || return 1
+      pg_review_accepted_ship_matches "$retained" "$(jq -r '.evidence.proof.base_oid // empty' <<<"$input")" \
+        "$(jq -r .target.head_oid <<<"$input")" "$(jq -r '.evidence.proof.raw_patch_digest // empty' <<<"$input")" || return 1
+    fi
     counts="$(pg_review_open_severity "$snapshot")" || return 1
     IFS=$'\t' read -r p0 p1 <<<"$counts"
-    if [ "$verdict" = NEEDS-DISCUSSION ]; then
-      choices="$(pg_review_decision_named_choices "$snapshot")" || choices='[]'
-    fi
+    choices="$(pg_review_decision_named_choices "$snapshot" "$verdict")" || choices='[]'
   fi
   # Refuse a source or binding replaced during interpretation. Canonical identity always hashes
   # the result we actually read, including supported predecessor contract identities.
@@ -4611,6 +4616,247 @@ pg_review_accepted_ship_matches() { # accepted facts base head raw-digest
   jq -e --arg base "$base" --arg head "$head" --arg digest "$digest" \
     '.result_binding.ship_proof | .base_oid==$base and .head_oid==$head and .diff_digest==$digest' \
     <<<"$accepted" >/dev/null
+}
+
+# Rebuild a binding's evidence relation from the exact files named by the invocation. This checks
+# proof only: marker and charged epoch remain immutable history, and are separately validated.
+# Scoped review deliberately hashes its raw endpoint and reviewed payload independently.
+pg_review_decision_input_proof_current() { # binding repo pr host owner name head base
+  local binding="$1" repo="$2" pr="$3" host="$4" owner="$5" name="$6" head="$7" base="$8"
+  local mode endpoint reviewed manifest confirmation raw_digest reviewed_digest manifest_digest confirmation_digest lineage pr_evidence metadata_digest
+  pg_review_input_binding_validate "$binding" "$(jq -r '.marker // ""' <<<"$binding" 2>/dev/null)" || return 1
+  jq -e --arg h "$host" --arg o "$owner" --arg r "$name" --argjson p "$pr" --arg head "$head" \
+    '.repository.host==$h and .repository.owner==$o and .repository.repo==$r and .target.pr==$p and .target.head_oid==$head' \
+    <<<"$binding" >/dev/null 2>&1 || return 1
+  mode="$(jq -r .evidence.mode <<<"$binding")"
+  case "$mode" in full-pr|scoped-delta)
+    pr_evidence="$(pg_pr_evidence_read "${PRO_GATE_REVIEW_PR_EVIDENCE:-}" "${PRO_GATE_REVIEW_ENDPOINT_PATCH:-}" \
+      "$repo" "$host" "$owner" "$name" "$pr")" || return 1
+    metadata_digest="$(pg_pr_evidence_metadata_digest "$pr_evidence")" || return 1
+    jq -e --arg digest "$metadata_digest" '.evidence.proof.pr_metadata_digest==$digest' <<<"$binding" >/dev/null || return 1
+    [ "$base" = "$(jq -r .metadata.target.base_oid <<<"$pr_evidence")" ] || return 1
+    ;;
+  esac
+  reviewed="${REVIEW_DECISION_REVIEWED_DIFF_FILE:-${DIFF_FILE:-}}"
+  case "$mode" in
+    connector)
+      [ "$INPUT" = connector ] || [ "$INPUT" = both ] || return 1
+      jq -e --arg target "$host/$owner/$name" --arg head "$head" \
+        '.evidence.proof.repository_target==$target and .evidence.proof.commit_target==$head' \
+        <<<"$binding" >/dev/null 2>&1 ;;
+    full-pr)
+      [ "$INPUT" = bundle ] || [ "$INPUT" = both ] || return 1
+      endpoint="${PRO_GATE_REVIEW_ENDPOINT_PATCH:-}"
+      [ -n "$base" ] && [ -f "$endpoint" ] && [ ! -L "$endpoint" ] \
+        && [ -f "$reviewed" ] && [ ! -L "$reviewed" ] || return 1
+      [ "$(wc -c < "$endpoint" 2>/dev/null | tr -d ' ')" -le 26214400 ] \
+        && [ "$(wc -c < "$reviewed" 2>/dev/null | tr -d ' ')" -le 26214400 ] || return 1
+      raw_digest="$(pg_sha256 "$reviewed" 2>/dev/null || true)"
+      endpoint="$(pg_sha256 "$endpoint" 2>/dev/null || true)"
+      # Full-PR authority requires the full prepared payload. A partial payload
+      # needs its scoped manifest/confirmation; it cannot fall back to full-pr.
+      [ -n "$raw_digest" ] && [ "$raw_digest" = "$endpoint" ] || return 1
+      jq -e --arg base "$base" --arg head "$head" --arg raw "$raw_digest" --arg endpoint "$endpoint" \
+        '.evidence.proof.base_oid==$base and .evidence.proof.head_oid==$head and .evidence.proof.raw_patch_digest==$raw and .evidence.proof.endpoint_digest==$endpoint' \
+        <<<"$binding" >/dev/null 2>&1 ;;
+    scoped-delta)
+      [ "$INPUT" = bundle ] || [ "$INPUT" = both ] || return 1
+      endpoint="${PRO_GATE_REVIEW_ENDPOINT_PATCH:-}"; manifest="${PRO_GATE_REVIEW_FILTER_MANIFEST:-}"; confirmation="${CONFIRM_FILE:-}"
+      [ -n "$base" ] && [ -f "$endpoint" ] && [ ! -L "$endpoint" ] \
+        && [ -f "$reviewed" ] && [ ! -L "$reviewed" ] && [ -f "$manifest" ] && [ ! -L "$manifest" ] \
+        && [ -f "$confirmation" ] && [ ! -L "$confirmation" ] || return 1
+      [ "$(wc -c < "$endpoint" 2>/dev/null | tr -d ' ')" -le 26214400 ] \
+        && [ "$(wc -c < "$reviewed" 2>/dev/null | tr -d ' ')" -le 26214400 ] \
+        && [ "$(wc -c < "$manifest" 2>/dev/null | tr -d ' ')" -le 65536 ] \
+        && [ "$(wc -c < "$confirmation" 2>/dev/null | tr -d ' ')" -le 262144 ] && pg_is_review "$confirmation" || return 1
+      raw_digest="$(pg_sha256 "$endpoint" 2>/dev/null || true)"
+      reviewed_digest="$(pg_sha256 "$reviewed" 2>/dev/null || true)"
+      manifest_digest="$(pg_sha256 "$manifest" 2>/dev/null || true)"
+      confirmation_digest="$(pg_sha256 "$confirmation" 2>/dev/null || true)"
+      lineage="confirmation:${confirmation_digest}"
+      jq -e --arg base "$base" --arg head "$head" --arg raw "$raw_digest" --arg reviewed "$reviewed_digest" \
+        --arg manifest "$manifest_digest" --arg lineage "$lineage" \
+        '.evidence.proof.base_oid==$base and .evidence.proof.end_oid==$head and .evidence.proof.raw_digest==$raw and .evidence.proof.reviewed_payload_digest==$reviewed and .evidence.proof.filtering_manifest_digest==$manifest and .evidence.proof.lineage_identity==$lineage' \
+        <<<"$binding" >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Discover completion records before validating acceptance. Attribution metadata and the marker's
+# PR key establish possible relevance only; they never supply a verdict or counts. Missing/corrupt
+# input siblings can therefore obstruct an older accepted review instead of disappearing in a scan.
+pg_review_facts_candidates() { # host owner repo pr -> candidate metadata JSON
+  local host="$1" owner="$2" repo="$3" pr="$4" key dir f marker raw meta mh mo mr mk mp out spend
+  local epoch identity relevant conflict candidates='[]'
+  key="$(printf '%s-%s-%s' "$owner" "$repo" "$pr" | tr -c 'A-Za-z0-9.\n-' '-')"
+  for dir in "$(pg_completed_dir)" "$(pg_review_result_binding_dir)" "$PRO_GATE_HOME/pending" "$PRO_GATE_HOME/recovered"; do
+    [ ! -e "$dir" ] || { [ -d "$dir" ] && [ -r "$dir" ] && [ -x "$dir" ]; } || return 1
+  done
+  while IFS= read -r marker; do
+    pg_reservation_marker_ok "$marker" || continue
+    relevant=false; conflict=false; epoch=''; raw=''; spend=''
+    f="$(pg_review_input_binding_dir)/$marker"
+    if [ -f "$f" ] && [ ! -L "$f" ] && [ -r "$f" ] && [ "$(wc -c < "$f")" -le 65536 ]; then
+      raw="$(jq -sceS 'select(length==1 and (.[0]|type)=="object") | .[0]' "$f" 2>/dev/null || true)"
+    fi
+    if [ -n "$raw" ]; then
+      jq -e --arg h "$host" --arg o "$owner" --arg r "$repo" --argjson p "$pr" \
+        '.repository=={host:$h,owner:$o,repo:$r} and .target.pr==$p' <<<"$raw" >/dev/null 2>&1 && relevant=true
+      epoch="$(jq -r '.charged_spend_epoch | select(type=="number" and floor==. and .>0)' <<<"$raw" 2>/dev/null || true)"
+    fi
+    meta="$(pg_run_meta_read "$marker" 2>/dev/null || true)"
+    if [ -n "$meta" ]; then
+      IFS=$'\t' read -r mh mo mr mk mp out spend <<<"$meta"
+      if [ "$mh" = "$host" ] && [ "$mo" = "$owner" ] && [ "$mr" = "$repo" ] && [ "$mp" = "$pr" ]; then
+        relevant=true
+      elif [ "$relevant" = true ]; then
+        conflict=true
+      fi
+      # A known other-host/repository sidecar disambiguates the host-less marker key.
+      [ "$relevant" = true ] || continue
+      if [ -n "$epoch" ] && [ "$epoch" != "$spend" ]; then conflict=true; epoch=null; fi
+      [ -n "$epoch" ] || epoch="$spend"
+    else
+      # A damaged sidecar can still attribute this completion, but cannot prove its ordering.
+      f="$(pg_run_meta_dir)/$marker"
+      if [ -f "$f" ] && [ ! -L "$f" ] && [ -r "$f" ] && [ "$(wc -c < "$f")" -le 65536 ]; then
+        IFS=$'\t' read -r mh mo mr mk mp out spend < "$f" || true
+        if [ "$mh" = "$host" ] && [ "$mo" = "$owner" ] && [ "$mr" = "$repo" ] && [ "$mp" = "$pr" ]; then relevant=true; fi
+      fi
+    fi
+    # A canonical input can disambiguate a colliding host-less key even without a sidecar.
+    # Conflicting target metadata above still makes the record relevant and obstructing.
+    if [ "$relevant" = false ] && [ -n "$raw" ] && pg_review_input_binding_validate "$raw" "$marker"; then continue; fi
+    case "$marker" in "pg-run-$key-"*) relevant=true ;; esac
+    [ "$relevant" = true ] || continue
+    # Contradictory full attribution is not permission to reinterpret a target-looking marker.
+    if [ -n "$raw" ] && jq -e '.repository.host and .repository.owner and .repository.repo and .target.pr' <<<"$raw" >/dev/null 2>&1; then
+      jq -e --arg h "$host" --arg o "$owner" --arg r "$repo" --argjson p "$pr" \
+        '.repository=={host:$h,owner:$o,repo:$r} and .target.pr==$p' <<<"$raw" >/dev/null 2>&1 || conflict=true
+    fi
+    if [ -n "$meta" ] && { [ "$mh" != "$host" ] || [ "$mo" != "$owner" ] || [ "$mr" != "$repo" ] || [ "$mp" != "$pr" ]; }; then conflict=true; fi
+    case "$epoch" in ''|0|*[!0-9]*) epoch=null ;; esac
+    identity="$(pg_review_result_binding_digest "$marker" 2>/dev/null || true)"
+    candidates="$(jq -cS --arg marker "$marker" --arg identity "$identity" --argjson epoch "$epoch" --argjson conflict "$conflict" \
+      '. + [{marker:$marker,canonical_identity:(if $identity=="" then null else $identity end),charged_spend_epoch:$epoch,conflict:$conflict}]' <<<"$candidates")" || return 1
+  done < <(
+    for dir in "$(pg_completed_dir)" "$(pg_review_result_binding_dir)" "$PRO_GATE_HOME/pending" "$PRO_GATE_HOME/recovered"; do
+      for f in "$dir"/pg-run-*; do
+        [ -e "$f" ] || [ -L "$f" ] || continue
+        marker="${f##*/}"
+        [ "$dir" != "$PRO_GATE_HOME/recovered" ] || marker="${marker%.md}"
+        printf '%s\n' "$marker"
+      done
+    done | LC_ALL=C sort -u
+  )
+  printf '%s' "$candidates"
+}
+
+pg_review_facts_emit() { # status reason repository pr candidate-head selected-marker applicable accepted-json
+  jq -cnS --arg status "$1" --arg reason "$2" --argjson repository "$3" --argjson pr "$4" \
+    --arg head "$5" --arg marker "$6" --argjson applicable "$7" --argjson accepted "$8" \
+    --arg evidence "$(if [ "$8" != null ]; then pg_review_relation_identity "$(jq -cS .input_binding <<<"$8")"; fi)" '
+    {schema:"review-facts/v1",status:$status,reason:$reason,repository:$repository,pr:$pr,
+     candidate_head:(if $head=="" then null else $head end),selected_marker:(if $marker=="" then null else $marker end),
+     applicable:$applicable,review:(if $accepted==null then null else
+       {canonical_identity:$accepted.canonical_identity,charged_spend_epoch:$accepted.input_binding.charged_spend_epoch,
+        reviewed_head:$accepted.input_binding.target.head_oid,evidence_mode:$accepted.input_binding.evidence.mode,
+        evidence_identity:$evidence,artifact_digest:$accepted.artifact_digest,verdict:$accepted.verdict,
+        named_choice:$accepted.result_binding.named_choice,named_choices:$accepted.named_choices,
+        open_p0:$accepted.open_p0,open_p1:$accepted.open_p1} end)}'
+}
+
+pg_review_facts_cli() { # checkout number-or-canonical-PR-URL; inspection only, no decision/lifecycle reduction
+  local repo="$1" query="$2" ident host owner name pr head repository candidates newest selected marker accepted input rc
+  local applicable=null reason=accepted-review base='' pr_evidence='' mode path field expected actual raw_digest='' differing=false
+  local REVIEW_DECISION_REVIEWED_DIFF_FILE="${DIFF_FILE:-}"
+  pg_have jq || { echo 'ERROR: --review-facts requires jq' >&2; return 2; }
+  [ "$(git -C "$repo" rev-parse --is-inside-work-tree 2>/dev/null)" = true ] \
+    || { echo 'ERROR: --review-facts requires a local git working tree' >&2; return 2; }
+  case "$query" in
+    http*://*/pull/*) pr="${query%/}"; pr="${pr##*/}"; ident="$(pg_repo_identity_from_url "${query%/}")" ;;
+    *) pr="$query"; ident="$(pg_repo_identity_from_url "$(git -C "$repo" remote get-url origin 2>/dev/null)")" ;;
+  esac
+  [ -n "$ident" ] && pr="$(pg_pr_number_normalize "$pr")" \
+    || { echo 'ERROR: --review-facts requires a numeric PR with canonical origin, or a canonical PR URL' >&2; return 2; }
+  IFS=$'\t' read -r host owner name <<<"$ident"
+  repository="$(jq -cnS --arg h "$host" --arg o "$owner" --arg r "$name" '{host:$h,owner:$o,repo:$r}')"
+  head="$(git -C "$repo" rev-parse --verify HEAD 2>/dev/null || true)"
+  case "$head" in ''|*[!0-9a-f]*) head='' ;; esac
+  candidates="$(pg_review_facts_candidates "$host" "$owner" "$name" "$pr")" || {
+    pg_review_facts_emit invalid completion-store-unreadable "$repository" "$pr" "$head" '' null null; return;
+  }
+  if [ "$(jq length <<<"$candidates")" -eq 0 ]; then
+    pg_review_facts_emit missing no-relevant-completion "$repository" "$pr" "$head" '' null null; return
+  fi
+  if jq -e 'any(.[]; .charged_spend_epoch==null)' <<<"$candidates" >/dev/null; then
+    pg_review_facts_emit ambiguous unproved-completion-order "$repository" "$pr" "$head" '' null null; return
+  fi
+  newest="$(jq -cS 'max_by(.charged_spend_epoch).charged_spend_epoch as $epoch | map(select(.charged_spend_epoch==$epoch))' <<<"$candidates")"
+  if [ "$(jq length <<<"$newest")" -gt 1 ] && jq -e 'any(.[]; .canonical_identity==null) or ([.[].canonical_identity]|length!=(unique|length))' <<<"$newest" >/dev/null; then
+    pg_review_facts_emit ambiguous ambiguous-completion-order "$repository" "$pr" "$head" '' null null; return
+  fi
+  selected="$(jq -cS 'sort_by(.canonical_identity) | last' <<<"$newest")"
+  marker="$(jq -r .marker <<<"$selected")"
+  if [ "$(jq -r .conflict <<<"$selected")" = true ]; then
+    pg_review_facts_emit invalid conflicting-completion-metadata "$repository" "$pr" "$head" "$marker" null null; return
+  fi
+  for path in "$(pg_review_input_binding_dir)/$marker" "$(pg_review_result_binding_dir)/$marker" "$(pg_completed_dir)/$marker"; do
+    if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+      pg_review_facts_emit incomplete missing-accepted-record "$repository" "$pr" "$head" "$marker" null null; return
+    fi
+  done
+  rc=0; accepted="$(pg_review_accepted_artifact_read "$marker")" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    reason=unaccepted-review; [ "$rc" -ne 2 ] || reason=verdict-disagreement
+    pg_review_facts_emit invalid "$reason" "$repository" "$pr" "$head" "$marker" null null; return
+  fi
+  input="$(jq -cS .input_binding <<<"$accepted")"
+  if ! jq -e --argjson repo "$repository" --argjson pr "$pr" '.repository==$repo and .target.pr==$pr' <<<"$input" >/dev/null; then
+    pg_review_facts_emit invalid target-mismatch "$repository" "$pr" "$head" "$marker" null null; return
+  fi
+  mode="$(jq -r .evidence.mode <<<"$input")"
+  if [ -n "$head" ] && [ "$head" != "$(jq -r .target.head_oid <<<"$input")" ]; then
+    differing=true
+  fi
+  if [ "${INPUT_SUPPLIED:-0}" = 1 ]; then
+    case "$INPUT:$mode" in connector:connector|bundle:full-pr|bundle:scoped-delta|both:full-pr|both:scoped-delta|both:connector) ;; *) differing=true ;; esac
+  fi
+  # Absence/unreadability is unknown; readable supplied bytes that differ are known non-matches.
+  # These comparisons can only establish false. Only the shared complete proof can establish true.
+  for field in reviewed endpoint manifest confirmation; do
+    expected=''; path=''
+    case "$mode:$field" in
+      full-pr:reviewed) path="${DIFF_FILE:-}"; expected="$(jq -r .evidence.proof.raw_patch_digest <<<"$input")" ;;
+      full-pr:endpoint) path="${PRO_GATE_REVIEW_ENDPOINT_PATCH:-}"; expected="$(jq -r .evidence.proof.endpoint_digest <<<"$input")" ;;
+      scoped-delta:reviewed) path="${DIFF_FILE:-}"; expected="$(jq -r .evidence.proof.reviewed_payload_digest <<<"$input")" ;;
+      scoped-delta:endpoint) path="${PRO_GATE_REVIEW_ENDPOINT_PATCH:-}"; expected="$(jq -r .evidence.proof.raw_digest <<<"$input")" ;;
+      scoped-delta:manifest) path="${PRO_GATE_REVIEW_FILTER_MANIFEST:-}"; expected="$(jq -r .evidence.proof.filtering_manifest_digest <<<"$input")" ;;
+      scoped-delta:confirmation) path="${CONFIRM_FILE:-}"; expected="$(jq -r .evidence.proof.lineage_identity <<<"$input")"; expected="${expected#confirmation:}" ;;
+    esac
+    if [ -n "$expected" ] && [ -f "$path" ] && [ ! -L "$path" ] && [ -r "$path" ]; then
+      actual="$(pg_sha256 "$path")"; [ -z "$actual" ] || [ "$actual" = "$expected" ] || differing=true
+    fi
+  done
+  pr_evidence="$(pg_pr_evidence_read "${PRO_GATE_REVIEW_PR_EVIDENCE:-}" "${PRO_GATE_REVIEW_ENDPOINT_PATCH:-}" \
+    "$repo" "$host" "$owner" "$name" "$pr" 2>/dev/null || true)"
+  if [ -n "$pr_evidence" ]; then
+    base="$(jq -r .metadata.target.base_oid <<<"$pr_evidence")"
+    expected="$(jq -r '.evidence.proof.pr_metadata_digest // empty' <<<"$input")"
+    if [ -n "$expected" ] && [ "$expected" != "$(pg_pr_evidence_metadata_digest "$pr_evidence")" ]; then differing=true; fi
+  fi
+  if [ "$differing" = true ]; then
+    applicable=false; reason=different-head-or-evidence
+  elif pg_review_decision_input_proof_current "$input" "$repo" "$pr" "$host" "$owner" "$name" "$head" "$base" >/dev/null 2>&1; then
+    applicable=true; reason=matching-current-proof
+    if [ "$(jq -r .verdict <<<"$accepted")" = SHIP ]; then
+      [ ! -f "${DIFF_FILE:-}" ] || raw_digest="$(pg_sha256 "$DIFF_FILE")"
+      if ! pg_review_accepted_ship_matches "$accepted" "$base" "$head" "$raw_digest"; then applicable=false; reason=ship-proof-mismatch; fi
+    fi
+  else
+    reason=current-proof-unavailable
+  fi
+  pg_review_facts_emit accepted "$reason" "$repository" "$pr" "$head" "$marker" "$applicable" "$accepted"
 }
 
 # pg_ledger_lookup_clean <marker>: echo "out<TAB>sha256" from the newest CLEAN ledger row for

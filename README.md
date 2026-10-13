@@ -137,6 +137,77 @@ This changes neither review provenance nor merge authority: the runtime remains 
 transport and the gate stops before merge. A surrounding agent may arm guarded auto-merge only
 after its own verification/review gates pass; exact-head required CI remains the final authority.
 
+## Retained review facts
+
+A standalone consumer can inspect retained accepted reviews through the installed runtime:
+
+```bash
+"${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" \
+  --review-facts --repo /path/to/checkout --pr 1983 --json
+```
+
+`--pr` also accepts a canonical PR URL. A numeric PR uses the checkout's canonical `origin`.
+This command reads existing records only: it does not submit, collect, repair, score, clean up,
+query the network/browser, spend a round, or override a stop. Invalid fresh-review input or
+attachment policy does not block inspection. It requires local `git`, `jq`, and a SHA-256 tool,
+not a signed-in browser or private consumer parser.
+
+The additive JSON schema is `review-facts/v1`. Consumers should check `schema` and `status`,
+allow additional fields, and treat unavailable facts as unavailable, not zero.
+
+| Field | Meaning |
+| --- | --- |
+| `schema` | `review-facts/v1` |
+| `status` | `accepted`, `missing`, `invalid`, `incomplete`, or `ambiguous` |
+| `reason` | Selection, acceptance, or applicability explanation |
+| `repository` / `pr` | Requested `{host, owner, repo}` and numeric PR |
+| `selected_marker` | Selected completion marker; `null` when no unique selection is proven |
+| `candidate_head` | Checkout's current HEAD, or `null` if unavailable; separate from the reviewed revision |
+| `applicable` | `true` for complete matching current proof; `false` for known different head/evidence; `null` when proof is unavailable |
+| `review` | Accepted facts below, or `null` for every unaccepted result |
+| `review.canonical_identity` | SHA-256 of the canonical accepted result binding, including its supported predecessor contract identity |
+| `review.charged_spend_epoch` | Recorded charge epoch used for completion ordering |
+| `review.reviewed_head` | Accepted input binding's reviewed revision |
+| `review.evidence_mode` | Retained `full-pr`, `scoped-delta`, `connector`, or `caller-patch` mode |
+| `review.evidence_identity` | `relation:<sha256>` of the complete canonical repository/target/evidence relation |
+| `review.artifact_digest` | SHA-256 of the accepted artifact bytes |
+| `review.verdict` | `SHIP`, `FIX-FIRST`, or `NEEDS-DISCUSSION`; independent of applicability |
+| `review.named_choice` | Recorded result-binding choice, or `null`; not an owner-policy selection |
+| `review.named_choices` | Accepted artifact's valid named `{id, label, consequence}` alternatives for any verdict; empty when unavailable or absent |
+| `review.open_p0` / `review.open_p1` | Open severity counts from the accepted artifact, not mutable round tuples |
+
+Selection discovers possibly relevant completions before acceptance validation, using existing
+completion/result records, input metadata, and charged run sidecars. It orders by charged epoch,
+then proven canonical result identity. An unproved epoch, unresolved identity tie, or newest
+relevant missing/corrupt/unreadable record obstructs selection; it does not fall back to older
+favorable evidence. Records attributed to another repository/PR do not obstruct this target.
+`missing` means no relevant completion; `incomplete` means a selected completion lacks a required
+accepted record; `invalid` means acceptance or attribution failed; `ambiguous` means ordering is
+unproved. Retained SHIP acceptance requires a full-PR/scoped result whose head, base, and raw
+digest match its historical input binding; fabricated connector/caller-patch SHIP is unaccepted.
+This does not require fresh metadata or proof. Unaccepted results expose no verdict or counts
+(`review: null`). These states return exit 0 as inspection results; incompatible flags or invalid
+CLI targets return usage exit 2.
+
+Historical acceptance is independent of current proof. Matching HEAD without complete proof
+leaves `applicable: null`; a known non-match yields `false`. To check current applicability,
+reuse the existing proof inputs: `--diff` for the exact reviewed bytes,
+`PRO_GATE_REVIEW_ENDPOINT_PATCH` for the retained/prepared endpoint patch, and
+`PRO_GATE_REVIEW_PR_EVIDENCE` for its PR metadata snapshot. Scoped evidence also requires
+`PRO_GATE_REVIEW_FILTER_MANIFEST` and `--confirm`. `--input bundle|both|connector` selects the
+proof mode (inspection defaults to `bundle`, independently of fresh-delivery policy).
+Head equality alone proves nothing current: metadata, endpoint/payload bytes, and scoped
+manifest/confirmation must match. SHIP also requires its base/head/raw-digest relationships;
+connector and caller-patch reviews cannot supply SHIP handoff applicability. The check is a
+file-only observation of supplied proof, not a fresh remote PR read.
+
+Only those proof inputs may accompany `--review-facts --repo --pr --json`. Review, recovery,
+status, output, timing, preparation, and decision/effect flags are usage errors, even when an
+incompatible flag has an empty value. Facts supply review truth, never merge authority or
+continuation policy. An accepted historical SHIP is not a current SHIP; even applicable SHIP
+leaves CI and merge policy to the consumer. Synthetic CLI tests prove these runtime contracts,
+not live model quality, marketplace release/installation, or a live SHIP verdict.
+
 ## Requirements
 
 - A **ChatGPT Pro** account, signed into a browser the tool can drive

@@ -41,6 +41,7 @@ jobs:
             tests: |
               bash tests/ci-assurance.test.sh
               bash tests/review-decision-adapters.test.sh
+              bash tests/review-facts.test.sh
               bash tests/daemon-reload.test.sh
               bash tests/daemon-current-head-completion.test.sh
               bash tests/daemon-query-isolation.test.sh
