@@ -7141,6 +7141,80 @@ check 'result binding is the only marker-bound sibling and validates input/artif
      && [ "$(find "$BIND_HOME" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort | tr '\n' ' ')" = 'review-input-bindings review-result-bindings ' ]; echo $?)" \
   "rc=$RESULT_RC dirs=$(find "$BIND_HOME" -mindepth 1 -maxdepth 1 -type d -printf '%f ' 2>/dev/null)"
 
+# U1 accepted-artifact reader: synthetic retained bytes, never evidence of a live review.
+u1_accepted_case() (
+  local scenario="$1" marker='pg-run-acme-widgets-1983-1700000700-1' input result artifact digest facts rc=0 before verdict=FIX-FIRST
+  export PRO_GATE_HOME="$TDIR/u1-$scenario"
+  unset PRO_GATE_COMPLETED_DIR PRO_GATE_REVIEW_INPUT_BINDING_DIR PRO_GATE_REVIEW_RESULT_BINDING_DIR
+  mkdir -p "$PRO_GATE_HOME/completed"
+  artifact="$PRO_GATE_HOME/completed/$marker"
+  input="$INPUT_BINDING"
+  case "$scenario" in
+    predecessor) input="$(jq -cS --arg cd "$PG214_PRED_A" '.contract_digest=$cd' <<<"$input")" ;;
+    p2) printf '[P2] f:1 — a minor issue still needs a fix\nVERDICT: FIX-FIRST\n' > "$artifact" ;;
+    choices)
+      verdict=NEEDS-DISCUSSION
+      printf '[P1] f:1 — choose a compatibility policy\nCHOICE: keep | Preserve | Keep compatibility\nCHOICE: break | Replace | Use new API\nVERDICT: NEEDS-DISCUSSION\n' > "$artifact" ;;
+    ship) verdict=SHIP; printf 'P0: none\nP1: none\nP2: none\nEverything is consistent.\nVERDICT: SHIP\n' > "$artifact" ;;
+  esac
+  if [ ! -f "$artifact" ]; then
+    printf '[P0] f:1 — RESOLVED — fixed\n[P0] f:2 — the RESOLVED state is forgeable\n[P1] f:3 — RESOLVED_MODEL is clobbered\nVERDICT: FIX-FIRST\n' > "$artifact"
+  fi
+  case "$scenario" in
+    foreign) printf 'VERDICT: FIX-FIRST (run marker: pg-run-other-99-1700000700-1)\n' >> "$artifact" ;;
+    invalid-utf8) printf '\377\nVERDICT: FIX-FIRST\n' >> "$artifact" ;;
+    nul) printf '\0\nVERDICT: FIX-FIRST\n' >> "$artifact" ;;
+  esac
+  digest="$(pg_sha256 "$artifact")"
+  result="$(jq -cS --arg digest "$digest" --arg ib "$(pg_review_sha256_text "$input")" --arg verdict "$verdict" \
+    '.artifact.digest=$digest | .input_binding_digest=$ib | .verdict=$verdict | if $verdict=="SHIP" then . else .ship_proof=null end' <<<"$RESULT_BINDING")"
+  case "$scenario" in
+    predecessor) result="$(jq -cS --arg cd "$PG214_PRED_B" '.contract_digest=$cd' <<<"$result")" ;;
+    input-digest) result="$(jq -cS '.input_binding_digest=("a"*64)' <<<"$result")" ;;
+    wrong-marker) result="$(jq -cS '.marker="pg-run-other-99-1700000700-1" | .input_binding_identity=.marker | .artifact.path=("completed/"+.marker)' <<<"$result")" ;;
+    verdict-mismatch) result="$(jq -cS '.verdict="NEEDS-DISCUSSION"' <<<"$result")" ;;
+  esac
+  pg_review_input_binding_write "$marker" "$input" || exit 1
+  mkdir -p "$(pg_review_result_binding_dir)"
+  printf '%s' "$result" > "$(pg_review_result_binding_dir)/$marker"
+  case "$scenario" in
+    corrupt) printf 'corrupted\n' >> "$artifact" ;;
+    unreadable) chmod 000 "$artifact" ;;
+    changing)
+      # Change the original during interpretation: the snapshot cannot mask a changed source.
+      pg_review_open_severity() { printf 'changed\n' >> "$artifact"; printf '1\t1\n'; } ;;
+  esac
+  facts="$(pg_review_accepted_artifact_read "$marker" "$input")" || rc=$?
+  [ "$scenario" != unreadable ] || chmod 600 "$artifact"
+  case "$scenario" in
+    corrupt|input-digest|wrong-marker|foreign|invalid-utf8|nul|unreadable|changing)
+      [ "$rc" -eq 1 ] && [ -z "$facts" ] ;;
+    verdict-mismatch)
+      [ "$rc" -eq 2 ] && jq -e 'has("open_p0")|not' <<<"$facts" >/dev/null ;;
+    *)
+      [ "$rc" -eq 0 ] || exit 1
+      jq -e --arg digest "$digest" --arg verdict "$verdict" --arg canonical "$(pg_review_sha256_text "$result")" \
+        '.artifact_digest==$digest and .verdict==$verdict and .canonical_identity==$canonical' <<<"$facts" >/dev/null || exit 1
+      case "$scenario" in
+        valid|predecessor) jq -e '.open_p0==1 and .open_p1==1' <<<"$facts" >/dev/null || exit 1 ;;
+        p2) jq -e '.open_p0==0 and .open_p1==0 and .verdict=="FIX-FIRST"' <<<"$facts" >/dev/null || exit 1 ;;
+        choices) jq -e '.named_choices|map(.id)==["keep","break"]' <<<"$facts" >/dev/null || exit 1 ;;
+        ship)
+          pg_review_accepted_ship_matches "$facts" '2222222222222222222222222222222222222222' '1111111111111111111111111111111111111111' 'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd' || exit 1
+          ! pg_review_accepted_ship_matches "$facts" '2222222222222222222222222222222222222222' '1111111111111111111111111111111111111111' 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' || exit 1 ;;
+      esac
+      before="$(find "$PRO_GATE_HOME" -type f -exec sha256sum {} + | sort)"
+      [ "$(pg_review_accepted_artifact_read "$marker" "$input")" = "$facts" ] || exit 1
+      [ "$before" = "$(find "$PRO_GATE_HOME" -type f -exec sha256sum {} + | sort)" ]
+      ;;
+  esac
+)
+for u1_case in valid predecessor p2 choices ship corrupt input-digest wrong-marker foreign invalid-utf8 nul unreadable changing verdict-mismatch; do
+  u1_result="$(u1_accepted_case "$u1_case" 2>&1)"; u1_rc=$?
+  check "accepted artifact interpretation: $u1_case" "$u1_rc" "$u1_result"
+done
+# End U1 accepted-artifact reader cases.
+
 # #214 (gate r2 P1): a v0.53.0 contract bump changes PG_REVIEW_DECISION_CONTRACT_DIGEST, but every
 # binding record written by a runtime carrying a predecessor digest must remain readable — its own
 # record_type/record_version shape rules already proved it, and the contract changes since were

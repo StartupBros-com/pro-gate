@@ -191,5 +191,33 @@ effect_case(){ (
 result="$(effect_case 2>&1)"; rc=$?
 check 'saved CONTINUE grant rechecks exhaustion before charge/browser at every boundary; cooldown still wins' "$rc" "$result"
 
+# The open-count reader shares the writer's status-position grammar, not its side effects.
+result="$(
+  clear_policy
+  PRO_GATE_HOME="$TDIR/severity"
+  seed severity 1 clean
+  review="$PRO_GATE_HOME/review"
+  cat > "$review" <<'REVIEW'
+[P0] f:1 — RESOLVED — fixed
+[P0] f:2 — the RESOLVED state is forgeable
+[p0] f:3 — RESOLVED_MODEL is clobbered
+[P1] f:4 -- RESOLVED -- fixed
+[p1] f:5 - resolved - lowercase remains open
+[P1] f:6 — STILL-PRESENT — broken
+[P2] f:7 — new minor issue
+VERDICT: FIX-FIRST
+REVIEW
+  pg_round_note_severity severity "$review"
+  [ "$(pg_round_last_severity severity)" = '2 2' ] || exit 1
+  # The governor's historical res tally is deliberately case-insensitive; do not change it.
+  [ "$(cut -f2-6 "$PRO_GATE_HOME/rounds/severity.hist" | tail -n 1)" = $'FIX-FIRST\t2\t2\t3\t1' ] || exit 1
+  before="$(find "$PRO_GATE_HOME" -type f -exec sha256sum {} + | sort)"
+  counts="$(pg_review_open_severity "$review")" || exit 1
+  [ "$counts" = $'2\t2' ] || exit 1
+  [ "$before" = "$(find "$PRO_GATE_HOME" -type f -exec sha256sum {} + | sort)" ] || exit 1
+  ! pg_review_open_severity "$PRO_GATE_HOME/missing"
+)"; rc=$?
+check 'pure open severity preserves status position, case and governor accounting' "$rc" "$result"
+
 printf '%s failures\n' "$FAILURES"
 [ "$FAILURES" -eq 0 ]

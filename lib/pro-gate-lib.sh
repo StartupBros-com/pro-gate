@@ -3067,6 +3067,21 @@ pg_round_unrecord() {
   return 0
 }
 
+# Pure open-count grammar: print P0<TAB>P1, or fail without counts on an unreadable file.
+# Only uppercase RESOLVED in status position excludes a finding; prose and identifiers do not.
+pg_review_open_severity() {
+  local out="$1" counts
+  [ -f "$out" ] && [ -r "$out" ] || return 1
+  counts="$(awk '
+    /^[[:space:]]*\[[Pp][01]\]/ {
+      if ($0 ~ /^[[:space:]]*\[[Pp][01]\][[:space:]]+[^[:space:]]+[[:space:]]+(—|--|-)[[:space:]]+RESOLVED([^_[:alnum:]]|$)/) next
+      if ($0 ~ /^[[:space:]]*\[[Pp]0\]/) p0++; else p1++
+    }
+    END { printf "%d\t%d", p0, p1 }
+  ' "$out")" || return 1
+  printf '%s\n' "$counts"
+}
+
 # pg_round_note_severity <key> <review-file>: record the P0/P1 counts of a change's most
 # recent COMPLETED review in a sidecar ($rounds/<key>.last), and append the full per-round
 # line (epoch, verdict word, open P0, open P1, resolved, still-present, wall-clock secs) to
@@ -3077,26 +3092,13 @@ pg_round_unrecord() {
 # hist line (concurrent harvest completions race the rewrite) only UNDER-counts earned
 # rounds — the governor degrades toward the base grant, never past the ceiling.
 pg_round_note_severity() {
-  local key="$1" out="$2" spend_epoch="${3:-}" dir p0 p1 verdict res sp now win t rest stamp dur
+  local key="$1" out="$2" spend_epoch="${3:-}" dir p0 p1 counts verdict res sp now win t rest stamp dur
   pg_round_key_ok "$key" || return 0
   dir="$(pg_rounds_dir)"
   [ -f "$dir/$key" ] || return 0
   [ -s "$out" ] || return 0
-  # v0.28 (#52 item 3): count only OPEN findings. Confirming reviews are REQUIRED to carry
-  # every prior P0/P1/P2 forward as a "[Pn] … RESOLVED …" verification block; grep-counting every
-  # severity tag reported resolved P0s as "OPEN P0" at round-cap time and prompted false
-  # force-round escalations. The RESOLVED filter is case-SENSITIVE on purpose: reviews upcase
-  # the verification token, while prose like "unresolved"/"Unresolved" must not exclude a line.
-  # STILL-PRESENT and new-finding lines carry no RESOLVED token and stay counted.
-  # (grep -c prints 0 AND exits 1 on no match: capture, then default only when empty.)
-  # Anchored to the STATUS POSITION (gate #54 r3+r4 P2): exclude only when RESOLVED is the
-  # first token after the delimiter that follows the [Pn] citation — headline shape
-  # "[P1] path:line — RESOLVED — …". A finding whose DESCRIPTION merely contains the word
-  # ("the RESOLVED state can be forged") or an identifier (RESOLVED_MODEL) stays counted.
-  p0="$(grep -iE '^[[:space:]]*\[P0\]' "$out" 2>/dev/null \
-    | grep -Evc '^[[:space:]]*\[[Pp]0\][[:space:]]+[^[:space:]]+[[:space:]]+(—|--|-)[[:space:]]+RESOLVED([^_[:alnum:]]|$)')"; [ -n "$p0" ] || p0=0
-  p1="$(grep -iE '^[[:space:]]*\[P1\]' "$out" 2>/dev/null \
-    | grep -Evc '^[[:space:]]*\[[Pp]1\][[:space:]]+[^[:space:]]+[[:space:]]+(—|--|-)[[:space:]]+RESOLVED([^_[:alnum:]]|$)')"; [ -n "$p1" ] || p1=0
+  counts="$(pg_review_open_severity "$out")" || return 0
+  IFS=$'\t' read -r p0 p1 <<<"$counts"
   { printf '%s\t%s\t%s\n' "$(date +%s)" "$p0" "$p1" > "$dir/$key.last.tmp" \
       && mv -f "$dir/$key.last.tmp" "$dir/$key.last"; } 2>/dev/null || true
   # v0.31 trajectory history for the round governor. Verdict word from the review's own
@@ -4545,6 +4547,71 @@ pg_review_input_binding_read() { pg_review_binding_read input "$1"; }
 pg_review_result_binding_read() { pg_review_binding_read result "$1"; }
 pg_review_input_binding_digest() { local r; r="$(pg_review_input_binding_read "$1")" || return 1; pg_review_sha256_text "$r"; }
 pg_review_result_binding_digest() { local r; r="$(pg_review_result_binding_read "$1")" || return 1; pg_review_sha256_text "$r"; }
+
+# Read one accepted completion without collection, repair, scoring or persistent writes.
+# All interpretation uses a private byte snapshot, not several reads of a changing artifact.
+# rc 0: accepted facts; rc 1: unavailable (no output); rc 2: verdict disagreement (diagnostic
+# facts only, never counts). The caller retains the decision reducer's distinct repair projection.
+pg_review_accepted_artifact_read() ( # marker [expected canonical input binding]
+  local marker="$1" expected="${2:-}" input result artifact snapshot digest canonical verdict stored choices='[]' counts p0 p1 text
+  pg_reservation_marker_ok "$marker" || return 1
+  input="$(pg_review_input_binding_read "$marker")" || return 1
+  [ -z "$expected" ] || [ "$input" = "$expected" ] || return 1
+  result="$(pg_review_result_binding_read "$marker")" || return 1
+  artifact="$(pg_completed_dir)/$marker"
+  [ -f "$artifact" ] && [ ! -L "$artifact" ] && [ -r "$artifact" ] || return 1
+  snapshot="$(mktemp "${TMPDIR:-/tmp}/pg-accepted-review.XXXXXX")" || return 1
+  trap 'rm -f "$snapshot"' EXIT
+  cat "$artifact" > "$snapshot" || return 1
+  digest="$(pg_sha256 "$snapshot")"; [ -n "$digest" ] || return 1
+  jq -e --arg ib "$(pg_review_sha256_text "$input")" --arg digest "$digest" \
+    '.input_binding_digest==$ib and .artifact.digest==$digest' <<<"$result" >/dev/null || return 1
+  # A JSON text roundtrip rejects invalid UTF-8 and NUL without silently repairing accepted bytes.
+  text="$(jq -Rs . "$snapshot")" || return 1
+  jq -e 'index("\u0000")==null' <<<"$text" >/dev/null || return 1
+  [ "$(jq -jr . <<<"$text" | pg_sha256 /dev/stdin)" = "$digest" ] || return 1
+  pg_is_review "$snapshot" || return 1
+  [ -z "$(pg_capture_foreign_echo "$snapshot" "$marker")" ] || return 1
+  stored="$(jq -r .verdict <<<"$result")"
+  verdict="$(pg_extract_verdict "$snapshot")"
+  canonical="$(pg_review_sha256_text "$result")"
+  if [ "$stored" = "$verdict" ]; then
+    counts="$(pg_review_open_severity "$snapshot")" || return 1
+    IFS=$'\t' read -r p0 p1 <<<"$counts"
+    if [ "$verdict" = NEEDS-DISCUSSION ]; then
+      choices="$(pg_review_decision_named_choices "$snapshot")" || choices='[]'
+    fi
+  fi
+  # Refuse a source or binding replaced during interpretation. Canonical identity always hashes
+  # the result we actually read, including supported predecessor contract identities.
+  [ -f "$artifact" ] && [ ! -L "$artifact" ] && [ "$(pg_sha256 "$artifact")" = "$digest" ] || return 1
+  [ "$(pg_review_input_binding_read "$marker")" = "$input" ] || return 1
+  [ "$(pg_review_result_binding_read "$marker")" = "$result" ] || return 1
+  if [ "$stored" != "$verdict" ]; then
+    echo "ERROR: result binding verdict $stored disagrees with parsed artifact verdict ${verdict:-NONE} for $marker; artifact=completed/$marker binding=review-result-bindings/$marker. Stop concurrent writers, archive the original binding outside the active result directory without deleting it, then rerun the query and apply its collect-existing-result effect." >&2
+    jq -cnS --arg digest "$digest" '{artifact_digest:$digest}'
+    return 2
+  fi
+  jq -cnS --argjson input "$input" --argjson result "$result" --arg digest "$digest" \
+    --arg canonical "$canonical" --arg verdict "$verdict" --argjson choices "$choices" \
+    --argjson p0 "$p0" --argjson p1 "$p1" \
+    '{input_binding:$input,result_binding:$result,artifact_digest:$digest,canonical_identity:$canonical,verdict:$verdict,named_choices:$choices,open_p0:$p0,open_p1:$p1}'
+)
+
+# Current SHIP applicability is separate from retained acceptance. In particular, a connector
+# review can inform progress but never supply handoff authority. The caller proves current input.
+pg_review_accepted_ship_matches() { # accepted facts base head raw-digest
+  local accepted="$1" base="$2" head="$3" raw="$4" mode digest
+  mode="$(jq -r .input_binding.evidence.mode <<<"$accepted")"
+  case "$mode" in
+    full-pr) [ -n "$base" ] && [ -n "$raw" ] || return 1; digest="$raw" ;;
+    scoped-delta) digest="$(jq -r .input_binding.evidence.proof.raw_digest <<<"$accepted")" ;;
+    *) return 1 ;;
+  esac
+  jq -e --arg base "$base" --arg head "$head" --arg digest "$digest" \
+    '.result_binding.ship_proof | .base_oid==$base and .head_oid==$head and .diff_digest==$digest' \
+    <<<"$accepted" >/dev/null
+}
 
 # pg_ledger_lookup_clean <marker>: echo "out<TAB>sha256" from the newest CLEAN ledger row for
 # a marker, or nothing. Fallback for pre-artifact collections (#52 item 2): lets a harvest

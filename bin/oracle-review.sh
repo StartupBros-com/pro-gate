@@ -522,10 +522,10 @@ pg_review_decision_cli() {
   local repo pr_num remote ident host owner repo_name head base raw_digest round_key code_identity
   local input_proven=false input_binding_valid=false input_identity evidence_identity evidence_state
   local input_marker="" input_record="" input_digest="" f marker candidate candidate_relation desired_relation exact=false active_marker="" active_state=none
-  local endpoint reviewed manifest confirmation endpoint_digest reviewed_digest manifest_digest confirmation_digest lineage mode ship_digest
+  local endpoint reviewed manifest confirmation endpoint_digest reviewed_digest manifest_digest confirmation_digest lineage mode
   local reservation_marker="" reservation_state=none governor_granted=false cooldown_left=0 completed='[]' prior_candidates='[]' prior_review result artifact artifact_digest canonical
-  local facts governor_facts decision effect_ok=false prospective exact_inputs='[]' choice_candidates='[]' choice_outcomes='[]' choice_selected="" choice_snapshot="" selection="" selection_supplied=false current_verdict=NONE current_canonical="" effect_input attempt_snapshot attempt_source parsed_verdict stored_verdict
-  local delivery_relation delivery_facts
+  local facts governor_facts decision effect_ok=false prospective exact_inputs='[]' choice_candidates='[]' choice_outcomes='[]' choice_selected="" choice_snapshot="" selection="" selection_supplied=false current_verdict=NONE current_canonical="" effect_input attempt_snapshot attempt_source
+  local delivery_relation delivery_facts accepted accepted_rc
   local pr_evidence="" legacy_pr_identity=false
 
   pg_have jq || { echo 'ERROR: review-decision/v1 requires jq' >&2; return 2; }
@@ -642,17 +642,11 @@ pg_review_decision_cli() {
       continue
     fi
     artifact="$(pg_completed_dir)/$marker"
-    [ -f "$artifact" ] && [ ! -L "$artifact" ] && pg_is_review "$artifact" || continue
-    [ -z "$(pg_capture_foreign_echo "$artifact" "$marker")" ] || continue
-    artifact_digest="$(pg_sha256 "$artifact" 2>/dev/null || true)"
-    [ -n "$artifact_digest" ] || continue
-    input_digest="$(pg_review_sha256_text "$candidate")"
-    jq -e --arg ib "$input_digest" --arg digest "$artifact_digest" \
-      '.input_binding_digest==$ib and .artifact.digest==$digest' <<<"$result" >/dev/null 2>&1 || continue
-    stored_verdict="$(jq -r .verdict <<<"$result")"
-    parsed_verdict="$(pg_extract_verdict "$artifact")"
-    if [ "$stored_verdict" != "$parsed_verdict" ]; then
-      echo "ERROR: result binding verdict $stored_verdict disagrees with parsed artifact verdict ${parsed_verdict:-NONE} for $marker; artifact=completed/$marker binding=review-result-bindings/$marker. Stop concurrent writers, archive the original binding outside the active result directory without deleting it, then rerun the query and apply its collect-existing-result effect." >&2
+    accepted_rc=0
+    accepted="$(pg_review_accepted_artifact_read "$marker" "$candidate")" || accepted_rc=$?
+    case "$accepted_rc" in 0|2) ;; *) continue ;; esac
+    artifact_digest="$(jq -r .artifact_digest <<<"$accepted")"
+    if [ "$accepted_rc" -eq 2 ]; then
       if [ "$exact" = true ]; then
         completed="$(jq -cS --arg marker "$marker" --arg artifact "$artifact_digest" \
           --argjson epoch "$(jq -r .charged_spend_epoch <<<"$candidate")" \
@@ -661,36 +655,19 @@ pg_review_decision_cli() {
       fi
       continue
     fi
-    canonical="$(pg_review_result_binding_digest "$marker" 2>/dev/null || true)"
-    [ -n "$canonical" ] || continue
+    result="$(jq -cS .result_binding <<<"$accepted")"
+    canonical="$(jq -r .canonical_identity <<<"$accepted")"
 
     if [ "$exact" = true ]; then
-      if [ "$(jq -r .verdict <<<"$result")" = SHIP ]; then
-        mode="$(jq -r .evidence.mode <<<"$candidate")"
-        case "$mode" in
-          full-pr)
-            [ -n "$base" ] && [ -n "$raw_digest" ] || continue
-            ship_digest="$raw_digest" ;;
-          scoped-delta)
-            # The binding recheck above proved endpoint, reviewed payload, manifest, confirmation,
-            # base, and head. Handoff additionally binds the result to that full raw endpoint.
-            ship_digest="$(jq -r .evidence.proof.raw_digest <<<"$candidate")" ;;
-          connector)
-            # Connector observations never become merge handoff authority.
-            continue ;;
-          *) continue ;;
-        esac
-        jq -e --arg base "$base" --arg head "$head" --arg digest "$ship_digest" \
-          '.ship_proof.base_oid==$base and .ship_proof.head_oid==$head and .ship_proof.diff_digest==$digest' \
-          <<<"$result" >/dev/null 2>&1 || continue
+      if [ "$(jq -r .verdict <<<"$accepted")" = SHIP ]; then
+        pg_review_accepted_ship_matches "$accepted" "$base" "$head" "$raw_digest" || continue
       fi
       completed="$(jq -cS --arg marker "$marker" --arg canonical "$canonical" --arg artifact "$artifact_digest" \
         --argjson epoch "$(jq -r .charged_spend_epoch <<<"$candidate")" --arg verdict "$(jq -r .verdict <<<"$result")" \
         --arg mode "$(pg_review_decision_result_mode "$candidate")" \
         '. + [{applicable:true,artifact_digest:$artifact,bindable:true,binding_valid:true,canonical_identity:$canonical,charged_spend_epoch:$epoch,collected:true,evidence_mode:$mode,legacy:false,marker:$marker,provenance_valid:true,verdict:$verdict}]' <<<"$completed")"
       if [ "$(jq -r .verdict <<<"$result")" = NEEDS-DISCUSSION ]; then
-        choice_outcomes="$(pg_review_decision_named_choices "$artifact" 2>/dev/null || true)"
-        [ -n "$choice_outcomes" ] || choice_outcomes='[]'
+        choice_outcomes="$(jq -cS .named_choices <<<"$accepted")"
         choice_candidates="$(jq -cS --arg canonical "$canonical" --argjson outcomes "$choice_outcomes" \
           '. + [{canonical_identity:$canonical,outcomes:$outcomes}]' <<<"$choice_candidates")"
       fi
