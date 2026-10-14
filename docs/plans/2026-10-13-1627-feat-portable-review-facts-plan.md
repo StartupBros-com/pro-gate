@@ -10,6 +10,10 @@ execution: code
 
 # Portable Review Facts - Plan
 
+> **Implemented and retired, 2026-10-14; retained as decision history.** All six units shipped: the public interpreter, facts command and optional GitHub adapter in [Pro-gate264](https://github.com/StartupBros-com/pro-gate/pull/264), with selection/identity repairs in [266](https://github.com/StartupBros-com/pro-gate/pull/266) and [268](https://github.com/StartupBros-com/pro-gate/pull/268); [v0.61.2](https://github.com/StartupBros-com/pro-gate/releases/tag/v0.61.2) and [marketplace197](https://github.com/StartupBros-com/hov-marketplace/pull/197) completed public distribution; [dotfiles1786](https://github.com/StartupBros-com/dotfiles/pull/1786) and [Pushbot4557](https://github.com/StartupBros-com/pushbot/pull/4557) migrated both consumers after release. Release bytes and a clean installation were verified, and the installed cross-repository integration passed 22/22 tests. Pushbot's ready-state CI passed before its exact-head merge; review coverage limits remain disclosed on those PRs, not promoted into stronger claims here.
+>
+> Maintained behavior now lives in [README.md](../../README.md), the runtime and adapter tests, and the consumer implementations. The requirements and execution instructions below are historical, not pending work. Public review facts do not transfer owner policy or merge authority into Pro-gate. Broader transport/attempt facts in [175](https://github.com/StartupBros-com/pro-gate/issues/175), transport repair in [204](https://github.com/StartupBros-com/pro-gate/issues/204), and capture-quality work in [262](https://github.com/StartupBros-com/pro-gate/issues/262)/[263](https://github.com/StartupBros-com/pro-gate/pull/263) are outside this completed plan; abandoned estimator and connector-routing proposals remain abandoned.
+
 ## Goal Capsule
 
 - **Objective:** Marketplace users and our automation can use verified review results without installing private repositories or interpreting Pro-gate's internal files.
