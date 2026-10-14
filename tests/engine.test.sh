@@ -7005,11 +7005,21 @@ PG214_PRED_B='7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee'
 PG214_PRED_C='5fcd19c12600061af6d90ed9cb980dd7067cff199c374910639003eec4caf5c3'
 PG214_PRED_D='6da6866bab4e95ad138cdc946fa1388be9c386bca7b592c3370c9f52e34b315f'
 PG214_PRED_E='fa91787e3fbf3c0852c78f5269b2f670d84b86561be64d6edef4229bf46aee9b'
+# Independently verified against the contract bytes and digest helper at 59d94fd.
+PG214_PRED_F='07d50c7d8a8b8f60b36c532231a8228f548f1dcb4a9b609b2ffedd32d2b518e1'
 PG214_UNKNOWN_CD='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+pg214_compatible_digests_match() { # candidate JSON array
+  jq -ne --arg a "$PG214_PRED_A" --arg b "$PG214_PRED_B" --arg c "$PG214_PRED_C" \
+    --arg d "$PG214_PRED_D" --arg e "$PG214_PRED_E" --arg f "$PG214_PRED_F" --argjson got "$1" \
+    '$got == ([$a,$b,$c,$d,$e,$f] | sort)' >/dev/null 2>&1
+}
 check 'the binding compatibility list preserves five historical digests plus the newly retired contract' \
-  "$(jq -ne --arg a "$PG214_PRED_A" --arg b "$PG214_PRED_B" --arg c "$PG214_PRED_C" --arg d "$PG214_PRED_D" --arg e "$PG214_PRED_E" --argjson got "$(pg_review_decision_compatible_contract_digests_json)" \
-      '$got | length==6 and contains([$a,$b,$c,$d,$e])' >/dev/null 2>&1; echo $?)" \
+  "$(pg214_compatible_digests_match "$(pg_review_decision_compatible_contract_digests_json)"; echo $?)" \
   "$(pg_review_decision_compatible_contract_digests_json)"
+PG214_SUBSTITUTED_DIGESTS="$(pg_review_decision_compatible_contract_digests_json | \
+  jq -c --arg retired "$PG214_PRED_F" --arg wrong "$PG214_UNKNOWN_CD" 'map(if .==$retired then $wrong else . end) | sort')"
+check 'the compatibility assertion rejects a substituted sixth digest of 64 a characters' \
+  "$(! pg214_compatible_digests_match "$PG214_SUBSTITUTED_DIGESTS"; echo $?)" "$PG214_SUBSTITUTED_DIGESTS"
 PG214_ENV_PRED_FACTS="$(rd_facts '{}')"; PG214_ENV_PRED_FACTS="$(jq -cS --arg cd "$PG214_PRED_A" '.contract.contract_digest=$cd' <<<"$PG214_ENV_PRED_FACTS")"
 PG214_ENV_PRED_OUT="$(rd_reduce "$PG214_ENV_PRED_FACTS")"
 check '#214: a decision envelope carrying a predecessor contract digest is still rejected as unknown-contract' \

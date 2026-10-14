@@ -426,7 +426,7 @@ for headline in '- [P1]' '**P1**:' 'P1 -' 'p1:' '+ [P0]' '[P1]' '1. __p1__:' '2)
   direct_review_case "P1-1 supported severity $headline requires a fix" \
     "$headline runtime.sh:1 — Concurrent writes lose data."$'\n'"$DEFERRAL_BODY" "$BLOCKING_PREDICATE"
 done
-for headline in 'P1]' '**P1]**:' '> [P1]' '### [P0]' '[**P1**]' '`[P1]`' '(P1)'; do
+for headline in 'P1]' '**P1]**:' '> [P1]' '[**P1**]' '`[P1]`' '(P1)'; do
   direct_review_case "P1-1 unrecognized severity $headline leaves counts unavailable" \
     "$headline runtime.sh:1 — Concurrent writes lose data."$'\n'"$DEFERRAL_BODY" \
     '.action=="fix-review-findings" and .facts.open_blocking==null'
@@ -438,6 +438,46 @@ for headline in 'P1:' '[P0]'; do
 done
 direct_review_case 'P1-1 none declarations positively prove zero blockers' \
   $'P0: none\np1: none\n'"$DEFERRAL_BODY" "$DEFERRAL_PREDICATE"
+
+# PR #276 round 3: section headings end blocks, while heading-form findings use the
+# same severity grammar. Unsupported quoted labels end a block without becoming findings.
+ROUND3_DEFERRAL_PREDICATE='.action=="allow-existing-merge-workflow" and .reason=="fix-first-deferred-p2-only" and .facts.open_blocking==0 and .facts.deferred_count==1'
+direct_review_case 'R3-P1 severity section headings preserve P2-only deferral' \
+  $'P0: none\n## P1 findings\nP1: none\n[P2] b.sh:2 — a nit\nVERDICT: FIX-FIRST\n' \
+  "$ROUND3_DEFERRAL_PREDICATE and .facts.deferred_findings==[{severity:\"P2\",text:\"b.sh:2 — a nit\"}]"
+for heading in '## P1' '### P1 (blocking)' '## P1 — Must fix' '## P0:' \
+  '## P1 findings:' '## P1 Issues (2)' '## [p1] notes' '## P1 severity level' \
+  '## P0 none' '## P1 empty' '## P1 n/a' '## P1 must-fix' '## P1 should fix' \
+  '## P1 nice to have' '## P1 items blockers blocking comments' '## P1 —'; do
+  direct_review_case "R3-P1 section $heading keeps zero counts known" \
+    "$heading"$'\nP0: none\nP1: none\nVERDICT: FIX-FIRST\n' \
+    '.action=="fix-review-findings" and .reason=="fix-first-without-findings" and .facts.open_blocking==0 and .facts.deferred_count==0'
+done
+for heading in '### [P1] lib/x.sh:12 — the lock is deleted' '### P1 — the lock is deleted' \
+  '### [P0] lib/x.sh:12 — the lock is deleted' '## P1 findings lose data' '## P1 (the lock is deleted)'; do
+  direct_review_case "R3-P1 finding $heading still counts a blocker" \
+    "$heading"$'\nVERDICT: FIX-FIRST\n' "$BLOCKING_PREDICATE"
+done
+for severity in P2 P3; do
+  direct_review_case "R3-P1 heading-form $severity finding preserves deferred text" \
+    "### [$severity] lib/x.sh:12 — a nit"$'\nVERDICT: FIX-FIRST\n' \
+    "$ROUND3_DEFERRAL_PREDICATE and .facts.deferred_findings==[{severity:\"$severity\",text:\"lib/x.sh:12 — a nit\"}]"
+done
+for heading in '## P2 findings' '## Findings' '## Refuted'; do
+  direct_review_case "R3-P1 boundary $heading closes a resolved blocker" \
+    $'[P1] a.sh:1 — RESOLVED — patched.\n'"$heading"$'\nCorrection: STILL-PRESENT; still broken\n[P3] c.sh:3 — a nit\nVERDICT: FIX-FIRST\n' \
+    "$ROUND3_DEFERRAL_PREDICATE and .facts.deferred_findings==[{severity:\"P3\",text:\"c.sh:3 — a nit\"}]"
+done
+for label in '> [P2]' '> [P3]' 'P2]' '`[P3]`'; do
+  direct_review_case "R3-P2 unsupported $label closes a resolved blocker without counting the quotation" \
+    $'[P1] a.sh:1 — RESOLVED — patched.\n'"$label"$' b.sh:2 — quoted\nCorrection: STILL-PRESENT; still broken\n[P3] c.sh:3 — a nit\nVERDICT: FIX-FIRST\n' \
+    "$ROUND3_DEFERRAL_PREDICATE and .facts.deferred_findings==[{severity:\"P3\",text:\"c.sh:3 — a nit\"}]"
+done
+direct_review_case 'R3-P1 malformed non-heading P1 label still leaves counts unavailable' \
+  $'P1] — something unparsed\nVERDICT: FIX-FIRST\n' \
+  '.action=="fix-review-findings" and .facts.open_blocking==null'
+direct_review_case 'R3-P1 bare P1 em-dash finding keeps its existing grammar' \
+  $'P1 — something unparsed\nVERDICT: FIX-FIRST\n' "$BLOCKING_PREDICATE"
 for status in 'Correction: STILL-PRESENT; concurrent requests still lose data.' 'REOPENED' 'NOT RESOLVED' 'NOT FIXED' 'Correction: the patch missed this path.' 'Correction:'; do
   direct_review_case "P1-2 continuation $status reopens a RESOLVED finding" \
     $'[P1] runtime.sh:1 — RESOLVED — patched.\n  '"$status"$'\n'"$DEFERRAL_BODY" "$BLOCKING_PREDICATE"

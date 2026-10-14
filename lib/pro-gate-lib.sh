@@ -3083,6 +3083,14 @@ pg_review_finding_summary() {
       else
         capture("^(?:\\*\\*|__)?(?<severity>[Pp][0-3])(?=\\s|:|—|-|\\*\\*|__|$)(?:\\*\\*|__)?\\s*:?\\s*(?:[-—]\\s+)?(?<text>.*)$")
       end | .severity |= ascii_upcase;
+    def none_declaration:
+      test("^(?:none|—|-)[.!]?\\s*$";"i");
+    def section_text:
+      "(?:findings?|issues?|items?|blockers?|blocking|notes?|comments?|severity|level|must[ -]fix|should fix|nice to have|none|empty|n/a)" as $word |
+      test("^\\s*(?:"+$word+"(?:\\s+"+$word+")*)?\\s*:?[ \\t]*(?:\\((?:"+$word+"|[0-9]+)\\))?\\s*:?\\s*$";"i");
+    def unsupported_label:
+      gsub("[*_`]";"") | sub("^[^[:alpha:]]+";"") |
+      capture("^(?<severity>[Pp][0-3])(?=[^_[:alnum:]]|$)").severity | ascii_upcase;
     def flush:
       if .current==null then . else .blocks += [.current] | .current=null end;
     def bounded:
@@ -3105,18 +3113,23 @@ pg_review_finding_summary() {
          .fence=($normal|capture("^(?<fence>`{3,}|~{3,})").fence) |
          if .current!=null then .current.lines += [$line] else . end
        else
-         ([$normal|headline] | first // null) as $head |
-         if $head!=null then
+         ($normal|test("^#{1,6}\\s+")) as $heading |
+         ([$normal | if $heading then sub("^#{1,6}\\s+";"") else . end | headline] | first // null) as $head |
+         ([$normal|unsupported_label] | first // null) as $unsupported |
+         if $heading and ($head==null or ($head.text|section_text or none_declaration)) then
+           flush
+         elif $head!=null then
            flush |
            if ($head.text|test("^\\s*$")) then
              if ($head.severity|IN("P0","P1")) then .unknown=true else . end
-           elif ($head.text|test("^(?:none|—|-)[.!]?\\s*$";"i")) then .
+           elif ($head.text|none_declaration) then .
            else .current={severity:$head.severity,lines:[$head.text]} end
-         elif ($normal|gsub("[*_`]";"")|sub("^[^[:alpha:]]+";"")|test("^[Pp][01](?=[^_[:alnum:]]|$)")) then
-           flush | .unknown=true
+         elif $unsupported!=null then
+           # Quoted labels end the preceding block without becoming live findings.
+           flush | .unknown=(.unknown or ($unsupported|IN("P0","P1")))
          elif .current!=null and ($normal|test("^Correction\\s*:";"i")) then
            .current.lines += [$line]
-         elif ($normal|test("^(?:(?:\\*\\*|__)?(?:VERDICT|CHOICE)(?:\\*\\*|__)?\\s*:|#{1,6}\\s|[A-Za-z][A-Za-z -]*:\\s*$)";"i")) then
+         elif ($normal|test("^(?:(?:\\*\\*|__)?(?:VERDICT|CHOICE)(?:\\*\\*|__)?\\s*:|[A-Za-z][A-Za-z -]*:\\s*$)";"i")) then
            flush
          elif .current!=null then .current.lines += [$line]
          else . end
