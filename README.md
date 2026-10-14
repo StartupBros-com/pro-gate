@@ -137,6 +137,151 @@ This changes neither review provenance nor merge authority: the runtime remains 
 transport and the gate stops before merge. A surrounding agent may arm guarded auto-merge only
 after its own verification/review gates pass; exact-head required CI remains the final authority.
 
+## Retained review facts
+
+A standalone consumer can inspect retained accepted reviews through the installed runtime:
+
+```bash
+"${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/oracle-review.sh" \
+  --review-facts --repo /path/to/checkout --pr 1983 --json
+```
+
+`--pr` also accepts a canonical PR URL. A numeric PR uses the checkout's canonical `origin`.
+This command reads existing records only: it does not submit, collect, repair, score, clean up,
+query the network/browser, spend a round, or override a stop. Invalid fresh-review input or
+attachment policy does not block inspection. It requires local `git`, `jq`, and a SHA-256 tool,
+not a signed-in browser or private consumer parser.
+
+Inspection defaults to the checkout's current HEAD. `--candidate-head <full-sha>` instead
+selects an explicit revision without switching branches. Matching that SHA alone is not proof:
+current applicability still requires the complete accepted input proof. The same optional flag
+on `--prepare-review-evidence` requires the live PR to name that exact head; it is rejected by
+review execution, continuation, recovery and status modes. The GitHub adapter supplies its
+live-checked reviewed SHA, so recording also works from a default-branch checkout.
+
+The additive JSON schema is `review-facts/v1`. Consumers should check `schema` and `status`,
+allow additional fields, and treat unavailable facts as unavailable, not zero.
+
+| Field | Meaning |
+| --- | --- |
+| `schema` | `review-facts/v1` |
+| `status` | `accepted`, `missing`, `invalid`, `incomplete`, or `ambiguous` |
+| `reason` | Selection, acceptance, or applicability explanation |
+| `repository` / `pr` | Requested `{host, owner, repo}` and numeric PR |
+| `selected_marker` | Selected completion marker; `null` when no unique selection is proven |
+| `candidate_head` | Explicit `--candidate-head`, otherwise checkout's current HEAD or `null` if unavailable; separate from the reviewed revision |
+| `applicable` | `true` for complete matching current proof; `false` for known different head/evidence; `null` when proof is unavailable |
+| `review` | Accepted facts below, or `null` for every unaccepted result |
+| `review.canonical_identity` | SHA-256 of the canonical accepted result binding, including its supported predecessor contract identity |
+| `review.charged_spend_epoch` | Recorded charge epoch used for completion ordering |
+| `review.reviewed_head` | Accepted input binding's reviewed revision |
+| `review.evidence_mode` | Retained `full-pr`, `scoped-delta`, `connector`, or `caller-patch` mode |
+| `review.evidence_identity` | `relation:<sha256>` of the complete canonical repository/target/evidence relation |
+| `review.artifact_digest` | SHA-256 of the accepted artifact bytes |
+| `review.verdict` | `SHIP`, `FIX-FIRST`, or `NEEDS-DISCUSSION`; independent of applicability |
+| `review.named_choice` | Recorded result-binding choice, or `null`; not an owner-policy selection |
+| `review.named_choices` | Accepted artifact's valid named `{id, label, consequence}` alternatives for any verdict; `[]` when absent, `null` when malformed or unavailable |
+| `review.open_p0` / `review.open_p1` | Open severity counts from the accepted artifact, not mutable round tuples |
+
+Selection discovers possibly relevant completions before acceptance validation, using existing
+completion/result records, input metadata, and charged run sidecars. It orders by charged epoch,
+then proven canonical result identity. An unproved epoch, unresolved identity tie, or newest
+relevant missing/corrupt/unreadable record obstructs selection; it does not fall back to older
+favorable evidence. Records attributed to another repository/PR do not obstruct this target.
+`missing` means no relevant completion; `incomplete` means a selected completion lacks a required
+accepted record; `invalid` means acceptance or attribution failed; `ambiguous` means ordering is
+unproved. Retained SHIP acceptance requires a full-PR/scoped result whose head, base, and raw
+digest match its historical input binding; fabricated connector/caller-patch SHIP is unaccepted.
+This does not require fresh metadata or proof. Unaccepted results expose no verdict or counts
+(`review: null`). These states return exit 0 as inspection results; incompatible flags or invalid
+CLI targets return usage exit 2.
+
+Historical acceptance is independent of current proof. Matching HEAD without complete proof
+leaves `applicable: null`; a known non-match yields `false`. To check current applicability,
+reuse the existing proof inputs: `--diff` for the exact reviewed bytes,
+`PRO_GATE_REVIEW_ENDPOINT_PATCH` for the retained/prepared endpoint patch, and
+`PRO_GATE_REVIEW_PR_EVIDENCE` for its PR metadata snapshot. Scoped evidence also requires
+`PRO_GATE_REVIEW_FILTER_MANIFEST` and `--confirm`. `--input bundle|both|connector` selects the
+proof mode (inspection defaults to `bundle`, independently of fresh-delivery policy).
+Head equality alone proves nothing current: metadata, endpoint/payload bytes, and scoped
+manifest/confirmation must match. SHIP also requires its base/head/raw-digest relationships;
+connector and caller-patch reviews cannot supply SHIP handoff applicability. The check is a
+file-only observation of supplied proof, not a fresh remote PR read.
+
+Only those proof inputs may accompany `--review-facts --repo --pr --json`. Review, recovery,
+status, output, timing, preparation, and decision/effect flags are usage errors, even when an
+incompatible flag has an empty value. Facts supply review truth, never merge authority or
+continuation policy. An accepted historical SHIP is not a current SHIP; even applicable SHIP
+leaves CI and merge policy to the consumer. Synthetic CLI tests prove these runtime contracts,
+not live model quality, marketplace release/installation, or a live SHIP verdict.
+
+## Optional GitHub status integration
+
+The runtime includes `record-pro-gate-verdict.mjs`. From the PR checkout, record an accepted
+review at its exact revision, then check the recorded status:
+
+```bash
+node "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/record-pro-gate-verdict.mjs" \
+  --pr 1983 --verdict SHIP --reviewed-sha <full-sha> --evidence <review-url>
+node "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/record-pro-gate-verdict.mjs" \
+  --verify-for-merge --pr 1983
+```
+
+This adapter requires Node.js, authenticated `gh`, and the public facts command's local tools.
+It runs from either the repository's `bin/` directory or the installed runtime, resolving the
+public command beside itself. It needs no private repository, owner scripts, or browser access.
+
+Record flags are assertions, not evidence. The adapter calls the public facts command and
+requires accepted facts, `applicable: true`, the same repository/PR, matching candidate and
+reviewed revisions, and the asserted verdict. Only a current, choice-free `SHIP` can record
+`success`; accepted current `FIX-FIRST` and `NEEDS-DISCUSSION` record `failure`. Historical,
+missing, corrupt, ambiguous, mismatched, or choice-bearing SHIP evidence cannot record success.
+The evidence URL is the status link, not a substitute for accepted review evidence.
+`--input bundle|both|connector` forwards the existing public proof mode (default `bundle`).
+Accepted current connector progress can record a non-SHIP failure, never successful SHIP.
+
+For fresh proof, recording invokes the existing `--prepare-review-evidence` command separately
+from inspection. Its private temporary files are cleaned on completion or failure. You may
+instead supply an existing explicit `PRO_GATE_REVIEW_ENDPOINT_PATCH` /
+`PRO_GATE_REVIEW_PR_EVIDENCE` pair; the adapter snapshots that pair privately so metadata and
+public inspection certify the same bytes. Either way, the proof's target and base must match
+the live PR head, base repository/ref, and branch-tip SHA. A cached PR base snapshot that differs from
+the live tip is refused, not stamped as current. Head, base tip, and default branch are checked
+again before posting exactly one status at the reviewed SHA.
+
+Full-PR recording defaults the reviewed payload to the prepared endpoint patch. Scoped recording
+must preserve its own reviewed payload and confirmation; it never substitutes full-PR bytes:
+
+```bash
+PRO_GATE_REVIEW_FILTER_MANIFEST=/path/to/manifest \
+  node "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/record-pro-gate-verdict.mjs" \
+    --pr 1983 --verdict SHIP --reviewed-sha <full-sha> --evidence <review-url> \
+    --diff /path/to/reviewed.patch --confirm /path/to/prior-review.md
+```
+
+Verification requires a successful SHIP status on the current head, bound to the same base
+repository/ref and the current default branch. It accepts an unchanged base, or an advanced
+base whose changes do not overlap the PR's files; both sides of renames count. Missing or
+ambiguous status reads, retargets, overlapping changes, and movement during rechecks refuse.
+Exit 0 means a status was recorded (including an honest failure status), or an advisory check
+passed. Exit 1 means recording/verification failed. Neither mode grants merge permission,
+changes rulesets, readies a PR, or merges it. `--owner-state` is explicitly unsupported;
+owner exceptions and merge policy remain downstream.
+
+Downstream code can import `checkGitBaseAdvance(tree, originalBase, currentBase, head)` for the
+same local-object comparison without reading statuses, fetching, or granting an exception.
+`originalBase` accepts the recorded 12-character abbreviation or a full 40-character SHA;
+`currentBase` and `head` require full SHAs. It returns a promise of
+`{ok, unchanged, overlap, commitCount}` and rejects missing/ambiguous git objects.
+`checkBaseAdvance({...})` exposes that comparison with the same SHA inputs and injectable
+`getInterveningFiles`, `getPrChangedFiles`, and `getInterveningCommitCount` callbacks.
+The callbacks must include both rename paths. This is a shared comparison utility, not an
+owner-policy interface.
+
+Synthetic tests exercise public acceptance and the local installed adapter with fake GitHub
+requests. They do not prove live status posting, model review quality, a marketplace release,
+or merge authorization. Version-matched release and private-consumer migration remain separate.
+
 ## Requirements
 
 - A **ChatGPT Pro** account, signed into a browser the tool can drive
