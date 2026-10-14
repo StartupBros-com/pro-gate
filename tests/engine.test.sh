@@ -1094,12 +1094,12 @@ HANDOFF_AT_SCAN
 # later regions read it too, so it lives here, where a region running alone still has it.
 LIB="$HERE/../lib/pro-gate-lib.sh"
 seed_review_tokens() { # fixture home, marker: retain the synthetic reviewed diff for replay
-  PRO_GATE_HOME="$1" bash -c '. "$1"; pg_review_tokens_write "$2" "$3"' fixture "$LIB" "$2" "$TDIR/small.diff"
+  PRO_GATE_HOME="$1" bash -c '. "$1"; pg_review_tokens_write "$2" "$3"' fixture "$LIB" "$2" "${3:-$TDIR/small.diff}"
 }
 FOREIGN164='pg-run-crossfeed-2619-1700000069-20' # another run's marker, for the #164 ownership cases
 seq 1 26000 | sed 's/^/+/' > "$TDIR/huge.diff"
 # Successful capture fixtures cite these files; include those references in the reviewed payload.
-printf 'diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -0,0 +1,2 @@\n+small\n+# fixture callers: a.sh src/x.sh src/real.sh src/stale-source.mjs src/canonical.sh src/prior.sh src/new.sh src/pub.sh src/meta.sh src/valid.sh src/noise.sh src/race.sh src/race2.sh src/final.sh src/verbose.sh policy/input.sh lib/x.sh classifyReview\n' > "$TDIR/small.diff"
+printf 'diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -0,0 +1,2 @@\n+small\n+# fixture callers: a.sh src/x.sh src/real.sh src/stale-source.mjs src/canonical.sh src/prior.sh src/new.sh src/pub.sh src/meta.sh src/valid.sh src/noise.sh src/race.sh src/race2.sh src/final.sh src/verbose.sh src/recover.sh src/ts.sh src/pending.sh policy/input.sh lib/x.sh classifyReview\n' > "$TDIR/small.diff"
 seed_review_tokens "$TDIR/home" "$MARKER"
 ORGANIZER_STATE="$TDIR/organizer-state.json"
 ORGANIZER_TITLE='pro-gate review: PR #77 r1 [engine-fixture]'
@@ -5954,6 +5954,7 @@ echo '# U3: recovery-only resolver and no-spend control flow'
 REC_HOME="$TDIR/home-recover"
 REC_MARKER='pg-run-acme-widgets-42-1700001000-11'
 REC_ART="$REC_HOME/completed/$REC_MARKER"
+seed_review_tokens "$REC_HOME" "$REC_MARKER"
 mkdir -p "$REC_HOME/completed" "$REC_HOME/run-meta"
 printf '[P1] src/recover.sh:1 - recovered finding\n  Why: durable fixture\nP2: none\nP3: none\nVERDICT: SHIP - recovered.\n' > "$REC_ART"
 printf 'github.com\tacme\twidgets\tacme-widgets-42\t42\t%s\t1700002000\n' "$TDIR/recover-original.md" > "$REC_HOME/run-meta/$REC_MARKER"
@@ -6332,6 +6333,7 @@ UNCH_REPO="$TDIR/uncharged-repo"; git init -q "$UNCH_REPO"
 git -C "$UNCH_REPO" remote add origin https://github.com/acme/uncharged.git
 mkdir -p "$UNCH_HOME/completed" "$UNCH_HOME/run-meta"
 UNCH_PRIOR='pg-run-acme-uncharged-201-1700009000-1'
+seed_review_tokens "$UNCH_HOME" "$UNCH_PRIOR"
 printf '[P1] src/prior.sh:1 - prior charged finding\n  Why: durable\nP2: none\nP3: none\nVERDICT: SHIP - prior.\n' > "$UNCH_HOME/completed/$UNCH_PRIOR"
 printf 'github.com\tacme\tuncharged\tacme-uncharged-201\t201\t/tmp/prior.md\t1700009100\n' > "$UNCH_HOME/run-meta/$UNCH_PRIOR"
 UNCH_BEFORE="$(find "$UNCH_HOME/run-meta" -type f | sort)"
@@ -6385,6 +6387,7 @@ check 'run-meta scan keeps a charged record whose repo name contains .tmp.' \
 echo '# fix: --recover accepts one trailing slash on a canonical PR URL'
 TRAILSLASH_HOME="$TDIR/home-trailslash"; mkdir -p "$TRAILSLASH_HOME/completed" "$TRAILSLASH_HOME/run-meta"
 TRAILSLASH_MARKER='pg-run-acme-widgets-401-1700010100-1'
+seed_review_tokens "$TRAILSLASH_HOME" "$TRAILSLASH_MARKER"
 printf '[P1] src/ts.sh:1 - trailing slash fixture\n  Why: durable\nP2: none\nP3: none\nVERDICT: SHIP - ts.\n' \
   > "$TRAILSLASH_HOME/completed/$TRAILSLASH_MARKER"
 printf 'github.com\tacme\twidgets\tacme-widgets-401\t401\t/tmp/ts.md\t1700010200\n' > "$TRAILSLASH_HOME/run-meta/$TRAILSLASH_MARKER"
@@ -6496,6 +6499,7 @@ check 'publication failure stdout carries no review claim' \
 echo '# gate #91 P1 (:169): --recover serves a pending-only durable artifact'
 REC_PEND_HOME="$TDIR/home-recover-pending"
 REC_PEND_MARKER='pg-run-acme-widgets-801-1700011500-1'
+seed_review_tokens "$REC_PEND_HOME" "$REC_PEND_MARKER"
 mkdir -p "$REC_PEND_HOME/pending" "$REC_PEND_HOME/run-meta"
 printf '[P1] src/pending.sh:1 - pending fixture\n  Why: durable pending only\nP2: none\nP3: none\nVERDICT: SHIP - pending.\n' \
   > "$REC_PEND_HOME/pending/$REC_PEND_MARKER"
@@ -6815,7 +6819,8 @@ check 'recover with locator AND captured body both invalid never surfaces the fo
 REC_ACTIVE_HOME="$TDIR/home-recover-active"
 mkdir -p "$REC_ACTIVE_HOME/completed" "$REC_ACTIVE_HOME/run-meta" "$REC_ACTIVE_HOME/active"
 REC_ACTIVE_OLD='pg-run-acme-widgets-110-1700009000-1'
-printf '[P1] old artifact\n  Why: stale\nP2: none\nP3: none\nVERDICT: SHIP - old.\n' > "$REC_ACTIVE_HOME/completed/$REC_ACTIVE_OLD"
+seed_review_tokens "$REC_ACTIVE_HOME" "$REC_ACTIVE_OLD"
+printf '[P1] old artifact\n  Why: classifyReview was checked\nP2: none\nP3: none\nVERDICT: SHIP - old.\n' > "$REC_ACTIVE_HOME/completed/$REC_ACTIVE_OLD"
 printf 'github.com\tacme\twidgets\tacme-widgets-110\t110\t/tmp/old-110.md\t1700009100\n' > "$REC_ACTIVE_HOME/run-meta/$REC_ACTIVE_OLD"
 REC_ACTIVE_NEW='pg-run-acme-widgets-110-1700009200-2'
 REC_ACTIVE_TOK="$(bash -c '. "'"$HERE"'/../lib/pro-gate-lib.sh"; pg_pid_token '"$$"'')"
@@ -6858,7 +6863,8 @@ check 'exact-marker recovery is unaffected by a live active record for the same 
 REC_GUARD_HOME="$TDIR/home-recover-outguard"
 mkdir -p "$REC_GUARD_HOME/completed" "$REC_GUARD_HOME/run-meta"
 REC_GUARD_MARKER='pg-run-acme-widgets-111-1700009400-1'
-printf '[P1] guarded artifact\n  Why: must not publish while guard held\nP2: none\nP3: none\nVERDICT: SHIP - guarded.\n' \
+seed_review_tokens "$REC_GUARD_HOME" "$REC_GUARD_MARKER"
+printf '[P1] guarded artifact\n  Why: classifyReview must not publish while guard held\nP2: none\nP3: none\nVERDICT: SHIP - guarded.\n' \
   > "$REC_GUARD_HOME/completed/$REC_GUARD_MARKER"
 printf 'github.com\tacme\twidgets\tacme-widgets-111\t111\t/tmp/og-111.md\t1700009500\n' \
   > "$REC_GUARD_HOME/run-meta/$REC_GUARD_MARKER"
@@ -7182,6 +7188,9 @@ u1_accepted_case() (
   unset PRO_GATE_COMPLETED_DIR PRO_GATE_REVIEW_INPUT_BINDING_DIR PRO_GATE_REVIEW_RESULT_BINDING_DIR
   mkdir -p "$PRO_GATE_HOME/completed"
   artifact="$PRO_GATE_HOME/completed/$marker"
+  # The synthetic bindings below refer to f:line; retain that fixture path vocabulary.
+  mkdir -p "$(pg_review_tokens_dir)"
+  printf 'f\n' > "$(pg_review_tokens_dir)/$marker"
   input="$INPUT_BINDING"
   case "$scenario" in
     predecessor) input="$(jq -cS --arg cd "$PG214_PRED_A" '.contract_digest=$cd' <<<"$input")" ;;
@@ -7189,7 +7198,7 @@ u1_accepted_case() (
     choices)
       verdict=NEEDS-DISCUSSION
       printf '[P1] f:1 — choose a compatibility policy\nCHOICE: keep | Preserve | Keep compatibility\nCHOICE: break | Replace | Use new API\nVERDICT: NEEDS-DISCUSSION\n' > "$artifact" ;;
-    ship) verdict=SHIP; printf 'P0: none\nP1: none\nP2: none\nEverything is consistent.\nVERDICT: SHIP\n' > "$artifact" ;;
+    ship) verdict=SHIP; printf 'P0: none\nP1: none\nP2: none\nChecked f:1 for consistency.\nVERDICT: SHIP\n' > "$artifact" ;;
   esac
   if [ ! -f "$artifact" ]; then
     printf '[P0] f:1 — RESOLVED — fixed\n[P0] f:2 — the RESOLVED state is forgeable\n[P1] f:3 — RESOLVED_MODEL is clobbered\nVERDICT: FIX-FIRST\n' > "$artifact"
@@ -7325,7 +7334,8 @@ PG214_E_DIGEST="$(pg_sha256 "$TDIR/pg214-e.patch")"
 PG214_E_HOME="$TDIR/home-pg214-upgrade-review"
 PG214_E_MARKER='pg-run-acme-upgrade-e2e-91-1700020000-1'
 mkdir -p "$PG214_E_HOME/completed"
-printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — upgrade regression fixture.' > "$PG214_E_HOME/completed/$PG214_E_MARKER"
+seed_review_tokens "$PG214_E_HOME" "$PG214_E_MARKER" "$TDIR/pg214-e.patch"
+printf '%s\n' 'P0: none' 'P1: none' 'Checked file.txt for regressions.' 'VERDICT: SHIP — upgrade regression fixture.' > "$PG214_E_HOME/completed/$PG214_E_MARKER"
 PG214_E_ARTIFACT_DIGEST="$(pg_sha256 "$PG214_E_HOME/completed/$PG214_E_MARKER")"
 PG214_E_INPUT_BINDING="$(jq -cnS --arg cd "$PG214_PRED_A" --arg marker "$PG214_E_MARKER" --arg base "$PG214_E_BASE" --arg head "$PG214_E_HEAD" --arg digest "$PG214_E_DIGEST" \
   '{charged_spend_epoch:1700020000,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("full-pr:"+$base+":"+$head),mode:"full-pr",proof:{base_oid:$base,endpoint_digest:$digest,head_oid:$head,raw_patch_digest:$digest}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:"github.com",owner:"acme",repo:"upgrade-e2e"},target:{head_oid:$head,kind:"pull-request",pr:91}}')"
@@ -7531,7 +7541,8 @@ done
 # collect effect repairs the exact marker binding under its own marker lock; replay is idempotent.
 cp "$TDIR/proof-raw.patch" "$TDIR/proof-endpoint.patch"
 mkdir -p "$DECISION_HOME/completed"
-printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — canonical review accepted with current proof' > "$DECISION_HOME/completed/$FULL_MARKER"
+seed_review_tokens "$DECISION_HOME" "$FULL_MARKER" "$TDIR/proof-raw.patch"
+printf '%s\n' 'P0: none' 'P1: none' 'Checked proof.txt for regressions.' 'VERDICT: SHIP — canonical review accepted with current proof' > "$DECISION_HOME/completed/$FULL_MARKER"
 # A newer equivalent binding with no artifact must not prevent repair of the older artifact selected
 # by its own canonical marker.
 FULL_REPAIR_NEW_MARKER='pg-run-acme-widgets-1983-1700013002-9'
@@ -7565,6 +7576,7 @@ check 'result-binding repair is idempotent and does not mutate canonical bytes' 
 # Re-resolution must compare the current parsed verdict before either exact or prior admission.
 mismatch_result() { # marker input stored-verdict artifact
   local marker="$1" input="$2" stored="$3" artifact="$4" input_digest artifact_digest proof
+  seed_review_tokens "$(dirname "$(dirname "$artifact")")" "$marker" "$TDIR/proof-raw.patch"
   input_digest="$(printf '%s' "$input" | sha256sum | awk '{print $1}')"
   artifact_digest="$(sha256sum "$artifact" | awk '{print $1}')"
   proof=null
@@ -7586,11 +7598,11 @@ for STORED_VERDICT in SHIP FIX-FIRST NEEDS-DISCUSSION; do
     mkdir -p "$MISMATCH_HOME/completed"
     PRO_GATE_HOME="$MISMATCH_HOME" pg_review_input_binding_write "$MISMATCH_MARKER" "$MISMATCH_INPUT"
     if [ "$STORED_VERDICT" = SHIP ] && [ "$PARSED_VERDICT" = FIX-FIRST ]; then
-      printf 'P0: none\nP1: none\n> VERDICT: SHIP — quoted legacy example. (run marker: %s)\nVERDICT: FIX-FIRST — current parser decision. (run marker: %s)\n' \
+      printf 'P0: none\nP1: none\nChecked proof.txt for regressions.\n> VERDICT: SHIP — quoted legacy example. (run marker: %s)\nVERDICT: FIX-FIRST — current parser decision. (run marker: %s)\n' \
         "$FOREIGN164" "$MISMATCH_MARKER" > "$MISMATCH_HOME/completed/$MISMATCH_MARKER"
       MIGRATION_HOME="$MISMATCH_HOME"; MIGRATION_MARKER="$MISMATCH_MARKER"
     else
-      printf 'P0: none\nP1: none\nVERDICT: %s — current parser decision. (run marker: %s)\n' \
+      printf 'P0: none\nP1: none\nChecked proof.txt for regressions.\nVERDICT: %s — current parser decision. (run marker: %s)\n' \
         "$PARSED_VERDICT" "$MISMATCH_MARKER" > "$MISMATCH_HOME/completed/$MISMATCH_MARKER"
     fi
     MISMATCH_RESULT="$(mismatch_result "$MISMATCH_MARKER" "$MISMATCH_INPUT" "$STORED_VERDICT" "$MISMATCH_HOME/completed/$MISMATCH_MARKER")"
@@ -7625,7 +7637,7 @@ PRIOR_MISMATCH_MARKER='pg-run-acme-widgets-1983-1700013200-20'
 PRIOR_MISMATCH_INPUT="$(jq -cS --arg marker "$PRIOR_MISMATCH_MARKER" '.marker=$marker | .charged_spend_epoch=1700013200 | .evidence.proof.endpoint_digest="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' <<<"$FULL_BINDING")"
 mkdir -p "$PRIOR_MISMATCH_HOME/completed"
 PRO_GATE_HOME="$PRIOR_MISMATCH_HOME" pg_review_input_binding_write "$PRIOR_MISMATCH_MARKER" "$PRIOR_MISMATCH_INPUT"
-printf 'P0: none\nP1: none\nVERDICT: FIX-FIRST — stale prior result. (run marker: %s)\n' "$PRIOR_MISMATCH_MARKER" > "$PRIOR_MISMATCH_HOME/completed/$PRIOR_MISMATCH_MARKER"
+printf 'P0: none\nP1: none\nChecked proof.txt for regressions.\nVERDICT: FIX-FIRST — stale prior result. (run marker: %s)\n' "$PRIOR_MISMATCH_MARKER" > "$PRIOR_MISMATCH_HOME/completed/$PRIOR_MISMATCH_MARKER"
 PRIOR_MISMATCH_RESULT="$(mismatch_result "$PRIOR_MISMATCH_MARKER" "$PRIOR_MISMATCH_INPUT" SHIP "$PRIOR_MISMATCH_HOME/completed/$PRIOR_MISMATCH_MARKER")"
 PRO_GATE_HOME="$PRIOR_MISMATCH_HOME" pg_review_result_binding_write "$PRIOR_MISMATCH_MARKER" "$PRIOR_MISMATCH_RESULT"
 env PRO_GATE_HOME="$PRIOR_MISMATCH_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/proof-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/proof-endpoint.patch" \
@@ -7705,8 +7717,9 @@ REFERENCE_HOME="$TDIR/home-reference-binding"
 REFERENCE_MARKER='pg-run-acme-widgets-1983-1700013010-10'
 REFERENCE_INPUT="$(jq -cS --arg marker "$REFERENCE_MARKER" '.marker=$marker | .charged_spend_epoch=1700013010' <<<"$FULL_BINDING")"
 mkdir -p "$REFERENCE_HOME/completed"
+seed_review_tokens "$REFERENCE_HOME" "$REFERENCE_MARKER" "$TDIR/proof-raw.patch"
 PRO_GATE_HOME="$REFERENCE_HOME" pg_review_input_binding_write "$REFERENCE_MARKER" "$REFERENCE_INPUT"
-printf '[P1] src/real.sh:4 — a current defect\nP2: none\n```text\nVERDICT: SHIP — fenced old decision. (run marker: %s)\n```\n> VERDICT: SHIP — quoted old decision. (run marker: %s)\nVERDICT: FIX-FIRST — repair required. (run marker: %s)\n' \
+printf '[P1] proof.txt:4 — a current defect\nP2: none\n```text\nVERDICT: SHIP — fenced old decision. (run marker: %s)\n```\n> VERDICT: SHIP — quoted old decision. (run marker: %s)\nVERDICT: FIX-FIRST — repair required. (run marker: %s)\n' \
   "$FOREIGN164" "$FOREIGN164" "$REFERENCE_MARKER" > "$REFERENCE_HOME/completed/$REFERENCE_MARKER"
 cp "$REFERENCE_HOME/completed/$REFERENCE_MARKER" "$REFERENCE_HOME/artifact.before"
 check 'adjacent quoted and fenced SHIP examples do not override owned FIX-FIRST extraction' \
@@ -7739,9 +7752,10 @@ PC_SCOPED="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg base "$PROOF_BASE" --a
 PC_SCOPED="$(jq -cS --arg digest "$PROOF_METADATA_DIGEST" '.evidence.proof.pr_metadata_digest=$digest' <<<"$PC_SCOPED")"
 precedence_result() { # marker input verdict accepted artifact
   local marker="$1" input="$2" verdict="$3" accepted="$4" artifact="$5" digest input_digest proof
+  seed_review_tokens "$(dirname "$(dirname "$artifact")")" "$marker" "$TDIR/proof-raw.patch"
   input_digest="$(printf '%s' "$input" | sha256sum | awk '{print $1}')"
   proof=null
-  printf '%s\n' 'P0: none' "VERDICT: $verdict — fixture." > "$artifact"
+  printf '%s\n' 'P0: none' 'Checked proof.txt for regressions.' "VERDICT: $verdict — fixture." > "$artifact"
   digest="$(sha256sum "$artifact" | awk '{print $1}')"
   jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg marker "$marker" --arg digest "$digest" --arg ib "$input_digest" --arg verdict "$verdict" --argjson accepted "$accepted" --argjson proof "$proof" \
     '{accepted_epoch:$accepted,artifact:{digest:$digest,path:("completed/"+$marker)},contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,input_binding_digest:$ib,input_binding_identity:$marker,marker:$marker,named_choice:null,provenance:{outcome:"accepted",validated_epoch:$accepted},record_type:"review-result-binding/v1",record_version:1,ship_proof:$proof,verdict:$verdict}'
@@ -9456,8 +9470,9 @@ check 'run-meta scan excludes a marker/key/PR mismatch' \
 fresh_reset_state
 FRESH_ADVISORY="$(fresh_query)"; printf '%s\n' "$FRESH_ADVISORY" > "$TDIR/fresh-advisory.json"
 mkdir -p "$FRESH_HOME/pending"
+seed_review_tokens "$FRESH_HOME" "$FRESH_TEMPLATE" "$TDIR/fresh-effect.patch"
 PRO_GATE_HOME="$FRESH_HOME" pg_review_input_binding_write "$FRESH_TEMPLATE" "$FRESH_BINDING"
-printf 'P0: none\nP1: none\nVERDICT: SHIP - pending only.\n' > "$FRESH_HOME/pending/$FRESH_TEMPLATE"
+printf 'P0: none\nP1: none\nChecked fresh.txt for regressions.\nVERDICT: SHIP - pending only.\n' > "$FRESH_HOME/pending/$FRESH_TEMPLATE"
 : > "$TDIR/fresh-oracle.calls"
 fresh_effect "$TDIR/fresh-advisory.json" "$TDIR/fresh-pending.md"
 check 'exact current pending review suppresses spend and routes only to collection/recovery' \
@@ -9687,8 +9702,9 @@ done
 echo '# U2 reopened: real CLI named-product selection'
 CHOICE_HOME="$TDIR/home-cli-choice"; CHOICE_MARKER='pg-run-acme-widgets-1983-1700017000-1'
 CHOICE_BINDING="$(jq -cS --arg marker "$CHOICE_MARKER" '.marker=$marker | .charged_spend_epoch=1700017000' <<<"$PC_SCOPED")"
+seed_review_tokens "$CHOICE_HOME" "$CHOICE_MARKER" "$TDIR/proof-raw.patch"
 mkdir -p "$CHOICE_HOME/completed"
-printf '%s\n' 'P0: none' 'P1: none' 'CHOICE: keep | Keep compatibility | Existing users need no migration.' 'CHOICE: replace | Replace API | Users migrate to the new contract.' 'VERDICT: NEEDS-DISCUSSION — choose intentionally.' > "$CHOICE_HOME/completed/$CHOICE_MARKER"
+printf '%s\n' 'P0: none' 'P1: none' 'Checked proof.txt for regressions.' 'CHOICE: keep | Keep compatibility | Existing users need no migration.' 'CHOICE: replace | Replace API | Users migrate to the new contract.' 'VERDICT: NEEDS-DISCUSSION — choose intentionally.' > "$CHOICE_HOME/completed/$CHOICE_MARKER"
 CHOICE_INPUT_DIGEST="$(printf '%s' "$CHOICE_BINDING" | sha256sum | awk '{print $1}')"
 CHOICE_ART_DIGEST="$(sha256sum "$CHOICE_HOME/completed/$CHOICE_MARKER" | awk '{print $1}')"
 CHOICE_RESULT="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg marker "$CHOICE_MARKER" --arg ib "$CHOICE_INPUT_DIGEST" --arg digest "$CHOICE_ART_DIGEST" '{accepted_epoch:1700017001,artifact:{digest:$digest,path:("completed/"+$marker)},contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,input_binding_digest:$ib,input_binding_identity:$marker,marker:$marker,named_choice:null,provenance:{outcome:"accepted",validated_epoch:1700017001},record_type:"review-result-binding/v1",record_version:1,ship_proof:null,verdict:"NEEDS-DISCUSSION"}')"
@@ -9789,8 +9805,9 @@ cp "$TDIR/proof-raw.patch" "$TDIR/scoped-raw-endpoint.patch"; printf 'unreviewed
 echo '# U2 reopened: scoped SHIP merge handoff'
 SCOPED_SHIP_HOME="$TDIR/home-scoped-ship"; SCOPED_SHIP_MARKER='pg-run-acme-widgets-1983-1700018000-1'
 SCOPED_SHIP_INPUT="$(jq -cS --arg marker "$SCOPED_SHIP_MARKER" '.marker=$marker | .charged_spend_epoch=1700018000' <<<"$PC_SCOPED")"
+seed_review_tokens "$SCOPED_SHIP_HOME" "$SCOPED_SHIP_MARKER" "$TDIR/proof-raw.patch"
 mkdir -p "$SCOPED_SHIP_HOME/completed"
-printf '%s\n' 'P0: none' 'P1: none' 'P2: none' 'P3: none' 'VERDICT: SHIP — scoped endpoint reviewed.' > "$SCOPED_SHIP_HOME/completed/$SCOPED_SHIP_MARKER"
+printf '%s\n' 'P0: none' 'P1: none' 'P2: none' 'P3: none' 'Checked proof.txt for regressions.' 'VERDICT: SHIP — scoped endpoint reviewed.' > "$SCOPED_SHIP_HOME/completed/$SCOPED_SHIP_MARKER"
 PRO_GATE_HOME="$SCOPED_SHIP_HOME" pg_review_input_binding_write "$SCOPED_SHIP_MARKER" "$SCOPED_SHIP_INPUT"
 env PRO_GATE_HOME="$SCOPED_SHIP_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/scoped-raw-endpoint.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/scoped-raw-endpoint.patch" PRO_GATE_REVIEW_FILTER_MANIFEST="$TDIR/scoped-manifest" \
   bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/proof-raw.patch" --confirm "$TDIR/scoped-confirmation.md" --input bundle \
@@ -9864,7 +9881,8 @@ check 'scoped SHIP with moved head cannot reach merge handoff' \
   "rc=$SCOPED_HEAD_RC output=$(cat "$TDIR/scoped-ship-head.json")"
 CONNECTOR_SHIP_HOME="$TDIR/home-connector-ship"; CONNECTOR_SHIP_MARKER='pg-run-acme-widgets-1983-1700018001-2'
 CONNECTOR_SHIP_INPUT="$(jq -cS --arg marker "$CONNECTOR_SHIP_MARKER" '.marker=$marker | .charged_spend_epoch=1700018001' <<<"$PC_CONNECTOR")"
-mkdir -p "$CONNECTOR_SHIP_HOME/completed"; printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — connector observation.' > "$CONNECTOR_SHIP_HOME/completed/$CONNECTOR_SHIP_MARKER"
+seed_review_tokens "$CONNECTOR_SHIP_HOME" "$CONNECTOR_SHIP_MARKER" "$TDIR/proof-raw.patch"
+mkdir -p "$CONNECTOR_SHIP_HOME/completed"; printf '%s\n' 'P0: none' 'P1: none' 'Checked proof.txt for regressions.' 'VERDICT: SHIP — connector observation.' > "$CONNECTOR_SHIP_HOME/completed/$CONNECTOR_SHIP_MARKER"
 CONNECTOR_INPUT_DIGEST="$(printf '%s' "$CONNECTOR_SHIP_INPUT" | sha256sum | awk '{print $1}')"; CONNECTOR_ART_DIGEST="$(sha256sum "$CONNECTOR_SHIP_HOME/completed/$CONNECTOR_SHIP_MARKER" | awk '{print $1}')"
 CONNECTOR_SHIP_RESULT="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg marker "$CONNECTOR_SHIP_MARKER" --arg ib "$CONNECTOR_INPUT_DIGEST" --arg digest "$CONNECTOR_ART_DIGEST" --arg base "$PROOF_BASE" --arg head "$PROOF_HEAD" --arg raw "$SCOPED_RAW_DIGEST" '{accepted_epoch:1700018002,artifact:{digest:$digest,path:("completed/"+$marker)},contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,input_binding_digest:$ib,input_binding_identity:$marker,marker:$marker,named_choice:null,provenance:{outcome:"accepted",validated_epoch:1700018002},record_type:"review-result-binding/v1",record_version:1,ship_proof:{base_oid:$base,diff_digest:$raw,head_oid:$head},verdict:"SHIP"}')"
 PRO_GATE_HOME="$CONNECTOR_SHIP_HOME" pg_review_input_binding_write "$CONNECTOR_SHIP_MARKER" "$CONNECTOR_SHIP_INPUT"; PRO_GATE_HOME="$CONNECTOR_SHIP_HOME" pg_review_result_binding_write "$CONNECTOR_SHIP_MARKER" "$CONNECTOR_SHIP_RESULT"
@@ -9881,7 +9899,8 @@ check 'connector SHIP never becomes merge eligibility' \
 CALLERPATCH_SHIP_HOME="$TDIR/home-callerpatch-ship"; CALLERPATCH_SHIP_MARKER='pg-run-acme-widgets-1983-1700018003-4'
 CALLERPATCH_SHIP_INPUT="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg marker "$CALLERPATCH_SHIP_MARKER" --arg head "$PROOF_HEAD" \
   '{charged_spend_epoch:1700018003,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("caller-patch:github.com/acme/widgets:"+$head),mode:"caller-patch",proof:{commit_target:$head,endpoint_digest:null,raw_diff_digest:null,repository_target:"github.com/acme/widgets"}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:"github.com",owner:"acme",repo:"widgets"},target:{head_oid:$head,kind:"pull-request",pr:1983}}')"
-mkdir -p "$CALLERPATCH_SHIP_HOME/completed"; printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — caller-patch observation.' > "$CALLERPATCH_SHIP_HOME/completed/$CALLERPATCH_SHIP_MARKER"
+seed_review_tokens "$CALLERPATCH_SHIP_HOME" "$CALLERPATCH_SHIP_MARKER" "$TDIR/proof-raw.patch"
+mkdir -p "$CALLERPATCH_SHIP_HOME/completed"; printf '%s\n' 'P0: none' 'P1: none' 'Checked proof.txt for regressions.' 'VERDICT: SHIP — caller-patch observation.' > "$CALLERPATCH_SHIP_HOME/completed/$CALLERPATCH_SHIP_MARKER"
 CALLERPATCH_INPUT_DIGEST="$(printf '%s' "$CALLERPATCH_SHIP_INPUT" | sha256sum | awk '{print $1}')"; CALLERPATCH_ART_DIGEST="$(sha256sum "$CALLERPATCH_SHIP_HOME/completed/$CALLERPATCH_SHIP_MARKER" | awk '{print $1}')"
 CALLERPATCH_SHIP_RESULT="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg marker "$CALLERPATCH_SHIP_MARKER" --arg ib "$CALLERPATCH_INPUT_DIGEST" --arg digest "$CALLERPATCH_ART_DIGEST" --arg base "$PROOF_BASE" --arg head "$PROOF_HEAD" --arg raw "$SCOPED_RAW_DIGEST" '{accepted_epoch:1700018004,artifact:{digest:$digest,path:("completed/"+$marker)},contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,input_binding_digest:$ib,input_binding_identity:$marker,marker:$marker,named_choice:null,provenance:{outcome:"accepted",validated_epoch:1700018004},record_type:"review-result-binding/v1",record_version:1,ship_proof:{base_oid:$base,diff_digest:$raw,head_oid:$head},verdict:"SHIP"}')"
 PRO_GATE_HOME="$CALLERPATCH_SHIP_HOME" pg_review_input_binding_write "$CALLERPATCH_SHIP_MARKER" "$CALLERPATCH_SHIP_INPUT"; PRO_GATE_HOME="$CALLERPATCH_SHIP_HOME" pg_review_result_binding_write "$CALLERPATCH_SHIP_MARKER" "$CALLERPATCH_SHIP_RESULT"
@@ -9896,9 +9915,10 @@ check '#161 caller-patch SHIP never becomes merge eligibility' \
 CONNECTOR_PENDING_HOME="$TDIR/home-connector-pending"; CONNECTOR_PENDING_MARKER='pg-run-acme-widgets-1983-1700018002-3'
 CONNECTOR_PENDING_HEAD="$(git -C "$DECISION_REPO" rev-parse HEAD)"
 CONNECTOR_PENDING_INPUT="$(jq -cS --arg marker "$CONNECTOR_PENDING_MARKER" --arg head "$CONNECTOR_PENDING_HEAD" '.marker=$marker | .charged_spend_epoch=1700018002 | .target.head_oid=$head | .evidence.identity=("connector:github.com/acme/widgets:" + $head) | .evidence.proof.commit_target=$head' <<<"$PC_CONNECTOR")"
+seed_review_tokens "$CONNECTOR_PENDING_HOME" "$CONNECTOR_PENDING_MARKER" "$TDIR/proof-raw.patch"
 mkdir -p "$CONNECTOR_PENDING_HOME/pending"
 PRO_GATE_HOME="$CONNECTOR_PENDING_HOME" pg_review_input_binding_write "$CONNECTOR_PENDING_MARKER" "$CONNECTOR_PENDING_INPUT"
-printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — pending connector observation.' > "$CONNECTOR_PENDING_HOME/pending/$CONNECTOR_PENDING_MARKER"
+printf '%s\n' 'P0: none' 'P1: none' 'Checked proof.txt for regressions.' 'VERDICT: SHIP — pending connector observation.' > "$CONNECTOR_PENDING_HOME/pending/$CONNECTOR_PENDING_MARKER"
 env PRO_GATE_HOME="$CONNECTOR_PENDING_HOME" PRO_GATE_RUN_LOGS=0 bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --input connector >"$TDIR/connector-pending.json" 2>"$TDIR/connector-pending.err"
 CONNECTOR_PENDING_RC=$?
 check 'exact pending connector SHIP is collect-only and never merge eligible' \
@@ -9918,8 +9938,9 @@ nb_connector_binding() { # marker epoch
 }
 # (a) connector SHIP in completed/ with no result binding: typed stop, never collect, never merge.
 NB_SHIP_HOME="$TDIR/home-not-bindable-ship"; NB_SHIP_MARKER='pg-run-acme-widgets-1983-1700019000-1'
+seed_review_tokens "$NB_SHIP_HOME" "$NB_SHIP_MARKER" "$TDIR/proof-raw.patch"
 mkdir -p "$NB_SHIP_HOME/completed"
-printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — connector observation.' > "$NB_SHIP_HOME/completed/$NB_SHIP_MARKER"
+printf '%s\n' 'P0: none' 'P1: none' 'Checked proof.txt for regressions.' 'VERDICT: SHIP — connector observation.' > "$NB_SHIP_HOME/completed/$NB_SHIP_MARKER"
 NB_SHIP_BINDING="$(nb_connector_binding "$NB_SHIP_MARKER" 1700019000)"
 PRO_GATE_HOME="$NB_SHIP_HOME" pg_review_input_binding_write "$NB_SHIP_MARKER" "$NB_SHIP_BINDING"
 env PRO_GATE_HOME="$NB_SHIP_HOME" PRO_GATE_RUN_LOGS=0 bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --input connector >"$TDIR/nb-ship.json" 2>"$TDIR/nb-ship.err"
@@ -9940,6 +9961,7 @@ check 'connector SHIP stop never repairs a result binding or becomes merge eligi
   "rc=$NB_SHIP_EFFECT_RC output=$(cat "$TDIR/nb-ship-effect.json") stderr=$(cat "$TDIR/nb-ship-effect.err")"
 # (b) connector FIX-FIRST in completed/ is bindable: collect, repair with a null proof, then fix.
 NB_FIX_HOME="$TDIR/home-not-bindable-fix"; NB_FIX_MARKER='pg-run-acme-widgets-1983-1700019001-2'
+seed_review_tokens "$NB_FIX_HOME" "$NB_FIX_MARKER" "$TDIR/small.diff"
 mkdir -p "$NB_FIX_HOME/completed"
 printf '%s\n' '[P1] a.sh:1 — fixture finding' 'P2: none' 'VERDICT: FIX-FIRST — connector observation.' > "$NB_FIX_HOME/completed/$NB_FIX_MARKER"
 NB_FIX_BINDING="$(nb_connector_binding "$NB_FIX_MARKER" 1700019001)"
@@ -9962,8 +9984,9 @@ NB_FULL_DIGEST="$(sha256sum "$TDIR/nb-full.patch" | awk '{print $1}')"
 NB_FULL_BINDING="$(jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg marker "$NB_FULL_MARKER" --arg base "$NB_BASE" --arg head "$NB_HEAD" --arg digest "$NB_FULL_DIGEST" '{charged_spend_epoch:1700019002,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("full-pr:"+$base+":"+$head),mode:"full-pr",proof:{base_oid:$base,endpoint_digest:$digest,head_oid:$head,raw_patch_digest:$digest}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:"github.com",owner:"acme",repo:"widgets"},target:{head_oid:$head,kind:"pull-request",pr:1983}}')"
 NB_METADATA_DIGEST="$(fixture_pr_evidence "$TDIR/nb-full.patch" widgets 1983 "$NB_BASE" "$NB_HEAD")"
 NB_FULL_BINDING="$(jq -cS --arg digest "$NB_METADATA_DIGEST" '.evidence.proof.pr_metadata_digest=$digest' <<<"$NB_FULL_BINDING")"
+seed_review_tokens "$NB_FULL_HOME" "$NB_FULL_MARKER" "$TDIR/nb-full.patch"
 mkdir -p "$NB_FULL_HOME/completed"
-printf '%s\n' 'P0: none' 'P1: none' 'VERDICT: SHIP — full endpoint reviewed.' > "$NB_FULL_HOME/completed/$NB_FULL_MARKER"
+printf '%s\n' 'P0: none' 'P1: none' 'Checked proof.txt for regressions.' 'VERDICT: SHIP — full endpoint reviewed.' > "$NB_FULL_HOME/completed/$NB_FULL_MARKER"
 PRO_GATE_HOME="$NB_FULL_HOME" pg_review_input_binding_write "$NB_FULL_MARKER" "$NB_FULL_BINDING"
 env PRO_GATE_HOME="$NB_FULL_HOME" PRO_GATE_RUN_LOGS=0 PRO_GATE_GH_BIN="$TDIR/evidence-gh" PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/nb-full.patch.pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/nb-full.patch" bash "$ENGINE" --review-decision --json --repo "$DECISION_REPO" --pr 1983 --diff "$TDIR/nb-full.patch" --input bundle >"$TDIR/nb-full-collect.json" 2>"$TDIR/nb-full-collect.err"
 NB_FULL_COLLECT_RC=$?

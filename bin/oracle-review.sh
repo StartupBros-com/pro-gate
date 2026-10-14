@@ -393,6 +393,7 @@ pg_review_decision_repair_result_binding() { # marker input-binding-json
   artifact="$(pg_completed_dir)/$marker"
   [ -f "$artifact" ] && [ ! -L "$artifact" ] && pg_is_review "$artifact" || return 1
   [ -z "$(pg_capture_foreign_echo "$artifact" "$marker")" ] || return 1
+  pg_review_shape_for_marker "$marker" "$artifact" || return 6
   input_digest="$(pg_review_sha256_text "$input")" || return 1
   verdict="$(pg_extract_verdict "$artifact")"
   case "$verdict" in SHIP|FIX-FIRST|NEEDS-DISCUSSION) ;; *) return 1;; esac
@@ -613,6 +614,11 @@ pg_review_decision_cli() {
       continue
     fi
 
+    if [ -n "$artifact" ] && ! pg_review_shape_for_marker "$marker" "$artifact"; then
+      jq -cn --arg marker "$marker" '{outcome:"template-verdict",marker:$marker}'
+      return 6
+    fi
+
     # A result is credible only when its own marker-bound input digest and canonical completed
     # artifact bytes validate. Missing bindings expose exact bytes as collect/recover-only facts.
     result="$(pg_review_result_binding_read "$marker" 2>/dev/null || true)"
@@ -628,7 +634,11 @@ pg_review_decision_cli() {
     artifact="$(pg_completed_dir)/$marker"
     accepted_rc=0
     accepted="$(pg_review_accepted_artifact_read "$marker" "$candidate")" || accepted_rc=$?
-    case "$accepted_rc" in 0|2) ;; *) continue ;; esac
+    case "$accepted_rc" in
+      0|2) ;;
+      6) jq -cn --arg marker "$marker" '{outcome:"template-verdict",marker:$marker}'; return 6 ;;
+      *) continue ;;
+    esac
     artifact_digest="$(jq -r .artifact_digest <<<"$accepted")"
     if [ "$accepted_rc" -eq 2 ]; then
       if [ "$exact" = true ]; then
@@ -979,6 +989,7 @@ if [ "$RECOVER_REQUESTED" = 1 ]; then
     REC_SRC="$REC_PENDING_ART"
   fi
   if [ -n "$REC_SRC" ]; then
+    pg_review_shape_for_marker "$REC_SELECTED" "$REC_SRC" || exit 6
     if [ -n "$OUT" ]; then
       # pg_completed_lookup only knows the completed store's own path, so the pending source needs
       # the identical copy-then-rename discipline inline: never pre-delete an existing --out (a
@@ -2542,7 +2553,7 @@ pg_check_review_shape() { # private capture, before any publication or completio
   fi
   PG_REVIEW_TOKENS_FILE="$tokens"
   TEMPLATE_VERDICT=0
-  if pg_review_shape "$body" "$tokens"; then return 0; fi
+  if pg_review_shape_for_marker "$RUN_MARKER" "$body" "$tokens"; then return 0; fi
   TEMPLATE_VERDICT=1
   pg_salvage_class_write "${RUN_MARKER:-}" template-verdict 2>/dev/null || true
   echo "[oracle-review] template-verdict: review names no path or identifier from the reviewed diff (${PG_BODY_BYTES} bytes)." >&2
@@ -2679,7 +2690,7 @@ pg_finish() {  # $1 exit code — settle organization, ramp, and ledger exactly 
   esac
   [ "${THROTTLED:-0}" = 1 ] && outcome=throttle
   [ "${CLOUDFLARE:-0}" = 1 ] && outcome=cloudflare
-  [ "${TEMPLATE_VERDICT:-0}" = 1 ] && outcome=template-verdict
+  [ "$rc" = 6 ] && [ "${TEMPLATE_VERDICT:-0}" = 1 ] && outcome=template-verdict
   # Harvests spend no Pro slot and never teach the ramp. Fresh clean/throttle/failure outcomes do;
   # Cloudflare records its distinct ledger outcome while feeding the same account-level backoff.
   if [ "${HARVEST:-0}" != 1 ]; then
@@ -3522,7 +3533,7 @@ EOF
   fi
   cat <<'EOF'
 
-OUTPUT FORMAT — output ONLY findings, nothing else, each exactly:
+OUTPUT FORMAT — output findings and the required rationale below, each finding exactly:
 
 [Pn] <file>:<line> — <one-line issue>
   Why it's a real problem: <concise reasoning>
@@ -3531,6 +3542,7 @@ OUTPUT FORMAT — output ONLY findings, nothing else, each exactly:
 
 where Pn is one of: P0 (critical / blocker / data-loss / security), P1 (major bug), P2 (minor), P3 (nit).
 Group by severity, P0 first. If a severity has no findings, write "Pn: none".
+If there are no findings, include a short rationale paragraph before the final VERDICT line, separate from every severity label and the VERDICT line. Cite at least one changed path, file:line, or identifier from the diff and name what you checked. For a VERSION-only or docs-only diff, cite the changed path (for example, VERSION or docs/guide.md).
 If a finding's real fix is a policy the repo owner must decide (pick one of several valid approaches, not a code defect with one correct fix), raise it as NEEDS-DISCUSSION with CHOICE lines, never as FIX-FIRST — a policy choice is not something a coding agent can resolve on its own.
 If and only if your verdict is NEEDS-DISCUSSION, emit 2-8 choice lines immediately before the final VERDICT line, each exactly: CHOICE: <safe-id> | <label> | <consequence>. Use a unique safe-id containing only letters, digits, dot, underscore, colon, slash, plus, or hyphen; label is 1-120 printable characters and consequence is 1-240 printable characters. Do not emit CHOICE lines for SHIP or FIX-FIRST. Do not add fields or extra pipes.
 End with one final line:  VERDICT: SHIP | FIX-FIRST | NEEDS-DISCUSSION  — <=15 word reason.

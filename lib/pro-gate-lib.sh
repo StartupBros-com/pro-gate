@@ -3411,8 +3411,17 @@ pg_review_tokens() { # file [rationale]: canonical tokens; rationale emits shape
       line=$0
       if (rationale) {
         sub(/^[[:space:]]*[-*#>_]*[[:space:]]*/, "", line)
-        if (line ~ /^([Pp][0-3][*_ ]*:|[Vv][Ee][Rr][Dd][Ii][Cc][Tt][*_ ]*:)/) next
+        if (line ~ /^[Pp][0-3][*_ ]*:/) next
+        # Keep the reason after the verdict word, but never the label, verdict or run nonce.
+        sub(/^[Vv][Ee][Rr][Dd][Ii][Cc][Tt][*_ ]*:[[:space:]]*[A-Za-z-]+/, "", line)
+        sub(/\([Rr]un marker:.*$/, "", line)
         if (line ~ /^[Rr]un marker:/) next
+      } else {
+        # Unified-diff metadata contributes paths only. Hunk prefixes are not identifiers.
+        if (line ~ /^diff --git /) sub(/^diff --git /, "", line)
+        else if (line ~ /^(---|\+\+\+) /) sub(/^(---|\+\+\+) /, "", line)
+        else if (line ~ /^(@@|index |new file mode |deleted file mode |old mode |new mode )/) next
+        else sub(/^[+ -]/, "", line)
       }
       gsub(/[^A-Za-z0-9_./:-]+/, " ", line)
       n=split(line, words, /[[:space:]]+/)
@@ -3420,7 +3429,7 @@ pg_review_tokens() { # file [rationale]: canonical tokens; rationale emits shape
         t=words[i]
         sub(/^[.\/]+/, "", t); sub(/[.:\/]+$/, "", t)
         if (t !~ /[A-Za-z]/) continue
-        shaped=(t ~ /[\/_]/ || t ~ /\.[A-Za-z][A-Za-z0-9]*(:[0-9]+)?$/ || t ~ /:[0-9]+$/ ||
+        shaped=(t == "VERSION" || t ~ /[\/_]/ || t ~ /\.[A-Za-z][A-Za-z0-9]*(:[0-9]+)?$/ || t ~ /:[0-9]+$/ ||
           (t ~ /[a-z]/ && substr(t,2) ~ /[A-Z]/))
         if (rationale && !shaped) continue
         sub(/:[0-9]+$/, "", t)
@@ -3457,6 +3466,23 @@ pg_review_shape() { # body tokens-file -> PG_BODY_BYTES, PG_NAMES_NOTHING; rc 0 
     return 0
   fi
   return 1
+}
+
+# Read-only acceptance for saved evidence. No vocabulary means no proof of a grounded review;
+# a legacy path manifest is sufficient without creating or repairing any persistent records.
+pg_review_shape_for_marker() { # marker body [private tokens-file] -> rc 0 or typed exit 6
+  local marker="$1" body="$2" tokens="${3:-$(pg_review_tokens_dir)/$1}" manifest
+  pg_reservation_marker_ok "$marker" || return 6
+  manifest="$(pg_manifest_dir)/$marker"
+  if [ -f "$tokens" ] && [ ! -L "$tokens" ] && [ -r "$tokens" ]; then
+    pg_review_shape "$body" "$tokens" && return 0
+  elif [ -f "$manifest" ] && [ ! -L "$manifest" ] && [ -r "$manifest" ]; then
+    pg_review_shape "$body" <(pg_review_tokens "$manifest") && return 0
+  else
+    pg_review_shape "$body" /dev/null || true
+  fi
+  echo 'template-verdict: review names no path or identifier from the retained reviewed diff' >&2
+  return 6
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4613,7 +4639,8 @@ pg_review_result_binding_digest() { local r; r="$(pg_review_result_binding_read 
 
 # Read one accepted completion without collection, repair, scoring or persistent writes.
 # All interpretation uses a private byte snapshot, not several reads of a changing artifact.
-# rc 0: accepted facts; rc 1: unavailable (no output); rc 2: verdict disagreement (diagnostic
+# rc 0: accepted facts; rc 1: unavailable (no output); rc 6: template-verdict;
+# rc 2: verdict disagreement (diagnostic
 # facts only, never counts). The caller retains the decision reducer's distinct repair projection.
 pg_review_accepted_artifact_read() ( # marker [expected canonical input binding]
   local marker="$1" expected="${2:-}" input result artifact snapshot digest canonical verdict stored choices='[]' counts p0 p1 text retained
@@ -4635,6 +4662,7 @@ pg_review_accepted_artifact_read() ( # marker [expected canonical input binding]
   [ "$(jq -jr . <<<"$text" | pg_sha256 /dev/stdin)" = "$digest" ] || return 1
   pg_is_review "$snapshot" || return 1
   [ -z "$(pg_capture_foreign_echo "$snapshot" "$marker")" ] || return 1
+  pg_review_shape_for_marker "$marker" "$snapshot" || return 6
   stored="$(jq -r .verdict <<<"$result")"
   verdict="$(pg_extract_verdict "$snapshot")"
   canonical="$(pg_review_sha256_text "$result")"
@@ -4906,6 +4934,10 @@ pg_review_facts_cli() { # checkout number-or-canonical-PR-URL [candidate-head]; 
   rc=0; accepted="$(pg_review_accepted_artifact_read "$marker")" || rc=$?
   if [ "$rc" -ne 0 ]; then
     reason=unaccepted-review; [ "$rc" -ne 2 ] || reason=verdict-disagreement
+    if [ "$rc" -eq 6 ]; then
+      pg_review_facts_emit invalid template-verdict "$repository" "$pr" "$head" "$marker" null null
+      return 6
+    fi
     pg_review_facts_emit invalid "$reason" "$repository" "$pr" "$head" "$marker" null null; return
   fi
   input="$(jq -cS .input_binding <<<"$accepted")"

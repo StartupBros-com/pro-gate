@@ -19,7 +19,7 @@ done
 pg_status() { PG_FAIL_DETAIL="${2:-}"; }
 pg_organizer_join() { :; }
 pg_organize_chat() { :; }
-pg_ramp_update() { :; }
+pg_ramp_update() { printf '%s\n' "$*" >> "$TDIR/ramp-calls"; }
 pg_active_clear() { :; }
 pg_model_label() { echo fixture; }
 WORK="$TDIR/work" OUT="$TDIR/out.md" RUN_START="$(date +%s)" LAUNCH_EPOCH=""
@@ -41,6 +41,8 @@ pg_review_shape "$TDIR/inline.md" "$TOKENS"; rc=$?
 check 'one-line skeleton is rejected' "$([ "$rc" = 1 ] && [ "$PG_NAMES_NOTHING" = true ]; echo $?)"
 
 review() { printf 'P0: none\nP1: none\nP2: none\nP3: none\n\n%s\n\nVERDICT: SHIP\n' "$1" > "$OUT"; }
+pg_review_shape "$ROOT/tests/fixtures/template-verdict/compliant-clean.txt" "$TOKENS"
+check 'P1-a: compliant clean review with a separate rationale is accepted' "$?"
 for rationale in 'Checked src/review-engine.ts:22 for failure handling.' 'Checked classifyReview for failure handling.' 'Checked policy_name for failure handling.' 'Checked review-engine.ts for failure handling.'; do
   review "$rationale"
   pg_review_shape "$OUT" "$TOKENS"; rc=$?
@@ -51,9 +53,34 @@ for rationale in 'tests clean function migration' 'Checked inventedIdentifier fo
   pg_review_shape "$OUT" "$TOKENS"; rc=$?
   check "no invented/plain/substr token credit: $rationale" "$([ "$rc" = 1 ] && [ "$PG_NAMES_NOTHING" = true ]; echo $?)"
 done
-printf 'P0: none classifyReview\nP1: none\nP2: none\nP3: none\nVERDICT: SHIP src/review-engine.ts\n' > "$OUT"
+printf 'P0: none classifyReview\nP1: none\nP2: none\nP3: none\nVERDICT: SHIP — ordinary explanation.\n' > "$OUT"
 pg_review_shape "$OUT" "$TOKENS"; rc=$?
-check 'names on severity-label or verdict lines do not establish rationale' "$([ "$rc" = 1 ] && [ "$PG_NAMES_NOTHING" = true ]; echo $?)"
+check 'severity-label names and plain-English verdict reasons do not establish rationale' "$([ "$rc" = 1 ] && [ "$PG_NAMES_NOTHING" = true ]; echo $?)"
+printf 'P0: none\nP1: none\nP2: none\nP3: none\nVERDICT: SHIP — Checked src/review-engine.ts for failure handling.\n' > "$OUT"
+pg_review_shape "$OUT" "$TOKENS"; rc=$?
+check 'P1-a: a diff path in the verdict reason establishes rationale' "$([ "$rc" = 0 ]; echo $?)"
+check 'P1-a: prompt requires a separate grounded clean-review paragraph' "$(grep -qF 'If there are no findings, include a short rationale paragraph' "$ROOT/bin/oracle-review.sh" && ! grep -qF 'output ONLY findings, nothing else' "$ROOT/bin/oracle-review.sh"; echo $?)"
+cat > "$TDIR/deleted.diff" <<'DIFF'
+diff --git a/src/deleted.ts b/src/deleted.ts
+index abc1234..def5678 100644
+--- a/src/deleted.ts
++++ b/src/deleted.ts
+@@ -1 +0,0 @@
+-readPolicy();
+DIFF
+pg_review_tokens "$TDIR/deleted.diff" > "$TDIR/deleted.tokens"
+review 'Checked readPolicy.'
+pg_review_shape "$OUT" "$TDIR/deleted.tokens"; rc=$?
+check 'P2-a: removed identifier matches without the deletion prefix' "$([ "$rc" = 0 ]; echo $?)"
+sed 's/readPolicy/otherPolicy/' "$TDIR/deleted.diff" > "$TDIR/other.diff"
+pg_review_tokens "$TDIR/other.diff" > "$TDIR/other.tokens"
+pg_review_shape "$OUT" "$TDIR/other.tokens"; rc=$?
+check 'P2-a: identifier absent from the diff still rejects' "$([ "$rc" = 1 ]; echo $?)"
+printf 'diff --git a/VERSION b/VERSION\n--- a/VERSION\n+++ b/VERSION\n@@ -1 +1 @@\n-0.61.2\n+0.62.0\n' > "$TDIR/version.diff"
+pg_review_tokens "$TDIR/version.diff" > "$TDIR/version.tokens"
+review 'Checked VERSION for release consistency.'
+pg_review_shape "$OUT" "$TDIR/version.tokens"; rc=$?
+check 'P1-a: VERSION-only changes can be cited by path' "$([ "$rc" = 0 ]; echo $?)"
 review 'Checked classifyReview; café paths remain safe.'
 pg_review_shape "$OUT" "$TOKENS"
 check 'body_bytes counts UTF-8 bytes, not characters' "$([ "$PG_BODY_BYTES" = "$(wc -c < "$OUT" | tr -d '[:space:]')" ]; echo $?)"
@@ -102,6 +129,12 @@ check 'fallback ledger JSON also carries bytes and the boolean flag' "$(tail -1 
 pg_ledger_append '{"marker":"pg-run-flagged-262-1791683605-2","outcome":"clean","out":"refuse.md","sha256":"abc","names_nothing":true,"body_bytes":54}'
 check 'clean-result lookup refuses an explicitly flagged row' "$([ -z "$(pg_ledger_lookup_clean pg-run-flagged-262-1791683605-2)" ]; echo $?)"
 
+# A diagnostic from an earlier capture must not overwrite deferred recovery or train the ramp.
+: > "$TDIR/ramp-calls"
+( TEMPLATE_VERDICT=1 HARVEST=0 PG_PRESERVE_STATE=1 SALVAGE_PRESERVE=1; pg_finish 9 ) > "$TDIR/deferred.stdout" 2> "$TDIR/deferred.stderr"
+rc=$?
+check 'P2-b: deferred skeleton records in-progress and leaves ramp unchanged' "$([ "$rc" = 9 ] && [ ! -s "$TDIR/ramp-calls" ] && tail -1 "$PRO_GATE_LEDGER" | jq -e '.exit==9 and .outcome=="in-progress"' >/dev/null; echo $?)"
+
 # Exercise the actual wrapper with the same mock CDP endpoint as the engine suite.
 printf 'run marker: %s\nP0: none\nP1: none\nP2: none\nP3: none\nVERDICT: SHIP (run marker: %s)\n' "$RUN_MARKER" "$RUN_MARKER" > "$TDIR/tab.txt"
 node "$ROOT/tests/mock-cdp.mjs" "$TDIR/tab.txt" > "$TDIR/port" 2> "$TDIR/cdp.log" &
@@ -146,6 +179,7 @@ marker="$(printf '%s' "$prompt" | grep -oE 'pg-run-[A-Za-z0-9.-]+' | tail -1)"
 printf 'P0: none\nP1: none\nP2: none\nP3: none\nVERDICT: SHIP (run marker: %s)\n' "$marker" > "$output"
 { printf 'run marker: %s\n' "$marker"; cat "$output"; } > "$TEMPLATE_TAB"
 printf 'submitted\n' >> "$TEMPLATE_SUBMISSIONS"
+[ -z "${TEMPLATE_OUTAGE_PID:-}" ] || kill "$TEMPLATE_OUTAGE_PID"
 ORACLE
 printf '#!/usr/bin/env bash\nexit 1\n' > "$TDIR/no-gh"
 chmod +x "$TDIR/oracle-template" "$TDIR/no-gh"
@@ -164,6 +198,20 @@ env PRO_GATE_HOME="$TDIR/fresh-home" PRO_GATE_LEDGER="$TDIR/fresh-ledger.jsonl" 
 rc=$?
 check 'fresh skeleton exits 6 after guarded salvage' "$([ "$rc" = 6 ]; echo $?)"
 check 'fresh skeleton never records clean or dispatches a second submission' "$(jq -se 'length==1 and .[0].outcome=="template-verdict" and .[0].names_nothing==true and .[0].body_bytes>0' "$TDIR/fresh-ledger.jsonl" >/dev/null && [ "$(wc -l < "$TDIR/submissions")" = 1 ]; echo $?)"
+env PRO_GATE_HOME="$TDIR/outage-home" PRO_GATE_LEDGER="$TDIR/outage-ledger.jsonl" \
+  ORACLE_BROWSER_PORT="$(cat "$TDIR/port")" PRO_GATE_BROWSER_MODE=remote-chrome \
+  PRO_GATE_ORACLE_BIN="$TDIR/oracle-template" PRO_GATE_GH_BIN="$TDIR/no-gh" \
+  PRO_GATE_INPUT_POLICY=bundle-only PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  PRO_GATE_MIN_AVAIL_MB=0 PRO_GATE_MAX_SWAP_PCT=101 PRO_GATE_EARLY_PROBE_SECS=0 \
+  PRO_GATE_CHAT_RENAME=0 PRO_GATE_KEEP_TABS=1 PRO_GATE_RAMP=0 PRO_GATE_MAX_RETRIES=1 \
+  PRO_GATE_SALVAGE_SECS=1 PRO_GATE_REATTACH_TIMEOUT=1 PRO_GATE_TIMEOUT_GRACE=0 \
+  PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_PRE_RETRY_PROBE_SECS=1 \
+  TEMPLATE_TAB="$TDIR/tab.txt" TEMPLATE_SUBMISSIONS="$TDIR/outage-submissions" TEMPLATE_OUTAGE_PID="$MOCK_PID" \
+  bash "$ROOT/bin/oracle-review.sh" --diff "$ROOT/tests/fixtures/template-verdict/review.diff" \
+    --repo "$TDIR" --out "$TDIR/outage.md" --timeout 2s \
+    > "$TDIR/outage.stdout" 2> "$TDIR/outage.stderr"
+rc=$?
+check 'P2-b: primary skeleton then salvage outage exits 9 with in-progress ledger' "$([ "$rc" = 9 ] && jq -se 'length==1 and .[0].exit==9 and .[0].outcome=="in-progress" and .[0].names_nothing==true' "$TDIR/outage-ledger.jsonl" >/dev/null; echo $?)"
 echo "$CHECKS checks, $FAILS failures"
 [ "$FAILS" = 0 ] && { echo 'ALL PASS'; exit 0; }
 exit 1

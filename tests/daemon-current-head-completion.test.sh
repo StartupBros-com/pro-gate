@@ -624,6 +624,7 @@ write_input_binding(){ # marker head-oid nwo num
     --arg base "$base" --arg head "$head" --arg endpoint "$endpoint" --arg raw "$raw" \
     '{charged_spend_epoch:1,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("full-pr:"+$base+":"+$head),mode:"full-pr",proof:{base_oid:$base,endpoint_digest:$endpoint,head_oid:$head,raw_patch_digest:$raw}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:$host,owner:$owner,repo:$repo},target:{head_oid:$head,kind:"pull-request",pr:$pr}}')"
   pg_review_input_binding_write "$marker" "$binding"
+  pg_review_tokens_write "$marker" "$HERE/fixtures/template-verdict/review.diff"
 }
 # #184 finding 2 (round 6): mirrors the real producer's ONE writer of review-result-binding/v1
 # records (pg_review_decision_repair_result_binding, oracle-review.sh:284-318) -- for a SHIP verdict,
@@ -664,7 +665,7 @@ COMPLETED_DIR="$(pg_completed_dir)"; mkdir -p "$COMPLETED_DIR"
 EVIDENT_NWO=acme/widgets; EVIDENT_NUM=1983   # same slug as $NWO#$NUM -> round_key acme-widgets-1983
 EVIDENT_SHA=4444444444444444444444444444444444444444
 EVIDENT_MARKER=pg-run-acme-widgets-1983-1700000500-1
-printf 'P0: none\nP1: none\nP2: none\nP3: none\nVERDICT: SHIP\n' > "$COMPLETED_DIR/$EVIDENT_MARKER"
+cp "$HERE/fixtures/template-verdict/pushbot-4451.txt" "$COMPLETED_DIR/$EVIDENT_MARKER"
 
 UNEVIDENT_NWO=acme/gadgets; UNEVIDENT_NUM=77
 UNEVIDENT_SHA=5555555555555555555555555555555555555555   # no ledger row, no completed artifact: unprovable
@@ -686,6 +687,13 @@ check 'a names_nothing round cannot prove a legacy completion' \
   "$(! daemon_legacy_row_has_durable_evidence "$EVIDENT_NWO" "$EVIDENT_NUM" "$EVIDENT_SHA"; echo $?)" \
   "$(cat "$LEDGER_FILE")"
 cp "$TDIR/unflagged-ledger.jsonl" "$LEDGER_FILE"
+check 'P1-b: an unflagged saved skeleton cannot prove legacy completion' \
+  "$(! daemon_legacy_row_has_durable_evidence "$EVIDENT_NWO" "$EVIDENT_NUM" "$EVIDENT_SHA"; echo $?)"
+# A grounded historical review remains eligible when its exact bindings and vocabulary match.
+printf 'P0: none\nP1: none\nP2: none\nP3: none\nChecked src/review-engine.ts for regressions.\nVERDICT: SHIP\n' > "$COMPLETED_DIR/$EVIDENT_MARKER"
+pg_review_tokens_write "$EVIDENT_MARKER" "$HERE/fixtures/template-verdict/review.diff"
+rm "$(pg_review_result_binding_dir)/$EVIDENT_MARKER"
+write_result_binding "$EVIDENT_MARKER" SHIP
 
 daemon_migrate_legacy_processed
 
@@ -711,7 +719,7 @@ SHA_A=6666666666666666666666666666666666666666   # genuinely reviewed
 SHA_B=7777777777777777777777777777777777777777   # never reviewed; only recorded because the old
                                                    # mark_processed_heads looked up the LIVE head
 AB_MARKER=pg-run-acme-rockets-42-1700000600-1
-printf 'P0: none\nP1: none\nP2: none\nP3: none\nVERDICT: SHIP\n' > "$COMPLETED_DIR/$AB_MARKER"
+printf 'P0: none\nP1: none\nP2: none\nP3: none\nChecked src/review-engine.ts for regressions.\nVERDICT: SHIP\n' > "$COMPLETED_DIR/$AB_MARKER"
 write_input_binding "$AB_MARKER" "$SHA_A" "$AB_NWO" "$AB_NUM"   # binding exists for A only
 write_result_binding "$AB_MARKER" SHIP   # #184 finding 2 (round 6): A also has a validated, digest-matching result binding
 append_clean_ledger_row "$AB_MARKER" "$AB_ROUND_KEY" "$AB_NUM" "$COMPLETED_DIR/$AB_MARKER"
@@ -792,7 +800,7 @@ check 'sanity: the two different (owner,repo) pairs collide on the SAME lossy ro
 
 COLLIDE_SHA=9444444444444444444444444444444444444444   # the SAME sha on both rows, to isolate identity from sha
 COLLIDE_MARKER=pg-run-foo-bar-baz-1-1700001100-1
-printf 'P0: none\nP1: none\nP2: none\nP3: none\nVERDICT: SHIP\n' > "$COMPLETED_DIR/$COLLIDE_MARKER"
+printf 'P0: none\nP1: none\nP2: none\nP3: none\nChecked src/review-engine.ts for regressions.\nVERDICT: SHIP\n' > "$COMPLETED_DIR/$COLLIDE_MARKER"
 write_input_binding "$COLLIDE_MARKER" "$COLLIDE_SHA" "$COLLIDE_NWO_A" "$COLLIDE_NUM_A"   # binding exists for A (owner=foo-bar) only
 write_result_binding "$COLLIDE_MARKER" SHIP   # #184 finding 2 (round 6): A also has a validated, digest-matching result binding
 append_clean_ledger_row "$COLLIDE_MARKER" "${COLLIDE_NWO_A//\//-}-${COLLIDE_NUM_A}" "$COLLIDE_NUM_A" "$COMPLETED_DIR/$COLLIDE_MARKER"
@@ -812,7 +820,7 @@ echo '# #184 finding 2 (round 6): a SHIP artifact plus a valid exact-sha input b
 NORESULT_NWO=acme/relays; NORESULT_NUM=55
 NORESULT_SHA=9555555555555555555555555555555555555555
 NORESULT_MARKER=pg-run-acme-relays-55-1700001200-1
-printf 'P0: none\nP1: none\nP2: none\nP3: none\nVERDICT: SHIP\n' > "$COMPLETED_DIR/$NORESULT_MARKER"
+printf 'P0: none\nP1: none\nP2: none\nP3: none\nChecked src/review-engine.ts for regressions.\nVERDICT: SHIP\n' > "$COMPLETED_DIR/$NORESULT_MARKER"
 write_input_binding "$NORESULT_MARKER" "$NORESULT_SHA" "$NORESULT_NWO" "$NORESULT_NUM"   # valid exact-sha input binding; deliberately NO result binding
 append_clean_ledger_row "$NORESULT_MARKER" "${NORESULT_NWO//\//-}-${NORESULT_NUM}" "$NORESULT_NUM" "$COMPLETED_DIR/$NORESULT_MARKER"
 : > "$LEGACY_FILE"; : > "$QUARANTINE_FILE"; : > "$STATE_FILE"
@@ -842,7 +850,7 @@ echo '# #184 finding 2 (round 6): a result binding whose ship_proof does not mat
 MISMATCH_NWO=acme/relays; MISMATCH_NUM=56
 MISMATCH_SHA=9666666666666666666666666666666666666666
 MISMATCH_MARKER=pg-run-acme-relays-56-1700001300-1
-printf 'P0: none\nP1: none\nP2: none\nP3: none\nVERDICT: SHIP\n' > "$COMPLETED_DIR/$MISMATCH_MARKER"
+printf 'P0: none\nP1: none\nP2: none\nP3: none\nChecked src/review-engine.ts for regressions.\nVERDICT: SHIP\n' > "$COMPLETED_DIR/$MISMATCH_MARKER"
 write_input_binding "$MISMATCH_MARKER" "$MISMATCH_SHA" "$MISMATCH_NWO" "$MISMATCH_NUM"
 mismatch_binding="$(pg_review_input_binding_read "$MISMATCH_MARKER")"
 mismatch_input_digest="$(pg_review_input_binding_digest "$MISMATCH_MARKER")"

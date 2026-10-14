@@ -1,0 +1,8 @@
+P0: none
+P1: none
+P2: none
+P3: none
+
+Checked src/review-engine.ts and classifyReview for failure handling; no defects found.
+
+VERDICT: SHIP — Review classification handles the changed policy consistently.
