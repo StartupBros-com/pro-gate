@@ -63,13 +63,26 @@ set -uo pipefail
 
 # --- locate + source the shared lib (works from repo and from deployed location) ---
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-for c in "$SELF/lib.sh" "$SELF/../lib/pro-gate-lib.sh" "${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/lib.sh"; do
+# Detect inspection intent before any config execution, including invalid invocations whose
+# parser will reject an earlier argument. A facts data root is data, never startup code.
+FACTS_STARTUP=0; STARTUP_VALUE=0
+for arg in "$@"; do
+  if [ "$STARTUP_VALUE" = 1 ]; then STARTUP_VALUE=0; continue; fi
+  case "$arg" in
+    --review-facts) FACTS_STARTUP=1 ;;
+    --pr|--repo|--diff|--input|--out|--timeout|--extra-files|--confirm|--brief|--harvest|--recover|--review-decision-effect|--review-choice-selection|--prepare-review-evidence|--candidate-head)
+      STARTUP_VALUE=1 ;;
+  esac
+done
+LIB_CANDIDATES=("$SELF/lib.sh" "$SELF/../lib/pro-gate-lib.sh")
+[ "$FACTS_STARTUP" = 1 ] || LIB_CANDIDATES+=("${PRO_GATE_HOME:-$HOME/.pro-review-daemon}/lib.sh")
+for c in ${LIB_CANDIDATES[@]+"${LIB_CANDIDATES[@]}"}; do
   [ -f "$c" ] && { . "$c"; break; }
 done
 type pg_os >/dev/null 2>&1 || { echo "ERROR: pro-gate lib not found (lib.sh)" >&2; exit 10; }
 
 pg_augment_path
-pg_load_env
+[ "$FACTS_STARTUP" = 1 ] || pg_load_env
 OS="$(pg_os)"; MODE="$(pg_browser_mode)"
 
 # One live run per --out (gate #54 r11): the status sidecar is keyed by $OUT, so two

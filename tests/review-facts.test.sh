@@ -192,7 +192,11 @@ query
 check 'known other-host sidecar disambiguates a malformed completion with the same host-less key' '.status=="accepted" and (.selected_marker|endswith("1700000700-1"))'
 rm "$PRO_GATE_HOME/run-meta/$NEWER"
 query
-check 'canonical other-host input disambiguates the same marker key even without a run sidecar' '.status=="accepted" and (.selected_marker|endswith("1700000700-1"))'
+check 'unbound other-host input cannot hide a malformed completion without a sidecar' '.status!="accepted" and .status!="missing" and .review==null'
+OTHER_RESULT="$(jq -cS --arg ib "$(pg_review_sha256_text "$OTHER_INPUT")" '.input_binding_digest=$ib' <<<"$NEW_RESULT")"
+printf '%s' "$OTHER_RESULT" > "$PRO_GATE_HOME/review-result-bindings/$NEWER"
+query
+check 'digest-bound other-host input disambiguates the same marker key without a run sidecar' '.status=="accepted" and (.selected_marker|endswith("1700000700-1"))'
 pg_run_meta_write "$NEWER" github.com acme widgets acme-widgets-1983 1983 "$TDIR/review.md" 1700000900
 query
 check 'conflicting relevant sidecar prevents unrelated input attribution from hiding the newest record' '.status=="invalid" and .reason=="conflicting-completion-metadata" and .review==null'
@@ -208,6 +212,7 @@ for location in pending recovered; do
   path="$PRO_GATE_HOME/$location/$NEWER"; [ "$location" != recovered ] || path="$path.md"
   mv "$PRO_GATE_HOME/completed/$NEWER" "$path"
   rm "$PRO_GATE_HOME/review-result-bindings/$NEWER"
+  pg_run_meta_write "$NEWER" github.com acme widgets acme-widgets-1983 1983 "$TDIR/review.md" 1700000900
   query
   check "newer $location artifact obstructs old accepted facts without collecting or repairing" '.status=="incomplete" and .review==null and (.selected_marker|endswith("1700000900-2"))'
 done
@@ -228,6 +233,7 @@ new_case tied
 newer_completion
 jq -cjS '.charged_spend_epoch=1700000700' <<<"$NEW_INPUT" > "$PRO_GATE_HOME/review-input-bindings/$NEWER"
 printf '{bad\n' > "$PRO_GATE_HOME/review-result-bindings/$NEWER"
+pg_run_meta_write "$NEWER" github.com acme widgets acme-widgets-1983 1983 "$TDIR/review.md" 1700000700
 query
 check 'equal charged epochs with unproved canonical identity are ambiguous, not a lexicographic SHIP pick' '.status=="ambiguous" and .reason=="ambiguous-completion-order" and .review==null'
 # With both immutable identities proven, the documented canonical tie-break is deterministic.
@@ -250,6 +256,61 @@ check 'newest FIX-FIRST wins over older SHIP and reports artifact-bound U1 open 
 current_proof
 query --diff "$TDIR/endpoint.patch"
 check 'applicability is separate from verdict: a matching FIX-FIRST review is applicable' '.status=="accepted" and .applicable==true and .review.verdict=="FIX-FIRST"'
+# No sidecar: unbound target/epoch edits must never demote a newer blocking review.
+SAVED_NEWER="$NEWER"
+for shape in keyed generic; do
+  NEWER="$SAVED_NEWER"; [ "$shape" != generic ] || NEWER=pg-run-newer
+  for mutation in repo pr epoch symlink missing-input named-choice; do
+    new_case "unbound-$shape-$mutation"
+    newer_completion
+    printf '[P0] file.txt:1 - Latest blocker\nVERDICT: FIX-FIRST\n' > "$PRO_GATE_HOME/completed/$NEWER"
+    BLOCKING_RESULT="$(jq -cS --arg digest "$(pg_sha256 "$PRO_GATE_HOME/completed/$NEWER")" '.artifact.digest=$digest | .verdict="FIX-FIRST" | .ship_proof=null' <<<"$NEW_RESULT")"
+    printf '%s' "$BLOCKING_RESULT" > "$PRO_GATE_HOME/review-result-bindings/$NEWER"
+    case "$mutation" in
+      repo) jq -cjS '.repository.repo="Elsewhere"' <<<"$NEW_INPUT" > "$PRO_GATE_HOME/review-input-bindings/$NEWER" ;;
+      pr) jq -cjS '.target.pr=1984' <<<"$NEW_INPUT" > "$PRO_GATE_HOME/review-input-bindings/$NEWER" ;;
+      epoch) jq -cjS '.charged_spend_epoch=99' <<<"$NEW_INPUT" > "$PRO_GATE_HOME/review-input-bindings/$NEWER" ;;
+      symlink) mv "$PRO_GATE_HOME/review-input-bindings/$NEWER" "$PRO_GATE_HOME/saved-input"; ln -s "$PRO_GATE_HOME/saved-input" "$PRO_GATE_HOME/review-input-bindings/$NEWER" ;;
+      missing-input) rm "$PRO_GATE_HOME/review-input-bindings/$NEWER" ;;
+      named-choice) jq -cjS '.named_choice={id:"keep",label:"Preserve",consequence:"Keep compatibility"}' <<<"$BLOCKING_RESULT" > "$PRO_GATE_HOME/review-result-bindings/$NEWER" ;;
+    esac
+    query
+    if [ "$mutation" = named-choice ]; then
+      check "$shape named choice remains selected for downstream owner policy" '.status=="accepted" and .review.open_p0==1 and .review.named_choice.id=="keep"'
+    else
+      check "$shape unbound $mutation refuses older favorable facts" '.status!="accepted" and .status!="missing" and .review==null'
+      if [ "$mutation" != symlink ] && [ "$mutation" != missing-input ]; then
+        CHECKS=$((CHECKS + 1))
+        grep -Fq 'digest mismatch' "$TDIR/err" || { printf 'FAIL - missing digest mismatch diagnostic\n' >&2; FAILS=$((FAILS + 1)); }
+      fi
+    fi
+  done
+done
+for mutation in missing-input malformed-input; do
+  new_case "unrelated-$mutation"
+  NEWER=pg-run-other-repo-99-1700000900-2
+  newer_completion
+  OTHER_INPUT="$(jq -cS '.repository.owner="other" | .repository.repo="repo" | .target.pr=99' <<<"$NEW_INPUT")"
+  OTHER_RESULT="$(jq -cS --arg ib "$(pg_review_sha256_text "$OTHER_INPUT")" '.input_binding_digest=$ib' <<<"$NEW_RESULT")"
+  printf '%s' "$OTHER_RESULT" > "$PRO_GATE_HOME/review-result-bindings/$NEWER"
+  case "$mutation" in
+    missing-input) rm "$PRO_GATE_HOME/review-input-bindings/$NEWER" ;;
+    malformed-input) printf '{bad\n' > "$PRO_GATE_HOME/review-input-bindings/$NEWER" ;;
+  esac
+  query
+  check "other-PR scoped result with $mutation does not obstruct this target" '.status=="accepted" and (.selected_marker|endswith("1700000700-1"))'
+done
+NEWER="$SAVED_NEWER"
+new_case publication-temp
+printf 'partial publication\n' > "$PRO_GATE_HOME/completed/$NEWER.tmp.456"
+query
+check 'numeric publication suffix is ignored' '.status=="accepted" and .review.open_p0==0'
+new_case literal-tmp
+NEWER=pg-run-latest.tmp.v2
+newer_completion
+query
+check 'literal nonnumeric tmp suffix remains a real candidate' '.status=="accepted" and .selected_marker=="pg-run-latest.tmp.v2"'
+NEWER="$SAVED_NEWER"
 new_case choices
 printf '[P1] f:1 - select a compatibility policy\nCHOICE: keep | Preserve | Keep compatibility\nCHOICE: break | Replace | Use new API\nVERDICT: NEEDS-DISCUSSION\n' > "$PRO_GATE_HOME/completed/$MARKER"
 CHOICE_RESULT="$(jq -cS --arg digest "$(pg_sha256 "$PRO_GATE_HOME/completed/$MARKER")" '.artifact.digest=$digest | .verdict="NEEDS-DISCUSSION" | .ship_proof=null' <<<"$RESULT")"
@@ -390,5 +451,39 @@ for mode in fresh decision status; do
 done
 query
 check 'same invocation without incompatible flags is permitted' '.status=="accepted" and .applicable==null'
+# Startup must not execute the inspected data root, even for malformed facts invocations.
+new_case env-isolation
+printf 'printf executed > "%s"\n' "$TDIR/env-executed" > "$PRO_GATE_HOME/.env"
+for invocation in valid invalid missing-value; do
+  args=(--review-facts --repo "$TDIR/checkout" --pr 1983 --json)
+  [ "$invocation" != invalid ] || args=(--unknown --review-facts)
+  [ "$invocation" != missing-value ] || args=(--review-facts --pr)
+  RC=0
+  bash "$TDIR/installed/oracle-review.sh" "${args[@]}" > "$TDIR/out.json" 2> "$TDIR/err" || RC=$?
+  CHECKS=$((CHECKS + 1))
+  expected=2; [ "$invocation" != valid ] || expected=0
+  if [ "$RC" -eq "$expected" ] && [ ! -e "$TDIR/env-executed" ]; then printf 'ok - %s facts invocation never sources data-root env\n' "$invocation"; else FAILS=$((FAILS + 1)); printf 'FAIL - %s facts env isolation\n' "$invocation" >&2; fi
+  rm -f "$TDIR/env-executed"
+done
+bash "$TDIR/installed/oracle-review.sh" --help > "$TDIR/help" 2> "$TDIR/err" || true
+CHECKS=$((CHECKS + 1))
+[ -e "$TDIR/env-executed" ] || { printf 'FAIL - normal mode lost env loading\n' >&2; FAILS=$((FAILS + 1)); }
+rm -f "$TDIR/env-executed"
+RC=0
+bash "$TDIR/installed/oracle-review.sh" --out --review-facts --unknown > "$TDIR/out.json" 2> "$TDIR/err" || RC=$?
+CHECKS=$((CHECKS + 1))
+if [ "$RC" -eq 2 ] && [ -e "$TDIR/env-executed" ]; then printf 'ok - facts spelling used as an option value keeps normal env loading\n'; else FAILS=$((FAILS + 1)); printf 'FAIL - option value mistaken for facts mode\n' >&2; fi
+rm -f "$TDIR/env-executed"
+RC=0
+bash "$TDIR/installed/oracle-review.sh" --out --review-facts --review-facts --json > "$TDIR/out.json" 2> "$TDIR/err" || RC=$?
+CHECKS=$((CHECKS + 1))
+if [ "$RC" -eq 2 ] && [ ! -e "$TDIR/env-executed" ]; then printf 'ok - facts flag following an option value still isolates startup\n'; else FAILS=$((FAILS + 1)); printf 'FAIL - facts flag hidden after an option value\n' >&2; fi
+mkdir "$TDIR/standalone"
+cp "$ROOT/bin/oracle-review.sh" "$TDIR/standalone/oracle-review.sh"
+printf 'printf executed > "%s"\n' "$TDIR/fallback-executed" > "$PRO_GATE_HOME/lib.sh"
+RC=0
+bash "$TDIR/standalone/oracle-review.sh" --review-facts --json > "$TDIR/out.json" 2> "$TDIR/err" || RC=$?
+CHECKS=$((CHECKS + 1))
+if [ "$RC" -eq 10 ] && [ ! -e "$TDIR/fallback-executed" ]; then printf 'ok - facts without distribution lib refuses data-root fallback\n'; else FAILS=$((FAILS + 1)); printf 'FAIL - facts executed data-root library fallback\n' >&2; fi
 printf '%s checks, %s failures\n' "$CHECKS" "$FAILS"
 [ "$FAILS" -eq 0 ]

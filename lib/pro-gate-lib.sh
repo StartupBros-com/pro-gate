@@ -4698,7 +4698,7 @@ pg_review_decision_input_proof_current() { # binding repo pr host owner name hea
 # input siblings can therefore obstruct an older accepted review instead of disappearing in a scan.
 pg_review_facts_candidates() { # host owner repo pr -> candidate metadata JSON
   local host="$1" owner="$2" repo="$3" pr="$4" key dir f marker raw meta mh mo mr mk mp out spend
-  local epoch identity relevant conflict candidates='[]'
+  local epoch identity relevant conflict input result bound tail candidates='[]'
   key="$(printf '%s-%s-%s' "$owner" "$repo" "$pr" | tr -c 'A-Za-z0-9.\n-' '-')"
   for dir in "$(pg_completed_dir)" "$(pg_review_result_binding_dir)" "$PRO_GATE_HOME/pending" "$PRO_GATE_HOME/recovered"; do
     [ ! -e "$dir" ] || { [ -d "$dir" ] && [ -r "$dir" ] && [ -x "$dir" ]; } || return 1
@@ -4713,7 +4713,19 @@ pg_review_facts_candidates() { # host owner repo pr -> candidate metadata JSON
     if [ -n "$raw" ]; then
       jq -e --arg h "$host" --arg o "$owner" --arg r "$repo" --argjson p "$pr" \
         '.repository=={host:$h,owner:$o,repo:$r} and .target.pr==$p' <<<"$raw" >/dev/null 2>&1 && relevant=true
-      epoch="$(jq -r '.charged_spend_epoch | select(type=="number" and floor==. and .>0)' <<<"$raw" 2>/dev/null || true)"
+    fi
+    # Shape-valid input is only a relevance hint until the accepted result binds its bytes.
+    # Otherwise editing its target can exclude it, or editing its epoch can demote it below SHIP.
+    bound=false
+    input="$(pg_review_input_binding_read "$marker" 2>/dev/null || true)"
+    result="$(pg_review_result_binding_read "$marker" 2>/dev/null || true)"
+    if [ -n "$input" ] && [ -n "$result" ]; then
+      if [ "$(pg_review_sha256_text "$input")" = "$(jq -r .input_binding_digest <<<"$result")" ]; then
+        bound=true
+        epoch="$(jq -r .charged_spend_epoch <<<"$input")"
+      else
+        echo "ERROR: input-result binding digest mismatch for $marker; input metadata cannot establish completion target or ordering." >&2
+      fi
     fi
     meta="$(pg_run_meta_read "$marker" 2>/dev/null || true)"
     if [ -n "$meta" ]; then
@@ -4735,9 +4747,12 @@ pg_review_facts_candidates() { # host owner repo pr -> candidate metadata JSON
         if [ "$mh" = "$host" ] && [ "$mo" = "$owner" ] && [ "$mr" = "$repo" ] && [ "$mp" = "$pr" ]; then relevant=true; fi
       fi
     fi
-    # A canonical input can disambiguate a colliding host-less key even without a sidecar.
-    # Conflicting target metadata above still makes the record relevant and obstructing.
-    if [ "$relevant" = false ] && [ -n "$raw" ] && pg_review_input_binding_validate "$raw" "$marker"; then continue; fi
+    # Only a digest-bound input can exclude a colliding key without a valid sidecar.
+    # An unscoped surviving result cannot rule this target out. A result-bound scoped marker
+    # can still identify another PR; damaged records there must not block every unrelated PR.
+    if [ "$relevant" = false ] && [ "$bound" = true ]; then continue; fi
+    if [ -z "$meta" ] && [ "$bound" = false ] && [ -n "$result" ] \
+      && ! [[ "$marker" =~ ^pg-run-.+-[0-9]+-[0-9]+$ ]]; then relevant=true; fi
     case "$marker" in "pg-run-$key-"*) relevant=true ;; esac
     [ "$relevant" = true ] || continue
     # Contradictory full attribution is not permission to reinterpret a target-looking marker.
@@ -4756,6 +4771,10 @@ pg_review_facts_candidates() { # host owner repo pr -> candidate metadata JSON
         [ -e "$f" ] || [ -L "$f" ] || continue
         marker="${f##*/}"
         [ "$dir" != "$PRO_GATE_HOME/recovered" ] || marker="${marker%.md}"
+        # Match publication PID suffixes only, not legitimate names such as .tmp.v2.
+        case "$marker" in
+          *.tmp.*) tail="${marker##*.tmp.}"; case "$tail" in ''|*[!0-9]*) ;; *) continue ;; esac ;;
+        esac
         printf '%s\n' "$marker"
       done
     done | LC_ALL=C sort -u
