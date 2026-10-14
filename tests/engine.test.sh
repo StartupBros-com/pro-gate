@@ -51,6 +51,7 @@ export PRO_GATE_MIN_AVAIL_MB=0 PRO_GATE_MAX_SWAP_PCT=101 PRO_GATE_TIMEOUT_BIN=/u
 # v0.28: the early URL-capture probe is off by default in tests (its sleep would slow every
 # fresh-run case); the dedicated early-capture test re-enables it explicitly.
 export PRO_GATE_EARLY_PROBE_SECS=0
+export PRO_GATE_SALVAGE_SECS=2
 
 cat > "$TDIR/bin/oracle-preflight" <<'FAKE_PREFLIGHT'
 #!/usr/bin/env bash
@@ -72,7 +73,7 @@ if [ "${PG_TEST_ORACLE_COMPLETE:-0}" = 1 ]; then
   done
   if [ -n "${PG_TEST_PROMPT_CAPTURE:-}" ]; then printf '%s' "$prompt" > "$PG_TEST_PROMPT_CAPTURE"; fi
   [[ "$prompt" =~ \(run\ marker:\ ([A-Za-z0-9.-]+) ]] || exit 99
-  printf '[P1] policy/input.sh:1 - fixture finding\nP2: none\nVERDICT: SHIP - fixture complete. (run marker: %s)\n' "${BASH_REMATCH[1]}" > "$output"
+  printf '[P1] policy/input.sh:1 - fixture finding; proof.txt and f.txt were checked\nP2: none\nVERDICT: SHIP - fixture complete. (run marker: %s)\n' "${BASH_REMATCH[1]}" > "$output"
   exit 0
 fi
 printf 'unexpected generic oracle invocation\n' >&2
@@ -197,7 +198,7 @@ run_change_lock_wait_budget_tests() {
   wait_real_flock="$(command -v flock)"
   install_flock_shim "$wait_bin"
   wait_path="$wait_bin:$PATH"
-  printf 'diff --git a/wait b/wait\n--- a/wait\n+++ b/wait\n@@ -0,0 +1 @@\n+wait\n' > "$wait_diff"
+  printf 'diff --git a/wait b/wait\n--- a/wait\n+++ b/wait\n@@ -0,0 +1 @@\n+wait policy/input.sh\n' > "$wait_diff"
   printf 'foreign idle tab\n' > "$TDIR/wait-sizing-tab.txt"
   start_mock "$TDIR/wait-sizing-tab.txt"
 
@@ -1092,9 +1093,14 @@ HANDOFF_AT_SCAN
 # Fixtures shared by every shard (#254). Each was first built by the test that needed it, but
 # later regions read it too, so it lives here, where a region running alone still has it.
 LIB="$HERE/../lib/pro-gate-lib.sh"
+seed_review_tokens() { # fixture home, marker: retain the synthetic reviewed diff for replay
+  PRO_GATE_HOME="$1" bash -c '. "$1"; pg_review_tokens_write "$2" "$3"' fixture "$LIB" "$2" "$TDIR/small.diff"
+}
 FOREIGN164='pg-run-crossfeed-2619-1700000069-20' # another run's marker, for the #164 ownership cases
 seq 1 26000 | sed 's/^/+/' > "$TDIR/huge.diff"
-printf 'diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -0,0 +1 @@\n+small\n' > "$TDIR/small.diff"
+# Successful capture fixtures cite these files; include those references in the reviewed payload.
+printf 'diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -0,0 +1,2 @@\n+small\n+# fixture callers: a.sh src/x.sh src/real.sh src/stale-source.mjs src/canonical.sh src/prior.sh src/new.sh src/pub.sh src/meta.sh src/valid.sh src/noise.sh src/race.sh src/race2.sh src/final.sh src/verbose.sh policy/input.sh lib/x.sh classifyReview\n' > "$TDIR/small.diff"
+seed_review_tokens "$TDIR/home" "$MARKER"
 ORGANIZER_STATE="$TDIR/organizer-state.json"
 ORGANIZER_TITLE='pro-gate review: PR #77 r1 [engine-fixture]'
 printf '{"title":null,"archived":false,"events":[]}\n' > "$ORGANIZER_STATE"
@@ -1386,7 +1392,7 @@ start_mock "$TDIR/tab.txt" "$ORGANIZER_STATE"
 # Input policy is resolved immediately after parsing. Rejections must precede every state or output
 # mutation, CDP request, and Oracle process; queries/effects use the same engine boundary.
 echo '# input delivery policy'
-printf 'diff --git a/policy b/policy\n--- a/policy\n+++ b/policy\n@@ -0,0 +1 @@\n+bundle\n' > "$TDIR/policy.diff"
+printf 'diff --git a/policy b/policy\n--- a/policy\n+++ b/policy\n@@ -0,0 +1 @@\n+bundle policy/input.sh\n' > "$TDIR/policy.diff"
 POLICY_SENTINEL="$TDIR/policy-oracle-invocations"; export POLICY_SENTINEL
 : > "$POLICY_SENTINEL"; : > "$TDIR/mock.log"
 for policy_input in both connector; do
@@ -1861,7 +1867,7 @@ start_mock "$TDIR/tab.txt" "$ORGANIZER_STATE"
 # single uncollected review starved every other run (#82). Completion must release the capacity
 # while KEEPING the record collectable.
 echo '# reservation releases capacity once its review is complete'
-printf 'run marker: %s\nP0: none\n\nVERDICT: SHIP — looks good. (run marker: %s)\n' "$MARKER" "$MARKER" > "$TDIR/tab.txt"
+printf 'run marker: %s\nP0: none\nChecked src/x.sh for failure handling.\n\nVERDICT: SHIP — looks good. (run marker: %s)\n' "$MARKER" "$MARKER" > "$TDIR/tab.txt"
 PRO_GATE_HOME="$TDIR/home" PRO_GATE_RESERVATION_MISSES=3 PRO_GATE_RECONCILE_INTERVAL=0 bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_reconcile '$HERE/../bin/cdp-salvage.mjs' '$PORT'"
 check 'complete probe marks the reservation complete' "$([ "$(PRO_GATE_HOME="$TDIR/home" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_state '$MARKER'")" = complete ]; echo $?)" "$(cat "$TDIR/home/in-progress/$MARKER")"
 check 'completed reservation survives as a harvest pointer' "$([ -f "$TDIR/home/in-progress/$MARKER" ]; echo $?)" 'record removed instead of released'
@@ -1986,6 +1992,7 @@ check 'harvest ledger row records post_slot_secs == secs' "$([ "$(printf '%s' "$
 # through the existing shell acceptance/persistence lifecycle without dispatching Oracle.
 echo '# U2: readable stale source harvest lifecycle'
 MSTALE="pg-run-stale-harvest-77-1700000700-701"
+seed_review_tokens "$TDIR/home" "$MSTALE"
 STALE_SOURCE="$TDIR/stale-source.txt"
 STALE_SCRATCH="$TDIR/stale-scratch.txt"
 STALE_EXPECTED="$TDIR/stale-expected.md"
@@ -2599,6 +2606,7 @@ check 'late-evidence run warns (cannot confirm)' "$([ -n "$(warn_of "$TDIR/o-lat
 echo '# U2/U5/P2: harvest derives the downgrade warning too (harvest branch no longer drops it)'
 # legacy (no-model) reservation: harvest cannot confirm the model -> role-based text AND a warning.
 MKL="pg-run-legacy-1700000009-77"
+seed_review_tokens "$TDIR/home" "$MKL"
 printf 'kL\t%s\t%s\t0\t\n' "$TDIR/o-legacy.md" "$(date +%s)" > "$TDIR/home/in-progress/$MKL"
 { printf 'run marker: %s\n' "$MKL"
   printf '[P1] src/x.sh:10 - real bug\n  Why: demonstrated\nP2: none\nP3: none\nVERDICT: SHIP - clean. (run marker: %s)\n' "$MKL"
@@ -2611,6 +2619,7 @@ check 'legacy-record harvest WARNS (cannot confirm; P2 fix)' "$([ -n "$(warn_of 
 # weak persisted model: harvest must surface the weak-model warning too. Realistic record shape:
 # a real exit-9 always holds a slot, so field 5 (slot) is non-empty alongside the model field 6.
 MKW="pg-run-weakres-1700000012-55"
+seed_review_tokens "$TDIR/home" "$MKW"
 printf 'kW\t%s\t%s\t0\t1\tGPT-4o mini\n' "$TDIR/o-weakres.md" "$(date +%s)" > "$TDIR/home/in-progress/$MKW"
 { printf 'run marker: %s\n' "$MKW"
   printf '[P1] src/x.sh:10 - real bug\n  Why: demonstrated\nP2: none\nP3: none\nVERDICT: SHIP - clean. (run marker: %s)\n' "$MKW"
@@ -2753,7 +2762,7 @@ printf 'x\n' > "$GD/f"; git -C "$GD" add f
 git -C "$GD" -c user.email=t@t -c user.name=t commit -qm init 2>/dev/null
 git -C "$GD" checkout -q --detach 2>/dev/null
 GSHA="$(git -C "$GD" rev-parse --short HEAD)"
-printf 'diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-x\n+y\n' > "$GD/d.diff"
+printf 'diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-x\n+y # a.sh caller\n' > "$GD/d.diff"
 printf 'foreign idle tab\n' > "$TDIR/tab.txt"
 env PRO_GATE_HOME="$RHOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
   PRO_GATE_RAMP=0 PRO_GATE_RECONCILE_INTERVAL=3600 PRO_GATE_MAX_RETRIES=0 \
@@ -3888,6 +3897,7 @@ check 'implausible spend epoch falls back to now' \
 # Harvests spend no slot and must never consume a round.
 NROUND_FILES="$(ls "$RHOME/rounds" 2>/dev/null | wc -l)"
 MKR="pg-run-roundharvest-1700000030-22"
+seed_review_tokens "$RHOME" "$MKR"
 printf 'kR\t%s\t%s\t0\t\n' "$RHOME/o-rh.md" "$(date +%s)" > "$RHOME/in-progress/$MKR"
 { printf 'run marker: %s\n' "$MKR"
   printf '[P1] src/x.sh:10 - real bug\n  Why: demonstrated\nP2: none\nP3: none\nVERDICT: SHIP - clean. (run marker: %s)\n' "$MKR"
@@ -4649,6 +4659,7 @@ check 'matching harvest removes reservation + manifest' "$([ ! -f "$TDIR/home/in
 
 echo '# v0.28: positive run-binding — a nonce-bearing capture is accepted and stripped'
 M8="pg-run-noncetest-3-1700000034-88"
+seed_review_tokens "$TDIR/home" "$M8"
 printf '3\t%s\t%s\t0\t1\tGPT-X\n' "$TDIR/o-nonce.md" "$(date +%s)" > "$TDIR/home/in-progress/$M8"
 printf 'src/real.sh\n' > "$TDIR/home/manifests/$M8"
 cat > "$TDIR/tab.txt" <<TAB
@@ -4658,11 +4669,13 @@ P0: none
 [P1] apps/blog-writer/collect.ts:12 — cites nothing from the diff
 [P1] apps/blog-writer/schema.ts:44 — second non-diff citation
 
+Checked classifyReview for failure handling.
+
 VERDICT: FIX-FIRST — but positively bound (run marker: $M8)
 TAB
 start_mock "$TDIR/tab.txt"
 run_engine --harvest "$M8" --out "$TDIR/o-nonce.md" --timeout 5s
-check 'nonce-bearing capture accepted despite path mismatch' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
+check 'nonce-bearing capture naming a diff identifier accepts context-path mismatch' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC $(tail -2 "$TDIR/stderr")"
 check 'nonce stripped from the returned review' "$(grep -q 'run marker' "$TDIR/o-nonce.md"; [ $? -ne 0 ]; echo $?)" "$(tail -1 "$TDIR/o-nonce.md" 2>/dev/null)"
 check 'VERDICT line survives the strip' "$(grep -q 'VERDICT: FIX-FIRST' "$TDIR/o-nonce.md"; echo $?)" "$(tail -1 "$TDIR/o-nonce.md" 2>/dev/null)"
 check 'clean collection writes the completed artifact' "$([ -s "$TDIR/home/completed/$M8" ]; echo $?)" "$(ls "$TDIR/home/completed" 2>/dev/null)"
@@ -4974,6 +4987,7 @@ echo '# v0.28: artifact-first recovery — no ledger row needed'
 M9="pg-run-artifact-4-1700000035-99"
 mkdir -p "$TDIR/home/completed"
 cp "$TDIR/prov-ours.md" "$TDIR/home/completed/$M9"
+seed_review_tokens "$TDIR/home" "$M9"
 printf 'idle tab with no markers at all\n' > "$TDIR/tab.txt"
 # Artifact recovery needs no browser and must precede the cooldown gate (gate #54 r3 P2):
 # retrievable even while the account is cooling.
@@ -5062,6 +5076,7 @@ run_artifact_organizer_case() { # <case-id> <marker> [NAME=VALUE ...]
   CASE_TITLE="pro-gate review: PR #${marker##*-} r1 [$case_id]"
   mkdir -p "$CASE_HOME/completed" "$CASE_HOME/conversation-titles"
   cp "$TDIR/prov-ours.md" "$CASE_HOME/completed/$marker"
+  seed_review_tokens "$CASE_HOME" "$marker"
   printf '%s\n' "$CASE_TITLE" > "$CASE_HOME/conversation-titles/$marker"
   printf '{"title":null,"archived":false,"events":[]}\n' > "$CASE_STATE"
   {
@@ -5162,6 +5177,7 @@ check 'memo naming the rejected URL is removed' "$([ ! -f "$SHOME/conversation-u
 
 echo '# v0.28: unbindable captures fail closed when the nonce was promised'
 M11="pg-run-unbound-1-1700000041-33"
+seed_review_tokens "$TDIR/home" "$M11"
 printf '1\t%s\t%s\t0\t1\tGPT-X\n' "$TDIR/o-unbound.md" "$(date +%s)" > "$TDIR/home/in-progress/$M11"
 printf 'src/real.sh\n' > "$TDIR/home/manifests/$M11"
 # Deliberately NO .nonce flag: fail-closed must not depend on the sidecar's existence
@@ -5171,6 +5187,8 @@ conversation for run marker: $M11
 P0: none
 
 [P1] callers/context-only.ts:5 — single citation, no echo
+
+Checked classifyReview for failure handling.
 
 VERDICT: FIX-FIRST — ambiguous
 TAB
@@ -5206,6 +5224,7 @@ check 'overwritten ledgered source rejected by digest (exit 6)' "$([ "$RC" -eq 6
 
 echo '# v0.28: already-collected harvest returns the ledgered review idempotently'
 M4="pg-run-collected-5-1700000031-55"
+seed_review_tokens "$TDIR/home" "$M4"
 cat > "$TDIR/prior-collected.md" <<'PC'
 P0: none
 
@@ -5514,6 +5533,7 @@ NOFLOCK_MARKER='pg-run-config-208-1700000208-28'
 NOFLOCK_DIR="$NOFLOCK_HOME/organizer-locks/$NOFLOCK_MARKER.d"
 mkdir -p "$NOFLOCK_HOME/completed" "$NOFLOCK_HOME/conversation-titles" "$NOFLOCK_DIR"
 cp "$TDIR/prov-ours.md" "$NOFLOCK_HOME/completed/$NOFLOCK_MARKER"
+seed_review_tokens "$NOFLOCK_HOME" "$NOFLOCK_MARKER"
 printf 'pro-gate review: PR #208 r1 [noflock]\n' > "$NOFLOCK_HOME/conversation-titles/$NOFLOCK_MARKER"
 inode_of() { stat -c %i "$1" 2>/dev/null || stat -f %i "$1" 2>/dev/null; }
 NOFLOCK_INODE="$(inode_of "$NOFLOCK_DIR")"
@@ -5556,6 +5576,7 @@ STALE_DIR="$STALE_LOCK_ROOT/$STALE_MARKER.d"
 FRESH_DIR="$STALE_LOCK_ROOT/pg-run-config-fresh-1700000282-282.d"
 mkdir -p "$STALE_HOME/completed" "$STALE_DIR" "$FRESH_DIR"
 cp "$TDIR/prov-ours.md" "$STALE_HOME/completed/$STALE_MARKER"
+seed_review_tokens "$STALE_HOME" "$STALE_MARKER"
 touch -d '3 days ago' "$STALE_DIR" 2>/dev/null || touch -t 202001010000 "$STALE_DIR"
 env PRO_GATE_HOME="$STALE_HOME" PRO_GATE_ORGANIZER_LOCK_DIR="$STALE_LOCK_ROOT" \
   ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
@@ -5592,6 +5613,7 @@ BUSY_HOME="$TDIR/home-organizer-busy"
 BUSY_MARKER='pg-run-config-209-1700000209-29'
 mkdir -p "$BUSY_HOME/completed" "$BUSY_HOME/organizer-locks/$BUSY_MARKER.d"
 cp "$TDIR/prov-ours.md" "$BUSY_HOME/completed/$BUSY_MARKER"
+seed_review_tokens "$BUSY_HOME" "$BUSY_MARKER"
 env PRO_GATE_HOME="$BUSY_HOME" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 \
   PRO_GATE_SELF_HEAL=0 PRO_GATE_RAMP=0 PRO_GATE_KEEP_TABS=1 PRO_GATE_CHAT_RENAME=0 \
   PRO_GATE_TEST_ORGANIZER_NO_FLOCK=1 PRO_GATE_TEST_ORGANIZER_LOCK_WAIT=1 NODE_OPTIONS= \
@@ -5611,6 +5633,7 @@ PUB_OS_HOME="$TDIR/os-home-organizer-publish-fail"
 PUB_INTERCEPT="$TDIR/organizer-publish-intercepted"
 mkdir -p "$PUB_HOME/completed" "$PUB_OS_HOME/.local/bin"
 cp "$TDIR/prov-ours.md" "$PUB_HOME/completed/$PUB_MARKER"
+seed_review_tokens "$PUB_HOME" "$PUB_MARKER"
 cat > "$PUB_OS_HOME/.local/bin/mv" <<'PUB_MV'
 #!/usr/bin/env bash
 last=""
@@ -5644,6 +5667,7 @@ RELEASE_MARKER='pg-run-config-211-1700000211-31'
 RELEASE_TIMEOUT="$TDIR/timeout-organizer-release"
 mkdir -p "$RELEASE_HOME/completed" "$RELEASE_HOME/conversation-titles"
 cp "$TDIR/prov-ours.md" "$RELEASE_HOME/completed/$RELEASE_MARKER"
+seed_review_tokens "$RELEASE_HOME" "$RELEASE_MARKER"
 printf 'pro-gate review: PR #211 r1 [release]\n' > "$RELEASE_HOME/conversation-titles/$RELEASE_MARKER"
 cat > "$RELEASE_TIMEOUT" <<'RELEASE_TIMEOUT_SH'
 #!/usr/bin/env bash
@@ -5729,7 +5753,7 @@ env TMPDIR="$SCRATCH_TMP" PRO_GATE_HOME="$TDIR/home-scratch" ORACLE_BROWSER_PORT
   bash "$ENGINE" --diff "$TDIR/huge.diff" --repo "$TDIR" --out "$TDIR/o-scratch.md" --timeout 5s \
   >"$TDIR/stdout" 2>"$TDIR/stderr"
 RC=$?
-check 'scratch test still refuses oversized (rc=11)' "$([ "$RC" -eq 11 ]; echo $?)" "rc=$RC"
+check 'scratch test still refuses oversized (rc=11)' "$([ "$RC" -eq 11 ]; echo $?)" "rc=$RC $(cat "$TDIR/stderr")"
 LEFT="$(find "$SCRATCH_TMP" -maxdepth 1 -type d -name 'pro-review.*' | wc -l | tr -d ' ')"
 check 'external --out: WORK removed on exit' "$([ "$LEFT" = 0 ]; echo $?)" "leftover=$LEFT"
 # Default --out (no --out flag) lands INSIDE WORK: siblings sweep, findings + status survive.
@@ -5974,6 +5998,7 @@ for REPLAY_STORE in completed pending; do
       printf '\n'
       case "$REPLAY_KIND" in mixed-last|mixed-legacy) printf '[P0] other/a.ts:1 — foreign\nVERDICT: FIX-FIRST (run marker: %s)\n' "$FOREIGN164";; esac
     } > "$REPLAY_ART"
+    seed_review_tokens "$REPLAY_HOME" "$REPLAY_MARKER"
     cp "$REPLAY_ART" "$REPLAY_HOME/artifact.before"
     for REPLAY_PASS in 1 2; do
       recover_run "$REPLAY_HOME" --recover "$REPLAY_MARKER" --out "$REPLAY_OUT" --timeout 1s
@@ -6145,6 +6170,7 @@ done
 # Repo-qualified URL and a current-repo --repo bare PR both resolve one newest durable candidate.
 REC_NEW='pg-run-acme-widgets-42-1700000001-12'
 printf '[P1] src/new.sh:1 - newer finding\n  Why: newest fixture\nP2: none\nP3: none\nVERDICT: SHIP - newer.\n' > "$REC_HOME/completed/$REC_NEW"
+seed_review_tokens "$REC_HOME" "$REC_NEW"
 printf 'github.com\tacme\twidgets\tacme-widgets-42\t42\t%s\t1700003000\n' "$TDIR/recover-new.md" > "$REC_HOME/run-meta/$REC_NEW"
 recover_run "$REC_HOME" --recover 'https://github.com/acme/widgets/pull/42' --out "$TDIR/recover-url.md"
 check 'recover repo-qualified URL selects newest charged run before artifact lookup' \
@@ -6162,7 +6188,8 @@ check 'recover bare PR with current repository proof selects newest charged run'
 REC_ORDER_HOME="$TDIR/home-recover-order"; mkdir -p "$REC_ORDER_HOME/completed" "$REC_ORDER_HOME/run-meta"
 REC_OLD='pg-run-acme-widgets-77-1700009000-1'; REC_LATE='pg-run-acme-widgets-77-1700001000-2'
 printf '[P1] old\n  Why: old\nP2: none\nP3: none\nVERDICT: SHIP - old.\n' > "$REC_ORDER_HOME/completed/$REC_OLD"
-printf '[P1] late\n  Why: late\nP2: none\nP3: none\nVERDICT: SHIP - late.\n' > "$REC_ORDER_HOME/completed/$REC_LATE"
+printf '[P1] late\n  Why: classifyReview was checked\nP2: none\nP3: none\nVERDICT: SHIP - late.\n' > "$REC_ORDER_HOME/completed/$REC_LATE"
+seed_review_tokens "$REC_ORDER_HOME" "$REC_LATE"
 printf 'github.com\tacme\twidgets\tacme-widgets-77\t77\t/tmp/old.md\t1700009100\n' > "$REC_ORDER_HOME/run-meta/$REC_OLD"
 printf 'github.com\tacme\twidgets\tacme-widgets-77\t77\t/tmp/late.md\t1700010000\n' > "$REC_ORDER_HOME/run-meta/$REC_LATE"
 recover_run "$REC_ORDER_HOME" --recover 'https://github.com/acme/widgets/pull/77'
@@ -6444,6 +6471,7 @@ PUBF_HOME="$TDIR/home-recover-pubfail"
 PUBF_MARKER='pg-run-acme-widgets-601-1700010500-1'
 mkdir -p "$PUBF_HOME/completed"
 printf '[P1] src/pub.sh:1 - pub fixture\n  Why: durable\nP2: none\nP3: none\nVERDICT: SHIP - pub.\n' > "$PUBF_HOME/completed/$PUBF_MARKER"
+seed_review_tokens "$PUBF_HOME" "$PUBF_MARKER"
 PUBF_BEFORE="$(cat "$PUBF_HOME/completed/$PUBF_MARKER")"
 : > "$TDIR/recover-oracle-sentinel"
 recover_run "$PUBF_HOME" --recover "$PUBF_MARKER" --out "$TDIR/no-such-parent-dir/out.md" --timeout 1s
@@ -6554,6 +6582,7 @@ check 'a recorded absolute OUT with a dead parent never creates the dead parent 
 # harvest path (the artifact-first fast path above never reads REC_SELECTED_OUT).
 RECVALID_HOME="$TDIR/home-recover-validout"
 RECVALID_MARKER='pg-run-acme-widgets-804-1700012100-1'
+seed_review_tokens "$RECVALID_HOME" "$RECVALID_MARKER"
 mkdir -p "$RECVALID_HOME/run-meta"
 printf 'github.com\tacme\twidgets\tacme-widgets-804\t804\t%s\t1700012200\n' "$TDIR/recover-validout-target.md" \
   > "$RECVALID_HOME/run-meta/$RECVALID_MARKER"
@@ -6580,6 +6609,7 @@ check 'a recorded valid absolute OUT is still used to publish the recovered arti
 echo '# gate #91 P2 (:199): recover harvest-delegation exposes one plain state line, not raw --harvest noise'
 RECNOISE_HOME="$TDIR/home-recover-noise"
 RECNOISE_MARKER='pg-run-acme-widgets-701-1700010600-1'
+seed_review_tokens "$RECNOISE_HOME" "$RECNOISE_MARKER"
 { printf 'run marker: %s\n' "$RECNOISE_MARKER"
   printf '[P1] src/noise.sh:1 - noisy finding\n  Why: leak check\nP2: none\nP3: none\nVERDICT: SHIP - noise. (run marker: %s)\n' \
     "$RECNOISE_MARKER" "$RECNOISE_MARKER"
@@ -6608,6 +6638,7 @@ check 'recover harvest-delegation success stderr is exactly one plain state line
 echo '# gate #91 P1 (:271): recover ignores a concurrently mutated --out, using the RESULT_FILE locator/captured body instead'
 RECRACE_HOME="$TDIR/home-recover-race-out"
 RECRACE_MARKER='pg-run-acme-widgets-705-1700011000-1'
+seed_review_tokens "$RECRACE_HOME" "$RECRACE_MARKER"
 { printf 'run marker: %s\n' "$RECRACE_MARKER"
   printf '[P1] src/race.sh:1 - race fixture\n  Why: out-mutation race check\nP2: none\nP3: none\nVERDICT: SHIP - race. (run marker: %s)\n' \
     "$RECRACE_MARKER" "$RECRACE_MARKER"
@@ -6643,6 +6674,7 @@ check 'recover under a continuous --out race still reports the plain success sta
 echo '# gate #91 P1 (:271): a locator naming a non-review file falls back to the captured review body, still ignoring a raced --out'
 RECRACE2_HOME="$TDIR/home-recover-race-artifact"
 RECRACE2_MARKER='pg-run-acme-widgets-706-1700011100-1'
+seed_review_tokens "$RECRACE2_HOME" "$RECRACE2_MARKER"
 { printf 'run marker: %s\n' "$RECRACE2_MARKER"
   printf '[P1] src/race2.sh:1 - locator fallback fixture\n  Why: locator-invalid race check\nP2: none\nP3: none\nVERDICT: SHIP - race2. (run marker: %s)\n' \
     "$RECRACE2_MARKER" "$RECRACE2_MARKER"
@@ -6715,6 +6747,7 @@ check 'recover with a racing completed artifact and racing --out prints the REAL
 echo '# gate #91 round3 P1 (:304): recover with locator AND captured body both invalid fails closed, never reading $OUT'
 RECFINAL_HOME="$TDIR/home-recover-final-fallback"
 RECFINAL_MARKER='pg-run-acme-widgets-708-1700011300-1'
+seed_review_tokens "$RECFINAL_HOME" "$RECFINAL_MARKER"
 { printf 'run marker: %s\n' "$RECFINAL_MARKER"
   printf '[P1] src/final.sh:1 - third-rung fixture\n  Why: OUT-fallback removal check\nP2: none\nP3: none\nVERDICT: SHIP - final. (run marker: %s)\n' \
     "$RECFINAL_MARKER" "$RECFINAL_MARKER"
@@ -6894,6 +6927,7 @@ check 'neither failure state dispatched oracle' "$([ ! -s "$TDIR/recover-oracle-
 # RECNOISE_MARKER's review is already durable from the success case above, so reusing it here
 # would take the artifact-first fast path (no harvest, no noise to gate at all).
 RECVERBOSE_MARKER='pg-run-acme-widgets-704-1700010900-1'
+seed_review_tokens "$RECNOISE_HOME" "$RECVERBOSE_MARKER"
 { printf 'run marker: %s\n' "$RECVERBOSE_MARKER"
   printf '[P1] src/verbose.sh:1 - verbose fixture\n  Why: opt-in check\nP2: none\nP3: none\nVERDICT: SHIP - verbose. (run marker: %s)\n' \
     "$RECVERBOSE_MARKER" "$RECVERBOSE_MARKER"
@@ -7828,7 +7862,7 @@ out=""
 while [ $# -gt 0 ]; do
   case "$1" in --write-output) out="$2"; shift 2;; *) shift;; esac
 done
-printf 'P0: none\nP1: none\nP2: none\nP3: none\nVERDICT: SHIP - fixture.\n' > "$out"
+printf 'P0: none\nP1: none\nP2: none\nP3: none\nChecked fresh.txt for failure handling.\nVERDICT: SHIP - fixture.\n' > "$out"
 FRESH_ORACLE
 chmod +x "$TDIR/fresh-bin/oracle"
 fresh_reset_state() {

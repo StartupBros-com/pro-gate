@@ -17,8 +17,10 @@ Conventions in this file:
 
 ## Version Timeline
 
+<!-- prettier-ignore -->
 | Version | Date | Artifact | Theme |
 |---|---|---|---|
+| v0.62.0 | 2026-10-14 | Pending release | Empty verdict skeletons now fail with exit 6 and outcome `template-verdict` instead of counting as a clean review. After severity label lines and the verdict are removed, a review must name a path or shaped identifier from its reviewed diff; the retained token index lets later harvests check the same payload without fetching again. Every run ledger row carries `body_bytes` and `names_nothing`, and salvage waits within its existing budget for an assistant paragraph beyond the verdict block (#262). |
 | v0.60.1 | 2026-10-03 | Pending release | A confirming pass (`--confirm`) now rechecks every prior P0, P1 and P2 finding as RESOLVED (with the fix's file:line) or STILL-PRESENT before reporting new findings; it rechecked only P0/P1, so a prior P2 left unfixed was neither rechecked nor new and could drop out of the follow-up review. P3 nits are still not rechecked, and the round governor still scores only P0/P1 lines. The full diff, output format, verdicts and input modes are unchanged (#252) |
 | v0.60.0 | 2026-09-29 | Pending release | A send that produced no ChatGPT conversation (`recovery-exhausted`, proof `no-conversation-after-send`) no longer spends a governor round when its attempt-time delivery evidence is known: its disposition is written as v2 with that evidence, it counts toward `delivery-failed-unchanged` alongside proven no-sends, and cleanup refunds its exact round epoch. With unknown evidence it keeps the v1 record and its round, since nothing else would bound a repeat. The ledger reason stays `no-conversation`. v0.59.x cannot read the new record (#246). |
 | v0.59.1 | 2026-09-29 | Pending release | The Node salvage helper no longer trims `salvage-nonmatching.txt` to its newest 500 lines past 800; like every other writer it only appends, so a resolved memo claim's fingerprint line and a concurrent shell append can no longer be dropped. Node memo pruning treats a symlinked review-input binding as unreadable, which protects its claims, matching the shell's reader |
@@ -315,14 +317,14 @@ four unbindable harvests, then exit 6 — the only unresolved exit-9 marker in ~
 rows) and pro-gate#66 (escaped by hand). The nonce guard was **working correctly** in both
 — the captures it rejected were genuinely another PR's review, citing another repo's files.
 The defect was upstream of it: `cdp-salvage` decided "this conversation is ours" from a bare
-full-page substring match on the run marker, and the marker rides the submitted *prompt*, so
+full-page substring match on the run marker, and the marker rides the submitted _prompt_, so
 a mis-navigated render could show our prompt above someone else's finished answer. That page
 was then memoized as ours — and because a remembered URL is exempt from blacklisting, the
 memo stayed poisoned permanently, while the harvest path had no way to expire a reservation
 (`pg_reservation_reconcile` ran only in fresh dispatch, and fresh runs are redirected to the
 reservation before they can submit — both exits closed).
 
-Fix: ownership now requires the *answer* to be ours. A page whose completed verdict echoes a
+Fix: ownership now requires the _answer_ to be ours. A page whose completed verdict echoes a
 different run's marker is that run's conversation regardless of prompt text — but only when
 that verdict sits AFTER our prompt, since a reused conversation legitimately holds an older
 round's verdict above it and convicting on scrollback would blacklist the live conversation.

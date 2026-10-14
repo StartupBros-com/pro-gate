@@ -2261,6 +2261,7 @@ pg_publish_out() {  # $1 = verified snapshot → atomically publish to $OUT; rc 
   # $OUT is a readable regular file afterwards (an existing directory or a failed rename is
   # a publication FAILURE, never silently "done" — gate #54 r9).
   local src="$1" rc=1
+  pg_require_review_shape "$src"
   if cp "$src" "$OUT.pub.$$" 2>/dev/null && mv -f "$OUT.pub.$$" "$OUT" 2>/dev/null \
      && [ -f "$OUT" ] && [ ! -d "$OUT" ]; then rc=0; fi
   rm -f "$OUT.pub.$$" 2>/dev/null
@@ -2273,6 +2274,7 @@ pg_persist_result() {  # $1 = verified snapshot — persist the CANONICAL, marke
   # two runs sharing it can both "win" a rename, and cross-feeding callers is worse than a
   # non-preferred path.
   local src="$1" input_binding
+  pg_require_review_shape "$src"
   if [ -n "$(pg_capture_foreign_echo "$src" "$RUN_MARKER")" ]; then
     PG_PRESERVE_STATE=1; PG_KEEP_FINAL=1
     echo "ERROR: result has invalid ownership; evidence retained at $src. Nothing persisted; do not respend." >&2
@@ -2523,6 +2525,36 @@ pg_salvage_fail_reason() { # fail detail
   esac
 }
 
+pg_check_review_shape() { # private capture, before any publication or completion bookkeeping
+  local body="$1" tokens="${PG_REVIEW_TOKENS_FILE:-$(pg_review_tokens_dir)/${RUN_MARKER:-}}" fallback
+  if [ ! -r "$tokens" ] && [ -r "${DIFF_FILE:-}" ]; then
+    tokens="$WORK/review.tokens"
+    pg_review_tokens "$DIFF_FILE" > "$tokens" || return 1
+  elif [ ! -r "$tokens" ] && [ -r "$(pg_manifest_dir)/${RUN_MARKER:-}" ]; then
+    # Pre-upgrade harvests retain paths only; identifiers cannot be proven from that manifest.
+    fallback="$(pg_manifest_dir)/${RUN_MARKER}"
+    tokens="$WORK/review.tokens"
+    pg_review_tokens "$fallback" > "$tokens" || return 1
+    # Successful collection removes the old manifest. Preserve its vocabulary for subsequent
+    # completed-artifact replays as well as this invocation's private acceptance checks.
+    pg_review_tokens_write "$RUN_MARKER" "$fallback" 2>/dev/null \
+      || echo '[oracle-review] WARNING: could not retain legacy review vocabulary for later replay.' >&2
+  fi
+  PG_REVIEW_TOKENS_FILE="$tokens"
+  TEMPLATE_VERDICT=0
+  if pg_review_shape "$body" "$tokens"; then return 0; fi
+  TEMPLATE_VERDICT=1
+  pg_salvage_class_write "${RUN_MARKER:-}" template-verdict 2>/dev/null || true
+  echo "[oracle-review] template-verdict: review names no path or identifier from the reviewed diff (${PG_BODY_BYTES} bytes)." >&2
+  return 1
+}
+
+pg_require_review_shape() { # final acceptance boundary (including saved-result replays)
+  pg_check_review_shape "$1" && return 0
+  pg_status failed "template-verdict: review names nothing from the reviewed diff"
+  pg_finish 6
+}
+
 pg_finish() {  # $1 exit code — settle organization, ramp, and ledger exactly once, then exit
   local rc="$1" outcome dur now pre_slot_secs post_slot_secs kind line model_label fsrc title_memo=""
   # Revoke every sleeping early organizer before anything at the terminal boundary can settle.
@@ -2573,6 +2605,13 @@ pg_finish() {  # $1 exit code — settle organization, ramp, and ledger exactly 
   # bytes and the ledger digest; a shared --out can be reused by unrelated markers.
   fsrc="${PG_FINAL_SRC:-$OUT}"
   [ -s "$fsrc" ] || fsrc="$OUT"
+  if [ "$rc" = 0 ] && ! pg_check_review_shape "$fsrc"; then
+    rc=6
+    pg_status failed "template-verdict: review names nothing from the reviewed diff"
+  elif [ "$rc" = 0 ]; then
+    # Count the returned body after nonce stripping, exactly as persisted and hashed below.
+    PG_BODY_BYTES="$(wc -c < "$fsrc" | tr -d '[:space:]')"
+  fi
   OUT_SHA=""
   if [ "$rc" = 0 ] && [ -n "${RUN_MARKER:-}" ] && [ -s "$fsrc" ]; then
     # Persist EXACTLY ONCE (gate #54 r12): when pg_persist_result already ran, a retry here
@@ -2640,11 +2679,13 @@ pg_finish() {  # $1 exit code — settle organization, ramp, and ledger exactly 
   esac
   [ "${THROTTLED:-0}" = 1 ] && outcome=throttle
   [ "${CLOUDFLARE:-0}" = 1 ] && outcome=cloudflare
+  [ "${TEMPLATE_VERDICT:-0}" = 1 ] && outcome=template-verdict
   # Harvests spend no Pro slot and never teach the ramp. Fresh clean/throttle/failure outcomes do;
   # Cloudflare records its distinct ledger outcome while feeding the same account-level backoff.
   if [ "${HARVEST:-0}" != 1 ]; then
     case "$outcome" in
       clean|throttle|failed) pg_ramp_update "$outcome" "${MAX_CONC:-1}" ;;
+      template-verdict)      pg_ramp_update failed "${MAX_CONC:-1}" ;;
       cloudflare)            pg_ramp_update throttle "${MAX_CONC:-1}" ;;
     esac
   fi
@@ -2657,7 +2698,10 @@ pg_finish() {  # $1 exit code — settle organization, ramp, and ledger exactly 
   # pg_status already JSON-escaped for the .status file. Both are empty (present, not absent)
   # on every non-failure row, matching the v0.27 marker/round_key convention.
   local reason="" fail_detail=""
-  if [ "$outcome" = failed ]; then
+  if [ "$outcome" = template-verdict ]; then
+    reason=template-verdict
+    fail_detail="${PG_FAIL_DETAIL:-template-verdict: review names nothing from the reviewed diff}"
+  elif [ "$outcome" = failed ]; then
     fail_detail="${PG_FAIL_DETAIL:-}"
     if [ "${_svc_restarted:-0}" = 1 ]; then
       reason=browser-restart
@@ -2684,13 +2728,15 @@ pg_finish() {  # $1 exit code — settle organization, ramp, and ledger exactly 
       --argjson conc "${EFF_CONC:-0}" --argjson ceiling "${MAX_CONC:-1}" \
       --argjson live "${LIVE_CONVERSATION:-0}" --argjson salvaged "${SALVAGED:-0}" \
       --argjson diff_lines "${DIFF_LINES:-0}" --arg out "$OUT" --arg model "$model_label" \
+      --argjson body_bytes "${PG_BODY_BYTES:-0}" --argjson names_nothing "${PG_NAMES_NOTHING:-false}" \
       --arg marker "${RUN_MARKER:-}" --arg round_key "${ROUND_KEY:-}" --arg sha256 "$OUT_SHA" \
       --arg reason "$reason" --arg detail "$fail_detail" \
-      '{ts:$ts,pr:$pr,repo:$repo,exit:$exit,outcome:$outcome,secs:$secs,pre_slot_secs:$pre_slot_secs,post_slot_secs:$post_slot_secs,kind:$kind,attempts:$attempts,conc:$conc,ceiling:$ceiling,live:$live,salvaged:$salvaged,diff_lines:$diff_lines,out:$out,model:$model,marker:$marker,round_key:$round_key,sha256:$sha256,reason:$reason,detail:$detail}' 2>/dev/null)"
+      '{ts:$ts,pr:$pr,repo:$repo,exit:$exit,outcome:$outcome,secs:$secs,pre_slot_secs:$pre_slot_secs,post_slot_secs:$post_slot_secs,kind:$kind,attempts:$attempts,conc:$conc,ceiling:$ceiling,live:$live,salvaged:$salvaged,diff_lines:$diff_lines,body_bytes:$body_bytes,names_nothing:$names_nothing,out:$out,model:$model,marker:$marker,round_key:$round_key,sha256:$sha256,reason:$reason,detail:$detail}' 2>/dev/null)"
   else
-    line="$(printf '{"ts":"%s","pr":"%s","exit":%d,"outcome":"%s","secs":%d,"pre_slot_secs":%d,"post_slot_secs":%d,"kind":"%s","attempts":%d,"conc":%d,"ceiling":%d,"live":%d,"salvaged":%d,"out":"%s","model":"%s","marker":"%s","round_key":"%s","sha256":"%s","reason":"%s","detail":"%s"}' \
+    line="$(printf '{"ts":"%s","pr":"%s","exit":%d,"outcome":"%s","secs":%d,"pre_slot_secs":%d,"post_slot_secs":%d,"kind":"%s","attempts":%d,"conc":%d,"ceiling":%d,"live":%d,"salvaged":%d,"body_bytes":%d,"names_nothing":%s,"out":"%s","model":"%s","marker":"%s","round_key":"%s","sha256":"%s","reason":"%s","detail":"%s"}' \
       "$(date +%Y-%m-%dT%H:%M:%S%z)" "${PR_NUM:-diff}" "$rc" "$outcome" "$dur" "$pre_slot_secs" "$post_slot_secs" "$kind" "${attempt:-0}" \
       "${EFF_CONC:-0}" "${MAX_CONC:-1}" "${LIVE_CONVERSATION:-0}" "${SALVAGED:-0}" \
+      "${PG_BODY_BYTES:-0}" "${PG_NAMES_NOTHING:-false}" \
       "$(printf '%s' "$OUT" | tr -d '"\\' | tr '\n' ' ')" \
       "$(printf '%s' "$model_label" | tr -d '"\\' | tr '\n' ' ')" \
       "$(printf '%s' "${RUN_MARKER:-}" | tr -d '"\\' | tr '\n' ' ')" \
@@ -2740,6 +2786,7 @@ if [ -n "$HARVEST_MARKER" ] && pg_reservation_marker_ok "$HARVEST_MARKER" \
       pg_finish 6
     fi
     PG_FINAL_SRC="$FASTPATH_SNAP"
+    pg_require_review_shape "$PG_FINAL_SRC"
     PG_RESULT_DURABLE=1
     SALVAGED=1
     # Retire any leftover reservation/manifest for this marker (gate #54 r7): a crash between
@@ -2992,6 +3039,7 @@ if [ -n "$HARVEST_MARKER" ]; then
     # Only now—after structural, nonce, and provenance acceptance—may the exact CDP source URL
     # narrow finalization. A merely observed candidate never gains mutation authority.
     PG_ACCEPTED_URL="${HARVEST_URL:-}"
+    pg_require_review_shape "$HARVEST_TMP"
     pg_strip_nonce "$HARVEST_TMP" "$RUN_MARKER"
     # Private verified snapshot is the authoritative return (gate #54 r6): $OUT is
     # publication only — a concurrent marker sharing the caller's --out cannot change what
@@ -3021,12 +3069,19 @@ if [ -n "$HARVEST_MARKER" ]; then
   # deleted the only copy: HARVEST_TMP comes straight from cdp-salvage stdout and is mirrored
   # nowhere, so the loss was total (gate #166 r3 P1).
   HARVEST_KEEP=""
+  if [ "$HARVEST_RC" -eq 6 ] && [ -s "$HARVEST_TMP" ]; then
+    SALVAGED=1
+    pg_check_review_shape "$HARVEST_TMP" || true
+  fi
   if [ "$HARVEST_RC" -eq 0 ] && [ -s "$HARVEST_TMP" ]; then
     HARVEST_KEEP="$OUT.unrecognized.$$"
     cp "$HARVEST_TMP" "$HARVEST_KEEP" 2>/dev/null || HARVEST_KEEP=""
   fi
   rm -f "$HARVEST_TMP"
   case "$HARVEST_RC" in
+    6) # The helper waited its full budget on an answer containing only the verdict block.
+       pg_status failed "template-verdict: salvage budget exhausted without review rationale"
+       pg_finish 6 ;;
     0) # Salvage SUCCEEDED and returned text; it just did not validate as a review. The
        # generic arm below blamed browser/CDP health and told the operator to retry, which
        # against static, already-generated text can never succeed. Name the real cause and
@@ -3368,6 +3423,10 @@ fi
 # gives --diff runs a real per-change identity instead of the shared literal "diff", so their
 # exit-9 reservations can redirect same-branch re-runs to harvest like PR runs always could.
 RUN_MARKER="pg-run-${ROUND_KEY:-diff}-$(date +%s)-$$"
+pg_review_tokens_write "$RUN_MARKER" "$DIFF_FILE" || {
+  pg_status failed "could not retain reviewed diff tokens; no review submitted"
+  pg_finish 3
+}
 # The marker is minted before queue/slot acquisition, but recovery metadata is published only
 # together with the authoritative charge (the adjacent pg_round_record + charged
 # pg_run_meta_write below, near pg_round_record's call site). An attempt that never charges a
@@ -4501,7 +4560,7 @@ while :; do
   fi
   # Accept ONLY a real review, not just any non-empty file — a corrupted capture (e.g. a stray "A")
   # must NOT pass as success; it falls through to salvage + retry below.
-  if pg_is_review "$CAPTURE_OUT"; then
+  if pg_is_review "$CAPTURE_OUT" && pg_check_review_shape "$CAPTURE_OUT"; then
     echo "[oracle-review] findings written ($(wc -c < "$CAPTURE_OUT" 2>/dev/null) bytes)." >&2; break
   fi
   if [ -s "$CAPTURE_OUT" ]; then
@@ -4565,7 +4624,8 @@ while :; do
   else
     echo "[oracle-review] no output — bounded salvage via reattach (session ${SLUG}, ${REATTACH_TIMEOUT}s)..." >&2
     pg_status salvaging "reattach ${SLUG}"
-    if pg_reattach_render "$SLUG" "$CAPTURE_OUT" "$REATTACH_TIMEOUT"; then
+    if pg_reattach_render "$SLUG" "$CAPTURE_OUT" "$REATTACH_TIMEOUT" \
+       && pg_check_review_shape "$CAPTURE_OUT"; then
       REATTACHED=1   # v0.28: browser-matched capture — subject to the provenance choke below
       CAPTURE_SOURCE=reattach   # gate #54 r3: reattach ALSO sets SALVAGED, so the memo-
                                 # invalidation guard must discriminate by source, not SALVAGED
@@ -4672,7 +4732,8 @@ MODEL_WARN="$(pg_derive_model_warn "$RESOLVED_MODEL" "$MODEL_STATUS")"
 # essentially every review (100% of clean runs 2026-07-22 → 08-03 landed via salvage/harvest).
 # Skip salvage entirely on a Cloudflare challenge: the submission never landed (nothing to
 # collect), and rendering conversation pages against a challenged account only deepens the block.
-if ! pg_is_review "$CAPTURE_OUT" && [ "${CLOUDFLARE:-0}" != 1 ] && command -v node >/dev/null 2>&1; then
+if { ! pg_is_review "$CAPTURE_OUT" || ! pg_check_review_shape "$CAPTURE_OUT"; } \
+   && [ "${CLOUDFLARE:-0}" != 1 ] && command -v node >/dev/null 2>&1; then
   # Live conversation (v0.14 probe hit): the review may still be thinking, so
   # wait with the full hard-cap budget; otherwise a short window suffices.
   # v0.30.1: the non-live window is its own knob. It used to ride PRO_GATE_STALL_SECS, so
@@ -4696,7 +4757,10 @@ if ! pg_is_review "$CAPTURE_OUT" && [ "${CLOUDFLARE:-0}" != 1 ] && command -v no
   SALVAGE_RAN=1
   SALVAGE_TMP="$WORK/salvage.capture"
   node "$SELF/cdp-salvage.mjs" "$RUN_MARKER" "$SALVAGE_SECS" "$PORT" > "$SALVAGE_TMP" 2>>"$RUNLOG" || SALVAGE_RC=$?
-  if [ "$SALVAGE_RC" -eq 0 ] && pg_is_review "$SALVAGE_TMP" \
+  if [ "$SALVAGE_RC" -eq 6 ] && [ -s "$SALVAGE_TMP" ]; then
+    pg_check_review_shape "$SALVAGE_TMP" || true
+  fi
+  if [ "$SALVAGE_RC" -eq 0 ] && pg_is_review "$SALVAGE_TMP" && pg_check_review_shape "$SALVAGE_TMP" \
      && mv "$SALVAGE_TMP" "$CAPTURE_OUT" 2>/dev/null; then
     # Checked install (gate #54 r10): SALVAGED is claimed only once the capture actually
     # reached CAPTURE_OUT; an install failure preserves instead of falling through to a
@@ -4704,7 +4768,8 @@ if ! pg_is_review "$CAPTURE_OUT" && [ "${CLOUDFLARE:-0}" != 1 ] && command -v no
     echo "[oracle-review] CDP salvage recovered a completed review." >&2
     SALVAGED=1
     CAPTURE_SOURCE=cdp   # this capture's source URL IS the marker's memo — invalidatable
-  elif [ "$SALVAGE_RC" -eq 0 ] && [ -s "$SALVAGE_TMP" ] && pg_is_review "$SALVAGE_TMP"; then
+  elif [ "$SALVAGE_RC" -eq 0 ] && [ -s "$SALVAGE_TMP" ] && pg_is_review "$SALVAGE_TMP" \
+       && [ "${TEMPLATE_VERDICT:-0}" != 1 ]; then
     SALVAGE_PRESERVE=1
     echo "[oracle-review] salvage captured a review but could not install it; preserving the run." >&2
   else
@@ -4726,7 +4791,7 @@ if ! pg_is_review "$CAPTURE_OUT" && [ "${CLOUDFLARE:-0}" != 1 ] && command -v no
   # instead of falling through to exit 6, which both closes the conversation and leaves no
   # reservation to stop the next invocation spending a second Pro slot on a review that exists.
   case "$SALVAGE_RC" in
-    4) : ;;
+    4|6) : ;;
     10)
       if [ -n "${PR_NUM:-}" ] && [ -n "${PG_META_HOST:-}" ] && [ -n "${PG_META_OWNER:-}" ] && [ -n "${PG_META_REPO:-}" ] \
          && pg_attempt_terminal_transition "$PG_META_HOST" "$PG_META_OWNER" "$PG_META_REPO" "$PR_NUM" \
@@ -4738,7 +4803,7 @@ if ! pg_is_review "$CAPTURE_OUT" && [ "${CLOUDFLARE:-0}" != 1 ] && command -v no
         echo "[oracle-review] terminal infrastructure evidence could not be persisted safely; preserving recovery state." >&2
       fi
       ;;
-    0) [ "${SALVAGED:-0}" = 1 ] || SALVAGE_PRESERVE=1 ;;
+    0) [ "${SALVAGED:-0}" = 1 ] || [ "${TEMPLATE_VERDICT:-0}" = 1 ] || SALVAGE_PRESERVE=1 ;;
     *) SALVAGE_PRESERVE=1 ;;
   esac
 fi
@@ -4760,9 +4825,10 @@ fi
 # oracle captures keep the inherent instant between oracle's write and this copy — a caller
 # sharing one --out across concurrent DIRECT runs is outside the engine's control.)
 FINAL_SNAP=""
-if pg_is_review "$CAPTURE_OUT" && cp "$CAPTURE_OUT" "$WORK/final.snap" 2>/dev/null && pg_is_review "$WORK/final.snap"; then
+if pg_is_review "$CAPTURE_OUT" && pg_check_review_shape "$CAPTURE_OUT" \
+   && cp "$CAPTURE_OUT" "$WORK/final.snap" 2>/dev/null && pg_is_review "$WORK/final.snap"; then
   FINAL_SNAP="$WORK/final.snap"
-elif pg_is_review "$CAPTURE_OUT"; then
+elif pg_is_review "$CAPTURE_OUT" && [ "${TEMPLATE_VERDICT:-0}" != 1 ]; then
   # A VALID capture that could not be snapshotted (disk full, WORK trouble) must not fall
   # through to the state-clearing generic exit 6 with its bytes forgotten (gate #54 r11):
   # preserve the run — the capture stays at $CAPTURE_OUT and the tab/reservation survive.

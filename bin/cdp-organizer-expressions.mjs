@@ -97,20 +97,29 @@ export function reviewVerdictClaims(text, marker) {
 }
 
 export function reviewTextContext(text, marker, promptAt = null) {
+  const assistantScoped = promptAt === 0;
   const scanned = reviewVerdictClaims(text, marker);
   const all = scanned.claims;
   // DOM user-turn scope is authoritative. Legacy text sources retain the known prompt-line
   // shapes only; a prose marker mention cannot erase an earlier verdict.
   if (promptAt === null) promptAt = scanned.promptAt;
   const claims = all.filter((claim) => claim.at > promptAt);
-  const markers = new Set(claims.flatMap((claim) => claim.markers.map((value) => value.toLowerCase())));
-  const mixed = markers.has(marker.toLowerCase()) && [...markers].some((value) => value !== marker.toLowerCase());
+  const markers = new Set(
+    claims.flatMap((claim) => claim.markers.map((value) => value.toLowerCase())),
+  );
+  const mixed =
+    markers.has(marker.toLowerCase()) &&
+    [...markers].some((value) => value !== marker.toLowerCase());
   const verdict = claims.at(-1) ?? all.at(-1) ?? null;
   let review = null;
   if (verdict) {
     if (mixed) {
       const from = promptAt < 0 ? 0 : text.indexOf('\n', promptAt) + 1;
       review = text.slice(from, verdict.at + verdict.line.length).trim();
+    } else if (assistantScoped && verdict.at > promptAt) {
+      // #262: readReviewText has removed the marked user prompt. Preserve assistant prose
+      // before P0 as well as after it, so real rationale cannot become a verdict skeleton.
+      review = text.slice(text.indexOf('\n') + 1, verdict.at + verdict.line.length).trim();
     } else {
       const lines = text.split('\n');
       let at = 0;
@@ -118,12 +127,20 @@ export function reviewTextContext(text, marker, promptAt = null) {
       let end = -1;
       for (let i = 0; i < lines.length; i++) {
         if (at === verdict.at) end = i;
-        if (at <= verdict.at && (verdict.at < promptAt || at > promptAt) && start < 0 &&
-            /^\s*[*_>#-]*\s*(P0\s*[:\-]|P0\b|\[P[0-3]\])/i.test(lines[i].trim())) start = i;
+        if (
+          at <= verdict.at &&
+          (verdict.at < promptAt || at > promptAt) &&
+          start < 0 &&
+          /^\s*[*_>#-]*\s*(P0\s*[:\-]|P0\b|\[P[0-3]\])/i.test(lines[i].trim())
+        )
+          start = i;
         at += lines[i].length + 1;
       }
       if (start < 0) start = Math.max(0, end - 120);
-      review = lines.slice(start, end + 1).join('\n').trim();
+      review = lines
+        .slice(start, end + 1)
+        .join('\n')
+        .trim();
     }
   }
   return { claims, verdict, mixed, review, promptAt };

@@ -1024,7 +1024,7 @@ daemon_legacy_row_has_durable_evidence(){ # nwo num sha -> rc 0 when durable evi
       *) continue ;; # connector: never SHIP merge-eligibility authority
     esac
     found=0; break
-  done < <(jq -r --arg rk "$round_key" 'select(.outcome=="clean" and (.round_key // "")==$rk) | .marker // empty' "$ledger" 2>/dev/null)
+  done < <(jq -r --arg rk "$round_key" 'select(.outcome=="clean" and .names_nothing!=true and (.round_key // "")==$rk) | .marker // empty' "$ledger" 2>/dev/null)
   return "$found"
 }
 

@@ -664,23 +664,29 @@ function seedOrganizer(marker, title, url = null, review = null) {
   };
 }
 
-const completedReview = (marker, summary = 'owned') => [
-  'P0: none',
-  'P1: none',
-  'P2: none',
-  'P3: none',
-  `VERDICT: SHIP — ${summary}. (run marker: ${marker})`,
-].join('\n');
+const completedReview = (marker, summary = 'owned') =>
+  [
+    'P0: none',
+    'P1: none',
+    'P2: none',
+    'P3: none',
+    'Checked src/review-engine.ts and classifyReview for failure handling.',
+    `VERDICT: SHIP — ${summary}. (run marker: ${marker})`,
+  ].join('\n');
 // #167: mirrors bin/cdp-salvage.mjs's asciiFold. The engine's pg_strip_nonce and the browser-side
 // stripMarkerEcho both remove the echo case-insensitively, so this test-side reimplementation must
 // too — otherwise a lowercased-echo fixture would produce durable bytes the finalizer's own strip
 // disagrees with, and the fixture would fail as result-mismatch for a reason that is not the code.
-const testAsciiFold = (value) => String(value ?? '').replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
+const testAsciiFold = (value) =>
+  String(value ?? '').replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
 const durableReview = (review, marker) => {
   const lines = review.split('\n');
   let verdict = -1;
   for (let i = lines.length - 1; i >= 0; i -= 1) {
-    if (/^\s*[*_>#-]*\s*VERDICT[*_\s]*:/i.test(lines[i])) { verdict = i; break; }
+    if (/^\s*[*_>#-]*\s*VERDICT[*_\s]*:/i.test(lines[i])) {
+      verdict = i;
+      break;
+    }
   }
   let start = -1;
   for (let i = verdict; i >= 0; i -= 1) {
@@ -689,10 +695,13 @@ const durableReview = (review, marker) => {
   if (start < 0) start = Math.max(0, verdict - 120);
   const token = `(run marker: ${marker})`;
   const foldedToken = testAsciiFold(token);
-  return lines.slice(start, verdict + 1).map((line) => {
-    const at = testAsciiFold(line).indexOf(foldedToken);
-    return at < 0 ? line : `${line.slice(0, at)}${line.slice(at + token.length)}`;
-  }).join('\n')
+  return lines
+    .slice(start, verdict + 1)
+    .map((line) => {
+      const at = testAsciiFold(line).indexOf(foldedToken);
+      return at < 0 ? line : `${line.slice(0, at)}${line.slice(at + token.length)}`;
+    })
+    .join('\n')
     .replace(/[ \t]+$/gm, '')
     .trim();
 };
@@ -706,8 +715,12 @@ const finalizerArgs = (marker, { archive = true, rename = true, acceptedUrl = nu
 
 let failures = 0;
 function check(name, cond, detail) {
-  if (cond) { console.log(`ok - ${name}`); return; }
-  failures += 1; console.log(`FAIL - ${name}${detail ? `: ${detail}` : ''}`);
+  if (cond) {
+    console.log(`ok - ${name}`);
+    return;
+  }
+  failures += 1;
+  console.log(`FAIL - ${name}${detail ? `: ${detail}` : ''}`);
 }
 
 // Deadline fixtures use this test-private proof so a shorter test deadline never turns an
@@ -721,6 +734,87 @@ const MARKER = 'pg-run-test-1234567890-42';
 // ("pg-run-StartupBros-com-pro-gate-166-..."). Fixtures that vary the ECHO's case need a marker
 // whose case can actually vary — MARKER is already all-lowercase and cannot express the bug.
 const MIXED_MARKER = 'pg-run-Test-Case-1234567890-43';
+
+{
+  // #262: the final assistant turn contains only the requested verdict skeleton.
+  const skeleton = [
+    'P0: none',
+    'P1: none',
+    'P2: none',
+    'P3: none',
+    `VERDICT: SHIP (run marker: ${MARKER})`,
+  ].join('\n');
+  const cdp = await mockCdp(`run marker: ${MARKER}\n${skeleton}`);
+  const probe = await runFastPollSalvage(['--probe', MARKER, '1'], cdp.port);
+  check(
+    '#262 a skeleton probe proves liveness without reporting complete',
+    probe.status === 0 && /probe-state: generating/.test(probe.stderr),
+    probe.stderr,
+  );
+  const result = await runFastPollSalvage([MARKER, '1'], cdp.port);
+  check(
+    '#262 a skeleton waits out the budget then returns typed no-result',
+    result.status === 6 &&
+      /evidence-kind: template-verdict/.test(result.stderr) &&
+      result.elapsedMs >= 900 &&
+      /VERDICT: SHIP/.test(result.stdout),
+    JSON.stringify(result),
+  );
+  check('#262 rejected skeleton keeps its conversation open', !cdp.closed.includes('tab1'));
+  await cdp.stop();
+}
+
+{
+  // Rationale can arrive after the verdict block without buying another salvage invocation.
+  const skeleton = `run marker: ${MARKER}\nP0: none\nVERDICT: SHIP (run marker: ${MARKER})`;
+  const cdp = await mockCdp(skeleton);
+  const update = setTimeout(
+    () => cdp.setText(`run marker: ${MARKER}\n${completedReview(MARKER)}`),
+    250,
+  );
+  const result = await runFastPollSalvage([MARKER, '2'], cdp.port);
+  clearTimeout(update);
+  check(
+    '#262 a later assistant paragraph completes within the same budget',
+    result.status === 0 && /classifyReview/.test(result.stdout),
+    JSON.stringify(result),
+  );
+  await cdp.stop();
+}
+
+{
+  // #262: assistant rationale may precede the labels; user-prompt paths cannot supply it.
+  for (const hasRationale of [true, false]) {
+    const answer = `${hasRationale ? 'Checked src/review-engine.ts for failure handling.\n\n' : ''}P0: none\nP1: none\nP2: none\nP3: none\nVERDICT: SHIP (run marker: ${MARKER})`;
+    const turn = (role, text) => ({
+      innerText: text,
+      textContent: text,
+      children: [],
+      matches: () => false,
+      getAttribute: (name) => (name === 'data-message-author-role' ? role : null),
+    });
+    const turns = [
+      turn('user', `Review src/review-engine.ts; run marker: ${MARKER}`),
+      turn('assistant', answer),
+    ];
+    const document = {
+      body: { innerText: turns.map((value) => value.innerText).join('\n') },
+      querySelectorAll: () => turns,
+    };
+    const cdp = await mockCdp(document.body.innerText, [], { document });
+    const result = await runFastPollSalvage([MARKER, '1'], cdp.port);
+    check(
+      hasRationale
+        ? '#262 leading assistant rationale is retained in the capture'
+        : '#262 a path in the user prompt cannot rescue an assistant skeleton',
+      hasRationale
+        ? result.status === 0 && result.stdout === answer + '\n'
+        : result.status === 6 && !result.stdout.includes('src/review-engine.ts'),
+      JSON.stringify(result),
+    );
+    cdp.stop();
+  }
+}
 
 { // Direct poll-parser boundary coverage (bin/cdp-test-timing.mjs), called in-process — no spawn. Every
   // one of these is real production input shape: an unset/empty/malformed
@@ -930,7 +1024,7 @@ const MIXED_MARKER = 'pg-run-Test-Case-1234567890-43';
   const staleSource = `run marker: ${MARKER}\nReasoning about the diff...`;
   const serverReview = [
     `run marker: ${MARKER}`,
-    'P1: none',
+    'P1: none\nChecked classifyReview for failure handling.',
     `VERDICT: SHIP — server-complete. (run marker: ${MARKER})`,
   ].join('\n');
   const cdp = await mockCdp(staleSource, [], { renderText: (url) => url === canonicalUrl ? serverReview : '' });
@@ -1208,12 +1302,12 @@ const MIXED_MARKER = 'pg-run-Test-Case-1234567890-43';
 {
   // Mixed results remain intact as diagnostic capture evidence for the engine's provenance gate.
   const foreign = 'pg-run-other-repo-2619-1111111111-9';
-  const ours = ['P0: none', 'P1: none', 'VERDICT: SHIP — ours. (run marker: ' + MARKER + ')'];
+  const ours = ['P0: none\nChecked src/review-engine.ts for failure handling.', 'P1: none\nChecked classifyReview for failure handling.', 'VERDICT: SHIP — ours. (run marker: ' + MARKER + ')'];
   const theirs = [
     '[P0] other/a.ts:1 — foreign finding',
     'VERDICT: FIX-FIRST — theirs. (run marker: ' + foreign + ')',
   ];
-  const dual = ['P0: none', 'VERDICT: SHIP (run marker: ' + MARKER + ') (run marker: ' + foreign + ')'];
+  const dual = ['P0: none\nChecked src/review-engine.ts for failure handling.', 'VERDICT: SHIP (run marker: ' + MARKER + ') (run marker: ' + foreign + ')'];
   for (const [layout, answer] of [
     ['foreign first', [...theirs, '', ...ours]],
     ['foreign last', [...ours, '', ...theirs]],
@@ -1317,7 +1411,7 @@ const MIXED_MARKER = 'pg-run-Test-Case-1234567890-43';
     ['heading without decision', ['VERDICT: example from ' + foreign]],
   ]) {
     const answer = [
-      'P0: none',
+      'P0: none\nChecked src/review-engine.ts for failure handling.',
       '[P1] src/real.sh:4 — reference example',
       ...reference,
       'and the finding continues',
@@ -1343,7 +1437,7 @@ const MIXED_MARKER = 'pg-run-Test-Case-1234567890-43';
 
 {
   for (const label of ['- **VERDICT:**', '## **VERDICT:**']) {
-    const answer = 'P0: none\n' + label + ' SHIP — ours. (run marker: ' + MARKER + ')';
+    const answer = 'P0: none\nChecked src/review-engine.ts for failure handling.\n' + label + ' SHIP — ours. (run marker: ' + MARKER + ')';
     const cdp = await mockCdp('run marker: ' + MARKER + '\n' + answer);
     const capture = await runSalvage([MARKER, '3'], cdp.port);
     const binding = bindCapture(capture.stdout, MARKER);
@@ -1379,7 +1473,7 @@ const MIXED_MARKER = 'pg-run-Test-Case-1234567890-43';
   });
   for (const tag of ['blockquote', 'pre', 'code']) {
     const answer = [
-      'P0: none',
+      'P0: none\nChecked src/review-engine.ts for failure handling.',
       '[P1] src/real.sh:4 — incident example',
       example,
       '[P2] src/other.sh:9 — another finding',
@@ -1393,7 +1487,7 @@ const MIXED_MARKER = 'pg-run-Test-Case-1234567890-43';
     );
     const turns = [
       node('div', 'run marker: ' + foreign, [], 'user'),
-      node('div', 'P0: none\n' + example, [], 'assistant'),
+      node('div', 'P0: none\nChecked src/review-engine.ts for failure handling.\n' + example, [], 'assistant'),
       node('div', 'Please review this change. run marker: ' + MARKER, [], 'user'),
       ownAnswer,
     ];
@@ -1450,7 +1544,7 @@ const MIXED_MARKER = 'pg-run-Test-Case-1234567890-43';
     ['signed verdict fragment', 'VERDICT: FIX-FIRST (run marker: ' + MARKER + ')', ' — ours.'],
   ]) {
     const real = 'VERDICT: FIX-FIRST — ours. (run marker: ' + MARKER + ')';
-    const lines = ['P0: none', '[P1] src/real.sh:4 — regression', ...(suffix ? [] : [real]), code + suffix];
+    const lines = ['P0: none\nChecked src/review-engine.ts for failure handling.', '[P1] src/real.sh:4 — regression', ...(suffix ? [] : [real]), code + suffix];
     const last = node('p', code + suffix, [node('span', code, [node('code', code)])]);
     const turns = [
       node('div', 'run marker: ' + MARKER, [], 'user'),
@@ -1496,7 +1590,7 @@ const MIXED_MARKER = 'pg-run-Test-Case-1234567890-43';
   };
 
   {
-    const answerNodes = [node('p', 'P0: none'), verdictNode(MARKER, 'ours', true)];
+    const answerNodes = [node('p', 'P0: none\nChecked src/review-engine.ts for failure handling.'), verdictNode(MARKER, 'ours', true)];
     const answer = answerNodes.map((answerNode) => answerNode.innerText).join('\n');
     const document = reviewDocument(answerNodes);
     const cdp = await mockCdp(document.body.innerText, [], { document });
@@ -1537,7 +1631,7 @@ const MIXED_MARKER = 'pg-run-Test-Case-1234567890-43';
 
   {
     const foreign = 'pg-run-other-repo-2619-1111111111-9';
-    const ours = [node('p', 'P0: none'), verdictNode(MARKER, 'ours', false)];
+    const ours = [node('p', 'P0: none\nChecked src/review-engine.ts for failure handling.'), verdictNode(MARKER, 'ours', false)];
     const theirs = [
       node('p', '[P0] other/a.ts:1 — foreign finding'),
       verdictNode(foreign, 'theirs', true),
@@ -1598,7 +1692,7 @@ const MIXED_MARKER = 'pg-run-Test-Case-1234567890-43';
   }
 
   const answer = [
-    'P0: none',
+    'P0: none\nChecked src/review-engine.ts for failure handling.',
     example,
     '[P1] src/real.sh:4 — a literal prompt marker in a finding',
     'run marker: ' + MARKER,
@@ -1625,7 +1719,7 @@ const MIXED_MARKER = 'pg-run-Test-Case-1234567890-43';
   // and prove neither rename nor archive dispatches even its first event after mixed drift.
   const foreign = 'pg-run-other-repo-2619-1111111111-9';
   const ours = completedReview(MARKER);
-  const theirs = 'P0: none\nVERDICT: FIX-FIRST (run marker: ' + foreign + ')';
+  const theirs = 'P0: none\nChecked src/review-engine.ts for failure handling.\nVERDICT: FIX-FIRST (run marker: ' + foreign + ')';
   for (const [layout, mixed] of [
     ['foreign first', theirs + '\n' + ours],
     ['foreign last', ours + '\n' + theirs],
@@ -1662,7 +1756,7 @@ const MIXED_MARKER = 'pg-run-Test-Case-1234567890-43';
   // Text-only old foreign scrollback stays outside a newly completed owned response.
   const foreign = 'pg-run-other-repo-2619-1111111111-9';
   const old = ['[P0] other/a.ts:1 — old finding', 'VERDICT: FIX-FIRST (run marker: ' + foreign + ')'];
-  const answer = ['P0: none', 'P1: none', 'VERDICT: SHIP — ours. (run marker: ' + MARKER + ')'];
+  const answer = ['P0: none\nChecked src/review-engine.ts for failure handling.', 'P1: none\nChecked classifyReview for failure handling.', 'VERDICT: SHIP — ours. (run marker: ' + MARKER + ')'];
   const body = [
     ...old,
     '(run marker: ' + MARKER + ' — internal correlation id, echo on the verdict line)',
@@ -2439,8 +2533,8 @@ const FOREIGN_ANSWER = (m) => [
   const CONVICTED_URL = 'https://chatgpt.com/c/mock-conversation';
   const convicted = [
     `run marker: ${MIXED_MARKER}`,
-    'P0: none',
-    'P1: none',
+    'P0: none\nChecked src/review-engine.ts for failure handling.',
+    'P1: none\nChecked classifyReview for failure handling.',
     'P2: none',
     'P3: none',
     `VERDICT: SHIP — ours. (run marker: ${MIXED_MARKER.toLowerCase()})`,
@@ -2741,7 +2835,7 @@ const FOREIGN_ANSWER = (m) => [
 
 { // probe: a FINISHED review still probes as present forever (ChatGPT keeps conversations
   // server-side), which is exactly why presence alone must not hold account capacity (#82).
-  const cdp = await mockCdp(`run marker: ${MARKER}\nP0: none\n\nVERDICT: SHIP — fine. (run marker: ${MARKER})`);
+  const cdp = await mockCdp(`run marker: ${MARKER}\nP0: none\nChecked src/review-engine.ts for failure handling.\n\nVERDICT: SHIP — fine. (run marker: ${MARKER})`);
   const r = await runSalvage(['--probe', MARKER, '10'], cdp.port);
   check('probe still exits 0 when the review is complete', r.status === 0, `status=${r.status}`);
   check('probe reports complete once an owned VERDICT is present',
@@ -2963,8 +3057,8 @@ const FOREIGN_ANSWER = (m) => [
   const remembered = 'https://chatgpt.com/c/tabless-finalized';
   const body = [
     `run marker: ${MARKER}`,
-    'P0: none',
-    'P1: none',
+    'P0: none\nChecked src/review-engine.ts for failure handling.',
+    'P1: none\nChecked classifyReview for failure handling.',
     'P2: none',
     'P3: none',
     `VERDICT: SHIP — owned. (run marker: ${MARKER})`,
@@ -3143,8 +3237,8 @@ const FOREIGN_ANSWER = (m) => [
   const duplicate = { id: 'same-url-duplicate', url: 'https://chatgpt.com/c/mock-conversation' };
   const body = [
     `run marker: ${MARKER}`,
-    'P0: none',
-    'P1: none',
+    'P0: none\nChecked src/review-engine.ts for failure handling.',
+    'P1: none\nChecked classifyReview for failure handling.',
     'P2: none',
     'P3: none',
     `VERDICT: SHIP — owned. (run marker: ${MARKER})`,
@@ -3168,8 +3262,8 @@ const FOREIGN_ANSWER = (m) => [
   const duplicate = { id: 'same-url-drifted', url: 'https://chatgpt.com/c/mock-conversation' };
   const owned = [
     `run marker: ${MARKER}`,
-    'P0: none',
-    'P1: none',
+    'P0: none\nChecked src/review-engine.ts for failure handling.',
+    'P1: none\nChecked classifyReview for failure handling.',
     'P2: none',
     'P3: none',
     `VERDICT: SHIP — owned. (run marker: ${MARKER})`,
@@ -3548,7 +3642,7 @@ const FOREIGN_ANSWER = (m) => [
   check('archive expression verifies confirmation rather than trusting a click',
     /verifyArchivedStateFromMenu/.test(archiveExpression) && /hasArchiveToast/.test(archiveExpression));
   const formattedFixture = organizerExpressionFixture(
-    `run marker: ${MARKER}\nP0: none\n**VERDICT:** SHIP (run marker: ${MARKER})`,
+    `run marker: ${MARKER}\nP0: none\nChecked src/review-engine.ts for failure handling.\n**VERDICT:** SHIP (run marker: ${MARKER})`,
     { title: dangerousTitle },
   );
   const formattedResult = await runInNewContext(renameExpression, formattedFixture.context);
@@ -3651,7 +3745,7 @@ const FOREIGN_ANSWER = (m) => [
     q.status === 0 && /^probe-state: generating$/m.test(q.stderr || '') && q.cooldown === null,
     `status=${q.status} cooldown=${q.cooldown} stderr=${q.stderr?.slice(0, 300)}`);
   quoted.stop();
-  const finished = await mockCdp(`${quoting}\nP1: none\nVERDICT: SHIP — quotes the limiter copy. (run marker: ${MARKER})`);
+  const finished = await mockCdp(`${quoting}\nP1: none\nChecked classifyReview for failure handling.\nVERDICT: SHIP — quotes the limiter copy. (run marker: ${MARKER})`);
   const d = await runSalvage([MARKER, '3'], finished.port);
   check('quoted throttle copy inside a finished review is still extracted (exit 0, no cooldown)',
     d.status === 0 && /VERDICT: SHIP/.test(d.stdout) && d.cooldown === null,
@@ -5312,7 +5406,7 @@ for (const placeholder of PLACEHOLDER_URLS) {
     });
   };
   const newAnswer = (m) => [
-    `run marker: ${m}`, 'P1: none', 'P2: none', 'P3: none',
+    `run marker: ${m}`, 'P1: none\nChecked classifyReview for failure handling.', 'P2: none', 'P3: none',
     `VERDICT: SHIP — ours. (run marker: ${m})`,
   ].join('\n');
 
@@ -5375,7 +5469,7 @@ for (const placeholder of PLACEHOLDER_URLS) {
     });
   };
   const newAnswer = (m) => [
-    `run marker: ${m}`, 'P1: none', 'P2: none', 'P3: none',
+    `run marker: ${m}`, 'P1: none\nChecked classifyReview for failure handling.', 'P2: none', 'P3: none',
     `VERDICT: SHIP — ours. (run marker: ${m})`,
   ].join('\n');
 
@@ -5416,7 +5510,7 @@ for (const placeholder of PLACEHOLDER_URLS) {
     });
   };
   const newAnswer = (m) => [
-    `run marker: ${m}`, 'P1: none', 'P2: none', 'P3: none',
+    `run marker: ${m}`, 'P1: none\nChecked classifyReview for failure handling.', 'P2: none', 'P3: none',
     `VERDICT: SHIP — ours. (run marker: ${m})`,
   ].join('\n');
 
@@ -5464,7 +5558,7 @@ for (const placeholder of PLACEHOLDER_URLS) {
   };
   const NEW_MARKER = 'pg-run-memo-legacy-new-1700099500-9';
   const cdp = await mockCdp([
-    `run marker: ${NEW_MARKER}`, 'P1: none', 'P2: none', 'P3: none',
+    `run marker: ${NEW_MARKER}`, 'P1: none\nChecked classifyReview for failure handling.', 'P2: none', 'P3: none',
     `VERDICT: SHIP — ours. (run marker: ${NEW_MARKER})`,
   ].join('\n'));
   const r = await runSalvage([NEW_MARKER, '20'], cdp.port, seed);
@@ -5563,7 +5657,7 @@ for (const placeholder of PLACEHOLDER_URLS) {
   };
   const legacyEvidence = { mode: 'full-pr', proof: { base_oid: 'a'.repeat(40) } };
   const currentEvidence = { mode: 'full-pr', proof: { base_oid: 'a'.repeat(40), pr_metadata_digest: 'c'.repeat(64) } };
-  const owned = [`run marker: ${MARKER}`, 'P1: none', 'P2: none', 'P3: none', `VERDICT: SHIP — ours. (run marker: ${MARKER})`].join('\n');
+  const owned = [`run marker: ${MARKER}`, 'P1: none\nChecked classifyReview for failure handling.', 'P2: none', 'P3: none', `VERDICT: SHIP — ours. (run marker: ${MARKER})`].join('\n');
   const run = async (args, evidence) => {
     const cdp = await mockCdp(owned, [{ id: 'root1', type: 'page', url: 'https://chatgpt.com/' }]);
     const r = await runSalvage(args, cdp.port, seedSidecar(evidence));

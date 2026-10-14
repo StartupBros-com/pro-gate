@@ -780,7 +780,7 @@ pg_manifest_dir() { echo "${PRO_GATE_MANIFEST_DIR:-$PRO_GATE_HOME/manifests}"; }
 pg_salvage_class_dir() { printf '%s\n' "${PRO_GATE_SALVAGE_CLASS_DIR:-$PRO_GATE_HOME/salvage-class}"; }
 pg_salvage_class_ok() { # kind
   case "$1" in
-    owned-incomplete|inconclusive|browser-down|absent|cross-bound|throttle|terminal|terminal-infrastructure) return 0;;
+    owned-incomplete|inconclusive|browser-down|absent|cross-bound|throttle|terminal|terminal-infrastructure|template-verdict) return 0;;
     *) return 1;;
   esac
 }
@@ -3401,6 +3401,64 @@ pg_is_review() {
   [ -n "$(pg_extract_verdict "$f")" ]
 }
 
+# #262: keep the reviewed vocabulary across collection invocations. This is derived from the
+# already-prepared payload, never a new GitHub fetch. Unlike the provenance manifest it must
+# survive reservation removal so an idempotent completed-result replay uses the same predicate.
+pg_review_tokens_dir() { printf '%s\n' "${PRO_GATE_REVIEW_TOKENS_DIR:-$PRO_GATE_HOME/review-tokens}"; }
+pg_review_tokens() { # file [rationale]: canonical tokens; rationale emits shaped tokens only
+  LC_ALL=C awk -v rationale="${2:-}" '
+    {
+      line=$0
+      if (rationale) {
+        sub(/^[[:space:]]*[-*#>_]*[[:space:]]*/, "", line)
+        if (line ~ /^([Pp][0-3][*_ ]*:|[Vv][Ee][Rr][Dd][Ii][Cc][Tt][*_ ]*:)/) next
+        if (line ~ /^[Rr]un marker:/) next
+      }
+      gsub(/[^A-Za-z0-9_./:-]+/, " ", line)
+      n=split(line, words, /[[:space:]]+/)
+      for (i=1; i<=n; i++) {
+        t=words[i]
+        sub(/^[.\/]+/, "", t); sub(/[.:\/]+$/, "", t)
+        if (t !~ /[A-Za-z]/) continue
+        shaped=(t ~ /[\/_]/ || t ~ /\.[A-Za-z][A-Za-z0-9]*(:[0-9]+)?$/ || t ~ /:[0-9]+$/ ||
+          (t ~ /[a-z]/ && substr(t,2) ~ /[A-Z]/))
+        if (rationale && !shaped) continue
+        sub(/:[0-9]+$/, "", t)
+        print t
+        if (!rationale) {
+          # A cited path may omit diff prefixes or directories; retain component boundaries,
+          # never arbitrary substrings of an identifier (fooBarExtra cannot prove fooBar).
+          rest=t
+          while (index(rest,"/")) { rest=substr(rest,index(rest,"/")+1); print rest }
+          count=split(t, components, /[.\/:]/)
+          for (j=1; j<=count; j++) if (components[j] != "") print components[j]
+        }
+      }
+    }' "$1" | LC_ALL=C sort -u
+}
+pg_review_tokens_write() { # marker reviewed-diff
+  local marker="$1" diff="$2" dir tmp
+  pg_reservation_marker_ok "$marker" || return 1
+  [ -r "$diff" ] || return 1
+  dir="$(pg_review_tokens_dir)"; mkdir -p "$dir" || return 1
+  tmp="$(mktemp "$dir/.tokens.XXXXXX")" || return 1
+  if pg_review_tokens "$diff" > "$tmp" && mv -f "$tmp" "$dir/$marker"; then return 0; fi
+  rm -f "$tmp"; return 1
+}
+pg_review_shape() { # body tokens-file -> PG_BODY_BYTES, PG_NAMES_NOTHING; rc 0 iff grounded
+  local body="$1" tokens="$2" candidates
+  PG_BODY_BYTES="$(wc -c < "$body" 2>/dev/null | tr -d '[:space:]')"
+  PG_BODY_BYTES="${PG_BODY_BYTES:-0}"
+  PG_NAMES_NOTHING=true
+  candidates="$(pg_review_tokens "$body" rationale)"
+  if [ -n "$candidates" ] && [ -r "$tokens" ] \
+     && printf '%s\n' "$candidates" | grep -Fx -f "$tokens" >/dev/null; then
+    PG_NAMES_NOTHING=false
+    return 0
+  fi
+  return 1
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # v0.28 (#48): review provenance. A structurally-complete review can still be the WRONG
 # conversation's answer — a failed send once salvaged a different PR's finished review with no
@@ -4909,7 +4967,7 @@ pg_ledger_lookup_clean() {
   pg_reservation_marker_ok "$marker" || return 1
   [ -s "$ledger" ] || return 1
   pg_have jq || return 1
-  jq -r --arg m "$marker" 'select((.marker // "") == $m and .outcome == "clean") | [.out, (.sha256 // "")] | @tsv' \
+  jq -r --arg m "$marker" 'select((.marker // "") == $m and .outcome == "clean" and .names_nothing != true) | [.out, (.sha256 // "")] | @tsv' \
     "$ledger" 2>/dev/null | tail -n 1
 }
 

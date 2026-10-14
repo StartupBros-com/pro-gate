@@ -677,6 +677,16 @@ write_input_binding "$EVIDENT_MARKER" "$EVIDENT_SHA" "$EVIDENT_NWO" "$EVIDENT_NU
 write_result_binding "$EVIDENT_MARKER" SHIP   # #184 finding 2 (round 6): durable evidence now also requires a validated, digest-matching result binding
 append_clean_ledger_row "$EVIDENT_MARKER" "${EVIDENT_NWO//\//-}-${EVIDENT_NUM}" "$EVIDENT_NUM" "$COMPLETED_DIR/$EVIDENT_MARKER"
 
+# #262: an explicitly flagged round never authorizes completion, even if a legacy caller
+# incorrectly labels it clean. Missing new fields on older unflagged rows remain readable.
+cp "$LEDGER_FILE" "$TDIR/unflagged-ledger.jsonl"
+jq '.names_nothing=true | .body_bytes=54' "$LEDGER_FILE" > "$TDIR/flagged-ledger.jsonl"
+cp "$TDIR/flagged-ledger.jsonl" "$LEDGER_FILE"
+check 'a names_nothing round cannot prove a legacy completion' \
+  "$(! daemon_legacy_row_has_durable_evidence "$EVIDENT_NWO" "$EVIDENT_NUM" "$EVIDENT_SHA"; echo $?)" \
+  "$(cat "$LEDGER_FILE")"
+cp "$TDIR/unflagged-ledger.jsonl" "$LEDGER_FILE"
+
 daemon_migrate_legacy_processed
 
 check 'a legacy row WITH durable evidence bound to its exact sha is carried forward into the new ledger' "$(already_done "$EVIDENT_NWO" "$EVIDENT_NUM" "$EVIDENT_SHA"; echo $?)" "$(cat "$STATE_FILE")"
