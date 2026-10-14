@@ -4693,13 +4693,21 @@ pg_review_decision_input_proof_current() { # binding repo pr host owner name hea
   esac
 }
 
+# Compare folded GitHub identities without changing the bytes authenticated by the result binding.
+pg_review_facts_target_matches() { # input-json host owner repo pr
+  jq -e --arg h "$2" --arg o "$3" --arg r "$4" --argjson p "$5" \
+    '(.repository | with_entries(.value |= ascii_downcase))=={host:($h|ascii_downcase),owner:($o|ascii_downcase),repo:($r|ascii_downcase)} and .target.pr==$p' \
+    <<<"$1" >/dev/null 2>&1
+}
+
 # Discover completion records before validating acceptance. Attribution metadata and the marker's
 # PR key establish possible relevance only; they never supply a verdict or counts. Missing/corrupt
 # input siblings can therefore obstruct an older accepted review instead of disappearing in a scan.
 pg_review_facts_candidates() { # host owner repo pr -> candidate metadata JSON
   local host="$1" owner="$2" repo="$3" pr="$4" key dir f marker raw meta mh mo mr mk mp out spend
-  local epoch identity relevant conflict input result bound tail candidates='[]'
-  key="$(printf '%s-%s-%s' "$owner" "$repo" "$pr" | tr -c 'A-Za-z0-9.\n-' '-')"
+  local epoch identity relevant conflict input result bound tail target meta_target candidates='[]'
+  target="$(printf '%s/%s/%s' "$host" "$owner" "$repo" | LC_ALL=C tr 'A-Z' 'a-z')"
+  key="$(printf '%s-%s-%s' "$owner" "$repo" "$pr" | tr -c 'A-Za-z0-9.\n-' '-' | LC_ALL=C tr 'A-Z' 'a-z')"
   for dir in "$(pg_completed_dir)" "$(pg_review_result_binding_dir)" "$PRO_GATE_HOME/pending" "$PRO_GATE_HOME/recovered"; do
     [ ! -e "$dir" ] || { [ -d "$dir" ] && [ -r "$dir" ] && [ -x "$dir" ]; } || return 1
   done
@@ -4711,8 +4719,7 @@ pg_review_facts_candidates() { # host owner repo pr -> candidate metadata JSON
       raw="$(jq -sceS 'select(length==1 and (.[0]|type)=="object") | .[0]' "$f" 2>/dev/null || true)"
     fi
     if [ -n "$raw" ]; then
-      jq -e --arg h "$host" --arg o "$owner" --arg r "$repo" --argjson p "$pr" \
-        '.repository=={host:$h,owner:$o,repo:$r} and .target.pr==$p' <<<"$raw" >/dev/null 2>&1 && relevant=true
+      pg_review_facts_target_matches "$raw" "$host" "$owner" "$repo" "$pr" && relevant=true
     fi
     # Shape-valid input is only a relevance hint until the accepted result binds its bytes.
     # Otherwise editing its target can exclude it, or editing its epoch can demote it below SHIP.
@@ -4730,7 +4737,8 @@ pg_review_facts_candidates() { # host owner repo pr -> candidate metadata JSON
     meta="$(pg_run_meta_read "$marker" 2>/dev/null || true)"
     if [ -n "$meta" ]; then
       IFS=$'\t' read -r mh mo mr mk mp out spend <<<"$meta"
-      if [ "$mh" = "$host" ] && [ "$mo" = "$owner" ] && [ "$mr" = "$repo" ] && [ "$mp" = "$pr" ]; then
+      meta_target="$(printf '%s/%s/%s' "$mh" "$mo" "$mr" | LC_ALL=C tr 'A-Z' 'a-z')"
+      if [ "$meta_target" = "$target" ] && [ "$mp" = "$pr" ]; then
         relevant=true
       elif [ "$relevant" = true ]; then
         conflict=true
@@ -4744,7 +4752,8 @@ pg_review_facts_candidates() { # host owner repo pr -> candidate metadata JSON
       f="$(pg_run_meta_dir)/$marker"
       if [ -f "$f" ] && [ ! -L "$f" ] && [ -r "$f" ] && [ "$(wc -c < "$f")" -le 65536 ]; then
         IFS=$'\t' read -r mh mo mr mk mp out spend < "$f" || true
-        if [ "$mh" = "$host" ] && [ "$mo" = "$owner" ] && [ "$mr" = "$repo" ] && [ "$mp" = "$pr" ]; then relevant=true; fi
+        meta_target="$(printf '%s/%s/%s' "$mh" "$mo" "$mr" | LC_ALL=C tr 'A-Z' 'a-z')"
+        if [ "$meta_target" = "$target" ] && [ "$mp" = "$pr" ]; then relevant=true; fi
       fi
     fi
     # Only a digest-bound input can exclude a colliding key without a valid sidecar.
@@ -4753,14 +4762,13 @@ pg_review_facts_candidates() { # host owner repo pr -> candidate metadata JSON
     if [ "$relevant" = false ] && [ "$bound" = true ]; then continue; fi
     if [ -z "$meta" ] && [ "$bound" = false ] && [ -n "$result" ] \
       && ! [[ "$marker" =~ ^pg-run-.+-.+-[1-9][0-9]*-[0-9]+-[0-9]+$ ]]; then relevant=true; fi
-    case "$marker" in "pg-run-$key-"*) relevant=true ;; esac
+    case "$(printf '%s' "$marker" | LC_ALL=C tr 'A-Z' 'a-z')" in "pg-run-$key-"*) relevant=true ;; esac
     [ "$relevant" = true ] || continue
     # Contradictory full attribution is not permission to reinterpret a target-looking marker.
     if [ -n "$raw" ] && jq -e '.repository.host and .repository.owner and .repository.repo and .target.pr' <<<"$raw" >/dev/null 2>&1; then
-      jq -e --arg h "$host" --arg o "$owner" --arg r "$repo" --argjson p "$pr" \
-        '.repository=={host:$h,owner:$o,repo:$r} and .target.pr==$p' <<<"$raw" >/dev/null 2>&1 || conflict=true
+      pg_review_facts_target_matches "$raw" "$host" "$owner" "$repo" "$pr" || conflict=true
     fi
-    if [ -n "$meta" ] && { [ "$mh" != "$host" ] || [ "$mo" != "$owner" ] || [ "$mr" != "$repo" ] || [ "$mp" != "$pr" ]; }; then conflict=true; fi
+    if [ -n "$meta" ] && { [ "$meta_target" != "$target" ] || [ "$mp" != "$pr" ]; }; then conflict=true; fi
     case "$epoch" in ''|0|*[!0-9]*) epoch=null ;; esac
     identity="$(pg_review_result_binding_digest "$marker" 2>/dev/null || true)"
     candidates="$(jq -cS --arg marker "$marker" --arg identity "$identity" --argjson epoch "$epoch" --argjson conflict "$conflict" \
@@ -4843,7 +4851,7 @@ pg_review_facts_cli() { # checkout number-or-canonical-PR-URL [candidate-head]; 
     pg_review_facts_emit invalid "$reason" "$repository" "$pr" "$head" "$marker" null null; return
   fi
   input="$(jq -cS .input_binding <<<"$accepted")"
-  if ! jq -e --argjson repo "$repository" --argjson pr "$pr" '.repository==$repo and .target.pr==$pr' <<<"$input" >/dev/null; then
+  if ! pg_review_facts_target_matches "$input" "$host" "$owner" "$name" "$pr"; then
     pg_review_facts_emit invalid target-mismatch "$repository" "$pr" "$head" "$marker" null null; return
   fi
   mode="$(jq -r .evidence.mode <<<"$input")"
