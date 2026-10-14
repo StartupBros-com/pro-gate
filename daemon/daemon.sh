@@ -117,12 +117,14 @@ daemon_decision_reason(){ jq -r '.reason // empty' "$1"; }
 #     before this helper is ever reached at either call site below -- so seeing
 #     allow-existing-merge-workflow/current-ship-is-merge-eligible on an envelope that already
 #     passed that check IS the reducer's own completed_results-backed SHIP selection.
+#     The same validated handoff with reason fix-first-deferred-p2-only completes a head whose
+#     accepted FIX-FIRST has proven zero open blockers and at least one deferred P2/P3 finding.
 #
 # Every other action, and every other stop/report reason (round-governor-denied, unproven-input,
 # invalid-binding, evidence-preparation-unsafe, no-safe-action, undefined-state,
 # legacy-not-authoritative, a completed-result tie, invalid-named-choice, stale-named-choice,
 # fix-review-findings, prepare-matching-review-evidence, ask-named-product-choice, ...) is
-# explicitly NOT completion -- reasons are an open set, so this checks the two positive shapes
+# explicitly NOT completion -- reasons are an open set, so this checks the positive shapes
 # rather than excluding a list. Positive facts, not reason strings alone, decide -- see #184
 # finding 1.
 daemon_decision_completes_current_head(){ # decision-file
@@ -138,7 +140,7 @@ daemon_decision_completes_current_head(){ # decision-file
         ($p.code_identity == .facts.input.identity) and
         ($p.evidence_identity == .facts.evidence.identity)
       ' "$1" >/dev/null 2>&1 ;;
-    allow-existing-merge-workflow/current-ship-is-merge-eligible)
+    allow-existing-merge-workflow/current-ship-is-merge-eligible|allow-existing-merge-workflow/fix-first-deferred-p2-only)
       return 0 ;;
     *)
       return 1 ;;

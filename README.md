@@ -45,9 +45,12 @@ auto-merge, with required hosted CI on the exact head remaining the final author
 | Verified provenance | Every run embeds a nonce the model echoes back on its verdict line; a capture that doesn't match the run is rejected, never silently accepted |
 | Round controls | Numeric grants are advisory by default: 2 rounds per change per rolling 24 h, +1 per shrinking re-review, up to 8; explicit settings enforce those limits. A separate churn stop covers positive P0/P1 counts that fail to shrink for two consecutive re-reviews; clean and P2/P3-only rounds do not accumulate churn |
 
-An accepted current `FIX-FIRST` with zero open P0/P1 hands off to the existing merge workflow
+An accepted current `FIX-FIRST` with proven zero open P0/P1 and at least one deferred P2/P3 hands off to the existing merge workflow
 with reason `fix-first-deferred-p2-only`. Its facts include `open_blocking: 0`,
-`deferred_findings` (P2/P3 severity and finding text in body order) and `deferred_count`.
+`deferred_findings` (P2/P3 severity and complete finding blocks in body order) and `deferred_count`.
+Each block is bounded to 1,024 characters, including any `… [truncated N chars]` marker.
+Unsupported blocking severity forms leave counts unavailable and require a fix. A FIX-FIRST
+with zero blockers and no deferred findings requires a re-review with reason `fix-first-without-findings`.
 Any open P0/P1 still requires a fix; `rounds-not-converging` preempts both paths.
 
 ### Quick example

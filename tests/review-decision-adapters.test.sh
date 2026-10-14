@@ -47,11 +47,11 @@ validate_contract_and_corpus() { # contract corpus
     (.base_facts | keys | sort) == ["active_index","completed_results","cooldown","deferred_count","deferred_findings","delivery","evidence","governor","input","named_choice","observation","open_blocking","prior_review","reservation","target","transport"] and
     .base_facts.transport == "review-decision/v1" and
     ([.. | objects | keys[] | select(. == "status" or . == "next_action")] | length == 0) and
-    (.cases | length == 20) and
+    (.cases | length == 21) and
     ([.cases[].expected.action] | unique | sort) == ([$contract[0].action_effects[].action] | sort) and
     ([.cases[] | select(.expected.action != .expected.effect)] | length == 0) and
     ([.cases[] | select(.expected.execution_class == "named-product-choice") | .expected.action] == ["ask-named-product-choice"]) and
-    ([.cases[] | select(.expected.execution_class != "named-product-choice") | .expected.action] | length == 19) and
+    ([.cases[] | select(.expected.execution_class != "named-product-choice") | .expected.action] | length == 20) and
     any(.cases[]; .expected.reason == "account-cooldown-active" and .patch.cooldown.active == true) and
     (.base_facts.cooldown == {active:false,seconds_remaining:0}) and
     (.base_facts.delivery == {failed_unchanged:0,override:false,state:"known"}) and
@@ -396,15 +396,82 @@ DEFERRAL_RC=0; DEFERRAL_DETAIL="$(deferral_case prose $'[P1] runtime.sh:1 — Th
 check '#274 RESOLVED in prose does not remove an open P1' "$DEFERRAL_RC" "$DEFERRAL_DETAIL"
 check '#274 genuine P2 deferral envelope validates through the shared consumer boundary' \
   "$(pg_review_decision_envelope_valid "$TMP/deferral-p2.json"; printf '%s' "$?")"
-jq -c '.facts.deferred_count=2' "$TMP/deferral-p2.json" > "$TMP/deferral-wrong-count.json"
+WRONG_COUNT_DECISION="$(pg_review_decision_reduce "$(jq -cS '.facts | .deferred_count=2' "$TMP/deferral-p2.json")")"
 check '#274 a deferred count inconsistent with its items is rejected' \
-  "$(envelope_rejects "$TMP/deferral-wrong-count.json"; printf '%s' "$?")"
-jq -c '.facts.deferred_findings[0].severity="P1"' "$TMP/deferral-p2.json" > "$TMP/deferral-wrong-severity.json"
+  "$(jq -e '.action=="stop-without-new-review" and .reason=="undefined-state"' <<<"$WRONG_COUNT_DECISION" >/dev/null; printf '%s' "$?")"
+WRONG_SEVERITY_DECISION="$(pg_review_decision_reduce "$(jq -cS '.facts | .deferred_findings[0].severity="P1"' "$TMP/deferral-p2.json")")"
 check '#274 a blocking severity cannot masquerade as a deferred item' \
-  "$(envelope_rejects "$TMP/deferral-wrong-severity.json"; printf '%s' "$?")"
+  "$(jq -e '.action=="stop-without-new-review" and .reason=="undefined-state"' <<<"$WRONG_SEVERITY_DECISION" >/dev/null; printf '%s' "$?")"
 UNKNOWN_COUNTS_DECISION="$(pg_review_decision_reduce "$(jq -cS '.facts | .open_blocking=null' "$TMP/deferral-p2.json")")"
 check '#274 unavailable blocking counts preserve FIX-FIRST rather than authorizing deferral' \
   "$(jq -e '.action=="fix-review-findings" and .reason=="review-findings-require-fix"' <<<"$UNKNOWN_COUNTS_DECISION" >/dev/null; printf '%s' "$?")"
+
+# PR #276: parse real review bytes, then call the reducer directly. No envelope replay can
+# reject these inputs before the particular count/status/deferral rule is exercised.
+direct_review_case() { # name body reducer-predicate
+  local name="$1" body="$2" predicate="$3" counts p0=null p1=null deferred facts decision rc=0
+  printf '%s' "$body" > "$TMP/direct-review.txt"
+  if counts="$(pg_review_open_severity "$TMP/direct-review.txt")"; then
+    IFS=$'\t' read -r p0 p1 <<<"$counts"
+  fi
+  deferred="$(pg_review_deferred_findings "$TMP/direct-review.txt")"
+  facts="$(jq -cS --argjson p0 "$p0" --argjson p1 "$p1" --argjson deferred "$deferred" \
+    '.facts | .open_blocking=(if $p0==null or $p1==null then null else $p0+$p1 end) | .deferred_findings=$deferred | .deferred_count=($deferred|length)' "$TMP/deferral-p2.json")"
+  decision="$(pg_review_decision_reduce "$facts")"
+  jq -e "$predicate" <<<"$decision" >/dev/null || rc=$?
+  check "$name" "$rc" "$decision"
+}
+BLOCKING_PREDICATE='.action=="fix-review-findings" and .reason=="review-findings-require-fix" and .facts.open_blocking==1'
+for headline in '- [P1]' '**P1**:' 'P1 -' 'p1:' '+ [P0]' '[P1]' '1. __p1__:' '2) **[p1]**:' '* [P1]:'; do
+  direct_review_case "P1-1 supported severity $headline requires a fix" \
+    "$headline runtime.sh:1 — Concurrent writes lose data."$'\n'"$DEFERRAL_BODY" "$BLOCKING_PREDICATE"
+done
+for headline in 'P1]' '**P1]**:' '> [P1]' '### [P0]' '[**P1**]' '`[P1]`' '(P1)'; do
+  direct_review_case "P1-1 unrecognized severity $headline leaves counts unavailable" \
+    "$headline runtime.sh:1 — Concurrent writes lose data."$'\n'"$DEFERRAL_BODY" \
+    '.action=="fix-review-findings" and .facts.open_blocking==null'
+done
+for headline in 'P1:' '[P0]'; do
+  direct_review_case "P1-1 empty blocking label $headline leaves counts unavailable" \
+    "$headline"$'\n  runtime.sh:1 — Concurrent writes lose data.\n'"$DEFERRAL_BODY" \
+    '.action=="fix-review-findings" and .facts.open_blocking==null'
+done
+direct_review_case 'P1-1 none declarations positively prove zero blockers' \
+  $'P0: none\np1: none\n'"$DEFERRAL_BODY" "$DEFERRAL_PREDICATE"
+for status in 'Correction: STILL-PRESENT; concurrent requests still lose data.' 'REOPENED' 'NOT RESOLVED' 'NOT FIXED' 'Correction: the patch missed this path.' 'Correction:'; do
+  direct_review_case "P1-2 continuation $status reopens a RESOLVED finding" \
+    $'[P1] runtime.sh:1 — RESOLVED — patched.\n  '"$status"$'\n'"$DEFERRAL_BODY" "$BLOCKING_PREDICATE"
+done
+direct_review_case 'P1-2 neutral continuation keeps a RESOLVED finding closed' \
+  $'[P1] runtime.sh:1 — RESOLVED — patched.\n  Verified the regression test.\n'"$DEFERRAL_BODY" "$DEFERRAL_PREDICATE"
+direct_review_case 'P1-3 skeleton FIX-FIRST contradicts its body' \
+  $'P0: none\nP1: none\nP2: none\nP3: none\nVERDICT: FIX-FIRST\n' \
+  '.action=="fix-review-findings" and .reason=="fix-first-without-findings" and .facts.deferred_count==0'
+direct_review_case 'P1-3 one real P2 permits deferral' "$DEFERRAL_BODY" "$DEFERRAL_PREDICATE"
+direct_review_case 'P2-4 deferred text keeps explanation, confidence, fix and code block' \
+  $'P0: none\nP1: none\n[P2] docs.md:7 — Clarify the example.\n  Why it is a real problem: readers copy the wrong flag.\n  Confidence: high.\n  Suggested fix: use the supported flag.\n  ```sh\n  pro-gate --status\n  ```\nP3: none\nVERDICT: FIX-FIRST\n' \
+  '.action=="allow-existing-merge-workflow" and .facts.deferred_count==1 and (.facts.deferred_findings[0].text | contains("\n  Why it is a real problem:") and contains("Confidence: high.") and contains("Suggested fix:") and contains("```sh\n  pro-gate --status\n  ```"))'
+direct_review_case 'P2-4 a longer closing code fence keeps a later blocker visible' \
+  $'[P2] docs.md:7 — Clarify.\n  ```sh\n  example\n  ````\n[P1] runtime.sh:1 — Concurrent writes lose data.\nVERDICT: FIX-FIRST\n' "$BLOCKING_PREDICATE"
+direct_review_case 'P1-1 an unterminated finding fence leaves counts unavailable' \
+  $'P0: none\nP1: none\n[P2] docs.md:7 — Clarify.\n  ```sh\n  example\nVERDICT: FIX-FIRST\n' \
+  '.action=="fix-review-findings" and .facts.open_blocking==null'
+LONG_FINDING="$(printf '%1500s' '' | tr ' ' x)"
+direct_review_case 'P2-4 oversized deferred text is bounded with an exact truncation marker' \
+  $'P0: none\nP1: none\n[P2] '"$LONG_FINDING"$'\nVERDICT: FIX-FIRST\n' \
+  '.action=="allow-existing-merge-workflow" and .facts.deferred_count==1 and (.facts.deferred_findings[0].text | length==1024 and endswith("… [truncated 499 chars]"))'
+direct_review_case 'P1-1 P2/P3 normalization matches blocker normalization' \
+  $'P0: none\nP1: none\n- **p2**: docs.md:7 — Clarify the example.\n2) __P3__: Add a link.\nVERDICT: FIX-FIRST\n' \
+  '.action=="allow-existing-merge-workflow" and .facts.deferred_count==2 and .facts.deferred_findings==[{severity:"P2",text:"docs.md:7 — Clarify the example."},{severity:"P3",text:"Add a link."}]'
+
+DEFERRAL_RC=0; DEFERRAL_DETAIL="$(deferral_case unavailable $'P1] runtime.sh:1 — Concurrent writes lose data.\n'"$DEFERRAL_BODY" \
+  '.action=="fix-review-findings" and .facts.open_blocking==null')" || DEFERRAL_RC=$?
+check 'P1-1 accepted artifact retains FIX-FIRST when counts are unavailable' "$DEFERRAL_RC" "$DEFERRAL_DETAIL"
+DEFERRAL_RC=0; DEFERRAL_DETAIL="$(deferral_case multiline $'P0: none\nP1: none\n[P2] docs.md:7 — Clarify the example.\n  Suggested fix: update the flag.\nVERDICT: FIX-FIRST\n' \
+  '.action=="allow-existing-merge-workflow" and (.facts.deferred_findings[0].text | contains("\n  Suggested fix:"))')" || DEFERRAL_RC=$?
+check 'P2-4 complete deferred blocks survive the accepted-artifact query' "$DEFERRAL_RC" "$DEFERRAL_DETAIL"
+check 'P2-4 multiline deferral envelope passes the consumer boundary' \
+  "$(pg_review_decision_envelope_valid "$TMP/deferral-multiline.json"; printf '%s' "$?")"
 
 check 'engine harvest hints carry the sized collection timeout, never the old fixed 20m' \
   "$(grep -Fq 'HARVEST_HINT_TIMEOUT="$(pg_harvest_hint_timeout)"' "$ENGINE" && grep -Fq 'TIMEOUT="$(pg_fresh_hint_timeout)"' "$ENGINE" && ! grep -Fq -- '--timeout 20m' "$ENGINE"; printf '%s' "$?")"

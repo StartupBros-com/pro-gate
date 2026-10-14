@@ -3069,31 +3069,80 @@ pg_round_unrecord() {
   return 0
 }
 
-# Pure open-count grammar: print P0<TAB>P1, or fail without counts on an unreadable file.
-# Only uppercase RESOLVED in status position excludes a finding; prose and identifiers do not.
-pg_review_open_severity() {
-  local out="$1" counts
-  [ -f "$out" ] && [ -r "$out" ] || return 1
-  counts="$(awk '
-    /^[[:space:]]*\[[Pp][01]\]/ {
-      if ($0 ~ /^[[:space:]]*\[[Pp][01]\][[:space:]]+[^[:space:]]+[[:space:]]+(—|--|-)[[:space:]]+RESOLVED([^_[:alnum:]]|$)/) next
-      if ($0 ~ /^[[:space:]]*\[[Pp]0\]/) p0++; else p1++
-    }
-    END { printf "%d\t%d", p0, p1 }
-  ' "$out")" || return 1
-  printf '%s\n' "$counts"
-}
-
-# Pure P2/P3 projection in body order; preserve finding text after its list marker and label.
-# These are follow-up items, not instructions. The decision grammar bounds their display text.
-pg_review_deferred_findings() {
+# One grammar for blocker counts and deferred blocks, interpreted from the same review bytes.
+# Unsupported blocking labels make counts unavailable; absence of a regex match is not proof.
+pg_review_finding_summary() {
   local out="$1"
   [ -f "$out" ] && [ -r "$out" ] || return 1
   jq -cS -Rs '
-    split("\n") | map(
-      select(test("^\\s*(?:(?:[-*+]|[0-9]+[.)])\\s+)?\\[[Pp][23]\\]")) |
-      capture("^\\s*(?:(?:[-*+]|[0-9]+[.)])\\s+)?\\[[Pp](?<level>[23])\\]\\s*(?<text>.*)$") |
-      {severity:("P"+.level),text})' "$out"
+    def normalized:
+      sub("^\\s+";"") | sub("^(?:[-*+]|[0-9]+[.)])\\s+";"");
+    def headline:
+      if test("^(?:\\*\\*|__)?\\[") then
+        capture("^(?:\\*\\*|__)?\\[(?<severity>[Pp][0-3])\\](?:\\*\\*|__)?\\s*:?\\s*(?<text>.*)$")
+      else
+        capture("^(?:\\*\\*|__)?(?<severity>[Pp][0-3])(?=\\s|:|—|-|\\*\\*|__|$)(?:\\*\\*|__)?\\s*:?\\s*(?:[-—]\\s+)?(?<text>.*)$")
+      end | .severity |= ascii_upcase;
+    def flush:
+      if .current==null then . else .blocks += [.current] | .current=null end;
+    def bounded:
+      if length<=1024 then . else
+        . as $text | length as $size |
+        # Iterate the suffix length to account for the digit count in the omitted length.
+        ("… [truncated \($size-1024) chars]") as $first |
+        ("… [truncated \($size-1024+($first|length)) chars]") as $second |
+        ("… [truncated \($size-1024+($second|length)) chars]") as $marker |
+        $text[:1024-($marker|length)] + $marker
+      end;
+    reduce (split("\n")[] | sub("\r$";"")) as $line
+      ({blocks:[],current:null,unknown:false,fence:null};
+       ($line|normalized) as $normal |
+       if .fence!=null then
+         (if .current!=null then .current.lines += [$line] else . end) |
+         .fence as $fence |
+         if ($normal|test("^"+$fence[0:1]+"{"+($fence|length|tostring)+",}\\s*$")) then .fence=null else . end
+       elif ($normal|test("^(?:```|~~~)")) then
+         .fence=($normal|capture("^(?<fence>`{3,}|~{3,})").fence) |
+         if .current!=null then .current.lines += [$line] else . end
+       else
+         ([$normal|headline] | first // null) as $head |
+         if $head!=null then
+           flush |
+           if ($head.text|test("^\\s*$")) then
+             if ($head.severity|IN("P0","P1")) then .unknown=true else . end
+           elif ($head.text|test("^(?:none|—|-)[.!]?\\s*$";"i")) then .
+           else .current={severity:$head.severity,lines:[$head.text]} end
+         elif ($normal|gsub("[*_`]";"")|sub("^[^[:alpha:]]+";"")|test("^[Pp][01](?=[^_[:alnum:]]|$)")) then
+           flush | .unknown=true
+         elif .current!=null and ($normal|test("^Correction\\s*:";"i")) then
+           .current.lines += [$line]
+         elif ($normal|test("^(?:(?:\\*\\*|__)?(?:VERDICT|CHOICE)(?:\\*\\*|__)?\\s*:|#{1,6}\\s|[A-Za-z][A-Za-z -]*:\\s*$)";"i")) then
+           flush
+         elif .current!=null then .current.lines += [$line]
+         else . end
+       end) |
+    flush | .unknown=(.unknown or .fence!=null) |
+    [.blocks[] | select(.severity|IN("P0","P1")) |
+      select((.lines[0]|test("^\\S+\\s+(?:—|--|-)\\s+RESOLVED([^_[:alnum:]]|$)"))==false or
+        (.lines[1:]|join("\n")|test("(^|[^_[:alnum:]])(?:STILL-PRESENT|REOPENED|NOT\\s+RESOLVED|NOT\\s+FIXED)([^_[:alnum:]]|$)|Correction\\s*:";"i")))] as $open |
+    {open_p0:(if .unknown then null else [$open[]|select(.severity=="P0")]|length end),
+     open_p1:(if .unknown then null else [$open[]|select(.severity=="P1")]|length end),
+     deferred_findings:[.blocks[]|select(.severity|IN("P2","P3"))|
+       {severity,text:(.lines|join("\n")|sub("\\s+$";"")|bounded)}]}' "$out"
+}
+
+# Print P0<TAB>P1, or fail without counts when any blocking headline is unavailable.
+pg_review_open_severity() {
+  local summary
+  summary="$(pg_review_finding_summary "$1")" || return 1
+  jq -er 'select(.open_p0!=null and .open_p1!=null) | [.open_p0,.open_p1] | @tsv' <<<"$summary"
+}
+
+# Follow-up display data in body order, bounded to the normalized string limit.
+pg_review_deferred_findings() {
+  local summary
+  summary="$(pg_review_finding_summary "$1")" || return 1
+  jq -cS .deferred_findings <<<"$summary"
 }
 
 # pg_round_note_severity <key> <review-file>: record the P0/P1 counts of a change's most
@@ -3207,10 +3256,12 @@ pg_round_last_severity() {
 # the trajectory remains available for human-facing notes even though it does not affect
 # enforcement. Called IN-SHELL (never via command substitution) by every caller that needs these
 # globals afterward — a subshell would compute them and then drop them on exit.
+pg_round_default_base() { printf '%s\n' 2; }
+
 pg_round_score() {
   local key="$1" f now win e verdict p0 p1 res sp dur open prev="" used
   PG_ROUND_EARNED=0; PG_ROUND_STREAK=0; PG_ROUND_ARROW=""; PG_ROUND_ELAPSED_SECS=0; PG_ROUND_SCORED=0
-  PG_ROUND_BASE="${PRO_GATE_ROUNDS_BASE:-2}"; case "$PG_ROUND_BASE" in ''|*[!0-9]*) PG_ROUND_BASE=2;; esac
+  PG_ROUND_BASE="${PRO_GATE_ROUNDS_BASE:-$(pg_round_default_base)}"; case "$PG_ROUND_BASE" in ''|*[!0-9]*) PG_ROUND_BASE="$(pg_round_default_base)";; esac
   PG_ROUND_CEILING="${PRO_GATE_ROUNDS_CEILING:-8}"; case "$PG_ROUND_CEILING" in ''|*[!0-9]*) PG_ROUND_CEILING=8;; esac
   # The ceiling is the IMMOVABLE backstop: an inconsistent config clamps the BASE DOWN to it,
   # never the ceiling up (#66 gate P1 — raising it let BASE=10/CEILING=8 grant 10 rounds and
@@ -3249,7 +3300,7 @@ pg_round_score() {
     fi
   fi
   if [ -n "${PRO_GATE_MAX_ROUNDS_PER_PR:-}" ]; then
-    case "$PRO_GATE_MAX_ROUNDS_PER_PR" in *[!0-9]*|'') PG_ROUND_GRANT=2;; *) PG_ROUND_GRANT="$PRO_GATE_MAX_ROUNDS_PER_PR";; esac
+    case "$PRO_GATE_MAX_ROUNDS_PER_PR" in *[!0-9]*|'') PG_ROUND_GRANT="$(pg_round_default_base)";; *) PG_ROUND_GRANT="$PRO_GATE_MAX_ROUNDS_PER_PR";; esac
     return 0
   fi
   PG_ROUND_GRANT=$(( PG_ROUND_BASE + PG_ROUND_EARNED ))
@@ -3914,8 +3965,8 @@ pg_completed_lookup() {  # <marker> <out>: place the artifact at <out>; rc 0 on 
 # ─────────────────────────────────────────────────────────────────────────────
 PG_REVIEW_DECISION_CONTRACT_ID='review-decision/v1'
 PG_REVIEW_DECISION_CONTRACT_VERSION=1
-PG_REVIEW_DECISION_CONTRACT_DIGEST='07d50c7d8a8b8f60b36c532231a8228f548f1dcb4a9b609b2ffedd32d2b518e1'
-PG_REVIEW_DECISION_CORPUS_DIGEST='521c9e63de5de69f2886c57ecd0f232dbe0191338bdfd1ccc5776c487b354875'
+PG_REVIEW_DECISION_CONTRACT_DIGEST='541b9baac5d00027014a07b3dd8333ce9f4151caad2389e5ac3191373dd20de3'
+PG_REVIEW_DECISION_CORPUS_DIGEST='678df427a883952beefb5dfc3b1f3a2b1ecafdbb699fe49eb1bc28427259bff2'
 
 # Binding-record compatibility only (#214, gate r2 P1). review-input-binding/v1 and
 # review-result-binding/v1 records are validated by their own record_type/record_version shape
@@ -3928,7 +3979,7 @@ PG_REVIEW_DECISION_CORPUS_DIGEST='521c9e63de5de69f2886c57ecd0f232dbe0191338bdfd1
 # Writers share these validators with readers: every production write site passes the CURRENT digest
 # (pg_review_decision_contract_digest), so this list only widens what can be READ back, never what a
 # fresh record may claim. Keep it that way when adding a writer.
-PG_REVIEW_DECISION_COMPATIBLE_CONTRACT_DIGESTS='bf36fdb5f8625e917be0539ca014fec518649d1160584846aca1cb9149533abb 7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee 5fcd19c12600061af6d90ed9cb980dd7067cff199c374910639003eec4caf5c3 6da6866bab4e95ad138cdc946fa1388be9c386bca7b592c3370c9f52e34b315f fa91787e3fbf3c0852c78f5269b2f670d84b86561be64d6edef4229bf46aee9b'
+PG_REVIEW_DECISION_COMPATIBLE_CONTRACT_DIGESTS='bf36fdb5f8625e917be0539ca014fec518649d1160584846aca1cb9149533abb 7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee 5fcd19c12600061af6d90ed9cb980dd7067cff199c374910639003eec4caf5c3 6da6866bab4e95ad138cdc946fa1388be9c386bca7b592c3370c9f52e34b315f fa91787e3fbf3c0852c78f5269b2f670d84b86561be64d6edef4229bf46aee9b 07d50c7d8a8b8f60b36c532231a8228f548f1dcb4a9b609b2ffedd32d2b518e1'
 
 pg_review_decision_contract_id() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_ID"; }
 pg_review_decision_contract_version() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_VERSION"; }
@@ -4104,7 +4155,9 @@ pg_review_decision_envelope_valid() { # decision-file
        (.action == "ask-named-product-choice" and .execution_class == "named-product-choice"))) and
     (.effect_request.action == .action) and
     ([.. | objects | keys[] | select(. == "status" or . == "next_action")] | length == 0) and
-    ([.. | strings | select(test("[[:cntrl:]]"))] | length == 0)
+    # Only deferred display text may contain newlines and tabs; every other field is closed.
+    ([del(.facts.deferred_findings[]?.text) | .. | strings | select(test("[[:cntrl:]]"))] | length == 0) and
+    ([.facts.deferred_findings[]?.text | strings | select(test("[\u0000-\u0008\u000b-\u001f\u007f]"))] | length == 0)
   ' "$decision" >/dev/null 2>&1 || return 1
   facts="$(jq -cS .facts "$decision" 2>/dev/null)" || return 1
   expected="$(pg_review_decision_reduce "$facts")" || return 1
@@ -4126,7 +4179,9 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
     if (type != "object") then "yes"
     elif ([.. | objects | keys[] |
       test("^(raw|.*_text|prose|prompt|caller.*|status|next_action|approval.*|.*ledger.*|.*password.*|.*secret.*|.*credential.*|authorization|api[_-]?key|api[_-]?token|access[_-]?token|private[_-]?key)$";"i")] | any) then "yes"
-    elif ([.. | strings | (length > 1024 or test("[\u0000-\u001f\u007f]"))] | any) then "yes"
+    elif ([.. | strings | length > 1024] | any) then "yes"
+    elif ([del(.deferred_findings[]?.text) | .. | strings | test("[\u0000-\u001f\u007f]")] | any) then "yes"
+    elif ([.deferred_findings[]?.text | strings | test("[\u0000-\u0008\u000b-\u001f\u007f]")] | any) then "yes"
     elif ([.. | arrays | length > 32] | any) then "yes"
     else "no" end' 2>/dev/null)" || unsafe=yes
   if [ "$unsafe" != no ]; then
@@ -4312,6 +4367,9 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
         # #274: only proven zero open P0/P1 defers the lower-severity items. Unknown counts
         # retain the fix action; the existing churn stop above always has precedence.
         if [ "$(jq -r '.open_blocking' <<<"$canonical")" = 0 ]; then
+          if [ "$(jq -r '.deferred_count' <<<"$canonical")" -eq 0 ]; then
+            pg_review_decision_emit fix-review-findings fix-first-without-findings "$canonical" "$snapshot" "$selected_ref"; return
+          fi
           pg_review_decision_emit allow-existing-merge-workflow fix-first-deferred-p2-only "$canonical" "$snapshot" "$selected_ref"; return
         fi
         pg_review_decision_emit fix-review-findings review-findings-require-fix "$canonical" "$snapshot" "$selected_ref"; return ;;
@@ -4580,7 +4638,7 @@ pg_review_result_binding_digest() { local r; r="$(pg_review_result_binding_read 
 # rc 0: accepted facts; rc 1: unavailable (no output); rc 2: verdict disagreement (diagnostic
 # facts only, never counts). The caller retains the decision reducer's distinct repair projection.
 pg_review_accepted_artifact_read() ( # marker [expected canonical input binding]
-  local marker="$1" expected="${2:-}" input result artifact snapshot digest canonical verdict stored choices='[]' counts p0 p1 text retained deferred='[]'
+  local marker="$1" expected="${2:-}" input result artifact snapshot digest canonical verdict stored choices='[]' summary p0 p1 text retained deferred='[]'
   pg_reservation_marker_ok "$marker" || return 1
   input="$(pg_review_input_binding_read "$marker")" || return 1
   [ -z "$expected" ] || [ "$input" = "$expected" ] || return 1
@@ -4610,9 +4668,9 @@ pg_review_accepted_artifact_read() ( # marker [expected canonical input binding]
       pg_review_accepted_ship_matches "$retained" "$(jq -r '.evidence.proof.base_oid // empty' <<<"$input")" \
         "$(jq -r .target.head_oid <<<"$input")" "$(jq -r '.evidence.proof.raw_patch_digest // empty' <<<"$input")" || return 1
     fi
-    counts="$(pg_review_open_severity "$snapshot")" || return 1
-    IFS=$'\t' read -r p0 p1 <<<"$counts"
-    deferred="$(pg_review_deferred_findings "$snapshot")" || return 1
+    summary="$(pg_review_finding_summary "$snapshot")" || return 1
+    p0="$(jq -r .open_p0 <<<"$summary")"; p1="$(jq -r .open_p1 <<<"$summary")"
+    deferred="$(jq -cS .deferred_findings <<<"$summary")" || return 1
     if choices="$(pg_review_decision_named_choices "$snapshot" "$verdict")"; then
       :
     elif [ "$?" -eq 2 ]; then

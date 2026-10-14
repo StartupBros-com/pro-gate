@@ -58,6 +58,15 @@ result="$(
 check '#274 default numeric grant is 2 with round environment unset (planted negative)' "$rc" "$result"
 result="$(
   clear_policy
+  export PRO_GATE_HOME="$TDIR/status-default" PRO_GATE_RUN_LOGS=0
+  mkdir -p "$PRO_GATE_HOME/rounds"
+  date +%s > "$PRO_GATE_HOME/rounds/status-default"
+  bash "${PG_TEST_STATUS_ENGINE:-$HERE/../bin/oracle-review.sh}" --status
+)"; rc=$?
+check 'P3-7 status heading reports adaptive base 2 with settings unset' \
+  "$([ "$rc" -eq 0 ] && [[ "$result" == *'adaptive (base 2,'* ]]; printf '%s' "$?")" "$result"
+result="$(
+  clear_policy
   PRO_GATE_HOME="$TDIR/explicit-cap"
   PRO_GATE_MAX_ROUNDS_PER_PR=4
   pg_round_score explicit

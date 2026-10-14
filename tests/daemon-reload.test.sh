@@ -245,7 +245,7 @@ decision="$TYPED_HOME/process-cooldown.json"; typed_decision "$cooldown_index" "
 MOCK_FRESH="$decision" MOCK_RECOVERED="$TYPED_HOME/process-recovered" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
 check "account-cooldown-active does not mark a processed SHA or failure budget" "$([ "$process_rc" -eq 0 ] && [ ! -s "$TYPED_STATE" ] && [ ! -s "$TYPED_FAILS" ]; echo $?)" "rc=$process_rc processed=$(wc -c < "$TYPED_STATE") failures=$(wc -c < "$TYPED_FAILS")"
 # #184 finding 1 (round 5): allow-existing-merge-workflow/current-ship-is-merge-eligible is one of
-# the two positive shapes daemon_decision_completes_current_head recognizes (the producer's FIRST
+# the positive shapes daemon_decision_completes_current_head recognizes (the producer's FIRST
 # SHIP result lives in .facts.completed_results, never .facts.prior_review) -- unlike the three
 # report/collection actions above, it correctly DOES mark the head done, or the unchanged head
 # re-clones and re-queries forever. Split out of the "does not mark" loop above on purpose.
@@ -255,6 +255,11 @@ check 'sanity: the allow-existing-merge-workflow corpus fixture is the FIRST-SHI
 : > "$TYPED_STATE"; : > "$TYPED_FAILS"
 MOCK_FRESH="$MERGE_DECISION" MOCK_RECOVERED="$TYPED_HOME/process-recovered" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
 check 'allow-existing-merge-workflow (current-ship-is-merge-eligible) completes the current head without a failure-budget charge' "$([ "$process_rc" -eq 0 ] && already_done acme/widgets 1983 "$PROCESS_SHA" && [ ! -s "$TYPED_FAILS" ]; echo $?)" "rc=$process_rc processed=$(wc -c < "$TYPED_STATE") failures=$(wc -c < "$TYPED_FAILS")"
+DEFER_INDEX="$(jq -r '.cases | to_entries[] | select(.value.expected.reason == "fix-first-deferred-p2-only") | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
+DEFER_DECISION="$TYPED_HOME/process-deferral.json"; typed_decision "$DEFER_INDEX" "$DEFER_DECISION"
+: > "$TYPED_STATE"; : > "$TYPED_FAILS"
+MOCK_FRESH="$DEFER_DECISION" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
+check 'P2-5 deferral allow completes the current head without a failure-budget charge' "$([ "$process_rc" -eq 0 ] && already_done acme/widgets 1983 "$PROCESS_SHA" && [ ! -s "$TYPED_FAILS" ]; echo $?)" "rc=$process_rc processed=$(wc -c < "$TYPED_STATE") failures=$(wc -c < "$TYPED_FAILS")"
 : > "$TYPED_STATE"; : > "$TYPED_FAILS"
 # #184c finding 1: a round-governor-denied stop means no applicable review ran, so it must NOT
 # complete the head. Positive current-head review proof ("identical-code-and-evidence") is covered

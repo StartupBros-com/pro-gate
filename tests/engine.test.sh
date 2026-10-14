@@ -4531,7 +4531,7 @@ echo '# v0.28: severity sidecar counts only OPEN findings (RESOLVED verification
 mkdir -p "$SHOME/rounds"
 printf '1000\n' > "$SHOME/rounds/sev-key-1"
 cat > "$TDIR/sevreview.md" <<'SEV'
-P0: none of the priors remain
+No prior P0 findings remain.
 
 [P0] a.sh:1 — RESOLVED — fixed earlier
 [P0] b.sh:2 — a new unresolved problem
@@ -7006,9 +7006,9 @@ PG214_PRED_C='5fcd19c12600061af6d90ed9cb980dd7067cff199c374910639003eec4caf5c3'
 PG214_PRED_D='6da6866bab4e95ad138cdc946fa1388be9c386bca7b592c3370c9f52e34b315f'
 PG214_PRED_E='fa91787e3fbf3c0852c78f5269b2f670d84b86561be64d6edef4229bf46aee9b'
 PG214_UNKNOWN_CD='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
-check 'the compiled binding-record compatibility list preserves all five predecessor contract digests' \
+check 'the binding compatibility list preserves five historical digests plus the newly retired contract' \
   "$(jq -ne --arg a "$PG214_PRED_A" --arg b "$PG214_PRED_B" --arg c "$PG214_PRED_C" --arg d "$PG214_PRED_D" --arg e "$PG214_PRED_E" --argjson got "$(pg_review_decision_compatible_contract_digests_json)" \
-      '$got == ([$a,$b,$c,$d,$e]|sort)' >/dev/null 2>&1; echo $?)" \
+      '$got | length==6 and contains([$a,$b,$c,$d,$e])' >/dev/null 2>&1; echo $?)" \
   "$(pg_review_decision_compatible_contract_digests_json)"
 PG214_ENV_PRED_FACTS="$(rd_facts '{}')"; PG214_ENV_PRED_FACTS="$(jq -cS --arg cd "$PG214_PRED_A" '.contract.contract_digest=$cd' <<<"$PG214_ENV_PRED_FACTS")"
 PG214_ENV_PRED_OUT="$(rd_reduce "$PG214_ENV_PRED_FACTS")"
@@ -7183,7 +7183,10 @@ u1_accepted_case() (
     unreadable) chmod 000 "$artifact" ;;
     changing)
       # Change the original during interpretation: the snapshot cannot mask a changed source.
-      pg_review_open_severity() { printf 'changed\n' >> "$artifact"; printf '1\t1\n'; } ;;
+      pg_review_finding_summary() {
+        printf 'changed\n' >> "$artifact"
+        printf '{"open_p0":1,"open_p1":1,"deferred_findings":[]}\n'
+      } ;;
   esac
   facts="$(pg_review_accepted_artifact_read "$marker" "$input")" || rc=$?
   [ "$scenario" != unreadable ] || chmod 600 "$artifact"

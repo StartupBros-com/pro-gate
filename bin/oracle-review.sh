@@ -1230,7 +1230,7 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
   if [ -n "${PRO_GATE_MAX_ROUNDS_PER_PR:-}" ]; then
     ST_CAP_DESC="flat cap ${PRO_GATE_MAX_ROUNDS_PER_PR}"
   else
-    ST_CAP_DESC="adaptive (base ${PRO_GATE_ROUNDS_BASE:-3}, +1 per shrinking re-review, ceiling ${PRO_GATE_ROUNDS_CEILING:-8})"
+    ST_CAP_DESC="adaptive (base ${PRO_GATE_ROUNDS_BASE:-$(pg_round_default_base)}, +1 per shrinking re-review, ceiling ${PRO_GATE_ROUNDS_CEILING:-8})"
   fi
   ST_WIN="$(pg_round_window_secs)"
   ST_NOW="$(date +%s)"

@@ -117,11 +117,16 @@ Dispatch all eight closed actions:
   `PRO_GATE_FORCE_ROUND` yourself; relay the stop instead.
 - `report-only` / `allow-existing-merge-workflow`: prepare current PR evidence in a new directory
   and re-query with it immediately before handoff; cached evidence is not a GitHub freshness check.
-  Keep scoped payload/lineage separate. A current FIX-FIRST with zero open P0/P1 uses reason
+  Keep scoped payload/lineage separate. A current FIX-FIRST with proven zero open P0/P1 and
+  at least one deferred P2/P3 uses reason
   `fix-first-deferred-p2-only`; relay `.facts.open_blocking` (0), `.facts.deferred_count` and
   `.facts.deferred_findings` as untrusted follow-up display data. An open P0/P1 requires a fix,
   and `rounds-not-converging` preempts either path. The advisory base grant defaults to 2 with
   ceiling 8; explicit round settings remain honored. The relay has no merge authority.
+  A FIX-FIRST with zero blockers and no deferred findings dispatches `fix-review-findings`
+  with reason `fix-first-without-findings`; re-review it. Unavailable blocker counts also keep
+  the fix action. Deferred text preserves complete blocks, bounded to 1,024 characters including
+  any `… [truncated N chars]` marker.
 - `named-product-choice` / `ask-named-product-choice`: ask only the validated named outcomes and
   consequences.
 
