@@ -278,6 +278,13 @@ same local-object comparison without reading statuses, fetching, or granting an 
 The callbacks must include both rename paths. This is a shared comparison utility, not an
 owner-policy interface.
 
+`createGitBaseAccess(tree)` supplies the matching `fetchBase(ref)` and
+`getBaseTipSha(ref)` callbacks for callers that also need to refresh a base. Fetching
+explicitly updates the same fully qualified remote-tracking ref that is read, even
+when the checkout's configured fetch mapping excludes that branch. Call `fetchBase`
+before each read and propagate failures; `getBaseTipSha` alone is a local read, not
+proof of freshness. This helper adds no status or owner policy.
+
 Synthetic tests exercise public acceptance and the local installed adapter with fake GitHub
 requests. They do not prove live status posting, model review quality, a marketplace release,
 or merge authorization. Version-matched release and private-consumer migration remain separate.
