@@ -148,6 +148,54 @@ newer_completion() {
   pg_review_input_binding_write "$NEWER" "$NEW_INPUT"
   pg_review_result_binding_write "$NEWER" "$NEW_RESULT"
 }
+# Repository spelling is case-insensitive; authenticated record bytes and marker paths are not.
+SAVED_NEWER="$NEWER"
+for shape in scoped generic; do
+  NEWER=pg-run-AcMe-WiDgEtS-1983-1700000900-2
+  [ "$shape" != generic ] || NEWER=pg-run-mixed-case
+  sidecars=(absent damaged)
+  [ "$shape" != scoped ] || sidecars+=(valid)
+  for sidecar in "${sidecars[@]}"; do
+    new_case "case-$shape-$sidecar"
+    newer_completion
+    CASE_INPUT="$(jq -cS '.repository.owner="AcMe" | .repository.repo="WiDgEtS"' <<<"$NEW_INPUT")"
+    printf '[P0] file.txt:1 - Latest blocker\nVERDICT: FIX-FIRST\n' > "$PRO_GATE_HOME/completed/$NEWER"
+    CASE_RESULT="$(jq -cS --arg ib "$(pg_review_sha256_text "$CASE_INPUT")" --arg digest "$(pg_sha256 "$PRO_GATE_HOME/completed/$NEWER")" '.input_binding_digest=$ib | .artifact.digest=$digest | .verdict="FIX-FIRST" | .ship_proof=null' <<<"$NEW_RESULT")"
+    printf '%s' "$CASE_INPUT" > "$PRO_GATE_HOME/review-input-bindings/$NEWER"
+    printf '%s' "$CASE_RESULT" > "$PRO_GATE_HOME/review-result-bindings/$NEWER"
+    case "$sidecar" in
+      valid) pg_run_meta_write "$NEWER" github.com ACME widgets AcMe-WiDgEtS-1983 1983 "$TDIR/review.md" 1700000900 ;;
+      damaged) mkdir -p "$PRO_GATE_HOME/run-meta"; printf 'github.com\tACME\twidgets\tbroken\t1983\n' > "$PRO_GATE_HOME/run-meta/$NEWER" ;;
+    esac
+    for spelling in acme/widgets ACME/WIDGETS; do
+      query --pr "https://github.com/$spelling/pull/1983"
+      check "$shape $sidecar mixed-case newest P0 survives query $spelling" ".status==\"accepted\" and .selected_marker==\"$NEWER\" and .review.verdict==\"FIX-FIRST\" and .review.open_p0==1 and .review.canonical_identity==\"$(pg_review_sha256_text "$CASE_RESULT")\""
+    done
+  done
+done
+NEWER=pg-run-AcMe-WiDgEtS-1983-1700000900-2
+for record in input result both; do
+  new_case "case-unbound-$record"
+  newer_completion
+  [ "$record" = result ] || rm "$PRO_GATE_HOME/review-input-bindings/$NEWER"
+  [ "$record" = input ] || rm "$PRO_GATE_HOME/review-result-bindings/$NEWER"
+  query
+  check "mixed-case scoped marker with missing $record obstructs older SHIP" '.status=="ambiguous" and .review==null'
+done
+new_case case-tampered
+newer_completion
+jq -cjS '.repository.owner="AcMe" | .repository.repo="WiDgEtS"' <<<"$NEW_INPUT" > "$PRO_GATE_HOME/review-input-bindings/$NEWER"
+query
+check 'case-only input tampering without digest rebinding remains invalid evidence' '.status!="accepted" and .status!="missing" and .review==null'
+new_case case-foreign
+newer_completion
+FOREIGN_INPUT="$(jq -cS '.repository.owner="AcMe" | .repository.repo="WiDgEtS-Other"' <<<"$NEW_INPUT")"
+FOREIGN_RESULT="$(jq -cS --arg ib "$(pg_review_sha256_text "$FOREIGN_INPUT")" '.input_binding_digest=$ib' <<<"$NEW_RESULT")"
+printf '%s' "$FOREIGN_INPUT" > "$PRO_GATE_HOME/review-input-bindings/$NEWER"
+printf '%s' "$FOREIGN_RESULT" > "$PRO_GATE_HOME/review-result-bindings/$NEWER"
+query
+check 'case folding does not conflate genuinely different repository names' '.status=="accepted" and (.selected_marker|endswith("1700000700-1"))'
+NEWER="$SAVED_NEWER"
 for scenario in corrupt unreadable missing-input missing-result missing-artifact malformed-input malformed-result input-digest wrong-target wrong-marker verdict-disagreement; do
   new_case "$scenario"
   newer_completion
