@@ -3092,7 +3092,14 @@ pg_review_finding_summary() {
       gsub("[*_`]";"") | sub("^[^[:alpha:]]+";"") |
       capture("^(?<severity>[Pp][0-3])(?=[^_[:alnum:]]|$)").severity | ascii_upcase;
     def flush:
-      if .current==null then . else .blocks += [.current] | .current=null end;
+      if .current==null then . else
+        if .current.section then
+          .current.lines |= map(select((test("^\\s*$") or none_declaration or
+            test("^no\\s+(?:\\S+\\s+){0,3}(?:findings?|issues?|blockers?|items?|problems?)\\b";"i"))|not))
+        else . end |
+        if .current.section and (.current.lines|length)==0 then .current=null
+        else .blocks += [(.current|del(.section))] | .current=null end
+      end;
     def bounded:
       if length<=1024 then . else
         . as $text | length as $size |
@@ -3116,8 +3123,10 @@ pg_review_finding_summary() {
          ($normal|test("^#{1,6}\\s+")) as $heading |
          ([$normal | if $heading then sub("^#{1,6}\\s+";"") else . end | headline] | first // null) as $head |
          ([$normal|unsupported_label] | first // null) as $unsupported |
-         if $heading and ($head==null or ($head.text|section_text or none_declaration)) then
-           flush
+         if $heading and $head==null then
+           flush | .unknown=(.unknown or ($unsupported|IN("P0","P1")))
+         elif $heading and ($head.text|section_text or none_declaration) then
+           flush | .current={severity:$head.severity,lines:[],section:true}
          elif $head!=null then
            flush |
            if ($head.text|test("^\\s*$")) then

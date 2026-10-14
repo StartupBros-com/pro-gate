@@ -463,11 +463,16 @@ for severity in P2 P3; do
     "### [$severity] lib/x.sh:12 — a nit"$'\nVERDICT: FIX-FIRST\n' \
     "$ROUND3_DEFERRAL_PREDICATE and .facts.deferred_findings==[{severity:\"$severity\",text:\"lib/x.sh:12 — a nit\"}]"
 done
-for heading in '## P2 findings' '## Findings' '## Refuted'; do
+for heading in '## Findings' '## Refuted'; do
   direct_review_case "R3-P1 boundary $heading closes a resolved blocker" \
     $'[P1] a.sh:1 — RESOLVED — patched.\n'"$heading"$'\nCorrection: STILL-PRESENT; still broken\n[P3] c.sh:3 — a nit\nVERDICT: FIX-FIRST\n' \
     "$ROUND3_DEFERRAL_PREDICATE and .facts.deferred_findings==[{severity:\"P3\",text:\"c.sh:3 — a nit\"}]"
 done
+# Round-3 repair: a severity section heading still closes the resolved P1, but its body is a
+# deferred P2 rather than dropped text (the body-dropping expectation was the round-3 regression).
+direct_review_case 'R3-P1 boundary ## P2 findings closes a resolved blocker and keeps its body as a deferred P2' \
+  $'[P1] a.sh:1 — RESOLVED — patched.\n## P2 findings\nCorrection: STILL-PRESENT; still broken\n[P3] c.sh:3 — a nit\nVERDICT: FIX-FIRST\n' \
+  '.action=="allow-existing-merge-workflow" and .reason=="fix-first-deferred-p2-only" and .facts.open_blocking==0 and .facts.deferred_count==2 and .facts.deferred_findings==[{severity:"P2",text:"Correction: STILL-PRESENT; still broken"},{severity:"P3",text:"c.sh:3 — a nit"}]'
 for label in '> [P2]' '> [P3]' 'P2]' '`[P3]`'; do
   direct_review_case "R3-P2 unsupported $label closes a resolved blocker without counting the quotation" \
     $'[P1] a.sh:1 — RESOLVED — patched.\n'"$label"$' b.sh:2 — quoted\nCorrection: STILL-PRESENT; still broken\n[P3] c.sh:3 — a nit\nVERDICT: FIX-FIRST\n' \
@@ -478,6 +483,49 @@ direct_review_case 'R3-P1 malformed non-heading P1 label still leaves counts una
   '.action=="fix-review-findings" and .facts.open_blocking==null'
 direct_review_case 'R3-P1 bare P1 em-dash finding keeps its existing grammar' \
   $'P1 — something unparsed\nVERDICT: FIX-FIRST\n' "$BLOCKING_PREDICATE"
+
+# PR #276 round 3 repair: section vocabulary can also title a real finding, and an
+# unparseable blocking heading must not turn unknown counts into known zeroes.
+SECTION_FINDING_BODY=$'lib/comments.sh:12 — Posting a comment deadlocks while holding the lock needed by the worker.\nSuggested fix: release the lock before waiting.\n'
+for heading in '### [P1] Blocking comments' '### [P0] Blocking issues'; do
+  direct_review_case "R3-repair-P1-1 $heading retains its blocking body" \
+    "$heading"$'\n'"$SECTION_FINDING_BODY"$'[P2] b.sh:2 — a nit\nVERDICT: FIX-FIRST\n' \
+    "$BLOCKING_PREDICATE"
+done
+for severity in P2 P3; do
+  direct_review_case "R3-repair-P1-1 section-like $severity heading retains its deferred body" \
+    "### [$severity] Blocking comments"$'\n'"$SECTION_FINDING_BODY"$'VERDICT: FIX-FIRST\n' \
+    ".action==\"allow-existing-merge-workflow\" and .reason==\"fix-first-deferred-p2-only\" and .facts.open_blocking==0 and .facts.deferred_count==1 and .facts.deferred_findings==[{severity:\"$severity\",text:\"lib/comments.sh:12 — Posting a comment deadlocks while holding the lock needed by the worker.\\nSuggested fix: release the lock before waiting.\"}]"
+done
+for heading in '### [**P1**] lib/x.sh:12 — the lock is deleted' \
+  '## (P1) lib/x.sh:12 — the lock is deleted' \
+  '## 1. P1 lib/x.sh:12 — the lock is deleted' \
+  '### [**P0**] lib/x.sh:12 — the lock is deleted'; do
+  direct_review_case "R3-repair-P1-2 malformed heading $heading leaves counts unavailable" \
+    "$heading"$'\n[P2] b.sh:2 — a nit\nVERDICT: FIX-FIRST\n' \
+    '.action=="fix-review-findings" and .facts.open_blocking==null'
+done
+direct_review_case 'R3-repair control explicit none closes an empty section' \
+  $'## P1 findings\nP1: none\n[P2] b.sh:2 — a nit\nVERDICT: FIX-FIRST\n' \
+  "$ROUND3_DEFERRAL_PREDICATE"
+direct_review_case 'R3-repair control prose none closes an empty section' \
+  $'## P1 findings\nNo P1 findings in this round.\n[P2] b.sh:2 — a nit\nVERDICT: FIX-FIRST\n' \
+  "$ROUND3_DEFERRAL_PREDICATE"
+direct_review_case 'R3-repair control blank sections preserve P2-only deferral' \
+  $'## P1\n\n## P2 findings\n[P2] b.sh:2 — a nit\nVERDICT: FIX-FIRST\n' \
+  "$ROUND3_DEFERRAL_PREDICATE"
+direct_review_case 'R3-repair control generic section keeps a following blocker visible' \
+  $'## Findings\n[P1] a.sh:1 — bug\nVERDICT: FIX-FIRST\n' "$BLOCKING_PREDICATE"
+direct_review_case 'R3-repair control a finding headline flushes an empty severity section' \
+  $'## P1 findings\n- [P1] a.sh:1 — bug\nVERDICT: FIX-FIRST\n' "$BLOCKING_PREDICATE"
+direct_review_case 'R3-repair-P1-1 a section-like blocker retains fenced evidence' \
+  $'### [P1] Blocking comments\n```sh\n[P2] quoted.sh:2 — quoted evidence\n```\n[P2] b.sh:2 — a nit\nVERDICT: FIX-FIRST\n' "$BLOCKING_PREDICATE"
+direct_review_case 'R3-repair-P1-1 a section-like P2 retains fenced evidence verbatim' \
+  $'### [P2] Blocking comments\n```sh\n[P1] quoted.sh:1 — quoted evidence\n```\nVERDICT: FIX-FIRST\n' \
+  '.action=="allow-existing-merge-workflow" and .facts.open_blocking==0 and .facts.deferred_count==1 and .facts.deferred_findings==[{severity:"P2",text:"```sh\n[P1] quoted.sh:1 — quoted evidence\n```"}]'
+direct_review_case 'R3-repair control provisional sections discard only empty declarations' \
+  $'## P0 issues\n\nnone\nNO P0 BLOCKING ISSUES in this round.\n## P1 findings\n—\nNo open P1 findings remain.\n## P2 findings\n-\nNo findings in this round.\n[P2] b.sh:2 — a nit\nVERDICT: FIX-FIRST\n' \
+  "$ROUND3_DEFERRAL_PREDICATE"
 for status in 'Correction: STILL-PRESENT; concurrent requests still lose data.' 'REOPENED' 'NOT RESOLVED' 'NOT FIXED' 'Correction: the patch missed this path.' 'Correction:'; do
   direct_review_case "P1-2 continuation $status reopens a RESOLVED finding" \
     $'[P1] runtime.sh:1 — RESOLVED — patched.\n  '"$status"$'\n'"$DEFERRAL_BODY" "$BLOCKING_PREDICATE"
