@@ -990,6 +990,7 @@ function makeGetReviewFacts(owner, repo, args) {
       encoding: "utf8",
     }).trim();
     const target = `https://github.com/${owner}/${repo}/pull/${pr}`;
+    const candidateHead = args.reviewedSha.trim().toLowerCase();
     const env = { ...process.env };
     let endpoint = env.PRO_GATE_REVIEW_ENDPOINT_PATCH;
     let snapshot = env.PRO_GATE_REVIEW_PR_EVIDENCE;
@@ -1012,6 +1013,8 @@ function makeGetReviewFacts(owner, repo, args) {
             checkout,
             "--pr",
             target,
+            "--candidate-head",
+            candidateHead,
           ],
           env,
         );
@@ -1079,6 +1082,8 @@ function makeGetReviewFacts(owner, repo, args) {
         "--pr",
         target,
         "--json",
+        "--candidate-head",
+        candidateHead,
         "--diff",
         args.diff ?? endpoint,
       ];

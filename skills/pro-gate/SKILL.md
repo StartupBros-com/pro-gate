@@ -36,7 +36,10 @@ jq -e --arg id "$CONTRACT_ID" --argjson version "$CONTRACT_VERSION" \
 Require `schema: "review-facts/v1"`. `status: "accepted"` supplies `review` identity, artifact
 digest, reviewed head, evidence relation, verdict, named choices, and artifact-bound open P0/P1.
 Other statuses (`missing`, `invalid`, `incomplete`, `ambiguous`) have `review: null`; unavailable
-counts are not zero. `candidate_head` is the checkout revision, not the reviewed revision.
+counts are not zero. `candidate_head` defaults to the checkout revision, not the reviewed revision.
+For inspection of an explicit PR revision from another checkout branch, pass `--candidate-head`
+with its full SHA; this chooses the target, not its approval. This flag is also accepted by evidence
+preparation, which checks it against the live PR, but never by review execution or continuation.
 `applicable` is `null` without current proof, `false` for known non-matches, and `true` only after
 complete matching proof; verdict is separate. Reuse `--diff`, `--input`, `--confirm` and the
 existing PR-evidence/endpoint/manifest environment inputs when applicability is requested.

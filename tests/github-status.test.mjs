@@ -2182,6 +2182,36 @@ test("inspection skill checks the matching runtime without browser or network pr
   assert.deepEqual(f.calls(), [], "inspection never invokes network preflight");
 });
 
+for (const proofMode of ["prepared", "explicit"]) {
+  test(`status recording uses the proven PR head from a default-branch checkout: ${proofMode}`, (t) => {
+    const f = cliFixture(t);
+    const proofEnv =
+      proofMode === "explicit"
+        ? {
+            PRO_GATE_REVIEW_ENDPOINT_PATCH: f.endpoint,
+            PRO_GATE_REVIEW_PR_EVIDENCE: f.evidenceFile,
+          }
+        : {};
+    f.git("checkout", "-q", "main");
+    assert.equal(f.git("rev-parse", "HEAD"), f.base);
+    const recorded = f.invoke([], proofEnv);
+    assert.equal(recorded.status, 0, recorded.stdout + recorded.stderr);
+    assert.equal(f.posts().length, 1);
+    assert.ok(f.posts()[0].includes(`repos/acme/widgets/statuses/${f.head}`));
+    assert.ok(f.posts()[0].includes("state=success"));
+    assert.equal(
+      f.git("rev-parse", "HEAD"),
+      f.base,
+      "recording must not switch branches",
+    );
+
+    f.configure({ head: f.base });
+    const stale = f.invoke([], proofEnv);
+    assert.equal(stale.status, 1, stale.stdout + stale.stderr);
+    assert.equal(f.posts().length, 1, "a changed live PR head still refuses");
+  });
+}
+
 test("shared git helper refuses an absent checkout or unresolved unchanged-base objects", async (t) => {
   const f = cliFixture(t);
   await assert.rejects(

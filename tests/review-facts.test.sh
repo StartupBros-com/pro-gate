@@ -122,6 +122,14 @@ check 'known changed reviewed bytes keep historical facts but are not applicable
 git -C "$TDIR/checkout" -c user.name=Fixture -c user.email=fixture@example.invalid commit --allow-empty -qm moved-head
 query --diff "$TDIR/endpoint.patch"
 check 'moving checkout HEAD keeps the reviewed revision, verdict, and counts but is not applicable' '.status=="accepted" and .applicable==false and .candidate_head!=.review.reviewed_head and .review.open_p0==0'
+query --candidate-head "$HEAD" --diff "$TDIR/endpoint.patch"
+check 'explicit candidate with complete matching proof is applicable independently of checkout HEAD' '.status=="accepted" and .applicable==true and .candidate_head==.review.reviewed_head'
+query --candidate-head "$BASE" --diff "$TDIR/endpoint.patch"
+check 'explicit different candidate preserves historical evidence but refuses applicability' '.status=="accepted" and .applicable==false and .candidate_head!=.review.reviewed_head'
+unset PRO_GATE_REVIEW_PR_EVIDENCE
+query --candidate-head "$HEAD" --diff "$TDIR/endpoint.patch"
+check 'explicit candidate without complete proof does not establish current SHIP' '.status=="accepted" and .applicable==null'
+current_proof
 git -C "$TDIR/checkout" checkout --detach -q "$HEAD"
 new_case missing
 mkdir -p "$TDIR/empty-state"
@@ -359,6 +367,27 @@ CHECKS=$((CHECKS + 1))
 query --input typo
 CHECKS=$((CHECKS + 1))
 [ "$RC" -eq 2 ] || { printf 'FAIL - invalid explicit proof mode accepted\n' >&2; FAILS=$((FAILS + 1)); }
+for candidate in '' short not-a-sha; do
+  query --candidate-head "$candidate"
+  CHECKS=$((CHECKS + 1))
+  if [ "$RC" -eq 2 ] && grep -Fq -- '--candidate-head requires a full commit SHA' "$TDIR/err"; then
+    printf 'ok - malformed explicit candidate rejects before effects\n'
+  else
+    printf 'FAIL - malformed explicit candidate accepted\n' >&2; FAILS=$((FAILS + 1))
+  fi
+done
+for mode in fresh decision status; do
+  mode_args=(); [ "$mode" != decision ] || mode_args=(--review-decision --json)
+  [ "$mode" != status ] || mode_args=(--status --json)
+  RC=0
+  bash "$TDIR/installed/oracle-review.sh" --repo "$TDIR/checkout" --pr 1983 --candidate-head "$HEAD" "${mode_args[@]}" > "$TDIR/out.json" 2> "$TDIR/err" || RC=$?
+  CHECKS=$((CHECKS + 1))
+  if [ "$RC" -eq 2 ] && grep -Fq -- '--candidate-head is only supported' "$TDIR/err" && [ ! -e "$PG_FACTS_EFFECT_LOG" ]; then
+    printf 'ok - explicit candidate cannot select %s execution\n' "$mode"
+  else
+    printf 'FAIL - explicit candidate escaped into %s mode\n' "$mode" >&2; FAILS=$((FAILS + 1))
+  fi
+done
 query
 check 'same invocation without incompatible flags is permitted' '.status=="accepted" and .applicable==null'
 printf '%s checks, %s failures\n' "$CHECKS" "$FAILS"

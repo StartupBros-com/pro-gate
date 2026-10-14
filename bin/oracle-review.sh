@@ -44,6 +44,8 @@
 #   oracle-review.sh --review-facts --repo <dir> --pr <number|canonical-pr-url> --json
 #       Read retained accepted review facts without delivery, recovery or decision effects.
 #       Current applicability requires complete supplied proof; historical verdicts are separate.
+#       --candidate-head <full-sha> selects an explicit target for inspection/preparation only;
+#       without it, both modes retain their checkout-HEAD default.
 #   oracle-review.sh --status [<pr-number|pr-url|pg-run-marker>] [--json]
 #       Expert/read-only diagnostics (v0.27): join reservations, round budget, remembered
 #       conversation URLs, and the ledger, and print each matching run's state plus the exact
@@ -132,7 +134,7 @@ pg_out_guard_acquire() {
 PR=""; REPO=""; DIFF_FILE=""; DIFF_IS_CALLER_SUPPLIED=0; INPUT=""; INPUT_SUPPLIED=0; OUT=""; TIMEOUT=""; EXTRA_GLOB=""; HARVEST_MARKER=""; HARVEST_REQUESTED=0; CONFIRM_FILE=""; BRIEF_FILE=""
 STATUS_REQUESTED=0; STATUS_QUERY=""; AS_JSON=0; RECOVER_REQUESTED=0; RECOVER_QUERY=""
 REVIEW_DECISION_REQUESTED=0; REVIEW_DECISION_EFFECT_FILE=""; REVIEW_CHOICE_SELECTION_FILE=""; PREPARE_EVIDENCE_DIR=""
-REVIEW_FACTS_REQUESTED=0; REVIEW_FACTS_INCOMPATIBLE=0
+REVIEW_FACTS_REQUESTED=0; REVIEW_FACTS_INCOMPATIBLE=0; CANDIDATE_HEAD=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --out|--timeout|--extra-files|--brief|--harvest|--recover|--status|--review-decision|--review-decision-effect|--review-choice-selection|--prepare-review-evidence)
@@ -148,7 +150,7 @@ while [ $# -gt 0 ]; do
   # symptoms with a clean usage error. --status is excluded: its second argument is deliberately
   # optional (its own branch below already handles "missing").
   case "$1" in
-    --pr|--repo|--diff|--input|--out|--timeout|--extra-files|--confirm|--brief|--harvest|--recover|--review-decision-effect|--review-choice-selection|--prepare-review-evidence)
+    --pr|--repo|--diff|--input|--out|--timeout|--extra-files|--confirm|--brief|--harvest|--recover|--review-decision-effect|--review-choice-selection|--prepare-review-evidence|--candidate-head)
       [ $# -ge 2 ] || { echo "ERROR: $1 requires a value" >&2; exit 2; };;
   esac
   case "$1" in
@@ -164,6 +166,9 @@ while [ $# -gt 0 ]; do
     --harvest) HARVEST_REQUESTED=1; HARVEST_MARKER="${2:-}"; shift 2;;
     --recover) RECOVER_REQUESTED=1; RECOVER_QUERY="${2:-}"; shift 2;;
     --review-facts) REVIEW_FACTS_REQUESTED=1; shift;;
+    --candidate-head)
+      [[ "$2" =~ ^[0-9a-fA-F]{40}$ ]] || { echo 'ERROR: --candidate-head requires a full commit SHA' >&2; exit 2; }
+      CANDIDATE_HEAD="${2,,}"; shift 2;;
     --review-decision) REVIEW_DECISION_REQUESTED=1; shift;;
     --review-decision-effect) REVIEW_DECISION_REQUESTED=1; REVIEW_DECISION_EFFECT_FILE="$2"; shift 2;;
     --review-choice-selection) REVIEW_CHOICE_SELECTION_FILE="$2"; shift 2;;
@@ -178,10 +183,16 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# An explicit candidate is for file-only inspection/preparation, never review execution.
+if [ -n "$CANDIDATE_HEAD" ] && [ "$REVIEW_FACTS_REQUESTED" != 1 ] && [ -z "$PREPARE_EVIDENCE_DIR" ]; then
+  echo 'ERROR: --candidate-head is only supported with --review-facts or --prepare-review-evidence' >&2
+  exit 2
+fi
+
 # Retained inspection is independent of fresh-delivery policy and all lifecycle/effect paths.
 if [ "$REVIEW_FACTS_REQUESTED" = 1 ]; then
   if [ "$REVIEW_FACTS_INCOMPATIBLE" = 1 ] || [ -z "$REPO" ] || [ -z "$PR" ] || [ "$AS_JSON" != 1 ]; then
-    echo 'ERROR: --review-facts requires --repo, --pr and --json; only --diff, --input and --confirm proof inputs may be added' >&2
+    echo 'ERROR: --review-facts requires --repo, --pr and --json; only --candidate-head, --diff, --input and --confirm inputs may be added' >&2
     exit 2
   fi
   if [ "$INPUT_SUPPLIED" = 1 ]; then
@@ -189,7 +200,7 @@ if [ "$REVIEW_FACTS_REQUESTED" = 1 ]; then
   else
     INPUT=bundle
   fi
-  pg_review_facts_cli "$REPO" "$PR"
+  pg_review_facts_cli "$REPO" "$PR" "$CANDIDATE_HEAD"
   exit $?
 fi
 
@@ -197,7 +208,7 @@ fi
 if [ -n "$PREPARE_EVIDENCE_DIR" ]; then
   if [ -z "$PR" ] || [ "$REVIEW_DECISION_REQUESTED$STATUS_REQUESTED$RECOVER_REQUESTED$HARVEST_REQUESTED$INPUT_SUPPLIED$AS_JSON" != 000000 ] \
      || [ -n "$OUT$DIFF_FILE$CONFIRM_FILE$BRIEF_FILE$EXTRA_GLOB$REVIEW_CHOICE_SELECTION_FILE$TIMEOUT" ]; then
-    echo 'ERROR: evidence preparation accepts only --pr, --repo and --prepare-review-evidence' >&2; exit 2
+    echo 'ERROR: evidence preparation accepts only --pr, --repo, --candidate-head and --prepare-review-evidence' >&2; exit 2
   fi
   REPO="${REPO:-$(pwd)}"
   case "$PR" in
@@ -206,7 +217,7 @@ if [ -n "$PREPARE_EVIDENCE_DIR" ]; then
   esac
   prep_identity="$(pg_repo_identity_from_url "$prep_target")" || { echo 'ERROR: cannot identify PR repository' >&2; exit 2; }
   IFS=$'\t' read -r prep_host prep_owner prep_repo <<<"$prep_identity"
-  pg_prepare_pr_evidence "$REPO" "$prep_host" "$prep_owner" "$prep_repo" "$prep_number" "$PREPARE_EVIDENCE_DIR"
+  pg_prepare_pr_evidence "$REPO" "$prep_host" "$prep_owner" "$prep_repo" "$prep_number" "$PREPARE_EVIDENCE_DIR" "$CANDIDATE_HEAD"
   exit $?
 fi
 

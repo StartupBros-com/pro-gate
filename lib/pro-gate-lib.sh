@@ -907,7 +907,7 @@ pg_pr_metadata_fetch() { # host owner repo pr -> canonical identity, bounded and
   printf '%s' "$metadata"
 }
 
-pg_pr_evidence_read() { # snapshot endpoint repo host owner name pr -> validated snapshot
+pg_pr_evidence_read() { # snapshot endpoint repo host owner name pr [candidate-head] -> validated snapshot
   local file="$1" endpoint="$2" repo="$3" host="$4" owner="$5" name="$6" pr="$7"
   local evidence metadata digest head
   [ -f "$file" ] && [ ! -L "$file" ] && [ "$(wc -c < "$file")" -le 65536 ] || return 1
@@ -920,7 +920,8 @@ pg_pr_evidence_read() { # snapshot endpoint repo host owner name pr -> validated
   ' "$file")" || return 1
   metadata="$(jq -cS .metadata <<<"$evidence")" || return 1
   pg_pr_metadata_validate "$metadata" "$host" "$owner" "$name" "$pr" || return 1
-  head="$(git -C "$repo" rev-parse HEAD)" || return 1
+  head="${8:-}"
+  [ -n "$head" ] || head="$(git -C "$repo" rev-parse HEAD)" || return 1
   digest="$(pg_sha256 "$endpoint")" || return 1
   jq -e --arg head "$head" --arg digest "$digest" \
     '.metadata.target.head_oid==$head and .endpoint_digest==$digest' <<<"$evidence" >/dev/null || return 1
@@ -944,19 +945,20 @@ pg_pr_evidence_metadata_digest() { # validated snapshot -> pr_metadata_digest
   pg_review_sha256_text "$metadata"
 }
 
-pg_prepare_pr_evidence() ( # repo host owner name pr new-output-directory
+pg_prepare_pr_evidence() ( # repo host owner name pr new-output-directory [candidate-head]
   set -euo pipefail
-  local repo="$1" host="$2" owner="$3" name="$4" pr="$5" dest="$6" before after base head tmp digest
+  local repo="$1" host="$2" owner="$3" name="$4" pr="$5" dest="$6" before after base head checkout_head tmp digest
   local gh_bin="${PRO_GATE_GH_BIN:-gh}" timeout_bin="${PRO_GATE_TIMEOUT_BIN:-timeout}" claimed=false published=false
   [ ! -e "$dest" ] && [ ! -L "$dest" ] || { echo 'ERROR: evidence output directory must be new' >&2; exit 2; }
   # Callers use this helper in conditionals, where Bash suppresses errexit even
   # in a subshell. Every fallible preparation/publication step must stop explicitly.
-  head="$(git -C "$repo" rev-parse HEAD)" || exit 2
+  checkout_head="$(git -C "$repo" rev-parse HEAD)" || exit 2
+  head="${7:-$checkout_head}"
   before="$(pg_pr_metadata_fetch "$host" "$owner" "$name" "$pr")" || {
     echo 'ERROR: cannot establish current PR metadata; no review submitted' >&2; exit 2;
   }
   jq -e --arg head "$head" '.target.head_oid==$head' <<<"$before" >/dev/null || {
-    echo 'ERROR: local HEAD is not the current PR head; no review submitted' >&2; exit 2;
+    echo 'ERROR: candidate head is not the current PR head; no review submitted' >&2; exit 2;
   }
   mkdir -p "$(dirname "$dest")" || exit 2
   tmp="$(mktemp -d "${dest}.prepare.XXXXXX")" || exit 2
@@ -978,7 +980,7 @@ pg_prepare_pr_evidence() ( # repo host owner name pr new-output-directory
     echo 'ERROR: PR patch is empty or exceeds the evidence limit' >&2; exit 2;
   }
   after="$(pg_pr_metadata_fetch "$host" "$owner" "$name" "$pr")" || exit 2
-  [ "$before" = "$after" ] && [ "$head" = "$(git -C "$repo" rev-parse HEAD)" ] || {
+  [ "$before" = "$after" ] && [ "$checkout_head" = "$(git -C "$repo" rev-parse HEAD)" ] || {
     echo 'ERROR: PR head/base changed while preparing evidence; no review submitted' >&2; exit 2;
   }
   digest="$(pg_sha256 "$tmp/endpoint.patch")" || exit 2
@@ -4630,7 +4632,7 @@ pg_review_accepted_ship_matches() { # accepted facts base head raw-digest
 # Rebuild a binding's evidence relation from the exact files named by the invocation. This checks
 # proof only: marker and charged epoch remain immutable history, and are separately validated.
 # Scoped review deliberately hashes its raw endpoint and reviewed payload independently.
-pg_review_decision_input_proof_current() { # binding repo pr host owner name head base
+pg_review_decision_input_proof_current() { # binding repo pr host owner name head base [explicit-candidate]
   local binding="$1" repo="$2" pr="$3" host="$4" owner="$5" name="$6" head="$7" base="$8"
   local mode endpoint reviewed manifest confirmation raw_digest reviewed_digest manifest_digest confirmation_digest lineage pr_evidence metadata_digest
   pg_review_input_binding_validate "$binding" "$(jq -r '.marker // ""' <<<"$binding" 2>/dev/null)" || return 1
@@ -4640,7 +4642,7 @@ pg_review_decision_input_proof_current() { # binding repo pr host owner name hea
   mode="$(jq -r .evidence.mode <<<"$binding")"
   case "$mode" in full-pr|scoped-delta)
     pr_evidence="$(pg_pr_evidence_read "${PRO_GATE_REVIEW_PR_EVIDENCE:-}" "${PRO_GATE_REVIEW_ENDPOINT_PATCH:-}" \
-      "$repo" "$host" "$owner" "$name" "$pr")" || return 1
+      "$repo" "$host" "$owner" "$name" "$pr" "${9:-}")" || return 1
     metadata_digest="$(pg_pr_evidence_metadata_digest "$pr_evidence")" || return 1
     jq -e --arg digest "$metadata_digest" '.evidence.proof.pr_metadata_digest==$digest' <<<"$binding" >/dev/null || return 1
     [ "$base" = "$(jq -r .metadata.target.base_oid <<<"$pr_evidence")" ] || return 1
@@ -4775,7 +4777,7 @@ pg_review_facts_emit() { # status reason repository pr candidate-head selected-m
         open_p0:$accepted.open_p0,open_p1:$accepted.open_p1} end)}'
 }
 
-pg_review_facts_cli() { # checkout number-or-canonical-PR-URL; inspection only, no decision/lifecycle reduction
+pg_review_facts_cli() { # checkout number-or-canonical-PR-URL [candidate-head]; inspection only
   local repo="$1" query="$2" ident host owner name pr head repository candidates newest selected marker accepted input rc
   local applicable=null reason=accepted-review base='' pr_evidence='' mode path field expected actual raw_digest='' differing=false
   local REVIEW_DECISION_REVIEWED_DIFF_FILE="${DIFF_FILE:-}"
@@ -4790,7 +4792,8 @@ pg_review_facts_cli() { # checkout number-or-canonical-PR-URL; inspection only, 
     || { echo 'ERROR: --review-facts requires a numeric PR with canonical origin, or a canonical PR URL' >&2; return 2; }
   IFS=$'\t' read -r host owner name <<<"$ident"
   repository="$(jq -cnS --arg h "$host" --arg o "$owner" --arg r "$name" '{host:$h,owner:$o,repo:$r}')"
-  head="$(git -C "$repo" rev-parse --verify HEAD 2>/dev/null || true)"
+  head="${3:-}"
+  [ -n "$head" ] || head="$(git -C "$repo" rev-parse --verify HEAD 2>/dev/null || true)"
   case "$head" in ''|*[!0-9a-f]*) head='' ;; esac
   candidates="$(pg_review_facts_candidates "$host" "$owner" "$name" "$pr")" || {
     pg_review_facts_emit invalid completion-store-unreadable "$repository" "$pr" "$head" '' null null; return;
@@ -4848,7 +4851,7 @@ pg_review_facts_cli() { # checkout number-or-canonical-PR-URL; inspection only, 
     fi
   done
   pr_evidence="$(pg_pr_evidence_read "${PRO_GATE_REVIEW_PR_EVIDENCE:-}" "${PRO_GATE_REVIEW_ENDPOINT_PATCH:-}" \
-    "$repo" "$host" "$owner" "$name" "$pr" 2>/dev/null || true)"
+    "$repo" "$host" "$owner" "$name" "$pr" "${3:-}" 2>/dev/null || true)"
   if [ -n "$pr_evidence" ]; then
     base="$(jq -r .metadata.target.base_oid <<<"$pr_evidence")"
     expected="$(jq -r '.evidence.proof.pr_metadata_digest // empty' <<<"$input")"
@@ -4856,7 +4859,7 @@ pg_review_facts_cli() { # checkout number-or-canonical-PR-URL; inspection only, 
   fi
   if [ "$differing" = true ]; then
     applicable=false; reason=different-head-or-evidence
-  elif pg_review_decision_input_proof_current "$input" "$repo" "$pr" "$host" "$owner" "$name" "$head" "$base" >/dev/null 2>&1; then
+  elif pg_review_decision_input_proof_current "$input" "$repo" "$pr" "$host" "$owner" "$name" "$head" "$base" "${3:-}" >/dev/null 2>&1; then
     applicable=true; reason=matching-current-proof
     if [ "$(jq -r .verdict <<<"$accepted")" = SHIP ]; then
       [ ! -f "${DIFF_FILE:-}" ] || raw_digest="$(pg_sha256 "$DIFF_FILE")"

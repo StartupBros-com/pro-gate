@@ -152,6 +152,13 @@ query the network/browser, spend a round, or override a stop. Invalid fresh-revi
 attachment policy does not block inspection. It requires local `git`, `jq`, and a SHA-256 tool,
 not a signed-in browser or private consumer parser.
 
+Inspection defaults to the checkout's current HEAD. `--candidate-head <full-sha>` instead
+selects an explicit revision without switching branches. Matching that SHA alone is not proof:
+current applicability still requires the complete accepted input proof. The same optional flag
+on `--prepare-review-evidence` requires the live PR to name that exact head; it is rejected by
+review execution, continuation, recovery and status modes. The GitHub adapter supplies its
+live-checked reviewed SHA, so recording also works from a default-branch checkout.
+
 The additive JSON schema is `review-facts/v1`. Consumers should check `schema` and `status`,
 allow additional fields, and treat unavailable facts as unavailable, not zero.
 
@@ -162,7 +169,7 @@ allow additional fields, and treat unavailable facts as unavailable, not zero.
 | `reason` | Selection, acceptance, or applicability explanation |
 | `repository` / `pr` | Requested `{host, owner, repo}` and numeric PR |
 | `selected_marker` | Selected completion marker; `null` when no unique selection is proven |
-| `candidate_head` | Checkout's current HEAD, or `null` if unavailable; separate from the reviewed revision |
+| `candidate_head` | Explicit `--candidate-head`, otherwise checkout's current HEAD or `null` if unavailable; separate from the reviewed revision |
 | `applicable` | `true` for complete matching current proof; `false` for known different head/evidence; `null` when proof is unavailable |
 | `review` | Accepted facts below, or `null` for every unaccepted result |
 | `review.canonical_identity` | SHA-256 of the canonical accepted result binding, including its supported predecessor contract identity |
