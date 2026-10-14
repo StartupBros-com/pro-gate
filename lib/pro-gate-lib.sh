@@ -4748,11 +4748,11 @@ pg_review_facts_candidates() { # host owner repo pr -> candidate metadata JSON
       fi
     fi
     # Only a digest-bound input can exclude a colliding key without a valid sidecar.
-    # An unscoped surviving result cannot rule this target out. A result-bound scoped marker
-    # can still identify another PR; damaged records there must not block every unrelated PR.
+    # An unscoped surviving result cannot rule this target out. A result-bound marker with the
+    # full owner-repo-PR-epoch-PID shape can identify another PR without blocking unrelated PRs.
     if [ "$relevant" = false ] && [ "$bound" = true ]; then continue; fi
     if [ -z "$meta" ] && [ "$bound" = false ] && [ -n "$result" ] \
-      && ! [[ "$marker" =~ ^pg-run-.+-[0-9]+-[0-9]+$ ]]; then relevant=true; fi
+      && ! [[ "$marker" =~ ^pg-run-.+-.+-[1-9][0-9]*-[0-9]+-[0-9]+$ ]]; then relevant=true; fi
     case "$marker" in "pg-run-$key-"*) relevant=true ;; esac
     [ "$relevant" = true ] || continue
     # Contradictory full attribution is not permission to reinterpret a target-looking marker.

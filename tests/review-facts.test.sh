@@ -258,8 +258,13 @@ query --diff "$TDIR/endpoint.patch"
 check 'applicability is separate from verdict: a matching FIX-FIRST review is applicable' '.status=="accepted" and .applicable==true and .review.verdict=="FIX-FIRST"'
 # No sidecar: unbound target/epoch edits must never demote a newer blocking review.
 SAVED_NEWER="$NEWER"
-for shape in keyed generic; do
-  NEWER="$SAVED_NEWER"; [ "$shape" != generic ] || NEWER=pg-run-newer
+for shape in keyed generic numeric-generic partial-key; do
+  case "$shape" in
+    keyed) NEWER="$SAVED_NEWER" ;;
+    generic) NEWER=pg-run-newer ;;
+    numeric-generic) NEWER=pg-run-newer-1700000900-2 ;;
+    partial-key) NEWER=pg-run-newer-1983-1700000900-2 ;;
+  esac
   for mutation in repo pr epoch symlink missing-input named-choice; do
     new_case "unbound-$shape-$mutation"
     newer_completion
