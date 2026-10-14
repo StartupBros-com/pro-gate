@@ -77,6 +77,26 @@ precheck() {
   PRECHECKS=$((PRECHECKS + 1))
   if [ "$2" = 0 ]; then printf 'ok - %s\n' "$1"; else printf 'FAIL - %s\n' "$1"; PRECHECK_FAILS=$((PRECHECK_FAILS + 1)); fi
 }
+typed_query() {
+  local before
+  before="$(snapshot)"
+  TYPED_RC=0
+  env PRO_GATE_INPUT_POLICY=bundle-only PRO_GATE_BROWSER_ATTACHMENTS=auto \
+    PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/endpoint.patch" \
+    bash "$ROOT/bin/oracle-review.sh" --review-decision --repo "$TDIR/checkout" --pr 1983 \
+      --diff "$TDIR/endpoint.patch" --input bundle --json > "$TDIR/decision.json" 2> "$TDIR/decision.err" || TYPED_RC=$?
+  [ "$before" = "$(snapshot)" ] && [ ! -e "$PG_FACTS_EFFECT_LOG" ]
+}
+typed_envelope() { # expected action reason; the consumer validator re-reduces the full facts
+  [ "$TYPED_RC" = 0 ] && pg_review_decision_envelope_valid "$TDIR/decision.json" &&
+    jq -e --arg action "$1" --arg reason "$2" '
+      .action==$action and .reason==$reason and .effect_request.execution_class=="report-only" and
+      (.facts|type=="object" and length>0) and
+      (.contract.contract_digest|test("^[0-9a-f]{64}$")) and
+      (.contract.corpus_digest|test("^[0-9a-f]{64}$")) and
+      (.effect_request.snapshot_digest|test("^[0-9a-f]{64}$"))
+    ' "$TDIR/decision.json" >/dev/null
+}
 for function in pg_review_decision_ship_mode_bindable pg_review_decision_repair_result_binding; do
   eval "$(awk -v name="$function" '$0 ~ "^" name "\\(\\)"{p=1} p{print} p && /^}/{exit}' "$ROOT/bin/oracle-review.sh")"
 done
@@ -103,17 +123,46 @@ for shape in skeleton real no-vocabulary manifest; do
   rc=0; bash "$TDIR/installed/oracle-review.sh" --recover "$MARKER" > "$TDIR/recover.out" 2> "$TDIR/recover.err" || rc=$?
   precheck "P1-b: pending recovery $shape exits $expected" "$([ "$rc" = "$expected" ] && { [ "$expected" = 0 ] || { grep -q template-verdict "$TDIR/recover.err" && ! grep -q 'Review ready' "$TDIR/recover.err" && [ ! -s "$TDIR/recover.out" ]; }; }; echo $?)"
   mv "$PRO_GATE_HOME/pending/$MARKER" "$PRO_GATE_HOME/completed/$MARKER"
-  before="$(snapshot)"
-  rc=0; env PRO_GATE_INPUT_POLICY=bundle-only PRO_GATE_BROWSER_ATTACHMENTS=auto \
-    PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/endpoint.patch" \
-    bash "$ROOT/bin/oracle-review.sh" --review-decision --repo "$TDIR/checkout" --pr 1983 \
-      --diff "$TDIR/endpoint.patch" --input bundle --json > "$TDIR/decision.json" 2> "$TDIR/decision.err" || rc=$?
-  precheck "P1-b: typed decision $shape exits $expected without effects" "$([ "$rc" = "$expected" ] && [ "$before" = "$(snapshot)" ] && [ ! -e "$PG_FACTS_EFFECT_LOG" ] && { if [ "$expected" = 0 ]; then jq -e '.action=="allow-existing-merge-workflow"' "$TDIR/decision.json" >/dev/null; else jq -e '.outcome=="template-verdict"' "$TDIR/decision.json" >/dev/null; fi; }; echo $?)"
+  typed_query
+  action=allow-existing-merge-workflow reason=current-ship-is-merge-eligible
+  if [ "$expected" = 6 ]; then action=stop-without-new-review reason=template-verdict; fi
+  precheck "round 2: typed $shape returns a complete $action envelope at exit 0 without effects" "$(typed_envelope "$action" "$reason"; echo $?)"
+  if [ "$expected" = 6 ]; then
+    precheck "round 2: typed $shape facts name the rejected marker and artifact digest" "$(jq -e --arg marker "$MARKER" --arg digest "$(pg_sha256 "$PRO_GATE_HOME/completed/$MARKER")" 'any(.facts.completed_results[]?; .marker==$marker and .artifact_digest==$digest and .shape=="template-verdict" and .applicable==false)' "$TDIR/decision.json" >/dev/null; echo $?)"
+  fi
   # A rejection must occur before the repair lock and before it can write a new binding.
   rm "$(pg_review_result_binding_dir)/$MARKER"
   rc=0; pg_review_decision_repair_result_binding "$MARKER" "$INPUT" > "$TDIR/repair.out" 2> "$TDIR/repair.err" || rc=$?
   precheck "P1-b: binding repair $shape exits $expected" "$([ "$rc" = "$expected" ] && { [ "$expected" = 0 ] || [ ! -e "$(pg_review_result_binding_dir)/$MARKER" ]; }; echo $?)"
   rm -f "$(pg_review_result_binding_dir)/$MARKER" "$(pg_manifest_dir)/$MARKER"
+done
+# Both marker enumeration orders must defer to charged epoch. The rejected artifact has no
+# result binding, as with a real skeleton capture; the grounded completion is digest-bound.
+for order in skeleton-first grounded-first; do
+  NEWER=pg-run-acme-widgets-1983-1700000900-2
+  if [ "$order" = skeleton-first ]; then
+    cp "$ROOT/tests/fixtures/template-verdict/pushbot-4451.txt" "$PRO_GATE_HOME/completed/$MARKER"
+    cp "$TDIR/real-review" "$PRO_GATE_HOME/completed/$NEWER"
+    GROUNDED="$NEWER" REJECTED="$MARKER"
+  else
+    cp "$TDIR/real-review" "$PRO_GATE_HOME/completed/$MARKER"
+    cp "$ROOT/tests/fixtures/template-verdict/pushbot-4451.txt" "$PRO_GATE_HOME/completed/$NEWER"
+    GROUNDED="$MARKER" REJECTED="$NEWER"
+  fi
+  NEW_INPUT="$(jq -cS --arg marker "$NEWER" '.marker=$marker | .charged_spend_epoch=1700000900' <<<"$INPUT")"
+  pg_review_input_binding_write "$NEWER" "$NEW_INPUT"
+  pg_review_tokens_write "$MARKER" "$TDIR/endpoint.patch"
+  pg_review_tokens_write "$NEWER" "$TDIR/endpoint.patch"
+  GROUNDED_INPUT="$(pg_review_input_binding_read "$GROUNDED")"
+  GROUNDED_RESULT="$(jq -cS --arg marker "$GROUNDED" --arg ib "$(pg_review_sha256_text "$GROUNDED_INPUT")" --arg digest "$(pg_sha256 "$PRO_GATE_HOME/completed/$GROUNDED")" '.marker=$marker | .input_binding_identity=$marker | .input_binding_digest=$ib | .artifact={digest:$digest,path:("completed/"+$marker)}' <<<"$RESULT")"
+  printf '%s' "$GROUNDED_RESULT" > "$(pg_review_result_binding_dir)/$GROUNDED"
+  typed_query
+  if [ "$order" = skeleton-first ]; then
+    precheck 'round 2: newer grounded review supersedes older skeleton' "$(typed_envelope allow-existing-merge-workflow current-ship-is-merge-eligible && jq -e --arg ref "$(pg_review_sha256_text "$GROUNDED_RESULT")" '.effect_request.applicable_ref==$ref' "$TDIR/decision.json" >/dev/null; echo $?)"
+  else
+    precheck 'round 2: newer skeleton supersedes older grounded review with a typed stop' "$(typed_envelope stop-without-new-review template-verdict && jq -e --arg marker "$REJECTED" --arg digest "$(pg_sha256 "$PRO_GATE_HOME/completed/$REJECTED")" '.effect_request.applicable_ref==$marker and any(.facts.completed_results[]; .marker==$marker and .shape=="template-verdict" and .artifact_digest==$digest and .applicable==false)' "$TDIR/decision.json" >/dev/null; echo $?)"
+  fi
+  rm -f "$(pg_review_result_binding_dir)/$GROUNDED" "$(pg_review_input_binding_dir)/$NEWER" "$PRO_GATE_HOME/completed/$NEWER" "$(pg_review_tokens_dir)/$NEWER"
 done
 cp "$TDIR/real-review" "$PRO_GATE_HOME/completed/$MARKER"
 printf '%s' "$RESULT" > "$(pg_review_result_binding_dir)/$MARKER"

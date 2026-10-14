@@ -7044,10 +7044,11 @@ PG214_PRED_B='7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee'
 # #204's additive delivery-failed-unchanged reason and facts.delivery key retired this digest.
 PG214_PRED_C='5fcd19c12600061af6d90ed9cb980dd7067cff199c374910639003eec4caf5c3'
 PG214_PRED_D='6da6866bab4e95ad138cdc946fa1388be9c386bca7b592c3370c9f52e34b315f'
+PG262_PRED_E='fa91787e3fbf3c0852c78f5269b2f670d84b86561be64d6edef4229bf46aee9b'
 PG214_UNKNOWN_CD='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
-check 'the compiled binding-record compatibility list preserves all four predecessor contract digests' \
-  "$(jq -ne --arg a "$PG214_PRED_A" --arg b "$PG214_PRED_B" --arg c "$PG214_PRED_C" --arg d "$PG214_PRED_D" --argjson got "$(pg_review_decision_compatible_contract_digests_json)" \
-      '$got == ([$a,$b,$c,$d]|sort)' >/dev/null 2>&1; echo $?)" \
+check 'the compiled binding-record compatibility list equals the full sorted five-digest array' \
+  "$(jq -ne --arg a "$PG214_PRED_A" --arg b "$PG214_PRED_B" --arg c "$PG214_PRED_C" --arg d "$PG214_PRED_D" --arg e "$PG262_PRED_E" --argjson got "$(pg_review_decision_compatible_contract_digests_json)" \
+      '$got == ([$a,$b,$c,$d,$e]|sort)' >/dev/null 2>&1; echo $?)" \
   "$(pg_review_decision_compatible_contract_digests_json)"
 PG214_ENV_PRED_FACTS="$(rd_facts '{}')"; PG214_ENV_PRED_FACTS="$(jq -cS --arg cd "$PG214_PRED_A" '.contract.contract_digest=$cd' <<<"$PG214_ENV_PRED_FACTS")"
 PG214_ENV_PRED_OUT="$(rd_reduce "$PG214_ENV_PRED_FACTS")"

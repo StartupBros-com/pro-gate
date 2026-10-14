@@ -3417,10 +3417,11 @@ pg_review_tokens() { # file [rationale]: canonical tokens; rationale emits shape
         sub(/\([Rr]un marker:.*$/, "", line)
         if (line ~ /^[Rr]un marker:/) next
       } else {
-        # Unified-diff metadata contributes paths only. Hunk prefixes are not identifiers.
+        # Paths and trailing hunk context contribute tokens; range prefixes do not.
         if (line ~ /^diff --git /) sub(/^diff --git /, "", line)
         else if (line ~ /^(---|\+\+\+) /) sub(/^(---|\+\+\+) /, "", line)
-        else if (line ~ /^(@@|index |new file mode |deleted file mode |old mode |new mode )/) next
+        else if (line ~ /^@@/) sub(/^@@[^@]*@@[[:space:]]*/, "", line)
+        else if (line ~ /^(index |new file mode |deleted file mode |old mode |new mode )/) next
         else sub(/^[+ -]/, "", line)
       }
       gsub(/[^A-Za-z0-9_./:-]+/, " ", line)
@@ -3986,8 +3987,8 @@ pg_completed_lookup() {  # <marker> <out>: place the artifact at <out>; rc 0 on 
 # ─────────────────────────────────────────────────────────────────────────────
 PG_REVIEW_DECISION_CONTRACT_ID='review-decision/v1'
 PG_REVIEW_DECISION_CONTRACT_VERSION=1
-PG_REVIEW_DECISION_CONTRACT_DIGEST='fa91787e3fbf3c0852c78f5269b2f670d84b86561be64d6edef4229bf46aee9b'
-PG_REVIEW_DECISION_CORPUS_DIGEST='32bc674aca33c10e60b808f6b7a483277d4f3edd6f1f94ed31a55189998e7ea2'
+PG_REVIEW_DECISION_CONTRACT_DIGEST='246b9e4e1d58f1820b4381a90cf93cf3fb7fb849f3ce4dd34b4d757be79c2e4f'
+PG_REVIEW_DECISION_CORPUS_DIGEST='c3803b3001699744df9b0021da3f785d73a8e011f9163937820f135574d0e522'
 
 # Binding-record compatibility only (#214, gate r2 P1). review-input-binding/v1 and
 # review-result-binding/v1 records are validated by their own record_type/record_version shape
@@ -4000,7 +4001,7 @@ PG_REVIEW_DECISION_CORPUS_DIGEST='32bc674aca33c10e60b808f6b7a483277d4f3edd6f1f94
 # Writers share these validators with readers: every production write site passes the CURRENT digest
 # (pg_review_decision_contract_digest), so this list only widens what can be READ back, never what a
 # fresh record may claim. Keep it that way when adding a writer.
-PG_REVIEW_DECISION_COMPATIBLE_CONTRACT_DIGESTS='bf36fdb5f8625e917be0539ca014fec518649d1160584846aca1cb9149533abb 7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee 5fcd19c12600061af6d90ed9cb980dd7067cff199c374910639003eec4caf5c3 6da6866bab4e95ad138cdc946fa1388be9c386bca7b592c3370c9f52e34b315f'
+PG_REVIEW_DECISION_COMPATIBLE_CONTRACT_DIGESTS='bf36fdb5f8625e917be0539ca014fec518649d1160584846aca1cb9149533abb 7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee 5fcd19c12600061af6d90ed9cb980dd7067cff199c374910639003eec4caf5c3 6da6866bab4e95ad138cdc946fa1388be9c386bca7b592c3370c9f52e34b315f fa91787e3fbf3c0852c78f5269b2f670d84b86561be64d6edef4229bf46aee9b'
 
 pg_review_decision_contract_id() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_ID"; }
 pg_review_decision_contract_version() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_VERSION"; }
@@ -4226,12 +4227,16 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
     def hex: type=="string" and test("^[0-9a-f]{64}$");
     def oid: type=="string" and test("^[0-9a-f]{40}([0-9a-f]{24})?$");
     def result:
-      keys_are(["applicable","artifact_digest","bindable","binding_valid","canonical_identity","charged_spend_epoch","collected","evidence_mode","legacy","marker","provenance_valid","verdict"])
+      keys_are(["applicable","artifact_digest","bindable","binding_valid","canonical_identity","charged_spend_epoch","collected","evidence_mode","legacy","marker","provenance_valid","verdict"] +
+        (if has("shape") then ["shape"] else [] end))
       and (.applicable|type=="boolean") and (.artifact_digest|hex) and (.bindable|type=="boolean") and (.binding_valid|type=="boolean")
       and (.canonical_identity|ident and length>0) and (.charged_spend_epoch|type=="number" and floor==.)
       and (.collected|type=="boolean") and (.evidence_mode|IN("full-pr","scoped-delta","connector","caller-patch","none"))
       and (.legacy|type=="boolean") and (.marker|marker and length>0)
-      and (.provenance_valid|type=="boolean") and (.verdict|IN("SHIP","FIX-FIRST","NEEDS-DISCUSSION","NONE"));
+      and (.provenance_valid|type=="boolean") and (.verdict|IN("SHIP","FIX-FIRST","NEEDS-DISCUSSION","NONE"))
+      and (if has("shape") then .shape=="template-verdict" and .applicable==false and .legacy==false
+        and .bindable==false and .binding_valid==false and .provenance_valid==false and .verdict=="NONE"
+        and .collected==true else true end);
     (keys_are(["active_index","completed_results","contract","cooldown","delivery","evidence","governor","input","named_choice","observation","prior_review","reservation","target","transport"]))
     and (.contract|keys_are(["contract_digest","contract_id","contract_version","corpus_digest"]))
     and (.cooldown|keys_are(["active","seconds_remaining"])) and (.cooldown.active|type=="boolean")
@@ -4294,13 +4299,18 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
 
   # Existing completed work wins. Selection is newest charged epoch, then canonical identity;
   # duplicate rows still tied on both fields are unresolved and stop closed.
-  selected="$(jq -cS '[.completed_results[] | select(.applicable or .legacy)] | sort_by(.charged_spend_epoch,.canonical_identity) | last // empty' <<<"$canonical")"
+  selected="$(jq -cS '[.completed_results[] | select(.applicable or .legacy or .shape=="template-verdict")] | sort_by(.charged_spend_epoch,.canonical_identity) | last // empty' <<<"$canonical")"
   if [ -n "$selected" ]; then
     selected_count="$(jq -r --argjson s "$selected" '[.completed_results[] | select(.charged_spend_epoch==$s.charged_spend_epoch and .canonical_identity==$s.canonical_identity)] | length' <<<"$canonical")"
     if [ "$selected_count" -gt 1 ]; then
       pg_review_decision_emit stop-without-new-review completed-result-tie "$canonical" "$snapshot"; return
     fi
     selected_ref="$(jq -r .canonical_identity <<<"$selected")"
+    # Rejected saved bytes participate in the same newest-epoch selection without supplying
+    # accepted authority. A newer grounded completion can supersede them; a newest rejection stops.
+    if [ "$(jq -r '.shape // ""' <<<"$selected")" = template-verdict ]; then
+      pg_review_decision_emit stop-without-new-review template-verdict "$canonical" "$snapshot" "$selected_ref"; return
+    fi
     if [ "$(jq -r .collected <<<"$selected")" = false ]; then
       # An uncollected result whose evidence mode can never carry merge proof (a connector SHIP,
       # #147) is unrepairable, not transient: re-issuing collect would loop forever. Stop typed,

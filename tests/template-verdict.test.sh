@@ -76,6 +76,21 @@ sed 's/readPolicy/otherPolicy/' "$TDIR/deleted.diff" > "$TDIR/other.diff"
 pg_review_tokens "$TDIR/other.diff" > "$TDIR/other.tokens"
 pg_review_shape "$OUT" "$TDIR/other.tokens"; rc=$?
 check 'P2-a: identifier absent from the diff still rejects' "$([ "$rc" = 1 ]; echo $?)"
+cat > "$TDIR/hunk-context.diff" <<'DIFF'
+@@ -10,3 +10,3 @@ function readPolicy() {
+-0
++1
+DIFF
+pg_review_tokens "$TDIR/hunk-context.diff" > "$TDIR/hunk-context.tokens"
+review 'Checked readPolicy for regressions.'
+pg_review_shape "$OUT" "$TDIR/hunk-context.tokens"; rc=$?
+check 'round 2: hunk-context identifier grounds a clean review' "$([ "$rc" = 0 ] && [ "$PG_NAMES_NOTHING" = false ]; echo $?)"
+review 'Checked otherPolicy for regressions.'
+pg_review_shape "$OUT" "$TDIR/hunk-context.tokens"; rc=$?
+check 'round 2: absent hunk-context identifier still rejects' "$([ "$rc" = 1 ] && [ "$PG_NAMES_NOTHING" = true ]; echo $?)"
+sed 's/@@ function readPolicy() {/@@/' "$TDIR/hunk-context.diff" > "$TDIR/headerless.diff"
+pg_review_tokens "$TDIR/headerless.diff" > "$TDIR/headerless.tokens"
+check 'round 2: hunk header without context contributes no tokens' "$([ ! -s "$TDIR/headerless.tokens" ]; echo $?)"
 printf 'diff --git a/VERSION b/VERSION\n--- a/VERSION\n+++ b/VERSION\n@@ -1 +1 @@\n-0.61.2\n+0.62.0\n' > "$TDIR/version.diff"
 pg_review_tokens "$TDIR/version.diff" > "$TDIR/version.tokens"
 review 'Checked VERSION for release consistency.'

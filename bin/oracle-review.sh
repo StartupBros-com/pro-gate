@@ -503,6 +503,17 @@ pg_review_decision_choice_selection_read() { # file -> canonical {selected_id,sn
   printf '%s' "$canonical"
 }
 
+pg_review_decision_shape_rejection_fact() { # marker artifact input-binding -> normalized candidate
+  local marker="$1" artifact="$2" binding="$3" digest
+  digest="$(pg_sha256 "$artifact")" || return 1
+  jq -cnS --arg marker "$marker" --arg digest "$digest" \
+    --argjson epoch "$(jq -r .charged_spend_epoch <<<"$binding")" \
+    --arg mode "$(pg_review_decision_result_mode "$binding")" '
+    {applicable:false,artifact_digest:$digest,bindable:false,binding_valid:false,
+     canonical_identity:$marker,charged_spend_epoch:$epoch,collected:true,evidence_mode:$mode,
+     legacy:false,marker:$marker,provenance_valid:false,shape:"template-verdict",verdict:"NONE"}'
+}
+
 pg_review_decision_cli() {
   local repo pr_num remote ident host owner repo_name head base raw_digest round_key code_identity
   local input_proven=false input_binding_valid=false input_identity evidence_identity evidence_state
@@ -615,8 +626,9 @@ pg_review_decision_cli() {
     fi
 
     if [ -n "$artifact" ] && ! pg_review_shape_for_marker "$marker" "$artifact"; then
-      jq -cn --arg marker "$marker" '{outcome:"template-verdict",marker:$marker}'
-      return 6
+      completed="$(jq -cS --argjson rejected "$(pg_review_decision_shape_rejection_fact "$marker" "$artifact" "$candidate")" \
+        '. + [$rejected]' <<<"$completed")" || return 2
+      continue
     fi
 
     # A result is credible only when its own marker-bound input digest and canonical completed
@@ -636,7 +648,12 @@ pg_review_decision_cli() {
     accepted="$(pg_review_accepted_artifact_read "$marker" "$candidate")" || accepted_rc=$?
     case "$accepted_rc" in
       0|2) ;;
-      6) jq -cn --arg marker "$marker" '{outcome:"template-verdict",marker:$marker}'; return 6 ;;
+      6)
+        if [ "$exact" = true ]; then
+          completed="$(jq -cS --argjson rejected "$(pg_review_decision_shape_rejection_fact "$marker" "$artifact" "$candidate")" \
+            '. + [$rejected]' <<<"$completed")" || return 2
+        fi
+        continue ;;
       *) continue ;;
     esac
     artifact_digest="$(jq -r .artifact_digest <<<"$accepted")"

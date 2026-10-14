@@ -99,6 +99,12 @@ Dispatch all eight closed actions:
   manifest and confirmation. Never infer PR base from the feature upstream, continue after failed
   preparation, or rewrite a historical binding to make it current.
 - `report-only` / `stop-without-new-review`: relay the normalized reason with no retry inference.
+  For `template-verdict`, the selected saved result lacks a grounded diff reference or retained
+  vocabulary. Its `.facts.completed_results` candidate names the marker and artifact digest,
+  with `shape:"template-verdict"` and `applicable:false`. Newest charged epoch, then canonical
+  identity, selects the candidate: a newer grounded review supersedes an older skeleton; a
+  newest skeleton stops closed. Preserve branch work. Typed queries return a complete envelope
+  at exit 0; legacy collection keeps exit 6. Trailing hunk-context identifiers count as vocabulary.
   For `account-cooldown-active`, also relay `.facts.cooldown.seconds_remaining`: ChatGPT is
   rate-limiting the account, and re-querying before that many seconds have passed cannot change
   the answer. For `rounds-not-converging`, the open-P0/P1 trajectory (`.facts.governor.arrow`) has

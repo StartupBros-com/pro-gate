@@ -678,15 +678,6 @@ write_input_binding "$EVIDENT_MARKER" "$EVIDENT_SHA" "$EVIDENT_NWO" "$EVIDENT_NU
 write_result_binding "$EVIDENT_MARKER" SHIP   # #184 finding 2 (round 6): durable evidence now also requires a validated, digest-matching result binding
 append_clean_ledger_row "$EVIDENT_MARKER" "${EVIDENT_NWO//\//-}-${EVIDENT_NUM}" "$EVIDENT_NUM" "$COMPLETED_DIR/$EVIDENT_MARKER"
 
-# #262: an explicitly flagged round never authorizes completion, even if a legacy caller
-# incorrectly labels it clean. Missing new fields on older unflagged rows remain readable.
-cp "$LEDGER_FILE" "$TDIR/unflagged-ledger.jsonl"
-jq '.names_nothing=true | .body_bytes=54' "$LEDGER_FILE" > "$TDIR/flagged-ledger.jsonl"
-cp "$TDIR/flagged-ledger.jsonl" "$LEDGER_FILE"
-check 'a names_nothing round cannot prove a legacy completion' \
-  "$(! daemon_legacy_row_has_durable_evidence "$EVIDENT_NWO" "$EVIDENT_NUM" "$EVIDENT_SHA"; echo $?)" \
-  "$(cat "$LEDGER_FILE")"
-cp "$TDIR/unflagged-ledger.jsonl" "$LEDGER_FILE"
 check 'P1-b: an unflagged saved skeleton cannot prove legacy completion' \
   "$(! daemon_legacy_row_has_durable_evidence "$EVIDENT_NWO" "$EVIDENT_NUM" "$EVIDENT_SHA"; echo $?)"
 # A grounded historical review remains eligible when its exact bindings and vocabulary match.
@@ -694,6 +685,16 @@ printf 'P0: none\nP1: none\nP2: none\nP3: none\nChecked src/review-engine.ts for
 pg_review_tokens_write "$EVIDENT_MARKER" "$HERE/fixtures/template-verdict/review.diff"
 rm "$(pg_review_result_binding_dir)/$EVIDENT_MARKER"
 write_result_binding "$EVIDENT_MARKER" SHIP
+check 'round 2: grounded unflagged row proves legacy completion before the flag check' \
+  "$(daemon_legacy_row_has_durable_evidence "$EVIDENT_NWO" "$EVIDENT_NUM" "$EVIDENT_SHA"; echo $?)"
+# A grounded, digest-bound artifact isolates the ledger flag filter from shape rejection.
+cp "$LEDGER_FILE" "$TDIR/unflagged-ledger.jsonl"
+jq --argjson bytes "$(wc -c < "$COMPLETED_DIR/$EVIDENT_MARKER")" '.names_nothing=true | .body_bytes=$bytes' "$LEDGER_FILE" > "$TDIR/flagged-ledger.jsonl"
+cp "$TDIR/flagged-ledger.jsonl" "$LEDGER_FILE"
+check 'round 2: a flagged grounded row cannot prove legacy completion' \
+  "$(! daemon_legacy_row_has_durable_evidence "$EVIDENT_NWO" "$EVIDENT_NUM" "$EVIDENT_SHA"; echo $?)" \
+  "$(cat "$LEDGER_FILE")"
+cp "$TDIR/unflagged-ledger.jsonl" "$LEDGER_FILE"
 
 daemon_migrate_legacy_processed
 
