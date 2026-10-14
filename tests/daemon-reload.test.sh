@@ -249,7 +249,7 @@ check "account-cooldown-active does not mark a processed SHA or failure budget" 
 # SHIP result lives in .facts.completed_results, never .facts.prior_review) -- unlike the three
 # report/collection actions above, it correctly DOES mark the head done, or the unchanged head
 # re-clones and re-queries forever. Split out of the "does not mark" loop above on purpose.
-MERGE_INDEX="$(jq -r --arg action allow-existing-merge-workflow '.cases | to_entries[] | select(.value.expected.action == $action) | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
+MERGE_INDEX="$(jq -r '.cases | to_entries[] | select(.value.expected.reason == "current-ship-is-merge-eligible") | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
 MERGE_DECISION="$TYPED_HOME/process-allow-existing-merge-workflow.json"; typed_decision "$MERGE_INDEX" "$MERGE_DECISION"
 check 'sanity: the allow-existing-merge-workflow corpus fixture is the FIRST-SHIP completion reason (current-ship-is-merge-eligible)' "$([ "$(jq -r .reason "$MERGE_DECISION")" = current-ship-is-merge-eligible ]; echo $?)" "$(jq -r .reason "$MERGE_DECISION")"
 : > "$TYPED_STATE"; : > "$TYPED_FAILS"

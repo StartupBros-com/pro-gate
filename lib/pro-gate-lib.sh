@@ -2895,7 +2895,7 @@ pg_ramp_update() {  # $1 = clean|throttle|failed, $2 = ceiling
 # wrong in BOTH directions — converging gates (open P0/P1 shrinking every round, e.g.
 # 6→5→3→2→0-SHIP at round 5) needed per-run human forcing past it, while whack-a-mole gates
 # (5→7→8→10) burned all four slots on churn. Governor: base grant PRO_GATE_ROUNDS_BASE
-# (default 3); each completed re-review whose OPEN P0+P1 count (RESOLVED-filtered, from the
+# (default 2); each completed re-review whose OPEN P0+P1 count (RESOLVED-filtered, from the
 # rounds/<key>.hist trajectory) is strictly below its predecessor's earns +1, clamped to the
 # immovable ceiling PRO_GATE_ROUNDS_CEILING (default 8); two consecutive non-shrinking
 # re-reviews collapse the grant (early exit 12 — churn stops BEFORE the base is spent, not
@@ -3084,6 +3084,18 @@ pg_review_open_severity() {
   printf '%s\n' "$counts"
 }
 
+# Pure P2/P3 projection in body order; preserve finding text after its list marker and label.
+# These are follow-up items, not instructions. The decision grammar bounds their display text.
+pg_review_deferred_findings() {
+  local out="$1"
+  [ -f "$out" ] && [ -r "$out" ] || return 1
+  jq -cS -Rs '
+    split("\n") | map(
+      select(test("^\\s*(?:(?:[-*+]|[0-9]+[.)])\\s+)?\\[[Pp][23]\\]")) |
+      capture("^\\s*(?:(?:[-*+]|[0-9]+[.)])\\s+)?\\[[Pp](?<level>[23])\\]\\s*(?<text>.*)$") |
+      {severity:("P"+.level),text})' "$out"
+}
+
 # pg_round_note_severity <key> <review-file>: record the P0/P1 counts of a change's most
 # recent COMPLETED review in a sidecar ($rounds/<key>.last), and append the full per-round
 # line (epoch, verdict word, open P0, open P1, resolved, still-present, wall-clock secs) to
@@ -3198,7 +3210,7 @@ pg_round_last_severity() {
 pg_round_score() {
   local key="$1" f now win e verdict p0 p1 res sp dur open prev="" used
   PG_ROUND_EARNED=0; PG_ROUND_STREAK=0; PG_ROUND_ARROW=""; PG_ROUND_ELAPSED_SECS=0; PG_ROUND_SCORED=0
-  PG_ROUND_BASE="${PRO_GATE_ROUNDS_BASE:-3}"; case "$PG_ROUND_BASE" in ''|*[!0-9]*) PG_ROUND_BASE=3;; esac
+  PG_ROUND_BASE="${PRO_GATE_ROUNDS_BASE:-2}"; case "$PG_ROUND_BASE" in ''|*[!0-9]*) PG_ROUND_BASE=2;; esac
   PG_ROUND_CEILING="${PRO_GATE_ROUNDS_CEILING:-8}"; case "$PG_ROUND_CEILING" in ''|*[!0-9]*) PG_ROUND_CEILING=8;; esac
   # The ceiling is the IMMOVABLE backstop: an inconsistent config clamps the BASE DOWN to it,
   # never the ceiling up (#66 gate P1 — raising it let BASE=10/CEILING=8 grant 10 rounds and
@@ -3237,7 +3249,7 @@ pg_round_score() {
     fi
   fi
   if [ -n "${PRO_GATE_MAX_ROUNDS_PER_PR:-}" ]; then
-    case "$PRO_GATE_MAX_ROUNDS_PER_PR" in *[!0-9]*|'') PG_ROUND_GRANT=4;; *) PG_ROUND_GRANT="$PRO_GATE_MAX_ROUNDS_PER_PR";; esac
+    case "$PRO_GATE_MAX_ROUNDS_PER_PR" in *[!0-9]*|'') PG_ROUND_GRANT=2;; *) PG_ROUND_GRANT="$PRO_GATE_MAX_ROUNDS_PER_PR";; esac
     return 0
   fi
   PG_ROUND_GRANT=$(( PG_ROUND_BASE + PG_ROUND_EARNED ))
@@ -3902,8 +3914,8 @@ pg_completed_lookup() {  # <marker> <out>: place the artifact at <out>; rc 0 on 
 # ─────────────────────────────────────────────────────────────────────────────
 PG_REVIEW_DECISION_CONTRACT_ID='review-decision/v1'
 PG_REVIEW_DECISION_CONTRACT_VERSION=1
-PG_REVIEW_DECISION_CONTRACT_DIGEST='fa91787e3fbf3c0852c78f5269b2f670d84b86561be64d6edef4229bf46aee9b'
-PG_REVIEW_DECISION_CORPUS_DIGEST='32bc674aca33c10e60b808f6b7a483277d4f3edd6f1f94ed31a55189998e7ea2'
+PG_REVIEW_DECISION_CONTRACT_DIGEST='07d50c7d8a8b8f60b36c532231a8228f548f1dcb4a9b609b2ffedd32d2b518e1'
+PG_REVIEW_DECISION_CORPUS_DIGEST='521c9e63de5de69f2886c57ecd0f232dbe0191338bdfd1ccc5776c487b354875'
 
 # Binding-record compatibility only (#214, gate r2 P1). review-input-binding/v1 and
 # review-result-binding/v1 records are validated by their own record_type/record_version shape
@@ -3916,7 +3928,7 @@ PG_REVIEW_DECISION_CORPUS_DIGEST='32bc674aca33c10e60b808f6b7a483277d4f3edd6f1f94
 # Writers share these validators with readers: every production write site passes the CURRENT digest
 # (pg_review_decision_contract_digest), so this list only widens what can be READ back, never what a
 # fresh record may claim. Keep it that way when adding a writer.
-PG_REVIEW_DECISION_COMPATIBLE_CONTRACT_DIGESTS='bf36fdb5f8625e917be0539ca014fec518649d1160584846aca1cb9149533abb 7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee 5fcd19c12600061af6d90ed9cb980dd7067cff199c374910639003eec4caf5c3 6da6866bab4e95ad138cdc946fa1388be9c386bca7b592c3370c9f52e34b315f'
+PG_REVIEW_DECISION_COMPATIBLE_CONTRACT_DIGESTS='bf36fdb5f8625e917be0539ca014fec518649d1160584846aca1cb9149533abb 7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee 5fcd19c12600061af6d90ed9cb980dd7067cff199c374910639003eec4caf5c3 6da6866bab4e95ad138cdc946fa1388be9c386bca7b592c3370c9f52e34b315f fa91787e3fbf3c0852c78f5269b2f670d84b86561be64d6edef4229bf46aee9b'
 
 pg_review_decision_contract_id() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_ID"; }
 pg_review_decision_contract_version() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_VERSION"; }
@@ -4133,8 +4145,8 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
     pg_review_decision_reject transport-collision "$snapshot"; return
   fi
 
-  # Closed normalized-facts grammar. No repository/review prose is admitted, marker references
-  # use the existing filename-safe grammar, and each nested object has an exact key set.
+  # Closed normalized-facts grammar. Only extracted, bounded finding lines carry review text;
+  # marker references use the filename-safe grammar and nested objects have exact key sets.
   valid="$(printf '%s' "$canonical" | jq -r '
     def keys_are($x): keys == ($x|sort);
     def marker: type=="string" and (length==0 or test("^pg-run-[A-Za-z0-9.-]+$"));
@@ -4148,7 +4160,7 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
       and (.collected|type=="boolean") and (.evidence_mode|IN("full-pr","scoped-delta","connector","caller-patch","none"))
       and (.legacy|type=="boolean") and (.marker|marker and length>0)
       and (.provenance_valid|type=="boolean") and (.verdict|IN("SHIP","FIX-FIRST","NEEDS-DISCUSSION","NONE"));
-    (keys_are(["active_index","completed_results","contract","cooldown","delivery","evidence","governor","input","named_choice","observation","prior_review","reservation","target","transport"]))
+    (keys_are(["active_index","completed_results","contract","cooldown","deferred_count","deferred_findings","delivery","evidence","governor","input","named_choice","observation","open_blocking","prior_review","reservation","target","transport"]))
     and (.contract|keys_are(["contract_digest","contract_id","contract_version","corpus_digest"]))
     and (.cooldown|keys_are(["active","seconds_remaining"])) and (.cooldown.active|type=="boolean")
     and (.cooldown.seconds_remaining|type=="number" and floor==. and .>=0)
@@ -4161,6 +4173,11 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
     and (.active_index.marker|marker)
     and (.active_index.state|IN("none","live","pre-charge","round-recorded","charged","run-meta-written","input-bound","submitted","unknown-fate"))
     and (.completed_results|type=="array" and all(.[];result))
+    and (.open_blocking==null or (.open_blocking|type=="number" and floor==. and .>=0))
+    and (.deferred_findings|type=="array" and all(.[];
+      keys_are(["severity","text"]) and (.severity|IN("P2","P3")) and (.text|type=="string")))
+    and (.deferred_count|type=="number" and floor==. and .>=0)
+    and (.deferred_count==(.deferred_findings|length))
     and (.evidence|keys_are(["identity","safe_to_prepare","state"])) and (.evidence.identity|ident)
     and (.evidence.safe_to_prepare|type=="boolean") and (.evidence.state|IN("matching","missing","unsafe","invalid","undefined"))
     and (.governor|keys_are(["arrow","continue_override","earned","grant","granted","policy_mode","scored","streak"]))
@@ -4291,6 +4308,11 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
         # how a chain that keeps churning gets here).
         if [ "$rounds_not_converging" = yes ]; then
           pg_review_decision_emit stop-without-new-review rounds-not-converging "$canonical" "$snapshot" "$selected_ref"; return
+        fi
+        # #274: only proven zero open P0/P1 defers the lower-severity items. Unknown counts
+        # retain the fix action; the existing churn stop above always has precedence.
+        if [ "$(jq -r '.open_blocking' <<<"$canonical")" = 0 ]; then
+          pg_review_decision_emit allow-existing-merge-workflow fix-first-deferred-p2-only "$canonical" "$snapshot" "$selected_ref"; return
         fi
         pg_review_decision_emit fix-review-findings review-findings-require-fix "$canonical" "$snapshot" "$selected_ref"; return ;;
       SHIP)
@@ -4558,7 +4580,7 @@ pg_review_result_binding_digest() { local r; r="$(pg_review_result_binding_read 
 # rc 0: accepted facts; rc 1: unavailable (no output); rc 2: verdict disagreement (diagnostic
 # facts only, never counts). The caller retains the decision reducer's distinct repair projection.
 pg_review_accepted_artifact_read() ( # marker [expected canonical input binding]
-  local marker="$1" expected="${2:-}" input result artifact snapshot digest canonical verdict stored choices='[]' counts p0 p1 text retained
+  local marker="$1" expected="${2:-}" input result artifact snapshot digest canonical verdict stored choices='[]' counts p0 p1 text retained deferred='[]'
   pg_reservation_marker_ok "$marker" || return 1
   input="$(pg_review_input_binding_read "$marker")" || return 1
   [ -z "$expected" ] || [ "$input" = "$expected" ] || return 1
@@ -4590,6 +4612,7 @@ pg_review_accepted_artifact_read() ( # marker [expected canonical input binding]
     fi
     counts="$(pg_review_open_severity "$snapshot")" || return 1
     IFS=$'\t' read -r p0 p1 <<<"$counts"
+    deferred="$(pg_review_deferred_findings "$snapshot")" || return 1
     if choices="$(pg_review_decision_named_choices "$snapshot" "$verdict")"; then
       :
     elif [ "$?" -eq 2 ]; then
@@ -4610,8 +4633,8 @@ pg_review_accepted_artifact_read() ( # marker [expected canonical input binding]
   fi
   jq -cnS --argjson input "$input" --argjson result "$result" --arg digest "$digest" \
     --arg canonical "$canonical" --arg verdict "$verdict" --argjson choices "$choices" \
-    --argjson p0 "$p0" --argjson p1 "$p1" \
-    '{input_binding:$input,result_binding:$result,artifact_digest:$digest,canonical_identity:$canonical,verdict:$verdict,named_choices:$choices,open_p0:$p0,open_p1:$p1}'
+    --argjson p0 "$p0" --argjson p1 "$p1" --argjson deferred "$deferred" \
+    '{input_binding:$input,result_binding:$result,artifact_digest:$digest,canonical_identity:$canonical,verdict:$verdict,named_choices:$choices,open_p0:$p0,open_p1:$p1,deferred_findings:$deferred}'
 )
 
 # Current SHIP applicability is separate from retained acceptance. In particular, a connector

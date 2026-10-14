@@ -43,7 +43,12 @@ auto-merge, with required hosted CI on the exact head remaining the final author
 | Spend protection | Deferrals, oversized refusals, and round caps exit without spending a Pro slot; an interrupted run leaves a harvestable reservation instead of a wasted slot |
 | Crash recovery | `--status` rediscovers any run from a bare PR number; `--harvest` collects a review the model was still writing when your session died |
 | Verified provenance | Every run embeds a nonce the model echoes back on its verdict line; a capture that doesn't match the run is rejected, never silently accepted |
-| Round controls | Numeric grants are advisory by default: 3 rounds per change per rolling 24 h, +1 per shrinking re-review, up to 8; explicit settings enforce those limits. A separate churn stop covers positive P0/P1 counts that fail to shrink for two consecutive re-reviews; clean and P2/P3-only rounds do not accumulate churn |
+| Round controls | Numeric grants are advisory by default: 2 rounds per change per rolling 24 h, +1 per shrinking re-review, up to 8; explicit settings enforce those limits. A separate churn stop covers positive P0/P1 counts that fail to shrink for two consecutive re-reviews; clean and P2/P3-only rounds do not accumulate churn |
+
+An accepted current `FIX-FIRST` with zero open P0/P1 hands off to the existing merge workflow
+with reason `fix-first-deferred-p2-only`. Its facts include `open_blocking: 0`,
+`deferred_findings` (P2/P3 severity and finding text in body order) and `deferred_count`.
+Any open P0/P1 still requires a fix; `rounds-not-converging` preempts both paths.
 
 ### Quick example
 
@@ -581,9 +586,9 @@ an endless collect. Use `bundle` or `both` for the final round.
 | `PRO_REVIEW_OWNERS` | *(required for daemon)* | GitHub owners the daemon may watch |
 | `PRO_REVIEW_MAX_BUDGET_USD` | `5` | Hard $ ceiling per PR for headless fixer runs |
 | `PRO_GATE_ROUND_GUARD` | *(unset/advisory)* | Set `1` for hard trajectory enforcement; `0` forces advisory/off even when limit knobs exist |
-| `PRO_GATE_ROUNDS_BASE` | `3` advisory | Computed base grant shown in status; explicitly setting it enables enforcement (`0` = lockdown) |
+| `PRO_GATE_ROUNDS_BASE` | `2` advisory | Computed base grant shown in status; explicitly setting it enables enforcement (`0` = lockdown) |
 | `PRO_GATE_ROUNDS_CEILING` | `8` advisory | Computed trajectory ceiling; explicitly setting it enables enforcement |
-| `PRO_GATE_MAX_ROUNDS_PER_PR` | *(unset)* | Explicit legacy flat-cap enforcement (`0` = lockdown) |
+| `PRO_GATE_MAX_ROUNDS_PER_PR` | *(unset)* | Explicit legacy flat-cap enforcement (`0` = lockdown; invalid values fall back to `2`) |
 | `PRO_GATE_ROUNDS_WINDOW` | `24h` | The rolling telemetry/enforcement window |
 | `PRO_GATE_ROUNDS_CONTINUE` | *(unset)* | Set `1` for the configured invocation to bypass churn while preserving enforced numeric limits, including exhausted and zero budgets. Stateless: there is no durable one-use counter. Cooldown, provenance and ownership still apply |
 | `PRO_GATE_MAX_DIFF_LINES` | `6000` | Above this a run proceeds but usually lands in-progress → harvest |

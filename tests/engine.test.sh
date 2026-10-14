@@ -2857,24 +2857,24 @@ check 'gate r5 P2: positive churn after a clean round still reaches streak 2' "$
 CLEAN3_GOV="$(env PRO_GATE_HOME="$GHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_governor_facts_json clean3 true")"
 check 'gate r5 P2: the governor facts for three clean rounds carry arrow [0,0,0] with streak 0' "$(jq -e '.arrow==[0,0,0] and .streak==0 and .scored==3' <<<"$CLEAN3_GOV" >/dev/null 2>&1; echo $?)" "$CLEAN3_GOV"
 # No explicit policy: count, grant, and trajectory are advisory and never ration a safe review.
-gseed nohist 3
+gseed nohist 2
 GOUT="$(gguard nohist)"; GRC=$?
 GPOLICY="$(env PRO_GATE_HOME="$GHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_policy_mode nohist")"
 check 'default round policy is advisory after the computed grant is spent' "$([ "$GRC" -eq 0 ] && [ "$GPOLICY" = advisory ]; echo $?)" "rc=$GRC policy=$GPOLICY out=$GOUT"
 # Explicit guard preserves the former trajectory-aware enforcement contract.
 GOUT="$(genforce nohist)"; GRC=$?
-check 'explicit governor: base grant refuses round 4 without earned rounds' "$([ "$GRC" -eq 1 ]; echo $?)" "rc=$GRC out=$GOUT"
-check 'explicit governor: exhaustion reason names base + earned + ceiling' "$(printf '%s' "$GOUT" | grep -q 'base 3 + 0 earned'; echo $?)" "$GOUT"
-gseed nohist 2
+check 'explicit governor: base grant refuses round 3 without earned rounds' "$([ "$GRC" -eq 1 ]; echo $?)" "rc=$GRC out=$GOUT"
+check 'explicit governor: exhaustion reason names base + earned + ceiling' "$(printf '%s' "$GOUT" | grep -q 'base 2 + 0 earned'; echo $?)" "$GOUT"
+gseed nohist 1
 genforce nohist >/dev/null; GRC=$?
-check 'explicit governor: round 3 of base 3 proceeds' "$([ "$GRC" -eq 0 ]; echo $?)" "rc=$GRC"
-# Shrinking trajectory earns extra enforced rounds: open 5 -> 3 -> 1 = +2 earned (grant 5).
-gseed shrink 4; ghist shrink 5 3 1
+check 'explicit governor: round 2 of base 2 proceeds' "$([ "$GRC" -eq 0 ]; echo $?)" "rc=$GRC"
+# Shrinking trajectory earns extra enforced rounds: open 5 -> 3 -> 1 = +2 earned (grant 4).
+gseed shrink 3; ghist shrink 5 3 1
 genforce shrink >/dev/null; GRC=$?
-check 'explicit governor: shrinking trajectory earns round 5' "$([ "$GRC" -eq 0 ]; echo $?)" "rc=$GRC $(genforce shrink)"
-gseed shrink 5
+check 'explicit governor: shrinking trajectory earns round 4' "$([ "$GRC" -eq 0 ]; echo $?)" "rc=$GRC $(genforce shrink)"
+gseed shrink 4
 GOUT="$(genforce shrink)"; GRC=$?
-check 'explicit governor: earned grant still exhausts (5/5)' "$([ "$GRC" -eq 1 ] && printf '%s' "$GOUT" | grep -q '5/5 rounds'; echo $?)" "rc=$GRC out=$GOUT"
+check 'explicit governor: earned grant still exhausts (4/4)' "$([ "$GRC" -eq 1 ] && printf '%s' "$GOUT" | grep -q '4/4 rounds'; echo $?)" "rc=$GRC out=$GOUT"
 # Churn remains telemetry by default and a brake only under explicit enforcement.
 gseed churn 3; ghist churn 5 7 8
 gguard churn >/dev/null; GRC=$?
@@ -2883,7 +2883,7 @@ GOUT="$(genforce churn)"; GRC=$?
 check 'explicit governor: churn brake refuses (not converging)' "$([ "$GRC" -eq 1 ] && printf '%s' "$GOUT" | grep -q 'churning, not converging'; echo $?)" "rc=$GRC out=$GOUT"
 check 'explicit governor: churn reason carries the trajectory arrow' "$(printf '%s' "$GOUT" | grep -q '5→7→8'; echo $?)" "$GOUT"
 # A recovery round (shrink after churn) resets the streak: 5 -> 7 -> 8 -> 2 is earning again.
-ghist churn 5 7 8 2
+gseed churn 2; ghist churn 5 7 8 2
 genforce churn >/dev/null; GRC=$?
 check 'explicit governor: a shrinking round releases the brake' "$([ "$GRC" -eq 0 ]; echo $?)" "rc=$GRC $(genforce churn)"
 # Ceiling remains the explicit-enforcement backstop while advisory mode still reports it.
@@ -2914,7 +2914,7 @@ check 'governor: base clamp warns loudly' "$(printf '%s' "$GERR" | grep -q 'clam
 # pg_round_grant mirrors the guard for --status: churn collapses remaining to 0.
 gseed churn2 3; ghist churn2 5 7 8
 GOUT="$(env PRO_GATE_HOME="$GHOME" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_round_grant churn2")"
-check 'grant: churn brake collapses the grant to spent' "$([ "$GOUT" = 3 ]; echo $?)" "grant=$GOUT"
+check 'grant: churn never raises the smaller numeric grant to spent' "$([ "$GOUT" = 2 ]; echo $?)" "grant=$GOUT"
 
 echo '# ledger-timing-split R4: MIXED 6-field (pre-upgrade) and 7-field (post-upgrade) .hist rows'
 # pg_round_note_severity copies existing .hist lines through VERBATIM and appends only the new
@@ -4159,7 +4159,7 @@ STATUS_OUT="$TDIR/status-review.md"
 printf '42\t%s\t%s\t0\t1\tGPT-X\n' "$STATUS_OUT" "$(date +%s)" > "$SHOME/in-progress/$SMARKER"
 printf '%s\n%s\n' "$(( $(date +%s) - 60 ))" "$(( $(date +%s) - 120 ))" > "$SHOME/rounds/acme-widgets-42"
 # Flat (non-shrinking) open counts so this fixture earns no extra round and leaves the
-# base-grant assertion below ('2 spent, 1 remaining') undisturbed — it exists only to give
+# base-grant assertion below ('2 spent, computed grant 2') undisturbed — it exists only to give
 # the elapsed-wall-clock assertion two real hist rows (2h total) to sum.
 printf '%s\tFIX-FIRST\t0\t5\t0\t0\t3600\n%s\tFIX-FIRST\t0\t5\t0\t0\t3600\n' "$(date +%s)" "$(date +%s)" > "$SHOME/rounds/acme-widgets-42.hist"
 printf 'https://chatgpt.com/c/abc123\n' > "$SHOME/conversation-urls/$SMARKER"
@@ -4172,7 +4172,7 @@ check '--status names the reservation marker' "$(grep -q "$SMARKER" "$TDIR/st.ou
 check '--status leads to a free harvest' "$(grep -q "FREE" "$TDIR/st.out" && grep -q -- "--harvest '$SMARKER'" "$TDIR/st.out"; echo $?)" "$(grep -i harvest "$TDIR/st.out")"
 # Round scoring remains visible, but ordinary unset configuration is advisory.
 check '--status reports spent rounds and advisory computed grant' \
-  "$(grep -q '2 spent, policy=advisory (source default), computed grant 3 is advisory' "$TDIR/st.out"; echo $?)" "$(grep spent "$TDIR/st.out")"
+  "$(grep -q '2 spent, policy=advisory (source default), computed grant 2 is advisory' "$TDIR/st.out"; echo $?)" "$(grep spent "$TDIR/st.out")"
 check '--status reports rounds used and total wall clock' \
   "$(grep -q '2 rounds; ~2.0h recorded across 2 scored round(s)' "$TDIR/st.out"; echo $?)" "$(grep spent "$TDIR/st.out")"
 check '--status writes nothing' "$([ ! -f "$SHOME/ledger.jsonl.tmp" ] && [ "$(wc -l < "$SHOME/ledger.jsonl")" -eq 1 ]; echo $?)" 'state mutated'
@@ -4332,7 +4332,7 @@ PRO_GATE_HOME="$SHOME" bash "$ENGINE" --status 42 --json >"$TDIR/st.json" 2>/dev
 check '--status --json exits 0' "$([ "$RC" -eq 0 ]; echo $?)" "rc=$RC"
 check '--status --json reservation marker' "$([ "$(jq -r '.reservations[0].marker' "$TDIR/st.json")" = "$SMARKER" ]; echo $?)" "$(cat "$TDIR/st.json")"
 check '--status --json remembered url' "$([ "$(jq -r '.reservations[0].conversation_url' "$TDIR/st.json")" = "https://chatgpt.com/c/abc123" ]; echo $?)" "$(jq -c .reservations "$TDIR/st.json")"
-check '--status --json rounds remaining' "$([ "$(jq -r '.rounds[0].remaining' "$TDIR/st.json")" = 1 ] && [ "$(jq -r '.rounds[0].cap' "$TDIR/st.json")" = 3 ]; echo $?)" "$(jq -c .rounds "$TDIR/st.json")"
+check '--status --json rounds remaining' "$([ "$(jq -r '.rounds[0].remaining' "$TDIR/st.json")" = 0 ] && [ "$(jq -r '.rounds[0].cap' "$TDIR/st.json")" = 2 ]; echo $?)" "$(jq -c .rounds "$TDIR/st.json")"
 check '--status --json reports default round policy as advisory' \
   "$([ "$(jq -r '.rounds[0].policy' "$TDIR/st.json")" = advisory ] && [ "$(jq -r '.rounds[0].policy_source' "$TDIR/st.json")" = default ] && [ "$(jq -r '.rounds[0].enforced' "$TDIR/st.json")" = false ]; echo $?)" \
   "$(jq -c .rounds "$TDIR/st.json")"
@@ -7004,10 +7004,11 @@ PG214_PRED_B='7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee'
 # #204's additive delivery-failed-unchanged reason and facts.delivery key retired this digest.
 PG214_PRED_C='5fcd19c12600061af6d90ed9cb980dd7067cff199c374910639003eec4caf5c3'
 PG214_PRED_D='6da6866bab4e95ad138cdc946fa1388be9c386bca7b592c3370c9f52e34b315f'
+PG214_PRED_E='fa91787e3fbf3c0852c78f5269b2f670d84b86561be64d6edef4229bf46aee9b'
 PG214_UNKNOWN_CD='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
-check 'the compiled binding-record compatibility list preserves all four predecessor contract digests' \
-  "$(jq -ne --arg a "$PG214_PRED_A" --arg b "$PG214_PRED_B" --arg c "$PG214_PRED_C" --arg d "$PG214_PRED_D" --argjson got "$(pg_review_decision_compatible_contract_digests_json)" \
-      '$got == ([$a,$b,$c,$d]|sort)' >/dev/null 2>&1; echo $?)" \
+check 'the compiled binding-record compatibility list preserves all five predecessor contract digests' \
+  "$(jq -ne --arg a "$PG214_PRED_A" --arg b "$PG214_PRED_B" --arg c "$PG214_PRED_C" --arg d "$PG214_PRED_D" --arg e "$PG214_PRED_E" --argjson got "$(pg_review_decision_compatible_contract_digests_json)" \
+      '$got == ([$a,$b,$c,$d,$e]|sort)' >/dev/null 2>&1; echo $?)" \
   "$(pg_review_decision_compatible_contract_digests_json)"
 PG214_ENV_PRED_FACTS="$(rd_facts '{}')"; PG214_ENV_PRED_FACTS="$(jq -cS --arg cd "$PG214_PRED_A" '.contract.contract_digest=$cd' <<<"$PG214_ENV_PRED_FACTS")"
 PG214_ENV_PRED_OUT="$(rd_reduce "$PG214_ENV_PRED_FACTS")"
@@ -7552,7 +7553,7 @@ for STORED_VERDICT in SHIP FIX-FIRST NEEDS-DISCUSSION; do
     mkdir -p "$MISMATCH_HOME/completed"
     PRO_GATE_HOME="$MISMATCH_HOME" pg_review_input_binding_write "$MISMATCH_MARKER" "$MISMATCH_INPUT"
     if [ "$STORED_VERDICT" = SHIP ] && [ "$PARSED_VERDICT" = FIX-FIRST ]; then
-      printf 'P0: none\nP1: none\n> VERDICT: SHIP — quoted legacy example. (run marker: %s)\nVERDICT: FIX-FIRST — current parser decision. (run marker: %s)\n' \
+      printf 'P0: none\n[P1] fixture.sh:1 — An open blocker.\n> VERDICT: SHIP — quoted legacy example. (run marker: %s)\nVERDICT: FIX-FIRST — current parser decision. (run marker: %s)\n' \
         "$FOREIGN164" "$MISMATCH_MARKER" > "$MISMATCH_HOME/completed/$MISMATCH_MARKER"
       MIGRATION_HOME="$MISMATCH_HOME"; MIGRATION_MARKER="$MISMATCH_MARKER"
     else
@@ -7707,7 +7708,11 @@ precedence_result() { # marker input verdict accepted artifact
   local marker="$1" input="$2" verdict="$3" accepted="$4" artifact="$5" digest input_digest proof
   input_digest="$(printf '%s' "$input" | sha256sum | awk '{print $1}')"
   proof=null
-  printf '%s\n' 'P0: none' "VERDICT: $verdict — fixture." > "$artifact"
+  {
+    printf '%s\n' 'P0: none'
+    [ "$verdict" != FIX-FIRST ] || printf '[P1] fixture.sh:1 — An open blocker.\n'
+    printf 'VERDICT: %s — fixture.\n' "$verdict"
+  } > "$artifact"
   digest="$(sha256sum "$artifact" | awk '{print $1}')"
   jq -cnS --arg cd "$RD_CONTRACT_DIGEST" --arg marker "$marker" --arg digest "$digest" --arg ib "$input_digest" --arg verdict "$verdict" --argjson accepted "$accepted" --argjson proof "$proof" \
     '{accepted_epoch:$accepted,artifact:{digest:$digest,path:("completed/"+$marker)},contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,input_binding_digest:$ib,input_binding_identity:$marker,marker:$marker,named_choice:null,provenance:{outcome:"accepted",validated_epoch:$accepted},record_type:"review-result-binding/v1",record_version:1,ship_proof:$proof,verdict:$verdict}'
