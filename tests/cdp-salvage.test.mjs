@@ -25,6 +25,8 @@ import {
   buildRenameConversationExpression,
   buildThrottleModalExpression,
   ORGANIZER_MUTATION_LEASE_MS,
+  readReviewText,
+  reviewTextContext,
 } from '../bin/cdp-organizer-expressions.mjs';
 import {
   parseTestPollMs,
@@ -359,7 +361,9 @@ function mockCdp(initialText, extraTabs = [], opts = {}) {
       let armMutation = null;
       let applyMutation = null;
       if (expression.includes('pro-gate:review-text') && opts.document) {
-        value = runInNewContext(expression, { document: opts.document });
+        const document = typeof opts.document === 'function' ? opts.document(id) : opts.document;
+        if (document) value = runInNewContext(expression, { document });
+        delayMs = Number(opts.reviewTextDelayMs?.(id) ?? 0);
       } else if (expression.includes('pro-gate:terminal-infrastructure')) {
         value = opts.infrastructureError ?? null;
       } else if (expression.includes('pro-gate:throttle-modal')) {
@@ -6396,5 +6400,184 @@ for (const placeholder of PLACEHOLDER_URLS) {
     `result=${resultPlainR12} entries=${JSON.stringify(fs.readdirSync(dirPlainR12))}`);
   fs.rmSync(dirPlainR12, { recursive: true, force: true });
 }
+
+// #262 capture-fidelity regression block: real DOM expressions and mock CDP, never a browser.
+{
+  const marker = 'pg-run-StartupBros-com-pro-gate-262-1791734400-262';
+  const foreign = 'pg-run-other-project-999-1791734400-999';
+  const node = (tag, innerText, children = [], role = null) => ({
+    innerText, textContent: innerText, children,
+    matches: (selector) => selector.split(', ').includes(tag),
+    getAttribute: (attribute) => attribute === 'data-message-author-role' ? role : null,
+  });
+  const user = (text) => node('div', text, [], 'user');
+  const assistant = (text, children = []) => node('div', text, children, 'assistant');
+  const documentFor = (turns) => ({
+    body: node('body', turns.map((turn) => turn.innerText).join('\n'), turns),
+    querySelectorAll: () => turns,
+  });
+  const prompt = user('Review the diff. run marker: ' + marker);
+  const prefix = 'I checked src/preferences.ts, serializePreferences(), and tests/preferences.test.ts.\n';
+  const skeleton = 'P0: none\n\nP1: none\n\nP2: none\n\nP3: none\n\nVERDICT: SHIP';
+  const signature = ' (run marker: ' + marker + ')';
+  const own = skeleton + signature;
+  const summary = ' — Native JSON serialization fixes preference persistence without introducing identifiable regressions.';
+  const stripped = (value) => value.replace(signature, '').trim();
+  const label = (name) => '#262: ' + name;
+
+  // A no-spend harvest exercises the actual publication and ledger path, with all runtime
+  // state isolated. Keep-tabs disables optional mock organizer actions; gh cannot run.
+  const engineHarvest = async (port) => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-fidelity-engine-'));
+    const out = path.join(home, 'review.txt');
+    const result = await new Promise((resolve) => {
+      const child = spawn('bash', [path.join(path.dirname(SALVAGE), 'oracle-review.sh'),
+        '--harvest', marker, '--out', out, '--timeout', '3s'], {
+        env: { PATH: process.env.PATH, HOME: home, PRO_GATE_HOME: home,
+          ORACLE_BROWSER_PORT: String(port), PRO_GATE_BROWSER_MODE: 'remote-chrome',
+          PRO_GATE_KEEP_TABS: '1', PRO_GATE_CHAT_RENAME: '0', PRO_GATE_CHAT_ARCHIVE: '0',
+          PRO_GATE_HARVEST_TTL_SWEEP: '0', PRO_GATE_GH_BIN: '/bin/false' },
+      });
+      let stdout = '', stderr = '';
+      child.stdout.on('data', (data) => { stdout += data; });
+      child.stderr.on('data', (data) => { stderr += data; });
+      const timer = setTimeout(() => child.kill('SIGKILL'), 30_000);
+      child.on('close', (status) => { clearTimeout(timer); resolve({ status, stdout, stderr }); });
+    });
+    const read = (file) => { try { return fs.readFileSync(path.join(home, file), 'utf8'); } catch { return ''; } };
+    result.review = read('review.txt');
+    result.canonical = read('completed/' + marker);
+    try { result.ledger = JSON.parse(read('ledger.jsonl').trim().split('\n').at(-1)); } catch {}
+    fs.rmSync(home, { recursive: true, force: true });
+    return result;
+  };
+
+  for (const [name, answer, expectedBytes] of [
+    ['54-byte suffix', prefix + own, 54],
+    ['159-byte suffix', prefix + skeleton + summary + signature, 159],
+    ['true skeleton unchanged', own, 54],
+  ]) {
+    const document = documentFor([prompt, assistant(answer)]);
+    const captured = readReviewText(document, marker);
+    const context = reviewTextContext(captured.text, marker, captured.promptAt, captured.assistantTurnScoped);
+    check(label(name + ' has explicit one-assistant scope'), captured.assistantTurnScoped === true);
+    check(label(name + ' retains the complete assistant prefix'), context.review === answer,
+      JSON.stringify(context.review));
+    const expected = stripped(answer) + '\n';
+    check(label(name + ' fixture reconstructs the reported suffix size'),
+      Buffer.byteLength(stripped(answer.replace(prefix, '')) + '\n') === expectedBytes);
+    const cdp = await mockCdp(document.body.innerText, [], { document });
+    try {
+      const capture = await runSalvage([marker, '3'], cdp.port);
+      const binding = bindCapture(capture.stdout, marker);
+      check(label(name + ' actual capture is byte-preserving and bound'),
+        capture.status === 0 && capture.stdout === answer + '\n' && binding.status === 0 &&
+        /^evidence-kind: terminal$/m.test(capture.stderr), JSON.stringify(capture));
+      const probe = await runSalvage(['--probe', marker, '3'], cdp.port);
+      check(label(name + ' keeps the existing completion decision'),
+        probe.status === 0 && /^probe-state: complete$/m.test(probe.stderr), probe.stderr);
+      const engine = await engineHarvest(cdp.port);
+      check(label(name + ' actual engine persists full bytes before clean ledgering'),
+        engine.status === 0 && engine.review === expected && engine.canonical === expected &&
+        engine.ledger?.exit === 0 && engine.ledger?.outcome === 'clean' && engine.ledger?.salvaged === 1,
+        JSON.stringify(engine));
+      const finalized = await runSalvage(finalizerArgs(marker, { archive: false, rename: false }), cdp.port,
+        seedOrganizer(marker, 'fidelity fixture', 'https://chatgpt.com/c/mock-conversation', stripped(answer)));
+      check(label(name + ' outer finalizer accepts the same full artifact'),
+        finalized.status === 0 && /close=closed/.test(finalized.stdout), JSON.stringify(finalized));
+    } finally { cdp.stop(); }
+
+    const fixture = organizerExpressionFixture(document.body.innerText, { document });
+    const options = {
+      marker, conversationUrl: 'https://chatgpt.com/c/mock-conversation',
+      mutationToken: 'fidelity.finalize', mutationExpiresAt: Date.now() + 10_000,
+      expectedReview: stripped(answer),
+    };
+    const finalized = await runInNewContext(buildRenameConversationExpression('unchanged title', options), fixture.context);
+    check(label(name + ' independent finalization guard accepts full bytes'),
+      finalized.status === 'already' && fixture.sidebarReads() > 0 && fixture.events.length === 0,
+      JSON.stringify(finalized));
+    if (answer.startsWith(prefix)) {
+      const wrongFixture = organizerExpressionFixture(document.body.innerText, { document });
+      const rejected = await runInNewContext(buildRenameConversationExpression('unchanged title', {
+        ...options, expectedReview: stripped(answer.slice(prefix.length)),
+      }), wrongFixture.context);
+      check(label(name + ' independent guard rejects a truncated artifact'),
+        rejected.reason === 'target-result-mismatch' && wrongFixture.events.length === 0,
+        JSON.stringify(rejected));
+    }
+  }
+
+  const quoted = 'VERDICT: SHIP (run marker: ' + foreign + ')';
+  const cases = [
+    { name: 'prior foreign turn excluded', turns: [user('run marker: ' + foreign), assistant('OLD SECRET\n' + quoted), prompt, assistant(prefix + own)], complete: true, bind: 0, expected: prefix + own },
+    { name: 'user prompt verdict excluded', turns: [user('run marker: ' + marker + '\n' + own), assistant('Still reading src/preferences.ts.')], complete: false, harvest: 3 },
+    { name: 'newer same-marker prompt remains generating', turns: [prompt, assistant(own), prompt, assistant(prefix)], complete: false, harvest: 3 },
+    { name: 'quoted own verdict is not terminal', turns: [prompt, assistant(own, [node('p', skeleton.split('VERDICT:')[0]), node('pre', 'VERDICT: SHIP' + signature)])], complete: false, harvest: 3 },
+    { name: 'quoted foreign verdict remains reference text', turns: [prompt, assistant(quoted + '\n' + prefix + own, [node('blockquote', quoted), node('p', prefix + own)])], complete: true, bind: 0, expected: '> ' + quoted + '\n' + prefix + own },
+    { name: 'mixed verdicts remain unbound', turns: [prompt, assistant(quoted + '\n' + own)], complete: false, bind: 2 },
+    { name: 'foreign verdict remains cross-bound', turns: [prompt, assistant(skeleton + ' (run marker: ' + foreign + ')')], complete: false, harvest: 4 },
+    { name: 'no assistant remains generating', turns: [prompt], complete: false, harvest: 3 },
+    { name: 'missing verdict remains generating', turns: [prompt, assistant(prefix + 'P0: none')], complete: false, harvest: 3 },
+    ...['user', 'system', 'tool'].map((role) => ({ name: 'later ' + role + ' retains legacy extraction',
+      turns: [prompt, assistant(prefix + own), node('div', 'Additional context.', [], role)], complete: true, bind: 0, expected: own, ambiguous: true })),
+    { name: 'multiple assistants retain legacy extraction', turns: [prompt, assistant(prefix), assistant(own)], complete: true, bind: 0, expected: own, ambiguous: true },
+  ];
+  for (const test of cases) {
+    const document = documentFor(test.turns);
+    const captured = readReviewText(document, marker);
+    if (test.ambiguous) check(label(test.name + ' has no expanded scope'), captured.assistantTurnScoped === false);
+    const cdp = await mockCdp(document.body.innerText, [], { document });
+    try {
+      const probe = await runSalvage(['--probe', marker, '1'], cdp.port);
+      check(label(test.name + ' preserves completion'),
+        /^probe-state: complete$/m.test(probe.stderr) === test.complete, probe.stderr);
+      const capture = await runSalvage([marker, '1'], cdp.port);
+      check(label(test.name + ' preserves harvest/binding'),
+        capture.status === (test.harvest ?? 0) && (test.bind === undefined || bindCapture(capture.stdout, marker).status === test.bind),
+        JSON.stringify(capture));
+      if (test.expected !== undefined) check(label(test.name + ' preserves exact boundaries'),
+        capture.stdout === test.expected + '\n', JSON.stringify(capture.stdout));
+    } finally { cdp.stop(); }
+  }
+
+  const transcript = 'run marker: ' + marker + '\n' + prefix + own;
+  for (const document of [null, { body: node('body', transcript), querySelectorAll: () => [] }]) {
+    const cdp = await mockCdp(transcript, [], { document });
+    try {
+      const capture = await runSalvage([marker, '3'], cdp.port);
+      check(label('legacy ' + (document ? 'DOM fallback' : 'string') + ' retains old extraction'),
+        capture.status === 0 && capture.stdout === own + '\n', JSON.stringify(capture));
+    } finally { cdp.stop(); }
+  }
+
+  // Concurrent equal-byte reads must not transfer positive scope. Test every fallback shape,
+  // both tab-list orders, and both CDP-response orders (250ms makes completion order explicit).
+  const answer = prefix + '\n' + own;
+  const eligible = documentFor([prompt, assistant(answer)]);
+  const equalText = readReviewText(eligible, marker).text;
+  const ambiguous = documentFor([prompt, assistant(prefix.slice(0, -1)), assistant(own)]);
+  check(label('collision fixture DOM captures are byte-identical'), readReviewText(ambiguous, marker).text === equalText);
+  for (const [kind, other] of [
+    ['legacy string', null],
+    ['unscoped DOM', { body: node('body', equalText), querySelectorAll: () => [] }],
+    ['ambiguous DOM', ambiguous],
+  ]) for (const eligibleFirst of [true, false]) for (const eligibleLast of [true, false]) {
+    const eligibleId = eligibleFirst ? 'tab1' : 'tab2';
+    const cdp = await mockCdp(equalText, [{ id: 'tab2', url: 'https://chatgpt.com/c/equal-text' }], {
+      tabText: () => equalText,
+      document: (id) => id === eligibleId ? eligible : other,
+      reviewTextDelayMs: (id) => (id === eligibleId) === eligibleLast ? 250 : 0,
+    });
+    try {
+      const capture = await runSalvage([marker, '3'], cdp.port);
+      check(label('equal-byte ' + kind + ' never inherits scope; eligible first=' + eligibleFirst + ' last=' + eligibleLast),
+        capture.status === 0 && capture.stdout === own + '\n' &&
+        cdp.requests.filter((request) => request.params?.expression?.includes('pro-gate:review-text')).length === 2,
+        JSON.stringify(capture));
+    } finally { cdp.stop(); }
+  }
+}
+// End #262 capture-fidelity regression block.
 
 process.exit(failures === 0 ? 0 : 1);

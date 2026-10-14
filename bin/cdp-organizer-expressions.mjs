@@ -46,10 +46,17 @@ export function readReviewText(document, marker) {
   for (let i = 0; i < turns.length; i++) {
     if (turns[i].getAttribute('data-message-author-role') === 'user' && exact(turns[i].innerText ?? '')) prompt = i;
   }
-  if (prompt >= 0) return {
-    text: 'run marker: ' + marker + '\n' + turns.slice(prompt + 1).map((turn) => read(turn)).join('\n\n'),
-    promptAt: 0,
-  };
+  if (prompt >= 0) {
+    const responseTurns = turns.slice(prompt + 1);
+    return {
+      text: 'run marker: ' + marker + '\n' + responseTurns.map((turn) => read(turn)).join('\n\n'),
+      promptAt: 0,
+      // A prompt boundary alone may contain later user/tool turns or several answers. Only
+      // this unambiguous DOM shape proves that every response byte belongs to one assistant.
+      assistantTurnScoped: responseTurns.length === 1 &&
+        responseTurns[0].getAttribute('data-message-author-role') === 'assistant',
+    };
+  }
   return { text: read(document.body), promptAt: null };
 }
 
@@ -96,7 +103,8 @@ export function reviewVerdictClaims(text, marker) {
   return { claims, promptAt };
 }
 
-export function reviewTextContext(text, marker, promptAt = null) {
+export function reviewTextContext(text, marker, promptAt = null, assistantTurnScoped = false) {
+  const preserveAssistantPrefix = assistantTurnScoped === true && promptAt === 0;
   const scanned = reviewVerdictClaims(text, marker);
   const all = scanned.claims;
   // DOM user-turn scope is authoritative. Legacy text sources retain the known prompt-line
@@ -108,7 +116,9 @@ export function reviewTextContext(text, marker, promptAt = null) {
   const verdict = claims.at(-1) ?? all.at(-1) ?? null;
   let review = null;
   if (verdict) {
-    if (mixed) {
+    if (mixed || (preserveAssistantPrefix && verdict.at > promptAt)) {
+      // A severity heading is not the start of a DOM-proven assistant answer. Retain its
+      // preamble, but keep the existing terminal-verdict boundary and all claim selection.
       const from = promptAt < 0 ? 0 : text.indexOf('\n', promptAt) + 1;
       review = text.slice(from, verdict.at + verdict.line.length).trim();
     } else {
@@ -235,7 +245,7 @@ function targetContext(marker, conversationUrl, {
       if (typeof location !== 'object' || location.href !== expectedUrl) return 'target-url-drift';
       const captured = readReviewText(document, expectedMarker);
       const text = captured.text;
-      const context = reviewTextContext(text, expectedMarker, captured.promptAt);
+      const context = reviewTextContext(text, expectedMarker, captured.promptAt, captured.assistantTurnScoped);
       if (context.mixed) return 'target-mixed-review';
       if (lastExactMarkerAt(text, expectedMarker) < 0) return 'target-marker-missing';
       const verdictLine = context.verdict?.line ?? '';
