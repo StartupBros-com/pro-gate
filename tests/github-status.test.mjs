@@ -1283,7 +1283,9 @@ const cp = require('node:child_process');
 const args = process.argv.slice(2);
 if (args[0] === 'fetch') {
   const cfg = JSON.parse(fs.readFileSync(${JSON.stringify(configFile)}, 'utf8'));
-  cp.execFileSync(${JSON.stringify(realGit)}, ['update-ref', 'refs/remotes/origin/'+args[2], cfg.liveBase]);
+  const refspec = /^\\+refs\\/heads\\/(.+):refs\\/remotes\\/origin\\/\\1$/.exec(args[2]);
+  if (!refspec) throw new Error('Expected explicit source/destination base refspec');
+  cp.execFileSync(${JSON.stringify(realGit)}, ['update-ref', 'refs/remotes/origin/'+refspec[1], cfg.liveBase]);
 } else {
   const result = cp.spawnSync(${JSON.stringify(realGit)}, args, {stdio:'inherit'});
   process.exit(result.status ?? 1);
