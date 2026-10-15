@@ -506,25 +506,20 @@ pg_review_decision_choice_selection_read() { # file -> canonical {selected_id,sn
   printf '%s' "$canonical"
 }
 
-pg_review_decision_shape_rejection_fact() { # marker artifact input-binding -> normalized candidate
-  local marker="$1" artifact="$2" binding="$3" digest
-  digest="$(pg_sha256 "$artifact")" || return 1
-  jq -cnS --arg marker "$marker" --arg digest "$digest" \
+pg_review_decision_rejected_fact() { # marker artifact-digest input-binding shape -> normalized candidate
+  local marker="$1" digest="$2" binding="$3" shape="$4"
+  jq -cnS --arg marker "$marker" --arg digest "$digest" --arg shape "$shape" \
     --argjson epoch "$(jq -r .charged_spend_epoch <<<"$binding")" \
     --arg mode "$(pg_review_decision_result_mode "$binding")" '
     {applicable:false,artifact_digest:$digest,bindable:false,binding_valid:false,
      canonical_identity:$marker,charged_spend_epoch:$epoch,collected:true,evidence_mode:$mode,
-     legacy:false,marker:$marker,provenance_valid:false,shape:"template-verdict",verdict:"NONE"}'
+     legacy:false,marker:$marker,provenance_valid:false,shape:$shape,verdict:"NONE"}'
 }
 
-pg_review_decision_rejected_capture_fact() { # marker capture-digest input-binding -> normalized candidate
-  local marker="$1" digest="$2" binding="$3"
-  jq -cnS --arg marker "$marker" --arg digest "$digest" \
-    --argjson epoch "$(jq -r .charged_spend_epoch <<<"$binding")" \
-    --arg mode "$(pg_review_decision_result_mode "$binding")" '
-    {applicable:false,artifact_digest:$digest,bindable:false,binding_valid:false,
-     canonical_identity:$marker,charged_spend_epoch:$epoch,collected:true,evidence_mode:$mode,
-     legacy:false,marker:$marker,provenance_valid:false,shape:"rejected-capture",verdict:"NONE"}'
+pg_review_decision_shape_rejection_fact() { # marker artifact input-binding -> normalized candidate
+  local digest
+  digest="$(pg_sha256 "$2")" || return 1
+  pg_review_decision_rejected_fact "$1" "$digest" "$3" template-verdict
 }
 
 pg_review_decision_cli() {
@@ -636,7 +631,7 @@ pg_review_decision_cli() {
     # any completed or pending artifact for the marker takes precedence and the record is unread.
     if [ "$exact" = true ] && [ -z "$artifact" ] \
        && rejected_digest="$(pg_rejected_capture_read "$marker" "$candidate" 2>/dev/null)"; then
-      completed="$(jq -cS --argjson rejected "$(pg_review_decision_rejected_capture_fact "$marker" "$rejected_digest" "$candidate")" \
+      completed="$(jq -cS --argjson rejected "$(pg_review_decision_rejected_fact "$marker" "$rejected_digest" "$candidate" rejected-capture)" \
         '. + [$rejected]' <<<"$completed")" || return 2
       continue
     fi

@@ -47,7 +47,8 @@ export function readReviewText(document, marker) {
     if (turns[i].getAttribute('data-message-author-role') === 'user' && exact(turns[i].innerText ?? '')) prompt = i;
   }
   if (prompt >= 0) {
-    const text = 'run marker: ' + marker + '\n' + turns.slice(prompt + 1).map((turn) => read(turn)).join('\n\n');
+    const following = turns.slice(prompt + 1);
+    const text = 'run marker: ' + marker + '\n' + following.map((turn) => read(turn)).join('\n\n');
     // #271: response-scope facts for salvage's completion proof. Proven only when exactly one
     // assistant message follows the latest marked prompt, it is the page's last message, its turn
     // shows Oracle's FINISHED_ACTIONS_SELECTOR buttons, no STOP_BUTTON_SELECTORS control is
@@ -56,7 +57,6 @@ export function readReviewText(document, marker) {
     try {
       const finishedActions = 'button[data-testid="copy-turn-action-button"], button[data-testid="good-response-turn-action-button"], button[data-testid="bad-response-turn-action-button"], button[aria-label="Share"]';
       const stopButtons = '[data-testid="stop-button"], [data-testid="composer-stop-button"], form button[aria-label*="stop" i]:not([aria-label*="dictat" i]):not([aria-label*="voice" i]):not([aria-label*="read" i])';
-      const following = turns.slice(prompt + 1);
       const answer = following.length === 1 ? following[0] : null;
       const assistantLast = !!answer && answer.getAttribute('data-message-author-role') === 'assistant'
         && answer === turns[turns.length - 1];

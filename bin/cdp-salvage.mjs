@@ -1389,16 +1389,20 @@ async function tabText(tab) {
 
 // #271: per-text response-scope memory for the completion proof (see readReviewText's scope).
 // A text read once unproven, or proven under a different URL, stays unproven for the rest of
-// this invocation: the proof needs every sighting of those exact bytes to agree.
-const responseScopes = new Map();   // text -> { proven, href }
+// this invocation: the proof needs every sighting of those exact bytes to agree. Keyed by the
+// text's SHA-256 so a long salvage does not retain one full response body per poll.
+const responseScopes = new Map();   // sha256(text) -> { proven, href }
+const responseScopeKey = (text) => createHash('sha256').update(text).digest('hex');
 const responseScopeProven = (scope) => scope?.following === 1 && scope.assistantLast === true
   && scope.finished === true && scope.generating === false && typeof scope.href === 'string';
 function noteResponseScope(text, scope) {
-  const seen = responseScopes.get(text);
-  if (!responseScopeProven(scope) || (seen && (!seen.proven || seen.href !== scope.href))) {
-    responseScopes.set(text, { proven: false, href: null });
+  const key = responseScopeKey(text);
+  const seen = responseScopes.get(key);
+  if (seen && !seen.proven) return;   // already poisoned for this invocation
+  if (!responseScopeProven(scope) || (seen && seen.href !== scope.href)) {
+    responseScopes.set(key, { proven: false, href: null });
   } else if (!seen) {
-    responseScopes.set(text, { proven: true, href: scope.href });
+    responseScopes.set(key, { proven: true, href: scope.href });
   }
 }
 
@@ -1410,7 +1414,7 @@ function noteResponseScope(text, scope) {
 async function completionProof(tab, text, printed) {
   if (probe || typeof text !== 'string' || typeof printed !== 'string') return null;
   const proven = () => {
-    const scope = responseScopes.get(text);
+    const scope = responseScopes.get(responseScopeKey(text));
     return scope?.proven === true && scope.href === tab.url && conversationUrlOk(tab.url)
       && (!knownUrl || knownUrl === tab.url);
   };

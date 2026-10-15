@@ -4379,7 +4379,7 @@ pg_review_decision_envelope_valid() { # decision-file
 }
 
 pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read stdin
-  local supplied canonical snapshot unsafe valid reason selected selected_ref selected_count
+  local supplied canonical snapshot unsafe valid reason selected selected_ref selected_count selected_shape
   local action prior prior_applicable verdict choice_snapshot rounds_not_converging
   pg_have jq || return 1
   if [ "$#" -gt 0 ]; then supplied="$1"; else supplied="$(cat)"; fi
@@ -4506,14 +4506,15 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
       pg_review_decision_emit stop-without-new-review completed-result-tie "$canonical" "$snapshot"; return
     fi
     selected_ref="$(jq -r .canonical_identity <<<"$selected")"
+    selected_shape="$(jq -r '.shape // ""' <<<"$selected")"
     # Rejected saved bytes participate in the same newest-epoch selection without supplying
     # accepted authority. A newer grounded completion can supersede them; a newest rejection stops.
-    if [ "$(jq -r '.shape // ""' <<<"$selected")" = template-verdict ]; then
+    if [ "$selected_shape" = template-verdict ]; then
       pg_review_decision_emit stop-without-new-review template-verdict "$canonical" "$snapshot" "$selected_ref"; return
     fi
     # #271: a retained proven completion that failed validation stops only its own attempt. While
     # another marker is active or reserved, that live work is recovered by the branches below.
-    if [ "$(jq -r '.shape // ""' <<<"$selected")" = rejected-capture ] \
+    if [ "$selected_shape" = rejected-capture ] \
        && jq -e --argjson s "$selected" '.active_index.state=="none" and (.reservation.state=="none" or .reservation.marker==$s.marker)' <<<"$canonical" >/dev/null; then
       pg_review_decision_emit stop-without-new-review rejected-capture "$canonical" "$snapshot" "$selected_ref"; return
     fi
