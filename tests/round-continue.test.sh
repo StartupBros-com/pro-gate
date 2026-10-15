@@ -48,6 +48,43 @@ facts_with_governor(){ # governor [patch]
   jq -cS --argjson governor "$1" --argjson patch "$patch" --argjson identity "$(pg_review_decision_identity_json)" \
     '.base_facts * $patch | .governor=$governor | .contract=$identity' "$HERE/fixtures/review-decision/v1/corpus.json"
 }
+result="$(
+  clear_policy
+  PRO_GATE_HOME="$TDIR/default-cap"
+  pg_round_score default
+  printf 'base=%s grant=%s ceiling=%s\n' "$PG_ROUND_BASE" "$PG_ROUND_GRANT" "$PG_ROUND_CEILING"
+  [ "$PG_ROUND_BASE" -eq 2 ] && [ "$PG_ROUND_GRANT" -eq 2 ] && [ "$PG_ROUND_CEILING" -eq 8 ]
+)"; rc=$?
+check '#274 default numeric grant is 2 with round environment unset (planted negative)' "$rc" "$result"
+result="$(
+  clear_policy
+  export PRO_GATE_HOME="$TDIR/status-default" PRO_GATE_RUN_LOGS=0
+  mkdir -p "$PRO_GATE_HOME/rounds"
+  date +%s > "$PRO_GATE_HOME/rounds/status-default"
+  bash "${PG_TEST_STATUS_ENGINE:-$HERE/../bin/oracle-review.sh}" --status
+)"; rc=$?
+check 'P3-7 status heading reports adaptive base 2 with settings unset' \
+  "$([ "$rc" -eq 0 ] && [[ "$result" == *'adaptive (base 2,'* ]]; printf '%s' "$?")" "$result"
+result="$(
+  clear_policy
+  PRO_GATE_HOME="$TDIR/explicit-cap"
+  PRO_GATE_MAX_ROUNDS_PER_PR=4
+  pg_round_score explicit
+  [ "$PG_ROUND_GRANT" -eq 4 ] && [ "$(pg_round_policy_mode explicit)" = enforced ]
+)"; rc=$?
+check '#274 explicit PRO_GATE_MAX_ROUNDS_PER_PR=4 remains honored (control)' "$rc" "$result"
+result="$(
+  clear_policy
+  PRO_GATE_HOME="$TDIR/invalid-cap"
+  PRO_GATE_MAX_ROUNDS_PER_PR=invalid
+  pg_round_score invalid
+  [ "$PG_ROUND_GRANT" -eq 2 ] || exit 1
+  unset PRO_GATE_MAX_ROUNDS_PER_PR
+  PRO_GATE_ROUNDS_BASE=4
+  pg_round_score explicit-base
+  [ "$PG_ROUND_BASE" -eq 4 ] && [ "$PG_ROUND_GRANT" -eq 4 ]
+)"; rc=$?
+check '#274 invalid flat cap falls back to 2 and explicit base 4 remains honored' "$rc" "$result"
 matrix_case(){ (
   local mode="$1" override="$2" trajectory="$3" budget="$4" policy base=6 numeric earned=0 streak=0 used=3
   local expected_granted=true expected_grant granted=false governor decision reason expected_reason
@@ -115,7 +152,7 @@ result="$(
   PRO_GATE_ROUNDS_CONTINUE=1
   seed default 3 churning
   pg_round_score default
-  [ "$PG_ROUND_GRANT" = 3 ] || exit 1
+  [ "$PG_ROUND_GRANT" = 2 ] || exit 1
   unset PRO_GATE_ROUNDS_CONTINUE
   decision="$(pg_review_decision_reduce "$(facts_with_governor "$(pg_round_governor_facts_json default true)")")"
   [ "$(jq -r .reason <<<"$decision")" = rounds-not-converging ]

@@ -46,6 +46,9 @@
 #       Current applicability requires complete supplied proof; historical verdicts are separate.
 #       --candidate-head <full-sha> selects an explicit target for inspection/preparation only;
 #       without it, both modes retain their checkout-HEAD default.
+#   oracle-review.sh --review-decision --repo <dir> --pr <number|canonical-pr-url> --json
+#       An accepted current FIX-FIRST with zero open P0/P1 defers P2/P3 to the existing merge
+#       workflow; rounds-not-converging still preempts it. The advisory base grant defaults to 2.
 #   oracle-review.sh --status [<pr-number|pr-url|pg-run-marker>] [--json]
 #       Expert/read-only diagnostics (v0.27): join reservations, round budget, remembered
 #       conversation URLs, and the ledger, and print each matching run's state plus the exact
@@ -522,6 +525,7 @@ pg_review_decision_cli() {
   local reservation_marker="" reservation_state=none governor_granted=false cooldown_left=0 completed='[]' prior_candidates='[]' prior_review result artifact artifact_digest canonical
   local facts governor_facts decision effect_ok=false prospective exact_inputs='[]' choice_candidates='[]' choice_outcomes='[]' choice_selected="" choice_snapshot="" selection="" selection_supplied=false current_verdict=NONE current_canonical="" effect_input attempt_snapshot attempt_source
   local delivery_relation delivery_facts accepted accepted_rc
+  local finding_candidates='[]' finding_summary
   local pr_evidence="" legacy_pr_identity=false
 
   pg_have jq || { echo 'ERROR: review-decision/v1 requires jq' >&2; return 2; }
@@ -677,6 +681,10 @@ pg_review_decision_cli() {
         --argjson epoch "$(jq -r .charged_spend_epoch <<<"$candidate")" --arg verdict "$(jq -r .verdict <<<"$result")" \
         --arg mode "$(pg_review_decision_result_mode "$candidate")" \
         '. + [{applicable:true,artifact_digest:$artifact,bindable:true,binding_valid:true,canonical_identity:$canonical,charged_spend_epoch:$epoch,collected:true,evidence_mode:$mode,legacy:false,marker:$marker,provenance_valid:true,verdict:$verdict}]' <<<"$completed")"
+      # Counts and deferred lines come from the same digest-verified private byte snapshot.
+      # Bind the summary to its result identity so a newer completion cannot inherit older nits.
+      finding_candidates="$(jq -cS --arg canonical "$canonical" --argjson accepted "$accepted" \
+        '. + [{canonical_identity:$canonical,open_blocking:($accepted.open_p0+$accepted.open_p1),deferred_findings:$accepted.deferred_findings}]' <<<"$finding_candidates")"
       if [ "$(jq -r .verdict <<<"$result")" = NEEDS-DISCUSSION ]; then
         choice_outcomes="$(jq -cS '.named_choices // []' <<<"$accepted")"
         choice_candidates="$(jq -cS --arg canonical "$canonical" --argjson outcomes "$choice_outcomes" \
@@ -704,6 +712,8 @@ pg_review_decision_cli() {
   [ -z "$input_record" ] || input_digest="$(pg_review_sha256_text "$input_record")"
   current_canonical="$(jq -r 'sort_by(.charged_spend_epoch,.canonical_identity) | last.canonical_identity // ""' <<<"$completed")"
   current_verdict="$(jq -r 'sort_by(.charged_spend_epoch,.canonical_identity) | last.verdict // "NONE"' <<<"$completed")"
+  finding_summary="$(jq -cS --arg canonical "$current_canonical" \
+    '[.[] | select(.canonical_identity==$canonical)] | last // {open_blocking:null,deferred_findings:[]}' <<<"$finding_candidates")"
   if [ "$current_verdict" = NEEDS-DISCUSSION ]; then
     choice_outcomes="$(jq -cS --arg canonical "$current_canonical" '[.[] | select(.canonical_identity==$canonical)] | last.outcomes // []' <<<"$choice_candidates")"
   else
@@ -774,11 +784,12 @@ pg_review_decision_cli() {
     --arg identity "$input_identity" --arg evidence "$evidence_identity" --arg state "$evidence_state" \
     --arg marker "$active_marker" --arg astate "$active_state" --arg reservation "$reservation_marker" --arg rstate "$reservation_state" \
     --argjson input_proven "$input_proven" --argjson input_binding "$input_binding_valid" --argjson governor "$governor_facts" \
-    --argjson cooldown_left "$cooldown_left" --argjson delivery "$delivery_facts" \
+    --argjson cooldown_left "$cooldown_left" --argjson delivery "$delivery_facts" --argjson findings "$finding_summary" \
     --argjson completed "$completed" --argjson prior "$prior_review" --argjson choices "$choice_outcomes" --arg choice "$choice_selected" --arg choice_snap "$choice_snapshot" --arg cd "$(pg_review_decision_contract_digest)" --arg xd "$(pg_review_decision_corpus_digest)" '
     {active_index:{binding_valid:$input_binding,charged_spend_epoch:0,marker:$marker,state:$astate},completed_results:$completed,
      contract:{contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,corpus_digest:$xd},
      cooldown:{active:($cooldown_left > 0),seconds_remaining:$cooldown_left},delivery:$delivery,
+     open_blocking:$findings.open_blocking,deferred_findings:$findings.deferred_findings,deferred_count:($findings.deferred_findings|length),
      evidence:{identity:$evidence,safe_to_prepare:true,state:$state},governor:$governor,
      input:{binding_valid:$input_binding,identity:$identity,proven:$input_proven},named_choice:{outcomes:$choices,selected_id:(if $choice=="" then null else $choice end),snapshot_digest:$choice_snap},
      observation:{kind:"idle"},prior_review:$prior,
@@ -1247,7 +1258,7 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
   if [ -n "${PRO_GATE_MAX_ROUNDS_PER_PR:-}" ]; then
     ST_CAP_DESC="flat cap ${PRO_GATE_MAX_ROUNDS_PER_PR}"
   else
-    ST_CAP_DESC="adaptive (base ${PRO_GATE_ROUNDS_BASE:-3}, +1 per shrinking re-review, ceiling ${PRO_GATE_ROUNDS_CEILING:-8})"
+    ST_CAP_DESC="adaptive (base ${PRO_GATE_ROUNDS_BASE:-$(pg_round_default_base)}, +1 per shrinking re-review, ceiling ${PRO_GATE_ROUNDS_CEILING:-8})"
   fi
   ST_WIN="$(pg_round_window_secs)"
   ST_NOW="$(date +%s)"
@@ -2178,7 +2189,7 @@ pg_fresh_dispatch_recheck() { # sets PG_FRESH_DECISION/PG_FRESH_ACTION
   facts="$(jq -cnS --arg h "$PG_META_HOST" --arg o "$PG_META_OWNER" --arg r "$PG_META_REPO" --arg head "$head" --argjson p "$PR_NUM" \
     --arg identity "$identity" --arg evidence "$evidence" --arg marker "$active_marker" --arg astate "${astate:-none}" --arg reservation "$reservation" \
     --argjson valid "$input_ok" --argjson input_binding "$input_binding" --argjson governor "$governor_facts" --argjson cooldown_left "$cooldown_left" --argjson delivery "$delivery_facts" --argjson completed "$completed" --arg cd "$(pg_review_decision_contract_digest)" --arg xd "$(pg_review_decision_corpus_digest)" \
-    '{active_index:{binding_valid:$input_binding,charged_spend_epoch:0,marker:$marker,state:$astate},completed_results:$completed,contract:{contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,corpus_digest:$xd},cooldown:{active:($cooldown_left > 0),seconds_remaining:$cooldown_left},delivery:$delivery,evidence:{identity:$evidence,safe_to_prepare:true,state:(if $valid then "matching" else "missing" end)},governor:$governor,input:{binding_valid:$input_binding,identity:$identity,proven:$valid},named_choice:{outcomes:[],selected_id:null,snapshot_digest:""},observation:{kind:"idle"},prior_review:{applicable:false,binding_valid:false,code_identity:"",evidence_identity:"",legacy:false,marker:"",provenance_valid:false,verdict:"NONE"},reservation:{binding_valid:false,legacy:false,marker:$reservation,state:(if $reservation=="" then "none" else "live" end)},target:{head_oid:$head,host:$h,owner:$o,pr:$p,repo:$r},transport:"review-decision/v1"}')" || return 1
+    '{active_index:{binding_valid:$input_binding,charged_spend_epoch:0,marker:$marker,state:$astate},completed_results:$completed,contract:{contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,corpus_digest:$xd},cooldown:{active:($cooldown_left > 0),seconds_remaining:$cooldown_left},deferred_count:0,deferred_findings:[],open_blocking:null,delivery:$delivery,evidence:{identity:$evidence,safe_to_prepare:true,state:(if $valid then "matching" else "missing" end)},governor:$governor,input:{binding_valid:$input_binding,identity:$identity,proven:$valid},named_choice:{outcomes:[],selected_id:null,snapshot_digest:""},observation:{kind:"idle"},prior_review:{applicable:false,binding_valid:false,code_identity:"",evidence_identity:"",legacy:false,marker:"",provenance_valid:false,verdict:"NONE"},reservation:{binding_valid:false,legacy:false,marker:$reservation,state:(if $reservation=="" then "none" else "live" end)},target:{head_oid:$head,host:$h,owner:$o,pr:$p,repo:$r},transport:"review-decision/v1"}')" || return 1
   PG_FRESH_DECISION="$(pg_review_decision_reduce "$facts")" || return 1
   PG_FRESH_ACTION="$(jq -r .action <<<"$PG_FRESH_DECISION")"
   [ "$PG_FRESH_ACTION" = run-granted-review ]

@@ -75,9 +75,16 @@ shape_binding() { # marker contract-digest
   jq -cnS --arg cd "$2" --arg marker "$1" '{charged_spend_epoch:1700000000,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:"full-pr:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",mode:"full-pr",proof:{base_oid:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",endpoint_digest:"2222222222222222222222222222222222222222222222222222222222222222",head_oid:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",raw_patch_digest:"1111111111111111111111111111111111111111111111111111111111111111"}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:"github.com",owner:"acme",repo:"review"},target:{head_oid:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",kind:"pull-request",pr:262}}'
 }
 PRE_MARKER=pg-run-acme-review-262-1700000000-11 POST_MARKER=pg-run-acme-review-262-1700000000-12 UNBOUND_MARKER=pg-run-acme-review-262-1700000000-13
+VOCAB_MARKER=pg-run-acme-review-262-1700000000-14
+VOCABULARY_CONTRACT_DIGEST=246b9e4e1d58f1820b4381a90cf93cf3fb7fb849f3ce4dd34b4d757be79c2e4f
+PRE_VOCABULARY_EXPECTED='bf36fdb5f8625e917be0539ca014fec518649d1160584846aca1cb9149533abb 7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee 5fcd19c12600061af6d90ed9cb980dd7067cff199c374910639003eec4caf5c3 6da6866bab4e95ad138cdc946fa1388be9c386bca7b592c3370c9f52e34b315f fa91787e3fbf3c0852c78f5269b2f670d84b86561be64d6edef4229bf46aee9b'
 pg_review_input_binding_write "$PRE_MARKER" "$(shape_binding "$PRE_MARKER" fa91787e3fbf3c0852c78f5269b2f670d84b86561be64d6edef4229bf46aee9b)"
 pg_review_input_binding_write "$POST_MARKER" "$(shape_binding "$POST_MARKER" "$(pg_review_decision_contract_digest)")"
-check 'gate r1 P1: the pre-vocabulary digest list is frozen to predecessors of the current contract' "$([ "$(printf '%s\n' $PG_REVIEW_PRE_VOCABULARY_CONTRACT_DIGESTS | LC_ALL=C sort | paste -sd' ')" = "$(pg_review_decision_compatible_contract_digests_json | jq -r 'join(" ")')" ] && ! printf '%s\n' $PG_REVIEW_PRE_VOCABULARY_CONTRACT_DIGESTS | grep -qxF "$(pg_review_decision_contract_digest)"; echo $?)"
+pg_review_input_binding_write "$VOCAB_MARKER" "$(shape_binding "$VOCAB_MARKER" "$VOCABULARY_CONTRACT_DIGEST")"
+check 'gate r1 P1: the pre-vocabulary digest list stays frozen to the five pre-0.62.0 digests' \
+  "$([ "$(printf '%s\n' $PG_REVIEW_PRE_VOCABULARY_CONTRACT_DIGESTS | LC_ALL=C sort | paste -sd' ')" = "$(printf '%s\n' $PRE_VOCABULARY_EXPECTED | LC_ALL=C sort | paste -sd' ')" ] \
+    && ! printf '%s\n' $PG_REVIEW_PRE_VOCABULARY_CONTRACT_DIGESTS | grep -qxF "$(pg_review_decision_contract_digest)" \
+    && ! printf '%s\n' $PG_REVIEW_PRE_VOCABULARY_CONTRACT_DIGESTS | grep -qxF "$VOCABULARY_CONTRACT_DIGEST"; echo $?)"
 review 'Checked src/review-engine.ts for failure handling.'
 pg_review_shape_for_marker "$PRE_MARKER" "$OUT" 2>/dev/null; rc=$?
 check 'gate r1 P1: a pre-vocabulary grounded completion is accepted without tokens or manifest' "$([ "$rc" = 0 ] && [ "$PG_NAMES_NOTHING" = false ]; echo $?)"
@@ -91,6 +98,11 @@ check 'gate r1 P1: a pre-vocabulary verdict-line-only citation is still refused'
 review 'Checked src/review-engine.ts for failure handling.'
 pg_review_shape_for_marker "$POST_MARKER" "$OUT" 2>/dev/null; rc=$?
 check 'gate r1 P1: a current-contract completion without retained vocabulary stays refused' "$([ "$rc" = 6 ]; echo $?)"
+pg_review_shape_for_marker "$VOCAB_MARKER" "$OUT" 2>/dev/null; rc=$?
+check 'gate r1 P1: a released 0.62.0 completion without retained vocabulary stays refused' "$([ "$rc" = 6 ]; echo $?)"
+pg_review_tokens_write "$VOCAB_MARKER" "$DIFF_FILE"
+pg_review_shape_for_marker "$VOCAB_MARKER" "$OUT" 2>/dev/null; rc=$?
+check 'gate r1 P1: a released 0.62.0 binding remains readable with matching retained vocabulary' "$([ "$rc" = 0 ]; echo $?)"
 pg_review_shape_for_marker "$UNBOUND_MARKER" "$OUT" 2>/dev/null; rc=$?
 check 'gate r1 P1: a completion with no input binding stays refused' "$([ "$rc" = 6 ]; echo $?)"
 review 'Checked src/not-reviewed.ts for failure handling.'
