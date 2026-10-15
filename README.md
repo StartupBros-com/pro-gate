@@ -561,6 +561,25 @@ line does. A completion whose input binding predates retained vocabulary (contra
 before v0.62.0) is judged on its own shape: grounded historical reviews stay accepted,
 skeletons stay refused.
 
+Since v0.64.0 a harvest that refuses a completed, current response also stops typed instead of
+recovering it forever. The refusal itself is unchanged: a skeleton without a grounded diff
+reference still exits 6, a review without the run-marker echo still exits 9, and the charge,
+reservation and input binding are kept. What changes is evidence. When the CDP helper proved the
+bytes it printed are the finished last assistant response after this attempt's marked prompt (no
+generation running, finished-turn actions present, identical text on a re-read about 2.5 s
+later, and the same conversation URL as the attempt's memo), the harvest also writes one
+write-once record (mode 0600) at `$PRO_GATE_HOME/rejected-captures/<marker>`. It binds the exact
+bytes and their SHA-256 to the marker, charged epoch, input binding and conversation URL. The next
+`--review-decision` then returns `stop-without-new-review` with reason `rejected-capture`
+(`report-only`, exit 0). Its `.facts.completed_results` row has `shape:"rejected-capture"`,
+`applicable:false` and the capture digest. The stop applies only while no other attempt is active
+or holds the reservation. A newer applicable completion supersedes it, and other live work still
+routes to recovery. The stop never resumes the attempt: a later vocabulary or classifier repair
+leaves it stopped, an explicit `--harvest` may reinspect the conversation, and a collected,
+accepted result then drives the decision. Anything short of that proof keeps today's recovery
+path: a generating, unfinished, foreign or stale response, a changed re-read, or a missing or
+invalid record.
+
 ### Exit codes
 
 | Code | Meaning                                                                                                                                                                                                                              | Slot spent? |

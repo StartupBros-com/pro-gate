@@ -167,7 +167,7 @@ done
 # gate #148 r1 P2: an unattended recovery passes --timeout only when PRO_REVIEW_ENGINE_TIMEOUT is
 # configured. The engine treats any --timeout it receives as final, so the fixed 60m the daemon used
 # to send bypassed the 45m collection default and PRO_GATE_HARVEST_TIMEOUT on every recovery.
-RECOVER_INDEX="$(jq -r '.cases | to_entries[] | select(.value.expected.action == "recover-existing-review") | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
+RECOVER_INDEX="$(jq -r 'first(.cases | to_entries[] | select(.value.expected.action == "recover-existing-review")) | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
 RECOVER_DECISION="$TYPED_HOME/recover-timeout.json"; typed_decision "$RECOVER_INDEX" "$RECOVER_DECISION"
 : > "$TYPED_ENGINE_CALLS"
 ( unset PRO_REVIEW_ENGINE_TIMEOUT; export PRO_GATE_HARVEST_TIMEOUT=5m
@@ -229,7 +229,7 @@ for PROCESS_AGENT_RC in 1 2; do
 done
 PROCESS_AGENT_RC=0
 for action in collect-existing-result recover-existing-review ask-named-product-choice; do
-  index="$(jq -r --arg action "$action" '.cases | to_entries[] | select(.value.expected.action == $action) | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
+  index="$(jq -r --arg action "$action" 'first(.cases | to_entries[] | select(.value.expected.action == $action)) | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
   decision="$TYPED_HOME/process-$action.json"; typed_decision "$index" "$decision"
   : > "$TYPED_STATE"; : > "$TYPED_FAILS"
   MOCK_FRESH="$decision" MOCK_RECOVERED="$TYPED_HOME/process-recovered" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?

@@ -132,6 +132,15 @@ retry. The typed query exits 0 with a complete decision envelope; legacy collect
 uses exit 6. Trailing hunk-context identifiers count as reviewed vocabulary; nothing on the
 VERDICT line does.
 
+`stop-without-new-review` / `rejected-capture` is a `report-only` stop for a completed, current
+response that harvest refused (no grounded diff reference, or no run-marker echo). The runtime
+proved those bytes are the finished last answer to this attempt's prompt in its bound conversation,
+and kept them in a write-once record. The `.facts.completed_results` row has
+`shape:"rejected-capture"`, `applicable:false` and the capture digest. The stop applies only while
+no other attempt is active or reserved, and a newer applicable completion supersedes it. Relay
+the reason and preserve branch work without inferring a retry or a harvest. An explicit `--harvest`
+may reinspect the conversation; a collected, accepted result then drives the next decision.
+
 Contract/corpus identity must match the promoted adapter. Any validation failure stops through the
 update path above. A saved decision is advisory, not authority.
 
