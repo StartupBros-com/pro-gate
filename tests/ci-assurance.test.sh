@@ -116,12 +116,13 @@ done
 echo 'ok - actual CI validator accepts empty/valid files and rejects malformed JSON/YAML with spaces'
 
 # Copy only the adapter test's dependencies; never mutate the working tree's identity.
-mkdir -p "$TDIR/repo/tests" "$TDIR/repo/daemon" "$TDIR/repo/bin"
+mkdir -p "$TDIR/repo/tests" "$TDIR/repo/daemon" "$TDIR/repo/bin" "$TDIR/repo/scripts"
 cp -R "$ROOT/lib" "$ROOT/skills" "$ROOT/agents" "$ROOT/.claude-plugin" "$TDIR/repo/"
 cp -R "$ROOT/tests/fixtures" "$TDIR/repo/tests/"
 cp "$ROOT/tests/review-decision-adapters.test.sh" "$TDIR/repo/tests/"
 cp "$ROOT/daemon/daemon.sh" "$TDIR/repo/daemon/"
 cp "$ROOT/bin/oracle-review.sh" "$TDIR/repo/bin/"
+cp "$ROOT/scripts/regenerate-review-decision.mjs" "$TDIR/repo/scripts/"
 cd "$TDIR/repo"
 $test_command > "$TDIR/adapters-valid.log" 2>&1 || { cat "$TDIR/adapters-valid.log"; fail 'unmodified adapter fixture'; }
 identity=skills/pro-gate/review-decision-v1.json
