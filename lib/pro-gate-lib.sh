@@ -3516,10 +3516,10 @@ pg_review_tokens() { # file [rationale]: canonical tokens; rationale emits shape
         t=words[i]
         sub(/^[.\/]+/, "", t); sub(/[.:\/]+$/, "", t)
         if (t !~ /[A-Za-z]/) continue
-        shaped=(t == "VERSION" || t ~ /[\/_]/ || t ~ /\.[A-Za-z][A-Za-z0-9]*(:[0-9]+)?$/ || t ~ /:[0-9]+$/ ||
+        shaped=(t == "VERSION" || t ~ /[\/_]/ || t ~ /\.[A-Za-z][A-Za-z0-9]*(:[0-9]+(-[0-9]+)?)?$/ || t ~ /:[0-9]+(-[0-9]+)?$/ ||
           (t ~ /[a-z]/ && substr(t,2) ~ /[A-Z]/))
         if (rationale && !shaped) continue
-        sub(/:[0-9]+$/, "", t)
+        sub(/:[0-9]+(-[0-9]+)?$/, "", t)
         print t
         if (!rationale) {
           # A cited path may omit diff prefixes or directories; retain component boundaries,
