@@ -3412,8 +3412,9 @@ pg_review_tokens() { # file [rationale]: canonical tokens; rationale emits shape
       if (rationale) {
         sub(/^[[:space:]]*[-*#>_]*[[:space:]]*/, "", line)
         if (line ~ /^[Pp][0-3][*_ ]*:/) next
-        # Keep the reason after the verdict word, but never the label, verdict or run nonce.
-        sub(/^[Vv][Ee][Rr][Dd][Ii][Cc][Tt][*_ ]*:[[:space:]]*[A-Za-z-]+/, "", line)
+        # The whole verdict line is excluded (gate r1 P2): a diff path appended to "VERDICT: SHIP"
+        # is still the skeleton, so the rationale has to stand in its own paragraph.
+        if (line ~ /^[Vv][Ee][Rr][Dd][Ii][Cc][Tt][*_ ]*:/) next
         sub(/\([Rr]un marker:.*$/, "", line)
         if (line ~ /^[Rr]un marker:/) next
       } else {
@@ -3469,8 +3470,26 @@ pg_review_shape() { # body tokens-file -> PG_BODY_BYTES, PG_NAMES_NOTHING; rc 0 
   return 1
 }
 
+# Contract digests written into input bindings by engines that predate retained review vocabulary
+# (every release before 0.62.0). Their completions were accepted without it, and reservation
+# removal already deleted their path manifests, so nothing on disk can say which diff they
+# reviewed (gate r1 P1: 1616 of 1616 production input bindings). Frozen on purpose: a later
+# contract bump never joins it, because every engine since 0.62.0 retains the vocabulary at
+# submission or refuses to submit.
+PG_REVIEW_PRE_VOCABULARY_CONTRACT_DIGESTS='bf36fdb5f8625e917be0539ca014fec518649d1160584846aca1cb9149533abb 7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee 5fcd19c12600061af6d90ed9cb980dd7067cff199c374910639003eec4caf5c3 6da6866bab4e95ad138cdc946fa1388be9c386bca7b592c3370c9f52e34b315f fa91787e3fbf3c0852c78f5269b2f670d84b86561be64d6edef4229bf46aee9b'
+pg_review_input_binding_predates_vocabulary() { # marker -> rc 0 iff a validated pre-0.62.0 input binding exists
+  local digest
+  digest="$(pg_review_input_binding_read "$1" 2>/dev/null | jq -r '.contract_digest // empty' 2>/dev/null)"
+  [ -n "$digest" ] || return 1
+  case " $PG_REVIEW_PRE_VOCABULARY_CONTRACT_DIGESTS " in *" $digest "*) return 0;; esac
+  return 1
+}
+
 # Read-only acceptance for saved evidence. No vocabulary means no proof of a grounded review;
 # a legacy path manifest is sufficient without creating or repairing any persistent records.
+# A completion whose input binding predates retained vocabulary is judged on its own shape: the
+# review must still name some path or identifier (both #262 skeletons name none), but nothing
+# can be compared against the diff it reviewed. Every later binding keeps the full requirement.
 pg_review_shape_for_marker() { # marker body [private tokens-file] -> rc 0 or typed exit 6
   local marker="$1" body="$2" tokens="${3:-$(pg_review_tokens_dir)/$1}" manifest
   pg_reservation_marker_ok "$marker" || return 6
@@ -3479,6 +3498,8 @@ pg_review_shape_for_marker() { # marker body [private tokens-file] -> rc 0 or ty
     pg_review_shape "$body" "$tokens" && return 0
   elif [ -f "$manifest" ] && [ ! -L "$manifest" ] && [ -r "$manifest" ]; then
     pg_review_shape "$body" <(pg_review_tokens "$manifest") && return 0
+  elif pg_review_input_binding_predates_vocabulary "$marker"; then
+    pg_review_shape "$body" <(pg_review_tokens "$body" rationale) && return 0
   else
     pg_review_shape "$body" /dev/null || true
   fi

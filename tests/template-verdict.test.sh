@@ -56,10 +56,49 @@ done
 printf 'P0: none classifyReview\nP1: none\nP2: none\nP3: none\nVERDICT: SHIP — ordinary explanation.\n' > "$OUT"
 pg_review_shape "$OUT" "$TOKENS"; rc=$?
 check 'severity-label names and plain-English verdict reasons do not establish rationale' "$([ "$rc" = 1 ] && [ "$PG_NAMES_NOTHING" = true ]; echo $?)"
-printf 'P0: none\nP1: none\nP2: none\nP3: none\nVERDICT: SHIP — Checked src/review-engine.ts for failure handling.\n' > "$OUT"
+# Gate r1 P2: the verdict line is excluded whole, so a diff path appended to it is still the
+# skeleton; the same path in its own paragraph beside a reasoned verdict line passes.
+for verdict_line in 'VERDICT: SHIP — Checked src/review-engine.ts for failure handling.' 'VERDICT: SHIP — reviewed src/review-engine.ts' '**VERDICT:** SHIP (src/review-engine.ts:22, classifyReview)'; do
+  printf 'P0: none\nP1: none\nP2: none\nP3: none\n%s\n' "$verdict_line" > "$OUT"
+  pg_review_shape "$OUT" "$TOKENS"; rc=$?
+  check "gate r1 P2: a diff reference only on the verdict line does not establish rationale: $verdict_line" "$([ "$rc" = 1 ] && [ "$PG_NAMES_NOTHING" = true ]; echo $?)"
+done
+printf 'P0: none\nP1: none\nP2: none\nP3: none\n\nChecked classifyReview for failure handling.\n\nVERDICT: SHIP — reviewed src/review-engine.ts\n' > "$OUT"
 pg_review_shape "$OUT" "$TOKENS"; rc=$?
-check 'P1-a: a diff path in the verdict reason establishes rationale' "$([ "$rc" = 0 ]; echo $?)"
+check 'gate r1 P2: a separate grounded paragraph still passes beside a reasoned verdict line' "$([ "$rc" = 0 ] && [ "$PG_NAMES_NOTHING" = false ]; echo $?)"
 check 'P1-a: prompt requires a separate grounded clean-review paragraph' "$(grep -qF 'If there are no findings, include a short rationale paragraph' "$ROOT/bin/oracle-review.sh" && ! grep -qF 'output ONLY findings, nothing else' "$ROOT/bin/oracle-review.sh"; echo $?)"
+
+# Gate r1 P1: a completion bound before retained vocabulary (every pre-0.62.0 input binding) has
+# neither tokens nor a manifest left on disk. It is judged on its own shape; a binding written
+# by this engine, or no binding at all, keeps the full requirement.
+shape_binding() { # marker contract-digest
+  jq -cnS --arg cd "$2" --arg marker "$1" '{charged_spend_epoch:1700000000,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:"full-pr:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",mode:"full-pr",proof:{base_oid:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",endpoint_digest:"2222222222222222222222222222222222222222222222222222222222222222",head_oid:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",raw_patch_digest:"1111111111111111111111111111111111111111111111111111111111111111"}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:"github.com",owner:"acme",repo:"review"},target:{head_oid:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",kind:"pull-request",pr:262}}'
+}
+PRE_MARKER=pg-run-acme-review-262-1700000000-11 POST_MARKER=pg-run-acme-review-262-1700000000-12 UNBOUND_MARKER=pg-run-acme-review-262-1700000000-13
+pg_review_input_binding_write "$PRE_MARKER" "$(shape_binding "$PRE_MARKER" fa91787e3fbf3c0852c78f5269b2f670d84b86561be64d6edef4229bf46aee9b)"
+pg_review_input_binding_write "$POST_MARKER" "$(shape_binding "$POST_MARKER" "$(pg_review_decision_contract_digest)")"
+check 'gate r1 P1: the pre-vocabulary digest list is frozen to predecessors of the current contract' "$([ "$(printf '%s\n' $PG_REVIEW_PRE_VOCABULARY_CONTRACT_DIGESTS | LC_ALL=C sort | paste -sd' ')" = "$(pg_review_decision_compatible_contract_digests_json | jq -r 'join(" ")')" ] && ! printf '%s\n' $PG_REVIEW_PRE_VOCABULARY_CONTRACT_DIGESTS | grep -qxF "$(pg_review_decision_contract_digest)"; echo $?)"
+review 'Checked src/review-engine.ts for failure handling.'
+pg_review_shape_for_marker "$PRE_MARKER" "$OUT" 2>/dev/null; rc=$?
+check 'gate r1 P1: a pre-vocabulary grounded completion is accepted without tokens or manifest' "$([ "$rc" = 0 ] && [ "$PG_NAMES_NOTHING" = false ]; echo $?)"
+for size in 54 159; do
+  pg_review_shape_for_marker "$PRE_MARKER" "$TDIR/$size.md" 2>/dev/null; rc=$?
+  check "gate r1 P1: a pre-vocabulary $size-byte skeleton is still refused" "$([ "$rc" = 6 ] && [ "$PG_NAMES_NOTHING" = true ]; echo $?)"
+done
+printf 'P0: none\nP1: none\nP2: none\nP3: none\nVERDICT: SHIP — reviewed src/review-engine.ts\n' > "$OUT"
+pg_review_shape_for_marker "$PRE_MARKER" "$OUT" 2>/dev/null; rc=$?
+check 'gate r1 P1: a pre-vocabulary verdict-line-only citation is still refused' "$([ "$rc" = 6 ]; echo $?)"
+review 'Checked src/review-engine.ts for failure handling.'
+pg_review_shape_for_marker "$POST_MARKER" "$OUT" 2>/dev/null; rc=$?
+check 'gate r1 P1: a current-contract completion without retained vocabulary stays refused' "$([ "$rc" = 6 ]; echo $?)"
+pg_review_shape_for_marker "$UNBOUND_MARKER" "$OUT" 2>/dev/null; rc=$?
+check 'gate r1 P1: a completion with no input binding stays refused' "$([ "$rc" = 6 ]; echo $?)"
+review 'Checked src/not-reviewed.ts for failure handling.'
+pg_review_shape_for_marker "$PRE_MARKER" "$OUT" 2>/dev/null; rc=$?
+check 'gate r1 P1: without vocabulary a pre-vocabulary citation cannot be checked against the diff' "$([ "$rc" = 0 ]; echo $?)"
+pg_review_tokens_write "$PRE_MARKER" "$DIFF_FILE"
+pg_review_shape_for_marker "$PRE_MARKER" "$OUT" 2>/dev/null; rc=$?
+check 'gate r1 P1: retained vocabulary outranks the pre-vocabulary fallback' "$([ "$rc" = 6 ] && [ "$PG_NAMES_NOTHING" = true ]; echo $?)"
 cat > "$TDIR/deleted.diff" <<'DIFF'
 diff --git a/src/deleted.ts b/src/deleted.ts
 index abc1234..def5678 100644

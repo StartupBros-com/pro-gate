@@ -122,13 +122,15 @@ jq -e --arg id "$CONTRACT_ID" --argjson version "$CONTRACT_VERSION" \
 ```
 
 `stop-without-new-review` / `template-verdict` is a `report-only` stop for saved bytes that
-lack a grounded reference to the reviewed diff, including missing retained vocabulary.
+lack a grounded reference to the reviewed diff, including a current-contract result with
+missing retained vocabulary; a pre-v0.62.0 completion is judged on its own shape instead.
 The rejected candidate in `.facts.completed_results` names its marker and artifact digest,
 with `shape:"template-verdict"` and `applicable:false`. Newest charged epoch, then canonical
 identity, selects the candidate: a newer grounded review supersedes an older skeleton; a
 newest skeleton stops closed. Relay the reason and preserve branch work without inferring a
 retry. The typed query exits 0 with a complete decision envelope; legacy collection still
-uses exit 6. Trailing hunk-context identifiers count as reviewed vocabulary.
+uses exit 6. Trailing hunk-context identifiers count as reviewed vocabulary; nothing on the
+VERDICT line does.
 
 Contract/corpus identity must match the promoted adapter. Any validation failure stops through the
 update path above. A saved decision is advisory, not authority.

@@ -103,16 +103,22 @@ done
 # The same digest-bound saved artifact exercises every public reader and binding repair.
 # No state writes, scoring, browser calls or network requests are allowed while reading it.
 cp "$PRO_GATE_HOME/completed/$MARKER" "$TDIR/real-review"
-for shape in skeleton real no-vocabulary manifest; do
+# legacy*: the input binding carries a pre-0.62.0 contract digest and nothing retains its diff
+# (gate r1 P1); a grounded review keeps its acceptance, a skeleton is still refused.
+LEGACY_INPUT="$(jq -cS '.contract_digest="fa91787e3fbf3c0852c78f5269b2f670d84b86561be64d6edef4229bf46aee9b"' <<<"$INPUT")"
+for shape in skeleton real no-vocabulary manifest legacy legacy-skeleton; do
+  CASE_INPUT="$INPUT"; case "$shape" in legacy*) CASE_INPUT="$LEGACY_INPUT";; esac
+  rm -f "$(pg_review_input_binding_dir)/$MARKER"
+  pg_review_input_binding_write "$MARKER" "$CASE_INPUT"
   cp "$TDIR/real-review" "$PRO_GATE_HOME/completed/$MARKER"
-  if [ "$shape" = skeleton ]; then cp "$ROOT/tests/fixtures/template-verdict/pushbot-4451.txt" "$PRO_GATE_HOME/completed/$MARKER"; fi
+  case "$shape" in *skeleton) cp "$ROOT/tests/fixtures/template-verdict/pushbot-4451.txt" "$PRO_GATE_HOME/completed/$MARKER";; esac
   mkdir -p "$(pg_manifest_dir)"
   pg_review_tokens_write "$MARKER" "$TDIR/endpoint.patch"
-  if [ "$shape" = no-vocabulary ] || [ "$shape" = manifest ]; then rm "$(pg_review_tokens_dir)/$MARKER"; fi
+  case "$shape" in no-vocabulary|manifest|legacy*) rm "$(pg_review_tokens_dir)/$MARKER";; esac
   if [ "$shape" = manifest ]; then pg_diff_paths "$TDIR/endpoint.patch" > "$(pg_manifest_dir)/$MARKER"; fi
-  SAVED_RESULT="$(jq -cS --arg digest "$(pg_sha256 "$PRO_GATE_HOME/completed/$MARKER")" '.artifact.digest=$digest' <<<"$RESULT")"
+  SAVED_RESULT="$(jq -cS --arg digest "$(pg_sha256 "$PRO_GATE_HOME/completed/$MARKER")" --arg ib "$(pg_review_sha256_text "$CASE_INPUT")" '.artifact.digest=$digest | .input_binding_digest=$ib' <<<"$RESULT")"
   printf '%s' "$SAVED_RESULT" > "$(pg_review_result_binding_dir)/$MARKER"
-  expected=0; case "$shape" in skeleton|no-vocabulary) expected=6;; esac
+  expected=0; case "$shape" in skeleton|no-vocabulary|legacy-skeleton) expected=6;; esac
   rc=0; pg_review_accepted_artifact_read "$MARKER" > "$TDIR/accepted.json" 2> "$TDIR/accepted.err" || rc=$?
   precheck "P1-b: accepted-artifact reader $shape exits $expected" "$([ "$rc" = "$expected" ]; echo $?)"
   query
@@ -132,10 +138,12 @@ for shape in skeleton real no-vocabulary manifest; do
   fi
   # A rejection must occur before the repair lock and before it can write a new binding.
   rm "$(pg_review_result_binding_dir)/$MARKER"
-  rc=0; pg_review_decision_repair_result_binding "$MARKER" "$INPUT" > "$TDIR/repair.out" 2> "$TDIR/repair.err" || rc=$?
+  rc=0; pg_review_decision_repair_result_binding "$MARKER" "$CASE_INPUT" > "$TDIR/repair.out" 2> "$TDIR/repair.err" || rc=$?
   precheck "P1-b: binding repair $shape exits $expected" "$([ "$rc" = "$expected" ] && { [ "$expected" = 0 ] || [ ! -e "$(pg_review_result_binding_dir)/$MARKER" ]; }; echo $?)"
   rm -f "$(pg_review_result_binding_dir)/$MARKER" "$(pg_manifest_dir)/$MARKER"
 done
+rm -f "$(pg_review_input_binding_dir)/$MARKER"
+pg_review_input_binding_write "$MARKER" "$INPUT"
 # Both marker enumeration orders must defer to charged epoch. The rejected artifact has no
 # result binding, as with a real skeleton capture; the grounded completion is digest-bound.
 for order in skeleton-first grounded-first; do

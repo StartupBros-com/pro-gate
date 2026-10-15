@@ -548,7 +548,10 @@ names its marker and artifact digest, with `shape:"template-verdict"` and `appli
 Selection still uses newest charged epoch, then canonical identity: a newer grounded review
 supersedes an older skeleton, while a newest skeleton stops. Preserve branch work and relay
 the reason without inferring a retry. Identifiers in trailing unified-diff hunk context count
-as reviewed vocabulary; a header without context contributes none.
+as reviewed vocabulary; a header without context contributes none, and nothing on the VERDICT
+line does. A completion whose input binding predates retained vocabulary (contract digests
+before v0.62.0) is judged on its own shape: grounded historical reviews stay accepted,
+skeletons stay refused.
 
 ### Exit codes
 
