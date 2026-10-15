@@ -806,12 +806,18 @@ that only exists once the release does:
 2. Merge the repin PR against `StartupBros-com/hov-marketplace`. Its hourly **Repin
    reconcile** workflow opens that PR once the draft's assets are complete; dispatch the
    workflow with `only_plugin=pro-gate` instead of waiting for the tick, and merge once both
-   required checks pass. The card is updated by a reviewed PR and never by a push from CI —
-   a standing credential able to write the distribution manifest is the one whose
-   compromise reaches every installed client.
+   required checks pass. A bot repin that changes only pin fields (source sha, version,
+   releaseId, releaseTag) takes no review round: hov-marketplace's required **Pinned
+   sources** check already proves, before the merge, that the tag resolves to the pinned
+   commit, so a reviewer would only re-read the pin. A card PR that also changes copy gets a
+   normal review. The card is updated by a merged PR and never by a push from CI — a
+   standing credential able to write the distribution manifest is the one whose compromise
+   reaches every installed client.
 3. Run the **Publish staged release** workflow (or `gh release edit vX.Y.Z --draft=false`).
-   It re-reads the live card and refuses unless the card names exactly this release, so a
-   mistimed run cannot publish something undistributed.
+   The workflow re-reads the live card and refuses unless the card names exactly this
+   release, so a mistimed run cannot publish something undistributed; this runs after the
+   repin merged, so it keeps the release a draft but cannot undo a wrong pin. The
+   `gh release edit` path skips that card check.
 4. Publishing fires the release train once: it verifies distribution and announces. The
    train only ever _reads_ the marketplace — it holds no deploy credential.
 
