@@ -3514,6 +3514,17 @@ pg_review_tokens() { # file [rationale]: canonical tokens; rationale emits shape
       n=split(line, words, /[[:space:]]+/)
       for (i=1; i<=n; i++) {
         t=words[i]
+        if (rationale) {
+          # Retained diff suffixes keep hidden-path dots. Emit that spelling too,
+          # without replacing the established stripped candidate or diff vocabulary.
+          literal=t
+          while (sub(/^\.\//, "", literal)) {}
+          sub(/[.:\/]+$/, "", literal)
+          if (literal ~ /^\.[A-Za-z0-9_-]/ && literal ~ /[A-Za-z]/) {
+            sub(/:[0-9]+(-[0-9]+)?$/, "", literal)
+            print literal
+          }
+        }
         sub(/^[.\/]+/, "", t); sub(/[.:\/]+$/, "", t)
         if (t !~ /[A-Za-z]/) continue
         shaped=(t == "VERSION" || t ~ /[\/_]/ || t ~ /\.[A-Za-z][A-Za-z0-9]*(:[0-9]+(-[0-9]+)?)?$/ || t ~ /:[0-9]+(-[0-9]+)?$/ ||

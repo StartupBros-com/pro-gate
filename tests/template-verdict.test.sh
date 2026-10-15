@@ -41,6 +41,68 @@ pg_review_shape "$TDIR/inline.md" "$TOKENS"; rc=$?
 check 'one-line skeleton is rejected' "$([ "$rc" = 1 ] && [ "$PG_NAMES_NOTHING" = true ]; echo $?)"
 
 review() { printf 'P0: none\nP1: none\nP2: none\nP3: none\n\n%s\n\nVERDICT: SHIP\n' "$1" > "$OUT"; }
+# Hidden-path regression: exercise generated vocabulary and independently frozen retained
+# vocabulary from 0.62.0/0.63.1 (path-only input emits the same tokens in both).
+cat > "$TDIR/hidden.diff" <<'DIFF'
+diff --git a/.claude-plugin/marketplace.json b/.claude-plugin/marketplace.json
+--- a/.claude-plugin/marketplace.json
++++ b/.claude-plugin/marketplace.json
+diff --git a/.gitignore b/.gitignore
+--- a/.gitignore
++++ b/.gitignore
+diff --git a/src/.config/settings.json b/src/.config/settings.json
+--- a/src/.config/settings.json
++++ b/src/.config/settings.json
+DIFF
+cat > "$TDIR/hidden-legacy.tokens" <<'TOKENS'
+.claude-plugin/marketplace.json
+.config/settings.json
+.gitignore
+a/.claude-plugin/marketplace.json
+a/.gitignore
+a/src/.config/settings.json
+b/.claude-plugin/marketplace.json
+b/.gitignore
+b/src/.config/settings.json
+claude-plugin
+gitignore
+json
+marketplace
+marketplace.json
+settings
+settings.json
+src
+src/.config/settings.json
+config
+a
+b
+TOKENS
+pg_review_tokens "$TDIR/hidden.diff" > "$TDIR/hidden.tokens"
+check 'hidden paths preserve the complete released diff vocabulary' "$(LC_ALL=C sort -u "$TDIR/hidden-legacy.tokens" > "$TDIR/hidden-expected.tokens" && cmp -s "$TDIR/hidden-expected.tokens" "$TDIR/hidden.tokens"; echo $?)"
+# The stripped spelling was already accepted for unprefixed path input. Keep that
+# retained spelling available too; do not replace normalization with literal-only output.
+printf '%s\n' 'claude-plugin/marketplace.json' > "$TDIR/hidden-normalized.tokens"
+for vocabulary in hidden hidden-legacy; do
+  for citation in '.claude-plugin/marketplace.json' '.claude-plugin/marketplace.json:5' '.claude-plugin/marketplace.json:5-19' './.claude-plugin/marketplace.json:5-19' '.gitignore' '.gitignore:5' '.gitignore:5-19' './.gitignore' './.gitignore:5-19' 'src/.config/settings.json' 'src/.config/settings.json:5-19' '.config/settings.json:5-19' './src/.config/settings.json:5-19'; do
+    review "Checked \`$citation\` for consistency."
+    pg_review_shape "$OUT" "$TDIR/$vocabulary.tokens"; rc=$?
+    if [ "$rc" = 0 ] && [ "$PG_NAMES_NOTHING" = false ]; then check "$vocabulary accepts hidden citation $citation" 0; else check "$vocabulary accepts hidden citation $citation" 1; fi
+  done
+  for citation in '.unknown/marketplace.json:5-19' '.claude-plugin/unknown.json' 'src/.unknown/settings.json' '.gitignoreExtra:5-19' '.claude-plugin/marketplace:5-19' '.claude-plugin/marketplace.jsonExtra' '.claude-plugin/marketplace.json:5-19-extra' '.gitignore:5-' '.gitignore:5-x' 'claudePluginExtra'; do
+    review "Checked \`$citation\` for consistency."
+    pg_review_shape "$OUT" "$TDIR/$vocabulary.tokens"; rc=$?
+    if [ "$rc" = 1 ] && [ "$PG_NAMES_NOTHING" = true ]; then check "$vocabulary rejects unknown/partial/malformed citation $citation" 0; else check "$vocabulary rejects unknown/partial/malformed citation $citation" 1; fi
+  done
+  printf 'P0: none .gitignore\nP1: none\nP2: none\nP3: none\nVERDICT: SHIP — reviewed .claude-plugin/marketplace.json:5-19\n' > "$OUT"
+  pg_review_shape "$OUT" "$TDIR/$vocabulary.tokens"; rc=$?
+  if [ "$rc" = 1 ] && [ "$PG_NAMES_NOTHING" = true ]; then check "$vocabulary excludes hidden citations confined to verdict/severity lines" 0; else check "$vocabulary excludes hidden citations confined to verdict/severity lines" 1; fi
+done
+for citation in 'claude-plugin/marketplace.json' '.claude-plugin/marketplace.json' './.claude-plugin/marketplace.json:5-19'; do
+  review "Checked \`$citation\` for consistency."
+  pg_review_shape "$OUT" "$TDIR/hidden-normalized.tokens"; rc=$?
+  if [ "$rc" = 0 ] && [ "$PG_NAMES_NOTHING" = false ]; then check "previously stripped vocabulary accepts $citation" 0; else check "previously stripped vocabulary accepts $citation" 1; fi
+done
+
 pg_review_shape "$ROOT/tests/fixtures/template-verdict/compliant-clean.txt" "$TOKENS"
 check 'P1-a: compliant clean review with a separate rationale is accepted' "$?"
 for rationale in 'Checked src/review-engine.ts:22 for failure handling.' 'Checked classifyReview for failure handling.' 'Checked policy_name for failure handling.' 'Checked review-engine.ts for failure handling.' 'Checked review-engine.ts:22-40 for failure handling.' 'Checked src/review-engine.ts:22-40 for failure handling.' 'Checked classifyReview:22-40 for failure handling.'; do
