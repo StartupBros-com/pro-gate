@@ -1875,6 +1875,7 @@ pg_scratch_cleanup() {
     "$WORK"/*)
       find "$WORK" -mindepth 1 -maxdepth 1 \
         ! -name "$(basename "$OUT")" ! -name "$(basename "$OUT").status" \
+        ! -name "$(basename "$OUT").rejected.*" \
         -exec rm -rf {} + 2>/dev/null || true ;;
     *) rm -rf "$WORK" 2>/dev/null || true ;;
   esac
@@ -2564,6 +2565,22 @@ pg_salvage_fail_reason() { # fail detail
   esac
 }
 
+pg_preserve_rejected_capture() { # diagnostic bytes, never a completed review
+  local src="$1" kept
+  [ -s "$src" ] || return 0
+  if [ -n "${PG_REJECTED_CAPTURE:-}" ] && cmp -s "$src" "$PG_REJECTED_CAPTURE"; then return 0; fi
+  kept="$(mktemp "$OUT.rejected.XXXXXX")"
+  if [ -n "$kept" ] && cp "$src" "$kept" && cmp -s "$src" "$kept"; then
+    PG_REJECTED_CAPTURE="$kept"
+    echo "[oracle-review] rejected capture retained at $kept (not an accepted review)." >&2
+    return 0
+  fi
+  PG_PRESERVE_STATE=1; PG_KEEP_FINAL=1
+  echo "ERROR: rejected capture could not be preserved beside $OUT; private evidence kept at $src." >&2
+  pg_status failed "rejected capture preservation failed; state kept"
+  pg_finish 3
+}
+
 pg_check_review_shape() { # private capture, before any publication or completion bookkeeping
   local body="$1" tokens="${PG_REVIEW_TOKENS_FILE:-$(pg_review_tokens_dir)/${RUN_MARKER:-}}" fallback
   if [ ! -r "$tokens" ] && [ -r "${DIFF_FILE:-}" ]; then
@@ -2583,6 +2600,7 @@ pg_check_review_shape() { # private capture, before any publication or completio
   TEMPLATE_VERDICT=0
   if pg_review_shape_for_marker "$RUN_MARKER" "$body" "$tokens"; then return 0; fi
   TEMPLATE_VERDICT=1
+  pg_preserve_rejected_capture "$body"
   pg_salvage_class_write "${RUN_MARKER:-}" template-verdict 2>/dev/null || true
   echo "[oracle-review] template-verdict: review names no path or identifier from the reviewed diff (${PG_BODY_BYTES} bytes)." >&2
   return 1
