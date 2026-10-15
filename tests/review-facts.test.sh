@@ -48,7 +48,8 @@ METADATA_DIGEST="$(pg_pr_evidence_metadata_digest "$(jq -cnS --argjson metadata 
 jq -cnS --argjson metadata "$METADATA" --arg digest "$RAW" '{record_type:"review-pr-evidence/v1",record_version:1,patch_format:"github-compare-diff",metadata:$metadata,endpoint_digest:$digest}' > "$TDIR/pr-evidence.json"
 MARKER=pg-run-acme-widgets-1983-1700000700-1
 INPUT="$(jq -cnS --arg cd "$(pg_review_decision_contract_digest)" --arg marker "$MARKER" --arg base "$BASE" --arg head "$HEAD" --arg raw "$RAW" --arg md "$METADATA_DIGEST" '{charged_spend_epoch:1700000700,contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,evidence:{identity:("full-pr:"+$base+":"+$head),mode:"full-pr",proof:{base_oid:$base,head_oid:$head,endpoint_digest:$raw,raw_patch_digest:$raw,pr_metadata_digest:$md}},marker:$marker,record_type:"review-input-binding/v1",record_version:1,repository:{host:"github.com",owner:"acme",repo:"widgets"},target:{head_oid:$head,kind:"pull-request",pr:1983}}')"
-printf 'P0: none\nP1: none\nP2: none\nAll reviewed changes are consistent.\nVERDICT: SHIP\n' > "$PRO_GATE_HOME/completed/$MARKER"
+printf 'P0: none\nP1: none\nP2: none\nChecked file.txt for regressions.\nVERDICT: SHIP\n' > "$PRO_GATE_HOME/completed/$MARKER"
+pg_review_tokens_write "$MARKER" "$TDIR/endpoint.patch"
 DIGEST="$(pg_sha256 "$PRO_GATE_HOME/completed/$MARKER")"
 RESULT="$(jq -cnS --arg cd "$(pg_review_decision_contract_digest)" --arg marker "$MARKER" --arg ib "$(pg_review_sha256_text "$INPUT")" --arg digest "$DIGEST" --arg base "$BASE" --arg head "$HEAD" --arg raw "$RAW" '{accepted_epoch:1700000800,artifact:{digest:$digest,path:("completed/"+$marker)},contract_digest:$cd,contract_id:"review-decision/v1",contract_version:1,input_binding_digest:$ib,input_binding_identity:$marker,marker:$marker,named_choice:null,provenance:{outcome:"accepted",validated_epoch:1700000800},record_type:"review-result-binding/v1",record_version:1,ship_proof:{base_oid:$base,head_oid:$head,diff_digest:$raw},verdict:"SHIP"}')"
 pg_review_input_binding_write "$MARKER" "$INPUT"
@@ -71,6 +72,109 @@ query() {
   [ "$before" = "$after" ] || { printf 'FAIL - public inspection mutated runtime state\n' >&2; exit 1; }
   [ ! -e "$PG_FACTS_EFFECT_LOG" ] || { printf 'FAIL - effect entrypoint invoked\n' >&2; cat "$PG_FACTS_EFFECT_LOG" >&2; exit 1; }
 }
+PRECHECKS=0 PRECHECK_FAILS=0
+precheck() {
+  PRECHECKS=$((PRECHECKS + 1))
+  if [ "$2" = 0 ]; then printf 'ok - %s\n' "$1"; else printf 'FAIL - %s\n' "$1"; PRECHECK_FAILS=$((PRECHECK_FAILS + 1)); fi
+}
+typed_query() {
+  local before
+  before="$(snapshot)"
+  TYPED_RC=0
+  env PRO_GATE_INPUT_POLICY=bundle-only PRO_GATE_BROWSER_ATTACHMENTS=auto \
+    PRO_GATE_REVIEW_PR_EVIDENCE="$TDIR/pr-evidence.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TDIR/endpoint.patch" \
+    bash "$ROOT/bin/oracle-review.sh" --review-decision --repo "$TDIR/checkout" --pr 1983 \
+      --diff "$TDIR/endpoint.patch" --input bundle --json > "$TDIR/decision.json" 2> "$TDIR/decision.err" || TYPED_RC=$?
+  [ "$before" = "$(snapshot)" ] && [ ! -e "$PG_FACTS_EFFECT_LOG" ]
+}
+typed_envelope() { # expected action reason; the consumer validator re-reduces the full facts
+  [ "$TYPED_RC" = 0 ] && pg_review_decision_envelope_valid "$TDIR/decision.json" &&
+    jq -e --arg action "$1" --arg reason "$2" '
+      .action==$action and .reason==$reason and .effect_request.execution_class=="report-only" and
+      (.facts|type=="object" and length>0) and
+      (.contract.contract_digest|test("^[0-9a-f]{64}$")) and
+      (.contract.corpus_digest|test("^[0-9a-f]{64}$")) and
+      (.effect_request.snapshot_digest|test("^[0-9a-f]{64}$"))
+    ' "$TDIR/decision.json" >/dev/null
+}
+for function in pg_review_decision_ship_mode_bindable pg_review_decision_repair_result_binding; do
+  eval "$(awk -v name="$function" '$0 ~ "^" name "\\(\\)"{p=1} p{print} p && /^}/{exit}' "$ROOT/bin/oracle-review.sh")"
+done
+# The same digest-bound saved artifact exercises every public reader and binding repair.
+# No state writes, scoring, browser calls or network requests are allowed while reading it.
+cp "$PRO_GATE_HOME/completed/$MARKER" "$TDIR/real-review"
+# legacy*: the input binding carries a pre-0.62.0 contract digest and nothing retains its diff
+# (gate r1 P1); a grounded review keeps its acceptance, a skeleton is still refused.
+LEGACY_INPUT="$(jq -cS '.contract_digest="fa91787e3fbf3c0852c78f5269b2f670d84b86561be64d6edef4229bf46aee9b"' <<<"$INPUT")"
+for shape in skeleton real no-vocabulary manifest legacy legacy-skeleton; do
+  CASE_INPUT="$INPUT"; case "$shape" in legacy*) CASE_INPUT="$LEGACY_INPUT";; esac
+  rm -f "$(pg_review_input_binding_dir)/$MARKER"
+  pg_review_input_binding_write "$MARKER" "$CASE_INPUT"
+  cp "$TDIR/real-review" "$PRO_GATE_HOME/completed/$MARKER"
+  case "$shape" in *skeleton) cp "$ROOT/tests/fixtures/template-verdict/pushbot-4451.txt" "$PRO_GATE_HOME/completed/$MARKER";; esac
+  mkdir -p "$(pg_manifest_dir)"
+  pg_review_tokens_write "$MARKER" "$TDIR/endpoint.patch"
+  case "$shape" in no-vocabulary|manifest|legacy*) rm "$(pg_review_tokens_dir)/$MARKER";; esac
+  if [ "$shape" = manifest ]; then pg_diff_paths "$TDIR/endpoint.patch" > "$(pg_manifest_dir)/$MARKER"; fi
+  SAVED_RESULT="$(jq -cS --arg digest "$(pg_sha256 "$PRO_GATE_HOME/completed/$MARKER")" --arg ib "$(pg_review_sha256_text "$CASE_INPUT")" '.artifact.digest=$digest | .input_binding_digest=$ib' <<<"$RESULT")"
+  printf '%s' "$SAVED_RESULT" > "$(pg_review_result_binding_dir)/$MARKER"
+  expected=0; case "$shape" in skeleton|no-vocabulary|legacy-skeleton) expected=6;; esac
+  rc=0; pg_review_accepted_artifact_read "$MARKER" > "$TDIR/accepted.json" 2> "$TDIR/accepted.err" || rc=$?
+  precheck "P1-b: accepted-artifact reader $shape exits $expected" "$([ "$rc" = "$expected" ]; echo $?)"
+  query
+  precheck "P1-b: review-facts $shape exits $expected" "$([ "$RC" = "$expected" ] && { [ "$expected" = 0 ] || jq -e '.status=="invalid" and .reason=="template-verdict" and .review==null' "$TDIR/out.json" >/dev/null; }; echo $?)"
+  rc=0; bash "$TDIR/installed/oracle-review.sh" --recover "$MARKER" > "$TDIR/recover.out" 2> "$TDIR/recover.err" || rc=$?
+  precheck "P1-b: recover $shape exits $expected" "$([ "$rc" = "$expected" ] && { [ "$expected" = 0 ] || { grep -q template-verdict "$TDIR/recover.err" && ! grep -q 'Review ready' "$TDIR/recover.err" && [ ! -s "$TDIR/recover.out" ]; }; }; echo $?)"
+  mv "$PRO_GATE_HOME/completed/$MARKER" "$PRO_GATE_HOME/pending/$MARKER"
+  rc=0; bash "$TDIR/installed/oracle-review.sh" --recover "$MARKER" > "$TDIR/recover.out" 2> "$TDIR/recover.err" || rc=$?
+  precheck "P1-b: pending recovery $shape exits $expected" "$([ "$rc" = "$expected" ] && { [ "$expected" = 0 ] || { grep -q template-verdict "$TDIR/recover.err" && ! grep -q 'Review ready' "$TDIR/recover.err" && [ ! -s "$TDIR/recover.out" ]; }; }; echo $?)"
+  mv "$PRO_GATE_HOME/pending/$MARKER" "$PRO_GATE_HOME/completed/$MARKER"
+  typed_query
+  action=allow-existing-merge-workflow reason=current-ship-is-merge-eligible
+  if [ "$expected" = 6 ]; then action=stop-without-new-review reason=template-verdict; fi
+  precheck "round 2: typed $shape returns a complete $action envelope at exit 0 without effects" "$(typed_envelope "$action" "$reason"; echo $?)"
+  if [ "$expected" = 6 ]; then
+    precheck "round 2: typed $shape facts name the rejected marker and artifact digest" "$(jq -e --arg marker "$MARKER" --arg digest "$(pg_sha256 "$PRO_GATE_HOME/completed/$MARKER")" 'any(.facts.completed_results[]?; .marker==$marker and .artifact_digest==$digest and .shape=="template-verdict" and .applicable==false)' "$TDIR/decision.json" >/dev/null; echo $?)"
+  fi
+  # A rejection must occur before the repair lock and before it can write a new binding.
+  rm "$(pg_review_result_binding_dir)/$MARKER"
+  rc=0; pg_review_decision_repair_result_binding "$MARKER" "$CASE_INPUT" > "$TDIR/repair.out" 2> "$TDIR/repair.err" || rc=$?
+  precheck "P1-b: binding repair $shape exits $expected" "$([ "$rc" = "$expected" ] && { [ "$expected" = 0 ] || [ ! -e "$(pg_review_result_binding_dir)/$MARKER" ]; }; echo $?)"
+  rm -f "$(pg_review_result_binding_dir)/$MARKER" "$(pg_manifest_dir)/$MARKER"
+done
+rm -f "$(pg_review_input_binding_dir)/$MARKER"
+pg_review_input_binding_write "$MARKER" "$INPUT"
+# Both marker enumeration orders must defer to charged epoch. The rejected artifact has no
+# result binding, as with a real skeleton capture; the grounded completion is digest-bound.
+for order in skeleton-first grounded-first; do
+  NEWER=pg-run-acme-widgets-1983-1700000900-2
+  if [ "$order" = skeleton-first ]; then
+    cp "$ROOT/tests/fixtures/template-verdict/pushbot-4451.txt" "$PRO_GATE_HOME/completed/$MARKER"
+    cp "$TDIR/real-review" "$PRO_GATE_HOME/completed/$NEWER"
+    GROUNDED="$NEWER" REJECTED="$MARKER"
+  else
+    cp "$TDIR/real-review" "$PRO_GATE_HOME/completed/$MARKER"
+    cp "$ROOT/tests/fixtures/template-verdict/pushbot-4451.txt" "$PRO_GATE_HOME/completed/$NEWER"
+    GROUNDED="$MARKER" REJECTED="$NEWER"
+  fi
+  NEW_INPUT="$(jq -cS --arg marker "$NEWER" '.marker=$marker | .charged_spend_epoch=1700000900' <<<"$INPUT")"
+  pg_review_input_binding_write "$NEWER" "$NEW_INPUT"
+  pg_review_tokens_write "$MARKER" "$TDIR/endpoint.patch"
+  pg_review_tokens_write "$NEWER" "$TDIR/endpoint.patch"
+  GROUNDED_INPUT="$(pg_review_input_binding_read "$GROUNDED")"
+  GROUNDED_RESULT="$(jq -cS --arg marker "$GROUNDED" --arg ib "$(pg_review_sha256_text "$GROUNDED_INPUT")" --arg digest "$(pg_sha256 "$PRO_GATE_HOME/completed/$GROUNDED")" '.marker=$marker | .input_binding_identity=$marker | .input_binding_digest=$ib | .artifact={digest:$digest,path:("completed/"+$marker)}' <<<"$RESULT")"
+  printf '%s' "$GROUNDED_RESULT" > "$(pg_review_result_binding_dir)/$GROUNDED"
+  typed_query
+  if [ "$order" = skeleton-first ]; then
+    precheck 'round 2: newer grounded review supersedes older skeleton' "$(typed_envelope allow-existing-merge-workflow current-ship-is-merge-eligible && jq -e --arg ref "$(pg_review_sha256_text "$GROUNDED_RESULT")" '.effect_request.applicable_ref==$ref' "$TDIR/decision.json" >/dev/null; echo $?)"
+  else
+    precheck 'round 2: newer skeleton supersedes older grounded review with a typed stop' "$(typed_envelope stop-without-new-review template-verdict && jq -e --arg marker "$REJECTED" --arg digest "$(pg_sha256 "$PRO_GATE_HOME/completed/$REJECTED")" '.effect_request.applicable_ref==$marker and any(.facts.completed_results[]; .marker==$marker and .shape=="template-verdict" and .artifact_digest==$digest and .applicable==false)' "$TDIR/decision.json" >/dev/null; echo $?)"
+  fi
+  rm -f "$(pg_review_result_binding_dir)/$GROUNDED" "$(pg_review_input_binding_dir)/$NEWER" "$PRO_GATE_HOME/completed/$NEWER" "$(pg_review_tokens_dir)/$NEWER"
+done
+cp "$TDIR/real-review" "$PRO_GATE_HOME/completed/$MARKER"
+printf '%s' "$RESULT" > "$(pg_review_result_binding_dir)/$MARKER"
+pg_review_tokens_write "$MARKER" "$TDIR/endpoint.patch"
 query
 if [ "$RC" -ne 0 ] || ! jq -e --arg head "$HEAD" --arg digest "$DIGEST" --arg marker "$MARKER" --arg canonical "$(pg_review_sha256_text "$RESULT")" '.schema=="review-facts/v1" and .status=="accepted" and .selected_marker==$marker and .candidate_head==$head and .applicable==null and .review.reviewed_head==$head and .review.artifact_digest==$digest and .review.canonical_identity==$canonical and .review.verdict=="SHIP" and .review.open_p0==0 and .review.open_p1==0' "$TDIR/out.json"; then
   printf 'FAIL - installed public CLI returns retained facts without current proof; exit=%s\n' "$RC" >&2
@@ -78,7 +182,7 @@ if [ "$RC" -ne 0 ] || ! jq -e --arg head "$HEAD" --arg digest "$DIGEST" --arg ma
   exit 1
 fi
 printf 'ok - installed public CLI returns retained facts with unknown applicability despite invalid fresh policy; all runtime state unchanged\n'
-CHECKS=1 FAILS=0
+CHECKS=$((PRECHECKS + 1)) FAILS=$PRECHECK_FAILS
 check() { # label jq predicate (against the actual public output)
   CHECKS=$((CHECKS + 1))
   if [ "$RC" -eq 0 ] && jq -e "$2" "$TDIR/out.json" >/dev/null; then
@@ -145,6 +249,7 @@ newer_completion() {
   NEW_INPUT="$(jq -cS --arg marker "$NEWER" '.marker=$marker | .charged_spend_epoch=1700000900' <<<"$INPUT")"
   NEW_RESULT="$(jq -cS --arg marker "$NEWER" --arg ib "$(pg_review_sha256_text "$NEW_INPUT")" '.marker=$marker | .input_binding_identity=$marker | .input_binding_digest=$ib | .artifact.path=("completed/"+$marker)' <<<"$RESULT")"
   cp "$PRO_GATE_HOME/completed/$MARKER" "$PRO_GATE_HOME/completed/$NEWER"
+  pg_review_tokens_write "$NEWER" "$TDIR/endpoint.patch"
   pg_review_input_binding_write "$NEWER" "$NEW_INPUT"
   pg_review_result_binding_write "$NEWER" "$NEW_RESULT"
 }
@@ -294,7 +399,7 @@ EXPECTED_CANONICAL="$(printf '%s\n%s\n' "$(pg_review_sha256_text "$TIED_RESULT")
 [ "$(jq -r .review.canonical_identity "$TDIR/out.json")" = "$EXPECTED_CANONICAL" ] || { printf 'FAIL - canonical identity tie-break\n' >&2; FAILS=$((FAILS + 1)); }
 new_case precedence
 newer_completion
-printf '[P0] f:1 - RESOLVED - already fixed\n[P0] f:2 - the RESOLVED state is forgeable\n[P1] f:3 - RESOLVED_MODEL is clobbered\nVERDICT: FIX-FIRST\n' > "$PRO_GATE_HOME/completed/$NEWER"
+printf '[P0] file.txt:1 - RESOLVED - already fixed\n[P0] file.txt:2 - the RESOLVED state is forgeable\n[P1] file.txt:3 - RESOLVED_MODEL is clobbered\nVERDICT: FIX-FIRST\n' > "$PRO_GATE_HOME/completed/$NEWER"
 FIX_RESULT="$(jq -cS --arg digest "$(pg_sha256 "$PRO_GATE_HOME/completed/$NEWER")" '.artifact.digest=$digest | .verdict="FIX-FIRST" | .ship_proof=null' <<<"$NEW_RESULT")"
 printf '%s' "$FIX_RESULT" > "$PRO_GATE_HOME/review-result-bindings/$NEWER"
 # A deliberately favorable mutable round tuple must not provide the public counts.
@@ -365,13 +470,13 @@ query
 check 'literal nonnumeric tmp suffix remains a real candidate' '.status=="accepted" and .selected_marker=="pg-run-latest.tmp.v2"'
 NEWER="$SAVED_NEWER"
 new_case choices
-printf '[P1] f:1 - select a compatibility policy\nCHOICE: keep | Preserve | Keep compatibility\nCHOICE: break | Replace | Use new API\nVERDICT: NEEDS-DISCUSSION\n' > "$PRO_GATE_HOME/completed/$MARKER"
+printf '[P1] file.txt:1 - select a compatibility policy\nCHOICE: keep | Preserve | Keep compatibility\nCHOICE: break | Replace | Use new API\nVERDICT: NEEDS-DISCUSSION\n' > "$PRO_GATE_HOME/completed/$MARKER"
 CHOICE_RESULT="$(jq -cS --arg digest "$(pg_sha256 "$PRO_GATE_HOME/completed/$MARKER")" '.artifact.digest=$digest | .verdict="NEEDS-DISCUSSION" | .ship_proof=null' <<<"$RESULT")"
 printf '%s' "$CHOICE_RESULT" > "$PRO_GATE_HOME/review-result-bindings/$MARKER"
 query
 check 'named choices come from accepted artifact bytes without choosing for the owner' '.status=="accepted" and .review.named_choice==null and (.review.named_choices|map(.id))==["keep","break"] and .review.open_p1==1'
 for verdict in FIX-FIRST SHIP; do
-  printf 'P0: none\nP1: none\nCHOICE: keep | Preserve | Keep compatibility\nCHOICE: break | Replace | Use new API\nVERDICT: %s\n' "$verdict" > "$PRO_GATE_HOME/completed/$MARKER"
+  printf 'P0: none\nP1: none\nChecked file.txt for regressions.\nCHOICE: keep | Preserve | Keep compatibility\nCHOICE: break | Replace | Use new API\nVERDICT: %s\n' "$verdict" > "$PRO_GATE_HOME/completed/$MARKER"
   OTHER_CHOICE_RESULT="$(jq -cS --arg digest "$(pg_sha256 "$PRO_GATE_HOME/completed/$MARKER")" --arg verdict "$verdict" '.artifact.digest=$digest | .verdict=$verdict | if $verdict=="SHIP" then . else .ship_proof=null end' <<<"$RESULT")"
   printf '%s' "$OTHER_CHOICE_RESULT" > "$PRO_GATE_HOME/review-result-bindings/$MARKER"
   query

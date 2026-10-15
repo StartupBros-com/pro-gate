@@ -780,7 +780,7 @@ pg_manifest_dir() { echo "${PRO_GATE_MANIFEST_DIR:-$PRO_GATE_HOME/manifests}"; }
 pg_salvage_class_dir() { printf '%s\n' "${PRO_GATE_SALVAGE_CLASS_DIR:-$PRO_GATE_HOME/salvage-class}"; }
 pg_salvage_class_ok() { # kind
   case "$1" in
-    owned-incomplete|inconclusive|browser-down|absent|cross-bound|throttle|terminal|terminal-infrastructure) return 0;;
+    owned-incomplete|inconclusive|browser-down|absent|cross-bound|throttle|terminal|terminal-infrastructure|template-verdict) return 0;;
     *) return 1;;
   esac
 }
@@ -3401,6 +3401,112 @@ pg_is_review() {
   [ -n "$(pg_extract_verdict "$f")" ]
 }
 
+# #262: keep the reviewed vocabulary across collection invocations. This is derived from the
+# already-prepared payload, never a new GitHub fetch. Unlike the provenance manifest it must
+# survive reservation removal so an idempotent completed-result replay uses the same predicate.
+pg_review_tokens_dir() { printf '%s\n' "${PRO_GATE_REVIEW_TOKENS_DIR:-$PRO_GATE_HOME/review-tokens}"; }
+pg_review_tokens() { # file [rationale]: canonical tokens; rationale emits shaped tokens only
+  LC_ALL=C awk -v rationale="${2:-}" '
+    {
+      line=$0
+      if (rationale) {
+        sub(/^[[:space:]]*[-*#>_]*[[:space:]]*/, "", line)
+        if (line ~ /^[Pp][0-3][*_ ]*:/) next
+        # The whole verdict line is excluded (gate r1 P2): a diff path appended to "VERDICT: SHIP"
+        # is still the skeleton, so the rationale has to stand in its own paragraph.
+        if (line ~ /^[Vv][Ee][Rr][Dd][Ii][Cc][Tt][*_ ]*:/) next
+        sub(/\([Rr]un marker:.*$/, "", line)
+        if (line ~ /^[Rr]un marker:/) next
+      } else {
+        # Paths and trailing hunk context contribute tokens; range prefixes do not.
+        if (line ~ /^diff --git /) sub(/^diff --git /, "", line)
+        else if (line ~ /^(---|\+\+\+) /) sub(/^(---|\+\+\+) /, "", line)
+        else if (line ~ /^@@/) sub(/^@@[^@]*@@[[:space:]]*/, "", line)
+        else if (line ~ /^(index |new file mode |deleted file mode |old mode |new mode )/) next
+        else sub(/^[+ -]/, "", line)
+      }
+      gsub(/[^A-Za-z0-9_./:-]+/, " ", line)
+      n=split(line, words, /[[:space:]]+/)
+      for (i=1; i<=n; i++) {
+        t=words[i]
+        sub(/^[.\/]+/, "", t); sub(/[.:\/]+$/, "", t)
+        if (t !~ /[A-Za-z]/) continue
+        shaped=(t == "VERSION" || t ~ /[\/_]/ || t ~ /\.[A-Za-z][A-Za-z0-9]*(:[0-9]+)?$/ || t ~ /:[0-9]+$/ ||
+          (t ~ /[a-z]/ && substr(t,2) ~ /[A-Z]/))
+        if (rationale && !shaped) continue
+        sub(/:[0-9]+$/, "", t)
+        print t
+        if (!rationale) {
+          # A cited path may omit diff prefixes or directories; retain component boundaries,
+          # never arbitrary substrings of an identifier (fooBarExtra cannot prove fooBar).
+          rest=t
+          while (index(rest,"/")) { rest=substr(rest,index(rest,"/")+1); print rest }
+          count=split(t, components, /[.\/:]/)
+          for (j=1; j<=count; j++) if (components[j] != "") print components[j]
+        }
+      }
+    }' "$1" | LC_ALL=C sort -u
+}
+pg_review_tokens_write() { # marker reviewed-diff
+  local marker="$1" diff="$2" dir tmp
+  pg_reservation_marker_ok "$marker" || return 1
+  [ -r "$diff" ] || return 1
+  dir="$(pg_review_tokens_dir)"; mkdir -p "$dir" || return 1
+  tmp="$(mktemp "$dir/.tokens.XXXXXX")" || return 1
+  if pg_review_tokens "$diff" > "$tmp" && mv -f "$tmp" "$dir/$marker"; then return 0; fi
+  rm -f "$tmp"; return 1
+}
+pg_review_shape() { # body tokens-file -> PG_BODY_BYTES, PG_NAMES_NOTHING; rc 0 iff grounded
+  local body="$1" tokens="$2" candidates
+  PG_BODY_BYTES="$(wc -c < "$body" 2>/dev/null | tr -d '[:space:]')"
+  PG_BODY_BYTES="${PG_BODY_BYTES:-0}"
+  PG_NAMES_NOTHING=true
+  candidates="$(pg_review_tokens "$body" rationale)"
+  if [ -n "$candidates" ] && [ -r "$tokens" ] \
+     && printf '%s\n' "$candidates" | grep -Fx -f "$tokens" >/dev/null; then
+    PG_NAMES_NOTHING=false
+    return 0
+  fi
+  return 1
+}
+
+# Contract digests written into input bindings by engines that predate retained review vocabulary
+# (every release before 0.62.0). Their completions were accepted without it, and reservation
+# removal already deleted their path manifests, so nothing on disk can say which diff they
+# reviewed (gate r1 P1: 1616 of 1616 production input bindings). Frozen on purpose: a later
+# contract bump never joins it, because every engine since 0.62.0 retains the vocabulary at
+# submission or refuses to submit.
+PG_REVIEW_PRE_VOCABULARY_CONTRACT_DIGESTS='bf36fdb5f8625e917be0539ca014fec518649d1160584846aca1cb9149533abb 7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee 5fcd19c12600061af6d90ed9cb980dd7067cff199c374910639003eec4caf5c3 6da6866bab4e95ad138cdc946fa1388be9c386bca7b592c3370c9f52e34b315f fa91787e3fbf3c0852c78f5269b2f670d84b86561be64d6edef4229bf46aee9b'
+pg_review_input_binding_predates_vocabulary() { # marker -> rc 0 iff a validated pre-0.62.0 input binding exists
+  local digest
+  digest="$(pg_review_input_binding_read "$1" 2>/dev/null | jq -r '.contract_digest // empty' 2>/dev/null)"
+  [ -n "$digest" ] || return 1
+  case " $PG_REVIEW_PRE_VOCABULARY_CONTRACT_DIGESTS " in *" $digest "*) return 0;; esac
+  return 1
+}
+
+# Read-only acceptance for saved evidence. No vocabulary means no proof of a grounded review;
+# a legacy path manifest is sufficient without creating or repairing any persistent records.
+# A completion whose input binding predates retained vocabulary is judged on its own shape: the
+# review must still name some path or identifier (both #262 skeletons name none), but nothing
+# can be compared against the diff it reviewed. Every later binding keeps the full requirement.
+pg_review_shape_for_marker() { # marker body [private tokens-file] -> rc 0 or typed exit 6
+  local marker="$1" body="$2" tokens="${3:-$(pg_review_tokens_dir)/$1}" manifest
+  pg_reservation_marker_ok "$marker" || return 6
+  manifest="$(pg_manifest_dir)/$marker"
+  if [ -f "$tokens" ] && [ ! -L "$tokens" ] && [ -r "$tokens" ]; then
+    pg_review_shape "$body" "$tokens" && return 0
+  elif [ -f "$manifest" ] && [ ! -L "$manifest" ] && [ -r "$manifest" ]; then
+    pg_review_shape "$body" <(pg_review_tokens "$manifest") && return 0
+  elif pg_review_input_binding_predates_vocabulary "$marker"; then
+    pg_review_shape "$body" <(pg_review_tokens "$body" rationale) && return 0
+  else
+    pg_review_shape "$body" /dev/null || true
+  fi
+  echo 'template-verdict: review names no path or identifier from the retained reviewed diff' >&2
+  return 6
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # v0.28 (#48): review provenance. A structurally-complete review can still be the WRONG
 # conversation's answer — a failed send once salvaged a different PR's finished review with no
@@ -3902,8 +4008,8 @@ pg_completed_lookup() {  # <marker> <out>: place the artifact at <out>; rc 0 on 
 # ─────────────────────────────────────────────────────────────────────────────
 PG_REVIEW_DECISION_CONTRACT_ID='review-decision/v1'
 PG_REVIEW_DECISION_CONTRACT_VERSION=1
-PG_REVIEW_DECISION_CONTRACT_DIGEST='fa91787e3fbf3c0852c78f5269b2f670d84b86561be64d6edef4229bf46aee9b'
-PG_REVIEW_DECISION_CORPUS_DIGEST='32bc674aca33c10e60b808f6b7a483277d4f3edd6f1f94ed31a55189998e7ea2'
+PG_REVIEW_DECISION_CONTRACT_DIGEST='246b9e4e1d58f1820b4381a90cf93cf3fb7fb849f3ce4dd34b4d757be79c2e4f'
+PG_REVIEW_DECISION_CORPUS_DIGEST='c3803b3001699744df9b0021da3f785d73a8e011f9163937820f135574d0e522'
 
 # Binding-record compatibility only (#214, gate r2 P1). review-input-binding/v1 and
 # review-result-binding/v1 records are validated by their own record_type/record_version shape
@@ -3916,7 +4022,7 @@ PG_REVIEW_DECISION_CORPUS_DIGEST='32bc674aca33c10e60b808f6b7a483277d4f3edd6f1f94
 # Writers share these validators with readers: every production write site passes the CURRENT digest
 # (pg_review_decision_contract_digest), so this list only widens what can be READ back, never what a
 # fresh record may claim. Keep it that way when adding a writer.
-PG_REVIEW_DECISION_COMPATIBLE_CONTRACT_DIGESTS='bf36fdb5f8625e917be0539ca014fec518649d1160584846aca1cb9149533abb 7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee 5fcd19c12600061af6d90ed9cb980dd7067cff199c374910639003eec4caf5c3 6da6866bab4e95ad138cdc946fa1388be9c386bca7b592c3370c9f52e34b315f'
+PG_REVIEW_DECISION_COMPATIBLE_CONTRACT_DIGESTS='bf36fdb5f8625e917be0539ca014fec518649d1160584846aca1cb9149533abb 7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee 5fcd19c12600061af6d90ed9cb980dd7067cff199c374910639003eec4caf5c3 6da6866bab4e95ad138cdc946fa1388be9c386bca7b592c3370c9f52e34b315f fa91787e3fbf3c0852c78f5269b2f670d84b86561be64d6edef4229bf46aee9b'
 
 pg_review_decision_contract_id() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_ID"; }
 pg_review_decision_contract_version() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_VERSION"; }
@@ -4142,12 +4248,16 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
     def hex: type=="string" and test("^[0-9a-f]{64}$");
     def oid: type=="string" and test("^[0-9a-f]{40}([0-9a-f]{24})?$");
     def result:
-      keys_are(["applicable","artifact_digest","bindable","binding_valid","canonical_identity","charged_spend_epoch","collected","evidence_mode","legacy","marker","provenance_valid","verdict"])
+      keys_are(["applicable","artifact_digest","bindable","binding_valid","canonical_identity","charged_spend_epoch","collected","evidence_mode","legacy","marker","provenance_valid","verdict"] +
+        (if has("shape") then ["shape"] else [] end))
       and (.applicable|type=="boolean") and (.artifact_digest|hex) and (.bindable|type=="boolean") and (.binding_valid|type=="boolean")
       and (.canonical_identity|ident and length>0) and (.charged_spend_epoch|type=="number" and floor==.)
       and (.collected|type=="boolean") and (.evidence_mode|IN("full-pr","scoped-delta","connector","caller-patch","none"))
       and (.legacy|type=="boolean") and (.marker|marker and length>0)
-      and (.provenance_valid|type=="boolean") and (.verdict|IN("SHIP","FIX-FIRST","NEEDS-DISCUSSION","NONE"));
+      and (.provenance_valid|type=="boolean") and (.verdict|IN("SHIP","FIX-FIRST","NEEDS-DISCUSSION","NONE"))
+      and (if has("shape") then .shape=="template-verdict" and .applicable==false and .legacy==false
+        and .bindable==false and .binding_valid==false and .provenance_valid==false and .verdict=="NONE"
+        and .collected==true else true end);
     (keys_are(["active_index","completed_results","contract","cooldown","delivery","evidence","governor","input","named_choice","observation","prior_review","reservation","target","transport"]))
     and (.contract|keys_are(["contract_digest","contract_id","contract_version","corpus_digest"]))
     and (.cooldown|keys_are(["active","seconds_remaining"])) and (.cooldown.active|type=="boolean")
@@ -4210,13 +4320,18 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
 
   # Existing completed work wins. Selection is newest charged epoch, then canonical identity;
   # duplicate rows still tied on both fields are unresolved and stop closed.
-  selected="$(jq -cS '[.completed_results[] | select(.applicable or .legacy)] | sort_by(.charged_spend_epoch,.canonical_identity) | last // empty' <<<"$canonical")"
+  selected="$(jq -cS '[.completed_results[] | select(.applicable or .legacy or .shape=="template-verdict")] | sort_by(.charged_spend_epoch,.canonical_identity) | last // empty' <<<"$canonical")"
   if [ -n "$selected" ]; then
     selected_count="$(jq -r --argjson s "$selected" '[.completed_results[] | select(.charged_spend_epoch==$s.charged_spend_epoch and .canonical_identity==$s.canonical_identity)] | length' <<<"$canonical")"
     if [ "$selected_count" -gt 1 ]; then
       pg_review_decision_emit stop-without-new-review completed-result-tie "$canonical" "$snapshot"; return
     fi
     selected_ref="$(jq -r .canonical_identity <<<"$selected")"
+    # Rejected saved bytes participate in the same newest-epoch selection without supplying
+    # accepted authority. A newer grounded completion can supersede them; a newest rejection stops.
+    if [ "$(jq -r '.shape // ""' <<<"$selected")" = template-verdict ]; then
+      pg_review_decision_emit stop-without-new-review template-verdict "$canonical" "$snapshot" "$selected_ref"; return
+    fi
     if [ "$(jq -r .collected <<<"$selected")" = false ]; then
       # An uncollected result whose evidence mode can never carry merge proof (a connector SHIP,
       # #147) is unrepairable, not transient: re-issuing collect would loop forever. Stop typed,
@@ -4555,7 +4670,8 @@ pg_review_result_binding_digest() { local r; r="$(pg_review_result_binding_read 
 
 # Read one accepted completion without collection, repair, scoring or persistent writes.
 # All interpretation uses a private byte snapshot, not several reads of a changing artifact.
-# rc 0: accepted facts; rc 1: unavailable (no output); rc 2: verdict disagreement (diagnostic
+# rc 0: accepted facts; rc 1: unavailable (no output); rc 6: template-verdict;
+# rc 2: verdict disagreement (diagnostic
 # facts only, never counts). The caller retains the decision reducer's distinct repair projection.
 pg_review_accepted_artifact_read() ( # marker [expected canonical input binding]
   local marker="$1" expected="${2:-}" input result artifact snapshot digest canonical verdict stored choices='[]' counts p0 p1 text retained
@@ -4577,6 +4693,7 @@ pg_review_accepted_artifact_read() ( # marker [expected canonical input binding]
   [ "$(jq -jr . <<<"$text" | pg_sha256 /dev/stdin)" = "$digest" ] || return 1
   pg_is_review "$snapshot" || return 1
   [ -z "$(pg_capture_foreign_echo "$snapshot" "$marker")" ] || return 1
+  pg_review_shape_for_marker "$marker" "$snapshot" || return 6
   stored="$(jq -r .verdict <<<"$result")"
   verdict="$(pg_extract_verdict "$snapshot")"
   canonical="$(pg_review_sha256_text "$result")"
@@ -4848,6 +4965,10 @@ pg_review_facts_cli() { # checkout number-or-canonical-PR-URL [candidate-head]; 
   rc=0; accepted="$(pg_review_accepted_artifact_read "$marker")" || rc=$?
   if [ "$rc" -ne 0 ]; then
     reason=unaccepted-review; [ "$rc" -ne 2 ] || reason=verdict-disagreement
+    if [ "$rc" -eq 6 ]; then
+      pg_review_facts_emit invalid template-verdict "$repository" "$pr" "$head" "$marker" null null
+      return 6
+    fi
     pg_review_facts_emit invalid "$reason" "$repository" "$pr" "$head" "$marker" null null; return
   fi
   input="$(jq -cS .input_binding <<<"$accepted")"
@@ -4909,7 +5030,7 @@ pg_ledger_lookup_clean() {
   pg_reservation_marker_ok "$marker" || return 1
   [ -s "$ledger" ] || return 1
   pg_have jq || return 1
-  jq -r --arg m "$marker" 'select((.marker // "") == $m and .outcome == "clean") | [.out, (.sha256 // "")] | @tsv' \
+  jq -r --arg m "$marker" 'select((.marker // "") == $m and .outcome == "clean" and .names_nothing != true) | [.out, (.sha256 // "")] | @tsv' \
     "$ledger" 2>/dev/null | tail -n 1
 }
 

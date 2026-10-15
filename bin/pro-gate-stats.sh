@@ -3,7 +3,7 @@
 #
 # The engine appends one JSON line per finished/deferred run to $PRO_GATE_HOME/ledger.jsonl
 # (fields: ts, pr, repo, exit, outcome, secs, pre_slot_secs, post_slot_secs, kind, attempts,
-# conc, ceiling, live, salvaged, diff_lines, out) and the ramp governor keeps its level in
+# conc, ceiling, live, salvaged, diff_lines, body_bytes, names_nothing, out) and the ramp governor keeps its level in
 # $PRO_GATE_HOME/ramp.state. pre_slot_secs/post_slot_secs (ledger-timing-split) split `secs`
 # into this run's life before vs. after it held an account slot — NOT queue-wait vs.
 # model-generation time (LAUNCH_EPOCH marks slot acquisition, not generation start); older rows
@@ -88,6 +88,8 @@ jq -s "[.[] | $FILTER] | {
   by_outcome: (group_by(.outcome) | map({(.[0].outcome): length}) | add // {}),
   success_rate_pct: (if length > 0 then (100 * ([.[] | select(.outcome == \"clean\")] | length) / length | floor) else null end),
   throttles: ([.[] | select(.outcome == \"throttle\")] | length),
+  names_nothing: ([.[] | select(.names_nothing == true)] | length),
+  names_nothing_rate_pct: (if length > 0 then (100 * ([.[] | select(.names_nothing == true)] | length) / length | floor) else null end),
   salvage_rate_pct: (if length > 0 then (100 * ([.[] | select(.salvaged == 1)] | length) / length | floor) else null end),
   duration_p50_s: ([.[] | select(.outcome == \"clean\") | .secs] | sort | if length > 0 then .[(length / 2 | floor)] else null end),
   duration_p95_s: ([.[] | select(.outcome == \"clean\") | .secs] | sort | if length > 0 then .[((length * 95 / 100) | floor)] else null end),

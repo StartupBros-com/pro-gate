@@ -1304,6 +1304,8 @@ if (args[0] === 'fetch') {
     script = join(state, "record-pro-gate-verdict.mjs");
   }
   const marker = "pg-run-acme-widgets-1983-1700000700-1";
+  mkdirSync(join(state, "review-tokens"), { recursive: true });
+  writeFileSync(join(state, "review-tokens", marker), "shared.txt\n");
   const retainedPaths = [
     "completed",
     "review-input-bindings",
@@ -1359,7 +1361,7 @@ if (args[0] === 'fetch') {
         pr: options.pr ?? 1983,
       },
     };
-    const artifact = `P0: none\nP1: none\nP2: none\nSynthetic retained review, not a live model result.\n${options.choices ? "CHOICE: keep | Preserve | Keep compatibility\nCHOICE: break | Replace | Use new API\n" : ""}VERDICT: ${verdict}\n`;
+    const artifact = `P0: none\nP1: none\nP2: none\n${options.skeleton ? "" : "Checked shared.txt for regressions. Synthetic retained review, not a live model result.\n"}${options.choices ? "CHOICE: keep | Preserve | Keep compatibility\nCHOICE: break | Replace | Use new API\n" : ""}VERDICT: ${verdict}\n`;
     const result = {
       accepted_epoch: 1700000800,
       artifact: { digest: hashBytes(artifact), path: `completed/${marker}` },
@@ -1603,6 +1605,7 @@ test("base tip moving during proof inspection refuses without recording", async 
 
 for (const [label, change] of [
   ["absent evidence", (f) => rmSync(f.retainedPaths[0])],
+  ["saved skeleton", (f) => f.retain("SHIP", { skeleton: true })],
   ["historical review", (f) => f.retain("SHIP", { head: "b".repeat(40) })],
   [
     "corrupt artifact",
