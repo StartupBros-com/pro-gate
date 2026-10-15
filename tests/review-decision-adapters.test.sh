@@ -101,6 +101,69 @@ check 'identity resolver supports the repository-mounted Codex skill layout' \
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+# Exercise the real generator against an isolated tree, never the source checkout.
+check 'generator checks and repairs every compiled identity pin without check-mode writes' \
+  "$(node --input-type=module - "$HERE/.." "$TMP/regenerator" <<'NODE'
+import assert from 'node:assert/strict';
+import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+const [source, root] = process.argv.slice(2);
+const paths = [
+  'scripts/regenerate-review-decision.mjs',
+  'tests/fixtures/review-decision/v1/contract.json',
+  'tests/fixtures/review-decision/v1/corpus.json',
+  'lib/pro-gate-lib.sh',
+  'skills/pro-gate/review-decision-v1.json',
+];
+for (const path of paths) {
+  mkdirSync(dirname(join(root, path)), { recursive: true });
+  copyFileSync(join(source, path), join(root, path));
+}
+const snapshot = () => paths.map(path => readFileSync(join(root, path), 'utf8'));
+const original = snapshot();
+const libPath = join(root, 'lib/pro-gate-lib.sh');
+const lib = original[3];
+const run = (...args) => {
+  const result = spawnSync(process.execPath,
+    [join(root, paths[0]), ...args], { encoding: 'utf8', timeout: 10000 });
+  assert.ifError(result.error);
+  assert.equal(result.signal, null, result.stderr);
+  return result;
+};
+assert.equal(run('--check').status, 0);
+assert.deepEqual(snapshot(), original, 'clean check must not write');
+assert.equal(run().status, 0);
+assert.deepEqual(snapshot(), original, 'clean regeneration must be byte-stable');
+for (const [name, pattern, drift] of [
+  ['PG_REVIEW_DECISION_CONTRACT_ID', /^PG_REVIEW_DECISION_CONTRACT_ID='[^']*'$/m, "'review-decision/v2'"],
+  ['PG_REVIEW_DECISION_CONTRACT_VERSION', /^PG_REVIEW_DECISION_CONTRACT_VERSION=[0-9]+$/m, '2'],
+]) {
+  assert.match(lib, pattern);
+  const mutated = lib.replace(pattern, `${name}=${drift}`);
+  assert.notEqual(mutated, lib);
+  writeFileSync(libPath, mutated);
+  const before = snapshot();
+  const checked = run('--check');
+  assert.notEqual(checked.status, 0, `${name}: drift must fail --check`);
+  assert.match(checked.stderr, /stale generated metadata: lib\/pro-gate-lib\.sh/);
+  assert.deepEqual(snapshot(), before, `${name}: failed check must not write`);
+  assert.equal(run().status, 0, `${name}: regeneration must repair drift`);
+  assert.deepEqual(snapshot(), original, `${name}: repair must preserve all other bytes`);
+  assert.equal(run('--check').status, 0, `${name}: repaired check must pass`);
+  writeFileSync(libPath, lib.replace(pattern, ''));
+  const missing = snapshot();
+  for (const args of [['--check'], []]) {
+    const result = run(...args);
+    assert.notEqual(result.status, 0, `${name}: missing pin must fail`);
+    assert.ok(result.stderr.includes(`missing identity pin: ${name}`), result.stderr);
+    assert.deepEqual(snapshot(), missing, `${name}: missing pin must not write`);
+  }
+  writeFileSync(libPath, lib);
+}
+NODE
+  printf '%s' "$?")"
+
 jq '.action_effects[0].action="unknown-action"' "$CONTRACT" > "$TMP/unknown-action.json"
 jq '.contract_id="review-decision/v2"' "$CORPUS" > "$TMP/unknown-contract.json"
 jq '.cases[0].expected.execution_class="named-product-choice"' "$CORPUS" > "$TMP/malformed-action.json"
