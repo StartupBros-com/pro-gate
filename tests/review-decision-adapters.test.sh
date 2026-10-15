@@ -334,7 +334,8 @@ deferral_case() { (
   export PRO_GATE_HOME="$TMP/deferral-$name" PRO_GATE_RUN_LOGS=0
   export PRO_GATE_REVIEW_PR_EVIDENCE="$TMP/deferral-pr.json" PRO_GATE_REVIEW_ENDPOINT_PATCH="$TMP/deferral.patch"
   mkdir -p "$PRO_GATE_HOME/completed"
-  printf '%s' "$body" > "$PRO_GATE_HOME/completed/$marker"
+  pg_review_tokens_write "$marker" "$TMP/deferral.patch" || exit 1
+  printf 'Checked file.txt for regressions.\n%s' "$body" > "$PRO_GATE_HOME/completed/$marker"
   digest="$(pg_sha256 "$PRO_GATE_HOME/completed/$marker")"
   input="$(jq -cnS --arg cd "$(pg_review_decision_contract_digest)" --arg marker "$marker" \
     --arg base "$DEFERRAL_BASE" --arg head "$DEFERRAL_HEAD" --arg raw "$DEFERRAL_RAW" --arg md "$DEFERRAL_MD" \
@@ -350,7 +351,8 @@ deferral_case() { (
   pg_review_result_binding_write "$marker" "$result" || exit 1
   if [ -n "${5:-}" ]; then
     local older_marker=pg-run-acme-widgets-1983-1700000600-1 older_input older_result
-    printf '%s' "$5" > "$PRO_GATE_HOME/completed/$older_marker"
+    pg_review_tokens_write "$older_marker" "$TMP/deferral.patch" || exit 1
+    printf 'Checked file.txt for regressions.\n%s' "$5" > "$PRO_GATE_HOME/completed/$older_marker"
     older_input="$(jq -cS --arg marker "$older_marker" '.marker=$marker | .charged_spend_epoch=1700000600' <<<"$input")"
     older_result="$(jq -cS --arg marker "$older_marker" --arg ib "$(pg_review_sha256_text "$older_input")" \
       --arg digest "$(pg_sha256 "$PRO_GATE_HOME/completed/$older_marker")" \
@@ -399,6 +401,12 @@ DEFERRAL_RC=0; DEFERRAL_DETAIL="$(deferral_case prose $'[P1] runtime.sh:1 — Th
 check '#274 RESOLVED in prose does not remove an open P1' "$DEFERRAL_RC" "$DEFERRAL_DETAIL"
 check '#274 genuine P2 deferral envelope validates through the shared consumer boundary' \
   "$(pg_review_decision_envelope_valid "$TMP/deferral-p2.json"; printf '%s' "$?")"
+SHAPE_DEFER_DECISION="$(pg_review_decision_reduce "$(jq -cS '
+  .facts | .completed_results[0] |= (. + {applicable:false,bindable:false,binding_valid:false,
+    provenance_valid:false,shape:"template-verdict",verdict:"NONE"})' "$TMP/deferral-p2.json")")"
+check '#262 shape rejection preempts #274 deferral even with proven zero blockers and deferred findings' \
+  "$(jq -e '.action=="stop-without-new-review" and .reason=="template-verdict" and
+    .facts.open_blocking==0 and .facts.deferred_count==1' <<<"$SHAPE_DEFER_DECISION" >/dev/null; printf '%s' "$?")"
 WRONG_COUNT_DECISION="$(pg_review_decision_reduce "$(jq -cS '.facts | .deferred_count=2' "$TMP/deferral-p2.json")")"
 check '#274 a deferred count inconsistent with its items is rejected' \
   "$(jq -e '.action=="stop-without-new-review" and .reason=="undefined-state"' <<<"$WRONG_COUNT_DECISION" >/dev/null; printf '%s' "$?")"
