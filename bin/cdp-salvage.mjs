@@ -75,6 +75,8 @@
 //           model is still generating; the tab is left open so a later --harvest can collect
 //           the finished review without respending the Pro slot);
 //       5 = ChatGPT throttle detected (cooldown written — do NOT resubmit);
+//       6 = verdict skeleton still lacks an assistant paragraph at the deadline; rejected
+//           bytes are printed for the caller's template-verdict classification, never success;
 //       7 = INCONCLUSIVE: either not one successful CDP tab list all invocation (browser down/
 //           restarting), or this run's remembered conversation could not be resolved either way
 //           (it never rendered decisively). Distinct from 4 because 4 is evidence of absence and
@@ -2184,6 +2186,7 @@ function terminalInfrastructureAfterPrompt(text, structuredError = null) {
   return lines.includes(structuredError) ? structuredError : null;
 }
 
+let templateReview = null;
 function classifyEvidence(text, structuredError = null, throttleModal = null) {
   if (!text || !text.trim()) return { kind: 'inconclusive', reason: 'empty-text' };
   // hashText (#208) is what an unowned trip fingerprints to recognize a repeat sighting of the
@@ -2198,13 +2201,25 @@ function classifyEvidence(text, structuredError = null, throttleModal = null) {
   // at all, ours or another's); a modal's underlying page can still carry a foreign marker even
   // though the modal itself carries none.
   if (isThrottlePage(text)) {
-    return { kind: 'throttle', reason: 'interstitial', owned: false, foreign: false, hashText: throttleModal ?? text };
+    return {
+      kind: 'throttle',
+      reason: 'interstitial',
+      owned: false,
+      foreign: false,
+      hashText: throttleModal ?? text,
+    };
   }
   // #162: the modal is account state painted over whatever conversation rendered. `owned` says
   // whether THIS run's exact marker is on the page beneath it (existence proof for --probe).
   if (throttleModal) {
     const owned = hasExactMarker(text, marker);
-    return { kind: 'throttle', reason: 'modal', owned, foreign: !owned && FOREIGN_MARKER_RE.test(text), hashText: throttleModal };
+    return {
+      kind: 'throttle',
+      reason: 'modal',
+      owned,
+      foreign: !owned && FOREIGN_MARKER_RE.test(text),
+      hashText: throttleModal,
+    };
   }
   if (!hasExactMarker(text, marker)) {
     return FOREIGN_MARKER_RE.test(text)
@@ -2218,13 +2233,18 @@ function classifyEvidence(text, structuredError = null, throttleModal = null) {
     return { kind: 'terminal-infrastructure', reason: infrastructureError };
   }
   const review = extractReview(text);
-  if (!review) return { kind: 'owned-incomplete' };
+  if (!review) {
+    templateReview = null;
+    return { kind: 'owned-incomplete' };
+  }
   const verdict = ownedVerdict(text);
   const promptMarkerAt = verdict ? lastExactMarkerAt(text.slice(0, verdict.at), marker) : -1;
-  const answerMarker = verdict?.line.match(/\(run marker:\s*(pg-run-[A-Za-z0-9.-]+)\s*\)/i)?.[1] ?? null;
+  const answerMarker =
+    verdict?.line.match(/\(run marker:\s*(pg-run-[A-Za-z0-9.-]+)\s*\)/i)?.[1] ?? null;
   // The marker echoed in the terminal line is not a later prompt. A separate exact marker after
   // that line is, and proves this otherwise-owned verdict belongs to an older turn in the same chat.
-  const newerPromptMarker = verdict && hasExactMarker(text.slice(verdict.at + verdict.line.length), marker);
+  const newerPromptMarker =
+    verdict && hasExactMarker(text.slice(verdict.at + verdict.line.length), marker);
   // A retry reuses this run's exact marker, so a stale SAME-marker verdict (one this run's own
   // marker binds) passes every other check here (owned, non-foreign, well-formed) AND the shell's
   // nonce check downstream — it would otherwise satisfy `kind: 'terminal'` while the newer
@@ -2236,14 +2256,33 @@ function classifyEvidence(text, structuredError = null, throttleModal = null) {
   // Gated on sameMarker: a verdict carrying a DIFFERENT marker ahead of our prompt (#68 gate
   // P1's reused-conversation scrollback) already fails the shell's nonce check on its
   // own — that case must stay 'terminal' so the engine can adjudicate it, not be swallowed here.
-  if (newerPromptMarker && sameMarker(answerMarker, marker)) return { kind: 'owned-incomplete', reason: 'stale-terminal' };
+  if (newerPromptMarker && sameMarker(answerMarker, marker))
+    return { kind: 'owned-incomplete', reason: 'stale-terminal' };
+  // #262: a verdict block can render before the actual answer. Keep sampling within the
+  // existing budget, and never let a probe release capacity on this incomplete shape.
+  const paragraphs = review
+    .split('\n')
+    .filter(
+      (line) =>
+        !/^\s*[*_>#-]*\s*(?:P[0-3][*_\s]*:|VERDICT[*_\s]*:|run marker:)/i.test(line) &&
+        !/^[\s`*_#>-]*$/.test(line),
+    );
+  if (!mixedAnswer(text) && paragraphs.length === 0) {
+    templateReview = review;
+    return { kind: 'owned-incomplete', reason: 'template-verdict' };
+  }
+  templateReview = null;
   return {
     kind: 'terminal',
     review,
     // newerPromptMarker can still be true here for a foreign answerMarker (scrollback case
     // above); the `&& !newerPromptMarker` term stays as a guard against that combination
     // ever being reported probe-complete, even though only --probe reads this field.
-    probeComplete: promptMarkerAt >= 0 && sameMarker(answerMarker, marker) && !newerPromptMarker && !mixedAnswer(text),
+    probeComplete:
+      promptMarkerAt >= 0 &&
+      sameMarker(answerMarker, marker) &&
+      !newerPromptMarker &&
+      !mixedAnswer(text),
     // Old foreign scrollback is retryable; the extracted review cannot carry this chronology.
     precedesPrompt: !!newerPromptMarker,
   };
@@ -2671,6 +2710,12 @@ if (!probe && stillGeneratingUrl && !lastMatchWasSeeded) {
 // stillGeneratingUrl is a per-scan signal and is cleared every cycle; seededLiveUrl is not.
 const liveUrl = stillGeneratingUrl || seededLiveUrl;
 if (!probe && liveUrl) {
+  if (templateReview !== null) {
+    console.error('evidence-kind: template-verdict');
+    console.error(`template-verdict: no assistant paragraph beyond the verdict block after ${timeoutSecs}s`);
+    console.log(templateReview);
+    process.exit(6);
+  }
   // Budget exhausted while the model is still generating. The Pro slot is SPENT and the answer
   // may land any minute: exiting 4 here historically made the engine declare failure and CLOSE
   // the tab, destroying the review (65-minute Pro run lost on 2026-07-09). Distinct code + open

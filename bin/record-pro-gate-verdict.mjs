@@ -863,23 +863,41 @@ function makeGetStatus(owner, repo) {
   };
 }
 
-/**
- * @returns {(baseRef: string) => void}
+/** Fetch and read the same explicit base ref, independent of remote fetch mappings.
+ * @param {string} cwd
  */
-function makeFetchBase() {
-  return (baseRef) => {
-    execFileSync("git", ["fetch", "origin", baseRef], { encoding: "utf8" });
-  };
-}
-
-/**
- * @returns {(baseRef: string) => string}
- */
-function makeGetBaseTipSha() {
-  return (baseRef) =>
-    execFileSync("git", ["rev-parse", `origin/${baseRef}`], {
+export function createGitBaseAccess(cwd = process.cwd()) {
+  /** @param {string} baseRef */
+  const refs = (baseRef) => {
+    const source = `refs/heads/${baseRef}`;
+    execFileSync("git", ["check-ref-format", source], {
+      cwd,
       encoding: "utf8",
-    }).trim();
+    });
+    return { source, destination: `refs/remotes/origin/${baseRef}` };
+  };
+  return {
+    /** @param {string} baseRef */
+    fetchBase(baseRef) {
+      const { source, destination } = refs(baseRef);
+      execFileSync("git", ["fetch", "origin", `+${source}:${destination}`], {
+        cwd,
+        encoding: "utf8",
+      });
+    },
+    /** @param {string} baseRef */
+    getBaseTipSha(baseRef) {
+      const { destination } = refs(baseRef);
+      return execFileSync(
+        "git",
+        ["rev-parse", "--verify", `${destination}^{commit}`],
+        {
+          cwd,
+          encoding: "utf8",
+        },
+      ).trim();
+    },
+  };
 }
 
 /**
@@ -1120,8 +1138,7 @@ async function main() {
         ? await verifyForMerge({
             ...common,
             getStatus: makeGetStatus(owner, repo),
-            fetchBase: makeFetchBase(),
-            getBaseTipSha: makeGetBaseTipSha(),
+            ...createGitBaseAccess(),
             getInterveningFiles: makeGetInterveningFiles(),
             getPrChangedFiles: makeGetPrChangedFiles(),
             getInterveningCommitCount: makeGetInterveningCommitCount(),
