@@ -299,7 +299,8 @@ SUPERSEDE_RC=$?
 sleep 1
 attempt "$HOME_DIR" 21
 decide newer
-check 'newer live attempt: the older rejection does not stop its recovery' "$([ -s "$TDIR/t271.record" ] && [ -s "$HOME_DIR/rejected-captures/$OLD_MARKER" ] && [ "$SUPERSEDE_RC" = 0 ] && decision_is newer recover-existing-review active-work-requires-recovery && jq -e --arg m "$MARKER" --arg old "$OLD_MARKER" '.effect_request.applicable_ref==$m and .effect_request.applicable_ref!=$old and any(.facts.completed_results[]; .marker==$old and .shape=="rejected-capture")' "$TDIR/newer.decision.json" >/dev/null; echo $?)"
+check 'older attempt released by proven supersession' "$([ "$SUPERSEDE_RC" = 0 ]; echo $?)"
+check 'newer live attempt: the older rejection does not stop its recovery' "$([ -s "$TDIR/t271.record" ] && [ -s "$HOME_DIR/rejected-captures/$OLD_MARKER" ] && decision_is newer recover-existing-review active-work-requires-recovery && jq -e --arg m "$MARKER" --arg old "$OLD_MARKER" '.effect_request.applicable_ref==$m and .effect_request.applicable_ref!=$old and any(.facts.completed_results[]; .marker==$old and .shape=="rejected-capture")' "$TDIR/newer.decision.json" >/dev/null; echo $?)"
 
 # ── 8. Proof never changes acceptance of a valid completion ─────────────────────────────────────
 attempt "$TDIR/home-accepted" 22
