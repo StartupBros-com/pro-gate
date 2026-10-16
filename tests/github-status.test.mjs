@@ -499,6 +499,200 @@ test("planted negative: a base equal to the default branch is accepted, a differ
   assert.equal(refusedCalls.length, 0);
 });
 
+// #288: the daemon binds a completed review to the PR resource's `base.sha`, a snapshot GitHub
+// refreshes only when the PR syncs, so on a busy repository the live tip is usually ahead of
+// the base the proof carries. The recorder accepts that snapshot when it reads it from the PR
+// itself, and records it as the reviewed base so verify-for-merge's overlap window starts
+// where the review did, not at the record-time tip.
+const prWithSnapshot = (overrides = {}) => ({
+  headSha: SHA_A,
+  baseRef: DEFAULT_BRANCH,
+  baseRepo: BASE_REPO,
+  baseSha: BASE_SHA,
+  ...overrides,
+});
+
+test("PR base snapshot: a proof carrying the PR's base.sha records once when the live tip is ahead, embedding the reviewed base", async () => {
+  const { calls, postStatus } = statusSpy();
+  /** @type {string[]} */
+  const logs = [];
+
+  const result = await run(
+    baseRunArgs({
+      getPrInfo: () => prWithSnapshot(),
+      getLiveBaseTip: () => NEW_BASE_SHA,
+      postStatus,
+      log: (msg) => logs.push(msg),
+    }),
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0], {
+    sha: SHA_A,
+    state: "success",
+    description: `SHIP · base ${BASE_REPO}@${DEFAULT_BRANCH}@${BASE_SHA_SHORT} · recorded 2026-08-16 · ${EVIDENCE}`,
+    targetUrl: EVIDENCE,
+    context: STATUS_CONTEXT,
+  });
+  assert.match(logs[0], new RegExp(`base: .* @ ${BASE_SHA}\n`));
+  assert.match(logs[0], new RegExp(`live tip: ${NEW_BASE_SHA}\n`));
+});
+
+// The planted negative for the recorded base: record through run() exactly as #288's parked
+// owners do (proof bound to the PR's base snapshot, main already ahead), then verify. Main's
+// snapshot-to-tip commits touch a PR file, so verification must refuse. Recording the
+// record-time tip instead would make that window invisible and this verification would pass.
+test("planted negative: verify-for-merge refuses a SHIP recorded at the PR's base snapshot when snapshot-to-tip changes overlap the PR", async () => {
+  const { calls, postStatus } = statusSpy();
+  const recorded = await run(
+    baseRunArgs({
+      getPrInfo: () => prWithSnapshot(),
+      getLiveBaseTip: () => NEW_BASE_SHA,
+      postStatus,
+    }),
+  );
+  assert.equal(recorded.ok, true);
+  assert.equal(calls.length, 1);
+
+  /** @type {Array<[string, string]>} */
+  const windows = [];
+  /** @type {string[]} */
+  const errors = [];
+  const result = await verifyForMerge({
+    pr: 1748,
+    getPrInfo: () => prWithSnapshot(),
+    getDefaultBranch: () => DEFAULT_BRANCH,
+    getStatus: () => ({
+      state: /** @type {string} */ (calls[0].state),
+      description: /** @type {string} */ (calls[0].description),
+    }),
+    fetchBase: () => {},
+    getBaseTipSha: () => NEW_BASE_SHA,
+    getInterveningFiles: (from, to) => {
+      windows.push([from, to]);
+      return ["apps/blog-writer/lib/shared.ts"];
+    },
+    getPrChangedFiles: () => [
+      "apps/blog-writer/lib/shared.ts",
+      "apps/blog-writer/lib/mine.ts",
+    ],
+    getInterveningCommitCount: () => 41,
+    log: () => {},
+    error: (msg) => errors.push(msg),
+  });
+
+  assert.equal(result.ok, false);
+  assert.deepEqual(windows, [[BASE_SHA_SHORT, NEW_BASE_SHA]]);
+  assert.match(
+    errors[0],
+    /base moved with overlapping changes; re-review required/,
+  );
+  assert.match(errors[0], /apps\/blog-writer\/lib\/shared\.ts/);
+});
+
+test("PR base snapshot: a proof base matching neither the live tip nor the PR's base.sha, or a retarget or moved head, refuses and posts nothing", async () => {
+  const proof = acceptedProof();
+  for (const [label, overrides] of [
+    [
+      "proof base equals neither",
+      {
+        getReviewFacts: () => ({
+          ...proof,
+          base: { ...proof.base, sha: "9".repeat(40) },
+        }),
+      },
+    ],
+    [
+      "proof ref differs from the PR's",
+      {
+        getReviewFacts: () => ({
+          ...proof,
+          base: { ...proof.base, ref: "staging" },
+        }),
+      },
+    ],
+    [
+      "proof repo differs from the PR's",
+      {
+        getReviewFacts: () => ({
+          ...proof,
+          base: { ...proof.base, repo: "other/repo" },
+        }),
+      },
+    ],
+    [
+      "PR retargeted before recording",
+      {
+        getPrInfo: (() => {
+          let reads = 0;
+          return () =>
+            prWithSnapshot(++reads === 1 ? {} : { baseRef: "staging" });
+        })(),
+      },
+    ],
+    [
+      "head moved before recording",
+      {
+        getPrInfo: (() => {
+          let reads = 0;
+          return () => prWithSnapshot(++reads === 1 ? {} : { headSha: SHA_B });
+        })(),
+      },
+    ],
+  ]) {
+    const { calls, postStatus } = statusSpy();
+    /** @type {string[]} */
+    const errors = [];
+
+    const result = await run(
+      baseRunArgs({
+        getPrInfo: () => prWithSnapshot(),
+        getLiveBaseTip: () => NEW_BASE_SHA,
+        postStatus,
+        error: (msg) => errors.push(msg),
+        ...overrides,
+      }),
+    );
+
+    assert.equal(result.ok, false, label);
+    assert.equal(calls.length, 0, label);
+    assert.match(errors[0], /Posting nothing/, label);
+  }
+});
+
+// The planted negative for #288: identical proof and live tip, differing only in what the PR
+// read returns. Acceptance must come from GitHub's PR resource at recording time, never from
+// the proof, so a reader that omits `baseSha` (or returns a short one) keeps the live-tip rule.
+test("planted negative: a stale proof base is accepted only through the PR read's full base.sha", async () => {
+  for (const pr of [
+    { headSha: SHA_A, baseRef: DEFAULT_BRANCH, baseRepo: BASE_REPO },
+    prWithSnapshot({ baseSha: BASE_SHA_SHORT }),
+  ]) {
+    const { calls, postStatus } = statusSpy();
+    const result = await run(
+      baseRunArgs({
+        getPrInfo: () => pr,
+        getLiveBaseTip: () => NEW_BASE_SHA,
+        postStatus,
+      }),
+    );
+    assert.equal(result.ok, false, JSON.stringify(pr));
+    assert.equal(calls.length, 0, JSON.stringify(pr));
+  }
+
+  const { calls, postStatus } = statusSpy();
+  const result = await run(
+    baseRunArgs({
+      getPrInfo: () => prWithSnapshot(),
+      getLiveBaseTip: () => NEW_BASE_SHA,
+      postStatus,
+    }),
+  );
+  assert.equal(result.ok, true);
+  assert.equal(calls.length, 1);
+});
+
 test("SHA and base match: posts exactly one status, embedding the base repo/ref/sha", async () => {
   const { calls, postStatus } = statusSpy();
 
@@ -575,14 +769,14 @@ test("run works with async getPrInfo, getDefaultBranch, and getLiveBaseTip (a re
 });
 
 // The required planted negative for the live-tip fix: the recorded base SHA
-// must come from `getLiveBaseTip`'s return value, never from any field that
-// happens to live on the `getPrInfo` result. Before the fix, `run()` read
-// `pull.base.sha` off the PR resource -- a value confirmed live (PR #1748)
-// to sit up to 25 commits behind the real branch tip. If `run()` ever
-// regressed to reading a field off `getPrInfo` instead of calling
-// `getLiveBaseTip`, this test fails: the bait value below would show up in
+// must come from the accepted proof -- here bound to `getLiveBaseTip`'s
+// return value -- never from any field that happens to live on the
+// `getPrInfo` result. Before the fix, `run()` read `pull.base.sha` off the
+// PR resource -- a value confirmed live (PR #1748) to sit up to 25 commits
+// behind the real branch tip. If `run()` ever regressed to recording a field
+// off `getPrInfo`, this test fails: the bait value below would show up in
 // the recorded description instead of `BASE_SHA`.
-test("planted negative: the recorded base SHA comes from getLiveBaseTip, never a stale field on getPrInfo", async () => {
+test("planted negative: the recorded base SHA comes from the accepted proof bound to getLiveBaseTip, never a stale field on getPrInfo", async () => {
   const { calls, postStatus } = statusSpy();
   const BAIT_SHA = "000000000000dead000000000000000000beef";
 
@@ -592,9 +786,10 @@ test("planted negative: the recorded base SHA comes from getLiveBaseTip, never a
         headSha: SHA_A,
         baseRef: DEFAULT_BRANCH,
         baseRepo: BASE_REPO,
-        // Bait: mimics the real PR resource's `base.sha`, which PrInfo no
-        // longer even has a slot for. If `run()` ever read it anyway, the
-        // recorded description would embed BAIT_SHA instead of BASE_SHA.
+        // Bait: mimics the real PR resource's `base.sha`. PrInfo has carried
+        // a `baseSha` slot since #288, but only to accept a proof bound to
+        // it; the recorded base is the accepted proof's, never this field. A
+        // `run()` that recorded the field would embed BAIT_SHA, not BASE_SHA.
         baseSha: BAIT_SHA,
       }),
       getLiveBaseTip: () => BASE_SHA,
@@ -1667,7 +1862,7 @@ for (const verdict of ["FIX-FIRST", "NEEDS-DISCUSSION"]) {
   });
 }
 
-test("explicit public proof environment is reused but must bind to live base, not cached pull snapshot", (t) => {
+test("explicit public proof environment is reused but must bind to the live base or the PR's own base snapshot", (t) => {
   const f = cliFixture(t);
   const proofEnv = {
     PRO_GATE_REVIEW_ENDPOINT_PATCH: f.endpoint,
@@ -1683,7 +1878,9 @@ test("explicit public proof environment is reused but must bind to live base, no
       .every((args) => args[0] !== "pr" && !args[1]?.includes("/compare/")),
   );
   assert.ok(f.posts()[0].some((arg) => arg.includes(f.base.slice(0, 12))));
-  f.configure({ liveBase: "b".repeat(40) });
+  // #288: a proof base equal to the PR's own base.sha now records, so the refused case moves
+  // both the live tip and the PR snapshot away from the proof base.
+  f.configure({ liveBase: "b".repeat(40), snapshotBase: "c".repeat(40) });
   assert.equal(f.invoke([], proofEnv).status, 1);
   assert.equal(f.posts().length, 1);
   assert.ok(
@@ -1703,6 +1900,44 @@ test("explicit public proof environment is reused but must bind to live base, no
   const restored = f.invoke([], proofEnv);
   assert.equal(restored.status, 0, restored.stdout + restored.stderr);
   assert.equal(f.posts().length, 2);
+});
+
+test("real public CLI records SHIP when the live tip is ahead of the PR base snapshot its proof carries (#288)", (t) => {
+  const f = cliFixture(t);
+  f.git("checkout", "-q", "main");
+  writeFileSync(
+    join(f.checkout, "unrelated.txt"),
+    "unrelated base advancement\n",
+  );
+  f.git("add", "unrelated.txt");
+  f.git("commit", "-qm", "synthetic disjoint advancement");
+  const advanced = f.git("rev-parse", "HEAD");
+  f.git("checkout", "-q", "candidate");
+  // GitHub has not resynced the PR: pulls/<n> and the prepared proof still carry the reviewed base.
+  f.configure({ liveBase: advanced });
+  const result = f.invoke();
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.equal(f.posts().length, 1);
+  assert.ok(f.posts()[0].includes("state=success"));
+  assert.ok(
+    f
+      .posts()[0]
+      .some((arg) =>
+        arg.includes(`base acme/widgets@main@${f.base.slice(0, 12)}`),
+      ),
+    "the status embeds the reviewed base, not the record-time tip",
+  );
+  assert.ok(
+    !f.posts()[0].some((arg) => arg.includes(advanced.slice(0, 12))),
+    "the record-time tip is not the recorded base",
+  );
+  assert.ok(result.stdout.includes(`base: acme/widgets@main @ ${f.base}\n`));
+  assert.ok(result.stdout.includes(`live tip: ${advanced}\n`));
+  // Verification diffs the real reviewed-base-to-tip window: one disjoint commit.
+  const verified = f.invoke(["--verify-for-merge"]);
+  assert.equal(verified.status, 0, verified.stdout + verified.stderr);
+  assert.match(verified.stdout, /advanced 1 commit/);
+  assert.equal(f.posts().length, 1);
 });
 
 test("real scoped public proof requires separate reviewed payload, endpoint, manifest and confirmation; no full-PR fallback", (t) => {
