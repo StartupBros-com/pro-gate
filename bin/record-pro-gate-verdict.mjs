@@ -342,7 +342,12 @@ export function parseGitHubRemote(url) {
   };
 }
 
-/** @typedef {{headSha: string, baseRef: string, baseRepo: string}} PrInfo */
+/**
+ * `baseSha` is the PR resource's `base.sha`: the base snapshot GitHub refreshes only when the
+ * PR syncs, which the daemon binds completed reviews to. Optional, so injected readers that
+ * omit it keep the live-tip-only proof check.
+ * @typedef {{headSha: string, baseRef: string, baseRepo: string, baseSha?: string}} PrInfo
+ */
 /** @typedef {{repo: string, ref: string, sha: string}} ProofBase */
 /**
  * @typedef {{facts: unknown, base: ProofBase}} ReviewProof
@@ -377,8 +382,10 @@ function count(value) {
  * Assertions supplied on the command line are not review evidence. Only the public
  * reader can accept retained artifacts; the adapter checks its exact current target
  * and the base of the proof supplied to that reader against live GitHub identity.
+ * The proof base may equal the live tip or the PR's own base snapshot (`prBase`), both
+ * read from GitHub at recording time, never from the proof.
  * @param {ReviewProof} proof
- * @param {{pr: number, verdict: string, head: string, repo: string, ref: string, base: string}} expected
+ * @param {{pr: number, verdict: string, head: string, repo: string, ref: string, base: string, prBase?: string}} expected
  */
 function proofMatches(proof, expected) {
   const facts = proof?.facts;
@@ -428,7 +435,8 @@ function proofMatches(proof, expected) {
     proof.base.repo.toLowerCase() === expected.repo.toLowerCase() &&
     proof.base.ref === expected.ref &&
     fullSha(proof.base.sha) &&
-    shasEqual(proof.base.sha, expected.base)
+    (shasEqual(proof.base.sha, expected.base) ||
+      (fullSha(expected.prBase) && shasEqual(proof.base.sha, expected.prBase)))
   );
 }
 
@@ -450,7 +458,12 @@ export async function run({
   log = console.log,
   error = console.error,
 }) {
-  const { headSha, baseRef, baseRepo } = await getPrInfo(pr);
+  const {
+    headSha,
+    baseRef,
+    baseRepo,
+    baseSha: prBaseSha,
+  } = await getPrInfo(pr);
   const defaultBranch = await getDefaultBranch();
   if (baseRef !== defaultBranch) {
     error(
@@ -482,10 +495,11 @@ export async function run({
       repo: expectedRepo,
       ref: baseRef,
       base: liveBaseSha,
+      prBase: prBaseSha,
     })
   ) {
     error(
-      "Public review facts or proof do not match the asserted verdict, current head and live default base. Posting nothing.",
+      "Public review facts or proof do not match the asserted verdict, current head and live default base or the PR's base snapshot. Posting nothing.",
     );
     return { ok: false };
   }
@@ -508,7 +522,7 @@ export async function run({
     verdict,
     baseRepo,
     baseRef,
-    baseSha: liveBaseSha,
+    baseSha: proof.base.sha,
     evidence,
     now: now(),
   });
@@ -518,7 +532,7 @@ export async function run({
     !recorded ||
     recorded.repo !== baseRepo ||
     recorded.ref !== baseRef ||
-    recorded.sha !== liveBaseSha.slice(0, BASE_SHA_LENGTH).toLowerCase()
+    recorded.sha !== proof.base.sha.slice(0, BASE_SHA_LENGTH).toLowerCase()
   ) {
     error("Base identity cannot fit the status description. Posting nothing.");
     return { ok: false };
@@ -531,7 +545,7 @@ export async function run({
     context: STATUS_CONTEXT,
   });
   log(
-    `recorded ${verdict} (${state}) for PR #${pr} at ${headSha}\n  base: ${baseRepo}@${baseRef} @ ${liveBaseSha}\n  target_url: ${evidence}`,
+    `recorded ${verdict} (${state}) for PR #${pr} at ${headSha}\n  base: ${baseRepo}@${baseRef} @ ${proof.base.sha}\n  live tip: ${liveBaseSha}\n  target_url: ${evidence}`,
   );
   return { ok: true };
 }
@@ -767,6 +781,7 @@ function makeGetPrInfo(owner, repo) {
       headSha: data.head.sha,
       baseRef: data.base.ref,
       baseRepo: data.base.repo.full_name,
+      baseSha: data.base.sha,
     };
   };
 }
