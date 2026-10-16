@@ -99,7 +99,8 @@ function expectedTitleFromExpression(expression) {
 // #271 (U5): when the state file carries `dom`, the shipped review-text expression runs against a
 // small ChatGPT-shaped document instead of receiving flat text, so response-scope facts come from
 // production code rather than from the fixture. Spec: {href, generating, turns:[{role, text,
-// actions}]}. Selectors cover the forms ChatGPT/Oracle use: tag, [attr], [attr="v"], [attr^="v"],
+// actions, busy}]}; `busy` renders Oracle's loading-shimmer marker inside that turn. Selectors
+// cover the forms ChatGPT/Oracle use: tag, .class, [attr], [attr="v"], [attr^="v"],
 // [attr*="v" i], :not(...), comma lists and descendant combinators. Anything else throws.
 function splitTop(source, separator) {
   const parts = [];
@@ -131,6 +132,8 @@ function matchesCompound(element, compound) {
       if (op === '=' && have !== need) return false;
       if (op === '^=' && !have.startsWith(need)) return false;
       if (op === '*=' && !have.includes(need)) return false;
+    } else if ((part = rest.match(/^\.([\w-]+)/))) {
+      if (!(element.getAttribute('class') ?? '').split(/\s+/).includes(part[1])) return false;
     } else if ((part = rest.match(/^:not\(((?:[^()]|\([^()]*\))*)\)/))) {
       if (matchesSelectorList(element, part[1])) return false;
     } else {
@@ -203,6 +206,7 @@ function fakeDocument(spec) {
       ? [button('copy-turn-action-button', 'Copy'), button('good-response-turn-action-button', 'Good response'),
         button('bad-response-turn-action-button', 'Bad response')]
       : [button('copy-turn-action-button', 'Copy')])] : []),
+    ...(turn.busy ? [new FakeElement('span', { class: 'loading-shimmer' }, 'Thinking')] : []),
   ]));
   const composer = new FakeElement('form', {}, '', [spec.generating
     ? button('stop-button', 'Stop streaming')

@@ -6500,9 +6500,13 @@ for (const placeholder of PLACEHOLDER_URLS) {
   const prompt271 = `Review the attached change.\n(run marker: ${MARKER}; echo it on the VERDICT line)`;
   const grounded271 = `P0: none\nP1: none\nP2: none\nP3: none\n\nChecked src/review-engine.ts for failure handling.\n\nVERDICT: SHIP (run marker: ${MARKER})`;
   const skeleton271 = `P0: none\nP1: none\nP2: none\nP3: none\nVERDICT: SHIP (run marker: ${MARKER})`;
-  const turn271 = (role, text, { finished = true, contained = true } = {}) => {
+  const turn271 = (role, text, { finished = true, contained = true, busy = false } = {}) => {
     const container = {
-      querySelector: (selector) => (finished && selector.includes('copy-turn-action-button') ? { tagName: 'BUTTON' } : null),
+      querySelector: (selector) => {
+        if (finished && selector.includes('copy-turn-action-button')) return { tagName: 'BUTTON' };
+        if (busy && selector.includes('[aria-busy="true"]')) return { tagName: 'SPAN' };
+        return null;
+      },
     };
     const node = {
       children: [],
@@ -6535,6 +6539,7 @@ for (const placeholder of PLACEHOLDER_URLS) {
   for (const [name, turns, opts] of [
     ['a rendered stop control', [user271(), turn271('assistant', grounded271)], { generating: () => true }],
     ['no finished-turn actions', [user271(), turn271('assistant', grounded271, { finished: false })]],
+    ['a busy indicator in the answer turn', [user271(), turn271('assistant', grounded271, { busy: true })]],
     ['no conversation-turn container', [user271(), turn271('assistant', grounded271, { contained: false })]],
     ['a newer user turn after the answer', [user271(), turn271('assistant', grounded271), turn271('user', 'One more thing.')]],
     ['two assistant turns after the prompt', [user271(), turn271('assistant', skeleton271), turn271('assistant', grounded271)]],

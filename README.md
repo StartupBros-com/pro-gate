@@ -566,7 +566,8 @@ recovering it forever. The refusal itself is unchanged: a skeleton without a gro
 reference still exits 6, a review without the run-marker echo still exits 9, and the charge,
 reservation and input binding are kept. What changes is evidence. When the CDP helper proved the
 bytes it printed are the finished last assistant response after this attempt's marked prompt (no
-generation running, finished-turn actions present, identical text on a re-read about 2.5 s
+generation running, no loading or busy marker in the answer's turn, finished-turn actions present,
+identical text on a re-read about 2.5 s
 later, and the same conversation URL as the attempt's memo), the harvest also writes one
 write-once record (mode 0600) at `$PRO_GATE_HOME/rejected-captures/<marker>`. It binds the exact
 bytes and their SHA-256 to the marker, charged epoch, input binding and conversation URL. The next

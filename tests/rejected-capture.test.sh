@@ -220,6 +220,7 @@ ambiguous_page() { # label serial rc generating href kind
     two-assistant) assistant="$(turn assistant "$(answer_271)" true)"; set -- "$1" "$2" "$3" false "$5" "$(printf '%s\n%s\n%s\n' "$user" "$(turn assistant 'Reading the diff now.' true)" "$assistant" | turns)" ;;
     foreign) assistant="$(turn assistant "$(answer_271 | sed 's/run marker: pg-run-[A-Za-z0-9.-]*/(run marker: pg-run-acme-other-999-1700000000-7)/')" true)"; set -- "$1" "$2" "$3" false "$5" "$(printf '%s\n%s\n' "$user" "$assistant" | turns)" ;;
     unmarked-prompt) assistant="$(turn assistant "$(printf 'Quoting your request: run marker: %s\n\n%s' "$MARKER" "$(answer_271)")" true)"; set -- "$1" "$2" "$3" false "$5" "$(printf '%s\n%s\n' "$(turn user 'Review the attached change.' true)" "$assistant" | turns)" ;;
+    busy) assistant="$(turn assistant "$(answer_271)" true | jq -c '.busy = true')"; set -- "$1" "$2" "$3" false "$5" "$(printf '%s\n%s\n' "$user" "$assistant" | turns)" ;;
     *) assistant="$(turn assistant "$(answer_271)" true)"; set -- "$1" "$2" "$3" false "$5" "$(printf '%s\n%s\n' "$user" "$assistant" | turns)" ;;
   esac
   page "$4" "$5" "$6"
@@ -239,6 +240,8 @@ ambiguous_page two-assistant-turns 15 9 false "$CONVERSATION" two-assistant
 ambiguous_page foreign-echo 16 9 false "$CONVERSATION" foreign
 ambiguous_page unmarked-prompt 17 6 false "$CONVERSATION" unmarked-prompt
 ambiguous_page other-conversation 18 6 false https://chatgpt.com/c/another-conversation in-scope
+# Finished actions beside Oracle's loading-shimmer marker in the same turn is interim, not complete.
+ambiguous_page busy-turn 24 6 false "$CONVERSATION" busy
 
 # An attempt without an immutable input binding cannot be bound, whatever the page shows.
 attempt "$TDIR/home-unbound-input" 19 no-binding
@@ -287,6 +290,18 @@ damaged other-input '.input_binding_digest = ("1" * 64)'
 damaged other-marker '.marker = "pg-run-acme-widgets-1983-1700000000-99"'
 damaged truncated truncated
 damaged interrupted-write partial
+
+# A proven harvest over a damaged final record never replaces it and never calls it kept.
+attempt "$TDIR/home-damaged-final" 23
+mkdir -p "$HOME_DIR/rejected-captures" && chmod 700 "$HOME_DIR/rejected-captures"
+printf '{"damaged":true}' > "$RECORD" && chmod 600 "$RECORD"
+cp "$RECORD" "$TDIR/damaged-final.record"
+page false "$CONVERSATION" "$(completed_page "$(answer_271)")"
+harvest damaged-final
+check 'damaged final record: refusal exit unchanged, every handle kept, record never replaced' "$([ "$HARVEST_RC" = 6 ] && retained damaged-final && cmp -s "$TDIR/damaged-final.record" "$RECORD"; echo $?)"
+check 'damaged final record is reported as unwritten, not kept' "$(grep -Eqi 'rejected-capture record.*could not' "$TDIR/damaged-final.harvest.err" && ! grep -q 'rejected-capture record kept' "$TDIR/damaged-final.harvest.err"; echo $?)"
+decide damaged-final
+check 'damaged final record: decision keeps recovering' "$(decision_is damaged-final recover-existing-review active-work-requires-recovery; echo $?)"
 
 # ── 7. A newer live attempt for the same head is recovered, not stopped by an older rejection ───
 # The older attempt is released by the real proven supersession, so the snapshot selects the

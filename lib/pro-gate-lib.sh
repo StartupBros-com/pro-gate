@@ -1315,14 +1315,19 @@ pg_rejected_capture_write() { # marker rejection capture-file conversation-url i
   cmp -s "$capture" <(jq -j .capture <<<"$canonical" 2>/dev/null) || return 1
   pg_rejected_capture_validate "$canonical" "$marker" "$binding" || return 1
   dir="$(pg_rejected_capture_dir)"
-  # Write-once: an existing final record is the evidence, whatever this pass collected.
-  [ -f "$dir/$marker" ] && [ ! -L "$dir/$marker" ] && return 0
+  f="$dir/$marker"
+  # Write-once: an existing final record is never replaced. It stands as the evidence, whatever
+  # this pass collected, only while it still validates for this attempt; otherwise refuse loudly.
+  if [ -e "$f" ] || [ -L "$f" ]; then
+    pg_rejected_capture_read "$marker" "$binding" >/dev/null 2>&1
+    return
+  fi
   mkdir -p "$dir" 2>/dev/null || return 1
-  f="$dir/$marker"; tmp="$dir/.$marker.tmp.$$"
+  tmp="$dir/.$marker.tmp.$$"
   rm -f "$tmp" 2>/dev/null
   if (umask 077 && printf '%s' "$canonical" > "$tmp") 2>/dev/null && ln "$tmp" "$f" 2>/dev/null; then
     rc=0
-  elif [ -f "$f" ] && [ ! -L "$f" ]; then
+  elif pg_rejected_capture_read "$marker" "$binding" >/dev/null 2>&1; then
     rc=0
   fi
   rm -f "$tmp" 2>/dev/null
