@@ -78,6 +78,32 @@ check "runtime install does not duplicate skill" test ! -e "$CLAUDE1/skills/pro-
 check "runtime install does not duplicate agent" test ! -e "$CLAUDE1/agents/oracle-reviewer.md"
 check "daemon defaults off" grep -q 'daemon: 0' "$TDIR/default.log"
 
+# #286: the archive shipped bin/cdp-test-timing.mjs but install.sh never copied it, so a fresh
+# install's cdp-salvage.mjs died with ERR_MODULE_NOT_FOUND. Hosts kept working only on a leftover
+# copy from an older deploy, so these checks run on homes that have no copy, or a stale one.
+BIN_NOT_INSTALLED=""
+while IFS= read -r archived; do
+  case "$archived" in */bin/?*) ;; *) continue ;; esac
+  cmp -s "$RUNTIME1/${archived##*/}" "$ROOT/bin/${archived##*/}" || BIN_NOT_INSTALLED="$BIN_NOT_INSTALLED ${archived##*/}"
+done < "$LIST"
+[ -z "$BIN_NOT_INSTALLED" ] || echo "archived bin/ files not installed:$BIN_NOT_INSTALLED"
+check "fresh install deploys every archived bin/ file byte-for-byte" test -z "$BIN_NOT_INSTALLED"
+salvage_loads() { # runtime label: the installed salvage resolves its imports and reaches usage (exit 2)
+  local rc=0
+  node "$1/cdp-salvage.mjs" --help >"$TDIR/salvage-$2.out" 2>"$TDIR/salvage-$2.err" || rc=$?
+  [ "$rc" -eq 2 ] && grep -q '^usage: cdp-salvage.mjs ' "$TDIR/salvage-$2.err"
+}
+check "fresh install's cdp-salvage.mjs loads its imports and prints usage" salvage_loads "$RUNTIME1" fresh
+
+STALE_HOME="$TDIR/stale-timing-home"; STALE_RUNTIME="$TDIR/stale-timing-runtime"
+mkdir -p "$STALE_HOME" "$STALE_RUNTIME"
+printf '%s\n' 'export const STALE_LEFTOVER = true;' > "$STALE_RUNTIME/cdp-test-timing.mjs"
+HOME="$STALE_HOME" PRO_GATE_HOME="$STALE_RUNTIME" \
+  bash "$ROOT/install.sh" --version "$VERSION" --archive "$ARCHIVE" --checksum "$CHECKSUM" >"$TDIR/stale-timing.log" 2>&1
+check "upgrade over a stale timing module installs the archived bytes" \
+  cmp -s "$STALE_RUNTIME/cdp-test-timing.mjs" "$ROOT/bin/cdp-test-timing.mjs"
+check "upgraded cdp-salvage.mjs loads its imports and prints usage" salvage_loads "$STALE_RUNTIME" stale
+
 LOCK_HOME="$TDIR/lock-home"; LOCK_RUNTIME="$TDIR/lock-runtime"
 mkdir -p "$LOCK_HOME" "$LOCK_RUNTIME/.install.lock.d"
 if HOME="$LOCK_HOME" PRO_GATE_HOME="$LOCK_RUNTIME" PRO_GATE_BROWSER_MODE=native PRO_GATE_FORCE_PORTABLE_LOCK=1 \
@@ -431,6 +457,8 @@ chmod +x "$ROLLBACK_BIN/chmod"
 cp "$RUNTIME1/review-decision-v1.json" "$TDIR/rollback-identity.before"
 cp "$RUNTIME1/VERSION" "$TDIR/rollback-version.before"
 cp "$RUNTIME1/.deploy-stamp" "$TDIR/rollback-stamp.before"
+printf '%s\n' 'export const ROLLBACK_SENTINEL = true;' > "$RUNTIME1/cdp-test-timing.mjs"
+cp "$RUNTIME1/cdp-test-timing.mjs" "$TDIR/rollback-timing.before"
 if HOME="$HOME1" PRO_GATE_HOME="$RUNTIME1" REAL_CHMOD="$REAL_CHMOD" ROLLBACK_FAIL_TARGET="$RUNTIME1/.env" \
   PATH="$ROLLBACK_BIN:$PATH" bash "$ROOT/install.sh" --version "$VERSION" \
   --archive "$ARCHIVE" --checksum "$CHECKSUM" >"$TDIR/rollback-live.log" 2>&1; then
@@ -440,6 +468,7 @@ check "live rollback restores prior engine bytes" grep -q '^sentinel$' "$RUNTIME
 check "live rollback restores prior identity bytes" cmp -s "$RUNTIME1/review-decision-v1.json" "$TDIR/rollback-identity.before"
 check "live rollback restores prior version bytes" cmp -s "$RUNTIME1/VERSION" "$TDIR/rollback-version.before"
 check "live rollback restores prior deploy stamp" cmp -s "$RUNTIME1/.deploy-stamp" "$TDIR/rollback-stamp.before"
+check "live rollback restores the prior salvage timing module" cmp -s "$RUNTIME1/cdp-test-timing.mjs" "$TDIR/rollback-timing.before"
 
 HOME2="$TDIR/consent-home"; RUNTIME2="$TDIR/consent-runtime"; mkdir -p "$HOME2"
 if HOME="$HOME2" PRO_GATE_HOME="$RUNTIME2" PRO_GATE_BROWSER_MODE=native \
