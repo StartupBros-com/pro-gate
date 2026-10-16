@@ -311,10 +311,11 @@ put "$SOURCE_ROOT/bin/record-pro-gate-verdict.mjs" "$PRO_GATE_HOME/record-pro-ga
 put "$SOURCE_ROOT/bin/pro-gate-doctor.sh" "$PRO_GATE_HOME/pro-gate-doctor.sh"
 put "$SOURCE_ROOT/bin/pro-gate-stats.sh" "$PRO_GATE_HOME/pro-gate-stats.sh"
 put "$SOURCE_ROOT/bin/pro-gate-autoupdate.sh" "$PRO_GATE_HOME/pro-gate-autoupdate.sh"
-put "$SOURCE_ROOT/bin/cdp-salvage.mjs" "$PRO_GATE_HOME/cdp-salvage.mjs"
+# cdp-salvage.mjs imports these two modules statically, and a review can start salvage while this
+# runs, so they land first: salvage never appears without the modules it loads (#286).
 put "$SOURCE_ROOT/bin/cdp-organizer-expressions.mjs" "$PRO_GATE_HOME/cdp-organizer-expressions.mjs"
-# cdp-salvage.mjs imports this module statically; without it salvage cannot load (#286).
 put "$SOURCE_ROOT/bin/cdp-test-timing.mjs" "$PRO_GATE_HOME/cdp-test-timing.mjs"
+put "$SOURCE_ROOT/bin/cdp-salvage.mjs" "$PRO_GATE_HOME/cdp-salvage.mjs"
 for f in daemon.sh run-daemon.sh run-oracle-chrome.sh login-view.sh; do put "$SOURCE_ROOT/daemon/$f" "$PRO_GATE_HOME/$f"; done
 # Deploy verified compatibility metadata before version/stamp publication. A failed write invokes
 # cleanup rollback, so no live runtime observes a new VERSION with an old identity record.
