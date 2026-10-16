@@ -104,6 +104,27 @@ check "upgrade over a stale timing module installs the archived bytes" \
   cmp -s "$STALE_RUNTIME/cdp-test-timing.mjs" "$ROOT/bin/cdp-test-timing.mjs"
 check "upgraded cdp-salvage.mjs loads its imports and prints usage" salvage_loads "$STALE_RUNTIME" stale
 
+# A review can start salvage mid-upgrade, and Node resolves its imports at startup, so salvage
+# must load at the moment it is moved into place. The mv shim runs it right then.
+SWAP_HOME="$TDIR/swap-order-home"; SWAP_RUNTIME="$TDIR/swap-order-runtime"; SWAP_BIN="$TDIR/swap-order-bin"
+mkdir -p "$SWAP_HOME" "$SWAP_BIN"
+REAL_MV_SWAP="$(command -v mv)"
+cat > "$SWAP_BIN/mv" <<'EOF'
+#!/usr/bin/env bash
+"${REAL_MV_SWAP:?}" "$@" || exit
+for dst; do :; done
+if [ "$dst" = "${SWAP_SALVAGE:?}" ]; then
+  rc=0; node "$dst" --help >/dev/null 2>"${SWAP_SALVAGE_ERR:?}" || rc=$?
+  printf '%s\n' "$rc" > "${SWAP_SALVAGE_RC:?}"
+fi
+EOF
+chmod +x "$SWAP_BIN/mv"
+SWAP_SALVAGE="$SWAP_RUNTIME/cdp-salvage.mjs" SWAP_SALVAGE_ERR="$TDIR/salvage-swap.err" SWAP_SALVAGE_RC="$TDIR/salvage-swap.rc" \
+  REAL_MV_SWAP="$REAL_MV_SWAP" HOME="$SWAP_HOME" PRO_GATE_HOME="$SWAP_RUNTIME" PATH="$SWAP_BIN:$PATH" \
+  bash "$ROOT/install.sh" --version "$VERSION" --archive "$ARCHIVE" --checksum "$CHECKSUM" >"$TDIR/swap-order.log" 2>&1
+check "cdp-salvage.mjs loads at the moment the installer swaps it in" \
+  sh -c "test \"\$(cat '$TDIR/salvage-swap.rc' 2>/dev/null)\" = 2 && grep -q '^usage: cdp-salvage.mjs ' '$TDIR/salvage-swap.err'"
+
 LOCK_HOME="$TDIR/lock-home"; LOCK_RUNTIME="$TDIR/lock-runtime"
 mkdir -p "$LOCK_HOME" "$LOCK_RUNTIME/.install.lock.d"
 if HOME="$LOCK_HOME" PRO_GATE_HOME="$LOCK_RUNTIME" PRO_GATE_BROWSER_MODE=native PRO_GATE_FORCE_PORTABLE_LOCK=1 \
