@@ -661,6 +661,7 @@ semantics. Native mode keeps the prompt's title hint and does not run remote-CDP
 | `bin/oracle-review.sh`              | **The engine**: assembles context, runs the review, captures/salvages/harvests the verdict                          |
 | `bin/cdp-salvage.mjs`               | Marker-owned CDP salvage and conversation organizer: recover, exact-rename, archive, and local cleanup decisions    |
 | `bin/cdp-organizer-expressions.mjs` | Auditable ChatGPT UI expressions for exact rename and archive; no backend API calls                                 |
+| `bin/cdp-test-timing.mjs`           | Test-only timing override parsers that cdp-salvage.mjs imports; production keeps its own defaults                   |
 | `bin/pro-gate-doctor.sh`            | One-command setup verification (deps, versions, browser, consent)                                                   |
 | `bin/pro-gate-stats.sh`             | Ledger stats: clean rate, exits, per-PR history                                                                     |
 | `bin/pro-gate-autoupdate.sh`        | The opt-in hourly skew-follower                                                                                     |
