@@ -4931,6 +4931,108 @@ pg_review_facts_target_matches() { # input-json host owner repo pr
     <<<"$1" >/dev/null 2>&1
 }
 
+# One batch of the candidate prefilter. Prints "<index><TAB>1" for each marker that could still be
+# relevant, or "<index><TAB>0" for one the per-marker scan would skip. Ownership mirrors that scan:
+# the input binding's sole JSON object through pg_review_facts_target_matches, the sidecar's first
+# line split the way `IFS=$'\t' read` splits it (a valid sidecar's PR is that field normalized), and
+# this PR's key prefix. Bytes the scan might read differently (anything outside printable ASCII)
+# and JSON this filter cannot evaluate count as possible relevance.
+pg_review_facts_relevance_batch() { # host owner repo pr target key [--arg mN marker --rawfile iN input --rawfile sN sidecar]...
+  local host="$1" owner="$2" repo="$3" pr="$4" target="$5" key="$6"
+  shift 6
+  jq -nr --arg h "$host" --arg o "$owner" --arg r "$repo" --argjson p "$pr" --arg pr "$pr" \
+    --arg target "$target" --arg key "$key" "$@" '
+    def bound_target($s):
+      if ($s | test("^[\t\n\r ]*$")) then false
+      elif ($s | test("[^\t\n\r -~]")) then true
+      else try ($s | fromjson | if type == "object" then
+          ((.repository | with_entries(.value |= ascii_downcase))=={host:($h|ascii_downcase),owner:($o|ascii_downcase),repo:($r|ascii_downcase)} and .target.pr==$p)
+        else false end) catch true
+      end;
+    def sidecar_target($s):
+      ($s | split("\n")[0] // "") as $line
+      | if ($line | test("[^\t -~]")) then true
+        else ($line | split("\t") | map(select(. != ""))) as $f
+          | ([$f[0], $f[1], $f[2]] | map(. // "") | join("/") | ascii_downcase) == $target
+            and (($f[4] // "") | test("^0*" + $pr + "$"))
+        end;
+    $ARGS.named as $a
+    | $a | keys[] | select(test("^m[0-9]+$")) | .[1:] as $i
+    | (($a["m" + $i] | ascii_downcase | startswith("pg-run-" + $key + "-"))
+        or sidecar_target($a["s" + $i]) or bound_target($a["i" + $i])) as $need
+    | "\($i)\t\(if $need then 1 else 0 end)"'
+}
+
+# Rule out, in a few jq processes instead of about ten per marker, the markers whose validation in
+# pg_review_facts_candidates can only end in `continue` (#292). For a full-shape marker that loop
+# keeps relevance only from its input binding's target, its sidecar's attribution (valid or
+# damaged), or this PR's key prefix: a valid sidecar for another target skips it, and otherwise an
+# irrelevant marker is skipped whether its result is bound or not. So a full-shape marker with none
+# of the three is skipped here without computing bound. Every other marker is passed through,
+# including a non-full-shape name (an unbound result may keep it relevant), a binding or sidecar
+# that is a symlink, FIFO, unreadable or larger than 64 KiB, and on any failure the whole list.
+# Output keeps the sorted input order, so the candidate list is byte-identical.
+pg_review_facts_prefilter() { # host owner repo pr target key < sorted markers -> markers to validate
+  local host="$1" owner="$2" repo="$3" pr="$4" target="$5" key="$6" input_dir meta_dir dir big
+  local marker f i n=0 sent=0 out='' idx flag
+  local markers=() need=() args=() dirs=() paths=()
+  while IFS= read -r marker; do markers+=("$marker"); n=$((n + 1)); done
+  [ "$n" -gt 0 ] || return 0
+  case "$pr" in ''|*[!0-9]*) printf '%s\n' "${markers[@]}"; return 0 ;; esac
+  input_dir="$(pg_review_input_binding_dir)"; meta_dir="$(pg_run_meta_dir)"
+  for dir in "$input_dir" "$meta_dir"; do
+    if [ -e "$dir" ] || [ -L "$dir" ]; then dirs+=("$dir"); fi
+  done
+  # Bounds what one pass reads into memory, as the scan's own 64 KiB guards do.
+  big=$'\n'
+  if [ "${#dirs[@]}" -gt 0 ]; then
+    big="$big$(find -H "${dirs[@]}" -type f -size +65536c 2>/dev/null)"$'\n' || { printf '%s\n' "${markers[@]}"; return 0; }
+  fi
+  for ((i = 0; i < n; i++)); do
+    marker="${markers[i]}"; need[i]=1
+    pg_reservation_marker_ok "$marker" || continue
+    [[ "$marker" =~ ^pg-run-.+-.+-[1-9][0-9]*-[0-9]+-[0-9]+$ ]] || continue
+    case "$big" in *"/$marker"$'\n'*) continue ;; esac
+    paths=()
+    for dir in "$input_dir" "$meta_dir"; do
+      f="$dir/$marker"
+      if [ ! -e "$f" ] && [ ! -L "$f" ]; then
+        paths+=(/dev/null)
+      elif [ -f "$f" ] && [ ! -L "$f" ] && [ -r "$f" ]; then
+        paths+=("$f")
+      else
+        break
+      fi
+    done
+    [ "${#paths[@]}" -eq 2 ] || continue
+    need[i]=''
+    args+=(--arg "m$i" "$marker" --rawfile "i$i" "${paths[0]}" --rawfile "s$i" "${paths[1]}")
+    sent=$((sent + 1))
+    if [ "$sent" -eq 200 ]; then
+      out="$out$(pg_review_facts_relevance_batch "$host" "$owner" "$repo" "$pr" "$target" "$key" "${args[@]}")"$'\n' \
+        || { printf '%s\n' "${markers[@]}"; return 0; }
+      args=(); sent=0
+    fi
+  done
+  if [ "$sent" -gt 0 ]; then
+    out="$out$(pg_review_facts_relevance_batch "$host" "$owner" "$repo" "$pr" "$target" "$key" "${args[@]}")"$'\n' \
+      || { printf '%s\n' "${markers[@]}"; return 0; }
+  fi
+  # Every marker sent must be answered exactly once, or nothing is ruled out.
+  while IFS=$'\t' read -r idx flag; do
+    [ -n "$idx$flag" ] || continue
+    case "$idx" in ''|*[!0-9]*) printf '%s\n' "${markers[@]}"; return 0 ;; esac
+    if [ "$idx" -ge "$n" ] || [ -n "${need[idx]}" ]; then printf '%s\n' "${markers[@]}"; return 0; fi
+    case "$flag" in 0|1) need[idx]="$flag" ;; *) printf '%s\n' "${markers[@]}"; return 0 ;; esac
+  done <<<"$out"
+  for ((i = 0; i < n; i++)); do
+    [ -n "${need[i]}" ] || { printf '%s\n' "${markers[@]}"; return 0; }
+  done
+  for ((i = 0; i < n; i++)); do
+    [ "${need[i]}" = 0 ] || printf '%s\n' "${markers[i]}"
+  done
+}
+
 # Discover completion records before validating acceptance. Attribution metadata and the marker's
 # PR key establish possible relevance only; they never supply a verdict or counts. Missing/corrupt
 # input siblings can therefore obstruct an older accepted review instead of disappearing in a scan.
@@ -5016,7 +5118,7 @@ pg_review_facts_candidates() { # host owner repo pr -> candidate metadata JSON
         esac
         printf '%s\n' "$marker"
       done
-    done | LC_ALL=C sort -u
+    done | LC_ALL=C sort -u | pg_review_facts_prefilter "$host" "$owner" "$repo" "$pr" "$target" "$key"
   )
   printf '%s' "$candidates"
 }
