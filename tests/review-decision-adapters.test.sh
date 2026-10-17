@@ -40,7 +40,8 @@ validate_contract_and_corpus() { # contract corpus
     (.reasons | index("account-cooldown-active") != null) and
     (.reasons | index("delivery-failed-unchanged") != null) and
     (.reasons | index("delivery-state-unavailable") != null) and
-    (.reasons | index("template-verdict") != null)
+    (.reasons | index("template-verdict") != null) and
+    (.reasons | index("rejected-capture") != null)
   ' "$contract" >/dev/null || return 1
 
   jq -e --slurpfile contract "$contract" '
@@ -48,13 +49,17 @@ validate_contract_and_corpus() { # contract corpus
     (.base_facts | keys | sort) == ["active_index","completed_results","cooldown","deferred_count","deferred_findings","delivery","evidence","governor","input","named_choice","observation","open_blocking","prior_review","reservation","target","transport"] and
     .base_facts.transport == "review-decision/v1" and
     ([.. | objects | keys[] | select(. == "status" or . == "next_action")] | length == 0) and
-    (.cases | length == 22) and
+    (.cases | length == 27) and
     ([.cases[].expected.action] | unique | sort) == ([$contract[0].action_effects[].action] | sort) and
     ([.cases[] | select(.expected.action != .expected.effect)] | length == 0) and
     ([.cases[] | select(.expected.execution_class == "named-product-choice") | .expected.action] == ["ask-named-product-choice"]) and
-    ([.cases[] | select(.expected.execution_class != "named-product-choice") | .expected.action] | length == 21) and
+    ([.cases[] | select(.expected.execution_class != "named-product-choice") | .expected.action] | length == 26) and
     any(.cases[]; .expected.action == "stop-without-new-review" and .expected.reason == "template-verdict" and
       any(.patch.completed_results[]?; .shape == "template-verdict" and .applicable == false)) and
+    any(.cases[]; .expected.action == "stop-without-new-review" and .expected.reason == "rejected-capture" and
+      any(.patch.completed_results[]?; .shape == "rejected-capture" and .applicable == false)) and
+    any(.cases[]; .expected.action == "recover-existing-review" and .patch.reservation.state == "live" and
+      any(.patch.completed_results[]?; .shape == "rejected-capture" and .marker != .patch.reservation.marker)) and
     any(.cases[]; .expected.reason == "account-cooldown-active" and .patch.cooldown.active == true) and
     (.base_facts.cooldown == {active:false,seconds_remaining:0}) and
     (.base_facts.delivery == {failed_unchanged:0,override:false,state:"known"}) and
