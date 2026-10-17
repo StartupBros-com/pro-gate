@@ -51,7 +51,9 @@ with reason `fix-first-deferred-p2-only`. Its facts include `open_blocking: 0`,
 Each block is bounded to 1,024 characters, including any `… [truncated N chars]` marker.
 Unsupported blocking severity forms leave counts unavailable and require a fix. A standalone
 `P0` or `P1` line counts the explicit same-severity `[Pn]` findings that follow it after optional
-blank lines; an empty section, prose, a fence or another severity leaves counts unavailable. A FIX-FIRST
+blank lines; an empty section, prose, a fence, another severity, or an unbracketed `path:line` line after a
+`RESOLVED` finding there leaves counts unavailable. A reopen marker anywhere in a finding, its `RESOLVED`
+headline included, keeps it open. A FIX-FIRST
 with zero blockers and no deferred findings requires a re-review with reason `fix-first-without-findings`.
 Any open P0/P1 still requires a fix; `rounds-not-converging` preempts both paths.
 

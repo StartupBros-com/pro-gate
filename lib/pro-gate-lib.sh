@@ -3164,6 +3164,10 @@ pg_review_finding_summary() {
       end | .severity |= ascii_upcase;
     def none_declaration:
       test("^(?:none|—|-)[.!]?\\s*$";"i");
+    def resolved_headline:
+      test("^\\S+\\s+(?:—|--|-)\\s+RESOLVED([^_[:alnum:]]|$)");
+    def path_anchor:
+      test("^(?:\\*\\*|__|`)?[^\\s`*:]+:[0-9]+([^0-9]|$)");
     def explicit_finding($severity):
       test("^(?:\\*\\*|__)?\\[") and
         (([headline] | first // null) as $finding |
@@ -3194,13 +3198,14 @@ pg_review_finding_summary() {
         $text[:1024-($marker|length)] + $marker
       end;
     reduce (split("\n")[] | sub("\r$";"")) as $line
-      ({blocks:[],current:null,unknown:false,fence:null,pending:null};
+      ({blocks:[],current:null,unknown:false,fence:null,pending:null,standalone:null};
        ($line|normalized) as $normal |
        # A standalone P0/P1 label resolves at the next non-blank line: only an explicit
        # same-severity [Pn] finding keeps counts available, and that line then parses normally.
+       # .standalone holds that severity while further same-severity findings continue the section.
        (if .pending==null or ($line|test("^\\s*$")) then .
         else .pending as $severity |
-          (if ($normal|explicit_finding($severity)) then . else .unknown=true end) | .pending=null
+          (if ($normal|explicit_finding($severity)) then .standalone=$severity else .unknown=true end) | .pending=null
         end) |
        if .fence!=null then
          (if .current!=null then .current.lines += [$line] else . end) |
@@ -3214,11 +3219,13 @@ pg_review_finding_summary() {
          ([$normal | if $heading then sub("^#{1,6}\\s+";"") else . end | headline] | first // null) as $head |
          ([$normal|unsupported_label] | first // null) as $unsupported |
          if $heading and $head==null then
-           flush | .unknown=(.unknown or ($unsupported|IN("P0","P1")))
+           flush | .standalone=null | .unknown=(.unknown or ($unsupported|IN("P0","P1")))
          elif $heading and ($head.text|section_text or none_declaration) then
-           flush | .current={severity:$head.severity,lines:[],section:true}
+           flush | .standalone=null | .current={severity:$head.severity,lines:[],section:true}
          elif $head!=null then
            flush |
+           .standalone as $section |
+           (if $section!=null and ($normal|explicit_finding($section)) then . else .standalone=null end) |
            if ($head.text|test("^\\s*$")) then
              if ($head.severity|IN("P0","P1")|not) then .
              elif ($line|test("^\\s*[Pp][01]\\s*$")) then .pending=$head.severity
@@ -3227,18 +3234,24 @@ pg_review_finding_summary() {
            else .current={severity:$head.severity,lines:[$head.text]} end
          elif $unsupported!=null then
            # Quoted labels end the preceding block without becoming live findings.
-           flush | .unknown=(.unknown or ($unsupported|IN("P0","P1")))
+           flush | .standalone=null | .unknown=(.unknown or ($unsupported|IN("P0","P1")))
          elif .current!=null and ($normal|test("^Correction\\s*:";"i")) then
            .current.lines += [$line]
          elif ($normal|test("^(?:(?:\\*\\*|__)?(?:VERDICT|CHOICE)(?:\\*\\*|__)?\\s*:|[A-Za-z][A-Za-z -]*:\\s*$)";"i")) then
-           flush
-         elif .current!=null then .current.lines += [$line]
+           flush | .standalone=null
+         elif .current!=null then
+           # Under a standalone label, an unbracketed path:line line after a RESOLVED finding has
+           # no severity of its own; folding it into the resolved block could hide a blocker.
+           (if .standalone!=null and (.current.lines[0]|resolved_headline) and ($normal|path_anchor)
+            then .unknown=true else . end) |
+           .current.lines += [$line]
          else . end
        end) |
     flush | .unknown=(.unknown or .fence!=null or .pending!=null) |
+    # A reopen marker anywhere in the block, the RESOLVED headline included, keeps it open.
     [.blocks[] | select(.severity|IN("P0","P1")) |
-      select((.lines[0]|test("^\\S+\\s+(?:—|--|-)\\s+RESOLVED([^_[:alnum:]]|$)"))==false or
-        (.lines[1:]|join("\n")|test("(^|[^_[:alnum:]])(?:STILL-PRESENT|REOPENED|NOT\\s+RESOLVED|NOT\\s+FIXED)([^_[:alnum:]]|$)|Correction\\s*:";"i")))] as $open |
+      select((.lines[0]|resolved_headline|not) or
+        (.lines|join("\n")|test("(^|[^_[:alnum:]])(?:STILL-PRESENT|REOPENED|NOT\\s+RESOLVED|NOT\\s+FIXED)([^_[:alnum:]]|$)|Correction\\s*:";"i")))] as $open |
     {open_p0:(if .unknown then null else [$open[]|select(.severity=="P0")]|length end),
      open_p1:(if .unknown then null else [$open[]|select(.severity=="P1")]|length end),
      deferred_findings:[.blocks[]|select(.severity|IN("P2","P3"))|

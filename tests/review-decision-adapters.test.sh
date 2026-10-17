@@ -548,6 +548,16 @@ for label in 'P1:' '**P1**' '[P1]' '- P1'; do
   direct_review_case "#291 decorated empty label $label keeps counts unavailable before a finding" \
     "$label"$'\n\n[P1] a.sh:1 — bug\nVERDICT: FIX-FIRST\n' "$UNAVAILABLE_PREDICATE"
 done
+# PR #296 round 1: the stop-merge consumer reads these counts as authority, so neither shape
+# that main left unavailable may become a zero. A reopen marker on the RESOLVED headline itself
+# keeps the finding open; an unbracketed anchored line after a resolved finding in a standalone
+# section has no severity of its own, so the counts stay unavailable.
+direct_review_case '#296 a reopen marker on the RESOLVED headline keeps a standalone-section finding open' \
+  "$(printf '%s\n' 'P0: none' 'P1' '[P1] a.sh:1 — RESOLVED — partial patch; NOT RESOLVED, race remains' '[P2] docs.md:1 — minor' 'VERDICT: FIX-FIRST')" \
+  "$BLOCKING_PREDICATE and .facts.deferred_count==1"
+direct_review_case '#296 an unbracketed anchored line after a resolved standalone-section finding leaves counts unavailable' \
+  "$(printf '%s\n' 'P0: none' '' 'P1' '' '[P1] a.sh:1 — RESOLVED' 'b.sh:2 — new crash on empty input' '' 'VERDICT: FIX-FIRST')" \
+  "$UNAVAILABLE_PREDICATE"
 
 # PR #276 round 3 repair: section vocabulary can also title a real finding, and an
 # unparseable blocking heading must not turn unknown counts into known zeroes.
