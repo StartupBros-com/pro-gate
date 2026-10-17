@@ -160,6 +160,12 @@ const POLL_MS = TEST_TIMING_ENABLED ? (parseTestPollMs(process.env.PRO_GATE_TEST
 const RENDER_SAMPLE_MS = TEST_TIMING_ENABLED
   ? (parseTestRenderSampleMs(process.env.PRO_GATE_TEST_RENDER_SAMPLE_MS) ?? 2_500)
   : 2_500;
+// #271: the completion proof's one confirmation re-read. It reuses the render-sample parser on
+// purpose: that parser's bounds (50..2500) top out at this production literal, so the test
+// override can only shorten the wait, and installed runtimes need no new cdp-test-timing export.
+const COMPLETION_CONFIRM_MS = TEST_TIMING_ENABLED
+  ? (parseTestRenderSampleMs(process.env.PRO_GATE_TEST_COMPLETION_CONFIRM_MS) ?? 2_500)
+  : 2_500;
 
 // #216 gate r1 P2: every PRO_GATE_* path override this file reads has a shell twin spelled
 // "${VAR:-<default>}" (pro-gate-lib.sh: PRO_GATE_HOME line 6, pg_cooldown_active,
@@ -1377,7 +1383,45 @@ async function tabText(tab) {
   if (typeof result.value === 'string') return result.value;
   if (typeof result.value?.text !== 'string') return null;
   if (result.value.promptAt === 0) scopedResponses.add(result.value.text);
+  noteResponseScope(result.value.text, result.value.scope);
   return result.value.text;
+}
+
+// #271: per-text response-scope memory for the completion proof (see readReviewText's scope).
+// A text read once unproven, or proven under a different URL, stays unproven for the rest of
+// this invocation: the proof needs every sighting of those exact bytes to agree. Keyed by the
+// text's SHA-256 so a long salvage does not retain one full response body per poll.
+const responseScopes = new Map();   // sha256(text) -> { proven, href }
+const responseScopeKey = (text) => createHash('sha256').update(text).digest('hex');
+const responseScopeProven = (scope) => scope?.following === 1 && scope.assistantLast === true
+  && scope.finished === true && scope.generating === false && typeof scope.href === 'string';
+function noteResponseScope(text, scope) {
+  const key = responseScopeKey(text);
+  const seen = responseScopes.get(key);
+  if (seen && !seen.proven) return;   // already poisoned for this invocation
+  if (!responseScopeProven(scope) || (seen && seen.href !== scope.href)) {
+    responseScopes.set(key, { proven: false, href: null });
+  } else if (!seen) {
+    responseScopes.set(key, { proven: true, href: scope.href });
+  }
+}
+
+// #271: the bytes about to be printed came from this live readable tab, whose latest marked
+// prompt has exactly one finished assistant response, and one re-read after
+// COMPLETION_CONFIRM_MS still shows the same text, scope and conversation. The line names the
+// SHA-256 of the exact stdout bytes (console.log appends one newline). Live-tab exits only:
+// scratch, seeded, revalidation and probe sources never prove completion.
+async function completionProof(tab, text, printed) {
+  if (probe || typeof text !== 'string' || typeof printed !== 'string') return null;
+  const proven = () => {
+    const scope = responseScopes.get(responseScopeKey(text));
+    return scope?.proven === true && scope.href === tab.url && conversationUrlOk(tab.url)
+      && (!knownUrl || knownUrl === tab.url);
+  };
+  if (!proven()) return null;
+  await sleep(COMPLETION_CONFIRM_MS);
+  if (await tabText(tab) !== text || !proven()) return null;
+  return `completion-proof ${createHash('sha256').update(`${printed}\n`).digest('hex')} ${tab.url}`;
 }
 
 async function tabTerminalInfrastructure(tab) {
@@ -2187,6 +2231,7 @@ function terminalInfrastructureAfterPrompt(text, structuredError = null) {
 }
 
 let templateReview = null;
+let templateSource = null;   // #271: { tab, text, review } of the live tab behind templateReview
 function classifyEvidence(text, structuredError = null, throttleModal = null) {
   if (!text || !text.trim()) return { kind: 'inconclusive', reason: 'empty-text' };
   // hashText (#208) is what an unowned trip fingerprints to recognize a repeat sighting of the
@@ -2313,7 +2358,7 @@ function rememberInconclusiveReadableSource(url) {
   knownUrl = url;
 }
 
-function emitEvidence(url, evidence) {
+function emitEvidence(url, evidence, proof = null) {
   if (probe) {
     console.error(`live conversation: ${url}`);
     console.error(`evidence-kind: ${evidence.kind}`);
@@ -2337,6 +2382,8 @@ function emitEvidence(url, evidence) {
     console.error(`matched-url ${url}`);
     // Chronology the engine cannot see: this block predates the prompt below it (#166 gate r3 P1).
     if (evidence.precedesPrompt) console.error('answer-chronology precedes-prompt');
+    // #271: only the live readable-tab caller passes a proof, computed over the line below.
+    if (proof && !evidence.precedesPrompt) console.error(proof);
     console.log(evidence.review);
     process.exit(0);
   }
@@ -2495,13 +2542,17 @@ while (Date.now() < deadline) {
       continue;
     }
     const evidence = classifyEvidence(text, infrastructureError);
+    // #271: the live tab whose text produced the current template bytes, for the deadline proof.
+    templateSource = evidence.reason === 'template-verdict' ? { tab, text, review: templateReview } : null;
     if (evidence.kind === 'cross-bound') {
       rejectCrossBound(tab.url, evidence.foreignMarker, 'tab');
       continue;
     }
     if (evidence.kind === 'terminal' || evidence.kind === 'terminal-infrastructure') {
+      // #271: confirm before onOurConversation can rewrite the remembered URL to this tab.
+      const proof = evidence.kind === 'terminal' ? await completionProof(tab, text, evidence.review) : null;
       onOurConversation(tab.url, evidence);
-      emitEvidence(tab.url, evidence);
+      emitEvidence(tab.url, evidence, proof);
     }
     if (evidence.kind !== 'owned-incomplete') continue;
     stillGeneratingUrl = tab.url;
@@ -2711,8 +2762,13 @@ if (!probe && stillGeneratingUrl && !lastMatchWasSeeded) {
 const liveUrl = stillGeneratingUrl || seededLiveUrl;
 if (!probe && liveUrl) {
   if (templateReview !== null) {
+    // #271: prove only bytes the still-live readable tab produced, never a scratch or seeded render.
+    const proof = templateSource && templateSource.review === templateReview && !lastMatchWasSeeded
+      && stillGeneratingUrl === templateSource.tab.url
+      ? await completionProof(templateSource.tab, templateSource.text, templateReview) : null;
     console.error('evidence-kind: template-verdict');
     console.error(`template-verdict: no assistant paragraph beyond the verdict block after ${timeoutSecs}s`);
+    if (proof) console.error(proof);
     console.log(templateReview);
     process.exit(6);
   }
