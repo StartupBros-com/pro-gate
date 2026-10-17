@@ -2289,6 +2289,15 @@ gc_seed "$(date +%s)" "$(( $(date +%s) - 1000 ))" generating
 check '#273 a recent generating holder keeps its slot' "$([ "$(avail 1)" = 0 ] && [ "$(holding)" = 1 ]; echo $?)" "available=$(avail 1) holding=$(holding)"
 GC_REPORT="$(PRO_GATE_HOME="$TDIR/home2" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_report_capacity_holders 1" 2>&1)"
 check '#273 the holder report still names a recent holder' "$(printf '%s' "$GC_REPORT" | grep -Fq '  pg-run-a-1-1  [k1] generating'; echo $?)" "$GC_REPORT"
+# The report reads the same predicate, so a record it cannot read a lifecycle from stays named
+# however old: a legacy record with no state and one with an unknown state.
+printf 'k2\to2\t100\t0\t1\n' > "$TDIR/home2/in-progress/pg-run-b-1-1"
+printf 'k3\to3\t100\t0\t1\tGPT-X\t100\twhatever\n' > "$TDIR/home2/in-progress/pg-run-c-1-1"
+GC_REPORT="$(PRO_GATE_HOME="$TDIR/home2" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_report_capacity_holders 1" 2>&1)"
+check '#273 the holder report still names legacy and unknown-state holders however old' \
+  "$(printf '%s' "$GC_REPORT" | grep -Fq '— 3 held by in-progress reservation(s)' \
+     && printf '%s' "$GC_REPORT" | grep -Fq '  pg-run-b-1-1  [k2] generating' \
+     && printf '%s' "$GC_REPORT" | grep -Fq '  pg-run-c-1-1  [k3] generating'; echo $?)" "$GC_REPORT"
 rm -rf "$TDIR/home2"
 
 echo '# slot exclusion prevents overbooking through a freed lower slot'
@@ -10475,6 +10484,31 @@ check '#273 a holder charged inside the generation ceiling still blocks the queu
      && [ "$(slotwait_state "$SW_RECENT_HOME" "$SW_RECENT_MARKER")" = generating ] \
      && grep -Fq "  $SW_RECENT_MARKER  [$SUPER_KEY] generating" "$TDIR/slotwait.stderr"; echo $?)" \
   "$(slotwait_detail "$SW_RECENT_HOME" "$SW_RECENT_MARKER")"
+# A past-ceiling holder whose PR has merged is still superseded when a sweep runs, and a sweep runs
+# only while something blocks the queued run: here a recent holder on the same merged PR. Only the
+# holder that held the slot may be logged as releasing it; the stale one held none, and both keep
+# their charge.
+SW_PAIR_HOME="$TDIR/home-slotwait-ceiling-pair"
+SW_PAIR_STALE_EPOCH="$(( $(date +%s) - 11000 ))"
+SW_PAIR_STALE="pg-run-acme-fresh-77-${SW_PAIR_STALE_EPOCH}-1"
+SW_PAIR_LIVE_EPOCH="$(( $(date +%s) - 1000 ))"
+SW_PAIR_LIVE="pg-run-acme-fresh-77-${SW_PAIR_LIVE_EPOCH}-1"
+super_seed "$SW_PAIR_HOME" "$SW_PAIR_STALE" "$SW_PAIR_STALE_EPOCH" "$FRESH_HEAD"
+super_seed "$SW_PAIR_HOME" "$SW_PAIR_LIVE" "$SW_PAIR_LIVE_EPOCH" "$FRESH_HEAD"
+SW_GEN_CEILING=10800 slotwait_run "$SW_PAIR_HOME" 20 MERGED "$FRESH_HEAD"
+check '#273 the sweep supersedes a past-ceiling holder without claiming it freed a slot' \
+  "$([ "$RC" -eq 0 ] && [ -s "$SW_PAIR_HOME/waiter.md" ] \
+     && [ "$(slotwait_state "$SW_PAIR_HOME" "$SW_PAIR_STALE")" = superseded ] \
+     && slotwait_ledgered "$SW_PAIR_HOME" "$SW_PAIR_STALE" "pr-merged:$FRESH_HEAD" \
+     && grep -Fq "superseded $SW_PAIR_STALE: pr-merged:$FRESH_HEAD, so its review no longer applies; it was already past the generation ceiling and held no slot" "$TDIR/slotwait.stderr" \
+     && ! grep -Fq "released the account slot held by $SW_PAIR_STALE" "$TDIR/slotwait.stderr" \
+     && [ "$(awk -F'\t' 'NR==1{print $7}' "$SW_PAIR_HOME/in-progress/$SW_PAIR_STALE")" = "$SW_PAIR_STALE_EPOCH" ]; echo $?)" \
+  "$(slotwait_detail "$SW_PAIR_HOME" "$SW_PAIR_STALE")"
+check '#273 the recent holder on the same sweep is the one logged as releasing the slot' \
+  "$([ "$(slotwait_state "$SW_PAIR_HOME" "$SW_PAIR_LIVE")" = superseded ] \
+     && grep -Fq "released the account slot held by $SW_PAIR_LIVE: pr-merged:$FRESH_HEAD" "$TDIR/slotwait.stderr" \
+     && ! grep -Fq "superseded $SW_PAIR_LIVE: " "$TDIR/slotwait.stderr"; echo $?)" \
+  "$(slotwait_detail "$SW_PAIR_HOME" "$SW_PAIR_LIVE")"
 
 # A holder's PR that merges while the run is already waiting is released on a later sweep. This gh
 # answers the proof's read OPEN at the bound head the first time and MERGED from the second.
