@@ -256,5 +256,25 @@ REVIEW
 )"; rc=$?
 check 'pure open severity preserves status position, case and governor accounting' "$rc" "$result"
 
+# #291: a standalone P1 label resolved by its finding has counts, so the completed round records
+# .last and .hist; an empty standalone section still has none and leaves both untouched.
+result="$(
+  clear_policy
+  PRO_GATE_HOME="$TDIR/standalone"
+  review="$PRO_GATE_HOME/review"
+  seed standalone 1 clean
+  printf 'P0: none\n\nP1\n\n[P1] f:75 — concurrent inserts race\n\nP2\n\nP2: none\n\nVERDICT: FIX-FIRST\n' > "$review"
+  pg_round_note_severity standalone "$review"
+  [ "$(pg_round_last_severity standalone)" = '0 1' ] || exit 1
+  [ "$(cut -f2-6 "$PRO_GATE_HOME/rounds/standalone.hist" | tail -n 1)" = $'FIX-FIRST\t0\t1\t0\t0' ] || exit 1
+  [ "$(grep -c . "$PRO_GATE_HOME/rounds/standalone.hist")" -eq 4 ] || exit 1
+  seed empty 1 clean
+  printf 'P0: none\n\nP1\n\nP2: none\n\nVERDICT: FIX-FIRST\n' > "$review"
+  before="$(sha256sum "$PRO_GATE_HOME/rounds/empty.hist")"
+  pg_round_note_severity empty "$review"
+  [ ! -e "$PRO_GATE_HOME/rounds/empty.last" ] && [ "$before" = "$(sha256sum "$PRO_GATE_HOME/rounds/empty.hist")" ]
+)"; rc=$?
+check '#291 a resolved standalone label records round severity; an empty one still skips history' "$rc" "$result"
+
 printf '%s failures\n' "$FAILURES"
 [ "$FAILURES" -eq 0 ]
