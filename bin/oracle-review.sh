@@ -506,15 +506,20 @@ pg_review_decision_choice_selection_read() { # file -> canonical {selected_id,sn
   printf '%s' "$canonical"
 }
 
-pg_review_decision_shape_rejection_fact() { # marker artifact input-binding -> normalized candidate
-  local marker="$1" artifact="$2" binding="$3" digest
-  digest="$(pg_sha256 "$artifact")" || return 1
-  jq -cnS --arg marker "$marker" --arg digest "$digest" \
+pg_review_decision_rejected_fact() { # marker artifact-digest input-binding shape -> normalized candidate
+  local marker="$1" digest="$2" binding="$3" shape="$4"
+  jq -cnS --arg marker "$marker" --arg digest "$digest" --arg shape "$shape" \
     --argjson epoch "$(jq -r .charged_spend_epoch <<<"$binding")" \
     --arg mode "$(pg_review_decision_result_mode "$binding")" '
     {applicable:false,artifact_digest:$digest,bindable:false,binding_valid:false,
      canonical_identity:$marker,charged_spend_epoch:$epoch,collected:true,evidence_mode:$mode,
-     legacy:false,marker:$marker,provenance_valid:false,shape:"template-verdict",verdict:"NONE"}'
+     legacy:false,marker:$marker,provenance_valid:false,shape:$shape,verdict:"NONE"}'
+}
+
+pg_review_decision_shape_rejection_fact() { # marker artifact input-binding -> normalized candidate
+  local digest
+  digest="$(pg_sha256 "$2")" || return 1
+  pg_review_decision_rejected_fact "$1" "$digest" "$3" template-verdict
 }
 
 pg_review_decision_cli() {
@@ -526,7 +531,7 @@ pg_review_decision_cli() {
   local facts governor_facts decision effect_ok=false prospective exact_inputs='[]' choice_candidates='[]' choice_outcomes='[]' choice_selected="" choice_snapshot="" selection="" selection_supplied=false current_verdict=NONE current_canonical="" effect_input attempt_snapshot attempt_source
   local delivery_relation delivery_facts accepted accepted_rc
   local finding_candidates='[]' finding_summary
-  local pr_evidence="" legacy_pr_identity=false
+  local pr_evidence="" legacy_pr_identity=false rejected_digest
 
   pg_have jq || { echo 'ERROR: review-decision/v1 requires jq' >&2; return 2; }
   repo="${REPO:-$(pwd)}"
@@ -619,6 +624,16 @@ pg_review_decision_cli() {
       elif [ -f "$PRO_GATE_HOME/pending/$marker" ] && [ ! -L "$PRO_GATE_HOME/pending/$marker" ] && pg_is_review "$PRO_GATE_HOME/pending/$marker"; then
         artifact="$PRO_GATE_HOME/pending/$marker"
       fi
+    fi
+
+    # #271: with no completed or pending bytes, a valid write-once rejected-capture record names
+    # this attempt's proven completion that failed validation. It supplies no accepted authority;
+    # any completed or pending artifact for the marker takes precedence and the record is unread.
+    if [ "$exact" = true ] && [ -z "$artifact" ] \
+       && rejected_digest="$(pg_rejected_capture_read "$marker" "$candidate" 2>/dev/null)"; then
+      completed="$(jq -cS --argjson rejected "$(pg_review_decision_rejected_fact "$marker" "$rejected_digest" "$candidate" rejected-capture)" \
+        '. + [$rejected]' <<<"$completed")" || return 2
+      continue
     fi
 
     if [ -n "$artifact" ] && [ -n "$(pg_capture_foreign_echo "$artifact" "$marker")" ]; then
@@ -3001,8 +3016,38 @@ if [ -n "$HARVEST_MARKER" ]; then
   esac
   echo "[oracle-review] harvesting in-progress review (marker ${RUN_MARKER}, up to ${HARVEST_SECS}s, no new slot spent)..." >&2
   pg_status salvaging "harvest up to ${HARVEST_SECS}s"
-  harvest_preserve_capture() { # aside message detail [provenance]
-    local aside="$1" message="$2" detail="$3" class="${4:-retryable}" res_key ttl_miss
+  # #271: salvage's completion proof names the SHA-256 of the exact bytes it printed and the live
+  # conversation they came from. It counts only while every fact agrees with what this harvest
+  # read; otherwise HARVEST_PROOF stays empty and nothing below records.
+  harvest_completion_proof() { # salvage stderr file -> proven conversation URL
+    local err="$1" line digest url memo
+    [ "$(grep -c '^completion-proof ' "$err" 2>/dev/null)" = 1 ] || return 1
+    line="$(grep '^completion-proof ' "$err")"
+    [[ "$line" =~ ^completion-proof\ ([0-9a-f]{64})\ ([^[:space:]]+)$ ]] || return 1
+    # Copy the groups out first: pg_conversation_url_ok's own match replaces BASH_REMATCH.
+    digest="${BASH_REMATCH[1]}" url="${BASH_REMATCH[2]}"
+    [ "$digest" = "$(pg_sha256 "$HARVEST_TMP")" ] || return 1
+    pg_conversation_url_ok "$url" || return 1
+    [ -z "${HARVEST_URL:-}" ] || [ "$url" = "$HARVEST_URL" ] || return 1
+    memo="$PRO_GATE_HOME/conversation-urls/$RUN_MARKER"
+    if [ -e "$memo" ] || [ -L "$memo" ]; then
+      [ "$(pg_memo_read "$memo" 2>/dev/null)" = "$url" ] || return 1
+    fi
+    pg_review_input_binding_read "$RUN_MARKER" >/dev/null 2>&1 || return 1
+    printf '%s' "$url"
+  }
+  # #271: retain a proven completion that failed validation as write-once evidence for the next
+  # decision's typed stop. Exits, reservation, charge and bindings are untouched either way.
+  harvest_record_rejected_capture() { # rejection retained-bytes
+    [ -n "$HARVEST_PROOF" ] && [ -s "${2:-}" ] || return 0
+    if pg_rejected_capture_write "$RUN_MARKER" "$1" "$2" "$HARVEST_PROOF" "$(pg_review_input_binding_read "$RUN_MARKER" 2>/dev/null)"; then
+      echo "[oracle-review] rejected-capture record kept at $(pg_rejected_capture_dir)/$RUN_MARKER: a completed response that failed validation; never accepted, and the next review decision stops instead of recovering." >&2
+    else
+      echo "ERROR: rejected-capture record could not be written for $RUN_MARKER; the capture stays at $2 and recovery state is unchanged." >&2
+    fi
+  }
+  harvest_preserve_capture() { # aside message detail [class] [rejected-capture rejection]
+    local aside="$1" message="$2" detail="$3" class="${4:-retryable}" record="${5:-}" res_key ttl_miss
     [ "$class" != provenance ] || PG_PRESERVE_STATE=1
     if ! mv "$HARVEST_TMP" "$aside"; then
       PG_PRESERVE_STATE=1; PG_KEEP_FINAL=1; PG_FINAL_SRC="$HARVEST_TMP"
@@ -3032,6 +3077,7 @@ if [ -n "$HARVEST_MARKER" ]; then
       fi
       echo "[oracle-review] past-TTL recovery remains fail-closed until confirmed marker misses reach the threshold (${ttl_miss})." >&2
     fi
+    [ -z "$record" ] || harvest_record_rejected_capture "$record" "$aside"
     echo "$message" >&2
     pg_status in-progress "$detail"
     pg_finish 9
@@ -3049,6 +3095,7 @@ if [ -n "$HARVEST_MARKER" ]; then
   # (pg_salvage_class_write; observation only, never a lifecycle input).
   HARVEST_KIND="$(sed -n 's/^evidence-kind: //p' "$HARVEST_TMP.err" 2>/dev/null | tail -1)"
   [ -z "$HARVEST_KIND" ] || pg_salvage_class_write "$RUN_MARKER" "$HARVEST_KIND" 2>/dev/null || true
+  HARVEST_PROOF="$(harvest_completion_proof "$HARVEST_TMP.err" 2>/dev/null || true)"
   rm -f "$HARVEST_TMP.err"
   if [ "$HARVEST_RC" -eq 0 ] && pg_is_review "$HARVEST_TMP"; then
     # v0.28 (#48/#55): provenance before acceptance, positive binding first. A capture whose
@@ -3079,7 +3126,7 @@ if [ -n "$HARVEST_MARKER" ]; then
       # independent of manifest/sidecar persistence (r4 P1): missing metadata fails CLOSED.
       harvest_preserve_capture "$OUT.unbound.$$" \
         "ERROR: harvested a complete review that cannot be bound to this run (no run-marker echo — possibly an older answer while the current one is still generating). Reservation and candidate kept. Retry --harvest; inspect $OUT.unbound.$$; PRO_GATE_REQUIRE_NONCE=0 accepts best-effort captures." \
-        "harvested review unbindable (no nonce echo); reservation kept, retry"
+        "harvested review unbindable (no nonce echo); reservation kept, retry" retryable unbound
     elif [ -s "$HARVEST_MANIFEST" ] && ! pg_review_matches_change "$HARVEST_TMP" "$HARVEST_MANIFEST"; then
       # Legacy mode (REQUIRE_NONCE=0): path overlap is authoritative, so a zero-overlap
       # capture IS foreign here — blacklist its exact source and rescan.
@@ -3101,7 +3148,12 @@ if [ -n "$HARVEST_MARKER" ]; then
     # Only now—after structural, nonce, and provenance acceptance—may the exact CDP source URL
     # narrow finalization. A merely observed candidate never gains mutation authority.
     PG_ACCEPTED_URL="${HARVEST_URL:-}"
-    pg_require_review_shape "$HARVEST_TMP"
+    # pg_require_review_shape's refusal, plus #271's proven-completion record (harvest only).
+    if ! pg_check_review_shape "$HARVEST_TMP"; then
+      harvest_record_rejected_capture template-verdict "${PG_REJECTED_CAPTURE:-}"
+      pg_status failed "template-verdict: review names nothing from the reviewed diff"
+      pg_finish 6
+    fi
     pg_strip_nonce "$HARVEST_TMP" "$RUN_MARKER"
     # Private verified snapshot is the authoritative return (gate #54 r6): $OUT is
     # publication only — a concurrent marker sharing the caller's --out cannot change what
@@ -3133,7 +3185,7 @@ if [ -n "$HARVEST_MARKER" ]; then
   HARVEST_KEEP=""
   if [ "$HARVEST_RC" -eq 6 ] && [ -s "$HARVEST_TMP" ]; then
     SALVAGED=1
-    pg_check_review_shape "$HARVEST_TMP" || true
+    pg_check_review_shape "$HARVEST_TMP" || harvest_record_rejected_capture template-verdict "${PG_REJECTED_CAPTURE:-}"
   fi
   if [ "$HARVEST_RC" -eq 0 ] && [ -s "$HARVEST_TMP" ]; then
     HARVEST_KEEP="$OUT.unrecognized.$$"

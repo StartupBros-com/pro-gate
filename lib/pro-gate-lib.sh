@@ -1255,6 +1255,85 @@ pg_attempt_disposition_find() { # host owner repo pr [exclude-marker] -> newest 
   pg_attempt_disposition_read "$best"
 }
 
+# ── Rejected-capture records (#271) ───────────────────────────────────────────────────────────
+# A harvest whose salvage child proved the capture is the one finished response to this attempt's
+# latest prompt (cdp-salvage `completion-proof`), but whose bytes failed review validation, keeps
+# those exact bytes here, bound to the attempt's input binding and conversation. The record is
+# write-once evidence for a typed stop; it is never an accepted review and never authority to
+# collect, refund, finalize or resend. Damaged, partial or foreign records read as absent.
+PG_REJECTED_CAPTURE_MAX_BYTES=4194304
+
+pg_rejected_capture_dir() { printf '%s\n' "$PRO_GATE_HOME/rejected-captures"; }
+
+pg_conversation_url_ok() { # url: cdp-salvage.mjs CONVERSATION_URL_RE
+  [[ "${1-}" =~ ^https://chatgpt\.com/c/[A-Za-z0-9-]+([?#].*)?$ ]]
+}
+
+pg_rejected_capture_validate() { # canonical-json marker input-binding-json
+  local json="$1" marker="$2" binding="$3" epoch ib digest
+  epoch="$(jq -r .charged_spend_epoch <<<"$binding" 2>/dev/null)" || return 1
+  case "$epoch" in ''|*[!0-9]*) return 1;; esac
+  ib="$(pg_review_sha256_text "$binding")" || return 1
+  jq -e --arg marker "$marker" --argjson epoch "$epoch" --arg ib "$ib" '
+    keys == ["capture","capture_sha256","charged_spend_epoch","conversation_url","input_binding_digest","marker","record_type","record_version","rejection"]
+    and .record_type=="rejected-capture/v1" and .record_version==1 and .marker==$marker
+    and (.rejection|IN("template-verdict","unbound")) and .charged_spend_epoch==$epoch
+    and .input_binding_digest==$ib and (.capture|type=="string" and length>0)
+    and (.capture_sha256|type=="string" and test("^[0-9a-f]{64}$"))
+    and (.conversation_url|type=="string")' <<<"$json" >/dev/null 2>&1 || return 1
+  pg_conversation_url_ok "$(jq -r .conversation_url <<<"$json")" || return 1
+  digest="$(pg_sha256 <(jq -j .capture <<<"$json" 2>/dev/null))" || return 1
+  [ -n "$digest" ] && [ "$digest" = "$(jq -r .capture_sha256 <<<"$json")" ]
+}
+
+pg_rejected_capture_read() { # marker input-binding-json -> capture_sha256 (read-only, exact path)
+  local marker="$1" binding="$2" f json canonical LC_ALL=C
+  pg_reservation_marker_ok "$marker" || return 1
+  f="$(pg_rejected_capture_dir)/$marker"
+  [ -f "$f" ] && [ ! -L "$f" ] || return 1
+  json="$(head -c "$((PG_REJECTED_CAPTURE_MAX_BYTES + 1))" "$f" 2>/dev/null && printf '.')" || return 1
+  json="${json%.}"
+  [ "${#json}" -le "$PG_REJECTED_CAPTURE_MAX_BYTES" ] || return 1
+  canonical="$(jq -cS . <<<"$json" 2>/dev/null)" || return 1
+  [ "$canonical" = "$json" ] || return 1
+  pg_rejected_capture_validate "$canonical" "$marker" "$binding" || return 1
+  jq -r .capture_sha256 <<<"$canonical"
+}
+
+pg_rejected_capture_write() { # marker rejection capture-file conversation-url input-binding-json
+  local marker="$1" rejection="$2" capture="$3" url="$4" binding="$5" dir f tmp canonical rc=1 LC_ALL=C
+  pg_reservation_marker_ok "$marker" || return 1
+  case "$rejection" in template-verdict|unbound) ;; *) return 1;; esac
+  [ -f "$capture" ] && [ ! -L "$capture" ] && [ -s "$capture" ] || return 1
+  canonical="$(jq -cnS --arg marker "$marker" --arg rejection "$rejection" --arg url "$url" \
+    --argjson epoch "$(jq -r .charged_spend_epoch <<<"$binding" 2>/dev/null)" \
+    --arg ib "$(pg_review_sha256_text "$binding")" --arg digest "$(pg_sha256 "$capture")" --rawfile capture "$capture" \
+    '{capture:$capture,capture_sha256:$digest,charged_spend_epoch:$epoch,conversation_url:$url,input_binding_digest:$ib,
+      marker:$marker,record_type:"rejected-capture/v1",record_version:1,rejection:$rejection}' 2>/dev/null)" || return 1
+  [ "${#canonical}" -le "$PG_REJECTED_CAPTURE_MAX_BYTES" ] || return 1
+  # Invalid UTF-8 would become a lossy JSON string; only an exact byte round trip is evidence.
+  cmp -s "$capture" <(jq -j .capture <<<"$canonical" 2>/dev/null) || return 1
+  pg_rejected_capture_validate "$canonical" "$marker" "$binding" || return 1
+  dir="$(pg_rejected_capture_dir)"
+  f="$dir/$marker"
+  # Write-once: an existing final record is never replaced. It stands as the evidence, whatever
+  # this pass collected, only while it still validates for this attempt; otherwise refuse loudly.
+  if [ -e "$f" ] || [ -L "$f" ]; then
+    pg_rejected_capture_read "$marker" "$binding" >/dev/null 2>&1
+    return
+  fi
+  mkdir -p "$dir" 2>/dev/null || return 1
+  tmp="$dir/.$marker.tmp.$$"
+  rm -f "$tmp" 2>/dev/null
+  if (umask 077 && printf '%s' "$canonical" > "$tmp") 2>/dev/null && ln "$tmp" "$f" 2>/dev/null; then
+    rc=0
+  elif pg_rejected_capture_read "$marker" "$binding" >/dev/null 2>&1; then
+    rc=0
+  fi
+  rm -f "$tmp" 2>/dev/null
+  return "$rc"
+}
+
 # ── Delivery-condition records (#204) ──────────────────────────────────────────────────────────
 # Proven no-send refunds retain delivery evidence in the required v2 disposition. The v1
 # sidecar remains a compatibility mirror and reader; its failure cannot discard the evidence
@@ -4149,8 +4228,8 @@ pg_completed_lookup() {  # <marker> <out>: place the artifact at <out>; rc 0 on 
 # ─────────────────────────────────────────────────────────────────────────────
 PG_REVIEW_DECISION_CONTRACT_ID='review-decision/v1'
 PG_REVIEW_DECISION_CONTRACT_VERSION=1
-PG_REVIEW_DECISION_CONTRACT_DIGEST='31f41b872c7cdffef6fe17a41e9bac1dc829418b738d9bdbcf9fd775ae781667'
-PG_REVIEW_DECISION_CORPUS_DIGEST='09f089ca0f8cd48faf838bc3e0e23d055c7a4a3fbf885d7c5437072ab287c927'
+PG_REVIEW_DECISION_CONTRACT_DIGEST='c5586d5f4cde6b5ba6590b5840a3a21cf76af2be81d2c53f28d61c34d8c297ac'
+PG_REVIEW_DECISION_CORPUS_DIGEST='7e944bd4cce21191ad6df85452630f05d26ae2b63a4162429e8d0952a8eb6d19'
 
 # Binding-record compatibility only (#214, gate r2 P1). review-input-binding/v1 and
 # review-result-binding/v1 records are validated by their own record_type/record_version shape
@@ -4163,7 +4242,7 @@ PG_REVIEW_DECISION_CORPUS_DIGEST='09f089ca0f8cd48faf838bc3e0e23d055c7a4a3fbf885d
 # Writers share these validators with readers: every production write site passes the CURRENT digest
 # (pg_review_decision_contract_digest), so this list only widens what can be READ back, never what a
 # fresh record may claim. Keep it that way when adding a writer.
-PG_REVIEW_DECISION_COMPATIBLE_CONTRACT_DIGESTS='bf36fdb5f8625e917be0539ca014fec518649d1160584846aca1cb9149533abb 7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee 5fcd19c12600061af6d90ed9cb980dd7067cff199c374910639003eec4caf5c3 6da6866bab4e95ad138cdc946fa1388be9c386bca7b592c3370c9f52e34b315f fa91787e3fbf3c0852c78f5269b2f670d84b86561be64d6edef4229bf46aee9b 246b9e4e1d58f1820b4381a90cf93cf3fb7fb849f3ce4dd34b4d757be79c2e4f'
+PG_REVIEW_DECISION_COMPATIBLE_CONTRACT_DIGESTS='bf36fdb5f8625e917be0539ca014fec518649d1160584846aca1cb9149533abb 7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee 5fcd19c12600061af6d90ed9cb980dd7067cff199c374910639003eec4caf5c3 6da6866bab4e95ad138cdc946fa1388be9c386bca7b592c3370c9f52e34b315f fa91787e3fbf3c0852c78f5269b2f670d84b86561be64d6edef4229bf46aee9b 246b9e4e1d58f1820b4381a90cf93cf3fb7fb849f3ce4dd34b4d757be79c2e4f 31f41b872c7cdffef6fe17a41e9bac1dc829418b738d9bdbcf9fd775ae781667'
 
 pg_review_decision_contract_id() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_ID"; }
 pg_review_decision_contract_version() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_VERSION"; }
@@ -4350,7 +4429,7 @@ pg_review_decision_envelope_valid() { # decision-file
 }
 
 pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read stdin
-  local supplied canonical snapshot unsafe valid reason selected selected_ref selected_count
+  local supplied canonical snapshot unsafe valid reason selected selected_ref selected_count selected_shape
   local action prior prior_applicable verdict choice_snapshot rounds_not_converging
   pg_have jq || return 1
   if [ "$#" -gt 0 ]; then supplied="$1"; else supplied="$(cat)"; fi
@@ -4400,7 +4479,7 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
       and (.collected|type=="boolean") and (.evidence_mode|IN("full-pr","scoped-delta","connector","caller-patch","none"))
       and (.legacy|type=="boolean") and (.marker|marker and length>0)
       and (.provenance_valid|type=="boolean") and (.verdict|IN("SHIP","FIX-FIRST","NEEDS-DISCUSSION","NONE"))
-      and (if has("shape") then .shape=="template-verdict" and .applicable==false and .legacy==false
+      and (if has("shape") then (.shape|IN("template-verdict","rejected-capture")) and .applicable==false and .legacy==false
         and .bindable==false and .binding_valid==false and .provenance_valid==false and .verdict=="NONE"
         and .collected==true else true end);
     (keys_are(["active_index","completed_results","contract","cooldown","deferred_count","deferred_findings","delivery","evidence","governor","input","named_choice","observation","open_blocking","prior_review","reservation","target","transport"]))
@@ -4470,17 +4549,24 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
 
   # Existing completed work wins. Selection is newest charged epoch, then canonical identity;
   # duplicate rows still tied on both fields are unresolved and stop closed.
-  selected="$(jq -cS '[.completed_results[] | select(.applicable or .legacy or .shape=="template-verdict")] | sort_by(.charged_spend_epoch,.canonical_identity) | last // empty' <<<"$canonical")"
+  selected="$(jq -cS '[.completed_results[] | select(.applicable or .legacy or .shape=="template-verdict" or .shape=="rejected-capture")] | sort_by(.charged_spend_epoch,.canonical_identity) | last // empty' <<<"$canonical")"
   if [ -n "$selected" ]; then
     selected_count="$(jq -r --argjson s "$selected" '[.completed_results[] | select(.charged_spend_epoch==$s.charged_spend_epoch and .canonical_identity==$s.canonical_identity)] | length' <<<"$canonical")"
     if [ "$selected_count" -gt 1 ]; then
       pg_review_decision_emit stop-without-new-review completed-result-tie "$canonical" "$snapshot"; return
     fi
     selected_ref="$(jq -r .canonical_identity <<<"$selected")"
+    selected_shape="$(jq -r '.shape // ""' <<<"$selected")"
     # Rejected saved bytes participate in the same newest-epoch selection without supplying
     # accepted authority. A newer grounded completion can supersede them; a newest rejection stops.
-    if [ "$(jq -r '.shape // ""' <<<"$selected")" = template-verdict ]; then
+    if [ "$selected_shape" = template-verdict ]; then
       pg_review_decision_emit stop-without-new-review template-verdict "$canonical" "$snapshot" "$selected_ref"; return
+    fi
+    # #271: a retained proven completion that failed validation stops only its own attempt. While
+    # another marker is active or reserved, that live work is recovered by the branches below.
+    if [ "$selected_shape" = rejected-capture ] \
+       && jq -e --argjson s "$selected" '.active_index.state=="none" and (.reservation.state=="none" or .reservation.marker==$s.marker)' <<<"$canonical" >/dev/null; then
+      pg_review_decision_emit stop-without-new-review rejected-capture "$canonical" "$snapshot" "$selected_ref"; return
     fi
     if [ "$(jq -r .collected <<<"$selected")" = false ]; then
       # An uncollected result whose evidence mode can never carry merge proof (a connector SHIP,

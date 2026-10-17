@@ -25,6 +25,7 @@ import {
   buildRenameConversationExpression,
   buildThrottleModalExpression,
   ORGANIZER_MUTATION_LEASE_MS,
+  readReviewText,
 } from '../bin/cdp-organizer-expressions.mjs';
 import {
   parseTestPollMs,
@@ -6489,6 +6490,122 @@ for (const placeholder of PLACEHOLDER_URLS) {
       && Date.now() - fs.statSync(targetPlainR12).mtimeMs < 60_000,
     `result=${resultPlainR12} entries=${JSON.stringify(fs.readdirSync(dirPlainR12))}`);
   fs.rmSync(dirPlainR12, { recursive: true, force: true });
+}
+
+{
+  // #271: readReviewText's response-scope facts, then salvage's completion proof, over fake
+  // ChatGPT turns run through the real expression. Each document counts its review-text reads
+  // (one querySelectorAll per evaluation) so a fixture can change what a later read sees.
+  const url271 = 'https://chatgpt.com/c/mock-conversation';
+  const prompt271 = `Review the attached change.\n(run marker: ${MARKER}; echo it on the VERDICT line)`;
+  const grounded271 = `P0: none\nP1: none\nP2: none\nP3: none\n\nChecked src/review-engine.ts for failure handling.\n\nVERDICT: SHIP (run marker: ${MARKER})`;
+  const skeleton271 = `P0: none\nP1: none\nP2: none\nP3: none\nVERDICT: SHIP (run marker: ${MARKER})`;
+  const turn271 = (role, text, { finished = true, contained = true, busy = false } = {}) => {
+    const container = {
+      querySelector: (selector) => {
+        if (finished && selector.includes('copy-turn-action-button')) return { tagName: 'BUTTON' };
+        if (busy && selector.includes('[aria-busy="true"]')) return { tagName: 'SPAN' };
+        return null;
+      },
+    };
+    const node = {
+      children: [],
+      matches: () => false,
+      getAttribute: (name) => (name === 'data-message-author-role' ? role : null),
+    };
+    if (contained) node.closest = (selector) => (selector.startsWith('[data-testid^="conversation-turn"]') ? container : null);
+    Object.defineProperty(node, 'innerText', { get: () => (typeof text === 'function' ? text() : text) });
+    Object.defineProperty(node, 'textContent', { get: () => node.innerText });
+    return node;
+  };
+  const document271 = (turns, { generating = () => false, href = url271, reads = { n: 0 } } = {}) => {
+    const document = {
+      reads,
+      body: { get innerText() { return turns.map((turn) => turn.innerText).join('\n'); } },
+      querySelectorAll: () => { reads.n += 1; return turns; },
+      querySelector: (selector) => (selector.includes('stop-button') && generating(reads.n) ? { tagName: 'BUTTON' } : null),
+    };
+    if (href !== null) document.location = { href };
+    return document;
+  };
+  const user271 = () => turn271('user', prompt271);
+  const proven271 = (scope) => scope?.following === 1 && scope.assistantLast === true && scope.finished === true
+    && scope.generating === false && scope.href === url271;
+  const scopeOf = (turns, opts) => readReviewText(document271(turns, opts), MARKER).scope;
+
+  const provenScope = scopeOf([user271(), turn271('assistant', grounded271)]);
+  check('#271 scope: one finished, last assistant answer after the marked prompt is proven',
+    proven271(provenScope), JSON.stringify(provenScope));
+  for (const [name, turns, opts] of [
+    ['a rendered stop control', [user271(), turn271('assistant', grounded271)], { generating: () => true }],
+    ['no finished-turn actions', [user271(), turn271('assistant', grounded271, { finished: false })]],
+    ['a busy indicator in the answer turn', [user271(), turn271('assistant', grounded271, { busy: true })]],
+    ['no conversation-turn container', [user271(), turn271('assistant', grounded271, { contained: false })]],
+    ['a newer user turn after the answer', [user271(), turn271('assistant', grounded271), turn271('user', 'One more thing.')]],
+    ['two assistant turns after the prompt', [user271(), turn271('assistant', skeleton271), turn271('assistant', grounded271)]],
+    ['a user turn as the only following message', [user271(), turn271('user', 'Follow-up question.')]],
+    ['a page with no URL', [user271(), turn271('assistant', grounded271)], { href: null }],
+  ]) {
+    const scope = scopeOf(turns, opts);
+    check(`#271 scope: ${name} stays unproven`, !proven271(scope), JSON.stringify(scope));
+  }
+  const throwing271 = document271([user271(), turn271('assistant', grounded271)]);
+  throwing271.querySelector = () => { throw new Error('detached'); };
+  const thrownScope = readReviewText(throwing271, MARKER).scope;
+  check('#271 scope: a throwing DOM read keeps the fail-closed defaults',
+    thrownScope?.generating === true && thrownScope.following === -1 && !proven271(thrownScope), JSON.stringify(thrownScope));
+
+  const sha271 = (bytes) => createHash('sha256').update(bytes).digest('hex');
+  const proofs271 = (stderr) => stderr.split('\n').filter((line) => line.startsWith('completion-proof '));
+  const run271 = async (document, args) => {
+    const cdp = await mockCdp(document.body.innerText, [], { document });
+    const result = await runFastPollSalvage(args, cdp.port, undefined,
+      { PRO_GATE_TEST_COMPLETION_CONFIRM_MS: String(TEST_RENDER_SAMPLE_MS_MIN) });
+    await cdp.stop();
+    return { ...result, proofs: proofs271(result.stderr), reads: document.reads.n };
+  };
+
+  const terminal = await run271(document271([user271(), turn271('assistant', grounded271)]), [MARKER, '2']);
+  check('#271 proof: a proven terminal answer names sha256 of the exact stdout bytes and its conversation, after a re-read',
+    terminal.status === 0 && terminal.proofs.length === 1
+      && terminal.proofs[0] === `completion-proof ${sha271(terminal.stdout)} ${url271}` && terminal.reads >= 2,
+    `status=${terminal.status} proofs=${JSON.stringify(terminal.proofs)} reads=${terminal.reads}`);
+
+  const template = await run271(document271([user271(), turn271('assistant', skeleton271)]), [MARKER, '1']);
+  check('#271 proof: a proven template exit (6) names sha256 of the exact stdout bytes',
+    template.status === 6 && template.proofs.length === 1
+      && template.proofs[0] === `completion-proof ${sha271(template.stdout)} ${url271}`,
+    `status=${template.status} proofs=${JSON.stringify(template.proofs)}`);
+
+  const generating = await run271(
+    document271([user271(), turn271('assistant', grounded271)], { generating: () => true }), [MARKER, '2']);
+  check('#271 proof: a terminal answer while a stop control is rendered is still emitted, without proof',
+    generating.status === 0 && generating.stdout.includes('VERDICT: SHIP') && generating.proofs.length === 0,
+    `status=${generating.status} proofs=${JSON.stringify(generating.proofs)}`);
+
+  const foreign = await run271(
+    document271([user271(), turn271('assistant', grounded271)], { href: 'https://chatgpt.com/c/another-conversation' }), [MARKER, '2']);
+  check('#271 proof: a scope whose page URL is not the tab URL proves nothing',
+    foreign.status === 0 && foreign.proofs.length === 0, `status=${foreign.status} proofs=${JSON.stringify(foreign.proofs)}`);
+
+  const changingReads = { n: 0 };
+  const changing = await run271(document271([
+    user271(),
+    turn271('assistant', () => (changingReads.n <= 1 ? grounded271 : `${grounded271}\n\nA paragraph rendered later.`)),
+  ], { reads: changingReads }), [MARKER, '2']);
+  check('#271 proof: bytes that change on the confirmation re-read prove nothing',
+    changing.status === 0 && changing.proofs.length === 0 && changing.reads >= 2,
+    `status=${changing.status} proofs=${JSON.stringify(changing.proofs)} reads=${changing.reads}`);
+
+  const probe = await run271(document271([user271(), turn271('assistant', grounded271)]), ['--probe', MARKER, '2']);
+  check('#271 proof: probe mode never prints a completion proof',
+    probe.status === 0 && probe.proofs.length === 0, `status=${probe.status} proofs=${JSON.stringify(probe.proofs)}`);
+
+  const poisoned = await run271(
+    document271([user271(), turn271('assistant', skeleton271)], { generating: (n) => n <= 1 }), [MARKER, '1']);
+  check('#271 proof: template bytes first seen unproven stay unproven for the invocation',
+    poisoned.status === 6 && poisoned.proofs.length === 0 && poisoned.reads >= 2,
+    `status=${poisoned.status} proofs=${JSON.stringify(poisoned.proofs)} reads=${poisoned.reads}`);
 }
 
 process.exit(failures === 0 ? 0 : 1);

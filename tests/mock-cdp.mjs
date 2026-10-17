@@ -96,6 +96,140 @@ function expectedTitleFromExpression(expression) {
   try { return JSON.parse(match[1]); } catch { return null; }
 }
 
+// #271 (U5): when the state file carries `dom`, the shipped review-text expression runs against a
+// small ChatGPT-shaped document instead of receiving flat text, so response-scope facts come from
+// production code rather than from the fixture. Spec: {href, generating, turns:[{role, text,
+// actions, busy}]}; `busy` renders Oracle's loading-shimmer marker inside that turn. Selectors
+// cover the forms ChatGPT/Oracle use: tag, .class, [attr], [attr="v"], [attr^="v"],
+// [attr*="v" i], :not(...), comma lists and descendant combinators. Anything else throws.
+function splitTop(source, separator) {
+  const parts = [];
+  let depth = 0; let quote = null; let start = 0;
+  for (let i = 0; i < source.length; i += 1) {
+    const ch = source[i];
+    if (quote) { if (ch === quote) quote = null; continue; }
+    if (ch === '"' || ch === "'") quote = ch;
+    else if (ch === '(' || ch === '[') depth += 1;
+    else if (ch === ')' || ch === ']') depth -= 1;
+    else if (depth === 0 && separator.test(ch)) { parts.push(source.slice(start, i)); start = i + 1; }
+  }
+  parts.push(source.slice(start));
+  return parts.map((part) => part.trim()).filter(Boolean);
+}
+
+function matchesCompound(element, compound) {
+  const head = compound.match(/^([a-z][a-z0-9-]*|\*)?/i)[0];
+  if (head && head !== '*' && element.tagName !== head.toUpperCase()) return false;
+  let rest = compound.slice(head.length);
+  while (rest) {
+    let part = rest.match(/^\[\s*([\w-]+)\s*(?:([\^*]?=)\s*"([^"]*)"\s*(i)?)?\s*\]/);
+    if (part) {
+      const [, name, op, want, fold] = part;
+      const value = element.getAttribute(name);
+      if (value === null) return false;
+      const have = fold ? value.toLowerCase() : value;
+      const need = fold ? want.toLowerCase() : want;
+      if (op === '=' && have !== need) return false;
+      if (op === '^=' && !have.startsWith(need)) return false;
+      if (op === '*=' && !have.includes(need)) return false;
+    } else if ((part = rest.match(/^\.([\w-]+)/))) {
+      if (!(element.getAttribute('class') ?? '').split(/\s+/).includes(part[1])) return false;
+    } else if ((part = rest.match(/^:not\(((?:[^()]|\([^()]*\))*)\)/))) {
+      if (matchesSelectorList(element, part[1])) return false;
+    } else {
+      throw new Error(`mock DOM: unsupported selector ${JSON.stringify(compound)}`);
+    }
+    rest = rest.slice(part[0].length);
+  }
+  return true;
+}
+
+function matchesSelector(element, selector) {
+  const compounds = splitTop(selector, /\s/);
+  if (!matchesCompound(element, compounds.at(-1))) return false;
+  let ancestor = element.parentElement;
+  for (let i = compounds.length - 2; i >= 0; i -= 1) {
+    while (ancestor && !matchesCompound(ancestor, compounds[i])) ancestor = ancestor.parentElement;
+    if (!ancestor) return false;
+    ancestor = ancestor.parentElement;
+  }
+  return true;
+}
+
+function matchesSelectorList(element, list) {
+  return splitTop(list, /,/).some((selector) => matchesSelector(element, selector));
+}
+
+class FakeElement {
+  constructor(tag, attributes = {}, text = '', children = []) {
+    this.tagName = tag.toUpperCase();
+    this.attributes = attributes;
+    this.ownText = text;
+    this.children = children;
+    this.parentElement = null;
+    for (const child of children) child.parentElement = this;
+  }
+  getAttribute(name) { return Object.hasOwn(this.attributes, name) ? String(this.attributes[name]) : null; }
+  hasAttribute(name) { return Object.hasOwn(this.attributes, name); }
+  get innerText() {
+    return this.children.length
+      ? this.children.map((child) => child.innerText).filter(Boolean).join('\n\n')
+      : this.ownText;
+  }
+  get textContent() { return this.innerText; }
+  matches(selector) { return matchesSelectorList(this, selector); }
+  closest(selector) {
+    for (let node = this; node; node = node.parentElement) if (node.matches(selector)) return node;
+    return null;
+  }
+  querySelectorAll(selector) {
+    const found = [];
+    const walk = (node) => {
+      for (const child of node.children) {
+        if (child.matches(selector)) found.push(child);
+        walk(child);
+      }
+    };
+    walk(this);
+    return found;
+  }
+  querySelector(selector) { return this.querySelectorAll(selector)[0] ?? null; }
+}
+
+function fakeDocument(spec) {
+  const button = (testid, label) => new FakeElement('button', { 'data-testid': testid, 'aria-label': label });
+  const articles = (spec.turns ?? []).map((turn, index) => new FakeElement('article', {
+    'data-testid': `conversation-turn-${index + 1}`,
+  }, '', [
+    new FakeElement('div', { 'data-message-author-role': turn.role, 'data-message-id': `mock-${index + 1}` }, turn.text ?? ''),
+    ...(turn.actions ? [new FakeElement('div', {}, '', turn.role === 'assistant'
+      ? [button('copy-turn-action-button', 'Copy'), button('good-response-turn-action-button', 'Good response'),
+        button('bad-response-turn-action-button', 'Bad response')]
+      : [button('copy-turn-action-button', 'Copy')])] : []),
+    ...(turn.busy ? [new FakeElement('span', { class: 'loading-shimmer' }, 'Thinking')] : []),
+  ]));
+  const composer = new FakeElement('form', {}, '', [spec.generating
+    ? button('stop-button', 'Stop streaming')
+    : button('send-button', 'Send prompt')]);
+  const body = new FakeElement('body', {}, '', [new FakeElement('main', {}, '', articles), composer]);
+  return {
+    body,
+    location: { href: spec.href ?? PRIMARY_URL },
+    querySelectorAll: (selector) => body.querySelectorAll(selector),
+    querySelector: (selector) => body.querySelector(selector),
+  };
+}
+
+function evaluateReviewText(expression, spec) {
+  try {
+    const document = fakeDocument(spec);
+    return new Function('document', 'location', `return (${expression});`)(document, document.location);
+  } catch (error) {
+    console.error(`mock DOM evaluation failed: ${error?.message ?? error}`);
+    return null;
+  }
+}
+
 const scratch = new Map();   // id -> url, for tabs opened via /json/new
 let scratchSeq = 0;
 let primaryClosed = false;
@@ -190,6 +324,9 @@ server.on('upgrade', (req, socket) => {
         console.error('archived conversation');
         value = { status: 'archived' };
       }
+    } else if (targetId === 'tab1' && expression.includes('pro-gate:review-text')) {
+      const dom = readState().dom;
+      if (dom) value = evaluateReviewText(expression, dom);
     }
     socket.write(wsTextFrame(JSON.stringify({ id: request.id, result: { result: { value } } })));
   }));

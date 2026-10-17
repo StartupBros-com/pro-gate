@@ -7135,18 +7135,21 @@ PG214_PRED_D='6da6866bab4e95ad138cdc946fa1388be9c386bca7b592c3370c9f52e34b315f'
 PG214_PRED_E='fa91787e3fbf3c0852c78f5269b2f670d84b86561be64d6edef4229bf46aee9b'
 # The released v0.62.0 contract remains readable after this additive merge.
 PG214_PRED_F='246b9e4e1d58f1820b4381a90cf93cf3fb7fb849f3ce4dd34b4d757be79c2e4f'
+# #271's additive rejected-capture shape and reason retired the released v0.63 contract.
+PG214_PRED_G='31f41b872c7cdffef6fe17a41e9bac1dc829418b738d9bdbcf9fd775ae781667'
 PG214_UNKNOWN_CD='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 pg214_compatible_digests_match() { # candidate JSON array
   jq -ne --arg a "$PG214_PRED_A" --arg b "$PG214_PRED_B" --arg c "$PG214_PRED_C" \
-    --arg d "$PG214_PRED_D" --arg e "$PG214_PRED_E" --arg f "$PG214_PRED_F" --argjson got "$1" \
-    '$got == ([$a,$b,$c,$d,$e,$f] | sort)' >/dev/null 2>&1
+    --arg d "$PG214_PRED_D" --arg e "$PG214_PRED_E" --arg f "$PG214_PRED_F" \
+    --arg g "$PG214_PRED_G" --argjson got "$1" \
+    '$got == ([$a,$b,$c,$d,$e,$f,$g] | sort)' >/dev/null 2>&1
 }
-check 'the compiled binding-record compatibility list equals the full sorted six-digest array' \
+check 'the compiled binding-record compatibility list equals the full sorted seven-digest array' \
   "$(pg214_compatible_digests_match "$(pg_review_decision_compatible_contract_digests_json)"; echo $?)" \
   "$(pg_review_decision_compatible_contract_digests_json)"
 PG214_SUBSTITUTED_DIGESTS="$(pg_review_decision_compatible_contract_digests_json | \
-  jq -c --arg retired "$PG214_PRED_F" --arg wrong "$PG214_UNKNOWN_CD" 'map(if .==$retired then $wrong else . end) | sort')"
-check 'the compatibility assertion rejects a substituted sixth digest of 64 a characters' \
+  jq -c --arg retired "$PG214_PRED_G" --arg wrong "$PG214_UNKNOWN_CD" 'map(if .==$retired then $wrong else . end) | sort')"
+check 'the compatibility assertion rejects a substituted seventh digest of 64 a characters' \
   "$(! pg214_compatible_digests_match "$PG214_SUBSTITUTED_DIGESTS"; echo $?)" "$PG214_SUBSTITUTED_DIGESTS"
 PG214_ENV_PRED_FACTS="$(rd_facts '{}')"; PG214_ENV_PRED_FACTS="$(jq -cS --arg cd "$PG214_PRED_A" '.contract.contract_digest=$cd' <<<"$PG214_ENV_PRED_FACTS")"
 PG214_ENV_PRED_OUT="$(rd_reduce "$PG214_ENV_PRED_FACTS")"
