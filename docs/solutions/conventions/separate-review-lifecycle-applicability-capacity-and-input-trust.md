@@ -212,6 +212,7 @@ Bad:
 Good:
   attempt = canonical_snapshot(target)
   holds_capacity = attempt is recoverable and not complete/superseded
+                   and (if generating) its charge is younger than the generation ceiling
   applicable = immutable evidence still matches the current target
   next_action = review_decision(attempt, applicable, current_evidence)
 ```

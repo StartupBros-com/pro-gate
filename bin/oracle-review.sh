@@ -1369,6 +1369,10 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
       st_match "$m" "$r_pr" || continue
       case "$r_created" in ''|*[!0-9]*) r_age="";; *) r_age=$(( ST_NOW - r_created ));; esac
       r_life="$(pg_reservation_state "$m" 2>/dev/null || echo generating)"
+      # #273: the same predicate the slot plan uses, so status can never report a slot held that
+      # the plan has already freed (or the reverse). Lifecycle state alone no longer answers it.
+      r_holds=0; pg_reservation_holds_capacity "$f" "$ST_NOW" && r_holds=1
+      r_past_ceiling=0; [ "$r_life" = generating ] && [ "$r_holds" = 0 ] && r_past_ceiling=1
       # Only an UNEXPIRED, applicable reservation marks the change recoverable. Superseded review
       # state remains optionally collectable but cannot block current-head admission or capacity.
       # reaped at the next fresh-run reconciliation, and treating it as live would let a
@@ -1444,8 +1448,9 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
           --arg age "${r_age:-}" --arg miss "${r_miss:-}" --arg model "${r_model:-}" \
           --arg url "$r_url" --arg harvest_cmd "$r_cmd" --argjson unbound "$r_unbound" \
           --argjson crossbound "$r_crossbound" --arg life "$r_life" \
+          --argjson holds "$r_holds" --argjson past_ceiling "$r_past_ceiling" \
           --arg class "$r_class" --arg class_at "$r_class_at" --arg ttl_left "$r_ttl_left" \
-          '{marker:$marker,pr:$pr,out:$out,age_secs:(($age|tonumber?)//null),miss_streak:(($miss|tonumber?)//null),model:$model,conversation_url:$url,harvest_cmd:$harvest_cmd,unbound_captures:$unbound,crossbound_hits:$crossbound,classification:(if $class == "" then null else $class end),classified_at:(($class_at|tonumber?)//null),ttl_remaining_secs:(($ttl_left|tonumber?)//null),holds_capacity:($life != "complete" and $life != "superseded"),state:(if $life == "superseded" then "superseded-awaiting-optional-harvest" elif $crossbound > 0 then "cross-bound" elif $unbound > 0 then "unbindable-ambiguous" elif $life == "complete" then "complete-awaiting-harvest" else "generating-or-recoverable" end)}' \
+          '{marker:$marker,pr:$pr,out:$out,age_secs:(($age|tonumber?)//null),miss_streak:(($miss|tonumber?)//null),model:$model,conversation_url:$url,harvest_cmd:$harvest_cmd,unbound_captures:$unbound,crossbound_hits:$crossbound,classification:(if $class == "" then null else $class end),classified_at:(($class_at|tonumber?)//null),ttl_remaining_secs:(($ttl_left|tonumber?)//null),holds_capacity:($holds == 1),past_generation_ceiling:($past_ceiling == 1),state:(if $life == "superseded" then "superseded-awaiting-optional-harvest" elif $crossbound > 0 then "cross-bound" elif $unbound > 0 then "unbindable-ambiguous" elif $life == "complete" then "complete-awaiting-harvest" elif $past_ceiling == 1 then "past-generation-ceiling" else "generating-or-recoverable" end)}' \
           >> "$ST_TMP/res.jsonl" 2>/dev/null
       else
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$m" "${r_pr:-?}" "${r_age:-?}" "${r_miss:-?}" "$r_unbound" "$r_crossbound" "$r_cmd" >> "$ST_TMP/res.tsv"
@@ -1750,7 +1755,7 @@ if [ "$STATUS_REQUESTED" = 1 ]; then
     echo "in-progress reservations (harvest these for FREE — never re-run):"
     if pg_have jq && [ -s "$ST_TMP/res.jsonl" ]; then
       jq -r '"  " + .marker + "  pr=" + .pr + (if .age_secs then "  age=\(.age_secs / 60 | floor)m" else "" end) + (if .conversation_url != "" then "  url=remembered" else "" end)
-             + (if .holds_capacity then "  [holding a review slot]" else "  [complete — slot already released, collect when convenient]" end)
+             + (if .holds_capacity then "  [holding a review slot]" elif .past_generation_ceiling then "  [past the generation ceiling — no longer counted against capacity, collect when convenient]" else "  [complete — slot already released, collect when convenient]" end)
              + (if .crossbound_hits > 0 then "  [STUCK: cross-bound to another run - retrying cannot bind it]" else (if .unbound_captures > 0 then "  [\(.unbound_captures) unbindable capture(s) - ambiguous, still retryable]" else "" end) end)
              + "\n    harvest: " + .harvest_cmd' "$ST_TMP/res.jsonl"
     else
@@ -4066,9 +4071,17 @@ while :; do
         [ -f "$SLOT_HOLDER_F" ] && pg_reservation_marker_ok "$SLOT_HOLDER" || continue
         [ "$(pg_reservation_state "$SLOT_HOLDER" 2>/dev/null)" = generating ] || continue
         SLOT_SWEPT=1
+        # #273: a generating record past the generation ceiling already holds no slot. It is still
+        # proven and superseded here (supersession also settles its applicability), but the log
+        # must not claim it freed capacity it was not holding.
+        SLOT_HOLDER_HELD=1; pg_reservation_holds_capacity "$SLOT_HOLDER_F" || SLOT_HOLDER_HELD=0
         if SLOT_HOLDER_PROOF="$(pg_reservation_supersede_proven "$SLOT_HOLDER")"; then
-          echo "[oracle-review] released the account slot held by ${SLOT_HOLDER}: ${SLOT_HOLDER_PROOF}, so its review no longer applies (charge kept; still harvestable for audit)." >&2
-          SLOT_FREED=1
+          if [ "$SLOT_HOLDER_HELD" = 1 ]; then
+            echo "[oracle-review] released the account slot held by ${SLOT_HOLDER}: ${SLOT_HOLDER_PROOF}, so its review no longer applies (charge kept; still harvestable for audit)." >&2
+            SLOT_FREED=1
+          else
+            echo "[oracle-review] superseded ${SLOT_HOLDER}: ${SLOT_HOLDER_PROOF}, so its review no longer applies; it was already past the generation ceiling and held no slot (charge kept; still harvestable for audit)." >&2
+          fi
         fi
       done
     fi

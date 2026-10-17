@@ -2338,24 +2338,69 @@ pg_reservation_count() {
   echo "$n"
 }
 
+# pg_reservation_holds_capacity <record-file> [now]: exit 0 when the reservation occupies account
+# capacity, 1 when it does not. Every capacity reader (slot plan, holding count, holder report,
+# --status) asks this one question, so they cannot disagree about what is held.
+#
+# complete/superseded never hold (#82, #234). Empty/legacy or unknown state always holds: an
+# unknown state must never free capacity. An explicit `generating` record holds only while its
+# charge is younger than PRO_GATE_GENERATION_CEILING (#273). Measured on the live ledger and owner
+# logs (2026-10-17): owner probes saw a completed answer within 592s of send (n=30); 1,817 fresh
+# successes spent at most 3,838s after taking their slot (a sample the run timeout bounds); and the
+# longest conversation ever seen still writing, at 9,432s, never produced a review and ended
+# recovery-exhausted. A record past the default 3h is a review nothing is waiting on: its owner
+# died, or parked on an unbindable capture that nothing retries, and it used to hold a slot until
+# the TTL and miss proof finally removed it. Two such records held half the account for hours
+# while queued runs timed out (#273). The cost of being wrong the other way is one extra
+# concurrent chat on the account, not a lost review.
+#
+# This is read-side only: nothing is rewritten, removed, refunded or terminalized. The record stays
+# collectable by --harvest, same-change admission still finds it (pg_reservation_find_pr reads no
+# capacity), and the TTL/miss rule in pg_reservation_note_miss stays the only removal path. A
+# harvest re-arm cannot reset the clock: pg_reservation_write keeps field 7 (spend) unless a fresh
+# dispatch passes a new one. The clock is the charge epoch, falling back to the creation epoch only
+# when a record predates field 7. A clock that is missing, zero, non-numeric or in the future holds.
+# 0 disables the ceiling.
+pg_reservation_holds_capacity() {
+  local f="$1" now="${2:-}" ceiling clock
+  [ -f "$f" ] || return 1
+  case "$(awk -F'\t' 'NR==1{print $8}' "$f" 2>/dev/null)" in
+    complete|superseded) return 1 ;;
+    generating) ;;
+    *) return 0 ;;
+  esac
+  ceiling="${PRO_GATE_GENERATION_CEILING:-10800}"
+  case "$ceiling" in ''|*[!0-9]*) ceiling=10800;; esac
+  [ "$ceiling" -gt 0 ] 2>/dev/null || return 0
+  clock="$(awk -F'\t' 'NR==1{print $7}' "$f" 2>/dev/null)"
+  [ -n "$clock" ] || clock="$(awk -F'\t' 'NR==1{print $3}' "$f" 2>/dev/null)"
+  case "$clock" in ''|*[!0-9]*) return 0;; esac
+  [ "$clock" -gt 0 ] 2>/dev/null || return 0
+  case "$now" in ''|*[!0-9]*) now="$(date +%s)";; esac
+  [ "$(( now - clock ))" -lt "$ceiling" ]
+}
+
 # pg_reservation_slot_plan <effective-concurrency>: compute the slot-acquisition plan under the
 # reservation guard. Echoes "R|excluded slots": scan slots 1..R skipping the excluded ones.
 # Slot-tagged reservations exclude their exact slot (the tab still occupies that account
 # capacity); reservations without a slot (legacy) and tagged slots outside the current range
 # shrink the range instead. Processed descending so range shrink cascades correctly.
 pg_reservation_slot_plan() {
-  local eff="${1:-1}" dir f slot state slots="" excl="" r legacy=0 s avail
+  local eff="${1:-1}" dir f slot slots="" excl="" r legacy=0 s avail now
   dir="$(pg_reservation_dir)"
   r="$eff"
   if [ -d "$dir" ]; then
+    now="$(date +%s)"
     for f in "$dir"/*; do
       [ -f "$f" ] || continue
       # A COMPLETE reservation is a harvest pointer, not account occupancy (#82): its review
       # stopped generating, so it holds no slot even though it stays collectable until TTL.
       # Empty/legacy state reads as generating, so pre-state records keep their hold — an
-      # unknown state must never free capacity (overbooking the account is the worse error).
-      state="$(awk -F'\t' 'NR==1{print $8}' "$f" 2>/dev/null)"
-      case "$state" in complete|superseded) continue;; esac
+      # unknown state must never free capacity. A known `generating` record past the generation
+      # ceiling stops holding (#273); pg_reservation_holds_capacity carries the measured bound.
+      # Its slot number is a flock file only, so a new run taking it cannot disturb the old
+      # record's tab: harvest finds that conversation by marker, never by slot.
+      pg_reservation_holds_capacity "$f" "$now" || continue
       slot="$(awk -F'\t' 'NR==1{print $5}' "$f" 2>/dev/null)"
       case "$slot" in
         ''|*[!0-9]*) legacy=$(( legacy + 1 ));;
@@ -2556,16 +2601,18 @@ pg_reservation_set_state() {
 }
 
 # pg_reservation_holding_count: how many reservations actually OCCUPY account capacity, i.e.
-# everything except the ones proven complete or superseded. Distinct from pg_reservation_count, which counts
+# everything except the ones proven complete or superseded and the ones past the generation
+# ceiling (pg_reservation_holds_capacity). Distinct from pg_reservation_count, which counts
 # collectable records: once a finished review stops holding its slot, "a reservation exists" and
 # "capacity is reserved" stop being the same question, and a timeout caused by genuinely busy
 # runs must not be blamed on an uncollected review that is holding nothing (#82).
 pg_reservation_holding_count() {
-  local dir f n=0
+  local dir f n=0 now
   dir="$(pg_reservation_dir)"; [ -d "$dir" ] || { echo 0; return 0; }
+  now="$(date +%s)"
   for f in "$dir"/*; do
     [ -f "$f" ] || continue
-    case "$(awk -F'\t' 'NR==1{print $8}' "$f" 2>/dev/null)" in complete|superseded) continue;; esac
+    pg_reservation_holds_capacity "$f" "$now" || continue
     n=$(( n + 1 ))
   done
   echo "$n"
@@ -2577,24 +2624,22 @@ pg_reservation_holding_count() {
 # see is that a FINISHED review still holds its slot until someone collects it (#82). Naming the
 # marker and the exact free-it command turns a 40-minute mystery into one command.
 pg_report_capacity_holders() {
-  local eff="${1:-}" dir f marker state pr held=0
+  local eff="${1:-}" dir f marker pr held=0 now
   dir="$(pg_reservation_dir)"; [ -d "$dir" ] || return 0
+  now="$(date +%s)"
   for f in "$dir"/*; do
     [ -f "$f" ] || continue
-    case "$(awk -F'\t' 'NR==1{print $8}' "$f" 2>/dev/null)" in complete|superseded) continue;; esac
+    pg_reservation_holds_capacity "$f" "$now" || continue
     held=$(( held + 1 ))
   done
   [ "$held" -gt 0 ] || return 0
   echo "[pro-gate] 0 of ${eff:-?} effective slot(s) free — ${held} held by in-progress reservation(s):" >&2
   for f in "$dir"/*; do
     [ -f "$f" ] || continue
+    pg_reservation_holds_capacity "$f" "$now" || continue
     marker="$(basename "$f")"
     pr="$(awk -F'\t' 'NR==1{print $1}' "$f" 2>/dev/null)"
-    state="$(pg_reservation_state "$marker" 2>/dev/null || echo generating)"
-    case "$state" in
-      complete|superseded) continue ;;
-      *) echo "  $marker  [$pr] generating — still using the account" >&2 ;;
-    esac
+    echo "  $marker  [$pr] generating — still using the account" >&2
   done
   echo "  collect a finished one for FREE (no new spend, never re-run):" >&2
   echo "    oracle-review.sh --harvest <marker> --out <path> --timeout $(pg_harvest_hint_timeout)" >&2
