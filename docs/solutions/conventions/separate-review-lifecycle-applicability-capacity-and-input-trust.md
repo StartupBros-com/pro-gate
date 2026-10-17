@@ -128,7 +128,8 @@ Four constraints keep this honest, and the last two bound where it applies at al
 - **The head move must be work you were going to do anyway.** A rebase the branch needs, a fix, a
   real commit. Manufacturing a commit to free a slot games the runtime and corrupts the proof this
   whole model rests on. When nothing is pending, the accurate statement is that the slot stays held
-  until the next real push — not that it cannot be released.
+  until the next real push, or until the generation ceiling (#273) stops it counting 3 h after its
+  charge — not that it cannot be released.
 - **A free collection attempt is not a substitute.** Harvesting a stalled conversation returns the
   same in-progress result; it neither completes nor releases anything.
 - **This is not the current-head stuck case.** If the head has *not* moved, no proof exists yet and
@@ -138,7 +139,9 @@ Four constraints keep this honest, and the last two bound where it applies at al
 - **It requires an input binding.** The proof path reads the attempt's immutable input binding before
   it will query the host, and fails closed when there is none. A classic run given a caller-supplied
   diff has no such binding, so supersession can never be proven for it and this remedy simply does
-  not apply — a known open gap, not a misuse.
+  not apply — a known open gap, not a misuse. The generation ceiling (#273) bounds it: such a
+  reservation still stops counting against capacity 3 h after its charge, though it is never
+  superseded.
 
 The failure this prevents is a reasoning error, not a code defect: treating the absence of one proof
 (the conversation terminating) as the absence of *any* proof, and escalating to a human for something
