@@ -411,6 +411,26 @@ check 'newest FIX-FIRST wins over older SHIP and reports artifact-bound U1 open 
 current_proof
 query --diff "$TDIR/endpoint.patch"
 check 'applicability is separate from verdict: a matching FIX-FIRST review is applicable' '.status=="accepted" and .applicable==true and .review.verdict=="FIX-FIRST"'
+# #291: a standalone label resolved by an explicit same-severity finding reports artifact-bound
+# counts through the installed CLI (pushbot#4377 shape); an empty standalone section stays unknown.
+for shape in pushbot-4377 blank-run empty; do
+  new_case "standalone-$shape"
+  newer_completion
+  case "$shape" in
+    pushbot-4377) printf 'P0: none\n\nP1\n\n[P1] file.txt:1 - concurrent started inserts race\n\nP2\n\nP2: none\n\nP3\n\nP3: none\n\nVERDICT: FIX-FIRST\n' ;;
+    blank-run) printf 'P0\n\n \t\n\n[P0] file.txt:1 - data loss\nP1: none\nVERDICT: FIX-FIRST\n' ;;
+    empty) printf 'P0: none\n\nP1\n\nP2: none\nChecked file.txt for regressions.\nVERDICT: FIX-FIRST\n' ;;
+  esac > "$PRO_GATE_HOME/completed/$NEWER"
+  STANDALONE_DIGEST="$(pg_sha256 "$PRO_GATE_HOME/completed/$NEWER")"
+  jq -cjS --arg digest "$STANDALONE_DIGEST" '.artifact.digest=$digest | .verdict="FIX-FIRST" | .ship_proof=null' <<<"$NEW_RESULT" > "$PRO_GATE_HOME/review-result-bindings/$NEWER"
+  query
+  STANDALONE_IDENTITY=".status==\"accepted\" and .selected_marker==\"$NEWER\" and .review.artifact_digest==\"$STANDALONE_DIGEST\" and .review.verdict==\"FIX-FIRST\""
+  case "$shape" in
+    pushbot-4377) check '#291 standalone P1 label between blank lines reports its finding' "$STANDALONE_IDENTITY and .review.open_p0==0 and .review.open_p1==1" ;;
+    blank-run) check '#291 standalone P0 label before whitespace-only lines reports its finding' "$STANDALONE_IDENTITY and .review.open_p0==1 and .review.open_p1==0" ;;
+    empty) check '#291 empty standalone P1 section keeps public counts unavailable' "$STANDALONE_IDENTITY and .review.open_p0==null and .review.open_p1==null" ;;
+  esac
+done
 # No sidecar: unbound target/epoch edits must never demote a newer blocking review.
 SAVED_NEWER="$NEWER"
 for shape in keyed generic numeric-generic partial-key; do

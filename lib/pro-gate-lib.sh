@@ -3085,6 +3085,11 @@ pg_review_finding_summary() {
       end | .severity |= ascii_upcase;
     def none_declaration:
       test("^(?:none|—|-)[.!]?\\s*$";"i");
+    def explicit_finding($severity):
+      test("^(?:\\*\\*|__)?\\[") and
+        (([headline] | first // null) as $finding |
+         $finding!=null and $finding.severity==$severity and
+         ($finding.text|test("^\\s*$")|not) and ($finding.text|none_declaration|not));
     def section_text:
       "(?:findings?|issues?|items?|blockers?|blocking|notes?|comments?|severity|level|must[ -]fix|should fix|nice to have|none|empty|n/a)" as $word |
       test("^\\s*(?:"+$word+"(?:\\s+"+$word+")*)?\\s*:?[ \\t]*(?:\\((?:"+$word+"|[0-9]+)\\))?\\s*:?\\s*$";"i");
@@ -3110,8 +3115,14 @@ pg_review_finding_summary() {
         $text[:1024-($marker|length)] + $marker
       end;
     reduce (split("\n")[] | sub("\r$";"")) as $line
-      ({blocks:[],current:null,unknown:false,fence:null};
+      ({blocks:[],current:null,unknown:false,fence:null,pending:null};
        ($line|normalized) as $normal |
+       # A standalone P0/P1 label resolves at the next non-blank line: only an explicit
+       # same-severity [Pn] finding keeps counts available, and that line then parses normally.
+       (if .pending==null or ($line|test("^\\s*$")) then .
+        else .pending as $severity |
+          (if ($normal|explicit_finding($severity)) then . else .unknown=true end) | .pending=null
+        end) |
        if .fence!=null then
          (if .current!=null then .current.lines += [$line] else . end) |
          .fence as $fence |
@@ -3130,7 +3141,9 @@ pg_review_finding_summary() {
          elif $head!=null then
            flush |
            if ($head.text|test("^\\s*$")) then
-             if ($head.severity|IN("P0","P1")) then .unknown=true else . end
+             if ($head.severity|IN("P0","P1")|not) then .
+             elif ($line|test("^\\s*[Pp][01]\\s*$")) then .pending=$head.severity
+             else .unknown=true end
            elif ($head.text|none_declaration) then .
            else .current={severity:$head.severity,lines:[$head.text]} end
          elif $unsupported!=null then
@@ -3143,7 +3156,7 @@ pg_review_finding_summary() {
          elif .current!=null then .current.lines += [$line]
          else . end
        end) |
-    flush | .unknown=(.unknown or .fence!=null) |
+    flush | .unknown=(.unknown or .fence!=null or .pending!=null) |
     [.blocks[] | select(.severity|IN("P0","P1")) |
       select((.lines[0]|test("^\\S+\\s+(?:—|--|-)\\s+RESOLVED([^_[:alnum:]]|$)"))==false or
         (.lines[1:]|join("\n")|test("(^|[^_[:alnum:]])(?:STILL-PRESENT|REOPENED|NOT\\s+RESOLVED|NOT\\s+FIXED)([^_[:alnum:]]|$)|Correction\\s*:";"i")))] as $open |

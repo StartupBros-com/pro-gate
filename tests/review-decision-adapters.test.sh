@@ -495,6 +495,55 @@ direct_review_case 'R3-P1 malformed non-heading P1 label still leaves counts una
 direct_review_case 'R3-P1 bare P1 em-dash finding keeps its existing grammar' \
   $'P1 — something unparsed\nVERDICT: FIX-FIRST\n' "$BLOCKING_PREDICATE"
 
+# #291: a standalone P0/P1 label line is provisional. Blank lines may separate it from an
+# explicit same-severity [Pn] finding, which is counted; anything else keeps counts unavailable.
+UNAVAILABLE_PREDICATE='.action=="fix-review-findings" and .facts.open_blocking==null'
+direct_review_case '#291 pushbot#4377 standalone P1 label between blank lines counts its finding' \
+  $'P0: none\n\nP1\n\n[P1] apps/blog-writer/supabase/migrations/20270930000700_persist_missing_cron_terminal_outcomes.sql:75 — Concurrent started inserts can race.\n\nWhy it matters: the second terminal outcome is lost.\n\nP2\n\nP2: none\n\nP3\n\nP3: none\n\nVERDICT: FIX-FIRST — concurrent inserts lose a terminal outcome.\n' \
+  "$BLOCKING_PREDICATE and .facts.deferred_count==0"
+direct_review_case '#291 pushbot#4621 standalone P1 label then one blank line counts its finding' \
+  $'P0: none\nP1\n\n[P1] apps/startupbros/lib/server/email/postmaster/postmaster-run.ts:198 — Days with an available domain spam rate are finalized early.\nP2: none\nP3: none\n\nVERDICT: FIX-FIRST — delayed metrics are omitted.\n' \
+  "$BLOCKING_PREDICATE and .facts.deferred_count==0"
+direct_review_case '#291 a standalone label directly above its finding counts it' \
+  $'P0: none\nP1\n[P1] a.sh:1 — bug\nVERDICT: FIX-FIRST\n' "$BLOCKING_PREDICATE"
+direct_review_case '#291 several blank, whitespace-only and CRLF lines may precede a list-item finding' \
+  $'P0: none\r\n p1 \r\n\r\n \t\r\n\r\n- [P1] a.sh:1 — bug\r\nVERDICT: FIX-FIRST\r\n' "$BLOCKING_PREDICATE"
+direct_review_case '#291 a standalone P0 label counts its explicit P0 finding' \
+  $'P0\n\n[P0] a.sh:1 — data loss\nP1: none\nVERDICT: FIX-FIRST\n' "$BLOCKING_PREDICATE"
+direct_review_case '#291 every finding under a resolved standalone label is counted' \
+  $'P0: none\nP1\n\n[P1] a.sh:1 — bug\n[P1] b.sh:2 — another bug\n[P2] c.sh:3 — a nit\nVERDICT: FIX-FIRST\n' \
+  '.action=="fix-review-findings" and .facts.open_blocking==2 and .facts.deferred_count==1'
+direct_review_case '#291 repeated standalone sections each resolve to their own findings' \
+  $'P0\n\n[P0] a.sh:1 — data loss\n\nP1\n\n[P1] b.sh:2 — bug\nVERDICT: FIX-FIRST\n' \
+  '.action=="fix-review-findings" and .facts.open_blocking==2'
+direct_review_case '#291 a RESOLVED finding under a standalone label keeps its status grammar' \
+  $'P0: none\nP1\n\n[P1] a.sh:1 — RESOLVED — patched.\n[P2] docs.md:7 — Clarify the example.\nVERDICT: FIX-FIRST\n' \
+  "$DEFERRAL_PREDICATE"
+direct_review_case '#291 an empty standalone section before the next label leaves counts unavailable' \
+  $'P0: none\nP1\n\nP2: none\n[P2] b.sh:2 — a nit\nVERDICT: FIX-FIRST\n' "$UNAVAILABLE_PREDICATE"
+direct_review_case '#291 an empty standalone section before the verdict leaves counts unavailable' \
+  $'P0: none\nP1\n\nVERDICT: FIX-FIRST\n' "$UNAVAILABLE_PREDICATE"
+direct_review_case '#291 a standalone label at end of input leaves counts unavailable' \
+  $'P0: none\nP1\n\n \n' "$UNAVAILABLE_PREDICATE"
+direct_review_case '#291 a deferred finding under a standalone P1 label leaves counts unavailable' \
+  $'P0: none\nP1\n\n[P2] b.sh:2 — a nit\nVERDICT: FIX-FIRST\n' "$UNAVAILABLE_PREDICATE"
+direct_review_case '#291 a P0 finding under a standalone P1 label leaves counts unavailable' \
+  $'P0: none\nP1\n\n[P0] a.sh:1 — data loss\nVERDICT: FIX-FIRST\n' "$UNAVAILABLE_PREDICATE"
+for finding in '> [P1] a.sh:1 — quoted' '[**P1**] a.sh:1 — bug' 'P1: a.sh:1 — bug' '[P1] none' '## P1 findings'; do
+  direct_review_case "#291 standalone label followed by $finding leaves counts unavailable" \
+    $'P0: none\nP1\n\n'"$finding"$'\n[P1] b.sh:2 — bug\nVERDICT: FIX-FIRST\n' "$UNAVAILABLE_PREDICATE"
+done
+direct_review_case '#291 a fence after a standalone label leaves counts unavailable' \
+  $'P0: none\nP1\n\n```text\n[P1] a.sh:1 — quoted\n```\n[P1] a.sh:1 — bug\nVERDICT: FIX-FIRST\n' "$UNAVAILABLE_PREDICATE"
+direct_review_case '#291 prose between a standalone label and its finding leaves counts unavailable' \
+  $'P0: none\nP1\n\nConcurrent writes lose data.\n\n[P1] a.sh:1 — bug\nVERDICT: FIX-FIRST\n' "$UNAVAILABLE_PREDICATE"
+direct_review_case '#291 a repeated standalone label without a finding leaves counts unavailable' \
+  $'P0: none\nP1\n\nP1\n\n[P1] a.sh:1 — bug\nVERDICT: FIX-FIRST\n' "$UNAVAILABLE_PREDICATE"
+for label in 'P1:' '**P1**' '[P1]' '- P1'; do
+  direct_review_case "#291 decorated empty label $label keeps counts unavailable before a finding" \
+    "$label"$'\n\n[P1] a.sh:1 — bug\nVERDICT: FIX-FIRST\n' "$UNAVAILABLE_PREDICATE"
+done
+
 # PR #276 round 3 repair: section vocabulary can also title a real finding, and an
 # unparseable blocking heading must not turn unknown counts into known zeroes.
 SECTION_FINDING_BODY=$'lib/comments.sh:12 — Posting a comment deadlocks while holding the lock needed by the worker.\nSuggested fix: release the lock before waiting.\n'
