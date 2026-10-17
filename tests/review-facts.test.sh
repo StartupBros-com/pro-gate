@@ -67,7 +67,9 @@ query() {
   local before after
   before="$(snapshot)"
   RC=0
+  QUERY_START=$SECONDS
   bash "$TDIR/installed/oracle-review.sh" --review-facts --repo "$TDIR/checkout" --pr 1983 --json "$@" > "$TDIR/out.json" 2> "$TDIR/err" || RC=$?
+  QUERY_SECONDS=$((SECONDS - QUERY_START))
   after="$(snapshot)"
   [ "$before" = "$after" ] || { printf 'FAIL - public inspection mutated runtime state\n' >&2; exit 1; }
   [ ! -e "$PG_FACTS_EFFECT_LOG" ] || { printf 'FAIL - effect entrypoint invoked\n' >&2; cat "$PG_FACTS_EFFECT_LOG" >&2; exit 1; }
@@ -458,6 +460,110 @@ for mutation in missing-input malformed-input; do
   query
   check "other-PR scoped result with $mutation does not obstruct this target" '.status=="accepted" and (.selected_marker|endswith("1700000700-1"))'
 done
+# A full-shape name without this PR's key never rules a completion out by itself (#292): its
+# input binding, bound or not, or a damaged sidecar naming this target keeps it relevant, including
+# when unrelated bytes are not ASCII. A sidecar naming another PR does not.
+NEWER=pg-run-other-repo-99-1700000900-2
+for evidence in bound-input unbound-input unbound-input-nonascii damaged-sidecar damaged-sidecar-nonascii sidecar-other-pr; do
+  new_case "foreign-name-$evidence"
+  newer_completion
+  case "$evidence" in
+    unbound-input) printf '{bad\n' > "$PRO_GATE_HOME/review-result-bindings/$NEWER" ;;
+    unbound-input-nonascii)
+      jq -cjS '.evidence.identity="full-pr:révisé"' <<<"$NEW_INPUT" > "$PRO_GATE_HOME/review-input-bindings/$NEWER"
+      printf '{bad\n' > "$PRO_GATE_HOME/review-result-bindings/$NEWER" ;;
+    *sidecar*)
+      rm "$PRO_GATE_HOME/review-input-bindings/$NEWER"
+      mkdir -p "$PRO_GATE_HOME/run-meta"
+      case "$evidence" in
+        damaged-sidecar) printf 'github.com\tACME\tWidgets\tbroken\t1983\n' ;;
+        damaged-sidecar-nonascii) printf 'github.com\tacme\twidgets\tbr\303\266ken\t1983\n' ;;
+        sidecar-other-pr) printf 'github.com\tacme\twidgets\tbroken\t1984\n' ;;
+      esac > "$PRO_GATE_HOME/run-meta/$NEWER" ;;
+  esac
+  query
+  case "$evidence" in
+    bound-input) check "foreign-named completion with a digest-bound input for this PR is selected" ".status==\"accepted\" and .selected_marker==\"$NEWER\"" ;;
+    sidecar-other-pr) check 'foreign-named completion whose damaged sidecar names another PR does not obstruct' '.status=="accepted" and (.selected_marker|endswith("1700000700-1"))' ;;
+    *) check "foreign-named completion kept relevant by its $evidence obstructs older SHIP" '.status!="accepted" and .status!="missing" and .review==null' ;;
+  esac
+done
+# The one-pass relevance read must never open a FIFO: the per-marker readers skip non-regular files.
+new_case fifo
+FIFO_MARKER=pg-run-other-repo-99-1700000900-3
+cp "$PRISTINE/completed/$MARKER" "$PRO_GATE_HOME/completed/$FIFO_MARKER"
+mkdir -p "$PRO_GATE_HOME/run-meta"
+mkfifo "$PRO_GATE_HOME/review-input-bindings/$FIFO_MARKER" "$PRO_GATE_HOME/run-meta/$FIFO_MARKER"
+# Unblocks a reader that wrongly opened a FIFO, so a regression fails the bound instead of hanging.
+( sleep 60; : > "$PRO_GATE_HOME/review-input-bindings/$FIFO_MARKER"; : > "$PRO_GATE_HOME/run-meta/$FIFO_MARKER" ) \
+  > /dev/null 2>&1 < /dev/null &
+FIFO_UNBLOCKER=$!
+FIFO_START=$SECONDS
+query
+FIFO_ELAPSED=$((SECONDS - FIFO_START))
+pkill -P "$FIFO_UNBLOCKER" 2>/dev/null || true
+kill "$FIFO_UNBLOCKER" 2>/dev/null || true
+wait "$FIFO_UNBLOCKER" 2>/dev/null || true
+check "FIFO binding and sidecar files are skipped without blocking (${FIFO_ELAPSED}s)" "$FIFO_ELAPSED < 60 and .status==\"accepted\" and (.selected_marker|endswith(\"1700000700-1\"))"
+# Thousands of well-formed completions for other PRs and repositories must not cost a per-marker
+# validation each (#292). Every seeded completion is newer than the accepted review, so treating
+# one as relevant would change the outcome. Most carry a valid sidecar and a digest-bound input;
+# every tenth has no sidecar and every fifteenth no input binding. The first five reuse this PR's
+# key on another host, so only full validation can exclude them. Measured on this fixture: the
+# per-marker scan took 142 s and selected the same marker; the one-pass prefilter takes 2 s. The
+# 30 s bound fails the old scan with headroom for a loaded runner.
+new_case scale
+SCALE_COUNT=3000
+mkdir -p "$PRO_GATE_HOME/run-meta"
+SCALE_ARTIFACT="$(cat "$PRO_GATE_HOME/completed/$MARKER")"
+SCALE_INPUT="$(jq -cjS '.marker="@MARKER@" | .charged_spend_epoch="@EPOCH@" | .repository={host:"@HOST@",owner:"@OWNER@",repo:"@REPO@"} | .target.pr="@PR@"' <<<"$INPUT")"
+SCALE_RESULT="$(jq -cjS '.marker="@MARKER@" | .input_binding_identity="@MARKER@" | .input_binding_digest="@DIGEST@" | .artifact.path="completed/@MARKER@"' <<<"$RESULT")"
+for ((i = 0; i < SCALE_COUNT; i++)); do
+  scale_host=github.com scale_owner=acme scale_repo=widgets scale_pr=$((2000 + i))
+  case $((i % 3)) in
+    1) scale_repo="gadgets$((i % 50))" scale_pr=1983 ;;
+    2) scale_owner=Other-Org scale_pr=$((i + 1)) ;;
+  esac
+  [ "$i" -ge 5 ] || scale_host=ghe.example.com scale_owner=acme scale_repo=widgets scale_pr=1983
+  scale_epoch=$((1700001000 + i))
+  scale_marker="pg-run-$scale_owner-$scale_repo-$scale_pr-$scale_epoch-$((10 + i))"
+  printf '%s\n' "$SCALE_ARTIFACT" > "$PRO_GATE_HOME/completed/$scale_marker"
+  if [ $((i % 15)) -eq 7 ]; then
+    scale_json="${SCALE_RESULT//@MARKER@/$scale_marker}"
+    printf '%s' "${scale_json/@DIGEST@/$RAW}" > "$PRO_GATE_HOME/review-result-bindings/$scale_marker"
+  else
+    scale_json="${SCALE_INPUT/@MARKER@/$scale_marker}"
+    scale_json="${scale_json/\"@EPOCH@\"/$scale_epoch}"
+    scale_json="${scale_json/@HOST@/$scale_host}"
+    scale_json="${scale_json/@OWNER@/$scale_owner}"
+    scale_json="${scale_json/@REPO@/$scale_repo}"
+    printf '%s' "${scale_json/\"@PR@\"/$scale_pr}" > "$PRO_GATE_HOME/review-input-bindings/$scale_marker"
+  fi
+  if [ $((i % 10)) -ne 0 ]; then
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$scale_host" "$scale_owner" "$scale_repo" "$scale_owner-$scale_repo-$scale_pr" \
+      "$scale_pr" "$PRO_GATE_HOME/completed/$scale_marker" "$scale_epoch" > "$PRO_GATE_HOME/run-meta/$scale_marker"
+  fi
+  printf '%s\n' "$scale_marker" >> "$TDIR/scale-markers"
+done
+# One digest pass binds every seeded result to its input bytes.
+while read -r scale_digest scale_marker; do
+  [ "$scale_marker" != "$MARKER" ] || continue
+  scale_json="${SCALE_RESULT//@MARKER@/$scale_marker}"
+  printf '%s' "${scale_json/@DIGEST@/$scale_digest}" > "$PRO_GATE_HOME/review-result-bindings/$scale_marker"
+done < <(cd "$PRO_GATE_HOME/review-input-bindings" && sha256sum -- pg-run-*)
+CHECKS=$((CHECKS + 1))
+scale_sample="$(sed -n '1,3p;8p;11p' "$TDIR/scale-markers")"
+scale_bad=0
+while IFS= read -r scale_marker; do
+  if [ -e "$PRO_GATE_HOME/review-input-bindings/$scale_marker" ]; then
+    [ "$(pg_review_input_binding_digest "$scale_marker")" = "$(pg_review_result_binding_read "$scale_marker" | jq -r .input_binding_digest)" ] || scale_bad=1
+  fi
+  pg_review_result_binding_read "$scale_marker" > /dev/null || scale_bad=1
+  [ ! -e "$PRO_GATE_HOME/run-meta/$scale_marker" ] || pg_run_meta_read "$scale_marker" > /dev/null || scale_bad=1
+done <<<"$scale_sample"
+if [ "$scale_bad" -eq 0 ]; then printf 'ok - seeded scale records pass the production validators\n'; else printf 'FAIL - seeded scale records are malformed\n' >&2; FAILS=$((FAILS + 1)); fi
+query
+check "$SCALE_COUNT unrelated completions leave the same accepted review selected within 30s (${QUERY_SECONDS}s)" "$QUERY_SECONDS <= 30 and .status==\"accepted\" and .selected_marker==\"$MARKER\" and .review.verdict==\"SHIP\""
 NEWER="$SAVED_NEWER"
 new_case publication-temp
 printf 'partial publication\n' > "$PRO_GATE_HOME/completed/$NEWER.tmp.456"
