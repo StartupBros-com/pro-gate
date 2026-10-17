@@ -252,10 +252,14 @@ For fresh proof, recording invokes the existing `--prepare-review-evidence` comm
 from inspection. Its private temporary files are cleaned on completion or failure. You may
 instead supply an existing explicit `PRO_GATE_REVIEW_ENDPOINT_PATCH` /
 `PRO_GATE_REVIEW_PR_EVIDENCE` pair; the adapter snapshots that pair privately so metadata and
-public inspection certify the same bytes. Either way, the proof's target and base must match
-the live PR head, base repository/ref, and branch-tip SHA. A cached PR base snapshot that differs from
-the live tip is refused, not stamped as current. Head, base tip, and default branch are checked
-again before posting exactly one status at the reviewed SHA.
+public inspection certify the same bytes. Either way, the proof's target must match the live PR
+head and base repository/ref, and its base SHA must equal either the live branch tip or the PR's
+own base snapshot (`base.sha`, which GitHub refreshes only when the PR syncs and which the daemon
+binds completed reviews to). Both are read from GitHub at recording time, never from the proof; a
+proof base matching neither is refused. The status records the base the review ran against, so
+verification's overlap window runs from that reviewed base to the current tip and includes any
+commits that landed between the PR's snapshot and recording. Head, base tip, and default branch
+are checked again before posting exactly one status at the reviewed SHA.
 
 Full-PR recording defaults the reviewed payload to the prepared endpoint patch. Scoped recording
 must preserve its own reviewed payload and confirmation; it never substitutes full-PR bytes:
@@ -681,6 +685,7 @@ semantics. Native mode keeps the prompt's title hint and does not run remote-CDP
 | `bin/oracle-review.sh`              | **The engine**: assembles context, runs the review, captures/salvages/harvests the verdict                          |
 | `bin/cdp-salvage.mjs`               | Marker-owned CDP salvage and conversation organizer: recover, exact-rename, archive, and local cleanup decisions    |
 | `bin/cdp-organizer-expressions.mjs` | Auditable ChatGPT UI expressions for exact rename and archive; no backend API calls                                 |
+| `bin/cdp-test-timing.mjs`           | Test-only timing override parsers that cdp-salvage.mjs imports; production keeps its own defaults                   |
 | `bin/pro-gate-doctor.sh`            | One-command setup verification (deps, versions, browser, consent)                                                   |
 | `bin/pro-gate-stats.sh`             | Ledger stats: clean rate, exits, per-PR history                                                                     |
 | `bin/pro-gate-autoupdate.sh`        | The opt-in hourly skew-follower                                                                                     |
