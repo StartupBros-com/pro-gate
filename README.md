@@ -115,7 +115,9 @@ July 2026). The Pro model spends that long reasoning; the engine is built around
   nothing, or left a recoverable reservation. A run that dies mid-generation keeps its
   conversation reachable for 6 h so `--harvest` can collect it. If immutable proof later shows
   that review targets an old head or merged/closed PR, it remains charged and optionally
-  collectable but stops occupying capacity.
+  collectable but stops occupying capacity. A reservation still marked generating 3 h after its
+  charge (`PRO_GATE_GENERATION_CEILING`), far past any measured generation, also stops occupying
+  capacity while staying harvestable, so a dead caller cannot hold a slot for the whole TTL.
 - **Fail closed, recover explicitly.** A plugin/runtime version skew blocks the run.
   Final acceptance requires the whole bounded nonce with exact, case-sensitive spelling.
   Browser-side foreign-content conviction compares case-insensitively so a case-only near-match
@@ -644,7 +646,8 @@ an endless collect. Use `bundle` or `both` for the final round.
 | `PRO_GATE_MAX_DIFF_LINES`           | `6000`                            | Above this a run proceeds but usually lands in-progress → harvest                                                                                                                                                                        |
 | `PRO_GATE_DIFF_HARD_MAX`            | `25000`                           | Above this the engine refuses (exit 11, no spend)                                                                                                                                                                                        |
 | `PRO_GATE_MAX_CONCURRENCY`          | `1`                               | Ceiling for parallel Pro chats; a ramp governor earns up to it on clean streaks                                                                                                                                                          |
-| `PRO_GATE_RESERVATION_TTL`          | `21600`                           | Minimum age before confirmed exact-marker misses may exhaust recovery; elapsed time alone never releases it                                                                                                                              |
+| `PRO_GATE_RESERVATION_TTL`          | `21600`                           | Minimum age before confirmed exact-marker misses may exhaust recovery; elapsed time alone never removes the reservation or its charge                                                                                                     |
+| `PRO_GATE_GENERATION_CEILING`       | `10800`                           | Seconds after its charge that a still-`generating` reservation stops counting against review capacity; it stays harvestable and keeps its charge (`0` = never stop counting)                                                            |
 | `PRO_GATE_DIRLOCK_ORPHAN_GRACE`     | `5`                               | No-flock platforms only: seconds an unmarked guard directory must sit before a reclaimer may remove it                                                                                                                                   |
 | `PRO_GATE_BROWSER_MEM_PRESSURE_PCT` | `85`                              | Percent of the browser cgroup's effective limit (the smaller finite of `memory.high` and `memory.max`; `max` means unlimited) at which two consecutive samples arm the pressure sentinel and the health gate defers a slot with no spend |
 | `PRO_GATE_BROWSER_MEM_SAMPLE_SECS`  | `5`                               | Seconds between browser cgroup samples                                                                                                                                                                                                   |

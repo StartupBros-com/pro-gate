@@ -2216,7 +2216,9 @@ rm -rf "$TDIR/home2"
 echo '# slot plan: available count is explicit and state-aware'
 mkdir -p "$TDIR/home2/in-progress"
 avail(){ PRO_GATE_HOME="$TDIR/home2" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_slot_plan $1" | cut -d'|' -f3; }
-printf 'k1\to1\t100\t0\t1\t\t\tgenerating\n' > "$TDIR/home2/in-progress/pg-run-a-1-1"
+# A live holder is a recent one: under the #273 generation ceiling an epoch-100 clock would read
+# as a dead holder and free its slot, which the cases further down test on purpose.
+printf 'k1\to1\t%s\t0\t1\t\t\tgenerating\n' "$(date +%s)" > "$TDIR/home2/in-progress/pg-run-a-1-1"
 check 'generating reservation at eff 1 leaves zero available' "$([ "$(avail 1)" = '0' ]; echo $?)" "available=$(avail 1)"
 check 'generating reservation at eff 2 leaves one available' "$([ "$(avail 2)" = '1' ]; echo $?)" "available=$(avail 2)"
 # A finished review is a harvest pointer, not account occupancy: it must not hold a slot.
@@ -2232,6 +2234,70 @@ counted(){ PRO_GATE_HOME="$TDIR/home2" bash -c ". '$HERE/../lib/pro-gate-lib.sh'
 check 'legacy record counts as holding capacity' "$([ "$(holding)" = '1' ]; echo $?)" "holding=$(holding)"
 printf 'k1\to1\t100\t0\t1\t\t\tcomplete\n' > "$TDIR/home2/in-progress/pg-run-a-1-1"
 check 'complete record is collectable but holds nothing' "$([ "$(counted)" = '1' ] && [ "$(holding)" = '0' ]; echo $?)" "counted=$(counted) holding=$(holding)"
+rm -rf "$TDIR/home2"
+
+# #273: a `generating` record whose owner died, or parked on an unbindable capture nothing
+# retries, held its slot until TTL plus miss proof removed it; two of them held half the account
+# for hours. Past the generation ceiling (default 3h from the charge) it stops counting against
+# capacity while the record, its charge and its harvest path stay exactly as they were.
+echo '# #273: a generating reservation past the generation ceiling stops holding capacity'
+mkdir -p "$TDIR/home2/in-progress"
+GC_F="$TDIR/home2/in-progress/pg-run-a-1-1"
+gc_holds(){ PRO_GATE_HOME="$TDIR/home2" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_holds_capacity '$GC_F' $1"; }
+gc_seed(){ printf 'k1\to1\t%s\t0\t1\tGPT-X\t%s\t%s\n' "$1" "$2" "$3" > "$GC_F"; }
+GC_NOW=1800000000
+gc_seed "$GC_NOW" "$(( GC_NOW - 10799 ))" generating
+check '#273 generating record charged inside the ceiling holds' "$(gc_holds "$GC_NOW"; echo $?)" "$(cat "$GC_F")"
+gc_seed "$GC_NOW" "$(( GC_NOW - 10800 ))" generating
+check '#273 generating record charged exactly the ceiling ago no longer holds' "$(gc_holds "$GC_NOW" && echo 1 || echo 0)" "$(cat "$GC_F")"
+# The clock is the charge, not the record's creation: an exit-9 handoff stamps created long
+# after the send, and a fresh created must not keep an old charge holding.
+gc_seed "$GC_NOW" "$(( GC_NOW - 20000 ))" generating
+check '#273 the charge epoch is the clock, not a fresh creation epoch' "$(gc_holds "$GC_NOW" && echo 1 || echo 0)" "$(cat "$GC_F")"
+printf 'k1\to1\t%s\t0\t1\tGPT-X\t\tgenerating\n' "$(( GC_NOW - 20000 ))" > "$GC_F"
+check '#273 a record without a charge epoch falls back to its creation epoch' "$(gc_holds "$GC_NOW" && echo 1 || echo 0)" "$(cat "$GC_F")"
+# Planted negatives: every reading the predicate cannot trust keeps holding.
+gc_seed "$GC_NOW" "$(( GC_NOW + 600 ))" generating
+check '#273 a charge epoch in the future keeps holding' "$(gc_holds "$GC_NOW"; echo $?)" "$(cat "$GC_F")"
+gc_seed "$GC_NOW" 'x17' generating
+check '#273 a non-numeric charge epoch keeps holding' "$(gc_holds "$GC_NOW"; echo $?)" "$(cat "$GC_F")"
+printf 'k1\to1\t0\t0\t1\tGPT-X\t\tgenerating\n' > "$GC_F"
+check '#273 a zero clock keeps holding' "$(gc_holds "$GC_NOW"; echo $?)" "$(cat "$GC_F")"
+printf 'k1\to1\t100\t0\t1\n' > "$GC_F"
+check '#273 a legacy record without a state keeps holding however old' "$(gc_holds "$GC_NOW"; echo $?)" "$(cat "$GC_F")"
+printf 'k1\to1\t100\t0\t1\tGPT-X\t100\twhatever\n' > "$GC_F"
+check '#273 an unknown state keeps holding however old' "$(gc_holds "$GC_NOW"; echo $?)" "$(cat "$GC_F")"
+gc_seed "$GC_NOW" "$(( GC_NOW - 10800 ))" generating
+check '#273 ceiling 0 disables the release' \
+  "$(PRO_GATE_GENERATION_CEILING=0 PRO_GATE_HOME="$TDIR/home2" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_holds_capacity '$GC_F' $GC_NOW"; echo $?)" "$(cat "$GC_F")"
+check '#273 the ceiling is configurable' \
+  "$(PRO_GATE_GENERATION_CEILING=20000 PRO_GATE_HOME="$TDIR/home2" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_holds_capacity '$GC_F' $GC_NOW"; echo $?)" "$(cat "$GC_F")"
+check '#273 an invalid ceiling falls back to the default, never to unbounded release' \
+  "$(PRO_GATE_GENERATION_CEILING=abc PRO_GATE_HOME="$TDIR/home2" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_reservation_holds_capacity '$GC_F' $(( GC_NOW - 1000 ))"; echo $?)" "$(cat "$GC_F")"
+gc_seed "$GC_NOW" "$(( GC_NOW - 10800 ))" complete
+check '#273 complete and superseded still never hold' "$(gc_holds "$GC_NOW" && echo 1 || echo 0)" "$(cat "$GC_F")"
+# Every capacity reader agrees, against the wall clock: one stale holder frees its slot at
+# effective 1, a recent one keeps it, and the stale record stays on disk, unrewritten.
+gc_seed "$(date +%s)" "$(( $(date +%s) - 11000 ))" generating
+GC_BEFORE="$(cat "$GC_F")"
+check '#273 the slot plan frees the slot of a holder past the ceiling' "$([ "$(avail 1)" = 1 ]; echo $?)" "available=$(avail 1) $(cat "$GC_F")"
+check '#273 the holding count leaves it out while it stays collectable' "$([ "$(holding)" = 0 ] && [ "$(counted)" = 1 ]; echo $?)" "holding=$(holding) counted=$(counted)"
+check '#273 reading capacity rewrites nothing' "$([ "$(cat "$GC_F")" = "$GC_BEFORE" ]; echo $?)" "before=$GC_BEFORE after=$(cat "$GC_F")"
+GC_REPORT="$(PRO_GATE_HOME="$TDIR/home2" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_report_capacity_holders 1" 2>&1)"
+check '#273 the holder report names no holder past the ceiling' "$([ -z "$GC_REPORT" ]; echo $?)" "$GC_REPORT"
+gc_seed "$(date +%s)" "$(( $(date +%s) - 1000 ))" generating
+check '#273 a recent generating holder keeps its slot' "$([ "$(avail 1)" = 0 ] && [ "$(holding)" = 1 ]; echo $?)" "available=$(avail 1) holding=$(holding)"
+GC_REPORT="$(PRO_GATE_HOME="$TDIR/home2" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_report_capacity_holders 1" 2>&1)"
+check '#273 the holder report still names a recent holder' "$(printf '%s' "$GC_REPORT" | grep -Fq '  pg-run-a-1-1  [k1] generating'; echo $?)" "$GC_REPORT"
+# The report reads the same predicate, so a record it cannot read a lifecycle from stays named
+# however old: a legacy record with no state and one with an unknown state.
+printf 'k2\to2\t100\t0\t1\n' > "$TDIR/home2/in-progress/pg-run-b-1-1"
+printf 'k3\to3\t100\t0\t1\tGPT-X\t100\twhatever\n' > "$TDIR/home2/in-progress/pg-run-c-1-1"
+GC_REPORT="$(PRO_GATE_HOME="$TDIR/home2" bash -c ". '$HERE/../lib/pro-gate-lib.sh'; pg_report_capacity_holders 1" 2>&1)"
+check '#273 the holder report still names legacy and unknown-state holders however old' \
+  "$(printf '%s' "$GC_REPORT" | grep -Fq '— 3 held by in-progress reservation(s)' \
+     && printf '%s' "$GC_REPORT" | grep -Fq '  pg-run-b-1-1  [k2] generating' \
+     && printf '%s' "$GC_REPORT" | grep -Fq '  pg-run-c-1-1  [k3] generating'; echo $?)" "$GC_REPORT"
 rm -rf "$TDIR/home2"
 
 echo '# slot exclusion prevents overbooking through a freed lower slot'
@@ -4198,6 +4264,28 @@ if command -v jq >/dev/null 2>&1; then
   check '--status --json existing fields are unchanged beside the new ones' \
     "$([ "$(jq -r '.reservations[0].marker' "$TDIR/st-class.json")" = "$SMARKER" ] && [ "$(jq -r '.reservations[0].state' "$TDIR/st-class.json")" = generating-or-recoverable ]; echo $?)" \
     "$(jq -c '.reservations[0]' "$TDIR/st-class.json" 2>/dev/null)"
+  # #273: status asks the slot plan's own predicate, so it cannot call a slot held that the plan
+  # already freed. A generating record past the ceiling reads holds_capacity=false with its own
+  # label and state, and stays recoverable (still inside the TTL) and harvestable.
+  GCST_HOME="$TDIR/st-ceiling-home"; mkdir -p "$GCST_HOME/in-progress"
+  GCST_MARKER="pg-run-acme-widgets-43-1700000002-78"
+  printf '43\t%s\t%s\t0\t1\tGPT-X\t%s\tgenerating\n' "$TDIR/st-ceiling.md" "$(date +%s)" "$(( $(date +%s) - 11000 ))" > "$GCST_HOME/in-progress/$GCST_MARKER"
+  PRO_GATE_HOME="$GCST_HOME" bash "$ENGINE" --status 43 --json >"$TDIR/st-ceiling.json" 2>/dev/null
+  check '#273 --status --json reports a generating record past the ceiling as holding no capacity' \
+    "$(jq -e --arg m "$GCST_MARKER" '.reservations[0] | .marker == $m and .holds_capacity == false and .past_generation_ceiling == true and .state == "past-generation-ceiling"' "$TDIR/st-ceiling.json" >/dev/null; echo $?)" \
+    "$(jq -c '.reservations[0]' "$TDIR/st-ceiling.json" 2>/dev/null)"
+  check '#273 --status keeps a past-ceiling record recoverable and harvestable' \
+    "$(jq -e --arg m "$GCST_MARKER" '.recoverable == true and (.reservations[0].harvest_cmd | contains($m))' "$TDIR/st-ceiling.json" >/dev/null; echo $?)" \
+    "$(jq -c '{recoverable, recoverable_reason, harvest_cmd: .reservations[0].harvest_cmd}' "$TDIR/st-ceiling.json" 2>/dev/null)"
+  PRO_GATE_HOME="$GCST_HOME" bash "$ENGINE" --status 43 >"$TDIR/st-ceiling.out" 2>/dev/null
+  check '#273 --status names the past-ceiling record instead of calling it complete' \
+    "$(grep -Fq "past the generation ceiling — no longer counted against capacity" "$TDIR/st-ceiling.out" && ! grep -Fq 'holding a review slot' "$TDIR/st-ceiling.out"; echo $?)" \
+    "$(cat "$TDIR/st-ceiling.out")"
+  printf '43\t%s\t%s\t0\t1\tGPT-X\t%s\tgenerating\n' "$TDIR/st-ceiling.md" "$(date +%s)" "$(( $(date +%s) - 1000 ))" > "$GCST_HOME/in-progress/$GCST_MARKER"
+  PRO_GATE_HOME="$GCST_HOME" bash "$ENGINE" --status 43 --json >"$TDIR/st-ceiling.json" 2>/dev/null
+  check '#273 --status --json still reports a recent generating record as holding' \
+    "$(jq -e '.reservations[0] | .holds_capacity == true and .past_generation_ceiling == false and .state == "generating-or-recoverable"' "$TDIR/st-ceiling.json" >/dev/null; echo $?)" \
+    "$(jq -c '.reservations[0]' "$TDIR/st-ceiling.json" 2>/dev/null)"
 fi
 # #67/#68 P2: THREE states. Bare .unbound captures are AMBIGUOUS and retryable (strict nonce
 # mode makes one when an older answer is visible while ours generates); only a positively
@@ -10257,7 +10345,12 @@ SW_GH_LINE='pr view 77 --repo github.com/acme/fresh --json state,headRefOid'
 slotwait_run() { # home lock-wait gh-state gh-head [gh-mode] [max-concurrency] [reconcile-interval] [gh-bin]
   local home="$1"
   : > "$SUPER_GH_CALLS"
-  env PRO_GATE_HOME="$home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
+  # The #234 holders below are charged at fixed 2023 epochs that their markers, run-meta and
+  # bindings all bind to, so under the #273 generation ceiling they would hold no capacity at all
+  # and the sweep under test would never run. Those cases test supersession of a holder that
+  # still holds, so they turn the ceiling off; the #273 cases set SW_GEN_CEILING to the default.
+  env PRO_GATE_GENERATION_CEILING="${SW_GEN_CEILING:-0}" \
+    PRO_GATE_HOME="$home" ORACLE_BROWSER_PORT="$PORT" PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 \
     PRO_GATE_MAX_CONCURRENCY="${6:-1}" PRO_GATE_RAMP=0 PRO_GATE_LOCK_WAIT="$2" \
     PRO_GATE_RECONCILE_INTERVAL="${7:-3600}" PRO_GATE_GH_BIN="${8:-$SUPER_GH}" \
     PG_TEST_GH_CALLS="$SUPER_GH_CALLS" PG_TEST_GH_MODE="${5:-ok}" PG_TEST_GH_STATE="$3" PG_TEST_GH_HEAD="$4" \
@@ -10362,6 +10455,63 @@ check '#234 a zero-length slot wait starts no supersession sweep' \
   "$([ "$RC" -eq 7 ] && [ -z "$(slotwait_proof_calls)" ] \
      && [ "$(slotwait_state "$SW_NOWAIT_HOME" "$SW_NOWAIT_MARKER")" = generating ]; echo $?)" \
   "$(slotwait_detail "$SW_NOWAIT_HOME" "$SW_NOWAIT_MARKER")"
+
+# #273, the incident shape: the holder's PR is still open at its bound head, so supersession has
+# nothing to prove, and its owner is gone, so nothing will ever collect it. Charged 11000s ago,
+# past the default 3h generation ceiling, it must not block a queued run at effective 1. The
+# record is left exactly as it was: still generating, still harvestable, charge kept.
+SW_CEIL_HOME="$TDIR/home-slotwait-ceiling"
+SW_CEIL_EPOCH="$(( $(date +%s) - 11000 ))"
+SW_CEIL_MARKER="pg-run-acme-fresh-77-${SW_CEIL_EPOCH}-1"
+super_seed "$SW_CEIL_HOME" "$SW_CEIL_MARKER" "$SW_CEIL_EPOCH" "$FRESH_HEAD"
+SW_CEIL_BEFORE="$(cut -f1,2,4- "$SW_CEIL_HOME/in-progress/$SW_CEIL_MARKER")"
+SW_GEN_CEILING=10800 slotwait_run "$SW_CEIL_HOME" 3 OPEN "$FRESH_HEAD"
+check '#273 a queued run is not blocked by an open-PR holder charged past the generation ceiling' \
+  "$([ "$RC" -eq 0 ] && [ -s "$SW_CEIL_HOME/waiter.md" ]; echo $?)" \
+  "$(slotwait_detail "$SW_CEIL_HOME" "$SW_CEIL_MARKER")"
+check '#273 that holder stays generating and harvestable, with its charge, after the run takes its slot' \
+  "$([ "$(slotwait_state "$SW_CEIL_HOME" "$SW_CEIL_MARKER")" = generating ] \
+     && [ "$(cut -f1,2,4- "$SW_CEIL_HOME/in-progress/$SW_CEIL_MARKER")" = "$SW_CEIL_BEFORE" ] \
+     && [ -f "$SW_CEIL_HOME/run-meta/$SW_CEIL_MARKER" ] \
+     && ! grep -Fq '"outcome":"superseded"' "$SW_CEIL_HOME/ledger.jsonl" 2>/dev/null; echo $?)" \
+  "before=$SW_CEIL_BEFORE $(slotwait_detail "$SW_CEIL_HOME" "$SW_CEIL_MARKER")"
+# Planted negative: the same holder charged 1000s ago is a review that may still be generating,
+# so it keeps its slot and the queued run times out exactly as before.
+SW_RECENT_HOME="$TDIR/home-slotwait-recent"
+SW_RECENT_EPOCH="$(( $(date +%s) - 1000 ))"
+SW_RECENT_MARKER="pg-run-acme-fresh-77-${SW_RECENT_EPOCH}-1"
+super_seed "$SW_RECENT_HOME" "$SW_RECENT_MARKER" "$SW_RECENT_EPOCH" "$FRESH_HEAD"
+SW_GEN_CEILING=10800 slotwait_run "$SW_RECENT_HOME" 3 OPEN "$FRESH_HEAD"
+check '#273 a holder charged inside the generation ceiling still blocks the queued run' \
+  "$([ "$RC" -eq 7 ] && [ ! -s "$SW_RECENT_HOME/waiter.md" ] \
+     && [ "$(slotwait_state "$SW_RECENT_HOME" "$SW_RECENT_MARKER")" = generating ] \
+     && grep -Fq "  $SW_RECENT_MARKER  [$SUPER_KEY] generating" "$TDIR/slotwait.stderr"; echo $?)" \
+  "$(slotwait_detail "$SW_RECENT_HOME" "$SW_RECENT_MARKER")"
+# A past-ceiling holder whose PR has merged is still superseded when a sweep runs, and a sweep runs
+# only while something blocks the queued run: here a recent holder on the same merged PR. Only the
+# holder that held the slot may be logged as releasing it; the stale one held none, and both keep
+# their charge.
+SW_PAIR_HOME="$TDIR/home-slotwait-ceiling-pair"
+SW_PAIR_STALE_EPOCH="$(( $(date +%s) - 11000 ))"
+SW_PAIR_STALE="pg-run-acme-fresh-77-${SW_PAIR_STALE_EPOCH}-1"
+SW_PAIR_LIVE_EPOCH="$(( $(date +%s) - 1000 ))"
+SW_PAIR_LIVE="pg-run-acme-fresh-77-${SW_PAIR_LIVE_EPOCH}-1"
+super_seed "$SW_PAIR_HOME" "$SW_PAIR_STALE" "$SW_PAIR_STALE_EPOCH" "$FRESH_HEAD"
+super_seed "$SW_PAIR_HOME" "$SW_PAIR_LIVE" "$SW_PAIR_LIVE_EPOCH" "$FRESH_HEAD"
+SW_GEN_CEILING=10800 slotwait_run "$SW_PAIR_HOME" 20 MERGED "$FRESH_HEAD"
+check '#273 the sweep supersedes a past-ceiling holder without claiming it freed a slot' \
+  "$([ "$RC" -eq 0 ] && [ -s "$SW_PAIR_HOME/waiter.md" ] \
+     && [ "$(slotwait_state "$SW_PAIR_HOME" "$SW_PAIR_STALE")" = superseded ] \
+     && slotwait_ledgered "$SW_PAIR_HOME" "$SW_PAIR_STALE" "pr-merged:$FRESH_HEAD" \
+     && grep -Fq "superseded $SW_PAIR_STALE: pr-merged:$FRESH_HEAD, so its review no longer applies; it was already past the generation ceiling and held no slot" "$TDIR/slotwait.stderr" \
+     && ! grep -Fq "released the account slot held by $SW_PAIR_STALE" "$TDIR/slotwait.stderr" \
+     && [ "$(awk -F'\t' 'NR==1{print $7}' "$SW_PAIR_HOME/in-progress/$SW_PAIR_STALE")" = "$SW_PAIR_STALE_EPOCH" ]; echo $?)" \
+  "$(slotwait_detail "$SW_PAIR_HOME" "$SW_PAIR_STALE")"
+check '#273 the recent holder on the same sweep is the one logged as releasing the slot' \
+  "$([ "$(slotwait_state "$SW_PAIR_HOME" "$SW_PAIR_LIVE")" = superseded ] \
+     && grep -Fq "released the account slot held by $SW_PAIR_LIVE: pr-merged:$FRESH_HEAD" "$TDIR/slotwait.stderr" \
+     && ! grep -Fq "superseded $SW_PAIR_LIVE: " "$TDIR/slotwait.stderr"; echo $?)" \
+  "$(slotwait_detail "$SW_PAIR_HOME" "$SW_PAIR_LIVE")"
 
 # A holder's PR that merges while the run is already waiting is released on a later sweep. This gh
 # answers the proof's read OPEN at the bound head the first time and MERGED from the second.

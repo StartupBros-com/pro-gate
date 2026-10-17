@@ -10,7 +10,11 @@ One invocation bound to an immutable review target and evidence identity. An att
 
 ### Reservation
 
-Durable ownership of review-account capacity for a submitted attempt that may outlive its invoking process. A reservation can remain collectable without holding capacity after proof-backed completion or supersession.
+Durable ownership of review-account capacity for a submitted attempt that may outlive its invoking process. A reservation can remain collectable without holding capacity after proof-backed completion or supersession, or once it outlives the Generation Ceiling.
+
+### Generation Ceiling
+
+The age, measured from a reservation's charge, past which a still-generating reservation stops counting against review capacity. It is set well above the longest measured successful generation. Nothing is written when it passes: the record, its charge and its harvest path are unchanged, and removal still needs the TTL plus confirmed marker misses.
 
 ### Reservation Guard
 
@@ -118,6 +122,7 @@ The engine appends its own output contract after a brief, so a brief chooses the
 - A Reservation Guard serializes the recording of a Reservation against the capacity decision that reads it; it is not itself capacity, and it is held for far less time than a Reservation.
 - The Orphan Grace governs a Reservation Guard's lockless fallback only, and covers the window before an owner is recorded; the liveness check covers every moment after.
 - A Terminal Disposition or Supersession can release a Reservation's capacity without deleting the attempt's audit history.
+- The Generation Ceiling stops a Reservation counting against capacity without changing its lifecycle state, so a later harvest still sees `generating`.
 - Applicability is an input to the Review Decision, not a synonym for completion.
 - Input Policy constrains evidence delivery before a Review Attempt can be submitted.
 - A Brief redirects what a Review Attempt asks; it never widens who may act on the answer.
