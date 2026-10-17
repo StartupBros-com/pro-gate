@@ -3656,7 +3656,11 @@ EOF
   # prompt (a foreign or stale conversation's review cannot carry it). It sits ON the VERDICT
   # line because the collector's extraction ends at that line; the engine strips it before
   # returning output. Non-compliance degrades gracefully to the path-overlap check.
-  echo "(run marker: ${RUN_MARKER} — internal correlation id. Do not discuss it, but append it verbatim to the end of your final VERDICT line, i.e.: VERDICT: <your verdict> (run marker: ${RUN_MARKER}))"
+  # The example carries the reason the format above asks for, BEFORE the marker's own
+  # parentheses. An example without it made Pro fold the reason in with the marker
+  # ("VERDICT: SHIP (no defects; run marker: X)"), which never binds, so a finished SHIP was
+  # refused (#271). The parser stays strict; the prompt asks for the shape it accepts.
+  echo "(run marker: ${RUN_MARKER} — internal correlation id. Do not discuss it, but append it verbatim, in its own parentheses after your reason, to the end of your final VERDICT line. Never put the reason inside the marker's parentheses, i.e.: VERDICT: <SHIP|FIX-FIRST|NEEDS-DISCUSSION> — <reason> (run marker: ${RUN_MARKER}))"
 } > "$PROMPT_FILE"
 
 # --- assemble --file attachments (bundle mode) ---

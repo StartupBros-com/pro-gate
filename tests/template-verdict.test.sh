@@ -370,6 +370,7 @@ while [ "$#" -gt 0 ]; do
   case "$1" in -p) prompt="$2"; shift 2;; --write-output) output="$2"; shift 2;; *) shift;; esac
 done
 marker="$(printf '%s' "$prompt" | grep -oE 'pg-run-[A-Za-z0-9.-]+' | tail -1)"
+[ -z "${TEMPLATE_PROMPT:-}" ] || printf '%s\n' "$prompt" > "$TEMPLATE_PROMPT"
 printf 'P0: none\nP1: none\nP2: none\nP3: none\nVERDICT: SHIP (run marker: %s)\n' "$marker" > "$output"
 { printf 'run marker: %s\n' "$marker"; cat "$output"; } > "$TEMPLATE_TAB"
 printf 'submitted\n' >> "$TEMPLATE_SUBMISSIONS"
@@ -385,13 +386,20 @@ env PRO_GATE_HOME="$TDIR/fresh-home" PRO_GATE_LEDGER="$TDIR/fresh-ledger.jsonl" 
   PRO_GATE_CHAT_RENAME=0 PRO_GATE_KEEP_TABS=1 PRO_GATE_RAMP=0 PRO_GATE_MAX_RETRIES=1 \
   PRO_GATE_SALVAGE_SECS=1 PRO_GATE_REATTACH_TIMEOUT=1 PRO_GATE_TIMEOUT_GRACE=0 \
   PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_PRE_RETRY_PROBE_SECS=1 \
-  TEMPLATE_TAB="$TDIR/tab.txt" TEMPLATE_SUBMISSIONS="$TDIR/submissions" \
+  TEMPLATE_TAB="$TDIR/tab.txt" TEMPLATE_SUBMISSIONS="$TDIR/submissions" TEMPLATE_PROMPT="$TDIR/fresh-prompt.txt" \
   bash "$ROOT/bin/oracle-review.sh" --diff "$ROOT/tests/fixtures/template-verdict/review.diff" \
     --repo "$TDIR" --out "$TDIR/fresh.md" --timeout 2s \
     > "$TDIR/fresh.stdout" 2> "$TDIR/fresh.stderr"
 rc=$?
 check 'fresh skeleton exits 6 after guarded salvage' "$([ "$rc" = 6 ]; echo $?)"
 check 'fresh skeleton never records clean or dispatches a second submission' "$(jq -se 'length==1 and .[0].outcome=="template-verdict" and .[0].names_nothing==true and .[0].body_bytes>0' "$TDIR/fresh-ledger.jsonl" >/dev/null && [ "$(wc -l < "$TDIR/submissions")" = 1 ]; echo $?)"
+# #271: the VERDICT example in the prompt actually sent must put the reason before the marker's
+# own parentheses and, filled in, bind under the unchanged strict terminal parser.
+sent_marker="$(grep -oE 'pg-run-[A-Za-z0-9.-]+' "$TDIR/fresh-prompt.txt" | tail -1)"
+grep -F 'internal correlation id' "$TDIR/fresh-prompt.txt" | sed -n 's/.*i\.e\.: \(.*\))$/\1/p' > "$TDIR/example.txt"
+check '#271: the prompt example puts the reason before the marker parentheses' "$(grep -qF -- "— <reason> (run marker: $sent_marker)" "$TDIR/example.txt"; echo $?)"
+sed 's/<SHIP|FIX-FIRST|NEEDS-DISCUSSION>/SHIP/; s/<reason>/no defects in review.diff/' "$TDIR/example.txt" > "$TDIR/example-filled.md"
+check '#271: the filled prompt example binds to the run that sent it' "$([ -n "$sent_marker" ] && [ "$(pg_capture_verdict_claims "$TDIR/example-filled.md" terminal)" = "$sent_marker" ]; echo $?)"
 env PRO_GATE_HOME="$TDIR/outage-home" PRO_GATE_LEDGER="$TDIR/outage-ledger.jsonl" \
   ORACLE_BROWSER_PORT="$(cat "$TDIR/port")" PRO_GATE_BROWSER_MODE=remote-chrome \
   PRO_GATE_ORACLE_BIN="$TDIR/oracle-template" PRO_GATE_GH_BIN="$TDIR/no-gh" \
