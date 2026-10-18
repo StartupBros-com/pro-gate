@@ -5269,9 +5269,11 @@ pg_review_facts_candidates() { # host owner repo pr -> candidate metadata JSON
         [ -e "$f" ] || [ -L "$f" ] || continue
         marker="${f##*/}"
         [ "$dir" != "$PRO_GATE_HOME/recovered" ] || marker="${marker%.md}"
-        # Match publication PID suffixes only, not legitimate names such as .tmp.v2.
+        # Match publication PID suffixes only, not legitimate names such as .tmp.v2. The leading
+        # parentheses keep bash 3.2 (stock macOS) from reading a pattern's `)` as the end of this
+        # process substitution (#295).
         case "$marker" in
-          *.tmp.*) tail="${marker##*.tmp.}"; case "$tail" in ''|*[!0-9]*) ;; *) continue ;; esac ;;
+          (*.tmp.*) tail="${marker##*.tmp.}"; case "$tail" in (''|*[!0-9]*) ;; (*) continue ;; esac ;;
         esac
         printf '%s\n' "$marker"
       done
