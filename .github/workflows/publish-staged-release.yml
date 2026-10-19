@@ -81,10 +81,7 @@ jobs:
           fi
           IFS=$'\t' read -r card_version card_tag card_id card_sha card_kind card_url <<<"$card_tuple"
 
-          if [ "$card_version" != "$version" ] || [ "$card_tag" != "$RELEASE_TAG" ] \
-             || [ "$card_id" != "$release_id" ] || [ "$card_sha" != "$source_sha" ] \
-             || [ "$card_kind" != 'url' ] \
-             || [ "$card_url" != 'https://github.com/StartupBros-com/pro-gate.git' ]; then
+          if ! marketplace_card_matches_release "$card_tuple" "$version" "$RELEASE_TAG" "$release_id" "$source_sha"; then
             echo "error: marketplace card does not name $RELEASE_TAG (releaseId $release_id, sha $source_sha)." >&2
             echo "       card lists $card_tag (releaseId $card_id, sha $card_sha)." >&2
             echo "       Merge the repin PR against StartupBros-com/hov-marketplace first." >&2
