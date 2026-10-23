@@ -57,13 +57,18 @@ const corpusBytes = encode(corpus);
 const contractDigest = digest(contractBytes);
 const corpusDigest = digest(corpusBytes);
 let lib = read("lib/pro-gate-lib.sh");
-const replacePin = (name, value) => {
-  const pattern = new RegExp(`^${name}='([^']*)'`, "m");
+const replacePin = (name, value, numeric = false) => {
+  const pattern = new RegExp(
+    numeric ? `^${name}=([0-9]+)$` : `^${name}='([^']*)'`,
+    "m",
+  );
   if (!pattern.test(lib)) throw new Error(`missing identity pin: ${name}`);
   const previous = lib.match(pattern)[1];
-  lib = lib.replace(pattern, `${name}='${value}'`);
+  lib = lib.replace(pattern, () => `${name}=${numeric ? value : `'${value}'`}`);
   return previous;
 };
+replacePin("PG_REVIEW_DECISION_CONTRACT_ID", contract.contract_id);
+replacePin("PG_REVIEW_DECISION_CONTRACT_VERSION", contract.contract_version, true);
 const previous = replacePin(
   "PG_REVIEW_DECISION_CONTRACT_DIGEST",
   contractDigest,
