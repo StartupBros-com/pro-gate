@@ -302,4 +302,7 @@ pkg_step="$(grep -nxF 'Package exact runtime release' <<<"$REL_STEPS" | cut -d: 
 [ "$(yq '.permissions.actions' "$ROOT/.github/workflows/release.yml")" = read ] || fail 'the gate needs actions: read'
 pass 'release.yml requires the passed CI run between the tag checks and packaging'
 
+# All three release callers must agree on the exact six-field tuple.
+bash "$ROOT/tests/lib/marketplace-release-contract.sh" "$ROOT"
+
 echo 'ALL PASS'

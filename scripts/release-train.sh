@@ -2,12 +2,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CANONICAL_SOURCE_KIND='url'
-CANONICAL_SOURCE_URL='https://github.com/StartupBros-com/pro-gate.git'
 
 # Shared with scripts/publish-runtime-release.sh so the publish gate and this
 # post-publish guard can never disagree about what the card says. The failure
-# POLICY stays here (stale -> red); the helper only reads and types the tuple.
+# POLICY stays here (stale -> red); the library reads, types, and compares the tuple.
 # shellcheck source=scripts/lib/marketplace-card.sh
 . "$SCRIPT_DIR/lib/marketplace-card.sh"
 
@@ -150,8 +148,8 @@ verify_marketplace_promotion() {
   # Read + type the live card via the shared helper (one gh api call against the
   # marketplace's default branch, so this always sees whatever a merged repin PR
   # most recently produced). The helper fails closed on fetch/parse/type errors
-  # and NEVER decides staleness — that comparison stays below, because STALE and
-  # UNVERIFIED must not be conflated (issue #84).
+  # before the separate comparison below, because STALE and UNVERIFIED must
+  # not be conflated (issue #84).
   local card_rc=0
   card_tuple="$(marketplace_card_tuple "$REPOSITORY")" || card_rc=$?
   if [ "$card_rc" -ne 0 ]; then
@@ -159,10 +157,7 @@ verify_marketplace_promotion() {
   fi
   IFS=$'\t' read -r card_version card_tag card_id card_sha card_source_kind card_source_url <<<"$card_tuple"
 
-  if [[ "$card_version" == "$RELEASE_VERSION" && "$card_tag" == "$RELEASE_TAG" \
-        && "$card_id" == "$RELEASE_ID" && "$card_sha" == "$SOURCE_SHA" \
-        && "$card_source_kind" == "$CANONICAL_SOURCE_KIND" \
-        && "$card_source_url" == "$CANONICAL_SOURCE_URL" ]]; then
+  if marketplace_card_matches_release "$card_tuple" "$RELEASE_VERSION" "$RELEASE_TAG" "$RELEASE_ID" "$SOURCE_SHA"; then
     printf 'marketplace card already lists %s (releaseId %s, sha %s): distribution is current\n' \
       "$RELEASE_TAG" "$RELEASE_ID" "$SOURCE_SHA"
     return 0

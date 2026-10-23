@@ -84,3 +84,17 @@ marketplace_card_tuple() {
 
   printf '%s\n' "$tuple"
 }
+
+# marketplace_card_matches_release <typed-tsv-tuple> <version> <tag> <id> <sha>
+# Pure comparison of an already fetched, validated tuple. Fetch/type failures
+# remain UNVERIFIED at the caller; a non-match only selects its stale policy.
+marketplace_card_matches_release() {
+  local tuple="$1" version="$2" tag="$3" release_id="$4" source_sha="$5"
+  local card_version card_tag card_id card_sha card_kind card_url
+  IFS=$'\t' read -r card_version card_tag card_id card_sha card_kind card_url <<<"$tuple"
+
+  [ "$card_version" = "$version" ] && [ "$card_tag" = "$tag" ] \
+    && [ "$card_id" = "$release_id" ] && [ "$card_sha" = "$source_sha" ] \
+    && [ "$card_kind" = 'url' ] \
+    && [ "$card_url" = 'https://github.com/StartupBros-com/pro-gate.git' ]
+}

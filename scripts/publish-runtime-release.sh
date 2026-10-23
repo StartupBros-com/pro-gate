@@ -85,10 +85,7 @@ if [ "$state" = draft ]; then
   fi
   IFS=$'\t' read -r card_version card_tag card_id card_sha card_kind card_url <<<"$card_tuple"
 
-  if [ "$card_version" = "$version" ] && [ "$card_tag" = "$tag" ] \
-     && [ "$card_id" = "$release_id" ] && [ "$card_sha" = "$source_sha" ] \
-     && [ "$card_kind" = 'url' ] \
-     && [ "$card_url" = 'https://github.com/StartupBros-com/pro-gate.git' ]; then
+  if marketplace_card_matches_release "$card_tuple" "$version" "$tag" "$release_id" "$source_sha"; then
     printf 'marketplace card already lists %s (releaseId %s): publishing\n' "$tag" "$release_id"
     gh release edit "$tag" --draft=false
   else
