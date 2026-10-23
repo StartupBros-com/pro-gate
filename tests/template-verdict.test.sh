@@ -12,7 +12,7 @@ check() {
   CHECKS=$((CHECKS + 1))
   if [ "$2" = 0 ]; then echo "ok - $1"; else echo "FAIL - $1"; FAILS=$((FAILS + 1)); fi
 }
-for name in pg_check_review_shape pg_require_review_shape pg_finish; do
+for name in pg_preserve_rejected_capture pg_check_review_shape pg_require_review_shape pg_finish; do
   eval "$(awk -v name="$name" '$0 ~ "^" name "\\(\\)" {p=1} p{print} p && /^}/{exit}' "$ROOT/bin/oracle-review.sh")"
 done
 # Only lifecycle effects are stubbed; classification, bytes, hashing and ledger JSON are real.
@@ -41,14 +41,76 @@ pg_review_shape "$TDIR/inline.md" "$TOKENS"; rc=$?
 check 'one-line skeleton is rejected' "$([ "$rc" = 1 ] && [ "$PG_NAMES_NOTHING" = true ]; echo $?)"
 
 review() { printf 'P0: none\nP1: none\nP2: none\nP3: none\n\n%s\n\nVERDICT: SHIP\n' "$1" > "$OUT"; }
+# Hidden-path regression: exercise generated vocabulary and independently frozen retained
+# vocabulary from 0.62.0/0.63.1 (path-only input emits the same tokens in both).
+cat > "$TDIR/hidden.diff" <<'DIFF'
+diff --git a/.claude-plugin/marketplace.json b/.claude-plugin/marketplace.json
+--- a/.claude-plugin/marketplace.json
++++ b/.claude-plugin/marketplace.json
+diff --git a/.gitignore b/.gitignore
+--- a/.gitignore
++++ b/.gitignore
+diff --git a/src/.config/settings.json b/src/.config/settings.json
+--- a/src/.config/settings.json
++++ b/src/.config/settings.json
+DIFF
+cat > "$TDIR/hidden-legacy.tokens" <<'TOKENS'
+.claude-plugin/marketplace.json
+.config/settings.json
+.gitignore
+a/.claude-plugin/marketplace.json
+a/.gitignore
+a/src/.config/settings.json
+b/.claude-plugin/marketplace.json
+b/.gitignore
+b/src/.config/settings.json
+claude-plugin
+gitignore
+json
+marketplace
+marketplace.json
+settings
+settings.json
+src
+src/.config/settings.json
+config
+a
+b
+TOKENS
+pg_review_tokens "$TDIR/hidden.diff" > "$TDIR/hidden.tokens"
+check 'hidden paths preserve the complete released diff vocabulary' "$(LC_ALL=C sort -u "$TDIR/hidden-legacy.tokens" > "$TDIR/hidden-expected.tokens" && cmp -s "$TDIR/hidden-expected.tokens" "$TDIR/hidden.tokens"; echo $?)"
+# The stripped spelling was already accepted for unprefixed path input. Keep that
+# retained spelling available too; do not replace normalization with literal-only output.
+printf '%s\n' 'claude-plugin/marketplace.json' > "$TDIR/hidden-normalized.tokens"
+for vocabulary in hidden hidden-legacy; do
+  for citation in '.claude-plugin/marketplace.json' '.claude-plugin/marketplace.json:5' '.claude-plugin/marketplace.json:5-19' './.claude-plugin/marketplace.json:5-19' '.gitignore' '.gitignore:5' '.gitignore:5-19' './.gitignore' './.gitignore:5-19' 'src/.config/settings.json' 'src/.config/settings.json:5-19' '.config/settings.json:5-19' './src/.config/settings.json:5-19'; do
+    review "Checked \`$citation\` for consistency."
+    pg_review_shape "$OUT" "$TDIR/$vocabulary.tokens"; rc=$?
+    if [ "$rc" = 0 ] && [ "$PG_NAMES_NOTHING" = false ]; then check "$vocabulary accepts hidden citation $citation" 0; else check "$vocabulary accepts hidden citation $citation" 1; fi
+  done
+  for citation in '.unknown/marketplace.json:5-19' '.claude-plugin/unknown.json' 'src/.unknown/settings.json' '.gitignoreExtra:5-19' '.claude-plugin/marketplace:5-19' '.claude-plugin/marketplace.jsonExtra' '.claude-plugin/marketplace.json:5-19-extra' '.gitignore:5-' '.gitignore:5-x' 'claudePluginExtra'; do
+    review "Checked \`$citation\` for consistency."
+    pg_review_shape "$OUT" "$TDIR/$vocabulary.tokens"; rc=$?
+    if [ "$rc" = 1 ] && [ "$PG_NAMES_NOTHING" = true ]; then check "$vocabulary rejects unknown/partial/malformed citation $citation" 0; else check "$vocabulary rejects unknown/partial/malformed citation $citation" 1; fi
+  done
+  printf 'P0: none .gitignore\nP1: none\nP2: none\nP3: none\nVERDICT: SHIP — reviewed .claude-plugin/marketplace.json:5-19\n' > "$OUT"
+  pg_review_shape "$OUT" "$TDIR/$vocabulary.tokens"; rc=$?
+  if [ "$rc" = 1 ] && [ "$PG_NAMES_NOTHING" = true ]; then check "$vocabulary excludes hidden citations confined to verdict/severity lines" 0; else check "$vocabulary excludes hidden citations confined to verdict/severity lines" 1; fi
+done
+for citation in 'claude-plugin/marketplace.json' '.claude-plugin/marketplace.json' './.claude-plugin/marketplace.json:5-19'; do
+  review "Checked \`$citation\` for consistency."
+  pg_review_shape "$OUT" "$TDIR/hidden-normalized.tokens"; rc=$?
+  if [ "$rc" = 0 ] && [ "$PG_NAMES_NOTHING" = false ]; then check "previously stripped vocabulary accepts $citation" 0; else check "previously stripped vocabulary accepts $citation" 1; fi
+done
+
 pg_review_shape "$ROOT/tests/fixtures/template-verdict/compliant-clean.txt" "$TOKENS"
 check 'P1-a: compliant clean review with a separate rationale is accepted' "$?"
-for rationale in 'Checked src/review-engine.ts:22 for failure handling.' 'Checked classifyReview for failure handling.' 'Checked policy_name for failure handling.' 'Checked review-engine.ts for failure handling.'; do
+for rationale in 'Checked src/review-engine.ts:22 for failure handling.' 'Checked classifyReview for failure handling.' 'Checked policy_name for failure handling.' 'Checked review-engine.ts for failure handling.' 'Checked review-engine.ts:22-40 for failure handling.' 'Checked src/review-engine.ts:22-40 for failure handling.' 'Checked classifyReview:22-40 for failure handling.'; do
   review "$rationale"
   pg_review_shape "$OUT" "$TOKENS"; rc=$?
   check "token overlap: $rationale" "$([ "$rc" = 0 ]; echo $?)"
 done
-for rationale in 'tests clean function migration' 'Checked inventedIdentifier for regressions.' 'Checked src/not-reviewed.ts.' 'Checked classifyReviewExtra.'; do
+for rationale in 'tests clean function migration' 'Checked inventedIdentifier for regressions.' 'Checked src/not-reviewed.ts.' 'Checked classifyReviewExtra.' 'Checked not-reviewed.ts:22-40.' 'Checked src/not-reviewed.ts:22-40.' 'Checked classifyReviewExtra:22-40.' 'Checked review-engine.ts:22-40-extra.'; do
   review "$rationale"
   pg_review_shape "$OUT" "$TOKENS"; rc=$?
   check "no invented/plain/substr token credit: $rationale" "$([ "$rc" = 1 ] && [ "$PG_NAMES_NOTHING" = true ]; echo $?)"
@@ -58,7 +120,7 @@ pg_review_shape "$OUT" "$TOKENS"; rc=$?
 check 'severity-label names and plain-English verdict reasons do not establish rationale' "$([ "$rc" = 1 ] && [ "$PG_NAMES_NOTHING" = true ]; echo $?)"
 # Gate r1 P2: the verdict line is excluded whole, so a diff path appended to it is still the
 # skeleton; the same path in its own paragraph beside a reasoned verdict line passes.
-for verdict_line in 'VERDICT: SHIP — Checked src/review-engine.ts for failure handling.' 'VERDICT: SHIP — reviewed src/review-engine.ts' '**VERDICT:** SHIP (src/review-engine.ts:22, classifyReview)'; do
+for verdict_line in 'VERDICT: SHIP — Checked src/review-engine.ts for failure handling.' 'VERDICT: SHIP — reviewed src/review-engine.ts' '**VERDICT:** SHIP (src/review-engine.ts:22, classifyReview)' 'VERDICT: SHIP — reviewed review-engine.ts:22-40'; do
   printf 'P0: none\nP1: none\nP2: none\nP3: none\n%s\n' "$verdict_line" > "$OUT"
   pg_review_shape "$OUT" "$TOKENS"; rc=$?
   check "gate r1 P2: a diff reference only on the verdict line does not establish rationale: $verdict_line" "$([ "$rc" = 1 ] && [ "$PG_NAMES_NOTHING" = true ]; echo $?)"
@@ -218,8 +280,74 @@ rc=$?
 check 'real harvest rejects a final skeleton with exit 6' "$([ "$rc" = 6 ]; echo $?)"
 check 'real harvest records typed outcome, bytes and flag without a clean row' "$(jq -se 'length==1 and all(.[]; .outcome=="template-verdict" and .exit==6 and .body_bytes>0 and .names_nothing==true)' "$TDIR/engine-ledger.jsonl" >/dev/null; echo $?)"
 check 'real harvest publishes neither result nor completed artifact' "$([ ! -s "$TDIR/harvest.md" ] && [ ! -e "$ENGINE_HOME/completed/$RUN_MARKER" ] && ! grep -q RESULT_FILE "$TDIR/harvest.stdout"; echo $?)"
+check '#271: rejected skeleton bytes survive harvest for inspection' "$(grep -lF 'VERDICT: SHIP' "$TDIR"/harvest.md.rejected.* >/dev/null 2>&1; echo $?)"
+mkdir "$TDIR/default-work"
+env PRO_GATE_HOME="$ENGINE_HOME" PRO_GATE_LEDGER="$TDIR/default-ledger.jsonl" TMPDIR="$TDIR/default-work" \
+  ORACLE_BROWSER_PORT="$(cat "$TDIR/port")" PRO_GATE_BROWSER_MODE=remote-chrome \
+  PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_CHAT_RENAME=0 PRO_GATE_KEEP_TABS=1 \
+  bash "$ROOT/bin/oracle-review.sh" --harvest "$RUN_MARKER" --timeout 1s \
+  > "$TDIR/default.stdout" 2> "$TDIR/default.stderr"
+rc=$?
+default_capture="$(find "$TDIR/default-work" -name 'findings.md.rejected.*' -print -quit)"
+check '#271: default output cleanup retains rejected bytes too' "$([ "$rc" = 6 ] && [ -s "$default_capture" ] && grep -qF 'VERDICT: SHIP' "$default_capture"; echo $?)"
+
+mkdir "$TDIR/storage-work"
+long_out="$TDIR/$(printf '%0245d' 0)"
+env PRO_GATE_HOME="$ENGINE_HOME" PRO_GATE_LEDGER="$TDIR/storage-ledger.jsonl" TMPDIR="$TDIR/storage-work" \
+  ORACLE_BROWSER_PORT="$(cat "$TDIR/port")" PRO_GATE_BROWSER_MODE=remote-chrome \
+  PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_CHAT_RENAME=0 PRO_GATE_KEEP_TABS=1 \
+  bash "$ROOT/bin/oracle-review.sh" --harvest "$RUN_MARKER" --out "$long_out" --timeout 1s \
+  > "$TDIR/storage.stdout" 2> "$TDIR/storage.stderr"
+rc=$?
+private_capture="$(find "$TDIR/storage-work" -name harvest.capture -print -quit)"
+check '#271: rejected-output storage failure preserves private evidence' "$([ "$rc" = 3 ] && [ -s "$private_capture" ] && grep -qF 'VERDICT: SHIP' "$private_capture" && ! grep -q RESULT_FILE "$TDIR/storage.stdout"; echo $?)"
+
+# Retaining rejected bytes must not release recovery ownership or refund a charge.
+# Ungrounded, missing/foreign, stale and incomplete answers retain their existing protection.
+serial=40
+for ownership in owned foreign missing stale skeleton; do
+  serial=$((serial + 1))
+  reject_home="$TDIR/rejected-$ownership"
+  PRO_GATE_HOME="$reject_home" pg_round_record "$ROUND_KEY"
+  reject_epoch="$PG_ROUND_SPEND_EPOCH"
+  reject_marker="pg-run-$ROUND_KEY-$reject_epoch-$serial"
+  reject_out="$TDIR/rejected-$ownership.md"
+  PRO_GATE_HOME="$reject_home" pg_run_meta_write "$reject_marker" github.com acme review "$ROUND_KEY" 262 "$reject_out" "$reject_epoch"
+  PRO_GATE_HOME="$reject_home" pg_reservation_write "$reject_marker" "$ROUND_KEY" "$reject_out" "" fixture "$reject_epoch"
+  PRO_GATE_HOME="$reject_home" pg_review_tokens_write "$reject_marker" "$ROOT/tests/fixtures/template-verdict/review.diff"
+  reject_binding="$(shape_binding "$reject_marker" "$(pg_review_decision_contract_digest)" | jq -cS --argjson epoch "$reject_epoch" '.charged_spend_epoch=$epoch')"
+  PRO_GATE_HOME="$reject_home" pg_review_input_binding_write "$reject_marker" "$reject_binding"
+  case "$ownership" in
+    owned|stale|skeleton) echo_marker=" (run marker: $reject_marker)" ;;
+    foreign) echo_marker=' (run marker: pg-run-acme-other-999-1700000000-7)' ;;
+    missing) echo_marker='' ;;
+  esac
+  {
+    printf 'P0: none\nP1: none\nP2: none\nP3: none\n'
+    [ "$ownership" = skeleton ] || printf '\nChecked unrelatedIdentifier for regressions.\n\n'
+    printf 'VERDICT: SHIP%s\n' "$echo_marker"
+  } > "$TDIR/rejected-expected.md"
+  {
+    printf 'run marker: %s\n' "$reject_marker"
+    cat "$TDIR/rejected-expected.md"
+    [ "$ownership" != stale ] || printf '\nNew prompt: run marker: %s\n' "$reject_marker"
+  } > "$TDIR/tab.txt"
+  env PRO_GATE_HOME="$reject_home" PRO_GATE_LEDGER="$reject_home/ledger.jsonl" \
+    ORACLE_BROWSER_PORT="$(cat "$TDIR/port")" PRO_GATE_BROWSER_MODE=remote-chrome \
+    PRO_GATE_MIN_UPTIME=0 PRO_GATE_SELF_HEAL=0 PRO_GATE_CHAT_RENAME=0 PRO_GATE_KEEP_TABS=1 \
+    bash "$ROOT/bin/oracle-review.sh" --harvest "$reject_marker" --out "$reject_out" --timeout 1s \
+    > "$TDIR/rejected-$ownership.stdout" 2> "$TDIR/rejected-$ownership.stderr"
+  rc=$?
+  check "#271: $ownership rejection never publishes approval" "$([ ! -e "$reject_out" ] && [ ! -e "$reject_home/completed/$reject_marker" ] && ! grep -q RESULT_FILE "$TDIR/rejected-$ownership.stdout"; echo $?)"
+  check "#271: $ownership capture cannot release or refund a charged attempt" "$([ "$rc" != 0 ] && [ ! -e "$reject_home/attempt-dispositions/$reject_marker" ] && [ -s "$reject_home/in-progress/$reject_marker" ] && PRO_GATE_HOME="$reject_home" pg_round_has_epoch "$ROUND_KEY" "$reject_epoch"; echo $?)"
+  check "#271: $ownership rejection preserves its input binding" "$([ "$(PRO_GATE_HOME="$reject_home" pg_review_input_binding_read "$reject_marker")" = "$reject_binding" ]; echo $?)"
+  if [ "$ownership" = owned ]; then
+    kept_capture="$(find "$TDIR" -maxdepth 1 -name "rejected-$ownership.md.rejected.*" -print -quit)"
+    check '#271: retained rejected terminal matches the extracted bytes' "$(cmp -s "$TDIR/rejected-expected.md" "$kept_capture"; echo $?)"
+  fi
+done
 serial=1
-for name in 'src/review-engine.ts:22' classifyReview; do
+for name in 'src/review-engine.ts:22' classifyReview 'review-engine.ts:22-40' 'src/review-engine.ts:22-40'; do
   serial=$((serial + 1)); RUN_MARKER="pg-run-acme-review-262-1791683605-$serial"
   cp "$TOKENS" "$ENGINE_HOME/review-tokens/$RUN_MARKER"
   printf 'run marker: %s\nP0: none\nP1: none\nP2: none\nP3: none\nChecked %s for failure handling.\nVERDICT: SHIP (run marker: %s)\n' "$RUN_MARKER" "$name" "$RUN_MARKER" > "$TDIR/tab.txt"
@@ -242,6 +370,7 @@ while [ "$#" -gt 0 ]; do
   case "$1" in -p) prompt="$2"; shift 2;; --write-output) output="$2"; shift 2;; *) shift;; esac
 done
 marker="$(printf '%s' "$prompt" | grep -oE 'pg-run-[A-Za-z0-9.-]+' | tail -1)"
+[ -z "${TEMPLATE_PROMPT:-}" ] || printf '%s\n' "$prompt" > "$TEMPLATE_PROMPT"
 printf 'P0: none\nP1: none\nP2: none\nP3: none\nVERDICT: SHIP (run marker: %s)\n' "$marker" > "$output"
 { printf 'run marker: %s\n' "$marker"; cat "$output"; } > "$TEMPLATE_TAB"
 printf 'submitted\n' >> "$TEMPLATE_SUBMISSIONS"
@@ -257,13 +386,20 @@ env PRO_GATE_HOME="$TDIR/fresh-home" PRO_GATE_LEDGER="$TDIR/fresh-ledger.jsonl" 
   PRO_GATE_CHAT_RENAME=0 PRO_GATE_KEEP_TABS=1 PRO_GATE_RAMP=0 PRO_GATE_MAX_RETRIES=1 \
   PRO_GATE_SALVAGE_SECS=1 PRO_GATE_REATTACH_TIMEOUT=1 PRO_GATE_TIMEOUT_GRACE=0 \
   PRO_GATE_TEST_MODE=ci-fixture PRO_GATE_TEST_PRE_RETRY_PROBE_SECS=1 \
-  TEMPLATE_TAB="$TDIR/tab.txt" TEMPLATE_SUBMISSIONS="$TDIR/submissions" \
+  TEMPLATE_TAB="$TDIR/tab.txt" TEMPLATE_SUBMISSIONS="$TDIR/submissions" TEMPLATE_PROMPT="$TDIR/fresh-prompt.txt" \
   bash "$ROOT/bin/oracle-review.sh" --diff "$ROOT/tests/fixtures/template-verdict/review.diff" \
     --repo "$TDIR" --out "$TDIR/fresh.md" --timeout 2s \
     > "$TDIR/fresh.stdout" 2> "$TDIR/fresh.stderr"
 rc=$?
 check 'fresh skeleton exits 6 after guarded salvage' "$([ "$rc" = 6 ]; echo $?)"
 check 'fresh skeleton never records clean or dispatches a second submission' "$(jq -se 'length==1 and .[0].outcome=="template-verdict" and .[0].names_nothing==true and .[0].body_bytes>0' "$TDIR/fresh-ledger.jsonl" >/dev/null && [ "$(wc -l < "$TDIR/submissions")" = 1 ]; echo $?)"
+# #271: the VERDICT example in the prompt actually sent must put the reason before the marker's
+# own parentheses and, filled in, bind under the unchanged strict terminal parser.
+sent_marker="$(grep -oE 'pg-run-[A-Za-z0-9.-]+' "$TDIR/fresh-prompt.txt" | tail -1)"
+grep -F 'internal correlation id' "$TDIR/fresh-prompt.txt" | sed -n 's/.*i\.e\.: \(.*\))$/\1/p' > "$TDIR/example.txt"
+check '#271: the prompt example puts the reason before the marker parentheses' "$(grep -qF -- "— <reason> (run marker: $sent_marker)" "$TDIR/example.txt"; echo $?)"
+sed 's/<SHIP|FIX-FIRST|NEEDS-DISCUSSION>/SHIP/; s/<reason>/no defects in review.diff/' "$TDIR/example.txt" > "$TDIR/example-filled.md"
+check '#271: the filled prompt example binds to the run that sent it' "$([ -n "$sent_marker" ] && [ "$(pg_capture_verdict_claims "$TDIR/example-filled.md" terminal)" = "$sent_marker" ]; echo $?)"
 env PRO_GATE_HOME="$TDIR/outage-home" PRO_GATE_LEDGER="$TDIR/outage-ledger.jsonl" \
   ORACLE_BROWSER_PORT="$(cat "$TDIR/port")" PRO_GATE_BROWSER_MODE=remote-chrome \
   PRO_GATE_ORACLE_BIN="$TDIR/oracle-template" PRO_GATE_GH_BIN="$TDIR/no-gh" \

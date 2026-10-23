@@ -64,8 +64,10 @@ continuation from a `VERDICT`, exit code, recoverability flag, or round count.
 ### Make capacity a query over proof-backed attempt state
 
 A durable reservation can exist without consuming capacity. Completed and superseded reservations
-are excluded by `pg_reservation_holding_count` (`lib/pro-gate-lib.sh:1493-1502`). This avoids a second
-manually synchronized “active count.”
+are excluded by `pg_reservation_holding_count` (`lib/pro-gate-lib.sh:1493-1502`), and so is a
+still-generating reservation whose charge is older than the generation ceiling (#273). Every capacity
+reader (slot plan, holding count, holder report, `--status`) asks the one predicate
+`pg_reservation_holds_capacity`. This avoids a second manually synchronized “active count.”
 
 Supersession is monotonic. The transition rechecks the exact marker, canonical key, charged epoch,
 legacy proof, **and the head OID the caller validated against GitHub** under the reservation lock
@@ -126,7 +128,8 @@ Four constraints keep this honest, and the last two bound where it applies at al
 - **The head move must be work you were going to do anyway.** A rebase the branch needs, a fix, a
   real commit. Manufacturing a commit to free a slot games the runtime and corrupts the proof this
   whole model rests on. When nothing is pending, the accurate statement is that the slot stays held
-  until the next real push — not that it cannot be released.
+  until the next real push, or until the generation ceiling (#273) stops it counting 3 h after its
+  charge — not that it cannot be released.
 - **A free collection attempt is not a substitute.** Harvesting a stalled conversation returns the
   same in-progress result; it neither completes nor releases anything.
 - **This is not the current-head stuck case.** If the head has *not* moved, no proof exists yet and
@@ -136,7 +139,9 @@ Four constraints keep this honest, and the last two bound where it applies at al
 - **It requires an input binding.** The proof path reads the attempt's immutable input binding before
   it will query the host, and fails closed when there is none. A classic run given a caller-supplied
   diff has no such binding, so supersession can never be proven for it and this remedy simply does
-  not apply — a known open gap, not a misuse.
+  not apply — a known open gap, not a misuse. The generation ceiling (#273) bounds it: such a
+  reservation still stops counting against capacity 3 h after its charge, though it is never
+  superseded.
 
 The failure this prevents is a reasoning error, not a code defect: treating the absence of one proof
 (the conversation terminating) as the absence of *any* proof, and escalating to a human for something
@@ -175,14 +180,21 @@ timeout hypothesis as historical context; the latest issue guidance is evidence-
 future evidence-gated implementation should require a turn-scoped rendered terminal affordance after
 the latest exact marker, no active-generation control, no newer or foreign marker, and bounded
 fresh-render confirmation. Until that DOM contract is proven, the reservation correctly stays
+recoverable and charged. The generation ceiling (#273) does not change this: it is not terminal
+proof, and past it the reservation only stops counting against capacity, staying `generating`,
 recoverable and charged.
 
 ## Why This Matters
 
-The architecture maximizes useful subscription capacity without inventing a quota API. It releases a
-slot only when evidence says the review is complete or no longer applicable, and it resubmits only
-when the canonical lifecycle says no recoverable attempt remains. This protects both directions:
-starvation from obsolete reservations and double-spend from premature release.
+The architecture maximizes useful subscription capacity without inventing a quota API. It marks a
+reservation complete or superseded only when evidence says the review is complete or no longer
+applicable, and it resubmits only when the canonical lifecycle says no recoverable attempt remains.
+This protects both directions: starvation from obsolete reservations and double-spend from premature
+release. The one time-based rule, the generation ceiling (#273), stops a still-generating reservation
+from counting against capacity 3 h after its charge, without removing, refunding or terminalizing it.
+Same-change admission still reads the record, so each such reservation can add at most one concurrent
+chat on the account and never a second charge for the same change. It exists because a reservation
+whose owner died held its slot until the 6 h TTL plus three confirmed misses, starving queued runs.
 
 Centralizing action in the typed reducer also keeps safety fixes accretive. Capacity proof, legacy
 recovery, and input trust changed across several releases without creating a second caller protocol or
@@ -212,6 +224,7 @@ Bad:
 Good:
   attempt = canonical_snapshot(target)
   holds_capacity = attempt is recoverable and not complete/superseded
+                   and (if generating) its charge is younger than the generation ceiling
   applicable = immutable evidence still matches the current target
   next_action = review_decision(attempt, applicable, current_evidence)
 ```

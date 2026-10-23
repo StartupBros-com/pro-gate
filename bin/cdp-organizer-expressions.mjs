@@ -46,10 +46,34 @@ export function readReviewText(document, marker) {
   for (let i = 0; i < turns.length; i++) {
     if (turns[i].getAttribute('data-message-author-role') === 'user' && exact(turns[i].innerText ?? '')) prompt = i;
   }
-  if (prompt >= 0) return {
-    text: 'run marker: ' + marker + '\n' + turns.slice(prompt + 1).map((turn) => read(turn)).join('\n\n'),
-    promptAt: 0,
-  };
+  if (prompt >= 0) {
+    const following = turns.slice(prompt + 1);
+    const text = 'run marker: ' + marker + '\n' + following.map((turn) => read(turn)).join('\n\n');
+    // #271: response-scope facts for salvage's completion proof. Proven only when exactly one
+    // assistant message follows the latest marked prompt, it is the page's last message, its turn
+    // shows Oracle's FINISHED_ACTIONS_SELECTOR buttons, no STOP_BUTTON_SELECTORS control is
+    // rendered, that turn carries none of the loading-shimmer/aria-busy markers Oracle's own
+    // completion veto treats as live thinking (thinkingStatus.js), and the page names its URL.
+    // Any missing DOM method or exception leaves it unproven.
+    let scope = { following: -1, assistantLast: false, finished: false, generating: true, href: null };
+    try {
+      const finishedActions = 'button[data-testid="copy-turn-action-button"], button[data-testid="good-response-turn-action-button"], button[data-testid="bad-response-turn-action-button"], button[aria-label="Share"]';
+      const stopButtons = '[data-testid="stop-button"], [data-testid="composer-stop-button"], form button[aria-label*="stop" i]:not([aria-label*="dictat" i]):not([aria-label*="voice" i]):not([aria-label*="read" i])';
+      const busyIndicators = 'span.loading-shimmer, .loading-shimmer, [class*="loading-shimmer"], [aria-busy="true"]';
+      const answer = following.length === 1 ? following[0] : null;
+      const assistantLast = !!answer && answer.getAttribute('data-message-author-role') === 'assistant'
+        && answer === turns[turns.length - 1];
+      const container = assistantLast ? answer.closest?.('[data-testid^="conversation-turn"]') : null;
+      const finished = !!container && (container.querySelector?.(finishedActions) ?? null) !== null;
+      const generating = document.querySelector(stopButtons) !== null
+        || (!!container && (container.querySelector?.(busyIndicators) ?? null) !== null);
+      const href = typeof document.location?.href === 'string' ? document.location.href : null;
+      scope = { following: following.length, assistantLast, finished, generating, href };
+    } catch {
+      // Unproven: the defaults above already fail closed.
+    }
+    return { text, promptAt: 0, scope };
+  }
   return { text: read(document.body), promptAt: null };
 }
 

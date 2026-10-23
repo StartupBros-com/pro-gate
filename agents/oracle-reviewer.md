@@ -107,6 +107,10 @@ Dispatch all eight closed actions:
   newest skeleton stops closed. Preserve branch work. Typed queries return a complete envelope
   at exit 0; legacy collection keeps exit 6. Trailing hunk-context identifiers count as vocabulary;
   nothing on the VERDICT line does.
+  For `rejected-capture`, harvest refused a completed, current response that the runtime proved
+  is the finished answer to this attempt's prompt, and kept the bytes in a write-once record. Its
+  `.facts.completed_results` row has `shape:"rejected-capture"`, `applicable:false` and the
+  capture digest. Do not retry or harvest; preserve branch work.
   For `account-cooldown-active`, also relay `.facts.cooldown.seconds_remaining`: ChatGPT is
   rate-limiting the account, and re-querying before that many seconds have passed cannot change
   the answer. For `rounds-not-converging`, the open-P0/P1 trajectory (`.facts.governor.arrow`) has

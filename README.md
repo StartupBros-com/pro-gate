@@ -49,7 +49,11 @@ An accepted current `FIX-FIRST` with proven zero open P0/P1 and at least one def
 with reason `fix-first-deferred-p2-only`. Its facts include `open_blocking: 0`,
 `deferred_findings` (P2/P3 severity and complete finding blocks in body order) and `deferred_count`.
 Each block is bounded to 1,024 characters, including any `… [truncated N chars]` marker.
-Unsupported blocking severity forms leave counts unavailable and require a fix. A FIX-FIRST
+Unsupported blocking severity forms leave counts unavailable and require a fix. A standalone
+`P0` or `P1` line counts the explicit same-severity `[Pn]` findings that follow it after optional
+blank lines; an empty section, prose, a fence, another severity, or an unbracketed `path:line` line after a
+`RESOLVED` finding there leaves counts unavailable. A reopen marker anywhere in a finding, its `RESOLVED`
+headline included, keeps it open. A FIX-FIRST
 with zero blockers and no deferred findings requires a re-review with reason `fix-first-without-findings`.
 Any open P0/P1 still requires a fix; `rounds-not-converging` preempts both paths.
 
@@ -111,7 +115,9 @@ July 2026). The Pro model spends that long reasoning; the engine is built around
   nothing, or left a recoverable reservation. A run that dies mid-generation keeps its
   conversation reachable for 6 h so `--harvest` can collect it. If immutable proof later shows
   that review targets an old head or merged/closed PR, it remains charged and optionally
-  collectable but stops occupying capacity.
+  collectable but stops occupying capacity. A reservation still marked generating 3 h after its
+  charge (`PRO_GATE_GENERATION_CEILING`), far past any measured generation, also stops occupying
+  capacity while staying harvestable, so a dead caller cannot hold a slot for the whole TTL.
 - **Fail closed, recover explicitly.** A plugin/runtime version skew blocks the run.
   Final acceptance requires the whole bounded nonce with exact, case-sensitive spelling.
   Browser-side foreign-content conviction compares case-insensitively so a case-only near-match
@@ -252,10 +258,14 @@ For fresh proof, recording invokes the existing `--prepare-review-evidence` comm
 from inspection. Its private temporary files are cleaned on completion or failure. You may
 instead supply an existing explicit `PRO_GATE_REVIEW_ENDPOINT_PATCH` /
 `PRO_GATE_REVIEW_PR_EVIDENCE` pair; the adapter snapshots that pair privately so metadata and
-public inspection certify the same bytes. Either way, the proof's target and base must match
-the live PR head, base repository/ref, and branch-tip SHA. A cached PR base snapshot that differs from
-the live tip is refused, not stamped as current. Head, base tip, and default branch are checked
-again before posting exactly one status at the reviewed SHA.
+public inspection certify the same bytes. Either way, the proof's target must match the live PR
+head and base repository/ref, and its base SHA must equal either the live branch tip or the PR's
+own base snapshot (`base.sha`, which GitHub refreshes only when the PR syncs and which the daemon
+binds completed reviews to). Both are read from GitHub at recording time, never from the proof; a
+proof base matching neither is refused. The status records the base the review ran against, so
+verification's overlap window runs from that reviewed base to the current tip and includes any
+commits that landed between the PR's snapshot and recording. Head, base tip, and default branch
+are checked again before posting exactly one status at the reviewed SHA.
 
 Full-PR recording defaults the reviewed payload to the prepared endpoint patch. Scoped recording
 must preserve its own reviewed payload and confirmation; it never substitutes full-PR bytes:
@@ -561,6 +571,26 @@ line does. A completion whose input binding predates retained vocabulary (contra
 before v0.62.0) is judged on its own shape: grounded historical reviews stay accepted,
 skeletons stay refused.
 
+Since v0.64.0 a harvest that refuses a completed, current response also stops typed instead of
+recovering it forever. The refusal itself is unchanged: a skeleton without a grounded diff
+reference still exits 6, a review without the run-marker echo still exits 9, and the charge,
+reservation and input binding are kept. What changes is evidence. When the CDP helper proved the
+bytes it printed are the finished last assistant response after this attempt's marked prompt (no
+generation running, no loading or busy marker in the answer's turn, finished-turn actions present,
+identical text on a re-read about 2.5 s
+later, and the same conversation URL as the attempt's memo), the harvest also writes one
+write-once record (mode 0600) at `$PRO_GATE_HOME/rejected-captures/<marker>`. It binds the exact
+bytes and their SHA-256 to the marker, charged epoch, input binding and conversation URL. The next
+`--review-decision` then returns `stop-without-new-review` with reason `rejected-capture`
+(`report-only`, exit 0). Its `.facts.completed_results` row has `shape:"rejected-capture"`,
+`applicable:false` and the capture digest. The stop applies only while no other attempt is active
+or holds the reservation. A newer applicable completion supersedes it, and other live work still
+routes to recovery. The stop never resumes the attempt: a later vocabulary or classifier repair
+leaves it stopped, an explicit `--harvest` may reinspect the conversation, and a collected,
+accepted result then drives the decision. Anything short of that proof keeps today's recovery
+path: a generating, unfinished, foreign or stale response, a changed re-read, or a missing or
+invalid record.
+
 ### Exit codes
 
 | Code | Meaning                                                                                                                                                                                                                              | Slot spent? |
@@ -616,7 +646,8 @@ an endless collect. Use `bundle` or `both` for the final round.
 | `PRO_GATE_MAX_DIFF_LINES`           | `6000`                            | Above this a run proceeds but usually lands in-progress → harvest                                                                                                                                                                        |
 | `PRO_GATE_DIFF_HARD_MAX`            | `25000`                           | Above this the engine refuses (exit 11, no spend)                                                                                                                                                                                        |
 | `PRO_GATE_MAX_CONCURRENCY`          | `1`                               | Ceiling for parallel Pro chats; a ramp governor earns up to it on clean streaks                                                                                                                                                          |
-| `PRO_GATE_RESERVATION_TTL`          | `21600`                           | Minimum age before confirmed exact-marker misses may exhaust recovery; elapsed time alone never releases it                                                                                                                              |
+| `PRO_GATE_RESERVATION_TTL`          | `21600`                           | Minimum age before confirmed exact-marker misses may exhaust recovery; elapsed time alone never removes the reservation or its charge                                                                                                     |
+| `PRO_GATE_GENERATION_CEILING`       | `10800`                           | Seconds after its charge that a still-`generating` reservation stops counting against review capacity; it stays harvestable and keeps its charge (`0` = never stop counting)                                                            |
 | `PRO_GATE_DIRLOCK_ORPHAN_GRACE`     | `5`                               | No-flock platforms only: seconds an unmarked guard directory must sit before a reclaimer may remove it                                                                                                                                   |
 | `PRO_GATE_BROWSER_MEM_PRESSURE_PCT` | `85`                              | Percent of the browser cgroup's effective limit (the smaller finite of `memory.high` and `memory.max`; `max` means unlimited) at which two consecutive samples arm the pressure sentinel and the health gate defers a slot with no spend |
 | `PRO_GATE_BROWSER_MEM_SAMPLE_SECS`  | `5`                               | Seconds between browser cgroup samples                                                                                                                                                                                                   |
@@ -661,6 +692,7 @@ semantics. Native mode keeps the prompt's title hint and does not run remote-CDP
 | `bin/oracle-review.sh`              | **The engine**: assembles context, runs the review, captures/salvages/harvests the verdict                          |
 | `bin/cdp-salvage.mjs`               | Marker-owned CDP salvage and conversation organizer: recover, exact-rename, archive, and local cleanup decisions    |
 | `bin/cdp-organizer-expressions.mjs` | Auditable ChatGPT UI expressions for exact rename and archive; no backend API calls                                 |
+| `bin/cdp-test-timing.mjs`           | Test-only timing override parsers that cdp-salvage.mjs imports; production keeps its own defaults                   |
 | `bin/pro-gate-doctor.sh`            | One-command setup verification (deps, versions, browser, consent)                                                   |
 | `bin/pro-gate-stats.sh`             | Ledger stats: clean rate, exits, per-PR history                                                                     |
 | `bin/pro-gate-autoupdate.sh`        | The opt-in hourly skew-follower                                                                                     |
@@ -806,12 +838,18 @@ that only exists once the release does:
 2. Merge the repin PR against `StartupBros-com/hov-marketplace`. Its hourly **Repin
    reconcile** workflow opens that PR once the draft's assets are complete; dispatch the
    workflow with `only_plugin=pro-gate` instead of waiting for the tick, and merge once both
-   required checks pass. The card is updated by a reviewed PR and never by a push from CI —
-   a standing credential able to write the distribution manifest is the one whose
-   compromise reaches every installed client.
+   required checks pass. A bot repin that changes only pin fields (source sha, version,
+   releaseId, releaseTag) takes no review round: hov-marketplace's required **Pinned
+   sources** check already proves, before the merge, that the tag resolves to the pinned
+   commit, so a reviewer would only re-read the pin. A card PR that also changes copy gets a
+   normal review. The card is updated by a merged PR and never by a push from CI — a
+   standing credential able to write the distribution manifest is the one whose compromise
+   reaches every installed client.
 3. Run the **Publish staged release** workflow (or `gh release edit vX.Y.Z --draft=false`).
-   It re-reads the live card and refuses unless the card names exactly this release, so a
-   mistimed run cannot publish something undistributed.
+   The workflow re-reads the live card and refuses unless the card names exactly this
+   release, so a mistimed run cannot publish something undistributed; this runs after the
+   repin merged, so it keeps the release a draft but cannot undo a wrong pin. The
+   `gh release edit` path skips that card check.
 4. Publishing fires the release train once: it verifies distribution and announces. The
    train only ever _reads_ the marketplace — it holds no deploy credential.
 

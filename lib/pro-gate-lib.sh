@@ -1255,6 +1255,85 @@ pg_attempt_disposition_find() { # host owner repo pr [exclude-marker] -> newest 
   pg_attempt_disposition_read "$best"
 }
 
+# ── Rejected-capture records (#271) ───────────────────────────────────────────────────────────
+# A harvest whose salvage child proved the capture is the one finished response to this attempt's
+# latest prompt (cdp-salvage `completion-proof`), but whose bytes failed review validation, keeps
+# those exact bytes here, bound to the attempt's input binding and conversation. The record is
+# write-once evidence for a typed stop; it is never an accepted review and never authority to
+# collect, refund, finalize or resend. Damaged, partial or foreign records read as absent.
+PG_REJECTED_CAPTURE_MAX_BYTES=4194304
+
+pg_rejected_capture_dir() { printf '%s\n' "$PRO_GATE_HOME/rejected-captures"; }
+
+pg_conversation_url_ok() { # url: cdp-salvage.mjs CONVERSATION_URL_RE
+  [[ "${1-}" =~ ^https://chatgpt\.com/c/[A-Za-z0-9-]+([?#].*)?$ ]]
+}
+
+pg_rejected_capture_validate() { # canonical-json marker input-binding-json
+  local json="$1" marker="$2" binding="$3" epoch ib digest
+  epoch="$(jq -r .charged_spend_epoch <<<"$binding" 2>/dev/null)" || return 1
+  case "$epoch" in ''|*[!0-9]*) return 1;; esac
+  ib="$(pg_review_sha256_text "$binding")" || return 1
+  jq -e --arg marker "$marker" --argjson epoch "$epoch" --arg ib "$ib" '
+    keys == ["capture","capture_sha256","charged_spend_epoch","conversation_url","input_binding_digest","marker","record_type","record_version","rejection"]
+    and .record_type=="rejected-capture/v1" and .record_version==1 and .marker==$marker
+    and (.rejection|IN("template-verdict","unbound")) and .charged_spend_epoch==$epoch
+    and .input_binding_digest==$ib and (.capture|type=="string" and length>0)
+    and (.capture_sha256|type=="string" and test("^[0-9a-f]{64}$"))
+    and (.conversation_url|type=="string")' <<<"$json" >/dev/null 2>&1 || return 1
+  pg_conversation_url_ok "$(jq -r .conversation_url <<<"$json")" || return 1
+  digest="$(pg_sha256 <(jq -j .capture <<<"$json" 2>/dev/null))" || return 1
+  [ -n "$digest" ] && [ "$digest" = "$(jq -r .capture_sha256 <<<"$json")" ]
+}
+
+pg_rejected_capture_read() { # marker input-binding-json -> capture_sha256 (read-only, exact path)
+  local marker="$1" binding="$2" f json canonical LC_ALL=C
+  pg_reservation_marker_ok "$marker" || return 1
+  f="$(pg_rejected_capture_dir)/$marker"
+  [ -f "$f" ] && [ ! -L "$f" ] || return 1
+  json="$(head -c "$((PG_REJECTED_CAPTURE_MAX_BYTES + 1))" "$f" 2>/dev/null && printf '.')" || return 1
+  json="${json%.}"
+  [ "${#json}" -le "$PG_REJECTED_CAPTURE_MAX_BYTES" ] || return 1
+  canonical="$(jq -cS . <<<"$json" 2>/dev/null)" || return 1
+  [ "$canonical" = "$json" ] || return 1
+  pg_rejected_capture_validate "$canonical" "$marker" "$binding" || return 1
+  jq -r .capture_sha256 <<<"$canonical"
+}
+
+pg_rejected_capture_write() { # marker rejection capture-file conversation-url input-binding-json
+  local marker="$1" rejection="$2" capture="$3" url="$4" binding="$5" dir f tmp canonical rc=1 LC_ALL=C
+  pg_reservation_marker_ok "$marker" || return 1
+  case "$rejection" in template-verdict|unbound) ;; *) return 1;; esac
+  [ -f "$capture" ] && [ ! -L "$capture" ] && [ -s "$capture" ] || return 1
+  canonical="$(jq -cnS --arg marker "$marker" --arg rejection "$rejection" --arg url "$url" \
+    --argjson epoch "$(jq -r .charged_spend_epoch <<<"$binding" 2>/dev/null)" \
+    --arg ib "$(pg_review_sha256_text "$binding")" --arg digest "$(pg_sha256 "$capture")" --rawfile capture "$capture" \
+    '{capture:$capture,capture_sha256:$digest,charged_spend_epoch:$epoch,conversation_url:$url,input_binding_digest:$ib,
+      marker:$marker,record_type:"rejected-capture/v1",record_version:1,rejection:$rejection}' 2>/dev/null)" || return 1
+  [ "${#canonical}" -le "$PG_REJECTED_CAPTURE_MAX_BYTES" ] || return 1
+  # Invalid UTF-8 would become a lossy JSON string; only an exact byte round trip is evidence.
+  cmp -s "$capture" <(jq -j .capture <<<"$canonical" 2>/dev/null) || return 1
+  pg_rejected_capture_validate "$canonical" "$marker" "$binding" || return 1
+  dir="$(pg_rejected_capture_dir)"
+  f="$dir/$marker"
+  # Write-once: an existing final record is never replaced. It stands as the evidence, whatever
+  # this pass collected, only while it still validates for this attempt; otherwise refuse loudly.
+  if [ -e "$f" ] || [ -L "$f" ]; then
+    pg_rejected_capture_read "$marker" "$binding" >/dev/null 2>&1
+    return
+  fi
+  mkdir -p "$dir" 2>/dev/null || return 1
+  tmp="$dir/.$marker.tmp.$$"
+  rm -f "$tmp" 2>/dev/null
+  if (umask 077 && printf '%s' "$canonical" > "$tmp") 2>/dev/null && ln "$tmp" "$f" 2>/dev/null; then
+    rc=0
+  elif pg_rejected_capture_read "$marker" "$binding" >/dev/null 2>&1; then
+    rc=0
+  fi
+  rm -f "$tmp" 2>/dev/null
+  return "$rc"
+}
+
 # ── Delivery-condition records (#204) ──────────────────────────────────────────────────────────
 # Proven no-send refunds retain delivery evidence in the required v2 disposition. The v1
 # sidecar remains a compatibility mirror and reader; its failure cannot discard the evidence
@@ -2338,24 +2417,69 @@ pg_reservation_count() {
   echo "$n"
 }
 
+# pg_reservation_holds_capacity <record-file> [now]: exit 0 when the reservation occupies account
+# capacity, 1 when it does not. Every capacity reader (slot plan, holding count, holder report,
+# --status) asks this one question, so they cannot disagree about what is held.
+#
+# complete/superseded never hold (#82, #234). Empty/legacy or unknown state always holds: an
+# unknown state must never free capacity. An explicit `generating` record holds only while its
+# charge is younger than PRO_GATE_GENERATION_CEILING (#273). Measured on the live ledger and owner
+# logs (2026-10-17): owner probes saw a completed answer within 592s of send (n=30); 1,817 fresh
+# successes spent at most 3,838s after taking their slot (a sample the run timeout bounds); and the
+# longest conversation ever seen still writing, at 9,432s, never produced a review and ended
+# recovery-exhausted. A record past the default 3h is a review nothing is waiting on: its owner
+# died, or parked on an unbindable capture that nothing retries, and it used to hold a slot until
+# the TTL and miss proof finally removed it. Two such records held half the account for hours
+# while queued runs timed out (#273). The cost of being wrong the other way is one extra
+# concurrent chat on the account, not a lost review.
+#
+# This is read-side only: nothing is rewritten, removed, refunded or terminalized. The record stays
+# collectable by --harvest, same-change admission still finds it (pg_reservation_find_pr reads no
+# capacity), and the TTL/miss rule in pg_reservation_note_miss stays the only removal path. A
+# harvest re-arm cannot reset the clock: pg_reservation_write keeps field 7 (spend) unless a fresh
+# dispatch passes a new one. The clock is the charge epoch, falling back to the creation epoch only
+# when a record predates field 7. A clock that is missing, zero, non-numeric or in the future holds.
+# 0 disables the ceiling.
+pg_reservation_holds_capacity() {
+  local f="$1" now="${2:-}" ceiling clock
+  [ -f "$f" ] || return 1
+  case "$(awk -F'\t' 'NR==1{print $8}' "$f" 2>/dev/null)" in
+    complete|superseded) return 1 ;;
+    generating) ;;
+    *) return 0 ;;
+  esac
+  ceiling="${PRO_GATE_GENERATION_CEILING:-10800}"
+  case "$ceiling" in ''|*[!0-9]*) ceiling=10800;; esac
+  [ "$ceiling" -gt 0 ] 2>/dev/null || return 0
+  clock="$(awk -F'\t' 'NR==1{print $7}' "$f" 2>/dev/null)"
+  [ -n "$clock" ] || clock="$(awk -F'\t' 'NR==1{print $3}' "$f" 2>/dev/null)"
+  case "$clock" in ''|*[!0-9]*) return 0;; esac
+  [ "$clock" -gt 0 ] 2>/dev/null || return 0
+  case "$now" in ''|*[!0-9]*) now="$(date +%s)";; esac
+  [ "$(( now - clock ))" -lt "$ceiling" ]
+}
+
 # pg_reservation_slot_plan <effective-concurrency>: compute the slot-acquisition plan under the
 # reservation guard. Echoes "R|excluded slots": scan slots 1..R skipping the excluded ones.
 # Slot-tagged reservations exclude their exact slot (the tab still occupies that account
 # capacity); reservations without a slot (legacy) and tagged slots outside the current range
 # shrink the range instead. Processed descending so range shrink cascades correctly.
 pg_reservation_slot_plan() {
-  local eff="${1:-1}" dir f slot state slots="" excl="" r legacy=0 s avail
+  local eff="${1:-1}" dir f slot slots="" excl="" r legacy=0 s avail now
   dir="$(pg_reservation_dir)"
   r="$eff"
   if [ -d "$dir" ]; then
+    now="$(date +%s)"
     for f in "$dir"/*; do
       [ -f "$f" ] || continue
       # A COMPLETE reservation is a harvest pointer, not account occupancy (#82): its review
       # stopped generating, so it holds no slot even though it stays collectable until TTL.
       # Empty/legacy state reads as generating, so pre-state records keep their hold — an
-      # unknown state must never free capacity (overbooking the account is the worse error).
-      state="$(awk -F'\t' 'NR==1{print $8}' "$f" 2>/dev/null)"
-      case "$state" in complete|superseded) continue;; esac
+      # unknown state must never free capacity. A known `generating` record past the generation
+      # ceiling stops holding (#273); pg_reservation_holds_capacity carries the measured bound.
+      # Its slot number is a flock file only, so a new run taking it cannot disturb the old
+      # record's tab: harvest finds that conversation by marker, never by slot.
+      pg_reservation_holds_capacity "$f" "$now" || continue
       slot="$(awk -F'\t' 'NR==1{print $5}' "$f" 2>/dev/null)"
       case "$slot" in
         ''|*[!0-9]*) legacy=$(( legacy + 1 ));;
@@ -2556,16 +2680,18 @@ pg_reservation_set_state() {
 }
 
 # pg_reservation_holding_count: how many reservations actually OCCUPY account capacity, i.e.
-# everything except the ones proven complete or superseded. Distinct from pg_reservation_count, which counts
+# everything except the ones proven complete or superseded and the ones past the generation
+# ceiling (pg_reservation_holds_capacity). Distinct from pg_reservation_count, which counts
 # collectable records: once a finished review stops holding its slot, "a reservation exists" and
 # "capacity is reserved" stop being the same question, and a timeout caused by genuinely busy
 # runs must not be blamed on an uncollected review that is holding nothing (#82).
 pg_reservation_holding_count() {
-  local dir f n=0
+  local dir f n=0 now
   dir="$(pg_reservation_dir)"; [ -d "$dir" ] || { echo 0; return 0; }
+  now="$(date +%s)"
   for f in "$dir"/*; do
     [ -f "$f" ] || continue
-    case "$(awk -F'\t' 'NR==1{print $8}' "$f" 2>/dev/null)" in complete|superseded) continue;; esac
+    pg_reservation_holds_capacity "$f" "$now" || continue
     n=$(( n + 1 ))
   done
   echo "$n"
@@ -2577,24 +2703,22 @@ pg_reservation_holding_count() {
 # see is that a FINISHED review still holds its slot until someone collects it (#82). Naming the
 # marker and the exact free-it command turns a 40-minute mystery into one command.
 pg_report_capacity_holders() {
-  local eff="${1:-}" dir f marker state pr held=0
+  local eff="${1:-}" dir f marker pr held=0 now
   dir="$(pg_reservation_dir)"; [ -d "$dir" ] || return 0
+  now="$(date +%s)"
   for f in "$dir"/*; do
     [ -f "$f" ] || continue
-    case "$(awk -F'\t' 'NR==1{print $8}' "$f" 2>/dev/null)" in complete|superseded) continue;; esac
+    pg_reservation_holds_capacity "$f" "$now" || continue
     held=$(( held + 1 ))
   done
   [ "$held" -gt 0 ] || return 0
   echo "[pro-gate] 0 of ${eff:-?} effective slot(s) free — ${held} held by in-progress reservation(s):" >&2
   for f in "$dir"/*; do
     [ -f "$f" ] || continue
+    pg_reservation_holds_capacity "$f" "$now" || continue
     marker="$(basename "$f")"
     pr="$(awk -F'\t' 'NR==1{print $1}' "$f" 2>/dev/null)"
-    state="$(pg_reservation_state "$marker" 2>/dev/null || echo generating)"
-    case "$state" in
-      complete|superseded) continue ;;
-      *) echo "  $marker  [$pr] generating — still using the account" >&2 ;;
-    esac
+    echo "  $marker  [$pr] generating — still using the account" >&2
   done
   echo "  collect a finished one for FREE (no new spend, never re-run):" >&2
   echo "    oracle-review.sh --harvest <marker> --out <path> --timeout $(pg_harvest_hint_timeout)" >&2
@@ -3085,6 +3209,15 @@ pg_review_finding_summary() {
       end | .severity |= ascii_upcase;
     def none_declaration:
       test("^(?:none|—|-)[.!]?\\s*$";"i");
+    def resolved_headline:
+      test("^\\S+\\s+(?:—|--|-)\\s+RESOLVED([^_[:alnum:]]|$)");
+    def path_anchor:
+      test("^(?:\\*\\*|__|`)?[^\\s`*:]+:[0-9]+([^0-9]|$)");
+    def explicit_finding($severity):
+      test("^(?:\\*\\*|__)?\\[") and
+        (([headline] | first // null) as $finding |
+         $finding!=null and $finding.severity==$severity and
+         ($finding.text|test("^\\s*$")|not) and ($finding.text|none_declaration|not));
     def section_text:
       "(?:findings?|issues?|items?|blockers?|blocking|notes?|comments?|severity|level|must[ -]fix|should fix|nice to have|none|empty|n/a)" as $word |
       test("^\\s*(?:"+$word+"(?:\\s+"+$word+")*)?\\s*:?[ \\t]*(?:\\((?:"+$word+"|[0-9]+)\\))?\\s*:?\\s*$";"i");
@@ -3110,8 +3243,15 @@ pg_review_finding_summary() {
         $text[:1024-($marker|length)] + $marker
       end;
     reduce (split("\n")[] | sub("\r$";"")) as $line
-      ({blocks:[],current:null,unknown:false,fence:null};
+      ({blocks:[],current:null,unknown:false,fence:null,pending:null,standalone:null};
        ($line|normalized) as $normal |
+       # A standalone P0/P1 label resolves at the next non-blank line: only an explicit
+       # same-severity [Pn] finding keeps counts available, and that line then parses normally.
+       # .standalone holds that severity while further same-severity findings continue the section.
+       (if .pending==null or ($line|test("^\\s*$")) then .
+        else .pending as $severity |
+          (if ($normal|explicit_finding($severity)) then .standalone=$severity else .unknown=true end) | .pending=null
+        end) |
        if .fence!=null then
          (if .current!=null then .current.lines += [$line] else . end) |
          .fence as $fence |
@@ -3124,29 +3264,39 @@ pg_review_finding_summary() {
          ([$normal | if $heading then sub("^#{1,6}\\s+";"") else . end | headline] | first // null) as $head |
          ([$normal|unsupported_label] | first // null) as $unsupported |
          if $heading and $head==null then
-           flush | .unknown=(.unknown or ($unsupported|IN("P0","P1")))
+           flush | .standalone=null | .unknown=(.unknown or ($unsupported|IN("P0","P1")))
          elif $heading and ($head.text|section_text or none_declaration) then
-           flush | .current={severity:$head.severity,lines:[],section:true}
+           flush | .standalone=null | .current={severity:$head.severity,lines:[],section:true}
          elif $head!=null then
            flush |
+           .standalone as $section |
+           (if $section!=null and ($normal|explicit_finding($section)) then . else .standalone=null end) |
            if ($head.text|test("^\\s*$")) then
-             if ($head.severity|IN("P0","P1")) then .unknown=true else . end
+             if ($head.severity|IN("P0","P1")|not) then .
+             elif ($line|test("^\\s*[Pp][01]\\s*$")) then .pending=$head.severity
+             else .unknown=true end
            elif ($head.text|none_declaration) then .
            else .current={severity:$head.severity,lines:[$head.text]} end
          elif $unsupported!=null then
            # Quoted labels end the preceding block without becoming live findings.
-           flush | .unknown=(.unknown or ($unsupported|IN("P0","P1")))
+           flush | .standalone=null | .unknown=(.unknown or ($unsupported|IN("P0","P1")))
          elif .current!=null and ($normal|test("^Correction\\s*:";"i")) then
            .current.lines += [$line]
          elif ($normal|test("^(?:(?:\\*\\*|__)?(?:VERDICT|CHOICE)(?:\\*\\*|__)?\\s*:|[A-Za-z][A-Za-z -]*:\\s*$)";"i")) then
-           flush
-         elif .current!=null then .current.lines += [$line]
+           flush | .standalone=null
+         elif .current!=null then
+           # Under a standalone label, an unbracketed path:line line after a RESOLVED finding has
+           # no severity of its own; folding it into the resolved block could hide a blocker.
+           (if .standalone!=null and (.current.lines[0]|resolved_headline) and ($normal|path_anchor)
+            then .unknown=true else . end) |
+           .current.lines += [$line]
          else . end
        end) |
-    flush | .unknown=(.unknown or .fence!=null) |
+    flush | .unknown=(.unknown or .fence!=null or .pending!=null) |
+    # A reopen marker anywhere in the block, the RESOLVED headline included, keeps it open.
     [.blocks[] | select(.severity|IN("P0","P1")) |
-      select((.lines[0]|test("^\\S+\\s+(?:—|--|-)\\s+RESOLVED([^_[:alnum:]]|$)"))==false or
-        (.lines[1:]|join("\n")|test("(^|[^_[:alnum:]])(?:STILL-PRESENT|REOPENED|NOT\\s+RESOLVED|NOT\\s+FIXED)([^_[:alnum:]]|$)|Correction\\s*:";"i")))] as $open |
+      select((.lines[0]|resolved_headline|not) or
+        (.lines|join("\n")|test("(^|[^_[:alnum:]])(?:STILL-PRESENT|REOPENED|NOT\\s+RESOLVED|NOT\\s+FIXED)([^_[:alnum:]]|$)|Correction\\s*:";"i")))] as $open |
     {open_p0:(if .unknown then null else [$open[]|select(.severity=="P0")]|length end),
      open_p1:(if .unknown then null else [$open[]|select(.severity=="P1")]|length end),
      deferred_findings:[.blocks[]|select(.severity|IN("P2","P3"))|
@@ -3514,12 +3664,23 @@ pg_review_tokens() { # file [rationale]: canonical tokens; rationale emits shape
       n=split(line, words, /[[:space:]]+/)
       for (i=1; i<=n; i++) {
         t=words[i]
+        if (rationale) {
+          # Retained diff suffixes keep hidden-path dots. Emit that spelling too,
+          # without replacing the established stripped candidate or diff vocabulary.
+          literal=t
+          while (sub(/^\.\//, "", literal)) {}
+          sub(/[.:\/]+$/, "", literal)
+          if (literal ~ /^\.[A-Za-z0-9_-]/ && literal ~ /[A-Za-z]/) {
+            sub(/:[0-9]+(-[0-9]+)?$/, "", literal)
+            print literal
+          }
+        }
         sub(/^[.\/]+/, "", t); sub(/[.:\/]+$/, "", t)
         if (t !~ /[A-Za-z]/) continue
-        shaped=(t == "VERSION" || t ~ /[\/_]/ || t ~ /\.[A-Za-z][A-Za-z0-9]*(:[0-9]+)?$/ || t ~ /:[0-9]+$/ ||
+        shaped=(t == "VERSION" || t ~ /[\/_]/ || t ~ /\.[A-Za-z][A-Za-z0-9]*(:[0-9]+(-[0-9]+)?)?$/ || t ~ /:[0-9]+(-[0-9]+)?$/ ||
           (t ~ /[a-z]/ && substr(t,2) ~ /[A-Z]/))
         if (rationale && !shaped) continue
-        sub(/:[0-9]+$/, "", t)
+        sub(/:[0-9]+(-[0-9]+)?$/, "", t)
         print t
         if (!rationale) {
           # A cited path may omit diff prefixes or directories; retain component boundaries,
@@ -4093,8 +4254,8 @@ pg_completed_lookup() {  # <marker> <out>: place the artifact at <out>; rc 0 on 
 # ─────────────────────────────────────────────────────────────────────────────
 PG_REVIEW_DECISION_CONTRACT_ID='review-decision/v1'
 PG_REVIEW_DECISION_CONTRACT_VERSION=1
-PG_REVIEW_DECISION_CONTRACT_DIGEST='31f41b872c7cdffef6fe17a41e9bac1dc829418b738d9bdbcf9fd775ae781667'
-PG_REVIEW_DECISION_CORPUS_DIGEST='09f089ca0f8cd48faf838bc3e0e23d055c7a4a3fbf885d7c5437072ab287c927'
+PG_REVIEW_DECISION_CONTRACT_DIGEST='c5586d5f4cde6b5ba6590b5840a3a21cf76af2be81d2c53f28d61c34d8c297ac'
+PG_REVIEW_DECISION_CORPUS_DIGEST='7e944bd4cce21191ad6df85452630f05d26ae2b63a4162429e8d0952a8eb6d19'
 
 # Binding-record compatibility only (#214, gate r2 P1). review-input-binding/v1 and
 # review-result-binding/v1 records are validated by their own record_type/record_version shape
@@ -4107,7 +4268,7 @@ PG_REVIEW_DECISION_CORPUS_DIGEST='09f089ca0f8cd48faf838bc3e0e23d055c7a4a3fbf885d
 # Writers share these validators with readers: every production write site passes the CURRENT digest
 # (pg_review_decision_contract_digest), so this list only widens what can be READ back, never what a
 # fresh record may claim. Keep it that way when adding a writer.
-PG_REVIEW_DECISION_COMPATIBLE_CONTRACT_DIGESTS='bf36fdb5f8625e917be0539ca014fec518649d1160584846aca1cb9149533abb 7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee 5fcd19c12600061af6d90ed9cb980dd7067cff199c374910639003eec4caf5c3 6da6866bab4e95ad138cdc946fa1388be9c386bca7b592c3370c9f52e34b315f fa91787e3fbf3c0852c78f5269b2f670d84b86561be64d6edef4229bf46aee9b 246b9e4e1d58f1820b4381a90cf93cf3fb7fb849f3ce4dd34b4d757be79c2e4f'
+PG_REVIEW_DECISION_COMPATIBLE_CONTRACT_DIGESTS='bf36fdb5f8625e917be0539ca014fec518649d1160584846aca1cb9149533abb 7f5ece9bfa5aa19f858431da23302a9bc02a4a8f5770830d529f22484e5982ee 5fcd19c12600061af6d90ed9cb980dd7067cff199c374910639003eec4caf5c3 6da6866bab4e95ad138cdc946fa1388be9c386bca7b592c3370c9f52e34b315f fa91787e3fbf3c0852c78f5269b2f670d84b86561be64d6edef4229bf46aee9b 246b9e4e1d58f1820b4381a90cf93cf3fb7fb849f3ce4dd34b4d757be79c2e4f 31f41b872c7cdffef6fe17a41e9bac1dc829418b738d9bdbcf9fd775ae781667'
 
 pg_review_decision_contract_id() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_ID"; }
 pg_review_decision_contract_version() { printf '%s\n' "$PG_REVIEW_DECISION_CONTRACT_VERSION"; }
@@ -4294,7 +4455,7 @@ pg_review_decision_envelope_valid() { # decision-file
 }
 
 pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read stdin
-  local supplied canonical snapshot unsafe valid reason selected selected_ref selected_count
+  local supplied canonical snapshot unsafe valid reason selected selected_ref selected_count selected_shape
   local action prior prior_applicable verdict choice_snapshot rounds_not_converging
   pg_have jq || return 1
   if [ "$#" -gt 0 ]; then supplied="$1"; else supplied="$(cat)"; fi
@@ -4344,7 +4505,7 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
       and (.collected|type=="boolean") and (.evidence_mode|IN("full-pr","scoped-delta","connector","caller-patch","none"))
       and (.legacy|type=="boolean") and (.marker|marker and length>0)
       and (.provenance_valid|type=="boolean") and (.verdict|IN("SHIP","FIX-FIRST","NEEDS-DISCUSSION","NONE"))
-      and (if has("shape") then .shape=="template-verdict" and .applicable==false and .legacy==false
+      and (if has("shape") then (.shape|IN("template-verdict","rejected-capture")) and .applicable==false and .legacy==false
         and .bindable==false and .binding_valid==false and .provenance_valid==false and .verdict=="NONE"
         and .collected==true else true end);
     (keys_are(["active_index","completed_results","contract","cooldown","deferred_count","deferred_findings","delivery","evidence","governor","input","named_choice","observation","open_blocking","prior_review","reservation","target","transport"]))
@@ -4414,17 +4575,24 @@ pg_review_decision_reduce() { # [normalized-facts-json]; with no argument, read 
 
   # Existing completed work wins. Selection is newest charged epoch, then canonical identity;
   # duplicate rows still tied on both fields are unresolved and stop closed.
-  selected="$(jq -cS '[.completed_results[] | select(.applicable or .legacy or .shape=="template-verdict")] | sort_by(.charged_spend_epoch,.canonical_identity) | last // empty' <<<"$canonical")"
+  selected="$(jq -cS '[.completed_results[] | select(.applicable or .legacy or .shape=="template-verdict" or .shape=="rejected-capture")] | sort_by(.charged_spend_epoch,.canonical_identity) | last // empty' <<<"$canonical")"
   if [ -n "$selected" ]; then
     selected_count="$(jq -r --argjson s "$selected" '[.completed_results[] | select(.charged_spend_epoch==$s.charged_spend_epoch and .canonical_identity==$s.canonical_identity)] | length' <<<"$canonical")"
     if [ "$selected_count" -gt 1 ]; then
       pg_review_decision_emit stop-without-new-review completed-result-tie "$canonical" "$snapshot"; return
     fi
     selected_ref="$(jq -r .canonical_identity <<<"$selected")"
+    selected_shape="$(jq -r '.shape // ""' <<<"$selected")"
     # Rejected saved bytes participate in the same newest-epoch selection without supplying
     # accepted authority. A newer grounded completion can supersede them; a newest rejection stops.
-    if [ "$(jq -r '.shape // ""' <<<"$selected")" = template-verdict ]; then
+    if [ "$selected_shape" = template-verdict ]; then
       pg_review_decision_emit stop-without-new-review template-verdict "$canonical" "$snapshot" "$selected_ref"; return
+    fi
+    # #271: a retained proven completion that failed validation stops only its own attempt. While
+    # another marker is active or reserved, that live work is recovered by the branches below.
+    if [ "$selected_shape" = rejected-capture ] \
+       && jq -e --argjson s "$selected" '.active_index.state=="none" and (.reservation.state=="none" or .reservation.marker==$s.marker)' <<<"$canonical" >/dev/null; then
+      pg_review_decision_emit stop-without-new-review rejected-capture "$canonical" "$snapshot" "$selected_ref"; return
     fi
     if [ "$(jq -r .collected <<<"$selected")" = false ]; then
       # An uncollected result whose evidence mode can never carry merge proof (a connector SHIP,
@@ -4920,6 +5088,108 @@ pg_review_facts_target_matches() { # input-json host owner repo pr
     <<<"$1" >/dev/null 2>&1
 }
 
+# One batch of the candidate prefilter. Prints "<index><TAB>1" for each marker that could still be
+# relevant, or "<index><TAB>0" for one the per-marker scan would skip. Ownership mirrors that scan:
+# the input binding's sole JSON object through pg_review_facts_target_matches, the sidecar's first
+# line split the way `IFS=$'\t' read` splits it (a valid sidecar's PR is that field normalized), and
+# this PR's key prefix. Bytes the scan might read differently (anything outside printable ASCII)
+# and JSON this filter cannot evaluate count as possible relevance.
+pg_review_facts_relevance_batch() { # host owner repo pr target key [--arg mN marker --rawfile iN input --rawfile sN sidecar]...
+  local host="$1" owner="$2" repo="$3" pr="$4" target="$5" key="$6"
+  shift 6
+  jq -nr --arg h "$host" --arg o "$owner" --arg r "$repo" --argjson p "$pr" --arg pr "$pr" \
+    --arg target "$target" --arg key "$key" "$@" '
+    def bound_target($s):
+      if ($s | test("^[\t\n\r ]*$")) then false
+      elif ($s | test("[^\t\n\r -~]")) then true
+      else try ($s | fromjson | if type == "object" then
+          ((.repository | with_entries(.value |= ascii_downcase))=={host:($h|ascii_downcase),owner:($o|ascii_downcase),repo:($r|ascii_downcase)} and .target.pr==$p)
+        else false end) catch true
+      end;
+    def sidecar_target($s):
+      ($s | split("\n")[0] // "") as $line
+      | if ($line | test("[^\t -~]")) then true
+        else ($line | split("\t") | map(select(. != ""))) as $f
+          | ([$f[0], $f[1], $f[2]] | map(. // "") | join("/") | ascii_downcase) == $target
+            and (($f[4] // "") | test("^0*" + $pr + "$"))
+        end;
+    $ARGS.named as $a
+    | $a | keys[] | select(test("^m[0-9]+$")) | .[1:] as $i
+    | (($a["m" + $i] | ascii_downcase | startswith("pg-run-" + $key + "-"))
+        or sidecar_target($a["s" + $i]) or bound_target($a["i" + $i])) as $need
+    | "\($i)\t\(if $need then 1 else 0 end)"'
+}
+
+# Rule out, in a few jq processes instead of about ten per marker, the markers whose validation in
+# pg_review_facts_candidates can only end in `continue` (#292). For a full-shape marker that loop
+# keeps relevance only from its input binding's target, its sidecar's attribution (valid or
+# damaged), or this PR's key prefix: a valid sidecar for another target skips it, and otherwise an
+# irrelevant marker is skipped whether its result is bound or not. So a full-shape marker with none
+# of the three is skipped here without computing bound. Every other marker is passed through,
+# including a non-full-shape name (an unbound result may keep it relevant), a binding or sidecar
+# that is a symlink, FIFO, unreadable or larger than 64 KiB, and on any failure the whole list.
+# Output keeps the sorted input order, so the candidate list is byte-identical.
+pg_review_facts_prefilter() { # host owner repo pr target key < sorted markers -> markers to validate
+  local host="$1" owner="$2" repo="$3" pr="$4" target="$5" key="$6" input_dir meta_dir dir big
+  local marker f i n=0 sent=0 out='' idx flag
+  local markers=() need=() args=() dirs=() paths=()
+  while IFS= read -r marker; do markers+=("$marker"); n=$((n + 1)); done
+  [ "$n" -gt 0 ] || return 0
+  case "$pr" in ''|*[!0-9]*) printf '%s\n' "${markers[@]}"; return 0 ;; esac
+  input_dir="$(pg_review_input_binding_dir)"; meta_dir="$(pg_run_meta_dir)"
+  for dir in "$input_dir" "$meta_dir"; do
+    if [ -e "$dir" ] || [ -L "$dir" ]; then dirs+=("$dir"); fi
+  done
+  # Bounds what one pass reads into memory, as the scan's own 64 KiB guards do.
+  big=$'\n'
+  if [ "${#dirs[@]}" -gt 0 ]; then
+    big="$big$(find -H "${dirs[@]}" -type f -size +65536c 2>/dev/null)"$'\n' || { printf '%s\n' "${markers[@]}"; return 0; }
+  fi
+  for ((i = 0; i < n; i++)); do
+    marker="${markers[i]}"; need[i]=1
+    pg_reservation_marker_ok "$marker" || continue
+    [[ "$marker" =~ ^pg-run-.+-.+-[1-9][0-9]*-[0-9]+-[0-9]+$ ]] || continue
+    case "$big" in *"/$marker"$'\n'*) continue ;; esac
+    paths=()
+    for dir in "$input_dir" "$meta_dir"; do
+      f="$dir/$marker"
+      if [ ! -e "$f" ] && [ ! -L "$f" ]; then
+        paths+=(/dev/null)
+      elif [ -f "$f" ] && [ ! -L "$f" ] && [ -r "$f" ]; then
+        paths+=("$f")
+      else
+        break
+      fi
+    done
+    [ "${#paths[@]}" -eq 2 ] || continue
+    need[i]=''
+    args+=(--arg "m$i" "$marker" --rawfile "i$i" "${paths[0]}" --rawfile "s$i" "${paths[1]}")
+    sent=$((sent + 1))
+    if [ "$sent" -eq 200 ]; then
+      out="$out$(pg_review_facts_relevance_batch "$host" "$owner" "$repo" "$pr" "$target" "$key" "${args[@]}")"$'\n' \
+        || { printf '%s\n' "${markers[@]}"; return 0; }
+      args=(); sent=0
+    fi
+  done
+  if [ "$sent" -gt 0 ]; then
+    out="$out$(pg_review_facts_relevance_batch "$host" "$owner" "$repo" "$pr" "$target" "$key" "${args[@]}")"$'\n' \
+      || { printf '%s\n' "${markers[@]}"; return 0; }
+  fi
+  # Every marker sent must be answered exactly once, or nothing is ruled out.
+  while IFS=$'\t' read -r idx flag; do
+    [ -n "$idx$flag" ] || continue
+    case "$idx" in ''|*[!0-9]*) printf '%s\n' "${markers[@]}"; return 0 ;; esac
+    if [ "$idx" -ge "$n" ] || [ -n "${need[idx]}" ]; then printf '%s\n' "${markers[@]}"; return 0; fi
+    case "$flag" in 0|1) need[idx]="$flag" ;; *) printf '%s\n' "${markers[@]}"; return 0 ;; esac
+  done <<<"$out"
+  for ((i = 0; i < n; i++)); do
+    [ -n "${need[i]}" ] || { printf '%s\n' "${markers[@]}"; return 0; }
+  done
+  for ((i = 0; i < n; i++)); do
+    [ "${need[i]}" = 0 ] || printf '%s\n' "${markers[i]}"
+  done
+}
+
 # Discover completion records before validating acceptance. Attribution metadata and the marker's
 # PR key establish possible relevance only; they never supply a verdict or counts. Missing/corrupt
 # input siblings can therefore obstruct an older accepted review instead of disappearing in a scan.
@@ -4999,13 +5269,15 @@ pg_review_facts_candidates() { # host owner repo pr -> candidate metadata JSON
         [ -e "$f" ] || [ -L "$f" ] || continue
         marker="${f##*/}"
         [ "$dir" != "$PRO_GATE_HOME/recovered" ] || marker="${marker%.md}"
-        # Match publication PID suffixes only, not legitimate names such as .tmp.v2.
+        # Match publication PID suffixes only, not legitimate names such as .tmp.v2. The leading
+        # parentheses keep bash 3.2 (stock macOS) from reading a pattern's `)` as the end of this
+        # process substitution (#295).
         case "$marker" in
-          *.tmp.*) tail="${marker##*.tmp.}"; case "$tail" in ''|*[!0-9]*) ;; *) continue ;; esac ;;
+          (*.tmp.*) tail="${marker##*.tmp.}"; case "$tail" in (''|*[!0-9]*) ;; (*) continue ;; esac ;;
         esac
         printf '%s\n' "$marker"
       done
-    done | LC_ALL=C sort -u
+    done | LC_ALL=C sort -u | pg_review_facts_prefilter "$host" "$owner" "$repo" "$pr" "$target" "$key"
   )
   printf '%s' "$candidates"
 }

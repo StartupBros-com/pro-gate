@@ -10,7 +10,11 @@ One invocation bound to an immutable review target and evidence identity. An att
 
 ### Reservation
 
-Durable ownership of review-account capacity for a submitted attempt that may outlive its invoking process. A reservation can remain collectable without holding capacity after proof-backed completion or supersession.
+Durable ownership of review-account capacity for a submitted attempt that may outlive its invoking process. A reservation can remain collectable without holding capacity after proof-backed completion or supersession, or once it outlives the Generation Ceiling.
+
+### Generation Ceiling
+
+The age, measured from a reservation's charge, past which a still-generating reservation stops counting against review capacity. It is set well above the longest measured successful generation. Nothing is written when it passes: the record, its charge and its harvest path are unchanged, and removal still needs the TTL plus confirmed marker misses.
 
 ### Reservation Guard
 
@@ -51,6 +55,12 @@ An **acceptance** predicate publishes a capture as this run's review, so a false
 The same identifier can therefore be compared at different strictness in the two classes without inconsistency. Treating them as one question and picking a single global strictness is wrong in one direction by construction.
 
 What the acceptance predicate concluded about a published artifact is its **ownership**: `exact` (the authoritative verdict line named this run's marker) or `nonce-less` (an artifact accepted under the pre-marker rules). These are conceptual terms, not a persisted `ownership` field in binding records. A capture carrying a foreign authoritative claim has no ownership because it is never published. Final nonce acceptance is case-sensitive; browser-side foreign conviction folds case so a near-match is not destructively misclassified.
+
+### Run Marker
+
+A per-attempt correlation id that the review prompt asks the model to copy back verbatim, in its own parentheses, at the end of its final verdict line. The echo is how a captured answer proves it was written for this attempt's prompt and not another run's.
+
+Only a standalone echo counts toward `exact` ownership: written exactly in the form the prompt shows, and on the answer's final verdict line. A marker folded into other text inside the same parentheses, or carried on any other line, names the run without binding it, so the Acceptance Predicate refuses the capture instead of publishing it. The engine strips the echo before it returns the review.
 
 ### Conversation Memo
 
@@ -115,9 +125,11 @@ The engine appends its own output contract after a brief, so a brief chooses the
 ## Relationships
 
 - A Review Attempt may own one Reservation; Exact Recovery resumes that same attempt.
+- A Review Attempt has one Run Marker. Its echo on the final verdict line is what the Acceptance Predicate reads to grant `exact` ownership, and a Conversation Memo is keyed by it.
 - A Reservation Guard serializes the recording of a Reservation against the capacity decision that reads it; it is not itself capacity, and it is held for far less time than a Reservation.
 - The Orphan Grace governs a Reservation Guard's lockless fallback only, and covers the window before an owner is recorded; the liveness check covers every moment after.
 - A Terminal Disposition or Supersession can release a Reservation's capacity without deleting the attempt's audit history.
+- The Generation Ceiling stops a Reservation counting against capacity without changing its lifecycle state, so a later harvest still sees `generating`.
 - Applicability is an input to the Review Decision, not a synonym for completion.
 - Input Policy constrains evidence delivery before a Review Attempt can be submitted.
 - A Brief redirects what a Review Attempt asks; it never widens who may act on the answer.
