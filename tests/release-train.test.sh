@@ -8,8 +8,8 @@ CANONICAL_SOURCE_KIND='url'
 CANONICAL_SOURCE_URL='https://github.com/StartupBros-com/pro-gate.git'
 trap 'rm -rf "$TMP"' EXIT
 
-HARDENED_SHA='66e197874fe627f3d5f58dff49737e7747d20bfe'
-RETIRED_SHA='08f7d22f3a5b59b1658ab2e96a20d0d3c352869c'
+HARDENED_SHA='41bb6f811f1c1ad65f62c1ef32e696c60fb1d8c3'
+RETIRED_SHA='66e197874fe627f3d5f58dff49737e7747d20bfe'
 ANNOUNCE_WORKFLOW='StartupBros-com/hov-marketplace/.github/workflows/hov-tool-drop-announce.yml'
 HARDENED_USES="$ANNOUNCE_WORKFLOW@$HARDENED_SHA"
 ANNOUNCE_IF="github.event.release.draft == false && github.event.release.prerelease == false && needs.verify.result == 'success' && needs.verify.outputs.announce == 'true'"
@@ -40,7 +40,7 @@ validate_release_policy() {
   # the distribution manifest is the one whose compromise reaches every
   # installed client, and a direct bot push cannot satisfy required status
   # checks anyway (hov-marketplace require-ci, 2026-08-11). Promotion is a
-  # reviewed repin PR; this job only verifies and reports.
+  # merged repin PR; this job only verifies and reports.
   if grep -Fq 'HOV_MARKETPLACE_DEPLOY_KEY' "$workflow" "$script"; then
     printf 'marketplace deploy key must stay retired\n' >&2
     return 1

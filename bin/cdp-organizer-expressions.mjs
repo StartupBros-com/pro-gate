@@ -46,10 +46,34 @@ export function readReviewText(document, marker) {
   for (let i = 0; i < turns.length; i++) {
     if (turns[i].getAttribute('data-message-author-role') === 'user' && exact(turns[i].innerText ?? '')) prompt = i;
   }
-  if (prompt >= 0) return {
-    text: 'run marker: ' + marker + '\n' + turns.slice(prompt + 1).map((turn) => read(turn)).join('\n\n'),
-    promptAt: 0,
-  };
+  if (prompt >= 0) {
+    const following = turns.slice(prompt + 1);
+    const text = 'run marker: ' + marker + '\n' + following.map((turn) => read(turn)).join('\n\n');
+    // #271: response-scope facts for salvage's completion proof. Proven only when exactly one
+    // assistant message follows the latest marked prompt, it is the page's last message, its turn
+    // shows Oracle's FINISHED_ACTIONS_SELECTOR buttons, no STOP_BUTTON_SELECTORS control is
+    // rendered, that turn carries none of the loading-shimmer/aria-busy markers Oracle's own
+    // completion veto treats as live thinking (thinkingStatus.js), and the page names its URL.
+    // Any missing DOM method or exception leaves it unproven.
+    let scope = { following: -1, assistantLast: false, finished: false, generating: true, href: null };
+    try {
+      const finishedActions = 'button[data-testid="copy-turn-action-button"], button[data-testid="good-response-turn-action-button"], button[data-testid="bad-response-turn-action-button"], button[aria-label="Share"]';
+      const stopButtons = '[data-testid="stop-button"], [data-testid="composer-stop-button"], form button[aria-label*="stop" i]:not([aria-label*="dictat" i]):not([aria-label*="voice" i]):not([aria-label*="read" i])';
+      const busyIndicators = 'span.loading-shimmer, .loading-shimmer, [class*="loading-shimmer"], [aria-busy="true"]';
+      const answer = following.length === 1 ? following[0] : null;
+      const assistantLast = !!answer && answer.getAttribute('data-message-author-role') === 'assistant'
+        && answer === turns[turns.length - 1];
+      const container = assistantLast ? answer.closest?.('[data-testid^="conversation-turn"]') : null;
+      const finished = !!container && (container.querySelector?.(finishedActions) ?? null) !== null;
+      const generating = document.querySelector(stopButtons) !== null
+        || (!!container && (container.querySelector?.(busyIndicators) ?? null) !== null);
+      const href = typeof document.location?.href === 'string' ? document.location.href : null;
+      scope = { following: following.length, assistantLast, finished, generating, href };
+    } catch {
+      // Unproven: the defaults above already fail closed.
+    }
+    return { text, promptAt: 0, scope };
+  }
   return { text: read(document.body), promptAt: null };
 }
 
@@ -97,20 +121,29 @@ export function reviewVerdictClaims(text, marker) {
 }
 
 export function reviewTextContext(text, marker, promptAt = null) {
+  const assistantScoped = promptAt === 0;
   const scanned = reviewVerdictClaims(text, marker);
   const all = scanned.claims;
   // DOM user-turn scope is authoritative. Legacy text sources retain the known prompt-line
   // shapes only; a prose marker mention cannot erase an earlier verdict.
   if (promptAt === null) promptAt = scanned.promptAt;
   const claims = all.filter((claim) => claim.at > promptAt);
-  const markers = new Set(claims.flatMap((claim) => claim.markers.map((value) => value.toLowerCase())));
-  const mixed = markers.has(marker.toLowerCase()) && [...markers].some((value) => value !== marker.toLowerCase());
+  const markers = new Set(
+    claims.flatMap((claim) => claim.markers.map((value) => value.toLowerCase())),
+  );
+  const mixed =
+    markers.has(marker.toLowerCase()) &&
+    [...markers].some((value) => value !== marker.toLowerCase());
   const verdict = claims.at(-1) ?? all.at(-1) ?? null;
   let review = null;
   if (verdict) {
     if (mixed) {
       const from = promptAt < 0 ? 0 : text.indexOf('\n', promptAt) + 1;
       review = text.slice(from, verdict.at + verdict.line.length).trim();
+    } else if (assistantScoped && verdict.at > promptAt) {
+      // #262: readReviewText has removed the marked user prompt. Preserve assistant prose
+      // before P0 as well as after it, so real rationale cannot become a verdict skeleton.
+      review = text.slice(text.indexOf('\n') + 1, verdict.at + verdict.line.length).trim();
     } else {
       const lines = text.split('\n');
       let at = 0;
@@ -118,12 +151,20 @@ export function reviewTextContext(text, marker, promptAt = null) {
       let end = -1;
       for (let i = 0; i < lines.length; i++) {
         if (at === verdict.at) end = i;
-        if (at <= verdict.at && (verdict.at < promptAt || at > promptAt) && start < 0 &&
-            /^\s*[*_>#-]*\s*(P0\s*[:\-]|P0\b|\[P[0-3]\])/i.test(lines[i].trim())) start = i;
+        if (
+          at <= verdict.at &&
+          (verdict.at < promptAt || at > promptAt) &&
+          start < 0 &&
+          /^\s*[*_>#-]*\s*(P0\s*[:\-]|P0\b|\[P[0-3]\])/i.test(lines[i].trim())
+        )
+          start = i;
         at += lines[i].length + 1;
       }
       if (start < 0) start = Math.max(0, end - 120);
-      review = lines.slice(start, end + 1).join('\n').trim();
+      review = lines
+        .slice(start, end + 1)
+        .join('\n')
+        .trim();
     }
   }
   return { claims, verdict, mixed, review, promptAt };

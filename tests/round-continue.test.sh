@@ -48,6 +48,43 @@ facts_with_governor(){ # governor [patch]
   jq -cS --argjson governor "$1" --argjson patch "$patch" --argjson identity "$(pg_review_decision_identity_json)" \
     '.base_facts * $patch | .governor=$governor | .contract=$identity' "$HERE/fixtures/review-decision/v1/corpus.json"
 }
+result="$(
+  clear_policy
+  PRO_GATE_HOME="$TDIR/default-cap"
+  pg_round_score default
+  printf 'base=%s grant=%s ceiling=%s\n' "$PG_ROUND_BASE" "$PG_ROUND_GRANT" "$PG_ROUND_CEILING"
+  [ "$PG_ROUND_BASE" -eq 2 ] && [ "$PG_ROUND_GRANT" -eq 2 ] && [ "$PG_ROUND_CEILING" -eq 8 ]
+)"; rc=$?
+check '#274 default numeric grant is 2 with round environment unset (planted negative)' "$rc" "$result"
+result="$(
+  clear_policy
+  export PRO_GATE_HOME="$TDIR/status-default" PRO_GATE_RUN_LOGS=0
+  mkdir -p "$PRO_GATE_HOME/rounds"
+  date +%s > "$PRO_GATE_HOME/rounds/status-default"
+  bash "${PG_TEST_STATUS_ENGINE:-$HERE/../bin/oracle-review.sh}" --status
+)"; rc=$?
+check 'P3-7 status heading reports adaptive base 2 with settings unset' \
+  "$([ "$rc" -eq 0 ] && [[ "$result" == *'adaptive (base 2,'* ]]; printf '%s' "$?")" "$result"
+result="$(
+  clear_policy
+  PRO_GATE_HOME="$TDIR/explicit-cap"
+  PRO_GATE_MAX_ROUNDS_PER_PR=4
+  pg_round_score explicit
+  [ "$PG_ROUND_GRANT" -eq 4 ] && [ "$(pg_round_policy_mode explicit)" = enforced ]
+)"; rc=$?
+check '#274 explicit PRO_GATE_MAX_ROUNDS_PER_PR=4 remains honored (control)' "$rc" "$result"
+result="$(
+  clear_policy
+  PRO_GATE_HOME="$TDIR/invalid-cap"
+  PRO_GATE_MAX_ROUNDS_PER_PR=invalid
+  pg_round_score invalid
+  [ "$PG_ROUND_GRANT" -eq 2 ] || exit 1
+  unset PRO_GATE_MAX_ROUNDS_PER_PR
+  PRO_GATE_ROUNDS_BASE=4
+  pg_round_score explicit-base
+  [ "$PG_ROUND_BASE" -eq 4 ] && [ "$PG_ROUND_GRANT" -eq 4 ]
+)"; rc=$?
+check '#274 invalid flat cap falls back to 2 and explicit base 4 remains honored' "$rc" "$result"
 matrix_case(){ (
   local mode="$1" override="$2" trajectory="$3" budget="$4" policy base=6 numeric earned=0 streak=0 used=3
   local expected_granted=true expected_grant granted=false governor decision reason expected_reason
@@ -115,7 +152,7 @@ result="$(
   PRO_GATE_ROUNDS_CONTINUE=1
   seed default 3 churning
   pg_round_score default
-  [ "$PG_ROUND_GRANT" = 3 ] || exit 1
+  [ "$PG_ROUND_GRANT" = 2 ] || exit 1
   unset PRO_GATE_ROUNDS_CONTINUE
   decision="$(pg_review_decision_reduce "$(facts_with_governor "$(pg_round_governor_facts_json default true)")")"
   [ "$(jq -r .reason <<<"$decision")" = rounds-not-converging ]
@@ -190,6 +227,54 @@ effect_case(){ (
 ); }
 result="$(effect_case 2>&1)"; rc=$?
 check 'saved CONTINUE grant rechecks exhaustion before charge/browser at every boundary; cooldown still wins' "$rc" "$result"
+
+# The open-count reader shares the writer's status-position grammar, not its side effects.
+result="$(
+  clear_policy
+  PRO_GATE_HOME="$TDIR/severity"
+  seed severity 1 clean
+  review="$PRO_GATE_HOME/review"
+  cat > "$review" <<'REVIEW'
+[P0] f:1 — RESOLVED — fixed
+[P0] f:2 — the RESOLVED state is forgeable
+[p0] f:3 — RESOLVED_MODEL is clobbered
+[P1] f:4 -- RESOLVED -- fixed
+[p1] f:5 - resolved - lowercase remains open
+[P1] f:6 — STILL-PRESENT — broken
+[P2] f:7 — new minor issue
+VERDICT: FIX-FIRST
+REVIEW
+  pg_round_note_severity severity "$review"
+  [ "$(pg_round_last_severity severity)" = '2 2' ] || exit 1
+  # The governor's historical res tally is deliberately case-insensitive; do not change it.
+  [ "$(cut -f2-6 "$PRO_GATE_HOME/rounds/severity.hist" | tail -n 1)" = $'FIX-FIRST\t2\t2\t3\t1' ] || exit 1
+  before="$(find "$PRO_GATE_HOME" -type f -exec sha256sum {} + | sort)"
+  counts="$(pg_review_open_severity "$review")" || exit 1
+  [ "$counts" = $'2\t2' ] || exit 1
+  [ "$before" = "$(find "$PRO_GATE_HOME" -type f -exec sha256sum {} + | sort)" ] || exit 1
+  ! pg_review_open_severity "$PRO_GATE_HOME/missing"
+)"; rc=$?
+check 'pure open severity preserves status position, case and governor accounting' "$rc" "$result"
+
+# #291: a standalone P1 label resolved by its finding has counts, so the completed round records
+# .last and .hist; an empty standalone section still has none and leaves both untouched.
+result="$(
+  clear_policy
+  PRO_GATE_HOME="$TDIR/standalone"
+  review="$PRO_GATE_HOME/review"
+  seed standalone 1 clean
+  printf 'P0: none\n\nP1\n\n[P1] f:75 — concurrent inserts race\n\nP2\n\nP2: none\n\nVERDICT: FIX-FIRST\n' > "$review"
+  pg_round_note_severity standalone "$review"
+  [ "$(pg_round_last_severity standalone)" = '0 1' ] || exit 1
+  [ "$(cut -f2-6 "$PRO_GATE_HOME/rounds/standalone.hist" | tail -n 1)" = $'FIX-FIRST\t0\t1\t0\t0' ] || exit 1
+  [ "$(grep -c . "$PRO_GATE_HOME/rounds/standalone.hist")" -eq 4 ] || exit 1
+  seed empty 1 clean
+  printf 'P0: none\n\nP1\n\nP2: none\n\nVERDICT: FIX-FIRST\n' > "$review"
+  before="$(sha256sum "$PRO_GATE_HOME/rounds/empty.hist")"
+  pg_round_note_severity empty "$review"
+  [ ! -e "$PRO_GATE_HOME/rounds/empty.last" ] && [ "$before" = "$(sha256sum "$PRO_GATE_HOME/rounds/empty.hist")" ]
+)"; rc=$?
+check '#291 a resolved standalone label records round severity; an empty one still skips history' "$rc" "$result"
 
 printf '%s failures\n' "$FAILURES"
 [ "$FAILURES" -eq 0 ]

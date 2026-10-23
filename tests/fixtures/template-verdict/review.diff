@@ -1,0 +1,7 @@
+diff --git a/src/review-engine.ts b/src/review-engine.ts
+--- a/src/review-engine.ts
++++ b/src/review-engine.ts
+@@ -1,2 +1,3 @@
+ function classifyReview() {
++  const policy_name = readPolicy();
+   return tests + clean + functionName + migration;

@@ -117,12 +117,14 @@ daemon_decision_reason(){ jq -r '.reason // empty' "$1"; }
 #     before this helper is ever reached at either call site below -- so seeing
 #     allow-existing-merge-workflow/current-ship-is-merge-eligible on an envelope that already
 #     passed that check IS the reducer's own completed_results-backed SHIP selection.
+#     The same validated handoff with reason fix-first-deferred-p2-only completes a head whose
+#     accepted FIX-FIRST has proven zero open blockers and at least one deferred P2/P3 finding.
 #
 # Every other action, and every other stop/report reason (round-governor-denied, unproven-input,
 # invalid-binding, evidence-preparation-unsafe, no-safe-action, undefined-state,
 # legacy-not-authoritative, a completed-result tie, invalid-named-choice, stale-named-choice,
 # fix-review-findings, prepare-matching-review-evidence, ask-named-product-choice, ...) is
-# explicitly NOT completion -- reasons are an open set, so this checks the two positive shapes
+# explicitly NOT completion -- reasons are an open set, so this checks the positive shapes
 # rather than excluding a list. Positive facts, not reason strings alone, decide -- see #184
 # finding 1.
 daemon_decision_completes_current_head(){ # decision-file
@@ -138,7 +140,7 @@ daemon_decision_completes_current_head(){ # decision-file
         ($p.code_identity == .facts.input.identity) and
         ($p.evidence_identity == .facts.evidence.identity)
       ' "$1" >/dev/null 2>&1 ;;
-    allow-existing-merge-workflow/current-ship-is-merge-eligible)
+    allow-existing-merge-workflow/current-ship-is-merge-eligible|allow-existing-merge-workflow/fix-first-deferred-p2-only)
       return 0 ;;
     *)
       return 1 ;;
@@ -988,6 +990,7 @@ daemon_legacy_row_has_durable_evidence(){ # nwo num sha -> rc 0 when durable evi
     artifact="$completed_dir/$marker"
     [ -s "$artifact" ] && [ ! -L "$artifact" ] && pg_is_review "$artifact" || continue
     [ -z "$(pg_capture_foreign_echo "$artifact" "$marker")" ] || continue   # finding 2: reject foreign/mixed capture
+    pg_review_shape_for_marker "$marker" "$artifact" || continue
     [ "$(pg_extract_verdict "$artifact")" = SHIP ] || continue             # finding 2: only a SHIP outcome completes
     binding="$(pg_review_binding_read input "$marker" 2>/dev/null)" || continue
     jq -e --arg h "$DAEMON_HOST" --arg o "$owner" --arg r "$repo_name" --argjson p "$num" --arg sha "$sha" '
@@ -1024,7 +1027,7 @@ daemon_legacy_row_has_durable_evidence(){ # nwo num sha -> rc 0 when durable evi
       *) continue ;; # connector: never SHIP merge-eligibility authority
     esac
     found=0; break
-  done < <(jq -r --arg rk "$round_key" 'select(.outcome=="clean" and (.round_key // "")==$rk) | .marker // empty' "$ledger" 2>/dev/null)
+  done < <(jq -r --arg rk "$round_key" 'select(.outcome=="clean" and .names_nothing!=true and (.round_key // "")==$rk) | .marker // empty' "$ledger" 2>/dev/null)
   return "$found"
 }
 

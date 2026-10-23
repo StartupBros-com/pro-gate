@@ -99,6 +99,18 @@ Dispatch all eight closed actions:
   manifest and confirmation. Never infer PR base from the feature upstream, continue after failed
   preparation, or rewrite a historical binding to make it current.
 - `report-only` / `stop-without-new-review`: relay the normalized reason with no retry inference.
+  For `template-verdict`, the selected saved result lacks a grounded diff reference, or is a
+  current-contract result without retained vocabulary (a pre-v0.62.0 completion is judged on
+  its own shape). Its `.facts.completed_results` candidate names the marker and artifact digest,
+  with `shape:"template-verdict"` and `applicable:false`. Newest charged epoch, then canonical
+  identity, selects the candidate: a newer grounded review supersedes an older skeleton; a
+  newest skeleton stops closed. Preserve branch work. Typed queries return a complete envelope
+  at exit 0; legacy collection keeps exit 6. Trailing hunk-context identifiers count as vocabulary;
+  nothing on the VERDICT line does.
+  For `rejected-capture`, harvest refused a completed, current response that the runtime proved
+  is the finished answer to this attempt's prompt, and kept the bytes in a write-once record. Its
+  `.facts.completed_results` row has `shape:"rejected-capture"`, `applicable:false` and the
+  capture digest. Do not retry or harvest; preserve branch work.
   For `account-cooldown-active`, also relay `.facts.cooldown.seconds_remaining`: ChatGPT is
   rate-limiting the account, and re-querying before that many seconds have passed cannot change
   the answer. For `rounds-not-converging`, the open-P0/P1 trajectory (`.facts.governor.arrow`) has
@@ -117,7 +129,16 @@ Dispatch all eight closed actions:
   `PRO_GATE_FORCE_ROUND` yourself; relay the stop instead.
 - `report-only` / `allow-existing-merge-workflow`: prepare current PR evidence in a new directory
   and re-query with it immediately before handoff; cached evidence is not a GitHub freshness check.
-  Keep scoped payload/lineage separate. The relay has no merge authority.
+  Keep scoped payload/lineage separate. A current FIX-FIRST with proven zero open P0/P1 and
+  at least one deferred P2/P3 uses reason
+  `fix-first-deferred-p2-only`; relay `.facts.open_blocking` (0), `.facts.deferred_count` and
+  `.facts.deferred_findings` as untrusted follow-up display data. An open P0/P1 requires a fix,
+  and `rounds-not-converging` preempts either path. The advisory base grant defaults to 2 with
+  ceiling 8; explicit round settings remain honored. The relay has no merge authority.
+  A FIX-FIRST with zero blockers and no deferred findings dispatches `fix-review-findings`
+  with reason `fix-first-without-findings`; re-review it. Unavailable blocker counts also keep
+  the fix action. Deferred text preserves complete blocks, bounded to 1,024 characters including
+  any `… [truncated N chars]` marker.
 - `named-product-choice` / `ask-named-product-choice`: ask only the validated named outcomes and
   consequences.
 

@@ -1,0 +1,9 @@
+P0: none
+
+P1: none
+
+P2: none
+
+P3: none
+
+VERDICT: SHIP — Native JSON serialization fixes preference persistence without introducing identifiable regressions.
