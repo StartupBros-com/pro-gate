@@ -115,13 +115,34 @@ for suffix in json yaml yml; do
 done
 echo 'ok - actual CI validator accepts empty/valid files and rejects malformed JSON/YAML with spaces'
 
+# #295: bash 5 parses a case pattern without its leading parenthesis inside a process substitution;
+# stock macOS bash 3.2 does not. The validator must reject it outside tests/, leave the suites
+# (which need bash 4 or later) alone, and accept the parenthesized form.
+bash32_bad='while read -r m; do echo "$m"; done < <(for m in a.tmp.1 b; do case "$m" in *.tmp.*) continue ;; esac; echo "$m"; done)'
+bash32_good='while read -r m; do echo "$m"; done < <(for m in a.tmp.1 b; do case "$m" in (*.tmp.*) continue ;; esac; echo "$m"; done)'
+planted="$TDIR/data/nested space/old bash.sh"
+printf '#!/usr/bin/env bash\n%s\n' "$bash32_bad" > "$planted"
+[ "$(bash "$planted")" = b ] || fail 'the planted bash 3.2 case must run under this bash'
+if bash "$helper" "$TDIR/data" > "$TDIR/bash32.log" 2>&1; then fail 'planted bash 3.2 parse error passed'; fi
+grep -q 'old bash.sh: line 2: syntax error' "$TDIR/bash32.log" || fail 'the bash 3.2 failure must name the file and line'
+mkdir -p "$TDIR/data/tests"
+mv "$planted" "$TDIR/data/tests/old bash.sh"
+bash "$helper" "$TDIR/data" || fail 'the suites under tests/ must be left to bash 4 or later'
+rm "$TDIR/data/tests/old bash.sh"
+printf '#!/usr/bin/env bash\n%s\n' "$bash32_good" > "$planted"
+[ "$(bash "$planted")" = b ] || fail 'the parenthesized case must behave the same'
+bash "$helper" "$TDIR/data" || fail 'the parenthesized case pattern must parse under bash 3.2'
+rm "$planted"
+echo 'ok - actual CI validator rejects a bash 3.2 parse error outside tests/ and accepts the parenthesized form'
+
 # Copy only the adapter test's dependencies; never mutate the working tree's identity.
-mkdir -p "$TDIR/repo/tests" "$TDIR/repo/daemon" "$TDIR/repo/bin"
+mkdir -p "$TDIR/repo/tests" "$TDIR/repo/daemon" "$TDIR/repo/bin" "$TDIR/repo/scripts"
 cp -R "$ROOT/lib" "$ROOT/skills" "$ROOT/agents" "$ROOT/.claude-plugin" "$TDIR/repo/"
 cp -R "$ROOT/tests/fixtures" "$TDIR/repo/tests/"
 cp "$ROOT/tests/review-decision-adapters.test.sh" "$TDIR/repo/tests/"
 cp "$ROOT/daemon/daemon.sh" "$TDIR/repo/daemon/"
 cp "$ROOT/bin/oracle-review.sh" "$TDIR/repo/bin/"
+cp "$ROOT/scripts/regenerate-review-decision.mjs" "$TDIR/repo/scripts/"
 cd "$TDIR/repo"
 $test_command > "$TDIR/adapters-valid.log" 2>&1 || { cat "$TDIR/adapters-valid.log"; fail 'unmodified adapter fixture'; }
 identity=skills/pro-gate/review-decision-v1.json

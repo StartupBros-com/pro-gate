@@ -41,12 +41,17 @@ jobs:
             tests: |
               bash tests/ci-assurance.test.sh
               bash tests/review-decision-adapters.test.sh
+              bash tests/review-facts.test.sh
+              node --test tests/github-status.test.mjs
+              node --test tests/github-base-fetch.test.mjs
               bash tests/daemon-reload.test.sh
               bash tests/daemon-current-head-completion.test.sh
               bash tests/daemon-query-isolation.test.sh
               bash tests/memo-recovery.test.sh
               bash tests/round-continue.test.sh
               bash tests/delivery-disposition.test.sh
+              bash tests/template-verdict.test.sh
+              bash tests/rejected-capture.test.sh
               bash tests/autoupdate.test.sh
               bash tests/resolve-identity.test.sh
               bash tests/browser-launch.test.sh

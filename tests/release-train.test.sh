@@ -40,7 +40,7 @@ validate_release_policy() {
   # the distribution manifest is the one whose compromise reaches every
   # installed client, and a direct bot push cannot satisfy required status
   # checks anyway (hov-marketplace require-ci, 2026-08-11). Promotion is a
-  # reviewed repin PR; this job only verifies and reports.
+  # merged repin PR; this job only verifies and reports.
   if grep -Fq 'HOV_MARKETPLACE_DEPLOY_KEY' "$workflow" "$script"; then
     printf 'marketplace deploy key must stay retired\n' >&2
     return 1

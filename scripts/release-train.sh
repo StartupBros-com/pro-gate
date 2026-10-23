@@ -60,7 +60,7 @@ verify_release() {
   printf '%s\n' "$version"
 }
 
-# The marketplace card is updated by a REVIEWED repin PR, never by a push from
+# The marketplace card is updated by a merged repin PR, never by a push from
 # this job. Print the exact values that PR needs; a human or agent opens it.
 # Rationale: a standing deploy key able to write the distribution manifest is
 # the one credential whose compromise reaches every installed client, and a

@@ -167,7 +167,7 @@ done
 # gate #148 r1 P2: an unattended recovery passes --timeout only when PRO_REVIEW_ENGINE_TIMEOUT is
 # configured. The engine treats any --timeout it receives as final, so the fixed 60m the daemon used
 # to send bypassed the 45m collection default and PRO_GATE_HARVEST_TIMEOUT on every recovery.
-RECOVER_INDEX="$(jq -r '.cases | to_entries[] | select(.value.expected.action == "recover-existing-review") | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
+RECOVER_INDEX="$(jq -r 'first(.cases | to_entries[] | select(.value.expected.action == "recover-existing-review")) | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
 RECOVER_DECISION="$TYPED_HOME/recover-timeout.json"; typed_decision "$RECOVER_INDEX" "$RECOVER_DECISION"
 : > "$TYPED_ENGINE_CALLS"
 ( unset PRO_REVIEW_ENGINE_TIMEOUT; export PRO_GATE_HARVEST_TIMEOUT=5m
@@ -229,7 +229,7 @@ for PROCESS_AGENT_RC in 1 2; do
 done
 PROCESS_AGENT_RC=0
 for action in collect-existing-result recover-existing-review ask-named-product-choice; do
-  index="$(jq -r --arg action "$action" '.cases | to_entries[] | select(.value.expected.action == $action) | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
+  index="$(jq -r --arg action "$action" 'first(.cases | to_entries[] | select(.value.expected.action == $action)) | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
   decision="$TYPED_HOME/process-$action.json"; typed_decision "$index" "$decision"
   : > "$TYPED_STATE"; : > "$TYPED_FAILS"
   MOCK_FRESH="$decision" MOCK_RECOVERED="$TYPED_HOME/process-recovered" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
@@ -245,16 +245,21 @@ decision="$TYPED_HOME/process-cooldown.json"; typed_decision "$cooldown_index" "
 MOCK_FRESH="$decision" MOCK_RECOVERED="$TYPED_HOME/process-recovered" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
 check "account-cooldown-active does not mark a processed SHA or failure budget" "$([ "$process_rc" -eq 0 ] && [ ! -s "$TYPED_STATE" ] && [ ! -s "$TYPED_FAILS" ]; echo $?)" "rc=$process_rc processed=$(wc -c < "$TYPED_STATE") failures=$(wc -c < "$TYPED_FAILS")"
 # #184 finding 1 (round 5): allow-existing-merge-workflow/current-ship-is-merge-eligible is one of
-# the two positive shapes daemon_decision_completes_current_head recognizes (the producer's FIRST
+# the positive shapes daemon_decision_completes_current_head recognizes (the producer's FIRST
 # SHIP result lives in .facts.completed_results, never .facts.prior_review) -- unlike the three
 # report/collection actions above, it correctly DOES mark the head done, or the unchanged head
 # re-clones and re-queries forever. Split out of the "does not mark" loop above on purpose.
-MERGE_INDEX="$(jq -r --arg action allow-existing-merge-workflow '.cases | to_entries[] | select(.value.expected.action == $action) | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
+MERGE_INDEX="$(jq -r '.cases | to_entries[] | select(.value.expected.reason == "current-ship-is-merge-eligible") | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
 MERGE_DECISION="$TYPED_HOME/process-allow-existing-merge-workflow.json"; typed_decision "$MERGE_INDEX" "$MERGE_DECISION"
 check 'sanity: the allow-existing-merge-workflow corpus fixture is the FIRST-SHIP completion reason (current-ship-is-merge-eligible)' "$([ "$(jq -r .reason "$MERGE_DECISION")" = current-ship-is-merge-eligible ]; echo $?)" "$(jq -r .reason "$MERGE_DECISION")"
 : > "$TYPED_STATE"; : > "$TYPED_FAILS"
 MOCK_FRESH="$MERGE_DECISION" MOCK_RECOVERED="$TYPED_HOME/process-recovered" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
 check 'allow-existing-merge-workflow (current-ship-is-merge-eligible) completes the current head without a failure-budget charge' "$([ "$process_rc" -eq 0 ] && already_done acme/widgets 1983 "$PROCESS_SHA" && [ ! -s "$TYPED_FAILS" ]; echo $?)" "rc=$process_rc processed=$(wc -c < "$TYPED_STATE") failures=$(wc -c < "$TYPED_FAILS")"
+DEFER_INDEX="$(jq -r '.cases | to_entries[] | select(.value.expected.reason == "fix-first-deferred-p2-only") | .key' "$HERE/fixtures/review-decision/v1/corpus.json")"
+DEFER_DECISION="$TYPED_HOME/process-deferral.json"; typed_decision "$DEFER_INDEX" "$DEFER_DECISION"
+: > "$TYPED_STATE"; : > "$TYPED_FAILS"
+MOCK_FRESH="$DEFER_DECISION" process_pr acme/widgets 1983 "$PROCESS_SHA" branch https://example.test/pr/1983; process_rc=$?
+check 'P2-5 deferral allow completes the current head without a failure-budget charge' "$([ "$process_rc" -eq 0 ] && already_done acme/widgets 1983 "$PROCESS_SHA" && [ ! -s "$TYPED_FAILS" ]; echo $?)" "rc=$process_rc processed=$(wc -c < "$TYPED_STATE") failures=$(wc -c < "$TYPED_FAILS")"
 : > "$TYPED_STATE"; : > "$TYPED_FAILS"
 # #184c finding 1: a round-governor-denied stop means no applicable review ran, so it must NOT
 # complete the head. Positive current-head review proof ("identical-code-and-evidence") is covered
