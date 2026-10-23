@@ -101,7 +101,7 @@ if [ -n "$highlights" ]; then
     # ${#text} counts code points. A bullet of 145 characters including 45 emoji is 190 units:
     # it passed here and still reached customers with its tail silently removed. python3 is
     # already required by the release path, and is what the announcer itself uses.
-    units="$(printf '%s' "$text" | python3 -c 'import sys
+    units="$(printf '%s' "$text" | python3 -I -S -c 'import sys
 print(sum(2 if ord(c) > 0xFFFF else 1 for c in sys.stdin.read()))')"
     [ "$units" -gt 180 ] && problem "bullet $n is $units UTF-16 units; the feed truncates at 180"
     [ "${#text}" -lt 15 ] && problem "bullet $n is too short to say anything useful: ${text:0:60}"

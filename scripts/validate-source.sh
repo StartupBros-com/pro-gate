@@ -4,7 +4,7 @@ set -euo pipefail
 cd -- "${1:-.}"
 find . -path './.git' -prune -o -name '*.json' -exec jq empty {} +
 find . -path './.git' -prune -o \( -name '*.yaml' -o -name '*.yml' \) -exec yq eval '.' {} + >/dev/null
-find . -path './.git' -prune -o -name '*.sh' -exec shellcheck --severity=error {} +
+find . -path './.git' -prune -o -name '*.sh' -exec shellcheck --norc --severity=error {} +
 
 # Stock macOS /bin/bash is 3.2, whose parser rejects some scripts bash 5 accepts: a case pattern
 # without its leading parenthesis inside $( ) or <( ) ends the substitution early, so nothing that

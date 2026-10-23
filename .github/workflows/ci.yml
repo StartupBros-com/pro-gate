@@ -39,6 +39,7 @@ jobs:
               node --test tests/cdp-salvage.test.mjs
           - leg: rest
             tests: |
+              bash tests/trusted-data.test.sh
               bash tests/ci-assurance.test.sh
               bash tests/review-decision-adapters.test.sh
               bash tests/review-facts.test.sh
